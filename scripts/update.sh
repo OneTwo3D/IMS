@@ -565,6 +565,61 @@ LEGACY_FENCE_FILE="${LEGACY_CUTOVER_STATE_DIR}/FENCED"
 LEGACY_CRON_BACKUP="${LEGACY_CUTOVER_STATE_DIR}/crontab-${APP_USER}.bak"
 LEGACY_DB_FENCE_STATE="${LEGACY_CUTOVER_STATE_DIR}/db-connect-fence.json"
 DB_FENCE_SCRIPT="${APP_DIR}/scripts/fence-db-connections.mjs"
+# ---------------------------------------------------------------------------
+# WHAT A RECOVERY RUN NEEDS, KEPT WHERE THE APPLICATION CANNOT TAKE IT AWAY
+# (o3d-2sm1.5 r29, Codex HIGH).
+#
+# A RECOVERY PATH MAY NOT DEPEND ON THE THING WHOSE LOSS IT RECOVERS FROM. r28 moved the .env
+# refusal below the adoption so that a deleted ${APP_DIR}/.env could no longer make a recovery run
+# walk away from a standing fence. That was necessary and not sufficient: with the file gone,
+# initialisation leaves DATABASE_URL empty, so DB_FENCE_IDENTITY_ARGS is empty, and
+# adopt_db_connections() reached fence_db_connections() only to die on "the connection identity
+# could not be read". The refusal was in the right place and the adoption itself still needed the
+# missing file. The fence was neither re-applied nor re-drained, and the run stopped anyway.
+#
+# THREE THINGS THE ADOPTION READS, AND WHO OWNS THEM:
+#
+#   the four identity values   read out of DATABASE_URL in ${APP_DIR}/.env — APPLICATION-OWNED
+#   the fence script itself    ${APP_DIR}/scripts/fence-db-connections.mjs — APPLICATION-OWNED
+#   DEPLOY_ADMIN_DATABASE_URL  ${APP_DIR}/.env, else the ROOT INVOCATION
+#
+# The first two are answered here. When a fence is RAISED, the run that raises it publishes the
+# identity it aimed at and a copy of the script that aimed it into a root-owned directory; when a
+# later run ADOPTS that fence, it reads them from there. The identity belongs in that record and
+# not re-derived from a file: the fence standing on the database was raised against the identity
+# recorded here, so re-applying it against whatever ${APP_DIR}/.env says today would be a second
+# guess at a question the record already answers exactly.
+#
+# CREDENTIALS ARE THE PART A RECORD MUST NOT HOLD. DEPLOY_ADMIN_DATABASE_URL carries a password
+# and is not written anywhere by this script; on the recovery path it comes from the ROOT
+# INVOCATION, and a recovery with no such connection REFUSES, naming the variable.
+#
+# WHY A SEPARATE DIRECTORY FROM ${DB_ENV_SNAPSHOT_DIR}, AND WHY 0755. That one is 0700 because it
+# holds a DATABASE_URL, password and all, and only PID 1 needs to read it. These two files hold no
+# secret — a host, a port, a role, a database name, and a copy of a script that ships in the
+# repository — and the application user must be able to READ both, because the fence runs AS the
+# application user (a root-owned state file is one it cannot release). So: root-owned, world
+# readable, and not writable by the account whose loss this recovers from.
+#
+# AND IT IS A LITERAL, for the reason DB_ENV_SNAPSHOT_DIR is: a trust root chosen by a variable is
+# only as trustworthy as whatever can set that variable, and there is no spelling of an override
+# that is safe and also worth having. A deployment that must move it edits this line.
+#
+# NOT the cutover state directory, which is where the fence MARKER lives: that is the
+# application's own data directory, and therefore writable by the application user (see
+# DB_ENV_SNAPSHOT_DIR below, which was moved out of it for exactly this reason). Putting the
+# identity in the marker would hand the account this recovers from the ability to aim the recovery
+# re-fence at a database of its choosing.
+DB_FENCE_RECOVERY_DIR="/etc/ims-cutover-recovery"
+DB_FENCE_IDENTITY_FILE="${DB_FENCE_RECOVERY_DIR}/db-fence-identity.env"
+DB_FENCE_SCRIPT_COPY="${DB_FENCE_RECOVERY_DIR}/fence-db-connections.mjs"
+# Did the identity this run is fencing with come from that record rather than from
+# ${APP_DIR}/.env? Only then are the two .env-drift questions in fence_db_connections() skipped —
+# they are questions about a file that is gone, and the record is the better answer to both.
+DB_FENCE_IDENTITY_FROM_RECORD=false
+# Why the recovery record could not be read, for the refusal that names it.
+DB_FENCE_RECOVERY_REASON="the recovery record has not been read yet"
+# ---------------------------------------------------------------------------
 DB_OBJECT_ACCESS_SCRIPT="${APP_DIR}/scripts/check-app-db-object-access.mjs"
 # ---------------------------------------------------------------------------
 # THE APPLICATION'S CONNECTION IDENTITY: SUPPLIED TO THE FENCE, NEVER WORKED OUT BY IT
@@ -2097,6 +2152,157 @@ remove_db_identity_snapshot() {
 }
 
 # ---------------------------------------------------------------------------
+# THE RECOVERY RECORD: WRITTEN WHEN A FENCE IS RAISED, READ WHEN ONE IS ADOPTED
+# (o3d-2sm1.5 r29, Codex HIGH). See DB_FENCE_RECOVERY_DIR at the top for why it exists and why it
+# lives where it does.
+# ---------------------------------------------------------------------------
+
+# Publish the identity this run is about to fence with, and the script that will raise the fence,
+# where only root can change them.
+#
+# CALLED BEFORE THE REVOKE, not after it, and for the same reason mark_schema_touched() writes
+# before Prisma runs: a record written after the durable act does not exist on the path that
+# matters, which is the run that is killed between the two. A fence raised with no record is
+# exactly the state r28 left un-adoptable.
+publish_fence_recovery_record() {
+  if $DRY_RUN; then
+    echo -e "${YELLOW}[DRY]${RESET}   would publish ${DB_FENCE_IDENTITY_FILE} and a root-owned copy of the fence script at ${DB_FENCE_SCRIPT_COPY}"
+    return 0
+  fi
+  require_db_identity || return 1
+  mkdir -p "${DB_FENCE_RECOVERY_DIR}" || return 1
+  chown root:root "${DB_FENCE_RECOVERY_DIR}" 2>/dev/null || true
+  chmod 755 "${DB_FENCE_RECOVERY_DIR}" || return 1
+  {
+    printf 'db_app_host=%s\n' "${DB_IDENTITY_HOST}"
+    printf 'db_app_port=%s\n' "${DB_IDENTITY_PORT}"
+    printf 'db_app_user=%s\n' "${DB_IDENTITY_USER}"
+    printf 'db_app_database=%s\n' "${DB_IDENTITY_DATABASE}"
+    printf 'db_connect_fence_state=%s\n' "${DB_FENCE_STATE}"
+    printf 'recorded_at=%s\n' "$(date -Iseconds)"
+    # THE LAST LINE, AND IT IS THE POINT OF IT, exactly as marker_complete=1 is: a record that
+    # does not end here was never published in one piece, and a HALF-READ IDENTITY IS A DIFFERENT
+    # DATABASE. Four values read out of a truncated file could name the right host and the wrong
+    # database, and the adoption would re-fence and later release that one.
+    printf 'fence_identity_complete=1\n'
+  } | publish_durable_file "${DB_FENCE_IDENTITY_FILE}" || return 1
+  chown root:root "${DB_FENCE_IDENTITY_FILE}" 2>/dev/null || true
+  chmod 644 "${DB_FENCE_IDENTITY_FILE}" || return 1
+  # The script that is about to raise the fence, copied out of the application checkout while it
+  # is still there. It is the version that will WRITE ${DB_FENCE_STATE}, so it is also the version
+  # that can read it back: adopting a fence with a script that never wrote that record's format is
+  # a second guess where a copy is available.
+  # NOT when the checkout no longer has one: that is the recovery path re-applying a fence with
+  # the copy this function published earlier, and re-copying it over itself proves nothing. An
+  # existing copy is left exactly as it is.
+  if [[ -f "${DB_FENCE_SCRIPT}" ]]; then
+    publish_durable_file "${DB_FENCE_SCRIPT_COPY}" < "${DB_FENCE_SCRIPT}" || return 1
+    chown root:root "${DB_FENCE_SCRIPT_COPY}" 2>/dev/null || true
+    chmod 644 "${DB_FENCE_SCRIPT_COPY}" || return 1
+  elif [[ ! -f "${DB_FENCE_SCRIPT_COPY}" ]]; then
+    return 1
+  fi
+  return 0
+}
+
+# Which copy of the fence script this run can actually run.
+#
+# The checkout's copy is preferred — it is the current one, and on an ordinary run it is the only
+# one. The root-owned copy is the fallback, and it exists because ${DB_FENCE_SCRIPT} sits under
+# ${APP_DIR}: the application account can delete it, and until this round that turned every
+# adoption, every release and the exit trap's re-fence into a refusal. Prints the path it chose;
+# returns non-zero when there is none.
+db_fence_script_in_use() {
+  if [[ -f "${DB_FENCE_SCRIPT}" ]]; then
+    printf '%s' "${DB_FENCE_SCRIPT}"
+    return 0
+  fi
+  if [[ -f "${DB_FENCE_SCRIPT_COPY}" ]]; then
+    printf '%s' "${DB_FENCE_SCRIPT_COPY}"
+    return 0
+  fi
+  return 1
+}
+
+# Take the connection identity from the recovery record instead of from ${APP_DIR}/.env.
+#
+# ONLY the record, and only a COMPLETE one. There is no fallback to a partial read and no default
+# for a value it does not state: the whole point of the four values is that a fence which is not
+# told exactly where it is aimed does not run, and a recovery is not the moment to relax that.
+adopt_identity_from_recovery_record() {
+  local host port user database
+  DB_FENCE_RECOVERY_REASON=""
+  if [[ ! -f "${DB_FENCE_IDENTITY_FILE}" ]]; then
+    DB_FENCE_RECOVERY_REASON="there is no record at ${DB_FENCE_IDENTITY_FILE}, so nothing here knows which host, port, role and database that fence was aimed at"
+    return 1
+  fi
+  if ! grep -qE '^fence_identity_complete=1$' "${DB_FENCE_IDENTITY_FILE}" 2>/dev/null; then
+    DB_FENCE_RECOVERY_REASON="${DB_FENCE_IDENTITY_FILE} does not end with fence_identity_complete=1, so it was never published in one piece and the four values in it may not belong to the same database"
+    return 1
+  fi
+  host="$(env_file_value db_app_host "${DB_FENCE_IDENTITY_FILE}")"
+  port="$(env_file_value db_app_port "${DB_FENCE_IDENTITY_FILE}")"
+  user="$(env_file_value db_app_user "${DB_FENCE_IDENTITY_FILE}")"
+  database="$(env_file_value db_app_database "${DB_FENCE_IDENTITY_FILE}")"
+  if [[ -z "$host" || -z "$user" || -z "$database" ]]; then
+    DB_FENCE_RECOVERY_REASON="${DB_FENCE_IDENTITY_FILE} does not state all of db_app_host, db_app_user and db_app_database"
+    return 1
+  fi
+  if ! valid_tcp_port "$port"; then
+    DB_FENCE_RECOVERY_REASON="${DB_FENCE_IDENTITY_FILE} states db_app_port='${port}', which is not a port number"
+    return 1
+  fi
+  case "${host}${user}${database}" in
+    *[[:space:]]*|*%*)
+      DB_FENCE_RECOVERY_REASON="${DB_FENCE_IDENTITY_FILE} states a host, role or database containing whitespace or a percent-escape, and these are handed on to the fence verbatim"
+      return 1 ;;
+  esac
+
+  DB_IDENTITY_HOST="$host"
+  DB_IDENTITY_PORT="$port"
+  DB_IDENTITY_USER="$user"
+  DB_IDENTITY_DATABASE="$database"
+  DB_IDENTITY_REASON=""
+  DB_FENCE_IDENTITY_ARGS=(
+    "--app-host=${host}"
+    "--app-port=${port}"
+    "--app-user=${user}"
+    "--app-database=${database}"
+  )
+  # The pin moves with it. env_file_identity_unchanged() compares the pinned values against the
+  # file; on this path there is no file, and the checks that use the pin are skipped through
+  # DB_FENCE_IDENTITY_FROM_RECORD — but a pin left EMPTY beside a live DB_FENCE_IDENTITY_ARGS is
+  # two records of one fact disagreeing, and something downstream would eventually read the wrong
+  # one.
+  DB_IDENTITY_PINNED_HOST="$host"
+  DB_IDENTITY_PINNED_PORT="$port"
+  DB_IDENTITY_PINNED_USER="$user"
+  DB_IDENTITY_PINNED_DATABASE="$database"
+  DB_FENCE_IDENTITY_FROM_RECORD=true
+  # The by-hand release command an operator may have to run is composed from the identity, so it
+  # is recomposed here — and from the script this run can actually reach, which on this path is
+  # usually the root-owned copy.
+  DB_FENCE_RELEASE_CMD="node $(db_fence_script_in_use || printf '%s' "${DB_FENCE_SCRIPT}") --release --state-file=${DB_FENCE_STATE} ${DB_FENCE_IDENTITY_ARGS[*]:-}"
+  return 0
+}
+
+# The one entry point the adoption uses: keep the identity ${APP_DIR}/.env gave this run if it
+# gave one, and otherwise fall back to the record. Never the other way round — on an ordinary
+# recovery the file is there, says the same thing, and nothing about this run changes.
+require_adoption_identity() {
+  require_db_identity && return 0
+  # Captured BEFORE the record is read: adopt_identity_from_recovery_record() clears
+  # DB_IDENTITY_REASON on success, and the reason worth printing is why the FILE could not answer.
+  local why="${DB_IDENTITY_REASON:-it could not be read}"
+  adopt_identity_from_recovery_record || return 1
+  warn "${APP_DIR}/.env did not give this run a connection identity (${why}),"
+  warn "so the fence being adopted is identified from the root-owned record this deploy wrote when it"
+  warn "raised that fence: ${DB_IDENTITY_USER}@${DB_IDENTITY_HOST}:${DB_IDENTITY_PORT}/${DB_IDENTITY_DATABASE}"
+  warn "(${DB_FENCE_IDENTITY_FILE}). That record is what the fence on the database was aimed at."
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # The connection fence. See scripts/fence-db-connections.mjs for what it can and
 # cannot promise; the important part here is that a failure to RELEASE it is an
 # application that cannot reach its database at all, so every path releases it and
@@ -2107,8 +2313,17 @@ fence_db_connections() {
     echo -e "${YELLOW}[DRY]${RESET}   would run: node scripts/fence-db-connections.mjs --fence"
     return 0
   fi
-  [[ -f "${DB_FENCE_SCRIPT}" ]] || die \
-    "${DB_FENCE_SCRIPT} is not in this checkout, so this run cannot hold the database closed for the migration window. A snapshot probe is not a fence. Restore the script (it ships with the app) and re-run; nothing has been migrated."
+  # THE SCRIPT THAT RAISES THE FENCE IS ALSO APPLICATION-OWNED (o3d-2sm1.5 r29, Codex HIGH).
+  # This used to be `[[ -f "${DB_FENCE_SCRIPT}" ]] || die`, and ${DB_FENCE_SCRIPT} is under
+  # ${APP_DIR}: deleting one file made every fence, every release and every adoption a refusal.
+  # The root-owned copy published when the fence was raised is the fallback.
+  local fence_script rc=0
+  fence_script="$(db_fence_script_in_use)" || die \
+    "Neither ${DB_FENCE_SCRIPT} nor the root-owned copy at ${DB_FENCE_SCRIPT_COPY} exists, so this run cannot hold the database closed for the migration window. A snapshot probe is not a fence. Restore the script (it ships with the app) and re-run; nothing has been migrated."
+  if [[ "${fence_script}" != "${DB_FENCE_SCRIPT}" ]]; then
+    warn "${DB_FENCE_SCRIPT} is missing from the checkout, so the fence is being run from the"
+    warn "root-owned copy this deploy published at ${fence_script}."
+  fi
 
   # THE FENCE IS TOLD WHICH CONNECTION IT IS ABOUT, OR IT DOES NOT RUN (o3d-2sm1.5 r19).
   require_db_identity || die \
@@ -2116,25 +2331,43 @@ fence_db_connections() {
   # AND THE FILE IT WAS READ FROM MUST BE THE ONLY THING THAT CAN DEFINE IT (o3d-2sm1.5 r20,
   # Codex CRITICAL). Four values read out of a file the service may not use are four values about
   # the wrong database.
-  require_env_file_is_sole_definition || die \
-    "${DB_IDENTITY_SOURCE_REASON}. The fence, the migration and the release would all agree with each other about the database ${APP_DIR}/.env names, while the application that restarts afterwards connects somewhere else — a migration on a database nothing fenced, and a new build on a database nothing migrated. Nothing has been stopped and nothing has been migrated."
+  # BOTH OF THE TWO QUESTIONS BELOW ARE ABOUT ${APP_DIR}/.env, AND ON THE RECOVERY PATH THAT FILE
+  # IS GONE (o3d-2sm1.5 r29, Codex HIGH). They exist to stop this run fencing one database while
+  # the service is about to start on another — a comparison between the identity in hand and what
+  # the file will give systemd at exec. When the identity came from the ROOT-OWNED RECORD instead,
+  # there is no file to compare against and no better answer to compare with: the record IS what
+  # the standing fence was aimed at, and this call is re-applying that same fence rather than
+  # aiming a new one. Nothing is being started here either — the run refuses at the layout gate a
+  # few lines later — so the property the two guards protect is not in play.
+  #
+  # WHEN THE FILE DID ANSWER, NOTHING CHANGES: both still run, unaltered, on every ordinary run
+  # and on every recovery where ${APP_DIR}/.env is still there.
+  if ! $DB_FENCE_IDENTITY_FROM_RECORD; then
+    require_env_file_is_sole_definition || die \
+      "${DB_IDENTITY_SOURCE_REASON}. The fence, the migration and the release would all agree with each other about the database ${APP_DIR}/.env names, while the application that restarts afterwards connects somewhere else — a migration on a database nothing fenced, and a new build on a database nothing migrated. Nothing has been stopped and nothing has been migrated."
 
-  # AND THE FILE MUST STILL SAY WHAT IT SAID WHEN THIS RUN READ IT (o3d-2sm1.5 r22, Codex HIGH).
-  # The identity above was read once, in the preflight, before the build and before the stop;
-  # this is the last moment before the fence is aimed. Nothing has been fenced yet, so a
-  # disagreement here is the cheap one — it costs a restart of the old version and no schema.
-  require_start_identity_unchanged || die \
-    "The connection identity this run pinned is no longer the one ${APP_DIR}/.env gives the service: ${DB_IDENTITY_DRIFT_REASON}. DATABASE_URL was read once, in the preflight, and systemd does not read the environment file until it execs the service — so fencing on the pinned identity now would fence and migrate one database while the application starts on another. NO FENCE HAS BEEN RAISED and nothing has been migrated. Put the file back the way this run found it, or re-run so the identity is pinned from what the file says now."
+    # AND THE FILE MUST STILL SAY WHAT IT SAID WHEN THIS RUN READ IT (o3d-2sm1.5 r22, Codex HIGH).
+    # The identity above was read once, in the preflight, before the build and before the stop;
+    # this is the last moment before the fence is aimed. Nothing has been fenced yet, so a
+    # disagreement here is the cheap one — it costs a restart of the old version and no schema.
+    require_start_identity_unchanged || die \
+      "The connection identity this run pinned is no longer the one ${APP_DIR}/.env gives the service: ${DB_IDENTITY_DRIFT_REASON}. DATABASE_URL was read once, in the preflight, and systemd does not read the environment file until it execs the service — so fencing on the pinned identity now would fence and migrate one database while the application starts on another. NO FENCE HAS BEEN RAISED and nothing has been migrated. Put the file back the way this run found it, or re-run so the identity is pinned from what the file says now."
+  fi
 
   mkdir -p "${DB_FENCE_DIR}"
   chown "${APP_USER}:${APP_USER}" "${DB_FENCE_DIR}"
   chmod 700 "${DB_FENCE_DIR}"
 
-  local rc=0
+  # THE RECORD IS WRITTEN BEFORE THE REVOKE. A fence raised with no record of what it was aimed
+  # at is the state that made r28's recovery impossible, and a record published afterwards is
+  # absent on the one run that matters — the one that is killed in between.
+  publish_fence_recovery_record || die \
+    "The identity of the fence about to be raised could not be recorded at ${DB_FENCE_IDENTITY_FILE}, so a run that had to adopt this fence would have nothing to identify it by once ${APP_DIR}/.env is gone. NO FENCE HAS BEEN RAISED and nothing has been migrated."
+
   run_as_user "${APP_USER}" env \
     DATABASE_URL="${DATABASE_URL}" \
     DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-    node "${DB_FENCE_SCRIPT}" --fence --state-file="${DB_FENCE_STATE}" "${DB_FENCE_IDENTITY_ARGS[@]:-}" || rc=$?
+    node "${fence_script}" --fence --state-file="${DB_FENCE_STATE}" "${DB_FENCE_IDENTITY_ARGS[@]:-}" || rc=$?
 
   case "${rc}" in
     0)
@@ -2146,7 +2379,7 @@ fence_db_connections() {
       MIGRATION_DATABASE_URL="$(run_as_user "${APP_USER}" env \
         DATABASE_URL="${DATABASE_URL}" \
         DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-        node "${DB_FENCE_SCRIPT}" --print-migration-url "${DB_FENCE_IDENTITY_ARGS[@]:-}")" || die \
+        node "${fence_script}" --print-migration-url "${DB_FENCE_IDENTITY_ARGS[@]:-}")" || die \
         "The connection fence is up but the migration URL could not be composed, so the migration would run as the deploy admin and create objects the application cannot use. Nothing has been migrated; release the fence with: ${DB_FENCE_RELEASE_CMD}"
       [[ -n "${MIGRATION_DATABASE_URL}" ]] || die \
         "The connection fence is up but --print-migration-url produced nothing. Nothing has been migrated; release the fence with: ${DB_FENCE_RELEASE_CMD}"
@@ -2282,13 +2515,20 @@ release_db_connections() {
   # own database. So the script is ALWAYS run, and the DATABASE says what is standing. Its exit
   # codes: 0 released from a record and verified; 4 no record, and the application role's own
   # CONNECT is all that could be proven; anything else, a refusal.
-  [[ -f "${DB_FENCE_SCRIPT}" ]] || { error "Cannot release the connection fence: ${DB_FENCE_SCRIPT} is missing, so nothing here can ask the database whether one is standing."; return 1; }
+  # AND THE SCRIPT IT ASKS WITH IS APPLICATION-OWNED TOO (o3d-2sm1.5 r29, Codex HIGH). Deleting
+  # ${DB_FENCE_SCRIPT} used to turn every release into this refusal — including the exit trap's,
+  # over a fence this run had raised. The root-owned copy published when the fence went up is the
+  # fallback, and it is the version that WROTE ${DB_FENCE_STATE}.
+  local fence_script rc=0
+  fence_script="$(db_fence_script_in_use)" || {
+    error "Cannot release the connection fence: neither ${DB_FENCE_SCRIPT} nor the root-owned copy at ${DB_FENCE_SCRIPT_COPY} exists, so nothing here can ask the database whether one is standing."
+    return 1
+  }
 
-  local rc=0
   run_as_user "${APP_USER}" env \
     DATABASE_URL="${DATABASE_URL}" \
     DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-    node "${DB_FENCE_SCRIPT}" --release --state-file="${DB_FENCE_STATE}" "${DB_FENCE_IDENTITY_ARGS[@]:-}" || rc=$?
+    node "${fence_script}" --release --state-file="${DB_FENCE_STATE}" "${DB_FENCE_IDENTITY_ARGS[@]:-}" || rc=$?
 
   if [[ "${rc}" -eq 0 ]]; then
     MIGRATION_DATABASE_URL="${DATABASE_URL}"
@@ -2343,7 +2583,11 @@ release_db_connections() {
 refence_db_connections() {
   $DB_FENCE_UP && return 0
   $DRY_RUN && return 1
-  [[ -f "${DB_FENCE_SCRIPT}" ]] || return 1
+  # The checkout's copy, or the root-owned one published when the fence was raised. This trap
+  # runs after the pull and the build, so a checkout that lost the script mid-run is not
+  # hypothetical (o3d-2sm1.5 r29, Codex HIGH).
+  local fence_script
+  fence_script="$(db_fence_script_in_use)" || return 1
   [[ -n "${DEPLOY_ADMIN_DATABASE_URL}" ]] || return 1
   # THE TWO QUESTIONS ARE NOT THE SAME QUESTION, AND ONE OF THEM DOES NOT BELONG HERE
   # (o3d-2sm1.5 r23, Codex MEDIUM).
@@ -2376,7 +2620,7 @@ refence_db_connections() {
   run_as_user "${APP_USER}" env \
     DATABASE_URL="${DATABASE_URL}" \
     DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-    node "${DB_FENCE_SCRIPT}" --fence --state-file="${DB_FENCE_STATE}" "${DB_FENCE_IDENTITY_ARGS[@]:-}" || rc=$?
+    node "${fence_script}" --fence --state-file="${DB_FENCE_STATE}" "${DB_FENCE_IDENTITY_ARGS[@]:-}" || rc=$?
   # EVERY POST-COMMIT RESULT RAISES THE STICKY FLAG (o3d-2sm1.5, Codex r13 HIGH). Exit 5 says
   # the REVOKEs are COMMITTED and standing: this call could not call the database fenced, but it
   # certainly fenced something, and DB_FENCE_RAISED is the flag that decides whether a later
@@ -2406,7 +2650,7 @@ refence_db_connections() {
   MIGRATION_DATABASE_URL="$(run_as_user "${APP_USER}" env \
     DATABASE_URL="${DATABASE_URL}" \
     DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-    node "${DB_FENCE_SCRIPT}" --print-migration-url "${DB_FENCE_IDENTITY_ARGS[@]:-}")" || url_rc=$?
+    node "${fence_script}" --print-migration-url "${DB_FENCE_IDENTITY_ARGS[@]:-}")" || url_rc=$?
   if [[ "${url_rc}" -ne 0 || -z "${MIGRATION_DATABASE_URL}" ]]; then
     MIGRATION_DATABASE_URL=""
     warn "--print-migration-url refused to compose a migration URL (exit ${url_rc}); NOT falling back to DEPLOY_ADMIN_DATABASE_URL. The fence is up."
@@ -2426,6 +2670,20 @@ adopt_db_connections() {
     echo -e "${YELLOW}[DRY]${RESET}   recovery through DEPLOY_ADMIN_DATABASE_URL"
     return 0
   fi
+  # WHERE THIS RECOVERY'S IDENTITY COMES FROM (o3d-2sm1.5 r29, Codex HIGH).
+  #
+  # r28 moved the .env refusal below this call so a deleted ${APP_DIR}/.env could not make a
+  # recovery run abandon a standing fence. It could still make the recovery do NOTHING: with the
+  # file gone, DATABASE_URL is empty, DB_FENCE_IDENTITY_ARGS is empty, and the fence call below
+  # died on "the connection identity could not be read" — the refusal in the right place, the
+  # adoption still depending on the file whose loss it recovers from.
+  #
+  # So the identity is taken from the ROOT-OWNED RECORD the run that RAISED this fence wrote,
+  # which is the exact identity that fence was aimed at. ${APP_DIR}/.env is preferred when it is
+  # still there and still answers, so an ordinary recovery is unchanged.
+  require_adoption_identity || die \
+    "A previous run had already started migrating, so a connection fence is standing — and this run cannot establish which database it is standing on. ${APP_DIR}/.env does not answer (${DB_IDENTITY_REASON}) and neither does the record this deploy writes when it raises a fence: ${DB_FENCE_RECOVERY_REASON}. Re-fencing or releasing on a guess would revoke or grant CONNECT on the wrong database. Restore ${APP_DIR}/.env and re-run, which adopts this fence again; the grants to restore by hand are recorded in ${DB_FENCE_STATE}. NOTHING HAS BEEN MIGRATED BY THIS RUN, the service is stopped and both fences are standing."
+
   if [[ ! -f "${DB_FENCE_STATE}" ]]; then
     # AN ABSENT FILE IS NOT PROOF THAT NO PREVIOUS FENCE STANDS (o3d-2sm1.5, Codex r12 HIGH).
     # This used to declare it out loud — "No connection fence was standing" — on the strength of
@@ -2443,8 +2701,12 @@ adopt_db_connections() {
     warn "pg_database.datacl for any OTHER grantee that fence may still be holding out."
     return 0
   fi
+  # THE CREDENTIAL IS THE PART NO RECORD MAY HOLD (o3d-2sm1.5 r29, Codex HIGH). The identity above
+  # comes from a file this script writes; the password does not, and is never written anywhere by
+  # this script. On a recovery where ${APP_DIR}/.env is gone it can only come from the ROOT
+  # INVOCATION, so the refusal names the variable and says how to supply it.
   [[ -n "${DEPLOY_ADMIN_DATABASE_URL}" ]] || die \
-    "A connection fence is standing (${DB_FENCE_STATE}) but DEPLOY_ADMIN_DATABASE_URL is not set, so this run has no connection that survives it. Set it, or release the fence by hand: ${DB_FENCE_RELEASE_CMD}"
+    "A connection fence is standing (${DB_FENCE_STATE}) but DEPLOY_ADMIN_DATABASE_URL is not set, so this run has no connection that survives it. It is the one input this recovery cannot reconstruct: the identity of the fence is recorded at ${DB_FENCE_IDENTITY_FILE}, but the privileged credential is not written down by this script and ${APP_DIR}/.env is not necessarily there to hold it either. Supply it on the invocation — DEPLOY_ADMIN_DATABASE_URL=postgresql://ADMIN:PASSWORD@HOST:PORT/DATABASE sudo -E scripts/update.sh — or release the fence by hand: ${DB_FENCE_RELEASE_CMD}"
 
   warn "The previous run had already started migrating: HOLDING the connection fence."
   warn "The application stays shut out of its own database until this run has migrated,"
@@ -3014,6 +3276,13 @@ if [[ -f "${FENCE_FILE}" ]]; then
       install_reboot_fence "adopted at $(date -Iseconds)" \
         || die "Could not re-establish the reboot fence. Refusing to continue: a reboot could start the old version against a migrated schema."
       adopt_cron_fence
+      # BOTH BRANCHES BELOW NEED TO KNOW WHICH DATABASE (o3d-2sm1.5 r29, Codex HIGH). The hold
+      # path re-applies the revoke and the release path grants CONNECT back; each is told the
+      # host, port, role and database or it does nothing. ${APP_DIR}/.env is the ordinary source
+      # and is application-owned, so when it is gone the identity comes from the root-owned
+      # record the run that raised this fence wrote. adopt_db_connections() asks again for
+      # itself; this call is what puts the release branch on the same footing.
+      require_adoption_identity || warn "Neither ${APP_DIR}/.env nor ${DB_FENCE_IDENTITY_FILE} identifies the fence being adopted: ${DB_FENCE_RECOVERY_REASON}"
       if $SCHEMA_TOUCHED; then
         # HELD, not released: the previous run had started migrating, so the schema is in
         # an unknown state and the application must not reach it — not during this rebuild

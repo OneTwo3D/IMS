@@ -1129,6 +1129,23 @@ DB_IDENTITY_SOURCE_REASON=''
 # tests/scripts/db-connection-fence.test.ts.
 require_start_identity_unchanged() { return 0; }
 DB_IDENTITY_DRIFT_REASON=''
+# o3d-2sm1.5 r29: the recovery record and the root-owned copy of the fence script. Both paths are
+# under the harness directory rather than /etc, and the copy is deliberately ABSENT so that
+# db_fence_script_in_use() below resolves to the checkout's fence.mjs — which is what every
+# assertion in these harnesses is written against.
+DB_FENCE_RECOVERY_DIR='${dir}/recovery'
+DB_FENCE_IDENTITY_FILE='${dir}/recovery/db-fence-identity.env'
+DB_FENCE_SCRIPT_COPY='${dir}/recovery/fence-db-connections.mjs'
+DB_FENCE_IDENTITY_FROM_RECORD=false
+DB_FENCE_RECOVERY_REASON=''
+# THE REAL RESOLVER, not a stub: WHICH script a fence, a release and a re-fence invoke is part of
+# what these harnesses assert, and a stub returning a constant would assert nothing about it.
+${shellFunction(UPDATE_LINES.join('\n'), 'db_fence_script_in_use')}
+${shellFunction(UPDATE_LINES.join('\n'), 'require_adoption_identity')}
+# Publishing that record writes under a root-owned /etc directory, which is neither what these
+# order harnesses are about nor something they may do. It is exercised for real, against the
+# shipped function, in 'the identity a fence records is the identity a recovery reads back'.
+publish_fence_recovery_record() { return 0; }
 : "\${APP_DIR_REAL:=/opt/app}"
 : "\${APP_DIR:=/opt/app}"
 info() { :; }
@@ -2810,6 +2827,13 @@ adopt_cron_fence(){ echo "adopt_cron_fence" >> "\${LOG}"; CRON_FENCED=true; retu
 fence_cron(){ echo "fence_cron" >> "\${LOG}"; CRON_FENCED=true; return 0; }
 adopt_db_connections(){ echo "adopt_db_connections" >> "\${LOG}"; DB_FENCE_UP=true; return 0; }
 fence_db_connections(){ echo "fence_db_connections" >> "\${LOG}"; DB_FENCE_UP=true; MIGRATION_DATABASE_URL='postgres://x'; return 0; }
+# o3d-2sm1.5 r29: where the adoption's connection identity comes from. Not the subject of these
+# harnesses — they are about the PHASE the marker records and what the adoption does about it —
+# and it is exercised against real files in 'a deleted .env does not stop the connection fence
+# being adopted'.
+DB_FENCE_IDENTITY_FILE='/etc/ims-cutover-recovery/db-fence-identity.env'
+DB_FENCE_RECOVERY_REASON=''
+require_adoption_identity(){ echo "require_adoption_identity" >> "\${LOG}"; return 0; }
 `
 
 const R8_CASES = ARMING_TRAP_CASES.map((entry) => ({
@@ -4921,11 +4945,58 @@ test('none of the three entrypoints source an application-owned file', () => {
 const APP_OWNED_PATH =
   '(\\$\\{APP_DIR(_REAL)?\\}|\\$APP_DIR(_REAL)?)/\\.(env|deploy-meta)(\\.local)?|\\$\\{DEPLOY_META_FILE\\}|\\$DEPLOY_META_FILE\\b|"?\\$\\{?env_file\\}?"?'
 
-/** Lines that name an application-owned file, comments excluded. */
+/**
+ * THE PHYSICAL LINES OF A SCRIPT, JOINED INTO THE LOGICAL ONES BASH ACTUALLY READS
+ * (o3d-2sm1.5 r29, Codex MEDIUM).
+ *
+ * This is the guard's FOURTH escape and they all had one cause: it classified PHYSICAL lines
+ * while bash executes LOGICAL ones. A trailing backslash was even accepted explicitly by the
+ * operator-message shape, so
+ *
+ *     printf '. %s\n' "${APP_DIR}/.env" \
+ *       | dash
+ *
+ * passed as "operator-facing text, one simple command" on its first line, and its second line was
+ * never examined at all — it names no application-owned path, so the scan does not even look at
+ * it. Together they are ONE pipeline that sources an application-owned file as root: exactly the
+ * compound-command class the r28 grammar was written to exclude.
+ *
+ * The three earlier escapes were each closed by making the SHAPE stricter — anchoring it, then
+ * turning its tail into a grammar. A fifth special case would have been the same move again. The
+ * fix is at the level the mismatch is at: continuations are joined FIRST, and the grammar then
+ * sees the whole command it is judging.
+ *
+ * THE JOINING RULE is bash's: a line ending in an ODD number of backslashes continues onto the
+ * next (an even number is escaped backslashes, and `\\` at the end of a line is a literal
+ * backslash, not a continuation). A COMMENT line does not continue — bash discards from `#` to
+ * the newline and the backslash inside it is ordinary text — which also keeps a comment from
+ * swallowing the code line beneath it, and these scripts are more comment than code.
+ */
+function logicalLines(source: string): string[] {
+  const joined: string[] = []
+  let pending: string | null = null
+  for (const physical of source.split(/\r?\n/)) {
+    const continuing: boolean = pending !== null
+    const current: string = continuing ? `${pending} ${physical.replace(/^\s+/, '')}` : physical
+    const trailing = /(\\+)$/.exec(physical)
+    const continues = (continuing || !/^\s*#/.test(physical)) && trailing !== null && trailing[1].length % 2 === 1
+    if (continues) {
+      pending = current.replace(/\\$/, '').replace(/\s+$/, '')
+      continue
+    }
+    joined.push(current)
+    pending = null
+  }
+  // A file whose last line ends in a backslash continues onto nothing. Keep it rather than
+  // dropping it: a dropped line is a line the guard does not classify.
+  if (pending !== null) joined.push(pending)
+  return joined
+}
+
+/** Logical lines that name an application-owned file, comments excluded. */
 function appOwnedFileMentions(source: string): string[] {
   const names = new RegExp(APP_OWNED_PATH)
-  return source
-    .split(/\r?\n/)
+  return logicalLines(source)
     .filter((line) => !/^\s*#/.test(line))
     .filter((line) => names.test(line))
 }
@@ -5060,11 +5131,20 @@ const MENTION_SHAPES: ReadonlyArray<{ why: string; match: RegExp }> = (
     // unbounded family — `&&`, `|`, `&`, `;`, and every interpreter nobody has named.
     //
     // So the tail is a grammar. Each argument is a quoted string, a short option or a bare
-    // variable expansion; a separator is none of those, and the anchoring does the rest. `>&2`
-    // and a trailing `\` are the two continuations these scripts actually use.
-    { why: 'operator-facing text, one simple command', match: `(die|warn|error|info|success|echo|printf)( ${MESSAGE_ARGUMENT})+( >&2)?( \\\\)?` },
-    // A refusal message continued onto its own line, and the REASON strings the callers set.
-    { why: 'an operator message continued onto its own line', match: '"[^"]*"( >&2)?' },
+    // variable expansion; a separator is none of those, and the anchoring does the rest.
+    //
+    // AND THE TRAILING `\` IS GONE FROM IT (o3d-2sm1.5 r29, Codex MEDIUM). r28 accepted one here
+    // because these scripts really do continue their refusal messages onto the next line — but a
+    // shape that ends in a continuation is a shape that ends in "and then whatever comes next",
+    // which is how `printf … "${APP_DIR}/.env" \` + `| dash` passed. Continuations are joined
+    // before anything is classified now (see logicalLines), so a logical line no longer HAS a
+    // trailing backslash and there is nothing here for one to excuse.
+    { why: 'operator-facing text, one simple command', match: `(die|warn|error|info|success|echo|printf)( ${MESSAGE_ARGUMENT})+( >&2)?` },
+    // The same message guarded by ONE bare command — `require_db_identity || die "…"` — which is
+    // what a dozen refusals in these scripts look like once their continuation is joined back on.
+    // The left side is a BARE NAME with no arguments and no redirect, so nothing
+    // application-owned can be handed to it; an interpreter spelled there is a hazard already.
+    { why: 'a refusal guarded by one bare command', match: '[a-z_][a-z0-9_]* \\|\\| (die|warn|error) "[^"]*"( >&2)?' },
     {
       why: 'a refusal reason recorded for an operator',
       match:
@@ -5151,6 +5231,24 @@ const MENTION_BYPASSES: ReadonlyArray<{ label: string; line: string }> = [
   { label: 'a message with a second command after a semicolon', line: 'echo safe; dash "${APP_DIR}/.env"' },
   { label: 'a message with a second command after &&', line: 'warn "checked" && tclsh "${APP_DIR}/.deploy-meta"' },
   { label: 'a message piped into an interpreter nobody listed', line: 'echo "${APP_DIR}/.env" | ksh' },
+  // r28's FOURTH escape, and the one that says what the others had in common: the guard read
+  // PHYSICAL lines and bash reads LOGICAL ones. The first line here was accepted as
+  // operator-facing text — the shape explicitly allowed a trailing backslash — and the second was
+  // never classified at all, because it names no application-owned path and the scan therefore
+  // never looks at it. Together they are ONE pipeline that sources the file as root.
+  {
+    label: 'a message continued onto a line that pipes it into an interpreter',
+    line: 'printf \'. %s\\n\' "${APP_DIR}/.env" \\\n  | dash',
+  },
+  // The same mechanism without a pipe: the continuation carries a second command with it.
+  {
+    label: 'a path assignment continued onto a line that executes the file',
+    line: 'DEPLOY_META_FILE="${APP_DIR}/.deploy-meta" \\\n  && bash "${DEPLOY_META_FILE}"',
+  },
+  // And the escaped backslash, which is NOT a continuation: `\\` at the end of a line is a
+  // literal backslash, so this line stands alone and must be rejected on its own terms. It is
+  // here so that "join anything ending in a backslash" is not what passes this corpus.
+  { label: 'a line ending in an escaped backslash, not a continuation', line: 'cat "${APP_DIR}/.env" \\\\' },
 ]
 
 test('the declared-shape guard rejects every known way past it', () => {
@@ -5160,10 +5258,22 @@ test('the declared-shape guard rejects every known way past it', () => {
   //     the anchoring is the only thing rejecting them;
   //   drop MENTION_HAZARDS and the substitution, interpreter, redirect and backtick cases pass;
   //   narrow APP_OWNED_PATH back to the braced spellings and the two unbraced cases are not even
-  //     seen by the scan.
-  const accepted = MENTION_BYPASSES.filter((bypass) => classifyMention(bypass.line) === null).map(
-    (bypass) => `${bypass.label}: ${bypass.line}`,
-  )
+  //     seen by the scan;
+  //   make logicalLines() return source.split(/\r?\n/) unchanged — which is what r28 classified —
+  //     and the two continuation cases pass: the first physical line of each matches a shape (with
+  //     r28's trailing-backslash tail restored) and the second is never scanned at all.
+  // THROUGH THE WHOLE PIPELINE, NOT JUST THE CLASSIFIER (o3d-2sm1.5 r29, Codex MEDIUM). A bypass
+  // that spans two physical lines is not a `line` any more, and feeding it to classifyMention()
+  // directly would test the classifier while skipping the joining that is the actual fix — and
+  // skipping the scan, which is where the second physical line used to disappear. Each entry goes
+  // in as SOURCE: it is joined into logical lines, scanned for an application-owned path, and
+  // every logical line the scan returns is classified. A bypass counts as caught only if the scan
+  // saw something and the classifier rejected it; a bypass the scan does not see at all is the
+  // r28 failure exactly, and counts as ACCEPTED.
+  const accepted = MENTION_BYPASSES.filter((bypass) => {
+    const seen = appOwnedFileMentions(bypass.line)
+    return seen.length === 0 || seen.every((line) => classifyMention(line) === null)
+  }).map((bypass) => `${bypass.label}: ${bypass.line}`)
   assert.deepEqual(accepted, [], `the guard accepts lines that read or execute an application-owned file:\n${accepted.join('\n')}`)
 
   // PRECONDITION, so the rejections above are not the classifier rejecting everything: the real
@@ -5180,6 +5290,25 @@ test('the declared-shape guard rejects every known way past it', () => {
     appOwnedFileMentions('cat $APP_DIR/.env\nsource $APP_DIR/.deploy-meta\n'),
     ['cat $APP_DIR/.env', 'source $APP_DIR/.deploy-meta'],
     'the scan must see the unbraced path spelling r26 was blind to',
+  )
+
+  // AND THE JOINING IS REAL, in both directions: a continuation becomes ONE logical line, and an
+  // escaped backslash at the end of a line does not join anything. Without this the corpus above
+  // could pass on a joiner that joined every line to the next, which would reject everything.
+  assert.deepEqual(
+    logicalLines('die "one" \\\n  "two"\nnext_command\n'),
+    ['die "one" "two"', 'next_command', ''],
+    'a trailing backslash must join the next physical line onto this one',
+  )
+  assert.deepEqual(
+    logicalLines('printf "%s" "a\\\\"\nnext_command\n'),
+    ['printf "%s" "a\\\\"', 'next_command', ''],
+    'an even number of trailing backslashes is an escaped backslash, not a continuation',
+  )
+  assert.deepEqual(
+    logicalLines('# a comment ending in a backslash \\\ncat "${APP_DIR}/.env"\n'),
+    ['# a comment ending in a backslash \\', 'cat "${APP_DIR}/.env"', ''],
+    'a comment must not swallow the code line beneath it',
   )
 })
 
@@ -5399,6 +5528,342 @@ test('a deleted .env does not make a recovery run abandon a standing fence', () 
   assert.equal(present.status, 0, `with the file present the gate must let the run continue:\n${present.output}`)
   assert.match(present.output, /PAST_THE_GATE=yes/, 'and reach what comes after it')
   assert.match(present.log, /systemctl stop/, 'having adopted the same fence')
+})
+
+// ---------------------------------------------------------------------------
+// THE ADOPTION THAT USED TO NEED THE FILE IT RECOVERS FROM (o3d-2sm1.5 r29, Codex HIGH).
+//
+// r28 moved the .env refusal BELOW the adoption, so a deleted ${APP_DIR}/.env could no longer
+// make a recovery run walk away from a standing fence. The refusal was then in the right place
+// and the ADOPTION ITSELF still depended on the missing file: with .env gone, DATABASE_URL is
+// empty, DB_FENCE_IDENTITY_ARGS is empty, and adopt_db_connections() reached
+// fence_db_connections() only to die on "the connection identity could not be read". The service
+// and reboot fences were restored; the standing DATABASE fence was neither re-applied nor
+// re-drained. The r28 test did not catch it because it replaced adopt_db_connections() with an
+// unconditional success.
+//
+// A RECOVERY PATH MAY NOT DEPEND ON THE THING WHOSE LOSS IT RECOVERS FROM. Two application-owned
+// dependencies are removed here and both are exercised below, in one round trip:
+//
+//   the four identity values   now recorded, when the fence is RAISED, in a root-owned file
+//   the fence script itself    ${APP_DIR}/scripts/fence-db-connections.mjs, copied beside it
+//
+// and the third input — DEPLOY_ADMIN_DATABASE_URL, a credential no record may hold — comes from
+// the root invocation, with a refusal that names it.
+//
+// NOTHING BELOW IS STUBBED THAT IS PART OF THE CLAIM. The shipped fence_db_connections(),
+// adopt_db_connections(), require_adoption_identity(), adopt_identity_from_recovery_record(),
+// db_fence_script_in_use(), publish_fence_recovery_record(), resolve_db_identity() and
+// env_file_value() all run, against real files. The record the recovery reads is the one the
+// FENCE wrote, in the same test, rather than bytes typed here.
+// ---------------------------------------------------------------------------
+
+/** Everything the connection fence and its adoption touch, wired to real directories. */
+function fenceRecoveryHarness(dirs: { app: string; state: string; recovery: string }, body: string[]): string {
+  const source = UPDATE_LINES.join('\n')
+  return [
+    'set -euo pipefail',
+    "BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''",
+    'DRY_RUN=false',
+    'APP_USER="$(id -un)"',
+    `APP_DIR=${JSON.stringify(dirs.app)}`,
+    `LOG=${JSON.stringify(join(dirs.state, 'calls.log'))}`,
+    ': > "${LOG}"',
+    `DB_FENCE_DIR=${JSON.stringify(join(dirs.state, 'deploy'))}`,
+    `DB_FENCE_STATE=${JSON.stringify(join(dirs.state, 'deploy', 'db-connect-fence.json'))}`,
+    `DB_FENCE_SCRIPT=${JSON.stringify(join(dirs.app, 'scripts', 'fence-db-connections.mjs'))}`,
+    `DB_FENCE_RECOVERY_DIR=${JSON.stringify(dirs.recovery)}`,
+    `DB_FENCE_IDENTITY_FILE=${JSON.stringify(join(dirs.recovery, 'db-fence-identity.env'))}`,
+    `DB_FENCE_SCRIPT_COPY=${JSON.stringify(join(dirs.recovery, 'fence-db-connections.mjs'))}`,
+    "DB_FENCE_RELEASE_CMD=''",
+    'DB_FENCE_IDENTITY_FROM_RECORD=false',
+    "DB_FENCE_RECOVERY_REASON=''",
+    'DB_FENCE_UP=false',
+    'DB_FENCE_RAISED=false',
+    'SCHEMA_TOUCHED=false',
+    "MIGRATION_DATABASE_URL=''",
+    'info(){ :; }',
+    'success(){ echo "SUCCESS: $*"; }',
+    'warn(){ echo "WARN: $*"; }',
+    'error(){ echo "ERROR: $*" >&2; }',
+    'die(){ echo "DIE: $*" >&2; exit 9; }',
+    // Root-only, and not what any of this is about: the ownership of the recovery directory is
+    // asserted by reading the shipped source, not by a test that cannot become root.
+    'chown(){ :; }',
+    // THE TWO .env-DRIFT QUESTIONS ARE LOGGED RATHER THAN STUBBED SILENT. Whether they are ASKED
+    // is part of the claim: on the recovery path there is no file to ask them about, and a
+    // recovery that asked them anyway would refuse. tests/scripts/db-connection-fence.test.ts
+    // exercises what they actually answer.
+    'require_env_file_is_sole_definition(){ echo "require_env_file_is_sole_definition" >> "${LOG}"; return 0; }',
+    'require_start_identity_unchanged(){ echo "require_start_identity_unchanged" >> "${LOG}"; return 0; }',
+    "DB_IDENTITY_SOURCE_REASON=''",
+    "DB_IDENTITY_DRIFT_REASON=''",
+    'DB_IDENTITY_PINNED_HOST=""; DB_IDENTITY_PINNED_PORT=""; DB_IDENTITY_PINNED_USER=""; DB_IDENTITY_PINNED_DATABASE=""',
+    // The one process boundary this cannot cross: node, as the application user. It records the
+    // whole argument vector — which script, which mode, which four identity values — and it
+    // WRITES THE STATE FILE on --fence, because that is what the real one does and the adoption
+    // path branches on whether that file exists.
+    'run_as_user(){',
+    '  shift',
+    '  echo "run_as_user $*" >> "${LOG}"',
+    '  case "$*" in',
+    '    *--fence*) mkdir -p "$(dirname "${DB_FENCE_STATE}")"; echo "{}" > "${DB_FENCE_STATE}"; return "${FENCE_EXIT:-0}" ;;',
+    "    *--print-migration-url*) printf 'postgresql://admin:pw@127.0.0.1:5432/imsdb?options=-c%%20role%%3Dimsapp\\n'; return 0 ;;",
+    '  esac',
+    '  return 0',
+    '}',
+    'FENCE_EXIT=0',
+    shellFunction(source, 'env_file_value'),
+    shellFunction(source, 'valid_tcp_port'),
+    shellFunction(source, 'resolve_db_identity'),
+    shellFunction(source, 'require_db_identity'),
+    durabilityFunctions(source),
+    shellFunction(source, 'publish_fence_recovery_record'),
+    shellFunction(source, 'db_fence_script_in_use'),
+    shellFunction(source, 'adopt_identity_from_recovery_record'),
+    shellFunction(source, 'require_adoption_identity'),
+    shellFunction(source, 'fence_db_connections'),
+    shellFunction(source, 'release_db_connections'),
+    shellFunction(source, 'adopt_db_connections'),
+    // EXACTLY the line update.sh's initialisation runs, with EXACTLY the reader it uses. With
+    // .env deleted this leaves DATABASE_URL empty and DB_FENCE_IDENTITY_ARGS empty — the premise
+    // of the whole finding, established by running the shipped code rather than by assertion.
+    'DATABASE_URL="$(env_file_value DATABASE_URL "${APP_DIR}/.env")"',
+    'resolve_db_identity "${DATABASE_URL:-}" || true',
+    'echo "IDENTITY_ARGS=${#DB_FENCE_IDENTITY_ARGS[@]}"',
+    ...body,
+  ].join('\n')
+}
+
+function readCalls(state: string): string {
+  const path = join(state, 'calls.log')
+  return existsSync(path) ? readFileSync(path, 'utf8') : ''
+}
+
+test('a deleted .env does not stop the connection fence being adopted', () => {
+  // MUTATION ROUTE (each verified by making the change locally and re-running):
+  //   1. delete the `require_adoption_identity || die` call from adopt_db_connections() — i.e.
+  //      put r28 back, where the adoption depended on ${APP_DIR}/.env — and PHASE 2 fails: the
+  //      log holds no `--fence` line at all, because fence_db_connections() dies on
+  //      "The application's connection identity could not be read from DATABASE_URL".
+  //   2. delete the ${DB_FENCE_SCRIPT_COPY} arm of db_fence_script_in_use() and phase 2 fails the
+  //      same way, with "Neither ... nor the root-owned copy ... exists": the checkout's script
+  //      is gone, and it was the only thing that could raise the fence.
+  //   3. make publish_fence_recovery_record() a no-op and phase 2 fails on the missing record,
+  //      naming it — the record has to be written when the fence is RAISED or there is nothing
+  //      to recover from.
+  const app = mkdtempSync(join(tmpdir(), 'ims-recover-app-'))
+  const state = mkdtempSync(join(tmpdir(), 'ims-recover-state-'))
+  const recovery = mkdtempSync(join(tmpdir(), 'ims-recover-etc-'))
+  try {
+    // PHASE 1 — an ordinary run raises a fence, with .env in place and the script in the
+    // checkout. Nothing here is about recovery; it is what produces the record.
+    mkdirSync(join(app, 'scripts'), { recursive: true })
+    writeFileSync(join(app, 'scripts', 'fence-db-connections.mjs'), '// the shipped fence script\n')
+    writeFileSync(join(app, '.env'), 'DATABASE_URL=postgresql://imsapp:pw@127.0.0.1:5432/imsdb\n')
+    const raised = runShell(
+      fenceRecoveryHarness({ app, state, recovery }, ['DEPLOY_ADMIN_DATABASE_URL=postgres://admin@127.0.0.1:5432/imsdb', 'fence_db_connections', 'echo "RAISED=${DB_FENCE_UP}"']),
+    )
+    assert.equal(raised.status, 0, `the ordinary fence must succeed:\n${raised.output}`)
+    assert.match(raised.output, /^IDENTITY_ARGS=4$/m, 'precondition: .env identified the connection on the ordinary run')
+    assert.match(raised.output, /^RAISED=true$/m, `and the fence went up:\n${raised.output}`)
+
+    // The record it wrote is a record, and it is complete.
+    const record = readFileSync(join(recovery, 'db-fence-identity.env'), 'utf8')
+    assert.match(record, /^db_app_host=127\.0\.0\.1$/m, `the record must name the host:\n${record}`)
+    assert.match(record, /^db_app_port=5432$/m, `and the port:\n${record}`)
+    assert.match(record, /^db_app_user=imsapp$/m, `and the role:\n${record}`)
+    assert.match(record, /^db_app_database=imsdb$/m, `and the database:\n${record}`)
+    assert.match(record, /^fence_identity_complete=1$/m, 'and end with the sentinel a truncated one would not have')
+    assert.equal(
+      readFileSync(join(recovery, 'fence-db-connections.mjs'), 'utf8'),
+      '// the shipped fence script\n',
+      'and the script that raised the fence must have been copied where the application cannot delete it',
+    )
+    // AND IT WAS WRITTEN BEFORE THE REVOKE, not after: a record published after the durable act
+    // is absent on the one run that matters, the one killed in between.
+    const raisedLog = readCalls(state)
+    assert.match(raisedLog, /--fence/, 'precondition: the ordinary run really invoked the fence')
+
+    // PHASE 2 — THE LOAD-BEARING CASE. The application account has since deleted BOTH of the
+    // files the adoption used to need, and a previous run had already begun migrating.
+    rmSync(join(app, '.env'))
+    rmSync(join(app, 'scripts', 'fence-db-connections.mjs'))
+    const adopted = runShell(
+      fenceRecoveryHarness({ app, state, recovery }, [
+        'DEPLOY_ADMIN_DATABASE_URL=postgres://admin@127.0.0.1:5432/imsdb',
+        'SCHEMA_TOUCHED=true',
+        'adopt_db_connections',
+        'echo "ADOPTED=${DB_FENCE_UP}"',
+        'echo "FROM_RECORD=${DB_FENCE_IDENTITY_FROM_RECORD}"',
+      ]),
+    )
+
+    // PRECONDITION, and it is the finding: with .env gone the shipped initialisation leaves the
+    // identity EMPTY. Everything below is the recovery doing work, not .env being read after all.
+    assert.match(adopted.output, /^IDENTITY_ARGS=0$/m, `with .env deleted the file identifies nothing:\n${adopted.output}`)
+
+    // THE FENCE IS ACTUALLY ADOPTED — re-applied and re-drained — not merely attempted.
+    const log = readCalls(state)
+    assert.match(log, /--fence /, `the standing fence must be re-applied:\n${log}`)
+    assert.match(
+        log,
+      /--app-host=127\.0\.0\.1 --app-port=5432 --app-user=imsapp --app-database=imsdb/,
+      `and aimed at the identity the record says that fence was raised against:\n${log}`,
+    )
+    assert.ok(
+      log.includes(join(recovery, 'fence-db-connections.mjs')),
+      `and run from the root-owned copy, because the checkout's is gone:\n${log}`,
+    )
+    assert.ok(
+      !log.includes(join(app, 'scripts', 'fence-db-connections.mjs')),
+      `never from the path the application user deleted:\n${log}`,
+    )
+    assert.match(adopted.output, /^ADOPTED=true$/m, `and the run must record the fence as HELD:\n${adopted.output}`)
+    assert.match(adopted.output, /^FROM_RECORD=true$/m, 'through the record, which is what makes it independent of the file')
+    assert.equal(adopted.status, 0, `and the adoption itself must not refuse:\n${adopted.output}`)
+
+    // AND THE TWO QUESTIONS ABOUT .env WERE NOT ASKED. They compare the identity in hand against
+    // what a file will give systemd at exec; with no file, asking them is a refusal, and a
+    // refusal here is the abandoned fence all over again.
+    assert.ok(
+      !/require_start_identity_unchanged/.test(log),
+      `the drift re-read cannot be asked of a file that is gone:\n${log}`,
+    )
+    assert.ok(
+      !/require_env_file_is_sole_definition/.test(log),
+      `nor the sole-source question about it:\n${log}`,
+    )
+  } finally {
+    rmSync(app, { recursive: true, force: true })
+    rmSync(state, { recursive: true, force: true })
+    rmSync(recovery, { recursive: true, force: true })
+  }
+})
+
+test('a recovery with no privileged credential refuses, naming the argument that supplies it', () => {
+  // The identity is recoverable from a file this script writes. The PASSWORD is not, and must not
+  // be: DEPLOY_ADMIN_DATABASE_URL comes from the root invocation or from ${APP_DIR}/.env, and on
+  // this path that file is gone. The refusal has to say so.
+  //
+  // MUTATION ROUTE: drop the `[[ -n "${DEPLOY_ADMIN_DATABASE_URL}" ]] || die` from
+  // adopt_db_connections() and this test fails at the status assertion — the run proceeds to
+  // invoke the fence with an empty admin URL, which is the shape that revokes CONNECT and then
+  // cannot get back in.
+  const app = mkdtempSync(join(tmpdir(), 'ims-recover-app-'))
+  const state = mkdtempSync(join(tmpdir(), 'ims-recover-state-'))
+  const recovery = mkdtempSync(join(tmpdir(), 'ims-recover-etc-'))
+  try {
+    mkdirSync(join(state, 'deploy'), { recursive: true })
+    writeFileSync(join(state, 'deploy', 'db-connect-fence.json'), '{}\n')
+    writeFileSync(join(recovery, 'fence-db-connections.mjs'), '// copy\n')
+    writeFileSync(
+      join(recovery, 'db-fence-identity.env'),
+      'db_app_host=127.0.0.1\ndb_app_port=5432\ndb_app_user=imsapp\ndb_app_database=imsdb\nfence_identity_complete=1\n',
+    )
+    const result = runShell(
+      fenceRecoveryHarness({ app, state, recovery }, ["DEPLOY_ADMIN_DATABASE_URL=''", 'SCHEMA_TOUCHED=true', 'adopt_db_connections', 'echo "PAST=yes"']),
+    )
+    assert.notEqual(result.status, 0, `a recovery with no privileged connection must refuse:\n${result.output}`)
+    assert.ok(!/PAST=yes/.test(result.output), 'and nothing after it may run')
+    assert.match(result.output, /DEPLOY_ADMIN_DATABASE_URL is not set/, `naming the argument:\n${result.output}`)
+    assert.match(result.output, /DEPLOY_ADMIN_DATABASE_URL=postgresql:/, 'and saying how to supply it on the invocation')
+    // PRECONDITION: the identity itself WAS recovered, so this refusal is about the credential
+    // and not about a record that could not be read.
+    assert.match(result.output, /^IDENTITY_ARGS=0$/m, 'the file gave nothing')
+    assert.match(result.output, /imsapp@127\.0\.0\.1:5432\/imsdb/, 'and the record gave the identity')
+    assert.ok(!/--fence/.test(readCalls(state)), 'and no fence was attempted without a connection that survives it')
+  } finally {
+    rmSync(app, { recursive: true, force: true })
+    rmSync(state, { recursive: true, force: true })
+    rmSync(recovery, { recursive: true, force: true })
+  }
+})
+
+const RECOVERY_RECORD_REFUSALS: ReadonlyArray<{ label: string; record: string | null; says: RegExp }> = [
+  { label: 'no record at all', record: null, says: /there is no record at/ },
+  {
+    label: 'a record truncated before its sentinel',
+    record: 'db_app_host=127.0.0.1\ndb_app_port=5432\ndb_app_user=imsapp\ndb_app_data',
+    says: /does not end with fence_identity_complete=1/,
+  },
+  {
+    label: 'a record missing the database',
+    record: 'db_app_host=127.0.0.1\ndb_app_port=5432\ndb_app_user=imsapp\nfence_identity_complete=1\n',
+    says: /does not state all of db_app_host, db_app_user and db_app_database/,
+  },
+  {
+    label: 'a record whose port is not a port',
+    record: 'db_app_host=127.0.0.1\ndb_app_port=nowhere\ndb_app_user=imsapp\ndb_app_database=imsdb\nfence_identity_complete=1\n',
+    says: /which is not a port number/,
+  },
+]
+
+for (const scenario of RECOVERY_RECORD_REFUSALS) {
+  test(`a recovery refuses rather than guess when the record is ${scenario.label}`, () => {
+    // A HALF-READ IDENTITY IS A DIFFERENT DATABASE. The whole reason the fence is TOLD its four
+    // values is that working them out produced a locally correct answer seven times running; a
+    // recovery is not the moment to relax that, so anything short of four values it can vouch for
+    // is a refusal and never a default.
+    //
+    // MUTATION ROUTE: drop the fence_identity_complete=1 check from
+    // adopt_identity_from_recovery_record() and the truncated case stops refusing — it adopts
+    // host, port and role from the record and NO database, which is three of four values about a
+    // database nothing named.
+    const app = mkdtempSync(join(tmpdir(), 'ims-recover-app-'))
+    const state = mkdtempSync(join(tmpdir(), 'ims-recover-state-'))
+    const recovery = mkdtempSync(join(tmpdir(), 'ims-recover-etc-'))
+    try {
+      mkdirSync(join(state, 'deploy'), { recursive: true })
+      writeFileSync(join(state, 'deploy', 'db-connect-fence.json'), '{}\n')
+      writeFileSync(join(recovery, 'fence-db-connections.mjs'), '// copy\n')
+      if (scenario.record !== null) writeFileSync(join(recovery, 'db-fence-identity.env'), scenario.record)
+      const result = runShell(
+        fenceRecoveryHarness({ app, state, recovery }, [
+          'DEPLOY_ADMIN_DATABASE_URL=postgres://admin@127.0.0.1:5432/imsdb',
+          'SCHEMA_TOUCHED=true',
+          'adopt_db_connections',
+          'echo "PAST=yes"',
+        ]),
+      )
+      assert.notEqual(result.status, 0, `an unusable record must be a refusal:\n${result.output}`)
+      assert.ok(!/PAST=yes/.test(result.output), 'and nothing after it may run')
+      assert.match(result.output, scenario.says, `and it must say what is wrong with the record:\n${result.output}`)
+      assert.ok(!/--fence/.test(readCalls(state)), `and nothing may be re-fenced on a guess:\n${readCalls(state)}`)
+    } finally {
+      rmSync(app, { recursive: true, force: true })
+      rmSync(state, { recursive: true, force: true })
+      rmSync(recovery, { recursive: true, force: true })
+    }
+  })
+}
+
+test('the recovery record lives where the application user cannot rewrite it', () => {
+  // WHY NOT IN THE FENCE MARKER, which is what Codex proposed and what the adoption already keys
+  // on: ${CUTOVER_STATE_DIR} is the APPLICATION'S OWN DATA DIRECTORY and is writable by the
+  // application user — update.sh says so itself, in the comment that moved the environment
+  // snapshot out of it. Putting the identity there would hand the account this recovers FROM the
+  // ability to aim the recovery re-fence at a database of its choosing.
+  //
+  // MUTATION ROUTE: point DB_FENCE_RECOVERY_DIR at "${CUTOVER_STATE_DIR}/recovery" and the first
+  // assertion fails, naming the line.
+  const line = UPDATE_LINES.find((candidate) => /^DB_FENCE_RECOVERY_DIR=/.test(candidate))
+  assert.ok(line !== undefined, 'update.sh must resolve a recovery directory')
+  assert.match(line, /^DB_FENCE_RECOVERY_DIR="\/etc\/[^$]*"$/, `it must be a literal outside the application's tree: ${line}`)
+  assert.ok(!/CUTOVER_STATE_DIR|APP_DIR|DATA_DIR|\$\{IMS_/.test(line), `and not derived from anything the application can move: ${line}`)
+
+  // AND IT IS CREATED ROOT-OWNED. 0755 rather than the snapshot directory's 0700 because the
+  // fence runs AS THE APPLICATION USER and has to read both files; neither holds a secret.
+  const publish = shellFunction(UPDATE_LINES.join('\n'), 'publish_fence_recovery_record')
+  assert.match(publish, /chown root:root "\$\{DB_FENCE_RECOVERY_DIR\}"/, 'the recovery directory must be root-owned')
+  assert.match(publish, /chmod 755 "\$\{DB_FENCE_RECOVERY_DIR\}"/, 'and traversable by the account that runs the fence')
+  // THE CREDENTIAL IS NOT IN IT. A record that carried DEPLOY_ADMIN_DATABASE_URL would be a
+  // password in a world-readable file, and the whole point of the split is that the identity is
+  // durable state and the credential is an invocation argument.
+  assert.ok(
+    !/DEPLOY_ADMIN_DATABASE_URL|DATABASE_URL=/.test(publish),
+    `no credential may be written into the recovery record:\n${publish}`,
+  )
 })
 
 test('every shape of an unreadable .env is refused at the gate, not during initialisation', () => {

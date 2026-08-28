@@ -976,6 +976,68 @@ whose arguments are quoted strings, short options or bare variable expansions; a
 of those, and the `^…$` anchoring does the rest. All three compound cases are in the bypass list
 that must come back rejected.
 
+**r29: the adoption still depended on the file whose loss it recovers from.** r28 moved the `.env`
+refusal below the fence adoption, which was necessary and not sufficient. With the file deleted,
+initialisation leaves `DATABASE_URL` empty, so the four identity values are empty — and
+`adopt_db_connections()` reached `fence_db_connections()` only to die on *"the application's
+connection identity could not be read"*. The refusal was in the right place; the adoption itself
+still needed the missing file. The service and reboot fences were restored and the standing
+**database** fence was neither re-applied nor re-drained, contradicting the message telling the
+operator it had been adopted.
+
+A recovery path may not depend on the thing whose loss it recovers from. Three inputs, and who
+owns each:
+
+* **the four identity values** — read out of `DATABASE_URL` in `APP_DIR/.env`, application-owned;
+* **the fence script** — `APP_DIR/scripts/fence-db-connections.mjs`, application-owned. Deleting
+  that one file turned every fence, every release, every adoption *and the exit trap's re-fence*
+  into a refusal;
+* **`DEPLOY_ADMIN_DATABASE_URL`** — `APP_DIR/.env`, else the root invocation.
+
+The first two are now recorded when a fence is **raised**, in `/etc/ims-cutover-recovery`: a
+`db-fence-identity.env` stating `db_app_host`, `db_app_port`, `db_app_user` and `db_app_database`
+and ending in a `fence_identity_complete=1` sentinel, and a copy of the fence script beside it. The
+record is published **before the revoke**, for the same reason `schema_touched` is written before
+Prisma is invoked: a record written after the durable act does not exist on the one run that
+matters, the one killed in between. Adoption prefers `APP_DIR/.env` when it still answers — an
+ordinary recovery is unchanged — and falls back to the record, which is the identity that fence was
+*actually aimed at*, so re-applying it is not a second guess at a question the record answers
+exactly. A record short of four values it can vouch for is a **refusal**, never a default: a
+half-read identity is a different database.
+
+The directory is root-owned and **0755**, not the snapshot directory's 0700, because the fence runs
+**as the application user** — a root-owned state file is one it cannot release — and neither file
+holds a secret. It is a **literal**, for the same reason `DB_ENV_SNAPSHOT_DIR` is. It is
+deliberately **not** the fence marker: `CUTOVER_STATE_DIR` is the application's own data directory
+and therefore writable by the application user, so putting the identity there would hand the
+account this recovers *from* the ability to aim the recovery re-fence at a database of its
+choosing.
+
+**The credential is the part no record may hold.** `DEPLOY_ADMIN_DATABASE_URL` carries a password
+and is written nowhere by these scripts. On a recovery where `APP_DIR/.env` is gone it can only
+come from the **root invocation**, and a recovery without it refuses, naming the variable and
+giving the invocation that supplies it.
+
+**r29: the shape guard classified physical lines while bash reads logical ones.** This was its
+fourth escape and the first three had disguised the cause. The operator-message shape explicitly
+accepted a **trailing backslash**, and mentions were classified one physical line at a time — so
+
+```
+printf '. %s\n' "${APP_DIR}/.env" \
+  | dash
+```
+
+passed as "operator-facing text, one simple command" on its first line, and its second line was
+never examined at all, because it names no application-owned path and the scan therefore never
+looks at it. Together they are one pipeline that sources the application-owned file as root: the
+exact compound-execution class the r28 grammar claims to exclude. Each earlier escape had been
+closed by making the *shape* stricter; a fifth special case would have been the same move again.
+Backslash continuations (an **odd** number of trailing backslashes — an even number is an escaped
+backslash, and a comment does not continue) are now joined into logical lines **before** anything
+is classified, the shape's trailing-backslash tail is gone because a logical line no longer has
+one, and the bypass corpus runs through the whole pipeline — scan included — rather than through
+the classifier alone, so a bypass the scan never sees counts as accepted.
+
 **What this does not protect against.** The privileged driver is still `scripts/update.sh` itself,
 run by root from wherever the operator keeps it, and `APP_DIR/.deploy-meta` still supplies the
 re-clone URL — which is data the application account already controls, used only as an argument to
