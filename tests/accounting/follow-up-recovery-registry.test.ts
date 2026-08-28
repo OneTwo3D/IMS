@@ -4,6 +4,8 @@ import path from 'node:path'
 import test from 'node:test'
 import ts from 'typescript'
 
+import { followUpObligationRecoveryNote } from '@/lib/domain/accounting/back-reference'
+import { xeroRetainedFollowUpObligationDescription } from '@/lib/connectors/xero/sync-processor'
 import {
   ACCOUNTING_FOLLOW_UP_RECOVERY,
   CONNECTORS_WITHOUT_FOLLOW_UP_CONSUMER,
@@ -810,7 +812,8 @@ function destructuredMarkerAliases(sourceFile: ts.SourceFile): Set<string> {
  */
 function soleReturnExpression(fn: ts.Node): ts.Expression | null {
   if (ts.isArrowFunction(fn) && !ts.isBlock(fn.body)) return fn.body
-  const body = (ts.isArrowFunction(fn) || ts.isFunctionExpression(fn) || ts.isFunctionDeclaration(fn))
+  const body = (ts.isArrowFunction(fn) || ts.isFunctionExpression(fn) || ts.isFunctionDeclaration(fn)
+    || ts.isMethodDeclaration(fn))
     ? fn.body
     : undefined
   if (!body || !ts.isBlock(body)) return null
@@ -891,6 +894,30 @@ function calleeFunction(
       seen.add(`fn:${callee.text}`)
       const inner = resolve(bound, bindings, seen)
       if (ts.isArrowFunction(inner) || ts.isFunctionExpression(inner)) return inner
+    }
+  }
+  // `predicates.stale(cutoff)` — A METHOD ON A LOCALLY DECLARED OBJECT (o3d-0bfh r11, Codex MEDIUM).
+  //
+  // Only bare identifier calls were followed, so a predicate builder reached through a property
+  // access resolved to nothing at all — and that nothing was accepted twice over, exactly as the
+  // r10 finding described for functions: `predicateClauses` produced an unresolved expression which
+  // `couldConcernMarker` then cleared because neither the call text nor (there being no callee) any
+  // body named the column, while the literal inside the method was visited on its own, OUTSIDE
+  // predicate context, where the judge runs non-strictly and lets a call operand through. Two
+  // fail-open answers agreeing, in a different syntax.
+  if (ts.isPropertyAccessExpression(callee)) {
+    const owner = resolve(callee.expression, bindings, seen)
+    if (ts.isObjectLiteralExpression(owner)) {
+      for (const member of owner.properties) {
+        if (keyOf(member, bindings) !== callee.name.text) continue
+        // `{ stale(c) { ... } }`
+        if (ts.isMethodDeclaration(member)) return member
+        // `{ stale: (c) => ({ ... }) }`
+        if (ts.isPropertyAssignment(member)) {
+          const value = resolve(member.initializer, bindings, seen)
+          if (ts.isArrowFunction(value) || ts.isFunctionExpression(value)) return value
+        }
+      }
     }
   }
   return null
@@ -1513,8 +1540,11 @@ const BANNED_OPERATOR_INSTRUCTIONS: Array<{ pattern: RegExp; why: string }> = [
     why: 'same: it authorises a hand-made payment that no request id can deduplicate',
   },
   {
-    pattern: /register the receipt in QuickBooks by hand/i,
-    why: 'a payment created in the QuickBooks UI cannot be deduplicated against the queued row',
+    // NOT pinned to one accounting package (o3d-0bfh r11, Codex HIGH). The Xero processor shipped
+    // "register the receipt in Xero by hand" through the round that grew this list to eleven, and a
+    // pattern naming QuickBooks could not see it. The instruction is the danger, not the vendor.
+    pattern: /register the (receipt|payment) in \w+ by hand/i,
+    why: 'a payment created in the accounting package\'s UI cannot be deduplicated against the queued row',
   },
   {
     pattern: /re-run the invoice sync/i,
@@ -1918,6 +1948,41 @@ test('[o3d-0bfh r9] the marker scan REFUSES the shapes it cannot read, instead o
       what: 'raw SQL composed from a column constant',
       code: 'const MARKER_COLUMN = "backReferenceFollowUpsPendingAt"; await db.$queryRaw(sql`SELECT 1 FROM "accounting_sync_logs" WHERE "${MARKER_COLUMN}" < $1`)',
     },
+    {
+      // CODEX r10 MEDIUM. `calleeFunction` followed BARE IDENTIFIER calls only, so a predicate
+      // builder reached through a property access resolved to nothing — and that nothing was
+      // accepted twice over, exactly as r10 described for plain functions: `predicateClauses`
+      // handed back an unresolved expression, `couldConcernMarker` cleared it because neither the
+      // call text nor (there being no callee) any body named the column, and the literal inside the
+      // method was visited on its own OUTSIDE predicate context, where the judge runs non-strictly
+      // and lets a call operand through. Same two fail-open answers, different syntax.
+      what: 'A LOCAL OBJECT METHOD RETURNING THE WHOLE WHERE CLAUSE',
+      code: 'const predicates = { stale(cutoff) { return { backReferenceFollowUpsPendingAt: olderThan(cutoff) } } }\n'
+        + 'await db.accountingSyncLog.findMany({ where: predicates.stale(cutoff) })',
+    },
+    {
+      what: 'the same method written as an arrow property',
+      code: 'const predicates = { stale: (cutoff) => ({ backReferenceFollowUpsPendingAt: olderThan(cutoff) }) }\n'
+        + 'await db.accountingSyncLog.findMany({ where: predicates.stale(cutoff) })',
+    },
+    {
+      what: 'a local object method returning a whole clause into an AND array',
+      code: 'const predicates = { stale(cutoff) { return { backReferenceFollowUpsPendingAt: { lt: cutoff } } } }\n'
+        + 'await db.accountingSyncLog.findMany({ where: { AND: [predicates.stale(cutoff)] } })',
+    },
+    {
+      // The method equivalent of the two-return helper: unreadable, and named on the marker only
+      // through the body the property access now reaches. Invisible to every other check.
+      what: 'a local object method with two returns, so the clause it builds is unknowable',
+      code: 'const predicates = { stale(c, flag) { if (flag) { return { backReferenceFollowUpsPendingAt: olderThan(c) } }\n'
+        + ' return { backReferenceFollowUpsPendingAt: notOlderThan(c) } } }\n'
+        + 'await db.accountingSyncLog.findMany({ where: predicates.stale(c, true) })',
+    },
+    {
+      what: 'a local object method producing only the OPERAND',
+      code: 'const predicates = { staleAt(cutoff) { return { lt: cutoff } } }\n'
+        + 'await db.accountingSyncLog.findMany({ where: { backReferenceFollowUpsPendingAt: predicates.staleAt(cutoff) } })',
+    },
   ]
   for (const { what, code } of refused) {
     const offences = markerClockReads(code, 'control.ts')
@@ -1981,4 +2046,128 @@ test('[o3d-0bfh r9] the marker scan REFUSES the shapes it cannot read, instead o
       `the scan refused ${what}, which is the protocol's own use:\n${code}`,
     )
   }
+})
+
+// ---------------------------------------------------------------------------
+// o3d-0bfh r11 (Codex HIGH) — THE CONTRACT COVERS THE STRINGS IT IS POINTED AT.
+//
+// r10 grew THE ONE LIST from three patterns to eleven and ran it over the registry strings, the
+// exception inbox, help-docs/xero-sync.md, lib/connectors/quickbooks/sync-processor.ts and
+// lib/domain/accounting/back-reference.ts. Through that same round the XERO processor shipped
+//
+//     "Re-run the invoice sync for this reference, or register the receipt in Xero by hand."
+//
+// on the connector where the automatic retry actually exists — so the instruction races a queued
+// re-enqueue and produces a second, undeduplicable payment. Two of the eleven patterns match that
+// sentence. Neither ever saw it, because the scan named two files and this was in a third.
+//
+// So the list is now pointed at the PRODUCERS: every activity string an operator can receive on
+// this path, taken from the function that composes it, plus a whole-file scan of BOTH connector
+// sync-processors so a string nobody thought to extract cannot hide behind the ones that were.
+// ---------------------------------------------------------------------------
+
+/**
+ * EVERY OPERATOR-FACING STRING THIS PATH CAN PRODUCE, taken from its producer at runtime.
+ *
+ * Not from the constants they are built out of, and not from a source scan: a source scan cannot
+ * see a sentence composed at call time, and a constant scan cannot see one composed from two safe
+ * halves. `mustEscalate` marks the strings that have to say what to do INSTEAD, so "delete the
+ * sentence and say nothing" is not a passing fix.
+ */
+function activityProducers(): Array<{ what: string; text: string; mustEscalate: boolean }> {
+  const produced: Array<{ what: string; text: string; mustEscalate: boolean }> = []
+
+  // 1. THE XERO RETAINED-OBLIGATION ACTIVITY — the producer this finding is about, at runtime.
+  produced.push({
+    what: 'xeroRetainedFollowUpObligationDescription (the xero_followup_obligation_retained activity)',
+    text: xeroRetainedFollowUpObligationDescription('log-xero-1'),
+    mustEscalate: true,
+  })
+
+  // 2. THE SHARED RECOVERY NOTE, for every connector the registry declares AND the fallback — this
+  //    is the string every console.error on the release path composes, and the one the Xero
+  //    activity above now interpolates instead of writing prose of its own.
+  for (const connector of [...Object.keys(ACCOUNTING_FOLLOW_UP_RECOVERY), UNDECLARED_CONNECTOR]) {
+    produced.push({
+      what: `followUpObligationRecoveryNote for ${connector}`,
+      text: followUpObligationRecoveryNote(followUpObligationRecoveryFor(connector)),
+      mustEscalate: false,
+    })
+  }
+  return produced
+}
+
+test('[o3d-0bfh r11] every activity string an operator can receive is judged by THE ONE LIST, taken from its producer', () => {
+  // Route: xeroRetainedFollowUpObligationDescription() — the function that composes the
+  // `xero_followup_obligation_retained` activity description — plus
+  // followUpObligationRecoveryNote() for every registry connector and the undeclared fallback.
+  //
+  // Mutation: restore either half of the shipped sentence — "Re-run the invoice sync for this
+  // reference" or "register the receipt in Xero by hand" — to the Xero producer and this fails
+  // naming the producer. Drop the escalation and the escalate assertion fails, so removing the
+  // instruction without replacing it is not a passing fix either.
+  const produced = activityProducers()
+  assert.equal(
+    produced.length, Object.keys(ACCOUNTING_FOLLOW_UP_RECOVERY).length + 2,
+    'one Xero activity plus the shared note for every registry connector and the fallback',
+  )
+  for (const { what, text, mustEscalate } of produced) {
+    assert.ok(text.length > 0, `${what} must actually produce a string, or this scan reads nothing`)
+    assertNoBannedInstruction(what, text)
+    if (mustEscalate) assert.match(text, /ESCALATE/i, `${what} must say what to do instead: escalate`)
+  }
+
+  // NON-VACUITY, on the exact producer the finding named: THE ONE LIST must be able to reject the
+  // sentence that shipped. Composed from the shipped string so the control cannot rot into a test
+  // of a hardcoded paragraph.
+  const shipped = xeroRetainedFollowUpObligationDescription('log-xero-1')
+  for (const phrase of [
+    ' Re-run the invoice sync for this reference',
+    ' Or register the receipt in Xero by hand',
+    ' This still has to be re-driven by hand',
+  ]) {
+    assert.throws(
+      () => assertNoBannedInstruction('the mutated Xero activity description', shipped + phrase),
+      /banned operator instruction/,
+      `THE ONE LIST must reject "${phrase.trim()}" in the Xero activity description — this is the surface `
+        + 'that shipped it through the round that grew the list to eleven',
+    )
+  }
+
+  // AND THE UNSETTLED-OUTCOME CONTROL Codex asked for: this producer is reached ONLY when the
+  // deferred receipts are NOT settled, so the string above IS the unsettled outcome. It must name
+  // the outstanding receipt — otherwise "make it safe" could be satisfied by making it say nothing.
+  assert.match(shipped, /receipt recorded before this invoice is still not registered/)
+  assert.match(shipped, /deliberately left marked as owing follow-ups/)
+  // ...and it must say what DOES re-drive it, from the registry rather than from prose here.
+  assert.match(
+    shipped, /a later sweep re-reads the marker and re-enqueues them idempotently/,
+    'the recovery half must be the registry\'s declared fact for this connector, not a sentence written in the processor',
+  )
+})
+
+test('[o3d-0bfh r11] BOTH connector sync-processors are scanned whole, so an unextracted string cannot hide behind an extracted one', () => {
+  // The producer test above can only judge the producers somebody named. This one judges the files,
+  // for exactly the reason r10 failed: the list was pointed at two connector files and the sentence
+  // was in the third.
+  //
+  // Route: lib/connectors/xero/sync-processor.ts and lib/connectors/quickbooks/sync-processor.ts,
+  // executable source with comments stripped and string CONTENTS kept.
+  //
+  // Mutation: put "Re-run the invoice sync for this reference, or register the receipt in Xero by
+  // hand." back into the Xero processor and this fails naming the file.
+  const sources = [
+    readSource(path.join(REPO_ROOT, 'lib', 'connectors', 'xero', 'sync-processor.ts')),
+    readSource(path.join(REPO_ROOT, 'lib', 'connectors', 'quickbooks', 'sync-processor.ts')),
+  ]
+  for (const source of sources) assertNoBannedInstruction(source.rel, source.code)
+
+  // CONTROLS: the scanner read the files it names, and the Xero one carries the REPLACEMENT rather
+  // than merely having lost the sentence.
+  assert.match(sources[0]!.code, /xeroRetainedFollowUpObligationDescription/, 'the Xero producer must be the thing there')
+  assert.match(
+    sources[0]!.code, /followUpObligationRecoveryNote\(followUpObligationRecoveryFor\(XERO_CONNECTOR\)\)/,
+    'and its recovery guidance must come from the registry',
+  )
+  assert.match(sources[1]!.code, /HOW FAR IT GOT IS NOT KNOWN FROM HERE/)
 })

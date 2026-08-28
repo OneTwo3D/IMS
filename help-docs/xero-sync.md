@@ -1459,6 +1459,17 @@ of the list, and each row carries the connector's own wording — both read from
 `lib/domain/accounting/follow-up-obligation-registry.ts`, which is the only place this instruction is
 written down.)
 
+**On Xero the same marker means something different — and still nothing to do.** Xero *does* have a
+back-reference repair sweep bound (`repairXeroBackReferences`, run by the accounting-sync cron and by
+a manual sync), so a Xero row whose deferred receipt is still unregistered is retained *work* rather
+than stranded work: the sweep re-reads the marker and re-enqueues the follow-ups idempotently, and
+the `xero_followup_obligation_retained` activity now says exactly that. It used to tell the operator
+to drive the sync for that reference again or settle the receipt themselves — which on this connector
+is the *worse* advice, because the automatic retry really does exist and a settlement made in the
+Xero UI races work already queued, producing a second payment no request id can deduplicate. If a row
+is still marked after the next accounting-sync run, read the invoice in Xero, record what is present,
+and escalate that reading.
+
 **When the id itself is the blocker.** One case cannot be resolved by linking the document by hand:
 the write was refused because *another local record already holds that id* — typically a bill from a
 QuickBooks company you are no longer connected to, whose integer the new company has since reissued.
