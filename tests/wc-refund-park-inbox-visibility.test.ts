@@ -275,7 +275,14 @@ mock.module('@/lib/auth/server', {
     freshAuthFailureResult: () => null,
   },
 })
-mock.module('@/lib/activity-log', { namedExports: { logActivity: async (entry: Record<string, unknown>) => { state.activity.push(entry) } } })
+mock.module('@/lib/activity-log', {
+  namedExports: {
+    logActivity: async (entry: Record<string, unknown>) => { state.activity.push(entry) },
+    // o3d-xnwu r14: the recovery's witness is written INSIDE its transaction now, so this seam has
+    // to exist here too — the real one does not catch, and neither does this.
+    logActivityInTransaction: async (_tx: unknown, entry: Record<string, unknown>) => { state.activity.push(entry) },
+  },
+})
 mock.module('next/cache', { namedExports: { revalidatePath: () => {} } })
 mock.module('@/lib/connectors/woocommerce/api', {
   namedExports: {
