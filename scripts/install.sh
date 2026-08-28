@@ -633,7 +633,12 @@ LEGACY_CRON_BACKUP="${LEGACY_CUTOVER_STATE_DIR}/crontab-${APP_USER}.bak"
 LEGACY_DB_FENCE_STATE="${LEGACY_CUTOVER_STATE_DIR}/db-connect-fence.json"
 DB_FENCE_SCRIPT="${APP_DIR}/scripts/fence-db-connections.mjs"
 DB_OBJECT_ACCESS_SCRIPT="${APP_DIR}/scripts/check-app-db-object-access.mjs"
-DB_FENCE_RELEASE_CMD="node ${DB_FENCE_SCRIPT} --release --state-file=${DB_FENCE_STATE}"
+# WHICH UNIT THE FENCE ASKS SYSTEMD ABOUT (o3d-2sm1.5 r18, Codex r17 CRITICAL). This script GENERATES
+# /etc/systemd/system/${APP_NAME}.service, so it is the one place that knows the unit name for
+# certain — and the fence only ever runs on an upgrade cutover, where that unit already exists (a
+# FIRST install has no database to hold closed and never reaches it; see require_fenceable_database).
+DB_FENCE_UNIT_ARG="--service-unit=${APP_NAME}.service"
+DB_FENCE_RELEASE_CMD="node ${DB_FENCE_SCRIPT} --release --state-file=${DB_FENCE_STATE} ${DB_FENCE_UNIT_ARG}"
 # Is the reboot fence ACTUALLY loaded by systemd right now? Distinct from FENCE_ARMED, which
 # only says this run has stopped something: the failure banner used to describe a drop-in that
 # may never have been installed (o3d-2sm1.5, Codex r4 HIGH).
@@ -1306,7 +1311,7 @@ fence_db_connections() {
   ( cd "${APP_DIR}" && run_as_user "${APP_USER}" env \
       DATABASE_URL="${DATABASE_URL}" \
       DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-      node "${DB_FENCE_SCRIPT}" --fence --state-file="${DB_FENCE_STATE}" ) || rc=$?
+      node "${DB_FENCE_SCRIPT}" --fence --state-file="${DB_FENCE_STATE}" "${DB_FENCE_UNIT_ARG}" ) || rc=$?
 
   case "${rc}" in
     0)
@@ -1320,7 +1325,7 @@ fence_db_connections() {
       MIGRATION_DATABASE_URL="$( cd "${APP_DIR}" && run_as_user "${APP_USER}" env \
         DATABASE_URL="${DATABASE_URL}" \
         DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-        node "${DB_FENCE_SCRIPT}" --print-migration-url )" || die \
+        node "${DB_FENCE_SCRIPT}" --print-migration-url "${DB_FENCE_UNIT_ARG}" )" || die \
         "The connection fence is up but the migration URL could not be composed, so the migration would run as the deploy admin and create objects the application cannot use. Nothing has been migrated; release the fence with: ${DB_FENCE_RELEASE_CMD}"
       [[ -n "${MIGRATION_DATABASE_URL}" ]] || die \
         "The connection fence is up but --print-migration-url produced nothing. Nothing has been migrated; release the fence with: ${DB_FENCE_RELEASE_CMD}"
@@ -1391,7 +1396,7 @@ require_fenceable_database() {
   ( cd "${APP_DIR}" && run_as_user "${APP_USER}" env \
       DATABASE_URL="${DATABASE_URL}" \
       DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-      node "${DB_FENCE_SCRIPT}" --preflight ) || rc=$?
+      node "${DB_FENCE_SCRIPT}" --preflight "${DB_FENCE_UNIT_ARG}" ) || rc=$?
   [[ "${rc}" -eq 0 ]] || die \
     "The migration window could NOT be fenced (fence preflight exit ${rc}); the reason is printed above. Refusing to migrate an EXISTING installation. Nothing has been stopped and nothing has been migrated."
 
@@ -1413,7 +1418,7 @@ release_db_connections() {
   ( cd "${APP_DIR}" && run_as_user "${APP_USER}" env \
       DATABASE_URL="${DATABASE_URL}" \
       DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-      node "${DB_FENCE_SCRIPT}" --release --state-file="${DB_FENCE_STATE}" ) || rc=$?
+      node "${DB_FENCE_SCRIPT}" --release --state-file="${DB_FENCE_STATE}" "${DB_FENCE_UNIT_ARG}" ) || rc=$?
 
   if [[ "${rc}" -eq 0 ]]; then
     MIGRATION_DATABASE_URL="${DATABASE_URL}"
@@ -1470,7 +1475,7 @@ refence_db_connections() {
   ( cd "${APP_DIR}" && run_as_user "${APP_USER}" env \
       DATABASE_URL="${DATABASE_URL}" \
       DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-      node "${DB_FENCE_SCRIPT}" --fence --state-file="${DB_FENCE_STATE}" ) || rc=$?
+      node "${DB_FENCE_SCRIPT}" --fence --state-file="${DB_FENCE_STATE}" "${DB_FENCE_UNIT_ARG}" ) || rc=$?
   # EVERY POST-COMMIT RESULT RAISES THE STICKY FLAG (o3d-2sm1.5, Codex r13 HIGH). Exit 5 says
   # the REVOKEs are COMMITTED and standing: this call could not call the database fenced, but it
   # certainly fenced something, and DB_FENCE_RAISED is the flag that decides whether a later
@@ -1500,7 +1505,7 @@ refence_db_connections() {
   MIGRATION_DATABASE_URL="$( cd "${APP_DIR}" && run_as_user "${APP_USER}" env \
     DATABASE_URL="${DATABASE_URL}" \
     DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-    node "${DB_FENCE_SCRIPT}" --print-migration-url )" || url_rc=$?
+    node "${DB_FENCE_SCRIPT}" --print-migration-url "${DB_FENCE_UNIT_ARG}" )" || url_rc=$?
   if [[ "${url_rc}" -ne 0 || -z "${MIGRATION_DATABASE_URL}" ]]; then
     MIGRATION_DATABASE_URL=""
     warn "--print-migration-url refused to compose a migration URL (exit ${url_rc}); NOT falling back to DEPLOY_ADMIN_DATABASE_URL. The fence is up."
@@ -1809,7 +1814,7 @@ on_cutover_exit() {
       error "  The only thing keeping it off is that ${APP_NAME}.service is stopped and fenced"
       error "  against a reboot. Do NOT start it. Close the database by hand, or re-run this"
       error "  installer, which re-establishes the fence before it migrates:"
-      error "    node ${DB_FENCE_SCRIPT} --fence --state-file=${DB_FENCE_STATE}"
+      error "    node ${DB_FENCE_SCRIPT} --fence --state-file=${DB_FENCE_STATE} ${DB_FENCE_UNIT_ARG}"
     fi
   else
     release_db_connections || true

@@ -457,7 +457,23 @@ fi
 CRON_BACKUP="${CUTOVER_STATE_DIR}/crontab-${APP_USER}.bak"
 LEGACY_CRON_BACKUP="${LEGACY_CUTOVER_STATE_DIR}/crontab-${APP_USER}.bak"
 DB_FENCE_SCRIPT="${APP_DIR_REAL}/scripts/fence-db-connections.mjs"
-DB_FENCE_RELEASE_CMD="node ${DB_FENCE_SCRIPT} --release --state-file=${DB_FENCE_STATE}"
+# WHICH UNIT THE FENCE ASKS SYSTEMD ABOUT (o3d-2sm1.5 r18, Codex r17 CRITICAL).
+#
+# The helper no longer reads the service's environment out of a file it guesses at, and it no
+# longer takes the path to that file from its own environment — a stale IMS_SERVICE_ENV_FILE in
+# an operator shell or a cron wrapper could redirect every mode of it at an unrelated cluster.
+# It asks `systemctl show <unit>`, and the unit NAME comes from here: the same SERVICE_UNITS this
+# script already stops, drains and restarts. Filled in after detect_service_units() below, which
+# is why this starts empty and DB_FENCE_RELEASE_CMD is composed twice.
+DB_FENCE_UNIT_ARGS=()
+db_fence_release_cmd() {
+  local args="" unit
+  for unit in "${DB_FENCE_UNIT_ARGS[@]:-}"; do
+    [[ -n "$unit" ]] && args+=" ${unit}"
+  done
+  echo "node ${DB_FENCE_SCRIPT} --release --state-file=${DB_FENCE_STATE}${args}"
+}
+DB_FENCE_RELEASE_CMD="$(db_fence_release_cmd)"
 DB_OBJECT_ACCESS_SCRIPT="${APP_DIR_REAL}/scripts/check-app-db-object-access.mjs"
 
 # Read ONE variable out of .env without `source` (which executes whatever is in the file)
@@ -965,7 +981,7 @@ fence_db_connections() {
 
   local rc=0
   as_app_user env DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-    node "$DB_FENCE_SCRIPT" --fence --state-file="$DB_FENCE_STATE" || rc=$?
+    node "$DB_FENCE_SCRIPT" --fence --state-file="$DB_FENCE_STATE" "${DB_FENCE_UNIT_ARGS[@]:-}" || rc=$?
 
   case "$rc" in
     0)
@@ -978,7 +994,7 @@ fence_db_connections() {
       # the admin URL, so authentication (and therefore the CONNECT the fence revoked) is
       # still the admin's while ownership is the application's.
       MIGRATION_DATABASE_URL="$(as_app_user env DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-        node "$DB_FENCE_SCRIPT" --print-migration-url)" || die \
+        node "$DB_FENCE_SCRIPT" --print-migration-url "${DB_FENCE_UNIT_ARGS[@]:-}")" || die \
         "The connection fence is up but the migration URL could not be composed, so the migration would run as the deploy admin and create objects the application cannot use. Nothing has been migrated; release the fence with: ${DB_FENCE_RELEASE_CMD}"
       [[ -n "$MIGRATION_DATABASE_URL" ]] || die \
         "The connection fence is up but --print-migration-url produced nothing. Nothing has been migrated; release the fence with: ${DB_FENCE_RELEASE_CMD}"
@@ -1052,7 +1068,7 @@ require_fenceable_database() {
     # cannot reach the database must still exit 0, having said so.
     local dry_rc=0
     as_app_user env DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-      node "$DB_FENCE_SCRIPT" --preflight || dry_rc=$?
+      node "$DB_FENCE_SCRIPT" --preflight "${DB_FENCE_UNIT_ARGS[@]:-}" || dry_rc=$?
     if [[ "$dry_rc" -eq 0 ]]; then
       ok "A REAL RUN WOULD BE FENCEABLE: the preflight above asked the database and it answered yes."
     else
@@ -1077,7 +1093,7 @@ require_fenceable_database() {
   # nothing; the only reasons it can fail are the reasons --fence would fail.
   local rc=0
   as_app_user env DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-    node "$DB_FENCE_SCRIPT" --preflight || rc=$?
+    node "$DB_FENCE_SCRIPT" --preflight "${DB_FENCE_UNIT_ARGS[@]:-}" || rc=$?
   [[ "$rc" -eq 0 ]] || die \
     "The migration window could NOT be fenced (fence preflight exit ${rc}); the reason is printed above. Refusing to migrate. Nothing has been stopped and nothing has been migrated."
 
@@ -1102,7 +1118,7 @@ release_db_connections() {
 
   local rc=0
   as_app_user env DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-    node "$DB_FENCE_SCRIPT" --release --state-file="$DB_FENCE_STATE" || rc=$?
+    node "$DB_FENCE_SCRIPT" --release --state-file="$DB_FENCE_STATE" "${DB_FENCE_UNIT_ARGS[@]:-}" || rc=$?
 
   if [[ "$rc" -eq 0 ]]; then
     MIGRATION_DATABASE_URL=""
@@ -1166,7 +1182,7 @@ refence_db_connections() {
 
   local rc=0
   as_app_user env DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-    node "$DB_FENCE_SCRIPT" --fence --state-file="$DB_FENCE_STATE" || rc=$?
+    node "$DB_FENCE_SCRIPT" --fence --state-file="$DB_FENCE_STATE" "${DB_FENCE_UNIT_ARGS[@]:-}" || rc=$?
   # EVERY POST-COMMIT RESULT RAISES THE STICKY FLAG (o3d-2sm1.5, Codex r13 HIGH). Exit 5 says
   # the REVOKEs are COMMITTED and standing: this call could not call the database fenced, but it
   # certainly fenced something, and DB_FENCE_RAISED is the flag that decides whether a later
@@ -1194,7 +1210,7 @@ refence_db_connections() {
   # leave it empty instead: the fence is up, and nothing this trap does next needs the URL.
   local url_rc=0
   MIGRATION_DATABASE_URL="$(as_app_user env DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-    node "$DB_FENCE_SCRIPT" --print-migration-url)" || url_rc=$?
+    node "$DB_FENCE_SCRIPT" --print-migration-url "${DB_FENCE_UNIT_ARGS[@]:-}")" || url_rc=$?
   if [[ "$url_rc" -ne 0 || -z "$MIGRATION_DATABASE_URL" ]]; then
     MIGRATION_DATABASE_URL=""
     warn "--print-migration-url refused to compose a migration URL (exit ${url_rc}); NOT falling back to DEPLOY_ADMIN_DATABASE_URL. The fence is up."
@@ -1646,7 +1662,7 @@ on_exit() {
           echo -e "${RED}  stopped and fenced against a reboot. Do NOT start it. Close the database by${RESET}" >&2
           echo -e "${RED}  hand, or re-run this script, which re-establishes the fence before it${RESET}" >&2
           echo -e "${RED}  rebuilds:${RESET}" >&2
-          echo -e "${RED}    node ${DB_FENCE_SCRIPT} --fence --state-file=${DB_FENCE_STATE}${RESET}" >&2
+          echo -e "${RED}    node ${DB_FENCE_SCRIPT} --fence --state-file=${DB_FENCE_STATE} ${DB_FENCE_UNIT_ARGS[*]:-}${RESET}" >&2
         fi
       else
         release_db_connections || true
@@ -1701,6 +1717,15 @@ fi
 if [[ "${#SERVICE_UNITS[@]}" -eq 1 && -z "${SERVICE_UNITS[0]}" ]]; then
   SERVICE_UNITS=()
 fi
+
+# The fence helper asks systemd about exactly these units. Every one of them serves this app dir
+# and therefore writes to this database, so all of them are named and the helper refuses if two
+# of them disagree about PGHOST/PGPORT/PGUSER/PGDATABASE.
+DB_FENCE_UNIT_ARGS=()
+for unit in "${SERVICE_UNITS[@]:-}"; do
+  [[ -n "$unit" ]] && DB_FENCE_UNIT_ARGS+=("--service-unit=${unit}")
+done
+DB_FENCE_RELEASE_CMD="$(db_fence_release_cmd)"
 
 if [[ "${#SERVICE_UNITS[@]}" -gt 0 ]]; then
   info "Launcher: systemd — ${SERVICE_UNITS[*]}"

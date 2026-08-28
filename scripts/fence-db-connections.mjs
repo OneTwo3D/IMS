@@ -140,68 +140,406 @@
 // than the fenced snapshot.
 // =============================================================================
 
+import { spawnSync } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { userInfo } from 'node:os'
 import { dirname, resolve as resolvePath } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
-import { config as loadDotenv, parse as parseEnvFile } from 'dotenv'
+import { config as loadDotenv } from 'dotenv'
 import pg from 'pg'
 
 // ---------------------------------------------------------------------------
-// WHOSE ENVIRONMENT DECIDES WHERE THIS SCRIPT LOOKS (o3d-2sm1.5, Codex r17 CRITICAL)
+// WHOSE ENVIRONMENT DECIDES WHERE THIS SCRIPT LOOKS (o3d-2sm1.5, Codex r18)
 //
 // r16 moved identity onto the driver, which was right: `pg` fills every value a URL omits from
 // `PGHOST`, `PGPORT`, `PGUSER` and `PGDATABASE` before it dials, so nothing short of the driver
-// can say where a URL lands. What r16 did not ask is WHOSE `PGHOST` it was reading.
+// can say where a URL lands. r17 asked whose `PGHOST` that was — the deploy shell's, not the
+// service's — and that was right too. What r17 then did was WRITE ITS OWN systemd: it read
+// `<app dir>/.env` with dotenv and called the result "the environment the unit is given". That is
+// rounds 13-16 again with a new spec. Those rounds were all one mistake — our reimplementation of
+// the DRIVER's URL parsing disagreed with the driver — and it was settled by asking the driver.
+// Reimplementing systemd's `EnvironmentFile` grammar (quoting, escaping, continuation, `-`
+// prefixes, later-file-wins, `Environment=`, drop-ins layered over all of it) is the same trap:
+// dotenv reads `PGUSER=ims#writer` as `ims`, systemd reads it as `ims#writer`, and BOTH are legal
+// PostgreSQL roles — so the fence revokes CONNECT from one while the service keeps connecting as
+// the other.
 //
-// THE APPLICATION DOES NOT INHERIT THE DEPLOY SHELL'S ENVIRONMENT. It is started by systemd from
-// a unit whose whole environment is `Environment=` plus `EnvironmentFile=-<app dir>/.env`; the
-// deploy, update and install shells run this helper through `runuser ... env` with their own
-// environment intact, and `loadDotenv({ override: false })` below deliberately lets that ambient
-// copy win. So an operator shell — or a cron wrapper, or a `.bashrc` — carrying `PGPORT=6432`
-// while the service file carries none made this script resolve identity against 6432 while the
-// application connected to 5432. The gate then compared two URLs that agreed with each other,
-// the fence revoked CONNECT on 6432, and the migration ran there, while the real database stayed
-// open and unmigrated for the length of the window. THE MORE FAITHFULLY IT FOLLOWED THE DRIVER,
-// THE MORE FAITHFULLY IT FOLLOWED THE WRONG ENVIRONMENT.
+// SO THE AUTHORITY IS ASKED. `systemctl show <unit>` reports what systemd resolved: the unit's
+// `Environment=` with every drop-in already layered in the right order, the ordered
+// `EnvironmentFiles=` list with each entry's `ignore_errors` flag, the `User=` the service runs
+// as, and the `WorkingDirectory=` that says which app dir this unit is. Nothing here reconstructs
+// any of that.
 //
-// So the four variables that move a connection are RECONSTRUCTED FROM THE SERVICE'S OWN
-// ENVIRONMENT FILE before anything is resolved, connected, fenced or released: whatever this
-// process inherited is DELETED, and whatever the file the unit is given defines is put back. The
-// deploy shell keeps every other variable it passes deliberately — `DEPLOY_ADMIN_DATABASE_URL`
-// above all, which is the deploy's own and has no business coming from the application's file.
+// AND THE ONE THING SYSTEMD WILL NOT TELL US IS REFUSED RATHER THAN GUESSED (verified against
+// this host's real units, read-only, 2026-08-28):
 //
-// AND WHEN THE FILE CANNOT BE READ, THIS REFUSES. Not "fall back to the ambient environment",
-// which is the defect; not "assume none are set", which is a guess about the very thing that was
-// wrong. An unreadable service environment means this script cannot say where the application
-// connects, and every mode of this script exists to answer exactly that.
+//     $ systemctl show ims-stage-dev.service -p Environment -p EnvironmentFiles
+//     Environment=NODE_ENV=development ... NPM_CONFIG_CACHE=/opt/ims/onetwo3d-ims/.npm-cache
+//     EnvironmentFiles=/opt/ims/onetwo3d-ims/.env (ignore_errors=yes)
 //
-// WHY THE FILE AND NOT `systemctl show`. The file is what the unit is generated with
-// (`EnvironmentFile=-${APP_DIR}/.env`, scripts/install.sh), it is where DATABASE_URL itself comes
-// from, and it is readable at first install — before any unit exists — which is when
-// scripts/install.sh runs the preflight. A `PG*` set in a unit `Environment=` line or a drop-in
-// is therefore OUTSIDE what this reconstructs; the generated unit sets none, and the identity
-// gate's own two-URL comparison is what catches a disagreement it cannot see the cause of.
+// `Environment=` is the `Environment=` DIRECTIVES ONLY. systemd reads an `EnvironmentFile` when it
+// forks the service, not when it loads the unit, and it never publishes the result: the seven
+// variables above are the unit's own, and the file's contents (23 variables in that service's
+// `/proc/<MainPID>/environ`, `DATABASE_URL` among them) appear in no property systemd exposes. So
+// "ask systemd for the unit's resolved environment" has an authoritative answer for the
+// `Environment=` layer and NO answer at all for the file layer.
+//
+// The file layer is therefore settled by the one question about a file's contents that every
+// grammar answers the same way: DOES THE FILE MENTION THE NAME AT ALL? dotenv, systemd, `sh` and
+// a hand-written parser all agree that a file in which the bytes `PGUSER` never appear does not
+// set `PGUSER`. When none of the four names appears in any file systemd will read, no parsing
+// disagreement is possible and the `Environment=` layer is the whole answer. When one of them
+// DOES appear, this refuses and says to move it into the unit's `Environment=`, where systemd
+// will report it. That is a refusal, not a guess, and it is the only reading that cannot be wrong.
+//
+// A file systemd WILL read and this CANNOT read is a refusal for the same reason (Codex r17
+// CRITICAL): "unreadable" is not "sets none of them". The only skip is the one systemd itself
+// makes — an `EnvironmentFile=-` whose file does not exist.
+//
+// THE SAME SCAN COVERS THE APPLICATION'S OWN DOTENV OVERLAY. `<app dir>/.env.local` and friends
+// never reach systemd at all; Next loads them inside the process, after exec, and a `PGHOST` there
+// would move the application's connection without appearing in any systemd property. It is not
+// parsed either — it is scanned for the same four names and refused on a mention.
+//
+// WHICH UNIT, AND HOW WE KNOW. The unit name is NOT hardcoded here and NOT read from this
+// process's environment (Codex r17 CRITICAL: `IMS_SERVICE_ENV_FILE` came straight off the
+// invoking shell, so a stale variable redirected every mode to an unrelated file). It arrives as
+// `--service-unit=<unit>`, once per unit, from the entrypoint that already knows how it addresses
+// the service: scripts/deploy.sh from its `SERVICE_UNITS` (detected by `WorkingDirectory`, or
+// `IMS_SERVICE_UNIT`), scripts/update.sh from `SERVICE_UNIT`, scripts/install.sh from
+// `${APP_NAME}.service`. No units named is a refusal. Two units that disagree about one of the
+// four is a refusal.
+//
+// AND THE UNIT IS CHECKED TO BE THIS APP'S. systemd's `WorkingDirectory=` must resolve to the
+// directory this script ships in, so being handed the wrong unit name is caught here rather than
+// producing a confident fence against another installation's cluster.
 // ---------------------------------------------------------------------------
 
 /** The four `pg` reads from the environment to decide WHERE a connection lands and AS WHOM. */
 export const IDENTITY_ENVIRONMENT_VARIABLES = ['PGHOST', 'PGPORT', 'PGUSER', 'PGDATABASE']
 
+/** Everything this asks systemd about a unit. `LoadState` is what proves the answer was real. */
+export const UNIT_PROPERTIES = ['LoadState', 'Environment', 'EnvironmentFiles', 'WorkingDirectory', 'User', 'FragmentPath']
+
 /**
- * The file(s) that hold the application service's environment.
+ * The application directory, from THIS FILE'S OWN LOCATION and nothing else.
  *
- * Resolved against THIS SCRIPT's own location, not the working directory: the helper ships at
- * `<app dir>/scripts/fence-db-connections.mjs` and the unit's `EnvironmentFile` is
- * `<app dir>/.env`, so the answer is the same whether the deploy ran `cd` first and whether the
- * operator pasted the printed `--release` command into a shell sitting somewhere else.
- * `IMS_SERVICE_ENV_FILE` overrides it for a non-standard layout, and for the tests.
+ * The helper ships at `<app dir>/scripts/fence-db-connections.mjs`. Deriving the app dir from the
+ * script rather than from `process.cwd()` is what makes every path below — the dotenv loads in
+ * `main()` included — the same whether the deploy ran `cd` first and whether the operator pasted
+ * the printed `--release` command into a shell sitting somewhere else (Codex r17 HIGH).
  */
-export function serviceEnvironmentPaths(env = process.env, scriptUrl = import.meta.url) {
-  if (env.IMS_SERVICE_ENV_FILE) return [env.IMS_SERVICE_ENV_FILE]
-  const appDir = dirname(dirname(fileURLToPath(scriptUrl)))
-  return [resolvePath(appDir, '.env'), resolvePath(appDir, '.env.local')]
+export function appDirectory(scriptUrl = import.meta.url) {
+  return dirname(dirname(fileURLToPath(scriptUrl)))
+}
+
+/**
+ * `systemctl show` output — `Key=Value` per line — as a Map.
+ *
+ * A property whose value is EMPTY is still printed (`Environment=`); a property that does not
+ * apply is OMITTED ENTIRELY (a unit with no `EnvironmentFile=` prints no `EnvironmentFiles=`
+ * line, and neither does a unit that does not exist). Both were measured against this host.
+ * `LoadState` is printed in every case, which is why its ABSENCE is what this reads as "systemd
+ * did not answer" rather than treating an empty answer as an answer.
+ */
+export function parseSystemctlShow(text) {
+  const properties = new Map()
+  for (const line of String(text).split('\n')) {
+    if (line === '') continue
+    const equals = line.indexOf('=')
+    if (equals <= 0) continue
+    properties.set(line.slice(0, equals), line.slice(equals + 1))
+  }
+  return properties
+}
+
+/**
+ * systemd's serialization of `EnvironmentFiles=`: one `<path> (ignore_errors=yes|no)` per line.
+ *
+ * The flag is the `-` prefix in the unit file, and it is the ONLY skip this module honours: a
+ * missing optional file is skipped by systemd too, so skipping it is faithful rather than
+ * permissive. Anything else about a listed file — unreadable, unstattable, present but
+ * unparseable-by-anyone — is a refusal.
+ *
+ * @throws {Error} on a line this cannot read, because an EnvironmentFile it cannot even NAME is
+ *   a file it cannot rule out.
+ */
+export function parseSystemdEnvironmentFiles(value) {
+  const files = []
+  for (const line of String(value ?? '').split('\n')) {
+    const trimmed = line.trim()
+    if (trimmed === '') continue
+    const match = /^(.*) \(ignore_errors=(yes|no)\)$/.exec(trimmed)
+    if (!match) throw new Error(`systemd reported an EnvironmentFiles entry this cannot read: ${JSON.stringify(trimmed)}`)
+    files.push({ path: match[1], ignoreErrors: match[2] === 'yes' })
+  }
+  return files
+}
+
+/**
+ * systemd's serialization of `Environment=`: a string vector, space separated, each element
+ * double-quoted and C-escaped when it needs to be.
+ *
+ * THIS IS A PARSER, AND THAT IS THE POINT OF THE THROW. It reads systemd's OUTPUT FORMAT — a
+ * bounded grammar whose whole job is to be read back — not systemd's `EnvironmentFile` semantics,
+ * which is the thing this round stopped reimplementing. Anything it cannot read unambiguously
+ * (an unterminated quote, an escape it does not know, an element with no `=`) throws, and the
+ * caller turns that into the same refusal as "systemd could not be asked": the answer could not
+ * be parsed, so there is no answer.
+ *
+ * @throws {Error}
+ */
+export function parseSystemdEnvironment(value) {
+  const text = String(value ?? '')
+  const values = new Map()
+  let index = 0
+  while (index < text.length) {
+    if (text[index] === ' ') {
+      index += 1
+      continue
+    }
+    let element = ''
+    let quoted = false
+    while (index < text.length) {
+      const character = text[index]
+      if (!quoted && character === ' ') break
+      index += 1
+      if (character === '"') {
+        quoted = !quoted
+        continue
+      }
+      if (character !== '\\') {
+        element += character
+        continue
+      }
+      const escape = text[index]
+      index += 1
+      if (escape === undefined) throw new Error('systemd reported an Environment= ending in a lone backslash')
+      const simple = { n: '\n', t: '\t', r: '\r', '\\': '\\', '"': '"', "'": "'", a: '\x07', b: '\b', f: '\f', v: '\v', s: ' ' }
+      if (Object.prototype.hasOwnProperty.call(simple, escape)) {
+        element += simple[escape]
+        continue
+      }
+      if (escape === 'x') {
+        const hex = text.slice(index, index + 2)
+        if (!/^[0-9A-Fa-f]{2}$/.test(hex)) throw new Error('systemd reported an Environment= with a malformed \\x escape')
+        element += String.fromCharCode(parseInt(hex, 16))
+        index += 2
+        continue
+      }
+      throw new Error(`systemd reported an Environment= with an escape this cannot read: \\${escape}`)
+    }
+    if (quoted) throw new Error('systemd reported an Environment= with an unterminated quote')
+    if (element === '') continue
+    const equals = element.indexOf('=')
+    if (equals <= 0) throw new Error(`systemd reported an Environment= element that is not NAME=VALUE: ${JSON.stringify(element)}`)
+    values.set(element.slice(0, equals), element.slice(equals + 1))
+  }
+  return values
+}
+
+/**
+ * The first identity variable whose NAME appears anywhere in this text, or ''.
+ *
+ * THE ONE QUESTION EVERY GRAMMAR ANSWERS THE SAME WAY. dotenv, systemd, `sh` and anything else
+ * agree that a file in which the bytes `PGUSER` never occur does not set `PGUSER`; they disagree
+ * about almost everything else, which is why nothing here parses these files. A substring match
+ * is deliberately BROADER than "assigns it": `MY_PGUSER=x`, or the name inside a comment, is
+ * reported too. Over-reporting costs a refusal with an instruction; under-reporting costs a fence
+ * on the wrong cluster.
+ */
+export function mentionedIdentityVariable(text) {
+  const haystack = String(text)
+  return IDENTITY_ENVIRONMENT_VARIABLES.find((name) => haystack.includes(name)) ?? ''
+}
+
+/**
+ * The dotenv files the APPLICATION ITSELF loads, after exec, inside the process.
+ *
+ * These never reach systemd — Next reads them at startup — so no systemd property can report a
+ * `PGHOST` in one, and it would still move the application's connection. They are scanned for a
+ * mention exactly like the files systemd reads, and refused on one. `.env` is in both lists on
+ * purpose; scanning it twice costs nothing.
+ */
+export function applicationDotenvPaths(appDir) {
+  return ['.env.local', '.env.production.local', '.env.production', '.env'].map((name) => resolvePath(appDir, name))
+}
+
+/**
+ * WHERE `systemctl` IS, WITHOUT ASKING `PATH` (o3d-2sm1.5 r18).
+ *
+ * The authority is only an authority if the thing answering really is systemd. `PATH` is
+ * inherited, and this whole round is about not letting the invoking shell decide what this script
+ * resolves — so the binary is looked for at the places a distribution puts it, and NOWHERE ELSE.
+ * None of them present is "systemd cannot be asked", which is a refusal.
+ */
+export const SYSTEMCTL_PATHS = ['/usr/bin/systemctl', '/bin/systemctl', '/usr/sbin/systemctl', '/sbin/systemctl']
+
+export function findSystemctl(paths = SYSTEMCTL_PATHS, io = {}) {
+  const exists = io.exists ?? ((path) => { try { statSync(path); return true } catch { return false } })
+  return paths.find((path) => exists(path)) ?? ''
+}
+
+/**
+ * `systemctl show` for one unit, or a failure this can refuse on.
+ *
+ * `systemctlPath` is an EXPLICIT ARGUMENT, defaulting to the discovery above and overridable only
+ * through `--systemctl=`. That is the shape Codex asked for when it rejected `IMS_SERVICE_ENV_FILE`
+ * (r17 CRITICAL): an argv value comes from the entrypoint that ran this, or from an operator
+ * typing the command, and unlike an environment variable it cannot arrive from a `.bashrc`, a
+ * cron wrapper or a shell left open since last week. The shipped entrypoints never pass it; the
+ * tests do, because a test cannot install a systemd unit.
+ */
+function systemctlShowUnit(unit, systemctlPath = '') {
+  const binary = systemctlPath || findSystemctl()
+  if (!binary) {
+    return { ok: false, reason: `systemd cannot be asked: no systemctl at ${SYSTEMCTL_PATHS.join(', ')}`, stdout: '' }
+  }
+  let result
+  try {
+    result = spawnSync(binary, ['show', '--no-pager', ...UNIT_PROPERTIES.map((property) => `--property=${property}`), unit], {
+      encoding: 'utf8',
+    })
+  } catch (error) {
+    return { ok: false, reason: `systemd could not be asked (${error instanceof Error ? error.message : String(error)})`, stdout: '' }
+  }
+  if (result.error) return { ok: false, reason: `systemd could not be asked (${result.error.message})`, stdout: '' }
+  if (result.status !== 0) {
+    return { ok: false, reason: `${binary} show ${unit} exited ${result.status}: ${String(result.stderr ?? '').trim() || 'no output'}`, stdout: '' }
+  }
+  return { ok: true, reason: '', stdout: String(result.stdout ?? '') }
+}
+
+/**
+ * WHAT SYSTEMD SAYS THE APPLICATION SERVICE'S FOUR IDENTITY VARIABLES ARE — or why this run
+ * cannot say, which is always a refusal and never a fallback.
+ *
+ * @param {string[]} units          Unit names, from `--service-unit=`. Empty is a refusal.
+ * @param {object}   io             Test seams: `show`, `readText`, `realpath`, `appDir`, `osAccount`.
+ * @returns {{ ok: boolean, reason: string, values?: Record<string,string>, sources?: string[],
+ *            serviceAccount?: string, runsAsServiceAccount?: boolean, osAccount?: string }}
+ */
+export function readUnitEnvironment(units, io = {}) {
+  const show = io.show ?? ((unit) => systemctlShowUnit(unit, io.systemctlPath ?? ''))
+  const readText = io.readText ?? ((path) => readFileSync(path, 'utf8'))
+  const appDir = io.appDir ?? appDirectory()
+  const realpath = io.realpath ?? ((path) => { try { return realpathSync(path) } catch { return path } })
+  const osAccount = io.osAccount ?? processOsAccount(io)
+
+  const named = (units ?? []).map((unit) => String(unit).trim()).filter((unit) => unit !== '')
+  if (named.length === 0) {
+    return {
+      ok: false,
+      reason:
+        'no --service-unit=<unit> was given, so there is no unit to ask systemd about. This run will NOT fall back to its own shell\'s PGHOST/PGPORT/PGUSER/PGDATABASE: the deploy\'s variables are not the application\'s, and resolving identity against them is how a fence lands on the wrong cluster. The deploy, update and install scripts each pass the unit they already address the service by',
+    }
+  }
+
+  const values = new Map()
+  const sources = []
+  const accounts = new Set()
+  for (const unit of named) {
+    const shown = show(unit)
+    if (!shown.ok) return { ok: false, reason: `${shown.reason}, so what environment systemd starts ${unit} with is unknown` }
+    const properties = parseSystemctlShow(shown.stdout)
+    if (!properties.has('LoadState')) {
+      return { ok: false, reason: `systemctl show ${unit} reported no LoadState, so its answer could not be parsed and nothing here knows what environment ${unit} is given` }
+    }
+    const loadState = properties.get('LoadState')
+    if (loadState !== 'loaded') {
+      return { ok: false, reason: `systemd reports ${unit} as LoadState=${loadState}, not loaded, so there is no unit whose environment this could read` }
+    }
+
+    // THE UNIT MUST BE THIS APP'S. Being handed the wrong name is otherwise indistinguishable
+    // from being handed the right one, and the answer would be another installation's cluster.
+    const workingDirectory = properties.get('WorkingDirectory') ?? ''
+    if (workingDirectory !== '' && realpath(workingDirectory) !== realpath(appDir)) {
+      return {
+        ok: false,
+        reason: `systemd reports WorkingDirectory=${workingDirectory} for ${unit}, which is not ${appDir} — the directory this helper ships in. That unit serves a different installation, so its environment says nothing about this one`,
+      }
+    }
+    accounts.add(properties.get('User') ?? '')
+
+    // THE FILE LAYER: systemd will read these and will not say what it made of them.
+    let files
+    try {
+      files = parseSystemdEnvironmentFiles(properties.get('EnvironmentFiles'))
+    } catch (error) {
+      return { ok: false, reason: `${error instanceof Error ? error.message : String(error)} (${unit})` }
+    }
+    for (const file of files) {
+      let text
+      try {
+        text = readText(file.path)
+      } catch (error) {
+        if (file.ignoreErrors && error && error.code === 'ENOENT') continue
+        return {
+          ok: false,
+          reason: `${unit} is given EnvironmentFile=${file.path}, which systemd will read and this run cannot (${error instanceof Error ? error.message : String(error)}). An unreadable file is not a file that sets no PGHOST/PGPORT/PGUSER/PGDATABASE`,
+        }
+      }
+      const mentioned = mentionedIdentityVariable(text)
+      if (mentioned) {
+        return {
+          ok: false,
+          reason: `${unit} is given EnvironmentFile=${file.path}, and that file mentions ${mentioned}. systemd reads that file when it forks the service and publishes nothing about what it made of it, and this helper will not reimplement its parsing to find out — dotenv and systemd disagree over ordinary lines, and both readings are legal. Set ${mentioned} in the unit's own Environment= (systemctl show reports that), or remove it from the file`,
+        }
+      }
+      sources.push(`${unit}:EnvironmentFile=${file.path}`)
+    }
+
+    // AND THE APPLICATION'S OWN OVERLAY, which systemd never sees at all.
+    for (const path of applicationDotenvPaths(appDir)) {
+      let text
+      try {
+        text = readText(path)
+      } catch {
+        continue
+      }
+      const mentioned = mentionedIdentityVariable(text)
+      if (mentioned) {
+        return {
+          ok: false,
+          reason: `${path} mentions ${mentioned}, and the application loads that file itself after systemd has started it, so systemd can report nothing about it. Set ${mentioned} in the unit's own Environment= instead, or remove it`,
+        }
+      }
+    }
+
+    // THE LAYER SYSTEMD DOES REPORT — drop-ins already folded in, in systemd's own order.
+    let unitEnvironment
+    try {
+      unitEnvironment = parseSystemdEnvironment(properties.get('Environment'))
+    } catch (error) {
+      return { ok: false, reason: `${error instanceof Error ? error.message : String(error)} (${unit}), so its answer could not be parsed` }
+    }
+    sources.push(`${unit}:Environment=`)
+    for (const name of IDENTITY_ENVIRONMENT_VARIABLES) {
+      if (!unitEnvironment.has(name)) continue
+      const value = unitEnvironment.get(name)
+      const previous = values.get(name)
+      if (previous && previous.value !== value) {
+        return {
+          ok: false,
+          reason: `${previous.unit} sets ${name}=${JSON.stringify(previous.value)} and ${unit} sets ${name}=${JSON.stringify(value)}. Both units serve this app dir and both write to the database, so this run cannot say which cluster the fence is meant to close. Make them agree`,
+        }
+      }
+      if (!previous) values.set(name, { value, unit })
+    }
+  }
+
+  const serviceAccount = accounts.size === 1 ? [...accounts][0] : ''
+  return {
+    ok: true,
+    reason: '',
+    sources,
+    serviceAccount,
+    osAccount,
+    runsAsServiceAccount: Boolean(serviceAccount && osAccount && serviceAccount === osAccount),
+    values: Object.fromEntries([...values].map(([name, entry]) => [name, entry.value])),
+  }
 }
 
 /**
@@ -225,98 +563,24 @@ export function processOsAccount(io = {}) {
 }
 
 /**
- * What the service's environment says about the four identity variables — and whether this
- * process is the account the service runs as.
- *
- * TWO READABLE FILES THAT DISAGREE ARE REFUSED. `<app dir>/.env` reaches the application through
- * systemd's `EnvironmentFile`, `<app dir>/.env.local` reaches it through Next's own dotenv load,
- * and which one wins depends on the order those two happen in. Picking a winner here is the same
- * mistake as every other ambiguity this file refuses: name one of them.
- */
-export function readServiceEnvironment(paths, io = {}) {
-  const readText = io.readText ?? ((path) => readFileSync(path, 'utf8'))
-  const ownerUid = io.ownerUid ?? ((path) => statSync(path).uid)
-  const uid = io.uid ?? (typeof process.getuid === 'function' ? process.getuid() : -1)
-  const osAccount = io.osAccount ?? processOsAccount(io)
-
-  const sources = []
-  const values = new Map()
-  let ownedByThisProcess = false
-  for (const path of paths) {
-    let text
-    try {
-      text = readText(path)
-    } catch {
-      continue
-    }
-    sources.push(path)
-    // OWNERSHIP, BECAUSE IT ANSWERS "IS THIS PROCESS THE APPLICATION ACCOUNT?" (Codex r17 MEDIUM).
-    // scripts/install.sh writes this file `chown ${APP_USER}:${APP_USER}` and `chmod 600`, and the
-    // unit reads it as that same `User=`. A process that owns it is therefore running as the
-    // account the application runs as. uid 0 is excluded: root owns and reads everything, which
-    // would make the test say yes about the deploy account.
-    try {
-      if (uid > 0 && ownerUid(path) === uid) ownedByThisProcess = true
-    } catch {
-      // an unstattable file simply does not vouch for anyone
-    }
-    let parsed
-    try {
-      parsed = parseEnvFile(text)
-    } catch {
-      return { ok: false, reason: `${path} could not be parsed as an environment file, so what the application service is given for ${IDENTITY_ENVIRONMENT_VARIABLES.join(', ')} is unknown`, sources }
-    }
-    for (const name of IDENTITY_ENVIRONMENT_VARIABLES) {
-      if (!Object.prototype.hasOwnProperty.call(parsed, name)) continue
-      const previous = values.get(name)
-      if (previous && previous.value !== parsed[name]) {
-        return {
-          ok: false,
-          reason: `${previous.path} sets ${name}=${JSON.stringify(previous.value)} and ${path} sets ${name}=${JSON.stringify(parsed[name])}. Which one the application connects with depends on the order systemd's EnvironmentFile and the app's own dotenv load happen in, so this run cannot say where the application connects. Delete one of them`,
-          sources,
-        }
-      }
-      if (!previous) values.set(name, { value: parsed[name], path })
-    }
-  }
-
-  if (sources.length === 0) {
-    return {
-      ok: false,
-      reason: `none of ${paths.join(', ')} could be read, so the environment the application service actually starts with — and therefore which server ${IDENTITY_ENVIRONMENT_VARIABLES.join(', ')} put it on — is unknown. This run will NOT fall back to its own shell's environment: the deploy's PG* variables are not the application's, and resolving identity against them is how a fence lands on the wrong cluster. Point IMS_SERVICE_ENV_FILE at the file the service unit's EnvironmentFile= names`,
-      sources,
-    }
-  }
-
-  return {
-    ok: true,
-    reason: '',
-    sources,
-    ownedByThisProcess,
-    osAccount,
-    values: Object.fromEntries([...values].map(([name, entry]) => [name, entry.value])),
-  }
-}
-
-/**
  * Put the service's environment in place of this process's, for the four variables that decide
  * where a connection goes. Mutates `env` and reports exactly what it did.
  *
- * AND MAKES THE APPLICATION'S IMPLICIT LOGIN ROLE EXPLICIT (o3d-2sm1.5, Codex r17 MEDIUM). When a
- * URL names no role, `pg` falls back to the OS account of whichever process asked. r16 subtracted
- * that fallback wholesale — every OS-account answer became '' and therefore "unidentified", which
- * is refused — on the grounds that this script runs as the deploy account and the application
- * runs as its own. In the SUPPORTED INSTALLATION they are the same account: the deploy, update
- * and install scripts all run this helper through `runuser -u ${APP_USER}`, and the generated
- * unit runs `User=${APP_USER}`. So the fallback there is not a stray identity at all — it is the
- * application's, and refusing it blocked upgrades of a working peer-authenticated installation.
+ * THE DELETION IS UNCONDITIONAL AND COMES FIRST (Codex r17/r18 CRITICAL). Every one of the four is
+ * removed from this process whether or not systemd names a replacement, so a `PGPORT` in the
+ * deploy shell cannot survive as the value the driver resolves through. "The service sets none"
+ * and "the deploy shell sets one" then mean the same thing to the driver, which is what it means
+ * for the ambient override to be closed.
  *
- * The distinction is drawn where it can be MEASURED rather than assumed: this process is the
- * application account when it OWNS the service's environment file (see above). When it does, the
- * account is written into the reconstructed environment as `PGUSER`, so the driver resolves it
- * through a deliberate setting and the sentinel probe in `resolveDriverIdentity()` has nothing to
- * catch. When it does not — a deploy running as root, or as some third account — nothing is
- * written, the fallback stays unidentified, and identity is refused exactly as r16 left it.
+ * AND IT MAKES THE APPLICATION'S IMPLICIT LOGIN ROLE EXPLICIT (o3d-2sm1.5, Codex r17 MEDIUM). When
+ * a URL names no role, `pg` falls back to the OS account of whichever process asked — an ambient
+ * value, and `resolveDriverIdentity()` subtracts it. In the SUPPORTED INSTALLATION that account is
+ * not a stray identity at all: the deploy, update and install scripts run this helper through
+ * `runuser -u ${APP_USER}` and the unit runs `User=${APP_USER}`. r17 established that by file
+ * OWNERSHIP; r18 asks systemd, which states it outright — `User=` from `systemctl show`, compared
+ * against this process's own account. When they match, the account is written into `PGUSER` so the
+ * driver resolves it as a setting; when they do not, nothing is written and identity stays
+ * unidentified, which is refused.
  */
 export function applyServiceEnvironment(service, env = process.env) {
   const removed = []
@@ -331,7 +595,7 @@ export function applyServiceEnvironment(service, env = process.env) {
     applied.push(`${name}=${value}`)
   }
   let declaredOsAccount = ''
-  if (env.PGUSER === undefined && service.ownedByThisProcess && service.osAccount) {
+  if (env.PGUSER === undefined && service.runsAsServiceAccount && service.osAccount) {
     env.PGUSER = service.osAccount
     declaredOsAccount = service.osAccount
   }
@@ -1065,13 +1329,20 @@ export function verifyRelease(datacl, ownerRole, grantees) {
 // I/O
 // ---------------------------------------------------------------------------
 
-function parseArgs(argv) {
-  const options = { mode: '', stateFile: '', appRole: '', timeoutSeconds: 30 }
+export function parseArgs(argv) {
+  const options = { mode: '', stateFile: '', appRole: '', timeoutSeconds: 30, serviceUnits: [], systemctlPath: '' }
   for (const arg of argv) {
     if (arg === '--fence' || arg === '--release' || arg === '--preflight' || arg === '--print-migration-url') options.mode = arg.slice(2)
     else if (arg.startsWith('--state-file=')) options.stateFile = arg.slice('--state-file='.length)
     else if (arg.startsWith('--app-role=')) options.appRole = arg.slice('--app-role='.length)
     else if (arg.startsWith('--timeout-seconds=')) options.timeoutSeconds = Number(arg.slice('--timeout-seconds='.length))
+    // REPEATABLE, because scripts/deploy.sh may find more than one unit serving this app dir and
+    // every one of them is a writer into the database. They must agree about the four identity
+    // variables or this refuses; see readUnitEnvironment().
+    else if (arg.startsWith('--service-unit=')) options.serviceUnits.push(arg.slice('--service-unit='.length))
+    // The systemd binary itself, for the tests: see systemctlShowUnit(). Never passed by
+    // scripts/deploy.sh, scripts/update.sh or scripts/install.sh.
+    else if (arg.startsWith('--systemctl=')) options.systemctlPath = arg.slice('--systemctl='.length)
   }
   return options
 }
@@ -1884,31 +2155,42 @@ export async function doRelease(client, options) {
 }
 
 async function main() {
-  loadDotenv({ path: '.env.local', override: false, quiet: true })
-  loadDotenv({ path: '.env', override: false, quiet: true })
+  // ABSOLUTE, AGAINST THIS SCRIPT'S OWN DIRECTORY (o3d-2sm1.5 r18, Codex r17 HIGH). These were
+  // `.env.local` and `.env` — relative, and therefore resolved against whatever directory the
+  // caller happened to be in. The deploy `cd`s to the app dir first, so it worked there; the
+  // `--release` command this script's callers PRINT for an operator is a bare absolute `node
+  // /opt/.../fence-db-connections.mjs --release ...`, and from any other directory it loaded no
+  // DATABASE_URL, no DIRECT_URL and no DEPLOY_ADMIN_DATABASE_URL — so the one command offered for
+  // taking a committed fence back down could not obtain the admin connection that takes it down.
+  // The app dir is derived from the script, so the same paths are read from every directory.
+  const appDir = appDirectory()
+  loadDotenv({ path: resolvePath(appDir, '.env.local'), override: false, quiet: true })
+  loadDotenv({ path: resolvePath(appDir, '.env'), override: false, quiet: true })
 
   const options = parseArgs(process.argv.slice(2))
   const modes = ['fence', 'release', 'preflight', 'print-migration-url']
   if (!modes.includes(options.mode)) {
-    console.error('Usage: node scripts/fence-db-connections.mjs (--preflight|--fence|--release|--print-migration-url) [--state-file=PATH] [--app-role=ROLE] [--timeout-seconds=N]')
+    console.error('Usage: node scripts/fence-db-connections.mjs (--preflight|--fence|--release|--print-migration-url) --service-unit=UNIT [--service-unit=UNIT ...] [--state-file=PATH] [--app-role=ROLE] [--timeout-seconds=N]')
     process.exit(EXIT_ERROR)
   }
 
   // BEFORE ANY IDENTITY IS RESOLVED, AND THEREFORE BEFORE ANYTHING IS CONNECTED, FENCED,
-  // RELEASED OR PRINTED (o3d-2sm1.5, Codex r17 CRITICAL). Every mode of this script answers a
-  // question about WHERE THE APPLICATION CONNECTS, and `pg` answers it out of the environment of
-  // whichever process asks. This one's is the deploy shell's. See the section at the top of the
-  // file: the four identity variables are replaced by the service's own, and a service
-  // environment that cannot be read is a refusal rather than a fallback to the ambient one.
+  // RELEASED OR PRINTED (o3d-2sm1.5 r18). Every mode of this script answers a question about
+  // WHERE THE APPLICATION CONNECTS, and `pg` answers it out of the environment of whichever
+  // process asks. This one's is the deploy shell's. See the section at the top of the file: the
+  // four identity variables are taken away from this process and replaced by what SYSTEMD says
+  // the named unit is given, and anything systemd cannot be asked — or cannot answer, or answers
+  // in a way that could be read two ways — is a refusal rather than a fallback to the ambient
+  // environment or an assumption that the service sets none.
   //
   // The dotenv loads above stay where they are: they supply DATABASE_URL and friends the way they
   // always have, and `override: false` keeps a variable the caller passed deliberately —
   // DEPLOY_ADMIN_DATABASE_URL — winning over the file. Only the four below are taken away from
   // the caller, because only those four are statements about the APPLICATION's connection that
   // the deploy shell has no standing to make.
-  const service = readServiceEnvironment(serviceEnvironmentPaths())
+  const service = readUnitEnvironment(options.serviceUnits, { appDir, systemctlPath: options.systemctlPath })
   if (!service.ok) {
-    console.error(`The application service's environment ${service.reason}.`)
+    console.error(`The application service's environment cannot be established: ${service.reason}.`)
     console.error('Refusing to act on a connection this run cannot prove is the application\'s.')
     process.exit(options.mode === 'fence' || options.mode === 'preflight' ? EXIT_NOT_FENCEABLE : EXIT_ERROR)
   }
@@ -1921,7 +2203,9 @@ async function main() {
     console.error(`Ignoring this shell's ${reconstructed.removed.join(', ')}: the application service does not inherit them.`)
   }
   if (reconstructed.applied.length > 0) {
-    console.error(`Using the service's own ${reconstructed.applied.join(', ')} (${service.sources.join(', ')}).`)
+    console.error(`Using the service's own ${reconstructed.applied.join(', ')}, as systemd reports them (${service.sources.join(', ')}).`)
+  } else {
+    console.error(`systemd reports no ${IDENTITY_ENVIRONMENT_VARIABLES.join(', ')} for ${options.serviceUnits.join(', ')}, so none is set here either (${service.sources.join(', ')}).`)
   }
   if (reconstructed.declaredOsAccount) {
     console.error(`A URL naming no role logs in as "${reconstructed.declaredOsAccount}": this process runs as the account the service runs as.`)
