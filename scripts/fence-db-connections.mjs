@@ -141,12 +141,202 @@
 // =============================================================================
 
 import { randomBytes } from 'node:crypto'
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
-import { dirname } from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { userInfo } from 'node:os'
+import { dirname, resolve as resolvePath } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
-import { config as loadDotenv } from 'dotenv'
+import { config as loadDotenv, parse as parseEnvFile } from 'dotenv'
 import pg from 'pg'
+
+// ---------------------------------------------------------------------------
+// WHOSE ENVIRONMENT DECIDES WHERE THIS SCRIPT LOOKS (o3d-2sm1.5, Codex r17 CRITICAL)
+//
+// r16 moved identity onto the driver, which was right: `pg` fills every value a URL omits from
+// `PGHOST`, `PGPORT`, `PGUSER` and `PGDATABASE` before it dials, so nothing short of the driver
+// can say where a URL lands. What r16 did not ask is WHOSE `PGHOST` it was reading.
+//
+// THE APPLICATION DOES NOT INHERIT THE DEPLOY SHELL'S ENVIRONMENT. It is started by systemd from
+// a unit whose whole environment is `Environment=` plus `EnvironmentFile=-<app dir>/.env`; the
+// deploy, update and install shells run this helper through `runuser ... env` with their own
+// environment intact, and `loadDotenv({ override: false })` below deliberately lets that ambient
+// copy win. So an operator shell — or a cron wrapper, or a `.bashrc` — carrying `PGPORT=6432`
+// while the service file carries none made this script resolve identity against 6432 while the
+// application connected to 5432. The gate then compared two URLs that agreed with each other,
+// the fence revoked CONNECT on 6432, and the migration ran there, while the real database stayed
+// open and unmigrated for the length of the window. THE MORE FAITHFULLY IT FOLLOWED THE DRIVER,
+// THE MORE FAITHFULLY IT FOLLOWED THE WRONG ENVIRONMENT.
+//
+// So the four variables that move a connection are RECONSTRUCTED FROM THE SERVICE'S OWN
+// ENVIRONMENT FILE before anything is resolved, connected, fenced or released: whatever this
+// process inherited is DELETED, and whatever the file the unit is given defines is put back. The
+// deploy shell keeps every other variable it passes deliberately — `DEPLOY_ADMIN_DATABASE_URL`
+// above all, which is the deploy's own and has no business coming from the application's file.
+//
+// AND WHEN THE FILE CANNOT BE READ, THIS REFUSES. Not "fall back to the ambient environment",
+// which is the defect; not "assume none are set", which is a guess about the very thing that was
+// wrong. An unreadable service environment means this script cannot say where the application
+// connects, and every mode of this script exists to answer exactly that.
+//
+// WHY THE FILE AND NOT `systemctl show`. The file is what the unit is generated with
+// (`EnvironmentFile=-${APP_DIR}/.env`, scripts/install.sh), it is where DATABASE_URL itself comes
+// from, and it is readable at first install — before any unit exists — which is when
+// scripts/install.sh runs the preflight. A `PG*` set in a unit `Environment=` line or a drop-in
+// is therefore OUTSIDE what this reconstructs; the generated unit sets none, and the identity
+// gate's own two-URL comparison is what catches a disagreement it cannot see the cause of.
+// ---------------------------------------------------------------------------
+
+/** The four `pg` reads from the environment to decide WHERE a connection lands and AS WHOM. */
+export const IDENTITY_ENVIRONMENT_VARIABLES = ['PGHOST', 'PGPORT', 'PGUSER', 'PGDATABASE']
+
+/**
+ * The file(s) that hold the application service's environment.
+ *
+ * Resolved against THIS SCRIPT's own location, not the working directory: the helper ships at
+ * `<app dir>/scripts/fence-db-connections.mjs` and the unit's `EnvironmentFile` is
+ * `<app dir>/.env`, so the answer is the same whether the deploy ran `cd` first and whether the
+ * operator pasted the printed `--release` command into a shell sitting somewhere else.
+ * `IMS_SERVICE_ENV_FILE` overrides it for a non-standard layout, and for the tests.
+ */
+export function serviceEnvironmentPaths(env = process.env, scriptUrl = import.meta.url) {
+  if (env.IMS_SERVICE_ENV_FILE) return [env.IMS_SERVICE_ENV_FILE]
+  const appDir = dirname(dirname(fileURLToPath(scriptUrl)))
+  return [resolvePath(appDir, '.env'), resolvePath(appDir, '.env.local')]
+}
+
+/**
+ * The OS account this process is running as, or '' when the two ways of asking disagree.
+ *
+ * `pg`'s last fallback for the login role is `pg.defaults.user`, which is `process.env.USER` — a
+ * variable, and therefore inheritable, stale or set by hand. `userInfo()` reads the passwd entry
+ * for the effective uid, which is not. Both must say the same thing before anything here treats
+ * an OS account as an identity; a disagreement means the process is not who its environment says
+ * it is, and that is precisely the case not to resolve.
+ */
+export function processOsAccount(io = {}) {
+  let fromPasswd = ''
+  try {
+    fromPasswd = String((io.userInfo ?? userInfo)().username ?? '')
+  } catch {
+    fromPasswd = ''
+  }
+  const fromEnvironment = String(io.driverDefaultUser ?? pg.defaults.user ?? '')
+  return fromPasswd && fromPasswd === fromEnvironment ? fromPasswd : ''
+}
+
+/**
+ * What the service's environment says about the four identity variables — and whether this
+ * process is the account the service runs as.
+ *
+ * TWO READABLE FILES THAT DISAGREE ARE REFUSED. `<app dir>/.env` reaches the application through
+ * systemd's `EnvironmentFile`, `<app dir>/.env.local` reaches it through Next's own dotenv load,
+ * and which one wins depends on the order those two happen in. Picking a winner here is the same
+ * mistake as every other ambiguity this file refuses: name one of them.
+ */
+export function readServiceEnvironment(paths, io = {}) {
+  const readText = io.readText ?? ((path) => readFileSync(path, 'utf8'))
+  const ownerUid = io.ownerUid ?? ((path) => statSync(path).uid)
+  const uid = io.uid ?? (typeof process.getuid === 'function' ? process.getuid() : -1)
+  const osAccount = io.osAccount ?? processOsAccount(io)
+
+  const sources = []
+  const values = new Map()
+  let ownedByThisProcess = false
+  for (const path of paths) {
+    let text
+    try {
+      text = readText(path)
+    } catch {
+      continue
+    }
+    sources.push(path)
+    // OWNERSHIP, BECAUSE IT ANSWERS "IS THIS PROCESS THE APPLICATION ACCOUNT?" (Codex r17 MEDIUM).
+    // scripts/install.sh writes this file `chown ${APP_USER}:${APP_USER}` and `chmod 600`, and the
+    // unit reads it as that same `User=`. A process that owns it is therefore running as the
+    // account the application runs as. uid 0 is excluded: root owns and reads everything, which
+    // would make the test say yes about the deploy account.
+    try {
+      if (uid > 0 && ownerUid(path) === uid) ownedByThisProcess = true
+    } catch {
+      // an unstattable file simply does not vouch for anyone
+    }
+    let parsed
+    try {
+      parsed = parseEnvFile(text)
+    } catch {
+      return { ok: false, reason: `${path} could not be parsed as an environment file, so what the application service is given for ${IDENTITY_ENVIRONMENT_VARIABLES.join(', ')} is unknown`, sources }
+    }
+    for (const name of IDENTITY_ENVIRONMENT_VARIABLES) {
+      if (!Object.prototype.hasOwnProperty.call(parsed, name)) continue
+      const previous = values.get(name)
+      if (previous && previous.value !== parsed[name]) {
+        return {
+          ok: false,
+          reason: `${previous.path} sets ${name}=${JSON.stringify(previous.value)} and ${path} sets ${name}=${JSON.stringify(parsed[name])}. Which one the application connects with depends on the order systemd's EnvironmentFile and the app's own dotenv load happen in, so this run cannot say where the application connects. Delete one of them`,
+          sources,
+        }
+      }
+      if (!previous) values.set(name, { value: parsed[name], path })
+    }
+  }
+
+  if (sources.length === 0) {
+    return {
+      ok: false,
+      reason: `none of ${paths.join(', ')} could be read, so the environment the application service actually starts with — and therefore which server ${IDENTITY_ENVIRONMENT_VARIABLES.join(', ')} put it on — is unknown. This run will NOT fall back to its own shell's environment: the deploy's PG* variables are not the application's, and resolving identity against them is how a fence lands on the wrong cluster. Point IMS_SERVICE_ENV_FILE at the file the service unit's EnvironmentFile= names`,
+      sources,
+    }
+  }
+
+  return {
+    ok: true,
+    reason: '',
+    sources,
+    ownedByThisProcess,
+    osAccount,
+    values: Object.fromEntries([...values].map(([name, entry]) => [name, entry.value])),
+  }
+}
+
+/**
+ * Put the service's environment in place of this process's, for the four variables that decide
+ * where a connection goes. Mutates `env` and reports exactly what it did.
+ *
+ * AND MAKES THE APPLICATION'S IMPLICIT LOGIN ROLE EXPLICIT (o3d-2sm1.5, Codex r17 MEDIUM). When a
+ * URL names no role, `pg` falls back to the OS account of whichever process asked. r16 subtracted
+ * that fallback wholesale — every OS-account answer became '' and therefore "unidentified", which
+ * is refused — on the grounds that this script runs as the deploy account and the application
+ * runs as its own. In the SUPPORTED INSTALLATION they are the same account: the deploy, update
+ * and install scripts all run this helper through `runuser -u ${APP_USER}`, and the generated
+ * unit runs `User=${APP_USER}`. So the fallback there is not a stray identity at all — it is the
+ * application's, and refusing it blocked upgrades of a working peer-authenticated installation.
+ *
+ * The distinction is drawn where it can be MEASURED rather than assumed: this process is the
+ * application account when it OWNS the service's environment file (see above). When it does, the
+ * account is written into the reconstructed environment as `PGUSER`, so the driver resolves it
+ * through a deliberate setting and the sentinel probe in `resolveDriverIdentity()` has nothing to
+ * catch. When it does not — a deploy running as root, or as some third account — nothing is
+ * written, the fallback stays unidentified, and identity is refused exactly as r16 left it.
+ */
+export function applyServiceEnvironment(service, env = process.env) {
+  const removed = []
+  for (const name of IDENTITY_ENVIRONMENT_VARIABLES) {
+    if (env[name] === undefined) continue
+    removed.push(`${name}=${env[name]}`)
+    delete env[name]
+  }
+  const applied = []
+  for (const [name, value] of Object.entries(service.values ?? {})) {
+    env[name] = value
+    applied.push(`${name}=${value}`)
+  }
+  let declaredOsAccount = ''
+  if (env.PGUSER === undefined && service.ownedByThisProcess && service.osAccount) {
+    env.PGUSER = service.osAccount
+    declaredOsAccount = service.osAccount
+  }
+  return { removed, applied, declaredOsAccount }
+}
 
 /**
  * THE OBJECT THAT DECIDES WHERE THE CONNECTION GOES (o3d-2sm1.5, Codex r16 CRITICAL).
@@ -191,12 +381,20 @@ export function resolveDriverIdentity(connectionString) {
   const client = new pg.Client({ connectionString })
 
   // THE ONE COMPONENT THAT IS NOT SHARED CONFIGURATION. `PGHOST`, `PGPORT`, `PGUSER` and
-  // `PGDATABASE` are deliberate settings that this script and the application read from the same
-  // environment, so honouring them is the whole point of resolving through the driver. `pg`'s
-  // LAST fallback for the login role is not a setting at all: it is `process.env.USER`, the OS
-  // account of whichever process happens to be running. This script runs as the deploy account;
-  // the application runs as its own. Taking the deploy's OS account for the application's login
-  // role would revoke CONNECT from a role nobody connects as and report the door shut.
+  // `PGDATABASE` are deliberate settings — and, since r17, they are THE SERVICE'S settings by the
+  // time this runs, reconstructed from its own environment file rather than inherited from the
+  // deploy shell (see the section at the top of the file). Honouring them is the whole point of
+  // resolving through the driver. `pg`'s LAST fallback for the login role is not a setting at
+  // all: it is `process.env.USER`, the OS account of whichever process happens to be running.
+  // Where that account is NOT the application's, taking it for the application's login role would
+  // revoke CONNECT from a role nobody connects as and report the door shut.
+  //
+  // WHERE IT IS the application's, it is not a stray identity and is not subtracted (Codex r17
+  // MEDIUM): `applyServiceEnvironment()` establishes that by ownership of the service's
+  // environment file and writes the account into `PGUSER`, so the driver resolves it as a
+  // setting and the probe below never sees the default. This function is therefore unchanged and
+  // still holds no opinion — it subtracts an ANONYMOUS fallback, and by the time it runs the
+  // application's own account is no longer anonymous.
   //
   // Asked of the driver rather than inferred: re-resolve with `pg.defaults.user` swapped for a
   // sentinel, and if the answer moves, that field came from the OS account and from nothing else.
@@ -1694,6 +1892,35 @@ async function main() {
   if (!modes.includes(options.mode)) {
     console.error('Usage: node scripts/fence-db-connections.mjs (--preflight|--fence|--release|--print-migration-url) [--state-file=PATH] [--app-role=ROLE] [--timeout-seconds=N]')
     process.exit(EXIT_ERROR)
+  }
+
+  // BEFORE ANY IDENTITY IS RESOLVED, AND THEREFORE BEFORE ANYTHING IS CONNECTED, FENCED,
+  // RELEASED OR PRINTED (o3d-2sm1.5, Codex r17 CRITICAL). Every mode of this script answers a
+  // question about WHERE THE APPLICATION CONNECTS, and `pg` answers it out of the environment of
+  // whichever process asks. This one's is the deploy shell's. See the section at the top of the
+  // file: the four identity variables are replaced by the service's own, and a service
+  // environment that cannot be read is a refusal rather than a fallback to the ambient one.
+  //
+  // The dotenv loads above stay where they are: they supply DATABASE_URL and friends the way they
+  // always have, and `override: false` keeps a variable the caller passed deliberately —
+  // DEPLOY_ADMIN_DATABASE_URL — winning over the file. Only the four below are taken away from
+  // the caller, because only those four are statements about the APPLICATION's connection that
+  // the deploy shell has no standing to make.
+  const service = readServiceEnvironment(serviceEnvironmentPaths())
+  if (!service.ok) {
+    console.error(`The application service's environment ${service.reason}.`)
+    console.error('Refusing to act on a connection this run cannot prove is the application\'s.')
+    process.exit(options.mode === 'fence' || options.mode === 'preflight' ? EXIT_NOT_FENCEABLE : EXIT_ERROR)
+  }
+  const reconstructed = applyServiceEnvironment(service)
+  if (reconstructed.removed.length > 0) {
+    console.log(`Ignoring this shell's ${reconstructed.removed.join(', ')}: the application service does not inherit them.`)
+  }
+  if (reconstructed.applied.length > 0) {
+    console.log(`Using the service's own ${reconstructed.applied.join(', ')} (${service.sources.join(', ')}).`)
+  }
+  if (reconstructed.declaredOsAccount) {
+    console.log(`A URL naming no role logs in as "${reconstructed.declaredOsAccount}": this process runs as the account the service runs as.`)
   }
 
   // Opens no connection: it is pure string work over two environment variables, and the
