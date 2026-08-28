@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -376,21 +376,16 @@ test('dotenv is a runtime dependency, because `npm ci --omit=dev` has to be able
   assert.equal(pkg.devDependencies?.dotenv, undefined, 'and must not also be a devDependency')
 })
 
-function runScript(args: string[], env: Record<string, string | undefined>) {
+function runScript(args: string[], env: Record<string, string | undefined>, identity?: string[]) {
   const cwd = mkdtempSync(join(tmpdir(), 'ims-noenv-'))
-  // THE SERVICE'S ENVIRONMENT COMES FROM SYSTEMD (o3d-2sm1.5 r18). scripts/fence-db-connections.mjs
-  // asks `systemctl show <unit>` for PGHOST/PGPORT/PGUSER/PGDATABASE and refuses when it cannot,
-  // so these runs stand a systemctl in for it — reporting a loaded unit with no PG* — rather than
-  // depending on what unit this box happens to have. `--systemctl=` and `--service-unit=` are argv
-  // values, supplied here the way the deploy scripts supply them.
-  const systemctl = join(cwd, 'systemctl')
-  writeFileSync(
-    systemctl,
-    "#!/bin/sh\ncat <<'PROPS'\nEnvironment=\nWorkingDirectory=\nUser=\nLoadState=loaded\nPROPS\n",
-  )
-  chmodSync(systemctl, 0o755)
+  // THE APPLICATION'S IDENTITY IS ON THE COMMAND LINE (o3d-2sm1.5 r19). scripts/fence-db-connections.mjs
+  // no longer works out where the application connects — from this process's environment, from a
+  // dotenv overlay or from systemd — so every run of it here supplies the four values the way the
+  // deploy scripts do, and a run without them would be refused before anything is opened.
   const isFence = args[0].endsWith('fence-db-connections.mjs')
-  const extra = isFence ? ['--service-unit=one-two-inventory.service', `--systemctl=${systemctl}`] : []
+  const extra = isFence
+    ? (identity ?? ['--app-host=127.0.0.1', '--app-port=5432', '--app-user=imsapp', '--app-database=ims'])
+    : []
   try {
     const stdout = execFileSync('node', [join(process.cwd(), ...args[0].split('/')), ...args.slice(1), ...extra], {
       encoding: 'utf8',
@@ -431,19 +426,17 @@ test('--print-migration-url composes the URL the migration runs through, and ope
 })
 
 test('--print-migration-url refuses rather than emitting a URL that would create admin-owned objects', () => {
-  // USER IS CLEARED ON PURPOSE (o3d-2sm1.5, Codex r17 MEDIUM). A DATABASE_URL naming no role is
-  // no longer automatically roleless: where this process runs as the account the service runs as,
-  // that account IS the login role the application authenticates with, and emitting it is right.
-  // The refusal this test is about is the case where NOTHING vouches for an account — so nothing
-  // does, and `-c role=` is still never emitted empty.
+  // THE ROLE THE MIGRATION RUNS AS IS THE SUPPLIED --app-user (o3d-2sm1.5 r19), so the refusal is
+  // now the case where the caller supplied no role at all — and `-c role=` is still never emitted
+  // empty. A run that supplies three of four is refused before any URL is composed.
   const noRole = runScript(['scripts/fence-db-connections.mjs', '--print-migration-url'], {
     DEPLOY_ADMIN_DATABASE_URL: 'postgresql://deployadmin@127.0.0.1:5432/ims',
     DATABASE_URL: 'postgresql://127.0.0.1:5432/ims',
     USER: '',
     DIRECT_URL: '',
-  })
+  }, ['--app-host=127.0.0.1', '--app-port=5432', '--app-user=', '--app-database=ims'])
   assert.notEqual(noRole.status, 0)
-  assert.match(noRole.output, /owned by the admin/)
+  assert.match(noRole.output, /--app-user was not supplied/)
 
   const noAdmin = runScript(['scripts/fence-db-connections.mjs', '--print-migration-url'], {
     DEPLOY_ADMIN_DATABASE_URL: '',

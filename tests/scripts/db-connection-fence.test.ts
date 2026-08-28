@@ -2255,3 +2255,58 @@ test('o3d-2sm1.5 r19: the strict reader in the entrypoints accepts only a URL st
     assert.match(answer, expected, url || '(empty)')
   }
 })
+
+test('o3d-2sm1.5 r19: the four options are parsed, and the one file still read is resolved from the SCRIPT', () => {
+  // TWO THINGS THE PRINTED --release COMMAND DEPENDS ON, and it is the one command an operator is
+  // offered for taking a committed fence back down.
+  //
+  // 1. THE OPTIONS EXIST AND ARE READ. A flag parseArgs() silently ignores is a flag the callers
+  //    pass into a void, and every mode would then refuse on a value that WAS supplied.
+  //    MUTATION ROUTE: drop any `--app-*` arm from parseArgs() and the matching assertion fails.
+  assert.deepEqual(
+    parseArgs(['--release', '--app-host=db.internal', '--app-port=6432', '--app-user=imsapp', '--app-database=imsdb', '--state-file=/x']),
+    { mode: 'release', stateFile: '/x', appRole: '', timeoutSeconds: 30, appHost: 'db.internal', appPort: '6432', appUser: 'imsapp', appDatabase: 'imsdb' },
+  )
+  // And nothing remains that would take a unit name or a systemctl path.
+  const withUnit = parseArgs(['--fence', '--service-unit=one-two-inventory.service', '--systemctl=/x/systemctl']) as Record<string, unknown>
+  assert.equal(withUnit.serviceUnits, undefined, 'no unit is interrogated any more')
+  assert.equal(withUnit.systemctlPath, undefined, 'and no systemctl path is taken')
+
+  // 2. THE .env IT READS IS THE APP DIRECTORY'S, resolved from this file's own location — because
+  //    the printed command is a bare absolute `node /opt/.../fence-db-connections.mjs --release
+  //    ...` and an operator runs it from wherever they are standing (Codex r17 HIGH). A relative
+  //    path loaded nothing there, so the one command offered for taking a fence down could not
+  //    obtain the admin connection that takes it down.
+  //    MUTATION ROUTE: put the relative path back in main(). The run below then picks up the
+  //    DECOY .env sitting in its working directory and reports a privileged connection it does
+  //    not have, so `DEPLOY_ADMIN_DATABASE_URL is not set` stops appearing.
+  assert.equal(appDirectory(), process.cwd(), 'precondition: the helper derives the app dir from its own path')
+  const helper = readFileSync(join(process.cwd(), 'scripts/fence-db-connections.mjs'), 'utf8')
+  const loads = helper.split('\n').filter((line) => /^\s*loadDotenv\(/.test(line))
+  assert.deepEqual(
+    loads.map((line) => line.trim()),
+    ["loadDotenv({ path: resolvePath(appDir, '.env'), override: false, quiet: true })"],
+    'exactly one file is loaded, and it is the one systemd gives the service — .env.local is not loaded at all',
+  )
+  assert.equal(
+    readFileSync(join(process.cwd(), '.env'), 'utf8').includes('DEPLOY_ADMIN_DATABASE_URL'),
+    false,
+    'precondition: the app directory\'s own .env sets no admin URL, so the decoy is the only source of one',
+  )
+
+  const cwd = mkdtempSync(join(tmpdir(), 'ims-decoy-'))
+  try {
+    writeFileSync(join(cwd, '.env'), 'DEPLOY_ADMIN_DATABASE_URL=postgresql://decoy@127.0.0.1:5432/decoy\n')
+    const run = spawnSync(
+      'node',
+      [join(process.cwd(), 'scripts/fence-db-connections.mjs'), '--preflight', ...identityArgs({ appDatabase: 'ims' })],
+      { encoding: 'utf8', cwd, env: { ...process.env, DEPLOY_ADMIN_DATABASE_URL: '', DIRECT_URL: '' }, stdio: ['ignore', 'pipe', 'pipe'] },
+    )
+    const output = `${run.stdout ?? ''}${run.stderr ?? ''}`
+    assert.equal(run.status, EXIT_NOT_FENCEABLE, output)
+    assert.match(output, /DEPLOY_ADMIN_DATABASE_URL is not set/, 'a .env in the working directory is not this application\'s')
+    assert.doesNotMatch(output, /decoy/, 'and nothing from it reaches the run')
+  } finally {
+    rmSync(cwd, { recursive: true, force: true })
+  }
+})
