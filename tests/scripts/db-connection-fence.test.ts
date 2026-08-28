@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { execFileSync } from 'node:child_process'
+import { spawnSync } from 'node:child_process'
 import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -110,22 +110,22 @@ function runFenceScript(
     serviceEnvFile = join(cwd, 'service.env')
     writeFileSync(serviceEnvFile, serviceEnv)
   }
-  try {
-    const stdout = execFileSync('node', [join(process.cwd(), 'scripts/fence-db-connections.mjs'), ...args], {
-      encoding: 'utf8',
-      env: {
-        ...process.env,
-        IMS_SERVICE_ENV_FILE: serviceEnvFile ?? join(cwd, 'no-such-file.env'),
-        ...env,
-      },
-      cwd,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    })
-    return { status: 0, output: stdout }
-  } catch (error) {
-    const failure = error as { status?: number; stdout?: string; stderr?: string }
-    return { status: failure.status ?? -1, output: `${failure.stdout ?? ''}${failure.stderr ?? ''}` }
-  }
+  // spawnSync, not execFileSync: the script's diagnostics go to STDERR so that stdout stays the
+  // machine-readable channel `--print-migration-url` is captured through, and a test that could
+  // only see stdout on success could not tell the two apart.
+  const run = spawnSync('node', [join(process.cwd(), 'scripts/fence-db-connections.mjs'), ...args], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      IMS_SERVICE_ENV_FILE: serviceEnvFile ?? join(cwd, 'no-such-file.env'),
+      ...env,
+    },
+    cwd,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  const stdout = run.stdout ?? ''
+  const stderr = run.stderr ?? ''
+  return { status: run.status ?? -1, stdout, stderr, output: `${stdout}${stderr}` }
 }
 
 // o3d-2sm1.2 — check-db-writers.mjs SNAPSHOTS pg_stat_activity and closes; the dump
@@ -2202,11 +2202,12 @@ test('the shipped script runs on the SERVICE\'S environment, end to end', () => 
     DIRECT_URL: '',
   }, 'PGUSER=imsapp\n')
   assert.equal(result.status, 0, result.output)
-  const emitted = result.output.trim().split('\n').at(-1) ?? ''
+  const emitted = result.stdout.trim().split('\n').at(-1) ?? ''
   assert.match(emitted, /^postgresql:\/\//, 'the last line is the URL the deploy captures')
   assert.match(emitted, /options=-c\+role%3Dimsapp|options=-c%20role%3Dimsapp/, 'the migration runs as the role the SERVICE names')
   assert.doesNotMatch(emitted, /deployrole/, 'and the deploy shell\'s PGUSER reaches nothing the migration runs through')
-  assert.match(result.output, /Ignoring this shell's PGUSER=deployrole/, 'and it says so out loud')
+  assert.match(result.stderr, /Ignoring this shell's PGUSER=deployrole/, 'and it says so out loud, on stderr')
+  assert.doesNotMatch(result.stdout, /Ignoring/, 'stdout carries the URL and nothing else: the deploy captures it with $(...)')
 })
 
 test('the service environment file is found from the SCRIPT, not from the working directory', () => {

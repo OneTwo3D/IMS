@@ -1912,15 +1912,19 @@ async function main() {
     console.error('Refusing to act on a connection this run cannot prove is the application\'s.')
     process.exit(options.mode === 'fence' || options.mode === 'preflight' ? EXIT_NOT_FENCEABLE : EXIT_ERROR)
   }
+  //
+  // ON STDERR, NOT STDOUT. `--print-migration-url` writes the URL the deploy captures with
+  // `MIGRATION_DATABASE_URL="$(... --print-migration-url)"`, so stdout is a machine-readable
+  // channel and a diagnostic line on it is a corrupt connection string.
   const reconstructed = applyServiceEnvironment(service)
   if (reconstructed.removed.length > 0) {
-    console.log(`Ignoring this shell's ${reconstructed.removed.join(', ')}: the application service does not inherit them.`)
+    console.error(`Ignoring this shell's ${reconstructed.removed.join(', ')}: the application service does not inherit them.`)
   }
   if (reconstructed.applied.length > 0) {
-    console.log(`Using the service's own ${reconstructed.applied.join(', ')} (${service.sources.join(', ')}).`)
+    console.error(`Using the service's own ${reconstructed.applied.join(', ')} (${service.sources.join(', ')}).`)
   }
   if (reconstructed.declaredOsAccount) {
-    console.log(`A URL naming no role logs in as "${reconstructed.declaredOsAccount}": this process runs as the account the service runs as.`)
+    console.error(`A URL naming no role logs in as "${reconstructed.declaredOsAccount}": this process runs as the account the service runs as.`)
   }
 
   // Opens no connection: it is pure string work over two environment variables, and the

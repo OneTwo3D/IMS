@@ -377,11 +377,18 @@ test('dotenv is a runtime dependency, because `npm ci --omit=dev` has to be able
 })
 
 function runScript(args: string[], env: Record<string, string | undefined>) {
+  const cwd = mkdtempSync(join(tmpdir(), 'ims-noenv-'))
+  // THE SERVICE'S ENVIRONMENT, SUPPLIED AS A FILE (o3d-2sm1.5, Codex r17 CRITICAL). The fence
+  // reconstructs PGHOST/PGPORT/PGUSER/PGDATABASE from the file the unit's `EnvironmentFile=`
+  // names and refuses when it cannot read one, so these runs say which file that is instead of
+  // depending on whether the checkout they run from happens to have a .env.
+  const serviceEnvFile = join(cwd, 'service.env')
+  writeFileSync(serviceEnvFile, '')
   try {
     const stdout = execFileSync('node', [join(process.cwd(), ...args[0].split('/')), ...args.slice(1)], {
       encoding: 'utf8',
-      env: { ...process.env, ...env },
-      cwd: mkdtempSync(join(tmpdir(), 'ims-noenv-')),
+      env: { ...process.env, IMS_SERVICE_ENV_FILE: serviceEnvFile, ...env },
+      cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
     })
     return { status: 0, output: stdout }
@@ -417,9 +424,15 @@ test('--print-migration-url composes the URL the migration runs through, and ope
 })
 
 test('--print-migration-url refuses rather than emitting a URL that would create admin-owned objects', () => {
+  // USER IS CLEARED ON PURPOSE (o3d-2sm1.5, Codex r17 MEDIUM). A DATABASE_URL naming no role is
+  // no longer automatically roleless: where this process runs as the account the service runs as,
+  // that account IS the login role the application authenticates with, and emitting it is right.
+  // The refusal this test is about is the case where NOTHING vouches for an account — so nothing
+  // does, and `-c role=` is still never emitted empty.
   const noRole = runScript(['scripts/fence-db-connections.mjs', '--print-migration-url'], {
     DEPLOY_ADMIN_DATABASE_URL: 'postgresql://deployadmin@127.0.0.1:5432/ims',
     DATABASE_URL: 'postgresql://127.0.0.1:5432/ims',
+    USER: '',
     DIRECT_URL: '',
   })
   assert.notEqual(noRole.status, 0)
