@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
-import { execFileSync, spawn } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { execFileSync, spawn, spawnSync } from 'node:child_process'
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -7648,5 +7648,477 @@ test('r31: a dry run probes a root-owned snapshot, publishes nothing, and cleans
     assert.match(probe.output, /^AFTER=gone$/m, 'and the snapshot is removed when it is done with')
   } finally {
     rmSync(join(dirs.app, '..'), { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// r32: SUBSTITUTION OF THE IMPORTS (o3d-2sm1.5, Codex CRITICAL)
+//
+// r29 closed DELETION, r30 closed SUBSTITUTION AT READ, r31 closed SUBSTITUTION AT WRITE — and
+// all three protected ONE FILE. The protected mirror reached its `node_modules` through a symlink
+// into the application-owned checkout, and `fence-db-connections.mjs` imports at module scope, so
+// the account being defended against still chose executable bytes in every supposedly protected
+// process. A substituted `pg` can read argv, exit 0 for --preflight and --fence, print a
+// migration URL of its own, and never revoke anything.
+//
+// The tests below run REAL node processes out of the published artefact. "The substituted package
+// never ran" is answered by the filesystem, and the CONTROL in each one proves the substitution
+// was live — a test where the swap did nothing would pass for the wrong reason.
+// ---------------------------------------------------------------------------
+
+/** A helper that reports which `pg` it got and, if it is the substituted one, what it stole. */
+function importReportingHelper(dir: string): string {
+  return [
+    "import { writeFileSync } from 'node:fs'",
+    "import pg from 'pg'",
+    `writeFileSync(${JSON.stringify(join(dir, 'flavour.txt'))}, String(pg.FLAVOUR))`,
+    '',
+  ].join('\n')
+}
+
+/** The `pg` an application account would put there instead: it steals the admin credential. */
+const STEALING_PG = [
+  "require('fs').writeFileSync(process.env.IMS_TEST_STOLEN_PATH, String(process.env.DEPLOY_ADMIN_DATABASE_URL ?? ''))",
+  "module.exports = { Client: class {}, FLAVOUR: 'SUBSTITUTED-PG' }",
+  '',
+].join('\n')
+
+/** The library alone, pointed at a scratch root laid out by writeFenceCheckout(). */
+function artefactHarness(root: string, body: string[]): string {
+  return [
+    'set -uo pipefail',
+    'exec 2>&1',
+    `source ${JSON.stringify(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'))}`,
+    `DB_FENCE_SCRIPT=${JSON.stringify(checkoutHelper(root))}`,
+    ...protectedLibraryLines(root),
+    `DB_FENCE_STATE=${JSON.stringify(join(root, 'state.json'))}`,
+    'chown(){ :; }',
+    ...body,
+  ].join('\n')
+}
+
+test('r32: a dependency substituted in the checkout is never the one the protected helper imports', () => {
+  // THE LOAD-BEARING TEST FOR THE CRITICAL. Two real node processes, one artefact, one swap.
+  //
+  // MUTATION ROUTE (verified by making each change locally and re-running):
+  //   1. put r31's hop back — replace the `_fence_vendor_into` call in _fence_stage_and_publish()
+  //      with `ln -sfn "${app_dir}/node_modules" "${DB_FENCE_PROTECTED_APP_DIR}/node_modules"`.
+  //      The published tree then resolves `pg` through the checkout, ${dir}/STOLEN appears holding
+  //      the admin URL, and both the flavour and the STOLEN assertions fail.
+  //   2. drop `--no-dereference` from the copy and point ${app}/node_modules/pg at a directory
+  //      outside the checkout: the escape stops being refused and is copied in silently.
+  const dir = mkdtempSync(join(tmpdir(), 'ims-r32-swap-'))
+  try {
+    writeFenceCheckout(dir, importReportingHelper(dir))
+    const stolen = join(dir, 'STOLEN')
+    const flavour = join(dir, 'flavour.txt')
+
+    const resolved = runShell(artefactHarness(dir, ['script="$(db_fence_script_in_use)" || exit 1', 'echo "SCRIPT=${script}"']))
+    assert.equal(resolved.status, 0, `the artefact must publish:\n${resolved.output}`)
+    const script = /^SCRIPT=(.+)$/m.exec(resolved.output)?.[1]
+    assert.equal(script, protectedPaths(dir).helper, `and the resolved script is the protected one:\n${resolved.output}`)
+
+    // THE SWAP. The account owns node_modules and does not need to delete anything — only to
+    // supply something that works.
+    writeFileSync(checkoutPgEntry(dir), STEALING_PG)
+
+    const env = {
+      ...process.env,
+      DEPLOY_ADMIN_DATABASE_URL: 'postgresql://admin:sup3rsecret@127.0.0.1:5432/imsdb',
+      IMS_TEST_STOLEN_PATH: stolen,
+    }
+    const run = spawnSync('node', [script!], { encoding: 'utf8', env, cwd: dir })
+    assert.equal(run.status, 0, `the protected helper must still run:\n${run.stdout}${run.stderr}`)
+    assert.equal(readFileSync(flavour, 'utf8'), 'SHIPPED-PG', 'and it imported the VENDORED pg, not the checkout\'s')
+    assert.ok(!existsSync(stolen), 'so nothing wrote the admin credential out')
+
+    // THE CONTROL, and it is what makes the two assertions above mean something: the very same
+    // substituted package, reached from the checkout's own copy of the helper, DOES run and DOES
+    // steal. The swap was live; the artefact is what refused it.
+    const control = spawnSync('node', [checkoutHelper(dir)], { encoding: 'utf8', env, cwd: dir })
+    assert.equal(control.status, 0, `${control.stdout}${control.stderr}`)
+    assert.equal(readFileSync(flavour, 'utf8'), 'SUBSTITUTED-PG', 'the substitution is real')
+    assert.equal(
+      readFileSync(stolen, 'utf8'),
+      'postgresql://admin:sup3rsecret@127.0.0.1:5432/imsdb',
+      'and it captures the credential the deploy hands the helper',
+    )
+
+    // AND THE MIRROR HOLDS A REAL DIRECTORY, not a link back into the checkout. lstat, because
+    // existsSync follows symlinks and would be satisfied by exactly the thing r31 shipped.
+    const modules = join(protectedPaths(dir).app, 'node_modules')
+    assert.ok(lstatSync(modules).isDirectory(), 'the mirror\'s node_modules must be a directory')
+    assert.ok(!lstatSync(modules).isSymbolicLink(), 'and never a symlink')
+    assert.ok(existsSync(protectedPaths(dir).pgEntry), 'with the package really copied into it')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('r32: no module resolution out of the protected artefact can reach the application directory', () => {
+  // THE OTHER HALF OF THE SAME CLAIM, and it is a property of the PATH rather than of a check:
+  // ${APP_DIR} is not an ancestor of /etc/ims-cutover-recovery/app, so no walk that starts inside
+  // the mirror can arrive there. A specifier that was not vendored is ERR_MODULE_NOT_FOUND — a
+  // fence that refuses — and never a package the application account chose.
+  //
+  // MUTATION ROUTE: symlink the mirror's node_modules at the checkout's (r31's shape) and the
+  // second assertion fails: `late` resolves and the run exits 0.
+  const dir = mkdtempSync(join(tmpdir(), 'ims-r32-walk-'))
+  try {
+    // A helper that imports something OUTSIDE DB_FENCE_VENDOR_ROOTS, and a package of that name
+    // sitting in the checkout where the r31 hop would have found it.
+    writeFenceCheckout(dir, "import 'late-addition'\nprocess.stdout.write('LOADED\\n')\n")
+    const late = join(dir, 'app', 'node_modules', 'late-addition')
+    mkdirSync(late, { recursive: true })
+    writeFileSync(join(late, 'package.json'), `${JSON.stringify({ name: 'late-addition', version: '0.0.0', main: 'index.js' })}\n`)
+    writeFileSync(join(late, 'index.js'), "module.exports = {}\n")
+
+    const resolved = runShell(artefactHarness(dir, ['script="$(db_fence_script_in_use)" || exit 1', 'echo "SCRIPT=${script}"']))
+    assert.equal(resolved.status, 0, `the artefact must publish:\n${resolved.output}`)
+    const script = /^SCRIPT=(.+)$/m.exec(resolved.output)![1]
+
+    // FROM THE CHECKOUT it resolves, because the checkout is where the package is.
+    const control = spawnSync('node', [checkoutHelper(dir)], { encoding: 'utf8', cwd: dir })
+    assert.equal(control.status, 0, `precondition — the package really is resolvable in the checkout:\n${control.stderr}`)
+    assert.match(control.stdout, /LOADED/, 'and the import really is reached')
+
+    // FROM THE MIRROR it does not, and the failure is the interpreter's, not a guess.
+    const run = spawnSync('node', [script], { encoding: 'utf8', cwd: dir })
+    assert.notEqual(run.status, 0, `an unvendored import must not resolve from the mirror:\n${run.stdout}${run.stderr}`)
+    assert.match(run.stderr, /ERR_MODULE_NOT_FOUND|Cannot find package/, run.stderr)
+    assert.doesNotMatch(run.stdout, /LOADED/, 'and nothing out of the application directory was executed')
+
+    // AND THE PATHS SAY SO. The mirror is not under the checkout, so the walk has nowhere to
+    // arrive: it ends at the filesystem root.
+    assert.ok(
+      !protectedPaths(dir).app.startsWith(join(dir, 'app') + '/'),
+      'the protected artefact must not live inside the application directory',
+    )
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+/** The recipe the library computes with, and the one docs/installation.md prints. */
+const ARTEFACT_RECIPE = (() => {
+  const library = readFileSync(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'), 'utf8')
+  const line = /^DB_FENCE_ARTEFACT_RECIPE="(.+)"$/m.exec(library)
+  assert.ok(line, 'the library must state the digest recipe as one string')
+  return line[1].replace(/\\\\/g, '\\')
+})()
+
+test('r32: the recorded digest covers the whole tree, and the documented command reproduces it', () => {
+  // A DIGEST AN OPERATOR CANNOT REPRODUCE IS A CHECK THEY WILL CONCLUDE IS BROKEN AND STOP
+  // RUNNING. So the recipe is one string in the library, the library hashes with exactly those
+  // bytes, docs/installation.md prints exactly that string, and this runs it.
+  //
+  // MUTATION ROUTE (each verified locally):
+  //   1. change `printf '%s\n' "$manifest" | sha256sum` in _fence_tree_digest() back to
+  //      `printf '%s'` — one missing newline — and the reproduction assertion fails: the recorded
+  //      value and the documented command's value differ, which is exactly the failure mode this
+  //      test exists for, and nothing else in the suite notices.
+  //   2. make the manifest hash only scripts/ and the "covers the vendored packages" assertion
+  //      fails: touching a vendored file stops being detected.
+  const dir = mkdtempSync(join(tmpdir(), 'ims-r32-digest-'))
+  try {
+    writeFenceCheckout(dir, importReportingHelper(dir))
+    const paths = protectedPaths(dir)
+    assert.equal(runShell(artefactHarness(dir, ['db_fence_script_in_use >/dev/null || exit 1'])).status, 0)
+
+    const record = readFileSync(paths.artefactFile, 'utf8')
+    const recorded = /^fence_artefact_sha256=([0-9a-f]{64})$/m.exec(record)?.[1]
+    assert.ok(recorded, `the record must carry a tree digest:\n${record}`)
+
+    // THE DOCUMENTED COMMAND, run verbatim in the published tree.
+    const reproduced = execFileSync('bash', ['-c', ARTEFACT_RECIPE], { cwd: paths.app, encoding: 'utf8' }).split(' ')[0]
+    assert.equal(reproduced, recorded, 'the documented command must reproduce the recorded digest')
+
+    // AND THE RUNBOOK PRINTS THAT SAME STRING, so the operator is not reproducing a different one.
+    const runbook = readFileSync(join(process.cwd(), 'docs/installation.md'), 'utf8')
+    assert.ok(runbook.includes(ARTEFACT_RECIPE), `docs/installation.md must print the recipe verbatim:\n${ARTEFACT_RECIPE}`)
+
+    // IT COVERS THE VENDORED PACKAGES. Change one byte of a dependency, leave the entry file
+    // alone, and the resolution refuses — while the entry file's own digest is untouched, which
+    // is precisely what r31's check would have looked at and passed.
+    const entryBefore = execFileSync('sha256sum', [paths.helper], { encoding: 'utf8' }).split(' ')[0]
+    writeFileSync(paths.pgEntry, `${readFileSync(paths.pgEntry, 'utf8')}// moved\n`)
+    const entryAfter = execFileSync('sha256sum', [paths.helper], { encoding: 'utf8' }).split(' ')[0]
+    assert.equal(entryAfter, entryBefore, 'precondition: the entry file did not move, only a dependency did')
+
+    const after = runShell(artefactHarness(dir, ['db_fence_script_in_use >/dev/null; echo "RC=$?"']))
+    assert.match(after.output, /^RC=1$/m, `a moved dependency must be refused:\n${after.output}`)
+    assert.match(after.output, /is not the tree its record binds/, after.output)
+    assert.match(after.output, /sha256sum -c/, 'and it must say how to find WHICH file moved')
+
+    // The manifest it points at really does name it, so that instruction is not decoration.
+    const check = spawnSync('sha256sum', ['-c', paths.manifestFile], { cwd: paths.app, encoding: 'utf8' })
+    assert.notEqual(check.status, 0, 'the manifest check must fail')
+    assert.match(`${check.stdout}${check.stderr}`, /node_modules\/pg\/lib\/index\.js: FAILED/, `${check.stdout}${check.stderr}`)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('r32: a symlink anywhere in the closure is refused rather than published', () => {
+  // A symlink is FOLLOWED by node and is NOT HASHED by the manifest, so a tree containing one has
+  // an executable surface its digest does not cover — this round's defect coming back in by the
+  // door marked "convenience". Both shapes are refused: a link inside a vendored package, and a
+  // package directory that is itself a link out of the checkout.
+  //
+  // MUTATION ROUTE: delete the `! -type d -a ! -type f` clause from _fence_tree_is_sealed() and
+  // the first case publishes, with /etc/hostname's contents reachable from inside the artefact.
+  // Delete the `relative.startsWith('..')` check in the closure program and the second publishes.
+  const inside = mkdtempSync(join(tmpdir(), 'ims-r32-link-'))
+  try {
+    writeFenceCheckout(inside, importReportingHelper(inside))
+    symlinkSync('/etc/hostname', join(inside, 'app', 'node_modules', 'pg', 'lib', 'sneaked.js'))
+    const result = runShell(artefactHarness(inside, ['db_fence_script_in_use >/dev/null; echo "RC=$?"']))
+    assert.match(result.output, /^RC=1$/m, `a symlink in the closure must stop the publication:\n${result.output}`)
+    assert.match(result.output, /neither a regular file nor a directory/, result.output)
+    assert.match(result.output, /sneaked\.js/, 'and it must name the offending path')
+    assert.ok(!existsSync(protectedPaths(inside).helper), 'and nothing may be left standing to execute')
+  } finally {
+    rmSync(inside, { recursive: true, force: true })
+  }
+
+  const out = mkdtempSync(join(tmpdir(), 'ims-r32-escape-'))
+  try {
+    writeFenceCheckout(out, importReportingHelper(out))
+    const real = join(out, 'elsewhere')
+    renameSync(join(out, 'app', 'node_modules', 'pg'), real)
+    symlinkSync(real, join(out, 'app', 'node_modules', 'pg'))
+    const result = runShell(artefactHarness(out, ['db_fence_script_in_use >/dev/null; echo "RC=$?"']))
+    assert.match(result.output, /^RC=1$/m, `a package that resolves outside the checkout must be refused:\n${result.output}`)
+    assert.match(result.output, /which is outside/, result.output)
+    assert.ok(!existsSync(protectedPaths(out).helper), 'and nothing may be published')
+  } finally {
+    rmSync(out, { recursive: true, force: true })
+  }
+})
+
+test('r32: IMS_FENCE_ARTEFACT_SHA256 pins the whole tree, at publication and at every run', () => {
+  // The entry-file pin authenticates a tenth of what executes. This one authenticates all of it,
+  // and it is what an operator who has already published a release on one host uses to require
+  // byte-identity on the next.
+  //
+  // MUTATION ROUTE: delete the DB_FENCE_EXPECTED_ARTEFACT_SHA256 comparison from
+  // _fence_stage_and_publish() and case 1 publishes under a digest nobody authorised; delete it
+  // from db_fence_script_in_use() and case 3 runs a tree this invocation did not pin.
+  const dir = mkdtempSync(join(tmpdir(), 'ims-r32-pin-'))
+  try {
+    writeFenceCheckout(dir, importReportingHelper(dir))
+    const paths = protectedPaths(dir)
+
+    // 1 — A WRONG PIN AT BOOTSTRAP PUBLISHES NOTHING AT ALL.
+    const wrong = runShell(artefactHarness(dir, [`IMS_FENCE_ARTEFACT_SHA256=${'a'.repeat(64)}`, 'DB_FENCE_EXPECTED_ARTEFACT_SHA256="${IMS_FENCE_ARTEFACT_SHA256}"', 'db_fence_script_in_use >/dev/null; echo "RC=$?"']))
+    assert.match(wrong.output, /^RC=1$/m, `a mismatched pin must refuse:\n${wrong.output}`)
+    assert.match(wrong.output, /IMS_FENCE_ARTEFACT_SHA256 expects/, wrong.output)
+    assert.ok(!existsSync(paths.app), 'and leave nothing behind under the protected directory')
+
+    // 2 — WITHOUT A PIN IT BOOTSTRAPS, and the digest it records is the one to pin with.
+    assert.equal(runShell(artefactHarness(dir, ['db_fence_script_in_use >/dev/null || exit 1'])).status, 0)
+    const digest = /^fence_artefact_sha256=([0-9a-f]{64})$/m.exec(readFileSync(paths.artefactFile, 'utf8'))![1]
+
+    // 3 — THE RIGHT PIN RUNS; A WRONG ONE REFUSES A TREE ALREADY STANDING.
+    const pinned = runShell(artefactHarness(dir, [`IMS_FENCE_ARTEFACT_SHA256=${digest}`, 'DB_FENCE_EXPECTED_ARTEFACT_SHA256="${IMS_FENCE_ARTEFACT_SHA256}"', 'db_fence_script_in_use >/dev/null; echo "RC=$?"']))
+    assert.match(pinned.output, /^RC=0$/m, `the matching pin must be accepted:\n${pinned.output}`)
+    // A mismatched pin against a standing artefact is refused at the ROTATION: the pin says
+    // "publish this exact tree", the tree that can be assembled is not it, and nothing is written.
+    const mismatched = runShell(artefactHarness(dir, [`IMS_FENCE_ARTEFACT_SHA256=${'b'.repeat(64)}`, 'DB_FENCE_EXPECTED_ARTEFACT_SHA256="${IMS_FENCE_ARTEFACT_SHA256}"', 'db_fence_script_in_use >/dev/null; echo "RC=$?"']))
+    assert.match(mismatched.output, /^RC=1$/m, `and a mismatched one must refuse:\n${mismatched.output}`)
+    assert.match(mismatched.output, /IMS_FENCE_ARTEFACT_SHA256 expects b{64}/, mismatched.output)
+    assert.match(mismatched.output, /NOTHING was published/, 'and say that nothing moved')
+    assert.equal(
+      /^fence_artefact_sha256=([0-9a-f]{64})$/m.exec(readFileSync(paths.artefactFile, 'utf8'))![1],
+      digest,
+      'the standing artefact is untouched by a refused rotation',
+    )
+
+    // 4 — AND WITH A FENCE STANDING, where rotation is refused outright, the pin is still checked
+    // BEFORE the tree is executed. This is the path that would otherwise run a version the
+    // invocation did not authenticate: the rotation says "not now", and without the second check
+    // the run would carry on with whatever is there.
+    writeFileSync(join(dir, 'state.json'), '{}\n')
+    const standing = runShell(artefactHarness(dir, [`IMS_FENCE_ARTEFACT_SHA256=${'c'.repeat(64)}`, 'DB_FENCE_EXPECTED_ARTEFACT_SHA256="${IMS_FENCE_ARTEFACT_SHA256}"', 'db_fence_script_in_use >/dev/null; echo "RC=$?"']))
+    assert.match(standing.output, /a connection fence is recorded at/, `the rotation must be refused while a fence stands:\n${standing.output}`)
+    assert.match(standing.output, /^RC=1$/m, 'and the run must not go on with an unauthenticated tree')
+    assert.match(standing.output, /Refusing to run a tree this invocation did not authenticate/, standing.output)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// r32: THE OPERATOR-FACING TEXT (o3d-2sm1.5, Codex HIGH x2)
+//
+// Both findings were one defect: the code was fixed in r31 and every printed instruction still
+// described the world before it. So each printed recovery instruction is now asked two questions,
+// and both are asked here rather than by reading:
+//
+//   1. does it name a path that is still TRUSTED?   — the static half below
+//   2. would it actually RUN if pasted?             — the dynamic half, which pastes it
+//
+// An emergency instruction that fails when typed is worse than none: it is followed at the one
+// moment when there is no time to debug it, and the database stays fenced while it is debugged.
+// ---------------------------------------------------------------------------
+
+const ENTRYPOINT_SOURCES = [
+  { name: 'deploy.sh', lines: DEPLOY_LINES },
+  { name: 'update.sh', lines: UPDATE_LINES },
+  { name: 'install.sh', lines: INSTALL_LINES },
+] as const
+
+test('r32: no printed instruction in any entrypoint names the checkout as something to run', () => {
+  // MUTATION ROUTE (verified locally): restore r31's banner line in deploy.sh —
+  //   echo -e "${RED}    node ${DB_FENCE_SCRIPT} --fence --state-file=... ${RESET}" >&2
+  // — and this fails, naming deploy.sh and the line. The same for update.sh's
+  // `error "  node ${DB_FENCE_SCRIPT} --fence ..."` and install.sh's.
+  //
+  // NOT A PROXIMITY RULE. It is about the GRAMMAR of the printed text: an executable invocation
+  // (`node <path>`) whose path is the checkout's. A line that merely mentions ${DB_FENCE_SCRIPT}
+  // in prose — "Restore ${DB_FENCE_SCRIPT} (it ships with the app)" — is not an instruction to
+  // execute it and is not caught, which is why the pattern requires the `node ` prefix.
+  // `\$\{DB_FENCE_SCRIPT\}` exactly — NOT a prefix of it. A first draft wrote the closing brace
+  // as optional and matched `${DB_FENCE_SCRIPT_COPY}`, which is the protected path and the whole
+  // point, so the test failed on the three dry-run lines that describe the correct behaviour.
+  const RUNNABLE =
+    /\bnode\s+(?:"?\$(?:\{DB_FENCE_SCRIPT\}|DB_FENCE_SCRIPT\b)"?|"?\$\{APP_DIR(?:_REAL)?\}[^"\s]*fence-db-connections\.mjs"?|(?:\.\/)?scripts\/fence-db-connections\.mjs)/
+  const offenders: string[] = []
+  for (const { name, lines } of ENTRYPOINT_SOURCES) {
+    for (const line of lines) {
+      if (!isCode(line)) continue
+      // Only lines that PRINT. An actual invocation is `node "$fence_script"` with the resolved
+      // path and is not one of these.
+      if (!/^\s*(echo|printf|warn|error|die|info|success|ok)\b/.test(line.trim())) continue
+      if (RUNNABLE.test(line)) offenders.push(`${name}: ${line.trim()}`)
+    }
+  }
+  assert.deepEqual(
+    offenders,
+    [],
+    'a printed recovery instruction may not tell an operator to execute the application-owned checkout',
+  )
+
+  // AND THE PRECONDITION, so the empty list above is not an empty scan: the same pattern DOES
+  // match the line r31 shipped, run through the same classifier.
+  const r31Line = '          echo -e "${RED}    node ${DB_FENCE_SCRIPT} --fence --state-file=${DB_FENCE_STATE}${RESET}" >&2'
+  assert.ok(isCode(r31Line) && RUNNABLE.test(r31Line), 'precondition: the pattern catches the line this replaced')
+
+  // EVERY ENTRYPOINT POINTS AT THE WRAPPERS, and at nothing else.
+  for (const { name, lines } of ENTRYPOINT_SOURCES) {
+    const source = lines.join('\n')
+    assert.match(source, /^DB_FENCE_RELEASE_CMD="\$\{DB_FENCE_RELEASE_WRAPPER\}"$/m, `${name} must name the release wrapper`)
+    assert.match(source, /^DB_FENCE_REFENCE_CMD="\$\{DB_FENCE_REFENCE_WRAPPER\}"$/m, `${name} must name the re-fence wrapper`)
+    // Nothing may reassign them to a command line again.
+    const rebuilt = lines.filter(
+      (line) => isCode(line) && /^\s*DB_FENCE_(RELEASE|REFENCE)_CMD=/.test(line) && !/WRAPPER\}"$/.test(line.trim()),
+    )
+    assert.deepEqual(rebuilt, [], `${name} must not recompose a recovery command out of a path and arguments`)
+  }
+})
+
+test('r32: the recovery wrapper an operator is given runs, as pasted, with nothing else supplied', () => {
+  // THE LOAD-BEARING TEST FOR BOTH HIGHs. The wrapper is executed as a real process, exactly as
+  // an operator would paste it — no arguments, no environment — and what reaches the protected
+  // helper is read back off the filesystem.
+  //
+  // MUTATION ROUTE (each verified locally):
+  //   1. delete the ${APP_DIR}/.env fallback from the generated wrapper (this is r31's world,
+  //      where the credential had nowhere to come from): PHASE 1 fails — the wrapper exits 1 with
+  //      "DEPLOY_ADMIN_DATABASE_URL is not set" and the helper is never reached.
+  //   2. point `helper=` at ${DB_FENCE_SCRIPT} instead of ${DB_FENCE_SCRIPT_COPY}: phase 1's
+  //      "which file ran" assertion fails.
+  //   3. drop the digest re-check from the wrapper: PHASE 3 fails, and a wrapper left behind
+  //      after the artefact moved would hand the credential to the new tree.
+  const dir = mkdtempSync(join(tmpdir(), 'ims-r32-wrapper-'))
+  try {
+    const log = join(dir, 'invocation.json')
+    writeFenceCheckout(
+      dir,
+      [
+        "import { writeFileSync } from 'node:fs'",
+        "import 'pg'",
+        `writeFileSync(${JSON.stringify(log)}, JSON.stringify({`,
+        '  ran: process.argv[1],',
+        '  argv: process.argv.slice(2),',
+        "  admin: process.env.DEPLOY_ADMIN_DATABASE_URL ?? '',",
+        '}))',
+        '',
+      ].join('\n'),
+    )
+    // The credential where the deploy reads it from — quoted, with a trailing comment, which is
+    // the shape env_file_value() exists for and the shape a naive `grep | cut` gets wrong.
+    writeFileSync(join(dir, 'app', '.env'), 'DEPLOY_ADMIN_DATABASE_URL="postgresql://admin:pw@127.0.0.1:5432/imsdb"  # deploy admin\n')
+
+    const paths = protectedPaths(dir)
+    const publish = runShell(
+      artefactHarness(dir, [
+        'db_fence_script_in_use >/dev/null || exit 1',
+        `db_fence_publish_operator_wrappers "$(id -un)" ${JSON.stringify(join(dir, 'app', '.env'))} ${JSON.stringify(join(dir, 'state.json'))} --app-host=db.internal --app-port=6432 --app-user=imsapp --app-database=imsdb || exit 1`,
+      ]),
+    )
+    assert.equal(publish.status, 0, `the wrappers must be published:\n${publish.output}`)
+    for (const wrapper of [paths.releaseWrapper, paths.refenceWrapper]) {
+      assert.ok(existsSync(wrapper), `${wrapper} must exist`)
+      assert.equal(spawnSync('bash', ['-n', wrapper], { encoding: 'utf8' }).status, 0, `${wrapper} must parse`)
+    }
+
+    // PHASE 1 — PASTED, WITH NOTHING SUPPLIED. This is the whole of Codex's second HIGH: r31's
+    // printed command could not obtain the credential from anywhere.
+    const bare = spawnSync(paths.releaseWrapper, [], { encoding: 'utf8', env: { PATH: process.env.PATH ?? '' } as unknown as NodeJS.ProcessEnv })
+    assert.equal(bare.status, 0, `the wrapper must run with nothing supplied:\n${bare.stdout}${bare.stderr}`)
+    const invocation = JSON.parse(readFileSync(log, 'utf8'))
+    assert.equal(invocation.ran, paths.helper, 'and the file it ran is the PROTECTED one, not the checkout')
+    assert.deepEqual(
+      invocation.argv,
+      ['--release', '--state-file=' + join(dir, 'state.json'), '--app-host=db.internal', '--app-port=6432', '--app-user=imsapp', '--app-database=imsdb'],
+      'with this run\'s state file and the four identity values already filled in',
+    )
+    assert.equal(
+      invocation.admin,
+      'postgresql://admin:pw@127.0.0.1:5432/imsdb',
+      'and the admin credential read out of the same .env the deploy reads',
+    )
+
+    // The re-fence wrapper is the same instruction in the other direction — Codex's third finding,
+    // where the banner still named the checkout at the moment the schema had already moved.
+    rmSync(log)
+    const refence = spawnSync(paths.refenceWrapper, [], { encoding: 'utf8', env: { PATH: process.env.PATH ?? '' } as unknown as NodeJS.ProcessEnv })
+    assert.equal(refence.status, 0, `${refence.stdout}${refence.stderr}`)
+    assert.equal(JSON.parse(readFileSync(log, 'utf8')).argv[0], '--fence', 'the re-fence wrapper raises the fence')
+
+    // PHASE 2 — NO CREDENTIAL ANYWHERE. It refuses, names the variable, and prints its OWN path
+    // in the command that would supply it, so the next paste works too.
+    rmSync(log)
+    renameSync(join(dir, 'app', '.env'), join(dir, 'app', '.env.away'))
+    const noCredential = spawnSync(paths.releaseWrapper, [], { encoding: 'utf8', env: { PATH: process.env.PATH ?? '' } as unknown as NodeJS.ProcessEnv })
+    assert.equal(noCredential.status, 1, 'a wrapper with no credential must refuse')
+    assert.ok(!existsSync(log), 'and must not reach the helper at all')
+    assert.match(noCredential.stderr, /DEPLOY_ADMIN_DATABASE_URL is not set/, noCredential.stderr)
+    assert.match(
+      noCredential.stderr,
+      new RegExp(`DEPLOY_ADMIN_DATABASE_URL='postgresql://ADMIN:PASSWORD@HOST:PORT/DATABASE' ${paths.releaseWrapper}`),
+      `and the command it suggests must name itself, absolutely:\n${noCredential.stderr}`,
+    )
+    // …and that suggestion works, which is the difference between an instruction and a decoration.
+    const supplied = spawnSync(paths.releaseWrapper, [], {
+      encoding: 'utf8',
+      env: { PATH: process.env.PATH ?? '', DEPLOY_ADMIN_DATABASE_URL: 'postgresql://typed:in@127.0.0.1:5432/imsdb' } as unknown as NodeJS.ProcessEnv,
+    })
+    assert.equal(supplied.status, 0, `${supplied.stdout}${supplied.stderr}`)
+    assert.equal(JSON.parse(readFileSync(log, 'utf8')).admin, 'postgresql://typed:in@127.0.0.1:5432/imsdb')
+    renameSync(join(dir, 'app', '.env.away'), join(dir, 'app', '.env'))
+
+    // PHASE 3 — THE ARTEFACT MOVED UNDER IT. A wrapper is a file with a digest baked in; if the
+    // tree it was written for is not the tree on disk, it refuses rather than handing the
+    // credential to whatever is there now.
+    rmSync(log)
+    writeFileSync(paths.pgEntry, `${readFileSync(paths.pgEntry, 'utf8')}// moved\n`)
+    const stale = spawnSync(paths.releaseWrapper, [], { encoding: 'utf8', env: { PATH: process.env.PATH ?? '' } as unknown as NodeJS.ProcessEnv })
+    assert.equal(stale.status, 1, 'a wrapper whose artefact moved must refuse')
+    assert.ok(!existsSync(log), 'and must not run it')
+    assert.match(stale.stderr, /has changed since the fence was raised/, stale.stderr)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
   }
 })

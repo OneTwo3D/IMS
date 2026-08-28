@@ -1019,7 +1019,7 @@ So the precedence is inverted, and it is one rule for every privileged artefact:
 | artefact | which source decides | `APP_DIR/.env` / the checkout |
 | --- | --- | --- |
 | the four identity values | `db-fence-identity.env` whenever it exists | read only to be **compared**; a mismatch is a refusal at **both** adoption call sites |
-| the fence script | `/etc/ims-cutover-recovery/app/scripts/fence-db-connections.mjs`, and it is the only file **executed** | published into the protected path **once**, and never run in place — see r31 below |
+| the fence script **and its imports** | `/etc/ims-cutover-recovery/app/`, a root-owned, wholly digested tree, and the only thing **executed** | published into the protected path **once**, never run in place, and its dependency closure copied rather than linked — see r31 and r32 below |
 | `DEPLOY_ADMIN_DATABASE_URL` | the **root invocation** | fills in only when the invocation is silent; a disagreement is announced |
 | the environment snapshot | the root-owned `zz-` drop-in, which systemd loads **last** | overridden by it for the length of one cutover |
 | the fence state file | the database itself, cross-checked against the record | app-writable by necessity — `--fence` refuses to re-apply a state whose `database` is not the one the connection is attached to |
@@ -1079,7 +1079,8 @@ the fence rather than silently.
 invocation*:
 
 ```bash
-IMS_FENCE_SCRIPT_SHA256=<digest of the release's fence helper> sudo -E bash scripts/update.sh
+# as root, from the release tree being deployed
+IMS_FENCE_SCRIPT_SHA256=<digest of the release's fence helper> bash /path/to/release/scripts/update.sh
 ```
 
 The digest comes **from the release and not from the box** — `git show <tag>:scripts/fence-db-connections.mjs | sha256sum`
@@ -1099,9 +1100,9 @@ Two more properties of the rotation:
 * it is **refused while a fence may be standing** (`db-connect-fence.json` exists). The helper that
   raised a fence is the helper that must release it, from a record the raise wrote; swapping
   versions across that pair is how a release stops meaning what the fence meant.
-* the **second rotation path is root itself**: remove
-  `/etc/ims-cutover-recovery/app/scripts/fence-db-connections.mjs`. Only root can, and the next run
-  bootstraps. It is the escape hatch for a box whose expected digest has been lost, and it is
+* the **second rotation path is root itself**: remove `/etc/ims-cutover-recovery/app` (the whole
+  tree, since r32 — removing only the entry file leaves a vendored closure the next publication
+  would have to reconcile). Only root can, and the next run bootstraps. It is the escape hatch for a box whose expected digest has been lost, and it is
   deliberately an act at the console rather than a flag. Do it only with no fence standing — with a
   record present and the copy gone, every run refuses by design.
 
@@ -1118,36 +1119,161 @@ cutover's worth of time to replace it.
 `--dry-run` is the one invocation that cannot use the publishing path, because a dry run writes
 nothing and least of all under `/etc`. It may not run the checkout's file in place either
 (`--preflight` opens the admin connection with `DEPLOY_ADMIN_DATABASE_URL`, so "it only reads" is a
-property of the *shipped* script). So it uses the protected copy when there is one, and otherwise
-snapshots the checkout's bytes into a **throwaway root-owned directory**, probes that, and removes
-it.
+property of the *shipped* script). So it uses the protected artefact when there is one, and otherwise
+snapshots the checkout's bytes **and their resolved dependency closure** into a **throwaway
+root-owned directory** laid out the same way, seals and probes that, and removes it.
 
 **Where the protected copy lives, and why it is not a bare file under `/etc`.**
-`fence-db-connections.mjs` imports `pg` and `dotenv` and derives the application directory from its
-*own location*. Node resolves bare specifiers by walking up from the importing module's directory,
-not from the working directory, and `NODE_PATH` does not apply to ESM at all — so the copy r30
-published at `/etc/ims-cutover-recovery/fence-db-connections.mjs` resolved `node_modules` from
-`/etc` and `/`, found neither, and would have died with `ERR_MODULE_NOT_FOUND` before it could fence
-anything. Every caller stubs the process boundary, so no test saw it. The copy is now published
-into a root-owned **mirror of the shipped layout**:
+`fence-db-connections.mjs` imports `pg` and node builtins, and node resolves bare specifiers by
+walking up from the importing module's directory, not from the working directory, and `NODE_PATH`
+does not apply to ESM at all — so the copy r30 published at
+`/etc/ims-cutover-recovery/fence-db-connections.mjs` resolved `node_modules` from `/etc` and `/`,
+found neither, and would have died with `ERR_MODULE_NOT_FOUND` before it could fence anything.
+Every caller stubs the process boundary, so no test saw it. The copy is published into a root-owned
+**mirror of the shipped layout** — see r32 below for what is inside it.
+
+### r32: the protected copy imported application-controlled code
+
+r29 closed **deletion**, r30 **substitution at read**, r31 **substitution at write** — and all three
+protected exactly *one file*. `/etc/ims-cutover-recovery/app/node_modules` was a **symlink back into
+`APP_DIR/node_modules`**, and `fence-db-connections.mjs` imported `dotenv` and `pg` at module
+scope, before `main()` had a statement to run. So the account this whole mechanism defends against
+still chose executable bytes in every supposedly protected process. A substituted `pg` can read
+`argv`, exit 0 for `--preflight` and `--fence`, print a migration URL of its own, and never revoke
+anything — the exact lie the protection claims to close — and hashing the entry file authenticated
+a tenth of what ran.
+
+**`dotenv` was removed rather than vendored.** It existed for a single call, loading `<app dir>/.env`
+so that a pasted `--release` command would pick up `DEPLOY_ADMIN_DATABASE_URL`. Under the mirror
+that call resolved `/etc/ims-cutover-recovery/app/.env`, which does not exist: it supplied nothing
+while holding a whole package open in the import graph. The shell side already reads that file
+(`env_file_value()`, in all three entrypoints) and passes the value through `env`, and the recovery
+wrappers below do the same. **The helper now reads no file out of the application directory at
+all** — the credential arrives in the environment or the run refuses.
+
+**`pg` is vendored, with its whole closure.** The transitive closure is resolved with node's own
+resolver from `APP_DIR/scripts/`, so nesting (`pg-types/node_modules/postgres-array`) is preserved
+exactly, and it is **copied**, root-owned, into the mirror:
 
 | path | what it is |
 | --- | --- |
 | `/etc/ims-cutover-recovery/app/scripts/fence-db-connections.mjs` | the only file executed |
-| `/etc/ims-cutover-recovery/app/node_modules` | a symlink to `<app dir>/node_modules` |
+| `/etc/ims-cutover-recovery/app/node_modules/pg/…` | a real root-owned directory, not a link |
+| `/etc/ims-cutover-recovery/app/node_modules/pg-protocol/…` etc. | …and the rest of the resolved closure (13 packages, ~140 files) |
+| `/etc/ims-cutover-recovery/db-fence-artefact.sha256` | what the tree hashes to, and what the entry file hashes to |
+| `/etc/ims-cutover-recovery/db-fence-artefact.manifest` | per-file digests, so a mismatch can name the file |
+| `/etc/ims-cutover-recovery/release-db-fence` | the root-owned recovery wrapper (below) |
+| `/etc/ims-cutover-recovery/refence-db` | the same, for raising the fence again |
 
-which makes `appDirectory()` name a root-owned directory (so no `.env` is read from `/`, and a
-stray `/etc/.env` is not read either) and makes the module walk find the application's installed
-dependencies at the first hop.
+Three refusals make that a boundary rather than a copy:
 
-**What this does and does not buy — stated rather than implied.** The mechanism fixes *which bytes
-of the helper run*. It does not make the helper's `node_modules` trusted, and it could not without
-vendoring a runtime. Note what bounds that: the helper is executed **as the application user** on
-every path, by design — the fence state file has to be releasable by that account — so
-`DEPLOY_ADMIN_DATABASE_URL` is reachable from that account through `/proc` whatever bytes run. What
-substitution bought, and ownership of `node_modules` does not, is the ability to **lie**: to report
-a raised fence over an open database, and let a migration proceed against live writers. That is
-what is closed.
+* **a package that resolves outside `APP_DIR`** (a `node_modules` entry that is a symlink
+  elsewhere) is refused, not followed;
+* **anything in the staged tree that is not a regular file or a directory** — a symlink, device,
+  fifo or socket — is refused *by name*. A symlink is followed by node and is **not hashed** by the
+  manifest, so a tree containing one has executable surface its digest does not cover;
+* **a closure over `DB_FENCE_VENDOR_MAX_FILES` (2000) files** is refused. A `package.json` in the
+  checkout can declare anything as a dependency, and this bounds what the application account can
+  talk root into copying under `/etc`.
+
+The module walk **cannot reach `APP_DIR`**, and that is a property of the path rather than of a
+check: from `/etc/ims-cutover-recovery/app/scripts/` node tries `…/app/scripts/node_modules`,
+`…/app/node_modules` (hit), and stops; even for a specifier that was *not* vendored the walk
+continues `/etc/ims-cutover-recovery/node_modules`, `/etc/node_modules`, `/node_modules` and ends
+at the root. `APP_DIR` is not an ancestor of the mirror, so no walk from inside it can arrive
+there. A missing package is `ERR_MODULE_NOT_FOUND` — a fence that refuses — never a package the
+application account chose.
+
+#### The artefact digest, and how to reproduce it
+
+The recorded digest covers **every regular file in the tree**, content and relative path only —
+no timestamps, no inode numbers, no absolute paths — so the value is the same on the box that
+published it, on the box that verifies it, and in a clean reproduction from the release:
+
+```bash
+cd /etc/ims-cutover-recovery/app && find . -type f -printf '%P\0' | LC_ALL=C sort -z | xargs -0 -r sha256sum -- | sha256sum
+```
+
+That is the literal command the library computes with; a test asserts that the library, this page
+and the recorded value all agree, because a documented check that does not reproduce is a check an
+operator concludes is broken and stops running. Compare its output with `fence_artefact_sha256` in
+`/etc/ims-cutover-recovery/db-fence-artefact.sha256`. When they differ,
+`cd /etc/ims-cutover-recovery/app && sha256sum -c /etc/ims-cutover-recovery/db-fence-artefact.manifest`
+names **which** file moved, which "the digest changed" does not.
+
+The digest is **verified before every execution**, along with the seal (every file owned by root,
+nothing group- or other-writable, nothing that is not a regular file or a directory). A mismatch is
+a refusal, not a warning.
+
+**Reproducing it from a release.** The entry file comes from git, so
+`git show <tag>:scripts/fence-db-connections.mjs | sha256sum` is exact. The vendored packages come
+from the registry through `package-lock.json`, so `npm ci` at that tag in a clean tree produces the
+same package contents, and the same command over a tree assembled the same way reproduces the
+artefact digest. What it does not survive is a package manager that rewrites package contents on
+install; if that is ever true here, the entry-file digest is still exact and the artefact digest
+degrades to "identical to what this box published", which is what the standing record is for.
+
+**`IMS_FENCE_ARTEFACT_SHA256` pins the whole tree**, the way `IMS_FENCE_SCRIPT_SHA256` pins the
+entry file — and it is the stronger of the two. Supplied, it is enforced **at publication** (the
+staged tree must hash to it, or nothing is published) *and* **at every execution** (the standing
+record must say it, or nothing is run). It is what an operator who has already published a release
+on one host uses to require byte-identity on the next.
+
+**What the application account still controls — stated rather than implied.**
+
+* **Bootstrap.** The first publication takes the entry file *and the packages* from the checkout,
+  because there is nothing else on the box to take them from. `IMS_FENCE_SCRIPT_SHA256` and
+  `IMS_FENCE_ARTEFACT_SHA256` are how an operator refuses to trust that.
+* **The process it runs as.** The helper is executed **as the application user** on every in-script
+  path, by design — the fence state file has to be releasable by that account — so
+  `DEPLOY_ADMIN_DATABASE_URL` is reachable from that account through `/proc` and `ptrace` whatever
+  bytes run. Vendoring does not change that and does not claim to. What it closes is the ability to
+  **lie**: to report a raised fence over an open database, or to hand back a migration URL that
+  points somewhere else.
+* **The interpreter.** `node` is taken from root's `PATH`. A root `PATH` containing an
+  application-writable directory defeats this and every other protection here; that is a
+  host-hardening property, not one these scripts can assert.
+* **`APP_DIR/.env`.** It still holds the credential, and the recovery wrapper still reads it from
+  there — with a one-key reader and never `source`. That is a *credential* the account already
+  has, not code.
+
+#### The two commands an operator is ever given
+
+r31 fixed which bytes the scripts execute and left every printed instruction describing the world
+before it. Two separate defects of one kind:
+
+* the printed `--release` line named the protected copy but had **no way to obtain**
+  `DEPLOY_ADMIN_DATABASE_URL`. The helper's `.env` load resolved against its own mirrored location,
+  and the mirror holds no `.env`; the deploy's copy of the variable lives in *its* shell, not the
+  operator's. Pasted, it failed while the database stayed fenced — the primary recovery guidance
+  was an outage-extending dead end.
+* the re-fence banner — printed at the single highest-pressure moment in the script, schema moved
+  and fence down — still said `node ${DB_FENCE_SCRIPT} --fence`, the **application-owned** path.
+
+So nothing prints a command line any more. Root writes two wrappers at fence time, and the banners
+print their paths:
+
+```bash
+/etc/ims-cutover-recovery/release-db-fence      # release the standing fence
+/etc/ims-cutover-recovery/refence-db            # raise it again
+```
+
+Each one is root-owned and `0700`, **never sources anything from the checkout**, carries this run's
+state file and four identity values baked in, re-verifies the artefact digest before `exec`, takes
+`DEPLOY_ADMIN_DATABASE_URL` from its own environment or from `APP_DIR/.env` with the same one-key
+reader the entrypoints use, and runs the helper **as the application user**. Run either as root
+(or as the application account itself). There is nothing to fill in:
+
+```bash
+sudo /etc/ims-cutover-recovery/release-db-fence
+```
+
+and if no credential can be found it says exactly what to set:
+
+```bash
+DEPLOY_ADMIN_DATABASE_URL='postgresql://ADMIN:PASSWORD@HOST:PORT/DATABASE' \
+  /etc/ims-cutover-recovery/release-db-fence
+```
 
 **The credential is the part no record may hold.** `DEPLOY_ADMIN_DATABASE_URL` carries a password
 and is written nowhere by these scripts. On a recovery where `APP_DIR/.env` is gone it can only

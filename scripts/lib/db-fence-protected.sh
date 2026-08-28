@@ -858,8 +858,11 @@ db_fence_publish_operator_wrappers() {
       printf 'expected_artefact=%q\n' "${artefact_digest}"
       printf 'mode=%q\n' "${mode}"
       cat <<'WRAPPER_EOF'
-if [[ "$(id -u)" -ne 0 ]]; then
-  echo "Run this as root: it runs the protected fence helper as ${app_account}." >&2
+# Root, because switching to the application account needs it — or the application account
+# itself, which needs no switch and is who the helper runs as on every path anyway. Anyone else
+# would fail at runuser with a less useful message.
+if [[ "$(id -u)" -ne 0 && "$(id -un)" != "${app_account}" ]]; then
+  echo "Run this as root, or as ${app_account}: it runs the protected fence helper as ${app_account}." >&2
   exit 1
 fi
 # The tree this is about to execute must still be the tree this wrapper was written for.
