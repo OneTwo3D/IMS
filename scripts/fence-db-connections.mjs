@@ -142,11 +142,35 @@
 
 import { randomBytes } from 'node:crypto'
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
+import { createRequire } from 'node:module'
 import { dirname } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
 import { config as loadDotenv } from 'dotenv'
 import pg from 'pg'
+
+/**
+ * THE PARSER `pg` ITSELF LOADS, not a copy of its rules (o3d-2sm1.5, Codex r15 CRITICAL).
+ *
+ * Two rounds on this file have now ended with "our reimplementation of the driver's rules
+ * differs from the driver's rules": first the authority/query precedence, then repeated
+ * parameters, where `URLSearchParams.get()` returns the FIRST value while pg-connection-string
+ * copies every entry into one config object, so the LAST one wins. A third reimplementation
+ * invites a fourth finding, so the effective host/port/user/database are now DERIVED by the
+ * driver's own parser and this file no longer holds an opinion about how a URL resolves.
+ *
+ * Resolved from `pg`'s own directory rather than from ours, so that if the tree ever carries two
+ * copies of pg-connection-string this reads the one `pg/lib/connection-parameters.js` requires --
+ * the point being that it is the SAME CODE, not merely the same version number.
+ */
+const scriptRequire = createRequire(import.meta.url)
+export const parseWithDriver = (() => {
+  try {
+    return scriptRequire(scriptRequire.resolve('pg-connection-string', { paths: [dirname(scriptRequire.resolve('pg'))] })).parse
+  } catch {
+    return scriptRequire('pg-connection-string').parse
+  }
+})()
 
 export const EXIT_OK = 0
 export const EXIT_ERROR = 1
@@ -266,37 +290,53 @@ function decodeOrRaw(value) {
 }
 
 /**
+ * The query parameters that decide WHERE a connection lands and AS WHOM. Repeating any of these
+ * is refused outright (see parseConnectionIdentity).
+ */
+const IDENTITY_PARAMS = ['host', 'port', 'user', 'dbname', 'database']
+
+/**
  * Pure: the (login role, server, database) a libpq connection URL EFFECTIVELY names -- what
  * node-postgres will actually connect as and to, not what the URL's obvious components suggest.
  *
- * THE QUERY STRING WINS OVER THE AUTHORITY, AND IT REDIRECTS THE CONNECTION (o3d-2sm1.5, Codex
- * r14 CRITICAL). This used to read the authority first and consult the query only as a fallback.
- * The installed parser (pg-connection-string, reached through pg) does the opposite: it copies
- * every query parameter into the config FIRST, and only then fills in `host`, `port` and `user`
- * from the authority `if` the query left them unset. So
+ * THE EFFECTIVE VALUES ARE THE DRIVER'S OWN (o3d-2sm1.5, Codex r15 CRITICAL). They are read out
+ * of `parseWithDriver()` -- the very pg-connection-string module `pg` requires -- rather than
+ * re-derived here. Two rounds running, a hand-rolled re-derivation disagreed with the real
+ * parser and the fence proved itself against a connection nobody uses:
  *
- *     postgres://app@localhost:5432/appdb?host=remote.example&port=6432&user=actual
+ *   r14  the authority was read first and the query consulted only as a fallback. The driver
+ *        does the opposite -- it copies every query parameter into the config FIRST and fills
+ *        `host`, `port` and `user` from the authority only `if` the query left them unset -- so
+ *        `postgres://app@localhost:5432/appdb?host=remote.example&port=6432&user=actual` was
+ *        classified as `app` at localhost:5432 while the application authenticated as `actual`
+ *        against remote.example:6432.
+ *   r15  the query was then read with `URLSearchParams.get()`, which returns the FIRST value.
+ *        The driver iterates `searchParams.entries()` into one config object, so the LAST
+ *        duplicate wins: `?host=local&host=remote&port=5432&port=6432&user=app&user=other` read
+ *        here as local:5432/app and connected to remote:6432/other.
  *
- * was classified here as `app` at localhost:5432 -- it passed against a local admin URL naming
- * the same database -- while the application's own adapter authenticated as `actual` against
- * remote.example:6432. Preflight, the fence and the release then all succeeded against the wrong
- * cluster and the wrong role, and the application went on writing across the migration through a
- * connection nothing in this script had ever looked at.
+ * So there are now two rules, both fail-closed, and neither of them re-implements libpq:
  *
- * Two rules, both fail-closed:
+ *   * A REPEATED IDENTITY PARAMETER IS REFUSED. Not resolved to the driver's answer -- refused.
+ *     The driver's answer is knowable, but a URL that names two hosts is a URL whose reader and
+ *     whose driver see different databases, and every ambiguity in this file is refused rather
+ *     than resolved (an authority that disagrees with its own query string, below, is refused on
+ *     exactly the same grounds). Refusal is also the one answer that cannot go stale if the
+ *     driver's precedence changes again.
+ *   * ANYTHING ELSE IS WHATEVER THE DRIVER SAYS IT IS. `host`, `port`, `user` and `database`
+ *     come straight out of the driver's config, so `?host=` falling back to the authority, the
+ *     `@/` empty-authority form, percent-decoding and the unconditional overwrite of `database`
+ *     from the pathname are the driver's behaviour by construction rather than by imitation.
  *
- *   * The EFFECTIVE value is the query parameter when it carries one, exactly as the driver
- *     resolves it (`config.host || authority`, so an EMPTY parameter still falls back).
- *   * A URL that says one thing in its authority and a DIFFERENT thing in its query string is
- *     REFUSED rather than resolved. The driver would take the query value, but an environment
- *     that disagrees with itself about which server or which role it means is not a thing to
- *     pick a winner from -- and this check exists precisely to stop "probably what they meant".
+ * A URL that says one thing in its authority and a DIFFERENT thing in its query string is still
+ * REFUSED rather than resolved. The driver would take the query value, but an environment that
+ * disagrees with itself about which server or which role it means is not a thing to pick a
+ * winner from -- and this check exists precisely to stop "probably what they meant".
  *
- * `database` is deliberately taken from the path alone: the driver overwrites `config.database`
- * from the pathname UNCONDITIONALLY, so `?dbname=`/`?database=` change nothing whatever. Carrying
- * one is a statement about the database that the connection will not honour, and a false
- * statement about WHICH DATABASE is the entire subject of this section -- so it is refused rather
- * than silently ignored.
+ * `?dbname=`/`?database=` are likewise refused when they name something other than the path: the
+ * driver overwrites `config.database` from the pathname UNCONDITIONALLY, so such a parameter is a
+ * statement about the database that the connection will not honour, and a false statement about
+ * WHICH DATABASE is the entire subject of this section.
  */
 export function parseConnectionIdentity(connectionString) {
   if (!connectionString) return { ok: false, reason: 'is not set' }
@@ -318,18 +358,37 @@ export function parseConnectionIdentity(connectionString) {
   }
   const params = url.searchParams
 
+  // A repeated identity parameter, refused BEFORE anything is resolved.
+  for (const name of IDENTITY_PARAMS) {
+    const all = params.getAll(name)
+    if (all.length > 1) {
+      return {
+        ok: false,
+        reason: `carries ?${name}= ${all.length} times (${all.map((value) => JSON.stringify(value)).join(', ')}). node-postgres copies EVERY query parameter into one config object, so the LAST one is the one it connects with, while anything reading the URL a parameter at a time sees the first — which is how a URL passes a check here and opens somewhere else. Refusing to pick a winner; delete all but one`,
+      }
+    }
+  }
+
+  // The effective values, as resolved by the module `pg` itself requires. It can throw — an
+  // sslcert/sslkey/sslrootcert it cannot read, a uselibpqcompat conflict — and a URL the driver
+  // will not parse is a URL this cannot identify.
+  let driver
+  try {
+    driver = parseWithDriver(connectionString)
+  } catch {
+    return { ok: false, reason: 'cannot be parsed by node-postgres (pg-connection-string rejected it), so where it connects is unknown' }
+  }
+
   const authorityHost = !emptyAuthorityHost && url.hostname ? decodeOrRaw(url.hostname) : ''
   const authorityPort = url.port || ''
   const authorityUser = url.username ? decodeOrRaw(url.username) : ''
-  const queryHost = params.get('host') || ''
-  const queryPort = params.get('port') || ''
-  const queryUser = params.get('user') || ''
 
-  for (const [name, authority, query] of [
-    ['host', authorityHost, queryHost],
-    ['port', authorityPort, queryPort],
-    ['user', authorityUser, queryUser],
+  for (const [name, authority] of [
+    ['host', authorityHost],
+    ['port', authorityPort],
+    ['user', authorityUser],
   ]) {
+    const query = params.get(name) || ''
     if (query && authority && query !== authority) {
       return {
         ok: false,
@@ -338,7 +397,7 @@ export function parseConnectionIdentity(connectionString) {
     }
   }
 
-  const database = decodeOrRaw(url.pathname.replace(/^\//, ''))
+  const database = String(driver.database ?? '')
   for (const name of ['dbname', 'database']) {
     const value = params.get(name)
     if (value && value !== database) {
@@ -349,9 +408,9 @@ export function parseConnectionIdentity(connectionString) {
     }
   }
 
-  const host = queryHost || authorityHost
-  const port = queryPort || authorityPort || '5432'
-  const user = queryUser || authorityUser
+  const host = String(driver.host ?? '')
+  const port = String(driver.port ?? '') || '5432'
+  const user = String(driver.user ?? '')
   const lowered = String(host).toLowerCase()
   const family = String(host).startsWith('/') || LOCAL_HOSTS.has(lowered) ? '(this host)' : lowered
   return { ok: true, reason: '', host, port, user, database, server: `${family}:${port}` }
@@ -649,7 +708,8 @@ export function assessMigrationRole({ adminRole, appRole, adminIsSuperuser, admi
  * libpq splits `options` on spaces, so a space inside a role name is backslash-escaped; the
  * whole value is then percent-encoded, because `+` is NOT decoded as a space here and using
  * URLSearchParams would produce exactly that. An `options` already present is preserved and
- * appended to rather than overwritten.
+ * appended to rather than overwritten -- the EFFECTIVE one, which for a repeated parameter is the
+ * last, because that is the one the driver would have applied.
  *
  * IT THROWS RATHER THAN RETURNING THE INPUT (o3d-2sm1.5, Codex r5 MEDIUM). Returning the admin
  * URL unchanged on unparseable input produced a connection with NO `role=` at all — the
@@ -685,7 +745,12 @@ export function buildMigrationConnectionString(adminConnectionString, appRole) {
     )
   }
   const escaped = String(appRole).replace(/([\\ '])/g, '\\$1')
-  const existing = url.searchParams.get('options')
+  // The LAST `options=`, not the first (o3d-2sm1.5, Codex r15 CRITICAL, same shape). The driver
+  // copies every query entry into one config object, so a repeated `options=` resolves to the
+  // last; merging into the first would compose a URL that carries a startup setting the admin
+  // connection never had, and drop the one it did.
+  const allOptions = url.searchParams.getAll('options')
+  const existing = allOptions.length > 0 ? allOptions[allOptions.length - 1] : null
   const merged = existing ? `${existing} -c role=${escaped}` : `-c role=${escaped}`
   url.searchParams.delete('options')
   const query = url.searchParams.toString()
