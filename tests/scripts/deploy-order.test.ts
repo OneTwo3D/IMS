@@ -5656,6 +5656,7 @@ function fenceRecoveryHarness(dirs: { app: string; state: string; recovery: stri
     shellFunction(source, 'refuse_adoption_identity_mismatch'),
     shellFunction(source, 'fence_db_connections'),
     shellFunction(source, 'release_db_connections'),
+    shellFunction(source, 'refence_db_connections'),
     shellFunction(source, 'adopt_db_connections'),
     // EXACTLY the line update.sh's initialisation runs, with EXACTLY the reader it uses. With
     // .env deleted this leaves DATABASE_URL empty and DB_FENCE_IDENTITY_ARGS empty — the premise
@@ -5869,6 +5870,309 @@ for (const scenario of RECOVERY_RECORD_REFUSALS) {
     }
   })
 }
+
+// ---------------------------------------------------------------------------
+// o3d-2sm1.5 r30 — A TRUSTED SOURCE CONSULTED ONLY WHEN THE UNTRUSTED ONE FAILS IS NOT A TRUST
+// BOUNDARY (Codex CRITICAL + HIGH).
+//
+// r29 published the two artefacts above and then made each of them the FALLBACK. That closes
+// DELETION and leaves SUBSTITUTION completely open: the account this defends against does not
+// need to remove its file, it needs to supply one that works. The three tests below are the two
+// substitutions Codex named, and the record's own immutability under an adoption.
+// ---------------------------------------------------------------------------
+
+/** Raise a fence the ordinary way, against a real .env and a real checkout script. */
+function raiseFenceFor(dirs: { app: string; state: string; recovery: string }, script = '// the shipped fence script\n'): void {
+  mkdirSync(join(dirs.app, 'scripts'), { recursive: true })
+  writeFileSync(join(dirs.app, 'scripts', 'fence-db-connections.mjs'), script)
+  writeFileSync(join(dirs.app, '.env'), 'DATABASE_URL=postgresql://imsapp:pw@127.0.0.1:5432/imsdb\n')
+  const raised = runShell(
+    fenceRecoveryHarness(dirs, [
+      'DEPLOY_ADMIN_DATABASE_URL=postgres://admin@127.0.0.1:5432/imsdb',
+      'fence_db_connections',
+      'echo "RAISED=${DB_FENCE_UP}"',
+    ]),
+  )
+  assert.equal(raised.status, 0, `precondition: the ordinary fence must succeed:\n${raised.output}`)
+  assert.match(raised.output, /^RAISED=true$/m, `precondition: and the fence must go up:\n${raised.output}`)
+}
+
+function recoveryDirs(): { app: string; state: string; recovery: string } {
+  return {
+    app: mkdtempSync(join(tmpdir(), 'ims-r30-app-')),
+    state: mkdtempSync(join(tmpdir(), 'ims-r30-state-')),
+    recovery: mkdtempSync(join(tmpdir(), 'ims-r30-etc-')),
+  }
+}
+
+function cleanUp(dirs: { app: string; state: string; recovery: string }): void {
+  for (const dir of [dirs.app, dirs.state, dirs.recovery]) rmSync(dir, { recursive: true, force: true })
+}
+
+test('an .env retargeted to another database cannot redirect a standing fence', () => {
+  // THE CRITICAL, EXACTLY AS DESCRIBED. A legitimate run fences database A over a touched schema.
+  // The application account then replaces ${APP_DIR}/.env with a perfectly valid, internally
+  // consistent identity for database B and a matching admin URL. Nothing is tampered with: the
+  // marker is untouched, the record is untouched, and the sole-source and drift checks would
+  // pass, because all they prove is that the replacement agrees with itself.
+  //
+  // The record holds the identity the STANDING FENCE WAS AIMED AT — that is why it is written
+  // before the revoke — so this is not a preference question. A mismatch means the database the
+  // fence guards is not the database the file names, and the run refuses before touching either.
+  //
+  // MUTATION ROUTE (verified by making the change locally and re-running): put r29's first line
+  // back at the top of require_adoption_identity() —
+  //   require_db_identity && return 0
+  // — and this test fails at the status assertion and at both log assertions: the run adopts the
+  // replacement, and the log shows `--fence ... --app-database=otherdb` while the record still
+  // says imsdb. Removing only the `refuse_adoption_identity_mismatch` call from
+  // adopt_db_connections() fails the same way.
+  const dirs = recoveryDirs()
+  try {
+    raiseFenceFor(dirs)
+
+    // PHASE 2 — the substitution. Four good values, a different database.
+    writeFileSync(
+      join(dirs.app, '.env'),
+      'DATABASE_URL=postgresql://otherapp:pw@127.0.0.1:5432/otherdb\nDEPLOY_ADMIN_DATABASE_URL=postgresql://admin:pw@127.0.0.1:5432/otherdb\n',
+    )
+    const redirected = runShell(
+      fenceRecoveryHarness(dirs, [
+        'DEPLOY_ADMIN_DATABASE_URL=postgres://admin@127.0.0.1:5432/otherdb',
+        'SCHEMA_TOUCHED=true',
+        'adopt_db_connections',
+        'echo "PAST=yes"',
+      ]),
+    )
+
+    // PRECONDITION, and it is the whole point: the replacement .env is not malformed. The shipped
+    // reader accepts it and produces four values, so nothing below is a refusal about a bad file.
+    assert.match(redirected.output, /^IDENTITY_ARGS=4$/m, `the replacement must be a perfectly good identity:\n${redirected.output}`)
+
+    assert.notEqual(redirected.status, 0, `a retargeted .env must be a refusal:\n${redirected.output}`)
+    assert.ok(!/PAST=yes/.test(redirected.output), 'and nothing after it may run')
+    assert.match(redirected.output, /DO NOT NAME THE SAME DATABASE/, `and it must say what is wrong:\n${redirected.output}`)
+    assert.match(redirected.output, /otherapp@127\.0\.0\.1:5432\/otherdb/, 'naming what the file now says')
+    assert.match(redirected.output, /imsapp@127\.0\.0\.1:5432\/imsdb/, 'and what the record says that fence was aimed at')
+
+    // NOTHING REACHED EITHER DATABASE. Not a re-fence of B, and not a release of A.
+    const log = readCalls(dirs.state)
+    assert.ok(!/--fence/.test(log), `no database may be re-fenced on the file's answer:\n${log}`)
+    assert.ok(!/--release/.test(log), `and none released on it either:\n${log}`)
+
+    // AND THE RECORD IS UNTOUCHED, so a re-run with the file put back adopts the same fence.
+    assert.match(
+      readFileSync(join(dirs.recovery, 'db-fence-identity.env'), 'utf8'),
+      /^db_app_database=imsdb$/m,
+      'the record must still name the database the fence was raised on',
+    )
+  } finally {
+    cleanUp(dirs)
+  }
+})
+
+test('a fence script replaced in the checkout is never the one that runs', () => {
+  // THE HIGH. r29 selected ${DB_FENCE_SCRIPT} whenever it EXISTED, so the application account
+  // could REPLACE it rather than delete it — and every caller hands the result
+  // DEPLOY_ADMIN_DATABASE_URL and runs it as the application user. The three call sites below are
+  // the ones Codex named, and the third is the reach of it: the exit trap's re-fence is the path
+  // that runs when everything else has already gone wrong.
+  //
+  // MUTATION ROUTE (verified by making the change locally and re-running): put r29's first arm
+  // back at the top of db_fence_script_in_use() —
+  //   if [[ -f "${DB_FENCE_SCRIPT}" ]]; then printf '%s' "${DB_FENCE_SCRIPT}"; return 0; fi
+  // — and all three cases fail at the "never the checkout's path" assertion, because the
+  // substituted file is chosen every time. Removing only the `publish_fence_script_copy` call
+  // from publish_fence_recovery_record() fails at the "the protected copy is still the shipped
+  // one" assertion instead.
+  const cases: ReadonlyArray<{ label: string; body: string[] }> = [
+    { label: 'the adoption', body: ['SCHEMA_TOUCHED=true', 'adopt_db_connections'] },
+    { label: 'the release', body: ['release_db_connections'] },
+    {
+      label: "the exit trap's re-fence",
+      body: ['SCHEMA_TOUCHED=true', 'DB_FENCE_RAISED=true', 'refence_db_connections || echo "REFENCE_RC=$?"'],
+    },
+  ]
+  for (const scenario of cases) {
+    const dirs = recoveryDirs()
+    try {
+      raiseFenceFor(dirs)
+      const protectedCopy = join(dirs.recovery, 'fence-db-connections.mjs')
+      const checkoutScript = join(dirs.app, 'scripts', 'fence-db-connections.mjs')
+      const recordBefore = readFileSync(join(dirs.recovery, 'db-fence-identity.env'), 'utf8')
+
+      // THE SUBSTITUTION. The file is not deleted — that is r29's case, and it is closed. It is
+      // REPLACED, which is the same act with a working file left behind.
+      writeFileSync(checkoutScript, '// SUBSTITUTED BY THE APPLICATION ACCOUNT\n')
+
+      const result = runShell(
+        fenceRecoveryHarness(dirs, ['DEPLOY_ADMIN_DATABASE_URL=postgres://admin@127.0.0.1:5432/imsdb', ...scenario.body]),
+      )
+      const log = readCalls(dirs.state)
+
+      assert.ok(log.length > 0, `${scenario.label}: precondition — the fence helper was invoked at all:\n${result.output}`)
+      assert.ok(log.includes(protectedCopy), `${scenario.label}: must run the root-owned copy:\n${log}`)
+      assert.ok(!log.includes(checkoutScript), `${scenario.label}: and never the path the application account rewrote:\n${log}`)
+
+      // AND THE SUBSTITUTE NEVER BECOMES THE PROTECTED ONE. An adoption that republished the copy
+      // would launder exactly the file it just refused to run.
+      assert.equal(
+        readFileSync(protectedCopy, 'utf8'),
+        '// the shipped fence script\n',
+        `${scenario.label}: the protected copy must still be the one the fence was raised with`,
+      )
+      assert.equal(
+        readFileSync(join(dirs.recovery, 'db-fence-identity.env'), 'utf8'),
+        recordBefore,
+        `${scenario.label}: and the record — digest included — must not have been rewritten by a run that is adopting`,
+      )
+    } finally {
+      cleanUp(dirs)
+    }
+  }
+})
+
+test('a protected fence script that is not the one the record names is refused', () => {
+  // The digest is what BINDS the copy to the record, and it is why the initial fence publishes
+  // the script and then runs the published copy rather than the original: r29 copied and then
+  // executed ${DB_FENCE_SCRIPT}, so the protected copy was not guaranteed to be the code that
+  // wrote ${DB_FENCE_STATE}. With the two bound, a copy that is not the recorded one is a state
+  // only root could have produced, and it is a refusal rather than a shrug.
+  //
+  // MUTATION ROUTE: delete the `[[ "${actual}" != "${recorded}" ]]` arm from
+  // db_fence_script_in_use() and this test fails at the status assertion — the adoption runs the
+  // unrecorded script.
+  const dirs = recoveryDirs()
+  try {
+    mkdirSync(join(dirs.state, 'deploy'), { recursive: true })
+    writeFileSync(join(dirs.state, 'deploy', 'db-connect-fence.json'), '{}\n')
+    writeFileSync(join(dirs.recovery, 'fence-db-connections.mjs'), '// not the recorded script\n')
+    writeFileSync(
+      join(dirs.recovery, 'db-fence-identity.env'),
+      [
+        'db_app_host=127.0.0.1',
+        'db_app_port=5432',
+        'db_app_user=imsapp',
+        'db_app_database=imsdb',
+        `fence_script_sha256=${'0'.repeat(64)}`,
+        'fence_identity_complete=1',
+        '',
+      ].join('\n'),
+    )
+    const result = runShell(
+      fenceRecoveryHarness(dirs, [
+        'DEPLOY_ADMIN_DATABASE_URL=postgres://admin@127.0.0.1:5432/imsdb',
+        'SCHEMA_TOUCHED=true',
+        'adopt_db_connections',
+        'echo "PAST=yes"',
+      ]),
+    )
+    assert.notEqual(result.status, 0, `an unrecorded protected script must be a refusal:\n${result.output}`)
+    assert.ok(!/PAST=yes/.test(result.output), 'and nothing after it may run')
+    assert.match(result.output, /is not the one the recovery record binds to this fence/, `and it must say why:\n${result.output}`)
+    assert.ok(!/--fence/.test(readCalls(dirs.state)), `and nothing may be re-fenced with it:\n${readCalls(dirs.state)}`)
+  } finally {
+    cleanUp(dirs)
+  }
+})
+
+test('the privileged connection comes from the root invocation, not from the application-owned file', () => {
+  // FOUND BY THE SWEEP the CRITICAL asked for, and it is the same shape a third time:
+  // DEPLOY_ADMIN_DATABASE_URL was resolved as "${_env_file_admin_url:-${DEPLOY_ADMIN_DATABASE_URL}}"
+  // — the application-owned file first, root's own invocation only as a fallback. The recovery
+  // refusal tells an operator to supply this variable on the command line precisely because
+  // ${APP_DIR}/.env cannot be relied on at that moment, and a file that could then silently
+  // substitute a different privileged connection makes that instruction meaningless.
+  //
+  // MUTATION ROUTE: swap the two halves of the `:-` back and the first case below reports the
+  // file's URL.
+  const dir = mkdtempSync(join(tmpdir(), 'ims-r30-admin-'))
+  try {
+    writeFileSync(
+      join(dir, '.env'),
+      'DATABASE_URL=postgresql://imsapp:pw@127.0.0.1:5432/imsdb\nDEPLOY_ADMIN_DATABASE_URL=postgresql://filesays:pw@127.0.0.1:5432/otherdb\n',
+    )
+
+    const both = runUpdatePrelude(
+      dir,
+      ['DEPLOY_ADMIN_DATABASE_URL'],
+      'DEPLOY_ADMIN_DATABASE_URL=postgresql://roottyped:pw@127.0.0.1:5432/imsdb',
+    )
+    assert.equal(both.status, 0, `the prelude must run:\n${both.output}`)
+    assert.match(
+      both.output,
+      /^DEPLOY_ADMIN_DATABASE_URL=postgresql:\/\/roottyped:pw@127\.0\.0\.1:5432\/imsdb$/m,
+      `the invocation's value must win:\n${both.output}`,
+    )
+    assert.match(both.output, /set BOTH on this invocation and in/, `and the disagreement must be announced:\n${both.output}`)
+
+    // AND NOTHING CHANGES ON AN ORDINARY RUN, which is the case that matters operationally:
+    // `sudo scripts/update.sh` carries no such variable, so the file still answers.
+    const fileOnly = runUpdatePrelude(dir, ['DEPLOY_ADMIN_DATABASE_URL'])
+    assert.match(
+      fileOnly.output,
+      /^DEPLOY_ADMIN_DATABASE_URL=postgresql:\/\/filesays:pw@127\.0\.0\.1:5432\/otherdb$/m,
+      `with nothing on the invocation the file answers, exactly as before:\n${fileOnly.output}`,
+    )
+    assert.ok(!/set BOTH on this invocation/.test(fileOnly.output), 'and there is nothing to announce')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('every adoption call site refuses an identity mismatch, not only the one that holds the fence', () => {
+  // update.sh establishes the adoption identity in TWO places: adopt_db_connections(), which
+  // HOLDS a fence over a touched schema, and the marker-adoption block, whose other branch
+  // RELEASES one. The release branch is the more dangerous of the two to get wrong — `--release`
+  // GRANTS CONNECT from the state file's record — so a refusal wired into one and not the other
+  // would leave the worse half open. One wording, both sites, and nothing between the call and
+  // the refusal that could use the identity first.
+  //
+  // MUTATION ROUTE: delete either `refuse_adoption_identity_mismatch` line from update.sh and
+  // this test fails on the count; move one of them a line further down and it fails on adjacency.
+  const source = UPDATE_LINES.join('\n')
+  const callSites = UPDATE_LINES.map((line, index) => ({ line, index }))
+    .filter((entry) => isCode(entry.line) && /^\s*require_adoption_identity \|\| [a-z_]+=\$\?$/.test(entry.line))
+  assert.equal(callSites.length, 2, `precondition: update.sh establishes the adoption identity in two places (${callSites.length})`)
+
+  const refusals = UPDATE_LINES.filter((line) => isCode(line) && /^\s*refuse_adoption_identity_mismatch "/.test(line))
+  assert.equal(refusals.length, 2, 'and each of them must go through the shared refusal')
+
+  for (const site of callSites) {
+    // The NEXT LINE OF CODE, comments skipped: both call sites carry a paragraph of reasoning
+    // between them, and a rule written about raw adjacency would be a rule about prose.
+    const next = UPDATE_LINES.findIndex((line, index) => index > site.index && isCode(line))
+    assert.match(
+      UPDATE_LINES[next] ?? '',
+      /^\s*refuse_adoption_identity_mismatch "/,
+      `nothing may come between the call and its refusal:\n${UPDATE_LINES.slice(site.index, next + 1).filter(isCode).join('\n')}`,
+    )
+  }
+
+  // AND THE REFUSAL IS FATAL, on exactly the code require_adoption_identity() returns for it.
+  const refusal = shellFunction(source, 'refuse_adoption_identity_mismatch')
+  assert.match(refusal, /-eq 2 \]\] \|\| return 0/, `it must fire on the mismatch code and nothing else:\n${refusal}`)
+  assert.match(refusal, /\n  die "/, `and it must die rather than warn:\n${refusal}`)
+})
+
+test('no entrypoint executes the application-owned fence script from its own path', () => {
+  // The rule stated once, over the source, so a mode added later cannot reintroduce it quietly:
+  // update.sh runs the fence helper through a RESOLVED path — the root-owned copy — and never
+  // through ${DB_FENCE_SCRIPT} directly. The other two entrypoints have no recovery record and no
+  // protected copy at all, so they are excluded by name rather than by silence.
+  //
+  // MUTATION ROUTE: put `node "${DB_FENCE_SCRIPT}" --preflight` back in require_fenceable_database
+  // and this test fails, printing that line.
+  const direct = UPDATE_LINES.filter((line) => isCode(line) && /node "\$\{?DB_FENCE_SCRIPT\}?"/.test(line))
+  assert.deepEqual(
+    direct,
+    [],
+    'update.sh must never execute the application-owned fence script in place; resolve it through db_fence_script_in_use() first',
+  )
+  // PRECONDITION: it really does invoke the helper, so the assertion above is not vacuous.
+  const resolved = UPDATE_LINES.filter((line) => isCode(line) && /node "\$\{(fence|preflight|dry|release)_script\}"/.test(line))
+  assert.ok(resolved.length >= 4, `precondition: update.sh invokes the fence helper through a resolved path (${resolved.length})`)
+})
 
 test('the recovery record lives where the application user cannot rewrite it', () => {
   // WHY NOT IN THE FENCE MARKER, which is what Codex proposed and what the adoption already keys

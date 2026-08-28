@@ -2662,11 +2662,22 @@ require_fenceable_database() {
     # The preflight changes nothing, so a dry run may run it for real — and saying what it
     # actually answered is the whole point of --dry-run. Not fatal here: a dry run that cannot
     # reach the database still exits 0, having said so.
-    local dry_rc=0
+    #
+    # THE SAME PRECEDENCE AS EVERY OTHER MODE, MINUS THE PUBLICATION (o3d-2sm1.5 r30). The
+    # root-owned copy wins whenever there is one — a dry run on a box mid-recovery must probe with
+    # the script the fence was raised by, not with whatever is in the checkout now. It does not
+    # PUBLISH one when there is none: a dry run writes nothing, least of all under /etc, and with
+    # no copy there is nothing for the checkout to be substituted for.
+    local dry_rc=0 dry_script="${DB_FENCE_SCRIPT}"
+    if [[ -f "${DB_FENCE_SCRIPT_COPY}" ]]; then
+      dry_script="${DB_FENCE_SCRIPT_COPY}"
+      warn "A fence raised by an earlier run is recorded here, so this dry run probes with the"
+      warn "root-owned copy of the fence script at ${dry_script} rather than the checkout's."
+    fi
     run_as_user "${APP_USER}" env \
       DATABASE_URL="${DATABASE_URL}" \
       DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-      node "${DB_FENCE_SCRIPT}" --preflight "${DB_FENCE_IDENTITY_ARGS[@]:-}" || dry_rc=$?
+      node "${dry_script}" --preflight "${DB_FENCE_IDENTITY_ARGS[@]:-}" || dry_rc=$?
     if [[ "${dry_rc}" -eq 0 ]]; then
       success "A REAL RUN WOULD BE FENCEABLE: the preflight above asked the database and it answered yes."
     else

@@ -927,6 +927,40 @@ test('a grantee that appeared since the fence was recorded is recorded durably b
   }
 })
 
+test('the fence refuses to re-apply a record written for another database', async () => {
+  // o3d-2sm1.5 r30, Codex CRITICAL (the second half of it). `--release` has asked this since it
+  // was written; `--fence` never did, and the re-apply path is where it matters most: an existing
+  // record is reused for its GRANTEE LIST, and that list is the set of roles a fence on THAT
+  // database took CONNECT from. Aimed at another database it revokes from roles chosen for a
+  // different ACL, appends to a record that now claims the wrong database, and leaves the fence
+  // the record was written for standing with nothing tracking it. It is the last line of defence
+  // under a substituted DATABASE_URL, and it holds even when everything above it was fooled.
+  //
+  // MUTATION ROUTE (verified by making the change locally and re-running): delete the
+  // `existing.database !== facts.database` guard from doFence() and this test fails at the exit
+  // code and at `revokes` — the fence re-applies "otherdb"'s grantee list against imsdb.
+  const dir = stateDir()
+  try {
+    const stateFile = join(dir, 'db-connect-fence.json')
+    publishState(stateFile, { ...SAMPLE_STATE, database: 'otherdb', revoked: ['PUBLIC', 'otherapp'] })
+    const before = readFileSync(stateFile, 'utf8')
+
+    // The connection is attached to imsdb — FakeAdminClient reports it as current_database() —
+    // and the supplied identity names imsdb too, so every check above this one passes.
+    const client = new FakeAdminClient({ stateFile })
+    const code = await withAdminUrl(() =>
+      doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1, ...suppliedIdentity({ appDatabase: 'imsdb' }) }),
+    )
+
+    assert.equal(code, EXIT_NOT_FENCEABLE, 'a record for another database must abort the fence')
+    assert.deepEqual(client.revokes, [], 'and nothing may be revoked on the database it is not the record for')
+    assert.ok(!client.log.includes('BEGIN'), 'the transaction must never be opened')
+    assert.equal(readFileSync(stateFile, 'utf8'), before, "and the other database's record must be left exactly as found")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('the fence refuses to start a fresh record over one it cannot read', async () => {
   // The same absence-read-as-negative defect on the WRITE side: the old readState() collapsed
   // "unusable" into null, and doFence would then publish a fresh record over the only account
@@ -2186,7 +2220,8 @@ test('o3d-2sm1.5 r19: every entrypoint supplies the four values, and refuses whe
           line.includes('"${DB_FENCE_SCRIPT}"') ||
           line.includes('"$DB_FENCE_SCRIPT"') ||
           line.includes('"${fence_script}"') ||
-          line.includes('"${preflight_script}"'),
+          line.includes('"${preflight_script}"') ||
+          line.includes('"${dry_script}"'),
       )
     const modes = invocations.filter((line) => /--(fence|release|preflight|print-migration-url)\b/.test(line))
     assert.ok(modes.length >= 4, `${name}: precondition — the helper is actually invoked here (${modes.length})`)

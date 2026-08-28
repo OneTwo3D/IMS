@@ -992,18 +992,48 @@ owns each:
 * **the fence script** — `APP_DIR/scripts/fence-db-connections.mjs`, application-owned. Deleting
   that one file turned every fence, every release, every adoption *and the exit trap's re-fence*
   into a refusal;
-* **`DEPLOY_ADMIN_DATABASE_URL`** — `APP_DIR/.env`, else the root invocation.
+* **`DEPLOY_ADMIN_DATABASE_URL`** — a password, so no record may hold it.
 
 The first two are now recorded when a fence is **raised**, in `/etc/ims-cutover-recovery`: a
-`db-fence-identity.env` stating `db_app_host`, `db_app_port`, `db_app_user` and `db_app_database`
-and ending in a `fence_identity_complete=1` sentinel, and a copy of the fence script beside it. The
-record is published **before the revoke**, for the same reason `schema_touched` is written before
-Prisma is invoked: a record written after the durable act does not exist on the one run that
-matters, the one killed in between. Adoption prefers `APP_DIR/.env` when it still answers — an
-ordinary recovery is unchanged — and falls back to the record, which is the identity that fence was
-*actually aimed at*, so re-applying it is not a second guess at a question the record answers
-exactly. A record short of four values it can vouch for is a **refusal**, never a default: a
-half-read identity is a different database.
+`db-fence-identity.env` stating `db_app_host`, `db_app_port`, `db_app_user`, `db_app_database` and
+`fence_script_sha256`, ending in a `fence_identity_complete=1` sentinel, and the fence script
+published beside it. The record is written **before the revoke**, for the same reason
+`schema_touched` is written before Prisma is invoked: a record written after the durable act does
+not exist on the one run that matters, the one killed in between. A record short of the values it
+can vouch for is a **refusal**, never a default: a half-read identity is a different database.
+
+**r30: a trusted source consulted only when the untrusted one fails is not a trust boundary.** r29
+published both artefacts and then used each of them only as a *fallback*, when the
+application-owned version could not be read. That defends against **deletion** and not against
+**substitution** — the account this recovers from does not need to remove its file, it needs to
+supply one that works. A legitimate touched-schema fence on database A could be "recovered" by an
+`APP_DIR/.env` replaced with a valid, internally consistent identity for database B: A stayed
+fenced and abandoned while B was re-fenced and migrated, and the sole-source and drift checks did
+not help, because all they prove is that the replacement agrees with itself. The same for the
+script: `APP_DIR/scripts/fence-db-connections.mjs` could be **replaced** rather than deleted, and
+attacker-controlled code would then be handed `DEPLOY_ADMIN_DATABASE_URL` — including inside the
+exit trap's re-fence, the path that runs when everything else has already gone wrong.
+
+So the precedence is inverted, and it is one rule for every privileged artefact:
+
+| artefact | which source decides | `APP_DIR/.env` / the checkout |
+| --- | --- | --- |
+| the four identity values | `db-fence-identity.env` whenever it exists | read only to be **compared**; a mismatch is a refusal at **both** adoption call sites |
+| the fence script | `/etc/ims-cutover-recovery/fence-db-connections.mjs`, and it is the only file **executed** | published into the protected path when a fence is raised, and never run in place |
+| `DEPLOY_ADMIN_DATABASE_URL` | the **root invocation** | fills in only when the invocation is silent; a disagreement is announced |
+| the environment snapshot | the root-owned `zz-` drop-in, which systemd loads **last** | overridden by it for the length of one cutover |
+| the fence state file | the database itself, cross-checked against the record | app-writable by necessity — `--fence` refuses to re-apply a state whose `database` is not the one the connection is attached to |
+
+The record's digest **binds** the protected copy to the fence it recorded, which is also why the
+initial fence publishes the script and then runs *that published copy*: r29 copied the script and
+then executed the original, so the protected copy was not guaranteed to be the code that wrote the
+state file. An **adoption never rewrites the record** — the record describes the fence on the
+database, not this run's opinion of it, and only the run that *raises* a fence may write one.
+
+The one case where the checkout still decides is the one the application account cannot
+manufacture: `/etc/ims-cutover-recovery` is root-owned, so "no record and no protected copy" means
+no fence these scripts ever recorded. There is nothing to be substituted *for*, and the checkout's
+script is published into the protected path and run from there — never in place.
 
 The directory is root-owned and **0755**, not the snapshot directory's 0700, because the fence runs
 **as the application user** — a root-owned state file is one it cannot release — and neither file
@@ -1016,7 +1046,12 @@ choosing.
 **The credential is the part no record may hold.** `DEPLOY_ADMIN_DATABASE_URL` carries a password
 and is written nowhere by these scripts. On a recovery where `APP_DIR/.env` is gone it can only
 come from the **root invocation**, and a recovery without it refuses, naming the variable and
-giving the invocation that supplies it.
+giving the invocation that supplies it. For the same reason the **invocation's value wins** over
+the file's since r30: the refusal tells an operator to type the variable on the command line
+precisely because that file cannot be relied on at that moment, so a file that could silently
+substitute a different privileged connection would make the instruction meaningless. Nothing
+changes on an ordinary run — `sudo scripts/update.sh` carries no such variable, so `.env` answers,
+exactly as before — and when both are set and differ, the disagreement is printed.
 
 **r29: the shape guard classified physical lines while bash reads logical ones.** This was its
 fourth escape and the first three had disguised the cause. The operator-message shape explicitly
