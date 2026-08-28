@@ -331,16 +331,24 @@ async function runTransaction<T>(fn: (tx: unknown) => Promise<T>): Promise<T> {
       // afterwards is not retroactively deleted by it. A double that applied the wipe at COMMIT time
       // would swallow a pin written in between, i.e. it would produce the bug's outcome no matter which
       // order the production code deletes in, and the test would be measuring the double.
+      //
+      // AND `notIn` IS A WHOLESALE WIPE (o3d-2w2j r2). Since the reset takes the three binding rows by
+      // name first, its bulk delete carries an exclusion list rather than no predicate at all — but it
+      // is still "every settings row this statement can see, bar those", so it is the statement the
+      // injected failure has to land on and the statement that has to clear the table. A double that
+      // read it as a NAMED delete would quietly stop wiping anything and stop failing on demand, which
+      // is how a test keeps passing while measuring nothing.
       deleteMany: async (args?: { where?: { key?: unknown } }) => {
-        if (args?.where?.key == null && settingsWipeFails) {
+        const predicate = args?.where?.key as { in?: string[]; notIn?: string[] } | string | null | undefined
+        const excluded = predicate !== null && typeof predicate === 'object' ? predicate.notIn : undefined
+        const wholesale = predicate == null || Array.isArray(excluded)
+        if (wholesale && settingsWipeFails) {
           // A reset that dies part-way is a state, not a story: with both deletes in one transaction
           // it must leave the binding WHOLE, and with them apart it leaves half of it behind.
           throw new Error('settings wipe failed (injected)')
         }
-        if (args?.where?.key != null) {
-          const keys = typeof args.where.key === 'string'
-            ? [args.where.key]
-            : ((args.where.key as { in?: string[] }).in ?? [])
+        if (!wholesale) {
+          const keys = typeof predicate === 'string' ? [predicate] : (predicate?.in ?? [])
           let count = 0
           for (const key of keys) {
             if (visibleSetting(key) == null) continue
@@ -353,6 +361,7 @@ async function runTransaction<T>(fn: (tx: unknown) => Promise<T>): Promise<T> {
         let count = 0
         for (const key of new Set([...Object.keys(settings), ...Object.keys(staged)])) {
           if (visibleSetting(key) == null) continue
+          if (excluded?.includes(key)) continue
           delete staged[key]
           stagedDeletes.add(key)
           count += 1

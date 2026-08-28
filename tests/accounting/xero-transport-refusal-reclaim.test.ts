@@ -80,6 +80,15 @@ type Row = {
   createDispatchedAt: Date | null
   createDispatchIdempotencyKey: string | null
   /**
+   * o3d-gvzu: the release beside the marker. Modelled here because the hand-back now writes it under
+   * a predicate over BOTH of the other two — a double that did not carry it would throw rather than
+   * silently pass, which is the property `whereMatches` is built for, but it would also make the
+   * release untestable at the only seam it has.
+   */
+  createDispatchReleasedAt: Date | null
+  /** Named by the release's own fence, so it has to be on the row for the predicate to be evaluated. */
+  connector: string
+  /**
    * THE THREE COLUMNS THE WELDED REFUSAL READS (o3d-anu8 r3), modelled because the release now
    * carries a predicate over them. Leaving them off the row would not have made the refusal
    * harmless — it would have made it UNEVALUATED, which is the same shape of defect as ignoring
@@ -165,6 +174,8 @@ function makeRowStore(row: Partial<Row> & { id: string }) {
     errorMessage: null,
     createDispatchedAt: null,
     createDispatchIdempotencyKey: null,
+    createDispatchReleasedAt: null,
+    connector: 'xero',
     type: 'COGS_JOURNAL',
     remoteAttemptedAt: null,
     ...row,
@@ -214,7 +225,7 @@ function markerVerdict(now: Date) {
   return decideCreateDispatch({
     type: 'COGS_JOURNAL',
     idempotencyKey: KEY,
-    recorded: { dispatchedAt: T_DISPATCH, idempotencyKey: KEY },
+    recorded: { dispatchedAt: T_DISPATCH, idempotencyKey: KEY, releasedAt: null },
     now,
     label: 'COGS_JOURNAL for PurchaseOrder po-1',
   })
@@ -639,6 +650,8 @@ function makeWorld(options: { sync?: Partial<Row>; activityLogFails?: boolean } 
       errorMessage: null,
       createDispatchedAt: T_DISPATCH,
       createDispatchIdempotencyKey: KEY,
+      createDispatchReleasedAt: null,
+      connector: 'xero',
       // See the note on `Row`: the state a real hand-back releases from, refusal columns included.
       type: 'COGS_JOURNAL',
       remoteAttemptedAt: null,
@@ -1271,7 +1284,11 @@ function makeSampledDatabase(options: { dispatchedAt: Date; startElapsedMs: numb
         // THE SLOW SECOND QUERY. Under load this is where the time goes, and under r8 every
         // millisecond of it fell outside the elapsed figure.
         dbNowMs += options.secondQueryMs
-        return { createDispatchedAt: options.dispatchedAt, createDispatchIdempotencyKey: KEY }
+        return {
+          createDispatchedAt: options.dispatchedAt,
+          createDispatchIdempotencyKey: KEY,
+          createDispatchReleasedAt: null,
+        }
       },
     },
   }
@@ -1569,4 +1586,200 @@ test('o3d-jit6 r10: the clamp guarantees EXECUTION its minimum, AFTER acquisitio
   const wide = unsentHandBackAttemptBounds(UNSENT_HANDBACK_RETRY_BUDGET_MS)
   assert.equal(wide.maxWait, UNSENT_HANDBACK_MAX_WAIT_MS)
   assert.equal(wide.timeout, UNSENT_HANDBACK_RETRY_BUDGET_MS - UNSENT_HANDBACK_MAX_WAIT_MS)
+})
+
+/* ------------------------------------------------------------------------------------------------
+ * o3d-gvzu — AND THE MARKER'S RELEASE, WRITTEN IN THE SAME COMMIT.
+ *
+ * Round 4 gave the row back inside the replay window and said, correctly, that the marker still
+ * refuses a late attempt: "releasing the claim buys a chance to get back before the deadline; it does
+ * not move the deadline". That is what one "Not connected to Xero" blip cost — a permanent refusal
+ * needing an operator, for a create nobody made. The release is the deadline finally moving, and only
+ * on positive evidence: `notPosted.releaseCreateDispatch` is present ONLY when the transport named a
+ * provably pre-egress refusal AND the marker is one this attempt can speak for.
+ * ---------------------------------------------------------------------------------------------- */
+
+/** What the journal branch attaches when, and only when, the release is licensed. */
+const RELEASING = {
+  ...NOT_POSTED,
+  releaseCreateDispatch: { notSent: 'no-connection', basis: 'first-dispatch' },
+}
+
+test('o3d-gvzu: a proven pre-egress refusal releases the marker, in the hand-back\'s own commit', async () => {
+  const w = makeWorld()
+
+  const out = await w.transaction((tx) => recordAndReleaseUnsentTransportRefusal(tx, {
+    entry: { id: 'log-1', type: 'COGS_JOURNAL' },
+    notPosted: RELEASING,
+    lease: claimHeldFrom(T_DISPATCH),
+    attempt: ATTEMPT,
+  }))
+
+  assert.equal(out.released, true)
+  const after = w.world()
+  assert.notEqual(after.sync.createDispatchReleasedAt, null, 'THE POINT: the release is recorded')
+  // THE MARKER ITSELF IS UNTOUCHED, which is the whole reason this is a second column: the pair is
+  // write-once by database trigger because it is a prohibition, and a prohibition that tampering
+  // clears hands the tamperer what they wanted.
+  assert.equal(after.sync.createDispatchedAt?.valueOf(), T_DISPATCH.valueOf())
+  assert.equal(after.sync.createDispatchIdempotencyKey, KEY)
+  // And it is one fact with the rest of the hand-back: same commit, same evidence trail.
+  assert.equal(after.sync.status, 'PENDING')
+  assert.equal(after.activity[0].action, 'xero_sync_transport_refused_before_post')
+  const commit = after.activity[1].metadata as Record<string, unknown>
+  assert.equal(commit.createDispatchReleased, true, 'the commit record says the release landed')
+  assert.equal(commit.notSent, 'no-connection', 'and names the refusal that licensed it')
+})
+
+test('o3d-gvzu: a refusal with NO proof writes no release at all', async () => {
+  // The ordinary case, and the safe one: a timeout, a socket reset mid-write, a 5xx, or a replay of a
+  // marker some earlier attempt minted. `releaseCreateDispatch` is absent, so nothing is released and
+  // the row behaves exactly as round 4 left it.
+  //
+  // MUTATION THAT KILLS THIS TEST: making the release unconditional — dropping the
+  // `args.notPosted.releaseCreateDispatch ?` guard in `recordAndReleaseUnsentTransportRefusal`.
+  // Under it every transport refusal releases the marker, including the ones that may have arrived.
+  const w = makeWorld()
+
+  const out = await w.transaction((tx) => recordAndReleaseUnsentTransportRefusal(tx, {
+    entry: { id: 'log-1', type: 'COGS_JOURNAL' },
+    notPosted: NOT_POSTED,
+    lease: claimHeldFrom(T_DISPATCH),
+    attempt: ATTEMPT,
+  }))
+
+  assert.equal(out.released, true, 'the row is still handed back — that part is unchanged')
+  const after = w.world()
+  assert.equal(after.sync.createDispatchReleasedAt, null, 'THE POINT: but nothing is released')
+  const commit = after.activity[1].metadata as Record<string, unknown>
+  assert.equal(commit.createDispatchReleased, null,
+    'and the commit record distinguishes "no release attempted" from "attempted and matched nothing"')
+})
+
+test('o3d-gvzu: the release is FENCED — a displaced owner releases nothing', async () => {
+  // The same fence every non-terminal write here carries. A worker whose claim has been taken must
+  // not be able to license a post on a row somebody else is already posting.
+  //
+  // MUTATION THAT KILLS THIS TEST: dropping `heldClaimWhere` (or the attempt revision) from
+  // `releaseCreateDispatchMarker`'s predicate. Under it the stale worker's release lands.
+  const w = makeWorld()
+
+  const out = await w.transaction((tx) => recordAndReleaseUnsentTransportRefusal(tx, {
+    entry: { id: 'log-1', type: 'COGS_JOURNAL' },
+    notPosted: RELEASING,
+    // A claim instant this row no longer carries: another worker took it and renewed.
+    lease: claimHeldFrom(new Date(T_DISPATCH.getTime() - 60_000)),
+    attempt: ATTEMPT,
+  }))
+
+  assert.equal(out.released, false, 'the claim release matches nothing either')
+  const after = w.world()
+  assert.equal(after.sync.createDispatchReleasedAt, null, 'THE POINT: and neither does the release')
+  const commit = after.activity[1].metadata as Record<string, unknown>
+  assert.equal(commit.createDispatchReleased, false, 'reported as attempted-and-matched-nothing')
+})
+
+test('o3d-gvzu: a release already standing is not re-stamped by a second refusal', async () => {
+  // WRITE-ONCE PER PROOF. The instant on the row belongs to the proof that first established it, and
+  // a second refusal on the same standing release must not move it — the column is only ever read as
+  // present/absent, so moving it buys nothing and loses the one thing it records.
+  //
+  // MUTATION THAT KILLS THIS TEST: dropping `createDispatchReleasedAt: null` from the predicate.
+  const first = new Date(T_DISPATCH.getTime() + 500)
+  const w = makeWorld({ sync: { createDispatchReleasedAt: first } })
+
+  await w.transaction((tx) => recordAndReleaseUnsentTransportRefusal(tx, {
+    entry: { id: 'log-1', type: 'COGS_JOURNAL' },
+    notPosted: RELEASING,
+    lease: claimHeldFrom(T_DISPATCH),
+    attempt: ATTEMPT,
+  }))
+
+  assert.equal(w.world().sync.createDispatchReleasedAt?.valueOf(), first.valueOf())
+})
+
+test('o3d-gvzu: a row with NO marker cannot be released — there is nothing for a release to be about', async () => {
+  // Belt as well as braces: the database refuses this too (the trigger nulls a release written onto a
+  // row whose OLD marker was null), and the predicate refuses it here so a row that reaches the
+  // hand-back without a marker cannot acquire a standing permission out of nowhere.
+  //
+  // MUTATION THAT KILLS THIS TEST: dropping `createDispatchedAt: { not: null }` from the predicate.
+  const w = makeWorld({ sync: { createDispatchedAt: null, createDispatchIdempotencyKey: null } })
+
+  await w.transaction((tx) => recordAndReleaseUnsentTransportRefusal(tx, {
+    entry: { id: 'log-1', type: 'COGS_JOURNAL' },
+    notPosted: RELEASING,
+    lease: claimHeldFrom(T_DISPATCH),
+    attempt: ATTEMPT,
+  }))
+
+  assert.equal(w.world().sync.createDispatchReleasedAt, null)
+})
+
+test('o3d-gvzu: the released row may send again, and the send SPENDS the release', async () => {
+  // What the release is worth, end to end, through the real decision function rather than a model of
+  // it. A row past the window with a standing release dispatches — and the fence write it hands back
+  // is the CONSUMPTION, so the permission cannot outlive the request it permitted. Without that, a
+  // send that landed and then failed to settle would meet the same standing release and post again.
+  const pastTheWindow = new Date(T_DISPATCH.getTime() + XERO_IDEMPOTENCY_KEY_RETENTION_MS + 60_000)
+
+  const refused = decideCreateDispatch({
+    type: 'COGS_JOURNAL',
+    idempotencyKey: KEY,
+    recorded: { dispatchedAt: T_DISPATCH, idempotencyKey: KEY, releasedAt: null },
+    now: pastTheWindow,
+    label: 'COGS_JOURNAL for PurchaseOrder po-1',
+  })
+  assert.equal(refused.dispatch, false, 'the wedged state this issue is about')
+
+  const released = decideCreateDispatch({
+    type: 'COGS_JOURNAL',
+    idempotencyKey: KEY,
+    recorded: { dispatchedAt: T_DISPATCH, idempotencyKey: KEY, releasedAt: T_REFUSAL },
+    now: pastTheWindow,
+    label: 'COGS_JOURNAL for PurchaseOrder po-1',
+  })
+  assert.equal(released.dispatch, true, 'THE POINT: a proven-unsent marker no longer wedges the row')
+  assert.equal(released.dispatch === true ? released.basis : null, 'released-nothing-left-the-process')
+
+  // AND THE ARM THAT WINS IS THE ONE THAT SPENDS IT. Inside the window a same-key replay would also
+  // dispatch — but on a basis that writes NOTHING, which would leave the release standing over a
+  // request that then went out.
+  //
+  // MUTATION THAT KILLS THIS TEST: moving the release arm below the replay arm in
+  // `decideCreateDispatch`. The basis comes back as 'replay-within-idempotency-window', the fence
+  // writes nothing, and the release survives its own send.
+  const insideTheWindow = new Date(T_DISPATCH.getTime() + 1_000)
+  const both = decideCreateDispatch({
+    type: 'COGS_JOURNAL',
+    idempotencyKey: KEY,
+    recorded: { dispatchedAt: T_DISPATCH, idempotencyKey: KEY, releasedAt: T_REFUSAL },
+    now: insideTheWindow,
+    label: 'COGS_JOURNAL for PurchaseOrder po-1',
+  })
+  assert.equal(both.dispatch === true ? both.basis : null, 'released-nothing-left-the-process',
+    'the release arm wins even where the replay arm would also have dispatched')
+})
+
+test('o3d-gvzu: the fence write for that basis is the CONSUMPTION, and the fence fails closed on it', async () => {
+  const source = readFileSync(join(process.cwd(), 'lib/domain/accounting/create-dispatch-record.ts'), 'utf8')
+  const plan = source.slice(source.indexOf('export async function planCreateDispatch('))
+  // MUTATION THAT KILLS THIS TEST: returning `write: null` for the released basis, so the permission
+  // is never spent.
+  assert.match(
+    plan,
+    /decision\.basis === 'released-nothing-left-the-process'\s*\n\s*\? \{ createDispatchReleasedAt: null \}\s*\n\s*: null/,
+    'the released basis, and only it, hands the fence the consumption',
+  )
+
+  const processor = readFileSync(join(process.cwd(), 'lib/connectors/xero/sync-processor.ts'), 'utf8')
+  const fence = processor.slice(processor.indexOf('async fenceBeforeRemoteWrite(operation: string'))
+  // A create whose consumption cannot be written is a create whose outcome cannot be recorded either:
+  // the same rule the mint already answers to, and the same reason.
+  assert.match(fence.slice(0, fence.indexOf('if (!again)')), /if \(!createDispatchWrite\) throw error/)
+  assert.match(
+    processor.slice(processor.indexOf('export async function renewClaimForRemoteWrite(')),
+    /data: write \? \{ processingStartedAt: renewedAt, \.\.\.write \} : \{ processingStartedAt: renewedAt \}/,
+    'and it rides inside the claim proof, exactly as the mint does',
+  )
 })

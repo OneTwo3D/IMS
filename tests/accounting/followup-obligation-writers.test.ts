@@ -2,6 +2,8 @@ import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
 import { QBO_UNRECORDED_POSTED_DOCUMENT_ACTION } from '@/lib/domain/accounting/unrecorded-posted-document'
+import { nextFollowUpObligationGeneration } from '@/lib/domain/accounting/back-reference'
+import { buildFollowUpObligationBacklogWhere } from '@/lib/domain/accounting/follow-up-obligation-registry'
 
 // ---------------------------------------------------------------------------
 // o3d-9kek Codex r10 finding 1 — the NORMAL Xero writer must claim the follow-up obligation.
@@ -47,6 +49,8 @@ type SyncRow = {
   createdAt: Date
   backReferenceCheckedAt: Date | null
   backReferenceFollowUpsPendingAt: Date | null
+  /** o3d-0bfh r8: stamped by the DATABASE, never by a writer — see stampFollowUpClaimClock. */
+  backReferenceFollowUpsClaimedAtDatabaseClock: Date | null
   /**
    * o3d-0m56 r10: the two columns the money-attempt repair reads. `attemptStampingCustodyAt` is
    * written by every production create path, so a row this codebase made carries it and the repair
@@ -69,6 +73,11 @@ const SYNC_COLUMNS = new Set([
   'id', 'connector', 'type', 'referenceType', 'referenceId', 'externalTransactionId', 'status',
   'payload', 'retryCount', 'processingStartedAt', 'syncedAt', 'errorMessage', 'createdAt',
   'backReferenceCheckedAt', 'backReferenceFollowUpsPendingAt', 'backReferenceEvidenceCompactedAt',
+  // o3d-0bfh r8: the claim's DATABASE-stamped wall clock, which the backlog's settling grace is now
+  // aged against. The double writes it the way the trigger in migration 20260827120000 does — see
+  // stampFollowUpClaimClock below — so these assertions are about the predicate production evaluates
+  // against the value the database would actually hold.
+  'backReferenceFollowUpsClaimedAtDatabaseClock',
   // o3d-e2mz: the per-attempt identity every processor write is now fenced on. Listed here rather
   // than tolerated, because this matcher's whole contract is to throw on a predicate it cannot
   // honour — silently ignoring the fence would turn these assertions into assertions about nothing.
@@ -84,6 +93,34 @@ const SYNC_COLUMNS = new Set([
  * everything. A double that silently ignores a predicate turns "the compound where prevents a stale
  * double-write" into an assertion about nothing.
  */
+/**
+ * THE TRIGGER FROM MIGRATION 20260827120000, IN THE DOUBLE (o3d-0bfh r8, Codex HIGH).
+ *
+ * `backReferenceFollowUpsClaimedAtDatabaseClock` is not written by any application writer: a
+ * BEFORE INSERT/UPDATE trigger on `accounting_sync_logs` stamps it from `clock_timestamp()` in the
+ * same statement that mints a new generation, clears it when the marker is cleared, and carries the
+ * old value over otherwise. The backlog's settling grace is aged against it, so a double that did
+ * not model the trigger would leave every claimed row with a NULL stamp and quietly test the
+ * `createdAt` FALLBACK branch instead of the branch production takes.
+ *
+ * `now` is a parameter rather than `new Date()` so the emulation is not itself a second clock: the
+ * caller passes the instant it wants the database to have stamped.
+ */
+function stampFollowUpClaimClock(
+  previous: Date | null | undefined,
+  data: Record<string, unknown>,
+  now: Date,
+): void {
+  if (!('backReferenceFollowUpsPendingAt' in data)) return
+  const next = data.backReferenceFollowUpsPendingAt as Date | null
+  if (next === null) {
+    data.backReferenceFollowUpsClaimedAtDatabaseClock = null
+    return
+  }
+  const changed = previous == null || previous.getTime() !== next.getTime()
+  if (changed) data.backReferenceFollowUpsClaimedAtDatabaseClock = now
+}
+
 function matches(row: Record<string, unknown>, where: Record<string, unknown>): boolean {
   for (const [key, condition] of Object.entries(where)) {
     if (key === 'OR') {
@@ -115,6 +152,11 @@ function matches(row: Record<string, unknown>, where: Record<string, unknown>): 
         const right = operand instanceof Date ? operand.getTime() : operand
         if (op === 'in') { if (!(operand as unknown[]).includes(value)) return false; continue }
         if (op === 'not') { if (operand === null ? value === null : left === right) return false; continue }
+        // SQL: a range comparison against NULL is UNKNOWN, never true. JavaScript coerces null to 0
+        // and would answer `null < anyDate` = true, which would have made a NULL `syncedAt` satisfy
+        // the backlog's age predicate — the double disagreeing with the database on exactly the
+        // column the o3d-0bfh r7 grace is measured on.
+        if (value === null && (op === 'lt' || op === 'lte' || op === 'gt' || op === 'gte')) return false
         if (op === 'lt') { if (!((left as number) < (right as number))) return false; continue }
         if (op === 'lte') { if (!((left as number) <= (right as number))) return false; continue }
         if (op === 'gt') { if (!((left as number) > (right as number))) return false; continue }
@@ -176,6 +218,13 @@ const state = {
    */
   throwingActivityActions: new Set<string>(),
   /**
+   * o3d-0bfh r4: fired ONCE, immediately before the release statement is evaluated — the exact
+   * interleaving the finding is about. Production has by then minted its generation, run the
+   * follow-ups and built a release fenced on that generation; this is where another writer's commit
+   * lands. Given the row so it can advance the marker the way a sweep would.
+   */
+  raceBeforeRelease: null as ((row: SyncRow) => void) | null,
+  /**
    * Activity actions whose PERSISTED write must report failure (o3d-nepa r3). `logActivityPersisted`
    * returns false rather than throwing when the row cannot be written, and a double that always
    * returned true could not tell a warning that landed from one that did not — which is the whole
@@ -191,6 +240,12 @@ const state = {
    * could not see it at all, and "the identifier was escalated" would be an assertion about nothing.
    */
   activityRows: [] as Array<Record<string, unknown>>,
+  /**
+   * o3d-0bfh r6: the back-reference WRITE fails (not a unique-id conflict — an ordinary transient
+   * error). QuickBooks swallows that, so the entry still succeeds while the link never landed, which
+   * is the path that reaches settleFollowUpObligation's RETAINED branch.
+   */
+  failBackReferenceWrite: false,
 }
 
 function marker(): Date | null {
@@ -224,6 +279,7 @@ const syncLogClient = {
     return state.syncRows.filter((row) => matches(row, args.where)).length
   },
   async create(args: { data: Record<string, unknown> }) {
+    stampFollowUpClaimClock(null, args.data, new Date())
     const row = {
       ...blankRow(),
       ...args.data,
@@ -248,13 +304,35 @@ const syncLogClient = {
         throw new Error('transient: the SYNCED transaction could not be written')
       }
     }
+    stampFollowUpClaimClock(row.backReferenceFollowUpsPendingAt, args.data, new Date())
     Object.assign(row, args.data)
     record('syncLog.update', args.data)
     return { ...row }
   },
   async updateMany(args: { where: Record<string, unknown>; data: Record<string, unknown> }) {
+    // THE RELEASE IS AN updateMany SINCE o3d-0bfh r4, fenced on the generation the caller minted —
+    // which is what moved both of these hooks off `update`. The race fires BEFORE the predicate is
+    // evaluated, so the row it sees is the row production's fence will be tested against.
+    if (args.data.backReferenceFollowUpsPendingAt === null) {
+      const subjectRow = state.syncRows[0]
+      if (subjectRow && state.raceBeforeRelease) {
+        const race = state.raceBeforeRelease
+        state.raceBeforeRelease = null
+        race(subjectRow)
+      }
+      if (subjectRow && state.failReleaseFor.has(subjectRow.id)) {
+        record('release.attempted-and-failed')
+        throw new Error('transient: could not clear the obligation')
+      }
+    }
     const matched = state.syncRows.filter((row) => matches(row, args.where))
-    for (const row of matched) Object.assign(row, args.data)
+    const stampedAt = new Date()
+    for (const row of matched) {
+      // Per row, because the trigger is FOR EACH ROW and each row's OLD value is its own.
+      const data = { ...args.data }
+      stampFollowUpClaimClock(row.backReferenceFollowUpsPendingAt, data, stampedAt)
+      Object.assign(row, data)
+    }
     // The WHERE is journalled too (o3d-xl63 r5 #2): the fresh-post SYNCED write is claim-FENCED now,
     // and a journal that recorded only `data` could not tell a fenced write from an unfenced one.
     record('syncLog.updateMany', args.data, args.where)
@@ -268,6 +346,10 @@ const billClient = {
     return bill ? { accountingInvoiceId: bill.accountingInvoiceId } : null
   },
   async update(args: { where: { id: string }; data: Record<string, unknown> }) {
+    if (state.failBackReferenceWrite) {
+      record('backReference.attempted-and-failed')
+      throw new Error('transient: could not write the back-reference')
+    }
     const bill = state.bills.find((candidate) => candidate.id === args.where.id)
     if (!bill) throw new Error(`fake db: no bill ${args.where.id}`)
     Object.assign(bill, args.data)
@@ -318,6 +400,12 @@ function repairOutsideCustody(): number {
   return matched.length
 }
 
+/**
+ * The sales order the SALES_INVOICE subject points at, or `null` for every other fixture in this file
+ * (which is what `salesOrder.findUnique` answered before o3d-0bfh r15 added the sales-invoice case).
+ */
+let salesOrderRow: Record<string, unknown> | null = null
+
 const db = {
   accountingSyncLog: syncLogClient,
   // o3d-19gy: the processor asks which accounting connection is live before it posts anything, and
@@ -335,7 +423,14 @@ const db = {
     },
   },
   purchaseInvoice: billClient,
-  salesOrder: { async findUnique() { return null }, async update() { return {} } },
+  salesOrder: {
+    async findUnique() { return salesOrderRow },
+    async update(args: { data: Record<string, unknown> }) {
+      Object.assign(salesOrderRow ?? {}, args.data)
+      record('backReference.written', args.data)
+      return salesOrderRow
+    },
+  },
   salesOrderRefund: { async findUnique() { return null }, async update() { return {} } },
   supplierCreditNote: { async findUnique() { return null }, async update() { return {} } },
   integrationOutbox: outboxClient,
@@ -395,6 +490,43 @@ mock.module('@/lib/domain/accounting/accounting-event-mirror', {
 // The FRESH-POST branch — the one the finding named by line — needs a connector call to succeed.
 // Only these two are stubbed, so everything between "the ledger accepted it" and "the follow-ups are
 // enqueued" is the real production code.
+/**
+ * o3d-0bfh r15 — THE DEFERRED-RECEIPT RE-DRIVE, DOUBLED FAITHFULLY ON ITS NEW HALF.
+ *
+ * Production's re-drive re-reads the order's receipts UNDER THE SALES-ORDER LOCK and clears the
+ * obligation generation it was handed IN THAT SAME TRANSACTION. The double therefore does the
+ * clearing write too — through the same `updateMany` the journal records — because the property
+ * under test here is that NOTHING ELSE clears it afterwards. A double that only answered "settled"
+ * would leave the caller's own release looking like the only one, which is the shape being removed.
+ */
+const deferredReceipts = {
+  obligation: null as { syncLogId: string; generation: Date | null } | null,
+}
+
+mock.module('@/lib/domain/accounting/invoice-payment-enqueue', {
+  namedExports: {
+    registerDeferredOrderReceipts: async (
+      _orderId: string,
+      _posted: unknown,
+      obligation: { syncLogId: string; generation: Date | null } | null,
+    ) => {
+      deferredReceipts.obligation = obligation
+      // NO ORDER, NO FENCE. Production returns `no-order` UNFENCED — a Payment row cannot exist for
+      // an order that does not, so no later receipt can make that answer wrong — and leaves the
+      // marker to the caller. The tombstone fixtures in this file are exactly that case, and a
+      // double that cleared regardless would silently rewrite what they are testing.
+      if (salesOrderRow === null) return { settled: true, reason: 'no-order', release: 'unfenced' }
+      if (obligation?.generation) {
+        await syncLogClient.updateMany({
+          where: { id: obligation.syncLogId, backReferenceFollowUpsPendingAt: obligation.generation },
+          data: { backReferenceFollowUpsPendingAt: null },
+        })
+      }
+      return { settled: true, reason: 'registered', release: obligation?.generation ? 'released' : 'not-held' }
+    },
+  },
+})
+
 mock.module('@/lib/connectors/xero/auth', {
   namedExports: { getGrantedScopes: async () => null },
 })
@@ -495,6 +627,7 @@ function blankRow(): SyncRow {
     createdAt: new Date('2026-01-01T00:00:00Z'),
     backReferenceCheckedAt: null,
     backReferenceFollowUpsPendingAt: null,
+    backReferenceFollowUpsClaimedAtDatabaseClock: null,
     backReferenceEvidenceCompactedAt: null,
   }
 }
@@ -517,6 +650,11 @@ function reset(connector = 'xero') {
   ledgerVerdict = { clear: true }
   qboPostVerdict = { success: true, invoiceId: 'XBILL-1' }
   emailsSent = 0
+  state.raceBeforeRelease = null
+  state.unpersistableActivityActions.clear()
+  state.failBackReferenceWrite = false
+  salesOrderRow = null
+  deferredReceipts.obligation = null
 }
 
 /** The single sync row under test (the follow-up rows the run creates are appended after it). */
@@ -544,6 +682,49 @@ function firstJournalEntry(op: string) {
   return entry
 }
 
+/**
+ * THE OBLIGATION IS CLAIMED WITH THE SYNCED TRANSITION, AND THE CLAIM IS A COMPARE-AND-SET
+ * (o3d-9kek r10 f1, restated at o3d-0bfh r4 Codex HIGH).
+ *
+ * r10 asserted the claim rode the SYNCED statement's `data`. r4 had to move it OUT of that statement
+ * — a `data` fragment cannot read, and a claim that cannot read the generation it replaces cannot
+ * report the one it minted, so its release could only clear by id, which is the defect. It is now the
+ * NEXT statement in the same transaction, and this asserts the strictly stronger property r10 was
+ * reaching for:
+ *
+ *   • the claim is the very next write to the sync row after the SYNCED transition — no other write
+ *     is interleaved, so there is no state anyone can observe in which the row is SYNCED-with-an-id
+ *     and silent about what it owes (they commit together in any case);
+ *   • and it is a COMPARE-AND-SET on the generation it observed, not a write by id. A claim by id
+ *     would pass every other assertion in this file and take a generation that is not exclusive.
+ */
+function assertObligationClaimedWithTheSyncedWrite(syncedOp: 'syncLog.update' | 'syncLog.updateMany') {
+  const syncedIndex = state.journal.findIndex((entry) => entry.op === syncedOp && entry.data?.status === 'SYNCED')
+  assert.ok(syncedIndex >= 0, `expected a "${syncedOp}" marking the row SYNCED; saw ${JSON.stringify(journalOps())}`)
+  const nextWrite = state.journal.findIndex((entry, index) => index > syncedIndex
+    && (entry.op === 'syncLog.update' || entry.op === 'syncLog.updateMany'))
+  assert.ok(nextWrite > syncedIndex, 'the SYNCED transition must be followed by the obligation claim')
+  const claim = state.journal[nextWrite]
+  assert.ok(
+    claim.data?.backReferenceFollowUpsPendingAt instanceof Date,
+    'the obligation must be claimed by the write IMMEDIATELY after the SYNCED transition, in the same '
+      + `transaction — nothing may come between them; saw ${JSON.stringify(claim.data)}`,
+  )
+  assert.ok(
+    claim.where && 'backReferenceFollowUpsPendingAt' in claim.where,
+    'and the claim must be a COMPARE-AND-SET on the generation it observed, not a write keyed on the id alone',
+  )
+  return claim
+}
+
+/** The release statement — the LAST write to the sync row, and the only one that clears the marker. */
+function releaseStatement() {
+  const entry = [...state.journal].reverse().find((candidate) => candidate.op === 'syncLog.updateMany'
+    && candidate.data?.backReferenceFollowUpsPendingAt === null)
+  assert.ok(entry, `expected a release; saw ${JSON.stringify(journalOps())}`)
+  return entry
+}
+
 async function runDirect() {
   process.env.XERO_ACCOUNTING_OUTBOX_ENABLED = 'false'
   const { processPendingXeroSync } = await import('@/lib/connectors/xero/sync-processor')
@@ -563,18 +744,12 @@ test('[o3d-9kek r10 f1] the direct Xero writer claims the follow-up obligation I
 
   assert.equal(result.succeeded, 1)
   assert.equal(subjectOutboxJob(), undefined, 'this is the DIRECT loop — no outbox job for the subject row')
-  // The claim is not a call of its own: it rides the update that flips the row to SYNCED, so there
-  // is no interval — not even one statement wide — in which the row is SYNCED with an external id
-  // and silent about what it still owes.
-  // o3d-550x: the SYNCED transition is an updateMany now — its where carries the "do not overwrite a
-  // DIFFERENT document" precondition, which Prisma's unique-where update cannot express. The property
-  // this file is about is unchanged: the obligation is claimed in the SAME write.
-  const synced = state.journal.find((entry) => entry.op === 'syncLog.updateMany' && entry.data?.status === 'SYNCED')
-  assert.ok(synced, 'the row must be marked SYNCED')
-  assert.ok(
-    synced.data?.backReferenceFollowUpsPendingAt instanceof Date,
-    'the obligation must be claimed in the SAME write as the SYNCED transition, not in a later one',
-  )
+  // The claim is not a transaction of its own: it is the next statement inside the one that flips
+  // the row to SYNCED, so there is no interval in which the row is SYNCED with an external id and
+  // silent about what it still owes. o3d-550x made that transition an updateMany (its where carries
+  // the "do not overwrite a DIFFERENT document" precondition); o3d-0bfh r4 made the claim a
+  // compare-and-set of its own. Both are asserted by the helper.
+  assertObligationClaimedWithTheSyncedWrite('syncLog.updateMany')
 
   // …and it was already durable at the instant the document became linked. This is the assertion
   // the pre-fix code fails: it wrote the link with the marker still null.
@@ -593,13 +768,17 @@ test('[o3d-9kek r10 f1] the direct Xero writer releases it only after the follow
   const ops = journalOps()
   const linked = ops.indexOf('backReference.written')
   const enqueued = ops.indexOf('followup.created')
-  const released = ops.lastIndexOf('syncLog.update')
+  const released = state.journal.indexOf(releaseStatement())
   assert.ok(enqueued > linked, 'the follow-ups are enqueued after the link')
   assert.ok(released > enqueued, 'and the obligation is discharged only after that')
-  assert.equal(
-    state.journal[released].data?.backReferenceFollowUpsPendingAt,
-    null,
-    'the release is what clears the marker',
+  // o3d-0bfh r4: and the release is FENCED on the generation this pass minted — the claim's own
+  // value, carried down rather than re-read. Cleared by id, it would erase a generation a sweep had
+  // taken in the meantime, which is the finding.
+  const claimed = assertObligationClaimedWithTheSyncedWrite('syncLog.updateMany').data?.backReferenceFollowUpsPendingAt
+  assert.deepEqual(
+    state.journal[released].where,
+    { id: 'log-1', backReferenceFollowUpsPendingAt: claimed },
+    'the release clears ONLY the generation this pass claimed',
   )
   assert.equal(subject().backReferenceFollowUpsPendingAt, null, 'nothing is owed once the work is queued')
   // The follow-up itself, so "released" cannot be passing because nothing ran at all.
@@ -653,11 +832,7 @@ test('[o3d-9kek r10 f1] the OUTBOX Xero writer claims and releases it the same w
 
   assert.equal(result.succeeded, 1, 'the outbox loop must have processed the row, not skipped it')
   assert.equal(subjectOutboxJob()?.status, 'SUCCEEDED', 'and it really went through the outbox, not the direct loop')
-  // o3d-550x: the SYNCED transition is an updateMany now — its where carries the "do not overwrite a
-  // DIFFERENT document" precondition, which Prisma's unique-where update cannot express. The property
-  // this file is about is unchanged: the obligation is claimed in the SAME write.
-  const synced = state.journal.find((entry) => entry.op === 'syncLog.updateMany' && entry.data?.status === 'SYNCED')
-  assert.ok(synced?.data?.backReferenceFollowUpsPendingAt instanceof Date, 'claimed in the SYNCED write')
+  assertObligationClaimedWithTheSyncedWrite('syncLog.updateMany')
   assert.ok(
     firstJournalEntry('backReference.written').markerAtThisPoint instanceof Date,
     'and durable before the link is written',
@@ -731,7 +906,9 @@ test('[o3d-nepa r3] retrying a COMPACTED row announces the follow-ups it can no 
   assert.match(String(warning.description), /had already posted, so this retry settled the sync row without re-sending it/)
   assert.match(String(warning.description), /its payload was compacted away/)
   assert.match(String(warning.description), /XBILL-1/, 'names the external id the operator has to go and look at')
-  assert.match(String(warning.description), /re-drive it manually/)
+  // o3d-0bfh r12: read-and-escalate, not a hand re-drive — see buildCompactedFollowUpLossActivity.
+  assert.match(String(warning.description), /Nothing here authorises settling that by hand/)
+  assert.match(String(warning.description), /ESCALATE that reading/)
   // Settled only because the warning landed.
   assert.equal(subject().backReferenceFollowUpsPendingAt, null)
   assert.equal(subject().status, 'SYNCED')
@@ -1031,10 +1208,9 @@ test('[o3d-9kek r10 f1] a FRESHLY POSTED Xero row claims the obligation in the w
   // restated, for the reason above; what this test exists to prove — the id and the obligation ride
   // ONE write — is asserted immediately below and is untouched by any of it.
   assert.equal(synced.data?.externalTransactionId, 'XBILL-1', 'this is the write that records the id')
-  assert.ok(
-    synced.data?.backReferenceFollowUpsPendingAt instanceof Date,
-    'so it is also the write that must record the obligation — there is no safe interval between them',
-  )
+  // …and the claim is the next statement in that same transaction, so there is no safe interval
+  // between them (o3d-0bfh r4 moved it out of the statement, not out of the transaction).
+  assertObligationClaimedWithTheSyncedWrite('syncLog.updateMany')
   assert.ok(firstJournalEntry('backReference.written').markerAtThisPoint instanceof Date)
   assert.equal(subject().backReferenceFollowUpsPendingAt, null, 'released once the follow-ups are enqueued')
   assert.equal(state.syncRows.filter((row) => row.type === 'BILL_ATTACHMENT').length, 1)
@@ -1062,7 +1238,7 @@ test('[o3d-9kek r10 f1] the same holds on the OUTBOX fresh-post branch', async (
   // tests/accounting/xero-remote-write-lease.test.ts.
   const synced = state.journal.find((entry) => entry.op === 'syncLog.updateMany' && entry.data?.status === 'SYNCED')
   assert.equal(synced?.data?.externalTransactionId, 'XBILL-1')
-  assert.ok(synced?.data?.backReferenceFollowUpsPendingAt instanceof Date)
+  assertObligationClaimedWithTheSyncedWrite('syncLog.updateMany')
   assert.ok(firstJournalEntry('backReference.written').markerAtThisPoint instanceof Date)
   assert.equal(subject().backReferenceFollowUpsPendingAt, null)
 })
@@ -1093,12 +1269,14 @@ test('[o3d-9kek r10 f1] a fresh post whose follow-ups fail keeps the obligation,
 // is not a feature, and leaving it open on one side while closing it on the other would be a
 // difference nobody chose.
 //
-// What is genuinely different, and stays different: the QuickBooks repair SWEEP is still unwired
-// (o3d-s36z, realm isolation, is its precondition — see the block at the end of its sync-processor).
-// Recording the obligation and repairing it are separate acts, and only the second is what that
-// issue gates: the marker is a timestamp on the sync row and crosses no realm boundary. It has to
-// be written at the moment it is true, because afterwards the state is unrecoverable — which is the
-// same reason there is no backfill for rows written before the column existed.
+// What is genuinely different, and stays different: the QuickBooks repair SWEEP is unwired, so on
+// this connector NOTHING EVER READS THE MARKER BACK (o3d-0bfh r5, Codex HIGH — the last two tests in
+// this file pin that). Recording the obligation and repairing it are separate acts, and only the
+// second is blocked: the marker is a timestamp on the sync row and crosses no realm boundary. It has
+// to be written at the moment it is true, because afterwards the state is unrecoverable — which is
+// the same reason there is no backfill for rows written before the column existed. What that
+// justifies is WRITING it; it does not make anything read it. See the block at the end of the
+// QuickBooks sync-processor for what the actual blocker is (o3d-8prh, not the closed o3d-s36z).
 // ---------------------------------------------------------------------------
 
 async function runQuickBooks() {
@@ -1112,13 +1290,9 @@ test('[o3d-9kek r10 f1] the QuickBooks writer claims the obligation IN the SYNCE
   const result = await runQuickBooks()
 
   assert.equal(result.succeeded, 1)
-  // QuickBooks is unchanged by o3d-550x (out of scope), so its SYNCED transition is still `update`.
-  const synced = state.journal.find((entry) => entry.op === 'syncLog.update' && entry.data?.status === 'SYNCED')
-  assert.ok(synced, 'the row must be marked SYNCED')
-  assert.ok(
-    synced.data?.backReferenceFollowUpsPendingAt instanceof Date,
-    'claimed in the SAME write as the SYNCED transition, exactly as Xero does',
-  )
+  // QuickBooks is unchanged by o3d-550x (out of scope), so its SYNCED transition is still `update`;
+  // the claim after it is the same compare-and-set Xero takes (o3d-0bfh r4).
+  assertObligationClaimedWithTheSyncedWrite('syncLog.update')
   assert.ok(
     firstJournalEntry('backReference.written').markerAtThisPoint instanceof Date,
     'the link is never written while nothing records that follow-ups are outstanding',
@@ -1138,7 +1312,7 @@ test('[o3d-9kek r10 f1] a FRESHLY POSTED QuickBooks row claims it in the write t
   // QuickBooks is unchanged by o3d-550x (out of scope), so its SYNCED transition is still `update`.
   const synced = state.journal.find((entry) => entry.op === 'syncLog.update' && entry.data?.status === 'SYNCED')
   assert.equal(synced?.data?.externalTransactionId, 'XBILL-1')
-  assert.ok(synced?.data?.backReferenceFollowUpsPendingAt instanceof Date)
+  assertObligationClaimedWithTheSyncedWrite('syncLog.update')
   assert.ok(firstJournalEntry('backReference.written').markerAtThisPoint instanceof Date)
   assert.equal(subject().backReferenceFollowUpsPendingAt, null, 'released once the follow-ups are enqueued')
 })
@@ -1170,7 +1344,8 @@ test('[o3d-9kek r10 f1] a failed QuickBooks follow-up enqueue leaves the obligat
   // transition no longer contradicts the ledger — pinned by the two tests at the end of this file.
   // Either way the marker must survive: it is the only thing left that distinguishes this row from
   // one whose follow-ups ran, and with the QuickBooks sweep unwired it is also the state that makes
-  // the work recoverable the day o3d-s36z lands.
+  // the work recoverable the day a consumer is bound — which waits on post-time authorization
+  // (o3d-8prh) and origin propagation, not on the closed o3d-s36z.
   reset('quickbooks')
   state.failFollowUpsFor.add('log-1')
 
@@ -1774,4 +1949,537 @@ test('[o3d-qn21] a DOCUMENT post keeps its Request-Id wording — the split is p
     /NO REQUEST ID PROTECTS IT/,
     'the no-protection warning must not leak onto an operation that has the protection',
   )
+})
+
+// o3d-0bfh r4 (Codex HIGH) — THE CONNECTOR-VERSUS-SWEEP INTERLEAVING.
+//
+// r3 made the SWEEP's claim a strictly-later compare-and-set and proved it exclusive BETWEEN SWEEPS.
+// The connector release was the writer standing outside that protocol: it cleared the marker by id,
+// so the sequence below lost the money the protocol exists to protect.
+//
+//   connector  claims generation C in the SYNCED transaction
+//   connector  writes the link, enqueues the follow-ups, and its probe answers "nothing deferred"
+//   sweep      reads the row, claims S (strictly later than C), enqueues — and a receipt RECORDED
+//              BETWEEN THE TWO PROBES has not reached the ledger, so it answers "still owed" and
+//              DELIBERATELY RETAINS S, writing nothing
+//   connector  releases by id → S is gone
+//
+// The row is then SYNCED, linked and marker-null: the next sweep computes `owesFollowUps = false`,
+// stamps `backReferenceCheckedAt`, and the row leaves the candidate population for ever with the
+// receipt unregistered and nothing anywhere saying so.
+//
+// These drive the REAL processor to the release and land the sweep's claim in the window immediately
+// before that statement — which is the same window a `pause` gives it in production, because the
+// release is the connector's only remaining write to the row.
+// ---------------------------------------------------------------------------
+
+/** The generation the connector claimed on this run, read off the journal rather than assumed. */
+function claimedGeneration(syncedOp: 'syncLog.update' | 'syncLog.updateMany'): Date {
+  const claimed = assertObligationClaimedWithTheSyncedWrite(syncedOp).data?.backReferenceFollowUpsPendingAt
+  assert.ok(claimed instanceof Date)
+  return claimed
+}
+
+test('[o3d-0bfh r4] a sweep that takes the obligation after the connector claimed it keeps it, even in the SAME MILLISECOND', async () => {
+  // THE SAME-MILLISECOND CASE, and it is the one that proved a plain `now()` mint unsound in r3: the
+  // sweep's clock reads EXACTLY the connector's generation. A mint that wrote `now()` would write the
+  // value the connector is holding, the connector's fence would match it, and the sweep's retained
+  // obligation would be cleared by the very predicate added to protect it. The strictly-later mint is
+  // what makes the two values distinguishable at all.
+  reset()
+  let sweptTo: Date | null = null
+  state.raceBeforeRelease = (row) => {
+    const held = row.backReferenceFollowUpsPendingAt
+    assert.ok(held instanceof Date, 'the connector must be holding a generation for the sweep to advance')
+    // A sweep claiming with a clock reading exactly the connector's generation — the same mint
+    // production uses, so this is the sweep's real behaviour rather than a convenient value.
+    sweptTo = nextFollowUpObligationGeneration(held, new Date(held.getTime()))
+    row.backReferenceFollowUpsPendingAt = sweptTo
+  }
+
+  const result = await runDirect()
+
+  assert.equal(result.succeeded, 1, "the connector's own work all landed — this is not a failure of the entry")
+  assert.ok(sweptTo, 'the race must actually have fired, or this test asserts nothing')
+  const connectorGeneration = claimedGeneration('syncLog.updateMany')
+  assert.equal(
+    (sweptTo as Date).getTime(),
+    connectorGeneration.getTime() + 1,
+    "the sweep's mint must be STRICTLY later than the generation it observed, inside one millisecond too",
+  )
+  assert.deepEqual(
+    subject().backReferenceFollowUpsPendingAt,
+    sweptTo,
+    "the sweep's obligation SURVIVES the connector's release — this is the whole finding",
+  )
+  // And the row is still a candidate: unstamped, so the next sweep re-reads it and discharges the
+  // obligation it is holding rather than finding a reconciled row with a receipt still unregistered.
+  assert.equal(subject().backReferenceCheckedAt, null)
+  assert.equal(subject().status, 'SYNCED', 'and nothing about the refusal drags the row out of SYNCED')
+})
+
+test('[o3d-0bfh r4] the same holds when the sweep claims a plainly later generation', async () => {
+  // The ordinary shape of the same race — a sweep a few seconds behind the post. Kept alongside the
+  // same-millisecond case because a fence that compared only "is the stored value later than mine"
+  // would pass this one and fail that one.
+  reset()
+  const sweepGeneration = new Date('2036-01-01T00:00:00.000Z')
+  state.raceBeforeRelease = (row) => { row.backReferenceFollowUpsPendingAt = sweepGeneration }
+
+  const result = await runDirect()
+
+  assert.equal(result.succeeded, 1)
+  assert.deepEqual(subject().backReferenceFollowUpsPendingAt, sweepGeneration, "the sweep's obligation stands")
+  assert.equal(subject().backReferenceCheckedAt, null, 'and the row stays a candidate')
+})
+
+test('[o3d-0bfh r4] an UNDISTURBED row is still released — the fence must not simply refuse everything', async () => {
+  // THE CONTROL. A predicate that matched nothing would satisfy every assertion above while
+  // discharging no obligation ever, which is the "marker left set for ever" failure wearing the
+  // fix's clothes. This row is claimed and released with nobody else touching it, and the marker
+  // must end up null.
+  reset()
+
+  const result = await runDirect()
+
+  assert.equal(result.succeeded, 1)
+  assert.equal(subject().backReferenceFollowUpsPendingAt, null, 'an uncontested obligation IS discharged')
+  assert.equal(state.syncRows.filter((row) => row.type === 'BILL_ATTACHMENT').length, 1)
+})
+
+test('[o3d-0bfh r4] the QuickBooks connector honours the same fence', async () => {
+  // Cross-ported deliberately. Three rounds running, a fix landed in one connector and the identical
+  // hole survived in the other; the QuickBooks sweep is unwired (o3d-s36z) but the marker it will
+  // read is written today, and a release that clears somebody else's generation is not made safe by
+  // the reader arriving later.
+  reset('quickbooks')
+  const sweepGeneration = new Date('2036-01-01T00:00:00.000Z')
+  state.raceBeforeRelease = (row) => { row.backReferenceFollowUpsPendingAt = sweepGeneration }
+
+  const result = await runQuickBooks()
+
+  assert.equal(result.succeeded, 1)
+  assert.deepEqual(subject().backReferenceFollowUpsPendingAt, sweepGeneration, "the other writer's obligation stands")
+})
+
+test('[o3d-0bfh r4] and a QuickBooks row nobody touched is still released', async () => {
+  // The same control on the second connector, for the same reason.
+  reset('quickbooks')
+
+  const result = await runQuickBooks()
+
+  assert.equal(result.succeeded, 1)
+  assert.equal(subject().backReferenceFollowUpsPendingAt, null)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-0bfh r5 (Codex HIGH) — THE QUICKBOOKS MARKER HAS NO CONSUMER, PINNED AS A FACT.
+//
+// Codex asked for "a test that terminates execution after the SYNCED/marker transaction and proves a
+// later production run enqueues the outstanding money work". On QuickBooks that test CANNOT PASS,
+// and that is the finding rather than an obstacle to it: there is no sweep binding and no cron
+// invocation, so nothing re-reads the marker. The honest test is therefore the inverse — the same
+// crash, the same later production run, and an assertion of exactly how far it gets — which turns a
+// silent hole into a named one that fails the day somebody closes it without reading the plan.
+//
+// THE CRASH STATE IS PRODUCED BY THE REAL PROCESSOR, NOT SEEDED. A hand-built row would drift from
+// whatever the connector actually leaves behind, and then the gap this pins would be a gap in the
+// test's imagination. Run one is the existing fresh-post-with-failing-follow-ups path: it commits
+// SYNCED with the external id, claims the obligation in that same transaction, fails the enqueue,
+// swallows it and counts the entry succeeded. That is byte-for-byte the state a process death one
+// instruction after the commit leaves.
+//
+// AND THE CONTROL BELOW IS THE POINT OF THE WHOLE BLOCK AT THE END OF THE QUICKBOOKS PROCESSOR: the
+// recovery logic EXISTS and works perfectly. The idempotency branch re-claims and re-enqueues the
+// outstanding work exactly as it should. It is simply unreachable, because no candidate query on
+// this connector will ever select the row again. Without that control, "run two enqueued nothing"
+// would be equally satisfied by a harness that cannot observe an enqueue at all.
+// ---------------------------------------------------------------------------
+
+/** Drive the connector to the state a crash immediately after the SYNCED/marker commit leaves. */
+async function crashAfterTheSyncedCommit() {
+  reset('quickbooks')
+  state.syncRows = [{ ...blankRow(), externalTransactionId: null }]
+  state.failFollowUpsFor.add('log-1')
+  const posted = await runQuickBooks()
+
+  // THE PRECONDITION. Every assertion after this is about a row in this exact state, and a run that
+  // ended anywhere else would make the "nothing happened" below true for the wrong reason.
+  assert.equal(posted.succeeded, 1, 'the post itself landed — this is a crash after success, not a failure')
+  assert.equal(subject().status, 'SYNCED', 'the SYNCED transition COMMITTED')
+  assert.equal(subject().externalTransactionId, 'XBILL-1', 'and it carries the id QuickBooks issued')
+  assert.ok(subject().backReferenceFollowUpsPendingAt instanceof Date, 'and the obligation was claimed with it')
+  assert.equal(
+    state.syncRows.filter((row) => row.type === 'BILL_ATTACHMENT').length, 0,
+    'while the money work never ran — which is the whole reason the marker is set',
+  )
+  return subject().backReferenceFollowUpsPendingAt as Date
+}
+
+test('[o3d-0bfh r5] a QuickBooks crash after the SYNCED/marker commit is re-driven by NOTHING', async () => {
+  const owed = await crashAfterTheSyncedCommit()
+
+  // A later production run. The follow-up injection is gone, so if anything selected this row its
+  // work would succeed — the enqueue is not what stops it.
+  state.failFollowUpsFor.clear()
+  state.journal = []
+  const later = await runQuickBooks()
+
+  assert.equal(later.processed, 0, 'the row is SYNCED, and the processor selects PENDING and stale PROCESSING only')
+  assert.deepEqual(state.journal, [], 'nothing wrote to the row at all')
+  assert.equal(
+    state.syncRows.filter((row) => row.type === 'BILL_ATTACHMENT').length, 0,
+    'so the outstanding payment/PDF/email/attachment is still not enqueued — EVIDENCE IS PRESERVED, THE WORK IS NOT LIVE',
+  )
+  assert.deepEqual(
+    subject().backReferenceFollowUpsPendingAt, owed,
+    'and the obligation is still recorded, unread, by the same generation that recorded it',
+  )
+  // If this test ever fails, a consumer has been wired. Read the block at the end of
+  // lib/connectors/quickbooks/sync-processor.ts BEFORE deleting it: closing o3d-s36z was not enough,
+  // and a consumer that enqueues a payment before o3d-8prh lands can post it to the wrong company.
+  // o3d-s4q2 carries the gap and the order of work; it is blocked on o3d-8prh.
+})
+
+test('[o3d-0bfh r5] CONTROL: the recovery logic works perfectly — it is only unreachable', async () => {
+  const owed = await crashAfterTheSyncedCommit()
+
+  // The ONE thing that changes: the row is returned to the candidate population, exactly as an
+  // operator retry does. Nothing else about the row or the harness is touched.
+  subject().status = 'PENDING'
+  subject().processingStartedAt = null
+  state.failFollowUpsFor.clear()
+  const later = await runQuickBooks()
+
+  assert.equal(later.processed, 1, 'now it is selected')
+  assert.equal(later.succeeded, 1)
+  assert.equal(
+    state.syncRows.filter((row) => row.type === 'BILL_ATTACHMENT').length, 1,
+    'and the idempotency branch re-drives the outstanding money work correctly, without re-posting the bill',
+  )
+  assert.equal(subject().backReferenceFollowUpsPendingAt, null, 'and only then is the obligation discharged')
+  assert.notEqual(owed, null, 'the obligation this discharged is the one the crash recorded')
+  // So the marker protocol is complete and correct on this connector in every respect but one: no
+  // candidate query selects a SYNCED row by its marker. That single missing binding is the finding.
+})
+
+// ---------------------------------------------------------------------------
+// o3d-0bfh r6 (Codex HIGH) — THE ONLY HUMAN-RECOVERY NOTIFICATION COULD BE SILENTLY LOST.
+//
+// The two QuickBooks paths above said, in as many words, that the activity entry IS the notification
+// and human action is the entire recovery. Both wrote it with `logActivity`, which swallows a
+// persistence failure and resolves `void` — so the appended `.catch()` could never fire on the
+// failure that matters. The entry was then counted successful, the row stayed SYNCED, nothing
+// selected it again, and no sweep consumes its marker: one transient activity-log failure left a
+// payment, PDF, email or attachment permanently stalled with NO operator-visible notice at all.
+//
+// The fix is not a better log line. It is that the obligation is no longer announced only in the log:
+// the marker on the row — a state that is already committed by the time any of this runs — is
+// surfaced as an operational backlog (buildFollowUpObligationBacklogWhere, rendered in the exception
+// inbox). A row carrying a marker with no consumer is ALREADY a queryable state, and a view over it
+// depends on no second write landing at the worst possible moment.
+//
+// SO THESE TESTS FAIL THE ACTIVITY-LOG INSERT AND ASSERT THE OBLIGATION IS STILL VISIBLE, by
+// evaluating the PRODUCTION where-clause against the row the production processor left behind. The
+// where-interpreter throws on any predicate it cannot honour, so this cannot degrade into "some
+// query matched something".
+// ---------------------------------------------------------------------------
+
+/**
+ * Does the operational backlog select this row? The REAL predicate, evaluated by the same matcher
+ * every other assertion in this file uses. `now` is pushed past the settling grace, because a row
+ * that has just been claimed is deliberately not listed — the connector releases the marker a few
+ * statements after it takes it, and a backlog that flickered on every healthy post is not a surface.
+ */
+function inTheOperatorBacklog(row: SyncRow, atMinutesLater = 30): boolean {
+  const where = buildFollowUpObligationBacklogWhere({
+    // o3d-0bfh r8: the cutoff is a DATABASE clock reading in production
+    // (readFollowUpObligationDatabaseNow). Here it stands in for one, and the parameter is required
+    // precisely so a caller cannot fall back to this host's clock without saying so.
+    databaseNow: new Date(Date.now() + atMinutesLater * 60_000),
+  }) as unknown as Record<string, unknown>
+  return matches(row as unknown as Record<string, unknown>, where)
+}
+
+/** console.error, captured — the last-resort channel for a notice the database could not take. */
+function captureStderr(): { lines: string[]; restore: () => void } {
+  const lines: string[] = []
+  const original = console.error
+  console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')) }
+  return { lines, restore: () => { console.error = original } }
+}
+
+test('[o3d-0bfh r6] a follow-up failure whose ACTIVITY LOG could not be written is still visible to an operator', async () => {
+  reset('quickbooks')
+  state.syncRows = [{ ...blankRow(), externalTransactionId: null }]
+  state.failFollowUpsFor.add('log-1')
+  // THE INJECTION THIS TEST IS ABOUT: the notice cannot be persisted. Under the old code this was
+  // indistinguishable from success, because logActivity reports nothing.
+  state.unpersistableActivityActions.add('quickbooks_followup_error')
+  const stderr = captureStderr()
+
+  let result
+  try {
+    result = await runQuickBooks()
+  } finally {
+    stderr.restore()
+  }
+
+  // The entry is STILL counted succeeded and the row STILL ends SYNCED — that is deliberate (the
+  // document is in QuickBooks), and it is precisely what makes the row indistinguishable from a
+  // completed one and therefore what makes the notice load-bearing.
+  assert.equal(result.succeeded, 1)
+  assert.equal(subject().status, 'SYNCED')
+  assert.equal(
+    state.syncRows.filter((row) => row.type === 'BILL_ATTACHMENT').length, 0,
+    'the follow-up work really did not run — otherwise there is no obligation to be visible',
+  )
+
+  // 1. The notice was ATTEMPTED and reported as unwritable, rather than being awaited and assumed.
+  assert.ok(
+    state.activities.some((entry) => entry.action === 'quickbooks_followup_error'),
+    'the write must have been attempted through the PERSISTED logger',
+  )
+  assert.ok(
+    stderr.lines.some((line) => line.includes('could NOT be written') && line.includes('log-1')),
+    `a lost notice must reach the one channel the failed database write cannot swallow; saw ${JSON.stringify(stderr.lines)}`,
+  )
+
+  // 2. AND THE OBLIGATION IS STILL VISIBLE WITHOUT IT. This is the assertion the finding asked for:
+  // the debt survives on the row, and the production backlog query selects it.
+  assert.ok(
+    subject().backReferenceFollowUpsPendingAt instanceof Date,
+    'the marker — the durable record of the debt — is retained',
+  )
+  assert.ok(
+    inTheOperatorBacklog(subject()),
+    'and the operational backlog selects the row, so the operator sees the stalled payment/PDF/email even '
+      + 'though every activity-log write for it failed',
+  )
+})
+
+test('[o3d-0bfh r6] the same holds on the RETAINED-obligation path, where the log line WAS the whole notification', async () => {
+  // The other site Codex named by line (settleFollowUpObligation). Reached by failing the
+  // back-reference WRITE: QuickBooks swallows that, so the entry succeeds, the link never landed,
+  // and the obligation is deliberately retained with a log line as its only announcement.
+  reset('quickbooks')
+  state.failBackReferenceWrite = true
+  state.unpersistableActivityActions.add('quickbooks_followup_obligation_retained')
+  const stderr = captureStderr()
+
+  let result
+  try {
+    result = await runQuickBooks()
+  } finally {
+    stderr.restore()
+  }
+
+  assert.equal(result.succeeded, 1, 'the post landed; only the local link did not')
+  assert.ok(
+    state.journal.some((entry) => entry.op === 'backReference.attempted-and-failed'),
+    'the link write must actually have been attempted and failed, or this row owes nothing',
+  )
+  assert.ok(
+    state.activities.some((entry) => entry.action === 'quickbooks_followup_obligation_retained'),
+    'the retained-obligation notice was attempted',
+  )
+  assert.ok(
+    stderr.lines.some((line) => line.includes('could NOT be written')),
+    `and its failure was reported rather than swallowed; saw ${JSON.stringify(stderr.lines)}`,
+  )
+  assert.ok(subject().backReferenceFollowUpsPendingAt instanceof Date, 'the obligation is retained')
+  assert.ok(inTheOperatorBacklog(subject()), 'and it is listed for an operator with no dependence on that log write')
+})
+
+test('[o3d-0bfh r6] CONTROL: a row whose follow-ups RAN is not in the backlog', async () => {
+  // Without this, "the backlog selects the row" is satisfied by a predicate that selects every row —
+  // which would bury the real obligations in a list of healthy documents and be no surface at all.
+  reset('quickbooks')
+
+  const result = await runQuickBooks()
+
+  assert.equal(result.succeeded, 1)
+  assert.equal(state.syncRows.filter((row) => row.type === 'BILL_ATTACHMENT').length, 1, 'the follow-ups ran')
+  assert.equal(subject().backReferenceFollowUpsPendingAt, null, 'so the obligation was discharged')
+  assert.equal(inTheOperatorBacklog(subject()), false, 'and nothing about it is listed as owed')
+})
+
+test('[o3d-0bfh r6] CONTROL: a marked row inside the settling grace, and a XERO row, are not listed', async () => {
+  // Two ways the backlog could cry wolf, both asserted against the real predicate:
+  //
+  //   • a row claimed moments ago is MID-PASS — the connector releases the marker a few statements
+  //     after taking it, so listing it would flicker on every healthy post;
+  //   • a Xero row's marker HAS a consumer. Listing it would tell an operator to do by hand what the
+  //     sweep is about to do, which is how a duplicate payment gets recorded.
+  reset('quickbooks')
+  state.syncRows = [{ ...blankRow(), externalTransactionId: null }]
+  state.failFollowUpsFor.add('log-1')
+  await runQuickBooks()
+  assert.ok(subject().backReferenceFollowUpsPendingAt instanceof Date)
+
+  assert.equal(
+    inTheOperatorBacklog(subject(), 0), false,
+    'a marker claimed seconds ago is still in flight, not stranded',
+  )
+  assert.equal(inTheOperatorBacklog(subject(), 30), true, 'and the same row IS listed once the grace has passed')
+
+  const asXero = { ...subject(), connector: 'xero' }
+  assert.equal(
+    inTheOperatorBacklog(asXero, 30), false,
+    'a connector WITH a sweep consumer is never listed as needing a human',
+  )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-0bfh r7 (Codex HIGH) — THE SETTLING GRACE READ THE FENCING GENERATION AS WALL-CLOCK TIME.
+//
+// r6 excluded a row from the backlog with `backReferenceFollowUpsPendingAt < now - grace`. That
+// column is NOT a timestamp: `nextFollowUpObligationGeneration` mints it as `max(now, observed +
+// 1ms)`, deliberately AHEAD of the minting host's clock, so that two writers inside one TIMESTAMP(3)
+// millisecond cannot mint the same value. The value therefore carried two meanings — an ordering
+// token, and roughly-a-time — and only the first is true under load.
+//
+// Consequence: a contended row's marker sits in the FUTURE, `marker < now - grace` is false for
+// longer than the grace, and the amount grows with contention. The row hidden that way is a stalled
+// payment, PDF, email or attachment on a connector with no sweep — the exact thing the backlog
+// exists to show. The grace now measures on `syncedAt` (else `createdAt`), which are real times
+// nothing mints, and the marker is asked only whether it is null.
+// ---------------------------------------------------------------------------
+
+test('[o3d-0bfh r7] a generation pushed AHEAD of real time by contention still appears in the backlog', async () => {
+  reset('quickbooks')
+  state.syncRows = [{ ...blankRow(), externalTransactionId: null }]
+  state.failFollowUpsFor.add('log-1')
+  await runQuickBooks()
+
+  const row = subject()
+  const claimed = row.backReferenceFollowUpsPendingAt
+  assert.ok(claimed instanceof Date, 'the obligation is retained — there is something to be hidden')
+  assert.ok(row.syncedAt instanceof Date, 'and the row carries the real completion time the grace measures on')
+
+  // CONTENTION, minted by the production mint rather than by hand: a peer observed a generation an
+  // hour ahead (a second host whose clock had run fast, or a burst of re-claims on this row), so the
+  // next mint is an hour and a millisecond ahead of ANY clock that will read it.
+  const contended = nextFollowUpObligationGeneration(
+    new Date(Date.now() + 60 * 60_000),
+    new Date(),
+  )
+  assert.ok(
+    contended.getTime() > Date.now() + 30 * 60_000,
+    'the mint really does push the generation past the clock — that is the premise of this test',
+  )
+  row.backReferenceFollowUpsPendingAt = contended
+
+  // Thirty minutes on: the document posted half an hour ago and nothing has come back for it. Under
+  // the r6 predicate the marker (now + 60m) is not less than (now + 30m - 5m), so the row was
+  // invisible — and would stay invisible for an hour and five minutes after the money work stalled.
+  assert.equal(
+    inTheOperatorBacklog(row, 30), true,
+    'a stranded obligation must be listed on the age of the ROW, not on a fencing token that contention pushed '
+      + 'into the future',
+  )
+
+  // The same row an hour and a half on, when even the inflated marker has fallen behind the clock:
+  // still listed. Nothing about this depends on the marker's value, which is the point.
+  assert.equal(inTheOperatorBacklog(row, 90), true, 'and it does not appear only once the future marker matures')
+
+  // CONTROL, so this is not satisfied by a predicate that ignores the grace entirely: the same
+  // contention-inflated marker on a row that posted seconds ago is still mid-pass and NOT listed.
+  assert.equal(
+    inTheOperatorBacklog(row, 0), false,
+    'the grace still holds a freshly-posted row back — it is a noise filter on a real age, not a no-op',
+  )
+})
+
+test('[o3d-0bfh r7] a FAILED row that never reached SYNCED is aged on createdAt, not on the marker', async () => {
+  // The other branch of the where-clause. A row whose retries exhausted before it ever posted has no
+  // `syncedAt`; without the createdAt branch it could never be listed at all, and FAILED is one of
+  // the two statuses this backlog exists for.
+  reset('quickbooks')
+  const row: SyncRow = {
+    ...blankRow(),
+    status: 'FAILED',
+    syncedAt: null,
+    createdAt: new Date(Date.now() - 60 * 60_000),
+    backReferenceFollowUpsPendingAt: nextFollowUpObligationGeneration(new Date(Date.now() + 60 * 60_000), new Date()),
+  }
+  assert.equal(inTheOperatorBacklog(row, 0), true, 'an hour-old FAILED row owing follow-ups is stranded, and listed')
+
+  const fresh: SyncRow = { ...row, createdAt: new Date() }
+  assert.equal(
+    inTheOperatorBacklog(fresh, 0), false,
+    'and one created seconds ago is not — the createdAt branch is a real age too, not an unconditional pass',
+  )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-0bfh r15 (Codex HIGH) — ON THE SALES-INVOICE PATH THE RELEASE IS THE RE-DRIVE'S, AND THE
+// CALLER MUST NOT TAKE IT AGAIN.
+//
+// The re-drive now clears the obligation generation inside the same transaction as its final re-read
+// of the order's receipts, under the sales-order lock — because a receipt committing after its
+// snapshot would otherwise read a live marker, be told its recovery is retained, and then have that
+// marker cleared over it. A caller that goes on to clear the marker AFTERWARDS is a second,
+// UNFENCED clearing path: it is the write the fence exists to remove, and on the run where the
+// generations happen to differ it is the write that loses the receipt.
+// ---------------------------------------------------------------------------
+
+function salesInvoiceSubject() {
+  reset()
+  salesOrderRow = { id: 'so-1', accountingInvoiceId: null, customerEmail: null, shoppingLinks: [] }
+  Object.assign(state.syncRows[0], {
+    type: 'SALES_INVOICE',
+    referenceType: 'SalesOrder',
+    referenceId: 'so-1',
+    externalTransactionId: 'XINV-1',
+    payload: { invoiceNumber: 'INV-1' },
+  })
+}
+
+/** Every write that CLEARS the obligation marker, in order. */
+function markerClears() {
+  return state.journal.filter((entry) => entry.op === 'syncLog.updateMany'
+    && entry.data?.backReferenceFollowUpsPendingAt === null)
+}
+
+test('[o3d-0bfh r15] the Xero sales-invoice post hands its GENERATION to the re-drive', async () => {
+  salesInvoiceSubject()
+
+  const result = await runDirect()
+
+  assert.equal(result.succeeded, 1)
+  const claimed = assertObligationClaimedWithTheSyncedWrite('syncLog.updateMany').data?.backReferenceFollowUpsPendingAt
+  assert.deepEqual(
+    deferredReceipts.obligation,
+    { syncLogId: 'log-1', connector: 'xero', generation: claimed, recovery: { consumer: 'sweep' } },
+    'the re-drive is given the generation THIS pass minted, which is what lets it clear the marker '
+      + 'inside the same transaction as its receipt re-read — the whole of o3d-0bfh r15',
+  )
+})
+
+test('[o3d-0bfh r15] and the marker is cleared ONCE, by the fenced pass, not again by the caller', async () => {
+  salesInvoiceSubject()
+
+  await runDirect()
+
+  assert.equal(
+    markerClears().length, 1,
+    'exactly one write clears the marker. A second one here is an UNFENCED clearing path outside the '
+      + 'sales-order lock — the write o3d-0bfh r15 removed — and it reports a false "the obligation '
+      + 'marker has been re-claimed since" on every successful post besides.',
+  )
+  assert.equal(subject().backReferenceFollowUpsPendingAt, null, 'and the obligation really is discharged')
+})
+
+test('[o3d-0bfh r15] CONTROL: a path with no deferred receipt still has its marker cleared by the caller', async () => {
+  // The bill subject never reaches the re-drive, so `obligationFenced` is false and the caller's own
+  // release is the only one there is. Without this, the assertion above is also satisfied by a
+  // connector that stopped releasing anything at all.
+  reset()
+
+  await runDirect()
+
+  assert.equal(deferredReceipts.obligation, null, 'the re-drive was never reached on this path')
+  assert.equal(markerClears().length, 1)
+  assert.equal(subject().backReferenceFollowUpsPendingAt, null)
 })

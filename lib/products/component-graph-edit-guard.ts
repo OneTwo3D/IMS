@@ -338,9 +338,11 @@ const TERMINAL_REFUSING_ORDER_STATUSES = new Set(['CANCELLED'])
  *     three either remove the rows or move the order to a terminal status). An allocation blocker
  *     can only exist on an in-flight order by construction (`IN_FLIGHT_ORDER_STATUSES`), so no
  *     cancelled-order case arises here;
- *   - a PICKING/PACKED SHIPMENT blocker on a LIVE order clears by DISPATCHING that shipment, or by
- *     cancelling the whole order — `cancelSalesOrderFulfillmentState` deletes PENDING/PICKING/PACKED
- *     shipments outright. `SHIPMENT_TRANSITIONS` is forward-only and IMS has no per-shipment cancel
+ *   - a PICKING/PACKED SHIPMENT blocker on a LIVE order clears by DISPATCHING that shipment, by
+ *     REOPENING it (`reopenShipmentForRepack`, o3d-2k5 — it reverts to a PENDING draft, and a draft
+ *     is not a `committed_shipment` blocker), or by cancelling the whole order —
+ *     `cancelSalesOrderFulfillmentState` deletes PENDING/PICKING/PACKED shipments outright.
+ *     `SHIPMENT_TRANSITIONS` is still forward-only and there is still no per-shipment DELETE
  *     (o3d-q8r6), which is why the message must not offer one;
  *   - a PICKING/PACKED SHIPMENT blocker on a CANCELLED order clears ONLY through the repair action
  *     (`discardCancelledOrderShipments`), which deletes the order's remaining non-dispatched
@@ -370,8 +372,8 @@ export function describeComponentGraphEditBlockers(
     + 'editing it now would silently change what those orders are deemed to require and let an '
     + 'incomplete kit ship. To clear this: deallocate, dispatch or cancel those orders'
     + (liveCommitted.length > 0
-      ? '; a shipment already at picking/packed can only be cleared by dispatching it or cancelling '
-        + 'its order (there is no route back to draft and no per-shipment cancel)'
+      ? '; a shipment already at picking/packed is cleared by dispatching it, by using "Reopen for '
+        + 'repack" on it (which returns it to a pending draft), or by cancelling its order'
       : '')
     + (cancelledRefs.length > 0
       ? `; the picking/packed shipment(s) on already-cancelled order(s) ${cancelledRefs.join(', ')} `

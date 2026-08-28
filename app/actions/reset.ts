@@ -4,6 +4,12 @@ import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { lockIntegrationPluginSelection } from '@/lib/integration-plugin-selection-lock'
+import {
+  ACCOUNTING_BINDING_PIN_SETTING_KEYS,
+  ACCOUNTING_BINDING_SETTING_KEYS,
+  ACCOUNTING_BINDING_WITNESS_SETTING_KEYS,
+  runOrderedAccountingBindingWrites,
+} from '@/lib/connectors/accounting-binding-lock-order'
 import { freshAuthFailureResult, requireFreshAdmin } from '@/lib/auth/server'
 import { issueDestructiveActionCode, consumeDestructiveActionCode } from '@/lib/destructive-action-confirm'
 import {
@@ -283,10 +289,39 @@ async function clearFullScope() {
   // the orphan-cancel sweep's row locks had to fence (o3d-osl8 round 6, finding 2). A concurrent cancel
   // then either commits before this or waits for it, instead of deciding what to discard from a
   // selection this is deleting underneath it.
+  //
+  // ...AND IT TAKES THE BINDING ROWS BY NAME, IN THE CANONICAL ORDER, BEFORE IT WIPES ANYTHING ELSE
+  // (o3d-2w2j r2, Codex MEDIUM).
+  //
+  // The first round of the lock-order work EXCLUDED this writer, on the ground that it "deletes whole
+  // TABLES, not the named rows of one binding, so there is nothing for the helper to key on". That
+  // reason is wrong, and it is wrong in the direction that matters: `setting.deleteMany({})` is not an
+  // absence of row acquisitions, it is EVERY row acquisition, taken in scan order — the pin and the
+  // release witness among them.
+  //
+  // THE CYCLE THAT MAKES IT CONCRETE. In the legitimate released state the pin row is ABSENT while the
+  // token's release receipt and the `xero_pin_release_witness` row both exist. A concurrent consent
+  // INSERTs the pin, which fires `xero_pin_write_consumes_release` (20260819210000): the trigger
+  // UPDATEs `accounting_tokens` — taking the token row — and then DELETEs the witness, which this wipe
+  // is already holding. This wipe then reaches `accountingToken.deleteMany` and waits on that token.
+  // Witness-then-token here, token-then-witness there; PostgreSQL breaks it by killing one of them,
+  // and both of them are on the path an operator takes when they are already mid-incident.
+  //
+  // SO: pin, token, witness — the one order, through the one helper — and then everything else with
+  // those keys EXCLUDED. The exclusion is load-bearing, not tidiness: a bare `deleteMany({})` after
+  // the token delete could still block on a binding row held by an uncommitted consent while this
+  // transaction held the token, which is the same cycle one statement later. And the r7 property is
+  // preserved and sharpened rather than lost — both pins are still deleted BEFORE the token row, so a
+  // consent that commits in between leaves a pin with no token ("not connected", repaired by
+  // connecting again) and never a token with no pin (the halt).
   await db.$transaction(async (tx) => {
     await lockIntegrationPluginSelection(tx)
-    await tx.setting.deleteMany({})
-    await tx.accountingToken.deleteMany({})
+    await runOrderedAccountingBindingWrites({
+      pin: () => tx.setting.deleteMany({ where: { key: { in: [...ACCOUNTING_BINDING_PIN_SETTING_KEYS] } } }),
+      token: () => tx.accountingToken.deleteMany({}),
+      witness: () => tx.setting.deleteMany({ where: { key: { in: [...ACCOUNTING_BINDING_WITNESS_SETTING_KEYS] } } }),
+    })
+    await tx.setting.deleteMany({ where: { key: { notIn: [...ACCOUNTING_BINDING_SETTING_KEYS] } } })
   })
   await db.warehouse.deleteMany({})
   await db.organisation.deleteMany({})

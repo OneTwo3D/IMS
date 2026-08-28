@@ -197,7 +197,15 @@ export function isFxGainLossJournalSuppressed(
  */
 export type ConnectorEnqueueOutcome = {
   queued: boolean
-  reason?: 'not-configured' | 'refused'
+  /**
+   * `already-queued` (o3d-ekn8 r4, Codex MEDIUM) — `queued: true` WITHOUT A WRITE. The idempotency
+   * short-circuit finds a live row carrying the same key and reports success, which is right for the
+   * fourteen callers that only ask "is this work on the queue". It is NOT right for a caller that
+   * then decides to ROLL THE WRITE BACK: there was no write, the pre-existing row is still live and
+   * still going to post, and rolling back an empty transaction while telling the operator "nothing
+   * was sent" is the one message that guarantees nobody goes looking for it.
+   */
+  reason?: 'not-configured' | 'refused' | 'already-queued'
 }
 
 export type AccountingEnqueueOutcome = ConnectorEnqueueOutcome & {
@@ -446,7 +454,9 @@ export async function queueAccountingSyncTx(
       },
       select: { id: true },
     })
-    if (existing) return answer({ queued: true }, context.connector)
+    // NOTHING IS WRITTEN HERE. `queued: true` means "the work is on the queue", not "this call put
+    // it there" — see ConnectorEnqueueOutcome.reason (o3d-ekn8 r4).
+    if (existing) return answer({ queued: true, reason: 'already-queued' }, context.connector)
   }
 
   try {

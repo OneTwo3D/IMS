@@ -47,6 +47,22 @@ export type OutboxUpdateClient = {
   integrationOutbox: { updateMany(args: unknown): Promise<{ count: number }> }
 }
 
+/**
+ * o3d-2k5r r9: how a read asks its question OF THE STATUS COLUMN.
+ *
+ * Two shapes because the two reads want two different things, and neither is a special case of the
+ * other: the operator control wants a KNOWN SET (`in`), the dispatch fence wants EVERYTHING BUT ONE
+ * VALUE (`not`). Passing a `string[]` to the private helper forced both to be allowlists, which is
+ * what let an unknown status slip the fence.
+ */
+export type OutboxStatusPredicate = { in: string[] } | { not: string }
+
+/** o3d-2k5r r4: the READ half — what "is a repack recovery still outstanding?" needs. */
+export type OutstandingReleaseReadClient = {
+  salesOrderRefund: { findMany(args: unknown): Promise<Array<{ id: string }>> }
+  integrationOutbox: { count(args: unknown): Promise<number> }
+}
+
 export const REFUND_RESERVATION_RELEASE_OUTBOX_CONNECTOR = 'sales'
 export const REFUND_RESERVATION_RELEASE_OUTBOX_OPERATION = 'refund.reservation-release'
 const REFUND_RESERVATION_RELEASE_OUTBOX_WORKER = 'refund-reservation-release-drain'
@@ -181,10 +197,187 @@ export async function scheduleRefundUnmatchedWarningOutbox(
  * Re-running allocation is not side-effect-idempotent (it deletes/recreates
  * OrderAllocation rows and resets staged allocation accounting), so once the
  * immediate attempt has released, the durable backstop's work is done (Codex review
- * r2). Only resolves a still-open (PENDING / RETRYABLE_FAILED) row — a row the drain
- * has already claimed (PROCESSING) or finished is left untouched. Best-effort: if this
- * fails, the drain re-runs the (numerically idempotent) release on the next tick.
+ * r2). Only resolves a row an operator can still finish (`RESUMABLE_RELEASE_STATUSES` — including a
+ * dead-lettered PERMANENT_FAILED one, which is the whole point of o3d-2k5r r6: the
+ * in-transaction recovery is now the only thing that can ever clear it) — a row the
+ * drain has already claimed (PROCESSING) or finished is left untouched. Best-effort: if
+ * this fails, the drain re-runs the (numerically idempotent) release on the next tick.
  */
+/**
+ * TWO QUESTIONS ABOUT THE SAME COLUMN, AND THEY ARE NOT THE SAME QUESTION (o3d-2k5r r8, Codex).
+ *
+ * r4 shipped ONE status set behind ONE count, on the principle that a reader and a resolver which
+ * disagree leave a control that can be pressed and can never go away. That principle still holds —
+ * for the OPERATOR CONTROL. It does not hold for the DISPATCH FENCE added in r7, which reused the
+ * same count and so inherited the one exclusion that is exactly backwards for it: PROCESSING.
+ *
+ *   "May the operator press Finish repack recovery?"  PROCESSING is a NO. The drain owns the row
+ *                                                     and is running the same repair right now;
+ *                                                     offering the button invites a race with it.
+ *   "May this dispatch go?"                           PROCESSING is the strongest YES-IT-IS-OWED
+ *                                                     there is. A worker is mid-repair on it.
+ *
+ * And it MATTERS rather than merely reading oddly, because of WHERE the claim happens.
+ * `claimIntegrationOutboxWork` flips the row to PROCESSING BEFORE the drain calls allocation, and
+ * that claim takes NO sales-order lock. So a dispatch can take the order lock inside the window
+ * between the claim and the worker's allocation, count zero outstanding rows, and commit SHIPPED.
+ * The worker then takes the lock, finds a dispatched shipment, refuses, and hands the row back as
+ * RETRYABLE_FAILED — now pointing at an order no click can ever recover. The order lock does not
+ * serialize that, because the claim never took it. The fence has to count the claim itself.
+ *
+ * So: two named sets, two named reads, one question each. Neither is the "correct" one.
+ */
+
+/**
+ * THE STATUSES AN OPERATOR CAN STILL PICK UP AND FINISH (o3d-2k5r r4, widened in r6).
+ *
+ * One set, used by BOTH the evidence read that offers the recovery control and the write that
+ * resolves the row when the recovery runs — because a status the reader counts as outstanding but
+ * the resolver refuses to clear is a control that can be pressed and can never go away.
+ *
+ * PENDING / RETRYABLE_FAILED — the drain still owns them; the release is owed.
+ *
+ * PERMANENT_FAILED — the drain has GIVEN UP on them, and that is the strongest evidence of all
+ * (o3d-2k5r r6). The drain refuses while any shipment exists and burns an attempt each time, so an
+ * order stranded long enough dead-letters here; `claimIntegrationOutboxWork` never claims a
+ * PERMANENT_FAILED row again, so nothing else in the system will ever release that reservation.
+ * Excluding it inverted the design's own promise: the orders the resume path was BUILT for — the
+ * ones stranded by the earlier non-transactional shape, which have had the longest to exhaust their
+ * retries — were the exact orders it withheld the control from, leaving stock reserved indefinitely.
+ *
+ * PROCESSING is deliberately NOT here. The drain holds the row and is running the same repair right
+ * now; offering the operator the button then is inviting them to race a worker that already has it,
+ * and a resolver that cleared a claimed row would let the recovery and the drain both believe they
+ * finished it. If the drain fails it returns the row to RETRYABLE_FAILED and the control comes back
+ * on the next read. THE DISPATCH FENCE MUST NOT COPY THIS EXCLUSION — see
+ * `UNFINISHED_RELEASE_STATUS_PREDICATE`.
+ *
+ * SUCCEEDED is the recovery already done.
+ */
+const RESUMABLE_RELEASE_STATUSES: string[] = [
+  INTEGRATION_OUTBOX_STATUS.PENDING,
+  INTEGRATION_OUTBOX_STATUS.RETRYABLE_FAILED,
+  INTEGRATION_OUTBOX_STATUS.PERMANENT_FAILED,
+]
+
+/**
+ * THE PREDICATE THAT MEANS THE RELEASE HAS NOT HAPPENED (o3d-2k5r r8, widened to a negative in r9).
+ *
+ * NOT a status list. r8 derived the fence's list from `INTEGRATION_OUTBOX_STATUS` so that "a status
+ * added later fences by default" — but a list is still an ALLOWLIST, and it is queried with
+ * `status IN (...)`. The derivation happens when THIS binary compiles; the row is read at run time.
+ * `IntegrationOutbox.status` is an unconstrained string, so during a rolling deploy or a rollback a
+ * newer writer can persist a status this process has never heard of. That value is in nobody's
+ * `Object.values` here, matches no element of the IN list, counts zero — and the fence, whose entire
+ * job is to fail closed, silently opens on exactly the state it does not understand (Codex r8).
+ *
+ * So the fence asks the question the other way round. Not "is the row's status one of the unfinished
+ * ones I happen to know", which can only be as complete as this binary's enum, but "is the row's
+ * status NOT the one value that means finished" — which needs no list, and is complete against every
+ * status that will ever exist. SUCCEEDED is a value written by the resolver in THIS module; an
+ * unknown status is by construction not it, so an unknown status fences. Being wrong in this
+ * direction costs a refused dispatch whose message names the remedy; being wrong in the other costs
+ * an order nobody can repair.
+ *
+ * (`status` is a non-nullable column, so `NOT (status = 'SUCCEEDED')` has no NULL third case to
+ * leak through. The operator control above deliberately KEEPS its allowlist: "which rows may a
+ * human press Finish on" genuinely wants a known, enumerated set — a status this binary cannot name
+ * is a status whose recovery semantics it cannot vouch for, and offering a button for it would be
+ * the same guess in the more dangerous direction.)
+ *
+ * NOTHING STRANDS ON THIS. Every status the predicate catches has a way out that does not
+ * require a dispatch:
+ *   - PENDING / RETRYABLE_FAILED / PERMANENT_FAILED are all resumable by the operator control
+ *     (`RESUMABLE_RELEASE_STATUSES` above is exactly those three), and while the order holds no
+ *     dispatched shipment that control's own prerequisite — reopen the committed siblings — is
+ *     reachable too.
+ *   - PROCESSING cannot be terminal. `attempts` is only ever incremented by the same write that
+ *     moves the row OUT of PROCESSING, so a claimed row always satisfies the `attempts < maxAttempts`
+ *     half of `claimableWhere`, and its other half re-claims any PROCESSING row whose `lockedAt` is
+ *     older than the stale-lock window. A crashed worker's row therefore returns to a resumable
+ *     status on a later drain tick rather than sitting here for ever.
+ *   - a status this binary does not know is, by the same argument, a status some OTHER binary
+ *     writes and drains; the row is owned by the deploy that understands it, and the worst this
+ *     process can do is decline to ship past it until that owner resolves it to SUCCEEDED.
+ * And the fence has its own escape hatch regardless: `dispatchForeclosesRepackRecovery` stops
+ * refusing once the order already holds a dispatch, so an order past the wall still ships.
+ */
+const UNFINISHED_RELEASE_STATUS_PREDICATE: OutboxStatusPredicate = {
+  not: INTEGRATION_OUTBOX_STATUS.SUCCEEDED,
+}
+
+/**
+ * o3d-2k5r r4 — THE DURABLE EVIDENCE THAT A REPACK RECOVERY IS STILL OUTSTANDING.
+ *
+ * The recovery's third step resolves these rows. So a row still sitting at one of the caller's
+ * statuses, for one of this order's refunds, is exactly "the refunded units' reservation has not
+ * been released for this order yet", committed inside the refund's own transaction and therefore
+ * surviving every crash the recovery can suffer.
+ *
+ * Deliberately NOT "the order has a PENDING shipment": every order with a draft has one, and
+ * offering the control on all of them would be an invitation to re-run a repair that is already
+ * done. Nor "an activity-log row exists": logActivity swallows write failures, so its absence
+ * proves nothing.
+ *
+ * Private: callers pick a QUESTION (one of the two exported reads below), never a status list.
+ */
+async function countRefundReservationReleasesAt(
+  orderId: string,
+  statusPredicate: OutboxStatusPredicate,
+  options: { client?: OutstandingReleaseReadClient },
+): Promise<number> {
+  const client = options.client ?? (db as unknown as OutstandingReleaseReadClient)
+  const refunds = await client.salesOrderRefund.findMany({ where: { orderId }, select: { id: true } })
+  if (refunds.length === 0) return 0
+  const idempotencyKeys = refunds.map((refund) => buildOutboxIdempotencyKey(
+    REFUND_RESERVATION_RELEASE_OUTBOX_CONNECTOR,
+    REFUND_RESERVATION_RELEASE_OUTBOX_OPERATION,
+    refund.id,
+  ))
+  return client.integrationOutbox.count({
+    where: {
+      connector: REFUND_RESERVATION_RELEASE_OUTBOX_CONNECTOR,
+      operation: REFUND_RESERVATION_RELEASE_OUTBOX_OPERATION,
+      idempotencyKey: { in: idempotencyKeys },
+      status: statusPredicate,
+    },
+  })
+}
+
+/**
+ * THE AFFORDANCE READ — "does this order owe a recovery an OPERATOR can finish right now?"
+ *
+ * Gates the "Finish repack recovery" control (`getOrderShipments`), so it appears only where there
+ * is something to finish and disappears once there is not. Excludes PROCESSING on purpose: while
+ * the drain holds the row the operator has nothing to press, and `resolveRefundReservationReleaseOutbox`
+ * would refuse to clear a claimed row anyway.
+ *
+ * NOT the dispatch fence's question — use `countUnfinishedRefundReservationReleases` for that.
+ */
+export async function countResumableRefundReservationReleases(
+  orderId: string,
+  options: { client?: OutstandingReleaseReadClient } = {},
+): Promise<number> {
+  return countRefundReservationReleasesAt(orderId, { in: RESUMABLE_RELEASE_STATUSES }, options)
+}
+
+/**
+ * THE DISPATCH-FENCE READ — "has this order's deferred reservation release actually happened?"
+ *
+ * Counts a claimed (PROCESSING) row as outstanding, which is the whole difference from the
+ * affordance read above: a worker OWNING the row is precisely when a dispatch must not proceed,
+ * because the claim took no order lock and the worker's allocation has not run yet.
+ *
+ * NOT the affordance's question — a row counted here may be one the operator can do nothing about
+ * this second, and that is fine: the fence refuses a dispatch, it does not render a button.
+ */
+export async function countUnfinishedRefundReservationReleases(
+  orderId: string,
+  options: { client?: OutstandingReleaseReadClient } = {},
+): Promise<number> {
+  return countRefundReservationReleasesAt(orderId, UNFINISHED_RELEASE_STATUS_PREDICATE, options)
+}
+
 export async function resolveRefundReservationReleaseOutbox(
   refundId: string,
   options: { client?: OutboxUpdateClient } = {},
@@ -200,9 +393,16 @@ export async function resolveRefundReservationReleaseOutbox(
       connector: REFUND_RESERVATION_RELEASE_OUTBOX_CONNECTOR,
       operation: REFUND_RESERVATION_RELEASE_OUTBOX_OPERATION,
       idempotencyKey,
-      status: { in: [INTEGRATION_OUTBOX_STATUS.PENDING, INTEGRATION_OUTBOX_STATUS.RETRYABLE_FAILED] },
+      status: { in: RESUMABLE_RELEASE_STATUSES },
     },
-    data: { status: INTEGRATION_OUTBOX_STATUS.SUCCEEDED, lockedAt: null, lockedBy: null },
+    // `nextAttemptAt` is cleared with the rest: a PERMANENT_FAILED row carries null already, and a
+    // RETRYABLE_FAILED one must not keep a due time on a row nothing will drain again.
+    data: {
+      status: INTEGRATION_OUTBOX_STATUS.SUCCEEDED,
+      lockedAt: null,
+      lockedBy: null,
+      nextAttemptAt: null,
+    },
   })
   return count
 }

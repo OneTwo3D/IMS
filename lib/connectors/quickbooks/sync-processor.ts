@@ -12,7 +12,7 @@ import { retireSalesInvoiceForCancelledOrder } from '@/lib/domain/accounting/can
 import { readClaimedSyncLogPayload } from '@/lib/domain/accounting/claimed-sync-payload'
 import { claimHeldFrom } from '@/lib/domain/accounting/sync-claim-fence'
 import { UNCLAIMED_ATTEMPT_REVISION } from '@/lib/domain/accounting/sync-log-attempt'
-import { logActivity } from '@/lib/activity-log'
+import { logActivity, logActivityPersisted } from '@/lib/activity-log'
 import { pushSalesInvoice } from './invoices'
 import { pushPurchaseBill } from './bills'
 import { pushCreditMemo } from './credit-notes'
@@ -20,7 +20,12 @@ import { pushJournalEntry } from './journals'
 import { qboPost, qboUploadAttachment, resolveAccountRef, qboPostIdempotent} from './api'
 import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
-import { planFollowUpEnqueue, readFollowUpIdempotencyKey } from '@/lib/domain/accounting/followup-idempotency'
+import {
+  liveRowOccupiesFollowUpSlot,
+  planFollowUpEnqueue,
+  readFollowUpIdempotencyKey,
+  type FollowUpPayload,
+} from '@/lib/domain/accounting/followup-idempotency'
 import { repairMoneyAttemptsOutsideStampingCustody, stampingCustodyOnClaim, stampingCustodyOnCreate } from '@/lib/domain/accounting/money-attempt-provenance'
 import { ledgerClearsFollowUpRevival, postMoneyUnderLedgerFence } from '@/lib/connectors/accounting-settlement-probe'
 import { moneyPostDateToSend, settlementMarkerFor } from '@/lib/domain/accounting/ledger-settlement-evidence'
@@ -52,10 +57,11 @@ import {
   applyBackReference,
   backReferenceHolder,
   findExternalDocumentIdClaim,
-  followUpObligationClaim,
+  claimFollowUpObligation,
   isExternalDocumentIdConflict,
   releaseFollowUpObligation,
 } from '@/lib/domain/accounting/back-reference'
+import { FOLLOW_UP_OBLIGATION_OUTCOME_IS_UNKNOWN, followUpObligationRecoveryFor } from '@/lib/domain/accounting/follow-up-obligation-registry'
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 import { resolveStoredInvoiceUploadPath } from '@/lib/upload-storage'
 
@@ -330,8 +336,14 @@ async function persistFreshQboPost(
   entry: { id: string; type: AccountingSyncType; referenceType: string; referenceId: string },
   payload: SyncPayload,
   externalId: string | null,
-): Promise<void> {
-  await db.$transaction(async (tx) => {
+  /**
+   * Returns THE OBLIGATION GENERATION THIS PASS MINTED (o3d-0bfh r4), or `null` when the claim did
+   * not land. A pass that owns no generation has no standing to say the follow-ups are done, so the
+   * value has to travel out of the transaction that took it rather than be re-read afterwards —
+   * re-reading gives whichever generation is live NOW, which may be somebody else's.
+   */
+): Promise<Date | null> {
+  return await db.$transaction(async (tx) => {
     await tx.accountingSyncLog.update({
       where: { id: entry.id },
       data: {
@@ -340,12 +352,14 @@ async function persistFreshQboPost(
         syncedAt: new Date(),
         errorMessage: null,
         processingStartedAt: null,
-        // The external id and the record that follow-ups are owed become durable in ONE
-        // write (r10 finding 1) — the comment above is exactly why they have to: everything
-        // after this transaction can die without the row ever being re-posted.
-        ...followUpObligationClaim(),
       },
     })
+    // The external id and the record that follow-ups are owed become durable in ONE
+    // TRANSACTION (r10 finding 1) — the comment above is exactly why they have to: everything
+    // after it can die without the row ever being re-posted. o3d-0bfh r4 moved the claim out of
+    // the statement above and into this one so it can read the generation it replaces and report
+    // the one it minted; both statements commit together, so the window is still zero.
+    const claim = await claimFollowUpObligation(tx, { syncLogId: entry.id, connector: QBO_CONNECTOR })
     await updateMirroredEventForSyncLog(tx, {
       syncLogId: entry.id,
       type: entry.type,
@@ -355,6 +369,7 @@ async function persistFreshQboPost(
       status: 'POSTED',
       externalId,
     })
+    return claim.claimed ? claim.generation : null
   })
 }
 
@@ -445,21 +460,26 @@ function unpersistedQboPostRecord(incident: UnpersistedQboPost, description: str
  * or there until o3d-4b5p gives this connector a real quiescence fence. The single authority on the
  * wording is `describeUnpersistedQboPost`.
  *
- * Returns whether the id is now durable. `false` means the caller must NOT continue into the
- * follow-ups and must NOT let the outer handler see this iteration.
+ * Returns whether the id is now durable, AND — o3d-0bfh r4 — the obligation generation the durable
+ * write claimed. `persisted: false` means the caller must NOT continue into the follow-ups and must
+ * NOT let the outer handler see this iteration; there is then no generation, which is correct, since
+ * a pass whose post was never recorded has claimed nothing it could later discharge.
  */
+type FreshQboPostPersistence =
+  | { persisted: true; obligation: Date | null }
+  | { persisted: false }
+
 async function persistFreshQboPostOrEscalate(
   entry: { id: string; type: AccountingSyncType; referenceType: string; referenceId: string },
   payload: SyncPayload,
   externalId: string | null,
   /** o3d-batch-ret r10: the handler's own answer to "did anything leave this process". */
   externalEffect?: RemoteEffectOutcome,
-): Promise<boolean> {
+): Promise<FreshQboPostPersistence> {
   let lastError: unknown
   for (let attempt = 0; attempt < POST_EVIDENCE_TRANSACTION_ATTEMPTS; attempt += 1) {
     try {
-      await persistFreshQboPost(entry, payload, externalId)
-      return true
+      return { persisted: true, obligation: await persistFreshQboPost(entry, payload, externalId) }
     } catch (error) {
       lastError = error
     }
@@ -494,7 +514,7 @@ async function persistFreshQboPostOrEscalate(
       + `written either: ${String(cause)}`,
     )
   }
-  return false
+  return { persisted: false }
 }
 
 /**
@@ -518,15 +538,46 @@ async function persistFreshQboPostOrEscalate(
  * WORST-FIRST, as o3d-nf9i established for aggregation: one asserted occupant is enough for the
  * suppression to rest on an assertion, because any of them may be the only reason this is skipped.
  *
- * DELIBERATELY NOT PORTED HERE: Xero's `liveRowOccupiesFollowUpSlot` anchor comparison (o3d-hbgo),
- * which narrows the live set to rows targeting the SAME external document. That is a different
- * finding about a different defect, and mixing it in would change which rows this returns as well as
- * how they are described. The scope predicate is unchanged; only the basis is new.
+ * PORTED HERE (o3d-hbgo, this branch) — AND ONLY A ROW TARGETING THE SAME DOCUMENT OCCUPIES THE SLOT.
+ *
+ * The o3d-anu8 note that stood here said Xero's `liveRowOccupiesFollowUpSlot` was "deliberately not
+ * ported: a different finding about a different defect". That was the right call for THAT branch — it
+ * would have changed which rows this returns as well as how they are described — and it is the wrong
+ * state to leave behind, because the defect it declined to fix is fully live on this connector:
+ *
+ *   A SalesOrder's invoice is deleted and re-posted to a NEW QuickBooks invoice. The SYNCED
+ *   INVOICE_PAYMENT row from the FIRST invoice still matches (connector, type, referenceType,
+ *   referenceId), so `exists` is true, `planFollowUpEnqueue` skips, and the REPLACEMENT invoice is
+ *   never settled. Silently — a skip logs nothing. Same shape for INVOICE_PDF: the order keeps the
+ *   PDF of the invoice it no longer has.
+ *
+ * WHAT MAKES IT SAFE TO NARROW NOW, which was not obviously true when it was declined. The partial
+ * unique index `accounting_sync_logs_followup_live_unique` is keyed on the `connector` COLUMN, so
+ * 20260819120000 made it anchor-scoped for BOTH connectors at once. Since then the database has
+ * ALREADY permitted two live QuickBooks rows in this scope that name different documents, and this
+ * coarse lookup has been the only thing standing in the way — an application guard stricter than its
+ * own backstop, in the direction that loses work. Narrowing it makes the two agree rather than
+ * loosening anything the database was enforcing.
+ *
+ * AND IT DOES NOT OPEN A DOUBLE-PAY. The rows this now lets through name a DIFFERENT invoice from
+ * every live row on the order; the payment they post settles a document nothing has settled. A row
+ * that records NO anchor still occupies the slot (`liveRowOccupiesFollowUpSlot` treats an unanchored
+ * stored payload as matching), so legacy rows written before the payload carried one keep suppressing,
+ * exactly as they do today: for money, unknown target has to read as "possibly this one".
+ *
+ * ONE PREDICATE, NOT A SECOND SPELLING OF IT. The comparison is imported, not copied — the two
+ * connectors reach one rule, as they already do for the settlement basis below.
+ *
+ * `asserted` IS NARROWED WITH IT, and that is not incidental. Judged over every live row, an
+ * operator's assertion about the RETIRED invoice would refuse the enqueue for the REPLACEMENT — the
+ * o3d-anu8 refusal firing on a document its assertion never named, which is the same category error
+ * this fix removes, arriving by the other route.
  */
 async function hasExistingSyncLog(
   type: AccountingSyncType,
   referenceType: string,
   referenceId: string,
+  payload: SyncPayload,
 ): Promise<{ exists: boolean; asserted: boolean }> {
   const liveRows = await db.accountingSyncLog.findMany({
     where: {
@@ -536,14 +587,16 @@ async function hasExistingSyncLog(
       referenceId,
       status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
     },
+    // payload, because the anchors that say WHICH DOCUMENT this row settles live inside the JSON; and
     // settlementBasis, because the occupying row is what makes the enqueue a silent skip and a SYNCED
     // row is written by TWO things — the processor's writeback after QuickBooks answered, and an
     // operator typing a document id into the settlement dialog.
-    select: { settlementBasis: true },
+    select: { payload: true, settlementBasis: true },
   })
+  const occupying = liveRows.filter((row) => liveRowOccupiesFollowUpSlot(row.payload, payload as FollowUpPayload))
   return {
-    exists: liveRows.length > 0,
-    asserted: liveRows.some((row) => isOperatorAssertedSettlement(row.settlementBasis)),
+    exists: occupying.length > 0,
+    asserted: occupying.some((row) => isOperatorAssertedSettlement(row.settlementBasis)),
   }
 }
 
@@ -560,7 +613,7 @@ export async function enqueueFollowUpSyncLog(
   /** Bounds the re-plan below, so a pathological race cannot recurse forever. */
   attempt = 0,
 ): Promise<FollowUpEnqueueOutcome> {
-  const live = await hasExistingSyncLog(type, referenceType, referenceId)
+  const live = await hasExistingSyncLog(type, referenceType, referenceId, payload)
   const liveRowExists = live.exists
   // o3d-h2wx: a FAILED row is REUSED rather than replaced. The QuickBooks Request-Id is
   // derived from the entry id, so a replacement row posts the retry under a request id
@@ -853,7 +906,7 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
       // Idempotency guard: if a previous run already posted to QBO but failed
       // during follow-up work, don't re-post. Skip straight to follow-ups.
       if (entry.externalTransactionId) {
-        await db.$transaction(async (tx) => {
+        const obligation = await db.$transaction(async (tx) => {
           await tx.accountingSyncLog.update({
             where: { id: entry.id },
             data: {
@@ -861,12 +914,15 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
               syncedAt: new Date(),
               errorMessage: null,
               processingStartedAt: null,
-              // Claimed in the SYNCED transaction, exactly as Xero does (r10 finding 1). See the
-              // block above enqueueFollowUps at the end of this file for why the marker is set here
-              // even though the QuickBooks sweep is still unwired.
-              ...followUpObligationClaim(),
             },
           })
+          // Claimed in the SYNCED TRANSACTION, exactly as Xero does (r10 finding 1) — and since
+          // o3d-0bfh r4 as a second statement inside it rather than a fragment of the first, so the
+          // claim can READ the generation it replaces and hand back the one it minted. The update
+          // above already holds this row's exclusive lock, which is what makes that read-then-CAS
+          // unlosable. See the block above enqueueFollowUps at the end of this file for why the
+          // marker is set here even though NOTHING on this connector reads it back.
+          const claim = await claimFollowUpObligation(tx, { syncLogId: entry.id, connector: QBO_CONNECTOR })
           await updateMirroredEventForSyncLog(tx, {
             syncLogId: entry.id,
             type: entry.type,
@@ -876,6 +932,7 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
             status: 'POSTED',
             externalId: entry.externalTransactionId,
           })
+          return claim.claimed ? claim.generation : null
         })
         // EVERY FOLLOW-UP FAILURE ON THIS ARM IS CAUGHT HERE, AND NONE OF THEM MAY REACH THE
         // MAIN-POST FAILURE HANDLER (Codex round 2, HIGH).
@@ -906,13 +963,27 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
         // for a plain failure the only thing that changes is WHICH transition records it, and it is
         // the transition that does not contradict the ledger.
         try {
-          await updateBackReference(entry.id, entry.type, entry.referenceType, entry.referenceId, entry.externalTransactionId, undefined)
+          const link = await updateBackReference(entry.id, entry.type, entry.referenceType, entry.referenceId, entry.externalTransactionId, undefined)
+          // o3d-0bfh r15: the generation this pass claimed goes DOWN to the deferred-receipt re-drive,
+          // so its final re-read and this release commit together under the sales-order lock. It is
+          // withheld when the LINK did not land: the marker is then the record of that debt too, and
+          // the receipt fence knows nothing about it (`settleFollowUpObligation` keeps it below).
+          const followUps = await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, { externalId: entry.externalTransactionId },
+            backReferenceLeavesNothingOwed(link) ? obligation : null)
           // o3d-peh1: a REFUSED enqueue throws here for the same reason a failed one does — the
-          // release below must not discharge a marker for work that was never queued.
-          requireFollowUpsEnqueued(entry.id, await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, { externalId: entry.externalTransactionId }))
-          // Only reached when the enqueue did NOT throw, so the obligation is discharged only for
-          // work that actually ran.
-          await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: QBO_CONNECTOR })
+          // release below must not discharge a marker for work that was never queued. It throws into
+          // THIS arm's own catch, not the outer handler, which is the whole point of the block above.
+          requireFollowUpsEnqueued(entry.id, followUps)
+          // Only reached when the enqueue did NOT throw — and on this arm a throw is caught directly
+          // above, so the obligation simply stays claimed, which is the correct state for work that
+          // has not run.
+          //
+          // AND NOT THROWING IS NOT THE SAME AS NOTHING BEING OWED (o3d-ekn8 r5): the back-reference
+          // write swallows its failure and the deferred-receipt re-drive is built never to throw, so
+          // the discharge asks both of them instead of inferring it from the absence of an exception.
+          // That is a THIRD silent answer beside the refusal above, and each is invisible to the
+          // others: nothing queued, money queued but not landed, and a link that never wrote.
+          await settleFollowUpObligation(entry, link, followUps, obligation)
         } catch (followUpError) {
           await logActivity({
             entityType: 'SYSTEM',
@@ -959,20 +1030,37 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
         // evidence fence there cannot stop it because the database has no evidence yet. See
         // persistFreshQboPostOrEscalate: the write is re-driven, and an id that still cannot be
         // recorded is escalated rather than denied.
-        if (!await persistFreshQboPostOrEscalate(
+        // o3d-0bfh r4: AND IT HANDS BACK THE GENERATION IT CLAIMED, rather than the claim being a
+        // fragment of the SYNCED update. The claim reads the generation it replaces and reports the
+        // one it minted, inside the same transaction, so the release below is fenced on a value no
+        // overlapping pass can also be holding. Extracting the transaction into the escalating
+        // helper is what made it a return value instead of a write nobody could name.
+        const persistence = await persistFreshQboPostOrEscalate(
           entry, payload, syncResult.externalId ?? null, syncResult.externalEffect,
-        )) {
+        )
+        if (!persistence.persisted) {
           result.failed++
           continue
         }
+        const obligation = persistence.obligation
 
         // Follow-up work (back-references, enqueue PDF/email/payment).
         // These are best-effort: if they fail, the external post is already
         // safely recorded and won't be replayed.
         try {
-          await updateBackReference(entry.id, entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber)
-          requireFollowUpsEnqueued(entry.id, await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, syncResult))
-          await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: QBO_CONNECTOR })
+          const link = await updateBackReference(entry.id, entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber)
+          // o3d-0bfh r15: see the sibling call above — the generation travels down so the release is
+          // fenced by the order lock, and is withheld when the link itself is still owed.
+          const followUps = await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, syncResult,
+            backReferenceLeavesNothingOwed(link) ? obligation : null)
+          // o3d-peh1: and a REFUSED enqueue throws, exactly as a failed one does. Distinct from
+          // both answers the settle helper reads below — a link that did not land and a receipt
+          // that did not reach the ledger — because this one queued nothing at all.
+          requireFollowUpsEnqueued(entry.id, followUps)
+          // o3d-ekn8 r5, Codex HIGH: released only if the link landed AND the receipts recorded
+          // before this invoice reached the ledger. Neither of those failures throws, so both had
+          // been arriving here as success and clearing the row's last record of the work.
+          await settleFollowUpObligation(entry, link, followUps, obligation)
         } catch (followUpError) {
           // ERROR, not WARNING: the external post is committed and this entry is about to be
           // marked succeeded, so nothing will drive these follow-ups again. A payment or PDF
@@ -981,17 +1069,34 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
           //
           // The obligation is deliberately NOT released here (r10 finding 1). This branch marks the
           // entry succeeded regardless, so the row is about to look identical to one whose
-          // follow-ups ran — the marker is the only thing left that says otherwise, and it is what
-          // lets the QuickBooks sweep pick the work up once o3d-s36z unblocks it.
-          await logActivity({
-            entityType: 'SYSTEM',
+          // follow-ups ran — the marker is the only thing left that says otherwise. It is EVIDENCE,
+          // not a work queue: no QuickBooks sweep reads it (o3d-8prh). See the block at the end of
+          // this file.
+          //
+          // THE ERROR BELOW IS NO LONGER THE ONLY NOTICE (o3d-0bfh r6, Codex HIGH). It used to be —
+          // written with `logActivity`, which swallows a failed insert and resolves `void`, so a
+          // transient failure of that one write left this stalled payment/PDF/email invisible while
+          // the entry was counted successful. The retained marker is now surfaced as an operational
+          // backlog in the exception inbox, so the operator-visible record of the debt is the ROW,
+          // already committed; `reportRetainedObligation` additionally reports a lost notice to
+          // stderr instead of discarding it.
+          await reportRetainedObligation({
             action: 'quickbooks_followup_error',
-            tag: 'sync',
             level: 'ERROR',
-            description: `QuickBooks sync entry ${entry.id} posted successfully but its follow-up work was NOT `
-              + `enqueued: ${String(followUpError)}. The document is in QuickBooks; its payment, PDF or email `
-              + 'follow-ups need to be re-driven manually.',
+            // o3d-0bfh r8 (Codex HIGH): this used to say the follow-up work "was NOT enqueued" and
+            // that it "needs to be re-driven manually". BOTH are unestablished, and the second is
+            // dangerous. `enqueueFollowUps` writes each follow-up as its own local row and enqueues
+            // INVOICE_PAYMENT BEFORE INVOICE_PDF, so the ordinary way this branch is reached leaves
+            // a payment already PENDING in the queue; telling an operator to re-drive it by hand is
+            // telling them to create a second, undeduplicable payment against one invoice.
+            description: `QuickBooks sync entry ${entry.id} posted successfully but its follow-up pass stopped `
+              + `partway: ${String(followUpError)}. HOW FAR IT GOT IS NOT KNOWN FROM HERE — the follow-ups are `
+              + 'enqueued one at a time as separate local rows, so some may already be queued and due to execute. '
+              + 'The document is in QuickBooks and the row is listed in the exception inbox at /sync/exceptions '
+              + 'under "Accounting follow-ups owed, with nothing to re-drive them". '
+              + FOLLOW_UP_OBLIGATION_OUTCOME_IS_UNKNOWN,
             metadata: { syncLogId: entry.id, type: entry.type, referenceType: entry.referenceType, referenceId: entry.referenceId },
+            syncLogId: entry.id,
           })
           // o3d-peh1, cross-ported from the Xero side (Codex, this branch) — A REFUSAL IS NOT A
           // BEST-EFFORT FAILURE, AND THIS CATCH WAS ABSORBING BOTH.
@@ -1638,7 +1743,7 @@ async function quarantineRefusedBackReference(params: {
   const description = `QuickBooks ${params.type} for ${params.referenceType} ${params.referenceId} POSTED SUCCESSFULLY as `
     + `external id ${params.externalId}, but that id could not be recorded locally: ${blockerText}. `
     + 'The document exists in QuickBooks and this sync row is the only local record of it — it is NOT re-posted and NOT retried '
-    + '(QuickBooks has no back-reference repair sweep; blocked on realm isolation, o3d-s36z). '
+    + '(QuickBooks has no back-reference repair sweep; blocked on o3d-8prh, post-time realm enforcement). '
     + remedy
 
   await logActivity({
@@ -1667,6 +1772,207 @@ async function quarantineRefusedBackReference(params: {
   }
 }
 
+/**
+ * WHETHER THE LOCAL LINK LANDED (o3d-ekn8 r5, Codex HIGH).
+ *
+ * `updateBackReference` swallows its failures on this connector (see the catch below — de-swallowing
+ * would change retry semantics for every type at once), and it used to return `void`, so the caller
+ * could not tell a written link from a failed one. That silence propagated: the deferred-receipt
+ * re-drive then found an order with no invoice id and returned quietly, and the processor released
+ * the follow-up obligation marker — the last record that this posted invoice still owed work.
+ *
+ * The failure is still swallowed. What is no longer swallowed is the FACT of it.
+ *
+ * `nothing-to-link` is kept apart from the failures on purpose: no external id means no link was
+ * ever owed, so it must not hold an obligation open. `ambiguous` and `contended` ARE failures for
+ * this purpose even though neither is an error — the link is not on the document, and on this
+ * connector nothing retries it.
+ */
+type BackReferenceLink =
+  | { linked: true }
+  | { linked: false; reason: 'nothing-to-link' }
+  | { linked: false; reason: 'ambiguous' | 'contended' | 'conflict' | 'failed' }
+
+/** Whether a link outcome leaves the row owing nothing further — see BackReferenceLink. */
+function backReferenceLeavesNothingOwed(link: BackReferenceLink): boolean {
+  return link.linked || link.reason === 'nothing-to-link'
+}
+
+/**
+ * WHAT RE-DRIVES A RETAINED OBLIGATION ON THIS CONNECTOR: NOTHING (o3d-0bfh r5, Codex HIGH).
+ *
+ * Passed to every release, so a future QuickBooks caller cannot inherit Xero's "a later sweep will
+ * discharge it" by omission. `blockedBy` is the CURRENT blocker — post-time authorization (o3d-8prh)
+ * and origin propagation — and it is not the one this file named for three rounds; see the block at
+ * the end of this file for why o3d-s36z closing did not unblock anything.
+ *
+ * READ FROM THE REGISTRY, NOT WRITTEN HERE (o3d-0bfh r6, Codex MEDIUM). r5 declared the recovery as
+ * a local literal, and a literal is copyable: a third connector could paste Xero's
+ * `{ consumer: 'sweep' }`, have no sweep at all, and compile. The declaration now lives in
+ * lib/domain/accounting/follow-up-obligation-registry.ts, where a test requires every `sweep` entry
+ * to have both an exported binding and an invocation — and where the backlog that makes THIS
+ * connector's retained markers visible to an operator reads the same entry.
+ */
+const QBO_FOLLOW_UP_RECOVERY = followUpObligationRecoveryFor(QBO_CONNECTOR)
+
+/**
+ * The remedy an operator reads, taken from that same registry entry rather than restated here
+ * (o3d-0bfh r8). Narrowed rather than reached through a helper so this file takes no extra import:
+ * the branch is the type saying that only a connector with NO consumer has a remedy at all, and if
+ * QuickBooks ever gains a sweep the message correctly stops telling anyone to do anything by hand.
+ */
+const QBO_FOLLOW_UP_REMEDY = QBO_FOLLOW_UP_RECOVERY.consumer === 'none'
+  ? QBO_FOLLOW_UP_RECOVERY.operatorRemedy
+  : 'a later sweep re-reads the marker and re-enqueues the work, so there is nothing to do by hand'
+
+/**
+ * DISCHARGE THE FOLLOW-UP OBLIGATION ONLY WHEN NOTHING IS STILL OWED (o3d-ekn8 r5, Codex HIGH).
+ *
+ * The release used to be unconditional on both post-success paths: `updateBackReference` swallows
+ * its failure and `enqueueFollowUps` returned `void`, so the loop cleared the marker whether or not
+ * the link had landed and whether or not the receipts recorded before the invoice ever reached the
+ * ledger. That marker is the ONLY thing distinguishing this row from one whose follow-ups completed
+ * — the row is SYNCED with an external id either way — so clearing it early is not a lost warning,
+ * it is a lost debt: a recorded receipt permanently unsettled behind a row that looks finished.
+ *
+ * The asymmetry is deliberate and is the one followUpObligationClaim was designed around: a marker
+ * left set costs one idempotent re-enqueue on a later sweep; a marker cleared early costs the
+ * payment. So it is released only when BOTH facts say nothing is outstanding.
+ *
+ * AND ON THIS CONNECTOR THE RETAINED MARKER DRIVES NOTHING AT ALL — NOT "NOT YET" (o3d-0bfh r5,
+ * Codex HIGH). Earlier rounds wrote this as a temporary state waiting on o3d-s36z. o3d-s36z has
+ * since CLOSED and nothing here became live, because it was never the blocker for the consumer side;
+ * the block at the end of this file states what is. Until that lands, retaining the marker preserves
+ * EVIDENCE and schedules NO WORK, and both halves have to be said together:
+ *
+ *   • it is still the correct state to leave behind. The alternative is not "no marker", it is a row
+ *     that has forgotten what it owes — SYNCED, carrying its external id, byte-identical to one that
+ *     completed — and that fact is unrecoverable afterwards;
+ *   • and it is NOT a repair. The payment, PDF, email or attachment does not run later. The log line
+ *     below is the whole of the notification, and a human acting on it is the whole of the recovery.
+ */
+async function settleFollowUpObligation(
+  entry: { id: string; type: AccountingSyncType; referenceType: string; referenceId: string },
+  link: BackReferenceLink,
+  followUps: FollowUpOutcome,
+  /**
+   * THE GENERATION THIS PASS TOOK IN THE SYNCED TRANSACTION (o3d-0bfh r4, Codex HIGH). Carried down
+   * rather than re-read: a re-read is the same race one layer lower. `null` means the claim did not
+   * land, and then nothing is cleared — a pass that owns no generation has no standing to say the
+   * work is done.
+   */
+  obligation: Date | null,
+): Promise<void> {
+  const linked = backReferenceLeavesNothingOwed(link)
+  if (linked && followUps.deferredReceiptsSettled) {
+    // ALREADY DISCHARGED, UNDER THE ORDER LOCK (o3d-0bfh r15, Codex HIGH). The deferred-receipt pass
+    // clears the generation inside the same transaction as its final re-read of the order's
+    // receipts, which is the only ordering in which a receipt arriving mid-pass cannot be settled
+    // over. Clearing it a second time here would be the unfenced write the fence exists to remove.
+    if (followUps.obligationFenced) return
+    // Fenced on `obligation`. A `superseded` answer means a newer generation is on the row — a later
+    // post's, since no sweep claims on this connector — and it stands. What it does NOT mean here is
+    // that somebody else will finish the work: `recovery` is what stops the helper saying so.
+    await releaseFollowUpObligation(db, {
+      syncLogId: entry.id,
+      connector: QBO_CONNECTOR,
+      generation: obligation,
+      recovery: QBO_FOLLOW_UP_RECOVERY,
+    })
+    return
+  }
+  const outstanding: string[] = []
+  if (!linked) outstanding.push(`the local link to the QuickBooks document did not land (${link.linked ? 'linked' : link.reason})`)
+  if (!followUps.deferredReceiptsSettled) outstanding.push('a receipt recorded before this invoice is still not registered in the ledger')
+  await reportRetainedObligation({
+    action: 'quickbooks_followup_obligation_retained',
+    // ERROR when money is the thing left outstanding, WARNING when it is only the local link — the
+    // two need different people to do different things, and at one level the first reads as the
+    // second and nobody acts on it.
+    level: followUps.deferredReceiptsSettled ? 'WARNING' : 'ERROR',
+    description: `QuickBooks sync entry ${entry.id} posted to the ledger, but ${outstanding.join(', and ')}. `
+      + 'The row is deliberately left marked as owing follow-ups, because nothing else about it records that: '
+      + 'it is SYNCED and carries its external id exactly like a row that completed. NOTHING WILL RE-DRIVE '
+      + 'THIS AUTOMATICALLY — QuickBooks has no back-reference repair sweep bound (o3d-8prh), so the marker is '
+      + 'evidence rather than scheduled work. It is listed in the exception inbox at /sync/exceptions under '
+      + '"Accounting follow-ups owed, with nothing to re-drive them". '
+      // o3d-0bfh r8 (Codex HIGH): "re-run the invoice sync, or register the receipt by hand" was a
+      // direct re-drive instruction on the money path. Nothing here establishes that the receipt is
+      // unregistered — only that THIS pass could not confirm it — and a hand-registered payment
+      // cannot be deduplicated against one the local queue is still holding. The remedy comes from
+      // the connector's own registry entry, which says read and escalate.
+      + QBO_FOLLOW_UP_REMEDY + '.',
+    metadata: {
+      syncLogId: entry.id,
+      type: entry.type,
+      referenceType: entry.referenceType,
+      referenceId: entry.referenceId,
+      backReference: link.linked ? 'linked' : link.reason,
+      deferredReceiptsSettled: followUps.deferredReceiptsSettled,
+    },
+    syncLogId: entry.id,
+  })
+}
+
+/**
+ * ANNOUNCE A RETAINED OBLIGATION — AND SAY SO WHEN THE ANNOUNCEMENT ITSELF DID NOT LAND
+ * (o3d-0bfh r6, Codex HIGH).
+ *
+ * What stood here was `logActivity(...).catch(...)`, under a comment that called the log line the
+ * whole of the notification and a human the whole of the recovery. Those two facts do not fit
+ * together: `logActivity` swallows a persistence failure and resolves `void`, so the appended
+ * `.catch()` could never fire on the failure that matters, the entry was counted successful, the row
+ * stayed SYNCED and was never selected again — a payment, PDF, email or attachment permanently
+ * stalled with no operator-visible notice at all. A recovery that rests entirely on a human seeing
+ * something cannot rest on a write whose failure nobody can observe.
+ *
+ * TWO CHANGES, AND THE SECOND IS THE LOAD-BEARING ONE:
+ *
+ *   • `logActivityPersisted` REPORTS whether the row landed, so the failure is at least observable
+ *     here rather than silently swallowed, and a lost notice reaches stderr — the one channel that
+ *     does not depend on the database this row could not be written to;
+ *   • the obligation is no longer announced ONLY in the activity log. The marker left on the sync
+ *     row is now surfaced as an operational backlog
+ *     (lib/domain/accounting/follow-up-obligation-registry.ts, rendered in the exception inbox), so
+ *     the durable, operator-visible record of the debt is THE ROW ITSELF — a state that is already
+ *     committed by the time this function is reached, and a view over it that needs no second write
+ *     to succeed at the worst possible moment.
+ *
+ * So this function never throws and its return value is deliberately not a gate: retaining the
+ * marker is already the safe state, and failing to describe it must not turn a posted invoice into a
+ * failed sync entry.
+ */
+async function reportRetainedObligation(params: {
+  action: string
+  level: 'WARNING' | 'ERROR'
+  description: string
+  metadata: Record<string, unknown>
+  syncLogId: string
+}): Promise<void> {
+  let persisted = false
+  try {
+    persisted = await logActivityPersisted({
+      entityType: 'SYSTEM',
+      action: params.action,
+      tag: 'sync',
+      level: params.level,
+      description: params.description,
+      metadata: params.metadata,
+    })
+  } catch {
+    // logActivityPersisted is documented not to throw; if it does, it is still not a reason to fail
+    // a posted invoice, and the backlog below is unaffected either way.
+    persisted = false
+  }
+  if (persisted) return
+  console.error(
+    `[quickbooks] the activity-log notice for sync entry ${params.syncLogId} could NOT be written (${params.action}). `
+    + 'The obligation itself is NOT lost: the row still carries backReferenceFollowUpsPendingAt and appears in the '
+    + 'exception inbox at /sync/exceptions under "Accounting follow-ups owed, with nothing to re-drive them". '
+    + params.description,
+  )
+}
+
 async function updateBackReference(
   syncLogId: string,
   type: AccountingSyncType,
@@ -1674,8 +1980,8 @@ async function updateBackReference(
   referenceId: string,
   externalId?: string,
   invoiceNumber?: string,
-): Promise<void> {
-  if (!externalId) return
+): Promise<BackReferenceLink> {
+  if (!externalId) return { linked: false, reason: 'nothing-to-link' }
 
   try {
     // EVERY type goes through the shared writer, exactly as Xero's does (o3d-9kek). Hand-rolled
@@ -1697,17 +2003,23 @@ async function updateBackReference(
         level: 'WARNING',
         description: `Did not write the QuickBooks back-reference for PO ${referenceId}: its bill cannot be identified `
           + `(${applied.attribution.reason}). Link the bill manually — the external id is on the sync row. `
-          + 'NOTHING re-checks this automatically: QuickBooks has no back-reference repair sweep (it is blocked on realm '
-          + 'isolation, o3d-s36z), so resolving the ambiguity on its own will not link the bill.',
+          + 'NOTHING re-checks this automatically: no QuickBooks back-reference repair sweep (blocked on o3d-8prh, '
+          + 'post-time realm enforcement), so resolving the ambiguity on its own will not link the bill.',
         metadata: { referenceType, referenceId, externalId, reason: applied.attribution.reason },
       })
+      return { linked: false, reason: 'ambiguous' }
     }
     // o3d-9kek finding 3: the resolved bill gained an external id between the resolve and
     // the compare-and-swap, so nothing was written and nothing was overwritten. Not an
     // error — the repair sweep re-resolves it from the state that actually won.
     if (applied.outcome === 'contended') {
       console.warn(`quickbooks: back-reference for PO ${referenceId} lost the race for bill ${applied.purchaseInvoiceId}; it must be linked by hand.`)
+      return { linked: false, reason: 'contended' }
     }
+    // `nothing-to-apply` is a type/reference pair that writes no back-reference at all (or a legacy
+    // PO row with no bill to attribute to) — nothing was owed, so nothing is outstanding.
+    if (applied.outcome === 'nothing-to-apply') return { linked: false, reason: 'nothing-to-link' }
+    return { linked: true }
   } catch (error) {
     // AN EXTERNAL-ID CONFLICT IS NOT A FAILURE TO REPORT AND FORGET (o3d-9kek r7 finding 1). The
     // document is already in the QuickBooks ledger; the index refused only the LOCAL record of it.
@@ -1717,7 +2029,7 @@ async function updateBackReference(
     // same index refuses a manual link too.
     if (isExternalDocumentIdConflict(error)) {
       await quarantineRefusedBackReference({ syncLogId, type, referenceType, referenceId, externalId, error })
-      return
+      return { linked: false, reason: 'conflict' }
     }
     // Pre-existing: QuickBooks swallows back-reference failures here (Xero does not — it
     // propagates so the caller retries). Still not changed, because de-swallowing alters QBO's
@@ -1733,7 +2045,8 @@ async function updateBackReference(
     // realm switch it could attribute a retired company's id to a live document. Nothing retries a
     // failed QuickBooks back-reference now, and the operator is told exactly that instead of being
     // told a sweep exists. Telling someone a retry will happen when nothing retries is worse than
-    // saying nothing; o3d-s36z is what would make the sweep safe to bind again.
+    // saying nothing; o3d-8prh is what would make the sweep safe to bind again (o3d-s36z, which this
+    // line used to name, has closed and was never the consumer-side blocker — see the end of file).
     console.error(`quickbooks: back-reference write failed for ${referenceType} ${referenceId}`, error)
     await logActivity({
       entityType: 'SYSTEM',
@@ -1742,20 +2055,57 @@ async function updateBackReference(
       level: 'WARNING',
       description: `Could not write the QuickBooks back-reference for ${referenceType} ${referenceId}: ${String(error)}. `
         + 'The external id is on the sync row, but NOTHING retries this: QuickBooks has no back-reference repair sweep '
-        + '(blocked on realm isolation, o3d-s36z). Link the document to that external id by hand.',
+        + '(blocked on o3d-8prh, post-time realm enforcement). Link the document to that external id by hand.',
       metadata: { type, referenceType, referenceId, externalId },
     })
+    return { linked: false, reason: 'failed' }
   }
 }
 
+/**
+ * WHAT THE FOLLOW-UP WORK LEFT OUTSTANDING (o3d-ekn8 r5, Codex HIGH).
+ *
+ * `enqueueFollowUps` returned `void`, so "it did not throw" was the only signal the processing loop
+ * had — and it released the durable follow-up obligation on that. But the deferred-receipt re-drive
+ * is explicitly built never to throw (a receipt that cannot be registered must not fail a sync entry
+ * whose invoice HAS posted), so every way it can leave money unregistered arrived at the release as
+ * success. This carries the fact back instead of leaving the loop to assume it.
+ */
+type FollowUpOutcome = FollowUpEnqueueOutcome & {
+  /** False when a receipt recorded before this invoice is still waiting to reach the ledger. */
+  deferredReceiptsSettled: boolean
+  /**
+   * TRUE WHEN THE DEFERRED PASS ALREADY TOOK THE MARKER DECISION ITSELF (o3d-0bfh r15, Codex HIGH).
+   *
+   * The re-drive re-reads the order's receipts UNDER THE SALES-ORDER LOCK and clears the exact
+   * obligation generation in that same transaction, because a receipt committing after its snapshot
+   * would otherwise read a live marker — and be told its recovery is retained — and then have that
+   * marker cleared over it. So when this is true, `settleFollowUpObligation` must clear NOTHING: a
+   * second, unfenced clear re-opens the window the fence closes.
+   */
+  obligationFenced: boolean
+}
+
 async function enqueueSalesInvoiceFollowUps(
-  _entryId: string,
+  /** o3d-0bfh r15: the sync-log row that carries the obligation marker this pass may clear. */
+  entryId: string,
   referenceType: string,
   referenceId: string,
   payload: SyncPayload,
   syncResult: { externalId?: string; invoiceNumber?: string },
-): Promise<FollowUpEnqueueOutcome> {
-  if (referenceType !== 'SalesOrder' || !syncResult.externalId) return FOLLOW_UPS_ENQUEUED
+  /**
+   * THE OBLIGATION GENERATION THIS PASS CLAIMED (o3d-0bfh r15, Codex HIGH), threaded down to the
+   * deferred-receipt re-drive so its final re-read of the order's receipts and the clearing of this
+   * generation commit in ONE transaction under the sales-order lock. `null` means this pass holds
+   * nothing this call may clear — either it never claimed a generation, or the back-reference link
+   * did not land and the marker is the record of THAT debt as well.
+   */
+  followUpObligation: Date | null,
+): Promise<FollowUpOutcome> {
+  if (referenceType !== 'SalesOrder' || !syncResult.externalId) return { enqueued: true, deferredReceiptsSettled: true, obligationFenced: false }
+  // Captured once, so the id handed to the deferred re-drive below is provably the one THIS post
+  // returned rather than a re-read of a narrowed property.
+  const postedInvoiceId: string = syncResult.externalId
   // o3d-peh1: the PAYMENT's outcome is kept and folded in with the PDF's at the end. Both are still
   // attempted; a refused payment is no reason to withhold the PDF.
   let paymentOutcome: FollowUpEnqueueOutcome = FOLLOW_UPS_ENQUEUED
@@ -1826,7 +2176,65 @@ async function enqueueSalesInvoiceFollowUps(
     referenceId,
     invoiceNumber: syncResult.invoiceNumber,
   })
-  return combineFollowUpEnqueueOutcomes(paymentOutcome, pdfOutcome)
+
+  // o3d-ekn8, CROSS-PORTED FROM THE XERO PATH (this branch) — REGISTER THE RECEIPTS THAT WERE
+  // RECORDED BEFORE THIS INVOICE EXISTED.
+  //
+  // `registerInvoicePaymentWithLedger` refuses a receipt with DOCUMENT_NOT_POSTED while the order has
+  // no accountingInvoiceId, and nothing ever came back for it once the invoice landed: the receipt
+  // stayed recorded, the ledger stayed unsettled, and the only sign was a red NOT_SENT verdict
+  // somebody had to notice. The re-drive that closes it shipped on the Xero connector ONLY, and the
+  // receipt-registration path it re-drives is connector-agnostic — this processor posts INVOICE_PAYMENT
+  // rows itself — so on QuickBooks the defect was still whole.
+  //
+  // THIS IS THE MOMENT THE REFUSAL STOPS APPLYING, and the ordering that makes it so is the same here
+  // as there: `updateBackReference` runs immediately before `enqueueFollowUps`, so the re-read below
+  // sees the id this post just wrote. It re-runs the SAME guarded decision — currency, bank-account
+  // mapping and invoice capacity are all re-checked per receipt — rather than a second, laxer copy.
+  //
+  // Imported dynamically so the connector does not take a static dependency on the sales domain, and
+  // awaited but never allowed to throw: the invoice HAS posted, and a receipt that could not be
+  // re-registered must not turn that into a failed sync entry.
+  const { registerDeferredOrderReceipts } = await import('@/lib/domain/accounting/invoice-payment-enqueue')
+  // PINNED TO THIS POST (o3d-ekn8 r2, Codex HIGH). Handing over only the order id made the callee
+  // re-derive both of the facts this hand-off is about — it asked which connector is active NOW and
+  // which document the order points at NOW — while the authoritative answers were sitting right here:
+  // this processor made the call, and `syncResult.externalId` is the id the call returned. A connector
+  // swap or a delete-and-re-post between the post and the re-drive silently redirected it. Re-resolving
+  // after a pin is the race being closed, not a check of it, so the evidence goes IN.
+  //
+  // AND THE ANSWER IS CARRIED BACK (o3d-ekn8 r5, Codex HIGH). It is awaited but never allowed to
+  // throw, which meant "it returned" was indistinguishable from "the receipts reached the ledger" —
+  // including the case this whole hand-off is about, where `updateBackReference` failed, the order
+  // carries no invoice id, and the re-drive has nothing it is allowed to settle against.
+  //
+  // AND THE OBLIGATION GOES IN WITH IT (o3d-0bfh r15, Codex HIGH). The re-drive's final re-read of
+  // the order's receipts and the clearing of this generation now happen in ONE transaction holding
+  // the sales-order lock, because a receipt committing after the re-drive's snapshot would otherwise
+  // read a live marker — and be told its recovery is retained — and then have that marker cleared by
+  // this caller over it.
+  const redrive = await registerDeferredOrderReceipts(referenceId, {
+    connector: 'quickbooks',
+    accountingInvoiceId: postedInvoiceId,
+  }, {
+    syncLogId: entryId,
+    connector: QBO_CONNECTOR,
+    generation: followUpObligation,
+    // The same registry answer `settleFollowUpObligation` reads — on this connector it says NOTHING
+    // re-drives a retained marker, and that has to reach the operator notice unchanged.
+    recovery: QBO_FOLLOW_UP_RECOVERY,
+  })
+  // `unfenced` is the one answer that leaves the marker to this caller: the re-drive returned on a
+  // fact no later receipt can change (payments do not post at all; the order is gone).
+  // AND THE ENQUEUE'S OWN VERDICT TRAVELS WITH IT (o3d-peh1). Kept SEPARATE from the receipt
+  // answer rather than folded into it: a refusal means nothing was queued and an operator has to
+  // clear it, an unsettled receipt means money that WAS queued has not landed. One boolean would
+  // make each of them the other's blind spot.
+  return {
+    ...combineFollowUpEnqueueOutcomes(paymentOutcome, pdfOutcome),
+    deferredReceiptsSettled: redrive.settled,
+    obligationFenced: redrive.release !== 'unfenced',
+  }
 }
 
 async function enqueuePurchaseInvoiceFollowUps(
@@ -1853,13 +2261,28 @@ async function enqueueFollowUps(
   referenceId: string,
   payload: SyncPayload,
   syncResult: { externalId?: string; invoiceNumber?: string },
-): Promise<FollowUpEnqueueOutcome> {
+  /**
+   * THE OBLIGATION GENERATION THIS PASS CLAIMED (o3d-0bfh r15, Codex HIGH), threaded down to the
+   * deferred-receipt re-drive so its final re-read of the order's receipts and the clearing of this
+   * generation commit in ONE transaction under the sales-order lock. `null` means this pass holds
+   * nothing this call may clear — either it never claimed a generation, or the back-reference link
+   * did not land and the marker is the record of THAT debt as well.
+   */
+  followUpObligation: Date | null,
+): Promise<FollowUpOutcome> {
   if (type === 'SALES_INVOICE') {
-    return await enqueueSalesInvoiceFollowUps(entryId, referenceType, referenceId, payload, syncResult)
+    return enqueueSalesInvoiceFollowUps(entryId, referenceType, referenceId, payload, syncResult, followUpObligation)
   }
 
   if (type === 'PURCHASE_INVOICE') {
-    return await enqueuePurchaseInvoiceFollowUps(entryId, referenceType, referenceId, payload, syncResult)
+    // o3d-peh1: the sibling enqueue ANSWERS, and its answer is the caller's settle verdict.
+    // Discarding the return here would put a refused bill attachment back in the silence
+    // this branch exists to end; it has no deferred receipt of its own.
+    return {
+      ...await enqueuePurchaseInvoiceFollowUps(entryId, referenceType, referenceId, payload, syncResult),
+      deferredReceiptsSettled: true,
+      obligationFenced: false,
+    }
   }
 
   if (type === 'INVOICE_PDF' && referenceType === 'SalesOrder') {
@@ -1884,53 +2307,149 @@ async function enqueueFollowUps(
     if (order?.shoppingLinks.length) {
       outcomes.push(await enqueueFollowUpSyncLog('WC_INVOICE_NOTE', referenceType, referenceId, { referenceId }))
     }
-    return combineFollowUpEnqueueOutcomes(...outcomes)
+    return { ...combineFollowUpEnqueueOutcomes(...outcomes), deferredReceiptsSettled: true, obligationFenced: false }
   }
-
-  return FOLLOW_UPS_ENQUEUED
+  // Every remaining type enqueues rows that carry their own document id in the payload; none of them
+  // has a deferred receipt waiting on it, and none of them refused anything.
+  return { enqueued: true, deferredReceiptsSettled: true, obligationFenced: false }
 }
 
 // ---------------------------------------------------------------------------
-// THERE IS DELIBERATELY NO QuickBooks BINDING OF THE BACK-REFERENCE REPAIR SWEEP (o3d-9kek r6).
+// THERE IS DELIBERATELY NO QuickBooks BINDING OF THE BACK-REFERENCE REPAIR SWEEP, AND THEREFORE NO
+// CONSUMER OF THE FOLLOW-UP OBLIGATION MARKER THIS FILE WRITES (o3d-9kek r6; restated and RE-BASED
+// on the correct blocker — post-time authorization, o3d-8prh — at o3d-0bfh r5, Codex HIGH).
 //
-// One existed briefly on this branch and was REMOVED on purpose. Do not re-add it without first
-// closing o3d-s36z (connector-tenant / realm isolation) — that issue is this binding's precondition,
-// not a nice-to-have alongside it.
+// One binding existed briefly and was REMOVED on purpose. Read the next two sections before adding
+// one back; the second is the one three rounds of this branch got wrong.
 //
-// WHY. repairAccountingBackReferences scopes its candidate query by `connector` and nothing else. A
-// QuickBooks external id is a small integer that is only meaningful inside ONE realm (company), and
-// disconnecting removes the expected-realm pin entirely — so after reconnecting to realm B, an
-// unresolved row that posted to realm A is still a candidate, and the sweep would write realm A's
-// integer onto a local document. The payment poller then reads that id as a realm-B document and can
-// mark or update the WRONG bill or order.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// WHAT THE ABSENCE COSTS. SAY IT FIRST, BECAUSE IT IS THE PART THAT LOOKS LIKE NOTHING.
 //
-// The global unique index on purchase_invoices.accounting_invoice_id does NOT cover this: it only
-// stops a SECOND local row taking an id another row already holds. When no local row holds the
-// orphaned id — which is exactly the state a realm switch leaves behind — the write succeeds.
+// This file runs a full follow-up obligation protocol: the SYNCED write and the claim of
+// `backReferenceFollowUpsPendingAt` commit in ONE transaction, the release is fenced on the exact
+// generation this pass minted, and every way the work can fail to land retains the marker instead of
+// clearing it. All of that is correct and all of it is BOOKKEEPING WITH NO READER. A QuickBooks row
+// that dies between its SYNCED commit and its enqueue is left SYNCED, carrying its external id, with
+// a non-null marker — and nothing ever looks at that marker again:
 //
-// So the choice was between a sweep that can attribute across realms and no sweep at all, and the
-// governing principle decides it: failing to repair is acceptable, repairing onto the wrong document
-// is not. QuickBooks is the secondary connector; Xero is the priority one and has no realm exposure
-// here (its poller builds its match set from Xero itself), so the Xero binding stays.
+//   • `processPendingQuickBooksSync` selects PENDING and stale-PROCESSING rows. The crashed row is
+//     SYNCED, so the processor will not retry it. (Its idempotency branch WOULD re-run the
+//     follow-ups correctly if the row were ever selected again — that is the cruel part: the
+//     recovery logic exists and is reachable by nothing.)
+//   • there is no sweep to select it by its marker instead, which is what this block is about.
 //
-// The cost of the absence is real and is stated honestly rather than papered over: a QuickBooks
-// back-reference that fails to write is NOT retried by anything, and updateBackReference's warnings
-// above say so in as many words instead of promising a sweep. Whoever closes o3d-s36z should re-add
-// the binding here — the connector-agnostic sweep module needs no changes for it, only a trustworthy
-// realm boundary underneath.
+// So the payment, PDF, email or attachment simply never runs. EVIDENCE IS PRESERVED, THE WORK IS
+// NOT LIVE. Everything in this file that describes the marker now says exactly that, and the release
+// helper is passed `QBO_FOLLOW_UP_RECOVERY` so it cannot repeat Xero's true-there/false-here promise
+// that "a later sweep will discharge it".
 //
-// THE FOLLOW-UP OBLIGATION MARKER IS STILL CLAIMED HERE, AND THAT IS NOT A CONTRADICTION (r10
-// finding 1). Recording that work is owed and repairing it are two different acts, and only the
-// second one is what o3d-s36z gates. The marker writes nothing to any accounting document and
-// crosses no realm boundary — it is a timestamp on the sync row that already carries the external
-// id — so none of the reasoning above applies to it.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// THE PRECONDITION THIS BLOCK USED TO NAME HAS BEEN MET, AND IT WAS THE WRONG ONE. THE REAL ONE IS
+// POST-TIME AUTHORIZATION (o3d-8prh), PLUS ORIGIN PROPAGATION ON THE ROWS A CONSUMER WOULD CREATE.
+//
+// Every earlier revision said: do not re-add the binding before closing o3d-s36z (connector-tenant /
+// realm isolation), because `repairAccountingBackReferences` scopes its candidate query by
+// `connector` alone, a QuickBooks external id is a small integer meaningful only inside ONE realm,
+// and after a reconnect to company B the sweep could write company A's integer onto a live document.
+// That reasoning was sound and the hazard is real.
+//
+// o3d-s36z CLOSED on 2026-08-21 (PR #632, o3d-batch-realm). A row's realm IS now recorded, durably
+// and in a place retention cannot reach:
+//
+//   • `AccountingSyncLog.connectionProvenance` (o3d-dzip) — minted from the payload stamp in the
+//     same INSERT, trigger-protected against any later UPDATE;
+//   • `_connectionProvenance` in the payload (o3d-19gy), read TOGETHER with the column by
+//     `readAccountingOriginRecord`, because either half alone is a known hole;
+//   • `accountingPayloadConnectionVerdict`, which permits exactly one decision — `match` — and
+//     refuses absence, disagreement and unreadability alike.
+//
+// SO THE CANDIDATE FENCE IS NOW DERIVABLE FROM WHAT THE ROW ALREADY RECORDS. A sweep could select
+// only rows whose recorded origin equals the QuickBooks realm connected now. That is a genuine
+// change since this block was written, and it is exactly why the stale precondition was dangerous
+// to leave standing: the next person to read it would check o3d-s36z, find it closed, and wire the
+// binding — believing they had satisfied the condition this file set them.
+//
+// THEY WOULD NOT HAVE. The fence is only the SELECT side. What a repair sweep does is ENQUEUE, and
+// what a QuickBooks enqueue leads to is a post that nothing checks:
+//
+//   • NO POST-TIME ENFORCEMENT ON THIS CONNECTOR (o3d-8prh, OPEN). `accounting-posting-intent` and
+//     `accounting-egress-authorization` — the modules that carry the verdict to the last statement
+//     before the socket — are imported by `lib/connectors/xero/*` and by nothing under
+//     `lib/connectors/quickbooks/`. `lib/accounting.ts` says so where it writes the stamp: "only the
+//     Xero processor ENFORCES it today (the QuickBooks half is o3d-8prh)". So does
+//     `readClaimedSyncLogPayload`, whose header names this connector as the caller that does not
+//     make the connection check. A row correctly fenced AT SWEEP TIME is still posted against
+//     whatever is connected AT POST TIME, and the interval between them is where an operator's
+//     disconnect-and-reconnect lives — which is the whole of o3d-19gy, unguarded here.
+//   • AND THE ROWS A CONSUMER CREATED WOULD RECORD NO ORIGIN AT ALL. This file's own
+//     `enqueueFollowUpSyncLog` takes no origin evidence (Xero's takes `FollowUpOriginEvidence` and
+//     carries it verbatim) and mints no `connectionProvenance` on the row it creates (Xero's does).
+//     Every follow-up a sweep produced here would therefore be born `no-origin-recorded` — the state
+//     three rounds of o3d-s36z worked to stop MANUFACTURING — and would refuse the moment o3d-8prh
+//     did land, having in the meantime posted unchecked.
+//
+// The follow-up types are the reason this is a money finding rather than a tidiness one:
+// INVOICE_PAYMENT carries an `accountingInvoiceId`, and QuickBooks ids are small sequential
+// integers, so the id of an invoice in company A is very likely to name SOME invoice in company B.
+// The governing principle decides it in one line, unchanged from the original reasoning: FAILING TO
+// REPAIR IS ACCEPTABLE, REPAIRING ONTO THE WRONG DOCUMENT IS NOT.
+//
+// A realm-pinned durable outbox instead of a fenced sweep does not escape this. An outbox moves
+// where the pin is written; it still ends at `processPendingQuickBooksSync` posting with no verdict.
+// Carrying a pin all the way to the socket IS `accounting-posting-intent` plus
+// `accounting-egress-authorization`, i.e. o3d-8prh — so the outbox is that work plus an outbox,
+// never less of it.
+//
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// WHAT TO DO, IN ORDER, WHENEVER SOMEONE PICKS THIS UP (o3d-s4q2 tracks it, blocked on o3d-8prh):
+//
+//   1. Land o3d-8prh: the connection verdict reached as the last statement before the QuickBooks
+//      socket, the same shape Xero has. Nothing below is safe before this.
+//   2. Give this file's `enqueueFollowUpSyncLog` an `origin: FollowUpOriginEvidence` parameter and
+//      mint `connectionProvenance` on the rows it creates, inheriting verbatim and never reading the
+//      live connection — the o3d-19gy rule. Otherwise step 3 manufactures unpostable rows.
+//   3. Bind the sweep, fencing its candidate query on the row's recorded origin against the realm
+//      connected now, refusing every decision but `match`.
+//   4. Change the QUICKBOOKS ENTRY in lib/domain/accounting/follow-up-obligation-registry.ts to the
+//      sweep consumer — not a literal here; the registry is where the binding and the invocation are
+//      checked, and tests/accounting/follow-up-recovery-registry.test.ts refuses the entry until
+//      step 3 above is actually done. Changing it also empties this connector's exception-inbox
+//      backlog, because that view is derived from the same entry.
+//
+// WHEN IT IS RE-ADDED, ITS `enqueueFollowUps` MUST RETURN THIS FILE'S `FollowUpOutcome` (o3d-0bfh).
+// The Xero binding wrapped the call in an `async` adapter that awaited it and dropped the outcome to
+// satisfy a `Promise<void>` dep, which made the sweep a second release path around the very gate
+// `settleFollowUpObligation` installs above: `deferredReceiptsSettled: false` never throws, so it
+// arrived as success and the sweep cleared the obligation marker over an unregistered receipt. The
+// dep is now `Promise<BackReferenceFollowUpOutcome>`, so the compiler refuses a binding that
+// discards it — but only if the outcome is RETURNED rather than awaited-and-swallowed inside an
+// adapter, which type-checks just as happily. Return it directly.
+//
+// AND IT MUST ACCEPT AND FORWARD THE SWEEP'S SETTLEMENT PREREQUISITE (o3d-0bfh r16, Codex HIGH).
+// The dep's ninth argument is a condition the SWEEP must have made durable — its terminal warnings —
+// before the deferred-receipt fence may clear the obligation generation. `enqueueSalesInvoiceFollowUps`
+// below takes no such argument today, and a function with fewer parameters is assignable to a
+// signature with more: a binding wired without threading it would compile, run, and clear the marker
+// before the warning that permits the settlement was written. That is the r16 finding, and on this
+// connector it would arrive silently. Thread it into the `registerDeferredOrderReceipts` obligation
+// exactly as the Xero processor does, or do not bind the sweep.
+//
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// THE MARKER IS STILL CLAIMED HERE, AND THAT IS STILL NOT A CONTRADICTION (r10 finding 1).
+//
+// Recording that work is owed and repairing it are two different acts, and only the second is what
+// any of the above gates. The marker writes nothing to any accounting document and crosses no realm
+// boundary — it is a timestamp on the sync row that already carries the external id.
 //
 // Claiming it now was the choice over deferring it because the alternative is not "no marker", it
 // is "a window that stays silent". A QuickBooks row that dies between its SYNCED write and its
 // enqueue is indistinguishable afterwards from one that completed, and nothing can recover that
 // distinction later: it has to be recorded at the moment it is true or not at all. Adding it when
-// the sweep is wired would leave every row written before then permanently unrecoverable, for the
+// a consumer is wired would leave every row written before then permanently unrecoverable, for the
 // same reason there is no backfill for rows written before the column existed. Xero having the
 // marker and QuickBooks not having it would also be a difference nobody chose — the two connectors
 // drifted once already, on precisely this function's back-reference logic.
+//
+// What that argument establishes is that the marker is worth WRITING. It does not establish that
+// anything reads it, and r5 is the round that stopped this block implying otherwise.
 // ---------------------------------------------------------------------------

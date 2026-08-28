@@ -8,11 +8,13 @@ import {
   applyBackReference,
   backReferenceHolder,
   backReferenceIsMissing,
+  claimFollowUpObligation,
   followUpObligationClaim,
   isExternalBillIdConflict,
   isExternalCreditNoteIdConflict,
   isExternalDocumentIdConflict,
   releaseAndRelinkExternalDocumentId,
+  nextFollowUpObligationGeneration,
   releaseFollowUpObligation,
   resolvePurchaseOrderBackReference,
   syncTypeWritesBackReference,
@@ -1269,44 +1271,253 @@ test('[o3d-9kek r7 f1] releasing the confirmed holder links the id to the docume
 })
 
 // ---------------------------------------------------------------------------
-// o3d-9kek Codex r10 finding 1 — the shared obligation helpers, on their own.
+// o3d-9kek Codex r10 finding 1 + o3d-0bfh r4 Codex HIGH — the shared obligation helpers, on their own.
 //
 // The connectors' behaviour is asserted end-to-end in tests/accounting/followup-obligation-writers;
-// these two pin the CONTRACT that makes the shape safe to reuse, so a future third caller inherits
-// it instead of reinventing it.
+// these pin the CONTRACT that makes the shape safe to reuse, so a future writer inherits the
+// generation protocol instead of reinventing it — which is exactly how the connector release came to
+// be standing outside it.
 // ---------------------------------------------------------------------------
 
-test('[o3d-9kek r10 f1] the claim is a data fragment, so it can only be merged into an existing write', () => {
-  // Not a function that performs a write. That is the whole point: merged into the update that marks
-  // a row SYNCED, the claim cannot fail separately from the transition it describes, so there is no
-  // ordering in which a row becomes SYNCED-with-an-id while nothing records what it still owes.
+/** A one-row double for the obligation client, with a hook to move the row mid-call. */
+function obligationClient(initial: Date | null, options: {
+  onFindUnique?: () => void
+  failFindUnique?: boolean
+  failUpdateMany?: boolean
+} = {}) {
+  const row = { backReferenceFollowUpsPendingAt: initial }
+  const writes: Array<{ where: Record<string, unknown>; data: Record<string, unknown> }> = []
+  const client = {
+    accountingSyncLog: {
+      async findUnique(_args: { where: { id: string }; select: { backReferenceFollowUpsPendingAt: true } }) {
+        if (options.failFindUnique) throw new Error('transient: read failed')
+        const snapshot = { backReferenceFollowUpsPendingAt: row.backReferenceFollowUpsPendingAt }
+        // THE INTERLEAVING POINT. Fired AFTER the value is snapshotted and BEFORE the compare-and-set
+        // sees the row, which is the only window in which another writer can make this call's
+        // observation stale — the window the CAS exists to detect.
+        options.onFindUnique?.()
+        return snapshot
+      },
+      async updateMany(args: { where: Record<string, unknown>; data: Record<string, unknown> }) {
+        if (options.failUpdateMany) throw new Error('transient: write failed')
+        writes.push(args)
+        const expected = (args.where as { backReferenceFollowUpsPendingAt?: Date | null }).backReferenceFollowUpsPendingAt
+        const current = row.backReferenceFollowUpsPendingAt
+        const matched = expected === undefined
+          ? true
+          : (expected === null ? current === null : current !== null && current.getTime() === expected.getTime())
+        if (!matched) return { count: 0 }
+        row.backReferenceFollowUpsPendingAt = (args.data as { backReferenceFollowUpsPendingAt: Date | null }).backReferenceFollowUpsPendingAt
+        return { count: 1 }
+      },
+    },
+  }
+  return { client, row, writes }
+}
+
+test('[o3d-9kek r10 f1] the claim fragment is still exactly the marker, and nothing else', () => {
   const now = new Date('2026-08-17T09:00:00Z')
   assert.deepEqual(followUpObligationClaim(now), { backReferenceFollowUpsPendingAt: now })
   assert.ok(followUpObligationClaim().backReferenceFollowUpsPendingAt instanceof Date, 'and it defaults to now')
+})
+
+test('[o3d-0bfh r4] the mint is STRICTLY later than the generation observed, including inside one millisecond', () => {
+  // ONE definition of the rule, shared by the sweep's compare-and-set and by both connectors. A
+  // restated copy is how the connector fell out of the protocol, and a plain `now()` is not a mint:
+  // the column is TIMESTAMP(3), so two writers in one millisecond would each write the value the
+  // other observed and every fence built on it would prove nothing.
+  const observed = new Date('2026-08-17T09:00:00.000Z')
+  assert.deepEqual(nextFollowUpObligationGeneration(null, observed), observed, 'nothing observed: the clock stands')
+  assert.equal(
+    nextFollowUpObligationGeneration(observed, observed).getTime(),
+    observed.getTime() + 1,
+    'the SAME millisecond still advances',
+  )
+  assert.equal(
+    nextFollowUpObligationGeneration(observed, new Date(observed.getTime() - 5_000)).getTime(),
+    observed.getTime() + 1,
+    'and a clock that has gone BACKWARDS cannot mint a generation an earlier writer could hold',
+  )
+  assert.equal(
+    nextFollowUpObligationGeneration(observed, new Date(observed.getTime() + 5_000)).getTime(),
+    observed.getTime() + 5_000,
+    'a clock that has moved on is used as-is',
+  )
+})
+
+test('[o3d-0bfh r4] a connector claim advances the stored generation and reports the value it wrote', async () => {
+  const stored = new Date('2026-08-17T09:00:00.000Z')
+  const { client, row, writes } = obligationClient(stored)
+  const claim = await claimFollowUpObligation(client, {
+    syncLogId: 'log-1',
+    connector: 'xero',
+    // The same millisecond the row already carries — the case that proved a plain `now()` unsound.
+    now: stored,
+  })
+  assert.equal(claim.claimed, true)
+  assert.ok(claim.claimed && claim.generation.getTime() === stored.getTime() + 1, 'strictly later than what it observed')
+  assert.equal(row.backReferenceFollowUpsPendingAt?.getTime(), stored.getTime() + 1, 'and that is what the row now carries')
+  assert.deepEqual(
+    writes[0].where,
+    { id: 'log-1', backReferenceFollowUpsPendingAt: stored },
+    'the claim is a COMPARE-AND-SET on the generation it observed, not a write by id',
+  )
+})
+
+test('[o3d-0bfh r4] a connector claim that loses the compare-and-set owns nothing and leaves the winner in place', async () => {
+  const stored = new Date('2026-08-17T09:00:00.000Z')
+  const other = new Date('2026-08-17T09:00:05.000Z')
+  const { client, row } = obligationClient(stored, {
+    // A sweep claims between this call's read and its write.
+    onFindUnique: () => { row.backReferenceFollowUpsPendingAt = other },
+  })
+  const claim = await claimFollowUpObligation(client, { syncLogId: 'log-1', connector: 'xero', now: stored })
+  assert.deepEqual(claim, { claimed: false, reason: 'contended' })
+  assert.equal(row.backReferenceFollowUpsPendingAt?.getTime(), other.getTime(), "the other writer's generation stands")
+})
+
+test('[o3d-0bfh r4] a claim whose statement fails owns nothing, and the row still says it owes follow-ups', async () => {
+  // Failing CLOSED is the whole asymmetry: whatever the outcome, the marker is non-null, so the row
+  // still records the debt. All that is lost is the standing to say it has been paid.
+  const stored = new Date('2026-08-17T09:00:00.000Z')
+  const read = await claimFollowUpObligation(obligationClient(stored, { failFindUnique: true }).client,
+    { syncLogId: 'log-1', connector: 'xero' })
+  assert.deepEqual(read, { claimed: false, reason: 'unwritable' })
+  const written = obligationClient(stored, { failUpdateMany: true })
+  const wrote = await claimFollowUpObligation(written.client, { syncLogId: 'log-1', connector: 'xero' })
+  assert.deepEqual(wrote, { claimed: false, reason: 'unwritable' })
+  assert.equal(written.row.backReferenceFollowUpsPendingAt?.getTime(), stored.getTime(), 'the obligation is still recorded')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-0bfh r5 (Codex HIGH) — THE RELEASE HELPER PROMISED A SWEEP THAT ONE CONNECTOR DOES NOT HAVE.
+//
+// All three of its non-clearing outcomes used to end with some form of "a later sweep will
+// re-enqueue them". That is true on Xero, which binds `repairXeroBackReferences` and has cron invoke
+// it. It is FALSE on QuickBooks, which has no binding and no invocation, so a retained marker there
+// is read by nothing and the outstanding payment, PDF, email or attachment never runs.
+//
+// The distinction is not cosmetic. The whole protocol prefers RETAINING a marker to clearing one on
+// the stated ground that retention costs only "one idempotent re-enqueue on a later sweep". Where
+// there is no sweep, retention costs the payment exactly as clearing it would — the difference is
+// only that the evidence survives — and a log line telling an operator the work is in hand is the
+// difference between someone re-driving it by hand and nobody doing anything.
+//
+// So the caller states it and the helper reports what the caller stated. `SWEEP` below is the
+// control: without it these tests would pass just as well if the recovery wording were deleted
+// outright, which would lose Xero's true and useful promise to fix QuickBooks' false one.
+// ---------------------------------------------------------------------------
+
+const SWEEP = { consumer: 'sweep' } as const
+const NO_CONSUMER = {
+  consumer: 'none',
+  blockedBy: 'no QuickBooks sweep is bound (o3d-8prh)',
+  operatorRemedy: 'find the row by its marker and re-drive the payment by hand',
+} as const
+
+/** Capture what the helper tells an operator, without letting it reach the test runner's output. */
+async function releaseSaying(
+  client: Parameters<typeof releaseFollowUpObligation>[0],
+  params: Parameters<typeof releaseFollowUpObligation>[1],
+): Promise<{ outcome: string; said: string }> {
+  const real = console.error
+  const lines: string[] = []
+  console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')) }
+  try {
+    const outcome = await releaseFollowUpObligation(client, params)
+    return { outcome, said: lines.join('\n') }
+  } finally {
+    console.error = real
+  }
+}
+
+test('[o3d-0bfh r5] EVERY refusal on a connector with no consumer says nothing re-enqueues it, and promises no sweep', async () => {
+  // All three non-clearing paths, because the promise was in all three and a fix applied to one
+  // would leave the other two telling an operator the money work is scheduled when it is stalled.
+  const mine = new Date('2026-08-17T09:00:00.000Z')
+  const newer = new Date('2026-08-17T09:00:00.001Z')
+
+  const owningNothing = await releaseSaying(obligationClient(newer).client,
+    { syncLogId: 'log-1', connector: 'quickbooks', generation: null, recovery: NO_CONSUMER })
+  const superseded = await releaseSaying(obligationClient(newer).client,
+    { syncLogId: 'log-1', connector: 'quickbooks', generation: mine, recovery: NO_CONSUMER })
+  const unwritable = await releaseSaying(obligationClient(mine, { failUpdateMany: true }).client,
+    { syncLogId: 'log-1', connector: 'quickbooks', generation: mine, recovery: NO_CONSUMER })
+
+  // THE PRECONDITION, asserted so this cannot pass by reaching none of the paths (a helper that
+  // threw, or an outcome that cleared, would otherwise leave three empty strings satisfying every
+  // negative assertion below).
+  assert.deepEqual(
+    [owningNothing.outcome, superseded.outcome, unwritable.outcome],
+    ['superseded', 'superseded', 'unwritable'],
+    'all three non-clearing paths must actually have been reached',
+  )
+
+  for (const [path, { said }] of Object.entries({ owningNothing, superseded, unwritable })) {
+    assert.ok(said.length > 0, `${path} said nothing at all — a refusal counted nowhere is a settlement`)
+    assert.match(said, /NOTHING re-enqueues them on this connector/,
+      `${path} must tell an operator the work is stalled, not scheduled`)
+    assert.match(said, /o3d-8prh/, `${path} must name why nothing re-enqueues it`)
+    assert.match(said, /re-drive the payment by hand/, `${path} must say what a human has to do instead`)
+    assert.doesNotMatch(said, /later sweep/,
+      `${path} must not promise a sweep this connector does not have — that promise is the finding`)
+  }
+})
+
+test('[o3d-0bfh r5] CONTROL: a connector that DOES have a sweep is still told so', async () => {
+  // Without this, the test above is satisfied by deleting the recovery wording from the helper
+  // entirely — which would replace a false promise with no information, and Xero's promise is true
+  // and is what tells an operator that a stranded row needs nothing from them.
+  const mine = new Date('2026-08-17T09:00:00.000Z')
+  const newer = new Date('2026-08-17T09:00:00.001Z')
+  const { said, outcome } = await releaseSaying(obligationClient(newer).client,
+    { syncLogId: 'log-1', connector: 'xero', generation: mine, recovery: SWEEP })
+
+  assert.equal(outcome, 'superseded', 'the same path as the test above, so the two are comparable')
+  assert.match(said, /a later sweep re-reads the marker and re-enqueues them idempotently/)
+  assert.doesNotMatch(said, /NOTHING re-enqueues/)
+})
+
+test('[o3d-0bfh r4] a release clears ONLY the generation it minted', async () => {
+  const mine = new Date('2026-08-17T09:00:00.000Z')
+  const { client, row, writes } = obligationClient(mine)
+  const outcome = await releaseFollowUpObligation(client, { syncLogId: 'log-1', connector: 'xero', generation: mine, recovery: SWEEP })
+  assert.equal(outcome, 'released')
+  assert.equal(row.backReferenceFollowUpsPendingAt, null)
+  assert.deepEqual(writes[0].where, { id: 'log-1', backReferenceFollowUpsPendingAt: mine }, 'fenced on the generation, not the id alone')
+  assert.deepEqual(writes[0].data, { backReferenceFollowUpsPendingAt: null }, 'and it clears ONLY the obligation')
+})
+
+test('[o3d-0bfh r4] a release over a NEWER generation is superseded, and the newer obligation survives', async () => {
+  // THE FINDING, at the unit. The connector claimed C, paused, and a sweep advanced C to S and
+  // deliberately retained S over a receipt it could not register. Clearing by id erased S and the
+  // next sweep stamped the row reconciled with the money still unregistered.
+  const mine = new Date('2026-08-17T09:00:00.000Z')
+  const sweep = new Date('2026-08-17T09:00:00.001Z')
+  const { client, row } = obligationClient(sweep)
+  const outcome = await releaseFollowUpObligation(client, { syncLogId: 'log-1', connector: 'xero', generation: mine, recovery: SWEEP })
+  assert.equal(outcome, 'superseded')
+  assert.equal(row.backReferenceFollowUpsPendingAt?.getTime(), sweep.getTime(), "the sweep's obligation is intact")
+})
+
+test('[o3d-0bfh r4] a release that owns no generation writes nothing at all', async () => {
+  const sweep = new Date('2026-08-17T09:00:00.000Z')
+  const { client, row, writes } = obligationClient(sweep)
+  const outcome = await releaseFollowUpObligation(client, { syncLogId: 'log-1', connector: 'xero', generation: null, recovery: SWEEP })
+  assert.equal(outcome, 'superseded')
+  assert.equal(writes.length, 0, 'a caller that owns nothing does not get to write')
+  assert.equal(row.backReferenceFollowUpsPendingAt?.getTime(), sweep.getTime())
 })
 
 test('[o3d-9kek r10 f1] a release that fails REPORTS rather than throws, leaving the work recorded as owed', async () => {
   // By the time this runs the follow-ups have already been enqueued, so a throw here would drive the
   // caller's follow-up-failure path and re-run work that succeeded. Failing to clear the marker
   // costs one idempotent re-enqueue on a later sweep; failing the entry costs a duplicate.
-  const writes: Array<Record<string, unknown>> = []
-  const ok = await releaseFollowUpObligation({
-    accountingSyncLog: {
-      async update(args: { where: { id: string }; data: Record<string, unknown> }) {
-        writes.push(args.data)
-        return {}
-      },
-    },
-  }, { syncLogId: 'log-1', connector: 'xero' })
-  assert.equal(ok, true)
-  assert.deepEqual(writes, [{ backReferenceFollowUpsPendingAt: null }], 'and it clears ONLY the obligation')
-
-  const failing = await releaseFollowUpObligation({
-    accountingSyncLog: {
-      async update() { throw new Error('transient') },
-    },
-  }, { syncLogId: 'log-1', connector: 'xero' })
-  assert.equal(failing, false, 'reported, not thrown')
+  const mine = new Date('2026-08-17T09:00:00.000Z')
+  const { client, row } = obligationClient(mine, { failUpdateMany: true })
+  const failing = await releaseFollowUpObligation(client, { syncLogId: 'log-1', connector: 'xero', generation: mine, recovery: SWEEP })
+  assert.equal(failing, 'unwritable', 'reported, not thrown')
+  assert.equal(row.backReferenceFollowUpsPendingAt?.getTime(), mine.getTime(), 'and the obligation survives the failure')
 })
 
 test('[o3d-9kek r10 f1] the release writes a link but does NOT discharge the follow-up obligation', async () => {

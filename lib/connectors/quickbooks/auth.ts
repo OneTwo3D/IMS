@@ -14,6 +14,7 @@ import { decryptSecret, encryptSecret, hasEncryptionKey, isEncryptedValue } from
 import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { connectorFetch } from '@/lib/security/connector-fetch'
+import { orderedAccountingBindingWrites } from '@/lib/connectors/accounting-binding-lock-order'
 
 const QBO_AUTHORIZE_URL = 'https://appcenter.intuit.com/connect/oauth2'
 const QBO_TOKEN_URL = 'https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer'
@@ -22,7 +23,8 @@ const QBO_CONNECTOR = 'quickbooks'
 const QBO_OAUTH_STATE_PREFIX = 'qbo_oauth_state:'
 const QBO_OAUTH_STATE_TTL_MS = 10 * 60 * 1000 // 10 minutes
 const QBO_SCOPES = 'com.intuit.quickbooks.accounting openid profile email'
-const QBO_EXPECTED_REALM_KEY = 'quickbooks_expected_realm_id'
+/** Exported so the binding-lock-order test can check it against that module's own list (o3d-2w2j r2). */
+export const QBO_EXPECTED_REALM_KEY = 'quickbooks_expected_realm_id'
 const REFRESH_EARLY_MS = 2 * 60 * 1000
 
 type TokenResponse = {
@@ -460,8 +462,24 @@ export async function disconnect(): Promise<void> {
   }
 
   await db.$transaction([
-    db.accountingToken.deleteMany({ where: { connector: QBO_CONNECTOR } }),
-    db.setting.deleteMany({ where: { key: QBO_EXPECTED_REALM_KEY } }),
+    // THE THIRD ACQUIRER OF A BINDING PAIR, AND IT HAD THE SAME INVERSION (o3d-2w2j).
+    //
+    // This transaction took the TOKEN row and then the realm PIN — the reverse of the order the Xero
+    // binding writers use, and the reverse of the one `orderedAccountingBindingWrites` now names for
+    // every writer of more than one binding row. It is a smaller hazard than the Xero disconnect was,
+    // because the QuickBooks consent writes its token and its pin in two SEPARATE auto-commit
+    // statements and so never holds both at once, and because the two connectors' pins are different
+    // `settings` rows: nothing contends today. That is a fact about the current callback, not a
+    // property of the rows, and it is exactly the kind of fact a future re-provision that wraps the
+    // consent in one transaction would quietly invalidate. One order everywhere costs nothing and
+    // removes the question.
+    //
+    // No witness: the QuickBooks binding has no release receipt, so it supplies two of the three rows
+    // and gets two back.
+    ...orderedAccountingBindingWrites({
+      pin: db.setting.deleteMany({ where: { key: QBO_EXPECTED_REALM_KEY } }),
+      token: db.accountingToken.deleteMany({ where: { connector: QBO_CONNECTOR } }),
+    }),
     // Clear cached contact + item IDs so stale QuickBooks IDs aren't reused after
     // reconnecting to a different company or switching connectors.
     db.customer.updateMany({

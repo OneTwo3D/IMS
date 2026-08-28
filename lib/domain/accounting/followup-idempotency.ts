@@ -808,6 +808,27 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
  * one is not. That is the OPPOSITE of the database index's null handling — the index groups unanchored
  * rows into their own slot — and deliberately so: the application guard may be stricter than the
  * constraint that backs it, never laxer.
+ *
+ * SHARED BY BOTH CONNECTORS since the o3d-hbgo QuickBooks port. The o3d-anu8 branch left the
+ * QuickBooks lookup counting rows, on the reasoning that narrowing it "changes which rows a lookup
+ * returns"; it does, and the rows it was returning were the ones that stranded a re-invoiced order's
+ * payment. One predicate, imported by both, so the two connectors cannot drift into two readings of
+ * "already handled".
+ *
+ * AND IT STAYS ON THIS MODULE'S TOKEN-SCOPED `anchorsOf`, NOT ON `couldBeTheSameDocument` — which is
+ * worth stating, because the canonical comparison looks like the obvious upgrade and is the right
+ * answer to a DIFFERENT question. `couldBeTheSameDocument` asks "could these two rows be one LEDGER
+ * DOCUMENT?", and the money fence and the lock key want that: coarser there costs only serialization.
+ * This asks "does that live row already own the follow-up we would post?", and the honest scope for
+ * that is the scope of the REMOTE TOKEN the post would carry — which `buildFollowUpIdempotencySource`
+ * derives from exactly these anchors, byte-exactly and over both id fields.
+ *
+ * Swapping in the canonical comparison would make the row dedup COARSER than that token, and the
+ * module's own rule cuts both ways: a dedup that names LESS than the token can only discard work the
+ * token was ready to tell apart. Two follow-ups differing in a field the token separates would derive
+ * two distinct remote requests, and a type-aware comparison that ignored that field would skip the
+ * second — o3d-hbgo's own failure mode, arriving at a different anchor. The two comparisons are
+ * therefore both correct, for their own readers, and neither is a spelling of the other.
  */
 export function liveRowOccupiesFollowUpSlot(storedPayload: unknown, freshPayload: FollowUpPayload): boolean {
   return couldHaveCommittedThis(asPayload(storedPayload), anchorsOf(freshPayload))
