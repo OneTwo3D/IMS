@@ -836,3 +836,147 @@ test('o3d-2k5r r10: the runtime pool, the deploy check and the preflight all rea
     else process.env.DATABASE_URL = before
   }
 })
+
+// ---------------------------------------------------------------------------
+// o3d-2k5r r11 (Codex HIGH + MEDIUM) — THE URL THIS MODULE READ DIFFERENTLY FROM THE SERVER.
+//
+// Both of these produced the branch's own signature failure from inside the fix for it: a gate
+// that inspects one schema while the writes land in another.
+//
+//   HIGH     `search_path=TenantA` unquoted IS the schema `tenanta` — PostgreSQL folds it. This
+//            read `TenantA`, emitted the always-quoted `search_path="TenantA"`, and moved an
+//            existing options-only URL onto a different schema entirely.
+//   MEDIUM   `URLSearchParams.get('options')` is FIRST-wins; the installed pg-connection-string
+//            is LAST-wins. The second `?options=` was what the server received and the first was
+//            what this module read, pinned from, and then deleted.
+// ---------------------------------------------------------------------------
+
+test('o3d-2k5r r11: an UNQUOTED mixed-case search_path is the schema the SERVER folds it to, and a quoted one is not', async () => {
+  const { pgConnectionConfig, resolveDatabaseUrlSchema, prismaAdapterSchemaOptions, DatabaseUrlSchemaConflictError } =
+    await import('../lib/db/database-url-schema.mjs')
+
+  // MUTATION ROUTE: return the trimmed characters as written from singleSchemaOfSearchPath() and
+  // drop the foldUnquotedIdentifier() call (the r10 implementation, i.e. exactly the code this
+  // finding was raised against). The unquoted URL below then resolves to 'TenantA' and pins
+  // `-c search_path="TenantA"`, moving the connection off `tenanta`; the conflict assertion stops
+  // throwing because both spellings read as 'TenantA'; and the two pins stop differing at all.
+  const unquoted = 'postgresql://u:p@localhost:5432/ims?options=-c%20search_path%3DTenantA'
+  const quoted = 'postgresql://u:p@localhost:5432/ims?options=-c%20search_path%3D%22TenantA%22'
+
+  assert.deepEqual(resolveDatabaseUrlSchema(unquoted), { parsed: true, explicit: true, schema: 'tenanta' })
+  assert.deepEqual(prismaAdapterSchemaOptions(unquoted), { schema: 'tenanta' }, 'the adapter half is folded too, or the two halves split')
+  assert.equal(pgConnectionConfig(unquoted).options, '-c search_path="tenanta"')
+
+  assert.deepEqual(resolveDatabaseUrlSchema(quoted), { parsed: true, explicit: true, schema: 'TenantA' })
+  assert.equal(pgConnectionConfig(quoted).options, '-c search_path="TenantA"')
+
+  // The property in one line: quotedness is part of the name, so these two URLs are NOT the same
+  // connection and must not produce the same pin.
+  assert.notEqual(pgConnectionConfig(unquoted).options, pgConnectionConfig(quoted).options)
+
+  // AND WHAT THE PIN SAYS IS WHAT THE DRIVER SENDS — measured, not described.
+  assert.equal(
+    await effectiveStartupOptions({ ...pgConnectionConfig(unquoted) }),
+    '-c search_path="tenanta"',
+    'the startup packet carries the folded name, which is the schema the unquoted URL asked for',
+  )
+
+  // TWO SPELLINGS THAT NAME TWO SCHEMAS ARE A CONFLICT, not agreement. `?schema=` reaches Prisma
+  // verbatim, so `?schema=TenantA` really is the schema `TenantA`, while the unquoted search_path
+  // beside it really is `tenanta`. Reading both as written made this pair pass the conflict check
+  // and then split the two halves apart.
+  assert.throws(
+    () => pgConnectionConfig('postgresql://u:p@localhost:5432/ims?schema=TenantA&options=-c%20search_path%3DTenantA'),
+    (error: unknown) => {
+      assert.ok(error instanceof DatabaseUrlSchemaConflictError)
+      assert.match((error as Error).message, /TenantA/)
+      assert.match((error as Error).message, /tenanta/)
+      return true
+    },
+  )
+
+  // THE CONTROLS, so a check that refuses every legitimate configuration cannot be the reason this
+  // passes: the pair that genuinely agrees after folding, and the pair that agrees as written.
+  assert.equal(
+    pgConnectionConfig('postgresql://u:p@localhost:5432/ims?schema=tenanta&options=-c%20search_path%3DTenantA').options,
+    '-c search_path="tenanta"',
+  )
+  assert.equal(
+    pgConnectionConfig('postgresql://u:p@localhost:5432/ims?schema=TenantA&options=-c%20search_path%3D%22TenantA%22').options,
+    '-c search_path="TenantA"',
+  )
+
+  // AN UNQUOTED NAME THIS CANNOT FOLD THE SERVER'S WAY IS REFUSED. PostgreSQL maps case on
+  // non-ASCII letters with the database's own encoding and collation, so `Ünster` unquoted is a
+  // schema whose real name is not knowable from here — and guessing it is how a pin lands
+  // somewhere nobody asked for.
+  //
+  // MUTATION ROUTE: fold with String.prototype.toLowerCase() instead of the ASCII-only map and
+  // this stops throwing, silently pinning a name JavaScript's Unicode rules produced rather than
+  // the server's.
+  assert.throws(
+    () => pgConnectionConfig('postgresql://u:p@localhost:5432/ims?options=-c%20search_path%3D%C3%9Cnster'),
+    DatabaseUrlSchemaConflictError,
+  )
+  // ...and quoting it names it exactly, so there is a way to say what was meant.
+  assert.equal(
+    pgConnectionConfig('postgresql://u:p@localhost:5432/ims?options=-c%20search_path%3D%22%C3%9Cnster%22').options,
+    '-c search_path="Ünster"',
+  )
+})
+
+test('o3d-2k5r r11: a REPEATED ?options= is refused, because the driver keeps the LAST and this read the FIRST', async () => {
+  const { pgConnectionConfig, resolveDatabaseUrlSchema, prismaAdapterSchemaOptions, DatabaseUrlSchemaConflictError } =
+    await import('../lib/db/database-url-schema.mjs')
+
+  const duplicated =
+    'postgresql://u:p@localhost:5432/ims' +
+    '?options=-c%20search_path%3Dfirst%20-c%20statement_timeout%3D1000' +
+    '&options=-c%20search_path%3Dsecond%20-c%20lock_timeout%3D2000'
+
+  // PRECONDITIONS, MEASURED ON THE INSTALLED DRIVER RATHER THAN DESCRIBED. These two disagree, and
+  // that disagreement is the whole finding.
+  assert.equal(
+    new URL(duplicated).searchParams.get('options'),
+    '-c search_path=first -c statement_timeout=1000',
+    'precondition: URLSearchParams.get() returns the FIRST occurrence',
+  )
+  assert.equal(
+    await effectiveStartupOptions({ connectionString: duplicated }),
+    '-c search_path=second -c lock_timeout=2000',
+    'precondition: and the installed driver connects with the LAST',
+  )
+
+  // MUTATION ROUTE: replace soleConnectionParameter() with url.searchParams.get() (the r10
+  // implementation). Nothing below throws; pgConnectionConfig() resolves the schema to `first`
+  // while the server had been receiving `second`, and — because it deletes EVERY occurrence — the
+  // driver's real `lock_timeout=2000` disappears from the startup packet with no trace at all.
+  for (const call of [
+    () => resolveDatabaseUrlSchema(duplicated),
+    () => pgConnectionConfig(duplicated),
+    () => prismaAdapterSchemaOptions(duplicated),
+  ]) {
+    assert.throws(call, (error: unknown) => {
+      assert.ok(error instanceof DatabaseUrlSchemaConflictError)
+      assert.match((error as Error).message, /\?options= 2 times/)
+      assert.match((error as Error).message, /search_path=first/)
+      assert.match((error as Error).message, /search_path=second/)
+      return true
+    })
+  }
+
+  // A REPEATED ?schema= goes the same way. It feeds the ADAPTER half of the same pin, so one URL
+  // naming it twice is one URL that cannot say which schema the generated queries are qualified
+  // with — and this module refuses every other ambiguity in a DATABASE_URL.
+  assert.throws(
+    () => pgConnectionConfig('postgresql://u:p@localhost:5432/ims?schema=one&schema=two'),
+    DatabaseUrlSchemaConflictError,
+  )
+
+  // THE CONTROL: one `options`, said once, is untouched — including a setting that is not
+  // search_path, which must still reach the server.
+  assert.equal(
+    pgConnectionConfig('postgresql://u:p@localhost:5432/ims?options=-c%20search_path%3Dsecond%20-c%20lock_timeout%3D2000').options,
+    '-c lock_timeout=2000 -c search_path="second"',
+  )
+})
