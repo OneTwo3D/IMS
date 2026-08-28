@@ -1,4 +1,31 @@
 import type { AccountingSyncType } from '@/app/generated/prisma/client'
+import {
+  renderLocalDirection,
+  type LocalDirectionContext,
+} from '@/lib/domain/accounting/local-operator-direction'
+
+/**
+ * THE DIRECTIONS THESE MESSAGES CARRY ARE COMPOSED, NOT WRITTEN (o3d-batch-ret r18, Codex HIGH).
+ *
+ * Every operator instruction a lookup-less record ships is `renderLocalDirection(...)` interpolated
+ * into the sentence around it, so the instruction is a function of a typed {action, target} value
+ * rather than prose that happens to contain the same words. See
+ * lib/domain/accounting/local-operator-direction.ts for what the model refuses to represent.
+ *
+ * `QBO_DIRECTIONS` is the context for the module-level wording TABLES, which are constants: the
+ * ledger is QuickBooks throughout those tables (they name `quickbooks_sync_attach_pdf` and a
+ * QuickBooks bill in as many words), and `syncRowId` is a `render()` SLOT rather than a value
+ * because a constant has no incident to read one from. None of the directions composed into those
+ * tables reads it, and if one ever did, `render()` throws on a slot it does not know — so the
+ * failure is a red build, never a "{syncRowId}" shipped to an operator. The formatters that DO have
+ * an incident build their own context from it.
+ */
+const QBO_DIRECTIONS: LocalDirectionContext = { ledger: 'QuickBooks', syncRowId: '{syncRowId}' }
+
+/** The context for a message being composed about one incident, where the sync row IS known. */
+function directionsFor(ledger: string, syncRowId: string): LocalDirectionContext {
+  return { ledger, syncRowId }
+}
 
 /**
  * A DOCUMENT EXISTS IN THE LEDGER AND ITS SYNC ROW WILL NEVER NAME IT (o3d-550x).
@@ -506,16 +533,23 @@ export const QBO_OPERATIONS_WITHOUT_REQUEST_ID: Partial<Record<
     MADE_TARGET_UNRECORDED: {
       effect: 'the supplier invoice PDF is uploaded to that bill in QuickBooks AGAIN, once per sweep',
       check: 'THIS RECORD DOES NOT NAME THE BILL THE PDF WENT ONTO, so it cannot send you to the '
-        + 'duplicates and nothing kept here derives the bill. Escalate this record to whoever '
-        + 'administers this installation',
+        + 'duplicates and nothing kept here derives the bill. '
+        + renderLocalDirection(
+          { action: 'ESCALATE', target: 'THIS_RECORD_AND_ITS_SYNC_ROW', naming: 'RECORD_ONLY', caseForm: 'SENTENCE' },
+          QBO_DIRECTIONS,
+        ),
     },
     NONE: {
       effect: 'NOTHING — PROVIDED ATTACHMENT UPLOAD IS STILL OFF WHEN THE SWEEP RUNS. What this '
         + 'record knows is that quickbooks_sync_attach_pdf read "false" AT THE MOMENT THIS ATTEMPT '
         + 'RAN, which is the only reading it ever took. If that setting is on by the time the row is '
         + 'reclaimed, every sweep uploads the supplier invoice PDF to the bill instead',
-      check: 'nothing this attempt did needs undoing — it created no attachment. THEN GO AND READ '
-        + 'quickbooks_sync_attach_pdf AS IT STANDS NOW, because this record cannot: if it is off, the '
+      check: 'nothing this attempt did needs undoing — it created no attachment. '
+        + renderLocalDirection(
+          { action: 'READ_SETTING', target: 'SETTING_ATTACH_PDF', lead: 'THEN_GO_AND', purpose: 'NONE' },
+          QBO_DIRECTIONS,
+        )
+        + ', because this record cannot: if it is off, the '
         + 'replay above stays a no-op and there is nothing to change; if it is ON, the replay uploads '
         + 'to a bill THIS RECORD DOES NOT NAME, so there is no duplicate this record can send you to. '
         + 'The one lever here is that setting, and it stops attachment uploads for EVERY bill on this '
@@ -529,14 +563,22 @@ export const QBO_OPERATIONS_WITHOUT_REQUEST_ID: Partial<Record<
         + 'sweep, or nothing happens at all — which of the two depends on quickbooks_sync_attach_pdf '
         + 'as it stands when the sweep runs, and this record carries no reading of it',
       check: 'IMS DID NOT RECORD WHETHER THIS ATTEMPT UPLOADED ANYTHING, and it does not name the '
-        + 'bill either. READ quickbooks_sync_attach_pdf AS IT STANDS NOW to learn what a replay would '
-        + 'do, and escalate this record to whoever administers this installation rather than clearing '
-        + 'an attachment off a bill picked out any other way',
+        + 'bill either. '
+        + renderLocalDirection(
+          { action: 'READ_SETTING', target: 'SETTING_ATTACH_PDF', lead: 'NONE', purpose: 'LEARN_WHAT_A_REPLAY_WOULD_DO' },
+          QBO_DIRECTIONS,
+        )
+        + ', and '
+        + renderLocalDirection(
+          { action: 'ESCALATE', target: 'THIS_RECORD_AND_ITS_SYNC_ROW', naming: 'RECORD_ONLY', caseForm: 'CLAUSE' },
+          QBO_DIRECTIONS,
+        )
+        + ' rather than clearing an attachment off a bill picked out any other way',
     },
   },
   INVOICE_PDF: {
     effect: 'the invoice PDF is re-downloaded and written over the stored copy AGAIN, once per sweep',
-    check: 'confirm the invoice PDF stored against the order is the document you expect',
+    check: renderLocalDirection({ action: 'CONFIRM', target: 'ORDER_INVOICE_PDF' }, QBO_DIRECTIONS),
   },
   INVOICE_EMAIL: {
     // NO DELIVERY CLAIM (round 7, Codex MEDIUM). The previous wording said every queued copy "will
@@ -575,14 +617,27 @@ export const QBO_OPERATIONS_WITHOUT_REQUEST_ID: Partial<Record<
     check: 'this operation succeeds by QUEUEING, not by sending, and IMS CANNOT CANCEL A QUEUED COPY. '
       + 'EmailOutbox has four states — PENDING, PROCESSING, SENT, FAILED — none of which means '
       + '"deliberately not delivered", and no action, route or screen removes an unsent row, so there '
-      + 'is nothing to press. TURN THE LEVER BELOW OFF FIRST, so that no NEW run is admitted — but '
+      + 'is nothing to press. '
+      + renderLocalDirection(
+        { action: 'TURN_OFF', target: 'SETTING_SYNC_ENABLED', control: 'LEVER_BELOW' },
+        QBO_DIRECTIONS,
+      )
+      + ' — but '
       + 'it is an ADMISSION CHECK, NOT A FENCE: a run admitted a moment before you flipped it can '
-      + 'queue another copy afterwards, and nothing in IMS reports whether one is doing so. Then '
-      + 'INSPECT the outbox: query it for kind ACCOUNTING_INVOICE, referenceType SalesOrder, '
-      + 'referenceId = the order id (no page in IMS lists them) and read each row\'s status, attempts, '
-      + 'lastError, createdAt and sentAt. WHAT COMES BACK IS A NON-QUIESCENT SNAPSHOT: the set can '
-      + 'still grow after you have read it, so re-run the query rather than treating one result as '
-      + 'the final list. AND IMS CANNOT NARROW IT: no outbox row records the sync attempt that queued '
+      + 'queue another copy afterwards, and nothing in IMS reports whether one is doing so. '
+      + renderLocalDirection(
+        {
+          action: 'INSPECT',
+          target: 'EMAIL_OUTBOX_ROWS',
+          selector: 'BY_KIND_AND_REFERENCE',
+          read: ['status', 'attempts', 'lastError', 'createdAt', 'sentAt'],
+        },
+        QBO_DIRECTIONS,
+      )
+      + ' WHAT COMES BACK IS A NON-QUIESCENT SNAPSHOT: the set can '
+      + 'still grow after you have read it, '
+      + renderLocalDirection({ action: 'RE_READ', target: 'EMAIL_OUTBOX_ROWS' }, QBO_DIRECTIONS)
+      + '. AND IMS CANNOT NARROW IT: no outbox row records the sync attempt that queued '
       + 'it, so nothing attributes a copy to this incident; the authenticated accounting-invoice '
       + 'email action writes the identical shape, so ordinary operator sends are in the same result; '
       + 'a SENT row has already gone; and A FAILED ROW IS NOT PROOF THAT NOTHING WENT — it means IMS '
@@ -596,7 +651,11 @@ export const QBO_OPERATIONS_WITHOUT_REQUEST_ID: Partial<Record<
       + 'top of the sweep, reads only the suppression table, and overwrites whatever the row already '
       + 'carried — so it speaks for the attempt that wrote it and for no attempt before it. IMS keeps '
       + 'no per-attempt outcome, so no row can be read backwards into its own history (o3d-ch0h). '
-      + 'Read them by status, lastError and time, and DO NOT REPORT A '
+      + renderLocalDirection(
+        { action: 'READ', target: 'EMAIL_OUTBOX_ROWS', read: ['status', 'lastError', 'time'] },
+        QBO_DIRECTIONS,
+      )
+      + ', and DO NOT REPORT A '
       + 'COUNT OF DUPLICATES, OF PENDING DELIVERIES OR OF COPIES THAT DID NOT ARRIVE FROM THIS QUERY: '
       + 'it cannot establish any of them (o3d-il7a)',
   },
@@ -608,8 +667,12 @@ export const QBO_OPERATIONS_WITHOUT_REQUEST_ID: Partial<Record<
     effect: 'a second invoice note is written onto the WooCommerce order, once per sweep',
     check: 'THIS RECORD DOES NOT NAME THE WOOCOMMERCE ORDER — it holds the IMS reference above and '
       + 'nothing else, and the IMS record that maps that reference to a WooCommerce order does not '
-      + 'survive a database reset. Escalate this record to whoever administers this installation '
-      + 'rather than clearing notes off an order picked out any other way',
+      + 'survive a database reset. '
+      + renderLocalDirection(
+        { action: 'ESCALATE', target: 'THIS_RECORD_AND_ITS_SYNC_ROW', naming: 'RECORD_ONLY', caseForm: 'SENTENCE' },
+        QBO_DIRECTIONS,
+      )
+      + ' rather than clearing notes off an order picked out any other way',
   },
 }
 
@@ -970,7 +1033,10 @@ function render(template: string, slots: WordingSlots): string {
 
 
 /** The one escalation instruction, so the seven places that end in it cannot each word it slightly differently. */
-const ESCALATE_REMEDY = 'REMEDY: escalate this record to whoever administers this installation'
+const ESCALATE_REMEDY = `REMEDY: ${renderLocalDirection(
+    { action: 'ESCALATE', target: 'THIS_RECORD_AND_ITS_SYNC_ROW', naming: 'RECORD_ONLY', caseForm: 'CLAUSE' },
+    QBO_DIRECTIONS,
+  )}`
 
 /**
  * WHAT THE RECORD HOLDS, SAID ONCE. Every message ends in it, so no remedy has to imply the record
@@ -992,7 +1058,11 @@ const OUTCOME_UNRECORDED_REMEDY: string =
   + 'and IMS did not record which was used for this attempt — so it cannot say whether any balance '
   + 'moved. DO NOT void, credit-note, reverse or delete anything on the strength of this record: the '
   + 'remedy for a live posting is the one that does the most damage to a draft, and the other way '
-  + 'round. Escalate this record to whoever administers this installation'
+  + 'round. '
+  + renderLocalDirection(
+    { action: 'ESCALATE', target: 'THIS_RECORD_AND_ITS_SYNC_ROW', naming: 'RECORD_ONLY', caseForm: 'SENTENCE' },
+    QBO_DIRECTIONS,
+  )
 
 /**
  * THE SAME ANSWER FOR AN UPDATE, WHICH KNOWS ONE MORE THING (round 11, Codex MEDIUM).
@@ -1370,8 +1440,12 @@ export const NON_DOCUMENT_INCIDENT_WORDING: Readonly<Record<
         + 'for one',
       remedy: 'REMEDY: DO NOT OPEN, KEEP OR VOID EITHER THE BILL OR THE CREDIT NOTE ON THE STRENGTH OF '
         + 'THIS RECORD. Both of them existed before this operation and neither was created by it; what '
-        + 'happened is that one was applied to the other. Escalate this record to whoever '
-        + 'administers this installation.',
+        + 'happened is that one was applied to the other. '
+        + renderLocalDirection(
+          { action: 'ESCALATE', target: 'THIS_RECORD_AND_ITS_SYNC_ROW', naming: 'RECORD_ONLY', caseForm: 'SENTENCE' },
+          QBO_DIRECTIONS,
+        )
+        + '.',
       needs: [],
     },
     TAX_RATE_SYNC: {
@@ -1384,8 +1458,12 @@ export const NON_DOCUMENT_INCIDENT_WORDING: Readonly<Record<
       // instruction is deleted; the escalation is what remains.
       remedy: 'REMEDY: THERE IS NOTHING TO VOID OR CREDIT — nothing was posted to a customer or a '
         + 'supplier account. THIS RECORD DOES NOT SAY WHAT THE RATE WAS BEFORE THE WRITE, so it '
-        + 'cannot tell you what correcting it would restore. Escalate this record to whoever '
-        + 'administers this installation.',
+        + 'cannot tell you what correcting it would restore. '
+        + renderLocalDirection(
+          { action: 'ESCALATE', target: 'THIS_RECORD_AND_ITS_SYNC_ROW', naming: 'RECORD_ONLY', caseForm: 'SENTENCE' },
+          QBO_DIRECTIONS,
+        )
+        + '.',
       needs: [],
     },
     // ROUND 10 (Codex MEDIUM): THE ONE OPERATION WHOSE OWN OUTCOME DECIDES THE SENTENCE. The handler
@@ -1422,8 +1500,12 @@ export const NON_DOCUMENT_INCIDENT_WORDING: Readonly<Record<
           + 'record does not carry the id of the bill it went onto either',
         remedy: 'REMEDY: DO NOT REMOVE AN ATTACHMENT FROM A BILL THIS RECORD CANNOT NAME. The upload '
           + 'happened, so a duplicate may exist, but nothing kept here says which bill it is on and '
-          + 'nothing kept here derives it. Escalate this record to whoever administers this '
-          + 'installation.',
+          + 'nothing kept here derives it. '
+          + renderLocalDirection(
+            { action: 'ESCALATE', target: 'THIS_RECORD_AND_ITS_SYNC_ROW', naming: 'RECORD_ONLY', caseForm: 'SENTENCE' },
+            QBO_DIRECTIONS,
+          )
+          + '.',
         needs: [],
       },
       NONE: {
@@ -1443,7 +1525,11 @@ export const NON_DOCUMENT_INCIDENT_WORDING: Readonly<Record<
           + 'this attempt was',
         remedy: 'REMEDY: DO NOT REMOVE AN ATTACHMENT ON THE STRENGTH OF THIS RECORD — this attempt '
           + 'may never have created one, and this record does not name the bill one would be on. '
-          + 'Escalate this record to whoever administers this installation.',
+          + renderLocalDirection(
+            { action: 'ESCALATE', target: 'THIS_RECORD_AND_ITS_SYNC_ROW', naming: 'RECORD_ONLY', caseForm: 'SENTENCE' },
+            QBO_DIRECTIONS,
+          )
+          + '.',
         needs: [],
       },
     },
@@ -1451,8 +1537,9 @@ export const NON_DOCUMENT_INCIDENT_WORDING: Readonly<Record<
       stands: NOTHING_CREATED_STANDS,
       did: 'it re-downloaded the invoice PDF and wrote it over the copy IMS had stored, so the effect '
         + 'landed inside IMS',
-      remedy: 'REMEDY: confirm the invoice PDF stored against the order is the document you expect. '
-        + 'There is nothing to void in {ledger}.',
+      remedy: 'REMEDY: '
+        + renderLocalDirection({ action: 'CONFIRM', target: 'ORDER_INVOICE_PDF' }, QBO_DIRECTIONS)
+        + '. There is nothing to void in {ledger}.',
       needs: [],
     },
     INVOICE_EMAIL: {
@@ -1461,8 +1548,17 @@ export const NON_DOCUMENT_INCIDENT_WORDING: Readonly<Record<
         + 'succeeds by QUEUEING, not by sending',
       remedy: 'REMEDY: IMS CANNOT CANCEL A QUEUED COPY — EmailOutbox has four states (PENDING, '
         + 'PROCESSING, SENT, FAILED), none of which means "deliberately not delivered", and no action, '
-        + 'route or screen removes an unsent row. Inspect the outbox rows for this order and read each '
-        + 'row\'s status, attempts, lastError and sentAt. A FAILED ROW IS NOT PROOF THAT NOTHING WENT, '
+        + 'route or screen removes an unsent row. '
+        + renderLocalDirection(
+          {
+            action: 'INSPECT',
+            target: 'EMAIL_OUTBOX_ROWS',
+            selector: 'THIS_ORDERS_ROWS',
+            read: ['status', 'attempts', 'lastError', 'sentAt'],
+          },
+          QBO_DIRECTIONS,
+        )
+        + ' A FAILED ROW IS NOT PROOF THAT NOTHING WENT, '
         + 'whatever its lastError says: IMS keeps no per-attempt outcome, so a row\'s final error '
         + 'cannot be read backwards into its history (o3d-ch0h).',
       needs: [],
@@ -1476,8 +1572,12 @@ export const NON_DOCUMENT_INCIDENT_WORDING: Readonly<Record<
       // same reset that preserves this record.
       remedy: 'REMEDY: THIS RECORD DOES NOT NAME THE WOOCOMMERCE ORDER. It holds the IMS reference '
         + 'above and nothing else, and the IMS record that maps that reference to a WooCommerce order '
-        + 'does not survive a database reset. Escalate this record to whoever administers this '
-        + 'installation rather than clearing notes off an order picked out any other way. There is '
+        + 'does not survive a database reset. '
+        + renderLocalDirection(
+          { action: 'ESCALATE', target: 'THIS_RECORD_AND_ITS_SYNC_ROW', naming: 'RECORD_ONLY', caseForm: 'SENTENCE' },
+          QBO_DIRECTIONS,
+        )
+        + ' rather than clearing notes off an order picked out any other way. There is '
         + 'nothing to void in {ledger}.',
       needs: [],
     },
@@ -1967,8 +2067,16 @@ function describeQboNoEffectIncident(
     + 'journals with nothing to do with this row — for as long as it stays off. '
     + `WHAT IS ACTUALLY WRONG IS THE WRITE, NOT THE OPERATION: sync row ${entry.id} was left `
     + 'PROCESSING at attempt revision 0 with no mirrored event, and nothing in IMS will settle it. '
-    + `Fix the failure named above, and ESCALATE sync row ${entry.id}, with this record, to whoever `
-    + 'administers this installation: closing it safely needs someone who can read the database '
+    + renderLocalDirection(
+      {
+        action: 'ESCALATE',
+        target: 'THIS_RECORD_AND_ITS_SYNC_ROW',
+        naming: 'SYNC_ROW',
+        after: 'FIX_THE_FAILURE',
+      },
+      directionsFor('QuickBooks', entry.id),
+    )
+    + ': closing it safely needs someone who can read the database '
     + 'directly (o3d-4b5p, o3d-3lhp). '
     + 'ONE THING ON SCREEN IS ACTIVELY WRONG AND YOU WILL SEE IT: the accounting log renders a '
     + 'settle control for every FAILED or PROCESSING row, and on this one it resolves to the words '
@@ -2042,16 +2150,19 @@ export function describeUnpersistedQboPost(incident: UnpersistedQboPost, cause: 
       + `${render(noRequestId.effect, replaySlots)}, `
       + 'unbounded, because no retry is consumed while the row never leaves PROCESSING. '
       + `WHAT TO DO ABOUT THE EFFECT: ${render(noRequestId.check, replaySlots)}. `
-      + 'HOW TO STOP MORE OF IT: turn QuickBooks sync OFF. The control is the checkbox at the top of '
-      + 'the SYNC tab of the QuickBooks connector panel, and it writes the setting '
-      + 'quickbooks_sync_enabled. IT IS LABELLED "Enable Xero Sync" EVEN THERE, and its helper text '
+      + renderLocalDirection(
+        { action: 'TURN_OFF', target: 'SETTING_SYNC_ENABLED', control: 'CONNECTOR_PANEL_CHECKBOX' },
+        directionsFor('QuickBooks', entry.id),
+      )
+      + ' IT IS LABELLED "Enable Xero Sync" EVEN THERE, and its helper text '
       + 'says Xero too: the QuickBooks panel renders the Xero client and those two strings are '
       + 'hardcoded. The words are wrong; the checkbox is the right one. (Filed as o3d-m9wm.) '
       + 'The stale-claim sweep and the manual Sync button both READ '
       + 'that setting before they call the QuickBooks processor, so while it is off neither one '
       + 'STARTS another run. It stops EVERY QuickBooks row, not this one, and it recalls nothing '
       + 'already queued or already done. '
-      + 'THEN LEAVE IT OFF, BECAUSE TURNING IT OFF IS NOT A FENCE. Both of those call sites read the '
+      + renderLocalDirection({ action: 'LEAVE_OFF', target: 'SETTING_SYNC_ENABLED' }, directionsFor('QuickBooks', entry.id))
+      + ' Both of those call sites read the '
       + 'setting and then call the processor with nothing in between, so a run admitted a moment '
       + 'before you flipped it keeps going: it can claim THIS row afterwards, run the operation '
       + 'again, and then write over the row — the write that records a QuickBooks post updates the '
@@ -2061,8 +2172,17 @@ export function describeUnpersistedQboPost(incident: UnpersistedQboPost, cause: 
       + 'reports whether such a run is still going, so there is no moment you can point at and call '
       + 'this row quiet. '
       + `SO DO NOT CLOSE THIS ROW YOURSELF, AND DO NOT TURN QUICKBOOKS SYNC BACK ON TO FINISH THE `
-      + `JOB. Leave the toggle off and ESCALATE sync row ${entry.id}, with this record, to whoever `
-      + 'administers this installation: closing it safely needs someone who can read the database '
+      + 'JOB. '
+      + renderLocalDirection(
+        {
+          action: 'ESCALATE',
+          target: 'THIS_RECORD_AND_ITS_SYNC_ROW',
+          naming: 'SYNC_ROW',
+          after: 'LEAVE_THE_TOGGLE_OFF',
+        },
+        directionsFor('QuickBooks', entry.id),
+      )
+      + ': closing it safely needs someone who can read the database '
       + 'directly, and the machinery that would make an operator remedy sound is filed as o3d-4b5p '
       + '(a quiescence fence the cron, the manual sync, the claim and the writeback all honour) and '
       + 'o3d-3lhp (a per-row remediation, and a way to cancel a queued email). '
