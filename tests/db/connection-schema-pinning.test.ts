@@ -112,6 +112,95 @@ test('o3d-2k5r r12: whitespace outside ASCII is refused rather than guessed at',
   assert.deepEqual(splitLibpqOptions('-c\\ x=1'), ['-c\\ x=1'])
 })
 
+/**
+ * THE SIX CHARACTERS THE BACKEND SPLITS A STARTUP `options` ON, named once for every test below.
+ *
+ * `pg_split_opts()` tests `isspace((unsigned char) *optstr)`, which in the C locale is exactly
+ * these. Round 12 taught the READER all six; round 13 is about the WRITER agreeing.
+ */
+const BACKEND_SEPARATORS: [string, string][] = [
+  ['space', ' '],
+  ['tab', '\t'],
+  ['newline', '\n'],
+  ['carriage return', '\r'],
+  ['form feed', '\f'],
+  ['vertical tab', '\v'],
+]
+
+/** A schema name carrying every one of them at once. */
+const ALL_SEPARATORS_SCHEMA = BACKEND_SEPARATORS.map(([, separator], index) => `t${index}${separator}`).join('') + 'end'
+
+test('o3d-2k5r r13: a schema name containing any backend separator survives emit -> read unchanged', () => {
+  // ROUTE: `?schema=<name>` -> resolveDatabaseUrlSchema().schema -> pgConnectionConfig() ->
+  // escapeLibpqValue() -> the `options` string in the startup packet -> splitLibpqOptions() ->
+  // readLibpqSettings() -> singleSchemaOfSearchPath() -> the schema again. This is the ROUND TRIP:
+  // it makes the emitter and the tokenizer check each other instead of each being checked against
+  // a hand-written expectation that can drift with them.
+  //
+  // MUTATION: put the emitter back to `String(value).replace(/([\\ ])/g, '\\$1')` — the exact
+  // space-only escape this round replaces. Every non-space case below then fails twice over: the
+  // token count assertion sees 3+ tokens where the backend would have split the name in half, and
+  // the re-read comes back as a different schema (or throws on the unterminated quote). The space
+  // case still passes, which is precisely why a list-shaped test missed this for four rounds.
+  for (const [label, separator] of [...BACKEND_SEPARATORS, ['all six', null] as [string, null]]) {
+    const schema = separator === null ? ALL_SEPARATORS_SCHEMA : `ten${separator}ant`
+    const emitted = pgConnectionConfig(`postgresql://u:p@localhost:5432/ims?schema=${encodeURIComponent(schema)}`)
+    assert.ok(emitted.options, `${label}: a parseable URL always yields a pin`)
+
+    // PRECONDITION, so this test cannot pass by examining nothing: the name really does contain a
+    // separator, and the emitted string really does contain it escaped rather than dropped.
+    if (separator !== null) assert.ok(schema.includes(separator), `${label}: the name under test carries the separator`)
+    assert.ok(emitted.options!.includes('\\'), `${label}: the emitter escaped something`)
+
+    // THE BACKEND'S OWN SPLIT: two tokens, `-c` and the whole setting. Three would mean the server
+    // is being handed a search path cut through the middle of the schema name.
+    assert.deepEqual(
+      splitLibpqOptions(emitted.options!).length,
+      2,
+      `${label}: the backend splits the pin into exactly -c and one setting, not through the name`,
+    )
+
+    // AND BACK: read the emitted options as a URL parameter, exactly as the driver would receive it.
+    const roundTrip = new URL('postgresql://u:p@localhost:5432/ims')
+    roundTrip.searchParams.set('options', emitted.options!)
+    assert.deepEqual(
+      resolveDatabaseUrlSchema(roundTrip.toString()),
+      { parsed: true, explicit: true, schema },
+      `${label}: the schema read back out of the pin is the schema that went into it`,
+    )
+
+    // AND IT IS STABLE: emitting what was just read produces the same string. A round trip that
+    // loses nothing but changes the spelling every pass would still let the two halves drift.
+    assert.equal(
+      pgConnectionConfig(roundTrip.toString()).options,
+      emitted.options,
+      `${label}: the pg-native spelling re-emits to itself`,
+    )
+  }
+})
+
+test('o3d-2k5r r13: whitespace the tokenizer refuses is escaped by the emitter, not written raw', () => {
+  // ROUTE: `?schema=` carrying U+00A0 -> pgConnectionConfig() -> escapeLibpqValue() -> the pin ->
+  // splitLibpqOptions(), which REFUSES an unescaped U+00A0 because whether the backend splits on
+  // it depends on the database's encoding and locale.
+  //
+  // MUTATION: narrow the emitter's character class to the six ASCII separators
+  // (`/[\\ \t\n\v\f\r]/g`). The pin below is then emitted with a bare U+00A0 in it, and the
+  // re-read throws DatabaseUrlSchemaConflictError instead of returning the name — a string this
+  // module emits and then cannot read. Both assertions after the emit fail.
+  const schema = 'ten\u00A0ant' // U+00A0, written as an escape so it cannot be mistaken for a space
+  const emitted = pgConnectionConfig(`postgresql://u:p@localhost:5432/ims?schema=${encodeURIComponent(schema)}`)
+  assert.equal(
+    emitted.options,
+    '-c search_path="ten\\\u00A0ant"',
+    'the ambiguous character is escaped, so it is a literal on both sides',
+  )
+
+  const roundTrip = new URL('postgresql://u:p@localhost:5432/ims')
+  roundTrip.searchParams.set('options', emitted.options!)
+  assert.deepEqual(resolveDatabaseUrlSchema(roundTrip.toString()), { parsed: true, explicit: true, schema })
+})
+
 // ---------------------------------------------------------------------------
 // Live: a throwaway database, and the schema the row actually landed in.
 // ---------------------------------------------------------------------------
@@ -349,4 +438,58 @@ test('o3d-2k5r r12: every install-path writer builds its client through the shar
   // queries with — and `prisma/seed.ts` is entirely generated queries.
   assert.match(sources['../../prisma/seed.ts'], /new PrismaPg\(\s*pgConnectionConfig\(/)
   assert.match(sources['../../prisma/seed.ts'], /prismaAdapterSchemaOptions\(process\.env\.DATABASE_URL!\)/)
+})
+
+test('o3d-2k5r r13 (live): a schema name containing every backend separator is pinned by the real server', async (t) => {
+  const scratch = await openScratch(t)
+  if (!scratch) return
+  try {
+    // ROUTE: `?schema=<name>` -> pgConnectionConfig() -> escapeLibpqValue() -> the startup packet
+    // -> pg_split_opts() IN THE BACKEND -> the connection's own `search_path` -> where an
+    // unqualified INSERT lands. The pure round-trip above proves this module agrees with itself;
+    // this one proves the character it agreed on is the character POSTGRESQL agrees on too. Only
+    // the server can answer that, because the escape is interpreted by the server's splitter.
+    //
+    // MUTATION: restore the space-only emitter (`/([\\ ])/g`). For every separator but the space
+    // the pin reaches the backend split into three tokens — `-c`, `search_path="ten` and `ant"` —
+    // so `current_schema()` is not the named schema and the connect either errors on the
+    // unterminated identifier or resolves the login role's default. Both assertions below fail,
+    // and the write lands in `public.settings` instead.
+    for (const [label, separator] of [...BACKEND_SEPARATORS, ['all six', null] as [string, null]]) {
+      const schema = separator === null ? ALL_SEPARATORS_SCHEMA : `ten${separator}ant`
+      const quoted = `"${schema.replace(/"/g, '""')}"`
+      await scratch.admin.query(`CREATE SCHEMA ${quoted}`)
+      await scratch.admin.query(
+        `CREATE TABLE ${quoted}.settings (key text primary key, value text not null, "updatedAt" timestamptz not null)`,
+      )
+
+      const url = `${scratch.url}?schema=${encodeURIComponent(schema)}`
+      const config = pgConnectionConfig(url)
+      const client = new pg.Client({ ...config, connectionTimeoutMillis: 3_000 })
+      await client.connect()
+      try {
+        assert.equal(
+          (await client.query<{ schema: string }>('select current_schema() as schema')).rows[0]?.schema,
+          schema,
+          `${label}: the backend resolved the WHOLE name, not the part before the separator`,
+        )
+        const key = `probe-${label.replace(/\s+/g, '-')}`
+        await client.query('insert into settings (key, value, "updatedAt") values ($1, $2, now())', [key, label])
+        const landed = await scratch.admin.query<{ nspname: string }>(
+          `select n.nspname from ${quoted}.settings s, pg_namespace n where s.key = $1 and n.nspname = $2`,
+          [key, schema],
+        )
+        assert.equal(landed.rowCount, 1, `${label}: the unqualified write landed in the named schema`)
+        assert.equal(
+          (await scratch.admin.query('select 1 from public.settings where key = $1', [key])).rowCount,
+          0,
+          `${label}: and not in the login role's default schema`,
+        )
+      } finally {
+        await client.end().catch(() => undefined)
+      }
+    }
+  } finally {
+    await scratch.drop()
+  }
 })
