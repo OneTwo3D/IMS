@@ -1,5 +1,9 @@
 import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
+import path from 'node:path'
 import test from 'node:test'
+
+import ts from 'typescript'
 
 import { BACK_REFERENCE_PO_ATTRIBUTION_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
 import { BACK_REFERENCE_PAIRS, syncTypeWritesBackReference } from '@/lib/domain/accounting/back-reference'
@@ -3906,4 +3910,140 @@ test('[o3d-0bfh r16] CONTROL: an UNSETTLED receipt still stops the terminal warn
   const row = harness.store.syncRows[0]
   assert.deepEqual(row.backReferenceFollowUpsPendingAt, at(600), 'and the marker is kept for the receipt')
   assert.equal(row.backReferenceCheckedAt, null)
+})
+
+// ---------------------------------------------------------------------------
+// THE STRUCTURAL HALF OF THE SAME FINDING (Codex HIGH, this round).
+//
+// The two tests above prove the linked tombstone now asks both questions. They cannot prove that
+// the NEXT reader will, and that is the shape the finding actually has: `BackReferenceFollowUpOutcome`
+// carries three independent facts, the doc comment on it says a caller must consult all of them, and
+// one of three call sites consulted one. A structure a caller CAN read one field of will be read one
+// field at a time, however emphatically the comment says otherwise.
+//
+// The type cannot forbid it — see the note in the module — so the enforcement is here: in
+// `back-reference-sweep.ts`, an axis of the outcome may be read ONLY inside `followUpSettlement`,
+// the helper that answers "may I settle?" over all of them at once, or inside `reportRefusedFollowUps`,
+// which IS the `enqueued` axis's reporter. Anywhere else is a caller consulting a fact in isolation.
+//
+// THE AXIS LIST IS DERIVED, NOT WRITTEN OUT, so a fourth fact added to either half of the
+// intersection is covered the day it is added rather than the day somebody remembers this test.
+// ---------------------------------------------------------------------------
+
+/** Every property name the two halves of `BackReferenceFollowUpOutcome` declare. */
+async function outcomeAxes(): Promise<string[]> {
+  const axes = new Set<string>()
+  const sources: [string, string][] = [
+    ['lib/domain/accounting/back-reference-sweep.ts', 'BackReferenceFollowUpOutcome'],
+    ['lib/domain/accounting/followup-enqueue-outcome.ts', 'FollowUpEnqueueOutcome'],
+  ]
+  for (const [file, alias] of sources) {
+    const text = await readFile(path.join(process.cwd(), file), 'utf8')
+    const source = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true)
+    let found = false
+    const visit = (node: ts.Node): void => {
+      if (ts.isTypeAliasDeclaration(node) && node.name.text === alias) {
+        found = true
+        const collect = (type: ts.Node): void => {
+          if (ts.isTypeLiteralNode(type)) {
+            for (const member of type.members) {
+              // `refusals` is the refusal DETAIL carried by one arm, not a fact about the enqueue;
+              // it is read by `followUpEnqueueRefusals` in its own module and never by this sweep.
+              if (member.name && ts.isIdentifier(member.name) && member.name.text !== 'refusals') {
+                axes.add(member.name.text)
+              }
+            }
+          }
+          type.forEachChild(collect)
+        }
+        collect(node.type)
+      }
+      node.forEachChild(visit)
+    }
+    visit(source)
+    assert.ok(found, `the walk never reached ${alias} in ${file} — the derivation read nothing`)
+  }
+  return [...axes].sort()
+}
+
+test('[Codex HIGH] no reader in the sweep consults ONE axis of the follow-up outcome', async () => {
+  // MUTATION THAT KILLS THIS (run): move `if (!outcome.deferredReceiptsSettled) { ... }` out of
+  // `followUpSettlement` and back into `settleOutstandingFollowUpsOnly`. The read is then enclosed
+  // by a function that is not one of the two permitted consumers and the assertion fails naming it.
+  //
+  // ROUTE: a TypeScript AST over the SHIPPED lib/domain/accounting/back-reference-sweep.ts. Every
+  // property access whose name is a declared axis is located and attributed to the nearest enclosing
+  // named function; the axis list itself is read out of the two shipped type declarations.
+  const axes = await outcomeAxes()
+  assert.deepEqual(
+    axes, ['deferredReceiptsSettled', 'enqueued', 'obligationFenced'],
+    'the outcome grew or lost an axis. That is fine — but read the callers, because the whole finding '
+    + 'was a caller that consulted a subset, and a new axis is a new subset to consult',
+  )
+
+  const file = 'lib/domain/accounting/back-reference-sweep.ts'
+  const text = await readFile(path.join(process.cwd(), file), 'utf8')
+  const source = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true)
+
+  /** The nearest enclosing function's name, by the binding it is declared under. */
+  const enclosingName = (node: ts.Node): string => {
+    for (let current: ts.Node | undefined = node.parent; current; current = current.parent) {
+      if (ts.isFunctionDeclaration(current) && current.name) return current.name.text
+      if (ts.isMethodDeclaration(current) && ts.isIdentifier(current.name)) return current.name.text
+      if (
+        (ts.isArrowFunction(current) || ts.isFunctionExpression(current))
+        && current.parent
+        && ts.isVariableDeclaration(current.parent)
+        && ts.isIdentifier(current.parent.name)
+      ) return current.parent.name.text
+    }
+    return '<top level>'
+  }
+
+  // The two permitted consumers, and nothing else. `followUpSettlement` is the one that answers the
+  // whole question; `reportRefusedFollowUps` is the `enqueued` axis's own reporter, which
+  // `followUpSettlement` calls.
+  const consumers = new Set(['followUpSettlement', 'reportRefusedFollowUps'])
+  const reads: { axis: string; enclosing: string; line: number }[] = []
+  const visit = (node: ts.Node): void => {
+    if (ts.isPropertyAccessExpression(node) && axes.includes(node.name.text)) {
+      reads.push({
+        axis: node.name.text,
+        enclosing: enclosingName(node),
+        line: source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1,
+      })
+    }
+    node.forEachChild(visit)
+  }
+  visit(source)
+
+  // THE PRECONDITION, ASSERTED: the walk found reads at all. A walk that matched nothing would pass
+  // the check below by examining nothing, which is the failure mode this whole file exists to refuse.
+  assert.ok(reads.length >= 3, `only ${reads.length} axis reads were found — the walk read nothing`)
+  assert.deepEqual(
+    [...new Set(reads.map((read) => read.axis))].sort(), axes,
+    'every axis must actually be consulted somewhere; one that is read nowhere is a fact the module '
+    + 'stopped acting on',
+  )
+
+  assert.deepEqual(
+    reads.filter((read) => !consumers.has(read.enclosing)),
+    [],
+    'a reader in this module consults an axis of the follow-up outcome outside the helper that '
+    + 'consults ALL of them. That is the finding itself: the axes are independent, so a caller that '
+    + 'reads one has made the others its blind spot. Ask `followUpSettlement`',
+  )
+
+  // AND THE HELPER REALLY DOES CONSULT ALL OF THEM — otherwise the funnel above is a funnel into a
+  // reader with the same defect.
+  const inSettlement = new Set(reads.filter((read) => read.enclosing === 'followUpSettlement').map((read) => read.axis))
+  assert.ok(
+    inSettlement.has('deferredReceiptsSettled') && inSettlement.has('obligationFenced'),
+    `followUpSettlement reads only ${JSON.stringify([...inSettlement])} — it is the site that must read every axis`,
+  )
+  assert.match(
+    text.slice(text.indexOf('const followUpSettlement'), text.indexOf('const settlementPrerequisite')),
+    /reportRefusedFollowUps\(row, outcome\)/,
+    'and it asks the `enqueued` axis through its reporter, which is why that read is not in the list above',
+  )
 })
