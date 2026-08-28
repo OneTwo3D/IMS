@@ -5418,7 +5418,7 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
   // ...AND NONE OF THE SIX FIXES THAT CAME BEFORE IT CLOSES IT, which is what makes this a seventh
   // round rather than a regression of one of them. Each is turned OFF in turn with the key rule ON:
   // if any of them were what refuses this route, one of these would come back clean.
-  for (const [what, complaints] of [
+  const withoutEachEarlierFix = [
     ['receiver propagation (round 24)', judgeRendererOutput(viaAssertedKey, {}, 'SYMBOLIC', 'TRACKED', 'DEFERRED')],
     ['argument provenance (round 24)', judgeRendererOutput(viaAssertedKey, {}, 'SYMBOLIC', 'CALL_LOCAL', 'PROPAGATED')],
     ['modelled defaults (round 25)', judgeRendererOutput(
@@ -5433,7 +5433,12 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
     ['root default provenance (round 27)', judgeRendererOutput(
       viaAssertedKey, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'MODELLED', 'NAMED', 'ABSTRACT', 'DROPPED',
     )],
-  ] as const) {
+  ] as const
+  assert.equal(
+    withoutEachEarlierFix.length, 6,
+    'all six earlier fixes must be switched off in turn, or this loop is a claim about a subset of them',
+  )
+  for (const [what, complaints] of withoutEachEarlierFix) {
     assert.ok(
       complaints.some((complaint) => complaint.includes('take the second PDF off it')),
       `THE KEY RULE IS WHAT CLOSES THIS: with ${what} switched off it is still refused, so it is not that fix `
@@ -5443,13 +5448,15 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
   // ...AND THE FIX DOES NOT UNDO ANY OF THEM. The six routes those controls are about are still
   // refused with the key rule in place — asserted here so that "keep all existing controls passing"
   // is a statement this control makes rather than one a reader has to take on trust.
-  for (const [what, mutated] of [
+  const earlierRoutes = [
     ['(L1) the runtime copy', viaRuntimeCopy],
     ['(L2) the asserted argument', viaAssertedArgument],
     ['(M) the asserted default', viaDefaultedParameter],
     ['(N) the defaulted root parameter', viaDefaultedRootParameter],
     ['(O) the asserted root default', viaAssertedRootDefault],
-  ] as const) {
+  ] as const
+  assert.equal(earlierRoutes.length, 5, 'every earlier Codex route is re-judged here, not a sample of them')
+  for (const [what, mutated] of earlierRoutes) {
     assert.ok(
       judgeRendererOutput(mutated).length > 0,
       `${what} must still be refused — demanding provenance of a key must not have loosened anything else`,
