@@ -2853,3 +2853,202 @@ test('o3d-2k5r r23 (live): a TRANSPARENT relay still cannot carry a non-ASCII pi
     await scratch.drop()
   }
 })
+
+// ---------------------------------------------------------------------------
+// o3d-2k5r r24, Codex HIGH (live) — THE UNIX SOCKET, MEASURED RATHER THAN REASONED ABOUT.
+//
+// Round 23 skipped the peer comparison over a Unix-domain socket and called the residue "a
+// hypothetical proxy that forwards startup options faithfully AND multiplexes AND is reached over
+// a Unix socket". Odyssey is that proxy — transaction pooling, Unix sockets, and client startup
+// parameters maintained across backend attachments, all documented and all on by default. There is
+// no Odyssey package for this host and no vendored build here, so what stands in for it is the
+// half that a proxy cannot change: what the BACKEND reports about its client over a Unix socket,
+// and what this process can read about its own end. Measured against the local PostgreSQL 17:
+//
+//   * the backend reports `client_addr` NULL and `client_port` -1 — the same answer a proxy on a
+//     Unix socket produces, since the proxy's own leg to the backend is also a Unix socket;
+//   * node reports NO `localPort` for the client socket either, so neither half of the comparison
+//     exists on this path;
+//   * and the non-ASCII pin ARRIVES INTACT — `current_schema()` is the U+00A0 schema and a query
+//     resolves the pinned table rather than `public`.
+//
+// That last one is the cost, and it is why this refusal is NOT the pooler refusal. Behind
+// PgBouncer nothing worked and refusing reported that. Over a Unix socket the configuration DID
+// work, and refusing it takes it away. The test below asserts that it worked before asserting that
+// it is refused, so the cost is measured rather than claimed — and then shows the way out working
+// on the same server, same schema, over TCP.
+// ---------------------------------------------------------------------------
+
+/**
+ * The same database reached over a Unix-domain socket, or `null` when this environment has no
+ * socket route this process may use.
+ *
+ * `local` lines in `pg_hba.conf` commonly use `peer`, which no password can satisfy — so the
+ * socket may only be reachable as a role other than `DATABASE_URL`'s, and `UNIX_SOCKET_DATABASE_URL`
+ * names that route where one exists. Its database name is replaced with the throwaway one, so it
+ * points at the same database the TCP legs use. Failing that, the URL's own credentials are tried
+ * over the server's socket directory: `SHOW unix_socket_directories` is superuser-only, so the two
+ * conventional locations are tried when it cannot be read.
+ */
+async function unixSocketUrlFor(scratchUrl: string): Promise<string | null> {
+  const scratchPath = new URL(scratchUrl).pathname
+  const candidates: string[] = []
+
+  const explicit = process.env.UNIX_SOCKET_DATABASE_URL
+  if (explicit) {
+    try {
+      const borrowed = new URL(explicit)
+      borrowed.pathname = scratchPath
+      candidates.push(borrowed.toString())
+    } catch {
+      // Not a URL this module could parse either, so it is not a route this test can use.
+    }
+  }
+
+  const directories: string[] = []
+  const probe = new pg.Client({ connectionString: scratchUrl, connectionTimeoutMillis: 3_000 })
+  try {
+    await probe.connect()
+    const shown = (await probe.query<{ unix_socket_directories: string }>('show unix_socket_directories')).rows[0]
+    for (const entry of String(shown?.unix_socket_directories ?? '').split(',')) {
+      const trimmed = entry.trim()
+      if (trimmed.startsWith('/')) directories.push(trimmed)
+    }
+  } catch {
+    // Superuser-only, or unreachable. Fall through to the conventional locations.
+  } finally {
+    await probe.end().catch(() => undefined)
+  }
+  for (const fallback of ['/var/run/postgresql', '/tmp']) {
+    if (!directories.includes(fallback)) directories.push(fallback)
+  }
+  // The HOSTNAME IS LEFT IN PLACE and `?host=` added beside it. libpq — and `pg` — take the socket
+  // directory from the parameter in preference to the host, and `new URL()` (which this module's
+  // own `sanitisedProbeConnectionString()` uses) rejects the credentialled empty-host spelling
+  // `postgresql://user@/db` outright, so the parameter form is the only one both ends accept.
+  for (const directory of directories) {
+    const overSocket = new URL(scratchUrl)
+    overSocket.search = ''
+    overSocket.searchParams.set('host', directory)
+    candidates.push(overSocket.toString())
+  }
+
+  for (const candidate of candidates) {
+    const client = new pg.Client({ connectionString: candidate, connectionTimeoutMillis: 3_000 })
+    try {
+      await client.connect()
+      return candidate
+    } catch {
+      // Not this one.
+    } finally {
+      await client.end().catch(() => undefined)
+    }
+  }
+  return null
+}
+
+test('o3d-2k5r r24 (live): a Unix socket carries the pin, reports NO PEER, and is refused for it', async (t) => {
+  const scratch = await openScratch(t)
+  if (!scratch) return
+  resetStartupOptionByteSafety()
+  const pools: pg.Pool[] = []
+  try {
+    const schema = 'ten\u00A0ant' // U+00A0, as in the r19/r22/r23 live tests
+    await scratch.admin.query(`CREATE SCHEMA ${'"' + schema + '"'}`)
+    await scratch.admin.query(`CREATE TABLE ${'"' + schema + '"'}.marker (v text)`)
+    await scratch.admin.query(`INSERT INTO ${'"' + schema + '"'}.marker VALUES ('tenant')`)
+    await scratch.admin.query('CREATE TABLE public.marker (v text)')
+    await scratch.admin.query("INSERT INTO public.marker VALUES ('public')")
+
+    const socketBase = await unixSocketUrlFor(scratch.url)
+    if (!socketBase) {
+      t.skip('no usable Unix-socket route to this server (pg_hba `local` lines are commonly `peer`); set UNIX_SOCKET_DATABASE_URL to one')
+      return
+    }
+    const pin = `-c search_path=${'"' + schema + '"'}`
+
+    // 1. THE COST, MEASURED BEFORE IT IS PAID. Over the socket this configuration WORKS: the
+    // startup option arrives, the session is on the non-ASCII schema, and an unqualified name
+    // resolves there rather than in `public`. Unlike the pooler case — where the pin never arrived
+    // and refusing reported a configuration that was already broken — refusing this one takes away
+    // something that ran. That is stated here as an assertion so it cannot quietly stop being true.
+    const direct = new pg.Client({ connectionString: socketBase, options: pin, connectionTimeoutMillis: 3_000 })
+    await direct.connect()
+    try {
+      assert.equal(
+        (await direct.query<{ s: string }>('select current_schema() as s')).rows[0]?.s,
+        schema,
+        'PRECONDITION: over a Unix socket the non-ASCII pin arrives intact',
+      )
+      assert.equal(
+        (await direct.query<{ v: string }>('select v from marker')).rows[0]?.v,
+        'tenant',
+        'and an unqualified name resolves in the pinned schema, not public',
+      )
+      const seen = (await direct.query<{ a: string, p: string }>(
+        "select coalesce((select host(client_addr) from pg_stat_activity where pid = pg_backend_pid()), '') as a, " +
+        "coalesce((select client_port::text from pg_stat_activity where pid = pg_backend_pid()), '') as p",
+      )).rows[0]
+      // WHY THE COMPARISON HAS NO ANSWER HERE, from both ends rather than from one.
+      assert.equal(seen?.p, '-1', 'the backend reports no client port — which is also what a proxy on a Unix socket reports')
+      assert.equal(seen?.a, '', 'and no client address')
+      assert.equal(
+        (direct as unknown as { connection?: { stream?: { localPort?: number } } }).connection?.stream?.localPort,
+        undefined,
+        'and this process has no local port of its own to compare against either',
+      )
+    } finally {
+      await direct.end().catch(() => undefined)
+    }
+
+    // 2. AND IT IS REFUSED ANYWAY, at the probe — one message, at boot, in preflight:production and
+    // in the pre-deploy check, rather than an opaque per-connection error later.
+    //
+    // MUTATION ROUTE: restore r23's `if (backendSees.port === '' || backendSees.port === '-1')
+    // return null` early return in interposedPeerRefusal(). This verdict settles established and
+    // carries TRUE — every other leg passes, because the pin really does arrive — and
+    // pgConnectionConfig() below stops throwing. That is the shipped r23 behaviour and the finding.
+    const socketUrl = (() => {
+      const withSchema = new URL(socketBase)
+      withSchema.searchParams.set('schema', schema)
+      return withSchema.toString()
+    })()
+    const verdict = await establishStartupOptionByteSafety(socketUrl)
+    assert.equal(verdict.established, false, 'no licence is granted where directness cannot be shown')
+    assert.equal(verdict.carries, false)
+    assert.match(verdict.reason, /does not reach the backend directly/)
+    assert.match(verdict.reason, /reports no client peer/)
+    assert.match(verdict.reason, /Odyssey/, 'and it names the topology it cannot be told apart from')
+    assert.throws(() => pgConnectionConfig(socketUrl), DatabaseUrlSchemaConflictError)
+
+    // 3. AND THE WAY OUT IS NOT A SUGGESTION: the SAME server, the SAME database, the SAME schema,
+    // over TCP — admitted through a real pool, landing on the pinned schema. Without this the test
+    // above would pass on a guard that strands every deployment rather than one that redirects it.
+    //
+    // MUTATION ROUTE: make interposedPeerRefusal() refuse whenever `ours` and `backendSees` are
+    // both present. This leg then fails and the refusal is revealed as a blanket denial.
+    resetStartupOptionByteSafety()
+    const tcpUrl = `${scratch.url}?schema=${encodeURIComponent(schema)}`
+    const tcpVerdict = await establishStartupOptionByteSafety(tcpUrl)
+    assert.equal(tcpVerdict.established, true, 'over TCP the peer comparison has both halves and can be made')
+    assert.equal(tcpVerdict.carries, true, 'and this server carries the byte')
+    const config = pgConnectionConfig(tcpUrl)
+    assert.equal(typeof config.onConnect, 'function', 'PRECONDITION: the licensed pin still carries a per-connection guard')
+    const admitted = new pg.Pool({ ...config, max: 1, connectionTimeoutMillis: 3_000 })
+    pools.push(admitted)
+    const client = await admitted.connect()
+    try {
+      assert.equal(
+        (await client.query<{ v: string }>('select v from marker')).rows[0]?.v,
+        'tenant',
+        'the TCP route is admitted and lands on the same schema the socket route was refused for',
+      )
+    } finally {
+      client.release()
+    }
+  } finally {
+    resetStartupOptionByteSafety()
+    for (const pool of pools) await pool.end().catch(() => undefined)
+    await scratch.drop()
+  }
+})
