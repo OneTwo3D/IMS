@@ -2295,23 +2295,45 @@ function constantText(node: ts.Expression, bindings: ReadonlyMap<string, string>
 /**
  * Every module-level `const` in the file that holds a string a reader could have typed.
  *
- * Iterated to a fixed point so a constant built out of earlier constants resolves too — one pass
- * would leave exactly the two-hop form open, which is the mutation the control below runs.
+ * A GENUINE FIXED POINT (round 20, Codex MEDIUM). What stood here hard-capped the resolution at
+ * FIVE passes under a comment that called it a fixed point, and the two are not the same claim: a
+ * sentence split across two halves and routed through forward-reference chains six hops long stays
+ * unresolved, no intermediate literal holds the distinctive fragment, and `handWrittenDirectionProse`
+ * reports nothing while the byte-identical sentence ships. A comment asserting a property the code
+ * does not have is the exact defect class this whole branch exists to remove, so the cap is gone
+ * rather than the comment.
+ *
+ * THE BOUND IS THE NUMBER OF DECLARATIONS, and it is a real bound rather than a guess: `bindings`
+ * only ever grows, an already-bound name is never recomputed, so a pass either binds at least one
+ * NEW name or binds none — and a pass that binds none ends the loop. At most one productive pass per
+ * declaration can therefore run, plus the unproductive one that stops it.
+ *
+ * CYCLES TERMINATE BY THAT SAME PROPERTY rather than by a cap. `const A = B + '!'; const B = A`
+ * binds nothing on its first pass, so the loop ends there and both names stay UNBOUND — which is the
+ * fail-closed answer: `constantText` returns null for them, and a run containing one breaks rather
+ * than being bridged across a value nobody can evaluate.
  */
 function constantStringBindings(sourceFile: ts.SourceFile): Map<string, string> {
-  const bindings = new Map<string, string>()
-  for (let pass = 0; pass < 5; pass++) {
-    const before = bindings.size
-    for (const statement of sourceFile.statements) {
-      if (!ts.isVariableStatement(statement)) continue
-      if (!(statement.declarationList.flags & ts.NodeFlags.Const)) continue
-      for (const declaration of statement.declarationList.declarations) {
-        if (!ts.isIdentifier(declaration.name) || !declaration.initializer) continue
-        const text = constantText(declaration.initializer, bindings)
-        if (text !== null) bindings.set(declaration.name.text, text)
-      }
+  const declarations: Array<{ name: string; initializer: ts.Expression }> = []
+  for (const statement of sourceFile.statements) {
+    if (!ts.isVariableStatement(statement)) continue
+    if (!(statement.declarationList.flags & ts.NodeFlags.Const)) continue
+    for (const declaration of statement.declarationList.declarations) {
+      if (!ts.isIdentifier(declaration.name) || !declaration.initializer) continue
+      declarations.push({ name: declaration.name.text, initializer: declaration.initializer })
     }
-    if (bindings.size === before) break
+  }
+  const bindings = new Map<string, string>()
+  for (let pass = 0; pass <= declarations.length; pass++) {
+    const before = bindings.size
+    for (const { name, initializer } of declarations) {
+      // Never recomputed once bound: that is what makes "a productive pass binds a NEW name" true,
+      // and with it the bound above.
+      if (bindings.has(name)) continue
+      const text = constantText(initializer, bindings)
+      if (text !== null) bindings.set(name, text)
+    }
+    if (bindings.size === before) return bindings
   }
   return bindings
 }
@@ -2577,6 +2599,40 @@ test('ROUND 19 (Codex HIGH): no direction prose is written down, and SPLITTING T
     'a constant assembled from constants declared after it must still resolve, or the two-hop form is the '
     + 'next way through',
   )
+  // ROUND 20 (Codex MEDIUM): AND A CHAIN LONGER THAN THE OLD FIVE-PASS CAP, ON BOTH HALVES. The cap
+  // was written under a comment claiming fixed-point behaviour; six hops on each half is the shape
+  // that comment was wrong about, and nothing else here would have noticed — no intermediate literal
+  // holds the distinctive fragment, so `handWrittenDirectionProse` simply reported nothing while the
+  // sentence shipped byte-identical and the corpus closure stripped it as reviewed prose.
+  const chain = (name: string, value: string, hops: number): string => {
+    // Every link declared BEFORE the one it names, so one pass in source order resolves exactly one
+    // hop and the chain costs `hops + 1` passes. That is the only layout the cap was wrong about:
+    // a chain written the other way round resolves in a single pass however long it is.
+    const lines = [`const ${name} = ${name}_0\n`]
+    for (let hop = 0; hop < hops; hop++) {
+      lines.push(hop === hops - 1 ? `const ${name}_${hop} = '${value}'\n` : `const ${name}_${hop} = ${name}_${hop + 1}\n`)
+    }
+    return lines.join('')
+  }
+  const deepChain = chain('HEAD', escalation.slice(0, cut), 6)
+    + chain('TAIL', escalation.slice(cut), 6)
+    + 'const message = HEAD + TAIL\n'
+  assert.deepEqual(
+    handWrittenDirectionProse(deepChain).length, 1,
+    'THE CODEX MEDIUM: six forward-reference hops on each half of the sentence. The five-pass cap left '
+    + 'both halves unresolved, so the concatenation resolved to nothing and the hand-written sentence '
+    + 'was reported as composed',
+  )
+
+  // AND A CYCLE STILL TERMINATES, WITHOUT RESOLVING ANYTHING. The bound is the number of
+  // declarations, so an unresolvable self-reference must end the loop by binding nothing rather than
+  // by running out of passes — and must leave the names unbound, which is the fail-closed answer.
+  const cyclic = "const A = B + ' tail'\nconst B = A\nconst message = 'prefix ' + A\n"
+  assert.deepEqual(
+    handWrittenDirectionProse(cyclic), [],
+    'a cyclic binding resolves to nothing and reports nothing, rather than spinning or being bridged',
+  )
+
   // ...while a genuine composition point is still not a hand-written sentence: an identifier the
   // resolver cannot evaluate must break the run rather than be bridged.
   const unresolvable = 'const message = prefix + renderLocalDirection(d, ctx) + suffix\n'
@@ -2898,30 +2954,110 @@ test('ROUND 20 (Codex HIGH): every string the renderer emits is one written out 
 })
 
 /**
- * Every string literal the renderer's own code can put into its return value.
+ * WHAT THE RENDERER CAN EMIT, AND WHAT THIS WALK REFUSES TO GUESS AT (round 20 follow-up, Codex
+ * HIGH).
  *
- * Walked from the two exported renderers, following identifiers into the module-level declarations
- * they name, so a sentence parked in a helper or a constant is read as the renderer's prose. What is
- * SKIPPED is the literal that selects a branch rather than being emitted by one: a `case` label, an
- * operand of `===`/`!==`, a literal type, a property name. Those choose a sentence; they are not one.
+ * WHAT WAS HERE INDEXED ONLY MODULE-LEVEL FUNCTION AND VARIABLE DECLARATIONS, BY NAME, and followed
+ * identifiers through that map alone. Every other way of reaching a string was therefore INVISIBLE
+ * and — this is the half that carried five rounds of findings — SILENT: an identifier the map did
+ * not hold was simply dropped, and the walk reported a clean inventory. A renderer branch calling a
+ * STATIC CLASS METHOD, or an IMPORTED HELPER, could return a destructive sentence and both round-20
+ * checks passed: exact equality only executes the fourteen DECLARED directions with the placeholder
+ * context, so a type-valid but unenumerated direction (a READ with an empty `read` array, say)
+ * reaches a branch nothing ever renders.
+ *
+ * SO IDENTIFIERS ARE RESOLVED THROUGH TYPESCRIPT SYMBOLS, over a real `ts.Program` rather than a
+ * lone `ts.createSourceFile`. Whatever a name binds to — a class, a static or instance method, an
+ * enum, an object literal's property, a helper in another module reached through an import alias —
+ * the checker names its declaration and the walk goes into it. There is no syntax-form list left to
+ * be incomplete.
+ *
+ * AND IT FAILS CLOSED, WHICH IS THE IMPORTANT HALF. Anything whose output cannot be statically
+ * resolved is an OFFENCE, not a gap:
+ *
+ *   • a call whose callee is not a name at all — `(cond ? a : b)()`, `table[key]()`, `f()()` — is
+ *     refused, because there is no declaration to read;
+ *   • a name that resolves to no symbol, or to a symbol with no declaration, is refused.
+ *
+ * The branch already applies exactly this rule elsewhere (an unresolved predicate is an offence, an
+ * unknown status fences), and the reason it has to apply here is that the alternative is the shape
+ * every previous version of this walk had: complete over the forms it knew, silent about the rest.
+ *
+ * WHAT IS NOT AN OFFENCE, and why. A declaration in a `.d.ts` — `Array.prototype.join`,
+ * `String.prototype.toUpperCase` — is a BUILT-IN: it holds no project prose, and its output is a
+ * function of a receiver and arguments this walk reads on its way past. And a TYPE emits no value at
+ * all, so type nodes, type aliases and interfaces are not descended into: their string LITERAL TYPES
+ * choose a branch rather than being one, which is the same distinction `selectsABranch` draws.
  */
-function rendererEmittedLiterals(sourceText: string): string[] {
-  const sourceFile = ts.createSourceFile('model.ts', sourceText, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
-  const declarations = new Map<string, ts.Node>()
-  for (const statement of sourceFile.statements) {
-    if (ts.isFunctionDeclaration(statement) && statement.name) declarations.set(statement.name.text, statement)
-    if (ts.isVariableStatement(statement)) {
-      for (const declaration of statement.declarationList.declarations) {
-        if (ts.isIdentifier(declaration.name)) declarations.set(declaration.name.text, declaration)
-      }
-    }
+type RendererLiteralScan = {
+  /** Every string literal the renderer's own code can put into its return value. */
+  literals: string[]
+  /** Every point at which this walk could not say what would be emitted. Must be empty. */
+  unresolved: string[]
+}
+
+/** Reused across programs so the default library is parsed once rather than per scan. */
+const LIB_SOURCE_CACHE = new Map<string, ts.SourceFile | undefined>()
+
+/**
+ * Build a program over the direction model — as given, so a mutated copy can be scanned without
+ * writing it to disk — plus any extra modules a control declares.
+ */
+function directionModelProgram(model: string, extraFiles: Record<string, string>): ts.Program {
+  const modelPath = path.resolve(process.cwd(), DIRECTION_MODEL_FILE)
+  const overlay = new Map<string, string>([[modelPath, model]])
+  for (const [name, text] of Object.entries(extraFiles)) overlay.set(path.resolve(process.cwd(), name), text)
+  const options: ts.CompilerOptions = {
+    target: ts.ScriptTarget.ES2022,
+    module: ts.ModuleKind.ESNext,
+    moduleResolution: ts.ModuleResolutionKind.Bundler,
+    strict: true,
+    noEmit: true,
+    skipLibCheck: true,
+    noResolve: false,
   }
+  const host = ts.createCompilerHost(options, true)
+  const readOverlay = (fileName: string) => overlay.get(path.resolve(fileName))
+  const baseGetSourceFile = host.getSourceFile.bind(host)
+  const baseFileExists = host.fileExists.bind(host)
+  const baseReadFile = host.readFile.bind(host)
+  host.getSourceFile = (fileName, languageVersion, onError, shouldCreate) => {
+    const text = readOverlay(fileName)
+    if (text !== undefined) return ts.createSourceFile(fileName, text, languageVersion, true, ts.ScriptKind.TS)
+    if (!LIB_SOURCE_CACHE.has(fileName)) {
+      LIB_SOURCE_CACHE.set(fileName, baseGetSourceFile(fileName, languageVersion, onError, shouldCreate))
+    }
+    return LIB_SOURCE_CACHE.get(fileName)
+  }
+  host.fileExists = (fileName) => readOverlay(fileName) !== undefined || baseFileExists(fileName)
+  host.readFile = (fileName) => readOverlay(fileName) ?? baseReadFile(fileName)
+  return ts.createProgram([...overlay.keys()], options, host)
+}
+
+function scanRendererOutput(model: string, extraFiles: Record<string, string> = {}): RendererLiteralScan {
+  const program = directionModelProgram(model, extraFiles)
+  const checker = program.getTypeChecker()
+  const modelPath = path.resolve(process.cwd(), DIRECTION_MODEL_FILE)
+  const modelFile = program.getSourceFiles().find((file) => path.resolve(file.fileName) === modelPath)
+  assert.ok(modelFile, 'the direction model must be in the program, or this walk reads nothing')
+
+  const literals: string[] = []
+  const unresolved: string[] = []
+  const walked = new Set<ts.Node>()
+
+  /**
+   * A literal that SELECTS a branch rather than being emitted by one: a `case` label, an operand of
+   * an equality comparison, a literal type, a property NAME. Those choose a sentence; they are not
+   * one.
+   */
   const selectsABranch = (node: ts.Node): boolean => {
     const parent = node.parent as ts.Node | undefined
     if (!parent) return false
     if (ts.isCaseClause(parent)) return true
     if (ts.isLiteralTypeNode(parent)) return true
     if (ts.isPropertyAssignment(parent) && parent.name === node) return true
+    if (ts.isPropertySignature(parent) && parent.name === node) return true
+    if (ts.isElementAccessExpression(parent) && parent.argumentExpression === node) return true
     if (ts.isBinaryExpression(parent)) {
       const kind = parent.operatorToken.kind
       return kind === ts.SyntaxKind.EqualsEqualsEqualsToken || kind === ts.SyntaxKind.ExclamationEqualsEqualsToken
@@ -2929,9 +3065,46 @@ function rendererEmittedLiterals(sourceText: string): string[] {
     }
     return false
   }
-  const literals: string[] = []
-  const walked = new Set<string>()
-  const walk = (node: ts.Node): void => {
+
+  const where = (node: ts.Node): string => {
+    const file = node.getSourceFile()
+    const { line } = file.getLineAndCharacterOfPosition(node.getStart(file))
+    return `${path.relative(process.cwd(), file.fileName)}:${line + 1}`
+  }
+
+  /** Resolve a name to its declarations and walk them. Anything unresolvable is an offence. */
+  const follow = (name: ts.Node): void => {
+    if (!ts.isIdentifier(name)) {
+      unresolved.push(`${where(name)}: a ${ts.SyntaxKind[name.kind]} member name cannot be resolved to a declaration`)
+      return
+    }
+    let symbol = checker.getSymbolAtLocation(name)
+    if (symbol && (symbol.flags & ts.SymbolFlags.Alias) !== 0) {
+      const aliased = checker.getAliasedSymbol(symbol)
+      if (aliased) symbol = aliased
+    }
+    if (!symbol) {
+      unresolved.push(`${where(name)}: "${name.text}" resolves to no symbol, so what it contributes is unknown`)
+      return
+    }
+    const declarations = symbol.declarations ?? []
+    if (declarations.length === 0) {
+      unresolved.push(`${where(name)}: "${name.text}" has no declaration, so what it contributes is unknown`)
+      return
+    }
+    for (const declaration of declarations) {
+      // A BUILT-IN. Its output is a function of the receiver and arguments this walk reads on its
+      // way past, and it holds no project prose of its own.
+      if (declaration.getSourceFile().isDeclarationFile) continue
+      if (walked.has(declaration)) continue
+      walked.add(declaration)
+      walk(declaration)
+    }
+  }
+
+  function walk(node: ts.Node): void {
+    // A TYPE EMITS NO VALUE. Its string literals are literal TYPES, which select rather than say.
+    if (ts.isTypeNode(node) || ts.isTypeAliasDeclaration(node) || ts.isInterfaceDeclaration(node)) return
     if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) {
       if (node.text && !selectsABranch(node)) literals.push(node.text)
       return
@@ -2944,23 +3117,41 @@ function rendererEmittedLiterals(sourceText: string): string[] {
       }
       return
     }
-    if (ts.isIdentifier(node)) {
-      const declaration = declarations.get(node.text)
-      if (declaration && !walked.has(node.text)) {
-        walked.add(node.text)
-        walk(declaration)
+    if (ts.isPropertyAccessExpression(node)) {
+      walk(node.expression)
+      follow(node.name)
+      return
+    }
+    if (ts.isCallExpression(node) || ts.isNewExpression(node)) {
+      const callee = node.expression
+      if (!ts.isIdentifier(callee) && !ts.isPropertyAccessExpression(callee)) {
+        // FAIL CLOSED. There is no name here to resolve, so nothing can say what this returns.
+        unresolved.push(`${where(node)}: a call through a ${ts.SyntaxKind[callee.kind]} cannot be `
+          + 'resolved to a declaration, so what it emits is unknown')
       }
+      walk(callee)
+      for (const argument of node.arguments ?? []) walk(argument)
+      return
+    }
+    if (ts.isIdentifier(node)) {
+      follow(node)
       return
     }
     ts.forEachChild(node, walk)
   }
+
+  const exported = checker.getExportsOfModule(checker.getSymbolAtLocation(modelFile)!)
   for (const root of ['renderLocalDirection', 'renderLocalDirectionSequence']) {
-    const declaration = declarations.get(root)
-    assert.ok(declaration, `${root} must be a module-level declaration, or this walk reads nothing`)
-    walked.add(root)
-    walk(declaration!)
+    const symbol = exported.find((candidate) => candidate.name === root)
+    assert.ok(symbol, `${root} must be exported from the direction model, or this walk reads nothing`)
+    const declarations = symbol!.declarations ?? []
+    assert.ok(declarations.length > 0, `${root} must have a declaration, or this walk reads nothing`)
+    for (const declaration of declarations) {
+      walked.add(declaration)
+      walk(declaration)
+    }
   }
-  return literals
+  return { literals, unresolved }
 }
 
 test('ROUND 20 (Codex HIGH): the inventory is kept in step — no renderer literal escapes it', async () => {
@@ -2969,41 +3160,115 @@ test('ROUND 20 (Codex HIGH): the inventory is kept in step — no renderer liter
   // including a parameter combination the inventory does not declare and a sentence parked in a
   // helper. Every literal the renderer can emit must already read inside a reviewed sentence.
   //
-  // Route: the AST of lib/domain/accounting/local-operator-direction.ts, walked from the two
-  // exported renderers through the module-level declarations they name.
+  // Route: a ts.Program over lib/domain/accounting/local-operator-direction.ts, walked from the two
+  // exported renderers with every identifier resolved THROUGH THE TYPE CHECKER — so a class, a
+  // static method, an object property or a helper in another module is followed just as a
+  // module-level function is, and anything unresolvable is an offence rather than a gap.
   //
-  // Mutation: add a sentence to ANY branch — reachable or not — and it fails naming the literal.
-  // Controls below run both a reachable and an unreachable one.
+  // Mutation: add a sentence to ANY branch — reachable or not, in this module or one it imports —
+  // and it fails naming the literal. Controls below run five of them.
   const model = await readFile(path.join(process.cwd(), DIRECTION_MODEL_FILE), 'utf8')
-  const literals = rendererEmittedLiterals(model)
-  assert.ok(literals.length > 20, `only ${literals.length} literals were read — the walk found nothing`)
+  const scan = scanRendererOutput(model)
+  assert.ok(scan.literals.length > 20, `only ${scan.literals.length} literals were read — the walk found nothing`)
+
+  assert.deepEqual(
+    scan.unresolved, [],
+    'THE FAIL-CLOSED HALF: the renderer reaches a value this walk cannot statically resolve, so what it '
+    + 'emits there is unknown — and an unknown is not an absence. Every previous version of this walk was '
+    + 'complete over the shapes it knew and SILENT about the rest, which is what carried five rounds of '
+    + 'findings. Make the call resolvable, or take it out of the renderer',
+  )
 
   const reviewed = LOCAL_DIRECTION_SPANS
-  const escaped = literals.filter((literal) => !reviewed.some((span) => span.includes(literal)))
+  const escaped = scan.literals.filter((literal) => !reviewed.some((span) => span.includes(literal)))
   assert.deepEqual(
     escaped, [],
     'the renderer can emit prose that appears in no reviewed sentence. Write the sentence it produces into '
     + 'RENDERED_DIRECTIONS, where somebody reads it, or take it out of the renderer',
   )
 
-  // NON-VACUITY, both ways.
+  /** A mutated model must be reported as emitting prose no reviewed sentence holds. */
+  const escapes = (mutated: string, extra: Record<string, string> = {}): boolean => {
+    const result = scanRendererOutput(mutated, extra)
+    assert.deepEqual(result.unresolved, [], 'this control is about the literal, not about resolvability')
+    return result.literals.some((literal) => !reviewed.some((span) => span.includes(literal)))
+  }
+
+  // NON-VACUITY (1) and (2): the shapes the round-20 walk already caught.
   const reachable = model.replace(
     "return `ESCALATE sync row ${context.syncRowId}, with this record, ${administrator}`",
     "return `ESCALATE sync row ${context.syncRowId}, with this record, ${administrator}. " + UNDECLARED_REMOTE_ACTION + "`",
   )
   assert.notEqual(reachable, model, 'the reachable-branch mutation must actually have been applied')
-  assert.ok(
-    rendererEmittedLiterals(reachable).some((literal) => !reviewed.some((span) => span.includes(literal))),
-    'CONTROL: the sentence appended to the ESCALATE branch is reported as prose no reviewed sentence holds',
-  )
+  assert.ok(escapes(reachable), 'CONTROL: the sentence appended to the ESCALATE branch is reported as prose no reviewed sentence holds')
+
   const unreachable = model.replace(
     "case 'CONFIRM':",
     "case 'CONFIRM':\n      if (context.ledger === 'never') return '" + UNDECLARED_REMOTE_ACTION + "'",
   )
   assert.notEqual(unreachable, model, 'the unreachable-branch mutation must actually have been applied')
-  assert.ok(
-    rendererEmittedLiterals(unreachable).some((literal) => !reviewed.some((span) => span.includes(literal))),
-    'CONTROL: and so is one on a branch no declared direction reaches, which exact equality alone cannot see',
-  )
-})
+  assert.ok(escapes(unreachable), 'CONTROL: and so is one on a branch no declared direction reaches, which exact equality alone cannot see')
 
+  // (3) THE CODEX ROUTE, VERBATIM: a static method on a module-level class, called from a
+  // type-valid but UNENUMERATED direction. The old walk indexed function and variable declarations
+  // only, so `RemoteInstruction` resolved to nothing and the branch was read as emitting nothing;
+  // exact equality never renders that direction, because LOCAL_DIRECTIONS does not contain it.
+  const viaStaticMethod = model.replace(
+    "    case 'READ':\n      return `Read them by ${andList(direction.read)}`",
+    "    case 'READ':\n"
+    + "      if (direction.read.length === 0) return RemoteInstruction.render()\n"
+    + "      return `Read them by ${andList(direction.read)}`",
+  ).replace(
+    'function andList(',
+    "class RemoteInstruction {\n"
+    + "  static render(): string {\n"
+    + "    return '" + UNDECLARED_REMOTE_ACTION + "'\n"
+    + "  }\n"
+    + "}\n\nfunction andList(",
+  )
+  assert.notEqual(viaStaticMethod, model, 'the static-method mutation must actually have been applied')
+  assert.ok(
+    escapes(viaStaticMethod),
+    'CONTROL, THE CODEX ROUTE: a destructive sentence stored in a static class method, returned from a '
+    + 'type-valid direction the inventory does not enumerate. Resolving identifiers through symbols is what '
+    + 'reaches it; the declaration-kind index that stood here could not',
+  )
+
+  // (4) THE OTHER HALF OF THE ROUTE: an IMPORTED helper. Nothing about the importing module says
+  // what it returns, so a walk confined to one source file reads the call and moves on.
+  const helperPath = 'lib/domain/accounting/__scan-control-remote-helper.ts'
+  const viaImportedHelper = "import { remoteRemediation } from './__scan-control-remote-helper'\n"
+    + model.replace(
+      "    case 'RE_READ':\n      return 'so re-run the query rather than treating one result as the final list'",
+      "    case 'RE_READ':\n"
+      + "      if (context.ledger === 'never') return remoteRemediation()\n"
+      + "      return 'so re-run the query rather than treating one result as the final list'",
+    )
+  assert.notEqual(viaImportedHelper, model, 'the imported-helper mutation must actually have been applied')
+  assert.ok(
+    escapes(viaImportedHelper, {
+      [helperPath]: "export function remoteRemediation(): string {\n  return '" + UNDECLARED_REMOTE_ACTION + "'\n}\n",
+    }),
+    'CONTROL: and a helper in ANOTHER MODULE, reached through an import alias, is followed to its own '
+    + 'declaration — a walk over one source file could only ever have dropped it',
+  )
+
+  // (5) FAIL CLOSED ON WHAT CANNOT BE RESOLVED AT ALL. A call through a value rather than a name has
+  // no declaration to read, and the only honest answer is a FAILURE. This is the half that makes the
+  // four controls above a property rather than a list of the shapes somebody thought of: the next
+  // shape nobody thought of arrives here instead of passing in silence.
+  const viaUnresolvableCall = model.replace(
+    "    case 'RE_READ':\n      return 'so re-run the query rather than treating one result as the final list'",
+    "    case 'RE_READ':\n"
+    + "      return (context.ledger === 'never' ? andList : andList)([context.ledger])\n",
+  )
+  assert.notEqual(viaUnresolvableCall, model, 'the unresolvable-call mutation must actually have been applied')
+  const unresolvableScan = scanRendererOutput(viaUnresolvableCall)
+  assert.equal(
+    unresolvableScan.unresolved.length, 1,
+    'CONTROL: a call through an expression rather than a name is REFUSED, not skipped. It emits nothing '
+    + 'this walk can read, and an unknown must be a failure — that silence is what every earlier round of '
+    + `this finding turned on. Saw: ${JSON.stringify(unresolvableScan.unresolved)}`,
+  )
+  assert.match(unresolvableScan.unresolved[0], /cannot be .*resolved to a declaration/)
+})
