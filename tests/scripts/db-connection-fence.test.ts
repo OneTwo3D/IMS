@@ -2491,10 +2491,16 @@ test('o3d-2sm1.5 r21: a unit that can define DATABASE_URL anywhere but that file
   // Environment/PassEnvironment/UnsetEnvironment loop, the `loads_our_file` comparison, the
   // LoadState check or the count-versus-elements check. That fixture's expectation flips from
   // REFUSE to SOLE, and the deploy proceeds to fence, migrate and release one database while the
-  // restarted application connects to another. Two named mutations of the r20 reader it replaces:
-  // matching UnsetEnvironment with `case " ${value} " in *' DATABASE_URL '*` passes the
-  // assignment-form fixture, and taking the environment file as `${line%% (ignore_errors=*}` off
-  // one text line passes the two-file fixture.
+  // restarted application connects to another. THREE OF THOSE WERE RUN, each failing on the one
+  // fixture named for it and on nothing else:
+  //
+  //   * delete the `count -gt 1` refusal            -> 'a SECOND environment file' becomes SOLE;
+  //   * delete the `-n "$pam_name"` refusal         -> 'PAMName= brings a whole environment
+  //                                                    source with it' becomes SOLE;
+  //   * match UnsetEnvironment on the bare token only, which is what the r20 reader did
+  //     (`[[ "$element" == "DATABASE_URL" ]]` for that property alone, the other two left as
+  //     they are) -> 'UnsetEnvironment= removes it in the ASSIGNMENT form' becomes SOLE while the
+  //     bare-name fixture still refuses.
   const dir = mkdtempSync(join(tmpdir(), 'ims-systemd-'))
   try {
     writeFileSync(
@@ -2530,7 +2536,7 @@ test('o3d-2sm1.5 r21: a unit that can define DATABASE_URL anywhere but that file
 
       function ask(unit: SystemdUnit, argv: [string, string] = ['/opt/app/.env', 'one-two-inventory.service']): string {
         const properties = { ...SOLE_UNIT, ...unit }
-        const env: Record<string, string> = { ...process.env as Record<string, string>, PATH: `${dir}:${process.env.PATH ?? ''}` }
+        const env: NodeJS.ProcessEnv = { ...process.env, PATH: `${dir}:${process.env.PATH ?? ''}` }
         for (const [key, value] of Object.entries(properties)) env[`FAKE_${key}`] = value
         const run = spawnSync('bash', ['-c', bash, 'ask', ...argv], { encoding: 'utf8', env })
         assert.equal(run.status, 0, run.stderr)
