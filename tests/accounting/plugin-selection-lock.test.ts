@@ -1039,6 +1039,12 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   // Both connections are SANITISED (the URL with `?options=` and `?schema=` removed and no
   // `options` beside it), it runs two reads and no write, and it touches no application table.
   'lib/db/database-url-schema.mjs': 'compatibility-probe',
+  // o3d-2k5r r25 / o3d-a5zz. THE factory the three lock pools and the restore lock client now build
+  // through, so the proof that a session-lock connection reaches the backend directly is a property
+  // of one function rather than of four call sites. It constructs a `pg` Pool/Client and issues no
+  // statement of its own: the one query the connection makes before it is handed out is the peer
+  // read in `database-url-schema.mjs`, over `pg_stat_activity` for its own pid.
+  'lib/db/session-lock-pool.ts': 'pinned-lock-session',
   'lib/db/pinned-advisory-lock.ts': 'pinned-lock-session',
   'lib/connectors/xero/payment-write-lock.ts': 'pinned-lock-session',
   'lib/domain/wms/dispatch-sweep-lock.ts': 'pinned-lock-session',
