@@ -904,6 +904,78 @@ That hazard scan found a real one on its first run: two `die` messages contained
 `` `systemctl start` ``, inside double quotes, which bash **executes** while composing the text.
 Both are now escaped.
 
+**r28: `Environment=PORT=` is a directive, and a directive is not the composed environment.** r27
+read the unit's `Environment=PORT=` and called it authoritative. In the same file, four hundred
+lines above, `DATABASE_URL` had already established why that is not enough: systemd applies
+`EnvironmentFile=` **after** `Environment=`, a `zz-` drop-in's `EnvironmentFile=` lands last of
+all, `UnsetEnvironment=` is applied as the final composition step, and a PAM stack under
+`PAMName=` runs later still. A unit with `Environment=PORT=3000`, an `EnvironmentFile=-` naming
+the application's own dotenv file and no CLI flag binds whatever `PORT` **the application writes
+into that file** — and the `APP_PORT` cross-check cannot see it, because the name in the file
+would be `PORT` and not `APP_PORT`. The doctrine had been written for one variable and applied to
+one variable.
+
+So there is now **one mechanism, told which variable to ask about**. The sole-source scan takes
+the variable name and the **layer** that is allowed to answer for it:
+
+* `file` — the environment file named is the only permitted definition, and an `Environment=`
+  directive competes with it. This is how the connection identity asks, unchanged;
+* `directive` — the unit's own `Environment=` is the permitted definition and **no environment
+  file may be loaded at all**, because every one of them is composed later and none of them is
+  read (reading one would put the precedence question straight back). This is how the port asks.
+
+On the installed unit that means a port pinned **only** in `Environment=` is refused outright,
+naming the file that could move it: the unit loads `APP_DIR/.env`. `install.sh` writes the port
+literally into `ExecStart=` (`next start -p <port>`), which is the one pin nothing composed later
+can reach, so a supported installation is unaffected. Verified read-only against this host's real
+units: `ims-stage-dev.service` and `ims-e2e-dev.service` both pin `Environment=PORT=` **and** load
+an `EnvironmentFile=-` with `ignore_errors=yes`, and both still resolve — to 3000 and 3002 — from
+their `ExecStart=` flags. With the flag removed, both would now be refused, which is the correct
+answer for them. Nothing else in the three entrypoints reads `Environment=`: `deploy.sh` takes its
+port from `IMS_PORT` on the root invocation and `install.sh` writes the unit rather than reading
+one, so `PORT` was the only value read from a directive with the old assumption.
+
+**r28: deleting `.env` bypassed fence adoption too.** The `APP_DIR`/`.env` existence-and-shape
+refusal was the same misplaced-refusal shape r27 had just moved for the port, two lines above it:
+`[[ -f "${APP_DIR}/.env" ]] || die` ran during top-level initialisation — before the `EXIT` trap,
+before the cutover lock and before marker adoption — and refused on a path the **application user
+owns**. After an interrupted migration that account could delete the file, or replace it with a
+directory or a dangling symlink, and the recovery run walked out: service left stopped, reboot
+fence left standing, crontab left commented out, connection fence left un-adopted, and no trap
+installed to say any of it.
+
+The shape is now **read** where it always was, deciding nothing, and refused at a **layout gate**
+beside the port gate — after adoption has re-stopped the service, re-established and verified both
+fences and held or released the connection fence on the marker's own record. Every other fatal
+exit ahead of the adoption was re-read for the same shape and none of the rest is misplaced: the
+`Run as root` refusal is about the invocation rather than about anything the application can
+write (and a non-root run could not adopt a fence in any case), and the refusals inside the
+cutover lock and the state-directory creation are the lock itself and the directory the fence
+state lives in — without either, adoption is not possible at all, so refusing there is not
+abandoning. Everything else already sat after the adoption.
+
+**r28: a listening socket with no PID attribution is an unknown, not an absence.** The reader
+behind the socket proof was one pipeline: select the rows `ss -ltnp` prints for the port, then
+`grep -oE 'pid=[0-9]+'` them — which **silently drops** a row it cannot attribute. With
+`SO_REUSEPORT` several sockets can be bound to the same port and the kernel hands an incoming
+connection to one of them, so a box holding two — one the unit's, one a process whose owner the
+root shell cannot see — produced a pid list containing **only the trusted holder**. Every pid in
+it then verified against the unit, the proof passed, and the health request that decides the point
+of no return could have been answered by the other socket. The existing empty-list refusal never
+fired, because the list was not empty: it covered only the case where *every* row was
+unattributable. The rows are now counted, the unattributable ones counted separately, and the
+proof refuses on that count **before** it verifies any pid.
+
+**r28: the operator-message shape admitted a compound command.** The declared shape for
+operator-facing text ended in `.*`, and `.*` is not a grammar — it consumes a command separator
+and everything after it. `echo safe; dash "${APP_DIR}/.env"` classified as operator-facing text
+while executing an application-owned file **as root**, and so did
+`warn "checked" && tclsh "${APP_DIR}/.deploy-meta"`. Neither carries a hazard, because no finite
+list of interpreter names can be complete. The shape now describes **exactly one simple command**
+whose arguments are quoted strings, short options or bare variable expansions; a separator is none
+of those, and the `^…$` anchoring does the rest. All three compound cases are in the bypass list
+that must come back rejected.
+
 **What this does not protect against.** The privileged driver is still `scripts/update.sh` itself,
 run by root from wherever the operator keeps it, and `APP_DIR/.deploy-meta` still supplies the
 re-clone URL — which is data the application account already controls, used only as an argument to
