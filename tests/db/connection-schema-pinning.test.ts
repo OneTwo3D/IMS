@@ -1214,3 +1214,158 @@ test('o3d-2k5r r16 (live): the REAL server resolves a quoted-empty search path t
     await scratch.drop()
   }
 })
+
+test('o3d-2k5r r17: a terminal escape is CONSUMED, so the separator before the pin survives', () => {
+  // ROUTE: DATABASE_URL `?options=-c application_name=foo\` -> splitLibpqOptions() (the terminal
+  // escape) -> readLibpqSettings() -> pgConnectionConfig()'s `[...carried, pin].join(' ')` -> the
+  // `options` string every raw consumer opens its startup packet with.
+  //
+  // The setting is deliberately a VALID NON-`search_path` GUC. Nothing about the schema is wrong
+  // in this finding — `application_name` is carried through untouched, as this module promises to
+  // carry every setting it does not own — and that is exactly what made it dangerous: the
+  // corruption is inflicted by the JOIN, on the pin, by a token the module was not even reading.
+  //
+  // MUTATION: restore `if (escaped) current += '\\'` before the push at the end of
+  // splitLibpqOptions(). The token comes back as `application_name=foo\`, the composed value
+  // becomes `-c application_name=foo\ -c search_path="public"`, and the first assertion below
+  // fails on the emitted string. The live test that follows then measures what that string does to
+  // a real server: it does not connect at all.
+  assert.equal(
+    pgConnectionConfig(
+      `postgresql://u:p@localhost:5432/ims?schema=public&options=${encodeURIComponent('-c application_name=foo\\')}`,
+    ).options,
+    '-c application_name=foo -c search_path="public"',
+  )
+
+  // The tokenizer alone, stated as the server's own rule: the marker is consumed and NOTHING takes
+  // its place, so re-joining the tokens with a single space is once again an equivalent string.
+  assert.deepEqual(splitLibpqOptions('-c application_name=foo\\'), ['-c', 'application_name=foo'])
+
+  // AND A DOUBLED BACKSLASH IS NOT A TERMINAL ESCAPE. It is an escaped literal, the token keeps it
+  // escaped exactly as every other escaped literal in this file is kept, and the composed value
+  // still reaches the server with the backslash in the value. Without this the "fix" could have
+  // been an unconditional strip of one trailing character, which would corrupt a real trailing
+  // backslash instead — measured live below.
+  assert.deepEqual(splitLibpqOptions('-c application_name=foo\\\\'), ['-c', 'application_name=foo\\\\'])
+  assert.equal(
+    pgConnectionConfig(
+      `postgresql://u:p@localhost:5432/ims?schema=public&options=${encodeURIComponent('-c application_name=foo\\\\')}`,
+    ).options,
+    '-c application_name=foo\\\\ -c search_path="public"',
+  )
+
+  // A terminal escape that opens a token and CLOSES NOTHING is the one case with no equivalent
+  // string to return, so it is refused rather than dropped. `pg_split_opts()` emits the token
+  // EMPTY and the server rejects that argument on sight; an empty token joined ahead of the pin
+  // would be swallowed by the backend's own whitespace skip, so silently dropping it would leave
+  // this module accepting a URL the server refuses.
+  //
+  // MUTATION: delete the `escaped && current === ''` throw. Both refusals below stop throwing and
+  // pgConnectionConfig() happily emits `-c statement_timeout=5000 -c search_path="public"` for a
+  // URL whose real startup packet the server will not accept.
+  for (const options of ['\\', '-c statement_timeout=5000 \\']) {
+    assert.throws(
+      () =>
+        pgConnectionConfig(
+          `postgresql://u:p@localhost:5432/ims?schema=public&options=${encodeURIComponent(options)}`,
+        ),
+      (error: unknown) => {
+        assert.ok(error instanceof DatabaseUrlSchemaConflictError, `${JSON.stringify(options)}: a schema conflict`)
+        assert.match((error as Error).message, /escapes nothing/, `${JSON.stringify(options)}: with the reason`)
+        return true
+      },
+      `${JSON.stringify(options)}: refused rather than normalised away`,
+    )
+  }
+})
+
+test('o3d-2k5r r17 (live): the REAL server drops the terminal escape, and the composed pin reaches it', async (t) => {
+  const scratch = await openScratch(t)
+  if (!scratch) return
+  try {
+    // ROUTE, first half — THE PREMISE, measured rather than read out of the backend's source: an
+    // `options` ending in an unmatched escape is a WORKING startup value. `pg_split_opts()` ends
+    // its inner loop on the terminating NUL with `last_was_escape` still set and never writes the
+    // marker out, so the server sees `application_name=foo` and connects.
+    //
+    // This half is what decides the treatment. If the server rejected this value, refusing it here
+    // would cost nothing; because the server ACCEPTS it, refusing here would take a DATABASE_URL
+    // that connects today and make this module the reason it stopped.
+    const raw: pg.Client = new pg.Client({
+      connectionString: scratch.url,
+      options: '-c application_name=foo\\',
+      connectionTimeoutMillis: 3_000,
+    })
+    await raw.connect()
+    try {
+      assert.equal(
+        (await raw.query<{ name: string }>("select current_setting('application_name') as name")).rows[0]?.name,
+        'foo',
+        'the server accepts a terminal escape and resolves the GUC without it',
+      )
+    } finally {
+      await raw.end().catch(() => undefined)
+    }
+
+    // ROUTE, second half — THE FINDING. The same URL through the module, opened against the real
+    // server. The connection must open, the preserved GUC must still carry its server-resolved
+    // value, and current_schema() must be the PINNED schema: the pin is the thing the restored
+    // backslash used to eat.
+    //
+    // MUTATION: restore `if (escaped) current += '\\'` at the end of splitLibpqOptions(). The
+    // composed options become `-c application_name=foo\ -c search_path="tenant_a"`, which the
+    // backend retokenises as `['-c', 'application_name=foo -c', 'search_path="tenant_a"']` — a
+    // third token that is not an option at all — and connect() rejects with `invalid command-line
+    // argument for server process: search_path="tenant_a"`. This test then fails at connect(),
+    // before any assertion, which is precisely the outage the finding describes: not a
+    // mis-resolved schema but every raw consumer unable to reach the database.
+    const url = `${scratch.url}?schema=tenant_a&options=${encodeURIComponent('-c application_name=foo\\')}`
+    const pinned: pg.Client = new pg.Client({ ...pgConnectionConfig(url), connectionTimeoutMillis: 3_000 })
+    await pinned.connect()
+    try {
+      assert.equal(
+        (await pinned.query<{ name: string }>("select current_setting('application_name') as name")).rows[0]?.name,
+        'foo',
+        'the preserved setting still reaches the server, with the escape consumed',
+      )
+      assert.equal(
+        (await pinned.query<{ s: string }>('select current_schema() as s')).rows[0]?.s,
+        'tenant_a',
+        'AND the appended pin survived the join — this is the assertion the restored backslash broke',
+      )
+      await pinned.query('insert into settings (key, value, "updatedAt") values ($1, $2, now())', ['terminal', 'x'])
+      assert.deepEqual(
+        await schemasHolding(scratch.admin, 'terminal'),
+        ['tenant_a'],
+        'so the unqualified write lands in the pinned schema and nowhere else',
+      )
+    } finally {
+      await pinned.end().catch(() => undefined)
+    }
+
+    // AND THE DOUBLED BACKSLASH, live: a REAL trailing backslash in the GUC value is not a terminal
+    // escape and must survive to the server intact, with the pin still appended after it. This is
+    // what rules out "strip one trailing character" as the fix.
+    const literal: pg.Client = new pg.Client({
+      ...pgConnectionConfig(`${scratch.url}?schema=tenant_a&options=${encodeURIComponent('-c application_name=foo\\\\')}`),
+      connectionTimeoutMillis: 3_000,
+    })
+    await literal.connect()
+    try {
+      assert.equal(
+        (await literal.query<{ name: string }>("select current_setting('application_name') as name")).rows[0]?.name,
+        'foo\\',
+        'an escaped backslash is a literal one, and the server receives it',
+      )
+      assert.equal(
+        (await literal.query<{ s: string }>('select current_schema() as s')).rows[0]?.s,
+        'tenant_a',
+        'and the pin still reached the server behind it',
+      )
+    } finally {
+      await literal.end().catch(() => undefined)
+    }
+  } finally {
+    await scratch.drop()
+  }
+})
