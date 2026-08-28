@@ -502,8 +502,10 @@ to do:
 | connection-fence state | `/var/lib/one-two-inventory/deploy/db-connect-fence.json` |
 | cutover lock | `/var/lib/one-two-inventory/cutover.lock` |
 
-Set `IMS_CUTOVER_STATE_DIR` to move all four together; `IMS_DEPLOY_STATE_DIR` and
-`IMS_DATA_DIR` are still honoured. Until o3d-2sm1.5 `deploy.sh` kept its own set under
+Set `IMS_CUTOVER_STATE_DIR` **in the environment of the root invocation** to move all four
+together; `IMS_DEPLOY_STATE_DIR` and `IMS_DATA_DIR` are still honoured. Setting any of them in
+`APP_DIR/.env` does nothing: `update.sh` sources that file as root and restores every deploy-control
+variable to what the invocation said, because the application user owns it (o3d-2sm1.5 r24). Until o3d-2sm1.5 `deploy.sh` kept its own set under
 `/var/lib/ims-deploy` while the other two used the paths above, so following the banner after a
 failed install ran `deploy.sh` against a namespace holding none of it: no marker to adopt, no
 cron backup to reuse, and a fresh backup taken of an already-fenced crontab. Anything still at
@@ -712,7 +714,8 @@ against the file by string comparison rather than by re-parsing it. But the reas
 no file to be wrong about" stopped being true at the line where it **writes** `APP_DIR/.env`, long
 before the build, the migration and the start of a unit that loads that file at exec. It now asks
 systemd the same bus question about the unit it has just written, after its own `daemon-reload` and
-before `systemctl enable --now`.
+before `systemctl start` (r24 split the old `enable --now`: the enable happens before the reload,
+because it reloads implicitly).
 
 ### The environment snapshot: binding, not checking (o3d-2sm1.5 r23)
 
@@ -721,7 +724,8 @@ correct and incomplete for the same reason: it was a **read** of a file systemd 
 exec, and that something else can replace in between. Round 22 moved the last read to the last line
 before `systemctl start`; that shortens the window and does not close it. The timestamp, the
 `unmask`, the logging and the earlier units in the start loop all execute after the check and
-before the exec.
+before the exec — and the `unmask` among them reloads systemd, so it did not merely lengthen the
+window, it invalidated the check (see r24 below).
 
 So the last round stops checking and **binds**. Immediately before the connection fence comes down,
 and with it still held, each entrypoint:
@@ -749,8 +753,32 @@ and with it still held, each entrypoint:
 different timing. The **set** of environment files is unit *configuration*, fixed at
 `daemon-reload` and **not** re-read by `systemctl start`; the **contents** are read at exec. The
 run issues the final reload itself, verifies the loaded list after it, and nothing between that
-verification and the start issues another — so the list cannot move under it. The contents can be
-changed only by root.
+verification and the start runs a unit-file command at all — so the list cannot move under it. The
+contents can be changed only by root.
+
+**And that sentence only became true in r24.** `systemctl unmask` and `systemctl enable` reload
+the daemon *implicitly* unless they are given `--no-reload` (`systemctl(1)`: *"When used with
+enable, disable, preset, mask, or unmask, do not implicitly reload daemon configuration after
+executing the changes"*). `deploy.sh` unmasked inside its start loop, `update.sh` on the line above
+its start, and `install.sh` started the service with `enable --now` — so all three re-read every
+unit file and drop-in on disk **after** the verification above, once per unit, with the remaining
+units still to start. The argument was sound about *explicit* reloads and blind to the implicit
+one. Every unmask and enable now happens **before** the final `daemon-reload`, and the only
+`systemctl` verb left after the proof is `start`, which acts on the loaded configuration and does
+not re-read unit files. Reordered rather than flagged `--no-reload`, so the invariant does not
+depend on every future caller remembering a flag.
+
+**The snapshot directory is a literal, not a setting.** It was
+`${IMS_CUTOVER_ENV_DIR:-/etc/ims-cutover}` until r24, and `update.sh` sources `APP_DIR/.env` as
+root *before* it resolves that — so the variable choosing where the root-protected snapshot went
+was one the **application user writes**, which is the whole boundary the location exists to draw.
+There is no configurable spelling of it that is safe: an override only a root-owned source may set
+is indistinguishable from no override. Move it by editing `DB_ENV_SNAPSHOT_DIR` at the top of all
+three entrypoints. For the same reason `update.sh` now captures every `IMS_*` deploy-control
+variable from the **root invocation's** environment before it sources `.env` and restores them
+verbatim afterwards, so the cutover namespace and the legacy namespace it imports from are
+likewise not the application's to move. `install.sh` and `deploy.sh` never source that file at all
+— they read one key at a time.
 
 The binding is **removed on every exit path**: on the success path once the health check is behind
 it, and in the failure trap. A drop-in left standing would override `APP_DIR/.env` for every

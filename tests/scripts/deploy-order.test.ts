@@ -565,13 +565,13 @@ test('install.sh verifies its reboot fence with systemd and never uses systemctl
 
 test('install.sh runs the post-migration verification hook before it starts anything', () => {
   const hook = realCodeLine(INSTALL_LINES, 'run-migration-verifications.mjs')
-  const start = realCodeLine(INSTALL_LINES, /systemctl enable --now/)
+  const start = realCodeLine(INSTALL_LINES, /^systemctl start /)
   assert.notEqual(hook, -1, 'the installer must run the migrations\' own checks too')
   assert.ok(hook < start, 'and pass them before the service is started')
 })
 
 test('install.sh lifts the fences immediately before the start, and restores cron after it', () => {
-  const start = realCodeLine(INSTALL_LINES, /systemctl enable --now/)
+  const start = realCodeLine(INSTALL_LINES, /^systemctl start /)
   const release = realCodeLine(INSTALL_LINES, /^release_db_connections \\$/)
   const removeFence = realCodeLine(INSTALL_LINES, /^remove_reboot_fence$/)
   const unfence = realCodeLine(INSTALL_LINES, /^unfence_cron$/)
@@ -1533,7 +1533,7 @@ test('install.sh keeps the seed and the bootstrap INSIDE the window, after the m
   const migrate = realCodeLine(INSTALL_LINES, 'prisma migrate deploy')
   const seed = realCodeLine(INSTALL_LINES, /npm run db:seed/)
   const bootstrap = realCodeLine(INSTALL_LINES, /node "\$\{BOOTSTRAP_SCRIPT\}"/)
-  const start = realCodeLine(INSTALL_LINES, /systemctl enable --now/)
+  const start = realCodeLine(INSTALL_LINES, /^systemctl start /)
 
   assert.notEqual(seed, -1, 'the installer must seed')
   assert.notEqual(bootstrap, -1, 'and bootstrap the admin/settings')
@@ -1545,7 +1545,7 @@ test('install.sh keeps the seed and the bootstrap INSIDE the window, after the m
 test('install.sh health-checks the new build before it calls the cutover complete', () => {
   // The cutover had no health check at all: it started the unit and restored cron, so a new
   // build that failed on its first request was reported as a successful upgrade.
-  const start = realCodeLine(INSTALL_LINES, /systemctl enable --now/)
+  const start = realCodeLine(INSTALL_LINES, /^systemctl start /)
   const health = realCodeLine(INSTALL_LINES, /curl -fsS[^\n]*INSTALL_HEALTH_URL/)
   const unfence = realCodeLine(INSTALL_LINES, /^unfence_cron$/)
 
@@ -1914,7 +1914,7 @@ function callContinuation(lines: string[], index: number): string {
 for (const [name, lines, startPattern] of [
   ['deploy.sh', DEPLOY_LINES, /systemctl start|npm start/],
   ['update.sh', UPDATE_LINES, /systemctl start/],
-  ['install.sh', INSTALL_LINES, /systemctl enable --now/],
+  ['install.sh', INSTALL_LINES, /^systemctl start /],
 ] as const) {
   test(`${name} asks the database whether the application role can use what the migration just created`, () => {
     const call = realCodeLine(lines, OBJECT_ACCESS_INVOCATION)
@@ -4624,3 +4624,323 @@ for (const entry of FENCE_HARNESS) {
     }
   })
 }
+
+// ---------------------------------------------------------------------------
+// o3d-2sm1.5 r24, Codex HIGH #1 — THE APPLICATION-OWNED .env DECIDED WHERE THE
+// ROOT-PROTECTED SNAPSHOT WENT.
+//
+// update.sh sources ${APP_DIR}/.env as root with `set -a`, and then resolved
+// `DB_ENV_SNAPSHOT_DIR="${IMS_CUTOVER_ENV_DIR:-/etc/ims-cutover}"` out of the resulting
+// environment. The whole point of /etc/ims-cutover is that the application user cannot reach it;
+// an override read from the file the snapshot exists to distrust hands that boundary straight
+// back. publish_db_identity_snapshot() chowns and chmods only the FINAL directory, so a path
+// under an app-writable parent is secured after the parent has already been chosen.
+//
+// The same shape was wider than that one variable: EVERY `${IMS_...:-default}` update.sh resolves
+// after the source was app-settable, including the cutover namespace (marker, cron backup,
+// connection-fence record, lock) and the legacy namespace this run IMPORTS state from.
+// ---------------------------------------------------------------------------
+
+/** The lines of a script from the top down to and including the last top-level path assignment. */
+function preludeThrough(lines: string[], lastAssignment: RegExp): string {
+  const end = lines.findIndex((line) => lastAssignment.test(line))
+  assert.notEqual(end, -1, 'the prelude must still contain the assignment it is cut at')
+  return lines.slice(0, end + 1).join('\n')
+}
+
+test('the environment snapshot lives at a literal path in all three entrypoints, not behind an override', () => {
+  // MUTATION ROUTE: put `${IMS_CUTOVER_ENV_DIR:-...}` back in any one of the three and the
+  // equality below fails, naming the script that reintroduced it.
+  for (const entry of R9_SCRIPTS) {
+    const line = entry.source.split(/\r?\n/).find((candidate) => candidate.startsWith('DB_ENV_SNAPSHOT_DIR='))
+    assert.equal(
+      line,
+      'DB_ENV_SNAPSHOT_DIR="/etc/ims-cutover"',
+      `${entry.name} must resolve the snapshot directory to a literal: an override only a root-owned source may set is indistinguishable from no override, and one an app-owned source CAN set is the finding`,
+    )
+  }
+  // And nothing anywhere still reads the variable, including the messages that used to tell an
+  // operator to set it.
+  for (const entry of R9_SCRIPTS) {
+    const reads = entry.source
+      .split(/\r?\n/)
+      .filter((line) => !/^\s*#/.test(line))
+      .filter((line) => line.includes('IMS_CUTOVER_ENV_DIR'))
+    assert.deepEqual(reads, [], `${entry.name} still reads IMS_CUTOVER_ENV_DIR outside a comment: ${reads}`)
+  }
+})
+
+test('an IMS_CUTOVER_ENV_DIR in the application-owned .env is ignored by update.sh, and so is the rest of the namespace', () => {
+  // THE SCRIPT'S OWN PRELUDE, EXECUTED — not a re-description of it. Everything from line 1 down
+  // to the last namespace assignment runs, against a real .env that tries to move all four paths,
+  // and the resolved values are printed by the script's own variables.
+  const dir = mkdtempSync(join(tmpdir(), 'ims-envdir-'))
+  try {
+    writeFileSync(
+      join(dir, '.env'),
+      [
+        'DATABASE_URL=postgresql://app:pw@127.0.0.1:5432/ims',
+        // The attack: the application user writes these into the file update.sh sources as root.
+        'IMS_CUTOVER_ENV_DIR=/tmp/attacker-owned',
+        'IMS_CUTOVER_STATE_DIR=/tmp/attacker-state',
+        'IMS_DEPLOY_STATE_DIR=/tmp/attacker-deploy',
+        'IMS_DATA_DIR=/tmp/attacker-data',
+        'IMS_LEGACY_CUTOVER_STATE_DIR=/tmp/attacker-legacy',
+        '',
+      ].join('\n'),
+    )
+    const program = [
+      preludeThrough(UPDATE_LINES, /^DB_OBJECT_ACCESS_SCRIPT=/),
+      'echo "SNAPSHOT_DIR=${DB_ENV_SNAPSHOT_DIR}"',
+      'echo "SNAPSHOT_FILE=${DB_ENV_SNAPSHOT_FILE}"',
+      'echo "CUTOVER_STATE_DIR=${CUTOVER_STATE_DIR}"',
+      'echo "LEGACY_CUTOVER_STATE_DIR=${LEGACY_CUTOVER_STATE_DIR}"',
+      'echo "DATABASE_URL=${DATABASE_URL}"',
+    ].join('\n')
+    // `--dry-run` is what lets the prelude run unprivileged; IMS_APP_DIR comes from the ROOT
+    // INVOCATION's environment, which is the one source that legitimately steers this script.
+    const result = runShell(`IMS_APP_DIR=${JSON.stringify(dir)} bash -s -- --dry-run <<'IMS_PRELUDE_EOF'\n${program}\nIMS_PRELUDE_EOF`)
+
+    // MUTATION ROUTE: restore `DB_ENV_SNAPSHOT_DIR="${IMS_CUTOVER_ENV_DIR:-/etc/ims-cutover}"`
+    // and this assertion reports /tmp/attacker-owned. Restore the namespace expressions' exposure
+    // by deleting the deploy-control restore loop after the source, and the two below report the
+    // attacker's paths instead.
+    assert.equal(result.status, 0, `the prelude must run cleanly:\n${result.output}`)
+    assert.match(result.output, /^DATABASE_URL=postgresql:\/\/app:pw@127\.0\.0\.1:5432\/ims$/m, 'precondition: the .env really was sourced, so the values below were reachable')
+    assert.match(result.output, /^SNAPSHOT_DIR=\/etc\/ims-cutover$/m, 'the snapshot directory is not the application’s to choose')
+    assert.match(result.output, /^SNAPSHOT_FILE=\/etc\/ims-cutover\/db-identity-snapshot\.env$/m, 'and neither is the file inside it')
+    assert.match(result.output, /^CUTOVER_STATE_DIR=\/var\/lib\/one-two-inventory$/m, 'nor the namespace holding the marker, the cron backup, the fence record and the lock')
+    assert.match(result.output, /^LEGACY_CUTOVER_STATE_DIR=\/var\/lib\/ims-deploy$/m, 'nor the legacy namespace this run IMPORTS state from')
+    assert.ok(!/attacker/.test(result.output.replace(/^DATABASE_URL=.*$/m, '')), `no path may come from the .env: ${result.output}`)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a deploy-control variable set on the root invocation still wins, so the restore is a restore and not a reset', () => {
+  // The other half: the capture/restore must put the INVOCATION's value back, not clear it. A
+  // restore that unset everything would be a different bug wearing the same fix.
+  const dir = mkdtempSync(join(tmpdir(), 'ims-envdir-inv-'))
+  try {
+    writeFileSync(join(dir, '.env'), 'DATABASE_URL=postgresql://app:pw@127.0.0.1:5432/ims\nIMS_CUTOVER_STATE_DIR=/tmp/attacker-state\n')
+    const program = [
+      preludeThrough(UPDATE_LINES, /^DB_OBJECT_ACCESS_SCRIPT=/),
+      'echo "CUTOVER_STATE_DIR=${CUTOVER_STATE_DIR}"',
+    ].join('\n')
+    const result = runShell(
+      `IMS_APP_DIR=${JSON.stringify(dir)} IMS_CUTOVER_STATE_DIR=/srv/operator-chose-this bash -s -- --dry-run <<'IMS_PRELUDE_EOF'\n${program}\nIMS_PRELUDE_EOF`,
+    )
+
+    // MUTATION ROUTE: change the restore loop's `printf -v` branch to an unconditional `unset`
+    // and this reports /var/lib/one-two-inventory instead of the operator's path.
+    assert.equal(result.status, 0, `the prelude must run cleanly:\n${result.output}`)
+    assert.match(result.output, /^CUTOVER_STATE_DIR=\/srv\/operator-chose-this$/m, 'the root invocation is the source that may steer this script')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('update.sh restores every deploy-control variable it reads, not only the ones resolved after the source', () => {
+  // The list is the guard. A future edit that moves an assignment below the source, or adds a new
+  // IMS_* path variable, must add it here too — otherwise the shape comes straight back.
+  const restored = /^DEPLOY_CONTROL_VARS=\(\n([\s\S]*?)\n\)$/m.exec(UPDATE_LINES.join('\n'))
+  assert.notEqual(restored, null, 'update.sh must declare the deploy-control variables it protects')
+  const covered = new Set((restored as RegExpExecArray)[1].split(/\s+/).filter(Boolean))
+
+  const read = new Set(
+    UPDATE_LINES.filter((line) => !/^\s*#/.test(line))
+      .flatMap((line) => Array.from(line.matchAll(/\$\{(IMS_[A-Z0-9_]+):-/g)).map((match) => match[1])),
+  )
+  const missing = Array.from(read).filter((name) => !covered.has(name))
+  assert.deepEqual(missing, [], `update.sh resolves a path from ${missing} but does not restore it after sourcing the application-owned .env`)
+})
+
+test('install.sh and deploy.sh never source the application-owned .env into their environment', () => {
+  // Why they need no restore loop: install.sh reads .env into an associative array
+  // (load_existing_env) and deploy.sh greps one key at a time (env_file_value). Neither exports
+  // anything from it. If either ever starts sourcing it, this fails and the restore has to follow.
+  //
+  // MUTATION ROUTE: add `set -a; source "${APP_DIR}/.env"; set +a` to either script.
+  for (const entry of [
+    { name: 'install.sh', source: INSTALL_SOURCE },
+    { name: 'deploy.sh', source: DEPLOY_LINES.join('\n') },
+  ]) {
+    const sourced = entry.source
+      .split(/\r?\n/)
+      .filter((line) => !/^\s*#/.test(line))
+      .filter((line) => /(^|[\s;])(source|\.)\s+"?\$\{APP_DIR(_REAL)?\}\/\.env/.test(line))
+    assert.deepEqual(sourced, [], `${entry.name} sources the application-owned .env: ${sourced}`)
+  }
+})
+
+// ---------------------------------------------------------------------------
+// o3d-2sm1.5 r24, Codex HIGH #2 — A COMMAND THAT RELOADS SYSTEMD WITHOUT SAYING SO.
+//
+// `systemctl unmask` and `systemctl enable` reload the daemon IMPLICITLY unless given
+// --no-reload (systemctl(1): "When used with enable, disable, preset, mask, or unmask, do not
+// implicitly reload daemon configuration after executing the changes"). deploy.sh unmasked inside
+// its start loop, update.sh on the line above its start, and install.sh started with
+// `enable --now` — so all three re-read every unit file and drop-in on disk AFTER
+// require_start_identity_bound had proved the loaded configuration binds the service to this
+// run's environment snapshot. r22's atomicity argument was sound about EXPLICIT reloads and
+// blind to the implicit one, which is why the claim is now re-derived from the commands actually
+// in the window rather than from the ones the argument remembered.
+// ---------------------------------------------------------------------------
+
+/** Every systemctl verb that can change what systemd has loaded, explicitly or implicitly. */
+const RELOAD_CAPABLE_VERBS = /systemctl\s+(?:[^\n]*\s)?(daemon-reload|daemon-reexec|enable|disable|preset|preset-all|mask|unmask|reenable|link|revert|set-property|edit)\b/
+
+const START_WINDOWS = [
+  { name: 'deploy.sh', lines: DEPLOY_LINES },
+  { name: 'update.sh', lines: UPDATE_LINES },
+  { name: 'install.sh', lines: INSTALL_LINES },
+] as const
+
+/** The command that starts the service, as a LINE — not a mention of it inside a refusal banner. */
+const START_COMMAND = /^\s*(run\s+)?systemctl start\b/
+
+/**
+ * The executable lines between the final binding proof and the systemctl start that follows it.
+ *
+ * The proof is `require_start_identity_bound || die \` followed by a multi-line banner, and that
+ * banner CONTAINS the words "systemctl start". A first draft of this searched for that text and
+ * located the window's end on the banner itself, one line after its start — so the window came
+ * back empty for two of the three entrypoints and the assertions over it examined nothing. The
+ * banner is consumed by quote-counting and the end is matched as a COMMAND, and the callers below
+ * prove the result is not vacuous by re-running the same extraction over a mutated copy.
+ */
+function startWindowBounds(lines: string[]): { from: number; to: number } {
+  const proof = lines.findIndex((line) => /^require_start_identity_bound\s*\|\|/.test(line))
+  assert.notEqual(proof, -1, 'the entrypoint must still prove the binding before it starts anything')
+
+  // Walk off the end of the refusal banner. The proof is `require_start_identity_bound || die \`
+  // and its argument is one double-quoted string on the following line(s), so BOTH conditions
+  // have to be consumed: a trailing backslash continues the command, and an odd running
+  // double-quote count means the string is still open. Counting quotes alone stops on the proof
+  // line itself (it has none), which put the banner inside the window — and the banner mentions
+  // "systemctl start", so the assertions below skipped it and examined nothing.
+  let cursor = proof
+  let quotes = 0
+  for (;;) {
+    quotes += (lines[cursor].match(/"/g) ?? []).length
+    const continued = lines[cursor].trimEnd().endsWith('\\')
+    cursor += 1
+    if ((!continued && quotes % 2 === 0) || cursor >= lines.length) break
+  }
+
+  const start = lines.findIndex((line, index) => index >= cursor && START_COMMAND.test(line))
+  assert.notEqual(start, -1, 'and it must still start the service after it')
+  return { from: cursor, to: start }
+}
+
+function startWindow(lines: string[]): string[] {
+  const { from, to } = startWindowBounds(lines)
+  return lines.slice(from, to).filter((line) => isCode(line))
+}
+
+/**
+ * The same script with a reload-capable command spliced into the window, to prove the guard bites.
+ *
+ * It splices at the window's OWN end, not at the first `systemctl start` in the file: install.sh
+ * starts postgresql hundreds of lines earlier, and a fixture that spliced there would insert the
+ * command outside the window and then report that the window could not see it.
+ */
+function withUnmaskInTheWindow(lines: string[]): string[] {
+  const { to } = startWindowBounds(lines)
+  return [...lines.slice(0, to), '  run systemctl unmask "$unit" >/dev/null 2>&1 || true', ...lines.slice(to)]
+}
+
+for (const entry of START_WINDOWS) {
+  test(`${entry.name} runs no unit-file command between the binding proof and the start`, () => {
+    // MUTATION ROUTE: put `run systemctl unmask "$unit"` back into the start loop (deploy.sh), or
+    // on the line above the start (update.sh), or restore `systemctl enable --now` (install.sh),
+    // and the window contains a reload-capable verb again.
+    const window = startWindow(entry.lines)
+    const offenders = window.filter((line) => RELOAD_CAPABLE_VERBS.test(line))
+    assert.deepEqual(
+      offenders,
+      [],
+      `${entry.name} invalidates its own binding proof: these run after it and reload unit configuration:\n${offenders.join('\n')}`,
+    )
+
+    // AND THE GUARD IS NOT VACUOUS. update.sh's window is legitimately two lines long, so "no
+    // offenders" would also be the answer if the extraction had located nothing at all — which is
+    // exactly the bug the comment over startWindow() describes. The same extraction, over the same
+    // script with one unmask spliced in above the start, must come back with that unmask.
+    const caught = startWindow(withUnmaskInTheWindow(entry.lines)).filter((line) => RELOAD_CAPABLE_VERBS.test(line))
+    assert.equal(caught.length, 1, `the extraction for ${entry.name} must be able to SEE a command in the window: ${caught}`)
+
+    // AND THE ENUMERATION IS COMPLETE, which is the half the previous round got wrong: it is not
+    // enough that the commands someone remembered are safe. Every executable line in the window
+    // must be one of the shapes below, so a command nobody thought about fails here rather than
+    // being reasoned past.
+    const unexplained = window.filter(
+      (line) =>
+        !/^\s*(if|then|else|elif|fi|for|do|done)\b/.test(line) &&
+        !/^\s*[A-Z_]+=/.test(line) &&
+        !/^\s*(echo|info|ok|success|step|header|warn)\b/.test(line) &&
+        !/systemctl start/.test(line) &&
+        !/nohup npm start|as_app_user\b/.test(line),
+    )
+    assert.deepEqual(unexplained, [], `${entry.name} has a command in the window that this test cannot account for:\n${unexplained.join('\n')}`)
+  })
+
+  test(`${entry.name} does every unmask and enable BEFORE the final daemon-reload`, () => {
+    // The reorder, not the flag: `--no-reload` would leave the invariant depending on every
+    // future caller remembering it, while moving the operations makes "nothing after the proof
+    // changes the loaded configuration" true by construction.
+    //
+    // MUTATION ROUTE: move the unmask (or install.sh's enable) back below remove_reboot_fence.
+    const source = entry.lines.join('\n')
+    const code = entry.lines.map((line, index) => ({ line, index })).filter(({ line }) => isCode(line))
+    const lastReload = code.filter(({ line }) => /^\s*remove_reboot_fence\s*$/.test(line)).pop()
+    assert.notEqual(lastReload, undefined, `${entry.name} must still issue its final reload through remove_reboot_fence`)
+
+    // Scoped to the window that matters: the final reload up to the start. install.sh enables
+    // unattended-upgrades and fail2ban further down, long after the application is serving, and a
+    // reload there cannot affect a unit that is already running.
+    const startLine = code.find(({ line, index }) => index > (lastReload as { index: number }).index && START_COMMAND.test(line))
+    assert.notEqual(startLine, undefined, `${entry.name} must still start the service after its final reload`)
+    const late = code.filter(
+      ({ line, index }) =>
+        index > (lastReload as { index: number }).index &&
+        index < (startLine as { index: number }).index &&
+        RELOAD_CAPABLE_VERBS.test(line),
+    )
+    assert.deepEqual(late.map(({ line }) => line), [], `${entry.name} changes unit configuration after its final daemon-reload and before the start:\n${late.map(({ line }) => line).join('\n')}`)
+
+    // The unmask/enable this moved must be UPSTREAM of that reload, which is the reorder itself.
+    const lifts = code.filter(({ line }) => /systemctl (unmask|enable) "\$/.test(line) || /systemctl (unmask|enable) "\$\{/.test(line))
+    assert.notEqual(lifts.length, 0, `${entry.name} must still lift the mask (or register the unit) it used to do late`)
+    for (const lift of lifts) {
+      assert.ok(
+        lift.index < (lastReload as { index: number }).index,
+        `${entry.name} runs "${lift.line.trim()}" after its final daemon-reload; it reloads implicitly and must happen before it`,
+      )
+    }
+
+    void source
+  })
+}
+
+test('the entrypoints no longer claim an atomicity that only covered explicit reloads', () => {
+  // The banner is what an operator reads at 03:00, so it has to say the true thing. The old text
+  // was "Nothing between here and systemctl start issues another daemon-reload", which was a
+  // statement about the verb `daemon-reload` and not about the commands in the window.
+  //
+  // MUTATION ROUTE: revert either banner to the daemon-reload-only wording.
+  for (const entry of [
+    { name: 'deploy.sh', source: DEPLOY_LINES.join('\n') },
+    { name: 'update.sh', source: UPDATE_LINES.join('\n') },
+  ]) {
+    assert.match(
+      entry.source,
+      /NOTHING BETWEEN HERE AND THE START RUNS A UNIT-FILE COMMAND AT ALL/,
+      `${entry.name}'s refusal banner must state the claim the reorder actually establishes`,
+    )
+    assert.ok(
+      !/Nothing between here and systemctl start issues another daemon-reload/.test(entry.source),
+      `${entry.name} still carries the claim that was true of explicit reloads and false of the implicit one`,
+    )
+  }
+})
