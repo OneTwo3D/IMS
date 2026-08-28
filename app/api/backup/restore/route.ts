@@ -1,7 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createHash, randomBytes } from 'crypto'
 import { spawn } from 'child_process'
-import pg from 'pg'
 import { createReadStream, createWriteStream } from 'fs'
 import { mkdir, access, unlink, stat, statfs } from 'fs/promises'
 import path from 'path'
@@ -16,7 +15,7 @@ import { sendEmail } from '@/lib/mailer'
 import { consumeAuthToken, deleteAuthToken, setAuthToken } from '@/lib/auth/token-store'
 import { db } from '@/lib/db'
 import { ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY } from '@/lib/db/advisory-locks'
-import { pgConnectionConfig, pinClientToMeasuredBackend } from '@/lib/db/database-url-schema.mjs'
+import { createSessionAdvisoryLockClient } from '@/lib/db/session-lock-pool'
 import { createRestoreSqlScanner } from '@/lib/backup/restore-sql-guard'
 import { parsePositiveIntegerEnv } from '@/lib/env'
 import { getClientIp } from '@/lib/request-ip'
@@ -861,20 +860,20 @@ export function createRestoreSelectionLockHolder(options: {
   /** Called when the lock is deliberately NOT released. Loud by default; injectable for tests. */
   onLockRetained?: (reason: string) => void
 } = {}): RestoreSelectionLockHolder {
-  // BUILT FROM THE GUARDED CONFIG (o3d-2k5r r23, Codex HIGH). This client takes the advisory lock
-  // that decides whether a restore may overwrite the database, and it reads `pg_stat_activity` to
-  // confirm the restore's own backend has gone. A raw `{ connectionString: DATABASE_URL }` carries
-  // no `search_path` pin and none of the per-connection backend checks, so on a deployment whose
-  // schema needs a non-ASCII startup option it could hold the lock on a backend other than the one
-  // the restore runs against. `pinClientToMeasuredBackend` is a no-op for an ASCII schema — it
-  // returns the client untouched when the config carries no guard.
-  const createClient = options.createClient ?? (() => {
-    const clientConfig = {
-      ...pgConnectionConfig(process.env.DATABASE_URL),
+  // BUILT BY THE SESSION-LOCK FACTORY (o3d-2k5r r23 and r25, Codex HIGH; o3d-a5zz). This client
+  // takes the SESSION advisory lock that decides whether a restore may overwrite the database, and
+  // it reads `pg_stat_activity` to confirm the restore's own backend has gone. r23 stopped it being
+  // a raw `{ connectionString: DATABASE_URL }`, which carried no `search_path` pin and none of the
+  // per-connection backend checks. r25 stopped `pgConnectionConfig()` alone being enough here: that
+  // config attaches its check only for a non-ASCII startup option, so on an ASCII schema this
+  // client — the one holding the fence over a whole database restore — was never shown to reach the
+  // backend directly, and a session lock through a transaction pooler is held by nobody.
+  // `createSessionAdvisoryLockClient()` wraps `connect()` with the affinity proof and ends the
+  // client if it is refused.
+  const createClient = options.createClient ?? (() =>
+    createSessionAdvisoryLockClient('the restore selection lock', {
       application_name: 'ims_restore_lock_holder',
-    }
-    return pinClientToMeasuredBackend(new pg.Client(clientConfig), clientConfig) as unknown as RestoreLockClient
-  })
+    }) as unknown as RestoreLockClient)
   const now = options.now ?? Date.now
   const delay = options.delay ?? ((ms: number) => new Promise<void>((resolve) => { setTimeout(resolve, ms) }))
   const maxWaitMs = options.maxWaitMs ?? RESTORE_SELECTION_LOCK_MAX_WAIT_MS
