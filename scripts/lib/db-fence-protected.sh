@@ -413,8 +413,15 @@ _fence_protected_dir_ready() {
 #   * a specifier that will not resolve is a refusal, because a tree missing an import is a fence
 #     that dies at exec, and discovering that after the rename would leave exactly that standing.
 #
-# The program is written into the ROOT-OWNED recovery directory and run from there, never from the
-# checkout: it is authored by this file, which root read in the same instant as the entrypoint.
+# The program is authored by THIS FILE — which root read in the same instant as the entrypoint —
+# written into a directory this call already owns, and run from there. It is never read out of the
+# checkout.
+#
+# ${app_dir} is dirname(dirname(${DB_FENCE_SCRIPT})) in every caller, so the entry file the
+# resolution starts from is ${DB_FENCE_SCRIPT} itself. That is an invariant of the shipped layout
+# rather than a second opinion about it: the mirror only works at all because the helper sits at
+# <app>/scripts/, and a checkout where it does not is one whose imports would resolve differently
+# from the mirror's in any case.
 #
 # THE ANSWER GOES TO A FILE, NOT TO STDOUT. Every caller would otherwise read it through a
 # command substitution, and DB_FENCE_ROTATION_NOTE set inside one dies with the subshell — which
