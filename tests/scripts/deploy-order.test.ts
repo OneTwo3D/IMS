@@ -1129,19 +1129,33 @@ DB_IDENTITY_SOURCE_REASON=''
 # tests/scripts/db-connection-fence.test.ts.
 require_start_identity_unchanged() { return 0; }
 DB_IDENTITY_DRIFT_REASON=''
-# o3d-2sm1.5 r29: the recovery record and the root-owned copy of the fence script. Both paths are
-# under the harness directory rather than /etc, and the copy is deliberately ABSENT so that
-# db_fence_script_in_use() below resolves to the checkout's fence.mjs — which is what every
-# assertion in these harnesses is written against.
+# o3d-2sm1.5 r29/r30: the recovery record and the root-owned copy of the fence script. Both paths
+# are under the harness directory rather than /etc. As of r30 the copy is what actually RUNS — the
+# checkout's script is published into it and never executed in place — so these harnesses let that
+# publication happen for real. The stub written to ${dir}/fence.mjs logs to an ABSOLUTE
+# ${dir}/calls.log, so the copy of it records the same calls at the same place and every
+# assertion below still reads what was invoked.
 DB_FENCE_RECOVERY_DIR='${dir}/recovery'
 DB_FENCE_IDENTITY_FILE='${dir}/recovery/db-fence-identity.env'
 DB_FENCE_SCRIPT_COPY='${dir}/recovery/fence-db-connections.mjs'
 DB_FENCE_IDENTITY_FROM_RECORD=false
+DB_FENCE_ADOPTING=false
 DB_FENCE_RECOVERY_REASON=''
+DB_FENCE_IDENTITY_MISMATCH=''
+# The four values themselves, which require_adoption_identity() reads to COMPARE the file's answer
+# against the record's (o3d-2sm1.5 r30). Empty here: these harnesses are about order, and which
+# source wins is exercised against real files in the recovery tests below.
+DB_IDENTITY_HOST=''; DB_IDENTITY_PORT=''; DB_IDENTITY_USER=''; DB_IDENTITY_DATABASE=''
+DB_IDENTITY_PINNED_HOST=''; DB_IDENTITY_PINNED_PORT=''; DB_IDENTITY_PINNED_USER=''; DB_IDENTITY_PINNED_DATABASE=''
 # THE REAL RESOLVER, not a stub: WHICH script a fence, a release and a re-fence invoke is part of
 # what these harnesses assert, and a stub returning a constant would assert nothing about it.
+${durabilityFunctions(UPDATE_LINES.join('\n'))}
+${shellFunction(UPDATE_LINES.join('\n'), 'file_sha256')}
+${shellFunction(UPDATE_LINES.join('\n'), 'fence_record_script_digest')}
+${shellFunction(UPDATE_LINES.join('\n'), 'publish_fence_script_copy')}
 ${shellFunction(UPDATE_LINES.join('\n'), 'db_fence_script_in_use')}
 ${shellFunction(UPDATE_LINES.join('\n'), 'require_adoption_identity')}
+${shellFunction(UPDATE_LINES.join('\n'), 'refuse_adoption_identity_mismatch')}
 # Publishing that record writes under a root-owned /etc directory, which is neither what these
 # order harnesses are about nor something they may do. It is exercised for real, against the
 # shipped function, in 'the identity a fence records is the identity a recovery reads back'.
@@ -2833,7 +2847,13 @@ fence_db_connections(){ echo "fence_db_connections" >> "\${LOG}"; DB_FENCE_UP=tr
 # being adopted'.
 DB_FENCE_IDENTITY_FILE='/etc/ims-cutover-recovery/db-fence-identity.env'
 DB_FENCE_RECOVERY_REASON=''
+DB_FENCE_ADOPTING=false
 require_adoption_identity(){ echo "require_adoption_identity" >> "\${LOG}"; return 0; }
+# o3d-2sm1.5 r30: the refusal that fires when the app-owned .env and the root-owned record name
+# different databases. Logged rather than stubbed silent, because WHETHER the adoption block asks
+# it is part of the claim; what it answers is exercised against real files in 'an .env that names
+# a different database than the record refuses the adoption'.
+refuse_adoption_identity_mismatch(){ echo "refuse_adoption_identity_mismatch $*" >> "\${LOG}"; return 0; }
 `
 
 const R8_CASES = ARMING_TRAP_CASES.map((entry) => ({
@@ -5148,7 +5168,7 @@ const MENTION_SHAPES: ReadonlyArray<{ why: string; match: RegExp }> = (
     {
       why: 'a refusal reason recorded for an operator',
       match:
-        '((([A-Za-z_]+|\\*)\\) )?)(local )?(DB_IDENTITY_(SOURCE_|DRIFT_)?REASON|ENV_VAR_SOURCE_REASON|APP_LAYOUT_REASON|UNIT_PORT_REASON|APP_PORT_REASON|RESPONDER_REASON|description|RESUME_EVIDENCE)="[^"]*"( ;;)?',
+        '((([A-Za-z_]+|\\*)\\) )?)(local )?(DB_IDENTITY_(SOURCE_|DRIFT_)?REASON|DB_FENCE_IDENTITY_MISMATCH|ENV_VAR_SOURCE_REASON|APP_LAYOUT_REASON|UNIT_PORT_REASON|APP_PORT_REASON|RESPONDER_REASON|description|RESUME_EVIDENCE)="[^"]*"( ;;)?',
     },
   ] as ReadonlyArray<{ why: string; match: string }>
 ).map((shape) => ({ why: shape.why, match: new RegExp(`^(${shape.match})$`) }))
@@ -5460,6 +5480,12 @@ function runLayoutGate(options: { env: string | null; marker: string | null }): 
       'adopt_db_connections(){ echo "adopt_db_connections" >> "${LOG}"; DB_FENCE_UP=true; return 0; }',
       'release_db_connections(){ echo "release_db_connections" >> "${LOG}"; DB_FENCE_UP=false; return 0; }',
       'resume_from_interrupted_arming(){ echo "resume_from_interrupted_arming" >> "${LOG}"; return 0; }',
+      // o3d-2sm1.5 r30: where the adoption's identity comes from, and the refusal when the record
+      // and .env disagree. Both are defined further down update.sh than this prelude reaches, and
+      // neither is the subject here — this harness is about the layout gate coming AFTER the
+      // adoption. They are exercised against real files in the recovery tests below.
+      'require_adoption_identity(){ echo "require_adoption_identity" >> "${LOG}"; return 0; }',
+      'refuse_adoption_identity_mismatch(){ echo "refuse_adoption_identity_mismatch $*" >> "${LOG}"; return 0; }',
       shellFunction(source, 'marker_is_complete'),
       shellFunction(source, 'marker_phase'),
       shellFunction(source, 'predecessor_is_active'),
@@ -5577,7 +5603,9 @@ function fenceRecoveryHarness(dirs: { app: string; state: string; recovery: stri
     `DB_FENCE_SCRIPT_COPY=${JSON.stringify(join(dirs.recovery, 'fence-db-connections.mjs'))}`,
     "DB_FENCE_RELEASE_CMD=''",
     'DB_FENCE_IDENTITY_FROM_RECORD=false',
+    'DB_FENCE_ADOPTING=false',
     "DB_FENCE_RECOVERY_REASON=''",
+    "DB_FENCE_IDENTITY_MISMATCH=''",
     'DB_FENCE_UP=false',
     'DB_FENCE_RAISED=false',
     'SCHEMA_TOUCHED=false',
@@ -5618,10 +5646,14 @@ function fenceRecoveryHarness(dirs: { app: string; state: string; recovery: stri
     shellFunction(source, 'resolve_db_identity'),
     shellFunction(source, 'require_db_identity'),
     durabilityFunctions(source),
+    shellFunction(source, 'file_sha256'),
+    shellFunction(source, 'fence_record_script_digest'),
+    shellFunction(source, 'publish_fence_script_copy'),
     shellFunction(source, 'publish_fence_recovery_record'),
     shellFunction(source, 'db_fence_script_in_use'),
     shellFunction(source, 'adopt_identity_from_recovery_record'),
     shellFunction(source, 'require_adoption_identity'),
+    shellFunction(source, 'refuse_adoption_identity_mismatch'),
     shellFunction(source, 'fence_db_connections'),
     shellFunction(source, 'release_db_connections'),
     shellFunction(source, 'adopt_db_connections'),

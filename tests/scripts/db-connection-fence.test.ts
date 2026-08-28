@@ -2174,16 +2174,19 @@ test('o3d-2sm1.5 r19: every entrypoint supplies the four values, and refuses whe
   for (const [name, source] of [['deploy.sh', deploy], ['update.sh', update], ['install.sh', install]] as const) {
     // EVERY invocation of the helper carries the identity — not just the one a test happened to
     // look at. A mode added later without it would otherwise reintroduce the whole finding.
-    // r29: update.sh no longer names ${DB_FENCE_SCRIPT} at the invocation. The script it runs is
-    // resolved first — the checkout's copy, or the root-owned one published when the fence was
-    // raised, because ${APP_DIR}/scripts/fence-db-connections.mjs is application-owned and
-    // deleting it used to turn every fence, release and adoption into a refusal. Both spellings
-    // are an invocation of the helper and both must carry the identity.
+    // r29/r30: update.sh no longer names ${DB_FENCE_SCRIPT} at the invocation. The script it runs
+    // is resolved first, and since r30 it is always the ROOT-OWNED copy — the checkout's file is
+    // published into it and never executed in place, because it is application-owned and could be
+    // REPLACED as easily as removed. Every spelling of the resolved path is an invocation of the
+    // helper and every one of them must carry the identity.
     const invocations = source
       .split('\n')
       .filter(
         (line) =>
-          line.includes('"${DB_FENCE_SCRIPT}"') || line.includes('"$DB_FENCE_SCRIPT"') || line.includes('"${fence_script}"'),
+          line.includes('"${DB_FENCE_SCRIPT}"') ||
+          line.includes('"$DB_FENCE_SCRIPT"') ||
+          line.includes('"${fence_script}"') ||
+          line.includes('"${preflight_script}"'),
       )
     const modes = invocations.filter((line) => /--(fence|release|preflight|print-migration-url)\b/.test(line))
     assert.ok(modes.length >= 4, `${name}: precondition — the helper is actually invoked here (${modes.length})`)
@@ -2210,9 +2213,7 @@ test('o3d-2sm1.5 r19: every entrypoint supplies the four values, and refuses whe
   const conditions = fenceBody.split('\n').filter((line) => /^\s*if .*; then$/.test(line) && !/\$DRY_RUN/.test(line))
   assert.deepEqual(
     conditions.map((line) => line.trim()),
-    ['if ! $DB_FENCE_IDENTITY_FROM_RECORD; then', 'if [[ "${fence_script}" != "${DB_FENCE_SCRIPT}" ]]; then'].sort((a, b) =>
-      fenceBody.indexOf(a) - fenceBody.indexOf(b),
-    ),
+    ['if ! $DB_FENCE_IDENTITY_FROM_RECORD; then'],
     'nothing else may condition what fence_db_connections() asks',
   )
   const raises = update.split('\n').filter((line) => /^\s*DB_FENCE_IDENTITY_FROM_RECORD=true$/.test(line))
@@ -3189,14 +3190,20 @@ test('o3d-2sm1.5 r23: the trap re-fences the database it migrated even when the 
         'DB_FENCE_UP=false',
         'DRY_RUN=false',
         'DB_FENCE_SCRIPT="$1"',
-        // r29: the shipped function resolves the script it runs before anything else — the
-        // checkout's copy, or the root-owned one published when the fence was raised. The copy is
-        // deliberately absent here so it resolves to the real file above, which is what every
-        // assertion below is written against.
-        'DB_FENCE_SCRIPT_COPY="/nonexistent/fence-db-connections.mjs"',
-        source.includes('db_fence_script_in_use() {')
-          ? source.slice(source.indexOf('db_fence_script_in_use() {'), source.indexOf('\n}\n', source.indexOf('db_fence_script_in_use() {')) + 3)
-          : '',
+        // r29/r30: the shipped function resolves the script it runs before anything else, and
+        // since r30 that is ALWAYS the root-owned copy — the checkout's file is published into it
+        // and never executed in place. Both paths are under the harness directory here; the copy
+        // is absent to begin with, so the resolver publishes the real file above into it and runs
+        // that, which is what every assertion below is written against.
+        `DB_FENCE_RECOVERY_DIR=${JSON.stringify(fenceDir)}`,
+        `DB_FENCE_SCRIPT_COPY=${JSON.stringify(join(fenceDir, 'protected-fence-db-connections.mjs'))}`,
+        `DB_FENCE_IDENTITY_FILE=${JSON.stringify(join(fenceDir, 'db-fence-identity.env'))}`,
+        ...['fsync_path', 'publish_durable_file', 'file_sha256', 'fence_record_script_digest', 'publish_fence_script_copy', 'db_fence_script_in_use']
+          .map((fn) =>
+            source.includes(`\n${fn}() {`)
+              ? source.slice(source.indexOf(`\n${fn}() {`) + 1, source.indexOf('\n}\n', source.indexOf(`\n${fn}() {`)) + 3)
+              : '',
+          ),
         'DEPLOY_ADMIN_DATABASE_URL="postgresql://admin@127.0.0.1:5432/main"',
         'DATABASE_URL="postgresql://app:pw@127.0.0.1:5432/main"',
         'APP_USER="app"',

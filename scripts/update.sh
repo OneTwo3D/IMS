@@ -3516,7 +3516,9 @@ if [[ -f "${FENCE_FILE}" ]]; then
       # record; aimed at a database that fence was never raised on, that is a grant nobody asked
       # for on one database and an abandoned fence on another.
       refuse_adoption_identity_mismatch "${adoption_identity_rc}"
-      [[ "${adoption_identity_rc}" -eq 0 ]] || warn "Neither ${APP_DIR}/.env nor ${DB_FENCE_IDENTITY_FILE} identifies the fence being adopted: ${DB_FENCE_RECOVERY_REASON}"
+      if [[ "${adoption_identity_rc}" -ne 0 ]]; then
+        warn "Neither ${APP_DIR}/.env nor ${DB_FENCE_IDENTITY_FILE} identifies the fence being adopted: ${DB_FENCE_RECOVERY_REASON}"
+      fi
       if $SCHEMA_TOUCHED; then
         # HELD, not released: the previous run had started migrating, so the schema is in
         # an unknown state and the application must not reach it — not during this rebuild
