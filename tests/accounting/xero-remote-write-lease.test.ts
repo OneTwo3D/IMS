@@ -260,6 +260,11 @@ function reset(): void {
     errorMessage: null,
     processingStartedAt: null,
     createdAt: new Date('2026-08-20T09:00:00.000Z'),
+    // o3d-0bfh r4: the obligation generation, carried here because the persist CLAIMS it inside the
+    // SYNCED transaction and the claim reads it first. A row missing the column answers `undefined`
+    // where Prisma answers `null`, the claim fails, and the persist would report a generation of
+    // `null` — a double that could not see the column would make this test pass for the wrong reason.
+    backReferenceFollowUpsPendingAt: null,
     payload: { invoiceNumber: 'INV-1', contactName: 'A Customer', date: '2026-08-20', currency: 'GBP', lines: [] },
   }
   state.posted = []
@@ -637,8 +642,19 @@ test('r6: a claim renewed while the persist is RE-DRIVEN is the claim the settli
     'and it moved FORWARD, so a caller-side snapshot would now be a superseded instant')
   assert.equal(state.transactionAttempts, 2, 'one failure to start, then the re-drive')
 
-  assert.deepEqual(recorded, { persisted: true },
-    'the document Xero holds is recorded across the re-drive')
+  assert.equal(recorded.persisted, true, 'the document Xero holds is recorded across the re-drive')
+  // o3d-0bfh r4: and the persist reports the obligation GENERATION it claimed in that same
+  // transaction, which is what the release downstream is fenced on. `null` here would mean the claim
+  // never landed and the follow-ups could never be discharged exclusively.
+  assert.ok(
+    recorded.persisted && recorded.followUpObligation instanceof Date,
+    'and it carries the obligation generation the SYNCED transaction claimed',
+  )
+  assert.deepEqual(
+    state.row?.backReferenceFollowUpsPendingAt,
+    recorded.persisted ? recorded.followUpObligation : null,
+    'the value reported is the value written — not a re-read, which is the race one layer down',
+  )
   const settled = settlingWrite()
   assert.ok(settled, 'the settling write was attempted')
   assert.equal(settled!.count, 1, 'and it MATCHED — the double evaluated the WHERE against real row state')

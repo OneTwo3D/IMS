@@ -18,6 +18,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
+import { FOLLOW_UP_OBLIGATION_OUTCOME_IS_UNKNOWN } from '@/lib/domain/accounting/follow-up-obligation-registry'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { useStepUpReauth, isFreshAuthFailure, type MaybeFreshAuthFailure } from '@/components/auth/use-step-up-reauth'
 import { replayWmsOrderPush } from '@/app/actions/wms-order-push'
@@ -813,6 +814,59 @@ export function ExceptionsClient({ data }: Props) {
                       <CheckCircle2 className="h-3 w-3 mr-1" />Clear
                     </Button>
                   </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </Card>
+      ) : null}
+
+      {data.accountingFollowUpObligations.length > 0 ? (
+        <Card className="p-4 space-y-3">
+          <SectionHeading
+            title={`Accounting follow-ups owed, with nothing to re-drive them (${data.summary.accountingFollowUpObligations})`}
+            /*
+             * RENDERED FROM THE REGISTRY, NOT RESTATED (o3d-0bfh r9, Codex HIGH).
+             *
+             * This prop used to hold its own paragraph, and that paragraph still ended "create only
+             * what is verifiably absent" three rounds after the registry remedy stopped saying it.
+             * One rule with two authors: correcting the registry protected nobody, because THIS is
+             * the sentence an operator reads. A payment can be PENDING in the local queue while
+             * QuickBooks shows none — INVOICE_PAYMENT is enqueued before INVOICE_PDF, in separate
+             * transactions — so an operator who creates on a clean read races the queued row, and a
+             * second payment against an invoice is not undoable.
+             *
+             * There is now no second copy to go stale: the section text IS the registry's own
+             * string, and each row's cell below carries that connector's own `operatorRemedy`, also
+             * straight from the registry via `describeFollowUpObligationBacklogRow`. No operator
+             * instruction is authored in this file at all, and
+             * tests/accounting/follow-up-recovery-registry.test.ts scans this file to keep it that
+             * way.
+             */
+            detail={FOLLOW_UP_OBLIGATION_OUTCOME_IS_UNKNOWN}
+            shown={data.accountingFollowUpObligations.length}
+            total={data.summary.accountingFollowUpObligations}
+          />
+          <Table containerClassName="rounded-lg border" className="min-w-[860px]">
+            <TableHeader className="bg-muted/40">
+              <TableRow>
+                <TableHead>Connector</TableHead>
+                <TableHead>Document</TableHead>
+                <TableHead>Reference</TableHead>
+                <TableHead>External id</TableHead>
+                <TableHead>Owed since</TableHead>
+                <TableHead>Why nothing re-drives it</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {data.accountingFollowUpObligations.map((row) => (
+                <TableRow key={row.id}>
+                  <TableCell className="text-xs">{row.connector}</TableCell>
+                  <TableCell className="text-xs">{row.type} <span className="text-muted-foreground">({row.status})</span></TableCell>
+                  <TableCell className="text-xs font-mono">{row.referenceType}/{row.referenceId}</TableCell>
+                  <TableCell className="text-xs font-mono">{row.externalTransactionId ?? '—'}</TableCell>
+                  <TableCell className="text-xs">{row.owedSince ? new Date(row.owedSince).toLocaleString() : '—'}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground">{row.blockedBy} — {row.operatorRemedy}</TableCell>
                 </TableRow>
               ))}
             </TableBody>

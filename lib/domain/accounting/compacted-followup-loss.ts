@@ -457,7 +457,7 @@ export function buildCompactedFollowUpLossActivity(input: {
   const discarded = joinPhrases(verdict.discarded)
   const survivors = verdict.rebuilt.length > 0
     ? ` ${capitalise(joinPhrases(verdict.rebuilt))} ${verdict.rebuilt.length === 1 ? 'is' : 'are'} built from columns `
-      + 'compaction keeps and can still be enqueued, so it is only the part named above that needs a hand.'
+      + 'compaction keeps and can still be enqueued, so it is only the part named above that is lost.'
     : ''
   return {
     entityType: 'SYSTEM',
@@ -466,7 +466,11 @@ export function buildCompactedFollowUpLossActivity(input: {
     level: 'WARNING',
     description: `${preamble} ${discarded} can no longer be `
       + 'enqueued: this sync row outlived the retention period unresolved, so its payload was compacted away. The document is linked '
-      + `to external id ${row.externalTransactionId}; check whether it is missing and re-drive it manually.${survivors}`,
+      + `to external id ${row.externalTransactionId}. Nothing here authorises settling that by hand: the pass this row `
+      + 'was interrupted in enqueues each follow-up as its OWN local sync row, so one for the part named above may '
+      + 'ALREADY be sitting PENDING or FAILED in the queue, and no request id can deduplicate a payment or an '
+      + `attachment a human created afterwards. READ the document in ${connectorLabel}, record what is actually `
+      + `present, and ESCALATE that reading.${survivors}`,
     metadata: {
       syncLogId: row.id,
       type: row.type,
