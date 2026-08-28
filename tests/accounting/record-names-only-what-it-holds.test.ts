@@ -3126,6 +3126,29 @@ test('ROUND 20 (Codex HIGH): every string the renderer emits is one written out 
  * the CHECKER's literal type, which folds only when the type itself admits exactly one string —
  * which is knowledge about the program, not a stand-in for a runtime value.
  *
+ * AND A CALL BOUNDARY IS NOT A LAUNDERING STEP (round 24, Codex HIGH). Rounds 22 and 23 each closed
+ * one place where a TYPE stood in for a VALUE, and each left the next one open. Codex's third route
+ * on the same axis went through a HELPER: assert at the ARGUMENT, and what the walk reads on the
+ * other side is the PARAMETER's declared type — which round 23 trusted unconditionally, because a
+ * parameter annotation is normally somebody's own contract. Two things had to be wrong at once:
+ *
+ *   • THE ORDER. `resolveProperty`/`resolveElement` consulted the checker-literal fallback BEFORE
+ *     propagating an `UNKNOWN` receiver, so a value this walk had already refused came back
+ *     concrete off its own declaration. That is now the first thing either of them does, and it is
+ *     unconditional: an unknown receiver makes its property unknown, whatever the type says. This
+ *     is the invariant, not a case — it deletes an ordering rather than adding an exception.
+ *   • THE TRUST. A parameter's declared literal type is honest exactly as far as the ARGUMENT bound
+ *     to it is, so `originFrames` carries each argument's provenance into the frame and
+ *     `symbolOrigin` reads it back. A parameter with NO entry was never given an argument — it is a
+ *     root this walk supplied itself, and its annotation is the module's own word. That is what
+ *     keeps `direction.target` folding, and it is why the computed set is still one sentence per
+ *     direction rather than every branch taken both ways.
+ *
+ * ONE FIX WOULD NOT HAVE DONE. Codex's own route is closed by either; the receiver in it is
+ * `UNKNOWN`. But assert over `direction` instead and the receiver is `OPAQUE`, so propagation never
+ * fires and only provenance refuses it. Control (L) holds both halves, each against the evaluator
+ * that lacked it.
+ *
  * `contextBinding` exists ONLY so a control can re-run this walk with the pre-fix concrete binding
  * and demonstrate that the branch is pruned again. Nothing else passes anything but `'SYMBOLIC'`.
  */
