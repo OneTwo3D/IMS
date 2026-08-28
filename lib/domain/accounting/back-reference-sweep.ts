@@ -1825,8 +1825,25 @@ export async function repairAccountingBackReferences(
             // classification calls REBUILT — an invoice PDF is assembled from `externalTransactionId`
             // and `referenceId`, both of which a tombstone keeps. Enqueue, then announce: the
             // announcement gates the SETTLE (o3d-nepa r4) and must never gate the work.
+            //
+            // AND IT IS CLAIMED AND ITS ANSWER IS READ (o3d-0bfh, applied to the enqueue o3d-bqw7 r2
+            // added here). This branch acquired an enqueue and kept a settlement that predates it:
+            // `markChecked` below discharges the obligation, so an enqueue whose answer was dropped
+            // made this the third alternate release path around the gate the rest of this module now
+            // holds. The re-drive does not throw for a receipt it could not register, so control flow
+            // could never see the case — exactly the shape of the original finding.
+            const obligation = await claimFollowUpObligation(row)
+            if (!obligation.claimed) {
+              if (obligation.contended) {
+                deferSettlement(row.id, 'another run holds this row\'s follow-up obligation, so this pass is not the one to discharge it')
+              } else {
+                result.failed++
+              }
+              continue
+            }
+            let tombstoneOutcome: BackReferenceFollowUpOutcome
             try {
-              await deps.enqueueFollowUps(
+              tombstoneOutcome = await deps.enqueueFollowUps(
                 row.id,
                 row.type,
                 row.referenceType,
@@ -1840,7 +1857,17 @@ export async function repairAccountingBackReferences(
               console.error(`${prefix}: tombstone follow-up enqueue failed`, row.id, followUpError)
               continue
             }
+            // IT RETURNED IS NOT IT SETTLED. Refusing here leaves the row unstamped and still carrying
+            // the generation this pass claimed, which is what brings it back to the next sweep.
+            if (!tombstoneOutcome.deferredReceiptsSettled) {
+              await reportUnsettledReceipts(row, 'already-applied')
+              continue
+            }
             if (discardsFollowUps && !(await reportDiscardedFollowUps(row, 'already-applied'))) continue
+            // Linked, its recoverable half raised and settled, its terminal half announced. Stamped
+            // against the generation THIS run claimed, never the one it merely read.
+            await markChecked(settlementFence(row, obligation.pendingAt))
+            continue
           }
           // Linked, nothing outstanding: reconciled. Stamped, so it never occupies a slot again —
           // unless the row moved under this verdict, in which case the fence refuses and the next
@@ -1858,28 +1885,33 @@ export async function repairAccountingBackReferences(
         // persisted, nothing else is done to the row: the link is still missing, so the next sweep
         // repeats this pass from the top rather than linking a document whose outstanding work
         // nothing records.
-        // The marker generation this run's settlement will be fenced on: the one already on the row
-        // when a claim was unnecessary, the one just written when it was, and (for a tombstone,
-        // which claims nothing) whatever the row was read with.
+        // The marker generation this run's settlement will be fenced on: the one just written by the
+        // claim below, never the one the row was merely read with.
         //
         // AND THE CLAIM IS EXCLUSIVE (o3d-0bfh r3): losing it means another run already owns this
         // row's obligation, so this one stops HERE — before the id write and before the enqueue —
         // rather than doing the work twice and racing to report a verdict about a generation it does
         // not hold. Nothing has been written yet at this point, so the deferral costs exactly
         // nothing: `missing` is still true and the next sweep repeats the whole pass.
-        let settlementMarker: Date | null = row.backReferenceFollowUpsPendingAt
-        if (!evidenceOnly) {
-          const obligation = await claimFollowUpObligation(row)
-          if (!obligation.claimed) {
-            if (obligation.contended) {
-              deferSettlement(row.id, 'another run holds this row\'s follow-up obligation, so this pass is not the one to discharge it')
-            } else {
-              result.failed++
-            }
-            continue
+        //
+        // A TOMBSTONE CLAIMS TOO. r3 exempted it — "marking a discard as pending would promise a
+        // retry that can never happen" — and that was true while a tombstone skipped the enqueue
+        // entirely. o3d-bqw7 r2 removed the skip: the rebuildable half (an invoice PDF, built from
+        // `externalTransactionId` and `referenceId`, which compaction keeps) goes out on this path
+        // like any other row's. So there IS a retry to promise, and there is an enqueue whose answer
+        // two overlapping runs can disagree about — which is the entire condition the claim exists
+        // for. Exempting it would have left one run discharging the generation the other is still
+        // truthfully holding.
+        const obligation = await claimFollowUpObligation(row)
+        if (!obligation.claimed) {
+          if (obligation.contended) {
+            deferSettlement(row.id, 'another run holds this row\'s follow-up obligation, so this pass is not the one to discharge it')
+          } else {
+            result.failed++
           }
-          settlementMarker = obligation.pendingAt
+          continue
         }
+        const settlementMarker: Date | null = obligation.pendingAt
 
         // Where the write actually landed. For a PO-keyed row that is the bill the FENCED
         // attribution chose, which is the only attribution that ever reaches a write.

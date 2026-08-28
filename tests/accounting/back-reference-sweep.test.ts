@@ -3143,3 +3143,148 @@ test('[o3d-0bfh r3] a row that goes stale INSIDE the page it was read in loses i
   assert.ok(harness.store.syncRows.find((row) => row.id === 'log-0001')!.backReferenceCheckedAt,
     'while the row that owned its generation settles as usual — the deferral is about a row, not about the run')
 })
+
+// ---------------------------------------------------------------------------
+// THE TWO PATHS THE MERGE CREATED, AND NEITHER SIDE COULD HAVE SEEN ALONE.
+//
+// o3d-bqw7 r2 gave the TOMBSTONE an enqueue on two paths that had never had one — its rebuildable
+// half (an invoice PDF, assembled from `externalTransactionId` and `referenceId`, which compaction
+// keeps) had been thrown away. o3d-0bfh, separately, established that an enqueue's answer is a
+// return value and not control flow, and that a run may only discharge a generation it CLAIMED.
+//
+// Put together, each of those new enqueues arrived outside both rules:
+//
+//   (a) the LINKED tombstone (`!missing && evidenceOnly && owesFollowUps`) enqueued, dropped the
+//       answer, and ran `markChecked` — which clears `backReferenceFollowUpsPendingAt`. A receipt
+//       the re-drive could not register was therefore released, permanently, by the one path that
+//       had no gate on it. This is the same defect o3d-0bfh fixed on the other three call sites.
+//
+//   (b) the REPAIR path exempted a tombstone from the obligation claim, on r3's reasoning that a
+//       tombstone runs no enqueue and so cannot disagree with an overlapping run about one. That
+//       reasoning is exactly what o3d-bqw7 r2 removed.
+//
+// Both are the merge's own defect: neither branch contained it, and a clean rebase would have
+// shipped it. The tests below drive each, and each names the mutation that restores it.
+// ---------------------------------------------------------------------------
+
+test('[o3d-0bfh + o3d-bqw7 r2] a LINKED tombstone whose receipt is still unregistered is NOT stamped', async () => {
+  // MUTATION THAT KILLS THIS: delete the `if (!tombstoneOutcome.deferredReceiptsSettled)` branch in
+  // the `evidenceOnly && owesFollowUps` arm (equivalently, restore the bare
+  // `await deps.enqueueFollowUps(...)` that discards its answer). The discard warning is then
+  // announced and `markChecked` settles the row: stamped, marker cleared, receipt gone.
+  const harness = makeHarness({
+    syncRows: [salesInvoiceRow(1, {
+      status: 'FAILED',
+      payload: {},
+      backReferenceEvidenceCompactedAt: at(500),
+      connectionProvenance: 'xero:tenant-A',
+      // It RECORDED a payment obligation, so the terminal discard below is a true one — which is
+      // what makes the ordering matter: refusing must happen before the discard consumes the marker.
+      followUpObligations: ['payment-registration', 'invoice-pdf'],
+    })],
+    bills: [],
+    // Already linked: `missing` is false, so this is the reconciled arm and not the repair.
+    orders: [{ id: 'so-1', accountingInvoiceId: 'XINV-1' }],
+  })
+  harness.unsettledFollowUpsFor.add('log-0001')
+
+  const run = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+
+  assert.deepEqual(harness.followUps.map((entry) => entry.entryId), ['log-0001'],
+    'the rebuildable half still goes out — the finding is about what is RELEASED on the strength of it')
+  assert.equal(run.followUpsUnsettled, 1, 'and the outstanding receipt is counted, never absorbed')
+  assert.equal(run.failed, 0, 'the enqueue ran and answered truthfully; that is not a failure')
+
+  const row = harness.store.syncRows[0]
+  assert.equal(row.backReferenceCheckedAt, null,
+    'a stamped row is never a candidate again, so stamping this one loses the receipt for good')
+  assert.ok(row.backReferenceFollowUpsPendingAt, 'the marker is the only record that the money is still owed')
+
+  const retained = harness.activities.find((entry) => entry.action === 'xero_backreference_followups_retained')
+  assert.ok(retained, 'the outstanding receipt is announced')
+  assert.equal(retained.metadata.phase, 'already-applied')
+  assert.equal(
+    harness.activities.find((entry) => entry.action === 'xero_backreference_followups_discarded'),
+    undefined,
+    'and the TERMINAL discard is not announced on a pass that also failed to register a receipt: it '
+      + 'consumes the marker, which is the record the receipt is still owed',
+  )
+
+  // It comes back and settles once the receipt lands — a deferral, not an abandonment.
+  harness.unsettledFollowUpsFor.clear()
+  const second = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+  assert.equal(second.followUpsUnsettled, 0)
+  assert.ok(harness.store.syncRows[0].backReferenceCheckedAt, 'settled on the second pass')
+  assert.ok(
+    harness.activities.some((entry) => entry.action === 'xero_backreference_followups_discarded'),
+    'and only NOW is the permanent loss announced',
+  )
+})
+
+test('[o3d-0bfh r3 + o3d-bqw7 r2] a TOMBSTONE that loses the obligation claim writes nothing at all', async () => {
+  // MUTATION THAT KILLS THIS: restore the `if (!evidenceOnly)` guard around
+  // `claimFollowUpObligation` on the repair path (and with it
+  // `settlementMarker = row.backReferenceFollowUpsPendingAt`). The tombstone then skips the claim,
+  // writes the link, runs the enqueue against a generation another writer holds, and only discovers
+  // it had no right to when the settlement fence refuses one step later — which is precisely the
+  // "did the work first, asked afterwards" shape r3 exists to prevent.
+  const harness = makeHarness({
+    syncRows: [salesInvoiceRow(1, {
+      status: 'FAILED',
+      payload: {},
+      backReferenceEvidenceCompactedAt: at(500),
+      backReferenceFollowUpsPendingAt: at(500),
+      connectionProvenance: 'xero:tenant-A',
+      followUpObligations: ['invoice-pdf'],
+    })],
+    bills: [],
+    // NOT linked: `missing` is true, so this is the repair path.
+    orders: [{ id: 'so-1', accountingInvoiceId: null }],
+  })
+  // A connector post re-claims the obligation between this run reading the row and claiming it.
+  harness.raceAfterProbe = (rows) => { rows[0].backReferenceFollowUpsPendingAt = at(999) }
+
+  const run = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+
+  assert.equal(run.repaired, 0, 'no link is written by a run that does not own the obligation')
+  assert.equal(harness.store.orders[0].accountingInvoiceId, null, 'and the sale is untouched')
+  assert.equal(harness.followUps.length, 0,
+    'and the rebuildable half is NOT raised against a generation somebody else holds')
+  assert.equal(run.failed, 0, 'losing a race is not a failure')
+  assert.equal(run.settlementDeferred, 1, 'it is a deferral, and a counted one')
+
+  const row = harness.store.syncRows[0]
+  assert.deepEqual(row.backReferenceFollowUpsPendingAt, at(999), 'the other writer\'s obligation is intact')
+  assert.equal(row.backReferenceCheckedAt, null)
+  const { where } = buildBackReferenceCandidateQuery({
+    connector: 'xero', after: null, ambiguityRecheckBefore: at(0), take: 10,
+  })
+  assert.equal(matches(row as unknown as Record<string, unknown>, where, SYNC_COLUMNS), true, 'and it comes back')
+})
+
+test('[o3d-0bfh r3 + o3d-bqw7 r2] CONTROL: an undisturbed TOMBSTONE still claims, repairs and settles', async () => {
+  // THE CONTROL, and it is load-bearing: a claim that could never succeed for a tombstone would
+  // satisfy the test above while retiring the sweep's ability to repair one at all — which is the
+  // work o3d-bqw7 r2 added in the first place.
+  const harness = makeHarness({
+    syncRows: [salesInvoiceRow(1, {
+      status: 'FAILED',
+      payload: {},
+      backReferenceEvidenceCompactedAt: at(500),
+      connectionProvenance: 'xero:tenant-A',
+      followUpObligations: ['invoice-pdf'],
+    })],
+    bills: [],
+    orders: [{ id: 'so-1', accountingInvoiceId: null }],
+  })
+
+  const run = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+
+  assert.equal(run.repaired, 1, 'the link is written')
+  assert.equal(harness.store.orders[0].accountingInvoiceId, 'XINV-1')
+  assert.deepEqual(harness.followUps.map((entry) => entry.entryId), ['log-0001'], 'the rebuildable half goes out')
+  assert.equal(run.settlementDeferred, 0)
+  const row = harness.store.syncRows[0]
+  assert.ok(row.backReferenceCheckedAt, 'and it settles')
+  assert.equal(row.backReferenceFollowUpsPendingAt, null, 'discharging the generation THIS run claimed')
+})
