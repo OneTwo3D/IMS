@@ -1064,7 +1064,7 @@ and nothing else:
 
 | state | what happens |
 | --- | --- |
-| no protected copy yet | the checkout's helper is staged into the root-owned directory and published there. Trust on first use, named as such: there is no earlier artefact and no operator digest, and the alternative is a mechanism that cannot start. An expected digest is still enforced if one was supplied. |
+| no protected copy yet | the checkout's helper **and its resolved dependency closure** are staged into the root-owned directory and published there. Trust on first use — and since r33 the run **says so**, names the path that made the source application-writable, and prints the artefact digest to pin every host after this one with. There is no earlier artefact and no operator digest, and the alternative is a mechanism that cannot start. A supplied digest is still enforced, and `IMS_FENCE_SCRIPT_SHA256` **on its own is refused here**: see below. |
 | a protected copy, no expected digest | the protected copy is used unchanged. A checkout that **differs** is reported — both digests, and the invocation that would adopt it — and **not** promoted. |
 | a protected copy and an expected digest | an authenticated rotation (below). |
 
@@ -1080,8 +1080,32 @@ invocation*:
 
 ```bash
 # as root, from the release tree being deployed
-IMS_FENCE_SCRIPT_SHA256=<digest of the release's fence helper> bash /path/to/release/scripts/update.sh
+IMS_FENCE_SCRIPT_SHA256=<digest of the release's entry file> \
+IMS_FENCE_ARTEFACT_SHA256=<digest of the whole artefact tree> \
+  bash /path/to/release/scripts/update.sh
 ```
+
+**Both, from an application-writable checkout — and that is what the script-only pin now means.**
+`IMS_FENCE_SCRIPT_SHA256` authenticates the **entry file**, which is roughly a tenth of what runs:
+the artefact also vendors the helper's dependency closure out of `APP_DIR/node_modules`, and the
+account that owns that directory can leave the legitimate helper untouched, replace one file inside
+`pg`, and have those bytes sealed, digested and recorded as the trusted artefact. `pg` is imported
+*before* `main()`, so it can report a fence that was never raised. So the entry-file pin is
+sufficient **by itself only when the source the closure is assembled from is already one nobody
+else can write** — every path the vendoring reads owned by the publishing account (root) and
+writable by no one else. From an application-writable checkout — which is every ordinary
+deployment — it is **refused as insufficient**, naming `IMS_FENCE_ARTEFACT_SHA256` and three ways
+to obtain it, rather than publishing an unauthenticated closure under a pin that reads like
+authorisation. It is *not* refused where nothing would be published: a pin that already matches the
+standing copy is still "nothing to rotate".
+
+**Where the whole-tree digest comes from before you have one.** From the release, or from a host
+that has already published it (`grep '^fence_artefact_sha256=' /etc/ims-cutover-recovery/db-fence-artefact.sha256`),
+or from `--dry-run` on the box itself: the dry run assembles exactly the tree a real run would
+publish, into a throwaway root-owned directory, prints what it hashes to, and writes nothing. A
+refusal also reports the value the checkout in front of it assembles to — clearly labelled as
+**reported and not authenticated**, because it is what the tree under question says about itself.
+Compare it with the release before pinning with it.
 
 The digest comes **from the release and not from the box** — `git show <tag>:scripts/fence-db-connections.mjs | sha256sum`
 run somewhere that is *not* the machine being deployed, or the checksum published with the release.
@@ -1224,16 +1248,23 @@ install; if that is ever true here, the entry-file digest is still exact and the
 degrades to "identical to what this box published", which is what the standing record is for.
 
 **`IMS_FENCE_ARTEFACT_SHA256` pins the whole tree**, the way `IMS_FENCE_SCRIPT_SHA256` pins the
-entry file — and it is the stronger of the two. Supplied, it is enforced **at publication** (the
-staged tree must hash to it, or nothing is published) *and* **at every execution** (the standing
-record must say it, or nothing is run). It is what an operator who has already published a release
-on one host uses to require byte-identity on the next.
+entry file — and it is the stronger of the two, so much so that since r33 it is the **required**
+one for any publication out of an application-writable checkout. Supplied, it is enforced **at
+publication** (the staged tree must hash to it, or nothing is published) *and* **at every
+execution** (the standing record must say it, or nothing is run). It is what an operator who has
+already published a release on one host uses to require byte-identity on the next.
 
 **What the application account still controls — stated rather than implied.**
 
 * **Bootstrap.** The first publication takes the entry file *and the packages* from the checkout,
-  because there is nothing else on the box to take them from. `IMS_FENCE_SCRIPT_SHA256` and
-  `IMS_FENCE_ARTEFACT_SHA256` are how an operator refuses to trust that.
+  because there is nothing else on the box to take them from. `IMS_FENCE_ARTEFACT_SHA256` is how
+  an operator refuses to trust that; `IMS_FENCE_SCRIPT_SHA256` alone is **not**, and is refused
+  here rather than accepted for less than it appears to cover. An **unpinned** bootstrap still
+  proceeds — refusing it would leave a mechanism that cannot start on a release nobody has
+  published anywhere yet — but it is no longer silent: the run prints `TRUST ON FIRST USE`, names
+  the path that made the source application-writable, and gives the digest to pin the next host
+  with. That one publication is the only moment the application account can choose these bytes;
+  from then on the tree is root-owned and its digest is verified before every execution.
 * **The process it runs as.** The helper is executed **as the application user** on every in-script
   path, by design — the fence state file has to be releasable by that account — so
   `DEPLOY_ADMIN_DATABASE_URL` is reachable from that account through `/proc` and `ptrace` whatever
@@ -1260,30 +1291,49 @@ before it. Two separate defects of one kind:
 * the re-fence banner — printed at the single highest-pressure moment in the script, schema moved
   and fence down — still said `node ${DB_FENCE_SCRIPT} --fence`, the **application-owned** path.
 
-So nothing prints a command line any more. Root writes two wrappers at fence time, and the banners
-print their paths:
+So nothing prints a command line any more. Root writes two wrappers at fence time:
 
 ```bash
-/etc/ims-cutover-recovery/release-db-fence      # release the standing fence
-/etc/ims-cutover-recovery/refence-db            # raise it again
+sudo /etc/ims-cutover-recovery/release-db-fence      # release the standing fence
+sudo /etc/ims-cutover-recovery/refence-db            # raise it again
 ```
 
 Each one is root-owned and `0700`, **never sources anything from the checkout**, carries this run's
 state file and four identity values baked in, re-verifies the artefact digest before `exec`, takes
 `DEPLOY_ADMIN_DATABASE_URL` from its own environment or from `APP_DIR/.env` with the same one-key
-reader the entrypoints use, and runs the helper **as the application user**. Run either as root
-(or as the application account itself). There is nothing to fill in:
+reader the entrypoints use, and runs the helper **as the application user**. There is nothing to
+fill in.
+
+**r33: the banners print the `sudo`, and that is not decoration.** r32 asked of every printed line
+"would it run if pasted?" and answered yes for these — correctly for root, and wrongly for the
+person most likely to be reading them. The wrappers are `0700` and root-owned, so the operator who
+launched the cutover as `sudo bash scripts/update.sh` is back in a **non-root shell** when the
+banner appears and a bare path gives them `Permission denied` at the one moment there is no time to
+debug it. The question is therefore asked as *would this run when pasted by the account that reads
+it*. The mode stays `0700` rather than being opened to the application account: the point of the
+artefact is that the account being defended against does not choose what runs beside
+`DEPLOY_ADMIN_DATABASE_URL`, and a wrapper it can execute is one it can invoke at a moment of its
+own choosing. Where `sudo` is not installed the banners print the bare path, and that is right
+rather than a fallback — the entrypoints refuse to run as anything but root, so a box without
+`sudo` is one whose banner can only be being read by root.
+
+If no credential can be found the wrapper says exactly what to set, in the same form, with its own
+absolute path:
 
 ```bash
-sudo /etc/ims-cutover-recovery/release-db-fence
-```
-
-and if no credential can be found it says exactly what to set:
-
-```bash
-DEPLOY_ADMIN_DATABASE_URL='postgresql://ADMIN:PASSWORD@HOST:PORT/DATABASE' \
+sudo env DEPLOY_ADMIN_DATABASE_URL='postgresql://ADMIN:PASSWORD@HOST:PORT/DATABASE' \
   /etc/ims-cutover-recovery/release-db-fence
 ```
+
+`sudo env VAR=…`, not `VAR=… /path`: `sudo` does not accept assignments before the command, and the
+bare assignment form is the one that has just been shown to be `Permission denied`.
+
+Two printed instructions whose answer does **not** differ by account, for completeness: the
+artefact-mismatch message's `cd /etc/ims-cutover-recovery/app && sha256sum -c …` runs for either
+reader — the recovery directory is `0755` and the artefact tree world-readable, because the fence
+itself runs as the application user — and the recovery invocation that re-runs an entrypoint now
+carries the same transition (`sudo env DEPLOY_ADMIN_DATABASE_URL=… bash …`), since those scripts
+refuse to run as anything but root.
 
 **The credential is the part no record may hold.** `DEPLOY_ADMIN_DATABASE_URL` carries a password
 and is written nowhere by these scripts. On a recovery where `APP_DIR/.env` is gone it can only
