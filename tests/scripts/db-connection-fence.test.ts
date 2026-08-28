@@ -2805,7 +2805,13 @@ test('o3d-2sm1.5 r22: the re-read stands at the fence, at the release, and after
     assert.ok(anchor > 0, `${name}: precondition — the start path is where it says it is`)
     const preRelease = source.indexOf('require_start_identity_unchanged ||', anchor)
     const release = source.indexOf('release_db_connections \\', anchor)
-    const reboot = source.indexOf('remove_reboot_fence', release)
+    // THE CALL, NOT THE WORD. `remove_reboot_fence` is named in the comment above the second
+    // re-read, so indexOf() on the bare name found that comment and the ordering assertion below
+    // passed with the re-read moved to the WRONG SIDE of the reload — proved by running exactly
+    // that mutation. A line that is only the call cannot be satisfied by prose.
+    const rebootOffset = source.slice(release).search(/^remove_reboot_fence$/m)
+    assert.ok(rebootOffset > 0, `${name}: precondition — the reboot fence comes down by a call, on its own line`)
+    const reboot = release + rebootOffset
     const postReload = source.indexOf('require_start_identity_unchanged ||', reboot)
     const start = source.indexOf(anchors.start, reboot)
     assert.ok(preRelease > anchor && preRelease < release, `${name}: re-read while the fence is still held`)
