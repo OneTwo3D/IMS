@@ -2139,6 +2139,30 @@ export async function repairAccountingBackReferences(
               console.error(`${prefix}: tombstone follow-up enqueue failed`, row.id, followUpError)
               continue
             }
+            // AND A REFUSAL IS NOT AN ENQUEUE AT ALL (o3d-peh1 follow-up, Codex HIGH). This branch
+            // read ONE of the two independent facts the outcome carries. `enqueued: false` and
+            // `deferredReceiptsSettled: true` is a reachable combination — the connector declines
+            // the enqueue for a reason that has nothing to do with receipts (an ambiguous
+            // idempotency-token history, a ledger that will not confirm the attempt is absent, an
+            // unprobed unfenced reuse target) while the deferred-receipt re-drive has nothing
+            // outstanding to report — and on that combination this branch announced the terminal
+            // discard, CONSUMED the marker and stamped the row, with the rebuildable half never
+            // queued and nothing anywhere saying so. That is the same defect the two-axis outcome
+            // was composed to prevent, at the one call site that never got the memo.
+            //
+            // Asked FIRST, exactly as at the two sibling call sites: before the receipt question,
+            // because the refusal is the answer that explains why nothing went out; and before the
+            // terminal discard below, because that discard consumes the marker, and consuming it
+            // for a rebuildable half that was never queued is the silence both findings exist to
+            // remove.
+            //
+            // Counted as a failure like the sibling in `settleOutstandingFollowUpsOnly`, and unlike
+            // the repair path: this pass wrote NOTHING — the row was already linked — so there is
+            // no real repair for the count to hide.
+            if (!(await reportRefusedFollowUps(row, tombstoneOutcome))) {
+              result.failed++
+              continue
+            }
             // IT RETURNED IS NOT IT SETTLED. Refusing here leaves the row unstamped and still carrying
             // the generation this pass claimed, which is what brings it back to the next sweep.
             if (!tombstoneOutcome.deferredReceiptsSettled) {
