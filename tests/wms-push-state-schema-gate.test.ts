@@ -906,22 +906,38 @@ test('o3d-2k5r r11: an UNQUOTED mixed-case search_path is the schema the SERVER 
     '-c search_path="TenantA"',
   )
 
-  // AN UNQUOTED NAME THIS CANNOT FOLD THE SERVER'S WAY IS REFUSED. PostgreSQL maps case on
-  // non-ASCII letters with the database's own encoding and collation, so `Ünster` unquoted is a
-  // schema whose real name is not knowable from here — and guessing it is how a pin lands
-  // somewhere nobody asked for.
+  // A NON-ASCII NAME IS REFUSED, QUOTED OR NOT (o3d-2k5r r18, Codex HIGH). Round 11 refused the
+  // UNQUOTED spelling because PostgreSQL maps case on non-ASCII letters with the database's own
+  // encoding and collation, and let the QUOTED one through as "the way to say what was meant".
+  // That exemption assumed the quotes decide the boundaries. They do not: `pg_split_opts()` asks
+  // `isspace()` one BYTE at a time, before any quote has meaning, so a byte of `Ü` classed as
+  // space by the deployment's LC_CTYPE ends the token inside the quoted name — an unterminated
+  // quote at the server, or a different schema. Both spellings are now refused by
+  // `splitLibpqOptions()` on the one shared justification.
   //
-  // MUTATION ROUTE: fold with String.prototype.toLowerCase() instead of the ASCII-only map and
-  // this stops throwing, silently pinning a name JavaScript's Unicode rules produced rather than
-  // the server's.
-  assert.throws(
-    () => pgConnectionConfig('postgresql://u:p@localhost:5432/ims?options=-c%20search_path%3D%C3%9Cnster'),
-    DatabaseUrlSchemaConflictError,
-  )
-  // ...and quoting it names it exactly, so there is a way to say what was meant.
+  // MUTATION ROUTE: delete the NON_ASCII_OPTION_CHARACTER branch from splitLibpqOptions(). The
+  // quoted assertion below stops throwing and pins `-c search_path="Ünster"` again — round 11's
+  // behaviour, restored. The unquoted one still throws, from foldUnquotedIdentifier(), but on the
+  // fold reason rather than the byte one, so the message assertion fails: which refusal answers
+  // this URL is the thing that changed.
+  for (const [spelling, url] of [
+    ['unquoted', 'postgresql://u:p@localhost:5432/ims?options=-c%20search_path%3D%C3%9Cnster'],
+    ['quoted', 'postgresql://u:p@localhost:5432/ims?options=-c%20search_path%3D%22%C3%9Cnster%22'],
+  ] as [string, string][]) {
+    assert.throws(
+      () => pgConnectionConfig(url),
+      (error: unknown) => {
+        assert.ok(error instanceof DatabaseUrlSchemaConflictError, `${spelling}: refused`)
+        assert.match((error as Error).message, /ONE BYTE AT A TIME/, `${spelling}: on the byte-level reason`)
+        return true
+      },
+    )
+  }
+  // AND THE ASCII CONTROL, so this is a refusal of non-ASCII and not of quoting: the quoted
+  // spelling still names a schema exactly, which is what round 11 established and round 18 keeps.
   assert.equal(
-    pgConnectionConfig('postgresql://u:p@localhost:5432/ims?options=-c%20search_path%3D%22%C3%9Cnster%22').options,
-    '-c search_path="Ünster"',
+    pgConnectionConfig('postgresql://u:p@localhost:5432/ims?options=-c%20search_path%3D%22Unster%22').options,
+    '-c search_path="Unster"',
   )
 })
 
