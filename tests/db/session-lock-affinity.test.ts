@@ -373,7 +373,7 @@ test('o3d-a5zz: an override naming a DIFFERENT database is refused, not used', (
     () => pgSessionLockConnectionConfig('postgresql://app:pw@pooler:6432/ims?schema=public', 'postgresql://app:pw@10.0.0.5:5432/other?schema=public'),
     (error: unknown) => {
       assert.ok(error instanceof DatabaseUrlSchemaConflictError)
-      assert.match((error as Error).message, /"other".*"ims"|"ims".*"other"/s)
+      assert.match((error as Error).message, /"other"[\s\S]*"ims"|"ims"[\s\S]*"other"/)
       return true
     },
   )
