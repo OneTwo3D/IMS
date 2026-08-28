@@ -10,6 +10,7 @@ import {
   checkoutPgEntry,
   protectedLibraryLines,
   protectedLibraryLinesAt,
+  sealCheckoutModes,
   writeCheckoutPg,
   protectedPaths,
   writeFenceCheckout,
@@ -8783,7 +8784,8 @@ test('r34: a directory ABOVE the application directory is part of the provenance
   //      succeeds — which is the finding, exactly.
   //   2. drop `-a ! -perm -1000` from that clause: CASE 3 fails, and so does every other test in
   //      this file that builds a checkout under /tmp (1777), which is the availability trap the
-  //      relaxation exists to avoid — measured: 9 further failures in this file.
+  //      relaxation exists to avoid — measured: 51 of this file's 328 tests fail, the whole fence
+  //      estate, because no fixture can assemble a trusted source any more.
   //   3. drop `-a ! -uid 0` from it: CASE 2 fails on any box where a parent of the scratch
   //      directory is root-owned, for the same reason.
   const root = mkdtempSync(join(tmpdir(), 'ims-r34-anc-'))
@@ -8862,8 +8864,9 @@ test('r34: the provenance answer is about the bytes that were COPIED, not the on
   // MUTATION ROUTE (each verified by making the change locally and re-running):
   //   1. move the `_fence_source_trust` call back above the copy loop AND delete the before/after
   //      comparison — r33's order — and the publication SUCCEEDS: measured, ${recovery}/app is
-  //      standing and its node_modules/pg/lib/index.js holds DECOY-PG, i.e. the bytes that
-  //      arrived after the judgement was made.
+  //      standing and its node_modules/pg-protocol/index.js holds DECOY-PROTOCOL. The closure is
+  //      copied in sorted order, so the swap lands between `pg` and `pg-protocol` and the second
+  //      package is read out of a tree that arrived after the judgement was made.
   //   2. keep the copy-first order but delete only the before/after comparison: the same, because
   //      the decoy is indistinguishable from the original by ownership and mode.
   //   3. drop _FENCE_SRC_PARENTS from _fence_source_ident(): a swap of ${app_dir} itself is still
@@ -8874,6 +8877,14 @@ test('r34: the provenance answer is about the bytes that were COPIED, not the on
   try {
     writeFenceCheckout(root, '// helper\n')
     writeFenceCheckout(decoyRoot, '// helper\n', "module.exports = { Client: class {}, FLAVOUR: 'DECOY-PG' }\n")
+    // THE SECOND package differs too, and it is the one that matters: the closure is copied in
+    // sorted order, so `pg` is already in the staging tree when the swap happens and
+    // `pg-protocol` is the package read out of the decoy.
+    writeFileSync(
+      join(decoyRoot, 'app', 'node_modules', 'pg-protocol', 'index.js'),
+      "module.exports = { FLAVOUR: 'DECOY-PROTOCOL' }\n",
+    )
+    sealCheckoutModes(join(decoyRoot, 'app'))
     const appDir = join(root, 'app')
     const paths = protectedPaths(root)
 
@@ -8899,6 +8910,11 @@ test('r34: the provenance answer is about the bytes that were COPIED, not the on
     // PRECONDITION: the swap really happened, so the refusal is not passing for another reason.
     assert.ok(existsSync(join(root, 'app.original')), 'precondition: the original tree was moved aside')
     assert.match(readFileSync(checkoutPgEntry(root), 'utf8'), /DECOY-PG/, 'precondition: the decoy took its place')
+    assert.match(
+      readFileSync(join(root, 'app', 'node_modules', 'pg-protocol', 'index.js'), 'utf8'),
+      /DECOY-PROTOCOL/,
+      'precondition: and the package the copy had not reached yet is the decoy\'s',
+    )
   } finally {
     rmSync(root, { recursive: true, force: true })
     rmSync(decoyRoot, { recursive: true, force: true })
@@ -9021,11 +9037,14 @@ test('r34: a dry run against a substituted checkout executes no part of it, and 
         'node "${DB_FENCE_PROBE_SCRIPT:-/nonexistent-probe}" --preflight >/dev/null 2>&1; echo "EXEC=$?"',
       ]),
     )
+    // THE WITNESSES FIRST, because they are the finding: under r33's behaviour both of these
+    // files exist by now, and asserting them ahead of everything else is what makes the mutation
+    // route below a MEASUREMENT rather than a prediction.
+    assert.ok(!existsSync(flavour), 'NO part of the checkout helper graph may have run')
+    assert.ok(!existsSync(stolen), 'and DEPLOY_ADMIN_DATABASE_URL may not have reached any of it')
     assert.match(run.output, /^RC=1$/m, `the probe must refuse to nominate anything:\n${run.output}`)
     assert.match(run.output, /^PROBE=\[\]$/m, run.output)
     assert.match(run.output, /^TEMP=\[\]$/m, 'and leave no snapshot behind for a caller to find')
-    assert.ok(!existsSync(flavour), 'NO part of the checkout helper graph may have run')
-    assert.ok(!existsSync(stolen), 'and DEPLOY_ADMIN_DATABASE_URL may not have reached any of it')
     assert.match(run.output, /^EXEC=[1-9][0-9]*$/m, 'the unchecked caller fails, having executed nothing')
 
     // THE ANSWERABILITY IT WAS TRADED AGAINST SURVIVES: the digest was still produced, from the
