@@ -2867,6 +2867,31 @@ test('ROUND 18 (Codex HIGH): a formatter composing a MISMATCHED direction does n
 const UNDECLARED_REMOTE_ACTION = 'Go to that bill and take the second PDF off it.'
 
 /**
+ * THE CONTEXTS THE RUNTIME PASS SAMPLES. Both connector names this installation runs, crossed with
+ * two sync row ids — one the fixture's, one that is not (round 23, Codex HIGH).
+ *
+ * IT IS AT MODULE SCOPE BECAUSE THE THING IT IS EVIDENCE FOR IS ELSEWHERE (round 24, Codex HIGH).
+ * `ledger` has two values and both are sampled, so a branch keyed on it cannot escape a runtime
+ * pass. `syncRowId` is a database id: UNBOUNDED, so any finite sample leaves branches keyed on it
+ * unexercised, and no number of samples closes that. Control (L) in the round-21 test takes exactly
+ * that route and is held to these same four contexts, so "the sampled pass cannot see it" is
+ * asserted against the sample the pass actually uses rather than against a description of it.
+ */
+const RUNTIME_CONTEXTS: readonly LocalDirectionContext[] = [
+  { ledger: 'QuickBooks', syncRowId: 'log-1' },
+  { ledger: 'Xero', syncRowId: 'log-1' },
+  { ledger: 'QuickBooks', syncRowId: 'sync-row-742' },
+  { ledger: 'Xero', syncRowId: 'sync-row-742' },
+]
+
+/**
+ * A SYNC ROW ID NO PASS IN THIS FILE EVER RENDERS WITH, and a real one: 32 hex characters is what
+ * the table holds. Control (L)'s laundered branch is keyed on it, which is what makes that control
+ * a demonstration that a finite sample of an unbounded id closes nothing.
+ */
+const OFF_SAMPLE_SYNC_ROW = 'sync-row-9c2f41d0e7b84a15'
+
+/**
  * THE REVIEWED SENTENCE AS ONE PARTICULAR CONTEXT WOULD PRINT IT (round 23, Codex HIGH).
  *
  * ROUND 22 COMPARED THE OTHER WAY ROUND. It rendered with a real connector name and pushed the
@@ -2948,12 +2973,6 @@ test('ROUND 20 (Codex HIGH): every string the renderer emits is one written out 
   //
   // The sync row id is sampled at a value that is NOT the fixture's for the same reason: coverage
   // that only ever passes 'log-1' cannot see a branch keyed on it (Codex, round 23).
-  const RUNTIME_CONTEXTS: readonly LocalDirectionContext[] = [
-    { ledger: 'QuickBooks', syncRowId: 'log-1' },
-    { ledger: 'Xero', syncRowId: 'log-1' },
-    { ledger: 'QuickBooks', syncRowId: 'sync-row-742' },
-    { ledger: 'Xero', syncRowId: 'sync-row-742' },
-  ]
   for (const runtime of RUNTIME_CONTEXTS) {
     assertRenderedInventory(
       (direction) => renderLocalDirection(direction, runtime),
@@ -4056,7 +4075,7 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
   // RENDERED_DIRECTIONS.
   //
   // Mutation: change any branch's prose, in any way, anywhere it is composed from, and this fails
-  // naming the value it now emits. Eleven controls below (A-K), including the four Codex named.
+  // naming the value it now emits. Twelve controls below (A-L), including the five Codex named.
   const model = await readFile(path.join(process.cwd(), DIRECTION_MODEL_FILE), 'utf8')
   const computed = computeRendererOutput(model)
 
@@ -4437,4 +4456,172 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
     'and the walk must still COMPUTE them with the placeholders in place — a symbol that renders as nothing '
     + 'would make every context-bearing sentence unemittable rather than undecidable',
   )
+
+  // (L) A DISCRIMINANT LAUNDERED ACROSS A HELPER BOUNDARY — THE ROUND-24 ROUTE (Codex HIGH), and
+  // the third control here about the EVALUATOR. Round 23 refused to fold a literal type an `as`
+  // had manufactured — AT THE NODE THE ASSERTION IS ON. This mutation puts a call between the two:
+  // the assertion is on the ARGUMENT, and what the walk reads inside the helper is the PARAMETER's
+  // declared type, which round 23's allowlist trusted unconditionally. Two things had to be wrong
+  // at once for it to work, and each is fixed and controlled separately below.
+  //
+  // (L1) IS THE ORDERING. `JSON.parse(...)` is a value this walk has already given up on: it
+  // resolves to a declaration file, so it is UNKNOWN. But `resolveProperty` asked the checker what
+  // `runtime.syncRowId` is DECLARED to be before propagating that UNKNOWN, so a value the walk had
+  // refused came back concrete off its own parameter's type.
+  const viaRuntimeCopy = model.replace(
+    "      return 'confirm the invoice PDF stored against the order is the document you expect'",
+    '      return fromRuntimeCopy(JSON.parse(JSON.stringify(context)) as { syncRowId: \'claimed-row\' })',
+  ).replace(
+    'function andList(',
+    "function fromRuntimeCopy(runtime: { syncRowId: 'claimed-row' }): string {\n"
+    + "  const offSampleRow: string = '" + OFF_SAMPLE_SYNC_ROW + "'\n"
+    + '  return runtime.syncRowId === offSampleRow\n'
+    + "    ? '" + UNDECLARED_REMOTE_ACTION + "'\n"
+    + "    : 'confirm the invoice PDF stored against the order is the document you expect'\n"
+    + '}\n\nfunction andList(',
+  )
+  assert.notEqual(viaRuntimeCopy, model, 'the runtime-copy mutation must actually have been applied')
+  // AND IT IS A MUTATION THE COMPILER ADMITS, byte for byte the same diagnostics as the shipped
+  // model: `JSON.parse` is `any`, so the assertion is legal, and `offSampleRow` is `string`, so the
+  // comparison is not the "have no overlap" one TypeScript rejects.
+  assert.deepEqual(
+    modelDiagnostics(viaRuntimeCopy), modelDiagnostics(model),
+    'the runtime-copy mutation must type-check exactly as the shipped model does, or it is not a route '
+    + 'anybody could take',
+  )
+  const runtimeCopyComplaints = judgeRendererOutput(viaRuntimeCopy)
+  assert.ok(
+    runtimeCopyComplaints.some((complaint) => complaint.startsWith('emits a sentence nobody reviewed')
+      && complaint.includes('take the second PDF off it')),
+    'CONTROL: a property read off a receiver this walk holds as UNKNOWN must stay UNKNOWN. A type says what a '
+    + 'value MAY be; this walk is computing what it IS, and consulting the declaration instead re-concretizes '
+    + `exactly the value the walk had already refused. Saw: ${JSON.stringify(runtimeCopyComplaints)}`,
+  )
+  // ...AND THE PRE-FIX ORDERING LETS IT THROUGH, asserted rather than described — the same shape as
+  // (J) and (K). Re-run the SAME judgement over the SAME mutated renderer with the round-23
+  // evaluator: the checker-literal fallback consulted before the UNKNOWN propagates, and provenance
+  // traced only as far as the call boundary. It reports a clean inventory while the sentence ships.
+  assert.deepEqual(
+    judgeRendererOutput(viaRuntimeCopy, {}, 'SYMBOLIC', 'CALL_LOCAL', 'DEFERRED'), [],
+    'THE ROUND-23 EVALUATOR MUST STILL LET IT THROUGH — if it also refused this, control (L) would be passing '
+    + 'for some other reason and would prove nothing about either fix',
+  )
+  // ...and EACH FIX ALONE closes this particular route, which is why (1) was taken as the invariant
+  // rather than as one more case: propagating the UNKNOWN removes the ordering, and carrying the
+  // argument's provenance removes the trust. Both are asserted, so neither can rot into decoration.
+  assert.ok(
+    judgeRendererOutput(viaRuntimeCopy, {}, 'SYMBOLIC', 'CALL_LOCAL', 'PROPAGATED').length > 0,
+    'propagating the UNKNOWN receiver must close this route on its own',
+  )
+  assert.ok(
+    judgeRendererOutput(viaRuntimeCopy, {}, 'SYMBOLIC', 'TRACKED', 'DEFERRED').length > 0,
+    'and so must carrying the argument\'s provenance across the call boundary, on its own',
+  )
+
+  // ...AND THE RUNTIME PASS CANNOT SEE IT, asserted against the sample that pass actually uses.
+  // The laundered branch is keyed on a sync row id, and sync row ids are unbounded: hand-run the
+  // mutated renderer over all four RUNTIME_CONTEXTS and every one reports the reviewed inventory,
+  // because none of them is the id the branch is keyed on. That is the whole reason this route has
+  // to be closed statically — no finite sample of an unbounded id closes it.
+  assert.ok(
+    !RUNTIME_CONTEXTS.some((context) => context.syncRowId === OFF_SAMPLE_SYNC_ROW)
+      && LOCAL_DIRECTION_CONTEXT.syncRowId !== OFF_SAMPLE_SYNC_ROW,
+    'the off-sample id must be off-sample, or the demonstration below is about nothing',
+  )
+  const laundered = (direction: LocalDirection, context: LocalDirectionContext): string => (
+    direction.action === 'CONFIRM' && context.syncRowId === OFF_SAMPLE_SYNC_ROW
+      ? UNDECLARED_REMOTE_ACTION
+      : renderLocalDirection(direction, context)
+  )
+  assert.equal(RUNTIME_CONTEXTS.length, 4, 'the four sampled contexts, unchanged')
+  for (const context of RUNTIME_CONTEXTS) {
+    assertRenderedInventory(
+      (direction) => laundered(direction, context),
+      (text) => substitutePlaceholders(text, context),
+    )
+  }
+  const offSampleContext: LocalDirectionContext = { ledger: 'Xero', syncRowId: OFF_SAMPLE_SYNC_ROW }
+  assert.throws(
+    () => assertRenderedInventory(
+      (direction) => laundered(direction, offSampleContext),
+      (text) => substitutePlaceholders(text, offSampleContext),
+    ),
+    /is NOT the reviewed sentence for it/,
+    'and the SAME renderer refused the moment the id is one nobody sampled — so what the four contexts '
+    + 'established was the ids they carry, not the renderer',
+  )
+
+  // (L2) IS THE TRUST, and it is the half that survives (1). Here the laundered receiver is not
+  // UNKNOWN at all: `direction` is an OPAQUE root, so propagating unknown never fires, and the
+  // parameter's asserted literal type folds exactly as before. THIS ONE FIRES AT RUN TIME — the
+  // assertion claims every escalation names its sync row, and two of the fourteen do not.
+  const viaAssertedArgument = model.replace(
+    "    case 'ESCALATE': {\n"
+    + "      const administrator = 'to whoever administers this installation'\n"
+    + "      if (direction.naming === 'SYNC_ROW') {\n"
+    + '        return `ESCALATE sync row ${context.syncRowId}, with this record, ${administrator}`\n'
+    + '      }\n'
+    + "      return `${direction.caseForm === 'SENTENCE' ? 'Escalate' : 'escalate'} this record ${administrator}`\n"
+    + '    }',
+    "    case 'ESCALATE': {\n"
+    + "      const administrator = 'to whoever administers this installation'\n"
+    + '      return fromAssertedEscalation(\n'
+    + "        direction as { action: 'ESCALATE'; target: 'THIS_RECORD_AND_ITS_SYNC_ROW'; naming: 'SYNC_ROW' },\n"
+    + "        direction.naming === 'SYNC_ROW'\n"
+    + '          ? `ESCALATE sync row ${context.syncRowId}, with this record, ${administrator}`\n'
+    + "          : `${direction.caseForm === 'SENTENCE' ? 'Escalate' : 'escalate'} this record ${administrator}`,\n"
+    + '      )\n'
+    + '    }',
+  ).replace(
+    'function andList(',
+    'function fromAssertedEscalation(\n'
+    + "  claimed: { action: 'ESCALATE'; target: 'THIS_RECORD_AND_ITS_SYNC_ROW'; naming: 'SYNC_ROW' },\n"
+    + '  reviewed: string,\n'
+    + '): string {\n'
+    + "  const recordOnly: string = 'RECORD_ONLY'\n"
+    + "  return claimed.naming === recordOnly ? '" + UNDECLARED_REMOTE_ACTION + "' : reviewed\n"
+    + '}\n\nfunction andList(',
+  )
+  assert.notEqual(viaAssertedArgument, model, 'the asserted-argument mutation must actually have been applied')
+  assert.deepEqual(
+    modelDiagnostics(viaAssertedArgument), modelDiagnostics(model),
+    'the asserted-argument mutation must type-check exactly as the shipped model does — the asserted type IS '
+    + 'one member of the union being asserted from, so this is an assertion TypeScript allows',
+  )
+  const assertedArgumentComplaints = judgeRendererOutput(viaAssertedArgument)
+  assert.ok(
+    assertedArgumentComplaints.some((complaint) => complaint.startsWith('emits a sentence nobody reviewed')
+      && complaint.includes('take the second PDF off it')),
+    'CONTROL, THE CODEX ROUTE: a parameter\'s declared literal type is knowledge about the program only as far '
+    + 'as the ARGUMENT bound to it is. An `as` at the call site manufactures the parameter\'s contract, and the '
+    + `helper boundary is not a laundering step. Saw: ${JSON.stringify(assertedArgumentComplaints)}`,
+  )
+  // ...AND PROPAGATING THE UNKNOWN DOES NOT CLOSE IT, which is the answer to "is (2) still needed":
+  // the receiver here is OPAQUE, not UNKNOWN, so fix (1) never fires and the fold happens anyway.
+  assert.deepEqual(
+    judgeRendererOutput(viaAssertedArgument, {}, 'SYMBOLIC', 'CALL_LOCAL', 'PROPAGATED'), [],
+    'THE ORDERING FIX ALONE MUST STILL LET THIS THROUGH — it is why argument provenance is carried as well as '
+    + 'the UNKNOWN propagated. If this were also refused, carrying provenance would be dead weight',
+  )
+  assert.deepEqual(
+    judgeRendererOutput(viaAssertedArgument, {}, 'SYMBOLIC', 'CALL_LOCAL', 'DEFERRED'), [],
+    'and so must the round-23 evaluator entire',
+  )
+  // ...and this one the runtime pass WOULD have caught, which is the difference between the two
+  // halves of (L) stated as an assertion rather than left to the reader: it fires for every context,
+  // so it is only the STATIC reach that (L2) is about. (L1) is the one no sampling closes.
+  const launderedEscalation = (direction: LocalDirection, context: LocalDirectionContext): string => (
+    direction.action === 'ESCALATE' && direction.naming === 'RECORD_ONLY'
+      ? UNDECLARED_REMOTE_ACTION
+      : renderLocalDirection(direction, context)
+  )
+  for (const context of RUNTIME_CONTEXTS) {
+    assert.throws(
+      () => assertRenderedInventory(
+        (direction) => launderedEscalation(direction, context),
+        (text) => substitutePlaceholders(text, context),
+      ),
+      /is NOT the reviewed sentence for it/,
+    )
+  }
 })
