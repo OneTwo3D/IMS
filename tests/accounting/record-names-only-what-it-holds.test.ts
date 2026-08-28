@@ -1319,8 +1319,9 @@ test('ROUND 15: allowlist removal is a set, not a sequence — the longest span 
 // composition Codex named — must decompose ENTIRELY into three hand-written lists in this file:
 //
 //   LOCAL_DIRECTIONS      the complete inventory of what these records tell an operator to DO.
-//                         Fourteen lines, capped, each naming the IMS-LOCAL object it points at,
-//                         from a closed union type that HAS NO MEMBER for a remote object.
+//                         Fourteen entries, capped. ROUND 17: they are {action, target} STRUCTURES
+//                         with no free-text field, and their prose is generated from them, so the
+//                         closed target union produces the sentence instead of labelling it.
 //   BREADCRUMB_DIRECTIONS the reset breadcrumb's own instructions, which may point at a ledger
 //                         because the records it counts carry their own ids — held to appearing in
 //                         the breadcrumb and in NO per-incident message.
@@ -1341,9 +1342,15 @@ test('ROUND 15: allowlist removal is a set, not a sequence — the longest span 
 // AND WHAT IT DOES NOT BUY, STATED RATHER THAN IMPLIED. Closure makes an UNREVIEWED sentence
 // impossible; it cannot make a REVIEWED one right. Somebody may still add an instruction to
 // RECORD_PROSE and mis-call it prose. That is a deliberate line in this file with a diff attached,
-// not a verb nobody thought of — and it is the last residue. The structured answer, where a
-// directive's target kind, locality and permitted action are TYPED and the prose is generated from
-// them, is Codex's own recommendation and is filed as o3d-cvyv.
+// not a verb nobody thought of — and it is the last residue.
+//
+// ROUND 17 TOOK THE STRUCTURED ANSWER FOR THE DIRECTIONS. Codex's finding on round 16 was that the
+// closed target union was never coupled to the instruction text: `object` was hand-written beside a
+// hand-written `span`, and `object.length > 0` was the only thing joining them, so a direction could
+// declare a local target and instruct something else entirely. LOCAL_DIRECTIONS are now typed
+// {action, target} values whose prose is GENERATED (see `renderLocalDirection`), which is the shape
+// filed as o3d-cvyv, scoped to the fourteen directions rather than the whole module. RECORD_PROSE
+// and BREADCRUMB_DIRECTIONS are still reviewed lists of sentences, and that is the residue above.
 //
 // NOTHING HAD TO BE REMOVED FROM THE SHIPPED TEXT TO GET HERE. Every span below was read against
 // this rule, and rounds 12 to 15 had already deleted the three instructions that broke it ("open
@@ -1410,91 +1417,250 @@ function lookupLessMessages(): { label: string; text: string }[] {
  *
  * A closed union, and the whole safety property is in what it does NOT have: there is no member for
  * a bill, an invoice, a ledger document, a WooCommerce order — for anything in somebody else's
- * system. An instruction at one of those cannot be given a target, so it cannot be written down
- * here, so it cannot ship. That is the difference between this and five rounds of regex: the
- * category is absent from the type rather than excluded by a pattern.
+ * system.
+ *
+ * ROUND 17 (Codex HIGH): THAT UNION USED TO SIT NEXT TO THE SENTENCE INSTEAD OF PRODUCING IT.
+ *
+ * Round 16 paired each direction with a hand-written `span` and a separately hand-written `object`,
+ * and the only thing tying the two together was `assert.ok(object.length > 0)`. So the closed type
+ * constrained a LABEL, and nothing established that the label was the thing the sentence was about.
+ * Codex's route, in full: extend the escalation span with the books/entry/PDF sentence, leave
+ * `object: 'this record and its sync row'` exactly as it stands, leave the cap at 14. The sentence
+ * carries no mutation lexeme, so round 14 passes it; the extended span is a REVIEWED span, so round
+ * 16's closure strips it and passes; TypeScript sees a member of the union and compiles. A remote
+ * instruction ships, and the type that was supposed to make it unrepresentable never read it.
+ *
+ * SO THERE IS NO `span` FIELD ANY MORE. A direction is a discriminated {action, target} value with
+ * typed parameters and NOTHING ELSE — no field of free text anywhere in it — and its prose is
+ * produced by `renderLocalDirection`, a total function whose every branch is selected by the action
+ * and the target. The target does not annotate a sentence somebody else wrote; it CHOOSES the
+ * sentence. Codex's route is a type error now rather than a review failure, because the field the
+ * instruction was smuggled into does not exist.
+ *
+ * AND THE PARAMETERS ARE TYPED TOO, for the same reason: the outbox directions name their columns
+ * from `OutboxReadAxis`, the setting directions cannot name a setting other than the two IMS holds.
+ * There is no string in a direction that a reviewer has to read.
+ *
+ * WHAT THIS STILL DOES NOT BUY, stated rather than implied — the same residue round 16 named for
+ * RECORD_PROSE. The renderer's own strings can be edited, and somebody who writes a remote
+ * instruction into the ESCALATE branch has written a remote instruction. That is a diff on a named
+ * branch of a function, in front of a reviewer, and `LOCAL_DIRECTION_SPANS` must still appear
+ * verbatim in a shipped message, so the edit fails here unless the module ships the same sentence
+ * too. What is GONE is the shape where an instruction arrives as DATA in a field whose neighbouring
+ * label goes on claiming the target is local.
  */
-type LocalObject =
-  | 'the invoice PDF IMS stored against the order'
-  | 'the local EmailOutbox rows'
-  | 'the plugin setting quickbooks_sync_attach_pdf'
-  | 'the plugin setting quickbooks_sync_enabled'
-  | 'this record and its sync row'
+type LocalTarget =
+  | 'ORDER_INVOICE_PDF'
+  | 'EMAIL_OUTBOX_ROWS'
+  | 'SETTING_SYNC_ENABLED'
+  | 'SETTING_ATTACH_PDF'
+  | 'THIS_RECORD_AND_ITS_SYNC_ROW'
+
+/**
+ * What each target IS, and the words a message must already be using for a direction at it to be
+ * about it. The `anchor` is the second half of the coupling: generation makes the sentence a
+ * function of the target, and the anchor check makes the MESSAGE the sentence ships in name that
+ * same target — so a direction cannot be a fragment floating in a message about something else.
+ */
+const LOCAL_TARGET: Record<LocalTarget, {
+  object: string
+  anchor: string
+  /**
+   * Whether naming the anchor DISTINGUISHES this target from the others. Four of the five do: an
+   * outbox direction lands in messages that say "outbox", and there are shipped messages that never
+   * say it, so the check can fail and does discriminate.
+   *
+   * The fifth cannot, and saying so is more honest than choosing a word that looks discriminating.
+   * The target of an escalation IS the record the operator is reading, and every one of these
+   * records names its own sync row — that is the invariant the whole file is built on. So its
+   * anchor is UNIVERSAL: asserting it proves the records still name themselves, and nothing about
+   * which direction landed where. What couples that target is the other half of round 17 — the
+   * ESCALATE branch of `renderLocalDirection` cannot produce prose about anything else, because
+   * there is no field to put other prose in.
+   */
+  reach: 'DISTINGUISHING' | 'UNIVERSAL'
+}> = {
+  ORDER_INVOICE_PDF: {
+    object: 'the invoice PDF IMS stored against the order',
+    anchor: 'invoice PDF',
+    reach: 'DISTINGUISHING',
+  },
+  EMAIL_OUTBOX_ROWS: {
+    object: 'the local EmailOutbox rows',
+    anchor: 'outbox',
+    reach: 'DISTINGUISHING',
+  },
+  SETTING_SYNC_ENABLED: {
+    object: 'the plugin setting quickbooks_sync_enabled',
+    anchor: 'quickbooks_sync_enabled',
+    reach: 'DISTINGUISHING',
+  },
+  SETTING_ATTACH_PDF: {
+    object: 'the plugin setting quickbooks_sync_attach_pdf',
+    anchor: 'quickbooks_sync_attach_pdf',
+    reach: 'DISTINGUISHING',
+  },
+  THIS_RECORD_AND_ITS_SYNC_ROW: {
+    object: 'this record and its sync row',
+    anchor: 'sync row',
+    reach: 'UNIVERSAL',
+  },
+}
+
+/** The EmailOutbox columns (and the one derived axis) a direction may send a reader to read. */
+type OutboxReadAxis = 'status' | 'attempts' | 'lastError' | 'createdAt' | 'sentAt' | 'time'
+
+/** The two settings IMS itself holds. There is no third, and no way to name anything else. */
+const SETTING_NAME: Record<'SETTING_SYNC_ENABLED' | 'SETTING_ATTACH_PDF', string> = {
+  SETTING_SYNC_ENABLED: 'quickbooks_sync_enabled',
+  SETTING_ATTACH_PDF: 'quickbooks_sync_attach_pdf',
+}
+
+/**
+ * WHAT A LOOKUP-LESS RECORD MAY TELL AN OPERATOR TO DO, AS STRUCTURE.
+ *
+ * Every member pairs an action with an IMS-LOCAL target, and carries only enumerated parameters.
+ * Every action is read-only or a switch on IMS's own setting; there is no member whose target is in
+ * anybody else's system, and no member with a field that would accept one.
+ */
+type LocalDirection =
+  | { action: 'CONFIRM'; target: 'ORDER_INVOICE_PDF' }
+  | {
+      action: 'INSPECT'
+      target: 'EMAIL_OUTBOX_ROWS'
+      selector: 'THIS_ORDERS_ROWS' | 'BY_KIND_AND_REFERENCE'
+      read: readonly OutboxReadAxis[]
+    }
+  | { action: 'READ'; target: 'EMAIL_OUTBOX_ROWS'; read: readonly OutboxReadAxis[] }
+  | { action: 'RE_READ'; target: 'EMAIL_OUTBOX_ROWS' }
+  | { action: 'TURN_OFF'; target: 'SETTING_SYNC_ENABLED'; control: 'LEVER_BELOW' | 'CONNECTOR_PANEL_CHECKBOX' }
+  | { action: 'LEAVE_OFF'; target: 'SETTING_SYNC_ENABLED' }
+  | {
+      action: 'READ_SETTING'
+      target: 'SETTING_ATTACH_PDF'
+      lead: 'THEN_GO_AND' | 'NONE'
+      purpose: 'LEARN_WHAT_A_REPLAY_WOULD_DO' | 'NONE'
+    }
+  | {
+      action: 'ESCALATE'
+      target: 'THIS_RECORD_AND_ITS_SYNC_ROW'
+      naming: 'SYNC_ROW'
+      after: 'LEAVE_THE_TOGGLE_OFF' | 'FIX_THE_FAILURE'
+    }
+  | {
+      action: 'ESCALATE'
+      target: 'THIS_RECORD_AND_ITS_SYNC_ROW'
+      naming: 'RECORD_ONLY'
+      caseForm: 'SENTENCE' | 'CLAUSE'
+    }
+
+/** "a, b and c" — the shipped wording for a list of read axes. */
+function andList(items: readonly string[]): string {
+  return items.length < 2
+    ? (items[0] ?? '')
+    : `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}`
+}
+
+/**
+ * THE PROSE, GENERATED FROM THE STRUCTURE. Total over `LocalDirection`: adding a member without a
+ * branch here fails the build on the return type, and there is no default case to absorb one.
+ *
+ * Every sentence lives in the branch its TARGET selects. A direction cannot carry text its target
+ * did not choose, which is the whole of the round-17 fix.
+ */
+function renderLocalDirection(direction: LocalDirection): string {
+  switch (direction.action) {
+    case 'CONFIRM':
+      return 'confirm the invoice PDF stored against the order is the document you expect'
+    case 'INSPECT': {
+      const selector = direction.selector === 'THIS_ORDERS_ROWS'
+        ? 'Inspect the outbox rows for this order'
+        : 'Then INSPECT the outbox: query it for kind ACCOUNTING_INVOICE, referenceType SalesOrder, '
+          + 'referenceId = the order id (no page in IMS lists them)'
+      return `${selector} and read each row's ${andList(direction.read)}.`
+    }
+    case 'READ':
+      return `Read them by ${andList(direction.read)}`
+    case 'RE_READ':
+      return 'so re-run the query rather than treating one result as the final list'
+    case 'TURN_OFF':
+      return direction.control === 'LEVER_BELOW'
+        ? 'TURN THE LEVER BELOW OFF FIRST, so that no NEW run is admitted'
+        : 'HOW TO STOP MORE OF IT: turn {ledger} sync OFF. The control is the checkbox at the top of '
+          + 'the SYNC tab of the {ledger} connector panel, and it writes the setting '
+          + `${SETTING_NAME[direction.target]}.`
+    case 'LEAVE_OFF':
+      return 'THEN LEAVE IT OFF, BECAUSE TURNING IT OFF IS NOT A FENCE.'
+    case 'READ_SETTING': {
+      const lead = direction.lead === 'THEN_GO_AND' ? 'THEN GO AND ' : ''
+      const purpose = direction.purpose === 'LEARN_WHAT_A_REPLAY_WOULD_DO'
+        ? ' to learn what a replay would do'
+        : ''
+      return `${lead}READ ${SETTING_NAME[direction.target]} AS IT STANDS NOW${purpose}`
+    }
+    case 'ESCALATE': {
+      const administrator = 'to whoever administers this installation'
+      if (direction.naming === 'SYNC_ROW') {
+        const after = direction.after === 'LEAVE_THE_TOGGLE_OFF'
+          ? 'Leave the toggle off and '
+          : 'Fix the failure named above, and '
+        return `${after}ESCALATE sync row {syncRowId}, with this record, ${administrator}`
+      }
+      return `${direction.caseForm === 'SENTENCE' ? 'Escalate' : 'escalate'} this record ${administrator}`
+    }
+  }
+}
 
 /**
  * THE COMPLETE INVENTORY OF WHAT A LOOKUP-LESS RECORD TELLS AN OPERATOR TO DO. Every one is at an
  * object IMS itself holds and this message names, every one is read-only or a switch on IMS's own
- * setting, and the cap is the review: a sixteenth line means somebody decided to add an instruction
+ * setting, and the cap is the review: a fifteenth line means somebody decided to add an instruction
  * to a record that can name nothing, and has to raise the cap in front of a reviewer to do it.
  */
-const LOCAL_DIRECTIONS: readonly { object: LocalObject; span: string }[] = [
+const LOCAL_DIRECTIONS: readonly LocalDirection[] = [
   // The PDF IMS downloaded and stored against the order. Local file, read-only, and the message
   // prints the IMS reference that reaches it.
-  {
-    object: 'the invoice PDF IMS stored against the order',
-    span: 'confirm the invoice PDF stored against the order is the document you expect',
-  },
+  { action: 'CONFIRM', target: 'ORDER_INVOICE_PDF' },
   // The local EmailOutbox rows, by that table's own columns — every one walked into the schema in
   // rounds 6 through 9. Reads only: EmailOutbox has no state that means "cancelled", and the record
   // says so in prose rather than instructing one.
   {
-    object: 'the local EmailOutbox rows',
-    span: "Inspect the outbox rows for this order and read each row's status, attempts, lastError and sentAt.",
+    action: 'INSPECT',
+    target: 'EMAIL_OUTBOX_ROWS',
+    selector: 'THIS_ORDERS_ROWS',
+    read: ['status', 'attempts', 'lastError', 'sentAt'],
   },
   {
-    object: 'the local EmailOutbox rows',
-    span: "Then INSPECT the outbox: query it for kind ACCOUNTING_INVOICE, referenceType SalesOrder, referenceId = the order id (no page in IMS lists them) and read each row's status, attempts, lastError, createdAt and sentAt.",
+    action: 'INSPECT',
+    target: 'EMAIL_OUTBOX_ROWS',
+    selector: 'BY_KIND_AND_REFERENCE',
+    read: ['status', 'attempts', 'lastError', 'createdAt', 'sentAt'],
   },
-  {
-    object: 'the local EmailOutbox rows',
-    span: 'so re-run the query rather than treating one result as the final list',
-  },
-  {
-    object: 'the local EmailOutbox rows',
-    span: 'Read them by status, lastError and time',
-  },
+  { action: 'RE_READ', target: 'EMAIL_OUTBOX_ROWS' },
+  { action: 'READ', target: 'EMAIL_OUTBOX_ROWS', read: ['status', 'lastError', 'time'] },
   // The two plugin settings. Reading one is read-only; turning one off writes an IMS row and
   // touches nothing in anybody else's system — and the record says in prose, at length, that the
   // switch is an admission check rather than a fence.
+  { action: 'TURN_OFF', target: 'SETTING_SYNC_ENABLED', control: 'LEVER_BELOW' },
+  { action: 'READ_SETTING', target: 'SETTING_ATTACH_PDF', lead: 'THEN_GO_AND', purpose: 'NONE' },
   {
-    object: 'the plugin setting quickbooks_sync_enabled',
-    span: 'TURN THE LEVER BELOW OFF FIRST, so that no NEW run is admitted',
+    action: 'READ_SETTING',
+    target: 'SETTING_ATTACH_PDF',
+    lead: 'NONE',
+    purpose: 'LEARN_WHAT_A_REPLAY_WOULD_DO',
   },
-  {
-    object: 'the plugin setting quickbooks_sync_attach_pdf',
-    span: 'THEN GO AND READ quickbooks_sync_attach_pdf AS IT STANDS NOW',
-  },
-  {
-    object: 'the plugin setting quickbooks_sync_attach_pdf',
-    span: 'READ quickbooks_sync_attach_pdf AS IT STANDS NOW to learn what a replay would do',
-  },
-  {
-    object: 'the plugin setting quickbooks_sync_enabled',
-    span: 'HOW TO STOP MORE OF IT: turn {ledger} sync OFF. The control is the checkbox at the top of the SYNC tab of the {ledger} connector panel, and it writes the setting quickbooks_sync_enabled.',
-  },
-  {
-    object: 'the plugin setting quickbooks_sync_enabled',
-    span: 'THEN LEAVE IT OFF, BECAUSE TURNING IT OFF IS NOT A FENCE.',
-  },
-  // The escalation, in the four shapes the module writes it. Its object is this record and the sync
+  { action: 'TURN_OFF', target: 'SETTING_SYNC_ENABLED', control: 'CONNECTOR_PANEL_CHECKBOX' },
+  { action: 'LEAVE_OFF', target: 'SETTING_SYNC_ENABLED' },
+  // The escalation, in the four shapes the module writes it. Its target is this record and the sync
   // row this message names — both IMS's own.
-  {
-    object: 'this record and its sync row',
-    span: 'Leave the toggle off and ESCALATE sync row {syncRowId}, with this record, to whoever administers this installation',
-  },
-  {
-    object: 'this record and its sync row',
-    span: 'Fix the failure named above, and ESCALATE sync row {syncRowId}, with this record, to whoever administers this installation',
-  },
-  {
-    object: 'this record and its sync row',
-    span: 'Escalate this record to whoever administers this installation',
-  },
-  {
-    object: 'this record and its sync row',
-    span: 'escalate this record to whoever administers this installation',
-  },
+  { action: 'ESCALATE', target: 'THIS_RECORD_AND_ITS_SYNC_ROW', naming: 'SYNC_ROW', after: 'LEAVE_THE_TOGGLE_OFF' },
+  { action: 'ESCALATE', target: 'THIS_RECORD_AND_ITS_SYNC_ROW', naming: 'SYNC_ROW', after: 'FIX_THE_FAILURE' },
+  { action: 'ESCALATE', target: 'THIS_RECORD_AND_ITS_SYNC_ROW', naming: 'RECORD_ONLY', caseForm: 'SENTENCE' },
+  { action: 'ESCALATE', target: 'THIS_RECORD_AND_ITS_SYNC_ROW', naming: 'RECORD_ONLY', caseForm: 'CLAUSE' },
 ]
+
+/** The prose of the inventory, which is generated and never written down. */
+const LOCAL_DIRECTION_SPANS: readonly string[] = LOCAL_DIRECTIONS.map(renderLocalDirection)
 
 /** The most instructions a record that can name nothing may carry. Raising this IS the decision. */
 const LOCAL_DIRECTION_CAP = 14
@@ -1701,7 +1867,7 @@ function unreviewedWords(text: string, spans: readonly string[]): string[] {
 
 /** The three lists, which between them must account for every word of every lookup-less message. */
 const REVIEWED_SPANS: readonly string[] = [
-  ...LOCAL_DIRECTIONS.map(({ span }) => span), ...BREADCRUMB_DIRECTIONS, ...RECORD_PROSE,
+  ...LOCAL_DIRECTION_SPANS, ...BREADCRUMB_DIRECTIONS, ...RECORD_PROSE,
 ]
 
 // MUTATION THAT KILLS THIS (run): add ANY word to ANY surface a lookup-less message reaches — a
@@ -1730,8 +1896,9 @@ test('ROUND 16 (Codex HIGH x2): every word of a lookup-less record is one that w
       `${label} says ${unreviewed.length} word(s) no reviewed span accounts for — `
       + `${unreviewed.slice(0, 14).join(' ')} — on a record that names no ledger identifier. Every `
       + 'such word has to be enumerated: in LOCAL_DIRECTIONS if it tells an operator to do something '
-      + '(and then only at an object in the LocalObject union, which has no member for anything in '
-      + 'another system), in BREADCRUMB_DIRECTIONS if it belongs to the reset breadcrumb, or in '
+      + '(and then only as a {action, target} direction whose target is in the LocalTarget union, '
+      + 'which has no member for anything in another system), in BREADCRUMB_DIRECTIONS if it '
+      + 'belongs to the reset breadcrumb, or in '
       + 'RECORD_PROSE if it says what happened, what is not known, or what must not be done.',
     )
   }
@@ -1750,14 +1917,29 @@ test('ROUND 16 (Codex HIGH x2): every word of a lookup-less record is one that w
   )
 })
 
-// MUTATION THAT KILLS THIS (run): add a sixteenth line to LOCAL_DIRECTIONS and the cap fails. RUN.
-// Change any line's `object` to a remote one and the BUILD fails — `LocalObject` has no such
-// member, which is the point of it being a union rather than a string. Put a mutation lexeme in one
-// — 'and remove the duplicate' — and the read-only assertion fails naming it.
+// MUTATION THAT KILLS THIS (run): add a fifteenth direction to LOCAL_DIRECTIONS and the cap fails.
+// RUN. Put a mutation lexeme in a renderer branch — 'and remove the duplicate' — and the read-only
+// assertion fails naming it.
 //
-// ROUTE: the list is read here; the corpus is the SHIPPED per-incident messages, breadcrumbs
-// excluded, so a line that only ever appears in the breadcrumb cannot hide in this list.
-test('ROUND 16: the complete instruction inventory of a record that can name nothing', () => {
+// AND THE ROUND-17 ASSERTION, WHICH IS THE COUPLING (Codex HIGH). Round 16 asserted only
+// `object.length > 0`, so the target was a label sitting next to the sentence, and Codex's route
+// was to extend the sentence and leave the label alone. There is no sentence to extend now — the
+// prose is `renderLocalDirection(direction)` — so RUN Codex's route and it does not compile:
+// appending ' In your books, use the IMS reference above to reach the matching entry and take the
+// second PDF off it.' needs a field to put it in and `LocalDirection` has none (tsc: "Object
+// literal may only specify known properties, and 'span' does not exist in type 'LocalDirection'").
+//
+// The runnable half is the ANCHOR: the message a direction ships in must NAME the target the
+// direction declares. RUN with the CONFIRM direction's target swapped to EMAIL_OUTBOX_ROWS — a
+// legal `LocalTarget`, which is why round 16 accepted all five equally — and it fails on the
+// invoice-PDF message never saying "outbox". The same swap on any other direction fails the same
+// way, EXCEPT into THIS_RECORD_AND_ITS_SYNC_ROW, whose anchor every record carries; that one is
+// declared UNIVERSAL above and is carried by generation, not by the anchor.
+//
+// ROUTE: the directions are read here and rendered; the corpus is the SHIPPED per-incident
+// messages, breadcrumbs excluded, so a line that only ever appears in the breadcrumb cannot hide in
+// this list.
+test('ROUND 17 (Codex HIGH): the instruction inventory is generated from its targets, and lands on them', () => {
   const incidents = lookupLessMessages().filter(({ label }) => !label.startsWith('breadcrumb'))
   assert.ok(incidents.length > 0, 'sanity: per-incident messages were rendered')
 
@@ -1767,18 +1949,81 @@ test('ROUND 16: the complete instruction inventory of a record that can name not
     + `${LOCAL_DIRECTION_CAP}, and raising it is the decision, not a formality`,
   )
 
-  for (const { object, span } of LOCAL_DIRECTIONS) {
+  for (const direction of LOCAL_DIRECTIONS) {
+    const span = renderLocalDirection(direction)
+    const { object, anchor } = LOCAL_TARGET[direction.target]
+
     assert.deepEqual(
       mutationLexemes([span], []), [],
       `"${span}" instructs a MUTATION on a record that can name no object — a permitted local `
       + "instruction may read, inspect, confirm or move IMS's own switch, and nothing else",
     )
+
+    const carriers = incidents.filter(({ text }) => text.includes(span))
     assert.ok(
-      incidents.some(({ text }) => text.includes(span)),
-      `"${span}" appears in no shipped incident message — delete it rather than leaving an `
-      + 'exemption nothing is standing in',
+      carriers.length > 0,
+      `"${span}" appears in no shipped incident message — delete the direction rather than leaving `
+      + 'an exemption nothing is standing in',
     )
-    assert.ok(object.length > 0, `"${span}" must name the local object it points at`)
+
+    // THE COUPLING. A direction may be a fragment ("Read them by status, lastError and time") whose
+    // subject was established earlier in the sentence, so the anchor is checked against the whole
+    // MESSAGE rather than the span: wherever this instruction ships, the reader has been told which
+    // IMS-local thing it is about. A direction that lands in a message that never names its target
+    // is an instruction pointing at nothing the reader can identify — which is the failure mode the
+    // whole file exists to prevent, arriving through the target field instead of through the prose.
+    for (const { label, text } of carriers) {
+      assert.ok(
+        text.toLowerCase().includes(anchor.toLowerCase()),
+        `${label} carries the ${direction.action} direction "${span}" but never names ${object} `
+        + `(no "${anchor}" anywhere in it), so nothing in that message says what the reader is `
+        + 'being sent to',
+      )
+    }
+  }
+
+  // NOT VACUOUS, AND EXACT ABOUT WHICH ANCHORS CARRY WEIGHT. A DISTINGUISHING anchor must be
+  // absent from at least one shipped message, or it would pass on any direction whatsoever; a
+  // UNIVERSAL one must be present in all of them, which is the claim being made about it.
+  for (const [target, { anchor, reach }] of Object.entries(LOCAL_TARGET)) {
+    const absent = incidents.some(({ text }) => !text.toLowerCase().includes(anchor.toLowerCase()))
+    if (reach === 'DISTINGUISHING') {
+      assert.ok(
+        absent,
+        `every shipped message contains "${anchor}", so the anchor for ${target} would pass on any `
+        + 'direction whatsoever — either it is not a distinguishing word or the target is UNIVERSAL',
+      )
+    } else {
+      assert.ok(
+        !absent,
+        `${target} is declared UNIVERSAL, but a shipped message does not name "${anchor}" — so the `
+        + 'anchor is in fact selective and should be declared DISTINGUISHING and checked as one',
+      )
+    }
+  }
+
+  // AND THE SWAP IS CAUGHT — for every direction, not merely somewhere in the corpus.
+  //
+  // Stated at the strength it actually holds: a single message may legitimately name SEVERAL local
+  // objects (the QuickBooks email incident names the outbox rows and the sync toggle in the same
+  // breath), so the anchor cannot refuse every other target and claiming it does would be a fence
+  // that fails the first time somebody writes a longer message. What it must do is refuse AT LEAST
+  // ONE — because round 16's `object.length > 0` was satisfied by all five members equally, and an
+  // assertion satisfied by every value of the field is not an assertion about the field.
+  for (const direction of LOCAL_DIRECTIONS) {
+    const span = renderLocalDirection(direction)
+    const carriers = incidents.filter(({ text }) => text.includes(span))
+    const refused = Object.entries(LOCAL_TARGET).filter(([target, { anchor, reach }]) => (
+      target !== direction.target
+      && reach === 'DISTINGUISHING'
+      && carriers.some(({ text }) => !text.toLowerCase().includes(anchor.toLowerCase()))
+    ))
+    assert.ok(
+      refused.length > 0,
+      `"${span}" would pass with its target changed to ANY other member of LocalTarget — every `
+      + 'message carrying it names all of them — so for this direction the target field is back to '
+      + 'being a label nothing checks',
+    )
   }
 })
 
