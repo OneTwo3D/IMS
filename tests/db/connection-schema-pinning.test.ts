@@ -1771,6 +1771,181 @@ test('o3d-2k5r r19: where the answer cannot be established the refusal names the
   resetStartupOptionByteSafety()
 })
 
+// ---------------------------------------------------------------------------
+// o3d-2k5r r21, Codex HIGH — ONE BACKEND'S VERDICT MUST NOT LICENSE THE ENDPOINT.
+//
+// `db.internal:5432/ims` is a LOGICAL endpoint. A pooler, a TCP load balancer, a DNS name with
+// several A records or a failover pair can all serve the probe from one PostgreSQL and the
+// application's pool from another — and the permission earned by measuring the first is then spent
+// emitting a non-ASCII startup option at the second. The stand-in below is that topology: the same
+// connection string, a different backend on each connection.
+// ---------------------------------------------------------------------------
+
+/**
+ * A `pg.Client` stand-in whose connections are served by the backends in `backends`, in order and
+ * then repeating. Each entry is one physical server's answer to the identity query.
+ */
+function fanOutClient(
+  backends: ReadonlyArray<Record<string, unknown>>,
+  probeAnswer: (config: { options?: string }) => unknown = (config) =>
+    /-c ims\.startup_option_probe=(.*)$/.exec(config.options ?? '')?.[1]?.replace(/\\(.)/g, '$1'),
+) {
+  let opened = 0
+  return async (config: { options?: string }) => {
+    const backend = backends[opened % backends.length]!
+    opened += 1
+    return {
+      async connect() {
+        return undefined
+      },
+      async query(text: string) {
+        if (text.startsWith('select pg_encoding_to_char')) return { rows: [{ ...backend }] }
+        return { rows: [{ startup_option_probe: probeAnswer(config) }] }
+      },
+      async end() {
+        return undefined
+      },
+    }
+  }
+}
+
+const ONE_BACKEND = {
+  server_encoding: 'UTF8',
+  lc_ctype: 'C.UTF-8',
+  backend_address: '10.0.0.11',
+  backend_port: '5432',
+  server_version: '17.11',
+}
+
+test('o3d-2k5r r21: a positive verdict NAMES the backend that gave it', async () => {
+  resetStartupOptionByteSafety()
+  const url = `postgresql://app:pw@db.internal:5432/ims?schema=${encodeURIComponent('ténant')}`
+
+  // PRECONDITION: unprobed it is refused, so what follows is a lift.
+  assert.throws(() => pgConnectionConfig(url), DatabaseUrlSchemaConflictError, 'unprobed, it is refused')
+
+  const verdict = await establishStartupOptionByteSafety(url, { createClient: fanOutClient([ONE_BACKEND]) })
+  assert.equal(verdict.established, true)
+  assert.equal(verdict.carries, true)
+  // MUTATION ROUTE: drop `backend: distinct[0] ?? null` from the positive settle and this reads
+  // null — a verdict that cannot say which server it is about.
+  assert.equal(
+    verdict.backend,
+    '10.0.0.11:5432|17.11|UTF8|C.UTF-8',
+    'the verdict records the physical backend every probe connection reached',
+  )
+  assert.match(verdict.reason, /which is the one backend every probe connection to this endpoint reached/)
+  assert.equal(pgConnectionConfig(url).options, '-c search_path="ténant"', 'and the pin is granted')
+  resetStartupOptionByteSafety()
+})
+
+test('o3d-2k5r r21: an endpoint that serves two different backends gets NO permission', async () => {
+  resetStartupOptionByteSafety()
+  const url = `postgresql://app:pw@db.internal:5432/ims?schema=${encodeURIComponent('ténant')}`
+
+  // TWO SERVERS BEHIND ONE NAME, and both would answer the measurement the same way — that is the
+  // point. The refusal is not because either of them failed; it is because a measurement made on
+  // one of them says nothing about connections that land on the other.
+  const second = { ...ONE_BACKEND, backend_address: '10.0.0.12' }
+
+  // MUTATION ROUTE: delete the `distinct.length > 1` block from
+  // establishStartupOptionByteSafety(). This endpoint then settles established/carries true — one
+  // backend's answer licensing every connection behind the name — and the pgConnectionConfig
+  // assertion below stops throwing. That is the shipped behaviour Codex found.
+  const verdict = await establishStartupOptionByteSafety(url, {
+    createClient: fanOutClient([ONE_BACKEND, second]),
+  })
+  assert.equal(verdict.established, false, 'a fanned-out endpoint settles nothing')
+  assert.equal(verdict.carries, false)
+  assert.equal(verdict.backend, null, 'and it names no backend, because there was not one')
+  assert.match(verdict.reason, /did not answer as one server/)
+  assert.match(verdict.reason, /10\.0\.0\.11/, 'the refusal names both backends it saw')
+  assert.match(verdict.reason, /10\.0\.0\.12/)
+  assert.throws(
+    () => pgConnectionConfig(url),
+    DatabaseUrlSchemaConflictError,
+    'and the refusal stands: no permission is granted on one backend for connections that may reach another',
+  )
+  resetStartupOptionByteSafety()
+})
+
+test('o3d-2k5r r21: backends differing only in ENCODING are two backends for this question', async () => {
+  resetStartupOptionByteSafety()
+  const url = `postgresql://app:pw@db.internal:5432/ims?schema=${encodeURIComponent('ténant')}`
+
+  // Same address, different encoding — a replica restored with another locale, or a pooler in
+  // front of two clusters. The address is not the identity; the properties the measurement is
+  // ABOUT are part of it, which is why `backendIdentityOf` carries them.
+  //
+  // MUTATION ROUTE: reduce `backendIdentityOf` to address and port only. These two samples then
+  // compare equal, the verdict settles positive, and the LATIN1 backend is licensed by the UTF8
+  // one's answer.
+  const latin1 = { ...ONE_BACKEND, server_encoding: 'LATIN1', lc_ctype: 'en_US.ISO-8859-1' }
+  const verdict = await establishStartupOptionByteSafety(url, {
+    createClient: fanOutClient([ONE_BACKEND, latin1]),
+  })
+  assert.equal(verdict.established, false)
+  assert.match(verdict.reason, /did not answer as one server/)
+  assert.match(verdict.reason, /LATIN1/, 'and says which two answers it got')
+  assert.throws(() => pgConnectionConfig(url), DatabaseUrlSchemaConflictError)
+  resetStartupOptionByteSafety()
+})
+
+test('o3d-2k5r r21: fan-out does NOT block a REFUSAL — only a permission is bound to one backend', async () => {
+  resetStartupOptionByteSafety()
+  const url = `postgresql://app:pw@db.internal:5432/ims?schema=${encodeURIComponent('ténant')}`
+
+  // THE ASYMMETRY, ASSERTED. A server that hands the bytes back CHANGED is an unsafe answer, and an
+  // unsafe answer from any backend behind the endpoint is safe to apply to all of them — so the
+  // measurement settles `carries: false` on its own merits and the agreement check never runs.
+  // Without this the new rule would have turned a precise refusal ("this server alters the bytes")
+  // into a vaguer one, and lost the measurement in the message the operator reads.
+  //
+  // MUTATION ROUTE: move the `distinct.length > 1` check above the `returned !== sentinel` branch
+  // and this reason becomes the fan-out one, losing what was actually measured.
+  const verdict = await establishStartupOptionByteSafety(url, {
+    createClient: fanOutClient([ONE_BACKEND, { ...ONE_BACKEND, backend_address: '10.0.0.12' }], () => 'atenantz'),
+  })
+  assert.equal(verdict.established, true, 'the measurement is an answer, and it is a refusing one')
+  assert.equal(verdict.carries, false)
+  assert.match(verdict.reason, /did not return the probed characters unchanged/)
+  assert.throws(() => pgConnectionConfig(url), DatabaseUrlSchemaConflictError)
+  resetStartupOptionByteSafety()
+})
+
+test('o3d-2k5r r21: an endpoint whose SECOND connection cannot be opened settles nothing', async () => {
+  resetStartupOptionByteSafety()
+  const url = `postgresql://app:pw@db.internal:5432/ims?schema=${encodeURIComponent('ténant')}`
+
+  // The independent sample is not optional. If it cannot be taken, whether this endpoint has one
+  // backend or several is unknown — and unknown is the refusal, not a pass.
+  //
+  // MUTATION ROUTE: delete the second sanitised connection. This settles positive on one sample,
+  // which is exactly the evidence Codex said was too thin.
+  let opened = 0
+  const verdict = await establishStartupOptionByteSafety(url, {
+    createClient: async () => {
+      opened += 1
+      if (opened > 1) throw new Error('connect ECONNREFUSED 10.0.0.12:5432')
+      return {
+        async connect() {
+          return undefined
+        },
+        async query() {
+          return { rows: [{ ...ONE_BACKEND }] }
+        },
+        async end() {
+          return undefined
+        },
+      }
+    },
+  })
+  assert.equal(verdict.established, false)
+  assert.match(verdict.reason, /whether it has one backend or several is unknown/)
+  assert.throws(() => pgConnectionConfig(url), DatabaseUrlSchemaConflictError)
+  resetStartupOptionByteSafety()
+})
+
 test('o3d-2k5r r19: an ASCII URL settles without opening a connection at all', async () => {
   resetStartupOptionByteSafety()
   const url = 'postgresql://app:pw@db.internal:5432/ims?schema=ims_app'
