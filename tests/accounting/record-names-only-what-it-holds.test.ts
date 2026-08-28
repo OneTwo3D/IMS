@@ -2754,7 +2754,8 @@ test('ROUND 19 (Codex HIGH): each direction emits ONE action on its OWN declared
  */
 function directionModelDiagnostics(snippet: string): readonly ts.Diagnostic[] {
   const probePath = path.join(process.cwd(), 'lib', 'domain', 'accounting', '__direction-probe.ts')
-  const source = "import { renderLocalDirection, type LocalDirectionContext } from './local-operator-direction'\n"
+  const source = "import { renderLocalDirection, type LocalDirectionContext, type OutboxReadAxis } "
+    + "from './local-operator-direction'\n"
     + 'const context: LocalDirectionContext = { ledger: \'Xero\', syncRowId: \'log-1\' }\n'
     + `export const probe: string = ${snippet}\n`
   const options: ts.CompilerOptions = {
@@ -2813,13 +2814,20 @@ test('ROUND 18 (Codex HIGH): a formatter composing a MISMATCHED direction does n
         + "IMS reference above to reach the matching entry and take the second PDF off it.' }, context)",
     },
     {
+      // r21: the read axes are no longer a field on a direction — they are the three named lists in
+      // `OUTBOX_READ_LIST`, whose `satisfies` clause is what still fences them to real columns. So the
+      // claim is probed where it now lives rather than through a field that has gone.
       what: 'an outbox read axis that is not a column of that table',
-      snippet: "renderLocalDirection({ action: 'READ', target: 'EMAIL_OUTBOX_ROWS', read: ['grossTotal'] }, context)",
+      snippet: "((): string => { const axis: OutboxReadAxis = 'grossTotal'; return axis })()",
+    },
+    {
+      what: 'an outbox read-list name that is not one of the ones that ship',
+      snippet: "renderLocalDirection({ action: 'INSPECT', target: 'EMAIL_OUTBOX_ROWS', form: 'BY_GROSS_TOTAL' }, context)",
     },
     {
       what: 'a setting direction naming a setting IMS does not hold',
-      snippet: "renderLocalDirection({ action: 'READ_SETTING', target: 'SETTING_ATTACH_PDF', lead: 'NONE', "
-        + "purpose: 'NONE', setting: 'xero_sync_enabled' }, context)",
+      snippet: "renderLocalDirection({ action: 'READ_SETTING', target: 'SETTING_ATTACH_PDF', "
+        + "form: 'THEN_GO_AND_READ_IT', setting: 'xero_sync_enabled' }, context)",
     },
     {
       what: 'an action the model has no branch for',
