@@ -209,6 +209,22 @@ env_file_value() {
   printf '%s' "$value"
 }
 
+# THE ONE PLACE A TCP PORT IS DECIDED TO BE A TCP PORT (o3d-2sm1.5 r26, Codex HIGH).
+#
+# A port that is not a port is not a cosmetic problem here: it is spliced straight into the URL
+# the health check polls, and a URL that cannot be reached is indistinguishable from a service
+# that did not come up. On the update path that costs a healthy deployment — the poll times out,
+# the script stops the service it just started and re-establishes the post-migration fences.
+#
+# So the shape is checked ONCE, where the value is read, and the run refuses BEFORE anything is
+# stopped rather than discovering it after the schema has moved. Decimal digits only, 1-65535,
+# and `10#` so a leading zero is a decimal port and not a bash octal error under `set -e`.
+valid_tcp_port() {
+  local value="$1"
+  [[ "$value" =~ ^[0-9]{1,5}$ ]] || return 1
+  (( 10#$value >= 1 && 10#$value <= 65535 )) || return 1
+}
+
 APP_NAME="one-two-inventory"
 APP_USER="imsapp"
 APP_DIR="${IMS_APP_DIR:-/opt/${APP_NAME}}"
@@ -314,6 +330,44 @@ if [[ -f "${DEPLOY_META_FILE}" ]]; then
   GIT_REPO_URL="$(env_file_value GIT_REPO_URL "${DEPLOY_META_FILE}")"
   GIT_BRANCH="$(env_file_value GIT_BRANCH "${DEPLOY_META_FILE}")"
   GIT_DEPLOY_KEY_ENABLED="$(env_file_value GIT_DEPLOY_KEY_ENABLED "${DEPLOY_META_FILE}")"
+fi
+
+# ---------------------------------------------------------------------------
+# THE PORT THE HEALTH CHECK WILL POLL — SIXTH NAME, SAME READER, READ HERE (o3d-2sm1.5 r26,
+# Codex HIGH).
+#
+# Until this round the health check read it for itself, at the bottom of the script, with
+# `grep "^APP_PORT=" .env | cut -d= -f2`. That is the second reader r25 said did not exist, and
+# it is wrong in two separate ways on values dotenv accepts and the service resolves correctly:
+#
+#   APP_PORT="3000"            -> `"3000"` — quotes kept, spliced into the URL
+#   APP_PORT=3000  # internal  -> `3000  # internal` — comment kept, and word-split
+#   APP_PORT declared twice    -> the FIRST line, where dotenv and env_file_value take the last
+#   APP_PORT absent            -> EMPTY, not the `3000` the `|| echo "3000"` suggests: the
+#                                 pipeline's status is `cut`'s, which is 0 when grep matched
+#                                 nothing, so the fallback never fired and the URL became
+#                                 `http://127.0.0.1:/api/health`
+#
+# Every one of those makes `curl` poll a URL nothing serves. The service is up and healthy; the
+# poll times out after 60s; the script then STOPS the service it just started and re-establishes
+# the post-migration fences. A malformed-but-supported port turns a successful update into an
+# outage — which is why the check is here, at preflight, and not at the health check: this is
+# before the crontab is taken, before the stop, before the fence and before the migration, so a
+# refusal costs nothing but a re-run.
+#
+# The value is PINNED here for the same reason DATABASE_URL is: it is what this run is prepared
+# to prove things about. It is also what makes predecessor_is_active()'s listener probe work at
+# all — that check reads ${APP_PORT:-} and, with the read at the bottom of the script, the name
+# was unset every time it was consulted.
+APP_PORT="$(env_file_value APP_PORT "${APP_DIR}/.env")"
+# Absent is not malformed: install.sh's own default is 3000, and an .env that never mentioned the
+# key has always meant that. Present-and-not-a-port is malformed, and is refused rather than
+# guessed at, because guessing 3000 for a service listening on 8080 polls a URL nothing serves
+# just as surely.
+if [[ -z "${APP_PORT}" ]]; then
+  APP_PORT="3000"
+elif ! valid_tcp_port "${APP_PORT}"; then
+  die "APP_PORT in ${APP_DIR}/.env is not a TCP port: '${APP_PORT}'. It is read the way dotenv reads it (quotes and trailing comment removed, last definition wins) and it must be a decimal number in 1-65535, because it becomes the address this script polls to decide whether the new build came up — and a URL that cannot be reached is indistinguishable from a service that did not start. Nothing has been stopped and nothing has been migrated."
 fi
 
 START_TIME=$(date +%s)
@@ -2292,8 +2346,9 @@ RESUME_EVIDENCE=""
 # IS THE OLD VERSION STILL UP? Asked only to decide whether an interrupted ARMING can be
 # resumed, and answered conservatively: a unit systemd reports active, or anything listening
 # on the app's port, counts as "still serving". A `false` sends the run down the ordinary
-# adoption path, which stops and re-fences — the pre-existing behaviour. APP_PORT is read out
-# of .env much further down, so it is only consulted when it happens to be known.
+# adoption path, which stops and re-fences — the pre-existing behaviour. APP_PORT is read and
+# validated in the preflight above, so by the time this runs it is always known — it was not
+# before r26, when the only read was at the bottom of the script and this probe was dead code.
 predecessor_is_active() {
   if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "${SERVICE_UNIT}" 2>/dev/null; then
     RESUME_EVIDENCE="systemd reports ${SERVICE_UNIT} active"
@@ -2896,8 +2951,8 @@ success "Application service started."
 CURRENT_STEP="health"
 header "Health check"
 
-APP_PORT=$(grep "^APP_PORT=" "${APP_DIR}/.env" 2>/dev/null | cut -d= -f2 || echo "3000")
-
+# APP_PORT was read out of .env through env_file_value() in the preflight, and validated as a
+# TCP port there — before anything was stopped, fenced or migrated. Nothing re-reads it here.
 if $DRY_RUN; then
   echo -e "${YELLOW}[DRY]${RESET}   would poll http://127.0.0.1:${APP_PORT}/api/health"
 else

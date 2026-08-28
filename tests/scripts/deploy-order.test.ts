@@ -4875,12 +4875,234 @@ test('none of the three entrypoints source an application-owned file', () => {
     assert.deepEqual(sourced, [], `${entry.name} sources an application-owned file into a privileged shell: ${sourced}`)
   }
   // And update.sh in particular reads those two files ONLY through the non-evaluating reader.
-  const readers = UPDATE_LINES.filter((line) => !/^\s*#/.test(line)).filter(
-    (line) => /\$\{APP_DIR\}\/\.env|\$\{DEPLOY_META_FILE\}/.test(line) && /^\s*[A-Z_]+="\$\(/.test(line),
+  // r25 asserted that by filtering for `NAME="$(...)"`, which is a SHAPE and not the property:
+  // the second reader that survived that round was `APP_PORT=$(grep ... | cut ...)`, unquoted, so
+  // the filter never looked at it. The enumeration below replaces the shape test — see the
+  // next test, which classifies EVERY mention regardless of quoting.
+  const readers = UPDATE_LINES.filter((line) => !/^\s*#/.test(line)).filter((line) =>
+    /env_file_value /.test(line),
   )
-  assert.ok(readers.length >= 4, `update.sh must load .env and .deploy-meta by key: found ${readers.length} such reads`)
-  for (const line of readers) {
-    assert.match(line, /env_file_value /, `update.sh loads an application-owned file some other way: ${line}`)
+  assert.ok(readers.length >= 6, `update.sh must load .env and .deploy-meta by key: found ${readers.length} such reads`)
+})
+
+// ---------------------------------------------------------------------------
+// EVERY MENTION, CLASSIFIED — the single-reader claim as an ENUMERATION (o3d-2sm1.5 r26,
+// Codex HIGH).
+//
+// r25's guard recognised a read only when it was written `NAME="$(...)"`. `APP_PORT=$(grep
+// "^APP_PORT=" "${APP_DIR}/.env" | cut -d= -f2)` is the same read with one pair of quotes
+// missing, and it went through five rounds of review inside a script whose headline claim is
+// that it has exactly one reader.
+//
+// So the guard no longer recognises reads. It takes EVERY non-comment line that names an
+// application-owned file — ${APP_DIR}/.env, ${APP_DIR_REAL}/.env, ${DEPLOY_META_FILE},
+// ${APP_DIR}/.deploy-meta, and the `env_file` local that holds one of them — and requires each
+// to match one of the shapes declared below. A line that matches none FAILS, and is printed.
+// Adding a new way to touch those files therefore fails the build until it is either routed
+// through env_file_value() or declared here with a reason.
+// ---------------------------------------------------------------------------
+
+/** Lines that name an application-owned file, comments excluded. */
+function appOwnedFileMentions(source: string): string[] {
+  return source
+    .split(/\r?\n/)
+    .filter((line) => !/^\s*#/.test(line))
+    .filter((line) =>
+      /\$\{APP_DIR(_REAL)?\}\/\.(env|deploy-meta)\b|\$\{DEPLOY_META_FILE\}|\$\{?env_file\}?\b/.test(line),
+    )
+}
+
+/**
+ * The declared shapes. Order is irrelevant — a line needs exactly one match — but each carries
+ * WHY it is not a second reader, because that is the thing being claimed.
+ */
+const MENTION_SHAPES: ReadonlyArray<{ why: string; match: RegExp }> = [
+  // THE READER. The only thing in any of the three that opens one of these files for its values.
+  { why: 'read through env_file_value()', match: /env_file_value / },
+  // install.sh's SECOND declared reader, and the one exception this project makes. It snapshots
+  // the whole previous .env so a re-run can offer it back as prompt defaults and write it back
+  // VERBATIM; parsing there would change the bytes that go back into the file (a `#` inside a
+  // secret is the case that bites), so it deliberately keeps them raw. It is named here rather
+  // than left to be discovered.
+  { why: "install.sh's raw round-trip snapshot for re-run defaults", match: /^load_existing_env "\$\{APP_DIR\}\/\.env"$/ },
+  // Shape and readability tests. They stat the path; they do not open it.
+  { why: 'a file-shape or readability test', match: /\[\[\s*!?\s*-[efrLnz]\s/ },
+  // The path itself, assigned to a name.
+  { why: 'a path assignment', match: /^\s*(local\s+)?[A-Za-z_][A-Za-z0-9_]*="\$\{[A-Za-z_][A-Za-z0-9_]*\}\/\.(env|deploy-meta)"$/ },
+  // Path canonicalisation for the EnvironmentFile= comparison — readlink resolves, it does not read.
+  { why: 'readlink -f canonicalisation of the path', match: /readlink -f "\$env_file"/ },
+  // Passed to a named helper that compares the PATH against systemd's view of the unit and never
+  // opens it. Enumerated by name so a helper that starts reading the file has to be added here.
+  { why: 'passed by path to env_file_is_sole_database_url_source(), which reads the UNIT', match: /^\s*env_file_is_sole_database_url_source / },
+  // install.sh OWNS these two files: it writes them, then locks them down.
+  { why: 'install.sh writing the file it owns', match: /^\s*(cat > "\$\{(APP_DIR\}\/\.env|DEPLOY_META_FILE)\}?" <<EOF|chown |chmod |rm -f )/ },
+  { why: 'the unit directive and the cron env path install.sh writes', match: /^(EnvironmentFile=|CRON_ENV_FILE=)/ },
+  // Text shown to an operator. A path inside a message is not a read.
+  { why: 'operator-facing text', match: /^\s*(die|warn|error|info|success|echo|printf)\b|^\s*"|\b(DB_IDENTITY_(SOURCE_|DRIFT_)?REASON|description|RESUME_EVIDENCE)="/ },
+]
+
+test('every mention of an application-owned file in the three entrypoints is a declared shape, whatever its quoting', () => {
+  // MUTATION ROUTE (run against this tree): put r25's line back —
+  //   APP_PORT=$(grep "^APP_PORT=" "${APP_DIR}/.env" 2>/dev/null | cut -d= -f2 || echo "3000")
+  // — anywhere in update.sh and this test fails printing that exact line under update.sh. Its
+  // quoted twin, APP_PORT="$(grep ...)", fails identically, which is the whole point: the guard
+  // no longer has a shape it can be slipped past.
+  for (const entry of R9_SCRIPTS) {
+    const unclassified = appOwnedFileMentions(entry.source).filter(
+      (line) => !MENTION_SHAPES.some((shape) => shape.match.test(line)),
+    )
+    assert.deepEqual(
+      unclassified,
+      [],
+      `${entry.name} touches an application-owned file in a way nothing declares. Either route it through env_file_value() or add the shape to MENTION_SHAPES with a reason:\n${unclassified.join('\n')}`,
+    )
+  }
+
+  // PRECONDITION, so the enumeration cannot pass by matching nothing: each script really does
+  // mention those files, and update.sh's mentions include the reads this round moved into it.
+  for (const entry of R9_SCRIPTS) {
+    assert.ok(appOwnedFileMentions(entry.source).length > 10, `${entry.name}: the scan found almost no mentions, so it is not scanning`)
+  }
+  assert.ok(
+    UPDATE_LINES.some((line) => /^APP_PORT="\$\(env_file_value APP_PORT "\$\{APP_DIR\}\/\.env"\)"$/.test(line)),
+    'update.sh must read APP_PORT through the one reader',
+  )
+})
+
+// ---------------------------------------------------------------------------
+// THE PORT, RUN FOR REAL (o3d-2sm1.5 r26, Codex HIGH).
+//
+// Structural guards say the read goes through the reader. These say the reader gets the RIGHT
+// ANSWER for the value shapes dotenv accepts and the service resolves correctly — which is where
+// `grep | cut` was wrong, and wrong silently: the URL it built was unreachable, the 60s poll
+// timed out, and the script then stopped the service it had just started and put the fences back.
+// A supported .env value turned a successful update into an outage.
+// ---------------------------------------------------------------------------
+const APP_PORT_CASES: ReadonlyArray<{ label: string; env: string; port: string; wasWrongBefore: string }> = [
+  {
+    label: 'quoted',
+    env: 'APP_PORT="8080"\n',
+    port: '8080',
+    wasWrongBefore: 'grep|cut kept the quotes: http://127.0.0.1:"8080"/api/health',
+  },
+  {
+    label: 'a trailing comment',
+    env: 'APP_PORT=8080  # the internal port\n',
+    port: '8080',
+    wasWrongBefore: 'grep|cut kept the comment, and the URL then word-split across three curl arguments',
+  },
+  {
+    label: 'quoted AND commented',
+    env: 'APP_PORT="8080" # the internal port\n',
+    port: '8080',
+    wasWrongBefore: 'both at once',
+  },
+  {
+    label: 'exported',
+    env: 'export APP_PORT=8080\n',
+    port: '8080',
+    wasWrongBefore: 'grep "^APP_PORT=" did not match the line at all, so the value read as empty',
+  },
+  {
+    label: 'defined twice',
+    env: 'APP_PORT=3000\nAPP_PORT=8080\n',
+    port: '8080',
+    wasWrongBefore: 'grep took the FIRST line; dotenv and the service take the last',
+  },
+  {
+    label: 'absent',
+    env: '',
+    port: '3000',
+    wasWrongBefore: 'the `|| echo "3000"` never fired — a pipeline’s status is `cut`’s, and `cut` succeeds on empty input — so the port read as EMPTY and the URL became http://127.0.0.1:/api/health',
+  },
+]
+
+for (const scenario of APP_PORT_CASES) {
+  test(`update.sh resolves APP_PORT correctly when it is ${scenario.label}`, () => {
+    // MUTATION ROUTE: replace the preflight read with r25's
+    //   APP_PORT=$(grep "^APP_PORT=" "${APP_DIR}/.env" 2>/dev/null | cut -d= -f2 || echo "3000")
+    // and the quoted, commented, quoted+commented, exported and defined-twice cases all report a
+    // different value — verified by running exactly that against this harness, not asserted from
+    // reading it. `absent` survives that mutation on its own, because the `-z` -> 3000 fallback
+    // below the read is a separate line; it is covered instead by the mutation that deletes THAT
+    // branch, which makes the port empty.
+    const dir = mkdtempSync(join(tmpdir(), 'ims-appport-'))
+    try {
+      writeFileSync(join(dir, '.env'), `DATABASE_URL=postgresql://app:pw@127.0.0.1:5432/ims\n${scenario.env}`)
+      const result = runUpdatePrelude(dir, ['APP_PORT'])
+      assert.equal(result.status, 0, `the prelude must run cleanly:\n${result.output}`)
+      // PRECONDITION: the prelude really reached this .env, so the port below is a read value.
+      assert.match(result.output, /^APP_PORT=/m, 'precondition: the prelude reported a port at all')
+      assert.match(
+        result.output,
+        new RegExp(`^APP_PORT=${scenario.port}$`, 'm'),
+        `${scenario.label}: ${scenario.wasWrongBefore}\n${result.output}`,
+      )
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+}
+
+test('update.sh REFUSES an APP_PORT that is not a TCP port, before anything is stopped', () => {
+  // The other half of the fix. A value the reader parses correctly can still not be a port, and
+  // then the health URL is unreachable for a different reason — so it is refused at the
+  // preflight, which is before the crontab is taken, before the stop, before the fence and
+  // before the migration. That placement is the point: the same refusal at the health check
+  // costs a migrated database and a stopped service.
+  //
+  // MUTATION ROUTE: delete the `valid_tcp_port` branch from the preflight and every case below
+  // exits 0 carrying the malformed value forward.
+  for (const bad of ['0', '65536', '99999', 'not-a-port', '80 80', '-1', '3000/tcp', '3e3']) {
+    const dir = mkdtempSync(join(tmpdir(), 'ims-appport-bad-'))
+    try {
+      writeFileSync(join(dir, '.env'), `DATABASE_URL=postgresql://app:pw@127.0.0.1:5432/ims\nAPP_PORT=${bad}\n`)
+      const result = runUpdatePrelude(dir, ['APP_PORT'])
+      assert.notEqual(result.status, 0, `APP_PORT=${bad} must be refused, not carried forward:\n${result.output}`)
+      assert.match(result.output, /is not a TCP port/, `APP_PORT=${bad}: the refusal must say what is wrong:\n${result.output}`)
+      assert.match(result.output, /Nothing has been stopped and nothing has been migrated/, `APP_PORT=${bad}: the refusal must say what state the box is in`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }
+})
+
+test('valid_tcp_port is the same function in all three entrypoints, and it accepts exactly 1-65535', () => {
+  // One shape check, three copies, kept honest the way env_file_value() is.
+  //
+  // MUTATION ROUTE: change `65535` to `65536` in any one copy and the equality below names that
+  // script; change it in all three and the range assertions below fail on 65536.
+  const bodies = R9_SCRIPTS.map((entry) => ({
+    name: entry.name,
+    body: entry.source.slice(entry.source.indexOf('valid_tcp_port() {')).split('\n}\n')[0],
+  }))
+  assert.ok(bodies[0].body.includes('10#'), 'precondition: the function was found, not an empty slice')
+  for (const other of bodies.slice(1)) {
+    assert.equal(other.body, bodies[0].body, `${other.name} carries a different valid_tcp_port() from ${bodies[0].name}`)
+  }
+
+  // And each script actually CALLS it on the port it will build a health URL out of — a shared
+  // function nobody invokes is not a check. MUTATION ROUTE: delete any one call site and this
+  // names that script.
+  const CALL_SITES: ReadonlyArray<{ name: string; call: RegExp }> = [
+    { name: 'update.sh', call: /^\s*elif ! valid_tcp_port "\$\{APP_PORT\}"; then$/m },
+    { name: 'install.sh', call: /^valid_tcp_port "\$\{APP_PORT\}" \|\| die /m },
+    { name: 'deploy.sh', call: /^valid_tcp_port "\$\{PORT\}" \|\| die /m },
+  ]
+  for (const site of CALL_SITES) {
+    const entry = R9_SCRIPTS.find((candidate) => candidate.name === site.name)
+    assert.ok(entry, `${site.name} must be one of the three entrypoints`)
+    assert.match(entry.source, site.call, `${site.name} defines valid_tcp_port but never applies it to the port it polls`)
+  }
+
+  const program = [bodies[0].body, '}', 'for p in "$@"; do if valid_tcp_port "$p"; then echo "ok:$p"; else echo "no:$p"; fi; done'].join('\n')
+  const result = runShell(`bash -s -- 1 80 3000 65535 0 65536 "" abc " 80" 08 +80 -80 3000x <<'IMS_PORT_EOF'\n${program}\nIMS_PORT_EOF`)
+  assert.equal(result.status, 0, `the harness must run cleanly:\n${result.output}`)
+  for (const good of ['ok:1', 'ok:80', 'ok:3000', 'ok:65535', 'ok:08']) {
+    assert.match(result.output, new RegExp(`^${good.replace('+', '\\+')}$`, 'm'), `${good} must be accepted:\n${result.output}`)
+  }
+  for (const bad of ['no:0', 'no:65536', 'no:', 'no:abc', 'no: 80', 'no:+80', 'no:-80', 'no:3000x']) {
+    assert.match(result.output, new RegExp(`^${bad.replace('+', '\\+')}$`, 'm'), `${bad} must be rejected:\n${result.output}`)
   }
 })
 

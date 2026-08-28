@@ -1181,6 +1181,22 @@ env_file_value() {
   printf '%s' "$value"
 }
 
+# THE ONE PLACE A TCP PORT IS DECIDED TO BE A TCP PORT (o3d-2sm1.5 r26, Codex HIGH).
+#
+# A port that is not a port is not a cosmetic problem here: it is spliced straight into the URL
+# the health check polls, and a URL that cannot be reached is indistinguishable from a service
+# that did not come up. On the update path that costs a healthy deployment — the poll times out,
+# the script stops the service it just started and re-establishes the post-migration fences.
+#
+# So the shape is checked ONCE, where the value is read, and the run refuses BEFORE anything is
+# stopped rather than discovering it after the schema has moved. Decimal digits only, 1-65535,
+# and `10#` so a leading zero is a decimal port and not a bash octal error under `set -e`.
+valid_tcp_port() {
+  local value="$1"
+  [[ "$value" =~ ^[0-9]{1,5}$ ]] || return 1
+  (( 10#$value >= 1 && 10#$value <= 65535 )) || return 1
+}
+
 # ---------------------------------------------------------------------------
 # IS THE FILE WE READ THE ONLY THING THAT CAN DEFINE DATABASE_URL FOR THIS SERVICE?
 # (o3d-2sm1.5 r20, Codex CRITICAL; r21 asks systemd's BUS instead of its text output)
@@ -2555,6 +2571,13 @@ echo ""
 info "--- Application ---"
 prompt APP_DOMAIN      "Domain name (e.g. ims.yourdomain.com)" "ims.localhost"
 prompt APP_PORT        "Internal port the app listens on"       "3000"
+# The same shape check update.sh applies to the value it reads back out of .env (o3d-2sm1.5 r26,
+# Codex HIGH). Here it is not a parsing question — the value came from a prompt or, under
+# --non-interactive, from the invocation's own environment — but it lands in exactly the same
+# places: `next start -p ${APP_PORT}` in the unit, the nginx upstream, the crontab base URL and
+# the health URL this script polls before declaring the install irreversible. Refusing at the
+# prompt costs a re-run; refusing later costs a half-installed host.
+valid_tcp_port "${APP_PORT}" || die "APP_PORT must be a decimal TCP port in 1-65535, not '${APP_PORT}'. It is written into the systemd unit's \`next start -p\`, the nginx upstream, the cron base URL and the health check this installer polls."
 prompt_yn INSTALL_SSHD "Install OpenSSH server on this system?" "n"
 if [[ "$INSTALL_SSHD" == "y" ]]; then
   prompt SSH_AUTHORIZED_KEY "Authorized SSH public key for root login (leave blank to skip key install)" ""

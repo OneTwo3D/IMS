@@ -787,16 +787,45 @@ own, a redefinition of one of the script's own functions, or an assignment to `S
 restore**, so an application-account compromise reached root on the next update and the restore
 was no boundary at all.
 
-Both `source` calls are gone. `update.sh` now reads the five names it needs out of the two files
+Both `source` calls are gone. `update.sh` now reads the six names it needs out of the two files
 by name, with the same non-evaluating dotenv reader `install.sh` and `deploy.sh` have always used
-— `DATABASE_URL` and `DEPLOY_ADMIN_DATABASE_URL` from `.env`; `GIT_REPO_URL`, `GIT_BRANCH` and
-`GIT_DEPLOY_KEY_ENABLED` from `.deploy-meta`. A line the reader is not asked for is never looked
+— `DATABASE_URL`, `DEPLOY_ADMIN_DATABASE_URL` and `APP_PORT` from `.env`; `GIT_REPO_URL`,
+`GIT_BRANCH` and `GIT_DEPLOY_KEY_ENABLED` from `.deploy-meta`. A line the reader is not asked for is never looked
 at, and a line it is asked for becomes a string and nothing else. The `set -a` that exported the
 whole of `.env` into the update shell and every child process went with it: every child that
 touches the database is handed its connection explicitly, and the build reads `APP_DIR/.env`
 itself through Next's own loader. The r24 capture-and-restore was **removed** rather than kept
 alongside — with nothing sourced, `IMS_*` can only come from the root invocation, and two
 mechanisms for one property are two things to keep true.
+
+**r26: `APP_PORT` was the reader that was still there.** r25 claimed one reader and shipped two.
+The health check kept its own `grep "^APP_PORT=" .env | cut -d= -f2`, which is wrong on values
+dotenv accepts and the service resolves correctly — `APP_PORT="3000"` keeps its quotes,
+`APP_PORT=3000  # internal` keeps the comment and then word-splits the `curl` arguments,
+`export APP_PORT=3000` is not matched at all, a key defined twice takes the *first* line where
+dotenv takes the last, and an absent key produced an **empty** value rather than the `3000` the
+`|| echo "3000"` implies (a pipeline's status is `cut`'s, and `cut` succeeds on empty input). Any
+of those makes the poll target a URL nothing serves: the service is up and healthy, the poll times
+out after 60s, and `update.sh` then stops the service it has just started and re-establishes the
+post-migration fences. A supported `.env` value turned a successful update into an outage.
+
+`APP_PORT` is now read through the same reader, in the **preflight** — before the crontab is
+taken, before the stop, before the fence and before the migration — and validated there as a
+decimal TCP port in 1–65535 by `valid_tcp_port()`, a function all three entrypoints carry
+identically and all three apply to the port they build a health URL out of (`install.sh` to the
+value it prompts for and writes into the unit, the nginx upstream and the cron base URL;
+`deploy.sh` to `IMS_PORT`). Absent still means 3000; present-and-not-a-port is refused with
+nothing stopped and nothing migrated. The refusal is deliberately at the preflight: the same
+refusal at the health check costs a migrated database and a stopped service.
+
+The guard behind the single-reader claim changed shape too. r25's recognised a read only when it
+was written `NAME="$(…)"`, which is why one unquoted assignment survived five rounds of review.
+It now **enumerates every non-comment line in all three entrypoints that names an
+application-owned file** and requires each to match one declared shape — the reader, a file-shape
+test, a path assignment, `install.sh`'s own writes, `install.sh`'s raw round-trip snapshot of the
+previous `.env` for re-run prompt defaults (the one other declared reader, kept raw on purpose so
+the bytes it writes back are the bytes it read), or operator-facing text. Anything else fails the
+build, printing the line.
 
 **What this does not protect against.** The privileged driver is still `scripts/update.sh` itself,
 run by root from wherever the operator keeps it, and `APP_DIR/.deploy-meta` still supplies the

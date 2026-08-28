@@ -553,6 +553,28 @@ env_file_value() {
   printf '%s' "$value"
 }
 
+# THE ONE PLACE A TCP PORT IS DECIDED TO BE A TCP PORT (o3d-2sm1.5 r26, Codex HIGH).
+#
+# A port that is not a port is not a cosmetic problem here: it is spliced straight into the URL
+# the health check polls, and a URL that cannot be reached is indistinguishable from a service
+# that did not come up. On the update path that costs a healthy deployment — the poll times out,
+# the script stops the service it just started and re-establishes the post-migration fences.
+#
+# So the shape is checked ONCE, where the value is read, and the run refuses BEFORE anything is
+# stopped rather than discovering it after the schema has moved. Decimal digits only, 1-65535,
+# and `10#` so a leading zero is a decimal port and not a bash octal error under `set -e`.
+valid_tcp_port() {
+  local value="$1"
+  [[ "$value" =~ ^[0-9]{1,5}$ ]] || return 1
+  (( 10#$value >= 1 && 10#$value <= 65535 )) || return 1
+}
+
+# PORT here comes from the deploy invocation (IMS_PORT), not from an application-owned file, so
+# it is not a reader question — but it ends up in HEALTH_URL and in the listener probe exactly as
+# update.sh's APP_PORT does, and an unreachable health URL reads as "the new build did not come
+# up" in both scripts. Checked here, which is before the build, the stop and the fence.
+valid_tcp_port "${PORT}" || die "IMS_PORT must be a decimal TCP port in 1-65535, not '${PORT}'. It becomes ${HEALTH_URL}, which this deploy polls to decide whether the new build came up."
+
 # The connection the migration itself runs through: the privileged URL while the
 # connection fence is up, because the fence shuts the application role out and the
 # migration must not be shut out with it.
