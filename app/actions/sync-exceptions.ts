@@ -21,7 +21,7 @@ import { runPostMaintenanceRecheckForActiveConnector } from '@/lib/domain/wms/po
 import { eligibleCohortDigest, isolatableLinkWhere, loadUnresolvedDriftIncidents, readRawDriftState, unresolvedDriftStateKey } from '@/lib/domain/wms/unresolved-drift'
 import { INTEGRATION_PLUGIN_SETTING_KEYS } from '@/lib/integration-plugins'
 import { withDispatchSweepLockOrSkip } from '@/lib/domain/wms/dispatch-sweep-lock'
-import { logActivity } from '@/lib/activity-log'
+import { logActivity, logActivityInTransaction } from '@/lib/activity-log'
 import { freshAuthFailureResult, requireFreshPermission, requirePermission } from '@/lib/auth/server'
 import {
   IntegrationOutboxAdminError,
@@ -54,6 +54,7 @@ import {
   type RefundParkRecoveryRefusalCode,
   type RefundParkView,
   type WcOrderRefundEvidence,
+  WC_REFUND_PARK_RECOVERED_ACTION,
 } from '@/lib/domain/sales/refund-park-recovery'
 // o3d-w00 (Codex r7 #3): the pure payload→order-line link, imported from its own module rather than
 // through the sync — the inbox needs the link, not a WooCommerce client.
@@ -1893,11 +1894,18 @@ export async function recordRefundParkManually(
  * name on it; the ownership is evidence, not an assertion. The decision vocabulary — every refusal
  * and every patch — lives in lib/domain/sales/refund-park-recovery.ts as pure functions.
  *
- * THE AUDIT. logActivity is best-effort (it swallows its own errors), which is why the recovery note
- * is written onto the PARK ROW ITSELF in the same transaction as the status change: the fact that a
- * human recovered this park, and what WooCommerce said when they did, survives a logging failure.
- * o3d-batch-settle adds logActivityInTransaction for exactly this problem; when that lands, this
- * activity write should move inside the transaction rather than being duplicated here.
+ * THE AUDIT, AND WHY IT IS NOT BEST-EFFORT (o3d-xnwu r14, Codex HIGH). The recovery note is written
+ * onto the PARK ROW ITSELF in the same transaction as the status change, and so, now, is the
+ * `wc_refund_park_recovered` activity entry — with logActivityInTransaction, which does not catch.
+ *
+ * The two are not redundant, because THE ROW'S OWN NOTE CAN BE OVERWRITTEN. The predecessor's
+ * held-invoice writer takes a recovered park wholesale — payload, externalId, errorMessage, status
+ * — and leaves a row indistinguishable from a legitimate hold; that is the whole reason check 7 of
+ * the 20260822120000 migration's verify.sql looks at HISTORY rather than at the row. The activity
+ * entry is the half of the audit a later write to the row cannot reach, so it has to be exactly as
+ * durable as the recovery: written in the same transaction (this file), and exempt from
+ * activity-log retention (lib/activity-log-cleanup.ts), because a check whose evidence a cleanup
+ * cron deletes at 60 days is not a check.
  */
 export type RecoverRefundSyncParkInput = { observedOrderId: string } & (
   | { outcome: 'REASSIGN'; wcOrderId: number }
@@ -2316,43 +2324,64 @@ export async function recoverRefundSyncPark(
           },
         }
       }
+
+      // THE WITNESS, IN THE SAME TRANSACTION AS THE THING IT WITNESSES (o3d-xnwu r14, Codex HIGH).
+      //
+      // This entry is not a notification. It is the evidence check 7 of the 20260822120000
+      // migration's verify.sql joins to, and check 7 exists because THIS ROW CAN AFTERWARDS BE MADE
+      // TO LOOK INNOCENT: the predecessor's held-invoice writer overwrites the payload, externalId,
+      // message and status of a recovered park wholesale, and every check that reads the row alone
+      // then returns zero over a destroyed accounting payload.
+      //
+      // It used to be written with `logActivity` AFTER this transaction committed — and logActivity
+      // SWALLOWS ITS OWN FAILURES, so an ordinary transient write error, not merely a crash, left
+      // the recovery committed with nothing to join to and the check silently blind on that row.
+      // `logActivityInTransaction` does not catch: a witness that cannot be written takes the
+      // recovery down with it, the operator is told, and they retry. That is the right way round
+      // for a mutation that moves refund evidence between orders and whose only later audit is this
+      // entry. (Its other half — retention — is in lib/activity-log-cleanup.ts, which now exempts
+      // this action: a check whose evidence a cleanup cron deletes at 60 days is not a check.)
+      await logActivityInTransaction(tx, {
+        entityType: 'SYNC',
+        entityId: parkedOrderId,
+        tag: 'sync',
+        action: WC_REFUND_PARK_RECOVERED_ACTION,
+        // WARNING, not INFO: a human correcting an order association on a refund whose money has
+        // already left the business, on evidence the system could not act on by itself.
+        level: 'WARNING',
+        description: assertion.outcome === 'REASSIGN'
+          ? `Reassigned parked WooCommerce refund ${externalRefundId} from order ${parkedOrderId} to order `
+            + `${targetOrderId} after WooCommerce confirmed it on WC order ${evidence.wcOrderId}`
+          : `Dismissed the parked WooCommerce refund ${externalRefundId} on order ${parkedOrderId} after `
+            + `WooCommerce order ${evidence.wcOrderId} did not list it`,
+        metadata: {
+          shoppingSyncLogId: park.id,
+          externalRefundId,
+          outcome: assertion.outcome,
+          parkedOrderId,
+          targetOrderId,
+          // What was asked, and what came back — so the recovery can be re-judged later against the
+          // evidence it was actually made on rather than against WooCommerce as it is by then.
+          wcOrderId: evidence.wcOrderId,
+          wcRefundIds: [...evidence.refundIds],
+          wcFetchedAt: evidence.fetchedAt.toISOString(),
+          // How many complete walks the evidence had to survive. A dismissal is made on two that agreed;
+          // a reassign on one, because presence cannot be produced by a short list. Recorded so the
+          // recovery can be re-judged later on the standard of proof it was actually held to.
+          wcEvidenceReads: assertion.outcome === 'DISMISS' ? 2 : 1,
+          priorStatus: park.status,
+          userId: session.user.id,
+        },
+        // Required by logActivityInTransaction, and deliberately so: the session lookup logActivity
+        // falls back on is a React cache() read, which has no place inside a database transaction.
+        userId: session.user.id,
+      })
+
       return { ok: true as const }
     })
 
     if (!applied.ok) return { success: false, error: applied.refusal.message, code: applied.refusal.code }
 
-    await logActivity({
-      entityType: 'SYNC',
-      entityId: parkedOrderId,
-      tag: 'sync',
-      action: 'wc_refund_park_recovered',
-      // WARNING, not INFO: a human correcting an order association on a refund whose money has
-      // already left the business, on evidence the system could not act on by itself.
-      level: 'WARNING',
-      description: assertion.outcome === 'REASSIGN'
-        ? `Reassigned parked WooCommerce refund ${externalRefundId} from order ${parkedOrderId} to order `
-          + `${targetOrderId} after WooCommerce confirmed it on WC order ${evidence.wcOrderId}`
-        : `Dismissed the parked WooCommerce refund ${externalRefundId} on order ${parkedOrderId} after `
-          + `WooCommerce order ${evidence.wcOrderId} did not list it`,
-      metadata: {
-        shoppingSyncLogId: park.id,
-        externalRefundId,
-        outcome: assertion.outcome,
-        parkedOrderId,
-        targetOrderId,
-        // What was asked, and what came back — so the recovery can be re-judged later against the
-        // evidence it was actually made on rather than against WooCommerce as it is by then.
-        wcOrderId: evidence.wcOrderId,
-        wcRefundIds: [...evidence.refundIds],
-        wcFetchedAt: evidence.fetchedAt.toISOString(),
-        // How many complete walks the evidence had to survive. A dismissal is made on two that agreed;
-        // a reassign on one, because presence cannot be produced by a short list. Recorded so the
-        // recovery can be re-judged later on the standard of proof it was actually held to.
-        wcEvidenceReads: assertion.outcome === 'DISMISS' ? 2 : 1,
-        priorStatus: park.status,
-        userId: session.user.id,
-      },
-    })
     revalidatePath('/sync/exceptions')
     return { success: true, outcome: assertion.outcome, targetOrderId }
   } catch (error) {

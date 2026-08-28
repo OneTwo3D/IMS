@@ -77,6 +77,41 @@ export function isRecoverableRefundParkStatus(status: string): status is Recover
 export const WC_REFUND_PARK_RECORD_KIND = 'WC_REFUND_PARK'
 
 /**
+ * THE WITNESS — the activity-log action `recoverParkedWcRefund` writes when it recovers a park, and
+ * the only evidence check 7 of the 20260822120000 migration's verify.sql has to join to (o3d-xnwu
+ * r14, Codex HIGH).
+ *
+ * Check 7 exists because the ACCUSED ROW CAN BE MADE INNOCENT. The predecessor's held-invoice
+ * writer overwrites a recovered park wholesale — payload, externalId, errorMessage, status — and
+ * every check that reads the row alone then returns zero over a destroyed accounting payload. So
+ * the evidence has to come from somewhere the second write cannot reach, and this entry is it: a
+ * fact about the PAST, naming the row in `metadata.shoppingSyncLogId`.
+ *
+ * WHICH MAKES IT EVIDENCE, NOT HISTORY, AND EVIDENCE HAS TO BE AS DURABLE AS THE THING IT
+ * WITNESSES. It was neither. It was written with `logActivity` AFTER the recovery transaction
+ * committed — and `logActivity` swallows its own failures, so an ordinary transient write error
+ * (not merely a crash) left the recovery committed with nothing to join to. And it is a WARNING,
+ * which `purgeExpiredActivityLogs` deletes after 60 days by default, so a cutover run a quarter
+ * after the recovery would find no witness for a row that really was recovered and the check would
+ * go quiet — silently, and exactly for the oldest incidents.
+ *
+ * Both are closed, and it takes both:
+ *
+ *   1. THE WITNESS IS WRITTEN IN THE RECOVERY'S OWN TRANSACTION, with `logActivityInTransaction`,
+ *      which does not catch. No recovery can commit without it; a witness write that fails takes
+ *      the recovery down with it, and the operator sees a failure and retries. That is the right
+ *      way round for a mutation whose only later audit is this row.
+ *   2. IT IS EXEMPT FROM ACTIVITY-LOG RETENTION (lib/activity-log-cleanup.ts). Ageing it out does
+ *      not expire a log line; it deletes the only proof that a recovered row was ever recovered,
+ *      and switches off the one check a later overwrite cannot switch off.
+ *
+ * Named here, in the pure module the recovery vocabulary lives in, so that the writer, the
+ * retention exemption and the tests all spell it the same way. verify.sql carries the same literal
+ * and tests/prisma/shopping-sync-log-record-kind-verify.test.ts holds the two together.
+ */
+export const WC_REFUND_PARK_RECOVERED_ACTION = 'wc_refund_park_recovered'
+
+/**
  * THE ONE PREDICATE THAT SAYS "THIS ROW IS AN ACTIVE REFUND PARK" — AND IT SAYS SO POSITIVELY
  * (o3d-xnwu r7, Codex HIGH).
  *

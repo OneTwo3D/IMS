@@ -59,10 +59,25 @@
 -- stamped as a held sales invoice. It is the only check here whose evidence is not in the row it
 -- accuses, and therefore the only one a later write to that row cannot switch off.
 --
--- Its one blind spot, said out loud: `logActivity` runs AFTER the update transaction commits, so a
--- crash in between leaves the recovery with no entry and this check with nothing to join to. That
--- makes it best-effort in that one direction — which is still strictly more than the six checks
--- above can see here, and it never produces a false positive from the same gap.
+-- AND ITS EVIDENCE IS AS DURABLE AS THE THING IT WITNESSES (o3d-xnwu r14, Codex HIGH). It was not.
+-- The entry used to be written with `logActivity` AFTER the recovery transaction committed, and
+-- `logActivity` SWALLOWS ITS OWN FAILURES — so not merely a crash but an ordinary transient write
+-- error left the recovery committed with nothing here to join to. Worse, the entry is a WARNING and
+-- `purgeExpiredActivityLogs` deletes WARNING entries after 60 days by default, so this check would
+-- have gone quiet on its own, silently, and FIRST for the oldest incidents — the ones nobody has
+-- looked at — while a cutover may run a year after the recovery. A verification check whose evidence
+-- a retention cron deletes is not a verification check.
+--
+-- Both halves are closed, and it takes both:
+--
+--   * `recoverParkedWcRefund` writes the entry with `logActivityInTransaction`, INSIDE the same
+--     transaction as the park mutation. It does not catch, so no recovery can commit without its
+--     witness: a failed witness write aborts the recovery and the operator retries.
+--   * `wc_refund_park_recovered` is in RETAINED_ACTIONS in lib/activity-log-cleanup.ts, so no
+--     retention period can remove it.
+--
+-- What remains is only what no design can remove: this check accuses nothing it cannot see, and it
+-- never produces a false positive from a missing entry.
 --
 -- WHY THERE ARE SIX AND NOT FIVE (Codex MEDIUM, round 5). Checks 1-5 model what the predecessor
 -- WRITES INTO A ROW. They do not model what it does to a row's STATUS AND MESSAGE while leaving the
@@ -495,10 +510,12 @@ SELECT 'shopping_sync_logs held-release outcome on a row that is not a hold' AS 
 --
 --    WHEN THE CURRENT STATE CAN BE MADE TO LOOK INNOCENT, THE EVIDENCE HAS TO COME FROM HISTORY.
 --    `recoverParkedWcRefund` writes a `wc_refund_park_recovered` activity entry naming the row it
---    acted on (metadata.shoppingSyncLogId) — in the same request, after the update, and no code
---    path rewrites or deletes it. That entry is a fact about the PAST that a later overwrite of the
---    sync-log row cannot reach. So this check says: a row a park recovery once acted on must never
---    afterwards be shaped or stamped as a held sales invoice.
+--    acted on (metadata.shoppingSyncLogId) — IN THE SAME TRANSACTION as the park mutation
+--    (`logActivityInTransaction`, which does not catch, so the recovery cannot commit without it),
+--    exempt from activity-log retention, and rewritten or deleted by no code path. That entry is a
+--    fact about the PAST that a later overwrite of the sync-log row cannot reach. So this check
+--    says: a row a park recovery once acted on must never afterwards be shaped or stamped as a held
+--    sales invoice.
 --
 --    BOTH OUTCOMES, NOT ONLY REASSIGN. A DISMISS leaves entityId alone, so the same second step —
 --    the predecessor re-holding order A onto the dismissed row — restores the identity equality and
