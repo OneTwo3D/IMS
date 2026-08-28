@@ -259,10 +259,29 @@ DB_FENCE_ROTATION_NOTE=""
 # because "the artefact is not sealed" is not something an operator can act on.
 DB_FENCE_SEAL_REASON=""
 
-# Set by db_fence_probe_script(): the file a --preflight probe may run, and the throwaway
-# directory (if any) that has to be removed afterwards.
+# Set by db_fence_probe_script(): the file a --preflight probe may run, the throwaway directory
+# (if any) that has to be removed afterwards, and what the probed tree hashes to — which is the
+# value an operator pins the FIRST publication with, obtainable from a run that writes nothing.
 DB_FENCE_PROBE_SCRIPT=""
 DB_FENCE_PROBE_TEMP=""
+DB_FENCE_PROBE_ARTEFACT_SHA256=""
+
+# Set by _fence_source_trust(): empty when the tree the artefact was assembled FROM is one only
+# the publishing account could have written, and otherwise the first path that is not.
+DB_FENCE_SOURCE_UNTRUSTED_PATH=""
+
+# THE PRIVILEGE TRANSITION IS PART OF A PRINTED INSTRUCTION, NOT AN ASSUMPTION ABOUT ITS READER
+# (o3d-2sm1.5 r33, Codex HIGH). The recovery wrappers below are root-owned and 0700, so an
+# operator who launched the cutover with `sudo bash scripts/update.sh` returns to a NON-ROOT shell
+# and gets `Permission denied` from a banner that printed a bare path. The banners therefore print
+# this prefix in front of it.
+#
+# Empty when sudo is not installed, and that is not a fallback that leaves a reader stuck: every
+# entrypoint refuses to run as anything but root, so on a box with no sudo the run cannot have
+# been launched through it either, and the shell reading the banner is root's. `sudo <path>` is
+# also correct FROM a root shell, so where sudo exists one form serves both readers.
+DB_FENCE_SUDO_PREFIX=""
+if command -v sudo >/dev/null 2>&1; then DB_FENCE_SUDO_PREFIX="sudo "; fi
 
 # ---------------------------------------------------------------------------
 # Durability, owned here rather than borrowed from the sourcing script.
@@ -505,6 +524,64 @@ CLOSURE_EOF
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# COULD ANYONE BUT THE PUBLISHER HAVE CHOSEN THESE BYTES?
+#
+# o3d-2sm1.5 r33, Codex CRITICAL, and it is the r32 finding one level up. r32 made the artefact
+# self-contained and gave it a whole-tree digest — which authenticates the tree FROM THE MOMENT IT
+# IS RECORDED. It does not authenticate what the tree was first assembled from. IMS_FENCE_SCRIPT_SHA256
+# covers the ENTRY FILE; the closure is taken from ${APP_DIR}/node_modules; so an account that can
+# write there can leave the legitimate helper untouched, replace one file inside `pg`, and have the
+# substitution sealed, digested and recorded as the trusted artefact. `pg` is imported before
+# main() runs, so those bytes can report a fence that was never raised and hand back a migration
+# URL of their own. The recorded digest then detects every LATER change to bytes it should never
+# have trusted in the first place.
+#
+# So a publication asks this before it happens, and the answer is a property of the source paths
+# rather than a judgement about them:
+#
+#   * the entry file, and every directory the vendoring walks through to reach a package, and
+#   * every file and directory inside every package that is copied
+#
+# must be owned by the publishing account — uid 0 in production, since all three entrypoints
+# refuse to run as anything else — and writable by nobody else. Anything else and the source is
+# APPLICATION-WRITABLE, which is the case this entire file exists for.
+#
+# The ANCESTORS are checked at depth 0 only. Descending them would walk the whole application
+# directory, which says nothing: what matters about a directory on the way to a package is whether
+# somebody else can swap what is IN it.
+#
+# It names the FIRST offending path rather than counting them, because an operator acts on a path.
+# A find that cannot stat what it was asked about is a failure, not a pass: this is the one
+# question whose "no answer" must never read as "no problem".
+# ---------------------------------------------------------------------------
+_fence_source_trust() {
+  local app_dir="$1" list="$2" uid relative acc part offender
+  local -a ancestors=() packages=()
+  DB_FENCE_SOURCE_UNTRUSTED_PATH=""
+  uid="$(id -u)" || return 1
+  ancestors+=("${app_dir}" "$(dirname "${DB_FENCE_SCRIPT}")")
+  packages+=("${DB_FENCE_SCRIPT}")
+  while IFS= read -r relative; do
+    [[ -n "${relative}" ]] || continue
+    acc="${app_dir}"
+    while [[ "${relative}" == */* ]]; do
+      part="${relative%%/*}"
+      relative="${relative#*/}"
+      acc="${acc}/${part}"
+      ancestors+=("${acc}")
+    done
+    packages+=("${acc}/${relative}")
+  done < "${list}"
+
+  offender="$(find "${ancestors[@]}" -maxdepth 0 \( ! -uid "${uid}" -o -perm /022 \) -print -quit 2>/dev/null)" || return 1
+  if [[ -z "${offender}" ]]; then
+    offender="$(find "${packages[@]}" \( ! -uid "${uid}" -o -perm /022 \) -print -quit 2>/dev/null)" || return 1
+  fi
+  [[ -z "${offender}" ]] || DB_FENCE_SOURCE_UNTRUSTED_PATH="${offender}"
+  return 0
+}
+
 # Copy that closure into the staged tree at the SAME relative paths, so node's walk inside the
 # mirror finds exactly what it finds inside the checkout — nesting included.
 #
@@ -521,6 +598,14 @@ _fence_vendor_into() {
   mkdir -p "${staged}" || return 1
   rm -f "${list}"
   _fence_vendor_closure "${app_dir}" "${staged}" "${list}" "${DB_FENCE_VENDOR_ROOTS[@]}" || { rm -f "${list}"; return 1; }
+  # THE PROVENANCE OF THE CLOSURE, decided from the list before a byte of it is copied. What the
+  # answer then AUTHORISES is _fence_stage_and_publish()'s business; establishing it is this
+  # function's, because this is where the source paths are known.
+  if ! _fence_source_trust "${app_dir}" "${list}"; then
+    rm -f "${list}"
+    DB_FENCE_ROTATION_NOTE="the ownership and modes of the fence helper's dependency closure under ${app_dir} could not be read, so there is no answer to whether an account other than this one could have chosen those bytes. Nothing was published."
+    return 1
+  fi
   if [[ ! -s "${list}" ]]; then
     rm -f "${list}"
     DB_FENCE_ROTATION_NOTE="the fence helper's dependency closure resolved to nothing at all from ${app_dir}, which cannot be right while it still imports ${DB_FENCE_VENDOR_ROOTS[*]}"
@@ -603,6 +688,28 @@ _fence_stage_and_publish() {
     return 1
   fi
 
+  # WHAT A SCRIPT-ONLY PIN CAN AUTHENTICATE, AND WHAT IT CANNOT (o3d-2sm1.5 r33, Codex CRITICAL).
+  #
+  # IMS_FENCE_SCRIPT_SHA256 authenticates the ENTRY FILE. That is a whole statement about a tenth
+  # of what executes, and it is sufficient BY ITSELF only when the rest of the tree came from a
+  # source the publishing account already owns outright. From an application-writable checkout it
+  # is not sufficient and it is REFUSED as such, naming the variable that would cover the rest —
+  # rather than publishing an unauthenticated closure under a pin that reads like authorisation.
+  #
+  # WITH NO PIN AT ALL this is the bootstrap, and it is reported rather than refused: there is no
+  # earlier artefact to compare against, an operator who has never published this release has no
+  # digest to supply, and the alternative is a mechanism that cannot start. It is trust on first
+  # use, it is now SAID so on the run that does it, and the run prints the value that pins the
+  # next host.
+  if [[ -z "${DB_FENCE_EXPECTED_ARTEFACT_SHA256}" && -n "${DB_FENCE_SOURCE_UNTRUSTED_PATH}" ]]; then
+    if [[ -n "${DB_FENCE_EXPECTED_SHA256}" ]]; then
+      rm -rf "${DB_FENCE_STAGED_APP_DIR}"
+      DB_FENCE_ROTATION_NOTE="IMS_FENCE_SCRIPT_SHA256 IS NOT SUFFICIENT HERE, so NOTHING was published to ${DB_FENCE_PROTECTED_APP_DIR}. It authenticates the entry file only — ${script_digest}, which did match — and the artefact also vendors that helper's dependency closure out of ${app_dir}, where ${DB_FENCE_SOURCE_UNTRUSTED_PATH} is owned or writable by an account other than this one. Leaving the entry file alone and replacing one file inside a vendored package would therefore have been sealed, digested and recorded as trusted. Re-run supplying IMS_FENCE_ARTEFACT_SHA256=<digest of the WHOLE tree> as well, obtained the way the entry-file digest is: from the release, or from a host that has already published it (\`grep '^fence_artefact_sha256=' ${DB_FENCE_ARTEFACT_FILE}\` there), or from --dry-run on this box, which assembles the same tree and prints what it would hash to without writing anything. FOR INFORMATION ONLY, the tree assembled from ${app_dir} just now hashes to ${artefact_digest} — that value is REPORTED AND NOT AUTHENTICATED, it is what the checkout being questioned says about itself, so compare it against the release before pinning it."
+      return 1
+    fi
+    DB_FENCE_ROTATION_NOTE="TRUST ON FIRST USE: this is the first publication of the protected fence artefact at ${DB_FENCE_PROTECTED_APP_DIR}, and nothing authenticated it. The entry file and the whole vendored dependency closure were taken from ${app_dir}, where ${DB_FENCE_SOURCE_UNTRUSTED_PATH} is owned or writable by an account other than this one, and there was no earlier artefact and no supplied digest to compare them with. From here on the tree is root-owned and its digest is verified before every execution, so this is the ONE moment the application account could have chosen these bytes. What was published hashes to ${artefact_digest}: record it, and pin the next host with IMS_FENCE_ARTEFACT_SHA256=${artefact_digest} — and pin this one on its next update, once you have compared that value with the release."
+  fi
+
   # THE SWAP. The previous tree is moved aside rather than deleted, so a failure between the two
   # renames leaves the OLD artefact standing — which still fences — rather than none, which does
   # not.
@@ -660,7 +767,10 @@ publish_fence_script_copy() {
 
   if [[ ! -f "${DB_FENCE_SCRIPT_COPY}" ]]; then
     # BOOTSTRAP. Nothing this mechanism ever published is standing, so there is nothing here to
-    # substitute FOR; an expected digest, if the operator supplied one, still has to match.
+    # substitute FOR; an expected digest, if the operator supplied one, still has to match — and
+    # IMS_FENCE_SCRIPT_SHA256 on its own does NOT match enough, which _fence_stage_and_publish()
+    # refuses. A bootstrap with no pin at all is trust on first use and returns saying so in
+    # ${DB_FENCE_ROTATION_NOTE}, which the caller prints.
     _fence_stage_and_publish || return 1
     return 0
   fi
@@ -814,11 +924,24 @@ db_fence_script_in_use() {
 # moment in the whole script — schema moved, fence down — still said
 # `node ${DB_FENCE_SCRIPT} --fence`, which is the application-owned path.
 #
-# So nothing prints a command line any more. Root writes two WRAPPERS, and the banners print
-# their paths:
+# So nothing prints a command line any more. Root writes two WRAPPERS, and the banners print an
+# instruction that runs them:
 #
-#   ${DB_FENCE_RELEASE_WRAPPER}   release the standing fence
-#   ${DB_FENCE_REFENCE_WRAPPER}   raise it again
+#   ${DB_FENCE_SUDO_PREFIX}${DB_FENCE_RELEASE_WRAPPER}   release the standing fence
+#   ${DB_FENCE_SUDO_PREFIX}${DB_FENCE_REFENCE_WRAPPER}   raise it again
+#
+# THE PREFIX IS NOT DECORATION (o3d-2sm1.5 r33, Codex HIGH). r32 asked of every printed line
+# "would it run if pasted?" and answered yes for these — correctly for root, and wrongly for the
+# person most likely to be reading them. The wrappers are root-owned and 0700; an operator who
+# launched the cutover as `sudo bash scripts/update.sh` reads the banner in a NON-ROOT shell and a
+# bare path gives them `Permission denied` at the one moment there is no time to debug it. The
+# question is therefore asked as: would this run when pasted BY THE ACCOUNT THAT READS IT.
+#
+# The mode stays 0700 and root-owned rather than being opened to the application account: the
+# whole point of the artefact is that the account being defended against does not get to choose
+# what runs with DEPLOY_ADMIN_DATABASE_URL beside it, and an executable-by-the-app-user wrapper is
+# a file that account can at least invoke at a moment of its choosing. The identity gate inside
+# stays too — a mode is not a proof, and the gate is what holds if one ever changes.
 #
 # Each one:
 #   * is root-owned and 0700, written by root, and NEVER sources this library from the checkout —
@@ -869,12 +992,25 @@ db_fence_publish_operator_wrappers() {
       printf 'state_file=%q\n' "${state_file}"
       printf 'expected_artefact=%q\n' "${artefact_digest}"
       printf 'mode=%q\n' "${mode}"
+      # ITS OWN ABSOLUTE PATH, baked rather than taken from $0: an instruction this file prints
+      # about itself has to be one that runs from anywhere, and $0 is whatever the caller typed.
+      printf 'self=%q\n' "${target}"
+      # AND THE PRIVILEGE TRANSITION, resolved when the wrapper RUNS rather than when it is
+      # written: what it prints is for the shell reading it, which may not be the one that
+      # published it, and sudo may have been installed since.
+      printf '%s\n' 'sudo_prefix=""'
+      printf '%s\n' 'if command -v sudo >/dev/null 2>&1; then sudo_prefix="sudo "; fi' 
       cat <<'WRAPPER_EOF'
 # Root, because switching to the application account needs it — or the application account
 # itself, which needs no switch and is who the helper runs as on every path anyway. Anyone else
 # would fail at runuser with a less useful message.
+#
+# In practice this file is 0700 and root-owned, so a reader who is not root does not reach this
+# line at all: they get EACCES from the kernel first, which is why every banner that names this
+# file prints a privilege transition in front of it. The gate is kept because the mode is not a
+# proof and this message is the better one if the mode ever changes.
 if [[ "$(id -u)" -ne 0 && "$(id -un)" != "${app_account}" ]]; then
-  echo "Run this as root, or as ${app_account}: it runs the protected fence helper as ${app_account}." >&2
+  echo "Run this as root — ${sudo_prefix}${self} — or as ${app_account}: it runs the protected fence helper as ${app_account}." >&2
   exit 1
 fi
 # The tree this is about to execute must still be the tree this wrapper was written for.
@@ -905,7 +1041,11 @@ if [[ -z "${DEPLOY_ADMIN_DATABASE_URL:-}" ]]; then
   echo "DEPLOY_ADMIN_DATABASE_URL is not set and ${app_env_file} does not define it, so there is" >&2
   echo "no privileged connection to ${mode} with. Re-run supplying it:" >&2
   echo "" >&2
-  echo "  DEPLOY_ADMIN_DATABASE_URL='postgresql://ADMIN:PASSWORD@HOST:PORT/DATABASE' $0" >&2
+  # `env`, and the whole line prefixed rather than the assignment: `sudo VAR=x /path` is not a
+  # thing sudo accepts, and a bare `VAR=x /path` is EACCES for the non-root shell this is most
+  # likely being read in. The prefix is empty where sudo is not installed, which is a box the
+  # reader can only have reached as root anyway.
+  echo "  ${sudo_prefix}env DEPLOY_ADMIN_DATABASE_URL='postgresql://ADMIN:PASSWORD@HOST:PORT/DATABASE' ${self}" >&2
   echo "" >&2
   echo "It must be a superuser or database-owner connection as a DIFFERENT role from the one the" >&2
   echo "fence revoked CONNECT from; see docs/installation.md." >&2
@@ -944,8 +1084,11 @@ db_fence_probe_script() {
   DB_FENCE_PROBE_SCRIPT=""
   DB_FENCE_PROBE_TEMP=""
 
+  DB_FENCE_PROBE_ARTEFACT_SHA256=""
+
   if [[ -f "${DB_FENCE_SCRIPT_COPY}" ]] && _fence_tree_is_sealed "${DB_FENCE_PROTECTED_APP_DIR}"; then
     DB_FENCE_PROBE_SCRIPT="${DB_FENCE_SCRIPT_COPY}"
+    DB_FENCE_PROBE_ARTEFACT_SHA256="$(_fence_tree_digest "${DB_FENCE_PROTECTED_APP_DIR}")" || DB_FENCE_PROBE_ARTEFACT_SHA256=""
     return 0
   fi
 
@@ -959,6 +1102,10 @@ db_fence_probe_script() {
   # nobody else, which is what makes the snapshot mean anything.
   chmod -R u=rwX,go=rX "${dir}" || { rm -rf "${dir}"; return 1; }
   _fence_tree_is_sealed "${dir}" || { rm -rf "${dir}"; return 1; }
+  # WHAT A REAL RUN WOULD PUBLISH, HASHED WITHOUT PUBLISHING IT. This is the answer to "and how do
+  # I compute IMS_FENCE_ARTEFACT_SHA256 before the first publication?" — the snapshot is assembled
+  # exactly the way the artefact is, so its digest is the artefact's, and a dry run writes nothing.
+  DB_FENCE_PROBE_ARTEFACT_SHA256="$(_fence_tree_digest "${dir}")" || DB_FENCE_PROBE_ARTEFACT_SHA256=""
   DB_FENCE_PROBE_SCRIPT="${dir}/scripts/fence-db-connections.mjs"
   DB_FENCE_PROBE_TEMP="${dir}"
   return 0
@@ -968,5 +1115,6 @@ db_fence_probe_cleanup() {
   if [[ -n "${DB_FENCE_PROBE_TEMP}" ]]; then rm -rf "${DB_FENCE_PROBE_TEMP}"; fi
   DB_FENCE_PROBE_TEMP=""
   DB_FENCE_PROBE_SCRIPT=""
+  DB_FENCE_PROBE_ARTEFACT_SHA256=""
   return 0
 }

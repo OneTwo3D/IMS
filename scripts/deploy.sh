@@ -560,9 +560,20 @@ source "${IMS_SCRIPT_LIB_DIR}/db-fence-protected.sh" || {
 # artefact this run resolved, with the state file and the four identity values baked in. They take
 # the credential from their own environment or from ${APP_DIR_REAL}/.env with the same reader
 # env_file_value() uses, re-verify the artefact digest before exec, and run as ${APP_USER}. There
-# is nothing to fill in and nothing to paste wrongly: the instruction is a path.
-DB_FENCE_RELEASE_CMD="${DB_FENCE_RELEASE_WRAPPER}"
-DB_FENCE_REFENCE_CMD="${DB_FENCE_REFENCE_WRAPPER}"
+# is nothing to fill in and nothing to paste wrongly.
+#
+# AND THE INSTRUCTION IS NOT THE BARE PATH (o3d-2sm1.5 r33, Codex HIGH). Those wrappers are
+# root-owned and 0700. The operator most likely to be reading this banner launched the cutover
+# with `sudo bash scripts/...` and is back in a NON-ROOT shell, where pasting a bare path gives
+# `Permission denied` while the database is still fenced. ${DB_FENCE_SUDO_PREFIX} carries the
+# privilege transition, and it is empty only on a box with no sudo — which is a box this run
+# cannot have been launched on as anything but root, so the reader is root there.
+#
+# ONE ASSIGNMENT EACH, and every banner in this file prints these two variables rather than
+# composing a command of its own: that is the same "one rule, several readers" discipline the
+# fence library exists for, applied to the text.
+DB_FENCE_RELEASE_CMD="${DB_FENCE_SUDO_PREFIX}${DB_FENCE_RELEASE_WRAPPER}"
+DB_FENCE_REFENCE_CMD="${DB_FENCE_SUDO_PREFIX}${DB_FENCE_REFENCE_WRAPPER}"
 
 # THE ONE PLACE THIS SCRIPT DECIDES WHICH BYTES THE FENCE RUNS, and the one place the recovery
 # wrappers are refreshed — so the file that is executed and the file an operator is pointed at can
@@ -1950,6 +1961,16 @@ require_fenceable_database() {
     if [[ "$DB_FENCE_PROBE_SCRIPT" == "$DB_FENCE_SCRIPT_COPY" ]]; then
       warn "A fence raised by an earlier run is recorded here, so this dry run probes with the"
       warn "root-owned copy of the fence script at ${DB_FENCE_PROBE_SCRIPT} rather than the checkout's."
+    fi
+    # AND WHAT IT WOULD HASH TO. "Supply IMS_FENCE_ARTEFACT_SHA256" is only an instruction if
+    # there is somewhere to get the value BEFORE the first publication; the probe assembles the
+    # same tree the real run would publish and writes nothing, so this is that somewhere
+    # (o3d-2sm1.5 r33, Codex CRITICAL).
+    if [[ -n "${DB_FENCE_PROBE_ARTEFACT_SHA256}" ]]; then
+      warn "The fence artefact this box would run hashes to ${DB_FENCE_PROBE_ARTEFACT_SHA256} — that is"
+      warn "the value IMS_FENCE_ARTEFACT_SHA256 pins, and this run assembled it without writing anything."
+      warn "Compare it against the release before pinning with it: it was assembled from a checkout the"
+      warn "application account can write, which is the thing the pin exists to stop trusting."
     fi
     as_app_user env DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
       node "$DB_FENCE_PROBE_SCRIPT" --preflight "${DB_FENCE_IDENTITY_ARGS[@]:-}" || dry_rc=$?
