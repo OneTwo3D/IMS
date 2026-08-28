@@ -2480,6 +2480,10 @@ test('[o3d-0bfh r11/r12] every FILE that writes about a retained obligation is s
     readSource(path.join(REPO_ROOT, 'lib', 'connectors', 'quickbooks', 'sync-processor.ts')),
     readSource(path.join(REPO_ROOT, 'lib', 'domain', 'accounting', 'back-reference-sweep.ts')),
     readSource(path.join(REPO_ROOT, 'lib', 'domain', 'accounting', 'compacted-followup-loss.ts')),
+    // The LOADER the inbox renders from. It authors no sentence — it spreads the describer's output
+    // — and that is asserted below rather than assumed, because a remedy written here would reach an
+    // operator through a surface the r9 UI scan does not read.
+    readSource(path.join(REPO_ROOT, 'app', 'actions', 'sync-exceptions.ts')),
   ]
   for (const source of sources) assertNoBannedInstruction(source.rel, source.code)
 
@@ -2501,4 +2505,8 @@ test('[o3d-0bfh r11/r12] every FILE that writes about a retained obligation is s
     'and its recovery guidance must come from the registry',
   )
   assert.match(sources[3]!.code, /Nothing here authorises settling that by hand/)
+  assert.match(
+    sources[4]!.code, /describeFollowUpObligationBacklogRow\(row\)/,
+    'the exception-inbox loader must pass the registry describer through, not compose a remedy of its own',
+  )
 })
