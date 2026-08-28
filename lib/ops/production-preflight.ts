@@ -207,6 +207,12 @@ async function checkDatabaseConnectivity(
     if (dbConnect) {
       await dbConnect(databaseUrl)
     } else {
+      // DELIBERATELY UNGUARDED, and it is the ONE runtime client that is (o3d-2k5r r23, Codex HIGH).
+      // This asks one question — can a TCP connection to this URL be opened and answered — and its
+      // only statement is `SELECT 1`, which resolves no object and so has no schema to be wrong
+      // about. Routing it through `pgConnectionConfig()` would make an unsupported schema name
+      // report itself as "database connectivity failed", which is the wrong check failing: the
+      // schema is `checkWmsPushStateSchema()` below, and that one IS guarded.
       const { Client } = await import('pg')
       const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 })
       try {

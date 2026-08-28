@@ -16,6 +16,7 @@ import { sendEmail } from '@/lib/mailer'
 import { consumeAuthToken, deleteAuthToken, setAuthToken } from '@/lib/auth/token-store'
 import { db } from '@/lib/db'
 import { ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY } from '@/lib/db/advisory-locks'
+import { pgConnectionConfig, pinClientToMeasuredBackend } from '@/lib/db/database-url-schema.mjs'
 import { createRestoreSqlScanner } from '@/lib/backup/restore-sql-guard'
 import { parsePositiveIntegerEnv } from '@/lib/env'
 import { getClientIp } from '@/lib/request-ip'
@@ -860,10 +861,20 @@ export function createRestoreSelectionLockHolder(options: {
   /** Called when the lock is deliberately NOT released. Loud by default; injectable for tests. */
   onLockRetained?: (reason: string) => void
 } = {}): RestoreSelectionLockHolder {
-  const createClient = options.createClient ?? (() => new pg.Client({
-    connectionString: process.env.DATABASE_URL,
-    application_name: 'ims_restore_lock_holder',
-  }) as unknown as RestoreLockClient)
+  // BUILT FROM THE GUARDED CONFIG (o3d-2k5r r23, Codex HIGH). This client takes the advisory lock
+  // that decides whether a restore may overwrite the database, and it reads `pg_stat_activity` to
+  // confirm the restore's own backend has gone. A raw `{ connectionString: DATABASE_URL }` carries
+  // no `search_path` pin and none of the per-connection backend checks, so on a deployment whose
+  // schema needs a non-ASCII startup option it could hold the lock on a backend other than the one
+  // the restore runs against. `pinClientToMeasuredBackend` is a no-op for an ASCII schema — it
+  // returns the client untouched when the config carries no guard.
+  const createClient = options.createClient ?? (() => {
+    const clientConfig = {
+      ...pgConnectionConfig(process.env.DATABASE_URL),
+      application_name: 'ims_restore_lock_holder',
+    }
+    return pinClientToMeasuredBackend(new pg.Client(clientConfig), clientConfig) as unknown as RestoreLockClient
+  })
   const now = options.now ?? Date.now
   const delay = options.delay ?? ((ms: number) => new Promise<void>((resolve) => { setTimeout(resolve, ms) }))
   const maxWaitMs = options.maxWaitMs ?? RESTORE_SELECTION_LOCK_MAX_WAIT_MS

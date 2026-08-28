@@ -1,5 +1,7 @@
 import { Pool, type PoolClient } from 'pg'
 
+import { pgConnectionConfig } from '@/lib/db/database-url-schema.mjs'
+
 /**
  * Serializes the two jobs that write `paidAt` from Xero — the 15-minute payment poll and the daily
  * backlog reconcile — so neither can act on a Xero read the other has already invalidated (o3d-2s8,
@@ -28,12 +30,23 @@ export const LOCK_SKIPPED: LockSkipped = { lockSkipped: true }
 // every other session — it does not need to be the connection the writes happen on, only a stable
 // one held for the lock's lifetime. Lazily created; a handful of connections is plenty for two
 // low-frequency jobs.
+/**
+ * THE LOCK POOL IS BUILT FROM THE GUARDED CONFIG, NOT FROM `DATABASE_URL` (o3d-2k5r r23, Codex
+ * HIGH). A `new Pool({ connectionString })` is a second, unguarded route to the database inside a
+ * process whose Prisma pool is guarded: it carries no `search_path` pin, so its raw statements
+ * resolve through the server-default schema rather than the one the application writes to, and it
+ * carries none of the per-connection backend checks, so on a deployment whose schema name needs a
+ * non-ASCII startup option it can be served by a backend the deployment probe never measured. An
+ * exclusion taken somewhere other than where the work happens is not an exclusion.
+ * `pgConnectionConfig()` supplies the pin and, for a non-ASCII pin only, the `onConnect` guard; for
+ * an ASCII schema it is the same connection string plus an explicit search path, and costs nothing.
+ */
 let lockPool: Pool | null = null
 function getLockPool(): Pool {
   if (!lockPool) {
     const connectionString = process.env.DATABASE_URL
     if (!connectionString) throw new Error('DATABASE_URL is required for the payment-write lock')
-    lockPool = new Pool({ connectionString, max: 4 })
+    lockPool = new Pool({ ...pgConnectionConfig(connectionString), max: 4 })
   }
   return lockPool
 }

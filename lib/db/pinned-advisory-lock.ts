@@ -1,5 +1,7 @@
 import { Pool, type PoolClient } from 'pg'
 
+import { pgConnectionConfig } from './database-url-schema.mjs'
+
 /**
  * A SESSION-level advisory lock, held on one pinned connection (o3d-4ajo).
  *
@@ -20,13 +22,24 @@ import { Pool, type PoolClient } from 'pg'
  * lock; this is the same shape, callable by any job.
  */
 
+/**
+ * THE LOCK POOL IS BUILT FROM THE GUARDED CONFIG, NOT FROM `DATABASE_URL` (o3d-2k5r r23, Codex
+ * HIGH). A `new Pool({ connectionString })` is a second, unguarded route to the database inside a
+ * process whose Prisma pool is guarded: it carries no `search_path` pin, so its raw statements
+ * resolve through the server-default schema rather than the one the application writes to, and it
+ * carries none of the per-connection backend checks, so on a deployment whose schema name needs a
+ * non-ASCII startup option it can be served by a backend the deployment probe never measured. An
+ * exclusion taken somewhere other than where the work happens is not an exclusion.
+ * `pgConnectionConfig()` supplies the pin and, for a non-ASCII pin only, the `onConnect` guard; for
+ * an ASCII schema it is the same connection string plus an explicit search path, and costs nothing.
+ */
 let lockPool: Pool | null = null
 function getLockPool(): Pool {
   if (!lockPool) {
     const connectionString = process.env.DATABASE_URL
     if (!connectionString) throw new Error('DATABASE_URL is required for advisory locks')
     // Small: these are a handful of low-frequency, long-lived jobs.
-    lockPool = new Pool({ connectionString, max: 4 })
+    lockPool = new Pool({ ...pgConnectionConfig(connectionString), max: 4 })
   }
   return lockPool
 }
