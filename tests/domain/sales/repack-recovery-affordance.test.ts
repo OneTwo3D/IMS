@@ -6,7 +6,10 @@ import {
   repackReopenControlIsAvailable,
   summariseRepackBlockers,
 } from '../../../lib/domain/sales/repack-recovery-affordance.ts'
-import { countOutstandingRefundReservationReleases } from '../../../lib/domain/sales/refund-reservation-release-outbox.ts'
+import {
+  countResumableRefundReservationReleases,
+  countUnfinishedRefundReservationReleases,
+} from '../../../lib/domain/sales/refund-reservation-release-outbox.ts'
 
 /**
  * o3d-2k5r r4 — WALKING THE ACTUAL UI SEQUENCE.
@@ -235,13 +238,13 @@ test('o3d-2k5r r4 evidence: an unresolved backstop row for one of the order\'s r
   const { client, counted } = readClient(['refund-1'], [
     { idempotencyKey: 'sales:refund.reservation-release:refund-1', status: 'PENDING' },
   ])
-  assert.equal(await countOutstandingRefundReservationReleases('order-1', { client }), 1)
+  assert.equal(await countResumableRefundReservationReleases('order-1', { client }), 1)
   // The key is derived from the REFUND id, so a row belonging to another order's refund cannot be
   // counted for this one — which is what would make the control appear on unrelated orders.
   assert.deepEqual(counted[0].idempotencyKey, { in: ['sales:refund.reservation-release:refund-1'] })
 })
 
-test('o3d-2k5r r4 evidence: RETRYABLE_FAILED counts, SUCCEEDED and PROCESSING do not', async () => {
+test('o3d-2k5r r4 evidence: RETRYABLE_FAILED counts for the CONTROL, SUCCEEDED and PROCESSING do not', async () => {
   const rows: OutboxRow[] = [
     { idempotencyKey: 'sales:refund.reservation-release:r-ok', status: 'SUCCEEDED' },
     { idempotencyKey: 'sales:refund.reservation-release:r-claimed', status: 'PROCESSING' },
@@ -250,7 +253,39 @@ test('o3d-2k5r r4 evidence: RETRYABLE_FAILED counts, SUCCEEDED and PROCESSING do
   const { client } = readClient(['r-ok', 'r-claimed', 'r-failed'], rows)
   // SUCCEEDED is the recovery already done. PROCESSING is the drain holding the row and running the
   // same repair right now — offering the operator the button there is inviting them to race it.
-  assert.equal(await countOutstandingRefundReservationReleases('order-1', { client }), 1)
+  assert.equal(await countResumableRefundReservationReleases('order-1', { client }), 1)
+})
+
+test('o3d-2k5r r8 evidence: the two reads answer PROCESSING differently, on purpose', async () => {
+  // THE FINDING, AS ARITHMETIC. r7's fence reused the read above, and so inherited its PROCESSING
+  // exclusion — the one exclusion that is backwards for a fence. Both predicates are correct; they
+  // are answering different questions of the same column:
+  //
+  //   the CONTROL asks  "is there something an operator can press and finish?"  — a claimed row: no
+  //   the FENCE asks    "has the release actually happened?"                    — a claimed row: no,
+  //                                                                               so it is owed
+  //
+  // Collapse them back to one call (point either name at the other's status set) and this fails.
+  const rows: OutboxRow[] = [
+    { idempotencyKey: 'sales:refund.reservation-release:r-claimed', status: 'PROCESSING' },
+  ]
+  const { client } = readClient(['r-claimed'], rows)
+  assert.equal(await countResumableRefundReservationReleases('order-1', { client }), 0)
+  assert.equal(await countUnfinishedRefundReservationReleases('order-1', { client }), 1)
+})
+
+test('o3d-2k5r r8 evidence: the fence read counts every non-SUCCEEDED state, and only those', async () => {
+  // Derived from the status enum rather than listed, so a status added later fences by default
+  // instead of becoming a hole. Asserted state by state because "every non-SUCCEEDED" is the whole
+  // claim: drop any one of these from `UNFINISHED_RELEASE_STATUSES` and this fails naming it.
+  for (const status of ['PENDING', 'PROCESSING', 'RETRYABLE_FAILED', 'PERMANENT_FAILED']) {
+    const { client } = readClient(['r-1'], [{ idempotencyKey: 'sales:refund.reservation-release:r-1', status }])
+    assert.equal(await countUnfinishedRefundReservationReleases('order-1', { client }), 1, status)
+  }
+  const { client } = readClient(['r-1'], [{ idempotencyKey: 'sales:refund.reservation-release:r-1', status: 'SUCCEEDED' }])
+  // And SUCCEEDED is what stops the widening becoming "has ever been refunded" — the fence must let
+  // every ordinary dispatch on a refunded order through once the release is done.
+  assert.equal(await countUnfinishedRefundReservationReleases('order-1', { client }), 0)
 })
 
 test('o3d-2k5r r6 evidence: a DEAD-LETTERED (PERMANENT_FAILED) row is outstanding — it is the oldest stranded order', async () => {
@@ -262,7 +297,7 @@ test('o3d-2k5r r6 evidence: a DEAD-LETTERED (PERMANENT_FAILED) row is outstandin
   const { client } = readClient(['r-dead'], [
     { idempotencyKey: 'sales:refund.reservation-release:r-dead', status: 'PERMANENT_FAILED' },
   ])
-  assert.equal(await countOutstandingRefundReservationReleases('order-1', { client }), 1)
+  assert.equal(await countResumableRefundReservationReleases('order-1', { client }), 1)
 })
 
 test('o3d-2k5r r6: a PENDING draft whose only backstop row is PERMANENT_FAILED gets the Finish control', async () => {
@@ -272,7 +307,7 @@ test('o3d-2k5r r6: a PENDING draft whose only backstop row is PERMANENT_FAILED g
   const { client } = readClient(['r-dead'], [
     { idempotencyKey: 'sales:refund.reservation-release:r-dead', status: 'PERMANENT_FAILED' },
   ])
-  const outstanding = await countOutstandingRefundReservationReleases('order-1', { client })
+  const outstanding = await countResumableRefundReservationReleases('order-1', { client })
   assert.deepEqual(
     controlsOnOrder([{ name: 'A', status: 'PENDING' }], { status: PROCESSING, recoveryOutstanding: outstanding > 0 }),
     { A: ['finish-recovery'] },
@@ -283,6 +318,6 @@ test('o3d-2k5r r4 evidence: an order with no refunds asks the outbox nothing', a
   // The recovery only exists because of a refund. No refund, no deferred release, no control — and
   // no query either, which is what keeps this off the hot path of every order detail page.
   const { client, counted } = readClient([], [])
-  assert.equal(await countOutstandingRefundReservationReleases('order-1', { client }), 0)
+  assert.equal(await countResumableRefundReservationReleases('order-1', { client }), 0)
   assert.deepEqual(counted, [])
 })

@@ -10,6 +10,14 @@ import {
   transitionShipmentStatus,
   type ShipmentServiceClient,
 } from '@/lib/domain/sales/shipment-service'
+import {
+  claimIntegrationOutboxWork,
+  markIntegrationOutboxRetryableFailure,
+  markIntegrationOutboxSuccess,
+  type IntegrationOutboxClient,
+  type IntegrationOutboxRow,
+} from '@/lib/domain/integrations/outbox'
+import { processRefundReservationReleaseOutbox } from '@/lib/domain/sales/refund-reservation-release-outbox'
 import { SHIPMENT_STATUSES } from '@/lib/domain/workflows/status-types'
 import { adapterUniqueViolation } from '@/tests/helpers/prisma-unique-error'
 
@@ -95,13 +103,19 @@ type State = {
   refundLines?: Array<{ orderId: string; salesOrderLineId: string | null; productId: string | null; qty: number }>
   /**
    * o3d-2k5r r7: the order's REFUNDS (not their lines), and the refund-reservation-release backstop
-   * rows keyed off them. These are what `countOutstandingRefundReservationReleases` reads, and they
+   * rows keyed off them. These are what `countUnfinishedRefundReservationReleases` reads, and they
    * are a DIFFERENT fact from `refundLines`: the lines say how much the dispatch cap must net off,
    * these say whether the reservation release behind that refund has actually happened yet.
    * Absent means "no refunds", which is every fixture that predates the dispatch fence.
+   *
+   * o3d-2k5r r8: the rest of the outbox row is optional so the SAME objects can be handed to the
+   * real `claimIntegrationOutboxWork` (see `releaseOutboxClient`). The concurrency regression needs
+   * the drain's claim and the dispatch fence's count to be looking at one row, not two copies.
    */
   refunds?: Array<{ id: string; orderId: string }>
-  releaseOutbox?: Array<{ idempotencyKey: string; status: string }>
+  releaseOutbox?: Array<
+    { idempotencyKey: string; status: string } & Partial<Omit<IntegrationOutboxRow, 'idempotencyKey' | 'status'>>
+  >
   // Kit/BOM graph: productId -> its component requirements. Absent products are treated as SIMPLE.
   kits?: Record<string, Array<{ componentId: string; qty: number; sku?: string }>>
   /**
@@ -2744,4 +2758,246 @@ test('o3d-2k5r r7: an unresolved row on ANOTHER order does not fence this one', 
 
   assert.equal(result.success, true)
   assert.equal(state.shipments[1].status, 'SHIPPED')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-2k5r r8 (Codex) — THE CLAIM IS NOT UNDER THE ORDER LOCK.
+//
+// r7 put the fence inside the dispatch transaction, after `lockSalesOrder`, and reasoned that a
+// repack recovery committing between the read and the dispatch is impossible because the recovery
+// takes the same lock. True of the recovery. NOT true of the drain, and the drain does the same
+// repair: `claimIntegrationOutboxWork` flips the backstop row to PROCESSING *before* allocation is
+// called and without taking any sales-order lock. r7's fence reused the affordance's read, which
+// excludes PROCESSING on purpose — so the claim opened a window in which the fence counted zero.
+//
+// The two tests below are the two halves of that. The first is the STATE: a claimed row is still an
+// owed release. The second is the SEQUENCE, driven through the real claim and the real drain.
+// ---------------------------------------------------------------------------
+
+/** The order's refunds with the backstop row CLAIMED — the drain owns it and has not finished. */
+function claimedRecovery() {
+  return {
+    refunds: [{ id: 'refund-1', orderId: 'order-1' }],
+    releaseOutbox: [{ idempotencyKey: 'sales:refund.reservation-release:refund-1', status: 'PROCESSING' }],
+  }
+}
+
+test('o3d-2k5r r8: a backstop row the drain has CLAIMED still fences the dispatch', async () => {
+  // Point `validateDispatchPreservesRepackRecovery` back at the affordance's read
+  // (`countResumableRefundReservationReleases`), or drop PROCESSING from
+  // `UNFINISHED_RELEASE_STATUSES`, and this test fails — which is the finding, as a single state.
+  //
+  // The operator sees no "Finish repack recovery" button on this order right now, and that is
+  // correct: a worker holds the row. It is not a reason to let the goods go.
+  const state = partlyRefundedTwoShipmentOrder({
+    shipments: [
+      { id: 'shipment-a', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PENDING', trackingNumber: null, shippingService: null },
+      { id: 'shipment-b', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null },
+    ],
+    ...claimedRecovery(),
+  })
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-b',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.equal(result.success, false)
+  assert.match((result as { error: string }).error, /repack recovery/)
+  assert.equal(state.shipments[1].status, 'PACKED')
+  assert.equal(state.movements.length, 0)
+})
+
+const RELEASE_OUTBOX_EPOCH = new Date('2026-08-27T10:00:00.000Z')
+
+type OutboxWhere = {
+  id?: string
+  connector?: string
+  operation?: string
+  idempotencyKey?: { in?: string[] }
+  status?: string | { in?: string[] }
+  attempts?: { lt?: number; gte?: number }
+  lockedAt?: Date | null | { lt?: Date }
+  lockedBy?: string
+  nextAttemptAt?: null | { lte?: Date }
+  AND?: OutboxWhere[]
+  OR?: OutboxWhere[]
+}
+
+function outboxRowMatches(row: IntegrationOutboxRow, where: OutboxWhere | undefined): boolean {
+  if (!where) return true
+  if (where.AND?.some((branch) => !outboxRowMatches(row, branch))) return false
+  if (where.OR && !where.OR.some((branch) => outboxRowMatches(row, branch))) return false
+  if (where.id !== undefined && row.id !== where.id) return false
+  if (where.connector !== undefined && row.connector !== where.connector) return false
+  if (where.operation !== undefined && row.operation !== where.operation) return false
+  if (where.idempotencyKey?.in && !where.idempotencyKey.in.includes(row.idempotencyKey)) return false
+  if (typeof where.status === 'string' && row.status !== where.status) return false
+  if (typeof where.status === 'object' && where.status.in && !where.status.in.includes(row.status)) return false
+  if (where.attempts?.lt !== undefined && row.attempts >= where.attempts.lt) return false
+  if (where.attempts?.gte !== undefined && row.attempts < where.attempts.gte) return false
+  if (where.lockedBy !== undefined && row.lockedBy !== where.lockedBy) return false
+  if (where.lockedAt === null && row.lockedAt !== null) return false
+  if (where.lockedAt instanceof Date && row.lockedAt?.getTime() !== where.lockedAt.getTime()) return false
+  if (where.lockedAt && !(where.lockedAt instanceof Date) && where.lockedAt.lt) {
+    if (row.lockedAt === null || row.lockedAt >= where.lockedAt.lt) return false
+  }
+  if (where.nextAttemptAt === null && row.nextAttemptAt !== null) return false
+  if (where.nextAttemptAt?.lte && (row.nextAttemptAt === null || row.nextAttemptAt > where.nextAttemptAt.lte)) return false
+  return true
+}
+
+/**
+ * o3d-2k5r r8: an IntegrationOutbox client backed by `state.releaseOutbox` — the VERY SAME row
+ * objects the shipment client's `integrationOutbox.count` reads.
+ *
+ * That sharing is the point. A double that handed the drain its own copy of the row would let the
+ * claim write PROCESSING somewhere the fence never looks, and the interleaving test would pass with
+ * the bug still in place. The fixture rows are hydrated in place with the columns the real
+ * `claimIntegrationOutboxWork` predicates on (attempts / nextAttemptAt / lockedAt / lockedBy), so
+ * the claim's due-and-unlocked rules are genuinely exercised rather than assumed.
+ */
+function releaseOutboxClient(state: State): IntegrationOutboxClient {
+  const rows = (state.releaseOutbox ?? []).map((row, index) => {
+    const target = row as Record<string, unknown>
+    const defaults: Record<string, unknown> = {
+      id: `release-outbox-${index + 1}`,
+      connector: 'sales',
+      operation: 'refund.reservation-release',
+      payloadJson: { orderId: 'order-1', refundId: row.idempotencyKey.split(':').pop() ?? 'refund-1' },
+      attempts: 0,
+      nextAttemptAt: null,
+      lastError: null,
+      lockedAt: null,
+      lockedBy: null,
+      createdAt: RELEASE_OUTBOX_EPOCH,
+      updatedAt: RELEASE_OUTBOX_EPOCH,
+    }
+    for (const [key, value] of Object.entries(defaults)) {
+      if (target[key] === undefined) target[key] = value
+    }
+    return target as unknown as IntegrationOutboxRow
+  })
+
+  return {
+    integrationOutbox: {
+      create: async () => { throw new Error('the release-outbox double does not enqueue') },
+      findUnique: async (args: unknown) => {
+        const { where } = args as { where: { id?: string; idempotencyKey?: string } }
+        return rows.find((row) => (
+          (where.id === undefined || row.id === where.id)
+          && (where.idempotencyKey === undefined || row.idempotencyKey === where.idempotencyKey)
+        )) ?? null
+      },
+      findMany: async (args: unknown) => {
+        const { where, take } = args as { where?: OutboxWhere; take?: number }
+        return rows
+          .filter((row) => outboxRowMatches(row, where))
+          .sort((left, right) => left.createdAt.getTime() - right.createdAt.getTime())
+          .slice(0, take)
+      },
+      updateMany: async (args: unknown) => {
+        const { where, data } = args as {
+          where?: OutboxWhere
+          data: Record<string, unknown> & { attempts?: number | { increment: number } }
+        }
+        const matched = rows.filter((row) => outboxRowMatches(row, where))
+        for (const row of matched) {
+          const attempts = typeof data.attempts === 'object' && data.attempts !== null
+            ? row.attempts + data.attempts.increment
+            : data.attempts
+          Object.assign(row, data, { attempts: attempts ?? row.attempts, updatedAt: RELEASE_OUTBOX_EPOCH })
+        }
+        return { count: matched.length }
+      },
+    },
+  } as unknown as IntegrationOutboxClient
+}
+
+test('o3d-2k5r r8: claim -> PROCESSING -> a dispatch takes the order lock -> the worker allocates: the dispatch is refused', async () => {
+  // THE INTERLEAVING THE FINDING DESCRIBES, DRIVEN RATHER THAN ASSERTED. Every step below is a real
+  // call in the real order:
+  //
+  //   1. `processRefundReservationReleaseOutbox` runs the REAL `claimIntegrationOutboxWork`, which
+  //      writes PROCESSING to the row — taking no sales-order lock, because the outbox claim never
+  //      does.
+  //   2. INSIDE the drain's `allocate`, i.e. after the claim and before the worker has reached the
+  //      order lock, a dispatch runs end to end through `transitionShipmentStatus`. This is the
+  //      window: under r7 the fence counted zero here and shipment-b went out.
+  //   3. Only then does the worker's allocation resolve the way the real one does on an order that
+  //      still holds shipments — `refuseIfShipmentsExist` declines, nothing is reconciled.
+  //
+  // The row and the fence read the SAME object (`releaseOutboxClient`), so step 2 sees exactly what
+  // step 1 wrote. Revert the fence to the resumable read and step 2 succeeds — the assertions below
+  // then fail on the dispatch AND on shipment-b's status, which is the whole irreversible act.
+  const state = partlyRefundedTwoShipmentOrder({
+    shipments: [
+      { id: 'shipment-a', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PENDING', trackingNumber: null, shippingService: null },
+      { id: 'shipment-b', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null },
+    ],
+    refunds: [{ id: 'refund-1', orderId: 'order-1' }],
+    releaseOutbox: [{ idempotencyKey: 'sales:refund.reservation-release:refund-1', status: 'PENDING' }],
+  })
+  const outbox = releaseOutboxClient(state)
+
+  const statusSeenByDispatch: string[] = []
+  let dispatch: Awaited<ReturnType<typeof transitionShipmentStatus>> | null = null
+
+  const drained = await processRefundReservationReleaseOutbox({
+    claimWork: (options) => claimIntegrationOutboxWork({ ...options, client: outbox }),
+    allocate: async (orderId) => {
+      assert.equal(orderId, 'order-1')
+      // PRECONDITION, asserted rather than hoped for: the window really is open. If the claim did
+      // not write PROCESSING this test would be exercising the PENDING path the r7 tests already
+      // cover, and would prove nothing about the finding.
+      statusSeenByDispatch.push(String(state.releaseOutbox?.[0].status))
+      dispatch = await transitionShipmentStatus(createClient(state), {
+        shipmentId: 'shipment-b',
+        targetStatus: 'SHIPPED',
+      })
+      // What `autoAllocateOrder(..., { refuseIfShipmentsExist: true })` returns once it has the
+      // order lock and finds a shipment: a deliberate, consistent no-op. Not `committed`.
+      return { success: true, refused: true }
+    },
+    markSuccess: (options) => markIntegrationOutboxSuccess({ ...options, client: outbox }),
+    markRetry: (options) => markIntegrationOutboxRetryableFailure({ ...options, client: outbox }),
+    logDeferral: async () => 'written' as const,
+  })
+
+  assert.deepEqual(statusSeenByDispatch, ['PROCESSING'])
+  assert.equal(drained.claimed, 1)
+  const dispatched = dispatch as unknown as { success: boolean; error?: string }
+  assert.equal(dispatched.success, false)
+  assert.match(String(dispatched.error), /repack recovery/)
+  // Nothing irreversible happened: no dispatch, no stock movement, no COGS relief.
+  assert.equal(state.shipments[1].status, 'PACKED')
+  assert.equal(state.movements.length, 0)
+  assert.equal(state.cogsEntries.length, 0)
+  // And the worker's own outcome is untouched by the fence: it refused, the row went back to a
+  // status the operator control can pick up, and the order is still fully recoverable.
+  assert.equal(drained.failed, 1)
+  assert.equal(state.releaseOutbox?.[0].status, 'RETRYABLE_FAILED')
+})
+
+test('o3d-2k5r r8: the widened fence still does not outlive the recovery — a CLAIMED row on an order already dispatched ships', async () => {
+  // The r7 narrowness test, re-asked against the state the widening added. shipment-a is SHIPPED,
+  // so the recovery is already foreclosed however the backstop row is doing; refusing shipment-b as
+  // well would strand goods that must still go out, on an order that needs the o3d-339
+  // reconciliation either way. Widening WHAT the fence counts must not widen WHEN it refuses.
+  const state = partlyRefundedTwoShipmentOrder({
+    shipments: [
+      { id: 'shipment-a', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'SHIPPED', trackingNumber: null, shippingService: null },
+      { id: 'shipment-b', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null },
+    ],
+    ...claimedRecovery(),
+  })
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-b',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(state.shipments[1].status, 'SHIPPED')
+  assert.equal(state.movements.length, 1)
 })
