@@ -14,7 +14,7 @@ import { checkFileScanHealth, type FileScanResult } from '@/lib/security/file-sc
 import { RETIRED_ENV_VARS } from '@/lib/ops/retired-env-vars'
 import {
   missingWmsPushStates,
-  pgSearchPathOptions,
+  pgConnectionConfig,
   WMS_PUSH_STATE_COLUMN,
   WMS_PUSH_STATE_ENUM,
   WMS_PUSH_STATE_ENUM_LABELS_SQL,
@@ -256,10 +256,12 @@ async function checkWmsPushStateSchema(
       // and the shared statement resolves the table through whatever search path the asking
       // connection has. A preflight that resolved `wms_order_push_links` to a different table from
       // the application it is vouching for would be answering about the wrong object.
+      // The spread comes FIRST and carries the connection string with it: `pg` parses
+      // `connectionString` after the surrounding config, so an `options=` left inside the URL
+      // would overwrite the search path composed beside it (o3d-2k5r r10).
       const client = new Client({
-        connectionString: databaseUrl,
+        ...pgConnectionConfig(databaseUrl),
         connectionTimeoutMillis: 5_000,
-        ...pgSearchPathOptions(databaseUrl),
       })
       try {
         await client.connect()
@@ -272,9 +274,13 @@ async function checkWmsPushStateSchema(
         await client.end().catch(() => undefined)
       }
     }
-  } catch {
-    // An unreadable catalogue is not a clean one.
-    add(checks, 'fail', 'wms-push-state-schema', WMS_PUSH_STATE_ENUM, `Could not read the enum ${WMS_PUSH_STATE_TABLE}.${WMS_PUSH_STATE_COLUMN} is declared as, so ${WMS_PUSH_STATE_ENUM} cannot be confirmed to carry what this build writes. Release gate: o3d-1izw.`)
+  } catch (error) {
+    // An unreadable catalogue is not a clean one — and neither is a DATABASE_URL that names two
+    // schemas, which throws from the config composition above rather than picking one. The reason
+    // is carried through, because "could not read the catalogue" would send an operator looking at
+    // the database for a fault that is in the URL.
+    const because = error instanceof Error && error.message ? ` (${error.message})` : ''
+    add(checks, 'fail', 'wms-push-state-schema', WMS_PUSH_STATE_ENUM, `Could not read the enum ${WMS_PUSH_STATE_TABLE}.${WMS_PUSH_STATE_COLUMN} is declared as, so ${WMS_PUSH_STATE_ENUM} cannot be confirmed to carry what this build writes${because}. Release gate: o3d-1izw.`)
     return
   }
 

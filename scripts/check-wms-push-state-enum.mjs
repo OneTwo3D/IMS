@@ -22,7 +22,7 @@
 import { config as loadDotenv } from 'dotenv'
 
 import {
-  pgSearchPathOptions,
+  pgConnectionConfig,
   WMS_PUSH_STATE_COLUMN,
   WMS_PUSH_STATE_ENUM_LABELS_SQL,
   WMS_PUSH_STATE_TABLE,
@@ -46,10 +46,12 @@ const { Client } = await import('pg')
 // Prisma reads `?schema=` from the URL and sets search_path from it; `pg` does not. The shared
 // statement resolves the table through the asking connection's search path on purpose, so this
 // out-of-process check aligns itself with the process it is vouching for.
+// The spread comes FIRST and carries the connection string with it: `pg` parses
+// `connectionString` after the surrounding config, so an `options=` left inside the URL would
+// overwrite the search path composed beside it (o3d-2k5r r10).
 const client = new Client({
-  connectionString: databaseUrl,
+  ...pgConnectionConfig(databaseUrl),
   connectionTimeoutMillis: 10_000,
-  ...pgSearchPathOptions(databaseUrl),
 })
 
 let labels

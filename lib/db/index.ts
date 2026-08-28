@@ -1,7 +1,7 @@
 import { PrismaClient } from '@/app/generated/prisma/client'
 import { PrismaPg } from '@prisma/adapter-pg'
 
-import { pgSearchPathOptions, prismaAdapterSchemaOptions } from './database-url-schema.mjs'
+import { pgConnectionConfig, prismaAdapterSchemaOptions } from './database-url-schema.mjs'
 
 const globalForPrisma = globalThis as unknown as { prisma?: PrismaClient }
 
@@ -109,11 +109,15 @@ export function dbPoolConfig(): {
   connectionTimeoutMillis: number
   options?: string
 } {
+  // THE SPREAD COMES FIRST, AND IT CARRIES THE CONNECTION STRING (o3d-2k5r r10). `pg` parses
+  // `connectionString` AFTER the surrounding config and assigns the result over it, so a
+  // `connectionString` set here and an `options` set beside it is not a pinned search path at all:
+  // an `options=` inside the URL wins. pgConnectionConfig() strips it from the URL and folds it
+  // into one effective value, so the two can no longer be different things.
   return {
-    connectionString: process.env.DATABASE_URL!,
+    ...pgConnectionConfig(process.env.DATABASE_URL),
     max: DB_POOL_MAX,
     connectionTimeoutMillis: DB_POOL_ACQUISITION_TIMEOUT_MS,
-    ...pgSearchPathOptions(process.env.DATABASE_URL),
   }
 }
 

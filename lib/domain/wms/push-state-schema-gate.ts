@@ -44,7 +44,7 @@
  * gate can see that the question is asked of a column rather than of a type name.
  */
 export {
-  pgSearchPathOptions,
+  pgConnectionConfig,
   WMS_PUSH_STATE_COLUMN,
   WMS_PUSH_STATE_ENUM_LABELS_SQL,
   WMS_PUSH_STATE_TABLE,
