@@ -706,7 +706,11 @@ source "${IMS_SCRIPT_LIB_DIR}/db-fence-protected.sh" || {
 # command out of. A digest resolved from ${APP_DIR} would be the target's answer to a question
 # only the release can answer.
 if $PRINT_FENCE_DIGEST; then
-  db_fence_report_candidate_digest "$(dirname "$(dirname "${IMS_ENTRYPOINT_PATH}")")" || exit 1
+  # AND THIS SCRIPT SAYS WHICH HELPER, the way it does for every other fence path: the library
+  # never works out where the checkout's helper is, and a digest-report mode that let it would be
+  # a second answer to the one question the library is not allowed to answer.
+  DB_FENCE_SCRIPT="$(dirname "$(dirname "${IMS_ENTRYPOINT_PATH}")")/scripts/fence-db-connections.mjs"
+  db_fence_report_candidate_digest || exit 1
   exit 0
 fi
 # Did the identity this run is fencing with come from that record rather than from

@@ -1371,9 +1371,12 @@ db_fence_probe_cleanup() {
 # _fence_stage_and_publish() would RECORD, produced by the same assembly and the same digest, or
 # it is a second opinion about the artefact and an operator pinning it gets a refusal.
 #
-# WHAT IT NEEDS: the checkout it is handed, and `node`. That is the entire list, and it is the
-# point — the entrypoint calls it with dirname(dirname(<its own path>)), so the tree under
-# question is the one the command was typed out of and never ${APP_DIR}.
+# WHAT IT NEEDS: ${DB_FENCE_SCRIPT} and `node`. That is the entire list. And ${DB_FENCE_SCRIPT} is
+# THE CALLER'S to set, here as everywhere else in this file — where the checkout's helper lives is
+# the one thing this library must never work out for itself, and a digest-report mode that derived
+# its own path would be a second answer to that question. The entrypoint points it at
+# dirname(dirname(<its own path>))/scripts/fence-db-connections.mjs, so the tree under question is
+# the one the command was typed out of and never ${APP_DIR}.
 #
 # WHAT IT DOES NOT NEED, and must be able to prove it does not need: ${APP_DIR}, ${APP_DIR}/.env,
 # a service unit, a port, DEPLOY_ADMIN_DATABASE_URL, a database, a standing artefact, or root.
@@ -1382,17 +1385,15 @@ db_fence_probe_cleanup() {
 # build host has neither, and reporting on the box's standing artefact from a command about a
 # RELEASE would answer a question nobody asked. It publishes nothing, opens no connection, and
 # executes no part of the tree it hashes: the digest is computed by READING bytes into a
-# throwaway directory this call creates and removes. ${DB_FENCE_SCRIPT} is restored afterwards so
-# a caller that goes on to do anything else is unaffected by having asked.
+# throwaway directory this call creates and removes. The throwaway is removed before it
+# returns, so a caller that goes on to do anything else is unaffected by having asked.
 db_fence_report_candidate_digest() {
-  local checkout="$1" saved="${DB_FENCE_SCRIPT:-}" rc=0 line
-  DB_FENCE_SCRIPT="${checkout}/scripts/fence-db-connections.mjs"
+  local rc=0 line
   db_fence_probe_candidate_digest || rc=1
   # db_fence_probe_report() prints the standing artefact's digest only when
   # DB_FENCE_PROBE_STANDING_SHA256 is set, and nothing above sets it: the candidate is the whole
-  # answer here.
+  # answer here, and the box's own artefact is not this command's business.
   while IFS= read -r line; do printf '%s\n' "${line}"; done < <(db_fence_probe_report)
   db_fence_probe_cleanup
-  DB_FENCE_SCRIPT="${saved}"
   return "${rc}"
 }

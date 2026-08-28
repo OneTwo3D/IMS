@@ -1244,6 +1244,14 @@ DB_IDENTITY_DRIFT_REASON=''
 # pointed at the harness directory instead of /etc.
 ${fenceProtectedLibrary(dir)}
 ${shellFunction(INSTALL_SOURCE, 'resolve_fence_script')}
+# o3d-2sm1.5 r35: install.sh's resolver refuses outright on a FIRST INSTALL, which performs no
+# credentialed fence execution. Every harness below is an UPGRADE cutover — that is what they are
+# for — so the flag is named here with the value the upgrade branch runs under. Named rather than
+# defaulted inside the shipped function: an interlock with a default is an interlock a slice can
+# lose without noticing, and an unbound-variable abort is how a harness discovers it exists at
+# all. The first-install value is exercised for real in
+# tests/scripts/fence-digest-and-first-install.test.ts.
+FIRST_INSTALL_NO_CREDENTIALED_FENCE=false
 DB_FENCE_REFENCE_CMD="\${DB_FENCE_REFENCE_WRAPPER}"
 : "\${APP_DIR_REAL:=/opt/app}"
 : "\${APP_DIR:=/opt/app}"
@@ -9121,11 +9129,10 @@ test('r34: the runbook says where a first-ever install gets the digest, in the w
 
   assert.match(doc, /IMS_FENCE_ARTEFACT_SHA256/, 'the page must name the variable')
   assert.match(doc, /first-ever install/i, 'and address the install that has nothing to read it off')
-  assert.match(doc, /--dry-run/, 'and name the command that produces it')
   assert.match(
     doc,
-    /bash scripts\/update\.sh --dry-run/,
-    'as something runnable rather than as a description of one',
+    /bash scripts\/update\.sh --print-fence-digest/,
+    'and name the command that produces it, as something runnable rather than as a description of one',
   )
   assert.match(doc, /THE FENCE ARTEFACT THIS CHECKOUT WOULD PUBLISH HASHES TO/, 'and the line to read the value off')
   assert.match(
@@ -9140,12 +9147,30 @@ test('r34: the runbook says where a first-ever install gets the digest, in the w
     'the page must not still describe the behaviour the ruling removed',
   )
 
-  // AND THE FIRST COMMAND ON THE PAGE CARRIES IT. The refusal lands during install.sh's own
-  // migration fence, so an operator following the quickstart hits it before they ever reach the
-  // fence section — a required input documented only where the mechanism is explained is one they
-  // meet as a failure first.
-  const install = /```bash\n([^`]*bash scripts\/install\.sh[^`]*)```/.exec(doc)?.[1] ?? ''
-  assert.ok(install.length > 0, 'precondition: the page must show how to run the installer')
-  assert.match(install, /IMS_FENCE_ARTEFACT_SHA256=/, 'the installer command must carry the pin the run now requires')
-  assert.match(doc, /required on an ordinary install and the run refuses without it/, 'and say plainly that it is not optional')
+  // o3d-2sm1.5 r35, Codex HIGH + MEDIUM — WHAT THIS TEST IS NO LONGER ALLOWED TO BE.
+  //
+  // The r34 revision of this block asserted that the page's opening installer command carried
+  // `IMS_FENCE_ARTEFACT_SHA256=` and that the page said the run "refuses without it". Both
+  // assertions passed. Both sentences were FALSE: the first-install path never read the variable,
+  // so omitting it produced no refusal and supplying it published nothing. A test that reads
+  // documentation verifies the claim, not the code, and this one certified a claim the code
+  // contradicted for a whole round.
+  //
+  // So the behavioural half now lives in tests/scripts/fence-digest-and-first-install.test.ts,
+  // which RUNS the documented release command from a clean checkout and RUNS a first install with
+  // and without the pin. What is left here is the only thing a page can be tested for: that the
+  // one text with several readers has not drifted, and that the sentence the previous round got
+  // wrong has not come back.
+  assert.doesNotMatch(
+    doc,
+    /required on an ordinary install and the run refuses without it/,
+    'the page must not claim a first install refuses without the pin: it does not, and nothing in install.sh ever checked',
+  )
+  const FIRST_INSTALL_POLICY = /performs? no credentialed fence execution/i
+  assert.match(doc, FIRST_INSTALL_POLICY, 'the page must state the first-install policy in the words the code uses')
+  assert.match(
+    INSTALL_SOURCE,
+    /performs NO credentialed fence execution/,
+    'and the installer must be the thing that says it, in the refusal an operator would actually meet',
+  )
 })
