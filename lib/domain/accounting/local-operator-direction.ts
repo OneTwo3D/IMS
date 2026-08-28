@@ -32,7 +32,7 @@
  *     `{ lead: 'THEN_GO_AND', purpose: 'LEARN_WHAT_A_REPLAY_WOULD_DO' }` shipped prose nobody saw.
  *   • `READ` and `INSPECT` both took `readonly OutboxReadAxis[]`, which is unbounded and INCLUDES
  *     THE EMPTY ARRAY. That is the branch Codex's counterexample used: nothing renders it, so the
- *     runtime equality check never reaches it, and `andList([])` made the sentence end mid-word.
+ *     runtime equality check never reaches it, and r21's `andList([])` ended the sentence mid-word.
  *
  * Each is one enumerated field now, and the column lists are named members of `OUTBOX_READ_LIST`.
  * The test that reads this module computes the VALUE of every string expression these two functions
@@ -104,12 +104,18 @@ export type LocalTarget =
  * frozen table THROWS rather than being silently dropped. Not exporting alone would not have been
  * enough: a private mutable table is still mutable from inside this module.
  */
-function freezeDeep<T>(table: T, seen: WeakSet<object> = new WeakSet()): T {
+function freezeDeep<T>(table: T): T {
   if (table === null || typeof table !== 'object') return table
-  if (seen.has(table)) return table
-  seen.add(table)
+  // ALREADY-FROZEN IS THE REVISIT GUARD, and it replaced a `WeakSet` (r32). The set was two more
+  // prototype methods — `WeakSet.prototype.add` and `.has` — dispatched to do a job `Object.isFrozen`
+  // does with one intrinsic: nothing here starts frozen, this line runs after the freeze below, so a
+  // second arrival at the same object returns instead of recursing. `for...of` went with it: it
+  // dispatches `Array.prototype[Symbol.iterator]` and the iterator's `next`, and an indexed loop
+  // over a local array reads only own properties.
+  if (Object.isFrozen(table)) return table
   Object.freeze(table)
-  for (const inner of Object.values(table as Record<string, unknown>)) freezeDeep(inner, seen)
+  const inner = Object.values(table as Record<string, unknown>)
+  for (let index = 0; index < inner.length; index += 1) freezeDeep(inner[index])
   return table
 }
 
@@ -173,8 +179,8 @@ export type OutboxReadAxis = 'status' | 'attempts' | 'lastError' | 'createdAt' |
  * `read: readonly OutboxReadAxis[]` was a FREE PARAMETER: six axes in any order and any length, so
  * the sentence "Read them by ..." had an unbounded set of values and only three of them were ever
  * written down and read. The empty array was in that set too, and it is the branch Codex's
- * split-literal counterexample rode in on — `andList([])` returns '', so the shipped renderer could
- * emit "Read them by " for a type-valid direction nobody enumerated.
+ * split-literal counterexample rode in on — r21's `andList([])` returned '', so the shipped renderer
+ * could emit "Read them by " for a type-valid direction nobody enumerated.
  *
  * A LIST IS A NAME NOW. Three of them, each a non-empty tuple of axes the type still fences, so the
  * prose a direction can produce is finite and every value of it is in the reviewed inventory.
@@ -187,6 +193,39 @@ const OUTBOX_READ_LIST = {
   /** What a row can be read for once narrowing it is known to be impossible. */
   WHEN_NARROWING_IS_IMPOSSIBLE: ['status', 'lastError', 'time'],
 } as const satisfies Record<string, readonly [OutboxReadAxis, ...OutboxReadAxis[]]>
+
+/**
+ * "a, b and c" FOR EACH OF THOSE LISTS, BUILT WITHOUT DISPATCHING A PROTOTYPE METHOD (o3d-batch-ret
+ * r32, Codex HIGH).
+ *
+ * r21's `andList` did this at INVOCATION TIME, and it did it through `Array.prototype`:
+ * `items.slice(0, -1).join(', ')` resolves `slice` and `join` off a prototype every program in the
+ * process can write to. `Array.prototype.join = () => 'open the remote bill and delete it'` in any
+ * importer — an ordinary assignment, no diagnostic, no diff to this file — rewrote the shipped READ
+ * sentence AFTER every freeze at the foot of this file had run. Freezing the TABLES closed the data;
+ * it could not close the prototypes, because the renderer never held the methods, it looked them up
+ * each time it ran.
+ *
+ * SO THERE IS NO LOOKUP TO DIVERT. Each phrase is one concatenation of indexed reads off the frozen
+ * tuple above it, evaluated ONCE at module evaluation, and the renderer's branches interpolate the
+ * finished string. The axes are still the single source of the words — no column name is written out
+ * here — and the arity is fenced by the tuple type: `[3]` on a three-element tuple does not compile,
+ * and a list that GREW would leave an axis out of its phrase, which the test that rebuilds these
+ * phrases from the axes refuses.
+ *
+ * A template's substitution and `+` are what remain, and neither is a lookup: both operands of every
+ * one of them is a string PRIMITIVE, and ToString/ToPrimitive of a primitive returns it without
+ * reading a property from anything. See the note at the foot of this file.
+ */
+const OUTBOX_READ_PHRASE = {
+  THIS_ORDERS_ROWS: `${OUTBOX_READ_LIST.THIS_ORDERS_ROWS[0]}, ${OUTBOX_READ_LIST.THIS_ORDERS_ROWS[1]}, `
+    + `${OUTBOX_READ_LIST.THIS_ORDERS_ROWS[2]} and ${OUTBOX_READ_LIST.THIS_ORDERS_ROWS[3]}`,
+  BY_KIND_AND_REFERENCE: `${OUTBOX_READ_LIST.BY_KIND_AND_REFERENCE[0]}, `
+    + `${OUTBOX_READ_LIST.BY_KIND_AND_REFERENCE[1]}, ${OUTBOX_READ_LIST.BY_KIND_AND_REFERENCE[2]}, `
+    + `${OUTBOX_READ_LIST.BY_KIND_AND_REFERENCE[3]} and ${OUTBOX_READ_LIST.BY_KIND_AND_REFERENCE[4]}`,
+  WHEN_NARROWING_IS_IMPOSSIBLE: `${OUTBOX_READ_LIST.WHEN_NARROWING_IS_IMPOSSIBLE[0]}, `
+    + `${OUTBOX_READ_LIST.WHEN_NARROWING_IS_IMPOSSIBLE[1]} and ${OUTBOX_READ_LIST.WHEN_NARROWING_IS_IMPOSSIBLE[2]}`,
+}
 
 /**
  * The two settings IMS itself holds. There is no third, and no way to name anything else.
@@ -240,20 +279,6 @@ export type LocalDirection =
     }
 
 /**
- * "a, b and c" — the shipped wording for a list of read axes.
- *
- * o3d-batch-ret r21 (Codex HIGH): the parameter is a NON-EMPTY tuple of axes, so `items[0]` needs no
- * `?? ''` fallback and there is no argument that makes this return the empty string. Every call site
- * passes a member of `OUTBOX_READ_LIST`, whose lengths are known, so the value of this function at
- * each call site is a constant a reader can compute.
- */
-function andList(items: readonly [OutboxReadAxis, ...OutboxReadAxis[]]): string {
-  return items.length < 2
-    ? items[0]
-    : `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}`
-}
-
-/**
  * THE PROSE, GENERATED FROM THE STRUCTURE. Total over `LocalDirection`: adding a member without a
  * branch here fails the build on the return type, and there is no default case to absorb one.
  *
@@ -273,12 +298,12 @@ export function renderLocalDirection(direction: LocalDirection, context: LocalDi
       return 'confirm the invoice PDF stored against the order is the document you expect'
     case 'INSPECT':
       return direction.form === 'THIS_ORDERS_ROWS'
-        ? `Inspect the outbox rows for this order and read each row's ${andList(OUTBOX_READ_LIST.THIS_ORDERS_ROWS)}.`
+        ? `Inspect the outbox rows for this order and read each row's ${OUTBOX_READ_PHRASE.THIS_ORDERS_ROWS}.`
         : 'Then INSPECT the outbox: query it for kind ACCOUNTING_INVOICE, referenceType SalesOrder, '
           + 'referenceId = the order id (no page in IMS lists them) and read each row\'s '
-          + `${andList(OUTBOX_READ_LIST.BY_KIND_AND_REFERENCE)}.`
+          + `${OUTBOX_READ_PHRASE.BY_KIND_AND_REFERENCE}.`
     case 'READ':
-      return `Read them by ${andList(OUTBOX_READ_LIST.WHEN_NARROWING_IS_IMPOSSIBLE)}`
+      return `Read them by ${OUTBOX_READ_PHRASE.WHEN_NARROWING_IS_IMPOSSIBLE}`
     case 'RE_READ':
       return 'so re-run the query rather than treating one result as the final list'
     case 'TURN_OFF':
@@ -371,8 +396,18 @@ export const LOCAL_DIRECTION_CAP = 14
 // an instruction the cap has not counted. That is asserted, not merely intended.
 // ---------------------------------------------------------------------------
 
-/** One remediation that is genuinely two acts, in the order they must be performed. */
-export type LocalDirectionSequence = readonly [LocalDirection, LocalDirection, ...LocalDirection[]]
+/**
+ * One remediation that is genuinely two acts, in the order they must be performed.
+ *
+ * EXACTLY TWO (o3d-batch-ret r32). The rest element `...LocalDirection[]` was r21's defect one type
+ * over: a parameter whose values nobody had enumerated. Its length was unbounded, so the set of
+ * sentences the sequence renderer could emit was INFINITE, and the only thing any reviewer had ever
+ * read was a pair. Fixing the arity is what lets the renderer below be a concatenation rather than a
+ * `map`/`join` over a length it cannot know — and it turns the sequence renderer's computed output
+ * from "a repeat, of at least two, of these fourteen" into a finite set of constants held to the
+ * reviewed inventory the same way a direction's is. A third act is a third element and a diff here.
+ */
+export type LocalDirectionSequence = readonly [LocalDirection, LocalDirection]
 
 /**
  * Compose a sequence into the shipped sentence.
@@ -385,7 +420,7 @@ export function renderLocalDirectionSequence(
   sequence: LocalDirectionSequence,
   context: LocalDirectionContext,
 ): string {
-  return sequence.map((direction) => renderLocalDirection(direction, context)).join(' and ')
+  return renderLocalDirection(sequence[0], context) + ' and ' + renderLocalDirection(sequence[1], context)
 }
 
 /**
@@ -405,23 +440,81 @@ export const LOCAL_DIRECTION_SEQUENCES: readonly LocalDirectionSequence[] = [
 // ---------------------------------------------------------------------------
 // AND EVERY ONE OF THEM IS FROZEN BEFORE ANYTHING CAN RENDER (o3d-batch-ret r31, Codex HIGH).
 //
-// These six statements run at module evaluation, which is before the first `renderLocalDirection`
+// These seven statements run at module evaluation, which is before the first `renderLocalDirection`
 // call by construction: a module body runs to completion before any of its exports can be read.
 // From here on a write to any of these tables — from an importer, from this module, at any depth —
 // throws a TypeError instead of changing what an operator is told to do.
 //
-// WHAT THE GUARANTEE NOW RESTS ON, stated plainly rather than implied. The analyzer's conclusion —
-// "the set of sentences these renderers can emit is exactly the reviewed inventory" — is
-// UNCONDITIONAL on data: there is no longer any object a renderer reads at invocation time that
-// anything can write after the analysis. It still rests on two things that are not data, and both
-// are diffs to THIS FILE in front of a reviewer: the renderer's own branch strings, and these
-// freeze calls themselves. It also assumes `Object.freeze` is the standard one — a program that
-// replaced the global intrinsic before this module loaded would defeat it, as it would defeat every
-// other use of it in the process.
+// ---------------------------------------------------------------------------
+// WHAT THE GUARANTEE RESTS ON, DERIVED FROM THE CODE RATHER THAN RECALLED (o3d-batch-ret r32,
+// Codex HIGH).
+//
+// R31 STATED THIS LIST AND THE LIST WAS INCOMPLETE. It said the conclusion — "the set of sentences
+// these renderers can emit is exactly the reviewed inventory" — rested on the renderer's branch
+// strings, these freeze calls, and `Object.freeze` being the standard intrinsic. It rested on
+// `Array.prototype` too, and nothing in that list said so: `andList` resolved `slice` and `join`
+// through the prototype every time it ran, and the sequence renderer resolved `map` and `join` the
+// same way, so an ordinary `Array.prototype.join = …` in any importer rewrote a shipped sentence
+// after all six freezes had completed. Six frozen tables and a mutable prototype is not a closure.
+//
+// THE OMISSION WAS FINDABLE BECAUSE THE CONDITIONS WERE WRITTEN DOWN, so they are written down
+// again — but DERIVED this time, by reading every construct the two renderers execute and asking of
+// each one whether it resolves a name through anything a program can write. The derivation is the
+// point: a reader can redo it against the code below rather than trust the list.
+//
+// WHAT THE RENDERERS EXECUTE AT INVOCATION TIME, exhaustively, and why none of it is a lookup
+// anything can divert:
+//
+//   1. `direction.action`, `.form`, `.control`, `.naming`, `.caseForm`, `.target`, and
+//      `context.ledger` / `.syncRowId` — property reads on the two ARGUMENTS. Every one of them is
+//      an OWN property of any value of the declared type, so no prototype is consulted. This is a
+//      condition on the CALLER, and it is the one condition here that is not a diff to this file:
+//      an object that omitted a property would read `Object.prototype` instead. What that buys is
+//      bounded and worth stating — every one of those reads except `context.*` and `direction.target`
+//      is only ever COMPARED against a string literal, so a prototype-supplied value can at worst
+//      select the other arm of the same enumerated pair, and both arms are reviewed sentences.
+//   2. `SETTING_NAME[direction.target]` and `OUTBOX_READ_PHRASE.THIS_ORDERS_ROWS` (and its two
+//      siblings) — property reads on the module's own tables, which are frozen below. The keys are
+//      fenced by the discriminated union, so each read finds an own property.
+//   3. `sequence[0]` and `sequence[1]` — indexed reads on a tuple whose type fixes its length at
+//      two, so both indices are own properties and neither can fall through to `Array.prototype`.
+//      This is why the rest element had to go: an index BEYOND the length is a prototype read.
+//   4. `===` (and the `switch`, which is `===`) — between two string primitives. Strict equality
+//      on primitives reads no property from anything.
+//   5. Template substitution `${…}` — ToString. Every substituted expression is typed `string`
+//      (`OutboxReadAxis`, `LocalDirectionContext`'s two fields, or one of the phrase constants), and
+//      ToString of a string PRIMITIVE returns it; the `Symbol.toPrimitive` / `toString` lookup
+//      happens only for an OBJECT operand, and there is none here.
+//   6. `+` between strings — the same answer through ToPrimitive, and for the same reason: it
+//      dispatches only on an object operand. Both operands of every `+` below are primitives.
+//   7. `renderLocalDirection(...)` from the sequence renderer — a call through a module-scope
+//      binding, which is a scope lookup and not a property read, so there is no receiver to poison.
+//   8. `administrator` — a local `const` holding a string literal. A scope lookup, as above.
+//
+//   THERE IS NO PROTOTYPE METHOD LEFT IN EITHER RENDERER. That is checkable rather than asserted:
+//   neither function body contains a call whose callee is a property access, so there is nothing to
+//   enumerate and capture.
+//
+// AND WHAT THIS MODULE EXECUTES AT EVALUATION TIME, which is before any renderer can run and so is
+// only reachable by a program that loaded FIRST:
+//
+//   9. `Object.freeze`, `Object.isFrozen` and `Object.values` in `freezeDeep`, plus the indexed
+//      walk over the array `Object.values` returns. Replacing one of those three intrinsics before
+//      this module loads defeats the freeze — as it would defeat every other use of `Object.freeze`
+//      in the process. `freezeDeep` uses no `for...of` and no `WeakSet` precisely so this list is
+//      three names long: an iterator protocol and `WeakSet.prototype.add`/`.has` would each be
+//      another entry.
+//  10. The `OUTBOX_READ_PHRASE` construction — templates and `+` over indexed reads of a frozen
+//      tuple, so items 3, 5 and 6 above, one evaluation earlier. A prototype written to after this
+//      module loads cannot reach it: the phrases are already strings by then.
+//
+// AND WHAT REMAINS UNCONDITIONAL is what it was: the renderer's own branch strings and these freeze
+// calls, both of which are diffs to THIS FILE in front of a reviewer.
 // ---------------------------------------------------------------------------
 
 freezeDeep(LOCAL_TARGET)
 freezeDeep(OUTBOX_READ_LIST)
+freezeDeep(OUTBOX_READ_PHRASE)
 freezeDeep(SETTING_NAME)
 freezeDeep(LOCAL_DIRECTIONS)
 freezeDeep(LEAVE_THE_TOGGLE_OFF_THEN_ESCALATE)
