@@ -94,11 +94,18 @@ behind a transaction pooler the restore fence would be held by nobody while the 
 holder connection is therefore refused unless the backend names this process's own socket as its
 peer; if `DATABASE_URL` points at a pooler, set `DATABASE_SESSION_LOCK_URL` to a direct, non-pooled
 URL for the same database and schema (see `docs/installation.md`). That override is not trusted
-because it agrees on names: the first lock connection takes an advisory lock through it and
+because it agrees on names: the lock connection takes an advisory lock through it and
 requires a `DATABASE_URL` connection to be blocked by the same key, so an override pointing at a
 restored clone or a staging server -- which carries the same database name, schema, OID and system
-identifier as production -- is refused rather than used (o3d-2k5r r26). The refusal happens before
+identifier as production -- is refused rather than used (o3d-2k5r r26). That measurement is repeated
+for every lock acquisition rather than cached for the life of the process, and the probe itself is
+bounded (5s per connect, 5s per statement, 20s overall) so a pooler that accepts a socket and then
+stops answering refuses the restore instead of hanging it (o3d-2k5r r27). The refusal happens before
 the restore starts, so nothing is half-applied by it.
+
+What none of that claims: it detects an override that reaches a different PostgreSQL from the data
+path. It does not make a session advisory lock a sufficient exclusion on its own -- the lock still
+ends with its connection, and any check is a sample taken before the thing it licenses (o3d-ic9a).
 
 The lock has no expiry: it is released when the restore finishes, not on a timer. If `psql` overruns
 its five-minute ceiling it is killed, its database backend is terminated from the lock-holding
