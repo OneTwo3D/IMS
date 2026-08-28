@@ -614,13 +614,10 @@ The count of blockers went 1 → 4 → 5. That is not an implementation problem:
 bounded answer**, because the composition rules belong to systemd, Next and libpq at once and any
 of the three is free to add a layer.
 
-So it is no longer asked. `scripts/fence-db-connections.mjs` **requires** the four values on its
-command line and **refuses** without them:
-
-```
-node scripts/fence-db-connections.mjs --preflight \
-  --app-host=localhost --app-port=5432 --app-user=imsuser --app-database=one_two_inventory
-```
+So it is no longer asked. `scripts/fence-db-connections.mjs` **requires** four options —
+`--app-host=`, `--app-port=`, `--app-user=` and `--app-database=` — on every mode, and **refuses**
+without them (exit 3 for `--preflight`/`--fence`, which every entrypoint reads as "nothing was
+revoked"; exit 1 otherwise). It is not run by hand: the entrypoints below pass them.
 
 There is no environment reconstruction, no systemd interrogation, no dotenv scanning and no
 precedence emulation left in the helper. **The operator types nothing new** — the calling scripts
@@ -635,7 +632,12 @@ supply the values:
   the same twenty lines in both) that **accepts only a URL stating all four**. No port, no path,
   more than one path segment, a `?host=`/`?port=`/`?user=`/`?dbname=`/`?database=` query
   parameter, a percent-escape, whitespace: each one is a **refusal** that stops the run before
-  anything is stopped or migrated. Never a default.
+  anything is stopped or migrated. Never a default. In particular the libpq unix-socket spelling
+  `postgres://role@/db?host=/var/run/postgresql` is **refused** here — it states neither host nor
+  port in its authority and puts the host in the query string, which is the one shape this reader
+  will not accept. Nothing this repo ships composes that form (`install.sh` and `.env.example`
+  both write `host:port`); an installation that uses it must give `DATABASE_URL` an explicit
+  `host:port`, or run `deploy.sh --skip-migrate`.
 
 **And the strictness is what closes the question rather than narrowing it.** `PGHOST`, `PGPORT`,
 `PGUSER` and `PGDATABASE` are consulted by libpq and by `pg` *only* for values the connection

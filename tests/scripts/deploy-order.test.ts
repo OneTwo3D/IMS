@@ -643,11 +643,15 @@ PORT=3000
 CRON_BACKUP="\${STATE_DIR}/crontab.bak"
 SERVICE_UNITS=(app.service)
 DB_FENCE_STATE="\${STATE_DIR}/db-connect-fence.json"
-DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release --service-unit=one-two-inventory.service'
-# o3d-2sm1.5 r18: the unit the helper asks systemd about, passed by every entrypoint on every
-# fence invocation. The extracted functions below reference it exactly as the shipped scripts do.
-DB_FENCE_UNIT_ARG='--service-unit=one-two-inventory.service'
-DB_FENCE_UNIT_ARGS=('--service-unit=one-two-inventory.service')
+DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release --app-host=localhost --app-port=5432 --app-user=imsapp --app-database=imsdb'
+# o3d-2sm1.5 r19: the application's connection identity, which the helper is TOLD and never works
+# out. Every entrypoint passes it on every fence invocation, and refuses when it cannot read it —
+# the extracted functions below reference both exactly as the shipped scripts do.
+DB_FENCE_IDENTITY_ARGS=('--app-host=localhost' '--app-port=5432' '--app-user=imsapp' '--app-database=imsdb')
+require_db_identity() { [[ "\${#DB_FENCE_IDENTITY_ARGS[@]}" -eq 4 ]]; }
+DB_IDENTITY_REASON=''
+: "\${APP_DIR_REAL:=/opt/app}"
+: "\${APP_DIR:=/opt/app}"
 ok() { :; }
 die() { echo "die: $*" >&2; exit 1; }
 `,
@@ -670,11 +674,15 @@ DB_FENCE_UP=true
 BACKUP_FILE=''
 CRON_BACKUP="\${DATA_DIR}/crontab.bak"
 DB_FENCE_STATE="\${DATA_DIR}/db-connect-fence.json"
-DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release --service-unit=one-two-inventory.service'
-# o3d-2sm1.5 r18: the unit the helper asks systemd about, passed by every entrypoint on every
-# fence invocation. The extracted functions below reference it exactly as the shipped scripts do.
-DB_FENCE_UNIT_ARG='--service-unit=one-two-inventory.service'
-DB_FENCE_UNIT_ARGS=('--service-unit=one-two-inventory.service')
+DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release --app-host=localhost --app-port=5432 --app-user=imsapp --app-database=imsdb'
+# o3d-2sm1.5 r19: the application's connection identity, which the helper is TOLD and never works
+# out. Every entrypoint passes it on every fence invocation, and refuses when it cannot read it —
+# the extracted functions below reference both exactly as the shipped scripts do.
+DB_FENCE_IDENTITY_ARGS=('--app-host=localhost' '--app-port=5432' '--app-user=imsapp' '--app-database=imsdb')
+require_db_identity() { [[ "\${#DB_FENCE_IDENTITY_ARGS[@]}" -eq 4 ]]; }
+DB_IDENTITY_REASON=''
+: "\${APP_DIR_REAL:=/opt/app}"
+: "\${APP_DIR:=/opt/app}"
 success() { :; }
 die() { echo "die: $*" >&2; exit 1; }
 `,
@@ -696,11 +704,15 @@ SCHEMA_TOUCHED=false
 DB_FENCE_UP=true
 CRON_BACKUP="\${DATA_DIR}/crontab.bak"
 DB_FENCE_STATE="\${DATA_DIR}/db-connect-fence.json"
-DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release --service-unit=one-two-inventory.service'
-# o3d-2sm1.5 r18: the unit the helper asks systemd about, passed by every entrypoint on every
-# fence invocation. The extracted functions below reference it exactly as the shipped scripts do.
-DB_FENCE_UNIT_ARG='--service-unit=one-two-inventory.service'
-DB_FENCE_UNIT_ARGS=('--service-unit=one-two-inventory.service')
+DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release --app-host=localhost --app-port=5432 --app-user=imsapp --app-database=imsdb'
+# o3d-2sm1.5 r19: the application's connection identity, which the helper is TOLD and never works
+# out. Every entrypoint passes it on every fence invocation, and refuses when it cannot read it —
+# the extracted functions below reference both exactly as the shipped scripts do.
+DB_FENCE_IDENTITY_ARGS=('--app-host=localhost' '--app-port=5432' '--app-user=imsapp' '--app-database=imsdb')
+require_db_identity() { [[ "\${#DB_FENCE_IDENTITY_ARGS[@]}" -eq 4 ]]; }
+DB_IDENTITY_REASON=''
+: "\${APP_DIR_REAL:=/opt/app}"
+: "\${APP_DIR:=/opt/app}"
 success() { :; }
 die() { echo "die: $*" >&2; exit 1; }
 `,
@@ -1009,11 +1021,15 @@ DB_FENCE_STATE='${dir}/db-connect-fence.json'
 DEPLOY_ADMIN_DATABASE_URL='postgres://admin@127.0.0.1/nowhere'
 MIGRATION_DATABASE_URL=''
 DB_FENCE_UP=false
-DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release --service-unit=one-two-inventory.service'
-# o3d-2sm1.5 r18: the unit the helper asks systemd about, passed by every entrypoint on every
-# fence invocation. The extracted functions below reference it exactly as the shipped scripts do.
-DB_FENCE_UNIT_ARG='--service-unit=one-two-inventory.service'
-DB_FENCE_UNIT_ARGS=('--service-unit=one-two-inventory.service')
+DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release --app-host=localhost --app-port=5432 --app-user=imsapp --app-database=imsdb'
+# o3d-2sm1.5 r19: the application's connection identity, which the helper is TOLD and never works
+# out. Every entrypoint passes it on every fence invocation, and refuses when it cannot read it —
+# the extracted functions below reference both exactly as the shipped scripts do.
+DB_FENCE_IDENTITY_ARGS=('--app-host=localhost' '--app-port=5432' '--app-user=imsapp' '--app-database=imsdb')
+require_db_identity() { [[ "\${#DB_FENCE_IDENTITY_ARGS[@]}" -eq 4 ]]; }
+DB_IDENTITY_REASON=''
+: "\${APP_DIR_REAL:=/opt/app}"
+: "\${APP_DIR:=/opt/app}"
 info() { :; }
 ok() { :; }
 warn() { echo "WARN: $*"; }
@@ -1036,11 +1052,15 @@ DATABASE_URL='postgres://app@127.0.0.1/nowhere'
 DEPLOY_ADMIN_DATABASE_URL='postgres://admin@127.0.0.1/nowhere'
 MIGRATION_DATABASE_URL=''
 DB_FENCE_UP=false
-DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release --service-unit=one-two-inventory.service'
-# o3d-2sm1.5 r18: the unit the helper asks systemd about, passed by every entrypoint on every
-# fence invocation. The extracted functions below reference it exactly as the shipped scripts do.
-DB_FENCE_UNIT_ARG='--service-unit=one-two-inventory.service'
-DB_FENCE_UNIT_ARGS=('--service-unit=one-two-inventory.service')
+DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release --app-host=localhost --app-port=5432 --app-user=imsapp --app-database=imsdb'
+# o3d-2sm1.5 r19: the application's connection identity, which the helper is TOLD and never works
+# out. Every entrypoint passes it on every fence invocation, and refuses when it cannot read it —
+# the extracted functions below reference both exactly as the shipped scripts do.
+DB_FENCE_IDENTITY_ARGS=('--app-host=localhost' '--app-port=5432' '--app-user=imsapp' '--app-database=imsdb')
+require_db_identity() { [[ "\${#DB_FENCE_IDENTITY_ARGS[@]}" -eq 4 ]]; }
+DB_IDENTITY_REASON=''
+: "\${APP_DIR_REAL:=/opt/app}"
+: "\${APP_DIR:=/opt/app}"
 info() { :; }
 success() { :; }
 warn() { echo "WARN: $*"; }
@@ -1063,11 +1083,15 @@ DATABASE_URL='postgres://app@127.0.0.1/nowhere'
 DEPLOY_ADMIN_DATABASE_URL='postgres://admin@127.0.0.1/nowhere'
 MIGRATION_DATABASE_URL=''
 DB_FENCE_UP=false
-DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release --service-unit=one-two-inventory.service'
-# o3d-2sm1.5 r18: the unit the helper asks systemd about, passed by every entrypoint on every
-# fence invocation. The extracted functions below reference it exactly as the shipped scripts do.
-DB_FENCE_UNIT_ARG='--service-unit=one-two-inventory.service'
-DB_FENCE_UNIT_ARGS=('--service-unit=one-two-inventory.service')
+DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release --app-host=localhost --app-port=5432 --app-user=imsapp --app-database=imsdb'
+# o3d-2sm1.5 r19: the application's connection identity, which the helper is TOLD and never works
+# out. Every entrypoint passes it on every fence invocation, and refuses when it cannot read it —
+# the extracted functions below reference both exactly as the shipped scripts do.
+DB_FENCE_IDENTITY_ARGS=('--app-host=localhost' '--app-port=5432' '--app-user=imsapp' '--app-database=imsdb')
+require_db_identity() { [[ "\${#DB_FENCE_IDENTITY_ARGS[@]}" -eq 4 ]]; }
+DB_IDENTITY_REASON=''
+: "\${APP_DIR_REAL:=/opt/app}"
+: "\${APP_DIR:=/opt/app}"
 info() { :; }
 success() { :; }
 warn() { echo "WARN: $*"; }
@@ -1534,11 +1558,15 @@ PORT=3000
 CRON_BACKUP="\${STATE_DIR}/crontab.bak"
 SERVICE_UNITS=(app.service)
 DB_FENCE_STATE="\${STATE_DIR}/db-connect-fence.json"
-DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release --service-unit=one-two-inventory.service'
-# o3d-2sm1.5 r18: the unit the helper asks systemd about, passed by every entrypoint on every
-# fence invocation. The extracted functions below reference it exactly as the shipped scripts do.
-DB_FENCE_UNIT_ARG='--service-unit=one-two-inventory.service'
-DB_FENCE_UNIT_ARGS=('--service-unit=one-two-inventory.service')
+DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release --app-host=localhost --app-port=5432 --app-user=imsapp --app-database=imsdb'
+# o3d-2sm1.5 r19: the application's connection identity, which the helper is TOLD and never works
+# out. Every entrypoint passes it on every fence invocation, and refuses when it cannot read it —
+# the extracted functions below reference both exactly as the shipped scripts do.
+DB_FENCE_IDENTITY_ARGS=('--app-host=localhost' '--app-port=5432' '--app-user=imsapp' '--app-database=imsdb')
+require_db_identity() { [[ "\${#DB_FENCE_IDENTITY_ARGS[@]}" -eq 4 ]]; }
+DB_IDENTITY_REASON=''
+: "\${APP_DIR_REAL:=/opt/app}"
+: "\${APP_DIR:=/opt/app}"
 ok() { :; }
 warn() { :; }
 die() { echo "die: $*" >&2; exit 1; }
@@ -1570,11 +1598,15 @@ FENCE_DROPIN_CREATED=false
 BACKUP_FILE=''
 CRON_BACKUP="\${DATA_DIR}/crontab.bak"
 DB_FENCE_STATE="\${DATA_DIR}/db-connect-fence.json"
-DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release --service-unit=one-two-inventory.service'
-# o3d-2sm1.5 r18: the unit the helper asks systemd about, passed by every entrypoint on every
-# fence invocation. The extracted functions below reference it exactly as the shipped scripts do.
-DB_FENCE_UNIT_ARG='--service-unit=one-two-inventory.service'
-DB_FENCE_UNIT_ARGS=('--service-unit=one-two-inventory.service')
+DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release --app-host=localhost --app-port=5432 --app-user=imsapp --app-database=imsdb'
+# o3d-2sm1.5 r19: the application's connection identity, which the helper is TOLD and never works
+# out. Every entrypoint passes it on every fence invocation, and refuses when it cannot read it —
+# the extracted functions below reference both exactly as the shipped scripts do.
+DB_FENCE_IDENTITY_ARGS=('--app-host=localhost' '--app-port=5432' '--app-user=imsapp' '--app-database=imsdb')
+require_db_identity() { [[ "\${#DB_FENCE_IDENTITY_ARGS[@]}" -eq 4 ]]; }
+DB_IDENTITY_REASON=''
+: "\${APP_DIR_REAL:=/opt/app}"
+: "\${APP_DIR:=/opt/app}"
 success() { :; }
 warn() { :; }
 error() { :; }
@@ -1603,11 +1635,15 @@ FENCE_MARKER_PREEXISTED=false
 FENCE_DROPIN_CREATED=false
 CRON_BACKUP="\${DATA_DIR}/crontab.bak"
 DB_FENCE_STATE="\${DATA_DIR}/db-connect-fence.json"
-DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release --service-unit=one-two-inventory.service'
-# o3d-2sm1.5 r18: the unit the helper asks systemd about, passed by every entrypoint on every
-# fence invocation. The extracted functions below reference it exactly as the shipped scripts do.
-DB_FENCE_UNIT_ARG='--service-unit=one-two-inventory.service'
-DB_FENCE_UNIT_ARGS=('--service-unit=one-two-inventory.service')
+DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release --app-host=localhost --app-port=5432 --app-user=imsapp --app-database=imsdb'
+# o3d-2sm1.5 r19: the application's connection identity, which the helper is TOLD and never works
+# out. Every entrypoint passes it on every fence invocation, and refuses when it cannot read it —
+# the extracted functions below reference both exactly as the shipped scripts do.
+DB_FENCE_IDENTITY_ARGS=('--app-host=localhost' '--app-port=5432' '--app-user=imsapp' '--app-database=imsdb')
+require_db_identity() { [[ "\${#DB_FENCE_IDENTITY_ARGS[@]}" -eq 4 ]]; }
+DB_IDENTITY_REASON=''
+: "\${APP_DIR_REAL:=/opt/app}"
+: "\${APP_DIR:=/opt/app}"
 success() { :; }
 warn() { :; }
 error() { :; }
@@ -2148,11 +2184,15 @@ DB_FENCE_STATE="\${STATE_DIR}/db.json"
 DB_FENCE_SCRIPT=/opt/app/scripts/fence-db-connections.mjs
 DEPLOY_ADMIN_DATABASE_URL='postgres://admin@127.0.0.1/nowhere'
 MIGRATION_DATABASE_URL=''
-DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release --service-unit=one-two-inventory.service'
-# o3d-2sm1.5 r18: the unit the helper asks systemd about, passed by every entrypoint on every
-# fence invocation. The extracted functions below reference it exactly as the shipped scripts do.
-DB_FENCE_UNIT_ARG='--service-unit=one-two-inventory.service'
-DB_FENCE_UNIT_ARGS=('--service-unit=one-two-inventory.service')
+DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release --app-host=localhost --app-port=5432 --app-user=imsapp --app-database=imsdb'
+# o3d-2sm1.5 r19: the application's connection identity, which the helper is TOLD and never works
+# out. Every entrypoint passes it on every fence invocation, and refuses when it cannot read it —
+# the extracted functions below reference both exactly as the shipped scripts do.
+DB_FENCE_IDENTITY_ARGS=('--app-host=localhost' '--app-port=5432' '--app-user=imsapp' '--app-database=imsdb')
+require_db_identity() { [[ "\${#DB_FENCE_IDENTITY_ARGS[@]}" -eq 4 ]]; }
+DB_IDENTITY_REASON=''
+: "\${APP_DIR_REAL:=/opt/app}"
+: "\${APP_DIR:=/opt/app}"
 `,
   },
   {
@@ -2185,11 +2225,15 @@ DB_FENCE_STATE="\${DATA_DIR}/db.json"
 DB_FENCE_SCRIPT=/opt/app/scripts/fence-db-connections.mjs
 DEPLOY_ADMIN_DATABASE_URL='postgres://admin@127.0.0.1/nowhere'
 MIGRATION_DATABASE_URL=''
-DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release --service-unit=one-two-inventory.service'
-# o3d-2sm1.5 r18: the unit the helper asks systemd about, passed by every entrypoint on every
-# fence invocation. The extracted functions below reference it exactly as the shipped scripts do.
-DB_FENCE_UNIT_ARG='--service-unit=one-two-inventory.service'
-DB_FENCE_UNIT_ARGS=('--service-unit=one-two-inventory.service')
+DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release --app-host=localhost --app-port=5432 --app-user=imsapp --app-database=imsdb'
+# o3d-2sm1.5 r19: the application's connection identity, which the helper is TOLD and never works
+# out. Every entrypoint passes it on every fence invocation, and refuses when it cannot read it —
+# the extracted functions below reference both exactly as the shipped scripts do.
+DB_FENCE_IDENTITY_ARGS=('--app-host=localhost' '--app-port=5432' '--app-user=imsapp' '--app-database=imsdb')
+require_db_identity() { [[ "\${#DB_FENCE_IDENTITY_ARGS[@]}" -eq 4 ]]; }
+DB_IDENTITY_REASON=''
+: "\${APP_DIR_REAL:=/opt/app}"
+: "\${APP_DIR:=/opt/app}"
 `,
   },
   {
@@ -2217,11 +2261,15 @@ DB_FENCE_STATE="\${DATA_DIR}/db.json"
 DB_FENCE_SCRIPT=/opt/app/scripts/fence-db-connections.mjs
 DEPLOY_ADMIN_DATABASE_URL='postgres://admin@127.0.0.1/nowhere'
 MIGRATION_DATABASE_URL=''
-DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release --service-unit=one-two-inventory.service'
-# o3d-2sm1.5 r18: the unit the helper asks systemd about, passed by every entrypoint on every
-# fence invocation. The extracted functions below reference it exactly as the shipped scripts do.
-DB_FENCE_UNIT_ARG='--service-unit=one-two-inventory.service'
-DB_FENCE_UNIT_ARGS=('--service-unit=one-two-inventory.service')
+DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release --app-host=localhost --app-port=5432 --app-user=imsapp --app-database=imsdb'
+# o3d-2sm1.5 r19: the application's connection identity, which the helper is TOLD and never works
+# out. Every entrypoint passes it on every fence invocation, and refuses when it cannot read it —
+# the extracted functions below reference both exactly as the shipped scripts do.
+DB_FENCE_IDENTITY_ARGS=('--app-host=localhost' '--app-port=5432' '--app-user=imsapp' '--app-database=imsdb')
+require_db_identity() { [[ "\${#DB_FENCE_IDENTITY_ARGS[@]}" -eq 4 ]]; }
+DB_IDENTITY_REASON=''
+: "\${APP_DIR_REAL:=/opt/app}"
+: "\${APP_DIR:=/opt/app}"
 `,
   },
 ] as const
@@ -3260,11 +3308,15 @@ SERVICE_UNITS=(app.service)
 CRON_BACKUP_CREATED=false
 CRON_FENCED=false
 DB_FENCE_STATE="\${CUTOVER_STATE_DIR}/deploy/db-connect-fence.json"
-DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release --service-unit=one-two-inventory.service'
-# o3d-2sm1.5 r18: the unit the helper asks systemd about, passed by every entrypoint on every
-# fence invocation. The extracted functions below reference it exactly as the shipped scripts do.
-DB_FENCE_UNIT_ARG='--service-unit=one-two-inventory.service'
-DB_FENCE_UNIT_ARGS=('--service-unit=one-two-inventory.service')
+DB_FENCE_RELEASE_CMD='node fence-db-connections.mjs --release --app-host=localhost --app-port=5432 --app-user=imsapp --app-database=imsdb'
+# o3d-2sm1.5 r19: the application's connection identity, which the helper is TOLD and never works
+# out. Every entrypoint passes it on every fence invocation, and refuses when it cannot read it —
+# the extracted functions below reference both exactly as the shipped scripts do.
+DB_FENCE_IDENTITY_ARGS=('--app-host=localhost' '--app-port=5432' '--app-user=imsapp' '--app-database=imsdb')
+require_db_identity() { [[ "\${#DB_FENCE_IDENTITY_ARGS[@]}" -eq 4 ]]; }
+DB_IDENTITY_REASON=''
+: "\${APP_DIR_REAL:=/opt/app}"
+: "\${APP_DIR:=/opt/app}"
 info(){ :; }
 ok(){ :; }
 success(){ :; }

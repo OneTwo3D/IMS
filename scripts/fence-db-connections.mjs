@@ -621,12 +621,19 @@ export function parseConnectionIdentity(connectionString) {
  * Pure: may this run treat the connection it opened as the application's own database, opened as
  * the role it was meant to be opened as?
  *
- * `connectedDatabase` is `current_database()` read from that connection — the live half, and the
- * only one that can catch an admin URL whose path is empty. `connectedLoginRole` is `session_user`
- * and `connectedEffectiveRole` is `current_user`, read from the same connection: the role half of
- * the same question, asked of the connection rather than inferred from the URL. `adminUrl` is
- * compared only when it is set, because without it the connection IS the application's URL and
- * there are not two things to bind together.
+ * `app` is the identity the CALLER SUPPLIED on argv, and is never derived here (o3d-2sm1.5 r19).
+ * `connectedDatabase` is `current_database()` read from the open connection — the live half, and
+ * the only one that can catch an admin URL whose path is empty. `connectedLoginRole` is
+ * `session_user` and `connectedEffectiveRole` is `current_user`, read from the same connection:
+ * the role half of the same question, asked of the connection rather than inferred from a URL.
+ * `adminUrl` is compared only when it is set.
+ *
+ * @param {{ adminUrl?: string,
+ *           app?: { appHost?: string, appPort?: string, appUser?: string, appDatabase?: string } | null,
+ *           connectedDatabase?: string,
+ *           connectedLoginRole?: string,
+ *           connectedEffectiveRole?: string }} facts
+ * @returns {{ bound: boolean, reason: string }}
  */
 export function assessDatabaseIdentity({
   adminUrl = '',

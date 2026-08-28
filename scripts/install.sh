@@ -1501,8 +1501,8 @@ refence_db_connections() {
   ${DB_FENCE_UP} && return 0
   [[ -f "${DB_FENCE_SCRIPT}" ]] || return 1
   [[ -n "${DEPLOY_ADMIN_DATABASE_URL}" ]] || return 1
-  # No identity, no fence (o3d-2sm1.5 r19). A soft refusal, not a die: this runs inside the exit
-  # trap, where dying loses the status and the banner.
+  # No identity, no fence (o3d-2sm1.5 r19). A soft refusal — this runs inside the exit trap, and
+  # aborting there would lose the status and the banner.
   require_db_identity || return 1
   local rc=0
   ( cd "${APP_DIR}" && run_as_user "${APP_USER}" env \

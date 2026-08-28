@@ -45,20 +45,10 @@ function withPgEnv(values: Record<string, string>): () => void {
 }
 
 import {
-  IDENTITY_ENVIRONMENT_VARIABLES,
-  SYSTEMCTL_PATHS,
-  UNIT_PROPERTIES,
+  REQUIRED_IDENTITY_OPTIONS,
   appDirectory,
-  applicationDotenvPaths,
-  applyServiceEnvironment,
-  findSystemctl,
-  mentionedIdentityVariable,
   parseArgs,
-  parseSystemctlShow,
-  parseSystemdEnvironment,
-  parseSystemdEnvironmentFiles,
-  processOsAccount,
-  readUnitEnvironment,
+  requireSuppliedIdentity,
   EXIT_ERROR,
   EXIT_FENCE_STANDING,
   EXIT_FENCE_UNPROVEN,
@@ -100,59 +90,44 @@ import {
 const ATTACHED_AS_ADMIN = { connectedLoginRole: 'deployadmin', connectedEffectiveRole: 'deployadmin' }
 
 /**
- * A STAND-IN FOR `systemctl show`, because a test cannot install a systemd unit.
- *
- * It answers with the properties the helper asks for, in `systemctl show`'s own `Key=Value`
- * shape, and it is reached through `--systemctl=<path>` — an ARGV value, which is the seam the
- * review asked for when it rejected the `IMS_SERVICE_ENV_FILE` environment variable (r17
- * CRITICAL): argv comes from the entrypoint that ran the script, and unlike an inherited variable
- * it cannot arrive from a `.bashrc`, a cron wrapper or a shell left open since last week.
+ * THE FOUR VALUES THE CALLER SUPPLIES, in the shape `assessDatabaseIdentity()` now requires
+ * (o3d-2sm1.5 r19). Nothing here derives them from a URL, because nothing in the helper does.
  */
-function stubSystemctl(
-  directory: string,
-  properties: { LoadState?: string; Environment?: string; EnvironmentFiles?: string; WorkingDirectory?: string; User?: string },
-): string {
-  const lines = [
-    `Environment=${properties.Environment ?? ''}`,
-    ...(properties.EnvironmentFiles === undefined ? [] : [`EnvironmentFiles=${properties.EnvironmentFiles}`]),
-    `WorkingDirectory=${properties.WorkingDirectory ?? ''}`,
-    `User=${properties.User ?? ''}`,
-    `LoadState=${properties.LoadState ?? 'loaded'}`,
-    'FragmentPath=/etc/systemd/system/one-two-inventory.service',
+function suppliedIdentity(overrides: Partial<Record<'appHost' | 'appPort' | 'appUser' | 'appDatabase', string>> = {}) {
+  return { appHost: 'localhost', appPort: '5432', appUser: 'imsapp', appDatabase: 'onetwo3d_ims', ...overrides }
+}
+
+/** The same four as command-line arguments, for the end-to-end runs. */
+function identityArgs(overrides: Partial<Record<'appHost' | 'appPort' | 'appUser' | 'appDatabase', string>> = {}) {
+  const identity = suppliedIdentity(overrides)
+  return [
+    `--app-host=${identity.appHost}`,
+    `--app-port=${identity.appPort}`,
+    `--app-user=${identity.appUser}`,
+    `--app-database=${identity.appDatabase}`,
   ]
-  const path = join(directory, 'systemctl')
-  writeFileSync(path, `#!/bin/sh\ncat <<'PROPS'\n${lines.join('\n')}\nPROPS\n`)
-  chmodSync(path, 0o755)
-  return path
 }
 
 /**
  * Run the shipped script from a directory with no .env, and report what it said.
  *
- * THE SERVICE'S ENVIRONMENT COMES FROM SYSTEMD (o3d-2sm1.5 r18). The script asks
- * `systemctl show <unit>` for PGHOST/PGPORT/PGUSER/PGDATABASE and refuses when systemd cannot be
- * asked, when the unit is not loaded, or when the answer cannot be read — precisely so that a
- * variable in the calling shell cannot decide where the application connects. `unitEnvironment` is
- * what the stub reports as the unit's `Environment=`; passing `null` points `--systemctl=` at
- * nothing, which is the "systemd cannot be asked" refusal.
+ * THE APPLICATION'S IDENTITY IS ON THE COMMAND LINE (o3d-2sm1.5 r19). The script no longer works
+ * out where the application connects — not from this process's environment, not from a dotenv
+ * overlay, and not from systemd — so every run here passes the four values explicitly, and
+ * `identity: null` is the "nothing was supplied" refusal.
  */
 function runFenceScript(
   args: string[],
   env: Record<string, string | undefined>,
-  unitEnvironment: string | null = '',
-  unitArgs: string[] = ['--service-unit=one-two-inventory.service'],
+  identity: string[] | null = identityArgs({ appDatabase: 'ims' }),
 ) {
   const cwd = mkdtempSync(join(tmpdir(), 'ims-fence-'))
-  const systemctl =
-    unitEnvironment === null
-      ? join(cwd, 'no-such-systemctl')
-      : stubSystemctl(cwd, { Environment: unitEnvironment })
   // spawnSync, not execFileSync: the script's diagnostics go to STDERR so that stdout stays the
   // machine-readable channel `--print-migration-url` is captured through, and a test that could
   // only see stdout on success could not tell the two apart.
   const run = spawnSync(
     'node',
-    [join(process.cwd(), 'scripts/fence-db-connections.mjs'), ...args, ...unitArgs, `--systemctl=${systemctl}`],
+    [join(process.cwd(), 'scripts/fence-db-connections.mjs'), ...args, ...(identity ?? [])],
     {
       encoding: 'utf8',
       env: { ...process.env, ...env },
@@ -640,6 +615,8 @@ class FakeAdminClient {
       datacl?: string | null
       releasedDatacl?: string | null
       connectedDatabase?: string
+      /** pg_postmaster_start_time() — the stamp that says WHICH CLUSTER this is (o3d-2sm1.5 r19). */
+      postmaster?: string
       /** session_user — what this connection logged in as. */
       loginRole?: string
       /** current_user — what it is running as, which a SET ROLE can move away from the login role. */
@@ -671,6 +648,7 @@ class FakeAdminClient {
         rows: [
           {
             database: 'imsdb',
+            postmaster: this.options.postmaster ?? '',
             admin_role: this.options.effectiveRole ?? 'deployadmin',
             admin_login_role: this.options.loginRole ?? 'deployadmin',
             owner_role: 'owner',
@@ -690,6 +668,7 @@ class FakeAdminClient {
             connected_database: this.options.connectedDatabase ?? 'imsdb',
             connected_login_role: this.options.loginRole ?? 'deployadmin',
             connected_effective_role: this.options.effectiveRole ?? 'deployadmin',
+            connected_postmaster: this.options.postmaster ?? '',
           },
         ],
       }
@@ -852,7 +831,7 @@ test('the fence refuses to revoke when its record cannot be created at all', asy
     const stateFile = join(dir, 'db-connect-fence.json')
     chmodSync(dir, NO_WRITE)
     const client = new FakeAdminClient({ stateFile })
-    const code = await withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1 }))
+    const code = await withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1, ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
     chmodSync(dir, 0o700)
 
     assert.equal(code, EXIT_NOT_FENCEABLE, 'an unrecordable fence is NOT a fence')
@@ -874,7 +853,7 @@ test('the fence refuses to revoke when its record is visible but its name is not
     const stateFile = join(dir, 'db-connect-fence.json')
     chmodSync(dir, NO_READ)
     const client = new FakeAdminClient({ stateFile })
-    const code = await withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1 }))
+    const code = await withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1, ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
     chmodSync(dir, 0o700)
 
     // Precondition: the rename HAPPENED, so this is the post-rename side and not the other one.
@@ -897,7 +876,7 @@ test('the complete record is on the medium before the revoking transaction is op
   try {
     const stateFile = join(dir, 'db-connect-fence.json')
     const client = new FakeAdminClient({ stateFile })
-    const code = await withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1 }))
+    const code = await withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1, ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
 
     assert.equal(code, EXIT_OK, 'the happy path must still fence')
     assert.ok(client.fileAtBegin !== null, 'the record must exist before BEGIN, not after COMMIT')
@@ -933,7 +912,7 @@ test('a grantee that appeared since the fence was recorded is recorded durably b
 
     chmodSync(dir, NO_READ)
     const client = new FakeAdminClient({ stateFile })
-    const code = await withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1 }))
+    const code = await withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1, ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
     chmodSync(dir, 0o700)
 
     assert.equal(code, EXIT_NOT_FENCEABLE, 'an unrecordable append must abort')
@@ -959,7 +938,7 @@ test('the fence refuses to start a fresh record over one it cannot read', async 
     const before = readFileSync(stateFile, 'utf8')
 
     const client = new FakeAdminClient({ stateFile })
-    const code = await withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1 }))
+    const code = await withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1, ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
 
     assert.equal(code, EXIT_NOT_FENCEABLE, 'an unusable record must abort the fence, not be overwritten')
     assert.deepEqual(client.revokes, [], 'and nothing may be revoked over it')
@@ -1061,7 +1040,7 @@ test('--release over a lost record grants nothing and fails, rather than reporti
   try {
     const stateFile = join(dir, 'db-connect-fence.json')
     const client = new FakeAdminClient({ stateFile, stillConnectsBefore: false })
-    const code = await withAdminUrl(() => doRelease(client as never, { stateFile, appRole: 'imsapp' }))
+    const code = await withAdminUrl(() => doRelease(client as never, { stateFile, appRole: 'imsapp', ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
 
     assert.equal(code, EXIT_ERROR, 'a release that cannot prove the database is open must fail')
     assert.deepEqual(client.grants, [], 'and it must not guess at grants it has no record of')
@@ -1094,6 +1073,7 @@ test('--release over a lost record refuses even when the application connects, b
       doRelease(client as never, {
         stateFile,
         appRole: 'imsapp',
+        ...suppliedIdentity({ appDatabase: 'imsdb' }),
         // The application's own connection succeeds — this is the state where BOTH halves agree
         // that imsapp is back inside, and it is STILL not a released fence (r13 kept r12 whole).
         probeApplication: async () => ({ attempted: true, connected: true, database: 'imsdb', error: '' }),
@@ -1123,7 +1103,7 @@ test('--release restores exactly the recorded grantees when the record survived'
       stateFile,
       releasedDatacl: '{owner=CTc/owner,=Tc/owner,imsapp=c/owner}',
     })
-    const code = await withAdminUrl(() => doRelease(client as never, { stateFile, appRole: 'imsapp' }))
+    const code = await withAdminUrl(() => doRelease(client as never, { stateFile, appRole: 'imsapp', ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
 
     assert.equal(code, EXIT_OK)
     assert.deepEqual(client.grants, [
@@ -1159,7 +1139,7 @@ test('an admin URL naming a different database from DATABASE_URL is refused even
   // disagree are a refusal on their own merits, whatever this particular connection reached.
   const verdict = assessDatabaseIdentity({ ...ATTACHED_AS_ADMIN,
     adminUrl: 'postgres://deployadmin@localhost:5432/onetwo3d_ims_copy',
-    appUrl: 'postgres://imsapp@localhost:5432/onetwo3d_ims',
+    app: suppliedIdentity(),
     connectedDatabase: 'onetwo3d_ims',
   })
 
@@ -1173,7 +1153,7 @@ test('an admin URL on a different server is refused rather than assumed to be th
   // privilege read on one server says nothing whatever about another.
   const verdict = assessDatabaseIdentity({ ...ATTACHED_AS_ADMIN,
     adminUrl: 'postgres://deployadmin@db-old.internal:5432/onetwo3d_ims',
-    appUrl: 'postgres://imsapp@db-new.internal:5432/onetwo3d_ims',
+    app: suppliedIdentity({ appHost: 'db-new.internal' }),
     connectedDatabase: 'onetwo3d_ims',
   })
 
@@ -1190,7 +1170,7 @@ test('a connection attached to a database neither URL asked for is refused', () 
   // MUTATION ROUTE: delete the `connectedDatabase !== app.database` arm and this returns bound.
   const verdict = assessDatabaseIdentity({ ...ATTACHED_AS_ADMIN,
     adminUrl: 'postgres://deployadmin@localhost:5432/',
-    appUrl: 'postgres://imsapp@localhost:5432/onetwo3d_ims',
+    app: suppliedIdentity(),
     connectedDatabase: 'deployadmin',
   })
 
@@ -1207,7 +1187,7 @@ test('a loopback address, localhost and a unix socket are the same machine, and 
   assert.equal(
     assessDatabaseIdentity({ ...ATTACHED_AS_ADMIN,
       adminUrl: 'postgres://deployadmin@127.0.0.1:5432/onetwo3d_ims',
-      appUrl: 'postgres://imsapp@localhost:5432/onetwo3d_ims',
+      app: suppliedIdentity(),
       connectedDatabase: 'onetwo3d_ims',
     }).bound,
     true,
@@ -1215,7 +1195,7 @@ test('a loopback address, localhost and a unix socket are the same machine, and 
   assert.equal(
     assessDatabaseIdentity({ ...ATTACHED_AS_ADMIN,
       adminUrl: 'postgresql:///onetwo3d_ims?host=/var/run/postgresql',
-      appUrl: 'postgres://imsapp@localhost/onetwo3d_ims',
+      app: suppliedIdentity(),
       connectedDatabase: 'onetwo3d_ims',
     }).bound,
     true,
@@ -1225,26 +1205,52 @@ test('a loopback address, localhost and a unix socket are the same machine, and 
   assert.equal(
     assessDatabaseIdentity({ ...ATTACHED_AS_ADMIN,
       adminUrl: 'postgres://deployadmin@localhost:5433/onetwo3d_ims',
-      appUrl: 'postgres://imsapp@localhost:5432/onetwo3d_ims',
+      app: suppliedIdentity(),
       connectedDatabase: 'onetwo3d_ims',
     }).bound,
     false,
   )
 })
 
-test('nothing to bind to is not a pass: an unset or database-less DATABASE_URL is refused', () => {
-  // MUTATION ROUTE: return { bound: true } when appUrl is missing — the "there is nothing to
-  // check, so it must be fine" reading — and both of these fail.
-  assert.equal(assessDatabaseIdentity({ ...ATTACHED_AS_ADMIN, adminUrl: 'postgres://deployadmin@localhost/imsdb', appUrl: '', connectedDatabase: 'imsdb' }).bound, false)
+test('nothing to bind to is not a pass: a missing or partial supplied identity is refused', () => {
+  // ROUTE: --app-host/--app-port/--app-user/--app-database -> requireSuppliedIdentity() ->
+  // assessDatabaseIdentity(), which is what licenses every fence, release and printed URL.
+  //
+  // MUTATION ROUTE: return { bound: true } when nothing was supplied — the "there is nothing to
+  // check, so it must be fine" reading, which is what an unset variable used to produce — and
+  // every assertion here fails.
   assert.equal(
-    assessDatabaseIdentity({ ...ATTACHED_AS_ADMIN, adminUrl: 'postgres://deployadmin@localhost/imsdb', appUrl: 'postgres://imsapp@localhost/', connectedDatabase: 'imsdb' }).bound,
+    assessDatabaseIdentity({ ...ATTACHED_AS_ADMIN, adminUrl: 'postgres://deployadmin@localhost:5432/imsdb', app: {}, connectedDatabase: 'imsdb' }).bound,
     false,
-    'a URL with no database in its path lands on the login role\'s own name, which is not the database this run is attached to',
+    'no identity at all is not "any identity will do"',
   )
+  // THREE OF FOUR IS NOT AN IDENTITY, and each one is named in the refusal so the caller knows
+  // which of its own values was empty.
+  for (const [option, key] of [['--app-host', 'appHost'], ['--app-port', 'appPort'], ['--app-user', 'appUser'], ['--app-database', 'appDatabase']] as const) {
+    const verdict = assessDatabaseIdentity({
+      ...ATTACHED_AS_ADMIN,
+      adminUrl: 'postgres://deployadmin@localhost:5432/imsdb',
+      app: suppliedIdentity({ appDatabase: 'imsdb', [key]: '' }),
+      connectedDatabase: 'imsdb',
+    })
+    assert.equal(verdict.bound, false, `${option} is required`)
+    assert.ok(verdict.reason.includes(option), `${option} is named in the refusal`)
+  }
+  // AND A BLANK IS A MISSING VALUE, not a default: `--app-host=` is the shape an unset shell
+  // variable takes when a caller interpolates it, and reading it as `localhost` is exactly the
+  // guess this round removed.
+  assert.equal(requireSuppliedIdentity(suppliedIdentity({ appHost: '   ' })).ok, false)
   assert.equal(parseConnectionIdentity('not a url at all').ok, false)
 })
 
-/** Admin and application URLs that do NOT agree — the two-database configuration, at the wire. */
+/**
+ * The admin URL and the SUPPLIED identity do NOT agree — the two-database configuration, at the
+ * wire. The application half is now `MISMATCHED_IDENTITY` on the options, not a URL in the
+ * environment (o3d-2sm1.5 r19); the environment is set here only because `--release`'s probe
+ * still opens DATABASE_URL as a credential.
+ */
+const MISMATCHED_IDENTITY = { appHost: 'localhost', appPort: '5432', appUser: 'imsapp', appDatabase: 'onetwo3d_ims' }
+
 async function withMismatchedUrls<T>(run: () => Promise<T>): Promise<T> {
   const previous = process.env.DEPLOY_ADMIN_DATABASE_URL
   const previousApp = process.env.DATABASE_URL
@@ -1275,7 +1281,7 @@ test('the fence revokes nothing when the admin connection is not the application
     try {
       const stateFile = join(dir, 'db-connect-fence.json')
       const client = new FakeAdminClient({ stateFile })
-      const code = await withMismatchedUrls(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1 }))
+      const code = await withMismatchedUrls(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1, ...MISMATCHED_IDENTITY }))
 
       assert.equal(code, EXIT_NOT_FENCEABLE, 'a database that cannot be shown to be the right one is not fenceable')
       assert.deepEqual(client.revokes, [], 'and NOTHING may be revoked on it')
@@ -1300,7 +1306,7 @@ test('a release over an unbound connection restores nothing, however good its re
     const stateFile = join(dir, 'db-connect-fence.json')
     publishState(stateFile, SAMPLE_STATE)
     const client = new FakeAdminClient({ stateFile, releasedDatacl: '{owner=CTc/owner,=Tc/owner,imsapp=c/owner}' })
-    const code = await withMismatchedUrls(() => doRelease(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1 }))
+    const code = await withMismatchedUrls(() => doRelease(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1, ...MISMATCHED_IDENTITY }))
 
     assert.equal(code, EXIT_ERROR, 'an unidentified database is a refusal, not a release')
     assert.notEqual(code, EXIT_OK, 'and above all not a success')
@@ -1323,7 +1329,7 @@ test('a release refuses when the record it holds was written for another databas
     const stateFile = join(dir, 'db-connect-fence.json')
     publishState(stateFile, { ...SAMPLE_STATE, database: 'elsewhere' })
     const client = new FakeAdminClient({ stateFile, connectedDatabase: 'imsdb' })
-    const code = await withAdminUrl(() => doRelease(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1 }))
+    const code = await withAdminUrl(() => doRelease(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1, ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
 
     assert.equal(code, EXIT_ERROR)
     assert.deepEqual(client.grants, [], 'nothing recorded somewhere else may be restored from here')
@@ -1348,6 +1354,7 @@ test('an unrecorded release proves "the application can connect" by connecting a
         stateFile: '',
         appRole: '',
         timeoutSeconds: 1,
+        ...suppliedIdentity({ appDatabase: 'imsdb' }),
         probeApplication: async (connectionString: string) => {
           probed = connectionString
           return { attempted: true, connected: false, database: '', error: 'FATAL: permission denied for database "imsdb"' }
@@ -1371,6 +1378,7 @@ test('an unrecorded release refuses when the application lands on a different da
         stateFile: '',
         appRole: '',
         timeoutSeconds: 1,
+        ...suppliedIdentity({ appDatabase: 'imsdb' }),
         probeApplication: async () => ({ attempted: true, connected: true, database: 'onetwo3d_ims', error: '' }),
       } as never),
     )
@@ -1392,6 +1400,7 @@ test('an unrecorded release still refuses to call a fence released when the appl
         stateFile: '',
         appRole: '',
         timeoutSeconds: 1,
+        ...suppliedIdentity({ appDatabase: 'imsdb' }),
         probeApplication: async () => ({ attempted: true, connected: true, database: 'imsdb', error: '' }),
       } as never),
     )
@@ -1421,7 +1430,7 @@ test('a fence that committed its revokes and could not shut the application out 
   try {
     const stateFile = join(dir, 'db-connect-fence.json')
     const client = new FakeAdminClient({ stateFile, stillConnectsAfter: true })
-    const code = await withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1 }))
+    const code = await withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1, ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
 
     assert.equal(code, EXIT_FENCE_STANDING, 'the revokes are committed, so this is not "the fence failed"')
     assert.notEqual(code, EXIT_ERROR, 'and not the code a fence that revoked nothing returns')
@@ -1442,7 +1451,7 @@ test('a fence whose room will not go quiet says the fence is STANDING', async ()
       stateFile,
       attached: [{ pid: 4242, application_name: 'psql', usename: 'someone' }],
     })
-    const code = await withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1 }))
+    const code = await withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1, ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
 
     assert.equal(code, EXIT_FENCE_STANDING, 'CONNECT is revoked and standing; the drain is what failed')
     assert.ok(client.log.includes('COMMIT'))
@@ -1462,7 +1471,7 @@ test('an error thrown AFTER the commit is a standing fence, not an exception the
   try {
     const stateFile = join(dir, 'db-connect-fence.json')
     const client = new FakeAdminClient({ stateFile, throwAfterCommit: 'server closed the connection unexpectedly' })
-    const code = await withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1 }))
+    const code = await withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1, ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
 
     assert.equal(code, EXIT_FENCE_STANDING, 'a throw after COMMIT is still a database with a fence on it')
     assert.ok(client.log.includes('COMMIT'), 'precondition: the revokes committed before the failure')
@@ -1485,20 +1494,24 @@ test('an error thrown AFTER the commit is a standing fence, not an exception the
 // `options=-c role=` are all outside any URL.
 // ---------------------------------------------------------------------------
 
-test('a query parameter that redirects the server is what the driver uses, so it is what is compared', () => {
-  // THE FINDING'S OWN URL. Its authority and path say localhost:5432/onetwo3d_ims — the admin
-  // URL's own address, exactly — and the query string is where node-postgres actually goes.
+test('a query parameter that redirects the ADMIN connection is what the driver uses, so it is what is compared', () => {
+  // THE FINDING'S OWN URL, now on the half that is still a URL. The application's host, port,
+  // role and database are SUPPLIED (o3d-2sm1.5 r19) and nothing derives them; the admin URL is
+  // the connection THIS process opens, so `pg`'s own resolution of it is the right one — and its
+  // authority and path can still say localhost:5432/onetwo3d_ims while the query string is where
+  // node-postgres actually goes.
   //
-  // MUTATION ROUTE: restore the original parse, which is BOTH halves of the fix at once — read
-  // the authority first (`url.hostname || params.get('host')`, `url.port || params.get('port')`)
-  // AND drop the conflict refusal. This then returns bound: both URLs look like localhost:5432
-  // while the application is on remote.example:6432, and the fence proves itself against a
-  // cluster nobody uses. Either half alone catches it, which is why those routes are separate
-  // below; this test is the whole defect as reported.
+  // ROUTE: DEPLOY_ADMIN_DATABASE_URL -> parseConnectionIdentity() -> resolveDriverIdentity() ->
+  // the `admin.server !== appServer` arm of assessDatabaseIdentity().
+  //
+  // MUTATION ROUTE: restore the original parse — read the authority first
+  // (`url.hostname || params.get('host')`) AND drop the conflict refusal. This then returns
+  // bound: the admin URL looks like localhost:5432 while the privileged connection is on
+  // remote.example:6432, and the fence proves itself against a cluster nobody uses.
   const redirected = assessDatabaseIdentity({
     ...ATTACHED_AS_ADMIN,
-    adminUrl: 'postgres://deployadmin@localhost:5432/onetwo3d_ims',
-    appUrl: 'postgres://imsapp@localhost:5432/onetwo3d_ims?host=remote.example&port=6432',
+    adminUrl: 'postgres://deployadmin@localhost:5432/onetwo3d_ims?host=remote.example&port=6432',
+    app: suppliedIdentity(),
     connectedDatabase: 'onetwo3d_ims',
   })
   assert.equal(redirected.bound, false, 'the query string is where this connection actually goes')
@@ -1508,15 +1521,15 @@ test('a query parameter that redirects the server is what the driver uses, so it
   // libpq form WHATWG URL rejects and node-postgres accepts by retrying with a dummy host — the
   // query values are simply what this connection IS: resolved and compared as remote.example:6432
   // rather than refused as unreadable.
-  const identity = parseConnectionIdentity('postgres://imsapp@/onetwo3d_ims?host=remote.example&port=6432')
+  const identity = parseConnectionIdentity('postgres://deployadmin@/onetwo3d_ims?host=remote.example&port=6432')
   assert.equal(identity.ok, true, 'a URL the driver connects with must not be refused as unparseable')
   assert.equal(identity.host, 'remote.example')
   assert.equal(identity.port, '6432')
   assert.equal(identity.server, 'remote.example:6432')
   const viaQueryOnly = assessDatabaseIdentity({
     ...ATTACHED_AS_ADMIN,
-    adminUrl: 'postgres://deployadmin@localhost:5432/onetwo3d_ims',
-    appUrl: 'postgres://imsapp@/onetwo3d_ims?host=remote.example&port=6432',
+    adminUrl: 'postgres://deployadmin@/onetwo3d_ims?host=remote.example&port=6432',
+    app: suppliedIdentity(),
     connectedDatabase: 'onetwo3d_ims',
   })
   assert.equal(viaQueryOnly.bound, false)
@@ -1573,7 +1586,7 @@ test('the role half is asked of the connection: what it logged in as, and what i
   // three of these return bound.
   const base = {
     adminUrl: 'postgres://deployadmin@localhost/onetwo3d_ims',
-    appUrl: 'postgres://imsapp@localhost/onetwo3d_ims',
+    app: suppliedIdentity(),
     connectedDatabase: 'onetwo3d_ims',
   }
 
@@ -1607,36 +1620,29 @@ test('the role half is asked of the connection: what it logged in as, and what i
   assert.equal(assessDatabaseIdentity({ ...base, ...ATTACHED_AS_ADMIN }).bound, true)
 })
 
-/** An application URL that is redirected by its query string, at the wire. */
-async function withRedirectedAppUrl<T>(appUrl: string, run: () => Promise<T>): Promise<T> {
-  const previous = process.env.DEPLOY_ADMIN_DATABASE_URL
-  const previousApp = process.env.DATABASE_URL
-  process.env.DEPLOY_ADMIN_DATABASE_URL = 'postgres://deployadmin@localhost:5432/imsdb'
-  process.env.DATABASE_URL = appUrl
-  try {
-    return await run()
-  } finally {
-    if (previous === undefined) delete process.env.DEPLOY_ADMIN_DATABASE_URL
-    else process.env.DEPLOY_ADMIN_DATABASE_URL = previous
-    if (previousApp === undefined) delete process.env.DATABASE_URL
-    else process.env.DATABASE_URL = previousApp
-  }
-}
-
-test('the fence revokes nothing when DATABASE_URL is redirected to another cluster by its query string', async () => {
-  // THE WHOLE FINDING, AT THE WIRE. The admin URL and the application URL name the same database
-  // on the same authority; only the query string says the application is somewhere else entirely.
-  // Fencing here locks other people's clients out of THIS cluster while the application keeps
-  // writing to remote.example across the migration.
+test('the fence revokes nothing when the SUPPLIED identity is not the cluster this connection is on', async () => {
+  // THE WHOLE FINDING, AT THE WIRE, ON THE NEW SHAPE. The admin URL reaches localhost:5432/imsdb;
+  // the caller says the application is on remote.example:6432. Fencing here would lock other
+  // people's clients out of THIS cluster while the application keeps writing to remote.example
+  // across the migration. It is refused BEFORE anything is revoked, committed or recorded.
   //
-  // MUTATION ROUTE: read the authority first in parseConnectionIdentity() and this fence proceeds
-  // — client.revokes stops being empty and the code stops being EXIT_NOT_FENCEABLE.
+  // ROUTE: --app-host/--app-port -> requireBoundDatabaseIdentity() in doFence() ->
+  // assessDatabaseIdentity()'s `admin.server !== appServer` arm.
+  //
+  // MUTATION ROUTE: delete that arm (or the requireBoundDatabaseIdentity() call from doFence())
+  // and this fence proceeds — client.revokes stops being empty, COMMIT appears in the log and the
+  // record is published.
   const dir = stateDir()
   try {
     const stateFile = join(dir, 'db-connect-fence.json')
     const client = new FakeAdminClient({ stateFile })
-    const code = await withRedirectedAppUrl('postgres://imsapp@localhost:5432/imsdb?host=remote.example&port=6432', () =>
-      doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1 }),
+    const code = await withAdminUrl(() =>
+      doFence(client as never, {
+        stateFile,
+        appRole: 'imsapp',
+        timeoutSeconds: 1,
+        ...suppliedIdentity({ appHost: 'remote.example', appPort: '6432', appDatabase: 'imsdb' }),
+      }),
     )
 
     assert.equal(code, EXIT_NOT_FENCEABLE)
@@ -1656,7 +1662,7 @@ test('the fence revokes nothing when the connection logged in as a role the admi
   try {
     const stateFile = join(dir, 'db-connect-fence.json')
     const client = new FakeAdminClient({ stateFile, loginRole: 'postgres', effectiveRole: 'postgres' })
-    const code = await withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1 }))
+    const code = await withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1, ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
 
     assert.equal(code, EXIT_NOT_FENCEABLE)
     assert.deepEqual(client.revokes, [])
@@ -1684,7 +1690,7 @@ test('a COMMIT whose acknowledgement never arrives is a fence that MAY BE STANDI
   try {
     const stateFile = join(dir, 'db-connect-fence.json')
     const client = new FakeAdminClient({ stateFile, failCommitAck: 'Connection terminated unexpectedly' })
-    const code = await withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1 }))
+    const code = await withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1, ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
 
     assert.equal(code, EXIT_FENCE_STANDING, 'unknown must not be reported as the not-committed case')
     assert.notEqual(code, EXIT_ERROR, 'and exit 1 is the code the entrypoints read as "no fence was raised"')
@@ -1720,7 +1726,7 @@ test('a failure BEFORE the COMMIT is issued still rolls back and still reports a
     }
     const client = new RefusingClient({ stateFile })
     await assert.rejects(
-      () => withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1 })),
+      () => withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1, ...suppliedIdentity({ appDatabase: 'imsdb' }) })),
       /permission denied/,
       'a revoke that was refused is a fence that demonstrably did not happen',
     )
@@ -1861,28 +1867,40 @@ test('a port node-postgres cannot read as a number is refused, not silently defa
   assert.match(identity.reason, /port number/)
 })
 
-test('the fence revokes nothing, and commits nothing, when DATABASE_URL names two hosts, two ports and two roles', async () => {
+/** An ADMIN URL that is ambiguous about where it goes, at the wire. */
+async function withAdminUrlOf<T>(adminUrl: string, run: () => Promise<T>): Promise<T> {
+  const previous = process.env.DEPLOY_ADMIN_DATABASE_URL
+  process.env.DEPLOY_ADMIN_DATABASE_URL = adminUrl
+  try {
+    return await run()
+  } finally {
+    if (previous === undefined) delete process.env.DEPLOY_ADMIN_DATABASE_URL
+    else process.env.DEPLOY_ADMIN_DATABASE_URL = previous
+  }
+}
+
+test('the fence revokes nothing, and commits nothing, when the ADMIN URL names two hosts, two ports and two roles', async () => {
   // THE WHOLE FINDING, AT THE WIRE, IN THE DIRECTION THAT ACTUALLY FENCES. The duplicates here
-  // resolve — through the driver — to precisely the admin URL's own address and role, so with the
-  // repetition accepted the identity binds and the fence goes ahead: it would revoke CONNECT on
-  // this cluster while the operator reading the URL, and every log line quoting it, says the
-  // application is on remote.example:6432 as `other`. Nobody would look here for the writes.
+  // resolve — through the driver — to precisely the address and role the caller supplies, so with
+  // the repetition accepted the identity binds and the fence goes ahead: it would revoke CONNECT
+  // on this cluster while the operator reading the URL, and every log line quoting it, says the
+  // privileged connection is on remote.example:6432 as `other`. Nobody would look here.
   //
   // MUTATION ROUTE: delete the IDENTITY_PARAMS getAll() loop from parseConnectionIdentity() and
   // this fence proceeds — client.revokes stops being empty, COMMIT appears in the log, and the
   // state file is written.
-  const ambiguous = 'postgres://@/imsdb?host=remote.example&host=localhost&port=6432&port=5432&user=other&user=imsapp'
+  const ambiguous = 'postgres://@/imsdb?host=remote.example&host=localhost&port=6432&port=5432&user=other&user=deployadmin'
   const effective = driverParse(ambiguous)
-  assert.equal(effective.host, 'localhost', 'precondition: the driver lands on the admin URL\'s own host')
-  assert.equal(effective.port, '5432', 'precondition: and its port')
-  assert.equal(effective.user, 'imsapp', 'precondition: and the application role, so nothing else would refuse this')
+  assert.equal(effective.host, 'localhost', 'precondition: the driver lands on the supplied host')
+  assert.equal(effective.port, '5432', 'precondition: and the supplied port')
+  assert.equal(effective.user, 'deployadmin', 'precondition: and the role the connection logs in as, so nothing else would refuse this')
 
   const dir = stateDir()
   try {
     const stateFile = join(dir, 'db-connect-fence.json')
     const client = new FakeAdminClient({ stateFile })
-    const code = await withRedirectedAppUrl(ambiguous, () =>
-      doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1 }),
+    const code = await withAdminUrlOf(ambiguous, () =>
+      doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1, ...suppliedIdentity({ appDatabase: 'imsdb' }) }),
     )
 
     assert.equal(code, EXIT_NOT_FENCEABLE)
@@ -1894,128 +1912,12 @@ test('the fence revokes nothing, and commits nothing, when DATABASE_URL names tw
   }
 })
 
-test('a value the URL never mentions and the ENVIRONMENT supplies is where the application really connects, and the fence follows it there', async () => {
-  // THE WHOLE r16 FINDING, IN THE DIRECTION THAT ACTUALLY FENCES.
-  //
-  // DATABASE_URL names no port. PGPORT does, and node-postgres dials it. Read the URL — even with
-  // the driver's OWN STRING PARSER, which is what r15 shipped — and the application looks like it
-  // is on 5432, which is exactly where the admin URL is: the identity binds, the fence revokes
-  // CONNECT on 5432, and the application writes to 6432 undisturbed for the whole migration. The
-  // one cluster nobody is protecting is the one being migrated.
-  //
-  // MUTATION ROUTE: make resolveDriverIdentity() return the installed pg-connection-string parse
-  // of the connection string, and every assertion below flips — identity.port reads '5432', the
-  // server reads '(this host):5432', assessDatabaseIdentity() returns bound, and doFence()
-  // revokes, commits and writes the state file.
-  const restore = withPgEnv({ PGPORT: '6432' })
-  try {
-    const appUrl = 'postgres://imsapp@localhost/imsdb'
-    assert.equal(driverParse(appUrl).port ?? '', '', 'precondition: the URL itself names no port at all')
-    assert.equal(driverConnection(appUrl).port, 6432, 'precondition: and the connection node-postgres opens is on 6432')
-
-    const identity = parseConnectionIdentity(appUrl)
-    assert.equal(identity.port, '6432', 'the port the environment supplies is the port this connects to')
-    assert.equal(identity.server, '(this host):6432')
-
-    const verdict = assessDatabaseIdentity({
-      ...ATTACHED_AS_ADMIN,
-      adminUrl: 'postgres://deployadmin@localhost:5432/imsdb',
-      appUrl,
-      connectedDatabase: 'imsdb',
-    })
-    assert.equal(verdict.bound, false, 'the admin connection is on 5432 and the application is not')
-    assert.match(verdict.reason, /6432/, 'and the refusal names where the application really is')
-
-    // At the wire: nothing revoked, nothing committed, no record published.
-    const dir = stateDir()
-    try {
-      const stateFile = join(dir, 'db-connect-fence.json')
-      const client = new FakeAdminClient({ stateFile })
-      const code = await withRedirectedAppUrl(appUrl, () =>
-        doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1 }),
-      )
-      assert.equal(code, EXIT_NOT_FENCEABLE)
-      assert.deepEqual(client.revokes, [], 'nothing may be revoked on a cluster the application does not use')
-      assert.ok(!client.log.includes('COMMIT'), 'and no transaction may commit')
-      assert.equal(existsSync(stateFile), false, 'and no record may be published for a fence that never happened')
-    } finally {
-      rmSync(dir, { recursive: true, force: true })
-    }
-  } finally {
-    restore()
-  }
-})
-
-test('an empty authority plus PGHOST moves the whole server, and that is refused rather than bound', () => {
-  // The same defect on the other axis. `postgres://role@/db` is the libpq form with no host at
-  // all; the parser reports '' and node-postgres then takes PGHOST. A fence bound on the parser's
-  // answer locks out this machine while the application is on another one entirely.
-  //
-  // MUTATION ROUTE: return the pg-connection-string parse from resolveDriverIdentity() and the
-  // host reads '' — which LOCAL_HOSTS treats as "(this host)" — so this binds to the local admin
-  // URL and fences the wrong machine.
-  const restore = withPgEnv({ PGHOST: 'remote.example' })
-  try {
-    const appUrl = 'postgres://imsapp@/imsdb'
-    assert.equal(driverParse(appUrl).host ?? '', '', 'precondition: the URL names no host')
-    const identity = parseConnectionIdentity(appUrl)
-    assert.equal(identity.host, 'remote.example')
-    assert.equal(identity.server, 'remote.example:5432')
-    const verdict = assessDatabaseIdentity({
-      ...ATTACHED_AS_ADMIN,
-      adminUrl: 'postgres://deployadmin@localhost:5432/imsdb',
-      appUrl,
-      connectedDatabase: 'imsdb',
-    })
-    assert.equal(verdict.bound, false)
-    assert.match(verdict.reason, /remote\.example/)
-  } finally {
-    restore()
-  }
-})
-
-test('PGDATABASE is where a path-less DATABASE_URL lands, and the live attachment still has to agree with it', () => {
-  // A URL with an empty path used to be refused as "names no database". That was a statement
-  // about the URL, not about the connection: node-postgres attaches to PGDATABASE, and failing
-  // that to the login role's own name. Both are now resolved, and both are then held against
-  // current_database() read from the connection this run actually opened — which is the half a
-  // URL cannot fake.
-  //
-  // MUTATION ROUTE: return the pg-connection-string parse from resolveDriverIdentity() and the
-  // first case reads no database at all, so the run reports "DATABASE_URL resolves to no
-  // database" about a URL that resolves perfectly well to onetwo3d_ims.
-  const restore = withPgEnv({ PGDATABASE: 'onetwo3d_ims' })
-  try {
-    assert.equal(parseConnectionIdentity('postgres://imsapp@localhost/').database, 'onetwo3d_ims')
-    assert.equal(
-      assessDatabaseIdentity({ ...ATTACHED_AS_ADMIN, adminUrl: 'postgres://deployadmin@localhost/onetwo3d_ims', appUrl: 'postgres://imsapp@localhost/', connectedDatabase: 'onetwo3d_ims' }).bound,
-      true,
-      'the connection is attached to the database the environment sends it to',
-    )
-    assert.equal(
-      assessDatabaseIdentity({ ...ATTACHED_AS_ADMIN, adminUrl: 'postgres://deployadmin@localhost/onetwo3d_ims', appUrl: 'postgres://imsapp@localhost/', connectedDatabase: 'imsdb' }).bound,
-      false,
-      'and a connection attached elsewhere is still refused',
-    )
-  } finally {
-    restore()
-  }
-  // With no PGDATABASE, libpq falls back to the login role's own name — so this URL identifies
-  // "imsapp", and a run attached to imsdb is not it.
-  assert.equal(parseConnectionIdentity('postgres://imsapp@localhost/').database, 'imsapp')
-  assert.equal(
-    assessDatabaseIdentity({ ...ATTACHED_AS_ADMIN, adminUrl: 'postgres://deployadmin@localhost/imsdb', appUrl: 'postgres://imsapp@localhost/', connectedDatabase: 'imsdb' }).bound,
-    false,
-  )
-})
-
-test('the deploy account\'s own OS user is not the application\'s login role, and is not mistaken for it', () => {
-  // PGHOST/PGPORT/PGUSER/PGDATABASE are deliberate settings this script and the application read
-  // from the same environment, which is why identity now resolves through them. pg's LAST
-  // fallback for the login role is not a setting at all — it is process.env.USER, the account
-  // running whichever process asked. This script runs as the deploy account and the application
-  // runs as its own, so taking one for the other would revoke CONNECT from a role nobody
-  // connects as and then report the door shut.
+test('the deploy account\'s own OS user is not a role the admin URL names, and is not mistaken for one', () => {
+  // PGHOST/PGPORT/PGUSER/PGDATABASE are deliberate settings for THIS process's own connection —
+  // the admin one — which is why its identity still resolves through them. pg's LAST fallback for
+  // the login role is not a setting at all: it is process.env.USER, the account running whichever
+  // process asked. Taking that for a role the admin URL names would make the identity gate's
+  // "the URL says X and the connection logged in as Y" arm compare a role nobody wrote down.
   //
   // MUTATION ROUTE: delete the OS_ACCOUNT_SENTINEL probe from resolveDriverIdentity() and return
   // client.user/client.database straight through. This test then reads back whatever account the
@@ -2023,15 +1925,16 @@ test('the deploy account\'s own OS user is not the application\'s login role, an
   // address, localhost and a unix socket are the same machine' starts being refused for naming a
   // role it never named — i.e. the suite's verdict starts depending on who runs it.
   assert.equal(driverConnection('postgresql://localhost/ims').user, String(pg.defaults.user), 'precondition: the driver does fall back to the OS account')
-  assert.equal(parseRoleFromConnectionString('postgresql://localhost/ims'), '', 'and no OS account is accepted as the application role')
+  assert.equal(parseRoleFromConnectionString('postgresql://localhost/ims'), '', 'and no OS account is accepted as a named role')
   assert.equal(parseConnectionIdentity('postgresql://localhost/').database, '', 'nor as the database libpq would derive from it')
+  // An admin URL that names no role at all is bound by `session_user` alone, read from the open
+  // connection — never by the account this script happens to run as.
   assert.equal(
-    assessDatabaseIdentity({ ...ATTACHED_AS_ADMIN, adminUrl: 'postgres://deployadmin@localhost/imsdb', appUrl: 'postgresql://localhost/', connectedDatabase: 'imsdb' }).bound,
-    false,
-    'so there is nothing to bind the run to',
+    assessDatabaseIdentity({ ...ATTACHED_AS_ADMIN, adminUrl: 'postgresql://localhost:5432/imsdb', app: suppliedIdentity({ appDatabase: 'imsdb' }), connectedDatabase: 'imsdb' }).bound,
+    true,
   )
 
-  // PGUSER, by contrast, IS deliberate shared configuration, and is honoured like the rest.
+  // PGUSER, by contrast, IS deliberate shared configuration for this process, and is honoured.
   const restore = withPgEnv({ PGUSER: 'configured' })
   try {
     assert.equal(parseRoleFromConnectionString('postgresql://localhost/ims'), 'configured')
@@ -2042,557 +1945,313 @@ test('the deploy account\'s own OS user is not the application\'s login role, an
 })
 
 // ---------------------------------------------------------------------------
-// o3d-2sm1.5 (Codex r17, CRITICAL + MEDIUM) — WHOSE ENVIRONMENT, AND WHOSE ACCOUNT.
+// o3d-2sm1.5 r19 — THE IDENTITY IS REQUIRED, NOT INFERRED.
 //
-// r16 moved identity onto the driver, and the driver reads PGHOST/PGPORT/PGUSER/PGDATABASE from
-// the environment OF WHICHEVER PROCESS ASKS. This one's is the deploy shell's; the application's
-// is systemd's `Environment=` plus the unit's `EnvironmentFile=`. So the more faithfully this
-// followed the driver, the more faithfully it followed the wrong environment — and a `PGPORT` in
-// an operator's shell, absent from the service file, moved the whole fence onto another cluster.
+// Seven rounds went into deciding WHERE THE APPLICATION CONNECTS by reconstructing what its
+// runtime resolves — this repo's reading of the URL, then the driver's string parser, then the
+// driver's real client in the deploy shell's environment, then the service's environment file,
+// then `systemctl show`. Each answer was locally correct and uncovered another layer; the review
+// of the last one named five more (PassEnvironment=, UnsetEnvironment=, wildcard EnvironmentFile=
+// globs, Next's per-mode dotenv overlays, a unit with no WorkingDirectory=, and DATABASE_URL's own
+// precedence chain). The blocker count went 1 -> 4 -> 5.
 //
-// The tests below are about the two halves of that: the environment the script resolves in, and
-// the OS account it is entitled to treat as the application's.
+// THE QUESTION HAS NO BOUNDED ANSWER, because the composition rules belong to systemd, Next and
+// libpq at once. So it is no longer asked: the four values arrive on argv and a run without them
+// refuses. These two tests are what that has to mean, and nothing else in the file can cover them:
+// a missing value refuses, and an ambient variable that DIFFERS from the supplied one is not
+// consulted at all.
 // ---------------------------------------------------------------------------
 
-/** Set or DELETE environment variables for the length of one test, and put back what was there. */
-function withEnv(values: Record<string, string | undefined>): () => void {
-  const previous = new Map<string, string | undefined>()
-  for (const [key, value] of Object.entries(values)) {
-    previous.set(key, process.env[key])
-    if (value === undefined) delete process.env[key]
-    else process.env[key] = value
-  }
-  return () => {
-    for (const [key, value] of previous) {
-      if (value === undefined) delete process.env[key]
-      else process.env[key] = value
-    }
-  }
-}
-
-/** A directory only this test can see, for stub binaries and stand-in environment files. */
-function scratch(): string {
-  return mkdtempSync(join(tmpdir(), 'ims-fence-systemd-'))
-}
-
-/** `readUnitEnvironment` against a stand-in systemd, with no process spawned. */
-function unitEnvironment(
-  properties: Record<string, string | undefined>,
-  overrides: Record<string, unknown> = {},
-) {
-  const stdout = Object.entries(properties)
-    .filter(([, value]) => value !== undefined)
-    .map(([key, value]) => `${key}=${value}`)
-    .join('\n')
-  return readUnitEnvironment(['one-two-inventory.service'], {
-    show: () => ({ ok: true, reason: '', stdout }),
-    readText: () => {
-      const error = new Error('ENOENT') as Error & { code?: string }
-      error.code = 'ENOENT'
-      throw error
-    },
-    appDir: '/opt/one-two-inventory',
-    realpath: (path: string) => path,
-    osAccount: 'imsapp',
-    ...overrides,
-  })
-}
-
-test('o3d-2sm1.5 r18: an ambient PG* that DIFFERS from what systemd reports never reaches the fence', () => {
-  // ROUTE: main() -> readUnitEnvironment(options.serviceUnits) -> `systemctl show <unit>` ->
-  // Environment= -> applyServiceEnvironment() -> process.env -> the `pg.Client`
-  // resolveDriverIdentity() builds -> parseConnectionIdentity() -> assessDatabaseIdentity(),
-  // which is what licenses the fence.
+test('o3d-2sm1.5 r19: a missing required value is a REFUSAL, in every mode, before anything is opened', () => {
+  // ROUTE: node scripts/fence-db-connections.mjs <mode> -> parseArgs() ->
+  // requireSuppliedIdentity() -> process.exit, ahead of every dotenv read, every pg.Client and
+  // every query.
   //
-  // MUTATION ROUTE: delete the `delete env[name]` loop from applyServiceEnvironment() (or the
-  // applyServiceEnvironment() call from main()). The ambient PGPORT below survives, the identity
-  // reads 6432 — the port this shell happens to carry — and the first assertion fails. Delete
-  // only the re-apply loop instead and the SECOND case fails: 6544 is neither the ambient value
-  // nor pg's static default, so it can only be there by having come from systemd.
-  const restore = withEnv({ PGPORT: '6432', PGHOST: 'deploy-shell.example', PGUSER: undefined, PGDATABASE: undefined })
-  try {
-    // PRECONDITION, MEASURED ON THE DRIVER: the ambient variables really do move the connection.
-    // Without this the test could pass against a driver that ignored them.
-    assert.equal(driverConnection('postgres://imsapp@localhost/imsdb').port, 6432, 'precondition: this shell\'s PGPORT reaches the driver')
-
-    const service = unitEnvironment({ LoadState: 'loaded', Environment: 'PGPORT=5432', WorkingDirectory: '', User: 'imsapp' })
-    assert.equal(service.ok, true, service.reason)
-    const applied = applyServiceEnvironment(service)
-    assert.deepEqual(applied.applied, ['PGPORT=5432'])
-    assert.ok(applied.removed.includes('PGPORT=6432'), 'this shell\'s copy is taken away, not merged with')
-    assert.ok(applied.removed.includes('PGHOST=deploy-shell.example'), 'and so is every other identity variable it carried')
-
-    const identity = parseConnectionIdentity('postgres://imsapp@localhost/imsdb')
-    assert.equal(identity.port, '5432', 'the fence resolves the port SYSTEMD reports, not the one this shell has')
-    assert.equal(identity.host, 'localhost', 'and a host this shell invented does not survive at all')
-  } finally {
-    restore()
-  }
-
-  // THE OTHER DIRECTION, which a mere `delete` would pass by accident: a value that is neither the
-  // ambient one nor pg's default has to be the answer.
-  const restoreOther = withEnv({ PGPORT: '6432', PGHOST: undefined, PGUSER: undefined, PGDATABASE: undefined })
-  try {
-    applyServiceEnvironment(unitEnvironment({ LoadState: 'loaded', Environment: 'PGPORT=6544', WorkingDirectory: '', User: 'imsapp' }))
-    assert.equal(parseConnectionIdentity('postgres://imsapp@localhost/imsdb').port, '6544')
-  } finally {
-    restoreOther()
-  }
-})
-
-test('o3d-2sm1.5 r18: systemd being unavailable is a REFUSAL, never a fallback to this shell\'s environment', () => {
-  // ROUTE: main() -> readUnitEnvironment() -> ok:false -> exit before any connection is opened.
-  //
-  // MUTATION ROUTE: make readUnitEnvironment() return `{ ok: true, values: {} }` on any of these
-  // (i.e. "systemd said nothing, so assume the service sets none"). Every assertion here fails,
-  // and the shipped script runs on the ambient environment — which is precisely the guess this
-  // refuses to make, since the answer it could not get is the only thing that could contradict it.
-
-  // 1. systemctl cannot be run at all.
-  const missing = readUnitEnvironment(['one-two-inventory.service'], {
-    show: () => ({ ok: false, reason: 'systemd cannot be asked: no systemctl at /usr/bin/systemctl', stdout: '' }),
-    appDir: '/opt/one-two-inventory',
-  })
-  assert.equal(missing.ok, false)
-  assert.match(missing.reason, /systemd cannot be asked/)
-
-  // 2. the unit is not there.
-  const notFound = unitEnvironment({ LoadState: 'not-found', Environment: '', WorkingDirectory: '', User: '' })
-  assert.equal(notFound.ok, false)
-  assert.match(notFound.reason, /LoadState=not-found, not loaded/)
-
-  // 3. systemd answered, and the answer cannot be parsed. `LoadState` is printed for every unit
-  //    that exists AND for every name that does not, so its ABSENCE is not an empty answer — it
-  //    is not systemd's answer at all.
-  const unparseable = unitEnvironment({ Environment: 'PGPORT=5432', WorkingDirectory: '', User: 'imsapp' })
-  assert.equal(unparseable.ok, false)
-  assert.match(unparseable.reason, /reported no LoadState/)
-
-  // 4. no unit was named, so there is nothing to ask about. This is the closed ambient override:
-  //    without --service-unit= there is no path back to the deleted variables.
-  const unnamed = readUnitEnvironment([], { appDir: '/opt/one-two-inventory' })
-  assert.equal(unnamed.ok, false)
-  assert.match(unnamed.reason, /will NOT fall back to its own shell's/)
-
-  // ...and the SHIPPED SCRIPT exits on it, with the code its callers read as "nothing was
-  // revoked", so a deploy aborts cleanly rather than proceeding unfenced. `null` here points
-  // --systemctl= at a path that does not exist.
-  const refused = runFenceScript(['--preflight'], {
+  // MUTATION ROUTE: make requireSuppliedIdentity() return `{ ok: true, identity }` when a value
+  // is blank — the "nothing was supplied, so use what is here" reading that seven rounds of this
+  // file kept re-deriving. Every assertion below fails: the modes stop refusing, and --preflight
+  // goes on to open a connection to a database nobody named.
+  const env = {
     DEPLOY_ADMIN_DATABASE_URL: 'postgresql://deployadmin@127.0.0.1:5432/ims',
     DATABASE_URL: 'postgresql://imsapp@127.0.0.1:5432/ims',
-  }, null)
-  assert.equal(refused.status, EXIT_NOT_FENCEABLE, refused.output)
-  assert.match(refused.output, /systemd could not be asked/)
-
-  // And so does a run that names no unit at all, with a working systemctl.
-  const unnamedRun = runFenceScript(['--preflight'], {
-    DEPLOY_ADMIN_DATABASE_URL: 'postgresql://deployadmin@127.0.0.1:5432/ims',
-    DATABASE_URL: 'postgresql://imsapp@127.0.0.1:5432/ims',
-  }, '', [])
-  assert.equal(unnamedRun.status, EXIT_NOT_FENCEABLE, unnamedRun.output)
-  assert.match(unnamedRun.output, /no --service-unit=<unit> was given/)
-})
-
-test('o3d-2sm1.5 r18: a file systemd will read is never PARSED here — a mention of the name is a refusal', () => {
-  // THE TRAP THIS ROUND CLOSES. `systemctl show -p Environment` reports the Environment=
-  // DIRECTIVES ONLY; systemd reads an EnvironmentFile when it FORKS the service and publishes
-  // nothing about what it made of it. r17's answer was to parse the file with dotenv, whose
-  // grammar is not systemd's: `PGUSER=ims#writer` is the role `ims` to dotenv and `ims#writer` to
-  // systemd, and both are legal. So the file is not parsed at all — it is asked the one question
-  // every grammar answers identically, and a mention is refused.
-  //
-  // MUTATION ROUTE: parse the file (with dotenv, or any grammar) and merge what it yields. The
-  // first case below returns ok with PGUSER=ims, the fence revokes CONNECT from a role the
-  // service does not use, and the assertion on `ok` fails.
-  const directory = scratch()
-  const withPg = join(directory, 'with-pg.env')
-  writeFileSync(withPg, 'DATABASE_URL=postgresql://ims@localhost/ims\nPGUSER=ims#writer\n')
-  const withoutPg = join(directory, 'plain.env')
-  writeFileSync(withoutPg, 'DATABASE_URL=postgresql://ims@localhost/ims\nNODE_ENV=production\n')
-
-  const readReal = (path: string) => readFileSync(path, 'utf8')
-  const mentions = unitEnvironment(
-    { LoadState: 'loaded', Environment: '', EnvironmentFiles: `${withPg} (ignore_errors=yes)`, WorkingDirectory: '', User: 'imsapp' },
-    { readText: readReal },
-  )
-  assert.equal(mentions.ok, false)
-  assert.match(mentions.reason, /that file mentions PGUSER/)
-  assert.match(mentions.reason, /will not reimplement its parsing/)
-
-  // A file that does not mention any of the four cannot set any of them under ANY grammar, so it
-  // is not a disagreement and not a refusal.
-  const clean = unitEnvironment(
-    { LoadState: 'loaded', Environment: '', EnvironmentFiles: `${withoutPg} (ignore_errors=yes)`, WorkingDirectory: '', User: 'imsapp' },
-    { readText: readReal },
-  )
-  assert.equal(clean.ok, true, clean.reason)
-  assert.deepEqual(clean.values, {})
-  assert.ok(clean.sources?.includes(`one-two-inventory.service:EnvironmentFile=${withoutPg}`))
-
-  // AN UNREADABLE FILE IS NOT AN EMPTY ONE (Codex r17 CRITICAL). systemd will read it; this
-  // cannot; "unreadable" is therefore not "sets none of them".
-  const unreadable = unitEnvironment(
-    { LoadState: 'loaded', Environment: '', EnvironmentFiles: `${join(directory, 'locked.env')} (ignore_errors=yes)`, WorkingDirectory: '', User: 'imsapp' },
-    { readText: () => { throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' }) } },
-  )
-  assert.equal(unreadable.ok, false)
-  assert.match(unreadable.reason, /systemd will read and this run cannot/)
-
-  // THE ONLY SKIP IS THE ONE SYSTEMD ITSELF MAKES: an `EnvironmentFile=-` whose file is absent.
-  const absentOptional = unitEnvironment({
-    LoadState: 'loaded',
-    Environment: '',
-    EnvironmentFiles: `${join(directory, 'gone.env')} (ignore_errors=yes)`,
-    WorkingDirectory: '',
-    User: 'imsapp',
-  })
-  assert.equal(absentOptional.ok, true, absentOptional.reason)
-
-  // ...but a REQUIRED file that is absent is a unit that cannot start, and a refusal here.
-  const absentRequired = unitEnvironment({
-    LoadState: 'loaded',
-    Environment: '',
-    EnvironmentFiles: `${join(directory, 'gone.env')} (ignore_errors=no)`,
-    WorkingDirectory: '',
-    User: 'imsapp',
-  })
-  assert.equal(absentRequired.ok, false)
-  assert.match(absentRequired.reason, /ENOENT/)
-
-  // AND THE APPLICATION'S OWN OVERLAY, which systemd never sees: Next loads .env.local inside the
-  // process, after exec, so no systemd property could ever report a PGHOST in it.
-  const overlay = readUnitEnvironment(['one-two-inventory.service'], {
-    show: () => ({ ok: true, reason: '', stdout: 'Environment=\nWorkingDirectory=\nUser=imsapp\nLoadState=loaded\n' }),
-    appDir: directory,
-    realpath: (path: string) => path,
-    osAccount: 'imsapp',
-    readText: (path: string) => (path === join(directory, '.env.local') ? 'PGHOST=elsewhere.example\n' : readReal(path)),
-  })
-  assert.equal(overlay.ok, false)
-  assert.match(overlay.reason, /\.env\.local mentions PGHOST/)
-  assert.match(overlay.reason, /the application loads that file itself/)
-})
-
-test('o3d-2sm1.5 r18: the unit must be THIS installation\'s, and two units may not disagree', () => {
-  // ROUTE: readUnitEnvironment() -> systemd's WorkingDirectory= for the named unit, against the
-  // directory this helper ships in. Being handed the wrong unit name is otherwise
-  // indistinguishable from being handed the right one, and the answer would be another
-  // installation's cluster — which is the wrong-environment failure in its purest form.
-  //
-  // MUTATION ROUTE: drop the WorkingDirectory comparison. The first case returns ok and hands the
-  // fence the OTHER installation's PGPORT.
-  const elsewhere = unitEnvironment({
-    LoadState: 'loaded',
-    Environment: 'PGPORT=6544',
-    WorkingDirectory: '/opt/some-other-install',
-    User: 'imsapp',
-  })
-  assert.equal(elsewhere.ok, false)
-  assert.match(elsewhere.reason, /WorkingDirectory=\/opt\/some-other-install/)
-  assert.match(elsewhere.reason, /serves a different installation/)
-
-  // The control: the unit that DOES serve this app dir is accepted.
-  const here = unitEnvironment({
-    LoadState: 'loaded',
-    Environment: 'PGPORT=6544',
-    WorkingDirectory: '/opt/one-two-inventory',
-    User: 'imsapp',
-  })
-  assert.equal(here.ok, true, here.reason)
-  assert.deepEqual(here.values, { PGPORT: '6544' })
-
-  // TWO UNITS SERVING ONE APP DIR — scripts/deploy.sh finds them by WorkingDirectory and both are
-  // writers into this database. Which cluster the fence is meant to close has no answer when they
-  // disagree, so it is refused rather than resolved to the first.
-  //
-  // MUTATION ROUTE: keep the first value and drop the disagreement check. This returns ok with
-  // PGPORT=5432 while the second unit is writing to 6432 — a fence proved against a cluster
-  // nobody chose.
-  const answers: Record<string, string> = {
-    'a.service': 'Environment=PGPORT=5432\nWorkingDirectory=\nUser=imsapp\nLoadState=loaded\n',
-    'b.service': 'Environment=PGPORT=6432\nWorkingDirectory=\nUser=imsapp\nLoadState=loaded\n',
-    'c.service': 'Environment=PGPORT=5432 PGHOST=db.example\nWorkingDirectory=\nUser=imsapp\nLoadState=loaded\n',
+    DIRECT_URL: '',
   }
-  const twoUnits = (units: string[]) =>
-    readUnitEnvironment(units, {
-      show: (unit: string) => ({ ok: true, reason: '', stdout: answers[unit] }),
-      readText: () => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }) },
-      appDir: '/opt/one-two-inventory',
-      realpath: (path: string) => path,
-      osAccount: 'imsapp',
-    })
-  const clash = twoUnits(['a.service', 'b.service'])
-  assert.equal(clash.ok, false)
-  assert.match(clash.reason, /a\.service sets PGPORT="5432" and b\.service sets PGPORT="6432"/)
 
-  // The control: units that AGREE are merged, and a variable only one of them sets is kept.
-  const agreeing = twoUnits(['a.service', 'c.service'])
-  assert.equal(agreeing.ok, true, agreeing.reason)
-  assert.deepEqual(agreeing.values, { PGPORT: '5432', PGHOST: 'db.example' })
+  // NOTHING SUPPLIED AT ALL. --preflight and --fence exit 3 (the code every entrypoint reads as
+  // "nothing was revoked", so a deploy aborts cleanly); --release and --print-migration-url exit 1.
+  for (const [mode, expected] of [
+    ['--preflight', EXIT_NOT_FENCEABLE],
+    ['--fence', EXIT_NOT_FENCEABLE],
+    ['--release', EXIT_ERROR],
+    ['--print-migration-url', EXIT_ERROR],
+  ] as [string, number][]) {
+    const refused = runFenceScript([mode], env, [])
+    assert.equal(refused.status, expected, `${mode}: ${refused.output}`)
+    assert.match(refused.output, /connection identity was not supplied/, `${mode} says why`)
+    assert.match(refused.output, /--app-host, --app-port, --app-user, --app-database/, `${mode} names all four`)
+  }
+
+  // AND THREE OF FOUR IS STILL NOTHING. Each option is dropped in turn, and the refusal names the
+  // one that is missing rather than the whole list.
+  for (const option of REQUIRED_IDENTITY_OPTIONS) {
+    const partial = identityArgs({ appDatabase: 'ims' }).filter((argument) => !argument.startsWith(`${option}=`))
+    assert.equal(partial.length, 3, `precondition: exactly ${option} was dropped`)
+    const refused = runFenceScript(['--preflight'], env, partial)
+    assert.equal(refused.status, EXIT_NOT_FENCEABLE, refused.output)
+    assert.ok(refused.output.includes(`${option} was not supplied`), `${option}: ${refused.output}`)
+  }
+
+  // A BLANK IS A MISSING VALUE, not a default — `--app-host=` is the shape an unset shell variable
+  // takes when a caller interpolates it into the command line.
+  const blank = runFenceScript(['--preflight'], env, ['--app-host=', '--app-port=5432', '--app-user=imsapp', '--app-database=ims'])
+  assert.equal(blank.status, EXIT_NOT_FENCEABLE, blank.output)
+  assert.match(blank.output, /--app-host was not supplied/)
+
+  // And a port that is not a port is refused too, because the server comparison is made on it.
+  const badPort = runFenceScript(['--preflight'], env, identityArgs({ appPort: 'five-four-three-two', appDatabase: 'ims' }))
+  assert.equal(badPort.status, EXIT_NOT_FENCEABLE, badPort.output)
+  assert.match(badPort.output, /is not a port number/)
 })
 
-test('o3d-2sm1.5 r18: systemd\'s own output format is read, and anything ambiguous in it is refused', () => {
-  // ROUTE: parseSystemdEnvironment() over `systemctl show -p Environment`'s serialized strv.
-  // THIS IS A PARSER OF SYSTEMD'S OUTPUT, not of systemd's EnvironmentFile semantics — a bounded
-  // grammar whose whole job is to be read back. What it cannot read unambiguously it throws on,
-  // and main() turns that into the same refusal as "systemd could not be asked".
+test('o3d-2sm1.5 r19: an ambient PG* that DIFFERS from the supplied value is not consulted at all', () => {
+  // THE OTHER HALF, AND THE ONE THAT USED TO NEED SYSTEMD. `pg` fills PGHOST, PGPORT, PGUSER and
+  // PGDATABASE in for everything a connection string omits — so for seven rounds this file tried
+  // to establish WHOSE environment those came from. Now nothing reads them on the application's
+  // behalf: the four supplied values are the answer, and an ambient variable naming something
+  // else changes nothing.
   //
-  // MUTATION ROUTE: replace the body with `value.split(' ')`. The quoted case below loses
-  // everything after the space in the value, so a PGDATABASE of `ims prod` silently becomes `ims`
-  // and the fence closes a database nobody named; the assertion on it fails.
-  assert.deepEqual(
-    [...parseSystemdEnvironment('NODE_ENV=production PGPORT=5432')],
-    [['NODE_ENV', 'production'], ['PGPORT', '5432']],
-  )
-  assert.deepEqual([...parseSystemdEnvironment('"PGDATABASE=ims prod"')], [['PGDATABASE', 'ims prod']])
-  assert.deepEqual([...parseSystemdEnvironment('"PGUSER=ims\\"writer"')], [['PGUSER', 'ims"writer']])
-  assert.deepEqual([...parseSystemdEnvironment('PGUSER=a\\tb')], [['PGUSER', 'a\tb']])
-  assert.deepEqual([...parseSystemdEnvironment('PGUSER=a\\x41b')], [['PGUSER', 'aAb']])
-  assert.deepEqual([...parseSystemdEnvironment('')], [])
-
-  assert.throws(() => parseSystemdEnvironment('"PGUSER=unterminated'), /unterminated quote/)
-  assert.throws(() => parseSystemdEnvironment('PGUSER=trailing\\'), /lone backslash/)
-  assert.throws(() => parseSystemdEnvironment('PGUSER=bad\\q'), /escape this cannot read/)
-  assert.throws(() => parseSystemdEnvironment('PGUSER=bad\\xZZ'), /malformed \\x escape/)
-  assert.throws(() => parseSystemdEnvironment('NOT_AN_ASSIGNMENT'), /not NAME=VALUE/)
-
-  // ...and an unreadable Environment= is a refusal, not an empty environment.
-  const ambiguous = unitEnvironment({ LoadState: 'loaded', Environment: '"PGUSER=oops', WorkingDirectory: '', User: 'imsapp' })
-  assert.equal(ambiguous.ok, false)
-  assert.match(ambiguous.reason, /unterminated quote/)
-  assert.match(ambiguous.reason, /could not be parsed/)
-
-  // EnvironmentFiles= is systemd's format too, and an entry this cannot even NAME is a file it
-  // cannot rule out.
-  assert.deepEqual(parseSystemdEnvironmentFiles('/a/.env (ignore_errors=yes)\n/b/.env (ignore_errors=no)'), [
-    { path: '/a/.env', ignoreErrors: true },
-    { path: '/b/.env', ignoreErrors: false },
-  ])
-  assert.deepEqual(parseSystemdEnvironmentFiles(undefined), [])
-  assert.throws(() => parseSystemdEnvironmentFiles('/a/.env'), /EnvironmentFiles entry this cannot read/)
-
-  // `systemctl show` prints an EMPTY property but OMITS one that does not apply — measured against
-  // this host's real units. Both readings matter: the empty one is an answer, the absent one is not.
-  const properties = parseSystemctlShow('Environment=\nWorkingDirectory=/opt/x\nLoadState=loaded\n')
-  assert.equal(properties.get('Environment'), '')
-  assert.equal(properties.has('EnvironmentFiles'), false)
-  assert.equal(properties.get('WorkingDirectory'), '/opt/x')
-})
-
-test('o3d-2sm1.5 r18: the OS account is the application\'s when SYSTEMD says the unit runs as it', () => {
-  // r16 subtracted EVERY OS-account fallback, on the grounds that this script runs as the deploy
-  // account. In the supported installation it does not: deploy.sh, update.sh and install.sh all
-  // run this helper through `runuser -u ${APP_USER}`, and the generated unit runs `User=${APP_USER}`.
-  // r17 established that by OWNERSHIP of a file; r18 asks systemd, which states it outright.
+  // ROUTE: the environment -> (nowhere) ; --app-* -> requireSuppliedIdentity() -> the identity
+  // assessDatabaseIdentity() compares the admin connection against.
   //
-  // ROUTE: readUnitEnvironment() -> systemd's `User=` vs processOsAccount() -> runsAsServiceAccount
-  // -> applyServiceEnvironment() writes PGUSER -> the driver resolves the login role as a SETTING
-  // -> the OS_ACCOUNT_SENTINEL probe in resolveDriverIdentity() has nothing to catch.
-  //
-  // MUTATION ROUTE: drop the `runsAsServiceAccount && osAccount` arm from applyServiceEnvironment()
-  // and the first assertion returns to '' — the r16 behaviour, i.e. the finding. Drop the
-  // `runsAsServiceAccount` CONDITION instead and the second fails: the deploy account's identity
-  // is then accepted as the application's, which is what the sentinel exists to stop.
-  const restore = withEnv({ PGUSER: undefined, PGHOST: undefined, PGPORT: undefined, PGDATABASE: undefined })
+  // MUTATION ROUTE: make assessDatabaseIdentity() fall back to `parseConnectionIdentity(appUrl)`
+  // when a supplied value is absent, or reintroduce any read of process.env for the application's
+  // identity. Every assertion below flips: the supplied port stops winning, and the deliberately
+  // hostile PGHOST/PGPORT/PGDATABASE start deciding what the fence is about.
+  const restore = withPgEnv({ PGHOST: 'remote.example', PGPORT: '6432', PGUSER: 'ambient', PGDATABASE: 'ambient_db' })
   try {
-    const account = processOsAccount()
-    assert.notEqual(account, '', 'precondition: this process has an OS account both ways of asking agree on')
-    assert.equal(driverConnection('postgresql://localhost/ims').user, account, 'precondition: the driver falls back to it')
+    // PRECONDITION, MEASURED ON THE DRIVER: these really do move a connection, so the test is not
+    // passing against variables that were never capable of doing anything.
+    const moved = driverConnection('postgres://imsapp@localhost/imsdb')
+    assert.equal(moved.port, 6432, 'precondition: this shell\'s PGPORT reaches the driver')
+    assert.equal(driverConnection('postgres://@/').host, 'remote.example', 'precondition: and its PGHOST')
+    assert.equal(driverConnection('postgres://@/').database, 'ambient_db', 'precondition: and its PGDATABASE')
 
-    const runsAsIt = unitEnvironment({ LoadState: 'loaded', Environment: '', WorkingDirectory: '', User: account }, { osAccount: account })
-    assert.equal(runsAsIt.runsAsServiceAccount, true, 'systemd says the unit runs as this process\'s account')
-    applyServiceEnvironment(runsAsIt)
+    // THE SUPPLIED VALUE WINS, and the ambient one is nowhere in the answer.
+    const supplied = requireSuppliedIdentity(suppliedIdentity({ appDatabase: 'imsdb' }))
+    assert.equal(supplied.ok, true, supplied.reason)
+    assert.deepEqual(supplied.identity, { host: 'localhost', port: '5432', user: 'imsapp', database: 'imsdb' })
+
+    // AND THE GATE IS DECIDED ON IT. The admin URL is on localhost:5432/imsdb — which agrees with
+    // what the caller supplied and disagrees with every ambient variable in scope.
     assert.equal(
-      parseConnectionIdentity('postgresql://localhost/ims').user,
-      account,
-      'the account systemd says the service runs as is the application\'s login role, not an anonymous fallback',
+      assessDatabaseIdentity({
+        ...ATTACHED_AS_ADMIN,
+        adminUrl: 'postgres://deployadmin@localhost:5432/imsdb',
+        app: suppliedIdentity({ appDatabase: 'imsdb' }),
+        connectedDatabase: 'imsdb',
+      }).bound,
+      true,
+      'the environment says remote.example:6432/ambient_db, and it is not asked',
     )
-    assert.equal(parseConnectionIdentity('postgresql://localhost/').database, account, 'and the database libpq derives from it is identified too')
 
-    // A DIFFERENT ACCOUNT: a deploy running as root against a unit with `User=imsapp` gets the
-    // r16 answer, because nothing here can show the two are the same identity.
-    delete process.env.PGUSER
-    const runsAsOther = unitEnvironment({ LoadState: 'loaded', Environment: '', WorkingDirectory: '', User: 'someone-else' }, { osAccount: account })
-    assert.equal(runsAsOther.runsAsServiceAccount, false)
-    applyServiceEnvironment(runsAsOther)
-    assert.equal(process.env.PGUSER, undefined, 'nothing is asserted about an account this run cannot show is the application\'s')
-    assert.equal(parseConnectionIdentity('postgresql://localhost/ims').user, '', 'so the fallback stays unidentified, and unidentified is refused')
+    // THE CONVERSE, so this cannot pass by ignoring the supplied values too: supply what the
+    // ENVIRONMENT says and the same admin URL is refused. Only the supplied values moved.
+    const followed = assessDatabaseIdentity({
+      ...ATTACHED_AS_ADMIN,
+      adminUrl: 'postgres://deployadmin@localhost:5432/imsdb',
+      app: suppliedIdentity({ appHost: 'remote.example', appPort: '6432', appDatabase: 'imsdb' }),
+      connectedDatabase: 'imsdb',
+    })
+    assert.equal(followed.bound, false)
+    assert.match(followed.reason, /remote\.example:6432/)
 
-    // A UNIT THAT NAMES THE ROLE OUTRIGHT WINS OVER BOTH: it is a deliberate setting.
-    delete process.env.PGUSER
-    applyServiceEnvironment(unitEnvironment({ LoadState: 'loaded', Environment: 'PGUSER=imsapp', WorkingDirectory: '', User: account }, { osAccount: account }))
-    assert.equal(parseConnectionIdentity('postgresql://localhost/ims').user, 'imsapp')
+    // AND A MISSING VALUE IS NOT FILLED IN FROM DATABASE_URL EITHER — the fallback that would make
+    // "required" mean "preferred". The URL below would bind PERFECTLY if anything still read it,
+    // which is what makes this assertion capable of failing.
+    //
+    // MUTATION ROUTE: add `if (!supplied.ok) supplied = parseConnectionIdentity(process.env.DATABASE_URL)`
+    // to assessDatabaseIdentity() — the shape seven rounds of this file kept re-deriving — and
+    // these two assertions fail while everything else in the suite still passes.
+    const previousUrl = process.env.DATABASE_URL
+    process.env.DATABASE_URL = 'postgres://imsapp@localhost:5432/imsdb'
+    try {
+      assert.equal(
+        parseConnectionIdentity(process.env.DATABASE_URL).database,
+        'imsdb',
+        'precondition: this URL resolves to exactly what the gate below would need',
+      )
+      const partial = assessDatabaseIdentity({
+        ...ATTACHED_AS_ADMIN,
+        adminUrl: 'postgres://deployadmin@localhost:5432/imsdb',
+        app: suppliedIdentity({ appDatabase: '' }),
+        connectedDatabase: 'imsdb',
+      })
+      assert.equal(partial.bound, false, 'a value nobody supplied is refused, never taken from DATABASE_URL')
+      assert.ok(partial.reason.includes('--app-database was not supplied'))
+    } finally {
+      if (previousUrl === undefined) delete process.env.DATABASE_URL
+      else process.env.DATABASE_URL = previousUrl
+    }
   } finally {
     restore()
   }
-})
 
-test('processOsAccount refuses an account the passwd entry and the environment disagree about', () => {
-  // pg's fallback is `process.env.USER`, which is inheritable and can be stale or set by hand;
-  // `userInfo()` reads the passwd entry for the effective uid, which cannot. Only an agreement
-  // is an identity.
+  // END TO END, IN THE SHIPPED SCRIPT: --print-migration-url derives the role the migration RUNS
+  // AS. A hostile PGUSER in this shell, and a DATABASE_URL naming no role at all, used to decide
+  // it; the supplied --app-user does now.
   //
-  // MUTATION ROUTE: return the passwd name (or the driver default) unconditionally. The second
-  // assertion fails, and with it the account test above starts vouching for whatever name the
-  // calling shell put in USER.
-  assert.equal(processOsAccount({ userInfo: () => ({ username: 'imsapp' }), driverDefaultUser: 'imsapp' }), 'imsapp')
-  assert.equal(processOsAccount({ userInfo: () => ({ username: 'imsapp' }), driverDefaultUser: 'root' }), '')
-  assert.equal(processOsAccount({ userInfo: () => ({ username: 'imsapp' }), driverDefaultUser: '' }), '')
-})
-
-test('o3d-2sm1.5 r18: the shipped script runs on the environment SYSTEMD reports, end to end', () => {
-  // THE WHOLE PROCESS, not a function: `--print-migration-url` derives the role the migration runs
-  // as from DATABASE_URL, and a URL naming no role falls through to PGUSER. So the ambient
-  // environment and systemd's answer are made to disagree about PGUSER, and the emitted URL says
-  // which one won.
-  //
-  // ROUTE: node scripts/fence-db-connections.mjs --print-migration-url --service-unit=... ->
-  // main()'s readUnitEnvironment/applyServiceEnvironment -> parseRoleFromConnectionString(DATABASE_URL)
-  // -> buildMigrationConnectionString() -> `options=-c role=...` on stdout.
-  //
-  // MUTATION ROUTE: remove the applyServiceEnvironment() call from main(). The emitted URL becomes
-  // `-c role=deployrole` — this shell's variable deciding what the migration runs as, on a box
-  // where the service has never heard of that role.
+  // MUTATION ROUTE: put `parseRoleFromConnectionString(process.env.DATABASE_URL)` back in front of
+  // `options.appUser` in main(). The emitted URL becomes `-c role=deployrole` — this shell's
+  // variable deciding what the migration runs as, on a box where the service has never heard of
+  // that role — and the last three assertions fail.
   const result = runFenceScript(['--print-migration-url'], {
     DEPLOY_ADMIN_DATABASE_URL: 'postgresql://deployadmin@127.0.0.1:5432/ims',
     DATABASE_URL: 'postgresql://127.0.0.1:5432/ims',
     PGUSER: 'deployrole',
     DIRECT_URL: '',
-  }, 'PGUSER=imsapp')
+  })
   assert.equal(result.status, 0, result.output)
   const emitted = result.stdout.trim().split('\n').at(-1) ?? ''
   assert.match(emitted, /^postgresql:\/\//, 'the last line is the URL the deploy captures')
-  assert.match(emitted, /options=-c\+role%3Dimsapp|options=-c%20role%3Dimsapp/, 'the migration runs as the role SYSTEMD names')
+  assert.match(emitted, /options=-c\+role%3Dimsapp|options=-c%20role%3Dimsapp/, 'the migration runs as the SUPPLIED role')
   assert.doesNotMatch(emitted, /deployrole/, 'and this shell\'s PGUSER reaches nothing the migration runs through')
-  assert.match(result.stderr, /Ignoring this shell's PGUSER=deployrole/, 'and it says so out loud, on stderr')
-  assert.doesNotMatch(result.stdout, /Ignoring/, 'stdout carries the URL and nothing else: the deploy captures it with $(...)')
+  assert.doesNotMatch(result.stdout, /supplied by the caller/, 'stdout carries the URL and nothing else: the deploy captures it with $(...)')
+  assert.match(result.stderr, /as supplied by the caller/, 'and the diagnostic goes to stderr')
 })
 
-test('o3d-2sm1.5 r18: everything the script reads is resolved from the SCRIPT, not the working directory', () => {
-  // The `--release` command the callers print is a bare absolute `node /opt/.../fence-db-connections.mjs`
-  // meant to be runnable by an operator from wherever they are standing, and the deploy scripts
-  // `cd` to the app directory for reasons of their own. main() loaded `.env.local` and `.env`
-  // RELATIVE, so from any other directory that command loaded no DATABASE_URL, no DIRECT_URL and
-  // no DEPLOY_ADMIN_DATABASE_URL — the one command offered for taking a committed fence down could
-  // not obtain the connection that takes it down (Codex r17 HIGH).
+test('o3d-2sm1.5 r19: --release will not read "the application can connect" off another cluster', () => {
+  // A DATABASE NAME IS NOT AN IDENTITY. `imsdb` exists on the staging server too, and
+  // DATABASE_URL is the one string this helper still OPENS — as a credential, through whatever
+  // environment this process happens to have. So the probe is asked where it went:
+  // pg_postmaster_start_time() is the same microsecond stamp on every backend of one postmaster
+  // and a different one on any other.
   //
-  // MUTATION ROUTE: put the relative paths back in main(). The end-to-end case below runs from a
-  // temporary directory with a DECOY .env in it and no DATABASE_URL in its own environment; with
-  // relative loading it reads the decoy and emits the decoy's role, and the assertions fail.
-  assert.equal(appDirectory('file:///opt/one-two-inventory/scripts/fence-db-connections.mjs'), '/opt/one-two-inventory')
-  assert.deepEqual(applicationDotenvPaths('/opt/one-two-inventory'), [
-    '/opt/one-two-inventory/.env.local',
-    '/opt/one-two-inventory/.env.production.local',
-    '/opt/one-two-inventory/.env.production',
-    '/opt/one-two-inventory/.env',
-  ])
-  assert.deepEqual(IDENTITY_ENVIRONMENT_VARIABLES, ['PGHOST', 'PGPORT', 'PGUSER', 'PGDATABASE'])
-  assert.deepEqual(UNIT_PROPERTIES, ['LoadState', 'Environment', 'EnvironmentFiles', 'WorkingDirectory', 'User', 'FragmentPath'])
+  // ROUTE: doRelease() -> the attachment query's connected_postmaster -> releaseWithoutRecord()
+  // -> assessUnrecordedRelease()'s postmaster arm.
+  //
+  // MUTATION ROUTE: delete that arm and this returns EXIT_FENCE_UNPROVEN (4) — which the callers
+  // treat as "the application role holds CONNECT", about a cluster this run has never touched.
+  return (async () => {
+    const client = new FakeAdminClient({ stillConnectsBefore: true, connectedDatabase: 'imsdb', postmaster: '2026-08-01 10:00:00.123456+00' })
+    const elsewhere = await withAdminUrl(() =>
+      doRelease(client as never, {
+        stateFile: '',
+        appRole: '',
+        timeoutSeconds: 1,
+        ...suppliedIdentity({ appDatabase: 'imsdb' }),
+        probeApplication: async () => ({ attempted: true, connected: true, database: 'imsdb', postmaster: '2026-07-14 09:30:00.654321+00', error: '' }),
+      } as never),
+    )
+    assert.equal(elsewhere, EXIT_ERROR, 'two postmasters are two clusters, whatever their databases are called')
+    assert.deepEqual(client.grants, [], 'and nothing is restored on the strength of it')
 
-  // systemctl is found at an absolute path rather than through the inherited PATH, so the shell
-  // that ran this cannot decide what answers for systemd.
-  assert.ok(SYSTEMCTL_PATHS.every((path) => path.startsWith('/')), 'every candidate is absolute')
-  assert.equal(findSystemctl(['/nonexistent/systemctl'], { exists: () => false }), '')
-  assert.equal(findSystemctl(['/a/systemctl', '/b/systemctl'], { exists: (path: string) => path === '/b/systemctl' }), '/b/systemctl')
-
-  // AND END TO END, from a directory that is not the app dir and holds a DECOY .env.
-  const elsewhere = mkdtempSync(join(tmpdir(), 'ims-fence-cwd-'))
-  writeFileSync(join(elsewhere, '.env'), 'DATABASE_URL=postgresql://decoyrole@127.0.0.1:5432/decoy\n')
-  const systemctl = stubSystemctl(elsewhere, { Environment: '' })
-  const run = spawnSync(
-    'node',
-    [
-      join(process.cwd(), 'scripts/fence-db-connections.mjs'),
-      '--print-migration-url',
-      '--service-unit=one-two-inventory.service',
-      `--systemctl=${systemctl}`,
-    ],
-    {
-      encoding: 'utf8',
-      cwd: elsewhere,
-      env: {
-        ...process.env,
-        DATABASE_URL: undefined,
-        DIRECT_URL: undefined,
-        DEPLOY_ADMIN_DATABASE_URL: 'postgresql://deployadmin@127.0.0.1:5432/ims',
-        PGUSER: undefined,
-        PGHOST: undefined,
-        PGPORT: undefined,
-        PGDATABASE: undefined,
-      } as NodeJS.ProcessEnv,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    },
-  )
-  const output = `${run.stdout ?? ''}${run.stderr ?? ''}`
-  assert.doesNotMatch(output, /decoyrole|decoy/, 'the .env sitting in the working directory is not read')
-
-  // The DATABASE_URL it did find is the app dir's own — which is what makes the printed release
-  // command work from an unrelated directory. Its role is whatever this checkout's .env names, so
-  // the assertion is that a role was found at all rather than that it is a particular one.
-  const repoRole = parseRoleFromConnectionString(
-    (readFileSync(join(process.cwd(), '.env'), 'utf8').match(/^DATABASE_URL=(.*)$/m)?.[1] ?? '').replace(/^["']|["']$/g, ''),
-  )
-  if (repoRole) {
-    assert.equal(run.status, 0, output)
-    assert.match(output, new RegExp(`role%3D${repoRole}`), 'the role comes from the APP DIR\'s .env, from any working directory')
-  } else {
-    assert.notEqual(run.status, 0, 'no DATABASE_URL anywhere means a refusal, not a silent read of the local decoy')
-  }
+    // THE CONTROL: the same shapes with ONE postmaster still reach the r12 verdict, so this is
+    // not a check that refuses everything.
+    const sameCluster = new FakeAdminClient({ stillConnectsBefore: true, connectedDatabase: 'imsdb', postmaster: '2026-08-01 10:00:00.123456+00' })
+    const together = await withAdminUrl(() =>
+      doRelease(sameCluster as never, {
+        stateFile: '',
+        appRole: '',
+        timeoutSeconds: 1,
+        ...suppliedIdentity({ appDatabase: 'imsdb' }),
+        probeApplication: async () => ({ attempted: true, connected: true, database: 'imsdb', postmaster: '2026-08-01 10:00:00.123456+00', error: '' }),
+      } as never),
+    )
+    assert.equal(together, EXIT_FENCE_UNPROVEN, 'one cluster, and still not a released fence')
+  })()
 })
 
-test('o3d-2sm1.5 r18: every entrypoint names the unit it already addresses the service by', () => {
-  // ROUTE: scripts/{deploy,update,install}.sh -> `--service-unit=` on every fence invocation ->
-  // parseArgs().serviceUnits -> readUnitEnvironment(). The unit name is NOT hardcoded in the
-  // helper and NOT read from its environment; each script passes the name it already stops,
-  // drains and restarts the service by.
+test('o3d-2sm1.5 r19: every entrypoint supplies the four values, and refuses when it cannot read them', () => {
+  // The helper refuses without them; this is the other half — that the shipped callers actually
+  // pass them, and that each one says plainly where it got them and what it does when it cannot.
   //
-  // MUTATION ROUTE: drop `"${DB_FENCE_UNIT_ARG}"` from any one invocation in update.sh or
-  // install.sh, or `"${DB_FENCE_UNIT_ARGS[@]:-}"` from any in deploy.sh. That invocation refuses
-  // at run time with "no --service-unit=<unit> was given", and the count assertion here fails by
-  // name before it ever gets that far.
-  const scripts = Object.fromEntries(
-    ['deploy.sh', 'update.sh', 'install.sh'].map((name) => [name, readFileSync(join(process.cwd(), 'scripts', name), 'utf8')]),
-  )
+  // MUTATION ROUTE: drop `${DB_FENCE_IDENTITY_ARGS[@]:-}` from any invocation, or delete a
+  // `require_db_identity ||` refusal, and the matching assertion fails by name.
+  const deploy = readFileSync(join(process.cwd(), 'scripts/deploy.sh'), 'utf8')
+  const update = readFileSync(join(process.cwd(), 'scripts/update.sh'), 'utf8')
+  const install = readFileSync(join(process.cwd(), 'scripts/install.sh'), 'utf8')
 
-  // deploy.sh finds its units by WorkingDirectory (or IMS_SERVICE_UNIT) and may find more than one.
-  assert.match(scripts['deploy.sh'], /DB_FENCE_UNIT_ARGS\+=\("--service-unit=\$\{unit\}"\)/)
-  // update.sh and install.sh each address exactly one unit, and each takes the name from the
-  // variable it already uses for `systemctl stop`.
-  assert.match(scripts['update.sh'], /DB_FENCE_UNIT_ARG="--service-unit=\$\{SERVICE_UNIT\}"/)
-  assert.match(scripts['install.sh'], /DB_FENCE_UNIT_ARG="--service-unit=\$\{APP_NAME\}\.service"/)
-
-  // EVERY invocation carries it — this is the sweep, so a mode added later cannot quietly omit it.
-  for (const [name, source] of Object.entries(scripts)) {
-    const invocations = source.match(/node "\$\{?DB_FENCE_SCRIPT\}?" --\S+/g) ?? []
-    assert.ok(invocations.length >= 4, `${name}: expected every fence mode to be invoked, found ${invocations.length}`)
-    const lines = source.split('\n').filter((line) => /node "\$\{?DB_FENCE_SCRIPT\}?" --/.test(line))
-    for (const line of lines) {
-      assert.match(line, /DB_FENCE_UNIT_ARGS?\[?/, `${name}: this invocation names no unit: ${line.trim()}`)
+  for (const [name, source] of [['deploy.sh', deploy], ['update.sh', update], ['install.sh', install]] as const) {
+    // EVERY invocation of the helper carries the identity — not just the one a test happened to
+    // look at. A mode added later without it would otherwise reintroduce the whole finding.
+    const invocations = source.split('\n').filter((line) => line.includes('"${DB_FENCE_SCRIPT}"') || line.includes('"$DB_FENCE_SCRIPT"'))
+    const modes = invocations.filter((line) => /--(fence|release|preflight|print-migration-url)\b/.test(line))
+    assert.ok(modes.length >= 4, `${name}: precondition — the helper is actually invoked here (${modes.length})`)
+    for (const line of modes) {
+      assert.ok(line.includes('DB_FENCE_IDENTITY_ARGS[@]'), `${name}: every invocation passes the identity — ${line.trim()}`)
     }
+    // AND NOTHING NAMES A UNIT ANY MORE: the systemd interrogation is gone, not merely unused.
+    assert.ok(!source.includes('--service-unit'), `${name}: no unit is interrogated`)
+    assert.ok(!source.includes('--systemctl='), `${name}: and no systemctl path is passed`)
+    // AND A CALLER THAT CANNOT DETERMINE A VALUE REFUSES rather than defaulting.
+    assert.ok(source.includes('require_db_identity ||'), `${name}: refuses when the four are not known`)
   }
 
-  // AND THE PRINTED RELEASE COMMAND CARRIES IT TOO, or the operator's copy of it refuses.
-  assert.match(scripts['update.sh'], /DB_FENCE_RELEASE_CMD="node \$\{DB_FENCE_SCRIPT\} --release --state-file=\$\{DB_FENCE_STATE\} \$\{DB_FENCE_UNIT_ARG\}"/)
-  assert.match(scripts['install.sh'], /DB_FENCE_RELEASE_CMD="node \$\{DB_FENCE_SCRIPT\} --release --state-file=\$\{DB_FENCE_STATE\} \$\{DB_FENCE_UNIT_ARG\}"/)
-  assert.match(scripts['deploy.sh'], /db_fence_release_cmd\(\)/)
-
-  // parseArgs takes the flag more than once, because deploy.sh may pass more than one unit.
-  assert.deepEqual(parseArgs(['--fence', '--service-unit=a.service', '--service-unit=b.service']).serviceUnits, ['a.service', 'b.service'])
-  assert.deepEqual(parseArgs(['--fence']).serviceUnits, [])
-  assert.equal(parseArgs(['--release', '--systemctl=/x/systemctl']).systemctlPath, '/x/systemctl')
+  // WHERE EACH ONE GETS THEM, stated in the source and asserted here so the answer cannot drift:
+  // install.sh OWNS the values (it created the role and the database with them), and the other
+  // two split DATABASE_URL with a reader that refuses any URL not stating all four.
+  assert.match(install, /--app-host=\$\{DB_HOST\}/, 'install.sh passes the variables it created the database with')
+  assert.match(install, /--app-database=\$\{DB_NAME\}/)
+  assert.ok(!install.includes('resolve_db_identity'), 'and parses nothing at all')
+  for (const [name, source] of [['deploy.sh', deploy], ['update.sh', update]] as const) {
+    assert.ok(source.includes('resolve_db_identity '), `${name}: reads DATABASE_URL through the strict reader`)
+    assert.match(source, /DB_IDENTITY_REASON="DATABASE_URL states no port/, `${name}: and refuses a URL that does not state the port`)
+    assert.match(source, /host\|port\|user\|dbname\|database\)/, `${name}: and one that restates any of the four in its query string`)
+  }
 })
 
-test('o3d-2sm1.5 r18: a mention is decided on the NAME alone, under every grammar', () => {
-  // The one question dotenv, systemd, sh and a hand-written parser all answer the same way. It is
-  // deliberately BROADER than "assigns it": over-reporting costs a refusal with an instruction,
-  // under-reporting costs a fence on the wrong cluster.
+test('o3d-2sm1.5 r19: the strict reader in the entrypoints accepts only a URL stating all four', () => {
+  // THE CALLERS' HALF, EXECUTED rather than read. resolve_db_identity() is lifted straight out of
+  // the shipped update.sh and run by bash, so what is asserted is the code that ships.
   //
-  // MUTATION ROUTE: narrow it to /^\s*PGUSER=/m (i.e. "assigns it"). The commented and prefixed
-  // cases below stop being reported, and with them every spelling of an assignment whose grammar
-  // this module has decided not to reproduce.
-  assert.equal(mentionedIdentityVariable('DATABASE_URL=postgres://x\nNODE_ENV=production\n'), '')
-  assert.equal(mentionedIdentityVariable('PGUSER=ims#writer\n'), 'PGUSER')
-  assert.equal(mentionedIdentityVariable('# PGUSER is deliberately unset\n'), 'PGUSER')
-  assert.equal(mentionedIdentityVariable('MY_PGHOST=x\n'), 'PGHOST')
-  assert.equal(mentionedIdentityVariable('PGPORT=5432\nPGHOST=a\n'), 'PGHOST', 'the first in IDENTITY_ENVIRONMENT_VARIABLES order')
+  // MUTATION ROUTE: delete any refusal arm from resolve_db_identity() (the port check, the query
+  // scan, the percent check) and the matching case below starts being ACCEPTED — which is a fence
+  // pointed at whatever PGHOST/PGPORT/PGDATABASE happen to say in whichever process resolves it.
+  const source = readFileSync(join(process.cwd(), 'scripts/update.sh'), 'utf8')
+  const reader = source.slice(source.indexOf('resolve_db_identity() {'), source.indexOf('\n}\n', source.indexOf('resolve_db_identity() {')) + 3)
+  assert.ok(reader.includes('DB_FENCE_IDENTITY_ARGS=('), 'precondition: the whole function was lifted')
+
+  function read(url: string) {
+    const script = [
+      'set -uo pipefail',
+      'DB_IDENTITY_HOST=""; DB_IDENTITY_PORT=""; DB_IDENTITY_USER=""; DB_IDENTITY_DATABASE=""; DB_IDENTITY_REASON=""; DB_FENCE_IDENTITY_ARGS=()',
+      reader,
+      'if resolve_db_identity "$1"; then printf "OK %s\\n" "${DB_FENCE_IDENTITY_ARGS[*]}"; else printf "REFUSE %s\\n" "$DB_IDENTITY_REASON"; fi',
+    ].join('\n')
+    const run = spawnSync('bash', ['-c', script, 'reader', url], { encoding: 'utf8' })
+    assert.equal(run.status, 0, run.stderr)
+    return (run.stdout ?? '').trim()
+  }
+
+  // THE SHAPE EVERY SHIPPED .env HAS, and the one install.sh composes.
+  assert.equal(
+    read('postgresql://imsuser:secret@localhost:5432/one_two_inventory'),
+    'OK --app-host=localhost --app-port=5432 --app-user=imsuser --app-database=one_two_inventory',
+  )
+  // A password containing '@' still works: the userinfo ends at the LAST '@', which is the rule
+  // both WHATWG URL and node-postgres follow. A reader that refused this would get switched off.
+  assert.match(read('postgresql://imsuser:p@ss@localhost:5432/ims'), /^OK --app-host=localhost --app-port=5432 --app-user=imsuser --app-database=ims$/)
+  // And a parameter that does not touch identity is left alone.
+  assert.match(read('postgresql://imsuser:s@localhost:5432/ims?sslmode=require'), /^OK /)
+
+  // AND EVERY URL WHOSE DESTINATION DEPENDS ON SOMETHING ELSE IS REFUSED, never defaulted.
+  for (const [url, expected] of [
+    ['postgresql://imsuser:s@localhost/ims', /states no port/],
+    ['postgresql://imsuser:s@localhost:5432', /states no database/],
+    ['postgresql://localhost:5432/ims', /states no role/],
+    ['postgresql://imsuser:s@localhost:5432/ims?host=remote.example', /carries \?host=/],
+    ['postgresql://imsuser:s@localhost:5432/ims?port=6432', /carries \?port=/],
+    ['postgresql://imsuser:s@localhost:5432/ims?user=other', /carries \?user=/],
+    ['postgresql://imsuser:s@localhost:5432/ims?dbname=other', /carries \?dbname=/],
+    ['postgresql://ims%2Fuser:s@localhost:5432/ims', /percent-escapes/],
+    ['postgresql://imsuser:s@localhost:abc/ims', /not a port number/],
+    ['postgresql://imsuser:s@localhost:5432/a/b', /more than one path segment/],
+    ['postgres://imsuser@/ims?host=/var/run/postgresql', /states no port/],
+    ['mysql://imsuser:s@localhost:3306/ims', /does not begin with postgres/],
+    ['', /is not set/],
+  ] as [string, RegExp][]) {
+    const answer = read(url)
+    assert.match(answer, /^REFUSE /, `${url || '(empty)'} must be refused, not read`)
+    assert.match(answer, expected, url || '(empty)')
+  }
 })
