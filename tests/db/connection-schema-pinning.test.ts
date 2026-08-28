@@ -9,6 +9,7 @@ import pg from 'pg'
 import {
   DatabaseUrlSchemaConflictError,
   pgConnectionConfig,
+  prismaAdapterSchemaOptions,
   resolveDatabaseUrlSchema,
   splitLibpqOptions,
 } from '../../lib/db/database-url-schema.mjs'
@@ -497,6 +498,79 @@ test('o3d-2k5r r14: U+0000 is refused, because no startup packet can carry one',
     // AND THE SAME URL WITHOUT THE NUL IS ACCEPTED, so the guard is not refusing the shape.
     assert.ok(pgConnectionConfig(url.replaceAll('%00', '')).options, `${label}: the NUL-free spelling still resolves`)
   }
+})
+
+test('o3d-2k5r r16: a search path naming a ZERO-LENGTH schema is refused by both readers', () => {
+  // ROUTE: DATABASE_URL `?options=-c search_path=""` -> splitLibpqOptions() -> readLibpqSettings()
+  // -> singleSchemaOfSearchPath()'s QUOTED branch -> searchPathSchemaOf() -> BOTH readers of the
+  // resolution: resolveDatabaseUrlSchema() (and prismaAdapterSchemaOptions() through it) and
+  // pgConnectionConfig(), which composes the startup packet.
+  //
+  // WHY IT IS A REFUSAL AND NOT A NAME: `""` is a legal search-path element and the server takes
+  // it (measured live below — `current_schema()` comes back NULL), but no schema of that name can
+  // exist. Read as `{ schema: '' }` it was worse than either: the value is FALSY, so
+  // pgConnectionConfig() returned the URL untouched with the operator's own empty search path
+  // still on it while prismaAdapterSchemaOptions() returned `undefined` and Prisma qualified its
+  // generated queries with `public`. Raw statements resolve through nothing, generated ones write
+  // into `public` — the split this gate exists to stop, from the one value that looks pinned.
+  //
+  // MUTATION: restore `if (quoted) return { schema: quoted[1].replace(/""/g, '"'), quoted: true }`
+  // in singleSchemaOfSearchPath() — i.e. drop the `decoded === ''` rejection. Nothing throws any
+  // more: every assert.throws below fails for the `""` spellings, and the two "what it would have
+  // resolved to" assertions inside them are never reached. Deleting the zero-length branch in
+  // searchPathSchemaOf() alone does NOT make the test pass either — the refusal still happens, but
+  // the message match fails, which is the routing half of this fix.
+  const empties: [string, string][] = [
+    ['quoted empty', '""'],
+    ['assigned nothing', ''],
+    // ESCAPED whitespace, because a bare space would end the token at the splitter and never reach
+    // the quoted branch at all: `\ ""\<TAB>` unescapes to ` ""<TAB>`, which trimScannerWhitespace()
+    // trims back to the quoted-empty name.
+    ['quoted empty, padded with escaped scanner whitespace', '\\ ""\\\t'],
+  ]
+  for (const [label, value] of empties) {
+    for (const [spelling, write] of GUC_SPELLINGS) {
+      const url = `postgresql://u:p@localhost:5432/ims?options=${encodeURIComponent(write(`search_path=${value}`))}`
+      // PRECONDITION: the reader really does see a `search_path` entry here — so the refusal below
+      // is this guard firing and not the parameter being missed altogether.
+      assert.equal(
+        new URL(url).searchParams.get('options'),
+        write(`search_path=${value}`),
+        `${label} (${spelling}): the parsed URL carries the empty search path`,
+      )
+      for (const [reader, run] of [
+        ['resolveDatabaseUrlSchema', () => resolveDatabaseUrlSchema(url)],
+        ['prismaAdapterSchemaOptions', () => prismaAdapterSchemaOptions(url)],
+        ['pgConnectionConfig', () => pgConnectionConfig(url)],
+      ] as [string, () => unknown][]) {
+        assert.throws(
+          run,
+          (error: unknown) => {
+            assert.ok(
+              error instanceof DatabaseUrlSchemaConflictError,
+              `${label} (${spelling}, ${reader}): refused as a schema conflict`,
+            )
+            assert.match(
+              (error as Error).message,
+              /zero characters long/,
+              `${label} (${spelling}, ${reader}): and the message says WHICH thing is wrong`,
+            )
+            return true
+          },
+          `${label} (${spelling}, ${reader}): is refused`,
+        )
+      }
+    }
+  }
+
+  // AND A ONE-CHARACTER QUOTED NAME IS STILL CARRIED, so the guard is refusing emptiness and not
+  // the quoted spelling: `""""` decodes to a single `"`, which is a nameable schema.
+  const quotedName = `postgresql://u:p@localhost:5432/ims?options=${encodeURIComponent('-c search_path=""""')}`
+  assert.deepEqual(
+    resolveDatabaseUrlSchema(quotedName),
+    { parsed: true, explicit: true, schema: '"' },
+    'a quoted name of one character is still a schema',
+  )
 })
 
 // ---------------------------------------------------------------------------
@@ -1050,6 +1124,91 @@ test('o3d-2k5r r15 (live): the REAL server strips the six and KEEPS the four, an
           await pinned.end().catch(() => undefined)
         }
       }
+    }
+  } finally {
+    await scratch.drop()
+  }
+})
+
+test('o3d-2k5r r16 (live): the REAL server resolves a quoted-empty search path through NO schema', async (t) => {
+  const scratch = await openScratch(t)
+  if (!scratch) return
+  try {
+    // ROUTE, first half: the startup packet a URL carrying `options=-c search_path=""` would open
+    // if it were not refused — built here with `pg` directly, exactly as pgConnectionConfig()
+    // would have left it (it returned the connection string UNTOUCHED for a falsy schema, so the
+    // URL's own `options` reached the server).
+    //
+    // This is the measurement the pure test above can only assert about: the server ACCEPTS the
+    // value, `current_schema()` is NULL, and an unqualified statement resolves nothing at all —
+    // while Prisma, handed `undefined` by prismaAdapterSchemaOptions(), qualifies its generated
+    // queries with `public`, where the table does exist. Not one schema: a split, plus an outage
+    // on every raw statement.
+    const unpinned: pg.Client = new pg.Client({
+      connectionString: scratch.url,
+      options: '-c search_path=""',
+      connectionTimeoutMillis: 3_000,
+    })
+    await unpinned.connect()
+    try {
+      assert.equal(
+        (await unpinned.query<{ schema: string | null }>('select current_schema() as schema')).rows[0]?.schema,
+        null,
+        'the server accepts the value and resolves through no schema',
+      )
+      assert.equal(
+        (await unpinned.query<{ path: string }>("select current_setting('search_path') as path")).rows[0]?.path,
+        '""',
+        'and it kept the empty element rather than folding it away',
+      )
+      await assert.rejects(
+        unpinned.query('insert into settings (key, value, "updatedAt") values ($1, $2, now())', ['empty', 'x']),
+        /relation "settings" does not exist/,
+        'so an unqualified write — every raw statement in this app — cannot resolve its table',
+      )
+    } finally {
+      await unpinned.end().catch(() => undefined)
+    }
+
+    // ROUTE, second half: the same value through the module, from a URL of the REAL database, so
+    // the refusal is proved on a connection that would otherwise have opened successfully.
+    //
+    // MUTATION: drop the `decoded === ''` rejection from singleSchemaOfSearchPath(). Both
+    // assert.throws stop throwing — pgConnectionConfig() returns `{ connectionString }` with the
+    // empty search path still in it (the client above, which the assertions above just proved is
+    // on no schema at all), and prismaAdapterSchemaOptions() returns `undefined`.
+    const url = `${scratch.url}?options=${encodeURIComponent('-c search_path=""')}`
+    for (const [reader, run] of [
+      ['pgConnectionConfig', () => pgConnectionConfig(url)],
+      ['prismaAdapterSchemaOptions', () => prismaAdapterSchemaOptions(url)],
+    ] as [string, () => unknown][]) {
+      assert.throws(
+        run,
+        (error: unknown) => {
+          assert.ok(error instanceof DatabaseUrlSchemaConflictError, `${reader}: refused as a schema conflict`)
+          assert.match((error as Error).message, /zero characters long/, `${reader}: with the reason`)
+          return true
+        },
+        `${reader}: refuses to build a consumer on the empty search path`,
+      )
+    }
+
+    // AND THE SAME URL NAMING A REAL SCHEMA STILL OPENS, so the guard is not refusing the shape:
+    // the pinned client lands its unqualified write in `tenant_a` and nowhere else.
+    const pinned: pg.Client = new pg.Client({
+      ...pgConnectionConfig(`${scratch.url}?options=${encodeURIComponent('-c search_path="tenant_a"')}`),
+      connectionTimeoutMillis: 3_000,
+    })
+    await pinned.connect()
+    try {
+      await pinned.query('insert into settings (key, value, "updatedAt") values ($1, $2, now())', ['named', 'x'])
+      assert.deepEqual(
+        await schemasHolding(scratch.admin, 'named'),
+        ['tenant_a'],
+        'a search path that names a real schema is still pinned and still writes there',
+      )
+    } finally {
+      await pinned.end().catch(() => undefined)
     }
   } finally {
     await scratch.drop()
