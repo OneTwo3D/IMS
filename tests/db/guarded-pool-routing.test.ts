@@ -532,7 +532,8 @@ test('o3d-2k5r r27: every session-lock factory re-establishes the shared lock sp
   //
   // IT DOES NOT CLAIM THE FINDING IS CLOSED. Per-acquisition re-measurement narrows the window from
   // the process's lifetime to milliseconds; it does not make a session advisory lock a sufficient
-  // exclusion for money movement. That is o3d-ic9a (P0) and is not written in this branch.
+  // exclusion for money movement. That is o3d-ic9a (P1 since the 2026-08-28 rescope) and is not
+  // written in this branch.
   //
   // MUTATION ROUTE: replace `gateOnFreshLockSpace<PoolClient>(` in `createSessionAdvisoryLockPool`
   // with any other call. That factory's name appears below and this fails.

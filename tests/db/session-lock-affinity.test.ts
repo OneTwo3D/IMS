@@ -842,7 +842,8 @@ test('[o3d-2k5r r26] (live): an override whose lock space is NOT the data path i
 // probe and the `pg_try_advisory_lock` it licenses. They do NOT claim the finding is closed: a
 // check is a sample taken before the thing it licenses, and no number of samples becomes the
 // property. The mechanism that would close it — durable, fenced state written through the
-// authoritative DATABASE_URL transaction — is o3d-ic9a (P0), and is not written inside this branch.
+// authoritative DATABASE_URL transaction, or connector-side idempotency on the post itself — is
+// o3d-ic9a (P1 since the 2026-08-28 rescope), and is not written inside this branch.
 //
 // MEDIUM: "the probe has no deadline after connection establishment". Only `connectionTimeoutMillis`
 // was set, so once either socket was up the holder query, `begin`, the witness query, `rollback`,
