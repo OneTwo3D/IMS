@@ -76,8 +76,30 @@
 --   * `wc_refund_park_recovered` is in RETAINED_ACTIONS in lib/activity-log-cleanup.ts, so no
 --     retention period can remove it.
 --
+-- AND SO IS THE ROW IT ACCUSES (o3d-xnwu r15, Codex HIGH). A durable witness is half a join. This
+-- check drives FROM shopping_sync_logs and uses the witness only in an EXISTS subquery, so a
+-- deleted row is not a half-evidenced accusation — it is ZERO VIOLATIONS. And the damage sequence
+-- documented below ENDS in a deletable row: the predecessor rewrites the recovered park as a held
+-- invoice, the ordinary release path settles it to SYNCED, and `purgeExpiredData` then expires it
+-- on its ORIGINAL `createdAt` — six months by default, and possibly on the very next sweep if the
+-- park was already old when it was recovered. lib/data-retention.ts now refuses to delete any
+-- shopping_sync_logs row a `wc_refund_park_recovered` entry names, in the same statement that does
+-- the deleting (a `NOT EXISTS`, not a pre-read id list, so a recovery committing mid-sweep cannot
+-- be swept by it).
+--
+-- WHY THE ROW AND NOT MORE EVIDENCE IN THE WITNESS. The accusation is about the row's CURRENT
+-- state, so no entry written at recovery time can carry it: the overwrite had not happened yet.
+-- And the obvious substitute — treating an ABSENT witness-referenced row as an incident — is a
+-- false-positive engine, because a legitimately recovered park settles to SYNCED and expires by age
+-- like anything else. On any installation older than the retention period that would fail the
+-- cutover over healthy history, which is the cutover outage this file keeps warning about. The
+-- price of keeping the row instead is that these rows outlive the configured retention period
+-- indefinitely; the set is bounded by manual operator recoveries and every member of it is a refund
+-- whose money left the business, and components/settings/data-retention.tsx says so.
+--
 -- What remains is only what no design can remove: this check accuses nothing it cannot see, and it
--- never produces a false positive from a missing entry.
+-- never produces a false positive from a missing entry. A row already deleted by a predecessor
+-- binary's retention sweep, before that exemption shipped, is beyond any check here.
 --
 -- WHY THERE ARE SIX AND NOT FIVE (Codex MEDIUM, round 5). Checks 1-5 model what the predecessor
 -- WRITES INTO A ROW. They do not model what it does to a row's STATUS AND MESSAGE while leaving the

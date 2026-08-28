@@ -23,7 +23,7 @@ const FIELDS = [
   { key: 'retention_purchase_orders_months', label: 'Purchase Orders', stateKey: 'purchaseOrders' as const, hint: 'Archive received, closed, invoiced, returned, or cancelled POs' },
   { key: 'retention_customers_months', label: 'Customers', stateKey: 'customers' as const, hint: 'Archive inactive customers' },
   { key: 'retention_stock_movements_months', label: 'Stock Movements', stateKey: 'stockMovements' as const, hint: 'Permanently delete movements' },
-  { key: 'retention_sync_logs_months', label: 'Sync Logs', stateKey: 'syncLogs' as const, hint: 'Permanently delete settled sync logs (unfinished accounting work is kept)' },
+  { key: 'retention_sync_logs_months', label: 'Sync Logs', stateKey: 'syncLogs' as const, hint: 'Permanently delete settled sync logs (unfinished accounting work, unresolved refund parks and any row an operator recovery acted on are kept)' },
   { key: 'retention_webhook_events_months', label: 'Webhook Events', stateKey: 'webhookEvents' as const, hint: 'Clear processed inbox payloads (keeps dedup + dead letters)' },
   { key: 'retention_wms_events_months', label: 'WMS Inbound Events', stateKey: 'wmsEvents' as const, hint: 'Clear processed WMS callback payloads (keeps dedup + dead letters)' },
   { key: 'retention_wms_sync_jobs_months', label: 'WMS Sync Runs', stateKey: 'wmsSyncJobs' as const, hint: 'Delete finished sync runs and their per-SKU log lines' },
