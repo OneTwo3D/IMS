@@ -7503,6 +7503,8 @@ function rotationHarness(dirs: { app: string; recovery: string; state: string },
 function rotationDirs(): { app: string; recovery: string; state: string } {
   const root = mkdtempSync(join(tmpdir(), 'ims-r31-rot-'))
   mkdirSync(join(root, 'app', 'scripts'), { recursive: true })
+  // writeCheckoutPg() seals the modes: since r33 an entry-file pin alone may only publish from a
+  // source nobody but the publisher can write, and these cases are about the ENTRY FILE.
   writeCheckoutPg(join(root, 'app'))
   mkdirSync(join(root, 'recovery'), { recursive: true })
   mkdirSync(join(root, 'state'), { recursive: true })
@@ -8556,7 +8558,20 @@ test('r33: every printed recovery instruction carries the privilege the account 
     //    sudo is one whose banner can only be being read by root.
     rmSync(log)
     renameSync(join(dir, 'app', '.env'), join(dir, 'app', '.env.away'))
-    const noSudo = spawnSync(paths.releaseWrapper, [], { encoding: 'utf8', env: { PATH: '/nonexistent' } as unknown as NodeJS.ProcessEnv })
+    // A PATH that still has coreutils and no sudo — the wrapper needs `id`, `find` and
+    // `sha256sum` to reach the message at all, and stripping everything would have tested the
+    // wrong refusal.
+    const noSudoPath = (process.env.PATH ?? '')
+      .split(':')
+      .filter((entry) => entry && !existsSync(join(entry, 'sudo')))
+      .join(':')
+    assert.equal(sudoPrefixOn(noSudoPath), '', 'precondition: that PATH really has no sudo on it')
+    assert.equal(
+      spawnSync('bash', ['-c', 'command -v sha256sum >/dev/null'], { env: { PATH: noSudoPath } as unknown as NodeJS.ProcessEnv }).status,
+      0,
+      'precondition: and it still has the tools the wrapper runs',
+    )
+    const noSudo = spawnSync(paths.releaseWrapper, [], { encoding: 'utf8', env: { PATH: noSudoPath } as unknown as NodeJS.ProcessEnv })
     const bareLine = noSudo.stderr.split('\n').find((line) => line.includes('DEPLOY_ADMIN_DATABASE_URL='))
     assert.equal(
       bareLine?.trim(),
@@ -8573,6 +8588,56 @@ test('r33: every printed recovery instruction carries the privilege the account 
     assert.equal(statSync(paths.manifestFile).mode & 0o004, 0o004, 'and the manifest readable')
     const check = spawnSync('sha256sum', ['-c', paths.manifestFile], { cwd: paths.app, encoding: 'utf8' })
     assert.equal(check.status, 0, `the manifest instruction must run and pass over an untouched tree:\n${check.stdout}${check.stderr}`)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('r33: an authenticated rotation out of an application-writable checkout needs the whole-tree pin too', () => {
+  // BOOTSTRAP IS NOT THE ONLY PUBLICATION. The rotation path reads the same checkout and vendors
+  // the same closure, so IMS_FENCE_SCRIPT_SHA256 covers exactly as little there — and there it is
+  // worse, because a standing artefact is REPLACED by one nobody authenticated.
+  //
+  // MUTATION ROUTE: move the r33 gate in _fence_stage_and_publish() inside the bootstrap branch of
+  // publish_fence_script_copy() instead, so rotation is exempt: CASE 2 rotates, and the protected
+  // artefact becomes the credential-stealing tree while the entry-file digest matched throughout.
+  const dir = mkdtempSync(join(tmpdir(), 'ims-r33-rot-'))
+  try {
+    // CASE 1 — a clean bootstrap from a source only this account can write, pinned by entry file.
+    writeFenceCheckout(dir, importReportingHelper(dir))
+    const paths = protectedPaths(dir)
+    const v1 = sha256File(checkoutHelper(dir))
+    const first = runShell(artefactHarness(dir, [`DB_FENCE_EXPECTED_SHA256=${v1}`, 'db_fence_script_in_use >/dev/null; echo "RC=$?"']))
+    assert.match(first.output, /^RC=0$/m, `the clean bootstrap must publish:\n${first.output}`)
+    const standing = readFileSync(paths.pgEntry, 'utf8')
+    assert.match(standing, /SHIPPED-PG/, 'and the vendored package is the shipped one')
+
+    // CASE 2 — the release moves on, and so does the checkout's `pg`, which the account owns.
+    writeFileSync(checkoutHelper(dir), `${importReportingHelper(dir)}// v2\n`)
+    writeFileSync(checkoutPgEntry(dir), `require('pg-protocol')\n${STEALING_PG}`)
+    chmodSync(checkoutPgEntry(dir), 0o664)
+    const v2 = sha256File(checkoutHelper(dir))
+    assert.notEqual(v2, v1, 'precondition: this is a real upgrade of the entry file')
+    const refused = runShell(artefactHarness(dir, [`DB_FENCE_EXPECTED_SHA256=${v2}`, 'db_fence_script_in_use >/dev/null; echo "RC=$?"']))
+    assert.match(refused.output, /^RC=1$/m, `the rotation must be refused:\n${refused.output}`)
+    assert.match(refused.output, /IMS_FENCE_SCRIPT_SHA256 IS NOT SUFFICIENT HERE/, refused.output)
+    assert.equal(readFileSync(paths.pgEntry, 'utf8'), standing, 'and the standing artefact must be untouched')
+    assert.doesNotMatch(readFileSync(paths.pgEntry, 'utf8'), /SUBSTITUTED-PG/, 'so the substituted package was never published')
+
+    // CASE 3 — with the whole tree pinned, the same rotation goes through: the operator has
+    // authenticated what they are adopting, dependencies included.
+    const reported = /just now hashes to ([0-9a-f]{64})/.exec(refused.output)?.[1]
+    assert.ok(reported, `the refusal must report what the tree would hash to:\n${refused.output}`)
+    const rotated = runShell(
+      artefactHarness(dir, [
+        `DB_FENCE_EXPECTED_SHA256=${v2}`,
+        `DB_FENCE_EXPECTED_ARTEFACT_SHA256=${reported}`,
+        'db_fence_script_in_use >/dev/null; echo "RC=$?"',
+      ]),
+    )
+    assert.match(rotated.output, /^RC=0$/m, `the whole-tree pin must authorise it:\n${rotated.output}`)
+    assert.equal(sha256File(paths.helper), v2, 'and the entry file moves')
+    assert.match(readFileSync(paths.pgEntry, 'utf8'), /SUBSTITUTED-PG/, 'together with the closure the operator pinned')
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

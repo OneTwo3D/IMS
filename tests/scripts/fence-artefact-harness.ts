@@ -11,6 +11,7 @@
  * findings were all "one rule, several readers", and a harness that describes the artefact layout
  * is a reader of that rule.
  */
+import { execFileSync } from 'node:child_process'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
@@ -55,11 +56,25 @@ export function writeFenceCheckout(
 export const SHIPPED_PG_BODY = "module.exports = { Client: class {}, FLAVOUR: 'SHIPPED-PG' }\n"
 
 /**
+ * TAKE GROUP AND OTHER WRITE OFF A FAKE CHECKOUT (r33).
+ *
+ * Since r33 the library refuses to publish an artefact whose dependency closure was assembled
+ * from a source that anybody but the publishing account can write. Left to the harness's ambient
+ * umask, whether a test exercised the TRUSTED or the UNTRUSTED path would be a property of the
+ * machine rather than of the test — so it is stated here, and the tests that want the untrusted
+ * path put a mode back deliberately and assert on the message that names it.
+ */
+
+/**
  * Put the fake `pg` into an application directory that already exists. Split out of
  * writeFenceCheckout() because several harnesses build their own `<app>/scripts` first and only
  * need the dependency half — and because every one of them needs it: publishing the protected
  * artefact VENDORS this closure, and a checkout with nothing to vendor cannot be published from.
  */
+export function sealCheckoutModes(appDir: string): void {
+  execFileSync('chmod', ['-R', 'go-w', appDir])
+}
+
 export function writeCheckoutPg(appDir: string, pgBody: string = SHIPPED_PG_BODY): void {
   mkdirSync(join(appDir, 'node_modules', 'pg', 'lib'), { recursive: true })
   mkdirSync(join(appDir, 'node_modules', 'pg-protocol'), { recursive: true })
@@ -71,6 +86,7 @@ export function writeCheckoutPg(appDir: string, pgBody: string = SHIPPED_PG_BODY
     `${JSON.stringify({ name: 'pg-protocol', version: '0.0.0', main: 'index.js' })}\n`,
   )
   writeFileSync(join(appDir, 'node_modules', 'pg-protocol', 'index.js'), 'module.exports = {}\n')
+  sealCheckoutModes(appDir)
 }
 
 /**
