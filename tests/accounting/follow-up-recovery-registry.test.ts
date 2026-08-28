@@ -1002,9 +1002,13 @@ test('[o3d-0bfh r7] the remedy never asserts the follow-ups were never enqueued'
       const unknown = followUpObligationRecoveryFor('sage')
       return unknown.consumer === 'none' ? unknown.operatorRemedy : ''
     })() },
-    { what: 'the exception-inbox section', prose: readSource(
-      path.join(REPO_ROOT, 'app', '(dashboard)', 'sync', 'exceptions', 'exceptions-client.tsx'),
-    ).text.split('\n').filter((line) => /Accounting follow-ups owed|reached the accounting package/.test(line)).join('\n') },
+    // THE INBOX SECTION IS THIS STRING (o3d-0bfh r9). It used to be scraped out of the .tsx by
+    // matching lines, because the section held a paragraph of its own — the paragraph that was
+    // still saying "create only what is verifiably absent" a whole round after the registry
+    // stopped. It authors nothing now: `detail={FOLLOW_UP_OBLIGATION_OUTCOME_IS_UNKNOWN}`. The
+    // proof that the inbox really renders this and cannot reacquire a literal of its own is the
+    // r9 surface test below; here it is simply the prose an operator reads.
+    { what: 'the exception-inbox section', prose: FOLLOW_UP_OBLIGATION_OUTCOME_IS_UNKNOWN },
   ]
   for (const { what, prose } of surfaces) {
     assert.ok(prose.length > 20, `${what}: nothing was found to check`)
@@ -1020,8 +1024,8 @@ test('[o3d-0bfh r7] the remedy never asserts the follow-ups were never enqueued'
     assert.match(
       prose,
       /verifiably absent|only what is verifiably|escalat/i,
-      `${what} must give an action that is safe to take twice — reconcile first, create only what is missing, `
-        + 'or escalate — rather than "re-drive each one"',
+      `${what} must give an action that is safe to take twice — read the document and escalate — rather than `
+        + '"re-drive each one". (Creating "only what is missing" is NOT such an action: see r8.)',
     )
   }
 })
@@ -1243,4 +1247,188 @@ test('[o3d-0bfh r8] the QuickBooks processor no longer asserts that follow-up wo
   // CONTROL: the scanner is looking at the right file and the right text. The description that
   // REPLACED them is present, so a rename or a failed read cannot make the four assertions vacuous.
   assert.match(source.code, /HOW FAR IT GOT IS NOT KNOWN FROM HERE/, 'the replacement wording must be the thing there')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-0bfh r9 (Codex HIGH) — THE REGISTRY IS NOT THE SURFACE. THE SURFACE IS.
+//
+// r8 corrected the registry's remedy and the QuickBooks processor's log lines, and the test above
+// asserted both. It protected nobody: the exception inbox's own SectionHeading held an INDEPENDENT
+// copy of the sentence being removed — "create only what is verifiably absent" — and that is the
+// sentence an operator actually reads. One rule, two authors, one of them fixed. The same round
+// left a third copy in help-docs/xero-sync.md ("a QuickBooks follow-up that fails still has to be
+// re-driven by hand") and a fourth in a code comment that justified the row as "the remedy is a
+// human act in the accounting package (register the payment, ...)" — which is where UI prose comes
+// from.
+//
+// So the contract is no longer "the registry strings are safe". It is:
+//
+//   1. NO OPERATOR-FACING SURFACE AUTHORS ITS OWN INSTRUCTION FOR THESE ROWS. The inbox section
+//      renders `FOLLOW_UP_OBLIGATION_OUTCOME_IS_UNKNOWN` and each row renders its connector's own
+//      `operatorRemedy`; a literal `detail="..."` on that section is banned outright, because a
+//      literal is the only way a second copy can exist.
+//   2. AND every surface that still writes prose about these rows — the processor's activity
+//      messages, the operator documentation — is scanned for the same banned instructions the
+//      registry strings are.
+//
+// (1) is the part that stops a THIRD copy appearing; (2) is the part that catches one that already
+// has. Both are needed: a scan alone would have missed nothing here, but it also cannot stop
+// somebody writing a fresh paragraph that happens to avoid the banned words.
+// ---------------------------------------------------------------------------
+
+/**
+ * The instructions no surface may carry for a retained follow-up obligation, with why.
+ *
+ * Shared by the registry-string test above and the surface scan below so that a pattern added for
+ * one is a pattern added for all — the r8 failure was two lists, not two files.
+ */
+const BANNED_OPERATOR_INSTRUCTIONS: Array<{ pattern: RegExp; why: string }> = [
+  {
+    pattern: /\bcreate (only|ONLY)\b/,
+    why: 'remote absence is not proof that creation is safe — a payment can be PENDING in the local queue while '
+      + 'the accounting package shows none',
+  },
+  {
+    // The lookbehind exempts the exception-inbox SECTION TITLE ("...with nothing to re-drive
+    // them"), which is a statement that nothing will, not an instruction that somebody should.
+    pattern: /(?<!nothing to )re-?driv(e|en) (it|them|this|the)\b/i,
+    why: 'a re-drive on the money path can double a payment already queued',
+  },
+  {
+    pattern: /re-?driven by hand/i,
+    why: 'same: it authorises a hand-made payment that no request id can deduplicate',
+  },
+  {
+    pattern: /register the receipt in QuickBooks by hand/i,
+    why: 'a payment created in the QuickBooks UI cannot be deduplicated against the queued row',
+  },
+  {
+    pattern: /re-run the invoice sync/i,
+    why: 'it is a re-drive instruction wearing different words',
+  },
+]
+
+/** The UI section for this backlog, sliced out of the inbox by its own section markers. */
+function accountingFollowUpSection(): { slice: string; whole: string } {
+  const full = path.join(REPO_ROOT, 'app', '(dashboard)', 'sync', 'exceptions', 'exceptions-client.tsx')
+  const { code } = readSource(full)
+  const marker = /\{data\.\w+\.length > 0 \? \(/g
+  const starts: number[] = []
+  for (let m = marker.exec(code); m; m = marker.exec(code)) starts.push(m.index)
+  const start = starts.findIndex((index) => code.startsWith('{data.accountingFollowUpObligations', index))
+  assert.notEqual(start, -1, 'the accounting follow-up section must still be rendered by the exception inbox')
+  const end = starts[start + 1] ?? code.length
+  return { slice: code.slice(starts[start]!, end), whole: code }
+}
+
+test('[o3d-0bfh r9] the exception inbox renders the registry remedy and authors no instruction of its own', () => {
+  // THE R8 DEFECT, AS A TEST. The registry said read-and-escalate while this SectionHeading said
+  // "create only what is verifiably absent", and nothing compared them because nothing looked at
+  // the UI at all.
+  //
+  // Route: app/(dashboard)/sync/exceptions/exceptions-client.tsx -> <SectionHeading detail={...}>
+  // for `data.accountingFollowUpObligations`, and the per-row cell that renders
+  // `row.operatorRemedy` (produced by describeFollowUpObligationBacklogRow straight off the
+  // registry). Executable source, comments stripped: a comment is not a surface, a rendered string
+  // is.
+  //
+  // Mutation: put the r8 paragraph back as `detail="These documents reached ... create only what is
+  // verifiably absent ..."` and BOTH the literal-detail assertion and the banned-instruction scan
+  // fail; change the cell to a hardcoded sentence and the `row.operatorRemedy` assertion fails.
+  const { slice } = accountingFollowUpSection()
+
+  // CONTROL: the slice is the right region and is not the whole file, so the assertions below
+  // cannot pass by looking at nothing.
+  assert.match(slice, /Accounting follow-ups owed, with nothing to re-drive them/, 'the slice is this section')
+  assert.match(slice, /<SectionHeading/, 'and it contains the heading being checked')
+  assert.equal(slice.includes('productStructureConflicts'), false, 'and stops before the next section')
+
+  // 1. THE SECTION TEXT IS THE REGISTRY'S OWN STRING, not a restatement of it.
+  assert.match(
+    slice, /detail=\{FOLLOW_UP_OBLIGATION_OUTCOME_IS_UNKNOWN\}/,
+    'the section detail must BE the registry string, not a copy that can go stale independently',
+  )
+  // 2. AND A LITERAL IS BANNED OUTRIGHT — this is the assertion that stops a third copy, because a
+  //    literal is the only way one can exist. A scan for bad words cannot do this: the next author
+  //    would simply phrase the authorisation differently.
+  assert.doesNotMatch(
+    slice, /detail="/,
+    'a literal section detail is how the r8 copy survived a round that corrected the registry',
+  )
+  // 3. AND THE PER-ROW REMEDY COMES FROM THE ROW, i.e. from the connector's registry entry.
+  assert.match(
+    slice, /\{row\.operatorRemedy\}/,
+    'each row must render its connector\'s declared remedy rather than a sentence written here',
+  )
+
+  for (const { pattern, why } of BANNED_OPERATOR_INSTRUCTIONS) {
+    assert.doesNotMatch(
+      slice, pattern,
+      `the exception inbox's accounting follow-up section carries a banned instruction — ${why}`,
+    )
+  }
+})
+
+test('[o3d-0bfh r9] the operator documentation for these rows authorises no hand settlement either', () => {
+  // THE THIRD COPY. help-docs/xero-sync.md is what an operator is pointed at, and it said "a
+  // QuickBooks follow-up that fails still has to be re-driven by hand" for the whole of r8.
+  //
+  // Route: help-docs/xero-sync.md, every paragraph that talks about QuickBooks AND follow-ups —
+  // i.e. about the connector this backlog exists for. Paragraphs about Xero's sweep are a different
+  // mechanism (it has a consumer) and are deliberately out of scope, so the scan is not silently
+  // wider than the finding.
+  //
+  // Mutation: restore "a QuickBooks follow-up that fails still has to be re-driven by hand" and
+  // this fails naming the paragraph; delete the paragraphs entirely and the non-vacuity control
+  // below fails instead of the test passing on an empty set.
+  const doc = readFileSync(path.join(REPO_ROOT, 'help-docs', 'xero-sync.md'), 'utf8')
+  const paragraphs = doc.split(/\n\s*\n/)
+  const scoped = paragraphs.filter((p) => /quickbooks/i.test(p) && /follow-?ups?\b/i.test(p))
+
+  assert.equal(scoped.length > 0, true, 'the documentation must still describe the QuickBooks follow-up backlog')
+  for (const paragraph of scoped) {
+    for (const { pattern, why } of BANNED_OPERATOR_INSTRUCTIONS) {
+      assert.doesNotMatch(
+        paragraph, pattern,
+        `help-docs/xero-sync.md tells an operator to settle a retained follow-up by hand — ${why}\n${paragraph.slice(0, 300)}`,
+      )
+    }
+  }
+  // CONTROL: the doc still carries the refusal, so "delete the guidance" is not a passing strategy.
+  assert.match(
+    doc, /Do not settle one of these rows by hand/,
+    'the documentation must say what an operator may NOT do, not merely stop saying what they may',
+  )
+})
+
+test('[o3d-0bfh r9] the activity messages and the shared recovery note carry the registry remedy, not their own', () => {
+  // The processor's own strings were corrected in r8 and are re-checked here against the SHARED
+  // banned list rather than a second list that can drift from it — two lists is the r8 failure in
+  // miniature.
+  //
+  // Route: lib/connectors/quickbooks/sync-processor.ts (activity-log descriptions and warnings) and
+  // lib/domain/accounting/back-reference.ts (`followUpObligationRecoveryNote`, the one definition
+  // every `console.error` on this path composes its message from).
+  //
+  // Mutation: restore any r7 instruction to either file and the scan fails naming it; make
+  // followUpObligationRecoveryNote restate a remedy instead of interpolating
+  // `recovery.operatorRemedy` and the composition assertion fails.
+  const processor = readSource(path.join(REPO_ROOT, 'lib', 'connectors', 'quickbooks', 'sync-processor.ts'))
+  const backReference = readSource(path.join(REPO_ROOT, 'lib', 'domain', 'accounting', 'back-reference.ts'))
+
+  for (const source of [processor, backReference]) {
+    for (const { pattern, why } of BANNED_OPERATOR_INSTRUCTIONS) {
+      assert.doesNotMatch(source.code, pattern, `${source.rel} carries a banned instruction — ${why}`)
+    }
+  }
+
+  // The shared note must COMPOSE the registry's remedy, so a connector's declaration is what an
+  // operator reads wherever the note is logged.
+  assert.match(
+    backReference.code, /\$\{recovery\.operatorRemedy\}/,
+    'followUpObligationRecoveryNote must interpolate the declared remedy rather than restate one',
+  )
+  // CONTROL: the scanner read the files it names.
+  assert.match(processor.code, /Accounting follow-ups owed, with nothing to re-drive them/)
+  assert.match(backReference.code, /followUpObligationRecoveryNote/)
 })
