@@ -597,107 +597,97 @@ to a temporary in the same directory, `fsync`ed, renamed and the directory `fsyn
 `BEGIN`; if any of that cannot be proven, **nothing is revoked** and the run aborts with exit 3.
 The last field of a complete record is `"state_complete": 1`.
 
-**Both URLs must name the same database, and it is proven rather than assumed** (o3d-2sm1.5).
-Every mode connects through `DEPLOY_ADMIN_DATABASE_URL` when it is set, and then asks its
-questions of `current_database()` on *that* connection while taking the **role** from
-`DATABASE_URL`. Point the admin URL at another database on which the application role happens to
-hold `CONNECT` — a copy, a `postgres` maintenance database, a staging URL left in the environment
-— and `--release` answered "the application can connect" about a database the application never
-uses, while the real one still denied it; the health route does not touch the database, so the
-deploy reported success with the application locked out. `--preflight`, `--fence` and `--release`
-now **refuse** unless the two URLs name the same host, port and database *and* the live connection
-reports it is attached to that database. A loopback address, `localhost` and a unix-socket
-directory are treated as the same machine; anything else that differs is a refusal, not a guess.
+**The fence is TOLD which connection it is closing; it does not work it out** (o3d-2sm1.5 r19).
 
-**The comparison is of the connection node-postgres will really open, not of the URL's obvious
-parts** (o3d-2sm1.5). `pg-connection-string`, which `pg` uses, copies the **query string** into the
-connection config first and fills `host`, `port` and `user` from the authority only if the query
-left them unset — so those three parameters *redirect the connection*. A `DATABASE_URL` of
-`postgres://app@localhost:5432/appdb?host=remote.example&port=6432&user=actual` authenticates as
-`actual` against `remote.example:6432`, and the identity proof used to read it as `app` at
-`localhost:5432` and pass it against a local admin URL. The parse no longer *imitates* the
-driver's rules, and no longer stops at the driver's **string parser** either: the effective host,
-port, user and database are read off the `pg.Client({ connectionString })` that `pg` would open,
-before it is opened. `client.host` and `client.port` are the two arguments handed to
-`Connection#connect()` and `client.user` / `client.database` are what goes in the startup packet,
-so there is nothing left between them and the wire. Three rounds running, something short of that
-client disagreed with it — first a hand-rolled read of the authority, then a hand-rolled read of
-repeated parameters, then `pg-connection-string.parse()`, which reads the URL and stops. And:
+Seven rounds went into deciding *where the application connects* by reconstructing what its
+runtime resolves. Each answer was locally correct and uncovered another layer beneath it:
 
-* **the environment is part of the connection.** `pg/lib/connection-parameters.js` fills every
-  value the URL omits from `PGHOST`, `PGPORT`, `PGUSER` and `PGDATABASE` before dialling. With
-  `PGPORT=6432` a `DATABASE_URL` of `postgres://imsapp@localhost/imsdb` connects to **6432**,
-  and the identity proof used to read it as `5432`, agree with an admin URL that really was on
-  5432, and fence a cluster the application does not use for the length of the migration. A
-  path-less URL likewise lands on `PGDATABASE`, or failing that on the login role's own name;
-* **except the OS account**, which is not configuration. `pg`'s last fallback for the login role
-  is `process.env.USER` — the account running whichever process asked, which for this script is
-  the deploy account and not the application's. That one value is subtracted (detected by asking
-  the driver to resolve again with its own default swapped out, not by re-reading the URL), and
-  an identity that rests on it is **unidentified**, which is refused;
-* a port `pg` cannot read as a number reaches `ConnectionParameters` as `NaN`, and is **refused**
-  rather than quietly defaulted to 5432;
+| round | what it resolved through | what was wrong with it |
+| --- | --- | --- |
+| r13-r15 | this repo's own reading of `DATABASE_URL` | authority-versus-query precedence, `?user=` overriding the authority, repeated parameters |
+| r16 | `pg`'s own **string parser** | a string parser is not a connection: `pg` fills `PGHOST`, `PGPORT`, `PGUSER`, `PGDATABASE` in for everything the URL omits |
+| r17 | the driver's real client, in the **deploy shell's** environment | the application does not inherit the deploy shell — so the service's environment file was read instead |
+| r18 | `systemctl show <unit>` | systemd answers for `Environment=` and **not** for the `EnvironmentFile=` layer, which then had to be refused on a mention of a name |
+| r19 | — | and five more layers appeared: `PassEnvironment=`, `UnsetEnvironment=`, wildcard `EnvironmentFile=` globs, the `.env.development*` / `.env.test*` overlays Next loads in other modes, a unit with no `WorkingDirectory=`, and `DATABASE_URL`'s own precedence chain |
+
+The count of blockers went 1 → 4 → 5. That is not an implementation problem: **the question has no
+bounded answer**, because the composition rules belong to systemd, Next and libpq at once and any
+of the three is free to add a layer.
+
+So it is no longer asked. `scripts/fence-db-connections.mjs` **requires** the four values on its
+command line and **refuses** without them:
+
+```
+node scripts/fence-db-connections.mjs --preflight \
+  --app-host=localhost --app-port=5432 --app-user=imsuser --app-database=one_two_inventory
+```
+
+There is no environment reconstruction, no systemd interrogation, no dotenv scanning and no
+precedence emulation left in the helper. **The operator types nothing new** — the calling scripts
+supply the values:
+
+* **`scripts/install.sh` owns them.** It prompts for `DB_HOST`, `DB_PORT`, `DB_NAME` and `DB_USER`,
+  creates the role and the database with them, and composes `DATABASE_URL` out of them. It passes
+  those same variables; nothing is parsed anywhere. Reached before the database exists (an exit
+  trap on an early failure), the values are still empty and the fence is **refused**;
+* **`scripts/update.sh` and `scripts/deploy.sh` split them out of `DATABASE_URL`** — the file they
+  already read `DEPLOY_ADMIN_DATABASE_URL` from — with a strict reader (`resolve_db_identity`,
+  the same twenty lines in both) that **accepts only a URL stating all four**. No port, no path,
+  more than one path segment, a `?host=`/`?port=`/`?user=`/`?dbname=`/`?database=` query
+  parameter, a percent-escape, whitespace: each one is a **refusal** that stops the run before
+  anything is stopped or migrated. Never a default.
+
+**And the strictness is what closes the question rather than narrowing it.** `PGHOST`, `PGPORT`,
+`PGUSER` and `PGDATABASE` are consulted by libpq and by `pg` *only* for values the connection
+string leaves out. A URL that states all four cannot be moved by any of them, in any process,
+under any of the three composition systems above — so for exactly the URLs the callers accept, the
+whole environment question has no bearing on the answer, and for every other URL there is a
+refusal in place of a guess.
+
+If your `DATABASE_URL` does not state all four, write it as
+`postgresql://ROLE:PASSWORD@HOST:PORT/DATABASE`. A `deploy.sh` run that only needs no schema
+change can also use `--skip-migrate`, which moves nothing and needs no fence.
+
+**Being told an identity is not the same as being on it**, so what can be proven still is:
+
+* the admin URL this run opens must reach the **same database and the same server** as the four
+  supplied values, or every mode refuses. A loopback address, `localhost` and a unix-socket
+  directory are treated as the same machine; anything else that differs is a refusal, not a guess;
+* the connection actually opened must report that database as `current_database()`, and must be
+  running as the role it **logged in** as (`session_user` = `current_user`), or it refuses. A
+  connection string with no database in its path connects to `PGDATABASE`, or failing that to the
+  login role's own name, which is how the two come apart without the admin URL looking wrong;
+* in `--release`, the application probe must reach **the same postmaster** as this run —
+  `pg_postmaster_start_time()`, asked of both — before "the application can connect" is allowed to
+  mean anything. A database name is not an identity: `imsdb` exists on the staging server too.
+
+**`DATABASE_URL` is a credential to this helper and nothing else.** It is no longer read for the
+role, the host, the port or the database name. The only thing the helper does with it is *open*
+it, in `--release`, to see whether the application gets in — and where that lands is then
+cross-checked as above. `.env.local` is no longer loaded either: systemd hands the service `.env`,
+and reading a file the service never sees was divergence bought for nothing.
+
+**The admin URL is still resolved through the driver, and that is still worth stating**
+(o3d-2sm1.5). It is the connection *this process* opens, so `pg`'s own resolution of it is the
+right one, and the identity gate reads the effective host, port, user and database off the
+`pg.Client({ connectionString })` that `pg` would open rather than off the URL's obvious parts.
+For that URL:
 
 * a **repeated** `?host=`, `?port=`, `?user=`, `?dbname=` or `?database=` is **refused** outright.
   The driver copies every query entry into one config object, so the **last** one is the one it
   connects with, while anything reading the URL a parameter at a time — `URLSearchParams.get()`,
-  an operator's eye, a log line — sees the **first**. `?host=local&host=remote` is therefore a URL
-  that passes a check about `local` and opens on `remote`;
+  an operator's eye, a log line — sees the **first**;
 * a URL whose authority and query string **disagree** about the host, port or user is **refused**
-  rather than resolved — the driver would take the query value, but an environment that
-  contradicts itself about which server or which role it means is not something to pick a winner
-  from;
+  rather than resolved;
 * a `?dbname=` / `?database=` parameter is **refused** when it names anything but the URL path,
-  because the driver overwrites the database from the path unconditionally and the parameter does
-  nothing at all;
+  because the driver overwrites the database from the path unconditionally;
+* a port `pg` cannot read as a number reaches `ConnectionParameters` as `NaN`, and is **refused**
+  rather than quietly defaulted to 5432;
+* the **OS account** is subtracted: `pg`'s last fallback for the login role is `process.env.USER`,
+  the account running this script and not the application's, so an admin URL that rests on it is
+  **unidentified** — and `session_user`, read from the open connection, is what binds the role;
 * `postgres://role@/db?host=/var/run/postgresql` — a login role with no host in the authority — is
   read the way the driver reads it, not rejected as unparseable.
-
-**And those four variables are the SERVICE'S, taken from systemd** (o3d-2sm1.5). The bullet above
-is only half the finding: `pg` fills a URL's gaps from `PGHOST`, `PGPORT`, `PGUSER` and
-`PGDATABASE` — but from *whose* environment? The application does not inherit the deploy shell's.
-It is started by systemd; the deploy, update and install scripts run this helper through
-`runuser ... env` with their own environment intact. A `PGPORT=6432` in an operator shell, a cron
-wrapper or a `.bashrc` therefore made the helper resolve identity against 6432 while the
-application connected to 5432 — the gate compared two URLs that agreed with each other, the fence
-revoked `CONNECT` on 6432, the migration ran there, and the real database stayed open and
-unmigrated for the whole window. The more faithfully it followed the driver, the more faithfully
-it followed the wrong environment.
-
-So the four are **deleted from this process and replaced by what systemd says the unit is given**:
-
-* the unit is named on the command line — `--service-unit=<unit>`, once per unit — by the script
-  that already addresses the service (`scripts/deploy.sh` from the units it detects by
-  `WorkingDirectory`, or `IMS_SERVICE_UNIT`; `scripts/update.sh` from `SERVICE_UNIT`;
-  `scripts/install.sh` from `<app name>.service`). It is **not** taken from the environment, and
-  **no unit named is a refusal**. The `--release` command the scripts print for an operator
-  carries it, so pasting that command still works;
-* `systemctl show <unit>` supplies `Environment=` (with drop-ins already layered by systemd, in
-  systemd's order), `EnvironmentFiles=`, `User=` and `WorkingDirectory=`. **systemd cannot be
-  asked, the unit is not `LoadState=loaded`, or its answer cannot be parsed → refusal**, never a
-  fallback to the ambient environment and never an assumption that the service sets none. A unit
-  whose `WorkingDirectory` is not this app directory is refused too: it serves another
-  installation;
-* **an `EnvironmentFile` is never parsed here.** `systemctl show -p Environment` reports the
-  `Environment=` *directives only* — systemd reads an `EnvironmentFile` when it forks the service,
-  not when it loads the unit, and publishes nothing about the result. Reimplementing its grammar
-  is how this went wrong before (`dotenv` reads `PGUSER=ims#writer` as the role `ims`; systemd
-  reads it as `ims#writer`; both are legal). So each file systemd will read is asked the one
-  question every grammar answers the same way — **does it mention one of the four names at all?**
-  A file that mentions none cannot set one. A file that mentions one is **refused**, with the
-  instruction to set it in the unit's own `Environment=`. A file systemd will read and this cannot
-  read is refused; the only skip is the one systemd itself makes, an `EnvironmentFile=-` whose file
-  is absent. The application's own `.env.local` overlay — which systemd never sees, because Next
-  loads it inside the process — is scanned the same way;
-* two units serving this app directory that **disagree** about one of the four are refused rather
-  than resolved to the first;
-* **in practice this costs nothing**: the shipped `.env` carries `DATABASE_URL`, not `PG*`, and the
-  generated unit sets no `PG*` either — so the usual answer is "systemd reports none", and none is
-  what the driver is then given.
-
-If you do need one of the four set for the service, put it in the unit
-(`Environment=PGHOST=...`, or a drop-in), not in `.env`. That is the only place systemd will
-report it from, and the fence refuses what it cannot be told.
 
 **And the role is asked of the connection, not derived from the URL** (o3d-2sm1.5). `PGUSER`, a
 `.pgpass` entry, an ident or peer map and `options=-c role=` are all outside any URL. Every mode

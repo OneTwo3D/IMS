@@ -331,12 +331,128 @@ LEGACY_CRON_BACKUP="${LEGACY_CUTOVER_STATE_DIR}/crontab-${APP_USER}.bak"
 LEGACY_DB_FENCE_STATE="${LEGACY_CUTOVER_STATE_DIR}/db-connect-fence.json"
 DB_FENCE_SCRIPT="${APP_DIR}/scripts/fence-db-connections.mjs"
 DB_OBJECT_ACCESS_SCRIPT="${APP_DIR}/scripts/check-app-db-object-access.mjs"
-# WHICH UNIT THE FENCE ASKS SYSTEMD ABOUT (o3d-2sm1.5 r18, Codex r17 CRITICAL). The helper reads
-# the service's four PG* variables from `systemctl show <unit>` rather than from a file it guesses
-# at, and it takes the unit name from here — the same SERVICE_UNIT this script stops and starts —
-# rather than from its own environment, where a stale value could point it at another cluster.
-DB_FENCE_UNIT_ARG="--service-unit=${SERVICE_UNIT}"
-DB_FENCE_RELEASE_CMD="node ${DB_FENCE_SCRIPT} --release --state-file=${DB_FENCE_STATE} ${DB_FENCE_UNIT_ARG}"
+# ---------------------------------------------------------------------------
+# THE APPLICATION'S CONNECTION IDENTITY: SUPPLIED TO THE FENCE, NEVER WORKED OUT BY IT
+# (o3d-2sm1.5 r19).
+#
+# scripts/fence-db-connections.mjs used to derive the host, port, role and database THE
+# APPLICATION connects to — first by reading the URL itself, then through node-postgres's own
+# resolution, then from the deploy shell's PG* variables, then from the service's environment
+# file, then from `systemctl show`. Seven rounds; each answer locally correct; each uncovering
+# another layer beneath it — PassEnvironment=, UnsetEnvironment=, wildcard EnvironmentFile=
+# globs, the .env.development*/.env.test* overlays Next loads in other modes, a unit with no
+# WorkingDirectory=, and DATABASE_URL's own precedence chain. The question is UNBOUNDED, because
+# the composition rules belong to systemd, Next and libpq at once and any of them may add a
+# layer. So it is no longer asked: the four values are REQUIRED on the fence's command line, and
+# a fence that is not given them refuses to fence anything.
+#
+# THIS is where they come from, and the operator types nothing new for it: DATABASE_URL, split by
+# a reader that ACCEPTS ONLY A URL STATING ALL FOUR. That strictness is what CLOSES the question
+# rather than narrowing it — PGHOST, PGPORT, PGUSER and PGDATABASE are consulted by libpq and by
+# `pg` ONLY for values the connection string leaves out, so a URL that states all four cannot be
+# moved by any environment, in any process, under any of those three systems. Everything else —
+# no port, no path, more than one path segment, an identity-bearing query parameter, a
+# percent-escape this refuses to decode — is a REFUSAL that stops the run before anything is
+# stopped or migrated. Never a default, and never a guess at what was meant.
+#
+# On success it sets DB_IDENTITY_HOST/PORT/USER/DATABASE and DB_FENCE_IDENTITY_ARGS. On failure
+# it leaves all of them empty and puts the reason in DB_IDENTITY_REASON; fence_db_connections()
+# then dies with that reason rather than fencing a connection nobody has identified.
+DB_IDENTITY_HOST=""
+DB_IDENTITY_PORT=""
+DB_IDENTITY_USER=""
+DB_IDENTITY_DATABASE=""
+DB_IDENTITY_REASON="DATABASE_URL has not been read yet"
+DB_FENCE_IDENTITY_ARGS=()
+
+resolve_db_identity() {
+  local url="${1:-}" rest authority userinfo hostport path host port user database query
+  local -a pairs
+  DB_IDENTITY_HOST=""; DB_IDENTITY_PORT=""; DB_IDENTITY_USER=""; DB_IDENTITY_DATABASE=""
+  DB_FENCE_IDENTITY_ARGS=()
+
+  if [[ -z "$url" ]]; then
+    DB_IDENTITY_REASON="DATABASE_URL is not set, so there is no application connection to name"
+    return 1
+  fi
+  case "$url" in
+    postgres://*)   rest="${url#postgres://}" ;;
+    postgresql://*) rest="${url#postgresql://}" ;;
+    *) DB_IDENTITY_REASON="DATABASE_URL does not begin with postgres:// or postgresql://"; return 1 ;;
+  esac
+  case "$rest" in
+    */*) authority="${rest%%/*}"; path="${rest#*/}" ;;
+    *)   DB_IDENTITY_REASON="DATABASE_URL states no database: there is no /<database> after the host"; return 1 ;;
+  esac
+  # The userinfo ends at the LAST '@' of the authority, which is the rule both WHATWG URL and
+  # node-postgres follow, and it is the only reason a password containing '@' works at all.
+  case "$authority" in
+    *@*) userinfo="${authority%@*}"; hostport="${authority##*@}" ;;
+    *)   DB_IDENTITY_REASON="DATABASE_URL states no role: there is no user@ in front of the host"; return 1 ;;
+  esac
+  user="${userinfo%%:*}"
+  case "$hostport" in
+    \[*\]:*) host="${hostport%%]:*}]"; port="${hostport##*]:}" ;;
+    \[*)     DB_IDENTITY_REASON="DATABASE_URL states no port for the address ${hostport}"; return 1 ;;
+    *:*)     host="${hostport%:*}";    port="${hostport##*:}" ;;
+    *)       DB_IDENTITY_REASON="DATABASE_URL states no port: without one the connection takes PGPORT, or 5432, and which server it reaches is not stated by the URL"; return 1 ;;
+  esac
+  database="${path%%\?*}"
+  query=""
+  case "$path" in *\?*) query="${path#*\?}" ;; esac
+
+  [[ -n "$user" ]]     || { DB_IDENTITY_REASON="DATABASE_URL states an empty role"; return 1; }
+  [[ -n "$host" ]]     || { DB_IDENTITY_REASON="DATABASE_URL states an empty host"; return 1; }
+  [[ -n "$database" ]] || { DB_IDENTITY_REASON="DATABASE_URL states an empty database name"; return 1; }
+  case "$database" in */*) DB_IDENTITY_REASON="DATABASE_URL has more than one path segment (${path}), so which of them is the database is not stated"; return 1 ;; esac
+  [[ "$port" =~ ^[0-9]{1,5}$ ]] || { DB_IDENTITY_REASON="DATABASE_URL states the port '${port}', which is not a port number"; return 1; }
+  # PERCENT-ESCAPES ARE REFUSED, NOT DECODED. Decoding is a reimplementation, and this reader
+  # exists because reimplementations were the problem; a role or database written with one must
+  # be written plainly, or the fence is not run.
+  case "${user}${host}${database}" in *%*) DB_IDENTITY_REASON="DATABASE_URL percent-escapes part of its role, host or database, and this will not decode it — write them plainly or run with --skip-migrate"; return 1 ;; esac
+  # WHITESPACE would also be a value this cannot hand on unambiguously.
+  case "${user}${host}${database}${port}" in *[[:space:]]*) DB_IDENTITY_REASON="DATABASE_URL states a role, host or database containing whitespace"; return 1 ;; esac
+  # THE QUERY STRING MAY NOT RESTATE ANY OF THE FOUR. node-postgres copies every query parameter
+  # into its config, so one of these makes the URL's own authority a false statement about where
+  # it connects — which is the whole class of defect this reader exists to refuse.
+  if [[ -n "$query" ]]; then
+    IFS='&' read -r -a pairs <<<"$query"
+    local pair name
+    for pair in "${pairs[@]}"; do
+      name="${pair%%=*}"
+      case "$name" in
+        host|port|user|dbname|database)
+          DB_IDENTITY_REASON="DATABASE_URL carries ?${name}= in its query string, which node-postgres uses in preference to the authority — so the URL does not connect where it appears to. Delete it"
+          return 1 ;;
+      esac
+    done
+  fi
+
+  DB_IDENTITY_HOST="$host"
+  DB_IDENTITY_PORT="$port"
+  DB_IDENTITY_USER="$user"
+  DB_IDENTITY_DATABASE="$database"
+  DB_IDENTITY_REASON=""
+  DB_FENCE_IDENTITY_ARGS=(
+    "--app-host=${host}"
+    "--app-port=${port}"
+    "--app-user=${user}"
+    "--app-database=${database}"
+  )
+  return 0
+}
+
+# The refusal every fence mode goes through: four values or nothing happens.
+require_db_identity() {
+  [[ "${#DB_FENCE_IDENTITY_ARGS[@]}" -eq 4 ]] && return 0
+  return 1
+}
+
+# `.env` was sourced above, so DATABASE_URL is in hand. A failure here is not fatal at this
+# point — it is fatal in fence_db_connections() below, with the reason printed, before anything
+# is stopped or migrated.
+resolve_db_identity "${DATABASE_URL:-}" || true
+DB_FENCE_RELEASE_CMD="node ${DB_FENCE_SCRIPT} --release --state-file=${DB_FENCE_STATE} ${DB_FENCE_IDENTITY_ARGS[*]:-}"
 # Is the reboot fence ACTUALLY loaded by systemd right now? Distinct from FENCE_MASK, which
 # only says this run intends to migrate: the failure banner used to describe a drop-in that
 # may never have been installed (o3d-2sm1.5, Codex r4 HIGH).
@@ -792,6 +908,10 @@ fence_db_connections() {
   [[ -f "${DB_FENCE_SCRIPT}" ]] || die \
     "${DB_FENCE_SCRIPT} is not in this checkout, so this run cannot hold the database closed for the migration window. A snapshot probe is not a fence. Restore the script (it ships with the app) and re-run; nothing has been migrated."
 
+  # THE FENCE IS TOLD WHICH CONNECTION IT IS ABOUT, OR IT DOES NOT RUN (o3d-2sm1.5 r19).
+  require_db_identity || die \
+    "The application's connection identity could not be read from DATABASE_URL in ${APP_DIR}/.env: ${DB_IDENTITY_REASON}. The connection fence is TOLD which host, port, role and database it is closing — it no longer works that out from the environment, because seven rounds of doing so each uncovered another layer of systemd, Next and libpq composition. Write DATABASE_URL as a URL that states all four (postgresql://ROLE:PASSWORD@HOST:PORT/DATABASE, with no host/port/user/dbname query parameter) and re-run. Nothing has been stopped and nothing has been migrated."
+
   mkdir -p "${DB_FENCE_DIR}"
   chown "${APP_USER}:${APP_USER}" "${DB_FENCE_DIR}"
   chmod 700 "${DB_FENCE_DIR}"
@@ -800,7 +920,7 @@ fence_db_connections() {
   run_as_user "${APP_USER}" env \
     DATABASE_URL="${DATABASE_URL}" \
     DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-    node "${DB_FENCE_SCRIPT}" --fence --state-file="${DB_FENCE_STATE}" "${DB_FENCE_UNIT_ARG}" || rc=$?
+    node "${DB_FENCE_SCRIPT}" --fence --state-file="${DB_FENCE_STATE}" "${DB_FENCE_IDENTITY_ARGS[@]:-}" || rc=$?
 
   case "${rc}" in
     0)
@@ -812,7 +932,7 @@ fence_db_connections() {
       MIGRATION_DATABASE_URL="$(run_as_user "${APP_USER}" env \
         DATABASE_URL="${DATABASE_URL}" \
         DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-        node "${DB_FENCE_SCRIPT}" --print-migration-url "${DB_FENCE_UNIT_ARG}")" || die \
+        node "${DB_FENCE_SCRIPT}" --print-migration-url "${DB_FENCE_IDENTITY_ARGS[@]:-}")" || die \
         "The connection fence is up but the migration URL could not be composed, so the migration would run as the deploy admin and create objects the application cannot use. Nothing has been migrated; release the fence with: ${DB_FENCE_RELEASE_CMD}"
       [[ -n "${MIGRATION_DATABASE_URL}" ]] || die \
         "The connection fence is up but --print-migration-url produced nothing. Nothing has been migrated; release the fence with: ${DB_FENCE_RELEASE_CMD}"
@@ -875,6 +995,14 @@ require_fenceable_database() {
       warn "migration. See docs/installation.md. Nothing has been changed by this dry run."
       return 0
     fi
+    if ! require_db_identity; then
+      warn "A REAL RUN WOULD BE REFUSED HERE: the application's connection identity could not be"
+      warn "read from DATABASE_URL in ${APP_DIR}/.env — ${DB_IDENTITY_REASON}."
+      warn "The fence is TOLD which host, port, role and database it closes; it does not work that"
+      warn "out. Write DATABASE_URL as postgresql://ROLE:PASSWORD@HOST:PORT/DATABASE with no"
+      warn "host/port/user/dbname query parameter. Nothing has been changed by this dry run."
+      return 0
+    fi
     # The preflight changes nothing, so a dry run may run it for real — and saying what it
     # actually answered is the whole point of --dry-run. Not fatal here: a dry run that cannot
     # reach the database still exits 0, having said so.
@@ -882,7 +1010,7 @@ require_fenceable_database() {
     run_as_user "${APP_USER}" env \
       DATABASE_URL="${DATABASE_URL}" \
       DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-      node "${DB_FENCE_SCRIPT}" --preflight "${DB_FENCE_UNIT_ARG}" || dry_rc=$?
+      node "${DB_FENCE_SCRIPT}" --preflight "${DB_FENCE_IDENTITY_ARGS[@]:-}" || dry_rc=$?
     if [[ "${dry_rc}" -eq 0 ]]; then
       success "A REAL RUN WOULD BE FENCEABLE: the preflight above asked the database and it answered yes."
     else
@@ -897,6 +1025,8 @@ require_fenceable_database() {
     "${DB_FENCE_SCRIPT} is missing from this checkout, so the migration window cannot be fenced. Nothing has been stopped and nothing has been migrated."
   [[ -f "${DB_OBJECT_ACCESS_SCRIPT}" ]] || die \
     "${DB_OBJECT_ACCESS_SCRIPT} is missing from this checkout, so nothing would check that the application role can use what the migration creates. Nothing has been stopped and nothing has been migrated."
+  require_db_identity || die \
+    "The application's connection identity could not be read from DATABASE_URL in ${APP_DIR}/.env: ${DB_IDENTITY_REASON}. The connection fence is TOLD which host, port, role and database it is closing — it no longer works that out from the environment. Write DATABASE_URL as a URL that states all four (postgresql://ROLE:PASSWORD@HOST:PORT/DATABASE, with no host/port/user/dbname query parameter) and re-run. Nothing has been stopped and nothing has been migrated."
 
   # AND IT IS RUN, NOT LOOKED AT (o3d-2sm1.5, Codex r4 HIGH). This used to be `[[ -f ... ]]`,
   # which proves a file exists and nothing about whether it works — and its own dependency was
@@ -908,7 +1038,7 @@ require_fenceable_database() {
   run_as_user "${APP_USER}" env \
     DATABASE_URL="${DATABASE_URL}" \
     DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-    node "${DB_FENCE_SCRIPT}" --preflight "${DB_FENCE_UNIT_ARG}" || rc=$?
+    node "${DB_FENCE_SCRIPT}" --preflight "${DB_FENCE_IDENTITY_ARGS[@]:-}" || rc=$?
   [[ "${rc}" -eq 0 ]] || die \
     "The migration window could NOT be fenced (fence preflight exit ${rc}); the reason is printed above. Refusing to migrate. Nothing has been stopped and nothing has been migrated."
 
@@ -935,7 +1065,7 @@ release_db_connections() {
   run_as_user "${APP_USER}" env \
     DATABASE_URL="${DATABASE_URL}" \
     DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-    node "${DB_FENCE_SCRIPT}" --release --state-file="${DB_FENCE_STATE}" "${DB_FENCE_UNIT_ARG}" || rc=$?
+    node "${DB_FENCE_SCRIPT}" --release --state-file="${DB_FENCE_STATE}" "${DB_FENCE_IDENTITY_ARGS[@]:-}" || rc=$?
 
   if [[ "${rc}" -eq 0 ]]; then
     MIGRATION_DATABASE_URL="${DATABASE_URL}"
@@ -997,7 +1127,7 @@ refence_db_connections() {
   run_as_user "${APP_USER}" env \
     DATABASE_URL="${DATABASE_URL}" \
     DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-    node "${DB_FENCE_SCRIPT}" --fence --state-file="${DB_FENCE_STATE}" "${DB_FENCE_UNIT_ARG}" || rc=$?
+    node "${DB_FENCE_SCRIPT}" --fence --state-file="${DB_FENCE_STATE}" "${DB_FENCE_IDENTITY_ARGS[@]:-}" || rc=$?
   # EVERY POST-COMMIT RESULT RAISES THE STICKY FLAG (o3d-2sm1.5, Codex r13 HIGH). Exit 5 says
   # the REVOKEs are COMMITTED and standing: this call could not call the database fenced, but it
   # certainly fenced something, and DB_FENCE_RAISED is the flag that decides whether a later
@@ -1027,7 +1157,7 @@ refence_db_connections() {
   MIGRATION_DATABASE_URL="$(run_as_user "${APP_USER}" env \
     DATABASE_URL="${DATABASE_URL}" \
     DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-    node "${DB_FENCE_SCRIPT}" --print-migration-url "${DB_FENCE_UNIT_ARG}")" || url_rc=$?
+    node "${DB_FENCE_SCRIPT}" --print-migration-url "${DB_FENCE_IDENTITY_ARGS[@]:-}")" || url_rc=$?
   if [[ "${url_rc}" -ne 0 || -z "${MIGRATION_DATABASE_URL}" ]]; then
     MIGRATION_DATABASE_URL=""
     warn "--print-migration-url refused to compose a migration URL (exit ${url_rc}); NOT falling back to DEPLOY_ADMIN_DATABASE_URL. The fence is up."
@@ -1252,7 +1382,7 @@ on_exit() {
           error "The only thing keeping it off is that ${SERVICE_UNIT} is stopped and fenced"
           error "against a reboot. Do NOT start it. Close the database by hand, or re-run this"
           error "script, which re-establishes the fence before it rebuilds:"
-          error "  node ${DB_FENCE_SCRIPT} --fence --state-file=${DB_FENCE_STATE} ${DB_FENCE_UNIT_ARG}"
+          error "  node ${DB_FENCE_SCRIPT} --fence --state-file=${DB_FENCE_STATE} ${DB_FENCE_IDENTITY_ARGS[*]:-}"
         fi
       else
         release_db_connections || true

@@ -633,12 +633,35 @@ LEGACY_CRON_BACKUP="${LEGACY_CUTOVER_STATE_DIR}/crontab-${APP_USER}.bak"
 LEGACY_DB_FENCE_STATE="${LEGACY_CUTOVER_STATE_DIR}/db-connect-fence.json"
 DB_FENCE_SCRIPT="${APP_DIR}/scripts/fence-db-connections.mjs"
 DB_OBJECT_ACCESS_SCRIPT="${APP_DIR}/scripts/check-app-db-object-access.mjs"
-# WHICH UNIT THE FENCE ASKS SYSTEMD ABOUT (o3d-2sm1.5 r18, Codex r17 CRITICAL). This script GENERATES
-# /etc/systemd/system/${APP_NAME}.service, so it is the one place that knows the unit name for
-# certain — and the fence only ever runs on an upgrade cutover, where that unit already exists (a
-# FIRST install has no database to hold closed and never reaches it; see require_fenceable_database).
-DB_FENCE_UNIT_ARG="--service-unit=${APP_NAME}.service"
-DB_FENCE_RELEASE_CMD="node ${DB_FENCE_SCRIPT} --release --state-file=${DB_FENCE_STATE} ${DB_FENCE_UNIT_ARG}"
+# THE APPLICATION'S CONNECTION IDENTITY, WHICH THIS INSTALLER OWNS OUTRIGHT (o3d-2sm1.5 r19).
+#
+# scripts/fence-db-connections.mjs no longer works out where the application connects. Seven
+# rounds of deriving it — from the URL, from node-postgres's own resolution, from the deploy
+# shell's PG* variables, from the service's environment file, from `systemctl show` — each gave a
+# locally correct answer and uncovered another layer beneath it (PassEnvironment=,
+# UnsetEnvironment=, wildcard EnvironmentFile= globs, Next's per-mode dotenv overlays, a unit
+# with no WorkingDirectory=, DATABASE_URL's own precedence chain). The question is unbounded,
+# because the composition rules belong to systemd, Next and libpq at once. So the fence is TOLD,
+# and refuses if it is not.
+#
+# HERE THERE IS NOTHING TO PARSE AND NOTHING TO GUESS. This script PROMPTS for DB_HOST, DB_PORT,
+# DB_NAME and DB_USER, CREATEs the role and the database with them, and COMPOSES DATABASE_URL out
+# of them further down. The four values below are those same variables, and they are filled in at
+# that point — deliberately EMPTY until then, so a fence reached before the database exists (an
+# exit trap on an early failure) refuses rather than fencing an unnamed connection.
+DB_FENCE_IDENTITY_ARGS=()
+db_fence_release_cmd() {
+  local args="" arg
+  for arg in "${DB_FENCE_IDENTITY_ARGS[@]:-}"; do
+    [[ -n "${arg}" ]] && args+=" ${arg}"
+  done
+  echo "node ${DB_FENCE_SCRIPT} --release --state-file=${DB_FENCE_STATE}${args}"
+}
+require_db_identity() {
+  [[ "${#DB_FENCE_IDENTITY_ARGS[@]}" -eq 4 ]] && return 0
+  return 1
+}
+DB_FENCE_RELEASE_CMD="$(db_fence_release_cmd)"
 # Is the reboot fence ACTUALLY loaded by systemd right now? Distinct from FENCE_ARMED, which
 # only says this run has stopped something: the failure banner used to describe a drop-in that
 # may never have been installed (o3d-2sm1.5, Codex r4 HIGH).
@@ -1303,6 +1326,11 @@ resume_from_interrupted_arming() {
 fence_db_connections() {
   [[ -f "${DB_FENCE_SCRIPT}" ]] || die \
     "${DB_FENCE_SCRIPT} is not in this checkout, so this run cannot hold the database closed for the migration window. A snapshot probe is not a fence. Restore the script (it ships with the app) and re-run; nothing has been migrated."
+  # THE FENCE IS TOLD WHICH CONNECTION IT IS ABOUT, OR IT DOES NOT RUN (o3d-2sm1.5 r19). Reaching
+  # here before the PostgreSQL section has filled these in means this run has no database of its
+  # own yet, and a fence over an unnamed connection is exactly what this round removed.
+  require_db_identity || die \
+    "The application's database has not been set up yet in this run, so there is no host, port, role and database to tell the connection fence about. The fence is TOLD which connection it closes — it no longer works that out from the environment. Nothing has been migrated."
   mkdir -p "${DB_FENCE_DIR}"
   chown "${APP_USER}:${APP_USER}" "${DB_FENCE_DIR}"
   chmod 700 "${DB_FENCE_DIR}"
@@ -1311,7 +1339,7 @@ fence_db_connections() {
   ( cd "${APP_DIR}" && run_as_user "${APP_USER}" env \
       DATABASE_URL="${DATABASE_URL}" \
       DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-      node "${DB_FENCE_SCRIPT}" --fence --state-file="${DB_FENCE_STATE}" "${DB_FENCE_UNIT_ARG}" ) || rc=$?
+      node "${DB_FENCE_SCRIPT}" --fence --state-file="${DB_FENCE_STATE}" "${DB_FENCE_IDENTITY_ARGS[@]:-}" ) || rc=$?
 
   case "${rc}" in
     0)
@@ -1325,7 +1353,7 @@ fence_db_connections() {
       MIGRATION_DATABASE_URL="$( cd "${APP_DIR}" && run_as_user "${APP_USER}" env \
         DATABASE_URL="${DATABASE_URL}" \
         DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-        node "${DB_FENCE_SCRIPT}" --print-migration-url "${DB_FENCE_UNIT_ARG}" )" || die \
+        node "${DB_FENCE_SCRIPT}" --print-migration-url "${DB_FENCE_IDENTITY_ARGS[@]:-}" )" || die \
         "The connection fence is up but the migration URL could not be composed, so the migration would run as the deploy admin and create objects the application cannot use. Nothing has been migrated; release the fence with: ${DB_FENCE_RELEASE_CMD}"
       [[ -n "${MIGRATION_DATABASE_URL}" ]] || die \
         "The connection fence is up but --print-migration-url produced nothing. Nothing has been migrated; release the fence with: ${DB_FENCE_RELEASE_CMD}"
@@ -1385,6 +1413,8 @@ require_fenceable_database() {
     "${DB_FENCE_SCRIPT} is missing from this checkout, so the migration window cannot be fenced. Nothing has been stopped and nothing has been migrated."
   [[ -f "${DB_OBJECT_ACCESS_SCRIPT}" ]] || die \
     "${DB_OBJECT_ACCESS_SCRIPT} is missing from this checkout, so nothing would check that the application role can use what the migration creates. Nothing has been stopped and nothing has been migrated."
+  require_db_identity || die \
+    "The application's database has not been set up yet in this run, so there is no host, port, role and database to tell the connection fence about. The fence is TOLD which connection it closes — it no longer works that out from the environment. Nothing has been stopped and nothing has been migrated."
 
   # AND IT IS RUN, NOT LOOKED AT (o3d-2sm1.5, Codex r4 HIGH). This used to be `[[ -f ... ]]`,
   # which proves a file exists and nothing about whether it works — and its own dependency was
@@ -1396,7 +1426,7 @@ require_fenceable_database() {
   ( cd "${APP_DIR}" && run_as_user "${APP_USER}" env \
       DATABASE_URL="${DATABASE_URL}" \
       DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-      node "${DB_FENCE_SCRIPT}" --preflight "${DB_FENCE_UNIT_ARG}" ) || rc=$?
+      node "${DB_FENCE_SCRIPT}" --preflight "${DB_FENCE_IDENTITY_ARGS[@]:-}" ) || rc=$?
   [[ "${rc}" -eq 0 ]] || die \
     "The migration window could NOT be fenced (fence preflight exit ${rc}); the reason is printed above. Refusing to migrate an EXISTING installation. Nothing has been stopped and nothing has been migrated."
 
@@ -1418,7 +1448,7 @@ release_db_connections() {
   ( cd "${APP_DIR}" && run_as_user "${APP_USER}" env \
       DATABASE_URL="${DATABASE_URL}" \
       DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-      node "${DB_FENCE_SCRIPT}" --release --state-file="${DB_FENCE_STATE}" "${DB_FENCE_UNIT_ARG}" ) || rc=$?
+      node "${DB_FENCE_SCRIPT}" --release --state-file="${DB_FENCE_STATE}" "${DB_FENCE_IDENTITY_ARGS[@]:-}" ) || rc=$?
 
   if [[ "${rc}" -eq 0 ]]; then
     MIGRATION_DATABASE_URL="${DATABASE_URL}"
@@ -1471,11 +1501,14 @@ refence_db_connections() {
   ${DB_FENCE_UP} && return 0
   [[ -f "${DB_FENCE_SCRIPT}" ]] || return 1
   [[ -n "${DEPLOY_ADMIN_DATABASE_URL}" ]] || return 1
+  # No identity, no fence (o3d-2sm1.5 r19). A soft refusal, not a die: this runs inside the exit
+  # trap, where dying loses the status and the banner.
+  require_db_identity || return 1
   local rc=0
   ( cd "${APP_DIR}" && run_as_user "${APP_USER}" env \
       DATABASE_URL="${DATABASE_URL}" \
       DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-      node "${DB_FENCE_SCRIPT}" --fence --state-file="${DB_FENCE_STATE}" "${DB_FENCE_UNIT_ARG}" ) || rc=$?
+      node "${DB_FENCE_SCRIPT}" --fence --state-file="${DB_FENCE_STATE}" "${DB_FENCE_IDENTITY_ARGS[@]:-}" ) || rc=$?
   # EVERY POST-COMMIT RESULT RAISES THE STICKY FLAG (o3d-2sm1.5, Codex r13 HIGH). Exit 5 says
   # the REVOKEs are COMMITTED and standing: this call could not call the database fenced, but it
   # certainly fenced something, and DB_FENCE_RAISED is the flag that decides whether a later
@@ -1505,7 +1538,7 @@ refence_db_connections() {
   MIGRATION_DATABASE_URL="$( cd "${APP_DIR}" && run_as_user "${APP_USER}" env \
     DATABASE_URL="${DATABASE_URL}" \
     DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-    node "${DB_FENCE_SCRIPT}" --print-migration-url "${DB_FENCE_UNIT_ARG}" )" || url_rc=$?
+    node "${DB_FENCE_SCRIPT}" --print-migration-url "${DB_FENCE_IDENTITY_ARGS[@]:-}" )" || url_rc=$?
   if [[ "${url_rc}" -ne 0 || -z "${MIGRATION_DATABASE_URL}" ]]; then
     MIGRATION_DATABASE_URL=""
     warn "--print-migration-url refused to compose a migration URL (exit ${url_rc}); NOT falling back to DEPLOY_ADMIN_DATABASE_URL. The fence is up."
@@ -1814,7 +1847,7 @@ on_cutover_exit() {
       error "  The only thing keeping it off is that ${APP_NAME}.service is stopped and fenced"
       error "  against a reboot. Do NOT start it. Close the database by hand, or re-run this"
       error "  installer, which re-establishes the fence before it migrates:"
-      error "    node ${DB_FENCE_SCRIPT} --fence --state-file=${DB_FENCE_STATE} ${DB_FENCE_UNIT_ARG}"
+      error "    node ${DB_FENCE_SCRIPT} --fence --state-file=${DB_FENCE_STATE} ${DB_FENCE_IDENTITY_ARGS[*]:-}"
     fi
   else
     release_db_connections || true
@@ -2208,6 +2241,18 @@ EOSQL
 fi
 
 DATABASE_URL="postgresql://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}"
+
+# THE SAME FOUR VALUES THE URL ABOVE WAS COMPOSED FROM, handed to the connection fence rather
+# than parsed back out of it (o3d-2sm1.5 r19). Nothing is derived, so nothing can be derived
+# wrongly; and because the URL states all four, no PGHOST/PGPORT/PGUSER/PGDATABASE in any
+# process can move the connection away from them.
+DB_FENCE_IDENTITY_ARGS=(
+  "--app-host=${DB_HOST}"
+  "--app-port=${DB_PORT}"
+  "--app-user=${DB_USER}"
+  "--app-database=${DB_NAME}"
+)
+DB_FENCE_RELEASE_CMD="$(db_fence_release_cmd)"
 
 # ---------------------------------------------------------------------------
 # 6. SSH

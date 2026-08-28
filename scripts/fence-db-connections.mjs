@@ -125,13 +125,15 @@
 //     Said here because the state file calls itself a restore of "exactly the grants".
 //
 // WHICH DATABASE ANY OF THIS IS ABOUT. Every mode above connects through
-// DEPLOY_ADMIN_DATABASE_URL when it is set, and asks its questions of `current_database()` on
-// that connection while taking the ROLE from DATABASE_URL. assessDatabaseIdentity() is what
-// binds the two together — same host, same port, same database name, and the live connection
-// attached to it — and no mode fences or releases without it (o3d-2sm1.5, Codex r13 CRITICAL).
-// `--release` goes further on the path where it has no record: the claim "the application can
-// connect" is made by CONNECTING AS THE APPLICATION, because a privilege read taken over the
-// admin connection answers about the admin connection's database.
+// DEPLOY_ADMIN_DATABASE_URL when it is set and asks its questions of `current_database()` on that
+// connection — while the application's own host, port, role and database are SUPPLIED ON ARGV by
+// the caller (`--app-host`, `--app-port`, `--app-user`, `--app-database`) and are never worked out
+// here. assessDatabaseIdentity() binds the two together — same host, same port, same database
+// name, and the live connection attached to it — and no mode fences or releases without it
+// (o3d-2sm1.5, Codex r13 CRITICAL). `--release` goes further on the path where it has no record:
+// the claim "the application can connect" is made by CONNECTING AS THE APPLICATION, because a
+// privilege read taken over the admin connection answers about the admin connection's database —
+// and that probe must land on the SAME POSTMASTER as this run, or it is refused.
 //
 // THE STATE FILE is written BEFORE anything is revoked, and it records what each
 // grantee held beforehand so that `--release` restores that and not "everything".
@@ -140,10 +142,8 @@
 // than the fenced snapshot.
 // =============================================================================
 
-import { spawnSync } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
-import { userInfo } from 'node:os'
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname, resolve as resolvePath } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
@@ -151,77 +151,111 @@ import { config as loadDotenv } from 'dotenv'
 import pg from 'pg'
 
 // ---------------------------------------------------------------------------
-// WHOSE ENVIRONMENT DECIDES WHERE THIS SCRIPT LOOKS (o3d-2sm1.5, Codex r18)
+// THE APPLICATION'S CONNECTION IDENTITY IS REQUIRED, NOT INFERRED (o3d-2sm1.5 r19)
 //
-// r16 moved identity onto the driver, which was right: `pg` fills every value a URL omits from
-// `PGHOST`, `PGPORT`, `PGUSER` and `PGDATABASE` before it dials, so nothing short of the driver
-// can say where a URL lands. r17 asked whose `PGHOST` that was — the deploy shell's, not the
-// service's — and that was right too. What r17 then did was WRITE ITS OWN systemd: it read
-// `<app dir>/.env` with dotenv and called the result "the environment the unit is given". That is
-// rounds 13-16 again with a new spec. Those rounds were all one mistake — our reimplementation of
-// the DRIVER's URL parsing disagreed with the driver — and it was settled by asking the driver.
-// Reimplementing systemd's `EnvironmentFile` grammar (quoting, escaping, continuation, `-`
-// prefixes, later-file-wins, `Environment=`, drop-ins layered over all of it) is the same trap:
-// dotenv reads `PGUSER=ims#writer` as `ims`, systemd reads it as `ims#writer`, and BOTH are legal
-// PostgreSQL roles — so the fence revokes CONNECT from one while the service keeps connecting as
-// the other.
+// SEVEN ROUNDS went into deciding WHERE THE APPLICATION CONNECTS by reconstructing what its
+// runtime resolves. Every answer was locally correct and uncovered another layer:
 //
-// SO THE AUTHORITY IS ASKED. `systemctl show <unit>` reports what systemd resolved: the unit's
-// `Environment=` with every drop-in already layered in the right order, the ordered
-// `EnvironmentFiles=` list with each entry's `ignore_errors` flag, the `User=` the service runs
-// as, and the `WorkingDirectory=` that says which app dir this unit is. Nothing here reconstructs
-// any of that.
+//   r13-r15  this file's own reading of the URL disagreed with the driver's — authority-versus-
+//            query precedence, `?user=` overriding the authority, repeated parameters.
+//   r16      the driver's STRING PARSER disagreed with the driver's CONNECTION: `pg` fills
+//            PGHOST, PGPORT, PGUSER and PGDATABASE in for everything the URL omits.
+//   r17      the environment those come from is the DEPLOY SHELL'S, not the service's — so the
+//            service's environment file was read instead.
+//   r18      reading that file is reimplementing systemd, so systemd was asked instead. It
+//            answers for the `Environment=` layer and NOT for the file layer, which then had to
+//            be refused on a mention of the name.
+//   r19      and the review of r18 named five more layers: `PassEnvironment=`, `UnsetEnvironment=`,
+//            wildcard `EnvironmentFile=` globs, the `.env.development*` / `.env.test*` overlays
+//            Next loads in other modes, a unit with no `WorkingDirectory=` — and a separate
+//            precedence chain for `DATABASE_URL` itself.
 //
-// AND THE ONE THING SYSTEMD WILL NOT TELL US IS REFUSED RATHER THAN GUESSED (verified against
-// this host's real units, read-only, 2026-08-28):
+// THE COUNT WENT 1 -> 4 -> 5, four of them CRITICAL. That is not an implementation problem. THE
+// QUESTION HAS NO BOUNDED ANSWER: the composition rules belong to three different systems
+// (systemd, Next, libpq), each of them is free to add a layer, and a helper that answers it will
+// be wrong again the round after it is made right.
 //
-//     $ systemctl show ims-stage-dev.service -p Environment -p EnvironmentFiles
-//     Environment=NODE_ENV=development ... NPM_CONFIG_CACHE=/opt/ims/onetwo3d-ims/.npm-cache
-//     EnvironmentFiles=/opt/ims/onetwo3d-ims/.env (ignore_errors=yes)
+// SO IT IS NO LONGER ASKED. The four values that decide WHICH CONNECTION this run is talking
+// about — HOST, PORT, USER and DATABASE — arrive on argv, and a run that is not given all four
+// REFUSES. There is no environment reconstruction, no systemd interrogation, no dotenv scanning
+// and no precedence emulation left in this file to be wrong about.
 //
-// `Environment=` is the `Environment=` DIRECTIVES ONLY. systemd reads an `EnvironmentFile` when it
-// forks the service, not when it loads the unit, and it never publishes the result: the seven
-// variables above are the unit's own, and the file's contents (23 variables in that service's
-// `/proc/<MainPID>/environ`, `DATABASE_URL` among them) appear in no property systemd exposes. So
-// "ask systemd for the unit's resolved environment" has an authoritative answer for the
-// `Environment=` layer and NO answer at all for the file layer.
+// WHO SUPPLIES THEM, AND HOW THEY KNOW. The operator is asked for nothing new; the callers
+// already hold everything below.
 //
-// The file layer is therefore settled by the one question about a file's contents that every
-// grammar answers the same way: DOES THE FILE MENTION THE NAME AT ALL? dotenv, systemd, `sh` and
-// a hand-written parser all agree that a file in which the bytes `PGUSER` never appear does not
-// set `PGUSER`. When none of the four names appears in any file systemd will read, no parsing
-// disagreement is possible and the `Environment=` layer is the whole answer. When one of them
-// DOES appear, this refuses and says to move it into the unit's `Environment=`, where systemd
-// will report it. That is a refusal, not a guess, and it is the only reading that cannot be wrong.
+//   scripts/install.sh   OWNS the four. It prompts for DB_HOST, DB_PORT, DB_NAME and DB_USER,
+//                        CREATEs the role and the database with them, and COMPOSES DATABASE_URL
+//                        out of them. It passes those same variables. Nothing is parsed at all.
+//   scripts/update.sh    read DATABASE_URL from `<app dir>/.env` — the file they already take
+//   scripts/deploy.sh    DEPLOY_ADMIN_DATABASE_URL from — and split it with a STRICT reader
+//                        (`db_identity_from_url`, the same twenty lines in both) that ACCEPTS
+//                        ONLY A URL STATING ALL FOUR. No port, no path, an identity-bearing query
+//                        parameter, a percent-escape in a component it would have to decode: each
+//                        one is a REFUSAL that stops the deploy before anything is stopped or
+//                        migrated. Never a default.
 //
-// A file systemd WILL read and this CANNOT read is a refusal for the same reason (Codex r17
-// CRITICAL): "unreadable" is not "sets none of them". The only skip is the one systemd itself
-// makes — an `EnvironmentFile=-` whose file does not exist.
+// AND THE STRICTNESS IS WHAT CLOSES THE QUESTION RATHER THAN NARROWING IT. `PGHOST`, `PGPORT`,
+// `PGUSER` and `PGDATABASE` are consulted by libpq and by `pg` ONLY for values the connection
+// string leaves out. A URL that states all four cannot be moved by any of them, in any process,
+// under any of the three composition systems above — so for exactly the URLs the callers accept,
+// the environment question has no bearing on the answer, and for every other URL there is a
+// refusal in place of a guess.
 //
-// THE SAME SCAN COVERS THE APPLICATION'S OWN DOTENV OVERLAY. `<app dir>/.env.local` and friends
-// never reach systemd at all; Next loads them inside the process, after exec, and a `PGHOST` there
-// would move the application's connection without appearing in any systemd property. It is not
-// parsed either — it is scanned for the same four names and refused on a mention.
+// WHAT IS STILL PROVEN HERE, because being TOLD an identity is not the same as being ON it:
 //
-// WHICH UNIT, AND HOW WE KNOW. The unit name is NOT hardcoded here and NOT read from this
-// process's environment (Codex r17 CRITICAL: `IMS_SERVICE_ENV_FILE` came straight off the
-// invoking shell, so a stale variable redirected every mode to an unrelated file). It arrives as
-// `--service-unit=<unit>`, once per unit, from the entrypoint that already knows how it addresses
-// the service: scripts/deploy.sh from its `SERVICE_UNITS` (detected by `WorkingDirectory`, or
-// `IMS_SERVICE_UNIT`), scripts/update.sh from `SERVICE_UNIT`, scripts/install.sh from
-// `${APP_NAME}.service`. No units named is a refusal. Two units that disagree about one of the
-// four is a refusal.
+//   * the admin URL this run opens must reach the SAME database and the SAME server as the four
+//     supplied values, or this refuses (assessDatabaseIdentity);
+//   * the connection actually opened must report that database as `current_database()`, and must
+//     be running as the role it logged in as, or this refuses;
+//   * and in `--release`, the application probe must reach THE SAME POSTMASTER as this
+//     connection — `pg_postmaster_start_time()`, asked of both — before "the application can
+//     connect" is allowed to mean anything about this database.
 //
-// AND THE UNIT IS CHECKED TO BE THIS APP'S. systemd's `WorkingDirectory=` must resolve to the
-// directory this script ships in, so being handed the wrong unit name is caught here rather than
-// producing a confident fence against another installation's cluster.
+// `DATABASE_URL` IS A CREDENTIAL HERE AND NOTHING ELSE. It is no longer read for the role, the
+// host, the port or the database name. The only thing this file does with it is OPEN it, in
+// `--release`, to see whether the application gets in; where that lands is then cross-checked
+// against the supplied identity and against this connection's own postmaster. `.env.local` is no
+// longer loaded either: systemd hands the service `.env`, and reading a file the service never
+// sees was divergence with nothing to gain.
 // ---------------------------------------------------------------------------
 
-/** The four `pg` reads from the environment to decide WHERE a connection lands and AS WHOM. */
-export const IDENTITY_ENVIRONMENT_VARIABLES = ['PGHOST', 'PGPORT', 'PGUSER', 'PGDATABASE']
+/** The argv options a run must be GIVEN before it may claim to know which connection it means. */
+export const REQUIRED_IDENTITY_OPTIONS = ['--app-host', '--app-port', '--app-user', '--app-database']
 
-/** Everything this asks systemd about a unit. `LoadState` is what proves the answer was real. */
-export const UNIT_PROPERTIES = ['LoadState', 'Environment', 'EnvironmentFiles', 'WorkingDirectory', 'User', 'FragmentPath']
+/**
+ * Pure: the application connection's identity AS SUPPLIED, or the reason this run cannot say
+ * which connection it is about.
+ *
+ * Nothing is defaulted and nothing is filled in from anywhere. A blank value is a missing value:
+ * `--app-host=` with nothing after it is the shape an unset shell variable takes when a caller
+ * interpolates it, and it must not be mistaken for `localhost`.
+ *
+ * The port is checked to be a port because every comparison below prints it and one of them
+ * compares it: `pg` runs a port through `parseInt`, so `--app-port=` carrying a word would make
+ * this run's idea of the server and the driver's differ silently.
+ */
+export function requireSuppliedIdentity(options = {}) {
+  const identity = {
+    host: String(options.appHost ?? '').trim(),
+    port: String(options.appPort ?? '').trim(),
+    user: String(options.appUser ?? '').trim(),
+    database: String(options.appDatabase ?? '').trim(),
+  }
+  const missing = REQUIRED_IDENTITY_OPTIONS.filter((option, index) => identity[['host', 'port', 'user', 'database'][index]] === '')
+  if (missing.length > 0) {
+    return {
+      ok: false,
+      reason: `${missing.join(', ')} ${missing.length === 1 ? 'was' : 'were'} not supplied. This run will NOT work out where the application connects: seven rounds of reconstructing it from URLs, driver defaults, systemd properties and dotenv overlays each produced a locally correct answer and another layer underneath, because the composition rules belong to systemd, Next and libpq at once and are open-ended. The caller states the four values instead — scripts/deploy.sh and scripts/update.sh split them out of DATABASE_URL with a reader that refuses any URL not stating all four, and scripts/install.sh passes the DB_HOST, DB_PORT, DB_USER and DB_NAME it created the database with`,
+    }
+  }
+  if (!/^[0-9]{1,5}$/.test(identity.port) || Number(identity.port) < 1 || Number(identity.port) > 65535) {
+    return {
+      ok: false,
+      reason: `--app-port=${JSON.stringify(identity.port)} is not a port number, so which server this run is talking about cannot be stated`,
+    }
+  }
+  return { ok: true, reason: '', identity }
+}
 
 /**
  * The application directory, from THIS FILE'S OWN LOCATION and nothing else.
@@ -233,373 +267,6 @@ export const UNIT_PROPERTIES = ['LoadState', 'Environment', 'EnvironmentFiles', 
  */
 export function appDirectory(scriptUrl = import.meta.url) {
   return dirname(dirname(fileURLToPath(scriptUrl)))
-}
-
-/**
- * `systemctl show` output — `Key=Value` per line — as a Map.
- *
- * A property whose value is EMPTY is still printed (`Environment=`); a property that does not
- * apply is OMITTED ENTIRELY (a unit with no `EnvironmentFile=` prints no `EnvironmentFiles=`
- * line, and neither does a unit that does not exist). Both were measured against this host.
- * `LoadState` is printed in every case, which is why its ABSENCE is what this reads as "systemd
- * did not answer" rather than treating an empty answer as an answer.
- */
-export function parseSystemctlShow(text) {
-  const properties = new Map()
-  for (const line of String(text).split('\n')) {
-    if (line === '') continue
-    const equals = line.indexOf('=')
-    if (equals <= 0) continue
-    properties.set(line.slice(0, equals), line.slice(equals + 1))
-  }
-  return properties
-}
-
-/**
- * systemd's serialization of `EnvironmentFiles=`: one `<path> (ignore_errors=yes|no)` per line.
- *
- * The flag is the `-` prefix in the unit file, and it is the ONLY skip this module honours: a
- * missing optional file is skipped by systemd too, so skipping it is faithful rather than
- * permissive. Anything else about a listed file — unreadable, unstattable, present but
- * unparseable-by-anyone — is a refusal.
- *
- * @throws {Error} on a line this cannot read, because an EnvironmentFile it cannot even NAME is
- *   a file it cannot rule out.
- */
-export function parseSystemdEnvironmentFiles(value) {
-  const files = []
-  for (const line of String(value ?? '').split('\n')) {
-    const trimmed = line.trim()
-    if (trimmed === '') continue
-    const match = /^(.*) \(ignore_errors=(yes|no)\)$/.exec(trimmed)
-    if (!match) throw new Error(`systemd reported an EnvironmentFiles entry this cannot read: ${JSON.stringify(trimmed)}`)
-    files.push({ path: match[1], ignoreErrors: match[2] === 'yes' })
-  }
-  return files
-}
-
-/**
- * systemd's serialization of `Environment=`: a string vector, space separated, each element
- * double-quoted and C-escaped when it needs to be.
- *
- * THIS IS A PARSER, AND THAT IS THE POINT OF THE THROW. It reads systemd's OUTPUT FORMAT — a
- * bounded grammar whose whole job is to be read back — not systemd's `EnvironmentFile` semantics,
- * which is the thing this round stopped reimplementing. Anything it cannot read unambiguously
- * (an unterminated quote, an escape it does not know, an element with no `=`) throws, and the
- * caller turns that into the same refusal as "systemd could not be asked": the answer could not
- * be parsed, so there is no answer.
- *
- * @throws {Error}
- */
-export function parseSystemdEnvironment(value) {
-  const text = String(value ?? '')
-  const values = new Map()
-  let index = 0
-  while (index < text.length) {
-    if (text[index] === ' ') {
-      index += 1
-      continue
-    }
-    let element = ''
-    let quoted = false
-    while (index < text.length) {
-      const character = text[index]
-      if (!quoted && character === ' ') break
-      index += 1
-      if (character === '"') {
-        quoted = !quoted
-        continue
-      }
-      if (character !== '\\') {
-        element += character
-        continue
-      }
-      const escape = text[index]
-      index += 1
-      if (escape === undefined) throw new Error('systemd reported an Environment= ending in a lone backslash')
-      const simple = { n: '\n', t: '\t', r: '\r', '\\': '\\', '"': '"', "'": "'", a: '\x07', b: '\b', f: '\f', v: '\v', s: ' ' }
-      if (Object.prototype.hasOwnProperty.call(simple, escape)) {
-        element += simple[escape]
-        continue
-      }
-      if (escape === 'x') {
-        const hex = text.slice(index, index + 2)
-        if (!/^[0-9A-Fa-f]{2}$/.test(hex)) throw new Error('systemd reported an Environment= with a malformed \\x escape')
-        element += String.fromCharCode(parseInt(hex, 16))
-        index += 2
-        continue
-      }
-      throw new Error(`systemd reported an Environment= with an escape this cannot read: \\${escape}`)
-    }
-    if (quoted) throw new Error('systemd reported an Environment= with an unterminated quote')
-    if (element === '') continue
-    const equals = element.indexOf('=')
-    if (equals <= 0) throw new Error(`systemd reported an Environment= element that is not NAME=VALUE: ${JSON.stringify(element)}`)
-    values.set(element.slice(0, equals), element.slice(equals + 1))
-  }
-  return values
-}
-
-/**
- * The first identity variable whose NAME appears anywhere in this text, or ''.
- *
- * THE ONE QUESTION EVERY GRAMMAR ANSWERS THE SAME WAY. dotenv, systemd, `sh` and anything else
- * agree that a file in which the bytes `PGUSER` never occur does not set `PGUSER`; they disagree
- * about almost everything else, which is why nothing here parses these files. A substring match
- * is deliberately BROADER than "assigns it": `MY_PGUSER=x`, or the name inside a comment, is
- * reported too. Over-reporting costs a refusal with an instruction; under-reporting costs a fence
- * on the wrong cluster.
- */
-export function mentionedIdentityVariable(text) {
-  const haystack = String(text)
-  return IDENTITY_ENVIRONMENT_VARIABLES.find((name) => haystack.includes(name)) ?? ''
-}
-
-/**
- * The dotenv files the APPLICATION ITSELF loads, after exec, inside the process.
- *
- * These never reach systemd — Next reads them at startup — so no systemd property can report a
- * `PGHOST` in one, and it would still move the application's connection. They are scanned for a
- * mention exactly like the files systemd reads, and refused on one. `.env` is in both lists on
- * purpose; scanning it twice costs nothing.
- */
-export function applicationDotenvPaths(appDir) {
-  return ['.env.local', '.env.production.local', '.env.production', '.env'].map((name) => resolvePath(appDir, name))
-}
-
-/**
- * WHERE `systemctl` IS, WITHOUT ASKING `PATH` (o3d-2sm1.5 r18).
- *
- * The authority is only an authority if the thing answering really is systemd. `PATH` is
- * inherited, and this whole round is about not letting the invoking shell decide what this script
- * resolves — so the binary is looked for at the places a distribution puts it, and NOWHERE ELSE.
- * None of them present is "systemd cannot be asked", which is a refusal.
- */
-export const SYSTEMCTL_PATHS = ['/usr/bin/systemctl', '/bin/systemctl', '/usr/sbin/systemctl', '/sbin/systemctl']
-
-export function findSystemctl(paths = SYSTEMCTL_PATHS, io = {}) {
-  const exists = io.exists ?? ((path) => { try { statSync(path); return true } catch { return false } })
-  return paths.find((path) => exists(path)) ?? ''
-}
-
-/**
- * `systemctl show` for one unit, or a failure this can refuse on.
- *
- * `systemctlPath` is an EXPLICIT ARGUMENT, defaulting to the discovery above and overridable only
- * through `--systemctl=`. That is the shape Codex asked for when it rejected `IMS_SERVICE_ENV_FILE`
- * (r17 CRITICAL): an argv value comes from the entrypoint that ran this, or from an operator
- * typing the command, and unlike an environment variable it cannot arrive from a `.bashrc`, a
- * cron wrapper or a shell left open since last week. The shipped entrypoints never pass it; the
- * tests do, because a test cannot install a systemd unit.
- */
-function systemctlShowUnit(unit, systemctlPath = '') {
-  const binary = systemctlPath || findSystemctl()
-  if (!binary) {
-    return { ok: false, reason: `systemd cannot be asked: no systemctl at ${SYSTEMCTL_PATHS.join(', ')}`, stdout: '' }
-  }
-  let result
-  try {
-    result = spawnSync(binary, ['show', '--no-pager', ...UNIT_PROPERTIES.map((property) => `--property=${property}`), unit], {
-      encoding: 'utf8',
-    })
-  } catch (error) {
-    return { ok: false, reason: `systemd could not be asked (${error instanceof Error ? error.message : String(error)})`, stdout: '' }
-  }
-  if (result.error) return { ok: false, reason: `systemd could not be asked (${result.error.message})`, stdout: '' }
-  if (result.status !== 0) {
-    return { ok: false, reason: `${binary} show ${unit} exited ${result.status}: ${String(result.stderr ?? '').trim() || 'no output'}`, stdout: '' }
-  }
-  return { ok: true, reason: '', stdout: String(result.stdout ?? '') }
-}
-
-/**
- * WHAT SYSTEMD SAYS THE APPLICATION SERVICE'S FOUR IDENTITY VARIABLES ARE — or why this run
- * cannot say, which is always a refusal and never a fallback.
- *
- * @param {string[]} units          Unit names, from `--service-unit=`. Empty is a refusal.
- * @param {object}   io             Test seams: `show`, `readText`, `realpath`, `appDir`, `osAccount`.
- * @returns {{ ok: boolean, reason: string, values?: Record<string,string>, sources?: string[],
- *            serviceAccount?: string, runsAsServiceAccount?: boolean, osAccount?: string }}
- */
-export function readUnitEnvironment(units, io = {}) {
-  const show = io.show ?? ((unit) => systemctlShowUnit(unit, io.systemctlPath ?? ''))
-  const readText = io.readText ?? ((path) => readFileSync(path, 'utf8'))
-  const appDir = io.appDir ?? appDirectory()
-  const realpath = io.realpath ?? ((path) => { try { return realpathSync(path) } catch { return path } })
-  const osAccount = io.osAccount ?? processOsAccount(io)
-
-  const named = (units ?? []).map((unit) => String(unit).trim()).filter((unit) => unit !== '')
-  if (named.length === 0) {
-    return {
-      ok: false,
-      reason:
-        'no --service-unit=<unit> was given, so there is no unit to ask systemd about. This run will NOT fall back to its own shell\'s PGHOST/PGPORT/PGUSER/PGDATABASE: the deploy\'s variables are not the application\'s, and resolving identity against them is how a fence lands on the wrong cluster. The deploy, update and install scripts each pass the unit they already address the service by',
-    }
-  }
-
-  const values = new Map()
-  const sources = []
-  const accounts = new Set()
-  for (const unit of named) {
-    const shown = show(unit)
-    if (!shown.ok) return { ok: false, reason: `${shown.reason}, so what environment systemd starts ${unit} with is unknown` }
-    const properties = parseSystemctlShow(shown.stdout)
-    if (!properties.has('LoadState')) {
-      return { ok: false, reason: `systemctl show ${unit} reported no LoadState, so its answer could not be parsed and nothing here knows what environment ${unit} is given` }
-    }
-    const loadState = properties.get('LoadState')
-    if (loadState !== 'loaded') {
-      return { ok: false, reason: `systemd reports ${unit} as LoadState=${loadState}, not loaded, so there is no unit whose environment this could read` }
-    }
-
-    // THE UNIT MUST BE THIS APP'S. Being handed the wrong name is otherwise indistinguishable
-    // from being handed the right one, and the answer would be another installation's cluster.
-    const workingDirectory = properties.get('WorkingDirectory') ?? ''
-    if (workingDirectory !== '' && realpath(workingDirectory) !== realpath(appDir)) {
-      return {
-        ok: false,
-        reason: `systemd reports WorkingDirectory=${workingDirectory} for ${unit}, which is not ${appDir} — the directory this helper ships in. That unit serves a different installation, so its environment says nothing about this one`,
-      }
-    }
-    accounts.add(properties.get('User') ?? '')
-
-    // THE FILE LAYER: systemd will read these and will not say what it made of them.
-    let files
-    try {
-      files = parseSystemdEnvironmentFiles(properties.get('EnvironmentFiles'))
-    } catch (error) {
-      return { ok: false, reason: `${error instanceof Error ? error.message : String(error)} (${unit})` }
-    }
-    for (const file of files) {
-      let text
-      try {
-        text = readText(file.path)
-      } catch (error) {
-        if (file.ignoreErrors && error && error.code === 'ENOENT') continue
-        return {
-          ok: false,
-          reason: `${unit} is given EnvironmentFile=${file.path}, which systemd will read and this run cannot (${error instanceof Error ? error.message : String(error)}). An unreadable file is not a file that sets no PGHOST/PGPORT/PGUSER/PGDATABASE`,
-        }
-      }
-      const mentioned = mentionedIdentityVariable(text)
-      if (mentioned) {
-        return {
-          ok: false,
-          reason: `${unit} is given EnvironmentFile=${file.path}, and that file mentions ${mentioned}. systemd reads that file when it forks the service and publishes nothing about what it made of it, and this helper will not reimplement its parsing to find out — dotenv and systemd disagree over ordinary lines, and both readings are legal. Set ${mentioned} in the unit's own Environment= (systemctl show reports that), or remove it from the file`,
-        }
-      }
-      sources.push(`${unit}:EnvironmentFile=${file.path}`)
-    }
-
-    // AND THE APPLICATION'S OWN OVERLAY, which systemd never sees at all.
-    for (const path of applicationDotenvPaths(appDir)) {
-      let text
-      try {
-        text = readText(path)
-      } catch {
-        continue
-      }
-      const mentioned = mentionedIdentityVariable(text)
-      if (mentioned) {
-        return {
-          ok: false,
-          reason: `${path} mentions ${mentioned}, and the application loads that file itself after systemd has started it, so systemd can report nothing about it. Set ${mentioned} in the unit's own Environment= instead, or remove it`,
-        }
-      }
-    }
-
-    // THE LAYER SYSTEMD DOES REPORT — drop-ins already folded in, in systemd's own order.
-    let unitEnvironment
-    try {
-      unitEnvironment = parseSystemdEnvironment(properties.get('Environment'))
-    } catch (error) {
-      return { ok: false, reason: `${error instanceof Error ? error.message : String(error)} (${unit}), so its answer could not be parsed` }
-    }
-    sources.push(`${unit}:Environment=`)
-    for (const name of IDENTITY_ENVIRONMENT_VARIABLES) {
-      if (!unitEnvironment.has(name)) continue
-      const value = unitEnvironment.get(name)
-      const previous = values.get(name)
-      if (previous && previous.value !== value) {
-        return {
-          ok: false,
-          reason: `${previous.unit} sets ${name}=${JSON.stringify(previous.value)} and ${unit} sets ${name}=${JSON.stringify(value)}. Both units serve this app dir and both write to the database, so this run cannot say which cluster the fence is meant to close. Make them agree`,
-        }
-      }
-      if (!previous) values.set(name, { value, unit })
-    }
-  }
-
-  const serviceAccount = accounts.size === 1 ? [...accounts][0] : ''
-  return {
-    ok: true,
-    reason: '',
-    sources,
-    serviceAccount,
-    osAccount,
-    runsAsServiceAccount: Boolean(serviceAccount && osAccount && serviceAccount === osAccount),
-    values: Object.fromEntries([...values].map(([name, entry]) => [name, entry.value])),
-  }
-}
-
-/**
- * The OS account this process is running as, or '' when the two ways of asking disagree.
- *
- * `pg`'s last fallback for the login role is `pg.defaults.user`, which is `process.env.USER` — a
- * variable, and therefore inheritable, stale or set by hand. `userInfo()` reads the passwd entry
- * for the effective uid, which is not. Both must say the same thing before anything here treats
- * an OS account as an identity; a disagreement means the process is not who its environment says
- * it is, and that is precisely the case not to resolve.
- */
-export function processOsAccount(io = {}) {
-  let fromPasswd = ''
-  try {
-    fromPasswd = String((io.userInfo ?? userInfo)().username ?? '')
-  } catch {
-    fromPasswd = ''
-  }
-  const fromEnvironment = String(io.driverDefaultUser ?? pg.defaults.user ?? '')
-  return fromPasswd && fromPasswd === fromEnvironment ? fromPasswd : ''
-}
-
-/**
- * Put the service's environment in place of this process's, for the four variables that decide
- * where a connection goes. Mutates `env` and reports exactly what it did.
- *
- * THE DELETION IS UNCONDITIONAL AND COMES FIRST (Codex r17/r18 CRITICAL). Every one of the four is
- * removed from this process whether or not systemd names a replacement, so a `PGPORT` in the
- * deploy shell cannot survive as the value the driver resolves through. "The service sets none"
- * and "the deploy shell sets one" then mean the same thing to the driver, which is what it means
- * for the ambient override to be closed.
- *
- * AND IT MAKES THE APPLICATION'S IMPLICIT LOGIN ROLE EXPLICIT (o3d-2sm1.5, Codex r17 MEDIUM). When
- * a URL names no role, `pg` falls back to the OS account of whichever process asked — an ambient
- * value, and `resolveDriverIdentity()` subtracts it. In the SUPPORTED INSTALLATION that account is
- * not a stray identity at all: the deploy, update and install scripts run this helper through
- * `runuser -u ${APP_USER}` and the unit runs `User=${APP_USER}`. r17 established that by file
- * OWNERSHIP; r18 asks systemd, which states it outright — `User=` from `systemctl show`, compared
- * against this process's own account. When they match, the account is written into `PGUSER` so the
- * driver resolves it as a setting; when they do not, nothing is written and identity stays
- * unidentified, which is refused.
- */
-export function applyServiceEnvironment(service, env = process.env) {
-  const removed = []
-  for (const name of IDENTITY_ENVIRONMENT_VARIABLES) {
-    if (env[name] === undefined) continue
-    removed.push(`${name}=${env[name]}`)
-    delete env[name]
-  }
-  const applied = []
-  for (const [name, value] of Object.entries(service.values ?? {})) {
-    env[name] = value
-    applied.push(`${name}=${value}`)
-  }
-  let declaredOsAccount = ''
-  if (env.PGUSER === undefined && service.runsAsServiceAccount && service.osAccount) {
-    env.PGUSER = service.osAccount
-    declaredOsAccount = service.osAccount
-  }
-  return { removed, applied, declaredOsAccount }
 }
 
 /**
@@ -644,21 +311,19 @@ export function resolveDriverIdentity(connectionString) {
   // allocates an unconnected socket, nothing more.
   const client = new pg.Client({ connectionString })
 
-  // THE ONE COMPONENT THAT IS NOT SHARED CONFIGURATION. `PGHOST`, `PGPORT`, `PGUSER` and
-  // `PGDATABASE` are deliberate settings — and, since r17, they are THE SERVICE'S settings by the
-  // time this runs, reconstructed from its own environment file rather than inherited from the
-  // deploy shell (see the section at the top of the file). Honouring them is the whole point of
-  // resolving through the driver. `pg`'s LAST fallback for the login role is not a setting at
-  // all: it is `process.env.USER`, the OS account of whichever process happens to be running.
-  // Where that account is NOT the application's, taking it for the application's login role would
-  // revoke CONNECT from a role nobody connects as and report the door shut.
+  // WHOSE ENVIRONMENT THIS RESOLVES THROUGH, NOW THAT NOTHING RECONSTRUCTS ONE (o3d-2sm1.5 r19).
+  // THIS PROCESS'S — and that is correct, because the only connection string still resolved here
+  // is the ADMIN URL, which is the connection THIS PROCESS OPENS. `PGHOST`, `PGPORT`, `PGUSER`
+  // and `PGDATABASE` in the deploy shell are settings for the deploy shell's own connection, and
+  // honouring them is what makes `client.host`/`client.port` the two arguments the driver would
+  // dial. Nothing here is a statement about the APPLICATION's connection any more: that identity
+  // is supplied on argv (see the section at the top of the file), and the admin URL is checked
+  // AGAINST it rather than used to derive it.
   //
-  // WHERE IT IS the application's, it is not a stray identity and is not subtracted (Codex r17
-  // MEDIUM): `applyServiceEnvironment()` establishes that by ownership of the service's
-  // environment file and writes the account into `PGUSER`, so the driver resolves it as a
-  // setting and the probe below never sees the default. This function is therefore unchanged and
-  // still holds no opinion — it subtracts an ANONYMOUS fallback, and by the time it runs the
-  // application's own account is no longer anonymous.
+  // `pg`'s LAST fallback for the login role is not a setting at all: it is `process.env.USER`,
+  // the OS account of whichever process happens to be running. It is subtracted here, so an admin
+  // URL naming no role resolves to '' — "unidentified" — rather than to whoever ran the deploy;
+  // `session_user`, read from the connection once it is open, is what actually binds the role.
   //
   // Asked of the driver rather than inferred: re-resolve with `pg.defaults.user` swapped for a
   // sentinel, and if the answer moves, that field came from the OS account and from nothing else.
@@ -789,6 +454,18 @@ export function parseRoleFromConnectionString(connectionString) {
 
 /** Hosts that all mean "the machine this is running on", however they are spelled. */
 const LOCAL_HOSTS = new Set(['', 'localhost', '127.0.0.1', '::1', '[::1]'])
+
+/**
+ * ONE SPELLING OF "WHICH SERVER", so the supplied identity and a parsed admin URL are compared on
+ * the same terms. A loopback address, `localhost` and a unix-socket directory are the same
+ * machine; anything else is compared as written, lower-cased, because "probably the same host by
+ * another name" is the reasoning the comparison exists to stop.
+ */
+function serverOf(host, port) {
+  const lowered = String(host).toLowerCase()
+  const family = String(host).startsWith('/') || LOCAL_HOSTS.has(lowered) ? '(this host)' : lowered
+  return `${family}:${port}`
+}
 
 /** Best-effort percent-decoding: a value that will not decode is compared as written. */
 function decodeOrRaw(value) {
@@ -937,9 +614,7 @@ export function parseConnectionIdentity(connectionString) {
   }
   const port = String(driver.port)
   const user = String(driver.user ?? '')
-  const lowered = String(host).toLowerCase()
-  const family = String(host).startsWith('/') || LOCAL_HOSTS.has(lowered) ? '(this host)' : lowered
-  return { ok: true, reason: '', host, port, user, database, server: `${family}:${port}` }
+  return { ok: true, reason: '', host, port, user, database, server: serverOf(host, port) }
 }
 
 /**
@@ -955,39 +630,35 @@ export function parseConnectionIdentity(connectionString) {
  */
 export function assessDatabaseIdentity({
   adminUrl = '',
-  appUrl = '',
+  app = null,
   connectedDatabase = '',
   connectedLoginRole = '',
   connectedEffectiveRole = '',
 }) {
-  const app = parseConnectionIdentity(appUrl)
-  if (!app.ok) {
+  const supplied = requireSuppliedIdentity(app ?? {})
+  if (!supplied.ok) {
     return {
       bound: false,
-      reason: `DATABASE_URL ${app.reason}, so there is nothing to prove this deploy's connection is the application's own database. Every question this script asks is asked of current_database() on the connection it opened, and without the application's URL that database is unidentified.`,
+      reason: `${supplied.reason}, so there is nothing to prove this run's connection is the application's own database.`,
     }
   }
-  if (!app.database) {
-    return {
-      bound: false,
-      reason: 'DATABASE_URL resolves to no database at all -- nothing in its path, no PGDATABASE, and no login role whose name node-postgres could fall back to -- so the database the application actually uses is unidentified and nothing can be bound to it.',
-    }
-  }
+  const identity = supplied.identity
+  const appServer = serverOf(identity.host, identity.port)
   if (adminUrl) {
     const admin = parseConnectionIdentity(adminUrl)
     if (!admin.ok) {
-      return { bound: false, reason: `DEPLOY_ADMIN_DATABASE_URL ${admin.reason}, so it cannot be shown to name the same database as DATABASE_URL.` }
+      return { bound: false, reason: `DEPLOY_ADMIN_DATABASE_URL ${admin.reason}, so it cannot be shown to reach the database this run was told the application uses.` }
     }
-    if (admin.database && admin.database !== app.database) {
+    if (admin.database && admin.database !== identity.database) {
       return {
         bound: false,
-        reason: `DEPLOY_ADMIN_DATABASE_URL names the database "${admin.database}" and DATABASE_URL names "${app.database}". Everything this script asks — including whether the application role can connect — would be asked of "${admin.database}", and answered about a database the application does not use.`,
+        reason: `DEPLOY_ADMIN_DATABASE_URL reaches the database "${admin.database}" and --app-database says "${identity.database}". Everything this script asks — including whether the application role can connect — would be asked of "${admin.database}", and answered about a database the application does not use.`,
       }
     }
-    if (admin.server !== app.server) {
+    if (admin.server !== appServer) {
       return {
         bound: false,
-        reason: `DEPLOY_ADMIN_DATABASE_URL points at ${admin.server} and DATABASE_URL at ${app.server}. A privilege read on one server says nothing about the other, so this is refused rather than assumed to be the same host under another name. Make both URLs name the same host and port.`,
+        reason: `DEPLOY_ADMIN_DATABASE_URL points at ${admin.server} and --app-host/--app-port say ${appServer}. A privilege read on one server says nothing about the other, so this is refused rather than assumed to be the same host under another name. Make the admin URL name the same host and port.`,
       }
     }
   }
@@ -997,10 +668,10 @@ export function assessDatabaseIdentity({
       reason: 'the open connection did not report which database it is attached to, so it cannot be shown to be the application\'s.',
     }
   }
-  if (connectedDatabase !== app.database) {
+  if (connectedDatabase !== identity.database) {
     return {
       bound: false,
-      reason: `the connection this run opened is attached to "${connectedDatabase}", and DATABASE_URL names "${app.database}". A connection string with no database in its path connects to PGDATABASE, or failing that to the login role's own name, which is how these come apart without either URL looking wrong.`,
+      reason: `the connection this run opened is attached to "${connectedDatabase}", and --app-database says "${identity.database}". A connection string with no database in its path connects to PGDATABASE, or failing that to the login role's own name, which is how these come apart without the admin URL looking wrong.`,
     }
   }
   // THE ROLE HALF, ASKED OF THE CONNECTION (o3d-2sm1.5, Codex r14 CRITICAL). Everything below the
@@ -1133,7 +804,7 @@ export function planConnectionFence(facts) {
   } = facts
 
   if (!appRole) {
-    return { fenceable: false, reason: 'DATABASE_URL carries no role name, so there is nothing to revoke CONNECT from.', revoke: [] }
+    return { fenceable: false, reason: '--app-user names no role, so there is nothing to revoke CONNECT from.', revoke: [] }
   }
   if (appRoleIsSuperuser) {
     return {
@@ -1215,7 +886,7 @@ export function planConnectionFence(facts) {
  */
 export function assessMigrationRole({ adminRole, appRole, adminIsSuperuser, adminCanSetAppRole }) {
   if (!appRole) {
-    return { usable: false, reason: 'DATABASE_URL carries no role name, so the migration has no role to run as.' }
+    return { usable: false, reason: '--app-user names no role, so the migration has no role to run as.' }
   }
   if (adminIsSuperuser || adminCanSetAppRole) return { usable: true, reason: '' }
   return {
@@ -1330,19 +1001,18 @@ export function verifyRelease(datacl, ownerRole, grantees) {
 // ---------------------------------------------------------------------------
 
 export function parseArgs(argv) {
-  const options = { mode: '', stateFile: '', appRole: '', timeoutSeconds: 30, serviceUnits: [], systemctlPath: '' }
+  const options = { mode: '', stateFile: '', appRole: '', timeoutSeconds: 30, appHost: '', appPort: '', appUser: '', appDatabase: '' }
   for (const arg of argv) {
     if (arg === '--fence' || arg === '--release' || arg === '--preflight' || arg === '--print-migration-url') options.mode = arg.slice(2)
     else if (arg.startsWith('--state-file=')) options.stateFile = arg.slice('--state-file='.length)
     else if (arg.startsWith('--app-role=')) options.appRole = arg.slice('--app-role='.length)
     else if (arg.startsWith('--timeout-seconds=')) options.timeoutSeconds = Number(arg.slice('--timeout-seconds='.length))
-    // REPEATABLE, because scripts/deploy.sh may find more than one unit serving this app dir and
-    // every one of them is a writer into the database. They must agree about the four identity
-    // variables or this refuses; see readUnitEnvironment().
-    else if (arg.startsWith('--service-unit=')) options.serviceUnits.push(arg.slice('--service-unit='.length))
-    // The systemd binary itself, for the tests: see systemctlShowUnit(). Never passed by
-    // scripts/deploy.sh, scripts/update.sh or scripts/install.sh.
-    else if (arg.startsWith('--systemctl=')) options.systemctlPath = arg.slice('--systemctl='.length)
+    // THE FOUR THIS RUN IS TOLD RATHER THAN WORKS OUT. Every mode needs them and every mode
+    // refuses without them; see requireSuppliedIdentity() and the section at the top of the file.
+    else if (arg.startsWith('--app-host=')) options.appHost = arg.slice('--app-host='.length)
+    else if (arg.startsWith('--app-port=')) options.appPort = arg.slice('--app-port='.length)
+    else if (arg.startsWith('--app-user=')) options.appUser = arg.slice('--app-user='.length)
+    else if (arg.startsWith('--app-database=')) options.appDatabase = arg.slice('--app-database='.length)
   }
   return options
 }
@@ -1477,6 +1147,11 @@ export function publishState(stateFile, state) {
 async function readFacts(client, appRole) {
   const { rows } = await client.query(
     `SELECT current_database()                                  AS database,
+            -- THE POSTMASTER THIS CONNECTION IS ON (o3d-2sm1.5 r19). One stamp per cluster, to
+            -- the microsecond, identical on every backend of it. --release compares it with the
+            -- application probe's, so "the application can connect" is an answer about THIS
+            -- cluster and not about a same-named database on another one.
+            pg_postmaster_start_time()::text                    AS postmaster,
             current_user                                        AS admin_role,
             -- THE ROLE THIS CONNECTION LOGGED IN AS, which is not necessarily current_user and is
             -- not necessarily the URL's username either (o3d-2sm1.5, Codex r14 CRITICAL). CONNECT
@@ -1587,21 +1262,21 @@ function requireAdminUrl(what) {
  * Printed as a refusal rather than returned, because there is exactly one thing to do with a
  * "not proven" here and every caller does it.
  */
-function requireBoundDatabaseIdentity(attachment, prefix) {
+function requireBoundDatabaseIdentity(attachment, prefix, options) {
   const verdict = assessDatabaseIdentity({
     adminUrl: process.env.DEPLOY_ADMIN_DATABASE_URL || '',
-    appUrl: process.env.DATABASE_URL || '',
+    app: options,
     connectedDatabase: attachment.database ?? '',
     connectedLoginRole: attachment.loginRole ?? '',
     connectedEffectiveRole: attachment.effectiveRole ?? '',
   })
   if (verdict.bound) return true
   console.error(`${prefix}: ${verdict.reason}`)
-  console.error('This run cannot show that the database it is connected to is the one the application uses,')
-  console.error('and that it is attached to it as the role it believes it is. Every answer it could give —')
-  console.error('"the fence took", "the application can connect" — would be about whichever database it')
-  console.error('reached, as whichever role it reached it as. Align DEPLOY_ADMIN_DATABASE_URL and DATABASE_URL')
-  console.error('on the same host, port and database name, with a role each URL states plainly, and re-run.')
+  console.error('This run cannot show that the database it is connected to is the one it was TOLD the')
+  console.error('application uses, and that it is attached to it as the role it believes it is. Every answer')
+  console.error('it could give — "the fence took", "the application can connect" — would be about whichever')
+  console.error('database it reached, as whichever role it reached it as. Point DEPLOY_ADMIN_DATABASE_URL at')
+  console.error('the host, port and database the --app-* options name, and re-run.')
   return false
 }
 
@@ -1618,19 +1293,35 @@ function attachmentOf(facts) {
  * database. This opens DATABASE_URL itself and reports whether it got in and where it landed, so
  * "the application can connect" is an observation of the application connecting.
  *
+ * DATABASE_URL IS A CREDENTIAL HERE AND NOTHING ELSE (o3d-2sm1.5 r19). Nothing is derived from
+ * this string — not the role, not the host, not the port, not the database name. It is opened,
+ * and then the connection is asked WHERE IT WENT: `current_database()`, and
+ * `pg_postmaster_start_time()`, which is the same microsecond stamp on every backend of one
+ * postmaster and a different one on any other. The caller compares both against the connection
+ * this run already holds, so a DATABASE_URL that resolves — through PGHOST, a dotenv overlay or
+ * anything else — to a same-named database on another cluster is caught rather than believed.
+ *
  * Never throws: a refused connection is the answer, not an error.
  */
 export async function probeApplicationConnection(connectionString) {
   if (!connectionString) {
-    return { attempted: false, connected: false, database: '', error: 'DATABASE_URL is not set, so there is no application connection to test.' }
+    return { attempted: false, connected: false, database: '', postmaster: '', error: 'DATABASE_URL is not set, so there is no application connection to test.' }
   }
   const probe = new pg.Client({ connectionString, application_name: 'ims-deploy-fence-app-probe' })
   try {
     await probe.connect()
-    const { rows } = await probe.query('SELECT current_database() AS connected_database')
-    return { attempted: true, connected: true, database: rows[0]?.connected_database ?? '', error: '' }
+    const { rows } = await probe.query(
+      'SELECT current_database() AS connected_database, pg_postmaster_start_time()::text AS postmaster',
+    )
+    return {
+      attempted: true,
+      connected: true,
+      database: rows[0]?.connected_database ?? '',
+      postmaster: rows[0]?.postmaster ?? '',
+      error: '',
+    }
   } catch (error) {
-    return { attempted: true, connected: false, database: '', error: error instanceof Error ? error.message : String(error) }
+    return { attempted: true, connected: false, database: '', postmaster: '', error: error instanceof Error ? error.message : String(error) }
   } finally {
     await probe.end().catch(() => {})
   }
@@ -1649,16 +1340,16 @@ export async function probeApplicationConnection(connectionString) {
  * kills the preflight instead, while the predecessor is still up.
  */
 async function doPreflight(client, options) {
-  const appRole = options.appRole || parseRoleFromConnectionString(process.env.DATABASE_URL)
+  const appRole = options.appRole || options.appUser
   const { facts, plan, role } = await assessFence(client, appRole)
 
   // THE SAME QUESTIONS ARE ONLY THE SAME QUESTIONS IF THEY ARE ASKED OF THE SAME DATABASE.
   // Asked here as well as in --fence for the reason this whole mode exists: a preflight that
   // skips a check --fence performs is a preflight that passes and then fails after the stop.
-  if (!requireBoundDatabaseIdentity(attachmentOf(facts), 'NOT FENCEABLE')) return EXIT_NOT_FENCEABLE
+  if (!requireBoundDatabaseIdentity(attachmentOf(facts), 'NOT FENCEABLE', options)) return EXIT_NOT_FENCEABLE
 
   if (appRole && !facts.app_role_exists) {
-    console.error(`NOT FENCED: the role ${appRole} from DATABASE_URL does not exist on this server.`)
+    console.error(`NOT FENCED: the role ${appRole} named by --app-user does not exist on this server.`)
     return EXIT_NOT_FENCEABLE
   }
   if (!plan.fenceable) {
@@ -1705,17 +1396,17 @@ export async function doFence(client, options) {
     return EXIT_NOT_FENCEABLE
   }
 
-  const appRole = options.appRole || parseRoleFromConnectionString(process.env.DATABASE_URL)
+  const appRole = options.appRole || options.appUser
   const { facts, plan: freshPlan, role } = await assessFence(client, appRole)
 
   // BEFORE ANYTHING IS REVOKED (o3d-2sm1.5, Codex r13 CRITICAL). A fence raised on a database
   // that is not the application's locks other people's clients out of somewhere else while the
   // application keeps writing across the migration, and every verification below — the ACL read,
   // the effective-CONNECT check, the drain — would be a truthful report about the wrong database.
-  if (!requireBoundDatabaseIdentity(attachmentOf(facts), 'NOT FENCED')) return EXIT_NOT_FENCEABLE
+  if (!requireBoundDatabaseIdentity(attachmentOf(facts), 'NOT FENCED', options)) return EXIT_NOT_FENCEABLE
 
   if (appRole && !facts.app_role_exists) {
-    console.error(`NOT FENCED: the role ${appRole} from DATABASE_URL does not exist on this server.`)
+    console.error(`NOT FENCED: the role ${appRole} named by --app-user does not exist on this server.`)
     return EXIT_NOT_FENCEABLE
   }
 
@@ -1963,8 +1654,9 @@ async function completeFence(client, options, { facts, plan, grants, appRole, re
  *   appRole: string,
  *   stateFile?: string,
  *   appStillConnects: boolean,
- *   appConnection?: { attempted: boolean, connected: boolean, database: string, error: string } | null,
+ *   appConnection?: { attempted: boolean, connected: boolean, database: string, postmaster?: string, error: string } | null,
  *   connectedDatabase?: string,
+ *   connectedPostmaster?: string,
  * }} facts
  */
 export function assessUnrecordedRelease({
@@ -1975,6 +1667,7 @@ export function assessUnrecordedRelease({
   appStillConnects,
   appConnection = null,
   connectedDatabase = '',
+  connectedPostmaster = '',
 }) {
   const where = stateFile || '<no --state-file was given>'
   const what = `${status}${detail ? `: ${detail}` : ''}`
@@ -1984,7 +1677,7 @@ export function assessUnrecordedRelease({
       fenceProvenAbsent: false,
       lines: [
         `No usable connection-fence record (${what}) at ${where}, and no application role to ask about:`,
-        'DATABASE_URL carries no role name and --app-role was not given.',
+        '--app-user names no role and --app-role was not given.',
         'Refusing to report "nothing to release": absence of a record is not absence of a fence, and',
         'without a role there is nothing to prove the database is open to. Pass --app-role=<role> and re-run.',
       ],
@@ -2012,6 +1705,29 @@ export function assessUnrecordedRelease({
           'Refusing to report anything but a failure. Fix the connection or restore CONNECT by hand:',
           '  SELECT datacl FROM pg_database WHERE datname = current_database();',
           `  GRANT CONNECT ON DATABASE <the application's database> TO ${appRole};`,
+        ],
+      }
+    }
+    // AND THE SAME CLUSTER, NOT ONLY THE SAME DATABASE NAME (o3d-2sm1.5 r19). A database name is
+    // not an identity: `imsdb` exists on the staging server too. Nothing here works out where
+    // DATABASE_URL resolves to any more — the connection is asked instead, and
+    // `pg_postmaster_start_time()` is the same microsecond stamp on every backend of one
+    // postmaster and a different one on any other. Refused rather than resolved: a probe that
+    // reached another cluster proves nothing about this one, and the caller is about to start an
+    // application on the strength of it.
+    if (connectedPostmaster && appConnection.postmaster && appConnection.postmaster !== connectedPostmaster) {
+      return {
+        exitCode: EXIT_ERROR,
+        fenceProvenAbsent: false,
+        appRoleConnects: true,
+        lines: [
+          `No usable connection-fence record (${what}) at ${where}, AND THE TWO CONNECTIONS ARE NOT THE SAME SERVER.`,
+          `This run is on the postmaster started ${connectedPostmaster}; DATABASE_URL reached the one started ${appConnection.postmaster}.`,
+          `They may both hold a database called "${connectedDatabase || appConnection.database}", but a privilege read,`,
+          'an ACL and a fence on one of them say nothing whatever about the other. Nothing here can speak',
+          'for the database the application actually uses.',
+          'Point DEPLOY_ADMIN_DATABASE_URL and the --app-host/--app-port options at the same server as',
+          'DATABASE_URL and re-run before this database is treated as open.',
         ],
       }
     }
@@ -2075,8 +1791,8 @@ export function assessUnrecordedRelease({
  * The branch taken when the record cannot answer. Asks the database, which is where the
  * durable half of the fence lives, and reports what it can actually prove.
  */
-async function releaseWithoutRecord(client, options, read, connectedDatabase = '') {
-  const appRole = options.appRole || parseRoleFromConnectionString(process.env.DATABASE_URL)
+async function releaseWithoutRecord(client, options, read, connectedDatabase = '', connectedPostmaster = '') {
+  const appRole = options.appRole || options.appUser
   const effective = appRole ? await readEffectiveConnect(client, appRole) : { stillConnects: false }
   // Only when the privilege read says the application is back inside: that claim is the one this
   // run would let a caller act on, so it is the one that has to be observed rather than inferred.
@@ -2092,6 +1808,7 @@ async function releaseWithoutRecord(client, options, read, connectedDatabase = '
     appStillConnects: effective.stillConnects,
     appConnection,
     connectedDatabase,
+    connectedPostmaster,
   })
   for (const line of verdict.lines) (verdict.exitCode === EXIT_OK ? console.log : console.error)(line)
   return verdict.exitCode
@@ -2103,21 +1820,23 @@ export async function doRelease(client, options) {
   // somebody else's or — worse, because it is silent — reports the application free while the
   // real database still refuses it.
   const { rows: attachment } = await client.query(
-    `SELECT current_database() AS connected_database,
-            session_user        AS connected_login_role,
-            current_user        AS connected_effective_role`,
+    `SELECT current_database()               AS connected_database,
+            session_user                     AS connected_login_role,
+            current_user                     AS connected_effective_role,
+            pg_postmaster_start_time()::text AS connected_postmaster`,
   )
   const connectedDatabase = attachment[0]?.connected_database ?? ''
+  const connectedPostmaster = attachment[0]?.connected_postmaster ?? ''
   const released = {
     database: connectedDatabase,
     loginRole: attachment[0]?.connected_login_role ?? '',
     effectiveRole: attachment[0]?.connected_effective_role ?? '',
   }
-  if (!requireBoundDatabaseIdentity(released, 'NOT RELEASED')) return EXIT_ERROR
+  if (!requireBoundDatabaseIdentity(released, 'NOT RELEASED', options)) return EXIT_ERROR
 
   const read = options.stateFile ? readState(options.stateFile) : { status: STATE_ABSENT, detail: 'no --state-file was given' }
   if (read.status !== STATE_PRESENT) {
-    return releaseWithoutRecord(client, options, read, connectedDatabase)
+    return releaseWithoutRecord(client, options, read, connectedDatabase, connectedPostmaster)
   }
   const state = read.state
 
@@ -2155,61 +1874,54 @@ export async function doRelease(client, options) {
 }
 
 async function main() {
-  // ABSOLUTE, AGAINST THIS SCRIPT'S OWN DIRECTORY (o3d-2sm1.5 r18, Codex r17 HIGH). These were
-  // `.env.local` and `.env` — relative, and therefore resolved against whatever directory the
-  // caller happened to be in. The deploy `cd`s to the app dir first, so it worked there; the
-  // `--release` command this script's callers PRINT for an operator is a bare absolute `node
-  // /opt/.../fence-db-connections.mjs --release ...`, and from any other directory it loaded no
-  // DATABASE_URL, no DIRECT_URL and no DEPLOY_ADMIN_DATABASE_URL — so the one command offered for
-  // taking a committed fence back down could not obtain the admin connection that takes it down.
-  // The app dir is derived from the script, so the same paths are read from every directory.
+  // THE ONE FILE THIS STILL READS, AND ONLY FOR CREDENTIALS (o3d-2sm1.5 r19).
+  //
+  // ABSOLUTE, AGAINST THIS SCRIPT'S OWN DIRECTORY (Codex r17 HIGH). This was a relative
+  // `.env`, resolved against whatever directory the caller happened to be in. The deploy `cd`s
+  // to the app dir first, so it worked there; the `--release` command this script's callers
+  // PRINT for an operator is a bare absolute `node /opt/.../fence-db-connections.mjs --release
+  // ...`, and from any other directory it loaded no DEPLOY_ADMIN_DATABASE_URL — so the one
+  // command offered for taking a committed fence back down could not obtain the admin connection
+  // that takes it down. The app dir comes from this file's own location, so the same path is read
+  // from every directory.
+  //
+  // `.env.local` IS NO LONGER LOADED (Codex r18 CRITICAL). It was loaded FIRST, and it is a file
+  // systemd never gives the service: a DATABASE_URL there was invisible to the application and
+  // authoritative here, which is divergence bought for nothing. Only `.env` is read, and what it
+  // supplies is CREDENTIALS — DEPLOY_ADMIN_DATABASE_URL, DIRECT_URL, DATABASE_URL. NOT IDENTITY:
+  // which host, port, role and database this run is about comes from argv and from nowhere else,
+  // and every claim made about the connection that is opened is then proven against the
+  // connection itself (assessDatabaseIdentity, and the postmaster stamp in --release).
+  // `override: false` keeps a variable the caller passed deliberately winning over the file.
   const appDir = appDirectory()
-  loadDotenv({ path: resolvePath(appDir, '.env.local'), override: false, quiet: true })
   loadDotenv({ path: resolvePath(appDir, '.env'), override: false, quiet: true })
 
   const options = parseArgs(process.argv.slice(2))
   const modes = ['fence', 'release', 'preflight', 'print-migration-url']
   if (!modes.includes(options.mode)) {
-    console.error('Usage: node scripts/fence-db-connections.mjs (--preflight|--fence|--release|--print-migration-url) --service-unit=UNIT [--service-unit=UNIT ...] [--state-file=PATH] [--app-role=ROLE] [--timeout-seconds=N]')
+    console.error('Usage: node scripts/fence-db-connections.mjs (--preflight|--fence|--release|--print-migration-url) --app-host=HOST --app-port=PORT --app-user=ROLE --app-database=NAME [--state-file=PATH] [--app-role=ROLE] [--timeout-seconds=N]')
     process.exit(EXIT_ERROR)
   }
 
-  // BEFORE ANY IDENTITY IS RESOLVED, AND THEREFORE BEFORE ANYTHING IS CONNECTED, FENCED,
-  // RELEASED OR PRINTED (o3d-2sm1.5 r18). Every mode of this script answers a question about
-  // WHERE THE APPLICATION CONNECTS, and `pg` answers it out of the environment of whichever
-  // process asks. This one's is the deploy shell's. See the section at the top of the file: the
-  // four identity variables are taken away from this process and replaced by what SYSTEMD says
-  // the named unit is given, and anything systemd cannot be asked — or cannot answer, or answers
-  // in a way that could be read two ways — is a refusal rather than a fallback to the ambient
-  // environment or an assumption that the service sets none.
-  //
-  // The dotenv loads above stay where they are: they supply DATABASE_URL and friends the way they
-  // always have, and `override: false` keeps a variable the caller passed deliberately —
-  // DEPLOY_ADMIN_DATABASE_URL — winning over the file. Only the four below are taken away from
-  // the caller, because only those four are statements about the APPLICATION's connection that
-  // the deploy shell has no standing to make.
-  const service = readUnitEnvironment(options.serviceUnits, { appDir, systemctlPath: options.systemctlPath })
-  if (!service.ok) {
-    console.error(`The application service's environment cannot be established: ${service.reason}.`)
-    console.error('Refusing to act on a connection this run cannot prove is the application\'s.')
-    process.exit(options.mode === 'fence' || options.mode === 'preflight' ? EXIT_NOT_FENCEABLE : EXIT_ERROR)
-  }
+  // BEFORE ANYTHING IS CONNECTED, FENCED, RELEASED OR PRINTED. Every mode of this script answers
+  // a question ABOUT THE APPLICATION'S CONNECTION, and this run is not the application: it does
+  // not share its environment, its dotenv overlay, its systemd unit or its working directory.
+  // Seven rounds of deriving that connection from here each produced a locally correct answer and
+  // another layer beneath it, so the four values are now REQUIRED rather than resolved — see the
+  // section at the top of the file for who supplies them and how they know.
   //
   // ON STDERR, NOT STDOUT. `--print-migration-url` writes the URL the deploy captures with
   // `MIGRATION_DATABASE_URL="$(... --print-migration-url)"`, so stdout is a machine-readable
   // channel and a diagnostic line on it is a corrupt connection string.
-  const reconstructed = applyServiceEnvironment(service)
-  if (reconstructed.removed.length > 0) {
-    console.error(`Ignoring this shell's ${reconstructed.removed.join(', ')}: the application service does not inherit them.`)
+  const supplied = requireSuppliedIdentity(options)
+  if (!supplied.ok) {
+    console.error(`The application's connection identity was not supplied: ${supplied.reason}.`)
+    console.error('Refusing to act on a connection this run has not been told the identity of.')
+    process.exit(options.mode === 'fence' || options.mode === 'preflight' ? EXIT_NOT_FENCEABLE : EXIT_ERROR)
   }
-  if (reconstructed.applied.length > 0) {
-    console.error(`Using the service's own ${reconstructed.applied.join(', ')}, as systemd reports them (${service.sources.join(', ')}).`)
-  } else {
-    console.error(`systemd reports no ${IDENTITY_ENVIRONMENT_VARIABLES.join(', ')} for ${options.serviceUnits.join(', ')}, so none is set here either (${service.sources.join(', ')}).`)
-  }
-  if (reconstructed.declaredOsAccount) {
-    console.error(`A URL naming no role logs in as "${reconstructed.declaredOsAccount}": this process runs as the account the service runs as.`)
-  }
+  console.error(
+    `The application connects to ${supplied.identity.database} at ${supplied.identity.host}:${supplied.identity.port} as ${supplied.identity.user}, as supplied by the caller. Nothing here infers it.`,
+  )
 
   // Opens no connection: it is pure string work over two environment variables, and the
   // caller needs it BEFORE the migration runs, from a shell that cannot parse a URL safely.
@@ -2218,9 +1930,9 @@ async function main() {
       console.error('DEPLOY_ADMIN_DATABASE_URL is not set — there is no privileged connection to compose a migration URL from.')
       process.exit(EXIT_ERROR)
     }
-    const appRole = options.appRole || parseRoleFromConnectionString(process.env.DATABASE_URL)
+    const appRole = options.appRole || options.appUser
     if (!appRole) {
-      console.error('DATABASE_URL carries no role name, so the migration has no role to run as. Refusing to emit a URL that would create objects owned by the admin.')
+      console.error('--app-user names no role, so the migration has no role to run as. Refusing to emit a URL that would create objects owned by the admin.')
       process.exit(EXIT_ERROR)
     }
     process.stdout.write(`${buildMigrationConnectionString(process.env.DEPLOY_ADMIN_DATABASE_URL, appRole)}\n`)
