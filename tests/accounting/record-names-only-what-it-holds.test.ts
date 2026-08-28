@@ -1214,16 +1214,10 @@ test('ROUND 15: every enumerated frame span is one the shipped frames still say,
       `"${frame}" appears in no rendered incident message — delete it rather than leaving a hole `
       + 'nothing is standing in',
     )
-    // THE SAME RULE THE TABLES ARE HELD TO. A frame sentence may name an act, or it may point at
-    // something in the other system — but if it does both it has to be REFUSING, or it is an
-    // instruction wearing a frame.
-    if (remoteReferences([frame], []).length > 0) {
-      assert.match(
-        frame, REFUSAL,
-        `"${frame}" names both an act and a remote object without refusing — a frame may not `
-        + 'instruct one on a message that carries no identifier',
-      )
-    }
+    // ROUND 15 ALSO ASKED HERE WHETHER THE FRAME NAMED A REMOTE OBJECT, using the closed noun list
+    // Codex then walked through. That question is gone rather than re-asked: round 16 requires
+    // every word of a frame to be a reviewed span, which is a stronger claim than any list of nouns
+    // could support and does not depend on recognising one.
   }
 
   for (const summary of RESET_BREADCRUMB_TEMPLATES) {
@@ -1262,253 +1256,626 @@ test('ROUND 15: allowlist removal is a set, not a sequence — the longest span 
   )
 })
 
-// ---------------------------------------------------------------------------------------------
-// FINDING 2 — THE OBJECT FENCE.
-// ---------------------------------------------------------------------------------------------
+// =============================================================================================
+// ROUND 16 (the decision) — A LOOKUP-LESS RECORD MAY NOT INSTRUCT AN ACTION ON A REMOTE OBJECT
+// AT ALL, IN ANY WORDING. NOT FENCED. NOT ENUMERATED. ABSENT.
+//
+// FIVE FENCES IN FIVE ROUNDS, ALL DEFEATED, AND ALWAYS THE SAME WAY. Round 9 enumerated field
+// PHRASES; round 10 the DECLARATION; round 13 the imperative POSITION and the gerunds; round 14 a
+// closed VERB list; round 15 a closed OBJECT-NOUN list. Codex walked through every one of them, and
+// the sentence it walked through the last one with is the argument against a sixth:
+//
+//     "In your books, use the IMS reference above to reach the matching entry and take the second
+//      PDF off it."
+//
+// No listed verb. No listed noun. A complete, performable instruction to remove a document from a
+// ledger record this message cannot name. Codex's verdict: "Extending this noun regex cannot
+// establish closure because synonyms, descriptions, and anaphora remain open." That is correct, and
+// it is correct about every future list too — English has no closed set of ways to say WHICH thing,
+// any more than it has one for what to DO to it.
+//
+// AND THE TWO ROUND-15 FIXES WERE NEVER COMPOSED. The object fence read `remedy`/`check` off the
+// wording tables; the rendered-message test called only the mutation-lexeme checker. So the same
+// sentence in a formatter FRAME, or in an `effect`, `did`, `stands` or `bothExist` field, passed
+// both — one because the checker never saw those surfaces, the other because it was looking for a
+// verb that is not in the sentence.
+//
+// -------------------------------------------------------------------------------------------
+// SO THE INSTRUCTION IS REMOVED RATHER THAN FENCED, AND THE CHECK IS CLOSURE RATHER THAN A FENCE.
+// -------------------------------------------------------------------------------------------
+// A record that cannot name its object may say what happened, may say what is NOT known, may REFUSE
+// an act — and, for what it CAN name, may give a small, listed set of local, read-only
+// instructions. It may not send anybody to a remote object. Not with an allowed verb, not with an
+// allowed noun, not with a synonym, a description or a pronoun: there is no such sentence to write,
+// so there is nothing left for a grammar to be wrong about.
+//
+// WHAT THE CHECK IS. Not "does this text contain a bad thing" — that is the question that has been
+// answered wrongly five times. It is: IS EVERY WORD OF THIS MESSAGE ONE THAT WAS REVIEWED? Every
+// lookup-less rendered message — formatter frames and every table field included, which is the
+// composition Codex named — must decompose ENTIRELY into three hand-written lists in this file:
+//
+//   LOCAL_DIRECTIONS      the complete inventory of what these records tell an operator to DO.
+//                         Fourteen lines, capped, each naming the IMS-LOCAL object it points at,
+//                         from a closed union type that HAS NO MEMBER for a remote object.
+//   BREADCRUMB_DIRECTIONS the reset breadcrumb's own instructions, which may point at a ledger
+//                         because the records it counts carry their own ids — held to appearing in
+//                         the breadcrumb and in NO per-incident message.
+//   RECORD_PROSE          everything else these messages say: statements of fact, statements of
+//                         incapacity, refusals. Not one of them instructs.
+//
+// A word that is in none of them fails the test. Codex's sentence therefore fails wherever it is
+// put — a frame, an `effect` field, a `remedy` — not because of what it says but because nobody
+// reviewed it. There is no vocabulary to extend and no grammar to walk around, because nothing is
+// being parsed.
+//
+// WHAT IT COSTS, PLAINLY. An operator reading a lookup-less incident is told what happened, what is
+// known, what is NOT known, and to escalate — instead of being handed a remote action they might
+// perform against the wrong document. For a record that is exempt from retention and from the
+// factory reset, and outlives everything else in this system, being useless is recoverable and
+// being wrong is not.
+//
+// AND WHAT IT DOES NOT BUY, STATED RATHER THAN IMPLIED. Closure makes an UNREVIEWED sentence
+// impossible; it cannot make a REVIEWED one right. Somebody may still add an instruction to
+// RECORD_PROSE and mis-call it prose. That is a deliberate line in this file with a diff attached,
+// not a verb nobody thought of — and it is the last residue. The structured answer, where a
+// directive's target kind, locality and permitted action are TYPED and the prose is generated from
+// them, is Codex's own recommendation and is filed as o3d-cvyv.
+//
+// NOTHING HAD TO BE REMOVED FROM THE SHIPPED TEXT TO GET HERE. Every span below was read against
+// this rule, and rounds 12 to 15 had already deleted the three instructions that broke it ("open
+// that bill", "open the order in WooCommerce", "correct or archive that rate"). What round 16
+// changes is that there is now no wording in which one can come back.
+// =============================================================================================
 
-/** The fields that TELL AN OPERATOR WHAT TO DO, as opposed to saying what happened. */
-const DIRECTIVE_FIELDS = new Set([
+/** The fields that decide WHICH wording entry a message is: the ones that tell an operator what to do. */
+const IDENTITY_FIELDS = new Set([
   'remedy', 'remedyRowGone', 'remedyDuplicate', 'remedyIdUnrecorded', 'check',
 ])
 
+/** The branch that has no wording entry at all — an operation type this binary does not classify. */
+const UNCLASSIFIED_MARKER = 'THIS VERSION OF IMS DOES NOT CLASSIFY THAT OPERATION TYPE'
+
+const OPERATION_TYPES_LONGEST_FIRST = [...OPERATION_TYPES].sort((a, b) => b.length - a.length)
+
 /**
- * A REMOTE REFERENCE: any way this module has of saying WHICH object in somebody else’s system a
- * sentence is about. Three closed groups, and between them an instruction cannot locate its target
- * without using one:
- *
- *   • the object vocabulary of the two ledgers and the storefront;
- *   • the systems themselves, named or interpolated;
- *   • the one deictic that stands in for them, `there`.
- *
- * A pronoun alone ("take it off") locates nothing, so it is not an instruction anybody could carry
- * out — which is why this list does not need pronouns in it to be closed.
+ * Put EVERY per-incident value back into placeholder form, not only the two round 15 did. The
+ * closure below compares whole spans, so a value that varies per message — the cause, the
+ * reference, the operation type, an external id the message itself calls "not a document id" —
+ * would otherwise make one reviewed sentence look like forty unreviewed ones.
  */
-const REMOTE_REFERENCE = new RegExp(
+function normaliseIncidentValues(text: string): string {
+  let t = normaliseRenderedValues(text)
+    .split('Error: write conflict').join('{cause}')
+    .split('SalesOrder order-1').join('{reference}')
+    .split('EXT-OTHER').join('{namedExternalId}')
+    .split('EXT-1').join('{postedExternalId}')
+  for (const type of OPERATION_TYPES_LONGEST_FIRST) {
+    t = t.split(`${type} for {reference}`).join('{type} for {reference}')
+  }
+  return t
+}
+
+/**
+ * EVERY SHIPPED MESSAGE A LOOKUP-LESS ENTRY CAN PRODUCE — selected from the ENTRY, not from the
+ * message's appearance.
+ *
+ * Round 15 selected on "the message contains no fixture id", which is a property of the message and
+ * was the right correction to make then. It is not enough: a lookup-less NON-DOCUMENT entry renders
+ * inside a message that DOES print an external id — the frame's own sentence saying that id is not
+ * a document id — and that message was outside round 15's corpus while carrying the same
+ * instruction. So the corpus is the union: every message that renders a lookup-less entry's
+ * directive field, every message that names no identifier at all, the unclassified branch that has
+ * no entry, and the reset breadcrumbs.
+ */
+function lookupLessMessages(): { label: string; text: string }[] {
+  const identity = [...everyWordingEntry(), ...everyReplayWordingEntry()]
+    .filter((entry) => entry.lookup.length === 0)
+    .flatMap(({ fields }) => Object.entries(fields)
+      .filter(([field, value]) => IDENTITY_FIELDS.has(field) && typeof value === 'string')
+      .map(([, value]) => normaliseIncidentValues(value)))
+  return everyIncidentMessage()
+    .filter(({ label, text }) => label.startsWith('breadcrumb')
+      || text.includes(UNCLASSIFIED_MARKER)
+      || !LEDGER_ID_FIXTURES.some((id) => text.includes(id))
+      || identity.some((span) => normaliseIncidentValues(text).includes(span)))
+    .map(({ label, text }) => ({ label, text: normaliseIncidentValues(text) }))
+}
+
+/**
+ * THE IMS-LOCAL OBJECTS A RECORD THAT CAN NAME NOTHING IS STILL ALLOWED TO POINT AT.
+ *
+ * A closed union, and the whole safety property is in what it does NOT have: there is no member for
+ * a bill, an invoice, a ledger document, a WooCommerce order — for anything in somebody else's
+ * system. An instruction at one of those cannot be given a target, so it cannot be written down
+ * here, so it cannot ship. That is the difference between this and five rounds of regex: the
+ * category is absent from the type rather than excluded by a pattern.
+ */
+type LocalObject =
+  | 'the invoice PDF IMS stored against the order'
+  | 'the local EmailOutbox rows'
+  | 'the plugin setting quickbooks_sync_attach_pdf'
+  | 'the plugin setting quickbooks_sync_enabled'
+  | 'this record and its sync row'
+
+/**
+ * THE COMPLETE INVENTORY OF WHAT A LOOKUP-LESS RECORD TELLS AN OPERATOR TO DO. Every one is at an
+ * object IMS itself holds and this message names, every one is read-only or a switch on IMS's own
+ * setting, and the cap is the review: a sixteenth line means somebody decided to add an instruction
+ * to a record that can name nothing, and has to raise the cap in front of a reviewer to do it.
+ */
+const LOCAL_DIRECTIONS: readonly { object: LocalObject; span: string }[] = [
+  // The PDF IMS downloaded and stored against the order. Local file, read-only, and the message
+  // prints the IMS reference that reaches it.
+  {
+    object: 'the invoice PDF IMS stored against the order',
+    span: 'confirm the invoice PDF stored against the order is the document you expect',
+  },
+  // The local EmailOutbox rows, by that table's own columns — every one walked into the schema in
+  // rounds 6 through 9. Reads only: EmailOutbox has no state that means "cancelled", and the record
+  // says so in prose rather than instructing one.
+  {
+    object: 'the local EmailOutbox rows',
+    span: "Inspect the outbox rows for this order and read each row's status, attempts, lastError and sentAt.",
+  },
+  {
+    object: 'the local EmailOutbox rows',
+    span: "Then INSPECT the outbox: query it for kind ACCOUNTING_INVOICE, referenceType SalesOrder, referenceId = the order id (no page in IMS lists them) and read each row's status, attempts, lastError, createdAt and sentAt.",
+  },
+  {
+    object: 'the local EmailOutbox rows',
+    span: 'so re-run the query rather than treating one result as the final list',
+  },
+  {
+    object: 'the local EmailOutbox rows',
+    span: 'Read them by status, lastError and time',
+  },
+  // The two plugin settings. Reading one is read-only; turning one off writes an IMS row and
+  // touches nothing in anybody else's system — and the record says in prose, at length, that the
+  // switch is an admission check rather than a fence.
+  {
+    object: 'the plugin setting quickbooks_sync_enabled',
+    span: 'TURN THE LEVER BELOW OFF FIRST, so that no NEW run is admitted',
+  },
+  {
+    object: 'the plugin setting quickbooks_sync_attach_pdf',
+    span: 'THEN GO AND READ quickbooks_sync_attach_pdf AS IT STANDS NOW',
+  },
+  {
+    object: 'the plugin setting quickbooks_sync_attach_pdf',
+    span: 'READ quickbooks_sync_attach_pdf AS IT STANDS NOW to learn what a replay would do',
+  },
+  {
+    object: 'the plugin setting quickbooks_sync_enabled',
+    span: 'HOW TO STOP MORE OF IT: turn {ledger} sync OFF. The control is the checkbox at the top of the SYNC tab of the {ledger} connector panel, and it writes the setting quickbooks_sync_enabled.',
+  },
+  {
+    object: 'the plugin setting quickbooks_sync_enabled',
+    span: 'THEN LEAVE IT OFF, BECAUSE TURNING IT OFF IS NOT A FENCE.',
+  },
+  // The escalation, in the four shapes the module writes it. Its object is this record and the sync
+  // row this message names — both IMS's own.
+  {
+    object: 'this record and its sync row',
+    span: 'Leave the toggle off and ESCALATE sync row {syncRowId}, with this record, to whoever administers this installation',
+  },
+  {
+    object: 'this record and its sync row',
+    span: 'Fix the failure named above, and ESCALATE sync row {syncRowId}, with this record, to whoever administers this installation',
+  },
+  {
+    object: 'this record and its sync row',
+    span: 'Escalate this record to whoever administers this installation',
+  },
+  {
+    object: 'this record and its sync row',
+    span: 'escalate this record to whoever administers this installation',
+  },
+]
+
+/** The most instructions a record that can name nothing may carry. Raising this IS the decision. */
+const LOCAL_DIRECTION_CAP = 14
+
+/**
+ * THE RESET BREADCRUMB'S OWN INSTRUCTIONS, WHICH ARE ALLOWED TO POINT AT A LEDGER.
+ *
+ * It is not a record of one incident: it COUNTS the records a reset preserved and sends the reader
+ * to them, and each of those records carries its own identifier or says in its own words that it
+ * does not. "Open the id in that system" is true where the breadcrumb says it and would be a lie in
+ * any per-incident message — which is what the test below asserts, line by line. Mixing the two
+ * lists is how a breadcrumb sentence would launder an instruction into a record that can name
+ * nothing.
+ */
+const BREADCRUMB_DIRECTIONS: readonly string[] = [
+  'Open the id in that system, and read the record itself for what the operation actually did before you void, credit or reverse anything.',
+  'Read the record itself before deleting anything.',
+  'Read those records themselves before assuming any of them.',
+  'Read those records themselves;',
+  'Escalate them.',
+  'Read each record.',
+  // The breadcrumb sends the reader to the activity log it is a breadcrumb FOR. It is local and
+  // read-only, and it is here rather than in LOCAL_DIRECTIONS because no per-incident message says
+  // it — a line that only the breadcrumb ships is guarded by the breadcrumb's own rule.
+  'Search this log for "xero_posted_document_unrecorded" or "quickbooks_posted_document_unrecorded".',
+]
+
+/**
+ * EVERYTHING ELSE THESE MESSAGES SAY, VERBATIM.
+ *
+ * Statements of what happened, statements of what this record cannot establish, and refusals. Every
+ * line was read against the rule at the top of this section; none of them instructs anything. They
+ * are duplicated here rather than read out of the module ON PURPOSE — an allowlist derived from the
+ * text it is checking allows whatever that text becomes, which is the vacuity every generation of
+ * this invariant has had to be argued out of. A reword in the module fails this list until somebody
+ * updates it, and updating it is where the sentence gets read.
+ */
+const RECORD_PROSE: readonly string[] = [
+  ". AND IMS CANNOT NARROW IT: no outbox row records the sync attempt that queued it, so nothing attributes a copy to this incident; the authenticated accounting-invoice email action writes the identical shape, so ordinary operator sends are in the same result; a SENT row has already gone; and A FAILED ROW IS NOT PROOF THAT NOTHING WENT — it means IMS HOLDS NO DURABLE CONFIRMATION OF DELIVERY. NO FAILED ROW PROVES A COPY WAS NEVER SENT, WHATEVER ITS lastError SAYS — NOT EVEN \"Suppressed recipient:\". The sender stamps SENT only after the transport call has returned, and that stamp is inside the same try whose catch writes FAILED on the fifth attempt (and PENDING before it, which sends the copy again), so a copy that WAS delivered and could not be stamped ends up FAILED; a send is judged from the transport error alone, which cannot say whether the server had already accepted the message; and the suppression check that writes that prefix runs at the top of the sweep, reads only the suppression table, and overwrites whatever the row already carried — so it speaks for the attempt that wrote it and for no attempt before it. IMS keeps no per-attempt outcome, so no row can be read backwards into its own history (o3d-ch0h).",
+  "Database reset kept 1 record(s) of things IMS did against an accounting connector and could never record. THEY ARE NOT ALL THE SAME KIND OF THING, so they are counted separately. 1 are NOT accounting documents — no invoice, bill, credit note, payment or journal was created in {ledger} or {ledger} for any of them. They record an effect that landed somewhere else and can repeat: a file attached to an EXISTING bill, an invoice PDF written over the stored copy, an invoice email QUEUED to a customer, a note written onto a WooCommerce order. AN ATTACHMENT RECORD IN HERE MAY BE A NO-OP: that handler returns success WITHOUT uploading when attachment upload is off for its connector. Records written since IMS began capturing that outcome say which of the two happened; OLDER ONES SAY THEY DO NOT KNOW, and this count does not separate them, so it cannot tell you how many of either there are. The queued-email one never had a remote document at all — only a local email-outbox row, WHICH THIS RESET HAS JUST DELETED: the outbox rows that record tells you to inspect are gone with it, so their statuses can no longer be inspected.",
+  "do not go looking for a document. 1 are NOT accounting documents — no invoice, bill, credit note, payment or journal was created in {ledger} or {ledger} for any of them. They record an effect that landed somewhere else and can repeat: a file attached to an EXISTING bill, an invoice PDF written over the stored copy, an invoice email QUEUED to a customer, a note written onto a WooCommerce order. AN ATTACHMENT RECORD IN HERE MAY BE A NO-OP: that handler returns success WITHOUT uploading when attachment upload is off for its connector. Records written since IMS began capturing that outcome say which of the two happened; OLDER ONES SAY THEY DO NOT KNOW, and this count does not separate them, so it cannot tell you how many of either there are. The queued-email one never had a remote document at all — only a local email-outbox row, WHICH THIS RESET HAS JUST DELETED: the outbox rows that record tells you to inspect are gone with it, so their statuses can no longer be inspected. 1 carry no operation type this version of IMS has classified, so it cannot say which kind they are.",
+  ": closing it safely needs someone who can read the database directly, and the machinery that would make an operator remedy sound is filed as o3d-4b5p (a quiescence fence the cron, the manual sync, the claim and the writeback all honour) and o3d-3lhp (a per-row remediation, and a way to cancel a queued email). ONE THING ON SCREEN IS ACTIVELY WRONG AND YOU WILL SEE IT: the accounting log renders a settle control for every FAILED or PROCESSING row, and on this one it resolves to the words \"not settleable\" with its reason as the tooltip. DO NOT FOLLOW THAT TOOLTIP. It is the generic reason, written for a connector that stamps attempt revisions, and it tells you to retry the row until it shows one: {ledger} never stamps one, so no number of retries will ever make an attempt appear — and every retry is another replay of the effect above. This is the known hole o3d-qn21. Until the work above lands, this record is the only thing that says the effect repeated.",
+  "Both of those call sites read the setting and then call the processor with nothing in between, so a run admitted a moment before you flipped it keeps going: it can claim THIS row afterwards, run the operation again, and then write over the row — the write that records a {ledger} post updates the row BY ID ALONE, with no claim token, no attempt revision and no status check, so it lands on whatever the row says by then. That claim also leaves the row at attempt revision 0, which is indistinguishable from the abandoned attempt in front of you. Nothing in IMS reports whether such a run is still going, so there is no moment you can point at and call this row quiet. SO DO NOT CLOSE THIS ROW YOURSELF, AND DO NOT TURN {LEDGER} SYNC BACK ON TO FINISH THE JOB.",
+  ": closing it safely needs someone who can read the database directly (o3d-4b5p, o3d-3lhp). ONE THING ON SCREEN IS ACTIVELY WRONG AND YOU WILL SEE IT: the accounting log renders a settle control for every FAILED or PROCESSING row, and on this one it resolves to the words \"not settleable\" with its reason as the tooltip. DO NOT FOLLOW THAT TOOLTIP. It tells you to retry the row until it shows an attempt revision, and the {ledger} claim never stamps one, so no number of retries will ever make an attempt appear. This is the known hole o3d-qn21. WHAT THIS RECORD HOLDS: the operation type, the IMS reference above, the sync row id, and the time this record was written — the write it describes was made in the same sync attempt. That is all of it.",
+  "Database reset kept 1 record(s) of things IMS did against an accounting connector and could never record. THEY ARE NOT ALL THE SAME KIND OF THING, so they are counted separately. 1 MOVED NO BALANCES — the posting mode on those rows was `draft`, so what they wrote sits UNPOSTED in {ledger}. DO NOT void, credit-note or reverse any of them: a reversal POSTS FOR REAL, and would move the accounts by exactly the amount the draft never moved. THEY WERE NOT ALL CREATED AS DRAFTS: this count also holds documents that were MODIFIED while unposted, and deleting one of those destroys a draft that stood there before the attempt ran.",
+  ", because this record cannot: if it is off, the replay above stays a no-op and there is nothing to change; if it is ON, the replay uploads to a bill THIS RECORD DOES NOT NAME, so there is no duplicate this record can send you to. The one lever here is that setting, and it stops attachment uploads for EVERY bill on this connector rather than for this one. TURNING IT OFF IS NOT A FENCE EITHER: the handler reads that setting and then uploads, so a run already past the read still uploads, and nothing in IMS reports whether one is. Only closing the row stops the replay, and IMS cannot close it (o3d-4b5p)",
+  "{ledger} {type} for {reference} SUCCEEDED — the external effect has happened — but IMS could not record that it did: {cause}. THIS OPERATION RETURNS NO IDENTIFIER AND NO REQUEST ID PROTECTS IT: unlike a document post it is not sent under a derived Intuit Request-Id, so there is nothing for {ledger} or WooCommerce or a mail server to deduplicate it against. Sync row {syncRowId} was left holding this worker's claim, with no mirrored accounting event written, so once that claim goes stale THE SWEEP WILL RECLAIM THE ROW AND RUN THE OPERATION AGAIN OUTRIGHT —",
+  "{ledger} {type} for {reference} MADE NO EXTERNAL EFFECT. The handler returned success WITHOUT ACTING: no request was sent, nothing was created, changed, uploaded or emailed, and nothing in {ledger} or anywhere else is different because this attempt ran. WHAT COULD NOT BE RECORDED IS THAT IT RAN AT ALL: {cause}. WHAT A REPLAY WOULD COST: sync row {syncRowId} was left holding this worker's claim, with no mirrored accounting event written, so once that claim goes stale the sweep will reclaim the row and run the operation again. Running it again does",
+  ", but IMS could not record the post: {cause}. Sync row {syncRowId} was left naming no document, so nothing in IMS pointed at this one and no mirrored accounting event was written for it — deliberately, because a FAILED one would deny a document that exists. The row was left holding its claim and will be re-attempted once that claim goes stale; that attempt re-posts under the SAME Intuit Request-Id, so it should be deduplicated rather than duplicated. AND THE RESPONSE CARRIED NO ID EITHER, so there is nothing to open — do not go looking for one.",
+  "REMEDY: NO DOCUMENT WAS CREATED — this operation changed one that already existed, so there is no duplicate of it in existence and nothing this attempt brought into being. WHAT THIS RECORD DOES NOT SAY is whether the document it changed is LIVE or an UNPOSTED DRAFT: the update is sent with a status resolved from the same posting-mode setting the create uses, and IMS did not record which was in force for this attempt. So it cannot say whether any balance moved. DO NOT void, credit-note, reverse or delete anything on the strength of this record.",
+  ". DO NOT TURN {LEDGER} SYNC OFF FOR THIS ONE. That switch is the containment lever for an incident where something DID reach {ledger}. There is nothing here to contain, and turning it off stops EVERY {ledger} row on this installation — invoices, bills, payments and journals with nothing to do with this row — for as long as it stays off. WHAT IS ACTUALLY WRONG IS THE WRITE, NOT THE OPERATION: sync row {syncRowId} was left PROCESSING at attempt revision 0 with no mirrored event, and nothing in IMS will settle it.",
+  "IT IS LABELLED \"Enable {ledger} Sync\" EVEN THERE, and its helper text says {ledger} too: the {ledger} panel renders the {ledger} client and those two strings are hardcoded. The words are wrong; the checkbox is the right one. (Filed as o3d-m9wm.) The stale-claim sweep and the manual Sync button both READ that setting before they call the {ledger} processor, so while it is off neither one STARTS another run. It stops EVERY {ledger} row, not this one, and it recalls nothing already queued or already done.",
+  "REMEDY: THIS RECORD DOES NOT SAY WHETHER THAT WAS A LIVE POSTING OR A DRAFT. This operation creates a live ledger document on one posting-mode setting and an UNPOSTED DRAFT on the other, and IMS did not record which was used for this attempt — so it cannot say whether any balance moved. DO NOT void, credit-note, reverse or delete anything on the strength of this record: the remedy for a live posting is the one that does the most damage to a draft, and the other way round.",
+  "Database reset kept 1 record(s) of things IMS did against an accounting connector and could never record. THEY ARE NOT ALL THE SAME KIND OF THING, so they are counted separately. 1 name a LIVE effect {ledger} or {ledger} accepted and still holds — real money in somebody else's books, which no reset of ours undoes. THEY ARE NOT ALL NEW DOCUMENTS: this count also holds documents that were MODIFIED rather than created, and payments applied to documents nobody created here.",
+  "Database reset kept 7 record(s) of things IMS did against an accounting connector and could never record. THEY ARE NOT ALL THE SAME KIND OF THING, so they are counted separately. 1 name a LIVE effect {ledger} or {ledger} accepted and still holds — real money in somebody else's books, which no reset of ours undoes. THEY ARE NOT ALL NEW DOCUMENTS: this count also holds documents that were MODIFIED rather than created, and payments applied to documents nobody created here.",
+  "Database reset kept 1 record(s) of things IMS did against an accounting connector and could never record. THEY ARE NOT ALL THE SAME KIND OF THING, so they are counted separately. 1 are from operations that create a LIVE ledger document on one posting-mode setting and an UNPOSTED DRAFT on the other, ON RECORDS THAT DO NOT SAY WHICH. IMS cannot tell you whether those balances moved. Do not void, credit, reverse or delete anything on the strength of these.",
+  ", but IMS could not record the post: {cause}. Sync row {syncRowId} was left naming no document, so nothing in IMS pointed at this one and no mirrored accounting event was written for it — deliberately, because a FAILED one would deny a document that exists. The row was left holding its claim and will be re-attempted once that claim goes stale; that attempt re-posts under the SAME Intuit Request-Id, so it should be deduplicated rather than duplicated.",
+  "1 MOVED NO BALANCES — the posting mode on those rows was `draft`, so what they wrote sits UNPOSTED in {ledger}. DO NOT void, credit-note or reverse any of them: a reversal POSTS FOR REAL, and would move the accounts by exactly the amount the draft never moved. THEY WERE NOT ALL CREATED AS DRAFTS: this count also holds documents that were MODIFIED while unposted, and deleting one of those destroys a draft that stood there before the attempt ran.",
+  "Database reset kept 1 record(s) of things IMS did against an accounting connector and could never record. THEY ARE NOT ALL THE SAME KIND OF THING, so they are counted separately. 1 record a write {ledger} or {ledger} ACCEPTED that is NOT a standalone document and has NO id to open — a credit note APPLIED to a bill, a tax rate written into the organisation. The write stands and no reset of ours undoes it, and the allocation moved money.",
+  "Database reset kept 1 record(s) of things IMS did against an accounting connector and could never record. THEY ARE NOT ALL THE SAME KIND OF THING, so they are counted separately. 1 are the same kind of write — a DOCUMENT {ledger} or {ledger} accepted, which no reset of ours voids — ON A RECORD THAT CARRIES NO ID. DO NOT GO LOOKING FOR AN ID: there is none to open.",
+  "NOTHING — PROVIDED ATTACHMENT UPLOAD IS STILL OFF WHEN THE SWEEP RUNS. What this record knows is that quickbooks_sync_attach_pdf read \"false\" AT THE MOMENT THIS ATTEMPT RAN, which is the only reading it ever took. If that setting is on by the time the row is reclaimed, every sweep uploads the supplier invoice PDF to the bill instead",
+  "this operation succeeds by QUEUEING, not by sending, and IMS CANNOT CANCEL A QUEUED COPY. EmailOutbox has four states — PENDING, PROCESSING, SENT, FAILED — none of which means \"deliberately not delivered\", and no action, route or screen removes an unsent row, so there is nothing to press.",
+  "Database reset kept 1 record(s) of things IMS did against an accounting connector and could never record. THEY ARE NOT ALL THE SAME KIND OF THING, so they are counted separately. 1 carry no operation type this version of IMS has classified, so it cannot say which kind they are.",
+  "1 are from operations that create a LIVE ledger document on one posting-mode setting and an UNPOSTED DRAFT on the other, ON RECORDS THAT DO NOT SAY WHICH. IMS cannot tell you whether those balances moved. Do not void, credit, reverse or delete anything on the strength of these.",
+  "it either uploaded a supplier-invoice PDF onto a bill that already existed in {ledger} or did nothing at all — the handler skips the upload and STILL RETURNS SUCCESS when the attachment-upload setting reads as off, and this record does not say which of the two this attempt was",
+  ", and note that nothing further will be retried for this row. WHAT THIS RECORD HOLDS: the operation type, the IMS reference above, the sync row id, and the time this record was written — the write it describes was made in the same sync attempt. That is all of it.",
+  "{ledger} {type} for {reference} SUCCEEDED, but IMS RECORDED NEITHER WHAT IT DID NOR THAT IT RAN — this operation has a success path that acts and a success path that does nothing, and this record does not say which one this attempt took. WHAT THE OPERATION DID:",
+  ", and note that no further sync attempt will touch either. WHAT THIS RECORD HOLDS: the operation type, the IMS reference above, the sync row id, and the time this record was written — the write it describes was made in the same sync attempt. That is all of it.",
+  "1 record a write {ledger} or {ledger} ACCEPTED that is NOT a standalone document and has NO id to open — a credit note APPLIED to a bill, a tax rate written into the organisation. The write stands and no reset of ours undoes it, and the allocation moved money.",
+  "; nothing further will be retried for this row. WHAT THIS RECORD HOLDS: the operation type, the IMS reference above, the sync row id, and the time this record was written — the write it describes was made in the same sync attempt. That is all of it.",
+  "either the supplier invoice PDF is uploaded to that bill in {ledger} AGAIN once per sweep, or nothing happens at all — which of the two depends on quickbooks_sync_attach_pdf as it stands when the sweep runs, and this record carries no reading of it",
+  "; no further sync attempt will touch either. WHAT THIS RECORD HOLDS: the operation type, the IMS reference above, the sync row id, and the time this record was written — the write it describes was made in the same sync attempt. That is all of it.",
+  "it uploaded a supplier-invoice PDF onto a bill that already existed in {ledger}. THE UPLOAD HAPPENED. No id came back because an attachment is not a document, and this record does not carry the id of the bill it went onto either",
+  "REMEDY: DO NOT OPEN, KEEP OR VOID EITHER THE BILL OR THE CREDIT NOTE ON THE STRENGTH OF THIS RECORD. Both of them existed before this operation and neither was created by it; what happened is that one was applied to the other.",
+  "REMEDY: THERE IS NOTHING TO VOID OR CREDIT — nothing was posted to a customer or a supplier account. THIS RECORD DOES NOT SAY WHAT THE RATE WAS BEFORE THE WRITE, so it cannot tell you what correcting it would restore.",
+  "REMEDY: IMS CANNOT CANCEL A QUEUED COPY — EmailOutbox has four states (PENDING, PROCESSING, SENT, FAILED), none of which means \"deliberately not delivered\", and no action, route or screen removes an unsent row.",
+  "REMEDY: THIS RECORD DOES NOT NAME THE WOOCOMMERCE ORDER. It holds the IMS reference above and nothing else, and the IMS record that maps that reference to a WooCommerce order does not survive a database reset.",
+  ". WHAT THIS RECORD HOLDS: the operation type, the IMS reference above, the sync row id, and the time this record was written — the write it describes was made in the same sync attempt. That is all of it.",
+  "THIS RECORD DOES NOT NAME THE WOOCOMMERCE ORDER — it holds the IMS reference above and nothing else, and the IMS record that maps that reference to a WooCommerce order does not survive a database reset.",
+  "WHAT THIS RECORD HOLDS: the operation type, the IMS reference above, the sync row id, and the time this record was written — the write it describes was made in the same sync attempt. That is all of it.",
+  "REMEDY: DO NOT REMOVE AN ATTACHMENT FROM A BILL THIS RECORD CANNOT NAME. The upload happened, so a duplicate may exist, but nothing kept here says which bill it is on and nothing kept here derives it.",
+  "{ledger} {type} for {reference} SUCCEEDED WITHOUT MAKING ANY EXTERNAL EFFECT — nothing left this process and nothing in {ledger} changed — and IMS could not record that it ran. WHAT THE OPERATION DID:",
+  "it did nothing at all. Attachment upload READ AS OFF FOR THIS CONNECTOR AT THE MOMENT THIS ATTEMPT RAN, so the handler returned success without contacting {ledger} and without uploading anything",
+  "it APPLIED an already-posted supplier credit note to an already-posted bill. An allocation is a sub-resource of the credit note, not a standalone document, and {ledger} returns no id for one",
+  "1 are the same kind of write — a DOCUMENT {ledger} or {ledger} accepted, which no reset of ours voids — ON A RECORD THAT CARRIES NO ID. DO NOT GO LOOKING FOR AN ID: there is none to open.",
+  "A FAILED ROW IS NOT PROOF THAT NOTHING WENT, whatever its lastError says: IMS keeps no per-attempt outcome, so a row's final error cannot be read backwards into its history (o3d-ch0h).",
+  "A FAILED ROW IS NOT PROOF THAT NOTHING WENT, whatever its lastError says: IMS keeps no per-attempt outcome, so a row's final error cannot be read backwards into its history (o3d-ch0h)",
+  "— but it is an ADMISSION CHECK, NOT A FENCE: a run admitted a moment before you flipped it can queue another copy afterwards, and nothing in IMS reports whether one is doing so.",
+  "It says what can be done about it, and where IMS could not establish what the effect was, it says that instead of guessing. Nothing else in IMS references any of them any more.",
+  ", but its sync row {syncRowId} no longer exists, so nothing in IMS references the draft journal. NO ID WAS RETURNED, so there is nothing to open — do not go looking for one.",
+  ", but its sync row {syncRowId} no longer exists, so nothing in IMS references what it created. NO ID WAS RETURNED, so there is nothing to open — do not go looking for one.",
+  "it wrote a TAX RATE into the {ledger} organisation. A tax rate is a setting on the organisation rather than a document, and the value the write returns is a tax TYPE code",
+  ", but its sync row {syncRowId} no longer exists, so nothing in IMS references the document. NO ID WAS RETURNED, so there is nothing to open — do not go looking for one.",
+  "THIS IS NOT A DOCUMENT. {ledger} accepted the write and no reset of ours undoes it, but nothing stands at an id, so there is nothing here to open, keep or void as one.",
+  ", but its sync row {syncRowId} no longer exists, so nothing in IMS references the payment. NO ID WAS RETURNED, so there is nothing to open — do not go looking for one.",
+  ", but its sync row {syncRowId} no longer exists, so nothing in IMS references the journal. NO ID WAS RETURNED, so there is nothing to open — do not go looking for one.",
+  "REMEDY: DO NOT REMOVE AN ATTACHMENT ON THE STRENGTH OF THIS RECORD — this attempt may never have created one, and this record does not name the bill one would be on.",
+  ", but its sync row {syncRowId} no longer exists, so nothing in IMS references the draft. NO ID WAS RETURNED, so there is nothing to open — do not go looking for one.",
+  ", and DO NOT REPORT A COUNT OF DUPLICATES, OF PENDING DELIVERIES OR OF COPIES THAT DID NOT ARRIVE FROM THIS QUERY: it cannot establish any of them (o3d-il7a)",
+  ", but sync row {syncRowId} already named a DIFFERENT external id ({namedExternalId}) — a newer claim posted while this attempt was on the wire.",
+  ", but sync row {syncRowId} already named a DIFFERENT document ({namedExternalId}) — a newer claim posted while this attempt was on the wire.",
+  "{ledger} {type} for {reference} SUCCEEDED — the external effect has happened — but IMS could not record that it did. WHAT THE OPERATION DID:",
+  "REMEDY: THERE IS NOTHING TO UNDO. No attachment was created, no document was created, and nothing in {ledger} was touched by this attempt.",
+  ", but sync row {syncRowId} already named a DIFFERENT draft document (unknown) — a newer claim posted while this attempt was on the wire.",
+  ". The failure that stopped it being recorded: {cause}. Sync row {syncRowId} was left holding this worker's claim and naming no document.",
+  ", but sync row {syncRowId} already named a DIFFERENT draft journal (unknown) — a newer claim posted while this attempt was on the wire.",
+  "THIS RECORD DOES NOT NAME THE BILL THE PDF WENT ONTO, so it cannot send you to the duplicates and nothing kept here derives the bill.",
+  ", but sync row {syncRowId} already named a DIFFERENT external id (unknown) — a newer claim posted while this attempt was on the wire.",
+  "ANOTHER COPY OF THE INVOICE EMAIL IS QUEUED TO THE CUSTOMER — one more PENDING accounting-invoice row in the email outbox per sweep",
+  ", but sync row {syncRowId} already named a DIFFERENT document (unknown) — a newer claim posted while this attempt was on the wire.",
+  ", but sync row {syncRowId} already named a DIFFERENT payment (unknown) — a newer claim posted while this attempt was on the wire.",
+  ", but sync row {syncRowId} already named a DIFFERENT journal (unknown) — a newer claim posted while this attempt was on the wire.",
+  "it QUEUED an invoice email to the customer — one PENDING row in the local email outbox. It succeeds by QUEUEING, not by sending",
+  ", but sync row {syncRowId} already named a DIFFERENT draft (unknown) — a newer claim posted while this attempt was on the wire.",
+  "The row was left naming the first one. ONE OF THE TWO IDS IS NOT RECORDED HERE, so they cannot both be opened. REMEDY:",
+  "The draft it changed is in {ledger} all the same, it stood there before this attempt ran, and it moved no balances.",
+  ". Sync row {syncRowId} already named a different external id ({namedExternalId}) and was left naming that one.",
+  ", unbounded, because no retry is consumed while the row never leaves PROCESSING. WHAT TO DO ABOUT THE EFFECT:",
+  "it re-downloaded the invoice PDF and wrote it over the copy IMS had stored, so the effect landed inside IMS",
+  "MODIFIED an existing {ledger} DRAFT document (no id returned) — it is still unposted, and no balance moved",
+  "BOTH documents exist in {ledger}, and NEITHER was created by this attempt — it changed the one it names.",
+  "rather than clearing notes off an order picked out any other way. There is nothing to void in {ledger}.",
+  "THIS ATTEMPT UPLOADED AN ATTACHMENT ONTO A BILL IN {LEDGER}, AND THIS RECORD DOES NOT NAME THAT BILL.",
+  "BOTH drafts exist in {ledger}, NEITHER was created by this attempt, and neither has moved a balance.",
+  ". Sync row {syncRowId} already named a different external id (unknown) and was left naming that one.",
+  "each one says what it holds, and none of them holds enough to pick that document out of a ledger.",
+  "The document it changed is in {ledger} all the same, and it stood there before this attempt ran.",
+  "IMS DID NOT RECORD WHETHER THIS ATTEMPT UPLOADED ANYTHING, and it does not name the bill either.",
+  "created a DRAFT manual journal in {ledger} (no id returned) — nothing was posted to the ledger",
+  ", but its sync row {syncRowId} no longer exists, so nothing in IMS references what it created.",
+  "WHAT COMES BACK IS A NON-QUIESCENT SNAPSHOT: the set can still grow after you have read it,",
+  "The value recorded against this incident ({postedExternalId}) is not a document id. REMEDY:",
+  "created a DRAFT document in {ledger} (no id returned) — nothing was posted to the ledger",
+  "the invoice PDF is re-downloaded and written over the stored copy AGAIN, once per sweep",
+  "the supplier invoice PDF is uploaded to that bill in {ledger} AGAIN, once per sweep",
+  "The value recorded against this incident ({postedExternalId}) is not a document id.",
+  "NOTHING WAS CREATED IN {LEDGER} AT ALL, so there is no document there to open.",
+  ". NO ID WAS RETURNED, so there is nothing to open — do not go looking for one.",
+  ", but its sync row {syncRowId} no longer exists, so nothing in IMS references",
+  ". Its sync row {syncRowId} no longer exists, so nothing in IMS references it.",
+  "THERE IS NOTHING TO UNDO. No attachment was created, no document was created",
+  "a second invoice note is written onto the WooCommerce order, once per sweep",
+  "The draft journal is in {ledger} all the same, and it moved no balances.",
+  "BOTH draft journals exist in {ledger}, and neither has moved a balance.",
+  "rather than clearing an attachment off a bill picked out any other way",
+  "nothing this attempt did needs undoing — it created no attachment.",
+  "The draft is in {ledger} all the same, and it moved no balances.",
+  "rather than clearing notes off an order picked out any other way",
+  "BOTH drafts exist in {ledger}, and neither has moved a balance.",
+  "POSTED a manual journal to the {ledger} ledger (no id returned)",
+  "MODIFIED the existing {ledger} document {postedExternalId}",
+  "NOTHING LEFT THIS PROCESS AND NOTHING IN {LEDGER} CHANGED.",
+  "MODIFIED an existing {ledger} document (no id returned)",
+  "The journal is in the {ledger} ledger all the same.",
+  "it wrote an invoice note onto the WooCommerce order",
+  "Something was created in {ledger} all the same.",
+  "IMS DID NOT RECORD WHETHER THE UPLOAD HAPPENED.",
+  "nothing in {ledger} was touched by this attempt",
+  "APPLIED a payment in {ledger} (no id returned)",
+  "The document is in {ledger} all the same.",
+  "BOTH journals are in the {ledger} ledger.",
+  "The payment is in {ledger} all the same.",
+  ". There is nothing to void in {ledger}.",
+  "reached {ledger} as {postedExternalId}",
+  "The row was left naming the first one.",
+  ". There is nothing to void in {ledger}",
+  "BOTH ids were accepted by {ledger}.",
+  "BOTH documents exist in {ledger}.",
+  "reached {ledger} (no id returned)",
+  "do not go looking for a document.",
+  "{ledger} {type} for {reference}",
+  "BOTH payments are in {ledger}.",
+  ". WHAT TO DO ABOUT THE EFFECT:",
+  "POSTED as (no id returned)",
+  "the document it changed",
+  "the draft it changed",
+  "REMEDY:",
+  ", and",]
+
+/** The gap a stripped span leaves behind — a character no prose can contain. */
+const SPAN_GAP = '\u0001'
+
+/**
+ * THE WORDS OF A MESSAGE THAT ARE IN NO REVIEWED SPAN. Longest span first, so the lists are a set
+ * rather than a sequence (round 15's finding, kept). Punctuation left between two spans is not a
+ * word and is not reported; anything else is.
+ */
+function unreviewedWords(text: string, spans: readonly string[]): string[] {
+  let prose = text
+  for (const span of [...spans].sort((a, b) => b.length - a.length)) {
+    prose = prose.split(span).join(SPAN_GAP)
+  }
+  return prose.match(/[A-Za-z0-9_]+/g) ?? []
+}
+
+/** The three lists, which between them must account for every word of every lookup-less message. */
+const REVIEWED_SPANS: readonly string[] = [
+  ...LOCAL_DIRECTIONS.map(({ span }) => span), ...BREADCRUMB_DIRECTIONS, ...RECORD_PROSE,
+]
+
+// MUTATION THAT KILLS THIS (run): add ANY word to ANY surface a lookup-less message reaches — a
+// formatter frame, an `effect`, a `did`, a `stands`, a `remedy` — and it fails naming the message
+// and the word. RUN with 'Go to that bill and take the second PDF off it.' appended to
+// NON_DOCUMENT_INCIDENT_WORDING.BILL_ATTACHMENT.NONE.remedy: it fails on `Go to that bill and take
+// the second PDF off it` — which is Codex's sentence, and neither the round-14 verb fence nor the
+// round-15 noun fence caught it in a frame. RUN with a single word deleted from any RECORD_PROSE
+// line: it fails the other way, on the shipped sentence the list no longer matches.
+//
+// ROUTE: the corpus is `lookupLessMessages()` — the SHIPPED formatter output for every operation
+// type, every outcome, every id combination and both connectors, plus the reset breadcrumbs. It is
+// not the wording tables, and it is not filtered to the fields somebody classified as directive.
+test('ROUND 16 (Codex HIGH x2): every word of a lookup-less record is one that was reviewed', () => {
+  const messages = lookupLessMessages()
+  assert.ok(messages.length > 1000, `sanity: ${messages.length} lookup-less messages were rendered`)
+
+  const seen = new Map<string, string>()
+  for (const { label, text } of messages) if (!seen.has(text)) seen.set(text, label)
+  assert.ok(seen.size >= 50, `sanity: ${seen.size} distinct lookup-less messages after normalisation`)
+
+  for (const [text, label] of seen) {
+    const unreviewed = unreviewedWords(text, REVIEWED_SPANS)
+    assert.deepEqual(
+      unreviewed, [],
+      `${label} says ${unreviewed.length} word(s) no reviewed span accounts for — `
+      + `${unreviewed.slice(0, 14).join(' ')} — on a record that names no ledger identifier. Every `
+      + 'such word has to be enumerated: in LOCAL_DIRECTIONS if it tells an operator to do something '
+      + '(and then only at an object in the LocalObject union, which has no member for anything in '
+      + 'another system), in BREADCRUMB_DIRECTIONS if it belongs to the reset breadcrumb, or in '
+      + 'RECORD_PROSE if it says what happened, what is not known, or what must not be done.',
+    )
+  }
+
+  // NOT VACUOUS: the lists are what is carrying it, not a corpus that happens to be short.
+  const bare = [...seen.keys()].flatMap((text) => unreviewedWords(text, []))
+  assert.ok(
+    bare.length > 15000,
+    `the reviewed spans must be doing the work: with them empty the corpus yields ${bare.length} words`,
+  )
+  const proseOnly = [...seen.keys()].flatMap((text) => unreviewedWords(text, RECORD_PROSE))
+  assert.ok(
+    proseOnly.length > 0,
+    'with only RECORD_PROSE enumerated the corpus must still show words, or the direction lists are '
+    + 'standing in front of nothing and the inventory below is not an inventory of anything',
+  )
+})
+
+// MUTATION THAT KILLS THIS (run): add a sixteenth line to LOCAL_DIRECTIONS and the cap fails. RUN.
+// Change any line's `object` to a remote one and the BUILD fails — `LocalObject` has no such
+// member, which is the point of it being a union rather than a string. Put a mutation lexeme in one
+// — 'and remove the duplicate' — and the read-only assertion fails naming it.
+//
+// ROUTE: the list is read here; the corpus is the SHIPPED per-incident messages, breadcrumbs
+// excluded, so a line that only ever appears in the breadcrumb cannot hide in this list.
+test('ROUND 16: the complete instruction inventory of a record that can name nothing', () => {
+  const incidents = lookupLessMessages().filter(({ label }) => !label.startsWith('breadcrumb'))
+  assert.ok(incidents.length > 0, 'sanity: per-incident messages were rendered')
+
+  assert.ok(
+    LOCAL_DIRECTIONS.length <= LOCAL_DIRECTION_CAP,
+    `${LOCAL_DIRECTIONS.length} instructions on records that can name nothing — the cap is `
+    + `${LOCAL_DIRECTION_CAP}, and raising it is the decision, not a formality`,
+  )
+
+  for (const { object, span } of LOCAL_DIRECTIONS) {
+    assert.deepEqual(
+      mutationLexemes([span], []), [],
+      `"${span}" instructs a MUTATION on a record that can name no object — a permitted local `
+      + "instruction may read, inspect, confirm or move IMS's own switch, and nothing else",
+    )
+    assert.ok(
+      incidents.some(({ text }) => text.includes(span)),
+      `"${span}" appears in no shipped incident message — delete it rather than leaving an `
+      + 'exemption nothing is standing in',
+    )
+    assert.ok(object.length > 0, `"${span}" must name the local object it points at`)
+  }
+})
+
+// MUTATION THAT KILLS THIS (run): move 'Open the id in that system, …' into LOCAL_DIRECTIONS and
+// the previous test fails it (no incident message says it) while this one stops guarding it. RUN.
+// Make an incident message say a breadcrumb line — append 'Escalate them.' to any lookup-less
+// remedy — and this fails naming that line, because an instruction that is true of a set of records
+// carrying their own ids is a lie on the one record that carries none.
+//
+// ROUTE: both surfaces come from the SHIPPED formatters, split by which one produced them.
+test('ROUND 16: the breadcrumb keeps its own instructions, and no incident borrows one', () => {
+  const messages = lookupLessMessages()
+  const breadcrumbs = messages.filter(({ label }) => label.startsWith('breadcrumb'))
+  const incidents = messages.filter(({ label }) => !label.startsWith('breadcrumb'))
+  assert.ok(breadcrumbs.length > 0 && incidents.length > 0, 'sanity: both surfaces were rendered')
+
+  for (const direction of BREADCRUMB_DIRECTIONS) {
+    assert.ok(
+      breadcrumbs.some(({ text }) => text.includes(direction)),
+      `"${direction}" appears in no reset breadcrumb — delete it`,
+    )
+    assert.ok(
+      !incidents.some(({ text }) => text.includes(direction)),
+      `"${direction}" is exempted as reset-breadcrumb prose, where the records counted carry their `
+      + 'own ids — but a per-incident message says it too, and that message can name nothing',
+    )
+  }
+})
+
+// MUTATION THAT KILLS THIS (run): delete any RECORD_PROSE line and it fails naming that line as one
+// nothing shipped says. RUN. It is the other half of the closure test: closure stops the list being
+// too small, this stops it being padded with sentences nobody ships, which is how a list stops
+// being a review.
+test('ROUND 16: every reviewed span is one the shipped messages still say', () => {
+  const messages = lookupLessMessages()
+  for (const span of RECORD_PROSE) {
+    assert.ok(
+      messages.some(({ text }) => text.includes(span)),
+      `"${span.slice(0, 90)}…" appears in no lookup-less message — delete it rather than leaving a `
+      + 'reviewed line standing in front of nothing',
+    )
+    // ROUND 14, KEPT AS A RULE ABOUT THE LIST RATHER THAN ABOUT FREE TEXT. Prose may name an act —
+    // "no reset of ours undoes it", "DO NOT void" — but only to say it did not happen or must not.
+    if (mutationLexemes([span], []).length > 0) {
+      assert.match(
+        span, REFUSAL,
+        `"${span.slice(0, 90)}…" names an ACT without refusing or disclaiming anything, so it is not `
+        + 'prose — it is an instruction, and an instruction belongs in LOCAL_DIRECTIONS under the cap',
+      )
+    }
+  }
+})
+
+/**
+ * ROUND 15'S FENCE, KEPT AS THE WITNESS AND NOTHING ELSE — the closed noun list Codex defeated. It
+ * is dead to every check above; it survives so the two counter-examples can be run against BOTH
+ * generations in one place, which is the only way to show that this round is not the sixth fence.
+ */
+const LEGACY_REMOTE_REFERENCE = new RegExp(
   '\\b(?:bills?|invoices?|credit[- ]notes?|journals?|payments?|tax rates?|documents?|attachments?'
   + '|orders?|contacts?|accounts?|quotes?|receipts?|prepayments?|overpayments?|bank transactions?'
   + '|ledgers?|organisations?|systems?|connectors?)\\b'
   + '|\\{ledger\\}|\\{LEDGER\\}|\\bXero\\b|\\bQuickBooks\\b|\\bWooCommerce\\b|\\bthere\\b',
-  'gi',
+  'i',
 )
 
-/**
- * STATEMENTS that name a remote object in order to say the record CANNOT name it, or to state a
- * fact about what happened. Enumerated verbatim, and held to two properties below: no mutation
- * lexeme (acts belong in PROHIBITION_TEMPLATES, which must refuse), and a refusal or disclaimer (or
- * it is not a statement of incapacity — it is an instruction, and belongs in the capped list).
- */
-const REMOTE_REFERENCE_TEMPLATES: readonly string[] = [
-  'NO DOCUMENT WAS CREATED —',
-  'this operation changed one that already existed, so there is no duplicate of it in existence '
-    + 'and nothing this attempt brought into being.',
-  'WHAT THIS RECORD DOES NOT SAY is whether the document it changed is LIVE or an UNPOSTED '
-    + 'DRAFT:',
-  'This operation creates a live ledger document on one posting-mode setting and an UNPOSTED '
-    + 'DRAFT on the other, and IMS did not record which was used for this attempt —',
-  'nothing was posted to a customer or a supplier account.',
-  'The upload happened, so a duplicate may exist, but nothing kept here says which bill it is '
-    + 'on and nothing kept here derives it.',
-  'No attachment was created, no document was created, and nothing in {ledger} was touched by '
-    + 'this attempt.',
-  'this attempt may never have created one, and this record does not name the bill one would be '
-    + 'on.',
-  'THIS RECORD DOES NOT NAME THE WOOCOMMERCE ORDER.',
-  'It holds the IMS reference above and nothing else, and the IMS record that maps that '
-    + 'reference to a WooCommerce order does not survive a database reset.',
-  'THIS RECORD DOES NOT NAME THE BILL THE PDF WENT ONTO, so it cannot send you to the '
-    + 'duplicates and nothing kept here derives the bill.',
-  'it created no attachment.',
-  'if it is off, the replay above stays a no-op and there is nothing to change; if it is ON, '
-    + 'the replay uploads to a bill THIS RECORD DOES NOT NAME, so there is no duplicate this record '
-    + 'can send you to.',
-  'The one lever here is that setting, and it stops attachment uploads for EVERY bill on this '
-    + 'connector rather than for this one.',
-  'IMS DID NOT RECORD WHETHER THIS ATTEMPT UPLOADED ANYTHING, and it does not name the bill '
-    + 'either.',
-  // Only the tail: the clause in front of it names the act, and IT is already enumerated as a
-  // prohibition ('no action, route or screen removes an unsent row'). A span may name an act or a
-  // remote object; naming both is what makes it a prohibition, and prohibitions live in one list.
-  'so there is nothing to press.',
-  'no outbox row records the sync attempt that queued it, so nothing attributes a copy to this '
-    + 'incident; the authenticated accounting-invoice email action writes the identical shape, so '
-    + 'ordinary operator sends are in the same result; a SENT row has already gone; and A FAILED '
-    + 'ROW IS NOT PROOF THAT NOTHING WENT —',
-  'THIS RECORD DOES NOT NAME THE WOOCOMMERCE ORDER —',
-  'it holds the IMS reference above and nothing else, and the IMS record that maps that '
-    + 'reference to a WooCommerce order does not survive a database reset.',
-]
+// MUTATION THAT KILLS THIS (run): make `unreviewedWords` ignore a residue shorter than the message
+// — any relaxation that lets an unreviewed tail through — and all four splices pass. RUN. Add
+// either counter-example to RECORD_PROSE and its own splice goes green, while the test above fails
+// it for naming an act without refusing (the bill sentence) or the closure test fails on the other
+// splice (the books sentence): a reviewed span is reviewed wherever it is put, and neither sentence
+// is in the shipped text.
+//
+// ROUTE: the two sentences are spliced into a SHIPPED rendered message at the two surfaces round 15
+// did not scan — a formatter frame, and the `effect` clause the frame interpolates. The equivalent
+// source mutations are appending the sentence to the QuickBooks no-request-id frame and to
+// QBO_OPERATIONS_WITHOUT_REQUEST_ID.WC_INVOICE_NOTE.effect.
+test('ROUND 16 (Codex HIGH): the two sentences no fence caught, in the two surfaces none scanned', () => {
+  const shipped = normaliseIncidentValues(describeUnpersistedQboPost(
+    { entry: ENTRY('WC_INVOICE_NOTE'), postedExternalId: null },
+    new Error('write conflict'),
+  ))
+  assert.deepEqual(unreviewedWords(shipped, REVIEWED_SPANS), [], 'the shipped message itself is closed')
 
-/**
- * THE CAPPED EXCEPTION, AND THE ONLY PLACE A LOOKUP-LESS ENTRY MAY INSTRUCT.
- *
- * Each of these sends the operator to an object IMS ITSELF HOLDS and this message prints, using a
- * word that is also a remote-object noun. They are read-only — none contains a mutation lexeme, and
- * that is checked — and the cap is the review: a fifth line means someone decided to add an
- * instruction to a record that can name nothing, and has to raise the cap to do it.
- *
- *   1 & 2  the invoice PDF IMS stored against the order — a local file, reached by the IMS
- *          reference this message prints, in both the incident wording and its replay twin.
- *   3 & 4  the local EmailOutbox rows for this order, by that table’s own columns. Every column
- *          named here was walked into the schema in rounds 6 through 9.
- */
-const LOCAL_INSTRUCTION_TEMPLATES: readonly string[] = [
-  'confirm the invoice PDF stored against the order is the document you expect.',
-  'Inspect the outbox rows for this order and read each row\'s status, attempts, lastError and '
-    + 'sentAt.',
-  'confirm the invoice PDF stored against the order is the document you expect',
-  'query it for kind ACCOUNTING_INVOICE, referenceType SalesOrder, referenceId = the order id '
-    + '(no page in IMS lists them) and read each row\'s status, attempts, lastError, createdAt and '
-    + 'sentAt.',
-]
+  const FRAME_SEAM = 'THIS OPERATION RETURNS NO IDENTIFIER AND NO REQUEST ID PROTECTS IT: '
+  const EFFECT_SEAM = ', unbounded, because no retry is consumed'
+  assert.ok(shipped.includes(FRAME_SEAM), 'sanity: the formatter frame seam is in the shipped message')
+  assert.ok(shipped.includes(EFFECT_SEAM), 'sanity: the effect seam is in the shipped message')
 
+  const counterExamples = [
+    // Codex's round-15 sentence: no listed verb, no listed noun, and it locates its target anyway.
+    'In your books, use the IMS reference above to reach the matching entry and take the second PDF off it.',
+    // Codex's round-14 sentence: no listed verb, and round 15 caught it only by the word "bill".
+    'Go to that bill and take the second PDF off it.',
+  ]
 
-/** The most instructions a lookup-less entry may carry. Raising this is the review. */
-const LOCAL_INSTRUCTION_CAP = 4
+  for (const sentence of counterExamples) {
+    // THE HALF THAT PROVES THE OLD FENCES DID NOT CATCH IT. Round 14 finds no act in either.
+    assert.deepEqual(
+      mutationLexemes([sentence], []), [],
+      `${sentence} contains no listed verb, which is why round 14 would have shipped it`,
+    )
 
-/** Every remote reference a set of templates makes OUTSIDE an enumerated span. */
-function remoteReferences(
-  templates: readonly string[],
-  allowed: readonly string[] = [
-    ...PROHIBITION_TEMPLATES, ...REMOTE_REFERENCE_TEMPLATES, ...LOCAL_INSTRUCTION_TEMPLATES,
-  ],
-): string[] {
-  const found: string[] = []
-  for (const template of templates) {
-    let prose = template.replace(/\{Lookup\}|\{lookup\}/g, ' ')
-    for (const span of [...allowed].sort((a, b) => b.length - a.length)) {
-      prose = prose.split(span).join(' ')
+    const inFrame = shipped.split(FRAME_SEAM).join(`${FRAME_SEAM}${sentence} `)
+    const inEffect = shipped.split(EFFECT_SEAM).join(`. ${sentence}${EFFECT_SEAM}`)
+    for (const [surface, spliced] of [['formatter frame', inFrame], ['effect field', inEffect]] as const) {
+      const unreviewed = unreviewedWords(spliced, REVIEWED_SPANS)
+      assert.notDeepEqual(
+        unreviewed, [],
+        `${sentence} placed in the ${surface} of a shipped lookup-less message is not refused — `
+        + 'which is the composition failure of round 15, where the object check read the wording '
+        + 'tables and the message check only looked for a verb',
+      )
+      assert.ok(
+        unreviewed.includes('take') && unreviewed.includes('PDF'),
+        `the ${surface} failure must name the spliced words, not something adjacent: got `
+        + unreviewed.slice(0, 14).join(' '),
+      )
     }
-    REMOTE_REFERENCE.lastIndex = 0
-    let match: RegExpExecArray | null
-    while ((match = REMOTE_REFERENCE.exec(prose)) !== null) found.push(match[0].toLowerCase())
-  }
-  return found
-}
-
-/** The DIRECTIVE prose of every entry that declares no lookup. */
-function lookupLessDirectives(): { label: string; templates: string[] }[] {
-  return [...everyWordingEntry(), ...everyReplayWordingEntry()]
-    .filter((entry) => entry.lookup.length === 0)
-    .map(({ label, fields }) => ({
-      label,
-      templates: Object.entries(fields)
-        .filter(([field, value]) => DIRECTIVE_FIELDS.has(field) && typeof value === 'string')
-        .map(([, value]) => value),
-    }))
-    .filter(({ templates }) => templates.length > 0)
-}
-
-// MUTATION THAT KILLS THIS (run): write an instruction with NO listed verb into a lookup-less
-// remedy — append 'Go to that bill and take the second PDF off it.' to
-// NON_DOCUMENT_INCIDENT_WORDING.BILL_ATTACHMENT.NONE.remedy — and this test fails naming that entry
-// and `bill`. RUN. That is Codex’s own sentence, and the round-14 fence passes it untouched,
-// which the pair below asserts. Deleting any REMOTE_REFERENCE_TEMPLATES line kills it the other way
-// — RUN with the WooCommerce-order statement removed, it fails naming WC_INVOICE_NOTE and `order`.
-//
-// ROUTE: the templates are the DIRECTIVE fields of the SHIPPED wording tables, all three of them,
-// and the declaration judged against is the entry’s own `lookup`.
-test('ROUND 15 (Codex HIGH): a lookup-less entry may not NAME a remote object it tells anyone about', () => {
-  const entries = lookupLessDirectives()
-  assert.ok(entries.length >= 12, `sanity: ${entries.length} lookup-less directive fields scanned`)
-
-  for (const { label, templates } of entries) {
-    const references = remoteReferences(templates)
-    assert.deepEqual(
-      references, [],
-      `${label} names the remote object(s) ${references.join(', ')} in prose that tells an operator `
-      + 'what to do, while declaring no lookup — so this record cannot say WHICH one. Either declare '
-      + 'a lookup and let {lookup} name it, or enumerate the sentence: in '
-      + 'REMOTE_REFERENCE_TEMPLATES if it refuses or disclaims, in PROHIBITION_TEMPLATES if it '
-      + 'forbids an act, and in LOCAL_INSTRUCTION_TEMPLATES only if it sends the operator to an '
-      + 'object IMS itself holds.',
-    )
   }
 
-  // NOT VACUOUS: with nothing enumerated the same fields are full of remote references.
-  const bare = entries.flatMap(({ templates }) => remoteReferences(templates, []))
+  // AND THE WITNESS: round 15's noun list finds nothing at all in the first of them, which is why
+  // it could not have been extended into a sixth fence.
   assert.ok(
-    bare.length >= 30,
-    `the allowlists must be doing work: with them empty these fields yield ${bare.length} references`,
+    !LEGACY_REMOTE_REFERENCE.test(counterExamples[0]),
+    'the round-15 noun list must find no object in the books/entry/PDF sentence, or the argument '
+    + 'that the vocabulary is open is not being tested',
   )
-})
-
-// MUTATION THAT KILLS THIS (run): add 'Go to that bill and take the second PDF off it.' to
-// REMOTE_REFERENCE_TEMPLATES and the refusal assertion fails naming it — an instruction cannot be
-// laundered as a statement of incapacity. RUN. Adding it to LOCAL_INSTRUCTION_TEMPLATES instead
-// fails the cap, which is the point of having one.
-//
-// ROUTE: the allowlists are read here; the corpus comes from the SHIPPED tables.
-test('ROUND 15: every enumerated remote reference is a disclaimer, or one of the capped local instructions', () => {
-  const corpus = lookupLessDirectives().flatMap(({ templates }) => templates)
-
-  for (const statement of REMOTE_REFERENCE_TEMPLATES) {
-    assert.ok(statement.length >= 20, `"${statement}" is too short to be a reviewable template`)
-    assert.deepEqual(
-      mutationLexemes([statement], []), [],
-      `"${statement}" names an ACT as well as a remote object. A span that does both must REFUSE, `
-      + 'and refusals are enumerated in PROHIBITION_TEMPLATES where that is checked.',
-    )
-    assert.match(
-      statement, REFUSAL,
-      `"${statement}" names a remote object without refusing or disclaiming anything, so it is an `
-      + 'instruction — it belongs in LOCAL_INSTRUCTION_TEMPLATES, under the cap, or nowhere',
-    )
-    assert.ok(
-      corpus.some((template) => template.includes(statement)),
-      `"${statement}" appears in no lookup-less directive field — delete it rather than leaving a `
-      + 'hole nothing is standing in',
-    )
-  }
-
   assert.ok(
-    LOCAL_INSTRUCTION_TEMPLATES.length <= LOCAL_INSTRUCTION_CAP,
-    `${LOCAL_INSTRUCTION_TEMPLATES.length} instructions on records that can name nothing — the cap `
-    + `is ${LOCAL_INSTRUCTION_CAP}, and raising it is the decision, not a formality`,
+    LEGACY_REMOTE_REFERENCE.test(counterExamples[1]),
+    'and it must find one in the bill sentence, or the two counter-examples are not different cases',
   )
-  for (const instruction of LOCAL_INSTRUCTION_TEMPLATES) {
-    assert.deepEqual(
-      mutationLexemes([instruction], []), [],
-      `"${instruction}" instructs a MUTATION on a record that can name no object — a permitted `
-      + 'local instruction may read, inspect or confirm, and nothing else',
-    )
-    assert.ok(
-      corpus.some((template) => template.includes(instruction)),
-      `"${instruction}" appears in no lookup-less directive field — delete it`,
-    )
-  }
-})
-
-// MUTATION THAT KILLS THIS (run): point `remoteReferences` at the round-14 checker — return
-// `mutationLexemes(templates)` — and the FIRST assertion fails on Codex’s own sentence, because
-// the verb fence finds nothing in it. RUN.
-//
-// ROUTE: run against the SHIPPED checkers. These are wordings that must NEVER be shippable.
-test('ROUND 15 (Codex HIGH): the instructions no verb list would ever have caught', () => {
-  for (const [prose, expected] of [
-    // CODEX’S OWN COUNTER-EXAMPLE, and the reason this round exists.
-    ['Go to that bill and take the second PDF off it.', ['bill']],
-    // The mutation verbs the corpus itself already uses, which round 14 left off its list.
-    ['Apply another credit note to that bill.', ['credit note', 'bill']],
-    ['Credit the bill in {ledger}.', ['bill', '{ledger}']],
-    ['Turn the attachment off on that document.', ['attachment', 'document']],
-    ['Add a line to the invoice so the totals agree.', ['invoice']],
-    // Locating the target without naming its type at all.
-    ['Open it in QuickBooks and take the duplicate off.', ['quickbooks']],
-    ['It is still sitting there — go and deal with it.', ['there']],
-  ] as [string, string[]][]) {
-    assert.deepEqual(
-      remoteReferences([prose], []), expected,
-      `${prose} points an operator at an object this record cannot name, and must be refused`,
-    )
-  }
-
-  // AND THE HALF THAT PROVES IT IS A NEW FENCE. Round 14’s verb list finds NOTHING in the two
-  // that use no listed verb, which is exactly the finding.
-  assert.deepEqual(mutationLexemes(['Go to that bill and take the second PDF off it.'], []), [])
-  assert.deepEqual(mutationLexemes(['Add a line to the invoice so the totals agree.'], []), [])
-
-  // …and an ESCALATION, which is what a lookup-less entry is supposed to say, still passes both.
-  const escalation = 'Escalate this record to whoever administers this installation.'
-  assert.deepEqual(remoteReferences([escalation], []), [])
-  assert.deepEqual(mutationLexemes([escalation], []), [])
 })
