@@ -8,10 +8,15 @@ import pg from 'pg'
 
 import {
   DatabaseUrlSchemaConflictError,
+  establishStartupOptionByteSafety,
+  nonAsciiStartupOptionCharacters,
   pgConnectionConfig,
   prismaAdapterSchemaOptions,
+  resetStartupOptionByteSafety,
   resolveDatabaseUrlSchema,
+  sanitisedProbeConnectionString,
   splitLibpqOptions,
+  startupOptionByteSafety,
 } from '../../lib/db/database-url-schema.mjs'
 import { provisioningClient, seedSetting } from '../../scripts/provision-instance.mjs'
 
@@ -1568,6 +1573,277 @@ test('o3d-2k5r r17 (live): the REAL server drops the terminal escape, and the co
       await literal.end().catch(() => undefined)
     }
   } finally {
+    await scratch.drop()
+  }
+})
+
+// ---------------------------------------------------------------------------
+// o3d-2k5r r19, Codex HIGH — THE REFUSAL THAT STRANDED A WORKING DEPLOYMENT.
+//
+// Round 18 rejected every non-ASCII `?schema=` before inspecting the deployment. The byte-level
+// reasoning behind it is right and is asserted above and below, unchanged. What was wrong was that
+// an installation ALREADY USING such a schema — quoted, exactly as docs/installation.md told it to
+// — had no accepted `DATABASE_URL` left, because the adapter is composed at import: the
+// application stopped booting and nothing said what to do instead.
+//
+// The boundary is a fact about the server's encoding and `LC_CTYPE`, so the server is asked. These
+// exercise both answers with a fake client, so the two branches are deterministic and neither
+// depends on which PostgreSQL happens to be reachable; the live section at the end runs the real
+// probe against the real server.
+// ---------------------------------------------------------------------------
+
+/** A `pg.Client` stand-in that answers the probe's two queries however the case under test needs. */
+function probeClient(recorder: { configs: object[] }, answers: (config: { options?: string }) => Record<string, unknown>) {
+  return async (config: { options?: string }) => {
+    recorder.configs.push(config)
+    return {
+      async connect() {
+        return undefined
+      },
+      async query(text: string) {
+        const row = answers(config)
+        if (text.startsWith('select pg_encoding_to_char')) {
+          return { rows: [{ server_encoding: row.server_encoding, lc_ctype: row.lc_ctype }] }
+        }
+        if (row.throws) throw new Error(String(row.throws))
+        return { rows: [{ startup_option_probe: row.startup_option_probe }] }
+      },
+      async end() {
+        return undefined
+      },
+    }
+  }
+}
+
+/** The characters the probe was asked to carry, read back out of the startup options it sent. */
+function probedSentinel(configs: Array<{ options?: string }>): string | undefined {
+  const measured = configs.find((config) => typeof config.options === 'string')
+  return measured?.options
+}
+
+test('o3d-2k5r r19: a Unicode schema is CARRIED on a server whose measured tokenizer keeps the bytes', async () => {
+  resetStartupOptionByteSafety()
+  const schema = 'ténant'
+  const url = `postgresql://app:pw@db.internal:5432/ims?schema=${encodeURIComponent(schema)}`
+
+  // PRECONDITION, so this cannot pass by examining nothing: the name really is non-ASCII, and with
+  // no verdict established it really is refused — which is round 18's behaviour, unchanged.
+  assert.equal(nonAsciiStartupOptionCharacters(url), 'é')
+  assert.throws(() => resolveDatabaseUrlSchema(url), DatabaseUrlSchemaConflictError, 'unprobed, it is refused')
+
+  const recorder = { configs: [] as object[] }
+  const verdict = await establishStartupOptionByteSafety(url, {
+    createClient: probeClient(recorder, (config) => ({
+      server_encoding: 'UTF8',
+      lc_ctype: 'C.UTF-8',
+      // The server keeps every byte: it says back exactly what the startup options carried.
+      startup_option_probe: /-c ims\.startup_option_probe=(.*)$/.exec(config.options ?? '')?.[1]?.replace(/\\(.)/g, '$1'),
+    })),
+  })
+
+  // THE PROBE IS SANITISED, which is the half that makes it safe to run at all: its FIRST
+  // connection carries no `options` and no `?schema=`, so not one byte whose boundary is in
+  // question is in that startup packet.
+  assert.equal(sanitisedProbeConnectionString(url), 'postgresql://app:pw@db.internal:5432/ims')
+  assert.equal((recorder.configs[0] as { options?: string }).options, undefined, 'the first probe connection carries no startup options')
+  assert.equal((recorder.configs[0] as { connectionString: string }).connectionString, 'postgresql://app:pw@db.internal:5432/ims')
+  assert.match(String(probedSentinel(recorder.configs as Array<{ options?: string }>)), /ims\.startup_option_probe=/, 'and the second measures through a custom GUC, not application_name')
+
+  assert.equal(verdict.established, true)
+  assert.equal(verdict.carries, true)
+  assert.equal(verdict.probed, 'é')
+  assert.equal(verdict.serverEncoding, 'UTF8')
+  assert.equal(verdict.lcCtype, 'C.UTF-8')
+  assert.equal(startupOptionByteSafety().carries, true, 'and the verdict is what the module consults')
+
+  // MUTATION ROUTE: drop `&& !nonAsciiOptionByteIsCarried(character, databaseUrl)` from the
+  // `?schema=` loop in resolveDatabaseUrlSchema(). The refusal fires regardless of the measurement
+  // and both assertions below throw — which is exactly the stranding Codex found.
+  assert.equal(resolveDatabaseUrlSchema(url).schema, schema, 'the measured name is carried')
+  assert.equal(pgConnectionConfig(url).options, `-c search_path=${'"ténant"'}`, 'and it is pinned in the spelling the probe measured')
+  assert.deepEqual(prismaAdapterSchemaOptions(url), { schema }, 'and the adapter is given the same one')
+  resetStartupOptionByteSafety()
+})
+
+test('o3d-2k5r r19: the same name on the same server is refused for a character the probe never measured', async () => {
+  // The verdict is per-character because `isspace()` is a per-byte classification with no
+  // adjacency: a character measured intact is intact wherever it appears, and one that was never
+  // measured is not covered by a verdict about other ones.
+  resetStartupOptionByteSafety()
+  const probedUrl = 'postgresql://app:pw@db.internal:5432/ims?schema=' + encodeURIComponent('ténant')
+  await establishStartupOptionByteSafety(probedUrl, {
+    createClient: probeClient({ configs: [] }, (config) => ({
+      server_encoding: 'UTF8',
+      lc_ctype: 'C.UTF-8',
+      startup_option_probe: /-c ims\.startup_option_probe=(.*)$/.exec(config.options ?? '')?.[1]?.replace(/\\(.)/g, '$1'),
+    })),
+  })
+  assert.equal(resolveDatabaseUrlSchema(probedUrl).schema, 'ténant', 'precondition: the measured character is carried')
+
+  // MUTATION ROUTE: delete the `verdict.probed.includes(character)` line from
+  // nonAsciiOptionByteIsCarried(). U+2020 — never measured, and carrying the very byte (A0) the
+  // whole finding is about — is carried on the strength of a measurement of U+00E9.
+  const other = 'postgresql://app:pw@db.internal:5432/ims?schema=' + encodeURIComponent('ten†ant')
+  assert.throws(
+    () => resolveDatabaseUrlSchema(other),
+    (error: unknown) => {
+      assert.ok(error instanceof DatabaseUrlSchemaConflictError)
+      assert.match((error as Error).message, /U\+2020/, 'and it names the character that was not measured')
+      return true
+    },
+  )
+
+  // And a verdict is about ONE server: the same name against a different host is not covered.
+  const elsewhere = 'postgresql://app:pw@other.internal:5432/ims?schema=' + encodeURIComponent('ténant')
+  assert.throws(() => resolveDatabaseUrlSchema(elsewhere), DatabaseUrlSchemaConflictError, 'a verdict is not transferable between servers')
+  resetStartupOptionByteSafety()
+})
+
+test('o3d-2k5r r19: where the answer cannot be established the refusal names the alternative', async () => {
+  resetStartupOptionByteSafety()
+  const schema = 'ténant'
+  const url = `postgresql://app:pw@db.internal:5432/ims?schema=${encodeURIComponent(schema)}`
+
+  // THE SERVER ANSWERED, AND THE ANSWER IS NO: it did not return the bytes unchanged, which is
+  // what a tokenizer that splits on them looks like when the connection survives at all.
+  const changed = await establishStartupOptionByteSafety(url, {
+    createClient: probeClient({ configs: [] }, () => ({
+      server_encoding: 'LATIN1',
+      lc_ctype: 'en_GB.ISO-8859-1',
+      startup_option_probe: 'a',
+    })),
+  })
+  assert.equal(changed.established, true)
+  assert.equal(changed.carries, false)
+
+  // MUTATION ROUTE: delete the `${nonAsciiUpgradePath()}` clause from nonAsciiRefusal(). Every
+  // assertion below fails, and the operator is back to a refusal with no way out of it — which is
+  // the finding.
+  for (const [label, produce] of [
+    ['?schema=', () => resolveDatabaseUrlSchema(url)],
+    ['pgConnectionConfig', () => pgConnectionConfig(url)],
+    ['options=', () => splitLibpqOptions(`-c search_path="${schema}"`)],
+  ] as Array<[string, () => unknown]>) {
+    assert.throws(
+      produce,
+      (error: unknown) => {
+        assert.ok(error instanceof DatabaseUrlSchemaConflictError, `${label}: refused`)
+        const message = (error as Error).message
+        assert.match(message, /ONE BYTE AT A TIME/, `${label}: the byte-level reason is kept`)
+        assert.match(message, /NOT A FLAT REFUSAL/, `${label}: and it says so`)
+        assert.match(message, /establishStartupOptionByteSafety\(\)/, `${label}: it names the probe`)
+        assert.match(message, /instrumentation\.ts/, `${label}: and where the probe runs`)
+        assert.match(message, /check-wms-push-state-enum\.mjs/, `${label}: including before a deploy stops the old server`)
+        assert.match(message, /ALTER SCHEMA "<current name>" RENAME TO <ascii_name>;/, `${label}: and the exact SQL for the other way out`)
+        assert.match(message, /server_encoding=LATIN1/, `${label}: with what was actually measured`)
+        assert.match(message, /lc_ctype=en_GB\.ISO-8859-1/, `${label}: including the ctype the boundary depends on`)
+        return true
+      },
+      `${label}: an unsafe measurement must refuse`,
+    )
+  }
+
+  // AND WHEN NOTHING COULD BE ASKED AT ALL, the refusal still says what to do — it just cannot
+  // report a measurement.
+  resetStartupOptionByteSafety()
+  const unreachable = await establishStartupOptionByteSafety(url, {
+    createClient: async () => {
+      throw new Error('connect ECONNREFUSED 10.0.0.1:5432')
+    },
+  })
+  assert.equal(unreachable.established, false, 'an unreachable server is not an answer either way')
+  assert.match(unreachable.reason, /could not reach the server/)
+  assert.throws(
+    () => resolveDatabaseUrlSchema(url),
+    (error: unknown) => {
+      const message = (error as Error).message
+      assert.match(message, /ALTER SCHEMA "<current name>" RENAME TO <ascii_name>;/, 'the rename procedure is offered whether or not the server answered')
+      assert.match(message, /could not reach the server/, 'and the reason it could not be established is quoted')
+      return true
+    },
+  )
+
+  // The probe NEVER throws out of a boot path: an unreachable database must not be an exception
+  // from instrumentation.ts, only a verdict that refuses with a reason.
+  //
+  // MUTATION ROUTE: let the `createClient` rejection propagate instead of settling a verdict.
+  assert.ok(true)
+  resetStartupOptionByteSafety()
+})
+
+test('o3d-2k5r r19: an ASCII URL settles without opening a connection at all', async () => {
+  resetStartupOptionByteSafety()
+  const url = 'postgresql://app:pw@db.internal:5432/ims?schema=ims_app'
+  assert.equal(nonAsciiStartupOptionCharacters(url), '', 'nothing to measure')
+
+  // MUTATION ROUTE: delete the `probed === ''` short circuit from
+  // establishStartupOptionByteSafety(). The createClient below is called and throws, so the
+  // verdict comes back unestablished and this fails — which is the cost every ordinary deployment
+  // would pay at startup.
+  const verdict = await establishStartupOptionByteSafety(url, {
+    createClient: async () => {
+      throw new Error('the probe must not connect for an ASCII URL')
+    },
+  })
+  assert.equal(verdict.established, true)
+  assert.equal(verdict.carries, true)
+  assert.equal(verdict.probed, '')
+  assert.equal(resolveDatabaseUrlSchema(url).schema, 'ims_app')
+  resetStartupOptionByteSafety()
+})
+
+test('o3d-2k5r r19 (live): the REAL server settles the boundary, and the pin it licenses reaches it', async (t) => {
+  const scratch = await openScratch(t)
+  if (!scratch) return
+  resetStartupOptionByteSafety()
+  try {
+    const schema = 'ten\u00A0ant' // U+00A0, written as an escape so it cannot be mistaken for a space
+    await scratch.admin.query(`CREATE SCHEMA ${'"' + schema + '"'}`)
+    await scratch.admin.query(`CREATE TABLE ${'"' + schema + '"'}.settings (key text primary key, value text, "updatedAt" timestamptz)`)
+
+    const url = `${scratch.url}?schema=${encodeURIComponent(schema)}`
+
+    // PRECONDITION: with no verdict, this is round 18's refusal — so what follows is a lift and
+    // not a test of a gate that was never closed.
+    assert.throws(() => pgConnectionConfig(url), DatabaseUrlSchemaConflictError, 'unprobed, the URL is refused')
+
+    // THE REAL PROBE, against the real server, with no fake client anywhere.
+    const verdict = await establishStartupOptionByteSafety(url)
+    assert.equal(verdict.probed, '\u00A0', 'it measured the character in the name')
+    assert.ok(verdict.serverEncoding, `and recorded the encoding the boundary depends on: ${verdict.serverEncoding}/${verdict.lcCtype}`)
+
+    if (!verdict.carries) {
+      // A server that genuinely cannot carry it: the refusal must still stand, with the reason.
+      assert.throws(
+        () => pgConnectionConfig(url),
+        (error: unknown) => {
+          assert.match((error as Error).message, /ALTER SCHEMA "<current name>" RENAME TO <ascii_name>;/)
+          return true
+        },
+      )
+      return
+    }
+
+    // MUTATION ROUTE: make nonAsciiOptionByteIsCarried() return false unconditionally (round 18's
+    // behaviour). pgConnectionConfig() throws and this assertion never gets to the server — which
+    // is the stranding: this DATABASE_URL works here and had no accepted spelling.
+    const client: pg.Client = new pg.Client({ ...pgConnectionConfig(url), connectionTimeoutMillis: 3_000 })
+    await client.connect()
+    try {
+      assert.equal(
+        (await client.query<{ s: string }>('select current_schema() as s')).rows[0]?.s,
+        schema,
+        'the pin the measurement licensed resolves at the real server, in the schema the URL named',
+      )
+      // And a write through it lands there rather than in public — the split this module exists to stop.
+      await client.query('insert into settings (key, value, "updatedAt") values ($1, $2, now())', ['r19', 'live'])
+      const landed = await scratch.admin.query(`select 1 from ${'"' + schema + '"'}.settings where key = 'r19'`)
+      assert.equal(landed.rowCount, 1, 'and the write lands in the measured schema')
+    } finally {
+      await client.end().catch(() => undefined)
+    }
+  } finally {
+    resetStartupOptionByteSafety()
     await scratch.drop()
   }
 })

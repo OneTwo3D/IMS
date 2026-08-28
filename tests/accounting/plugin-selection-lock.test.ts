@@ -946,6 +946,12 @@ function executableFiles(dir: string, found: string[] = []): string[] {
  *                             covered by the lexical inventory above.
  *   'pinned-lock-session'   — builds a small dedicated `pg` pool/client to hold ONE advisory lock on
  *                             a connection Prisma will not reassign. Takes a lock; writes nothing.
+ *   'compatibility-probe'   — opens a short-lived client purely to ASK the server about itself, and
+ *                             runs no statement that touches an application table. o3d-2k5r r19's
+ *                             startup-option probe is the only one: two `SELECT`s (`pg_database`,
+ *                             and a `SHOW` of a custom GUC it set on its own session) whose answers
+ *                             decide whether a non-ASCII schema name can be pinned at all. It takes
+ *                             no lock and needs none — it writes nothing, anywhere, ever.
  *   'names-the-tools-only'  — touches NO database at all, in any mode. It appears in this inventory
  *                             because its own prose names `psql` / `prisma migrate` — which is the
  *                             deliberately generous half of this scan working as intended, and is
@@ -968,6 +974,7 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   | 'names-the-tools-only'
   | 'app-database-client'
   | 'pinned-lock-session'
+  | 'compatibility-probe'
   | 'seed'
 > = {
   'app/api/backup/restore/route.ts': 'replays-external-sql',
@@ -1026,6 +1033,12 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   // question the round-8 inventory did not ask.
   'lib/backup/restore-sql-guard.ts': 'validates-external-sql',
   'lib/db/index.ts': 'app-database-client',
+  // o3d-2k5r r19. Discovered here because `establishStartupOptionByteSafety()` builds its own `pg`
+  // client — deliberately, since the question it answers ("does THIS server's tokenizer carry these
+  // bytes?") has to be asked before the application's own connection config can be composed at all.
+  // Both connections are SANITISED (the URL with `?options=` and `?schema=` removed and no
+  // `options` beside it), it runs two reads and no write, and it touches no application table.
+  'lib/db/database-url-schema.mjs': 'compatibility-probe',
   'lib/db/pinned-advisory-lock.ts': 'pinned-lock-session',
   'lib/connectors/xero/payment-write-lock.ts': 'pinned-lock-session',
   'lib/domain/wms/dispatch-sweep-lock.ts': 'pinned-lock-session',
