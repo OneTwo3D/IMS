@@ -216,6 +216,96 @@ test('o3d-2k5r r23: no runtime pool or client is built straight from DATABASE_UR
 })
 
 // ---------------------------------------------------------------------------
+// o3d-2k5r r25 / o3d-a5zz: and every SESSION-LOCK connection goes through the lock factory.
+// ---------------------------------------------------------------------------
+
+/**
+ * THE TEST ABOVE IS NOT ENOUGH SINCE r25, AND THIS IS WHY.
+ *
+ * `pgConnectionConfig()` satisfies the rule above and still attaches NO per-connection check for an
+ * ASCII schema, because the check it carries is the licence for a non-ASCII startup option. That is
+ * correct for the data path — it is why the exemption exists, and an ordinary pool must not pay a
+ * round trip per connection for a permission it is not spending. It is NOT correct for a connection
+ * that is about to take a SESSION advisory lock, which behind a transaction pooler is held by
+ * nobody: measured against Odyssey 1.5.3-rc1, two clients each got `true` from the same
+ * `pg_try_advisory_lock` and the first's own `pg_locks` showed nothing.
+ *
+ * So a lock holder that writes `new Pool({ ...pgConnectionConfig(url) })` passes the rule above and
+ * is still unprotected. The requirement therefore belongs to `lib/db/session-lock-pool.ts`, and
+ * this is the reader that stops a fifth holder appearing without it — the several-readers-one-fixed
+ * shape again, closed the same way.
+ *
+ * TRANSACTION-SCOPED LOCKS ARE DELIBERATELY OUT OF SCOPE. `pg_advisory_xact_lock` lives and dies
+ * with its transaction, and a transaction pooler holds one backend for the whole transaction by
+ * construction, so multiplexing cannot take that lock away mid-flight. It is the SESSION form, held
+ * across a callback, that needs the connection to be the connection.
+ */
+const TAKES_A_SESSION_ADVISORY_LOCK = /pg_try_advisory_lock\s*\(|pg_advisory_lock\s*\(/
+
+/** A construction that opens its own connection, rather than asking the lock factory for one. */
+const BUILDS_ITS_OWN_CONNECTION = /new\s+(?:pg\s*\.\s*)?(?:Pool|Client)\s*\(/
+
+test('o3d-2k5r r25 / o3d-a5zz: every SESSION advisory lock is taken on a connection the lock factory built', () => {
+  // MUTATION ROUTE: in any of `lib/db/pinned-advisory-lock.ts`,
+  // `lib/connectors/xero/payment-write-lock.ts`, `lib/domain/wms/dispatch-sweep-lock.ts` or the
+  // restore route, replace the factory call with `new Pool({ ...pgConnectionConfig(connectionString),
+  // max: 4 })` — the r23 shape, which the test above still passes. That file reappears in
+  // `offenders` here, and on an ASCII deployment behind a pooler its lock would silently stop
+  // excluding anything.
+  const files = runtimeSources()
+  assert.ok(files.length > 400, `the walk must actually reach the runtime tree; it found ${files.length} files`)
+
+  const holders: string[] = []
+  const offenders: string[] = []
+  for (const file of files) {
+    // Comments are not code — every one of these call sites now carries a WHY block that QUOTES the
+    // construction it replaced and names `pg_try_advisory_lock`, so a raw-text rule would report the
+    // fixed files as holders AND as offenders. Whole-line `//` only, so the `//` of a
+    // `postgresql://` literal survives.
+    const source = readFileSync(path.join(REPO_ROOT, file), 'utf8')
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^[ \t]*\/\/.*$/gm, '')
+    if (!TAKES_A_SESSION_ADVISORY_LOCK.test(source)) continue
+    holders.push(file)
+    const asksTheFactory = /createSessionAdvisoryLock(Pool|Client)/.test(source)
+    if (!asksTheFactory || BUILDS_ITS_OWN_CONNECTION.test(source)) {
+      offenders.push(`${file}${asksTheFactory ? ' (opens its own connection as well)' : ' (never asks the lock factory)'}`)
+    }
+  }
+
+  // PRECONDITION, so this cannot pass by finding nothing: the four known holders are all present,
+  // and the detector really did classify them.
+  for (const holder of [
+    'lib/db/pinned-advisory-lock.ts',
+    'lib/connectors/xero/payment-write-lock.ts',
+    'lib/domain/wms/dispatch-sweep-lock.ts',
+    'app/api/backup/restore/route.ts',
+  ]) {
+    assert.ok(holders.includes(holder), `PRECONDITION: ${holder} takes a session advisory lock and the scan must see it; it saw ${holders.join(', ')}`)
+  }
+
+  assert.deepEqual(
+    offenders,
+    [],
+    'these take a SESSION advisory lock on a connection the lock factory did not build, so nothing proves the ' +
+      `connection reaches the backend directly and behind a transaction pooler the lock excludes nobody:\n${offenders.join('\n')}`,
+  )
+})
+
+test('o3d-2k5r r25 / o3d-a5zz: the escape hatch is read in ONE place, so it reaches every lock or none', () => {
+  // MUTATION ROUTE: read `process.env.DATABASE_SESSION_LOCK_URL` in one lock file instead of in the
+  // factory. An operator setting it would then move some locks past the pooler and leave the others
+  // refusing — a half-applied remedy, which is worse than none because it looks like it worked.
+  const readers = runtimeSources().filter((file) => {
+    const source = readFileSync(path.join(REPO_ROOT, file), 'utf8')
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^[ \t]*\/\/.*$/gm, '')
+    return /process\.env\[?\s*(SESSION_LOCK_DATABASE_URL_ENV|['"`]DATABASE_SESSION_LOCK_URL['"`])/.test(source)
+  })
+  assert.deepEqual(readers, ['lib/db/session-lock-pool.ts'], 'DATABASE_SESSION_LOCK_URL is read by the lock factory and by nothing else')
+})
+
+// ---------------------------------------------------------------------------
 // Live: the lock pool's PHYSICAL connections go through the per-connection guard.
 // ---------------------------------------------------------------------------
 

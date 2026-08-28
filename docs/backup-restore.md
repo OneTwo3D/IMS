@@ -88,6 +88,14 @@ dedicated PostgreSQL session, so a connector switch or an orphaned-sync-row canc
 interleave with the replay. If the lock cannot be taken within 60 seconds the restore fails
 immediately, having changed nothing, and says another restore or connector change is in progress.
 
+The lock-holding session must be able to show that it reaches PostgreSQL **directly**. A session
+advisory lock lives on one backend and is freed the moment that backend goes back to a pool, so
+behind a transaction pooler the restore fence would be held by nobody while the replay ran. The
+holder connection is therefore refused unless the backend names this process's own socket as its
+peer; if `DATABASE_URL` points at a pooler, set `DATABASE_SESSION_LOCK_URL` to a direct, non-pooled
+URL for the same database and schema (see `docs/installation.md`). The refusal happens before the
+restore starts, so nothing is half-applied by it.
+
 The lock has no expiry: it is released when the restore finishes, not on a timer. If `psql` overruns
 its five-minute ceiling it is killed, its database backend is terminated from the lock-holding
 session, and only then is the lock released — so "the restore has stopped writing" is observed
