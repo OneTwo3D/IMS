@@ -3124,8 +3124,10 @@ test('ROUND 20 (Codex HIGH): every string the renderer emits is one written out 
  * round 25 only a root gets one at all; a list
  * parameter becomes an `OPEN_LIST` carrying only its type's length FLOOR, and reading `.length` off
  * one is `UNKNOWN` rather than a number; a discriminant read off an `OPAQUE` value is resolved from
- * the CHECKER's literal type, which folds only when the type itself admits exactly one string —
- * which is knowledge about the program, not a stand-in for a runtime value.
+ * the CHECKER's literal type, which folds only when the type itself admits exactly one string AND
+ * `literalOrigin` can trace that type to a declaration nobody asserted into existence — knowledge
+ * about the program, rather than a stand-in for a runtime value. That second condition is the one
+ * every round on this axis has been about, and round 27 is where it finally reaches every path.
  *
  * AND A CALL BOUNDARY IS NOT A LAUNDERING STEP (round 24, Codex HIGH). Rounds 22 and 23 each closed
  * one place where a TYPE stood in for a VALUE, and each left the next one open. Codex's third route
@@ -3190,6 +3192,36 @@ test('ROUND 20 (Codex HIGH): every string the renderer emits is one written out 
  * through an internal omitted argument and is still refused; round 26's route is one round 25
  * OPENED — round 24's binding already walked both arms of it — and is closed only by the root-entry
  * distinction.
+ *
+ * AND THE ROOT DROPS THE DEFAULT'S VALUE, NOT ITS PROVENANCE (round 27, Codex HIGH). Round 26's
+ * early return dropped two different things and only one of them should have been dropped. There
+ * are two maps here and they answer two questions:
+ *
+ *   `frame`        WHAT IS this parameter. Not binding it at root entry is the round-26 fix and it
+ *                  is right: the caller chooses the value, so the walk must not decide it.
+ *   `originFrame`  HOW FAR is this parameter's DECLARED TYPE to be trusted. Round 24's answer is
+ *                  "exactly as far as whatever would bind it is", and a DEFAULT INITIALIZER is one
+ *                  of the things that would.
+ *
+ * Returning before recording anything left the parameter looking like a root nothing had ever
+ * touched, `symbolOrigin` read that absence as the module's own word, and `resolveProperty`'s
+ * checker-literal fallback re-concretized a property straight off the annotation. So
+ * `options: { mode: 'REVIEWED' } = ({ mode: 'UNREVIEWED' } as unknown as { mode: 'REVIEWED' })`
+ * folded `options.mode` to `'REVIEWED'` and pruned the arm every omitted-argument call takes at run
+ * time — the same type-stands-in-for-value hole as rounds 22-26, reopened at the entry the fix for
+ * round 26 created.
+ *
+ * THE FIX IS THE RULE, NOT A SIXTH ARM. `callImplementation`'s root branch still binds no value and
+ * now records `argumentOrigin(parameter.initializer)` — the same provenance reader a written-out
+ * argument goes through, at the one binding site round 26 stopped looking at. A default with clean
+ * provenance records `null` and changes nothing, and the shipped renderers declare no defaults at
+ * all, so the computed inventory is untouched: fourteen shapes, fourteen distinct sentences,
+ * fourteen reviewed, nothing unresolved — the same numbers every round since 21.
+ *
+ * Control (O) is the route, and its sequence renderer passes the safe value EXPLICITLY so that the
+ * only path to the pruned arm is the root: with the argument omitted there too, round 25's internal
+ * default modelling would surface the sentence through the sequence and the control would be about
+ * round 25 instead.
  *
  * `contextBinding` exists ONLY so a control can re-run this walk with the pre-fix concrete binding
  * and demonstrate that the branch is pruned again. Nothing else passes anything but `'SYMBOLIC'`.
@@ -3641,9 +3673,12 @@ function computeRendererOutput(
       // the call boundary and came out the other side as a declaration this walk trusted. So the
       // argument's provenance is carried in at the call (`originFrames`) and read back here.
       //
-      // A parameter with no entry was never given an argument: it is a root this walk supplied
-      // itself, and its declared type is the module's own word. That is what keeps `direction.target`
-      // folding, which is what keeps the computed set one sentence per direction.
+      // A parameter with no entry had nothing bind it at all — no argument AND no default — so it is
+      // a root this walk supplied itself, and its declared type is the module's own word. That is
+      // what keeps `direction.target` folding, which is what keeps the computed set one sentence per
+      // direction. Since round 27 the "no default" half is real rather than assumed: a root
+      // parameter that HAS a default records that default's provenance even though its value is not
+      // bound, so an absence here means an absence of both.
       if (ts.isParameter(declaration)) {
         const carried = boundOrigin(symbol)
         if (carried) {
@@ -5202,7 +5237,7 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
     + 'is doing the work',
   )
   assert.deepEqual(
-    judgeRendererOutput(viaAssertedRootDefault, {}, 'SYMBOLIC', 'TRACKED', 'INFERRED', 'MODELLED', 'NAMED', 'ABSTRACT', 'DROPPED'),
+    judgeRendererOutput(viaAssertedRootDefault, {}, 'SYMBOLIC', 'TRACKED', 'DEFERRED', 'MODELLED', 'NAMED', 'ABSTRACT', 'DROPPED'),
     [],
     'and neither must receiver propagation — the receiver here is OPAQUE, not UNKNOWN, which is exactly why '
     + 'round 24\'s ordering fix cannot reach it',
