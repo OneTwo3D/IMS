@@ -3316,6 +3316,15 @@ type RootTrust = 'NAMED' | 'INFERRED'
 type RootEntry = 'ABSTRACT' | 'DEFAULTED'
 
 /**
+ * WHETHER THE ROOT CARRIES ITS DEFAULT'S PROVENANCE (round 27, Codex HIGH).
+ *
+ * `'CARRIED'` is what ships, and it is round 24's rule reaching the one binding site round 26
+ * stopped looking at. `'DROPPED'` reproduces round 26 and exists only so control (O) can show what
+ * it folded. See the block above `RootEntry` and the root branch of `callImplementation`.
+ */
+type RootProvenance = 'CARRIED' | 'DROPPED'
+
+/**
  * THE ROOTS THIS WALK CREATES, BY NAME. `rootShapes` calls exactly these two with no arguments, so
  * exactly their parameters are values this walk supplied and whose declared types are therefore the
  * module's own word about itself. Everything else in the program is reached through a call, and
@@ -3478,6 +3487,7 @@ function computeRendererOutput(
   defaultBinding: DefaultBinding = 'MODELLED',
   rootTrust: RootTrust = 'NAMED',
   rootEntry: RootEntry = 'ABSTRACT',
+  rootProvenance: RootProvenance = 'CARRIED',
 ): ComputedRendererOutput {
   const program = directionModelProgram(model, extraFiles)
   const checker = program.getTypeChecker()
@@ -3806,7 +3816,32 @@ function computeRendererOutput(
         // here decides a discriminant the caller actually chooses. Left unbound, the parameter
         // falls to `resolveIdentifier`'s abstract root value; an OPAQUE one decides no comparison,
         // so both arms of every branch keyed on it are walked.
-        if (entry === 'ROOT' && rootEntry === 'ABSTRACT') return
+        if (entry === 'ROOT' && rootEntry === 'ABSTRACT') {
+          // THE VALUE IS NOT BOUND — AND THE PROVENANCE STILL IS (round 27, Codex HIGH).
+          //
+          // Round 26 returned here and recorded nothing, which drops TWO different things at once
+          // and only one of them should be dropped. `frame` answers "what IS this parameter"; not
+          // binding it is the round-26 fix and it is right — the caller chooses the value, so the
+          // walk must not decide it. `originFrame` answers a different question: "how far is this
+          // parameter's DECLARED TYPE to be trusted". Round 24's rule for that is that a
+          // parameter's annotation is honest exactly as far as whatever would bind it is, and a
+          // default initializer is one of the things that would. Dropping the initializer's
+          // provenance therefore left the parameter looking like a root nothing had ever touched,
+          // and `symbolOrigin` reads that absence as the module's own word — after which
+          // `resolveProperty`'s checker-literal fallback re-concretizes a property off the
+          // annotation the initializer asserted into existence. `options: { mode: 'REVIEWED' } =
+          // ({ mode: 'UNREVIEWED' } as unknown as { mode: 'REVIEWED' })` folds `options.mode` to
+          // `'REVIEWED'` and prunes the arm every omitted-argument call takes at run time.
+          //
+          // So the ONE RULE — a declared type is trusted only as far as what bound the value is —
+          // is applied on this path too, and the two maps go back to answering their own questions.
+          // A default with clean provenance records `null` and changes nothing: the shipped
+          // renderers declare no defaults at all, so the computed inventory is untouched.
+          if (rootProvenance === 'CARRIED' && parameter.initializer) {
+            originFrame.set(symbol, argumentOrigin(parameter.initializer))
+          }
+          return
+        }
         // AN OMITTED ARGUMENT TAKES THE DEFAULT'S VALUE AND THE DEFAULT'S PROVENANCE (round 25,
         // Codex HIGH). Round 24 recorded nothing here, so the parameter arrived at `symbolOrigin`
         // looking exactly like a root this walk had created — and `helper()` with
@@ -4232,10 +4267,11 @@ function judgeRendererOutput(
   defaultBinding: DefaultBinding = 'MODELLED',
   rootTrust: RootTrust = 'NAMED',
   rootEntry: RootEntry = 'ABSTRACT',
+  rootProvenance: RootProvenance = 'CARRIED',
 ): string[] {
   const computed = computeRendererOutput(
     model, extraFiles, contextBinding, literalProvenance, receiverPropagation, defaultBinding, rootTrust,
-    rootEntry,
+    rootEntry, rootProvenance,
   )
   const reviewed = RENDERED_DIRECTIONS.map((entry) => entry.text)
   const complaints = [...computed.unresolved]
@@ -5082,6 +5118,114 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
     [],
     'and with internal defaults unbound again (M1) is through, so the two rules are not one rule written twice',
   )
+
+  // (O) THE ASSERTED DEFAULT ON A ROOT PARAMETER — THE ROUND-27 ROUTE (Codex HIGH), and the same
+  // axis for the sixth time: a TYPE standing in for a VALUE.
+  //
+  // Round 26 stopped the analyzer's own `[]` from being read as an omission, so a root parameter
+  // is no longer PINNED to its default. But it returned before recording anything at all, and the
+  // parameter's DECLARED TYPE was then trusted for exactly round 24's reason — nothing had been
+  // traced into it, so it looked like a root this walk supplied itself. `resolveProperty`'s
+  // checker-literal fallback then recovered a single literal off that annotation and the branch
+  // keyed on it was pruned again, one level further out than round 25 closed it.
+  //
+  // The route is compiler-clean and needs no helper: the default is an object whose ASSERTED type
+  // is a single literal and whose VALUE is the other one. Every existing caller omits the argument,
+  // so every existing caller evaluates that object and takes the prohibited arm at run time, while
+  // the analyzer reads the annotation and reports a clean inventory.
+  const viaAssertedRootDefault = model.replace(
+    'export function renderLocalDirection(direction: LocalDirection, context: LocalDirectionContext): string {',
+    'export function renderLocalDirection(\n'
+    + '  direction: LocalDirection,\n'
+    + '  context: LocalDirectionContext,\n'
+    + "  options: { mode: 'REVIEWED' } = ({ mode: 'UNREVIEWED' } as unknown as { mode: 'REVIEWED' }),\n"
+    + '): string {',
+  ).replace(
+    "      return 'confirm the invoice PDF stored against the order is the document you expect'",
+    "      return options.mode === 'REVIEWED'\n"
+    + "        ? 'confirm the invoice PDF stored against the order is the document you expect'\n"
+    + "        : '" + UNDECLARED_REMOTE_ACTION + "'",
+  ).replace(
+    // THE SEQUENCE PASSES THE SAFE VALUE EXPLICITLY, which is what makes this a route through the
+    // ROOT and nothing else. Round 25 models an omitted argument at an INTERNAL call, so if the
+    // sequence omitted it too, round 25 would evaluate the asserted object there and the sentence
+    // would surface through the sequence renderer no matter what the root did — and the control
+    // would be about round 25 rather than about round 27. Passing `{ mode: 'REVIEWED' }` is also
+    // the realistic shape of the mistake: the caller inside the module is careful, and the DEFAULT
+    // is what every caller outside it gets.
+    'return sequence.map((direction) => renderLocalDirection(direction, context)).join(\' and \')',
+    "return sequence.map((direction) => renderLocalDirection(direction, context, { mode: 'REVIEWED' })).join(' and ')",
+  )
+  assert.notEqual(viaAssertedRootDefault, model, 'the asserted-root-default mutation must actually have been applied')
+  // AND THE COMPILER ADMITS IT, byte for byte: the parameter has a default so every existing call
+  // site still type-checks, the assertion goes through `unknown` so it is a legal one, and the
+  // comparison is between the declared literal and itself.
+  assert.deepEqual(
+    modelDiagnostics(viaAssertedRootDefault), modelDiagnostics(model),
+    'the asserted-root-default mutation must type-check exactly as the shipped model does, or it is not a '
+    + 'route anybody could take',
+  )
+  const assertedRootComplaints = judgeRendererOutput(viaAssertedRootDefault)
+  assert.ok(
+    assertedRootComplaints.some((complaint) => complaint.startsWith('emits a sentence nobody reviewed')
+      && complaint.includes('take the second PDF off it')),
+    'CONTROL, THE CODEX ROUTE: an OPAQUE root parameter whose default ASSERTED its declared type is not a '
+    + 'parameter whose annotation is the module\'s own word. The initializer\'s provenance is carried even '
+    + `though its value is not, so the fold is refused and both arms are walked. Saw: ${JSON.stringify(assertedRootComplaints)}`,
+  )
+  // ...and the refusal says WHY, at the point of refusal, rather than the branch merely happening
+  // to be walked for some unrelated reason.
+  assert.ok(
+    computeRendererOutput(viaAssertedRootDefault).unresolved.length === 0,
+    'the asserted-root-default mutation must still COMPUTE — the complaint is the sentence it emits, not a '
+    + 'value this walk gave up on',
+  )
+  // ...AND THE ROUND-26 EVALUATOR LETS IT THROUGH, asserted rather than described — the same shape
+  // as (J) through (N). Re-run the SAME judgement over the SAME mutated renderer with the root
+  // dropping its default's provenance: a clean inventory, while the sentence ships.
+  assert.deepEqual(
+    judgeRendererOutput(viaAssertedRootDefault, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'MODELLED', 'NAMED', 'ABSTRACT', 'DROPPED'),
+    [],
+    'THE ROUND-26 EVALUATOR MUST STILL LET IT THROUGH — if it also refused this, control (O) would be passing '
+    + 'for some other reason and would prove nothing',
+  )
+  // ...AND IT IS NOT CLOSED BY ANY OF THE FIVE FIXES THAT CAME BEFORE IT, which is what makes it a
+  // sixth round rather than a regression of one of them. Provenance tracking at CALL boundaries
+  // (round 24) never sees this argument, because there is no call and no argument; receiver
+  // propagation (round 24) never fires, because the receiver is OPAQUE and not UNKNOWN; modelling
+  // defaults at internal calls (round 25) is about a different entry; and naming the trusted root
+  // set (round 25) is what makes this parameter trusted in the first place.
+  assert.deepEqual(
+    judgeRendererOutput(viaAssertedRootDefault, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'UNBOUND', 'NAMED', 'ABSTRACT', 'DROPPED'),
+    [],
+    'round 24\'s unbound-default rule must not close this on its own, or the round-27 distinction is not what '
+    + 'is doing the work',
+  )
+  assert.deepEqual(
+    judgeRendererOutput(viaAssertedRootDefault, {}, 'SYMBOLIC', 'TRACKED', 'INFERRED', 'MODELLED', 'NAMED', 'ABSTRACT', 'DROPPED'),
+    [],
+    'and neither must receiver propagation — the receiver here is OPAQUE, not UNKNOWN, which is exactly why '
+    + 'round 24\'s ordering fix cannot reach it',
+  )
+  // ...AND THE FIX DOES NOT UNDO ROUND 26. A root parameter whose default is CLEAN is still not
+  // pinned to it: (N)'s route carries no assertion, so carrying its provenance records `null` and
+  // the branch is still walked both ways for the round-26 reason.
+  assert.ok(
+    judgeRendererOutput(viaDefaultedRootParameter)
+      .some((complaint) => complaint.includes('take the second PDF off it')),
+    'ROUND 26 MUST STILL HOLD — a clean default on a root parameter is still not a value the caller did not '
+    + 'choose, and carrying provenance must not have turned that back into a fold',
+  )
+  // ...AND THE RUNTIME PASS CANNOT SEE IT EITHER: the sample calls the renderer the way every
+  // caller does, which is with the argument omitted — and at run time that evaluates the asserted
+  // object and takes the arm the analyzer had pruned. The sample is judged against the inventory
+  // and passes, because the sentence it never reaches is the one that is not in it.
+  for (const context of RUNTIME_CONTEXTS) {
+    assertRenderedInventory(
+      (direction) => renderLocalDirection(direction, context),
+      (text) => substitutePlaceholders(text, context),
+    )
+  }
   // ...AND THE RUNTIME PASS CANNOT SEE IT EITHER, for the reason every control here says: the
   // sampled renderer is called the way the sample calls it, which is with the default.
   for (const context of RUNTIME_CONTEXTS) {
