@@ -240,7 +240,28 @@ test('o3d-2k5r r23: no runtime pool or client is built straight from DATABASE_UR
  * construction, so multiplexing cannot take that lock away mid-flight. It is the SESSION form, held
  * across a callback, that needs the connection to be the connection.
  */
-const TAKES_A_SESSION_ADVISORY_LOCK = /pg_try_advisory_lock\s*\(|pg_advisory_lock\s*\(/
+/**
+ * HOW POSTGRESQL SPELLS "TAKE A SESSION ADVISORY LOCK" (o3d-2k5r r27, Codex MEDIUM).
+ *
+ * Until r27 this was two case-SENSITIVE alternatives requiring an unquoted, unqualified, lowercase
+ * function name. PostgreSQL accepts `SELECT PG_TRY_ADVISORY_LOCK(...)` (it folds an unquoted
+ * identifier), `pg_catalog.PG_ADVISORY_LOCK(...)` (schema-qualified, which is what a
+ * `search_path`-paranoid author writes) and `"pg_try_advisory_lock"(...)` (quoted, which is what a
+ * generator emits) — and all three produced ZERO matches. A fifth raw session-lock holder written
+ * in any of them, or an unrelated session lock added inside the classified factory file, walked
+ * past this whole test while carrying exactly the pooler-induced split-lock risk it exists to
+ * report.
+ *
+ * `_shared` is included because `pg_advisory_lock_shared` is a SESSION lock too — same lifetime,
+ * same problem behind a transaction pooler. The `xact` forms are still deliberately out of scope
+ * (see above), and `pg_advisory_unlock` is not a taking.
+ *
+ * ONE pattern, two regexes, so the detector and the key extractor cannot drift apart — a bypass in
+ * one would otherwise be a bypass the other still reported, which is how a guard ends up half
+ * true. The spellings are pinned in their own test below.
+ */
+const SESSION_LOCK_PATTERN = String.raw`(?:"?pg_catalog"?\s*\.\s*)?"?pg_(?:try_)?advisory_lock(?:_shared)?"?\s*\(`
+const TAKES_A_SESSION_ADVISORY_LOCK = new RegExp(SESSION_LOCK_PATTERN, 'i')
 
 /** A construction that opens its own connection, rather than asking the lock factory for one. */
 const BUILDS_ITS_OWN_CONNECTION = /new\s+(?:pg\s*\.\s*)?(?:Pool|Client)\s*\(/
@@ -266,7 +287,7 @@ const BUILDS_ITS_OWN_CONNECTION = /new\s+(?:pg\s*\.\s*)?(?:Pool|Client)\s*\(/
  * purpose uses a different key and is reported.
  */
 const DEFINES_THE_LOCK_FACTORY = /export function pgSessionLockConnectionConfig\(/
-const SESSION_LOCK_CALL = /pg_(?:try_)?advisory_lock\s*\(\s*([^,)]*)/g
+const SESSION_LOCK_CALL = new RegExp(`${SESSION_LOCK_PATTERN}\\s*([^,)]*)`, 'gi')
 
 test('o3d-2k5r r25 / o3d-a5zz: every SESSION advisory lock is taken on a connection the lock factory built', () => {
   // MUTATION ROUTE: in any of `lib/db/pinned-advisory-lock.ts`,
@@ -439,4 +460,96 @@ test('o3d-2k5r r23 (live): the money-post lock refuses a backend the deployment 
       await cleanup.end().catch(() => undefined)
     }
   }
+})
+
+// ---------------------------------------------------------------------------
+// o3d-2k5r r27, Codex MEDIUM: the detector above must read the spellings the SERVER accepts.
+// ---------------------------------------------------------------------------
+
+test('o3d-2k5r r27: the session-lock detector judges every spelling PostgreSQL accepts, not one lowercase one', () => {
+  // MUTATION ROUTE: drop the `i` flag from `TAKES_A_SESSION_ADVISORY_LOCK`/`SESSION_LOCK_CALL`, or
+  // remove the `"?` / `pg_catalog` alternatives from `SESSION_LOCK_PATTERN` — i.e. restore the r26
+  // regexes. The uppercase, quoted and qualified cases below stop being judged, and with them a
+  // fifth raw session-lock holder written that way walks past the scan above while carrying exactly
+  // the split-lock risk it exists to report. VERIFIED: with the r26 regexes back AND one real
+  // holder (`lib/domain/wms/dispatch-sweep-lock.ts`) rewritten in the uppercase spelling, the scan
+  // above stops seeing it as a holder at all and its PRECONDITION fails.
+  for (const spelling of [
+    'const rows = await client.query(`SELECT PG_TRY_ADVISORY_LOCK(${params})`)',
+    'await client.query("select pg_catalog.PG_ADVISORY_LOCK(1, 2)")',
+    'await client.query(`select "pg_try_advisory_lock"(1, 2)`)',
+    'await client.query(`select pg_catalog . pg_advisory_lock(1, 2)`)',
+    'await client.query(`select "PG_CATALOG"."pg_try_advisory_lock"(1, 2)`)',
+    'await client.query(`select pg_advisory_lock_shared(1, 2)`)',
+    'await client.query(`select pg_try_advisory_lock(ns, key) as locked`)',
+  ]) {
+    assert.ok(TAKES_A_SESSION_ADVISORY_LOCK.test(spelling), `this takes a SESSION advisory lock and must be judged: ${spelling}`)
+  }
+
+  // AND IT STAYS OFF WHAT IS DELIBERATELY OUT OF SCOPE, or "judged" would mean nothing: a rule that
+  // matches everything reports the whole repository and gets exempted into uselessness.
+  for (const spelling of [
+    'await client.query(`select pg_try_advisory_xact_lock(${namespace}, ${key}) as acquired`)',
+    'await client.query(`select PG_ADVISORY_XACT_LOCK(1, 2)`)',
+    'await client.query(`select pg_advisory_unlock(${params}) as unlocked`)',
+    'await client.query("select pg_advisory_unlock_all()")',
+  ]) {
+    assert.ok(!TAKES_A_SESSION_ADVISORY_LOCK.test(spelling), `this is not a session lock being taken and must NOT be judged: ${spelling}`)
+  }
+
+  // The key extractor reads the FIRST argument through the same spellings — it is what decides
+  // whether the factory file's own locks are the probe's, so a spelling it cannot parse is a
+  // classified file whose locks are never checked.
+  const keys = [...'select PG_CATALOG."PG_TRY_ADVISORY_LOCK"(4242, 7); select pg_advisory_lock_shared( 99 , 1)'.matchAll(SESSION_LOCK_CALL)]
+    .map((match) => match[1]?.trim())
+  assert.deepEqual(keys, ['4242', '99'], 'both calls are found and both first arguments are read')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-2k5r r27, Codex HIGH: and the acquisition gate is a property of the FACTORY.
+// ---------------------------------------------------------------------------
+
+/**
+ * The exported lock factories in the factory file, and whether each routes through the gate.
+ *
+ * The call is matched with its OPTIONAL TYPE ARGUMENT — `gateOnFreshLockSpace<PoolClient>(` is the
+ * real spelling in both factories, and a plain `includes('gateOnFreshLockSpace(')` reported both of
+ * them as ungated while the gate was right there. Same class of defect as the SQL-spelling bypass
+ * above: a reader that only knows one way of writing the thing it looks for.
+ */
+const ROUTES_THROUGH_THE_GATE = /gateOnFreshLockSpace\s*(?:<[^>]*>)?\s*\(/
+function factoriesWithoutTheGate(source: string): string[] {
+  const bodies = [...source.matchAll(/export function (createSessionAdvisoryLock\w+)[\s\S]*?\n}/g)]
+  return bodies.filter((body) => !ROUTES_THROUGH_THE_GATE.test(body[0])).map((body) => body[1] ?? '?')
+}
+
+test('o3d-2k5r r27: every session-lock factory re-establishes the shared lock space for the ACQUISITION', () => {
+  // WHY A READER RATHER THAN A NOTE. The probe used to be memoised for the life of the process, so
+  // a verdict measured at boot went on authorising money movement after a failover re-pointed one
+  // of the two endpoints (Codex HIGH). The fix is per-acquisition re-measurement, and it belongs to
+  // the factory for the same reason the affinity proof does: a factory that forgets it is silent,
+  // and the lock still returns `true`.
+  //
+  // IT DOES NOT CLAIM THE FINDING IS CLOSED. Per-acquisition re-measurement narrows the window from
+  // the process's lifetime to milliseconds; it does not make a session advisory lock a sufficient
+  // exclusion for money movement. That is o3d-ic9a (P0) and is not written in this branch.
+  //
+  // MUTATION ROUTE: replace `gateOnFreshLockSpace<PoolClient>(` in `createSessionAdvisoryLockPool`
+  // with any other call. That factory's name appears below and this fails.
+  const source = readFileSync(path.join(REPO_ROOT, 'lib/db/session-lock-pool.ts'), 'utf8')
+  const named = [...source.matchAll(/export function (createSessionAdvisoryLock\w+)/g)].map((match) => match[1])
+  assert.deepEqual(
+    named.sort(),
+    ['createSessionAdvisoryLockClient', 'createSessionAdvisoryLockPool'],
+    `PRECONDITION: the scan must find both factories; it found ${named.join(', ') || 'none'}`,
+  )
+  assert.deepEqual(factoriesWithoutTheGate(source), [], 'these build a session-lock connection without re-establishing the shared lock space for the acquisition')
+
+  // NOT VACUOUS: the same reader really does report a factory that drops the gate.
+  assert.deepEqual(
+    factoriesWithoutTheGate(
+      'export function createSessionAdvisoryLockPool(purpose: string, max: number): Pool {\n  return new Pool({ ...sessionLockRoute(purpose).config, max })\n}',
+    ),
+    ['createSessionAdvisoryLockPool'],
+  )
 })

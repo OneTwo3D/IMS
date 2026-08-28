@@ -579,6 +579,8 @@ test('[o3d-2k5r r27] the per-connection leg REUSES a verdict, so one acquisition
     { createClient },
   )
   for (let connection = 0; connection < 4; connection += 1) {
+    // Spaced, so the reuse is a decision rather than four calls landing on one millisecond.
+    if (connection > 0) await new Promise((resolve) => setTimeout(resolve, 3))
     await (config.onConnect as (c: unknown) => Promise<void>)(directStandIn().client)
   }
   assert.equal(dialled.length, 2, `the probe opened ${dialled.length} connections across four lock connections`)
@@ -1008,19 +1010,26 @@ test('[o3d-2k5r r27] the acquisition gate reads its instant BEFORE opening, so a
   // `onConnect` probe that ran on the way up — so that probe is rejected as too old and every new
   // physical connection measures twice; the assertion below fails on the same instant.
   const seen: number[] = []
-  let openedAt = 0
+  let probedAt = 0
   const gated = gateOnFreshLockSpace<string>(
     async () => {
-      await new Promise((resolve) => setTimeout(resolve, 10))
-      openedAt = Date.now()
+      // The connection comes up, its `onConnect` measures — and OPENING TAKES TIME, which is what
+      // makes the ordering observable rather than a coin toss on one millisecond's resolution.
+      probedAt = Date.now()
+      await new Promise((resolve) => setTimeout(resolve, 15))
       return 'client'
     },
-    async (notBefore) => { seen.push(notBefore) },
+    async (notBefore) => {
+      seen.push(notBefore)
+      // THE SEMANTICS, not just the arithmetic: a verdict measured while this very connection was
+      // coming up must satisfy this acquisition, or every new physical connection probes twice.
+      if (notBefore > probedAt) throw new Error(`the probe that ran at ${probedAt} while this connection came up was rejected as older than ${notBefore}`)
+    },
     () => { throw new Error('nothing was refused, so nothing may be discarded') },
   )
   assert.equal(await gated(), 'client', 'an admitted acquisition gets its connection')
   assert.equal(seen.length, 1, 'and the gate really ran')
-  assert.ok(seen[0]! <= openedAt, `notBefore (${seen[0]}) was taken before the connection opened (${openedAt})`)
+  assert.ok(seen[0]! <= probedAt, `notBefore (${seen[0]}) was taken before the connection came up (${probedAt})`)
 })
 
 test('[o3d-2k5r r27] a refused acquisition DISCARDS its connection and rethrows, rather than handing it out', async () => {
