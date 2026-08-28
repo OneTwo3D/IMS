@@ -239,17 +239,25 @@ DEPLOY_SSH_KNOWN_HOSTS="${DEPLOY_SSH_DIR}/known_hosts"
 NO_GIT=false
 SKIP_BUILD=false
 DRY_RUN=false
+# THE RELEASE BUILD HOST'S MODE (o3d-2sm1.5 r35, Codex HIGH). Not an update at all: it prints the
+# digest a release must publish and exits, before any gate this script would otherwise refuse at.
+PRINT_FENCE_DIGEST=false
 
 for arg in "$@"; do
   case "$arg" in
     --no-git)     NO_GIT=true ;;
     --skip-build) SKIP_BUILD=true ;;
     --dry-run)    DRY_RUN=true ;;
+    --print-fence-digest) PRINT_FENCE_DIGEST=true ;;
     --help)
-      echo "Usage: bash update.sh [--no-git] [--skip-build] [--dry-run]"
+      echo "Usage: bash update.sh [--no-git] [--skip-build] [--dry-run] [--print-fence-digest]"
       echo "  --no-git      Skip git pull (use current source files)"
       echo "  --skip-build  Skip npm build (run migrations + restart only)"
       echo "  --dry-run     Print the plan and change nothing"
+      echo "  --print-fence-digest"
+      echo "                Print the fence artefact digest THIS CHECKOUT would publish and exit."
+      echo "                For the release build host: needs no installation, no .env, no"
+      echo "                database and no root, and writes nothing outside a throwaway."
       exit 0
       ;;
   esac
@@ -257,8 +265,12 @@ done
 
 # --dry-run changes nothing, so it does not need root. A real update stops a systemd
 # unit and rewrites another user's crontab, so that one does.
-if [[ $EUID -ne 0 ]] && ! $DRY_RUN; then
-  die "Run as root: sudo bash update.sh  (--dry-run works unprivileged)"
+#
+# AND NEITHER DOES --print-fence-digest (o3d-2sm1.5 r35, Codex HIGH). It reads this checkout into a
+# throwaway directory and hashes it; a release is built by CI as often as by a person, and a
+# root-only way to obtain a REQUIRED release input is a required input the release cannot produce.
+if [[ $EUID -ne 0 ]] && ! $DRY_RUN && ! $PRINT_FENCE_DIGEST; then
+  die "Run as root: sudo bash update.sh  (--dry-run and --print-fence-digest work unprivileged)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -669,6 +681,34 @@ source "${IMS_SCRIPT_LIB_DIR}/db-fence-protected.sh" || {
   echo "FATAL: ${IMS_SCRIPT_LIB_DIR}/db-fence-protected.sh could not be sourced. It decides which bytes the connection fence may be executed with, and without it this run cannot fence a migration window. Nothing has been changed." >&2
   exit 1
 }
+
+# ---------------------------------------------------------------------------
+# THE DIGEST-REPORT MODE, AND IT IS THE FIRST THING THAT CAN HAPPEN AFTER THE LIBRARY IS READ
+# (o3d-2sm1.5 r35, Codex HIGH).
+#
+# IMS_FENCE_ARTEFACT_SHA256 is a REQUIRED input, published WITH the release, and the host that
+# produces it is a clean checkout of the tag with `npm ci` run in it. r34 printed the candidate
+# digest from --dry-run, first thing inside require_fenceable_database() — which is ahead of every
+# refusal THAT function can return, and behind every refusal this script takes on the way to it.
+# ${APP_DIR} defaults to /opt/one-two-inventory, which a build host does not have, and the layout
+# gate several hundred lines below refuses on a missing ${APP_DIR}/.env in any case. So the one
+# machine that must publish the value could not print it.
+#
+# THIS RUNS BEFORE ALL OF THEM — the installation gate, the .env reads, the service-port gate, the
+# database checks and every fence gate — because it needs nothing any of them are about. It is
+# placed HERE, immediately after the source, because the library is the only thing it does need:
+# there is nothing between the argument loop and this line that touches ${APP_DIR}, and a test
+# runs the literal documented command from a checkout with no installation, no .env, no database
+# and no fence to prove it.
+#
+# THE TREE IS THIS SCRIPT'S OWN CHECKOUT and not ${APP_DIR}: ${IMS_ENTRYPOINT_PATH} is
+# <checkout>/scripts/update.sh, so dirname twice is the release tree the operator typed the
+# command out of. A digest resolved from ${APP_DIR} would be the target's answer to a question
+# only the release can answer.
+if $PRINT_FENCE_DIGEST; then
+  db_fence_report_candidate_digest "$(dirname "$(dirname "${IMS_ENTRYPOINT_PATH}")")" || exit 1
+  exit 0
+fi
 # Did the identity this run is fencing with come from that record rather than from
 # ${APP_DIR}/.env? Only then are the two .env-drift questions in fence_db_connections() skipped —
 # they are questions about a file that is gone, and the record is the better answer to both.

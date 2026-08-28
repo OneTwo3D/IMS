@@ -257,7 +257,7 @@ DB_FENCE_ARTEFACT_RECIPE="find . -type f -printf '%P\\0' | LC_ALL=C sort -z | xa
 # where a first-ever install gets it. Stated once here so the two refusals, the entrypoints and
 # docs/installation.md cannot drift into three different answers — which is the defect this whole
 # library was made a library to avoid. A test asserts the doc page contains it verbatim.
-DB_FENCE_ARTEFACT_SOURCE_TEXT="WHERE THAT VALUE COMES FROM, ON A FIRST-EVER INSTALL AS MUCH AS ON ANY OTHER: it is published WITH THE RELEASE. The release is built on a host that is not this one — a clean checkout of the tag, 'npm ci', then 'bash scripts/update.sh --dry-run', which assembles exactly this tree, prints the line 'THE FENCE ARTEFACT THIS CHECKOUT WOULD PUBLISH HASHES TO <digest>', and neither writes nor executes any part of it — and that digest is published with the release checksums. A host that has ALREADY published this release will also report it: grep '^fence_artefact_sha256=' ${DB_FENCE_ARTEFACT_FILE} there. Running --dry-run on THIS box prints the same kind of line, but assembled from the checkout under question, so it can CONFIRM the release's value and never stand in for it. The other way out needs no digest at all: bootstrap from a source only this account can write — install the release tree as root and take group and other write off it — and the provenance question answers itself."
+DB_FENCE_ARTEFACT_SOURCE_TEXT="WHERE THAT VALUE COMES FROM, ON A FIRST-EVER INSTALL AS MUCH AS ON ANY OTHER: it is published WITH THE RELEASE. The release is built on a host that is not this one — a clean checkout of the tag, 'npm ci', then 'bash scripts/update.sh --print-fence-digest', which assembles exactly this tree, prints the line 'THE FENCE ARTEFACT THIS CHECKOUT WOULD PUBLISH HASHES TO <digest>', and neither writes nor executes any part of it. That mode exists BECAUSE the build host has no installation: it resolves the tree from the checkout the command was typed out of, needs no application directory, no .env, no port, no database and no root, and it runs before every gate the update path would otherwise refuse at — and that digest is published with the release checksums. A host that has ALREADY published this release will also report it: grep '^fence_artefact_sha256=' ${DB_FENCE_ARTEFACT_FILE} there. Running either that mode or --dry-run on THIS box prints the same kind of line, but assembled from the checkout under question, so it can CONFIRM the release's value and never stand in for it. The other way out needs no digest at all: bootstrap from a source only this account can write — install the release tree as root and take group and other write off it — and the provenance question answers itself."
 
 # The expected digests, from the ROOT INVOCATION and from nowhere else. Never read out of the
 # checkout, never out of ${APP_DIR}/.env — both are writable by the account this authenticates
@@ -1324,7 +1324,7 @@ db_fence_probe_script() {
 db_fence_probe_report() {
   if [[ -n "${DB_FENCE_PROBE_ARTEFACT_SHA256}" ]]; then
     printf '%s\n' "THE FENCE ARTEFACT THIS CHECKOUT WOULD PUBLISH HASHES TO ${DB_FENCE_PROBE_ARTEFACT_SHA256}"
-    printf '%s\n' "That is the value IMS_FENCE_ARTEFACT_SHA256 pins. This run produced it by READING the helper and its resolved dependency closure into a root-owned throwaway and hashing it: nothing was written outside that throwaway, and no part of it was executed."
+    printf '%s\n' "That is the value IMS_FENCE_ARTEFACT_SHA256 pins. This run produced it by READING the helper and its resolved dependency closure into a throwaway directory owned by this run and writable by nobody else, and hashing that: nothing was written outside the throwaway, the throwaway was removed, and no part of it was executed."
     printf '%s\n' "It is REPORTED AND NOT AUTHENTICATED — it is what the checkout in front of this run says about itself. ${DB_FENCE_ARTEFACT_SOURCE_TEXT}"
   else
     printf '%s\n' "This run could not assemble the tree this checkout would publish, so it cannot say what IMS_FENCE_ARTEFACT_SHA256 would have to be: ${DB_FENCE_ROTATION_NOTE:-no reason was recorded}."
@@ -1346,4 +1346,53 @@ db_fence_probe_cleanup() {
   DB_FENCE_PROBE_STANDING_SHA256=""
   DB_FENCE_PROBE_REASON=""
   return 0
+}
+
+# ---------------------------------------------------------------------------
+# THE RELEASE BUILD HOST'S ONE COMMAND (o3d-2sm1.5 r35, Codex HIGH).
+#
+# IMS_FENCE_ARTEFACT_SHA256 became a REQUIRED input in r34, and the host that has to produce it is
+# the RELEASE BUILD HOST: a clean checkout of the tag with `npm ci` run in it, and nothing else.
+# No installation under ${APP_DIR}, no ${APP_DIR}/.env, no service unit, no port, no database, no
+# fence — and not necessarily root either, because a release is built by CI as often as by a
+# person.
+#
+# r34 answered that need by printing the candidate digest FIRST inside --dry-run, ahead of every
+# refusal that path can return. It is ahead of every refusal INSIDE require_fenceable_database();
+# it is not ahead of the ones the update path takes to get there. `bash scripts/update.sh
+# --dry-run` on a clean checkout exits at the layout gate — ${APP_DIR} defaults to the
+# installation directory, which does not exist on a build host, and ${APP_DIR}/.env is mandatory —
+# with no digest printed. So the one machine that MUST publish the value was the one machine that
+# could not: exactly the "refusal whose precondition nobody can satisfy" shape r34 set out to
+# avoid, one layer up from where it was looking.
+#
+# This function is that command's whole implementation. It lives here rather than in the
+# entrypoint for the reason the rest of this file does: the value it prints has to be the value
+# _fence_stage_and_publish() would RECORD, produced by the same assembly and the same digest, or
+# it is a second opinion about the artefact and an operator pinning it gets a refusal.
+#
+# WHAT IT NEEDS: the checkout it is handed, and `node`. That is the entire list, and it is the
+# point — the entrypoint calls it with dirname(dirname(<its own path>)), so the tree under
+# question is the one the command was typed out of and never ${APP_DIR}.
+#
+# WHAT IT DOES NOT NEED, and must be able to prove it does not need: ${APP_DIR}, ${APP_DIR}/.env,
+# a service unit, a port, DEPLOY_ADMIN_DATABASE_URL, a database, a standing artefact, or root.
+#
+# WHAT IT DOES NOT DO: it does not read ${DB_FENCE_PROTECTED_APP_DIR} or the recovery record — a
+# build host has neither, and reporting on the box's standing artefact from a command about a
+# RELEASE would answer a question nobody asked. It publishes nothing, opens no connection, and
+# executes no part of the tree it hashes: the digest is computed by READING bytes into a
+# throwaway directory this call creates and removes. ${DB_FENCE_SCRIPT} is restored afterwards so
+# a caller that goes on to do anything else is unaffected by having asked.
+db_fence_report_candidate_digest() {
+  local checkout="$1" saved="${DB_FENCE_SCRIPT:-}" rc=0 line
+  DB_FENCE_SCRIPT="${checkout}/scripts/fence-db-connections.mjs"
+  db_fence_probe_candidate_digest || rc=1
+  # db_fence_probe_report() prints the standing artefact's digest only when
+  # DB_FENCE_PROBE_STANDING_SHA256 is set, and nothing above sets it: the candidate is the whole
+  # answer here.
+  while IFS= read -r line; do printf '%s\n' "${line}"; done < <(db_fence_probe_report)
+  db_fence_probe_cleanup
+  DB_FENCE_SCRIPT="${saved}"
+  return "${rc}"
 }
