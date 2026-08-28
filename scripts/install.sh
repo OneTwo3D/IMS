@@ -773,8 +773,28 @@ DB_FENCE_REFENCE_CMD="${DB_FENCE_SUDO_PREFIX}${DB_FENCE_REFENCE_WRAPPER}"
 # a root-owned directory, and failing a fence over it would trade a real protection for a
 # cosmetic one. The path printed in the banners is still the right one to run — a previous run's
 # wrapper is very likely standing there — and the warning says the refresh did not happen.
+# WHETHER THIS RUN IS A FIRST INSTALL, AND WHAT THAT FORBIDS (o3d-2sm1.5 r35, Codex MEDIUM).
+#
+# A first install has no service, no crontab, no PM2 instance and no process in ${APP_DIR} — that
+# is what upgrade_in_place() asks — and it has just created the database it is about to migrate.
+# There is no writer to stop, so there is no window to hold closed, so the fence helper is never
+# executed and DEPLOY_ADMIN_DATABASE_URL is never handed to bytes out of this checkout. That is
+# the POLICY, stated in docs/installation.md in those words, and this flag is what makes it a
+# property of the code rather than a description of it: set on the first-install branch, and
+# refused by resolve_fence_script() below, which is the sole route to executing the helper.
+#
+# It is an ENFORCEMENT and not a comment because the alternative is what the previous round
+# shipped: a runbook asserting a requirement nothing checked. A later change that adds a fence
+# call to this path now stops the install with the sentence below instead of quietly executing an
+# unauthenticated artefact.
+FIRST_INSTALL_NO_CREDENTIALED_FENCE=false
+
 resolve_fence_script() {
   local script
+  if ${FIRST_INSTALL_NO_CREDENTIALED_FENCE}; then
+    echo "This run is a FIRST INSTALL — no service, no crontab and no other launcher was found, and the database was created by this run — so it performs NO credentialed fence execution: there is no writer to drain and nothing to hold closed. Something on this path asked for the fence helper anyway, and it will not be handed DEPLOY_ADMIN_DATABASE_URL: the tree it would run is assembled out of an application-owned checkout, and a first install is exactly the run with no standing artefact to authenticate it against. Nothing has been migrated." >&2
+    return 1
+  fi
   script="$(db_fence_script_in_use)" || return 1
   db_fence_publish_operator_wrappers "${APP_USER}" "${APP_DIR}/.env" "${DB_FENCE_STATE}" \
     "${DB_FENCE_IDENTITY_ARGS[@]:-}" \
@@ -784,6 +804,69 @@ resolve_fence_script() {
 require_db_identity() {
   [[ "${#DB_FENCE_IDENTITY_ARGS[@]}" -eq 4 ]] && return 0
   return 1
+}
+
+# ---------------------------------------------------------------------------
+# WHAT A FIRST INSTALL DOES ABOUT THE FENCE — ONE POLICY, ENFORCED (o3d-2sm1.5 r35, Codex MEDIUM).
+#
+# THE DEFECT. r34 made IMS_FENCE_ARTEFACT_SHA256 a required input and said so on the first command
+# in docs/installation.md: "required on an ordinary install and the run refuses without it". The
+# code did no such thing. require_fenceable_database() and resolve_fence_script() are reached only
+# inside the upgrade branch, so on a first install the variable was read by the library, compared
+# against nothing, and ignored: omitting it produced no refusal, supplying it published no
+# artefact, and the first later cutover discovered that the authenticated bootstrap was still
+# outstanding. A runbook asserting a requirement the code ignores is the same defect as a comment
+# describing behaviour the code does not have, and this branch has now shipped it three times.
+#
+# THE POLICY, CHOSEN ON THE MERITS AND STATED IN THE RUNBOOK IN THESE WORDS:
+#
+#   A FIRST INSTALL PERFORMS NO CREDENTIALED FENCE EXECUTION.
+#
+# It is what is actually true and it is what should be true. upgrade_in_place() returning false
+# means no unit, no crontab entry, no PM2 instance and no process in ${APP_DIR}; the database was
+# created by this run moments ago. There is no writer to stop, so there is no window to hold
+# closed, so nothing is fenced and the helper — whose whole risk is that it is executed with
+# DEPLOY_ADMIN_DATABASE_URL beside it — is never executed at all. REQUIRING a pin for an execution
+# that does not happen is theatre, and it is the "refusal whose precondition nobody can satisfy"
+# shape this round is explicitly under instructions to avoid: it would stop every first install on
+# a fresh box until the operator had gone and found a release digest, and buy nothing.
+#
+# So the pin is NOT required here, and the runbook no longer says it is.
+#
+# BUT IT IS NOT IGNORED EITHER, because a supplied value that nothing reads is the defect in its
+# other form. When the operator does pass one — they have it, it ships with the release, and they
+# will need it on the first upgrade — this run PUBLISHES the artefact under it, before the
+# migration. That is a read and a copy performed by root; nothing is executed, so it is safe on
+# exactly the reasoning above, and it means the first cutover finds a standing, authenticated
+# artefact instead of discovering the bootstrap is still outstanding at the worst moment. A pin
+# that does NOT authenticate this checkout is a REFUSAL and never a warning: it is the operator
+# saying which bytes they expect, over bytes the application account owns.
+#
+# AND THE NO-EXECUTION HALF IS A FLAG, NOT A COMMENT. resolve_fence_script() is the sole route to
+# executing the helper in this file, and it refuses while this is set.
+first_install_fence_policy() {
+  FIRST_INSTALL_NO_CREDENTIALED_FENCE=true
+
+  if [[ -z "${DB_FENCE_EXPECTED_ARTEFACT_SHA256}" && -z "${DB_FENCE_EXPECTED_SHA256}" ]]; then
+    info "First install: nothing is serving, no crontab is live and this run created the database,"
+    info "so there is no writer to stop and no migration window to fence. NO fence helper is"
+    info "executed on this path and no protected artefact is published."
+    info "IMS_FENCE_ARTEFACT_SHA256 is therefore NOT required here, and was not supplied. The FIRST"
+    info "UPGRADE of this box does require it — that run fences a real window — so obtain it with"
+    info "the release (bash scripts/update.sh --print-fence-digest on a clean checkout of the tag)"
+    info "and pass it then, or pass it to this installer to have the artefact published now."
+    return 0
+  fi
+
+  header "Publishing the protected fence artefact (pinned on this invocation)"
+  info "A first install fences nothing, so this publishes rather than executes: the artefact is"
+  info "assembled from this checkout by root, authenticated against the digest on the invocation,"
+  info "and left standing so the first upgrade cutover has one already."
+  publish_fence_script_copy || die \
+    "The protected fence artefact could not be published under the digest this invocation supplied: ${DB_FENCE_ROTATION_NOTE:-no reason was recorded}. A pin names the bytes you expect, so this is a refusal and not a warning. NOTHING HAS BEEN MIGRATED and nothing has been started; re-run with a digest that matches this release, or with neither pin, in which case this install fences nothing, publishes nothing and the first upgrade asks for the digest instead."
+  if [[ -n "${DB_FENCE_ROTATION_NOTE}" ]]; then info "${DB_FENCE_ROTATION_NOTE}"; fi
+  success "The protected fence artefact at ${DB_FENCE_PROTECTED_APP_DIR} is standing and authenticated."
+  return 0
 }
 # Is the reboot fence ACTUALLY loaded by systemd right now? Distinct from FENCE_ARMED, which
 # only says this run has stopped something: the failure banner used to describe a drop-in that
@@ -3339,6 +3422,8 @@ if upgrade_in_place; then
   acquire_cutover_lock
   import_legacy_cutover_state
   adopt_existing_fence
+else
+  first_install_fence_policy
 fi
 
 # ---------------------------------------------------------------------------

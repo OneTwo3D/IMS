@@ -14,17 +14,38 @@
 Run the installer as root:
 
 ```bash
+bash scripts/install.sh
+```
+
+```bash
+# ...or, on a box you will later upgrade, with the release's digest, which publishes the
+# protected fence artefact now instead of asking for it at the first cutover:
 IMS_FENCE_ARTEFACT_SHA256=<digest published with this release> \
   bash scripts/install.sh
 ```
 
-**That variable is required on an ordinary install and the run refuses without it.** The installer
-raises a connection fence around its migration, and the helper that raises it is executed with an
-administrative database credential; the tree it is built from is assembled out of this checkout,
-which the application account owns. Since r34 that tree must be authenticated by a whole-tree
-digest that came from the release rather than from the box —
-[where to get it, on a first-ever install as much as any other](#artefact-digest-first-install) —
-or the source must be one only root can write. Omit it and the run stops before anything is
+**A first install performs no credentialed fence execution, so `IMS_FENCE_ARTEFACT_SHA256` is not
+required there.** `upgrade_in_place()` returning false means there is no service, no crontab, no
+PM2 instance and no process in the application directory, and the database was created by this
+run: there is no writer to stop, so there is no migration window to hold closed, so the fence
+helper — whose whole risk is that it is executed with an administrative database credential
+beside it — is never executed. `resolve_fence_script()` **refuses** on that path rather than
+merely never being called, so the policy is a property of the code and not a description of it.
+
+**Supply the digest anyway if you have it, and it is enforced.** With `IMS_FENCE_ARTEFACT_SHA256`
+(or `IMS_FENCE_SCRIPT_SHA256`) on the invocation, a first install *publishes* the protected
+artefact before it migrates — root reads and copies the tree, executing nothing — so the first
+upgrade cutover finds a standing, authenticated artefact instead of discovering the bootstrap is
+still outstanding at the worst possible moment. A pin that does **not** authenticate this checkout
+is a **refusal**, never a warning: nothing has been migrated and nothing has been started.
+
+**An upgrade is where the pin becomes mandatory.** Running this installer over an existing
+installation, or running `scripts/update.sh` or `scripts/deploy.sh`, fences a real window and
+executes the helper with an administrative credential. Until a protected artefact stands on the
+box, that tree is assembled out of this checkout — which the application account owns — and must
+be authenticated by a whole-tree digest that came from the release rather than from the box
+([where to get it, on a first-ever install as much as any other](#artefact-digest-first-install)),
+or the source must be one only root can write. Omit it there and the run stops before anything is
 migrated, printing every route to the value it wants.
 
 The script performs the following steps:
@@ -1078,6 +1099,15 @@ and nothing else:
 | a protected copy, no expected digest | the protected copy is used unchanged. A checkout that **differs** is reported — both digests, and the invocation that would adopt it, which since r33 names **both** pins because a rotation republishes the closure too — and **not** promoted. |
 | a protected copy and an expected digest | an authenticated rotation (below). |
 
+**And a fourth case that is not a state of the artefact at all: a FIRST INSTALL.** `install.sh` on
+a box with no service, no crontab, no PM2 instance and no process in the application directory
+fences nothing — there is no writer to stop — so it never reaches the table above by needing to
+*execute* the helper. `resolve_fence_script()` refuses outright on that path. It reaches the first
+row only when the operator supplies a pin, in which case it **publishes** the artefact before the
+migration (a read and a copy by root; nothing is executed) so the first upgrade has one standing.
+With no pin it publishes nothing and says so, and the pin is required at the first upgrade
+instead. See [The Install Script](#the-install-script).
+
 Divergence **warns rather than refuses** deliberately. Refusing would hand the application account
 a denial of service on every future cutover — write one byte into a file it owns and no deploy runs
 again — which trades a credential-theft path for an availability path the same account controls.
@@ -1118,7 +1148,7 @@ deployment. There are three sources and they are not interchangeable:
    checkout of the tag, `npm ci`, then
 
    ```bash
-   sudo bash scripts/update.sh --dry-run
+   bash scripts/update.sh --print-fence-digest
    ```
 
    which assembles exactly the tree a publication would record, hashes it, and prints
@@ -1128,13 +1158,22 @@ deployment. There are three sources and they are not interchangeable:
    ```
 
    It **writes nothing outside its own throwaway and executes no part of the tree** — the digest
-   is computed by reading bytes, not by running them — so it needs no database, no
-   `DEPLOY_ADMIN_DATABASE_URL` and no fence, and it is printed **before** any of the dry run's
-   other refusals can return. That value is published with the release checksums, and it is what
-   the operator passes as `IMS_FENCE_ARTEFACT_SHA256` on every target.
+   is computed by reading bytes, not by running them.
+
+   **That mode exists because a release build host is not a deployment.** It resolves the tree
+   from the checkout the command was typed out of, and it runs immediately after the fence
+   library is sourced — **before** the installation gate, the `.env` reads, the service-port
+   gate, the database checks and every fence gate. So it needs no application directory, no
+   `.env`, no service unit, no port, no `DEPLOY_ADMIN_DATABASE_URL`, no database, no standing
+   artefact and **no root**. `--dry-run` cannot stand in for it: `APP_DIR` defaults to the
+   installation directory, which a clean release checkout does not have, and the dry run refuses
+   at the layout gate before it reaches its own digest print. That value is published with the
+   release checksums, and it is what the operator passes as `IMS_FENCE_ARTEFACT_SHA256` on every
+   target that needs one.
 2. **A host that has already published this release.**
    `grep '^fence_artefact_sha256=' /etc/ims-cutover-recovery/db-fence-artefact.sha256` there.
-3. **`--dry-run` on the target itself — for comparison only.** It prints the same line, assembled
+3. **`--print-fence-digest` or `--dry-run` on the target itself — for comparison only.** Either
+   prints the same line, assembled
    from the checkout under question, so it can **confirm** the release's value and can never stand
    in for one. Every refusal that reports a digest labels it **reported and not authenticated** for
    the same reason.
