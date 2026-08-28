@@ -97,7 +97,7 @@ test('o3d-2k5r r20: the probe in one module instance settles the refusal in a DI
 
   // MUTATION ROUTE: restore round 19's `let startupOptionByteVerdict = NO_VERDICT` and have
   // startupOptionByteSafety()/settle()/nonAsciiOptionByteIsCarried() read and write it instead of
-  // the `Symbol.for('ims.db.startupOptionByteVerdict.v1')` slot on globalThis. The runtime
+  // the `Symbol.for('ims.db.startupOptionByteVerdict.v2')` slot on globalThis. The runtime
   // instance then still holds NO_VERDICT, every assertion below throws
   // DatabaseUrlSchemaConflictError, and that is the shipped failure: a measured, working
   // deployment refused at boot with an instruction to rename its schema.
@@ -127,7 +127,7 @@ test('o3d-2k5r r20: the probe in one module instance settles the refusal in a DI
 
 test('o3d-2k5r r20: a slot holding something this module did not write reads as NO VERDICT', async () => {
   const copy = (await import(`${MODULE_SPECIFIER}?bundle=guard`)) as SchemaModule
-  const slot = Symbol.for('ims.db.startupOptionByteVerdict.v1')
+  const slot = Symbol.for('ims.db.startupOptionByteVerdict.v2')
   const globals = globalThis as unknown as Record<symbol, unknown>
   copy.resetStartupOptionByteSafety()
   try {
@@ -192,33 +192,131 @@ function jsFilesUnder(dir: string): string[] {
 
 const NEXT_BUILD_DIR = new URL('../../.next/', import.meta.url).pathname
 
-test('o3d-2k5r r20: every copy of this module in the built output reaches the process-wide slot', (t: TestContext) => {
-  if (!existsSync(join(NEXT_BUILD_DIR, 'BUILD_ID'))) {
+/**
+ * HOW A BUNDLED COPY IS FOUND, AND WHY NOT BY THE PROBE (o3d-2k5r r21, Codex HIGH).
+ *
+ * Round 20 identified copies by the probe's GUC name, `ims.startup_option_probe`. That is a marker
+ * on the WRITER — the function that measures the server — and the bundler tree-shakes. In the
+ * artifact Codex read, three files carried that marker while FIVE carried the verdict reader: the
+ * runtime and SSR chunks are readers with the probe shaken out of them, so a check named "every
+ * copy" was measuring three fifths of the artifact and two copies could have kept private state
+ * without failing anything.
+ *
+ * So discovery is now READER-SIDE. `NO_VERDICT.reason` is a string literal that exists only inside
+ * this module's reader — `heldStartupOptionByteVerdict()` returns it when the slot is empty — and it
+ * is not re-exported into a caller, so a file containing it contains a copy of the reader. Every
+ * such file must reach the shared slot.
+ *
+ * And discovery is CHECKED AGAINST OTHER MARKERS rather than trusted: each of the writer marker,
+ * the slot key, and the connection-config implementation must appear only in files discovery
+ * already found. A marker set that is NOT a subset means the reader marker has stopped finding
+ * every copy, and that is a failure here rather than a silently narrowed check.
+ */
+const ARTIFACT_MARKERS = {
+  /** The reader's own `NO_VERDICT.reason`. This is what discovers copies. */
+  reader: 'no deployment probe has run in this process',
+  /** Round 20's marker: the probe's GUC. Present only in copies that kept the WRITER. */
+  probe: 'ims.startup_option_probe',
+  /** The shared slot, which is what every discovered copy must reach. */
+  slot: /Symbol\.for\((["'])ims\.db\.startupOptionByteVerdict\.v2\1\)/,
+  /**
+   * `pgConnectionConfig()`'s body — the emitted pin. A file carrying this contains the
+   * IMPLEMENTATION of the connection config, not merely a call to it: the two importer chunks that
+   * call `(0, x.pgConnectionConfig)(url)` do not contain it.
+   */
+  connectionConfig: '-c search_path=',
+  /** The refusal this module raises, which is the other half of the reader. */
+  refusal: 'RENAME TO <ascii_name>',
+} as const
+
+/** Which execution context the bundler emitted a file for, from where it put it. */
+function bundleContext(relative: string): 'edge' | 'ssr' | 'node' {
+  if (relative.startsWith('server/edge/')) return 'edge'
+  if (relative.includes('/ssr/')) return 'ssr'
+  return 'node'
+}
+
+test('o3d-2k5r r21: every copy of this module in the built output reaches the process-wide slot', (t: TestContext) => {
+  // IN CI THIS IS NOT ALLOWED TO SKIP. `IMS_REQUIRE_BUILD_ARTIFACT=1` is set by the workflow step
+  // that runs immediately after `npm run build`, so a missing artifact there is a failure rather
+  // than a green tick over a check that never ran — which is the state Codex found: the validation
+  // job runs unit tests in a fresh workspace before any build, so this skipped on every run.
+  const built = existsSync(join(NEXT_BUILD_DIR, 'BUILD_ID'))
+  if (!built && process.env.IMS_REQUIRE_BUILD_ARTIFACT === '1') {
+    assert.fail(
+      `IMS_REQUIRE_BUILD_ARTIFACT=1 but there is no build output under ${NEXT_BUILD_DIR}. This check reads what ` +
+        'the bundler emitted, and it must run against a build rather than skip.',
+    )
+  }
+  if (!built) {
     t.skip('no .next build output; run `npm run build` first — this check reads what the bundler emitted')
     return
   }
 
-  // The probe's custom GUC name appears in exactly one module, so it identifies a bundled copy of
-  // it without depending on how the bundler names chunks.
-  const marker = 'ims.startup_option_probe'
-  const copies = jsFilesUnder(NEXT_BUILD_DIR).filter((file) => readFileSync(file, 'utf8').includes(marker))
+  const files = jsFilesUnder(NEXT_BUILD_DIR).map((file) => ({
+    relative: file.slice(NEXT_BUILD_DIR.length),
+    source: readFileSync(file, 'utf8'),
+  }))
+  const carrying = (marker: string) => files.filter((file) => file.source.includes(marker)).map((file) => file.relative)
+
+  const copies = carrying(ARTIFACT_MARKERS.reader)
 
   // NON-VACUITY: if no copy is found, the marker or the layout changed and this test is asserting
   // over an empty set — which is a failure, not a pass.
   assert.ok(copies.length > 0, `no bundled copy of database-url-schema.mjs found under ${NEXT_BUILD_DIR}`)
 
-  // THIS IS THE FINDING, MEASURED: the module is emitted more than once. The count is reported so
-  // a build that stopped duplicating it cannot quietly turn the check below into a tautology.
-  t.diagnostic(`bundled copies carrying the probe: ${copies.length}`)
+  // DISCOVERY IS NOT NARROWER THAN ANY OTHER MARKER. This is the finding, as an assertion: the
+  // probe marker found three copies where the reader is in five, so a discovery keyed on it missed
+  // two. Every marker set must live inside what discovery found.
+  //
+  // MUTATION ROUTE: put `ARTIFACT_MARKERS.probe` back as the discovery marker. The
+  // connection-config and reader-implementation subsets below then contain files discovery did not
+  // find, and this fails naming them — `server/chunks/_07_ay5p._.js` and
+  // `server/chunks/ssr/_0g3o6-l._.js` in the artifact this was written against.
+  for (const [name, marker] of [
+    ['the probe writer', ARTIFACT_MARKERS.probe],
+    ['the connection-config implementation', ARTIFACT_MARKERS.connectionConfig],
+    ['the refusal path', ARTIFACT_MARKERS.refusal],
+  ] as const) {
+    const found = carrying(marker)
+    assert.ok(found.length > 0, `${name} appears in NO emitted file, so this subset check is vacuous`)
+    assert.deepEqual(
+      found.filter((file) => !copies.includes(file)),
+      [],
+      `${name} is in a file that copy discovery did not find, so "every copy" is measuring a subset`,
+    )
+  }
+  // And the slot key must not appear anywhere discovery did not look either.
+  assert.deepEqual(
+    files.filter((file) => ARTIFACT_MARKERS.slot.test(file.source) && !copies.includes(file.relative)).map((file) => file.relative),
+    [],
+    'the shared slot is referenced from a file copy discovery did not find',
+  )
+
+  // THE COUNTS AND THE CONTEXTS, REPORTED. A build that stopped duplicating the module cannot
+  // quietly turn the loop below into a tautology, and a build that stopped emitting one of the
+  // three execution contexts is visible here rather than silently uncovered.
+  const contexts = copies.map(bundleContext)
+  t.diagnostic(
+    `bundled copies of the reader: ${copies.length} (${copies.join(', ')}); ` +
+      `carrying the probe writer: ${carrying(ARTIFACT_MARKERS.probe).length}; ` +
+      `carrying the connection-config implementation: ${carrying(ARTIFACT_MARKERS.connectionConfig).length}; ` +
+      `contexts: ${[...new Set(contexts)].sort().join(', ')}`,
+  )
+  // The known outputs Codex named. Asserted rather than reported, because "the SSR copy is covered"
+  // is the specific claim round 20 could not make; if a future build stops emitting one of these,
+  // this must be updated deliberately.
+  for (const context of ['node', 'ssr', 'edge'] as const) {
+    assert.ok(contexts.includes(context), `no ${context} copy was found, so that execution context is uncovered`)
+  }
 
   // MUTATION ROUTE: restore the module-local `let`. Not one emitted copy then mentions the shared
   // slot and every one of these fails — which is the state of the artifact Codex reviewed.
-  for (const file of copies) {
-    const source = readFileSync(file, 'utf8')
+  for (const copy of copies) {
     assert.match(
-      source,
-      /Symbol\.for\((["'])ims\.db\.startupOptionByteVerdict\.v1\1\)/,
-      `${file.slice(NEXT_BUILD_DIR.length)} keeps a private verdict instead of the process-wide one`,
+      files.find((file) => file.relative === copy)!.source,
+      ARTIFACT_MARKERS.slot,
+      `${copy} keeps a private verdict instead of the process-wide one`,
     )
   }
 })
@@ -319,14 +417,28 @@ async function askBuiltServer(databaseUrl: string, timeoutMs = 90_000): Promise<
   }
 }
 
+/**
+ * In CI this leg is not allowed to skip either. The workflow step that runs it sets
+ * `IMS_REQUIRE_BUILD_ARTIFACT=1` and provides both a build and a PostgreSQL service, so every
+ * reason this test has to skip is a reason to FAIL there — a check that skips is a check that is
+ * not there, and skipping silently is exactly how round 20's evidence never ran on any PR.
+ *
+ * @param t the test context, for the skip
+ * @param reason why it cannot run
+ */
+function skipOrFail(t: TestContext, reason: string): void {
+  if (process.env.IMS_REQUIRE_BUILD_ARTIFACT === '1') assert.fail(`IMS_REQUIRE_BUILD_ARTIFACT=1 but this check cannot run: ${reason}`)
+  t.skip(reason)
+}
+
 test('o3d-2k5r r20 (built server): the probe instrumentation runs lets the RUNTIME carry the schema', { timeout: 300_000 }, async (t: TestContext) => {
   if (!existsSync(join(NEXT_BUILD_DIR, 'BUILD_ID'))) {
-    t.skip('no .next build output; this check starts the built server, so it needs `npm run build` first')
+    skipOrFail(t, 'no .next build output; this check starts the built server, so it needs `npm run build` first')
     return
   }
   const base = configuredDatabaseUrl()
   if (!base) {
-    t.skip('no DATABASE_URL configured; the probe needs a reachable PostgreSQL to measure')
+    skipOrFail(t, 'no DATABASE_URL configured; the probe needs a reachable PostgreSQL to measure')
     return
   }
 
@@ -339,14 +451,14 @@ test('o3d-2k5r r20 (built server): the probe instrumentation runs lets the RUNTI
     await bootstrap.connect()
   } catch {
     await bootstrap.end().catch(() => undefined)
-    t.skip('no reachable PostgreSQL; the built-server check is skipped')
+    skipOrFail(t, 'no reachable PostgreSQL; the built-server check needs one to create a throwaway database')
     return
   }
   try {
     await bootstrap.query(`CREATE DATABASE ${name}`)
   } catch (error) {
     await bootstrap.end().catch(() => undefined)
-    t.skip(`cannot create a throwaway database (${error instanceof Error ? error.message : String(error)})`)
+    skipOrFail(t, `cannot create a throwaway database (${error instanceof Error ? error.message : String(error)})`)
     return
   }
   await bootstrap.end().catch(() => undefined)

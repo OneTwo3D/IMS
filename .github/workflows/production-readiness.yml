@@ -179,7 +179,32 @@ jobs:
     needs: classify_changes
     if: needs.classify_changes.outputs.run_expensive == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
+    # o3d-2k5r r21, Codex: THE BUILD-LEVEL CHECKS RUN HERE, BECAUSE THIS IS THE ONLY JOB THAT HAS A
+    # BUILD. GitHub jobs do not share a workspace: `validate` runs the unit suite in a fresh
+    # checkout with no `.next`, so tests/db/startup-option-verdict-across-bundles.test.ts SKIPPED on
+    # every run — a bundler-specific regression could merge with every required check green, which
+    # is the exact class of failure round 20 exists to catch. The database is here for the same
+    # reason: the built-server leg creates a throwaway database with a Unicode schema in it.
+    #
+    # IMS_REQUIRE_BUILD_ARTIFACT=1 turns every skip in that file into a failure, so "it ran" is not
+    # something anybody has to read the log to find out.
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/ims_ci
+    services:
+      postgres:
+        image: postgres:14.13
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ims_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d ims_ci"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -189,6 +214,11 @@ jobs:
       - run: npm ci
       - run: npx prisma generate --schema prisma/schema.prisma
       - run: npm run build
+      # AFTER the build, in the SAME workspace, against what the bundler actually emitted.
+      - name: Build-level DB startup-option checks (artifact + built server)
+        env:
+          IMS_REQUIRE_BUILD_ARTIFACT: "1"
+        run: npx tsx --test --experimental-test-module-mocks tests/db/startup-option-verdict-across-bundles.test.ts
 
   e2e-select:
     needs: classify_changes
