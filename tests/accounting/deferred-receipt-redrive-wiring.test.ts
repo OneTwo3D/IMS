@@ -432,7 +432,20 @@ test('[o3d-ekn8 r3] a re-post landing AFTER the pre-lock check is refused UNDER 
   // The message itself, which nothing had ever executed: it has to say what happened and what to do.
   assert.match(refusals[0].description, /re-posted while the payment was being queued/)
   assert.match(refusals[0].description, /Nothing was sent/)
-  assert.match(refusals[0].description, /Re-run the invoice sync for this order/)
+  // o3d-0bfh r13 (Codex HIGH). It used to end "Re-run the invoice sync for this order, or register
+  // the payment in the ledger by hand". Both halves are unsafe HERE and only here: the branch is
+  // inside `if (pinned)`, so it is only ever the deferred re-drive that reaches it, the connector
+  // retains the follow-up obligation on the `settled: false` this produces, and on Xero a bound
+  // cron-invoked sweep re-reads that marker and re-drives this very function. The hand-made payment
+  // would race it, and no request id can deduplicate one keyed into the Xero UI.
+  assert.doesNotMatch(refusals[0].description, /Re-run the invoice sync for this order/)
+  assert.doesNotMatch(refusals[0].description, /register the payment in the ledger by hand/i)
+  assert.match(refusals[0].description, /HAND SETTLEMENT IS REFUSED HERE/)
+  assert.match(
+    refusals[0].description, /a later sweep re-reads the marker and re-enqueues them idempotently/,
+    "the recovery half is the REGISTRY's declared fact for the pinned connector, not prose written here",
+  )
+  assert.match(refusals[0].description, /ESCALATE/)
 })
 
 test('[o3d-ekn8 r3] the same order registers normally when nothing moves under the lock', async () => {

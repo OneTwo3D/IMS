@@ -2,6 +2,11 @@ import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
 import { createSyncLogStore, syncLogRow, type SyncLogStore } from '../fixtures/accounting-sync-log-store.ts'
+// o3d-0bfh r13: the REAL recovery note, re-exported through the mock below. The enqueue path now
+// composes its refusal remedies out of it, so a mock that omitted it would replace the sentence an
+// operator reads with a TypeError — swallowed by `warn`, and every activity assertion here would
+// then read zero for a reason that has nothing to do with what it is testing.
+import { followUpObligationRecoveryNote } from '@/lib/domain/accounting/back-reference'
 
 // ---------------------------------------------------------------------------
 // o3d-ekn8, THE QUICKBOOKS HALF — A RECEIPT RECORDED BEFORE ITS INVOICE POSTS MUST BE REGISTERED
@@ -211,6 +216,8 @@ mock.module('@/lib/domain/accounting/back-reference', {
       return { claimed: true as const, generation }
     },
     isExternalDocumentIdConflict: () => false,
+    // NOT faked: it is pure, and the refusal messages under test are composed out of it.
+    followUpObligationRecoveryNote,
     releaseFollowUpObligation: async (_client: unknown, params: { syncLogId: string; generation: Date | null }) => {
       // FENCED, so a release that carried no generation clears nothing — which is what makes
       // `released` still able to tell a discharge from a refusal (o3d-0bfh r4).
@@ -419,7 +426,18 @@ test('[o3d-ekn8 r2] a row the enqueue wrote for another connector is ROLLED BACK
   )
   const refusals = activity.filter((entry) => entry.action === 'invoice_payment_not_registered')
   assert.equal(refusals.length, 1, 'and the operator is told, with a remedy')
-  assert.match(String(refusals[0].description), /register the payment in the accounting connector by hand/i)
+  // o3d-0bfh r13 (Codex HIGH). This message used to end "register the payment in the accounting
+  // connector by hand". It is reachable ONLY under a pin — the fence throws inside `if (pinned …)` —
+  // so it is always the deferred re-drive that receives it, the connector RETAINS the obligation on
+  // the `settled: false` this produces, and the hand-made payment would race whatever re-reads the
+  // marker. On QuickBooks nothing does, and the registry says so and says escalate instead.
+  assert.doesNotMatch(String(refusals[0].description), /register the payment in the accounting connector by hand/i)
+  assert.match(String(refusals[0].description), /HAND SETTLEMENT IS REFUSED HERE/)
+  assert.match(
+    String(refusals[0].description), /NOTHING re-enqueues them on this connector/,
+    "the recovery half is the REGISTRY's declaration for the pinned connector, not prose written at the call site",
+  )
+  assert.match(String(refusals[0].description), /ESCALATE/, 'and it says what to do instead of settling by hand')
 })
 
 // ---------------------------------------------------------------------------

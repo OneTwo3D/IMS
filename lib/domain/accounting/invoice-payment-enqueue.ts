@@ -26,7 +26,10 @@ import {
   selectReceiptsAwaitingRegistration,
   unresolvedInvoicePaymentAttempts,
   type InvoicePaymentRegistrationDecision,
+  type InvoicePaymentRegistrationRefusal,
 } from '@/lib/domain/accounting/invoice-payment-registration'
+import { followUpObligationRecoveryNote } from '@/lib/domain/accounting/back-reference'
+import { followUpObligationRecoveryFor } from '@/lib/domain/accounting/follow-up-obligation-registry'
 import { ledgerSalesInvoiceTotalForeign, type PaymentSyncRow } from '@/lib/domain/accounting/settlement-status'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 import { attemptCouldHaveReachedTheLedger, effectiveTokenFor } from '@/lib/domain/accounting/followup-retry-guard'
@@ -247,6 +250,372 @@ export function invoicePaymentEnqueueKey(paymentId: string, accountingInvoiceId:
   return `invoice-payment:payment:${paymentId}:invoice:${accountingInvoiceId}`
 }
 
+// ---------------------------------------------------------------------------
+// WHAT ACTUALLY COMES BACK FOR A RECEIPT THIS MODULE REFUSED (o3d-0bfh r13, Codex HIGH).
+//
+// Every operator message below used to end in the same sentence — "register the payment in the
+// ledger by hand", on the pinned branches beside "re-run the invoice sync for this order". On the
+// OPERATOR-ENTERED path that is the only exit there is: nothing was queued, no obligation marker
+// exists anywhere, and nothing will ever revisit the receipt. Banning a hand registration THERE
+// would strand a customer's payment for good, which is why this file is not, and must not be,
+// added to the whole-file scan that judges the retained-obligation producers.
+//
+// IT IS THE EXACT OPPOSITE ON THE DEFERRED PATH, and that is what r12 left undecided.
+// `registerDeferredOrderReceipts` is called by a connector immediately after a SALES_INVOICE posts,
+// INSIDE a claimed follow-up obligation, and every receipt it leaves unregistered makes it answer
+// `settled: false` — on which the connector DELIBERATELY RETAINS the marker rather than clearing it.
+// What re-reads a retained marker is a fact the registry declares per connector
+// (`followUpObligationRecoveryFor`), and on Xero it is a bound, cron-invoked sweep that re-drives
+// THIS VERY FUNCTION. So a hand remedy there races work that is already scheduled, and a payment a
+// human keys into the accounting package's own UI carries no request id the queued row could ever be
+// deduplicated against: both settle the invoice, and a second payment is not undoable.
+//
+// That is the same defect this branch removed from four other producers — the Xero processor, the
+// back-reference sweep, the compacted-tombstone announcement, and the registry remedy itself. The
+// fact the distinction turns on is `postedUnder`, which is what {@link InvoicePaymentRedrive}
+// carries: it is not a property of the refusal REASON, because most of these branches are reachable
+// from both paths and the same reason is safe on one and unsafe on the other.
+//
+// THE THIRD CASE IS DOCUMENT_NOT_POSTED, and it is the one r12 did not see at all. That refusal
+// writes no sync row, and a receipt with no sync row of its own is EXACTLY what
+// `selectReceiptsAwaitingRegistration` picks up when the SALES_INVOICE finally does post. So the
+// automatic recovery is not behind a retained marker there — it is the deferred re-drive itself,
+// still ahead of us. A hand registration in that window races it just as surely.
+// ---------------------------------------------------------------------------
+
+/**
+ * WHAT WILL COME BACK FOR THIS RECEIPT once the message below has been written.
+ *
+ * Three states, and every operator string in this module ends in the remedy that belongs to the one
+ * it is in. Deliberately NOT a boolean: "automatic" is not one fact here — on the deferred path the
+ * recovery is a RETAINED MARKER whose consumer the registry declares per connector, and before the
+ * invoice posts it is the re-drive that has not happened yet. The two have different remedies and
+ * different failure modes, and collapsing them is how a connector with no consumer would inherit
+ * Xero's sweep by omission (the r6 finding, one level down).
+ */
+export type InvoicePaymentRedrive =
+  /**
+   * Reached from `registerDeferredOrderReceipts`, i.e. under a follow-up obligation the connector
+   * claimed for this post and will RETAIN because this receipt is left unregistered. The connector
+   * is the PINNED one, never the active one — the registry answer must be about the ledger the
+   * obligation is actually owed on.
+   */
+  | { redrive: 'deferred'; connector: string }
+  /**
+   * The invoice has not posted yet, so this receipt has no sync row and the deferred re-drive at the
+   * next SALES_INVOICE post is what registers it. Automatic, conditional only on the DOCUMENT sync
+   * that the message already tells the operator to chase.
+   */
+  | { redrive: 'invoice-post' }
+  /** Nothing holds an obligation and no re-drive is ahead: the hand remedy is the only exit. */
+  | { redrive: 'none' }
+
+/**
+ * The remedy sentence for one refusal — the ONE place in this module that says what a human should
+ * do, so a branch cannot acquire a hand remedy by having prose written at its call site.
+ *
+ * On the deferred path the recovery half is `followUpObligationRecoveryNote` over the REGISTRY's
+ * declaration for the pinned connector, exactly as `releaseFollowUpObligation`, the Xero processor
+ * and the sweep already do. Nothing about what re-drives a retained obligation is written as prose
+ * here, on any connector: Xero's bound sweep and QuickBooks' "nothing does, READ AND ESCALATE" are
+ * both the registry's answers, not this module's guesses.
+ */
+export function invoicePaymentRemedyNote(redrive: InvoicePaymentRedrive): string {
+  if (redrive.redrive === 'none') {
+    return 'Nothing will come back for this receipt, so register it in the accounting connector by hand if it is '
+      + 'genuinely owed.'
+  }
+  if (redrive.redrive === 'invoice-post') {
+    return 'HAND SETTLEMENT IS REFUSED HERE: this receipt has no sync row of its own, which is exactly what the '
+      + 'deferred re-registration selects, so the connector registers it automatically as soon as the invoice for '
+      + "this order posts. A payment keyed into the accounting package's own UI carries no request id, so nothing "
+      + 'could deduplicate it against that registration and both would settle the invoice. Chase the DOCUMENT sync; '
+      + 'if the invoice cannot be posted at all, record what the accounting package already holds and ESCALATE.'
+  }
+  return 'HAND SETTLEMENT IS REFUSED HERE: this receipt is still owed under a follow-up obligation the connector '
+    + `retains precisely because it is unregistered, and ${followUpObligationRecoveryNote(followUpObligationRecoveryFor(redrive.connector))}. `
+    + "A payment keyed into the accounting package's own UI carries no request id, so nothing could deduplicate it "
+    + 'against the registration that is still owed and both would settle the invoice, which is not undoable. Read '
+    + 'the document, record what is actually there, and ESCALATE.'
+}
+
+/** The redrive state for one call of {@link registerInvoicePaymentWithLedger}. */
+export function invoicePaymentRedriveFor(
+  pinned: PostedInvoiceEvidence | null,
+  refusal: InvoicePaymentRegistrationRefusal | null,
+): InvoicePaymentRedrive {
+  if (pinned) return { redrive: 'deferred', connector: pinned.connector }
+  // Unpinned, and the document is not there yet: the post that triggers the deferred re-drive is
+  // still ahead of us, and this receipt is what it will select.
+  if (refusal === 'DOCUMENT_NOT_POSTED') return { redrive: 'invoice-post' }
+  return { redrive: 'none' }
+}
+
+/**
+ * EVERY REFUSAL MESSAGE `reportRefusal` CAN WRITE, as a pure producer (o3d-0bfh r13, Codex HIGH).
+ *
+ * Extracted out of the reporting closure so the runtime contract in
+ * tests/accounting/follow-up-recovery-registry.test.ts can take THE BRANCH'S OWN STRING for both
+ * redrive states rather than judging a sentence somebody re-typed into a test. `null` is
+ * SYNC_DISABLED, which reports nothing at all: nothing was expected to post.
+ */
+export function describeInvoicePaymentRefusal(params: {
+  refused: InvoicePaymentRegistrationDecision & { register: false }
+  orderReference: string
+  amount: number
+  currency: string
+  orderCurrency: string
+  method: string | null
+  redrive: InvoicePaymentRedrive
+}): { description: string; metadata: Record<string, unknown> } | null {
+  const { refused, redrive } = params
+  const amount = `${params.currency} ${params.amount.toFixed(2)}`
+  const remedy = invoicePaymentRemedyNote(redrive)
+  const base = { amount: params.amount, currency: params.currency, refusal: refused.refusal }
+  const withLedger = { ...base, detail: refused.detail, ledgerTotal: refused.ledgerTotal }
+  const withRegistered = { ...base, alreadyRegistered: refused.alreadyRegistered, ledgerTotal: refused.ledgerTotal }
+  switch (refused.refusal) {
+    // Nothing is expected to post at all, so there is nothing to report.
+    case 'SYNC_DISABLED':
+      return null
+    // Not a settlement fault — a payment cannot attach to an invoice the ledger has never seen, and
+    // the DOCUMENT sync is what to chase. The receipt is NOT abandoned: it carries no sync row, so
+    // the re-drive at the next SALES_INVOICE post is what registers it, which is why the remedy for
+    // this branch refuses hand settlement rather than offering it (see invoicePaymentRedriveFor).
+    case 'DOCUMENT_NOT_POSTED':
+      return {
+        description:
+          `Recorded ${amount} against ${params.orderReference}, but its invoice has not posted to the `
+          + `accounting connector yet, so the payment could not be registered there. ${remedy}`,
+        metadata: base,
+      }
+    // addPayment rejects a currency mismatch, so this only fires if the order currency changed
+    // underneath the receipt. Registering the wrong currency is worse than not registering.
+    case 'CURRENCY_MISMATCH':
+      return {
+        description:
+          `Recorded a ${params.currency} payment against ${params.orderReference}, which is in `
+          + `${params.orderCurrency}. The payment was NOT registered in the accounting connector. ${remedy}`,
+        metadata: { ...base, orderCurrency: params.orderCurrency },
+      }
+    case 'NO_BANK_ACCOUNT':
+      return {
+        description:
+          `Recorded ${amount} against ${params.orderReference}, but no bank account is mapped for method `
+          + `"${params.method ?? ''}" / currency "${params.currency}". Add a mapping in Settings → `
+          + `Accounting → Payment Account Mapping. ${remedy}`,
+        metadata: { ...base, method: params.method },
+      }
+    // o3d-0m56: an earlier attempt on this order is FAILED or CANCELLED and the ledger could not be
+    // shown NOT to hold its payment. The capacity arithmetic cannot see this — a failed row
+    // consumes no capacity — so without this arm the receipt would look like it fits and a second
+    // payment would post. `detail` says which of the two it was: the ledger was unreachable, or it
+    // answered and the answer matched the earlier attempt.
+    case 'UNRESOLVED_PAYMENT_ATTEMPT':
+      return {
+        description:
+          `Recorded ${amount} against ${params.orderReference}, but an earlier payment attempt on this `
+          + `order did not resolve and could not be ruled out in the accounting connector `
+          + `(${refused.detail ?? 'no detail'}). Sending this one could pay the invoice twice, so it was `
+          + `not sent. Resolve the earlier attempt on the Accounting Sync page first. ${remedy}`,
+        metadata: withLedger,
+      }
+    // o3d-ekn8 r4: a LIVE row for this receipt settles a document the order no longer points at —
+    // the invoice was deleted and re-posted. Every document-scoped filter drops that row, which is
+    // right for capacity and wrong for evidence: it is the record of a payment that was SENT, and
+    // nothing here has read the ledger to see whether deleting the old document took it away.
+    case 'SETTLED_ON_RETIRED_DOCUMENT':
+      return {
+        description:
+          `Recorded ${amount} against ${params.orderReference}, but this receipt is ALREADY REGISTERED `
+          + `in the accounting connector against a different document (${refused.detail ?? 'unnamed'}) — `
+          + `that invoice was deleted and re-posted, so the order now points somewhere else. The earlier `
+          + `payment was actually sent, and on some connectors a deleted invoice leaves its payment behind `
+          + `as an unapplied credit, so sending this one could credit the customer twice. Nothing was sent. `
+          + `Open that payment in the accounting system: if it is genuinely gone, cancel the earlier sync `
+          + `row on the Accounting Sync page and the next invoice sync will register this receipt against `
+          + `the new document. ${remedy}`,
+        metadata: withLedger,
+      }
+    // o3d-anu8: a registration on this invoice was SETTLED BY AN OPERATOR, so the figure IMS holds
+    // for it is what IMS meant to send and not what the ledger recorded. There IS a document id
+    // to go and read, which is what separates this from LEDGER_AMOUNT_UNKNOWN, so the message
+    // names it and says what reading it decides.
+    case 'LEDGER_AMOUNT_ASSERTED':
+      return {
+        description:
+          `Recorded ${amount} against ${params.orderReference}, but a payment already registered against this `
+          + `invoice (${refused.detail ?? 'unnamed'}) was recorded on an OPERATOR'S ASSERTION rather than confirmed by `
+          + `the accounting connector — IMS never made that call and never read the document, so the amount it holds `
+          + `for it is what it MEANT to send, not what the ledger recorded. How much of the invoice is still `
+          + `outstanding therefore cannot be computed, and this receipt was not sent. Open that payment in the `
+          + `accounting system and confirm what it actually settled. ${remedy}`,
+        metadata: withLedger,
+      }
+    // A registration is already on the invoice but IMS cannot read WHAT it was for, so the room
+    // left on the invoice is unknown. Naming a figure here would be inventing one (o3d-cjt8).
+    case 'LEDGER_AMOUNT_UNKNOWN':
+      return {
+        description:
+          `Recorded ${amount} against ${params.orderReference}, but a payment already sent to the `
+          + `accounting connector for this invoice does not record its amount, so IMS cannot tell how `
+          + `much of the invoice is still outstanding. It was not sent. ${remedy}`,
+        metadata: withRegistered,
+      }
+    // Since o3d-cjt8 this is a CAPACITY refusal, not a one-per-order one: part payments each
+    // register, and only the receipt that would take the total past the invoice is refused. So the
+    // message has to name what is already on it, not just the invoice total.
+    case 'WOULD_OVERPAY':
+      return {
+        description:
+          `Recorded ${amount} against ${params.orderReference}, but the invoice the accounting connector `
+          + `holds is for ${params.currency} ${(refused.ledgerTotal ?? 0).toFixed(2)}`
+          + (refused.alreadyRegistered
+            ? ` with ${params.currency} ${refused.alreadyRegistered.toFixed(2)} already registered against it`
+            : '')
+          + ` — it would refuse a larger payment. Check the invoice in the ledger: on a tax-inclusive `
+          + `imported order it can be posted NET of VAT. ${remedy}`,
+        metadata: withRegistered,
+      }
+  }
+}
+
+/**
+ * The order stopped pointing at the document this post returned — before the queue (`before-queue`)
+ * or between the pre-check and the write (`while-queueing`).
+ *
+ * REACHABLE ONLY WITH A PIN, on both phases: each site is inside `if (pinned …)`. So the redrive is
+ * always `deferred` and the remedy is always the registry's, which is precisely Codex's r13 finding
+ * — this branch told an operator to re-run the sync and register by hand in front of a re-drive the
+ * retained marker guarantees.
+ */
+export function invoicePaymentDocumentMovedDescription(params: {
+  phase: 'before-queue' | 'while-queueing'
+  orderReference: string
+  amount: number
+  currency: string
+  postedInvoiceId: string
+  currentInvoiceId: string | null
+  connector: string
+}): string {
+  const head = `Recorded ${params.currency} ${params.amount.toFixed(2)} against ${params.orderReference}, but `
+  const remedy = invoicePaymentRemedyNote({ redrive: 'deferred', connector: params.connector })
+  return params.phase === 'before-queue'
+    ? head
+      + `the invoice that had just posted (${params.postedInvoiceId}) is no longer the one this order points `
+      + `at (${params.currentInvoiceId ?? 'none'}) — it was re-posted while the receipt was being registered. `
+      + `Nothing was sent. ${remedy}`
+    : head
+      + `its invoice was re-posted while the payment was being queued, so the document this receipt was `
+      + `measured against (${params.postedInvoiceId}) is no longer the one the order holds. Nothing was sent. `
+      + `${remedy}`
+}
+
+/**
+ * The enqueue wrote for a connector this call did not pin — see {@link PinnedConnectorMoved}.
+ *
+ * ALSO PIN-ONLY (the throw is guarded by `pinned &&`), so both arms carry the registry remedy. The
+ * `alreadyQueued` arm keeps its own instruction — cancelling a live row on the Accounting Sync page
+ * is not a hand settlement, it is the removal of one — and gains the refusal, because the row that
+ * is still live is a QUEUED registration and creating a second by hand is the hazard.
+ */
+export function invoicePaymentConnectorMovedDescription(params: {
+  orderReference: string
+  amount: number
+  currency: string
+  pinnedConnector: string | null
+  wroteFor: string | null
+  alreadyQueued: boolean
+}): string {
+  const head =
+    `Recorded ${params.currency} ${params.amount.toFixed(2)} against ${params.orderReference}, but the `
+    + `active accounting connector changed from ${params.pinnedConnector ?? 'none'} to `
+    + `${params.wroteFor ?? 'none'} while the payment was being queued, so the registration would have `
+    + `been sent to a ledger it was never measured against.`
+  const remedy = invoicePaymentRemedyNote(
+    params.pinnedConnector
+      ? { redrive: 'deferred', connector: params.pinnedConnector }
+      : { redrive: 'none' },
+  )
+  // o3d-ekn8 r4: the rollback only rolls something back if this call WROTE something. On the
+  // idempotency short-circuit it did not — a live row was already there under the other connector,
+  // the transaction had nothing in it to undo, and that row is still going to post. Telling an
+  // operator "nothing was sent" there is the one message that stops them looking.
+  return params.alreadyQueued
+    ? `${head} A registration for this receipt was ALREADY QUEUED under `
+      + `${params.wroteFor ?? 'none'} before this ran, so there was nothing to roll back and THAT ROW `
+      + `IS STILL LIVE AND WILL POST. Check it on the Accounting Sync page and cancel it if it must not `
+      + `go to that ledger. ${remedy}`
+    : `${head} Nothing was sent. ${remedy}`
+}
+
+/** Payment posting was switched off between the check and the write. Reachable pinned and unpinned. */
+export function invoicePaymentPostingContextChangedDescription(params: {
+  orderReference: string
+  amount: number
+  currency: string
+  redrive: InvoicePaymentRedrive
+}): string {
+  return `Recorded ${params.currency} ${params.amount.toFixed(2)} against ${params.orderReference}, but `
+    + `accounting sync for payments was switched off while it was being queued, so nothing was sent. `
+    + `Re-enable it. ${invoicePaymentRemedyNote(params.redrive)}`
+}
+
+/**
+ * The enqueue threw. Same shape as markBillPaid's queue failure: the receipt is recorded in IMS with
+ * nothing queued to tell the ledger and no FAILED row to notice, because the row was never written.
+ *
+ * Reachable pinned and unpinned, and the two are genuinely different: unpinned, nothing will ever
+ * retry and the hand remedy is the only exit; pinned, the connector retains the obligation on
+ * `settled: false` and the registry says what re-reads it.
+ */
+export function invoicePaymentNotQueuedDescription(params: {
+  orderReference: string
+  amount: number
+  currency: string
+  redrive: InvoicePaymentRedrive
+}): string {
+  return `Recorded ${params.currency} ${params.amount.toFixed(2)} against ${params.orderReference}, but the `
+    + `payment could not be queued for the accounting connector — the ledger still shows the invoice `
+    + `outstanding. ${invoicePaymentRemedyNote(params.redrive)}`
+}
+
+/**
+ * THE DEFERRED WRAPPER'S OWN THREE MESSAGES (o3d-0bfh r13, Codex HIGH).
+ *
+ * Every one of these is written from inside `registerDeferredOrderReceipts`, i.e. always under a
+ * claimed obligation, and every one of them returns `settled: false` — so the connector retains the
+ * marker and the registry's declared consumer is what comes back. There is no unpinned form of any
+ * of them, which is why they take a connector and not a redrive.
+ */
+export function deferredReceiptsUnlinkedDescription(params: {
+  connector: string
+  postedInvoiceId: string
+  receipts: number
+}): string {
+  return `The invoice for this order posted to ${params.connector} as ${params.postedInvoiceId}, but the `
+    + `order carries no invoice id — the back-reference write did not land — so the ${params.receipts} `
+    + `receipt(s) recorded before it were NOT registered. Link the order to ${params.postedInvoiceId}. `
+    + invoicePaymentRemedyNote({ redrive: 'deferred', connector: params.connector })
+}
+
+export function deferredReceiptsDocumentMovedDescription(params: {
+  connector: string
+  postedInvoiceId: string
+  currentInvoiceId: string
+}): string {
+  return `The invoice that just posted (${params.postedInvoiceId}) is no longer the one this order `
+    + `points at (${params.currentInvoiceId}), so the receipts recorded before it were NOT registered `
+    + `— they would have settled a document this post did not create. `
+    + invoicePaymentRemedyNote({ redrive: 'deferred', connector: params.connector })
+}
+
+export function deferredReceiptsFailedDescription(params: { connector: string; error: string }): string {
+  return `The invoice for this order posted, but the receipts recorded before it could not be registered `
+    + `with the accounting connector: ${params.error}. `
+    + invoicePaymentRemedyNote({ redrive: 'deferred', connector: params.connector })
+}
+
 export async function registerInvoicePaymentWithLedger(params: {
   orderId: string
   orderReference: string
@@ -312,10 +681,15 @@ export async function registerInvoicePaymentWithLedger(params: {
     // SALES_INVOICE post re-drives, and the message names the hand remedy.
     if (pinned && so.accountingInvoiceId !== pinned.accountingInvoiceId) {
       await warn('invoice_payment_not_registered',
-        `Recorded ${params.currency} ${params.amount.toFixed(2)} against ${params.orderReference}, but the ` +
-        `invoice that had just posted (${pinned.accountingInvoiceId}) is no longer the one this order points ` +
-        `at (${so.accountingInvoiceId ?? 'none'}) — it was re-posted while the receipt was being registered. ` +
-        `Nothing was sent. Re-run the invoice sync for this order, or register the payment in the ledger by hand.`,
+        invoicePaymentDocumentMovedDescription({
+          phase: 'before-queue',
+          orderReference: params.orderReference,
+          amount: params.amount,
+          currency: params.currency,
+          postedInvoiceId: pinned.accountingInvoiceId,
+          currentInvoiceId: so.accountingInvoiceId,
+          connector: pinned.connector,
+        }),
         {
           amount: params.amount, currency: params.currency, refusal: 'DOCUMENT_MOVED',
           postedInvoiceId: pinned.accountingInvoiceId, currentInvoiceId: so.accountingInvoiceId,
@@ -380,120 +754,25 @@ export async function registerInvoicePaymentWithLedger(params: {
     }
     const decision = decideInvoicePaymentRegistration(decisionInput)
 
+    // THE REDRIVE STATE FOR THIS CALL (o3d-0bfh r13, Codex HIGH). Not a property of the refusal
+    // reason: most of these branches are reachable from BOTH the operator-entered receipt and the
+    // deferred re-drive, and the hand remedy that is the only exit on one races a queued
+    // registration on the other. `pinned` is the fact that separates them.
+    const redriveFor = (refusal: InvoicePaymentRegistrationRefusal) => invoicePaymentRedriveFor(pinned, refusal)
+
     const reportRefusal = async (refused: InvoicePaymentRegistrationDecision & { register: false }) => {
-      const amount = `${params.currency} ${params.amount.toFixed(2)}`
-      const tail = `Register it in the accounting connector by hand if it is genuinely owed.`
-      switch (refused.refusal) {
-        // Nothing is expected to post at all, so there is nothing to report.
-        case 'SYNC_DISABLED':
-          return
-        // Not a settlement fault — a payment cannot attach to an invoice the ledger has never seen, and
-        // the DOCUMENT sync is what to chase. But nothing re-registers this receipt when the invoice
-        // finally does post either, so say so once here rather than leave it to reconciliation.
-        case 'DOCUMENT_NOT_POSTED':
-          await warn('invoice_payment_not_registered',
-            `Recorded ${amount} against ${params.orderReference}, but its invoice has not posted to the ` +
-            `accounting connector yet, so the payment could not be registered there. Register it once the ` +
-            `invoice syncs, or record it in the ledger by hand.`,
-            { amount: params.amount, currency: params.currency, refusal: refused.refusal })
-          return
-        // addPayment rejects a currency mismatch, so this only fires if the order currency changed
-        // underneath the receipt. Registering the wrong currency is worse than not registering.
-        case 'CURRENCY_MISMATCH':
-          await warn('invoice_payment_not_registered',
-            `Recorded a ${params.currency} payment against ${params.orderReference}, which is in ` +
-            `${so.currency}. The payment was NOT registered in the accounting connector — register it there by hand.`,
-            { amount: params.amount, currency: params.currency, orderCurrency: so.currency, refusal: refused.refusal })
-          return
-        case 'NO_BANK_ACCOUNT':
-          await warn('invoice_payment_not_registered',
-            `Recorded ${amount} against ${params.orderReference}, but no bank account is mapped for method ` +
-            `"${params.method ?? ''}" / currency "${params.currency}". Add a mapping in Settings → ` +
-            `Accounting → Payment Account Mapping, then register the payment there.`,
-            { amount: params.amount, currency: params.currency, method: params.method, refusal: refused.refusal })
-          return
-        // o3d-0m56: an earlier attempt on this order is FAILED or CANCELLED and the ledger could not be
-        // shown NOT to hold its payment. The capacity arithmetic cannot see this — a failed row
-        // consumes no capacity — so without this arm the receipt would look like it fits and a second
-        // payment would post. `detail` says which of the two it was: the ledger was unreachable, or it
-        // answered and the answer matched the earlier attempt.
-        case 'UNRESOLVED_PAYMENT_ATTEMPT':
-          await warn('invoice_payment_not_registered',
-            `Recorded ${amount} against ${params.orderReference}, but an earlier payment attempt on this ` +
-            `order did not resolve and could not be ruled out in the accounting connector ` +
-            `(${refused.detail ?? 'no detail'}). Sending this one could pay the invoice twice, so it was ` +
-            `not sent. Resolve the earlier attempt on the Accounting Sync page first. ${tail}`,
-            {
-              amount: params.amount, currency: params.currency, refusal: refused.refusal,
-              detail: refused.detail, ledgerTotal: refused.ledgerTotal,
-            })
-          return
-        // o3d-ekn8 r4: a LIVE row for this receipt settles a document the order no longer points at —
-        // the invoice was deleted and re-posted. Every document-scoped filter drops that row, which is
-        // right for capacity and wrong for evidence: it is the record of a payment that was SENT, and
-        // nothing here has read the ledger to see whether deleting the old document took it away.
-        case 'SETTLED_ON_RETIRED_DOCUMENT':
-          await warn('invoice_payment_not_registered',
-            `Recorded ${amount} against ${params.orderReference}, but this receipt is ALREADY REGISTERED ` +
-            `in the accounting connector against a different document (${refused.detail ?? 'unnamed'}) — ` +
-            `that invoice was deleted and re-posted, so the order now points somewhere else. The earlier ` +
-            `payment was actually sent, and on some connectors a deleted invoice leaves its payment behind ` +
-            `as an unapplied credit, so sending this one could credit the customer twice. Nothing was sent. ` +
-            `Open that payment in the accounting system: if it is genuinely gone, cancel the earlier sync ` +
-            `row on the Accounting Sync page and the next invoice sync will register this receipt against ` +
-            `the new document. ${tail}`,
-            {
-              amount: params.amount, currency: params.currency, refusal: refused.refusal,
-              detail: refused.detail, ledgerTotal: refused.ledgerTotal,
-            })
-          return
-        // o3d-anu8: a registration on this invoice was SETTLED BY AN OPERATOR, so the figure IMS holds
-        // for it is what IMS meant to send and not what the ledger recorded. There IS a document id
-        // to go and read, which is what separates this from LEDGER_AMOUNT_UNKNOWN, so the message
-        // names it and says what reading it decides.
-        case 'LEDGER_AMOUNT_ASSERTED':
-          await warn('invoice_payment_not_registered',
-            `Recorded ${amount} against ${params.orderReference}, but a payment already registered against this ` +
-            `invoice (${refused.detail ?? 'unnamed'}) was recorded on an OPERATOR'S ASSERTION rather than confirmed by ` +
-            `the accounting connector — IMS never made that call and never read the document, so the amount it holds ` +
-            `for it is what it MEANT to send, not what the ledger recorded. How much of the invoice is still ` +
-            `outstanding therefore cannot be computed, and this receipt was not sent. Open that payment in the ` +
-            `accounting system, confirm what it actually settled, and register the balance there. ${tail}`,
-            {
-              amount: params.amount, currency: params.currency, refusal: refused.refusal,
-              detail: refused.detail, ledgerTotal: refused.ledgerTotal,
-            })
-          return
-        // A registration is already on the invoice but IMS cannot read WHAT it was for, so the room
-        // left on the invoice is unknown. Naming a figure here would be inventing one (o3d-cjt8).
-        case 'LEDGER_AMOUNT_UNKNOWN':
-          await warn('invoice_payment_not_registered',
-            `Recorded ${amount} against ${params.orderReference}, but a payment already sent to the ` +
-            `accounting connector for this invoice does not record its amount, so IMS cannot tell how ` +
-            `much of the invoice is still outstanding. It was not sent. ${tail}`,
-            {
-              amount: params.amount, currency: params.currency, refusal: refused.refusal,
-              alreadyRegistered: refused.alreadyRegistered, ledgerTotal: refused.ledgerTotal,
-            })
-          return
-        // Since o3d-cjt8 this is a CAPACITY refusal, not a one-per-order one: part payments each
-        // register, and only the receipt that would take the total past the invoice is refused. So the
-        // message has to name what is already on it, not just the invoice total.
-        case 'WOULD_OVERPAY':
-          await warn('invoice_payment_not_registered',
-            `Recorded ${amount} against ${params.orderReference}, but the invoice the accounting connector ` +
-            `holds is for ${params.currency} ${(refused.ledgerTotal ?? 0).toFixed(2)}` +
-            (refused.alreadyRegistered
-              ? ` with ${params.currency} ${refused.alreadyRegistered.toFixed(2)} already registered against it`
-              : '') +
-            ` — it would refuse a larger payment. Check the invoice in the ledger: on a tax-inclusive ` +
-            `imported order it can be posted NET of VAT. ${tail}`,
-            {
-              amount: params.amount, currency: params.currency, refusal: refused.refusal,
-              alreadyRegistered: refused.alreadyRegistered, ledgerTotal: refused.ledgerTotal,
-            })
-          return
-      }
+      const notice = describeInvoicePaymentRefusal({
+        refused,
+        orderReference: params.orderReference,
+        amount: params.amount,
+        currency: params.currency,
+        orderCurrency: so.currency,
+        method: params.method,
+        redrive: redriveFor(refused.refusal),
+      })
+      // SYNC_DISABLED produces no notice: nothing was expected to post at all.
+      if (!notice) return
+      await warn('invoice_payment_not_registered', notice.description, notice.metadata)
     }
 
     if (!decision.register) {
@@ -599,23 +878,15 @@ export async function registerInvoicePaymentWithLedger(params: {
       outcome = await runEnqueue()
     } catch (moved) {
       if (!(moved instanceof PinnedConnectorMoved)) throw moved
-      const head =
-        `Recorded ${params.currency} ${params.amount.toFixed(2)} against ${params.orderReference}, but the ` +
-        `active accounting connector changed from ${pinned?.connector ?? 'none'} to ` +
-        `${moved.wroteFor ?? 'none'} while the payment was being queued, so the registration would have ` +
-        `been sent to a ledger it was never measured against.`
-      // o3d-ekn8 r4: the rollback only rolls something back if this call WROTE something. On the
-      // idempotency short-circuit it did not — a live row was already there under the other
-      // connector, the transaction had nothing in it to undo, and that row is still going to post.
-      // Telling an operator "nothing was sent" there is the one message that stops them looking.
       await warn('invoice_payment_not_registered',
-        moved.alreadyQueued
-          ? `${head} A registration for this receipt was ALREADY QUEUED under ` +
-            `${moved.wroteFor ?? 'none'} before this ran, so there was nothing to roll back and THAT ROW ` +
-            `IS STILL LIVE AND WILL POST. Check it on the Accounting Sync page: cancel it if it must not ` +
-            `go to that ledger, and re-run the invoice sync for this order afterwards.`
-          : `${head} Nothing was sent. Register the payment in ` +
-            `the accounting connector by hand, or re-run the invoice sync for this order.`,
+        invoicePaymentConnectorMovedDescription({
+          orderReference: params.orderReference,
+          amount: params.amount,
+          currency: params.currency,
+          pinnedConnector: pinned?.connector ?? null,
+          wroteFor: moved.wroteFor,
+          alreadyQueued: moved.alreadyQueued,
+        }),
         {
           amount: params.amount, currency: params.currency, refusal: 'PINNED_CONNECTOR_MOVED',
           pinnedConnector: pinned?.connector ?? null, wroteFor: moved.wroteFor,
@@ -638,11 +909,16 @@ export async function registerInvoicePaymentWithLedger(params: {
     }
     if (outcome === 'document-moved') {
       await warn('invoice_payment_not_registered',
-        `Recorded ${params.currency} ${params.amount.toFixed(2)} against ${params.orderReference}, but its ` +
-        `invoice was re-posted while the payment was being queued, so the document this receipt was ` +
-        `measured against (${pinned?.accountingInvoiceId ?? 'unknown'}) is no longer the one the order ` +
-        `holds. Nothing was sent. Re-run the invoice sync for this order, or register the payment in the ` +
-        `ledger by hand.`,
+        invoicePaymentDocumentMovedDescription({
+          phase: 'while-queueing',
+          orderReference: params.orderReference,
+          amount: params.amount,
+          currency: params.currency,
+          postedInvoiceId: pinned?.accountingInvoiceId ?? 'unknown',
+          currentInvoiceId: so.accountingInvoiceId,
+          // Only reachable under a pin — the `document-moved` outcome is written inside `if (pinned)`.
+          connector: pinned?.connector ?? 'unknown',
+        }),
         {
           amount: params.amount, currency: params.currency, refusal: 'DOCUMENT_MOVED',
           postedInvoiceId: pinned?.accountingInvoiceId ?? null,
@@ -651,9 +927,12 @@ export async function registerInvoicePaymentWithLedger(params: {
     }
     if (outcome === 'context-changed') {
       await warn('invoice_payment_not_registered',
-        `Recorded ${params.currency} ${params.amount.toFixed(2)} against ${params.orderReference}, but ` +
-        `accounting sync for payments was switched off while it was being queued, so nothing was sent. ` +
-        `Re-enable it and register the payment, or record it in the ledger by hand.`,
+        invoicePaymentPostingContextChangedDescription({
+          orderReference: params.orderReference,
+          amount: params.amount,
+          currency: params.currency,
+          redrive: invoicePaymentRedriveFor(pinned, null),
+        }),
         { amount: params.amount, currency: params.currency, refusal: 'POSTING_CONTEXT_CHANGED' })
     }
   } catch (e) {
@@ -666,10 +945,12 @@ export async function registerInvoicePaymentWithLedger(params: {
       action: 'invoice_payment_not_queued',
       tag: 'accounting',
       level: 'ERROR',
-      description:
-        `Recorded ${params.currency} ${params.amount.toFixed(2)} against ${params.orderReference}, but the ` +
-        `payment could not be queued for the accounting connector — the ledger still shows the invoice ` +
-        `outstanding and nothing will retry. Re-queue it, or record the payment in the ledger by hand.`,
+      description: invoicePaymentNotQueuedDescription({
+        orderReference: params.orderReference,
+        amount: params.amount,
+        currency: params.currency,
+        redrive: invoicePaymentRedriveFor(pinned, null),
+      }),
       metadata: {
         orderNumber: params.orderReference,
         paymentId: params.paymentId,
@@ -768,12 +1049,11 @@ export async function registerDeferredOrderReceipts(
         action: 'deferred_invoice_payment_registration_unlinked',
         tag: 'accounting',
         level: 'ERROR',
-        description:
-          `The invoice for this order posted to ${posted.connector} as ${posted.accountingInvoiceId}, but the ` +
-          `order carries no invoice id — the back-reference write did not land — so the ` +
-          `${order.payments.length} receipt(s) recorded before it were NOT registered and nothing retries ` +
-          `them. Link the order to ${posted.accountingInvoiceId}, then re-run the invoice sync, or register ` +
-          `the payments in the accounting connector by hand.`,
+        description: deferredReceiptsUnlinkedDescription({
+          connector: posted.connector,
+          postedInvoiceId: posted.accountingInvoiceId,
+          receipts: order.payments.length,
+        }),
         metadata: {
           orderId,
           connector: posted.connector,
@@ -794,11 +1074,11 @@ export async function registerDeferredOrderReceipts(
         action: 'deferred_invoice_payment_registration_skipped',
         tag: 'accounting',
         level: 'WARNING',
-        description:
-          `The invoice that just posted (${posted.accountingInvoiceId}) is no longer the one this order ` +
-          `points at (${order.accountingInvoiceId}), so the receipts recorded before it were NOT registered ` +
-          `— they would have settled a document this post did not create. Re-run the invoice sync for this ` +
-          `order, or register the payments in the accounting connector by hand.`,
+        description: deferredReceiptsDocumentMovedDescription({
+          connector: posted.connector,
+          postedInvoiceId: posted.accountingInvoiceId,
+          currentInvoiceId: order.accountingInvoiceId,
+        }),
         metadata: {
           orderId,
           connector: posted.connector,
@@ -862,10 +1142,10 @@ export async function registerDeferredOrderReceipts(
       action: 'deferred_invoice_payment_registration_failed',
       tag: 'accounting',
       level: 'WARNING',
-      description:
-        `The invoice for this order posted, but the receipts recorded before it could not be registered ` +
-        `with the accounting connector: ${String(error)}. Register them there by hand, or re-run the ` +
-        `invoice sync.`,
+      description: deferredReceiptsFailedDescription({
+        connector: posted.connector,
+        error: String(error),
+      }),
       metadata: { orderId, error: error instanceof Error ? error.message : String(error) },
     }).catch(() => { /* logging must never block the follow-up either */ })
     return { settled: false, reason: 'failed' }

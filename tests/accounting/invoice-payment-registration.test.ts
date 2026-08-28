@@ -10,6 +10,7 @@ import {
   type ExistingInvoicePaymentSync,
 } from '@/lib/domain/accounting/invoice-payment-registration'
 import type { LedgerSettlementRecord } from '@/lib/domain/accounting/ledger-settlement-evidence'
+import { describeInvoicePaymentRefusal } from '@/lib/domain/accounting/invoice-payment-enqueue'
 
 /**
  * o3d-lgo.15, decision recorded 2026-07-25: a manually-recorded sales receipt DOES register against the
@@ -425,10 +426,30 @@ test('sales.ts asks the ledger exactly when the decision needs it (o3d-0m56)', a
 
   // The refusal has to be surfaced, not swallowed: an operator who is not told will record the
   // receipt again.
+  //
+  // o3d-0bfh r13: taken from the PRODUCER rather than by slicing 900 characters after the `case`
+  // label. The message moved into `describeInvoicePaymentRefusal` when the remedies became
+  // recovery-aware, and the source slice was measuring where the `warn` call happened to sit — it
+  // would have gone on passing over prose written anywhere in that window, and it broke the moment
+  // the reporting moved one function away without the property changing at all.
   assert.match(source, /case 'UNRESOLVED_PAYMENT_ATTEMPT':/)
-  const warn = source.slice(source.indexOf("case 'UNRESOLVED_PAYMENT_ATTEMPT':"))
-  assert.match(warn.slice(0, 900), /invoice_payment_not_registered/)
-  assert.match(warn.slice(0, 900), /could pay the invoice twice/)
+  const notice = describeInvoicePaymentRefusal({
+    refused: { register: false, refusal: 'UNRESOLVED_PAYMENT_ATTEMPT', detail: 'the ledger could not be read' },
+    orderReference: 'SO-1',
+    amount: 100,
+    currency: 'GBP',
+    orderCurrency: 'GBP',
+    method: 'card',
+    redrive: { redrive: 'none' },
+  })
+  assert.ok(notice, 'an unresolved attempt must produce an operator notice, not a silent return')
+  assert.match(notice.description, /could pay the invoice twice/)
+  assert.equal(notice.metadata.refusal, 'UNRESOLVED_PAYMENT_ATTEMPT')
+  assert.equal(notice.metadata.detail, 'the ledger could not be read', 'and it carries WHY it could not be ruled out')
+  // ...and that notice is what `reportRefusal` logs, under the action an operator can search for.
+  const reporter = source.slice(source.indexOf('const reportRefusal ='))
+  assert.match(reporter.slice(0, 900), /describeInvoicePaymentRefusal\(\{/)
+  assert.match(reporter.slice(0, 900), /invoice_payment_not_registered/)
 })
 
 test('the BILL side is closed by a different mechanism, and it must stay closed (o3d-0m56)', async () => {

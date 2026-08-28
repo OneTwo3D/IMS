@@ -12,6 +12,18 @@ import {
 } from '@/lib/domain/accounting/compacted-followup-loss'
 import { xeroRetainedFollowUpObligationDescription } from '@/lib/connectors/xero/sync-processor'
 import {
+  deferredReceiptsDocumentMovedDescription,
+  deferredReceiptsFailedDescription,
+  deferredReceiptsUnlinkedDescription,
+  describeInvoicePaymentRefusal,
+  invoicePaymentConnectorMovedDescription,
+  invoicePaymentDocumentMovedDescription,
+  invoicePaymentNotQueuedDescription,
+  invoicePaymentPostingContextChangedDescription,
+  invoicePaymentRedriveFor,
+  invoicePaymentRemedyNote,
+} from '@/lib/domain/accounting/invoice-payment-enqueue'
+import {
   ACCOUNTING_FOLLOW_UP_RECOVERY,
   CONNECTORS_WITHOUT_FOLLOW_UP_CONSUMER,
   FOLLOW_UP_OBLIGATION_AGE_COLUMNS,
@@ -928,6 +940,31 @@ function parameterNames(name: ts.BindingName): string[] {
 }
 
 /**
+ * Every name an expression READS — an over-approximation, deliberately (o3d-0bfh r13).
+ *
+ * Property NAMES are excluded (`row.generation` reads `row`, not `generation`) and so are
+ * non-computed object keys, because neither is a free variable and treating them as one would refuse
+ * ordinary shapes. Everything else counts, including a shorthand property, whose key IS a read.
+ */
+function referencedIdentifiers(expression: ts.Expression): Set<string> {
+  const names = new Set<string>()
+  const visit = (node: ts.Node): void => {
+    if (ts.isIdentifier(node)) { names.add(node.text); return }
+    if (ts.isShorthandPropertyAssignment(node)) { names.add(node.name.text); return }
+    // `a.b` reads `a`; `b` is a property name in the object, not a binding in this scope.
+    if (ts.isPropertyAccessExpression(node)) { visit(node.expression); return }
+    if (ts.isPropertyAssignment(node)) {
+      if (ts.isComputedPropertyName(node.name)) visit(node.name.expression)
+      visit(node.initializer)
+      return
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(expression)
+  return names
+}
+
+/**
  * Pair a followed call's actual arguments with the callee's formal parameters (o3d-0bfh r12).
  *
  * EVERY parameter name is first REMOVED from the scope and recorded as unbound, because a parameter
@@ -939,6 +976,24 @@ function parameterNames(name: ts.BindingName): string[] {
  * every index a guess, a rest parameter has no single argument, a destructuring pattern binds names
  * that are properties of an argument rather than the argument, and a missing argument with no
  * default is `undefined` and is certainly not a generation.
+ *
+ * AND FAIL-CLOSED ON CAPTURE (o3d-0bfh r13, Codex MEDIUM). r12 installed the caller's RAW argument
+ * expression into the callee's table, which is only a valid substitution while the callee redefines
+ * no name the argument reads. It does redefine its own parameters, so
+ *
+ *     const generation = olderThan(cutoff)
+ *     function stale(generation) { return { backReferenceFollowUpsPendingAt: generation } }
+ *     findMany({ where: stale(generation) })
+ *
+ * bound `generation` to the identifier `generation` — a binding that points at ITSELF. `resolveIn`
+ * follows it once, marks the name seen, stops, and hands back a bare identifier; the range
+ * comparison sitting in the caller's `olderThan(cutoff)` is never looked at, and the name is then
+ * waved through because it is in PROTOCOL_OPERAND_NAMES. Substituting `f(b, a)` into
+ * `function f(a, b)` is the same defect without the self-reference.
+ *
+ * Hygienic renaming is not available to a scan with no type checker, so the answer is REFUSAL: an
+ * argument that reads ANY name this call is about to shadow does not get installed, the parameter
+ * stays in `unbound`, and `judgeMarkerPredicateOperand` refuses it ahead of the allowlist.
  */
 function bindCallArguments(
   callee: ts.Node,
@@ -950,6 +1005,9 @@ function bindCallArguments(
   if (!parameters) return scope
   const next = new Map(scope)
   const spreadCall = call.arguments.some(ts.isSpreadElement)
+  // Every name this call redefines. Collected across ALL parameters before any pairing, because the
+  // capture that matters is between one parameter's binding and another parameter's name.
+  const shadowed = new Set(parameters.flatMap((parameter) => parameterNames(parameter.name)))
   parameters.forEach((parameter, index) => {
     for (const name of parameterNames(parameter.name)) {
       next.delete(name)
@@ -958,6 +1016,21 @@ function bindCallArguments(
     if (spreadCall || parameter.dotDotDotToken || !ts.isIdentifier(parameter.name)) return
     const argument = call.arguments[index] ?? parameter.initializer
     if (!argument) return
+    // CAPTURE. The argument would be read in a scope where these names mean something else — for the
+    // self-referential case, itself. There is no rename available here, so it stays unbound.
+    //
+    // ONE CARVE-OUT, and it is provably a no-op: `f(generation)` into `function f(generation)` while
+    // the CALLER has no binding for that name is the identity substitution. The name is free on both
+    // sides, means the same unreadable runtime value on both sides, and the allowlist reaches the
+    // same verdict it would reach for a plain read — which is the protocol's own fence
+    // (`fenceWhere(row.id, generation)`), not a hiding place. The moment the caller DOES bind the
+    // name, that binding is precisely what the substitution would hide, and it is refused.
+    const identity = ts.isIdentifier(argument) && argument.text === parameter.name.text && !scope.has(argument.text)
+    for (const referenced of referencedIdentifiers(argument)) {
+      if (!shadowed.has(referenced)) continue
+      if (identity && referenced === parameter.name.text) continue
+      return
+    }
     next.set(parameter.name.text, argument)
     unbound.delete(parameter.name.text)
   })
@@ -2159,6 +2232,42 @@ test('[o3d-0bfh r9] the marker scan REFUSES the shapes it cannot read, instead o
         + 'function stale(generation) { return { backReferenceFollowUpsPendingAt: generation } }\n'
         + 'await db.accountingSyncLog.findMany({ where: stale(olderThan(cutoff)) })',
     },
+    {
+      // CODEX r12 MEDIUM, VERBATIM — THE SAME-NAME CAPTURE. r12 installed the caller's RAW argument
+      // expression into the callee's table, which is a valid substitution only while the callee
+      // redefines no name the argument reads. Here it redefines the very one: the binding
+      // `generation → generation` points at ITSELF, `resolveIn` follows it once, marks the name
+      // seen and stops, and hands back a bare identifier. The `olderThan(cutoff)` the caller
+      // actually passed is never looked at, and the name is waved through by the allowlist. This is
+      // the shipped probe from the review, and it returned NO offences.
+      what: 'AN ARGUMENT CAPTURED BY A PARAMETER OF ITS OWN NAME, HIDING THE CALLER FROM ITSELF',
+      code: 'const generation = olderThan(cutoff)\n'
+        + 'function stale(generation) { return { backReferenceFollowUpsPendingAt: generation } }\n'
+        + 'await db.accountingSyncLog.findMany({ where: stale(generation) })',
+    },
+    {
+      what: 'the same capture through an object method rather than a plain function',
+      code: 'const generation = olderThan(cutoff)\n'
+        + 'const predicates = { stale(generation) { return { backReferenceFollowUpsPendingAt: generation } } }\n'
+        + 'await db.accountingSyncLog.findMany({ where: predicates.stale(generation) })',
+    },
+    {
+      // The same defect without the self-reference: two parameters whose names are each other's
+      // arguments. Substituting both raw expressions makes the pair resolve in a circle.
+      what: 'two arguments SWAPPED into parameters named after each other',
+      code: 'const generation = params.generation\n'
+        + 'const cutoff = olderThan(now)\n'
+        + 'function stale(generation, cutoff) { return { backReferenceFollowUpsPendingAt: generation } }\n'
+        + 'await db.accountingSyncLog.findMany({ where: stale(cutoff, generation) })',
+    },
+    {
+      // And the capture buried inside a larger argument, so the check cannot be "is the argument
+      // exactly this identifier".
+      what: 'a captured name reached inside a composed argument',
+      code: 'const generation = olderThan(cutoff)\n'
+        + 'function stale(generation) { return { backReferenceFollowUpsPendingAt: generation } }\n'
+        + 'await db.accountingSyncLog.findMany({ where: stale(pick(generation)) })',
+    },
   ]
   for (const { what, code } of refused) {
     const offences = markerClockReads(code, 'control.ts')
@@ -2509,4 +2618,262 @@ test('[o3d-0bfh r11/r12] every FILE that writes about a retained obligation is s
     sources[4]!.code, /describeFollowUpObligationBacklogRow\(row\)/,
     'the exception-inbox loader must pass the registry describer through, not compose a remedy of its own',
   )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-0bfh r13 (Codex HIGH) — THE DEFERRED ENQUEUE PATH JOINS THE CONTRACT, WITHOUT BLANKET-BANNING
+// THE FILE.
+//
+// r12 filed the question and left it: lib/domain/accounting/invoice-payment-enqueue.ts carried
+// eleven operator strings naming a hand remedy, and whether that was safe depended on whether the
+// deferred re-drive reaches the branch — which nobody had established. Codex answered it: the
+// pinned-invoice-moved branch is reachable ONLY with `postedUnder`, which only
+// `registerDeferredOrderReceipts` supplies, and every refusal it produces makes that function answer
+// `settled: false`, on which the connector RETAINS the follow-up obligation. So a hand-made payment
+// there races exactly the work the retained marker exists to schedule.
+//
+// AND THE OPPOSITE IS STILL TRUE FOR THE OTHER BRANCHES, which is why this file is NOT added to the
+// whole-file scan above. An operator-entered receipt refused for capacity or currency has no
+// obligation marker, no queued row and nothing that will ever revisit it; banning a hand
+// registration there would strand a customer's payment permanently. THE ONE LIST is scoped to
+// RETAINED obligations, and the enqueue path is only sometimes in one.
+//
+// So the enforcement is structural instead of textual, in two halves:
+//
+//   • every remedy sentence in that module comes from ONE producer, `invoicePaymentRemedyNote`,
+//     and the source check below proves no second one exists outside it;
+//   • that producer, and every description composed out of it, is walked HERE at runtime in the
+//     DEFERRED state and judged by THE ONE LIST, while the `none` state is asserted to keep its hand
+//     remedy so the deliberate exemption is a pinned decision rather than an oversight.
+// ---------------------------------------------------------------------------
+
+/** Every refusal `decideInvoicePaymentRegistration` can return — stated, so a new one is loud. */
+const INVOICE_PAYMENT_REFUSALS = [
+  'SYNC_DISABLED',
+  'DOCUMENT_NOT_POSTED',
+  'CURRENCY_MISMATCH',
+  'NO_BANK_ACCOUNT',
+  'UNRESOLVED_PAYMENT_ATTEMPT',
+  'LEDGER_AMOUNT_UNKNOWN',
+  'LEDGER_AMOUNT_ASSERTED',
+  'SETTLED_ON_RETIRED_DOCUMENT',
+  'WOULD_OVERPAY',
+] as const
+
+/** The connectors the enqueue producers are walked for: every registry entry plus the fallback. */
+const REDRIVE_CONNECTORS = [...Object.keys(ACCOUNTING_FOLLOW_UP_RECOVERY), UNDECLARED_CONNECTOR]
+
+/**
+ * EVERY OPERATOR STRING THE ENQUEUE PATH PRODUCES WHILE AN OBLIGATION IS OUTSTANDING.
+ *
+ * Taken from the producers at runtime, for every connector the registry declares AND the undeclared
+ * fallback, because the remedy half is the registry's answer for the PINNED connector and a walk of
+ * the one connector bound today would leave the other branches unexercised.
+ */
+function deferredEnqueueProducers(): Array<{ what: string; text: string }> {
+  const produced: Array<{ what: string; text: string }> = []
+  const money = { orderReference: 'SO-1', amount: 100, currency: 'GBP' }
+
+  for (const connector of REDRIVE_CONNECTORS) {
+    const redrive = { redrive: 'deferred' as const, connector }
+    produced.push({
+      what: `invoicePaymentRemedyNote (deferred, ${connector})`,
+      text: invoicePaymentRemedyNote(redrive),
+    })
+
+    // Every refusal `reportRefusal` can write, in the state the deferred re-drive puts it in.
+    // SYNC_DISABLED produces no notice at all, which is asserted rather than skipped.
+    for (const refusal of INVOICE_PAYMENT_REFUSALS) {
+      const notice = describeInvoicePaymentRefusal({
+        refused: { register: false, refusal, alreadyRegistered: 40, ledgerTotal: 120, detail: 'INV-OLD' },
+        orderCurrency: 'EUR',
+        method: 'card',
+        redrive,
+        ...money,
+      })
+      if (refusal === 'SYNC_DISABLED') {
+        assert.equal(notice, null, 'SYNC_DISABLED reports nothing — nothing was expected to post')
+        continue
+      }
+      assert.ok(notice, `${refusal} must produce a notice, or this walk reads nothing`)
+      produced.push({ what: `describeInvoicePaymentRefusal ${refusal} (deferred, ${connector})`, text: notice.description })
+    }
+
+    for (const phase of ['before-queue', 'while-queueing'] as const) {
+      produced.push({
+        what: `invoicePaymentDocumentMovedDescription ${phase} (${connector})`,
+        text: invoicePaymentDocumentMovedDescription({
+          phase, postedInvoiceId: 'INV-1', currentInvoiceId: 'INV-9', connector, ...money,
+        }),
+      })
+    }
+    for (const alreadyQueued of [true, false]) {
+      produced.push({
+        what: `invoicePaymentConnectorMovedDescription alreadyQueued=${alreadyQueued} (${connector})`,
+        text: invoicePaymentConnectorMovedDescription({
+          pinnedConnector: connector, wroteFor: 'somewhere-else', alreadyQueued, ...money,
+        }),
+      })
+    }
+    produced.push({
+      what: `invoicePaymentPostingContextChangedDescription (deferred, ${connector})`,
+      text: invoicePaymentPostingContextChangedDescription({ redrive, ...money }),
+    })
+    produced.push({
+      what: `invoicePaymentNotQueuedDescription (deferred, ${connector})`,
+      text: invoicePaymentNotQueuedDescription({ redrive, ...money }),
+    })
+    produced.push({
+      what: `deferredReceiptsUnlinkedDescription (${connector})`,
+      text: deferredReceiptsUnlinkedDescription({ connector, postedInvoiceId: 'INV-1', receipts: 2 }),
+    })
+    produced.push({
+      what: `deferredReceiptsDocumentMovedDescription (${connector})`,
+      text: deferredReceiptsDocumentMovedDescription({ connector, postedInvoiceId: 'INV-1', currentInvoiceId: 'INV-9' }),
+    })
+    produced.push({
+      what: `deferredReceiptsFailedDescription (${connector})`,
+      text: deferredReceiptsFailedDescription({ connector, error: 'ECONNRESET' }),
+    })
+  }
+
+  // The third state, which r12 did not see at all: the invoice has not posted, so this receipt has
+  // no sync row and the deferred re-drive at the next SALES_INVOICE post is what registers it.
+  produced.push({
+    what: 'invoicePaymentRemedyNote (invoice-post)',
+    text: invoicePaymentRemedyNote({ redrive: 'invoice-post' }),
+  })
+  return produced
+}
+
+/** How many strings the walk must yield — stated, so a dropped producer is loud. */
+const EXPECTED_DEFERRED_ENQUEUE_PRODUCERS =
+  // per connector: the remedy note, the eight refusals less the silent SYNC_DISABLED, two
+  // document-moved phases, two connector-moved arms, the posting-context change, the queue failure,
+  // and the deferred wrapper's own three messages
+  REDRIVE_CONNECTORS.length * (1 + (INVOICE_PAYMENT_REFUSALS.length - 1) + 2 + 2 + 1 + 1 + 3)
+  // plus the pre-post state, which has no connector
+  + 1
+
+test('[o3d-0bfh r13] every enqueue string written while an obligation is outstanding is judged by THE ONE LIST', () => {
+  // Route: the producers in lib/domain/accounting/invoice-payment-enqueue.ts, at runtime, in the
+  // DEFERRED redrive state — i.e. the state `registerDeferredOrderReceipts` puts every one of them
+  // in — for every registry connector plus the undeclared fallback.
+  //
+  // Mutation: restore "Re-run the invoice sync for this order, or register the payment in the ledger
+  // by hand." to `invoicePaymentRemedyNote`'s deferred branch, or to any one of the descriptions,
+  // and this fails naming the producer. Drop the escalation and the escalate assertion fails, so
+  // "say nothing at all" is not a passing fix either.
+  const produced = deferredEnqueueProducers()
+  assert.equal(
+    produced.length, EXPECTED_DEFERRED_ENQUEUE_PRODUCERS,
+    'every enqueue producer, for every registry connector and the fallback, plus the pre-post state',
+  )
+  for (const { what, text } of produced) {
+    assert.ok(text.length > 0, `${what} must actually produce a string, or this scan reads nothing`)
+    assertNoBannedInstruction(what, text)
+    assert.match(text, /ESCALATE/, `${what} must say what to do instead of settling by hand: escalate`)
+  }
+
+  // NON-VACUITY on the exact sentences that shipped, composed from the shipped strings so the
+  // control cannot rot into a test of a hardcoded paragraph.
+  const shipped = invoicePaymentRemedyNote({ redrive: 'deferred', connector: 'xero' })
+  for (const phrase of [
+    ' Re-run the invoice sync for this order',
+    ' Or register the payment in Xero by hand',
+    ' This still has to be re-driven by hand',
+  ]) {
+    assert.throws(
+      () => assertNoBannedInstruction('the mutated deferred enqueue remedy', shipped + phrase),
+      /banned operator instruction/,
+      `THE ONE LIST must reject "${phrase.trim()}" in the deferred enqueue remedy`,
+    )
+  }
+  // And the deferred remedy's recovery half is the REGISTRY's fact about the pinned connector, on
+  // both sides of the declaration — not a sentence written in the enqueue module.
+  assert.match(shipped, /a later sweep re-reads the marker and re-enqueues them idempotently/)
+  assert.match(
+    invoicePaymentRemedyNote({ redrive: 'deferred', connector: 'quickbooks' }),
+    /NOTHING re-enqueues them on this connector/,
+  )
+  assert.match(
+    invoicePaymentRemedyNote({ redrive: 'deferred', connector: UNDECLARED_CONNECTOR }),
+    /NOTHING re-enqueues them on this connector/,
+    'an undeclared connector must not inherit the sweep answer here either',
+  )
+})
+
+test('[o3d-0bfh r13] the UNPINNED refusal deliberately KEEPS its hand remedy, because nothing will come back for it', () => {
+  // THE OTHER HALF OF THE DECISION, pinned as a test so a later round does not "tidy" it away.
+  //
+  // An operator-entered receipt refused for capacity, currency or a missing bank-account mapping has
+  // no follow-up obligation, no queued row and no re-drive ahead of it. Refusing hand settlement
+  // there would leave a customer's payment unregistered for good, which is strictly worse than the
+  // double-payment risk the deferred branches carry — there is no double to risk.
+  //
+  // Route: invoicePaymentRemedyNote({ redrive: 'none' }) and the WOULD_OVERPAY description composed
+  // out of it. Mutation: make the `none` branch refuse hand settlement and this fails.
+  const alone = invoicePaymentRemedyNote({ redrive: 'none' })
+  assert.match(alone, /register it in the accounting connector by hand/i)
+  assert.doesNotMatch(alone, /HAND SETTLEMENT IS REFUSED/)
+
+  const notice = describeInvoicePaymentRefusal({
+    refused: { register: false, refusal: 'WOULD_OVERPAY', alreadyRegistered: 40, ledgerTotal: 120 },
+    orderReference: 'SO-1',
+    amount: 100,
+    currency: 'GBP',
+    orderCurrency: 'GBP',
+    method: 'card',
+    redrive: { redrive: 'none' },
+  })
+  assert.ok(notice)
+  assert.match(notice.description, /register it in the accounting connector by hand/i)
+
+  // AND THE STATE MACHINE THAT DECIDES WHICH OF THE THREE APPLIES, which is where the r12 question
+  // was actually answered. A pin means the deferred re-drive is the caller; no pin and no document
+  // means the post that triggers it is still ahead; no pin and a posted document means nothing is
+  // coming.
+  assert.deepEqual(
+    invoicePaymentRedriveFor({ connector: 'xero', accountingInvoiceId: 'INV-1' }, 'WOULD_OVERPAY'),
+    { redrive: 'deferred', connector: 'xero' },
+  )
+  assert.deepEqual(invoicePaymentRedriveFor(null, 'DOCUMENT_NOT_POSTED'), { redrive: 'invoice-post' })
+  assert.deepEqual(invoicePaymentRedriveFor(null, 'WOULD_OVERPAY'), { redrive: 'none' })
+  assert.deepEqual(invoicePaymentRedriveFor(null, null), { redrive: 'none' })
+})
+
+test('[o3d-0bfh r13] the enqueue module writes NO remedy sentence outside the one producer', () => {
+  // The structural half. The producer walk above can only judge the producers somebody named, and
+  // the whole-file scan that catches the rest cannot be pointed at this file — it would ban the
+  // legitimate unpinned hand remedy along with everything else. So instead: EXCISE
+  // `invoicePaymentRemedyNote`, the one function allowed to say what a human should do, and require
+  // that nothing in the remainder of the module says anything of the kind.
+  //
+  // That is what makes "every message ends in the producer's output" a property rather than a habit:
+  // a sentence typed at a call site cannot be reached by the runtime walk, but it cannot survive
+  // this either.
+  //
+  // Mutation: put "or register the payment in the ledger by hand" back onto any refusal message and
+  // this fails; the r13 fix removed thirteen such sites.
+  const source = readSource(path.join(REPO_ROOT, 'lib', 'domain', 'accounting', 'invoice-payment-enqueue.ts'))
+  const from = source.code.indexOf('export function invoicePaymentRemedyNote(')
+  assert.ok(from > 0, 'the one remedy producer must be there, or this test is excising nothing')
+  const to = source.code.indexOf('\n}\n', from)
+  assert.ok(to > from, 'and it must be a complete function')
+  const rest = source.code.slice(0, from) + source.code.slice(to)
+
+  // The excision is real: the remedy sentences ARE in the part that was cut.
+  assert.match(source.code.slice(from, to), /by hand/i)
+  assert.match(source.code.slice(from, to), /HAND SETTLEMENT IS REFUSED HERE/)
+
+  assertNoBannedInstruction(`${source.rel} (outside invoicePaymentRemedyNote)`, rest)
+  assert.doesNotMatch(
+    rest, /by hand/i,
+    'no operator remedy may be written at a call site in this module — it comes from invoicePaymentRemedyNote',
+  )
+
+  // And the producers really are what the module reports through.
+  assert.match(rest, /describeInvoicePaymentRefusal\(\{/)
+  assert.match(rest, /invoicePaymentDocumentMovedDescription\(\{/)
+  assert.match(rest, /deferredReceiptsUnlinkedDescription\(\{/)
 })
