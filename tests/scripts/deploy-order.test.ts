@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync, spawn, spawnSync } from 'node:child_process'
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -7979,6 +7979,18 @@ const ENTRYPOINT_SOURCES = [
   { name: 'install.sh', lines: INSTALL_LINES },
 ] as const
 
+/**
+ * What the library will put in front of a printed root-only path, for a given PATH. Resolved the
+ * same way the library resolves it — `command -v sudo` — rather than assumed, because a box
+ * without sudo is one the reader can only have reached as root, and there the bare path IS the
+ * runnable instruction. Tests that hard-coded either answer would pass on one host and fail on
+ * the next.
+ */
+function sudoPrefixOn(path: string): string {
+  const found = spawnSync('bash', ['-c', 'command -v sudo >/dev/null 2>&1'], { env: { PATH: path } as unknown as NodeJS.ProcessEnv })
+  return found.status === 0 ? 'sudo ' : ''
+}
+
 test('r32: no printed instruction in any entrypoint names the checkout as something to run', () => {
   // MUTATION ROUTE (verified locally): restore r31's banner line in deploy.sh —
   //   echo -e "${RED}    node ${DB_FENCE_SCRIPT} --fence --state-file=... ${RESET}" >&2
@@ -8015,11 +8027,13 @@ test('r32: no printed instruction in any entrypoint names the checkout as someth
   const r31Line = '          echo -e "${RED}    node ${DB_FENCE_SCRIPT} --fence --state-file=${DB_FENCE_STATE}${RESET}" >&2'
   assert.ok(isCode(r31Line) && RUNNABLE.test(r31Line), 'precondition: the pattern catches the line this replaced')
 
-  // EVERY ENTRYPOINT POINTS AT THE WRAPPERS, and at nothing else.
+  // EVERY ENTRYPOINT POINTS AT THE WRAPPERS, and at nothing else — with the privilege transition
+  // in front of them since r33, because a 0700 root-owned path is not an instruction for the
+  // non-root shell the banner is usually read in.
   for (const { name, lines } of ENTRYPOINT_SOURCES) {
     const source = lines.join('\n')
-    assert.match(source, /^DB_FENCE_RELEASE_CMD="\$\{DB_FENCE_RELEASE_WRAPPER\}"$/m, `${name} must name the release wrapper`)
-    assert.match(source, /^DB_FENCE_REFENCE_CMD="\$\{DB_FENCE_REFENCE_WRAPPER\}"$/m, `${name} must name the re-fence wrapper`)
+    assert.match(source, /^DB_FENCE_RELEASE_CMD="\$\{DB_FENCE_SUDO_PREFIX\}\$\{DB_FENCE_RELEASE_WRAPPER\}"$/m, `${name} must name the release wrapper`)
+    assert.match(source, /^DB_FENCE_REFENCE_CMD="\$\{DB_FENCE_SUDO_PREFIX\}\$\{DB_FENCE_REFENCE_WRAPPER\}"$/m, `${name} must name the re-fence wrapper`)
     // Nothing may reassign them to a command line again.
     const rebuilt = lines.filter(
       (line) => isCode(line) && /^\s*DB_FENCE_(RELEASE|REFENCE)_CMD=/.test(line) && !/WRAPPER\}"$/.test(line.trim()),
@@ -8108,8 +8122,8 @@ test('r32: the recovery wrapper an operator is given runs, as pasted, with nothi
     assert.match(noCredential.stderr, /DEPLOY_ADMIN_DATABASE_URL is not set/, noCredential.stderr)
     assert.match(
       noCredential.stderr,
-      new RegExp(`DEPLOY_ADMIN_DATABASE_URL='postgresql://ADMIN:PASSWORD@HOST:PORT/DATABASE' ${paths.releaseWrapper}`),
-      `and the command it suggests must name itself, absolutely:\n${noCredential.stderr}`,
+      new RegExp(`${sudoPrefixOn(process.env.PATH ?? '')}env DEPLOY_ADMIN_DATABASE_URL='postgresql://ADMIN:PASSWORD@HOST:PORT/DATABASE' ${paths.releaseWrapper}`),
+      `and the command it suggests must name itself, absolutely, with the privilege the reader needs:\n${noCredential.stderr}`,
     )
     // …and that suggestion works, which is the difference between an instruction and a decoration.
     const supplied = spawnSync(paths.releaseWrapper, [], {
@@ -8129,6 +8143,436 @@ test('r32: the recovery wrapper an operator is given runs, as pasted, with nothi
     assert.equal(stale.status, 1, 'a wrapper whose artefact moved must refuse')
     assert.ok(!existsSync(log), 'and must not run it')
     assert.match(stale.stderr, /has changed since the fence was raised/, stale.stderr)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// r33: WHAT A SCRIPT-ONLY PIN AUTHENTICATES, AND WHAT IT DOES NOT
+// (o3d-2sm1.5, Codex CRITICAL)
+//
+// r32 made the protected artefact self-contained and gave it a whole-tree digest. That
+// authenticates the tree from the moment it is RECORDED; it says nothing about what the tree was
+// first assembled FROM. IMS_FENCE_SCRIPT_SHA256 covers the entry file, the closure is vendored
+// out of ${APP_DIR}/node_modules, and an account that can write there can leave the legitimate
+// helper untouched, replace one file inside `pg`, and have those bytes sealed, digested and
+// recorded as the trusted artefact. `pg` is imported before main() runs.
+//
+// So the script-only pin now has a stated meaning: it authenticates the ENTRY FILE, and it is
+// sufficient on its own ONLY where the closure's source is already one nobody else can write. It
+// is never silently treated as covering more than that — from an application-writable checkout it
+// is REFUSED, naming IMS_FENCE_ARTEFACT_SHA256 and three ways to obtain it.
+// ---------------------------------------------------------------------------
+
+/** sha256 of a file, the way an operator would take it. */
+function sha256File(path: string): string {
+  return execFileSync('sha256sum', [path], { encoding: 'utf8' }).split(' ')[0]
+}
+
+const escapeRe = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+test('r33: a script-only pin cannot authorise a publication whose closure comes from an application-writable checkout', () => {
+  // THE LOAD-BEARING TEST FOR THE CRITICAL. The entry file is the legitimate one and its digest
+  // MATCHES — that is the whole point: only a vendored package was replaced, in a directory the
+  // application account owns. r32 would have sealed, digested and recorded those bytes as
+  // trusted, and the recorded digest would then have protected them.
+  //
+  // "Application-writable" is proved here through the group-write arm of the predicate, because
+  // this suite does not run as root and cannot chown a file to another uid. The OWNERSHIP arm —
+  // which is the production arm, where the checkout belongs to the application account — is
+  // exercised directly in the test below.
+  //
+  // MUTATION ROUTE (each verified by making the change locally and re-running):
+  //   1. delete the `-n "${DB_FENCE_SOURCE_UNTRUSTED_PATH}"` gate from _fence_stage_and_publish():
+  //      PHASE 1 publishes, and the protected artefact holds the credential-stealing `pg`.
+  //   2. drop the `-perm /022` clause from _fence_source_trust(): the same, because the source
+  //      stops being recognised as writable by anybody else.
+  //   3. delete the `_fence_source_trust` call from _fence_vendor_into(): PHASE 1 publishes while
+  //      PHASE 3 still passes, so nothing else in the suite notices.
+  //   4. change the refusal to a warning that publishes anyway: PHASE 1's "nothing published"
+  //      assertion fails.
+  const dir = mkdtempSync(join(tmpdir(), 'ims-r33-pin-'))
+  try {
+    // A checkout whose HELPER is the shipped one and whose `pg` steals the admin credential.
+    writeFenceCheckout(dir, importReportingHelper(dir), STEALING_PG)
+    chmodSync(checkoutPgEntry(dir), 0o664)
+    const entryDigest = sha256File(checkoutHelper(dir))
+    const paths = protectedPaths(dir)
+
+    // PHASE 1 — THE PIN THAT LOOKS LIKE AUTHORISATION.
+    const refused = runShell(
+      artefactHarness(dir, [`DB_FENCE_EXPECTED_SHA256=${entryDigest}`, 'db_fence_script_in_use >/dev/null; echo "RC=$?"']),
+    )
+    assert.match(refused.output, /^RC=1$/m, `a script-only pin must not authorise this publication:\n${refused.output}`)
+    assert.match(refused.output, /IMS_FENCE_SCRIPT_SHA256 IS NOT SUFFICIENT HERE/, refused.output)
+    // THE PRECONDITION THAT MAKES THE REFUSAL MEAN WHAT IT SAYS: the entry-file pin MATCHED. A
+    // refusal over a mismatched entry file would be the r31 behaviour and would prove nothing.
+    assert.match(refused.output, new RegExp(`${entryDigest}, which did match`), refused.output)
+    assert.match(refused.output, /IMS_FENCE_ARTEFACT_SHA256=<digest of the WHOLE tree>/, 'naming the variable that would cover the rest')
+    assert.match(refused.output, /--dry-run/, 'and how to obtain it before there is anything published to read it off')
+    assert.match(
+      refused.output,
+      new RegExp(escapeRe(checkoutPgEntry(dir))),
+      `and the path that makes the source application-writable:\n${refused.output}`,
+    )
+    assert.match(refused.output, /REPORTED AND NOT AUTHENTICATED/, 'and the digest it offers is labelled as coming from the checkout under question')
+    assert.ok(!existsSync(paths.app), 'and NOTHING may be published')
+
+    // THE CONTROL, which is what makes the assertions above mean something: the substitution is
+    // live. Reached from the checkout's own helper, that `pg` runs and takes the credential.
+    const stolen = join(dir, 'STOLEN')
+    const env = {
+      ...process.env,
+      DEPLOY_ADMIN_DATABASE_URL: 'postgresql://admin:sup3rsecret@127.0.0.1:5432/imsdb',
+      IMS_TEST_STOLEN_PATH: stolen,
+    }
+    const control = spawnSync('node', [checkoutHelper(dir)], { encoding: 'utf8', env, cwd: dir })
+    assert.equal(control.status, 0, `${control.stdout}${control.stderr}`)
+    assert.equal(
+      readFileSync(stolen, 'utf8'),
+      'postgresql://admin:sup3rsecret@127.0.0.1:5432/imsdb',
+      'precondition: the substituted package really does take the credential when it runs',
+    )
+    rmSync(stolen)
+
+    // PHASE 2 — THE REMEDY THE MESSAGE NAMES ACTUALLY WORKS. An operator who has compared the
+    // reported value against the release pins it, and the same publication goes through. An
+    // instruction that cannot be followed is the defect this round is about, one level down.
+    const reported = /just now hashes to ([0-9a-f]{64})/.exec(refused.output)?.[1]
+    assert.ok(reported, `the refusal must report what the tree would hash to:\n${refused.output}`)
+    const pinned = runShell(
+      artefactHarness(dir, [
+        `DB_FENCE_EXPECTED_SHA256=${entryDigest}`,
+        `DB_FENCE_EXPECTED_ARTEFACT_SHA256=${reported}`,
+        'db_fence_script_in_use >/dev/null; echo "RC=$?"',
+      ]),
+    )
+    assert.match(pinned.output, /^RC=0$/m, `the artefact pin the refusal named must be accepted:\n${pinned.output}`)
+    assert.equal(
+      /^fence_artefact_sha256=([0-9a-f]{64})$/m.exec(readFileSync(paths.artefactFile, 'utf8'))?.[1],
+      reported,
+      'and what it records is the tree the operator pinned',
+    )
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+
+  // PHASE 3 — AND IT IS NOT A BLANKET REFUSAL. The same script-only pin, over a checkout nobody
+  // but this account can write, publishes: that is the "source that is already trusted" half of
+  // what the pin now means, and without it this guard could not distinguish anything.
+  const clean = mkdtempSync(join(tmpdir(), 'ims-r33-clean-'))
+  try {
+    writeFenceCheckout(clean, importReportingHelper(clean))
+    const digest = sha256File(checkoutHelper(clean))
+    const result = runShell(
+      artefactHarness(clean, [`DB_FENCE_EXPECTED_SHA256=${digest}`, 'db_fence_script_in_use >/dev/null; echo "RC=$?"']),
+    )
+    assert.match(result.output, /^RC=0$/m, `a trusted source must publish under the entry-file pin alone:\n${result.output}`)
+    assert.doesNotMatch(result.output, /IS NOT SUFFICIENT/, result.output)
+    assert.ok(existsSync(protectedPaths(clean).helper), 'and the artefact must be standing')
+  } finally {
+    rmSync(clean, { recursive: true, force: true })
+  }
+})
+
+test('r33: an unpinned bootstrap still starts the mechanism, and says on the run that nothing authenticated it', () => {
+  // THE OTHER HALF OF THE SAME QUESTION. Refusing an unpinned first install would leave a
+  // mechanism that cannot start — there is no earlier artefact, and an operator deploying a
+  // release for the first time anywhere has no digest to supply. So it publishes, and the one
+  // moment the application account could ever have chosen these bytes is NAMED on the run that
+  // does it, together with the value that pins every host after this one.
+  //
+  // MUTATION ROUTE: delete the trust-on-first-use branch from _fence_stage_and_publish() and the
+  // bootstrap goes back to publishing in silence — the two message assertions fail while the
+  // publication still succeeds, which is precisely the silence this closes.
+  const dir = mkdtempSync(join(tmpdir(), 'ims-r33-tofu-'))
+  try {
+    writeFenceCheckout(dir, importReportingHelper(dir))
+    chmodSync(checkoutPgEntry(dir), 0o664)
+    const paths = protectedPaths(dir)
+
+    const boot = runShell(artefactHarness(dir, ['db_fence_script_in_use >/dev/null; echo "RC=$?"']))
+    assert.match(boot.output, /^RC=0$/m, `the mechanism must be able to start:\n${boot.output}`)
+    assert.match(boot.output, /TRUST ON FIRST USE/, `and must say so:\n${boot.output}`)
+    assert.match(boot.output, new RegExp(escapeRe(checkoutPgEntry(dir))), 'naming what made the source untrusted')
+
+    // AND THE VALUE IT TELLS THE OPERATOR TO PIN WITH IS THE ONE IT RECORDED, so the instruction
+    // is not decoration.
+    const advertised = /IMS_FENCE_ARTEFACT_SHA256=([0-9a-f]{64})/.exec(boot.output)?.[1]
+    assert.ok(advertised, `the note must offer a value to pin with:\n${boot.output}`)
+    assert.equal(
+      /^fence_artefact_sha256=([0-9a-f]{64})$/m.exec(readFileSync(paths.artefactFile, 'utf8'))?.[1],
+      advertised,
+      'and it must be what was actually published',
+    )
+    // …and it is accepted as a pin on the next run, which is the whole use of printing it.
+    const next = runShell(
+      artefactHarness(dir, [`DB_FENCE_EXPECTED_ARTEFACT_SHA256=${advertised}`, 'db_fence_script_in_use >/dev/null; echo "RC=$?"']),
+    )
+    assert.match(next.output, /^RC=0$/m, `the advertised value must work as a pin:\n${next.output}`)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('r33: the provenance question is asked about ownership as well as modes, and a source it cannot read is a refusal', () => {
+  // The predicate has two arms and production uses the one this suite cannot create by chowning:
+  // the checkout belongs to the APPLICATION ACCOUNT, not to the publisher. So it is exercised
+  // against a path that really is owned by somebody else, whoever this suite is running as.
+  //
+  // MUTATION ROUTE (each verified locally):
+  //   1. delete `! -uid "${uid}" -o` from _fence_source_trust(): CASE 1 reports nothing.
+  //   2. delete `-perm /022`: CASE 3 reports nothing.
+  //   3. change either `|| return 1` after a find to `|| offender=""`: CASE 4 answers "trusted"
+  //      for a source it could not stat at all, which is the one answer that must never be a pass.
+  const dir = mkdtempSync(join(tmpdir(), 'ims-r33-uid-'))
+  try {
+    const uid = process.getuid!()
+    const appDir = join(dir, 'app')
+    mkdirSync(join(appDir, 'scripts'), { recursive: true })
+    const entry = join(appDir, 'scripts', 'fence-db-connections.mjs')
+    writeFileSync(entry, '// helper\n')
+    const list = join(dir, 'closure.list')
+
+    // A path owned by SOMEBODY ELSE. As root that has to be made; as anyone else the system
+    // already provides one.
+    let foreign = '/usr/bin'
+    if (uid === 0) {
+      foreign = join(dir, 'foreign')
+      mkdirSync(foreign)
+      assert.equal(spawnSync('chown', ['nobody', foreign]).status, 0, 'precondition: a foreign-owned directory is needed')
+    }
+    assert.notEqual(statSync(foreign).uid, uid, 'precondition: the subject must be owned by another account')
+
+    const ask = (appDirectory: string, listBody: string): { status: number; output: string } => {
+      writeFileSync(list, listBody)
+      return runShell(
+        [
+          'set -uo pipefail',
+          'exec 2>&1',
+          `source ${JSON.stringify(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'))}`,
+          `DB_FENCE_SCRIPT=${JSON.stringify(entry)}`,
+          `_fence_source_trust ${JSON.stringify(appDirectory)} ${JSON.stringify(list)} || { echo "RC=1"; exit 0; }`,
+          'echo "RC=0"',
+          'echo "UNTRUSTED=[${DB_FENCE_SOURCE_UNTRUSTED_PATH}]"',
+        ].join('\n'),
+      )
+    }
+
+    // CASE 1 — OWNED BY ANOTHER ACCOUNT. This is the production shape.
+    const owned = ask(foreign, '')
+    assert.match(owned.output, /^RC=0$/m, owned.output)
+    assert.match(owned.output, new RegExp(`UNTRUSTED=\\[${escapeRe(foreign)}\\]`), `ownership must be reported:\n${owned.output}`)
+
+    // CASE 2 — OUR OWN, MODE-CLEAN TREE. The guard must be able to answer "trusted", or it is
+    // not a guard, it is a ban.
+    const mine = ask(appDir, '')
+    assert.match(mine.output, /^UNTRUSTED=\[\]$/m, `a source only this account can write must pass:\n${mine.output}`)
+
+    // CASE 3 — OUR OWN TREE WITH ONE GROUP-WRITABLE FILE INSIDE A VENDORED PACKAGE.
+    mkdirSync(join(appDir, 'node_modules', 'pg'), { recursive: true })
+    const loose = join(appDir, 'node_modules', 'pg', 'index.js')
+    writeFileSync(loose, 'module.exports = {}\n')
+    chmodSync(loose, 0o664)
+    const writable = ask(appDir, 'node_modules/pg\n')
+    assert.match(writable.output, new RegExp(`UNTRUSTED=\\[${escapeRe(loose)}\\]`), `a group-writable file must be reported:\n${writable.output}`)
+
+    // CASE 4 — A SOURCE IT CANNOT STAT. "No answer" may not read as "no problem".
+    const missing = ask(appDir, 'node_modules/not-there\n')
+    assert.match(missing.output, /^RC=1$/m, `a closure path that cannot be examined must be a refusal:\n${missing.output}`)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// r33: THE PRINTED-INSTRUCTION SWEEP, RE-RUN WITH THE QUESTION RESTATED
+// (o3d-2sm1.5, Codex HIGH)
+//
+// r32 asked of every printed line "would it run if pasted?" and answered yes for the recovery
+// wrappers. That answer was right for root and wrong for the person most likely to be reading the
+// banner: the wrappers are root-owned and 0700, and an operator who launched the cutover with
+// `sudo bash scripts/update.sh` is back in a NON-ROOT shell when it prints. So the question is
+// now asked as: would this run when pasted BY THE ACCOUNT THAT READS THIS BANNER.
+// ---------------------------------------------------------------------------
+
+test('r33: every printed recovery instruction carries the privilege the account reading it has', () => {
+  // MUTATION ROUTE (each verified locally):
+  //   1. change DB_FENCE_RELEASE_CMD back to "${DB_FENCE_RELEASE_WRAPPER}" in any entrypoint: the
+  //      assignment rule fails, naming that entrypoint.
+  //   2. drop `${sudo_prefix}` from the wrapper's credential-missing message: PHASE C fails — the
+  //      printed line is the bare `env … /path` form, which PHASE B has just proved is EACCES for
+  //      a reader who is not the owner.
+  //   3. remove `${DB_FENCE_SUDO_PREFIX}env ` from update.sh's recovery invocation: the
+  //      entrypoint-invocation rule fails, naming the line.
+  //   4. hard-code `sudo ` in the library instead of resolving it: PHASE A's second case fails,
+  //      because a box with no sudo would be told to run a command it does not have.
+  const dir = mkdtempSync(join(tmpdir(), 'ims-r33-instr-'))
+  try {
+    // A `sudo` that only re-executes its arguments. It proves the printed line is a WELL-FORMED
+    // command — the right word order, an absolute path, nothing lost to quoting — and reaches the
+    // wrapper. It cannot prove sudo grants the privilege; that is sudo's business, and PHASE B is
+    // what establishes that the privilege is the thing missing.
+    const shim = join(dir, 'bin')
+    mkdirSync(shim)
+    writeFileSync(join(shim, 'sudo'), '#!/bin/bash\nexec "$@"\n')
+    chmodSync(join(shim, 'sudo'), 0o755)
+    const sudoPath = `${shim}:${process.env.PATH ?? ''}`
+
+    // ---- PHASE A: the prefix is RESOLVED from the box, not assumed.
+    const prefixOn = (path: string): string =>
+      runShell(
+        [
+          `PATH=${JSON.stringify(path)}`,
+          `source ${JSON.stringify(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'))}`,
+          'printf "PREFIX=[%s]\\n" "${DB_FENCE_SUDO_PREFIX}"',
+        ].join('\n'),
+      ).output
+    assert.match(prefixOn(sudoPath), /^PREFIX=\[sudo \]$/m, 'where sudo exists the instruction carries it')
+    assert.match(
+      prefixOn(join(dir, 'nowhere')),
+      /^PREFIX=\[\]$/m,
+      'and where it does not, the instruction is the bare path — a box with no sudo is one the reader can only have reached as root',
+    )
+
+    // ---- The three static rules over the entrypoints.
+    // R1 — ONE ASSIGNMENT EACH, and the prefix is part of it. (Its exact shape is asserted by the
+    // r32 test above; this is the rule that no OTHER line rebuilds a bare command.)
+    // R2 — no printed line puts a wrapper PATH where a command belongs.
+    const COMMAND_POSITION =
+      /^\s*(?:echo(?:\s+-e)?|printf|warn|error|die|info|success|ok)\s+"(?:\$\{(?:RED|YELLOW|GREEN|BLUE|BOLD|RESET)\}|\\[nt]|\s)*\$\{DB_FENCE_(?:RELEASE|REFENCE)_WRAPPER\}/
+    const bare: string[] = []
+    for (const { name, lines } of ENTRYPOINT_SOURCES) {
+      for (const line of lines) {
+        if (!isCode(line)) continue
+        if (COMMAND_POSITION.test(line)) bare.push(`${name}: ${line.trim()}`)
+      }
+    }
+    assert.deepEqual(bare, [], 'a banner may not offer a root-only wrapper path as the command to run; it must go through DB_FENCE_RELEASE_CMD/DB_FENCE_REFENCE_CMD, which carry the privilege prefix')
+    // PRECONDITION, so the empty list is not an empty scan: the rule catches the shape it forbids.
+    assert.ok(
+      COMMAND_POSITION.test('      error "  ${DB_FENCE_RELEASE_WRAPPER}"') &&
+        COMMAND_POSITION.test('          echo -e "${RED}    ${DB_FENCE_REFENCE_WRAPPER}${RESET}" >&2'),
+      'precondition: the rule must catch a bare wrapper path in command position',
+    )
+    // …and it must NOT catch the prose that merely names them, or it would be unusable.
+    assert.ok(
+      !COMMAND_POSITION.test('    || echo "The recovery wrappers at ${DB_FENCE_RELEASE_WRAPPER} and ${DB_FENCE_REFENCE_WRAPPER} could not be refreshed." >&2'),
+      'precondition: prose that names a wrapper is not an instruction to run it',
+    )
+
+    // R3 — every printed instruction that INVOKES AN ENTRYPOINT carries the transition too. Those
+    // scripts refuse to run as anything but root, so pasted from the operator's shell they die on
+    // the identity check with the fence still standing.
+    const invocations: string[] = []
+    for (const { name, lines } of ENTRYPOINT_SOURCES) {
+      for (const line of lines) {
+        if (!isCode(line)) continue
+        if (!/bash \$\{IMS_ENTRYPOINT_PATH\}/.test(line)) continue
+        if (!/\$\{DB_FENCE_SUDO_PREFIX\}env /.test(line)) invocations.push(`${name}: ${line.trim()}`)
+      }
+    }
+    assert.deepEqual(invocations, [], 'a printed instruction that re-runs an entrypoint must carry the privilege transition and pass the credential through `env`')
+    // PRECONDITION: the rule catches the line it replaced.
+    const r32Line = `    "Supply it on the invocation, as root: DEPLOY_ADMIN_DATABASE_URL='x' bash \${IMS_ENTRYPOINT_PATH} — or ..."`
+    assert.ok(
+      /bash \$\{IMS_ENTRYPOINT_PATH\}/.test(r32Line) && !/\$\{DB_FENCE_SUDO_PREFIX\}env /.test(r32Line),
+      'precondition: the rule catches the pre-r33 wording',
+    )
+
+    // ---- The executed half. Publish a real artefact and real wrappers.
+    const log = join(dir, 'invocation.json')
+    writeFenceCheckout(
+      dir,
+      [
+        "import { writeFileSync } from 'node:fs'",
+        "import 'pg'",
+        `writeFileSync(${JSON.stringify(log)}, JSON.stringify({ argv: process.argv.slice(2), admin: process.env.DEPLOY_ADMIN_DATABASE_URL ?? '' }))`,
+        '',
+      ].join('\n'),
+    )
+    writeFileSync(join(dir, 'app', '.env'), 'DEPLOY_ADMIN_DATABASE_URL="postgresql://admin:pw@127.0.0.1:5432/imsdb"  # deploy admin\n')
+    const paths = protectedPaths(dir)
+    const publish = runShell(
+      artefactHarness(dir, [
+        'db_fence_script_in_use >/dev/null || exit 1',
+        `db_fence_publish_operator_wrappers "$(id -un)" ${JSON.stringify(join(dir, 'app', '.env'))} ${JSON.stringify(join(dir, 'state.json'))} --app-user=imsapp || exit 1`,
+      ]),
+    )
+    assert.equal(publish.status, 0, `the wrappers must be published:\n${publish.output}`)
+
+    // ---- PHASE B: the bare path is what fails, and it fails for exactly this reason.
+    for (const wrapper of [paths.releaseWrapper, paths.refenceWrapper]) {
+      assert.equal(statSync(wrapper).mode & 0o777, 0o700, `${wrapper} must stay executable by its owner alone`)
+    }
+    // A reader without the owner's privilege gets EACCES from the kernel, before any message this
+    // code could print. Reproduced by taking the execute bit away from the only account this
+    // suite has — the same refusal a non-root shell meets on a root-owned 0700 file.
+    chmodSync(paths.releaseWrapper, 0o000)
+    const denied = spawnSync(paths.releaseWrapper, [], { encoding: 'utf8' })
+    assert.equal(
+      (denied.error as NodeJS.ErrnoException | undefined)?.code,
+      'EACCES',
+      `precondition: a reader who may not execute the wrapper must be refused by the kernel, not by the wrapper:\n${denied.stderr ?? ''}`,
+    )
+    assert.ok(!existsSync(log), 'and nothing runs')
+    chmodSync(paths.releaseWrapper, 0o700)
+
+    // ---- PHASE C: the printed instruction, pasted, runs.
+    // 1. THE BANNER FORM. `${DB_FENCE_SUDO_PREFIX}${DB_FENCE_RELEASE_WRAPPER}` is what every
+    //    entrypoint prints; assembled with a PATH that has sudo, it is `sudo <absolute path>`.
+    const bannerLine = `${sudoPrefixOn(sudoPath)}${paths.releaseWrapper}`
+    assert.equal(bannerLine, `sudo ${paths.releaseWrapper}`, 'the banner must print the transition and the absolute path')
+    const banner = spawnSync('bash', ['-c', bannerLine], { encoding: 'utf8', env: { PATH: sudoPath } as unknown as NodeJS.ProcessEnv })
+    assert.equal(banner.status, 0, `the banner's instruction must run as pasted:\n${banner.stdout}${banner.stderr}`)
+    assert.equal(JSON.parse(readFileSync(log, 'utf8')).argv[0], '--release', 'and reach the protected helper')
+
+    // 2. THE CREDENTIAL-MISSING FORM, which is the one Codex named. Read what the wrapper prints
+    //    for the shell it is being read in, then paste that line back.
+    rmSync(log)
+    renameSync(join(dir, 'app', '.env'), join(dir, 'app', '.env.away'))
+    const refused = spawnSync(paths.releaseWrapper, [], { encoding: 'utf8', env: { PATH: sudoPath } as unknown as NodeJS.ProcessEnv })
+    assert.equal(refused.status, 1, 'a wrapper with no credential must refuse')
+    const printed = refused.stderr.split('\n').find((line) => line.includes('DEPLOY_ADMIN_DATABASE_URL='))
+    assert.ok(printed, `it must print a command that supplies it:\n${refused.stderr}`)
+    assert.equal(
+      printed!.trim(),
+      `sudo env DEPLOY_ADMIN_DATABASE_URL='postgresql://ADMIN:PASSWORD@HOST:PORT/DATABASE' ${paths.releaseWrapper}`,
+      `and it must be runnable by the account reading it:\n${refused.stderr}`,
+    )
+    const pasted = printed!.replace('postgresql://ADMIN:PASSWORD@HOST:PORT/DATABASE', 'postgresql://typed:in@127.0.0.1:5432/imsdb')
+    const supplied = spawnSync('bash', ['-c', pasted], { encoding: 'utf8', env: { PATH: sudoPath } as unknown as NodeJS.ProcessEnv })
+    assert.equal(supplied.status, 0, `and running it must work:\n${supplied.stdout}${supplied.stderr}`)
+    assert.equal(
+      JSON.parse(readFileSync(log, 'utf8')).admin,
+      'postgresql://typed:in@127.0.0.1:5432/imsdb',
+      'with the credential it told the operator to type',
+    )
+    renameSync(join(dir, 'app', '.env.away'), join(dir, 'app', '.env'))
+
+    // 3. WITHOUT SUDO ON THE BOX the same message is the bare form, and that is correct rather
+    //    than a fallback: the entrypoints refuse to run as anything but root, so a box with no
+    //    sudo is one whose banner can only be being read by root.
+    rmSync(log)
+    renameSync(join(dir, 'app', '.env'), join(dir, 'app', '.env.away'))
+    const noSudo = spawnSync(paths.releaseWrapper, [], { encoding: 'utf8', env: { PATH: '/nonexistent' } as unknown as NodeJS.ProcessEnv })
+    const bareLine = noSudo.stderr.split('\n').find((line) => line.includes('DEPLOY_ADMIN_DATABASE_URL='))
+    assert.equal(
+      bareLine?.trim(),
+      `env DEPLOY_ADMIN_DATABASE_URL='postgresql://ADMIN:PASSWORD@HOST:PORT/DATABASE' ${paths.releaseWrapper}`,
+      `a box with no sudo must not be told to run one:\n${noSudo.stderr}`,
+    )
+    renameSync(join(dir, 'app', '.env.away'), join(dir, 'app', '.env'))
+
+    // ---- PHASE D: the one printed instruction whose answer does NOT differ by account. The
+    // artefact-mismatch message tells an operator to run `sha256sum -c` inside the protected tree;
+    // that tree is deliberately world-readable and traversable, because the fence runs as the
+    // application user, so it runs for either reader. Stated rather than assumed, and run.
+    assert.equal(statSync(paths.recovery).mode & 0o005, 0o005, 'the recovery directory must stay traversable and readable by everyone')
+    assert.equal(statSync(paths.manifestFile).mode & 0o004, 0o004, 'and the manifest readable')
+    const check = spawnSync('sha256sum', ['-c', paths.manifestFile], { cwd: paths.app, encoding: 'utf8' })
+    assert.equal(check.status, 0, `the manifest instruction must run and pass over an untouched tree:\n${check.stdout}${check.stderr}`)
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
