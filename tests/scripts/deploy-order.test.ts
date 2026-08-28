@@ -7249,3 +7249,306 @@ test('the entrypoints no longer claim an atomicity that only covered explicit re
     )
   }
 })
+
+// ---------------------------------------------------------------------------
+// r31: SUBSTITUTION AT WRITE (o3d-2sm1.5, Codex CRITICAL x2)
+//
+// r29 closed DELETION of the fence helper. r30 closed SUBSTITUTION AT READ — the root-owned copy
+// wins whenever it exists. Neither closed SUBSTITUTION AT WRITE: the publication step still took
+// whatever was in the application-owned checkout and promoted it into the protected path on every
+// fence, so the account being defended against supplied the trusted artefact, and the digest
+// recorded beside it proved only that the substitution was consistent with itself. And deploy.sh
+// and install.sh never resolved at all: they handed DEPLOY_ADMIN_DATABASE_URL straight to
+// ${APP_DIR}/scripts/fence-db-connections.mjs.
+//
+// The two tests below are the load-bearing ones. Both run REAL node processes through the
+// shipped functions of all three entrypoints, so "the substituted code never ran" is answered by
+// the filesystem rather than by reading the source.
+// ---------------------------------------------------------------------------
+
+/** A fence helper that records every invocation, and answers the two modes the callers read. */
+function shippedHelper(dir: string): string {
+  return [
+    "import { appendFileSync, writeFileSync } from 'node:fs'",
+    `appendFileSync(${JSON.stringify(join(dir, 'calls.log'))}, 'SHIPPED ' + process.argv.slice(2).join(' ') + '\\n')`,
+    "if (process.argv.includes('--print-migration-url')) {",
+    "  process.stdout.write('postgres://admin@127.0.0.1/nowhere?options=-c%20role%3Dimsapp\\n')",
+    '}',
+    "if (process.argv.includes('--fence')) {",
+    `  writeFileSync(${JSON.stringify(join(dir, 'db-connect-fence.json'))}, '{}')`,
+    '}',
+    'process.exit(0)',
+    '',
+  ].join('\n')
+}
+
+/**
+ * What the application account would put there instead. It STEALS: if it is ever executed it
+ * writes the privileged credential out of its own environment, which is the finding stated as a
+ * file that either exists or does not.
+ */
+function substitutedHelper(dir: string): string {
+  return [
+    "import { appendFileSync, writeFileSync } from 'node:fs'",
+    `appendFileSync(${JSON.stringify(join(dir, 'calls.log'))}, 'SUBSTITUTED ' + process.argv.slice(2).join(' ') + '\\n')`,
+    `writeFileSync(${JSON.stringify(join(dir, 'STOLEN'))}, String(process.env.DEPLOY_ADMIN_DATABASE_URL ?? ''))`,
+    "if (process.argv.includes('--print-migration-url')) {",
+    "  process.stdout.write('postgres://attacker@127.0.0.1/nowhere?options=-c%20role%3Dimsapp\\n')",
+    '}',
+    "if (process.argv.includes('--fence')) {",
+    `  writeFileSync(${JSON.stringify(join(dir, 'db-connect-fence.json'))}, '{}')`,
+    '}',
+    'process.exit(0)',
+    '',
+  ].join('\n')
+}
+
+for (const entry of FENCE_HARNESS) {
+  test(`${entry.name}: a helper substituted in the checkout is neither promoted nor handed the credential`, () => {
+    // THE LOAD-BEARING TEST FOR BOTH CRITICALS. Phase 1 is an ordinary fence, which publishes the
+    // shipped helper into the protected path. Phase 2 replaces the CHECKOUT's file — the account
+    // owns that directory and does not need to delete anything, only to supply something that
+    // works — and fences again.
+    //
+    // MUTATION ROUTE (each verified by making the change locally and re-running):
+    //   1. drop the `[[ ! -f "${DB_FENCE_SCRIPT_COPY}" ]]` guard from publish_fence_script_copy()
+    //      so it publishes unconditionally, as r30 did: ${dir}/STOLEN appears, the protected copy
+    //      becomes the substituted bytes, and the copy-content assertion fails.
+    //   2. in deploy.sh or install.sh, change the invocation back to `node "$DB_FENCE_SCRIPT"`
+    //      (which is what r30 shipped in both): ${dir}/STOLEN appears for that entrypoint, holding
+    //      the admin URL, and the calls log shows SUBSTITUTED.
+    const dir = mkdtempSync(join(tmpdir(), 'ims-r31-swap-'))
+    try {
+      writeFileSync(join(dir, 'fence.mjs'), shippedHelper(dir))
+      const shipped = readFileSync(join(dir, 'fence.mjs'), 'utf8')
+      const run = (): { status: number; output: string } => {
+        const program = [
+          'set -euo pipefail',
+          // What the resolution says about a refused promotion goes to stderr; an operator sees
+          // both streams, so the harness does too.
+          'exec 2>&1',
+          entry.preamble(dir),
+          shellFunction(entry.source, 'ensure_cutover_state_dirs'),
+          shellFunction(entry.source, 'fence_db_connections'),
+          'fence_db_connections',
+          'echo "FENCE_UP=${DB_FENCE_UP}"',
+        ].join('\n')
+        return runShell(program)
+      }
+
+      const first = run()
+      assert.equal(first.status, 0, `phase 1 must fence normally:\n${first.output}`)
+      const copy = join(dir, 'recovery', 'app', 'scripts', 'fence-db-connections.mjs')
+      assert.ok(existsSync(copy), `phase 1 must publish a protected copy:\n${first.output}`)
+      assert.equal(readFileSync(copy, 'utf8'), shipped, 'and it is the shipped helper')
+      assert.match(readFileSync(join(dir, 'calls.log'), 'utf8'), /^SHIPPED .*--fence/m, 'and the fence really ran')
+
+      // PHASE 2 — the substitution, after the publication, which is the interval r30 left open.
+      writeFileSync(join(dir, 'fence.mjs'), substitutedHelper(dir))
+      const second = run()
+
+      assert.ok(
+        !existsSync(join(dir, 'STOLEN')),
+        `the substituted helper must never be executed with DEPLOY_ADMIN_DATABASE_URL:\n${second.output}`,
+      )
+      assert.ok(
+        !/SUBSTITUTED/.test(readFileSync(join(dir, 'calls.log'), 'utf8')),
+        `and never invoked at all:\n${readFileSync(join(dir, 'calls.log'), 'utf8')}`,
+      )
+      assert.equal(
+        readFileSync(copy, 'utf8'),
+        shipped,
+        'and the protected copy must still be the bytes the first fence published, not the replacement',
+      )
+      // AND IT SAID SO, naming both digests and the only thing that could authorise the swap.
+      assert.match(second.output, /was NOT promoted/, `the divergence must be reported:\n${second.output}`)
+      assert.match(second.output, /IMS_FENCE_SCRIPT_SHA256/, 'naming what a legitimate rotation needs')
+      // NOT FATAL, though: refusing here would let the same account stop every future cutover by
+      // writing one byte into a file it owns.
+      assert.equal(second.status, 0, `and the run must go on with the protected copy:\n${second.output}`)
+      assert.match(second.output, /FENCE_UP=true/, 'having fenced with it')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+}
+
+// ---------------------------------------------------------------------------
+// The rotation path, exercised against the library itself.
+//
+// A mechanism nobody can update is its own failure mode, so there has to be a way to move the
+// protected copy forward — and it may not be anything the checkout can produce, because the
+// checkout is what is being authenticated. These run the shipped library, against real files.
+// ---------------------------------------------------------------------------
+
+/** The library alone, pointed at a scratch directory, with a checkout beside it. */
+function rotationHarness(dirs: { app: string; recovery: string; state: string }, body: string[]): string {
+  return [
+    'set -uo pipefail',
+    // The library reports a refused promotion on stderr, because every caller reads it through a
+    // command substitution and a global set inside one dies with the subshell. Merged here so the
+    // harness sees what an operator would.
+    'exec 2>&1',
+    `source ${JSON.stringify(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'))}`,
+    `DB_FENCE_SCRIPT=${JSON.stringify(join(dirs.app, 'scripts', 'fence-db-connections.mjs'))}`,
+    `DB_FENCE_RECOVERY_DIR=${JSON.stringify(dirs.recovery)}`,
+    `DB_FENCE_IDENTITY_FILE=${JSON.stringify(join(dirs.recovery, 'db-fence-identity.env'))}`,
+    `DB_FENCE_PROTECTED_APP_DIR=${JSON.stringify(join(dirs.recovery, 'app'))}`,
+    `DB_FENCE_SCRIPT_COPY=${JSON.stringify(join(dirs.recovery, 'app', 'scripts', 'fence-db-connections.mjs'))}`,
+    `DB_FENCE_SCRIPT_STAGED=${JSON.stringify(join(dirs.recovery, 'app', 'scripts', '.fence-db-connections.mjs.staged'))}`,
+    `DB_FENCE_MODULES_LINK=${JSON.stringify(join(dirs.recovery, 'app', 'node_modules'))}`,
+    `DB_FENCE_STATE=${JSON.stringify(join(dirs.state, 'db-connect-fence.json'))}`,
+    'chown(){ :; }',
+    ...body,
+  ].join('\n')
+}
+
+function rotationDirs(): { app: string; recovery: string; state: string } {
+  const root = mkdtempSync(join(tmpdir(), 'ims-r31-rot-'))
+  mkdirSync(join(root, 'app', 'scripts'), { recursive: true })
+  mkdirSync(join(root, 'recovery'), { recursive: true })
+  mkdirSync(join(root, 'state'), { recursive: true })
+  return { app: join(root, 'app'), recovery: join(root, 'recovery'), state: join(root, 'state') }
+}
+
+const sha256 = (text: string): string =>
+  execFileSync('sha256sum', [], { input: text, encoding: 'utf8' }).split(' ')[0]
+
+test('r31: the protected helper is bootstrapped once and then only rotated by an authenticated digest', () => {
+  // MUTATION ROUTE (each verified locally):
+  //   * make publish_fence_script_copy() publish whenever ${DB_FENCE_SCRIPT} exists (r30's rule)
+  //     and case 2 fails: the protected copy becomes v2 with nothing authorising it.
+  //   * drop the `[[ "${digest}" != "${DB_FENCE_EXPECTED_SHA256}" ]]` refusal from
+  //     _fence_stage_and_publish() and case 3 fails: a wrong expected digest publishes anyway.
+  //   * delete the _fence_rewrite_record_digest() call and case 4 fails at the record assertion,
+  //     and every later run would be refused by db_fence_script_in_use() — a rotation that bricks
+  //     the mechanism is not a rotation.
+  //   * delete the ${DB_FENCE_STATE} arm and case 5 rotates the helper out from under a standing
+  //     fence, so the version that would RELEASE it is not the version that RAISED it.
+  const dirs = rotationDirs()
+  const helper = join(dirs.app, 'scripts', 'fence-db-connections.mjs')
+  const copy = join(dirs.recovery, 'app', 'scripts', 'fence-db-connections.mjs')
+  const record = join(dirs.recovery, 'db-fence-identity.env')
+  const V1 = '// v1, the shipped helper\n'
+  const V2 = '// v2, the release being deployed\n'
+  try {
+    // CASE 1 — BOOTSTRAP. Nothing protected exists, so there is nothing to substitute FOR and the
+    // checkout's bytes are published. Trust on first use, and it is named as such.
+    writeFileSync(helper, V1)
+    const bootstrap = runShell(rotationHarness(dirs, ['db_fence_script_in_use && echo']))
+    assert.equal(bootstrap.status, 0, `the bootstrap must succeed:\n${bootstrap.output}`)
+    assert.match(bootstrap.output, new RegExp(copy.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), 'and return the protected path')
+    assert.equal(readFileSync(copy, 'utf8'), V1, 'and hold the checkout bytes')
+    // The record a raised fence would have written, so the digest binding is live for the rest.
+    writeFileSync(
+      record,
+      [
+        'db_app_host=127.0.0.1',
+        'db_app_port=5432',
+        'db_app_user=imsapp',
+        'db_app_database=imsdb',
+        `fence_script_sha256=${sha256(V1)}`,
+        'fence_identity_complete=1',
+        '',
+      ].join('\n'),
+    )
+
+    // CASE 2 — THE CHECKOUT MOVES ON ITS OWN. This is the CRITICAL: the application account owns
+    // that file, so a newer version there is not evidence of anything.
+    writeFileSync(helper, V2)
+    const drift = runShell(rotationHarness(dirs, ['db_fence_script_in_use && echo']))
+    assert.equal(drift.status, 0, `a diverged checkout is not fatal:\n${drift.output}`)
+    assert.equal(readFileSync(copy, 'utf8'), V1, 'and it is NOT promoted')
+    assert.match(drift.output, /was NOT promoted/, `and the divergence is reported:\n${drift.output}`)
+    assert.match(drift.output, new RegExp(sha256(V2)), 'naming what the checkout now hashes to')
+    assert.match(drift.output, new RegExp(sha256(V1)), 'and what the protected copy hashes to')
+
+    // CASE 3 — AN EXPECTED DIGEST THAT DOES NOT MATCH THE CHECKOUT. The rotation is refused and
+    // the standing copy is untouched: an operator who was given the wrong digest, or a checkout
+    // that was tampered with between the release and the box, are the same event here.
+    const wrong = runShell(rotationHarness(dirs, [`DB_FENCE_EXPECTED_SHA256=${sha256('// something else\n')}`, 'db_fence_script_in_use && echo']))
+    assert.notEqual(wrong.status, 0, `a digest that does not match must refuse:\n${wrong.output}`)
+    assert.equal(readFileSync(copy, 'utf8'), V1, 'and change nothing')
+    assert.ok(!existsSync(join(dirs.recovery, 'app', 'scripts', '.fence-db-connections.mjs.staged')), 'and leave no staged file behind')
+
+    // CASE 4 — THE LEGITIMATE UPGRADE. The digest comes from the release, on the root invocation;
+    // the bytes are staged inside the root-owned directory, hashed THERE, and that same file is
+    // renamed into place, so the checkout cannot change between the check and the publication.
+    const rotate = runShell(rotationHarness(dirs, [`DB_FENCE_EXPECTED_SHA256=${sha256(V2)}`, 'db_fence_script_in_use && echo']))
+    assert.equal(rotate.status, 0, `the authenticated rotation must succeed:\n${rotate.output}`)
+    assert.equal(readFileSync(copy, 'utf8'), V2, 'and the protected copy moves')
+    const after = readFileSync(record, 'utf8')
+    assert.match(after, new RegExp(`^fence_script_sha256=${sha256(V2)}$`, 'm'), 'and the record binds to the file it now names')
+    assert.match(after, /^db_app_database=imsdb$/m, 'while the identity it describes is untouched')
+    assert.match(after, /^fence_identity_complete=1$/m, 'and it still ends with its sentinel')
+
+    // CASE 5 — NOT WHILE A FENCE MAY BE STANDING. The helper that raised it is the helper that
+    // has to release it, from a record the raise wrote.
+    writeFileSync(helper, '// v3\n')
+    writeFileSync(join(dirs.state, 'db-connect-fence.json'), '{}\n')
+    const held = runShell(rotationHarness(dirs, [`DB_FENCE_EXPECTED_SHA256=${sha256('// v3\n')}`, 'db_fence_script_in_use && echo']))
+    assert.equal(readFileSync(copy, 'utf8'), V2, 'a standing fence blocks the rotation')
+    assert.match(held.output, /Release the fence first/, `and says why:\n${held.output}`)
+    assert.equal(held.status, 0, 'without failing the run, which still has a fence to release')
+  } finally {
+    rmSync(join(dirs.app, '..'), { recursive: true, force: true })
+  }
+})
+
+test('r31: a protected copy removed by root is not silently reminted from the checkout', () => {
+  // Only root can delete out of ${DB_FENCE_RECOVERY_DIR}, so a record naming a copy that is GONE
+  // is not a bootstrap — it is a state the application account cannot have produced. Publishing a
+  // fresh copy there would both promote application bytes and leave a copy that can never match
+  // the record again, refusing every run after this one.
+  //
+  // MUTATION ROUTE: move the `recorded`/`-f` check in db_fence_script_in_use() to AFTER the
+  // publish_fence_script_copy() call and this fails on both assertions — a copy appears, and the
+  // run is then refused for a mismatch it created itself.
+  const dirs = rotationDirs()
+  const copy = join(dirs.recovery, 'app', 'scripts', 'fence-db-connections.mjs')
+  try {
+    writeFileSync(join(dirs.app, 'scripts', 'fence-db-connections.mjs'), '// v1\n')
+    writeFileSync(
+      join(dirs.recovery, 'db-fence-identity.env'),
+      `db_app_host=127.0.0.1\ndb_app_port=5432\ndb_app_user=imsapp\ndb_app_database=imsdb\nfence_script_sha256=${sha256('// v1\n')}\nfence_identity_complete=1\n`,
+    )
+    const result = runShell(rotationHarness(dirs, ['db_fence_script_in_use && echo']))
+    assert.notEqual(result.status, 0, `a record with no copy must refuse:\n${result.output}`)
+    assert.match(result.output, /Only root can remove it/, 'saying what that state means')
+    assert.ok(!existsSync(copy), 'and no replacement may be minted from the application checkout')
+  } finally {
+    rmSync(join(dirs.app, '..'), { recursive: true, force: true })
+  }
+})
+
+test('r31: a dry run probes a root-owned snapshot, publishes nothing, and cleans up after itself', () => {
+  // --dry-run may not write under /etc, and it may not run the checkout's file in place either:
+  // --preflight opens the admin connection with DEPLOY_ADMIN_DATABASE_URL, so "it only reads" is a
+  // property of the SHIPPED script and not of whatever is at that path.
+  //
+  // MUTATION ROUTE: make db_fence_probe_script() return ${DB_FENCE_SCRIPT} when there is no
+  // protected copy — which is what update.sh did before r31 — and the first two assertions fail.
+  // Delete the db_fence_probe_cleanup call and the last one fails.
+  const dirs = rotationDirs()
+  try {
+    writeFileSync(join(dirs.app, 'scripts', 'fence-db-connections.mjs'), '// v1\n')
+    const probe = runShell(
+      rotationHarness(dirs, [
+        'db_fence_probe_script || { echo "PROBE_FAILED"; exit 1; }',
+        'echo "PROBE=${DB_FENCE_PROBE_SCRIPT}"',
+        'echo "TEMP=${DB_FENCE_PROBE_TEMP}"',
+        'echo "CONTENT=$(cat "${DB_FENCE_PROBE_SCRIPT}")"',
+        'db_fence_probe_cleanup',
+        'echo "AFTER=$([[ -e "${DB_FENCE_PROBE_TEMP:-/nonexistent}" ]] && echo present || echo gone)"',
+      ]),
+    )
+    assert.equal(probe.status, 0, `the probe must resolve something:\n${probe.output}`)
+    const probed = /^PROBE=(.*)$/m.exec(probe.output)?.[1] ?? ''
+    assert.notEqual(probed, join(dirs.app, 'scripts', 'fence-db-connections.mjs'), 'never the checkout file in place')
+    assert.match(probe.output, /^CONTENT=\/\/ v1$/m, 'but the same bytes, snapshotted')
+    assert.ok(!existsSync(join(dirs.recovery, 'app')), 'and a dry run publishes nothing under the protected directory')
+    assert.match(probe.output, /^AFTER=gone$/m, 'and the snapshot is removed when it is done with')
+  } finally {
+    rmSync(join(dirs.app, '..'), { recursive: true, force: true })
+  }
+})
