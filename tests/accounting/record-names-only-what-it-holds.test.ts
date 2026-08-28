@@ -2900,6 +2900,24 @@ test('ROUND 20 (Codex HIGH): every string the renderer emits is one written out 
   // whatever the renderer returns. Run as a control immediately below, so the claim is demonstrated.
   assertRenderedInventory((direction) => renderLocalDirection(direction, LOCAL_DIRECTION_CONTEXT))
 
+  // AND WITH THE REAL LEDGER NAMES PRODUCTION SUPPLIES (round 22, Codex HIGH), normalised back the
+  // way the corpus is. The placeholder context is a FIXTURE: a branch selected by comparing
+  // `context.ledger` against 'QuickBooks' or 'Xero' is never taken while it is what renders, so
+  // rendering only with it leaves exactly the branch production takes unexercised.
+  for (const ledger of ['QuickBooks', 'Xero']) {
+    assertRenderedInventory((direction) => normaliseRenderedValues(
+      renderLocalDirection(direction, { ledger, syncRowId: 'log-1' }),
+    ))
+  }
+  for (const { sequence, text } of RENDERED_DIRECTION_SEQUENCES) {
+    for (const ledger of ['QuickBooks', 'Xero']) {
+      assert.equal(
+        normaliseRenderedValues(renderLocalDirectionSequence(sequence, { ledger, syncRowId: 'log-1' })), text,
+        'a sequence renders something other than its reviewed sentence once a real ledger name is in the context',
+      )
+    }
+  }
+
   // The sequences too: the conjunction is prose, and it is nobody's element.
   assert.equal(RENDERED_DIRECTION_SEQUENCES.length, LOCAL_DIRECTION_SEQUENCES.length)
   for (const { sequence, text } of RENDERED_DIRECTION_SEQUENCES) {
@@ -2991,15 +3009,46 @@ test('ROUND 20 (Codex HIGH): every string the renderer emits is one written out 
  * WHAT IS NOT AN OFFENCE, and why. A TYPE emits no value, so type nodes are never descended into and
  * a literal type is read as the closed set of values it stands for rather than as prose. A
  * CONDITION is not an emitted value either: when this walk cannot decide one it takes BOTH branches,
- * which is the fail-closed direction for a branch selector. And the two fields of
- * `LocalDirectionContext` are bound to the placeholders `LOCAL_DIRECTION_CONTEXT` substitutes —
- * `{ledger}` and `{syncRowId}` — because that is exactly what the reviewed inventory was written
- * against, and it is the same binding the runtime equality check above renders with.
+ * which is the fail-closed direction for a branch selector.
+ *
+ * AND THE TWO CONTEXT FIELDS ARE SYMBOLIC, NOT CONCRETE (round 22, Codex HIGH). They used to be
+ * bound to the literal strings `{ledger}` and `{syncRowId}` — the placeholders
+ * `LOCAL_DIRECTION_CONTEXT` substitutes — because those are what the reviewed inventory is written
+ * against. But a literal is a value this walk KNOWS, so `context.ledger === 'QuickBooks'` folded to
+ * FALSE and the arm behind it was PRUNED: a branch reachable only at run time (production supplies
+ * `ledger: 'QuickBooks'` and `ledger: 'Xero'`) was never evaluated, and whatever it emitted was
+ * never compared against the inventory. That is the defect this walk exists to remove, one level in
+ * — the checks it replaced could not SEE certain output; this one DECIDED IT DID NOT EXIST.
+ *
+ * So a context field is a `SYMBOL` segment. It still renders as its placeholder wherever it is
+ * concatenated (`renderedOf`), so the inventory comparison is unchanged; but it is not a constant
+ * (`constantOf` returns null), so any comparison or other control-flow use of it is INDETERMINATE
+ * and both arms are evaluated and both outputs judged. THE RULE, stated once: a value that is
+ * unknown at analysis time must make its condition indeterminate, NEVER false.
+ *
+ * The only other stand-ins this walk binds are already sound under that rule. A function parameter
+ * with no argument is `OPAQUE` (never a string, so never one constant, so never decidable); a list
+ * parameter becomes an `OPEN_LIST` carrying only its type's length FLOOR, and reading `.length` off
+ * one is `UNKNOWN` rather than a number; a discriminant read off an `OPAQUE` value is resolved from
+ * the CHECKER's literal type, which folds only when the type itself admits exactly one string —
+ * which is knowledge about the program, not a stand-in for a runtime value.
+ *
+ * `contextBinding` exists ONLY so a control can re-run this walk with the pre-fix concrete binding
+ * and demonstrate that the branch is pruned again. Nothing else passes anything but `'SYMBOLIC'`.
  */
 
 /** A run of the value a renderer can emit. */
 type Segment =
   | { kind: 'TEXT'; text: string }
+  /**
+   * A VALUE THAT IS NOT KNOWN UNTIL RUN TIME (round 22, Codex HIGH) — a field of
+   * `LocalDirectionContext`. It RENDERS as `placeholder`, which is the form the reviewed inventory
+   * is written in, and that is the ONLY thing it may be used for. It is deliberately NOT a `TEXT`
+   * run: a `TEXT` run is a string this walk KNOWS, and knowing it makes a comparison against it
+   * decidable. See `constantOf` against `renderedOf` below — the whole of the fix is that those two
+   * are different functions.
+   */
+  | { kind: 'SYMBOL'; name: string; placeholder: string }
   /**
    * A `join` over a list whose length is not known: one of `alternatives`, then `separator` and
    * another, at least `minimum` times. `renderLocalDirectionSequence` is the only one of these.
@@ -3031,6 +3080,13 @@ type ComputedRendererOutput = {
   unresolved: readonly string[]
 }
 
+/**
+ * How the two `LocalDirectionContext` fields are bound. `'SYMBOLIC'` is what ships and what every
+ * judgement uses; `'CONCRETE'` reproduces the round-21 binding — the fields as the literal strings
+ * `{ledger}` and `{syncRowId}` — and exists only so control (J) can show what that binding let past.
+ */
+type ContextBinding = 'SYMBOLIC' | 'CONCRETE'
+
 /** The three intrinsics this walk will evaluate, and only over a list it computed itself. */
 const INTRINSIC_LIST_OPERATIONS = ['join', 'slice', 'map'] as const
 
@@ -3058,12 +3114,36 @@ function concatShapes(left: readonly Shape[], right: readonly Shape[]): readonly
   return out
 }
 
-/** The string a shape IS, or null when it holds a REPEAT and therefore stands for many. */
+/**
+ * THE STRING A SHAPE *IS* — null when any part of it is not known at analysis time, which a SYMBOL
+ * and a REPEAT both are. This is the DECIDABILITY question: a `===` may only be folded when both
+ * sides are one of these, so a comparison against a context field is indeterminate and both arms of
+ * the conditional it selects get evaluated.
+ */
 function constantOf(shape: Shape): string | null {
   let text = ''
   for (const segment of shape) {
     if (segment.kind !== 'TEXT') return null
     text += segment.text
+  }
+  return text
+}
+
+/**
+ * THE STRING A SHAPE *RENDERS AS* — a SYMBOL contributes its placeholder, because `{ledger}` and
+ * `{syncRowId}` are exactly what the reviewed inventory was written against. Null only for a REPEAT,
+ * which stands for many strings rather than one.
+ *
+ * This is the JUDGEMENT question, and it is a different question from the one above. A context field
+ * renders as a placeholder AND is undecidable in a condition; collapsing the two into one notion is
+ * what let a runtime-only branch be pruned (round 22, Codex HIGH).
+ */
+function renderedOf(shape: Shape): string | null {
+  let text = ''
+  for (const segment of shape) {
+    if (segment.kind === 'TEXT') { text += segment.text; continue }
+    if (segment.kind === 'SYMBOL') { text += segment.placeholder; continue }
+    return null
   }
   return text
 }
@@ -3074,6 +3154,7 @@ function patternOf(shape: Shape): RegExp {
   let source = ''
   for (const segment of shape) {
     if (segment.kind === 'TEXT') { source += escape(segment.text); continue }
+    if (segment.kind === 'SYMBOL') { source += escape(segment.placeholder); continue }
     const alternatives = `(?:${segment.alternatives.map(escape).join('|')})`
     source += `${alternatives}(?:${escape(segment.separator)}${alternatives}){${Math.max(segment.minimum - 1, 0)},}`
   }
@@ -3083,9 +3164,11 @@ function patternOf(shape: Shape): RegExp {
 /** What a shape LOOKS like, for a failure message. */
 function describeShape(shape: Shape): string {
   return shape
-    .map((segment) => (segment.kind === 'TEXT'
-      ? segment.text
-      : `<one of ${segment.alternatives.length} sentences, joined by ${JSON.stringify(segment.separator)}>`))
+    .map((segment) => {
+      if (segment.kind === 'TEXT') return segment.text
+      if (segment.kind === 'SYMBOL') return segment.placeholder
+      return `<one of ${segment.alternatives.length} sentences, joined by ${JSON.stringify(segment.separator)}>`
+    })
     .join('')
 }
 
@@ -3130,7 +3213,11 @@ function directionModelProgram(model: string, extraFiles: Record<string, string>
 /** A callee this walk is willing to read: something with a body in a file that is not a declaration. */
 type Implementation = ts.FunctionDeclaration | ts.MethodDeclaration | ts.ArrowFunction | ts.FunctionExpression
 
-function computeRendererOutput(model: string, extraFiles: Record<string, string> = {}): ComputedRendererOutput {
+function computeRendererOutput(
+  model: string,
+  extraFiles: Record<string, string> = {},
+  contextBinding: ContextBinding = 'SYMBOLIC',
+): ComputedRendererOutput {
   const program = directionModelProgram(model, extraFiles)
   const checker = program.getTypeChecker()
   const modelPath = path.resolve(process.cwd(), DIRECTION_MODEL_FILE)
@@ -3149,15 +3236,24 @@ function computeRendererOutput(model: string, extraFiles: Record<string, string>
   const unknown = (reason: string): UnknownValue => ({ kind: 'UNKNOWN', reason })
   const text = (value: string): StringValue => ({ kind: 'STRING', shapes: [shapeOf([{ kind: 'TEXT', text: value }])] })
 
+  /** A value that RENDERS as `placeholder` and is otherwise not known — see the `SYMBOL` segment. */
+  const symbolic = (name: string, placeholder: string): StringValue => (
+    { kind: 'STRING', shapes: [shapeOf([{ kind: 'SYMBOL', name, placeholder }])] }
+  )
+
   /**
-   * The two values a direction's prose varies by, bound to the placeholders the reviewed inventory
-   * was written against — the same substitution `LOCAL_DIRECTION_CONTEXT` makes at run time.
+   * The two values a direction's prose varies by. SYMBOLIC (round 22, Codex HIGH): they render as
+   * the placeholders the reviewed inventory is written against, and they decide no condition, so a
+   * branch selected by comparing one against a real ledger name is evaluated on BOTH arms.
    */
+  const contextField = (name: string, placeholder: string): StringValue => (
+    contextBinding === 'SYMBOLIC' ? symbolic(name, placeholder) : text(placeholder)
+  )
   const CONTEXT_VALUE: ObjectValue = {
     kind: 'OBJECT',
     properties: new Map<string, Value>([
-      ['ledger', text(LOCAL_DIRECTION_CONTEXT.ledger)],
-      ['syncRowId', text(LOCAL_DIRECTION_CONTEXT.syncRowId)],
+      ['ledger', contextField('context.ledger', LOCAL_DIRECTION_CONTEXT.ledger)],
+      ['syncRowId', contextField('context.syncRowId', LOCAL_DIRECTION_CONTEXT.syncRowId)],
     ]),
   }
 
@@ -3324,9 +3420,11 @@ function computeRendererOutput(model: string, extraFiles: Record<string, string>
         return unknown('a `join` over a list that may be EMPTY, whose value would then be the empty string — a '
           + 'shape cannot express "or nothing at all", so this is refused rather than under-described')
       }
-      const alternatives = receiver.element.shapes.map(constantOf)
+      // `renderedOf`, not `constantOf`: an element carrying a context placeholder is one sentence a
+      // reviewer has read, and it is only a REPEAT — many sentences — that cannot be joined here.
+      const alternatives = receiver.element.shapes.map(renderedOf)
       if (alternatives.some((alternative) => alternative === null)) {
-        return unknown('a `join` over a list whose elements are not themselves constants')
+        return unknown('a `join` over a list whose elements do not each render as one sentence')
       }
       return {
         kind: 'STRING',
@@ -3541,7 +3639,11 @@ function computeRendererOutput(model: string, extraFiles: Record<string, string>
           const equal = a === b
           return { kind: 'BOOLEAN', value: operator === ts.SyntaxKind.EqualsEqualsEqualsToken ? equal : !equal }
         }
-        return unknown('a comparison this walk cannot decide')
+        // NOT DECIDED, so not decided AGAINST either. A context field reaches here (it renders as a
+        // placeholder but is no constant), and so does anything else this walk does not know: the
+        // conditional above will take both arms, which is the only safe reading of a value that is
+        // chosen at run time.
+        return unknown('a comparison this walk cannot decide, so the branch it selects is taken both ways')
       }
       return unknown(`a \`${ts.tokenToString(operator)}\` this walk does not evaluate`)
     }
@@ -3623,12 +3725,16 @@ function computeRendererOutput(model: string, extraFiles: Record<string, string>
  * EVERY COMPLAINT THE COMPUTED OUTPUT RAISES AGAINST A MODEL. One function, so the controls below
  * run exactly the judgement the shipped model is held to rather than a paraphrase of it.
  */
-function judgeRendererOutput(model: string, extraFiles: Record<string, string> = {}): string[] {
-  const computed = computeRendererOutput(model, extraFiles)
+function judgeRendererOutput(
+  model: string,
+  extraFiles: Record<string, string> = {},
+  contextBinding: ContextBinding = 'SYMBOLIC',
+): string[] {
+  const computed = computeRendererOutput(model, extraFiles, contextBinding)
   const reviewed = RENDERED_DIRECTIONS.map((entry) => entry.text)
   const complaints = [...computed.unresolved]
   for (const shape of computed.direction) {
-    const value = constantOf(shape)
+    const value = renderedOf(shape)
     if (value === null) {
       complaints.push(`a direction sentence that is not one computable constant: ${describeShape(shape)}`)
       continue
@@ -3636,7 +3742,7 @@ function judgeRendererOutput(model: string, extraFiles: Record<string, string> =
     if (!reviewed.includes(value)) complaints.push(`emits a sentence nobody reviewed: ${JSON.stringify(value)}`)
   }
   for (const value of reviewed) {
-    if (!computed.direction.some((shape) => constantOf(shape) === value)) {
+    if (!computed.direction.some((shape) => renderedOf(shape) === value)) {
       complaints.push(`a reviewed sentence this renderer cannot emit: ${JSON.stringify(value)}`)
     }
   }
@@ -3666,7 +3772,7 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
   // RENDERED_DIRECTIONS.
   //
   // Mutation: change any branch's prose, in any way, anywhere it is composed from, and this fails
-  // naming the value it now emits. Nine controls below (A-I), including the two Codex named.
+  // naming the value it now emits. Ten controls below (A-J), including the three Codex named.
   const model = await readFile(path.join(process.cwd(), DIRECTION_MODEL_FILE), 'utf8')
   const computed = computeRendererOutput(model)
 
@@ -3680,14 +3786,14 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
   // (1) EVERY VALUE IS A CONSTANT. The direction renderer takes no free parameter, so there is
   // nothing left for it to emit that a reader cannot be shown in full.
   assert.deepEqual(
-    computed.direction.filter((shape) => constantOf(shape) === null).map(describeShape), [],
+    computed.direction.filter((shape) => renderedOf(shape) === null).map(describeShape), [],
     'a direction sentence is not one computable constant. Every parameter a direction carries is enumerated, '
     + 'so an unbounded value here means one of them stopped being',
   )
 
   // (2) AND THE SET OF THEM IS THE REVIEWED INVENTORY, BOTH WAYS.
   const reviewed = RENDERED_DIRECTIONS.map((entry) => entry.text)
-  const emitted = [...new Set(computed.direction.map((shape) => constantOf(shape)!))]
+  const emitted = [...new Set(computed.direction.map((shape) => renderedOf(shape)!))]
   assert.ok(emitted.length >= LOCAL_DIRECTIONS.length, `only ${emitted.length} values were computed — the walk read nothing`)
   assert.deepEqual(
     emitted.filter((value) => !reviewed.includes(value)), [],
@@ -3918,5 +4024,80 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
   assert.ok(
     judgeRendererOutput(viaSequenceConjunction).some((complaint) => complaint.includes('reviewed sequence')),
     'CONTROL: the conjunction the sequence renderer contributes is judged too, because it is nobody\'s element',
+  )
+
+  // (J) A BRANCH SELECTED BY A CONTEXT VALUE — THE ROUND-22 ROUTE (Codex HIGH), and the one control
+  // here that is about the EVALUATOR rather than about the renderer. `context.ledger` is not known
+  // until run time; production supplies 'QuickBooks' and 'Xero'. While the walk bound that field to
+  // the concrete string `{ledger}`, this comparison folded to FALSE, the QuickBooks arm was PRUNED,
+  // and the instruction behind it was never compared against the inventory by anything.
+  const viaRuntimeLedger = model.replace(
+    "    case 'CONFIRM':\n      return 'confirm the invoice PDF stored against the order is the document you expect'",
+    "    case 'CONFIRM':\n      return context.ledger === 'QuickBooks'\n        ? '" + UNDECLARED_REMOTE_ACTION
+    + "'\n        : 'confirm the invoice PDF stored against the order is the document you expect'",
+  )
+  assert.notEqual(viaRuntimeLedger, model, 'the runtime-ledger mutation must actually have been applied')
+  const runtimeLedgerComplaints = judgeRendererOutput(viaRuntimeLedger)
+  assert.ok(
+    runtimeLedgerComplaints.some((complaint) => complaint.startsWith('emits a sentence nobody reviewed')
+      && complaint.includes('take the second PDF off it')),
+    'CONTROL: a branch reachable only at run time — selected by comparing a context field against a real '
+    + 'ledger name — must be EVALUATED, not decided away. Both arms are taken because the comparison is '
+    + `indeterminate, and both outputs are judged. Saw: ${JSON.stringify(runtimeLedgerComplaints)}`,
+  )
+
+  // ...AND THE BINDING IS WHAT CATCHES IT, asserted rather than described. Re-run the SAME judgement
+  // over the SAME mutated renderer with the context fields bound to concrete strings — the round-21
+  // representation — and it reports a clean inventory while the QuickBooks arm ships. That is the
+  // mutation of the evaluator itself, and it is the reason `constantOf` and `renderedOf` are two
+  // functions rather than one.
+  assert.deepEqual(
+    judgeRendererOutput(viaRuntimeLedger, {}, 'CONCRETE'), [],
+    'THE PRE-FIX BINDING MUST STILL LET IT THROUGH — if concrete binding also refused this, control (J) '
+    + 'would be passing for some other reason and would prove nothing about the symbolic representation',
+  )
+
+  // ...and neither does binding it to the OTHER real ledger name rescue the concrete reading: pick a
+  // stand-in and you have chosen which runtime branch to be blind to, whichever one you pick.
+  const viaRuntimeLedgerXero = model.replace(
+    "    case 'CONFIRM':\n      return 'confirm the invoice PDF stored against the order is the document you expect'",
+    "    case 'CONFIRM':\n      return context.ledger === 'Xero'\n        ? '" + UNDECLARED_REMOTE_ACTION
+    + "'\n        : 'confirm the invoice PDF stored against the order is the document you expect'",
+  )
+  assert.notEqual(viaRuntimeLedgerXero, model, 'the Xero runtime-ledger mutation must actually have been applied')
+  assert.ok(
+    judgeRendererOutput(viaRuntimeLedgerXero).some((complaint) => complaint.startsWith('emits a sentence nobody '
+      + 'reviewed') && complaint.includes('take the second PDF off it')),
+    'CONTROL: and the same for the other ledger this installation runs',
+  )
+  assert.deepEqual(judgeRendererOutput(viaRuntimeLedgerXero, {}, 'CONCRETE'), [])
+
+  // ...and the same route through the OTHER context field, so the fix is the representation and not
+  // one special-cased property name.
+  const viaRuntimeSyncRow = model.replace(
+    "    case 'CONFIRM':\n      return 'confirm the invoice PDF stored against the order is the document you expect'",
+    "    case 'CONFIRM':\n      return context.syncRowId === 'log-1'\n        ? '" + UNDECLARED_REMOTE_ACTION
+    + "'\n        : 'confirm the invoice PDF stored against the order is the document you expect'",
+  )
+  assert.notEqual(viaRuntimeSyncRow, model, 'the runtime-syncRowId mutation must actually have been applied')
+  assert.ok(
+    judgeRendererOutput(viaRuntimeSyncRow).some((complaint) => complaint.startsWith('emits a sentence nobody '
+      + 'reviewed') && complaint.includes('take the second PDF off it')),
+    'CONTROL: `syncRowId` is a runtime value too, and it selects a branch the same way',
+  )
+  assert.deepEqual(judgeRendererOutput(viaRuntimeSyncRow, {}, 'CONCRETE'), [])
+
+  // ...and a context field still RENDERS as its placeholder, which is the half that must NOT have
+  // changed: every reviewed sentence that carries one is still emittable, and the shipped model
+  // above raised nothing. Held here explicitly so a later round cannot "fix" the symbol by dropping
+  // the placeholder and quietly turn the inventory comparison vacuous.
+  assert.ok(
+    reviewed.some((value) => value.includes('{ledger}')) && reviewed.some((value) => value.includes('{syncRowId}')),
+    'the inventory must still contain placeholder-bearing sentences, or (J) is checking nothing',
+  )
+  assert.ok(
+    emitted.some((value) => value.includes('{ledger}')) && emitted.some((value) => value.includes('{syncRowId}')),
+    'and the walk must still COMPUTE them with the placeholders in place — a symbol that renders as nothing '
+    + 'would make every context-bearing sentence unemittable rather than undecidable',
   )
 })
