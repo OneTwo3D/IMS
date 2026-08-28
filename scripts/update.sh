@@ -2659,7 +2659,24 @@ require_fenceable_database() {
   # A dry run stops nothing and migrates nothing, so it REPORTS the refusal instead of being
   # it: the point of --dry-run is to find out what a real run would do.
   if $DRY_RUN; then
+    # THE CANDIDATE DIGEST FIRST, BEFORE ANY REFUSAL BELOW CAN RETURN (o3d-2sm1.5 r34, Codex
+    # CRITICAL). IMS_FENCE_ARTEFACT_SHA256 is a REQUIRED input now, not a hardening, and the host
+    # that has to produce it is the release build host — which has no DEPLOY_ADMIN_DATABASE_URL,
+    # no database and no fence to raise. If the value only appeared after those checks passed,
+    # the one machine that is supposed to publish it could never print it.
+    #
+    # AND IT IS COMPUTED BY READING, NOT BY RUNNING (the same finding). db_fence_probe_script()
+    # assembles the checkout's helper and its closure into a root-owned throwaway and hashes it;
+    # it hands back something to EXECUTE only when the standing artefact is the authenticated one
+    # or when IMS_FENCE_ARTEFACT_SHA256 authenticates the candidate. Otherwise
+    # ${DB_FENCE_PROBE_SCRIPT} is empty, and this run preflights nothing rather than handing an
+    # administrative credential to bytes the application account chose.
+    local probe_rc=0 probe_line
+    db_fence_probe_script || probe_rc=1
+    while IFS= read -r probe_line; do warn "${probe_line}"; done < <(db_fence_probe_report)
+
     if [[ -z "${DEPLOY_ADMIN_DATABASE_URL}" ]] || { [[ ! -f "${DB_FENCE_SCRIPT}" ]] && [[ ! -f "${DB_FENCE_SCRIPT_COPY}" ]]; } || [[ ! -f "${DB_OBJECT_ACCESS_SCRIPT}" ]]; then
+      db_fence_probe_cleanup
       warn "A REAL RUN WOULD BE REFUSED HERE: the migration window cannot be fenced."
       warn "DEPLOY_ADMIN_DATABASE_URL is not set (or fence-db-connections.mjs is missing), so CONNECT"
       warn "could not be revoked for the window and nothing would stop a client attaching across the"
@@ -2667,6 +2684,7 @@ require_fenceable_database() {
       return 0
     fi
     if ! require_db_identity; then
+      db_fence_probe_cleanup
       warn "A REAL RUN WOULD BE REFUSED HERE: the application's connection identity could not be"
       warn "read from DATABASE_URL in ${APP_DIR}/.env — ${DB_IDENTITY_REASON}."
       warn "The fence is TOLD which host, port, role and database it closes; it does not work that"
@@ -2675,6 +2693,7 @@ require_fenceable_database() {
       return 0
     fi
     if ! require_env_file_is_sole_definition; then
+      db_fence_probe_cleanup
       warn "A REAL RUN WOULD BE REFUSED HERE: ${DB_IDENTITY_SOURCE_REASON}."
       warn "The identity the fence is given is read from ${APP_DIR}/.env, so anything else that can"
       warn "define DATABASE_URL for the service means the fence and the application could be talking"
@@ -2685,34 +2704,28 @@ require_fenceable_database() {
     # actually answered is the whole point of --dry-run. Not fatal here: a dry run that cannot
     # reach the database still exits 0, having said so.
     #
-    # THE SAME PRECEDENCE AS EVERY OTHER MODE, MINUS THE PUBLICATION (o3d-2sm1.5 r30/r31). The
-    # root-owned copy wins whenever there is one — a dry run on a box mid-recovery must probe with
-    # the script the fence was raised by, not with whatever is in the checkout now. It does not
-    # PUBLISH one when there is none: a dry run writes nothing, least of all under /etc. But it no
-    # longer runs the checkout's file IN PLACE either (r31): --preflight opens the admin connection
-    # with DEPLOY_ADMIN_DATABASE_URL, and "it only reads" is a property of the SHIPPED script and
-    # not of whatever is at that path. db_fence_probe_script() snapshots the checkout's bytes into
-    # a throwaway ROOT-OWNED directory and returns that, so the file that runs cannot change
-    # between this line and the exec, and nothing durable is written.
-    local dry_rc=0
-    db_fence_probe_script || {
-      warn "A REAL RUN WOULD BE REFUSED HERE: there is no fence script this run could execute."
-      warn "Nothing has been changed by this dry run."
+    # WHAT IT MAY RUN IT WITH IS NOT THIS SCRIPT'S CHOICE. db_fence_probe_script() decided that
+    # above, and an empty ${DB_FENCE_PROBE_SCRIPT} means "nothing here is authenticated enough to
+    # be handed DEPLOY_ADMIN_DATABASE_URL". r33 answered that case by snapshotting the checkout
+    # into a root-owned throwaway and running it, which froze the bytes without authenticating
+    # them: a substituted `pg` in the checkout stole the credential from an operator following the
+    # printed digest-discovery instructions. So the dry run now reports the refusal instead of
+    # being the vulnerability (o3d-2sm1.5 r34, Codex CRITICAL).
+    if [[ "${probe_rc}" -ne 0 ]] || [[ -z "${DB_FENCE_PROBE_SCRIPT}" ]]; then
+      warn "A REAL RUN WOULD NOT PREFLIGHT THE DATABASE FROM HERE, AND NEITHER DID THIS ONE:"
+      warn "${DB_FENCE_PROBE_REASON:-there is no fence script this run is willing to execute.}"
+      warn "The preflight is the only part of a dry run that opens the admin connection, so nothing"
+      warn "was executed with DEPLOY_ADMIN_DATABASE_URL. Nothing has been changed by this dry run."
+      db_fence_probe_cleanup
       return 0
-    }
-    if [[ "${DB_FENCE_PROBE_SCRIPT}" == "${DB_FENCE_SCRIPT_COPY}" ]]; then
-      warn "A fence raised by an earlier run is recorded here, so this dry run probes with the"
-      warn "root-owned copy of the fence script at ${DB_FENCE_PROBE_SCRIPT} rather than the checkout's."
     fi
-    # AND WHAT IT WOULD HASH TO. "Supply IMS_FENCE_ARTEFACT_SHA256" is only an instruction if
-    # there is somewhere to get the value BEFORE the first publication; the probe assembles the
-    # same tree the real run would publish and writes nothing, so this is that somewhere
-    # (o3d-2sm1.5 r33, Codex CRITICAL).
-    if [[ -n "${DB_FENCE_PROBE_ARTEFACT_SHA256}" ]]; then
-      warn "The fence artefact this box would run hashes to ${DB_FENCE_PROBE_ARTEFACT_SHA256} — that is"
-      warn "the value IMS_FENCE_ARTEFACT_SHA256 pins, and this run assembled it without writing anything."
-      warn "Compare it against the release before pinning with it: it was assembled from a checkout the"
-      warn "application account can write, which is the thing the pin exists to stop trusting."
+    local dry_rc=0
+    if [[ "${DB_FENCE_PROBE_SCRIPT}" == "${DB_FENCE_SCRIPT_COPY}" ]]; then
+      warn "This dry run probes with the root-owned artefact at ${DB_FENCE_PROBE_SCRIPT}, which is the"
+      warn "tree this box already publishes and verifies — not with the checkout's copy."
+    else
+      warn "This dry run probes with a throwaway copy of the tree IMS_FENCE_ARTEFACT_SHA256 named,"
+      warn "which is the only checkout-derived tree it will execute with the admin credential."
     fi
     run_as_user "${APP_USER}" env \
       DATABASE_URL="${DATABASE_URL}" \
