@@ -889,6 +889,104 @@ resolve_db_identity "$(env_file_value DATABASE_URL "${APP_DIR_REAL}/.env")" || t
 DB_FENCE_RELEASE_CMD="$(db_fence_release_cmd)"
 
 # ---------------------------------------------------------------------------
+# AND RE-READ, BECAUSE SYSTEMD READS THAT FILE LATER THAN THIS DID
+# (o3d-2sm1.5 r22, Codex HIGH).
+#
+# The line above is the ONLY read, and it happens while the predecessor is still serving —
+# before the build, before the stop, before the migration. `EnvironmentFile=` is read by systemd
+# at the moment it EXECS the service, at the far end of that window. r21's sole-source check
+# closed "is this the file the service uses?" by asking the bus; it compares the configured PATH,
+# and a path is not its contents. So an atomic replacement, a `rm`, or a symlink retarget in
+# between still moves the connection: this run fences and migrates database A, and the service
+# starts on database B. The shipped units load the file with a leading `-`, which makes a MISSING
+# file skipped rather than fatal — so a deletion does not even fail loudly, it hands the
+# application back to its own dotenv overlays, the exact composition r19 stopped reproducing.
+#
+# THIS IS NOT A RETURN TO INFERRING THE ENVIRONMENT. Nothing new is consulted and no precedence
+# is reproduced: the file is still the single configured source, still proven sole by the bus
+# read, and still parsed by the same strict reader with the same refusals. What changes is WHEN.
+# A value read once and used much later is a time-of-check/time-of-use gap, which is the defect
+# class the sibling branch closed on its dispatch fence — and the answer is the same one: re-run
+# the check at the point of use rather than trusting the cached answer.
+#
+# THE PINNED IDENTITY IS THE BASELINE, AND IT NEVER MOVES. Every re-read is compared against
+# these four values and never adopted over them, because everything this run has already done —
+# the fence it raised, the database it migrated, the release command it printed — is about THIS
+# database. A file that has come to say something else is a refusal, not a new instruction.
+DB_IDENTITY_PINNED_HOST="$DB_IDENTITY_HOST"
+DB_IDENTITY_PINNED_PORT="$DB_IDENTITY_PORT"
+DB_IDENTITY_PINNED_USER="$DB_IDENTITY_USER"
+DB_IDENTITY_PINNED_DATABASE="$DB_IDENTITY_DATABASE"
+DB_IDENTITY_DRIFT_REASON="the environment file has not been re-read yet"
+
+# Re-read ${APP_DIR_REAL}/.env and require it to still state the pinned identity.
+#
+# IT RESTORES THE GLOBALS IT BORROWS, unconditionally. resolve_db_identity() writes
+# DB_IDENTITY_* and CLEARS DB_FENCE_IDENTITY_ARGS as its first act, and those arguments are what
+# release_db_connections() and the exit trap's re-fence are built from. A re-read that failed and
+# left them empty would disarm the release on the one path where the fence is standing — turning
+# a detection into the outage it exists to prevent.
+env_file_identity_unchanged() {
+  local env_file="${APP_DIR_REAL}/.env"
+  DB_IDENTITY_DRIFT_REASON=""
+
+  if [[ -z "${DB_IDENTITY_PINNED_HOST}${DB_IDENTITY_PINNED_PORT}${DB_IDENTITY_PINNED_USER}${DB_IDENTITY_PINNED_DATABASE}" ]]; then
+    DB_IDENTITY_DRIFT_REASON="no connection identity was pinned when this run started, so there is nothing to re-read ${env_file} against"
+    return 1
+  fi
+  if [[ ! -e "$env_file" ]]; then
+    DB_IDENTITY_DRIFT_REASON="${env_file} no longer exists. The service units load it with a leading '-', so systemd SKIPS a missing environment file instead of failing on it, and the application would start on whatever its own dotenv overlays supply — not on the database this run fenced and migrated"
+    return 1
+  fi
+  if [[ ! -f "$env_file" || ! -r "$env_file" ]]; then
+    DB_IDENTITY_DRIFT_REASON="${env_file} is no longer a readable regular file, so what it will give the service when systemd execs it cannot be read here"
+    return 1
+  fi
+
+  local saved_host="$DB_IDENTITY_HOST" saved_port="$DB_IDENTITY_PORT"
+  local saved_user="$DB_IDENTITY_USER" saved_database="$DB_IDENTITY_DATABASE"
+  local saved_reason="$DB_IDENTITY_REASON"
+  local -a saved_args=()
+  if [[ "${#DB_FENCE_IDENTITY_ARGS[@]}" -gt 0 ]]; then saved_args=("${DB_FENCE_IDENTITY_ARGS[@]}"); fi
+
+  local rc=0
+  resolve_db_identity "$(env_file_value DATABASE_URL "$env_file")" || rc=$?
+  local now_host="$DB_IDENTITY_HOST" now_port="$DB_IDENTITY_PORT"
+  local now_user="$DB_IDENTITY_USER" now_database="$DB_IDENTITY_DATABASE"
+  local now_reason="$DB_IDENTITY_REASON"
+
+  DB_IDENTITY_HOST="$saved_host"; DB_IDENTITY_PORT="$saved_port"
+  DB_IDENTITY_USER="$saved_user"; DB_IDENTITY_DATABASE="$saved_database"
+  DB_IDENTITY_REASON="$saved_reason"
+  DB_FENCE_IDENTITY_ARGS=()
+  if [[ "${#saved_args[@]}" -gt 0 ]]; then DB_FENCE_IDENTITY_ARGS=("${saved_args[@]}"); fi
+
+  if [[ "$rc" -ne 0 ]]; then
+    DB_IDENTITY_DRIFT_REASON="${env_file} no longer states a connection identity this will accept: ${now_reason}"
+    return 1
+  fi
+  if [[ "$now_host" != "$DB_IDENTITY_PINNED_HOST" || "$now_port" != "$DB_IDENTITY_PINNED_PORT" \
+     || "$now_user" != "$DB_IDENTITY_PINNED_USER" || "$now_database" != "$DB_IDENTITY_PINNED_DATABASE" ]]; then
+    DB_IDENTITY_DRIFT_REASON="${env_file} now names ${now_user}@${now_host}:${now_port}/${now_database}, and this run is fencing and migrating ${DB_IDENTITY_PINNED_USER}@${DB_IDENTITY_PINNED_HOST}:${DB_IDENTITY_PINNED_PORT}/${DB_IDENTITY_PINNED_DATABASE}"
+    return 1
+  fi
+  return 0
+}
+
+# BOTH halves, re-run: the file still says the same thing, AND systemd still says that file is the
+# only thing that can define DATABASE_URL for the service. The second half is not a formality at
+# the later call sites — the unit's loaded configuration is re-read after this run's own final
+# daemon-reload, so a drop-in that appeared during the window is folded in before it is asked.
+require_start_identity_unchanged() {
+  env_file_identity_unchanged || return 1
+  if ! require_env_file_is_sole_definition; then
+    DB_IDENTITY_DRIFT_REASON="$DB_IDENTITY_SOURCE_REASON"
+    return 1
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # The reboot fence. The marker file is the condition; the drop-in is what makes
 # systemd honour it. Both are written BEFORE anything is stopped.
 # ---------------------------------------------------------------------------
@@ -1363,6 +1461,13 @@ fence_db_connections() {
   # the wrong database.
   require_env_file_is_sole_definition || die \
     "${DB_IDENTITY_SOURCE_REASON}. The fence, the migration and the release would all agree with each other about the database ${APP_DIR_REAL}/.env names, while the application that restarts afterwards connects somewhere else — a migration on a database nothing fenced, and a new build on a database nothing migrated. Re-run with --skip-migrate, which moves no schema and needs no fence. Nothing has been stopped and nothing has been migrated."
+
+  # AND THE FILE MUST STILL SAY WHAT IT SAID WHEN THIS RUN READ IT (o3d-2sm1.5 r22, Codex HIGH).
+  # The identity above was parsed once, before the build and before the stop; this is the last
+  # moment before the fence is aimed. Nothing has been fenced yet, so a disagreement here is the
+  # cheap one — it costs a restart of the predecessor and no schema at all.
+  require_start_identity_unchanged || die \
+    "The connection identity this run pinned is no longer the one ${APP_DIR_REAL}/.env gives the service: ${DB_IDENTITY_DRIFT_REASON}. DATABASE_URL was read once, before the build and the stop, and systemd does not read the environment file until it execs the service — so fencing on the pinned identity now would fence and migrate one database while the application starts on another. NO FENCE HAS BEEN RAISED and nothing has been migrated. Put the file back the way this run found it, or re-run so the identity is pinned from what the file says now."
 
   ensure_cutover_state_dirs
 
@@ -2826,9 +2931,36 @@ step "Start the new build"
 # migration applied, the deployed schema matched prisma/schema.prisma, and every declared
 # verification returned zero — the schema is known good and the new build is about to
 # start. Every other path either never touched the schema or leaves the fence standing.
+
+# BEFORE THE RELEASE, WITH THE FENCE STILL HELD (o3d-2sm1.5 r22, Codex HIGH). The migration
+# window is closing and the whole point of the fence is that the database it is holding shut is
+# the database that is about to be served. If ${APP_DIR_REAL}/.env has been replaced, deleted or
+# retargeted since the pin — or the unit has acquired another definition of DATABASE_URL — then
+# releasing here opens database A and starts the application on database B.
+#
+# SO IT REFUSES, AND THE FENCE STAYS UP. This die reaches on_exit() with FENCE_ARMED and
+# SCHEMA_TOUCHED both true, which is the path that HOLDS the connection fence, re-stops the
+# units, re-installs the reboot fence and prints the release command; the state is stated there
+# rather than claimed here. That is deliberately the expensive answer: a migrated database left
+# closed is recoverable by a re-run, and an application started on the wrong one is not.
+require_start_identity_unchanged || die \
+  "THE CONNECTION FENCE IS BEING HELD AND THE APPLICATION IS NOT BEING STARTED: ${DB_IDENTITY_DRIFT_REASON}. The migration applied and every verification passed, but the identity this run fenced and migrated is no longer the one ${APP_DIR_REAL}/.env will give the service when systemd execs it — so releasing the fence and starting now would open the database this run migrated and start the application on a different one. Restore ${APP_DIR_REAL}/.env to the identity above and re-run this script, which adopts the standing fence; or, once you are certain which database the service should use, release it by hand with the command printed below. Do NOT start the service until one of those is done."
+
 release_db_connections \
   || die "Refusing to start the application while it has no CONNECT on its own database."
 remove_reboot_fence
+
+# AND ONCE MORE AFTER THIS RUN'S FINAL daemon-reload, WHICH remove_reboot_fence() JUST ISSUED
+# (o3d-2sm1.5 r22, Codex HIGH). That reload is what folds every drop-in written during the
+# window into the unit's loaded configuration, so this is the first moment the LOADED unit can be
+# asked, and the last moment before `systemctl start` hands the file to systemd to read.
+#
+# A refusal here also leaves both fences standing, by the same route and without doing it by
+# hand: the die reaches on_exit() with SCHEMA_TOUCHED true and DB_FENCE_UP false, which is
+# exactly the branch that re-establishes the connection fence through refence_db_connections()
+# and re-installs the reboot fence, and then says which of the two it actually managed.
+require_start_identity_unchanged || die \
+  "THE APPLICATION IS NOT BEING STARTED, AND BOTH FENCES ARE BEING PUT BACK: ${DB_IDENTITY_DRIFT_REASON}. This was checked after the final daemon-reload, so it is the loaded unit configuration and the current file contents that disagree with the identity this run fenced and migrated — the one systemd is about to read. The connection fence was released a moment ago for the start and is being re-established below; the banner that follows says whether that succeeded and what is standing. Restore ${APP_DIR_REAL}/.env and the unit to the identity above and re-run this script, which adopts the fence. Do NOT start the service by hand first."
 
 # The instant the restart was issued. The responder proof below requires the process on the
 # port to post-date it: anything older survived the stop and is not what this run started.
