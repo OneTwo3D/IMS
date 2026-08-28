@@ -3381,7 +3381,12 @@ test('ROUND 20 (Codex HIGH): every string the renderer emits is one written out 
  *   AND THE ANNOTATION READ    a property signature, a type alias, a type parameter (round 30: each
  *                              has a type node, and `typeOrigin` reads it). An INTERFACE is the one
  *                              kind with no type node of its own: what it can supply comes from its
- *                              MEMBERS, each of which arrives here as its own declaration.
+ *                              MEMBERS, each of which arrives here as its own declaration — AND
+ *                              THAT LAST SENTENCE WAS ROUND 31'S HOLE. It is true of the member
+ *                              LIST and false of the type: HERITAGE gives an interface members that
+ *                              are declared in another type entirely, so no declaration reaching
+ *                              here carries the substitution. `typeOrigin` traces heritage now, and
+ *                              this row is a statement about `symbolOrigin` only (control (T)).
  *   REFUSED by name            everything else, and `literalOrigin` is DEFAULT-DENY around it.
  *
  * AND `typeOrigin` IS THE SECOND DEFAULT-DENY WALK, over TYPE syntax, for the reason round 29
@@ -3391,6 +3396,33 @@ test('ROUND 20 (Codex HIGH): every string the renderer emits is one written out 
  * type keywords, a literal type, an object type (whose members are declarations in their own right)
  * and the composite forms it recurses through — union, intersection, array, tuple, indexed access,
  * type operator, conditional, mapped, template literal, function — and refuses every other by name.
+ *
+ * AND BEING DEFAULT-DENY OVER SYNTAX IS NOT THE SAME AS BEING DEFAULT-DENY OVER MEANING (round 31,
+ * Codex HIGH). Round 30 walked every type node it accepted... except the ones it accepted on an
+ * ARGUMENT ABOUT WHERE THEIR LITERALS COME FROM. That is the third consecutive round in which a
+ * JUSTIFICATION, not a row, was the thing that was wrong, so this pass was made about the walk's
+ * ENTRY POINTS: at every node `typeOrigin` accepts without recursing all of it, can this type
+ * acquire MEMBERS or ARGUMENTS from somewhere other than its own inline syntax? Three answer yes.
+ *
+ *   HERITAGE (interface, class)   A HOLE, and Codex's route. `interface Base<T> { mode: T }` plus
+ *                                 `interface Render extends Base<typeof manufacturedMode> {}` puts a
+ *                                 manufactured literal on `Render.mode` while every declaration on
+ *                                 the path reads clean: `Render` has no member list at all and
+ *                                 `Base`'s one property signature says `T`. Closed by
+ *                                 `heritageOrigin` — every base followed, every heritage type
+ *                                 ARGUMENT read, and a base that is an EXPRESSION rather than a name
+ *                                 (`class X extends mixin(B) {}`) refused outright. Control (T).
+ *   an `infer` CONSTRAINT         ALREADY CLOSED, and now walked anyway. A constraint reaches a
+ *                                 value only through a REFERENCE to the type parameter, and such a
+ *                                 reference resolves to a `TypeParameterDeclaration` whose
+ *                                 constraint round 30 already reads. Control (T2) runs it with the
+ *                                 heritage walk OFF and shows it still refused.
+ *   a SIGNATURE's own type
+ *   parameters                    ALREADY CLOSED, for the same reason and shown the same way.
+ *
+ * An ENUM is left accepted, and now for a reason with no `except` in it: it has no heritage clause
+ * and no type parameters, so its members are the whole of what it can supply and every one of them
+ * arrives at `symbolOrigin` as its own declaration.
  *
  * SO THE CRITERION, STATED TO COVER NAMING AS WELL AS CONTAINING:
  *
@@ -3414,12 +3446,32 @@ test('ROUND 20 (Codex HIGH): every string the renderer emits is one written out 
  * type-checks with the same diagnostics as the shipped model, and this walk reports the inventory
  * CLEAN over a renderer keyed on `modeTable.mode` — verified against this analyzer, not supposed.
  * Position (14) computes the OBJECT from the initializer and `resolveProperty` reads the property
- * straight off it; no checker type is consulted, so nothing in TABLE ONE fires. IT IS NOT CLOSED
- * HERE, and the reason is that every closure available is a proof over the WRONG PROGRAM: this
- * walk's program is the model file plus whatever a control declares, while the module is importable
- * by anything, so "no assignment targets a property anywhere in this program" would be an assumption
- * wearing a scan. Clause (b) is worth having precisely because TypeScript enforces it program-wide;
- * a property-write rule would not be, and a partial proof here is worse than the restriction.
+ * straight off it; no checker type is consulted, so nothing in TABLE ONE fires.
+ *
+ * ROUND 30 LEFT THAT OPEN AND SAID SO, on the grounds that every closure available was a proof over
+ * the WRONG PROGRAM: this walk's program is the model file plus whatever a control declares, while
+ * the module is importable by anything, so "no assignment targets a property anywhere in this
+ * program" would be an assumption wearing a scan. THAT REASONING STILL HOLDS AND IT WAS NOT AN
+ * ANSWER — because the residue was REACHABLE FROM THE SHIPPED RENDERER (round 31, Codex HIGH).
+ * `SETTING_NAME` was an exported object and `renderLocalDirection` reads it AT INVOCATION TIME:
+ * `SETTING_NAME.SETTING_SYNC_ENABLED = '…'` is admitted by its `Record<..., string>` type, and
+ * Codex executed it and got the injected instruction out of the shipped TURN_OFF branch, with this
+ * walk reporting clean throughout. So the whole inventory guarantee was conditional on nobody
+ * writing to a table.
+ *
+ * IT IS CLOSED IN THE MODULE RATHER THAN IN THE WALK, which is the only place a closure is not a
+ * proof over the wrong program: the two tables nothing outside reads are NOT EXPORTED, and every
+ * table that remains is DEEP-FROZEN at module evaluation, so the write throws instead of landing
+ * (a module is strict-mode code). Both halves are needed — a private mutable table is still mutable
+ * from inside the module, and freezing without un-exporting would leave a lever nothing has a
+ * reason to keep. Control (U), and `freezeDeep` at the foot of the direction model.
+ *
+ * SO WHAT THE ANALYZER'S CONCLUSION NOW RESTS ON, stated as one sentence a reader can rely on: the
+ * set of sentences these renderers can emit is exactly the reviewed inventory, UNCONDITIONALLY on
+ * data — there is no object a renderer reads at invocation time that anything can write after this
+ * walk has read it. It still rests on the renderer's own branch strings and on the freeze calls
+ * themselves, and both of those are diffs to the model file in front of a reviewer, which is the
+ * whole point of the file being small enough to read.
  *
  * WHAT ELSE RESTED ON A JUSTIFICATION RATHER THAN ON A RULE: re-derived row by row — (1), (2), (5),
  * (7), (8) and (12) consult no checker type at all; (6) is the closed count of NUMBER producers
