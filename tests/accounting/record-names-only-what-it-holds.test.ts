@@ -3127,7 +3127,8 @@ test('ROUND 20 (Codex HIGH): every string the renderer emits is one written out 
  * the CHECKER's literal type, which folds only when the type itself admits exactly one string AND
  * `literalOrigin` can trace that type to a declaration nobody asserted into existence — knowledge
  * about the program, rather than a stand-in for a runtime value. That second condition is the one
- * every round on this axis has been about, and round 27 is where it finally reaches every path.
+ * every round on this axis has been about, and the ENUMERATION below — not a claim that the latest
+ * fix "reaches every path" — is what says where it is now demanded and where it is not.
  *
  * AND A CALL BOUNDARY IS NOT A LAUNDERING STEP (round 24, Codex HIGH). Rounds 22 and 23 each closed
  * one place where a TYPE stood in for a VALUE, and each left the next one open. Codex's third route
@@ -3222,6 +3223,61 @@ test('ROUND 20 (Codex HIGH): every string the renderer emits is one written out 
  * only path to the pruned arm is the root: with the argument omitted there too, round 25's internal
  * default modelling would surface the sentence through the sequence and the control would be about
  * round 25 instead.
+ *
+ * AND AN ELEMENT ACCESS HAS TWO EXPRESSIONS IN IT, NOT ONE (round 28, Codex HIGH). Rounds 22-27
+ * are one pattern stated six times: a rule demands provenance at the position it was written for,
+ * and ONE ADJACENT EXPRESSION POSITION IS NEVER ASKED. Receiver properties, then call arguments,
+ * then default initializers, then root-entry initializers — and now the KEY. `literalOrigin` traced
+ * the RECEIVER of `a[k]` and returned; nothing ever looked at `k`. So
+ * `direction[(context.syncRowId === OFF_SAMPLE ? 'action' : 'target') as 'target']` types as
+ * exactly `"ORDER_INVOICE_PDF"` with no diagnostic at all, the comparison against that value folds
+ * TRUE, and the arm an off-sample id takes at run time is pruned — on an OPAQUE root, with no call,
+ * no argument, no default and nothing UNKNOWN, so not one of the five earlier fixes can reach it.
+ * `keyOrigin` is the fix: the key is asked the same question the receiver is.
+ *
+ * SO HERE IS THE ENUMERATION, rather than a sixth claim that the axis is now closed. Every position
+ * `resolveProperty` and `resolveElement` can produce a CONCRETE value from, and what each is held
+ * to. (1)-(4) are `a.n`; (5)-(10) are `a[k]`.
+ *
+ *    (1) `a`, OBJECT branch      VALUE-COMPUTED. The walk computed the receiver itself; no checker
+ *                                type is consulted, and `valueOf` unwraps an `as` to compute what
+ *                                is underneath it. Nothing to demand.
+ *    (2) `a`, LIST `.length`     VALUE-COMPUTED — a number this walk counted.
+ *    (3) `a`, checker fold       DEMANDED, `literalOrigin` (rounds 23-27).
+ *    (4) `n`, the property name  DEMANDED, `symbolOrigin`. `n` is an identifier and never an
+ *                                expression, so nothing can be asserted at the access site; what
+ *                                CAN be asserted is the declaration it resolves to, and that is
+ *                                what `symbolOrigin` walks.
+ *    (5) `a`, LIST branch        VALUE-COMPUTED.
+ *    (6) `k`, LIST branch        NOT DEMANDED, AND SOUND — stated rather than assumed. The branch
+ *                                requires a NUMBER, and this walk produces a NUMBER only from a
+ *                                numeric literal, a unary minus, `+`/`-` over two NUMBERs, and
+ *                                `LIST.length`. `checkerLiterals` yields only STRING, so no checker
+ *                                type can manufacture an index.
+ *    (7) `a`, OBJECT branch      VALUE-COMPUTED.
+ *    (8) `k`, OBJECT branch      VALUE-COMPUTED, and demanded wherever computing it consults the
+ *                                checker — the key goes through `valueOf`, which reaches a checker
+ *                                literal only via (3), (4), (9) or (10). A key with more than one
+ *                                shape unions BOTH properties rather than choosing one.
+ *    (9) `a`, checker fold       DEMANDED, `literalOrigin`.
+ *   (10) `k`, checker fold       DEMANDED as of round 28, `keyOrigin`. This is Codex's route, and
+ *                                it was the one position of the ten nobody had asked.
+ *
+ * `literalOrigin` is DEFAULT-DENY, which is what makes ten a closed count rather than a sample: it
+ * admits six syntactic forms and refuses every other by name, and of the six only parenthesis,
+ * non-null, property access and element access have sub-expressions at all. Element access was the
+ * only one of those four with a sub-expression it did not visit.
+ *
+ * AND ONE GAP THAT REMAINS, NAMED RATHER THAN LEFT FOR ROUND 29. `symbolOrigin` trusts a
+ * `PropertyDeclaration` — a CLASS field — on its annotation alone, without reading its initializer,
+ * which is exactly the trust round 27 removed from a parameter's default. `class C { static mode:
+ * 'REVIEWED' = 'UNREVIEWED' as unknown as 'REVIEWED' }` is that shape. It is not reachable TODAY,
+ * and the reason is not provenance: a class identifier resolves to a `ClassDeclaration`, which
+ * `resolveIdentifier` cannot compute, and a `new` resolves to one, which `implementationsOf`
+ * refuses — so the receiver is UNKNOWN and round 24's propagation kills the access before any
+ * annotation is read. If either of those ever learns to compute a class, this position folds. The
+ * same is true of `EnumMember` for the same reason. Both are held closed by receiver propagation
+ * and by the callee allowlist, not by `literalOrigin`.
  *
  * `contextBinding` exists ONLY so a control can re-run this walk with the pre-fix concrete binding
  * and demonstrate that the branch is pruned again. Nothing else passes anything but `'SYMBOLIC'`.
@@ -3355,6 +3411,16 @@ type RootEntry = 'ABSTRACT' | 'DEFAULTED'
  * it folded. See the block above `RootEntry` and the root branch of `callImplementation`.
  */
 type RootProvenance = 'CARRIED' | 'DROPPED'
+
+/**
+ * WHETHER THE KEY OF AN ELEMENT ACCESS MUST BE HONEST TOO (round 28, Codex HIGH).
+ *
+ * `'DEMANDED'` is what ships and what every judgement uses: `a[k]` folds to a checker literal only
+ * when BOTH `a` and `k` trace to a declaration nobody asserted into existence. `'IGNORED'`
+ * reproduces rounds 22-27, every one of which asked the receiver and never the key — so
+ * `direction[(...) as 'target']` folded off an OPAQUE root. Control (P) shows what it let past.
+ */
+type KeyProvenance = 'DEMANDED' | 'IGNORED'
 
 /**
  * THE ROOTS THIS WALK CREATES, BY NAME. `rootShapes` calls exactly these two with no arguments, so
@@ -3520,6 +3586,7 @@ function computeRendererOutput(
   rootTrust: RootTrust = 'NAMED',
   rootEntry: RootEntry = 'ABSTRACT',
   rootProvenance: RootProvenance = 'CARRIED',
+  keyProvenance: KeyProvenance = 'DEMANDED',
 ): ComputedRendererOutput {
   const program = directionModelProgram(model, extraFiles)
   const checker = program.getTypeChecker()
@@ -3645,7 +3712,13 @@ function computeRendererOutput(
     if (ts.isPropertyAccessExpression(node)) {
       return literalOrigin(node.expression, seen) ?? symbolOrigin(node.name, seen)
     }
-    if (ts.isElementAccessExpression(node)) return literalOrigin(node.expression, seen)
+    // BOTH HALVES OF AN ELEMENT ACCESS, NOT JUST THE RECEIVER (round 28, Codex HIGH). `a[k]` has
+    // TWO expressions in it and its literal type is chosen by BOTH. Every round from 22 to 27
+    // traced the receiver and never once asked the key, so an assertion on the KEY manufactured a
+    // literal type exactly the way an assertion on the value did — see `keyOrigin`.
+    if (ts.isElementAccessExpression(node)) {
+      return literalOrigin(node.expression, seen) ?? keyOrigin(node.argumentExpression, seen)
+    }
     if (ts.isIdentifier(node)) return symbolOrigin(node, seen)
     if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) return null
     return `a ${ts.SyntaxKind[node.kind]}, whose literal type this walk cannot trace to a declaration`
@@ -3718,6 +3791,29 @@ function computeRendererOutput(
         + 'cannot trace to a declaration'
     }
     return null
+  }
+
+  /**
+   * WHERE THE KEY OF AN ELEMENT ACCESS CAME FROM (round 28, Codex HIGH).
+   *
+   * `a[k]`'s literal type is a function of TWO expressions, and rounds 22-27 each demanded
+   * provenance of the one they were written for. `literalOrigin` traced the RECEIVER and stopped,
+   * so a key nobody could compute manufactured the same trusted literal every earlier round was
+   * about: `direction[(context.syncRowId === OFF_SAMPLE ? 'action' : 'target') as 'target']` types
+   * as exactly `"ORDER_INVOICE_PDF"`, with no diagnostic, while at run time the key is chosen by an
+   * unbounded id. The receiver is an OPAQUE root, so no earlier fix reaches it — there is no call,
+   * no argument, no default, and nothing UNKNOWN to propagate.
+   *
+   * THE RULE IS THE SAME ONE, ASKED OF THE OTHER HALF: a key this walk cannot trace to a
+   * declaration nobody asserted into existence makes the access indeterminate. `keyOrigin` is
+   * `literalOrigin` plus the one form a key may take that a value position never needs — an INDEX
+   * WRITTEN OUT IN SOURCE, which names exactly what it says and was manufactured by nobody.
+   */
+  function keyOrigin(node: ts.Expression, seen: Set<ts.Node>): string | null {
+    if (keyProvenance === 'IGNORED') return null
+    if (ts.isParenthesizedExpression(node)) return keyOrigin(node.expression, seen)
+    if (ts.isNumericLiteral(node)) return null
+    return literalOrigin(node, seen)
   }
 
   /**
@@ -4303,10 +4399,11 @@ function judgeRendererOutput(
   rootTrust: RootTrust = 'NAMED',
   rootEntry: RootEntry = 'ABSTRACT',
   rootProvenance: RootProvenance = 'CARRIED',
+  keyProvenance: KeyProvenance = 'DEMANDED',
 ): string[] {
   const computed = computeRendererOutput(
     model, extraFiles, contextBinding, literalProvenance, receiverPropagation, defaultBinding, rootTrust,
-    rootEntry, rootProvenance,
+    rootEntry, rootProvenance, keyProvenance,
   )
   const reviewed = RENDERED_DIRECTIONS.map((entry) => entry.text)
   const complaints = [...computed.unresolved]
@@ -5261,12 +5358,131 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
       (text) => substitutePlaceholders(text, context),
     )
   }
-  // ...AND THE RUNTIME PASS CANNOT SEE IT EITHER, for the reason every control here says: the
-  // sampled renderer is called the way the sample calls it, which is with the default.
+  // (P) THE ASSERTED COMPUTED KEY — THE ROUND-28 ROUTE (Codex HIGH), and the seventh appearance of
+  // one axis: a TYPE standing in for a VALUE.
+  //
+  // Rounds 22-27 each demanded provenance at the position the round was written for and left one
+  // ADJACENT expression position unasked. `literalOrigin` traced the RECEIVER of an element access
+  // and never the KEY, so an assertion on the key manufactured the same trusted literal every
+  // earlier round was about — and it does it with no call, no argument, no default and no UNKNOWN
+  // receiver, which is why not one of the five earlier fixes reaches it.
+  //
+  // The key is chosen at RUN TIME by the sync row id, which is unbounded. The checker is told it is
+  // `'target'`; sampled ids do read `target` and render the reviewed sentence; an off-sample id
+  // reads `action` and the comparison goes the other way.
+  const viaAssertedKey = model.replace(
+    "    case 'CONFIRM':\n"
+    + "      return 'confirm the invoice PDF stored against the order is the document you expect'",
+    "    case 'CONFIRM':\n"
+    + "      return direction[(context.syncRowId === '" + OFF_SAMPLE_SYNC_ROW + "' ? 'action' : 'target') as 'target']\n"
+    + "        === 'ORDER_INVOICE_PDF'\n"
+    + "        ? 'confirm the invoice PDF stored against the order is the document you expect'\n"
+    + "        : '" + UNDECLARED_REMOTE_ACTION + "'",
+  )
+  assert.notEqual(viaAssertedKey, model, 'the asserted-key mutation must actually have been applied')
+  // AND THE COMPILER ADMITS IT, byte for byte. The asserted type is one member of the union being
+  // asserted from, so the assertion is one TypeScript allows outright; the access then types as
+  // `direction['target']`, which in this narrowed branch is exactly `'ORDER_INVOICE_PDF'`, and the
+  // comparison is between that literal and itself.
+  assert.deepEqual(
+    modelDiagnostics(viaAssertedKey), modelDiagnostics(model),
+    'the asserted-key mutation must type-check exactly as the shipped model does, or it is not a route '
+    + 'anybody could take',
+  )
+  const assertedKeyComplaints = judgeRendererOutput(viaAssertedKey)
+  assert.ok(
+    assertedKeyComplaints.some((complaint) => complaint.startsWith('emits a sentence nobody reviewed')
+      && complaint.includes('take the second PDF off it')),
+    'CONTROL, THE CODEX ROUTE: an element access has TWO expressions in it and its literal type is chosen by '
+    + 'both. Demanding provenance of the receiver and not of the key left the key free to manufacture the '
+    + `literal. Saw: ${JSON.stringify(assertedKeyComplaints)}`,
+  )
+  // ...and the refusal is a REFUSAL TO FOLD, not a value this walk gave up on: the walk still
+  // computes every sentence, it just takes both arms of the comparison it cannot decide.
+  assert.deepEqual(
+    computeRendererOutput(viaAssertedKey).unresolved, [],
+    'the asserted-key mutation must still COMPUTE — the complaint is the sentence it emits, not an expression '
+    + 'this walk could not read',
+  )
+  // ...AND THE PRE-FIX ANALYZER REPORTS IT CLEAN, asserted rather than described — the same shape as
+  // (J) through (O). Re-run the SAME judgement over the SAME mutated renderer with every round-22-to-27
+  // fix in place and only the key's provenance ignored: no complaint at all, while the sentence ships.
+  assert.deepEqual(
+    judgeRendererOutput(
+      viaAssertedKey, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'MODELLED', 'NAMED', 'ABSTRACT', 'CARRIED', 'IGNORED',
+    ),
+    [],
+    'THE PRE-FIX ANALYZER MUST STILL LET IT THROUGH — if it also refused this, control (P) would be passing '
+    + 'for some other reason and would prove nothing',
+  )
+  // ...AND NONE OF THE SIX FIXES THAT CAME BEFORE IT CLOSES IT, which is what makes this a seventh
+  // round rather than a regression of one of them. Each is turned OFF in turn with the key rule ON:
+  // if any of them were what refuses this route, one of these would come back clean.
+  for (const [what, complaints] of [
+    ['receiver propagation (round 24)', judgeRendererOutput(viaAssertedKey, {}, 'SYMBOLIC', 'TRACKED', 'DEFERRED')],
+    ['argument provenance (round 24)', judgeRendererOutput(viaAssertedKey, {}, 'SYMBOLIC', 'CALL_LOCAL', 'PROPAGATED')],
+    ['modelled defaults (round 25)', judgeRendererOutput(
+      viaAssertedKey, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'UNBOUND',
+    )],
+    ['the named root set (round 25)', judgeRendererOutput(
+      viaAssertedKey, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'MODELLED', 'INFERRED',
+    )],
+    ['abstract root entry (round 26)', judgeRendererOutput(
+      viaAssertedKey, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'MODELLED', 'NAMED', 'DEFAULTED',
+    )],
+    ['root default provenance (round 27)', judgeRendererOutput(
+      viaAssertedKey, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'MODELLED', 'NAMED', 'ABSTRACT', 'DROPPED',
+    )],
+  ] as const) {
+    assert.ok(
+      complaints.some((complaint) => complaint.includes('take the second PDF off it')),
+      `THE KEY RULE IS WHAT CLOSES THIS: with ${what} switched off it is still refused, so it is not that fix `
+      + 'wearing a new coat',
+    )
+  }
+  // ...AND THE FIX DOES NOT UNDO ANY OF THEM. The six routes those controls are about are still
+  // refused with the key rule in place — asserted here so that "keep all existing controls passing"
+  // is a statement this control makes rather than one a reader has to take on trust.
+  for (const [what, mutated] of [
+    ['(L1) the runtime copy', viaRuntimeCopy],
+    ['(L2) the asserted argument', viaAssertedArgument],
+    ['(M) the asserted default', viaDefaultedParameter],
+    ['(N) the defaulted root parameter', viaDefaultedRootParameter],
+    ['(O) the asserted root default', viaAssertedRootDefault],
+  ] as const) {
+    assert.ok(
+      judgeRendererOutput(mutated).length > 0,
+      `${what} must still be refused — demanding provenance of a key must not have loosened anything else`,
+    )
+  }
+  // ...AND THE RUNTIME PASS CANNOT SEE IT, asserted against the sample that pass actually uses. The
+  // key is chosen by a sync row id and sync row ids are unbounded: hand-run the mutated renderer's
+  // own selection over all four RUNTIME_CONTEXTS and every one reports the reviewed inventory,
+  // because none of them is the id the key is chosen by. That is the whole reason this route has to
+  // be closed statically — no finite sample of an unbounded id closes it.
+  const byAssertedKey = (direction: LocalDirection, context: LocalDirectionContext): string => (
+    direction.action === 'CONFIRM'
+      ? (direction[(context.syncRowId === OFF_SAMPLE_SYNC_ROW ? 'action' : 'target') as 'target'] as string)
+        === 'ORDER_INVOICE_PDF'
+        ? renderLocalDirection(direction, context)
+        : UNDECLARED_REMOTE_ACTION
+      : renderLocalDirection(direction, context)
+  )
+  assert.equal(RUNTIME_CONTEXTS.length, 4, 'the four sampled contexts, unchanged')
   for (const context of RUNTIME_CONTEXTS) {
     assertRenderedInventory(
-      (direction) => renderLocalDirection(direction, context),
+      (direction) => byAssertedKey(direction, context),
       (text) => substitutePlaceholders(text, context),
     )
   }
+  const offSampleKeyContext: LocalDirectionContext = { ledger: 'QuickBooks', syncRowId: OFF_SAMPLE_SYNC_ROW }
+  assert.throws(
+    () => assertRenderedInventory(
+      (direction) => byAssertedKey(direction, offSampleKeyContext),
+      (text) => substitutePlaceholders(text, offSampleKeyContext),
+    ),
+    /is NOT the reviewed sentence for it/,
+    'and the SAME renderer refused the moment the id is one nobody sampled — so what the four contexts '
+    + 'established was the ids they carry, not the renderer',
+  )
 })
