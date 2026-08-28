@@ -142,7 +142,6 @@
 
 import { randomBytes } from 'node:crypto'
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
-import { createRequire } from 'node:module'
 import { dirname } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
@@ -150,27 +149,42 @@ import { config as loadDotenv } from 'dotenv'
 import pg from 'pg'
 
 /**
- * THE PARSER `pg` ITSELF LOADS, not a copy of its rules (o3d-2sm1.5, Codex r15 CRITICAL).
+ * THE OBJECT THAT DECIDES WHERE THE CONNECTION GOES (o3d-2sm1.5, Codex r16 CRITICAL).
  *
- * Two rounds on this file have now ended with "our reimplementation of the driver's rules
- * differs from the driver's rules": first the authority/query precedence, then repeated
- * parameters, where `URLSearchParams.get()` returns the FIRST value while pg-connection-string
- * copies every entry into one config object, so the LAST one wins. A third reimplementation
- * invites a fourth finding, so the effective host/port/user/database are now DERIVED by the
- * driver's own parser and this file no longer holds an opinion about how a URL resolves.
+ * FOUR rounds on this file have now ended the same way: whatever this script used to work out
+ * "where does DATABASE_URL actually go" was one layer short of what `pg` connects with.
  *
- * Resolved from `pg`'s own directory rather than from ours, so that if the tree ever carries two
- * copies of pg-connection-string this reads the one `pg/lib/connection-parameters.js` requires --
- * the point being that it is the SAME CODE, not merely the same version number.
+ *   r13/r14  a hand-rolled read of the URL -- wrong about authority-vs-query precedence, and
+ *            wrong about `?user=` overriding the authority's username.
+ *   r15      a hand-rolled read of the URL -- wrong about repeated parameters, because
+ *            `URLSearchParams.get()` returns the FIRST value while pg-connection-string copies
+ *            every entry into one config object, so the LAST one wins.
+ *   r16      `pg-connection-string.parse()` -- the driver's own STRING PARSER, but still not the
+ *            driver's connection. `pg/lib/connection-parameters.js` fills every value the URL
+ *            omits from `PGHOST`, `PGPORT`, `PGUSER`, `PGDATABASE` and its own defaults BEFORE
+ *            connecting. With `PGPORT=6432` and an application URL that names no port, the
+ *            parser says 5432 and the application connects to 6432 -- so the fence revokes
+ *            CONNECT on one cluster while the application keeps writing to another, right
+ *            through the migration.
+ *
+ * A fifth reimplementation would find a fifth gap. So identity is no longer RECONSTRUCTED at all:
+ * it is READ OFF THE CLIENT OBJECT THE DRIVER WOULD OPEN. `new pg.Client({ connectionString })`
+ * builds its `ConnectionParameters` in the constructor and touches the network only when
+ * `.connect()` is called, which this never calls. `client.host` and `client.port` are literally
+ * the two arguments handed to `Connection#connect()`, and `client.user` / `client.database` are
+ * the values `getStartupConf()` puts in the startup packet. There is nothing left between these
+ * four fields and the wire for a fifth round to find.
+ *
+ * Consequently this file holds NO opinion about how a URL resolves, and no fallback that could
+ * hold one: a construction that throws is reported as "where it connects is unknown", which is
+ * refused everywhere identity is required.
  */
-const scriptRequire = createRequire(import.meta.url)
-export const parseWithDriver = (() => {
-  try {
-    return scriptRequire(scriptRequire.resolve('pg-connection-string', { paths: [dirname(scriptRequire.resolve('pg'))] })).parse
-  } catch {
-    return scriptRequire('pg-connection-string').parse
-  }
-})()
+export function resolveDriverIdentity(connectionString) {
+  // NOT connected, and never connected: the constructor resolves ConnectionParameters and
+  // allocates an unconnected socket, nothing more.
+  const client = new pg.Client({ connectionString })
+  return { host: client.host, port: client.port, user: client.user, database: client.database }
+}
 
 export const EXIT_OK = 0
 export const EXIT_ERROR = 1
@@ -299,10 +313,10 @@ const IDENTITY_PARAMS = ['host', 'port', 'user', 'dbname', 'database']
  * Pure: the (login role, server, database) a libpq connection URL EFFECTIVELY names -- what
  * node-postgres will actually connect as and to, not what the URL's obvious components suggest.
  *
- * THE EFFECTIVE VALUES ARE THE DRIVER'S OWN (o3d-2sm1.5, Codex r15 CRITICAL). They are read out
- * of `parseWithDriver()` -- the very pg-connection-string module `pg` requires -- rather than
- * re-derived here. Two rounds running, a hand-rolled re-derivation disagreed with the real
- * parser and the fence proved itself against a connection nobody uses:
+ * THE EFFECTIVE VALUES ARE THE DRIVER'S OWN (o3d-2sm1.5, Codex r16 CRITICAL). They are read off
+ * `resolveDriverIdentity()` -- the `pg.Client` the driver would open -- rather than re-derived
+ * here. THREE rounds running, something short of that client disagreed with it, and the fence
+ * proved itself against a connection nobody uses:
  *
  *   r14  the authority was read first and the query consulted only as a fallback. The driver
  *        does the opposite -- it copies every query parameter into the config FIRST and fills
@@ -314,6 +328,11 @@ const IDENTITY_PARAMS = ['host', 'port', 'user', 'dbname', 'database']
  *        The driver iterates `searchParams.entries()` into one config object, so the LAST
  *        duplicate wins: `?host=local&host=remote&port=5432&port=6432&user=app&user=other` read
  *        here as local:5432/app and connected to remote:6432/other.
+ *   r16  the driver's own string parser was then used -- and a string parser is not a
+ *        connection. `pg/lib/connection-parameters.js` fills in `PGHOST`, `PGPORT`, `PGUSER`,
+ *        `PGDATABASE` and its own defaults for everything the URL omits, so with `PGPORT=6432`
+ *        `postgres://imsapp@localhost/imsdb` read here as (this host):5432 and connected to
+ *        6432. An empty authority plus `PGHOST` moves the whole server the same way.
  *
  * So there are now two rules, both fail-closed, and neither of them re-implements libpq:
  *
@@ -323,10 +342,13 @@ const IDENTITY_PARAMS = ['host', 'port', 'user', 'dbname', 'database']
  *     than resolved (an authority that disagrees with its own query string, below, is refused on
  *     exactly the same grounds). Refusal is also the one answer that cannot go stale if the
  *     driver's precedence changes again.
- *   * ANYTHING ELSE IS WHATEVER THE DRIVER SAYS IT IS. `host`, `port`, `user` and `database`
- *     come straight out of the driver's config, so `?host=` falling back to the authority, the
- *     `@/` empty-authority form, percent-decoding and the unconditional overwrite of `database`
- *     from the pathname are the driver's behaviour by construction rather than by imitation.
+ *   * ANYTHING ELSE IS WHATEVER THE DRIVER SAYS IT IS. `host`, `port`, `user` and `database` are
+ *     read off the `pg.Client` that would be opened, so `?host=` falling back to the authority,
+ *     the `@/` empty-authority form, percent-decoding, the unconditional overwrite of `database`
+ *     from the pathname, AND the environment defaults (`PGHOST`/`PGPORT`/`PGUSER`/`PGDATABASE`,
+ *     port 5432, host `localhost`, and a database that falls back to the login role's own name)
+ *     are the driver's behaviour by construction rather than by imitation. Nothing here merges
+ *     a parser's output with the environment; that merge is the driver's, and it is done once.
  *
  * A URL that says one thing in its authority and a DIFFERENT thing in its query string is still
  * REFUSED rather than resolved. The driver would take the query value, but an environment that
@@ -369,14 +391,14 @@ export function parseConnectionIdentity(connectionString) {
     }
   }
 
-  // The effective values, as resolved by the module `pg` itself requires. It can throw — an
+  // The effective values, read off the client `pg` would open. Constructing it can throw — an
   // sslcert/sslkey/sslrootcert it cannot read, a uselibpqcompat conflict — and a URL the driver
-  // will not parse is a URL this cannot identify.
+  // will not build a connection from is a URL this cannot identify.
   let driver
   try {
-    driver = parseWithDriver(connectionString)
+    driver = resolveDriverIdentity(connectionString)
   } catch {
-    return { ok: false, reason: 'cannot be parsed by node-postgres (pg-connection-string rejected it), so where it connects is unknown' }
+    return { ok: false, reason: 'cannot be resolved to a node-postgres connection (pg rejected it), so where it connects is unknown' }
   }
 
   const authorityHost = !emptyAuthorityHost && url.hostname ? decodeOrRaw(url.hostname) : ''
@@ -403,13 +425,21 @@ export function parseConnectionIdentity(connectionString) {
     if (value && value !== database) {
       return {
         ok: false,
-        reason: `carries ?${name}=${value}, which node-postgres IGNORES -- the database always comes from the URL path, which names "${database || '(nothing)'}". A parameter naming a different database from the one the connection actually reaches cannot be left standing here`,
+        reason: `carries ?${name}=${value}, which node-postgres IGNORES -- the database comes from the URL path (or, when the path is empty, from PGDATABASE and then from the login role's own name), and the connection this URL opens reaches "${database || '(nothing)'}". A parameter naming a different database from the one the connection actually reaches cannot be left standing here`,
       }
     }
   }
 
   const host = String(driver.host ?? '')
-  const port = String(driver.port ?? '') || '5432'
+  // `ConnectionParameters` runs the port through `parseInt`, so a port that is not a number
+  // reaches the driver as NaN and the server this URL opens is unknown rather than defaulted.
+  if (!Number.isInteger(driver.port)) {
+    return {
+      ok: false,
+      reason: `resolves to the port ${JSON.stringify(String(driver.port))}, which node-postgres cannot read as a port number, so which server it reaches is unknown`,
+    }
+  }
+  const port = String(driver.port)
   const user = String(driver.user ?? '')
   const lowered = String(host).toLowerCase()
   const family = String(host).startsWith('/') || LOCAL_HOSTS.has(lowered) ? '(this host)' : lowered
@@ -444,7 +474,7 @@ export function assessDatabaseIdentity({
   if (!app.database) {
     return {
       bound: false,
-      reason: 'DATABASE_URL names no database in its path, so the database the application actually uses is unidentified and nothing can be bound to it.',
+      reason: 'DATABASE_URL resolves to no database at all -- nothing in its path, no PGDATABASE, and no login role whose name node-postgres could fall back to -- so the database the application actually uses is unidentified and nothing can be bound to it.',
     }
   }
   if (adminUrl) {
@@ -474,7 +504,7 @@ export function assessDatabaseIdentity({
   if (connectedDatabase !== app.database) {
     return {
       bound: false,
-      reason: `the connection this run opened is attached to "${connectedDatabase}", and DATABASE_URL names "${app.database}". A connection string with no database in its path connects to the login role's default database, which is how these come apart without either URL looking wrong.`,
+      reason: `the connection this run opened is attached to "${connectedDatabase}", and DATABASE_URL names "${app.database}". A connection string with no database in its path connects to PGDATABASE, or failing that to the login role's own name, which is how these come apart without either URL looking wrong.`,
     }
   }
   // THE ROLE HALF, ASKED OF THE CONNECTION (o3d-2sm1.5, Codex r14 CRITICAL). Everything below the
