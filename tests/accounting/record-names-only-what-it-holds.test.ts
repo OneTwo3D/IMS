@@ -3312,6 +3312,10 @@ function computeRendererOutput(model: string, extraFiles: Record<string, string>
       if (receiver.element.kind !== 'STRING') {
         return unknown('a `join` over a list whose element value this walk cannot read as prose')
       }
+      if (receiver.minimum < 1) {
+        return unknown('a `join` over a list that may be EMPTY, whose value would then be the empty string — a '
+          + 'shape cannot express "or nothing at all", so this is refused rather than under-described')
+      }
       const alternatives = receiver.element.shapes.map(constantOf)
       if (alternatives.some((alternative) => alternative === null)) {
         return unknown('a `join` over a list whose elements are not themselves constants')
@@ -3322,7 +3326,7 @@ function computeRendererOutput(model: string, extraFiles: Record<string, string>
           kind: 'REPEAT',
           alternatives: alternatives as string[],
           separator,
-          minimum: Math.max(receiver.minimum, 1),
+          minimum: receiver.minimum,
         }])],
       }
     }
@@ -3340,12 +3344,10 @@ function computeRendererOutput(model: string, extraFiles: Record<string, string>
     if (!callback || (!ts.isArrowFunction(callback) && !ts.isFunctionExpression(callback))) {
       return unknown('a `map` whose callback is not a function written out at the call site')
     }
-    const element = receiver.kind === 'LIST'
-      ? callImplementation(callback, [receiver.items[0] ?? { kind: 'OPAQUE' }])
-      : callImplementation(callback, [receiver.element])
-    return receiver.kind === 'LIST'
-      ? { kind: 'LIST', items: receiver.items.map(() => element) }
-      : { kind: 'OPEN_LIST', element, minimum: receiver.minimum }
+    if (receiver.kind === 'LIST') {
+      return { kind: 'LIST', items: receiver.items.map((item) => callImplementation(callback, [item])) }
+    }
+    return { kind: 'OPEN_LIST', element: callImplementation(callback, [receiver.element]), minimum: receiver.minimum }
   }
 
   const evaluateCall = (call: ts.CallExpression | ts.NewExpression): Value => {
@@ -3490,11 +3492,25 @@ function computeRendererOutput(model: string, extraFiles: Record<string, string>
     }
     if (ts.isBinaryExpression(node)) {
       const operator = node.operatorToken.kind
+      if (operator === ts.SyntaxKind.PlusToken) {
+        // `+` is arithmetic or concatenation, and the checker already knows which. Asking it here
+        // keeps a long concatenation from being walked once per level of nesting.
+        if ((checker.getTypeAtLocation(node).flags & ts.TypeFlags.NumberLike) === 0) {
+          return { kind: 'STRING', shapes: emitShapes(node) }
+        }
+        const augend = valueOf(node.left)
+        const addend = valueOf(node.right)
+        return augend.kind === 'NUMBER' && addend.kind === 'NUMBER'
+          ? { kind: 'NUMBER', value: augend.value + addend.value }
+          : unknown('an arithmetic `+` whose operands this walk cannot compute')
+      }
+      if (operator === ts.SyntaxKind.QuestionQuestionToken || operator === ts.SyntaxKind.BarBarToken) {
+        return { kind: 'STRING', shapes: emitShapes(node) }
+      }
       const left = valueOf(node.left)
       const right = valueOf(node.right)
       if (left.kind === 'NUMBER' && right.kind === 'NUMBER') {
         switch (operator) {
-          case ts.SyntaxKind.PlusToken: return { kind: 'NUMBER', value: left.value + right.value }
           case ts.SyntaxKind.MinusToken: return { kind: 'NUMBER', value: left.value - right.value }
           case ts.SyntaxKind.LessThanToken: return { kind: 'BOOLEAN', value: left.value < right.value }
           case ts.SyntaxKind.LessThanEqualsToken: return { kind: 'BOOLEAN', value: left.value <= right.value }
@@ -3518,10 +3534,6 @@ function computeRendererOutput(model: string, extraFiles: Record<string, string>
           return { kind: 'BOOLEAN', value: operator === ts.SyntaxKind.EqualsEqualsEqualsToken ? equal : !equal }
         }
         return unknown('a comparison this walk cannot decide')
-      }
-      if (operator === ts.SyntaxKind.PlusToken || operator === ts.SyntaxKind.QuestionQuestionToken
-        || operator === ts.SyntaxKind.BarBarToken) {
-        return { kind: 'STRING', shapes: emitShapes(node) }
       }
       return unknown(`a \`${ts.tokenToString(operator)}\` this walk does not evaluate`)
     }
