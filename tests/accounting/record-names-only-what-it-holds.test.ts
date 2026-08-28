@@ -3235,9 +3235,48 @@ test('ROUND 20 (Codex HIGH): every string the renderer emits is one written out 
  * no argument, no default and nothing UNKNOWN, so not one of the five earlier fixes can reach it.
  * `keyOrigin` is the fix: the key is asked the same question the receiver is.
  *
- * SO HERE IS THE ENUMERATION, rather than a sixth claim that the axis is now closed. Every position
- * `resolveProperty` and `resolveElement` can produce a CONCRETE value from, and what each is held
- * to. (1)-(4) are `a.n`; (5)-(10) are `a[k]`.
+ * AND A DECLARATION CAN HOLD AN EXPRESSION TOO (round 29, Codex HIGH). Round 28 ended with a gap
+ * NAMED rather than closed: `symbolOrigin` trusted a class `PropertyDeclaration` on its annotation
+ * alone, without reading its initializer, which is exactly the trust round 27 removed from a
+ * parameter's default. The reason given for leaving it was that a class identifier resolves to a
+ * `ClassDeclaration` `resolveIdentifier` cannot compute and a `new` resolves to one
+ * `implementationsOf` refuses, so the receiver would be UNKNOWN and round 24's propagation would
+ * kill the access before any annotation was read.
+ *
+ * THE DISCLOSURE IS WHY THE ROUTE WAS FOUND, AND THE REASON IS WHAT FAILED. The fence quoted above
+ * covers the receivers you have to EVALUATE. The ROOTS produce a different kind: `rootShapes`
+ * trusts every parameter of the two renderer roots, and `resolveIdentifier` hands a non-context,
+ * non-list root straight back as OPAQUE. AN OPAQUE RECEIVER IS NOT AN UNKNOWN ONE — propagation
+ * never fires on it, which is the very thing controls (N), (O) and (P) each say in their own words.
+ * So a class-TYPED root parameter reads the annotation with no class identifier and no `new`
+ * evaluated anywhere: `class C { readonly mode: 'REVIEWED' = 'UNREVIEWED' as unknown as 'REVIEWED' }`
+ * folds `render.mode` to `'REVIEWED'`, and the arm every caller takes at run time is pruned.
+ *
+ * THE FIX IS THE CRITERION, NOT THE CASE. `symbolOrigin` accepted six declaration kinds
+ * unconditionally, and the criterion it needed is structural: FOUR of them — property signature,
+ * interface, type alias, type parameter — are type-position syntax from end to end, so there is
+ * nowhere in them an `as` could be written and nothing whose runtime value could disagree. The
+ * other TWO — a class field and an enum member — PAIR AN ANNOTATION WITH AN EXPRESSION, which is
+ * the pairing every round since 23 has been about. Those two now take the same initializer trace a
+ * variable does; one with no initializer is refused, because the annotation is then backed by
+ * nothing this walk reads; and an AMBIENT one is refused outright, for the reason
+ * `resolveIdentifier` already refuses an ambient variable — its value lives in code this program
+ * does not contain.
+ *
+ * THE ENUM MEMBER IS THE SAME RULE AND A DIFFERENT REACH. Round 28 held it closed for the round-28
+ * reason, so it was open for the round-28 reason — but not in the same shape. TypeScript refuses a
+ * computed value in a string enum outright (TS18033), so an enum member's initializer cannot carry
+ * an assertion at all and (Q)'s exact route has no enum form. What it does have is the AMBIENT one,
+ * reached the same way — a root parameter typed `typeof E` — and control (Q3) takes it. A read
+ * through the enum OBJECT is genuinely UNKNOWN, because `resolveIdentifier` cannot compute an
+ * `EnumDeclaration`; (Q3) asserts that too, since it is the receiver round 28's argument was
+ * actually about and the one the roots do not produce.
+ *
+ * SO HERE IS THE ENUMERATION, RE-DERIVED RATHER THAN RE-STATED — because a table that was wrong
+ * once can be wrong twice, and the row that was wrong was wrong in a way the table's own shape
+ * hid. Every position that can produce a CONCRETE value from a CHECKER TYPE, which is the only
+ * place a type can stand in for a value. (1)-(4) are `a.n`; (5)-(10) are `a[k]`; (11) is a bare
+ * identifier, and the table used to stop at ten.
  *
  *    (1) `a`, OBJECT branch      VALUE-COMPUTED. The walk computed the receiver itself; no checker
  *                                type is consulted, and `valueOf` unwraps an `as` to compute what
@@ -3246,38 +3285,61 @@ test('ROUND 20 (Codex HIGH): every string the renderer emits is one written out 
  *    (3) `a`, checker fold       DEMANDED, `literalOrigin` (rounds 23-27).
  *    (4) `n`, the property name  DEMANDED, `symbolOrigin`. `n` is an identifier and never an
  *                                expression, so nothing can be asserted at the access site; what
- *                                CAN be asserted is the declaration it resolves to, and that is
- *                                what `symbolOrigin` walks.
+ *                                CAN be asserted is the declaration it resolves to — see the
+ *                                sub-table below, which is where round 28's error actually lived.
  *    (5) `a`, LIST branch        VALUE-COMPUTED.
- *    (6) `k`, LIST branch        NOT DEMANDED, AND SOUND — stated rather than assumed. The branch
- *                                requires a NUMBER, and this walk produces a NUMBER only from a
- *                                numeric literal, a unary minus, `+`/`-` over two NUMBERs, and
- *                                `LIST.length`. `checkerLiterals` yields only STRING, so no checker
- *                                type can manufacture an index.
+ *    (6) `k`, LIST branch        NOT DEMANDED, AND SOUND — re-derived, not carried over. The branch
+ *                                requires a NUMBER, and this walk produces a NUMBER in exactly four
+ *                                places: a numeric literal, a unary minus, `+`/`-` over two
+ *                                NUMBERs, and `LIST.length`. `checkerLiterals` yields only STRING,
+ *                                so no checker type can manufacture an index.
  *    (7) `a`, OBJECT branch      VALUE-COMPUTED.
  *    (8) `k`, OBJECT branch      VALUE-COMPUTED, and demanded wherever computing it consults the
  *                                checker — the key goes through `valueOf`, which reaches a checker
- *                                literal only via (3), (4), (9) or (10). A key with more than one
- *                                shape unions BOTH properties rather than choosing one.
+ *                                literal only via (3), (4), (9), (10) or (11). A key with more than
+ *                                one shape unions BOTH properties rather than choosing one.
  *    (9) `a`, checker fold       DEMANDED, `literalOrigin`.
- *   (10) `k`, checker fold       DEMANDED as of round 28, `keyOrigin`. This is Codex's route, and
- *                                it was the one position of the ten nobody had asked.
+ *   (10) `k`, checker fold       DEMANDED as of round 28, `keyOrigin`.
+ *   (11) a bare IDENTIFIER       DEMANDED, `literalOrigin` — and this row is NEW, because the
+ *                                round-28 table scoped itself to `resolveProperty` and
+ *                                `resolveElement` while `checkerLiterals` has a THIRD caller:
+ *                                `resolveIdentifier`'s fall-through, for a name that is neither a
+ *                                bound parameter nor a variable. That is not an edge: a DESTRUCTURED
+ *                                name is a `BindingElement` and lands here, so round 23's own Codex
+ *                                route — `const { ledger } = context as { ledger: 'QuickBooks' }` —
+ *                                runs through position (11) and not through (3) or (4) at all.
+ *                                Instrumenting the walk over this file's controls reaches it with
+ *                                `ledger` as a `BindingElement`, and with a `ClassDeclaration` and
+ *                                an `EnumDeclaration` receiver. The table was not merely short at
+ *                                the edge; it omitted the position its earliest control uses.
  *
- * `literalOrigin` is DEFAULT-DENY, which is what makes ten a closed count rather than a sample: it
+ * AND THE SUB-TABLE THE ROWS ABOVE DELEGATE TO, which round 28 did not write down and which is
+ * where its one wrong justification was. (3), (4), (9), (10) and (11) all end in `symbolOrigin`,
+ * and `symbolOrigin` decides by DECLARATION KIND:
+ *
+ *   REFUSED, always            a binding element (its type is whatever it was destructured out of
+ *                              was declared OR asserted to have — round 23).
+ *   REFUSED unless the
+ *   argument was honest        a parameter — `originFrames` carries the argument's provenance, a
+ *                              default's provenance is carried at both entries, and only the roots
+ *                              in `analyzerRoots` are trusted unbacked (rounds 24-27).
+ *   TRACED to its initializer  a variable, a property assignment, and — as of round 29 — a class
+ *                              field and an enum member. No initializer, or an ambient one, is
+ *                              refused rather than trusted.
+ *   ACCEPTED on annotation     a property signature, an interface, a type alias, a type parameter.
+ *                              These four hold NO EXPRESSION ANYWHERE, so there is nothing in them
+ *                              to assert. That is the criterion; "the receiver would be UNKNOWN"
+ *                              was not, and it is what round 28 used for the two kinds above it.
+ *   REFUSED by name            everything else, and `literalOrigin` is DEFAULT-DENY around it.
+ *
+ * WHAT ELSE RESTED ON THE RECEIVER ARGUMENT: nothing. Re-derived row by row — (1), (2), (5), (7)
+ * and (8) consult no checker type at all, so no provenance question arises; (6) is the closed count
+ * of NUMBER producers above; (3), (4), (9), (10) and (11) all DEMAND provenance and differ only in
+ * which expression they demand it of. The receiver-UNKNOWN argument appeared exactly once, in the
+ * sub-table, for exactly the two kinds that carry an expression — and both are now traced instead.
+ * `literalOrigin` staying DEFAULT-DENY is what makes eleven a closed count rather than a sample: it
  * admits six syntactic forms and refuses every other by name, and of the six only parenthesis,
- * non-null, property access and element access have sub-expressions at all. Element access was the
- * only one of those four with a sub-expression it did not visit.
- *
- * AND ONE GAP THAT REMAINS, NAMED RATHER THAN LEFT FOR ROUND 29. `symbolOrigin` trusts a
- * `PropertyDeclaration` — a CLASS field — on its annotation alone, without reading its initializer,
- * which is exactly the trust round 27 removed from a parameter's default. `class C { static mode:
- * 'REVIEWED' = 'UNREVIEWED' as unknown as 'REVIEWED' }` is that shape. It is not reachable TODAY,
- * and the reason is not provenance: a class identifier resolves to a `ClassDeclaration`, which
- * `resolveIdentifier` cannot compute, and a `new` resolves to one, which `implementationsOf`
- * refuses — so the receiver is UNKNOWN and round 24's propagation kills the access before any
- * annotation is read. If either of those ever learns to compute a class, this position folds. The
- * same is true of `EnumMember` for the same reason. Both are held closed by receiver propagation
- * and by the callee allowlist, not by `literalOrigin`.
+ * non-null, property access and element access have sub-expressions at all.
  *
  * `contextBinding` exists ONLY so a control can re-run this walk with the pre-fix concrete binding
  * and demonstrate that the branch is pruned again. Nothing else passes anything but `'SYMBOLIC'`.
