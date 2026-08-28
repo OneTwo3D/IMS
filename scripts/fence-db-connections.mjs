@@ -300,15 +300,25 @@ function decodeOrRaw(value) {
  */
 export function parseConnectionIdentity(connectionString) {
   if (!connectionString) return { ok: false, reason: 'is not set' }
+  //  `postgres://role@/db?host=/var/run/postgresql` — a login role with NO host in the authority —
+  //  is a libpq form WHATWG URL rejects, and node-postgres accepts it by retrying with a dummy
+  //  host and then treating the hostname as empty. Read it the same way or this refuses a URL the
+  //  driver connects with, and a check that refuses valid configurations gets switched off.
   let url
+  let emptyAuthorityHost = false
   try {
     url = new URL(connectionString)
   } catch {
-    return { ok: false, reason: 'cannot be parsed as a URL' }
+    try {
+      url = new URL(connectionString.replace('@/', '@___DUMMY___/'))
+      emptyAuthorityHost = true
+    } catch {
+      return { ok: false, reason: 'cannot be parsed as a URL' }
+    }
   }
   const params = url.searchParams
 
-  const authorityHost = url.hostname ? decodeOrRaw(url.hostname) : ''
+  const authorityHost = !emptyAuthorityHost && url.hostname ? decodeOrRaw(url.hostname) : ''
   const authorityPort = url.port || ''
   const authorityUser = url.username ? decodeOrRaw(url.username) : ''
   const queryHost = params.get('host') || ''

@@ -38,6 +38,14 @@ import {
   verifyRelease,
 } from '@/scripts/fence-db-connections.mjs'
 
+/**
+ * The live half of the ROLE identity check, as every pre-existing case has it: the connection
+ * logged in as the admin role and is running as that same role (o3d-2sm1.5, Codex r14 CRITICAL).
+ * assessDatabaseIdentity() refuses without it, so the cases that are about the DATABASE half say
+ * so by spreading this in; the cases that are about the role half override it deliberately.
+ */
+const ATTACHED_AS_ADMIN = { connectedLoginRole: 'deployadmin', connectedEffectiveRole: 'deployadmin' }
+
 /** Run the shipped script from a directory with no .env, and report what it said. */
 function runFenceScript(args: string[], env: Record<string, string | undefined>) {
   try {
@@ -529,8 +537,14 @@ class FakeAdminClient {
       datacl?: string | null
       releasedDatacl?: string | null
       connectedDatabase?: string
+      /** session_user — what this connection logged in as. */
+      loginRole?: string
+      /** current_user — what it is running as, which a SET ROLE can move away from the login role. */
+      effectiveRole?: string
       attached?: { pid: number; application_name: string; usename: string }[]
       throwAfterCommit?: string
+      /** COMMIT reaches the server and its acknowledgement never comes back. */
+      failCommitAck?: string
     } = {},
   ) {}
 
@@ -539,6 +553,11 @@ class FakeAdminClient {
   async query(text: string) {
     const sql = String(text).trim()
     this.log.push(sql)
+    if (sql === 'COMMIT' && this.options.failCommitAck) {
+      // THE COMMIT IS ON THE WIRE AND THE ANSWER NEVER ARRIVES. The revokes above are logged, so
+      // the assertion can prove they were sent; what the caller never learns is whether they took.
+      throw new Error(this.options.failCommitAck)
+    }
     if (sql === 'BEGIN' && this.options.stateFile) {
       // The instant that matters: what the medium had been asked to hold before the
       // transaction that makes it necessary was even opened.
@@ -549,7 +568,8 @@ class FakeAdminClient {
         rows: [
           {
             database: 'imsdb',
-            admin_role: 'deployadmin',
+            admin_role: this.options.effectiveRole ?? 'deployadmin',
+            admin_login_role: this.options.loginRole ?? 'deployadmin',
             owner_role: 'owner',
             datacl: this.options.datacl ?? '{owner=CTc/owner,=Tc/owner,imsapp=c/owner}',
             admin_is_superuser: true,
@@ -561,7 +581,15 @@ class FakeAdminClient {
       }
     }
     if (sql.includes('AS connected_database')) {
-      return { rows: [{ connected_database: this.options.connectedDatabase ?? 'imsdb' }] }
+      return {
+        rows: [
+          {
+            connected_database: this.options.connectedDatabase ?? 'imsdb',
+            connected_login_role: this.options.loginRole ?? 'deployadmin',
+            connected_effective_role: this.options.effectiveRole ?? 'deployadmin',
+          },
+        ],
+      }
     }
     if (sql.includes('AS still_connects')) {
       this.connectAsks += 1
@@ -1026,7 +1054,7 @@ test('an admin URL naming a different database from DATABASE_URL is refused even
   // assessDatabaseIdentity() and this returns bound. The live check below cannot cover it: the
   // migration runs through a SEPARATE connection composed from the admin URL, so two URLs that
   // disagree are a refusal on their own merits, whatever this particular connection reached.
-  const verdict = assessDatabaseIdentity({
+  const verdict = assessDatabaseIdentity({ ...ATTACHED_AS_ADMIN,
     adminUrl: 'postgres://deployadmin@localhost:5432/onetwo3d_ims_copy',
     appUrl: 'postgres://imsapp@localhost:5432/onetwo3d_ims',
     connectedDatabase: 'onetwo3d_ims',
@@ -1040,7 +1068,7 @@ test('an admin URL naming a different database from DATABASE_URL is refused even
 test('an admin URL on a different server is refused rather than assumed to be the same host renamed', () => {
   // MUTATION ROUTE: delete the `admin.server !== app.server` arm and this returns bound. A
   // privilege read on one server says nothing whatever about another.
-  const verdict = assessDatabaseIdentity({
+  const verdict = assessDatabaseIdentity({ ...ATTACHED_AS_ADMIN,
     adminUrl: 'postgres://deployadmin@db-old.internal:5432/onetwo3d_ims',
     appUrl: 'postgres://imsapp@db-new.internal:5432/onetwo3d_ims',
     connectedDatabase: 'onetwo3d_ims',
@@ -1057,7 +1085,7 @@ test('a connection attached to a database neither URL asked for is refused', () 
   // the case a URL comparison cannot see at all.
   //
   // MUTATION ROUTE: delete the `connectedDatabase !== app.database` arm and this returns bound.
-  const verdict = assessDatabaseIdentity({
+  const verdict = assessDatabaseIdentity({ ...ATTACHED_AS_ADMIN,
     adminUrl: 'postgres://deployadmin@localhost:5432/',
     appUrl: 'postgres://imsapp@localhost:5432/onetwo3d_ims',
     connectedDatabase: 'deployadmin',
@@ -1074,7 +1102,7 @@ test('a loopback address, localhost and a unix socket are the same machine, and 
   // MUTATION ROUTE: compare the host strings as written — drop the LOCAL_HOSTS/socket family in
   // parseConnectionIdentity() — and both of these are refused.
   assert.equal(
-    assessDatabaseIdentity({
+    assessDatabaseIdentity({ ...ATTACHED_AS_ADMIN,
       adminUrl: 'postgres://deployadmin@127.0.0.1:5432/onetwo3d_ims',
       appUrl: 'postgres://imsapp@localhost:5432/onetwo3d_ims',
       connectedDatabase: 'onetwo3d_ims',
@@ -1082,7 +1110,7 @@ test('a loopback address, localhost and a unix socket are the same machine, and 
     true,
   )
   assert.equal(
-    assessDatabaseIdentity({
+    assessDatabaseIdentity({ ...ATTACHED_AS_ADMIN,
       adminUrl: 'postgresql:///onetwo3d_ims?host=/var/run/postgresql',
       appUrl: 'postgres://imsapp@localhost/onetwo3d_ims',
       connectedDatabase: 'onetwo3d_ims',
@@ -1092,7 +1120,7 @@ test('a loopback address, localhost and a unix socket are the same machine, and 
   )
   // And the port still separates two clusters on that one machine.
   assert.equal(
-    assessDatabaseIdentity({
+    assessDatabaseIdentity({ ...ATTACHED_AS_ADMIN,
       adminUrl: 'postgres://deployadmin@localhost:5433/onetwo3d_ims',
       appUrl: 'postgres://imsapp@localhost:5432/onetwo3d_ims',
       connectedDatabase: 'onetwo3d_ims',
@@ -1104,9 +1132,9 @@ test('a loopback address, localhost and a unix socket are the same machine, and 
 test('nothing to bind to is not a pass: an unset or database-less DATABASE_URL is refused', () => {
   // MUTATION ROUTE: return { bound: true } when appUrl is missing — the "there is nothing to
   // check, so it must be fine" reading — and both of these fail.
-  assert.equal(assessDatabaseIdentity({ adminUrl: 'postgres://deployadmin@localhost/imsdb', appUrl: '', connectedDatabase: 'imsdb' }).bound, false)
+  assert.equal(assessDatabaseIdentity({ ...ATTACHED_AS_ADMIN, adminUrl: 'postgres://deployadmin@localhost/imsdb', appUrl: '', connectedDatabase: 'imsdb' }).bound, false)
   assert.equal(
-    assessDatabaseIdentity({ adminUrl: 'postgres://deployadmin@localhost/imsdb', appUrl: 'postgres://imsapp@localhost/', connectedDatabase: 'imsdb' }).bound,
+    assessDatabaseIdentity({ ...ATTACHED_AS_ADMIN, adminUrl: 'postgres://deployadmin@localhost/imsdb', appUrl: 'postgres://imsapp@localhost/', connectedDatabase: 'imsdb' }).bound,
     false,
     'a URL with no database in its path identifies no database',
   )
@@ -1335,6 +1363,256 @@ test('an error thrown AFTER the commit is a standing fence, not an exception the
 
     assert.equal(code, EXIT_FENCE_STANDING, 'a throw after COMMIT is still a database with a fence on it')
     assert.ok(client.log.includes('COMMIT'), 'precondition: the revokes committed before the failure')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// o3d-2sm1.5 (Codex r14) — THE CONNECTION NODE-POSTGRES WILL REALLY OPEN.
+//
+//   CRITICAL  the identity proof compared the URL's AUTHORITY. pg-connection-string, which pg
+//             uses, copies the QUERY STRING into the config first and fills host/port/user from
+//             the authority only if the query left them unset — so `?host=`, `?port=` and
+//             `?user=` redirect the connection. The proof passed while the application connected
+//             to another cluster, as another role, and went on writing across the migration.
+//
+// The parse is one half. The other is that the role is now ASKED OF THE CONNECTION —
+// session_user and current_user — because PGUSER, a .pgpass entry, an ident map and
+// `options=-c role=` are all outside any URL.
+// ---------------------------------------------------------------------------
+
+test('a query parameter that redirects the server is what the driver uses, so it is what is compared', () => {
+  // THE FINDING'S OWN URL. Its authority and path say localhost:5432/onetwo3d_ims — the admin
+  // URL's own address, exactly — and the query string is where node-postgres actually goes.
+  //
+  // MUTATION ROUTE: restore the original parse, which is BOTH halves of the fix at once — read
+  // the authority first (`url.hostname || params.get('host')`, `url.port || params.get('port')`)
+  // AND drop the conflict refusal. This then returns bound: both URLs look like localhost:5432
+  // while the application is on remote.example:6432, and the fence proves itself against a
+  // cluster nobody uses. Either half alone catches it, which is why those routes are separate
+  // below; this test is the whole defect as reported.
+  const redirected = assessDatabaseIdentity({
+    ...ATTACHED_AS_ADMIN,
+    adminUrl: 'postgres://deployadmin@localhost:5432/onetwo3d_ims',
+    appUrl: 'postgres://imsapp@localhost:5432/onetwo3d_ims?host=remote.example&port=6432',
+    connectedDatabase: 'onetwo3d_ims',
+  })
+  assert.equal(redirected.bound, false, 'the query string is where this connection actually goes')
+  assert.match(redirected.reason, /remote\.example/)
+
+  // And with nothing in the authority to disagree with — `postgres://role@/db?host=...`, the
+  // libpq form WHATWG URL rejects and node-postgres accepts by retrying with a dummy host — the
+  // query values are simply what this connection IS: resolved and compared as remote.example:6432
+  // rather than refused as unreadable.
+  const identity = parseConnectionIdentity('postgres://imsapp@/onetwo3d_ims?host=remote.example&port=6432')
+  assert.equal(identity.ok, true, 'a URL the driver connects with must not be refused as unparseable')
+  assert.equal(identity.host, 'remote.example')
+  assert.equal(identity.port, '6432')
+  assert.equal(identity.server, 'remote.example:6432')
+  const viaQueryOnly = assessDatabaseIdentity({
+    ...ATTACHED_AS_ADMIN,
+    adminUrl: 'postgres://deployadmin@localhost:5432/onetwo3d_ims',
+    appUrl: 'postgres://imsapp@/onetwo3d_ims?host=remote.example&port=6432',
+    connectedDatabase: 'onetwo3d_ims',
+  })
+  assert.equal(viaQueryOnly.bound, false)
+  assert.match(viaQueryOnly.reason, /remote\.example:6432/, 'and the refusal names where it really goes')
+})
+
+test('a query parameter that redirects the ROLE is the role the fence would have to revoke', () => {
+  // `?user=` is what node-postgres authenticates as; the authority username is a decoration it
+  // never reaches. The fence revokes CONNECT from the application role and verifies with
+  // has_database_privilege() against it, so reading the wrong one fences a role nobody uses.
+  //
+  // MUTATION ROUTE: return `url.username` from parseRoleFromConnectionString() and this returns
+  // '' for the query-only form and the authority name for the conflicting one.
+  assert.equal(parseRoleFromConnectionString('postgres://@localhost:5432/onetwo3d_ims?user=actual'), 'actual')
+  assert.equal(parseRoleFromConnectionString('postgres://imsapp@localhost:5432/onetwo3d_ims'), 'imsapp')
+  // And a URL that names two different roles is refused outright rather than resolved, so no
+  // caller gets a role at all — which every caller treats as a refusal.
+  assert.equal(parseRoleFromConnectionString('postgres://app@localhost:5432/onetwo3d_ims?user=actual'), '')
+})
+
+test('a URL that disagrees with itself about host, port or role is refused, not resolved', () => {
+  // MUTATION ROUTE: drop the authority/query conflict loop and each of these becomes ok, silently
+  // resolving to the query value — which is the driver's answer, but "probably what they meant"
+  // is the reasoning this whole check exists to stop.
+  for (const url of [
+    'postgres://imsapp@localhost:5432/onetwo3d_ims?host=remote.example',
+    'postgres://imsapp@localhost:5432/onetwo3d_ims?port=6432',
+    'postgres://imsapp@localhost:5432/onetwo3d_ims?user=actual',
+  ]) {
+    const identity = parseConnectionIdentity(url)
+    assert.equal(identity.ok, false, `${url} names two different things and must be refused`)
+    assert.match(identity.reason, /query string/)
+  }
+  // An EMPTY parameter is not a disagreement: the driver falls back to the authority, and so does
+  // this. The control on the control — a check that refuses valid URLs gets turned off.
+  assert.equal(parseConnectionIdentity('postgres://imsapp@localhost:5432/onetwo3d_ims?host=').host, 'localhost')
+})
+
+test('a ?dbname= that names a database the driver ignores is refused rather than believed', () => {
+  // node-postgres overwrites config.database from the pathname UNCONDITIONALLY, so this parameter
+  // does nothing at all — and a false statement about WHICH DATABASE is the subject of this gate.
+  //
+  // MUTATION ROUTE: delete the dbname/database loop and this returns ok with database 'imsdb',
+  // the operator believing the connection lands on onetwo3d_ims.
+  const identity = parseConnectionIdentity('postgres://imsapp@localhost/imsdb?dbname=onetwo3d_ims')
+  assert.equal(identity.ok, false)
+  assert.match(identity.reason, /IGNORES/)
+  // The same name in both places is not a disagreement and is allowed through.
+  assert.equal(parseConnectionIdentity('postgres://imsapp@localhost/imsdb?dbname=imsdb').ok, true)
+})
+
+test('the role half is asked of the connection: what it logged in as, and what it is running as', () => {
+  // MUTATION ROUTE: delete the connectedLoginRole arms from assessDatabaseIdentity() and all
+  // three of these return bound.
+  const base = {
+    adminUrl: 'postgres://deployadmin@localhost/onetwo3d_ims',
+    appUrl: 'postgres://imsapp@localhost/onetwo3d_ims',
+    connectedDatabase: 'onetwo3d_ims',
+  }
+
+  // A connection that will not say what it logged in as cannot be shown to be the one whose
+  // CONNECT is deliberately NOT revoked. Absence is not a pass.
+  assert.equal(assessDatabaseIdentity({ ...base, connectedLoginRole: '', connectedEffectiveRole: 'deployadmin' }).bound, false)
+
+  // Running as somebody other than it logged in as: every ACL answer below would be given as the
+  // assumed role while CONNECT belongs to the login one.
+  const assumed = assessDatabaseIdentity({ ...base, connectedLoginRole: 'deployadmin', connectedEffectiveRole: 'imsapp' })
+  assert.equal(assumed.bound, false)
+  assert.match(assumed.reason, /SET ROLE/)
+
+  // The URL says one role and the connection logged in as another — PGUSER, .pgpass, an ident map.
+  const elsewhere = assessDatabaseIdentity({ ...base, connectedLoginRole: 'postgres', connectedEffectiveRole: 'postgres' })
+  assert.equal(elsewhere.bound, false)
+  assert.match(elsewhere.reason, /deployadmin/)
+  assert.match(elsewhere.reason, /postgres/)
+
+  // And the ordinary configuration still passes.
+  assert.equal(assessDatabaseIdentity({ ...base, ...ATTACHED_AS_ADMIN }).bound, true)
+})
+
+/** An application URL that is redirected by its query string, at the wire. */
+async function withRedirectedAppUrl<T>(appUrl: string, run: () => Promise<T>): Promise<T> {
+  const previous = process.env.DEPLOY_ADMIN_DATABASE_URL
+  const previousApp = process.env.DATABASE_URL
+  process.env.DEPLOY_ADMIN_DATABASE_URL = 'postgres://deployadmin@localhost:5432/imsdb'
+  process.env.DATABASE_URL = appUrl
+  try {
+    return await run()
+  } finally {
+    if (previous === undefined) delete process.env.DEPLOY_ADMIN_DATABASE_URL
+    else process.env.DEPLOY_ADMIN_DATABASE_URL = previous
+    if (previousApp === undefined) delete process.env.DATABASE_URL
+    else process.env.DATABASE_URL = previousApp
+  }
+}
+
+test('the fence revokes nothing when DATABASE_URL is redirected to another cluster by its query string', async () => {
+  // THE WHOLE FINDING, AT THE WIRE. The admin URL and the application URL name the same database
+  // on the same authority; only the query string says the application is somewhere else entirely.
+  // Fencing here locks other people's clients out of THIS cluster while the application keeps
+  // writing to remote.example across the migration.
+  //
+  // MUTATION ROUTE: read the authority first in parseConnectionIdentity() and this fence proceeds
+  // — client.revokes stops being empty and the code stops being EXIT_NOT_FENCEABLE.
+  const dir = stateDir()
+  try {
+    const stateFile = join(dir, 'db-connect-fence.json')
+    const client = new FakeAdminClient({ stateFile })
+    const code = await withRedirectedAppUrl('postgres://imsapp@localhost:5432/imsdb?host=remote.example&port=6432', () =>
+      doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1 }),
+    )
+
+    assert.equal(code, EXIT_NOT_FENCEABLE)
+    assert.deepEqual(client.revokes, [], 'nothing may be revoked on a cluster the application does not use')
+    assert.ok(!client.log.includes('COMMIT'), 'and no transaction may commit')
+    assert.equal(existsSync(stateFile), false, 'and no record may be published for a fence that never happened')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('the fence revokes nothing when the connection logged in as a role the admin URL does not name', async () => {
+  // MUTATION ROUTE: delete the admin.user vs connectedLoginRole arm and this fence proceeds,
+  // excluding 'deployadmin' from the revoke while the connection it must keep is 'postgres' —
+  // which is how a fence locks out the very connection that would release it.
+  const dir = stateDir()
+  try {
+    const stateFile = join(dir, 'db-connect-fence.json')
+    const client = new FakeAdminClient({ stateFile, loginRole: 'postgres', effectiveRole: 'postgres' })
+    const code = await withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1 }))
+
+    assert.equal(code, EXIT_NOT_FENCEABLE)
+    assert.deepEqual(client.revokes, [])
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// o3d-2sm1.5 (Codex r14) — A LOST ACKNOWLEDGEMENT IS NOT A NEGATIVE ANSWER.
+//
+//   HIGH  the post-commit protection began only after `await client.query('COMMIT')` RESOLVED.
+//         PostgreSQL can commit the REVOKEs and then lose the connection before the
+//         acknowledgement arrives; the promise rejects, the old code rolled back into thin air
+//         and threw, main() exited 1 — and all three entrypoints, which raise the sticky
+//         DB_FENCE_RAISED only on exits 0 and 5, recorded a run with no fence to its name over a
+//         database whose CONNECT may be revoked from PUBLIC, monitoring, backup, BI and a second
+//         application. The boundary is now the moment COMMIT is ISSUED.
+// ---------------------------------------------------------------------------
+
+test('a COMMIT whose acknowledgement never arrives is a fence that MAY BE STANDING, not one that did not happen', async () => {
+  // MUTATION ROUTE: move `commitIssued = true` to after the COMMIT await — the old boundary — and
+  // this test rejects instead of returning, because the catch rethrows.
+  const dir = stateDir()
+  try {
+    const stateFile = join(dir, 'db-connect-fence.json')
+    const client = new FakeAdminClient({ stateFile, failCommitAck: 'Connection terminated unexpectedly' })
+    const code = await withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1 }))
+
+    assert.equal(code, EXIT_FENCE_STANDING, 'unknown must not be reported as the not-committed case')
+    assert.notEqual(code, EXIT_ERROR, 'and exit 1 is the code the entrypoints read as "no fence was raised"')
+    // Precondition: this really is the lost-acknowledgement path — the revokes and the COMMIT were
+    // both put on the wire, and only the answer went missing.
+    assert.equal(client.revokes.length, 3, 'the revokes must have been sent for this to be about a possible fence')
+    assert.ok(client.log.includes('COMMIT'), 'and the COMMIT must have been issued')
+    // No rollback: a transaction that has been told to commit is not one this run can take back,
+    // and a ROLLBACK here would only make the log claim it undid something.
+    assert.ok(!client.log.includes('ROLLBACK'), 'nothing may claim to have undone a commit whose fate is unknown')
+    // The record is the only account of what may now be revoked, so it stays.
+    assert.equal(existsSync(stateFile), true, 'the undo record must survive the failure that made it necessary')
+    assert.deepEqual(JSON.parse(readFileSync(stateFile, 'utf8')).revoked, ['PUBLIC', 'owner', 'imsapp'])
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a failure BEFORE the COMMIT is issued still rolls back and still reports a fence that never happened', async () => {
+  // The control on the control (o3d-2sm1.5): if every failure became EXIT_FENCE_STANDING, the
+  // code would stop meaning anything and every aborted run would send an operator hunting for a
+  // fence that is not there.
+  //
+  // MUTATION ROUTE: drop the `if (!commitIssued)` guard and this stops throwing.
+  const dir = stateDir()
+  try {
+    const stateFile = join(dir, 'db-connect-fence.json')
+    class RefusingClient extends FakeAdminClient {
+      override async query(text: string) {
+        if (String(text).trim().startsWith('REVOKE')) throw new Error('permission denied for database imsdb')
+        return super.query(text)
+      }
+    }
+    const client = new RefusingClient({ stateFile })
+    await assert.rejects(
+      () => withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1 })),
+      /permission denied/,
+      'a revoke that was refused is a fence that demonstrably did not happen',
+    )
+    assert.ok(client.log.includes('ROLLBACK'), 'and the transaction it opened is rolled back')
+    assert.ok(!client.log.includes('COMMIT'), 'precondition: nothing was ever told to commit')
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
