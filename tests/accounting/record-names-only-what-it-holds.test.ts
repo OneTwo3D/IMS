@@ -3738,7 +3738,8 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
   assert.notEqual(splitLiteral, model, 'the split-literal mutation must actually have been applied')
   const splitComplaints = judgeRendererOutput(splitLiteral)
   assert.ok(
-    splitComplaints.some((complaint) => complaint.includes('retry')),
+    splitComplaints.some((complaint) => complaint.startsWith('emits a sentence nobody reviewed')
+      && complaint.includes('retry')),
     'CONTROL, THE CODEX ROUTE: an instruction composed out of one-character literals must be refused on the '
     + `value it composes to. Saw: ${JSON.stringify(splitComplaints)}`,
   )
@@ -3829,7 +3830,8 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
   )
   assert.notEqual(appended, model, 'the appended-sentence mutation must actually have been applied')
   assert.ok(
-    judgeRendererOutput(appended).some((complaint) => complaint.includes('take the second PDF off it')),
+    judgeRendererOutput(appended).some((complaint) => complaint.startsWith('emits a sentence nobody reviewed')
+      && complaint.includes('take the second PDF off it')),
     'CONTROL: a destructive sentence appended to a reachable branch is refused on the value it produces',
   )
 
@@ -3851,7 +3853,8 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
     'the static method must be READ rather than refused — resolving through symbols is what reaches it',
   )
   assert.ok(
-    staticComplaints.some((complaint) => complaint.includes('take the second PDF off it')),
+    staticComplaints.some((complaint) => complaint.startsWith('emits a sentence nobody reviewed')
+      && complaint.includes('take the second PDF off it')),
     `CONTROL: and what it returns is then judged as a value. Saw: ${JSON.stringify(staticComplaints)}`,
   )
 
@@ -3865,8 +3868,24 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
   assert.ok(
     judgeRendererOutput(viaImportedHelper, {
       [helperPath]: "export function remoteRemediation(): string {\n  return '" + UNDECLARED_REMOTE_ACTION + "'\n}\n",
-    }).some((complaint) => complaint.includes('take the second PDF off it')),
+    }).some((complaint) => complaint.startsWith('emits a sentence nobody reviewed')
+      && complaint.includes('take the second PDF off it')),
     'CONTROL: a helper in another module is followed through its import alias and judged on what it returns',
+  )
+
+  // (I) AND A REVIEWED SENTENCE THAT STOPS BEING EMITTABLE IS AN OFFENCE TOO. An inventory nothing is
+  // held to reviews nothing: a branch quietly collapsed into another leaves a sentence sitting in
+  // RENDERED_DIRECTIONS that no longer describes anything the module does.
+  const collapsedBranch = model.replace(
+    "      return `${direction.caseForm === 'SENTENCE' ? 'Escalate' : 'escalate'} this record ${administrator}`",
+    '      return `Escalate this record ${administrator}`',
+  )
+  assert.notEqual(collapsedBranch, model, 'the collapsed-branch mutation must actually have been applied')
+  assert.ok(
+    judgeRendererOutput(collapsedBranch).some((complaint) => complaint.startsWith('a reviewed sentence this renderer '
+      + 'cannot emit') && complaint.includes('escalate this record')),
+    'CONTROL: the inventory is held to the module in BOTH directions — a reviewed sentence the renderer can no '
+    + 'longer produce is drift, not tidying',
   )
 
   // (H) AND THE SEQUENCE RENDERER'S OWN CONJUNCTION IS PROSE. It belongs to neither element, so it
