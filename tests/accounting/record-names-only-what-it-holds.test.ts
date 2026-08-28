@@ -40,6 +40,24 @@ import {
 
 const OPERATION_TYPES = Object.keys(OPERATION_SEMANTIC_BY_TYPE) as AccountingSyncType[]
 
+/**
+ * ROUND 17 (Codex MEDIUM): THE TYPES THIS BINARY DOES NOT CLASSIFY.
+ *
+ * `AccountingSyncType` is a Prisma enum, so a newer release can persist a value this build has no
+ * `OPERATION_SEMANTIC_BY_TYPE` row for, and both formatters have a frame for exactly that — the
+ * `UNCLASSIFIED_MARKER` branch, which this file already treats as a supported forward-skew path
+ * (the round-9 test drives `FUTURE_LEDGER_THING` through it by hand).
+ *
+ * But the CORPUS was built from `Object.keys(OPERATION_SEMANTIC_BY_TYPE)`, so every message it
+ * generated was classified, the unclassified filter in `lookupLessMessages()` matched nothing, and
+ * the two unclassified frames were never decomposed against the three reviewed lists. New wording
+ * in either of them could have reintroduced a remote instruction without failing round 16 at all.
+ * They are in the corpus now.
+ */
+const UNCLASSIFIED_OPERATION_TYPES = ['FUTURE_LEDGER_THING'] as unknown as AccountingSyncType[]
+
+const EVERY_GENERATED_TYPE: AccountingSyncType[] = [...OPERATION_TYPES, ...UNCLASSIFIED_OPERATION_TYPES]
+
 const ENTRY = (type: AccountingSyncType) => ({
   id: 'log-1',
   type,
@@ -70,7 +88,7 @@ const OUTCOMES: (PostedOperationOutcome | undefined)[] = [
 /** Every message the module can produce, for every type, every id combination and every outcome. */
 function everyIncidentMessage(): { label: string; text: string }[] {
   const messages: { label: string; text: string }[] = []
-  for (const type of OPERATION_TYPES) {
+  for (const type of EVERY_GENERATED_TYPE) {
     for (const outcome of OUTCOMES) {
       const o = JSON.stringify(outcome ?? null)
       for (const posted of [null, 'EXT-1']) {
@@ -1110,6 +1128,12 @@ const FRAME_TEMPLATES: readonly string[] = [
     + 'directly, and the machinery that would make an operator remedy sound is filed as o3d-4b5p (a '
     + 'quiescence fence the cron, the manual sync, the claim and the writeback all honour) and '
     + 'o3d-3lhp (a per-row remediation, and a way to cancel a queued email).',
+  // ROUND 17 (Codex MEDIUM): the unclassified frame's refusal. It names three acts — open, keep,
+  // void — and refuses all three in the same breath, which is the only reason a record that can
+  // establish nothing is allowed to mention them at all. It was outside every scan until the
+  // corpus started generating unclassified types.
+  'DO NOT ASSUME A DOCUMENT. This record will not tell you to open, keep or void one, because it '
+    + 'cannot establish that there is one.',
 ]
 
 /**
@@ -1335,7 +1359,7 @@ const IDENTITY_FIELDS = new Set([
 /** The branch that has no wording entry at all — an operation type this binary does not classify. */
 const UNCLASSIFIED_MARKER = 'THIS VERSION OF IMS DOES NOT CLASSIFY THAT OPERATION TYPE'
 
-const OPERATION_TYPES_LONGEST_FIRST = [...OPERATION_TYPES].sort((a, b) => b.length - a.length)
+const OPERATION_TYPES_LONGEST_FIRST = [...EVERY_GENERATED_TYPE].sort((a, b) => b.length - a.length)
 
 /**
  * Put EVERY per-incident value back into placeholder form, not only the two round 15 did. The
@@ -1648,7 +1672,16 @@ const RECORD_PROSE: readonly string[] = [
   "the document it changed",
   "the draft it changed",
   "REMEDY:",
-  ", and",]
+  ", and",
+  // ROUND 17 (Codex MEDIUM): the three spans the unclassified frames contribute. The first is the
+  // classified preamble stopping short — an unclassified message cannot go on to say WHAT THE
+  // OPERATION DID, because it does not know. The second and third are the two sentences the
+  // unclassified branch adds in its place: a statement of incapacity, and a refusal. None of them
+  // instructs, and none of them was decomposed until the corpus reached this branch.
+  "{ledger} {type} for {reference} SUCCEEDED — the external effect has happened — but IMS could not record that it did",
+  "THIS VERSION OF IMS DOES NOT CLASSIFY THAT OPERATION TYPE, so it cannot say what, if anything, now stands in {ledger}.",
+  "DO NOT ASSUME A DOCUMENT. This record will not tell you to open, keep or void one, because it cannot establish that there is one.",
+]
 
 /** The gap a stripped span leaves behind — a character no prose can contain. */
 const SPAN_GAP = '\u0001'
