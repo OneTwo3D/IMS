@@ -783,7 +783,7 @@ publish_fence_script_copy() {
     if [[ -f "${DB_FENCE_SCRIPT}" ]]; then
       candidate="$(file_sha256 "${DB_FENCE_SCRIPT}")" || candidate=""
       if [[ -n "${candidate}" && -n "${existing}" && "${candidate}" != "${existing}" ]]; then
-        DB_FENCE_ROTATION_NOTE="${DB_FENCE_SCRIPT} (${candidate}) differs from the protected copy at ${DB_FENCE_SCRIPT_COPY} (${existing}) and was NOT promoted: the checkout is application-owned and cannot authenticate itself. To adopt it deliberately, re-run with IMS_FENCE_SCRIPT_SHA256=<digest of the release's scripts/fence-db-connections.mjs>, taken from the release and not from this box; or remove ${DB_FENCE_PROTECTED_APP_DIR} as root and re-run."
+        DB_FENCE_ROTATION_NOTE="${DB_FENCE_SCRIPT} (${candidate}) differs from the protected copy at ${DB_FENCE_SCRIPT_COPY} (${existing}) and was NOT promoted: the checkout is application-owned and cannot authenticate itself. To adopt it deliberately, re-run with BOTH IMS_FENCE_SCRIPT_SHA256=<digest of the release's entry file> and IMS_FENCE_ARTEFACT_SHA256=<digest of the whole artefact tree>, taken from the release and not from this box — the entry-file digest alone does not cover the dependency closure this would also republish out of the checkout, and is refused on its own here. Or discard the artefact and let the next run bootstrap: ${DB_FENCE_SUDO_PREFIX}rm -rf ${DB_FENCE_PROTECTED_APP_DIR}"
       fi
     fi
     return 0
@@ -888,7 +888,7 @@ db_fence_script_in_use() {
 
   recorded_artefact="$(fence_record_artefact_digest)" || recorded_artefact=""
   if [[ -z "${recorded_artefact}" ]]; then
-    echo "There is no complete artefact record at ${DB_FENCE_ARTEFACT_FILE}, so nothing says what ${DB_FENCE_PROTECTED_APP_DIR} is supposed to hash to and the tree cannot be authenticated. Remove ${DB_FENCE_PROTECTED_APP_DIR} as root and re-run to republish it, or supply IMS_FENCE_ARTEFACT_SHA256." >&2
+    echo "There is no complete artefact record at ${DB_FENCE_ARTEFACT_FILE}, so nothing says what ${DB_FENCE_PROTECTED_APP_DIR} is supposed to hash to and the tree cannot be authenticated. Discard it and let the next run republish — ${DB_FENCE_SUDO_PREFIX}rm -rf ${DB_FENCE_PROTECTED_APP_DIR} — or supply IMS_FENCE_ARTEFACT_SHA256." >&2
     return 1
   fi
   actual_artefact="$(_fence_tree_digest "${DB_FENCE_PROTECTED_APP_DIR}")" || actual_artefact=""

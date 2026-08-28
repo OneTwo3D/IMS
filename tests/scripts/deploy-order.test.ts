@@ -7465,6 +7465,11 @@ for (const entry of FENCE_HARNESS) {
       // AND IT SAID SO, naming both digests and the only thing that could authorise the swap.
       assert.match(second.output, /was NOT promoted/, `the divergence must be reported:\n${second.output}`)
       assert.match(second.output, /IMS_FENCE_SCRIPT_SHA256/, 'naming what a legitimate rotation needs')
+      // BOTH PINS (r33). A rotation republishes the dependency closure as well, out of the same
+      // application-writable checkout, so advice that named only the entry-file digest would send
+      // an operator into a refusal. MUTATION ROUTE: drop IMS_FENCE_ARTEFACT_SHA256 from the
+      // divergence note in publish_fence_script_copy() and this fails.
+      assert.match(second.output, /IMS_FENCE_ARTEFACT_SHA256/, 'and the whole-tree digest it also needs')
       // NOT FATAL, though: refusing here would let the same account stop every future cutover by
       // writing one byte into a file it owns.
       assert.equal(second.status, 0, `and the run must go on with the protected copy:\n${second.output}`)
@@ -7562,6 +7567,8 @@ test('r31: the protected helper is bootstrapped once and then only rotated by an
     assert.match(drift.output, /was NOT promoted/, `and the divergence is reported:\n${drift.output}`)
     assert.match(drift.output, new RegExp(sha256(V2)), 'naming what the checkout now hashes to')
     assert.match(drift.output, new RegExp(sha256(V1)), 'and what the protected copy hashes to')
+    assert.match(drift.output, /IMS_FENCE_SCRIPT_SHA256/, 'and what would adopt it')
+    assert.match(drift.output, /IMS_FENCE_ARTEFACT_SHA256/, 'both of them, since a rotation republishes the closure too (r33)')
 
     // CASE 3 — AN EXPECTED DIGEST THAT DOES NOT MATCH THE CHECKOUT. The rotation is refused and
     // the standing copy is untouched: an operator who was given the wrong digest, or a checkout

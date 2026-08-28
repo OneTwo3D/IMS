@@ -1065,7 +1065,7 @@ and nothing else:
 | state | what happens |
 | --- | --- |
 | no protected copy yet | the checkout's helper **and its resolved dependency closure** are staged into the root-owned directory and published there. Trust on first use — and since r33 the run **says so**, names the path that made the source application-writable, and prints the artefact digest to pin every host after this one with. There is no earlier artefact and no operator digest, and the alternative is a mechanism that cannot start. A supplied digest is still enforced, and `IMS_FENCE_SCRIPT_SHA256` **on its own is refused here**: see below. |
-| a protected copy, no expected digest | the protected copy is used unchanged. A checkout that **differs** is reported — both digests, and the invocation that would adopt it — and **not** promoted. |
+| a protected copy, no expected digest | the protected copy is used unchanged. A checkout that **differs** is reported — both digests, and the invocation that would adopt it, which since r33 names **both** pins because a rotation republishes the closure too — and **not** promoted. |
 | a protected copy and an expected digest | an authenticated rotation (below). |
 
 Divergence **warns rather than refuses** deliberately. Refusing would hand the application account
