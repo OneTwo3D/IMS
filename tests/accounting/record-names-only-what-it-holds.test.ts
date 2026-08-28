@@ -3423,6 +3423,19 @@ type RootProvenance = 'CARRIED' | 'DROPPED'
 type KeyProvenance = 'DEMANDED' | 'IGNORED'
 
 /**
+ * WHETHER A DECLARATION THAT CARRIES AN INITIALIZER IS TRUSTED ON ITS ANNOTATION (round 29, Codex
+ * HIGH).
+ *
+ * `'DEMANDED'` is what ships: a class `PropertyDeclaration` and an `EnumMember` pair an annotation
+ * with an EXPRESSION, so — like a variable, a property assignment and a parameter default before
+ * them — the annotation is honest exactly as far as that expression is, and a member declared
+ * without an implementation this walk can read is honest not at all. `'IGNORED'` reproduces rounds
+ * 22-28, every one of which let both kinds through on the annotation alone. Control (Q) shows what
+ * that let past.
+ */
+type FieldProvenance = 'DEMANDED' | 'IGNORED'
+
+/**
  * THE ROOTS THIS WALK CREATES, BY NAME. `rootShapes` calls exactly these two with no arguments, so
  * exactly their parameters are values this walk supplied and whose declared types are therefore the
  * module's own word about itself. Everything else in the program is reached through a call, and
@@ -3587,6 +3600,7 @@ function computeRendererOutput(
   rootEntry: RootEntry = 'ABSTRACT',
   rootProvenance: RootProvenance = 'CARRIED',
   keyProvenance: KeyProvenance = 'DEMANDED',
+  fieldProvenance: FieldProvenance = 'DEMANDED',
 ): ComputedRendererOutput {
   const program = directionModelProgram(model, extraFiles)
   const checker = program.getTypeChecker()
@@ -3770,12 +3784,53 @@ function computeRendererOutput(
         }
         continue
       }
-      // THE HONEST PROVENANCE, and the only one that folds: a type annotation somebody wrote down.
-      // A property signature of the closed direction union, an enum member. `direction.target` and
-      // `direction.form` are these, and nothing else here is.
-      if (ts.isPropertySignature(declaration) || ts.isPropertyDeclaration(declaration)
-        || ts.isEnumMember(declaration) || ts.isTypeAliasDeclaration(declaration)
+      // THE HONEST PROVENANCE, and the only one that folds: a type annotation somebody wrote down
+      // in a declaration THAT CANNOT CARRY AN EXPRESSION AT ALL. A property signature of the closed
+      // direction union, an interface, a type alias, a type parameter — every one of them is
+      // type-position syntax from end to end, so there is nowhere in it an `as` could have been
+      // written and nothing whose runtime value could disagree with what it says.
+      // `direction.target` and `direction.form` are these, and nothing else here is.
+      //
+      // THAT — not "the receiver would be UNKNOWN" — IS THE CRITERION (round 29, Codex HIGH). Round
+      // 28 kept `PropertyDeclaration` and `EnumMember` in this list and defended them with a
+      // reachability argument about their receivers. The criterion the list actually needs is
+      // structural, and it splits these six exactly: four kinds hold no expression, and two do.
+      if (ts.isPropertySignature(declaration) || ts.isTypeAliasDeclaration(declaration)
         || ts.isInterfaceDeclaration(declaration) || ts.isTypeParameterDeclaration(declaration)) {
+        continue
+      }
+      // A DECLARATION THAT PAIRS AN ANNOTATION WITH AN EXPRESSION IS HONEST ONLY AS FAR AS THAT
+      // EXPRESSION IS (round 29, Codex HIGH). A class FIELD and an ENUM MEMBER are that pairing, and
+      // rounds 23-27 are one sentence about it: the annotation is what the checker reports, the
+      // expression is what runs. `class C { mode: 'REVIEWED' = 'UNREVIEWED' as unknown as
+      // 'REVIEWED' }` is (O)'s asserted default, one declaration kind further along.
+      //
+      // ROUND 28 NAMED THIS POSITION AND ARGUED IT UNREACHABLE, AND THE ARGUMENT WAS WRONG. It said
+      // a class identifier resolves to a `ClassDeclaration` this walk cannot compute and a `new`
+      // resolves to one `implementationsOf` refuses, so the receiver is UNKNOWN and round 24's
+      // propagation kills the access. That fence covers a different receiver class from the one the
+      // ROOTS produce: `rootShapes` trusts every parameter of the two renderer roots, and
+      // `resolveIdentifier` hands a non-context, non-list root back as OPAQUE. An OPAQUE receiver is
+      // not an UNKNOWN one — propagation never fires — so a class-typed root parameter reads the
+      // annotation with no class identifier and no `new` evaluated anywhere. See control (Q).
+      //
+      // So both kinds go through the same initializer trace a variable does, and an AMBIENT one —
+      // `declare enum`, a member of a `.d.ts` — is refused outright: its value lives in code this
+      // program does not contain, which is the same reason `resolveIdentifier` refuses an ambient
+      // variable rather than reading its declared type as a value.
+      if (ts.isPropertyDeclaration(declaration) || ts.isEnumMember(declaration)) {
+        if (fieldProvenance === 'IGNORED') continue
+        const kind = ts.SyntaxKind[declaration.kind]
+        if (declaration.getSourceFile().isDeclarationFile || isAmbient(declaration)) {
+          return `"${name.text}" is a ${kind} declared without an implementation this walk can read, so its `
+            + 'literal type is a claim about code this program does not contain'
+        }
+        if (!declaration.initializer) {
+          return `"${name.text}" is a ${kind} with no initializer, so its literal type is an annotation and `
+            + 'whatever assigns it is not read here'
+        }
+        const inner = literalOrigin(declaration.initializer, seen)
+        if (inner) return inner
         continue
       }
       // A value whose type is its initializer's is honest exactly as far as that initializer is.
@@ -4400,10 +4455,11 @@ function judgeRendererOutput(
   rootEntry: RootEntry = 'ABSTRACT',
   rootProvenance: RootProvenance = 'CARRIED',
   keyProvenance: KeyProvenance = 'DEMANDED',
+  fieldProvenance: FieldProvenance = 'DEMANDED',
 ): string[] {
   const computed = computeRendererOutput(
     model, extraFiles, contextBinding, literalProvenance, receiverPropagation, defaultBinding, rootTrust,
-    rootEntry, rootProvenance, keyProvenance,
+    rootEntry, rootProvenance, keyProvenance, fieldProvenance,
   )
   const reviewed = RENDERED_DIRECTIONS.map((entry) => entry.text)
   const complaints = [...computed.unresolved]
