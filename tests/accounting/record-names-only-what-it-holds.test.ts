@@ -1571,6 +1571,8 @@ const RENDERED_DIRECTIONS: readonly { direction: LocalDirection; text: string }[
  * reads and is contributed by `renderLocalDirectionSequence` rather than by either element, so it
  * has to be reviewed as prose and not inferred from the two halves.
  */
+const SEQUENCE_CONJUNCTION = ' and '
+
 const RENDERED_DIRECTION_SEQUENCES: readonly { sequence: LocalDirectionSequence; text: string }[] = [
   {
     sequence: LEAVE_THE_TOGGLE_OFF_THEN_ESCALATE,
@@ -2131,6 +2133,23 @@ test('ROUND 16 (Codex HIGH): the two sentences no fence caught, in the two surfa
 // ---------------------------------------------------------------------------
 
 const DIRECTION_MODEL_FILE = 'lib/domain/accounting/local-operator-direction.ts'
+
+/**
+ * THE SEQUENCE RENDERER'S BODY, AS THE CONTROLS BELOW REWRITE IT (o3d-batch-ret r32).
+ *
+ * It used to be `sequence.map(...).join(' and ')` and it is a concatenation of two indexed reads
+ * now, because a `map` and a `join` are `Array.prototype` methods the renderer looked up every time
+ * it ran — see the note at the foot of the direction model. Eight controls rewrite this statement to
+ * forward an extra argument, so it is written down ONCE here: a control that silently stopped
+ * matching would be a control that judges the shipped body instead of its own mutation.
+ */
+const SEQUENCE_BODY = "return renderLocalDirection(sequence[0], context) + ' and ' + "
+  + 'renderLocalDirection(sequence[1], context)'
+const SEQUENCE_BODY_FORWARDING = "return renderLocalDirection(sequence[0], context, render) + ' and ' + "
+  + 'renderLocalDirection(sequence[1], context, render)'
+const SEQUENCE_BODY_REVIEWED = "return renderLocalDirection(sequence[0], context, { mode: 'REVIEWED' }) + ' and ' + "
+  + "renderLocalDirection(sequence[1], context, { mode: 'REVIEWED' })"
+
 const FORMATTER_FILE = 'lib/domain/accounting/unrecorded-posted-document.ts'
 
 /**
@@ -3072,7 +3091,10 @@ test('ROUND 20 (Codex HIGH): every string the renderer emits is one written out 
  * identifiers, object and element access, `Array` `join` / `slice` / `map`, and calls into helper
  * bodies with their parameters bound to the arguments passed. The result is a set of SHAPES, and a
  * shape is a run of literal text possibly containing one REPEAT — a `join` over a list whose length
- * is not known, which is what `renderLocalDirectionSequence` is.
+ * is not known. NEITHER SHIPPED RENDERER IS ONE SINCE r32: the sequence renderer's parameter is a
+ * pair rather than a list with a floor, so its value is a set of constants like the direction
+ * renderer's. The REPEAT stays because the walk must still be able to READ a `join` — a mutation
+ * that puts one back has to be judged, not skipped.
  *
  * The direction renderer's shapes must all be CONSTANTS, and the set of those constants must be
  * EXACTLY the reviewed inventory — no sentence it can emit that nobody wrote out, and no reviewed
@@ -3498,7 +3520,8 @@ type Segment =
   | { kind: 'SYMBOL'; name: string; placeholder: string }
   /**
    * A `join` over a list whose length is not known: one of `alternatives`, then `separator` and
-   * another, at least `minimum` times. `renderLocalDirectionSequence` is the only one of these.
+   * another, at least `minimum` times. No shipped renderer computes to one since r32; a mutated
+   * model that joins an unbounded list still does, and is refused on it.
    */
   | { kind: 'REPEAT'; alternatives: readonly string[]; separator: string; minimum: number }
 
@@ -4228,8 +4251,9 @@ function computeRendererOutput(
    * annotation this walk cannot read leaves the trust backed by nothing. It is not for a type
    * parameter's constraint and default, which are optional by construction and name nothing when
    * absent, nor for a non-root parameter, whose trust comes from the ARGUMENT's provenance
-   * (`originFrames`) rather than from its declaration — an unannotated arrow parameter of
-   * `sequence.map` is that case and is what the sequence renderer is read through.
+   * (`originFrames`) rather than from its declaration — an unannotated arrow parameter of a
+   * `sequence.map` callback is that case, which is how the sequence renderer was read before r32
+   * and how any mutation that reintroduces a `map` is read still.
    */
   const annotationOrigin = (
     type: ts.TypeNode | undefined,
@@ -4513,12 +4537,27 @@ function computeRendererOutput(
     return false
   }
 
-  /** A list value for a parameter this walk has no argument for, read off its declared type. */
+  /**
+   * A list value for a parameter this walk has no argument for, read off its declared type.
+   *
+   * A TUPLE WITH NO REST ELEMENT HAS A LENGTH, NOT A FLOOR (o3d-batch-ret r32). Every tuple used to
+   * become an `OPEN_LIST` carrying only `minLength`, which is all a `join` needs and not enough for
+   * an INDEX: `sequence[1]` off a floor is a read this walk cannot answer, and the sequence renderer
+   * is two indexed reads now. A fixed-length tuple is a `LIST` of that many OPAQUE elements, so an
+   * index inside it resolves and an index past it is refused by `resolveElement` as being past the
+   * end — which is the same answer the language gives, since a read past a tuple's length is a read
+   * off `Array.prototype`.
+   */
   const listFromType = (node: ts.Node): ListValue | null => {
     const type = checker.getTypeAtLocation(node)
     if (checker.isTupleType(type)) {
       const target = (type as ts.TypeReference).target as ts.TupleType
-      return { kind: 'OPEN_LIST', element: { kind: 'OPAQUE' }, minimum: target.minLength }
+      if (target.hasRestElement) {
+        return { kind: 'OPEN_LIST', element: { kind: 'OPAQUE' }, minimum: target.minLength }
+      }
+      const items: Value[] = []
+      for (let index = 0; index < target.fixedLength; index += 1) items.push({ kind: 'OPAQUE' })
+      return { kind: 'LIST', items }
     }
     if (checker.isArrayType(type)) return { kind: 'OPEN_LIST', element: { kind: 'OPAQUE' }, minimum: 0 }
     return null
@@ -5100,14 +5139,29 @@ function judgeRendererOutput(
       complaints.push(`a reviewed sentence this renderer cannot emit: ${JSON.stringify(value)}`)
     }
   }
+  // THE SEQUENCE RENDERER, JUDGED ON WHAT IT EMITS RATHER THAN ON WHAT IT JOINS (o3d-batch-ret r32).
+  // While its parameter's type carried a rest element its value was a REPEAT — a language, not a set
+  // — and the most that could be said was that every sentence it joined was reviewed. The type fixes
+  // the length at two now, so the value is a finite set of constants and is held to the inventory in
+  // BOTH directions, exactly as a direction's is: every ordered pair of reviewed sentences, joined by
+  // the conjunction the renderer contributes, and nothing else.
+  const reviewedPairs = new Set<string>()
+  for (const first of reviewed) {
+    for (const second of reviewed) reviewedPairs.add(first + SEQUENCE_CONJUNCTION + second)
+  }
+  const emittedPairs = new Set<string>()
   for (const shape of computed.sequence) {
-    for (const segment of shape) {
-      if (segment.kind !== 'REPEAT') continue
-      for (const alternative of segment.alternatives) {
-        if (!reviewed.includes(alternative)) {
-          complaints.push(`a sequence joins a sentence nobody reviewed: ${JSON.stringify(alternative)}`)
-        }
-      }
+    const value = renderedOf(shape)
+    if (value === null) {
+      complaints.push(`a sequence sentence that is not one computable constant: ${describeShape(shape)}`)
+      continue
+    }
+    emittedPairs.add(value)
+    if (!reviewedPairs.has(value)) complaints.push(`emits a sequence nobody reviewed: ${JSON.stringify(value)}`)
+  }
+  for (const pair of reviewedPairs) {
+    if (!emittedPairs.has(pair)) {
+      complaints.push(`a reviewed pair this renderer cannot emit: ${JSON.stringify(pair)}`)
     }
   }
   for (const { text } of RENDERED_DIRECTION_SEQUENCES) {
@@ -5166,33 +5220,41 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
     'and the two are the same size, so the inventory is the emitted set rather than a superset of it',
   )
 
-  // (3) THE SEQUENCE RENDERER, whose value is a `join` over a list whose length the type does not
-  // fix. Its shape is therefore a REPEAT rather than a constant — and every sentence it can join is
-  // a reviewed one, and the conjunction it contributes is the reviewed one.
+  // (3) THE SEQUENCE RENDERER, whose value is now a finite set of CONSTANTS (o3d-batch-ret r32).
+  // Its parameter's type fixed a floor of two and no ceiling while it was `[A, B, ...LocalDirection[]]`,
+  // so the shape it computed to was a REPEAT and its language was infinite: the most that could be
+  // asserted was that every sentence it joined had been reviewed. The type is a PAIR now and the
+  // renderer is a concatenation, so the whole set can be written down — every ordered pair of the
+  // inventory — and held to the reviewed one in both directions.
   assert.ok(computed.sequence.length > 0, 'the sequence renderer must have been read')
-  const repeats = computed.sequence.flatMap((shape) => shape.filter((segment) => segment.kind === 'REPEAT'))
-  assert.equal(
-    repeats.length, 1,
-    'the sequence renderer must compute to exactly one REPEAT — a `join` over a list whose length its type '
-    + 'does not fix. Without one the loop below judges nothing and the pattern match below is over a constant',
+  assert.deepEqual(
+    computed.sequence.flatMap((shape) => shape.filter((segment) => segment.kind === 'REPEAT')), [],
+    'the sequence renderer computes to a REPEAT, so its parameter has gone back to a length this walk cannot '
+    + 'fix — and the language of a repeat is infinite, which is the thing that could not be written down',
+  )
+  assert.deepEqual(
+    computed.sequence.filter((shape) => renderedOf(shape) === null).map(describeShape), [],
+    'a sequence sentence is not one computable constant',
+  )
+  const reviewedPairs = new Set(
+    RENDERED_DIRECTIONS.flatMap((first) => RENDERED_DIRECTIONS.map(
+      (second) => first.text + SEQUENCE_CONJUNCTION + second.text,
+    )),
   )
   assert.equal(
-    repeats[0]!.kind === 'REPEAT' && repeats[0]!.alternatives.length, RENDERED_DIRECTIONS.length,
-    'and it joins the whole direction inventory, so every sentence a sequence can carry is judged',
+    reviewedPairs.size, RENDERED_DIRECTIONS.length * RENDERED_DIRECTIONS.length,
+    'two different pairs concatenate to the same sentence, so the set below cannot tell them apart',
   )
-  assert.equal(
-    repeats[0]!.kind === 'REPEAT' && repeats[0]!.minimum, 2,
-    'and at least two of them, which is what `LocalDirectionSequence` declares',
+  const emittedPairs = new Set(computed.sequence.map((shape) => renderedOf(shape)!))
+  assert.deepEqual(
+    [...emittedPairs].filter((value) => !reviewedPairs.has(value)), [],
+    'the sequence renderer emits a pair that is not two reviewed sentences joined by the reviewed conjunction',
   )
-  for (const shape of computed.sequence) {
-    for (const segment of shape) {
-      if (segment.kind !== 'REPEAT') continue
-      assert.deepEqual(
-        segment.alternatives.filter((alternative) => !reviewed.includes(alternative)), [],
-        'the sequence renderer joins a sentence that is in no reviewed sentence',
-      )
-    }
-  }
+  assert.deepEqual(
+    [...reviewedPairs].filter((value) => !emittedPairs.has(value)), [],
+    'a pair of reviewed sentences the sequence renderer cannot emit — either an element stopped being the '
+    + 'whole inventory or the conjunction has drifted',
+  )
   for (const { sequence, text } of RENDERED_DIRECTION_SEQUENCES) {
     assert.ok(
       computed.sequence.some((shape) => patternOf(shape).test(text)),
@@ -5247,8 +5309,8 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
     "    case 'RE_READ':\n      return viaCallback(() => 'so re-run the query rather than treating one result "
     + "as the final list')",
   ).replace(
-    'function andList(',
-    'function viaCallback(emit: () => string): string {\n  return emit()\n}\n\nfunction andList(',
+    'export type LocalDirectionContext = {',
+    'function viaCallback(emit: () => string): string {\n  return emit()\n}\n\nexport type LocalDirectionContext = {',
   )
   assert.notEqual(viaParameterCallee, model, 'the parameter-callee mutation must actually have been applied')
   const parameterComplaints = judgeRendererOutput(viaParameterCallee)
@@ -5264,8 +5326,8 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
     "      return 'confirm the invoice PDF stored against the order is the document you expect'",
     '      return remoteWriter.emit()',
   ).replace(
-    'function andList(',
-    'interface RemoteWriter {\n  emit(): string\n}\ndeclare const remoteWriter: RemoteWriter\n\nfunction andList(',
+    'export type LocalDirectionContext = {',
+    'interface RemoteWriter {\n  emit(): string\n}\ndeclare const remoteWriter: RemoteWriter\n\nexport type LocalDirectionContext = {',
   )
   assert.notEqual(viaMethodSignature, model, 'the method-signature mutation must actually have been applied')
   const signatureComplaints = judgeRendererOutput(viaMethodSignature)
@@ -5294,7 +5356,11 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
   // (E) A CALL THROUGH A VALUE RATHER THAN A NAME. The shape nobody thought of arrives here.
   const viaUnnamedCallee = model.replace(
     "    case 'RE_READ':\n      return 'so re-run the query rather than treating one result as the final list'",
-    "    case 'RE_READ':\n      return (true ? andList : andList)(OUTBOX_READ_LIST.WHEN_NARROWING_IS_IMPOSSIBLE)",
+    "    case 'RE_READ':\n      return (true ? viaExpression : viaExpression)()",
+  ).replace(
+    'export type LocalDirectionContext = {',
+    "function viaExpression(): string {\n  return 'so re-run the query rather than treating one result as the "
+    + "final list'\n}\n\nexport type LocalDirectionContext = {",
   )
   assert.notEqual(viaUnnamedCallee, model, 'the unnamed-callee mutation must actually have been applied')
   const unnamedComplaints = judgeRendererOutput(viaUnnamedCallee)
@@ -5322,9 +5388,9 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
     "      return 'confirm the invoice PDF stored against the order is the document you expect'",
     '      return RemoteInstruction.render()',
   ).replace(
-    'function andList(',
+    'export type LocalDirectionContext = {',
     'class RemoteInstruction {\n  static render(): string {\n    return \''
-    + UNDECLARED_REMOTE_ACTION + "'\n  }\n}\n\nfunction andList(",
+    + UNDECLARED_REMOTE_ACTION + "'\n  }\n}\n\nexport type LocalDirectionContext = {",
   )
   assert.notEqual(viaStaticMethod, model, 'the static-method mutation must actually have been applied')
   const staticComplaints = judgeRendererOutput(viaStaticMethod)
@@ -5370,10 +5436,7 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
 
   // (H) AND THE SEQUENCE RENDERER'S OWN CONJUNCTION IS PROSE. It belongs to neither element, so it
   // has to be refused when it changes into an instruction.
-  const viaSequenceConjunction = model.replace(
-    ".join(' and ')",
-    ".join(' and then delete the other one and ')",
-  )
+  const viaSequenceConjunction = model.replace(" + ' and ' + ", " + ' and then delete the other one and ' + ")
   assert.notEqual(viaSequenceConjunction, model, 'the conjunction mutation must actually have been applied')
   assert.ok(
     judgeRendererOutput(viaSequenceConjunction).some((complaint) => complaint.includes('reviewed sequence')),
@@ -5523,13 +5586,13 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
     "      return 'confirm the invoice PDF stored against the order is the document you expect'",
     '      return fromRuntimeCopy(JSON.parse(JSON.stringify(context)) as { syncRowId: \'claimed-row\' })',
   ).replace(
-    'function andList(',
+    'export type LocalDirectionContext = {',
     "function fromRuntimeCopy(runtime: { syncRowId: 'claimed-row' }): string {\n"
     + "  const offSampleRow: string = '" + OFF_SAMPLE_SYNC_ROW + "'\n"
     + '  return runtime.syncRowId === offSampleRow\n'
     + "    ? '" + UNDECLARED_REMOTE_ACTION + "'\n"
     + "    : 'confirm the invoice PDF stored against the order is the document you expect'\n"
-    + '}\n\nfunction andList(',
+    + '}\n\nexport type LocalDirectionContext = {',
   )
   assert.notEqual(viaRuntimeCopy, model, 'the runtime-copy mutation must actually have been applied')
   // AND IT IS A MUTATION THE COMPILER ADMITS, byte for byte the same diagnostics as the shipped
@@ -5624,14 +5687,14 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
     + '      )\n'
     + '    }',
   ).replace(
-    'function andList(',
+    'export type LocalDirectionContext = {',
     'function fromAssertedEscalation(\n'
     + "  claimed: { action: 'ESCALATE'; target: 'THIS_RECORD_AND_ITS_SYNC_ROW'; naming: 'SYNC_ROW' },\n"
     + '  reviewed: string,\n'
     + '): string {\n'
     + "  const recordOnly: string = 'RECORD_ONLY'\n"
     + "  return claimed.naming === recordOnly ? '" + UNDECLARED_REMOTE_ACTION + "' : reviewed\n"
-    + '}\n\nfunction andList(',
+    + '}\n\nexport type LocalDirectionContext = {',
   )
   assert.notEqual(viaAssertedArgument, model, 'the asserted-argument mutation must actually have been applied')
   assert.deepEqual(
@@ -5694,7 +5757,7 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
     "      return 'confirm the invoice PDF stored against the order is the document you expect'",
     '      return fromDefaultedContext(context)',
   ).replace(
-    'function andList(',
+    'export type LocalDirectionContext = {',
     'function fromDefaultedContext(\n'
     + '  runtime: LocalDirectionContext,\n'
     + "  claimed: { syncRowId: 'claimed-row' } = runtime as { syncRowId: 'claimed-row' },\n"
@@ -5703,7 +5766,7 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
     + '  return claimed.syncRowId === offSampleRow\n'
     + "    ? '" + UNDECLARED_REMOTE_ACTION + "'\n"
     + "    : 'confirm the invoice PDF stored against the order is the document you expect'\n"
-    + '}\n\nfunction andList(',
+    + '}\n\nexport type LocalDirectionContext = {',
   )
   assert.notEqual(viaDefaultedParameter, model, 'the defaulted-parameter mutation must actually have been applied')
   // AND IT IS A MUTATION THE COMPILER ADMITS, byte for byte the same diagnostics as the shipped
@@ -5781,13 +5844,13 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
     "      return 'confirm the invoice PDF stored against the order is the document you expect'",
     '      return fromArgumentlessParameter()',
   ).replace(
-    'function andList(',
+    'export type LocalDirectionContext = {',
     "function fromArgumentlessParameter(claimed?: { syncRowId: 'claimed-row' }): string {\n"
     + "  const offSampleRow: string = '" + OFF_SAMPLE_SYNC_ROW + "'\n"
     + '  return claimed!.syncRowId === offSampleRow\n'
     + "    ? '" + UNDECLARED_REMOTE_ACTION + "'\n"
     + "    : 'confirm the invoice PDF stored against the order is the document you expect'\n"
-    + '}\n\nfunction andList(',
+    + '}\n\nexport type LocalDirectionContext = {',
   )
   assert.notEqual(viaArgumentlessParameter, model, 'the argument-less-parameter mutation must actually have been applied')
   assert.deepEqual(
@@ -5825,11 +5888,11 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
     "      return 'confirm the invoice PDF stored against the order is the document you expect'",
     '      return fromArgumentlessProse()',
   ).replace(
-    'function andList(',
+    'export type LocalDirectionContext = {',
     "function fromArgumentlessProse(claimed?: { syncRowId: 'claimed-row' }): string {\n"
     + '  return `confirm the invoice PDF stored against the order is the document you expect'
     + '${claimed!.syncRowId}`\n'
-    + '}\n\nfunction andList(',
+    + '}\n\nexport type LocalDirectionContext = {',
   )
   assert.notEqual(viaArgumentlessProse, model, 'the argument-less prose mutation must actually have been applied')
   assert.deepEqual(
@@ -5965,8 +6028,8 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
     // would be about round 25 rather than about round 27. Passing `{ mode: 'REVIEWED' }` is also
     // the realistic shape of the mistake: the caller inside the module is careful, and the DEFAULT
     // is what every caller outside it gets.
-    'return sequence.map((direction) => renderLocalDirection(direction, context)).join(\' and \')',
-    "return sequence.map((direction) => renderLocalDirection(direction, context, { mode: 'REVIEWED' })).join(' and ')",
+    SEQUENCE_BODY,
+    SEQUENCE_BODY_REVIEWED,
   )
   assert.notEqual(viaAssertedRootDefault, model, 'the asserted-root-default mutation must actually have been applied')
   // AND THE COMPILER ADMITS IT, byte for byte: the parameter has a default so every existing call
@@ -6216,20 +6279,20 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
     + '  sequence: LocalDirectionSequence,\n'
     + '  context: LocalDirectionContext,\n'
     + '): string {\n'
-    + "  return sequence.map((direction) => renderLocalDirection(direction, context)).join(' and ')",
+    + '  ' + SEQUENCE_BODY,
     'export function renderLocalDirectionSequence(\n'
     + '  sequence: LocalDirectionSequence,\n'
     + '  context: LocalDirectionContext,\n'
     + '  render: RenderMode,\n'
     + '): string {\n'
-    + "  return sequence.map((direction) => renderLocalDirection(direction, context, render)).join(' and ')",
+    + '  ' + SEQUENCE_BODY_FORWARDING,
   )
   // ALL THREE EDITS LANDED. `notEqual` alone would pass on one of them, and a route that changed the
   // renderer but not the sequence is a different control from the one this comment describes.
   for (const fragment of [
     "readonly mode: 'REVIEWED' = 'UNREVIEWED' as unknown as 'REVIEWED'",
     "return render.mode === 'REVIEWED'",
-    'renderLocalDirection(direction, context, render)',
+    'renderLocalDirection(sequence[0], context, render)',
   ]) {
     assert.ok(
       viaClassFieldAnnotation.includes(fragment),
@@ -6361,19 +6424,19 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
     + '  sequence: LocalDirectionSequence,\n'
     + '  context: LocalDirectionContext,\n'
     + '): string {\n'
-    + "  return sequence.map((direction) => renderLocalDirection(direction, context)).join(' and ')",
+    + '  ' + SEQUENCE_BODY,
     'export function renderLocalDirectionSequence(\n'
     + '  sequence: LocalDirectionSequence,\n'
     + '  context: LocalDirectionContext,\n'
     + '  render: RenderMode,\n'
     + '): string {\n'
-    + "  return sequence.map((direction) => renderLocalDirection(direction, context, render)).join(' and ')",
+    + '  ' + SEQUENCE_BODY_FORWARDING,
   )
   for (const fragment of [
     "readonly mode: 'REVIEWED'\n",
     'constructor(syncRowId: string) {',
     "return render.mode === 'REVIEWED'",
-    'renderLocalDirection(direction, context, render)',
+    'renderLocalDirection(sequence[0], context, render)',
   ]) {
     assert.ok(
       viaClassFieldWithoutInitializer.includes(fragment),
@@ -6457,17 +6520,17 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
     + '  sequence: LocalDirectionSequence,\n'
     + '  context: LocalDirectionContext,\n'
     + '): string {\n'
-    + "  return sequence.map((direction) => renderLocalDirection(direction, context)).join(' and ')",
+    + '  ' + SEQUENCE_BODY,
     'export function renderLocalDirectionSequence(\n'
     + '  sequence: LocalDirectionSequence,\n'
     + '  context: LocalDirectionContext,\n'
     + '  render: typeof AmbientRenderMode,\n'
     + '): string {\n'
-    + "  return sequence.map((direction) => renderLocalDirection(direction, context, render)).join(' and ')",
+    + '  ' + SEQUENCE_BODY_FORWARDING,
   )
   assert.ok(
     viaAmbientEnumMember.includes("(render.MODE as string) === 'REVIEWED'")
-      && viaAmbientEnumMember.includes('renderLocalDirection(direction, context, render)'),
+      && viaAmbientEnumMember.includes('renderLocalDirection(sequence[0], context, render)'),
     'the ambient-enum-member mutation must actually have been applied',
   )
   assert.deepEqual(
@@ -6558,13 +6621,13 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
     + '  sequence: LocalDirectionSequence,\n'
     + '  context: LocalDirectionContext,\n'
     + '): string {\n'
-    + "  return sequence.map((direction) => renderLocalDirection(direction, context)).join(' and ')",
+    + '  ' + SEQUENCE_BODY,
     'export function renderLocalDirectionSequence(\n'
     + '  sequence: LocalDirectionSequence,\n'
     + '  context: LocalDirectionContext,\n'
     + '  render: RenderMode,\n'
     + '): string {\n'
-    + "  return sequence.map((direction) => renderLocalDirection(direction, context, render)).join(' and ')",
+    + '  ' + SEQUENCE_BODY_FORWARDING,
   )
   // THE INITIALIZER IS HONEST, WHICH IS THE WHOLE POINT: there is no assertion anywhere round 29
   // reads, so a trace of it finds a plain string literal and calls the field trustworthy.
@@ -6572,7 +6635,7 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
     "readonly mode: 'REVIEWED' = 'REVIEWED'",
     'this.mode = (syncRowId ===',
     "return render.mode === 'REVIEWED'",
-    'renderLocalDirection(direction, context, render)',
+    'renderLocalDirection(sequence[0], context, render)',
   ]) {
     assert.ok(
       viaRewrittenClassField.includes(fragment),
@@ -6654,13 +6717,13 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
     + '  sequence: LocalDirectionSequence,\n'
     + '  context: LocalDirectionContext,\n'
     + '): string {\n'
-    + "  return sequence.map((direction) => renderLocalDirection(direction, context)).join(' and ')",
+    + '  ' + SEQUENCE_BODY,
     'export function renderLocalDirectionSequence(\n'
     + '  sequence: LocalDirectionSequence,\n'
     + '  context: LocalDirectionContext,\n'
     + '  render: RenderMode,\n'
     + '): string {\n'
-    + "  return sequence.map((direction) => renderLocalDirection(direction, context, render)).join(' and ')",
+    + '  ' + SEQUENCE_BODY_FORWARDING,
   )
   // ALL THREE EDITS LANDED, and the declaration really does hold no expression: the only `as` in
   // the mutation is on `manufacturedMode`, which the property signature NAMES rather than contains.
@@ -6668,7 +6731,7 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
     "const manufacturedMode = 'UNREVIEWED' as unknown as 'REVIEWED'",
     '  mode: typeof manufacturedMode',
     "return render.mode === 'REVIEWED'",
-    'renderLocalDirection(direction, context, render)',
+    'renderLocalDirection(sequence[0], context, render)',
   ]) {
     assert.ok(
       viaQueriedPropertySignature.includes(fragment),
@@ -6804,19 +6867,19 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
     + '  sequence: LocalDirectionSequence,\n'
     + '  context: LocalDirectionContext,\n'
     + '): string {\n'
-    + "  return sequence.map((direction) => renderLocalDirection(direction, context)).join(' and ')",
+    + '  ' + SEQUENCE_BODY,
     'export function renderLocalDirectionSequence(\n'
     + '  sequence: LocalDirectionSequence,\n'
     + '  context: LocalDirectionContext,\n'
     + '  render: typeof manufacturedRender,\n'
     + '): string {\n'
-    + "  return sequence.map((direction) => renderLocalDirection(direction, context, render)).join(' and ')",
+    + '  ' + SEQUENCE_BODY_FORWARDING,
   )
   for (const fragment of [
     "const manufacturedRender = { mode: 'UNREVIEWED' } as unknown as { mode: 'REVIEWED' }",
     '  render: typeof manufacturedRender,',
     "return render.mode === 'REVIEWED'",
-    'renderLocalDirection(direction, context, render)',
+    'renderLocalDirection(sequence[0], context, render)',
   ]) {
     assert.ok(
       viaQueriedParameter.includes(fragment),
@@ -7032,20 +7095,20 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
     + '  sequence: LocalDirectionSequence,\n'
     + '  context: LocalDirectionContext,\n'
     + '): string {\n'
-    + "  return sequence.map((direction) => renderLocalDirection(direction, context)).join(' and ')",
+    + '  ' + SEQUENCE_BODY,
     'export function renderLocalDirectionSequence(\n'
     + '  sequence: LocalDirectionSequence,\n'
     + '  context: LocalDirectionContext,\n'
     + '  render: RenderMode,\n'
     + '): string {\n'
-    + "  return sequence.map((direction) => renderLocalDirection(direction, context, render)).join(' and ')",
+    + '  ' + SEQUENCE_BODY_FORWARDING,
   )
   for (const fragment of [
     "const manufacturedMode = 'UNREVIEWED' as unknown as 'REVIEWED'",
     'export interface RenderBase<T> {\n  mode: T\n}',
     'export interface RenderMode extends RenderBase<typeof manufacturedMode> {}',
     "return render.mode === 'REVIEWED'",
-    'renderLocalDirection(direction, context, render)',
+    'renderLocalDirection(sequence[0], context, render)',
   ]) {
     assert.ok(
       viaInheritedTypeQuery.includes(fragment),
@@ -7358,7 +7421,7 @@ test('ROUND 31 (Codex HIGH): a table the renderer reads at invocation time canno
 
   // (U1) THE TWO TABLES NOTHING OUTSIDE THE MODULE READS ARE OFF THE PUBLIC SURFACE ENTIRELY.
   const surface = new Set(Object.keys(DIRECTION_MODULE))
-  for (const gone of ['SETTING_NAME', 'OUTBOX_READ_LIST']) {
+  for (const gone of ['SETTING_NAME', 'OUTBOX_READ_LIST', 'OUTBOX_READ_PHRASE']) {
     assert.ok(
       !surface.has(gone),
       `${gone} is exported again. The renderer reads it at invocation time, so exporting it hands every `
@@ -7459,7 +7522,7 @@ test('ROUND 31 (Codex HIGH): a table the renderer reads at invocation time canno
   // outside can name them. A private mutable table is still mutable from inside the module, so the
   // freeze is asserted at the only place a reader can check it.
   for (const table of [
-    'LOCAL_TARGET', 'OUTBOX_READ_LIST', 'SETTING_NAME', 'LOCAL_DIRECTIONS',
+    'LOCAL_TARGET', 'OUTBOX_READ_LIST', 'OUTBOX_READ_PHRASE', 'SETTING_NAME', 'LOCAL_DIRECTIONS',
     'LEAVE_THE_TOGGLE_OFF_THEN_ESCALATE', 'LOCAL_DIRECTION_SEQUENCES',
   ]) {
     assert.ok(
