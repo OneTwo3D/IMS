@@ -1885,6 +1885,19 @@ test('ROUND 16 (Codex HIGH x2): every word of a lookup-less record is one that w
   const messages = lookupLessMessages()
   assert.ok(messages.length > 1000, `sanity: ${messages.length} lookup-less messages were rendered`)
 
+  // ROUND 17 (Codex MEDIUM): AND THE UNCLASSIFIED BRANCH IS IN HERE, FROM BOTH CONNECTORS. The
+  // corpus used to iterate the keys of OPERATION_SEMANTIC_BY_TYPE, so every message it generated
+  // was classified, this filter matched nothing, and the two unclassified frames were never
+  // decomposed against the three lists. Asserted rather than assumed, because the way that hole
+  // opened is that nothing noticed the branch had left the corpus.
+  for (const connector of ['qbo', 'xero']) {
+    assert.ok(
+      messages.some(({ label, text }) => label.startsWith(connector) && text.includes(UNCLASSIFIED_MARKER)),
+      `no ${connector} message in the corpus reaches the unclassified frame, so its wording is not `
+      + 'being decomposed and a remote instruction could be added to it without failing this test',
+    )
+  }
+
   const seen = new Map<string, string>()
   for (const { label, text } of messages) if (!seen.has(text)) seen.set(text, label)
   assert.ok(seen.size >= 50, `sanity: ${seen.size} distinct lookup-less messages after normalisation`)
@@ -1930,11 +1943,14 @@ test('ROUND 16 (Codex HIGH x2): every word of a lookup-less record is one that w
 // literal may only specify known properties, and 'span' does not exist in type 'LocalDirection'").
 //
 // The runnable half is the ANCHOR: the message a direction ships in must NAME the target the
-// direction declares. RUN with the CONFIRM direction's target swapped to EMAIL_OUTBOX_ROWS — a
-// legal `LocalTarget`, which is why round 16 accepted all five equally — and it fails on the
-// invoice-PDF message never saying "outbox". The same swap on any other direction fails the same
-// way, EXCEPT into THIS_RECORD_AND_ITS_SYNC_ROW, whose anchor every record carries; that one is
-// declared UNIVERSAL above and is carried by generation, not by the anchor.
+// direction declares. RUN with the CONFIRM direction's target swapped to EMAIL_OUTBOX_ROWS and it
+// fails on the invoice-PDF message never saying "outbox" — and note what the swap costs to write:
+// `LocalDirection` pairs each action WITH its target, so the swap needs an explicit
+// `as unknown as LocalDirection` to reach the runtime check at all. Round 16's `object` field
+// accepted all five members of the union with no cast and no complaint, which is the difference.
+// The same swap on any other direction fails the same way, EXCEPT into
+// THIS_RECORD_AND_ITS_SYNC_ROW, whose anchor every record carries; that one is declared UNIVERSAL
+// above and is carried by generation, not by the anchor.
 //
 // ROUTE: the directions are read here and rendered; the corpus is the SHIPPED per-incident
 // messages, breadcrumbs excluded, so a line that only ever appears in the breadcrumb cannot hide in
