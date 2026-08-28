@@ -1475,8 +1475,18 @@ test('the role half is asked of the connection: what it logged in as, and what i
   }
 
   // A connection that will not say what it logged in as cannot be shown to be the one whose
-  // CONNECT is deliberately NOT revoked. Absence is not a pass.
+  // CONNECT is deliberately NOT revoked. Absence is not a pass — and it is not a pass even when
+  // there is nothing else left to catch it: an admin URL relying on peer authentication names no
+  // role either, so with the connection silent too NOTHING identifies the role being held.
   assert.equal(assessDatabaseIdentity({ ...base, connectedLoginRole: '', connectedEffectiveRole: 'deployadmin' }).bound, false)
+  const silent = assessDatabaseIdentity({
+    ...base,
+    adminUrl: 'postgres://localhost/onetwo3d_ims',
+    connectedLoginRole: '',
+    connectedEffectiveRole: '',
+  })
+  assert.equal(silent.bound, false, 'no role from the URL and none from the connection is not "any role will do"')
+  assert.match(silent.reason, /session_user/)
 
   // Running as somebody other than it logged in as: every ACL answer below would be given as the
   // assumed role while CONNECT belongs to the login one.
