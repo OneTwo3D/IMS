@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { readFile } from 'node:fs/promises'
 import path from 'node:path'
+import ts from 'typescript'
 
 import type { AccountingSyncType } from '@/app/generated/prisma/client'
 import {
@@ -1998,4 +1999,165 @@ test('ROUND 16 (Codex HIGH): the two sentences no fence caught, in the two surfa
     LEGACY_REMOTE_REFERENCE.test(counterExamples[1]),
     'and it must find one in the bill sentence, or the two counter-examples are not different cases',
   )
+})
+
+// ---------------------------------------------------------------------------
+// ROUND 18 (Codex HIGH) — THE INVARIANT IS ABOUT WHAT SHIPS, NOT ABOUT WHAT THIS FILE REBUILDS.
+//
+// Round 17's coupling was `production.includes(renderLocalDirection(direction))`, with
+// `LocalDirection` and the renderer declared in THIS FILE. Both halves of that are weak in the same
+// direction. The type-checker argument — that a mismatched direction cannot compile — constrained a
+// FIXTURE; and `includes` accepts any production message that contains the generated span, so a
+// formatter could keep the span and extend the same instruction with a remote action.
+//
+// The model is in lib/domain/accounting/local-operator-direction.ts now and the formatters compose
+// the shipped sentence from it. Two things establish that, and they are different KINDS of check:
+//
+//   1. THE PROSE IS NOT WRITTEN DOWN IN THE FORMATTER. Every direction's sentence is absent from
+//      unrecorded-posted-document.ts as a literal, and present only as a `renderLocalDirection(...)`
+//      call. A message can no longer contain the span by having been typed out beside it.
+//   2. A MISMATCHED DIRECTION DOES NOT COMPILE — checked by actually running the type-checker over
+//      the PRODUCTION module, so the claim is about the type production uses.
+// ---------------------------------------------------------------------------
+
+const DIRECTION_MODEL_FILE = 'lib/domain/accounting/local-operator-direction.ts'
+const FORMATTER_FILE = 'lib/domain/accounting/unrecorded-posted-document.ts'
+
+/**
+ * The longest run of a direction's prose that carries no placeholder — what a hand-written copy of
+ * that instruction would have to contain.
+ */
+function distinctiveFragment(span: string): string {
+  return span.split(/\{[A-Za-z]+\}/).reduce((longest, part) => (part.length > longest.length ? part : longest), '')
+}
+
+test('ROUND 18 (Codex HIGH): the formatters COMPOSE each direction, and none of them writes its prose down', async () => {
+  // Route: the shipped formatter module's own source. Mutation: replace any
+  // `renderLocalDirection({ ... })` call in unrecorded-posted-document.ts with the sentence it
+  // returns — which is exactly what round 17 shipped — and the fragment assertion fails naming it.
+  const formatter = await readFile(path.join(process.cwd(), FORMATTER_FILE), 'utf8')
+  const model = await readFile(path.join(process.cwd(), DIRECTION_MODEL_FILE), 'utf8')
+
+  // CONTROL: the files are the ones being read, so nothing below passes on an empty string.
+  assert.match(model, /export function renderLocalDirection/, 'the renderer must live in production')
+  assert.match(formatter, /renderLocalDirection\(/, 'and the formatter must call it')
+
+  for (const direction of LOCAL_DIRECTIONS) {
+    const span = renderLocalDirection(direction, LOCAL_DIRECTION_CONTEXT)
+    const fragment = distinctiveFragment(span)
+    assert.ok(fragment.length > 20, `the ${direction.action} direction has no fragment long enough to test on`)
+    // The renderer has a branch for this action — that is where the sentence comes from...
+    assert.ok(
+      model.includes(`case '${direction.action}':`),
+      `${DIRECTION_MODEL_FILE} has no branch for the ${direction.action} action, so its prose comes from `
+      + 'somewhere this check cannot see',
+    )
+    // ...and the sentence is NOT in the formatter, which may only compose it.
+    assert.equal(
+      formatter.includes(fragment),
+      false,
+      `${FORMATTER_FILE} writes the ${direction.action} direction's prose out by hand ("${fragment.slice(0, 60)}…"). `
+      + 'A message that contains a direction because somebody typed it is the round-17 shape: the span is '
+      + 'present, the instruction around it is unconstrained. Compose it with renderLocalDirection instead',
+    )
+  }
+
+  // AND EVERY COMPOSITION POINT IS A CALL. One per direction is the floor; there are more, because
+  // several directions are composed at two sites (the replay table and the frame around it).
+  const calls = formatter.match(/renderLocalDirection\(/g) ?? []
+  assert.ok(
+    calls.length >= LOCAL_DIRECTIONS.length,
+    `${calls.length} composition points for ${LOCAL_DIRECTIONS.length} directions — a direction that ships `
+    + 'must be composed somewhere, or the inventory has grown past what the record actually says',
+  )
+})
+
+/**
+ * Type-check a snippet against the PRODUCTION direction model.
+ *
+ * The module has no imports of its own, so this compiles two files and nothing else: the real
+ * production source from disk, and the probe from memory. That is what makes the claim below a claim
+ * about production rather than about a copy of it.
+ */
+function directionModelDiagnostics(snippet: string): readonly ts.Diagnostic[] {
+  const probePath = path.join(process.cwd(), 'lib', 'domain', 'accounting', '__direction-probe.ts')
+  const source = "import { renderLocalDirection, type LocalDirectionContext } from './local-operator-direction'\n"
+    + 'const context: LocalDirectionContext = { ledger: \'Xero\', syncRowId: \'log-1\' }\n'
+    + `export const probe: string = ${snippet}\n`
+  const options: ts.CompilerOptions = {
+    strict: true,
+    noEmit: true,
+    target: ts.ScriptTarget.ES2022,
+    module: ts.ModuleKind.ESNext,
+    moduleResolution: ts.ModuleResolutionKind.Bundler,
+    skipLibCheck: true,
+    types: [],
+  }
+  const host = ts.createCompilerHost(options, true)
+  const isProbe = (fileName: string) => path.resolve(fileName) === probePath
+  const readFileFromDisk = host.readFile.bind(host)
+  host.readFile = (fileName) => (isProbe(fileName) ? source : readFileFromDisk(fileName))
+  const existsOnDisk = host.fileExists.bind(host)
+  host.fileExists = (fileName) => (isProbe(fileName) ? true : existsOnDisk(fileName))
+  const sourceFileFromDisk = host.getSourceFile.bind(host)
+  host.getSourceFile = (fileName, languageVersion, onError, shouldCreate) => (isProbe(fileName)
+    ? ts.createSourceFile(fileName, source, languageVersion, true)
+    : sourceFileFromDisk(fileName, languageVersion, onError, shouldCreate))
+  const program = ts.createProgram([probePath], options, host)
+  return [...program.getSyntacticDiagnostics(), ...program.getSemanticDiagnostics()]
+}
+
+test('ROUND 18 (Codex HIGH): a formatter composing a MISMATCHED direction does not compile', () => {
+  // THE LOAD-BEARING PROOF, and it is run rather than asserted in a comment. Round 17 made this
+  // argument about a type declared in the test file, where it constrained the rebuild and not the
+  // record. The probe below imports the PRODUCTION model.
+  //
+  // Route: ts.createProgram over lib/domain/accounting/local-operator-direction.ts plus an in-memory
+  // probe. Mutation: give `LocalDirection` a `span: string` field, or loosen a member's `target` to
+  // `LocalTarget`, and the refusals below stop being refusals.
+
+  // CONTROL: the well-formed composition compiles clean, so "everything fails" is not the reason the
+  // refusals below pass.
+  assert.deepEqual(
+    directionModelDiagnostics("renderLocalDirection({ action: 'CONFIRM', target: 'ORDER_INVOICE_PDF' }, context)")
+      .map((d) => ts.flattenDiagnosticMessageText(d.messageText, ' ')),
+    [],
+    'the shipped shape must type-check, or this probe proves nothing about the refusals',
+  )
+
+  const refused: Array<{ what: string; snippet: string }> = [
+    {
+      what: 'an action paired with a target it is not declared for',
+      snippet: "renderLocalDirection({ action: 'CONFIRM', target: 'EMAIL_OUTBOX_ROWS' }, context)",
+    },
+    {
+      what: 'a target in somebody else\'s system',
+      snippet: "renderLocalDirection({ action: 'CONFIRM', target: 'THE_LEDGER_BILL' }, context)",
+    },
+    {
+      what: 'the round-17 route: free text smuggled in beside a local target',
+      snippet: "renderLocalDirection({ action: 'CONFIRM', target: 'ORDER_INVOICE_PDF', span: 'In your books, use the "
+        + "IMS reference above to reach the matching entry and take the second PDF off it.' }, context)",
+    },
+    {
+      what: 'an outbox read axis that is not a column of that table',
+      snippet: "renderLocalDirection({ action: 'READ', target: 'EMAIL_OUTBOX_ROWS', read: ['grossTotal'] }, context)",
+    },
+    {
+      what: 'a setting direction naming a setting IMS does not hold',
+      snippet: "renderLocalDirection({ action: 'READ_SETTING', target: 'SETTING_ATTACH_PDF', lead: 'NONE', "
+        + "purpose: 'NONE', setting: 'xero_sync_enabled' }, context)",
+    },
+    {
+      what: 'an action the model has no branch for',
+      snippet: "renderLocalDirection({ action: 'VOID', target: 'ORDER_INVOICE_PDF' }, context)",
+    },
+  ]
+  for (const { what, snippet } of refused) {
+    const diagnostics = directionModelDiagnostics(snippet)
+    assert.ok(
+      diagnostics.length > 0,
+      `the production direction model COMPILES ${what}, so a formatter could ship it:\n${snippet}`,
+    )
+  }
 })
