@@ -2875,3 +2875,349 @@ test('o3d-2sm1.5 r22: the re-read stands at the fence, at the release, and after
     assert.match(source, /^\s*if ! require_env_file_is_sole_definition; then$/m, `${name}: and the same bus question`)
   }
 })
+
+// ---------------------------------------------------------------------------
+// o3d-2sm1.5 r23 — THE BINDING, not another read.
+// ---------------------------------------------------------------------------
+
+/** The shape the bus reports for a unit that loads .env and then this run's snapshot. */
+const SNAPSHOT_PATH = '/etc/ims-cutover/db-identity-snapshot.env'
+
+test('o3d-2sm1.5 r23: the loaded unit must name THIS run\'s snapshot, last and mandatory', () => {
+  // ROUTE: `systemctl show`'s bus equivalent -> env_file_is_sole_database_url_source() -> the
+  // refusal that stands between the final daemon-reload and `systemctl start`. Rounds 20-22 asked
+  // this question to find out whether anything ELSE could define DATABASE_URL; r23 also asks it to
+  // prove that the one thing that CAN is a file this run wrote where the application user cannot
+  // reach it. Both halves are asserted here, on the same lifted function, because relaxing either
+  // one turns the binding back into the re-read it replaced.
+  //
+  // WHY EACH REFUSAL EXISTS, stated as the thing that would otherwise happen:
+  //   * not published by this run   -> a drop-in left by an older cutover pins a DATABASE_URL
+  //                                    nobody in this run validated.
+  //   * not the snapshot's path     -> some other tool's environment file wins the last-definition
+  //                                    race and the service connects where IT says.
+  //   * loaded with a leading '-'   -> deleting the file between the check and the exec silently
+  //                                    hands the service back to .env, which is the whole defect.
+  //   * snapshot FIRST, .env second -> .env is then the last definition and the binding is inert.
+  //   * required but absent         -> the start would go ahead on a value that can still move.
+  //
+  // MUTATION: delete any one of the four arms inside the `for index in 0 1` loop, or the
+  // `DB_IDENTITY_REQUIRE_SNAPSHOT && count -ne 2` refusal after it. Each has exactly one fixture
+  // below that flips from REFUSE to SOLE, and no other fixture changes.
+  const dir = mkdtempSync(join(tmpdir(), 'ims-systemd-bind-'))
+  try {
+    writeFileSync(
+      join(dir, 'busctl'),
+      [
+        '#!/usr/bin/env bash',
+        'if [[ "$1" == "call" ]]; then printf \'o "/org/freedesktop/systemd1/unit/fake_2eservice"\\n\'; exit 0; fi',
+        '[[ "$1" == "get-property" ]] || exit 1',
+        '[[ "$4" == org.freedesktop.systemd1.* ]] || exit 1',
+        'name="FAKE_$5"',
+        '[[ -n "${!name+set}" ]] || exit 1',
+        'printf \'%s\\n\' "${!name}"',
+        '',
+      ].join('\n'),
+    )
+    chmodSync(join(dir, 'busctl'), 0o755)
+
+    for (const script of ['deploy.sh', 'update.sh', 'install.sh'] as const) {
+      const lifted = liftSoleSource(script)
+      // PRECONDITION: the r23 half really was lifted, so a mutation to the shipped script reaches
+      // this test rather than a stale copy of an older function.
+      assert.ok(lifted.includes('bus_read_env_ignore_flags'), `${script}: the lifted reader reads the ignore_errors flags`)
+      assert.ok(lifted.includes('DB_ENV_SNAPSHOT_PUBLISHED'), `${script}: and knows whether this run published a snapshot`)
+
+      function ask(envFiles: string, published: boolean, required: boolean): string {
+        const bash = [
+          'set -uo pipefail',
+          'DB_IDENTITY_SOURCE_REASON=""',
+          `DB_ENV_SNAPSHOT_FILE="${SNAPSHOT_PATH}"`,
+          'DB_ENV_SNAPSHOT_DROPIN_NAME="zz-deploy-db-identity.conf"',
+          `DB_ENV_SNAPSHOT_PUBLISHED=${published}`,
+          lifted,
+          `DB_IDENTITY_REQUIRE_SNAPSHOT=${required}`,
+          'if env_file_is_sole_database_url_source "$1" "$2"; then printf "SOLE\\n"; else printf "REFUSE %s\\n" "$DB_IDENTITY_SOURCE_REASON"; fi',
+        ].join('\n')
+        const env: NodeJS.ProcessEnv = { ...process.env, PATH: `${dir}:${process.env.PATH ?? ''}` }
+        for (const [key, value] of Object.entries({ ...SOLE_UNIT, EnvironmentFiles: envFiles })) env[`FAKE_${key}`] = value
+        const run = spawnSync('bash', ['-c', bash, 'ask', '/opt/app/.env', 'one-two-inventory.service'], { encoding: 'utf8', env })
+        assert.equal(run.status, 0, run.stderr)
+        return (run.stdout ?? '').trim()
+      }
+
+      const bound = `a(sb) 2 "/opt/app/.env" true "${SNAPSHOT_PATH}" false`
+
+      // THE SHAPE THE BINDING MAKES, and it must pass BOTH ways round — as the ordinary "nothing
+      // else defines it" question and as the start's "and the binding is there" question. If it
+      // failed either, the start could never proceed and every refusal below would be vacuous.
+      assert.equal(ask(bound, true, false), 'SOLE', `${script}: .env then this run's snapshot is the shape`)
+      assert.equal(ask(bound, true, true), 'SOLE', `${script}: and it satisfies the start's requirement`)
+
+      // AND THE PLAIN SHAPE IS STILL FINE EVERYWHERE ELSE, which is what keeps the two questions
+      // different rather than one question asked twice.
+      assert.equal(ask('a(sb) 1 "/opt/app/.env" true', false, false), 'SOLE', `${script}: .env alone, before any snapshot`)
+
+      for (const [label, envFiles, published, required, refusal] of [
+        [
+          'a snapshot this run did not publish, which is an unexplained pin',
+          bound, false, false,
+          /loads a second environment file, \/etc\/ims-cutover\/db-identity-snapshot\.env, that this run did not publish/,
+        ],
+        [
+          'a second file that is not the snapshot, which would win the last-definition race',
+          'a(sb) 2 "/opt/app/.env" true "/etc/ims/other.env" false', true, false,
+          /and this run's environment snapshot is \/etc\/ims-cutover\/db-identity-snapshot\.env/,
+        ],
+        [
+          "the snapshot loaded with a leading '-', so losing it is silent instead of fatal",
+          `a(sb) 2 "/opt/app/.env" true "${SNAPSHOT_PATH}" true`, true, false,
+          /loads .* with a leading '-', so systemd SKIPS it if it is missing/,
+        ],
+        [
+          'the snapshot FIRST and .env second, so .env is the last definition and the pin is inert',
+          `a(sb) 2 "${SNAPSHOT_PATH}" false "/opt/app/.env" true`, true, false,
+          /as its first environment file and not \/opt\/app\/\.env/,
+        ],
+        [
+          'no snapshot at all, at the one call site that requires one',
+          'a(sb) 1 "/opt/app/.env" true', true, true,
+          /does not load this run's environment snapshot/,
+        ],
+      ] as [string, string, boolean, boolean, RegExp][]) {
+        const answer = ask(envFiles, published, required)
+        assert.match(answer, /^REFUSE /, `${script}: ${label} — must be refused`)
+        assert.match(answer, refusal, `${script}: ${label} — and named`)
+      }
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('o3d-2sm1.5 r23: the snapshot is written verbatim, root-only, and loaded without a fallback', () => {
+  // ROUTE: publish_db_identity_snapshot() -> ${DB_ENV_SNAPSHOT_FILE} and the drop-in that loads it
+  // -> systemd at exec. This is the WRITING end of the test above: it runs the shipped function
+  // with `chown`, `chmod` and `systemctl` recorded rather than performed, and asserts the bytes.
+  //
+  // WHY SINGLE QUOTES. systemd.exec documents a single-quoted value as verbatim — "can span
+  // multiple lines and contain any character verbatim other than single quote" — so the deploy's
+  // reader and systemd's reader cannot disagree about a password containing a backslash or a `#`,
+  // which they can for an unquoted one. A value carrying a single quote has no verbatim spelling
+  // and is refused rather than escaped into a form the two would read differently.
+  //
+  // MUTATION: drop the quotes from the printf and the `$#` password below is written bare, so the
+  // content assertion fails (and systemd would read it as a comment). Add a leading `-` to the
+  // EnvironmentFile= line and the drop-in assertion fails. Delete the chmod 700 and the recorded
+  // mode assertion fails, leaving the file in a directory whose mode nothing established.
+  for (const [script, appVar] of [['deploy.sh', 'APP_DIR_REAL'], ['update.sh', 'APP_DIR'], ['install.sh', 'APP_DIR']] as const) {
+    const source = readFileSync(join(process.cwd(), `scripts/${script}`), 'utf8')
+    const start = source.indexOf('publish_db_identity_snapshot() {')
+    assert.ok(start > 0, `${script}: precondition — the shipped script publishes a snapshot`)
+    const lifted = source.slice(start, source.indexOf('\n  return 0\n}\n', start) + 14)
+    assert.ok(lifted.includes('publish_durable_file'), `${script}: and publishes it durably`)
+
+    const dir = mkdtempSync(join(tmpdir(), 'ims-snapshot-'))
+    try {
+      const url = "postgresql://app:p#ss\\word@127.0.0.1:5432/main"
+      writeFileSync(join(dir, '.env'), `DATABASE_URL="${url}"\n`)
+      const bash = [
+        'set -uo pipefail',
+        'DRY_RUN=false',
+        'RED=""; RESET=""; YELLOW=""',
+        `${appVar}="$1"`,
+        'APP_DIR="$1"',
+        'APP_NAME="one-two-inventory"',
+        'SERVICE_UNIT="one-two-inventory.service"',
+        'SERVICE_UNITS=("one-two-inventory.service")',
+        'DATABASE_URL="$3"',
+        `DB_ENV_SNAPSHOT_DIR="$1/etc"`,
+        `DB_ENV_SNAPSHOT_FILE="$1/etc/db-identity-snapshot.env"`,
+        'DB_ENV_SNAPSHOT_DROPIN_NAME="zz-deploy-db-identity.conf"',
+        'DB_ENV_SNAPSHOT_DROPIN_FILE="$1/dropins/one-two-inventory.service.d/zz-deploy-db-identity.conf"',
+        'DB_ENV_SNAPSHOT_PUBLISHED=false',
+        'DB_ENV_SNAPSHOT_DROPINS_CREATED=()',
+        // RECORDED, NOT PERFORMED: the test does not run as root, and what matters is that the
+        // shipped function ASKS for root ownership and a 0700 directory.
+        'CALLS="$2"',
+        'chown() { printf "CHOWN %s\\n" "$*" >> "$CALLS"; return 0; }',
+        'chmod() { printf "CHMOD %s\\n" "$*" >> "$CALLS"; return 0; }',
+        'systemctl() { printf "SYSTEMCTL %s\\n" "$*" >> "$CALLS"; return 0; }',
+        'error() { printf "ERROR %s\\n" "$*"; }',
+        'warn() { printf "WARN %s\\n" "$*"; }',
+        'fsync_path() { sync "$1" 2>/dev/null || true; return 0; }',
+        readShellFunction(source, 'publish_durable_file'),
+        readShellFunction(source, 'publish_durable_dropin'),
+        readShellFunction(source, 'env_file_value'),
+        // deploy.sh names its own unit drop-ins through a helper; the other two use a variable.
+        source.includes('snapshot_dropin_file() {') ? 'snapshot_dropin_file() { echo "$DB_ENV_SNAPSHOT_DROPIN_FILE"; }' : '',
+        lifted,
+        'if publish_db_identity_snapshot; then printf "PUBLISHED\\n"; else printf "REFUSED\\n"; fi',
+      ].join('\n')
+
+      const run = spawnSync('bash', ['-c', bash, 'publish', dir, join(dir, 'calls.log'), url], { encoding: 'utf8' })
+      assert.equal(run.status, 0, `${script}: ${run.stderr}`)
+      assert.match(run.stdout ?? '', /PUBLISHED/, `${script}: the shipped function published`)
+
+      // THE VALUE, VERBATIM AND QUOTED. The `#` and the backslash are exactly the characters an
+      // unquoted systemd value would mangle.
+      const written = readFileSync(join(dir, 'etc/db-identity-snapshot.env'), 'utf8')
+      assert.equal(written, `DATABASE_URL='${url}'\n`, `${script}: the value is written single-quoted and whole`)
+
+      // THE DROP-IN, AND THE ABSENT '-'. `EnvironmentFile=-` would make a deleted snapshot a
+      // silent fall-through to .env instead of a refused start.
+      const dropin = readFileSync(join(dir, 'dropins/one-two-inventory.service.d/zz-deploy-db-identity.conf'), 'utf8')
+      assert.match(dropin, /^EnvironmentFile=[^-]/m, `${script}: the snapshot is loaded MANDATORILY`)
+      assert.ok(dropin.includes(`EnvironmentFile=${join(dir, 'etc/db-identity-snapshot.env')}`), `${script}: and it is the snapshot`)
+      assert.match(dropin, /^\[Service\]$/m, `${script}: in the section that can carry it`)
+
+      // AND THE OWNERSHIP IT ASKED FOR. A snapshot in a directory the application user can write
+      // is not a binding — the service could delete what it is bound to.
+      const calls = readFileSync(join(dir, 'calls.log'), 'utf8')
+      assert.match(calls, new RegExp(`CHOWN root:root ${join(dir, 'etc')}$`, 'm'), `${script}: the directory is root-owned`)
+      assert.match(calls, new RegExp(`CHMOD 700 ${join(dir, 'etc')}$`, 'm'), `${script}: and unreadable to anyone else`)
+      assert.match(calls, /SYSTEMCTL daemon-reload/, `${script}: and the drop-in is loaded before anything asks about it`)
+
+      // A VALUE WITH NO VERBATIM SPELLING IS REFUSED, not escaped into something the two readers
+      // would disagree about.
+      writeFileSync(join(dir, '.env'), "DATABASE_URL=\"postgresql://a:it's@h:5432/d\"\n")
+      const quoted = spawnSync('bash', ['-c', bash, 'publish', dir, join(dir, 'calls.log'), "postgresql://a:it's@h:5432/d"], { encoding: 'utf8' })
+      assert.match(quoted.stdout ?? '', /REFUSED/, `${script}: a single quote in the value is refused`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }
+})
+
+/** One shell function out of a script, by name, closed by a `}` in column 0. */
+function readShellFunction(source: string, name: string): string {
+  const start = source.indexOf(`\n${name}() {\n`)
+  assert.notEqual(start, -1, `the script must define ${name}()`)
+  const rest = source.slice(start + 1)
+  const end = rest.indexOf('\n}\n')
+  assert.notEqual(end, -1, `${name}() must be closed by a } in column 0`)
+  return rest.slice(0, end + 2)
+}
+
+test('o3d-2sm1.5 r23: the trap re-fences the database it migrated even when the UNIT now disagrees', () => {
+  // ROUTE: the post-release refusal (`require_start_identity_bound || die`) -> the exit trap ->
+  // SCHEMA_TOUCHED true, DB_FENCE_UP false -> refence_db_connections() -> `--fence`.
+  //
+  // THE DEFECT (Codex MEDIUM). refence_db_connections() re-ran
+  // require_env_file_is_sole_definition() before issuing --fence. That is a START gate: it asks
+  // whether anything but the app's .env can define DATABASE_URL for the SERVICE. The single
+  // commonest reason control reaches this trap with the fence down is that the very same refusal
+  // just fired upstream — so the guard necessarily failed again on the still-present unit
+  // disagreement, the function returned before `--fence`, and the banner announced a re-fence
+  // that was never attempted. The migrated database's CONNECT grants stayed RELEASED, with remote
+  // writers and any second application free to reconnect during recovery.
+  //
+  // THE RULE. Once this run has fenced and migrated, WHICH database to shut is not in question —
+  // it is the pinned identity, and what some unit now claims about its environment cannot make
+  // that the wrong database to close. It can make it wrong to START the application, which is
+  // exactly what the upstream refusal already decided.
+  //
+  // MUTATION: make the `require_env_file_is_sole_definition || return 1` unconditional again and
+  // the first assertion below fails — no --fence is issued on the recovery path. Delete the guard
+  // entirely (never ask it) and the last assertion fails, because the forward path would then
+  // re-fence a database whose service may be reading its identity from somewhere else.
+  for (const [script, runner] of [['deploy.sh', 'as_app_user'], ['update.sh', 'run_as_user']] as const) {
+    const source = readFileSync(join(process.cwd(), `scripts/${script}`), 'utf8')
+    const start = source.indexOf('refence_db_connections() {')
+    assert.ok(start > 0, `${script}: precondition — the trap re-fences through a function of its own`)
+    const lifted = source.slice(start, source.indexOf('\n  return 0\n}\n', start) + 14)
+    assert.ok(lifted.includes('--fence --state-file'), `${script}: and the lifted body is the one that issues it`)
+
+    // A REAL FILE, because the shipped function refuses when the fence script is missing — and a
+    // test whose every call refused there would prove nothing about the guard under test.
+    const fenceDir = mkdtempSync(join(tmpdir(), 'ims-refence-'))
+    const fenceScript = join(fenceDir, 'fence-db-connections.mjs')
+    writeFileSync(fenceScript, '')
+
+    function refence(schemaTouched: boolean, raised: boolean, soleOk: boolean): string {
+      const bash = [
+        'set -uo pipefail',
+        'DB_FENCE_UP=false',
+        'DRY_RUN=false',
+        'DB_FENCE_SCRIPT="$1"',
+        'DEPLOY_ADMIN_DATABASE_URL="postgresql://admin@127.0.0.1:5432/main"',
+        'DATABASE_URL="postgresql://app:pw@127.0.0.1:5432/main"',
+        'APP_USER="app"',
+        'DB_FENCE_STATE="/tmp/state.json"',
+        'DB_FENCE_RELEASE_CMD="release"',
+        'MIGRATION_DATABASE_URL=""',
+        'DB_FENCE_IDENTITY_ARGS=(--app-host=127.0.0.1 --app-port=5432 --app-user=app --app-database=main)',
+        `SCHEMA_TOUCHED=${schemaTouched}`,
+        `DB_FENCE_RAISED=${raised}`,
+        'require_db_identity() { return 0; }',
+        // THE STILL-PRESENT DISAGREEMENT: the unit acquired another environment source and the
+        // gate keeps saying so, exactly as it does upstream.
+        `require_env_file_is_sole_definition() { ${soleOk ? 'return 0' : 'return 1'}; }`,
+        'warn() { :; }',
+        `${runner}() { printf "CALL %s\\n" "$*"; return 0; }`,
+        lifted,
+        'refence_db_connections || printf "RETURNED-NONZERO\\n"',
+      ].join('\n')
+      const run = spawnSync('bash', ['-c', bash, 'refence', fenceScript], { encoding: 'utf8' })
+      assert.equal(run.status, 0, `${script}: ${run.stderr}`)
+      return run.stdout ?? ''
+    }
+
+    // THE RECOVERY PATH: schema touched, unit disagreeing. The re-fence must happen anyway.
+    assert.match(
+      refence(true, false, false),
+      /CALL .*--fence --state-file/,
+      `${script}: a migrated database is re-closed even though the unit now names another environment source`,
+    )
+    // The same when the disagreement is absent, so the assertion above is not passing on a
+    // function that ignores the gate in every case.
+    assert.match(refence(true, false, true), /CALL .*--fence --state-file/, `${script}: and when it agrees`)
+    // AND THE FORWARD PATH IS UNCHANGED: nothing migrated, nothing committed, and a service whose
+    // DATABASE_URL something else can define is still a database this must not aim at.
+    assert.doesNotMatch(
+      refence(false, false, false),
+      /--fence --state-file/,
+      `${script}: with nothing fenced or migrated yet, the unit-source gate still refuses`,
+    )
+    // A run that COMMITTED revokes has a database to re-close too, even before SCHEMA_TOUCHED.
+    assert.match(refence(false, true, false), /CALL .*--fence --state-file/, `${script}: and a committed fence counts`)
+    rmSync(fenceDir, { recursive: true, force: true })
+  }
+})
+
+test('o3d-2sm1.5 r23: the binding is taken away on every exit, and a stale one is cleared first', () => {
+  // A drop-in that outlives its run is worse than no drop-in: it overrides ${APP_DIR}/.env for
+  // every restart, reboot and Restart= that follows, silently, from a file in /etc/systemd/system
+  // that no document mentions. So the removal is on the success path AND in the failure trap, and
+  // a snapshot some SIGKILLed run left behind is cleared before anything asks the bus about it.
+  //
+  // MUTATION: delete either removal call from any entrypoint and its count assertion fails by
+  // name; delete the clear and the ordering assertion fails, and a re-run after a hard kill would
+  // refuse at the validate phase on a drop-in it wrote itself last time.
+  for (const script of ['deploy.sh', 'update.sh', 'install.sh'] as const) {
+    const source = readFileSync(join(process.cwd(), `scripts/${script}`), 'utf8')
+    const calls = source.split('\n').filter((line) => /^\s*(\$DRY_RUN \|\| )?remove_db_identity_snapshot$/.test(line))
+    assert.ok(calls.length >= 2, `${script}: the binding comes off on more than one path (${calls.length})`)
+
+    // THE FAILURE PATH: after the re-stop, so nothing is running with a pin that is about to be
+    // withdrawn, and before the reboot fence goes back. Anchored on the trap's OWN re-install —
+    // `systemctl stop` appears in several other places, and indexOf from the first of them would
+    // measure a distance in a different part of the script.
+    const reinstall = source.search(/install_reboot_fence "(deploy|update|install) failed at /)
+    assert.ok(reinstall > 0, `${script}: precondition — the failure trap re-installs the reboot fence`)
+    const stop = source.lastIndexOf('systemctl stop', reinstall)
+    assert.ok(stop > 0, `${script}: precondition — the trap re-stops before it re-fences`)
+    const trapRemoval = source.indexOf('remove_db_identity_snapshot', stop)
+    assert.ok(trapRemoval > stop && trapRemoval < reinstall, `${script}: the trap withdraws the binding it published`)
+  }
+
+  // AND THE TWO SCRIPTS THAT CAN BE RE-RUN AFTER A HARD KILL CLEAR A LEFTOVER BEFORE THE VALIDATE
+  // PHASE ASKS THE BUS. install.sh needs none: it publishes (and so overwrites) before it asks.
+  for (const script of ['deploy.sh', 'update.sh'] as const) {
+    const source = readFileSync(join(process.cwd(), `scripts/${script}`), 'utf8')
+    const clear = source.indexOf('$DRY_RUN || remove_db_identity_snapshot')
+    const fenceable = source.indexOf('require_fenceable_database\n')
+    assert.ok(clear > 0, `${script}: a leftover snapshot is cleared`)
+    assert.ok(fenceable > clear, `${script}: and cleared BEFORE the first question about the unit`)
+  }
+})
