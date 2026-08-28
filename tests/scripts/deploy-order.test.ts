@@ -8192,8 +8192,9 @@ test('r33: a script-only pin cannot authorise a publication whose closure comes 
   //      stops being recognised as writable by anybody else.
   //   3. delete the `_fence_source_trust` call from _fence_vendor_into(): PHASE 1 publishes while
   //      PHASE 3 still passes, so nothing else in the suite notices.
-  //   4. change the refusal to a warning that publishes anyway: PHASE 1's "nothing published"
-  //      assertion fails.
+  // Under mutation 1 the consequence was measured rather than assumed: the artefact publishes,
+  // ${recovery}/app/node_modules/pg/lib/index.js holds SUBSTITUTED-PG, and running the PROTECTED
+  // helper writes the admin URL out — a legitimate entry-file digest, an attacker's closure.
   const dir = mkdtempSync(join(tmpdir(), 'ims-r33-pin-'))
   try {
     // A checkout whose HELPER is the shipped one and whose `pg` steals the admin credential.
@@ -8402,7 +8403,8 @@ test('r33: the provenance question is asked about ownership as well as modes, an
 test('r33: every printed recovery instruction carries the privilege the account reading it has', () => {
   // MUTATION ROUTE (each verified locally):
   //   1. change DB_FENCE_RELEASE_CMD back to "${DB_FENCE_RELEASE_WRAPPER}" in any entrypoint: the
-  //      assignment rule fails, naming that entrypoint.
+  //      assignment shape is asserted by the r32 test above, which fails naming that entrypoint —
+  //      verified against install.sh.
   //   2. drop `${sudo_prefix}` from the wrapper's credential-missing message: PHASE C fails — the
   //      printed line is the bare `env … /path` form, which PHASE B has just proved is EACCES for
   //      a reader who is not the owner.
