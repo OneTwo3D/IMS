@@ -1509,21 +1509,11 @@ const RENDERED_DIRECTIONS: readonly { direction: LocalDirection; text: string }[
     text: 'confirm the invoice PDF stored against the order is the document you expect',
   },
   {
-    direction: {
-      action: 'INSPECT',
-      target: 'EMAIL_OUTBOX_ROWS',
-      selector: 'THIS_ORDERS_ROWS',
-      read: ['status', 'attempts', 'lastError', 'sentAt'],
-    },
+    direction: { action: 'INSPECT', target: 'EMAIL_OUTBOX_ROWS', form: 'THIS_ORDERS_ROWS' },
     text: "Inspect the outbox rows for this order and read each row's status, attempts, lastError and sentAt.",
   },
   {
-    direction: {
-      action: 'INSPECT',
-      target: 'EMAIL_OUTBOX_ROWS',
-      selector: 'BY_KIND_AND_REFERENCE',
-      read: ['status', 'attempts', 'lastError', 'createdAt', 'sentAt'],
-    },
+    direction: { action: 'INSPECT', target: 'EMAIL_OUTBOX_ROWS', form: 'BY_KIND_AND_REFERENCE' },
     text: 'Then INSPECT the outbox: query it for kind ACCOUNTING_INVOICE, referenceType SalesOrder, referenceId '
       + "= the order id (no page in IMS lists them) and read each row's status, attempts, lastError, createdAt "
       + 'and sentAt.',
@@ -1533,7 +1523,7 @@ const RENDERED_DIRECTIONS: readonly { direction: LocalDirection; text: string }[
     text: 'so re-run the query rather than treating one result as the final list',
   },
   {
-    direction: { action: 'READ', target: 'EMAIL_OUTBOX_ROWS', read: ['status', 'lastError', 'time'] },
+    direction: { action: 'READ', target: 'EMAIL_OUTBOX_ROWS' },
     text: 'Read them by status, lastError and time',
   },
   {
@@ -1541,16 +1531,11 @@ const RENDERED_DIRECTIONS: readonly { direction: LocalDirection; text: string }[
     text: 'TURN THE LEVER BELOW OFF FIRST, so that no NEW run is admitted',
   },
   {
-    direction: { action: 'READ_SETTING', target: 'SETTING_ATTACH_PDF', lead: 'THEN_GO_AND', purpose: 'NONE' },
+    direction: { action: 'READ_SETTING', target: 'SETTING_ATTACH_PDF', form: 'THEN_GO_AND_READ_IT' },
     text: 'THEN GO AND READ quickbooks_sync_attach_pdf AS IT STANDS NOW',
   },
   {
-    direction: {
-      action: 'READ_SETTING',
-      target: 'SETTING_ATTACH_PDF',
-      lead: 'NONE',
-      purpose: 'LEARN_WHAT_A_REPLAY_WOULD_DO',
-    },
+    direction: { action: 'READ_SETTING', target: 'SETTING_ATTACH_PDF', form: 'TO_LEARN_WHAT_A_REPLAY_WOULD_DO' },
     text: 'READ quickbooks_sync_attach_pdf AS IT STANDS NOW to learn what a replay would do',
   },
   {

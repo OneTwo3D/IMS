@@ -22,6 +22,22 @@
  * imperatives, only one of which its declared {action, target} covered. See the block above
  * `LocalDirectionSequence` at the end of this file — compound remediation is a SEQUENCE now, and
  * `after` is gone.
+ *
+ * ROUND 21 (Codex HIGH x2) CLOSED THE LAST OPEN PARAMETERS, so that the set of strings this renderer
+ * can emit is FINITE AND COMPUTABLE and equals the reviewed inventory in the test file, sentence for
+ * sentence. Three members carried fields whose product was wider than what anybody had read:
+ *
+ *   • `INSPECT` had `selector` x `read` — two independent fields, six sentences, two reviewed.
+ *   • `READ_SETTING` had `lead` x `purpose` — four sentences, two reviewed. A type-valid
+ *     `{ lead: 'THEN_GO_AND', purpose: 'LEARN_WHAT_A_REPLAY_WOULD_DO' }` shipped prose nobody saw.
+ *   • `READ` and `INSPECT` both took `readonly OutboxReadAxis[]`, which is unbounded and INCLUDES
+ *     THE EMPTY ARRAY. That is the branch Codex's counterexample used: nothing renders it, so the
+ *     runtime equality check never reaches it, and `andList([])` made the sentence end mid-word.
+ *
+ * Each is one enumerated field now, and the column lists are named members of `OUTBOX_READ_LIST`.
+ * The test that reads this module computes the VALUE of every string expression these two functions
+ * can return and requires that set to be exactly the reviewed one — which is only a statement worth
+ * making because there is no longer a parameter whose values nobody has enumerated.
  */
 
 /**
@@ -122,6 +138,27 @@ export const LOCAL_TARGET: Record<LocalTarget, {
 /** The EmailOutbox columns (and the one derived axis) a direction may send a reader to read. */
 export type OutboxReadAxis = 'status' | 'attempts' | 'lastError' | 'createdAt' | 'sentAt' | 'time'
 
+/**
+ * THE COLUMN LISTS THEMSELVES, ENUMERATED (o3d-batch-ret r21, Codex HIGH).
+ *
+ * `read: readonly OutboxReadAxis[]` was a FREE PARAMETER: six axes in any order and any length, so
+ * the sentence "Read them by ..." had an unbounded set of values and only three of them were ever
+ * written down and read. The empty array was in that set too, and it is the branch Codex's
+ * split-literal counterexample rode in on — `andList([])` returns '', so the shipped renderer could
+ * emit "Read them by " for a type-valid direction nobody enumerated.
+ *
+ * A LIST IS A NAME NOW. Three of them, each a non-empty tuple of axes the type still fences, so the
+ * prose a direction can produce is finite and every value of it is in the reviewed inventory.
+ */
+export const OUTBOX_READ_LIST = {
+  /** This order's own rows, read for where each one got to. */
+  THIS_ORDERS_ROWS: ['status', 'attempts', 'lastError', 'sentAt'],
+  /** The same, plus when the row was made — the query that cannot be narrowed to one attempt. */
+  BY_KIND_AND_REFERENCE: ['status', 'attempts', 'lastError', 'createdAt', 'sentAt'],
+  /** What a row can be read for once narrowing it is known to be impossible. */
+  WHEN_NARROWING_IS_IMPOSSIBLE: ['status', 'lastError', 'time'],
+} as const satisfies Record<string, readonly [OutboxReadAxis, ...OutboxReadAxis[]]>
+
 /** The two settings IMS itself holds. There is no third, and no way to name anything else. */
 export const SETTING_NAME: Record<'SETTING_SYNC_ENABLED' | 'SETTING_ATTACH_PDF', string> = {
   SETTING_SYNC_ENABLED: 'quickbooks_sync_enabled',
@@ -137,13 +174,13 @@ export const SETTING_NAME: Record<'SETTING_SYNC_ENABLED' | 'SETTING_ATTACH_PDF',
  */
 export type LocalDirection =
   | { action: 'CONFIRM'; target: 'ORDER_INVOICE_PDF' }
-  | {
-      action: 'INSPECT'
-      target: 'EMAIL_OUTBOX_ROWS'
-      selector: 'THIS_ORDERS_ROWS' | 'BY_KIND_AND_REFERENCE'
-      read: readonly OutboxReadAxis[]
-    }
-  | { action: 'READ'; target: 'EMAIL_OUTBOX_ROWS'; read: readonly OutboxReadAxis[] }
+  /**
+   * o3d-batch-ret r21 (Codex HIGH): ONE FIELD, NOT TWO. `selector` and `read` were independent, so
+   * the type admitted six INSPECT sentences and two of them were reviewed. The pair that ships is
+   * one choice, and the column list each half reads is chosen by that same choice.
+   */
+  | { action: 'INSPECT'; target: 'EMAIL_OUTBOX_ROWS'; form: 'THIS_ORDERS_ROWS' | 'BY_KIND_AND_REFERENCE' }
+  | { action: 'READ'; target: 'EMAIL_OUTBOX_ROWS' }
   | { action: 'RE_READ'; target: 'EMAIL_OUTBOX_ROWS' }
   | { action: 'TURN_OFF'; target: 'SETTING_SYNC_ENABLED'; control: 'LEVER_BELOW' | 'CONNECTOR_PANEL_CHECKBOX' }
   /**
@@ -152,12 +189,13 @@ export type LocalDirection =
    * the half that used to live in the ESCALATE branch's `after` field.
    */
   | { action: 'LEAVE_OFF'; target: 'SETTING_SYNC_ENABLED'; form: 'NOT_A_FENCE' | 'BEFORE_ESCALATION' }
-  | {
-      action: 'READ_SETTING'
-      target: 'SETTING_ATTACH_PDF'
-      lead: 'THEN_GO_AND' | 'NONE'
-      purpose: 'LEARN_WHAT_A_REPLAY_WOULD_DO' | 'NONE'
-    }
+  /**
+   * o3d-batch-ret r21 (Codex HIGH): THE SAME COLLAPSE. `lead` x `purpose` was a cartesian product of
+   * four sentences, of which TWO shipped and two had never been read by anybody — a type-valid
+   * `{ lead: 'THEN_GO_AND', purpose: 'LEARN_WHAT_A_REPLAY_WOULD_DO' }` emitted prose no reviewer had
+   * seen. One field, two forms, two sentences.
+   */
+  | { action: 'READ_SETTING'; target: 'SETTING_ATTACH_PDF'; form: 'THEN_GO_AND_READ_IT' | 'TO_LEARN_WHAT_A_REPLAY_WOULD_DO' }
   | { action: 'ESCALATE'; target: 'THIS_RECORD_AND_ITS_SYNC_ROW'; naming: 'SYNC_ROW' }
   | {
       action: 'ESCALATE'
@@ -166,10 +204,17 @@ export type LocalDirection =
       caseForm: 'SENTENCE' | 'CLAUSE'
     }
 
-/** "a, b and c" — the shipped wording for a list of read axes. */
-function andList(items: readonly string[]): string {
+/**
+ * "a, b and c" — the shipped wording for a list of read axes.
+ *
+ * o3d-batch-ret r21 (Codex HIGH): the parameter is a NON-EMPTY tuple of axes, so `items[0]` needs no
+ * `?? ''` fallback and there is no argument that makes this return the empty string. Every call site
+ * passes a member of `OUTBOX_READ_LIST`, whose lengths are known, so the value of this function at
+ * each call site is a constant a reader can compute.
+ */
+function andList(items: readonly [OutboxReadAxis, ...OutboxReadAxis[]]): string {
   return items.length < 2
-    ? (items[0] ?? '')
+    ? items[0]
     : `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}`
 }
 
@@ -191,15 +236,14 @@ export function renderLocalDirection(direction: LocalDirection, context: LocalDi
   switch (direction.action) {
     case 'CONFIRM':
       return 'confirm the invoice PDF stored against the order is the document you expect'
-    case 'INSPECT': {
-      const selector = direction.selector === 'THIS_ORDERS_ROWS'
-        ? 'Inspect the outbox rows for this order'
+    case 'INSPECT':
+      return direction.form === 'THIS_ORDERS_ROWS'
+        ? `Inspect the outbox rows for this order and read each row's ${andList(OUTBOX_READ_LIST.THIS_ORDERS_ROWS)}.`
         : 'Then INSPECT the outbox: query it for kind ACCOUNTING_INVOICE, referenceType SalesOrder, '
-          + 'referenceId = the order id (no page in IMS lists them)'
-      return `${selector} and read each row's ${andList(direction.read)}.`
-    }
+          + 'referenceId = the order id (no page in IMS lists them) and read each row\'s '
+          + `${andList(OUTBOX_READ_LIST.BY_KIND_AND_REFERENCE)}.`
     case 'READ':
-      return `Read them by ${andList(direction.read)}`
+      return `Read them by ${andList(OUTBOX_READ_LIST.WHEN_NARROWING_IS_IMPOSSIBLE)}`
     case 'RE_READ':
       return 'so re-run the query rather than treating one result as the final list'
     case 'TURN_OFF':
@@ -212,13 +256,10 @@ export function renderLocalDirection(direction: LocalDirection, context: LocalDi
       return direction.form === 'NOT_A_FENCE'
         ? 'THEN LEAVE IT OFF, BECAUSE TURNING IT OFF IS NOT A FENCE.'
         : 'Leave the toggle off'
-    case 'READ_SETTING': {
-      const lead = direction.lead === 'THEN_GO_AND' ? 'THEN GO AND ' : ''
-      const purpose = direction.purpose === 'LEARN_WHAT_A_REPLAY_WOULD_DO'
-        ? ' to learn what a replay would do'
-        : ''
-      return `${lead}READ ${SETTING_NAME[direction.target]} AS IT STANDS NOW${purpose}`
-    }
+    case 'READ_SETTING':
+      return direction.form === 'THEN_GO_AND_READ_IT'
+        ? `THEN GO AND READ ${SETTING_NAME[direction.target]} AS IT STANDS NOW`
+        : `READ ${SETTING_NAME[direction.target]} AS IT STANDS NOW to learn what a replay would do`
     case 'ESCALATE': {
       const administrator = 'to whoever administers this installation'
       if (direction.naming === 'SYNC_ROW') {
@@ -242,31 +283,16 @@ export const LOCAL_DIRECTIONS: readonly LocalDirection[] = [
   // The local EmailOutbox rows, by that table's own columns — every one walked into the schema in
   // rounds 6 through 9. Reads only: EmailOutbox has no state that means "cancelled", and the record
   // says so in prose rather than instructing one.
-  {
-    action: 'INSPECT',
-    target: 'EMAIL_OUTBOX_ROWS',
-    selector: 'THIS_ORDERS_ROWS',
-    read: ['status', 'attempts', 'lastError', 'sentAt'],
-  },
-  {
-    action: 'INSPECT',
-    target: 'EMAIL_OUTBOX_ROWS',
-    selector: 'BY_KIND_AND_REFERENCE',
-    read: ['status', 'attempts', 'lastError', 'createdAt', 'sentAt'],
-  },
+  { action: 'INSPECT', target: 'EMAIL_OUTBOX_ROWS', form: 'THIS_ORDERS_ROWS' },
+  { action: 'INSPECT', target: 'EMAIL_OUTBOX_ROWS', form: 'BY_KIND_AND_REFERENCE' },
   { action: 'RE_READ', target: 'EMAIL_OUTBOX_ROWS' },
-  { action: 'READ', target: 'EMAIL_OUTBOX_ROWS', read: ['status', 'lastError', 'time'] },
+  { action: 'READ', target: 'EMAIL_OUTBOX_ROWS' },
   // The two plugin settings. Reading one is read-only; turning one off writes an IMS row and
   // touches nothing in anybody else's system — and the record says in prose, at length, that the
   // switch is an admission check rather than a fence.
   { action: 'TURN_OFF', target: 'SETTING_SYNC_ENABLED', control: 'LEVER_BELOW' },
-  { action: 'READ_SETTING', target: 'SETTING_ATTACH_PDF', lead: 'THEN_GO_AND', purpose: 'NONE' },
-  {
-    action: 'READ_SETTING',
-    target: 'SETTING_ATTACH_PDF',
-    lead: 'NONE',
-    purpose: 'LEARN_WHAT_A_REPLAY_WOULD_DO',
-  },
+  { action: 'READ_SETTING', target: 'SETTING_ATTACH_PDF', form: 'THEN_GO_AND_READ_IT' },
+  { action: 'READ_SETTING', target: 'SETTING_ATTACH_PDF', form: 'TO_LEARN_WHAT_A_REPLAY_WOULD_DO' },
   { action: 'TURN_OFF', target: 'SETTING_SYNC_ENABLED', control: 'CONNECTOR_PANEL_CHECKBOX' },
   { action: 'LEAVE_OFF', target: 'SETTING_SYNC_ENABLED', form: 'NOT_A_FENCE' },
   { action: 'LEAVE_OFF', target: 'SETTING_SYNC_ENABLED', form: 'BEFORE_ESCALATION' },

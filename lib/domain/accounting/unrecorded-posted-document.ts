@@ -599,7 +599,7 @@ export const QBO_OPERATIONS_WITHOUT_REQUEST_ID: Partial<Record<
         + 'reclaimed, every sweep uploads the supplier invoice PDF to the bill instead',
       check: 'nothing this attempt did needs undoing — it created no attachment. '
         + renderLocalDirection(
-          { action: 'READ_SETTING', target: 'SETTING_ATTACH_PDF', lead: 'THEN_GO_AND', purpose: 'NONE' },
+          { action: 'READ_SETTING', target: 'SETTING_ATTACH_PDF', form: 'THEN_GO_AND_READ_IT' },
           QBO_DIRECTIONS,
         )
         + ', because this record cannot: if it is off, the '
@@ -618,7 +618,7 @@ export const QBO_OPERATIONS_WITHOUT_REQUEST_ID: Partial<Record<
       check: 'IMS DID NOT RECORD WHETHER THIS ATTEMPT UPLOADED ANYTHING, and it does not name the '
         + 'bill either. '
         + renderLocalDirection(
-          { action: 'READ_SETTING', target: 'SETTING_ATTACH_PDF', lead: 'NONE', purpose: 'LEARN_WHAT_A_REPLAY_WOULD_DO' },
+          { action: 'READ_SETTING', target: 'SETTING_ATTACH_PDF', form: 'TO_LEARN_WHAT_A_REPLAY_WOULD_DO' },
           QBO_DIRECTIONS,
         )
         + ', and '
@@ -679,12 +679,7 @@ export const QBO_OPERATIONS_WITHOUT_REQUEST_ID: Partial<Record<
       + 'it is an ADMISSION CHECK, NOT A FENCE: a run admitted a moment before you flipped it can '
       + 'queue another copy afterwards, and nothing in IMS reports whether one is doing so. '
       + renderLocalDirection(
-        {
-          action: 'INSPECT',
-          target: 'EMAIL_OUTBOX_ROWS',
-          selector: 'BY_KIND_AND_REFERENCE',
-          read: ['status', 'attempts', 'lastError', 'createdAt', 'sentAt'],
-        },
+        { action: 'INSPECT', target: 'EMAIL_OUTBOX_ROWS', form: 'BY_KIND_AND_REFERENCE' },
         QBO_DIRECTIONS,
       )
       + ' WHAT COMES BACK IS A NON-QUIESCENT SNAPSHOT: the set can '
@@ -705,7 +700,7 @@ export const QBO_OPERATIONS_WITHOUT_REQUEST_ID: Partial<Record<
       + 'carried — so it speaks for the attempt that wrote it and for no attempt before it. IMS keeps '
       + 'no per-attempt outcome, so no row can be read backwards into its own history (o3d-ch0h). '
       + renderLocalDirection(
-        { action: 'READ', target: 'EMAIL_OUTBOX_ROWS', read: ['status', 'lastError', 'time'] },
+        { action: 'READ', target: 'EMAIL_OUTBOX_ROWS' },
         QBO_DIRECTIONS,
       )
       + ', and DO NOT REPORT A '
@@ -1609,12 +1604,7 @@ export const NON_DOCUMENT_INCIDENT_WORDING: Readonly<Record<
         + 'PROCESSING, SENT, FAILED), none of which means "deliberately not delivered", and no action, '
         + 'route or screen removes an unsent row. '
         + renderLocalDirection(
-          {
-            action: 'INSPECT',
-            target: 'EMAIL_OUTBOX_ROWS',
-            selector: 'THIS_ORDERS_ROWS',
-            read: ['status', 'attempts', 'lastError', 'sentAt'],
-          },
+          { action: 'INSPECT', target: 'EMAIL_OUTBOX_ROWS', form: 'THIS_ORDERS_ROWS' },
           QBO_DIRECTIONS,
         )
         + ' A FAILED ROW IS NOT PROOF THAT NOTHING WENT, '
