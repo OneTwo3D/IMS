@@ -7,7 +7,41 @@ import bcrypt from 'bcryptjs'
 import nodemailer from 'nodemailer'
 import pg from 'pg'
 
+import { pgConnectionConfig } from '../lib/db/database-url-schema.mjs'
+
 const { Client } = pg
+
+/**
+ * THE CLIENT THIS SCRIPT SEEDS THROUGH, ON THE SAME SCHEMA THE APPLICATION RUNS ON
+ * (o3d-2k5r r12, Codex HIGH).
+ *
+ * Every statement below names its tables UNQUALIFIED — `settings`, `users` — so the schema they
+ * land in is whatever search path the connection was opened with. This used to be
+ * `new Client({ connectionString: databaseUrl })`, and `?schema=` is a PRISMA-ONLY query
+ * parameter: node-postgres discards it. On a `?schema=TenantA` deployment the runtime is pinned to
+ * `TenantA` and this writer went to the login role's default search path instead — the admin
+ * account, the SMTP settings and the plaintext WooCommerce consumer secret seeded into one schema
+ * while the application reads another. On a multi-schema database that is one tenant's credentials
+ * written into another tenant's schema; on a single-tenant one it is an installation that reports
+ * success and then presents an unconfigured connector and no admin to log in as.
+ *
+ * `pgConnectionConfig()` is the one place that decision is made, for all four runtime consumers
+ * (see lib/db/database-url-schema.mjs). It is spread FIRST and carries the connection string with
+ * it: `pg` parses `connectionString` after the surrounding config, so an `options=` left inside the
+ * URL would overwrite a search path set beside it.
+ *
+ * THE IMPORT IS STATIC ON PURPOSE. `scripts/install.sh` falls back to a bare
+ * `/root/provision-instance.mjs` when the application directory has no copy; a standalone file
+ * cannot reach the shared resolver (nor `pg`, which it already imports from the app's
+ * node_modules), so it now fails to load instead of connecting unpinned. Refusing to run is the
+ * correct outcome for a seeder that cannot know which schema it is seeding.
+ *
+ * @param {string} databaseUrl
+ * @returns {import('pg').Client}
+ */
+export function provisioningClient(databaseUrl) {
+  return new Client({ ...pgConnectionConfig(databaseUrl) })
+}
 
 function getEnv(name, { required = false, fallback = '' } = {}) {
   const raw = process.env[name]
@@ -181,7 +215,7 @@ async function main() {
   // against (o3d-esha; see lib/settings-store.ts).
   const wcStoreUrl = normaliseStoreUrl(getEnv('WC_STORE_URL'))
 
-  const db = new Client({ connectionString: databaseUrl })
+  const db = provisioningClient(databaseUrl)
   await db.connect()
 
   try {
