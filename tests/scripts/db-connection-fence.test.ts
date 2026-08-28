@@ -46,10 +46,19 @@ function withPgEnv(values: Record<string, string>): () => void {
 
 import {
   IDENTITY_ENVIRONMENT_VARIABLES,
+  SYSTEMCTL_PATHS,
+  UNIT_PROPERTIES,
+  appDirectory,
+  applicationDotenvPaths,
   applyServiceEnvironment,
+  findSystemctl,
+  mentionedIdentityVariable,
+  parseArgs,
+  parseSystemctlShow,
+  parseSystemdEnvironment,
+  parseSystemdEnvironmentFiles,
   processOsAccount,
-  readServiceEnvironment,
-  serviceEnvironmentPaths,
+  readUnitEnvironment,
   EXIT_ERROR,
   EXIT_FENCE_STANDING,
   EXIT_FENCE_UNPROVEN,
@@ -91,38 +100,66 @@ import {
 const ATTACHED_AS_ADMIN = { connectedLoginRole: 'deployadmin', connectedEffectiveRole: 'deployadmin' }
 
 /**
+ * A STAND-IN FOR `systemctl show`, because a test cannot install a systemd unit.
+ *
+ * It answers with the properties the helper asks for, in `systemctl show`'s own `Key=Value`
+ * shape, and it is reached through `--systemctl=<path>` — an ARGV value, which is the seam the
+ * review asked for when it rejected the `IMS_SERVICE_ENV_FILE` environment variable (r17
+ * CRITICAL): argv comes from the entrypoint that ran the script, and unlike an inherited variable
+ * it cannot arrive from a `.bashrc`, a cron wrapper or a shell left open since last week.
+ */
+function stubSystemctl(
+  directory: string,
+  properties: { LoadState?: string; Environment?: string; EnvironmentFiles?: string; WorkingDirectory?: string; User?: string },
+): string {
+  const lines = [
+    `Environment=${properties.Environment ?? ''}`,
+    ...(properties.EnvironmentFiles === undefined ? [] : [`EnvironmentFiles=${properties.EnvironmentFiles}`]),
+    `WorkingDirectory=${properties.WorkingDirectory ?? ''}`,
+    `User=${properties.User ?? ''}`,
+    `LoadState=${properties.LoadState ?? 'loaded'}`,
+    'FragmentPath=/etc/systemd/system/one-two-inventory.service',
+  ]
+  const path = join(directory, 'systemctl')
+  writeFileSync(path, `#!/bin/sh\ncat <<'PROPS'\n${lines.join('\n')}\nPROPS\n`)
+  chmodSync(path, 0o755)
+  return path
+}
+
+/**
  * Run the shipped script from a directory with no .env, and report what it said.
  *
- * THE SERVICE'S ENVIRONMENT IS SUPPLIED AS A FILE, not as this process's environment
- * (o3d-2sm1.5, Codex r17 CRITICAL). The script reconstructs PGHOST/PGPORT/PGUSER/PGDATABASE from
- * the file the unit's `EnvironmentFile=` names and refuses when it cannot read one, precisely so
- * that a variable in the calling shell cannot decide where the application connects. `serviceEnv`
- * is that file's contents; passing `null` supplies no file at all, which is the refusal case.
+ * THE SERVICE'S ENVIRONMENT COMES FROM SYSTEMD (o3d-2sm1.5 r18). The script asks
+ * `systemctl show <unit>` for PGHOST/PGPORT/PGUSER/PGDATABASE and refuses when systemd cannot be
+ * asked, when the unit is not loaded, or when the answer cannot be read — precisely so that a
+ * variable in the calling shell cannot decide where the application connects. `unitEnvironment` is
+ * what the stub reports as the unit's `Environment=`; passing `null` points `--systemctl=` at
+ * nothing, which is the "systemd cannot be asked" refusal.
  */
 function runFenceScript(
   args: string[],
   env: Record<string, string | undefined>,
-  serviceEnv: string | null = '',
+  unitEnvironment: string | null = '',
+  unitArgs: string[] = ['--service-unit=one-two-inventory.service'],
 ) {
   const cwd = mkdtempSync(join(tmpdir(), 'ims-fence-'))
-  let serviceEnvFile: string | undefined
-  if (serviceEnv !== null) {
-    serviceEnvFile = join(cwd, 'service.env')
-    writeFileSync(serviceEnvFile, serviceEnv)
-  }
+  const systemctl =
+    unitEnvironment === null
+      ? join(cwd, 'no-such-systemctl')
+      : stubSystemctl(cwd, { Environment: unitEnvironment })
   // spawnSync, not execFileSync: the script's diagnostics go to STDERR so that stdout stays the
   // machine-readable channel `--print-migration-url` is captured through, and a test that could
   // only see stdout on success could not tell the two apart.
-  const run = spawnSync('node', [join(process.cwd(), 'scripts/fence-db-connections.mjs'), ...args], {
-    encoding: 'utf8',
-    env: {
-      ...process.env,
-      IMS_SERVICE_ENV_FILE: serviceEnvFile ?? join(cwd, 'no-such-file.env'),
-      ...env,
+  const run = spawnSync(
+    'node',
+    [join(process.cwd(), 'scripts/fence-db-connections.mjs'), ...args, ...unitArgs, `--systemctl=${systemctl}`],
+    {
+      encoding: 'utf8',
+      env: { ...process.env, ...env },
+      cwd,
+      stdio: ['ignore', 'pipe', 'pipe'],
     },
-    cwd,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  })
+  )
   const stdout = run.stdout ?? ''
   const stderr = run.stderr ?? ''
   return { status: run.status ?? -1, stdout, stderr, output: `${stdout}${stderr}` }
@@ -2033,137 +2070,357 @@ function withEnv(values: Record<string, string | undefined>): () => void {
   }
 }
 
-/** One service environment file, written where only this test can see it. */
-function serviceEnvFile(contents: string): string {
-  const path = join(mkdtempSync(join(tmpdir(), 'ims-fence-env-')), 'service.env')
-  writeFileSync(path, contents)
-  return path
+/** A directory only this test can see, for stub binaries and stand-in environment files. */
+function scratch(): string {
+  return mkdtempSync(join(tmpdir(), 'ims-fence-systemd-'))
 }
 
-test('the deploy shell\'s PGPORT is not the application\'s, and the fence resolves the SERVICE\'S', () => {
-  // ROUTE: main() -> readServiceEnvironment(serviceEnvironmentPaths()) -> applyServiceEnvironment()
-  // -> process.env -> the `pg.Client` resolveDriverIdentity() builds -> parseConnectionIdentity()
-  // -> assessDatabaseIdentity(), which is what licenses the fence.
+/** `readUnitEnvironment` against a stand-in systemd, with no process spawned. */
+function unitEnvironment(
+  properties: Record<string, string | undefined>,
+  overrides: Record<string, unknown> = {},
+) {
+  const stdout = Object.entries(properties)
+    .filter(([, value]) => value !== undefined)
+    .map(([key, value]) => `${key}=${value}`)
+    .join('\n')
+  return readUnitEnvironment(['one-two-inventory.service'], {
+    show: () => ({ ok: true, reason: '', stdout }),
+    readText: () => {
+      const error = new Error('ENOENT') as Error & { code?: string }
+      error.code = 'ENOENT'
+      throw error
+    },
+    appDir: '/opt/one-two-inventory',
+    realpath: (path: string) => path,
+    osAccount: 'imsapp',
+    ...overrides,
+  })
+}
+
+test('o3d-2sm1.5 r18: an ambient PG* that DIFFERS from what systemd reports never reaches the fence', () => {
+  // ROUTE: main() -> readUnitEnvironment(options.serviceUnits) -> `systemctl show <unit>` ->
+  // Environment= -> applyServiceEnvironment() -> process.env -> the `pg.Client`
+  // resolveDriverIdentity() builds -> parseConnectionIdentity() -> assessDatabaseIdentity(),
+  // which is what licenses the fence.
   //
   // MUTATION ROUTE: delete the `delete env[name]` loop from applyServiceEnvironment() (or the
   // applyServiceEnvironment() call from main()). The ambient PGPORT below survives, the identity
-  // reads 6432 -- the port the deploy shell happens to carry -- and the first assertion fails.
-  // Deleting only the re-apply loop instead fails the second: the service's own 5432 is lost and
-  // pg's static default answers for it, which is the same number by accident and NOT by
-  // reconstruction, so the third case (a service file naming 6544) is what pins that half.
-  const file = serviceEnvFile('PGPORT=5432\n')
+  // reads 6432 — the port this shell happens to carry — and the first assertion fails. Delete
+  // only the re-apply loop instead and the SECOND case fails: 6544 is neither the ambient value
+  // nor pg's static default, so it can only be there by having come from systemd.
   const restore = withEnv({ PGPORT: '6432', PGHOST: 'deploy-shell.example', PGUSER: undefined, PGDATABASE: undefined })
   try {
     // PRECONDITION, MEASURED ON THE DRIVER: the ambient variables really do move the connection.
     // Without this the test could pass against a driver that ignored them.
-    assert.equal(driverConnection('postgres://imsapp@localhost/imsdb').port, 6432, 'precondition: the deploy shell\'s PGPORT reaches the driver')
+    assert.equal(driverConnection('postgres://imsapp@localhost/imsdb').port, 6432, 'precondition: this shell\'s PGPORT reaches the driver')
 
-    const service = readServiceEnvironment([file])
+    const service = unitEnvironment({ LoadState: 'loaded', Environment: 'PGPORT=5432', WorkingDirectory: '', User: 'imsapp' })
     assert.equal(service.ok, true, service.reason)
     const applied = applyServiceEnvironment(service)
     assert.deepEqual(applied.applied, ['PGPORT=5432'])
-    assert.ok(applied.removed.includes('PGPORT=6432'), 'the deploy shell\'s copy is taken away, not merged with')
+    assert.ok(applied.removed.includes('PGPORT=6432'), 'this shell\'s copy is taken away, not merged with')
     assert.ok(applied.removed.includes('PGHOST=deploy-shell.example'), 'and so is every other identity variable it carried')
 
     const identity = parseConnectionIdentity('postgres://imsapp@localhost/imsdb')
-    assert.equal(identity.port, '5432', 'the fence resolves the port the SERVICE has, not the one this shell has')
-    assert.equal(identity.host, 'localhost', 'and a host the deploy shell invented does not survive at all')
+    assert.equal(identity.port, '5432', 'the fence resolves the port SYSTEMD reports, not the one this shell has')
+    assert.equal(identity.host, 'localhost', 'and a host this shell invented does not survive at all')
   } finally {
     restore()
   }
 
-  // THE OTHER DIRECTION, which a mere `delete` would pass by accident: a service file whose PGPORT
-  // is neither the ambient one nor pg's default has to be the answer.
-  const other = serviceEnvFile('PGPORT=6544\n')
+  // THE OTHER DIRECTION, which a mere `delete` would pass by accident: a value that is neither the
+  // ambient one nor pg's default has to be the answer.
   const restoreOther = withEnv({ PGPORT: '6432', PGHOST: undefined, PGUSER: undefined, PGDATABASE: undefined })
   try {
-    applyServiceEnvironment(readServiceEnvironment([other]))
+    applyServiceEnvironment(unitEnvironment({ LoadState: 'loaded', Environment: 'PGPORT=6544', WorkingDirectory: '', User: 'imsapp' }))
     assert.equal(parseConnectionIdentity('postgres://imsapp@localhost/imsdb').port, '6544')
   } finally {
     restoreOther()
   }
 })
 
-test('a service environment that cannot be read is a REFUSAL, never a fallback to this shell\'s', () => {
-  // ROUTE: main() -> readServiceEnvironment() -> ok:false -> exit before any connection is opened.
+test('o3d-2sm1.5 r18: systemd being unavailable is a REFUSAL, never a fallback to this shell\'s environment', () => {
+  // ROUTE: main() -> readUnitEnvironment() -> ok:false -> exit before any connection is opened.
   //
-  // MUTATION ROUTE: make readServiceEnvironment() return `{ ok: true, values: {} }` when no file
-  // could be read (i.e. "assume the service sets none"). Both assertions fail: the script runs on,
-  // and it runs on the ambient environment -- which is precisely the guess this refuses to make,
-  // because the unreadable file is the only thing that could have contradicted it.
-  const missing = readServiceEnvironment(['/nonexistent/one.env', '/nonexistent/two.env'])
-  assert.equal(missing.ok, false)
-  assert.match(missing.reason, /will NOT fall back to its own shell's environment/)
+  // MUTATION ROUTE: make readUnitEnvironment() return `{ ok: true, values: {} }` on any of these
+  // (i.e. "systemd said nothing, so assume the service sets none"). Every assertion here fails,
+  // and the shipped script runs on the ambient environment — which is precisely the guess this
+  // refuses to make, since the answer it could not get is the only thing that could contradict it.
 
-  // ...and the shipped script exits on it, with the code its callers read as "nothing was
-  // revoked" so a deploy aborts cleanly rather than proceeding unfenced.
+  // 1. systemctl cannot be run at all.
+  const missing = readUnitEnvironment(['one-two-inventory.service'], {
+    show: () => ({ ok: false, reason: 'systemd cannot be asked: no systemctl at /usr/bin/systemctl', stdout: '' }),
+    appDir: '/opt/one-two-inventory',
+  })
+  assert.equal(missing.ok, false)
+  assert.match(missing.reason, /systemd cannot be asked/)
+
+  // 2. the unit is not there.
+  const notFound = unitEnvironment({ LoadState: 'not-found', Environment: '', WorkingDirectory: '', User: '' })
+  assert.equal(notFound.ok, false)
+  assert.match(notFound.reason, /LoadState=not-found, not loaded/)
+
+  // 3. systemd answered, and the answer cannot be parsed. `LoadState` is printed for every unit
+  //    that exists AND for every name that does not, so its ABSENCE is not an empty answer — it
+  //    is not systemd's answer at all.
+  const unparseable = unitEnvironment({ Environment: 'PGPORT=5432', WorkingDirectory: '', User: 'imsapp' })
+  assert.equal(unparseable.ok, false)
+  assert.match(unparseable.reason, /reported no LoadState/)
+
+  // 4. no unit was named, so there is nothing to ask about. This is the closed ambient override:
+  //    without --service-unit= there is no path back to the deleted variables.
+  const unnamed = readUnitEnvironment([], { appDir: '/opt/one-two-inventory' })
+  assert.equal(unnamed.ok, false)
+  assert.match(unnamed.reason, /will NOT fall back to its own shell's/)
+
+  // ...and the SHIPPED SCRIPT exits on it, with the code its callers read as "nothing was
+  // revoked", so a deploy aborts cleanly rather than proceeding unfenced. `null` here points
+  // --systemctl= at a path that does not exist.
   const refused = runFenceScript(['--preflight'], {
     DEPLOY_ADMIN_DATABASE_URL: 'postgresql://deployadmin@127.0.0.1:5432/ims',
     DATABASE_URL: 'postgresql://imsapp@127.0.0.1:5432/ims',
   }, null)
-  assert.equal(refused.status, EXIT_NOT_FENCEABLE)
-  assert.match(refused.output, /could be read/)
+  assert.equal(refused.status, EXIT_NOT_FENCEABLE, refused.output)
+  assert.match(refused.output, /systemd could not be asked/)
+
+  // And so does a run that names no unit at all, with a working systemctl.
+  const unnamedRun = runFenceScript(['--preflight'], {
+    DEPLOY_ADMIN_DATABASE_URL: 'postgresql://deployadmin@127.0.0.1:5432/ims',
+    DATABASE_URL: 'postgresql://imsapp@127.0.0.1:5432/ims',
+  }, '', [])
+  assert.equal(unnamedRun.status, EXIT_NOT_FENCEABLE, unnamedRun.output)
+  assert.match(unnamedRun.output, /no --service-unit=<unit> was given/)
 })
 
-test('two service environment files that disagree about an identity variable are refused', () => {
-  // ROUTE: readServiceEnvironment() reads `<app dir>/.env` (systemd's EnvironmentFile) and
-  // `<app dir>/.env.local` (Next's own dotenv load). Which one the application ends up connecting
-  // with depends on the order those two happen in, so there is no answer to give.
+test('o3d-2sm1.5 r18: a file systemd will read is never PARSED here — a mention of the name is a refusal', () => {
+  // THE TRAP THIS ROUND CLOSES. `systemctl show -p Environment` reports the Environment=
+  // DIRECTIVES ONLY; systemd reads an EnvironmentFile when it FORKS the service and publishes
+  // nothing about what it made of it. r17's answer was to parse the file with dotenv, whose
+  // grammar is not systemd's: `PGUSER=ims#writer` is the role `ims` to dotenv and `ims#writer` to
+  // systemd, and both are legal. So the file is not parsed at all — it is asked the one question
+  // every grammar answers identically, and a mention is refused.
+  //
+  // MUTATION ROUTE: parse the file (with dotenv, or any grammar) and merge what it yields. The
+  // first case below returns ok with PGUSER=ims, the fence revokes CONNECT from a role the
+  // service does not use, and the assertion on `ok` fails.
+  const directory = scratch()
+  const withPg = join(directory, 'with-pg.env')
+  writeFileSync(withPg, 'DATABASE_URL=postgresql://ims@localhost/ims\nPGUSER=ims#writer\n')
+  const withoutPg = join(directory, 'plain.env')
+  writeFileSync(withoutPg, 'DATABASE_URL=postgresql://ims@localhost/ims\nNODE_ENV=production\n')
+
+  const readReal = (path: string) => readFileSync(path, 'utf8')
+  const mentions = unitEnvironment(
+    { LoadState: 'loaded', Environment: '', EnvironmentFiles: `${withPg} (ignore_errors=yes)`, WorkingDirectory: '', User: 'imsapp' },
+    { readText: readReal },
+  )
+  assert.equal(mentions.ok, false)
+  assert.match(mentions.reason, /that file mentions PGUSER/)
+  assert.match(mentions.reason, /will not reimplement its parsing/)
+
+  // A file that does not mention any of the four cannot set any of them under ANY grammar, so it
+  // is not a disagreement and not a refusal.
+  const clean = unitEnvironment(
+    { LoadState: 'loaded', Environment: '', EnvironmentFiles: `${withoutPg} (ignore_errors=yes)`, WorkingDirectory: '', User: 'imsapp' },
+    { readText: readReal },
+  )
+  assert.equal(clean.ok, true, clean.reason)
+  assert.deepEqual(clean.values, {})
+  assert.ok(clean.sources?.includes(`one-two-inventory.service:EnvironmentFile=${withoutPg}`))
+
+  // AN UNREADABLE FILE IS NOT AN EMPTY ONE (Codex r17 CRITICAL). systemd will read it; this
+  // cannot; "unreadable" is therefore not "sets none of them".
+  const unreadable = unitEnvironment(
+    { LoadState: 'loaded', Environment: '', EnvironmentFiles: `${join(directory, 'locked.env')} (ignore_errors=yes)`, WorkingDirectory: '', User: 'imsapp' },
+    { readText: () => { throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' }) } },
+  )
+  assert.equal(unreadable.ok, false)
+  assert.match(unreadable.reason, /systemd will read and this run cannot/)
+
+  // THE ONLY SKIP IS THE ONE SYSTEMD ITSELF MAKES: an `EnvironmentFile=-` whose file is absent.
+  const absentOptional = unitEnvironment({
+    LoadState: 'loaded',
+    Environment: '',
+    EnvironmentFiles: `${join(directory, 'gone.env')} (ignore_errors=yes)`,
+    WorkingDirectory: '',
+    User: 'imsapp',
+  })
+  assert.equal(absentOptional.ok, true, absentOptional.reason)
+
+  // ...but a REQUIRED file that is absent is a unit that cannot start, and a refusal here.
+  const absentRequired = unitEnvironment({
+    LoadState: 'loaded',
+    Environment: '',
+    EnvironmentFiles: `${join(directory, 'gone.env')} (ignore_errors=no)`,
+    WorkingDirectory: '',
+    User: 'imsapp',
+  })
+  assert.equal(absentRequired.ok, false)
+  assert.match(absentRequired.reason, /ENOENT/)
+
+  // AND THE APPLICATION'S OWN OVERLAY, which systemd never sees: Next loads .env.local inside the
+  // process, after exec, so no systemd property could ever report a PGHOST in it.
+  const overlay = readUnitEnvironment(['one-two-inventory.service'], {
+    show: () => ({ ok: true, reason: '', stdout: 'Environment=\nWorkingDirectory=\nUser=imsapp\nLoadState=loaded\n' }),
+    appDir: directory,
+    realpath: (path: string) => path,
+    osAccount: 'imsapp',
+    readText: (path: string) => (path === join(directory, '.env.local') ? 'PGHOST=elsewhere.example\n' : readReal(path)),
+  })
+  assert.equal(overlay.ok, false)
+  assert.match(overlay.reason, /\.env\.local mentions PGHOST/)
+  assert.match(overlay.reason, /the application loads that file itself/)
+})
+
+test('o3d-2sm1.5 r18: the unit must be THIS installation\'s, and two units may not disagree', () => {
+  // ROUTE: readUnitEnvironment() -> systemd's WorkingDirectory= for the named unit, against the
+  // directory this helper ships in. Being handed the wrong unit name is otherwise
+  // indistinguishable from being handed the right one, and the answer would be another
+  // installation's cluster — which is the wrong-environment failure in its purest form.
+  //
+  // MUTATION ROUTE: drop the WorkingDirectory comparison. The first case returns ok and hands the
+  // fence the OTHER installation's PGPORT.
+  const elsewhere = unitEnvironment({
+    LoadState: 'loaded',
+    Environment: 'PGPORT=6544',
+    WorkingDirectory: '/opt/some-other-install',
+    User: 'imsapp',
+  })
+  assert.equal(elsewhere.ok, false)
+  assert.match(elsewhere.reason, /WorkingDirectory=\/opt\/some-other-install/)
+  assert.match(elsewhere.reason, /serves a different installation/)
+
+  // The control: the unit that DOES serve this app dir is accepted.
+  const here = unitEnvironment({
+    LoadState: 'loaded',
+    Environment: 'PGPORT=6544',
+    WorkingDirectory: '/opt/one-two-inventory',
+    User: 'imsapp',
+  })
+  assert.equal(here.ok, true, here.reason)
+  assert.deepEqual(here.values, { PGPORT: '6544' })
+
+  // TWO UNITS SERVING ONE APP DIR — scripts/deploy.sh finds them by WorkingDirectory and both are
+  // writers into this database. Which cluster the fence is meant to close has no answer when they
+  // disagree, so it is refused rather than resolved to the first.
   //
   // MUTATION ROUTE: keep the first value and drop the disagreement check. This returns ok with
-  // PGPORT=5432 while the application may well be on 6432 -- a fence proved against a cluster
-  // nobody chose, which is the whole finding in a second costume.
-  const first = serviceEnvFile('PGPORT=5432\n')
-  const second = serviceEnvFile('PGPORT=6432\n')
-  const clash = readServiceEnvironment([first, second])
+  // PGPORT=5432 while the second unit is writing to 6432 — a fence proved against a cluster
+  // nobody chose.
+  const answers: Record<string, string> = {
+    'a.service': 'Environment=PGPORT=5432\nWorkingDirectory=\nUser=imsapp\nLoadState=loaded\n',
+    'b.service': 'Environment=PGPORT=6432\nWorkingDirectory=\nUser=imsapp\nLoadState=loaded\n',
+    'c.service': 'Environment=PGPORT=5432 PGHOST=db.example\nWorkingDirectory=\nUser=imsapp\nLoadState=loaded\n',
+  }
+  const twoUnits = (units: string[]) =>
+    readUnitEnvironment(units, {
+      show: (unit: string) => ({ ok: true, reason: '', stdout: answers[unit] }),
+      readText: () => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }) },
+      appDir: '/opt/one-two-inventory',
+      realpath: (path: string) => path,
+      osAccount: 'imsapp',
+    })
+  const clash = twoUnits(['a.service', 'b.service'])
   assert.equal(clash.ok, false)
-  assert.match(clash.reason, /PGPORT="5432"[\s\S]*PGPORT="6432"/)
-  assert.match(clash.reason, /Delete one of them/)
+  assert.match(clash.reason, /a\.service sets PGPORT="5432" and b\.service sets PGPORT="6432"/)
 
-  // The control: the SAME value in both files is not a disagreement.
-  const agreeing = readServiceEnvironment([first, serviceEnvFile('PGPORT=5432\nPGHOST=db.example\n')])
-  assert.equal(agreeing.ok, true)
+  // The control: units that AGREE are merged, and a variable only one of them sets is kept.
+  const agreeing = twoUnits(['a.service', 'c.service'])
+  assert.equal(agreeing.ok, true, agreeing.reason)
   assert.deepEqual(agreeing.values, { PGPORT: '5432', PGHOST: 'db.example' })
 })
 
-test('the OS account is the application\'s when this process owns the service\'s environment file', () => {
+test('o3d-2sm1.5 r18: systemd\'s own output format is read, and anything ambiguous in it is refused', () => {
+  // ROUTE: parseSystemdEnvironment() over `systemctl show -p Environment`'s serialized strv.
+  // THIS IS A PARSER OF SYSTEMD'S OUTPUT, not of systemd's EnvironmentFile semantics — a bounded
+  // grammar whose whole job is to be read back. What it cannot read unambiguously it throws on,
+  // and main() turns that into the same refusal as "systemd could not be asked".
+  //
+  // MUTATION ROUTE: replace the body with `value.split(' ')`. The quoted case below loses
+  // everything after the space in the value, so a PGDATABASE of `ims prod` silently becomes `ims`
+  // and the fence closes a database nobody named; the assertion on it fails.
+  assert.deepEqual(
+    [...parseSystemdEnvironment('NODE_ENV=production PGPORT=5432')],
+    [['NODE_ENV', 'production'], ['PGPORT', '5432']],
+  )
+  assert.deepEqual([...parseSystemdEnvironment('"PGDATABASE=ims prod"')], [['PGDATABASE', 'ims prod']])
+  assert.deepEqual([...parseSystemdEnvironment('"PGUSER=ims\\"writer"')], [['PGUSER', 'ims"writer']])
+  assert.deepEqual([...parseSystemdEnvironment('PGUSER=a\\tb')], [['PGUSER', 'a\tb']])
+  assert.deepEqual([...parseSystemdEnvironment('PGUSER=a\\x41b')], [['PGUSER', 'aAb']])
+  assert.deepEqual([...parseSystemdEnvironment('')], [])
+
+  assert.throws(() => parseSystemdEnvironment('"PGUSER=unterminated'), /unterminated quote/)
+  assert.throws(() => parseSystemdEnvironment('PGUSER=trailing\\'), /lone backslash/)
+  assert.throws(() => parseSystemdEnvironment('PGUSER=bad\\q'), /escape this cannot read/)
+  assert.throws(() => parseSystemdEnvironment('PGUSER=bad\\xZZ'), /malformed \\x escape/)
+  assert.throws(() => parseSystemdEnvironment('NOT_AN_ASSIGNMENT'), /not NAME=VALUE/)
+
+  // ...and an unreadable Environment= is a refusal, not an empty environment.
+  const ambiguous = unitEnvironment({ LoadState: 'loaded', Environment: '"PGUSER=oops', WorkingDirectory: '', User: 'imsapp' })
+  assert.equal(ambiguous.ok, false)
+  assert.match(ambiguous.reason, /unterminated quote/)
+  assert.match(ambiguous.reason, /could not be parsed/)
+
+  // EnvironmentFiles= is systemd's format too, and an entry this cannot even NAME is a file it
+  // cannot rule out.
+  assert.deepEqual(parseSystemdEnvironmentFiles('/a/.env (ignore_errors=yes)\n/b/.env (ignore_errors=no)'), [
+    { path: '/a/.env', ignoreErrors: true },
+    { path: '/b/.env', ignoreErrors: false },
+  ])
+  assert.deepEqual(parseSystemdEnvironmentFiles(undefined), [])
+  assert.throws(() => parseSystemdEnvironmentFiles('/a/.env'), /EnvironmentFiles entry this cannot read/)
+
+  // `systemctl show` prints an EMPTY property but OMITS one that does not apply — measured against
+  // this host's real units. Both readings matter: the empty one is an answer, the absent one is not.
+  const properties = parseSystemctlShow('Environment=\nWorkingDirectory=/opt/x\nLoadState=loaded\n')
+  assert.equal(properties.get('Environment'), '')
+  assert.equal(properties.has('EnvironmentFiles'), false)
+  assert.equal(properties.get('WorkingDirectory'), '/opt/x')
+})
+
+test('o3d-2sm1.5 r18: the OS account is the application\'s when SYSTEMD says the unit runs as it', () => {
   // r16 subtracted EVERY OS-account fallback, on the grounds that this script runs as the deploy
   // account. In the supported installation it does not: deploy.sh, update.sh and install.sh all
   // run this helper through `runuser -u ${APP_USER}`, and the generated unit runs `User=${APP_USER}`.
-  // So a peer-authenticated URL that names no role was refused for naming no role, and upgrades of
-  // a working installation were blocked.
+  // r17 established that by OWNERSHIP of a file; r18 asks systemd, which states it outright.
   //
-  // ROUTE: applyServiceEnvironment() -> PGUSER in the reconstructed environment -> the driver
-  // resolves the login role as a SETTING -> the OS_ACCOUNT_SENTINEL probe in
-  // resolveDriverIdentity() has nothing to catch -> parseConnectionIdentity().user.
+  // ROUTE: readUnitEnvironment() -> systemd's `User=` vs processOsAccount() -> runsAsServiceAccount
+  // -> applyServiceEnvironment() writes PGUSER -> the driver resolves the login role as a SETTING
+  // -> the OS_ACCOUNT_SENTINEL probe in resolveDriverIdentity() has nothing to catch.
   //
-  // MUTATION ROUTE: drop the `ownedByThisProcess && osAccount` arm from applyServiceEnvironment()
-  // and the first assertion returns to '' -- the r16 behaviour, i.e. the finding. Drop the
-  // `ownedByThisProcess` CONDITION instead and the second assertion fails: the deploy account's
-  // identity is then accepted as the application's, which is what the sentinel exists to stop.
+  // MUTATION ROUTE: drop the `runsAsServiceAccount && osAccount` arm from applyServiceEnvironment()
+  // and the first assertion returns to '' — the r16 behaviour, i.e. the finding. Drop the
+  // `runsAsServiceAccount` CONDITION instead and the second fails: the deploy account's identity
+  // is then accepted as the application's, which is what the sentinel exists to stop.
   const restore = withEnv({ PGUSER: undefined, PGHOST: undefined, PGPORT: undefined, PGDATABASE: undefined })
   try {
     const account = processOsAccount()
     assert.notEqual(account, '', 'precondition: this process has an OS account both ways of asking agree on')
     assert.equal(driverConnection('postgresql://localhost/ims').user, account, 'precondition: the driver falls back to it')
 
-    applyServiceEnvironment({ ok: true, values: {}, ownedByThisProcess: true, osAccount: account })
+    const runsAsIt = unitEnvironment({ LoadState: 'loaded', Environment: '', WorkingDirectory: '', User: account }, { osAccount: account })
+    assert.equal(runsAsIt.runsAsServiceAccount, true, 'systemd says the unit runs as this process\'s account')
+    applyServiceEnvironment(runsAsIt)
     assert.equal(
       parseConnectionIdentity('postgresql://localhost/ims').user,
       account,
-      'the account the service runs as is the application\'s login role, not an anonymous fallback',
+      'the account systemd says the service runs as is the application\'s login role, not an anonymous fallback',
     )
     assert.equal(parseConnectionIdentity('postgresql://localhost/').database, account, 'and the database libpq derives from it is identified too')
 
-    // NOT OWNED: a deploy running as root, or as any third account, gets the r16 answer.
+    // A DIFFERENT ACCOUNT: a deploy running as root against a unit with `User=imsapp` gets the
+    // r16 answer, because nothing here can show the two are the same identity.
     delete process.env.PGUSER
-    applyServiceEnvironment({ ok: true, values: {}, ownedByThisProcess: false, osAccount: account })
+    const runsAsOther = unitEnvironment({ LoadState: 'loaded', Environment: '', WorkingDirectory: '', User: 'someone-else' }, { osAccount: account })
+    assert.equal(runsAsOther.runsAsServiceAccount, false)
+    applyServiceEnvironment(runsAsOther)
     assert.equal(process.env.PGUSER, undefined, 'nothing is asserted about an account this run cannot show is the application\'s')
     assert.equal(parseConnectionIdentity('postgresql://localhost/ims').user, '', 'so the fallback stays unidentified, and unidentified is refused')
 
-    // A SERVICE FILE THAT NAMES THE ROLE OUTRIGHT WINS OVER BOTH: it is a deliberate setting.
+    // A UNIT THAT NAMES THE ROLE OUTRIGHT WINS OVER BOTH: it is a deliberate setting.
     delete process.env.PGUSER
-    applyServiceEnvironment({ ok: true, values: { PGUSER: 'imsapp' }, ownedByThisProcess: true, osAccount: account })
+    applyServiceEnvironment(unitEnvironment({ LoadState: 'loaded', Environment: 'PGUSER=imsapp', WorkingDirectory: '', User: account }, { osAccount: account }))
     assert.equal(parseConnectionIdentity('postgresql://localhost/ims').user, 'imsapp')
   } finally {
     restore()
@@ -2176,52 +2433,166 @@ test('processOsAccount refuses an account the passwd entry and the environment d
   // is an identity.
   //
   // MUTATION ROUTE: return the passwd name (or the driver default) unconditionally. The second
-  // assertion fails, and with it the ownership test above starts vouching for whatever name the
+  // assertion fails, and with it the account test above starts vouching for whatever name the
   // calling shell put in USER.
   assert.equal(processOsAccount({ userInfo: () => ({ username: 'imsapp' }), driverDefaultUser: 'imsapp' }), 'imsapp')
   assert.equal(processOsAccount({ userInfo: () => ({ username: 'imsapp' }), driverDefaultUser: 'root' }), '')
   assert.equal(processOsAccount({ userInfo: () => ({ username: 'imsapp' }), driverDefaultUser: '' }), '')
 })
 
-test('the shipped script runs on the SERVICE\'S environment, end to end', () => {
+test('o3d-2sm1.5 r18: the shipped script runs on the environment SYSTEMD reports, end to end', () => {
   // THE WHOLE PROCESS, not a function: `--print-migration-url` derives the role the migration runs
-  // as from DATABASE_URL, and a URL naming no role falls through to PGUSER. So the two
-  // environments are made to disagree about PGUSER and the emitted URL says which one won.
+  // as from DATABASE_URL, and a URL naming no role falls through to PGUSER. So the ambient
+  // environment and systemd's answer are made to disagree about PGUSER, and the emitted URL says
+  // which one won.
   //
-  // ROUTE: node scripts/fence-db-connections.mjs --print-migration-url -> main()'s
-  // readServiceEnvironment/applyServiceEnvironment -> parseRoleFromConnectionString(DATABASE_URL)
+  // ROUTE: node scripts/fence-db-connections.mjs --print-migration-url --service-unit=... ->
+  // main()'s readUnitEnvironment/applyServiceEnvironment -> parseRoleFromConnectionString(DATABASE_URL)
   // -> buildMigrationConnectionString() -> `options=-c role=...` on stdout.
   //
   // MUTATION ROUTE: remove the applyServiceEnvironment() call from main(). The emitted URL becomes
-  // `-c role=deployrole` -- the deploy shell's variable deciding what the migration runs as, on a
-  // box where the service has never heard of that role.
+  // `-c role=deployrole` — this shell's variable deciding what the migration runs as, on a box
+  // where the service has never heard of that role.
   const result = runFenceScript(['--print-migration-url'], {
     DEPLOY_ADMIN_DATABASE_URL: 'postgresql://deployadmin@127.0.0.1:5432/ims',
     DATABASE_URL: 'postgresql://127.0.0.1:5432/ims',
     PGUSER: 'deployrole',
     DIRECT_URL: '',
-  }, 'PGUSER=imsapp\n')
+  }, 'PGUSER=imsapp')
   assert.equal(result.status, 0, result.output)
   const emitted = result.stdout.trim().split('\n').at(-1) ?? ''
   assert.match(emitted, /^postgresql:\/\//, 'the last line is the URL the deploy captures')
-  assert.match(emitted, /options=-c\+role%3Dimsapp|options=-c%20role%3Dimsapp/, 'the migration runs as the role the SERVICE names')
-  assert.doesNotMatch(emitted, /deployrole/, 'and the deploy shell\'s PGUSER reaches nothing the migration runs through')
+  assert.match(emitted, /options=-c\+role%3Dimsapp|options=-c%20role%3Dimsapp/, 'the migration runs as the role SYSTEMD names')
+  assert.doesNotMatch(emitted, /deployrole/, 'and this shell\'s PGUSER reaches nothing the migration runs through')
   assert.match(result.stderr, /Ignoring this shell's PGUSER=deployrole/, 'and it says so out loud, on stderr')
   assert.doesNotMatch(result.stdout, /Ignoring/, 'stdout carries the URL and nothing else: the deploy captures it with $(...)')
 })
 
-test('the service environment file is found from the SCRIPT, not from the working directory', () => {
-  // The printed `--release` command is meant to be runnable by an operator from wherever they are
-  // standing, and the deploy scripts `cd` to the app directory for reasons of their own. Resolving
-  // the file against the script's own location makes both work.
+test('o3d-2sm1.5 r18: everything the script reads is resolved from the SCRIPT, not the working directory', () => {
+  // The `--release` command the callers print is a bare absolute `node /opt/.../fence-db-connections.mjs`
+  // meant to be runnable by an operator from wherever they are standing, and the deploy scripts
+  // `cd` to the app directory for reasons of their own. main() loaded `.env.local` and `.env`
+  // RELATIVE, so from any other directory that command loaded no DATABASE_URL, no DIRECT_URL and
+  // no DEPLOY_ADMIN_DATABASE_URL — the one command offered for taking a committed fence down could
+  // not obtain the connection that takes it down (Codex r17 HIGH).
   //
-  // MUTATION ROUTE: resolve against process.cwd(). This test fails on the paths, and the operator
-  // pasting the release command from their home directory gets the refusal above instead of a
-  // release.
-  assert.deepEqual(
-    serviceEnvironmentPaths({} as unknown as NodeJS.ProcessEnv, 'file:///opt/one-two-inventory/scripts/fence-db-connections.mjs'),
-    ['/opt/one-two-inventory/.env', '/opt/one-two-inventory/.env.local'],
-  )
-  assert.deepEqual(serviceEnvironmentPaths({ IMS_SERVICE_ENV_FILE: '/etc/ims/app.env' } as unknown as NodeJS.ProcessEnv), ['/etc/ims/app.env'])
+  // MUTATION ROUTE: put the relative paths back in main(). The end-to-end case below runs from a
+  // temporary directory with a DECOY .env in it and no DATABASE_URL in its own environment; with
+  // relative loading it reads the decoy and emits the decoy's role, and the assertions fail.
+  assert.equal(appDirectory('file:///opt/one-two-inventory/scripts/fence-db-connections.mjs'), '/opt/one-two-inventory')
+  assert.deepEqual(applicationDotenvPaths('/opt/one-two-inventory'), [
+    '/opt/one-two-inventory/.env.local',
+    '/opt/one-two-inventory/.env.production.local',
+    '/opt/one-two-inventory/.env.production',
+    '/opt/one-two-inventory/.env',
+  ])
   assert.deepEqual(IDENTITY_ENVIRONMENT_VARIABLES, ['PGHOST', 'PGPORT', 'PGUSER', 'PGDATABASE'])
+  assert.deepEqual(UNIT_PROPERTIES, ['LoadState', 'Environment', 'EnvironmentFiles', 'WorkingDirectory', 'User', 'FragmentPath'])
+
+  // systemctl is found at an absolute path rather than through the inherited PATH, so the shell
+  // that ran this cannot decide what answers for systemd.
+  assert.ok(SYSTEMCTL_PATHS.every((path) => path.startsWith('/')), 'every candidate is absolute')
+  assert.equal(findSystemctl(['/nonexistent/systemctl'], { exists: () => false }), '')
+  assert.equal(findSystemctl(['/a/systemctl', '/b/systemctl'], { exists: (path: string) => path === '/b/systemctl' }), '/b/systemctl')
+
+  // AND END TO END, from a directory that is not the app dir and holds a DECOY .env.
+  const elsewhere = mkdtempSync(join(tmpdir(), 'ims-fence-cwd-'))
+  writeFileSync(join(elsewhere, '.env'), 'DATABASE_URL=postgresql://decoyrole@127.0.0.1:5432/decoy\n')
+  const systemctl = stubSystemctl(elsewhere, { Environment: '' })
+  const run = spawnSync(
+    'node',
+    [
+      join(process.cwd(), 'scripts/fence-db-connections.mjs'),
+      '--print-migration-url',
+      '--service-unit=one-two-inventory.service',
+      `--systemctl=${systemctl}`,
+    ],
+    {
+      encoding: 'utf8',
+      cwd: elsewhere,
+      env: {
+        ...process.env,
+        DATABASE_URL: undefined,
+        DIRECT_URL: undefined,
+        DEPLOY_ADMIN_DATABASE_URL: 'postgresql://deployadmin@127.0.0.1:5432/ims',
+        PGUSER: undefined,
+        PGHOST: undefined,
+        PGPORT: undefined,
+        PGDATABASE: undefined,
+      } as NodeJS.ProcessEnv,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    },
+  )
+  const output = `${run.stdout ?? ''}${run.stderr ?? ''}`
+  assert.doesNotMatch(output, /decoyrole|decoy/, 'the .env sitting in the working directory is not read')
+
+  // The DATABASE_URL it did find is the app dir's own — which is what makes the printed release
+  // command work from an unrelated directory. Its role is whatever this checkout's .env names, so
+  // the assertion is that a role was found at all rather than that it is a particular one.
+  const repoRole = parseRoleFromConnectionString(
+    (readFileSync(join(process.cwd(), '.env'), 'utf8').match(/^DATABASE_URL=(.*)$/m)?.[1] ?? '').replace(/^["']|["']$/g, ''),
+  )
+  if (repoRole) {
+    assert.equal(run.status, 0, output)
+    assert.match(output, new RegExp(`role%3D${repoRole}`), 'the role comes from the APP DIR\'s .env, from any working directory')
+  } else {
+    assert.notEqual(run.status, 0, 'no DATABASE_URL anywhere means a refusal, not a silent read of the local decoy')
+  }
+})
+
+test('o3d-2sm1.5 r18: every entrypoint names the unit it already addresses the service by', () => {
+  // ROUTE: scripts/{deploy,update,install}.sh -> `--service-unit=` on every fence invocation ->
+  // parseArgs().serviceUnits -> readUnitEnvironment(). The unit name is NOT hardcoded in the
+  // helper and NOT read from its environment; each script passes the name it already stops,
+  // drains and restarts the service by.
+  //
+  // MUTATION ROUTE: drop `"${DB_FENCE_UNIT_ARG}"` from any one invocation in update.sh or
+  // install.sh, or `"${DB_FENCE_UNIT_ARGS[@]:-}"` from any in deploy.sh. That invocation refuses
+  // at run time with "no --service-unit=<unit> was given", and the count assertion here fails by
+  // name before it ever gets that far.
+  const scripts = Object.fromEntries(
+    ['deploy.sh', 'update.sh', 'install.sh'].map((name) => [name, readFileSync(join(process.cwd(), 'scripts', name), 'utf8')]),
+  )
+
+  // deploy.sh finds its units by WorkingDirectory (or IMS_SERVICE_UNIT) and may find more than one.
+  assert.match(scripts['deploy.sh'], /DB_FENCE_UNIT_ARGS\+=\("--service-unit=\$\{unit\}"\)/)
+  // update.sh and install.sh each address exactly one unit, and each takes the name from the
+  // variable it already uses for `systemctl stop`.
+  assert.match(scripts['update.sh'], /DB_FENCE_UNIT_ARG="--service-unit=\$\{SERVICE_UNIT\}"/)
+  assert.match(scripts['install.sh'], /DB_FENCE_UNIT_ARG="--service-unit=\$\{APP_NAME\}\.service"/)
+
+  // EVERY invocation carries it — this is the sweep, so a mode added later cannot quietly omit it.
+  for (const [name, source] of Object.entries(scripts)) {
+    const invocations = source.match(/node "\$\{?DB_FENCE_SCRIPT\}?" --\S+/g) ?? []
+    assert.ok(invocations.length >= 4, `${name}: expected every fence mode to be invoked, found ${invocations.length}`)
+    const lines = source.split('\n').filter((line) => /node "\$\{?DB_FENCE_SCRIPT\}?" --/.test(line))
+    for (const line of lines) {
+      assert.match(line, /DB_FENCE_UNIT_ARGS?\[?/, `${name}: this invocation names no unit: ${line.trim()}`)
+    }
+  }
+
+  // AND THE PRINTED RELEASE COMMAND CARRIES IT TOO, or the operator's copy of it refuses.
+  assert.match(scripts['update.sh'], /DB_FENCE_RELEASE_CMD="node \$\{DB_FENCE_SCRIPT\} --release --state-file=\$\{DB_FENCE_STATE\} \$\{DB_FENCE_UNIT_ARG\}"/)
+  assert.match(scripts['install.sh'], /DB_FENCE_RELEASE_CMD="node \$\{DB_FENCE_SCRIPT\} --release --state-file=\$\{DB_FENCE_STATE\} \$\{DB_FENCE_UNIT_ARG\}"/)
+  assert.match(scripts['deploy.sh'], /db_fence_release_cmd\(\)/)
+
+  // parseArgs takes the flag more than once, because deploy.sh may pass more than one unit.
+  assert.deepEqual(parseArgs(['--fence', '--service-unit=a.service', '--service-unit=b.service']).serviceUnits, ['a.service', 'b.service'])
+  assert.deepEqual(parseArgs(['--fence']).serviceUnits, [])
+  assert.equal(parseArgs(['--release', '--systemctl=/x/systemctl']).systemctlPath, '/x/systemctl')
+})
+
+test('o3d-2sm1.5 r18: a mention is decided on the NAME alone, under every grammar', () => {
+  // The one question dotenv, systemd, sh and a hand-written parser all answer the same way. It is
+  // deliberately BROADER than "assigns it": over-reporting costs a refusal with an instruction,
+  // under-reporting costs a fence on the wrong cluster.
+  //
+  // MUTATION ROUTE: narrow it to /^\s*PGUSER=/m (i.e. "assigns it"). The commented and prefixed
+  // cases below stop being reported, and with them every spelling of an assignment whose grammar
+  // this module has decided not to reproduce.
+  assert.equal(mentionedIdentityVariable('DATABASE_URL=postgres://x\nNODE_ENV=production\n'), '')
+  assert.equal(mentionedIdentityVariable('PGUSER=ims#writer\n'), 'PGUSER')
+  assert.equal(mentionedIdentityVariable('# PGUSER is deliberately unset\n'), 'PGUSER')
+  assert.equal(mentionedIdentityVariable('MY_PGHOST=x\n'), 'PGHOST')
+  assert.equal(mentionedIdentityVariable('PGPORT=5432\nPGHOST=a\n'), 'PGHOST', 'the first in IDENTITY_ENVIRONMENT_VARIABLES order')
 })

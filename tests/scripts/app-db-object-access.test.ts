@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -378,16 +378,23 @@ test('dotenv is a runtime dependency, because `npm ci --omit=dev` has to be able
 
 function runScript(args: string[], env: Record<string, string | undefined>) {
   const cwd = mkdtempSync(join(tmpdir(), 'ims-noenv-'))
-  // THE SERVICE'S ENVIRONMENT, SUPPLIED AS A FILE (o3d-2sm1.5, Codex r17 CRITICAL). The fence
-  // reconstructs PGHOST/PGPORT/PGUSER/PGDATABASE from the file the unit's `EnvironmentFile=`
-  // names and refuses when it cannot read one, so these runs say which file that is instead of
-  // depending on whether the checkout they run from happens to have a .env.
-  const serviceEnvFile = join(cwd, 'service.env')
-  writeFileSync(serviceEnvFile, '')
+  // THE SERVICE'S ENVIRONMENT COMES FROM SYSTEMD (o3d-2sm1.5 r18). scripts/fence-db-connections.mjs
+  // asks `systemctl show <unit>` for PGHOST/PGPORT/PGUSER/PGDATABASE and refuses when it cannot,
+  // so these runs stand a systemctl in for it — reporting a loaded unit with no PG* — rather than
+  // depending on what unit this box happens to have. `--systemctl=` and `--service-unit=` are argv
+  // values, supplied here the way the deploy scripts supply them.
+  const systemctl = join(cwd, 'systemctl')
+  writeFileSync(
+    systemctl,
+    "#!/bin/sh\ncat <<'PROPS'\nEnvironment=\nWorkingDirectory=\nUser=\nLoadState=loaded\nPROPS\n",
+  )
+  chmodSync(systemctl, 0o755)
+  const isFence = args[0].endsWith('fence-db-connections.mjs')
+  const extra = isFence ? ['--service-unit=one-two-inventory.service', `--systemctl=${systemctl}`] : []
   try {
-    const stdout = execFileSync('node', [join(process.cwd(), ...args[0].split('/')), ...args.slice(1)], {
+    const stdout = execFileSync('node', [join(process.cwd(), ...args[0].split('/')), ...args.slice(1), ...extra], {
       encoding: 'utf8',
-      env: { ...process.env, IMS_SERVICE_ENV_FILE: serviceEnvFile, ...env },
+      env: { ...process.env, ...env },
       cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
     })
