@@ -657,6 +657,13 @@ DB_IDENTITY_REASON=''
 # itself against a fake systemctl.
 require_env_file_is_sole_definition() { return 0; }
 DB_IDENTITY_SOURCE_REASON=''
+# o3d-2sm1.5 r22: and the THIRD half — that the file still says what it said when the run
+# pinned it, re-read at the fence, at the release and after the final daemon-reload. Stubbed
+# to "unchanged" for the same reason: these harnesses are about ORDER, and the re-read is
+# exercised against real files, real tampering and a fake systemctl in
+# tests/scripts/db-connection-fence.test.ts.
+require_start_identity_unchanged() { return 0; }
+DB_IDENTITY_DRIFT_REASON=''
 : "\${APP_DIR_REAL:=/opt/app}"
 : "\${APP_DIR:=/opt/app}"
 ok() { :; }
@@ -695,6 +702,13 @@ DB_IDENTITY_REASON=''
 # itself against a fake systemctl.
 require_env_file_is_sole_definition() { return 0; }
 DB_IDENTITY_SOURCE_REASON=''
+# o3d-2sm1.5 r22: and the THIRD half — that the file still says what it said when the run
+# pinned it, re-read at the fence, at the release and after the final daemon-reload. Stubbed
+# to "unchanged" for the same reason: these harnesses are about ORDER, and the re-read is
+# exercised against real files, real tampering and a fake systemctl in
+# tests/scripts/db-connection-fence.test.ts.
+require_start_identity_unchanged() { return 0; }
+DB_IDENTITY_DRIFT_REASON=''
 : "\${APP_DIR_REAL:=/opt/app}"
 : "\${APP_DIR:=/opt/app}"
 success() { :; }
@@ -732,6 +746,13 @@ DB_IDENTITY_REASON=''
 # itself against a fake systemctl.
 require_env_file_is_sole_definition() { return 0; }
 DB_IDENTITY_SOURCE_REASON=''
+# o3d-2sm1.5 r22: and the THIRD half — that the file still says what it said when the run
+# pinned it, re-read at the fence, at the release and after the final daemon-reload. Stubbed
+# to "unchanged" for the same reason: these harnesses are about ORDER, and the re-read is
+# exercised against real files, real tampering and a fake systemctl in
+# tests/scripts/db-connection-fence.test.ts.
+require_start_identity_unchanged() { return 0; }
+DB_IDENTITY_DRIFT_REASON=''
 : "\${APP_DIR_REAL:=/opt/app}"
 : "\${APP_DIR:=/opt/app}"
 success() { :; }
@@ -1056,6 +1077,13 @@ DB_IDENTITY_REASON=''
 # itself against a fake systemctl.
 require_env_file_is_sole_definition() { return 0; }
 DB_IDENTITY_SOURCE_REASON=''
+# o3d-2sm1.5 r22: and the THIRD half — that the file still says what it said when the run
+# pinned it, re-read at the fence, at the release and after the final daemon-reload. Stubbed
+# to "unchanged" for the same reason: these harnesses are about ORDER, and the re-read is
+# exercised against real files, real tampering and a fake systemctl in
+# tests/scripts/db-connection-fence.test.ts.
+require_start_identity_unchanged() { return 0; }
+DB_IDENTITY_DRIFT_REASON=''
 : "\${APP_DIR_REAL:=/opt/app}"
 : "\${APP_DIR:=/opt/app}"
 info() { :; }
@@ -1094,6 +1122,13 @@ DB_IDENTITY_REASON=''
 # itself against a fake systemctl.
 require_env_file_is_sole_definition() { return 0; }
 DB_IDENTITY_SOURCE_REASON=''
+# o3d-2sm1.5 r22: and the THIRD half — that the file still says what it said when the run
+# pinned it, re-read at the fence, at the release and after the final daemon-reload. Stubbed
+# to "unchanged" for the same reason: these harnesses are about ORDER, and the re-read is
+# exercised against real files, real tampering and a fake systemctl in
+# tests/scripts/db-connection-fence.test.ts.
+require_start_identity_unchanged() { return 0; }
+DB_IDENTITY_DRIFT_REASON=''
 : "\${APP_DIR_REAL:=/opt/app}"
 : "\${APP_DIR:=/opt/app}"
 info() { :; }
@@ -1132,6 +1167,13 @@ DB_IDENTITY_REASON=''
 # itself against a fake systemctl.
 require_env_file_is_sole_definition() { return 0; }
 DB_IDENTITY_SOURCE_REASON=''
+# o3d-2sm1.5 r22: and the THIRD half — that the file still says what it said when the run
+# pinned it, re-read at the fence, at the release and after the final daemon-reload. Stubbed
+# to "unchanged" for the same reason: these harnesses are about ORDER, and the re-read is
+# exercised against real files, real tampering and a fake systemctl in
+# tests/scripts/db-connection-fence.test.ts.
+require_start_identity_unchanged() { return 0; }
+DB_IDENTITY_DRIFT_REASON=''
 : "\${APP_DIR_REAL:=/opt/app}"
 : "\${APP_DIR:=/opt/app}"
 info() { :; }
@@ -1614,6 +1656,13 @@ DB_IDENTITY_REASON=''
 # itself against a fake systemctl.
 require_env_file_is_sole_definition() { return 0; }
 DB_IDENTITY_SOURCE_REASON=''
+# o3d-2sm1.5 r22: and the THIRD half — that the file still says what it said when the run
+# pinned it, re-read at the fence, at the release and after the final daemon-reload. Stubbed
+# to "unchanged" for the same reason: these harnesses are about ORDER, and the re-read is
+# exercised against real files, real tampering and a fake systemctl in
+# tests/scripts/db-connection-fence.test.ts.
+require_start_identity_unchanged() { return 0; }
+DB_IDENTITY_DRIFT_REASON=''
 : "\${APP_DIR_REAL:=/opt/app}"
 : "\${APP_DIR:=/opt/app}"
 ok() { :; }
@@ -1661,6 +1710,13 @@ DB_IDENTITY_REASON=''
 # itself against a fake systemctl.
 require_env_file_is_sole_definition() { return 0; }
 DB_IDENTITY_SOURCE_REASON=''
+# o3d-2sm1.5 r22: and the THIRD half — that the file still says what it said when the run
+# pinned it, re-read at the fence, at the release and after the final daemon-reload. Stubbed
+# to "unchanged" for the same reason: these harnesses are about ORDER, and the re-read is
+# exercised against real files, real tampering and a fake systemctl in
+# tests/scripts/db-connection-fence.test.ts.
+require_start_identity_unchanged() { return 0; }
+DB_IDENTITY_DRIFT_REASON=''
 : "\${APP_DIR_REAL:=/opt/app}"
 : "\${APP_DIR:=/opt/app}"
 success() { :; }
@@ -1705,6 +1761,13 @@ DB_IDENTITY_REASON=''
 # itself against a fake systemctl.
 require_env_file_is_sole_definition() { return 0; }
 DB_IDENTITY_SOURCE_REASON=''
+# o3d-2sm1.5 r22: and the THIRD half — that the file still says what it said when the run
+# pinned it, re-read at the fence, at the release and after the final daemon-reload. Stubbed
+# to "unchanged" for the same reason: these harnesses are about ORDER, and the re-read is
+# exercised against real files, real tampering and a fake systemctl in
+# tests/scripts/db-connection-fence.test.ts.
+require_start_identity_unchanged() { return 0; }
+DB_IDENTITY_DRIFT_REASON=''
 : "\${APP_DIR_REAL:=/opt/app}"
 : "\${APP_DIR:=/opt/app}"
 success() { :; }
@@ -2261,6 +2324,13 @@ DB_IDENTITY_REASON=''
 # itself against a fake systemctl.
 require_env_file_is_sole_definition() { return 0; }
 DB_IDENTITY_SOURCE_REASON=''
+# o3d-2sm1.5 r22: and the THIRD half — that the file still says what it said when the run
+# pinned it, re-read at the fence, at the release and after the final daemon-reload. Stubbed
+# to "unchanged" for the same reason: these harnesses are about ORDER, and the re-read is
+# exercised against real files, real tampering and a fake systemctl in
+# tests/scripts/db-connection-fence.test.ts.
+require_start_identity_unchanged() { return 0; }
+DB_IDENTITY_DRIFT_REASON=''
 : "\${APP_DIR_REAL:=/opt/app}"
 : "\${APP_DIR:=/opt/app}"
 `,
@@ -2309,6 +2379,13 @@ DB_IDENTITY_REASON=''
 # itself against a fake systemctl.
 require_env_file_is_sole_definition() { return 0; }
 DB_IDENTITY_SOURCE_REASON=''
+# o3d-2sm1.5 r22: and the THIRD half — that the file still says what it said when the run
+# pinned it, re-read at the fence, at the release and after the final daemon-reload. Stubbed
+# to "unchanged" for the same reason: these harnesses are about ORDER, and the re-read is
+# exercised against real files, real tampering and a fake systemctl in
+# tests/scripts/db-connection-fence.test.ts.
+require_start_identity_unchanged() { return 0; }
+DB_IDENTITY_DRIFT_REASON=''
 : "\${APP_DIR_REAL:=/opt/app}"
 : "\${APP_DIR:=/opt/app}"
 `,
@@ -2352,6 +2429,13 @@ DB_IDENTITY_REASON=''
 # itself against a fake systemctl.
 require_env_file_is_sole_definition() { return 0; }
 DB_IDENTITY_SOURCE_REASON=''
+# o3d-2sm1.5 r22: and the THIRD half — that the file still says what it said when the run
+# pinned it, re-read at the fence, at the release and after the final daemon-reload. Stubbed
+# to "unchanged" for the same reason: these harnesses are about ORDER, and the re-read is
+# exercised against real files, real tampering and a fake systemctl in
+# tests/scripts/db-connection-fence.test.ts.
+require_start_identity_unchanged() { return 0; }
+DB_IDENTITY_DRIFT_REASON=''
 : "\${APP_DIR_REAL:=/opt/app}"
 : "\${APP_DIR:=/opt/app}"
 `,
@@ -3406,6 +3490,13 @@ DB_IDENTITY_REASON=''
 # itself against a fake systemctl.
 require_env_file_is_sole_definition() { return 0; }
 DB_IDENTITY_SOURCE_REASON=''
+# o3d-2sm1.5 r22: and the THIRD half — that the file still says what it said when the run
+# pinned it, re-read at the fence, at the release and after the final daemon-reload. Stubbed
+# to "unchanged" for the same reason: these harnesses are about ORDER, and the re-read is
+# exercised against real files, real tampering and a fake systemctl in
+# tests/scripts/db-connection-fence.test.ts.
+require_start_identity_unchanged() { return 0; }
+DB_IDENTITY_DRIFT_REASON=''
 : "\${APP_DIR_REAL:=/opt/app}"
 : "\${APP_DIR:=/opt/app}"
 info(){ :; }
