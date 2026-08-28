@@ -653,6 +653,52 @@ repeated parameters, then `pg-connection-string.parse()`, which reads the URL an
 * `postgres://role@/db?host=/var/run/postgresql` — a login role with no host in the authority — is
   read the way the driver reads it, not rejected as unparseable.
 
+**And those four variables are the SERVICE'S, taken from systemd** (o3d-2sm1.5). The bullet above
+is only half the finding: `pg` fills a URL's gaps from `PGHOST`, `PGPORT`, `PGUSER` and
+`PGDATABASE` — but from *whose* environment? The application does not inherit the deploy shell's.
+It is started by systemd; the deploy, update and install scripts run this helper through
+`runuser ... env` with their own environment intact. A `PGPORT=6432` in an operator shell, a cron
+wrapper or a `.bashrc` therefore made the helper resolve identity against 6432 while the
+application connected to 5432 — the gate compared two URLs that agreed with each other, the fence
+revoked `CONNECT` on 6432, the migration ran there, and the real database stayed open and
+unmigrated for the whole window. The more faithfully it followed the driver, the more faithfully
+it followed the wrong environment.
+
+So the four are **deleted from this process and replaced by what systemd says the unit is given**:
+
+* the unit is named on the command line — `--service-unit=<unit>`, once per unit — by the script
+  that already addresses the service (`scripts/deploy.sh` from the units it detects by
+  `WorkingDirectory`, or `IMS_SERVICE_UNIT`; `scripts/update.sh` from `SERVICE_UNIT`;
+  `scripts/install.sh` from `<app name>.service`). It is **not** taken from the environment, and
+  **no unit named is a refusal**. The `--release` command the scripts print for an operator
+  carries it, so pasting that command still works;
+* `systemctl show <unit>` supplies `Environment=` (with drop-ins already layered by systemd, in
+  systemd's order), `EnvironmentFiles=`, `User=` and `WorkingDirectory=`. **systemd cannot be
+  asked, the unit is not `LoadState=loaded`, or its answer cannot be parsed → refusal**, never a
+  fallback to the ambient environment and never an assumption that the service sets none. A unit
+  whose `WorkingDirectory` is not this app directory is refused too: it serves another
+  installation;
+* **an `EnvironmentFile` is never parsed here.** `systemctl show -p Environment` reports the
+  `Environment=` *directives only* — systemd reads an `EnvironmentFile` when it forks the service,
+  not when it loads the unit, and publishes nothing about the result. Reimplementing its grammar
+  is how this went wrong before (`dotenv` reads `PGUSER=ims#writer` as the role `ims`; systemd
+  reads it as `ims#writer`; both are legal). So each file systemd will read is asked the one
+  question every grammar answers the same way — **does it mention one of the four names at all?**
+  A file that mentions none cannot set one. A file that mentions one is **refused**, with the
+  instruction to set it in the unit's own `Environment=`. A file systemd will read and this cannot
+  read is refused; the only skip is the one systemd itself makes, an `EnvironmentFile=-` whose file
+  is absent. The application's own `.env.local` overlay — which systemd never sees, because Next
+  loads it inside the process — is scanned the same way;
+* two units serving this app directory that **disagree** about one of the four are refused rather
+  than resolved to the first;
+* **in practice this costs nothing**: the shipped `.env` carries `DATABASE_URL`, not `PG*`, and the
+  generated unit sets no `PG*` either — so the usual answer is "systemd reports none", and none is
+  what the driver is then given.
+
+If you do need one of the four set for the service, put it in the unit
+(`Environment=PGHOST=...`, or a drop-in), not in `.env`. That is the only place systemd will
+report it from, and the fence refuses what it cannot be told.
+
 **And the role is asked of the connection, not derived from the URL** (o3d-2sm1.5). `PGUSER`, a
 `.pgpass` entry, an ident or peer map and `options=-c role=` are all outside any URL. Every mode
 now reads `session_user` and `current_user` from the connection it opened, alongside
