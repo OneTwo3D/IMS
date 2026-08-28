@@ -34,6 +34,7 @@ import {
   renderLocalDirectionSequence,
   type LocalDirection,
   type LocalDirectionContext,
+  type OutboxReadAxis,
   type LocalDirectionSequence,
 } from '@/lib/domain/accounting/local-operator-direction'
 import * as DIRECTION_MODULE from '@/lib/domain/accounting/local-operator-direction'
@@ -7559,6 +7560,258 @@ test('ROUND 31 (Codex HIGH): a table the renderer reads at invocation time canno
 
   // (U6) AND THE WHOLE INVENTORY IS STILL THE REVIEWED ONE AFTER EVERY ATTEMPTED WRITE ABOVE — the
   // other direction of the same statement, and the one that would catch a write that DID land.
+  for (const context of RUNTIME_CONTEXTS) {
+    assertRenderedInventory(
+      (direction) => renderLocalDirection(direction, context),
+      (text) => substitutePlaceholders(text, context),
+    )
+  }
+})
+
+/**
+ * WHAT A FROZEN TABLE DOES NOT PROMISE EITHER (round 32, Codex HIGH).
+ *
+ * Round 31 removed the capability to write the DATA a renderer reads at invocation time, and stated
+ * what the guarantee then rested on: the renderer's branch strings, the freeze calls, and
+ * `Object.freeze` being the standard intrinsic. That list was written down, which is the only reason
+ * this was findable — and it was incomplete. A renderer reads more than data when it runs: it
+ * resolves every method it CALLS through a prototype, and `Array.prototype` is writable by anything
+ * in the process. `andList` resolved `slice` and `join` there; the sequence renderer resolved `map`
+ * and `join` there. Codex assigned to `Array.prototype.join` after importing the module and the
+ * shipped READ sentence changed from "Read them by status, lastError and time" to a remote
+ * instruction, with all six freezes long since completed and every static judgement in this file
+ * reporting clean.
+ *
+ * SO THE DISPATCH IS GONE RATHER THAN GUARDED. Capturing the three methods at module load would
+ * have been a second list to keep correct — every method added later is another entry — so the
+ * renderers build their strings by indexing and concatenating instead, and there is no method left
+ * to capture. The phrases the READ and INSPECT sentences carry are built once at module evaluation
+ * out of indexed reads off the frozen axis tuples; the sequence renderer's parameter is a PAIR, so
+ * its two elements are read by index rather than walked by `map`.
+ *
+ * This control is a RUNTIME one on purpose. (V4) below shows the static walk reporting a clean
+ * inventory for a model that dispatches through the prototype — because it does: the value it folds
+ * is the value the standard method would return. Nothing computed from the source can see this, so
+ * the assertion has to be made against a patched process.
+ */
+test('ROUND 32 (Codex HIGH): a prototype method written after import cannot reach a shipped sentence', async () => {
+  // Route: `renderLocalDirection` and `renderLocalDirectionSequence` resolve every method they call
+  // when they RUN. A method is not data, so no freeze at the foot of the model covers one, and the
+  // prototype it is resolved through can be written by any importer.
+  //
+  // Mutation that kills this: put either renderer back on a prototype method — `andList`'s
+  // `slice`/`join`, or the sequence renderer's `map`/`join` — and (V3) fails with the injected
+  // instruction in the shipped sentence while (V4) fails naming the call.
+  const model = await readFile(path.join(process.cwd(), DIRECTION_MODEL_FILE), 'utf8')
+  const readDirection: LocalDirection = { action: 'READ', target: 'EMAIL_OUTBOX_ROWS' }
+  const reviewedRead = RENDERED_DIRECTIONS.find((entry) => entry.direction.action === 'READ')!.text
+  const reviewedSequence = RENDERED_DIRECTION_SEQUENCES[0]!.text
+
+  // THE TWO PRE-FIX RENDERERS, REPRODUCED HERE BYTE FOR BYTE FROM THE ROUND-31 MODEL. They are what
+  // makes this control a statement about the FIX rather than about a patch nobody would notice: the
+  // same assignment runs against both, and the difference between them is the whole finding.
+  const preFixAndList = (items: readonly [OutboxReadAxis, ...OutboxReadAxis[]]): string => (
+    items.length < 2
+      ? items[0]
+      : `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}`
+  )
+  const preFixRead = (): string => `Read them by ${preFixAndList(['status', 'lastError', 'time'])}`
+  const preFixSequence = (sequence: LocalDirectionSequence, context: LocalDirectionContext): string => (
+    sequence.map((direction) => renderLocalDirection(direction, context)).join(' and ')
+  )
+
+  // (V1) THE PATCH. An ordinary assignment, the way an importer would make it — no assertion, no
+  // diagnostic, and nothing in this module's own file changed.
+  const prototype = Array.prototype as unknown as Record<string, unknown>
+  const standard = { join: prototype.join, slice: prototype.slice, map: prototype.map }
+  let probe = ''
+  let patchedPreFixRead = ''
+  let patchedPreFixSequence = ''
+  let patchedShippedRead = ''
+  let patchedShippedSequence = ''
+  let patchedShippedInspect = ''
+  try {
+    prototype.join = (): string => UNDECLARED_REMOTE_ACTION
+    prototype.slice = (): string[] => [UNDECLARED_REMOTE_ACTION]
+    prototype.map = (): string[] => [UNDECLARED_REMOTE_ACTION]
+    probe = ['status', 'lastError'].join(', ')
+    patchedPreFixRead = preFixRead()
+    patchedPreFixSequence = preFixSequence(LEAVE_THE_TOGGLE_OFF_THEN_ESCALATE, LOCAL_DIRECTION_CONTEXT)
+    patchedShippedRead = renderLocalDirection(readDirection, LOCAL_DIRECTION_CONTEXT)
+    patchedShippedInspect = renderLocalDirection(
+      { action: 'INSPECT', target: 'EMAIL_OUTBOX_ROWS', form: 'THIS_ORDERS_ROWS' }, LOCAL_DIRECTION_CONTEXT,
+    )
+    patchedShippedSequence = renderLocalDirectionSequence(LEAVE_THE_TOGGLE_OFF_THEN_ESCALATE, LOCAL_DIRECTION_CONTEXT)
+  } finally {
+    prototype.join = standard.join
+    prototype.slice = standard.slice
+    prototype.map = standard.map
+  }
+  // ...and the process is as it was, asserted before anything else runs on it.
+  assert.equal(Array.prototype.join, standard.join, 'the patch must be removed, or every test after this one is '
+    + 'running in a process whose arrays no longer join')
+  assert.equal(Array.prototype.slice, standard.slice, 'the same for `slice`')
+  assert.equal(Array.prototype.map, standard.map, 'the same for `map`')
+  // NON-VACUITY OF THE PATCH ITSELF: it was live, and it was live inside the window the renderers
+  // ran in. Without this the control below passes on a patch that never landed.
+  assert.equal(
+    probe, UNDECLARED_REMOTE_ACTION,
+    'the patch was not in force while the renderers ran, so nothing below is a statement about anything',
+  )
+
+  // (V2) THE FINDING, EXECUTED. The pre-fix renderers ship the injected instruction — so the same
+  // assignment WOULD have changed what an operator is told to do, and this control is about a write
+  // somebody would have bothered to make.
+  assert.equal(
+    patchedPreFixRead, `Read them by ${UNDECLARED_REMOTE_ACTION} and time`,
+    'the round-31 `andList` must be rewritten by the patch — it resolves `slice` and `join` through '
+    + '`Array.prototype` every time it runs',
+  )
+  assert.notEqual(patchedPreFixRead, reviewedRead, 'and what it emits is no longer the reviewed sentence')
+  assert.equal(
+    patchedPreFixSequence, UNDECLARED_REMOTE_ACTION,
+    'and the round-31 sequence renderer is rewritten whole — `map` and `join` are the same lookup',
+  )
+  assert.notEqual(
+    patchedPreFixSequence, substitutePlaceholders(reviewedSequence, LOCAL_DIRECTION_CONTEXT),
+    'and what it emits is no longer the reviewed sequence',
+  )
+
+  // (V3) AND THE SHIPPED RENDERERS ARE UNTOUCHED — compared against the REVIEWED sentence, not
+  // merely against themselves, so "unchanged" cannot be satisfied by being consistently wrong.
+  assert.equal(
+    patchedShippedRead, substitutePlaceholders(reviewedRead, LOCAL_DIRECTION_CONTEXT),
+    'the shipped READ sentence changed under a patched `Array.prototype`',
+  )
+  assert.equal(
+    patchedShippedInspect,
+    substitutePlaceholders(
+      RENDERED_DIRECTIONS.find((entry) => entry.direction.action === 'INSPECT')!.text, LOCAL_DIRECTION_CONTEXT,
+    ),
+    'the shipped INSPECT sentence changed under a patched `Array.prototype` — it carries a built phrase too',
+  )
+  assert.equal(
+    patchedShippedSequence, substitutePlaceholders(reviewedSequence, LOCAL_DIRECTION_CONTEXT),
+    'the shipped sequence changed under a patched `Array.prototype`',
+  )
+
+  // (V4) AND THERE IS NO METHOD LEFT TO CAPTURE, read off the syntax tree rather than asserted. A
+  // call whose callee is a property access is a method resolved through whatever the receiver
+  // inherits from; a call through a plain name is a scope lookup, which nothing outside this module
+  // can reach.
+  const callsIn = (source: string, renderer: string): { calls: number; viaProperty: number } => {
+    const file = ts.createSourceFile('renderer-probe.ts', source, ts.ScriptTarget.ES2022, true)
+    let declaration: ts.FunctionDeclaration | undefined
+    const find = (node: ts.Node): void => {
+      if (ts.isFunctionDeclaration(node) && node.name?.text === renderer) declaration = node
+      ts.forEachChild(node, find)
+    }
+    ts.forEachChild(file, find)
+    assert.ok(declaration?.body, `${renderer} is not a function with a body in the model this walk read`)
+    let calls = 0
+    let viaProperty = 0
+    const visit = (node: ts.Node): void => {
+      if (ts.isCallExpression(node)) {
+        calls += 1
+        if (ts.isPropertyAccessExpression(node.expression) || ts.isElementAccessExpression(node.expression)) {
+          viaProperty += 1
+        }
+      }
+      ts.forEachChild(node, visit)
+    }
+    visit(declaration!.body!)
+    return { calls, viaProperty }
+  }
+  assert.equal(
+    callsIn(model, 'renderLocalDirection').viaProperty, 0,
+    'the direction renderer calls a method through a receiver, so it resolves a name through a prototype at '
+    + 'invocation time and the guarantee is conditional on that prototype again',
+  )
+  const sequenceCalls = callsIn(model, 'renderLocalDirectionSequence')
+  assert.equal(sequenceCalls.viaProperty, 0, 'and the same for the sequence renderer')
+  assert.equal(
+    sequenceCalls.calls, 2,
+    'the sequence renderer must still CALL the direction renderer twice — a walk that found no calls at all '
+    + 'would report `viaProperty: 0` for a renderer it never read',
+  )
+  // NON-VACUITY OF THE WALK, on the code this round removed: it counts exactly the calls that were
+  // there before, so a zero above is a fact about the model rather than about the walk.
+  const withPrototypeDispatch = model.replace(
+    '      return `Read them by ${OUTBOX_READ_PHRASE.WHEN_NARROWING_IS_IMPOSSIBLE}`',
+    "      return `Read them by ${OUTBOX_READ_LIST.WHEN_NARROWING_IS_IMPOSSIBLE.slice(0, -1).join(', ')} and "
+    + '${OUTBOX_READ_LIST.WHEN_NARROWING_IS_IMPOSSIBLE[2]}`',
+  ).replace(SEQUENCE_BODY, "return sequence.map((direction) => renderLocalDirection(direction, context)).join(' and ')")
+  assert.notEqual(withPrototypeDispatch, model, 'the prototype-dispatch mutation must actually have been applied')
+  assert.equal(
+    callsIn(withPrototypeDispatch, 'renderLocalDirection').viaProperty, 2,
+    'the walk must count the `slice` and the `join` this round removed, or (V4) is about a walk that counts '
+    + 'nothing anywhere',
+  )
+  assert.equal(
+    callsIn(withPrototypeDispatch, 'renderLocalDirectionSequence').viaProperty, 2,
+    'and the `map` and the `join`',
+  )
+  // ...AND THIS IS WHY THE CONTROL IS A RUNTIME ONE. That model compiles identically and the static
+  // judgement reports it CLEAN — it folds what the standard methods would return, which is the
+  // reviewed sentence. Every analyzer in this file is blind to the defect by construction, so a
+  // syntactic rule and a patched process are what close it.
+  assert.deepEqual(
+    modelDiagnostics(withPrototypeDispatch), modelDiagnostics(model),
+    'the prototype-dispatch model must type-check exactly as the shipped one does, or it is not a route '
+    + 'anybody could take',
+  )
+  assert.deepEqual(
+    judgeRendererOutput(withPrototypeDispatch), [],
+    'the static judgement must report the prototype-dispatching model CLEAN — if it refused it, this control '
+    + 'would be redundant with round 21 and the runtime assertions above would be proving nothing new',
+  )
+
+  // (V5) AND THE PHRASES ARE STILL DERIVED FROM THE AXES rather than written out beside them. The
+  // dispatch went; the derivation did not. Every axis of every list appears in the phrase that list
+  // builds, in order, and the phrase indexes exactly as many positions as the list has — so a list
+  // that GREW without its phrase being extended is caught here rather than shipping an instruction
+  // that reads each row by one column fewer.
+  const lists = [...model.matchAll(/^ {2}([A-Z_]+): \[([^\]]+)\],$/gm)].map((match) => ({
+    name: match[1]!,
+    axes: [...match[2]!.matchAll(/'([a-zA-Z]+)'/g)].map((axis) => axis[1]!),
+  }))
+  assert.equal(lists.length, 3, `the axis-list read found ${lists.length} lists rather than the three declared`)
+  const phraseBlock = model.slice(model.indexOf('const OUTBOX_READ_PHRASE = {'), model.indexOf('const SETTING_NAME'))
+  assert.ok(phraseBlock.includes('OUTBOX_READ_LIST.'), 'the phrase block read is empty, so nothing below is checked')
+  const andJoin = (axes: readonly string[]): string => (
+    axes.length < 2 ? axes[0]! : `${axes.slice(0, -1).join(', ')} and ${axes[axes.length - 1]}`
+  )
+  for (const { name, axes } of lists) {
+    assert.ok(axes.length >= 3, `${name} was read as ${axes.length} axes, so the list read is not reading axes`)
+    const phrase = andJoin(axes)
+    const carrying = RENDERED_DIRECTIONS.filter((entry) => entry.text.includes(phrase))
+    assert.equal(
+      carrying.length, 1,
+      `no reviewed sentence reads a row by ${JSON.stringify(phrase)} — the phrase ${name} builds has drifted `
+      + 'from the axes it is built out of, or an axis was added to the list and left out of the phrase',
+    )
+    // AND THE PHRASE INDEXES THE WHOLE LIST. `includes` above would still pass if the phrase were
+    // written out by hand and the list quietly grew a column nobody reads.
+    for (let index = 0; index < axes.length; index += 1) {
+      assert.equal(
+        phraseBlock.split(`OUTBOX_READ_LIST.${name}[${index}]`).length - 1, 1,
+        `the phrase for ${name} does not read element ${index} exactly once, so it is not built from the list`,
+      )
+    }
+    assert.ok(
+      !phraseBlock.includes(`OUTBOX_READ_LIST.${name}[${axes.length}]`),
+      `the phrase for ${name} reads past the end of the list, which is a read off \`Array.prototype\``,
+    )
+    for (const axis of axes) {
+      assert.ok(
+        !phraseBlock.includes(`'${axis}'`),
+        `the phrase block writes the column name ${JSON.stringify(axis)} out instead of indexing the list`,
+      )
+    }
+  }
+
+  // (V6) AND THE WHOLE INVENTORY IS STILL THE REVIEWED ONE, in every sampled context — the other
+  // direction of the same statement, and the one that would catch a phrase that came back wrong.
   for (const context of RUNTIME_CONTEXTS) {
     assertRenderedInventory(
       (direction) => renderLocalDirection(direction, context),
