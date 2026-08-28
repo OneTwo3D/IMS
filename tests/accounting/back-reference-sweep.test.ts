@@ -2727,6 +2727,80 @@ test('[o3d-peh1] a REFUSED follow-up enqueue never lets the repair path settle t
   assert.equal(harness.store.syncRows[0].backReferenceFollowUpsPendingAt, null)
 })
 
+test('[o3d-batch-ret] a REFUSED enqueue on a LINKED, non-compacted row is counted as a failure', async () => {
+  // o3d-batch-ret (Codex MEDIUM) — THE ONE SITE BOTH BRANCHES REACH.
+  //
+  // The main repair loop's settlement call served two different passes and passed
+  // `countRefusalAsFailure: false` to both. On the `!followUpsOnly` branch that is right: the
+  // back-reference WAS written, and calling a real repair a failure would hide it. On the
+  // `followUpsOnly` branch — this one — the link was already there, `applyBackReference` was never
+  // called and NOTHING was written, which is exactly the condition the two sibling sites count. So a
+  // refusal here returned `failed: 0` with every piece of requested work undone, and the cron result
+  // reported a clean run.
+  //
+  // THE ROW: SALES_INVOICE, FAILED (so it owes follow-ups), carrying its external id, on an order
+  // that is ALREADY linked — the shape the sibling test above settles happily — and NOT a compaction
+  // tombstone, so it goes through the enqueue rather than the terminal-discard branch.
+  //
+  // MUTATION THAT KILLS THIS: collapse the two calls back to one and pass a literal `false` for
+  // `countRefusalAsFailure` (the shipped behaviour this replaced). `run.failed` reads 0 while every
+  // other assertion below still passes — which is the whole point of the finding: the row is
+  // correctly left unsettled and correctly re-reported, and only the COUNT lies.
+  // ROUTE: `repairAccountingBackReferences` → the main candidate loop with `missing === false` and
+  // `followUpsOnly === true` → `followUpSettlement(..., 'already-applied', true)`.
+  const harness = makeHarness({
+    syncRows: [salesInvoiceRow(1, { status: 'FAILED' })],
+    bills: [],
+    orders: [{ id: 'so-1', accountingInvoiceId: 'XINV-1' }],
+  })
+  harness.refuseFollowUpsFor.add('log-0001')
+
+  const run = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+
+  assert.equal(run.repaired, 0, 'PRECONDITION: nothing was repaired, so this really is the follow-ups-only branch')
+  assert.equal(
+    run.failed, 1,
+    'THE LOAD-BEARING ASSERTION: a pass that wrote nothing and queued nothing is a failure. Reporting '
+    + '0 here is what let a cron run finish clean with the payment still owed',
+  )
+  assert.equal(harness.followUps.length, 0, 'nothing was enqueued — that is what a refusal means')
+  assert.equal(harness.store.syncRows[0].backReferenceCheckedAt, null, 'and the row is not settled')
+  assert.equal(harness.store.syncRows[0].status, 'FAILED', 'nor flipped to SYNCED')
+  assert.ok(
+    harness.store.syncRows[0].backReferenceFollowUpsPendingAt,
+    'the record that the follow-ups are owed survives, so a later sweep picks the work back up',
+  )
+  assert.equal(
+    harness.activities.some((entry) => entry.action === 'xero_backreference_followups_recovered'),
+    false,
+    'and nothing claims a recovery that did not happen',
+  )
+})
+
+test('[o3d-batch-ret] a REFUSED enqueue on a repair that DID write the back-reference is still not a failure', async () => {
+  // The control that keeps the split honest in the other direction. Without it,
+  // `countRefusalAsFailure: true` at both branches — a one-character over-correction — passes the
+  // test above and silently reports every real repair whose follow-ups were refused as a failure,
+  // which is precisely the lie the original `false` was defending against.
+  //
+  // Same row, same refusal; the only difference is that the ORDER starts unlinked, so this pass
+  // performs the id write.
+  const harness = makeHarness({
+    syncRows: [salesInvoiceRow(1, { status: 'FAILED' })],
+    bills: [],
+    orders: [{ id: 'so-1', accountingInvoiceId: null }],
+  })
+  harness.refuseFollowUpsFor.add('log-0001')
+
+  const run = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+
+  assert.equal(run.repaired, 1, 'PRECONDITION: the back-reference half really did happen')
+  assert.equal(harness.store.orders[0].accountingInvoiceId, 'XINV-1')
+  assert.equal(run.failed, 0, 'so the refusal must not be counted as one — a real repair would be hidden by it')
+  assert.equal(harness.store.syncRows[0].backReferenceCheckedAt, null, 'the row is still left unsettled, as before')
+  assert.ok(harness.store.syncRows[0].backReferenceFollowUpsPendingAt)
+})
+
 test('[o3d-peh1] a REFUSED enqueue on the follow-ups-only path leaves the obligation standing', async () => {
   // The other caller, and the one the issue names: a row with NO back-reference of its own, whose
   // only outstanding work IS the enqueue. Here there is nothing else to have succeeded, so settling
