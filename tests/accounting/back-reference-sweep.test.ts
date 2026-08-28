@@ -183,6 +183,13 @@ type Harness = {
       connectionProvenance: string | null | undefined
       backReferenceEvidenceCompactedAt?: Date | null
     }
+    /**
+     * o3d-0bfh r15: the obligation GENERATION the sweep handed down, so the deferred-receipt
+     * re-drive can clear it inside the same transaction as its final re-read under the sales-order
+     * lock. Recorded because handing down the generation the run merely READ, or none at all, are
+     * both silent — the enqueue would simply fail to release and the row would be swept again.
+     */
+    followUpObligation: Date | null
   }>
   calls: {
     candidateQueries: number
@@ -201,6 +208,14 @@ type Harness = {
    * refusals and connector-switch rollbacks.
    */
   unsettledFollowUpsFor: Set<string>
+  /**
+   * Sync rows whose follow-up enqueue CLEARS THE OBLIGATION MARKER ITSELF (o3d-0bfh r15), which is
+   * what the production deferred-receipt re-drive does under the sales-order lock. The double writes
+   * `backReferenceFollowUpsPendingAt: null` on the row and answers `obligationFenced: true`, so a
+   * sweep that still fenced its settlement on the generation it claimed would find no row and leave
+   * the row unstamped for ever.
+   */
+  fencedFollowUpsFor: Set<string>
   failProbeFor: Set<string>
   /**
    * Activity-log persistence failures, by action. The PRODUCTION logActivity swallows its write
@@ -250,12 +265,13 @@ function makeHarness(store: Store): Harness {
   const calls = { candidateQueries: 0, syncRowsRead: 0, probes: 0, billUpdates: 0, transactions: 0, rawStatements: [] as Array<{ sql: string; values: unknown[] }> }
   const failFollowUpsFor = new Set<string>()
   const unsettledFollowUpsFor = new Set<string>()
+  const fencedFollowUpsFor = new Set<string>()
   const failProbeFor = new Set<string>()
   const failActivityFor = new Set<string>()
   const failPendingMarkerFor = new Set<string>()
   const failInvoiceDateReadFor = new Set<string>()
   const harness = {
-    store, activities, followUps, calls, failFollowUpsFor, unsettledFollowUpsFor, failProbeFor, failActivityFor,
+    store, activities, followUps, calls, failFollowUpsFor, unsettledFollowUpsFor, fencedFollowUpsFor, failProbeFor, failActivityFor,
     failPendingMarkerFor, failInvoiceDateReadFor, raceAfterBillRead: null, raceAfterFollowUps: null,
     raceAfterProbe: null,
   } as Harness
@@ -477,10 +493,21 @@ function sweepDeps(harness: Harness, now?: () => Date, overrides: { cursorStore?
       _payload: Record<string, unknown>,
       _syncResult: { externalId?: string; invoiceNumber?: string },
       origin: Harness['followUps'][number]['origin'],
+      followUpObligation: Date | null,
     ) => {
       if (harness.failFollowUpsFor.has(entryId)) throw new Error('follow-up enqueue failed')
-      harness.followUps.push({ entryId, referenceType, referenceId, origin })
-      const outcome = { deferredReceiptsSettled: !harness.unsettledFollowUpsFor.has(entryId) }
+      harness.followUps.push({ entryId, referenceType, referenceId, origin, followUpObligation })
+      // o3d-0bfh r15: the production re-drive CLEARS the generation it was handed, inside the same
+      // transaction as its final re-read of the order's receipts under the sales-order lock. The
+      // double does exactly that — the write, then the answer — so a sweep that still fenced on the
+      // generation it claimed would be measured against a column that really has moved.
+      const fenced = harness.fencedFollowUpsFor.has(entryId) && followUpObligation !== null
+      if (fenced) {
+        for (const row of harness.store.syncRows) {
+          if (row.id === entryId) row.backReferenceFollowUpsPendingAt = null
+        }
+      }
+      const outcome = { deferredReceiptsSettled: !harness.unsettledFollowUpsFor.has(entryId), obligationFenced: fenced }
       // The interleaving window (o3d-0bfh r2): the outcome exists, the verdict has not been written.
       // AWAITED (o3d-0bfh r3), so what runs in the window can be a whole second sweep rather than a
       // hand-written mutation. That difference is the point: a mutation asserts what the tester
@@ -3290,4 +3317,98 @@ test('[o3d-0bfh r3 + o3d-bqw7 r2] CONTROL: an undisturbed TOMBSTONE still claims
   const row = harness.store.syncRows[0]
   assert.ok(row.backReferenceCheckedAt, 'and it settles')
   assert.equal(row.backReferenceFollowUpsPendingAt, null, 'discharging the generation THIS run claimed')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-0bfh r15 (Codex HIGH) — THE SWEEP IS THE OTHER RELEASE PATH, AND IT REACHED THE FINDING BY THE
+// IDENTICAL ROUTE.
+//
+// It claims a marker, runs an enqueue whose deferred-receipt re-drive SNAPSHOTS the order's receipts,
+// and then clears the marker — while a receipt that committed after that snapshot has already read
+// the marker as live and been told, in terms, not to settle by hand. Worse here than on the post
+// path: `markChecked` also stamps `backReferenceCheckedAt`, which removes the row from the candidate
+// set for good.
+//
+// So the generation the run claims travels DOWN to the re-drive, which clears it inside the same
+// transaction as its final re-read under the sales-order lock. The consequence for this module is
+// the settlement fence: the marker column is ALREADY null by the time the stamp is written, so a
+// fence still expecting the claimed generation matches no row and defers the stamp for ever.
+// ---------------------------------------------------------------------------
+
+test('[o3d-0bfh r15] the sweep hands the enqueue THE GENERATION IT CLAIMED, not the one it read', async () => {
+  const harness = makeHarness({
+    syncRows: [salesInvoiceRow(1, { status: 'FAILED', attemptRevision: 3, backReferenceFollowUpsPendingAt: at(500) })],
+    bills: [],
+    orders: [{ id: 'so-1', accountingInvoiceId: null }],
+  })
+
+  await repairAccountingBackReferences(sweepDeps(harness, () => at(600)), { limit: 10 })
+
+  assert.equal(harness.followUps.length, 1)
+  assert.deepEqual(
+    harness.followUps[0].followUpObligation, at(600),
+    'the generation THIS run minted — handing down the one it merely READ (at(500)) would let the '
+      + 're-drive clear an obligation an overlapping run is holding',
+  )
+})
+
+test('[o3d-0bfh r15] a row whose re-drive cleared the marker under the order lock is STILL stamped', async () => {
+  // The regression. Production now clears `backReferenceFollowUpsPendingAt` inside the re-drive's
+  // fenced transaction; a settlement write that still fenced on the claimed generation would find no
+  // row, defer, and leave the row a candidate for ever — swept, re-enqueued and deferred on every
+  // run, permanently.
+  const harness = makeHarness({
+    syncRows: [salesInvoiceRow(1, { status: 'FAILED', attemptRevision: 3, backReferenceFollowUpsPendingAt: at(500) })],
+    bills: [],
+    orders: [{ id: 'so-1', accountingInvoiceId: null }],
+  })
+  harness.fencedFollowUpsFor.add('log-0001')
+
+  const run = await repairAccountingBackReferences(sweepDeps(harness, () => at(600)), { limit: 10 })
+
+  const row = harness.store.syncRows[0]
+  assert.equal(run.settlementDeferred, 0, 'the marker moving BECAUSE OF THIS RUN is not another run racing it')
+  assert.equal(run.repaired, 1)
+  assert.ok(row.backReferenceCheckedAt, 'the row settles, so it leaves the candidate set')
+  assert.equal(row.backReferenceFollowUpsPendingAt, null)
+  assert.equal(row.status, 'SYNCED')
+})
+
+test('[o3d-0bfh r15] but a marker RE-CLAIMED by somebody else after the fence still refuses the stamp', async () => {
+  // The fence is relaxed to `null`, not removed, and this is what proves it still fails closed. A
+  // second run claims a NEW generation after the re-drive cleared ours; the column is no longer null,
+  // the stamp is refused, and the row stays a candidate for the run that owns the obligation.
+  const harness = makeHarness({
+    syncRows: [salesInvoiceRow(1, { status: 'FAILED', attemptRevision: 3, backReferenceFollowUpsPendingAt: at(500) })],
+    bills: [],
+    orders: [{ id: 'so-1', accountingInvoiceId: null }],
+  })
+  harness.fencedFollowUpsFor.add('log-0001')
+  harness.raceAfterFollowUps = (rows) => { rows[0].backReferenceFollowUpsPendingAt = at(900) }
+
+  const run = await repairAccountingBackReferences(sweepDeps(harness, () => at(600)), { limit: 10 })
+
+  const row = harness.store.syncRows[0]
+  assert.equal(run.settlementDeferred, 1, 'the newer obligation stands and this run writes nothing')
+  assert.equal(row.backReferenceCheckedAt, null, 'so the row is still a candidate for whoever owns it')
+  assert.deepEqual(row.backReferenceFollowUpsPendingAt, at(900))
+})
+
+test('[o3d-0bfh r15] an UNSETTLED receipt still keeps the row unstamped, fence or no fence', async () => {
+  // The direction that costs money is unchanged: a re-drive that leaves a receipt unregistered
+  // answers `deferredReceiptsSettled: false`, and nothing about the fenced release may turn that
+  // into a settlement.
+  const harness = makeHarness({
+    syncRows: [salesInvoiceRow(1, { status: 'FAILED', attemptRevision: 3, backReferenceFollowUpsPendingAt: at(500) })],
+    bills: [],
+    orders: [{ id: 'so-1', accountingInvoiceId: null }],
+  })
+  harness.unsettledFollowUpsFor.add('log-0001')
+
+  const run = await repairAccountingBackReferences(sweepDeps(harness, () => at(600)), { limit: 10 })
+
+  const row = harness.store.syncRows[0]
+  assert.equal(run.followUpsUnsettled, 1)
+  assert.equal(row.backReferenceCheckedAt, null, 'never stamped over an unregistered receipt')
+  assert.deepEqual(row.backReferenceFollowUpsPendingAt, at(600), 'and the obligation this run claimed is kept')
 })

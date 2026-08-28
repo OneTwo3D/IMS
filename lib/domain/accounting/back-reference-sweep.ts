@@ -545,6 +545,17 @@ export type BackReferenceSweepActivity = {
 export type BackReferenceFollowUpOutcome = {
   /** False when a receipt recorded before this document is still waiting to reach the ledger. */
   deferredReceiptsSettled: boolean
+  /**
+   * TRUE WHEN THE ENQUEUE ALREADY CLEARED THE OBLIGATION GENERATION IT WAS HANDED (o3d-0bfh r15,
+   * Codex HIGH).
+   *
+   * The deferred-receipt re-drive re-reads the order's receipts UNDER THE SALES-ORDER LOCK and
+   * clears the generation in that same transaction, because a receipt committing after its snapshot
+   * would otherwise read a live marker — and be told its recovery is retained — and then have that
+   * marker cleared over it. The sweep must therefore fence its own settlement write on the column
+   * being `null` rather than on the generation it claimed: see `settlementFence`.
+   */
+  obligationFenced: boolean
 }
 
 export type BackReferenceSweepDeps = {
@@ -609,6 +620,17 @@ export type BackReferenceSweepDeps = {
       connectionProvenance: string | null | undefined
       backReferenceEvidenceCompactedAt?: Date | null
     },
+    /**
+     * THE OBLIGATION GENERATION THIS RUN CLAIMED (o3d-0bfh r15, Codex HIGH).
+     *
+     * The sweep is the OTHER release path, and it reaches the finding by the identical route: it
+     * claims a marker, runs an enqueue whose deferred-receipt re-drive snapshots the order's
+     * receipts, and then clears the marker — while a receipt that committed after that snapshot has
+     * read the marker as live. Handing the generation DOWN lets the re-drive clear it inside the
+     * same transaction as its final re-read, under the sales-order lock, which is the only ordering
+     * in which that receipt cannot be settled over. `null` withholds the release entirely.
+     */
+    followUpObligation: Date | null,
   ) => Promise<BackReferenceFollowUpOutcome>
   now?: () => Date
   /**
@@ -1561,6 +1583,11 @@ export async function repairAccountingBackReferences(
         (row.payload ?? {}) as Record<string, unknown>,
         { externalId: row.externalTransactionId ?? undefined },
         sweepRowOriginRecord(row),
+    // o3d-0bfh r15: the generation this run claimed goes DOWN to the enqueue, so the
+    // deferred-receipt re-drive can clear it inside the same transaction as its final re-read of
+    // the order's receipts, under the sales-order lock. When it does, `obligationFenced` says so
+    // and the settlement below fences on the column being null instead.
+        obligation.pendingAt,
       )
     } catch (followUpError) {
       result.failed++
@@ -1590,12 +1617,18 @@ export async function repairAccountingBackReferences(
       await reportUnsettledReceipts(row, 'already-applied')
       return { settle: false }
     }
+    // o3d-0bfh r15: NULL when the re-drive cleared the marker itself under the sales-order lock —
+    // fencing on the generation this run claimed would then match no row and defer the stamp for
+    // ever. The fence is still exclusive: `status`, `attemptRevision` and `backReferenceCheckedAt`
+    // are all in it, and a marker re-claimed by another run since is no longer null, so this fails
+    // closed exactly as before.
+    const settledMarker = (): Date | null => (outcome.obligationFenced ? null : obligation.pendingAt)
     // AND ONLY NOW THE TERMINAL DISCARD. The rebuildable half has gone out and settled; what is left
     // is work this tombstone can never recover, and the marker may be consumed only once that is on
     // record — and only the generation THIS run claimed, never the one it merely read.
     if (discarded.length > 0) {
       return (await reportDiscardedFollowUps(row, 'already-applied'))
-        ? { settle: true, marker: obligation.pendingAt }
+        ? { settle: true, marker: settledMarker() }
         : { settle: false }
     }
     await deps.logActivity({
@@ -1607,7 +1640,7 @@ export async function repairAccountingBackReferences(
         + `${row.referenceType} ${row.referenceId}; this row carries no back-reference of its own.`,
       metadata: { syncLogId: row.id, type: row.type, referenceType: row.referenceType, referenceId: row.referenceId },
     })
-    return { settle: true, marker: obligation.pendingAt }
+    return { settle: true, marker: settledMarker() }
   }
 
   // RESUME where the previous run stopped (r3 finding 4). A cursor that reset to null every
@@ -1898,6 +1931,8 @@ export async function repairAccountingBackReferences(
                 (row.payload ?? {}) as Record<string, unknown>,
                 { externalId: row.externalTransactionId ?? undefined },
                 sweepRowOriginRecord(row),
+                // o3d-0bfh r15: see the sibling call in `settleOutstandingFollowUpsOnly`.
+                obligation.pendingAt,
               )
             } catch (followUpError) {
               result.failed++
@@ -1913,7 +1948,9 @@ export async function repairAccountingBackReferences(
             if (discardsFollowUps && !(await reportDiscardedFollowUps(row, 'already-applied'))) continue
             // Linked, its recoverable half raised and settled, its terminal half announced. Stamped
             // against the generation THIS run claimed, never the one it merely read.
-            await markChecked(settlementFence(row, obligation.pendingAt))
+            // o3d-0bfh r15: null when the re-drive cleared it under the order lock — see
+            // `settleOutstandingFollowUpsOnly`.
+            await markChecked(settlementFence(row, tombstoneOutcome.obligationFenced ? null : obligation.pendingAt))
             continue
           }
           // Linked, nothing outstanding: reconciled. Stamped, so it never occupies a slot again —
@@ -1958,7 +1995,7 @@ export async function repairAccountingBackReferences(
           }
           continue
         }
-        const settlementMarker: Date | null = obligation.pendingAt
+        let settlementMarker: Date | null = obligation.pendingAt
 
         // Where the write actually landed. For a PO-keyed row that is the bill the FENCED
         // attribution chose, which is the only attribution that ever reaches a write.
@@ -2021,11 +2058,16 @@ export async function repairAccountingBackReferences(
               const outcome = await deps.enqueueFollowUps(row.id, row.type, row.referenceType, row.referenceId, payload, {
                 externalId: row.externalTransactionId,
                 invoiceNumber,
-              }, sweepRowOriginRecord(row))
+                // o3d-0bfh r15: see the sibling call in `settleOutstandingFollowUpsOnly`.
+              }, sweepRowOriginRecord(row), obligation.pendingAt)
               if (!outcome.deferredReceiptsSettled) {
                 followUpsEnqueued = false
                 await reportUnsettledReceipts(row, followUpsOnly ? 'already-applied' : 'repaired')
               }
+              // o3d-0bfh r15: the re-drive cleared the marker itself, under the order lock. The
+              // settlement write below must therefore expect the column to be NULL — fencing on the
+              // generation this run claimed would find no row and defer the stamp for ever.
+              if (outcome.obligationFenced) settlementMarker = null
             } catch (followUpError) {
               followUpsEnqueued = false
               console.error(`${prefix}: back-reference follow-up enqueue failed`, row.id, followUpError)

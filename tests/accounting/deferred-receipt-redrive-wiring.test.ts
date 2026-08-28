@@ -23,6 +23,12 @@ const state = {
   queued: [] as QueuedRow[],
   activity: [] as Array<{ action: string; level: string; description: string; metadata: Record<string, unknown> }>,
   payments: [] as Array<{ id: string; amount: number; currency: string; method: string | null; reference: string | null; paidAt: Date }>,
+  /**
+   * o3d-0bfh r15: every write that CLEARS the follow-up obligation marker, with the predicate it was
+   * fenced on. The finding is about a marker cleared over a receipt nothing considered, so the test
+   * has to be able to see the clearing write itself — not just the boolean the pass returned.
+   */
+  markerClears: [] as Array<{ where: Record<string, unknown>; data: Record<string, unknown> }>,
   // o3d-ekn8 r4: WHICH connector the enqueue reports the row was written under. The pinned
   // registration fences on this, so it has to be able to differ from the pin.
   enqueueConnector: 'xero' as string,
@@ -57,8 +63,22 @@ mock.module('@/lib/db', {
 
 function txClient() {
   return {
-    accountingSyncLog: { findMany: async () => state.syncRows },
-    payment: { findUnique: async ({ where }: { where: { id: string } }) => state.payments.find((p) => p.id === where.id) ?? null },
+    accountingSyncLog: {
+      findMany: async () => state.syncRows,
+      // o3d-0bfh r15: the obligation release now happens INSIDE the fenced transaction, so the
+      // transaction client is what performs it. Recorded rather than swallowed — see markerClears.
+      updateMany: async ({ where, data }: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
+        state.markerClears.push({ where, data })
+        return { count: 1 }
+      },
+    },
+    payment: {
+      findUnique: async ({ where }: { where: { id: string } }) => state.payments.find((p) => p.id === where.id) ?? null,
+      // o3d-0bfh r15: THE FENCE'S OWN RE-READ. Deliberately served from `state.payments` as it is at
+      // the moment of the call, so a receipt appended by `onOrderLock` — i.e. one that committed
+      // after the pass's snapshot — is visible to it and to nothing else.
+      findMany: async () => state.payments,
+    },
     // o3d-ekn8 r2: the pinned document is re-read UNDER THE LOCK, so the transaction client has to be
     // able to answer for the order too.
     salesOrder: { findUnique: async () => ({ ...state.order, payments: state.payments }) },
@@ -149,9 +169,17 @@ mock.module('@/lib/accounting', {
   },
 })
 
-async function redrive(postedInvoiceId = 'INV-1') {
+/** The generation the "caller" claimed — the exact value the fenced release must clear on. */
+const OBLIGATION = new Date('2026-08-01T00:00:00.000Z')
+
+async function redrive(postedInvoiceId = 'INV-1', obligation: Date | null = OBLIGATION) {
   const m = await import('@/lib/domain/accounting/invoice-payment-enqueue')
-  return m.registerDeferredOrderReceipts('order-1', { connector: 'xero', accountingInvoiceId: postedInvoiceId })
+  return m.registerDeferredOrderReceipts('order-1', { connector: 'xero', accountingInvoiceId: postedInvoiceId }, {
+    syncLogId: 'sync-1',
+    connector: 'xero',
+    generation: obligation,
+    recovery: { consumer: 'sweep' },
+  })
 }
 
 test.beforeEach(() => {
@@ -159,6 +187,7 @@ test.beforeEach(() => {
   state.queued = []
   state.activity = []
   state.payments = []
+  state.markerClears = []
   state.order.accountingInvoiceId = 'INV-1'
   onOrderLock = null
   state.order.totalForeign = 100
@@ -521,4 +550,138 @@ test('[o3d-ekn8 r4] but a row that was ALREADY QUEUED elsewhere is not rolled ba
   assert.match(refusals[0].description, /ALREADY QUEUED/)
   assert.match(refusals[0].description, /STILL LIVE AND WILL POST/)
   assert.match(refusals[0].description, /cancel it/i, 'and the message names what to do about it')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-0bfh r15 (Codex HIGH) — A RECEIPT THAT COMMITS AFTER THE PASS'S SNAPSHOT.
+//
+// r14 made the receipt path read the durable obligation marker and answer `held` — which REFUSES a
+// hand settlement — whenever a deferred pass is in flight for the order. The marker is live for that
+// whole window, and that much was right. What it does not establish is what the notice promises:
+// THE MARKER SAYS A PASS IS IN FLIGHT, NOT THAT THE PASS SAW THIS RECEIPT. The pass's view of which
+// receipts exist was fixed at its own `order.payments` snapshot, and its final verification re-used
+// that same snapshot — so a receipt committing while the pass was making its remote calls was
+// invisible to it, read `held`, was told not to settle by hand, and then had the marker cleared over
+// it. No sync row, no retained marker, no future sweep: a recorded customer payment permanently
+// absent from the ledger.
+//
+// The release is therefore taken UNDER THE SAME SALES-ORDER LOCK `addPayment` takes, over a re-read
+// of the receipts that exist NOW, in one transaction. `onOrderLock` is what lands the receipt in the
+// only window that matters: the instant the fence acquires that lock.
+// ---------------------------------------------------------------------------
+
+test('[o3d-0bfh r15] a receipt committed AFTER the pass\'s snapshot keeps the marker, and is not settled over', async () => {
+  // The pass's own snapshot: one receipt, already registered against this document, so the
+  // registration loop does nothing and the fence is the first thing to take the order lock.
+  state.payments = [...ONE_RECEIPT]
+  state.syncRows = [{
+    id: 'log-existing',
+    status: 'SYNCED',
+    externalTransactionId: null,
+    errorMessage: null,
+    retryCount: 0,
+    payload: { amount: 100, paymentId: 'pay-1', accountingInvoiceId: 'INV-1' },
+  }]
+  // `addPayment` commits a SECOND receipt the moment the fence takes the lock — after the pass read
+  // the order, and with no sync row of its own.
+  onOrderLock = () => {
+    state.payments = [...state.payments, {
+      id: 'pay-late', amount: 25, currency: 'GBP', method: 'card', reference: null, paidAt: new Date('2026-08-02T00:00:00.000Z'),
+    }]
+  }
+
+  const result = await redrive('INV-1')
+
+  assert.equal(result.settled, false, 'the pass must not report itself finished over a receipt it never considered')
+  assert.equal(result.reason, 'left-unregistered')
+  assert.equal(result.awaiting, 1, 'and it names the receipt that arrived, not the one it snapshotted')
+  assert.equal(result.release, 'retained')
+  assert.deepEqual(
+    state.markerClears, [],
+    'THE LOAD-BEARING ASSERTION: no write cleared the obligation marker. The late receipt read it as '
+    + 'held and was told its recovery is retained; clearing it here is what made that a lie.',
+  )
+})
+
+test('[o3d-0bfh r15] with nothing arriving, the fence clears THE GENERATION IT WAS HANDED and nothing else', async () => {
+  // The control. Without it, "the marker was not cleared" above is also what a fence that never
+  // clears anything produces, and the regression would pass for the wrong reason.
+  state.payments = [...ONE_RECEIPT]
+  state.syncRows = [{
+    id: 'log-existing',
+    status: 'SYNCED',
+    externalTransactionId: null,
+    errorMessage: null,
+    retryCount: 0,
+    payload: { amount: 100, paymentId: 'pay-1', accountingInvoiceId: 'INV-1' },
+  }]
+
+  const result = await redrive('INV-1')
+
+  assert.equal(result.settled, true)
+  assert.equal(result.release, 'released')
+  assert.equal(state.markerClears.length, 1, 'exactly one clearing write')
+  assert.deepEqual(state.markerClears[0].where, { id: 'sync-1', backReferenceFollowUpsPendingAt: OBLIGATION },
+    'fenced on the generation THIS pass was handed — a generation re-read here would be somebody else\'s')
+  assert.deepEqual(state.markerClears[0].data, { backReferenceFollowUpsPendingAt: null })
+})
+
+test('[o3d-0bfh r15] an order whose receipts were all EMPTY at the snapshot is fenced too', async () => {
+  // `no-receipts` returned `settled: true` unfenced, and it is the same snapshot claim: a receipt
+  // committing between that read and the caller's release reads a live marker and is settled over.
+  state.payments = []
+  onOrderLock = () => {
+    state.payments = [{
+      id: 'pay-late', amount: 40, currency: 'GBP', method: 'card', reference: null, paidAt: new Date('2026-08-02T00:00:00.000Z'),
+    }]
+  }
+
+  const result = await redrive('INV-1')
+
+  assert.equal(result.settled, false, 'an order that had no receipts a moment ago can have one now')
+  assert.equal(result.reason, 'left-unregistered')
+  assert.deepEqual(state.markerClears, [], 'and the marker the late receipt read stays exactly where it is')
+})
+
+test('[o3d-0bfh r15] a caller holding no generation clears nothing, and says so', async () => {
+  // `null` is a statement, not a default: the pass took no generation, so it has no standing to
+  // clear one. The old code path reached `releaseFollowUpObligation` and short-circuited there; the
+  // fence must not have quietly acquired an ability to clear a marker it does not own.
+  state.payments = [...ONE_RECEIPT]
+  state.syncRows = [{
+    id: 'log-existing',
+    status: 'SYNCED',
+    externalTransactionId: null,
+    errorMessage: null,
+    retryCount: 0,
+    payload: { amount: 100, paymentId: 'pay-1', accountingInvoiceId: 'INV-1' },
+  }]
+
+  const result = await redrive('INV-1', null)
+
+  assert.equal(result.settled, true)
+  assert.equal(result.release, 'superseded', 'a pass that owns no generation is not the one to clear the marker')
+  assert.deepEqual(state.markerClears, [])
+})
+
+test('[o3d-0bfh r15] a fence that cannot be taken retains the marker rather than reporting success', async () => {
+  // The transaction can fail — lock timeout, a dead connection — and the direction that failure
+  // resolves in is the whole asymmetry the obligation marker was designed around.
+  state.payments = [...ONE_RECEIPT]
+  state.syncRows = [{
+    id: 'log-existing',
+    status: 'SYNCED',
+    externalTransactionId: null,
+    errorMessage: null,
+    retryCount: 0,
+    payload: { amount: 100, paymentId: 'pay-1', accountingInvoiceId: 'INV-1' },
+  }]
+  onOrderLock = () => { throw new Error('could not lock sales order') }
+
+  const result = await redrive('INV-1')
+
+  assert.equal(result.settled, false)
+  assert.equal(result.reason, 'failed')
+  assert.equal(result.release, 'retained')
+  assert.deepEqual(state.markerClears, [])
 })

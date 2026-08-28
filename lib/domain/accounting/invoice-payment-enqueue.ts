@@ -29,7 +29,12 @@ import {
   type InvoicePaymentRegistrationDecision,
   type InvoicePaymentRegistrationRefusal,
 } from '@/lib/domain/accounting/invoice-payment-registration'
-import { followUpObligationRecoveryNote } from '@/lib/domain/accounting/back-reference'
+import {
+  followUpObligationRecoveryNote,
+  releaseFollowUpObligation,
+  type FollowUpObligationRecovery,
+  type FollowUpObligationReleaseOutcome,
+} from '@/lib/domain/accounting/back-reference'
 import { followUpObligationRecoveryFor } from '@/lib/domain/accounting/follow-up-obligation-registry'
 import { ledgerSalesInvoiceTotalForeign, type PaymentSyncRow } from '@/lib/domain/accounting/settlement-status'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
@@ -177,6 +182,158 @@ export type DeferredReceiptRedriveResult = {
     | 'failed'
   /** How many receipts were still awaiting registration when this returned. */
   awaiting?: number
+  /**
+   * WHAT THIS PASS DID WITH THE CALLER'S OBLIGATION MARKER (o3d-0bfh r15, Codex HIGH).
+   *
+   * The caller USED to clear the marker itself on `settled: true`, and that is the race this field
+   * exists to make unstateable: see {@link dischargeDeferredReceiptObligation}. A caller that holds
+   * an obligation must read this and clear NOTHING of its own unless it says `unfenced`.
+   */
+  release: DeferredReceiptRelease
+}
+
+/**
+ * THE MARKER DECISION, TAKEN UNDER THE SALES-ORDER LOCK — never by the caller afterwards.
+ *
+ *   • `released`   — the exact generation this pass was handed is now cleared, inside the fence.
+ *   • `superseded` — a newer generation holds the marker, so it stands and this pass wrote nothing.
+ *   • `unwritable` — the clearing write failed; the marker stands.
+ *   • `retained`   — the fence found a receipt still awaiting registration, so nothing was cleared.
+ *   • `not-held`   — the caller handed over no obligation, so there was none to clear.
+ *   • `unfenced`   — the pass answered before the fence ran, on a fact no later receipt can change
+ *     (payments do not post on this connector at all; the order no longer exists). ONLY on this
+ *     answer may a caller clear a marker of its own.
+ */
+export type DeferredReceiptRelease =
+  | FollowUpObligationReleaseOutcome
+  | 'retained'
+  | 'not-held'
+  | 'unfenced'
+
+/**
+ * THE OBLIGATION THIS PASS HOLDS, so its final recheck and its release commit TOGETHER.
+ *
+ * Handed over by the caller rather than re-read here, for the reason o3d-0bfh r4 gives: a generation
+ * read inside this call is whichever one is live NOW, and clearing that is clearing an obligation
+ * somebody else claimed. `generation: null` means the caller never took one, and then the release
+ * writes nothing at all.
+ */
+export type DeferredReceiptObligation = {
+  /** The AccountingSyncLog row carrying `backReferenceFollowUpsPendingAt`. */
+  syncLogId: string
+  /** The connector whose obligation this is — used for the log line, never for the predicate. */
+  connector: string
+  /** The generation THIS pass claimed, in the transaction that made the row SYNCED. */
+  generation: Date | null
+  /** What re-drives an obligation this call leaves behind. Required — see the type's header. */
+  recovery: FollowUpObligationRecovery
+}
+
+/**
+ * How long the fence may wait for, and hold, the sales-order row lock. Deliberately SHORT: it wraps
+ * two reads and one update and nothing else, so a wait longer than this is contention, not work.
+ */
+const RECEIPT_FENCE_TX_OPTIONS = { maxWait: 5000, timeout: 10000 }
+
+// ---------------------------------------------------------------------------
+// THE FENCED RELEASE (o3d-0bfh r15, Codex HIGH) — WHY THE DURABLE READ WAS NECESSARY AND NOT
+// SUFFICIENT.
+//
+// r14 made the receipt path ask the durable state whether a deferred pass is in flight for its
+// order, and answer `held` — which refuses a hand settlement — whenever one is. The marker IS live
+// for the whole window in which an unpinned call can see a document that pass posted, and that much
+// of the r14 argument holds.
+//
+// What it does not establish is the thing the notice actually promises. THE MARKER ANSWERS "IS A
+// PASS IN FLIGHT", NOT "DID THAT PASS SEE THIS RECEIPT" — and the deferred pass's view of which
+// receipts exist is FIXED AT ITS OWN SNAPSHOT (`order.payments`, read once near the top, and re-used
+// by the verification at the bottom). So:
+//
+//   1. the pass reads the order and its receipts; there are two, both of which it will register;
+//   2. `addPayment` commits a THIRD receipt and calls this module with no pin. The document has
+//      posted, so the refusal is not DOCUMENT_NOT_POSTED; on any refusal both paths share it reads
+//      the marker, gets `held`, and reports "recovery is retained, do not settle by hand";
+//   3. the pass finishes its two, re-verifies AGAINST ITS OWN SNAPSHOT — which has two receipts in
+//      it — finds nothing awaiting, and answers `settled: true`;
+//   4. the caller clears the marker.
+//
+// The third receipt now has no sync row, no retained marker, and no pass that ever considered it,
+// while its operator has been told in terms not to register it by hand. That is the same permanently
+// missing customer payment r13 and r14 were closing, reached one step further along.
+//
+// SO THE RELEASE IS SERIALIZED AGAINST RECEIPT INSERTION, and the read is kept: they answer
+// different halves. `addPayment` creates its Payment row inside a transaction whose FIRST statement
+// is `lockSalesOrder(tx, orderId)`. This fence takes THE SAME LOCK, and inside it re-reads every
+// receipt on the order and every sync row for the pinned connector — not the pass's snapshot — and
+// clears the exact obligation generation in the SAME transaction. There is then no interleaving
+// left: either the receipt commits before the fence takes the lock, in which case the fence SEES it
+// and keeps the marker; or it commits after the fence has committed, in which case the marker it
+// goes on to read is ALREADY CLEARED and it is told the truth — nothing will come back, settle it by
+// hand. The window in step (2) exists only because the clearing write was outside the lock.
+//
+// WHY THE LOCK IS THIS SCOPE AND NO WIDER. The alternative weighed in r14 — serializing the whole
+// deferred pass — puts the connector's REMOTE calls inside a lock on the money path: an unreachable
+// ledger would then block every operator receipt on that order for the length of an HTTP timeout,
+// and a lock held across a network round trip is how the sweep and the live path deadlock. So the
+// registration loop above stays outside, exactly where it is, and only the recheck and the release
+// are fenced. That is sound because the loop is not what the guarantee is about: whatever it did or
+// failed to do is READ BACK from the rows inside the fence, through the same selector that chose the
+// work, and a receipt it never saw is exactly what the fence's re-read is for.
+//
+// FAILING TO TAKE THE FENCE IS `settled: false`. The transaction can fail — lock timeout, a dead
+// connection — and the catch in `registerDeferredOrderReceipts` turns that into a retained marker
+// and a row the sweep comes back to. One idempotent re-enqueue against a payment that never posts:
+// the asymmetry `followUpObligationClaim` was designed around, in the direction it was designed for.
+// ---------------------------------------------------------------------------
+
+/**
+ * Re-read every receipt on this order under the sales-order lock and, only if none awaits
+ * registration, clear the caller's obligation generation in the SAME transaction.
+ *
+ * Exported so the interleaving regression test can drive the fence directly rather than through a
+ * connector, and so nothing has to re-implement "is this order finished with?" a second time.
+ *
+ * NEVER re-reads the caller's snapshot. The `receipts` selection, the sync rows and the release are
+ * all inside one transaction that holds `lockSalesOrder`.
+ */
+export async function dischargeDeferredReceiptObligation(
+  orderId: string,
+  posted: PostedInvoiceEvidence,
+  obligation: DeferredReceiptObligation | null,
+): Promise<{ awaiting: number; release: DeferredReceiptRelease }> {
+  return db.$transaction(async (tx) => {
+    // THE SAME LOCK `addPayment` TAKES, and taken FIRST — see lib/domain/sales/allocation-service.
+    // A receipt cannot be inserted for this order while this is held, so the read below is the whole
+    // receipt set as of the moment the marker is cleared, not a snapshot from before the loop.
+    await lockSalesOrder(tx, orderId)
+    const receipts = await tx.payment.findMany({
+      // A refund payment settles a CREDIT NOTE, not this invoice — the same predicate the pass's own
+      // read uses, because a wider one here would hold the obligation open over a refund.
+      where: { orderId, refundId: null },
+      select: { id: true, amount: true, currency: true, method: true, reference: true, paidAt: true },
+      orderBy: { paidAt: 'asc' },
+    })
+    const awaiting = selectReceiptsAwaitingRegistration({
+      receipts,
+      // Read THROUGH the transaction, so a sync row a concurrent registration has just written is
+      // visible and serialised by the lock this holds.
+      existing: await loadInvoicePaymentSyncRows(orderId, posted.connector, tx),
+      accountingInvoiceId: posted.accountingInvoiceId,
+    })
+    // A receipt is still owed to the ledger, so the marker is the record of that and stays.
+    if (awaiting.length > 0) return { awaiting: awaiting.length, release: 'retained' as const }
+    // Nothing is awaiting and the caller holds no obligation to clear: some callers (a connector
+    // with no consumer for the marker) genuinely have none. Answered explicitly rather than as
+    // `released`, so "the marker is gone" is never claimed by a call that cleared nothing.
+    if (!obligation) return { awaiting: 0, release: 'not-held' as const }
+    const release = await releaseFollowUpObligation(tx, {
+      syncLogId: obligation.syncLogId,
+      connector: obligation.connector,
+      generation: obligation.generation,
+      recovery: obligation.recovery,
+    })
+    return { awaiting: 0, release }
+  }, RECEIPT_FENCE_TX_OPTIONS)
 }
 
 /**
@@ -377,15 +534,23 @@ export function invoicePaymentRemedyNote(redrive: InvoicePaymentRedrive): string
 // So the settlement licensed at (3) races the registration (4) schedules, which is the double
 // payment this whole round exists to prevent.
 //
-// WHY THE DURABLE STATE RATHER THAN A LOCK. The other way to close this is to serialize receipt
-// creation and registration against deferred-receipt selection and obligation release. That means
-// every operator-entered receipt taking a lock the connector holds across its whole follow-up span,
-// remote calls included — a far wider change than this branch has been making, and one that puts a
-// network round trip inside a lock on the money path. It is also unnecessary, because the state that
-// answers the question is ALREADY WRITTEN AND ALREADY READ HERE: the obligation marker is claimed at
-// step (1), STRICTLY BEFORE the back-reference write at step (2) that opens the window at all, and
-// it is cleared only once the deferred pass reports the receipts settled. For the whole of the
-// window in which an unpinned call can see a posted document from that pass, the marker is live.
+// THE DURABLE READ, AND A LOCK — BOTH, BECAUSE THEY ANSWER DIFFERENT HALVES (o3d-0bfh r15).
+//
+// The read is what makes the state legible to a caller that holds no pin: the obligation marker is
+// claimed at step (1), STRICTLY BEFORE the back-reference write at step (2) that opens the window at
+// all, so for the whole of the window in which an unpinned call can see a posted document from that
+// pass, the marker is live. That is true, and r14 stopped there.
+//
+// IT IS NOT SUFFICIENT, and the reason is the sentence this block used to end on. The marker answers
+// "IS A PASS IN FLIGHT". It does NOT answer "DID THAT PASS SEE THIS RECEIPT" — the pass's view of
+// which receipts exist is fixed at its own snapshot, so a receipt committing after that snapshot
+// reads `held`, is told its recovery is retained, and is then not in the set the pass verifies
+// against before its marker is cleared. So the RELEASE is serialized against receipt insertion:
+// `dischargeDeferredReceiptObligation` takes the same sales-order lock `addPayment` takes, re-reads
+// every current receipt and sync row inside it, and clears the exact generation in that same
+// transaction. What was rejected — and still is — is serializing the WHOLE pass, remote calls
+// included: that is what would put a network round trip inside a lock on the money path. Only the
+// recheck and the release are fenced, and the block above that function says why that suffices.
 //
 // TESTED FOR EXISTENCE ONLY. It is a generation, not a time — see the "WHAT
 // `backReferenceFollowUpsPendingAt` IS, AND WHAT IT IS NOT" block in
@@ -1188,7 +1353,28 @@ export async function registerInvoicePaymentWithLedger(params: {
 export async function registerDeferredOrderReceipts(
   orderId: string,
   posted: PostedInvoiceEvidence,
+  /**
+   * THE OBLIGATION THIS PASS HOLDS (o3d-0bfh r15, Codex HIGH). REQUIRED, and `null` is a statement
+   * rather than a default: the caller took no generation and therefore has nothing to clear. It is
+   * not optional, because a caller that forgot to pass it would go back to clearing the marker
+   * itself, outside the lock — which is the entire finding.
+   */
+  obligation: DeferredReceiptObligation | null,
 ): Promise<DeferredReceiptRedriveResult> {
+  /**
+   * Every exit whose truth a LATER RECEIPT COULD CHANGE goes through the fence, and the fence is
+   * what clears the marker. `reason` is what this pass believed on the way in; `settled` is what the
+   * fence found under the lock, which can disagree — a pass that had nothing to do can still find a
+   * receipt that arrived while it was running.
+   */
+  const discharge = async (
+    reason: DeferredReceiptRedriveResult['reason'],
+  ): Promise<DeferredReceiptRedriveResult> => {
+    const fenced = await dischargeDeferredReceiptObligation(orderId, posted, obligation)
+    return fenced.awaiting === 0
+      ? { settled: true, reason, release: fenced.release }
+      : { settled: false, reason: 'left-unregistered', awaiting: fenced.awaiting, release: fenced.release }
+  }
   try {
     // Does the PINNED connector post payments at all?
     //
@@ -1199,7 +1385,9 @@ export async function registerDeferredOrderReceipts(
     // own; it falls through, and the cheap certain facts below — no order, no receipts — still get
     // to say that nothing was owed either way.
     const paymentsPost = await isAccountingSyncTypeEnabledFor(posted.connector, 'INVOICE_PAYMENT').catch(() => null)
-    if (paymentsPost === false) return { settled: true, reason: 'sync-disabled' }
+    // UNFENCED, and safely so: nothing on this order will EVER be registered against this
+    // connector, so no receipt arriving later can make this answer wrong.
+    if (paymentsPost === false) return { settled: true, reason: 'sync-disabled', release: 'unfenced' }
     const order = await db.salesOrder.findUnique({
       where: { id: orderId },
       select: {
@@ -1215,14 +1403,19 @@ export async function registerDeferredOrderReceipts(
         },
       },
     })
-    if (!order) return { settled: true, reason: 'no-order' }
+    // UNFENCED: a Payment row requires this order to exist, so a receipt cannot arrive for one that
+    // does not.
+    if (!order) return { settled: true, reason: 'no-order', release: 'unfenced' }
     // Nothing was recorded before the invoice, so nothing is owed and the caller's obligation is
     // genuinely discharged. Asked BEFORE the link check on purpose: an order with no receipts must
     // not hold an obligation open over a back-reference that has nothing to do with money.
-    if (order.payments.length === 0) return { settled: true, reason: 'no-receipts' }
+    // FENCED (o3d-0bfh r15). "There were no receipts a moment ago" is exactly the snapshot claim the
+    // finding is about: a receipt committing between this read and the release would read a live
+    // marker and then have it cleared over it.
+    if (order.payments.length === 0) return await discharge('no-receipts')
     // Receipts exist and we could not find out whether they are meant to post. That is the one state
     // where nothing has been decided about them, so nothing may be discharged on their behalf.
-    if (paymentsPost === null) return { settled: false, reason: 'posting-context-unknown' }
+    if (paymentsPost === null) return { settled: false, reason: 'posting-context-unknown', release: 'retained' }
 
     // THE LINK NEVER LANDED (o3d-ekn8 r5, Codex HIGH). QuickBooks' `updateBackReference` catches its
     // own failure, so the invoice can post while the order is left with no accountingInvoiceId at
@@ -1253,7 +1446,7 @@ export async function registerDeferredOrderReceipts(
           receipts: order.payments.length,
         },
       }).catch(() => { /* logging must never block the follow-up */ })
-      return { settled: false, reason: 'not-linked', awaiting: order.payments.length }
+      return { settled: false, reason: 'not-linked', awaiting: order.payments.length, release: 'retained' }
     }
 
     // The order must still point at the document this post returned. It normally does — updateBackReference
@@ -1278,7 +1471,7 @@ export async function registerDeferredOrderReceipts(
           currentInvoiceId: order.accountingInvoiceId,
         },
       }).catch(() => { /* logging must never block the follow-up */ })
-      return { settled: false, reason: 'document-moved', awaiting: order.payments.length }
+      return { settled: false, reason: 'document-moved', awaiting: order.payments.length, release: 'retained' }
     }
 
     const awaiting = selectReceiptsAwaitingRegistration({
@@ -1292,7 +1485,8 @@ export async function registerDeferredOrderReceipts(
       // as spoken for, and the replacement invoice was never settled by anything.
       accountingInvoiceId: posted.accountingInvoiceId,
     })
-    if (awaiting.length === 0) return { settled: true, reason: 'nothing-awaiting' }
+    // FENCED for the same reason as `no-receipts`: this selection is over the snapshot.
+    if (awaiting.length === 0) return await discharge('nothing-awaiting')
 
     const orderReference = getSalesOrderReference(order)
     for (const receipt of awaiting) {
@@ -1319,14 +1513,17 @@ export async function registerDeferredOrderReceipts(
     // the work — scoped to the pinned connector and the pinned document, so a row queued under the
     // connector that was switched on mid-flight cannot answer for one that was not. A second, laxer
     // copy of "is this receipt spoken for?" is exactly what o3d-ekn8 r3 had to unpick.
-    const stillAwaiting = selectReceiptsAwaitingRegistration({
-      receipts: order.payments,
-      existing: await loadInvoicePaymentSyncRows(order.id, posted.connector),
-      accountingInvoiceId: posted.accountingInvoiceId,
-    })
-    return stillAwaiting.length === 0
-      ? { settled: true, reason: 'registered' }
-      : { settled: false, reason: 'left-unregistered', awaiting: stillAwaiting.length }
+    //
+    // AND IT IS READ OFF THE RECEIPTS THAT EXIST NOW, UNDER THE ORDER LOCK, WITH THE RELEASE IN THE
+    // SAME TRANSACTION (o3d-0bfh r15, Codex HIGH). This re-check used to re-run the selector over
+    // `order.payments` — the snapshot taken before the loop — so a receipt that committed while the
+    // loop was making its remote calls was invisible to it, and the marker it had already read as
+    // `held` was then cleared by the caller. See the block above `dischargeDeferredReceiptObligation`.
+    // AWAITED, not returned bare: a promise returned out of a `try` rejects OUTSIDE it, so a fence
+    // that cannot take the lock would escape this function's catch — and this function's contract is
+    // that it never throws, because a receipt it cannot register must not fail a sync entry whose
+    // invoice HAS posted. `return await` is load-bearing here, and a test proves it.
+    return await discharge('registered')
   } catch (error) {
     await logActivity({
       entityType: 'SALES_ORDER',
@@ -1340,6 +1537,6 @@ export async function registerDeferredOrderReceipts(
       }),
       metadata: { orderId, error: error instanceof Error ? error.message : String(error) },
     }).catch(() => { /* logging must never block the follow-up either */ })
-    return { settled: false, reason: 'failed' }
+    return { settled: false, reason: 'failed', release: 'retained' }
   }
 }

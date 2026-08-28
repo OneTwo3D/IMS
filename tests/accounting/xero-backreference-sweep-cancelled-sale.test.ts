@@ -218,7 +218,31 @@ mock.module('@/lib/connectors/woocommerce/sync/invoice-note', {
  * so the only variable left in these fixtures is `SalesOrder.status`.
  */
 mock.module('@/lib/domain/accounting/invoice-payment-enqueue', {
-  namedExports: { registerDeferredOrderReceipts: async () => ({ settled: true, reason: 'no-receipts' }) },
+  namedExports: {
+    registerDeferredOrderReceipts: async (
+      _orderId: string,
+      _posted: unknown,
+      obligation: { syncLogId: string; generation: Date | null } | null,
+    ) => {
+      // o3d-0bfh r15: AND IT CLEARS THE GENERATION IT WAS HANDED. The production re-drive takes the
+      // sales-order lock, re-reads the receipts, and releases the obligation IN THAT SAME
+      // TRANSACTION — so by the time the sweep writes its settlement stamp the marker column is
+      // already null. A stub that answered "settled" without doing so would leave the sweep fencing
+      // its stamp on a generation nothing holds any more, and every live-sale twin below would
+      // report a deferral that production never produces.
+      if (obligation?.generation) {
+        await store.delegate.updateMany({
+          where: { id: obligation.syncLogId, backReferenceFollowUpsPendingAt: obligation.generation },
+          data: { backReferenceFollowUpsPendingAt: null },
+        } as never)
+      }
+      return {
+        settled: true,
+        reason: 'no-receipts',
+        release: obligation?.generation ? 'released' : 'not-held',
+      }
+    },
+  },
 })
 
 async function loadSweep() {

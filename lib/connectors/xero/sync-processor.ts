@@ -3793,7 +3793,10 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
             // o3d-bqw7 r2: the row's COMPLETE origin record. This is the tombstone path — `payload` here
             // is `{}` — so the durable column is the only half that still names an organisation, and
             // without it the invoice PDF this enqueue raises could never post.
-            { payload, ...origin })
+            { payload, ...origin },
+            // o3d-0bfh r15: the generation this pass claimed, so the deferred-receipt re-drive can
+            // release it inside the same transaction as its final re-read under the order lock.
+            record.followUpObligation)
           await announceCompactedFollowUpLoss(entry)
           // o3d-ekn8 r5: and the release is gated on what the enqueue LEFT OWED as well as on the
           // announcement, for the same reason — the marker must never be discharged on the strength
@@ -3924,7 +3927,10 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
           await updateBackReference(entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber)
           const followUps = await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, syncResult,
             // The record this post was made under, read in the same statement as the payload.
-            { payload, ...origin })
+            { payload, ...origin },
+            // o3d-0bfh r15: the generation this pass claimed, so the deferred-receipt re-drive can
+            // release it inside the same transaction as its final re-read under the order lock.
+            persisted.followUpObligation)
           // o3d-ekn8 r5: released only if the receipts recorded before this invoice reached the
           // ledger. The re-drive never throws, so that failure was arriving here as success. This
           // supersedes the bare releaseFollowUpObligation: an unsettled receipt now retains the marker.
@@ -4351,7 +4357,10 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
             // o3d-bqw7 r2: the row's COMPLETE origin record. This is the tombstone path — `payload` here
             // is `{}` — so the durable column is the only half that still names an organisation, and
             // without it the invoice PDF this enqueue raises could never post.
-            { payload, ...origin })
+            { payload, ...origin },
+            // o3d-0bfh r15: the generation this pass claimed, so the deferred-receipt re-drive can
+            // release it inside the same transaction as its final re-read under the order lock.
+            record.followUpObligation)
           await announceCompactedFollowUpLoss(entry)
           // o3d-ekn8 r5: and the release is gated on what the enqueue LEFT OWED as well as on the
           // announcement, for the same reason — the marker must never be discharged on the strength
@@ -4505,7 +4514,10 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
           await updateBackReference(entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber)
           const followUps = await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, syncResult,
             // The record this post was made under, read in the same statement as the payload.
-            { payload, ...origin })
+            { payload, ...origin },
+            // o3d-0bfh r15: the generation this pass claimed, so the deferred-receipt re-drive can
+            // release it inside the same transaction as its final re-read under the order lock.
+            persisted.followUpObligation)
           // o3d-ekn8 r5: released only if the receipts recorded before this invoice reached the
           // ledger. The re-drive never throws, so that failure was arriving here as success. This
           // supersedes the bare releaseFollowUpObligation: an unsettled receipt now retains the marker.
@@ -6728,6 +6740,16 @@ export async function reenqueueMissingCreditNoteAllocations(limit = 200): Promis
 type FollowUpOutcome = {
   /** False when a receipt recorded before this invoice is still waiting to reach the ledger. */
   deferredReceiptsSettled: boolean
+  /**
+   * TRUE WHEN THE DEFERRED PASS ALREADY TOOK THE MARKER DECISION ITSELF (o3d-0bfh r15, Codex HIGH).
+   *
+   * The re-drive now re-reads the order's receipts UNDER THE SALES-ORDER LOCK and clears the exact
+   * obligation generation in that same transaction, because a receipt that commits after its
+   * snapshot would otherwise read a live marker and then have it cleared over it. So when this is
+   * true the release has already happened (or was deliberately withheld) and `settleFollowUpObligation`
+   * must clear NOTHING — a second, unfenced clear here would re-open the very window the fence closes.
+   */
+  obligationFenced: boolean
 }
 
 /**
@@ -6748,6 +6770,11 @@ async function settleFollowUpObligation(
   obligation: Date | null,
 ): Promise<void> {
   if (followUps.deferredReceiptsSettled) {
+    // ALREADY DISCHARGED, UNDER THE ORDER LOCK (o3d-0bfh r15, Codex HIGH). The deferred-receipt pass
+    // clears the generation inside the same transaction as its final re-read, which is the only
+    // ordering in which a receipt arriving mid-pass cannot be settled over. Clearing it a second
+    // time here would be the unfenced write the fence exists to remove.
+    if (followUps.obligationFenced) return
     // The release is fenced on `obligation`; a `superseded` answer means a sweep (or a later post)
     // has claimed a NEWER generation since, so its obligation stands and this pass writes nothing.
     // Not an error for this entry — its own follow-ups did run — and the helper says so on the log.
@@ -6828,8 +6855,18 @@ async function enqueueSalesInvoiceFollowUps(
   payload: SyncPayload,
   syncResult: { externalId?: string; invoiceNumber?: string },
   origin: AccountingOriginRecord,
+  /**
+   * THE OBLIGATION GENERATION THIS PASS CLAIMED (o3d-0bfh r15, Codex HIGH), threaded down to the
+   * deferred-receipt re-drive so its final re-read and its release commit in ONE transaction under
+   * the sales-order lock. `null` means this pass never took one and may therefore clear nothing.
+   *
+   * It travels IN rather than being re-read at the bottom, for the reason r4 gives: a generation
+   * read after the work is whichever one is live NOW, and clearing that clears somebody else's
+   * obligation.
+   */
+  followUpObligation: Date | null,
 ): Promise<FollowUpOutcome> {
-  if (referenceType !== 'SalesOrder' || !syncResult.externalId) return { deferredReceiptsSettled: true }
+  if (referenceType !== 'SalesOrder' || !syncResult.externalId) return { deferredReceiptsSettled: true, obligationFenced: false }
   // Captured once, so the id handed to the deferred re-drive below is provably the one THIS post
   // returned rather than a re-read of a narrowed property.
   const postedInvoiceId: string = syncResult.externalId
@@ -6910,11 +6947,26 @@ async function enqueueSalesInvoiceFollowUps(
   // AND THE ANSWER IS CARRIED BACK (o3d-ekn8 r5, Codex HIGH). It is awaited but never allowed to
   // throw, which meant "it returned" was indistinguishable from "the receipts reached the ledger" —
   // and the caller discharges a durable obligation on that answer.
+  //
+  // AND THE OBLIGATION GOES IN WITH IT (o3d-0bfh r15, Codex HIGH). The re-drive's final re-read of
+  // the order's receipts and the clearing of this generation now happen in ONE transaction holding
+  // the sales-order lock, because a receipt committing after the re-drive's snapshot would otherwise
+  // read a live marker — and be told its recovery is retained — and then have that marker cleared
+  // by this caller over it.
   const redrive = await registerDeferredOrderReceipts(referenceId, {
     connector: 'xero',
     accountingInvoiceId: postedInvoiceId,
+  }, {
+    syncLogId: entryId,
+    connector: XERO_CONNECTOR,
+    generation: followUpObligation,
+    // The same registry answer `settleFollowUpObligation` reads, for the same reason: what re-drives
+    // a retained obligation is a declared fact about the connector, never a sentence written here.
+    recovery: followUpObligationRecoveryFor(XERO_CONNECTOR),
   })
-  return { deferredReceiptsSettled: redrive.settled }
+  // `unfenced` is the one answer that leaves the marker to this caller: the re-drive returned on a
+  // fact no later receipt can change (payments do not post at all; the order is gone).
+  return { deferredReceiptsSettled: redrive.settled, obligationFenced: redrive.release !== 'unfenced' }
 }
 
 async function enqueuePurchaseInvoiceFollowUps(
@@ -6999,19 +7051,29 @@ async function enqueueFollowUps(
    * honour.
    */
   origin: AccountingOriginRecord,
+  /**
+   * THE OBLIGATION GENERATION THIS PASS CLAIMED (o3d-0bfh r15, Codex HIGH), threaded down to the
+   * deferred-receipt re-drive so its final re-read and its release commit in ONE transaction under
+   * the sales-order lock. `null` means this pass never took one and may therefore clear nothing.
+   *
+   * It travels IN rather than being re-read at the bottom, for the reason r4 gives: a generation
+   * read after the work is whichever one is live NOW, and clearing that clears somebody else's
+   * obligation.
+   */
+  followUpObligation: Date | null,
 ): Promise<FollowUpOutcome> {
   if (type === 'SALES_INVOICE') {
-    return enqueueSalesInvoiceFollowUps(entryId, referenceType, referenceId, payload, syncResult, origin)
+    return enqueueSalesInvoiceFollowUps(entryId, referenceType, referenceId, payload, syncResult, origin, followUpObligation)
   }
 
   if (type === 'PURCHASE_INVOICE') {
     await enqueuePurchaseInvoiceFollowUps(entryId, referenceType, referenceId, payload, syncResult, origin)
-    return { deferredReceiptsSettled: true }
+    return { deferredReceiptsSettled: true, obligationFenced: false }
   }
 
   if (type === 'PURCHASE_CREDIT_NOTE') {
     await enqueuePurchaseCreditNoteFollowUps(entryId, referenceType, referenceId, payload, syncResult, origin)
-    return { deferredReceiptsSettled: true }
+    return { deferredReceiptsSettled: true, obligationFenced: false }
   }
 
   if (type === 'INVOICE_PDF' && referenceType === 'SalesOrder') {
@@ -7037,5 +7099,5 @@ async function enqueueFollowUps(
   }
   // Every remaining type enqueues rows that carry their own document id in the payload; none of them
   // has a deferred receipt waiting on it.
-  return { deferredReceiptsSettled: true }
+  return { deferredReceiptsSettled: true, obligationFenced: false }
 }

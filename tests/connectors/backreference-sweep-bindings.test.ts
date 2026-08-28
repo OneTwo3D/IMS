@@ -57,11 +57,21 @@ const logActivityPersisted = async () => true
 //     benign shape for every call so that no branch of the enqueue can be the thing this test is
 //     really measuring.
 // ---------------------------------------------------------------------------
-const deferredReceipts = { settled: true }
+const deferredReceipts = { settled: true, obligation: null as { syncLogId: string; generation: Date | null } | null }
 
 mock.module('@/lib/domain/accounting/invoice-payment-enqueue', {
   namedExports: {
-    registerDeferredOrderReceipts: async () => ({ settled: deferredReceipts.settled }),
+    // o3d-0bfh r15: the OBLIGATION the binding handed down is recorded. It is the value the re-drive
+    // clears under the sales-order lock, so a binding that dropped it would leave the marker to be
+    // cleared unfenced by the caller — the finding — with `settled` still travelling correctly.
+    registerDeferredOrderReceipts: async (
+      _orderId: string,
+      _posted: unknown,
+      obligation: { syncLogId: string; generation: Date | null } | null,
+    ) => {
+      deferredReceipts.obligation = obligation
+      return { settled: deferredReceipts.settled, reason: 'registered', release: 'released' }
+    },
   },
 })
 
@@ -149,6 +159,9 @@ test('[o3d-9kek] the Xero sweep binding passes a persisted cursor store and the 
 // BOTH pass under it, and the unsettled test below FAILS. That is the whole finding.
 // ---------------------------------------------------------------------------
 
+/** The generation the sweep claims before its enqueue — the value that must reach the re-drive. */
+const SWEEP_GENERATION = new Date('2026-08-01T00:00:00.000Z')
+
 test('[o3d-0bfh r2] an UNSETTLED deferred receipt reaches the sweep unchanged through the binding', async () => {
   captured.length = 0
   deferredReceipts.settled = false
@@ -166,9 +179,11 @@ test('[o3d-0bfh r2] an UNSETTLED deferred receipt reaches the sweep unchanged th
     payload: Record<string, unknown>,
     syncResult: { externalId?: string; invoiceNumber?: string },
     origin: { payload: unknown; connectionProvenance: string | null; backReferenceEvidenceCompactedAt: Date | null },
-  ) => Promise<{ deferredReceiptsSettled: boolean }>
+    followUpObligation: Date | null,
+  ) => Promise<{ deferredReceiptsSettled: boolean; obligationFenced: boolean }>
   assert.equal(typeof enqueueFollowUps, 'function')
 
+  deferredReceipts.obligation = null
   const outcome = await enqueueFollowUps(
     'log-1', 'SALES_INVOICE', 'SalesOrder', 'so-1', {}, { externalId: 'XINV-1' },
     // The seventh argument is the posting row's ORIGIN record (o3d-bqw7 r2). It is supplied because
@@ -176,13 +191,23 @@ test('[o3d-0bfh r2] an UNSETTLED deferred receipt reaches the sweep unchanged th
     // SETTLEMENT ANSWER survives the seam, and an origin that records nothing is the least
     // interesting one to send through it.
     { payload: {}, connectionProvenance: null, backReferenceEvidenceCompactedAt: null },
+    // o3d-0bfh r15: the EIGHTH is the obligation generation the sweep claimed. It has to reach the
+    // re-drive, because that is what clears the marker inside the order lock.
+    SWEEP_GENERATION,
   )
 
   assert.deepEqual(
     outcome,
-    { deferredReceiptsSettled: false },
+    { deferredReceiptsSettled: false, obligationFenced: true },
     'the sweep discharges a durable money obligation on this answer: an adapter that hardcoded true '
       + 'here is the exact regression o3d-0bfh fixed, and it would be invisible to every other test',
+  )
+  assert.deepEqual(
+    deferredReceipts.obligation,
+    { syncLogId: 'log-1', connector: 'xero', generation: SWEEP_GENERATION, recovery: { consumer: 'sweep' } },
+    'o3d-0bfh r15: and the GENERATION reaches the re-drive, which is what lets the release be taken '
+      + 'inside the same transaction as the receipt re-read. A binding that dropped it would leave '
+      + 'the marker to be cleared outside the lock, which is the whole finding.',
   )
   // The real implementation was reached rather than something that short-circuits before the
   // re-drive: an enqueue that never ran could report false for the wrong reason.
@@ -200,11 +225,11 @@ test('[o3d-0bfh r2] and a SETTLED one is not turned into a refusal either', asyn
 
   const enqueueFollowUps = captured[0].deps.enqueueFollowUps as (
     ...args: unknown[]
-  ) => Promise<{ deferredReceiptsSettled: boolean }>
+  ) => Promise<{ deferredReceiptsSettled: boolean; obligationFenced: boolean }>
   const outcome = await enqueueFollowUps('log-1', 'SALES_INVOICE', 'SalesOrder', 'so-1', {}, { externalId: 'XINV-1' },
-    { payload: {}, connectionProvenance: null, backReferenceEvidenceCompactedAt: null })
+    { payload: {}, connectionProvenance: null, backReferenceEvidenceCompactedAt: null }, SWEEP_GENERATION)
 
-  assert.deepEqual(outcome, { deferredReceiptsSettled: true })
+  assert.deepEqual(outcome, { deferredReceiptsSettled: true, obligationFenced: true })
 })
 
 test('[o3d-9kek r6] QuickBooks exports NO back-reference sweep binding, and never runs the sweep', async () => {

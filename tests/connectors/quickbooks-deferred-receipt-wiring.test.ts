@@ -87,6 +87,16 @@ const receipts = [
   { id: 'pay-1', amount: 100, currency: 'GBP', method: 'card', reference: null as string | null, paidAt: new Date('2026-08-01T00:00:00.000Z') },
 ]
 
+/**
+ * o3d-0bfh r15 — RECEIPTS THAT COMMIT AFTER THE PASS HAS READ THE ORDER.
+ *
+ * `salesOrder.findUnique` serves the pass's SNAPSHOT (`receipts` alone); `payment.findMany` — the
+ * read the FENCED release makes under the sales-order lock — serves the snapshot PLUS these. That is
+ * exactly the interleaving the finding is about, and it is expressible only because the two reads
+ * are separate: a fixture where the fence re-used the snapshot could not tell the fix from the bug.
+ */
+const lateReceipts: typeof receipts = []
+
 const accountingSyncLog = new Proxy({}, {
   get: (_target, prop: string) => (args: never) => {
     // Record WHICH connector's rows the registration path asked for. Scoping this to the active
@@ -105,6 +115,10 @@ const dbStub = {
   },
   payment: {
     findUnique: async ({ where }: { where: { id: string } }) => receipts.find((r) => r.id === where.id) ?? null,
+    // o3d-0bfh r15: the FENCED release re-reads the order's receipts under the sales-order lock,
+    // rather than re-using the snapshot the pass started from — so it, and only it, sees a receipt
+    // that committed while the pass was making its remote calls.
+    findMany: async () => [...receipts, ...lateReceipts],
   },
   // The advisory locks the enqueue takes. No-ops here, but they must ANSWER or the registration dies
   // before queueing anything and the assertion below would read zero for the wrong reason.
@@ -282,6 +296,7 @@ test.beforeEach(() => {
   order.totalForeign = 100
   // The state the defect lives in: the receipt exists, the invoice does NOT yet.
   order.accountingInvoiceId = null
+  lateReceipts.length = 0
 })
 
 async function runQuickBooks() {
@@ -306,7 +321,12 @@ test('[o3d-ekn8] a receipt recorded before the QuickBooks invoice posted IS regi
   // o3d-ekn8 r5. Stated HERE so the two retention tests below are not vacuous: on the path where the
   // receipt really does reach the ledger the obligation IS discharged, so an empty `released` in
   // those tests is a difference this harness can actually express.
-  assert.deepEqual(released, ['entry-invoice'], 'and the row stops saying it owes follow-ups')
+  assert.deepEqual(
+    released, ['entry-invoice'],
+    'and the row stops saying it owes follow-ups — EXACTLY ONCE (o3d-0bfh r15): the release is the '
+      + "fenced pass's, taken under the sales-order lock, and a caller that cleared the marker again "
+      + 'afterwards would be the unfenced second clearing path the fence exists to remove',
+  )
 })
 
 test('[o3d-ekn8] the re-drive runs the real guard — a receipt that cannot fit the invoice is NOT registered', async () => {
@@ -379,10 +399,15 @@ test('[o3d-ekn8 r2] the sync rows are read for the connector that POSTED, so a r
   await runQuickBooks()
 
   assert.equal(order.accountingInvoiceId, 'QBINV-9', 'precondition: the invoice really did post')
+  // o3d-0bfh r15: the re-drive now reads the sync rows TWICE — once to select the work, and once
+  // more inside the fenced release, under the sales-order lock. Both must name the connector that
+  // POSTED, so the property is asserted over every read rather than over their number: it is which
+  // ledger is asked about that decides whether a receipt is paid twice, not how often.
+  assert.ok(paymentRowScopes.length > 0, 'the capacity read really happened')
   assert.deepEqual(
-    paymentRowScopes,
+    [...new Set(paymentRowScopes)],
     ['quickbooks'],
-    'the capacity read names the connector the post was made against',
+    'every capacity read names the connector the post was made against, never the active one',
   )
   assert.deepEqual(
     queued.filter((row) => row.type === 'INVOICE_PAYMENT'),
@@ -507,4 +532,38 @@ test('[o3d-ekn8 r5] a connector switch mid-re-drive KEEPS the follow-up obligati
     /still not registered in the ledger/,
     'and it says which of the two halves is outstanding',
   )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-0bfh r15 (Codex HIGH) — END TO END, THROUGH THE CONNECTOR: A RECEIPT THAT ARRIVES WHILE THE
+// PASS IS RUNNING MUST NOT HAVE THE MARKER CLEARED OVER IT.
+//
+// The receipt path reads the obligation marker and, finding one live, tells the operator that
+// recovery is retained and refuses a hand settlement. That is only true if the pass whose marker it
+// read is going to consider THIS receipt — and the pass's view was fixed at its own snapshot. So the
+// release is taken under the same sales-order lock `addPayment` takes, over a re-read of the
+// receipts that exist now, in one transaction.
+// ---------------------------------------------------------------------------
+
+test('[o3d-0bfh r15] a receipt that commits after the pass read the order keeps the QuickBooks obligation', async () => {
+  // It commits while the pass is registering pay-1 — after `salesOrder.findUnique`, and with no sync
+  // row of its own. Only the fenced re-read can see it.
+  lateReceipts.push({ id: 'pay-late', amount: 0.01, currency: 'GBP', method: 'card', reference: null, paidAt: new Date('2026-08-02T00:00:00.000Z') })
+
+  await runQuickBooks()
+
+  assert.equal(order.accountingInvoiceId, 'QBINV-9', 'precondition: the invoice really did post')
+  assert.equal(
+    queued.filter((row) => row.type === 'INVOICE_PAYMENT').length, 1,
+    'precondition: the pass did its own work — the receipt it snapshotted was registered',
+  )
+  assert.deepEqual(
+    released, [],
+    'THE LOAD-BEARING ASSERTION: the obligation marker is NOT cleared. pay-late read it as live and '
+      + 'was told its recovery is retained; clearing it here is what made that a lie, and left a '
+      + 'recorded customer payment with no sync row, no marker and nothing coming back for it.',
+  )
+  const retained = activity.filter((entry) => entry.action === 'quickbooks_followup_obligation_retained')
+  assert.equal(retained.length, 1, 'and the row is announced as still owing follow-ups')
+  assert.equal(retained[0].level, 'ERROR', 'money outstanding, not just a local link')
 })

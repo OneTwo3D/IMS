@@ -353,6 +353,12 @@ function repairOutsideCustody(): number {
   return matched.length
 }
 
+/**
+ * The sales order the SALES_INVOICE subject points at, or `null` for every other fixture in this file
+ * (which is what `salesOrder.findUnique` answered before o3d-0bfh r15 added the sales-invoice case).
+ */
+let salesOrderRow: Record<string, unknown> | null = null
+
 const db = {
   accountingSyncLog: syncLogClient,
   // o3d-19gy: the processor asks which accounting connection is live before it posts anything, and
@@ -364,7 +370,14 @@ const db = {
   // honest answer is "none" — not a missing model.
   activityLog: { async findMany() { return [] }, async create(args: { data: unknown }) { return args.data } },
   purchaseInvoice: billClient,
-  salesOrder: { async findUnique() { return null }, async update() { return {} } },
+  salesOrder: {
+    async findUnique() { return salesOrderRow },
+    async update(args: { data: Record<string, unknown> }) {
+      Object.assign(salesOrderRow ?? {}, args.data)
+      record('backReference.written', args.data)
+      return salesOrderRow
+    },
+  },
   salesOrderRefund: { async findUnique() { return null }, async update() { return {} } },
   supplierCreditNote: { async findUnique() { return null }, async update() { return {} } },
   integrationOutbox: outboxClient,
@@ -406,6 +419,43 @@ mock.module('@/lib/domain/accounting/accounting-event-mirror', {
 // The FRESH-POST branch — the one the finding named by line — needs a connector call to succeed.
 // Only these two are stubbed, so everything between "the ledger accepted it" and "the follow-ups are
 // enqueued" is the real production code.
+/**
+ * o3d-0bfh r15 — THE DEFERRED-RECEIPT RE-DRIVE, DOUBLED FAITHFULLY ON ITS NEW HALF.
+ *
+ * Production's re-drive re-reads the order's receipts UNDER THE SALES-ORDER LOCK and clears the
+ * obligation generation it was handed IN THAT SAME TRANSACTION. The double therefore does the
+ * clearing write too — through the same `updateMany` the journal records — because the property
+ * under test here is that NOTHING ELSE clears it afterwards. A double that only answered "settled"
+ * would leave the caller's own release looking like the only one, which is the shape being removed.
+ */
+const deferredReceipts = {
+  obligation: null as { syncLogId: string; generation: Date | null } | null,
+}
+
+mock.module('@/lib/domain/accounting/invoice-payment-enqueue', {
+  namedExports: {
+    registerDeferredOrderReceipts: async (
+      _orderId: string,
+      _posted: unknown,
+      obligation: { syncLogId: string; generation: Date | null } | null,
+    ) => {
+      deferredReceipts.obligation = obligation
+      // NO ORDER, NO FENCE. Production returns `no-order` UNFENCED — a Payment row cannot exist for
+      // an order that does not, so no later receipt can make that answer wrong — and leaves the
+      // marker to the caller. The tombstone fixtures in this file are exactly that case, and a
+      // double that cleared regardless would silently rewrite what they are testing.
+      if (salesOrderRow === null) return { settled: true, reason: 'no-order', release: 'unfenced' }
+      if (obligation?.generation) {
+        await syncLogClient.updateMany({
+          where: { id: obligation.syncLogId, backReferenceFollowUpsPendingAt: obligation.generation },
+          data: { backReferenceFollowUpsPendingAt: null },
+        })
+      }
+      return { settled: true, reason: 'registered', release: obligation?.generation ? 'released' : 'not-held' }
+    },
+  },
+})
+
 mock.module('@/lib/connectors/xero/auth', {
   namedExports: { getGrantedScopes: async () => null },
 })
@@ -463,6 +513,8 @@ function reset(connector = 'xero') {
   state.raceBeforeRelease = null
   state.unpersistableActivityActions.clear()
   state.failBackReferenceWrite = false
+  salesOrderRow = null
+  deferredReceipts.obligation = null
 }
 
 /** The single sync row under test (the follow-up rows the run creates are appended after it). */
@@ -1623,4 +1675,76 @@ test('[o3d-0bfh r7] a FAILED row that never reached SYNCED is aged on createdAt,
     inTheOperatorBacklog(fresh, 0), false,
     'and one created seconds ago is not — the createdAt branch is a real age too, not an unconditional pass',
   )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-0bfh r15 (Codex HIGH) — ON THE SALES-INVOICE PATH THE RELEASE IS THE RE-DRIVE'S, AND THE
+// CALLER MUST NOT TAKE IT AGAIN.
+//
+// The re-drive now clears the obligation generation inside the same transaction as its final re-read
+// of the order's receipts, under the sales-order lock — because a receipt committing after its
+// snapshot would otherwise read a live marker, be told its recovery is retained, and then have that
+// marker cleared over it. A caller that goes on to clear the marker AFTERWARDS is a second,
+// UNFENCED clearing path: it is the write the fence exists to remove, and on the run where the
+// generations happen to differ it is the write that loses the receipt.
+// ---------------------------------------------------------------------------
+
+function salesInvoiceSubject() {
+  reset()
+  salesOrderRow = { id: 'so-1', accountingInvoiceId: null, customerEmail: null, shoppingLinks: [] }
+  Object.assign(state.syncRows[0], {
+    type: 'SALES_INVOICE',
+    referenceType: 'SalesOrder',
+    referenceId: 'so-1',
+    externalTransactionId: 'XINV-1',
+    payload: { invoiceNumber: 'INV-1' },
+  })
+}
+
+/** Every write that CLEARS the obligation marker, in order. */
+function markerClears() {
+  return state.journal.filter((entry) => entry.op === 'syncLog.updateMany'
+    && entry.data?.backReferenceFollowUpsPendingAt === null)
+}
+
+test('[o3d-0bfh r15] the Xero sales-invoice post hands its GENERATION to the re-drive', async () => {
+  salesInvoiceSubject()
+
+  const result = await runDirect()
+
+  assert.equal(result.succeeded, 1)
+  const claimed = assertObligationClaimedWithTheSyncedWrite('syncLog.updateMany').data?.backReferenceFollowUpsPendingAt
+  assert.deepEqual(
+    deferredReceipts.obligation,
+    { syncLogId: 'log-1', connector: 'xero', generation: claimed, recovery: { consumer: 'sweep' } },
+    'the re-drive is given the generation THIS pass minted, which is what lets it clear the marker '
+      + 'inside the same transaction as its receipt re-read — the whole of o3d-0bfh r15',
+  )
+})
+
+test('[o3d-0bfh r15] and the marker is cleared ONCE, by the fenced pass, not again by the caller', async () => {
+  salesInvoiceSubject()
+
+  await runDirect()
+
+  assert.equal(
+    markerClears().length, 1,
+    'exactly one write clears the marker. A second one here is an UNFENCED clearing path outside the '
+      + 'sales-order lock — the write o3d-0bfh r15 removed — and it reports a false "the obligation '
+      + 'marker has been re-claimed since" on every successful post besides.',
+  )
+  assert.equal(subject().backReferenceFollowUpsPendingAt, null, 'and the obligation really is discharged')
+})
+
+test('[o3d-0bfh r15] CONTROL: a path with no deferred receipt still has its marker cleared by the caller', async () => {
+  // The bill subject never reaches the re-drive, so `obligationFenced` is false and the caller's own
+  // release is the only one there is. Without this, the assertion above is also satisfied by a
+  // connector that stopped releasing anything at all.
+  reset()
+
+  await runDirect()
+
+  assert.equal(deferredReceipts.obligation, null, 'the re-drive was never reached on this path')
+  assert.equal(markerClears().length, 1)
+  assert.equal(subject().backReferenceFollowUpsPendingAt, null)
 })
