@@ -9,9 +9,11 @@ import pg from 'pg'
 import {
   DatabaseUrlSchemaConflictError,
   SESSION_LOCK_DATABASE_URL_ENV,
+  SESSION_LOCK_SPACE_PROBE_NAMESPACE,
   establishStartupOptionByteSafety,
   pgConnectionConfig,
   pgSessionLockConnectionConfig,
+  resetSessionLockSpaceMeasurements,
   resetStartupOptionByteSafety,
 } from '../../lib/db/database-url-schema.mjs'
 
@@ -397,5 +399,419 @@ test('o3d-a5zz: an unset or blank override changes nothing', () => {
   for (const empty of [undefined, null, '', '   ']) {
     const config = pgSessionLockConnectionConfig(base, empty as string | undefined)
     assert.match(config.connectionString, /127\.0\.0\.1:5432/)
+  }
+})
+
+// ---------------------------------------------------------------------------
+// o3d-2k5r r26, Codex HIGH: MATCHING DATABASE AND SCHEMA NAMES ARE NOT AN INSTANCE.
+//
+// The override validation compared the decoded database pathname and the resolved schema and
+// nothing else — host and port cannot be compared, since differing is the whole point of the
+// override — so `postgres://pooler/ims?schema=public` and `postgres://somewhere-else/ims?schema=public`
+// were equal on every field it looked at. The affinity leg then passes, because the unrelated
+// server IS reached directly. Every session lock in the process would be taken there, every holder
+// told it holds it, and `withMoneyPostLock` — which spans a ledger read and an EXTERNAL money post
+// — would let two workers pay the same document.
+//
+// What replaces it is not a better identifier. It is the PROPERTY the lock actually needs: a
+// session advisory lock taken through the override must be VISIBLE to a connection made through
+// DATABASE_URL. Measured on this host (PostgreSQL 17.11) while writing r26, which is why an
+// identifier is not used:
+//
+//   • a `pg_basebackup` clone of the live cluster reported the SAME pg_control_system() system
+//     identifier as its origin (7624286827215704424), the same database name, the same schema and
+//     the same database oid (16385) — and an independently initdb-ed cluster also reported oid
+//     16385. A system identifier admits the restored clone; a database oid admits both.
+//   • against that clone the property answers correctly: the witness ACQUIRED the key, so the
+//     override is refused.
+//   • and it does not falsely refuse the deployment it exists for: through PgBouncer 1.24.1 in
+//     `pool_mode = transaction`, with and without the `-c search_path="public"` startup option,
+//     the witness was blocked and the override admitted.
+// ---------------------------------------------------------------------------
+
+/** The database name both URLs of a wrongly-pointed override agree on. */
+function sameNamesDifferentEndpoint(base: string, port: number): string {
+  const url = new URL(base)
+  url.hostname = '127.0.0.1'
+  url.port = String(port)
+  url.searchParams.set('schema', ASCII_SCHEMA)
+  return url.toString()
+}
+
+/** The one property a stand-in has to have: it answers, and it records what it was asked. */
+function standInConnector(answers: { taken?: unknown; acquired?: unknown }) {
+  const asked: string[] = []
+  const dialled: string[] = []
+  const createClient = async (config: object) => {
+    dialled.push(String((config as { connectionString?: unknown }).connectionString ?? ''))
+    return {
+      async connect() { return undefined },
+      async query(text: string) {
+        asked.push(text)
+        if (text.includes('pg_try_advisory_lock')) return { rows: [{ taken: answers.taken ?? true }] }
+        if (text.includes('pg_try_advisory_xact_lock')) return { rows: [{ acquired: answers.acquired }] }
+        return { rows: [{}] }
+      },
+      async end() { return undefined },
+    }
+  }
+  return { createClient, asked, dialled }
+}
+
+test('[o3d-2k5r r26] an override on a DIFFERENT instance with the SAME database and schema names is REFUSED', async () => {
+  resetSessionLockSpaceMeasurements()
+  // Both URLs name the database `ims` and resolve to `public`. Every comparison the r25 check made
+  // says these agree. The DATABASE_URL side then ACQUIRES the key the override side is holding,
+  // which is what a second PostgreSQL looks like and what nothing but taking the lock can see.
+  const base = 'postgresql://app:pw@pooler.internal:6432/ims?schema=public'
+  const override = 'postgresql://app:pw@10.9.9.9:5432/ims?schema=public'
+  const { createClient, asked, dialled } = standInConnector({ taken: true, acquired: true })
+  const config = pgSessionLockConnectionConfig(base, override, 'the money-post lock', { createClient })
+
+  // ROUTE: createSessionAdvisoryLockPool() -> pgSessionLockConnectionConfig() -> pg-pool's
+  // onConnect -> the affinity leg (which PASSES here: the stand-in below answers as a direct
+  // connection) -> the shared-lock-space probe -> refusal, before pg_try_advisory_lock is sent for
+  // any real lock.
+  //
+  // MUTATION ROUTE: delete `if (sharedLockSpace) await sharedLockSpace()` from
+  // `sessionLockAffinityGuard()`, or restore the r25 `return { ...config, onConnect:
+  // sessionLockAffinityGuard(config.onConnect, purpose) }`. The pool connects to the unrelated
+  // server, every lock is taken there, and this resolves instead of rejecting.
+  const { client } = directStandIn()
+  await assert.rejects(
+    () => (config.onConnect as (c: unknown) => Promise<void>)(client),
+    (error: unknown) => {
+      assert.ok(error instanceof DatabaseUrlSchemaConflictError, `expected a schema/lock-space refusal, got ${String(error)}`)
+      const message = (error as Error).message
+      assert.match(message, new RegExp(SESSION_LOCK_DATABASE_URL_ENV), 'the refusal names the variable that is wrong')
+      assert.match(message, /does NOT share an advisory-lock space/, 'and what was measured')
+      // LOUD AND ACTIONABLE: an operator who did this has created a silent double-pay, and the
+      // message has to say so or it reads as a connection problem.
+      assert.match(message, /pay the same document twice/, 'and what it costs, in money rather than in connections')
+      assert.match(message, /only symptom/, 'and that nothing else will report it')
+      assert.match(message, /WHAT TO CHANGE/, 'and what to do about it')
+      assert.match(message, /pg_control_system\(\) system identifier/, 'and why matching names — or a system identifier — were not enough')
+      return true
+    },
+  )
+
+  // NOT VACUOUS: the refusal came from a lock that was really taken and a key that was really
+  // asked for, on two connections that were really dialled — one per URL.
+  assert.ok(asked.some((text) => text.startsWith(`select pg_try_advisory_lock(${SESSION_LOCK_SPACE_PROBE_NAMESPACE},`)), `the holder took the probe key; it asked ${JSON.stringify(asked)}`)
+  assert.ok(asked.some((text) => text.includes('pg_try_advisory_xact_lock')), 'and the DATABASE_URL side was asked for the same one')
+  assert.ok(asked.some((text) => text.startsWith('select pg_advisory_unlock(')), 'and the probe released what it took')
+  assert.deepEqual(
+    dialled.map((url) => new URL(url).host),
+    ['10.9.9.9:5432', 'pooler.internal:6432'],
+    'the holder is dialled on the override and the witness on DATABASE_URL, in that order',
+  )
+})
+
+test('[o3d-2k5r r26] the two advisory keys the probe uses are the SAME key', async () => {
+  // The reading only means something if the witness asks for the key the holder took. A probe that
+  // generated the key twice would report "not shared" for every correct deployment, and the
+  // refusal would be indistinguishable from a real one.
+  //
+  // MUTATION ROUTE: move `const key = ...` inside either leg, or re-roll it for the witness.
+  resetSessionLockSpaceMeasurements()
+  const { createClient, asked } = standInConnector({ taken: true, acquired: false })
+  const config = pgSessionLockConnectionConfig(
+    'postgresql://app:pw@pooler:6432/ims?schema=public',
+    'postgresql://app:pw@10.9.9.9:5432/ims?schema=public',
+    'a test lock',
+    { createClient },
+  )
+  await (config.onConnect as (c: unknown) => Promise<void>)(directStandIn().client)
+  const keyOf = (fragment: string) => /\((\d+), (\d+)\)/.exec(asked.find((text) => text.includes(fragment)) ?? '')?.slice(1).join('/')
+  const held = keyOf('pg_try_advisory_lock(')
+  assert.ok(held, `the holder leg ran; asked ${JSON.stringify(asked)}`)
+  assert.equal(keyOf('pg_try_advisory_xact_lock('), held, 'the witness asks for the key the holder took')
+  assert.equal(keyOf('pg_advisory_unlock('), held, 'and the release names it too')
+  assert.equal(held.split('/')[0], String(SESSION_LOCK_SPACE_PROBE_NAMESPACE), 'in the registered probe namespace')
+})
+
+test('[o3d-2k5r r26] the probe key is RANDOM, so two instances booting at once cannot refuse each other', async () => {
+  // A fixed key would make the SECOND instance's `pg_try_advisory_lock` return false while the
+  // first held it, and a deployment would be refused for somebody else's boot.
+  //
+  // MUTATION ROUTE: replace `1 + Math.floor(Math.random() * 0x7f_ff_ff_fe)` with a constant.
+  const keys = new Set<string>()
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    resetSessionLockSpaceMeasurements()
+    const { createClient, asked } = standInConnector({ taken: true, acquired: false })
+    const config = pgSessionLockConnectionConfig(
+      `postgresql://app:pw@pooler:6432/ims?schema=public`,
+      `postgresql://app:pw@10.9.9.9:5432/ims?schema=public`,
+      'a test lock',
+      { createClient },
+    )
+    await (config.onConnect as (c: unknown) => Promise<void>)(directStandIn().client)
+    const objid = /pg_try_advisory_lock\(\d+, (\d+)\)/.exec(asked.find((t) => t.includes('pg_try_advisory_lock(')) ?? '')?.[1]
+    assert.ok(objid, 'the holder leg ran')
+    assert.ok(Number(objid) > 0 && Number(objid) < 2 ** 31, `int4 positive; got ${objid}`)
+    keys.add(objid)
+  }
+  assert.ok(keys.size > 1, `five probes produced ${keys.size} distinct keys`)
+})
+
+test('[o3d-2k5r r26] the probe is measured ONCE per process, not once per connection', async () => {
+  // The cost statement, counted rather than asserted in prose: two throwaway connections and four
+  // statements, on the first lock connection that needs them and never again.
+  //
+  // MUTATION ROUTE: return `measureSharedAdvisoryLockSpace(...)` directly from
+  // `sharedAdvisoryLockSpaceEstablished()` without the memo. The counts below multiply by the
+  // number of connections.
+  resetSessionLockSpaceMeasurements()
+  const { createClient, asked, dialled } = standInConnector({ taken: true, acquired: false })
+  const config = pgSessionLockConnectionConfig(
+    'postgresql://app:pw@pooler:6432/ims?schema=public',
+    'postgresql://app:pw@10.9.9.9:5432/ims?schema=public',
+    'a test lock',
+    { createClient },
+  )
+  for (let connection = 0; connection < 4; connection += 1) {
+    await (config.onConnect as (c: unknown) => Promise<void>)(directStandIn().client)
+  }
+  assert.equal(dialled.length, 2, `the probe opened ${dialled.length} connections across four lock connections`)
+  assert.deepEqual(
+    asked.map((text) => text.replace(/\(\d+, \d+\)/, '(k)').replace(/^select /, '')),
+    ['pg_try_advisory_lock(k) as taken', 'begin', 'pg_try_advisory_xact_lock(k) as acquired', 'rollback', 'pg_advisory_unlock(k)'],
+    'and asked exactly these, once',
+  )
+})
+
+test('[o3d-2k5r r26] with NO override there is no second endpoint, so no probe runs at all', async () => {
+  // THE NON-OVERRIDE ANSWER, asserted rather than reasoned about. Without an override the lock
+  // connections and the data path are built from ONE string by one derivation, so there is no
+  // second endpoint that could name a different instance — and nothing is paid for asking a URL
+  // whether it agrees with itself.
+  //
+  // MUTATION ROUTE: drop the `override === null ? null :` branch in
+  // `pgSessionLockConnectionConfig()` and always attach the probe. `dialled` becomes 2 and every
+  // ordinary deployment starts opening two connections at its first lock.
+  resetSessionLockSpaceMeasurements()
+  const { createClient, dialled, asked } = standInConnector({ taken: true, acquired: false })
+  const config = pgSessionLockConnectionConfig('postgresql://app:pw@127.0.0.1:5432/ims?schema=public', undefined, 'a test lock', { createClient })
+  const { client, asked: onTheConnection } = directStandIn()
+  await (config.onConnect as (c: unknown) => Promise<void>)(client)
+  assert.deepEqual(dialled, [], 'no probe connection is opened')
+  assert.deepEqual(asked, [], 'and no probe statement is sent')
+  assert.equal(onTheConnection.length, 1, 'the connection still pays exactly the one affinity round trip it paid before')
+})
+
+test('[o3d-2k5r r26] an interposed lock connection is refused BEFORE the probe is paid for', async () => {
+  // Ordering, not decoration: the affinity leg is answered by the connection already in hand, so a
+  // deployment that is refused for interposition must not first open two connections to find out
+  // something it will not use.
+  //
+  // MUTATION ROUTE: move `if (sharedLockSpace) await sharedLockSpace()` above the peer comparison
+  // in `sessionLockAffinityGuard()`. `dialled` stops being empty.
+  resetSessionLockSpaceMeasurements()
+  const { createClient, dialled } = standInConnector({ taken: true, acquired: true })
+  const config = pgSessionLockConnectionConfig(
+    'postgresql://app:pw@pooler:6432/ims?schema=public',
+    'postgresql://app:pw@10.9.9.9:5432/ims?schema=public',
+    'the money-post lock',
+    { createClient },
+  )
+  const interposed = {
+    connection: { stream: { localAddress: '127.0.0.1', localPort: 51515 } },
+    async query() { return { rows: [{ client_address: '127.0.0.1', client_port: '40404' }] } },
+  }
+  await assert.rejects(
+    () => (config.onConnect as (c: unknown) => Promise<void>)(interposed),
+    (error: unknown) => {
+      assert.match((error as Error).message, /terminated the connection and opened its own to the backend/)
+      return true
+    },
+  )
+  assert.deepEqual(dialled, [], 'the probe was never opened for a connection that was refused anyway')
+})
+
+test('[o3d-2k5r r26] every unclear answer is a REFUSAL, not a pass', async () => {
+  // Fail closed, in the direction the rest of this module fails: "not shown" is not "shown". Each
+  // case names the mutation that turns it into a silent admission.
+  const base = 'postgresql://app:pw@pooler:6432/ims?schema=public'
+  const override = 'postgresql://app:pw@10.9.9.9:5432/ims?schema=public'
+
+  // 1. THE WITNESS COULD NOT BE REACHED. MUTATION ROUTE: `catch { return }` around the witness leg.
+  resetSessionLockSpaceMeasurements()
+  const refusingWitness = async (config: object) => {
+    if (String((config as { connectionString?: unknown }).connectionString).includes('pooler')) throw new Error('ECONNREFUSED 10.0.0.1:6432')
+    return { async connect() {}, async query() { return { rows: [{ taken: true }] } }, async end() {} }
+  }
+  await assert.rejects(
+    () => (pgSessionLockConnectionConfig(base, override, 'a test lock', { createClient: refusingWitness }).onConnect as (c: unknown) => Promise<void>)(directStandIn().client),
+    (error: unknown) => {
+      assert.ok(error instanceof DatabaseUrlSchemaConflictError)
+      assert.match((error as Error).message, /could not be established/, 'an unanswered question is refused')
+      assert.match((error as Error).message, /ECONNREFUSED/, 'and it quotes what actually went wrong')
+      assert.match((error as Error).message, /pay the same document twice/, 'and still says what is at stake')
+      return true
+    },
+  )
+
+  // 2. THE HOLDER COULD NOT TAKE ITS OWN FRESH KEY, so a blocked witness would mean nothing.
+  // MUTATION ROUTE: drop the `if (taken !== true)` guard — the witness's `false` would then be
+  // read as exclusion when it is only "nobody asked".
+  resetSessionLockSpaceMeasurements()
+  await assert.rejects(
+    () => (pgSessionLockConnectionConfig(base, override, 'a test lock', { createClient: standInConnector({ taken: false, acquired: false }).createClient }).onConnect as (c: unknown) => Promise<void>)(directStandIn().client),
+    (error: unknown) => {
+      assert.match((error as Error).message, /did not take its own freshly generated probe key/)
+      return true
+    },
+  )
+
+  // 3. AN ANSWER THAT IS NOT LITERALLY FALSE. A NULL, an absent column, a number — none of them
+  // say "blocked". MUTATION ROUTE: write `if (acquired !== true) return` instead of
+  // `if (acquired === false) return`; every one of these becomes a silent pass.
+  for (const acquired of [null, undefined, 1, 'yes', {}]) {
+    resetSessionLockSpaceMeasurements()
+    await assert.rejects(
+      () => (pgSessionLockConnectionConfig(base, override, 'a test lock', { createClient: standInConnector({ taken: true, acquired }).createClient }).onConnect as (c: unknown) => Promise<void>)(directStandIn().client),
+      (error: unknown) => {
+        assert.ok(error instanceof DatabaseUrlSchemaConflictError, `${String(acquired)} was admitted`)
+        assert.match((error as Error).message, /does NOT share an advisory-lock space/)
+        return true
+      },
+      `an ${JSON.stringify(String(acquired))} answer must not be read as "blocked"`,
+    )
+  }
+
+  // 4. AND THE ONE ANSWER THAT PASSES REALLY PASSES, or every case above would be about the probe
+  // existing rather than about the evidence. MUTATION ROUTE: make the probe throw unconditionally.
+  resetSessionLockSpaceMeasurements()
+  await (pgSessionLockConnectionConfig(base, override, 'a test lock', { createClient: standInConnector({ taken: true, acquired: false }).createClient }).onConnect as (c: unknown) => Promise<void>)(directStandIn().client)
+})
+
+// ---------------------------------------------------------------------------
+// LIVE: the same two answers, from a real PostgreSQL taking real advisory locks.
+// ---------------------------------------------------------------------------
+
+/** An arbitrary two-int key for these tests to contend on. Not an application lock. */
+const LIVE_TEST_KEY = [SESSION_LOCK_SPACE_PROBE_NAMESPACE, 26_260_726] as const
+
+test('[o3d-2k5r r26] (live): a CORRECT override is ADMITTED and the lock it takes really excludes', async (t) => {
+  // THE DEPLOYMENT THE OVERRIDE EXISTS FOR, end to end: DATABASE_URL through an interposed route
+  // (which is why the lock pool needed a way past it) and DATABASE_SESSION_LOCK_URL direct to the
+  // same server. The probe must admit it — and then the lock the pool takes must actually exclude
+  // a second holder, which is the whole point of admitting it.
+  //
+  // MUTATION ROUTE: make the probe refuse when `acquired === false` (invert the polarity). This
+  // test fails while every refusal test above still passes, which is why it is here.
+  const reachable = await reachablePostgres(t)
+  if (!reachable) return
+  resetSessionLockSpaceMeasurements()
+  resetStartupOptionByteSafety()
+  const relay = await startRelay(reachable.host, reachable.port)
+  const pool = new pg.Pool({
+    ...pgSessionLockConnectionConfig(
+      throughRelay(reachable.base, relay.port),
+      sameNamesDifferentEndpoint(reachable.base, reachable.port),
+      'the money-post lock',
+    ),
+    max: 1,
+  })
+  const rival = new pg.Client({ connectionString: reachable.base, connectionTimeoutMillis: 3_000 })
+  try {
+    // PRECONDITION: the two URLs really are different endpoints, or "admitted" would be trivial.
+    const dataHost = new URL(throughRelay(reachable.base, relay.port)).host
+    const lockHost = new URL(sameNamesDifferentEndpoint(reachable.base, reachable.port)).host
+    assert.notEqual(dataHost, lockHost, `PRECONDITION: DATABASE_URL (${dataHost}) and the override (${lockHost}) are different endpoints`)
+
+    const holder = await pool.connect()
+    try {
+      const { rows } = await holder.query<{ taken: boolean }>(`select pg_try_advisory_lock(${LIVE_TEST_KEY[0]}, ${LIVE_TEST_KEY[1]}) as taken`)
+      assert.equal(rows[0]?.taken, true, 'the pool was admitted and took the lock')
+      // AND IT EXCLUDES. A second connection to the same server must not get it.
+      await rival.connect()
+      const contended = await rival.query<{ taken: boolean }>(`select pg_try_advisory_lock(${LIVE_TEST_KEY[0]}, ${LIVE_TEST_KEY[1]}) as taken`)
+      assert.equal(contended.rows[0]?.taken, false, 'a rival on the same server is blocked, so the lock the override took is the lock the work sees')
+    } finally {
+      await holder.query(`select pg_advisory_unlock(${LIVE_TEST_KEY[0]}, ${LIVE_TEST_KEY[1]})`).catch(() => undefined)
+      holder.release()
+    }
+
+    // THE PROBE LEFT NOTHING BEHIND. It holds a session lock on a throwaway connection and takes a
+    // TRANSACTION-level one on the witness precisely so that neither outlives the measurement.
+    // MUTATION ROUTE: use `pg_try_advisory_lock` on the witness leg instead of the xact form, or
+    // drop the `pg_advisory_unlock` in the probe's `finally`. Through a transaction pooler that is
+    // a lock left on a server connection somebody else is handed next.
+    const { rows: left } = await rival.query<{ n: string }>(
+      `select count(*)::text as n from pg_locks where locktype = 'advisory' and classid = ${SESSION_LOCK_SPACE_PROBE_NAMESPACE}`,
+    )
+    assert.equal(left[0]?.n, '0', `the probe holds nothing after it answers; pg_locks shows ${left[0]?.n}`)
+  } finally {
+    await rival.end().catch(() => undefined)
+    await pool.end().catch(() => undefined)
+    await relay.close()
+    resetSessionLockSpaceMeasurements()
+    resetStartupOptionByteSafety()
+  }
+})
+
+test('[o3d-2k5r r26] (live): an override whose lock space is NOT the data path is refused, by a real PostgreSQL', async (t) => {
+  // THE SAME REFUSAL AS THE STAND-IN ABOVE, but with PostgreSQL answering. A DIFFERENT DATABASE on
+  // one server occupies a DIFFERENT advisory-lock space — measured in r26 to produce evidence
+  // identical to a second cluster and to a pg_basebackup clone of the first: the witness acquires
+  // the key. So the connector below dials the real server for both legs and sends the DATABASE_URL
+  // leg to a second database, which is what an unrelated instance with the same names IS, from the
+  // only vantage point the check has. Both URLs still name the same database and schema, so every
+  // comparison r25 made passes.
+  //
+  // MUTATION ROUTE: the same one as the stand-in test — drop the probe from
+  // `sessionLockAffinityGuard()`. Here the lock is taken on a real server that a real second
+  // connection is not excluded by, and the test still catches it.
+  const reachable = await reachablePostgres(t)
+  if (!reachable) return
+  const elsewhere = new URL(reachable.base)
+  elsewhere.pathname = '/postgres'
+  const reachableElsewhere = new pg.Client({ connectionString: elsewhere.toString(), connectionTimeoutMillis: 3_000 })
+  try {
+    await reachableElsewhere.connect()
+  } catch {
+    await reachableElsewhere.end().catch(() => undefined)
+    t.skip('no second database on this server to occupy a different advisory-lock space')
+    return
+  }
+  await reachableElsewhere.end().catch(() => undefined)
+
+  resetSessionLockSpaceMeasurements()
+  // DATABASE_URL through an interposed route and the override direct: the real deployment shape,
+  // and two distinguishable endpoints, so the connector below can send exactly one of them
+  // somewhere else.
+  const relay = await startRelay(reachable.host, reachable.port)
+  const base = throughRelay(reachable.base, relay.port)
+  const override = sameNamesDifferentEndpoint(reachable.base, reachable.port)
+  assert.equal(new URL(base).pathname, new URL(override).pathname, 'PRECONDITION: the two URLs name the SAME database, which is what r25 compared')
+  assert.notEqual(new URL(base).port, new URL(override).port, 'PRECONDITION: and they are different endpoints, which r25 could not compare')
+
+  const opened: string[] = []
+  const createClient = async (config: object) => {
+    const target = new URL(String((config as { connectionString?: unknown }).connectionString))
+    // The DATABASE_URL leg lands somewhere with its own lock space; the override leg is honest.
+    if (target.pathname !== '/postgres' && target.port === new URL(base).port) target.pathname = '/postgres'
+    opened.push(target.pathname)
+    return new pg.Client({ ...config, connectionString: target.toString() })
+  }
+  const config = pgSessionLockConnectionConfig(base, override, 'the money-post lock', { createClient })
+  const pool = new pg.Pool({ ...config, max: 1 })
+  try {
+    await assert.rejects(
+      () => pool.query('select 1'),
+      (error: unknown) => {
+        assert.ok(error instanceof DatabaseUrlSchemaConflictError, `expected a lock-space refusal, got ${String(error)}`)
+        assert.match((error as Error).message, /does NOT share an advisory-lock space/)
+        assert.match((error as Error).message, /pay the same document twice/)
+        return true
+      },
+      'a lock pool whose override does not share a lock space with DATABASE_URL is refused',
+    )
+    assert.deepEqual(opened, [new URL(override).pathname, '/postgres'], 'both probe legs really connected, to two lock spaces')
+  } finally {
+    await pool.end().catch(() => undefined)
+    await relay.close()
+    resetSessionLockSpaceMeasurements()
   }
 })
