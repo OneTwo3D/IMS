@@ -42,6 +42,10 @@ const state = {
   links: [] as Array<{ orderId: string; connector: string; externalOrderId: string }>,
   orders: new Set<string>(),
   activity: [] as Array<Record<string, unknown>>,
+  /** o3d-xnwu r14 — the transaction client each witness write was handed. */
+  activityTxClients: [] as unknown[],
+  /** o3d-xnwu r14 — the activity_logs insert fails, the way a transient database error does. */
+  activityWriteFails: false,
   rawSql: [] as string[],
   /** WooCommerce's answer per order id. Absent => an error from the store. */
   wcRefundsByOrder: new Map<number, number[]>(),
@@ -298,6 +302,21 @@ mock.module('@/lib/connectors/woocommerce/api', {
 mock.module('@/lib/activity-log', {
   namedExports: {
     logActivity: async (entry: Record<string, unknown>) => { state.activity.push(entry) },
+    /**
+     * o3d-xnwu r14 — the WITNESS, and it is written INSIDE the recovery transaction now.
+     *
+     * The real logActivityInTransaction deliberately does NOT catch, so a failed witness write
+     * aborts the caller's transaction and the recovery with it. This double reproduces exactly
+     * that: it throws when `state.activityWriteFails` is set, and the $transaction double above
+     * restores the park snapshot on the way out — so a test can prove that no recovery commits
+     * without its witness. It also records WHICH transaction client it was handed, because a
+     * witness written over the plain db client would commit separately and prove nothing.
+     */
+    logActivityInTransaction: async (tx: unknown, entry: Record<string, unknown>) => {
+      state.activityTxClients.push(tx)
+      if (state.activityWriteFails) throw new Error('activity_logs insert failed')
+      state.activity.push(entry)
+    },
   },
 })
 
@@ -343,6 +362,8 @@ test.beforeEach(() => {
   ]
   state.orders = new Set(['order-A', 'order-B'])
   state.activity = []
+  state.activityTxClients = []
+  state.activityWriteFails = false
   state.rawSql = []
   state.wcRefundsByOrder = new Map([[1001, [7001]], [2002, [9001]]])
   state.reportTotalPages = true
@@ -923,4 +944,65 @@ test('the recovery records the evidence it was made on, not just that it happene
   assert.deepEqual(metadata.wcRefundIds, [7001])
   assert.equal(metadata.wcOrderId, 1001)
   assert.ok(typeof metadata.wcFetchedAt === 'string')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-xnwu r14 (Codex HIGH) — THE WITNESS IS AS DURABLE AS THE THING IT WITNESSES.
+//
+// The `wc_refund_park_recovered` entry is not a notification. It is the evidence check 7 of the
+// 20260822120000 migration's verify.sql joins to, and that check exists because THE ROW ITSELF CAN
+// BE MADE INNOCENT: the predecessor's held-invoice writer overwrites a recovered park wholesale, so
+// every check that reads the row alone goes quiet over a destroyed accounting payload.
+//
+// It used to be written with `logActivity` AFTER this transaction committed — and logActivity
+// swallows its own failures, so an ordinary transient database error, not merely a crash, left the
+// recovery committed with nothing to join to. The witness is now written inside the transaction
+// with logActivityInTransaction, which does not catch.
+// ---------------------------------------------------------------------------
+
+test('a witness that cannot be written takes the recovery down with it, so no park is recovered unwitnessed', async () => {
+  // MUTATION ROUTE: move the witness back out of the transaction — `await logActivity({...})` after
+  // `if (!applied.ok) return ...` — and this fails twice over: the action resolves successfully and
+  // the park is left reassigned onto order-A with no entry naming it.
+  const recover = await loadAction()
+  state.activityWriteFails = true
+
+  await assert.rejects(
+    () => recover('log-1', { observedOrderId: 'order-B', outcome: 'REASSIGN', wcOrderId: 1001 }),
+    /activity_logs insert failed/,
+    'a recovery whose only later audit cannot be written must not report success',
+  )
+
+  // Precondition: the failure really is the witness write, reached after the mutation was applied.
+  assert.equal(state.activityTxClients.length, 1, 'the witness write must have been attempted')
+  assert.equal(state.transactions, 1, 'and inside the recovery transaction')
+  // And the transaction took the park with it: nothing moved.
+  assert.equal(stored().entityId, 'order-B', 'the park must still be on the order it was parked against')
+  assert.equal(stored().status, 'FAILED', 'and still actionable, so the operator can retry')
+  assert.equal(state.activity.length, 0, 'with no entry recorded either')
+})
+
+test('the witness is written over the recovery\'s own transaction client, and only when the mutation took', async () => {
+  // Two facts one test, because they are the same fact: the entry commits with the row or not at
+  // all. A witness written over the plain db client would commit separately and prove nothing; a
+  // witness written before the conditional update would name a recovery that never happened.
+  //
+  // MUTATION ROUTE: pass `db` instead of `tx` to logActivityInTransaction and the first assertion
+  // fails. Move the call above the `updated.count !== 1` guard and the second fails.
+  const recover = await loadAction()
+  const ok = await recover('log-1', { observedOrderId: 'order-B', outcome: 'REASSIGN', wcOrderId: 1001 })
+  assert.equal((ok as { success: boolean }).success, true)
+  assert.equal(state.activityTxClients.length, 1)
+  assert.notEqual(state.activityTxClients[0], undefined, 'the witness must be handed a transaction client')
+
+  // Now a recovery the fence refuses INSIDE the transaction: the park moves under the lock, the
+  // conditional update matches nothing, and no witness may be left behind claiming otherwise.
+  state.activity = []
+  state.activityTxClients = []
+  state.parks = [parkRow()]
+  state.mutateUnderLock = () => { state.parks[0].status = 'SYNCED' }
+  const refused = await recover('log-1', { observedOrderId: 'order-B', outcome: 'REASSIGN', wcOrderId: 1001 })
+  assert.equal((refused as { code?: string }).code, 'park_moved', 'precondition: the update matched nothing')
+  assert.equal(state.activity.length, 0, 'a recovery that did not happen leaves no witness saying it did')
+  assert.equal(state.activityTxClients.length, 0, 'and never even attempts one')
 })

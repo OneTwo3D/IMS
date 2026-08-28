@@ -1871,3 +1871,40 @@ test('check 7 asks the history FIRST, so nothing without a recovery entry can re
   }
   assert.equal(selects(6, anotherAction), false, 'and only a park RECOVERY is evidence a park was there')
 })
+
+/* ----------------------------------------------------------------------------------------------
+ * o3d-xnwu r14 (Codex HIGH) — A GENUINELY RECOVERED ROW WHOSE WITNESS IS GONE.
+ *
+ * Check 7's whole strength is that its evidence lives somewhere the rewrite cannot reach. Its whole
+ * WEAKNESS, until r14, was that the evidence could leave on its own:
+ *
+ *   * it was written with `logActivity` AFTER the recovery transaction committed, and logActivity
+ *     swallows its own failures — so an ordinary transient database error, not merely a crash, left
+ *     the recovery committed with no entry at all;
+ *   * it is a WARNING, and `purgeExpiredActivityLogs` deletes WARNING entries after 60 days by
+ *     default, while a cutover may run a year after the recovery.
+ *
+ * The test below is what that costs, stated as an assertion rather than as a caveat in a comment:
+ * the witness is the ONLY thing separating a destroyed accounting payload from a clean verification
+ * run. Which is why the witness is now written inside the recovery's own transaction
+ * (tests/refund-park-recovery-action.test.ts) and exempt from retention
+ * (tests/wc-refund-park-recovery-witness-retention.test.ts). Neither mechanism can be read off this
+ * file; both are what make the first half of this test unreachable in practice.
+ * ---------------------------------------------------------------------------------------------- */
+
+test('a recovered row whose witness is gone passes ALL SEVEN checks — the witness is the only thing standing there', () => {
+  // MUTATION ROUTE: delete the EXISTS subquery from check 7 and the first assertion fails — the
+  // check stops depending on the witness, and starts accusing every legitimate hold instead (the
+  // false-positive test above is the other half of that vice).
+  const witnessed = afterBackfill(reheldOnOrder2)
+  const witnessGone: Row = { ...witnessed, recoveries: [] }
+
+  // The two rows are IDENTICAL in every column verify.sql can read. The only difference is a row in
+  // another table, which is exactly the point.
+  assert.deepEqual({ ...witnessGone, recoveries: null }, { ...witnessed, recoveries: null })
+
+  for (const check of [0, 1, 2, 3, 4, 5, 6]) {
+    assert.equal(selects(check, witnessGone), false, `check ${check + 1} cannot see a rewritten row with no witness`)
+  }
+  assert.equal(selects(6, witnessed), true, 'and the same row WITH its witness is caught — the entry is the discriminator')
+})
