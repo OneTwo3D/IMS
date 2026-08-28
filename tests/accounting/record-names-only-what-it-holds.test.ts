@@ -25,11 +25,16 @@ import {
   type UnrecordedIncidentKind,
 } from '@/lib/domain/accounting/unrecorded-posted-document'
 import {
+  LEAVE_THE_TOGGLE_OFF_THEN_ESCALATE,
   LOCAL_DIRECTION_CAP,
+  LOCAL_DIRECTION_SEQUENCES,
   LOCAL_DIRECTIONS,
   LOCAL_TARGET,
   renderLocalDirection,
+  renderLocalDirectionSequence,
+  type LocalDirection,
   type LocalDirectionContext,
+  type LocalDirectionSequence,
 } from '@/lib/domain/accounting/local-operator-direction'
 
 // ---------------------------------------------------------------------------
@@ -1475,9 +1480,18 @@ function lookupLessMessages(): { label: string; text: string }[] {
  */
 const LOCAL_DIRECTION_CONTEXT: LocalDirectionContext = { ledger: '{ledger}', syncRowId: '{syncRowId}' }
 
-/** The prose of the inventory, which is generated and never written down. */
-const LOCAL_DIRECTION_SPANS: readonly string[] =
-  LOCAL_DIRECTIONS.map((direction) => renderLocalDirection(direction, LOCAL_DIRECTION_CONTEXT))
+/**
+ * The prose of the inventory, which is generated and never written down.
+ *
+ * ROUND 19: the declared SEQUENCES are rendered too, because the conjunction that joins them is
+ * prose an operator reads and it is contributed by `renderLocalDirectionSequence` rather than by
+ * either element. A word no span accounts for is the thing the closure scan below reports, and the
+ * join would otherwise be exactly such a word.
+ */
+const LOCAL_DIRECTION_SPANS: readonly string[] = [
+  ...LOCAL_DIRECTIONS.map((direction) => renderLocalDirection(direction, LOCAL_DIRECTION_CONTEXT)),
+  ...LOCAL_DIRECTION_SEQUENCES.map((sequence) => renderLocalDirectionSequence(sequence, LOCAL_DIRECTION_CONTEXT)),
+]
 
 /**
  * THE RESET BREADCRUMB'S OWN INSTRUCTIONS, WHICH ARE ALLOWED TO POINT AT A LEDGER.
@@ -2031,10 +2045,198 @@ function distinctiveFragment(span: string): string {
   return span.split(/\{[A-Za-z]+\}/).reduce((longest, part) => (part.length > longest.length ? part : longest), '')
 }
 
-test('ROUND 18 (Codex HIGH): the formatters COMPOSE each direction, and none of them writes its prose down', async () => {
-  // Route: the shipped formatter module's own source. Mutation: replace any
-  // `renderLocalDirection({ ... })` call in unrecorded-posted-document.ts with the sentence it
-  // returns — which is exactly what round 17 shipped — and the fragment assertion fails naming it.
+// ---------------------------------------------------------------------------
+// ROUND 19 (Codex HIGH) — A CHECK OVER SOURCE *TEXT* IS DEFEATED BY TEXT NOBODY ANTICIPATED.
+//
+// Round 18's proof was `formatter.includes(fragment) === false` plus `calls.length >= 14`. Both
+// halves are lexical, and Codex broke them together: replace one `renderLocalDirection(...)` call
+// with the byte-identical sentence SPLIT ACROSS TWO CONCATENATED LITERALS and `includes` is false
+// (the fragment straddles the `' + '`), while the remaining call count still clears the floor —
+// which is an AGGREGATE, so losing one call is invisible. Every output-based corpus check stays
+// green because the rendered message is unchanged. The formatter is back to the round-17
+// hand-written shape and the coupling test says nothing.
+//
+// This is the same lesson the fence itself learned over five rounds, arriving one level up. So the
+// two halves are replaced by two STRUCTURAL ones, both over the TypeScript AST:
+//
+//   1. WHAT IS CONSTRUCTED. Every `renderLocalDirection(...)` call site in the formatter is read as
+//      a VALUE — its object-literal argument evaluated into a plain object — and matched against
+//      `LOCAL_DIRECTIONS`. Per direction, not in aggregate: a direction that stops being composed
+//      is named, and a direction shape that is not in the inventory is named. A sequence call
+//      resolves to the sequence's elements, so the cap counts every element of it.
+//   2. WHAT IS WRITTEN DOWN. The formatter's string literals are flattened across concatenation
+//      FIRST — `'Leave the toggle' + ' off'` becomes one string — and only then searched for a
+//      direction's prose. Splitting a literal is no longer a way through, which is the exact
+//      mutation Codex named and which is run as a control below.
+// ---------------------------------------------------------------------------
+
+/** The sequences by the name the formatter refers to them by. */
+const DECLARED_SEQUENCES: Record<string, LocalDirectionSequence> = { LEAVE_THE_TOGGLE_OFF_THEN_ESCALATE }
+
+/** Read an object literal of enumerated values into a plain object, or null if it holds anything else. */
+function literalValue(node: ts.Expression): unknown {
+  if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) return node.text
+  if (ts.isArrayLiteralExpression(node)) {
+    const items = node.elements.map((element) => literalValue(element))
+    return items.some((item) => item === null) ? null : items
+  }
+  if (ts.isObjectLiteralExpression(node)) {
+    const out: Record<string, unknown> = {}
+    for (const property of node.properties) {
+      if (!ts.isPropertyAssignment(property)) return null
+      const key = ts.isIdentifier(property.name) || ts.isStringLiteral(property.name) ? property.name.text : null
+      if (key === null) return null
+      const value = literalValue(property.initializer)
+      if (value === null) return null
+      out[key] = value
+    }
+    return out
+  }
+  return null
+}
+
+/** Deep, order-insensitive equality over the plain values a direction is made of. */
+function sameDirection(a: unknown, b: unknown): boolean {
+  if (Array.isArray(a) || Array.isArray(b)) {
+    return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((item, i) => sameDirection(item, b[i]))
+  }
+  if (typeof a === 'object' && a !== null && typeof b === 'object' && b !== null) {
+    const ka = Object.keys(a as Record<string, unknown>).sort()
+    const kb = Object.keys(b as Record<string, unknown>).sort()
+    return ka.length === kb.length && ka.every((k, i) => k === kb[i])
+      && ka.every((k) => sameDirection((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k]))
+  }
+  return a === b
+}
+
+type ComposedDirection = { direction: LocalDirection | null; described: string; via: 'DIRECT' | 'SEQUENCE' }
+
+/**
+ * Every direction the given formatter source COMPOSES, read off the syntax tree.
+ *
+ * A call whose argument this cannot evaluate, or whose evaluated shape is in no inventory, comes
+ * back with `direction: null` and is reported — the fail-closed direction, because a composition
+ * this check cannot read is exactly where an undeclared instruction would sit.
+ */
+function composedDirections(sourceText: string): ComposedDirection[] {
+  const sourceFile = ts.createSourceFile('formatter.ts', sourceText, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
+  const found: ComposedDirection[] = []
+  const visit = (node: ts.Node): void => {
+    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)) {
+      const callee = node.expression.text
+      if (callee === 'renderLocalDirection') {
+        const argument = node.arguments[0]
+        const value = argument ? literalValue(argument) : null
+        const matched = LOCAL_DIRECTIONS.find((candidate) => sameDirection(value, candidate)) ?? null
+        found.push({
+          direction: matched,
+          described: argument?.getText(sourceFile).replace(/\s+/g, ' ') ?? '(no argument)',
+          via: 'DIRECT',
+        })
+      }
+      if (callee === 'renderLocalDirectionSequence') {
+        const argument = node.arguments[0]
+        const named = argument && ts.isIdentifier(argument) ? DECLARED_SEQUENCES[argument.text] : undefined
+        if (!named) {
+          found.push({ direction: null, described: argument?.getText(sourceFile) ?? '(no argument)', via: 'SEQUENCE' })
+        } else {
+          for (const element of named) {
+            found.push({
+              direction: LOCAL_DIRECTIONS.find((candidate) => sameDirection(element, candidate)) ?? null,
+              described: `${(argument as ts.Identifier).text}[${element.action}]`,
+              via: 'SEQUENCE',
+            })
+          }
+        }
+      }
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(sourceFile)
+  return found
+}
+
+/**
+ * The formatter's string literals, CONCATENATION-FLATTENED.
+ *
+ * `'a' + 'b'` becomes `ab`, so a sentence split across literals reads exactly as a sentence typed in
+ * one — the mutation that walked past round 18.
+ *
+ * THE WHOLE `+` CHAIN IS FLATTENED FIRST, and that is not a detail. `+` is left-associative, so in
+ * `'x' + call + 'a' + 'b'` the pair `'a' + 'b'` is NOT a subtree: the tree is `((('x' + call) + 'a')
+ * + 'b')`, and a check that only joined literal-plus-literal NODES would see two separate short
+ * literals and report nothing. Verified by mutation — the first version of this function missed
+ * exactly that shape.
+ *
+ * A NON-LITERAL OPERAND BREAKS THE RUN, because it is a genuine composition point and bridging
+ * across it would report prose nobody wrote. Template holes break it for the same reason.
+ */
+function flattenedLiterals(sourceText: string): string[] {
+  const sourceFile = ts.createSourceFile('formatter.ts', sourceText, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
+  const runs: string[] = []
+  const plainLiteral = (node: ts.Expression): string | null => (
+    ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) ? node.text : null
+  )
+  /** Every operand of one `+` chain, in source order, however the tree associates. */
+  const operands = (node: ts.Expression, out: ts.Expression[]): ts.Expression[] => {
+    if (ts.isParenthesizedExpression(node)) return operands(node.expression, out)
+    if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+      operands(node.left, out)
+      operands(node.right, out)
+      return out
+    }
+    out.push(node)
+    return out
+  }
+  const visit = (node: ts.Node): void => {
+    if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+      let run = ''
+      for (const operand of operands(node, [])) {
+        const literal = plainLiteral(operand)
+        if (literal !== null) { run += literal; continue }
+        if (run) { runs.push(run); run = '' }
+        visit(operand)
+      }
+      if (run) runs.push(run)
+      return
+    }
+    const literal = ts.isExpression(node) ? plainLiteral(node) : null
+    if (literal !== null) { runs.push(literal); return }
+    if (ts.isTemplateExpression(node)) {
+      runs.push(node.head.text)
+      for (const span of node.templateSpans) {
+        visit(span.expression)
+        runs.push(span.literal.text)
+      }
+      return
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(sourceFile)
+  return runs
+}
+
+/** Every direction whose prose is WRITTEN DOWN in the given source rather than composed. */
+function handWrittenDirectionProse(sourceText: string): string[] {
+  const runs = flattenedLiterals(sourceText)
+  const offences: string[] = []
+  for (const direction of LOCAL_DIRECTIONS) {
+    const fragment = distinctiveFragment(renderLocalDirection(direction, LOCAL_DIRECTION_CONTEXT))
+    if (fragment.length < 12) continue
+    if (runs.some((run) => run.includes(fragment))) {
+      offences.push(`${direction.action}: "${fragment.slice(0, 60)}…"`)
+    }
+  }
+  return offences
+}
+
+test('ROUND 19 (Codex HIGH): the formatter COMPOSES every direction it ships, judged on the syntax tree', async () => {
+  // Route: lib/domain/accounting/unrecorded-posted-document.ts parsed with ts.createSourceFile, and
+  // every renderLocalDirection / renderLocalDirectionSequence call read as a VALUE.
+  //
+  // Mutation: delete any one composition call and this fails naming the direction that stopped
+  // shipping — where round 18's aggregate `calls.length >= 14` would not have noticed. Compose a
+  // direction shape that is not in LOCAL_DIRECTIONS and it fails naming the argument.
   const formatter = await readFile(path.join(process.cwd(), FORMATTER_FILE), 'utf8')
   const model = await readFile(path.join(process.cwd(), DIRECTION_MODEL_FILE), 'utf8')
 
@@ -2042,33 +2244,201 @@ test('ROUND 18 (Codex HIGH): the formatters COMPOSE each direction, and none of 
   assert.match(model, /export function renderLocalDirection/, 'the renderer must live in production')
   assert.match(formatter, /renderLocalDirection\(/, 'and the formatter must call it')
 
+  const composed = composedDirections(formatter)
+  assert.ok(composed.length > 0, 'the walk must find composition points, or it is reading nothing')
+  const unreadable = composed.filter((entry) => entry.direction === null)
+  assert.deepEqual(
+    unreadable.map((entry) => `${entry.via}: ${entry.described}`),
+    [],
+    'a composition this check cannot match to LOCAL_DIRECTIONS is an instruction outside the capped inventory',
+  )
+
+  // EVERY DECLARED DIRECTION SHIPS, per direction rather than by counting calls.
+  const shipped = composed.map((entry) => entry.direction as LocalDirection)
   for (const direction of LOCAL_DIRECTIONS) {
-    const span = renderLocalDirection(direction, LOCAL_DIRECTION_CONTEXT)
-    const fragment = distinctiveFragment(span)
-    assert.ok(fragment.length > 20, `the ${direction.action} direction has no fragment long enough to test on`)
-    // The renderer has a branch for this action — that is where the sentence comes from...
     assert.ok(
-      model.includes(`case '${direction.action}':`),
-      `${DIRECTION_MODEL_FILE} has no branch for the ${direction.action} action, so its prose comes from `
-      + 'somewhere this check cannot see',
-    )
-    // ...and the sentence is NOT in the formatter, which may only compose it.
-    assert.equal(
-      formatter.includes(fragment),
-      false,
-      `${FORMATTER_FILE} writes the ${direction.action} direction's prose out by hand ("${fragment.slice(0, 60)}…"). `
-      + 'A message that contains a direction because somebody typed it is the round-17 shape: the span is '
-      + 'present, the instruction around it is unconstrained. Compose it with renderLocalDirection instead',
+      shipped.some((candidate) => sameDirection(candidate, direction)),
+      `the ${direction.action} direction ${JSON.stringify(direction)} is in the inventory but is composed nowhere `
+      + 'in the formatter — an entry counted against the cap that no record actually carries',
     )
   }
+  // ...and the sequence elements are counted, so a sequence cannot smuggle in an uncounted act.
+  for (const sequence of LOCAL_DIRECTION_SEQUENCES) {
+    for (const element of sequence) {
+      assert.ok(
+        LOCAL_DIRECTIONS.some((candidate) => sameDirection(candidate, element)),
+        `a declared sequence contains ${JSON.stringify(element)}, which is not in LOCAL_DIRECTIONS — the cap `
+        + 'would then be counting fewer instructions than the record carries',
+      )
+    }
+  }
+  assert.equal(LOCAL_DIRECTIONS.length, LOCAL_DIRECTION_CAP, 'and the inventory is exactly the cap')
+})
 
-  // AND EVERY COMPOSITION POINT IS A CALL. One per direction is the floor; there are more, because
-  // several directions are composed at two sites (the replay table and the frame around it).
-  const calls = formatter.match(/renderLocalDirection\(/g) ?? []
+test('ROUND 19 (Codex HIGH): no direction prose is written down, and SPLITTING THE LITERAL is not a way past it', async () => {
+  // Route: the formatter's string literals, flattened across `+` before being searched.
+  //
+  // Mutation: replace any renderLocalDirection call with the sentence it returns — split across two
+  // concatenated literals, which is precisely what defeated round 18 — and this fails naming the
+  // direction. Run below as a control on synthetic source, so the claim is demonstrated rather than
+  // asserted.
+  const formatter = await readFile(path.join(process.cwd(), FORMATTER_FILE), 'utf8')
+  assert.deepEqual(
+    handWrittenDirectionProse(formatter),
+    [],
+    `${FORMATTER_FILE} writes a direction's prose out by hand. A message that contains a direction because `
+    + 'somebody typed it is the round-17 shape: the span is present, the instruction around it is '
+    + 'unconstrained. Compose it with renderLocalDirection instead',
+  )
+
+  // NON-VACUITY, both ways, on a real direction's real sentence.
+  const shipped = renderLocalDirection(
+    { action: 'RE_READ', target: 'EMAIL_OUTBOX_ROWS' }, LOCAL_DIRECTION_CONTEXT,
+  )
+  const half = Math.floor(shipped.length / 2)
+  const contiguous = `const message = 'prefix ${shipped}'`
+  assert.deepEqual(
+    handWrittenDirectionProse(contiguous).length, 1,
+    'the checker must catch the sentence typed out in one literal, or it catches nothing',
+  )
+  const split = `const message = 'prefix ${shipped.slice(0, half)}'\n  + '${shipped.slice(half)}'`
+  assert.deepEqual(
+    handWrittenDirectionProse(split).length, 1,
+    'AND THE CODEX MUTATION: the same sentence split across two concatenated literals. Round 18 read the '
+    + 'raw source, so the fragment straddled the `+` and `includes` was false while the rendered message was '
+    + 'byte-identical. Flattening the concatenation first is what closes it',
+  )
+  // ...and the flattening must not bridge a genuine composition point, or every message would read
+  // as one run and the check would report prose nobody wrote.
+  const composedNotWritten = `const message = 'prefix ' + renderLocalDirection({ action: 'RE_READ', target: 'EMAIL_OUTBOX_ROWS' }, ctx) + ' suffix'`
+  assert.deepEqual(
+    handWrittenDirectionProse(composedNotWritten), [],
+    'a call between two literals breaks the run — composing is not writing down',
+  )
+
+  // AND THE COMPOSITION WALK REFUSES THE SAME MUTATION: the call it replaced is gone, so the
+  // direction is composed nowhere. Round 18's aggregate count could absorb exactly this.
+  assert.deepEqual(
+    composedDirections(split).filter((entry) => entry.direction !== null), [],
+    'the split-literal mutation leaves no composition point at all, which the per-direction walk reports',
+  )
+})
+
+// ---------------------------------------------------------------------------
+// ROUND 19 (Codex HIGH) — ONE ACTION, ON ONE DECLARED TARGET, PER DIRECTION.
+//
+// The type-checker probe below verifies DISCRIMINANTS: that an action is paired with a target it is
+// declared for, that no free-text field exists, that no member names a remote object. What it cannot
+// see is whether the rendered PROSE is exhausted by those discriminants — and round 18's ESCALATE
+// member proved the gap by shipping two imperatives under one {action, target}:
+//
+//     after: 'LEAVE_THE_TOGGLE_OFF'  ->  "Leave the toggle off and ESCALATE sync row {id}, …"
+//     after: 'FIX_THE_FAILURE'       ->  "Fix the failure named above, and ESCALATE sync row {id}, …"
+//
+// The first acts on SETTING_SYNC_ENABLED while the direction declares THIS_RECORD_AND_ITS_SYNC_ROW.
+// The second names an act — FIX — that is not an action this model has, against "the failure named
+// above", which is not one of its five targets. One capped inventory entry, two instructions, and
+// the cap counting the wrong thing.
+//
+// So three properties, all over the RENDERED output rather than over the type:
+//
+//   1. no direction's prose contains ANOTHER declared direction's prose whole — which is exactly
+//      what "Leave the toggle off and ESCALATE …" did once the leave-it-off half became a
+//      direction of its own;
+//   2. no direction's prose names the ANCHOR of a target other than its own;
+//   3. no direction's prose uses an imperative no action in the model declares.
+// ---------------------------------------------------------------------------
+
+/**
+ * Verbs that would be an ACTION if any direction had one, and which none does.
+ *
+ * A closed list, like every other fence in this file, and every entry is an act on somebody's data:
+ * the model's actions are all reads or a switch on one of IMS's own two settings. `FIX` is the one
+ * that shipped. Deliberately NOT here: `replay` and `re-run`, which appear in the model's prose
+ * DESCRIPTIVELY ("to learn what a replay would do", "re-run the query") rather than as instructions
+ * — a banlist that cannot tell those apart would have to be satisfied by rewording safe sentences.
+ */
+const UNDECLARED_IMPERATIVES: readonly RegExp[] = [
+  /\bfix\b/i, /\brepair\b/i, /\bresend\b/i, /\bretry\b/i, /\bdelete\b/i,
+  /\bvoid\b/i, /\breverse\b/i, /\bcredit-note\b/i, /\bcancel\b/i, /\bsettle\b/i, /\bclose\b/i,
+]
+
+test('ROUND 19 (Codex HIGH): each direction emits ONE action on its OWN declared target', () => {
+  // Route: renderLocalDirection over every member of LOCAL_DIRECTIONS, at runtime.
+  //
+  // Mutation: put the round-18 shape back — prefix the ESCALATE branch with 'Leave the toggle off
+  // and ' — and (1) fails, because that prefix IS the LEAVE_OFF direction's whole prose. Put back
+  // 'Fix the failure named above, and ' and (3) fails on `fix`. Both are run as controls below.
+  const rendered = LOCAL_DIRECTIONS.map((direction) => ({
+    direction,
+    text: renderLocalDirection(direction, LOCAL_DIRECTION_CONTEXT),
+  }))
+  assert.equal(rendered.length, LOCAL_DIRECTION_CAP, 'the inventory is the cap, so nothing is judged twice or not at all')
+
+  for (const { direction, text } of rendered) {
+    assert.ok(text.length > 0, `the ${direction.action} branch must produce prose`)
+
+    // 1. IT DOES NOT CONTAIN ANOTHER DIRECTION WHOLE.
+    for (const other of rendered) {
+      if (other === undefined || other.text === text) continue
+      assert.ok(
+        !text.includes(other.text),
+        `the ${direction.action}/${direction.target} direction emits the ${other.direction.action}/`
+        + `${other.direction.target} direction's whole instruction inside its own ("${other.text.slice(0, 40)}…"). `
+        + 'Two acts is a SEQUENCE of two directions, each counted against the cap and each declared '
+        + 'against the target it actually acts on',
+      )
+    }
+
+    // 2. IT NAMES NO OTHER TARGET.
+    for (const [name, target] of Object.entries(LOCAL_TARGET)) {
+      if (name === direction.target) continue
+      assert.ok(
+        !text.includes(target.anchor),
+        `the ${direction.action}/${direction.target} direction names "${target.anchor}", the anchor of `
+        + `${name} — so its sentence is about a target its declaration does not carry`,
+      )
+    }
+
+    // 3. IT USES NO IMPERATIVE THE MODEL DOES NOT DECLARE.
+    for (const imperative of UNDECLARED_IMPERATIVES) {
+      assert.doesNotMatch(
+        text, imperative,
+        `the ${direction.action}/${direction.target} direction uses an imperative no action in this model `
+        + 'declares. Either it is an act on somebody\'s data, which a record that can name nothing must not '
+        + 'instruct, or it is a real action and needs a member with its own permitted target',
+      )
+    }
+  }
+
+  // NON-VACUITY, on the two shapes that actually shipped, composed from the live renderings so the
+  // controls cannot rot into tests of hardcoded sentences.
+  const escalate = renderLocalDirection(
+    { action: 'ESCALATE', target: 'THIS_RECORD_AND_ITS_SYNC_ROW', naming: 'SYNC_ROW' }, LOCAL_DIRECTION_CONTEXT,
+  )
+  const leaveOff = renderLocalDirection(
+    { action: 'LEAVE_OFF', target: 'SETTING_SYNC_ENABLED', form: 'BEFORE_ESCALATION' }, LOCAL_DIRECTION_CONTEXT,
+  )
   assert.ok(
-    calls.length >= LOCAL_DIRECTIONS.length,
-    `${calls.length} composition points for ${LOCAL_DIRECTIONS.length} directions — a direction that ships `
-    + 'must be composed somewhere, or the inventory has grown past what the record actually says',
+    `${leaveOff} and ${escalate}`.includes(leaveOff),
+    'CONTROL for (1): the round-18 compound genuinely contains the LEAVE_OFF direction whole, so the '
+    + 'containment check is what refuses it rather than a coincidence of wording',
+  )
+  assert.ok(
+    UNDECLARED_IMPERATIVES.some((pattern) => pattern.test(`Fix the failure named above, and ${escalate}`)),
+    'CONTROL for (3): the round-18 FIX_THE_FAILURE prefix is caught by the banlist',
+  )
+  assert.ok(
+    !UNDECLARED_IMPERATIVES.some((pattern) => pattern.test(escalate)),
+    'and the shipped sentence is not, or the banlist rejects everything and proves nothing',
+  )
+
+  // AND THE COMPOUND IS REPRESENTED, so removing it was not the fix — it MOVED.
+  assert.equal(
+    renderLocalDirectionSequence(LEAVE_THE_TOGGLE_OFF_THEN_ESCALATE, LOCAL_DIRECTION_CONTEXT),
+    `${leaveOff} and ${escalate}`,
+    'the sequence renderer must produce exactly the sentence the compound direction used to, or the '
+    + 'record lost an instruction rather than gaining a structure for it',
   )
 })
 

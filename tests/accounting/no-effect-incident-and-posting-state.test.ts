@@ -74,7 +74,7 @@ const QBO_NO_EFFECT =
   + 'on this installation — invoices, bills, payments and journals with nothing to do with this '
   + 'row — for as long as it stays off. WHAT IS ACTUALLY WRONG IS THE WRITE, NOT THE OPERATION: '
   + 'sync row log-1 was left PROCESSING at attempt revision 0 with no mirrored event, and nothing '
-  + 'in IMS will settle it. Fix the failure named above, and ESCALATE sync row log-1, with this '
+  + 'in IMS will settle it. ESCALATE sync row log-1, with this '
   + 'record, to whoever administers this installation: closing it safely needs someone who can '
   + 'read the database directly (o3d-4b5p, o3d-3lhp). ONE THING ON SCREEN IS ACTIVELY WRONG AND '
   + 'YOU WILL SEE IT: the accounting log renders a settle control for every FAILED or PROCESSING '

@@ -1,6 +1,8 @@
 import type { AccountingSyncType } from '@/app/generated/prisma/client'
 import {
   renderLocalDirection,
+  renderLocalDirectionSequence,
+  LEAVE_THE_TOGGLE_OFF_THEN_ESCALATE,
   type LocalDirectionContext,
 } from '@/lib/domain/accounting/local-operator-direction'
 
@@ -1129,8 +1131,14 @@ const UPDATE_OUTCOME_UNRECORDED_REMEDY: string =
   + 'SAY is whether the document it changed is LIVE or an UNPOSTED DRAFT: the update is sent with a '
   + 'status resolved from the same posting-mode setting the create uses, and IMS did not record '
   + 'which was in force for this attempt. So it cannot say whether any balance moved. DO NOT void, '
-  + 'credit-note, reverse or delete anything on the strength of this record. Escalate this record to '
-  + 'whoever administers this installation'
+  + 'credit-note, reverse or delete anything on the strength of this record. '
+  // r19 (Codex HIGH), FOUND BY THE NEW CHECK: this escalation was typed out here, split across the
+  // `+` above — which is exactly why round 18's raw-source scan could not see it. Its sibling
+  // OUTCOME_UNRECORDED_REMEDY composed the same sentence three constants earlier.
+  + renderLocalDirection(
+    { action: 'ESCALATE', target: 'THIS_RECORD_AND_ITS_SYNC_ROW', naming: 'RECORD_ONLY', caseForm: 'SENTENCE' },
+    QBO_DIRECTIONS,
+  )
 
 /**
  * THE DOCUMENT REMEDY, PER OPERATION SEMANTIC AND PER POSTING MODE (round 10, Codex HIGH).
@@ -2118,13 +2126,13 @@ function describeQboNoEffectIncident(
     + 'journals with nothing to do with this row — for as long as it stays off. '
     + `WHAT IS ACTUALLY WRONG IS THE WRITE, NOT THE OPERATION: sync row ${entry.id} was left `
     + 'PROCESSING at attempt revision 0 with no mirrored event, and nothing in IMS will settle it. '
+    // r19 (Codex HIGH): the "Fix the failure named above, and" clause is gone. FIX was not an action
+    // this model has and "the failure named above" was not one of its targets — and the paragraph
+    // above already says the failure IS the write, and the tail below says closing the row safely
+    // needs someone who can read the database directly. It was an instruction nobody reading this
+    // record could perform.
     + renderLocalDirection(
-      {
-        action: 'ESCALATE',
-        target: 'THIS_RECORD_AND_ITS_SYNC_ROW',
-        naming: 'SYNC_ROW',
-        after: 'FIX_THE_FAILURE',
-      },
+      { action: 'ESCALATE', target: 'THIS_RECORD_AND_ITS_SYNC_ROW', naming: 'SYNC_ROW' },
       directionsFor('QuickBooks', entry.id),
     )
     + ': closing it safely needs someone who can read the database '
@@ -2212,7 +2220,10 @@ export function describeUnpersistedQboPost(incident: UnpersistedQboPost, cause: 
       + 'that setting before they call the QuickBooks processor, so while it is off neither one '
       + 'STARTS another run. It stops EVERY QuickBooks row, not this one, and it recalls nothing '
       + 'already queued or already done. '
-      + renderLocalDirection({ action: 'LEAVE_OFF', target: 'SETTING_SYNC_ENABLED' }, directionsFor('QuickBooks', entry.id))
+      + renderLocalDirection(
+        { action: 'LEAVE_OFF', target: 'SETTING_SYNC_ENABLED', form: 'NOT_A_FENCE' },
+        directionsFor('QuickBooks', entry.id),
+      )
       + ' Both of those call sites read the '
       + 'setting and then call the processor with nothing in between, so a run admitted a moment '
       + 'before you flipped it keeps going: it can claim THIS row afterwards, run the operation '
@@ -2224,13 +2235,11 @@ export function describeUnpersistedQboPost(incident: UnpersistedQboPost, cause: 
       + 'this row quiet. '
       + `SO DO NOT CLOSE THIS ROW YOURSELF, AND DO NOT TURN QUICKBOOKS SYNC BACK ON TO FINISH THE `
       + 'JOB. '
-      + renderLocalDirection(
-        {
-          action: 'ESCALATE',
-          target: 'THIS_RECORD_AND_ITS_SYNC_ROW',
-          naming: 'SYNC_ROW',
-          after: 'LEAVE_THE_TOGGLE_OFF',
-        },
+      // r19 (Codex HIGH): TWO acts, so TWO directions. The leave-it-off half acts on
+      // SETTING_SYNC_ENABLED and is declared against it; the escalation acts on this record and its
+      // sync row. The sentence is unchanged — the sequence renderer joins them with the same " and ".
+      + renderLocalDirectionSequence(
+        LEAVE_THE_TOGGLE_OFF_THEN_ESCALATE,
         directionsFor('QuickBooks', entry.id),
       )
       + ': closing it safely needs someone who can read the database '

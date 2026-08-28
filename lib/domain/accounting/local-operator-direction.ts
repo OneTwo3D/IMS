@@ -17,6 +17,11 @@
  *
  * Nothing about the model itself changed in the move: the same five targets, the same fourteen
  * directions, the same total renderer. What changed is which artefact the invariant is about.
+ *
+ * ROUND 19 (Codex HIGH) THEN FIXED WHAT THE MOVE EXPOSED: one direction was emitting two
+ * imperatives, only one of which its declared {action, target} covered. See the block above
+ * `LocalDirectionSequence` at the end of this file — compound remediation is a SEQUENCE now, and
+ * `after` is gone.
  */
 
 /**
@@ -141,19 +146,19 @@ export type LocalDirection =
   | { action: 'READ'; target: 'EMAIL_OUTBOX_ROWS'; read: readonly OutboxReadAxis[] }
   | { action: 'RE_READ'; target: 'EMAIL_OUTBOX_ROWS' }
   | { action: 'TURN_OFF'; target: 'SETTING_SYNC_ENABLED'; control: 'LEVER_BELOW' | 'CONNECTOR_PANEL_CHECKBOX' }
-  | { action: 'LEAVE_OFF'; target: 'SETTING_SYNC_ENABLED' }
+  /**
+   * o3d-batch-ret r19 (Codex HIGH): the two LEAVE-IT-OFF sentences are two FORMS of one action on
+   * one target, not one of them plus a clause hidden inside an escalation. `BEFORE_ESCALATION` is
+   * the half that used to live in the ESCALATE branch's `after` field.
+   */
+  | { action: 'LEAVE_OFF'; target: 'SETTING_SYNC_ENABLED'; form: 'NOT_A_FENCE' | 'BEFORE_ESCALATION' }
   | {
       action: 'READ_SETTING'
       target: 'SETTING_ATTACH_PDF'
       lead: 'THEN_GO_AND' | 'NONE'
       purpose: 'LEARN_WHAT_A_REPLAY_WOULD_DO' | 'NONE'
     }
-  | {
-      action: 'ESCALATE'
-      target: 'THIS_RECORD_AND_ITS_SYNC_ROW'
-      naming: 'SYNC_ROW'
-      after: 'LEAVE_THE_TOGGLE_OFF' | 'FIX_THE_FAILURE'
-    }
+  | { action: 'ESCALATE'; target: 'THIS_RECORD_AND_ITS_SYNC_ROW'; naming: 'SYNC_ROW' }
   | {
       action: 'ESCALATE'
       target: 'THIS_RECORD_AND_ITS_SYNC_ROW'
@@ -204,7 +209,9 @@ export function renderLocalDirection(direction: LocalDirection, context: LocalDi
           + `the SYNC tab of the ${context.ledger} connector panel, and it writes the setting `
           + `${SETTING_NAME[direction.target]}.`
     case 'LEAVE_OFF':
-      return 'THEN LEAVE IT OFF, BECAUSE TURNING IT OFF IS NOT A FENCE.'
+      return direction.form === 'NOT_A_FENCE'
+        ? 'THEN LEAVE IT OFF, BECAUSE TURNING IT OFF IS NOT A FENCE.'
+        : 'Leave the toggle off'
     case 'READ_SETTING': {
       const lead = direction.lead === 'THEN_GO_AND' ? 'THEN GO AND ' : ''
       const purpose = direction.purpose === 'LEARN_WHAT_A_REPLAY_WOULD_DO'
@@ -215,10 +222,7 @@ export function renderLocalDirection(direction: LocalDirection, context: LocalDi
     case 'ESCALATE': {
       const administrator = 'to whoever administers this installation'
       if (direction.naming === 'SYNC_ROW') {
-        const after = direction.after === 'LEAVE_THE_TOGGLE_OFF'
-          ? 'Leave the toggle off and '
-          : 'Fix the failure named above, and '
-        return `${after}ESCALATE sync row ${context.syncRowId}, with this record, ${administrator}`
+        return `ESCALATE sync row ${context.syncRowId}, with this record, ${administrator}`
       }
       return `${direction.caseForm === 'SENTENCE' ? 'Escalate' : 'escalate'} this record ${administrator}`
     }
@@ -264,14 +268,75 @@ export const LOCAL_DIRECTIONS: readonly LocalDirection[] = [
     purpose: 'LEARN_WHAT_A_REPLAY_WOULD_DO',
   },
   { action: 'TURN_OFF', target: 'SETTING_SYNC_ENABLED', control: 'CONNECTOR_PANEL_CHECKBOX' },
-  { action: 'LEAVE_OFF', target: 'SETTING_SYNC_ENABLED' },
-  // The escalation, in the four shapes the module writes it. Its target is this record and the sync
-  // row this message names — both IMS's own.
-  { action: 'ESCALATE', target: 'THIS_RECORD_AND_ITS_SYNC_ROW', naming: 'SYNC_ROW', after: 'LEAVE_THE_TOGGLE_OFF' },
-  { action: 'ESCALATE', target: 'THIS_RECORD_AND_ITS_SYNC_ROW', naming: 'SYNC_ROW', after: 'FIX_THE_FAILURE' },
+  { action: 'LEAVE_OFF', target: 'SETTING_SYNC_ENABLED', form: 'NOT_A_FENCE' },
+  { action: 'LEAVE_OFF', target: 'SETTING_SYNC_ENABLED', form: 'BEFORE_ESCALATION' },
+  // The escalation, in the three shapes the module writes it. Its target is this record and the
+  // sync row this message names — both IMS's own — and it is ONE act on that one target: the
+  // "leave the toggle off" half is now the LEAVE_OFF direction above, sequenced in front of it.
+  { action: 'ESCALATE', target: 'THIS_RECORD_AND_ITS_SYNC_ROW', naming: 'SYNC_ROW' },
   { action: 'ESCALATE', target: 'THIS_RECORD_AND_ITS_SYNC_ROW', naming: 'RECORD_ONLY', caseForm: 'SENTENCE' },
   { action: 'ESCALATE', target: 'THIS_RECORD_AND_ITS_SYNC_ROW', naming: 'RECORD_ONLY', caseForm: 'CLAUSE' },
 ]
 
 /** The most instructions a record that can name nothing may carry. Raising this IS the decision. */
 export const LOCAL_DIRECTION_CAP = 14
+
+// ---------------------------------------------------------------------------
+// COMPOUND REMEDIATION IS A SEQUENCE OF DIRECTIONS, NOT A DIRECTION WITH AN EXTRA CLAUSE
+// (o3d-batch-ret r19, Codex HIGH).
+//
+// r18's ESCALATE member carried `after: 'LEAVE_THE_TOGGLE_OFF' | 'FIX_THE_FAILURE'`, and the
+// renderer put that clause in front of the escalation. So ONE typed direction emitted TWO
+// imperatives — and only one of them was covered by its declared {action, target}:
+//
+//   • `LEAVE_THE_TOGGLE_OFF` acts on SETTING_SYNC_ENABLED while the direction declares
+//     THIS_RECORD_AND_ITS_SYNC_ROW. The target did not choose that sentence; a neighbouring
+//     enum value did, which is the r17 `span` defect wearing an enum instead of a string.
+//   • `FIX_THE_FAILURE` was worse: FIX is not an action this model has at all, and "the failure
+//     named above" is not one of the five targets. It named an act on an object the closed union
+//     was written to make unnameable.
+//
+// AND THE TYPE-CHECKER PROBE COULD NOT SEE EITHER, because it verifies discriminants and not
+// whether the rendered prose is exhausted by them. One entry in a capped inventory was carrying two
+// instructions, so the cap was counting something other than what it claims to count.
+//
+// So: `after` is gone. The leave-it-off half is a LEAVE_OFF direction on its own declared target,
+// in a second FORM, and the compound remediation is the SEQUENCE below. FIX is simply removed —
+// the message it sat in already says the failure is the WRITE and that closing the row safely needs
+// someone who can read the database directly (o3d-4b5p, o3d-3lhp), so "fix the failure named above"
+// was an instruction nobody reading that record could perform.
+//
+// EVERY ELEMENT OF EVERY SEQUENCE IS A MEMBER OF `LOCAL_DIRECTIONS`, so a sequence cannot introduce
+// an instruction the cap has not counted. That is asserted, not merely intended.
+// ---------------------------------------------------------------------------
+
+/** One remediation that is genuinely two acts, in the order they must be performed. */
+export type LocalDirectionSequence = readonly [LocalDirection, LocalDirection, ...LocalDirection[]]
+
+/**
+ * Compose a sequence into the shipped sentence.
+ *
+ * The join is the ONLY conjunction this module produces. A renderer branch that wanted to say "do A
+ * and then B" has to become two directions and come through here, which is what makes "one action
+ * on one declared target" a property of every branch rather than a habit of the person writing one.
+ */
+export function renderLocalDirectionSequence(
+  sequence: LocalDirectionSequence,
+  context: LocalDirectionContext,
+): string {
+  return sequence.map((direction) => renderLocalDirection(direction, context)).join(' and ')
+}
+
+/**
+ * THE COMPOUND REMEDIATIONS THE RECORDS SHIP. Declared here for the same reason the directions are:
+ * so the inventory is a list somebody has to change in front of a reviewer, not an argument shape.
+ */
+export const LEAVE_THE_TOGGLE_OFF_THEN_ESCALATE: LocalDirectionSequence = [
+  { action: 'LEAVE_OFF', target: 'SETTING_SYNC_ENABLED', form: 'BEFORE_ESCALATION' },
+  { action: 'ESCALATE', target: 'THIS_RECORD_AND_ITS_SYNC_ROW', naming: 'SYNC_ROW' },
+]
+
+/** Every declared sequence, so the test can hold all of them to the inventory. */
+export const LOCAL_DIRECTION_SEQUENCES: readonly LocalDirectionSequence[] = [
+  LEAVE_THE_TOGGLE_OFF_THEN_ESCALATE,
+]
