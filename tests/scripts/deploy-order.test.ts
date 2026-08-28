@@ -2458,6 +2458,9 @@ release_db_connections(){ echo "release_db_connections" >> "\${LOG}"; return 0; 
 refence_db_connections(){ echo "refence_db_connections" >> "\${LOG}"; return 0; }
 write_fence_marker(){ echo "write_fence_marker $*" >> "\${LOG}"; return 0; }
 write_cutover_marker(){ echo "write_cutover_marker $*" >> "\${LOG}"; return 0; }
+# o3d-2sm1.5 r23: the trap withdraws the environment snapshot it published before it re-fences.
+# Stubbed like every other side effect here, and RECORDED, so the ordering assertions can see it.
+remove_db_identity_snapshot(){ echo "remove_db_identity_snapshot" >> "\${LOG}"; return 0; }
 `
 
 function runTrapHarness(
@@ -4598,6 +4601,10 @@ for (const entry of FENCE_HARNESS) {
         entry.preamble(dir),
         'error() { echo "ERROR: $*" >&2; }',
         'DB_FENCE_RAISED=false',
+        // THE RECOVERY PATH, which is the only path this function is reached from: the migration
+        // has run. Since r23 that is also what tells the re-fence not to re-ask the unit-source
+        // START gate, so it has to be stated rather than left unset.
+        'SCHEMA_TOUCHED=true',
         shellFunction(entry.source, 'refence_db_connections'),
         shellFunction(entry.source, 'release_db_connections'),
         'refence_db_connections || echo "REFENCE REPORTED FAILURE"',

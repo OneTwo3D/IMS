@@ -682,7 +682,10 @@ defines it:
   the same refusal as the bare name: it removes what the file supplied and leaves the application's
   own dotenv loader to replace it;
 * **any second `EnvironmentFile=`** — refused *without being read*, because that it may define the
-  variable is enough, and reading it to find out puts the precedence question straight back;
+  variable is enough, and reading it to find out puts the precedence question straight back. The
+  one exception is the run's **own environment snapshot**, described below: refused unless *this*
+  run published it, unless it is the snapshot's exact path, unless it is **last**, and unless it is
+  loaded without a leading `-`. A **third** file is refused by count, as before;
 * a non-empty **`PAMName=`**. `systemd.exec` lists the variables PAM modules set *after* the
   `EnvironmentFile=` layer and says the later source wins, so a unit naming a PAM profile whose
   stack runs `pam_env` can be handed a different `DATABASE_URL` while every other property still
@@ -703,8 +706,57 @@ separators. The stated count is checked against the elements found, a disagreeme
 and a string systemd had to escape (`busctl` prints through `cescape()`) is refused rather than
 decoded.
 
-`install.sh` is **exempt**: it owns the four values, creates the role and the database with them
-and composes `DATABASE_URL` out of them, so it parses nothing and has no file to be wrong about.
+`install.sh` **was exempt and is not any more** (o3d-2sm1.5 r23). It still owns the four values and
+still parses nothing — its identity is the shell value it composed, and it re-checks that value
+against the file by string comparison rather than by re-parsing it. But the reasoning that it "has
+no file to be wrong about" stopped being true at the line where it **writes** `APP_DIR/.env`, long
+before the build, the migration and the start of a unit that loads that file at exec. It now asks
+systemd the same bus question about the unit it has just written, after its own `daemon-reload` and
+before `systemctl enable --now`.
+
+### The environment snapshot: binding, not checking (o3d-2sm1.5 r23)
+
+Rounds 13-22 asked *which database will the running service use* eleven ways, and every answer was
+correct and incomplete for the same reason: it was a **read** of a file systemd reads later, at
+exec, and that something else can replace in between. Round 22 moved the last read to the last line
+before `systemctl start`; that shortens the window and does not close it. The timestamp, the
+`unmask`, the logging and the earlier units in the start loop all execute after the check and
+before the exec.
+
+So the last round stops checking and **binds**. Immediately before the connection fence comes down,
+and with it still held, each entrypoint:
+
+1. writes the `DATABASE_URL` it fenced and migrated with to
+   `/etc/ims-cutover/db-identity-snapshot.env` — a **root-owned, 0700** directory and a 0600 file,
+   deliberately **not** under the cutover state directory, which the application user owns and
+   could therefore rewrite. systemd reads `EnvironmentFile=` as PID 1, before it drops to `User=`,
+   so the service never needs to read it. The value is written **single-quoted**, the one form
+   `systemd.exec` documents as verbatim, so the deploy's reader and systemd's reader cannot
+   disagree about a password containing a backslash or a `#`. A value carrying a single quote has
+   no verbatim spelling and is **refused**;
+2. gives every unit a `zz-deploy-db-identity.conf` drop-in that loads that file. `systemd.exec`:
+   *"If the same variable is set twice from these files, the files will be read in the order they
+   are specified and the later setting will override the earlier setting"*, and *"Settings from
+   these files override settings made with `Environment=`"*. The `zz-` prefix puts it last. So
+   whatever `APP_DIR/.env` has come to say by exec time, `DATABASE_URL` is the snapshot's;
+3. loads it with **no leading `-`**. A missing snapshot is then a **start failure**, not a silent
+   fall-through to the application's own dotenv overlays — the difference that made a *deleted*
+   `.env` dangerous, since the shipped units load that one with a `-`;
+4. asks the bus, after this run's final `daemon-reload`, that the loaded configuration really does
+   name the snapshot, last and mandatory, and that nothing else defines the variable.
+
+**Why that closes a race a re-read could not.** Two systemd reads are involved and they have
+different timing. The **set** of environment files is unit *configuration*, fixed at
+`daemon-reload` and **not** re-read by `systemctl start`; the **contents** are read at exec. The
+run issues the final reload itself, verifies the loaded list after it, and nothing between that
+verification and the start issues another — so the list cannot move under it. The contents can be
+changed only by root.
+
+The binding is **removed on every exit path**: on the success path once the health check is behind
+it, and in the failure trap. A drop-in left standing would override `APP_DIR/.env` for every
+restart, reboot and `Restart=` that followed, silently, from a file in `/etc/systemd/system` that
+no document mentions. A snapshot a `SIGKILL`ed run left behind is refused by the bus question
+above — this run did not publish it — and cleared at the validate phase, before anything asks.
 
 One thing this question cannot see, stated rather than papered over: an `ExecStart=` running a
 **wrapper that exports `DATABASE_URL` itself** is invisible to systemd's own properties, because
@@ -865,7 +917,8 @@ that moment on leaves a marker that adoption reads as *hold*.
 **A failed start does not get to claim the fence is up** (o3d-2sm1.4). The start phase releases the
 connection fence and removes the reboot marker *before* `systemctl start` and the health check,
 because the new build cannot serve a database it may not connect to. If either then fails, the
-failure path re-stops the service, **re-establishes the connection fence**, and prints — and records
+failure path re-stops the service, withdraws the environment snapshot it published,
+**re-establishes the connection fence**, and prints — and records
 in the marker as `db_connect_fence=held|released` — which of the two is actually true. If it cannot
 put the fence back it says `THE CONNECTION FENCE IS NOT IN PLACE` rather than describing one that
 does not exist.
