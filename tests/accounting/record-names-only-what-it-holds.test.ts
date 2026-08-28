@@ -151,6 +151,13 @@ async function retainedMetadataKeys(): Promise<{ perBuilder: Map<string, Set<str
 type WordingEntryView = {
   label: string
   templates: string[]
+  /**
+   * ROUND 15: the same strings KEYED BY FIELD. The round-14 fence judges an entry as a bag of
+   * prose, which is right for "may this entry name an act at all". The directive fence below has to
+   * separate the fields that TELL THE OPERATOR WHAT TO DO from the ones that say what happened, and
+   * a flattened array cannot.
+   */
+  fields: Record<string, string>
   needs: readonly string[]
   lookup: readonly string[]
 }
@@ -163,6 +170,7 @@ function everyWordingEntry(): WordingEntryView[] {
     out.push({
       label: `DOCUMENT_INCIDENT_WORDING.${key}`,
       templates: Object.values(rest),
+      fields: rest as Record<string, string>,
       needs,
       lookup: lookup ?? [],
     })
@@ -174,6 +182,7 @@ function everyWordingEntry(): WordingEntryView[] {
       out.push({
         label: `NON_DOCUMENT_INCIDENT_WORDING.${type}${variant ? `.${variant}` : ''}`,
         templates: Object.values(rest),
+        fields: rest as Record<string, string>,
         needs,
         lookup: lookup ?? [],
       })
@@ -201,6 +210,7 @@ function everyReplayWordingEntry(): WordingEntryView[] {
       out.push({
         label: `QBO_OPERATIONS_WITHOUT_REQUEST_ID.${type}${variant ? `.${variant}` : ''}`,
         templates: Object.values(rest),
+        fields: rest as Record<string, string>,
         needs: needs ?? [],
         lookup: lookup ?? [],
       })
@@ -587,7 +597,13 @@ function mutationLexemes(
     let prose = template.replace(/\{Lookup\}|\{lookup\}/g, ' ')
     // EXACT, CASE-SENSITIVE, WHOLE-STRING removal. Not a pattern: a prohibition that has been
     // reworded no longer matches its line, and fails until the line is updated to match it.
-    for (const prohibition of allowed) prose = prose.split(prohibition).join(' ')
+    // ROUND 15: LONGEST FIRST. Exact removal is order-dependent — 'there is no document there to
+    // open' is a substring of nothing here today, but a short line that happens to sit inside a long
+    // one would consume half of it and leave the remainder unmatched, failing on prose that IS
+    // enumerated. Sorting makes the allowlist a set rather than a sequence.
+    for (const prohibition of [...allowed].sort((a, b) => b.length - a.length)) {
+      prose = prose.split(prohibition).join(' ')
+    }
     MUTATION_LEXEME.lastIndex = 0
     let match: RegExpExecArray | null
     while ((match = MUTATION_LEXEME.exec(prose)) !== null) found.push(match[0].toLowerCase())
@@ -992,4 +1008,417 @@ test('ROUND 9 (Codex MEDIUM): the reset breadcrumb attributes to the incident on
   assert.match(emailRecord, /DO NOT REPORT A COUNT/, 'the record forbids exactly what the breadcrumb used to attribute')
   assert.doesNotMatch(breadcrumb, /the count cannot be made/i)
   assert.match(breadcrumb, /statuses can no longer be inspected/)
+})
+
+// =============================================================================================
+// ROUND 15 (Codex HIGH x2) — THE FENCE MOVES TO THE SHIPPED MESSAGE, AND FROM THE VERB TO THE
+// OBJECT.
+//
+// TWO FINDINGS, AND THEY ARE THE SAME MISTAKE TWICE: the check was aimed at something ADJACENT to
+// the thing that matters.
+//
+// FINDING 1 — IT SCANNED THE TABLES, NOT THE MESSAGE. `lookupLessTemplates()` reads the three
+// wording tables. What an operator reads is what the FORMATTERS emit, and they concatenate their
+// own prose around those entries. So every word the frames contribute was outside the fence, and
+// Codex named a live instance: the QuickBooks frame ends every no-request-id record with "o3d-3lhp
+// (a per-row remediation, and A WAY TO CANCEL A QUEUED EMAIL)". Delete the two enumerated email
+// prohibitions and the round-14 test still passes while the shipped message still says `cancel`.
+// Twelve rounds of these records have gone wrong in the FRAMING at least as often as in the table.
+//
+// FINDING 2 — THE VERB LIST WAS STILL A LIST. Round 14 admitted this in writing: an instruction
+// phrased without one of the fifteen stems passes. "Go to that bill and take the second PDF off it"
+// is not caught, and the same corpus already writes mutations as `APPLIED`, `wrote`, bare `CREDIT`
+// and `TURN … OFF`. A documented hole is not enough when the hole IS the invariant.
+//
+// THE FIX FOR BOTH IS ONE IDEA: STOP ENUMERATING THE OPEN HALF OF THE SENTENCE.
+//
+// English has no closed set of ways to tell somebody to do something — four rounds of chasing that
+// is what rounds 9 through 14 were. But it has a CLOSED SET OF THINGS THIS MODULE CAN TELL THEM TO
+// DO IT TO. The objects that live in somebody else\u2019s system are a fixed vocabulary: bill,
+// invoice, credit note, journal, payment, tax rate, document, attachment, order, and the systems
+// themselves. An instruction to act on one of them must SAY WHICH ONE, or the operator cannot go
+// anywhere; and to say which one it must use that vocabulary, or name the ledger, or point at it
+// ("there"). So the fence is pointed at the OBJECT, where the class is closed, instead of at the
+// VERB, where it never was.
+//
+// "Go to that bill and take the second PDF off it" contains no listed verb and is refused anyway,
+// because it says `bill`.
+//
+// THE INVARIANT, WHOLE, IN ONE SENTENCE. In the prose that tells an operator what to do, on an
+// entry that declares no lookup:
+//
+//   • a span that names an ACT must be an enumerated PROHIBITION, and a prohibition must REFUSE
+//     (round 14, unchanged);
+//   • a span that names a REMOTE OBJECT must be an enumerated STATEMENT that contains no act and
+//     does refuse or disclaim, or one of a SHORT, capped list of instructions at a LOCAL object;
+//   • therefore no sentence can direct an act at an object the record cannot name — whatever verb
+//     it uses, because the verb is no longer what is being asked about.
+//
+// WHAT THIS COSTS, SAID PLAINLY. The residue is not a language hole any more, it is a REVIEW GATE:
+// Codex\u2019s sentence can only ship by being added to `LOCAL_INSTRUCTION_TEMPLATES`, which is capped,
+// commented per line, and required to contain no act. That is a deliberate, reviewable line in this
+// file rather than a verb nobody thought of. The structured declared-target model (o3d-cvyv) would
+// replace the gate with a type; it is a rewrite of all three tables and both formatters, and it is
+// not what closes THIS hole — this does.
+// =============================================================================================
+
+/**
+ * The fixture ledger identifiers. A rendered message containing one of these CAN name its object,
+ * so the round-10/11 declaration tests govern it; one that contains none is the corpus here.
+ *
+ * This is the property of the SHIPPED MESSAGE, deliberately, rather than a walk back to the entry
+ * that produced it. Finding 1 is precisely that the message is more than its entry.
+ */
+const LEDGER_ID_FIXTURES = ['EXT-1', 'EXT-OTHER', 'LEDGER-BILL-1']
+
+/**
+ * Put the per-incident values BACK into placeholder form, so one frame sentence is one line here.
+ * The sync row id and the ledger name vary per message and per connector; the sentence does not.
+ */
+function normaliseRenderedValues(text: string): string {
+  return text
+    .split('log-1').join('{syncRowId}')
+    .split('QuickBooks').join('{ledger}')
+    .split('Xero').join('{ledger}')
+    .split('QUICKBOOKS').join('{LEDGER}')
+    .split('XERO').join('{LEDGER}')
+}
+
+/** Every message this module can produce that names no ledger identifier at all. */
+function everyNamelessMessage(): { label: string; text: string }[] {
+  return everyIncidentMessage()
+    .filter(({ text }) => !LEDGER_ID_FIXTURES.some((id) => text.includes(id)))
+    .map(({ label, text }) => ({ label, text: normaliseRenderedValues(text) }))
+}
+
+/**
+ * THE SPANS THE FORMATTERS THEMSELVES CONTRIBUTE, verbatim. Same closed-allowlist discipline as
+ * `PROHIBITION_TEMPLATES` and the same three checks below: each must contain a mutation lexeme (or
+ * it exempts nothing), each must refuse (or it is not a prohibition), and each must still appear in
+ * a shipped message (or it is a hole nothing stands in).
+ *
+ * These are the frames\u2019 own refusals and the reset breadcrumb\u2019s estate-level prose. They were
+ * never scanned before this round.
+ */
+const FRAME_TEMPLATES: readonly string[] = [
+  'AND THE RESPONSE CARRIED NO ID EITHER, so there is nothing to open — do not go looking for '
+    + 'one.',
+  'NO ID WAS RETURNED, so there is nothing to open — do not go looking for one.',
+  'ONE OF THE TWO IDS IS NOT RECORDED HERE, so they cannot both be opened.',
+  'Leave the toggle off and ESCALATE sync row {syncRowId}, with this record, to whoever '
+    + 'administers this installation: closing it safely needs someone who can read the database '
+    + 'directly, and the machinery that would make an operator remedy sound is filed as o3d-4b5p (a '
+    + 'quiescence fence the cron, the manual sync, the claim and the writeback all honour) and '
+    + 'o3d-3lhp (a per-row remediation, and a way to cancel a queued email).',
+  'name a LIVE effect {ledger} or {ledger} accepted and still holds — real money in somebody '
+    + 'else\'s books, which no reset of ours undoes.',
+  'Open the id in that system, and read the record itself for what the operation actually did '
+    + 'before you void, credit or reverse anything.',
+  'are the same kind of write — a DOCUMENT {ledger} or {ledger} accepted, which no reset of '
+    + 'ours voids — ON A RECORD THAT CARRIES NO ID.',
+  'DO NOT GO LOOKING FOR AN ID: there is none to open.',
+  'DO NOT void, credit-note or reverse any of them: a reversal POSTS FOR REAL, and would move '
+    + 'the accounts by exactly the amount the draft never moved.',
+  'THEY WERE NOT ALL CREATED AS DRAFTS: this count also holds documents that were MODIFIED '
+    + 'while unposted, and deleting one of those destroys a draft that stood there before the '
+    + 'attempt ran.',
+  'Read the record itself before deleting anything.',
+  'Do not void, credit, reverse or delete anything on the strength of these.',
+  'record a write {ledger} or {ledger} ACCEPTED that is NOT a standalone document and has NO id '
+    + 'to open — a credit note APPLIED to a bill, a tax rate written into the organisation.',
+  'The write stands and no reset of ours undoes it, and the allocation moved money.',
+  'The queued-email one never had a remote document at all — only a local email-outbox row, '
+    + 'WHICH THIS RESET HAS JUST DELETED: the outbox rows that record tells you to inspect are gone '
+    + 'with it, so their statuses can no longer be inspected.',
+]
+
+// MUTATION THAT KILLS THIS (run): delete `'IMS CANNOT CANCEL A QUEUED COPY'` and
+// `'no action, route or screen removes an unsent row'` from PROHIBITION_TEMPLATES — the round-14
+// test goes on passing, because it reads the tables, and THIS one fails naming the rendered
+// QuickBooks INVOICE_EMAIL message and `cancel`, which is Codex\u2019s live route. RUN. Deleting any
+// FRAME_TEMPLATES line kills it the other way — RUN with the o3d-3lhp sentence removed, it fails on
+// `cancel` in the frame tail, which is the word no table contains.
+//
+// ROUTE: the corpus is `everyIncidentMessage()` — the SHIPPED formatter output for every type,
+// every outcome and every id combination — not the wording tables.
+test('ROUND 15 (Codex HIGH): the fence scans the SHIPPED OPERATOR MESSAGE, frames included', () => {
+  const messages = everyNamelessMessage()
+  assert.ok(messages.length > 500, `sanity: ${messages.length} nameless messages were scanned`)
+  const allowed = [...PROHIBITION_TEMPLATES, ...FRAME_TEMPLATES]
+
+  for (const { label, text } of messages) {
+    const lexemes = mutationLexemes([text], allowed)
+    assert.deepEqual(
+      lexemes, [],
+      `${label} tells an operator about the act(s) ${lexemes.join(', ')} in a message that names no `
+      + 'ledger identifier, so nothing in it says which object they would act on. Either the record '
+      + 'must retain and print an identifier, or the sentence must be an escalation, or — if it '
+      + 'REFUSES the act — it must be enumerated in PROHIBITION_TEMPLATES or FRAME_TEMPLATES.',
+    )
+  }
+
+  // NOT VACUOUS: the rendered corpus passes THROUGH the allowlist, not past it.
+  const bare = messages.flatMap(({ text }) => mutationLexemes([text], []))
+  assert.ok(
+    bare.length >= 500,
+    `the allowlist must be doing work: with it empty the rendered corpus yields ${bare.length} lexemes`,
+  )
+  // AND THE FRAME LIST IS DOING ITS OWN SHARE — the tables alone do not carry the frames.
+  const tablesOnly = messages.flatMap(({ text }) => mutationLexemes([text], PROHIBITION_TEMPLATES))
+  assert.ok(
+    tablesOnly.length > 0,
+    'with only the wording-table prohibitions allowed the rendered corpus must still show lexemes, '
+    + 'or FRAME_TEMPLATES is standing in front of nothing and finding 1 was not real',
+  )
+})
+
+// ---------------------------------------------------------------------------------------------
+// FINDING 2 — THE OBJECT FENCE.
+// ---------------------------------------------------------------------------------------------
+
+/** The fields that TELL AN OPERATOR WHAT TO DO, as opposed to saying what happened. */
+const DIRECTIVE_FIELDS = new Set([
+  'remedy', 'remedyRowGone', 'remedyDuplicate', 'remedyIdUnrecorded', 'check',
+])
+
+/**
+ * A REMOTE REFERENCE: any way this module has of saying WHICH object in somebody else\u2019s system a
+ * sentence is about. Three closed groups, and between them an instruction cannot locate its target
+ * without using one:
+ *
+ *   • the object vocabulary of the two ledgers and the storefront;
+ *   • the systems themselves, named or interpolated;
+ *   • the one deictic that stands in for them, `there`.
+ *
+ * A pronoun alone ("take it off") locates nothing, so it is not an instruction anybody could carry
+ * out — which is why this list does not need pronouns in it to be closed.
+ */
+const REMOTE_REFERENCE = new RegExp(
+  '\\b(?:bills?|invoices?|credit[- ]notes?|journals?|payments?|tax rates?|documents?|attachments?'
+  + '|orders?|contacts?|accounts?|quotes?|receipts?|prepayments?|overpayments?|bank transactions?'
+  + '|ledgers?|organisations?|systems?|connectors?)\\b'
+  + '|\\{ledger\\}|\\{LEDGER\\}|\\bXero\\b|\\bQuickBooks\\b|\\bWooCommerce\\b|\\bthere\\b',
+  'gi',
+)
+
+/**
+ * STATEMENTS that name a remote object in order to say the record CANNOT name it, or to state a
+ * fact about what happened. Enumerated verbatim, and held to two properties below: no mutation
+ * lexeme (acts belong in PROHIBITION_TEMPLATES, which must refuse), and a refusal or disclaimer (or
+ * it is not a statement of incapacity — it is an instruction, and belongs in the capped list).
+ */
+const REMOTE_REFERENCE_TEMPLATES: readonly string[] = [
+  'NO DOCUMENT WAS CREATED —',
+  'this operation changed one that already existed, so there is no duplicate of it in existence '
+    + 'and nothing this attempt brought into being.',
+  'WHAT THIS RECORD DOES NOT SAY is whether the document it changed is LIVE or an UNPOSTED '
+    + 'DRAFT:',
+  'This operation creates a live ledger document on one posting-mode setting and an UNPOSTED '
+    + 'DRAFT on the other, and IMS did not record which was used for this attempt —',
+  'nothing was posted to a customer or a supplier account.',
+  'The upload happened, so a duplicate may exist, but nothing kept here says which bill it is '
+    + 'on and nothing kept here derives it.',
+  'No attachment was created, no document was created, and nothing in {ledger} was touched by '
+    + 'this attempt.',
+  'this attempt may never have created one, and this record does not name the bill one would be '
+    + 'on.',
+  'THIS RECORD DOES NOT NAME THE WOOCOMMERCE ORDER.',
+  'It holds the IMS reference above and nothing else, and the IMS record that maps that '
+    + 'reference to a WooCommerce order does not survive a database reset.',
+  'THIS RECORD DOES NOT NAME THE BILL THE PDF WENT ONTO, so it cannot send you to the '
+    + 'duplicates and nothing kept here derives the bill.',
+  'it created no attachment.',
+  'if it is off, the replay above stays a no-op and there is nothing to change; if it is ON, '
+    + 'the replay uploads to a bill THIS RECORD DOES NOT NAME, so there is no duplicate this record '
+    + 'can send you to.',
+  'The one lever here is that setting, and it stops attachment uploads for EVERY bill on this '
+    + 'connector rather than for this one.',
+  'IMS DID NOT RECORD WHETHER THIS ATTEMPT UPLOADED ANYTHING, and it does not name the bill '
+    + 'either.',
+  // Only the tail: the clause in front of it names the act, and IT is already enumerated as a
+  // prohibition ('no action, route or screen removes an unsent row'). A span may name an act or a
+  // remote object; naming both is what makes it a prohibition, and prohibitions live in one list.
+  'so there is nothing to press.',
+  'no outbox row records the sync attempt that queued it, so nothing attributes a copy to this '
+    + 'incident; the authenticated accounting-invoice email action writes the identical shape, so '
+    + 'ordinary operator sends are in the same result; a SENT row has already gone; and A FAILED '
+    + 'ROW IS NOT PROOF THAT NOTHING WENT —',
+  'THIS RECORD DOES NOT NAME THE WOOCOMMERCE ORDER —',
+  'it holds the IMS reference above and nothing else, and the IMS record that maps that '
+    + 'reference to a WooCommerce order does not survive a database reset.',
+]
+
+/**
+ * THE CAPPED EXCEPTION, AND THE ONLY PLACE A LOOKUP-LESS ENTRY MAY INSTRUCT.
+ *
+ * Each of these sends the operator to an object IMS ITSELF HOLDS and this message prints, using a
+ * word that is also a remote-object noun. They are read-only — none contains a mutation lexeme, and
+ * that is checked — and the cap is the review: a fifth line means someone decided to add an
+ * instruction to a record that can name nothing, and has to raise the cap to do it.
+ *
+ *   1 & 2  the invoice PDF IMS stored against the order — a local file, reached by the IMS
+ *          reference this message prints, in both the incident wording and its replay twin.
+ *   3 & 4  the local EmailOutbox rows for this order, by that table\u2019s own columns. Every column
+ *          named here was walked into the schema in rounds 6 through 9.
+ */
+const LOCAL_INSTRUCTION_TEMPLATES: readonly string[] = [
+  'confirm the invoice PDF stored against the order is the document you expect.',
+  'Inspect the outbox rows for this order and read each row\'s status, attempts, lastError and '
+    + 'sentAt.',
+  'confirm the invoice PDF stored against the order is the document you expect',
+  'query it for kind ACCOUNTING_INVOICE, referenceType SalesOrder, referenceId = the order id '
+    + '(no page in IMS lists them) and read each row\'s status, attempts, lastError, createdAt and '
+    + 'sentAt.',
+]
+
+
+/** The most instructions a lookup-less entry may carry. Raising this is the review. */
+const LOCAL_INSTRUCTION_CAP = 4
+
+/** Every remote reference a set of templates makes OUTSIDE an enumerated span. */
+function remoteReferences(
+  templates: readonly string[],
+  allowed: readonly string[] = [
+    ...PROHIBITION_TEMPLATES, ...REMOTE_REFERENCE_TEMPLATES, ...LOCAL_INSTRUCTION_TEMPLATES,
+  ],
+): string[] {
+  const found: string[] = []
+  for (const template of templates) {
+    let prose = template.replace(/\{Lookup\}|\{lookup\}/g, ' ')
+    for (const span of [...allowed].sort((a, b) => b.length - a.length)) {
+      prose = prose.split(span).join(' ')
+    }
+    REMOTE_REFERENCE.lastIndex = 0
+    let match: RegExpExecArray | null
+    while ((match = REMOTE_REFERENCE.exec(prose)) !== null) found.push(match[0].toLowerCase())
+  }
+  return found
+}
+
+/** The DIRECTIVE prose of every entry that declares no lookup. */
+function lookupLessDirectives(): { label: string; templates: string[] }[] {
+  return [...everyWordingEntry(), ...everyReplayWordingEntry()]
+    .filter((entry) => entry.lookup.length === 0)
+    .map(({ label, fields }) => ({
+      label,
+      templates: Object.entries(fields)
+        .filter(([field, value]) => DIRECTIVE_FIELDS.has(field) && typeof value === 'string')
+        .map(([, value]) => value),
+    }))
+    .filter(({ templates }) => templates.length > 0)
+}
+
+// MUTATION THAT KILLS THIS (run): write an instruction with NO listed verb into a lookup-less
+// remedy — append 'Go to that bill and take the second PDF off it.' to
+// NON_DOCUMENT_INCIDENT_WORDING.BILL_ATTACHMENT.NONE.remedy — and this test fails naming that entry
+// and `bill`. RUN. That is Codex\u2019s own sentence, and the round-14 fence passes it untouched,
+// which the pair below asserts. Deleting any REMOTE_REFERENCE_TEMPLATES line kills it the other way
+// — RUN with the WooCommerce-order statement removed, it fails naming WC_INVOICE_NOTE and `order`.
+//
+// ROUTE: the templates are the DIRECTIVE fields of the SHIPPED wording tables, all three of them,
+// and the declaration judged against is the entry\u2019s own `lookup`.
+test('ROUND 15 (Codex HIGH): a lookup-less entry may not NAME a remote object it tells anyone about', () => {
+  const entries = lookupLessDirectives()
+  assert.ok(entries.length >= 12, `sanity: ${entries.length} lookup-less directive fields scanned`)
+
+  for (const { label, templates } of entries) {
+    const references = remoteReferences(templates)
+    assert.deepEqual(
+      references, [],
+      `${label} names the remote object(s) ${references.join(', ')} in prose that tells an operator `
+      + 'what to do, while declaring no lookup — so this record cannot say WHICH one. Either declare '
+      + 'a lookup and let {lookup} name it, or enumerate the sentence: in '
+      + 'REMOTE_REFERENCE_TEMPLATES if it refuses or disclaims, in PROHIBITION_TEMPLATES if it '
+      + 'forbids an act, and in LOCAL_INSTRUCTION_TEMPLATES only if it sends the operator to an '
+      + 'object IMS itself holds.',
+    )
+  }
+
+  // NOT VACUOUS: with nothing enumerated the same fields are full of remote references.
+  const bare = entries.flatMap(({ templates }) => remoteReferences(templates, []))
+  assert.ok(
+    bare.length >= 30,
+    `the allowlists must be doing work: with them empty these fields yield ${bare.length} references`,
+  )
+})
+
+// MUTATION THAT KILLS THIS (run): add 'Go to that bill and take the second PDF off it.' to
+// REMOTE_REFERENCE_TEMPLATES and the refusal assertion fails naming it — an instruction cannot be
+// laundered as a statement of incapacity. RUN. Adding it to LOCAL_INSTRUCTION_TEMPLATES instead
+// fails the cap, which is the point of having one.
+//
+// ROUTE: the allowlists are read here; the corpus comes from the SHIPPED tables.
+test('ROUND 15: every enumerated remote reference is a disclaimer, or one of the capped local instructions', () => {
+  const corpus = lookupLessDirectives().flatMap(({ templates }) => templates)
+
+  for (const statement of REMOTE_REFERENCE_TEMPLATES) {
+    assert.ok(statement.length >= 20, `"${statement}" is too short to be a reviewable template`)
+    assert.deepEqual(
+      mutationLexemes([statement], []), [],
+      `"${statement}" names an ACT as well as a remote object. A span that does both must REFUSE, `
+      + 'and refusals are enumerated in PROHIBITION_TEMPLATES where that is checked.',
+    )
+    assert.match(
+      statement, REFUSAL,
+      `"${statement}" names a remote object without refusing or disclaiming anything, so it is an `
+      + 'instruction — it belongs in LOCAL_INSTRUCTION_TEMPLATES, under the cap, or nowhere',
+    )
+    assert.ok(
+      corpus.some((template) => template.includes(statement)),
+      `"${statement}" appears in no lookup-less directive field — delete it rather than leaving a `
+      + 'hole nothing is standing in',
+    )
+  }
+
+  assert.ok(
+    LOCAL_INSTRUCTION_TEMPLATES.length <= LOCAL_INSTRUCTION_CAP,
+    `${LOCAL_INSTRUCTION_TEMPLATES.length} instructions on records that can name nothing — the cap `
+    + `is ${LOCAL_INSTRUCTION_CAP}, and raising it is the decision, not a formality`,
+  )
+  for (const instruction of LOCAL_INSTRUCTION_TEMPLATES) {
+    assert.deepEqual(
+      mutationLexemes([instruction], []), [],
+      `"${instruction}" instructs a MUTATION on a record that can name no object — a permitted `
+      + 'local instruction may read, inspect or confirm, and nothing else',
+    )
+    assert.ok(
+      corpus.some((template) => template.includes(instruction)),
+      `"${instruction}" appears in no lookup-less directive field — delete it`,
+    )
+  }
+})
+
+// MUTATION THAT KILLS THIS (run): point `remoteReferences` at the round-14 checker — return
+// `mutationLexemes(templates)` — and the FIRST assertion fails on Codex\u2019s own sentence, because
+// the verb fence finds nothing in it. RUN.
+//
+// ROUTE: run against the SHIPPED checkers. These are wordings that must NEVER be shippable.
+test('ROUND 15 (Codex HIGH): the instructions no verb list would ever have caught', () => {
+  for (const [prose, expected] of [
+    // CODEX\u2019S OWN COUNTER-EXAMPLE, and the reason this round exists.
+    ['Go to that bill and take the second PDF off it.', ['bill']],
+    // The mutation verbs the corpus itself already uses, which round 14 left off its list.
+    ['Apply another credit note to that bill.', ['credit note', 'bill']],
+    ['Credit the bill in {ledger}.', ['bill', '{ledger}']],
+    ['Turn the attachment off on that document.', ['attachment', 'document']],
+    ['Add a line to the invoice so the totals agree.', ['invoice']],
+    // Locating the target without naming its type at all.
+    ['Open it in QuickBooks and take the duplicate off.', ['quickbooks']],
+    ['It is still sitting there — go and deal with it.', ['there']],
+  ] as [string, string[]][]) {
+    assert.deepEqual(
+      remoteReferences([prose], []), expected,
+      `${prose} points an operator at an object this record cannot name, and must be refused`,
+    )
+  }
+
+  // AND THE HALF THAT PROVES IT IS A NEW FENCE. Round 14\u2019s verb list finds NOTHING in the two
+  // that use no listed verb, which is exactly the finding.
+  assert.deepEqual(mutationLexemes(['Go to that bill and take the second PDF off it.'], []), [])
+  assert.deepEqual(mutationLexemes(['Add a line to the invoice so the totals agree.'], []), [])
+
+  // …and an ESCALATION, which is what a lookup-less entry is supposed to say, still passes both.
+  const escalation = 'Escalate this record to whoever administers this installation.'
+  assert.deepEqual(remoteReferences([escalation], []), [])
+  assert.deepEqual(mutationLexemes([escalation], []), [])
 })
