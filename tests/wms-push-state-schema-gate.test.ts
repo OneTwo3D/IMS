@@ -414,15 +414,17 @@ test('o3d-1izw: the out-of-process gates align their search path with Prisma\'s'
   // their own `pg` connections, and `pg` ignores the `?schema=` parameter Prisma sets search_path
   // from — so on a URL that names a schema they would resolve a different table, or none.
   //
-  // Route: pgSearchPathOptions(DATABASE_URL) -> `options: -c search_path=...` on the pg Client.
+  // Route: pgConnectionConfig(DATABASE_URL) -> the WHOLE `pg` Client config — connection string and
+  // `options: -c search_path=...` composed together, because a connection string set separately
+  // overrides the options beside it (r10, below).
   //
   // Mutation: return `{}` unconditionally and the first assertion fails; drop the spread from
   // either script and the source assertions below fail.
-  const { pgSearchPathOptions } = await import('../lib/domain/wms/push-state-enum-query.mjs')
+  const { pgConnectionConfig } = await import('../lib/domain/wms/push-state-enum-query.mjs')
   const { PRISMA_DEFAULT_SCHEMA, resolveDatabaseUrlSchema } = await import('../lib/db/database-url-schema.mjs')
   assert.deepEqual(
-    pgSearchPathOptions('postgresql://u:p@localhost:5432/ims?schema=ims_app'),
-    { options: '-c search_path="ims_app"' },
+    pgConnectionConfig('postgresql://u:p@localhost:5432/ims?schema=ims_app'),
+    { connectionString: 'postgresql://u:p@localhost:5432/ims?schema=ims_app', options: '-c search_path="ims_app"' },
   )
   // NO SCHEMA NAMED IS NOT "NOTHING TO ALIGN" (r9). Round 8 returned `{}` here, on the reasoning
   // that Prisma and pg both fall back to the server default and so already agree. Prisma does not
@@ -430,8 +432,8 @@ test('o3d-1izw: the out-of-process gates align their search path with Prisma\'s'
   // client on `"$user", public` is the same split, running the other way. The default is therefore
   // stated, not left implicit.
   assert.deepEqual(
-    pgSearchPathOptions('postgresql://u:p@localhost:5432/ims'),
-    { options: `-c search_path="${PRISMA_DEFAULT_SCHEMA}"` },
+    pgConnectionConfig('postgresql://u:p@localhost:5432/ims'),
+    { connectionString: 'postgresql://u:p@localhost:5432/ims', options: `-c search_path="${PRISMA_DEFAULT_SCHEMA}"` },
   )
   // PARSE FAILURE STAYS DISTINCT FROM SCHEMA ABSENCE. It is the only input that still yields no
   // schema, and it means the opposite thing: not "align me to the default" but "there is no
@@ -441,7 +443,7 @@ test('o3d-1izw: the out-of-process gates align their search path with Prisma\'s'
   // Mutation: make `resolveDatabaseUrlSchema` return `PRISMA_DEFAULT_SCHEMA` on the catch path (or
   // `null` for a valid URL with no `?schema=`) and the two `parsed`/`explicit` assertions below
   // fail even though the options above are unchanged.
-  assert.deepEqual(pgSearchPathOptions('not a url'), {})
+  assert.deepEqual(pgConnectionConfig('not a url'), { connectionString: 'not a url' })
   assert.deepEqual(
     resolveDatabaseUrlSchema('not a url'),
     { parsed: false, explicit: false, schema: null },
@@ -458,7 +460,7 @@ test('o3d-1izw: the out-of-process gates align their search path with Prisma\'s'
   const { readFile } = await import('node:fs/promises')
   for (const relative of ['../scripts/check-wms-push-state-enum.mjs', '../lib/ops/production-preflight.ts']) {
     const source = await readFile(new URL(relative, import.meta.url), 'utf8')
-    assert.match(source, /\.\.\.pgSearchPathOptions\(databaseUrl\)/, `${relative} aligns its search path`)
+    assert.match(source, /\.\.\.pgConnectionConfig\(databaseUrl\)/, `${relative} aligns its search path`)
   }
 })
 
@@ -473,7 +475,7 @@ test('o3d-1izw: on a non-public `?schema=` URL the RUNTIME resolves what the two
   // green gates. A gate has to be aligned to the thing it checks, not to the other gates.
   //
   // Route: DATABASE_URL=...?schema=ims_app -> lib/db/database-url-schema.mjs `databaseUrlSchema`
-  // -> (a) `pgSearchPathOptions` -> `dbPoolConfig().options` -> the pg Pool's startup search_path,
+  // -> (a) `pgConnectionConfig` -> `dbPoolConfig().options` -> the pg Pool's startup search_path,
   //    which the runtime gate's `$queryRawUnsafe` resolves through;
   //    (b) `prismaAdapterSchemaOptions` -> `createDbAdapter()`'s second argument -> PrismaPg
   //    `getConnectionInfo().schemaName`, which qualifies Prisma's generated queries;
@@ -481,7 +483,7 @@ test('o3d-1izw: on a non-public `?schema=` URL the RUNTIME resolves what the two
   //    module those two gates import it from.
   //
   // Mutation, either half: drop the second argument from `createDbAdapter()` and `schemaName` is
-  // `undefined`; drop the `...pgSearchPathOptions(...)` spread from `dbPoolConfig()` and both pool
+  // `undefined`; drop the `...pgConnectionConfig(...)` spread from `dbPoolConfig()` and both pool
   // assertions fail. In BOTH cases the external gates still pass unchanged — which is the finding.
   const before = process.env.DATABASE_URL
   const url = 'postgresql://u:p@localhost:5432/ims?schema=ims_app'
@@ -490,9 +492,9 @@ test('o3d-1izw: on a non-public `?schema=` URL the RUNTIME resolves what the two
     const { createDbAdapter, dbPoolConfig } = await import('@/lib/db')
     // Deliberately imported from the WMS module the deploy check and the preflight import it from,
     // so this compares the runtime against THEIR source of truth rather than against a third copy.
-    const { pgSearchPathOptions } = await import('../lib/domain/wms/push-state-enum-query.mjs')
+    const { pgConnectionConfig } = await import('../lib/domain/wms/push-state-enum-query.mjs')
 
-    const external = pgSearchPathOptions(url)
+    const external = pgConnectionConfig(url)
     assert.equal(
       external.options, '-c search_path="ims_app"',
       'the external gates put the URL\'s schema on their own connection',
@@ -523,7 +525,7 @@ test('o3d-1izw: on a non-public `?schema=` URL the RUNTIME resolves what the two
       await adapter.dispose()
     }
 
-    // NON-VACUITY. Without this, a `pgSearchPathOptions`/`prismaAdapterSchemaOptions` pair that
+    // NON-VACUITY. Without this, a `pgConnectionConfig`/`prismaAdapterSchemaOptions` pair that
     // returned the ims_app values unconditionally would satisfy everything above. A URL naming no
     // schema must produce Prisma's OWN default on both halves — not `ims_app`, and (since r9) not
     // nothing.
@@ -624,7 +626,7 @@ test('o3d-1izw r9: the SQL the generated client compiles is qualified to the sch
   //
   // Route: DATABASE_URL -> lib/db/database-url-schema.mjs -> (a) prismaAdapterSchemaOptions ->
   // createDbAdapter()'s `{ schema }` -> the query compiler's qualification of every generated
-  // statement, captured here at the driver boundary; (b) pgSearchPathOptions -> dbPoolConfig()
+  // statement, captured here at the driver boundary; (b) pgConnectionConfig -> dbPoolConfig()
   // `options` -> the pool's startup search_path, which is what `to_regclass($1)` resolves through
   // for the runtime gate and what the two out-of-process gates spread into their own pg Client.
   //
@@ -684,6 +686,151 @@ test('o3d-1izw r9: the SQL the generated client compiles is qualified to the sch
       qualifiedSchemaOf(unqualifiedSql), PRISMA_DEFAULT_SCHEMA,
       'an adapter reporting no schemaName qualifies generated queries with PRISMA_DEFAULT_SCHEMA — which is why the default is stated rather than left implicit',
     )
+  } finally {
+    if (before === undefined) delete process.env.DATABASE_URL
+    else process.env.DATABASE_URL = before
+  }
+})
+
+// ---------------------------------------------------------------------------
+// o3d-2k5r r10 — THE URL'S OWN `options` OVERRODE THE PIN.
+//
+//   HIGH  `pg` parses `connectionString` AFTER the surrounding config object and assigns the
+//         result over it (pg/lib/connection-parameters.js:60). Every gate here set
+//         `connectionString` itself and spread a separate `{ options }` beside it, so a URL
+//         carrying its own `options=-c search_path=...` won: the config visibly said `ims_app`
+//         and the client sent `legacy`.
+//
+// These tests build a REAL `pg` Client and read `connectionParameters.options` — the value that
+// goes into the startup packet. The r9 test compared `dbPoolConfig().options`, which is the
+// config the driver then overrode, so it could not see this at all.
+// ---------------------------------------------------------------------------
+
+/** The startup `options` the installed pg driver would really send for a config. */
+async function effectiveStartupOptions(config: Record<string, unknown>): Promise<string | undefined> {
+  const { Client } = await import('pg')
+  const client = new Client(config as never) as unknown as { connectionParameters: { options?: string } }
+  return client.connectionParameters.options
+}
+
+test('o3d-2k5r r10: an `options` inside DATABASE_URL cannot override the pinned search path', async () => {
+  const { pgConnectionConfig } = await import('../lib/domain/wms/push-state-enum-query.mjs')
+
+  // PRECONDITION, MEASURED ON THE INSTALLED DRIVER RATHER THAN DESCRIBED: the composition this
+  // replaces really is overridden. If pg ever stops doing this, this assertion fails and the
+  // change below is re-argued from fact instead of being carried on faith.
+  const url = 'postgresql://u:p@localhost:5432/ims?schema=ims_app&options=-c%20search_path%3Dlegacy'
+  assert.equal(
+    await effectiveStartupOptions({ connectionString: url, options: '-c search_path="ims_app"' }),
+    '-c search_path=legacy',
+    'precondition: connectionString is parsed last and overwrites the options beside it',
+  )
+
+  // MUTATION ROUTE: return `{ options }` alone from pgConnectionConfig() and let the call sites go
+  // back to setting `connectionString: databaseUrl` themselves. The URL below then reaches the
+  // driver with its own `options` intact and this assertion reads `-c search_path=legacy` while
+  // Prisma's generated queries stay on `ims_app` — the finding, exactly.
+  const carried = 'postgresql://u:p@localhost:5432/ims?options=-c%20search_path%3Dlegacy%20-c%20statement_timeout%3D5000'
+  const config = pgConnectionConfig(carried)
+  assert.equal(
+    await effectiveStartupOptions({ ...config, connectionTimeoutMillis: 5_000 }),
+    '-c statement_timeout=5000 -c search_path="legacy"',
+    'the effective startup options are the ones this module composed, not the URL\'s',
+  )
+  assert.doesNotMatch(config.connectionString, /options=/, 'and the URL no longer carries an options for pg to re-apply')
+
+  // A URL WITH NO `options` IS UNCHANGED, so the ordinary case still reaches the driver as before.
+  assert.equal(
+    await effectiveStartupOptions({ ...pgConnectionConfig('postgresql://u:p@localhost:5432/ims?schema=ims_app') }),
+    '-c search_path="ims_app"',
+  )
+})
+
+test('o3d-2k5r r10: a search_path written in the URL NAMES the schema; two different names are refused', async () => {
+  const { pgConnectionConfig, DatabaseUrlSchemaConflictError, resolveDatabaseUrlSchema, prismaAdapterSchemaOptions } =
+    await import('../lib/db/database-url-schema.mjs')
+
+  // WHAT WINS, STATED AS A TEST. The URL's `search_path` is not the loser of a precedence fight —
+  // it is READ, and it decides the schema for BOTH halves. An operator who wrote the pg-native
+  // spelling gets that schema on the adapter too, so the generated queries and the raw gates still
+  // resolve one place.
+  //
+  // MUTATION ROUTE: make searchPathSchemaOf() return null (i.e. ignore the URL's search_path and
+  // just overwrite it). The schema below becomes PRISMA_DEFAULT_SCHEMA — the pin silently defeats
+  // an explicit instruction, which is the half of the finding that is NOT about precedence.
+  const native = 'postgresql://u:p@localhost:5432/ims?options=-c%20search_path%3Dlegacy'
+  assert.deepEqual(resolveDatabaseUrlSchema(native), { parsed: true, explicit: true, schema: 'legacy' })
+  assert.deepEqual(prismaAdapterSchemaOptions(native), { schema: 'legacy' })
+  assert.equal(pgConnectionConfig(native).options, '-c search_path="legacy"')
+
+  // AND A URL THAT NAMES TWO SCHEMAS IS REFUSED, not resolved to either. Prisma qualifies
+  // generated queries with exactly one name; a URL supplying two IS the divergence these gates
+  // exist to catch, so the runtime does not boot, the deploy check exits non-zero and the
+  // preflight fails — all with one sentence naming both.
+  //
+  // MUTATION ROUTE: replace the throw with `named ?? fromOptions`. Every assertion in this block
+  // stops throwing and the config resolves to `ims_app` while the driver is told `legacy`.
+  const contradictory = 'postgresql://u:p@localhost:5432/ims?schema=ims_app&options=-c%20search_path%3Dlegacy'
+  for (const call of [
+    () => resolveDatabaseUrlSchema(contradictory),
+    () => pgConnectionConfig(contradictory),
+    () => prismaAdapterSchemaOptions(contradictory),
+  ]) {
+    assert.throws(call, (error: unknown) => {
+      assert.ok(error instanceof DatabaseUrlSchemaConflictError)
+      assert.match((error as Error).message, /ims_app/)
+      assert.match((error as Error).message, /legacy/)
+      return true
+    })
+  }
+
+  // A search_path that is a LIST is not a schema this can pin anything to: `to_regclass()` would
+  // resolve through every element while Prisma qualified with one. Refused for the same reason.
+  //
+  // MUTATION ROUTE: return the first element instead of throwing, and a URL whose table lives in
+  // the SECOND element passes every gate while generated writes go to the first.
+  assert.throws(
+    () => pgConnectionConfig('postgresql://u:p@localhost:5432/ims?options=-c%20search_path%3Dims_app,public'),
+    DatabaseUrlSchemaConflictError,
+  )
+  // The control: the same schema said twice, in both spellings, is agreement and not a conflict.
+  assert.equal(
+    pgConnectionConfig('postgresql://u:p@localhost:5432/ims?schema=ims_app&options=-c%20search_path%3D%22ims_app%22').options,
+    '-c search_path="ims_app"',
+  )
+})
+
+test('o3d-2k5r r10: the runtime pool, the deploy check and the preflight all reach the driver with the same effective search path', async () => {
+  // THE FINDING AT THE BOUNDARY, FOR ALL THREE CONSUMERS AT ONCE. Codex's next step asked for
+  // exactly this: the effective `connectionParameters.options` for the runtime, deploy-check and
+  // preflight configurations, on a URL that carries its own `options`.
+  //
+  // MUTATION ROUTE: restore `connectionString: databaseUrl` + a separate `...pgConnectionConfig()`
+  // spread at ANY ONE of the three call sites (or move the spread after the connection string in
+  // dbPoolConfig()) and that one assertion reads `-c search_path=legacy`.
+  const before = process.env.DATABASE_URL
+  const url = 'postgresql://u:p@localhost:5432/ims?schema=ims_app&options=-c%20application_name%3Dims'
+  process.env.DATABASE_URL = url
+  try {
+    const { dbPoolConfig } = await import('@/lib/db')
+    const { pgConnectionConfig } = await import('../lib/domain/wms/push-state-enum-query.mjs')
+    const expected = '-c application_name=ims -c search_path="ims_app"'
+
+    assert.equal(await effectiveStartupOptions(dbPoolConfig()), expected, 'the runtime pool')
+    assert.equal(
+      await effectiveStartupOptions({ ...pgConnectionConfig(url), connectionTimeoutMillis: 10_000 }),
+      expected,
+      'the deploy check',
+    )
+    assert.equal(
+      await effectiveStartupOptions({ ...pgConnectionConfig(url), connectionTimeoutMillis: 5_000 }),
+      expected,
+      'the preflight',
+    )
+
+    // And the setting the URL asked for that is NOT search_path survived: pinning the schema must
+    // not quietly throw away a caller's other startup settings.
+    assert.match(expected, /application_name=ims/)
   } finally {
     if (before === undefined) delete process.env.DATABASE_URL
     else process.env.DATABASE_URL = before
