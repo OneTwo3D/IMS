@@ -102,12 +102,21 @@ function createPrismaClient() {
  * makes the RAW statements this application runs — the o3d-1izw push-state gate among them — resolve the
  * same objects the two out-of-process release gates resolve. `PrismaPg`'s `{ schema }` option does
  * not cover them: it qualifies generated queries only.
+ *
+ * `onConnect` COMES FROM THE SAME PLACE AND IS PART OF THE SAME PIN (o3d-2k5r r22). It is present
+ * only when the composed `options` carries a non-ASCII byte — i.e. only when a deployment probe's
+ * verdict is being spent — and `pg-pool` awaits it on every NEW PHYSICAL CONNECTION before that
+ * connection is handed to anyone, refusing one served by a backend other than the one the verdict
+ * was measured on. It is deliberately NOT re-described here: it is composed by
+ * `pgConnectionConfig()`, arrives through the spread below, and reaches the pool because
+ * `PrismaPg`'s config form passes its config verbatim to `new pg.Pool(...)`.
  */
 export function dbPoolConfig(): {
   connectionString: string
   max: number
   connectionTimeoutMillis: number
   options?: string
+  onConnect?: (client: { query(text: string): Promise<{ rows: Array<Record<string, unknown>> }> }) => Promise<void>
 } {
   // THE SPREAD COMES FIRST, AND IT CARRIES THE CONNECTION STRING (o3d-2k5r r10). `pg` parses
   // `connectionString` AFTER the surrounding config and assigns the result over it, so a
