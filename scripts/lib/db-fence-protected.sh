@@ -1302,7 +1302,7 @@ db_fence_probe_script() {
   _fence_probe_discard_candidate
   if [[ -z "${DB_FENCE_PROBE_REASON}" ]]; then
     if [[ -z "${DB_FENCE_EXPECTED_ARTEFACT_SHA256}" ]]; then
-      DB_FENCE_PROBE_REASON="there is no protected fence artefact on this box yet, and nothing authenticates the one this checkout would publish. The preflight opens the admin connection with DEPLOY_ADMIN_DATABASE_URL, and the helper it would run imports packages out of the checkout, so running it unauthenticated would hand that credential to bytes the application account chose — which is the whole reason this artefact exists. Supply IMS_FENCE_ARTEFACT_SHA256 and the dry run will preflight with the tree it names."
+      DB_FENCE_PROBE_REASON="there is no protected fence artefact on this box yet, and this run was given nothing that authenticates the tree the checkout would publish. The preflight opens the admin connection with DEPLOY_ADMIN_DATABASE_URL, and the tree it would run is assembled out of the checkout, so it will not be executed on the strength of the checkout's own account of itself. Supply IMS_FENCE_ARTEFACT_SHA256 and this dry run preflights with the tree that value names; every run after the first publication preflights with the standing artefact instead, and needs nothing supplied."
     else
       DB_FENCE_PROBE_REASON="IMS_FENCE_ARTEFACT_SHA256 expects ${DB_FENCE_EXPECTED_ARTEFACT_SHA256} and the tree this checkout would publish hashes to ${DB_FENCE_PROBE_ARTEFACT_SHA256:-nothing that could be assembled}, so there is nothing this run is willing to execute with an administrative credential beside it."
     fi
