@@ -126,9 +126,9 @@
 # `dotenv` WAS THE OTHER ONE AND IT IS GONE (this round). It existed for a single call —
 # `loadDotenv({ path: <app dir>/.env })` — whose only job was to put DEPLOY_ADMIN_DATABASE_URL
 # into the environment when an operator pasted the printed `--release` command by hand. That call
-# was already dead in the protected copy: `appDirectory()` derives the app dir from the running
-# file's own location, which under the mirror is ${DB_FENCE_PROTECTED_APP_DIR}, and there is no
-# `.env` there. So it authenticated nothing and supplied nothing, while adding a whole package to
+# was already dead in the protected copy: the helper's `appDirectory()` (removed with the import)
+# derived the app dir from the running file's own location, which under the mirror is
+# ${DB_FENCE_PROTECTED_APP_DIR}, and there is no `.env` there. So it authenticated nothing and supplied nothing, while adding a whole package to
 # the executable surface. The shell side already reads that file — env_file_value() in all three
 # entrypoints — and passes the credential explicitly through `env`; the operator wrappers below
 # do the same. Removing the import removed a dependency instead of vendoring it.

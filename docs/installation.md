@@ -1088,12 +1088,22 @@ run somewhere that is *not* the machine being deployed, or the checksum publishe
 Deriving it on the target would authenticate the checkout against itself, and nothing computed from
 `APP_DIR` can authenticate `APP_DIR`. (That command is given inline rather than as a copy-pasteable
 block on purpose: it is a step for a workstation, not for the machine mid-cutover.)
-The bytes are then copied to a staging name inside `/etc/ims-cutover-recovery/app/scripts/`, which
-only root can write, the digest is taken **from that staged file**, and *that same file* is renamed
-into place — so the inode that was verified is the inode that is published, and the checkout is
-never read again after the copy. A rotation also moves `fence_script_sha256` in the recovery record
-with the file it names; leaving it behind would make every subsequent run refuse, and a rotation
-that bricks the mechanism is not a rotation.
+The **whole artefact** — the entry file and the vendored dependency closure — is then assembled at
+`/etc/ims-cutover-recovery/.app.staged`, which only root can write; it is sealed (ownership and
+modes), checked (nothing but regular files and directories), digested **from that staged tree**,
+and only then renamed into place, with the previous tree moved aside rather than deleted so a
+failure between the two renames leaves the *old* artefact standing rather than none. The tree that
+was verified is the tree that is published, and the checkout is never read again after the copy. A
+rotation also moves `fence_script_sha256` in the recovery record with the file it names; leaving it
+behind would make every subsequent run refuse, and a rotation that bricks the mechanism is not a
+rotation.
+
+A rotation republishes **both halves together** — a new entry file and a freshly resolved closure —
+which is the only way the vendored packages ever move. The consequence, stated because it is a real
+one: upgrading `pg` in `APP_DIR/node_modules` does **not** change what the fence imports, and
+nothing warns about it (the divergence notice compares entry files, not trees). The mirror is
+self-contained, so it keeps working; it is simply the version that was current when the artefact was
+last published, and `IMS_FENCE_SCRIPT_SHA256` on the next update is what moves it.
 
 Two more properties of the rotation:
 
