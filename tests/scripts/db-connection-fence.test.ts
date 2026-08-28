@@ -2384,7 +2384,7 @@ test('o3d-2sm1.5 r20: a percent-escaped query KEY is refused, because the driver
  * From the first helper to the end of the function, so a mutation anywhere in the mechanism —
  * the tokenizer, the arity check, the name match or any refusal — reaches this test.
  */
-function liftSoleSource(script: 'deploy.sh' | 'update.sh'): string {
+function liftSoleSource(script: 'deploy.sh' | 'update.sh' | 'install.sh'): string {
   const source = readFileSync(join(process.cwd(), `scripts/${script}`), 'utf8')
   const start = source.indexOf('bus_read_strings() {')
   const main = source.indexOf('env_file_is_sole_database_url_source() {')
@@ -2451,15 +2451,24 @@ const SYSTEMD_ANSWERS: [string, SystemdUnit, RegExp | null][] = [
   ],
   ['PAMName= brings a whole environment source with it', { PAMName: 's "login"' }, /sets PAMName=login/],
   [
-    'a SECOND environment file, which may define it',
+    // ROUND 23 SPLIT THIS ONE IN TWO. A second environment file used to be refused by its COUNT;
+    // now the count of 2 is the shape the binding needs, so a second file is refused by WHAT IT
+    // IS — not this run's snapshot, or one this run did not publish. A THIRD is still refused by
+    // count, and has its own fixture below.
+    'a SECOND environment file this run did not publish',
     { EnvironmentFiles: 'a(sb) 2 "/opt/app/.env" false "/etc/ims/override.env" true' },
-    /loads 2 environment files \(\/opt\/app\/\.env \/etc\/ims\/override\.env\)/,
+    /loads a second environment file, \/etc\/ims\/override\.env, that this run did not publish/,
+  ],
+  [
+    'a THIRD environment file, which is more than any shape this composes',
+    { EnvironmentFiles: 'a(sb) 3 "/opt/app/.env" false "/etc/ims/override.env" true "/etc/ims/more.env" true' },
+    /loads 3 environment files/,
   ],
   ['no environment file at all, so the application\'s own loader decides', { EnvironmentFiles: 'a(sb) 0' }, /does not load \/opt\/app\/\.env with EnvironmentFile=/],
   [
     'a different environment file instead of that one',
     { EnvironmentFiles: 'a(sb) 1 "/etc/ims/other.env" false' },
-    /loads \/etc\/ims\/other\.env as its environment file and not \/opt\/app\/\.env/,
+    /loads \/etc\/ims\/other\.env as its first environment file and not \/opt\/app\/\.env/,
   ],
   [
     'a path systemd had to escape, which this will not decode to compare',
@@ -2494,7 +2503,7 @@ test('o3d-2sm1.5 r21: a unit that can define DATABASE_URL anywhere but that file
   // restarted application connects to another. THREE OF THOSE WERE RUN, each failing on the one
   // fixture named for it and on nothing else:
   //
-  //   * delete the `count -gt 1` refusal            -> 'a SECOND environment file' becomes SOLE;
+  //   * delete the `count -gt 2` refusal            -> 'a THIRD environment file' becomes SOLE;
   //   * delete the `-n "$pam_name"` refusal         -> 'PAMName= brings a whole environment
   //                                                    source with it' becomes SOLE;
   //   * match UnsetEnvironment on the bare token only, which is what the r20 reader did
@@ -2530,6 +2539,11 @@ test('o3d-2sm1.5 r21: a unit that can define DATABASE_URL anywhere but that file
       const bash = [
         'set -uo pipefail',
         'DB_IDENTITY_SOURCE_REASON=""',
+        // r23's two globals. False and unset here, which is the shape at every call site that is
+        // not the one about to start the service.
+        'DB_ENV_SNAPSHOT_FILE="/etc/ims-cutover/db-identity-snapshot.env"',
+        'DB_ENV_SNAPSHOT_DROPIN_NAME="zz-deploy-db-identity.conf"',
+        'DB_ENV_SNAPSHOT_PUBLISHED=false',
         lifted,
         'if env_file_is_sole_database_url_source "$1" "$2"; then printf "SOLE\\n"; else printf "REFUSE %s\\n" "$DB_IDENTITY_SOURCE_REASON"; fi',
       ].join('\n')
@@ -2599,12 +2613,25 @@ test('o3d-2sm1.5 r20: every fence path asks it, and the installer is still exemp
     assert.ok(!source.includes('systemctl show -p Environment'), `${name}: and no longer parses systemctl's text rendering for it`)
   }
 
-  // THE INSTALLER IS EXEMPT, AND STAYS EXEMPT. It prompts for DB_HOST/DB_PORT/DB_NAME/DB_USER,
-  // creates the role and the database with them and composes DATABASE_URL out of them, so it
-  // parses nothing and has no file to be wrong about. Giving it this check would be asking a
-  // question about a service that does not exist yet.
-  assert.ok(!install.includes('env_file_is_sole_database_url_source'), 'install.sh owns the values and asks nothing')
-  assert.ok(!install.includes('require_env_file_is_sole_definition'), 'install.sh is not gated on a file it never reads')
+  // THE INSTALLER WAS EXEMPT UNTIL ROUND 23, AND IS NOT ANY MORE (Codex HIGH). The exemption's
+  // reasoning was that it prompts for DB_HOST/DB_PORT/DB_NAME/DB_USER, composes DATABASE_URL out
+  // of them and therefore "has no file to be wrong about". That stopped being true at the line
+  // where it WRITES ${APP_DIR}/.env — long before the build, the migration and the start — and
+  // the unit it then writes loads that file at exec. It still parses nothing and pins nothing
+  // from the file (its identity is the shell value, which is why the check below is a string
+  // comparison and not a four-value re-parse), but it must still ask systemd whether anything
+  // ELSE can define DATABASE_URL for the service it is about to start.
+  //
+  // MUTATION: delete the `require_start_identity_bound ||` line from install.sh and both
+  // assertions below fail; delete env_file_is_sole_database_url_source() from it and the first
+  // fails on its own.
+  assert.ok(install.includes('env_file_is_sole_database_url_source'), 'install.sh asks systemd about the unit it writes')
+  assert.equal(
+    install.split('\n').filter((line) => line.includes('require_start_identity_bound ||')).length,
+    1,
+    'install.sh gates its start on the composed unit, once, after its final daemon-reload',
+  )
+  assert.match(install, /busctl get-property org\.freedesktop\.systemd1/, 'install.sh: over the bus, like the other two')
 })
 
 /**
@@ -2775,10 +2802,18 @@ test('o3d-2sm1.5 r22: the re-read stands at the fence, at the release, and after
   // The other half: that the shipped entrypoints put it at the three moments that matter. A
   // re-read defined and never called is the finding with extra code in it.
   //
-  // MUTATION: delete any one `require_start_identity_unchanged ||` line from either script and
-  // the count assertion fails by name; move the post-reload one above `remove_reboot_fence` and
-  // the ordering assertion fails, because a check that runs before this run's final
-  // daemon-reload is not asking the unit configuration systemd is about to exec with.
+  // ROUND 23 CHANGED THE THIRD ONE, AND ONLY THE THIRD. The post-reload check is now
+  // require_start_identity_bound(), which runs the same two halves and additionally requires the
+  // environment snapshot to be in the loaded configuration — the binding that makes the answer
+  // survive the interval between the check and the exec. The first two are still the plain
+  // re-read, because at those moments no snapshot has been published yet.
+  //
+  // MUTATION: delete any one of the three lines from either script and the count assertion fails
+  // by name; move the post-reload one above `remove_reboot_fence` and the ordering assertion
+  // fails, because a check that runs before this run's final daemon-reload is not asking the unit
+  // configuration systemd is about to exec with; change the third back to
+  // require_start_identity_unchanged and the "bound" assertion fails, because the loaded unit
+  // would no longer have to name the file this run wrote.
   for (const [name, anchors] of [
     // `run systemctl start`, not `systemctl start`: the bare spelling appears in the comment
     // ABOVE the second re-read, which would make the ordering assertion pass on prose.
@@ -2786,10 +2821,17 @@ test('o3d-2sm1.5 r22: the re-read stands at the fence, at the release, and after
     ['update.sh', { release: 'THE ONLY PLACE A RELEASE FOLLOWS A MIGRATION', start: 'run systemctl start' }],
   ] as const) {
     const source = readFileSync(join(process.cwd(), `scripts/${name}`), 'utf8')
+    // `|| die`, not `||`: require_start_identity_bound() calls the plain re-read inside its own
+    // body, so counting the bare name would count the definition as a third call site.
     assert.equal(
-      source.split('\n').filter((line) => line.includes('require_start_identity_unchanged ||')).length,
-      3,
-      `${name}: the file is re-read at all three moments`,
+      source.split('\n').filter((line) => line.includes('require_start_identity_unchanged || die')).length,
+      2,
+      `${name}: the file is re-read before the fence and before the release`,
+    )
+    assert.equal(
+      source.split('\n').filter((line) => line.includes('require_start_identity_bound ||')).length,
+      1,
+      `${name}: and the post-reload moment asks for the BINDING, not only for another read`,
     )
 
     // 1. INSIDE THE FENCE, BEFORE IT IS RAISED. Nothing is fenced yet, so this is the cheap
@@ -2812,9 +2854,16 @@ test('o3d-2sm1.5 r22: the re-read stands at the fence, at the release, and after
     const rebootOffset = source.slice(release).search(/^remove_reboot_fence$/m)
     assert.ok(rebootOffset > 0, `${name}: precondition — the reboot fence comes down by a call, on its own line`)
     const reboot = release + rebootOffset
-    const postReload = source.indexOf('require_start_identity_unchanged ||', reboot)
+    const postReload = source.indexOf('require_start_identity_bound ||', reboot)
     const start = source.indexOf(anchors.start, reboot)
     assert.ok(preRelease > anchor && preRelease < release, `${name}: re-read while the fence is still held`)
+
+    // AND THE BINDING IS PUBLISHED WHILE THE FENCE IS STILL HELD TOO (o3d-2sm1.5 r23). Publishing
+    // after the release would leave a window in which the database is open and the service is
+    // startable by hand on whatever the file says — the exact window the release exists to close
+    // in one direction and this closes in the other.
+    const publish = source.indexOf('publish_db_identity_snapshot ||', anchor)
+    assert.ok(publish > preRelease && publish < release, `${name}: the snapshot is published after the check and before the release`)
     assert.ok(release < reboot, `${name}: precondition — the reboot fence comes down after the release`)
     assert.ok(postReload > reboot, `${name}: re-read again AFTER the final daemon-reload`)
     assert.ok(postReload < start, `${name}: and before anything is started`)

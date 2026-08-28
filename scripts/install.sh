@@ -621,6 +621,42 @@ FENCE_DROPIN_DIR="/etc/systemd/system/${APP_NAME}.service.d"
 FENCE_DROPIN_FILE="${FENCE_DROPIN_DIR}/zz-deploy-fence.conf"
 DB_FENCE_DIR="${CUTOVER_STATE_DIR}/deploy"
 DB_FENCE_STATE="${DB_FENCE_DIR}/db-connect-fence.json"
+# THE ENVIRONMENT THE STARTED SERVICE IS BOUND TO (o3d-2sm1.5 r23, Codex HIGH).
+#
+# Rounds 13-22 asked, in eleven spellings, WHICH DATABASE THE SERVICE WILL USE, and every answer
+# was correct and incomplete for one reason: it was a READ of a file the service reads later and
+# somebody else can replace in between. Re-reading closer to the start shortens that window; it
+# cannot close it, because `EnvironmentFile=` is read by systemd at the moment it EXECS.
+#
+# So this round stops checking and BINDS. The value this run validated, fenced and migrated is
+# written to a file under the cutover state directory — root-owned, 0600, in a directory the
+# application user cannot write — and every unit is given a drop-in that loads THAT file, LAST.
+# systemd.exec: "If the same variable is set twice from these files, the files will be read in
+# the order they are specified and the later setting will override the earlier setting", and
+# "Settings from these files override settings made with Environment=". So whatever
+# ${APP_DIR}/.env has come to say by exec time, DATABASE_URL is the snapshot's.
+#
+# AND IT IS MANDATORY, WITH NO LEADING `-`. A missing snapshot is then a START FAILURE rather
+# than a silent fall-through to the application's own dotenv overlays — the exact difference
+# that made a DELETED .env dangerous, since the shipped units load that one with a `-`.
+#
+# WHY THIS CLOSES THE RACE THE RE-READ COULD NOT. Two systemd reads are involved and they have
+# different timing. The SET of environment files is unit CONFIGURATION, fixed at the last
+# `daemon-reload` and NOT re-read by `systemctl start`; the CONTENTS are read at exec. This run
+# issues the final daemon-reload itself, verifies the loaded list on the bus AFTER it, and
+# nothing between that verification and the start issues another — so the list cannot change
+# under it. The contents can be changed only by root, which is not a position this deploy can
+# defend against and is not the threat model: the file the check-to-exec race was about was
+# writable by the application user and by whatever configuration management writes .env.
+# NOT under ${CUTOVER_STATE_DIR}, which is the application's own data directory and therefore
+# WRITABLE BY THE APPLICATION USER (o3d-2sm1.5 r23). A binding the service can delete is not a
+# binding: the drop-in would then name a file that is gone, and — because it is loaded without a
+# leading `-` — the unit would refuse to start. Fail-closed, but an outage the app user could
+# cause. This directory is created root-owned and 0700 by publish_db_identity_snapshot().
+DB_ENV_SNAPSHOT_DIR="${IMS_CUTOVER_ENV_DIR:-/etc/ims-cutover}"
+DB_ENV_SNAPSHOT_FILE="${DB_ENV_SNAPSHOT_DIR}/db-identity-snapshot.env"
+DB_ENV_SNAPSHOT_DROPIN_NAME="zz-deploy-db-identity.conf"
+DB_ENV_SNAPSHOT_DROPIN_FILE="${FENCE_DROPIN_DIR}/${DB_ENV_SNAPSHOT_DROPIN_NAME}"
 # ONE lock for all three entrypoints. deploy.sh and update.sh each held their own and this
 # script took none at all, so an install could run straight through another cutover.
 LOCK_FILE="${CUTOVER_STATE_DIR}/cutover.lock"
@@ -670,6 +706,13 @@ REBOOT_FENCE_INSTALLED=false
 # remove exactly that and leave an already-standing fence alone.
 FENCE_MARKER_PREEXISTED=false
 FENCE_DROPIN_CREATED=false
+# Whether THIS run published the environment snapshot. It gates the tolerance in
+# env_file_is_sole_database_url_source(): a snapshot the unit loads that this run did not
+# publish is an unexplained pin, and is refused rather than accepted.
+DB_ENV_SNAPSHOT_PUBLISHED=false
+DB_ENV_SNAPSHOT_DROPINS_CREATED=()
+# Why the composed unit was refused, when it was.
+DB_IDENTITY_SOURCE_REASON=""
 # The point of no return: the new build has answered its health check AND been shown to be
 # the process that answered. Nothing after this may stop it, re-fence it or revoke CONNECT
 # again (o3d-2sm1.5, Codex r4 HIGH).
@@ -1089,6 +1132,501 @@ rollback_reboot_fence_install() {
   if ! ${FENCE_MARKER_PREEXISTED} && ! ${FENCE_ARMED}; then
     rm -f "${FENCE_FILE}"
   fi
+  return 0
+}
+
+
+# Read ONE variable out of .env without `source` (which executes whatever is in the file)
+# and without `grep | cut` (which is what this used to be: it kept the surrounding quotes
+# and any trailing comment, so an ordinary `KEY="postgres://u:p@h/db"  # deploy admin`
+# reached psql complete with a double quote at each end and the word "deploy" on the end).
+# The quoting rules followed are dotenv's own, because dotenv is what reads this file
+# everywhere else: a quoted value ends at its closing quote, an unquoted one ends at the
+# first whitespace-preceded `#`, and later definitions win.
+env_file_value() {
+  local key="$1" file="$2" line value
+  [[ -f "$file" ]] || return 0
+  line="$(grep -E "^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=" "$file" 2>/dev/null | tail -1 || true)"
+  [[ -n "$line" ]] || return 0
+  value="${line#*=}"
+  value="${value#"${value%%[![:space:]]*}"}"
+  case "$value" in
+    \"*) value="${value#\"}"; value="${value%%\"*}" ;;
+    \'*) value="${value#\'}"; value="${value%%\'*}" ;;
+    *)
+      value="${value%%[[:space:]]#*}"
+      value="${value%"${value##*[![:space:]]}"}"
+      ;;
+  esac
+  printf '%s' "$value"
+}
+
+# ---------------------------------------------------------------------------
+# IS THE FILE WE READ THE ONLY THING THAT CAN DEFINE DATABASE_URL FOR THIS SERVICE?
+# (o3d-2sm1.5 r20, Codex CRITICAL; r21 asks systemd's BUS instead of its text output)
+#
+# r19 moved the identity from "worked out by the fence" to "supplied by the entrypoint", and the
+# entrypoint supplies it out of ${APP_DIR}/.env. That is the PREVIOUS PROBLEM ONE LEVEL UP: an
+# `Environment=DATABASE_URL=...` directive, a drop-in that adds one, a `PassEnvironment=` entry, a
+# `PAMName=` whose PAM stack exports one, or a second `EnvironmentFile=` can put a different URL in
+# the service's environment, and dotenv does NOT overwrite a variable that is already set. The
+# fence, the migration and the release would then all be self-consistent about the .env database
+# while the restarted application connects elsewhere — a migration run on a database nothing was
+# fenced off, and a new build started against a database nothing migrated.
+#
+# THIS DOES NOT REBUILD THE INFERENCE r19 DELETED, and the difference is the whole design. It
+# computes no value and reproduces no precedence. It asks ONE existence question about ONE
+# variable:
+#
+#     can anything other than the file we read define DATABASE_URL for this unit?
+#
+# systemd answers that directly, because it reports the COMPOSED Environment=, EnvironmentFiles=,
+# PassEnvironment=, UnsetEnvironment= and PAMName= with every drop-in already folded in by systemd
+# itself. Asking whether a second definition EXISTS is bounded; working out which of several would
+# WIN is the unbounded question, and it is never asked — any answer but "only that file" is a
+# refusal that names what else defines it and tells the operator to state the identity explicitly.
+# A second environment file is refused WITHOUT being read, for the same reason: that it may define
+# the variable is enough, and reading it to find out would put the precedence question straight
+# back. A non-empty PAMName= is refused without reading PAM configuration, for that same reason
+# again.
+#
+# IT IS ASKED OF THE BUS, NOT OF `systemctl show` (r21, Codex CRITICAL). Two of r20's three
+# findings were text-parsing bugs and only text-parsing bugs: `systemctl show` renders a property
+# as one `Name=` line of space-joined values, so where one entry of an ARRAY ends and the next
+# begins has to be guessed at — and `EnvironmentFiles` is an array of (path, ignore_errors) PAIRS
+# whose rendering the previous reader truncated at the first ` (ignore_errors=`. `busctl` — the
+# same package, on every host that has systemctl — prints the property's SIGNATURE and the array's
+# own ELEMENT COUNT before the elements:
+#
+#     a(sb) 1 "/opt/app/.env" true          as 2 "NODE_ENV=production" "PORT=3000"          s ""
+#
+# so "is there more than one environment file?" is answered by systemd's own data structure. The
+# count is read from the rendering and checked against the number of elements found in it; a
+# disagreement is a refusal. Nothing is inferred from where a space falls, and a string systemd had
+# to escape (busctl prints strings through `cescape()`) is REFUSED rather than decoded — decoding
+# it here would be one more reimplementation of somebody else's rules.
+#
+# EVERY ENVIRONMENT PROPERTY IS THEN MATCHED THE SAME WAY: on the NAME of each element, which is
+# everything before its first `=`. That is what makes `UnsetEnvironment=DATABASE_URL=<the value in
+# the .env>` a refusal (r21, Codex HIGH): systemd.exec takes "a space-separated list of variable
+# names or variable assignments", removes an exact assignment as the FINAL step of composing the
+# environment, and a scan for the bare token `DATABASE_URL` sees no such token in it — after which
+# the application's own dotenv loader supplies whatever `.env.local` says. The same rule applies to
+# Environment=, PassEnvironment= and UnsetEnvironment= alike, so no spelling of any of them is
+# matched by a substring.
+#
+# THE FILE MUST ALSO BE ONE SYSTEMD ITSELF LOADS. If the unit loads no environment file, the
+# variable reaches the application through the application's OWN loader instead, by rules that
+# belong to Next and not to systemd — `.env.local` and the per-mode overlays, which is precisely
+# the layer r19 stopped reproducing. So that is a refusal too, and it says which line to add.
+#
+# WHAT IT CANNOT SEE, STATED RATHER THAN PAPERED OVER: an `ExecStart=` that runs a wrapper which
+# exports DATABASE_URL itself is invisible to systemd's own properties, because that definition
+# lives inside a program rather than in the unit. Closing that would mean reading programs, which
+# is unbounded again. It is the standing argument for making the four values a DEPLOYMENT-OWNED
+# CONFIGURATION INPUT that these scripts read outright, instead of deriving them from a URL that
+# is only probably the one the service uses (o3d-1yvh, docs/installation.md).
+DB_IDENTITY_SOURCE_REASON="the service's environment has not been asked about yet"
+BUS_STRINGS=()
+
+# THE STRINGS IN ONE `busctl` RENDERING, in order, STILL ESCAPED.
+#
+# busctl prints every string through `cescape()`, so a `"` inside a value arrives as `\"` and
+# cannot end it early. This walks the rendering with that one rule and keeps the escapes: the
+# callers compare against names and paths that contain none, and refuse anything that does.
+# Returns 1 for a rendering whose quoting does not close, which is a rendering this cannot read.
+bus_read_strings() {
+  local text="${1:-}" index=0 length char current='' inside=0
+  BUS_STRINGS=()
+  length=${#text}
+  while (( index < length )); do
+    char="${text:index:1}"
+    if (( inside )); then
+      if [[ "$char" == '\' ]]; then
+        (( index + 1 < length )) || return 1
+        index=$(( index + 1 ))
+        current+="\\${text:index:1}"
+      elif [[ "$char" == '"' ]]; then
+        BUS_STRINGS+=("$current")
+        current=''
+        inside=0
+      else
+        current+="$char"
+      fi
+    elif [[ "$char" == '"' ]]; then
+      inside=1
+      current=''
+    fi
+    index=$(( index + 1 ))
+  done
+  (( inside == 0 )) || return 1
+  return 0
+}
+
+# THE ELEMENT COUNT systemd states in front of an array, for the signature we asked for.
+#
+# This is the number that makes the question bounded: it comes from the array, not from counting
+# separators in a line. A rendering of another signature — or none — is not an answer, and the
+# caller refuses.
+bus_array_count() {
+  local text="${1:-}" signature="${2:-}" rest
+  [[ "$text" == "${signature} "* ]] || return 1
+  rest="${text#"${signature}" }"
+  rest="${rest%% *}"
+  [[ "$rest" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$rest"
+}
+
+# One property of one unit, as systemd's own bus states it.
+bus_unit_property() {
+  busctl get-property org.freedesktop.systemd1 "${1:-}" "org.freedesktop.systemd1.${2:-}" "${3:-}" 2>/dev/null
+}
+
+# Does this element of an environment property NAME DATABASE_URL? Everything before the first `=`
+# is the name, so `DATABASE_URL`, `DATABASE_URL=postgresql://...` and an assignment carrying any
+# value at all are one answer, and `NEXT_PUBLIC_DATABASE_URL=...` is not.
+bus_element_names_database_url() {
+  [[ "${1%%=*}" == "DATABASE_URL" ]]
+}
+
+# THE `ignore_errors` HALF OF EnvironmentFiles=, which is an `a(sb)` and not an `as`
+# (o3d-2sm1.5 r23, Codex HIGH). bus_read_strings() reads the paths and drops the booleans; the
+# snapshot check needs them, because a snapshot loaded with a leading `-` is not a binding at
+# all — systemd would SKIP it if it were missing and hand the service back to whatever else
+# defines DATABASE_URL, which is the failure this round exists to remove.
+#
+# Every quoted element is removed first, which leaves the signature, systemd's own element count
+# and the booleans in order. Nothing here reimplements systemd's escaping: the callers already
+# refuse any element that had to be escaped.
+BUS_ENV_IGNORE_FLAGS=()
+bus_read_env_ignore_flags() {
+  local text="${1:-}" stripped word index=0
+  BUS_ENV_IGNORE_FLAGS=()
+  stripped="$(printf '%s' "$text" | sed 's/"\(\\.\|[^"\\]\)*"/ /g')" || return 1
+  local IFS=' '
+  local -a words=()
+  # shellcheck disable=SC2206  # deliberate word split on the space-separated rendering
+  words=($stripped)
+  for (( index = 2; index < ${#words[@]}; index++ )); do
+    word="${words[index]}"
+    case "$word" in
+      true|false) BUS_ENV_IGNORE_FLAGS+=("$word") ;;
+      *) return 1 ;;
+    esac
+  done
+  return 0
+}
+
+# Does the caller also REQUIRE the environment snapshot to be loaded? False everywhere the
+# question is only "is anything else defining DATABASE_URL"; true at the one call site that is
+# about to hand the units to systemd (o3d-2sm1.5 r23).
+DB_IDENTITY_REQUIRE_SNAPSHOT=false
+
+env_file_is_sole_database_url_source() {
+  local env_file="${1:-}"; shift || true
+  local -a units=("$@")
+  local unit object rendering count element expected resolved load_state pam_name snapshot_expected
+
+  DB_IDENTITY_SOURCE_REASON=""
+  expected="$(readlink -f "$env_file" 2>/dev/null || printf '%s' "$env_file")"
+  snapshot_expected="$(readlink -f "$DB_ENV_SNAPSHOT_FILE" 2>/dev/null || printf '%s' "$DB_ENV_SNAPSHOT_FILE")"
+
+  if [[ "${#units[@]}" -eq 0 || -z "${units[0]}" ]]; then
+    DB_IDENTITY_SOURCE_REASON="no systemd unit was identified for the application, so there is nothing that can say whether ${env_file} is what gives it DATABASE_URL"
+    return 1
+  fi
+  if ! command -v busctl >/dev/null 2>&1; then
+    DB_IDENTITY_SOURCE_REASON="busctl — systemd's own bus client, shipped beside systemctl — is not available, so whether anything other than ${env_file} defines DATABASE_URL for the service cannot be established"
+    return 1
+  fi
+
+  for unit in "${units[@]}"; do
+    [[ -n "$unit" ]] || continue
+
+    # LoadUnit, not GetUnit: it answers for a unit the manager has not loaded yet as well, so the
+    # LoadState below is what says whether there is a readable unit there at all. It is the same
+    # load `systemctl show` performs — it starts nothing and queues no job.
+    rendering="$(busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager LoadUnit s "$unit" 2>/dev/null)" || rendering=''
+    if ! bus_read_strings "$rendering" || [[ "${#BUS_STRINGS[@]}" -ne 1 || -z "${BUS_STRINGS[0]}" ]]; then
+      DB_IDENTITY_SOURCE_REASON="systemd would not say where ${unit} lives on its bus, so what defines DATABASE_URL for that service is unknown"
+      return 1
+    fi
+    object="${BUS_STRINGS[0]}"
+
+    rendering="$(bus_unit_property "$object" Unit LoadState)" || rendering=''
+    if ! bus_read_strings "$rendering" || [[ "${#BUS_STRINGS[@]}" -ne 1 ]]; then
+      DB_IDENTITY_SOURCE_REASON="systemd would not answer for ${unit}'s LoadState, so what defines DATABASE_URL for that service is unknown"
+      return 1
+    fi
+    load_state="${BUS_STRINGS[0]}"
+    if [[ "$load_state" != "loaded" ]]; then
+      DB_IDENTITY_SOURCE_REASON="systemd reports ${unit} as '${load_state:-unknown}' rather than loaded, so what defines DATABASE_URL for it cannot be read"
+      return 1
+    fi
+
+    # PAMName=, which the five-property question did not ask (r21, Codex CRITICAL). systemd.exec
+    # lists "variables set by any PAM modules in case PAMName= is in effect" AFTER the
+    # EnvironmentFile= layer and says the later source wins, so a unit naming a PAM profile whose
+    # stack runs pam_env can be handed a DATABASE_URL that beats the file this deploy read — while
+    # every other property here still says "only that file". What a PAM stack supplies is not
+    # knowable without reading PAM configuration, so ANY non-empty value is refused.
+    rendering="$(bus_unit_property "$object" Service PAMName)" || rendering=''
+    if ! bus_read_strings "$rendering" || [[ "${#BUS_STRINGS[@]}" -ne 1 ]]; then
+      DB_IDENTITY_SOURCE_REASON="systemd would not answer for ${unit}'s PAMName=, so whether a PAM stack also defines DATABASE_URL for it is unknown"
+      return 1
+    fi
+    pam_name="${BUS_STRINGS[0]}"
+    if [[ -n "$pam_name" ]]; then
+      DB_IDENTITY_SOURCE_REASON="${unit} sets PAMName=${pam_name}, and systemd applies the variables its PAM modules set AFTER the environment file — the later source wins. Whether that stack exports DATABASE_URL is a question about PAM configuration this will not read, so it is refused rather than guessed at. Remove PAMName=, or state the connection identity explicitly"
+      return 1
+    fi
+
+    # The three environment lists, all matched on the element NAME. UnsetEnvironment= takes a name
+    # OR an exact assignment and is applied as the final composition step, so the assignment form
+    # is the same refusal as the bare name (r21, Codex HIGH).
+    local property description
+    for property in Environment PassEnvironment UnsetEnvironment; do
+      rendering="$(bus_unit_property "$object" Service "$property")" || rendering=''
+      if ! count="$(bus_array_count "$rendering" 'as')" || ! bus_read_strings "$rendering" \
+        || [[ "${#BUS_STRINGS[@]}" -ne "$count" ]]; then
+        DB_IDENTITY_SOURCE_REASON="systemd would not answer readably for ${unit}'s ${property}=, so what defines DATABASE_URL for that service is unknown"
+        return 1
+      fi
+      for element in ${BUS_STRINGS[@]+"${BUS_STRINGS[@]}"}; do
+        bus_element_names_database_url "$element" || continue
+        case "$property" in
+          Environment) description="sets DATABASE_URL in its own Environment= (${element%%=*}=…). systemd puts that in the service's environment and dotenv will not overwrite an already-set variable, so the application connects where THAT says and not where ${env_file} says" ;;
+          PassEnvironment) description="lists DATABASE_URL in PassEnvironment=, so the service inherits whatever the service manager's own environment holds and ${env_file} does not decide where the application connects" ;;
+          *) description="lists DATABASE_URL in UnsetEnvironment= (as '${element}'), so systemd removes the value ${env_file} supplies — as the final step of composing the environment, whether it is written as a name or as an exact assignment — and the application's own loader decides what replaces it" ;;
+        esac
+        DB_IDENTITY_SOURCE_REASON="${unit} ${description}. Remove it, or state the connection identity explicitly"
+        return 1
+      done
+    done
+
+    # EnvironmentFiles=, an array of (path, ignore_errors) pairs. EXACTLY ONE entry, and it must
+    # be ours: the count is systemd's own, so a second file cannot hide behind the rendering.
+    rendering="$(bus_unit_property "$object" Service EnvironmentFiles)" || rendering=''
+    if ! count="$(bus_array_count "$rendering" 'a(sb)')" || ! bus_read_strings "$rendering" \
+      || [[ "${#BUS_STRINGS[@]}" -ne "$count" ]]; then
+      DB_IDENTITY_SOURCE_REASON="systemd would not answer readably for ${unit}'s EnvironmentFiles=, so what defines DATABASE_URL for that service is unknown"
+      return 1
+    fi
+    if [[ "$count" -eq 0 ]]; then
+      DB_IDENTITY_SOURCE_REASON="${unit} does not load ${env_file} with EnvironmentFile=, so DATABASE_URL reaches the application through its own dotenv loader instead — whose .env.local and per-mode overlays are exactly the composition this deploy stopped reproducing. Add EnvironmentFile=${env_file} to the unit, or state the connection identity explicitly"
+      return 1
+    fi
+    # ONE ENVIRONMENT FILE, OR TWO OF WHICH THE SECOND IS THIS RUN'S OWN SNAPSHOT
+    # (o3d-2sm1.5 r23, Codex HIGH). Until this round the answer was "exactly one, and it must be
+    # ${env_file}" — which is the right refusal for somebody ELSE's second file and the wrong one
+    # for the binding this round adds, since publish_db_identity_snapshot() gives every unit a
+    # drop-in that loads ${DB_ENV_SNAPSHOT_FILE} after it. So the shape is stated exactly: the
+    # application's file first, and at most one more, which may only be the snapshot THIS RUN
+    # published. A snapshot left behind by some earlier run is NOT tolerated — DB_ENV_SNAPSHOT_PUBLISHED
+    # is false until this run writes one — because an unexplained pin is a DATABASE_URL nobody
+    # here chose, which is precisely the condition this function exists to refuse.
+    if [[ "$count" -gt 2 ]]; then
+      DB_IDENTITY_SOURCE_REASON="${unit} loads ${count} environment files (${BUS_STRINGS[*]}). Whether any of them but ${env_file} defines DATABASE_URL, and which definition systemd would keep, is composition this will not reproduce — so it is refused rather than guessed at, and without reading them. Load only ${env_file}, or state the connection identity explicitly"
+      return 1
+    fi
+    if ! bus_read_env_ignore_flags "$rendering" || [[ "${#BUS_ENV_IGNORE_FLAGS[@]}" -ne "$count" ]]; then
+      DB_IDENTITY_SOURCE_REASON="systemd would not say readably whether ${unit} loads its environment files with a leading '-'. Whether a missing file is skipped or fatal decides what the service gets when one disappears, so it is refused rather than assumed"
+      return 1
+    fi
+    local index
+    for index in 0 1; do
+      [[ "$index" -lt "$count" ]] || continue
+      element="${BUS_STRINGS[index]}"
+      case "$element" in
+        *'\'*)
+          DB_IDENTITY_SOURCE_REASON="systemd reports one of ${unit}'s environment files as ${element}, a path it had to escape to state. Decoding that here to compare it with ${env_file} is a reimplementation of somebody else's escaping, so it is refused: give the unit an EnvironmentFile= path with no character needing an escape, or state the connection identity explicitly"
+          return 1 ;;
+      esac
+      resolved="$(readlink -f "$element" 2>/dev/null || printf '%s' "$element")"
+      if [[ "$index" -eq 0 ]]; then
+        if [[ "$resolved" != "$expected" ]]; then
+          DB_IDENTITY_SOURCE_REASON="${unit} loads ${element} as its first environment file and not ${env_file}, so the file this deploy read is not the one that gives the service DATABASE_URL. Load ${env_file}, or state the connection identity explicitly"
+          return 1
+        fi
+        continue
+      fi
+      # THE SECOND ENTRY, WHICH MAY ONLY BE THE BINDING. Three things are required of it and each
+      # is load-bearing: it is the snapshot's path (anything else is a source of DATABASE_URL this
+      # deploy did not write), THIS run published it (an old one pins a value nobody re-validated),
+      # and it is loaded WITHOUT a leading '-' (with one, deleting it between here and the exec
+      # takes the binding away silently and hands the service back to ${env_file}).
+      if ! $DB_ENV_SNAPSHOT_PUBLISHED; then
+        DB_IDENTITY_SOURCE_REASON="${unit} loads a second environment file, ${element}, that this run did not publish. A second file can define DATABASE_URL and systemd keeps the LAST definition, so what the service would connect to is not ${env_file}'s answer. Remove it (if it is a ${DB_ENV_SNAPSHOT_DROPIN_NAME} drop-in, an earlier cutover left it behind and it is safe to delete), or state the connection identity explicitly"
+        return 1
+      fi
+      if [[ "$resolved" != "$snapshot_expected" ]]; then
+        DB_IDENTITY_SOURCE_REASON="${unit} loads ${element} as a second environment file, and this run's environment snapshot is ${DB_ENV_SNAPSHOT_FILE}. A second file can define DATABASE_URL and systemd keeps the LAST definition, so the service would connect where that file says. Remove it, or state the connection identity explicitly"
+        return 1
+      fi
+      if [[ "${BUS_ENV_IGNORE_FLAGS[index]}" != "false" ]]; then
+        DB_IDENTITY_SOURCE_REASON="${unit} loads ${element} with a leading '-', so systemd SKIPS it if it is missing instead of failing the start. The whole point of the snapshot is that its absence stops the service rather than handing it back to ${env_file}; drop the '-' from the ${DB_ENV_SNAPSHOT_DROPIN_NAME} drop-in"
+        return 1
+      fi
+    done
+    # AND WHEN THE CALLER IS ABOUT TO START THE SERVICE, THE BINDING MUST BE THERE. Everywhere
+    # else this function is a refusal of extra sources; at the start it is also the proof that the
+    # one source that cannot be replaced under us is loaded.
+    if $DB_IDENTITY_REQUIRE_SNAPSHOT && [[ "$count" -ne 2 ]]; then
+      DB_IDENTITY_SOURCE_REASON="${unit} does not load this run's environment snapshot ${DB_ENV_SNAPSHOT_FILE}, so the DATABASE_URL it gets at exec is whatever ${env_file} says at that moment and not the one this run fenced and migrated"
+      return 1
+    fi
+  done
+  return 0
+}
+
+# The refusal the start goes through: a service whose DATABASE_URL nothing but that file (and
+# this run's own snapshot) can define.
+require_env_file_is_sole_definition() {
+  env_file_is_sole_database_url_source "${APP_DIR}/.env" "${APP_NAME}.service"
+}
+
+# THE SAME TWO HALVES, PLUS THE BINDING (o3d-2sm1.5 r23, Codex HIGH).
+#
+# Used at the ONE call site that is about to hand the units to systemd. The difference from
+# require_start_identity_unchanged() is not a stricter read of the same file — re-reading harder
+# is what rounds 13-22 already exhausted — it is that this one requires the loaded unit
+# configuration to name a file systemd will read at exec AND that this run wrote AND that the
+# application user cannot replace. What the two checks above establish about ${APP_DIR}/.env
+# is kept because a disagreement there is still worth refusing on: it means the operator's file
+# and this run have parted company, and starting into a snapshot that contradicts the file on
+# disk would be correct-but-astonishing.
+require_start_identity_bound() {
+  local rc=0
+  DB_IDENTITY_REQUIRE_SNAPSHOT=true
+  require_env_file_is_sole_definition || rc=$?
+  DB_IDENTITY_REQUIRE_SNAPSHOT=false
+  [[ "$rc" -eq 0 ]] || return "$rc"
+  # AND THE FILE STILL SAYS WHAT THIS RUN WROTE. install.sh does not READ its identity out of
+  # ${APP_DIR}/.env — it composed the value and wrote the file — so there is no four-value parse
+  # to re-run here, and an exact string comparison is stronger than one. A disagreement means the
+  # file was replaced during the build/migration window: the snapshot makes the START safe either
+  # way, and this refusal is what stops a correct-but-astonishing start into a database the file
+  # on disk no longer names.
+  local current
+  current="$(env_file_value DATABASE_URL "${APP_DIR}/.env")" || current=""
+  if [[ "$current" != "${DATABASE_URL}" ]]; then
+    DB_IDENTITY_SOURCE_REASON="${APP_DIR}/.env no longer states the DATABASE_URL this run fenced and migrated with. The service would still start on the right database — the environment snapshot is loaded last and wins — but the file on disk and this run have parted company, and starting into that disagreement silently is how the next operator is misled"
+    return 1
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# THE ENVIRONMENT SNAPSHOT: publish, and take it away again (o3d-2sm1.5 r23, Codex HIGH).
+# ---------------------------------------------------------------------------
+# Publish the DATABASE_URL this run fenced and migrated where only root can change it, and make
+# every unit load it LAST. Called with the connection fence still up and nothing started, so a
+# failure here costs a re-run and no outage.
+publish_db_identity_snapshot() {
+  if $DRY_RUN; then
+    echo -e "${YELLOW}[DRY]${RESET}   would publish ${DB_ENV_SNAPSHOT_FILE} and the ${DB_ENV_SNAPSHOT_DROPIN_NAME} drop-in, daemon-reload, and verify the loaded EnvironmentFiles on the bus"
+    return 0
+  fi
+  command -v systemctl >/dev/null 2>&1 || {
+    error "systemctl is unavailable, so the started service cannot be bound to the database this run migrated."
+    return 1
+  }
+  if [[ -z "${APP_NAME}" ]]; then
+    error "No systemd unit is named for the application, so there is nothing to bind the environment snapshot to."
+    return 1
+  fi
+
+  # A PATH SYSTEMD WOULD HAVE TO ESCAPE IS REFUSED, not escaped. The bus check compares the
+  # loaded path against this one and refuses any element that had to be escaped, so emitting one
+  # here would guarantee a refusal three lines later — with a message about somebody else's unit.
+  case "$DB_ENV_SNAPSHOT_FILE" in
+    *[$' \t\n\\']*)
+      error "${DB_ENV_SNAPSHOT_FILE} contains whitespace or a backslash, so systemd could not state it back unescaped and the binding could not be verified. Set IMS_CUTOVER_STATE_DIR to a path with neither."
+      return 1 ;;
+  esac
+
+  # THE VALUE IS THE ONE THIS RUN PINNED, re-read from the file and re-checked against the pin by
+  # the caller a moment ago. It is written SINGLE-QUOTED because that is the one form systemd
+  # documents as verbatim — "can span multiple lines and contain any character verbatim other
+  # than single quote" — so the deploy's reader and systemd's reader cannot disagree about it the
+  # way they can about an unquoted value with a backslash in it.
+  # AND IT IS THE SHELL VALUE, NOT A RE-READ OF THE FILE. install.sh composed DATABASE_URL and
+  # fenced and migrated with it; the file is something it WROTE. Binding to the file's current
+  # contents would re-introduce the very indirection this removes.
+  local value="${DATABASE_URL}"
+  if [[ -z "$value" ]]; then
+    error "This run has no DATABASE_URL to bind the service to."
+    return 1
+  fi
+  case "$value" in
+    *"'"*|*$'\n'*)
+      error "DATABASE_URL contains a single quote or a newline, which cannot be written into a systemd environment file verbatim. Re-write it without one."
+      return 1 ;;
+  esac
+
+  # The directory first, root-owned and 0700, so that nothing running as the application user can
+  # replace or remove what the unit is about to be pointed at.
+  if ! mkdir -p "$DB_ENV_SNAPSHOT_DIR" \
+     || ! chown root:root "$DB_ENV_SNAPSHOT_DIR" \
+     || ! chmod 700 "$DB_ENV_SNAPSHOT_DIR"; then
+    error "${DB_ENV_SNAPSHOT_DIR} could not be created root-owned and 0700, so the environment snapshot would sit somewhere the application user can rewrite."
+    return 1
+  fi
+
+  printf "DATABASE_URL='%s'\n" "$value" | publish_durable_file "$DB_ENV_SNAPSHOT_FILE" || {
+    error "${DB_ENV_SNAPSHOT_FILE} could not be published durably; the service is NOT bound and nothing has been started."
+    return 1
+  }
+  # publish_durable_file() leaves 0600; the owner is root because this script runs as root, and
+  # systemd reads EnvironmentFile= as PID 1 BEFORE it drops to User=. So the application user
+  # never needs to read it — which is the point: the file that decides the connection is not one
+  # the service, or anything running as it, can rewrite.
+  chown root:root "$DB_ENV_SNAPSHOT_FILE" 2>/dev/null || true
+  DB_ENV_SNAPSHOT_PUBLISHED=true
+
+  DB_ENV_SNAPSHOT_DROPINS_CREATED=()
+  [[ -f "${DB_ENV_SNAPSHOT_DROPIN_FILE}" ]] || DB_ENV_SNAPSHOT_DROPINS_CREATED+=("${DB_ENV_SNAPSHOT_DROPIN_FILE}")
+  if ! publish_durable_dropin "${DB_ENV_SNAPSHOT_DROPIN_FILE}" <<EOF
+[Service]
+# Installed by scripts/install.sh (o3d-2sm1.5 r23) for the length of ONE cutover, and removed
+# again before this run exits. It binds the service to the database this run fenced and
+# migrated: systemd reads environment files in order and the LAST definition of a variable
+# wins, so this beats whatever ${APP_DIR}/.env says at the moment of exec.
+# No leading '-': if the file is gone, the start must FAIL rather than fall back.
+EnvironmentFile=${DB_ENV_SNAPSHOT_FILE}
+EOF
+  then
+    error "${DB_ENV_SNAPSHOT_DROPIN_FILE} could not be published durably, so ${APP_NAME}.service is NOT bound to the database this run migrated."
+    return 1
+  fi
+
+  if ! systemctl daemon-reload; then
+    error "systemctl daemon-reload failed, so the environment snapshot is not in the unit's loaded configuration."
+    return 1
+  fi
+  return 0
+}
+
+# Take the binding away. Called on EVERY exit path, successful or not: a drop-in left standing
+# would pin a DATABASE_URL that a later, legitimate edit of ${APP_DIR}/.env could not
+# override, and it would do so silently.
+remove_db_identity_snapshot() {
+  if $DRY_RUN; then
+    echo -e "${YELLOW}[DRY]${RESET}   would remove the ${DB_ENV_SNAPSHOT_DROPIN_NAME} drop-ins, daemon-reload, and delete ${DB_ENV_SNAPSHOT_FILE}"
+    return 0
+  fi
+  local removed=false
+  if [[ -e "${DB_ENV_SNAPSHOT_DROPIN_FILE}" ]]; then
+    rm -f "${DB_ENV_SNAPSHOT_DROPIN_FILE}"
+    removed=true
+  fi
+  rmdir "${FENCE_DROPIN_DIR}" 2>/dev/null || true
+  if $removed && command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload || warn "daemon-reload failed while removing the environment snapshot drop-ins."
+  fi
+  rm -f "$DB_ENV_SNAPSHOT_FILE"
+  DB_ENV_SNAPSHOT_PUBLISHED=false
+  DB_ENV_SNAPSHOT_DROPINS_CREATED=()
   return 0
 }
 
@@ -1826,6 +2364,12 @@ on_cutover_exit() {
   error "  from the same place (${FENCE_FILE}) and adopt it."
 
   systemctl stop "${APP_NAME}.service" >/dev/null 2>&1 || true
+  # AND THE BINDING COMES OFF, ALWAYS (o3d-2sm1.5 r23). The environment snapshot pins
+  # DATABASE_URL over ${APP_DIR}/.env for as long as its drop-in is loaded, and it is only ever
+  # right for the run that published it. Left standing after a failure it would silently override
+  # a later, legitimate edit of the file — and the operator's first move after reading this
+  # banner is usually to edit that file.
+  remove_db_identity_snapshot
   install_reboot_fence "install failed at ${CUTOVER_STEP}" >/dev/null 2>&1 \
     || error "THE REBOOT FENCE IS NOT IN PLACE. This host may start the old version against a migrated schema on its next boot. Stop it by hand."
   # "HELD" IS A CLAIM, SO IT IS MADE TRUE BEFORE IT IS PRINTED (Codex r3 HIGH). The start
@@ -2886,7 +3430,20 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-systemctl daemon-reload
+# BIND THE SERVICE TO THE DATABASE THIS RUN MIGRATED, BEFORE THE RELOAD THAT LOADS THE UNIT
+# (o3d-2sm1.5 r23, Codex HIGH). The unit above loads ${APP_DIR}/.env with a leading `-`, and
+# systemd does not read it until it EXECS — at the far end of a window that has held a git
+# clone, an npm install, a Next build and a migration. Nothing in this script re-read it, and
+# re-reading it would not have helped: a read cannot bind a file somebody else can replace.
+#
+# So the value THIS RUN fenced and migrated with — the shell variable, not a re-read — is
+# published under the cutover state directory, root-owned and 0600, and the unit is given a
+# drop-in that loads it LAST. systemd keeps the last definition of a variable across environment
+# files, so it beats whatever ${APP_DIR}/.env has come to say; and it is loaded with NO leading
+# `-`, so if it is gone the start fails instead of falling back.
+publish_db_identity_snapshot || die \
+  "The application service could not be bound to the database this run fenced and migrated (the reason is printed above). The connection fence is still up and nothing has been started. Without the binding, the DATABASE_URL systemd reads at exec is whatever ${APP_DIR}/.env says at that instant, which is not something this script can hold still. Fix the cause and re-run; the re-run adopts the standing fence."
+
 # Legacy PM2 instances are stopped, disabled and deleted by stop_legacy_launchers() in the
 # cutover above — BEFORE the migration, not here. Removing them at this point meant a
 # PM2-run installation kept writing for the whole length of the schema change (o3d-2sm1.4).
@@ -2909,6 +3466,20 @@ CUTOVER_STEP="start"
 release_db_connections \
   || die "Refusing to start the application while it has no CONNECT on its own database."
 remove_reboot_fence
+
+# THE COMPOSED UNIT, ASKED OF SYSTEMD AFTER THE LAST daemon-reload (o3d-2sm1.5 r23, Codex HIGH).
+# remove_reboot_fence() has just issued it, so this is the first moment the LOADED configuration
+# can be read and the last before the start. Three things are proved here and nothing is assumed:
+# nothing but ${APP_DIR}/.env and this run's snapshot can define DATABASE_URL for the service
+# (no Environment=, PassEnvironment=, UnsetEnvironment=, PAMName= or third environment file — a
+# drop-in that survived from some other tool included); the snapshot is loaded LAST and
+# MANDATORILY; and ${APP_DIR}/.env still states the value this run migrated with.
+#
+# It is atomic with respect to the start in the one way that matters: the SET of environment
+# files is unit configuration, fixed at daemon-reload and not re-read by `systemctl start`, and
+# nothing between this line and the start issues another reload.
+require_start_identity_bound || die \
+  "THE APPLICATION IS NOT BEING STARTED: ${DB_IDENTITY_SOURCE_REASON}. This was checked after the final daemon-reload, so it is the unit's loaded configuration that systemd is about to act on. The migration applied and every verification passed; fix the unit (or ${APP_DIR}/.env) and re-run, which adopts the state this run left. Do NOT start the service by hand first."
 
 systemctl enable --now "${APP_NAME}.service"
 
@@ -2997,6 +3568,13 @@ CUTOVER_ARMING=false
 if ${PAST_POINT_OF_NO_RETURN}; then
   FENCE_ARMED=false
 fi
+
+# THE BINDING COMES OFF HERE, on the success path (o3d-2sm1.5 r23). The service is running and
+# has answered its health check, so it already HAS the environment; the drop-in has nothing left
+# to do and everything to break, because from now on it would override ${APP_DIR}/.env for every
+# restart, reboot and Restart= until somebody noticed a file in /etc/systemd/system that no
+# document mentions. Removing it does not touch the running process.
+remove_db_identity_snapshot
 
 # Cron goes back only once the new build is running, and BEFORE the crontab block below
 # is spliced in — splicing into a fenced crontab would preserve the commented-out lines
