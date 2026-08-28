@@ -2213,16 +2213,17 @@ test('o3d-2sm1.5 r19: every entrypoint supplies the four values, and refuses whe
     // published into it and never executed in place, because it is application-owned and could be
     // REPLACED as easily as removed. Every spelling of the resolved path is an invocation of the
     // helper and every one of them must carry the identity.
-    const invocations = source
-      .split('\n')
-      .filter(
-        (line) =>
-          line.includes('"${DB_FENCE_SCRIPT}"') ||
-          line.includes('"$DB_FENCE_SCRIPT"') ||
-          line.includes('"${fence_script}"') ||
-          line.includes('"${preflight_script}"') ||
-          line.includes('"${dry_script}"'),
-      )
+    // r31: ALL THREE entrypoints now resolve the helper before running it, through the shared
+    // scripts/lib/db-fence-protected.sh, so every one of them has these spellings and none of
+    // them still names ${DB_FENCE_SCRIPT} at an invocation.
+    const RESOLVED = [
+      '"${DB_FENCE_SCRIPT}"', '"$DB_FENCE_SCRIPT"',
+      '"${fence_script}"', '"$fence_script"',
+      '"${preflight_script}"', '"$preflight_script"',
+      '"${release_script}"', '"$release_script"',
+      '"${DB_FENCE_PROBE_SCRIPT}"', '"$DB_FENCE_PROBE_SCRIPT"',
+    ]
+    const invocations = source.split('\n').filter((line) => RESOLVED.some((spelling) => line.includes(spelling)))
     const modes = invocations.filter((line) => /--(fence|release|preflight|print-migration-url)\b/.test(line))
     assert.ok(modes.length >= 4, `${name}: precondition — the helper is actually invoked here (${modes.length})`)
     for (const line of modes) {
@@ -3230,15 +3231,16 @@ test('o3d-2sm1.5 r23: the trap re-fences the database it migrated even when the 
         // and never executed in place. Both paths are under the harness directory here; the copy
         // is absent to begin with, so the resolver publishes the real file above into it and runs
         // that, which is what every assertion below is written against.
+        // r31: the resolution is the SHARED library both scripts source, so the harness sources it
+        // too and then points its literals at the harness directory. Lifting the functions one by
+        // one would keep passing if an entrypoint stopped calling them, which is the finding.
+        `source ${JSON.stringify(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'))}`,
         `DB_FENCE_RECOVERY_DIR=${JSON.stringify(fenceDir)}`,
-        `DB_FENCE_SCRIPT_COPY=${JSON.stringify(join(fenceDir, 'protected-fence-db-connections.mjs'))}`,
+        `DB_FENCE_PROTECTED_APP_DIR=${JSON.stringify(join(fenceDir, 'protected'))}`,
+        `DB_FENCE_SCRIPT_COPY=${JSON.stringify(join(fenceDir, 'protected', 'scripts', 'fence-db-connections.mjs'))}`,
+        `DB_FENCE_SCRIPT_STAGED=${JSON.stringify(join(fenceDir, 'protected', 'scripts', '.staged'))}`,
+        `DB_FENCE_MODULES_LINK=${JSON.stringify(join(fenceDir, 'protected', 'node_modules'))}`,
         `DB_FENCE_IDENTITY_FILE=${JSON.stringify(join(fenceDir, 'db-fence-identity.env'))}`,
-        ...['fsync_path', 'publish_durable_file', 'file_sha256', 'fence_record_script_digest', 'publish_fence_script_copy', 'db_fence_script_in_use']
-          .map((fn) =>
-            source.includes(`\n${fn}() {`)
-              ? source.slice(source.indexOf(`\n${fn}() {`) + 1, source.indexOf('\n}\n', source.indexOf(`\n${fn}() {`)) + 3)
-              : '',
-          ),
         'DEPLOY_ADMIN_DATABASE_URL="postgresql://admin@127.0.0.1:5432/main"',
         'DATABASE_URL="postgresql://app:pw@127.0.0.1:5432/main"',
         'APP_USER="app"',

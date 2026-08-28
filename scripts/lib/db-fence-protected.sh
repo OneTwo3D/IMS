@@ -215,10 +215,15 @@ _fence_protected_dir_ready() {
 # The node_modules hop, pointed at the checkout the helper shipped with. Refreshed on every
 # publication rather than created once, because an application directory that moved would
 # otherwise leave the protected copy unable to import anything.
+#
+# THE TARGET IS NOT REQUIRED TO EXIST. A checkout with no installed dependencies is a checkout
+# whose fence helper cannot run from ANY path, protected or not — node says so, with the same
+# ERR_MODULE_NOT_FOUND either way — so refusing to publish over it would convert one clear failure
+# into a different, less clear one, and would make publication depend on a directory the
+# application account owns.
 _fence_link_modules() {
   local app_modules
   app_modules="$(dirname "$(dirname "${DB_FENCE_SCRIPT}")")/node_modules"
-  [[ -d "${app_modules}" ]] || return 1
   ln -sfn "${app_modules}" "${DB_FENCE_MODULES_LINK}" 2>/dev/null || return 1
   return 0
 }
@@ -237,7 +242,7 @@ _fence_stage_and_publish() {
   # BEFORE the publication, not after it: a copy that cannot import `pg` is a fence that dies at
   # exec, and a failure discovered after the rename would leave exactly that standing.
   _fence_link_modules || {
-    DB_FENCE_ROTATION_NOTE="the protected copy at ${DB_FENCE_SCRIPT_COPY} could not be given a node_modules to import from: there is none beside ${DB_FENCE_SCRIPT}"
+    DB_FENCE_ROTATION_NOTE="the protected copy at ${DB_FENCE_SCRIPT_COPY} could not be given the node_modules hop it imports \`pg\` through: ${DB_FENCE_MODULES_LINK} could not be created"
     return 1
   }
   _fence_publish_file "${DB_FENCE_SCRIPT_STAGED}" < "${DB_FENCE_SCRIPT}" || return 1
@@ -413,7 +418,7 @@ db_fence_probe_script() {
   cat < "${DB_FENCE_SCRIPT}" > "${dir}/scripts/fence-db-connections.mjs" || { rm -rf "${dir}"; return 1; }
   chmod 644 "${dir}/scripts/fence-db-connections.mjs" || { rm -rf "${dir}"; return 1; }
   app_modules="$(dirname "$(dirname "${DB_FENCE_SCRIPT}")")/node_modules"
-  if [[ -d "${app_modules}" ]]; then ln -sfn "${app_modules}" "${dir}/node_modules" 2>/dev/null || true; fi
+  ln -sfn "${app_modules}" "${dir}/node_modules" 2>/dev/null || true
   DB_FENCE_PROBE_SCRIPT="${dir}/scripts/fence-db-connections.mjs"
   DB_FENCE_PROBE_TEMP="${dir}"
   return 0
