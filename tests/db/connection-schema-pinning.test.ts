@@ -1617,18 +1617,32 @@ test('o3d-2k5r r17 (live): the REAL server drops the terminal escape, and the co
 // probe against the real server.
 // ---------------------------------------------------------------------------
 
+/*
+ * A DIRECT CONNECTION, AS BOTH ENDS SPELL IT (o3d-2k5r r24, Codex HIGH).
+ *
+ * Since r24 the peer comparison FAILS CLOSED on an absent peer: a backend that names no client
+ * (`client_port` -1 over a Unix socket, or an answer that never carried the columns) is refused,
+ * not skipped. So a stand-in that stands for a WORKING deployment has to carry both halves of the
+ * comparison — a local socket this process can read, and a backend row naming that same socket.
+ * Before r24 these stand-ins carried NEITHER and were admitted; that is the hole Codex found, and
+ * the tests that model a healthy deployment now have to say what healthy looks like.
+ */
+const DIRECT_SOCKET = { localAddress: '10.9.9.9', localPort: 41000 }
+const DIRECT_PEER = { client_address: '10.9.9.9', client_port: '41000' }
+
 /** A `pg.Client` stand-in that answers the probe's two queries however the case under test needs. */
 function probeClient(recorder: { configs: object[] }, answers: (config: { options?: string }) => Record<string, unknown>) {
   return async (config: { options?: string }) => {
     recorder.configs.push(config)
     return {
+      connection: { stream: DIRECT_SOCKET },
       async connect() {
         return undefined
       },
       async query(text: string) {
         const row = answers(config)
         if (text.startsWith('select pg_encoding_to_char')) {
-          return { rows: [{ server_encoding: row.server_encoding, lc_ctype: row.lc_ctype }] }
+          return { rows: [{ server_encoding: row.server_encoding, lc_ctype: row.lc_ctype, ...DIRECT_PEER }] }
         }
         if (row.throws) throw new Error(String(row.throws))
         return { rows: [{ startup_option_probe: row.startup_option_probe }] }
@@ -1820,11 +1834,12 @@ function fanOutClient(
     const backend = backends[opened % backends.length]!
     opened += 1
     return {
+      connection: { stream: DIRECT_SOCKET },
       async connect() {
         return undefined
       },
       async query(text: string) {
-        if (text.startsWith('select pg_encoding_to_char')) return { rows: [{ ...backend }] }
+        if (text.startsWith('select pg_encoding_to_char')) return { rows: [{ ...DIRECT_PEER, ...backend }] }
         return { rows: [{ startup_option_probe: probeAnswer(config) }] }
       },
       async end() {
@@ -2070,9 +2085,10 @@ function servedConnection(backend: Record<string, unknown>, searchPath: string) 
   const asked: string[] = []
   return {
     asked,
+    connection: { stream: DIRECT_SOCKET },
     async query(text: string) {
       asked.push(text)
-      return { rows: [{ ...backend, search_path: searchPath }] }
+      return { rows: [{ ...DIRECT_PEER, ...backend, search_path: searchPath }] }
     },
   }
 }
@@ -2312,6 +2328,7 @@ test('o3d-2k5r r22: a raw pg.Client is guarded through connect(), and ended when
       const state = { connected: false, ended: false }
       const client = {
         state,
+        connection: { stream: DIRECT_SOCKET },
         async connect() {
           state.connected = true
           return undefined
@@ -2321,7 +2338,7 @@ test('o3d-2k5r r22: a raw pg.Client is guarded through connect(), and ended when
           return undefined
         },
         async query() {
-          return { rows: [{ ...backend, search_path: searchPath }] }
+          return { rows: [{ ...DIRECT_PEER, ...backend, search_path: searchPath }] }
         },
       }
       return client
@@ -2537,7 +2554,7 @@ test('o3d-2k5r r23: the guard reaches backend A, the consumer would reach backen
   }
 })
 
-test('o3d-2k5r r23: a direct connection is admitted, and an absent peer is not treated as a wrong one', async () => {
+test('o3d-2k5r r23: a direct connection is admitted, over either spelling of its address', async () => {
   resetStartupOptionByteSafety()
   try {
     await establishStartupOptionByteSafety(R22_URL, { createClient: fanOutClient([ONE_BACKEND]) })
@@ -2546,9 +2563,10 @@ test('o3d-2k5r r23: a direct connection is admitted, and an absent peer is not t
     // 1. DIRECT: the backend's client IS this process's socket, so the leg passes. Without this
     // half the test above would pass on a blanket refusal that strands every deployment.
     //
-    // MUTATION ROUTE: compare `ours.port` against `backendSees.address`, or drop the `-1`/''
-    // early return so every answer is compared. Either turns this into a refusal and no non-ASCII
-    // deployment can open a connection at all.
+    // MUTATION ROUTE: compare `ours.port` against `backendSees.address` in
+    // interposedPeerRefusal(). This turns a direct connection into a refusal and no non-ASCII
+    // deployment can open a connection at all — which is what makes the r24 refusal below a
+    // statement about interposition rather than a blanket denial.
     await onConnect(servedOverSocket({
       backend: ONE_BACKEND,
       searchPath: '"ténant"',
@@ -2572,17 +2590,92 @@ test('o3d-2k5r r23: a direct connection is admitted, and an absent peer is not t
       backendSeesAddress: '10.9.9.9',
     }))
 
-    // 3. UNIX SOCKET: the backend reports no peer at all (`client_addr` NULL, `client_port` -1).
-    // That is an unanswerable question, not a failed comparison, and it is SKIPPED — the
-    // `search_path` leg is what covers that case, and the measurements above show it refuses every
-    // real pooler because the pin never arrives. Recorded as a residue, not claimed closed.
-    await onConnect(servedOverSocket({
-      backend: ONE_BACKEND,
-      searchPath: '"ténant"',
-      ourPort: 41000,
-      backendSeesPort: '-1',
-      backendSeesAddress: '',
-    }))
+  } finally {
+    resetStartupOptionByteSafety()
+  }
+})
+
+test('o3d-2k5r r24: a backend that reports NO PEER is refused, not skipped', async () => {
+  resetStartupOptionByteSafety()
+  try {
+    // ROUTE: establishStartupOptionByteSafety() -> the verdict's `backend` -> pgConnectionConfig()'s
+    // `onConnect` -> pg-pool's per-physical-connection hook -> interposedConnectionRefusal() ->
+    // interposedPeerRefusal()'s absent-peer branch.
+    //
+    // ROUND 23 ADMITTED THIS CONNECTION and recorded the residue as "a hypothetical proxy that
+    // forwards startup options faithfully AND multiplexes AND is reached over a Unix socket".
+    // Codex named one: Odyssey pools transactions, listens on Unix sockets, and maintains client
+    // startup parameters across backend attachments — so on this path a multiplexing proxy and a
+    // direct connection produce byte-identical evidence. The `search_path` leg named as the cover
+    // does not cover it either: it is ONE reading taken in `onConnect`, which says nothing about
+    // the backend that runs the next statement on a multiplexed session.
+    await establishStartupOptionByteSafety(R22_URL, { createClient: fanOutClient([ONE_BACKEND]) })
+    const onConnect = pgConnectionConfig(R22_URL).onConnect!
+
+    // EVERY OTHER LEG PASSES, which is the point: the identity IS the measured backend and the
+    // search_path IS the pin, exactly as a faithful Unix-socket proxy presents them at connect
+    // time. Only the peer question separates this from a direct connection, and it has no answer.
+    //
+    // MUTATION ROUTE: restore r23's `if (backendSees.port === '' || backendSees.port === '-1')
+    // return null` early return in interposedPeerRefusal(). Both rejections below stop rejecting,
+    // `consumerRanOn` becomes 'the next backend', and the licensed bytes are spent on a session
+    // that can be re-attached between statements. That is the shipped r23 behaviour.
+    for (const [label, port, address] of [
+      ['a Unix-domain socket', '-1', ''],
+      ['an answer that never carried the peer columns', '', ''],
+    ] as Array<[string, string, string]>) {
+      let consumerRanOn: string | null = null
+      const noPeer = servedOverSocket({
+        backend: ONE_BACKEND,
+        searchPath: '"ténant"',
+        ourPort: 41000,
+        backendSeesPort: port,
+        backendSeesAddress: address,
+        onConsumerQuery: () => {
+          consumerRanOn = 'the next backend'
+          return { rows: [{ current_schema: 'public' }] }
+        },
+      })
+      await assert.rejects(
+        () => onConnect(noPeer),
+        (error: unknown) => {
+          assert.ok(error instanceof DatabaseUrlSchemaConflictError, `${label}: refused`)
+          const message = (error as Error).message
+          assert.match(message, /reports no client peer/, `${label}: it says what could not be answered`)
+          assert.match(message, /UNIX-DOMAIN socket/, `${label}: and what that looks like`)
+          assert.match(message, /Odyssey/, `${label}: and names the topology it cannot be told apart from`)
+          assert.match(message, /host=127\.0\.0\.1/, `${label}: the cheap way out is stated`)
+          assert.match(message, /rename the schema to ASCII/, `${label}: and so is the other one`)
+          return true
+        },
+        `${label}: directness is unproven, so the licensed bytes are refused`,
+      )
+      assert.equal(consumerRanOn, null, `${label}: and no consumer statement ran on it`)
+    }
+  } finally {
+    resetStartupOptionByteSafety()
+  }
+})
+
+test('o3d-2k5r r24: the absent-peer refusal reaches the PROBE, so it is one message at boot', async () => {
+  resetStartupOptionByteSafety()
+  try {
+    // ROUTE: establishStartupOptionByteSafety() -> interposedPeerRefusal(measuredOver, servedBy).
+    // The per-connection guard above is the second line; this is the first, and it is the one an
+    // operator actually sees — instrumentation.ts, preflight:production and
+    // scripts/check-wms-push-state-enum.mjs all run the probe before anything opens a pool.
+    //
+    // MUTATION ROUTE: restore the `port === '' || port === '-1'` early return. This verdict
+    // settles established/carries TRUE — every other leg passes — and pgConnectionConfig() below
+    // stops throwing, so a Unix-socket deployment is licensed on evidence it never produced.
+    const verdict = await establishStartupOptionByteSafety(R22_URL, {
+      createClient: fanOutClient([{ ...ONE_BACKEND, client_address: '', client_port: '-1' }]),
+    })
+    assert.equal(verdict.established, false, 'no licence is granted where directness cannot be shown')
+    assert.equal(verdict.carries, false)
+    assert.match(verdict.reason, /does not reach the backend directly/)
+    assert.match(verdict.reason, /reports no client peer/)
+    assert.throws(() => pgConnectionConfig(R22_URL), DatabaseUrlSchemaConflictError)
   } finally {
     resetStartupOptionByteSafety()
   }

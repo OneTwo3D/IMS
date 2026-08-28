@@ -41,15 +41,22 @@ const MODULE_SPECIFIER = new URL('../../lib/db/database-url-schema.mjs', import.
 
 type SchemaModule = typeof import('../../lib/db/database-url-schema.mjs')
 
-/** A `pg.Client` stand-in that returns the probed characters unchanged: the server that carries them. */
+/**
+ * A `pg.Client` stand-in that returns the probed characters unchanged: the server that carries them.
+ *
+ * It reports a DIRECT connection — its own socket, and a backend row naming that same socket —
+ * because since o3d-2k5r r24 a backend that names no peer is refused rather than skipped, and a
+ * stand-in for a healthy deployment has to carry both halves of that comparison.
+ */
 function carryingClient() {
   return async (config: { options?: string }) => ({
+    connection: { stream: { localAddress: '10.9.9.9', localPort: 41000 } },
     async connect() {
       return undefined
     },
     async query(text: string) {
       if (text.startsWith('select pg_encoding_to_char')) {
-        return { rows: [{ server_encoding: 'UTF8', lc_ctype: 'C.UTF-8' }] }
+        return { rows: [{ server_encoding: 'UTF8', lc_ctype: 'C.UTF-8', client_address: '10.9.9.9', client_port: '41000' }] }
       }
       const sent = /-c ims\.startup_option_probe=(.*)$/.exec(config.options ?? '')?.[1]
       return { rows: [{ startup_option_probe: sent?.replace(/\\(.)/g, '$1') }] }

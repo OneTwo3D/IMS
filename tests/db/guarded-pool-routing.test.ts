@@ -264,11 +264,15 @@ test('o3d-2k5r r23 (live): the money-post lock refuses a backend the deployment 
     // The verdict is re-established against a stand-in that answers as another server; the URL, the
     // config and the real server on the other end are unchanged.
     await establishStartupOptionByteSafety(url, {
+      // It reports a DIRECT connection (its own socket, and a backend row naming that same
+      // socket). Without those halves it would be refused since o3d-2k5r r24 for reporting NO
+      // PEER, and the rejection below would stop being about the backend the verdict names.
       createClient: async () => ({
+        connection: { stream: { localAddress: '10.9.9.9', localPort: 41000 } },
         async connect() { return undefined },
         async query(text: string) {
           if (text.startsWith('select pg_encoding_to_char')) {
-            return { rows: [{ server_encoding: 'UTF8', lc_ctype: 'C.UTF-8', backend_address: '10.0.0.11', backend_port: '5432', server_version: '17.11' }] }
+            return { rows: [{ server_encoding: 'UTF8', lc_ctype: 'C.UTF-8', backend_address: '10.0.0.11', backend_port: '5432', server_version: '17.11', client_address: '10.9.9.9', client_port: '41000' }] }
           }
           return { rows: [{ startup_option_probe: 'a z' }] }
         },
@@ -287,7 +291,13 @@ test('o3d-2k5r r23 (live): the money-post lock refuses a backend the deployment 
       let ran = false
       await assert.rejects(
         () => withMoneyPostLock({ connectorId: 'c', documentKind: 'INVOICE', documentId: 'd' } as never, async () => { ran = true }),
-        DatabaseUrlSchemaConflictError,
+        (error: unknown) => {
+          assert.ok(error instanceof DatabaseUrlSchemaConflictError)
+          // Named, so this cannot pass on some OTHER refusal — the r24 absent-peer one, say.
+          assert.match((error as Error).message, /handed the application a different backend/)
+          assert.match((error as Error).message, /10\.0\.0\.11:5432/)
+          return true
+        },
         'the lock pool\'s physical connections are checked against the deployment verdict, like every other pool',
       )
       assert.equal(ran, false, 'and no money post ran under a lock that was refused')
