@@ -3658,7 +3658,7 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
   // RENDERED_DIRECTIONS.
   //
   // Mutation: change any branch's prose, in any way, anywhere it is composed from, and this fails
-  // naming the value it now emits. Seven controls below, including the two Codex named.
+  // naming the value it now emits. Nine controls below (A-I), including the two Codex named.
   const model = await readFile(path.join(process.cwd(), DIRECTION_MODEL_FILE), 'utf8')
   const computed = computeRendererOutput(model)
 
