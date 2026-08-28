@@ -2250,7 +2250,13 @@ test('o3d-2k5r r22 (live): the REAL pool admits the measured backend and refuses
     const refused = new pg.Pool({ ...config, max: 1, connectionTimeoutMillis: 3_000 })
     pools.push(refused)
     await assert.rejects(
-      () => refused.connect(),
+      // Released if it RESOLVES, because under the mutation route below it does — and a checked-out
+      // client that is never released makes `pool.end()` in the `finally` wait forever, which turns
+      // a failing assertion into a hung run that reports nothing.
+      async () => {
+        const leaked = await refused.connect()
+        leaked.release()
+      },
       (error: unknown) => {
         assert.ok(error instanceof DatabaseUrlSchemaConflictError)
         assert.match((error as Error).message, /10\.0\.0\.11:5432/, 'the refusal names the backend the verdict is about')
