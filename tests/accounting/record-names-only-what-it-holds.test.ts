@@ -3163,11 +3163,26 @@ type ContextBinding = 'SYMBOLIC' | 'CONCRETE'
 
 /**
  * WHETHER A CHECKER LITERAL TYPE IS FOLDED ON ITS PROVENANCE OR ON THE CHECKER'S WORD ALONE.
- * `'TRACKED'` is what ships and what every judgement uses; `'UNTRACKED'` reproduces the round-22
- * fold — any single-literal checker type becomes a concrete string — and exists only so control (K)
- * can show what that fold let past.
+ * `'TRACKED'` is what ships and what every judgement uses. The other two reproduce the two fixes'
+ * predecessors so a control can show what each let past:
+ *
+ *   • `'UNTRACKED'` is the round-22 fold — any single-literal checker type becomes a concrete
+ *     string, wherever it came from. Control (K).
+ *   • `'CALL_LOCAL'` is the round-23 fold — provenance is traced AT THE NODE, but it stops at a
+ *     call boundary: a parameter's declared literal type is taken as honest no matter what was
+ *     passed in. Control (L).
  */
-type LiteralProvenance = 'TRACKED' | 'UNTRACKED'
+type LiteralProvenance = 'TRACKED' | 'CALL_LOCAL' | 'UNTRACKED'
+
+/**
+ * WHETHER AN UNKNOWN RECEIVER SHORT-CIRCUITS ITS PROPERTY ACCESS (round 24, Codex HIGH).
+ * `'PROPAGATED'` is what ships and what every judgement uses: a property read off a value this walk
+ * does not know is UNKNOWN, full stop, before anything asks the checker what the property's type
+ * says. `'DEFERRED'` reproduces the round-23 ordering — the checker-literal fallback was consulted
+ * FIRST, so an unknown receiver could hand back a concrete string — and exists only so control (L)
+ * can show what that ordering let past.
+ */
+type ReceiverPropagation = 'PROPAGATED' | 'DEFERRED'
 
 /** The three intrinsics this walk will evaluate, and only over a list it computed itself. */
 const INTRINSIC_LIST_OPERATIONS = ['join', 'slice', 'map'] as const
@@ -3308,11 +3323,19 @@ function modelDiagnostics(model: string, extraFiles: Record<string, string> = {}
 /** A callee this walk is willing to read: something with a body in a file that is not a declaration. */
 type Implementation = ts.FunctionDeclaration | ts.MethodDeclaration | ts.ArrowFunction | ts.FunctionExpression
 
+/**
+ * ONE ARGUMENT AT A CALL: its value, AND where the literal type of the expression that produced it
+ * came from (round 24, Codex HIGH). The second half is the whole point — a value crossing a call
+ * boundary used to shed its history and pick up the parameter's declared type instead.
+ */
+type Argument = { readonly value: Value; readonly origin: string | null }
+
 function computeRendererOutput(
   model: string,
   extraFiles: Record<string, string> = {},
   contextBinding: ContextBinding = 'SYMBOLIC',
   literalProvenance: LiteralProvenance = 'TRACKED',
+  receiverPropagation: ReceiverPropagation = 'PROPAGATED',
 ): ComputedRendererOutput {
   const program = directionModelProgram(model, extraFiles)
   const checker = program.getTypeChecker()
@@ -3322,6 +3345,14 @@ function computeRendererOutput(
 
   const unresolved: string[] = []
   const frames: Array<Map<ts.Symbol, Value>> = []
+  /**
+   * WHERE A PARAMETER'S DECLARED LITERAL TYPE ACTUALLY CAME FROM (round 24, Codex HIGH). One entry
+   * per bound parameter, pushed and popped with `frames`: the reason its ARGUMENT's literal type is
+   * not honest, or null when it is. A parameter with no entry is one this walk supplied itself —
+   * the renderers' own roots — and its declared contract is the module's own word, which is what
+   * makes reading `direction.target` off it sound.
+   */
+  const originFrames: Array<Map<ts.Symbol, string | null>> = []
   const inProgress = new Set<ts.Node>()
 
   const where = (node: ts.Node): string => {
@@ -3357,6 +3388,15 @@ function computeRendererOutput(
     for (let index = frames.length - 1; index >= 0; index--) {
       const value = frames[index]!.get(symbol)
       if (value !== undefined) return value
+    }
+    return undefined
+  }
+
+  /** The argument provenance carried into a bound parameter, or undefined if it was never bound. */
+  const boundOrigin = (symbol: ts.Symbol): string | null | undefined => {
+    for (let index = originFrames.length - 1; index >= 0; index--) {
+      const frame = originFrames[index]!
+      if (frame.has(symbol)) return frame.get(symbol) ?? null
     }
     return undefined
   }
@@ -3433,10 +3473,27 @@ function computeRendererOutput(
         return `"${name.text}" is a BINDING ELEMENT: its literal type is whatever the value it was destructured `
           + 'out of was declared OR ASSERTED to have, so it is not knowledge about the program'
       }
+      // A PARAMETER IS HONEST ONLY AS FAR AS WHAT WAS PASSED INTO IT (round 24, Codex HIGH). Its
+      // declared type is a contract, and a contract is knowledge about the program exactly while
+      // nobody has ASSERTED their way through it. Round 23 allowed a parameter unconditionally, so
+      // `helper(context as { syncRowId: 'claimed-row' })` laundered a manufactured literal across
+      // the call boundary and came out the other side as a declaration this walk trusted. So the
+      // argument's provenance is carried in at the call (`originFrames`) and read back here.
+      //
+      // A parameter with no entry was never given an argument: it is a root this walk supplied
+      // itself, and its declared type is the module's own word. That is what keeps `direction.target`
+      // folding, which is what keeps the computed set one sentence per direction.
+      if (ts.isParameter(declaration)) {
+        const carried = boundOrigin(symbol)
+        if (carried) {
+          return `"${name.text}" is a PARAMETER bound to an argument whose own literal type is not honest: ${carried}`
+        }
+        continue
+      }
       // THE HONEST PROVENANCE, and the only one that folds: a type annotation somebody wrote down.
-      // A property signature of the closed direction union, a parameter's declared contract, an
-      // enum member. `direction.target` and `direction.form` are these, and nothing else here is.
-      if (ts.isParameter(declaration) || ts.isPropertySignature(declaration) || ts.isPropertyDeclaration(declaration)
+      // A property signature of the closed direction union, an enum member. `direction.target` and
+      // `direction.form` are these, and nothing else here is.
+      if (ts.isPropertySignature(declaration) || ts.isPropertyDeclaration(declaration)
         || ts.isEnumMember(declaration) || ts.isTypeAliasDeclaration(declaration)
         || ts.isInterfaceDeclaration(declaration) || ts.isTypeParameterDeclaration(declaration)) {
         continue
@@ -3463,10 +3520,18 @@ function computeRendererOutput(
   const checkerLiterals = (node: ts.Expression): Value | null => {
     const literals = literalStrings(node)
     if (literals === null) return null
-    const manufactured = literalProvenance === 'TRACKED' ? literalOrigin(node, new Set()) : null
+    const manufactured = literalProvenance === 'UNTRACKED' ? null : literalOrigin(node, new Set())
     if (manufactured !== null) return unknown(`this walk will not fold a checker literal here: ${manufactured}`)
     return { kind: 'STRING', shapes: literals.map((value) => shapeOf([{ kind: 'TEXT', text: value }])) }
   }
+
+  /**
+   * The provenance an ARGUMENT carries into the parameter it binds. `'CALL_LOCAL'` and `'UNTRACKED'`
+   * carry nothing, which is round 23 — see `LiteralProvenance` and control (L).
+   */
+  const argumentOrigin = (node: ts.Expression): string | null => (
+    literalProvenance === 'TRACKED' ? literalOrigin(node, new Set()) : null
+  )
 
   /** `declare`d here or anywhere above here — an implementation that lives outside this program. */
   const isAmbient = (node: ts.Node): boolean => {
@@ -3541,19 +3606,27 @@ function computeRendererOutput(
   }
 
   /** Run a body with its parameters bound to the values passed, and union what it returns. */
-  const callImplementation = (implementation: Implementation, args: readonly Value[]): Value => {
+  const callImplementation = (implementation: Implementation, args: readonly Argument[]): Value => {
     if (inProgress.has(implementation)) return unknown('a recursive call, whose value cannot be computed by this walk')
     const frame = new Map<ts.Symbol, Value>()
+    const originFrame = new Map<ts.Symbol, string | null>()
     implementation.parameters.forEach((parameter, index) => {
       const symbol = ts.isIdentifier(parameter.name) ? checker.getSymbolAtLocation(parameter.name) : undefined
-      const value = args[index]
-      if (symbol && value !== undefined) frame.set(symbol, value)
+      const argument = args[index]
+      if (symbol && argument !== undefined) {
+        frame.set(symbol, argument.value)
+        // Recorded even when it is null, so a bound parameter says "an argument was passed and it
+        // was honest" rather than falling back to "this walk supplied this root itself".
+        originFrame.set(symbol, argument.origin)
+      }
     })
     inProgress.add(implementation)
     frames.push(frame)
+    originFrames.push(originFrame)
     try {
       return returnValueOf(implementation)
     } finally {
+      originFrames.pop()
       frames.pop()
       inProgress.delete(implementation)
     }
@@ -3582,7 +3655,12 @@ function computeRendererOutput(
     return { kind: 'STRING', shapes }
   }
 
-  const listOperation = (call: ts.CallExpression, operation: string, receiver: ListValue): Value => {
+  const listOperation = (
+    call: ts.CallExpression,
+    operation: string,
+    receiver: ListValue,
+    receiverOrigin: string | null,
+  ): Value => {
     if (operation === 'join') {
       const separatorNode = call.arguments[0]
       const separatorValue = separatorNode ? valueOf(separatorNode) : text(',')
@@ -3636,10 +3714,19 @@ function computeRendererOutput(
     if (!callback || (!ts.isArrowFunction(callback) && !ts.isFunctionExpression(callback))) {
       return unknown('a `map` whose callback is not a function written out at the call site')
     }
+    // The element inherits the RECEIVER's provenance: `(rows as { form: 'X' }[]).map(...)` is the
+    // same laundering as passing an asserted value directly, one indirection along.
     if (receiver.kind === 'LIST') {
-      return { kind: 'LIST', items: receiver.items.map((item) => callImplementation(callback, [item])) }
+      return {
+        kind: 'LIST',
+        items: receiver.items.map((item) => callImplementation(callback, [{ value: item, origin: receiverOrigin }])),
+      }
     }
-    return { kind: 'OPEN_LIST', element: callImplementation(callback, [receiver.element]), minimum: receiver.minimum }
+    return {
+      kind: 'OPEN_LIST',
+      element: callImplementation(callback, [{ value: receiver.element, origin: receiverOrigin }]),
+      minimum: receiver.minimum,
+    }
   }
 
   const evaluateCall = (call: ts.CallExpression | ts.NewExpression): Value => {
@@ -3648,7 +3735,9 @@ function computeRendererOutput(
       return unknown(`a call through a ${ts.SyntaxKind[callee.kind]} has no name to resolve, so there is no `
         + 'declaration to read and nothing can say what it returns')
     }
-    const args = (call.arguments ?? []).map((argument) => valueOf(argument))
+    const args: readonly Argument[] = (call.arguments ?? []).map((argument) => (
+      { value: valueOf(argument), origin: argumentOrigin(argument) }
+    ))
     if (ts.isPropertyAccessExpression(callee)) {
       const receiver = valueOf(callee.expression)
       if (receiver.kind === 'LIST' || receiver.kind === 'OPEN_LIST') {
@@ -3662,7 +3751,7 @@ function computeRendererOutput(
               + `(${INTRINSIC_LIST_OPERATIONS.join(', ')}), so what it returns is not computed here`)
           }
           if (!ts.isCallExpression(call)) return unknown('a `new` on a list operation')
-          return listOperation(call, callee.name.text, receiver)
+          return listOperation(call, callee.name.text, receiver, argumentOrigin(callee.expression))
         }
       }
     }
@@ -3721,6 +3810,11 @@ function computeRendererOutput(
       if (value !== undefined) return value
     }
     if (object.kind === 'LIST' && node.name.text === 'length') return { kind: 'NUMBER', value: object.items.length }
+    // THE INVARIANT (round 24, Codex HIGH), and it comes FIRST. An unknown receiver makes its
+    // property unknown, whatever the property's DECLARED type says: a type describes what a value
+    // may be, and this walk is computing what it IS. Asking the checker before propagating let a
+    // value this walk had already given up on come back concrete off its own declaration.
+    if (receiverPropagation === 'PROPAGATED' && object.kind === 'UNKNOWN') return object
     const literals = checkerLiterals(node)
     if (literals) return literals
     if (object.kind === 'UNKNOWN') return object
@@ -3744,6 +3838,8 @@ function computeRendererOutput(
       if (values.some((value) => value === undefined)) return unknown('a property key that names nothing in the object')
       return unionValues(values as Value[])
     }
+    // The same invariant, through the other syntax — see `resolveProperty`.
+    if (receiverPropagation === 'PROPAGATED' && object.kind === 'UNKNOWN') return object
     const literals = checkerLiterals(node)
     if (literals) return literals
     if (object.kind === 'UNKNOWN') return object
@@ -3916,8 +4012,9 @@ function judgeRendererOutput(
   extraFiles: Record<string, string> = {},
   contextBinding: ContextBinding = 'SYMBOLIC',
   literalProvenance: LiteralProvenance = 'TRACKED',
+  receiverPropagation: ReceiverPropagation = 'PROPAGATED',
 ): string[] {
-  const computed = computeRendererOutput(model, extraFiles, contextBinding, literalProvenance)
+  const computed = computeRendererOutput(model, extraFiles, contextBinding, literalProvenance, receiverPropagation)
   const reviewed = RENDERED_DIRECTIONS.map((entry) => entry.text)
   const complaints = [...computed.unresolved]
   for (const shape of computed.direction) {
