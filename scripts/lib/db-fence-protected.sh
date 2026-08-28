@@ -1295,6 +1295,10 @@ db_fence_probe_script() {
   # And otherwise ONLY a candidate the invocation itself authenticated.
   if [[ -n "${DB_FENCE_PROBE_TEMP}" && -n "${DB_FENCE_EXPECTED_ARTEFACT_SHA256}" &&
         "${DB_FENCE_PROBE_ARTEFACT_SHA256}" == "${DB_FENCE_EXPECTED_ARTEFACT_SHA256}" ]]; then
+    # A reason recorded above is about a standing artefact this run declined to use, and this run
+    # found something else to preflight with. Callers print the reason only when there is nothing
+    # to run, so leaving it set would put a refusal next to a preflight that happened.
+    DB_FENCE_PROBE_REASON=""
     DB_FENCE_PROBE_SCRIPT="${DB_FENCE_PROBE_TEMP}/scripts/fence-db-connections.mjs"
     return 0
   fi

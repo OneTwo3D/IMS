@@ -14,8 +14,18 @@
 Run the installer as root:
 
 ```bash
-bash scripts/install.sh
+IMS_FENCE_ARTEFACT_SHA256=<digest published with this release> \
+  bash scripts/install.sh
 ```
+
+**That variable is required on an ordinary install and the run refuses without it.** The installer
+raises a connection fence around its migration, and the helper that raises it is executed with an
+administrative database credential; the tree it is built from is assembled out of this checkout,
+which the application account owns. Since r34 that tree must be authenticated by a whole-tree
+digest that came from the release rather than from the box —
+[where to get it, on a first-ever install as much as any other](#artefact-digest-first-install) —
+or the source must be one only root can write. Omit it and the run stops before anything is
+migrated, printing every route to the value it wants.
 
 The script performs the following steps:
 

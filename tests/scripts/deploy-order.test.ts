@@ -9139,4 +9139,13 @@ test('r34: the runbook says where a first-ever install gets the digest, in the w
     /An \*\*unpinned\*\* bootstrap still\s+proceeds/,
     'the page must not still describe the behaviour the ruling removed',
   )
+
+  // AND THE FIRST COMMAND ON THE PAGE CARRIES IT. The refusal lands during install.sh's own
+  // migration fence, so an operator following the quickstart hits it before they ever reach the
+  // fence section — a required input documented only where the mechanism is explained is one they
+  // meet as a failure first.
+  const install = /```bash\n([^`]*bash scripts\/install\.sh[^`]*)```/.exec(doc)?.[1] ?? ''
+  assert.ok(install.length > 0, 'precondition: the page must show how to run the installer')
+  assert.match(install, /IMS_FENCE_ARTEFACT_SHA256=/, 'the installer command must carry the pin the run now requires')
+  assert.match(doc, /required on an ordinary install and the run refuses without it/, 'and say plainly that it is not optional')
 })
