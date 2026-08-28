@@ -288,7 +288,9 @@ DB_FENCE_STATE="${DB_FENCE_DIR}/db-connect-fence.json"
 # different timing. The SET of environment files is unit CONFIGURATION, fixed at the last
 # `daemon-reload` and NOT re-read by `systemctl start`; the CONTENTS are read at exec. This run
 # issues the final daemon-reload itself, verifies the loaded list on the bus AFTER it, and
-# nothing between that verification and the start issues another — so the list cannot change
+# nothing between that verification and the start runs a unit-file command at all — not an
+# explicit daemon-reload and not one of the verbs that reloads IMPLICITLY (r24 moved the unmask
+# and the enable above the final reload for exactly that reason) — so the list cannot change
 # under it. The contents can be changed only by root, which is not a position this deploy can
 # defend against and is not the threat model: the file the check-to-exec race was about was
 # writable by the application user and by whatever configuration management writes .env.
@@ -297,7 +299,23 @@ DB_FENCE_STATE="${DB_FENCE_DIR}/db-connect-fence.json"
 # binding: the drop-in would then name a file that is gone, and — because it is loaded without a
 # leading `-` — the unit would refuse to start. Fail-closed, but an outage the app user could
 # cause. This directory is created root-owned and 0700 by publish_db_identity_snapshot().
-DB_ENV_SNAPSHOT_DIR="${IMS_CUTOVER_ENV_DIR:-/etc/ims-cutover}"
+# AND ITS PATH IS A CONSTANT, NOT AN OVERRIDE (o3d-2sm1.5 r24, Codex HIGH). It used to be
+# ${IMS_CUTOVER_ENV_DIR:-/etc/ims-cutover}, and update.sh sources ${APP_DIR}/.env into the
+# environment AS ROOT before it resolves this line — so the variable that chose where the
+# snapshot goes was one THE APPLICATION USER WRITES. That hands back the entire point of the
+# location. publish_db_identity_snapshot() chowns and chmods only the FINAL directory, so a path
+# under an app-writable parent is secured after the parent has already been chosen: rename the
+# secured child away, put an attacker-owned directory at the same path, and PID 1 reads that
+# instead while the bus check and the mandatory-file check both still pass. The same override
+# aimed at an existing system directory chmods it to 0700 and takes it out.
+#
+# There is no configurable spelling of this that is safe. An override only a root-owned source
+# may set is indistinguishable from no override, and a trust root read out of the very file the
+# snapshot exists to distrust is not a trust root. So it is a literal: a deployment that must
+# move it edits this line, which is a root-owned change to a root-owned file, reviewed like any
+# other. The same reasoning is why nothing else in this script resolves a privileged path from a
+# variable the application can set — see the deploy-control restore after the .env source.
+DB_ENV_SNAPSHOT_DIR="/etc/ims-cutover"
 DB_ENV_SNAPSHOT_FILE="${DB_ENV_SNAPSHOT_DIR}/db-identity-snapshot.env"
 DB_ENV_SNAPSHOT_DROPIN_NAME="zz-deploy-db-identity.conf"
 # The namespace deploy.sh wrote to before this round. Nothing writes here any more, and a
@@ -1599,7 +1617,7 @@ publish_db_identity_snapshot() {
   # here would guarantee a refusal three lines later — with a message about somebody else's unit.
   case "$DB_ENV_SNAPSHOT_FILE" in
     *[$' \t\n\\']*)
-      echo -e "${RED}[ERROR]${RESET} ${DB_ENV_SNAPSHOT_FILE} contains whitespace or a backslash, so systemd could not state it back unescaped and the binding could not be verified. Set IMS_CUTOVER_STATE_DIR to a path with neither." >&2
+      echo -e "${RED}[ERROR]${RESET} ${DB_ENV_SNAPSHOT_FILE} contains whitespace or a backslash, so systemd could not state it back unescaped and the binding could not be verified. That path is the literal DB_ENV_SNAPSHOT_DIR at the top of this script; edit it there to one with neither." >&2
       return 1 ;;
   esac
 
@@ -3255,11 +3273,36 @@ require_start_identity_unchanged || die \
 publish_db_identity_snapshot || die \
   "THE CONNECTION FENCE IS BEING HELD AND THE APPLICATION IS NOT BEING STARTED: this run could not bind the service to the database it fenced and migrated (the reason is printed above). Without that binding the DATABASE_URL systemd reads at exec is whatever ${APP_DIR_REAL}/.env says at that instant, which is not something this script can hold still. Fix the cause and re-run; the re-run adopts the standing fence."
 
+# THE UNMASK HAPPENS HERE, AHEAD OF THE FINAL RELOAD, AND NOT IN THE START LOOP (o3d-2sm1.5
+# r24, Codex HIGH). `systemctl unmask` RELOADS SYSTEMD IMPLICITLY unless it is given
+# --no-reload, so an unmask sitting between require_start_identity_bound and `systemctl start`
+# re-read every unit file and every drop-in on disk AFTER the proof that the loaded configuration
+# binds this service to this run's snapshot — once per unit, with the remaining units' starts
+# still to come. r22's atomicity argument was sound about EXPLICIT reloads and blind to that one,
+# and a concurrent unit or drop-in change could therefore remove, reorder or weaken the mandatory
+# snapshot in the window the proof claimed to have closed.
+#
+# Moving every unit-file operation upstream of remove_reboot_fence()'s daemon-reload makes
+# "nothing after the verification changes the loaded configuration" true BY CONSTRUCTION rather
+# than by every future caller remembering --no-reload. After the proof the only systemctl verb
+# left is `start`, which acts on the loaded configuration and does not re-read unit files.
+#
+# The unmask itself lifts a mask left by an older revision of this script, which masked from its
+# exit trap; harmless when there is none. It is safe this early because a mask is not what holds
+# the service down during the window — the stop and the reboot fence are — and unmasking starts
+# nothing.
+if [[ "${#SERVICE_UNITS[@]}" -gt 0 ]]; then
+  for unit in "${SERVICE_UNITS[@]}"; do
+    run systemctl unmask "$unit" >/dev/null 2>&1 || true
+  done
+fi
+
 release_db_connections \
   || die "Refusing to start the application while it has no CONNECT on its own database."
 remove_reboot_fence
 
-# AND ONCE MORE AFTER THIS RUN'S FINAL daemon-reload, WHICH remove_reboot_fence() JUST ISSUED
+# AND ONCE MORE AFTER THIS RUN'S FINAL daemon-reload, WHICH remove_reboot_fence() JUST ISSUED,
+# AND WITH EVERY UNIT-FILE COMMAND ALREADY BEHIND IT (o3d-2sm1.5 r24, Codex HIGH)
 # (o3d-2sm1.5 r22, Codex HIGH). That reload is what folds every drop-in written during the
 # window into the unit's loaded configuration, so this is the first moment the LOADED unit can be
 # asked, and the last moment before `systemctl start` hands the file to systemd to read.
@@ -3269,7 +3312,7 @@ remove_reboot_fence
 # exactly the branch that re-establishes the connection fence through refence_db_connections()
 # and re-installs the reboot fence, and then says which of the two it actually managed.
 require_start_identity_bound || die \
-  "THE APPLICATION IS NOT BEING STARTED, AND BOTH FENCES ARE BEING PUT BACK: ${DB_IDENTITY_DRIFT_REASON}. This was checked after the final daemon-reload, so it is the loaded unit configuration and the current file contents that disagree with the identity this run fenced and migrated. It is also the check that proves the environment snapshot this run published is in that loaded configuration, loaded last and loaded mandatorily — the binding that makes the answer independent of anything that happens between this line and the exec. Nothing between here and systemctl start issues another daemon-reload, so the list of environment files systemd will read is now fixed. The connection fence was released a moment ago for the start and is being re-established below; the banner that follows says whether that succeeded and what is standing. Restore ${APP_DIR_REAL}/.env and the unit to the identity above and re-run this script, which adopts the fence. Do NOT start the service by hand first."
+  "THE APPLICATION IS NOT BEING STARTED, AND BOTH FENCES ARE BEING PUT BACK: ${DB_IDENTITY_DRIFT_REASON}. This was checked after the final daemon-reload, so it is the loaded unit configuration and the current file contents that disagree with the identity this run fenced and migrated. It is also the check that proves the environment snapshot this run published is in that loaded configuration, loaded last and loaded mandatorily — the binding that makes the answer independent of anything that happens between this line and the exec. NOTHING BETWEEN HERE AND THE START RUNS A UNIT-FILE COMMAND AT ALL: the unmask moved above the final reload in r24 because it reloads implicitly, and every command left in the window is a timestamp, a shell test, a loop, an echo and `systemctl start` itself, which acts on the loaded configuration and does not re-read unit files. So the list of environment files systemd will read is now fixed. The connection fence was released a moment ago for the start and is being re-established below; the banner that follows says whether that succeeded and what is standing. Restore ${APP_DIR_REAL}/.env and the unit to the identity above and re-run this script, which adopts the fence. Do NOT start the service by hand first."
 
 # The instant the restart was issued. The responder proof below requires the process on the
 # port to post-date it: anything older survived the stop and is not what this run started.
@@ -3277,9 +3320,6 @@ SERVICE_START_EPOCH=$(date +%s)
 
 if [[ "${#SERVICE_UNITS[@]}" -gt 0 ]]; then
   for unit in "${SERVICE_UNITS[@]}"; do
-    # Lifts a mask left by an older revision of this script, which masked from its exit
-    # trap. Harmless when there is none.
-    run systemctl unmask "$unit" >/dev/null 2>&1 || true
     info "systemctl start ${unit}"
     run systemctl start "$unit"
   done

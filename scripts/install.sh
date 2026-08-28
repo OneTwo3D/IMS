@@ -644,7 +644,9 @@ DB_FENCE_STATE="${DB_FENCE_DIR}/db-connect-fence.json"
 # different timing. The SET of environment files is unit CONFIGURATION, fixed at the last
 # `daemon-reload` and NOT re-read by `systemctl start`; the CONTENTS are read at exec. This run
 # issues the final daemon-reload itself, verifies the loaded list on the bus AFTER it, and
-# nothing between that verification and the start issues another — so the list cannot change
+# nothing between that verification and the start runs a unit-file command at all — not an
+# explicit daemon-reload and not one of the verbs that reloads IMPLICITLY (r24 moved the unmask
+# and the enable above the final reload for exactly that reason) — so the list cannot change
 # under it. The contents can be changed only by root, which is not a position this deploy can
 # defend against and is not the threat model: the file the check-to-exec race was about was
 # writable by the application user and by whatever configuration management writes .env.
@@ -653,7 +655,23 @@ DB_FENCE_STATE="${DB_FENCE_DIR}/db-connect-fence.json"
 # binding: the drop-in would then name a file that is gone, and — because it is loaded without a
 # leading `-` — the unit would refuse to start. Fail-closed, but an outage the app user could
 # cause. This directory is created root-owned and 0700 by publish_db_identity_snapshot().
-DB_ENV_SNAPSHOT_DIR="${IMS_CUTOVER_ENV_DIR:-/etc/ims-cutover}"
+# AND ITS PATH IS A CONSTANT, NOT AN OVERRIDE (o3d-2sm1.5 r24, Codex HIGH). It used to be
+# ${IMS_CUTOVER_ENV_DIR:-/etc/ims-cutover}, and update.sh sources ${APP_DIR}/.env into the
+# environment AS ROOT before it resolves this line — so the variable that chose where the
+# snapshot goes was one THE APPLICATION USER WRITES. That hands back the entire point of the
+# location. publish_db_identity_snapshot() chowns and chmods only the FINAL directory, so a path
+# under an app-writable parent is secured after the parent has already been chosen: rename the
+# secured child away, put an attacker-owned directory at the same path, and PID 1 reads that
+# instead while the bus check and the mandatory-file check both still pass. The same override
+# aimed at an existing system directory chmods it to 0700 and takes it out.
+#
+# There is no configurable spelling of this that is safe. An override only a root-owned source
+# may set is indistinguishable from no override, and a trust root read out of the very file the
+# snapshot exists to distrust is not a trust root. So it is a literal: a deployment that must
+# move it edits this line, which is a root-owned change to a root-owned file, reviewed like any
+# other. The same reasoning is why nothing else in this script resolves a privileged path from a
+# variable the application can set — see the deploy-control restore after the .env source.
+DB_ENV_SNAPSHOT_DIR="/etc/ims-cutover"
 DB_ENV_SNAPSHOT_FILE="${DB_ENV_SNAPSHOT_DIR}/db-identity-snapshot.env"
 DB_ENV_SNAPSHOT_DROPIN_NAME="zz-deploy-db-identity.conf"
 DB_ENV_SNAPSHOT_DROPIN_FILE="${FENCE_DROPIN_DIR}/${DB_ENV_SNAPSHOT_DROPIN_NAME}"
@@ -1541,7 +1559,7 @@ publish_db_identity_snapshot() {
   # here would guarantee a refusal three lines later — with a message about somebody else's unit.
   case "$DB_ENV_SNAPSHOT_FILE" in
     *[$' \t\n\\']*)
-      error "${DB_ENV_SNAPSHOT_FILE} contains whitespace or a backslash, so systemd could not state it back unescaped and the binding could not be verified. Set IMS_CUTOVER_STATE_DIR to a path with neither."
+      error "${DB_ENV_SNAPSHOT_FILE} contains whitespace or a backslash, so systemd could not state it back unescaped and the binding could not be verified. That path is the literal DB_ENV_SNAPSHOT_DIR at the top of this script; edit it there to one with neither."
       return 1 ;;
   esac
 
@@ -3463,6 +3481,25 @@ stop_legacy_launchers
 # the schema or leaves the fence standing.
 # ---------------------------------------------------------------------------
 CUTOVER_STEP="start"
+
+# THE ENABLE HAPPENS HERE, AHEAD OF THE FINAL RELOAD, AND ONLY THE START COMES AFTER THE PROOF
+# (o3d-2sm1.5 r24, Codex HIGH). This used to be one `systemctl enable --now` below
+# require_start_identity_bound, and `systemctl enable` RELOADS SYSTEMD IMPLICITLY unless it is
+# given --no-reload — so the command that started the service also re-read every unit file and
+# every drop-in on disk AFTER the proof that the loaded configuration binds it to this run's
+# snapshot, which is the one thing that proof claimed nothing between it and the start could do.
+#
+# Splitting it puts every unit-file operation upstream of remove_reboot_fence()'s daemon-reload
+# and leaves `start` as the only systemctl verb after the verification; `start` acts on the
+# loaded configuration and does not re-read unit files. It is done BY CONSTRUCTION rather than
+# with --no-reload, which would leave the invariant depending on every future caller remembering
+# a flag.
+#
+# Enabling this early starts nothing — it writes the multi-user.target wants symlink — and the
+# reboot fence is still standing, so a machine that reboots in this window still refuses to bring
+# the service up.
+systemctl enable "${APP_NAME}.service"
+
 release_db_connections \
   || die "Refusing to start the application while it has no CONNECT on its own database."
 remove_reboot_fence
@@ -3477,11 +3514,16 @@ remove_reboot_fence
 #
 # It is atomic with respect to the start in the one way that matters: the SET of environment
 # files is unit configuration, fixed at daemon-reload and not re-read by `systemctl start`, and
-# nothing between this line and the start issues another reload.
+# nothing between this line and the start runs a unit-file command at all. That claim was FALSE
+# until r24 — this was `systemctl enable --now`, and `enable` reloads systemd IMPLICITLY unless
+# it is given --no-reload, so the command that started the service also re-read every unit file
+# and drop-in on disk after the proof. The enable now happens above remove_reboot_fence()'s
+# reload and only `start` is left here; the complete list of commands in the window is this
+# `success` line and that start.
 require_start_identity_bound || die \
   "THE APPLICATION IS NOT BEING STARTED: ${DB_IDENTITY_SOURCE_REASON}. This was checked after the final daemon-reload, so it is the unit's loaded configuration that systemd is about to act on. The migration applied and every verification passed; fix the unit (or ${APP_DIR}/.env) and re-run, which adopts the state this run left. Do NOT start the service by hand first."
 
-systemctl enable --now "${APP_NAME}.service"
+systemctl start "${APP_NAME}.service"
 
 success "Application service started and registered with systemd."
 
