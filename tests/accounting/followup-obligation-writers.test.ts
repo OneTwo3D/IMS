@@ -1637,13 +1637,24 @@ test('[o3d-peh1 r4 + o3d-0bfh r6] the FRESH-POST arm no longer reaches the failu
 
   // (1) a plain follow-up failure, with the announcement ALSO failing: the route that used to
   //     escalate, now swallowed at source.
+  //
+  //     INJECTED AT THE WRITER THE NOTICE ACTUALLY USES. o3d-0bfh r6 moved this announcement from
+  //     `logActivity` to `logActivityPersisted` (inside `reportRetainedObligation`), and those are
+  //     two different doubles: `throwingActivityActions` reaches the first, `unpersistable-
+  //     ActivityActions` the second. Keeping the old injection would have left this half asserting
+  //     the ordinary best-effort fall-through with its precondition never reached — proved by
+  //     mutation: making reportRetainedObligation rethrow changed nothing.
   reset('quickbooks')
   state.syncRows = [{ ...blankRow(), externalTransactionId: null, retryCount: QBO_MAX_RETRIES - 1 }]
   state.failFollowUpsFor.add('log-1')
-  state.throwingActivityActions.add('quickbooks_followup_error')
+  state.unpersistableActivityActions.add('quickbooks_followup_error')
 
   const plain = await runQuickBooks()
 
+  assert.ok(
+    state.activities.some((entry) => entry.action === 'quickbooks_followup_error'),
+    'the precondition was reached: the notice was attempted',
+  )
   assert.equal(plain.succeeded, 1, 'a transient follow-up failure is best-effort on this arm, and a lost NOTICE does not change that')
   assert.equal(plain.failed, 0, 'the announcement no longer decides the entry\'s outcome — o3d-0bfh r6')
   assert.equal(
@@ -1668,7 +1679,7 @@ test('[o3d-peh1 r4 + o3d-0bfh r6] the FRESH-POST arm no longer reaches the failu
   //     document posted.
   reset('quickbooks')
   state.syncRows = [{ ...blankRow(), externalTransactionId: null, retryCount: QBO_MAX_RETRIES - 1 }]
-  state.throwingActivityActions.add('quickbooks_followup_error')
+  state.unpersistableActivityActions.add('quickbooks_followup_error')
   ledgerVerdict = { clear: false, reason: 'a settlement matching this attempt is already in QuickBooks' }
 
   const refused = await runQuickBooks()
