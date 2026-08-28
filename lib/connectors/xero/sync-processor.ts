@@ -47,6 +47,7 @@ import {
   applyBackReference,
   backReferenceIsMissing,
   claimFollowUpObligation,
+  followUpObligationRecoveryNote,
   releaseFollowUpObligation,
   syncTypeWritesBackReference,
 } from '@/lib/domain/accounting/back-reference'
@@ -6775,10 +6776,7 @@ async function settleFollowUpObligation(
     action: 'xero_followup_obligation_retained',
     tag: 'sync',
     level: 'ERROR',
-    description: `Xero sync entry ${entry.id} posted to the ledger, but a receipt recorded before this invoice `
-      + 'is still not registered against it. The row is deliberately left marked as owing follow-ups, because '
-      + 'nothing else about it records that: it is SYNCED and carries its external id exactly like a row that '
-      + 'completed. Re-run the invoice sync for this reference, or register the receipt in Xero by hand.',
+    description: xeroRetainedFollowUpObligationDescription(entry.id),
     metadata: {
       syncLogId: entry.id,
       type: entry.type,
@@ -6788,6 +6786,39 @@ async function settleFollowUpObligation(
     // Retaining the marker is ALREADY the safe state, so failing to describe it must not turn a
     // posted invoice into a failed sync entry.
   }).catch(() => { /* the state is on the row; the log is the notification */ })
+}
+
+/**
+ * THE STRING AN OPERATOR ACTUALLY RECEIVES WHEN A XERO OBLIGATION IS RETAINED — exported so the
+ * shared banned-instruction contract can be run over the PRODUCER rather than over the constants it
+ * happens to be built from today (o3d-0bfh r11, Codex HIGH).
+ *
+ * WHAT WAS HERE TOLD THE OPERATOR TO RE-DRIVE A PATH THE SYSTEM RETRIES BY ITSELF: "Re-run the
+ * invoice sync for this reference, or register the receipt in Xero by hand." Both halves are unsafe
+ * on THIS connector precisely BECAUSE the marker is deliberately retained and
+ * `repairXeroBackReferences` re-reads it on the accounting-sync cron. The operator's hand-made
+ * receipt races the queued re-enqueue, and the connector's request id cannot deduplicate a payment a
+ * human entered in the Xero UI. It is the r7/r8 QuickBooks finding, on the connector where the
+ * automatic retry actually exists — which is what makes it worse here, not better.
+ *
+ * AND IT SHIPPED THROUGH A ROUND THAT EXPANDED THE BANNED-INSTRUCTION LIST FROM THREE STRINGS TO
+ * ELEVEN, because that list was pointed at the registry strings and the two files somebody had
+ * already looked at. A contract covers the strings it is pointed at, not every string an operator
+ * can receive. So this is a named, exported producer, and
+ * tests/accounting/follow-up-recovery-registry.test.ts runs THE ONE LIST over what it returns.
+ *
+ * The guidance itself is escalation-only and comes from the registry: what re-drives a retained
+ * obligation on this connector is a declared fact about the connector, not a sentence written here.
+ */
+export function xeroRetainedFollowUpObligationDescription(entryId: string): string {
+  const recovery = followUpObligationRecoveryNote(followUpObligationRecoveryFor(XERO_CONNECTOR))
+  return `Xero sync entry ${entryId} posted to the ledger, but a receipt recorded before this invoice `
+    + 'is still not registered against it. The row is deliberately left marked as owing follow-ups, because '
+    + 'nothing else about it records that: it is SYNCED and carries its external id exactly like a row that '
+    + `completed. There is no manual step here and a hand-made settlement is the one action that costs money: ${recovery}, `
+    + 'so a receipt entered by hand would be a SECOND one, racing work that is already queued — and no request id '
+    + 'can deduplicate a payment a human entered in the Xero UI. If the row is still marked after the next '
+    + 'accounting-sync run, READ the invoice in Xero, record what is actually present, and ESCALATE that reading.'
 }
 
 async function enqueueSalesInvoiceFollowUps(
