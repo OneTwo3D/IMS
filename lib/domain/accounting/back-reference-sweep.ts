@@ -1641,12 +1641,14 @@ export async function repairAccountingBackReferences(
       return { settle: false }
     }
     // o3d-0bfh r16: what THIS module still has to put on record before the generation may be
-    // cleared. Structurally this path can never reach the connector's fence — it is selected on the
-    // row having no external id or no back-reference pair, and the deferred-receipt re-drive returns
-    // before the fence without one — so the closure is answered below, by this module. It is handed
-    // down anyway, because "this path cannot reach the fence today" is a property of the candidate
-    // predicate and not of the release protocol, and the version of that assumption that goes stale
-    // silently is the one that is not stated in the call.
+    // cleared. Today this path cannot reach the connector's fence at all, on either half of the
+    // predicate that selects it: a row with NO external id makes the deferred re-drive return before
+    // the fence, and a row that HAS one is here only because its (type, referenceType) is not a
+    // back-reference pair — which SALES_INVOICE/SalesOrder, the one pair the re-drive runs for, is.
+    // So the closure is answered below, by this module, before `markChecked`. It is handed down
+    // anyway: that reasoning is a property of BACK_REFERENCE_PAIRS and of the connector's dispatch,
+    // not of the release protocol, and the version of an assumption like that which goes stale
+    // silently is the one that was never stated in the call.
     const prerequisites = settlementPrerequisite(
       row,
       async () => discarded.length === 0 || await reportDiscardedFollowUps(row, 'already-applied'),
