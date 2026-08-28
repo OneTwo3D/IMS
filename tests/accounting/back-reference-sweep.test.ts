@@ -1700,6 +1700,9 @@ function salesCreditNoteRow(index: number, overrides: Partial<SyncRow> = {}): Sy
     status: 'FAILED',
     payload: { invoiceNumber: `SCN-${index}` },
     createdAt: at(index),
+    // 1, not 0, for the reason `salesInvoiceRow` gives: a row that has been posted has been claimed,
+    // and the settlement fence (o3d-0bfh r2) compare-and-swaps on exactly this column.
+    attemptRevision: 1,
     backReferenceCheckedAt: null,
     backReferenceAmbiguousLoggedAt: null,
     backReferenceEvidenceCompactedAt: null,
