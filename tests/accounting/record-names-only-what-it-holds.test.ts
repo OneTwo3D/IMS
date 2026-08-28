@@ -3171,6 +3171,26 @@ test('ROUND 20 (Codex HIGH): every string the renderer emits is one written out 
  *     unbound because the call omitted an optional argument, which is `undefined` at run time and
  *     is not a value anybody's annotation describes.
  *
+ * AND THE ANALYZER'S OWN ENTRY IS NOT A CALL THAT OMITTED SOMETHING (round 26, Codex HIGH).
+ * Modelling defaults is right at an INTERNAL call and wrong one call further out. `rootShapes`
+ * calls each exported renderer with `[]` — not because a caller left arguments off, but because
+ * this walk is standing in for EVERY caller there can be. Round 25 ran that through the same code
+ * path, so a root parameter carrying a default was bound to that default for the whole analysis,
+ * and a discriminant the CALLER chooses became a constant the walk had already decided:
+ * `mode: 'REVIEWED' | 'UNREVIEWED' = 'REVIEWED'` on the exported renderer pruned every branch
+ * behind `mode === 'UNREVIEWED'`, and the inventory reported clean over prose it never read.
+ *
+ *   • ROOT ENTRY SEEDS, IT DOES NOT EVALUATE. `callImplementation` takes an `entry` of `'ROOT'` or
+ *     `'INTERNAL'`. At `'ROOT'` nothing is bound at all, so every parameter falls to the abstract
+ *     root value `resolveIdentifier` invents for the names in `analyzerRoots` — the reviewed
+ *     context, a list keeping only its length floor, or OPAQUE. An OPAQUE decides no comparison, so
+ *     both arms are walked. At `'INTERNAL'`, defaults are modelled exactly as round 25 left them.
+ *
+ * The two rules are independent and control (N) says so with assertions: round 25's route goes
+ * through an internal omitted argument and is still refused; round 26's route is one round 25
+ * OPENED — round 24's binding already walked both arms of it — and is closed only by the root-entry
+ * distinction.
+ *
  * `contextBinding` exists ONLY so a control can re-run this walk with the pre-fix concrete binding
  * and demonstrate that the branch is pruned again. Nothing else passes anything but `'SYMBOLIC'`.
  */
@@ -3270,6 +3290,30 @@ type DefaultBinding = 'MODELLED' | 'UNBOUND'
  * all — and an absence is not a positive fact. Control (M) shows the difference.
  */
 type RootTrust = 'NAMED' | 'INFERRED'
+
+/**
+ * WHAT A ROOT-ENTRY PARAMETER BINDS TO (round 26, Codex HIGH).
+ *
+ * `rootShapes` calls each exported renderer with NO arguments — but it is not a caller that omitted
+ * them. It is this walk creating an ABSTRACT entry, standing for every call any formatter can
+ * write. Round 25 taught `callImplementation` that an omitted argument takes its parameter's
+ * default, which is exactly right AT AN INTERNAL CALL and exactly wrong here: the analyzer's own
+ * `[]` then looked like a real omission, and a root parameter with a default was pinned to that
+ * default's value for the whole analysis.
+ *
+ * That prunes. `mode: 'REVIEWED' | 'UNREVIEWED' = 'REVIEWED'` binds `mode` to `'REVIEWED'`, the
+ * comparison `mode === 'UNREVIEWED'` becomes a DECIDED false, and the branch behind it is never
+ * walked — while any formatter may pass `'UNREVIEWED'` and get the sentence it emits. The
+ * inventory then reports clean over prose it never read.
+ *
+ * `'ABSTRACT'` is what ships: at root entry NOTHING is bound, so every root parameter falls to the
+ * abstract root value `resolveIdentifier` invents for the names in `analyzerRoots` — the reviewed
+ * context, a list keeping only its length floor, or OPAQUE. An OPAQUE discriminant decides no
+ * comparison, so both arms are taken, which is the only safe reading of a value the caller
+ * chooses. `'DEFAULTED'` reproduces round 25's behaviour and exists only so control (N) can show
+ * what it pruned.
+ */
+type RootEntry = 'ABSTRACT' | 'DEFAULTED'
 
 /**
  * THE ROOTS THIS WALK CREATES, BY NAME. `rootShapes` calls exactly these two with no arguments, so
@@ -3433,6 +3477,7 @@ function computeRendererOutput(
   receiverPropagation: ReceiverPropagation = 'PROPAGATED',
   defaultBinding: DefaultBinding = 'MODELLED',
   rootTrust: RootTrust = 'NAMED',
+  rootEntry: RootEntry = 'ABSTRACT',
 ): ComputedRendererOutput {
   const program = directionModelProgram(model, extraFiles)
   const checker = program.getTypeChecker()
@@ -3722,8 +3767,19 @@ function computeRendererOutput(
     return implementations
   }
 
-  /** Run a body with its parameters bound to the values passed, and union what it returns. */
-  const callImplementation = (implementation: Implementation, args: readonly Argument[]): Value => {
+  /**
+   * Run a body with its parameters bound to the values passed, and union what it returns.
+   *
+   * `entry` says WHO IS CALLING. `'INTERNAL'` is a call the program itself writes, and an argument
+   * it omits takes the parameter's default, as JavaScript does. `'ROOT'` is this walk creating the
+   * abstract entry in `rootShapes`: the empty argument list there is not an omission by anybody, so
+   * nothing is bound and every parameter falls to the abstract root value — see `RootEntry`.
+   */
+  const callImplementation = (
+    implementation: Implementation,
+    args: readonly Argument[],
+    entry: 'ROOT' | 'INTERNAL' = 'INTERNAL',
+  ): Value => {
     if (inProgress.has(implementation)) return unknown('a recursive call, whose value cannot be computed by this walk')
     const frame = new Map<ts.Symbol, Value>()
     const originFrame = new Map<ts.Symbol, string | null>()
@@ -3744,6 +3800,13 @@ function computeRendererOutput(
           originFrame.set(symbol, argument.origin)
           return
         }
+        // NOT AT THE ANALYZER'S OWN ROOT (round 26, Codex HIGH). `rootShapes` passes `[]` because
+        // this walk is standing in for EVERY caller, not because a caller omitted anything — so a
+        // root parameter's default is one value among the many a formatter may pass, and binding it
+        // here decides a discriminant the caller actually chooses. Left unbound, the parameter
+        // falls to `resolveIdentifier`'s abstract root value; an OPAQUE one decides no comparison,
+        // so both arms of every branch keyed on it are walked.
+        if (entry === 'ROOT' && rootEntry === 'ABSTRACT') return
         // AN OMITTED ARGUMENT TAKES THE DEFAULT'S VALUE AND THE DEFAULT'S PROVENANCE (round 25,
         // Codex HIGH). Round 24 recorded nothing here, so the parameter arrived at `symbolOrigin`
         // looking exactly like a root this walk had created — and `helper()` with
@@ -4141,7 +4204,7 @@ function computeRendererOutput(
           : undefined
         if (parameterSymbol) analyzerRoots.add(parameterSymbol)
       }
-      const value = callImplementation(declaration, [])
+      const value = callImplementation(declaration, [], 'ROOT')
       if (value.kind !== 'STRING') {
         unresolved.push(`${where(declaration)}: ${root} does not return prose this walk can read`)
         continue
@@ -4168,9 +4231,11 @@ function judgeRendererOutput(
   receiverPropagation: ReceiverPropagation = 'PROPAGATED',
   defaultBinding: DefaultBinding = 'MODELLED',
   rootTrust: RootTrust = 'NAMED',
+  rootEntry: RootEntry = 'ABSTRACT',
 ): string[] {
   const computed = computeRendererOutput(
     model, extraFiles, contextBinding, literalProvenance, receiverPropagation, defaultBinding, rootTrust,
+    rootEntry,
   )
   const reviewed = RENDERED_DIRECTIONS.map((entry) => entry.text)
   const complaints = [...computed.unresolved]
@@ -4937,4 +5002,92 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
       .some((complaint) => complaint.includes('claimed-row')),
     'the round-24 walk must have folded the asserted annotation into the prose, or (M3) is about nothing',
   )
+
+  // (N) THE DEFAULT ON A ROOT PARAMETER — THE ROUND-26 ROUTE (Codex HIGH), and the control about
+  // WHO THE CALLER IS rather than about what a call carries.
+  //
+  // Round 25 taught `callImplementation` that an omitted argument takes its parameter's default.
+  // That is right at an internal call and wrong at the analyzer's own entry: `rootShapes` passes
+  // `[]` because this walk stands in for EVERY formatter that can call the renderer, not because
+  // some caller left an argument out. The two were the same code path, so a root parameter with a
+  // default was pinned to that default for the entire analysis — and a discriminant the CALLER
+  // chooses became a constant the walk had decided.
+  //
+  // The route is one line of ordinary TypeScript: give the exported renderer a defaulted mode and
+  // key a branch on it. Every existing caller still compiles, every existing caller still gets the
+  // reviewed sentence, and a formatter that passes the other value gets prose the inventory never
+  // read.
+  const viaDefaultedRootParameter = model.replace(
+    'export function renderLocalDirection(direction: LocalDirection, context: LocalDirectionContext): string {',
+    'export function renderLocalDirection(\n'
+    + '  direction: LocalDirection,\n'
+    + '  context: LocalDirectionContext,\n'
+    + "  mode: 'REVIEWED' | 'UNREVIEWED' = 'REVIEWED',\n"
+    + '): string {',
+  ).replace(
+    "      return 'confirm the invoice PDF stored against the order is the document you expect'",
+    "      return mode === 'UNREVIEWED'\n"
+    + "        ? '" + UNDECLARED_REMOTE_ACTION + "'\n"
+    + "        : 'confirm the invoice PDF stored against the order is the document you expect'",
+  )
+  assert.notEqual(viaDefaultedRootParameter, model, 'the defaulted-root-parameter mutation must actually have been applied')
+  // AND IT IS A MUTATION THE COMPILER ADMITS, byte for byte the same diagnostics as the shipped
+  // model: the new parameter has a default, so every existing call site still type-checks, and the
+  // comparison is between two members of the same declared union.
+  assert.deepEqual(
+    modelDiagnostics(viaDefaultedRootParameter), modelDiagnostics(model),
+    'the defaulted-root-parameter mutation must type-check exactly as the shipped model does, or it is not a '
+    + 'route anybody could take',
+  )
+  const defaultedRootComplaints = judgeRendererOutput(viaDefaultedRootParameter)
+  assert.ok(
+    defaultedRootComplaints.some((complaint) => complaint.startsWith('emits a sentence nobody reviewed')
+      && complaint.includes('take the second PDF off it')),
+    'CONTROL, THE CODEX ROUTE: a parameter of a ROOT renderer is a value the caller chooses, whatever default '
+    + 'its declaration carries. The analyzer\'s own empty argument list is not an omission, so the default is '
+    + `not evaluated and the branch keyed on it is walked both ways. Saw: ${JSON.stringify(defaultedRootComplaints)}`,
+  )
+  // ...AND THE ROUND-25 EVALUATOR LETS IT THROUGH, asserted rather than described — the same shape
+  // as (J) through (M). Re-run the SAME judgement over the SAME mutated renderer with root entry
+  // evaluating defaults: a clean inventory, while the sentence ships.
+  assert.deepEqual(
+    judgeRendererOutput(viaDefaultedRootParameter, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'MODELLED', 'NAMED', 'DEFAULTED'),
+    [],
+    'THE ROUND-25 EVALUATOR MUST STILL LET IT THROUGH — if it also refused this, control (N) would be passing '
+    + 'for some other reason and would prove nothing',
+  )
+  // ...AND IT IS A ROUTE ROUND 25 OPENED, which is worth stating plainly rather than leaving as an
+  // apology: with round 24's binding — an omitted argument binds NOTHING — the root parameter fell
+  // straight through to the abstract root value and both arms were already walked. Round 25 was
+  // right about internal calls and applied its rule one call too far; the fix is a distinction, not
+  // a retreat.
+  assert.ok(
+    judgeRendererOutput(viaDefaultedRootParameter, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'UNBOUND', 'NAMED', 'DEFAULTED')
+      .some((complaint) => complaint.includes('take the second PDF off it')),
+    'the round-24 binding must already have refused this — it is what shows round 25 OPENED this route rather '
+    + 'than leaving it open, and therefore that the fix belongs at the root-entry distinction',
+  )
+  // ...AND MODELLING DEFAULTS AT INTERNAL CALLS IS STILL LOAD-BEARING, so round 26 did not undo
+  // round 25 while fixing it: (M1)'s route goes through an INTERNAL call with an omitted argument,
+  // and it must still be refused with root entry abstract.
+  assert.ok(
+    judgeRendererOutput(viaDefaultedParameter).length > 0,
+    'ROUND 25 MUST STILL HOLD — (M1) goes through an internal omitted argument, and making root entry abstract '
+    + 'must not have stopped defaults being modelled where a caller really did omit one',
+  )
+  // ...and the ROUND-25 rule is what refuses (M1): with root entry abstract AND internal defaults
+  // unbound, (M1) is through again. Two rules, each doing its own work.
+  assert.deepEqual(
+    judgeRendererOutput(viaDefaultedParameter, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'UNBOUND', 'INFERRED', 'ABSTRACT'),
+    [],
+    'and with internal defaults unbound again (M1) is through, so the two rules are not one rule written twice',
+  )
+  // ...AND THE RUNTIME PASS CANNOT SEE IT EITHER, for the reason every control here says: the
+  // sampled renderer is called the way the sample calls it, which is with the default.
+  for (const context of RUNTIME_CONTEXTS) {
+    assertRenderedInventory(
+      (direction) => renderLocalDirection(direction, context),
+      (text) => substitutePlaceholders(text, context),
+    )
+  }
 })
