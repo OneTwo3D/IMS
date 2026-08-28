@@ -5548,4 +5548,370 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
     'and the SAME renderer refused the moment the id is one nobody sampled — so what the four contexts '
     + 'established was the ids they carry, not the renderer',
   )
+
+  // (Q) THE CLASS FIELD READ OFF A ROOT PARAMETER — THE ROUND-29 ROUTE (Codex HIGH), and the eighth
+  // appearance of one axis: a TYPE standing in for a VALUE.
+  //
+  // ROUND 28 DISCLOSED THIS POSITION RATHER THAN CLOSING IT, and gave a reason for believing it
+  // unreachable: a class identifier resolves to a `ClassDeclaration` this walk cannot compute, and a
+  // `new` resolves to one `implementationsOf` refuses, so the receiver is UNKNOWN and round 24's
+  // propagation kills the access before the annotation is read. THE REASON WAS WRONG, and wrong in a
+  // way worth writing down rather than quietly patching: it fences the receivers you have to
+  // EVALUATE, and the ROOTS produce a different kind. `rootShapes` trusts every parameter of the two
+  // renderer roots, and `resolveIdentifier` hands a non-context, non-list root straight back as
+  // OPAQUE. An OPAQUE receiver is not an UNKNOWN one, so propagation never fires.
+  //
+  // So the route evaluates no class identifier and no `new` anywhere: a class-TYPED root parameter
+  // whose field is ANNOTATED as one literal and INITIALIZED to the other through an assertion. It is
+  // (O)'s asserted default one declaration kind further along, and no fix from rounds 22 to 28
+  // reaches it — there is no call at the root, no argument, no default, no UNKNOWN and no key.
+  const viaClassFieldAnnotation = model.replace(
+    'export function renderLocalDirection(direction: LocalDirection, context: LocalDirectionContext): string {',
+    'export class RenderMode {\n'
+    + "  readonly mode: 'REVIEWED' = 'UNREVIEWED' as unknown as 'REVIEWED'\n"
+    + '}\n'
+    + '\n'
+    + 'export function renderLocalDirection(\n'
+    + '  direction: LocalDirection,\n'
+    + '  context: LocalDirectionContext,\n'
+    + '  render: RenderMode,\n'
+    + '): string {',
+  ).replace(
+    "      return 'confirm the invoice PDF stored against the order is the document you expect'",
+    "      return render.mode === 'REVIEWED'\n"
+    + "        ? 'confirm the invoice PDF stored against the order is the document you expect'\n"
+    + "        : '" + UNDECLARED_REMOTE_ACTION + "'",
+  ).replace(
+    // THE SEQUENCE FORWARDS ITS OWN ROOT PARAMETER, which is what keeps this a route through a class
+    // FIELD and nothing else. An argument of `new RenderMode()` here would be refused by round 24's
+    // argument provenance — a `NewExpression` is not a literal type this walk can trace — and the
+    // control would then pass for round 24's reason with the field rule doing nothing. Forwarding a
+    // root parameter carries provenance `null`, so both renderers reach the field the same way: an
+    // OPAQUE receiver whose annotation is read.
+    'export function renderLocalDirectionSequence(\n'
+    + '  sequence: LocalDirectionSequence,\n'
+    + '  context: LocalDirectionContext,\n'
+    + '): string {\n'
+    + "  return sequence.map((direction) => renderLocalDirection(direction, context)).join(' and ')",
+    'export function renderLocalDirectionSequence(\n'
+    + '  sequence: LocalDirectionSequence,\n'
+    + '  context: LocalDirectionContext,\n'
+    + '  render: RenderMode,\n'
+    + '): string {\n'
+    + "  return sequence.map((direction) => renderLocalDirection(direction, context, render)).join(' and ')",
+  )
+  // ALL THREE EDITS LANDED. `notEqual` alone would pass on one of them, and a route that changed the
+  // renderer but not the sequence is a different control from the one this comment describes.
+  for (const fragment of [
+    "readonly mode: 'REVIEWED' = 'UNREVIEWED' as unknown as 'REVIEWED'",
+    "return render.mode === 'REVIEWED'",
+    'renderLocalDirection(direction, context, render)',
+  ]) {
+    assert.ok(
+      viaClassFieldAnnotation.includes(fragment),
+      `the class-field mutation must actually have been applied — missing ${JSON.stringify(fragment)}`,
+    )
+  }
+  // AND THE COMPILER ADMITS IT, byte for byte the same diagnostics as the shipped model: the
+  // assertion goes through `unknown` so it is a legal one, the field's declared type is the literal
+  // the comparison is against, and both call sites pass the new parameter.
+  assert.deepEqual(
+    modelDiagnostics(viaClassFieldAnnotation), modelDiagnostics(model),
+    'the class-field mutation must type-check exactly as the shipped model does, or it is not a route anybody '
+    + 'could take',
+  )
+  const classFieldComplaints = judgeRendererOutput(viaClassFieldAnnotation)
+  assert.ok(
+    classFieldComplaints.some((complaint) => complaint.startsWith('emits a sentence nobody reviewed')
+      && complaint.includes('take the second PDF off it')),
+    'CONTROL, THE CODEX ROUTE: a class FIELD pairs an annotation with an expression, so the annotation is '
+    + 'honest only as far as that expression is. Read off an OPAQUE root parameter there is no receiver to '
+    + `propagate and no argument to trace, so the field's own initializer is the only thing left to ask. Saw: ${
+      JSON.stringify(classFieldComplaints)}`,
+  )
+  // ...and the walk still COMPUTES every sentence — the complaint is the prose it emits, not an
+  // expression it gave up on, so the branch is walked both ways for this reason and not by accident.
+  assert.deepEqual(
+    computeRendererOutput(viaClassFieldAnnotation).unresolved, [],
+    'the class-field mutation must still COMPUTE — the complaint is the sentence it emits, not an expression '
+    + 'this walk could not read',
+  )
+  // ...AND THE PRE-FIX ANALYZER REPORTS IT CLEAN, asserted rather than described — the same shape as
+  // (J) through (P). Re-run the SAME judgement over the SAME mutated renderer with every round-22-to-28
+  // fix in place and only the field's provenance ignored: no complaint at all, while the sentence ships.
+  assert.deepEqual(
+    judgeRendererOutput(
+      viaClassFieldAnnotation, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'MODELLED', 'NAMED', 'ABSTRACT', 'CARRIED',
+      'DEMANDED', 'IGNORED',
+    ),
+    [],
+    'THE PRE-FIX ANALYZER MUST STILL LET IT THROUGH — if it also refused this, control (Q) would be passing '
+    + 'for some other reason and would prove nothing',
+  )
+  // ...AND NONE OF THE SEVEN FIXES THAT CAME BEFORE IT CLOSES IT, which is what makes this an eighth
+  // round rather than a regression of one of them — and, specifically, what disproves round 28's
+  // reachability argument: receiver propagation is in that list.
+  const withoutEachFixBeforeTheField = [
+    ['receiver propagation (round 24)', judgeRendererOutput(
+      viaClassFieldAnnotation, {}, 'SYMBOLIC', 'TRACKED', 'DEFERRED',
+    )],
+    ['argument provenance (round 24)', judgeRendererOutput(
+      viaClassFieldAnnotation, {}, 'SYMBOLIC', 'CALL_LOCAL', 'PROPAGATED',
+    )],
+    ['modelled defaults (round 25)', judgeRendererOutput(
+      viaClassFieldAnnotation, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'UNBOUND',
+    )],
+    ['the named root set (round 25)', judgeRendererOutput(
+      viaClassFieldAnnotation, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'MODELLED', 'INFERRED',
+    )],
+    ['abstract root entry (round 26)', judgeRendererOutput(
+      viaClassFieldAnnotation, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'MODELLED', 'NAMED', 'DEFAULTED',
+    )],
+    ['root default provenance (round 27)', judgeRendererOutput(
+      viaClassFieldAnnotation, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'MODELLED', 'NAMED', 'ABSTRACT', 'DROPPED',
+    )],
+    ['key provenance (round 28)', judgeRendererOutput(
+      viaClassFieldAnnotation, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'MODELLED', 'NAMED', 'ABSTRACT', 'CARRIED',
+      'IGNORED',
+    )],
+  ] as const
+  assert.equal(
+    withoutEachFixBeforeTheField.length, 7,
+    'all seven earlier fixes must be switched off in turn, or this loop is a claim about a subset of them',
+  )
+  for (const [what, complaints] of withoutEachFixBeforeTheField) {
+    assert.ok(
+      complaints.some((complaint) => complaint.includes('take the second PDF off it')),
+      `THE FIELD RULE IS WHAT CLOSES THIS: with ${what} switched off it is still refused, so it is not that fix `
+      + 'wearing a new coat',
+    )
+  }
+  // ...AND THE RUNTIME PASS DOES SEE THIS ONE, which is worth stating rather than borrowing (P)'s
+  // sentence. The field is a constant, so every caller that reaches CONFIRM gets the prohibited
+  // sentence and any sample that renders it fails. What the analyzer must not do is report the
+  // inventory CLEAN over it — a clean static report is what makes the sampled pass look redundant.
+  // (Q2) is the same position with no sample able to see it at all.
+  const byClassField = (direction: LocalDirection, context: LocalDirectionContext): string => (
+    direction.action === 'CONFIRM' ? UNDECLARED_REMOTE_ACTION : renderLocalDirection(direction, context)
+  )
+  assert.throws(
+    () => assertRenderedInventory(
+      (direction) => byClassField(direction, RUNTIME_CONTEXTS[0]!),
+      (text) => substitutePlaceholders(text, RUNTIME_CONTEXTS[0]!),
+    ),
+    /is NOT the reviewed sentence for it/,
+    'the mutated renderer emits the prohibited sentence at run time for every caller, so this route is one a '
+    + 'sample DOES catch — what the control is about is the analyzer reporting clean over it',
+  )
+
+  // (Q2) THE SAME FIELD WITH NO INITIALIZER AT ALL, assigned in the constructor from the sync row id
+  // — the half of the round-29 rule that "recursively check the initializer" does not reach, and the
+  // one no sample closes.
+  //
+  // A class field may be annotated and never initialized where it is declared. Its literal type is
+  // then an annotation backed by nothing this walk reads, and whatever assigns it may be keyed on a
+  // value that is unbounded at run time. REQUIRING the initializer is what refuses this; tracing one
+  // would find nothing to trace.
+  const viaClassFieldWithoutInitializer = model.replace(
+    'export function renderLocalDirection(direction: LocalDirection, context: LocalDirectionContext): string {',
+    'export class RenderMode {\n'
+    + "  readonly mode: 'REVIEWED'\n"
+    + '\n'
+    + '  constructor(syncRowId: string) {\n'
+    + "    this.mode = (syncRowId === '" + OFF_SAMPLE_SYNC_ROW + "' ? 'UNREVIEWED' : 'REVIEWED') as 'REVIEWED'\n"
+    + '  }\n'
+    + '}\n'
+    + '\n'
+    + 'export function renderLocalDirection(\n'
+    + '  direction: LocalDirection,\n'
+    + '  context: LocalDirectionContext,\n'
+    + '  render: RenderMode,\n'
+    + '): string {',
+  ).replace(
+    "      return 'confirm the invoice PDF stored against the order is the document you expect'",
+    "      return render.mode === 'REVIEWED'\n"
+    + "        ? 'confirm the invoice PDF stored against the order is the document you expect'\n"
+    + "        : '" + UNDECLARED_REMOTE_ACTION + "'",
+  ).replace(
+    'export function renderLocalDirectionSequence(\n'
+    + '  sequence: LocalDirectionSequence,\n'
+    + '  context: LocalDirectionContext,\n'
+    + '): string {\n'
+    + "  return sequence.map((direction) => renderLocalDirection(direction, context)).join(' and ')",
+    'export function renderLocalDirectionSequence(\n'
+    + '  sequence: LocalDirectionSequence,\n'
+    + '  context: LocalDirectionContext,\n'
+    + '  render: RenderMode,\n'
+    + '): string {\n'
+    + "  return sequence.map((direction) => renderLocalDirection(direction, context, render)).join(' and ')",
+  )
+  for (const fragment of [
+    "readonly mode: 'REVIEWED'\n",
+    'constructor(syncRowId: string) {',
+    "return render.mode === 'REVIEWED'",
+    'renderLocalDirection(direction, context, render)',
+  ]) {
+    assert.ok(
+      viaClassFieldWithoutInitializer.includes(fragment),
+      `the uninitialized-field mutation must actually have been applied — missing ${JSON.stringify(fragment)}`,
+    )
+  }
+  assert.deepEqual(
+    modelDiagnostics(viaClassFieldWithoutInitializer), modelDiagnostics(model),
+    'the uninitialized-field mutation must type-check exactly as the shipped model does — a `readonly` field '
+    + 'assigned in the constructor is definitely assigned, and the assertion narrows a union to one of its own '
+    + 'members',
+  )
+  const uninitializedFieldComplaints = judgeRendererOutput(viaClassFieldWithoutInitializer)
+  assert.ok(
+    uninitializedFieldComplaints.some((complaint) => complaint.startsWith('emits a sentence nobody reviewed')
+      && complaint.includes('take the second PDF off it')),
+    'CONTROL: a class field with NO initializer is an annotation this walk has no expression for, so it cannot '
+    + `be folded either. Saw: ${JSON.stringify(uninitializedFieldComplaints)}`,
+  )
+  assert.deepEqual(
+    judgeRendererOutput(
+      viaClassFieldWithoutInitializer, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'MODELLED', 'NAMED', 'ABSTRACT',
+      'CARRIED', 'DEMANDED', 'IGNORED',
+    ),
+    [],
+    'THE PRE-FIX ANALYZER MUST STILL LET IT THROUGH, or (Q2) proves nothing',
+  )
+  // ...AND NO SAMPLE CLOSES IT. The field is assigned from the sync row id, and sync row ids are
+  // unbounded: hand-run the mutated renderer's own selection over all four RUNTIME_CONTEXTS and
+  // every one reports the reviewed inventory, because none of them carries the id the constructor
+  // keys on. That is the whole reason this position has to be closed statically.
+  const byUninitializedField = (direction: LocalDirection, context: LocalDirectionContext): string => (
+    direction.action === 'CONFIRM' && context.syncRowId === OFF_SAMPLE_SYNC_ROW
+      ? UNDECLARED_REMOTE_ACTION
+      : renderLocalDirection(direction, context)
+  )
+  assert.equal(RUNTIME_CONTEXTS.length, 4, 'the four sampled contexts, unchanged')
+  for (const context of RUNTIME_CONTEXTS) {
+    assertRenderedInventory(
+      (direction) => byUninitializedField(direction, context),
+      (text) => substitutePlaceholders(text, context),
+    )
+  }
+  const offSampleFieldContext: LocalDirectionContext = { ledger: 'Xero', syncRowId: OFF_SAMPLE_SYNC_ROW }
+  assert.throws(
+    () => assertRenderedInventory(
+      (direction) => byUninitializedField(direction, offSampleFieldContext),
+      (text) => substitutePlaceholders(text, offSampleFieldContext),
+    ),
+    /is NOT the reviewed sentence for it/,
+    'and the SAME renderer refused the moment the id is one nobody sampled — so what the four contexts '
+    + 'established was the ids they carry, not the renderer',
+  )
+
+  // (Q3) THE ENUM MEMBER, which round 28 held closed for the same wrong reason and which is
+  // therefore open for the same reason.
+  //
+  // An enum member's initializer cannot carry an assertion — TypeScript refuses a computed value in
+  // a string enum outright (TS18033) — so (Q)'s exact shape is not available here. What IS available
+  // is the same position reached through a root parameter typed `typeof E`, over an AMBIENT enum:
+  // its members are values in code this program does not contain. The declaration says `'REVIEWED'`;
+  // the module that ships the implementation says whatever it says, and this walk has never read it.
+  // That is the reason `resolveIdentifier` already refuses an ambient VARIABLE rather than reading
+  // its declared type as a value, applied to the one declaration kind that had been exempt from it.
+  const AMBIENT_MODE_FILE = 'lib/domain/accounting/ambient-render-mode.d.ts'
+  const ambientMode = { [AMBIENT_MODE_FILE]: "declare enum AmbientRenderMode { MODE = 'REVIEWED' }\n" }
+  const viaAmbientEnumMember = model.replace(
+    'export function renderLocalDirection(direction: LocalDirection, context: LocalDirectionContext): string {',
+    'export function renderLocalDirection(\n'
+    + '  direction: LocalDirection,\n'
+    + '  context: LocalDirectionContext,\n'
+    + '  render: typeof AmbientRenderMode,\n'
+    + '): string {',
+  ).replace(
+    "      return 'confirm the invoice PDF stored against the order is the document you expect'",
+    "      return (render.MODE as string) === 'REVIEWED'\n"
+    + "        ? 'confirm the invoice PDF stored against the order is the document you expect'\n"
+    + "        : '" + UNDECLARED_REMOTE_ACTION + "'",
+  ).replace(
+    'export function renderLocalDirectionSequence(\n'
+    + '  sequence: LocalDirectionSequence,\n'
+    + '  context: LocalDirectionContext,\n'
+    + '): string {\n'
+    + "  return sequence.map((direction) => renderLocalDirection(direction, context)).join(' and ')",
+    'export function renderLocalDirectionSequence(\n'
+    + '  sequence: LocalDirectionSequence,\n'
+    + '  context: LocalDirectionContext,\n'
+    + '  render: typeof AmbientRenderMode,\n'
+    + '): string {\n'
+    + "  return sequence.map((direction) => renderLocalDirection(direction, context, render)).join(' and ')",
+  )
+  assert.ok(
+    viaAmbientEnumMember.includes("(render.MODE as string) === 'REVIEWED'")
+      && viaAmbientEnumMember.includes('renderLocalDirection(direction, context, render)'),
+    'the ambient-enum-member mutation must actually have been applied',
+  )
+  assert.deepEqual(
+    modelDiagnostics(viaAmbientEnumMember, ambientMode), modelDiagnostics(model),
+    'the ambient-enum-member mutation must type-check exactly as the shipped model does, or it is not a route '
+    + 'anybody could take',
+  )
+  const ambientEnumComplaints = judgeRendererOutput(viaAmbientEnumMember, ambientMode)
+  assert.ok(
+    ambientEnumComplaints.some((complaint) => complaint.startsWith('emits a sentence nobody reviewed')
+      && complaint.includes('take the second PDF off it')),
+    'CONTROL: an ENUM MEMBER declared without an implementation this walk can read is a claim about code this '
+    + `program does not contain, so its literal type is not knowledge about the program. Saw: ${
+      JSON.stringify(ambientEnumComplaints)}`,
+  )
+  assert.deepEqual(
+    judgeRendererOutput(
+      viaAmbientEnumMember, ambientMode, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'MODELLED', 'NAMED', 'ABSTRACT',
+      'CARRIED', 'DEMANDED', 'IGNORED',
+    ),
+    [],
+    'THE PRE-FIX ANALYZER MUST STILL LET IT THROUGH — the enum member folded on its annotation exactly as the '
+    + 'class field did, or (Q3) proves nothing',
+  )
+  // ...and the receiver here is an OPAQUE ROOT PARAMETER and not the enum object, which is what
+  // makes it a route at all: a bare `AmbientRenderMode.MODE` goes through `resolveIdentifier`, which
+  // cannot compute an `EnumDeclaration` and returns UNKNOWN, and round 24's propagation ends it
+  // before any member is read. Asserted, because that distinction IS round 28's mistake restated for
+  // the other declaration kind — one receiver class was fenced and the other was assumed to be the
+  // same one.
+  const viaEnumObjectDirectly = model.replace(
+    "      return 'confirm the invoice PDF stored against the order is the document you expect'",
+    "      return (AmbientRenderMode.MODE as string) === 'REVIEWED'\n"
+    + "        ? 'confirm the invoice PDF stored against the order is the document you expect'\n"
+    + "        : '" + UNDECLARED_REMOTE_ACTION + "'",
+  )
+  assert.ok(
+    judgeRendererOutput(
+      viaEnumObjectDirectly, ambientMode, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'MODELLED', 'NAMED', 'ABSTRACT',
+      'CARRIED', 'DEMANDED', 'IGNORED',
+    ).some((complaint) => complaint.includes('take the second PDF off it')),
+    'the PRE-FIX analyzer must already refuse the enum read through the enum OBJECT — that is the receiver '
+    + 'round 28\'s argument was about, and it is not the one the roots produce',
+  )
+
+  // ...AND THE FIX DOES NOT UNDO ANY OF THE SEVEN. The routes those controls are about are still
+  // refused with the field rule in place — asserted here so that "keep all existing controls
+  // passing" is a statement this control makes rather than one a reader has to take on trust.
+  const routesBeforeTheField = [
+    ['(L1) the runtime copy', viaRuntimeCopy],
+    ['(L2) the asserted argument', viaAssertedArgument],
+    ['(M) the asserted default', viaDefaultedParameter],
+    ['(N) the defaulted root parameter', viaDefaultedRootParameter],
+    ['(O) the asserted root default', viaAssertedRootDefault],
+    ['(P) the asserted key', viaAssertedKey],
+  ] as const
+  assert.equal(routesBeforeTheField.length, 6, 'every earlier Codex route is re-judged here, not a sample of them')
+  for (const [what, mutated] of routesBeforeTheField) {
+    assert.ok(
+      judgeRendererOutput(mutated).length > 0,
+      `${what} must still be refused — demanding provenance of a class field must not have loosened anything else`,
+    )
+  }
+  // ...and the SHIPPED model is still clean, which is the other direction of the same statement: the
+  // renderers declare no class field and no enum member, so the rule refuses nothing they emit.
+  assert.deepEqual(
+    judgeRendererOutput(model), [],
+    'the shipped renderers must still report a clean inventory under the field rule, or round 29 has narrowed '
+    + 'what this walk can READ rather than what it will TRUST',
+  )
 })
