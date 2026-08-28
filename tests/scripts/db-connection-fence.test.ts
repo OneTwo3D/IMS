@@ -2174,7 +2174,17 @@ test('o3d-2sm1.5 r19: every entrypoint supplies the four values, and refuses whe
   for (const [name, source] of [['deploy.sh', deploy], ['update.sh', update], ['install.sh', install]] as const) {
     // EVERY invocation of the helper carries the identity — not just the one a test happened to
     // look at. A mode added later without it would otherwise reintroduce the whole finding.
-    const invocations = source.split('\n').filter((line) => line.includes('"${DB_FENCE_SCRIPT}"') || line.includes('"$DB_FENCE_SCRIPT"'))
+    // r29: update.sh no longer names ${DB_FENCE_SCRIPT} at the invocation. The script it runs is
+    // resolved first — the checkout's copy, or the root-owned one published when the fence was
+    // raised, because ${APP_DIR}/scripts/fence-db-connections.mjs is application-owned and
+    // deleting it used to turn every fence, release and adoption into a refusal. Both spellings
+    // are an invocation of the helper and both must carry the identity.
+    const invocations = source
+      .split('\n')
+      .filter(
+        (line) =>
+          line.includes('"${DB_FENCE_SCRIPT}"') || line.includes('"$DB_FENCE_SCRIPT"') || line.includes('"${fence_script}"'),
+      )
     const modes = invocations.filter((line) => /--(fence|release|preflight|print-migration-url)\b/.test(line))
     assert.ok(modes.length >= 4, `${name}: precondition — the helper is actually invoked here (${modes.length})`)
     for (const line of modes) {
@@ -2186,6 +2196,33 @@ test('o3d-2sm1.5 r19: every entrypoint supplies the four values, and refuses whe
     // AND A CALLER THAT CANNOT DETERMINE A VALUE REFUSES rather than defaulting.
     assert.ok(source.includes('require_db_identity ||'), `${name}: refuses when the four are not known`)
   }
+
+  // r29: THE ONE EXEMPTION, AND WHAT IT IS CONDITIONED ON. fence_db_connections() drops both .env
+  // questions when the identity came from the root-owned recovery record rather than from
+  // ${APP_DIR}/.env — both compare the identity in hand against what a FILE will give systemd at
+  // exec, and on that path there is no file and nothing is being started (the run refuses at the
+  // layout gate a few lines later). The exemption is named here so it cannot be widened: exactly
+  // one condition may wrap them, and exactly one function may raise the flag it tests.
+  const fenceBody = update.slice(update.indexOf('\nfence_db_connections() {'), update.indexOf('\n# Asked in the VALIDATE phase'))
+  assert.ok(fenceBody.length > 500, 'precondition: fence_db_connections() was located in update.sh')
+  assert.match(fenceBody, /require_env_file_is_sole_definition \|\| die/, 'the sole-source question is still asked there')
+  assert.match(fenceBody, /require_start_identity_unchanged \|\| die/, 'and the drift re-read too')
+  const conditions = fenceBody.split('\n').filter((line) => /^\s*if .*; then$/.test(line) && !/\$DRY_RUN/.test(line))
+  assert.deepEqual(
+    conditions.map((line) => line.trim()),
+    ['if ! $DB_FENCE_IDENTITY_FROM_RECORD; then', 'if [[ "${fence_script}" != "${DB_FENCE_SCRIPT}" ]]; then'].sort((a, b) =>
+      fenceBody.indexOf(a) - fenceBody.indexOf(b),
+    ),
+    'nothing else may condition what fence_db_connections() asks',
+  )
+  const raises = update.split('\n').filter((line) => /^\s*DB_FENCE_IDENTITY_FROM_RECORD=true$/.test(line))
+  assert.equal(raises.length, 1, 'exactly one place may declare the identity to have come from the record')
+  const raiseAt = update.indexOf('  DB_FENCE_IDENTITY_FROM_RECORD=true')
+  const owner = update.lastIndexOf('() {', raiseAt)
+  assert.ok(
+    update.slice(update.lastIndexOf('\n', owner) + 1, owner).trim() === 'adopt_identity_from_recovery_record',
+    'and it is the function that reads the record',
+  )
 
   // WHERE EACH ONE GETS THEM, stated in the source and asserted here so the answer cannot drift:
   // install.sh OWNS the values (it created the role and the database with them), and the other
@@ -2600,10 +2637,22 @@ test('o3d-2sm1.5 r20: every fence path asks it, and the installer is still exemp
   for (const [name, source] of [['deploy.sh', deploy], ['update.sh', update]] as const) {
     // Wherever the identity is required, the source of that identity is required too: the two
     // refusals are the same refusal split in half, and one without the other is the finding.
-    const identity = source.split('\n').filter((line) => line.includes('require_db_identity ||')).length
-    const sole = source.split('\n').filter((line) => line.includes('require_env_file_is_sole_definition ||')).length
+    //
+    // r29: publish_fence_recovery_record() also requires the identity, and it is NOT a gate — it
+    // WRITES DOWN the identity the gates above it already established, so it has no sole-source
+    // half and should not have one. It is excised by NAME rather than by proximity to anything,
+    // and the excision is asserted to have removed something, so a gate added without its
+    // sole-source half still fails this.
+    const publisher = /publish_fence_recovery_record\(\) \{[\s\S]*?\n\}\n/
+    const gates = source.replace(publisher, '')
+    if (name === 'update.sh') {
+      assert.notEqual(gates.length, source.length, 'precondition: the record publisher was found and excised')
+    }
+    const identity = gates.split('\n').filter((line) => line.includes('require_db_identity ||')).length
+    const sole = gates.split('\n').filter((line) => line.includes('require_env_file_is_sole_definition ||')).length
     assert.ok(identity >= 3, `${name}: precondition — the identity is required at more than one place (${identity})`)
     assert.equal(sole, identity, `${name}: and its source is questioned at every one of them (${sole} of ${identity})`)
+
     // It asks systemd, and it asks about the one variable.
     // It asks SYSTEMD's own bus, and it asks about every property that can carry the variable —
     // PAMName included, which is the environment source the five-property text query omitted.
@@ -3140,6 +3189,14 @@ test('o3d-2sm1.5 r23: the trap re-fences the database it migrated even when the 
         'DB_FENCE_UP=false',
         'DRY_RUN=false',
         'DB_FENCE_SCRIPT="$1"',
+        // r29: the shipped function resolves the script it runs before anything else — the
+        // checkout's copy, or the root-owned one published when the fence was raised. The copy is
+        // deliberately absent here so it resolves to the real file above, which is what every
+        // assertion below is written against.
+        'DB_FENCE_SCRIPT_COPY="/nonexistent/fence-db-connections.mjs"',
+        source.includes('db_fence_script_in_use() {')
+          ? source.slice(source.indexOf('db_fence_script_in_use() {'), source.indexOf('\n}\n', source.indexOf('db_fence_script_in_use() {')) + 3)
+          : '',
         'DEPLOY_ADMIN_DATABASE_URL="postgresql://admin@127.0.0.1:5432/main"',
         'DATABASE_URL="postgresql://app:pw@127.0.0.1:5432/main"',
         'APP_USER="app"',

@@ -2230,7 +2230,7 @@ db_fence_script_in_use() {
 # for a value it does not state: the whole point of the four values is that a fence which is not
 # told exactly where it is aimed does not run, and a recovery is not the moment to relax that.
 adopt_identity_from_recovery_record() {
-  local host port user database
+  local host port user database release_script
   DB_FENCE_RECOVERY_REASON=""
   if [[ ! -f "${DB_FENCE_IDENTITY_FILE}" ]]; then
     DB_FENCE_RECOVERY_REASON="there is no record at ${DB_FENCE_IDENTITY_FILE}, so nothing here knows which host, port, role and database that fence was aimed at"
@@ -2282,7 +2282,8 @@ adopt_identity_from_recovery_record() {
   # The by-hand release command an operator may have to run is composed from the identity, so it
   # is recomposed here — and from the script this run can actually reach, which on this path is
   # usually the root-owned copy.
-  DB_FENCE_RELEASE_CMD="node $(db_fence_script_in_use || printf '%s' "${DB_FENCE_SCRIPT}") --release --state-file=${DB_FENCE_STATE} ${DB_FENCE_IDENTITY_ARGS[*]:-}"
+  release_script="$(db_fence_script_in_use)" || release_script="${DB_FENCE_SCRIPT}"
+  DB_FENCE_RELEASE_CMD="node ${release_script} --release --state-file=${DB_FENCE_STATE} ${DB_FENCE_IDENTITY_ARGS[*]:-}"
   return 0
 }
 
