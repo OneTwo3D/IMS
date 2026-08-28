@@ -5,6 +5,16 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 
+import {
+  checkoutHelper,
+  checkoutPgEntry,
+  protectedLibraryLines,
+  protectedLibraryLinesAt,
+  writeCheckoutPg,
+  protectedPaths,
+  writeFenceCheckout,
+} from './fence-artefact-harness.ts'
+
 // o3d-2sm1.1 — the deploy order is a safety property, not a style choice, so it is
 // asserted here rather than left to the header comment that used to describe it.
 //
@@ -260,12 +270,7 @@ function durabilityFunctions(source: string): string {
 function fenceProtectedLibrary(dir: string): string {
   return [
     `source ${JSON.stringify(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'))}`,
-    `DB_FENCE_RECOVERY_DIR='${dir}/recovery'`,
-    `DB_FENCE_IDENTITY_FILE='${dir}/recovery/db-fence-identity.env'`,
-    `DB_FENCE_PROTECTED_APP_DIR='${dir}/recovery/app'`,
-    `DB_FENCE_SCRIPT_COPY='${dir}/recovery/app/scripts/fence-db-connections.mjs'`,
-    `DB_FENCE_SCRIPT_STAGED='${dir}/recovery/app/scripts/.fence-db-connections.mjs.staged'`,
-    `DB_FENCE_MODULES_LINK='${dir}/recovery/app/node_modules'`,
+    ...protectedLibraryLines(dir),
   ].join('\n')
 }
 
@@ -1084,7 +1089,7 @@ APP_USER="$(id -un)"
 STATE_DIR='${dir}'
 CUTOVER_STATE_DIR='${dir}'
 DB_FENCE_DIR='${dir}'
-DB_FENCE_SCRIPT='${dir}/fence.mjs'
+DB_FENCE_SCRIPT='${dir}/app/scripts/fence-db-connections.mjs'
 DB_FENCE_STATE='${dir}/db-connect-fence.json'
 DEPLOY_ADMIN_DATABASE_URL='postgres://admin@127.0.0.1/nowhere'
 MIGRATION_DATABASE_URL=''
@@ -1114,7 +1119,8 @@ DB_IDENTITY_DRIFT_REASON=''
 # either — it resolves every invocation through the SHARED library, sourced here for real and then
 # pointed at the harness directory instead of /etc.
 ${fenceProtectedLibrary(dir)}
-${shellFunction(DEPLOY_LINES.join('\n'), 'db_fence_release_cmd')}
+${shellFunction(DEPLOY_LINES.join('\n'), 'resolve_fence_script')}
+DB_FENCE_REFENCE_CMD="\${DB_FENCE_REFENCE_WRAPPER}"
 : "\${APP_DIR_REAL:=/opt/app}"
 : "\${APP_DIR:=/opt/app}"
 info() { :; }
@@ -1133,7 +1139,7 @@ DRY_RUN=false
 BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
 APP_USER="$(id -un)"
 DB_FENCE_DIR='${dir}'
-DB_FENCE_SCRIPT='${dir}/fence.mjs'
+DB_FENCE_SCRIPT='${dir}/app/scripts/fence-db-connections.mjs'
 DB_FENCE_STATE='${dir}/db-connect-fence.json'
 DATABASE_URL='postgres://app@127.0.0.1/nowhere'
 DEPLOY_ADMIN_DATABASE_URL='postgres://admin@127.0.0.1/nowhere'
@@ -1163,10 +1169,12 @@ DB_IDENTITY_DRIFT_REASON=''
 # o3d-2sm1.5 r29/r30: the recovery record and the root-owned copy of the fence script. Both paths
 # are under the harness directory rather than /etc. As of r30 the copy is what actually RUNS — the
 # checkout's script is published into it and never executed in place — so these harnesses let that
-# publication happen for real. The stub written to ${dir}/fence.mjs logs to an ABSOLUTE
+# publication happen for real. The stub written into the fake checkout logs to an ABSOLUTE
 # ${dir}/calls.log, so the copy of it records the same calls at the same place and every
 # assertion below still reads what was invoked.
 ${fenceProtectedLibrary(dir)}
+${shellFunction(UPDATE_LINES.join('\n'), 'resolve_fence_script')}
+DB_FENCE_REFENCE_CMD="\${DB_FENCE_REFENCE_WRAPPER}"
 DB_FENCE_IDENTITY_FROM_RECORD=false
 DB_FENCE_ADOPTING=false
 DB_FENCE_RECOVERY_REASON=''
@@ -1203,7 +1211,7 @@ BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
 APP_USER="$(id -un)"
 APP_DIR='${dir}'
 DB_FENCE_DIR='${dir}'
-DB_FENCE_SCRIPT='${dir}/fence.mjs'
+DB_FENCE_SCRIPT='${dir}/app/scripts/fence-db-connections.mjs'
 DB_FENCE_STATE='${dir}/db-connect-fence.json'
 DATABASE_URL='postgres://app@127.0.0.1/nowhere'
 DEPLOY_ADMIN_DATABASE_URL='postgres://admin@127.0.0.1/nowhere'
@@ -1234,7 +1242,8 @@ DB_IDENTITY_DRIFT_REASON=''
 # either — it resolves every invocation through the SHARED library, sourced here for real and then
 # pointed at the harness directory instead of /etc.
 ${fenceProtectedLibrary(dir)}
-${shellFunction(INSTALL_SOURCE, 'db_fence_release_cmd')}
+${shellFunction(INSTALL_SOURCE, 'resolve_fence_script')}
+DB_FENCE_REFENCE_CMD="\${DB_FENCE_REFENCE_WRAPPER}"
 : "\${APP_DIR_REAL:=/opt/app}"
 : "\${APP_DIR:=/opt/app}"
 info() { :; }
@@ -1252,7 +1261,7 @@ for (const entry of FENCE_HARNESS) {
   test(`${entry.name} exits non-zero when the fence script reports CONNECT was not revoked`, () => {
     const dir = mkdtempSync(join(tmpdir(), 'ims-fence3-'))
     try {
-      execFileSync('bash', ['-c', `printf 'process.exit(3)\\n' > "${dir}/fence.mjs"`])
+      writeFenceCheckout(dir, 'process.exit(3)\n')
       const program = [
         'set -euo pipefail',
         entry.preamble(dir),
@@ -1287,8 +1296,8 @@ for (const entry of FENCE_HARNESS) {
       // The stub answers --print-migration-url the way the real script does, and exits 0 for
       // --fence. Anything else the shell might do with the admin URL is then visible in
       // MIGRATION_DATABASE_URL.
-      writeFileSync(
-        join(dir, 'fence.mjs'),
+      writeFenceCheckout(
+        dir,
         [
           "if (process.argv.includes('--print-migration-url')) {",
           "  process.stdout.write('postgres://admin@127.0.0.1/nowhere?options=-c%20role%3Dimsapp\\n')",
@@ -1333,8 +1342,8 @@ for (const entry of FENCE_HARNESS) {
     // a database the application cannot use. It has to abort while nothing has been migrated.
     const dir = mkdtempSync(join(tmpdir(), 'ims-fenceurl-'))
     try {
-      writeFileSync(
-        join(dir, 'fence.mjs'),
+      writeFenceCheckout(
+        dir,
         ["if (process.argv.includes('--print-migration-url')) process.exit(1)", 'process.exit(0)', ''].join('\n'),
       )
       const program = [
@@ -1383,8 +1392,8 @@ for (const entry of FENCE_HARNESS) {
 
 /** A stand-in for fence-db-connections.mjs that records its argv and exits how it is told. */
 function fenceStub(dir: string, exitCode: number): void {
-  writeFileSync(
-    join(dir, 'fence.mjs'),
+  writeFenceCheckout(
+    dir,
     [
       "import { appendFileSync } from 'node:fs'",
       `appendFileSync(${JSON.stringify(join(dir, 'calls.log'))}, process.argv.slice(2).join(' ') + '\\n')`,
@@ -4604,8 +4613,8 @@ test('no entrypoint writes its reboot-fence drop-in with a bare redirection', ()
 
 /** A fence stub that answers each mode with its own exit code, and logs what it was asked. */
 function fenceStubByMode(dir: string, codes: { fence: number; release: number }): void {
-  writeFileSync(
-    join(dir, 'fence.mjs'),
+  writeFenceCheckout(
+    dir,
     [
       "import { appendFileSync } from 'node:fs'",
       `appendFileSync(${JSON.stringify(join(dir, 'calls.log'))}, process.argv.slice(2).join(' ') + '\\n')`,
@@ -5174,6 +5183,18 @@ const MENTION_SHAPES: ReadonlyArray<{ why: string; match: RegExp }> = (
       why: 'passed by path to env_file_is_sole_database_url_source(), which reads the UNIT',
       match: `env_file_is_sole_database_url_source "(${APP_OWNED_PATH})" "[^"]*"`,
     },
+    // The second named helper of that kind (o3d-2sm1.5 r32). It writes the path INTO a root-owned
+    // recovery wrapper as a literal and never opens it here; the wrapper reads it at recovery
+    // time, with the same one-key reader env_file_value() uses and no `source`. Spelled out in
+    // full — helper name, argument order and the warning tail — so a call that started passing
+    // the file's CONTENTS, or a different helper, is not covered by this.
+    {
+      why: 'passed by path to db_fence_publish_operator_wrappers(), which writes it into a root-owned wrapper',
+      match:
+        `db_fence_publish_operator_wrappers "\\$\\{APP_USER\\}" "(${APP_OWNED_PATH})" ` +
+        '"\\$\\{DB_FENCE_STATE\\}" "\\$\\{DB_FENCE_IDENTITY_ARGS\\[@\\]:-\\}"' +
+        '( \\|\\| echo "[^"]*" >&2)?',
+    },
     // install.sh OWNS these two files: it writes them, then locks them down.
     { why: 'install.sh writing the file it owns', match: `cat > "(${APP_OWNED_PATH})" <<EOF` },
     {
@@ -5645,6 +5666,38 @@ test('a deleted .env does not make a recovery run abandon a standing fence', () 
 // FENCE wrote, in the same test, rather than bytes typed here.
 // ---------------------------------------------------------------------------
 
+/**
+ * Put a protected artefact in place THE WAY THE SHIPPED LIBRARY DOES (o3d-2sm1.5 r32).
+ *
+ * Several tests below need a protected copy that this run did not publish — a fence raised by an
+ * earlier run, which is the whole premise of the recovery path. Before r32 that was two lines of
+ * mkdir and writeFileSync. It cannot be any more: the artefact now carries a vendored dependency
+ * closure and a record of what the tree hashes to, and a test that wrote those by hand would be
+ * a second implementation of the digest — the "one rule, several readers" shape that produced the
+ * last three findings. So the library publishes it, from a throwaway checkout, exactly as a
+ * previous cutover would have.
+ */
+function plantProtectedArtefact(recovery: string, helperBody: string): void {
+  const seed = mkdtempSync(join(tmpdir(), 'ims-seed-'))
+  try {
+    writeFenceCheckout(seed, helperBody)
+    const result = runShell(
+      [
+        'set -uo pipefail',
+        'exec 2>&1',
+        `source ${JSON.stringify(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'))}`,
+        `DB_FENCE_SCRIPT=${JSON.stringify(checkoutHelper(seed))}`,
+        ...protectedLibraryLinesAt(recovery),
+        'chown(){ :; }',
+        'publish_fence_script_copy || { echo "PLANT FAILED: ${DB_FENCE_ROTATION_NOTE}"; exit 1; }',
+      ].join('\n'),
+    )
+    assert.equal(result.status, 0, `the previous run's artefact must be publishable:\n${result.output}`)
+  } finally {
+    rmSync(seed, { recursive: true, force: true })
+  }
+}
+
 /** Everything the connection fence and its adoption touch, wired to real directories. */
 function fenceRecoveryHarness(dirs: { app: string; state: string; recovery: string }, body: string[]): string {
   const source = UPDATE_LINES.join('\n')
@@ -5668,9 +5721,25 @@ function fenceRecoveryHarness(dirs: { app: string; state: string; recovery: stri
     `DB_FENCE_IDENTITY_FILE=${JSON.stringify(join(dirs.recovery, 'db-fence-identity.env'))}`,
     `DB_FENCE_PROTECTED_APP_DIR=${JSON.stringify(join(dirs.recovery, 'app'))}`,
     `DB_FENCE_SCRIPT_COPY=${JSON.stringify(join(dirs.recovery, 'app', 'scripts', 'fence-db-connections.mjs'))}`,
-    `DB_FENCE_SCRIPT_STAGED=${JSON.stringify(join(dirs.recovery, 'app', 'scripts', '.fence-db-connections.mjs.staged'))}`,
-    `DB_FENCE_MODULES_LINK=${JSON.stringify(join(dirs.recovery, 'app', 'node_modules'))}`,
-    "DB_FENCE_RELEASE_CMD=''",
+    `DB_FENCE_STAGED_APP_DIR=${JSON.stringify(join(dirs.recovery, '.app.staged'))}`,
+    `DB_FENCE_RETIRED_APP_DIR=${JSON.stringify(join(dirs.recovery, '.app.retired'))}`,
+    `DB_FENCE_ARTEFACT_FILE=${JSON.stringify(join(dirs.recovery, 'db-fence-artefact.sha256'))}`,
+    `DB_FENCE_MANIFEST_FILE=${JSON.stringify(join(dirs.recovery, 'db-fence-artefact.manifest'))}`,
+    `DB_FENCE_RELEASE_WRAPPER=${JSON.stringify(join(dirs.recovery, 'release-db-fence'))}`,
+    `DB_FENCE_REFENCE_WRAPPER=${JSON.stringify(join(dirs.recovery, 'refence-db'))}`,
+    // The shipped resolver, not a stub (o3d-2sm1.5 r32): it is what every fence path in update.sh
+    // now calls, and it does two things — resolve the artefact and rewrite the root-owned recovery
+    // wrappers — that a stub would silently drop.
+    shellFunction(source, 'resolve_fence_script'),
+    // The two recovery commands, exactly as update.sh sets them: the PATHS of the root-owned
+    // wrappers, not a command line (o3d-2sm1.5 r32). Setting them empty here would let a banner
+    // that prints nothing pass every assertion about what it names.
+    'DB_FENCE_RELEASE_CMD="${DB_FENCE_RELEASE_WRAPPER}"',
+    'DB_FENCE_REFENCE_CMD="${DB_FENCE_REFENCE_WRAPPER}"',
+    // The absolute path update.sh prints in the one refusal that tells an operator to re-run it
+    // with a credential on the invocation (o3d-2sm1.5 r32). Named here because `set -u` aborts on
+    // it, which is how a harness discovers that a refusal now carries a variable.
+    `IMS_ENTRYPOINT_PATH=${JSON.stringify(join(process.cwd(), 'scripts/update.sh'))}`,
     'DB_FENCE_IDENTITY_FROM_RECORD=false',
     'DB_FENCE_ADOPTING=false',
     "DB_FENCE_RECOVERY_REASON=''",
@@ -5758,6 +5827,8 @@ test('a deleted .env does not stop the connection fence being adopted', () => {
     // checkout. Nothing here is about recovery; it is what produces the record.
     mkdirSync(join(app, 'scripts'), { recursive: true })
     writeFileSync(join(app, 'scripts', 'fence-db-connections.mjs'), '// the shipped fence script\n')
+    // …and its imports, because publishing the protected artefact VENDORS them (o3d-2sm1.5 r32).
+    writeCheckoutPg(app)
     writeFileSync(join(app, '.env'), 'DATABASE_URL=postgresql://imsapp:pw@127.0.0.1:5432/imsdb\n')
     const raised = runShell(
       fenceRecoveryHarness({ app, state, recovery }, ['DEPLOY_ADMIN_DATABASE_URL=postgres://admin@127.0.0.1:5432/imsdb', 'fence_db_connections', 'echo "RAISED=${DB_FENCE_UP}"']),
@@ -5854,8 +5925,7 @@ test('a recovery with no privileged credential refuses, naming the argument that
   try {
     mkdirSync(join(state, 'deploy'), { recursive: true })
     writeFileSync(join(state, 'deploy', 'db-connect-fence.json'), '{}\n')
-    mkdirSync(join(recovery, 'app', 'scripts'), { recursive: true })
-    writeFileSync(join(recovery, 'app', 'scripts', 'fence-db-connections.mjs'), '// copy\n')
+    plantProtectedArtefact(recovery, '// copy\n')
     writeFileSync(
       join(recovery, 'db-fence-identity.env'),
       'db_app_host=127.0.0.1\ndb_app_port=5432\ndb_app_user=imsapp\ndb_app_database=imsdb\nfence_identity_complete=1\n',
@@ -5866,7 +5936,15 @@ test('a recovery with no privileged credential refuses, naming the argument that
     assert.notEqual(result.status, 0, `a recovery with no privileged connection must refuse:\n${result.output}`)
     assert.ok(!/PAST=yes/.test(result.output), 'and nothing after it may run')
     assert.match(result.output, /DEPLOY_ADMIN_DATABASE_URL is not set/, `naming the argument:\n${result.output}`)
-    assert.match(result.output, /DEPLOY_ADMIN_DATABASE_URL=postgresql:/, 'and saying how to supply it on the invocation')
+    assert.match(
+      result.output,
+      /DEPLOY_ADMIN_DATABASE_URL='postgresql:\/\/ADMIN:PASSWORD@HOST:PORT\/DATABASE' bash \/\S+\/scripts\/update\.sh/,
+      'and saying how to supply it on the invocation, as an ABSOLUTE path that would run if pasted (o3d-2sm1.5 r32)',
+    )
+    // AND THE OTHER HALF OF THE SAME SENTENCE NAMES THE ROOT-OWNED WRAPPER, not a command line
+    // built out of the checkout. This is the instruction an operator follows when the recovery
+    // itself cannot go on, so it is the one that must not point at an application-owned path.
+    assert.match(result.output, new RegExp(`release the fence by hand.*${recovery}/release-db-fence`), `naming the wrapper:\n${result.output}`)
     // PRECONDITION: the identity itself WAS recovered, so this refusal is about the credential
     // and not about a record that could not be read.
     assert.match(result.output, /^IDENTITY_ARGS=0$/m, 'the file gave nothing')
@@ -5915,8 +5993,7 @@ for (const scenario of RECOVERY_RECORD_REFUSALS) {
     try {
       mkdirSync(join(state, 'deploy'), { recursive: true })
       writeFileSync(join(state, 'deploy', 'db-connect-fence.json'), '{}\n')
-      mkdirSync(join(recovery, 'app', 'scripts'), { recursive: true })
-    writeFileSync(join(recovery, 'app', 'scripts', 'fence-db-connections.mjs'), '// copy\n')
+      plantProtectedArtefact(recovery, '// copy\n')
       if (scenario.record !== null) writeFileSync(join(recovery, 'db-fence-identity.env'), scenario.record)
       const result = runShell(
         fenceRecoveryHarness({ app, state, recovery }, [
@@ -5952,6 +6029,7 @@ for (const scenario of RECOVERY_RECORD_REFUSALS) {
 function raiseFenceFor(dirs: { app: string; state: string; recovery: string }, script = '// the shipped fence script\n'): void {
   mkdirSync(join(dirs.app, 'scripts'), { recursive: true })
   writeFileSync(join(dirs.app, 'scripts', 'fence-db-connections.mjs'), script)
+  writeCheckoutPg(dirs.app)
   writeFileSync(join(dirs.app, '.env'), 'DATABASE_URL=postgresql://imsapp:pw@127.0.0.1:5432/imsdb\n')
   const raised = runShell(
     fenceRecoveryHarness(dirs, [
@@ -6113,8 +6191,7 @@ test('a protected fence script that is not the one the record names is refused',
   try {
     mkdirSync(join(dirs.state, 'deploy'), { recursive: true })
     writeFileSync(join(dirs.state, 'deploy', 'db-connect-fence.json'), '{}\n')
-    mkdirSync(join(dirs.recovery, 'app', 'scripts'), { recursive: true })
-    writeFileSync(join(dirs.recovery, 'app', 'scripts', 'fence-db-connections.mjs'), '// not the recorded script\n')
+    plantProtectedArtefact(dirs.recovery, '// not the recorded script\n')
     writeFileSync(
       join(dirs.recovery, 'db-fence-identity.env'),
       [
@@ -6261,26 +6338,51 @@ test('the recovery record lives where the application user cannot rewrite it', (
   assert.match(line, /^DB_FENCE_RECOVERY_DIR="\/etc\/[^$]*"$/, `it must be a literal outside the application's tree: ${line}`)
   assert.ok(!/CUTOVER_STATE_DIR|APP_DIR|DATA_DIR|\$\{IMS_/.test(line), `and not derived from anything the application can move: ${line}`)
   for (const [label, lines] of [['update.sh', UPDATE_LINES], ['deploy.sh', DEPLOY_LINES], ['install.sh', INSTALL_LINES]] as const) {
-    const reassign = lines.filter((candidate) => isCode(candidate) && /^\s*DB_FENCE_(RECOVERY_DIR|SCRIPT_COPY|IDENTITY_FILE|PROTECTED_APP_DIR|SCRIPT_STAGED|MODULES_LINK)=/.test(candidate))
+    const reassign = lines.filter(
+      (candidate) =>
+        isCode(candidate) &&
+        /^\s*DB_FENCE_(RECOVERY_DIR|SCRIPT_COPY|IDENTITY_FILE|PROTECTED_APP_DIR|STAGED_APP_DIR|RETIRED_APP_DIR|ARTEFACT_FILE|MANIFEST_FILE|VENDOR_ROOTS)=/.test(candidate),
+    )
     assert.deepEqual(reassign, [], `${label} must not redefine the protected-helper paths the library owns`)
   }
-  // AND THE PROTECTED COPY IS LAID OUT LIKE THE APPLICATION IT CAME FROM. `pg` and `dotenv` are
-  // resolved by walking up from the importing module's own directory, so a copy published as a
-  // bare file under /etc resolves node_modules from /etc and / and dies with
-  // ERR_MODULE_NOT_FOUND before it can fence anything — which is what r30 published.
+  // AND THE PROTECTED COPY IS LAID OUT LIKE THE APPLICATION IT CAME FROM. `pg` is resolved by
+  // walking up from the importing module's own directory, so a copy published as a bare file
+  // under /etc resolves node_modules from /etc and / and dies with ERR_MODULE_NOT_FOUND before it
+  // can fence anything — which is what r30 published.
   //
   // MUTATION ROUTE: point DB_FENCE_SCRIPT_COPY back at "${DB_FENCE_RECOVERY_DIR}/fence-db-connections.mjs"
-  // and both assertions below fail.
+  // and the assertion below fails.
   const copyLine = LIBRARY_LINES.find((candidate) => /^DB_FENCE_SCRIPT_COPY=/.test(candidate))
   assert.match(
     copyLine ?? '',
     /^DB_FENCE_SCRIPT_COPY="\$\{DB_FENCE_PROTECTED_APP_DIR\}\/scripts\/fence-db-connections\.mjs"$/,
-    `the protected copy must sit at <root>/scripts/, the layout appDirectory() expects: ${copyLine}`,
+    `the protected copy must sit at <root>/scripts/, the layout node's module walk expects: ${copyLine}`,
+  )
+  // AND ITS IMPORTS ARE COPIED, NOT LINKED (o3d-2sm1.5 r32, Codex CRITICAL). r31 pointed
+  // <mirror>/node_modules at the APPLICATION-OWNED checkout with `ln -sfn`, so `pg` and `dotenv`
+  // — imported at module scope, before main() has a statement to run — were still bytes the
+  // account being defended against chose, in every supposedly protected process. Nothing in the
+  // library may create that link again.
+  //
+  // MUTATION ROUTE: add `ln -sfn "${app_modules}" "${DB_FENCE_PROTECTED_APP_DIR}/node_modules"`
+  // back into _fence_stage_and_publish() and the first assertion fails by name.
+  const libraryCode = LIBRARY_LINES.filter((candidate) => isCode(candidate)).join('\n')
+  assert.ok(
+    !/\bln -s/.test(libraryCode),
+    'the protected artefact may contain no symlink the library creates: a symlink is followed by node and is not covered by the artefact digest',
   )
   assert.match(
-    LIBRARY,
-    /ln -sfn "\$\{app_modules\}" "\$\{DB_FENCE_MODULES_LINK\}"/,
-    'and the protected directory must carry a node_modules hop, or the copy cannot import pg',
+    libraryCode,
+    /cp -R --no-dereference -- "\$\{app_dir\}\/\$\{relative\}" "\$\{staged\}\/\$\{relative\}"/,
+    'the dependency closure must be COPIED into the mirror, at the same relative paths',
+  )
+  // --no-dereference is load-bearing, not tidiness: it copies a symlink AS a symlink so that
+  // _fence_tree_is_sealed() can refuse it by name. Following it would pull the target's bytes in
+  // silently, which is an escape the digest would then bless.
+  assert.match(
+    libraryCode,
+    /find "\$root" \\\( ! -type d -a ! -type f \\\) -print -quit/,
+    'and anything in the published tree that is not a regular file or a directory must be refused',
   )
 
   // AND IT IS CREATED ROOT-OWNED. 0755 rather than the snapshot directory's 0700 because the
@@ -7319,8 +7421,8 @@ for (const entry of FENCE_HARNESS) {
     //      the admin URL, and the calls log shows SUBSTITUTED.
     const dir = mkdtempSync(join(tmpdir(), 'ims-r31-swap-'))
     try {
-      writeFileSync(join(dir, 'fence.mjs'), shippedHelper(dir))
-      const shipped = readFileSync(join(dir, 'fence.mjs'), 'utf8')
+      writeFenceCheckout(dir, shippedHelper(dir))
+      const shipped = readFileSync(checkoutHelper(dir), 'utf8')
       const run = (): { status: number; output: string } => {
         const program = [
           'set -euo pipefail',
@@ -7344,7 +7446,7 @@ for (const entry of FENCE_HARNESS) {
       assert.match(readFileSync(join(dir, 'calls.log'), 'utf8'), /^SHIPPED .*--fence/m, 'and the fence really ran')
 
       // PHASE 2 — the substitution, after the publication, which is the interval r30 left open.
-      writeFileSync(join(dir, 'fence.mjs'), substitutedHelper(dir))
+      writeFileSync(checkoutHelper(dir), substitutedHelper(dir))
       const second = run()
 
       assert.ok(
@@ -7391,12 +7493,7 @@ function rotationHarness(dirs: { app: string; recovery: string; state: string },
     'exec 2>&1',
     `source ${JSON.stringify(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'))}`,
     `DB_FENCE_SCRIPT=${JSON.stringify(join(dirs.app, 'scripts', 'fence-db-connections.mjs'))}`,
-    `DB_FENCE_RECOVERY_DIR=${JSON.stringify(dirs.recovery)}`,
-    `DB_FENCE_IDENTITY_FILE=${JSON.stringify(join(dirs.recovery, 'db-fence-identity.env'))}`,
-    `DB_FENCE_PROTECTED_APP_DIR=${JSON.stringify(join(dirs.recovery, 'app'))}`,
-    `DB_FENCE_SCRIPT_COPY=${JSON.stringify(join(dirs.recovery, 'app', 'scripts', 'fence-db-connections.mjs'))}`,
-    `DB_FENCE_SCRIPT_STAGED=${JSON.stringify(join(dirs.recovery, 'app', 'scripts', '.fence-db-connections.mjs.staged'))}`,
-    `DB_FENCE_MODULES_LINK=${JSON.stringify(join(dirs.recovery, 'app', 'node_modules'))}`,
+    ...protectedLibraryLinesAt(dirs.recovery),
     `DB_FENCE_STATE=${JSON.stringify(join(dirs.state, 'db-connect-fence.json'))}`,
     'chown(){ :; }',
     ...body,
@@ -7406,6 +7503,7 @@ function rotationHarness(dirs: { app: string; recovery: string; state: string },
 function rotationDirs(): { app: string; recovery: string; state: string } {
   const root = mkdtempSync(join(tmpdir(), 'ims-r31-rot-'))
   mkdirSync(join(root, 'app', 'scripts'), { recursive: true })
+  writeCheckoutPg(join(root, 'app'))
   mkdirSync(join(root, 'recovery'), { recursive: true })
   mkdirSync(join(root, 'state'), { recursive: true })
   return { app: join(root, 'app'), recovery: join(root, 'recovery'), state: join(root, 'state') }

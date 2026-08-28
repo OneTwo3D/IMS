@@ -833,6 +833,13 @@ db_fence_publish_operator_wrappers() {
     identity+=" $(printf '%q' "${arg}")"
   done
 
+  # LOWERCASE NAMES INSIDE THE GENERATED SCRIPT, deliberately. The wrapper body below is a
+  # QUOTED heredoc — bash writes it out, it does not expand it — but the repository's `set -u`
+  # guards scan this library line by line for `${NAME}` in capitals and cannot tell a written
+  # name from an expanded one. Capitals here would make those guards report names that nothing
+  # in this shell ever reads, and a guard that reports false names is a guard that gets switched
+  # off. The one capitalised name in the wrapper is DEPLOY_ADMIN_DATABASE_URL, which is a real
+  # environment variable in both scripts.
   local mode
   for mode in release fence; do
     local target="${DB_FENCE_RELEASE_WRAPPER}"
@@ -843,31 +850,31 @@ db_fence_publish_operator_wrappers() {
       printf '# self-contained: it reads nothing out of the application checkout except the\n'
       printf '# credential in %s, which is where the deploy reads it from too.\n' "${env_file}"
       printf 'set -uo pipefail\n'
-      printf 'APP_DIR_ENV=%q\n' "${env_file}"
-      printf 'APP_USER=%q\n' "${app_user}"
-      printf 'PROTECTED_DIR=%q\n' "${DB_FENCE_PROTECTED_APP_DIR}"
-      printf 'HELPER=%q\n' "${DB_FENCE_SCRIPT_COPY}"
-      printf 'STATE_FILE=%q\n' "${state_file}"
-      printf 'EXPECTED_ARTEFACT=%q\n' "${artefact_digest}"
-      printf 'MODE=%q\n' "${mode}"
+      printf 'app_env_file=%q\n' "${env_file}"
+      printf 'app_account=%q\n' "${app_user}"
+      printf 'protected_dir=%q\n' "${DB_FENCE_PROTECTED_APP_DIR}"
+      printf 'helper=%q\n' "${DB_FENCE_SCRIPT_COPY}"
+      printf 'state_file=%q\n' "${state_file}"
+      printf 'expected_artefact=%q\n' "${artefact_digest}"
+      printf 'mode=%q\n' "${mode}"
       cat <<'WRAPPER_EOF'
-if [[ $EUID -ne 0 ]]; then
-  echo "Run this as root: it runs the protected fence helper as ${APP_USER}." >&2
+if [[ "$(id -u)" -ne 0 ]]; then
+  echo "Run this as root: it runs the protected fence helper as ${app_account}." >&2
   exit 1
 fi
 # The tree this is about to execute must still be the tree this wrapper was written for.
-actual="$(cd "${PROTECTED_DIR}" 2>/dev/null && find . -type f -printf '%P\0' | LC_ALL=C sort -z | xargs -0 -r sha256sum -- | sha256sum)"
+actual="$(cd "${protected_dir}" 2>/dev/null && find . -type f -printf '%P\0' | LC_ALL=C sort -z | xargs -0 -r sha256sum -- | sha256sum)"
 actual="${actual%% *}"
-if [[ "${actual}" != "${EXPECTED_ARTEFACT}" ]]; then
-  echo "REFUSING: ${PROTECTED_DIR} hashes to ${actual:-nothing} but this wrapper was written for ${EXPECTED_ARTEFACT}." >&2
+if [[ "${actual}" != "${expected_artefact}" ]]; then
+  echo "REFUSING: ${protected_dir} hashes to ${actual:-nothing} but this wrapper was written for ${expected_artefact}." >&2
   echo "The protected fence artefact has changed since the fence was raised. Do not run it." >&2
   exit 1
 fi
-if [[ -z "${DEPLOY_ADMIN_DATABASE_URL:-}" ]] && [[ -f "${APP_DIR_ENV}" ]]; then
+if [[ -z "${DEPLOY_ADMIN_DATABASE_URL:-}" ]] && [[ -f "${app_env_file}" ]]; then
   # The same one-key reader the entrypoints use: a quoted value ends at its closing quote, an
   # unquoted one at the first whitespace-preceded '#', and later definitions win. `source` is not
   # used, because that executes whatever is in the file.
-  line="$(grep -E '^[[:space:]]*(export[[:space:]]+)?DEPLOY_ADMIN_DATABASE_URL[[:space:]]*=' "${APP_DIR_ENV}" 2>/dev/null | tail -1 || true)"
+  line="$(grep -E '^[[:space:]]*(export[[:space:]]+)?DEPLOY_ADMIN_DATABASE_URL[[:space:]]*=' "${app_env_file}" 2>/dev/null | tail -1 || true)"
   if [[ -n "${line}" ]]; then
     value="${line#*=}"
     value="${value#"${value%%[![:space:]]*}"}"
@@ -880,8 +887,8 @@ if [[ -z "${DEPLOY_ADMIN_DATABASE_URL:-}" ]] && [[ -f "${APP_DIR_ENV}" ]]; then
   fi
 fi
 if [[ -z "${DEPLOY_ADMIN_DATABASE_URL:-}" ]]; then
-  echo "DEPLOY_ADMIN_DATABASE_URL is not set and ${APP_DIR_ENV} does not define it, so there is no" >&2
-  echo "privileged connection to ${MODE} with. Re-run supplying it:" >&2
+  echo "DEPLOY_ADMIN_DATABASE_URL is not set and ${app_env_file} does not define it, so there is" >&2
+  echo "no privileged connection to ${mode} with. Re-run supplying it:" >&2
   echo "" >&2
   echo "  DEPLOY_ADMIN_DATABASE_URL='postgresql://ADMIN:PASSWORD@HOST:PORT/DATABASE' $0" >&2
   echo "" >&2
@@ -889,11 +896,11 @@ if [[ -z "${DEPLOY_ADMIN_DATABASE_URL:-}" ]]; then
   echo "fence revoked CONNECT from; see docs/installation.md." >&2
   exit 1
 fi
-run() {
-  if [[ "$(id -un)" == "${APP_USER}" ]]; then env "$@"; else runuser -u "${APP_USER}" -- env "$@"; fi
+run_helper() {
+  if [[ "$(id -un)" == "${app_account}" ]]; then env "$@"; else runuser -u "${app_account}" -- env "$@"; fi
 }
 WRAPPER_EOF
-      printf 'run DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" node "${HELPER}" --%s --state-file="${STATE_FILE}"%s\n' \
+      printf 'run_helper DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" node "${helper}" --%s --state-file="${state_file}"%s\n' \
         "${mode}" "${identity}"
     } | _fence_publish_file "${target}" 700 || return 1
     chown root:root "${target}" 2>/dev/null || true

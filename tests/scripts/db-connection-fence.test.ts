@@ -46,7 +46,6 @@ function withPgEnv(values: Record<string, string>): () => void {
 
 import {
   REQUIRED_IDENTITY_OPTIONS,
-  appDirectory,
   parseArgs,
   requireSuppliedIdentity,
   EXIT_ERROR,
@@ -80,6 +79,23 @@ import {
   quoteIdent,
   verifyRelease,
 } from '@/scripts/fence-db-connections.mjs'
+import { protectedLibraryLines, writeFenceCheckout } from './fence-artefact-harness.ts'
+
+/**
+ * resolve_fence_script(), lifted verbatim out of a shipped entrypoint (o3d-2sm1.5 r32).
+ *
+ * It is the one place each entrypoint decides which bytes the fence runs, and it is what
+ * refence_db_connections() calls. A harness that stubbed it would assert nothing about the
+ * resolution the finding was about, and one that lifted db_fence_script_in_use() instead would
+ * keep passing if the entrypoint stopped calling it.
+ */
+function liftedResolver(source: string): string {
+  const start = source.indexOf('resolve_fence_script() {')
+  assert.ok(start > 0, 'precondition: the entrypoint resolves through a function of its own')
+  const end = source.indexOf('\n}\n', start)
+  assert.ok(end > start, 'precondition: and that function has an end')
+  return source.slice(start, end + 3)
+}
 
 /**
  * The live half of the ROLE identity check, as every pre-existing case has it: the connection
@@ -2330,7 +2346,7 @@ test('o3d-2sm1.5 r19: the strict reader in the entrypoints accepts only a URL st
   }
 })
 
-test('o3d-2sm1.5 r19: the four options are parsed, and the one file still read is resolved from the SCRIPT', () => {
+test('o3d-2sm1.5 r19/r32: the four options are parsed, and no file is read from the application directory', () => {
   // TWO THINGS THE PRINTED --release COMMAND DEPENDS ON, and it is the one command an operator is
   // offered for taking a committed fence back down.
   //
@@ -2346,26 +2362,42 @@ test('o3d-2sm1.5 r19: the four options are parsed, and the one file still read i
   assert.equal(withUnit.serviceUnits, undefined, 'no unit is interrogated any more')
   assert.equal(withUnit.systemctlPath, undefined, 'and no systemctl path is taken')
 
-  // 2. THE .env IT READS IS THE APP DIRECTORY'S, resolved from this file's own location — because
-  //    the printed command is a bare absolute `node /opt/.../fence-db-connections.mjs --release
-  //    ...` and an operator runs it from wherever they are standing (Codex r17 HIGH). A relative
-  //    path loaded nothing there, so the one command offered for taking a fence down could not
-  //    obtain the admin connection that takes it down.
-  //    MUTATION ROUTE: put the relative path back in main(). The run below then picks up the
-  //    DECOY .env sitting in its working directory and reports a privileged connection it does
-  //    not have, so `DEPLOY_ADMIN_DATABASE_URL is not set` stops appearing.
-  assert.equal(appDirectory(), process.cwd(), 'precondition: the helper derives the app dir from its own path')
+  // 2. IT READS NO FILE AT ALL, FROM ANY DIRECTORY (o3d-2sm1.5 r32, Codex CRITICAL).
+  //
+  //    r17 made the `.env` load absolute against this file's own location, because the printed
+  //    `--release` command is a bare `node /opt/.../fence-db-connections.mjs --release ...` and an
+  //    operator runs it from wherever they are standing. r32 removed the load outright: the file
+  //    this actually executes from is the ROOT-OWNED MIRROR, whose directory holds no `.env`, so
+  //    the load supplied nothing on the only path that runs while `dotenv` stayed in the import
+  //    graph — executed with DEPLOY_ADMIN_DATABASE_URL, at module scope, out of an
+  //    application-owned node_modules. The credential now arrives in the environment, put there
+  //    by the entrypoints or by the generated recovery wrapper.
+  //
+  //    MUTATION ROUTE: add `import { config } from 'dotenv'` and a `config({ path: ... })` call
+  //    back into the helper. The first two assertions fail by name, and the decoy run below picks
+  //    up the `.env` in its working directory, so `DEPLOY_ADMIN_DATABASE_URL is not set` stops
+  //    appearing and `decoy` starts appearing.
   const helper = readFileSync(join(process.cwd(), 'scripts/fence-db-connections.mjs'), 'utf8')
-  const loads = helper.split('\n').filter((line) => /^\s*loadDotenv\(/.test(line))
+  const imports = helper
+    .split('\n')
+    .filter((line) => /^import .* from '[^']+'$/.test(line))
+    .map((line) => /from '([^']+)'$/.exec(line)![1])
   assert.deepEqual(
-    loads.map((line) => line.trim()),
-    ["loadDotenv({ path: resolvePath(appDir, '.env'), override: false, quiet: true })"],
-    'exactly one file is loaded, and it is the one systemd gives the service — .env.local is not loaded at all',
+    imports.filter((specifier) => !specifier.startsWith('node:')),
+    ['pg'],
+    'the fence helper may import exactly one package, because every import is executed with the admin credential and has to be vendored into the protected artefact',
   )
-  assert.equal(
-    readFileSync(join(process.cwd(), '.env'), 'utf8').includes('DEPLOY_ADMIN_DATABASE_URL'),
-    false,
-    'precondition: the app directory\'s own .env sets no admin URL, so the decoy is the only source of one',
+  assert.doesNotMatch(helper, /loadDotenv|from 'dotenv'/, 'and dotenv is not one of them')
+
+  // AND THE ONE PACKAGE IT DOES IMPORT IS THE ONE THE LIBRARY VENDORS. A dependency added here
+  // and not there resolves to nothing inside the mirror, which is a fence that dies at exec.
+  const library = readFileSync(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'), 'utf8')
+  const roots = /^DB_FENCE_VENDOR_ROOTS=\(([^)]*)\)$/m.exec(library)
+  assert.ok(roots, 'the library must name what it vendors')
+  assert.deepEqual(
+    roots[1].split(/\s+/).filter(Boolean),
+    imports.filter((specifier) => !specifier.startsWith('node:')),
+    'DB_FENCE_VENDOR_ROOTS must be exactly the helper\'s bare imports',
   )
 
   const cwd = mkdtempSync(join(tmpdir(), 'ims-decoy-'))
@@ -3217,8 +3249,12 @@ test('o3d-2sm1.5 r23: the trap re-fences the database it migrated even when the 
     // A REAL FILE, because the shipped function refuses when the fence script is missing — and a
     // test whose every call refused there would prove nothing about the guard under test.
     const fenceDir = mkdtempSync(join(tmpdir(), 'ims-refence-'))
-    const fenceScript = join(fenceDir, 'fence-db-connections.mjs')
-    writeFileSync(fenceScript, '')
+    // A CHECKOUT, not a bare file (o3d-2sm1.5 r32): resolving the fence script now VENDORS the
+    // helper's dependency closure into the protected mirror, so the harness has to give it the
+    // shipped layout to vendor from — `<app>/scripts/fence-db-connections.mjs` beside
+    // `<app>/node_modules`. A run with no `pg` to resolve refuses to publish, and every assertion
+    // below would then pass or fail for that reason instead of the one under test.
+    const fenceScript = writeFenceCheckout(fenceDir, '')
 
     function refence(schemaTouched: boolean, raised: boolean, soleOk: boolean): string {
       const bash = [
@@ -3235,12 +3271,16 @@ test('o3d-2sm1.5 r23: the trap re-fences the database it migrated even when the 
         // too and then points its literals at the harness directory. Lifting the functions one by
         // one would keep passing if an entrypoint stopped calling them, which is the finding.
         `source ${JSON.stringify(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'))}`,
-        `DB_FENCE_RECOVERY_DIR=${JSON.stringify(fenceDir)}`,
-        `DB_FENCE_PROTECTED_APP_DIR=${JSON.stringify(join(fenceDir, 'protected'))}`,
-        `DB_FENCE_SCRIPT_COPY=${JSON.stringify(join(fenceDir, 'protected', 'scripts', 'fence-db-connections.mjs'))}`,
-        `DB_FENCE_SCRIPT_STAGED=${JSON.stringify(join(fenceDir, 'protected', 'scripts', '.staged'))}`,
-        `DB_FENCE_MODULES_LINK=${JSON.stringify(join(fenceDir, 'protected', 'node_modules'))}`,
-        `DB_FENCE_IDENTITY_FILE=${JSON.stringify(join(fenceDir, 'db-fence-identity.env'))}`,
+        ...protectedLibraryLines(fenceDir),
+        // resolve_fence_script() is what both entrypoints now call: it resolves the artefact AND
+        // refreshes the root-owned recovery wrappers, so that the file executed and the file an
+        // operator is pointed at can never be about different artefacts. Lifted rather than
+        // stubbed, because "which script does the trap run" is the claim.
+        liftedResolver(source),
+        `DB_FENCE_RELEASE_WRAPPER=${JSON.stringify(join(fenceDir, 'recovery', 'release-db-fence'))}`,
+        `DB_FENCE_REFENCE_WRAPPER=${JSON.stringify(join(fenceDir, 'recovery', 'refence-db'))}`,
+        `APP_DIR=${JSON.stringify(join(fenceDir, 'app'))}`,
+        `APP_DIR_REAL=${JSON.stringify(join(fenceDir, 'app'))}`,
         'DEPLOY_ADMIN_DATABASE_URL="postgresql://admin@127.0.0.1:5432/main"',
         'DATABASE_URL="postgresql://app:pw@127.0.0.1:5432/main"',
         'APP_USER="app"',
