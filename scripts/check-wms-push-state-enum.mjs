@@ -24,6 +24,7 @@ import { config as loadDotenv } from 'dotenv'
 import { establishStartupOptionByteSafety, nonAsciiStartupOptionCharacters } from '../lib/db/database-url-schema.mjs'
 import {
   pgConnectionConfig,
+  pinClientToMeasuredBackend,
   WMS_PUSH_STATE_COLUMN,
   WMS_PUSH_STATE_ENUM_LABELS_SQL,
   WMS_PUSH_STATE_TABLE,
@@ -62,10 +63,13 @@ const { Client } = await import('pg')
 // The spread comes FIRST and carries the connection string with it: `pg` parses
 // `connectionString` after the surrounding config, so an `options=` left inside the URL would
 // overwrite the search path composed beside it (o3d-2k5r r10).
-const client = new Client({
+// `pinClientToMeasuredBackend` wraps `connect()` so this gate cannot read its catalogue from a
+// backend the deployment probe above is not about (o3d-2k5r r22). It is a no-op for an ASCII pin.
+const clientConfig = {
   ...pgConnectionConfig(databaseUrl),
   connectionTimeoutMillis: 10_000,
-})
+}
+const client = pinClientToMeasuredBackend(new Client(clientConfig), clientConfig)
 
 let labels
 try {

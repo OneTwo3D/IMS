@@ -7,7 +7,7 @@ import bcrypt from 'bcryptjs'
 import nodemailer from 'nodemailer'
 import pg from 'pg'
 
-import { pgConnectionConfig } from '../lib/db/database-url-schema.mjs'
+import { pgConnectionConfig, pinClientToMeasuredBackend } from '../lib/db/database-url-schema.mjs'
 
 const { Client } = pg
 
@@ -40,7 +40,12 @@ const { Client } = pg
  * @returns {import('pg').Client}
  */
 export function provisioningClient(databaseUrl) {
-  return new Client({ ...pgConnectionConfig(databaseUrl) })
+  // `pinClientToMeasuredBackend` wraps `connect()` so a seeder cannot write into a schema resolved
+  // by a backend the deployment probe is not about (o3d-2k5r r22). It is a no-op for an ASCII pin,
+  // and it is applied HERE rather than at the caller so the one place that builds this client is
+  // also the one place that guards it.
+  const config = pgConnectionConfig(databaseUrl)
+  return pinClientToMeasuredBackend(new Client({ ...config }), config)
 }
 
 function getEnv(name, { required = false, fallback = '' } = {}) {

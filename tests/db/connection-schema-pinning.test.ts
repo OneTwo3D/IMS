@@ -11,6 +11,7 @@ import {
   establishStartupOptionByteSafety,
   nonAsciiStartupOptionCharacters,
   pgConnectionConfig,
+  pinClientToMeasuredBackend,
   prismaAdapterSchemaOptions,
   resetStartupOptionByteSafety,
   resolveDatabaseUrlSchema,
@@ -987,11 +988,13 @@ test('o3d-2k5r r12: every install-path writer builds its client through the shar
         '../../scripts/check-stock-quantity-constraints.mjs',
         '../../prisma/seed.ts',
         '../../scripts/check-wms-push-state-enum.mjs',
+        '../../lib/ops/production-preflight.ts',
       ].map(async (relative) => [relative, await readFile(new URL(relative, import.meta.url), 'utf8')] as const),
     ),
   )
 
-  assert.match(sources['../../scripts/provision-instance.mjs'], /\.\.\.pgConnectionConfig\(databaseUrl\)/)
+  assert.match(sources['../../scripts/provision-instance.mjs'], /const config = pgConnectionConfig\(databaseUrl\)/)
+  assert.match(sources['../../scripts/provision-instance.mjs'], /new Client\(\{ \.\.\.config \}\)/)
   assert.match(
     sources['../../scripts/provision-instance.mjs'],
     /const db = provisioningClient\(databaseUrl\)/,
@@ -999,6 +1002,27 @@ test('o3d-2k5r r12: every install-path writer builds its client through the shar
   )
   assert.match(sources['../../scripts/check-stock-quantity-constraints.mjs'], /\.\.\.pgConnectionConfig\(databaseUrl\)/)
   assert.match(sources['../../scripts/check-wms-push-state-enum.mjs'], /\.\.\.pgConnectionConfig\(databaseUrl\)/)
+
+  // AND EVERY RAW `pg.Client` PATH IS GUARDED (o3d-2k5r r22). A Pool gets the per-connection check
+  // for free — `pgConnectionConfig()` returns it as `onConnect` and pg-pool awaits it — but
+  // `pg.Client` has no such hook, and these three gates use one. A gate that reads its catalogue,
+  // or a seeder that writes its rows, through a backend the deployment probe is not about is the
+  // same finding wearing a different hat.
+  //
+  // MUTATION: drop `pinClientToMeasuredBackend` from any one of the three and the assertion fails
+  // by name. The behavioural half is the live provisioningClient test further down; this is the
+  // SWEEP, so a fourth gate added later cannot quietly skip it.
+  for (const relative of [
+    '../../scripts/provision-instance.mjs',
+    '../../scripts/check-wms-push-state-enum.mjs',
+    '../../lib/ops/production-preflight.ts',
+  ]) {
+    assert.match(
+      sources[relative]!,
+      /pinClientToMeasuredBackend\(new Client\(/,
+      `${relative} builds its raw client through the per-connection backend guard`,
+    )
+  }
 
   // The seeder needs BOTH halves and they are not the same thing: the pool's search path decides
   // where raw statements resolve, the adapter's `schema` decides what Prisma QUALIFIES generated
@@ -2272,6 +2296,130 @@ test('o3d-2k5r r22 (live): the REAL pool admits the measured backend and refuses
   } finally {
     resetStartupOptionByteSafety()
     for (const pool of pools) await pool.end().catch(() => undefined)
+    await scratch.drop()
+  }
+})
+
+test('o3d-2k5r r22: a raw pg.Client is guarded through connect(), and ended when it is refused', async () => {
+  resetStartupOptionByteSafety()
+  try {
+    await establishStartupOptionByteSafety(R22_URL, { createClient: fanOutClient([ONE_BACKEND]) })
+    const config = pgConnectionConfig(R22_URL)
+
+    /** A `pg.Client` stand-in: one backend's answers, and a record of whether it was ended. */
+    const rawClient = (backend: Record<string, unknown>, searchPath: string) => {
+      const state = { connected: false, ended: false }
+      const client = {
+        state,
+        async connect() {
+          state.connected = true
+          return undefined
+        },
+        async end() {
+          state.ended = true
+          return undefined
+        },
+        async query() {
+          return { rows: [{ ...backend, search_path: searchPath }] }
+        },
+      }
+      return client
+    }
+
+    // THE MEASURED BACKEND: connect() resolves and the client is left open for its caller.
+    const good = pinClientToMeasuredBackend(rawClient(ONE_BACKEND, '"ténant"'), config)
+    await good.connect()
+    assert.equal(good.state.connected, true)
+    assert.equal(good.state.ended, false, 'a client that passed the check is not ended under its caller')
+
+    // ANOTHER BACKEND BEHIND THE SAME ENDPOINT: connect() rejects, and the socket is not left behind.
+    //
+    // MUTATION ROUTE: return `client` unchanged from pinClientToMeasuredBackend() (which is what
+    // shipping only the Pool hook would leave behind). The three out-of-process gates then read
+    // their catalogue — and the seeder writes its rows — through an unmeasured backend, which is
+    // the o3d-1izw split arriving through the gates that exist to prevent it.
+    const bad = pinClientToMeasuredBackend(rawClient({ ...ONE_BACKEND, backend_address: '10.0.0.12' }, '"ténant"'), config)
+    await assert.rejects(
+      () => bad.connect(),
+      (error: unknown) => {
+        assert.ok(error instanceof DatabaseUrlSchemaConflictError)
+        assert.match((error as Error).message, /10\.0\.0\.12/)
+        return true
+      },
+    )
+    assert.equal(bad.state.ended, true, 'and the refused client is ended rather than left dangling')
+
+    // THE CALLBACK FORM IS REFUSED RATHER THAN HALF-GUARDED.
+    const callbackForm = pinClientToMeasuredBackend(rawClient(ONE_BACKEND, '"ténant"'), config)
+    await assert.rejects(
+      () => (callbackForm.connect as (cb: unknown) => Promise<unknown>)(() => undefined),
+      /connect\(callback\) is not supported/,
+    )
+
+    // AND AN ASCII DEPLOYMENT IS NOT WRAPPED AT ALL — no guard, so nothing to wrap.
+    //
+    // MUTATION ROUTE: drop the `if (!guard) return client` early return. Every ASCII client then
+    // carries a wrapper that refuses everything, because no ASCII deployment ever probes.
+    const asciiConfig = pgConnectionConfig('postgresql://app:pw@db.internal:5432/ims?schema=tenant_a')
+    const plain = rawClient(ONE_BACKEND, '"tenant_a"')
+    const before = plain.connect
+    assert.equal(pinClientToMeasuredBackend(plain, asciiConfig).connect, before, 'the ASCII client is handed back untouched')
+  } finally {
+    resetStartupOptionByteSafety()
+  }
+})
+
+test('o3d-2k5r r22 (live): the provisioning seeder refuses a backend the verdict is not about', async (t) => {
+  const scratch = await openScratch(t)
+  if (!scratch) return
+  resetStartupOptionByteSafety()
+  try {
+    const schema = 'ten\u00A0ant' // U+00A0, written as an escape, as in the r19 live test
+    await scratch.admin.query(`CREATE SCHEMA ${'"' + schema + '"'}`)
+    const url = `${scratch.url}?schema=${encodeURIComponent(schema)}`
+
+    const verdict = await establishStartupOptionByteSafety(url)
+    if (!verdict.carries) {
+      t.skip('this server does not carry the byte, so there is no permission to hold to a backend')
+      return
+    }
+
+    // 1. THE MEASURED BACKEND: the seeder's own client connects and lands on the pinned schema.
+    const admitted = provisioningClient(url)
+    try {
+      await admitted.connect()
+      assert.equal(
+        (await admitted.query<{ s: string }>('select current_schema() as s')).rows[0]?.s,
+        schema,
+        'the seeder is on the schema the URL named',
+      )
+    } finally {
+      await admitted.end().catch(() => undefined)
+    }
+
+    // 2. THE ENDPOINT NOW HANDS OUT ANOTHER BACKEND. Same server on the wire; the verdict is about
+    // a different one. The seeder must not write a row through it.
+    //
+    // MUTATION ROUTE: drop `pinClientToMeasuredBackend` from provisioningClient(). This connect()
+    // resolves, and the installer seeds an admin, an SMTP password and a WooCommerce secret into a
+    // schema resolved by a server nothing measured.
+    await establishStartupOptionByteSafety(url, { createClient: fanOutClient([ONE_BACKEND]) })
+    const refused = provisioningClient(url)
+    try {
+      await assert.rejects(
+        () => refused.connect(),
+        (error: unknown) => {
+          assert.ok(error instanceof DatabaseUrlSchemaConflictError)
+          assert.match((error as Error).message, /10\.0\.0\.11:5432/)
+          return true
+        },
+        'the real seeder client refuses a backend the verdict is not about',
+      )
+    } finally {
+      await refused.end().catch(() => undefined)
+    }
+  } finally {
+    resetStartupOptionByteSafety()
     await scratch.drop()
   }
 })

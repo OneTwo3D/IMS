@@ -45,6 +45,7 @@
  */
 export {
   pgConnectionConfig,
+  pinClientToMeasuredBackend,
   WMS_PUSH_STATE_COLUMN,
   WMS_PUSH_STATE_ENUM_LABELS_SQL,
   WMS_PUSH_STATE_TABLE,
