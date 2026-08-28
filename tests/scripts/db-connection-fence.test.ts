@@ -5,6 +5,12 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 
+/**
+ * The parser `pg` requires, asked DIRECTLY. Imported here rather than re-exported from the script
+ * under test, so a parity assertion against it is a real comparison and not a tautology.
+ */
+import { parse as driverParse } from 'pg-connection-string'
+
 import {
   EXIT_ERROR,
   EXIT_FENCE_STANDING,
@@ -1623,6 +1629,138 @@ test('a failure BEFORE the COMMIT is issued still rolls back and still reports a
     )
     assert.ok(client.log.includes('ROLLBACK'), 'and the transaction it opened is rolled back')
     assert.ok(!client.log.includes('COMMIT'), 'precondition: nothing was ever told to commit')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// o3d-2sm1.5 (Codex r15) — A REPEATED PARAMETER REDIRECTS THE DRIVER.
+//
+//   CRITICAL  the identity proof read the query with URLSearchParams.get(), which returns the
+//             FIRST value. pg-connection-string iterates every entry into ONE config object, so
+//             the LAST duplicate wins. `?host=local&host=remote` was proven here as `local` and
+//             connected to `remote`.
+//
+// These tests ask the INSTALLED PARSER what it does rather than restating what it is believed to
+// do — both r14 and r15 exist because a hand-rolled copy of libpq's rules disagreed with libpq.
+// ---------------------------------------------------------------------------
+
+test('a repeated identity parameter is refused, because the driver keeps the LAST and every reader sees the first', () => {
+  // THE FINDING'S OWN URL. Its authority, its path AND its first query values all say
+  // localhost:5432/onetwo3d_ims as `imsapp` — the admin URL's address exactly.
+  const twoOfEverything =
+    'postgres://imsapp@localhost:5432/onetwo3d_ims?host=localhost&host=remote.example&port=5432&port=6432&user=imsapp&user=other'
+
+  // PRECONDITION, ASSERTED AGAINST THE INSTALLED PARSER RATHER THAN DESCRIBED: the driver really
+  // does take the last of each, and a reader taking them one at a time really does see the first.
+  // If pg ever changes this, this assertion fails and the refusal below is re-argued from fact.
+  const effective = driverParse(twoOfEverything)
+  assert.equal(effective.host, 'remote.example', 'precondition: pg-connection-string keeps the LAST host')
+  assert.equal(effective.port, '6432', 'precondition: and the last port')
+  assert.equal(effective.user, 'other', 'precondition: and the last user')
+  const read = new URL(twoOfEverything).searchParams
+  assert.equal(read.get('host'), 'localhost', 'precondition: and .get() — what this file used to use — returns the FIRST')
+
+  // MUTATION ROUTE: delete the IDENTITY_PARAMS getAll() loop from parseConnectionIdentity(). The
+  // authority/query conflict loop cannot catch this — its .get('host') is 'localhost', which is
+  // what the authority says — so the URL resolves ok, to the driver's remote.example:6432/other.
+  const identity = parseConnectionIdentity(twoOfEverything)
+  assert.equal(identity.ok, false, 'a URL naming two hosts is not a URL whose host is known')
+  assert.match(identity.reason, /\?host= 2 times/)
+  assert.match(identity.reason, /"localhost", "remote\.example"/, 'and it names both, so the operator can delete one')
+
+  // Each identity parameter on its own, including the two that name the database. `?dbname=` is
+  // ignored by the driver, but a URL carrying two of them is still a URL that disagrees with
+  // itself about which database it means, and this file refuses those.
+  for (const [name, url] of [
+    ['host', 'postgres://imsapp@localhost:5432/onetwo3d_ims?host=localhost&host=remote.example'],
+    ['port', 'postgres://imsapp@localhost:5432/onetwo3d_ims?port=5432&port=6432'],
+    ['user', 'postgres://imsapp@localhost:5432/onetwo3d_ims?user=imsapp&user=other'],
+    ['dbname', 'postgres://imsapp@localhost:5432/onetwo3d_ims?dbname=onetwo3d_ims&dbname=imsdb'],
+    ['database', 'postgres://imsapp@localhost:5432/onetwo3d_ims?database=onetwo3d_ims&database=imsdb'],
+  ] as const) {
+    const repeated = parseConnectionIdentity(url)
+    assert.equal(repeated.ok, false, `two ?${name}= parameters must be refused`)
+    assert.match(repeated.reason, new RegExp(`\\?${name}= 2 times`))
+  }
+
+  // And the refusal reaches the callers that ask only for a role: no role at all, which every
+  // caller treats as a refusal, rather than the first of two.
+  // MUTATION ROUTE (same loop): this returns 'imsapp' — the decoration — while pg logs in as
+  // 'other', so the fence revokes CONNECT from a role that is not the one connecting.
+  assert.equal(parseRoleFromConnectionString(twoOfEverything), '')
+
+  // THE CONTROL ON THE CONTROL: a parameter that appears once is not a repetition, and the
+  // ordinary URLs this script sees every deploy still resolve.
+  assert.equal(parseConnectionIdentity('postgres://imsapp@localhost:5432/onetwo3d_ims').ok, true)
+  assert.equal(parseConnectionIdentity('postgres://imsapp@localhost:5432/onetwo3d_ims?sslmode=disable&application_name=x').ok, true)
+})
+
+test('the effective host, port, user and database are the installed parser\'s answers, not a copy of its rules', () => {
+  // Every field is read out of pg-connection-string, so this compares the script against the
+  // module rather than against a belief about it. The two known divergences of a hand-rolled
+  // parse are in here: the query/authority precedence (r14) and the database path, which the
+  // driver decodes with decodeURI — NOT decodeURIComponent, so `%2F` survives.
+  //
+  // MUTATION ROUTE: put any one field back on its hand-rolled expression. Restoring
+  // `decodeOrRaw(url.pathname.replace(/^\//, ''))` for the database makes the last case resolve
+  // to 'ims/db' while the driver connects to a database literally named 'ims%2Fdb'; restoring
+  // `url.hostname || params.get('host')` for the host breaks the `@/` case.
+  for (const url of [
+    'postgres://imsapp@localhost:5432/onetwo3d_ims',
+    'postgres://imsapp@localhost/onetwo3d_ims',
+    'postgres://localhost/onetwo3d_ims',
+    'postgres://imsapp@localhost:5432/onetwo3d_ims?host=',
+    'postgres://imsapp@/onetwo3d_ims?host=remote.example&port=6432',
+    'postgres://ims%2Bapp@localhost/onetwo3d_ims',
+    'postgres://imsapp@localhost/ims%2Fdb',
+  ]) {
+    const identity = parseConnectionIdentity(url)
+    assert.equal(identity.ok, true, `${url} is a URL the driver connects with and must not be refused`)
+    const effective = driverParse(url)
+    assert.equal(identity.host, effective.host ?? '', `host of ${url}`)
+    assert.equal(identity.user, effective.user ?? '', `user of ${url}`)
+    assert.equal(identity.database, effective.database ?? '', `database of ${url}`)
+    // The one deliberate departure, and it is an addition rather than a difference: the driver
+    // leaves the port empty when the URL omits it, and this fills in libpq's default so that two
+    // URLs written `:5432` and bare compare equal instead of refusing each other.
+    assert.equal(identity.port, String(effective.port ?? '') || '5432', `port of ${url}`)
+  }
+  // Named, so the parity loop above cannot pass by comparing two identically-wrong answers.
+  assert.equal(parseConnectionIdentity('postgres://imsapp@localhost/ims%2Fdb').database, 'ims%2Fdb')
+  assert.equal(parseConnectionIdentity('postgres://ims%2Bapp@localhost/onetwo3d_ims').user, 'ims+app')
+  assert.equal(parseConnectionIdentity('postgres://imsapp@/onetwo3d_ims?host=remote.example&port=6432').server, 'remote.example:6432')
+})
+
+test('the fence revokes nothing, and commits nothing, when DATABASE_URL names two hosts, two ports and two roles', async () => {
+  // THE WHOLE FINDING, AT THE WIRE, IN THE DIRECTION THAT ACTUALLY FENCES. The duplicates here
+  // resolve — through the driver — to precisely the admin URL's own address and role, so with the
+  // repetition accepted the identity binds and the fence goes ahead: it would revoke CONNECT on
+  // this cluster while the operator reading the URL, and every log line quoting it, says the
+  // application is on remote.example:6432 as `other`. Nobody would look here for the writes.
+  //
+  // MUTATION ROUTE: delete the IDENTITY_PARAMS getAll() loop from parseConnectionIdentity() and
+  // this fence proceeds — client.revokes stops being empty, COMMIT appears in the log, and the
+  // state file is written.
+  const ambiguous = 'postgres://@/imsdb?host=remote.example&host=localhost&port=6432&port=5432&user=other&user=imsapp'
+  const effective = driverParse(ambiguous)
+  assert.equal(effective.host, 'localhost', 'precondition: the driver lands on the admin URL\'s own host')
+  assert.equal(effective.port, '5432', 'precondition: and its port')
+  assert.equal(effective.user, 'imsapp', 'precondition: and the application role, so nothing else would refuse this')
+
+  const dir = stateDir()
+  try {
+    const stateFile = join(dir, 'db-connect-fence.json')
+    const client = new FakeAdminClient({ stateFile })
+    const code = await withRedirectedAppUrl(ambiguous, () =>
+      doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1 }),
+    )
+
+    assert.equal(code, EXIT_NOT_FENCEABLE)
+    assert.deepEqual(client.revokes, [], 'nothing may be revoked for a URL whose destination is not known')
+    assert.ok(!client.log.includes('COMMIT'), 'and no transaction may commit')
+    assert.equal(existsSync(stateFile), false, 'and no record may be published for a fence that never happened')
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
