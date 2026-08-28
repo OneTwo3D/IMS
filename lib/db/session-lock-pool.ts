@@ -161,8 +161,8 @@ export function boundLockAcquisition<C>(
         reject(
           new Error(
             `Acquiring the connection for ${purpose} did not finish within ${deadlineMs}ms, so it was given up on ` +
-              'rather than left pending: an acquisition that hangs is a money post, an accounting batch, a WMS ' +
-              'dispatch sweep or a restore hanging with it. The lock was NOT taken.',
+              'rather than left pending: an acquisition that hangs is whatever was taking the lock hanging with it — ' +
+              'a money post, an accounting batch, a WMS dispatch sweep or a restore among them. The lock was NOT taken.',
           ),
         )
       }, deadlineMs)
