@@ -2606,3 +2606,217 @@ test('o3d-2sm1.5 r20: every fence path asks it, and the installer is still exemp
   assert.ok(!install.includes('env_file_is_sole_database_url_source'), 'install.sh owns the values and asks nothing')
   assert.ok(!install.includes('require_env_file_is_sole_definition'), 'install.sh is not gated on a file it never reads')
 })
+
+/**
+ * The re-read, lifted out of the shipped script and run by bash.
+ *
+ * `env_file_value()` comes with it because it is the reader the re-read uses, and in update.sh it
+ * is new: lifting the pair together means a mutation to either one reaches this test.
+ */
+function liftIdentityRecheck(script: 'deploy.sh' | 'update.sh'): string {
+  const source = readFileSync(join(process.cwd(), `scripts/${script}`), 'utf8')
+  const reader = source.indexOf('env_file_value() {')
+  const recheck = source.indexOf('env_file_identity_unchanged() {')
+  assert.ok(reader > 0 && recheck > reader, `${script}: precondition — the shipped script re-reads the file`)
+  const terminator = '\n  return 0\n}\n'
+  return (
+    source.slice(reader, source.indexOf('\n}\n', reader) + 3) +
+    '\n' +
+    source.slice(recheck, source.indexOf(terminator, recheck) + terminator.length)
+  )
+}
+
+/**
+ * HOW EACH SCRIPT PINS THE IDENTITY, reproduced rather than approximated.
+ *
+ * deploy.sh reads the file with env_file_value(); update.sh `source`s the whole .env in its
+ * preflight and pins from the resulting variable. That difference is the reason update.sh needed
+ * a file reader of its own, so the harness must keep it: pinning both the same way would test a
+ * script neither of them is.
+ */
+const IDENTITY_PIN: Record<'deploy.sh' | 'update.sh', string> = {
+  'deploy.sh': 'resolve_db_identity "$(env_file_value DATABASE_URL "${APP_DIR_REAL}/.env")" || true',
+  'update.sh': 'set -a; source "${APP_DIR}/.env"; set +a\nresolve_db_identity "${DATABASE_URL:-}" || true',
+}
+
+const PINNED_URL = 'postgresql://app:pw@127.0.0.1:5432/main'
+const PINNED_ARGS = '--app-host=127.0.0.1 --app-port=5432 --app-user=app --app-database=main'
+
+test('o3d-2sm1.5 r22: a DATABASE_URL that changes between the pin and the fence is refused', () => {
+  // ROUTE: ${APP_DIR}/.env -> the ONE parse at the top of the script -> DB_FENCE_IDENTITY_ARGS ->
+  // `--fence --app-host=... --app-database=...` -> the database CONNECT is revoked on and the
+  // migration runs against. systemd reads the SAME file again, at `EnvironmentFile=`, when it
+  // execs the service at the end of the window — so the two ends of that route can be different
+  // databases, and nothing compared them.
+  //
+  // MEASURED ON THIS HOST, read-only, before this test was written: ims-stage-dev.service and
+  // ims-e2e-dev.service both answer `EnvironmentFiles` as `a(sb) 1 "<dir>/.env" true`. That
+  // trailing `true` is ignore_errors — `EnvironmentFile=-` — which is why the DELETED case below
+  // is not a loud failure at start time but a silent fallback to the application's own dotenv
+  // overlays, on a database nothing here fenced.
+  //
+  // MUTATION: delete the `now_* != DB_IDENTITY_PINNED_*` comparison from
+  // env_file_identity_unchanged() and every REPLACED case below answers UNCHANGED. Delete the
+  // `-e` arm and DELETED answers UNCHANGED. Delete the `-f || -r` arm and NOT-A-FILE answers
+  // UNCHANGED. Drop the `|| rc=$?` capture and the strict reader's own refusal is swallowed.
+  for (const script of ['deploy.sh', 'update.sh'] as const) {
+    const dir = mkdtempSync(join(tmpdir(), 'ims-identity-recheck-'))
+    try {
+      const bash = [
+        'set -uo pipefail',
+        'APP_DIR_REAL="$1"',
+        'APP_DIR="$1"',
+        'SERVICE_UNIT=""',
+        'DB_IDENTITY_HOST=""; DB_IDENTITY_PORT=""; DB_IDENTITY_USER=""; DB_IDENTITY_DATABASE=""',
+        'DB_IDENTITY_REASON=""; DB_IDENTITY_SOURCE_REASON=""; DB_IDENTITY_DRIFT_REASON=""',
+        'DB_FENCE_IDENTITY_ARGS=()',
+        liftReader(script),
+        liftIdentityRecheck(script),
+        // THE PIN, exactly as the shipped script takes it, and BEFORE the tamper.
+        IDENTITY_PIN[script],
+        'DB_IDENTITY_PINNED_HOST="$DB_IDENTITY_HOST"; DB_IDENTITY_PINNED_PORT="$DB_IDENTITY_PORT"',
+        'DB_IDENTITY_PINNED_USER="$DB_IDENTITY_USER"; DB_IDENTITY_PINNED_DATABASE="$DB_IDENTITY_DATABASE"',
+        'printf "PIN %s\\n" "${DB_FENCE_IDENTITY_ARGS[*]:-}"',
+        // THE WINDOW: the build, the stop and the migration, compressed to whatever $2 does.
+        'eval "$2"',
+        'if env_file_identity_unchanged; then printf "UNCHANGED\\n"; else printf "REFUSE %s\\n" "$DB_IDENTITY_DRIFT_REASON"; fi',
+        // AND WHAT THE RELEASE WOULD BE BUILT FROM AFTERWARDS.
+        'printf "ARGS %s\\n" "${DB_FENCE_IDENTITY_ARGS[*]:-}"',
+      ].join('\n')
+
+      function ask(setup: string, tamper: string): string[] {
+        rmSync(join(dir, '.env'), { force: true, recursive: true })
+        rmSync(join(dir, 'other.env'), { force: true })
+        rmSync(join(dir, 'real.env'), { force: true })
+        // eslint-disable-next-line no-eval -- the setup runs in bash, not here
+        const prepare = spawnSync('bash', ['-c', setup, 'setup', dir], { encoding: 'utf8' })
+        assert.equal(prepare.status, 0, `${script}: fixture setup — ${prepare.stderr}`)
+        const run = spawnSync('bash', ['-c', bash, 'recheck', dir, tamper], { encoding: 'utf8' })
+        assert.equal(run.status, 0, `${script}: ${run.stderr}`)
+        return (run.stdout ?? '').trim().split('\n')
+      }
+
+      const plain = `printf 'DATABASE_URL="${PINNED_URL}"\\n' > "$1/.env"`
+      const viaSymlink = `printf 'DATABASE_URL="${PINNED_URL}"\\n' > "$1/real.env"; ln -sf "$1/real.env" "$1/.env"`
+
+      // NON-VACUITY FIRST. An untouched file must answer UNCHANGED, or every refusal below is
+      // just the check failing at everything and proving nothing about the tamper.
+      const [pin, verdict, args] = ask(plain, ':')
+      assert.equal(pin, `PIN ${PINNED_ARGS}`, `${script}: precondition — the identity was pinned from the file`)
+      assert.equal(verdict, 'UNCHANGED', `${script}: an untouched file is not a refusal`)
+      assert.equal(args, `ARGS ${PINNED_ARGS}`, `${script}: and the fence arguments are intact`)
+
+      for (const [label, setup, tamper, reason] of [
+        [
+          // The case Codex named: replaced ATOMICALLY, so no reader ever sees a partial file and
+          // nothing about the write is detectable except the contents.
+          'replaced atomically with another database',
+          plain,
+          `printf 'DATABASE_URL="postgresql://app:pw@127.0.0.1:5432/other"\\n' > "$1/.env.new"; mv -f "$1/.env.new" "$1/.env"`,
+          /now names app@127\.0\.0\.1:5432\/other, and this run is fencing and migrating app@127\.0\.0\.1:5432\/main/,
+        ],
+        [
+          'replaced atomically with another host',
+          plain,
+          `printf 'DATABASE_URL="postgresql://app:pw@10.0.0.9:5432/main"\\n' > "$1/.env.new"; mv -f "$1/.env.new" "$1/.env"`,
+          /now names app@10\.0\.0\.9:5432\/main/,
+        ],
+        [
+          // EnvironmentFile=- means systemd SKIPS this, and the application's own dotenv overlays
+          // answer instead. Measured on this host: both real units carry the `true`.
+          'deleted, which the unit ignores rather than fails on',
+          plain,
+          `rm -f "$1/.env"`,
+          /no longer exists.*leading '-'.*dotenv overlays/s,
+        ],
+        [
+          'a symlink retargeted at a different file',
+          viaSymlink,
+          `printf 'DATABASE_URL="postgresql://app:pw@127.0.0.1:5432/other"\\n' > "$1/other.env"; ln -sfn "$1/other.env" "$1/.env"`,
+          /now names app@127\.0\.0\.1:5432\/other/,
+        ],
+        [
+          'no longer a regular file',
+          plain,
+          `rm -f "$1/.env"; mkdir -p "$1/.env"`,
+          /no longer a readable regular file/,
+        ],
+        [
+          // THE STRICT READER IS RE-RUN, NOT RELAXED. A replacement that states no port is
+          // refused in the reader's own words, not compared field by field against the pin — a
+          // URL with no port is one PGPORT can move, which is the thing r19 closed.
+          'replaced with a URL the strict reader refuses',
+          plain,
+          `printf 'DATABASE_URL="postgresql://app:pw@127.0.0.1/main"\\n' > "$1/.env"`,
+          /no longer states a connection identity this will accept: DATABASE_URL states no port/,
+        ],
+      ] as [string, string, string, RegExp][]) {
+        const [, answer, after] = ask(setup, tamper)
+        assert.match(answer, /^REFUSE /, `${script}: ${label} — refused`)
+        assert.match(answer, reason, `${script}: ${label} — and the reason says what changed`)
+        // AND THE FENCE ARGUMENTS SURVIVE THE REFUSAL, which is the half that is easy to get
+        // wrong. resolve_db_identity() CLEARS DB_FENCE_IDENTITY_ARGS as its first act, so a
+        // re-read that returned without restoring them would empty the arguments that
+        // release_db_connections() and the exit trap's re-fence are built from — turning the
+        // detection into the outage it exists to prevent, on the one path where the fence is
+        // standing over a migrated schema.
+        //
+        // MUTATION: delete the four restore lines after the `resolve_db_identity` call and this
+        // assertion fails on every case with `ARGS ` and nothing after it.
+        assert.equal(after, `ARGS ${PINNED_ARGS}`, `${script}: ${label} — the release is still armed with the pinned identity`)
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }
+})
+
+test('o3d-2sm1.5 r22: the re-read stands at the fence, at the release, and after the last reload', () => {
+  // The other half: that the shipped entrypoints put it at the three moments that matter. A
+  // re-read defined and never called is the finding with extra code in it.
+  //
+  // MUTATION: delete any one `require_start_identity_unchanged ||` line from either script and
+  // the count assertion fails by name; move the post-reload one above `remove_reboot_fence` and
+  // the ordering assertion fails, because a check that runs before this run's final
+  // daemon-reload is not asking the unit configuration systemd is about to exec with.
+  for (const [name, anchors] of [
+    // `run systemctl start`, not `systemctl start`: the bare spelling appears in the comment
+    // ABOVE the second re-read, which would make the ordering assertion pass on prose.
+    ['deploy.sh', { release: 'THIS IS THE ONLY PLACE A RELEASE FOLLOWS A MIGRATION', start: 'run systemctl start' }],
+    ['update.sh', { release: 'THE ONLY PLACE A RELEASE FOLLOWS A MIGRATION', start: 'run systemctl start' }],
+  ] as const) {
+    const source = readFileSync(join(process.cwd(), `scripts/${name}`), 'utf8')
+    assert.equal(
+      source.split('\n').filter((line) => line.includes('require_start_identity_unchanged ||')).length,
+      3,
+      `${name}: the file is re-read at all three moments`,
+    )
+
+    // 1. INSIDE THE FENCE, BEFORE IT IS RAISED. Nothing is fenced yet, so this is the cheap
+    //    refusal — and it must come before the --fence invocation, not after it.
+    const fence = source.indexOf('fence_db_connections() {')
+    const preFence = source.indexOf('require_start_identity_unchanged ||', fence)
+    const raised = source.indexOf('--fence --state-file', fence)
+    assert.ok(fence > 0 && preFence > fence && preFence < raised, `${name}: re-read before the fence is raised`)
+
+    // 2. AND 3. THE START PATH, in order: re-read (fence HELD) -> release -> remove the reboot
+    //    fence, whose daemon-reload is this run's last -> re-read again -> start.
+    const anchor = source.indexOf(anchors.release)
+    assert.ok(anchor > 0, `${name}: precondition — the start path is where it says it is`)
+    const preRelease = source.indexOf('require_start_identity_unchanged ||', anchor)
+    const release = source.indexOf('release_db_connections \\', anchor)
+    const reboot = source.indexOf('remove_reboot_fence', release)
+    const postReload = source.indexOf('require_start_identity_unchanged ||', reboot)
+    const start = source.indexOf(anchors.start, reboot)
+    assert.ok(preRelease > anchor && preRelease < release, `${name}: re-read while the fence is still held`)
+    assert.ok(release < reboot, `${name}: precondition — the reboot fence comes down after the release`)
+    assert.ok(postReload > reboot, `${name}: re-read again AFTER the final daemon-reload`)
+    assert.ok(postReload < start, `${name}: and before anything is started`)
+
+    // IT RE-RUNS THE STRICT READER AND THE BUS QUESTION — it does not carry its own looser copy
+    // of either. This is what keeps "re-run them, don't relax them" true in the source rather
+    // than only in the commit message.
+    assert.match(source, /^\s*resolve_db_identity "\$\(env_file_value DATABASE_URL "\$env_file"\)" \|\| rc=\$\?$/m, `${name}: the same strict reader`)
+    assert.match(source, /^\s*if ! require_env_file_is_sole_definition; then$/m, `${name}: and the same bus question`)
+  }
+})
