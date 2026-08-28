@@ -3498,6 +3498,82 @@ type KeyProvenance = 'DEMANDED' | 'IGNORED'
 type FieldProvenance = 'DEMANDED' | 'IGNORED'
 
 /**
+ * WHETHER A DECLARATION TRUSTED ON ITS ANNOTATION HAS THAT ANNOTATION READ (round 30, Codex HIGH).
+ *
+ * Round 29 said a declaration may be trusted on its annotation exactly when it CAN HOLD NO
+ * EXPRESSION AT ALL, and split six declaration kinds on it. The criterion was right about syntax and
+ * wrong about what "hold" means: A DECLARATION DOES NOT HAVE TO CONTAIN AN EXPRESSION TO NAME ONE.
+ * `mode: typeof manufacturedMode` is a property signature with no expression anywhere in it, and its
+ * type is whatever a VALUE declaration elsewhere was ASSERTED to be.
+ *
+ * `'DEMANDED'` is what ships: every annotation this walk trusts is READ, by `typeOrigin`, which is
+ * default-deny over type syntax and refuses a `typeof` query, an `import(...)` type and any type
+ * reference that resolves to a value declaration. `'IGNORED'` reproduces rounds 22-29, every one of
+ * which accepted the four annotation-trusted kinds — and the roots' own parameters — without ever
+ * looking at what the annotation said. Controls (R) and (R2) show what that let past.
+ */
+type AnnotationProvenance = 'DEMANDED' | 'IGNORED'
+
+/**
+ * WHETHER A DECLARATION'S INITIALIZER IS TAKEN AS THE ONLY THING THAT WROTE IT (round 30, Codex
+ * HIGH).
+ *
+ * The other half of the same mistake. Rounds 23-29 traced a declaration to its INITIALIZER and
+ * stopped; a `let`, a `var` and a class FIELD can all be written again afterwards, and the write is
+ * on no syntactic link out of the declaration. `let mode: 'REVIEWED' = 'REVIEWED'` followed by
+ * `mode = 'UNREVIEWED' as unknown as 'REVIEWED'` has no diagnostic at all, and the initializer trace
+ * calls it honest.
+ *
+ * `'CONST_ONLY'` is what ships, and it is the FLOOR rather than a proof: recursive provenance runs
+ * through a `const` binding and nothing else, and a class field is refused outright — `readonly`
+ * does not close it, because a constructor may assign a readonly field, and a non-readonly one is
+ * assignable by any holder of the instance. `resolveIdentifier` takes the same floor for the VALUE
+ * it computes, which is the shorter version of the same route: `let mode = 'REVIEWED'` then
+ * `mode = 'UNREVIEWED'` needs no assertion at all. `'ANY_BINDING'` reproduces rounds 22-29.
+ * Controls (S), (S2) and (Q4) show what that let past.
+ *
+ * WHAT THIS IS NOT: a proof that no write reaches a use. It is a restriction to the bindings whose
+ * declaration IS the only write TypeScript admits. Everything the walk still trusts about mutation
+ * is written down under `symbolOrigin` — read it there rather than assuming this covers it.
+ */
+type BindingMutability = 'CONST_ONLY' | 'ANY_BINDING'
+
+/**
+ * THE TYPE KEYWORDS THAT NAME NO DECLARATION AT ALL, so there is nowhere in one for an assertion to
+ * have happened. `typeOrigin` is default-deny around this set and the handful of composite forms it
+ * walks into; everything else is refused BY NAME.
+ */
+const KEYWORD_TYPE_KINDS: ReadonlySet<ts.SyntaxKind> = new Set([
+  ts.SyntaxKind.AnyKeyword,
+  ts.SyntaxKind.UnknownKeyword,
+  ts.SyntaxKind.StringKeyword,
+  ts.SyntaxKind.NumberKeyword,
+  ts.SyntaxKind.BigIntKeyword,
+  ts.SyntaxKind.BooleanKeyword,
+  ts.SyntaxKind.SymbolKeyword,
+  ts.SyntaxKind.ObjectKeyword,
+  ts.SyntaxKind.VoidKeyword,
+  ts.SyntaxKind.UndefinedKeyword,
+  ts.SyntaxKind.NullKeyword,
+  ts.SyntaxKind.NeverKeyword,
+  ts.SyntaxKind.IntrinsicKeyword,
+])
+
+/** A `const` binding — the only variable form whose declaration is the only write TypeScript admits. */
+function isConstBinding(declaration: ts.VariableDeclaration): boolean {
+  return ts.isVariableDeclarationList(declaration.parent)
+    && (declaration.parent.flags & ts.NodeFlags.Const) !== 0
+}
+
+/** What a variable declaration was written with, for a refusal that names it. */
+function bindingKeyword(declaration: ts.VariableDeclaration): string {
+  if (!ts.isVariableDeclarationList(declaration.parent)) return 'catch/for-binding'
+  if ((declaration.parent.flags & ts.NodeFlags.Const) !== 0) return 'const'
+  if ((declaration.parent.flags & ts.NodeFlags.Let) !== 0) return 'let'
+  return 'var'
+}
+
+/**
  * THE ROOTS THIS WALK CREATES, BY NAME. `rootShapes` calls exactly these two with no arguments, so
  * exactly their parameters are values this walk supplied and whose declared types are therefore the
  * module's own word about itself. Everything else in the program is reached through a call, and
@@ -3663,6 +3739,8 @@ function computeRendererOutput(
   rootProvenance: RootProvenance = 'CARRIED',
   keyProvenance: KeyProvenance = 'DEMANDED',
   fieldProvenance: FieldProvenance = 'DEMANDED',
+  annotationProvenance: AnnotationProvenance = 'DEMANDED',
+  bindingMutability: BindingMutability = 'CONST_ONLY',
 ): ComputedRendererOutput {
   const program = directionModelProgram(model, extraFiles)
   const checker = program.getTypeChecker()
@@ -3844,23 +3922,56 @@ function computeRendererOutput(
             + `as a root (${ANALYZER_ROOT_RENDERERS.join(', ')}), so its declared literal type is a contract `
             + 'somebody may have asserted their way through rather than knowledge about the program'
         }
+        // AND WHAT IS BEING TRUSTED HERE IS AN ANNOTATION, SO THE ANNOTATION IS READ (round 30,
+        // Codex HIGH). A root parameter is trusted UNBACKED — on nothing but its own declaration —
+        // and that declaration is a type annotation which can NAME a value: `render: typeof
+        // manufacturedRender` is the module's own word about nothing at all. See control (R2).
+        const annotation = annotationOrigin(
+          declaration.type,
+          `"${name.text}" is a PARAMETER this walk trusts on its own declaration`,
+          analyzerRoots.has(symbol),
+        )
+        if (annotation) return annotation
         continue
       }
       // THE HONEST PROVENANCE, and the only one that folds: a type annotation somebody wrote down
-      // in a declaration THAT CANNOT CARRY AN EXPRESSION AT ALL. A property signature of the closed
-      // direction union, an interface, a type alias, a type parameter — every one of them is
-      // type-position syntax from end to end, so there is nowhere in it an `as` could have been
-      // written and nothing whose runtime value could disagree with what it says.
-      // `direction.target` and `direction.form` are these, and nothing else here is.
+      // in a declaration that holds no expression AND NAMES NO VALUE. A property signature of the
+      // closed direction union, an interface, a type alias, a type parameter — every one of them is
+      // type-position syntax from end to end. `direction.target` and `direction.form` are these.
       //
-      // THAT — not "the receiver would be UNKNOWN" — IS THE CRITERION (round 29, Codex HIGH). Round
-      // 28 kept `PropertyDeclaration` and `EnumMember` in this list and defended them with a
-      // reachability argument about their receivers. The criterion the list actually needs is
-      // structural, and it splits these six exactly: four kinds hold no expression, and two do.
-      if (ts.isPropertySignature(declaration) || ts.isTypeAliasDeclaration(declaration)
-        || ts.isInterfaceDeclaration(declaration) || ts.isTypeParameterDeclaration(declaration)) {
+      // "HOLDS NO EXPRESSION" WAS NOT ENOUGH (round 30, Codex HIGH). Round 29 replaced round 28's
+      // reachability argument with a structural one — a declaration may be trusted on its
+      // annotation iff it can hold no expression at all — and called it airtight. It is not: A
+      // DECLARATION DOES NOT HAVE TO CONTAIN AN EXPRESSION TO NAME ONE. `interface RenderMode {
+      // mode: typeof manufacturedMode }` contains no expression anywhere, and `typeof` is exactly a
+      // type-position way of pointing at a VALUE declaration — which may have been asserted into
+      // whatever it likes. Every one of the four is checked, not just the one Codex named, because
+      // every one of them has a type node in it: a property signature's, a type alias's
+      // right-hand side, a type parameter's constraint and default. An INTERFACE has none of its
+      // own — its members are declarations in their own right and come back through here — so it is
+      // the one kind with nothing to read, and that is asserted below rather than assumed.
+      if (ts.isPropertySignature(declaration)) {
+        const annotation = annotationOrigin(declaration.type, `"${name.text}" is a PROPERTY SIGNATURE`, true)
+        if (annotation) return annotation
         continue
       }
+      if (ts.isTypeAliasDeclaration(declaration)) {
+        const annotation = annotationOrigin(declaration.type, `"${name.text}" is a TYPE ALIAS`, true)
+        if (annotation) return annotation
+        continue
+      }
+      if (ts.isTypeParameterDeclaration(declaration)) {
+        const annotation = annotationOrigin(
+          declaration.constraint, `"${name.text}" is a TYPE PARAMETER whose CONSTRAINT`, false,
+        ) ?? annotationOrigin(declaration.default, `"${name.text}" is a TYPE PARAMETER whose DEFAULT`, false)
+        if (annotation) return annotation
+        continue
+      }
+      // AN INTERFACE NAMES NO VALUE OF ITS OWN. It has no type node: every literal type it can
+      // supply is supplied by one of its own MEMBER declarations, and each of those arrives here as
+      // a `PropertySignature` and is read there. `RenderMode` in control (R) is this exact shape —
+      // the interface is accepted and the member inside it is what refuses.
+      if (ts.isInterfaceDeclaration(declaration)) continue
       // A DECLARATION THAT PAIRS AN ANNOTATION WITH AN EXPRESSION IS HONEST ONLY AS FAR AS THAT
       // EXPRESSION IS (round 29, Codex HIGH). A class FIELD and an ENUM MEMBER are that pairing, and
       // rounds 23-27 are one sentence about it: the annotation is what the checker reports, the
@@ -3891,12 +4002,40 @@ function computeRendererOutput(
           return `"${name.text}" is a ${kind} with no initializer, so its literal type is an annotation and `
             + 'whatever assigns it is not read here'
         }
+        // AND AN INITIALIZER IS THE ONLY WRITER ONLY WHERE NOTHING ELSE MAY WRITE (round 30, Codex
+        // HIGH). Round 29 traced a class FIELD to its initializer, and a field is assignable AFTER
+        // that initializer runs: `readonly` permits a constructor assignment, and a non-readonly
+        // field is assignable by any holder of the instance. `class C { readonly mode: 'REVIEWED' =
+        // 'REVIEWED'; constructor(id: string) { this.mode = (...) as 'REVIEWED' } }` traces to an
+        // HONEST literal and runs the other one — control (Q4). This walk reads no assignments, so
+        // the field is refused rather than traced; that is the floor, not a proof.
+        //
+        // AN ENUM MEMBER IS NOT THE SAME CASE, and the difference is TypeScript's rather than this
+        // walk's: assigning to an enum member is an error ("cannot assign to a read-only property"),
+        // and a computed initializer in a string enum is TS18033 — so a string enum member's
+        // initializer really is the only expression that can have produced its literal type.
+        if (ts.isPropertyDeclaration(declaration) && bindingMutability === 'CONST_ONLY') {
+          return `"${name.text}" is a CLASS FIELD, whose initializer is not the only expression that can have `
+            + 'written it — a constructor may assign a `readonly` field and any holder of the instance may '
+            + 'assign a non-readonly one — and this walk reads no assignments'
+        }
         const inner = literalOrigin(declaration.initializer, seen)
         if (inner) return inner
         continue
       }
-      // A value whose type is its initializer's is honest exactly as far as that initializer is.
+      // A value whose type is its initializer's is honest exactly as far as that initializer is —
+      // AND ONLY WHERE THAT INITIALIZER IS THE ONLY WRITE (round 30, Codex HIGH). `let mode:
+      // 'REVIEWED' = 'REVIEWED'` followed by `mode = 'UNREVIEWED' as unknown as 'REVIEWED'` has no
+      // diagnostic, and rounds 23-29 read the declaration and called it honest. `const` is the only
+      // variable form whose declaration is the only write TypeScript admits, so it is the floor.
+      // Control (S) is the route; `resolveIdentifier` takes the same floor for the VALUE.
       if (ts.isVariableDeclaration(declaration) || ts.isPropertyAssignment(declaration)) {
+        if (bindingMutability === 'CONST_ONLY' && ts.isVariableDeclaration(declaration)
+          && !isConstBinding(declaration)) {
+          return `"${name.text}" is a \`${bindingKeyword(declaration)}\` binding, so its declaration's `
+            + 'initializer is not the only expression that can have written it: a later assignment can carry an '
+            + 'assertion the initializer does not, and this walk reads no assignments'
+        }
         if (!declaration.initializer) {
           return `"${name.text}" has no initializer, so where its literal type came from is unknown`
         }
@@ -3906,6 +4045,149 @@ function computeRendererOutput(
       }
       return `"${name.text}" resolves to a ${ts.SyntaxKind[declaration.kind]}, whose literal type this walk `
         + 'cannot trace to a declaration'
+    }
+    return null
+  }
+
+  /**
+   * THE REASON A TRUSTED ANNOTATION IS NOT THE MODULE'S OWN WORD, or null (round 30, Codex HIGH).
+   *
+   * `required` is whether the ABSENCE of an annotation is itself a refusal. It is for the four
+   * annotation-trusted kinds and for a ROOT parameter — those are trusted on nothing else, so an
+   * annotation this walk cannot read leaves the trust backed by nothing. It is not for a type
+   * parameter's constraint and default, which are optional by construction and name nothing when
+   * absent, nor for a non-root parameter, whose trust comes from the ARGUMENT's provenance
+   * (`originFrames`) rather than from its declaration — an unannotated arrow parameter of
+   * `sequence.map` is that case and is what the sequence renderer is read through.
+   */
+  const annotationOrigin = (
+    type: ts.TypeNode | undefined,
+    described: string,
+    required: boolean,
+  ): string | null => {
+    if (annotationProvenance === 'IGNORED') return null
+    if (!type) {
+      return required
+        ? `${described} with NO type annotation this walk can read, so what its declared literal type came `
+          + 'from is written down nowhere here'
+        : null
+    }
+    const inner = typeOrigin(type, new Set())
+    return inner === null ? null : `${described}, and its ANNOTATION is ${inner}`
+  }
+
+  /**
+   * WHAT AN ANNOTATION NAMES (round 30, Codex HIGH).
+   *
+   * Round 29's criterion was "a declaration may be trusted on its annotation iff it can hold no
+   * expression at all", and it is false: A DECLARATION DOES NOT HAVE TO CONTAIN AN EXPRESSION TO
+   * NAME ONE. Type syntax has its own door into value space — `typeof x` is the door, `import(...)`
+   * is a second, and a type reference that resolves to a `const`/`class`-as-a-value is how you walk
+   * through either without writing the keyword.
+   *
+   * So this is DEFAULT-DENY over type syntax, the way `literalOrigin` is over expression syntax: a
+   * closed set of forms that name no declaration (the keywords, a literal type), a closed set that
+   * this walk recurses through (unions, tuples, arrays, indexed access, operators, conditionals,
+   * mapped types, function types, parenthesis), a closed set of REFERENCES it resolves — and
+   * everything else refused BY NAME so a later syntax is a refusal rather than an omission.
+   *
+   * AN OBJECT TYPE IS ACCEPTED WITHOUT RECURSING ITS MEMBERS, and that is not a hole: a member's
+   * literal type reaches `symbolOrigin` as that member's OWN declaration — a `PropertySignature` —
+   * and is read there. Control (R) is exactly this path, and it is the member that refuses.
+   */
+  function typeOrigin(node: ts.TypeNode, seen: Set<ts.Node>): string | null {
+    // A cycle in type syntax introduces no new name; the visit that is still on the stack decides.
+    if (seen.has(node)) return null
+    seen.add(node)
+    const each = (nodes: readonly (ts.TypeNode | undefined)[]): string | null => {
+      for (const child of nodes) {
+        if (!child) continue
+        const inner = typeOrigin(child, seen)
+        if (inner) return inner
+      }
+      return null
+    }
+    // THE DOOR INTO VALUE SPACE, and Codex's route. `typeof x` holds no expression and NAMES one.
+    if (ts.isTypeQueryNode(node)) {
+      const named = ts.isIdentifier(node.exprName) ? `"${node.exprName.text}"` : `"${node.exprName.getText()}"`
+      return `a \`typeof\` TYPE QUERY over ${named} — type-position syntax that NAMES a VALUE declaration, so `
+        + 'whatever that declaration was ASSERTED to be is reported here as though somebody had declared it'
+    }
+    if (ts.isImportTypeNode(node)) {
+      return 'an `import(...)` type, which names a declaration this walk did not follow — and with a `typeof` '
+        + 'qualifier it names a value'
+    }
+    if (node.kind === ts.SyntaxKind.ThisType) {
+      return 'a `this` type, whose meaning is the VALUE it is eventually read on'
+    }
+    if (ts.isLiteralTypeNode(node)) return null
+    // An object type's members are declarations in their own right — see the block above.
+    if (ts.isTypeLiteralNode(node)) return null
+    if (ts.isInferTypeNode(node)) return null
+    if (KEYWORD_TYPE_KINDS.has(node.kind)) return null
+    if (ts.isParenthesizedTypeNode(node)) return typeOrigin(node.type, seen)
+    if (ts.isUnionTypeNode(node) || ts.isIntersectionTypeNode(node)) return each(node.types)
+    if (ts.isArrayTypeNode(node)) return typeOrigin(node.elementType, seen)
+    if (ts.isTupleTypeNode(node)) return each(node.elements)
+    if (ts.isNamedTupleMember(node) || ts.isRestTypeNode(node) || ts.isOptionalTypeNode(node)) {
+      return typeOrigin(node.type, seen)
+    }
+    if (ts.isTypeOperatorNode(node)) {
+      if (node.operator === ts.SyntaxKind.UniqueKeyword) {
+        return 'a `unique symbol`, whose identity is a VALUE this walk cannot read'
+      }
+      return typeOrigin(node.type, seen)
+    }
+    if (ts.isIndexedAccessTypeNode(node)) return each([node.objectType, node.indexType])
+    if (ts.isConditionalTypeNode(node)) {
+      return each([node.checkType, node.extendsType, node.trueType, node.falseType])
+    }
+    if (ts.isMappedTypeNode(node)) {
+      return each([node.typeParameter.constraint, node.nameType, node.type])
+    }
+    if (ts.isTemplateLiteralTypeNode(node)) return each(node.templateSpans.map((span) => span.type))
+    if (ts.isFunctionTypeNode(node) || ts.isConstructorTypeNode(node)) {
+      return each([...node.parameters.map((parameter) => parameter.type), node.type])
+    }
+    if (ts.isTypeReferenceNode(node)) return typeReferenceOrigin(node, seen)
+    return `a ${ts.SyntaxKind[node.kind]} in type position, which this walk cannot read end to end`
+  }
+
+  /** A NAME in type position: what it resolves to decides whether the annotation reaches a value. */
+  function typeReferenceOrigin(node: ts.TypeReferenceNode, seen: Set<ts.Node>): string | null {
+    for (const argument of node.typeArguments ?? []) {
+      const inner = typeOrigin(argument, seen)
+      if (inner) return inner
+    }
+    const printed = node.typeName.getText()
+    const symbol = aliasResolved(checker.getSymbolAtLocation(node.typeName))
+    if (!symbol) return `"${printed}" in type position resolves to no symbol, so what it names is unknown`
+    const declarations = symbol.declarations ?? []
+    if (declarations.length === 0) return `"${printed}" in type position has no declaration to read`
+    for (const declaration of declarations) {
+      // A TYPE ALIAS *IS* ITS RIGHT-HAND SIDE, so the query may be one name further in.
+      if (ts.isTypeAliasDeclaration(declaration)) {
+        const inner = typeOrigin(declaration.type, seen)
+        if (inner) return inner
+        continue
+      }
+      // AN INTERFACE, A CLASS TYPE AND AN ENUM TYPE name no literal of their own: whatever literal
+      // type they can supply comes from a member declaration, and every one of those is read by
+      // `symbolOrigin` when the member is actually accessed — a class field is REFUSED there, an
+      // ambient enum member is refused there, and a property signature is read there.
+      if (ts.isInterfaceDeclaration(declaration) || ts.isClassDeclaration(declaration)
+        || ts.isClassExpression(declaration) || ts.isEnumDeclaration(declaration)) {
+        continue
+      }
+      if (ts.isTypeParameterDeclaration(declaration)) {
+        const constraint = declaration.constraint ? typeOrigin(declaration.constraint, seen) : null
+        if (constraint) return constraint
+        const fallback = declaration.default ? typeOrigin(declaration.default, seen) : null
+        if (fallback) return fallback
+        continue
+      }
+      return `"${printed}" in type position resolves to a ${ts.SyntaxKind[declaration.kind]}, which is a VALUE `
+        + 'declaration — a type that names a value is honest only as far as that value is'
     }
     return null
   }
@@ -4284,6 +4566,14 @@ function computeRendererOutput(
       if (variable.getSourceFile().isDeclarationFile || isAmbient(variable)) {
         return unknown(`"${node.text}" is declared without an implementation this walk can read`)
       }
+      // THE SAME FLOOR, FOR THE VALUE (round 30, Codex HIGH). Codex found the later-write hole in
+      // the PROVENANCE trace; it is in the VALUE walk too, and there it needs no assertion at all —
+      // `let mode = 'REVIEWED'` then `mode = 'UNREVIEWED'` type-checks as plain `string` and this
+      // line used to hand back the initializer as though it were the value. Control (S2).
+      if (bindingMutability === 'CONST_ONLY' && !isConstBinding(variable)) {
+        return unknown(`"${node.text}" is a \`${bindingKeyword(variable)}\` binding, so its initializer is not `
+          + 'the only expression that can have written it — a later assignment is not read here')
+      }
       if (!variable.initializer) return unknown(`"${node.text}" has no initializer, so its value is unknown`)
       return valueOf(variable.initializer)
     }
@@ -4518,10 +4808,12 @@ function judgeRendererOutput(
   rootProvenance: RootProvenance = 'CARRIED',
   keyProvenance: KeyProvenance = 'DEMANDED',
   fieldProvenance: FieldProvenance = 'DEMANDED',
+  annotationProvenance: AnnotationProvenance = 'DEMANDED',
+  bindingMutability: BindingMutability = 'CONST_ONLY',
 ): string[] {
   const computed = computeRendererOutput(
     model, extraFiles, contextBinding, literalProvenance, receiverPropagation, defaultBinding, rootTrust,
-    rootEntry, rootProvenance, keyProvenance, fieldProvenance,
+    rootEntry, rootProvenance, keyProvenance, fieldProvenance, annotationProvenance, bindingMutability,
   )
   const reviewed = RENDERED_DIRECTIONS.map((entry) => entry.text)
   const complaints = [...computed.unresolved]
@@ -5924,11 +6216,24 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
   assert.deepEqual(
     judgeRendererOutput(
       viaAmbientEnumMember, ambientMode, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'MODELLED', 'NAMED', 'ABSTRACT',
-      'CARRIED', 'DEMANDED', 'IGNORED',
+      'CARRIED', 'DEMANDED', 'IGNORED', 'IGNORED',
     ),
     [],
     'THE PRE-FIX ANALYZER MUST STILL LET IT THROUGH — the enum member folded on its annotation exactly as the '
     + 'class field did, or (Q3) proves nothing',
+  )
+  // ...AND THE ROUND-29 RULE STILL CLOSES IT ON ITS OWN, which has to be said now that round 30
+  // refuses this route a second time: `render: typeof AmbientRenderMode` is an annotation that NAMES
+  // a value, so the annotation rule refuses it as well. Switch the annotation rule off and leave
+  // round 29's ambient rule on, and the sentence is still refused — so (Q3) is still about the enum
+  // member rather than about the parameter that reaches it.
+  assert.ok(
+    judgeRendererOutput(
+      viaAmbientEnumMember, ambientMode, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'MODELLED', 'NAMED', 'ABSTRACT',
+      'CARRIED', 'DEMANDED', 'DEMANDED', 'IGNORED',
+    ).some((complaint) => complaint.includes('take the second PDF off it')),
+    'the AMBIENT ENUM rule must close this without the annotation rule, or round 29\'s control has been '
+    + 'silently taken over by round 30',
   )
   // ...and the receiver here is an OPAQUE ROOT PARAMETER and not the enum object, which is what
   // makes it a route at all: a bare `AmbientRenderMode.MODE` goes through `resolveIdentifier`, which
@@ -5949,6 +6254,471 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
     ).some((complaint) => complaint.includes('take the second PDF off it')),
     'the PRE-FIX analyzer must already refuse the enum read through the enum OBJECT — that is the receiver '
     + 'round 28\'s argument was about, and it is not the one the roots produce',
+  )
+
+  // (Q4) THE SAME CLASS FIELD WITH AN HONEST INITIALIZER AND A LATER WRITE — THE ROUND-30 ROUTE
+  // (Codex HIGH), and the half of round 29 that "recursively check the initializer" cannot reach.
+  //
+  // ROUND 29 TRACED A CLASS FIELD TO ITS INITIALIZER. A field is assignable AFTER that initializer
+  // runs: `readonly` stops nobody in the CONSTRUCTOR, and a non-readonly field stops nobody at all.
+  // So the initializer can be the honest literal, the trace can find it, and the value the field
+  // holds when anybody reads it can be the other one. Nothing here is asserted where round 29 looks.
+  const viaRewrittenClassField = model.replace(
+    'export function renderLocalDirection(direction: LocalDirection, context: LocalDirectionContext): string {',
+    'export class RenderMode {\n'
+    + "  readonly mode: 'REVIEWED' = 'REVIEWED'\n"
+    + '\n'
+    + '  constructor(syncRowId: string) {\n'
+    + "    this.mode = (syncRowId === '" + OFF_SAMPLE_SYNC_ROW + "' ? 'UNREVIEWED' : 'REVIEWED') as 'REVIEWED'\n"
+    + '  }\n'
+    + '}\n'
+    + '\n'
+    + 'export function renderLocalDirection(\n'
+    + '  direction: LocalDirection,\n'
+    + '  context: LocalDirectionContext,\n'
+    + '  render: RenderMode,\n'
+    + '): string {',
+  ).replace(
+    "      return 'confirm the invoice PDF stored against the order is the document you expect'",
+    "      return render.mode === 'REVIEWED'\n"
+    + "        ? 'confirm the invoice PDF stored against the order is the document you expect'\n"
+    + "        : '" + UNDECLARED_REMOTE_ACTION + "'",
+  ).replace(
+    'export function renderLocalDirectionSequence(\n'
+    + '  sequence: LocalDirectionSequence,\n'
+    + '  context: LocalDirectionContext,\n'
+    + '): string {\n'
+    + "  return sequence.map((direction) => renderLocalDirection(direction, context)).join(' and ')",
+    'export function renderLocalDirectionSequence(\n'
+    + '  sequence: LocalDirectionSequence,\n'
+    + '  context: LocalDirectionContext,\n'
+    + '  render: RenderMode,\n'
+    + '): string {\n'
+    + "  return sequence.map((direction) => renderLocalDirection(direction, context, render)).join(' and ')",
+  )
+  // THE INITIALIZER IS HONEST, WHICH IS THE WHOLE POINT: there is no assertion anywhere round 29
+  // reads, so a trace of it finds a plain string literal and calls the field trustworthy.
+  for (const fragment of [
+    "readonly mode: 'REVIEWED' = 'REVIEWED'",
+    'this.mode = (syncRowId ===',
+    "return render.mode === 'REVIEWED'",
+    'renderLocalDirection(direction, context, render)',
+  ]) {
+    assert.ok(
+      viaRewrittenClassField.includes(fragment),
+      `the rewritten-field mutation must actually have been applied — missing ${JSON.stringify(fragment)}`,
+    )
+  }
+  assert.deepEqual(
+    modelDiagnostics(viaRewrittenClassField), modelDiagnostics(model),
+    'the rewritten-field mutation must type-check exactly as the shipped model does — TypeScript permits a '
+    + 'CONSTRUCTOR to assign a `readonly` field that already has an initializer, which is the entire route',
+  )
+  const rewrittenFieldComplaints = judgeRendererOutput(viaRewrittenClassField)
+  assert.ok(
+    rewrittenFieldComplaints.some((complaint) => complaint.startsWith('emits a sentence nobody reviewed')
+      && complaint.includes('take the second PDF off it')),
+    'CONTROL, THE CODEX ROUTE: a class FIELD is refused rather than traced, because its initializer is not the '
+    + `only expression that can have written it. Saw: ${JSON.stringify(rewrittenFieldComplaints)}`,
+  )
+  // ...AND ROUND 29 ENTIRE LETS IT THROUGH, with its own field rule fully ON. This is the assertion
+  // that says round 30 is a different rule and not round 29 restated: `fieldProvenance` is
+  // `'DEMANDED'` here, the initializer IS traced, the trace finds `'REVIEWED'`, and the sentence
+  // ships. Only the mutability floor closes it.
+  assert.deepEqual(
+    judgeRendererOutput(
+      viaRewrittenClassField, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'MODELLED', 'NAMED', 'ABSTRACT', 'CARRIED',
+      'DEMANDED', 'DEMANDED', 'DEMANDED', 'ANY_BINDING',
+    ),
+    [],
+    'ROUND 29 MUST STILL LET THIS THROUGH — its field rule traces an initializer that is honest, so if this '
+    + 'were also refused the mutability floor would be proving nothing',
+  )
+  // ...AND NO SAMPLE CLOSES IT EITHER, for (Q2)'s reason: the constructor keys on a sync row id, and
+  // the four sampled contexts do not carry the one it keys on.
+  const byRewrittenField = (direction: LocalDirection, context: LocalDirectionContext): string => (
+    direction.action === 'CONFIRM' && context.syncRowId === OFF_SAMPLE_SYNC_ROW
+      ? UNDECLARED_REMOTE_ACTION
+      : renderLocalDirection(direction, context)
+  )
+  for (const context of RUNTIME_CONTEXTS) {
+    assertRenderedInventory(
+      (direction) => byRewrittenField(direction, context),
+      (text) => substitutePlaceholders(text, context),
+    )
+  }
+
+  // (R) A `typeof` TYPE QUERY IN AN ACCEPTED PROPERTY SIGNATURE — THE ROUND-30 ROUTE (Codex HIGH),
+  // and the ninth appearance of one axis: a TYPE standing in for a VALUE.
+  //
+  // ROUND 29 REPLACED A REACHABILITY ARGUMENT WITH A STRUCTURAL CRITERION — a declaration may be
+  // trusted on its annotation iff it CAN HOLD NO EXPRESSION AT ALL — and the criterion is false. A
+  // property signature holds no expression; its TYPE ANNOTATION can NAME one. `typeof
+  // manufacturedMode` is type-position syntax from end to end, contains no `as` anywhere, and means
+  // "whatever that value declaration's type is" — which an assertion decided.
+  //
+  // So `render.mode` types as exactly `"REVIEWED"`, the resolver sees a property signature and
+  // accepts it, and the arm every caller passing `{ mode: manufacturedMode }` takes at run time is
+  // folded away. No call, no argument, no default, no key, no UNKNOWN, and no expression in the
+  // declaration: not one of the eight earlier fixes is looking at this.
+  const viaQueriedPropertySignature = model.replace(
+    'export function renderLocalDirection(direction: LocalDirection, context: LocalDirectionContext): string {',
+    "const manufacturedMode = 'UNREVIEWED' as unknown as 'REVIEWED'\n"
+    + '\n'
+    + 'export interface RenderMode {\n'
+    + '  mode: typeof manufacturedMode\n'
+    + '}\n'
+    + '\n'
+    + 'export function renderLocalDirection(\n'
+    + '  direction: LocalDirection,\n'
+    + '  context: LocalDirectionContext,\n'
+    + '  render: RenderMode,\n'
+    + '): string {',
+  ).replace(
+    "      return 'confirm the invoice PDF stored against the order is the document you expect'",
+    "      return render.mode === 'REVIEWED'\n"
+    + "        ? 'confirm the invoice PDF stored against the order is the document you expect'\n"
+    + "        : '" + UNDECLARED_REMOTE_ACTION + "'",
+  ).replace(
+    'export function renderLocalDirectionSequence(\n'
+    + '  sequence: LocalDirectionSequence,\n'
+    + '  context: LocalDirectionContext,\n'
+    + '): string {\n'
+    + "  return sequence.map((direction) => renderLocalDirection(direction, context)).join(' and ')",
+    'export function renderLocalDirectionSequence(\n'
+    + '  sequence: LocalDirectionSequence,\n'
+    + '  context: LocalDirectionContext,\n'
+    + '  render: RenderMode,\n'
+    + '): string {\n'
+    + "  return sequence.map((direction) => renderLocalDirection(direction, context, render)).join(' and ')",
+  )
+  // ALL THREE EDITS LANDED, and the declaration really does hold no expression: the only `as` in
+  // the mutation is on `manufacturedMode`, which the property signature NAMES rather than contains.
+  for (const fragment of [
+    "const manufacturedMode = 'UNREVIEWED' as unknown as 'REVIEWED'",
+    '  mode: typeof manufacturedMode',
+    "return render.mode === 'REVIEWED'",
+    'renderLocalDirection(direction, context, render)',
+  ]) {
+    assert.ok(
+      viaQueriedPropertySignature.includes(fragment),
+      `the type-query mutation must actually have been applied — missing ${JSON.stringify(fragment)}`,
+    )
+  }
+  assert.deepEqual(
+    modelDiagnostics(viaQueriedPropertySignature), modelDiagnostics(model),
+    'the type-query mutation must type-check exactly as the shipped model does, or it is not a route anybody '
+    + 'could take',
+  )
+  const queriedSignatureComplaints = judgeRendererOutput(viaQueriedPropertySignature)
+  assert.ok(
+    queriedSignatureComplaints.some((complaint) => complaint.startsWith('emits a sentence nobody reviewed')
+      && complaint.includes('take the second PDF off it')),
+    'CONTROL, THE CODEX ROUTE: a declaration that holds no expression can still NAME one. A property '
+    + `signature's ANNOTATION is read, and a \`typeof\` query in it is refused. Saw: ${
+      JSON.stringify(queriedSignatureComplaints)}`,
+  )
+  // ...and the walk still COMPUTES every sentence, so the complaint is the prose it emits rather
+  // than an expression it gave up on.
+  assert.deepEqual(
+    computeRendererOutput(viaQueriedPropertySignature).unresolved, [],
+    'the type-query mutation must still COMPUTE — the complaint is the sentence it emits',
+  )
+  // ...AND THE PRE-FIX ANALYZER REPORTS IT CLEAN, asserted rather than described — the same shape as
+  // (J) through (Q3). Every round-22-to-29 fix in place, only the annotation unread: no complaint at
+  // all, while the sentence ships.
+  assert.deepEqual(
+    judgeRendererOutput(
+      viaQueriedPropertySignature, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'MODELLED', 'NAMED', 'ABSTRACT',
+      'CARRIED', 'DEMANDED', 'DEMANDED', 'IGNORED',
+    ),
+    [],
+    'THE PRE-FIX ANALYZER MUST STILL LET IT THROUGH — if it also refused this, control (R) would be passing '
+    + 'for some other reason and would prove nothing',
+  )
+  // ...AND NONE OF THE EIGHT FIXES THAT CAME BEFORE IT CLOSES IT, which is what makes this a ninth
+  // round rather than a regression of one of them.
+  const withoutEachFixBeforeTheAnnotation = [
+    ['receiver propagation (round 24)', judgeRendererOutput(
+      viaQueriedPropertySignature, {}, 'SYMBOLIC', 'TRACKED', 'DEFERRED',
+    )],
+    ['argument provenance (round 24)', judgeRendererOutput(
+      viaQueriedPropertySignature, {}, 'SYMBOLIC', 'CALL_LOCAL', 'PROPAGATED',
+    )],
+    ['modelled defaults (round 25)', judgeRendererOutput(
+      viaQueriedPropertySignature, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'UNBOUND',
+    )],
+    ['the named root set (round 25)', judgeRendererOutput(
+      viaQueriedPropertySignature, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'MODELLED', 'INFERRED',
+    )],
+    ['abstract root entry (round 26)', judgeRendererOutput(
+      viaQueriedPropertySignature, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'MODELLED', 'NAMED', 'DEFAULTED',
+    )],
+    ['root default provenance (round 27)', judgeRendererOutput(
+      viaQueriedPropertySignature, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'MODELLED', 'NAMED', 'ABSTRACT',
+      'DROPPED',
+    )],
+    ['key provenance (round 28)', judgeRendererOutput(
+      viaQueriedPropertySignature, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'MODELLED', 'NAMED', 'ABSTRACT',
+      'CARRIED', 'IGNORED',
+    )],
+    ['the field trace (round 29)', judgeRendererOutput(
+      viaQueriedPropertySignature, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'MODELLED', 'NAMED', 'ABSTRACT',
+      'CARRIED', 'DEMANDED', 'IGNORED',
+    )],
+  ] as const
+  assert.equal(
+    withoutEachFixBeforeTheAnnotation.length, 8,
+    'all eight earlier fixes must be switched off in turn, or this loop is a claim about a subset of them',
+  )
+  for (const [what, complaints] of withoutEachFixBeforeTheAnnotation) {
+    assert.ok(
+      complaints.some((complaint) => complaint.includes('take the second PDF off it')),
+      `THE ANNOTATION RULE IS WHAT CLOSES THIS: with ${what} switched off it is still refused, so it is not `
+      + 'that fix wearing a new coat',
+    )
+  }
+  // ...AND THE REFUSAL NAMES THE TYPE QUERY, at the point of refusal — the same demand (M3) makes.
+  // Put the queried property straight into the prose and the reason lands in `unresolved`, where a
+  // reader is told it was a `typeof` over a named value and not some unrelated give-up. Without
+  // this the control could pass on any refusal at all, including one from a rule nobody wrote.
+  const viaQueriedProse = viaQueriedPropertySignature.replace(
+    "      return render.mode === 'REVIEWED'\n"
+    + "        ? 'confirm the invoice PDF stored against the order is the document you expect'\n"
+    + "        : '" + UNDECLARED_REMOTE_ACTION + "'",
+    '      return `confirm the invoice PDF stored against the order is the document you expect${render.mode}`',
+  )
+  assert.notEqual(viaQueriedProse, viaQueriedPropertySignature, 'the queried-prose mutation must have applied')
+  const queriedProse = computeRendererOutput(viaQueriedProse)
+  assert.ok(
+    queriedProse.unresolved.some((reason) => reason.includes('TYPE QUERY')
+      && reason.includes('"manufacturedMode"') && reason.includes('PROPERTY SIGNATURE')),
+    'the refusal must NAME the property signature and the `typeof` query inside its annotation, so the rule '
+    + `that fired is readable at the point of refusal. Saw: ${JSON.stringify(queriedProse.unresolved)}`,
+  )
+  // ...and round 29 folded that same annotation into the prose instead, which is the other half of
+  // the same demonstration: the sentence it shipped carries the manufactured literal.
+  assert.ok(
+    judgeRendererOutput(
+      viaQueriedProse, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'MODELLED', 'NAMED', 'ABSTRACT', 'CARRIED',
+      'DEMANDED', 'DEMANDED', 'IGNORED',
+    ).some((complaint) => complaint.includes('expectREVIEWED')),
+    'the round-29 walk must have folded the queried annotation into the prose, or (R) is about nothing',
+  )
+
+  // (R2) THE SAME QUERY IN THE ROOT PARAMETER'S OWN ANNOTATION — the position the four
+  // annotation-trusted DECLARATION KINDS do not cover, and the reason the rule is about ANNOTATIONS
+  // rather than about those four kinds.
+  //
+  // A root parameter is trusted UNBACKED: no argument, no default, nothing traced into it, and its
+  // declared type taken as the module's own word about itself (rounds 24-27). That word is an
+  // annotation, and an annotation can NAME a value exactly as a property signature's can. Here every
+  // declaration kind on the path is clean — the property signature `render.mode` resolves to says
+  // `'REVIEWED'` in so many letters — and the query is one level out, on the parameter.
+  const viaQueriedParameter = model.replace(
+    'export function renderLocalDirection(direction: LocalDirection, context: LocalDirectionContext): string {',
+    "const manufacturedRender = { mode: 'UNREVIEWED' } as unknown as { mode: 'REVIEWED' }\n"
+    + '\n'
+    + 'export function renderLocalDirection(\n'
+    + '  direction: LocalDirection,\n'
+    + '  context: LocalDirectionContext,\n'
+    + '  render: typeof manufacturedRender,\n'
+    + '): string {',
+  ).replace(
+    "      return 'confirm the invoice PDF stored against the order is the document you expect'",
+    "      return render.mode === 'REVIEWED'\n"
+    + "        ? 'confirm the invoice PDF stored against the order is the document you expect'\n"
+    + "        : '" + UNDECLARED_REMOTE_ACTION + "'",
+  ).replace(
+    'export function renderLocalDirectionSequence(\n'
+    + '  sequence: LocalDirectionSequence,\n'
+    + '  context: LocalDirectionContext,\n'
+    + '): string {\n'
+    + "  return sequence.map((direction) => renderLocalDirection(direction, context)).join(' and ')",
+    'export function renderLocalDirectionSequence(\n'
+    + '  sequence: LocalDirectionSequence,\n'
+    + '  context: LocalDirectionContext,\n'
+    + '  render: typeof manufacturedRender,\n'
+    + '): string {\n'
+    + "  return sequence.map((direction) => renderLocalDirection(direction, context, render)).join(' and ')",
+  )
+  for (const fragment of [
+    "const manufacturedRender = { mode: 'UNREVIEWED' } as unknown as { mode: 'REVIEWED' }",
+    '  render: typeof manufacturedRender,',
+    "return render.mode === 'REVIEWED'",
+    'renderLocalDirection(direction, context, render)',
+  ]) {
+    assert.ok(
+      viaQueriedParameter.includes(fragment),
+      `the queried-parameter mutation must actually have been applied — missing ${JSON.stringify(fragment)}`,
+    )
+  }
+  assert.deepEqual(
+    modelDiagnostics(viaQueriedParameter), modelDiagnostics(model),
+    'the queried-parameter mutation must type-check exactly as the shipped model does, or it is not a route '
+    + 'anybody could take',
+  )
+  const queriedParameterComplaints = judgeRendererOutput(viaQueriedParameter)
+  assert.ok(
+    queriedParameterComplaints.some((complaint) => complaint.startsWith('emits a sentence nobody reviewed')
+      && complaint.includes('take the second PDF off it')),
+    'CONTROL: the roots are trusted on their own annotations, so their annotations are read too. Checking only '
+    + `the four annotation-trusted DECLARATION KINDS would have left this open. Saw: ${
+      JSON.stringify(queriedParameterComplaints)}`,
+  )
+  assert.deepEqual(
+    judgeRendererOutput(
+      viaQueriedParameter, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'MODELLED', 'NAMED', 'ABSTRACT', 'CARRIED',
+      'DEMANDED', 'DEMANDED', 'IGNORED',
+    ),
+    [],
+    'THE PRE-FIX ANALYZER MUST STILL LET IT THROUGH, or (R2) proves nothing',
+  )
+
+  // (S) A LATER WRITE TO A TRACED VARIABLE — THE ROUND-30 ROUTE (Codex HIGH), and the other half of
+  // the same sentence: a declaration does not have to CONTAIN the dishonest expression to be read
+  // as though it did.
+  //
+  // ROUND 29 TRACED A NAME TO ITS DECLARATION'S INITIALIZER. A `let` is written again afterwards,
+  // and the write is on no syntactic link out of the declaration — nothing `symbolOrigin` follows
+  // passes anywhere near it. So the initializer can be a plain string literal, the trace can find
+  // it, and the value the name holds when the renderer runs can be the other one.
+  //
+  // The route is (P)'s position with the assertion moved off the key EXPRESSION and onto a later
+  // write to the key VARIABLE: `direction[assertedField]` inside `case 'CONFIRM'` types as exactly
+  // `"ORDER_INVOICE_PDF"`, so the comparison folds TRUE and the prohibited arm is pruned — while at
+  // run time the key is `'action'` and the comparison is false for every caller.
+  const viaRewrittenKeyBinding = model.replace(
+    'export function renderLocalDirection(direction: LocalDirection, context: LocalDirectionContext): string {',
+    "let assertedField: 'target' = 'target'\n"
+    + "assertedField = 'action' as unknown as 'target'\n"
+    + '\n'
+    + 'export function renderLocalDirection(direction: LocalDirection, context: LocalDirectionContext): string {',
+  ).replace(
+    "      return 'confirm the invoice PDF stored against the order is the document you expect'",
+    "      return direction[assertedField] === 'ORDER_INVOICE_PDF'\n"
+    + "        ? 'confirm the invoice PDF stored against the order is the document you expect'\n"
+    + "        : '" + UNDECLARED_REMOTE_ACTION + "'",
+  )
+  for (const fragment of [
+    "let assertedField: 'target' = 'target'",
+    "assertedField = 'action' as unknown as 'target'",
+    "return direction[assertedField] === 'ORDER_INVOICE_PDF'",
+  ]) {
+    assert.ok(
+      viaRewrittenKeyBinding.includes(fragment),
+      `the rewritten-binding mutation must actually have been applied — missing ${JSON.stringify(fragment)}`,
+    )
+  }
+  // AND THE DECLARATION ITSELF IS HONEST, which is the whole point: the only assertion in the
+  // mutation is in the ASSIGNMENT, which is not reachable from the declaration by any link this walk
+  // follows. Round 29's trace reads `= 'target'` and stops.
+  assert.ok(
+    viaRewrittenKeyBinding.includes("let assertedField: 'target' = 'target'\nassertedField = "),
+    'the initializer must be a plain literal and the assertion must be in the later WRITE, or (S) is round 28 '
+    + 'again rather than a route round 28 cannot see',
+  )
+  assert.deepEqual(
+    modelDiagnostics(viaRewrittenKeyBinding), modelDiagnostics(model),
+    'the rewritten-binding mutation must type-check exactly as the shipped model does — a `let` may be assigned '
+    + 'again, and the assertion narrows through `unknown`',
+  )
+  const rewrittenKeyComplaints = judgeRendererOutput(viaRewrittenKeyBinding)
+  assert.ok(
+    rewrittenKeyComplaints.some((complaint) => complaint.startsWith('emits a sentence nobody reviewed')
+      && complaint.includes('take the second PDF off it')),
+    'CONTROL, THE CODEX ROUTE: a `let` binding\'s initializer is not the only expression that can have written '
+    + `it, so recursive provenance runs through \`const\` and nothing else. Saw: ${
+      JSON.stringify(rewrittenKeyComplaints)}`,
+  )
+  assert.deepEqual(
+    computeRendererOutput(viaRewrittenKeyBinding).unresolved, [],
+    'the rewritten-binding mutation must still COMPUTE — the complaint is the sentence it emits',
+  )
+  // ...AND ROUND 29 ENTIRE LETS IT THROUGH, with key provenance (round 28) fully ON: the key IS
+  // asked where it came from, and the answer it gets is the honest declaration.
+  assert.deepEqual(
+    judgeRendererOutput(
+      viaRewrittenKeyBinding, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'MODELLED', 'NAMED', 'ABSTRACT', 'CARRIED',
+      'DEMANDED', 'DEMANDED', 'DEMANDED', 'ANY_BINDING',
+    ),
+    [],
+    'THE PRE-FIX ANALYZER MUST STILL LET IT THROUGH — round 28 demanded the key\'s provenance and round 29 '
+    + 'traced it to a declaration that says `target`, so if this were also refused the const floor would be '
+    + 'proving nothing',
+  )
+  // ...AND THE RUNTIME PASS DOES SEE THIS ONE: every caller reads `direction['action']`, so every
+  // rendered CONFIRM is the prohibited sentence. What the control is about is the analyzer reporting
+  // CLEAN over it — a clean static report is what makes the sampled pass look redundant.
+  const byRewrittenKey = (direction: LocalDirection, context: LocalDirectionContext): string => (
+    direction.action === 'CONFIRM' ? UNDECLARED_REMOTE_ACTION : renderLocalDirection(direction, context)
+  )
+  assert.throws(
+    () => assertRenderedInventory(
+      (direction) => byRewrittenKey(direction, RUNTIME_CONTEXTS[0]!),
+      (text) => substitutePlaceholders(text, RUNTIME_CONTEXTS[0]!),
+    ),
+    /is NOT the reviewed sentence for it/,
+    'the mutated renderer emits the prohibited sentence for every caller, so what (S) is about is the static '
+    + 'report rather than the sample',
+  )
+
+  // (S2) THE SAME LATER WRITE, SEEN BY THE VALUE WALK — and it needs no assertion anywhere.
+  //
+  // `resolveIdentifier` read a variable's initializer as its VALUE, which is the same mistake one
+  // layer down and a shorter route: `let renderMode = 'REVIEWED'` widens to `string`, the later
+  // `renderMode = 'UNREVIEWED'` is ordinary assignment, and no type is manufactured at any point.
+  // Rounds 22-29 are all about provenance of a CHECKER LITERAL and not one of them is looking here.
+  const viaRewrittenValueBinding = model.replace(
+    'export function renderLocalDirection(direction: LocalDirection, context: LocalDirectionContext): string {',
+    "let renderMode = 'REVIEWED'\n"
+    + "renderMode = 'UNREVIEWED'\n"
+    + '\n'
+    + 'export function renderLocalDirection(direction: LocalDirection, context: LocalDirectionContext): string {',
+  ).replace(
+    "      return 'confirm the invoice PDF stored against the order is the document you expect'",
+    "      return renderMode === 'REVIEWED'\n"
+    + "        ? 'confirm the invoice PDF stored against the order is the document you expect'\n"
+    + "        : '" + UNDECLARED_REMOTE_ACTION + "'",
+  )
+  assert.ok(
+    viaRewrittenValueBinding.includes("let renderMode = 'REVIEWED'\nrenderMode = 'UNREVIEWED'")
+      && viaRewrittenValueBinding.includes("return renderMode === 'REVIEWED'"),
+    'the rewritten-value mutation must actually have been applied',
+  )
+  // AND THERE IS NO ASSERTION IN IT AT ALL, which is what makes this a VALUE hole rather than a
+  // provenance one: nothing manufactures a type here, so every rule rounds 22-29 wrote is silent.
+  assert.equal(
+    viaRewrittenValueBinding.split('as unknown as').length, model.split('as unknown as').length,
+    'the value route must introduce no assertion, or it is one of the earlier rounds wearing a `let`',
+  )
+  assert.deepEqual(
+    modelDiagnostics(viaRewrittenValueBinding), modelDiagnostics(model),
+    'the rewritten-value mutation must type-check exactly as the shipped model does',
+  )
+  const rewrittenValueComplaints = judgeRendererOutput(viaRewrittenValueBinding)
+  assert.ok(
+    rewrittenValueComplaints.some((complaint) => complaint.startsWith('emits a sentence nobody reviewed')
+      && complaint.includes('take the second PDF off it')),
+    'CONTROL: the VALUE walk takes the same floor. A `let` binding\'s initializer is not what it holds. '
+    + `Saw: ${JSON.stringify(rewrittenValueComplaints)}`,
+  )
+  assert.deepEqual(
+    judgeRendererOutput(
+      viaRewrittenValueBinding, {}, 'SYMBOLIC', 'TRACKED', 'PROPAGATED', 'MODELLED', 'NAMED', 'ABSTRACT',
+      'CARRIED', 'DEMANDED', 'DEMANDED', 'DEMANDED', 'ANY_BINDING',
+    ),
+    [],
+    'THE PRE-FIX ANALYZER MUST STILL LET IT THROUGH, or (S2) proves nothing',
+  )
+  // ...and the SHIPPED model still computes its own `const administrator`, `SETTING_NAME` and
+  // `OUTBOX_READ_LIST` off their initializers — the floor removed `let` and `var`, not variables.
+  assert.ok(
+    emitted.some((value) => value.includes('to whoever administers this installation'))
+      && emitted.some((value) => value.includes('quickbooks_sync_attach_pdf')),
+    'the const floor must not have stopped the walk reading a `const` — if it had, the sentences composed out '
+    + 'of `administrator` and `SETTING_NAME` would have stopped being computable and every judgement above '
+    + 'would be vacuous',
   )
 
   // ...AND THE FIX DOES NOT UNDO ANY OF THE SEVEN. The routes those controls are about are still
