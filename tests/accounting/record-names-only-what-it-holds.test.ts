@@ -2867,10 +2867,49 @@ test('ROUND 18 (Codex HIGH): a formatter composing a MISMATCHED direction does n
 const UNDECLARED_REMOTE_ACTION = 'Go to that bill and take the second PDF off it.'
 
 /**
- * Hold a rendering of the model to the reviewed inventory. Taking the renderer as an argument is
- * what lets the refusal case below run the SAME check over a mutated one.
+ * THE REVIEWED SENTENCE AS ONE PARTICULAR CONTEXT WOULD PRINT IT (round 23, Codex HIGH).
+ *
+ * ROUND 22 COMPARED THE OTHER WAY ROUND. It rendered with a real connector name and pushed the
+ * OUTPUT back through `normaliseRenderedValues`, which maps BOTH 'QuickBooks' and 'Xero' onto the
+ * same `{ledger}`. That is lossy in exactly the direction that matters: a branch that hard-codes
+ * one connector's name is normalised into the other's reviewed sentence and passes, so the runtime
+ * pass could not see a wrong-connector sentence even while it was rendering one. The same holds for
+ * the sync row id, whose only sampled value was the fixture's own.
+ *
+ * So the substitution runs on the EXPECTED text, to the exact values this pass supplied, and the
+ * comparison is made on the renderer's own bytes. A sentence that differs from a reviewed one only
+ * by which connector it names now differs from what it is compared against, by those same bytes.
  */
-function assertRenderedInventory(render: (direction: LocalDirection) => string): void {
+function substitutePlaceholders(text: string, context: LocalDirectionContext): string {
+  // A placeholder this substitution does not know would be compared against a sentence nobody can
+  // produce, which is a silently unfalsifiable comparison rather than a failing one.
+  const unknownPlaceholder = text
+    .split('{ledger}').join('')
+    .split('{LEDGER}').join('')
+    .split('{syncRowId}').join('')
+    .match(/\{[A-Za-z]\w*\}/)
+  assert.equal(
+    unknownPlaceholder, null,
+    `the reviewed sentence ${JSON.stringify(text)} carries a placeholder this substitution does not know `
+    + `(${unknownPlaceholder?.[0]}), so comparing against it would compare against a sentence the renderer `
+    + 'cannot produce with any context at all',
+  )
+  return text
+    .split('{ledger}').join(context.ledger)
+    .split('{LEDGER}').join(context.ledger.toUpperCase())
+    .split('{syncRowId}').join(context.syncRowId)
+}
+
+/**
+ * Hold a rendering of the model to the reviewed inventory. Taking the renderer as an argument is
+ * what lets the refusal case below run the SAME check over a mutated one; taking `expected` is what
+ * lets a real-context pass compare against the reviewed sentence WITH THIS CONTEXT'S VALUES IN IT
+ * (round 23, Codex HIGH) rather than against a normalised copy of the output.
+ */
+function assertRenderedInventory(
+  render: (direction: LocalDirection) => string,
+  expected: (text: string) => string = (text) => text,
+): void {
   assert.equal(
     RENDERED_DIRECTIONS.length, LOCAL_DIRECTIONS.length,
     'every declared direction needs exactly one reviewed output, and the inventory no more than that',
@@ -2882,7 +2921,7 @@ function assertRenderedInventory(render: (direction: LocalDirection) => string):
       `${JSON.stringify(direction)} has ${entries.length} reviewed outputs — it must have exactly one`,
     )
     assert.equal(
-      render(direction), entries[0]!.text,
+      render(direction), expected(entries[0]!.text),
       `the ${direction.action}/${direction.target} branch emits prose that is NOT the reviewed sentence for it. `
       + 'Every string this renderer can emit is written out in RENDERED_DIRECTIONS and read there; a branch that '
       + 'produces something else is an instruction nobody reviewed',
@@ -2900,23 +2939,58 @@ test('ROUND 20 (Codex HIGH): every string the renderer emits is one written out 
   // whatever the renderer returns. Run as a control immediately below, so the claim is demonstrated.
   assertRenderedInventory((direction) => renderLocalDirection(direction, LOCAL_DIRECTION_CONTEXT))
 
-  // AND WITH THE REAL LEDGER NAMES PRODUCTION SUPPLIES (round 22, Codex HIGH), normalised back the
-  // way the corpus is. The placeholder context is a FIXTURE: a branch selected by comparing
-  // `context.ledger` against 'QuickBooks' or 'Xero' is never taken while it is what renders, so
-  // rendering only with it leaves exactly the branch production takes unexercised.
-  for (const ledger of ['QuickBooks', 'Xero']) {
-    assertRenderedInventory((direction) => normaliseRenderedValues(
-      renderLocalDirection(direction, { ledger, syncRowId: 'log-1' }),
-    ))
-  }
-  for (const { sequence, text } of RENDERED_DIRECTION_SEQUENCES) {
-    for (const ledger of ['QuickBooks', 'Xero']) {
+  // AND WITH THE REAL VALUES PRODUCTION SUPPLIES (round 22, Codex HIGH), compared against the
+  // reviewed sentence WITH THOSE VALUES SUBSTITUTED INTO IT (round 23, Codex HIGH). The placeholder
+  // context is a FIXTURE: a branch selected by comparing `context.ledger` against 'QuickBooks' or
+  // 'Xero' is never taken while it is what renders, so rendering only with it leaves exactly the
+  // branch production takes unexercised. Round 22 fixed that by normalising the output, which maps
+  // both connector names onto one placeholder and so cannot tell them apart — control (L) below.
+  //
+  // The sync row id is sampled at a value that is NOT the fixture's for the same reason: coverage
+  // that only ever passes 'log-1' cannot see a branch keyed on it (Codex, round 23).
+  const RUNTIME_CONTEXTS: readonly LocalDirectionContext[] = [
+    { ledger: 'QuickBooks', syncRowId: 'log-1' },
+    { ledger: 'Xero', syncRowId: 'log-1' },
+    { ledger: 'QuickBooks', syncRowId: 'sync-row-742' },
+    { ledger: 'Xero', syncRowId: 'sync-row-742' },
+  ]
+  for (const runtime of RUNTIME_CONTEXTS) {
+    assertRenderedInventory(
+      (direction) => renderLocalDirection(direction, runtime),
+      (text) => substitutePlaceholders(text, runtime),
+    )
+    for (const { sequence, text } of RENDERED_DIRECTION_SEQUENCES) {
       assert.equal(
-        normaliseRenderedValues(renderLocalDirectionSequence(sequence, { ledger, syncRowId: 'log-1' })), text,
-        'a sequence renders something other than its reviewed sentence once a real ledger name is in the context',
+        renderLocalDirectionSequence(sequence, runtime), substitutePlaceholders(text, runtime),
+        'a sequence renders something other than its reviewed sentence once real values are in the context',
       )
     }
   }
+
+  // (L) A CONNECTOR-MISMATCHED SENTENCE (round 23, Codex HIGH), and the one control here that is
+  // about the COMPARISON rather than about the renderer. This renderer prints the QuickBooks-named
+  // sentence for one direction while the context it was handed says Xero — which is what a branch
+  // pruned by an asserted discriminant ships at run time.
+  const xeroRuntime: LocalDirectionContext = { ledger: 'Xero', syncRowId: 'log-1' }
+  const quickBooksRuntime: LocalDirectionContext = { ledger: 'QuickBooks', syncRowId: 'log-1' }
+  const wrongConnector = (direction: LocalDirection): string => renderLocalDirection(
+    direction,
+    direction.action === 'TURN_OFF' && direction.control === 'CONNECTOR_PANEL_CHECKBOX'
+      ? quickBooksRuntime
+      : xeroRuntime,
+  )
+  assert.throws(
+    () => assertRenderedInventory(wrongConnector, (text) => substitutePlaceholders(text, xeroRuntime)),
+    /is NOT the reviewed sentence for it/,
+    'CONTROL: a sentence naming the WRONG connector for the context it was rendered with must be refused. The '
+    + 'reviewed text carries this pass\'s own values, so the only output that matches is the one that printed '
+    + 'them',
+  )
+  // ...AND NORMALISATION ACCEPTED IT, asserted rather than described — the same shape as (J). The
+  // round-22 comparison, run over the SAME mutated renderer, passes: `normaliseRenderedValues` maps
+  // 'QuickBooks' and 'Xero' onto one `{ledger}`, so the wrong connector's sentence is rewritten into
+  // the reviewed one before anything looks at it. That is the mutation of the CHECK itself.
+  assertRenderedInventory((direction) => normaliseRenderedValues(wrongConnector(direction)))
 
   // The sequences too: the conjunction is prose, and it is nobody's element.
   assert.equal(RENDERED_DIRECTION_SEQUENCES.length, LOCAL_DIRECTION_SEQUENCES.length)
@@ -3216,6 +3290,19 @@ function directionModelProgram(model: string, extraFiles: Record<string, string>
   host.fileExists = (fileName) => readOverlay(fileName) !== undefined || baseFileExists(fileName)
   host.readFile = (fileName) => readOverlay(fileName) ?? baseReadFile(fileName)
   return ts.createProgram([...overlay.keys()], options, host)
+}
+
+/**
+ * The semantic complaints the COMPILER makes about a model — so a control can establish that its
+ * mutation is one the type-checker admits, rather than a shape no diff could ever take.
+ */
+function modelDiagnostics(model: string, extraFiles: Record<string, string> = {}): string[] {
+  const program = directionModelProgram(model, extraFiles)
+  const modelPath = path.resolve(process.cwd(), DIRECTION_MODEL_FILE)
+  const modelFile = program.getSourceFiles().find((file) => path.resolve(file.fileName) === modelPath)
+  return program.getSemanticDiagnostics(modelFile).map((diagnostic) => (
+    ts.flattenDiagnosticMessageText(diagnostic.messageText, ' ')
+  ))
 }
 
 /** A callee this walk is willing to read: something with a body in a file that is not a declaration. */
@@ -3872,7 +3959,7 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
   // RENDERED_DIRECTIONS.
   //
   // Mutation: change any branch's prose, in any way, anywhere it is composed from, and this fails
-  // naming the value it now emits. Ten controls below (A-J), including the three Codex named.
+  // naming the value it now emits. Eleven controls below (A-K), including the four Codex named.
   const model = await readFile(path.join(process.cwd(), DIRECTION_MODEL_FILE), 'utf8')
   const computed = computeRendererOutput(model)
 
@@ -4186,6 +4273,59 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
     'CONTROL: `syncRowId` is a runtime value too, and it selects a branch the same way',
   )
   assert.deepEqual(judgeRendererOutput(viaRuntimeSyncRow, {}, 'CONCRETE'), [])
+
+  // (K) A DISCRIMINANT LAUNDERED THROUGH AN ASSERTION — THE ROUND-23 ROUTE (Codex HIGH), and the
+  // second control here about the EVALUATOR. Round 22 made `context.ledger` symbolic, so comparing
+  // against it is indeterminate. THIS MUTATION NEVER COMPARES AGAINST IT: it destructures the field
+  // through an `as` that CLAIMS the value is one literal, and the checker then reports that literal
+  // exactly as confidently as it reports a declared one. Fold it and the arm production takes at
+  // run time is pruned again, precisely as it was before round 22.
+  const viaAssertedBinding = model.replace(
+    "    case 'CONFIRM':\n      return 'confirm the invoice PDF stored against the order is the document you expect'",
+    "    case 'CONFIRM': {\n"
+    + "      const { ledger } = context as { ledger: 'QuickBooks'; syncRowId: string }\n"
+    + "      const otherLedger: string = 'Xero'\n"
+    + "      return ledger === otherLedger\n"
+    + "        ? '" + UNDECLARED_REMOTE_ACTION + "'\n"
+    + "        : 'confirm the invoice PDF stored against the order is the document you expect'\n"
+    + '    }',
+  )
+  assert.notEqual(viaAssertedBinding, model, 'the asserted-binding mutation must actually have been applied')
+  // AND IT IS A MUTATION THE COMPILER ADMITS, which is what makes it a route rather than a typo:
+  // `otherLedger` is `string`, so this is not the "have no overlap" comparison TypeScript rejects.
+  assert.deepEqual(
+    modelDiagnostics(viaAssertedBinding), modelDiagnostics(model),
+    'the asserted-binding mutation must type-check exactly as the shipped model does, or it is not a route '
+    + 'anybody could take',
+  )
+  const assertedBindingComplaints = judgeRendererOutput(viaAssertedBinding)
+  assert.ok(
+    assertedBindingComplaints.some((complaint) => complaint.startsWith('emits a sentence nobody reviewed')
+      && complaint.includes('take the second PDF off it')),
+    'CONTROL: a discriminant whose single-literal type was MANUFACTURED by an `as` over runtime context must be '
+    + 'INDETERMINATE — both arms taken, both outputs judged. A checker literal is knowledge about the program '
+    + `only when it came from a declaration. Saw: ${JSON.stringify(assertedBindingComplaints)}`,
+  )
+
+  // ...AND THE PROVENANCE-BLIND FOLD IS WHAT CATCHES IT, asserted rather than described — the same
+  // shape as (J). Re-run the SAME judgement over the SAME mutated renderer with checker literals
+  // folded on the checker's word alone, which is the round-22 rule, and it reports a clean inventory
+  // while the run-time Xero pass ships Codex's sentence.
+  assert.deepEqual(
+    judgeRendererOutput(viaAssertedBinding, {}, 'SYMBOLIC', 'UNTRACKED'), [],
+    'THE PRE-FIX FOLD MUST STILL LET IT THROUGH — if provenance-blind folding also refused this, control (K) '
+    + 'would be passing for some other reason and would prove nothing about tracking provenance',
+  )
+
+  // ...and the honest folds are STILL folded, or (K) was bought by refusing everything: the shipped
+  // model above raised nothing, and it only computes one sentence per direction because
+  // `direction.target`, `direction.form`, `direction.control` and `direction.caseForm` are read from
+  // the closed union's own property signatures.
+  assert.equal(
+    emitted.length, RENDERED_DIRECTIONS.length,
+    'a declared discriminant must still fold — if provenance tracking refused those too, every branch would be '
+    + 'taken both ways and the computed set would be wider than the inventory',
+  )
 
   // ...and a context field still RENDERS as its placeholder, which is the half that must NOT have
   // changed: every reviewed sentence that carries one is still emittable, and the shipped model
