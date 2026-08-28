@@ -504,8 +504,9 @@ to do:
 
 Set `IMS_CUTOVER_STATE_DIR` **in the environment of the root invocation** to move all four
 together; `IMS_DEPLOY_STATE_DIR` and `IMS_DATA_DIR` are still honoured. Setting any of them in
-`APP_DIR/.env` does nothing: `update.sh` sources that file as root and restores every deploy-control
-variable to what the invocation said, because the application user owns it (o3d-2sm1.5 r24). Until o3d-2sm1.5 `deploy.sh` kept its own set under
+`APP_DIR/.env` does nothing: the application user owns that file, and since o3d-2sm1.5 r25 none of
+the three entrypoints puts it into a shell's environment at all — each reads the handful of keys it
+needs out of it by name, so an `IMS_*` line in it never becomes a variable anywhere. Until o3d-2sm1.5 `deploy.sh` kept its own set under
 `/var/lib/ims-deploy` while the other two used the paths above, so following the banner after a
 failed install ran `deploy.sh` against a namespace holding none of it: no marker to adopt, no
 cron backup to reuse, and a fresh backup taken of an already-fenced crontab. Anything still at
@@ -769,16 +770,41 @@ not re-read unit files. Reordered rather than flagged `--no-reload`, so the inva
 depend on every future caller remembering a flag.
 
 **The snapshot directory is a literal, not a setting.** It was
-`${IMS_CUTOVER_ENV_DIR:-/etc/ims-cutover}` until r24, and `update.sh` sources `APP_DIR/.env` as
-root *before* it resolves that — so the variable choosing where the root-protected snapshot went
+`${IMS_CUTOVER_ENV_DIR:-/etc/ims-cutover}` until r24, and `update.sh` loaded `APP_DIR/.env` as
+root — with `source`, until r25 — *before* it resolved that — so the variable choosing where the root-protected snapshot went
 was one the **application user writes**, which is the whole boundary the location exists to draw.
 There is no configurable spelling of it that is safe: an override only a root-owned source may set
 is indistinguishable from no override. Move it by editing `DB_ENV_SNAPSHOT_DIR` at the top of all
-three entrypoints. For the same reason `update.sh` now captures every `IMS_*` deploy-control
-variable from the **root invocation's** environment before it sources `.env` and restores them
-verbatim afterwards, so the cutover namespace and the legacy namespace it imports from are
-likewise not the application's to move. `install.sh` and `deploy.sh` never source that file at all
-— they read one key at a time.
+three entrypoints. r24 followed that reasoning to a capture-and-restore: `update.sh` snapshotted
+every `IMS_*` deploy-control variable from the **root invocation's** environment before it sourced
+`.env` and put them back verbatim afterwards.
+
+**r25 removed the reason there was anything to restore.** `update.sh` `source`d two
+application-owned files as root — `APP_DIR/.env` and `APP_DIR/.deploy-meta` — and `source`
+*executes* a file. A `$(…)` in an ordinary-looking assignment, a bare command on a line of its
+own, a redefinition of one of the script's own functions, or an assignment to `SERVICE_UNIT`,
+`APP_DIR` or `DEPLOY_META_FILE` (none of which the restore covered) all ran **as root, before the
+restore**, so an application-account compromise reached root on the next update and the restore
+was no boundary at all.
+
+Both `source` calls are gone. `update.sh` now reads the five names it needs out of the two files
+by name, with the same non-evaluating dotenv reader `install.sh` and `deploy.sh` have always used
+— `DATABASE_URL` and `DEPLOY_ADMIN_DATABASE_URL` from `.env`; `GIT_REPO_URL`, `GIT_BRANCH` and
+`GIT_DEPLOY_KEY_ENABLED` from `.deploy-meta`. A line the reader is not asked for is never looked
+at, and a line it is asked for becomes a string and nothing else. The `set -a` that exported the
+whole of `.env` into the update shell and every child process went with it: every child that
+touches the database is handed its connection explicitly, and the build reads `APP_DIR/.env`
+itself through Next's own loader. The r24 capture-and-restore was **removed** rather than kept
+alongside — with nothing sourced, `IMS_*` can only come from the root invocation, and two
+mechanisms for one property are two things to keep true.
+
+**What this does not protect against.** The privileged driver is still `scripts/update.sh` itself,
+run by root from wherever the operator keeps it, and `APP_DIR/.deploy-meta` still supplies the
+re-clone URL — which is data the application account already controls, used only as an argument to
+a `git clone` that runs **as the application user** (passed after `--`, so a value starting with
+`-` cannot become a git option). Neither is a privilege crossing, but neither is a root-owned
+configuration input either. Moving the deployment metadata into a root-owned, non-writable
+location is filed as follow-up work, not done here.
 
 The binding is **removed on every exit path**: on the success path once the health check is behind
 it, and in the failure trap. A drop-in left standing would override `APP_DIR/.env` for every
