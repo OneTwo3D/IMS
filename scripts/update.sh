@@ -1224,18 +1224,19 @@ unit_listen_port() {
     # DATABASE_URL, that it is not: systemd applies EnvironmentFile= after Environment=, a `zz-`
     # drop-in's EnvironmentFile= lands last of all, UnsetEnvironment= is applied as the FINAL
     # step, and a PAM stack under PAMName= runs later still. A unit with `Environment=PORT=3000`,
-    # `EnvironmentFile=-${APP_DIR}/.env` and no CLI flag binds whatever PORT the APPLICATION
-    # writes into that file, while this returned 3000 — and the APP_PORT cross-check below cannot
-    # see it, because the name in the file would be PORT and not APP_PORT. The health poll then
-    # goes to an address the service never bound: no answer, and a healthy deployment is stopped
-    # and re-fenced; or an answer from something else, which the build-id probe cannot tell apart.
+    # an `EnvironmentFile=-` naming the APPLICATION'S OWN dotenv file, and no CLI flag binds
+    # whatever PORT that account writes into it, while this returned 3000 — and the APP_PORT
+    # cross-check at the port gate cannot see that, because the name in the file would be PORT and
+    # not APP_PORT. The health poll then goes to an address the service never bound: no answer,
+    # and a healthy deployment is stopped and re-fenced; or an answer from something else, which
+    # the build-id probe cannot tell apart from the service.
     #
     # So the doctrine that was written for one variable is now ASKED FOR THIS ONE, through the
     # same function — see unit_env_var_sole_source() above, whose `directive` layer refuses every
     # environment source composed after Environment=. On the installed unit that means a port
-    # pinned ONLY in Environment= is refused outright, because the unit loads ${APP_DIR}/.env:
-    # install.sh writes the port literally into ExecStart= (`next start -p <port>`), which is the
-    # branch above and needs none of this.
+    # pinned ONLY in Environment= is refused outright, because that unit loads an environment
+    # file; install.sh writes the port literally into ExecStart= (`next start -p <port>`), which
+    # is the branch above and needs none of this.
     if ! unit_env_var_sole_source PORT directive "" "$unit"; then
       UNIT_PORT_REASON="${unit} pins its port only in Environment=PORT=${env_port}, and a directive is not the composed environment: ${ENV_VAR_SOURCE_REASON}"
       return 1
