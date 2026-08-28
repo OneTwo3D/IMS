@@ -420,10 +420,14 @@ _fence_protected_dir_ready() {
 # command substitution, and DB_FENCE_ROTATION_NOTE set inside one dies with the subshell — which
 # is how the first version of this reported "could not be vendored" and swallowed the reason.
 _fence_vendor_closure() {
-  local app_dir="$1" out_file="$2" program rc=0 out
-  shift 2
-  program="${DB_FENCE_RECOVERY_DIR}/.fence-closure.cjs"
-  _fence_protected_dir_ready || return 1
+  local app_dir="$1" scratch="$2" out_file="$3" program rc=0 out
+  shift 3
+  # THE SCRATCH DIRECTORY IS THE CALLER'S, and it is always one this call already owns — the
+  # staging tree for a publication, the throwaway snapshot for a dry run. It was
+  # ${DB_FENCE_RECOVERY_DIR}, which made the DRY-RUN probe create a directory under /etc; a dry
+  # run writes nothing, least of all there, and that is the property the probe exists to keep.
+  program="${scratch}/.fence-closure.cjs"
+  mkdir -p "${scratch}" || return 1
   cat > "${program}" <<'CLOSURE_EOF' || return 1
 'use strict'
 const { createRequire } = require('module')
@@ -506,9 +510,10 @@ CLOSURE_EOF
 # parent is skipped rather than copied into itself.
 _fence_vendor_into() {
   local app_dir="$1" staged="$2" list relative count rc=0
-  list="${DB_FENCE_RECOVERY_DIR}/.fence-closure.list"
+  list="${staged}/.fence-closure.list"
+  mkdir -p "${staged}" || return 1
   rm -f "${list}"
-  _fence_vendor_closure "${app_dir}" "${list}" "${DB_FENCE_VENDOR_ROOTS[@]}" || { rm -f "${list}"; return 1; }
+  _fence_vendor_closure "${app_dir}" "${staged}" "${list}" "${DB_FENCE_VENDOR_ROOTS[@]}" || { rm -f "${list}"; return 1; }
   if [[ ! -s "${list}" ]]; then
     rm -f "${list}"
     DB_FENCE_ROTATION_NOTE="the fence helper's dependency closure resolved to nothing at all from ${app_dir}, which cannot be right while it still imports ${DB_FENCE_VENDOR_ROOTS[*]}"

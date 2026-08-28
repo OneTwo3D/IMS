@@ -7626,10 +7626,14 @@ test('r31: a dry run probes a root-owned snapshot, publishes nothing, and cleans
   //
   // MUTATION ROUTE: make db_fence_probe_script() return ${DB_FENCE_SCRIPT} when there is no
   // protected copy — which is what update.sh did before r31 — and the first two assertions fail.
-  // Delete the db_fence_probe_cleanup call and the last one fails.
+  // Delete the db_fence_probe_cleanup call and the "AFTER=gone" one fails. Point
+  // _fence_vendor_closure()'s scratch path back at ${DB_FENCE_RECOVERY_DIR} — which is where it
+  // first wrote its resolver — and the "nothing under the recovery directory" assertion fails,
+  // because a dry run would then create /etc/ims-cutover-recovery on a box that has none.
   const dirs = rotationDirs()
   try {
     writeFileSync(join(dirs.app, 'scripts', 'fence-db-connections.mjs'), '// v1\n')
+    rmSync(dirs.recovery, { recursive: true, force: true })
     const probe = runShell(
       rotationHarness(dirs, [
         'db_fence_probe_script || { echo "PROBE_FAILED"; exit 1; }',
@@ -7645,6 +7649,13 @@ test('r31: a dry run probes a root-owned snapshot, publishes nothing, and cleans
     assert.notEqual(probed, join(dirs.app, 'scripts', 'fence-db-connections.mjs'), 'never the checkout file in place')
     assert.match(probe.output, /^CONTENT=\/\/ v1$/m, 'but the same bytes, snapshotted')
     assert.ok(!existsSync(join(dirs.recovery, 'app')), 'and a dry run publishes nothing under the protected directory')
+    // NOT EVEN THE DIRECTORY (o3d-2sm1.5 r32). The snapshot now vendors the dependency closure
+    // too, and the resolver that computes it is a file that has to be written somewhere; writing
+    // it beside the protected artefact would make a dry run create /etc/ims-cutover-recovery on a
+    // box that has never had a fence. It goes in the throwaway instead.
+    assert.ok(!existsSync(dirs.recovery), 'and nothing at all under /etc — not even the recovery directory')
+    const temp = /^TEMP=(.*)$/m.exec(probe.output)?.[1] ?? ''
+    assert.ok(temp.length > 0, 'the probe must name its throwaway')
     assert.match(probe.output, /^AFTER=gone$/m, 'and the snapshot is removed when it is done with')
   } finally {
     rmSync(join(dirs.app, '..'), { recursive: true, force: true })

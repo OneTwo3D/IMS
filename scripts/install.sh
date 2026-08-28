@@ -2134,6 +2134,10 @@ release_db_connections() {
   error "no CONNECT on this database and cannot start until this is undone:"
   error "  ${DB_FENCE_RELEASE_CMD}"
   error "or, by hand as a superuser, the GRANT statements recorded in ${DB_FENCE_STATE}."
+  # o3d-2sm1.5 r32: see the same lines in scripts/deploy.sh. The state file is application-owned
+  # by necessity, so an instruction to run what it holds has to say what it is.
+  error "READ them first: that file is written by the fence AS ${APP_USER} and lives in an"
+  error "application-writable directory, so it is evidence to check, not SQL to paste unseen."
   return 1
 }
 

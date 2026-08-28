@@ -2058,6 +2058,12 @@ release_db_connections() {
   echo -e "${RED}[ERROR]${RESET} still has no CONNECT on this database and cannot start until this is undone:" >&2
   echo -e "${RED}[ERROR]${RESET}   ${DB_FENCE_RELEASE_CMD}" >&2
   echo -e "${RED}[ERROR]${RESET} or, by hand as a superuser, the GRANTs recorded in ${DB_FENCE_STATE}." >&2
+  # o3d-2sm1.5 r32: every printed instruction gets asked whether it names a path that is still
+  # TRUSTED. This one does not, and says so rather than being quietly dropped: ${DB_FENCE_STATE}
+  # is under the application-owned fence directory by necessity (the fence runs as that account
+  # and has to be able to release it), so what it records is evidence and not a script.
+  echo -e "${RED}[ERROR]${RESET} READ them first: that file is written by the fence AS ${APP_USER} and lives in an" >&2
+  echo -e "${RED}[ERROR]${RESET} application-writable directory, so it is evidence to check, not SQL to paste unseen." >&2
   return 1
 }
 
