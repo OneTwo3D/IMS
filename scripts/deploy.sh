@@ -539,17 +539,47 @@ source "${IMS_SCRIPT_LIB_DIR}/db-fence-protected.sh" || {
 }
 # The identity the fence is TOLD — see resolve_db_identity() below, which is defined after
 # env_file_value() because it reads DATABASE_URL out of the same .env. Starts empty so that a run
-# which cannot read it refuses instead of fencing an unidentified connection; DB_FENCE_RELEASE_CMD
-# is composed twice for the same reason.
-# The script named here is the one an operator would PASTE INTO A SHELL, so it has to be the file
-# that can actually release this fence — the protected copy once one has been resolved, and the
-# checkout's path only before that (o3d-2sm1.5 r31).
-db_fence_release_cmd() {
-  local script="${1:-${DB_FENCE_SCRIPT}}" args="" arg
-  for arg in "${DB_FENCE_IDENTITY_ARGS[@]:-}"; do
-    [[ -n "$arg" ]] && args+=" ${arg}"
-  done
-  echo "node ${script} --release --state-file=${DB_FENCE_STATE}${args}"
+# which cannot read it refuses instead of fencing an unidentified connection.
+#
+# ---------------------------------------------------------------------------
+# WHAT AN OPERATOR IS TOLD TO RUN (o3d-2sm1.5 r32, Codex HIGH x2)
+#
+# NOT A COMMAND LINE. r31 fixed which bytes this script executes and left every printed
+# instruction describing the world before it, which produced two separate defects of the same
+# kind:
+#
+#   * the printed `--release` line named the protected copy but had NO WAY TO OBTAIN
+#     DEPLOY_ADMIN_DATABASE_URL. The helper's `.env` load resolved against its own mirrored
+#     location, and the mirror holds no `.env`; the deploy's own copy of the variable lives in
+#     THIS shell and not in the operator's. Pasted, it failed while the database stayed fenced.
+#   * the re-fence banner — printed at the one moment when the schema has moved and the fence is
+#     down — still said `node ${DB_FENCE_SCRIPT} --fence`, the application-owned path, handing the
+#     admin credential to whatever is at it.
+#
+# So both are now ROOT-OWNED WRAPPERS, written by db_fence_publish_operator_wrappers() out of the
+# artefact this run resolved, with the state file and the four identity values baked in. They take
+# the credential from their own environment or from ${APP_DIR_REAL}/.env with the same reader
+# env_file_value() uses, re-verify the artefact digest before exec, and run as ${APP_USER}. There
+# is nothing to fill in and nothing to paste wrongly: the instruction is a path.
+DB_FENCE_RELEASE_CMD="${DB_FENCE_RELEASE_WRAPPER}"
+DB_FENCE_REFENCE_CMD="${DB_FENCE_REFENCE_WRAPPER}"
+
+# THE ONE PLACE THIS SCRIPT DECIDES WHICH BYTES THE FENCE RUNS, and the one place the recovery
+# wrappers are refreshed — so the file that is executed and the file an operator is pointed at can
+# never be about different artefacts. Prints the script path; the reason for a refusal is already
+# on stderr from the library.
+#
+# A wrapper that could not be written is a WARNING and not a refusal: it is a convenience file in
+# a root-owned directory, and failing a fence over it would trade a real protection for a
+# cosmetic one. The path printed in the banners is still the right one to run — a previous run's
+# wrapper is very likely standing there — and the warning says the refresh did not happen.
+resolve_fence_script() {
+  local script
+  script="$(db_fence_script_in_use)" || return 1
+  db_fence_publish_operator_wrappers "${APP_USER}" "${APP_DIR_REAL}/.env" "${DB_FENCE_STATE}" \
+    "${DB_FENCE_IDENTITY_ARGS[@]:-}" \
+    || echo "The recovery wrappers at ${DB_FENCE_RELEASE_WRAPPER} and ${DB_FENCE_REFENCE_WRAPPER} could not be refreshed for this run. Anything printed below that names them may be a previous run's copy; check it before running it." >&2
+  printf '%s' "$script"
 }
 DB_OBJECT_ACCESS_SCRIPT="${APP_DIR_REAL}/scripts/check-app-db-object-access.mjs"
 
@@ -1069,7 +1099,6 @@ require_env_file_is_sole_definition() {
 # in fence_db_connections() below, where the reason is printed and the deploy stops before
 # anything is stopped or migrated.
 resolve_db_identity "$(env_file_value DATABASE_URL "${APP_DIR_REAL}/.env")" || true
-DB_FENCE_RELEASE_CMD="$(db_fence_release_cmd)"
 
 # ---------------------------------------------------------------------------
 # AND RE-READ, BECAUSE SYSTEMD READS THAT FILE LATER THAN THIS DID
@@ -1768,7 +1797,7 @@ remove_db_identity_snapshot() {
 # ---------------------------------------------------------------------------
 fence_db_connections() {
   if $DRY_RUN; then
-    echo -e "${YELLOW}[DRY]${RESET}   would run: node scripts/fence-db-connections.mjs --fence  (as ${APP_USER})"
+    echo -e "${YELLOW}[DRY]${RESET}   would run: node ${DB_FENCE_SCRIPT_COPY} --fence  (as ${APP_USER})"
     return 0
   fi
   # A RECOVERY PATH MAY NOT DEPEND ON THE THING WHOSE LOSS IT RECOVERS FROM: a box that already
@@ -1802,11 +1831,8 @@ fence_db_connections() {
   # protected copy on a box that has none, and refuses one that does not match the recovery
   # record — happens with the fence about to be raised and not a build ago.
   local rc=0 fence_script
-  fence_script="$(db_fence_script_in_use)" || die \
+  fence_script="$(resolve_fence_script)" || die \
     "This run has no fence script it is willing to execute (the reason is printed above), so it cannot hold the database closed for the migration window. A snapshot probe is not a fence. Nothing has been migrated."
-  # The by-hand release command an operator may be given below names the file that will actually
-  # release this fence, which is the protected copy and not the checkout's path.
-  DB_FENCE_RELEASE_CMD="$(db_fence_release_cmd "$fence_script")"
   as_app_user env DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
     node "$fence_script" --fence --state-file="$DB_FENCE_STATE" "${DB_FENCE_IDENTITY_ARGS[@]:-}" || rc=$?
 
@@ -1960,7 +1986,7 @@ require_fenceable_database() {
   # the protected copy, so the bytes preflighted here are the bytes the fence is raised with a few
   # phases later, and the application account gets no window between the two.
   local rc=0 preflight_script
-  preflight_script="$(db_fence_script_in_use)" || die \
+  preflight_script="$(resolve_fence_script)" || die \
     "This run has no fence script it is willing to execute (the reason is printed above), so the migration window cannot be fenced. Nothing has been stopped and nothing has been migrated."
   as_app_user env DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
     node "$preflight_script" --preflight "${DB_FENCE_IDENTITY_ARGS[@]:-}" || rc=$?
@@ -1989,7 +2015,7 @@ release_db_connections() {
   # DEPLOY_ADMIN_DATABASE_URL in its environment; running the checkout's own file for that let the
   # account being released rewrite what "released" means, and report success without doing it.
   local rc=0 fence_script
-  fence_script="$(db_fence_script_in_use)" || { echo -e "${RED}[ERROR]${RESET} Cannot release the connection fence: this run has no fence script it is willing to execute (the reason is printed above), so nothing here can ask the database whether one is standing." >&2; return 1; }
+  fence_script="$(resolve_fence_script)" || { echo -e "${RED}[ERROR]${RESET} Cannot release the connection fence: this run has no fence script it is willing to execute (the reason is printed above), so nothing here can ask the database whether one is standing." >&2; return 1; }
 
   as_app_user env DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
     node "$fence_script" --release --state-file="$DB_FENCE_STATE" "${DB_FENCE_IDENTITY_ARGS[@]:-}" || rc=$?
@@ -2086,7 +2112,7 @@ refence_db_connections() {
   # refusal, like every other refusal in this function: dying inside an exit trap loses the status
   # and the banner.
   local rc=0 fence_script
-  fence_script="$(db_fence_script_in_use)" || return 1
+  fence_script="$(resolve_fence_script)" || return 1
   as_app_user env DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
     node "$fence_script" --fence --state-file="$DB_FENCE_STATE" "${DB_FENCE_IDENTITY_ARGS[@]:-}" || rc=$?
   # EVERY POST-COMMIT RESULT RAISES THE STICKY FLAG (o3d-2sm1.5, Codex r13 HIGH). Exit 5 says
@@ -2574,7 +2600,7 @@ on_exit() {
           echo -e "${RED}  stopped and fenced against a reboot. Do NOT start it. Close the database by${RESET}" >&2
           echo -e "${RED}  hand, or re-run this script, which re-establishes the fence before it${RESET}" >&2
           echo -e "${RED}  rebuilds:${RESET}" >&2
-          echo -e "${RED}    node ${DB_FENCE_SCRIPT} --fence --state-file=${DB_FENCE_STATE} ${DB_FENCE_IDENTITY_ARGS[*]:-}${RESET}" >&2
+          echo -e "${RED}    ${DB_FENCE_REFENCE_CMD}${RESET}" >&2
         fi
       else
         release_db_connections || true
@@ -3226,7 +3252,7 @@ step "Prove the writers are gone"
 
 if $DRY_RUN; then
   echo -e "${YELLOW}[DRY]${RESET}   would wait for :${PORT} to be free"
-  echo -e "${YELLOW}[DRY]${RESET}   would run: node scripts/fence-db-connections.mjs --fence  (as ${APP_USER})"
+  echo -e "${YELLOW}[DRY]${RESET}   would run: node ${DB_FENCE_SCRIPT_COPY} --fence  (as ${APP_USER})"
   echo -e "${YELLOW}[DRY]${RESET}   would run: node scripts/check-db-writers.mjs  (as ${APP_USER})"
 else
   for _ in $(seq 1 15); do

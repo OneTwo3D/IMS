@@ -144,10 +144,29 @@
 
 import { randomBytes } from 'node:crypto'
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs'
-import { dirname, resolve as resolvePath } from 'node:path'
-import { fileURLToPath, pathToFileURL } from 'node:url'
+import { dirname } from 'node:path'
+import { pathToFileURL } from 'node:url'
 
-import { config as loadDotenv } from 'dotenv'
+// THE ONLY BARE SPECIFIER LEFT, AND THAT IS THE POINT (o3d-2sm1.5 r32, Codex CRITICAL).
+//
+// This file is executed with DEPLOY_ADMIN_DATABASE_URL in its environment out of a root-owned
+// protected mirror (scripts/lib/db-fence-protected.sh), and everything it imports is executed
+// with it too — at module scope, BEFORE main() has a statement to run. The mirror used to reach
+// its `node_modules` through a symlink back into the application-owned checkout, so the account
+// this whole mechanism is built against still chose the bytes of every import. The closure of
+// `pg` is now VENDORED into the mirror and covered by the artefact digest.
+//
+// `dotenv` WAS HERE AND IS GONE. It existed for one call: loading `<app dir>/.env` so that an
+// operator pasting the printed `--release` command by hand would pick up the admin credential.
+// Under the mirror that call read `/etc/ims-cutover-recovery/app/.env`, which does not exist —
+// so it supplied nothing while adding a whole package to what runs with the credential. The
+// shell side reads that file already (env_file_value(), in all three entrypoints) and passes the
+// value through `env`, and the generated operator wrappers do the same. NOTHING HERE READS A
+// FILE OUT OF THE APPLICATION DIRECTORY ANY MORE — the credential arrives in the environment or
+// the run refuses.
+//
+// Adding an import means adding it to DB_FENCE_VENDOR_ROOTS in the library, and a test asserts
+// the two agree, so an unvendored dependency fails the suite rather than the cutover.
 import pg from 'pg'
 
 // ---------------------------------------------------------------------------
@@ -255,18 +274,6 @@ export function requireSuppliedIdentity(options = {}) {
     }
   }
   return { ok: true, reason: '', identity }
-}
-
-/**
- * The application directory, from THIS FILE'S OWN LOCATION and nothing else.
- *
- * The helper ships at `<app dir>/scripts/fence-db-connections.mjs`. Deriving the app dir from the
- * script rather than from `process.cwd()` is what makes every path below — the dotenv loads in
- * `main()` included — the same whether the deploy ran `cd` first and whether the operator pasted
- * the printed `--release` command into a shell sitting somewhere else (Codex r17 HIGH).
- */
-export function appDirectory(scriptUrl = import.meta.url) {
-  return dirname(dirname(fileURLToPath(scriptUrl)))
 }
 
 /**
@@ -1900,28 +1907,25 @@ export async function doRelease(client, options) {
 }
 
 async function main() {
-  // THE ONE FILE THIS STILL READS, AND ONLY FOR CREDENTIALS (o3d-2sm1.5 r19).
+  // THIS RUN READS NO FILE OUT OF THE APPLICATION DIRECTORY (o3d-2sm1.5 r32, Codex CRITICAL).
   //
-  // ABSOLUTE, AGAINST THIS SCRIPT'S OWN DIRECTORY (Codex r17 HIGH). This was a relative
-  // `.env`, resolved against whatever directory the caller happened to be in. The deploy `cd`s
-  // to the app dir first, so it worked there; the `--release` command this script's callers
-  // PRINT for an operator is a bare absolute `node /opt/.../fence-db-connections.mjs --release
-  // ...`, and from any other directory it loaded no DEPLOY_ADMIN_DATABASE_URL — so the one
-  // command offered for taking a committed fence back down could not obtain the admin connection
-  // that takes it down. The app dir comes from this file's own location, so the same path is read
-  // from every directory.
+  // It used to load `<app dir>/.env` through `dotenv`, resolved from this file's own location, so
+  // that the `--release` command the callers PRINT would pick up DEPLOY_ADMIN_DATABASE_URL from
+  // wherever an operator was standing (Codex r17 HIGH, and r18 dropped `.env.local` from that
+  // load). Both of those were right about the problem and are now solved somewhere better:
   //
-  // `.env.local` IS NO LONGER LOADED (Codex r18 CRITICAL). It was loaded FIRST, and it is a file
-  // systemd never gives the service: a DATABASE_URL there was invisible to the application and
-  // authoritative here, which is divergence bought for nothing. Only `.env` is read, and what it
-  // supplies is CREDENTIALS — DEPLOY_ADMIN_DATABASE_URL, DIRECT_URL, DATABASE_URL. NOT IDENTITY:
-  // which host, port, role and database this run is about comes from argv and from nowhere else,
-  // and every claim made about the connection that is opened is then proven against the
-  // connection itself (assessDatabaseIdentity, and the postmaster stamp in --release).
-  // `override: false` keeps a variable the caller passed deliberately winning over the file.
-  const appDir = appDirectory()
-  loadDotenv({ path: resolvePath(appDir, '.env'), override: false, quiet: true })
-
+  //   * the file this executes from is the ROOT-OWNED MIRROR, and `<mirror>/.env` does not exist,
+  //     so the load supplied nothing on the only path that runs — it was dead code holding a
+  //     package open in the import graph;
+  //   * the printed command is no longer a command line at all. It is a root-owned wrapper
+  //     (${DB_FENCE_RELEASE_WRAPPER}) generated at fence time, which reads that same `.env` with
+  //     the same one-key reader the entrypoints use and passes the value in through `env`.
+  //
+  // So credentials arrive in the ENVIRONMENT — DEPLOY_ADMIN_DATABASE_URL, and DIRECT_URL /
+  // DATABASE_URL for `--release` — and a run that is given none refuses and says so. Identity was
+  // already argv-only (see the section at the top), and every claim about the connection that is
+  // opened is proven against the connection itself (assessDatabaseIdentity, and the postmaster
+  // stamp in --release).
   const options = parseArgs(process.argv.slice(2))
   const modes = ['fence', 'release', 'preflight', 'print-migration-url']
   if (!modes.includes(options.mode)) {

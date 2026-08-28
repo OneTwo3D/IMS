@@ -84,7 +84,7 @@
 # expected digest is therefore an INPUT TO THE PRIVILEGED INVOCATION, from the release source and
 # not from the box:
 #
-#   IMS_FENCE_SCRIPT_SHA256=<64 hex> sudo -E scripts/update.sh
+#   IMS_FENCE_SCRIPT_SHA256=<64 hex> bash /path/to/release/scripts/update.sh      (as root)
 #
 # and the operator gets it from the release they are deploying, not from the deployed tree —
 # `git show <tag>:scripts/fence-db-connections.mjs | sha256sum` on a machine that is not this one,
@@ -346,7 +346,11 @@ _fence_tree_manifest() {
 _fence_tree_digest() {
   local manifest out
   manifest="$(_fence_tree_manifest "$1")" || return 1
-  out="$(printf '%s' "$manifest" | sha256sum 2>/dev/null)" || return 1
+  # printf '%s\n', not '%s': the manifest as a byte stream ENDS IN A NEWLINE, because that is
+  # what `xargs sha256sum` emits and therefore what ${DB_FENCE_ARTEFACT_RECIPE} hashes. Command
+  # substitution above stripped it; dropping it here instead would give a value no operator
+  # running the documented command could ever reproduce.
+  out="$(printf '%s\n' "$manifest" | sha256sum 2>/dev/null)" || return 1
   out="${out%% *}"
   fence_valid_sha256 "$out" || return 1
   printf '%s' "$out"
@@ -411,9 +415,13 @@ _fence_protected_dir_ready() {
 #
 # The program is written into the ROOT-OWNED recovery directory and run from there, never from the
 # checkout: it is authored by this file, which root read in the same instant as the entrypoint.
+#
+# THE ANSWER GOES TO A FILE, NOT TO STDOUT. Every caller would otherwise read it through a
+# command substitution, and DB_FENCE_ROTATION_NOTE set inside one dies with the subshell — which
+# is how the first version of this reported "could not be vendored" and swallowed the reason.
 _fence_vendor_closure() {
-  local app_dir="$1" program rc=0 out
-  shift
+  local app_dir="$1" out_file="$2" program rc=0 out
+  shift 2
   program="${DB_FENCE_RECOVERY_DIR}/.fence-closure.cjs"
   _fence_protected_dir_ready || return 1
   cat > "${program}" <<'CLOSURE_EOF' || return 1
@@ -482,7 +490,7 @@ CLOSURE_EOF
     DB_FENCE_ROTATION_NOTE="the fence helper's dependency closure could not be resolved from ${app_dir}, so no self-contained artefact could be built: ${out}"
     return 1
   fi
-  printf '%s\n' "${out}"
+  printf '%s\n' "${out}" > "${out_file}" || return 1
   return 0
 }
 
@@ -497,18 +505,23 @@ CLOSURE_EOF
 # before `node_modules/pg-types/node_modules/...`), so a nested package already inside a copied
 # parent is skipped rather than copied into itself.
 _fence_vendor_into() {
-  local app_dir="$1" staged="$2" closure relative count
-  closure="$(_fence_vendor_closure "${app_dir}" "${DB_FENCE_VENDOR_ROOTS[@]}")" || return 1
-  [[ -n "${closure}" ]] || {
+  local app_dir="$1" staged="$2" list relative count rc=0
+  list="${DB_FENCE_RECOVERY_DIR}/.fence-closure.list"
+  rm -f "${list}"
+  _fence_vendor_closure "${app_dir}" "${list}" "${DB_FENCE_VENDOR_ROOTS[@]}" || { rm -f "${list}"; return 1; }
+  if [[ ! -s "${list}" ]]; then
+    rm -f "${list}"
     DB_FENCE_ROTATION_NOTE="the fence helper's dependency closure resolved to nothing at all from ${app_dir}, which cannot be right while it still imports ${DB_FENCE_VENDOR_ROOTS[*]}"
     return 1
-  }
+  fi
   while IFS= read -r relative; do
     [[ -n "${relative}" ]] || continue
     [[ -e "${staged}/${relative}" ]] && continue
-    mkdir -p "${staged}/$(dirname "${relative}")" || return 1
-    cp -R --no-dereference -- "${app_dir}/${relative}" "${staged}/${relative}" || return 1
-  done <<< "${closure}"
+    mkdir -p "${staged}/$(dirname "${relative}")" || { rc=1; break; }
+    cp -R --no-dereference -- "${app_dir}/${relative}" "${staged}/${relative}" || { rc=1; break; }
+  done < "${list}"
+  rm -f "${list}"
+  [[ "${rc}" -eq 0 ]] || return 1
 
   count="$(find "${staged}" -type f 2>/dev/null | wc -l)" || return 1
   if [[ "${count}" -gt "${DB_FENCE_VENDOR_MAX_FILES}" ]]; then
