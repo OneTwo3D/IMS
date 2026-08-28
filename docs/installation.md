@@ -616,11 +616,27 @@ left them unset — so those three parameters *redirect the connection*. A `DATA
 `postgres://app@localhost:5432/appdb?host=remote.example&port=6432&user=actual` authenticates as
 `actual` against `remote.example:6432`, and the identity proof used to read it as `app` at
 `localhost:5432` and pass it against a local admin URL. The parse no longer *imitates* the
-driver's rules: the effective host, port, user and database are read straight out of the
-`pg-connection-string` module `pg` itself requires, resolved from `pg`'s own directory so it is
-the same code and not merely the same version. Two rounds running, a hand-rolled copy of libpq's
-rules disagreed with libpq — first about the authority, then about repetition — and each time the
-fence proved itself against a connection nobody uses. And:
+driver's rules, and no longer stops at the driver's **string parser** either: the effective host,
+port, user and database are read off the `pg.Client({ connectionString })` that `pg` would open,
+before it is opened. `client.host` and `client.port` are the two arguments handed to
+`Connection#connect()` and `client.user` / `client.database` are what goes in the startup packet,
+so there is nothing left between them and the wire. Three rounds running, something short of that
+client disagreed with it — first a hand-rolled read of the authority, then a hand-rolled read of
+repeated parameters, then `pg-connection-string.parse()`, which reads the URL and stops. And:
+
+* **the environment is part of the connection.** `pg/lib/connection-parameters.js` fills every
+  value the URL omits from `PGHOST`, `PGPORT`, `PGUSER` and `PGDATABASE` before dialling. With
+  `PGPORT=6432` a `DATABASE_URL` of `postgres://imsapp@localhost/imsdb` connects to **6432**,
+  and the identity proof used to read it as `5432`, agree with an admin URL that really was on
+  5432, and fence a cluster the application does not use for the length of the migration. A
+  path-less URL likewise lands on `PGDATABASE`, or failing that on the login role's own name;
+* **except the OS account**, which is not configuration. `pg`'s last fallback for the login role
+  is `process.env.USER` — the account running whichever process asked, which for this script is
+  the deploy account and not the application's. That one value is subtracted (detected by asking
+  the driver to resolve again with its own default swapped out, not by re-reading the URL), and
+  an identity that rests on it is **unidentified**, which is refused;
+* a port `pg` cannot read as a number reaches `ConnectionParameters` as `NaN`, and is **refused**
+  rather than quietly defaulted to 5432;
 
 * a **repeated** `?host=`, `?port=`, `?user=`, `?dbname=` or `?database=` is **refused** outright.
   The driver copies every query entry into one config object, so the **last** one is the one it

@@ -178,12 +178,46 @@ import pg from 'pg'
  * Consequently this file holds NO opinion about how a URL resolves, and no fallback that could
  * hold one: a construction that throws is reported as "where it connects is unknown", which is
  * refused everywhere identity is required.
+ *
+ * The single deliberate subtraction is the OS-account fallback for the login role -- see the body.
+ * It is subtracted rather than corrected, and it is DETECTED BY ASKING THE DRIVER, not by
+ * re-reading the URL, so this is still not a reimplementation of anything.
  */
+const OS_ACCOUNT_SENTINEL = ' fence-os-account-default '
+
 export function resolveDriverIdentity(connectionString) {
   // NOT connected, and never connected: the constructor resolves ConnectionParameters and
   // allocates an unconnected socket, nothing more.
   const client = new pg.Client({ connectionString })
-  return { host: client.host, port: client.port, user: client.user, database: client.database }
+
+  // THE ONE COMPONENT THAT IS NOT SHARED CONFIGURATION. `PGHOST`, `PGPORT`, `PGUSER` and
+  // `PGDATABASE` are deliberate settings that this script and the application read from the same
+  // environment, so honouring them is the whole point of resolving through the driver. `pg`'s
+  // LAST fallback for the login role is not a setting at all: it is `process.env.USER`, the OS
+  // account of whichever process happens to be running. This script runs as the deploy account;
+  // the application runs as its own. Taking the deploy's OS account for the application's login
+  // role would revoke CONNECT from a role nobody connects as and report the door shut.
+  //
+  // Asked of the driver rather than inferred: re-resolve with `pg.defaults.user` swapped for a
+  // sentinel, and if the answer moves, that field came from the OS account and from nothing else.
+  // `ConnectionParameters` also falls the database back to the login role's name, so the same
+  // swap reveals a database that is ambient for the same reason. Either one resolves to '' here,
+  // which every caller already treats as "unidentified", and unidentified is refused.
+  const previousDefault = pg.defaults.user
+  let probe
+  try {
+    pg.defaults.user = OS_ACCOUNT_SENTINEL
+    probe = new pg.Client({ connectionString })
+  } finally {
+    pg.defaults.user = previousDefault
+  }
+
+  return {
+    host: client.host,
+    port: client.port,
+    user: probe.user === OS_ACCOUNT_SENTINEL ? '' : client.user,
+    database: probe.database === OS_ACCOUNT_SENTINEL ? '' : client.database,
+  }
 }
 
 export const EXIT_OK = 0

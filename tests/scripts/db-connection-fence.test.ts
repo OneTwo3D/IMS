@@ -6,10 +6,43 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 
 /**
- * The parser `pg` requires, asked DIRECTLY. Imported here rather than re-exported from the script
- * under test, so a parity assertion against it is a real comparison and not a tautology.
+ * BOTH HALVES OF THE DRIVER, asked DIRECTLY rather than re-exported from the script under test.
+ *
+ * `driverParse` is the STRING PARSER: it reads the URL and stops. `driverConnection` is the
+ * CONNECTION: `pg/lib/connection-parameters.js` folds `PGHOST`, `PGPORT`, `PGUSER`, `PGDATABASE`
+ * and its own defaults over the parser's output, and that is what `Connection#connect()` and
+ * `getStartupConf()` are handed. The parity tests below assert the script against the SECOND one
+ * and assert that the two DISAGREE on the URLs they use -- so agreeing with the connection is
+ * measurably not agreeing with the parser, and the comparison cannot pass by accident.
  */
+import pg from 'pg'
 import { parse as driverParse } from 'pg-connection-string'
+
+/** The final connection configuration, built exactly as `pg` builds it and never opened. */
+function driverConnection(connectionString: string) {
+  const client = new pg.Client({ connectionString })
+  return {
+    host: String(client.host ?? ''),
+    port: Number(client.port),
+    user: String(client.user ?? ''),
+    database: String(client.database ?? ''),
+  }
+}
+
+/** Set PG* environment variables for the length of one test and put back what was there. */
+function withPgEnv(values: Record<string, string>): () => void {
+  const previous = new Map<string, string | undefined>()
+  for (const [key, value] of Object.entries(values)) {
+    previous.set(key, process.env[key])
+    process.env[key] = value
+  }
+  return () => {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  }
+}
 
 import {
   EXIT_ERROR,
@@ -1142,7 +1175,7 @@ test('nothing to bind to is not a pass: an unset or database-less DATABASE_URL i
   assert.equal(
     assessDatabaseIdentity({ ...ATTACHED_AS_ADMIN, adminUrl: 'postgres://deployadmin@localhost/imsdb', appUrl: 'postgres://imsapp@localhost/', connectedDatabase: 'imsdb' }).bound,
     false,
-    'a URL with no database in its path identifies no database',
+    'a URL with no database in its path lands on the login role\'s own name, which is not the database this run is attached to',
   )
   assert.equal(parseConnectionIdentity('not a url at all').ok, false)
 })
@@ -1697,45 +1730,71 @@ test('a repeated identity parameter is refused, because the driver keeps the LAS
   assert.equal(parseConnectionIdentity('postgres://imsapp@localhost:5432/onetwo3d_ims?sslmode=disable&application_name=x').ok, true)
 })
 
-test('the effective host, port, user and database are the installed parser\'s answers, not a copy of its rules', () => {
-  // Every field is read out of pg-connection-string, so this compares the script against the
-  // module rather than against a belief about it. The two known divergences of a hand-rolled
-  // parse are in here: the query/authority precedence (r14) and the database path, which the
-  // driver decodes with decodeURI — NOT decodeURIComponent, so `%2F` survives.
+test('the effective host, port, user and database are the DRIVER\'S CONNECTION, not a parser\'s reading of the URL', () => {
+  // r16's finding is that a string parser is not a connection: pg/lib/connection-parameters.js
+  // fills everything the URL omits from PGHOST/PGPORT/PGUSER/PGDATABASE and its own defaults
+  // BEFORE dialling. So this loop runs with all four set to values NO URL below mentions, and
+  // compares the script against the final connection rather than against the parser.
   //
-  // MUTATION ROUTE, verified on each of three fields: restore
-  // `decodeOrRaw(url.pathname.replace(/^\//, ''))` for the database and the last case resolves to
-  // 'ims/db' while the driver connects to a database literally named 'ims%2Fdb'; restore
-  // `url.username` for the user and `ims%2Bapp` stops being decoded; restore
-  // `authorityPort || '5432'` for the port and the `@/` case reads 5432 while the driver dials
-  // 6432. The HOST is the one field this loop cannot move on its own — the authority/query
-  // conflict refusal above already rejects every URL whose two spellings disagree, so nothing
-  // reaches the derivation with a host to get wrong. It is read from the driver anyway, because
-  // the next round's finding is the one nobody predicted.
-  for (const url of [
-    'postgres://imsapp@localhost:5432/onetwo3d_ims',
-    'postgres://imsapp@localhost/onetwo3d_ims',
-    'postgres://localhost/onetwo3d_ims',
-    'postgres://imsapp@localhost:5432/onetwo3d_ims?host=',
-    'postgres://imsapp@/onetwo3d_ims?host=remote.example&port=6432',
-    'postgres://ims%2Bapp@localhost/onetwo3d_ims',
-    'postgres://imsapp@localhost/ims%2Fdb',
-  ]) {
-    const identity = parseConnectionIdentity(url)
-    assert.equal(identity.ok, true, `${url} is a URL the driver connects with and must not be refused`)
-    const effective = driverParse(url)
-    assert.equal(identity.host, effective.host ?? '', `host of ${url}`)
-    assert.equal(identity.user, effective.user ?? '', `user of ${url}`)
-    assert.equal(identity.database, effective.database ?? '', `database of ${url}`)
-    // The one deliberate departure, and it is an addition rather than a difference: the driver
-    // leaves the port empty when the URL omits it, and this fills in libpq's default so that two
-    // URLs written `:5432` and bare compare equal instead of refusing each other.
-    assert.equal(identity.port, String(effective.port ?? '') || '5432', `port of ${url}`)
+  // MUTATION ROUTE, verified on each of the four fields: make resolveDriverIdentity() return the
+  // installed `pg-connection-string` parse of the URL — the r15 implementation, i.e. the exact
+  // code this finding was raised against — and the loop fails on the host of the `@/` case, the
+  // port of every case that omits one, the user of the case with no username and the database of
+  // the case with an empty path. The preconditions immediately below assert that divergence
+  // directly, so the loop cannot pass by comparing two identically-wrong answers.
+  const restore = withPgEnv({ PGHOST: 'env.example', PGPORT: '6432', PGUSER: 'envrole', PGDATABASE: 'envdb' })
+  try {
+    // The parser and the connection genuinely disagree here — one field at a time.
+    assert.equal(driverParse('postgres://imsapp@/onetwo3d_ims').host ?? '', '', 'precondition: the parser sees no host')
+    assert.equal(driverConnection('postgres://imsapp@/onetwo3d_ims').host, 'env.example', 'and the connection dials PGHOST')
+    assert.equal(driverParse('postgres://imsapp@localhost/onetwo3d_ims').port ?? '', '', 'precondition: the parser sees no port')
+    assert.equal(driverConnection('postgres://imsapp@localhost/onetwo3d_ims').port, 6432, 'and the connection dials PGPORT')
+    assert.equal(driverParse('postgres://localhost/onetwo3d_ims').user ?? '', '', 'precondition: the parser sees no user')
+    assert.equal(driverConnection('postgres://localhost/onetwo3d_ims').user, 'envrole', 'and the connection authenticates as PGUSER')
+    assert.equal(driverParse('postgres://imsapp@localhost/').database ?? '', '', 'precondition: the parser sees no database')
+    assert.equal(driverConnection('postgres://imsapp@localhost/').database, 'envdb', 'and the connection attaches to PGDATABASE')
+
+    for (const url of [
+      'postgres://imsapp@localhost:5432/onetwo3d_ims',
+      'postgres://imsapp@localhost/onetwo3d_ims',
+      'postgres://localhost/onetwo3d_ims',
+      'postgres://imsapp@localhost/',
+      'postgres://imsapp@/onetwo3d_ims',
+      'postgres://imsapp@localhost:5432/onetwo3d_ims?host=',
+      'postgres://imsapp@/onetwo3d_ims?host=remote.example&port=6432',
+      'postgres://ims%2Bapp@localhost:5432/onetwo3d_ims',
+      'postgres://imsapp@localhost:5432/ims%2Fdb',
+    ]) {
+      const identity = parseConnectionIdentity(url)
+      assert.equal(identity.ok, true, `${url} is a URL the driver connects with and must not be refused`)
+      const effective = driverConnection(url)
+      assert.equal(identity.host, effective.host, `host of ${url}`)
+      assert.equal(identity.user, effective.user, `user of ${url}`)
+      assert.equal(identity.database, effective.database, `database of ${url}`)
+      assert.equal(identity.port, String(effective.port), `port of ${url}`)
+    }
+    // Named, so the parity loop above cannot pass by comparing two identically-wrong answers.
+    // The driver decodes the path with decodeURI — NOT decodeURIComponent — so `%2F` survives,
+    // while the username is decoded and `%2B` does not.
+    assert.equal(parseConnectionIdentity('postgres://imsapp@localhost:5432/ims%2Fdb').database, 'ims%2Fdb')
+    assert.equal(parseConnectionIdentity('postgres://ims%2Bapp@localhost:5432/onetwo3d_ims').user, 'ims+app')
+    assert.equal(parseConnectionIdentity('postgres://imsapp@/onetwo3d_ims?host=remote.example&port=6432').server, 'remote.example:6432')
+  } finally {
+    restore()
   }
-  // Named, so the parity loop above cannot pass by comparing two identically-wrong answers.
-  assert.equal(parseConnectionIdentity('postgres://imsapp@localhost/ims%2Fdb').database, 'ims%2Fdb')
-  assert.equal(parseConnectionIdentity('postgres://ims%2Bapp@localhost/onetwo3d_ims').user, 'ims+app')
-  assert.equal(parseConnectionIdentity('postgres://imsapp@/onetwo3d_ims?host=remote.example&port=6432').server, 'remote.example:6432')
+})
+
+test('a port node-postgres cannot read as a number is refused, not silently defaulted to 5432', () => {
+  // ConnectionParameters runs the port through parseInt, so `?port=6432x` is NaN on the wire and
+  // where this URL lands is genuinely unknown. Defaulting it would name a cluster nobody asked
+  // for and then fence that one.
+  //
+  // MUTATION ROUTE: drop the Number.isInteger(driver.port) arm from parseConnectionIdentity() and
+  // this becomes ok with the port 'NaN', which no comparison in assessDatabaseIdentity() rejects.
+  assert.ok(Number.isNaN(driverConnection('postgres://imsapp@localhost/imsdb?port=nonsense').port), 'precondition: NaN is what reaches the driver')
+  const identity = parseConnectionIdentity('postgres://imsapp@localhost/imsdb?port=nonsense')
+  assert.equal(identity.ok, false)
+  assert.match(identity.reason, /port number/)
 })
 
 test('the fence revokes nothing, and commits nothing, when DATABASE_URL names two hosts, two ports and two roles', async () => {
@@ -1768,5 +1827,152 @@ test('the fence revokes nothing, and commits nothing, when DATABASE_URL names tw
     assert.equal(existsSync(stateFile), false, 'and no record may be published for a fence that never happened')
   } finally {
     rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a value the URL never mentions and the ENVIRONMENT supplies is where the application really connects, and the fence follows it there', async () => {
+  // THE WHOLE r16 FINDING, IN THE DIRECTION THAT ACTUALLY FENCES.
+  //
+  // DATABASE_URL names no port. PGPORT does, and node-postgres dials it. Read the URL — even with
+  // the driver's OWN STRING PARSER, which is what r15 shipped — and the application looks like it
+  // is on 5432, which is exactly where the admin URL is: the identity binds, the fence revokes
+  // CONNECT on 5432, and the application writes to 6432 undisturbed for the whole migration. The
+  // one cluster nobody is protecting is the one being migrated.
+  //
+  // MUTATION ROUTE: make resolveDriverIdentity() return the installed pg-connection-string parse
+  // of the connection string, and every assertion below flips — identity.port reads '5432', the
+  // server reads '(this host):5432', assessDatabaseIdentity() returns bound, and doFence()
+  // revokes, commits and writes the state file.
+  const restore = withPgEnv({ PGPORT: '6432' })
+  try {
+    const appUrl = 'postgres://imsapp@localhost/imsdb'
+    assert.equal(driverParse(appUrl).port ?? '', '', 'precondition: the URL itself names no port at all')
+    assert.equal(driverConnection(appUrl).port, 6432, 'precondition: and the connection node-postgres opens is on 6432')
+
+    const identity = parseConnectionIdentity(appUrl)
+    assert.equal(identity.port, '6432', 'the port the environment supplies is the port this connects to')
+    assert.equal(identity.server, '(this host):6432')
+
+    const verdict = assessDatabaseIdentity({
+      ...ATTACHED_AS_ADMIN,
+      adminUrl: 'postgres://deployadmin@localhost:5432/imsdb',
+      appUrl,
+      connectedDatabase: 'imsdb',
+    })
+    assert.equal(verdict.bound, false, 'the admin connection is on 5432 and the application is not')
+    assert.match(verdict.reason, /6432/, 'and the refusal names where the application really is')
+
+    // At the wire: nothing revoked, nothing committed, no record published.
+    const dir = stateDir()
+    try {
+      const stateFile = join(dir, 'db-connect-fence.json')
+      const client = new FakeAdminClient({ stateFile })
+      const code = await withRedirectedAppUrl(appUrl, () =>
+        doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1 }),
+      )
+      assert.equal(code, EXIT_NOT_FENCEABLE)
+      assert.deepEqual(client.revokes, [], 'nothing may be revoked on a cluster the application does not use')
+      assert.ok(!client.log.includes('COMMIT'), 'and no transaction may commit')
+      assert.equal(existsSync(stateFile), false, 'and no record may be published for a fence that never happened')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  } finally {
+    restore()
+  }
+})
+
+test('an empty authority plus PGHOST moves the whole server, and that is refused rather than bound', () => {
+  // The same defect on the other axis. `postgres://role@/db` is the libpq form with no host at
+  // all; the parser reports '' and node-postgres then takes PGHOST. A fence bound on the parser's
+  // answer locks out this machine while the application is on another one entirely.
+  //
+  // MUTATION ROUTE: return the pg-connection-string parse from resolveDriverIdentity() and the
+  // host reads '' — which LOCAL_HOSTS treats as "(this host)" — so this binds to the local admin
+  // URL and fences the wrong machine.
+  const restore = withPgEnv({ PGHOST: 'remote.example' })
+  try {
+    const appUrl = 'postgres://imsapp@/imsdb'
+    assert.equal(driverParse(appUrl).host ?? '', '', 'precondition: the URL names no host')
+    const identity = parseConnectionIdentity(appUrl)
+    assert.equal(identity.host, 'remote.example')
+    assert.equal(identity.server, 'remote.example:5432')
+    const verdict = assessDatabaseIdentity({
+      ...ATTACHED_AS_ADMIN,
+      adminUrl: 'postgres://deployadmin@localhost:5432/imsdb',
+      appUrl,
+      connectedDatabase: 'imsdb',
+    })
+    assert.equal(verdict.bound, false)
+    assert.match(verdict.reason, /remote\.example/)
+  } finally {
+    restore()
+  }
+})
+
+test('PGDATABASE is where a path-less DATABASE_URL lands, and the live attachment still has to agree with it', () => {
+  // A URL with an empty path used to be refused as "names no database". That was a statement
+  // about the URL, not about the connection: node-postgres attaches to PGDATABASE, and failing
+  // that to the login role's own name. Both are now resolved, and both are then held against
+  // current_database() read from the connection this run actually opened — which is the half a
+  // URL cannot fake.
+  //
+  // MUTATION ROUTE: return the pg-connection-string parse from resolveDriverIdentity() and the
+  // first case reads no database at all, so the run reports "DATABASE_URL resolves to no
+  // database" about a URL that resolves perfectly well to onetwo3d_ims.
+  const restore = withPgEnv({ PGDATABASE: 'onetwo3d_ims' })
+  try {
+    assert.equal(parseConnectionIdentity('postgres://imsapp@localhost/').database, 'onetwo3d_ims')
+    assert.equal(
+      assessDatabaseIdentity({ ...ATTACHED_AS_ADMIN, adminUrl: 'postgres://deployadmin@localhost/onetwo3d_ims', appUrl: 'postgres://imsapp@localhost/', connectedDatabase: 'onetwo3d_ims' }).bound,
+      true,
+      'the connection is attached to the database the environment sends it to',
+    )
+    assert.equal(
+      assessDatabaseIdentity({ ...ATTACHED_AS_ADMIN, adminUrl: 'postgres://deployadmin@localhost/onetwo3d_ims', appUrl: 'postgres://imsapp@localhost/', connectedDatabase: 'imsdb' }).bound,
+      false,
+      'and a connection attached elsewhere is still refused',
+    )
+  } finally {
+    restore()
+  }
+  // With no PGDATABASE, libpq falls back to the login role's own name — so this URL identifies
+  // "imsapp", and a run attached to imsdb is not it.
+  assert.equal(parseConnectionIdentity('postgres://imsapp@localhost/').database, 'imsapp')
+  assert.equal(
+    assessDatabaseIdentity({ ...ATTACHED_AS_ADMIN, adminUrl: 'postgres://deployadmin@localhost/imsdb', appUrl: 'postgres://imsapp@localhost/', connectedDatabase: 'imsdb' }).bound,
+    false,
+  )
+})
+
+test('the deploy account\'s own OS user is not the application\'s login role, and is not mistaken for it', () => {
+  // PGHOST/PGPORT/PGUSER/PGDATABASE are deliberate settings this script and the application read
+  // from the same environment, which is why identity now resolves through them. pg's LAST
+  // fallback for the login role is not a setting at all — it is process.env.USER, the account
+  // running whichever process asked. This script runs as the deploy account and the application
+  // runs as its own, so taking one for the other would revoke CONNECT from a role nobody
+  // connects as and then report the door shut.
+  //
+  // MUTATION ROUTE: delete the OS_ACCOUNT_SENTINEL probe from resolveDriverIdentity() and return
+  // client.user/client.database straight through. This test then reads back whatever account the
+  // suite happens to be running as instead of '', and the unix-socket admin URL in 'a loopback
+  // address, localhost and a unix socket are the same machine' starts being refused for naming a
+  // role it never named — i.e. the suite's verdict starts depending on who runs it.
+  assert.equal(driverConnection('postgresql://localhost/ims').user, String(pg.defaults.user), 'precondition: the driver does fall back to the OS account')
+  assert.equal(parseRoleFromConnectionString('postgresql://localhost/ims'), '', 'and no OS account is accepted as the application role')
+  assert.equal(parseConnectionIdentity('postgresql://localhost/').database, '', 'nor as the database libpq would derive from it')
+  assert.equal(
+    assessDatabaseIdentity({ ...ATTACHED_AS_ADMIN, adminUrl: 'postgres://deployadmin@localhost/imsdb', appUrl: 'postgresql://localhost/', connectedDatabase: 'imsdb' }).bound,
+    false,
+    'so there is nothing to bind the run to',
+  )
+
+  // PGUSER, by contrast, IS deliberate shared configuration, and is honoured like the rest.
+  const restore = withPgEnv({ PGUSER: 'configured' })
+  try {
+    assert.equal(parseRoleFromConnectionString('postgresql://localhost/ims'), 'configured')
+    assert.equal(parseConnectionIdentity('postgresql://localhost/').database, 'configured')
+  } finally {
+    restore()
   }
 })
