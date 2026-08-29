@@ -392,3 +392,45 @@ test('an ADMITTED order is unaffected — the durability check governs refusals 
     'and a real import still advances the cursor',
   )
 })
+
+// --- the field the OTHER callers read ----------------------------------------------------------
+
+test('an unrecorded refusal is reported as a FIELD, not as a sentence in `error`', async () => {
+  // o3d-batch-ret r15 (Codex HIGH). The webhook above can decide from `skipped` alone, because its
+  // failure handling is already "do not acknowledge". Every other caller of `importWcOrder` has to
+  // decide something else — whether to advance a cursor, whether to retire a queue row, whether to
+  // mark a backfill complete — and round 14 left the initial import matching on nothing at all and
+  // completing anyway. That decision cannot rest on prose, so it rests on this field.
+  //
+  // Driven through the REAL `importWcOrder`, with the real recorder and the real fault: a double
+  // returning the field would be asserting the double.
+  reset()
+  store.syncLogWritesThrow = true
+  const { importWcOrder } = await import('@/lib/connectors/woocommerce/sync/order-import')
+
+  const result = await importWcOrder(wcOrder(261, 'pending') as never)
+
+  assert.equal((await queued()).length, 0, 'precondition: the fault means nothing was recorded')
+  assert.equal(result.success, false)
+  assert.equal(result.skipped, undefined, 'an unrecorded refusal is not a resolved decision')
+  assert.equal(
+    result.unrecordedRefusal,
+    'status_not_admitted',
+    'and it names the reason, so a caller can log what it is withholding progress for',
+  )
+})
+
+test('a refusal that PERSISTS leaves the field unset, so it is not a synonym for "refused"', async () => {
+  // The control. A guard written against `unrecordedRefusal` must not fire on the ordinary
+  // acknowledged refusal an excluded status produces on every delivery — that would stop any store
+  // with an unticked status finishing its initial import.
+  reset()
+  const { importWcOrder } = await import('@/lib/connectors/woocommerce/sync/order-import')
+
+  const result = await importWcOrder(wcOrder(262, 'pending') as never)
+
+  assert.equal((await queued()).length, 1, 'precondition: this refusal really was recorded')
+  assert.equal(result.success, true)
+  assert.equal(result.skipped, 'status_not_admitted')
+  assert.equal(result.unrecordedRefusal, undefined)
+})
