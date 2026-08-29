@@ -761,7 +761,10 @@ DB_ENV_SNAPSHOT_DROPIN_FILE="${FENCE_DROPIN_DIR}/${DB_ENV_SNAPSHOT_DROPIN_NAME}"
 #
 # IT IS PERMANENT, unlike the identity snapshot. The snapshot pins ONE run's database and is
 # removed again before this script exits; there is no run in which the application is supposed to
-# take its transport from an ambient variable, so this stays on the host.
+# take its transport from an ambient variable, so this stays on the host. That is also what covers
+# the OTHER two entrypoints: deploy.sh and update.sh start the same unit and neither composes a
+# DATABASE_URL of its own, so neither has a transport to derive — what they need is that the
+# service they start cannot pick one up, and the directive left here is what gives them that.
 DB_ROUTE_DROPIN_NAME="zz-deploy-db-route.conf"
 DB_ROUTE_DROPIN_FILE="${FENCE_DROPIN_DIR}/${DB_ROUTE_DROPIN_NAME}"
 # ONE lock for all three entrypoints. deploy.sh and update.sh each held their own and this
@@ -1264,22 +1267,29 @@ compose_database_url() {
 # installed `pg` (8.20.0) and `pg-connection-string` (2.12.0), a URL with no query string parses to
 # `ssl: undefined` and the driver's first bytes on the wire are the StartupMessage itself: NO
 # SSLRequest, no GSSENCRequest. That is libpq's `sslmode=disable`, and it is matched by
-# `hostnossl`/`host` records and never by a `hostssl` one.
+# `hostnossl`/`host` records and never by a `hostssl` one. It is still what DB_SSLMODE=disable — the
+# default, and every installation that existed before r45 — emits.
 #
 # SO THE REFERENCE IS THE APPLICATION'S CONNECTION, AND EVERY OBSERVATION AND EVERY PROBE IS PUT ON
-# IT. The alternative — emitting `?sslmode=require` in DATABASE_URL — was measured too and refused:
-# on the installed pg-connection-string `require` is an ALIAS FOR verify-full (the driver says so
-# itself, on stderr), so it would demand a CA-verified certificate where the reader deliberately
-# verifies nothing and where a Debian cluster ships a self-signed one; there is no spelling of
-# libpq's `prefer` at all; the meaning is scheduled to change under the driver's feet at pg v9; and
-# it would change what EVERY EXISTING INSTALLATION's application connection does at the next
-# upgrade, from a branch already deep in review.
+# IT. r43 also measured the alternative — emitting `?sslmode=require` — and refused it: on the
+# installed pg-connection-string `require` is an ALIAS FOR verify-full (the driver says so itself,
+# on stderr), so it would demand a CA-verified certificate where the reader deliberately verifies
+# nothing and where a Debian cluster ships a self-signed one.
 #
-# IT ASKS THE COMPOSER RATHER THAN ASSERTING A CONSTANT, so the two cannot drift: if a later round
-# ever gives the emitted URL a query string, this stops answering rather than answering the old
-# answer. The password is a placeholder because url_encode_userinfo() percent-encodes everything
-# outside the RFC 3986 unreserved set — a `?` in a password reaches the URL as `%3F` — so no
-# credential can put a query string there, and none is needed to ask this question.
+# THAT OBJECTION WAS RIGHT ABOUT THAT SPELLING AND r45 DOES NOT USE IT. The emitted URL carries
+# `uselibpqcompat=true` beside `sslmode=`, which is the driver's own switch into its
+# libpq-compatible branch, where `require` means encrypt-and-verify-nothing exactly as libpq's does
+# — see compose_database_url() above, where the two branches are read out of the driver line for
+# line. Nothing is reproduced here; a branch the driver ships is selected. And it changes what an
+# existing installation does at its next upgrade only if the operator asks: DB_SSLMODE defaults to
+# `disable`, and an upgrade recovers whatever the previous run published.
+#
+# IT ASKS THE COMPOSER RATHER THAN ASSERTING A CONSTANT, so the two cannot drift: the query string
+# the derivation expects is the one db_url_route_query() would compose, and a URL that does not end
+# in it stops the answer rather than answering the old one. The password is a placeholder because
+# url_encode_userinfo() percent-encodes everything outside the RFC 3986 unreserved set — a `?` in a
+# password reaches the URL as `%3F` — so no credential can put a query string there, and none is
+# needed to ask this question.
 # AND THE URL IS ONLY HALF OF THE DRIVER'S CONFIGURATION (o3d-2sm1.5 r44, Codex HIGH).
 #
 # THE FINDING. r43 answered `disable` BECAUSE THE COMPOSED URL HAS NO QUERY STRING. That is not
@@ -1451,8 +1461,11 @@ unit_route_env_guaranteed() {
       break
     done
     if ! $found; then
-      ENV_ROUTE_GUARANTEE_REASON="${unit}'s loaded configuration does not list ${name} as a bare name in UnsetEnvironment= (systemd composes it as: ${unset_names[*]:-nothing at all}), so systemd does not remove it from the service's environment at exec — and ${name} reaching the application means %s. The ${DB_ROUTE_DROPIN_NAME} drop-in this installer writes states exactly that directive; a later drop-in whose own UnsetEnvironment= is EMPTY resets the list and is the usual cause"
-      printf -v ENV_ROUTE_GUARANTEE_REASON "$ENV_ROUTE_GUARANTEE_REASON" "$(db_route_env_effect "${name}")"
+      # CONCATENATION AND NOT `printf -v`. The sentence quotes systemd's own composed list back,
+      # and a `%` anywhere in it — in an assignment's VALUE, which UnsetEnvironment= may carry —
+      # would be read as a conversion by a format string, so the refusal would either lose text or
+      # print a literal it never saw.
+      ENV_ROUTE_GUARANTEE_REASON="${unit}'s loaded configuration does not list ${name} as a bare name in UnsetEnvironment= (systemd composes it as: ${unset_names[*]:-nothing at all}), so systemd does not remove it from the service's environment at exec — and ${name} reaching the application means $(db_route_env_effect "${name}"). The ${DB_ROUTE_DROPIN_NAME} drop-in this installer writes states exactly that directive; a later drop-in whose own UnsetEnvironment= is EMPTY resets the list and is the usual cause"
       return 1
     fi
   done < <(db_route_env_variables)
