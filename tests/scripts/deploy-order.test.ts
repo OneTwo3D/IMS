@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync, spawn, spawnSync } from 'node:child_process'
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { accessSync, chmodSync, constants, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -8085,6 +8085,78 @@ function sudoPrefixOn(path: string): string {
   return found.status === 0 ? 'sudo ' : ''
 }
 
+/**
+ * Link an EXPLICIT EXECUTABLE CLOSURE into `into`: for every command named, the first entry on
+ * `pathValue` that supplies a runnable file of that name, linked by its absolute path.
+ *
+ * THE QUESTION A SHELL ASKS, ASKED THE SAME WAY. The construction this replaced enumerated every
+ * PATH entry with `readdirSync` and linked whatever it listed, skipping directories it could not
+ * read. A SEARCH-ONLY DIRECTORY — mode 0111, which is a normal and valid way to publish
+ * executables — answers EACCES to `readdirSync` while everything inside it still runs, so
+ * enumeration silently dropped a directory that the real PATH resolves out of and the fixture came
+ * up short of a tool the test needs. Enumeration also cannot tell a name that resolves from one
+ * that does not: a dangling symlink or a file with no execute bit is a name a listing reports and
+ * a PATH search steps over, so the first-wins rule linked something unrunnable and shadowed the
+ * working candidate behind it. `execvp` asks a different question — is <entry>/<name> executable —
+ * and walks on when the answer is no. So does this.
+ *
+ * A command nothing supplies is a FIXTURE-BUILD FAILURE that names the command, not a surprise
+ * `status: null` from a spawn several assertions later.
+ */
+function linkExecutableClosure(into: string, commands: readonly string[], pathValue: string): void {
+  const entries = pathValue.split(':').filter((entry) => entry !== '')
+  for (const command of commands) {
+    let resolved: string | undefined
+    for (const entry of entries) {
+      const candidate = join(entry, command)
+      try {
+        accessSync(candidate, constants.X_OK)
+        // A directory can carry the execute bit and answer X_OK; it is not what a PATH search runs.
+        if (!statSync(candidate).isFile()) continue
+      } catch {
+        // Absent, dangling, or not executable by this account. Keep walking, exactly as execvp does.
+        continue
+      }
+      resolved = candidate
+      break
+    }
+    if (resolved === undefined) {
+      throw new Error(`the PATH fixture requires \`${command}\`, and no entry on ${pathValue} supplies a runnable one`)
+    }
+    symlinkSync(resolved, join(into, command))
+  }
+}
+
+/**
+ * WHAT THE NO-SUDO WRAPPER PHASE RUNS, AND HOW THE LIST WAS ESTABLISHED — read out of the wrapper
+ * body that `db_fence_publish_operator_wrappers()` writes (scripts/lib/db-fence-protected.sh, the
+ * quoted `WRAPPER_EOF` heredoc), taking every word in command position that is not a bash builtin,
+ * plus the one command the test itself spawns through this PATH:
+ *
+ *   bash                        `spawnSync('bash', …)` below and inside `sudoPrefixOn()`. The child
+ *                               resolves it out of the PATH it is handed, which is this fixture.
+ *   id                          `if [[ "$(id -u)" -ne 0 && "$(id -un)" != "${app_account}" ]]` —
+ *                               the account gate, the wrapper's first line of work.
+ *   find, sort, xargs,          `find . -type f -printf '%P\0' | LC_ALL=C sort -z |
+ *   sha256sum                   xargs -0 -r sha256sum -- | sha256sum` — the whole-tree artefact
+ *                               digest, checked before the wrapper prints anything at all.
+ *   grep, tail                  the one-key `.env` reader. This phase moves the `.env` away so the
+ *                               `[[ -f "${app_env_file}" ]]` branch is not taken, but it is one
+ *                               rename away and a fixture that omitted them would be a trap.
+ *
+ * `env`, `runuser` and `node` are DELIBERATELY ABSENT: they are reached only by `run_helper` on the
+ * wrapper's last line, which this phase never gets to — it exits 1 at the missing credential. A
+ * name on this list that the box cannot supply aborts the fixture, so the list is kept to what this
+ * phase can actually run rather than padded with what a different phase would.
+ *
+ * AND THE LIST IS PROVED SUFFICIENT RATHER THAN ASSERTED. If any of id/find/sort/xargs/sha256sum
+ * were missing, the digest would come out empty and the wrapper would print
+ * `REFUSING: … hashes to nothing` instead of the credential message — so the bare-form assertion
+ * at the end of the phase is what establishes the closure is complete, and it says so when it is
+ * not.
+ */
+const NO_SUDO_FIXTURE_COMMANDS = ['bash', 'id', 'find', 'sort', 'xargs', 'sha256sum', 'grep', 'tail'] as const
+
 test('r32: no printed instruction in any entrypoint names the checkout as something to run', () => {
   // MUTATION ROUTE (verified locally): restore r31's banner line in deploy.sh —
   //   echo -e "${RED}    node ${DB_FENCE_SCRIPT} --fence --state-file=... ${RESET}" >&2
@@ -8719,29 +8791,27 @@ test('r33: every printed recovery instruction carries the privilege the account 
     // because sudo lives in /usr/bin alongside bash and the whole of coreutils, so dropping that
     // directory drops the shell too and every spawn below fails with ENOENT rather than with the
     // refusal under test. It only appeared to work on a developer box with no sudo installed at
-    // all, where it subtracted nothing. So the directory is assembled instead: one symlink per
-    // executable name on the real PATH, minus sudo. That is a box with no sudo however the box
-    // this runs on happens to lay its binaries out.
+    // all, where it subtracted nothing. So the directory is assembled instead, and nothing is
+    // subtracted from anything: that is a box with no sudo however the box this runs on happens to
+    // lay its binaries out.
+    //
+    // AND ASSEMBLED AS A NAMED CLOSURE, NOT BY LISTING THE PATH. See NO_SUDO_FIXTURE_COMMANDS for
+    // where the list comes from and linkExecutableClosure() for why a listing is the wrong
+    // question — a search-only (0111) directory supplies commands that run and refuses to be
+    // read, so enumerating it lost tools the runner's own PATH resolves perfectly well.
     const noSudoDir = join(dir, 'nosudo')
     mkdirSync(noSudoDir)
-    for (const entry of (process.env.PATH ?? '').split(':')) {
-      if (!entry) continue
-      // A PATH may name a directory that does not exist, is not a directory, or cannot be read.
-      // None of those is this test's subject, and none of them should abort it.
-      let names: string[]
-      try {
-        names = readdirSync(entry)
-      } catch {
-        continue
-      }
-      for (const name of names) {
-        if (name === 'sudo') continue
-        // First entry wins, exactly as a PATH search would resolve it.
-        if (existsSync(join(noSudoDir, name))) continue
-        symlinkSync(join(entry, name), join(noSudoDir, name))
-      }
-    }
+    linkExecutableClosure(noSudoDir, NO_SUDO_FIXTURE_COMMANDS, process.env.PATH ?? '')
     const noSudoPath = noSudoDir
+    // THE SUDO EXCLUSION IS THE WHOLE POINT OF THE FIXTURE, so it is checked rather than left to
+    // the reader of the list: the closure does not name sudo, and — because the directory is built
+    // by addition — it holds the closure and nothing else, so nothing could have brought one in.
+    assert.ok(!(NO_SUDO_FIXTURE_COMMANDS as readonly string[]).includes('sudo'), 'precondition: the closure must not name sudo')
+    assert.deepEqual(
+      readdirSync(noSudoDir).sort(),
+      [...NO_SUDO_FIXTURE_COMMANDS].sort(),
+      'precondition: the fixture holds exactly the named closure — no sudo, and nothing unasked-for',
+    )
     // PRECONDITION, IN THIS ORDER. The tools first: `sudoPrefixOn` answers '' both for a PATH
     // with no sudo on it and for a PATH with no SHELL on it, so on its own it cannot tell the
     // fixture working from the fixture being empty. Establish that the shell and the tools are
@@ -8771,6 +8841,163 @@ test('r33: every printed recovery instruction carries the privilege the account 
     assert.equal(statSync(paths.manifestFile).mode & 0o004, 0o004, 'and the manifest readable')
     const check = spawnSync('sha256sum', ['-c', paths.manifestFile], { cwd: paths.app, encoding: 'utf8' })
     assert.equal(check.status, 0, `the manifest instruction must run and pass over an untouched tree:\n${check.stdout}${check.stderr}`)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('r33: the no-sudo PATH fixture resolves executables the way a shell does, rather than by listing directories', () => {
+  // THE FINDING, REPRODUCED. The fixture above used to be built by enumerating every directory on
+  // PATH and linking what it listed. That is not the question a PATH search asks, and three
+  // ordinary layouts answer the two questions differently:
+  //
+  //   A SEARCH-ONLY DIRECTORY (0111) supplies commands that run and refuses to be listed. This is
+  //   a normal published-executables layout, not a broken one. `readdirSync` gets EACCES; the
+  //   enumeration skipped the directory and the tools inside it vanished from the fixture.
+  //
+  //   A DANGLING SYMLINK is a name a listing reports and a PATH search steps over. Enumeration's
+  //   first-wins rule linked it and shadowed the working candidate on a later entry.
+  //
+  //   A FILE WITH NO EXECUTE BIT is the same shape of mistake with a different errno.
+  //
+  // Each case is built here for real — a directory, chmod'ed — and run BOTH ways, so the contrast
+  // is measured rather than described. `assert` on the old construction failing is what stops this
+  // test quietly passing against a fixture that never had the problem.
+  const dir = mkdtempSync(join(tmpdir(), 'ims-r33-closure-'))
+  // Root bypasses the discretionary bits — it can list a 0111 directory — so the half of this
+  // test that turns on a refusal cannot be asserted there. The suite does not run as root; the
+  // gate is here so that a runner which does gets the closure half rather than a false failure.
+  const dacApplies = (process.getuid?.() ?? 0) !== 0
+  // The old construction, verbatim in shape: list each entry, skip what cannot be listed, first
+  // name wins. Returns what it managed to build, or the error that stopped it.
+  const enumerateInto = (into: string, pathValue: string): unknown => {
+    try {
+      for (const entry of pathValue.split(':')) {
+        if (!entry) continue
+        let names: string[]
+        try {
+          names = readdirSync(entry)
+        } catch {
+          continue
+        }
+        for (const name of names) {
+          if (existsSync(join(into, name))) continue
+          symlinkSync(join(entry, name), join(into, name))
+        }
+      }
+    } catch (error) {
+      return error
+    }
+    return undefined
+  }
+  const runOn = (command: string, pathValue: string) =>
+    spawnSync(command, [], { encoding: 'utf8', env: { PATH: pathValue } as unknown as NodeJS.ProcessEnv })
+  const publishTool = (into: string, name: string, says: string, mode: number): void => {
+    writeFileSync(join(into, name), `#!/bin/bash\necho ${says}\n`)
+    chmodSync(join(into, name), mode)
+  }
+
+  try {
+    // ---- CASE 1: the search-only directory. THE FINDING.
+    const searchOnly = join(dir, 'search-only')
+    mkdirSync(searchOnly)
+    publishTool(searchOnly, 'ims-fixture-tool', 'FROM-SEARCH-ONLY', 0o755)
+    chmodSync(searchOnly, 0o111)
+    try {
+      if (dacApplies) {
+        assert.throws(
+          () => readdirSync(searchOnly),
+          (error: NodeJS.ErrnoException) => error.code === 'EACCES',
+          'precondition: a 0111 directory refuses to be listed — that is the whole mechanism',
+        )
+        assert.equal(
+          runOn('ims-fixture-tool', searchOnly).stdout?.trim(),
+          'FROM-SEARCH-ONLY',
+          'precondition: and the command inside it runs perfectly well from that same PATH',
+        )
+
+        const listed = join(dir, 'case1-listed')
+        mkdirSync(listed)
+        enumerateInto(listed, searchOnly)
+        assert.deepEqual(readdirSync(listed), [], 'the old enumeration comes away with nothing — the directory it could not read')
+        assert.notEqual(
+          runOn('ims-fixture-tool', listed).status,
+          0,
+          'so the fixture it builds cannot run a command the real PATH supplies, and the whole file aborts on the missing tool',
+        )
+      }
+
+      const resolved = join(dir, 'case1-closure')
+      mkdirSync(resolved)
+      linkExecutableClosure(resolved, ['ims-fixture-tool'], searchOnly)
+      assert.equal(
+        runOn('ims-fixture-tool', resolved).stdout?.trim(),
+        'FROM-SEARCH-ONLY',
+        'the closure asks whether the file is executable, which is what the search-only directory answers',
+      )
+    } finally {
+      // Readable again, or the rmSync in the outer finally cannot clean up after itself.
+      chmodSync(searchOnly, 0o755)
+    }
+
+    // ---- CASE 2: an earlier entry whose name is a dangling symlink.
+    const dangling = join(dir, 'dangling')
+    const behindDangling = join(dir, 'behind-dangling')
+    mkdirSync(dangling)
+    mkdirSync(behindDangling)
+    symlinkSync(join(dir, 'nowhere-at-all'), join(dangling, 'ims-broken-tool'))
+    publishTool(behindDangling, 'ims-broken-tool', 'THE-REAL-ONE', 0o755)
+    const danglingPath = `${dangling}:${behindDangling}`
+    assert.equal(runOn('ims-broken-tool', danglingPath).stdout?.trim(), 'THE-REAL-ONE', 'precondition: a real PATH search steps over the broken name')
+
+    const case2Listed = join(dir, 'case2-listed')
+    mkdirSync(case2Listed)
+    enumerateInto(case2Listed, danglingPath)
+    assert.equal(
+      (runOn('ims-broken-tool', case2Listed).error as NodeJS.ErrnoException | undefined)?.code,
+      'ENOENT',
+      'the old enumeration linked the name it listed first, and that name does not resolve',
+    )
+    const case2Closure = join(dir, 'case2-closure')
+    mkdirSync(case2Closure)
+    linkExecutableClosure(case2Closure, ['ims-broken-tool'], danglingPath)
+    assert.equal(runOn('ims-broken-tool', case2Closure).stdout?.trim(), 'THE-REAL-ONE', 'the closure takes the first candidate that answers')
+
+    // ---- CASE 3: an earlier entry whose name is there but not executable.
+    const unexecutable = join(dir, 'unexecutable')
+    const behindUnexecutable = join(dir, 'behind-unexecutable')
+    mkdirSync(unexecutable)
+    mkdirSync(behindUnexecutable)
+    publishTool(unexecutable, 'ims-inert-tool', 'NEVER-RUNS', 0o644)
+    publishTool(behindUnexecutable, 'ims-inert-tool', 'THE-RUNNABLE-ONE', 0o755)
+    const inertPath = `${unexecutable}:${behindUnexecutable}`
+    if (dacApplies) {
+      assert.equal(runOn('ims-inert-tool', inertPath).stdout?.trim(), 'THE-RUNNABLE-ONE', 'precondition: a real PATH search steps over the unexecutable name')
+    }
+    const case3Listed = join(dir, 'case3-listed')
+    mkdirSync(case3Listed)
+    enumerateInto(case3Listed, inertPath)
+    assert.equal(
+      (runOn('ims-inert-tool', case3Listed).error as NodeJS.ErrnoException | undefined)?.code,
+      'EACCES',
+      'the old enumeration linked the inert name and shadowed the runnable one behind it',
+    )
+    const case3Closure = join(dir, 'case3-closure')
+    mkdirSync(case3Closure)
+    linkExecutableClosure(case3Closure, ['ims-inert-tool'], inertPath)
+    assert.equal(runOn('ims-inert-tool', case3Closure).stdout?.trim(), 'THE-RUNNABLE-ONE', 'the closure skips it on X_OK and keeps walking')
+
+    // ---- CASE 4: a required command nothing supplies fails AT FIXTURE-BUILD TIME, naming itself.
+    // The alternative is what the enumeration did: build a short fixture in silence and let it
+    // surface many assertions later as `status: null` on a spawn that says nothing about why.
+    const case4 = join(dir, 'case4')
+    mkdirSync(case4)
+    assert.throws(
+      () => linkExecutableClosure(case4, ['ims-tool-that-is-nowhere'], inertPath),
+      /ims-tool-that-is-nowhere/,
+      'a required command absent from PATH must fail here, and say which one',
+    )
+    assert.deepEqual(readdirSync(case4), [], 'and nothing half-built is left behind for a later assertion to trip over')
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
