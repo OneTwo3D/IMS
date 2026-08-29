@@ -11,7 +11,7 @@
     "start": "next start",
     "lint": "eslint",
     "type-check": "tsc --noEmit",
-    "test:unit": "tsx --test --experimental-test-module-mocks \"tests/**/*.test.ts\"",
+    "test:unit": "tsx --test --import ./tests/temp-dir-sentinel.ts --experimental-test-module-mocks \"tests/**/*.test.ts\"",
     "check:decimal-boundaries": "node scripts/check-domain-decimal-boundaries.mjs",
     "check:connector-fetch-boundaries": "node scripts/check-connector-fetch-boundaries.mjs",
     "check:wms-connector-boundary": "node scripts/check-wms-connector-boundary.mjs",

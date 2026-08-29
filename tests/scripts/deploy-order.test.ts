@@ -15,6 +15,7 @@ import {
   protectedPaths,
   writeFenceCheckout,
 } from './fence-artefact-harness.ts'
+import { createTempDirSync } from './temp-dir.ts'
 
 // o3d-2sm1.1 — the deploy order is a safety property, not a style choice, so it is
 // asserted here rather than left to the header comment that used to describe it.
@@ -5614,7 +5615,11 @@ function runLayoutGate(options: { env: string | null; marker: string | null }): 
  * which is the class of thing this round exists to close.
  */
 function layoutInvocation(program: string, env: string): string {
-  const stage = mkdtempSync(join(tmpdir(), 'ims-staged-'))
+  // From the shared helper, not `mkdtempSync`, because this function RETURNS A COMMAND STRING: the
+  // staging directory has to outlive the call that made it, so there is no scope here in which to
+  // remove it. `createTempDirSync` registers the removal at the moment of creation instead
+  // (o3d-tmpleak) — this was the one site in tests/scripts/ that actually leaked.
+  const stage = createTempDirSync('ims-staged-')
   symlinkSync(join(process.cwd(), 'scripts/lib'), join(stage, 'lib'))
   const script = join(stage, 'lifted.sh')
   writeFileSync(script, `${program}\n`)
