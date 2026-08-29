@@ -54,18 +54,31 @@ const SCRIPT = 'scripts/install.sh'
  * PRODUCED rather than on a marker that moved.
  */
 function envWriteStartMarker(source: string): string {
+  // r39 split the writer in two: render_app_env_file() holds the heredoc and write_app_env_file()
+  // publishes its output durably. The RENDER is what this file is about, and it is the earlier of
+  // the two, so it is the boundary the preceding slice must stop at.
+  if (source.includes('render_app_env_file() {')) return 'render_app_env_file() {'
   return source.includes('write_app_env_file() {') ? 'write_app_env_file() {' : 'cat > "${APP_DIR}/.env"'
 }
 
 /**
- * The write itself: the shipped function plus its call, or the bare statements that preceded it.
+ * The write itself: the shipped renderer plus a redirect, the shipped function plus its call, or
+ * the bare statements that preceded either.
  *
- * The chown/chmod pair is dropped, which is exactly where the old slice ENDED. This rig runs as an
- * ordinary user and has no APP_USER to give the file to; what it is about is the CONTENT the
- * heredoc produces, and both ownership and mode are asserted elsewhere
- * (tests/scripts/install-credential-preservation.test.ts checks the mode after a rotation).
+ * WHAT THIS RIG IS ABOUT IS THE CONTENT, and it says so in three shapes of the script. r38 wrapped
+ * the heredoc in write_app_env_file(); r39 (Codex HIGH) split THAT into render_app_env_file(),
+ * which produces the bytes from held variables, and write_app_env_file(), which publishes them by
+ * rename with ownership and mode applied before the rename. Ownership is exactly what this rig
+ * cannot exercise — it runs as an ordinary user with no APP_USER to give a file to — so it takes
+ * the renderer and redirects it, the same way the pre-r38 slice dropped the chown/chmod pair.
+ *
+ * The publication half is asserted where it can be: install-credential-representation.test.ts
+ * proves the rename by hard link and asserts the mode, and install-credential-preservation.test.ts
+ * checks the mode after a rotation.
  */
 function envWriteBlock(source: string): string {
+  const rendered = sliceOptionalBlock(source, 'render_app_env_file() {')
+  if (rendered !== null) return `${rendered}\nrender_app_env_file > "\${APP_DIR}/.env"`
   const wrapped = sliceOptionalBlock(source, 'write_app_env_file() {')
   if (wrapped !== null) {
     const body = wrapped.split('\n').filter((line) => !/^\s*(chown|chmod) /.test(line))

@@ -43,6 +43,9 @@ const SHIPPED = [
   'pg_endpoint_psql',
   'pg_server_identity_select',
   'pg_extract_server_identity',
+  // r39 (Codex HIGH): ensure_database_role_exists() SQL-quotes the password rather than
+  // interpolating it into the literal, so the role work these tests run needs the quoter.
+  'sql_quote_literal',
   'verify_created_database_endpoint',
   'create_database_and_record_newness',
   'ensure_database_role_exists',

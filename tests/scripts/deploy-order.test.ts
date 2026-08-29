@@ -5206,6 +5206,27 @@ const MENTION_SHAPES: ReadonlyArray<{ why: string; match: RegExp }> = (
     },
     // install.sh OWNS these two files: it writes them, then locks them down.
     { why: 'install.sh writing the file it owns', match: `cat > "(${APP_OWNED_PATH})" <<EOF` },
+    // AND SINCE r39 IT PUBLISHES THEM BY RENAME (Codex HIGH). `cat >` truncated the application's
+    // only environment file and then filled it; publish_durable_file() writes a temporary file,
+    // applies ownership and mode to THAT, flushes, renames, and flushes the directory — so the
+    // path never names a partial file. Spelled out in full, argument by argument, for the reason
+    // db_fence_publish_operator_wrappers() is: the bytes come from `${rendered}`, a value this
+    // script rendered from variables it holds, and the application-owned path appears here as a
+    // DESTINATION and never as an input. A call that started piping something else into it, or
+    // that dropped the ownership argument, is not covered by this.
+    {
+      why: 'install.sh publishing the file it owns, by rename, from bytes it rendered itself',
+      match:
+        `printf '%s\\\\n' "\\$\\{rendered\\}" \\| publish_durable_file "(${APP_OWNED_PATH})" ` +
+        '"\\$\\{APP_USER\\}:\\$\\{APP_USER\\}" 600 \\|\\| return 1',
+    },
+    // The rotation journal write, which mentions the environment file only in the sentence it
+    // refuses with. Its two arguments are PASSWORDS BY VALUE — no path is handed to it — and it is
+    // named in full so that a call passing something else is not covered.
+    {
+      why: 'the rotation journal write, guarded by a refusal, handed two passwords by value',
+      match: 'write_role_rotation_journal "\\$\\{DB_PASSWORD_EFFECTIVE\\}" "\\$\\{DB_PASSWORD\\}" \\|\\| die "[^"]*"',
+    },
     {
       why: 'install.sh locking down or removing the file it owns',
       match: `(chown "\\$\\{APP_USER\\}:\\$\\{APP_USER\\}"|chmod [0-7]{3}|rm -f) "(${APP_OWNED_PATH})"`,

@@ -4446,7 +4446,7 @@ cat <<EOF
 
 NODE_ENV=production
 # What this deployment IS, as opposed to what it was built as. NODE_ENV is set
-# by the build and says `production` on stage and on a test rig too, so it
+# by the build and says "production" on stage and on a test rig too, so it
 # cannot be the thing that exempts production from a guard (o3d-l89a).
 IMS_INSTANCE_ROLE=production
 APP_PORT=${APP_PORT}

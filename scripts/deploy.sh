@@ -1270,13 +1270,21 @@ fsync_path() {
 #
 # Same directory, so the rename is a rename and not a copy. Every failure path removes the
 # temporary file and returns non-zero, leaving the last durable marker untouched.
+# OWNERSHIP AND MODE ARE PART OF THE PUBLICATION, NOT A STEP AFTER IT (o3d-2sm1.5 r39, Codex
+# HIGH). ${APP_DIR}/.env has to reach the application account readable, and a `chown` issued AFTER
+# the rename is a second observable state: a crash between the two leaves a complete, correct file
+# the application cannot open. Both are applied to the TEMPORARY file, before the barrier and
+# before the rename, so the name is published once and everything about it is already true.
+# `$2` and `$3` are optional and default to what every earlier caller already got: root's own
+# ownership, since this script runs as root, and mode 0600.
 publish_durable_file() {
-  local target="$1" dir tmp
+  local target="$1" owner="${2:-}" mode="${3:-600}" dir tmp
   dir="$(dirname "$target")"
   mkdir -p "$dir" || return 1
   tmp="$(mktemp "${target}.XXXXXX" 2>/dev/null)" || return 1
   if ! cat > "$tmp" 2>/dev/null; then rm -f "$tmp"; return 1; fi
-  if ! chmod 600 "$tmp" 2>/dev/null; then rm -f "$tmp"; return 1; fi
+  if ! chmod "$mode" "$tmp" 2>/dev/null; then rm -f "$tmp"; return 1; fi
+  if [[ -n "$owner" ]] && ! chown "$owner" "$tmp" 2>/dev/null; then rm -f "$tmp"; return 1; fi
   # BARRIER 1: the data, before the name exists. After this the rename can only publish
   # bytes that are already on the medium.
   if ! fsync_path "$tmp"; then rm -f "$tmp"; return 1; fi
