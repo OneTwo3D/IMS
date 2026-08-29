@@ -1157,6 +1157,23 @@ EOSQL
     warn "The password of the PRE-EXISTING role '${DB_USER}' has been changed to the one this run wrote into ${APP_DIR}/.env. Any other client still authenticating as ${DB_USER} with the previous password is refused from its next connection onwards."
   fi
 
+  # AND NOT WHILE A FENCE IS STANDING (o3d-2sm1.5 r37). `GRANT ALL PRIVILEGES ON DATABASE`
+  # grants CONNECT, which is the ONE privilege the connection fence exists to take away — so
+  # issuing it inside an adopted fence would re-open the door this run is holding shut, while
+  # DB_FENCE_UP goes on saying the window is closed. `ALTER DATABASE ... OWNER TO` is skipped for
+  # the same reason and not because it is harmless: changing the owner rewrites the owner's ACL
+  # entry, and a role that was revoked can come back through it.
+  #
+  # Skipping costs nothing real. A fence can only be standing over a database this run did NOT
+  # create — a previous run of this installer left it there — so the grant and the ownership are
+  # already what this statement would set them to, and the fence's own release is what restores
+  # what the fence revoked. The one thing above that IS still done is the password, which no
+  # fence has an opinion about.
+  if ${DB_FENCE_UP:-false}; then
+    warn "A connection fence is standing over '${DB_NAME}', so this run is NOT issuing GRANT ALL PRIVILEGES or ALTER DATABASE ... OWNER: the GRANT would give CONNECT back and lift the fence this run is holding. The fence's release restores what it revoked. If '${DB_USER}' turns out not to own this database, release the fence and re-run."
+    return 0
+  fi
+
   pg_local_psql -q >/dev/null <<EOSQL || die "Granting '${DB_USER}' on database '${DB_NAME}' failed. NOTHING HAS BEEN MIGRATED."
     GRANT ALL PRIVILEGES ON DATABASE "${DB_NAME}" TO "${DB_USER}";
     ALTER DATABASE "${DB_NAME}" OWNER TO "${DB_USER}";

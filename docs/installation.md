@@ -76,6 +76,11 @@ The endpoint connection is made as a throwaway role this run creates with a rand
 password and drops immediately. That is what lets the check run **before** anything has been done
 to the application role — see the next section.
 
+`IMS_PG_SOCKET_DIR` overrides the socket directory the local superuser connection uses (default
+`/var/run/postgresql`). It exists so the regression suite can bring up clusters of its own, and it
+cannot weaken the proof: pointing it at another cluster does not produce an exemption, it produces
+the refusal above — which is what that suite asserts.
+
 **Everything unproven is fenced**, which is every case below. Each requires
 `DEPLOY_ADMIN_DATABASE_URL` and a protected fence artefact, exactly as an upgrade does:
 
@@ -139,7 +144,13 @@ using this database right now:
 
 On the fenced path the second column runs after `require_fenceable_database()` has proved the
 window can be held closed and after any standing fence has been adopted; on the first-install path
-it runs once the exemption has been earned. **Not** after the fence is physically raised, and that
+it runs once the exemption has been earned. **Inside a standing fence the grant and the ownership
+change are skipped entirely** and only the password is set: `GRANT ALL PRIVILEGES ON DATABASE`
+grants `CONNECT`, which is the one privilege the fence exists to take away, and changing the owner
+rewrites the owner's ACL entry — either would re-open the door the run is holding shut while it
+still reported the window as closed. A fence can only be standing over a database this run did not
+create, so both are already what the statements would have set them to, and the fence's own
+release is what restores what it revoked. **Not** after the fence is physically raised, and that
 is deliberate: the fence goes up only after the predecessor has been stopped, while the build runs
 *before* the stop so that a release that will not compile costs no outage — and that build is
 handed `DATABASE_URL` and touches the database. Deferring the rotation past the raise would turn

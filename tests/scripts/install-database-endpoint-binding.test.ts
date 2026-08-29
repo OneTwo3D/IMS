@@ -584,6 +584,79 @@ test('r37: a duplicate database plus a failed fence preflight leaves credentials
   }
 })
 
+test('r37: the role work inside an adopted fence rotates the password and grants nothing back', async () => {
+  // A FENCE A PREVIOUS RUN LEFT STANDING IS ADOPTED BEFORE THE ROLE WORK — that is what makes
+  // "after the run knows it may proceed" reachable at all. But `GRANT ALL PRIVILEGES ON DATABASE`
+  // grants CONNECT, which is the one privilege the fence exists to take away: issued inside an
+  // adopted fence it re-opens the door this run is holding shut while DB_FENCE_UP goes on saying
+  // the window is closed. So under a fence the password is set and nothing is granted.
+  //
+  // The fence is REAL here, not a flag: CONNECT is revoked from the application role on the
+  // database, exactly as fence-db-connections.mjs leaves it, and the assertion is that it is
+  // STILL revoked afterwards.
+  //
+  // MUTATION ROUTE (measured): delete the `if ${DB_FENCE_UP:-false}` early return from
+  // provision_database_role_and_privileges(). The GRANT runs, the application role gets CONNECT
+  // back, and this test fails on the revoked-CONNECT assertion — alone.
+  const root = mkdtempSync(join(tmpdir(), 'ims-pgbind-'))
+  let cluster: Cluster | undefined
+  try {
+    cluster = startCluster(root, 'fenced', await freePort(), '127.0.0.1')
+    cluster.psql(['-c', "CREATE ROLE live_owner LOGIN PASSWORD 'owner-password'"])
+    cluster.psql(['-c', "CREATE ROLE imsuser LOGIN PASSWORD 'live-password'"])
+    cluster.psql(['-c', 'CREATE DATABASE one_two_inventory OWNER live_owner'])
+    // What a standing fence looks like in the database.
+    cluster.psql(['-c', 'REVOKE CONNECT ON DATABASE one_two_inventory FROM PUBLIC'])
+    cluster.psql(['-c', 'REVOKE CONNECT ON DATABASE one_two_inventory FROM imsuser'])
+    assert.equal(
+      cluster.psql(['-c', "SELECT has_database_privilege('imsuser', 'one_two_inventory', 'CONNECT')::text"]),
+      'false',
+      'precondition: the fence really is standing before the run',
+    )
+
+    const run = runShipped(
+      {
+        DB_HOST: '127.0.0.1',
+        DB_PORT: String(cluster.port),
+        DB_NAME: 'one_two_inventory',
+        DB_USER: 'imsuser',
+        DB_PASSWORD: 'rotated-by-this-run',
+        IMS_PG_SOCKET_DIR: cluster.socket,
+      },
+      {},
+      `
+        ensure_database_role_exists
+        DB_FENCE_UP=true
+        provision_database_role_and_privileges
+        echo "PROVISIONED=$?"
+      `,
+    )
+    assert.equal(run.status, 0, run.output)
+    assert.match(run.output, /PROVISIONED=0/, 'the run continues: a standing fence is not a failure here')
+
+    assert.equal(
+      cluster.psql(['-c', "SELECT has_database_privilege('imsuser', 'one_two_inventory', 'CONNECT')::text"]),
+      'false',
+      'the fence must still be standing — nothing may have granted CONNECT back',
+    )
+    assert.equal(
+      cluster.psql(['-c', "SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = 'one_two_inventory'"]),
+      'live_owner',
+      'and the owner must not have moved inside the window either',
+    )
+    // The password, which no fence has an opinion about, IS set — otherwise this test would pass
+    // on a function that did nothing at all.
+    assert.equal(
+      cluster.psql(['-c', 'SELECT 1'], { host: '127.0.0.1', user: 'imsuser', password: 'rotated-by-this-run', database: 'postgres' }),
+      '1',
+      'the credential this run wrote must be the one the server has',
+    )
+  } finally {
+    cluster?.stop()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('r37: the shipped order is the tested order — nothing mutating sits before classification', () => {
   // THE TEST ABOVE RUNS AN ORDER THIS FILE WROTE. This one asserts the SHIPPED script has the
   // same one, so the behavioural test cannot go on passing while install.sh drifts back.
