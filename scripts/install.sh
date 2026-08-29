@@ -744,23 +744,63 @@ DB_ENV_SNAPSHOT_DROPIN_FILE="${FENCE_DROPIN_DIR}/${DB_ENV_SNAPSHOT_DROPIN_NAME}"
 # replaced between the probe and the start, moving the trust root out from under everything this
 # gate just vouched for.
 #
-# SO THE BYTES ARE PUBLISHED, NOT THE PATHNAME. publish_db_ca() copies the validated file here —
-# root-owned, 0644, in a root-owned 0755 directory — and repoints DB_SSLROOTCERT at THIS path.
-# From that point the URL's `sslrootcert=`, the reader's `--sslrootcert=` and psql's
-# PGSSLROOTCERT are the same three characters, and that file is readable by every UID and
-# writable by root alone. verify_db_ca_published() re-checks the digest and the modes at each
-# principal's boundary; see it for what "stale" means when the operator's own CA changes.
+# SO THE BYTES ARE PUBLISHED, NOT THE PATHNAME. publish_db_ca() parses the operator's file, writes
+# the certificates it found here — root-owned, 0644, in a root-owned 0755 directory — and repoints
+# DB_SSLROOTCERT at THAT path. From that point the URL's `sslrootcert=`, the reader's
+# `--sslrootcert=` and psql's PGSSLROOTCERT are the same characters, and that file is readable by
+# every UID and writable by root alone. verify_db_ca_published() re-checks the digest and the modes
+# at each principal's boundary.
+#
+# AND THE PATH IS THE DIGEST OF WHAT IS IN IT (o3d-2sm1.5 r47, Codex HIGH). It was one fixed
+# `db-ca.crt`, and on an UPGRADE the installed DATABASE_URL already names that file. Publishing a
+# candidate therefore REPLACED the trust root the running installation verifies against, before any
+# connection had proved the candidate — so a wrong, stale or malformed CA, or any later refusal,
+# left the box with a durable trust root nothing could connect through, while the refusal said
+# "nothing has been changed on this host". That is this branch's oldest shape: the irreversible act
+# before the proof, exactly as the fence adoption and the credential rotation had it.
+#
+# A content-addressed name removes the act rather than merely re-ordering it. `db-ca-<sha256>.crt`
+# is derived from the published bytes, so a candidate whose bytes differ from the installed
+# generation's CANNOT land on the installed generation's path — there is no ordering to get wrong
+# and no window to be killed in. A candidate whose bytes are identical lands on the same path and
+# writes the same content, which is what makes re-running an unchanged installation a no-op. The
+# persisted URL is what selects a generation, and it is rewritten only where it always was: at the
+# environment-file publication and the identity snapshot, both far below every probe.
+#
+# THE OLD GENERATIONS ARE KEPT SO A ROLLBACK HAS SOMETHING TO ROLL BACK TO. prune_db_ca_generations()
+# runs at the END of a successful install and keeps: the generation this run published, the
+# generation the PREVIOUS installed DATABASE_URL named (unconditionally — that is the rollback
+# target), and the ${DB_CA_GENERATIONS_RETAINED} most recently modified of the rest. `ls -lt
+# /etc/ims-db-ca/` lists them newest first; re-running the installer with DB_SSLROOTCERT= naming one
+# of them republishes it — idempotently, onto its own path — and the next environment file names it
+# again. A failed run prunes nothing at all.
 #
 # A LITERAL, for the reason DB_ENV_SNAPSHOT_DIR is one: a privileged path resolved from a variable
 # the application can set is not a privileged path. The owner is a literal beside it so the
 # regression rigs — which run as an ordinary user with no root to give a file to, and which lift
 # FUNCTIONS rather than these assignments — can measure the mechanism without measuring `chown`.
 DB_CA_PUBLISH_DIR="/etc/ims-db-ca"
-DB_CA_PUBLISHED_FILE="${DB_CA_PUBLISH_DIR}/db-ca.crt"
 DB_CA_PUBLISH_OWNER="root:root"
-# The digest of the bytes this run published, so every later check compares against what was
-# validated rather than against whatever is at the path by then.
+# The generation name, in two halves so prune_db_ca_generations() can glob exactly what
+# db_ca_generation_file() emits and nothing else — the publication's own temporary files live in
+# the same directory and must not match.
+DB_CA_GENERATION_PREFIX="db-ca-"
+DB_CA_GENERATION_SUFFIX=".crt"
+# How many generations survive a prune BEYOND the two that are never pruned (this run's, and the one
+# the previous installation was using). Three is two rotations of headroom on a cluster whose CA
+# turns over yearly, and every one of them is a public certificate at 0644 — the cost of keeping
+# them is a few kilobytes, and the cost of not keeping them is an operator with no way back.
+DB_CA_GENERATIONS_RETAINED=3
+# WHICH GENERATION THIS RUN PUBLISHED, AND ITS DIGEST. Both are EMPTY until publish_db_ca() succeeds,
+# because that is the honest answer before it does — and because every refusal below quotes the
+# path, and a path quoted before anything was written there names a file that does not exist.
+DB_CA_PUBLISHED_FILE=""
 DB_CA_PUBLISHED_DIGEST=""
+# WHAT AN OPERATOR DOES WHEN A REFRESH REFUSES. Every refusal on the CA path ends with this, because
+# "nothing has been changed on this host" is a claim an operator has to be able to ACT on, and the
+# action is different from the one a first install takes. It is a single line so the two `die`
+# messages that quote it cannot drift apart.
+DB_CA_REFRESH_FAILURE_ADVICE="NO TRUST ROOT HAS BEEN REPLACED: each CA is published to its own generation under ${DB_CA_PUBLISH_DIR}, named after the digest of its contents, so a candidate can never be written over the generation an installed DATABASE_URL names. If this host already had a working installation it still has one — its environment file still names the generation it named before this run, that file is untouched, and 'systemctl start ${APP_NAME}.service' brings it back exactly as it was. Fix the certificate file and re-run; or, to go back to an earlier CA, 'ls -lt ${DB_CA_PUBLISH_DIR}' lists the retained generations newest first and re-running with DB_SSLROOTCERT= naming one of them republishes it."
 # THIS SCRIPT HAS NO --dry-run, AND UNDER `set -u` THAT WAS NOT THE SAME AS `false`
 # (o3d-2sm1.5 r45, found while adding a third reader of it).
 #
@@ -2518,23 +2558,190 @@ db_ca_path_is_open_to_every_uid() {
   return 0
 }
 
-# Copy the validated CA to the published path, durably, with ownership and mode applied BEFORE the
-# rename — publish_durable_file() is used rather than a second publisher for exactly that property,
-# and because a half-written trust root is the one file on this box that must not be reachable.
+# WHAT A TRUST-ANCHOR FILE MAY CONTAIN, ENUMERATED (o3d-2sm1.5 r47, Codex HIGH).
 #
-# `< "${source}"` and not a `cat |`: the redirection opens the source before the temporary file is
-# renamed over it, so re-publishing the published file ONTO ITSELF — which is what every re-run of
-# a TLS installation does, because the recovered DB_SSLROOTCERT names this very path — reads the
-# open file description and is a no-op that still proves the digest.
+# THE FINDING. The publisher took any file it could hash and copied its exact bytes out at mode
+# 0644. The caller had checked only that the source was a regular file root could read — and this
+# script runs as root, so THAT IS EVERY FILE ON THE BOX. `DB_SSLROOTCERT=/etc/ssl/private/db.key`,
+# a fat-fingered tab-completion, or a `fullchain+key.pem` an operator assembled for a web server,
+# and the private key is published world-readable to a well-known path before TLS ever parses it.
+# An arbitrary-file-disclosure primitive, reachable by a typo, with root's read privilege behind it.
+#
+# THE ACCEPT-LIST, AND WHY IT IS COMPLETE. DB_SSLROOTCERT is handed to three readers and all three
+# do the same thing with it: node-postgres passes it as `ssl.ca` to Node's tls, which hands it to
+# OpenSSL's X509_STORE; libpq passes it to SSL_CTX_load_verify_locations(); psql IS libpq. Every one
+# of those parses the file as a sequence of PEM X.509 CERTIFICATEs and reads NOTHING else out of it
+# — a revocation list is a different parameter (`sslcrl`/`sslcrldir`) against a different store, and
+# a private key has no reader here at all. So the set of block types this file may legitimately
+# contain is ONE: `CERTIFICATE`. That is not a denylist with the dangerous labels enumerated — the
+# shape that keeps failing on this branch, because the next dangerous label is always the one nobody
+# listed. It is the complete list of what any consumer of this file will ever look at, and
+# everything outside it is refused whether or not this script has heard of it.
+#
+# AND IT IS PARSED, NOT MATCHED. `grep -q 'PRIVATE KEY'` would be the denylist again, and it is also
+# wrong about its own subject: a block LABELLED `CERTIFICATE` carrying key material would pass it.
+# Each block is decoded by `openssl x509`, which base64-decodes it and then parses the DER as an
+# X.509 certificate — so a block that is not a certificate is refused no matter what its armour
+# says. The published bytes are then openssl's own re-encoding of the certificate it parsed, so what
+# reaches the world-readable path is CONSTRUCTED from parsed public material rather than copied from
+# the source. Nothing in the source that was not a certificate can survive into the published file,
+# including bytes this parser did not understand.
+#
+# The output goes to "$2", which every caller makes a private temporary file, and a failure at any
+# point leaves that temporary file to be removed: NOTHING IS PUBLISHED unless the whole source
+# parsed. A refusal mid-file — a bundle whose second block is a key — therefore discloses nothing,
+# which is the difference between this and rejecting the file after it has been copied out.
+DB_CA_ACCEPTED_PEM_LABEL="CERTIFICATE"
+
+normalize_db_ca_pem() {
+  local source="$1" dest="$2" line label block="" in_block=false certificates=0
+  command -v openssl >/dev/null 2>&1 || {
+    error "openssl is not on this host's PATH, and the database CA is published by PARSING the operator's file rather than by copying its bytes. Without a parser this script cannot tell a certificate from a private key, and copying unparsed bytes to a world-readable path is the defect this check exists to close. Install openssl and re-run."
+    return 1
+  }
+  : > "${dest}" || return 1
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    # A PEM file written on Windows arrives CRLF-terminated, and the boundary is a WHOLE line.
+    line="${line%$'\r'}"
+    case "${line}" in
+      '-----BEGIN '*'-----')
+        label="${line#-----BEGIN }"
+        label="${label%-----}"
+        if ${in_block}; then
+          error "${source} opens a '${label}' PEM block while a '${DB_CA_ACCEPTED_PEM_LABEL}' block is still open. That is not a file any TLS client can parse, and this installer will not guess where one block was meant to end and the next begin."
+          return 1
+        fi
+        if [[ "${label}" != "${DB_CA_ACCEPTED_PEM_LABEL}" ]]; then
+          error "${source} contains a '${label}' PEM block. A database trust root is a bundle of X.509 CERTIFICATEs and nothing else — that is all node-postgres, libpq and psql read out of the file DB_SSLROOTCERT names — and this file is published WORLD-READABLE so all three accounts can open it. A '${label}' block is either private material that must never be published or something no reader of this file will use, so it is refused rather than copied. NOTHING HAS BEEN PUBLISHED: if this is a combined key-and-certificate file, extract the certificates into a file of their own and name that instead."
+          return 1
+        fi
+        in_block=true
+        block="${line}"
+        ;;
+      '-----END '*'-----')
+        label="${line#-----END }"
+        label="${label%-----}"
+        ${in_block} || {
+          error "${source} closes a '${label}' PEM block that was never opened. A truncated or spliced certificate file is refused rather than partly published."
+          return 1
+        }
+        [[ "${label}" == "${DB_CA_ACCEPTED_PEM_LABEL}" ]] || {
+          error "${source} opens a '${DB_CA_ACCEPTED_PEM_LABEL}' PEM block and closes it as '${label}'. The armour disagrees with itself, so nothing here can say what the block holds; it is refused rather than published to a world-readable path."
+          return 1
+        }
+        block="${block}"$'\n'"${line}"
+        # THE PARSE. openssl decodes the base64 and reads the DER as an X.509 certificate; a block
+        # that is not one fails here whatever its label claimed. `-outform PEM` is what makes the
+        # published bytes openssl's re-encoding of the certificate rather than the source's bytes.
+        printf '%s\n' "${block}" | openssl x509 -inform PEM -outform PEM >> "${dest}" 2>/dev/null || {
+          error "A '${DB_CA_ACCEPTED_PEM_LABEL}' block in ${source} is not an X.509 certificate — openssl could not parse it. The label on a PEM block is not evidence about its contents, which is why this installer decodes every block instead of reading its armour, and a block it cannot decode is not published."
+          return 1
+        }
+        certificates=$((certificates + 1))
+        in_block=false
+        block=""
+        ;;
+      *)
+        # Outside a block this is commentary — the subject/issuer preambles a great many vendor
+        # bundles ship with — and it is DROPPED rather than refused, because it is not published.
+        # Inside one it is the payload openssl is about to be handed.
+        ${in_block} && block="${block}"$'\n'"${line}"
+        ;;
+    esac
+  done < "${source}"
+  ${in_block} && {
+    error "${source} ends inside an unterminated '${DB_CA_ACCEPTED_PEM_LABEL}' block. A truncated certificate file is refused rather than partly published."
+    return 1
+  }
+  [[ "${certificates}" -gt 0 ]] || {
+    error "${source} contains no PEM certificate at all. DB_SSLMODE verifies the server against the certificates in this file, and a file with none in it is not a trust root — it is a path that names something else. (A DER-encoded certificate is not accepted: none of the three clients that read this file parse one. Convert it with 'openssl x509 -inform DER -in <file> -out <file>.pem'.)"
+    return 1
+  }
+  return 0
+}
+
+# The generation path for a set of published bytes. The digest is 64 hex characters, so the whole
+# path stays inside the [A-Za-z0-9._/-] set DB_SSLROOTCERT is validated against — which matters
+# because this path, unlike the operator's, goes into the URL and the two probe command lines
+# without passing that validation again.
+db_ca_generation_file() {
+  printf '%s/%s%s%s' "${DB_CA_PUBLISH_DIR}" "${DB_CA_GENERATION_PREFIX}" "$1" "${DB_CA_GENERATION_SUFFIX}"
+}
+
+# Publish the CERTIFICATES in "$1" to the generation their own bytes name, durably, with ownership
+# and mode applied BEFORE the rename — publish_durable_file() is used rather than a second publisher
+# for exactly that property, and because a half-written trust root is the one file on this box that
+# must not be reachable.
+#
+# THE CANDIDATE IS BUILT IN A 0600 TEMPORARY FILE FIRST, and only bytes that parsed reach it. That
+# is what makes a refusal disclose nothing, and it is also what makes re-publishing the published
+# file ONTO ITSELF safe — which is what every re-run of a TLS installation does, because the
+# recovered DB_SSLROOTCERT names a generation this same function wrote. Normalisation is idempotent
+# (openssl's re-encoding of a certificate it re-encoded is the same DER), so that re-run computes
+# the same digest, lands on the same path and writes the same content.
+#
+# NOTHING EXISTING IS REPLACED. The target is derived from the content, so a candidate that differs
+# from the installed generation cannot be written over it, and one that does not differ writes what
+# is already there.
 publish_db_ca() {
-  local source="$1"
-  command -v sha256sum >/dev/null 2>&1 || return 1
-  DB_CA_PUBLISHED_DIGEST="$(file_sha256 "${source}")"
-  [[ -n "${DB_CA_PUBLISHED_DIGEST}" ]] || return 1
+  local source="$1" candidate digest
+  command -v sha256sum >/dev/null 2>&1 || {
+    error "sha256sum is not on this host's PATH. The published database CA is named and re-checked by the digest of its own bytes, so without it nothing here can say which generation was published or whether it is still the one that was validated."
+    return 1
+  }
   mkdir -p "${DB_CA_PUBLISH_DIR}" || return 1
   chown "${DB_CA_PUBLISH_OWNER}" "${DB_CA_PUBLISH_DIR}" || return 1
   chmod 755 "${DB_CA_PUBLISH_DIR}" || return 1
-  publish_durable_file "${DB_CA_PUBLISHED_FILE}" "${DB_CA_PUBLISH_OWNER}" 644 < "${source}" || return 1
+  # In the publish directory so the rename below is a rename; dot-prefixed and outside the
+  # generation glob so a prune cannot see it; 0600 so the bytes being parsed are never readable by
+  # anyone but root even for the moment they are unparsed.
+  candidate="$(mktemp "${DB_CA_PUBLISH_DIR}/.db-ca-candidate.XXXXXX" 2>/dev/null)" || return 1
+  chmod 600 "${candidate}" 2>/dev/null || { rm -f "${candidate}"; return 1; }
+  normalize_db_ca_pem "${source}" "${candidate}" || { rm -f "${candidate}"; return 1; }
+  digest="$(file_sha256 "${candidate}")"
+  [[ "${digest}" =~ ^[0-9a-f]{64}$ ]] || { rm -f "${candidate}"; return 1; }
+  # ASSIGNED ONLY ONCE BOTH ARE TRUE. A digest set before the file exists would make every refusal
+  # below quote a generation nobody wrote.
+  publish_durable_file "$(db_ca_generation_file "${digest}")" "${DB_CA_PUBLISH_OWNER}" 644 < "${candidate}" || {
+    rm -f "${candidate}"
+    return 1
+  }
+  rm -f "${candidate}"
+  DB_CA_PUBLISHED_DIGEST="${digest}"
+  DB_CA_PUBLISHED_FILE="$(db_ca_generation_file "${digest}")"
+  return 0
+}
+
+# WHAT SURVIVES A PRUNE, AND WHEN ONE HAPPENS (o3d-2sm1.5 r47, Codex HIGH).
+#
+# Called ONCE, at the end of a run that finished — never on a failure path, because the generation a
+# failed run would delete is the one an operator is about to need. Two files are exempt whatever
+# their age: the generation THIS run published, and the generation the PREVIOUS installed
+# DATABASE_URL named. The second is the rollback target and it is protected unconditionally rather
+# than by being recent enough, because "recent enough" is exactly the property an operator cannot
+# check before they need it. Of the rest, the ${DB_CA_GENERATIONS_RETAINED} most recently modified
+# stay and the older ones go.
+#
+# `existing_env` reads the environment file as it was when this run STARTED — load_existing_env()
+# ran during configuration, long before the new one was written — so it names the previous
+# generation and not the one just installed.
+#
+# IT NEVER FAILS THE INSTALL. Everything here is housekeeping over public certificates; a directory
+# that cannot be listed or a file that cannot be removed costs some kilobytes and nothing else.
+prune_db_ca_generations() {
+  local current="${DB_CA_PUBLISHED_FILE}" previous file kept=0
+  [[ -d "${DB_CA_PUBLISH_DIR}" ]] || return 0
+  previous="$(installed_database_sslrootcert "$(existing_env DATABASE_URL)")" || previous=""
+  while IFS= read -r file; do
+    [[ -n "${file}" ]] || continue
+    [[ "${file}" != "${current}" ]] || continue
+    [[ "${file}" != "${previous}" ]] || continue
+    kept=$((kept + 1))
+    [[ "${kept}" -gt "${DB_CA_GENERATIONS_RETAINED}" ]] || continue
+    rm -f "${file}" 2>/dev/null && info "Removed superseded database CA generation ${file}."
+  done < <(find "${DB_CA_PUBLISH_DIR}" -maxdepth 1 -type f \
+             -name "${DB_CA_GENERATION_PREFIX}*${DB_CA_GENERATION_SUFFIX}" \
+             -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2-)
   return 0
 }
 
@@ -2546,10 +2753,16 @@ publish_db_ca() {
 # exist yet is skipped rather than failed: this runs during configuration too, where the honest
 # answer about ${APP_USER} is "not yet", and the bits check above is what stands in until it does.
 #
-# WHEN THE OPERATOR'S CA CHANGES. The published file is a SNAPSHOT, taken from whatever
-# DB_SSLROOTCERT named at the moment of the run that took it. It is refreshed by re-running the
-# installer with DB_SSLROOTCERT= pointing at the new source file — which the r46 precedence makes
-# reachable under --non-interactive, since a supplied value beats the path recovered from the URL.
+# WHEN THE OPERATOR'S CA CHANGES. Each published file is a SNAPSHOT of whatever DB_SSLROOTCERT named
+# at the moment of the run that took it, and it is a GENERATION: a new CA is a new file at a new
+# path, published beside the old one rather than over it. The refresh is a re-run of the installer
+# with DB_SSLROOTCERT= pointing at the new source — which the r46 precedence makes reachable under
+# --non-interactive, since a supplied value beats the path recovered from the URL — and the switch
+# from one generation to the next is the new DATABASE_URL, written at the environment-file
+# publication far below every probe in this script. A run that refuses anywhere before that has
+# changed no trust root: the installed URL still names the generation it named this morning, that
+# file is still on disk with the same bytes, and starting the old service by hand still works.
+#
 # Doing nothing leaves the old trust root in place, and STALE HERE FAILS CLOSED: `verify-ca` and
 # `verify-full` refuse a certificate that does not chain to it, so a rotated cluster CA takes the
 # connection down loudly instead of quietly accepting a chain nobody vouched for.
@@ -5320,10 +5533,10 @@ prompt_db_sslmode() {
     # incidental — that function reconciles an interrupted rotation, and reconciling means PROBING,
     # over this transport and against this CA.
     publish_db_ca "${DB_SSLROOTCERT}" || die \
-      "The CA at DB_SSLROOTCERT=${DB_SSLROOTCERT} could not be published to ${DB_CA_PUBLISHED_FILE}. DB_SSLMODE=${DB_SSLMODE} verifies the server against a trust root that three different accounts have to open — this installer as root, the credential probes as postgres, and the service as ${APP_USER} — so the bytes are copied to one root-owned, world-readable path rather than the operator's pathname being passed around. Nothing has been changed on this host: make ${DB_CA_PUBLISH_DIR} creatable and re-run."
+      "The CA at DB_SSLROOTCERT=${DB_SSLROOTCERT} could not be published under ${DB_CA_PUBLISH_DIR}; the reason is above. DB_SSLMODE=${DB_SSLMODE} verifies the server against a trust root that three different accounts have to open — this installer as root, the credential probes as postgres, and the service as ${APP_USER} — so the CERTIFICATES IN that file are parsed and re-published to one root-owned, world-readable generation rather than the operator's pathname being passed around, and a source that is not a bundle of X.509 certificates is refused before anything is written. ${DB_CA_REFRESH_FAILURE_ADVICE}"
     DB_SSLROOTCERT="${DB_CA_PUBLISHED_FILE}"
     verify_db_ca_published postgres || die \
-      "The database CA published to ${DB_CA_PUBLISHED_FILE} did not verify immediately after publication; the reason is above. DB_SSLMODE=${DB_SSLMODE} is only as good as that file, so this run stops here rather than migrating a database behind a trust root it cannot vouch for. Nothing has been changed on this host."
+      "The database CA published to ${DB_CA_PUBLISHED_FILE} did not verify immediately after publication; the reason is above. DB_SSLMODE=${DB_SSLMODE} is only as good as that file, so this run stops here rather than migrating a database behind a trust root it cannot vouch for. ${DB_CA_REFRESH_FAILURE_ADVICE}"
   fi
 }
 
@@ -5788,7 +6001,7 @@ fi
 # file is written and long before anything is started.
 if [[ -n "${DB_SSLROOTCERT}" ]]; then
   verify_db_ca_published "${APP_USER}" postgres || die \
-    "The database CA at ${DB_CA_PUBLISHED_FILE} is not usable by the account the service runs as; the reason is above. DB_SSLMODE=${DB_SSLMODE} verifies every connection against that file, so an application that cannot open it cannot start. NOTHING HAS BEEN MIGRATED and nothing has been stopped."
+    "The database CA at ${DB_CA_PUBLISHED_FILE} is not usable by the account the service runs as; the reason is above. DB_SSLMODE=${DB_SSLMODE} verifies every connection against that file, so an application that cannot open it cannot start. NOTHING HAS BEEN MIGRATED and nothing has been stopped. ${DB_CA_REFRESH_FAILURE_ADVICE}"
 fi
 
 mkdir -p "${DATA_DIR}" "${LOG_DIR}" "${BACKUP_DIR}" \
@@ -6913,6 +7126,21 @@ if command -v ufw &>/dev/null && ufw status | grep -q "Status: active"; then
   ufw allow 443/tcp comment "${APP_NAME} HTTPS" 2>/dev/null || true
   success "ufw rules added for required public ports."
 fi
+
+# ---------------------------------------------------------------------------
+# 17b. SUPERSEDED DATABASE CA GENERATIONS (o3d-2sm1.5 r47, Codex HIGH)
+#
+# HERE AND NOWHERE EARLIER. Every generation under ${DB_CA_PUBLISH_DIR} is a trust root some
+# installation may still be verifying against, and a run that has not finished cannot say which. So
+# the prune is the last thing this script does before it prints, after the migration, after the
+# service was started and after the health check answered — by which point the environment file
+# names this run's generation and the box has demonstrably connected through it.
+#
+# It never removes the generation the PREVIOUS environment file named, whatever its age, so the one
+# step back an operator is most likely to want is always there to take. See
+# prune_db_ca_generations() for the rest of the rule.
+# ---------------------------------------------------------------------------
+prune_db_ca_generations
 
 # ---------------------------------------------------------------------------
 # 18. Post-install summary
