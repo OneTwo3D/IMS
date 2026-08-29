@@ -2816,3 +2816,79 @@ test('r45: an upgrade recovers the transport and the CA from the URL the previou
     rmSync(root, { recursive: true, force: true })
   }
 })
+
+// ---------------------------------------------------------------------------
+// 28. THE DIRECTIVE THAT IS ACTUALLY WRITTEN — and the `set -u` trap under it
+//
+// 23c proves the START refuses without the directive. This proves the installer WRITES the one
+// that satisfies it, by running the shipped publisher with its writes stubbed and reading the
+// bytes it hands to publish_durable_dropin(). Without this, "the drop-in states exactly that
+// directive" is an assertion about a comment.
+//
+// IT ALSO COVERS A `set -u` TRAP FOUND WHILE ADDING THIS PUBLISHER. install.sh runs under
+// `set -euo pipefail` and has no `--dry-run` flag, but publish_db_identity_snapshot() — lifted
+// from deploy.sh at r23, where the flag exists — opens with `if $DRY_RUN; then`. install.sh never
+// declared it. Bash EXITS on an unset expansion under `set -u`, and `f || die "..."` does not
+// catch that: `set -e` is suppressed on the left of `||`, `set -u` is not. So every install died
+// at "Setting up application service" — unit written, schema migrated, fence held, nothing
+// started — with `DRY_RUN: unbound variable` and no explanation.
+// ---------------------------------------------------------------------------
+
+test('r45: the installer writes the UnsetEnvironment directive the start gate requires', () => {
+  // MUTATION ROUTES:
+  //   M1 -- delete the top-level `DRY_RUN=false` from install.sh: the shell dies on the unbound
+  //         variable before the drop-in is written, and DIRECTIVE is never printed.
+  //   M2 -- write the names as assignments (`UnsetEnvironment=PGSSLMODE=`): the directive no
+  //         longer matches, and 23c's ASSIGNMENT_FORM is what says why that matters.
+  //   M3 -- have publish_db_route_guarantee() build its list from a literal instead of
+  //         db_route_env_variables(): NAMES_MATCH fails, because the two lists could then drift
+  //         and the start gate would demand a name the drop-in does not state.
+  const source = readFileSync(join(REPO, 'scripts/install.sh'), 'utf8')
+  const lift = (name: string): string => {
+    const start = source.indexOf(`\n${name}() {\n`)
+    assert.notEqual(start, -1, `precondition: scripts/install.sh must define ${name}()`)
+    return source.slice(start + 1, source.indexOf('\n}\n', start) + 3)
+  }
+  const dryRun = source.match(/^DRY_RUN=.*$/gm) ?? []
+  assert.equal(dryRun.length, 1, 'precondition: scripts/install.sh must declare DRY_RUN exactly once at top level')
+
+  const program = [
+    // THE SHIPPED FLAGS, because the trap this covers only exists under `set -u`.
+    'set -euo pipefail',
+    'APP_NAME="one-two-inventory"',
+    'YELLOW=""; RESET=""',
+    'DB_ROUTE_DROPIN_NAME=zz-deploy-db-route.conf',
+    'DB_ROUTE_DROPIN_FILE=/dev/null',
+    'error() { echo "ERROR: $*" >&2; }',
+    'systemctl() { return 0; }',
+    // The one write, replaced by a reader of exactly the bytes it would have written.
+    'publish_durable_dropin() { echo "DROPIN_B64=$(base64 -w0)"; }',
+    dryRun[0],
+    lift('db_route_env_variables'),
+    lift('publish_db_route_guarantee'),
+    'publish_db_route_guarantee || echo "PUBLISH_FAILED"',
+  ].join('\n')
+  let output = ''
+  try {
+    output = execFileSync('bash', ['-c', program], { encoding: 'utf8', env: cleanLibpqEnv(), stdio: ['ignore', 'pipe', 'pipe'] })
+  } catch (error) {
+    const failure = error as { stdout?: string; stderr?: string }
+    output = `${failure.stdout ?? ''}${failure.stderr ?? ''}`
+  }
+  assert.doesNotMatch(output, /unbound variable/,
+    `the shipped publisher must not die on an unset variable under \`set -u\`:\n${output}`)
+  assert.doesNotMatch(output, /PUBLISH_FAILED/, `and it must succeed:\n${output}`)
+  const dropin = Buffer.from(readVar(output, 'DROPIN_B64'), 'base64').toString('utf8')
+  assert.match(dropin, /^\[Service\]$/m, 'DIRECTIVE: it is a [Service] fragment')
+  assert.match(dropin, /^UnsetEnvironment=PGSSLMODE PGREPLICATION NODE_PG_FORCE_NATIVE$/m,
+    `DIRECTIVE: bare names, space-separated, all three:\n${dropin}`)
+
+  // NAMES_MATCH: the drop-in states the list the start gate reads, because both come from
+  // db_route_env_variables(). A literal in either place is two lists that can drift.
+  const listed = execFileSync('bash', ['-c', `set -euo pipefail\n${lift('db_route_env_variables')}\ndb_route_env_variables`], { encoding: 'utf8' })
+    .trim().split('\n')
+  for (const name of listed) {
+    assert.match(dropin, new RegExp(`^UnsetEnvironment=.*\\b${name}\\b`, 'm'),
+      `NAMES_MATCH: the directive must name ${name}, which the start gate requires`)
+  }
+})

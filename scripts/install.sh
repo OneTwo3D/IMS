@@ -732,6 +732,19 @@ DB_ENV_SNAPSHOT_DIR="/etc/ims-cutover"
 DB_ENV_SNAPSHOT_FILE="${DB_ENV_SNAPSHOT_DIR}/db-identity-snapshot.env"
 DB_ENV_SNAPSHOT_DROPIN_NAME="zz-deploy-db-identity.conf"
 DB_ENV_SNAPSHOT_DROPIN_FILE="${FENCE_DROPIN_DIR}/${DB_ENV_SNAPSHOT_DROPIN_NAME}"
+# THIS SCRIPT HAS NO --dry-run, AND UNDER `set -u` THAT WAS NOT THE SAME AS `false`
+# (o3d-2sm1.5 r45, found while adding a third reader of it).
+#
+# publish_db_identity_snapshot() and remove_db_identity_snapshot() were lifted from deploy.sh at
+# r23, and deploy.sh declares DRY_RUN beside its argument parser. install.sh has no such flag and
+# never declared the variable — so line 1 of the publisher expanded an unset name under
+# `set -euo pipefail`, and bash EXITS on that rather than returning non-zero. `f || die "..."`
+# does not catch it: `set -e` is suppressed for the left-hand side of `||`, `set -u` is not.
+#
+# The reachable effect was an install that died with `DRY_RUN: unbound variable` at "Setting up
+# application service" — unit written, database migrated, connection fence held, nothing started
+# and no explanation. It is declared here, `false`, because that is what this script always is.
+DRY_RUN=false
 # THE ROUTE GUARANTEE'S DROP-IN (o3d-2sm1.5 r45, Codex HIGH).
 #
 # The identity snapshot above binds WHICH DATABASE the service connects to. This one binds HOW it
