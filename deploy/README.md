@@ -72,8 +72,16 @@ replaced by a `start`, so a rebuilt tree with the old process still up leaves
 that process on whatever crontab lock path the *old* build derived — while
 anything that reconciles the crontab afterwards (a scheduler save, or
 `scripts/install.sh`) locks the new one. Two locks that do not exclude each
-other silently lose one side's managed block. The installer does this for you
-and aborts if the restart fails; a hand-deploy must not skip it.
+other silently lose one side's managed block. A hand-deploy must not skip it.
+
+`scripts/install.sh` reaches the same end by a different route and needs no
+`restart` of its own: it **stops** the service before the migration and refuses
+to continue while the port is still bound, so its later `start` acts on a
+stopped unit. It then *proves* the result rather than assuming it — it fetches
+`/_next/static/<BUILD_ID>/`, a route only the process whose own build id is that
+one serves, and aborts before the crontab section if anything else answers.
+Nothing here does that for you, which is why the `restart` above is the whole
+guarantee.
 
 ## Tuning notes
 
