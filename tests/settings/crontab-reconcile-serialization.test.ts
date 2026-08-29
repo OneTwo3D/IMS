@@ -2101,10 +2101,10 @@ test('[o3d-batch-ret] a listener serving the new build that is NOT the unit\'s p
     + 'case below cannot be constructed')
 
   const spawnListener = (stateDirectory?: string) => {
-    const env = { ...process.env } as Record<string, string>
+    const env: NodeJS.ProcessEnv = { ...process.env }
     if (stateDirectory === undefined) delete env.STATE_DIRECTORY
     else env.STATE_DIRECTORY = stateDirectory
-    return spawn('sleep', ['120'], { env, stdio: 'ignore' })
+    return spawn('sleep', ['120'], { env, stdio: ['ignore', 'ignore', 'ignore'] })
   }
 
   const impostor = spawnListener(undefined)
