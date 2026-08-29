@@ -73,6 +73,16 @@ sudo systemctl restart ims-stage
   `.next` cache and the uploads dirs listed in the unit. If you relocate uploads
   via `UPLOAD_STORAGE_DIR` / `PUBLIC_UPLOAD_STORAGE_DIR`, update `ReadWritePaths`
   (or add another `StateDirectory`) to match.
+- **`StateDirectory` is load-bearing beyond backups**: the crontab reconciliation
+  lock lives at `$STATE_DIRECTORY/.crontab-reconcile.lock`
+  (`lib/crontab-reconcile-lock.ts`, and the matching `flock` in
+  `scripts/install.sh`). systemd creates the directory, owns it to `User=`, and
+  adds it to `ReadWritePaths` implicitly, so it is the only path both the
+  application and the installer can derive *and* write under
+  `ProtectSystem=strict` — a lock beside the app cannot be created at all.
+  Dropping `StateDirectory=` from the unit does not fail at deploy time; it fails
+  at the first scheduler save, which then refuses and reports that the scheduler
+  may be behind.
 - **Sandbox validation**: `systemd-analyze security ims-stage` scores the unit;
   aim to keep it in the "OK"/"exposed" range or better.
 - Do **not** add `MemoryDenyWriteExecute=true` — it breaks the V8 JIT and the
