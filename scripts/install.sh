@@ -1458,13 +1458,16 @@ rotate_database_password_in_fenced_window() {
   # candidates is live. That question is answerable only on an endpoint whose pg_hba rule actually
   # checks the password, and only on one the reconciliation will still be able to reach — and the
   # reconciliation runs with THIS fence still standing over '${DB_NAME}', so the application
-  # database is disqualified by construction. `postgres` is the maintenance database every cluster
-  # has, PUBLIC holds CONNECT on it by default, and no fence in this script touches it.
+  # database is disqualified by construction — which is exactly what db_unfenced_probe_candidates()
+  # excludes. `postgres` leads that list because PUBLIC holds CONNECT on it by default and no fence
+  # here touches it; the rest of the list is READ FROM THE SERVER, so a site that has hardened the
+  # maintenance database still has somewhere this question can be asked.
   #
   # So it is proven here, with the negative control, BEFORE the ALTER: refuse a random password,
-  # accept the one this run knows is live. An endpoint that cannot do both cannot be relied on
-  # afterwards, and a rotation that would leave an unreconcilable journal is a rotation this run
-  # must not perform. Refusing costs nothing — no ALTER has been issued.
+  # accept the one this run knows is live. The FIRST endpoint that does both is the one recorded —
+  # an endpoint that cannot do both cannot be relied on afterwards, and a rotation that would leave
+  # an unreconcilable journal is a rotation this run must not perform. Refusing costs nothing — no
+  # ALTER has been issued.
   DB_PROBE_REPORT=""
   DB_ROTATION_PROBE_DATABASE=""
   local -a rotation_probe_candidates=()
