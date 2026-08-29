@@ -959,6 +959,14 @@ function executableFiles(dir: string, found: string[] = []): string[] {
  *                             every writer, and its whole job is to describe that window
  *                             (pg_stat_activity) or to check what the migration just did. It writes
  *                             nothing, so it cannot move a plugin key. o3d-2sm1.1.
+ *   'protocol-handshake-only'— opens a connection to this database and reads the FIRST message the
+ *                             server sends: the authentication request, which names the pg_hba
+ *                             method the server matched. It then drops the socket. It sends no
+ *                             password, so the connection NEVER REACHES THE AUTHENTICATED STATE; a
+ *                             PostgreSQL backend accepts no query before that point, so this path
+ *                             cannot read a row, let alone write one. It is discovered here because
+ *                             its prose names `psql` while explaining which connection it has to
+ *                             match. o3d-2sm1.5 r41.
  *   'seed'                  — a standalone client that WRITES this database, run from install.sh.
  *                             It takes no lock and cannot practically be made to (it runs before the
  *                             app is up); what keeps it safe is that it must not write a plugin key,
@@ -979,6 +987,7 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   | 'pinned-lock-session'
   | 'deploy-read-only-probe'
   | 'deploy-connection-fence'
+  | 'protocol-handshake-only'
   | 'seed'
 > = {
   'app/api/backup/restore/route.ts': 'replays-external-sql',
@@ -1029,6 +1038,12 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   // plugin key; what it can do — and what this classification is here to keep visible
   // — is leave the application unable to connect if a release is ever dropped.
   'scripts/fence-db-connections.mjs': 'deploy-connection-fence',
+  // o3d-2sm1.5 r41's matched-method reader. install.sh runs it before a credential rotation, and
+  // before the reconciliation of an interrupted one, to establish which pg_hba method the server
+  // matched for the application role on a given endpoint — because a `radius` or `ldap` rule
+  // discriminates between passwords while checking a credential ALTER ROLE cannot change. It is the
+  // one entry here that opens a connection it deliberately never completes.
+  'scripts/lib/pg-auth-request.mjs': 'protocol-handshake-only',
   'scripts/deploy.sh': 'migration-runner',
   'scripts/install.sh': 'migration-runner',
   'scripts/prisma-dev-db.sh': 'migration-runner',
