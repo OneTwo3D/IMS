@@ -4,7 +4,7 @@
 
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { wcFetch } from '../api'
+import { wcFetch, MAX_WC_PAGE_WALK_PAGES, describeWcPageWalkCeilingStall } from '../api'
 import type { WcFullOrder, SyncResult } from './types'
 import {
   mapWcAddress, upsertCustomer, mapWcLineItems, mapWcOrderDiscount,
@@ -15,7 +15,11 @@ import { decideStoredInvoiceNumberUpdate, resolveWcAccountingInvoiceNumber } fro
 import {
   buildHeldSalesInvoicePayload,
   buildReleasedSalesInvoicePayload,
+  HELD_SALES_INVOICE_RECORD_KIND,
   heldSalesInvoiceQueueWhere,
+  HELD_SALES_INVOICE_ORDER_MISSING_MESSAGE,
+  HELD_SALES_INVOICE_SUPERSEDED_PREFIX,
+  HELD_SALES_INVOICE_UNREADABLE_MESSAGE,
   isHeldSalesInvoicePayload,
   releasedSalesInvoiceQueueWhere,
 } from './held-sales-invoice'
@@ -191,12 +195,34 @@ function getPendingFxNotifyThreshold(env: Record<string, string | undefined> = p
   return parsePositiveIntegerEnv(env.WC_PENDING_FX_ORDER_NOTIFY_THRESHOLD, DEFAULT_PENDING_FX_NOTIFY_THRESHOLD)
 }
 
+/**
+ * The pending-FX queue, and NOTHING ELSE THIS TABLE HOLDS (o3d-xnwu r7, Codex HIGH).
+ *
+ * `entityId: null` is the load-bearing clause, and it is load-bearing in both directions.
+ *
+ * A queued order has no IMS order yet — that is WHY it is queued, and `recordPendingFxOrder` has
+ * never written one. A REFUND PARK, by contrast, always names the IMS order it is evidence about.
+ * So this column separates the two sets by construction, and it is a column IMS writes.
+ *
+ * `payload.reason` DOES NOT, and relying on it here was a live defect. A refund park persists the
+ * RAW WOOCOMMERCE REFUND, whose top-level `reason` is free text a human types when issuing the
+ * refund. A PENDING park whose operator wrote `missing_fx_rate` matched this query, failed
+ * `isQueuedWcOrderPayload` (correctly — it is not an order snapshot), and was then STAMPED FAILED by
+ * `markPendingFxRetryLogFailed` with a message about a missing order snapshot — overwriting the
+ * park's own error text, which is what the Record-manually and recovery paths read. A user-controlled
+ * string cannot be allowed to select rows for a writer.
+ *
+ * The marker stays as a POSITIVE assertion about our own payload — it is what we wrote, and the
+ * replay verifies the whole shape with `isQueuedWcOrderPayload` before touching it — but it is no
+ * longer the only thing standing between an operator's refund reason and a destructive update.
+ */
 export function pendingFxQueueWhere(externalOrderId?: string): Prisma.ShoppingSyncLogWhereInput {
   return {
     connector: 'woocommerce',
     direction: 'FROM_CONNECTOR',
     status: 'PENDING',
     entityType: 'SalesOrder',
+    entityId: null,
     ...(externalOrderId ? { externalId: externalOrderId } : {}),
     payload: {
       path: ['reason'],
@@ -968,6 +994,9 @@ async function holdWcSalesInvoiceForMissingNumber(params: {
     entityType: 'SalesOrder',
     entityId: params.salesOrderId,
     externalId: String(params.wcOrder.id),
+    // o3d-xnwu r8: the hold names its own family, so it is neither admitted by the refund-park
+    // predicate (which would offer refund recoveries on an invoice) nor able to select a park.
+    recordKind: HELD_SALES_INVOICE_RECORD_KIND,
     payload: jsonPayload,
     errorMessage: `Waiting for ${params.metaKey} on WooCommerce order ${params.wcOrder.number} before the sales invoice can be posted.`,
     syncedAt: null,
@@ -1066,7 +1095,7 @@ async function releaseHeldWcSalesInvoice(
       where: { id: row.id },
       data: {
         status: 'FAILED',
-        errorMessage: 'The held sales-invoice payload is unreadable, so the invoice cannot be released automatically — queue it from the order.',
+        errorMessage: HELD_SALES_INVOICE_UNREADABLE_MESSAGE,
         syncedAt: new Date(),
       },
     }).catch(() => {})
@@ -1289,8 +1318,7 @@ export async function retryHeldWcSalesInvoiceReleases(options?: {
         where: { id: row.id },
         data: {
           status: 'FAILED',
-          errorMessage:
-            'The sales order this invoice was held for cannot be found, so it can never be released. Nothing was posted.',
+          errorMessage: HELD_SALES_INVOICE_ORDER_MISSING_MESSAGE,
           syncedAt: new Date(),
         },
       }).catch(() => {})
@@ -1305,7 +1333,7 @@ export async function retryHeldWcSalesInvoiceReleases(options?: {
         data: {
           status: 'SYNCED',
           errorMessage:
-            `Superseded: this order already carries ledger document ${order.accountingInvoiceId}, so the held sales `
+            `${HELD_SALES_INVOICE_SUPERSEDED_PREFIX}${order.accountingInvoiceId}, so the held sales `
             + 'invoice was not released.',
           syncedAt: new Date(),
         },
@@ -2727,11 +2755,15 @@ export async function syncNewWcOrders(
     })
   }
 
-  // Fetch orders page by page
+  // Fetch orders page by page — ENDING ON AN EMPTY PAGE, not on `x-wp-totalpages` (o3d-xnwu).
+  // `totalPages` is a header, and `readWcCountHeader` answers the caller's default of 1 for an
+  // absent one; ending on it let a store that sends none truncate this sweep to 100 orders with no
+  // error, after which the cursor below advanced past everything it had never asked for.
   let page = 1
   let totalPages = 1
+  let endedOnEmptyPage = false
 
-  while (page <= totalPages) {
+  while (page <= MAX_WC_PAGE_WALK_PAGES) {
     const params: Record<string, string> = {
       status: statuses.join(','),
       per_page: '100',
@@ -2746,6 +2778,13 @@ export async function syncNewWcOrders(
 
     totalPages = tp
     const orders = data as WcFullOrder[]
+
+    // THE ONLY PROOF OF AN ENDING (o3d-xnwu). Before any work, so it costs one request and imports
+    // nothing.
+    if (orders.length === 0) {
+      endedOnEmptyPage = true
+      break
+    }
 
     for (const order of orders) {
       // Normalised on both sides (o3d-tj6v r4). `getWithdrawalStatuses` already returns normalised
@@ -2841,6 +2880,28 @@ export async function syncNewWcOrders(
     }
 
     page++
+  }
+
+  // A truncated read is a fetch error by another name, so it goes in `errors` and the cursor below
+  // is held (o3d-xnwu). The `break` on a fetch error above pushed its own, so this only fires on a
+  // clean walk that RAN OUT OF CEILING.
+  //
+  // Which is a STALL, and the same one product-sync has (round 3, Codex MEDIUM): this error holds
+  // `cursorKey`, so the next sweep rebuilds the identical `modified_after` window and stops in the
+  // identical place. Retrying is the failure, not the recovery, so the message says that and the
+  // run escalates instead of leaving one line that reads as transient.
+  const ranOutOfCeiling = !endedOnEmptyPage && result.errors.length === 0
+  if (ranOutOfCeiling) {
+    result.errors.push(describeWcPageWalkCeilingStall('order', cursorKey))
+    await logActivity({
+      entityType: 'SYNC',
+      action: 'wc_order_sync_ceiling_stall',
+      tag: 'sync',
+      level: 'ERROR',
+      description: result.errors[result.errors.length - 1],
+      metadata: { mode, cursorKey, modifiedAfter: lastSync, pagesRead: page - 1, ceiling: MAX_WC_PAGE_WALK_PAGES },
+      resolveUser: false,
+    })
   }
 
   // Only advance the cursor after a fully clean run. Advancing after a fetch

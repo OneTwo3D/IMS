@@ -57,6 +57,142 @@ export async function getWcCredentials(): Promise<ConnectorCredentials | null> {
   return null
 }
 
+/**
+ * Per-request ceiling for every WooCommerce call (o3d-jcx: exported so the callers that page can
+ * reason about their aggregate worst case against the webhook inbox's stale-processing window,
+ * instead of the number being three copies of a literal nobody can see from outside).
+ */
+export const WC_REQUEST_TIMEOUT_MS = 120_000
+
+/**
+ * Value used for a pagination header WooCommerce did not send readably (o3d-jcx).
+ *
+ * Negative on purpose: it can never be mistaken for a real count, and a caller that compares it
+ * against a page number stops rather than looping, while a caller that CHECKS for it (see
+ * fetchAllWcVariations) can say so out loud instead of silently treating page 1 as the whole set.
+ *
+ * It does not, and cannot, rescue a walk that ENDS on `totalPages`: an ABSENT header still arrives
+ * as the caller's default of 1, so "the store said nothing" and "the store said one page" remain
+ * the same value. Only an empty page proves an ending — see `fetchAllWcRefundsForOrder`.
+ */
+export const WC_PAGINATION_UNKNOWN = -1
+
+/**
+ * THE CEILING ON A COLLECTION WALK THAT ENDS ON AN EMPTY PAGE, not on `x-wp-totalpages`.
+ *
+ * o3d-xnwu — THE EMPTY-PAGE RULE WAS APPLIED TO THE WALKS THAT RETURN A LIST AND SKIPPED IN THE
+ * ONES THAT MOVE A CURSOR, which is the wrong way round. `fetchAllWcRefundsForOrder`,
+ * `fetchAllWcVariations` and the category mirror all end only on an empty page and treat a
+ * truncated read as an error. The bulk product sync, the bulk order import, the historical order
+ * import and the initial import all ended on `page > totalPages` — and `totalPages` is a header.
+ *
+ * That is not a theoretical gap. `readWcCountHeader` answers `WC_PAGINATION_UNKNOWN` for an EMPTY
+ * `x-wp-totalpages` and the caller's default of 1 for an ABSENT one, so a store that sends either
+ * gave the bulk product sync the first 100 products, NO ERROR, and therefore an ADVANCED CURSOR —
+ * permanently skipping every product beyond page 1 whose `date_modified` predates the new
+ * watermark. The sentinel was added so a caller "that CHECKS for it can say so out loud"; these
+ * four did not check it, and the same commit that added the sentinel also owned the cursor rule.
+ *
+ * ENDING ON AN EMPTY PAGE MAKES THE HEADER IRRELEVANT TO TERMINATION, which is why it is the fix
+ * rather than a special case for the sentinel: the walk keeps asking until the store says "nothing
+ * more", whatever it did or did not put in a header. `totalPages` survives only as progress text.
+ *
+ * The cost is exactly one extra request per walk — the empty page that proves the ending — which is
+ * the cost the other three walks already pay and document.
+ *
+ * AND A CEILING IS MANDATORY, because "keep asking until it is empty" against a store that ignores
+ * `page` never terminates. 1000 pages is 100,000 rows at the `per_page: 100` every one of these
+ * walks uses, which is far beyond any window they are ever pointed at (all four are scoped by a
+ * cursor, a date range or a status set), and reaching it is reported as an INCOMPLETE READ rather
+ * than passed off as an ending — so the cursor is held and the run is retried, exactly as
+ * `fetchAllWcVariations` does at its own ceiling.
+ */
+export const MAX_WC_PAGE_WALK_PAGES = 1000
+
+/**
+ * The message a walk that never reached an empty page reports.
+ *
+ * ONE WORDING for the walks that have no cursor to pin, because the thing being said is the same
+ * fact and the response is the same: this was a TRUNCATED READ, nothing about the collection has
+ * been established, and nothing may be treated as the end of it.
+ *
+ * A CURSOR WALK USES describeWcPageWalkCeilingStall INSTEAD (round 3, Codex MEDIUM). "It will be
+ * retried" is a promise, and for a walk whose cursor is held by this very error the retry is
+ * identical to the run that produced it — see below.
+ */
+export function describeUnendedWcPageWalk(collection: string, pagesRead: number): string {
+  return `The WooCommerce ${collection} walk did not reach an empty page within ${pagesRead} page(s) `
+    + `(ceiling ${MAX_WC_PAGE_WALK_PAGES}). A walk that ends on the page-count header rather than on an `
+    + 'empty page can be truncated by a store that sends no readable x-wp-totalpages, so this is reported '
+    + 'as an INCOMPLETE READ: nothing is treated as the end of the collection and the sync cursor is not '
+    + 'advanced past it. It will be retried.'
+}
+
+/**
+ * o3d-batch-wcsync round 3 (Codex MEDIUM) — WHEN A CURSOR WALK RUNS OUT OF CEILING, THE RETRY IS
+ * THE FAILURE.
+ *
+ * Both cursor walks read a window defined by their own cursor (`modified_after = <cursor>`) and
+ * hold that cursor whenever anything landed in `errors`. Running out of ceiling lands in `errors`.
+ * So the next run rebuilds the SAME window, walks the SAME first {ceiling} pages, imports the same
+ * rows again, hits the ceiling again and holds the cursor again — for ever, and the rows past the
+ * ceiling are never reached at all. Nothing narrows the window, pages from a different offset, or
+ * advances the cursor partially.
+ *
+ * `describeUnendedWcPageWalk` said "It will be retried", and blamed a store that sends no readable
+ * `x-wp-totalpages`. That diagnosis fits the OTHER cause of an unended walk and not this one: here
+ * the header was fine, the store is fine, and the retry is the thing that cannot help. An operator
+ * reading it would wait for a transient problem to clear.
+ *
+ * Not fixed by advancing the cursor part-way: neither walk asks for a deterministic order over the
+ * field its cursor is expressed in, so "everything up to the newest row seen" is not a fact either
+ * of them can establish. Both remedies below are things a human does; the run states them and
+ * escalates rather than pretending it can recover.
+ */
+export function describeWcPageWalkCeilingStall(collection: string, cursorKey: string): string {
+  return `The WooCommerce ${collection} walk reached its ${MAX_WC_PAGE_WALK_PAGES}-page ceiling `
+    + `(${MAX_WC_PAGE_WALK_PAGES * 100} rows) without the store ever returning an empty page, so the window `
+    + `this run reads is WIDER THAN THE WALK CAN COVER. This is NOT transient and RETRYING CANNOT CLEAR IT: `
+    + `the cursor "${cursorKey}" is held by this error, so the next run rebuilds the identical window, reads `
+    + 'the identical pages and stops in the identical place — and nothing past the ceiling is ever reached. '
+    + 'Narrow the window (import or reconcile a smaller catalogue first, so the cursor can advance) or raise '
+    + 'MAX_WC_PAGE_WALK_PAGES for this store. Until one of those happens this sync makes no progress at all.'
+}
+
+/**
+ * The message a walk reports when a PAGE FETCH FAILED — a hole in the middle, not a short tail.
+ *
+ * o3d-batch-wcsync round 3 (Codex CRITICAL). Two walks handled a page error with
+ * `errors.push(...); page++; continue`, which SKIPS the page and keeps going. The walk then reaches
+ * an empty page perfectly normally, so the end-on-empty flag is TRUE and the truncation check —
+ * which only ever asked whether the walk reached an empty page — reads FALSE. An initial import
+ * that lost a page to one transient 500 therefore passed as COMPLETE, wrote
+ * `wc_initial_import_completed`, unlocked live order sync and advanced `last_wc_order_sync_at`
+ * past a hundred orders that nothing will ever read again: the live sweeps are cursor-based and
+ * the backfill is the only thing that reads the history.
+ *
+ * "Ended on an empty page" answers a question about the TAIL. This answers the other one — was
+ * every page in between actually read — and it is the likelier failure, because a transient 500 or
+ * a timeout is far more common than a store that never returns an empty page.
+ *
+ * ONE WORDING, for the same reason describeUnendedWcPageWalk has one.
+ */
+export function describeUnreadWcPage(collection: string, page: number, error: string): string {
+  return `The WooCommerce ${collection} walk could not read page ${page} after 3 attempts: ${error}. `
+    + 'That page was NEVER READ, so up to 100 rows in the MIDDLE of the collection are missing — which '
+    + 'reaching an empty page later would not reveal. The walk stops here rather than skipping past the '
+    + 'hole: the pass has already failed, so the remaining pages cannot change the outcome and walking '
+    + `them costs up to ${MAX_WC_PAGE_WALK_PAGES} more fetches. This is reported as an INCOMPLETE READ: `
+    + 'nothing is marked complete and the sync cursor is not advanced. It will be retried.'
+}
+
+/** Exported for test: the NaN this replaced is the silent truncation itself (o3d-jcx). */
+export function readWcCountHeader(raw: string | null, whenAbsent: number): number {
+  if (raw === null) return whenAbsent
+  const parsed = Number.parseInt(raw.trim(), 10)
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : WC_PAGINATION_UNKNOWN
+}
+
 export async function wcFetch(
   path: string,
   params: Record<string, string> = {},
@@ -79,7 +215,7 @@ export async function wcFetch(
   const auth = Buffer.from(`${safeCredentials.key}:${safeCredentials.secret}`).toString('base64')
   const res = await connectorFetch(url, {
     headers: { Authorization: `Basic ${auth}` },
-    signal: AbortSignal.timeout(120000),
+    signal: AbortSignal.timeout(WC_REQUEST_TIMEOUT_MS),
   }, {
     connectorName: 'WooCommerce',
   })
@@ -94,8 +230,13 @@ export async function wcFetch(
     return { data: null, totalPages: 0, totalItems: 0, error: `WC API returned non-JSON response (${contentType}). The server may have timed out.` }
   }
 
-  const totalPages = parseInt(res.headers.get('x-wp-totalpages') ?? '1')
-  const totalItems = parseInt(res.headers.get('x-wp-total') ?? '0')
+  // o3d-jcx: `parseInt('')` is NaN, and `page <= NaN` is false — so a WooCommerce install that
+  // sent an EMPTY x-wp-totalpages ended every paging loop in this connector after page one and
+  // reported the truncated result as complete. NaN is now surfaced as a NEGATIVE sentinel so a
+  // caller that pages can tell "one page" from "the server did not say", rather than the two
+  // being indistinguishable. Callers that ignore it are no worse off than before.
+  const totalPages = readWcCountHeader(res.headers.get('x-wp-totalpages'), 1)
+  const totalItems = readWcCountHeader(res.headers.get('x-wp-total'), 0)
   const data = await res.json()
   return { data, totalPages, totalItems }
 }
@@ -119,7 +260,7 @@ export async function wcPost(
     method: 'POST',
     headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(120000),
+    signal: AbortSignal.timeout(WC_REQUEST_TIMEOUT_MS),
   }, {
     connectorName: 'WooCommerce',
   })
@@ -150,7 +291,7 @@ export async function wcPut(
     method: 'PUT',
     headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(120000),
+    signal: AbortSignal.timeout(WC_REQUEST_TIMEOUT_MS),
   }, {
     connectorName: 'WooCommerce',
   })

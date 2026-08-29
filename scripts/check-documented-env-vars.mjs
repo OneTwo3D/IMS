@@ -150,10 +150,19 @@ export function extractShellEnvHeredocKeys(text) {
   const lines = text.split(/\r?\n/)
   let inHeredoc = false
   let terminator = null
+  // WHICH FUNCTION THE OPENER IS IN, because the redirect is no longer on the opener line
+  // (o3d-2sm1.5 r39). The installer used to write `cat > "${APP_DIR}/.env" <<EOF`, and the path in
+  // that line was how this scanner recognised the app's environment file. r39 split the writer so
+  // that the bytes are rendered first and PUBLISHED BY RENAME afterwards — the heredoc now goes to
+  // stdout inside render_app_env_file() and names no path at all. Without this the scanner found
+  // no keys and every variable install.sh alone documents looked undocumented.
+  let enclosingFunction = ''
   for (const line of lines) {
     if (!inHeredoc) {
+      const definition = /^([A-Za-z_][A-Za-z0-9_]*)\(\)\s*\{/.exec(line)
+      if (definition) enclosingFunction = definition[1]
       const open = /<<-?\s*'?"?([A-Za-z_][A-Za-z0-9_]*)'?"?\s*$/.exec(line)
-      if (open && /\.env\b/.test(line)) {
+      if (open && (/\.env\b/.test(line) || /app_env_file$/.test(enclosingFunction))) {
         inHeredoc = true
         terminator = open[1]
       }

@@ -1,0 +1,563 @@
+#!/usr/bin/env node
+/**
+ * WHICH pg_hba RULE THE SERVER MATCHED, ASKED OF THE SERVER (o3d-2sm1.5 r41, Codex HIGH).
+ *
+ * THE FINDING. install.sh admitted an endpoint as evidence about the application role's password
+ * once it had watched that endpoint refuse a random password and accept an asserted one. That
+ * proves the endpoint discriminates BETWEEN PASSWORDS. It does not prove the password it
+ * discriminates on is PostgreSQL's own role credential -- the only thing `ALTER ROLE ... PASSWORD`
+ * changes. `pg_hba.conf` has password-dependent methods that consult somebody else's store:
+ * `ldap`, `pam`, `radius`, `bsd`. Under any of them both halves of that control behave exactly as
+ * expected while the answer is about a directory, and an interrupted rotation reconciled from it
+ * can publish a credential the role does not have.
+ *
+ * WHAT THIS PROGRAM ESTABLISHES. The PostgreSQL v3 startup exchange begins with the server
+ * choosing a pg_hba record -- ITS OWN MATCH, performed by its own matcher against its own file --
+ * and announcing the consequence as an Authentication request message. That message is a
+ * different value for the methods that check `pg_authid.rolpassword` than for the ones that do
+ * not, and the mapping is exact rather than statistical:
+ *
+ *   AuthenticationSASL (10) offering SCRAM-SHA-256 or SCRAM-SHA-256-PLUS
+ *       `scram-sha-256` -- or `md5` over a role whose stored verifier is SCRAM, which PostgreSQL
+ *       upgrades to SCRAM automatically. Either way the secret compared is the role's own.
+ *   AuthenticationMD5Password (5)
+ *       `md5` over an MD5-format stored verifier. The secret compared is the role's own.
+ *   AuthenticationCleartextPassword (3)
+ *       `password`, `ldap`, `pam`, `radius` or `bsd`. THESE ARE INDISTINGUISHABLE ON THE WIRE and
+ *       they must be: an external verifier can only be consulted with the plaintext, so the
+ *       server asks for the plaintext. `password` does check the role's own secret -- but nothing
+ *       in the protocol separates it from the four that do not, so this program reports the
+ *       ambiguity rather than resolving it, and the caller refuses.
+ *   AuthenticationOk (0)
+ *       the server asked for nothing: `trust`, or a rule already satisfied by the transport
+ *       (`peer`, `ident`, `cert`). No password of any kind is being checked.
+ *   AuthenticationGSS (7) / AuthenticationSSPI (9) / any other code
+ *       an external identity system. Not the role's own secret.
+ *
+ * SO THE EXIT STATUS IS THE VERDICT: 0 when -- and only when -- the server itself asked for a
+ * secret it will compare against `pg_authid.rolpassword` for this role, on this database, from
+ * this address, over this transport. 1 for every other answer, including every answer this
+ * program cannot classify. 2 for a usage error.
+ *
+ * WHAT IT DOES NOT ESTABLISH, said here because the caller's refusal text quotes it:
+ *
+ *   * It is not an authentication. NO PASSWORD IS EVER SENT -- the connection is dropped the
+ *     instant the request message has been read. It therefore says nothing about whether any
+ *     particular credential is live, nor whether the role holds CONNECT on the database. The
+ *     caller still has to ask that separately, and does.
+ *   * It cannot admit `password` (cleartext compared against the role's own secret), because the
+ *     wire cannot tell it from `ldap`. That is a deliberate narrowing, and it costs a site running
+ *     cleartext-against-PostgreSQL a refusal it did not strictly have to have.
+ *   * IT IS A SEPARATE CONNECTION from the one the caller then opens with psql, and from the one
+ *     the APPLICATION opens with node-postgres. That is why this program is TOLD which route to
+ *     take (`--sslmode=`) and REPORTS THE ROUTE IT TOOK (`sslmode=`), rather than only the method
+ *     it read. A method observed on one transport is not a statement about another: `hostssl` and
+ *     `hostnossl` are different records, and against `hostssl ... scram-sha-256` over
+ *     `hostnossl ... <anything>` the two answer differently about the same role.
+ *
+ *     WHICH ROUTE IS THE RIGHT ONE TO OBSERVE ON: THE APPLICATION'S (o3d-2sm1.5 r43, Codex HIGH).
+ *     Through r42 this program observed on libpq's default `sslmode=prefer` and the caller pinned
+ *     its psql probes to whatever came back. That aligned the instruments WITH EACH OTHER and left
+ *     them aligned with a connection nobody makes: node-postgres, handed the `DATABASE_URL` this
+ *     installer emits, sends no SSLRequest at all -- measured against the installed `pg`, not read
+ *     out of its documentation -- so the application is matched by the `hostnossl`/`host` record
+ *     while every probe was reading the `hostssl` one. On the split above that publishes a SCRAM
+ *     password the application's own route has never heard of.
+ *
+ *     So the caller passes the route the APPLICATION takes, this program takes exactly that one,
+ *     and the caller then pins its psql probes to it as well -- never `prefer`, so an
+ *     authentication failure has no second record to fall onto. Since r45 that route is a
+ *     DEPLOYMENT INPUT (install.sh's DB_SSLMODE=) rather than always `disable`, and the emitted
+ *     URL carries `uselibpqcompat=true` so that the word means the same thing to node-postgres,
+ *     to libpq and here. What remains is a
+ *     pg_hba RELOAD between the connections, which no pinning can close and which the negative
+ *     control does still catch.
+ *   * IT NEGOTIATES NO GSSAPI ENCRYPTION, and neither may the caller. libpq's `gssencmode=prefer`
+ *     sends a GSSENCRequest BEFORE the SSLRequest wherever a Kerberos credential cache is present,
+ *     and a connection that takes it is matched by `hostgssenc` records this program never sees.
+ *     install.sh therefore pairs the `sslmode=` pin with `gssencmode=disable`; the pin is only a
+ *     pin if it covers every transport decision libpq makes on its own.
+ *
+ * WHY IT SPEAKS THE PROTOCOL RATHER THAN READING A CATALOGUE. `pg_hba_file_rules` (PostgreSQL 10
+ * and later) lists the PARSED RULES. A rule listing is not a match: deciding which record applies
+ * means reproducing the server's own matching -- address families, CIDR arithmetic, `all` and
+ * `replication` and `+group` and `@file` expansion, first-match-wins ordering, `hostssl` versus
+ * `hostnossl` against the transport actually negotiated. That re-implementation IS the modelling
+ * error this file exists to remove, so it is not done.
+ *
+ * THE OTHER TWO ROUTES WERE MEASURED BEFORE THIS ONE WAS CHOSEN, and neither is available across
+ * the versions this installer meets -- it takes whatever PostgreSQL the distribution ships: 14 on
+ * Ubuntu 22.04, 15 on Debian 12, 16 on Ubuntu 24.04, 17 on Debian 13.
+ *
+ *   * NO CATALOGUE REPORTS THE MATCHED METHOD OF A LIVE BACKEND. `pg_stat_activity` carries no
+ *     such column -- verified against 17, which is the newest of the four. The server LOG has
+ *     carried `connection authenticated: identity=... method=...` since PostgreSQL 14, but that is
+ *     a log line, written after the fact, addressed to journald or syslog rather than to the
+ *     client, and not readable by an installer that has not been told where the log went.
+ *   * libpq's `require_auth` would be the ideal instrument -- it binds the requirement to the very
+ *     connection that then authenticates, closing the one gap left below. It is a CLIENT feature
+ *     and it arrived in libpq 16, so on Ubuntu 22.04 and Debian 12 it is not an option that
+ *     behaves differently, it is a connection parameter that does not exist. Making it the
+ *     mechanism would mean refusing on half the supported estate, or shipping two mechanisms of
+ *     which only the newer one is ever exercised by a test run on a modern box.
+ *
+ * The startup message is the one answer every supported version gives, in the same bytes, and has
+ * given since protocol 3.0.
+ *
+ * SSL, AND THE ROUTES `--sslmode=` SELECTS BETWEEN. The value is REQUIRED: there is no default,
+ * because a default is the one thing that can put this connection on a transport nobody chose,
+ * and that is the whole of the r43 finding.
+ *
+ *   `disable`  no SSLRequest is sent at all. Matched by `hostnossl`/`host` records only, and
+ *              what node-postgres does with a URL that carries no `sslmode=`.
+ *   `require`  SSLRequest, and an `N` is a FAILURE rather than a fallback. Verifies nothing, as
+ *              libpq's `require` verifies nothing -- anything stricter would refuse the
+ *              self-signed certificate a Debian cluster ships and that the psql beside it accepts.
+ *   `verify-ca`   as `require`, plus the certificate chain is verified against the CA named by
+ *              `--sslrootcert=`. The hostname is NOT checked, which is what the word means.
+ *   `verify-full` as `verify-ca`, plus node:tls's own hostname check -- the same one `pg` gets,
+ *              since `pg` supplies no checkServerIdentity of its own.
+ *   `prefer`   SSLRequest, upgrade on `S`, continue in the clear on `N`. libpq's default, and no
+ *              connection install.sh opens uses it: it picks its transport at RUN TIME, which is
+ *              what let an authentication FAILURE select a second pg_hba record.
+ *
+ * ALL FOUR TLS MODES ARE MATCHED BY THE SAME `hostssl` RECORD -- an SSLRequest was sent and
+ * accepted, and that is the only thing pg_hba's transport keyword looks at. What separates them is
+ * whether the handshake COMPLETES, which is why the reader takes the application's exact mode
+ * rather than the cheapest one that reaches the same record: a probe that verified less than the
+ * application does would report a method the application will never get to read.
+ *
+ * Debian's packaged cluster ships `ssl = on` and an `initdb` cluster ships `ssl = off`. Both are
+ * measured, on real clusters, because a suite that only ever runs the second leaves the transport
+ * every real installation offers untested.
+ *
+ * Unix-domain sockets take no SSLRequest, for the same reason libpq sends none.
+ */
+import { Buffer } from 'node:buffer'
+import net from 'node:net'
+import process from 'node:process'
+import fs from 'node:fs'
+import tls from 'node:tls'
+
+const PROTOCOL_VERSION_3_0 = 196608
+const SSL_REQUEST_CODE = 80877103
+const DEFAULT_TIMEOUT_MS = 10_000
+/** The startup message's parameter list is NUL-separated and NUL-terminated. */
+const NUL = '\u0000'
+
+function die(message, status) {
+  process.stdout.write(`requested=unknown\nsslmode=unknown\nmethod=unknown\nverifier=unknown\ndetail=${message}\n`)
+  process.exit(status)
+}
+
+function int32(value) {
+  const buffer = Buffer.alloc(4)
+  buffer.writeInt32BE(value, 0)
+  return buffer
+}
+
+function startupMessage(user, database) {
+  const payload = Buffer.concat([
+    int32(PROTOCOL_VERSION_3_0),
+    Buffer.from(`user${NUL}${user}${NUL}database${NUL}${database}${NUL}${NUL}`, 'utf8'),
+  ])
+  return Buffer.concat([int32(payload.length + 4), payload])
+}
+
+function sslRequest() {
+  return Buffer.concat([int32(8), int32(SSL_REQUEST_CODE)])
+}
+
+/** NUL-separated strings, terminated by an empty one -- the SASL mechanism list's shape. */
+function nulStrings(payload) {
+  const names = []
+  let start = 0
+  while (start < payload.length) {
+    const end = payload.indexOf(0, start)
+    if (end === -1) break
+    const name = payload.subarray(start, end).toString('utf8')
+    if (name.length === 0) break
+    names.push(name)
+    start = end + 1
+  }
+  return names
+}
+
+/** The ErrorResponse field list: a type byte, a NUL-terminated value, repeated, then a NUL. */
+function errorFields(payload) {
+  const fields = new Map()
+  let start = 0
+  while (start < payload.length && payload[start] !== 0) {
+    const type = String.fromCharCode(payload[start])
+    const end = payload.indexOf(0, start + 1)
+    if (end === -1) break
+    fields.set(type, payload.subarray(start + 1, end).toString('utf8'))
+    start = end + 1
+  }
+  return fields
+}
+
+/**
+ * A reader that owns the stream's `data` events, so that the TLS upgrade can be handed a socket
+ * with nothing buffered behind it. Everything it is asked for is read against an explicit
+ * deadline: a server that accepts the connection and then says nothing must not hang an installer.
+ */
+class Reader {
+  constructor() {
+    this.chunks = Buffer.alloc(0)
+    this.failure = null
+    this.finished = false
+    this.wake = null
+    this.stream = null
+    this.onData = (chunk) => { this.chunks = Buffer.concat([this.chunks, chunk]); this.pump() }
+    this.onError = (error) => { this.failure = error; this.pump() }
+    this.onClose = () => { this.finished = true; this.pump() }
+  }
+
+  attach(stream) {
+    this.detach()
+    this.stream = stream
+    stream.on('data', this.onData)
+    stream.on('error', this.onError)
+    stream.on('end', this.onClose)
+    stream.on('close', this.onClose)
+  }
+
+  detach() {
+    if (this.stream === null) return
+    this.stream.removeListener('data', this.onData)
+    this.stream.removeListener('error', this.onError)
+    this.stream.removeListener('end', this.onClose)
+    this.stream.removeListener('close', this.onClose)
+    this.stream = null
+  }
+
+  pump() {
+    const wake = this.wake
+    this.wake = null
+    if (wake !== null) wake()
+  }
+
+  buffered() {
+    return this.chunks.length
+  }
+
+  async read(length, deadline) {
+    while (this.chunks.length < length) {
+      if (this.failure !== null) throw this.failure
+      if (this.finished) throw new Error('the server closed the connection before it said anything')
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) throw new Error('the server did not answer in time')
+      await new Promise((resolve) => {
+        this.wake = resolve
+        const timer = setTimeout(resolve, Math.min(remaining, 50))
+        if (typeof timer.unref === 'function') timer.unref()
+      })
+    }
+    const head = this.chunks.subarray(0, length)
+    this.chunks = this.chunks.subarray(length)
+    return head
+  }
+
+  /** One protocol message: a type byte, an int32 length that counts itself, and the body. */
+  async message(deadline) {
+    const type = String.fromCharCode((await this.read(1, deadline))[0])
+    const length = (await this.read(4, deadline)).readInt32BE(0)
+    if (length < 4 || length > 1_000_000) throw new Error(`the server sent a message of implausible length ${length}`)
+    return { type, payload: await this.read(length - 4, deadline) }
+  }
+}
+
+function connect(host, port, deadline) {
+  return new Promise((resolve, reject) => {
+    const socket = host.startsWith('/')
+      ? net.connect({ path: `${host.replace(/\/+$/, '')}/.s.PGSQL.${port}` })
+      : net.connect({ host, port })
+    const timer = setTimeout(() => {
+      socket.destroy()
+      reject(new Error('the connection was not accepted in time'))
+    }, Math.max(1, deadline - Date.now()))
+    if (typeof timer.unref === 'function') timer.unref()
+    socket.once('connect', () => { clearTimeout(timer); resolve(socket) })
+    socket.once('error', (error) => { clearTimeout(timer); reject(error) })
+  })
+}
+
+/**
+ * THE TLS OPTIONS FOR ONE MODE, BUILT THE WAY THE APPLICATION'S DRIVER BUILDS THEM
+ * (o3d-2sm1.5 r45, Codex MEDIUM).
+ *
+ * This is not a mapping invented here. It is what pg-connection-string 2.12.0 produces for the
+ * same `sslmode=` under `uselibpqcompat=true` -- the branch install.sh selects by putting that
+ * parameter on the emitted URL -- read out of `node_modules/pg-connection-string/index.js:99-131`
+ * and reproduced field for field:
+ *
+ *   `require`/`prefer`  { rejectUnauthorized: false }. Encrypted, certificate not verified. This
+ *                       is what the reader has always done, and it is what a Debian cluster's
+ *                       self-signed certificate needs.
+ *   `verify-ca`         { ca, checkServerIdentity: () => {} }. The chain is verified against the
+ *                       CA install.sh was given; the HOSTNAME is not, which is what separates
+ *                       verify-ca from verify-full in libpq and in the driver alike.
+ *   `verify-full`       { ca }. Chain and hostname both, by node:tls's own default identity check
+ *                       -- the same one `pg` gets, because `pg` sets none of its own.
+ *
+ * So the reader and the application are the same TLS client on the same options. That is the
+ * closest this program can come to "probe through the driver" without requiring the driver: `pg`
+ * is not on disk at the moment the earliest probe runs (install.sh reconciles an interrupted
+ * rotation while collecting configuration, several hundred lines before it deploys the release or
+ * runs `npm ci`), and on an upgrade the copy that IS on disk belongs to the OLD release -- a
+ * different driver from the one about to be installed, which is the wrong client to measure.
+ */
+function tlsOptionsFor(mode, host, ca) {
+  const servername = net.isIP(host) === 0 ? host : undefined
+  if (mode === 'verify-full') return { servername, ca }
+  if (mode === 'verify-ca') return { servername, ca, checkServerIdentity: () => undefined }
+  return { servername, rejectUnauthorized: false }
+}
+
+function upgrade(socket, host, deadline, mode, ca) {
+  return new Promise((resolve, reject) => {
+    const secured = tls.connect({
+      socket,
+      ...tlsOptionsFor(mode, host, ca),
+    })
+    const timer = setTimeout(() => {
+      secured.destroy()
+      reject(new Error('the TLS handshake did not complete in time'))
+    }, Math.max(1, deadline - Date.now()))
+    if (typeof timer.unref === 'function') timer.unref()
+    secured.once('secureConnect', () => { clearTimeout(timer); resolve(secured) })
+    secured.once('error', (error) => { clearTimeout(timer); reject(error) })
+  })
+}
+
+function classify(type, payload) {
+  if (type === 'E') {
+    const fields = errorFields(payload)
+    return {
+      method: 'none',
+      verifier: 'unknown',
+      detail: `the server refused the connection before it asked for anything (SQLSTATE ${fields.get('C') ?? 'unknown'}: ${(fields.get('M') ?? 'no message').replace(/\s+/g, ' ')}), so there is no matched pg_hba method here to read`,
+    }
+  }
+  if (type !== 'R') {
+    return {
+      method: 'unknown',
+      verifier: 'unknown',
+      detail: `the server answered the startup message with a '${type}' message, which is not an authentication request`,
+    }
+  }
+  const code = payload.readInt32BE(0)
+  if (code === 0) {
+    return {
+      method: 'trust',
+      verifier: 'none',
+      detail: 'the server asked for NO password at all (AuthenticationOk), which is what a `trust` rule does -- or a `peer`, `ident` or `cert` rule already satisfied by the transport. No password of any kind is being checked here',
+    }
+  }
+  if (code === 3) {
+    return {
+      method: 'password-or-external',
+      verifier: 'unknown',
+      detail: 'the server asked for a CLEARTEXT password (AuthenticationCleartextPassword). That is what `password`, `ldap`, `pam`, `radius` and `bsd` all ask for, and the protocol does not separate them: an external verifier has to be handed the plaintext, so it must ask for the plaintext. ALTER ROLE changes the secret only the FIRST of those five consults, so an answer from this endpoint may be a directory answering about a different credential entirely',
+    }
+  }
+  if (code === 5) {
+    return {
+      method: 'md5',
+      verifier: 'role',
+      detail: 'the server asked for an MD5 response (AuthenticationMD5Password), which only a `md5` rule over an MD5-format verifier asks for, and which it checks against pg_authid.rolpassword -- the secret ALTER ROLE writes',
+    }
+  }
+  if (code === 10) {
+    const mechanisms = nulStrings(payload.subarray(4))
+    if (mechanisms.some((name) => name === 'SCRAM-SHA-256' || name === 'SCRAM-SHA-256-PLUS')) {
+      return {
+        method: 'scram-sha-256',
+        verifier: 'role',
+        detail: `the server offered SASL mechanisms ${mechanisms.join(', ')} (AuthenticationSASL), which only a \`scram-sha-256\` rule asks for -- or a \`md5\` rule over a SCRAM-format verifier, which PostgreSQL upgrades to SCRAM -- and which it checks against pg_authid.rolpassword: the secret ALTER ROLE writes`,
+      }
+    }
+    return {
+      method: `sasl:${mechanisms.join(',') || 'none'}`,
+      verifier: 'unknown',
+      detail: `the server offered SASL mechanisms ${mechanisms.join(', ') || '(none)'}, none of them SCRAM-SHA-256, so what it intends to compare the answer against is not something this can name`,
+    }
+  }
+  if (code === 7 || code === 8) {
+    return {
+      method: 'gss',
+      verifier: 'external',
+      detail: 'the server asked for GSSAPI (AuthenticationGSS), which authenticates against a Kerberos realm and not against this role\'s password',
+    }
+  }
+  if (code === 9) {
+    return {
+      method: 'sspi',
+      verifier: 'external',
+      detail: 'the server asked for SSPI (AuthenticationSSPI), which authenticates against a Windows domain and not against this role\'s password',
+    }
+  }
+  return {
+    method: `authentication-request-${code}`,
+    verifier: 'unknown',
+    detail: `the server sent authentication request ${code}, which this does not recognise; an unrecognised request is not evidence about a password`,
+  }
+}
+
+/**
+ * THE ROUTE THIS CONNECTION TOOK, AS THE libpq SETTING THAT REPRODUCES IT (r42, Codex HIGH).
+ *
+ * The caller pins every subsequent credential-bearing connection to this endpoint to exactly this
+ * value, so that an authentication failure cannot fall back onto a second pg_hba record. It is
+ * derived from what HAPPENED on the wire and never from what was asked for:
+ *
+ *   `require`   TLS was negotiated. `require` encrypts and verifies nothing, which is what
+ *               `prefer` did here -- so it matches the same `hostssl` record, and it CANNOT retry
+ *               in the clear, which is the whole point.
+ *   `disable`   the server answered `N` and the exchange continued in the clear, so the record
+ *               matched was a `hostnossl`/`host` one. `disable` sends no SSLRequest at all and so
+ *               cannot be upgraded onto the other record either.
+ *               A Unix-domain socket reports `disable` too. libpq ignores sslmode there -- there
+ *               is no SSLRequest on a socket, for either of us -- and `local` records are matched
+ *               by neither `hostssl` nor `hostnossl`, so there is no second record to fall onto.
+ *   `unknown`   nothing was negotiated: the connection failed, or the server refused it before
+ *               the startup message. There is no route to pin to, and the caller refuses.
+ *
+ * SINCE r45 A TLS ROUTE REPORTS WHICH TLS, because there are now three of them and they are not
+ * interchangeable: `require`, `verify-ca` and `verify-full` all send an SSLRequest and are all
+ * matched by the same `hostssl` record, but they verify different things, and the caller pins
+ * psql to the word this returns. The value is `applied` -- the mode the tls.connect() options
+ * were actually built from -- and it is passed in only AFTER the handshake completed under them,
+ * so it is still a statement about what happened. A reader too old to know `verify-full` cannot
+ * report it: it dies on the argument, or reports `require`, and either way the caller's
+ * check-back refuses instead of accepting a route it did not get.
+ */
+function pinFor(transport, ssl, applied) {
+  if (transport === 'unix') return 'disable'
+  if (ssl === 'yes') return applied ?? 'unknown'
+  if (ssl === 'no' || ssl === 'not-offered') return 'disable'
+  return 'unknown'
+}
+
+/**
+ * `requested=` is what the caller asked for; `sslmode=` is what HAPPENED, derived by pinFor().
+ * The caller compares them and refuses if they differ, which is what makes "the route the
+ * application takes" a checked claim rather than an argument passed and forgotten.
+ */
+function report(requested, transport, ssl, applied, verdict) {
+  process.stdout.write(`requested=${requested}\ntransport=${transport}\nssl=${ssl}\nsslmode=${pinFor(transport, ssl, applied)}\nmethod=${verdict.method}\nverifier=${verdict.verifier}\ndetail=${verdict.detail}\n`)
+}
+
+async function main() {
+  const options = new Map()
+  for (const argument of process.argv.slice(2)) {
+    const match = /^--([a-z][a-z0-9-]*)=([\s\S]*)$/.exec(argument)
+    if (match === null) die(`unrecognised argument ${JSON.stringify(argument)}; expected --host= --port= --user= --database= --sslmode= [--sslrootcert=] [--timeout-ms=]`, 2)
+    options.set(match[1], match[2])
+  }
+  for (const required of ['host', 'port', 'user', 'database', 'sslmode']) {
+    if (!options.has(required) || options.get(required).length === 0) die(`--${required}= is required`, 2)
+  }
+  // NO DEFAULT (r43). An omitted route is a usage error and not `prefer`: the caller's whole job
+  // is to name the transport the APPLICATION takes, and a default is exactly how this program
+  // came to be observing one nobody uses.
+  const requested = options.get('sslmode')
+  const MODES = ['disable', 'require', 'prefer', 'verify-ca', 'verify-full']
+  if (!MODES.includes(requested)) {
+    die(`--sslmode= must be one of ${MODES.join(', ')}, not ${JSON.stringify(requested)}`, 2)
+  }
+  // THE CA IS REQUIRED BY THE TWO MODES THAT VERIFY ONE, AND REFUSED BY THE ONES THAT DO NOT.
+  // Without it node:tls falls back to its own bundled roots while the psql beside it falls back to
+  // ~/.postgresql/root.crt -- two trust stores, and a probe that verified against neither of the
+  // things the application will.
+  let ca = undefined
+  if (requested === 'verify-ca' || requested === 'verify-full') {
+    if (!options.has('sslrootcert') || options.get('sslrootcert').length === 0) {
+      die(`--sslmode=${requested} verifies the server certificate, so --sslrootcert= is required`, 2)
+    }
+    try {
+      ca = fs.readFileSync(options.get('sslrootcert'))
+    } catch (error) {
+      die(`--sslrootcert=${options.get('sslrootcert')} could not be read: ${String(error && error.message ? error.message : error)}`, 2)
+    }
+  } else if (options.has('sslrootcert')) {
+    die(`--sslmode=${requested} verifies no certificate, so --sslrootcert= would change nothing and is refused rather than ignored`, 2)
+  }
+  const host = options.get('host')
+  const port = Number(options.get('port'))
+  if (!Number.isInteger(port) || port < 1 || port > 65535) die(`--port= must be a TCP port number, not ${JSON.stringify(options.get('port'))}`, 2)
+  const timeoutMs = options.has('timeout-ms') ? Number(options.get('timeout-ms')) : DEFAULT_TIMEOUT_MS
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) die('--timeout-ms= must be a positive number of milliseconds', 2)
+
+  const deadline = Date.now() + timeoutMs
+  const reader = new Reader()
+  const transport = host.startsWith('/') ? 'unix' : 'tcp'
+  let ssl = 'n/a'
+  // THE MODE THE HANDSHAKE ACTUALLY COMPLETED UNDER. Assigned after secureConnect and never
+  // before, so a route that was asked for and not taken cannot be reported as one that was.
+  let applied = null
+  let socket = null
+  let stream = null
+  try {
+    socket = await connect(host, port, deadline)
+    stream = socket
+    reader.attach(socket)
+    if (transport === 'tcp' && requested === 'disable') {
+      // WHAT node-postgres DOES WITH THE EMITTED URL: nothing at all before the startup message.
+      ssl = 'not-offered'
+    } else if (transport === 'tcp') {
+      socket.write(sslRequest())
+      const reply = String.fromCharCode((await reader.read(1, deadline))[0])
+      if (reply === 'S') {
+        // NOTHING MAY BE BUFFERED BEHIND THE UPGRADE. A server that answered `S` cannot legally
+        // have sent more before our ClientHello, and a stream that has is not one whose TLS
+        // records begin where node:tls will look for them.
+        if (reader.buffered() > 0) throw new Error('the server sent data after S and before the TLS handshake')
+        reader.detach()
+        stream = await upgrade(socket, host, deadline, requested, ca)
+        reader.attach(stream)
+        applied = requested === 'prefer' ? 'require' : requested
+        ssl = 'yes'
+      } else if (reply === 'N') {
+        // `require` DOES NOT FALL BACK, which is the difference between it and `prefer` and the
+        // only reason the caller may act on it.
+        if (requested !== 'prefer') throw new Error('the server refused TLS (it answered N to the SSLRequest) and this route does not fall back to the clear')
+        ssl = 'no'
+      } else if (reply === 'E') {
+        // A pre-negotiation ErrorResponse -- the rest of it is still on the wire, minus the type
+        // byte already consumed.
+        const length = (await reader.read(4, deadline)).readInt32BE(0)
+        const payload = await reader.read(Math.max(0, length - 4), deadline)
+        report(requested, transport, 'refused', applied, classify('E', payload))
+        process.exit(1)
+      } else {
+        throw new Error(`the server answered the SSL request with ${JSON.stringify(reply)}, which is neither S nor N`)
+      }
+    }
+
+    stream.write(startupMessage(options.get('user'), options.get('database')))
+    let message = await reader.message(deadline)
+    // A NoticeResponse may precede anything, and means nothing here.
+    while (message.type === 'N') message = await reader.message(deadline)
+    const verdict = classify(message.type, message.payload)
+    report(requested, transport, ssl, applied, verdict)
+    process.exit(verdict.verifier === 'role' ? 0 : 1)
+  } catch (error) {
+    report(requested, transport, ssl, applied, {
+      method: 'unknown',
+      verifier: 'unknown',
+      detail: String(error && error.message ? error.message : error).replace(/\s+/g, ' '),
+    })
+    process.exit(1)
+  } finally {
+    reader.detach()
+    // THE CONNECTION IS DROPPED WITHOUT ANSWERING. Whatever the server asked for, it is not
+    // getting it: this program exists to read the question, and handing a password to an endpoint
+    // it has just discovered might be a directory is the leak the question was asked to prevent.
+    try { if (stream !== null) stream.destroy() } catch { /* already gone */ }
+    try { if (socket !== null) socket.destroy() } catch { /* already gone */ }
+  }
+}
+
+await main()

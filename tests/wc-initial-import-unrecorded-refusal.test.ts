@@ -66,9 +66,35 @@ mock.module('@/lib/db', {
 mock.module('@/lib/activity-log', { namedExports: { logActivity: async () => {} } })
 mock.module('@/lib/notifications', { namedExports: { notify: () => {} } })
 
+// The REAL page-walk constants and describers, so this file exercises the shipped walk rather than
+// a stand-in for it. Only `wcFetch` is replaced.
+import {
+  MAX_WC_PAGE_WALK_PAGES,
+  describeUnendedWcPageWalk,
+  describeUnreadWcPage,
+} from '@/lib/connectors/woocommerce/api'
+
+/**
+ * PAGE 1 CARRIES THE ORDERS AND PAGE 2 IS EMPTY — the walk's only proof of an ending (o3d-xnwu).
+ *
+ * This double used to answer every page with the same three orders and `totalPages: 1`, which was
+ * enough while the loop's bound was `page <= totalPages`. It is not enough now: the shipped walk
+ * runs to `MAX_WC_PAGE_WALK_PAGES` unless a page comes back EMPTY, so the old double would have
+ * spun to the ceiling, set `truncatedRead`, and failed every case in this file — including the two
+ * CONTROLS, which assert that a pass DOES complete. That would have left the refusal assertions
+ * passing for the wrong reason: "the pass did not complete" is what they check, and a truncated
+ * read makes it true no matter what the refusal did.
+ */
 mock.module('@/lib/connectors/woocommerce/api', {
   namedExports: {
-    wcFetch: async () => ({ data: wcOrders.current, totalPages: 1, totalItems: wcOrders.current.length }),
+    wcFetch: async (_path: string, params?: Record<string, string>) => {
+      const page = Number(params?.page ?? '1')
+      const rows = page === 1 ? wcOrders.current : []
+      return { data: rows, totalPages: 1, totalItems: wcOrders.current.length, error: null }
+    },
+    MAX_WC_PAGE_WALK_PAGES,
+    describeUnendedWcPageWalk,
+    describeUnreadWcPage,
   },
 })
 

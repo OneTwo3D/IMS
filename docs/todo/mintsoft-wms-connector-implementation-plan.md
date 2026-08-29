@@ -1171,7 +1171,7 @@ No core changes needed. The `'mintsoft'` source is already supported at line 5.
 
 ### Deploy
 
-Use `scripts/deploy.sh` per memory `project_production_server.md` — never ad-hoc kill/build; apply the migration during build. Defaults are safe (plugin disabled, no bindings, no crons running).
+Use `scripts/deploy.sh` per memory `project_production_server.md` — never ad-hoc kill/build. The script builds first, then stops and drains every writer (service, stray processes, cron), and only then applies the migration; the migration is never applied while the predecessor is serving (o3d-2sm1.1). Defaults are safe (plugin disabled, no bindings, no crons running).
 
 ---
 

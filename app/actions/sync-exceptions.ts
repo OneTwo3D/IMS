@@ -1,7 +1,6 @@
 'use server'
 
 import { revalidatePath } from 'next/cache'
-import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { mergeStuckDispatchRows } from '@/lib/domain/wms/exception-inbox'
 import {
@@ -20,6 +19,13 @@ import {
 } from '@/lib/maintenance-mode'
 import { runPostMaintenanceRecheckForActiveConnector } from '@/lib/domain/wms/post-maintenance-recheck'
 import { eligibleCohortDigest, isolatableLinkWhere, loadUnresolvedDriftIncidents, readRawDriftState, unresolvedDriftStateKey } from '@/lib/domain/wms/unresolved-drift'
+import {
+  buildBlockedWmsPushRow,
+  buildOrderReconcileDriftRow,
+  decideWmsMissingRepush,
+} from '@/lib/domain/wms/push-recovery-affordance'
+import { wmsCreateIneligibleRefusal } from '@/lib/domain/wms/create-eligibility'
+import { isWmsCreateEligibleForUpdate, wmsCreateEligibleOrderIds, wmsPushOrderReference } from '@/lib/domain/wms/order-push-sweep'
 import { INTEGRATION_PLUGIN_SETTING_KEYS } from '@/lib/integration-plugins'
 import {
   buildFollowUpObligationBacklogOrderBy,
@@ -28,7 +34,7 @@ import {
   readFollowUpObligationDatabaseNow,
 } from '@/lib/domain/accounting/follow-up-obligation-registry'
 import { withDispatchSweepLockOrSkip } from '@/lib/domain/wms/dispatch-sweep-lock'
-import { logActivity } from '@/lib/activity-log'
+import { logActivity, logActivityInTransaction } from '@/lib/activity-log'
 import { freshAuthFailureResult, requireFreshPermission, requirePermission } from '@/lib/auth/server'
 import {
   IntegrationOutboxAdminError,
@@ -45,6 +51,7 @@ import { syncRefundsForOrder } from '@/lib/connectors/woocommerce/sync/refund-sy
 import { wcFetch } from '@/lib/connectors/woocommerce/api'
 import {
   RECOVERABLE_REFUND_PARK_STATUSES,
+  activeRefundParkWhere,
   buildRefundParkDismissData,
   buildRefundParkReassignData,
   describeRefundParkRecoverability,
@@ -60,6 +67,7 @@ import {
   type RefundParkRecoveryRefusalCode,
   type RefundParkView,
   type WcOrderRefundEvidence,
+  WC_REFUND_PARK_RECOVERED_ACTION,
 } from '@/lib/domain/sales/refund-park-recovery'
 // o3d-w00 (Codex r7 #3): the pure payload→order-line link, imported from its own module rather than
 // through the sync — the inbox needs the link, not a WooCommerce client.
@@ -186,10 +194,49 @@ export type WmsPushDeadLetterRow = {
   orderId: string
   orderNumber: string | null
   connector: string
+  /** o3d-92fu: DEAD_LETTER, VALIDATION_FAILED or AMBIGUOUS_CREATE — the remedies are different. */
+  state: string
   attempts: number
   lastError: string | null
   lastAttemptAt: string | null
+  /**
+   * o3d-2k5r r5 — the affordance, DERIVED ON THE SERVER from `decideWmsPushReplay`: the same call
+   * `replayWmsOrderPush` refuses on. The table used to render Replay for every state except
+   * VALIDATION_FAILED, so an AMBIGUOUS_CREATE row on a connector whose create cannot be repeated
+   * safely got a button the action refuses every time — and the docs already promised there was
+   * none. A client that decides this for itself
+   * is a second reader of a server-side question, which is the whole defect class.
+   */
+  replayable: boolean
+  /** What to do instead, when `replayable` is false. Rendered in place of the button. */
+  replayRefusal: string | null
+  /** What this row IS — derived from the evidence, not from the state name (an AMBIGUOUS_CREATE
+   *  row was labelled "Push failed", which is the one thing it is not). */
+  why: string
 }
+
+/**
+ * o3d-92fu — push states that mean "this order will NOT reach the warehouse without a human".
+ *
+ * AMBIGUOUS_CREATE belongs here for the sharpest version of the same reason (o3d-2k5r r4). A
+ * create request left this system and nothing recorded what became of it, so the order may already
+ * be sitting in the warehouse under an id IMS never learned. On a connector whose own create
+ * refuses a duplicate the sweep re-queues it by itself; on one that does not, NOTHING will move it
+ * without a person who can look at the WMS — and that is the state most in need of being seen,
+ * because the order is neither fulfilled nor deletable while it sits there.
+ *
+ * VALIDATION_FAILED belongs here even though it is not a failed remote call. It is the state
+ * the sweep parks an order in when its payload cannot be BUILT, and its whole purpose is to
+ * take the order out of the create queue so malformed orders stop starving valid ones — which
+ * means nothing retries it on its own except a payload rebuild that will keep failing until
+ * someone fixes the data. Left out of this inbox it would be a silent, permanent non-delivery,
+ * which is the same class of invisible drop the dead-letter section exists to prevent.
+ *
+ * NOT EXPORTED. This is a `'use server'` module: every export of one is a server action, so a
+ * non-function export both fails the repo's server-action guard-coverage test and is a shape
+ * `next build` rejects (a plain type-check does not see it). It is only read in this file.
+ */
+const BLOCKED_WMS_PUSH_STATES = ['DEAD_LETTER', 'VALIDATION_FAILED', 'AMBIGUOUS_CREATE'] as const
 
 export type PennyMismatchRow = {
   orderId: string
@@ -326,6 +373,16 @@ export type OrderReconcileDriftRow = {
   category: string
   detail: string | null
   foundAt: string | null
+  /** The connector the finding belongs to — the thing its replay policy is a property of. */
+  connector: string
+  /**
+   * o3d-2k5r r5 — MISSING_IN_WMS only, and derived on the server from `decideWmsMissingRepush`,
+   * the same call `repushMissingWmsOrder` refuses on. `false` for every other category, which
+   * has no Re-push control at all.
+   */
+  repushable: boolean
+  /** The manual reconciliation to do instead, when `repushable` is false on a MISSING_IN_WMS row. */
+  repushRefusal: string | null
 }
 
 /**
@@ -433,27 +490,29 @@ const OUTBOX_FAILURE_STATUSES = [
   INTEGRATION_OUTBOX_STATUS.PERMANENT_FAILED,
 ]
 
-// Codex P2: order-import writes FROM_CONNECTOR/SalesOrder rows too (failed
-// imports have NO entityId; the missing-FX queue rows have NO entityId and a
-// payload.reason marker). Refund-sync rows always carry entityId = the IMS
-// order id, so require it — and exclude the FX-queue marker defensively so a
-// future entityId-carrying FX row can never be "retried" as a refund. The
-// exclusion must explicitly admit SQL-NULL payloads (refund-sync's FAILED rows
-// carry none): a JSON-path NOT predicate silently drops NULL rows.
-const REFUND_PARK_WHERE = {
-  connector: 'woocommerce',
-  direction: 'FROM_CONNECTOR' as const,
-  entityType: 'SalesOrder',
-  // QUARANTINED (o3d-w00 #2/#5 / o3d-iup): a monetary-only refund deliberately parked because the order
-  // isn't uniformly taxed. It has no SalesOrderRefund and the sweep skips it, so the exception inbox is
-  // the ONLY way an operator sees and recovers it — it must appear here alongside PENDING/FAILED.
-  status: { in: ['PENDING' as const, 'FAILED' as const, 'QUARANTINED' as const] },
-  entityId: { not: null },
-  OR: [
-    { payload: { equals: Prisma.DbNull } },
-    { NOT: { payload: { path: ['reason'], equals: 'missing_fx_rate' } } },
-  ],
-}
+/**
+ * WHAT COUNTS AS AN ACTIONABLE REFUND PARK — POSITIVELY (o3d-xnwu r7, Codex HIGH).
+ *
+ * This used to carry one more clause: every row whose payload's top-level `reason` equalled the
+ * pending-FX queue marker was EXCLUDED, to keep the missing-FX queue out of the inbox. A refund park
+ * persists the RAW WOOCOMMERCE REFUND, and `reason` on a WooCommerce refund is free text a human
+ * types when they issue it. So an operator who happened to type `missing_fx_rate` as their refund
+ * reason hid their own park from the one page that can recover it — and because a foreign park now
+ * HOLDS the refund delivery (see the cross-order guard in refund-sync.ts), that was not cosmetic: it
+ * was a permanent hold with no visible way to resolve it.
+ *
+ * The clause was also never the thing keeping FX rows out. Those rows carry no `entityId`, which
+ * `entityId: { not: null }` already excludes; the exclusion was a guess added on top, and the guess
+ * was the part that could be wrong. So the whole predicate now lives in one place, made of columns
+ * IMS writes — see `activeRefundParkWhere`, which the refund sync's cross-order guard and the park
+ * upsert use too, and which the pending-FX queue is disjoint from by construction rather than by
+ * inspection of payload contents.
+ *
+ * QUARANTINED (o3d-w00 #2/#5 / o3d-iup) is in the set deliberately: a monetary-only refund parked
+ * because the order isn't uniformly taxed has no SalesOrderRefund and the sweep skips it, so this
+ * inbox is the ONLY way an operator sees and recovers it.
+ */
+const REFUND_PARK_WHERE = activeRefundParkWhere()
 
 /**
  * Stuck dispatch reconciliations have no first-class entity (dispatch-sweep.ts
@@ -619,20 +678,28 @@ async function loadOrderReconcileDrift(): Promise<OrderReconcileDriftRow[]> {
     select: {
       orderId: true,
       category: true,
+      connector: true,
       detail: true,
       externalOrderNumber: true,
       lastSeenAt: true,
-      order: { select: { orderNumber: true } },
+      order: { select: { id: true, orderNumber: true, externalOrderNumber: true } },
     },
   })
-  return rows.map((row) => ({
-    orderId: row.orderId,
-    orderNumber: row.order.orderNumber,
-    externalOrderNumber: row.externalOrderNumber,
-    category: row.category,
-    detail: row.detail,
-    foundAt: row.lastSeenAt.toISOString(),
-  }))
+  // o3d-2k5r r6: the affordance needs the create predicate's own verdict, so the control cannot
+  // render for an order the sweep would never select. Evaluated by the DATABASE, from the same
+  // where-clause `createCandidates` selects on — one query for the whole page, and only for the
+  // rows that could carry a control at all.
+  //
+  // A finding belonging to a connector that is not the active one gets `false` by construction: it
+  // is absent from the eligibility query, which is asked of the active connector's bindings. That
+  // is the right answer — its warehouse cannot be asked anything, and the action refuses it too.
+  const missing = rows.filter((row) => row.category === 'MISSING_IN_WMS')
+  const pluginState = await getIntegrationPluginState()
+  const activeConnectorId = WMS_CONNECTOR_IDS.find((id) => pluginState[id])
+  const eligible = activeConnectorId
+    ? await wmsCreateEligibleOrderIds(activeConnectorId, missing.map((row) => row.orderId))
+    : new Set<string>()
+  return rows.map((row) => buildOrderReconcileDriftRow({ ...row, createEligible: eligible.has(row.orderId) }))
 }
 
 /**
@@ -655,7 +722,10 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
   // means no grace at all, which lists every marked row — noise in the safe direction.
   const followUpDatabaseNow = await readFollowUpObligationDatabaseNow(db)
   const [wmsPushDeadLetters, outboxFailures, deadReceipts, deadWebhooks, refundSyncParks, pennyMismatches, stuckDispatches, orderReconcileDrift, productStructureConflicts, driftIncidents, accountingFollowUpObligations] = await Promise.all([
-    db.wmsOrderPushLink.count({ where: { state: 'DEAD_LETTER' } }),
+    // o3d-92fu / o3d-2k5r: the count is over EVERY blocked push state, not DEAD_LETTER alone — a
+    // VALIDATION_FAILED or AMBIGUOUS_CREATE order reaches the warehouse only via a human, so it
+    // belongs in the same total. Kept through the merge with o3d-0bfh's follow-up obligations.
+    db.wmsOrderPushLink.count({ where: { state: { in: [...BLOCKED_WMS_PUSH_STATES] } } }),
     db.integrationOutbox.count({ where: { status: { in: OUTBOX_FAILURE_STATUSES } } }),
     db.wmsInboundReceiptEvent.count({ where: { processingStatus: DEAD_RECEIPT_EVENT_STATUS } }),
     db.wmsWebhookEvent.count({ where: { processingStatus: DEAD_RECEIPT_EVENT_STATUS } }),
@@ -763,16 +833,21 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
   const followUpDatabaseNow = await readFollowUpObligationDatabaseNow(db)
   const [pushLinks, outbox, deadReceiptRows, deadWebhookRows, refundLogs, stuckDispatches, mismatchLinks, orderReconcileDrift, productStructureConflicts, driftIncidents, followUpObligationRows] = await Promise.all([
     db.wmsOrderPushLink.findMany({
-      where: { state: 'DEAD_LETTER' },
+      where: { state: { in: [...BLOCKED_WMS_PUSH_STATES] } },
       orderBy: { lastAttemptAt: 'desc' },
       take: SECTION_LIMIT,
       select: {
         orderId: true,
         connector: true,
+        state: true,
         attempts: true,
+        // o3d-2k5r r5: every column `decideWmsPushReplay` reads, so the row's affordance is the
+        // action's own answer rather than a re-derivation from `state`.
+        externalOrderId: true,
+        pushedAt: true,
         lastError: true,
         lastAttemptAt: true,
-        order: { select: { orderNumber: true } },
+        order: { select: { id: true, orderNumber: true, externalOrderNumber: true } },
       },
     }),
     // The admin list filter takes a single status, so query each failure status
@@ -1086,14 +1161,9 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
   }
 
   const data: Omit<ExceptionInboxData, 'summary' | 'maintenanceRecovery'> = {
-    wmsPushDeadLetters: pushLinks.map((link) => ({
-      orderId: link.orderId,
-      orderNumber: link.order.orderNumber,
-      connector: link.connector,
-      attempts: link.attempts,
-      lastError: link.lastError,
-      lastAttemptAt: link.lastAttemptAt?.toISOString() ?? null,
-    })),
+    // o3d-2k5r r5: every field including the affordance comes from the shared rule — the client
+    // receives the action's own answer rather than deriving one from `state`.
+    wmsPushDeadLetters: pushLinks.map(buildBlockedWmsPushRow),
     outboxFailures: outbox.map((row) => ({
       id: row.id,
       connector: row.connector,
@@ -1973,11 +2043,18 @@ export async function recordRefundParkManually(
  * name on it; the ownership is evidence, not an assertion. The decision vocabulary — every refusal
  * and every patch — lives in lib/domain/sales/refund-park-recovery.ts as pure functions.
  *
- * THE AUDIT. logActivity is best-effort (it swallows its own errors), which is why the recovery note
- * is written onto the PARK ROW ITSELF in the same transaction as the status change: the fact that a
- * human recovered this park, and what WooCommerce said when they did, survives a logging failure.
- * o3d-batch-settle adds logActivityInTransaction for exactly this problem; when that lands, this
- * activity write should move inside the transaction rather than being duplicated here.
+ * THE AUDIT, AND WHY IT IS NOT BEST-EFFORT (o3d-xnwu r14, Codex HIGH). The recovery note is written
+ * onto the PARK ROW ITSELF in the same transaction as the status change, and so, now, is the
+ * `wc_refund_park_recovered` activity entry — with logActivityInTransaction, which does not catch.
+ *
+ * The two are not redundant, because THE ROW'S OWN NOTE CAN BE OVERWRITTEN. The predecessor's
+ * held-invoice writer takes a recovered park wholesale — payload, externalId, errorMessage, status
+ * — and leaves a row indistinguishable from a legitimate hold; that is the whole reason check 7 of
+ * the 20260822120000 migration's verify.sql looks at HISTORY rather than at the row. The activity
+ * entry is the half of the audit a later write to the row cannot reach, so it has to be exactly as
+ * durable as the recovery: written in the same transaction (this file), and exempt from
+ * activity-log retention (lib/activity-log-cleanup.ts), because a check whose evidence a cleanup
+ * cron deletes at 60 days is not a check.
  */
 export type RecoverRefundSyncParkInput = { observedOrderId: string } & (
   | { outcome: 'REASSIGN'; wcOrderId: number }
@@ -2396,43 +2473,64 @@ export async function recoverRefundSyncPark(
           },
         }
       }
+
+      // THE WITNESS, IN THE SAME TRANSACTION AS THE THING IT WITNESSES (o3d-xnwu r14, Codex HIGH).
+      //
+      // This entry is not a notification. It is the evidence check 7 of the 20260822120000
+      // migration's verify.sql joins to, and check 7 exists because THIS ROW CAN AFTERWARDS BE MADE
+      // TO LOOK INNOCENT: the predecessor's held-invoice writer overwrites the payload, externalId,
+      // message and status of a recovered park wholesale, and every check that reads the row alone
+      // then returns zero over a destroyed accounting payload.
+      //
+      // It used to be written with `logActivity` AFTER this transaction committed — and logActivity
+      // SWALLOWS ITS OWN FAILURES, so an ordinary transient write error, not merely a crash, left
+      // the recovery committed with nothing to join to and the check silently blind on that row.
+      // `logActivityInTransaction` does not catch: a witness that cannot be written takes the
+      // recovery down with it, the operator is told, and they retry. That is the right way round
+      // for a mutation that moves refund evidence between orders and whose only later audit is this
+      // entry. (Its other half — retention — is in lib/activity-log-cleanup.ts, which now exempts
+      // this action: a check whose evidence a cleanup cron deletes at 60 days is not a check.)
+      await logActivityInTransaction(tx, {
+        entityType: 'SYNC',
+        entityId: parkedOrderId,
+        tag: 'sync',
+        action: WC_REFUND_PARK_RECOVERED_ACTION,
+        // WARNING, not INFO: a human correcting an order association on a refund whose money has
+        // already left the business, on evidence the system could not act on by itself.
+        level: 'WARNING',
+        description: assertion.outcome === 'REASSIGN'
+          ? `Reassigned parked WooCommerce refund ${externalRefundId} from order ${parkedOrderId} to order `
+            + `${targetOrderId} after WooCommerce confirmed it on WC order ${evidence.wcOrderId}`
+          : `Dismissed the parked WooCommerce refund ${externalRefundId} on order ${parkedOrderId} after `
+            + `WooCommerce order ${evidence.wcOrderId} did not list it`,
+        metadata: {
+          shoppingSyncLogId: park.id,
+          externalRefundId,
+          outcome: assertion.outcome,
+          parkedOrderId,
+          targetOrderId,
+          // What was asked, and what came back — so the recovery can be re-judged later against the
+          // evidence it was actually made on rather than against WooCommerce as it is by then.
+          wcOrderId: evidence.wcOrderId,
+          wcRefundIds: [...evidence.refundIds],
+          wcFetchedAt: evidence.fetchedAt.toISOString(),
+          // How many complete walks the evidence had to survive. A dismissal is made on two that agreed;
+          // a reassign on one, because presence cannot be produced by a short list. Recorded so the
+          // recovery can be re-judged later on the standard of proof it was actually held to.
+          wcEvidenceReads: assertion.outcome === 'DISMISS' ? 2 : 1,
+          priorStatus: park.status,
+          userId: session.user.id,
+        },
+        // Required by logActivityInTransaction, and deliberately so: the session lookup logActivity
+        // falls back on is a React cache() read, which has no place inside a database transaction.
+        userId: session.user.id,
+      })
+
       return { ok: true as const }
     })
 
     if (!applied.ok) return { success: false, error: applied.refusal.message, code: applied.refusal.code }
 
-    await logActivity({
-      entityType: 'SYNC',
-      entityId: parkedOrderId,
-      tag: 'sync',
-      action: 'wc_refund_park_recovered',
-      // WARNING, not INFO: a human correcting an order association on a refund whose money has
-      // already left the business, on evidence the system could not act on by itself.
-      level: 'WARNING',
-      description: assertion.outcome === 'REASSIGN'
-        ? `Reassigned parked WooCommerce refund ${externalRefundId} from order ${parkedOrderId} to order `
-          + `${targetOrderId} after WooCommerce confirmed it on WC order ${evidence.wcOrderId}`
-        : `Dismissed the parked WooCommerce refund ${externalRefundId} on order ${parkedOrderId} after `
-          + `WooCommerce order ${evidence.wcOrderId} did not list it`,
-      metadata: {
-        shoppingSyncLogId: park.id,
-        externalRefundId,
-        outcome: assertion.outcome,
-        parkedOrderId,
-        targetOrderId,
-        // What was asked, and what came back — so the recovery can be re-judged later against the
-        // evidence it was actually made on rather than against WooCommerce as it is by then.
-        wcOrderId: evidence.wcOrderId,
-        wcRefundIds: [...evidence.refundIds],
-        wcFetchedAt: evidence.fetchedAt.toISOString(),
-        // How many complete walks the evidence had to survive. A dismissal is made on two that agreed;
-        // a reassign on one, because presence cannot be produced by a short list. Recorded so the
-        // recovery can be re-judged later on the standard of proof it was actually held to.
-        wcEvidenceReads: assertion.outcome === 'DISMISS' ? 2 : 1,
-        priorStatus: park.status,
-        userId: session.user.id,
-      },
-    })
     revalidatePath('/sync/exceptions')
     return { success: true, outcome: assertion.outcome, targetOrderId }
   } catch (error) {
@@ -2792,10 +2890,38 @@ export async function dismissWithdrawnDispatch(orderId: string): Promise<Mutatio
 }
 
 /**
- * Re-create a WMS order the WMS no longer knows (MISSING_IN_WMS reconcile
- * finding): compare-and-set the SYNCED/MERGED link back to PENDING_CREATE so
- * the next push sweep re-pushes it. The sweep's own eligibility still applies,
- * so a no-longer-eligible order simply won't re-push.
+ * Re-create a WMS order the WMS no longer knows (MISSING_IN_WMS reconcile finding): compare-and-set
+ * the SYNCED/MERGED link back to PENDING_CREATE so the next push sweep re-pushes it.
+ *
+ * o3d-2k5r r5 — THE FIFTH WRITER THAT RE-OPENS A CREATE, and the one that was reviewed as "already
+ * correct" because it probes the warehouse. It was not, and it failed in BOTH directions.
+ *
+ *   IT PARKED THE ORDER IT CLAIMED TO HAVE RE-QUEUED. The reset left `lastAttemptAt` — the dispatch
+ *   stamp — in place. `decideCreateClaim` reads a PENDING_CREATE link carrying a stamp older than
+ *   the lease as PARK_AMBIGUOUS, so the very next sweep parked the "re-queued" order as
+ *   AMBIGUOUS_CREATE. Meanwhile this action had already RESOLVED the discrepancy and reported
+ *   success, so the finding left the inbox and the order left the create queue in the same click.
+ *   On a connector whose create cannot be repeated safely, that park has no automatic exit.
+ *
+ *   AND WHERE THERE WAS NO STAMP IT BYPASSED THE TWO-KEY RULE. A link with a null `lastAttemptAt`
+ *   (a legacy row, a restore) reads as CLAIM, so the sweep re-dispatched the create on the strength
+ *   of the presence probe ALONE — the exact reasoning create-replay-policy.ts exists to refuse,
+ *   and on a connector with no remote duplicate refusal, the exact way two warehouse orders get
+ *   picked under one reference.
+ *
+ * So it now takes BOTH KEYS, from the same rule the sweep and the dead-letter replay take:
+ *
+ *   1. THE CONNECTOR'S OWN CREATE MUST REFUSE A DUPLICATE (`decideWmsMissingRepush`). A lookup that
+ *      came back empty is not proof the order is gone — it is the same lookup whose answer is in
+ *      doubt. Only the remote's contract covers the case where it is wrong.
+ *   2. THE WAREHOUSE MUST SAY IT HOLDS NO SUCH ORDER, under every reference this order could be
+ *      found by: the one a re-create would use, and the one IMS recorded.
+ *
+ * And the write is bound to ALL of it: the compare-and-set names every column the decision was read
+ * from, the dispatch stamp is cleared (so the re-queue is a real one, not a park in waiting) — and
+ * the stamp is cleared only on the path where both keys turned, because refusing before the write
+ * is the only place that is decided. The finding resolution and the link reset are one transaction,
+ * so the discrepancy is resolved only if the safe requeue commits.
  */
 export async function repushMissingWmsOrder(orderId: string): Promise<MutationResult> {
   try {
@@ -2816,42 +2942,84 @@ export async function repushMissingWmsOrder(orderId: string): Promise<MutationRe
     if (!activeConnectorId || openFinding.connector !== activeConnectorId) {
       return { success: false, error: 'This finding belongs to a connector that is no longer active — the next reconcile run retires it.' }
     }
+    // Read the link BEFORE any decision, and read every column the decision rests on — the write
+    // below has to require all of them back.
+    const link = await db.wmsOrderPushLink.findUnique({
+      where: { orderId },
+      select: {
+        id: true,
+        connector: true,
+        state: true,
+        attempts: true,
+        externalOrderId: true,
+        externalOrderNumber: true,
+        pushedAt: true,
+        lastAttemptAt: true,
+        // o3d-2k5r r6: the eligibility columns are deliberately NOT selected here any more. Reading
+        // them invites a hand-written predicate over them, which is exactly what was wrong; the
+        // decision is the shared where-clause's, evaluated by the database.
+        order: { select: { id: true, orderNumber: true, externalOrderNumber: true } },
+      },
+    })
+    if (!link) {
+      return { success: false, error: 'There is no WMS push link for this order, so there is nothing to re-push. The push sweep creates one on its own once the order is eligible.' }
+    }
+    // The finding's connector is the active one; the LINK's connector is what the replay policy is
+    // a property of, and a link can outlive the connector that wrote it. All three must agree
+    // before a warehouse is asked anything.
+    if (link.connector !== activeConnectorId) {
+      return { success: false, error: `This order's push link belongs to ${link.connector}, which is not the active WMS connector — its warehouse cannot be asked whether the order exists. Resolve it by hand.` }
+    }
+    if (link.state !== 'SYNCED' && link.state !== 'MERGED') {
+      return { success: false, error: `This order's push link is ${link.state}, not a settled push — there is no missing warehouse order to re-create. Check the order's push state.` }
+    }
+    const reference = wmsPushOrderReference(link.order)
+    // THE FIRST TWO REFUSALS, from the rule the inbox renders the control with — see
+    // push-recovery-affordance.ts. Asked before the probe because no answer the warehouse could
+    // give would change either, so spending a lookup would be spending a connector call on a
+    // decision already made.
+    //
+    // o3d-2k5r r6: `createEligible` is the SHARED create predicate's own verdict, from the
+    // database, and it replaces a hand-written check of three of its six fences. The warehouse
+    // binding and the withdrawal fences were the missing three, and an order that failed them was
+    // reset, resolved, reported a success — and then never selected by the sweep again.
+    const createEligible = (await wmsCreateEligibleOrderIds(activeConnectorId, [orderId])).has(orderId)
+    const repush = decideWmsMissingRepush({ connector: link.connector, reference, createEligible })
+    if (!repush.repushable) {
+      return { success: false, error: repush.guidance }
+    }
     const connector = getWmsConnector(activeConnectorId)
     if (!connector.probeOrderPresence) {
       return { success: false, error: 'The active WMS connector cannot verify order absence, so a safe re-push is not possible.' }
     }
-    // Codex r30 P1: the push sweep's create pass only selects ready
-    // (PROCESSING/ALLOCATED), paid, not-fully-refunded orders — resetting the
-    // link for e.g. a PICKING/PACKING order would resolve the finding while the
-    // order is never re-created and silently never fulfils. Refuse; the
-    // operator must return the order to a ready status first.
-    const order = await db.salesOrder.findUnique({
-      where: { id: orderId },
-      select: { status: true, paidAt: true, refundStatus: true },
-    })
-    if (!order || !['PROCESSING', 'ALLOCATED'].includes(order.status) || !order.paidAt || order.refundStatus === 'FULL') {
-      return {
-        success: false,
-        error: `The push sweep only re-creates paid, ready (Processing/Allocated) orders — this order is ${order?.status ?? 'missing'}. Return it to a ready status (or resolve it manually in the WMS); the finding stays open meanwhile.`,
+    // THE SECOND KEY. Both references are asked, and both must come back MISSING: the one a
+    // re-create would push under (the duplicate risk) and the one IMS recorded (the finding's own
+    // subject). They are usually the same string, and when they are not, "absent under one of them"
+    // is not absence.
+    const references = [...new Set([reference, link.externalOrderNumber].filter((r): r is string => !!r))]
+    for (const probeReference of references) {
+      let presence: 'FOUND' | 'MISSING' | 'AMBIGUOUS'
+      try {
+        presence = await connector.probeOrderPresence(probeReference)
+      } catch (error) {
+        return {
+          success: false,
+          error: `The WMS could not be asked whether order ${probeReference} still exists (${
+            error instanceof Error ? error.message : String(error)
+          }), so nothing was re-pushed. Try again once the WMS is reachable.`,
+        }
       }
-    }
-    const link = await db.wmsOrderPushLink.findUnique({
-      where: { orderId },
-      select: { externalOrderNumber: true },
-    })
-    const presence = link?.externalOrderNumber
-      ? await connector.probeOrderPresence(link.externalOrderNumber)
-      : 'MISSING'
-    if (presence === 'FOUND') {
-      // The WMS knows the order again — the finding is stale; resolve it instead.
-      await db.wmsOrderDiscrepancy.updateMany({
-        where: { orderId, category: 'MISSING_IN_WMS', status: 'OPEN' },
-        data: { status: 'RESOLVED', resolvedAt: new Date() },
-      })
-      return { success: false, error: 'The WMS knows this order again — the finding was stale and has been resolved. No re-push needed.' }
-    }
-    if (presence === 'AMBIGUOUS') {
-      return { success: false, error: 'The WMS returned an ambiguous match for this order — re-pushing could create a duplicate. Resolve the ambiguity in the WMS first.' }
+      if (presence === 'FOUND') {
+        // The WMS knows the order again — the finding is stale; resolve it instead.
+        await db.wmsOrderDiscrepancy.updateMany({
+          where: { orderId, category: 'MISSING_IN_WMS', status: 'OPEN', connector: activeConnectorId },
+          data: { status: 'RESOLVED', resolvedAt: new Date() },
+        })
+        return { success: false, error: `The WMS knows order ${probeReference} again — the finding was stale and has been resolved. No re-push needed.` }
+      }
+      if (presence === 'AMBIGUOUS') {
+        return { success: false, error: `The WMS returned an ambiguous match for ${probeReference} — re-pushing could create a duplicate. Resolve the ambiguity in the WMS first.` }
+      }
     }
 
     // Codex: an OPEN finding is the AUTHORIZATION for this reset, and the two
@@ -2859,24 +3027,64 @@ export async function repushMissingWmsOrder(orderId: string): Promise<MutationRe
     // stays OPEN (it must not vanish from the inbox with the order unfixed).
     const outcome = await db.$transaction(async (tx) => {
       const finding = await tx.wmsOrderDiscrepancy.updateMany({
-        where: { orderId, category: 'MISSING_IN_WMS', status: 'OPEN' },
+        where: { orderId, category: 'MISSING_IN_WMS', status: 'OPEN', connector: activeConnectorId },
         data: { status: 'RESOLVED', resolvedAt: new Date() },
       })
       if (finding.count === 0) {
         return { ok: false as const, error: 'No open missing-in-WMS finding for this order (already resolved or re-verified).' }
       }
+      // o3d-2k5r r6 — THE ELIGIBILITY IS RE-PROVED HERE, under the sales order's row lock, from
+      // the same where-clause `createCandidates` selects on.
+      //
+      // The read above is a statement about the past: a warehouse binding can be deactivated, or
+      // the order moved to an unbound warehouse, between the page the operator is looking at and
+      // the click. Resolving the finding on a stale answer is precisely how an order becomes
+      // invisible — MISSING_IN_WMS only scans settled links and NOT_PUSHED only scans actively
+      // bound warehouses, so nothing raises it again. Refusing here rolls the resolution back with
+      // it, so the finding stays in the inbox.
+      if (!await isWmsCreateEligibleForUpdate(tx, activeConnectorId, orderId)) {
+        throw new Error('REPUSH_ORDER_NOT_ELIGIBLE')
+      }
       const updated = await tx.wmsOrderPushLink.updateMany({
-        // CAS on the exact WMS reference that was probed absent (Codex r20): a
-        // concurrent merge repoint changes externalOrderNumber, and clearing
-        // the NEW survivor reference off a stale probe would let the push
-        // sweep duplicate it.
-        where: { orderId, state: { in: ['SYNCED', 'MERGED'] }, externalOrderNumber: link?.externalOrderNumber ?? null },
+        // o3d-2k5r r5 — THE CAS NAMES EVERY COLUMN THE DECISION WAS READ FROM, not just the
+        // reference that was probed. `connector` decided the replay policy; `state` decided that
+        // this is a settled push; `externalOrderId`/`externalOrderNumber` are what the probe was
+        // about; `pushedAt`/`lastAttemptAt` are what the reset CLEARS, and clearing a column whose
+        // value has changed since it was read is how a dispatch stamp written by a concurrent sweep
+        // gets wiped. Anything that moved and this matches nothing — reported as stale rather than
+        // silently winning.
+        where: {
+          id: link.id,
+          connector: link.connector,
+          state: link.state,
+          attempts: link.attempts,
+          externalOrderId: link.externalOrderId,
+          externalOrderNumber: link.externalOrderNumber,
+          pushedAt: link.pushedAt,
+          lastAttemptAt: link.lastAttemptAt,
+        },
         data: {
           state: 'PENDING_CREATE',
           externalOrderId: null,
           externalOrderNumber: null,
           attempts: 0,
           lastError: null,
+          // THE DISPATCH STAMP, cleared — and reached only after both keys turned.
+          //
+          // `decideCreateClaim` reads a PENDING_CREATE link carrying a stamp as "a create left this
+          // system and we may never have learned the outcome", and parks it. Leaving the stamp on
+          // meant this action re-queued nothing: the next sweep parked the order AMBIGUOUS_CREATE
+          // while the finding was already resolved and the operator had been told it worked.
+          //
+          // Clearing it is this action's positive statement that the evidence was obtained — which
+          // is why it is safe here and would not have been on the probe alone. The claim rule grants
+          // on a CLEARED stamp, so whoever clears one is asserting the two-key rule was satisfied.
+          lastAttemptAt: null,
+          // The push that produced the now-missing warehouse order. Left in place it would make
+          // `wmsOrderMayExist` true for a link that carries no warehouse order at all, which is the
+          // first gate of the revalidation and ambiguous-create passes — the re-queued link would be
+          // permanently unre-queueable the moment it ever failed validation.
+          pushedAt: null,
           dispatchFailureCount: 0,
           dispatchLastError: null,
           dispatchDeadLetteredAt: null,
@@ -2892,7 +3100,10 @@ export async function repushMissingWmsOrder(orderId: string): Promise<MutationRe
       return { ok: true as const }
     }).catch((error) => {
       if (error instanceof Error && error.message === 'REPUSH_LINK_NOT_RESETTABLE') {
-        return { ok: false as const, error: 'The push link is no longer in a re-pushable state.' }
+        return { ok: false as const, error: 'This push link changed while you were looking at it — it is no longer the settled link that was inspected. Reload the inbox and check the order\'s current push state.' }
+      }
+      if (error instanceof Error && error.message === 'REPUSH_ORDER_NOT_ELIGIBLE') {
+        return { ok: false as const, error: wmsCreateIneligibleRefusal(reference) }
       }
       throw error
     })

@@ -227,8 +227,8 @@ export function ExceptionsClient({ data }: Props) {
       {data.wmsPushDeadLetters.length > 0 ? (
         <Card className="p-4 space-y-3">
           <SectionHeading
-            title={`WMS order pushes — dead-lettered (${data.summary.wmsPushDeadLetters})`}
-            detail="These orders never reached the warehouse (or a hold/cancel conflicted). They will not fulfil until replayed or resolved."
+            title={`WMS order pushes — blocked (${data.summary.wmsPushDeadLetters})`}
+            detail="These orders never reached the warehouse (or a hold/cancel conflicted). They will not fulfil until replayed or resolved. A payload-invalid row cannot be replayed — fix the order data and the sweep re-queues it by itself (o3d-92fu)."
             shown={data.wmsPushDeadLetters.length}
             total={data.summary.wmsPushDeadLetters}
           />
@@ -237,6 +237,7 @@ export function ExceptionsClient({ data }: Props) {
               <TableRow>
                 <TableHead>Order</TableHead>
                 <TableHead>Connector</TableHead>
+                <TableHead>Why</TableHead>
                 <TableHead>Attempts</TableHead>
                 <TableHead>Last error</TableHead>
                 <TableHead>Last attempt</TableHead>
@@ -250,19 +251,36 @@ export function ExceptionsClient({ data }: Props) {
                     <Link className="underline underline-offset-2" href={`/sales/${row.orderId}`}>{row.orderNumber ?? row.orderId}</Link>
                   </TableCell>
                   <TableCell className="text-xs">{row.connector}</TableCell>
+                  {/* o3d-2k5r r5: derived on the server from the link's evidence. "Push failed" is
+                      the one thing an AMBIGUOUS_CREATE row is not — nothing is known to have failed,
+                      and the hazard is that the create SUCCEEDED and IMS never heard. */}
+                  <TableCell className="text-xs">{row.why}</TableCell>
                   <TableCell className="text-xs">{row.attempts}</TableCell>
                   <TableCell className="text-xs text-muted-foreground max-w-[320px] truncate" title={row.lastError ?? ''}>{row.lastError ?? '—'}</TableCell>
                   <TableCell className="text-xs text-muted-foreground">{row.lastAttemptAt ? formatDateTime(row.lastAttemptAt) : '—'}</TableCell>
                   <TableCell className="text-right">
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      disabled={isPending}
-                      onClick={() => runAction(() => replayWmsOrderPush(row.orderId), `Re-queued the WMS push for ${row.orderNumber ?? row.orderId}.`)}
-                    >
-                      <RotateCcw className="h-3 w-3 mr-1" />Replay
-                    </Button>
+                    {/* o3d-2k5r r5 — THE AFFORDANCE IS THE ACTION'S OWN ANSWER (`replayable`,
+                        from `decideWmsPushReplay` on the server), never a state name read here.
+                        This condition used to be `state === 'VALIDATION_FAILED'`, which meant every
+                        other blocked state got a button — including an AMBIGUOUS_CREATE row on a
+                        connector whose create cannot be repeated safely, which `replayWmsOrderPush`
+                        refuses every single time and which the docs already promised had no button.
+                        Where there is no button there is the
+                        manual reconciliation instead, so the row still tells the operator what to
+                        do. */}
+                    {row.replayable ? (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        disabled={isPending}
+                        onClick={() => runAction(() => replayWmsOrderPush(row.orderId), `Re-queued the WMS push for ${row.orderNumber ?? row.orderId}.`)}
+                      >
+                        <RotateCcw className="h-3 w-3 mr-1" />Replay
+                      </Button>
+                    ) : (
+                      <span className="text-xs text-muted-foreground block text-left whitespace-normal">{row.replayRefusal}</span>
+                    )}
                   </TableCell>
                 </TableRow>
               ))}
@@ -759,7 +777,10 @@ export function ExceptionsClient({ data }: Props) {
                   <TableCell className="text-xs text-muted-foreground max-w-[320px] truncate" title={row.detail ?? ''}>{row.detail ?? '—'}</TableCell>
                   <TableCell className="text-xs text-muted-foreground">{row.foundAt ? formatDateTime(row.foundAt) : '—'}</TableCell>
                   <TableCell className="text-right">
-                    {row.category === 'MISSING_IN_WMS' ? (
+                    {/* o3d-2k5r r5: `repushable` is `decideWmsMissingRepush` — the same call the
+                        action refuses on. A connector whose create does not refuse a duplicate gets
+                        the reconciliation guidance rather than a button that cannot be pressed. */}
+                    {row.repushable ? (
                       <Button
                         type="button"
                         variant="outline"
@@ -769,6 +790,8 @@ export function ExceptionsClient({ data }: Props) {
                       >
                         <RotateCcw className="h-3 w-3 mr-1" />Re-push
                       </Button>
+                    ) : row.repushRefusal ? (
+                      <span className="text-xs text-muted-foreground block text-left whitespace-normal">{row.repushRefusal}</span>
                     ) : null}
                   </TableCell>
                 </TableRow>

@@ -31,6 +31,102 @@ export type ExternalFulfillmentUpdate = {
   tracking?: Array<{ trackingNumber: string; shippingService?: string | null }>
 }
 
+/**
+ * WHY THE FAILURE HAS A SHAPE AND NOT JUST A STRING (o3d-xnwu).
+ *
+ * `applyExternalFulfillmentUpdate` refuses for two quite different kinds of reason, and a caller
+ * that only sees `{ success: false, error }` cannot tell them apart:
+ *
+ *   - A BUSINESS REFUSAL. The order, as IMS holds it, may not be promoted to SHIPPED — the
+ *     shipment lines under-cover ordered-net-of-refunds demand (o3d-okbd), or the order is on
+ *     backorder so there is no physical stock to consume. Nothing about the request is wrong and
+ *     nothing failed; the answer is "no".
+ *   - A FAILURE. Auto-allocation, shipment creation or a shipment status transition returned an
+ *     error, or the order could not be resolved at all.
+ *
+ * The distinction matters at the WooCommerce webhook boundary, where `permanent` decides between
+ * acknowledging the delivery (o3d-bx9) and answering 5xx so it is redelivered (o3d-i0y).
+ */
+export type ExternalFulfillmentRefusal =
+  | 'order_not_found'
+  | 'auto_allocation_failed'
+  | 'insufficient_physical_stock'
+  | 'shipment_creation_failed'
+  | 'coverage_shortfall'
+  | 'shipment_status_transition_failed'
+
+export type ExternalFulfillmentOutcome =
+  | { success: true }
+  | {
+      success: false
+      error: string
+      refusal: ExternalFulfillmentRefusal
+      /**
+       * `true` when re-running this identical request would reach the identical answer, so a
+       * caller should record it and move on rather than retry.
+       *
+       * Only `coverage_shortfall` qualifies. It is computed entirely from committed IMS state —
+       * the order's own lines, its refunds and its shipment lines — so a redelivery of the same
+       * storefront event re-reads the same rows and refuses again.
+       *
+       * THAT IS TRUE ONLY ONCE THE ORDER'S REFUNDS ARE IN, and it is the CALLER'S job to know
+       * whether they are (o3d-xnwu r2, Codex HIGH). Committed state is not the same as settled
+       * state: the WooCommerce order webhook runs this via the status sync and sweeps the order's
+       * refunds AFTERWARDS, so a completion reaching here mid-delivery is answered from a state
+       * that is committed and STALE. Eight shipped of ten ordered with two refunded in the same
+       * delivery is a complete dispatch, and it is refused — and recorded as permanent, which
+       * buries it — moments before the refunds that would have netted the demand arrive. So this
+       * flag says what it has always said, and `externalFulfillmentRefusalAwaitsRefunds` below
+       * says which refusals a caller must not ACT on until it has finished reading refunds.
+       *
+       * `insufficient_physical_stock` is deliberately NOT permanent, on the same reasoning that
+       * keeps a P2002 on `sku` transient in product-sync-errors.ts: it is a statement about IMS
+       * stock at this instant, not about the request, and it clears the moment a receipt lands —
+       * so the retry is not merely safe, it is the fix.
+       */
+      permanent: boolean
+    }
+
+/** The refusals a retry can never resolve. Everything unlisted stays retryable, which is the safe direction. */
+const PERMANENT_EXTERNAL_FULFILLMENT_REFUSALS: ReadonlySet<ExternalFulfillmentRefusal> = new Set([
+  'coverage_shortfall',
+])
+
+/**
+ * The refusals whose answer a refund that has not been read yet can still change (o3d-xnwu r2).
+ *
+ * `coverage_shortfall` is computed against ordered-net-of-refunds demand, so every refund the store
+ * holds and IMS has not yet applied moves the line it is compared against — DOWNWARDS, i.e. towards
+ * the shipment covering it. A caller that reaches this refusal while it still has refunds to sweep
+ * has not been told "no"; it has been told "not with what you have read so far", and must re-ask
+ * once the sweep is complete rather than record a permanent refusal.
+ *
+ * The set is separate from PERMANENT_EXTERNAL_FULFILLMENT_REFUSALS rather than replacing it, and
+ * `coverage_shortfall` is deliberately in BOTH: once the refunds ARE in, the original reasoning
+ * holds exactly as it did and the refusal is permanent. Demoting it to transient instead would
+ * restore the endless-retry behaviour this branch exists to remove.
+ */
+const REFUSALS_AWAITING_REFUNDS: ReadonlySet<ExternalFulfillmentRefusal> = new Set([
+  'coverage_shortfall',
+])
+
+/**
+ * Would reading the order's outstanding refunds change this refusal? Asked by callers that sync
+ * refunds AFTER fulfilment, so they can hold the verdict instead of recording a stale one.
+ */
+export function externalFulfillmentRefusalAwaitsRefunds(
+  refusal: ExternalFulfillmentRefusal | undefined,
+): boolean {
+  return refusal !== undefined && REFUSALS_AWAITING_REFUNDS.has(refusal)
+}
+
+function refuseExternalFulfillment(
+  refusal: ExternalFulfillmentRefusal,
+  error: string,
+): ExternalFulfillmentOutcome {
+  return { success: false, error, refusal, permanent: PERMANENT_EXTERNAL_FULFILLMENT_REFUSALS.has(refusal) }
+}
+
 type ResolvedOrder = {
   id: string
   orderNumber: string | null
@@ -465,10 +561,10 @@ export function describeExternalFulfillmentShortfall(
 
 export async function applyExternalFulfillmentUpdate(
   update: ExternalFulfillmentUpdate,
-): Promise<{ success: boolean; error?: string }> {
+): Promise<ExternalFulfillmentOutcome> {
   const order = await resolveOrderForExternalFulfillment(update.source, update.lookup)
   if (!order) {
-    return { success: false, error: 'Order not found for external fulfillment update' }
+    return refuseExternalFulfillment('order_not_found', 'Order not found for external fulfillment update')
   }
 
   const { autoAllocateOrder, confirmAllocations, updateShipmentStatus } = await import('@/app/actions/allocation')
@@ -477,13 +573,26 @@ export async function applyExternalFulfillmentUpdate(
   if (allocationCount === 0) {
     const result = await autoAllocateOrder(order.id, { internalBypassToken: INTERNAL_ACTION_BYPASS })
     if (!result.success) {
-      return { success: false, error: result.error ?? 'Auto-allocation failed' }
+      return refuseExternalFulfillment('auto_allocation_failed', result.error ?? 'Auto-allocation failed')
     }
     if ((result.allocationCount ?? 0) === 0 && (result.unallocatedQty ?? 0) > 0) {
-      return {
-        success: false,
-        error: `External fulfillment requires physical stock — order has ${result.unallocatedQty} unit(s) on backorder`,
-      }
+      // o3d-xnwu: this refusal produced literally no record until now — the WooCommerce caller
+      // discarded the result and nothing was logged here either, so an order the store had marked
+      // completed simply never became an IMS shipment and no surface said so.
+      const error = `External fulfillment requires physical stock — order has ${result.unallocatedQty} unit(s) on backorder`
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: order.id,
+        action: 'external_fulfillment_backordered',
+        tag: 'sync',
+        level: 'WARNING',
+        description: `${update.source} dispatch for order ${order.externalOrderNumber ?? order.orderNumber ?? order.id} `
+          + `was refused: IMS has no physical stock to consume for ${result.unallocatedQty} unit(s), so the `
+          + 'order cannot be promoted to SHIPPED. It clears by itself once the stock is received.',
+        metadata: { source: update.source, unallocatedQty: result.unallocatedQty },
+        resolveUser: false,
+      })
+      return refuseExternalFulfillment('insufficient_physical_stock', error)
     }
   }
 
@@ -491,7 +600,7 @@ export async function applyExternalFulfillmentUpdate(
   if (shipmentCount === 0) {
     const result = await confirmAllocations(order.id, { internalBypassToken: INTERNAL_ACTION_BYPASS })
     if (!result.success) {
-      return { success: false, error: result.error ?? 'Shipment creation failed' }
+      return refuseExternalFulfillment('shipment_creation_failed', result.error ?? 'Shipment creation failed')
     }
   }
 
@@ -520,7 +629,7 @@ export async function applyExternalFulfillmentUpdate(
         metadata: { source: update.source, shortfalls },
         resolveUser: false,
       })
-      return { success: false, error }
+      return refuseExternalFulfillment('coverage_shortfall', error)
     }
   }
 
@@ -583,7 +692,10 @@ export async function applyExternalFulfillmentUpdate(
           metadata: { source: update.source, shipmentId: shipment.id, target, error: result.error },
           resolveUser: false,
         })
-        return { success: false, error: result.error ?? `Failed to update shipment to ${target}` }
+        return refuseExternalFulfillment(
+          'shipment_status_transition_failed',
+          result.error ?? `Failed to update shipment to ${target}`,
+        )
       }
     }
   }

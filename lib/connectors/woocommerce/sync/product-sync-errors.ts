@@ -106,6 +106,59 @@ export function assertWcRowNotClaimedByAnotherWcObject(
 }
 
 // ---------------------------------------------------------------------------
+// Variation-count limits (o3d-jcx)
+// ---------------------------------------------------------------------------
+
+/**
+ * The product has more variations than this sync is built to apply ATOMICALLY (o3d-jcx).
+ *
+ * fetchAllWcVariations trusted WooCommerce's `x-wp-totalpages` and retained every page in one
+ * array with no page, item or time limit; the write transaction then built a second array from
+ * it, issued one unbounded `sku IN (...)`, acquired one advisory lock per SKU and did 1-4
+ * sequential writes per variation — all inside a 60-second budget. A large enough product
+ * exhausted worker memory or ran the transaction out of time AFTER holding the parent lock and
+ * every earlier variation row lock for most of a minute, and then rolled back and did it again.
+ *
+ * REFUSING BEFORE THE FIRST WRITE is strictly better than that, and better than the obvious
+ * alternative of truncating: applying half a product's variations and reporting success is the
+ * silent-incompleteness failure this connector's whole error story exists to avoid.
+ *
+ * PERMANENT, because it is a property of the product rather than of the moment: re-reading the
+ * same product reaches the same count, so 24 retries into the dead-letter queue tell the operator
+ * nothing the first attempt did not. The remedy is a person deciding — raise the supported limit
+ * (and the transaction budget with it) or split the product in WooCommerce.
+ */
+export class WcVariationLimitExceededError extends Error {
+  readonly wcParentId: number
+  /** The supported ceiling that was breached. */
+  readonly limit: number
+  /** How many variations the walk had collected when it breached it. */
+  readonly observed: number
+
+  constructor(args: { wcParentId: number; limit: number; observed: number }) {
+    super(
+      `WooCommerce product ${args.wcParentId} has at least ${args.observed} variations, above the ` +
+        `${args.limit} this sync can import in one atomic transaction. Nothing was written — importing ` +
+        'part of a product and reporting success would leave the catalogue silently incomplete. Either ' +
+        'split the product in WooCommerce, or raise MAX_WC_VARIATIONS_PER_PRODUCT together with ' +
+        'PRODUCT_WRITE_TX_TIMEOUT_MS, which is the budget that limit is derived from.',
+    )
+    this.name = 'WcVariationLimitExceededError'
+    this.wcParentId = args.wcParentId
+    this.limit = args.limit
+    this.observed = args.observed
+  }
+}
+
+/** Duck-typed so a structured-clone / re-thrown copy across a boundary still matches. */
+export function isWcVariationLimitExceeded(error: unknown): boolean {
+  return (
+    error instanceof WcVariationLimitExceededError ||
+    (typeof error === 'object' && error !== null && (error as { name?: unknown }).name === 'WcVariationLimitExceededError')
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Unique-constraint conflicts (o3d-gtk)
 // ---------------------------------------------------------------------------
 
@@ -216,6 +269,9 @@ export function isPermanentProductSyncConflict(error: unknown): boolean {
   // SKU advisory locks, so a retry reaches the identical conclusion. Retrying it 24 times
   // tells nobody anything the first attempt did not.
   if (isWcSkuOwnershipConflict(error)) return true
+
+  // o3d-jcx: a property of the product, not of the moment. Re-reading it reaches the same count.
+  if (isWcVariationLimitExceeded(error)) return true
 
   if (!isUniqueConstraintViolation(error)) return false
 

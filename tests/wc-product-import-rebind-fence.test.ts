@@ -73,14 +73,19 @@ const VARIATION_ROW = {
 
 mock.module('@/lib/connectors/woocommerce/api', {
   namedExports: {
-    wcFetch: async (path: string, _params: Record<string, string> = {}, creds?: unknown) => {
+    wcFetch: async (path: string, params: Record<string, string> = {}, creds?: unknown) => {
       state.fetchCreds.push(creds)
       if (bumpVersionOnFetch) {
         versionAtWriteTime = bumpVersionOnFetch
         bumpVersionOnFetch = null
       }
       if (!path.includes('/variations')) return { data: [], totalPages: 1, totalItems: 0, error: null }
-      return { data: [VARIATION_ROW], totalPages: 1, totalItems: 1, error: null }
+      // HONOURS `page` (o3d-jcx). It used to serve the same row for every page, which models a
+      // store that ignores the parameter — harmless while the walk ended on `x-wp-totalpages`,
+      // but the walk now ends on an EMPTY PAGE, so a double that never serves one is a store that
+      // never ends.
+      const page = Number.parseInt(params.page ?? '1', 10)
+      return { data: page === 1 ? [VARIATION_ROW] : [], totalPages: 1, totalItems: 1, error: null }
     },
     wcPut: async () => ({ data: null, error: null }),
   },

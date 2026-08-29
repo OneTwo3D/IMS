@@ -36,6 +36,47 @@ import type { Prisma } from '@/app/generated/prisma/client'
 /** Marks a ShoppingSyncLog row as a held sales invoice. Lives at `payload.reason`. */
 export const MISSING_INVOICE_NUMBER_QUEUE_REASON = 'missing_wc_invoice_number'
 
+/**
+ * WHAT THIS ROW IS, in a column (o3d-xnwu r8, Codex HIGH).
+ *
+ * A hold shares connector, direction, `SalesOrder`, PENDING and a non-null `entityId` with a
+ * WooCommerce refund park, so until r8 the two families were indistinguishable to any predicate
+ * built out of this table's scalars — and both predicates were built out of them. The park's
+ * inbox admitted holds, and this queue selected parks.
+ *
+ * THIS SIDE IS THE ONE THAT WRITES, so it is the more dangerous half.
+ * `holdWcSalesInvoiceForMissingNumber` does a findFirst on {@link heldSalesInvoiceQueueWhere} and
+ * UPDATES whatever it finds; `retryHeldWcSalesInvoiceReleases` rewrites the `errorMessage` of what
+ * it finds. A refund park matched, because the only thing separating the two was
+ * `payload.reason` — and a park's payload is the RAW WOOCOMMERCE REFUND, whose `reason` is free
+ * text a human types when issuing it. So an operator who wrote `missing_wc_invoice_number` had
+ * their park silently overwritten with an invoice payload, or its own error text replaced. That is
+ * the o3d-xnwu r7 defect with the destination and the source swapped.
+ */
+export const HELD_SALES_INVOICE_RECORD_KIND = 'WC_HELD_SALES_INVOICE'
+
+/**
+ * THE THREE SENTENCES THE RELEASE SWEEP SETTLES A HOLD WITH (o3d-xnwu r9, Codex MEDIUM).
+ *
+ * Named here rather than typed inline at the three `update` calls, because verify.sql check 6
+ * MATCHES ON THEM: a row that is not a hold carrying one of these messages was settled by a
+ * predecessor whose queue predicate had no `recordKind` clause, and that has no legitimate
+ * producer. A check that keys on a string literal and a writer that types one are two copies of the
+ * same fact, and the copy in the migration cannot be recompiled — so the test asserts verify.sql
+ * against THESE, and drifting the writer's wording turns it red rather than turning the check off.
+ *
+ * Every one of them is written ONLY to a row selected by {@link heldSalesInvoiceQueueWhere}, which
+ * requires {@link HELD_SALES_INVOICE_RECORD_KIND}. That is the whole of check 6's forgery argument.
+ */
+export const HELD_SALES_INVOICE_ORDER_MISSING_MESSAGE =
+  'The sales order this invoice was held for cannot be found, so it can never be released. Nothing was posted.'
+
+/** The prefix — the rest names the ledger document, so the check matches on this much. */
+export const HELD_SALES_INVOICE_SUPERSEDED_PREFIX = 'Superseded: this order already carries ledger document '
+
+export const HELD_SALES_INVOICE_UNREADABLE_MESSAGE =
+  'The held sales-invoice payload is unreadable, so the invoice cannot be released automatically — queue it from the order.'
+
 export type HeldSalesInvoicePayload = {
   reason: typeof MISSING_INVOICE_NUMBER_QUEUE_REASON
   connector: 'woocommerce'
@@ -55,6 +96,14 @@ export type HeldSalesInvoicePayload = {
  * PENDING, not FAILED: this is work waiting on an external event, not work that went wrong, and
  * FAILED-error dashboards must not treat a normal "not numbered yet" order as a fault. The same
  * distinction the pending-FX queue and the QUARANTINED refund status already draw.
+ *
+ * THE COLUMN IS WHAT SELECTS, THE PAYLOAD MARKER ONLY CONFIRMS (o3d-xnwu r8). `recordKind` is
+ * written by this queue's own writer and by nothing else, so it is the clause a refund park cannot
+ * satisfy however its `reason` happens to read. The `payload.reason` clause stays beside it, as the
+ * pending-FX queue keeps its own: it is a POSITIVE assertion about a payload IMS built, and the
+ * release still validates the whole shape with `isHeldSalesInvoicePayload` before touching it. What
+ * it is no longer is the only thing standing between an operator's refund reason and a destructive
+ * update.
  */
 export function heldSalesInvoiceQueueWhere(params?: { salesOrderId?: string; externalOrderId?: string }): Prisma.ShoppingSyncLogWhereInput {
   return {
@@ -62,6 +111,7 @@ export function heldSalesInvoiceQueueWhere(params?: { salesOrderId?: string; ext
     direction: 'FROM_CONNECTOR',
     status: 'PENDING',
     entityType: 'SalesOrder',
+    recordKind: HELD_SALES_INVOICE_RECORD_KIND,
     ...(params?.salesOrderId ? { entityId: params.salesOrderId } : {}),
     ...(params?.externalOrderId ? { externalId: params.externalOrderId } : {}),
     payload: {

@@ -28,6 +28,8 @@
  * space from single-bigint locks and cannot collide with these values.
  */
 
+import { SESSION_LOCK_SPACE_PROBE_NAMESPACE as SESSION_LOCK_SPACE_PROBE_NAMESPACE_FROM_URL_SCHEMA } from './database-url-schema.mjs'
+
 /**
  * ACCOUNTING WRITE domain.
  *
@@ -244,6 +246,22 @@ export const ACCOUNTING_FOLLOWUP_SCOPE_LOCK_NAMESPACE = 411_220_871
  */
 export const ACCOUNTING_MONEY_POST_LOCK_NAMESPACE = 411_220_870
 
+/**
+ * The namespace the SESSION-LOCK-SPACE PROBE takes its key in (o3d-2k5r r26).
+ *
+ * Declared in `lib/db/database-url-schema.mjs` and re-exported here rather than written down twice:
+ * that module is `.mjs` and cannot import this registry — the dependency runs the other way — but a
+ * namespace that lived outside the registry would be exactly the unregistered constant o3d-4ajo is
+ * about, invisible to the distinctness test below.
+ *
+ * It is not a lock over any application state. When `DATABASE_SESSION_LOCK_URL` is set, the first
+ * session-lock connection takes this key on the override URL and asks a DATABASE_URL connection for
+ * the same one; the second must be blocked, or the two URLs are not the same PostgreSQL and every
+ * session lock in the process excludes nobody. The `objid` half is RANDOM per probe, so two
+ * instances booting at once cannot refuse each other.
+ */
+export const SESSION_LOCK_SPACE_PROBE_NAMESPACE = SESSION_LOCK_SPACE_PROBE_NAMESPACE_FROM_URL_SCHEMA
+
 export const TWO_INT_ADVISORY_LOCK_NAMESPACES = {
   WC_PRODUCT_WRITE_LOCK_NAMESPACE,
   DISPATCH_SWEEP_LOCK_NAMESPACE,
@@ -252,4 +270,5 @@ export const TWO_INT_ADVISORY_LOCK_NAMESPACES = {
   ACCOUNTING_FOLLOWUP_SCOPE_LOCK_NAMESPACE,
   ACCOUNTING_MONEY_POST_LOCK_NAMESPACE,
   XERO_INVOICE_NUMBER_SLOT_LOCK_NAMESPACE,
+  SESSION_LOCK_SPACE_PROBE_NAMESPACE,
 } as const

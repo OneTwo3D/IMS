@@ -961,10 +961,33 @@ function executableFiles(dir: string, found: string[] = []): string[] {
  *                             covered by the lexical inventory above.
  *   'pinned-lock-session'   — builds a small dedicated `pg` pool/client to hold ONE advisory lock on
  *                             a connection Prisma will not reassign. Takes a lock; writes nothing.
+ *   'compatibility-probe'   — opens a short-lived client purely to ASK the server about itself, and
+ *                             runs no statement that touches an application table. o3d-2k5r r19's
+ *                             startup-option probe is the only one: two `SELECT`s (`pg_database`,
+ *                             and a `SHOW` of a custom GUC it set on its own session) whose answers
+ *                             decide whether a non-ASCII schema name can be pinned at all. It takes
+ *                             no lock and needs none — it writes nothing, anywhere, ever.
  *   'names-the-tools-only'  — touches NO database at all, in any mode. It appears in this inventory
  *                             because its own prose names `psql` / `prisma migrate` — which is the
  *                             deliberately generous half of this scan working as intended, and is
  *                             why the inventory is a classification rather than a filter.
+ *   'deploy-connection-fence'— connects during a deploy cutover and changes DATABASE-LEVEL
+ *                             privileges only: REVOKE/GRANT CONNECT, plus pg_terminate_backend.
+ *                             It writes no row in any table, so it cannot move a plugin key.
+ *
+ *   'deploy-read-only-probe'— connects during a deploy cutover and only READS. It takes no lock and
+ *                             needs none: it runs in the window scripts/deploy.sh opens by stopping
+ *                             every writer, and its whole job is to describe that window
+ *                             (pg_stat_activity) or to check what the migration just did. It writes
+ *                             nothing, so it cannot move a plugin key. o3d-2sm1.1.
+ *   'protocol-handshake-only'— opens a connection to this database and reads the FIRST message the
+ *                             server sends: the authentication request, which names the pg_hba
+ *                             method the server matched. It then drops the socket. It sends no
+ *                             password, so the connection NEVER REACHES THE AUTHENTICATED STATE; a
+ *                             PostgreSQL backend accepts no query before that point, so this path
+ *                             cannot read a row, let alone write one. It is discovered here because
+ *                             its prose names `psql` while explaining which connection it has to
+ *                             match. o3d-2sm1.5 r41.
  *   'seed'                  — a standalone client that WRITES this database, run from install.sh.
  *                             It takes no lock and cannot practically be made to (it runs before the
  *                             app is up); what keeps it safe is that it must not write a plugin key,
@@ -983,6 +1006,10 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   | 'names-the-tools-only'
   | 'app-database-client'
   | 'pinned-lock-session'
+  | 'deploy-read-only-probe'
+  | 'deploy-connection-fence'
+  | 'protocol-handshake-only'
+  | 'compatibility-probe'
   | 'seed'
 > = {
   'app/api/backup/restore/route.ts': 'replays-external-sql',
@@ -1012,6 +1039,53 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   // comments. Rewording that sentence to dodge this scan would delete the lesson to satisfy the
   // detector, so it is classified instead.
   'scripts/check-documented-env-vars.mjs': 'names-the-tools-only',
+  // o3d-2sm1.1's two cutover probes. `check-db-writers.mjs` reads pg_stat_activity to prove the
+  // predecessor is STOPPED before a migration is applied; `run-migration-verifications.mjs` runs
+  // the read-only checks a migration declares in its own verify.sql, after the schema has moved and
+  // before the new build is started. Both are found by this scan because their prose names `psql`
+  // and `prisma migrate deploy` — neither executes either tool, and neither writes anything.
+  'scripts/check-db-writers.mjs': 'deploy-read-only-probe',
+  'scripts/run-migration-verifications.mjs': 'deploy-read-only-probe',
+  // o3d-2sm1.5's post-migration ownership assertion. It runs one SELECT over pg_class and asks
+  // has_table_privilege / has_sequence_privilege / has_schema_privilege ABOUT THE APPLICATION ROLE
+  // — the one question the drift check, the verification hook and pg_dump cannot ask, because they
+  // all run on the admin connection that OWNS whatever the migration just created. It writes
+  // nothing; it is found by this scan because its prose names `prisma migrate deploy` while
+  // explaining which step left the objects unusable.
+  'scripts/check-app-db-object-access.mjs': 'deploy-read-only-probe',
+  // o3d-2sm1.2's cutover fence, and the ONLY entry here that writes to this database
+  // outside the application. It writes no rows at all: its statements are REVOKE and
+  // GRANT CONNECT on the database itself, taken for the length of a migration window
+  // and released on every exit path. It cannot touch `settings`, so it cannot move a
+  // plugin key; what it can do — and what this classification is here to keep visible
+  // — is leave the application unable to connect if a release is ever dropped.
+  'scripts/fence-db-connections.mjs': 'deploy-connection-fence',
+  // o3d-2sm1.5 r41's matched-method reader. install.sh runs it before a credential rotation, and
+  // before the reconciliation of an interrupted one, to establish which pg_hba method the server
+  // matched for the application role on a given endpoint — because a `radius` or `ldap` rule
+  // discriminates between passwords while checking a credential ALTER ROLE cannot change. It is the
+  // one entry here that opens a connection it deliberately never completes.
+  'scripts/lib/pg-auth-request.mjs': 'protocol-handshake-only',
+  // o3d-2k5r r6 / o3d-1izw. Found for the same reason: its REFUSAL TEXT names `prisma migrate
+  // deploy`, because a refusal whose remedy is "apply the migration" is one nobody can act on. The
+  // module executes nothing — it takes a reader function and compares enum labels — and the one
+  // production reader is a parameterised `SELECT` over `pg_catalog` living in order-push-sweep.ts,
+  // through the app's own client. Rewording the remedy to dodge this scan would delete the only
+  // useful part of the message.
+  'lib/domain/wms/push-state-schema-gate.ts': 'names-the-tools-only',
+  // o3d-2k5r r7 / o3d-1izw. The schema gate's production reader. `$queryRawUnsafe` because the ONE
+  // catalogue statement is shared verbatim with the deploy check and the production preflight — a
+  // per-gate `$queryRaw` template would be three statements again, which is exactly the common-mode
+  // drift that let all three ask the wrong question. The statement is a module constant in
+  // lib/domain/wms/push-state-enum-query.mjs with no interpolation at all; the table and column are
+  // bind parameters, it is a SELECT over pg_catalog, and it runs on the app's own pooled client.
+  'lib/domain/wms/order-push-sweep.ts': 'runtime-assembled-sql',
+  // o3d-1izw. A read-only deploy gate: it opens its own `pg` client (deploy.sh runs it before the
+  // app is up, so there is no app client to borrow) and issues ONE parameterised SELECT over
+  // pg_catalog, anchored at the column it is vouching for. It writes nothing anywhere, and it names `prisma migrate deploy` for the same reason
+  // the module above does. Runs only on `deploy.sh --skip-migrate`, the delivery path that applies
+  // and validates nothing.
+  'scripts/check-wms-push-state-enum.mjs': 'names-the-tools-only',
   'scripts/deploy.sh': 'migration-runner',
   'scripts/install.sh': 'migration-runner',
   'scripts/prisma-dev-db.sh': 'migration-runner',
@@ -1021,6 +1095,18 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   // question the round-8 inventory did not ask.
   'lib/backup/restore-sql-guard.ts': 'validates-external-sql',
   'lib/db/index.ts': 'app-database-client',
+  // o3d-2k5r r19. Discovered here because `establishStartupOptionByteSafety()` builds its own `pg`
+  // client — deliberately, since the question it answers ("does THIS server's tokenizer carry these
+  // bytes?") has to be asked before the application's own connection config can be composed at all.
+  // Both connections are SANITISED (the URL with `?options=` and `?schema=` removed and no
+  // `options` beside it), it runs two reads and no write, and it touches no application table.
+  'lib/db/database-url-schema.mjs': 'compatibility-probe',
+  // o3d-2k5r r25 / o3d-a5zz. THE factory the three lock pools and the restore lock client now build
+  // through, so the proof that a session-lock connection reaches the backend directly is a property
+  // of one function rather than of four call sites. It constructs a `pg` Pool/Client and issues no
+  // statement of its own: the one query the connection makes before it is handed out is the peer
+  // read in `database-url-schema.mjs`, over `pg_stat_activity` for its own pid.
+  'lib/db/session-lock-pool.ts': 'pinned-lock-session',
   'lib/db/pinned-advisory-lock.ts': 'pinned-lock-session',
   'lib/connectors/xero/payment-write-lock.ts': 'pinned-lock-session',
   'lib/domain/wms/dispatch-sweep-lock.ts': 'pinned-lock-session',

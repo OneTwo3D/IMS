@@ -1,8 +1,15 @@
 import 'dotenv/config'
 import { PrismaPg } from '@prisma/adapter-pg'
+import { pgConnectionConfig, prismaAdapterSchemaOptions } from '@/lib/db/database-url-schema.mjs'
 import { PrismaClient } from '../app/generated/prisma/client.ts'
 
-const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL! })
+// Both halves of the schema, as prisma/seed.ts explains: the pool's search_path AND the
+// adapter's schemaName. A bare connectionString gives neither, so on a `?schema=` install this
+// fixture seeds one schema while the run under test reads another (o3d-2k5r r23).
+const adapter = new PrismaPg(
+  pgConnectionConfig(process.env.DATABASE_URL!),
+  prismaAdapterSchemaOptions(process.env.DATABASE_URL!),
+)
 const db = new PrismaClient({ adapter })
 
 type SnapshotEntry = {

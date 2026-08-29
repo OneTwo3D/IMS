@@ -262,15 +262,21 @@ test('production preflight validates database url protocol and database name', a
 
 test('production preflight can run an opt-in database connectivity check', async () => {
   await withStorageDirs(async (storage) => {
+    // o3d-1izw: PREFLIGHT_DB_CONNECT now also arms the WMS push-state schema check, which opens
+    // its own connection. Doubled here for the same reason `dbConnect` is — this test is about
+    // connectivity, and an un-doubled check would fail it by trying to reach a real database.
+    const schemaOk = async () => ['AMBIGUOUS_CREATE']
     const pass = await runProductionPreflight({
       env: { ...baseEnv(storage), PREFLIGHT_DB_CONNECT: 'true' },
       dbConnect: async () => undefined,
+      readWmsPushStates: schemaOk,
     })
     assert.equal(pass.ok, true)
     assertStatus(pass, 'database-connectivity', 'pass')
 
     const fail = await runProductionPreflight({
       env: { ...baseEnv(storage), PREFLIGHT_DB_CONNECT: 'true' },
+      readWmsPushStates: schemaOk,
       dbConnect: async () => {
         throw new Error('connection refused')
       },
