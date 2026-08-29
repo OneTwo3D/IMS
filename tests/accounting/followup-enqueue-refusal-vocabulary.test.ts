@@ -28,14 +28,39 @@ async function source(rel: string): Promise<string> {
   return await readFile(path.join(ROOT, rel), 'utf8')
 }
 
-test('[o3d-peh1 r4] every declared refusal reason is constructed somewhere', async () => {
+/**
+ * Every reason literal the vocabulary declares, across BOTH sub-unions.
+ *
+ * o3d-batch-ret r6 split the vocabulary in two — `FollowUpEnqueueDeclineReason` for what the enqueue
+ * itself refuses, `FollowUpPreEnqueueRefusalReason` for what a connector refuses before the enqueue
+ * is reached — because THREE prose sites state how many ways THE ENQUEUE declines, and folding a
+ * caller-side refusal into that one union would have made all three wrong in the direction that
+ * looks safe (a number too big describes refusals the enqueue does not have). The
+ * "is it constructed?" rule below is about the WHOLE vocabulary and so reads both; the count rule
+ * further down is about the enqueue and so reads one.
+ *
+ * The pre-enqueue arm is matched WITHOUT a leading `|`, because a one-member union has none.
+ */
+async function declaredReasons(): Promise<{ decline: string[]; preEnqueue: string[]; all: string[] }> {
   const outcome = await source('lib/domain/accounting/followup-enqueue-outcome.ts')
-  const union = outcome.slice(
-    outcome.indexOf('export type FollowUpEnqueueRefusalReason'),
-    outcome.indexOf('export type FollowUpEnqueueRefusal ='),
-  )
-  const declared = [...union.matchAll(/\|\s*'([a-z_]+)'/g)].map((m) => m[1])
-  assert.ok(declared.length > 0, 'the union must actually be parsed, or this test asserts nothing')
+  const cut = (from: string, to: string): string[] => {
+    const start = outcome.indexOf(from)
+    const end = outcome.indexOf(to)
+    assert.ok(start >= 0 && end > start, `the vocabulary must still declare ${from} before ${to}`)
+    return [...outcome.slice(start, end).matchAll(/'([a-z_]+)'/g)].map((m) => m[1])
+  }
+  const decline = cut('export type FollowUpEnqueueDeclineReason', 'export type FollowUpPreEnqueueRefusalReason')
+  const preEnqueue = cut('export type FollowUpPreEnqueueRefusalReason', 'export type FollowUpEnqueueRefusalReason =')
+  assert.ok(decline.length > 0, 'the decline union must actually be parsed, or this test asserts nothing')
+  assert.ok(preEnqueue.length > 0, 'the pre-enqueue union must actually be parsed, or this test asserts nothing')
+  return { decline, preEnqueue, all: [...decline, ...preEnqueue] }
+}
+
+test('[o3d-peh1 r4] every declared refusal reason is constructed somewhere', async () => {
+  const { all: declared, preEnqueue } = await declaredReasons()
+  // Non-vacuity in BOTH halves: the walk must reach the connector-side arm as well, which is the one
+  // o3d-batch-ret r6 added and the one whose absence was reported as success for four rounds.
+  assert.ok(preEnqueue.includes('payment_account_unmapped'), 'the pre-enqueue arm must still be in the walk')
 
   const constructors = [
     await source('lib/connectors/xero/sync-processor.ts'),
@@ -122,13 +147,9 @@ const PROSE_SITES: ReadonlyArray<{ file: string; marker: RegExp }> = [
 const NUMBER_WORDS = ['ZERO', 'ONE', 'TWO', 'THREE', 'FOUR', 'FIVE', 'SIX']
 
 test('[round 5] every prose description of the refusal set counts the same set', async () => {
-  const outcome = await source('lib/domain/accounting/followup-enqueue-outcome.ts')
-  const union = outcome.slice(
-    outcome.indexOf('export type FollowUpEnqueueRefusalReason'),
-    outcome.indexOf('export type FollowUpEnqueueRefusal ='),
-  )
-  const declared = [...union.matchAll(/\|\s*'([a-z_]+)'/g)].map((m) => m[1])
-  assert.ok(declared.length > 0, 'the union must actually be parsed, or this test asserts nothing')
+  // THE ENQUEUE'S OWN REFUSALS, which is what all three sites are describing. Counting the whole
+  // vocabulary here would make every site wrong the moment a connector-side refusal is added.
+  const { decline: declared } = await declaredReasons()
   const expected = NUMBER_WORDS[declared.length]
   assert.ok(expected, `no word for ${declared.length} refusals — extend NUMBER_WORDS`)
 
@@ -142,6 +163,46 @@ test('[round 5] every prose description of the refusal set counts the same set',
       `${site.file} says ${found[1]} refusals; the union declares ${declared.length} (${declared.join(', ')})`,
     )
   }
+})
+
+/**
+ * o3d-batch-ret ROUND 6 — AND NONE OF THEM MAY CLAIM ITS COUNT IS THE WHOLE VOCABULARY.
+ *
+ * This is the same defect as the count itself, one clause along. All three sites said their three
+ * refusals "are exactly the members of" / "are the whole of" `FollowUpEnqueueRefusalReason`. Adding
+ * a connector-side refusal to that union makes the SENTENCE false while leaving the NUMBER true, so
+ * the count test above would still pass — and a reader would believe a payment refused for missing
+ * configuration cannot exist, because the vocabulary they were pointed at does not contain it.
+ *
+ * The rule is about the CLAIM'S GRAMMAR, not about proximity to a correction: naming the wider union
+ * as the set the count exhausts is the offence, wherever the corrective sentence happens to sit.
+ *
+ * REVERT EVIDENCE: change any one site back to `the whole of \`FollowUpEnqueueRefusalReason\`` and
+ * this fails naming that file.
+ */
+test('[round 6] no prose site claims the enqueue refusals exhaust the WIDER vocabulary', async () => {
+  const { decline, preEnqueue } = await declaredReasons()
+  assert.ok(
+    preEnqueue.length > 0 && decline.length > 0,
+    'PRECONDITION: the vocabulary must be genuinely wider than the enqueue set, or this rule is vacuous',
+  )
+  let checked = 0
+  for (const site of PROSE_SITES) {
+    const text = await source(site.file)
+    const found = site.marker.exec(text)
+    assert.ok(found, `${site.file}: the marker must match, or this asserts nothing`)
+    // The sentence the count introduces, and a little past it — the claim always sits in the same
+    // thought as the number it qualifies.
+    const listing = text.slice(found.index, found.index + 600)
+    assert.doesNotMatch(
+      listing,
+      /(the whole of|exactly the members of)\s+`?FollowUpEnqueueRefusalReason/,
+      `${site.file} says its ${decline.length} enqueue refusals are the whole of FollowUpEnqueueRefusalReason, `
+      + `which also carries ${preEnqueue.join(', ')} — refusals a CONNECTOR raises before the enqueue is reached`,
+    )
+    checked++
+  }
+  assert.equal(checked, PROSE_SITES.length, 'every prose site was read')
 })
 
 test('[round 5] and none of them lists the lost slot as one of the refusals', async () => {

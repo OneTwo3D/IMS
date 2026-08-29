@@ -1198,9 +1198,11 @@ async function recordEnqueueRestingOnAssertion(
  * cheaper to pin directly than through a full post-and-follow-up loop.
  *
  * o3d-peh1 — IT RETURNS WHETHER THE FOLLOW-UP IS ACTUALLY OWED, and every path out of it says so.
- * THREE of them decline deliberately, and they are the whole of `FollowUpEnqueueRefusalReason`: an
+ * THREE of them decline deliberately, and they are the whole of `FollowUpEnqueueDeclineReason`: an
  * ambiguous token history, a ledger that will not confirm the attempt is absent, and a revival
- * target with no attempt revision whose type the ledger probe does not speak for. A live row holding
+ * target with no attempt revision whose type the ledger probe does not speak for. They are NOT the
+ * whole of `FollowUpEnqueueRefusalReason`, which since o3d-batch-ret r6 also carries what a
+ * connector refuses BEFORE reaching this function — see `decideInvoicePaymentFollowUp`. A live row holding
  * the scope under a DIFFERENT token is NOT one of them: `resolveLostFollowUpRevival` either answers
  * FOLLOW_UPS_ENQUEUED or THROWS, and the `slot_lost` code that once said otherwise was removed as
  * unconstructible (o3d-peh1 r4). The first two used to write a WARNING and then return `void`, which
