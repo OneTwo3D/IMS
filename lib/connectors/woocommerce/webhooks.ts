@@ -413,6 +413,12 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
       // `drainWcOrderAdmissionRefusals` re-reads on the fifteen-minute sweep, plus the watermark
       // that rewinds the cursors on a widening. The queue is the guarantee; the rewind is the
       // cheap bulk case.
+      //
+      // AND `skipped` NOW MEANS THE ROW IS CONFIRMED THERE (o3d-batch-ret r14, Codex HIGH). The
+      // recorder used to swallow its own write failures, so this branch could ACK 200 with nothing
+      // written — WooCommerce would never send the order again and no drain could reach it. A
+      // refusal whose row cannot be read back no longer sets `skipped` at all: it comes back as an
+      // ordinary `success: false` and falls through to the 500 below, which is retryable.
       return NextResponse.json({
         ok: true,
         // A lookup, not a ternary chain: r13's third reason would otherwise have been ACKed under

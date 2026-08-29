@@ -1453,6 +1453,11 @@ export type ImportWcOrderResult = {
    * creating it would mean inventing the ledger, the FX rate and the bank account (r13).
    * `success` is true for all three: these are resolved decisions, not failures to retry. All
    * three leave a durable by-id row in the admission-refusal queue.
+   *
+   * SET ONLY WHEN THAT ROW IS CONFIRMED READABLE (r14). A refusal whose queue row could not be
+   * written or read back is NOT a resolved decision — it is an order about to disappear — so it
+   * returns `success: false` with no `skipped`, and every caller treats it as the retryable
+   * failure it is.
    */
   skipped?: WcAdmissionRefusalReason
   /**
@@ -1487,7 +1492,28 @@ async function refuseWcOrderCreate(
   options: ImportWcOrderOptions,
 ): Promise<ImportWcOrderResult> {
   const { recordWcOrderAdmissionRefusal } = await import('./order-admission')
-  await recordWcOrderAdmissionRefusal(wcOrder, reason, configured)
+  const recorded = await recordWcOrderAdmissionRefusal(wcOrder, reason, configured)
+  if (!recorded.persisted) {
+    // A REFUSAL THAT WAS NOT WRITTEN DOWN IS NOT A REFUSAL, IT IS A LOSS (o3d-batch-ret r14,
+    // Codex HIGH). Every one of the three facts below is a fact about a refusal that was RECORDED:
+    // the ACK is right because the drain owns the order, the watermark is the cheap bulk case for
+    // an order that has a row, and retiring the pending-FX row is safe because the by-id row
+    // replaces it. With no row, ACKing means WooCommerce never sends the order again, no drain can
+    // reach it, and IMS holds no record that it ever existed.
+    //
+    // So: no `skipped` and no `success`. `skipped` is the caller's signal for "a resolved decision,
+    // acknowledge it", and this is not resolved. The webhook pushes an ordinary failure, returns
+    // 500, and the shared inbox classifies that as RETRYABLE — WooCommerce redelivers the identical
+    // payload, the refusal is attempted again, and the write gets another chance. The pull sweeps
+    // record it as an error and do not advance their cursor; the pending-FX row is deliberately
+    // left PENDING below, so that queue retries it too.
+    return {
+      success: false,
+      error: `WooCommerce order ${wcOrder.id} was refused (${reason}), but the durable by-id refusal `
+        + `row could not be confirmed (${recorded.reason}). The refusal was NOT acknowledged, so the `
+        + 'order is redelivered rather than lost.',
+    }
+  }
   await noteWcOrderAdmissionRefusal(wcOrder.date_modified_gmt ?? wcOrder.date_created_gmt)
   if (options.pendingFxRetryLogId) {
     await markPendingFxRetryLogFailed(
