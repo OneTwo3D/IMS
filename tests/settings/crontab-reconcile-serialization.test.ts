@@ -1919,8 +1919,18 @@ if [ "$src" = "-" ]; then cat > '${CRONTAB_FILE}'; else cat "$src" > '${CRONTAB_
 `)
 chmodSync(join(CUTOVER_BIN, 'crontab'), 0o755)
 
-function cutoverProgram(body: string): string {
-  return [
+/**
+ * A bash program built out of the SHIPPED entrypoint's own functions.
+ *
+ * `extraFunctions` lifts further bodies by name; `mutate` is applied to the assembled prelude, and
+ * is how the tests below run a body with one line changed back to what it was before a fix — the
+ * route, executed, rather than a description of it.
+ */
+function cutoverProgram(
+  body: string,
+  opts: { extraFunctions?: string[]; mutate?: (src: string) => string } = {},
+): string {
+  const program = [
     'set -uo pipefail',
     `PATH='${CUTOVER_BIN}':"$PATH"`,
     'IMS_CRONTAB_LOCK_WAIT_SECONDS=30',
@@ -1940,8 +1950,12 @@ function cutoverProgram(body: string): string {
     shellFunctionFrom(INSTALL_SH, 'fence_cron', 'scripts/install.sh'),
     shellFunctionFrom(INSTALL_SH, 'unfence_cron_locked', 'scripts/install.sh'),
     shellFunctionFrom(INSTALL_SH, 'unfence_cron', 'scripts/install.sh'),
-    body,
+    ...(opts.extraFunctions ?? []).map((name) => shellFunctionFrom(INSTALL_SH, name, 'scripts/install.sh')),
   ].join('\n')
+  const prelude = opts.mutate ? opts.mutate(program) : program
+  assert.notEqual(prelude, opts.mutate ? program : null,
+    'a mutation that changes nothing would make the control it is a control for vacuous')
+  return `${prelude}\n${body}`
 }
 
 const CUTOVER_ORIGINAL = '# an operator line the cutover must put back\n*/5 * * * * /usr/bin/true\n'
@@ -2271,4 +2285,408 @@ exit 0
   assert.equal(strict.code, 9, `with the bypass down the same program must refuse:\n${strict.stdout}`)
   assert.match(strict.stderr, /before CRONTAB_LOCK_FILE was composed/,
     'and say that the entrypoint never composed a lock path, which is an ordering bug and not an operator error')
+})
+
+// ---------------------------------------------------------------------------
+// 20 — LOAD-BEARING: a schedule saved between the service becoming REACHABLE and the
+//      unfence completing SURVIVES the unfence
+//
+// Codex r27's first HIGH, and the reason it is NOT a repeat of section 15. There the lock was
+// missing and two writers interleaved; here the lock is present and working. The new service
+// accepted traffic sections ago, the operator saves a schedule, the application takes the SAME
+// flock, writes the block it projected from the committed settings rows, releases and reports
+// success — every one of those steps correct. The cutover then takes the lock in ITS turn and
+// installs the snapshot it took before the stop. Perfectly ordered. The row says enabled, nothing
+// is scheduled, and no error was raised anywhere.
+//
+// Exclusion establishes ORDER; it does not establish which content is TRUE. So the property under
+// test is not "the two did not overlap" — they did not, and it did not help — but "the write that
+// survives is the one the database backs".
+//
+// Route: backup-schedule.tsx -> saveBackupScheduleSettings -> reconcileCrontab, racing the shipped
+// unfence_cron out of scripts/install.sh. Both writers drive REAL `crontab` executables over one
+// real file, and the save is a real commit into the settings store.
+// ---------------------------------------------------------------------------
+
+/**
+ * The shipped unfence with its plan replaced by "install the snapshot" — the body as it stood
+ * before this round, expressed as a one-line edit to the shipped source so that a change to that
+ * line breaks the mutation rather than letting it drift into testing nothing.
+ */
+const blindRestoreMutation = (src: string): string => {
+  const before = 'plan_crontab_unfence "${backup}" "${current}" || return "${CRONTAB_UNFENCE_DIVERGED}"'
+  assert.ok(src.includes(before), 'scripts/install.sh must plan the unfence on one line')
+  return src.replace(before, 'CRON_UNFENCE_PLAN=snapshot; CRON_UNFENCE_TEXT="${backup}"')
+}
+
+async function saveInsideTheUnfenceWindow(mutate?: (src: string) => string) {
+  writeFileSync(CRONTAB_FILE, CUTOVER_ORIGINAL)
+  rmSync(CUTOVER_BACKUP, { force: true })
+
+  // The cutover fences, post-stop, exactly as it ships. Nothing is parked: this window is not a
+  // race inside one read-modify-write, it is the ordinary gap between two of them.
+  const fenced = await sh(cutoverProgram('fence_cron'))
+  assert.equal(fenced.code, 0, `the shipped fence must complete:\n${fenced.stderr}`)
+
+  // THE WINDOW. Migration done, new build serving, unfence not yet reached. The lock is free, so
+  // the application is NOT refused — it commits and writes, as it would on any ordinary day.
+  const saved = await saveBackup(true)
+  const installedInWindow = backupLineInstalled()
+
+  const restore = await sh(cutoverProgram(
+    'CRON_FENCED=true\nunfence_cron\necho "PLAN=${CRON_UNFENCE_PLAN}"', { mutate }))
+  return { saved, installedInWindow, restore, final: crontabText() }
+}
+
+test('[o3d-batch-ret] a schedule saved after the service is reachable SURVIVES the unfence', async () => {
+  const run = await saveInsideTheUnfenceWindow()
+
+  // Not vacuous: the save really did commit and its block really did reach the crontab while the
+  // fence was up. If either of these stopped being true the assertion below would pass for the
+  // wrong reason.
+  assert.deepEqual(run.saved, { status: 'saved' },
+    'the lock is free in this window, so the save must succeed — that is the premise of the defect')
+  assert.equal(run.installedInWindow, true,
+    'and its managed block must actually be in the crontab before the unfence runs')
+
+  assert.equal(run.restore.code, 0, `the unfence must complete:\n${run.restore.stderr}`)
+  assert.match(run.restore.stdout, /PLAN=merge/,
+    'the live crontab is not the fence projection of the backup, so the snapshot route must not be taken')
+
+  // THE PROPERTY. The schedule the operator was told was saved is still scheduled.
+  assert.equal(backupLineInstalled(), true,
+    'THE COMMITTED SAVE SURVIVES: a snapshot taken before the cutover must not overwrite it')
+
+  // …and the merge is not "keep the new, lose the old": the operator's own line is back, and back
+  // ACTIVE. The crontab holds no other record of it, so losing it would be the same defect facing
+  // the other way.
+  assert.match(run.final, /^\*\/5 \* \* \* \* \/usr\/bin\/true$/m,
+    'the operator line must be un-fenced, not left commented out')
+  assert.match(run.final, /^# an operator line the cutover must put back$/m)
+  assert.doesNotMatch(run.final, /#DEPLOY-FENCE#/,
+    'no fence mark may survive the unfence')
+})
+
+test('[o3d-batch-ret] MUTATION: a blind restore of the snapshot discards that save silently', async () => {
+  // THE ROUTE, RUN. One line of the shipped body reverted to "install the backup", which is what
+  // it did before this round and what deploy.sh and update.sh did at the same site. If this test
+  // ever reports the same outcome as the one above, the plan has stopped deciding anything.
+  const run = await saveInsideTheUnfenceWindow(blindRestoreMutation)
+
+  assert.deepEqual(run.saved, { status: 'saved' })
+  assert.equal(run.installedInWindow, true)
+  assert.equal(run.restore.code, 0, `the blind restore must complete:\n${run.restore.stderr}`)
+  assert.match(run.restore.stdout, /PLAN=snapshot/)
+
+  assert.equal(backupLineInstalled(), false,
+    'THE LOST UPDATE: the save returned `saved`, and the schedule it committed is not in the crontab')
+  assert.equal(run.final, CUTOVER_ORIGINAL,
+    'the pre-cutover snapshot went back verbatim, over a later, correct write')
+})
+
+// ---------------------------------------------------------------------------
+// 21 — LOAD-BEARING: a transition recovery whose crontab does not match the backup's
+//      projection REFUSES rather than restoring
+//
+// Codex r27's second HIGH: the same defect reached through the first-rollout recovery path. There
+// the predecessor is STILL SERVING and was built before this lock existed, so no exclusion of ours
+// ever reached it; the interrupted run's backup can be minutes or hours stale, and every schedule
+// saved since went into the live crontab and into no backup at all. No concurrent write is
+// required for this one — only elapsed time.
+//
+// A backup is safe to install blindly only if the world still matches what it was taken from, so
+// the recovery asks exactly that: is the live crontab the fence's own projection of this backup?
+// Equal, and the snapshot is provably current. Different, and this path REFUSES — it does not
+// merge, because unlike the unfence window the writer here need not have held the lock, need not
+// be the application, and the divergence is not bounded. Nothing has been stopped and nothing
+// migrated at this point, so refusing costs a re-run.
+//
+// Route: scripts/install.sh -> resume_from_interrupted_arming -> resume_restore_cron_locked.
+// ---------------------------------------------------------------------------
+
+/** The fence transform, asked of the SHIPPED library rather than restated here. */
+async function fenceProjectionOf(text: string): Promise<string> {
+  const quoted = `'${text.replace(/'/g, "'\\''")}'`
+  const { code, stdout, stderr } = await sh(
+    `set -uo pipefail\ndie(){ exit 1; }\nsource '${CRONTAB_LOCK_LIB}'\ncrontab_fence_projection ${quoted}`)
+  assert.equal(code, 0, stderr)
+  return stdout
+}
+
+/** What a reconciliation by the still-serving predecessor left behind, after the backup was taken. */
+const PREDECESSOR_BLOCK = '# --- OTI CRON START ---\n'
+  + '*/7 * * * * curl -H "Authorization: Bearer $CRON_SECRET" "$BASE_URL/backup"\n'
+  + '# --- OTI CRON END ---'
+
+const blindResumeMutation = (src: string): string => {
+  const before = '  if [[ "${current}" != "$(crontab_fence_projection "${backup}")" ]]; then'
+  assert.ok(src.includes(before),
+    'scripts/install.sh must compare the live crontab with the backup projection on one line')
+  return src.replace(before, '  if false; then')
+}
+
+async function resumeAgainst(live: string, mutate?: (src: string) => string) {
+  writeFileSync(CUTOVER_BACKUP, `${CUTOVER_ORIGINAL.replace(/\n$/, '')}\n`)
+  writeFileSync(CRONTAB_FILE, live)
+  // The SHIPPED call shape: a failure here is fatal to the run, which is what makes "refuses"
+  // different from "skips". `die` is the harness's, and it exits 9.
+  const run = await sh(cutoverProgram(
+    'CRON_FENCED=true\n'
+    + 'with_crontab_lock resume_restore_cron_locked || die "the crontab could not be restored.'
+    + '${RESUME_CRON_DIVERGED:+ THE REASON IS NOT THE LOCK: }${RESUME_CRON_DIVERGED}"\n'
+    + 'echo RESTORED',
+    { extraFunctions: ['resume_restore_cron_locked'], mutate }))
+  return { run, final: crontabText() }
+}
+
+test('[o3d-batch-ret] a transition recovery REFUSES a backup whose world has moved', async () => {
+  const projection = await fenceProjectionOf(CUTOVER_ORIGINAL.replace(/\n$/, ''))
+
+  // CONTROL FIRST, so the refusal below is a decision and not a function that refuses everything.
+  // Nothing wrote since the interrupted run fenced: the live crontab IS the projection, and the
+  // backup goes back.
+  const untouched = await resumeAgainst(projection)
+  assert.equal(untouched.run.code, 0, untouched.run.stderr)
+  assert.match(untouched.run.stdout, /RESTORED/)
+  assert.equal(untouched.final, CUTOVER_ORIGINAL,
+    'an unmoved world restores exactly what the interrupted run had')
+  assert.equal(existsSync(CUTOVER_BACKUP), false, 'and the backup it consumed is gone')
+
+  // THE FINDING. The predecessor — still serving, never party to this lock — reconciled after the
+  // backup was taken. The live crontab is no longer the projection of it.
+  const moved = await resumeAgainst(`${projection}${PREDECESSOR_BLOCK}\n`)
+  assert.equal(moved.run.code, 9,
+    'a recovery that cannot prove the snapshot is current must FAIL, so its caller dies')
+  assert.doesNotMatch(moved.run.stdout, /RESTORED/)
+  assert.match(moved.run.stderr, /THE REASON IS NOT THE LOCK: the live crontab is not the fenced projection/,
+    'and the operator is told it was the crontab that moved, not a lock that was busy')
+  assert.equal(moved.final, `${projection}${PREDECESSOR_BLOCK}\n`,
+    'and it must leave the crontab EXACTLY as it found it — refusing means writing nothing')
+  assert.equal(existsSync(CUTOVER_BACKUP), true,
+    'the backup stays on disk: the operator is told to settle it, so it must still be there')
+
+  // …and the SHIPPED caller, in all three entrypoints, distinguishes this refusal from a lock it
+  // could not take — the two have different remedies and the message must not merge them.
+  for (const [name, src] of SHELL_ENTRYPOINTS) {
+    assert.match(src, /with_crontab_lock resume_restore_cron_locked \|\| die/,
+      `${name} must die when the interrupted arming's crontab cannot be put back`)
+    assert.match(src, /\$\{RESUME_CRON_DIVERGED:\+ THE REASON IS NOT THE LOCK: \}\$\{RESUME_CRON_DIVERGED\}/,
+      `${name} must say WHICH refusal this is`)
+  }
+})
+
+test('[o3d-batch-ret] MUTATION: without that comparison the recovery restores over the later write', async () => {
+  // THE ROUTE, RUN. The comparison short-circuited to false — the shipped body before this round,
+  // which installed the backup wholesale whatever the crontab had become.
+  const projection = await fenceProjectionOf(CUTOVER_ORIGINAL.replace(/\n$/, ''))
+  const moved = await resumeAgainst(`${projection}${PREDECESSOR_BLOCK}\n`, blindResumeMutation)
+
+  assert.equal(moved.run.code, 0, moved.run.stderr)
+  assert.match(moved.run.stdout, /RESTORED/)
+  assert.equal(moved.final, CUTOVER_ORIGINAL,
+    'THE SILENT LOSS: the predecessor block committed after the backup was taken is simply gone')
+  assert.doesNotMatch(moved.final, /OTI CRON START/)
+})
+
+// ---------------------------------------------------------------------------
+// 22 — LOAD-BEARING: a missing or failing socket tool REFUSES rather than fencing
+//
+// Codex r27's third HIGH, and it is about code this branch added last round. The cutover fence
+// moved below the stop because the only exclusion that reaches a predecessor built before the
+// shared lock is that it is NOT RUNNING — so "nothing is serving" stopped being a remark and
+// became the premise the fence rests on. The proof of that premise then warned when `ss` was
+// missing and fenced anyway, and its `ss … | grep -q` pipeline could not tell an `ss` that
+// found nothing from an `ss` that failed: both yield no output, the grep fails to match, and an
+// unanswerable question is recorded as the answer "nobody is there".
+//
+// Absence of evidence read as evidence of absence — the shape this branch has closed at the
+// responder attribution, the listener census and the marker sentinel.
+//
+// Route: scripts/update.sh's post-stop drain (and the identical sites in install.sh and
+// deploy.sh), through the shared require_port_drained.
+// ---------------------------------------------------------------------------
+
+const DRAIN_BIN = join(HARNESS, 'drain-bin')
+const DRAIN_EMPTY_PATH = join(HARNESS, 'drain-nothing')
+mkdirSync(DRAIN_BIN, { recursive: true })
+mkdirSync(DRAIN_EMPTY_PATH, { recursive: true })
+
+/** A doubled `ss`, because a real one cannot be made to fail on demand. */
+function writeSs(body: string) {
+  writeFileSync(join(DRAIN_BIN, 'ss'), `#!/bin/sh\n${body}\n`)
+  chmodSync(join(DRAIN_BIN, 'ss'), 0o755)
+}
+const SS_HEADER = 'State  Recv-Q Send-Q Local Address:Port  Peer Address:Port'
+
+function drainProgram(port: string, opts: { path?: string; legacy?: boolean } = {}): string {
+  const probe = opts.legacy
+    // The pipeline the shipped proof REPLACES, kept here as the mutation route rather than as a
+    // description of one. Both halves of the old shape are present: the `command -v` fall-through
+    // and the single grep that reads a failed query as an empty socket listing.
+    ? `if command -v ss >/dev/null 2>&1; then
+  if ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${port}\\$"; then echo "REFUSED=bound"; else echo DRAINED; fi
+else
+  echo DRAINED
+fi`
+    : `if require_port_drained '${port}'; then echo DRAINED; else echo "REFUSED=\${PORT_DRAIN_REASON}"; fi`
+  return [
+    'set -uo pipefail',
+    `PATH='${opts.path ?? `${DRAIN_BIN}:${process.env.PATH}`}'`,
+    'IMS_PORT_DRAIN_WAIT_SECONDS=0',
+    'die(){ echo "DIE: $*" >&2; exit 9; }',
+    `source '${CRONTAB_LOCK_LIB}'`,
+    probe,
+  ].join('\n')
+}
+
+test('[o3d-batch-ret] a drain that could not be PROVED refuses, in every way of not knowing', async () => {
+  // CONTROL FIRST. A census that ran and found the port free must say so, or every refusal below
+  // is a function that refuses everything.
+  writeSs(`echo '${SS_HEADER}'\nprintf 'LISTEN 0 511 0.0.0.0:5544 0.0.0.0:*\\n'`)
+  const free = await sh(drainProgram('3000'))
+  assert.match(free.stdout, /^DRAINED$/m,
+    'a census that ran and saw nothing on the port is the one case that may proceed')
+
+  // …and it is looking at the port it was given.
+  const bound = await sh(drainProgram('5544'))
+  assert.match(bound.stdout, /REFUSED=1 socket\(s\) are still listening on :5544/)
+
+  // (a) NO `ss` AT ALL. The premise cannot be established on this host, so the run stops.
+  const missing = await sh(drainProgram('3000', { path: DRAIN_EMPTY_PATH }))
+  assert.match(missing.stdout, /REFUSED=`ss` is not installed/,
+    'a missing tool is not a proof of absence')
+
+  // (b) `ss` PRESENT AND FAILING. The old pipeline could not see this at all.
+  writeSs('exit 2')
+  const failed = await sh(drainProgram('3000'))
+  assert.match(failed.stdout, /REFUSED=`ss -ltn` exited 2, so the socket census FAILED/)
+
+  // (c) `ss` EXITING 0 WITH NOTHING. It always prints its header; silence means it did not do what
+  // it was asked, whatever it exited with.
+  writeSs('exit 0')
+  const silent = await sh(drainProgram('3000'))
+  assert.match(silent.stdout, /REFUSED=`ss -ltn` exited 0 but produced no output at all/)
+
+  // (d) NO PORT RESOLVED. Nothing to census, so nothing is proved.
+  writeSs(`echo '${SS_HEADER}'`)
+  const unresolved = await sh(drainProgram(''))
+  assert.match(unresolved.stdout, /REFUSED=the application port could not be resolved/)
+})
+
+test('[o3d-batch-ret] MUTATION: the pipeline this replaced calls all three of those DRAINED', async () => {
+  // THE ROUTE, RUN. Same three conditions, same doubled `ss`, through the shape the shipped proof
+  // replaced. Each one reports the port drained — which is what then fenced the crontab and
+  // migrated.
+  const missing = await sh(drainProgram('3000', { path: DRAIN_EMPTY_PATH, legacy: true }))
+  assert.match(missing.stdout, /^DRAINED$/m, 'the old shape fell straight through a missing `ss`')
+
+  writeSs('exit 2')
+  const failed = await sh(drainProgram('3000', { legacy: true }))
+  assert.match(failed.stdout, /^DRAINED$/m, 'and read a failed query as an empty socket listing')
+
+  writeSs('exit 0')
+  const silent = await sh(drainProgram('3000', { legacy: true }))
+  assert.match(silent.stdout, /^DRAINED$/m, 'and read silence the same way')
+
+  // CONTROL — the old shape did detect a listener it could actually see, so the three above are
+  // its blind spots and not a probe that never refuses.
+  writeSs(`echo '${SS_HEADER}'\nprintf 'LISTEN 0 511 0.0.0.0:5544 0.0.0.0:*\\n'`)
+  const bound = await sh(drainProgram('5544', { legacy: true }))
+  assert.match(bound.stdout, /REFUSED=bound/)
+})
+
+// ---------------------------------------------------------------------------
+// 23 — the sweep: ALL THREE entrypoints prove the drain, fatally, before they fence
+// ---------------------------------------------------------------------------
+
+/**
+ * The rule, as a function so the mutation control below can run the SAME logic over a mutated
+ * source. Reports what is wrong with one entrypoint's drain proof, or an empty list.
+ */
+function drainProofFaultsIn(name: string, src: string): string[] {
+  const faults: string[] = []
+  const lines = src.split('\n')
+
+  const calls = lines
+    .map((line, index) => ({ line, index }))
+    .filter(({ line }) => /^\s*require_port_drained\b/.test(line))
+  if (calls.length !== 1) {
+    faults.push(`${name}: expected exactly one require_port_drained call, found ${calls.length}`)
+    return faults
+  }
+  // FATAL, not advisory. `|| die` on the same line, which is how every other refusal in these
+  // scripts is spelled.
+  if (!/\|\|\s*die\b/.test(calls[0].line) && !/\|\|\s*die\s*\\$/.test(calls[0].line)) {
+    faults.push(`${name}: the drain proof does not die on failure: ${calls[0].line.trim()}`)
+  }
+  // BEFORE the fence, because the fence is what rests on it. The MAIN-FLOW fence: the other
+  // `fence_cron` in each of these files is the nested re-fence inside adopt_cron_fence_locked,
+  // which runs on an already-adopted fence long before this section and is not what the drain is
+  // the premise for. Classified by enclosing function rather than by position, so moving either
+  // one shows up here.
+  const fences = lines
+    .map((line, index) => ({ line, index }))
+    .filter(({ line }) => /^\s*fence_cron$/.test(line))
+    .filter(({ index }) => enclosingFunctionInSource(lines, index + 1) === '(top level)')
+  if (fences.length !== 1) {
+    faults.push(`${name}: expected exactly one main-flow fence_cron, found ${fences.length}`)
+  } else if (fences[0].index < calls[0].index) {
+    faults.push(`${name}: fence_cron runs before the drain is proved`)
+  }
+
+  // AND NO SURVIVING FAIL-OPEN PIPELINE. A drain expressed as `ss … | grep -q` cannot tell a query
+  // that failed from a port that is free, wherever it is put.
+  lines.forEach((line, index) => {
+    if (line.trimStart().startsWith('#')) return
+    if (/\bss\s+-ltn\b/.test(line) && /grep\s+-q/.test(line)) {
+      faults.push(`${name}:${index + 1}: a fail-open \`ss -ltn | grep -q\` drain remains`)
+    }
+  })
+  return faults
+}
+
+test('[o3d-batch-ret] install, deploy and update all PROVE the drain before fencing', () => {
+  const faults = SHELL_ENTRYPOINTS.flatMap(([name, src]) => drainProofFaultsIn(name, src))
+  assert.deepEqual(faults, [],
+    'every entrypoint must prove the drain fatally, before its fence: ' + JSON.stringify(faults))
+
+  // NOT VACUOUS: the walk really did find a call and a fence in each of the three.
+  for (const [name, src] of SHELL_ENTRYPOINTS) {
+    assert.match(src, /^\s*require_port_drained /m, `${name} must call the shared drain proof`)
+    const mainFlowFences = src.split('\n')
+      .map((line, index) => ({ line, index }))
+      .filter(({ line }) => /^\s*fence_cron$/.test(line))
+      .filter(({ index }) => enclosingFunctionInSource(src.split('\n'), index + 1) === '(top level)')
+    assert.equal(mainFlowFences.length, 1, `${name} must still fence in its main flow`)
+  }
+  // And the proof lives in ONE place, so a fourth entrypoint cannot get it subtly wrong.
+  assert.match(CRONTAB_LOCK_LIB_SRC, /^require_port_drained\(\) \{$/m)
+  for (const [name, src] of SHELL_ENTRYPOINTS) {
+    assert.doesNotMatch(src, /^require_port_drained\(\) \{$/m,
+      `${name} must use the shared proof, not restate it`)
+  }
+})
+
+test('[o3d-batch-ret] MUTATION: the sweep rejects each way of putting the fail-open back', () => {
+  const base = UPDATE_SH
+  const call = base.split('\n').find((l) => /^\s*require_port_drained\b/.test(l))
+  assert.ok(call, 'scripts/update.sh must call require_port_drained')
+
+  const placements: Array<[string, string]> = [
+    ['a drain proof that only warns',
+      base.replace(call!, call!.replace(/\|\| die \\?$/, '|| warn "could not check" \\'))],
+    ['the fence moved above the proof',
+      base.replace(call!, 'fence_cron\n' + call!)],
+    ['an ss|grep -q pipeline put back somewhere else',
+      base + '\nif ss -ltn 2>/dev/null | awk \'{print $4}\' | grep -q ":${APP_PORT}\\$"; then :; fi\n'],
+    ['the call removed altogether', base.replace(call!, '  true \\')],
+  ]
+  for (const [what, mutated] of placements) {
+    assert.notEqual(mutated, base, `the ${what} mutation must change the source`)
+    assert.notDeepEqual(drainProofFaultsIn('scripts/update.sh', mutated), [],
+      `the sweep must reject ${what}`)
+  }
+
+  // CONTROL — the unmutated source comes back clean through the very same function.
+  assert.deepEqual(drainProofFaultsIn('scripts/update.sh', base), [])
 })
