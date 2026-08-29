@@ -841,14 +841,15 @@ test('[o3d-batch-ret r10] a `_registerPayment` that cannot be READ is refused du
   //
   // BOTH DIRECTIONS ARE WALKED because truthiness fails both ways and a guard written only against
   // `null` would pass a test that only drove falsy values.
-  for (const { what, flag, detail } of [
+  const flags: Array<{ what: string; flag: Record<string, unknown>; detail: RegExp }> = [
     { what: 'a present null — something wrote nothing into it', flag: { _registerPayment: null }, detail: /`_registerPayment` is null, which is neither `true` nor `false`/ },
     { what: 'a present 0', flag: { _registerPayment: 0 }, detail: /`_registerPayment` is 0, which is neither `true` nor `false`/ },
     { what: 'a present empty string', flag: { _registerPayment: '' }, detail: /`_registerPayment` is the string "", which is neither `true` nor `false`/ },
     { what: 'a key present holding an explicit `undefined` — present, and not absent', flag: { _registerPayment: undefined }, detail: /`_registerPayment` is present and holds `undefined`, which is neither `true` nor `false`/ },
     { what: 'the MALFORMED TRUTHY string "false", which truthiness let INTO payment registration', flag: { _registerPayment: 'false' }, detail: /`_registerPayment` is the string "false", which is neither `true` nor `false`/ },
     { what: 'a present 1 — the other truthy malformed value', flag: { _registerPayment: 1 }, detail: /`_registerPayment` is 1, which is neither `true` nor `false`/ },
-  ]) {
+  ]
+  for (const { what, flag, detail } of flags) {
     reset({ card: 'QBO-BANK-1' })
     store = createSyncLogStore([syncLogRow({
       id: 'entry-invoice',
@@ -929,11 +930,12 @@ test('[o3d-batch-ret r10] CONTROL: ABSENT and literal `false` still settle, and 
   // MUTATIONS THAT KILL IT: make `payloadPaymentRequested` refuse on an ABSENT key — arm 1 refuses;
   // drop the `value === false` arm so only `true` is readable — arm 2 refuses; make it answer
   // `{ value: false }` for a literal `true` — arm 3 queues no INVOICE_PAYMENT.
-  for (const { what, flag, expected, amount } of [
+  const readable: Array<{ what: string; flag: Record<string, unknown>; expected: string[]; amount: number | null }> = [
     { what: 'no `_registerPayment` key at all', flag: {}, expected: ['INVOICE_PDF'], amount: null },
     { what: 'a literal `false`', flag: { _registerPayment: false }, expected: ['INVOICE_PDF'], amount: null },
     { what: 'a literal `true`', flag: { _registerPayment: true }, expected: ['INVOICE_PAYMENT', 'INVOICE_PDF'], amount: 120 },
-  ]) {
+  ]
+  for (const { what, flag, expected, amount } of readable) {
     reset({ card: 'QBO-BANK-1' })
     store = createSyncLogStore([syncLogRow({
       id: 'entry-invoice',
@@ -996,7 +998,7 @@ test('[o3d-batch-ret r10] every OTHER field this path reads is refused when pres
   // null arms and the `''` currency then queue an INVOICE_PAYMENT against the GBP account and
   // RELEASE, the `'20/08/2026'` arm queues one dated "20/08/2026", and the numeric-date arm throws
   // instead of refusing. Every arm fails on `followUpTypes` or on the refusal count.
-  for (const { what, field, detail } of [
+  const fields: Array<{ what: string; field: Record<string, unknown>; detail: RegExp }> = [
     { what: 'a present `_paymentMethod` holding null', field: { _paymentMethod: null }, detail: /`_paymentMethod` is null, which is not a payment-method string/ },
     { what: 'a `_paymentMethod` that is not a string at all', field: { _paymentMethod: 7 }, detail: /`_paymentMethod` is 7, which is not a payment-method string/ },
     { what: 'a present `currency` holding null — the arm that used to settle into the STERLING account', field: { currency: null }, detail: /`currency` is null, which is not a currency code/ },
@@ -1004,7 +1006,8 @@ test('[o3d-batch-ret r10] every OTHER field this path reads is refused when pres
     { what: 'a present `_paymentDate` holding null', field: { _paymentDate: null }, detail: /`_paymentDate` is null, which is not a date string/ },
     { what: 'a `_paymentDate` that is a NUMBER — the arm that used to throw a TypeError after the post', field: { _paymentDate: 20260820 }, detail: /`_paymentDate` is 20260820, which is not a date string/ },
     { what: 'a `_paymentDate` string that is not a ledger date', field: { _paymentDate: '20/08/2026' }, detail: /`_paymentDate` is the string "20\/08\/2026", whose first ten characters are not a YYYY-MM-DD date/ },
-  ]) {
+  ]
+  for (const { what, field, detail } of fields) {
     reset({ card: 'QBO-BANK-1' })
     store = createSyncLogStore([syncLogRow({
       id: 'entry-invoice',
@@ -1073,7 +1076,7 @@ test('[o3d-batch-ret r10] CONTROL: an ABSENT method, currency or date still take
   // `payloadPaymentDate` answer `unreadableField(...)` for an ABSENT key — each arm then produces a
   // `payment_payload_unreadable` refusal instead of the outcome asserted here.
   const today = new Date().toISOString().slice(0, 10)
-  for (const { what, drop, expected, assertRow } of [
+  const absences: Array<{ what: string; drop: string; expected: string[]; assertRow: Record<string, string> | null }> = [
     {
       what: 'no `_paymentMethod` key at all',
       drop: '_paymentMethod',
@@ -1092,7 +1095,8 @@ test('[o3d-batch-ret r10] CONTROL: an ABSENT method, currency or date still take
       expected: ['INVOICE_PAYMENT', 'INVOICE_PDF'],
       assertRow: { paymentDate: today },
     },
-  ]) {
+  ]
+  for (const { what, drop, expected, assertRow } of absences) {
     reset({ card: 'QBO-BANK-1' })
     const payload: Record<string, unknown> = {
       currency: 'GBP',
