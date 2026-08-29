@@ -2567,16 +2567,39 @@ db_ca_path_is_open_to_every_uid() {
 # and the private key is published world-readable to a well-known path before TLS ever parses it.
 # An arbitrary-file-disclosure primitive, reachable by a typo, with root's read privilege behind it.
 #
-# THE ACCEPT-LIST, AND WHY IT IS COMPLETE. DB_SSLROOTCERT is handed to three readers and all three
-# do the same thing with it: node-postgres passes it as `ssl.ca` to Node's tls, which hands it to
-# OpenSSL's X509_STORE; libpq passes it to SSL_CTX_load_verify_locations(); psql IS libpq. Every one
-# of those parses the file as a sequence of PEM X.509 CERTIFICATEs and reads NOTHING else out of it
-# — a revocation list is a different parameter (`sslcrl`/`sslcrldir`) against a different store, and
-# a private key has no reader here at all. So the set of block types this file may legitimately
-# contain is ONE: `CERTIFICATE`. That is not a denylist with the dangerous labels enumerated — the
+# THE ACCEPT-LIST, AND HOW IT WAS ESTABLISHED (o3d-2sm1.5 r48, Codex MEDIUM). DB_SSLROOTCERT is
+# handed to three readers and all three end in the same place: node-postgres passes it as `ssl.ca`
+# to Node's tls, which hands it to OpenSSL's X509_STORE; libpq passes it to
+# SSL_CTX_load_verify_locations(); psql IS libpq. That store loads a file with
+# PEM_read_bio_X509_AUX(), NOT PEM_read_bio_X509() — and the two do not accept the same armour.
+#
+# r47 asserted the accepted set was the single label `CERTIFICATE` from the same reasoning, and the
+# reasoning was right about WHICH READER to ask and wrong about its ANSWER, which is the failure a
+# list arrived at by argument keeps having. So r48 MEASURED it instead: every PEM label OpenSSL 3.x
+# defines a PEM_STRING_* constant for, wrapped around one real CA's DER, offered to `openssl verify
+# -CAfile` and to a Node `tls` client verifying a real handshake. EXACTLY THREE of the twenty-nine
+# are consumed by either reader, and the two readers agree on all twenty-nine:
+#
+#   CERTIFICATE  ·  X509 CERTIFICATE  ·  TRUSTED CERTIFICATE
+#
+# Everything else — `CERTIFICATE PAIR`, `X509 CRL`, `PKCS7`, `ATTRIBUTE CERTIFICATE`, every key and
+# every parameter block — is skipped by the store as if it were not in the file. A revocation list
+# is a different parameter (`sslcrl`/`sslcrldir`) against a different store, and a private key has no
+# reader here at all. So this is still not a denylist with the dangerous labels enumerated — the
 # shape that keeps failing on this branch, because the next dangerous label is always the one nobody
-# listed. It is the complete list of what any consumer of this file will ever look at, and
-# everything outside it is refused whether or not this script has heard of it.
+# listed. It is the measured list of what the readers of this file actually consume, and everything
+# outside it is refused whether or not this script has heard of it.
+#
+# AND `TRUSTED CERTIFICATE` IS NOT MERELY ANOTHER SPELLING. Its X509_AUX block carries trust and
+# reject OIDs that RESTRICT what the anchor may vouch for, and the restriction is live in both
+# readers: a CA published with `-addreject serverAuth` makes `openssl verify -purpose sslserver`
+# fail with error 28 (certificate rejected) and makes Node's TLS client fail with INVALID_PURPOSE.
+# Re-encoding it with plain `openssl x509 -outform PEM` STRIPS the aux — measured, and the stripped
+# file then verifies the very leaf the operator's anchor was configured to refuse. Accepting the
+# label while re-encoding it that way would be worse than refusing it: it would silently WIDEN a
+# deliberately narrowed trust root. `-trustout` preserves the aux byte-identically (the re-encoding
+# of a re-encoding has the same sha256 as the source), so a trusted block is re-encoded with it and
+# the published block is then CHECKED to still be a `TRUSTED CERTIFICATE` before it is kept.
 #
 # AND IT IS PARSED, NOT MATCHED. `grep -q 'PRIVATE KEY'` would be the denylist again, and it is also
 # wrong about its own subject: a block LABELLED `CERTIFICATE` carrying key material would pass it.
@@ -2591,10 +2614,28 @@ db_ca_path_is_open_to_every_uid() {
 # point leaves that temporary file to be removed: NOTHING IS PUBLISHED unless the whole source
 # parsed. A refusal mid-file — a bundle whose second block is a key — therefore discloses nothing,
 # which is the difference between this and rejecting the file after it has been copied out.
-DB_CA_ACCEPTED_PEM_LABEL="CERTIFICATE"
+# The measured set, for the refusals to quote. db_ca_pem_label_encoding() below is the GATE; this is
+# only how a refusal spells the gate out to an operator, and a regression asserts the two agree over
+# every PEM label OpenSSL defines rather than over the three someone remembered to type here.
+DB_CA_ACCEPTED_PEM_LABELS="CERTIFICATE, X509 CERTIFICATE, TRUSTED CERTIFICATE"
+
+# WHICH RE-ENCODING A LABEL GETS, or non-zero for a label no reader of this file consumes.
+#
+# The two answers are not interchangeable. `plain` drops any X509_AUX block, which is right for the
+# two labels that cannot carry one and wrong for the one that can; `trusted` keeps it. This is a
+# function rather than a list because the accept decision and the re-encoding decision are the SAME
+# decision — a label admitted without an encoding chosen for it is the widening defect.
+db_ca_pem_label_encoding() {
+  case "$1" in
+    'CERTIFICATE'|'X509 CERTIFICATE') printf 'plain' ;;
+    'TRUSTED CERTIFICATE') printf 'trusted' ;;
+    *) return 1 ;;
+  esac
+}
 
 normalize_db_ca_pem() {
   local source="$1" dest="$2" line label block="" in_block=false certificates=0
+  local open_label="" encoding="" decoded=""
   command -v openssl >/dev/null 2>&1 || {
     error "openssl is not on this host's PATH, and the database CA is published by PARSING the operator's file rather than by copying its bytes. Without a parser this script cannot tell a certificate from a private key, and copying unparsed bytes to a world-readable path is the defect this check exists to close. Install openssl and re-run."
     return 1
@@ -2608,14 +2649,15 @@ normalize_db_ca_pem() {
         label="${line#-----BEGIN }"
         label="${label%-----}"
         if ${in_block}; then
-          error "${source} opens a '${label}' PEM block while a '${DB_CA_ACCEPTED_PEM_LABEL}' block is still open. That is not a file any TLS client can parse, and this installer will not guess where one block was meant to end and the next begin."
+          error "${source} opens a '${label}' PEM block while a '${open_label}' block is still open. That is not a file any TLS client can parse, and this installer will not guess where one block was meant to end and the next begin."
           return 1
         fi
-        if [[ "${label}" != "${DB_CA_ACCEPTED_PEM_LABEL}" ]]; then
-          error "${source} contains a '${label}' PEM block. A database trust root is a bundle of X.509 CERTIFICATEs and nothing else — that is all node-postgres, libpq and psql read out of the file DB_SSLROOTCERT names — and this file is published WORLD-READABLE so all three accounts can open it. A '${label}' block is either private material that must never be published or something no reader of this file will use, so it is refused rather than copied. NOTHING HAS BEEN PUBLISHED: if this is a combined key-and-certificate file, extract the certificates into a file of their own and name that instead."
+        encoding="$(db_ca_pem_label_encoding "${label}")" || {
+          error "${source} contains a '${label}' PEM block. A database trust root is a bundle of X.509 certificates and nothing else — the OpenSSL verification store behind all three readers of this file (node-postgres via Node's tls, libpq, and psql, which IS libpq) consumes exactly these labels and skips every other one: ${DB_CA_ACCEPTED_PEM_LABELS}. This file is published WORLD-READABLE so all three accounts can open it, so a '${label}' block is either private material that must never be published or something no reader of this file will use, and it is refused rather than copied. NOTHING HAS BEEN PUBLISHED: if this is a combined key-and-certificate file, extract the certificates into a file of their own and name that instead."
           return 1
-        fi
+        }
         in_block=true
+        open_label="${label}"
         block="${line}"
         ;;
       '-----END '*'-----')
@@ -2625,18 +2667,35 @@ normalize_db_ca_pem() {
           error "${source} closes a '${label}' PEM block that was never opened. A truncated or spliced certificate file is refused rather than partly published."
           return 1
         }
-        [[ "${label}" == "${DB_CA_ACCEPTED_PEM_LABEL}" ]] || {
-          error "${source} opens a '${DB_CA_ACCEPTED_PEM_LABEL}' PEM block and closes it as '${label}'. The armour disagrees with itself, so nothing here can say what the block holds; it is refused rather than published to a world-readable path."
+        [[ "${label}" == "${open_label}" ]] || {
+          error "${source} opens a '${open_label}' PEM block and closes it as '${label}'. The armour disagrees with itself, so nothing here can say what the block holds; it is refused rather than published to a world-readable path."
           return 1
         }
         block="${block}"$'\n'"${line}"
         # THE PARSE. openssl decodes the base64 and reads the DER as an X.509 certificate; a block
         # that is not one fails here whatever its label claimed. `-outform PEM` is what makes the
-        # published bytes openssl's re-encoding of the certificate rather than the source's bytes.
-        printf '%s\n' "${block}" | openssl x509 -inform PEM -outform PEM >> "${dest}" 2>/dev/null || {
-          error "A '${DB_CA_ACCEPTED_PEM_LABEL}' block in ${source} is not an X.509 certificate — openssl could not parse it. The label on a PEM block is not evidence about its contents, which is why this installer decodes every block instead of reading its armour, and a block it cannot decode is not published."
+        # published bytes openssl's re-encoding of the certificate rather than the source's bytes,
+        # and `-trustout` — for the one label that can carry them — is what makes the re-encoding
+        # keep the X509_AUX trust and reject OIDs instead of quietly dropping them.
+        if [[ "${encoding}" == "trusted" ]]; then
+          decoded="$(printf '%s\n' "${block}" | openssl x509 -inform PEM -outform PEM -trustout 2>/dev/null)" || decoded=""
+        else
+          decoded="$(printf '%s\n' "${block}" | openssl x509 -inform PEM -outform PEM 2>/dev/null)" || decoded=""
+        fi
+        [[ -n "${decoded}" ]] || {
+          error "A '${open_label}' block in ${source} is not an X.509 certificate — openssl could not parse it. The label on a PEM block is not evidence about its contents, which is why this installer decodes every block instead of reading its armour, and a block it cannot decode is not published."
           return 1
         }
+        # THE TRUST METADATA HAS TO HAVE SURVIVED. A 'TRUSTED CERTIFICATE' re-encoded as a plain one
+        # is a DIFFERENT trust anchor: the aux block's reject OIDs are what stop it vouching for
+        # purposes the operator excluded, and both readers enforce them. If this openssl emitted
+        # anything but a trusted block the anchor would be published WIDER than the one supplied, so
+        # it is refused instead — publishing nothing is recoverable, silently widening is not.
+        if [[ "${encoding}" == "trusted" && "${decoded}" != '-----BEGIN TRUSTED CERTIFICATE-----'* ]]; then
+          error "A 'TRUSTED CERTIFICATE' block in ${source} did not survive re-encoding as one — this openssl dropped the X509_AUX trust and reject settings that block carries. Publishing it would install a trust anchor WIDER than the one you supplied, vouching for purposes your CA file excludes, so nothing has been published."
+          return 1
+        fi
+        printf '%s\n' "${decoded}" >> "${dest}" || return 1
         certificates=$((certificates + 1))
         in_block=false
         block=""
@@ -2650,7 +2709,7 @@ normalize_db_ca_pem() {
     esac
   done < "${source}"
   ${in_block} && {
-    error "${source} ends inside an unterminated '${DB_CA_ACCEPTED_PEM_LABEL}' block. A truncated certificate file is refused rather than partly published."
+    error "${source} ends inside an unterminated '${open_label}' block. A truncated certificate file is refused rather than partly published."
     return 1
   }
   [[ "${certificates}" -gt 0 ]] || {
@@ -2666,6 +2725,26 @@ normalize_db_ca_pem() {
 # without passing that validation again.
 db_ca_generation_file() {
   printf '%s/%s%s%s' "${DB_CA_PUBLISH_DIR}" "${DB_CA_GENERATION_PREFIX}" "$1" "${DB_CA_GENERATION_SUFFIX}"
+}
+
+# THE INVERSE, and the only thing allowed to decide that a file is a generation (o3d-2sm1.5 r48,
+# Codex MEDIUM). Prints the digest a path's BASENAME claims, or returns non-zero if the basename is
+# not one db_ca_generation_file() could have produced.
+#
+# `db-ca-*.crt` is not that test. It matches `db-ca-manual.crt`, `db-ca-old.crt`, `db-ca-2024.crt` —
+# the names an operator reaches for — and prune_db_ca_generations() would then count them as
+# generations and DELETE them, which is the opposite of the guarantee the prune advertises. The
+# generation name is not a convention this publisher follows loosely: it is 64 lowercase hex
+# characters produced by sha256sum, and nothing else is one.
+db_ca_generation_digest() {
+  local name="${1##*/}" rest
+  rest="${name#"${DB_CA_GENERATION_PREFIX}"}"
+  [[ "${rest}" != "${name}" ]] || return 1
+  name="${rest}"
+  rest="${name%"${DB_CA_GENERATION_SUFFIX}"}"
+  [[ "${rest}" != "${name}" ]] || return 1
+  [[ "${rest}" =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s' "${rest}"
 }
 
 # Publish the CERTIFICATES in "$1" to the generation their own bytes name, durably, with ownership
@@ -2722,6 +2801,14 @@ publish_db_ca() {
 # check before they need it. Of the rest, the ${DB_CA_GENERATIONS_RETAINED} most recently modified
 # stay and the older ones go.
 #
+# AND IT ONLY EVER SEES GENERATIONS (r48, Codex MEDIUM). A `db-ca-*.crt` glob is not a test for
+# "a file this publisher wrote": it matches `db-ca-manual.crt` and every other name an operator
+# reaches for, and this function DELETES. So membership is decided by db_ca_generation_digest() —
+# the exact inverse of db_ca_generation_file(), 64 lowercase hex characters and nothing else — and
+# then by re-hashing the file to check the digest its own name claims. Anything that fails either
+# test is not deleted AND does not count against the retention window; the glob below survives only
+# as a cheap prefilter, so the decision is never made by a wildcard.
+#
 # `existing_env` reads the environment file as it was when this run STARTED — load_existing_env()
 # ran during configuration, long before the new one was written — so it names the previous
 # generation and not the one just installed.
@@ -2729,16 +2816,29 @@ publish_db_ca() {
 # IT NEVER FAILS THE INSTALL. Everything here is housekeeping over public certificates; a directory
 # that cannot be listed or a file that cannot be removed costs some kilobytes and nothing else.
 prune_db_ca_generations() {
-  local current="${DB_CA_PUBLISHED_FILE}" previous file kept=0
+  local current="${DB_CA_PUBLISHED_FILE}" previous file named kept=0
   [[ -d "${DB_CA_PUBLISH_DIR}" ]] || return 0
   previous="$(installed_database_sslrootcert "$(existing_env DATABASE_URL)")" || previous=""
   while IFS= read -r file; do
     [[ -n "${file}" ]] || continue
+    # IS THIS A GENERATION THIS PUBLISHER WROTE? Two questions, and a no to either takes the file
+    # out of the prune entirely — not deleted, and not counted against the retention window either,
+    # because a file the prune does not understand must not shorten the retention it advertises.
+    #
+    # First the NAME, which must be exactly ${DB_CA_GENERATION_PREFIX}<64 lowercase hex>${DB_CA_GENERATION_SUFFIX}.
+    named="$(db_ca_generation_digest "${file}")" || continue
+    # Then the BYTES, because the name is a claim and the whole point of content-addressing is that
+    # the claim is checkable. A file whose contents do not hash to the digest in its own name was not
+    # written by publish_db_ca(), whatever it is called — an operator's copy, a hand-edited bundle,
+    # a restored backup — and this is the one place on the CA path that DELETES, so it acts only on
+    # files it can prove it produced.
+    [[ "$(file_sha256 "${file}")" == "${named}" ]] || continue
     [[ "${file}" != "${current}" ]] || continue
     [[ "${file}" != "${previous}" ]] || continue
     kept=$((kept + 1))
     [[ "${kept}" -gt "${DB_CA_GENERATIONS_RETAINED}" ]] || continue
     rm -f "${file}" 2>/dev/null && info "Removed superseded database CA generation ${file}."
+  # A PREFILTER, NOT THE SELECTOR — db_ca_generation_digest() and the re-hash above decide.
   done < <(find "${DB_CA_PUBLISH_DIR}" -maxdepth 1 -type f \
              -name "${DB_CA_GENERATION_PREFIX}*${DB_CA_GENERATION_SUFFIX}" \
              -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2-)

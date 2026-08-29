@@ -90,8 +90,10 @@ export const SHIPPED = [
   // from what was published, and the prune that decides what survives. Lifted for the same reason:
   // a rig that re-implemented the PEM walk would be proving that its author can walk a PEM file,
   // and a rig that re-implemented the generation name would agree with itself and with nothing else.
+  'db_ca_pem_label_encoding',
   'normalize_db_ca_pem',
   'db_ca_generation_file',
+  'db_ca_generation_digest',
   'publish_db_ca',
   'prune_db_ca_generations',
   'verify_db_ca_published',
@@ -160,13 +162,14 @@ export const CAPTURE_TERMINATOR_ASSIGNMENT = (() => {
  * THE CA PUBLISHER'S OWN TOP-LEVEL ASSIGNMENTS, LIFTED IN SOURCE ORDER (o3d-2sm1.5 r47).
  *
  * `shippedFunction()` lifts functions; these are the four literals the lifted functions READ —
- * the one PEM label a trust root may contain, the two halves of the generation name, and how many
- * superseded generations survive a prune — plus the refusal advice both `die`s on the CA path quote.
+ * the PEM labels a trust root may contain (r48: three, measured, not one), the two halves of the
+ * generation name, and how many superseded generations survive a prune — plus the refusal advice
+ * both `die`s on the CA path quote.
  * A rig that declared its own copies would agree with itself and with nothing else: the accept-list
  * is the whole of the disclosure fix, and the generation name is the whole of the overwrite fix.
  */
 export const DB_CA_ASSIGNMENTS = [
-  'DB_CA_ACCEPTED_PEM_LABEL',
+  'DB_CA_ACCEPTED_PEM_LABELS',
   'DB_CA_GENERATION_PREFIX',
   'DB_CA_GENERATION_SUFFIX',
   'DB_CA_GENERATIONS_RETAINED',
