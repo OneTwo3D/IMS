@@ -38,6 +38,10 @@ yarn-error.log*
 .env.bak*
 scripts/*.env
 
+# The crontab reconciliation lock (lib/crontab-reconcile-lock.ts) — an flock target created
+# beside the app at runtime; the installer creates the deployed one under APP_DIR.
+.crontab-reconcile.lock
+
 # vercel
 .vercel
 
