@@ -7,6 +7,21 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { setSettings } from '@/app/actions/settings'
 
+/**
+ * o3d-j7y4 (Codex r18 MEDIUM): the shopping-inbox retention window is OVERRIDDEN for one set of rows
+ * while the currency-evidence hold stands, and until this notice existed the only statement this
+ * screen made about them was that processed webhook payloads are cleared on the schedule below —
+ * which, for those rows, was not true. `null` when no override is in force.
+ */
+export type EvidenceHoldNotice = {
+  /** The issue that owns the hold and is the only thing that lifts it. */
+  issue: string
+  /** Formatted cutoff, or null when this installation has not recorded one yet. */
+  cutoffLabel: string | null
+  /** Held rows that still carry a payload — what the override is actually keeping alive. */
+  heldRows: number
+}
+
 type Props = {
   salesOrdersValue: string
   purchaseOrdersValue: string
@@ -16,6 +31,7 @@ type Props = {
   webhookEventsValue: string
   wmsEventsValue: string
   wmsSyncJobsValue: string
+  evidenceHold: EvidenceHoldNotice | null
 }
 
 const FIELDS = [
@@ -38,6 +54,7 @@ export function DataRetentionSetting({
   webhookEventsValue,
   wmsEventsValue,
   wmsSyncJobsValue,
+  evidenceHold,
 }: Props) {
   const [isPending, startTransition] = useTransition()
   const [values, setValues] = useState({
@@ -81,10 +98,55 @@ export function DataRetentionSetting({
               onChange={(e) => setValues((v) => ({ ...v, [f.stateKey]: e.target.value }))}
               className="h-9"
             />
-            <p className="text-[10px] text-muted-foreground leading-tight pt-1.5 pb-3">{f.hint}</p>
+            <p className="text-[10px] text-muted-foreground leading-tight pt-1.5 pb-3">
+              {f.hint}
+              {evidenceHold && f.key === 'retention_webhook_events_months' && (
+                <span className="text-amber-700 dark:text-amber-500"> — one exception is in force, see below</span>
+              )}
+            </p>
           </div>
         ))}
       </div>
+      {evidenceHold && (
+        <div className="rounded-md border border-amber-500/40 bg-amber-500/5 p-3 space-y-1.5">
+          <p className="text-xs font-medium text-amber-800 dark:text-amber-400">
+            Webhook Events: an exemption is currently overriding this window
+          </p>
+          <p className="text-xs text-muted-foreground leading-relaxed">
+            WooCommerce <strong>order</strong> deliveries{' '}
+            {evidenceHold.cutoffLabel
+              ? <>received before <strong>{evidenceHold.cutoffLabel}</strong></>
+              : <>— <strong>all of them, at any age</strong></>}{' '}
+            are <strong>not</strong> cleared by the schedule above.{' '}
+            <strong>{evidenceHold.heldRows.toLocaleString()}</strong>{' '}
+            {evidenceHold.heldRows === 1 ? 'delivery is' : 'deliveries are'} being retained by it today.
+            Their payloads are the only evidence of whether the store stated a currency on orders imported
+            before IMS began requiring one, and clearing one destroys that evidence permanently. Everything
+            else in the inbox — product deliveries, the bulk of it — is cleared exactly as configured.
+          </p>
+          <p className="text-xs text-muted-foreground leading-relaxed">
+            {evidenceHold.cutoffLabel ? (
+              <>
+                The exemption <strong>does not grow</strong>: order deliveries received after that instant —
+                by which point this installation was running the currency guard, so no order it imports can
+                be affected — are cleared on your schedule like any other. The instant was recorded
+                automatically the first time the nightly cleanup ran on a version carrying the guard, and it
+                is not editable.
+              </>
+            ) : (
+              <>
+                No cutoff has been recorded for this installation yet, so the exemption currently covers
+                every WooCommerce order delivery. The nightly cleanup records one the first time it runs,
+                after which only deliveries received before that instant stay exempt.
+              </>
+            )}{' '}
+            It ends when <strong>{evidenceHold.issue}</strong> is closed — there is no automatic expiry, and
+            it is deliberately not a setting: re-enabling the deletion is a reviewed code change, not a
+            toggle. Until then these payloads are retained past your window, and they carry billing and
+            delivery names and addresses.
+          </p>
+        </div>
+      )}
       <div className="flex items-center gap-2">
         <Button size="sm" onClick={handleSave} disabled={isPending}>
           {isPending && <Loader2 className="h-4 w-4 mr-1 animate-spin" />}

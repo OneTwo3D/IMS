@@ -7,6 +7,7 @@ import { ActivitySquare, Archive, Plug, RotateCcw, ScrollText, Timer } from 'luc
 import { cn } from '@/lib/utils'
 import { Card } from '@/components/ui/card'
 import { getSetting } from '@/app/actions/settings'
+import { describeLegacyWcOrderEvidenceHold } from '@/lib/connectors/shopping-webhook-evidence-hold'
 import { getCrontabStatus } from '@/app/actions/cron'
 import { ActivityLogRetentionSetting } from '@/components/settings/activity-log-retention'
 import { DataRetentionSetting } from '@/components/settings/data-retention'
@@ -255,6 +256,7 @@ export default async function SystemSettingsPage({
               webhookEventsValue={retentionData.drWebhookEvents ?? '3'}
               wmsEventsValue={retentionData.drWmsEvents ?? '3'}
               wmsSyncJobsValue={retentionData.drWmsSyncJobs ?? '12'}
+              evidenceHold={retentionData.evidenceHold}
             />
           </Card>
         </div>
@@ -328,7 +330,18 @@ async function loadCronJobs(): Promise<CronJobState[]> {
   })
 }
 
+/**
+ * o3d-j7y4 (Codex r18 MEDIUM): the shopping-inbox retention window is being OVERRIDDEN for one set of
+ * rows, and an override an operator cannot see is not a bounded one. Formatted here, in UTC, rather
+ * than in the client component: the cutoff is a system fact rather than a local one, and a
+ * locale-formatted date rendered in the browser would not match what the server sent.
+ */
+function formatUtcMinute(at: Date): string {
+  return `${at.toISOString().slice(0, 16).replace('T', ' ')} UTC`
+}
+
 async function loadRetentionData() {
+  const evidenceHold = await describeLegacyWcOrderEvidenceHold()
   const [retInfo, retWarn, retError, drSales, drPurchase, drCustomers, drMovements, drSyncLogs, drWebhookEvents, drWmsEvents, drWmsSyncJobs] = await Promise.all([
     getSetting('activity_log_retention_info'),
     getSetting('activity_log_retention_warning'),
@@ -342,5 +355,14 @@ async function loadRetentionData() {
     getSetting('retention_wms_events_months'),
     getSetting('retention_wms_sync_jobs_months'),
   ])
-  return { retInfo, retWarn, retError, drSales, drPurchase, drCustomers, drMovements, drSyncLogs, drWebhookEvents, drWmsEvents, drWmsSyncJobs }
+  return {
+    retInfo, retWarn, retError, drSales, drPurchase, drCustomers, drMovements, drSyncLogs, drWebhookEvents, drWmsEvents, drWmsSyncJobs,
+    evidenceHold: evidenceHold
+      ? {
+          issue: evidenceHold.issue,
+          cutoffLabel: evidenceHold.cutoffAt ? formatUtcMinute(evidenceHold.cutoffAt) : null,
+          heldRows: evidenceHold.heldRows,
+        }
+      : null,
+  }
 }

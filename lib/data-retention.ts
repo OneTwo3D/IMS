@@ -1,6 +1,7 @@
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { ensureLegacyWcOrderEvidenceCutoff } from '@/lib/connectors/shopping-webhook-evidence-hold'
 import { compactableShoppingWebhookEventWhere } from '@/lib/connectors/shopping-webhook-retention'
 import { alignmentDryRunEvidenceQuery } from '@/lib/domain/wms/alignment-dry-run'
 import {
@@ -462,15 +463,27 @@ export async function purgeExpiredData(): Promise<{
   // PERMANENTLY excludes already-compacted rows, so each daily run only touches the newly-eligible set
   // (a day's worth of rows crossing the cutoff) rather than rewriting the whole retained tombstone set.
   //
-  // ONE SET IS HELD BACK: WooCommerce ORDER deliveries, while `o3d-j7y4` is open (Codex r17 HIGH). Their
-  // payloads are the only positive evidence of an order created on a currency WooCommerce never stated,
-  // and emptying one destroys that evidence for good. The predicate and the whole of the reasoning live
-  // in lib/connectors/shopping-webhook-retention.ts, next to the constant that lifts the hold.
+  // ONE SET IS HELD BACK: WooCommerce ORDER deliveries received before this installation's evidence
+  // cutoff, while `o3d-j7y4` is open (Codex r17 HIGH, bounded in r18). Their payloads are the only
+  // positive evidence of an order created on a currency WooCommerce never stated, and emptying one
+  // destroys that evidence for good. Order deliveries received AFTER the cutoff compact normally: by
+  // then this installation was running the guard, so no order it imported can be affected. The
+  // predicate and the whole of the reasoning live in lib/connectors/shopping-webhook-retention.ts,
+  // next to the constant that lifts the hold.
+  //
+  // THE CUTOFF IS RECORDED HERE, AND UNCONDITIONALLY — outside the `webhookMonths > 0` test below.
+  // What it marks is when THIS INSTALLATION stopped running the old importer, which this pass is the
+  // observer of (it is part of the same build as the guard). An installation running with webhook
+  // retention switched off must still get its cutoff stamped on time: if the stamp waited for the
+  // compaction to be enabled, switching it on a year later would record a year-late cutoff and the
+  // hold would cover the entire history it was supposed to bound.
+  const evidenceCutoff = await ensureLegacyWcOrderEvidenceCutoff()
+
   const webhookMonths = settings.retention_webhook_events_months
   if (webhookMonths > 0) {
     const cutoff = monthsAgo(webhookMonths)
     const { count } = await db.shoppingWebhookEvent.updateMany({
-      where: compactableShoppingWebhookEventWhere(cutoff),
+      where: compactableShoppingWebhookEventWhere(cutoff, evidenceCutoff),
       data: { payloadJson: {}, lastError: null },
     })
     webhookEventsCompacted = count
