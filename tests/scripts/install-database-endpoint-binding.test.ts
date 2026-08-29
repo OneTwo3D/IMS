@@ -25,23 +25,15 @@
  */
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { createServer } from 'node:net'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 
+import { type Cluster, freePort, shippedFunction, startCluster } from './real-postgres-cluster.ts'
+
 const REPO = process.cwd()
 const INSTALL_SOURCE = readFileSync(join(REPO, 'scripts/install.sh'), 'utf8')
-
-/** One shipped shell function, lifted whole, so the tests run the real bytes and not a copy. */
-function shippedFunction(source: string, name: string): string {
-  const start = source.indexOf(`\n${name}() {\n`)
-  assert.notEqual(start, -1, `precondition: scripts/install.sh must define ${name}()`)
-  const end = source.indexOf('\n}\n', start)
-  assert.notEqual(end, -1, `precondition: ${name}() must end at a } in column 0`)
-  return source.slice(start + 1, end + 3)
-}
 
 /** Everything the database section of install.sh is made of, in one string. */
 const SHIPPED = [
@@ -60,111 +52,6 @@ const SHIPPED = [
 ]
   .map((name) => shippedFunction(INSTALL_SOURCE, name))
   .join('\n')
-
-// ---------------------------------------------------------------------------
-// Real clusters
-// ---------------------------------------------------------------------------
-
-/** The server binaries, wherever this distribution keeps them. */
-function pgBinDir(): string {
-  const candidates = execFileSync('bash', [
-    '-c',
-    'ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -V | tail -1; command -v initdb 2>/dev/null | xargs -r dirname',
-  ], { encoding: 'utf8' })
-    .split('\n')
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0)
-  for (const dir of candidates) {
-    if (existsSync(join(dir, 'initdb')) && existsSync(join(dir, 'pg_ctl'))) return dir
-  }
-  throw new Error(
-    'no PostgreSQL server binaries (initdb, pg_ctl) were found. These tests bring up real clusters ' +
-      'on purpose — a fake psql would only test this file\'s model of libpq. Install the postgresql ' +
-      'server package (Debian: apt-get install postgresql) and re-run.',
-  )
-}
-
-/** A loopback port nothing currently holds. */
-function freePort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const server = createServer()
-    server.on('error', reject)
-    server.listen(0, '127.0.0.1', () => {
-      const address = server.address()
-      if (address === null || typeof address === 'string') {
-        reject(new Error('no port'))
-        return
-      }
-      const { port } = address
-      server.close(() => resolve(port))
-    })
-  })
-}
-
-interface Cluster {
-  readonly name: string
-  readonly data: string
-  readonly socket: string
-  readonly port: number
-  psql(args: string[], options?: { host?: string; password?: string; user?: string; database?: string }): string
-  stop(): void
-}
-
-/**
- * A cluster of our own: its own data directory, its own socket directory, its own port.
- *
- * `listen` is a parameter because one test needs TWO clusters on the SAME port — which is only
- * possible if at most one of them binds TCP. That pair is what makes the identity comparison
- * reachable at all: the port alone cannot tell them apart.
- */
-function startCluster(root: string, name: string, port: number, listen: string): Cluster {
-  const bin = pgBinDir()
-  const data = join(root, name, 'data')
-  const socket = join(root, name, 'sock')
-  mkdirSync(socket, { recursive: true })
-  execFileSync(join(bin, 'initdb'), [
-    '-D', data,
-    '--auth-local=trust',
-    '--auth-host=scram-sha-256',
-    '-E', 'UTF8',
-    '--no-sync',
-    '-N',
-  ], { stdio: 'pipe' })
-  execFileSync(join(bin, 'pg_ctl'), [
-    '-D', data,
-    '-l', join(root, name, 'pg.log'),
-    '-o', `-p ${port} -k ${socket} -c listen_addresses=${listen}`,
-    '-w', 'start',
-  ], { stdio: 'pipe' })
-
-  return {
-    name,
-    data,
-    socket,
-    port,
-    psql(args, options = {}) {
-      const env = { ...process.env }
-      for (const key of Object.keys(env)) if (/^(PG|PSQL)/.test(key)) delete env[key]
-      if (options.password !== undefined) env.PGPASSWORD = options.password
-      return execFileSync('psql', [
-        '-X', '-w', '-q', '-tA', '-v', 'ON_ERROR_STOP=1',
-        '-h', options.host ?? socket,
-        '-p', String(port),
-        '-U', options.user ?? execFileSync('id', ['-un'], { encoding: 'utf8' }).trim(),
-        '-d', options.database ?? 'postgres',
-        ...args,
-      ], { encoding: 'utf8', env, stdio: ['ignore', 'pipe', 'pipe'] }).trim()
-    },
-    stop() {
-      try {
-        execFileSync(join(bin, 'pg_ctl'), ['-D', data, '-m', 'immediate', '-w', 'stop'], { stdio: 'pipe' })
-      } catch {
-        // A cluster that never came up, or one already gone; the directory removal below is what
-        // actually matters and it happens either way.
-      }
-    },
-  }
-}
 
 interface Run {
   readonly status: number
@@ -201,6 +88,9 @@ DB_NEWNESS_FINDING="unset"
 FIRST_INSTALL_EXEMPTION_REFUSAL=""
 DB_ROLE_PREEXISTED=false
 DB_ROLE_CREDENTIALS_ROTATED=false
+DB_PASSWORD_INSTALLED=""
+DB_PASSWORD_EFFECTIVE=""
+DB_PASSWORD_ROTATION_PENDING=false
 ${assignments}
 ${SHIPPED}
 ${body}
@@ -592,7 +482,7 @@ test('r37: a duplicate database plus a failed fence preflight leaves credentials
   }
 })
 
-test('r37: the role work inside an adopted fence rotates the password and grants nothing back', async () => {
+test('r37/r38: the role work inside an adopted fence grants nothing back, and touches no password', async () => {
   // A FENCE A PREVIOUS RUN LEFT STANDING IS ADOPTED BEFORE THE ROLE WORK — that is what makes
   // "after the run knows it may proceed" reachable at all. But `GRANT ALL PRIVILEGES ON DATABASE`
   // grants CONNECT, which is the one privilege the fence exists to take away: issued inside an
@@ -603,9 +493,21 @@ test('r37: the role work inside an adopted fence rotates the password and grants
   // database, exactly as fence-db-connections.mjs leaves it, and the assertion is that it is
   // STILL revoked afterwards.
   //
-  // MUTATION ROUTE (measured): delete the `if ${DB_FENCE_UP:-false}` early return from
-  // provision_database_role_and_privileges(). The GRANT runs, the application role gets CONNECT
-  // back, and this test fails on the revoked-CONNECT assertion — alone.
+  // r38 CHANGED WHAT THIS TEST SAYS ABOUT THE PASSWORD, AND ONLY THAT. It used to assert that a
+  // credential supplied on the invocation became the role's password here. That was the r38
+  // finding: this function runs BEFORE the predecessor is stopped and before the build, so a
+  // password set here is taken away from a service that is still serving. It is now asserted
+  // NEGATIVELY — the pre-existing credential still authenticates after this function has run —
+  // and the rotation has its own window, its own function and its own file of regressions
+  // (tests/scripts/install-credential-preservation.test.ts).
+  //
+  // MUTATION ROUTES (each measured by making the change and re-running):
+  //   1. delete the `if ${DB_FENCE_UP:-false}` early return from
+  //      provision_database_role_and_privileges(). The GRANT runs, the application role gets
+  //      CONNECT back, and this test fails on the revoked-CONNECT assertion — alone.
+  //   2. put `ALTER USER "${DB_USER}" WITH PASSWORD '${DB_PASSWORD}';` back into
+  //      provision_database_role_and_privileges(), which is what r37 shipped. The live credential
+  //      stops authenticating and this test fails on its last assertion.
   const root = mkdtempSync(join(tmpdir(), 'ims-pgbind-'))
   let cluster: Cluster | undefined
   try {
@@ -652,12 +554,18 @@ test('r37: the role work inside an adopted fence rotates the password and grants
       'live_owner',
       'and the owner must not have moved inside the window either',
     )
-    // The password, which no fence has an opinion about, IS set — otherwise this test would pass
-    // on a function that did nothing at all.
+    // AND THE PASSWORD IS NOT TOUCHED EITHER (r38). `DB_PASSWORD` above is deliberately a
+    // DIFFERENT value from the one the live role has, so a function that still rotated would be
+    // caught here rather than passing on a value that happened to match.
     assert.equal(
-      cluster.psql(['-c', 'SELECT 1'], { host: '127.0.0.1', user: 'imsuser', password: 'rotated-by-this-run', database: 'postgres' }),
+      cluster.psql(['-c', 'SELECT 1'], { host: '127.0.0.1', user: 'imsuser', password: 'live-password', database: 'postgres' }),
       '1',
-      'the credential this run wrote must be the one the server has',
+      'the credential the live clients hold must still authenticate: nothing before the stop may rotate it',
+    )
+    assert.throws(
+      () => cluster.psql(['-c', 'SELECT 1'], { host: '127.0.0.1', user: 'imsuser', password: 'rotated-by-this-run', database: 'postgres' }),
+      /password authentication failed/,
+      'and the value on the invocation must NOT have become the role password here — that is the rotation, and it belongs after the stop',
     )
   } finally {
     cluster?.stop()

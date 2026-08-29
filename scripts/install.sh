@@ -1278,7 +1278,7 @@ write_env_database_url() {
     rm -f "${tmp}"
     die "The credential of '${DB_USER}' has been rotated but rewriting ${env_file} failed. The database has the NEW password; set DATABASE_URL by hand before starting ${APP_NAME}.service."
   fi
-  chown "${APP_USER}:${APP_USER}" "${tmp}" 2>/dev/null || true
+  chown "${APP_USER}:${APP_USER}" "${tmp}" || { rm -f "${tmp}"; die "The credential of '${DB_USER}' has been rotated but the replacement ${env_file} could not be given to ${APP_USER}, so it was not installed. The database has the NEW password; set DATABASE_URL by hand before starting ${APP_NAME}.service."; }
   chmod 600 "${tmp}" || { rm -f "${tmp}"; die "The credential of '${DB_USER}' has been rotated but the replacement ${env_file} could not be made mode 600, so it was not installed. The database has the NEW password; set DATABASE_URL by hand before starting ${APP_NAME}.service."; }
   mv -f "${tmp}" "${env_file}" || { rm -f "${tmp}"; die "The credential of '${DB_USER}' has been rotated but the rewritten ${env_file} could not be moved into place. The database has the NEW password; set DATABASE_URL by hand before starting ${APP_NAME}.service."; }
 }
@@ -3756,18 +3756,25 @@ fi
 # MIGRATION_DATABASE_URL, and what the fence preflight opens the application connection with — so
 # a build that fails leaves a predecessor whose environment file and whose database still agree.
 # rotate_database_password_in_fenced_window() replaces both, together, after the stop.
-DB_PASSWORD_EFFECTIVE="${DB_PASSWORD}"
-DB_PASSWORD_ROTATION_PENDING=false
-if ${DB_ROLE_PREEXISTED} && [[ -n "${DB_PASSWORD_INSTALLED}" && "${DB_PASSWORD}" != "${DB_PASSWORD_INSTALLED}" ]]; then
-  DB_PASSWORD_ROTATION_PENDING=true
-  DB_PASSWORD_EFFECTIVE="${DB_PASSWORD_INSTALLED}"
-  warn "A password DIFFERENT from the one ${APP_DIR}/.env carries was supplied for the PRE-EXISTING"
-  warn "role '${DB_USER}', so this run will rotate it — but not yet. Everything up to and including"
-  warn "the build uses the credential the server already has; the ALTER happens once the existing"
-  warn "installation is stopped and the database is fenced."
-fi
+#
+# IT IS A FUNCTION AND NOT FOUR STRAIGHT-LINE STATEMENTS so the tests can run these bytes instead
+# of a copy of them: a regression that re-implements the decision it is checking proves only that
+# its author can write the decision twice.
+classify_database_credential_rotation() {
+  DB_PASSWORD_EFFECTIVE="${DB_PASSWORD}"
+  DB_PASSWORD_ROTATION_PENDING=false
+  if ${DB_ROLE_PREEXISTED} && [[ -n "${DB_PASSWORD_INSTALLED}" && "${DB_PASSWORD}" != "${DB_PASSWORD_INSTALLED}" ]]; then
+    DB_PASSWORD_ROTATION_PENDING=true
+    DB_PASSWORD_EFFECTIVE="${DB_PASSWORD_INSTALLED}"
+    warn "A password DIFFERENT from the one ${APP_DIR}/.env carries was supplied for the PRE-EXISTING"
+    warn "role '${DB_USER}', so this run will rotate it — but not yet. Everything up to and including"
+    warn "the build uses the credential the server already has; the ALTER happens once the existing"
+    warn "installation is stopped and the database is fenced."
+  fi
+  DATABASE_URL="postgresql://${DB_USER}:${DB_PASSWORD_EFFECTIVE}@${DB_HOST}:${DB_PORT}/${DB_NAME}"
+}
 
-DATABASE_URL="postgresql://${DB_USER}:${DB_PASSWORD_EFFECTIVE}@${DB_HOST}:${DB_PORT}/${DB_NAME}"
+classify_database_credential_rotation
 
 # THE SAME FOUR VALUES THE URL ABOVE WAS COMPOSED FROM, handed to the connection fence rather
 # than parsed back out of it (o3d-2sm1.5 r19). Nothing is derived, so nothing can be derived
