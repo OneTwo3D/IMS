@@ -2504,7 +2504,7 @@ function activityProducers(): Array<{ what: string; text: string; mustEscalate: 
       // base currency, which is what the document was denominated in. It gets its own clause
       // precisely so the sentence does not send an operator to inspect a payload that is not at
       // fault, which is the r7/r8 lesson again.
-      { fact: 'base-currency' as const, detail: 'the payload names no currency, so the document was denominated by the ledger in ITS OWN base currency — and what that is was never verified for this connection' },
+      { fact: 'base-currency' as const, detail: 'no verified ledger base currency is recorded for this connection' },
     ]) {
       produced.push({
         what: `unreadablePaymentPayloadRefusalMessage for ${connector}, ${fact} clause `

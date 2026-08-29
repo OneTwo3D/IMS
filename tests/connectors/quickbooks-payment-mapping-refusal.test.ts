@@ -1095,7 +1095,7 @@ test('[o3d-batch-ret r10] every OTHER field this path reads is refused when pres
   }
 })
 
-test('[o3d-batch-ret r10] CONTROL: an ABSENT method, currency or date still takes its documented default', async () => {
+test('[o3d-batch-ret r10] CONTROL: an ABSENT method or date still takes its documented default', async () => {
   // Without this, the test above passes on a build that refuses every payload that omits an optional
   // field — and the WooCommerce importer writes `wcOrder.payment_method || undefined` and
   // `wcOrder.date_paid_gmt || undefined`, which JSON DROPS, so absence is the ordinary case and

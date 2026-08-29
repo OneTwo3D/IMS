@@ -542,10 +542,9 @@ function payloadPaymentMethod(payload: Record<string, unknown>): PayloadField<st
  * not persisted anywhere (o3d-emus).
  */
 const LEDGER_BASE_UNVERIFIED =
-  'the payload names no currency, so the document was denominated by the ledger in ITS OWN base '
-  + 'currency — and what that is was never verified for this connection: both connect-time guards '
-  + 'compare the remote base currency only when they could READ it, and neither records the value '
-  + 'they compared, so nothing here establishes that the ledger posts in the IMS base currency'
+  'no verified ledger base currency is recorded for this connection: the connect-time guard compares '
+  + 'the remote base currency against the IMS one ONLY when it can read the remote one, stores the '
+  + 'binding either way, and keeps neither the value nor the fact that it compared'
 
 /**
  * `currency` — THE FIELD WHERE THE OLD DEFAULT MOVED MONEY TO THE WRONG PLACE, THREE TIMES.
@@ -890,10 +889,9 @@ const UNREADABLE_PAYMENT_CLAUSES: Record<UnreadablePaymentFact, { asked: string;
       + 'ordinary — and the currency the ledger therefore denominated that document in is not established for this '
       + 'connection',
     claim: 'AN UNVERIFIED LEDGER BASE CURRENCY IS NOT THE IMS ONE: this row does not say the payment is in the IMS '
-      + 'base currency, it says the currency it would be settled in was never read back from the ledger — the '
-      + 'connect-time check compares that currency only when it can be read, and stores the connection either way — '
-      + 'and the bank account is keyed on that currency, so assuming one selects an account by a currency nobody '
-      + 'verified and stamps it onto the payment. Reconnect the ledger to establish it',
+      + 'base currency, it says the currency it would be settled in was never read back from the ledger — and the '
+      + 'bank account is keyed on that currency, so assuming one selects an account by a currency nobody verified '
+      + 'and stamps it onto the payment',
   },
 }
 
