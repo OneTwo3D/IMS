@@ -1461,6 +1461,53 @@ export type ImportWcOrderResult = {
    */
   skipped?: WcAdmissionRefusalReason
   /**
+   * THE OTHER HALF OF THAT SENTENCE, SAID STRUCTURALLY (o3d-batch-ret r15, Codex HIGH).
+   *
+   * Set when the boundary DECIDED to refuse this order and the durable by-id queue row could not
+   * be confirmed. `success` is false and `skipped` is deliberately unset, so a caller that only
+   * knows those two fields sees an ordinary error — which is right for a caller whose failure
+   * handling already withholds its own progress, and WRONG for one that counts errors and carries
+   * on. Round 14 fixed the webhook on exactly that reasoning and left the initial import, the
+   * second caller, advancing its cursor past an order that now exists nowhere at all.
+   *
+   * So the condition is a FIELD rather than a sentence in `error`. A caller that must withhold
+   * completion can test for it without matching on prose, and this doc block is the one place that
+   * says what every caller does with it:
+   *
+   *   `webhooks.ts` (order.created / order.updated)
+   *       No `skipped`, so it falls through to the 500 below the ACK branch. The shared inbox
+   *       classifies 5xx as RETRYABLE, WooCommerce redelivers the identical payload, and the
+   *       refusal is attempted again. Nothing is acknowledged.
+   *
+   *   `initial-import.ts` (the backfill)
+   *       COMPLETION-BLOCKING. The count is fed to `decideInitialImportOutcome`, which returns
+   *       `failed` however many other orders imported, so neither `wc_initial_import_completed`
+   *       nor `last_wc_order_sync_at` is written. Initial-import orders have no inbox delivery to
+   *       redeliver them, so advancing the cursor is the one thing that makes the loss permanent.
+   *
+   *   `syncNewWcOrders` (the `?modified_after=` pull sweep)
+   *       Pushed onto `result.errors`, and the cursor advances ONLY on `errors.length === 0`. The
+   *       next sweep re-fetches this order from the same watermark and refuses it again, with
+   *       another chance to write the row.
+   *
+   *   `retryPendingWcOrdersWaitingForFx` (the pending-FX queue drain)
+   *       Counted as `failed`. `refuseWcOrderCreate` returns BEFORE `markPendingFxRetryLogFailed`,
+   *       so the queue row stays PENDING and the next FX refresh retries the same order.
+   *
+   *   `drainWcOrderAdmissionRefusals` (the by-id refusal drain)
+   *       Counted as `unresolved`. The row it is draining is the very row that failed to confirm;
+   *       it is rotated to the back of the queue before the work and never resolved, so the next
+   *       fifteen-minute sweep re-reads the live order and tries again.
+   *
+   *   `runWcWithdrawalRecoverySweep` (withdrawal tombstone re-import)
+   *       Counted as `unresolved`. The tombstone is the durable retry signal here and a refusal
+   *       never resolves it, so the order stays in that queue regardless of this row.
+   *
+   * Every one of the six either retries the same payload or holds its own progress. If a seventh
+   * is added, it belongs in this list before it is merged.
+   */
+  unrecordedRefusal?: WcAdmissionRefusalReason
+  /**
    * The operator's selection at the moment of the refusal, so the caller can say so. Meaningful
    * for the two STATUS reasons only — a `currency_missing` refusal is not about the selection, and
    * reports the empty list rather than a selection that had nothing to do with it.
@@ -1509,6 +1556,9 @@ async function refuseWcOrderCreate(
     // left PENDING below, so that queue retries it too.
     return {
       success: false,
+      // The FIELD is the contract; the sentence is for the operator. A caller deciding whether to
+      // withhold its own completion must not have to match on prose (r15).
+      unrecordedRefusal: reason,
       error: `WooCommerce order ${wcOrder.id} was refused (${reason}), but the durable by-id refusal `
         + `row could not be confirmed (${recorded.reason}). The refusal was NOT acknowledged, so the `
         + 'order is redelivered rather than lost.',

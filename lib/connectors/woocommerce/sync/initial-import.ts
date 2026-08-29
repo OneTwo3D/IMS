@@ -48,12 +48,30 @@ const JOB_KEY = 'initial_order_import_job'
  * way to retry. A pass that imported/reconciled at least one order, or had no
  * active orders to import, is complete (per-order errors are surfaced but don't
  * block, since live sync of new orders can still proceed).
+ *
+ * EXCEPT FOR AN UNRECORDED REFUSAL, WHICH BLOCKS COMPLETION ON ITS OWN (o3d-batch-ret r15,
+ * Codex HIGH). "Per-order errors don't block" is true of every error this loop can otherwise
+ * produce, because every one of them leaves the order where the NEXT pass will find it: it is
+ * still in the `?status=` page, still absent from `shopping_order_links`, still re-fetched. An
+ * unrecorded admission refusal is the one error that is not like that. The order was refused, the
+ * refusal was not written down, and marking the pass complete does two irreversible things at
+ * once — it stamps `wc_initial_import_completed`, so this backfill never runs again, and it
+ * writes `last_wc_order_sync_at` to now, so the ongoing `?modified_after=` sweep starts AFTER the
+ * order it just skipped. A historical order is not redelivered by anything: no webhook is coming,
+ * there is no refusal row for the by-id drain, and the cursor is past it. It is gone.
+ *
+ * So the count is a separate input rather than part of `errorCount`. A mixed-success pass — nine
+ * orders imported, one refusal that could not be recorded — is FAILED, and the operator retries a
+ * backfill that is idempotent by construction (`importedOrderIds` skips what already landed).
  */
 export function decideInitialImportOutcome(input: {
   imported: number
   skipped: number
   errorCount: number
+  /** Orders refused whose durable by-id retry row could not be confirmed. See above. */
+  unrecordedRefusals: number
 }): 'complete' | 'failed' {
+  if (input.unrecordedRefusals > 0) return 'failed'
   const madeProgress = input.imported > 0 || input.skipped > 0
   return input.errorCount > 0 && !madeProgress ? 'failed' : 'complete'
 }
@@ -160,6 +178,10 @@ async function runInitialImport(progress: InitialImportProgress) {
 
     let page = 1
     let totalPages = 1
+    // Orders the admission boundary refused whose durable by-id retry row could not be confirmed.
+    // Counted separately from `progress.errors` because it decides a different question: not "how
+    // did this pass go" but "may this pass advance the cursor at all" (r15).
+    let unrecordedRefusals = 0
 
     while (page <= totalPages) {
       progress.currentPage = page
@@ -233,6 +255,9 @@ async function runInitialImport(progress: InitialImportProgress) {
           progress.activeOrdersSkipped++
         } else {
           progress.errors.push(`Order #${order.number}: ${importResult.error}`)
+          // The one error that must stop this pass completing, however well the rest went. The
+          // order is refused, unrecorded, and behind the cursor this pass would write.
+          if (importResult.unrecordedRefusal) unrecordedRefusals++
         }
 
         importedOrderIds.add(order.id)
@@ -248,6 +273,7 @@ async function runInitialImport(progress: InitialImportProgress) {
       imported: progress.activeOrdersImported,
       skipped: progress.activeOrdersSkipped,
       errorCount: progress.errors.length,
+      unrecordedRefusals,
     })
 
     if (outcome === 'failed') {
@@ -256,8 +282,15 @@ async function runInitialImport(progress: InitialImportProgress) {
       // would falsely unlock live sync and leave a dead-end "done" state with no
       // retry. Surface it as an error so the UI shows Retry and live order sync
       // stays gated off until a real import succeeds.
+      //
+      // OR an order was refused and the refusal could not be written down. That case says
+      // something different and is worded as itself \u2014 the pass may have imported most of the
+      // store, and the reason it must not complete is the ONE order that would be stranded behind
+      // the cursor this branch is declining to write (r15).
       progress.status = 'error'
-      progress.message = `Import failed \u2014 0 of ${progress.totalOrders} order${progress.totalOrders === 1 ? '' : 's'} imported (${progress.errors.length} error${progress.errors.length === 1 ? '' : 's'}). Resolve the cause and retry; live order sync stays off until the initial import succeeds.`
+      progress.message = unrecordedRefusals > 0
+        ? `Import held \u2014 ${unrecordedRefusals} order${unrecordedRefusals === 1 ? ' was' : 's were'} not imported and the durable retry row could not be written, so ${unrecordedRefusals === 1 ? 'it' : 'they'} would be stranded behind the sync cursor. Nothing was marked complete and the cursor was NOT advanced; ${progress.activeOrdersImported} order${progress.activeOrdersImported === 1 ? '' : 's'} did import and will be skipped on the retry. Resolve the cause and retry.`
+        : `Import failed \u2014 0 of ${progress.totalOrders} order${progress.totalOrders === 1 ? '' : 's'} imported (${progress.errors.length} error${progress.errors.length === 1 ? '' : 's'}). Resolve the cause and retry; live order sync stays off until the initial import succeeds.`
       await saveProgress(progress)
 
       await logActivity({

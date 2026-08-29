@@ -27,8 +27,13 @@ const VERDICT_EXPLANATION: Record<WcOrderCurrencyVerdict, string> = {
     'the stored code is not a canonical AAA — current code cannot have written it, and the FX '
     + 'lookup and accounting payload can read it differently from each other',
   fallback_invented:
-    'every archived WooCommerce delivery for this order states NO usable currency, yet a code is '
-    + 'stored — this is the pre-r13 fallback, positively identified',
+    'the delivery that PROVABLY created this order (successfully processed, and the order link was '
+    + 'written inside its processing window) states NO usable currency, yet a code is stored — this '
+    + 'is the pre-r13 fallback, positively identified',
+  archived_states_nothing:
+    'every archived delivery for this order states no usable currency, but NONE of them is provably '
+    + 'the one that created it — a pull-imported order later touched by a degraded update webhook '
+    + 'looks exactly like this. Non-definitive: worth reading, not proof of invention',
   disagrees_with_archived_payload:
     'the archived deliveries state a currency and it is not the one stored',
   disagrees_with_live:
@@ -81,7 +86,15 @@ async function main() {
         `  money: invoiced=${finding.monetary.invoicedAt ?? '-'} `
           + `xeroInvoice=${finding.monetary.accountingInvoiceId ?? '-'} `
           + `paid=${finding.monetary.paidAt ?? '-'} `
-          + `payments=${finding.monetary.payments} refunds=${finding.monetary.refunds} `
+          + `payments=${finding.monetary.payments} refunds=${finding.monetary.refunds}`,
+      )
+      // Printed even when zero. The whole point of these three is that an order can carry
+      // accounting work while every column above reads empty, so an operator has to be able to see
+      // that they were LOOKED AT rather than infer it from their absence.
+      console.log(
+        `  ledger: postableInvoiceJobs=${finding.monetary.postableInvoiceJobs} `
+          + `postedInvoices=[${finding.monetary.postedInvoiceExternalIds.join(', ')}] `
+          + `heldForInvoiceNumber=${finding.monetary.heldInvoiceJobs} `
           + `→ ${finding.monetary.uncommitted ? 'UNCOMMITTED' : 'COMMITTED — do not touch unattended'}`,
       )
     }
