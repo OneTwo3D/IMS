@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync, spawn, spawnSync } from 'node:child_process'
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -8710,19 +8710,41 @@ test('r33: every printed recovery instruction carries the privilege the account 
     //    sudo is one whose banner can only be being read by root.
     rmSync(log)
     renameSync(join(dir, 'app', '.env'), join(dir, 'app', '.env.away'))
-    // A PATH that still has coreutils and no sudo — the wrapper needs `id`, `find` and
-    // `sha256sum` to reach the message at all, and stripping everything would have tested the
-    // wrong refusal.
-    const noSudoPath = (process.env.PATH ?? '')
-      .split(':')
-      .filter((entry) => entry && !existsSync(join(entry, 'sudo')))
-      .join(':')
-    assert.equal(sudoPrefixOn(noSudoPath), '', 'precondition: that PATH really has no sudo on it')
+    // A PATH that still has coreutils and no sudo — the wrapper needs `id`, `find`, `sort`,
+    // `xargs` and `sha256sum` to reach the message at all, and stripping everything would have
+    // tested the wrong refusal.
+    //
+    // BUILT BY ADDITION, NOT BY SUBTRACTION. The obvious construction — take the real PATH and
+    // drop every directory that holds a `sudo` — cannot work on a box where sudo is installed,
+    // because sudo lives in /usr/bin alongside bash and the whole of coreutils, so dropping that
+    // directory drops the shell too and every spawn below fails with ENOENT rather than with the
+    // refusal under test. It only appeared to work on a developer box with no sudo installed at
+    // all, where it subtracted nothing. So the directory is assembled instead: one symlink per
+    // executable name on the real PATH, minus sudo. That is a box with no sudo however the box
+    // this runs on happens to lay its binaries out.
+    const noSudoDir = join(dir, 'nosudo')
+    mkdirSync(noSudoDir)
+    for (const entry of (process.env.PATH ?? '').split(':')) {
+      if (!entry || !existsSync(entry)) continue
+      for (const name of readdirSync(entry)) {
+        if (name === 'sudo') continue
+        if (existsSync(join(noSudoDir, name))) continue
+        symlinkSync(join(entry, name), join(noSudoDir, name))
+      }
+    }
+    const noSudoPath = noSudoDir
+    // PRECONDITION, IN THIS ORDER. The tools first: `sudoPrefixOn` answers '' both for a PATH
+    // with no sudo on it and for a PATH with no SHELL on it, so on its own it cannot tell the
+    // fixture working from the fixture being empty. Establish that the shell and the tools are
+    // reachable, and only then is the empty prefix evidence of anything.
     assert.equal(
-      spawnSync('bash', ['-c', 'command -v sha256sum >/dev/null'], { env: { PATH: noSudoPath } as unknown as NodeJS.ProcessEnv }).status,
+      spawnSync('bash', ['-c', 'command -v sha256sum >/dev/null && command -v id >/dev/null && command -v find >/dev/null && command -v xargs >/dev/null && command -v sort >/dev/null'], {
+        env: { PATH: noSudoPath } as unknown as NodeJS.ProcessEnv,
+      }).status,
       0,
-      'precondition: and it still has the tools the wrapper runs',
+      'precondition: that PATH still has the shell and the tools the wrapper runs',
     )
+    assert.equal(sudoPrefixOn(noSudoPath), '', 'precondition: and no sudo on it')
     const noSudo = spawnSync(paths.releaseWrapper, [], { encoding: 'utf8', env: { PATH: noSudoPath } as unknown as NodeJS.ProcessEnv })
     const bareLine = noSudo.stderr.split('\n').find((line) => line.includes('DEPLOY_ADMIN_DATABASE_URL='))
     assert.equal(
