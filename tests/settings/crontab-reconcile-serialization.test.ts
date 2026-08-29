@@ -80,6 +80,13 @@ import test, { mock } from 'node:test'
 //  15. LOAD-BEARING. the same, at the lock DIRECTORY: nothing appears inside the target
 //  16. LOAD-BEARING. the prepared lock cannot be replaced from a directory the service user cannot
 //      write — with a CONTROL showing round 23's placement can be
+//  17. LOAD-BEARING. an UPGRADE puts the RUNNING process on this protocol: the already-active
+//      service is RESTARTED, not merely enabled/started, and the restart is a RECORDED systemctl
+//      invocation rather than a word in the file        (scripts/install.sh, run by a real bash)
+//  18. a restart that fails, or that leaves the unit not active, ABORTS the install rather than
+//      letting the installer take a lock that excludes nothing
+//  19. the ordering itself: build -> unit -> restart -> guard -> lock, and the crontab section
+//      REFUSES to open the lock if the restart did not happen, with a CONTROL that it otherwise does
 //
 // DETERMINISM. There is no sleep and no timer used to sequence anything. The interleaving comes
 // from two injected barriers — one inside the settings snapshot, one inside a real `crontab`
@@ -889,7 +896,38 @@ test('[o3d-batch-ret] the lock path is writable under every sandboxing directive
   // and WorkingDirectory= are each read out of the unit and asserted, not merely counted here.
   // ------------------------------------------------------------------------
 
-  /** Every directive NAME active in the [Service] section, in order, duplicates included. */
+  /**
+   * Every directive NAME active in the [Service] section, in order, duplicates included.
+   *
+   * CONTINUATION, AS SYSTEMD ACTUALLY DOES IT (Codex r25 MEDIUM). The previous version cleared
+   * `continuing` on any physical line that did not end in a backslash — including a COMMENT line —
+   * which is not what systemd does, and made the census skippable: `ExecStart=… \`, a comment, then
+   * a line that merely LOOKS like `[Unit]` left this parser believing the section had changed, so
+   * every directive after it went uncounted while systemd was still reading them as [Service].
+   *
+   * The recommendation was to ignore blank AND comment lines while continuing. Half of that is
+   * wrong, and systemd is the authority, so it was measured rather than taken — `systemd-analyze
+   * verify` on scratch units under systemd 257 (it loads a unit in a test manager and reports
+   * `Unknown key 'X' in section [Service]`, which is exactly "did the section switch happen"):
+   *
+   *   ExecStart=… \ / '# c' / '[Unit]' / Documentation=  -> Unknown key in [Service]   CONTINUED
+   *   ExecStart=… \ / '# c' / ';  c' / '[Unit]' / Doc…   -> Unknown key in [Service]   CONTINUED
+   *   ExecStart=… \ / '# c' / Documentation=             -> no diagnostic              SWALLOWED
+   *   ExecStart=… \ / '# c' / '--flag \' / '# c' / Doc…  -> no diagnostic              SWALLOWED
+   *   ExecStart=… \ / ''    / '[Unit]' / Documentation=  -> no diagnostic              ENDED
+   *   ExecStart=… \ / ''    / Documentation=             -> Unknown key in [Service]   ENDED
+   *   ExecStart=… \ / '# c' / ''  / '[Unit]' / Doc…      -> no diagnostic              ENDED
+   *   ExecStart=… \ / ''    / '# c' / '[Unit]' / Doc…    -> no diagnostic              ENDED
+   *   (control) ExecStart=… / '[Unit]' / Documentation=   -> no diagnostic              no continuation
+   *
+   * So: a COMMENT line inside a continuation is skipped and does NOT end it — man systemd.syntax,
+   * "When a comment line or lines follow a line ending with a backslash, the comment block is
+   * ignored, so the continued line is concatenated with whatever follows the comment block". A
+   * BLANK line is NOT a comment for this purpose: it is consumed as the continuation's next
+   * physical line and, ending in no backslash, ends it — the man page never claims otherwise, and
+   * the last four rows above are the measurement. This parser follows systemd, not the
+   * recommendation.
+   */
   const serviceDirectiveNames = (unitText: string): string[] => {
     const names: string[] = []
     let inService = false
@@ -897,7 +935,11 @@ test('[o3d-batch-ret] the lock path is writable under every sandboxing directive
     for (const raw of unitText.split('\n')) {
       const line = raw.trim()
       if (continuing) {
-        // A continued VALUE is not a directive, however much it looks like one.
+        // Comments inside a continuation are invisible to systemd and do not end it. A blank line
+        // is not a comment here: it falls through and ends the continuation, as measured above.
+        if (line.startsWith('#') || line.startsWith(';')) continue
+        // A continued VALUE is not a directive, however much it looks like one — and that includes
+        // a line shaped like a [Section] header, which systemd consumes as part of the value.
         continuing = line.endsWith('\\')
         continue
       }
@@ -989,6 +1031,61 @@ test('[o3d-batch-ret] the lock path is writable under every sandboxing directive
       `${name} must FAIL this census: it changes what /var/lib/<state>/locks is, or whether it `
       + 'exists at all, and nothing here has reasoned about it')
   }
+
+  // --- the CONTINUATION BYPASS, closed (Codex r25 MEDIUM) ---
+  //
+  // Systemd is still inside [Service] at the final directive of every fixture below: the comment
+  // block does not end ExecStart's continuation, and the line that LOOKS like `[Unit]` is consumed
+  // as part of ExecStart's value rather than switching section. Each shape was measured with
+  // `systemd-analyze verify` on systemd 257 (it reports `Unknown key 'Documentation' in section
+  // [Service]` exactly when the switch did NOT happen); see serviceDirectiveNames above.
+  //
+  // The parser that cleared `continuing` on the comment believed the section HAD switched, so it
+  // reported a clean census over a region it had silently skipped — a green build guard with
+  // `TemporaryFileSystem=/var/lib` sitting unexamined on top of the state directory the lock lives
+  // in. Restore that behaviour and every assertion in this loop fails.
+  const CONTINUATION_BYPASS = [
+    // one comment line
+    'ExecStart=/bin/true \\\n# not a directive\n[Unit]\nTemporaryFileSystem=/var/lib',
+    // a comment BLOCK, using both of systemd's comment characters
+    'ExecStart=/bin/true \\\n# one\n; two\n[Unit]\nTemporaryFileSystem=/var/lib',
+    // a comment that itself ends in a backslash — still only a comment, and still skipped
+    'ExecStart=/bin/true \\\n# trailing backslash \\\n[Unit]\nTemporaryFileSystem=/var/lib',
+    // the value resumed after the comment and continued again, with a second comment inside
+    'ExecStart=/bin/true \\\n# one\n--flag \\\n# two\n[Unit]\nTemporaryFileSystem=/var/lib',
+  ]
+  for (const attempt of CONTINUATION_BYPASS) {
+    const censused = serviceDirectiveNames(withServiceDirective(attempt))
+    assert.ok(censused.includes('TemporaryFileSystem'),
+      'a directive systemd reads as [Service] must be censused: the comment did not end the '
+      + `continuation and the [Unit] line is part of ExecStart's value.\n${attempt}`)
+    assert.ok(!censused.includes('Unit') && !censused.includes('[Unit]'),
+      'the swallowed section header is a VALUE, not a directive, and must not be counted as one')
+    assert.deepEqual(censused.filter((name) => !classified(name)), ['TemporaryFileSystem'],
+      'and it must FAIL the census — this is the exact directive that can put a tmpfs over '
+      + `/var/lib and make the lock path a different, empty inode.\n${attempt}`)
+  }
+
+  // The other half of the rule, and it goes the OTHER way. A BLANK line is not a comment here:
+  // systemd consumes it as the continuation's next physical line and, since it ends in no
+  // backslash, the continuation ENDS. So the `[Unit]` after it is a real section switch, and
+  // treating blank lines like comments — which is what the review recommended — would make this
+  // census claim jurisdiction over directives that are genuinely outside [Service].
+  const afterBlankThenHeader = serviceDirectiveNames(withServiceDirective(
+    'ExecStart=/bin/true \\\n\n[Unit]\nVorpal=blade'))
+  assert.ok(!afterBlankThenHeader.includes('Vorpal'),
+    'the blank line ended the continuation, so [Unit] really switched section')
+  assert.ok(!afterBlankThenHeader.includes('ProtectSystem'),
+    'proof that the switch was real and not merely that Vorpal was skipped: everything after it, '
+    + 'including the sandboxing block, is now outside [Service] for this mutated unit')
+
+  // …and with no section header in the way, the directive after the blank line is an ordinary
+  // [Service] directive, so it IS censused. (Measured: systemd reports it as an unknown [Service]
+  // key, i.e. it parsed it as a directive rather than swallowing it into ExecStart.)
+  const afterBlankThenDirective = serviceDirectiveNames(withServiceDirective(
+    'ExecStart=/bin/true \\\n\nVorpal=blade'))
+  assert.deepEqual(afterBlankThenDirective.filter((name) => !classified(name)), ['Vorpal'],
+    'a blank line ends the continuation, so what follows is a directive and must be censused')
 
   // …and the scope is the [Service] section only: a directive added to [Unit] or [Install] is not
   // a sandboxing claim and must not be dragged in.
@@ -1355,4 +1452,182 @@ test('[o3d-batch-ret] the prepared lock cannot be replaced from a directory the 
   } finally {
     await sh(`chmod 0755 '${lockDir}'`)
   }
+})
+
+// ---------------------------------------------------------------------------
+// 17 — LOAD-BEARING: an UPGRADE puts the RUNNING process on this lock protocol
+//
+// The exclusion above is one flock on one inode, and it excludes exactly one thing: an application
+// process that locks the same inode. `systemctl enable --now` did not deliver that on the only run
+// where it matters. `--now` is `start`, and `start` on a unit that is ALREADY RUNNING is a no-op;
+// `daemon-reload` changes only what the NEXT start reads. So an upgrade left the pre-upgrade
+// process alive on the previous bundle, previous environment and previous lock path — or no lock at
+// all — and the installer then went on to take the NEW lock and rewrite the crontab beside it.
+//
+// Measured on this host, systemd 257, against a scratch unit in /run/systemd/system:
+//   systemctl start   on an ACTIVE unit   -> MainPID UNCHANGED   (nothing was replaced)
+//   systemctl restart on an ACTIVE unit   -> MainPID CHANGED     (the process is the new build)
+//   systemctl restart on an INACTIVE unit -> exit 0, becomes active (so `--now` buys nothing)
+//
+// These tests run the installer's OWN service lines under a real bash with a RECORDING `systemctl`,
+// so what is asserted is the invocation that was made, not the presence of a word in the file.
+// ---------------------------------------------------------------------------
+
+/**
+ * The shipped service-activation region of scripts/install.sh, lifted rather than re-typed.
+ *
+ * Bounded by two lines that exist in every version of the script — the `daemon-reload` that follows
+ * the unit heredoc, and the `success` that closes the section — so reverting the change under test
+ * runs the OLD lines here and the assertions fail on what they DID, not on a marker that moved.
+ */
+function serviceActivationRegion(): string {
+  const lines = INSTALL_SH.split('\n')
+  const from = lines.findIndex((l) => l === 'systemctl daemon-reload')
+  assert.notEqual(from, -1, 'scripts/install.sh must daemon-reload after writing the unit')
+  const to = lines.findIndex((l, i) => i > from && /^success "Application service /.test(l))
+  assert.notEqual(to, -1, 'the service section must end with its success line')
+  const region = lines.slice(from, to + 1).join('\n')
+  assert.match(region, /systemctl/, 'the lifted region must be the one that activates the service')
+  return region
+}
+
+/** Run that region with a recording `systemctl` (and a recording `pm2`, so no real one is used). */
+async function runServiceActivation(options: {
+  isActiveAfterRestart?: 'active' | 'activating' | 'failed'
+  restartExitCode?: number
+} = {}): Promise<{ code: number | null; stderr: string; invocations: string[] }> {
+  const dir = mkdtempSync(join(HARNESS, 'svc-'))
+  const journal = join(dir, 'invocations.txt')
+  const isActive = options.isActiveAfterRestart ?? 'active'
+  const restartExit = options.restartExitCode ?? 0
+  // The stub answers as an UPGRADE: the unit is already loaded and already running when the
+  // installer reaches this section. That is the only situation in which `start` and `restart`
+  // differ, and it is the situation the finding is about.
+  writeFileSync(join(dir, 'systemctl'), `#!/bin/sh
+echo "$*" >> '${journal}'
+case "$1" in
+  is-active) [ "${isActive}" = active ] || { echo "${isActive}"; exit 3; }; echo active; exit 0 ;;
+  restart) exit ${restartExit} ;;
+esac
+exit 0
+`)
+  writeFileSync(join(dir, 'pm2'), `#!/bin/sh\necho "pm2 $*" >> '${journal}'\nexit 0\n`)
+  chmodSync(join(dir, 'systemctl'), 0o755)
+  chmodSync(join(dir, 'pm2'), 0o755)
+
+  const script = `
+set -euo pipefail
+export PATH=${JSON.stringify(dir)}:"$PATH"
+APP_NAME=onetwoinventory
+APP_USER=ims
+APP_DIR=/opt/onetwoinventory
+CRONTAB_LOCK_FILE=/var/lib/onetwoinventory/locks/.crontab-reconcile.lock
+success() { :; }
+info() { :; }
+warn() { echo "WARN: $*" >&2; }
+die() { echo "DIE: $*" >&2; exit 9; }
+${serviceActivationRegion()}
+echo "APP_SERVICE_RESTARTED=\${APP_SERVICE_RESTARTED:-unset}"
+`
+  const { code, stdout, stderr } = await sh(script)
+  const invocations = existsSync(journal)
+    ? readFileSync(journal, 'utf8').split('\n').filter(Boolean)
+    : []
+  return { code, stderr: stderr + stdout, invocations }
+}
+
+test('[o3d-batch-ret] an ALREADY-RUNNING service is RESTARTED onto the new build, not merely enabled', async () => {
+  const { code, stderr, invocations } = await runServiceActivation()
+  assert.equal(code, 0, `the shipped service section must succeed against a healthy unit: ${stderr}`)
+
+  // The recording must have happened at all, or every assertion here is vacuous.
+  assert.ok(invocations.length >= 3,
+    `the stub systemctl must have been invoked (recorded: ${JSON.stringify(invocations)})`)
+  assert.ok(invocations.includes('daemon-reload'), 'the unit must be re-read before it is used')
+
+  // THE FINDING. A recorded `restart` of this unit, not a `start`, and not `enable --now`.
+  const restarts = invocations.filter((i) => i === 'restart onetwoinventory.service')
+  assert.deepEqual(restarts, ['restart onetwoinventory.service'],
+    'the installer must RESTART the application service exactly once. `systemctl start` on an '
+    + 'already-running unit is a no-op, so an upgrade would leave the previous process alive on '
+    + `the previous lock path. Recorded: ${JSON.stringify(invocations)}`)
+  assert.deepEqual(invocations.filter((i) => /^enable --now\b/.test(i)), [],
+    '`enable --now` must not be how the service is brought up: its `--now` is a `start`, which '
+    + `does nothing to a running process. Recorded: ${JSON.stringify(invocations)}`)
+  assert.deepEqual(invocations.filter((i) => /^start\b/.test(i)), [],
+    `a bare start is the same no-op. Recorded: ${JSON.stringify(invocations)}`)
+
+  // It is still enabled — a restart does not survive a reboot on its own.
+  assert.ok(invocations.includes('enable onetwoinventory.service'),
+    `the unit must also be enabled for boot. Recorded: ${JSON.stringify(invocations)}`)
+
+  // ORDER, as recorded: the unit is re-read, the legacy pm2 supervisor is removed, and only then
+  // is the process replaced — restarting before daemon-reload would restart onto the OLD unit.
+  const at = (needle: string) => invocations.findIndex((i) => i === needle)
+  assert.ok(at('daemon-reload') < at('restart onetwoinventory.service'),
+    `daemon-reload must precede the restart. Recorded: ${JSON.stringify(invocations)}`)
+  assert.ok(at('disable pm2-ims') < at('restart onetwoinventory.service'),
+    `the legacy pm2 unit is disposed of before the restart. Recorded: ${JSON.stringify(invocations)}`)
+
+  // And the state the crontab section keys off is set only after all of that.
+  assert.match(stderr, /APP_SERVICE_RESTARTED=yes/,
+    'the section must record that the restart happened, for the crontab section to check')
+})
+
+test('[o3d-batch-ret] a FAILED restart ABORTS the install before the crontab section', async () => {
+  // A restart that fails leaves us unable to say what is serving this installation. Continuing
+  // would have the installer take a lock that claims it knows.
+  const failed = await runServiceActivation({ restartExitCode: 1 })
+  assert.equal(failed.code, 9, `a failed restart must die, not warn: ${failed.stderr}`)
+  assert.match(failed.stderr, /^DIE: /m)
+  assert.match(failed.stderr, /crontab/i,
+    'the message must say why a failed restart is fatal HERE — the crontab lock below would '
+    + 'serialise against nothing')
+  assert.match(failed.stderr, /installer again/,
+    'and that re-running is the fix, because everything before this point is idempotent')
+  assert.doesNotMatch(failed.stderr, /APP_SERVICE_RESTARTED=yes/,
+    'the ordering flag must NOT be set on a failed restart')
+
+  // A restart can report success and still leave nothing running — with Restart=always a unit whose
+  // ExecStart cannot be executed sits in auto-restart, which is `activating`, not `active`.
+  const notUp = await runServiceActivation({ isActiveAfterRestart: 'activating' })
+  assert.equal(notUp.code, 9,
+    `a unit that is not active after the restart must abort too: ${notUp.stderr}`)
+  assert.match(notUp.stderr, /activating/,
+    'the message must name the state systemd actually reported')
+  assert.doesNotMatch(notUp.stderr, /APP_SERVICE_RESTARTED=yes/)
+})
+
+test('[o3d-batch-ret] the crontab section REFUSES to take the lock unless the restart happened first', async () => {
+  const lines = INSTALL_SH.split('\n')
+  const restartLine = lines.findIndex((l) => l === 'APP_SERVICE_RESTARTED=yes')
+  const guardLine = lines.findIndex((l) => /^\[\[ "\$\{APP_SERVICE_RESTARTED:-no\}" == "yes" \]\]/.test(l))
+  const openLine = lines.findIndex((l) => l === 'exec 9<"${CRONTAB_LOCK_FILE}"')
+  const buildLine = lines.findIndex((l) => /^run_as_user "\$\{APP_USER\}" npm run build/.test(l))
+  const unitLine = lines.findIndex((l) => /^cat > "\/etc\/systemd\/system\/\$\{APP_NAME\}\.service"/.test(l))
+  for (const [name, index] of [['restart', restartLine], ['guard', guardLine], ['open', openLine],
+    ['build', buildLine], ['unit', unitLine]] as Array<[string, number]>) {
+    assert.notEqual(index, -1, `scripts/install.sh no longer has the ${name} line`)
+  }
+  // "after installing the new build and unit, and before any installer crontab access."
+  assert.ok(buildLine < unitLine && unitLine < restartLine && restartLine < guardLine
+    && guardLine < openLine,
+    `the order must be build -> unit -> restart -> guard -> lock, and is build:${buildLine} `
+    + `unit:${unitLine} restart:${restartLine} guard:${guardLine} open:${openLine}`)
+
+  // The guard is not decoration: run the shipped line with the flag as an unrestarted run would
+  // leave it, and it must refuse.
+  const guard = lines[guardLine] + '\n' + lines[guardLine + 1]
+  const prelude = 'set -euo pipefail\ndie() { echo "DIE: $*" >&2; exit 9; }\n'
+  const refused = await sh(`${prelude}${guard}\necho REACHED-THE-LOCK`)
+  assert.equal(refused.code, 9, `an unrestarted run must not reach the lock: ${refused.stderr}`)
+  assert.doesNotMatch(refused.stdout, /REACHED-THE-LOCK/)
+  assert.match(refused.stderr, /ordering bug in the installer itself/,
+    'and it must say this is an installer ordering bug, not something an operator did')
+
+  // CONTROL — with the flag set, the same line falls through. Without this the refusal above could
+  // be a broken line rather than a guard.
+  const allowed = await sh(`${prelude}APP_SERVICE_RESTARTED=yes\n${guard}\necho REACHED-THE-LOCK`)
+  assert.equal(allowed.code, 0, allowed.stderr)
+  assert.match(allowed.stdout, /REACHED-THE-LOCK/)
 })
