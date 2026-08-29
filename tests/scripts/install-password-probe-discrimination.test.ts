@@ -2998,7 +2998,8 @@ test('r46: a CA readable only by its owner is published as a copy every uid can 
   //         this is what dropping the argument does): db_ca_path_is_open_to_every_uid() refuses,
   //         PUBLISH= is non-zero, and the run dies naming ${APP_USER}. That is the finding.
   //   M2 -- publish with mode 666: the same function refuses, because a trust root anyone can
-  //         rewrite is the other half of the finding.
+  //         rewrite is the other half of the finding. MUTABLE=/MUTABLE_RESTORED= measure that
+  //         refusal directly, and the pair is what stops it being a refusal about something else.
   //   M3 -- delete the digest comparison from verify_db_ca_published(): DIGEST_AFTER_TAMPER= comes
   //         back 0 and the tampered CA is accepted.
   //   M4 -- make verify_db_ca_published() iterate over nothing instead of over "$@": CALLED= comes
@@ -3042,6 +3043,14 @@ test('r46: a CA readable only by its owner is published as a copy every uid can 
         verify_db_ca_published "\${APP_USER}" >/dev/null 2>&1; echo "UNREADABLE=$?"
         run_as_user() { shift; "$@"; }
 
+        # A TRUST ROOT ITS OWN READERS CAN REWRITE IS THE OTHER HALF OF THE FINDING: the bytes are
+        # still the validated ones here, and it must be refused anyway, because nothing stops them
+        # being different by the time the service opens the file.
+        chmod 666 ${JSON.stringify(published)}
+        verify_db_ca_published "\${APP_USER}" >/dev/null 2>&1; echo "MUTABLE=$?"
+        chmod 644 ${JSON.stringify(published)}
+        verify_db_ca_published "\${APP_USER}" >/dev/null 2>&1; echo "MUTABLE_RESTORED=$?"
+
         # AND THE DIGEST IS WHAT SAYS THE BYTES ARE STILL THE ONES THAT WERE VALIDATED.
         printf '%s' "-- a different certificate authority --" > ${JSON.stringify(published)}
         verify_db_ca_published >/dev/null 2>&1; echo "DIGEST_AFTER_TAMPER=$?"
@@ -3053,6 +3062,10 @@ test('r46: a CA readable only by its owner is published as a copy every uid can 
     assert.match(run.output, /^VERIFY=0$/m,
       `VERIFY: the published copy must verify for the account the service runs as:\n${run.output}`)
     assert.match(run.output, /^DIGEST=[0-9a-f]{64}$/m, 'the publication must record the digest of what it published')
+    assert.match(run.output, /^MUTABLE=1$/m,
+      `MUTABLE: a published CA that more than its owner can write must be refused:\n${run.output}`)
+    assert.match(run.output, /^MUTABLE_RESTORED=0$/m,
+      `MUTABLE_RESTORED: and the refusal must be about the mode, or MUTABLE proves nothing:\n${run.output}`)
     assert.match(run.output, /^DIGEST_AFTER_TAMPER=1$/m,
       `DIGEST_AFTER_TAMPER: a trust root replaced after publication must be refused:\n${run.output}`)
 
