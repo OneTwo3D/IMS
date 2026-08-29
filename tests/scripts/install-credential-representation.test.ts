@@ -711,7 +711,7 @@ test('r39: boundary (4) — neither password authenticates: the run refuses and 
 
     const next = runShipped(installVars(cluster, root), NEXT_RUN_BODY)
     assert.equal(next.status, 9, `neither candidate authenticates, so the run must refuse:\n${next.output}`)
-    assert.match(next.output, /could not find a single endpoint able to tell one password from another/, 'for the reason the operator needs')
+    assert.match(next.output, /could not find a single endpoint that both checks POSTGRESQL'S OWN role credential for 'imsuser' and can tell one password from another/, 'for the reason the operator needs')
     assert.match(next.output, /NEITHER of the two passwords it recorded was accepted/, 'and it names the out-of-band rotation this looks like')
     // r40: the refusal now shows its WORKING — what each endpoint it asked actually did. Without
     // that, "no endpoint could discriminate" is indistinguishable from "the server is down", and

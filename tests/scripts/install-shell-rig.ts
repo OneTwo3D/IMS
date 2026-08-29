@@ -60,7 +60,12 @@ export const SHIPPED = [
   'write_role_rotation_journal',
   'clear_role_rotation_journal',
   // r40 (Codex HIGH): the probe that has to prove it can say NO before anything believes its YES.
+  // r41 (Codex HIGH): and, before either, the question of WHOSE password the endpoint checks —
+  // asked of the server, answered by the shipped reader, and lifted here rather than modelled.
   'db_endpoint_accepts_password',
+  'db_auth_request_probe_path',
+  'db_endpoint_checks_role_verifier',
+  'db_endpoint_discriminates_passwords',
   'db_endpoint_is_password_sensitive',
   'db_connectable_databases_except_app',
   'db_unfenced_probe_candidates',
@@ -151,6 +156,15 @@ DB_ROTATION_RECONCILED_PASSWORD=""
 DB_ROTATION_RECONCILED_WHICH=""
 DB_ROTATION_PROBE_DATABASE=""
 DB_PROBE_REPORT=""
+# r41 (Codex HIGH): THE SHIPPED READER, at its real path.
+#
+# In install.sh this resolves from \${IMS_SCRIPT_LIB_DIR}, which is derived from BASH_SOURCE — and
+# these functions are run outside the shipped file, so there is no BASH_SOURCE to derive it from.
+# It is pointed at the repository's own copy so the tests execute the SHIPPED BYTES; a rig that
+# defaulted to nothing would have every test silently measuring the 'reader is missing' refusal
+# instead of the mechanism. It is set BEFORE \${assignments}, so a test that wants that refusal —
+# and there is one — can still ask for it by name.
+IMS_AUTH_REQUEST_PROBE="${join(REPO, 'scripts/lib/pg-auth-request.mjs')}"
 ${CAPTURE_TERMINATOR_ASSIGNMENT}
 declare -A EXISTING_ENV=()
 ${assignments}

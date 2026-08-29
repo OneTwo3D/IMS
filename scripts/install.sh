@@ -1464,11 +1464,12 @@ rotate_database_password_in_fenced_window() {
   # here touches it; the rest of the list is READ FROM THE SERVER, so a site that has hardened the
   # maintenance database still has somewhere this question can be asked.
   #
-  # So it is proven here, with the negative control, BEFORE the ALTER: refuse a random password,
-  # accept the one this run knows is live. The FIRST endpoint that does both is the one recorded —
-  # an endpoint that cannot do both cannot be relied on afterwards, and a rotation that would leave
-  # an unreconcilable journal is a rotation this run must not perform. Refusing costs nothing — no
-  # ALTER has been issued.
+  # So it is proven here, BEFORE the ALTER, in three parts (r41 added the first of them): the
+  # SERVER names the pg_hba method it matched and it is one that compares pg_authid.rolpassword;
+  # the endpoint then refuses a random password; and it accepts the one this run knows is live.
+  # The FIRST endpoint that does all three is the one recorded — an endpoint that cannot cannot be
+  # relied on afterwards, and a rotation that would leave an unreconcilable journal is a rotation
+  # this run must not perform. Refusing costs nothing — no ALTER has been issued.
   DB_PROBE_REPORT=""
   DB_ROTATION_PROBE_DATABASE=""
   local -a rotation_probe_candidates=()
@@ -1481,16 +1482,18 @@ rotate_database_password_in_fenced_window() {
     fi
   done
   if [[ -n "${DB_ROTATION_PROBE_DATABASE}" ]]; then
-    info "Rotation endpoint proven: '${DB_ROTATION_PROBE_DATABASE}' refused a random 32-byte password"
-    info "and accepted the credential '${DB_USER}' is holding right now, so it can tell one password"
-    info "from another. That endpoint is recorded in the journal and is what a next run reconciles"
-    info "against — the application database is never it, because the fence stands over that one."
+    info "Rotation endpoint proven: on '${DB_ROTATION_PROBE_DATABASE}' the server itself named a"
+    info "matched pg_hba method that compares pg_authid.rolpassword — the secret ALTER ROLE writes —"
+    info "and that endpoint then refused a random 32-byte password and accepted the credential"
+    info "'${DB_USER}' is holding right now. It is recorded in the journal and is what a next run"
+    info "reconciles against — the application database is never it, because the fence stands over"
+    info "that one."
   else
     # ONE PHYSICAL LINE, AND THE REPORT LAST. deploy-order.test.ts classifies every source line that
     # names an application-owned path, and a literal newline inside this string makes its second half
     # a separate line with no declared shape. Keeping ${DB_PROBE_REPORT} — which carries its own
     # leading newlines — at the very end is what keeps the sentence readable and the line singular.
-    die "A database credential rotation was requested for '${DB_USER}', and this run cannot show that ANY unfenced endpoint would be able to tell afterwards which password the role has. The rotation is the one step here that has no undo, and its only safety net is a journal the next run reconciles by ASKING THE SERVER — so a probe that cannot refuse a password nothing knows, or cannot reach the role at all, turns that net into a guess. The application database '${DB_NAME}' cannot be that endpoint: the connection fence this run is holding revokes CONNECT on it, and a reconciliation runs with that fence still standing. THE ALTER HAS NOT BEEN ISSUED: '${DB_USER}' still has the credential ${APP_DIR}/.env names, the two agree, and starting the old service by hand would work. NOTHING HAS BEEN MIGRATED. Give the role a password-checked route to 'postgres': GRANT CONNECT ON DATABASE postgres TO that role, and a pg_hba.conf rule for ${DB_HOST} that is scram-sha-256 or md5 rather than trust. Then re-run; or rotate the password by hand and re-run supplying it. What this run asked, and what each endpoint did:${DB_PROBE_REPORT}"
+    die "A database credential rotation was requested for '${DB_USER}', and this run cannot show that ANY unfenced endpoint would be able to tell afterwards which password the role has. The rotation is the one step here that has no undo, and its only safety net is a journal the next run reconciles by ASKING THE SERVER — so a probe that cannot refuse a password nothing knows, or cannot reach the role at all, or is not checking POSTGRESQL'S OWN role credential in the first place, turns that net into a guess. The application database '${DB_NAME}' cannot be that endpoint: the connection fence this run is holding revokes CONNECT on it, and a reconciliation runs with that fence still standing. THE ALTER HAS NOT BEEN ISSUED: '${DB_USER}' still has the credential ${APP_DIR}/.env names, the two agree, and starting the old service by hand would work. NOTHING HAS BEEN MIGRATED. Give the role a password-checked route to 'postgres': GRANT CONNECT ON DATABASE postgres TO that role, and a pg_hba.conf rule for ${DB_HOST} that is scram-sha-256 or md5. Those two are the only methods accepted, because they are the only ones that compare the secret ALTER ROLE writes: 'trust' checks nothing, and 'password', 'ldap', 'pam', 'radius' and 'bsd' all ask for a cleartext password over the same protocol message, so the four that consult an outside directory cannot be told from the one that does not — an answer from any of them may be about a credential this installer has no way to change. Then re-run; or rotate the password by hand and re-run supplying it. What this run asked, and what each endpoint did:${DB_PROBE_REPORT}"
   fi
 
   # Refusing here costs nothing: nothing has been ALTERed yet, so the sentence below is true.
@@ -2004,6 +2007,50 @@ clear_role_rotation_journal() {
 }
 
 # ---------------------------------------------------------------------------
+# AND A PROBE THAT CAN SAY NO IS NOT EVIDENCE EITHER, UNTIL IT SAYS WHOSE PASSWORD IT CHECKED
+# (o3d-2sm1.5 r41, Codex HIGH)
+# ---------------------------------------------------------------------------
+#
+# THE DEFECT r40 LEFT. The negative control below proves an endpoint discriminates BETWEEN
+# PASSWORDS. It does not prove the password it discriminates on is POSTGRESQL'S ROLE CREDENTIAL,
+# which is the only thing `ALTER ROLE ... PASSWORD` changes. `pg_hba.conf` has password-dependent
+# methods that consult somebody else's store — `ldap`, `pam`, `radius`, `bsd` — and under every one
+# of them both halves of the control behave exactly as a healthy scram endpoint would:
+#
+#   `postgres` authenticates through RADIUS while '${DB_NAME}' uses scram. Before the rotation the
+#   RADIUS endpoint accepts the credential `.env` names and refuses the random control, so it is
+#   admitted and recorded. The run dies after the ALTER. The next run re-proves that same endpoint,
+#   RADIUS still accepts only the OLD password — it never heard of the ALTER — so the
+#   reconciliation concludes the ALTER did not commit, publishes the OLD password and CLEARS THE
+#   JOURNAL. The application database now wants the NEW one. The service cannot connect and the
+#   evidence for recovering it has been deleted.
+#
+# THE FIX IS TO STOP INFERRING THE METHOD AND ASK FOR IT. An endpoint is admitted only when the
+# SERVER ITSELF named a matched rule that checks `pg_authid.rolpassword`, and the server names it
+# in the ordinary v3 startup exchange: it performs its own pg_hba match and announces the
+# consequence as an Authentication request message, which is one value for `scram-sha-256`/`md5`
+# and a different value for everything else. lib/pg-auth-request.mjs reads that one message and
+# exits 0 only for the two, sending no password at all. Its header documents the mapping, the two
+# routes that were measured and rejected (`pg_hba_file_rules` is a rule LISTING and not a match;
+# libpq's `require_auth` does not exist before libpq 16), and what the answer does not cover.
+#
+# WHAT THIS ESTABLISHES: that the secret this endpoint is about to compare is the one ALTER ROLE
+# writes, for this role, on this database, from this address, over this transport.
+#
+# WHAT IT DOES NOT: it cannot admit the `password` method — cleartext compared against the role's
+# own secret — because on the wire that is the same message `ldap` sends, and it must be: an
+# external verifier can only be consulted with the plaintext. Refusing it is a deliberate
+# narrowing, and the refusal below says so and says what to change. Nor is the method observed on
+# the SAME connection psql then opens; it is observed on one stating the same user, database,
+# host, port and SSL preference, so only a pg_hba reload between the two could separate them —
+# which is the remaining reason the negative control is kept rather than retired as redundant.
+#
+# THE ORDER IS METHOD FIRST, AND THAT IS NOT AN OPTIMISATION. The positive half of the control
+# sends the application role's real password to the endpoint. Running it before the method is
+# known is handing that credential to a directory server this run has not yet established is not
+# involved. So nothing is sent until the server has said it is checking its own catalogue.
+#
+# ---------------------------------------------------------------------------
 # A PROBE THAT CANNOT SAY NO IS NOT EVIDENCE (o3d-2sm1.5 r40, Codex HIGH)
 # ---------------------------------------------------------------------------
 #
@@ -2057,9 +2104,62 @@ db_endpoint_accepts_password() {
 DB_ROTATION_PROBE_DATABASE=""
 DB_PROBE_REPORT=""
 
+# WHERE THE AUTHENTICATION-REQUEST READER LIVES (o3d-2sm1.5 r41, Codex HIGH).
+#
+# ${IMS_SCRIPT_LIB_DIR} is THIS SCRIPT'S OWN lib directory, resolved from BASH_SOURCE at startup —
+# the release being installed, not ${APP_DIR}. That distinction is the whole of r31's finding and
+# it is why db-fence-protected.sh is sourced from there; this helper is held to the same rule. It
+# is also handed NO credential of any kind: it reads one message and drops the connection, so even
+# the hazard that made the fence helper's provenance load-bearing does not arise here.
+#
+# IMS_AUTH_REQUEST_PROBE exists for the regressions, which run the shipped functions outside the
+# shipped file and so have no BASH_SOURCE to resolve from. It cannot weaken anything: pointing it
+# somewhere else does not produce an exemption, it produces the refusal below.
+db_auth_request_probe_path() {
+  printf '%s' "${IMS_AUTH_REQUEST_PROBE:-${IMS_SCRIPT_LIB_DIR:-}/pg-auth-request.mjs}"
+}
+
+# THE MATCHED METHOD, AS THE SERVER STATED IT. Returns 0 only when the rule PostgreSQL itself
+# matched for ${DB_USER} on this database, from ${DB_HOST}, over the transport libpq's default
+# `sslmode=prefer` negotiates, checks the secret `ALTER ROLE` writes. Appends to DB_PROBE_REPORT
+# on every refusal. Sends no password.
+db_endpoint_checks_role_verifier() {
+  local database="$1" probe verdict method detail status=0
+  probe="$(db_auth_request_probe_path)"
+  if [[ ! -f "${probe}" ]]; then
+    DB_PROBE_REPORT+="
+  - '${database}' was not asked which pg_hba rule matches it, because the reader that asks — ${probe} — is not there. Without it this run cannot tell a 'scram-sha-256' endpoint from an 'ldap' one, and an ldap endpoint answers about a directory rather than about the password ALTER ROLE writes. Re-run the installer from a complete release checkout."
+    return 1
+  fi
+  if ! command -v node >/dev/null 2>&1; then
+    DB_PROBE_REPORT+="
+  - '${database}' was not asked which pg_hba rule matches it, because there is no 'node' on this PATH to run ${probe} with. Install Node.js — this installer installs it further down its own run, so a host that reached a credential rotation has it — and re-run."
+    return 1
+  fi
+  # The reader's own answer, whatever it is, on stdout. Its EXIT STATUS is the verdict; the
+  # `method=` and `detail=` lines are what the refusal quotes back to the operator.
+  capture verdict node "${probe}" \
+    --host="${DB_HOST}" --port="${DB_PORT}" --user="${DB_USER}" --database="${database}" || status=$?
+  method="$(printf '%s\n' "${verdict}" | sed -n 's/^method=//p' | head -1)"
+  detail="$(printf '%s\n' "${verdict}" | sed -n 's/^detail=//p' | head -1)"
+  [[ -n "${method}" ]] || method="unknown"
+  [[ -n "${detail}" ]] || detail="the reader printed nothing this run could parse"
+  if [[ "${status}" -eq 0 ]]; then
+    return 0
+  fi
+  DB_PROBE_REPORT+="
+  - '${database}' does not authenticate '${DB_USER}' against PostgreSQL's own role credential: the matched pg_hba method reads as '${method}', and ${detail}. Only 'scram-sha-256' and 'md5' compare the secret ALTER ROLE writes, so nothing this endpoint says about a candidate password is evidence about the role."
+  return 1
+}
+
 # THE PAIR. Returns 0 only when the endpoint refused a password nothing can know AND accepted one
 # the caller is asserting is live. Appends a line to DB_PROBE_REPORT either way.
-db_endpoint_is_password_sensitive() {
+#
+# IT IS NO LONGER THE WHOLE GATE (r41) — db_endpoint_checks_role_verifier() runs FIRST and decides
+# whose password is being checked. This half is kept because it is the only thing that would catch
+# the two connections being matched by different pg_hba records, and because a positive that the
+# endpoint refuses still means the role cannot get in there at all.
+db_endpoint_discriminates_passwords() {
   local database="$1" positive="$2" control
   control="$(openssl rand -hex 32)"
   if db_endpoint_accepts_password "${database}" "${control}"; then
@@ -2072,6 +2172,16 @@ db_endpoint_is_password_sensitive() {
   - '${database}' refused the random password AND the candidate, so it has not been shown able to say yes. A revoked CONNECT is indistinguishable from a wrong password here — and this installer's own connection fence revokes CONNECT on '${DB_NAME}', which is why the application database cannot be the endpoint a rotation relies on."
     return 1
   fi
+  return 0
+}
+
+# THE WHOLE GATE, IN THE ORDER THE ARGUMENT RUNS (r41). Whose password first, then whether this
+# endpoint can tell one from another, then whether the role can get in with the one asserted live.
+# Nothing is sent to the server until the first question has been answered.
+db_endpoint_is_password_sensitive() {
+  local database="$1" positive="$2"
+  db_endpoint_checks_role_verifier "${database}" || return 1
+  db_endpoint_discriminates_passwords "${database}" "${positive}" || return 1
   return 0
 }
 
@@ -2150,9 +2260,16 @@ resolve_live_role_password() {
   DB_ROTATION_RECONCILED_WHICH=""
 
   for database in "${endpoints[@]}"; do
-    # THE CANDIDATES FIRST, so that the positive half of the control pair is a password this run
-    # actually cares about rather than a second throwaway role. An endpoint that accepts neither
-    # has not been shown able to say yes and is skipped by the pair test below.
+    # WHOSE PASSWORD, BEFORE ANY PASSWORD (o3d-2sm1.5 r41, Codex HIGH). The two attempts below send
+    # the journal's candidates to this endpoint. If its rule is `ldap`, `pam`, `radius` or `bsd`
+    # that hands both of the role's credentials to somebody else's directory — and the answer that
+    # came back would be about that directory, not about the role. So the server is asked which
+    # rule it matched first, and an endpoint that is not checking pg_authid.rolpassword is dropped
+    # here, before anything leaves this host.
+    db_endpoint_checks_role_verifier "${database}" || continue
+    # THE CANDIDATES, so that the positive half of the control pair is a password this run actually
+    # cares about rather than a second throwaway role. An endpoint that accepts neither has not
+    # been shown able to say yes and is skipped by the pair test below.
     new_ok=false; old_ok=false
     db_endpoint_accepts_password "${database}" "${new_password}" && new_ok=true
     db_endpoint_accepts_password "${database}" "${old_password}" && old_ok=true
@@ -2163,11 +2280,12 @@ resolve_live_role_password() {
     fi
     # AND NOW THE CONTROL, against the candidate that connected. This is the half that makes a
     # success mean something: under `trust` both flags above are true and the endpoint is thrown
-    # out here rather than believed.
+    # out here rather than believed. The method half of the gate already ran, at the top of this
+    # iteration, which is why this calls the discrimination half rather than the pair.
     if ${new_ok}; then
-      db_endpoint_is_password_sensitive "${database}" "${new_password}" || continue
+      db_endpoint_discriminates_passwords "${database}" "${new_password}" || continue
     else
-      db_endpoint_is_password_sensitive "${database}" "${old_password}" || continue
+      db_endpoint_discriminates_passwords "${database}" "${old_password}" || continue
     fi
     if ${new_ok} && ${old_ok}; then
       DB_ROTATION_PROBE_DATABASE="${database}"
@@ -2223,7 +2341,8 @@ reconcile_interrupted_role_rotation() {
   warn "A database credential rotation for ${identity} was INTERRUPTED: ${DB_ROLE_ROTATION_JOURNAL} exists,"
   warn "which means a previous run committed — or was about to commit — an ALTER USER and did not"
   warn "get as far as publishing ${env_file}. Asking the server which password that role has —"
-  warn "on an endpoint that has first been shown able to REFUSE a password nothing can know."
+  warn "on an endpoint whose matched pg_hba rule the SERVER named as one that compares the secret"
+  warn "ALTER ROLE writes, and which has then been shown able to REFUSE a password nothing knows."
 
   resolve_live_role_password "${old_password}" "${new_password}" "${recorded_probe}" || resolution=$?
 
@@ -2232,17 +2351,17 @@ reconcile_interrupted_role_rotation() {
   fi
 
   if [[ "${resolution}" -ne 0 ]]; then
-    die "A database credential rotation for ${identity} was interrupted and this run could not find a single endpoint able to tell one password from another for '${DB_USER}', so nothing it asked the server is evidence about which credential is live. A trust rule makes every candidate succeed and a revoked CONNECT makes every candidate fail, and this run refuses on either rather than adopting a password the probe cannot discriminate. NEITHER of the two passwords it recorded was accepted anywhere it could ask, which is also what you see when somebody has rotated the role OUT OF BAND or the server is not reachable from here — and nothing this script can ask tells those apart, which is why it stops. ${DB_ROLE_ROTATION_JOURNAL} is LEFT IN PLACE so the two candidates are not lost. Give '${DB_USER}' a password-checked route to an UNFENCED database — GRANT CONNECT ON DATABASE postgres TO that role, with a scram-sha-256 or md5 rule for ${DB_HOST} in pg_hba.conf, is the whole of it — or establish the role's password by hand and remove that file. NOTHING HAS BEEN INSTALLED and nothing has been stopped. What this run asked, and what each endpoint did:${DB_PROBE_REPORT}"
+    die "A database credential rotation for ${identity} was interrupted and this run could not find a single endpoint that both checks POSTGRESQL'S OWN role credential for '${DB_USER}' and can tell one password from another, so nothing it asked the server is evidence about which credential is live. A trust rule makes every candidate succeed; a revoked CONNECT makes every candidate fail; and an ldap, pam, radius or bsd rule answers confidently about a password held somewhere ALTER ROLE cannot reach — this run refuses on any of them rather than adopting a credential the probe cannot speak for. It may also be that NEITHER of the two passwords it recorded was accepted anywhere it could ask, which is what you see when somebody has rotated the role OUT OF BAND or the server is not reachable from here — and nothing this script can ask tells those apart, which is why it stops. ${DB_ROLE_ROTATION_JOURNAL} is LEFT IN PLACE so the two candidates are not lost. Give '${DB_USER}' a password-checked route to an UNFENCED database — GRANT CONNECT ON DATABASE postgres TO that role, with a scram-sha-256 or md5 rule for ${DB_HOST} in pg_hba.conf, is the whole of it — or establish the role's password by hand and remove that file. NOTHING HAS BEEN INSTALLED and nothing has been stopped. What this run asked, and what each endpoint did:${DB_PROBE_REPORT}"
   fi
 
   DB_ROTATION_JOURNAL_FOUND=true
 
   if [[ "${DB_ROTATION_RECONCILED_WHICH}" == "new" ]]; then
-    success "The server has the NEW password: the ALTER committed. Established on '${DB_ROTATION_PROBE_DATABASE}', which refused a random password in the same breath, so the acceptance means the server checked. This run FINISHES the transition — it treats that credential as the installed one, so the environment file it writes names what the server actually has, and the journal is cleared only once that file is on the medium. ${env_file} may currently name the old one; it is complete and it is about to be replaced."
+    success "The server has the NEW password: the ALTER committed. Established on '${DB_ROTATION_PROBE_DATABASE}', whose matched pg_hba rule the server named as scram-sha-256 or md5 — so the secret it compared is the one ALTER ROLE writes — and which refused a random password in the same breath. This run FINISHES the transition — it treats that credential as the installed one, so the environment file it writes names what the server actually has, and the journal is cleared only once that file is on the medium. ${env_file} may currently name the old one; it is complete and it is about to be replaced."
     return 0
   fi
 
-  success "The server still has the OLD password: the ALTER did not commit, so nothing was ever taken away and ${env_file} already agrees with the server. Established on '${DB_ROTATION_PROBE_DATABASE}', which refused a random password in the same breath. This run treats that credential as the installed one and clears the journal. Supply the new password again to ask for the rotation a second time; it will happen inside the stopped, fenced window."
+  success "The server still has the OLD password: the ALTER did not commit, so nothing was ever taken away and ${env_file} already agrees with the server. Established on '${DB_ROTATION_PROBE_DATABASE}', whose matched pg_hba rule the server named as scram-sha-256 or md5, and which refused a random password in the same breath. This run treats that credential as the installed one and clears the journal. Supply the new password again to ask for the rotation a second time; it will happen inside the stopped, fenced window."
   return 0
 }
 

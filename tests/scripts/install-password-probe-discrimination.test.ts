@@ -132,7 +132,13 @@ test('r40: a trust rule on the probe endpoint makes the rotation REFUSE, not pro
     assert.equal(run.status, 9, `the rotation must refuse on an endpoint that cannot discriminate:\n${run.output}`)
     assert.doesNotMatch(run.output, /ROTATED_ANYWAY/, 'and must not continue past the refusal')
     assert.match(run.output, /cannot show that ANY unfenced endpoint would be able to tell afterwards which password the role has/, 'for the reason the finding names')
-    assert.match(run.output, /'postgres' ACCEPTED a random 32-byte password/, 'and it reports the negative control that failed')
+    // r41: under `trust` the endpoint is now discarded ONE STEP EARLIER than it was in r40 — the
+    // server answers the startup message with AuthenticationOk, naming a rule that checks no
+    // password at all, so the method gate drops it before the negative control is ever run. The
+    // negative-control sentence is therefore no longer the one an operator sees here, and this
+    // assertion follows the code rather than the other way round.
+    assert.match(run.output, /'postgres' does not authenticate 'imsuser' against PostgreSQL's own role credential/, 'and it reports the endpoint that was refused')
+    assert.match(run.output, /the matched pg_hba method reads as 'trust'/, 'naming the method the SERVER said it matched')
     assert.match(run.output, /THE ALTER HAS NOT BEEN ISSUED/, 'and says what state the role is in')
     assert.match(run.output, /GRANT CONNECT ON DATABASE postgres/, 'and what the operator does about it')
 
@@ -212,9 +218,13 @@ test('r40: under trust the reconciliation REFUSES rather than adopting the candi
     assert.match(next.output, /CLUSTER_IS_OPEN=yes/, 'precondition: this cluster must accept any password, or the test is about nothing')
 
     assert.equal(next.status, 9, `a probe that cannot refuse must not decide:\n${next.output}`)
-    assert.match(next.output, /could not find a single endpoint able to tell one password from another/, 'for the reason the finding names')
-    assert.match(next.output, /'postgres' ACCEPTED a random 32-byte password/, 'and it reports the maintenance database')
-    assert.match(next.output, /'one_two_inventory' ACCEPTED a random 32-byte password/, 'and the application database')
+    assert.match(next.output, /could not find a single endpoint that both checks POSTGRESQL'S OWN role credential for 'imsuser' and can tell one password from another/, 'for the reason the finding names')
+    // r41: both endpoints are `trust`, and `trust` is now refused at the method gate — the server
+    // asks for no password at all — so both report the matched method rather than the acceptance
+    // of the random control.
+    assert.match(next.output, /'postgres' does not authenticate 'imsuser' against PostgreSQL's own role credential/, 'and it reports the maintenance database')
+    assert.match(next.output, /'one_two_inventory' does not authenticate 'imsuser' against PostgreSQL's own role credential/, 'and the application database')
+    assert.match(next.output, /the matched pg_hba method reads as 'trust'/, 'naming what the server said it matched')
     assert.match(next.output, /LEFT IN PLACE/, 'and the record is kept')
     assert.doesNotMatch(next.output, /ADOPTED=/, 'nothing past the refusal ran')
 
@@ -278,7 +288,7 @@ test('r40: a recorded probe endpoint that has gone trust is discarded, and a dis
     assert.equal(next.status, 0, next.output)
     assert.match(next.output, /server has the NEW password/, 'the discriminating endpoint must give the right answer')
     assert.match(next.output, /PROBE_DB=one_two_inventory/, 'and it must be the endpoint that could discriminate, not the recorded one')
-    assert.match(next.output, /Established on 'one_two_inventory', which refused a random password/, 'and the success must say where and on what evidence')
+    assert.match(next.output, /Established on 'one_two_inventory', whose matched pg_hba rule the server named as scram-sha-256 or md5/, 'and the success must say where and on what evidence')
     assert.equal(decodeVar(next.output, 'INSTALLED_B64'), 'rotated-secret')
     assert.match(next.output, /JOURNAL_LEFT=no/, 'and the record is cleared')
     assert.equal(await connectWithDriver(envDatabaseUrl(root)), 'imsuser', 'and the file the service restarts from opens a connection')
@@ -563,7 +573,7 @@ test('r40: a site with no CONNECT on postgres rotates against a database the ser
     `)
     assert.equal(interrupted.status, 0, `the rotation must find an endpoint the server named:\n${interrupted.output}`)
     assert.match(interrupted.output, /GATE_PROBE_DB=ims_spare_probe/, 'and it must be the spare database, not the maintenance one and not the application one')
-    assert.match(interrupted.output, /Rotation endpoint proven: 'ims_spare_probe'/, 'and the run must say so')
+    assert.match(interrupted.output, /Rotation endpoint proven: on 'ims_spare_probe' the server itself named a/, 'and the run must say so')
 
     // The rotation completed here, so re-create the state a crash before the clear leaves: the
     // journal standing over a server that already has the new password.
