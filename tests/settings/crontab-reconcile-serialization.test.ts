@@ -643,7 +643,11 @@ test('[o3d-batch-ret] every crontab writer in the repository is inside the one e
           if (!call) return
           if (/'-l'/.test(line)) codeReads.push(rel)
           else codeWrites.push(rel)
-        } else if (/(^|[|;&({]\s*)crontab\b/.test(line) && !line.trimStart().startsWith('#')) {
+          // `\s*` AFTER `^`, not before `crontab`. The original spelling required `crontab` to be
+          // the FIRST CHARACTER of the line, so every indented bare invocation — which is what a
+          // call inside a shell function looks like — was skipped by a test that calls itself a
+          // walk. The merge with o3d-2sm1.5 brought in nine of them.
+        } else if (/(^\s*|[|;&({]\s*)crontab\b/.test(line) && !line.trimStart().startsWith('#')) {
           shellCrontab.push({ file: rel, line: index + 1, text: line })
         }
       })
@@ -686,9 +690,90 @@ test('[o3d-batch-ret] every crontab writer in the repository is inside the one e
   }
   assert.equal(callSites, 6, 'six call sites — if this changed, the new caller must be listed above')
 
-  // --- writer 2: the installer, in shell ---
-  assert.deepEqual([...new Set(shellCrontab.map((c) => c.file))], ['scripts/install.sh'],
-    'only the installer touches the crontab from shell; a new script must take the same lock and be listed here')
+  // --- writer 2 and beyond: the shell scripts ---
+  //
+  // THIS USED TO SAY `['scripts/install.sh']`, AND IT WAS TRUE WHEN IT WAS WRITTEN. The merge with
+  // o3d-2sm1.5 brought in a fenced cutover — deploy.sh, update.sh and install.sh itself now comment
+  // the whole crontab out before a migration, back it up verbatim, and put it back afterwards —
+  // and NONE of those read-modify-writes takes the flock. So the honest statement is no longer
+  // "one shell writer"; it is "one shell writer is inside the protocol, and these named ones are
+  // not, and here is exactly which".
+  //
+  // Classified by ENCLOSING SHELL FUNCTION rather than by file, because that is the unit that
+  // either takes the lock or does not, and because a file-level list would go on passing while a
+  // seventh function was added to a file already on it.
+  const enclosingFunction = (file: string, line: number): string => {
+    const src = readFileSync(join(REPO_ROOT, file), 'utf8').split('\n')
+    for (let i = line - 1; i >= 0; i--) {
+      const opened = src[i].match(/^([a-zA-Z_][a-zA-Z0-9_]*)\(\) \{/)
+      if (opened) return opened[1]
+      if (i < line - 1 && /^\}/.test(src[i])) break   // left the previous function's body
+    }
+    return '(top level)'
+  }
+  const byScope = new Map<string, number>()
+  for (const c of shellCrontab) {
+    const key = `${c.file}:${enclosingFunction(c.file, c.line)}`
+    byScope.set(key, (byScope.get(key) ?? 0) + 1)
+  }
+
+  // (a) THE ONE THAT IS INSIDE THE PROTOCOL. install.sh's bootstrap block, at top level, between
+  //     the descriptor it opens on the lock and the one it closes.
+  const installLinesForScope = INSTALL_SH.split('\n')
+  const lockOpen = installLinesForScope.findIndex((l) => l === 'exec 9<"${CRONTAB_LOCK_FILE}"')
+  const lockClose = installLinesForScope.findIndex((l, i) => i > lockOpen && /^exec 9>&-/.test(l))
+  assert.ok(lockOpen !== -1 && lockClose > lockOpen,
+    'scripts/install.sh must still open and close the crontab lock descriptor')
+  // Asserted just below, against the same region computed from the same two lines.
+  const topLevelInstall = shellCrontab.filter(
+    (c) => c.file === 'scripts/install.sh' && enclosingFunction(c.file, c.line) === '(top level)')
+
+  // (b) THE ONES THAT ARE NOT, NAMED AND COUNTED. Every entry here is a crontab read-modify-write
+  //     that can race the application's `reconcileCrontab`, which six server actions can start from
+  //     a browser at any moment. They are the cutover fence and its unwind: the crontab is
+  //     commented out while the OLD build is still serving, and restored after the NEW one is,
+  //     so the application is live at both ends of the window.
+  //
+  //     Tracked as o3d-batch-ret follow-up "extend the crontab flock to the fenced cutover".
+  //     Listed rather than tolerated: a writer that is NOT one of these fails this test, and so
+  //     does closing the gap, which is the point — either change has to come back through here.
+  const OUTSIDE_THE_PROTOCOL: Record<string, number> = {
+    'scripts/install.sh:fence_cron': 2,
+    'scripts/install.sh:unfence_cron': 1,
+    'scripts/install.sh:resume_from_interrupted_arming': 2,
+    'scripts/install.sh:restore_cron_from_backup': 1,
+    'scripts/deploy.sh:fence_cron': 2,
+    'scripts/deploy.sh:unfence_cron': 1,
+    'scripts/deploy.sh:resume_from_interrupted_arming': 2,
+    'scripts/deploy.sh:restore_cron_from_backup': 1,
+    'scripts/deploy.sh:adopt_cron_fence': 1,
+    'scripts/update.sh:fence_cron': 2,
+    'scripts/update.sh:unfence_cron': 1,
+    'scripts/update.sh:resume_from_interrupted_arming': 2,
+    'scripts/update.sh:restore_cron_from_backup': 1,
+    'scripts/update.sh:adopt_cron_fence': 1,
+  }
+  const found: Record<string, number> = {}
+  for (const [key, count] of byScope) {
+    if (key === 'scripts/install.sh:(top level)') continue
+    found[key] = count
+  }
+  assert.deepEqual(found, OUTSIDE_THE_PROTOCOL,
+    'every shell function that touches this crontab must be either inside the flock or on this '
+    + 'list. A new one is a second exclusion protocol; a removed one means the gap closed and the '
+    + 'list must shrink with it.')
+
+  // And none of those may be an unlocked write in the file that DOES own the lock without saying
+  // so — install.sh's fenced-cutover functions are on the list above precisely because they run
+  // BEFORE the section-16 lock is ever opened.
+  for (const key of Object.keys(OUTSIDE_THE_PROTOCOL)) {
+    if (!key.startsWith('scripts/install.sh:')) continue
+    const fn = key.slice('scripts/install.sh:'.length)
+    const declared = installLinesForScope.findIndex((l) => l.startsWith(`${fn}() {`))
+    assert.notEqual(declared, -1, `scripts/install.sh no longer declares ${fn}()`)
+    assert.ok(declared < lockOpen,
+      `${fn}() must be declared before the lock section, or it should be taking the lock`)
+  }
 
   const installLines = INSTALL_SH.split('\n')
   const lineOf = (re: RegExp) => {
@@ -701,7 +786,13 @@ test('[o3d-batch-ret] every crontab writer in the repository is inside the one e
   const released = lineOf(/^exec 9>&-/)
   assert.ok(opened < acquired && acquired < released, 'open, lock, release, in that order')
 
-  for (const { line, text } of shellCrontab) {
+  // SCOPED TO install.sh's OWN TOP-LEVEL WRITES. It used to run over every shell crontab site in
+  // the repository, which was the same set while install.sh was the only shell writer. deploy.sh
+  // and update.sh are now writers too and are NOT inside this file's flock — that is recorded, and
+  // bounded, by OUTSIDE_THE_PROTOCOL above; asserting it here instead would only mean asserting
+  // that install.sh's line numbers apply to another file.
+  assert.ok(topLevelInstall.length > 0, 'the installer must still write the crontab at top level')
+  for (const { line, text } of topLevelInstall) {
     assert.ok(line > acquired && line < released,
       `scripts/install.sh:${line} touches the crontab outside the flock region (lines ${acquired}-${released}): ${text.trim()}`)
   }
@@ -1455,7 +1546,7 @@ test('[o3d-batch-ret] the prepared lock cannot be replaced from a directory the 
 })
 
 // ---------------------------------------------------------------------------
-// 17 — LOAD-BEARING: an UPGRADE puts the RUNNING process on this lock protocol
+// 17 — LOAD-BEARING: the process that contends for this lock is the one this run BUILT
 //
 // The exclusion above is one flock on one inode, and it excludes exactly one thing: an application
 // process that locks the same inode. `systemctl enable --now` did not deliver that on the only run
@@ -1464,170 +1555,160 @@ test('[o3d-batch-ret] the prepared lock cannot be replaced from a directory the 
 // process alive on the previous bundle, previous environment and previous lock path — or no lock at
 // all — and the installer then went on to take the NEW lock and rewrite the crontab beside it.
 //
-// Measured on this host, systemd 257, against a scratch unit in /run/systemd/system:
+// r25 answered that with `enable` + `restart`. THE MERGE WITH o3d-2sm1.5 REMOVED THE RESTART AND
+// KEPT THE FINDING, because the structure it merged into does not have the defect and a restart in
+// it would be a regression:
+//
+//   • `upgrade_in_place` returns true merely on /etc/systemd/system/<unit> EXISTING, so any host
+//     with a running service takes the cutover path;
+//   • that path `systemctl stop`s the unit, stops the legacy launchers and REFUSES to continue
+//     while ${APP_PORT} is still bound, all before the migration;
+//   • so `systemctl start` acts on a stopped unit, which is what `restart` would have made it;
+//   • and a `restart` here would bounce the process the health check is about to interrogate.
+//
+// What the installer must still not do is take the crontab lock without knowing WHICH process is
+// on the port. That is now proved by fetching /_next/static/<BUILD_ID>/ — a route only the process
+// whose own build id is that one serves — which is strictly stronger than r25's `systemctl
+// is-active`, and answers precisely the case is-active could not: a predecessor still holding the
+// port. `APP_SERVICE_ON_NEW_BUILD` carries that proof to section 16, and these tests are about
+// the two halves of it — that the flag CANNOT be raised without the proof, and that the crontab
+// section refuses to open the lock while it is down.
+//
+// The measurements that produced the original finding, on this host, systemd 257, against a
+// scratch unit in /run/systemd/system, are kept because they are why the ordering below matters:
 //   systemctl start   on an ACTIVE unit   -> MainPID UNCHANGED   (nothing was replaced)
 //   systemctl restart on an ACTIVE unit   -> MainPID CHANGED     (the process is the new build)
 //   systemctl restart on an INACTIVE unit -> exit 0, becomes active (so `--now` buys nothing)
-//
-// These tests run the installer's OWN service lines under a real bash with a RECORDING `systemctl`,
-// so what is asserted is the invocation that was made, not the presence of a word in the file.
 // ---------------------------------------------------------------------------
 
 /**
- * The shipped service-activation region of scripts/install.sh, lifted rather than re-typed.
- *
- * Bounded by two lines that exist in every version of the script — the `daemon-reload` that follows
- * the unit heredoc, and the `success` that closes the section — so reverting the change under test
- * runs the OLD lines here and the assertions fail on what they DID, not on a marker that moved.
+ * The shipped block that turns the build proof into permission to lock, lifted rather than
+ * re-typed: `if $NEW_BUILD_SERVING; then` through its closing `fi`.
  */
-function serviceActivationRegion(): string {
+function buildProofArmingBlock(): { block: string; from: number; to: number } {
   const lines = INSTALL_SH.split('\n')
-  const from = lines.findIndex((l) => l === 'systemctl daemon-reload')
-  assert.notEqual(from, -1, 'scripts/install.sh must daemon-reload after writing the unit')
-  const to = lines.findIndex((l, i) => i > from && /^success "Application service /.test(l))
-  assert.notEqual(to, -1, 'the service section must end with its success line')
-  const region = lines.slice(from, to + 1).join('\n')
-  assert.match(region, /systemctl/, 'the lifted region must be the one that activates the service')
-  return region
+  const from = lines.findIndex((l) => l === 'if $NEW_BUILD_SERVING; then')
+  assert.notEqual(from, -1,
+    'scripts/install.sh must gate the point of no return on $NEW_BUILD_SERVING')
+  const to = lines.findIndex((l, i) => i > from && l === 'fi')
+  assert.notEqual(to, -1, 'that block must be closed')
+  return { block: lines.slice(from, to + 1).join('\n'), from, to }
 }
 
-/** Run that region with a recording `systemctl` (and a recording `pm2`, so no real one is used). */
-async function runServiceActivation(options: {
-  isActiveAfterRestart?: 'active' | 'activating' | 'failed'
-  restartExitCode?: number
-} = {}): Promise<{ code: number | null; stderr: string; invocations: string[] }> {
-  const dir = mkdtempSync(join(HARNESS, 'svc-'))
-  const journal = join(dir, 'invocations.txt')
-  const isActive = options.isActiveAfterRestart ?? 'active'
-  const restartExit = options.restartExitCode ?? 0
-  // The stub answers as an UPGRADE: the unit is already loaded and already running when the
-  // installer reaches this section. That is the only situation in which `start` and `restart`
-  // differ, and it is the situation the finding is about.
-  writeFileSync(join(dir, 'systemctl'), `#!/bin/sh
-echo "$*" >> '${journal}'
-case "$1" in
-  is-active) [ "${isActive}" = active ] || { echo "${isActive}"; exit 3; }; echo active; exit 0 ;;
-  restart) exit ${restartExit} ;;
-esac
-exit 0
-`)
-  writeFileSync(join(dir, 'pm2'), `#!/bin/sh\necho "pm2 $*" >> '${journal}'\nexit 0\n`)
-  chmodSync(join(dir, 'systemctl'), 0o755)
-  chmodSync(join(dir, 'pm2'), 0o755)
-
-  const script = `
-set -euo pipefail
-export PATH=${JSON.stringify(dir)}:"$PATH"
-APP_NAME=onetwoinventory
-APP_USER=ims
-APP_DIR=/opt/onetwoinventory
-CRONTAB_LOCK_FILE=/var/lib/onetwoinventory/locks/.crontab-reconcile.lock
-success() { :; }
-info() { :; }
-warn() { echo "WARN: $*" >&2; }
-die() { echo "DIE: $*" >&2; exit 9; }
-${serviceActivationRegion()}
-echo "APP_SERVICE_RESTARTED=\${APP_SERVICE_RESTARTED:-unset}"
-`
-  const { code, stdout, stderr } = await sh(script)
-  const invocations = existsSync(journal)
-    ? readFileSync(journal, 'utf8').split('\n').filter(Boolean)
-    : []
-  return { code, stderr: stderr + stdout, invocations }
-}
-
-test('[o3d-batch-ret] an ALREADY-RUNNING service is RESTARTED onto the new build, not merely enabled', async () => {
-  const { code, stderr, invocations } = await runServiceActivation()
-  assert.equal(code, 0, `the shipped service section must succeed against a healthy unit: ${stderr}`)
-
-  // The recording must have happened at all, or every assertion here is vacuous.
-  assert.ok(invocations.length >= 3,
-    `the stub systemctl must have been invoked (recorded: ${JSON.stringify(invocations)})`)
-  assert.ok(invocations.includes('daemon-reload'), 'the unit must be re-read before it is used')
-
-  // THE FINDING. A recorded `restart` of this unit, not a `start`, and not `enable --now`.
-  const restarts = invocations.filter((i) => i === 'restart onetwoinventory.service')
-  assert.deepEqual(restarts, ['restart onetwoinventory.service'],
-    'the installer must RESTART the application service exactly once. `systemctl start` on an '
-    + 'already-running unit is a no-op, so an upgrade would leave the previous process alive on '
-    + `the previous lock path. Recorded: ${JSON.stringify(invocations)}`)
-  assert.deepEqual(invocations.filter((i) => /^enable --now\b/.test(i)), [],
-    '`enable --now` must not be how the service is brought up: its `--now` is a `start`, which '
-    + `does nothing to a running process. Recorded: ${JSON.stringify(invocations)}`)
-  assert.deepEqual(invocations.filter((i) => /^start\b/.test(i)), [],
-    `a bare start is the same no-op. Recorded: ${JSON.stringify(invocations)}`)
-
-  // It is still enabled — a restart does not survive a reboot on its own.
-  assert.ok(invocations.includes('enable onetwoinventory.service'),
-    `the unit must also be enabled for boot. Recorded: ${JSON.stringify(invocations)}`)
-
-  // ORDER, as recorded: the unit is re-read, the legacy pm2 supervisor is removed, and only then
-  // is the process replaced — restarting before daemon-reload would restart onto the OLD unit.
-  const at = (needle: string) => invocations.findIndex((i) => i === needle)
-  assert.ok(at('daemon-reload') < at('restart onetwoinventory.service'),
-    `daemon-reload must precede the restart. Recorded: ${JSON.stringify(invocations)}`)
-  assert.ok(at('disable pm2-ims') < at('restart onetwoinventory.service'),
-    `the legacy pm2 unit is disposed of before the restart. Recorded: ${JSON.stringify(invocations)}`)
-
-  // And the state the crontab section keys off is set only after all of that.
-  assert.match(stderr, /APP_SERVICE_RESTARTED=yes/,
-    'the section must record that the restart happened, for the crontab section to check')
-})
-
-test('[o3d-batch-ret] a FAILED restart ABORTS the install before the crontab section', async () => {
-  // A restart that fails leaves us unable to say what is serving this installation. Continuing
-  // would have the installer take a lock that claims it knows.
-  const failed = await runServiceActivation({ restartExitCode: 1 })
-  assert.equal(failed.code, 9, `a failed restart must die, not warn: ${failed.stderr}`)
-  assert.match(failed.stderr, /^DIE: /m)
-  assert.match(failed.stderr, /crontab/i,
-    'the message must say why a failed restart is fatal HERE — the crontab lock below would '
-    + 'serialise against nothing')
-  assert.match(failed.stderr, /installer again/,
-    'and that re-running is the fix, because everything before this point is idempotent')
-  assert.doesNotMatch(failed.stderr, /APP_SERVICE_RESTARTED=yes/,
-    'the ordering flag must NOT be set on a failed restart')
-
-  // A restart can report success and still leave nothing running — with Restart=always a unit whose
-  // ExecStart cannot be executed sits in auto-restart, which is `activating`, not `active`.
-  const notUp = await runServiceActivation({ isActiveAfterRestart: 'activating' })
-  assert.equal(notUp.code, 9,
-    `a unit that is not active after the restart must abort too: ${notUp.stderr}`)
-  assert.match(notUp.stderr, /activating/,
-    'the message must name the state systemd actually reported')
-  assert.doesNotMatch(notUp.stderr, /APP_SERVICE_RESTARTED=yes/)
-})
-
-test('[o3d-batch-ret] the crontab section REFUSES to take the lock unless the restart happened first', async () => {
+test('[o3d-batch-ret] the crontab guard flag is armed ONLY by the proof that THIS build is serving', async () => {
   const lines = INSTALL_SH.split('\n')
-  const restartLine = lines.findIndex((l) => l === 'APP_SERVICE_RESTARTED=yes')
-  const guardLine = lines.findIndex((l) => /^\[\[ "\$\{APP_SERVICE_RESTARTED:-no\}" == "yes" \]\]/.test(l))
-  const openLine = lines.findIndex((l) => l === 'exec 9<"${CRONTAB_LOCK_FILE}"')
-  const buildLine = lines.findIndex((l) => /^run_as_user "\$\{APP_USER\}" npm run build/.test(l))
-  const unitLine = lines.findIndex((l) => /^cat > "\/etc\/systemd\/system\/\$\{APP_NAME\}\.service"/.test(l))
-  for (const [name, index] of [['restart', restartLine], ['guard', guardLine], ['open', openLine],
-    ['build', buildLine], ['unit', unitLine]] as Array<[string, number]>) {
-    assert.notEqual(index, -1, `scripts/install.sh no longer has the ${name} line`)
+  const { block, from, to } = buildProofArmingBlock()
+
+  // (a) THERE IS EXACTLY ONE PLACE THAT RAISES IT, AND IT IS INSIDE THAT BLOCK. An assignment
+  //     anywhere else — including one added later "for the non-upgrade path" — would hand the
+  //     crontab section permission that no proof backs, which is the whole finding.
+  const raises = lines
+    .map((l, i) => [l, i] as [string, number])
+    .filter(([l]) => /^\s*APP_SERVICE_ON_NEW_BUILD=true\s*$/.test(l))
+  assert.equal(raises.length, 1,
+    `exactly one line may set APP_SERVICE_ON_NEW_BUILD=true; found ${raises.length} at lines `
+    + `${JSON.stringify(raises.map(([, i]) => i + 1))}`)
+  assert.ok(raises[0][1] > from && raises[0][1] < to,
+    `that line must be inside the $NEW_BUILD_SERVING block (${from + 1}..${to + 1}), and is at `
+    + `${raises[0][1] + 1}`)
+  assert.match(block, /APP_SERVICE_ON_NEW_BUILD=true/,
+    'the lifted block must be the one under test')
+
+  // (b) AND IT REALLY IS THE GATE — the shipped lines, run. Without the proof the flag stays down.
+  const prelude = 'set -euo pipefail\nPAST_POINT_OF_NO_RETURN=false\nAPP_SERVICE_ON_NEW_BUILD=false\n'
+  const report = '\necho "flag=${APP_SERVICE_ON_NEW_BUILD}"'
+  const unproved = await sh(`${prelude}NEW_BUILD_SERVING=false\n${block}${report}`)
+  assert.equal(unproved.code, 0, unproved.stderr)
+  assert.match(unproved.stdout, /flag=false/,
+    'a run that could not prove which build is on the port must NOT arm the crontab guard — '
+    + 'moving the assignment out of the if would make this read true')
+
+  // (c) CONTROL. With the proof, the same shipped lines raise it — so (b) is a gate and not a
+  //     block that never assigns anything.
+  const proved = await sh(`${prelude}NEW_BUILD_SERVING=true\n${block}${report}`)
+  assert.equal(proved.code, 0, proved.stderr)
+  assert.match(proved.stdout, /flag=true/)
+})
+
+test('[o3d-batch-ret] the predecessor is stopped, the new build is started, and only then is it proved', async () => {
+  const lines = INSTALL_SH.split('\n')
+  const at = (re: RegExp, what: string) => {
+    const i = lines.findIndex((l) => re.test(l))
+    assert.notEqual(i, -1, `scripts/install.sh no longer has the ${what} line`)
+    return i
   }
-  // "after installing the new build and unit, and before any installer crontab access."
-  assert.ok(buildLine < unitLine && unitLine < restartLine && restartLine < guardLine
-    && guardLine < openLine,
-    `the order must be build -> unit -> restart -> guard -> lock, and is build:${buildLine} `
-    + `unit:${unitLine} restart:${restartLine} guard:${guardLine} open:${openLine}`)
+  const build = at(/^\s*npm run build --prefix "\$\{APP_DIR\}"/, 'build')
+  // The CUTOVER stop, not the several `systemctl stop` lines inside the adoption and trap
+  // helpers — those are declared far above and would make this ordering read backwards. The
+  // cutover site is the only one the installer ANNOUNCES, so the announcement is the anchor.
+  const stop = at(/^\s*info "systemctl stop \$\{APP_NAME\}\.service"$/, 'cutover stop')
+  assert.match(INSTALL_SH.split('\n')[stop + 1], /^\s*systemctl stop "\$\{APP_NAME\}\.service"/,
+    'the announced cutover stop must be followed by the stop itself')
+  const unit = at(/^cat > "\/etc\/systemd\/system\/\$\{APP_NAME\}\.service"/, 'unit heredoc')
+  const start = at(/^systemctl start "\$\{APP_NAME\}\.service"$/, 'service start')
+  const proof = at(/^\s*NEW_BUILD_SERVING=true$/, 'build proof')
+  const arm = at(/^\s*APP_SERVICE_ON_NEW_BUILD=true$/, 'guard arming')
+  const guard = at(/^\[\[ "\$\{APP_SERVICE_ON_NEW_BUILD:-false\}" == "true" \]\]/, 'crontab guard')
+  const open = at(/^exec 9<"\$\{CRONTAB_LOCK_FILE\}"$/, 'lock open')
 
-  // The guard is not decoration: run the shipped line with the flag as an unrestarted run would
-  // leave it, and it must refuse.
+  // THE ORDER THE WHOLE PROTOCOL RESTS ON. The build is produced while the predecessor still
+  // serves; the predecessor is then stopped; the unit is rewritten; the new process is started
+  // and PROVED to be this build; only then may the crontab lock be opened.
+  const order = { build, stop, unit, start, proof, arm, guard, open }
+  assert.ok(build < stop && stop < unit && unit < start && start < proof
+    && proof < arm && arm < guard && guard < open,
+    'the order must be build -> stop -> unit -> start -> proof -> arm -> guard -> lock, and is '
+    + JSON.stringify(order))
+
+  // AND `enable --now` IS STILL NOT HOW THE SERVICE COMES UP. Its `--now` is a `start`, which does
+  // nothing to a running process — the original finding, and the reason enable and start are two
+  // statements here. Comments may DISCUSS it; no command line may BE it.
+  const enableNow = lines
+    .map((l, i) => [l, i] as [string, number])
+    .filter(([l]) => /(^|[;&|]\s*)systemctl\s+enable\s+--now\b/.test(l.replace(/^\s+/, ''))
+      && !/^\s*#/.test(l))
+  assert.deepEqual(enableNow, [],
+    '`enable --now` must not be a command in this installer: its `--now` is a `start`, which does '
+    + `nothing to an already-running process. Found at lines ${JSON.stringify(enableNow.map(([, i]) => i + 1))}`)
+
+  // A RUN THAT CANNOT SAY WHICH BUILD ANSWERED DOES NOT REACH ANY OF THIS. The else branch of the
+  // build proof dies, so there is no path from "something answered the port" to the crontab lock.
+  const proofElse = lines.slice(proof, guard).find((l) => /^\s*die "Something answered /.test(l))
+  assert.ok(proofElse,
+    'an unproved build must die between the health check and the crontab section, not warn')
+  assert.match(proofElse!, /predecessor still holding port/,
+    'and the message must name the case the proof exists for')
+})
+
+test('[o3d-batch-ret] the crontab section REFUSES to take the lock unless the build proof passed', async () => {
+  const lines = INSTALL_SH.split('\n')
+  const guardLine = lines.findIndex(
+    (l) => /^\[\[ "\$\{APP_SERVICE_ON_NEW_BUILD:-false\}" == "true" \]\]/.test(l))
+  assert.notEqual(guardLine, -1, 'scripts/install.sh no longer has the crontab ordering guard')
+
+  // The guard is not decoration: run the SHIPPED line with the flag as an unproved run would leave
+  // it, and it must refuse.
   const guard = lines[guardLine] + '\n' + lines[guardLine + 1]
   const prelude = 'set -euo pipefail\ndie() { echo "DIE: $*" >&2; exit 9; }\n'
-  const refused = await sh(`${prelude}${guard}\necho REACHED-THE-LOCK`)
-  assert.equal(refused.code, 9, `an unrestarted run must not reach the lock: ${refused.stderr}`)
+  const refused = await sh(`${prelude}APP_SERVICE_ON_NEW_BUILD=false\n${guard}\necho REACHED-THE-LOCK`)
+  assert.equal(refused.code, 9, `an unproved run must not reach the lock: ${refused.stderr}`)
   assert.doesNotMatch(refused.stdout, /REACHED-THE-LOCK/)
   assert.match(refused.stderr, /ordering bug in the installer itself/,
     'and it must say this is an installer ordering bug, not something an operator did')
+  assert.match(refused.stderr, /crontab lock/,
+    'the message must say what the refusal is protecting')
 
-  // CONTROL — with the flag set, the same line falls through. Without this the refusal above could
-  // be a broken line rather than a guard.
-  const allowed = await sh(`${prelude}APP_SERVICE_RESTARTED=yes\n${guard}\necho REACHED-THE-LOCK`)
+  // AND AN UNSET FLAG REFUSES TOO, not just a false one. Deleting the declaration is the likeliest
+  // way this comes undone, and `set -u` would abort on a bare expansion — the `:-false` default is
+  // what makes the refusal happen with a message instead.
+  const unset = await sh(`${prelude}${guard}\necho REACHED-THE-LOCK`)
+  assert.equal(unset.code, 9, unset.stderr)
+  assert.match(unset.stderr, /APP_SERVICE_ON_NEW_BUILD='unset'/,
+    'the refusal must report the flag as unset, so the default is doing the refusing')
+
+  // CONTROL — with the flag raised, the same line falls through. Without this the refusal above
+  // could be a broken line rather than a guard.
+  const allowed = await sh(`${prelude}APP_SERVICE_ON_NEW_BUILD=true\n${guard}\necho REACHED-THE-LOCK`)
   assert.equal(allowed.code, 0, allowed.stderr)
   assert.match(allowed.stdout, /REACHED-THE-LOCK/)
 })

@@ -124,23 +124,23 @@ test('[o3d-xnwu] a truncated initial import cannot report complete', () => {
   // orders — so a truncated read would have unlocked live order sync over a store IMS had mostly
   // never read. It is passed in separately for exactly that reason.
   assert.equal(
-    decideInitialImportOutcome({ imported: 100, skipped: 0, errorCount: 1, truncatedRead: true }),
+    decideInitialImportOutcome({ imported: 100, skipped: 0, errorCount: 1, truncatedRead: true, unrecordedRefusals: 0 }),
     'failed',
     'a truncated read must fail the pass however many orders it managed to import',
   )
   assert.equal(
-    decideInitialImportOutcome({ imported: 100, skipped: 0, errorCount: 1 }),
+    decideInitialImportOutcome({ imported: 100, skipped: 0, errorCount: 1, unrecordedRefusals: 0 }),
     'complete',
     'while ordinary per-order errors still do not block — that rule is unchanged',
   )
   assert.equal(
-    decideInitialImportOutcome({ imported: 0, skipped: 0, errorCount: 0, truncatedRead: true }),
+    decideInitialImportOutcome({ imported: 0, skipped: 0, errorCount: 0, truncatedRead: true, unrecordedRefusals: 0 }),
     'failed',
     'and an empty truncated read is not "no orders to import"',
   )
   // The pre-existing contract, re-asserted so the new input cannot be seen to have loosened it.
-  assert.equal(decideInitialImportOutcome({ imported: 0, skipped: 0, errorCount: 1 }), 'failed')
-  assert.equal(decideInitialImportOutcome({ imported: 0, skipped: 0, errorCount: 0 }), 'complete')
+  assert.equal(decideInitialImportOutcome({ imported: 0, skipped: 0, errorCount: 1, unrecordedRefusals: 0 }), 'failed')
+  assert.equal(decideInitialImportOutcome({ imported: 0, skipped: 0, errorCount: 0, unrecordedRefusals: 0 }), 'complete')
 })
 
 test('[round 3] a page that was never read is also an incomplete read', () => {
@@ -149,19 +149,19 @@ test('[round 3] a page that was never read is also an incomplete read', () => {
   // reveal. Its own input, because it fails the pass for a different reason and gets a different
   // sentence. That the WALK feeds it is asserted in wc-initial-import-page-hole.test.ts.
   assert.equal(
-    decideInitialImportOutcome({ imported: 100, skipped: 0, errorCount: 1, unreadPages: 1 }),
+    decideInitialImportOutcome({ imported: 100, skipped: 0, errorCount: 1, unreadPages: 1, unrecordedRefusals: 0 }),
     'failed',
     'a page of up to 100 orders was never read; nothing else in the system reads history',
   )
   assert.equal(
-    decideInitialImportOutcome({ imported: 500, skipped: 500, errorCount: 0, unreadPages: 1 }),
+    decideInitialImportOutcome({ imported: 500, skipped: 500, errorCount: 0, unreadPages: 1, unrecordedRefusals: 0 }),
     'failed',
     'and no amount of progress outvotes it, which is the whole difference from a per-ORDER error',
   )
   // Both causes can be absent, present, or both present.
-  assert.equal(decideInitialImportOutcome({ imported: 1, skipped: 0, errorCount: 0, unreadPages: 0 }), 'complete')
+  assert.equal(decideInitialImportOutcome({ imported: 1, skipped: 0, errorCount: 0, unreadPages: 0, unrecordedRefusals: 0 }), 'complete')
   assert.equal(
-    decideInitialImportOutcome({ imported: 1, skipped: 0, errorCount: 2, truncatedRead: true, unreadPages: 1 }),
+    decideInitialImportOutcome({ imported: 1, skipped: 0, errorCount: 2, truncatedRead: true, unreadPages: 1, unrecordedRefusals: 0 }),
     'failed',
   )
 })
