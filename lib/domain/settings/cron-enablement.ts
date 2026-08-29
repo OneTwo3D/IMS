@@ -26,8 +26,22 @@
  * registry or the database in.
  */
 
-/** `undefined` and `null` both mean "no row" — Map.get and getSetting disagree on which they return. */
+/**
+ * `undefined`, `null` and `''` all mean "no row".
+ *
+ * The first two because `Map.get` and a Prisma lookup disagree on which they return. The THIRD
+ * because a reader that flattens absence to `''` is the mistake that gets made (Codex r20 HIGH: the
+ * backup route's own helper did exactly that, and `''` read as an authoritative "off" defeated the
+ * legacy fallback entirely). No writer stores an empty enablement row — `saveCronJobSettings` and
+ * `saveBackupScheduleSettings` both write `String(boolean)` — so there is no state where treating it
+ * as a value is more faithful than treating it as absent, and one where it is catastrophically less.
+ */
 export type StoredSettingValue = string | null | undefined
+
+/** A stored enablement value that is really there. */
+function present(value: StoredSettingValue): value is string {
+  return value !== undefined && value !== null && value !== ''
+}
 
 export function resolveCronEnablement(input: {
   /** `cron_<settingKey>_enabled`. */
@@ -38,10 +52,8 @@ export function resolveCronEnablement(input: {
   hasLegacyKey: boolean
   defaultEnabled: boolean
 }): boolean {
-  if (input.canonical !== undefined && input.canonical !== null) return input.canonical === 'true'
-  if (input.hasLegacyKey && input.legacy !== undefined && input.legacy !== null) {
-    return input.legacy === 'true'
-  }
+  if (present(input.canonical)) return input.canonical === 'true'
+  if (input.hasLegacyKey && present(input.legacy)) return input.legacy === 'true'
   return input.defaultEnabled
 }
 

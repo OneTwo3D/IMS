@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from 'fs'
 import os from 'os'
 import path from 'path'
 import { revalidatePath } from 'next/cache'
+import { unstable_rethrow } from 'next/navigation'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { getAllCronJobs } from '@/lib/cron-jobs'
@@ -43,7 +44,26 @@ import { getPublicAppUrl } from '@/lib/public-app-url'
  * `crontab -` (stdin pipe, no shell injection) for the CALLING OS user — i.e. the user the app runs
  * as.
  */
-export async function reconcileCrontab(): Promise<{ success: boolean; error?: string }> {
+export type CrontabReconcileResult = {
+  /** Did the crontab itself change? This, and only this, is whether the SCHEDULER is up to date. */
+  success: boolean
+  /** Why the crontab write failed. */
+  error?: string
+  /**
+   * A step AFTER a successful crontab write did not complete — the audit row, the rendered cache
+   * (Codex r20 MEDIUM).
+   *
+   * It is reported separately because it is a different fact with a different remedy. This function
+   * used to `await` the audit row and the revalidate on the success path, so a logging failure
+   * turned an APPLIED crontab into `{ success: false }` at the caller — a screen telling the
+   * operator the scheduler could not be updated and to go and re-apply it, over a crontab that was
+   * already correct. That is worse than the missing audit row it was reporting, and worse still when
+   * combined with a local failure, since the scheduler warning is the one that wins.
+   */
+  followUpError?: string
+}
+
+export async function reconcileCrontab(): Promise<CrontabReconcileResult> {
   const secret = await getCronSecret()
   if (!secret) {
     return { success: false, error: 'Cron secret is not configured.' }
@@ -89,24 +109,37 @@ export async function reconcileCrontab(): Promise<{ success: boolean; error?: st
     proc.stdin?.end()
   })
 
-  if (result.success) {
-    await logActivity({
-      entityType: 'SYSTEM',
-      tag: 'system',
-      action: 'crontab_sync',
-      description: `Crontab synced from scheduled jobs settings (user ${os.userInfo().username})`,
-    })
-  } else {
-    await logActivity({
-      entityType: 'SYSTEM',
-      tag: 'system',
-      action: 'crontab_sync',
-      level: 'ERROR',
-      description: `Crontab sync failed: ${result.error}`,
-    })
+  // THE CRONTAB IS ALREADY WRITTEN, OR ALREADY NOT (Codex r20 MEDIUM). Nothing below can change
+  // that, so nothing below may turn `result` into a failure. `unstable_rethrow` runs first for the
+  // same reason it does in `runPostCommit`: a swallowed NEXT_REDIRECT leaves a principal whose
+  // session just became invalid sitting on a page instead of at the challenge.
+  try {
+    if (result.success) {
+      await logActivity({
+        entityType: 'SYSTEM',
+        tag: 'system',
+        action: 'crontab_sync',
+        description: `Crontab synced from scheduled jobs settings (user ${os.userInfo().username})`,
+      })
+    } else {
+      await logActivity({
+        entityType: 'SYSTEM',
+        tag: 'system',
+        action: 'crontab_sync',
+        level: 'ERROR',
+        description: `Crontab sync failed: ${result.error}`,
+      })
+    }
+
+    revalidatePath('/settings/system')
+  } catch (error) {
+    unstable_rethrow(error)
+    return {
+      ...result,
+      followUpError: error instanceof Error ? error.message : 'Failed to record the crontab change',
+    }
   }
 
-  revalidatePath('/settings/system')
   return result
 }
 

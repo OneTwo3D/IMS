@@ -114,9 +114,18 @@ export async function saveCronJobSettings(jobs: CronJobSettingInput[]): Promise<
     })
   }, 'Failed to record the scheduled-job change')
 
-  const scheduler = await runPostCommit(reconcileCrontab, 'Failed to sync crontab')
+  // The crontab write and the audit row it owes afterwards are DIFFERENT facts, and the
+  // reconciliation reports them separately (Codex r20 MEDIUM). Folding the follow-up into the
+  // local outcome is what stops a screen sending an operator to re-apply a crontab that is
+  // already correct.
+  let schedulerFollowUpError: string | null = null
+  const scheduler = await runPostCommit(async () => {
+    const result = await reconcileCrontab()
+    schedulerFollowUpError = result.followUpError ?? null
+    return result
+  }, 'Failed to sync crontab')
 
-  return combinePostCommitOutcomes({ local, scheduler })
+  return combinePostCommitOutcomes({ local, scheduler, schedulerFollowUpError })
 }
 
 export type CrontabDriftStatus = OtiCrontabStatus & {

@@ -91,12 +91,24 @@ export function resolveSettingSaveView(input: { result: SettingSaveResult; what:
 export function combinePostCommitOutcomes(input: {
   local: { status: 'ok' } | { status: 'failed'; error: string }
   scheduler: { status: 'ok' } | { status: 'failed'; error: string }
+  /**
+   * A failure from INSIDE the scheduler step that happened AFTER the crontab was written
+   * (`CrontabReconcileResult.followUpError`) — its audit row or its cache revalidation.
+   *
+   * It folds into the LOCAL outcome, because that is what it is: the crontab is applied, and what
+   * lags is a record of it. Reporting it as a scheduler failure sent the operator to re-apply a
+   * crontab that was already correct (Codex r20 MEDIUM).
+   */
+  schedulerFollowUpError?: string | null
 }): SettingSaveResult {
   if (input.scheduler.status === 'failed') {
     return { status: 'post-commit-failed', step: 'scheduler', error: input.scheduler.error }
   }
   if (input.local.status === 'failed') {
     return { status: 'post-commit-failed', step: 'local', error: input.local.error }
+  }
+  if (input.schedulerFollowUpError) {
+    return { status: 'post-commit-failed', step: 'local', error: input.schedulerFollowUpError }
   }
   return { status: 'saved' }
 }

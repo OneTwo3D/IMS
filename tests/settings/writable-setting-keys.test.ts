@@ -139,6 +139,13 @@ function keysInSourceConst(file: string, name: string): string[] {
   return [...source.slice(open, close).matchAll(/'([^']+)'/g)].map((m) => m[1])
 }
 
+/** Source with `//` and block comments removed, so a key NAMED in prose is not read as a use. */
+function codeOf(file: string): string {
+  return readFileSync(file, 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/(^|[^:'"`])\/\/[^\n]*/g, '$1 ')
+}
+
 test.beforeEach(reset)
 
 // ---------------------------------------------------------------------------
@@ -335,25 +342,72 @@ test('the allowlist names exactly the screens that call a generic settings write
   )
 })
 
-test('every allowlisted key really appears in the screen it is filed under', () => {
+/**
+ * Tokens in a caller file that LOOK like settings keys and are not (Codex r20 MEDIUM).
+ *
+ * The scan below is deliberately whole-file and shape-based rather than a parse of each call site: a
+ * parser has to understand four different payload shapes (a literal, a built `Record`, an
+ * `Object.fromEntries` over a field table, a conditional assignment) and silently misses the fifth
+ * one someone writes next. A shape-based scan cannot miss a key; it can only over-collect, and every
+ * over-collection is listed here with the reason it is not a key. An entry that stops appearing in
+ * its file fails the test, so this cannot rot into a way of hiding a real key.
+ */
+const NOT_A_SETTING_KEY: Readonly<Record<string, readonly string[]>> = {
+  // Stored VALUES of delivery_tracking_source, not keys.
+  'components/settings/delivery-tracking.tsx': ['shopping_connector'],
+  // Stored VALUES of invoice_trigger, not keys.
+  'components/settings/invoice-trigger.tsx': ['on_paid', 'on_shipped'],
+}
+
+/** snake_case with at least one underscore — the shape every settings key in this codebase has. */
+const SETTING_KEY_SHAPE = /\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b/g
+
+test('each screen writes EXACTLY the keys it is filed under, in both directions', () => {
+  // WHAT THE PREVIOUS VERSION OF THIS TEST DID NOT CATCH (Codex r20 MEDIUM). It walked the allowlist
+  // and asked whether each key was MENTIONED in its screen. Adding a NEW key to an existing screen's
+  // payload changed nothing it looked at, so the suite stayed green while that screen's save was
+  // refused before its transaction — the exact failure the allowlist is supposed to make loud, made
+  // silent by the test meant to guard it. A textual mention also kept a removed key green.
+  //
+  // So the comparison is now bidirectional and key-level: every key-shaped token in the screen must
+  // be allowlisted for that screen, and every key allowlisted for that screen must appear in it.
   let checked = 0
   for (const [screen, keys] of Object.entries(PREFERENCE_KEYS_BY_SCREEN)) {
-    const source = readFileSync(join(REPO, screen), 'utf8')
-    assert.ok(keys.length > 0, `${screen}: an empty screen would assert nothing`)
-    for (const key of keys) {
-      // Bare word, not a quoted literal: several screens pass their keys as unquoted object
-      // properties (`fx_schedule_enabled: isEnabled ? ...`) or by assignment
-      // (`values.backup_s3_secret_key = ...`).
-      assert.match(
-        source,
-        new RegExp(`(^|[^A-Za-z0-9_])${key}([^A-Za-z0-9_]|$)`),
-        `${screen} does not mention ${key} — a preference no screen offers has no business on this list`,
+    const source = codeOf(join(REPO, screen))
+    const exceptions = new Set(NOT_A_SETTING_KEY[screen] ?? [])
+
+    for (const exception of exceptions) {
+      assert.ok(
+        source.includes(exception),
+        `${screen}: '${exception}' is listed as not-a-key but no longer appears — a stale exception hides real keys`,
       )
-      checked += 1
+      assert.ok(!keys.includes(exception), `${screen}: '${exception}' cannot be both an exception and a key`)
     }
+
+    const found = [...new Set(source.match(SETTING_KEY_SHAPE) ?? [])].filter((token) => !exceptions.has(token))
+    assert.deepEqual(
+      found.sort(),
+      [...keys].sort(),
+      `${screen}: the keys it writes and the keys it is filed under must be the same set`,
+    )
+    checked += keys.length
   }
   assert.equal(checked, WRITABLE_SETTING_KEYS.length, 'no key is filed under two screens or none')
   assert.ok(checked >= 32, `the walk reached ${checked} keys`)
+})
+
+test('the key-shape scan is not vacuous — it sees a key added to a payload', () => {
+  // Proving the guard above can fail, rather than trusting that it can. Fed the exact edit it exists
+  // to catch: one more key in an existing setSettings payload.
+  const before = "await setSettings({ financial_year_start: value })"
+  const after = "await setSettings({ financial_year_start: value, some_new_preference: other })"
+  const keysOf = (source: string) => [...new Set(source.match(SETTING_KEY_SHAPE) ?? [])].sort()
+
+  assert.deepEqual(keysOf(before), ['financial_year_start'])
+  assert.deepEqual(keysOf(after), ['financial_year_start', 'some_new_preference'])
+
+  // And that comments do NOT contribute, which is what makes the strict equality above liveable.
+  assert.deepEqual(keysOf(codeOf(join(REPO, 'components/settings/dispatch-email.tsx'))), ['dispatch_email_enabled'])
 })
 
 // ---------------------------------------------------------------------------

@@ -1038,9 +1038,18 @@ export async function savePublicAppUrl(value: string): Promise<SettingSaveResult
   // returning early here left every managed job line pointing at the previous URL while the warning
   // talked about an audit row. Cross-ported from saveBackupScheduleSettings, which had the same
   // shape and the worse consequence.
-  const scheduler = await runPostCommit(reconcileCrontab, 'Failed to apply Public App URL changes.')
+  // The crontab write and the audit row it owes afterwards are DIFFERENT facts, and the
+  // reconciliation reports them separately (Codex r20 MEDIUM). Folding the follow-up into the
+  // local outcome is what stops a screen sending an operator to re-apply a crontab that is
+  // already correct.
+  let schedulerFollowUpError: string | null = null
+  const scheduler = await runPostCommit(async () => {
+    const result = await reconcileCrontab()
+    schedulerFollowUpError = result.followUpError ?? null
+    return result
+  }, 'Failed to apply Public App URL changes.')
 
-  return combinePostCommitOutcomes({ local, scheduler })
+  return combinePostCommitOutcomes({ local, scheduler, schedulerFollowUpError })
 }
 
 /**
@@ -1120,9 +1129,18 @@ export async function saveBackupScheduleSettings(input: BackupScheduleInput): Pr
   }, 'Failed to record the settings change')
 
   // The crontab is genuinely stale until this runs, whatever happened above.
-  const scheduler = await runPostCommit(reconcileCrontab, 'Failed to apply the backup schedule change.')
+  // The crontab write and the audit row it owes afterwards are DIFFERENT facts, and the
+  // reconciliation reports them separately (Codex r20 MEDIUM). Folding the follow-up into the
+  // local outcome is what stops a screen sending an operator to re-apply a crontab that is
+  // already correct.
+  let schedulerFollowUpError: string | null = null
+  const scheduler = await runPostCommit(async () => {
+    const result = await reconcileCrontab()
+    schedulerFollowUpError = result.followUpError ?? null
+    return result
+  }, 'Failed to apply the backup schedule change.')
 
-  return combinePostCommitOutcomes({ local, scheduler })
+  return combinePostCommitOutcomes({ local, scheduler, schedulerFollowUpError })
 }
 
 /** Not exported: nothing outside needs the name, and a 'use server' module's export surface is an RPC manifest. */

@@ -25,6 +25,21 @@ async function getSetting(key: string): Promise<string> {
   return row?.value ?? ''
 }
 
+/**
+ * ABSENCE PRESERVED, not flattened to `''` (Codex r20 HIGH).
+ *
+ * `getSetting` above answers `''` for a row that does not exist, and enablement resolution CANNOT
+ * use that: `''` is a value, so it would be read as an authoritative "off" and the legacy fallback
+ * would never be consulted. On an installation that has only `backup_schedule_enabled=true` — every
+ * installation that has not yet saved either schedule screen — the crontab and the Backup page
+ * resolved ENABLED while this route skipped every invocation as disabled. Silent, and exactly the
+ * class of disagreement the shared resolver exists to end.
+ */
+async function getSettingOrNull(key: string): Promise<string | null> {
+  const row = await db.setting.findUnique({ where: { key } })
+  return row?.value ?? null
+}
+
 function getDbConfig() {
   const url = new URL(process.env.DATABASE_URL!)
   return {
@@ -53,7 +68,7 @@ export async function GET(request: Request) {
       // the other — the cron line fired on schedule and every invocation returned "disabled". Saves
       // now write both rows; this is what makes an ALREADY diverged installation behave, with no
       // migration.
-      if (!(await isBackupScheduleEnabled(getSetting))) {
+      if (!(await isBackupScheduleEnabled(getSettingOrNull))) {
         return { skipped: true, reason: 'Scheduled backups disabled' }
       }
 

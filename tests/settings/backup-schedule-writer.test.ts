@@ -45,7 +45,7 @@ const state = {
   cronCalledAfterWrites: null as number | null,
   /** Whether a transaction was still open when it ran — it must not be. */
   openTransactionsWhenCronRan: null as number | null,
-  cronResult: { success: true } as { success: boolean; error?: string },
+  cronResult: { success: true } as { success: boolean; error?: string; followUpError?: string },
   cronThrows: null as Error | null,
   logActivityThrows: null as Error | null,
   revalidated: [] as string[],
@@ -128,6 +128,13 @@ mock.module('@/lib/crontab-reconcile', {
     readOwnCrontab: async () => '',
   },
 })
+
+/** Source with `//` and block comments removed, so a name in prose is not read as a use. */
+function codeOf(file: string): string {
+  return readFileSync(file, 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/(^|[^:'"`])\/\/[^\n]*/g, '$1 ')
+}
 
 const VALID = { enabled: true, retentionDays: '30', maxCount: '10', autoUpload: 's3' }
 
@@ -275,13 +282,6 @@ test('saveCronJobSettings mirrors the legacy enablement row, driven from the reg
   assert.deepEqual(state.writes, [`cron_${plain!.settingKey}_enabled=false`, `cron_${plain!.settingKey}_schedule=0 2 * * *`])
 })
 
-/** Source with `//` and block comments removed, so a key NAMED in a comment is not read as a use. */
-function codeOf(file: string): string {
-  return readFileSync(file, 'utf8')
-    .replace(/\/\*[\s\S]*?\*\//g, ' ')
-    .replace(/(^|[^:'"`])\/\/[^\n]*/g, '$1 ')
-}
-
 test('a failed LOCAL post-commit step does not skip the crontab reconciliation', async () => {
   // The enable switch IS a crontab line, so skipping the reconciliation on a transient activity-log
   // failure meant the operator switched backups on, the row committed, and no scheduled invocation
@@ -385,6 +385,54 @@ test('a diverged enablement pair resolves the same way for the crontab, the rout
     false,
     'a legacy value only counts for a job that declares a legacy key',
   )
+})
+
+test('a MISSING canonical row falls back to the legacy one, however absence is spelled', async () => {
+  // Codex r20 HIGH: the route's own helper answered `''` for a row that does not exist, and `''` is a
+  // value — so it was read as an authoritative "off" and the legacy fallback was never consulted. On
+  // every installation that has only `backup_schedule_enabled=true` (i.e. every one that has not yet
+  // saved either schedule screen) the crontab and the Backup page resolved ENABLED while the route
+  // skipped each invocation as disabled.
+  const { isBackupScheduleEnabled } = await import('@/lib/domain/settings/backup-schedule-enabled')
+
+  for (const absent of [null, undefined, ''] as const) {
+    const read = async (key: string) =>
+      key === 'cron_backup_enabled' ? (absent as string | null) : key === 'backup_schedule_enabled' ? 'true' : null
+    assert.equal(
+      await isBackupScheduleEnabled(read),
+      true,
+      `a canonical row spelled absent as ${JSON.stringify(absent)} must fall through to the legacy row`,
+    )
+  }
+
+  // ...and the route hands it a reader that really can say "absent". Asserted as source because the
+  // handler cannot be invoked here, and because the defect WAS the adapter, not the resolver.
+  const route = codeOf(join(REPO, 'app/api/cron/backup/route.ts'))
+  assert.match(route, /isBackupScheduleEnabled\(getSettingOrNull\)/, 'the route passes the absence-preserving reader')
+  assert.match(route, /async function getSettingOrNull[\s\S]*?row\?\.value \?\? null/, 'and that reader preserves absence')
+})
+
+test('a crontab that was WRITTEN is never reported as a scheduler failure', async () => {
+  // Codex r20 MEDIUM: reconcileCrontab awaited its audit row and revalidate on the success path, so a
+  // logging failure turned an APPLIED crontab into a scheduler failure — a screen telling the
+  // operator to go and re-apply a crontab that was already correct, and (because the scheduler
+  // outcome wins) doing so over a local failure too.
+  state.cronResult = { success: true, followUpError: 'activity log unavailable' }
+
+  const result = await saveBackup(VALID)
+
+  assert.equal(result.status, 'post-commit-failed')
+  assert.equal(
+    result.status === 'post-commit-failed' ? result.step : null,
+    'local',
+    'the crontab is applied; what lags is the record of it',
+  )
+
+  // And the real reconciliation returns it that way rather than throwing — checked against the
+  // module, because the double above could otherwise be asserting a shape nothing produces.
+  const reconcile = codeOf(join(REPO, 'lib/crontab-reconcile.ts'))
+  assert.match(reconcile, /followUpError:/, 'reconcileCrontab reports a post-write failure separately')
+  assert.match(reconcile, /unstable_rethrow\(error\)/, 'and still lets framework control flow through')
 })
 
 test('the purge READER is safe over rows written before the gate existed', async () => {
