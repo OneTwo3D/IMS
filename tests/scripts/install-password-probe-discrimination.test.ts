@@ -1059,6 +1059,32 @@ test('r41: a cleartext `password` rule is refused too, because the wire cannot t
 })
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// THE FOUR MUTATIONS THE r43 TESTS BELOW WERE MEASURED AGAINST
+//
+// Each was applied to the shipped bytes and the whole file re-run; the notes on the individual
+// tests name these by number rather than repeating the blast radius five times.
+//
+//   M1  db_application_route_sslmode() prints `require` instead of `disable`.
+//       19 of 21 FAIL. This is not "r42 restored" and must not be read as it: most clusters in
+//       this file are `initdb` clusters with `ssl = off`, so a pinned `require` cannot complete a
+//       handshake at all and the gate refuses everywhere. It is the blast radius of DISABLING the
+//       gate, and it is recorded so that a later reader does not mistake it for a narrow one.
+//   M2  r42 RESTORED FAITHFULLY: the route derivation prints `prefer` (libpq's own, which is what
+//       r42 observed on) AND the reported-route comparison in db_endpoint_checks_role_verifier()
+//       goes back to r42's `case "${sslmode}" in require|disable)`.
+//       EXACTLY the five r43 tests fail -- 14, 14b, 14c, 17 and 20 -- and all sixteen pre-r43
+//       tests pass. This is the discriminating mutation: it is the difference r43 makes, and
+//       nothing else.
+//   M3  the reader ignores its `--sslmode=` argument and sends the SSLRequest regardless
+//       (`requested === 'disable'` replaced by `false`).
+//       14, 14b, 14c and 17 fail; 20 does not, because it drives stub readers rather than the
+//       shipped one. This is what makes "the reader is TOLD the route" a checked claim.
+//   M4  the `route=(...)` assignment is deleted from pg_endpoint_psql(), so the psql probes are
+//       unpinned while the reader is still aligned.
+//       14b, 14c and 17 fail; 14 does not, because it refuses one step earlier on the method.
+// ---------------------------------------------------------------------------
+
 // 14. THE TRANSPORT: the route the APPLICATION takes is the one the reader must read (r43)
 // ---------------------------------------------------------------------------
 
@@ -1077,18 +1103,17 @@ test('r43: a cluster only TLS can authenticate on is REFUSED, because the applic
   // credential this run could publish that would start the application, and the only correct
   // outcome is a refusal BEFORE the ALTER, with the role still holding what `.env` names.
   //
-  // MUTATION ROUTES (each measured by making the change and re-running):
-  //   1. make db_application_route_sslmode() print `require` instead of `disable`: the reader is
-  //      back on the TLS record, reads scram-sha-256, the gate passes and the rotation proceeds.
-  //      This test fails on APP_DRIVER_BEFORE/AFTER staying reachable, on the run's status, on
-  //      ROTATED and on the reader's method line. THIS IS THE r42 BEHAVIOUR, restored, and it is
-  //      the outage.
-  //   2. drop the `route`/`sslmode` comparison from db_endpoint_checks_role_verifier() and pass
-  //      `--sslmode=prefer`: same failures -- the reader falls back onto the hostssl record.
-  //   3. delete the `requested === 'disable'` branch from the reader so it sends the SSLRequest
-  //      anyway: the reader reports `sslmode=require` against a `requested=disable`, the comparison
-  //      refuses it, and this test still passes -- on the REFUSAL, by the other route. Test 20 is
-  //      what states that comparison's message.
+  // MUTATIONS (see the block above these tests; each was applied and the file re-run):
+  //   M2 -- r42 restored: the reader is back on the TLS record, reads scram-sha-256, the gate
+  //      passes and the rotation proceeds. This test fails on the reader's requested/ssl/method
+  //      lines, on the run's status and on the two credential assertions at the end. THAT RUN IS
+  //      THE OUTAGE: the ALTER lands and the application still cannot connect.
+  //   M3 -- the reader sends the SSLRequest anyway: it reports `sslmode=require` against a
+  //      `requested=disable` and the comparison refuses, so the run still refuses -- but for the
+  //      wrong reason, and this test fails on the `ssl=not-offered` and `method=none` lines and on
+  //      the server-quote assertion.
+  //   M4 -- the psql pin removed: NO CHANGE here. The gate refuses one step earlier, on the
+  //      method, so no probe is ever opened. 14b and 17 are what measure that line.
   const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
   let cluster: Cluster | undefined
   try {
@@ -1171,15 +1196,15 @@ test('r43: a hostssl rule the probes could satisfy does not vouch for the hostno
   // application uses -- every candidate would be accepted -- and the gate must refuse BEFORE the
   // ALTER. It does, and the report names trust.
   //
-  // MUTATION ROUTES (each measured by making the change and re-running):
-  //   1. make db_application_route_sslmode() print `require` instead of `disable`: THIS IS r42,
-  //      restored. The reader reads the hostssl record, the gate admits it, the rotation runs, and
-  //      this test fails on the reader's requested/method lines, on the run's status, on ROTATED
-  //      and on the report assertion. Test 14 and test 17 fail with it.
-  //   2. delete the route comparison in db_endpoint_checks_role_verifier() and pass
-  //      `--sslmode=prefer`: same failures, by the same fallback.
-  //   3. delete the `route=(...)` assignment from pg_endpoint_psql(): no change HERE -- the gate
-  //      already refused one step earlier, on the method. Test 17 is what measures that line.
+  // MUTATIONS (see the block above these tests; each was applied and the file re-run):
+  //   M2 -- r42 restored: the reader reads the hostssl record, the gate admits it, the rotation
+  //      runs, and this test fails on the reader's requested/method lines, on the run's status and
+  //      on the trust report assertion.
+  //   M3 -- the reader sends the SSLRequest anyway: same failures on the reader lines; the run
+  //      still refuses, on the route comparison rather than on trust.
+  //   M4 -- the psql pin removed: R42_PAIR_ON_TLS becomes `refuses` -- unpinned, the control's
+  //      random password fails scram, falls back to the clear and is let in by trust -- and this
+  //      test fails on that precondition, which is r42's own claim being re-measured here.
   const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
   let cluster: Cluster | undefined
   try {
@@ -1258,13 +1283,14 @@ test('r43: the gate VALIDATES the application\'s route, on a cluster where only 
   // scram-sha-256, the ALTER runs, and THE APPLICATION'S OWN DRIVER opens a connection with the
   // credential the published file names.
   //
-  // MUTATION ROUTES (each measured by making the change and re-running):
-  //   1. make db_application_route_sslmode() print `require`: r42 restored. The reader reads
-  //      `trust`, the gate refuses, and this test fails on the run's status, on ROTATED and on the
-  //      driver connection at the end.
-  //   2. make it print `prefer`: the reader takes TLS and reports `require`, which no longer
-  //      equals the requested route, so the comparison refuses -- same failures, different line.
-  //   3. delete the route comparison so `prefer` is accepted: identical to (1).
+  // MUTATIONS (see the block above these tests; each was applied and the file re-run):
+  //   M2 -- r42 restored: the reader reads `trust` on the TLS record, the gate refuses a rotation
+  //      that is perfectly safe, and this test fails on the run's status, on ROTATED and on the
+  //      driver connection at the end. THIS IS THE REFUSAL r43 REMOVES.
+  //   M3 -- the reader sends the SSLRequest anyway: it reads `trust` and reports `require` against
+  //      `requested=disable`, so the comparison refuses; same failures, one line further on.
+  //   M4 -- the psql pin removed: the probes run on `prefer`, land on the hostssl trust record and
+  //      accept the negative control, so the discrimination half refuses. Same failures.
   const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
   let cluster: Cluster | undefined
   try {
@@ -1400,19 +1426,20 @@ test('r43: aligned to the probes, reconciliation publishes a credential the appl
   // is the only one that consumes it -- so it is run with a `.env` restored underneath it and its
   // effect is undone before run 3 begins.
   //
-  // MUTATION ROUTES (each measured by making the change and re-running):
-  //   1. make db_application_route_sslmode() print `require`: run 3 becomes run 2. This test fails
-  //      on run 3's status, on JOURNAL_LEFT and on APP_DRIVER_AFTER — the outage, restored. Tests
-  //      14, 14b and 14c fail with it.
-  //   2. delete the route comparison in db_endpoint_checks_role_verifier() and pass `prefer`:
-  //      identical failures, by libpq's own fallback rather than by the argument.
-  //   3. delete the `route=(...)` assignment from pg_endpoint_psql(): run 2 stops reconciling —
-  //      the old password falls back to RADIUS and both candidates read live — and this test fails
-  //      on run 2's status and on R42_PUBLISHED. Run 3 is unaffected: it refuses one step earlier,
-  //      on the method.
-  //   4. make db_endpoint_checks_role_verifier() admit `password-or-external` as verifier=role:
-  //      run 3 admits the RADIUS endpoint and adopts whichever candidate it accepts; this test
-  //      fails on run 3's status and JOURNAL_LEFT. Tests 10, 11 and 13 fail with it.
+  // MUTATIONS (see the block above these tests; each was applied and the file re-run):
+  //   M2 -- r42 restored: run 3 becomes run 2. It reconciles, publishes the SCRAM password and
+  //      clears the journal, and this test fails on run 3's reader lines, on its status, on
+  //      LEFT IN PLACE and on the final driver connection. THE OUTAGE, RESTORED.
+  //   M3 -- the reader sends the SSLRequest anyway: run 3 refuses on the route comparison instead
+  //      of on the method, and this test fails on its `method=password-or-external` line and on
+  //      the report assertion that names the rule shape.
+  //   M4 -- the psql pin removed: RUN 2 stops reconciling -- the old password fails scram, falls
+  //      back to the clear and RADIUS accepts it, so both candidates read live -- and this test
+  //      fails on run 2's status. Run 3 is unaffected: it refuses one step earlier, on the method.
+  //      This is r42's own claim, still measured, one round on.
+  //   Also measured, outside the four: make db_endpoint_checks_role_verifier() admit
+  //   `password-or-external` as verifier=role and run 3 adopts whichever candidate RADIUS accepts;
+  //   this test fails on run 3's status and on LEFT IN PLACE, and tests 10, 11 and 13 fail with it.
   const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
   let cluster: Cluster | undefined
   let radius: RadiusVerifier | undefined
@@ -1715,15 +1742,14 @@ test('r43: a method read on any route but the application\'s is refused, includi
   // output; it sends no password and opens no psql. The port below is deliberately one nothing is
   // listening on, so a version of this that DID connect would fail rather than quietly pass.
   //
-  // MUTATION ROUTES (each measured by making the change and re-running):
-  //   1. replace the `[[ "${sslmode}" == "${route}" ]]` comparison with r42's
-  //      `case ... require|disable)`: REQUIRE_ADMITTED becomes `yes` and REQUIRE_ROUTE becomes
-  //      `require`, and this test fails on both. Tests 14, 15 and 18 fail with it, on clusters.
-  //   2. drop the comparison entirely and publish whatever the reader said: PREFER_ADMITTED
-  //      becomes `yes` as well, and the report assertion fails too.
-  //   3. make db_application_route_sslmode() print `require`: DISABLE_ADMITTED becomes `no` and
-  //      REQUIRE_ADMITTED becomes `yes` — the two swap, which is the same measurement read
-  //      backwards, and is why both are asserted.
+  // MUTATIONS (see the block above these tests; each was applied and the file re-run):
+  //   M2 -- r42 restored: APP_ROUTE becomes `prefer`, REQUIRE_ADMITTED becomes `yes` and
+  //      REQUIRE_ROUTE becomes `require`, and this test fails on all three. It is the only one of
+  //      the five r43 tests that needs no cluster, so it is the one that isolates the comparison
+  //      itself from everything the clusters also measure.
+  //   M3 -- the reader sends the SSLRequest anyway: NO CHANGE. This test drives stub readers, not
+  //      the shipped one. 14, 14b, 14c and 17 are what cover that line.
+  //   M4 -- the psql pin removed: no change either; nothing here opens a psql.
   const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
   try {
     const reader = (sslmode: string) =>
@@ -1776,4 +1802,54 @@ test('r43: a method read on any route but the application\'s is refused, includi
   } finally {
     rmSync(root, { recursive: true, force: true })
   }
+})
+
+// ---------------------------------------------------------------------------
+// 21. AND WHERE THE APPLICATION'S ROUTE ITSELF IS UNKNOWN, EVERYTHING REFUSES
+// ---------------------------------------------------------------------------
+
+test('r43: a DATABASE_URL the driver was not measured against stops the gate rather than defaulting it', () => {
+  // THE STANDING RULE OF THIS BRANCH, APPLIED TO THE NEW REFERENCE POINT. `disable` is not a
+  // constant in db_application_route_sslmode(): it asks the SHIPPED composer what URL this run
+  // would publish and answers about that, so the derivation cannot drift away from the thing it
+  // describes. A URL carrying a query string is one node-postgres was NOT measured against — the
+  // driver reads `sslmode`, `ssl` and `uselibpqcompat` out of it and changes transport — so the
+  // route is unknown, and an unknown refuses.
+  //
+  // The unreachable-today shape is reached here through DB_NAME, which is the only one of the four
+  // identity values that compose_database_url() does not percent-encode. A password cannot do it:
+  // url_encode_userinfo() keeps only the RFC 3986 unreserved set, so a `?` reaches the URL as
+  // `%3F`, and the first assertion measures that rather than asserting it.
+  //
+  // MUTATIONS (measured):
+  //   - delete the `*\?*) return 1` arm: UNKNOWN_ROUTE becomes `disable`, the gate goes on to
+  //     observe on a route the driver would not take, and this test fails on both assertions about
+  //     it. Nothing else in the suite fails, which is why this test exists.
+  //   - make the function print a constant instead of asking the composer: identical failure, and
+  //     ENCODED_ROUTE stops being evidence of anything.
+  const run = runShipped({
+    APP_DIR: '/nonexistent',
+    APP_USER: currentUser(),
+    DB_HOST: '127.0.0.1',
+    DB_PORT: '1',
+    DB_NAME: 'one_two_inventory',
+    DB_USER: 'imsuser',
+  }, `
+    echo "ORDINARY_ROUTE=$(db_application_route_sslmode || echo REFUSED)"
+    # A PASSWORD CANNOT REACH THE QUERY STRING: the composer encodes the userinfo.
+    echo "ENCODED_URL=$(compose_database_url "\${DB_USER}" 'a?b' "\${DB_HOST}" "\${DB_PORT}" "\${DB_NAME}")"
+    ( DB_NAME='one_two_inventory?sslmode=require'
+      echo "UNKNOWN_ROUTE=$(db_application_route_sslmode || echo REFUSED)"
+      DB_PROBE_REPORT=""
+      if db_endpoint_checks_role_verifier postgres; then echo "UNKNOWN_ADMITTED=yes"; else echo "UNKNOWN_ADMITTED=no"; fi
+      echo "REPORT_B64=$(printf '%s' "\${DB_PROBE_REPORT}" | base64 -w0)" )
+  `)
+  assert.equal(run.status, 0, run.output)
+  assert.match(run.output, /ORDINARY_ROUTE=disable/, 'precondition: the ordinary URL has a known route')
+  assert.match(run.output, /ENCODED_URL=postgresql:\/\/imsuser:a%3Fb@/, 'and a `?` in the password cannot create a query string')
+  assert.match(run.output, /UNKNOWN_ROUTE=REFUSED/, 'a URL with a query string has no route this run has measured')
+  assert.match(run.output, /UNKNOWN_ADMITTED=no/, 'so no endpoint is asked which rule it matches')
+  const report = Buffer.from(readVar(run.output, 'REPORT_B64'), 'base64').toString('utf8')
+  assert.match(report, /cannot say which TRANSPORT the application's own connection takes/,
+    'and the report names the question that could not be answered')
 })

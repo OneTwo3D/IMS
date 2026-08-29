@@ -2390,6 +2390,33 @@ db_endpoint_discriminates_passwords() {
   return 0
 }
 
+# THE WHOLE CHAIN, AGAINST ONE REFERENCE — THE APPLICATION'S CONNECTION (o3d-2sm1.5 r43).
+#
+# Written out because every previous round aligned these to each other and called it alignment.
+# The reference is what node-postgres does with the DATABASE_URL this run will publish, which
+# db_application_route_sslmode() derives from the composer itself.
+#
+#   the authentication-request reader   ON IT. Told the route as `--sslmode=`, and admitted only
+#                                       when it reports having taken that route.
+#   db_endpoint_accepts_password()      ON IT. psql pinned to DB_PROBE_SSLMODE, which is that same
+#                                       route, plus `gssencmode=disable`.
+#   db_endpoint_discriminates_passwords()
+#                                       ON IT, both halves — the negative control and the positive
+#                                       both go through the function above and nothing else.
+#   resolve_live_role_password()        ON IT. Its four credential attempts are those two functions.
+#   the ALTER, and every local statement DELIBERATELY NOT. pg_local_psql() goes over the Unix socket
+#                                       as the `postgres` superuser: it is not evidence about the
+#                                       application's credential, and it has to keep working when
+#                                       the application's route is exactly what is broken —
+#                                       otherwise a misconfigured pg_hba could not be repaired.
+#   verify_created_database_endpoint()  DELIBERATELY NOT, argued in full at that function: its
+#                                       conclusion is about which postmaster answered, which no
+#                                       transport can change, and it authenticates as a throwaway
+#                                       role rather than as ${DB_USER}, so a pin could only turn a
+#                                       role-specific pg_hba layout into a stopped install.
+#   the migration and the build         ON IT BY CONSTRUCTION. They are handed DATABASE_URL and run
+#                                       the application's own driver, which is the reference itself.
+
 # THE WHOLE GATE, IN THE ORDER THE ARGUMENT RUNS (r41, r42). Whose password AND OVER WHICH
 # TRANSPORT first, then — on that transport and no other — whether this endpoint can tell one
 # password from another, then whether the role can get in with the one asserted live. Nothing is
