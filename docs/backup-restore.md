@@ -242,6 +242,15 @@ cutoff became "now" and the count limit matched every file, so a scheduled run d
 backup set moments after taking one.
 - **Auto-upload** — optionally upload each scheduled backup to S3 or SFTP automatically
 
+The switch shows, and sets, what the scheduler will actually do. Two rows have historically answered
+"are scheduled backups on?" — `cron_backup_enabled` (what the crontab is built from) and
+`backup_schedule_enabled` (what the backup route checks before doing any work) — and on an
+installation where they disagree the result was silent in both directions: a cron line that fired and
+returned "disabled", or a screen showing ON over a job with no cron line. Every reader now resolves
+them the same way (canonical row first, legacy row as a fallback, registry default last), and every
+save writes both, so the first save from either screen collapses the pair for good. No migration is
+needed.
+
 Saving this panel rewrites the managed crontab. The enable switch is the same enablement the
 **Database Backup** job uses in Settings → System → Scheduled Jobs, so the two screens cannot
 disagree: whichever one you save writes both the scheduler's row (`cron_backup_enabled`) and the row

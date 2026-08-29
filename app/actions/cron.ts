@@ -18,7 +18,7 @@ import { reconcileCrontab, readOwnCrontab } from '@/lib/crontab-reconcile'
 import { getAllCronJobs } from '@/lib/cron-jobs'
 import { serializeSettingValue } from '@/lib/settings-store'
 import { runPostCommit } from '@/lib/domain/post-commit'
-import type { SettingSaveResult } from '@/lib/domain/settings/setting-save-outcome'
+import { combinePostCommitOutcomes, type SettingSaveResult } from '@/lib/domain/settings/setting-save-outcome'
 
 /**
  * Reconcile the OS crontab from the stored cron_* settings, behind the permission gate.
@@ -102,6 +102,9 @@ export async function saveCronJobSettings(jobs: CronJobSettingInput[]): Promise<
   })
 
   // POST-COMMIT. Split in two so the warning sentence stays true about WHICH artefact lags.
+  // BOTH STEPS ALWAYS RUN (Codex r20 HIGH). Returning early on the local step meant a transient
+  // activity-log failure left the crontab un-reconciled — on the very screen whose whole purpose is
+  // to change it — under a warning that talked about the audit row instead.
   const local = await runPostCommit(async () => {
     await logActivity({
       entityType: 'SETTING',
@@ -110,11 +113,10 @@ export async function saveCronJobSettings(jobs: CronJobSettingInput[]): Promise<
       description: `Updated scheduled job settings (${jobs.length} jobs)`,
     })
   }, 'Failed to record the scheduled-job change')
-  if (local.status === 'failed') return { status: 'post-commit-failed', step: 'local', error: local.error }
 
   const scheduler = await runPostCommit(reconcileCrontab, 'Failed to sync crontab')
-  if (scheduler.status === 'failed') return { status: 'post-commit-failed', step: 'scheduler', error: scheduler.error }
-  return { status: 'saved' }
+
+  return combinePostCommitOutcomes({ local, scheduler })
 }
 
 export type CrontabDriftStatus = OtiCrontabStatus & {

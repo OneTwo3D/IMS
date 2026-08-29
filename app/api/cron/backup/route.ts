@@ -16,6 +16,7 @@ import {
   BACKUP_RETENTION_FALLBACK_DAYS,
   resolveBackupPurgeLimit,
 } from '@/lib/domain/settings/backup-schedule-input'
+import { isBackupScheduleEnabled } from '@/lib/domain/settings/backup-schedule-enabled'
 
 const BACKUP_DIR = getBackupDir()
 
@@ -46,8 +47,13 @@ export async function GET(request: Request) {
   const { runId, result, responseStatus } = await runCronWithLogging({
     jobName: 'backup',
     run: async () => {
-      const enabled = await getSetting('backup_schedule_enabled')
-      if (enabled !== 'true') {
+      // BOTH ENABLEMENT ROWS, resolved the way the crontab resolves them (Codex r20 HIGH). This read
+      // `backup_schedule_enabled` alone, while the crontab prefers `cron_backup_enabled`. On an
+      // installation where the two disagree — the Scheduled Jobs editor wrote one, the Backup panel
+      // the other — the cron line fired on schedule and every invocation returned "disabled". Saves
+      // now write both rows; this is what makes an ALREADY diverged installation behave, with no
+      // migration.
+      if (!(await isBackupScheduleEnabled(getSetting))) {
         return { skipped: true, reason: 'Scheduled backups disabled' }
       }
 

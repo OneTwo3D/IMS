@@ -282,6 +282,111 @@ function codeOf(file: string): string {
     .replace(/(^|[^:'"`])\/\/[^\n]*/g, '$1 ')
 }
 
+test('a failed LOCAL post-commit step does not skip the crontab reconciliation', async () => {
+  // The enable switch IS a crontab line, so skipping the reconciliation on a transient activity-log
+  // failure meant the operator switched backups on, the row committed, and no scheduled invocation
+  // was ever installed — under a warning that said only the audit entry or a cache might lag.
+  state.logActivityThrows = new Error('activity log unavailable')
+
+  const result = await saveBackup(VALID)
+
+  assert.equal(state.cronCalledAfterWrites, 5, 'the crontab was still reconciled')
+  // The local failure is what is reported, because the scheduler step succeeded.
+  assert.deepEqual(result, { status: 'post-commit-failed', step: 'local', error: 'activity log unavailable' })
+})
+
+test('when BOTH post-commit steps fail, the SCHEDULER is the one reported', async () => {
+  // It is the one with a named operator recovery, and the one whose artefact decides whether
+  // anything runs. Reporting the audit row instead is how the false sentence got written.
+  state.logActivityThrows = new Error('activity log unavailable')
+  state.cronResult = { success: false, error: 'crontab write failed: no crontab for ims' }
+
+  const result = await saveBackup(VALID)
+
+  assert.equal(result.status, 'post-commit-failed')
+  assert.equal(result.status === 'post-commit-failed' ? result.step : null, 'scheduler')
+  assert.match(result.status === 'post-commit-failed' ? result.error : '', /crontab write failed/)
+})
+
+test('the scheduled-jobs editor also reconciles after a failed local step', async () => {
+  // Cross-ported: same shape, on the screen whose entire purpose is to change the crontab.
+  const { saveCronJobSettings } = await import('@/app/actions/cron')
+  state.logActivityThrows = new Error('activity log unavailable')
+
+  const result = await saveCronJobSettings([{ settingKey: 'backup', enabled: true, schedule: '0 1 * * *' }])
+
+  assert.notEqual(state.cronCalledAfterWrites, null, 'the crontab was still reconciled')
+  assert.deepEqual(result, { status: 'post-commit-failed', step: 'local', error: 'activity log unavailable' })
+})
+
+test('a diverged enablement pair resolves the same way for the crontab, the route and the screen', async () => {
+  // No migration is applied on this branch, so an installation whose two rows already disagree is
+  // fixed at READ time or not at all. All three readers now go through one resolver, in the
+  // crontab's order — canonical, then legacy, then the registry default.
+  const { resolveCronEnablement } = await import('@/lib/domain/settings/cron-enablement')
+  const { isBackupScheduleEnabled } = await import('@/lib/domain/settings/backup-schedule-enabled')
+  const { buildOtiCrontabBlock } = await import('@/lib/crontab-sync')
+  const { getAllCronJobs } = await import('@/lib/cron-jobs')
+
+  const backup = getAllCronJobs().find((job) => job.slug === 'backup')
+  assert.ok(backup, 'the backup job is still registered')
+  assert.equal(backup!.legacyEnabledKey, 'backup_schedule_enabled', 'and still declares the legacy row')
+
+  // The two directions the divergence can take, plus the two agreeing cases and the absent case.
+  const cases: Array<{ canonical: string | null; legacy: string | null; expected: boolean; why: string }> = [
+    { canonical: 'true', legacy: 'false', expected: true, why: 'canonical wins: the cron line exists, so the route must not skip' },
+    { canonical: 'false', legacy: 'true', expected: false, why: 'canonical wins: there is no cron line, so the screen must not say ON' },
+    { canonical: 'true', legacy: 'true', expected: true, why: 'agreeing, on' },
+    { canonical: 'false', legacy: 'false', expected: false, why: 'agreeing, off' },
+    { canonical: null, legacy: 'true', expected: true, why: 'never migrated: the legacy row is all there is' },
+    { canonical: null, legacy: null, expected: backup!.defaultEnabled, why: 'neither row: the registry default' },
+  ]
+
+  for (const { canonical, legacy, expected, why } of cases) {
+    const read = async (key: string) =>
+      key === `cron_${backup!.settingKey}_enabled` ? canonical : key === backup!.legacyEnabledKey ? legacy : null
+
+    // 1. THE ROUTE / THE SCREEN — both call this.
+    assert.equal(await isBackupScheduleEnabled(read), expected, `route+screen: ${why}`)
+
+    // 2. THE CRONTAB — asserted through the real builder, not through the resolver again, so this
+    //    compares two independent readers rather than one reader with itself.
+    const settings = new Map<string, string>()
+    if (canonical !== null) settings.set(`cron_${backup!.settingKey}_enabled`, canonical)
+    if (legacy !== null) settings.set(backup!.legacyEnabledKey!, legacy)
+    const block = buildOtiCrontabBlock({
+      jobs: [backup!],
+      settings,
+      secretRef: { kind: 'literal', secret: 'x'.repeat(32) },
+      baseUrl: 'https://ims.example.com',
+    })
+    assert.ok(block.ok, 'the crontab block built')
+    const hasLine = block.ok && block.lines.some((line: string) => line.includes('/backup'))
+    assert.equal(hasLine, expected, `crontab: ${why}`)
+  }
+
+  // AND THE TWO READERS ACTUALLY GO THROUGH IT. Asserted as source because neither the route
+  // handler nor a server-component loader can be invoked here, and without this the whole case table
+  // above proves only that the resolver agrees with the crontab — which it would still do while the
+  // route quietly read one row on its own, exactly as it did before this round.
+  for (const file of ['app/api/cron/backup/route.ts', 'app/(dashboard)/settings/backup/page.tsx']) {
+    const source = readFileSync(join(REPO, file), 'utf8')
+    assert.match(source, /isBackupScheduleEnabled\(/, `${file} must resolve enablement through the shared reader`)
+    assert.doesNotMatch(
+      source.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/(^|[^:'"`])\/\/[^\n]*/g, '$1 '),
+      /getSetting\('backup_schedule_enabled'\)/,
+      `${file} must not read the legacy row on its own`,
+    )
+  }
+
+  // Non-vacuity of the resolver's own contract: a job with NO legacy key ignores a stray legacy value.
+  assert.equal(
+    resolveCronEnablement({ canonical: null, legacy: 'true', hasLegacyKey: false, defaultEnabled: false }),
+    false,
+    'a legacy value only counts for a job that declares a legacy key',
+  )
+})
+
 test('the purge READER is safe over rows written before the gate existed', async () => {
   // Validating the writer does not fix a row already in the database, and the destructive values are
   // exactly the ones the old ungated writer could store. `parseInt(x || 'default')` caught only an

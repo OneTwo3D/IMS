@@ -72,3 +72,31 @@ export function resolveSettingSaveView(input: { result: SettingSaveResult; what:
   }
   return { committed: true, error: '', warning: '' }
 }
+
+/**
+ * COMBINE A LOCAL AND A SCHEDULER POST-COMMIT OUTCOME — BOTH ARE ALWAYS ATTEMPTED (Codex r20 HIGH).
+ *
+ * The two writers that reconcile the crontab used to `return` on a failed LOCAL step, so a transient
+ * activity-log or revalidate failure skipped the reconciliation entirely. For the backup schedule
+ * that is the worst possible skip: the enable switch IS a crontab line, so the operator switched
+ * backups on, the row committed, and no scheduled invocation was ever installed — under a warning
+ * that said only the audit entry or a cache might lag, which was false.
+ *
+ * So the caller runs BOTH steps and hands the results here. The scheduler outcome wins when both
+ * fail: it is the one with a named operator recovery (Settings -> System -> Scheduled Jobs -> Save &
+ * Apply), and it is the one that describes an artefact the system's behaviour depends on. A missing
+ * audit row is real but it is not something the operator can act on differently, and reporting it
+ * INSTEAD of the stale crontab is how the false sentence got written in the first place.
+ */
+export function combinePostCommitOutcomes(input: {
+  local: { status: 'ok' } | { status: 'failed'; error: string }
+  scheduler: { status: 'ok' } | { status: 'failed'; error: string }
+}): SettingSaveResult {
+  if (input.scheduler.status === 'failed') {
+    return { status: 'post-commit-failed', step: 'scheduler', error: input.scheduler.error }
+  }
+  if (input.local.status === 'failed') {
+    return { status: 'post-commit-failed', step: 'local', error: input.local.error }
+  }
+  return { status: 'saved' }
+}

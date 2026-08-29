@@ -6,6 +6,7 @@ import { HardDrive, Clock, Cloud } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Card } from '@/components/ui/card'
 import { getSetting } from '@/app/actions/settings'
+import { isBackupScheduleEnabled } from '@/lib/domain/settings/backup-schedule-enabled'
 import { BackupRestore } from '@/components/settings/backup-restore'
 import { BackupScheduleSettings } from '@/components/settings/backup-schedule'
 import { BackupRemoteSettings } from '@/components/settings/backup-remote-settings'
@@ -118,14 +119,17 @@ export default async function BackupSettingsPage({
 // ---------------------------------------------------------------------------
 
 async function loadSchedule() {
-  const [schedEnabled, schedDays, schedMax, schedUpload] = await Promise.all([
-    getSetting('backup_schedule_enabled'),
+  // The switch shows what the SCHEDULER will do, resolved exactly as the crontab resolves it
+  // (Codex r20 HIGH). Reading `backup_schedule_enabled` alone meant that on an installation whose
+  // two enablement rows had diverged, this screen could show ON over a job with no cron line at all.
+  const [enabled, schedDays, schedMax, schedUpload] = await Promise.all([
+    isBackupScheduleEnabled(getSetting),
     getSetting('backup_retention_days'),
     getSetting('backup_max_count'),
     getSetting('backup_auto_upload'),
   ])
   return {
-    enabled: schedEnabled === 'true',
+    enabled,
     retentionDays: schedDays ?? '30',
     maxCount: schedMax ?? '10',
     autoUpload: schedUpload ?? '',

@@ -15,7 +15,7 @@ import { lockIntegrationPluginSelection } from '@/lib/integration-plugin-selecti
 import { completePluginSelectionSave, type PluginSelectionSaveResult } from '@/lib/domain/integrations/plugin-save-outcome'
 import { runPostCommit } from '@/lib/domain/post-commit'
 import { uniqueViolationTargetsField } from '@/lib/db/prisma-unique-violation'
-import type { SettingSaveResult } from '@/lib/domain/settings/setting-save-outcome'
+import { combinePostCommitOutcomes, type SettingSaveResult } from '@/lib/domain/settings/setting-save-outcome'
 import { assertWritableSettingKeys } from '@/lib/domain/settings/writable-setting-keys'
 import { reconcileCrontab } from '@/lib/crontab-reconcile'
 import { normalizePublicAppUrl } from '@/lib/domain/settings/public-app-url-input'
@@ -1031,14 +1031,16 @@ export async function savePublicAppUrl(value: string): Promise<SettingSaveResult
     await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: `Updated setting: ${key}` })
     revalidatePath('/settings', 'layout')
   }, 'Failed to record the settings change')
-  if (local.status === 'failed') return { status: 'post-commit-failed', step: 'local', error: local.error }
 
   // The crontab embeds the public app URL in every managed job line, so it is genuinely stale until
   // this runs — and it is the step with a named operator recovery, which is why it reports
-  // separately from the local steps above.
+  // separately from the local steps above. IT RUNS EVEN IF THE LOCAL STEP FAILED (Codex r20 HIGH):
+  // returning early here left every managed job line pointing at the previous URL while the warning
+  // talked about an audit row. Cross-ported from saveBackupScheduleSettings, which had the same
+  // shape and the worse consequence.
   const scheduler = await runPostCommit(reconcileCrontab, 'Failed to apply Public App URL changes.')
-  if (scheduler.status === 'failed') return { status: 'post-commit-failed', step: 'scheduler', error: scheduler.error }
-  return { status: 'saved' }
+
+  return combinePostCommitOutcomes({ local, scheduler })
 }
 
 /**
@@ -1101,7 +1103,12 @@ export async function saveBackupScheduleSettings(input: BackupScheduleInput): Pr
     }
   })
 
-  // EVERYTHING BELOW IS POST-COMMIT — see setSettings.
+  // EVERYTHING BELOW IS POST-COMMIT — see setSettings — AND BOTH STEPS ALWAYS RUN (Codex r20 HIGH).
+  //
+  // This used to `return` on a failed local step, which skipped the reconciliation. Here that is the
+  // worst possible skip: the enable switch IS a crontab line, so a transient activity-log failure
+  // meant the operator switched backups on, the row committed, and NO scheduled invocation was ever
+  // installed — reported as "the audit entry or a cache may lag", which was simply untrue.
   const local = await runPostCommit(async () => {
     await logActivity({
       entityType: 'SETTING',
@@ -1111,12 +1118,11 @@ export async function saveBackupScheduleSettings(input: BackupScheduleInput): Pr
     })
     revalidatePath('/settings', 'layout')
   }, 'Failed to record the settings change')
-  if (local.status === 'failed') return { status: 'post-commit-failed', step: 'local', error: local.error }
 
-  // The crontab is genuinely stale until this runs: the enable switch IS a crontab line.
+  // The crontab is genuinely stale until this runs, whatever happened above.
   const scheduler = await runPostCommit(reconcileCrontab, 'Failed to apply the backup schedule change.')
-  if (scheduler.status === 'failed') return { status: 'post-commit-failed', step: 'scheduler', error: scheduler.error }
-  return { status: 'saved' }
+
+  return combinePostCommitOutcomes({ local, scheduler })
 }
 
 /** Not exported: nothing outside needs the name, and a 'use server' module's export surface is an RPC manifest. */

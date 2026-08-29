@@ -19,6 +19,8 @@ export const OTI_CRON_END_MARKER = '# --- OTI CRON END ---'
 // Marker detection tolerant of trailing whitespace / CR (Codex r5: exact
 // equality left whitespace- or CRLF-suffixed markers unmatched, so old blocks
 // survived as live duplicates).
+import { resolveCronEnablement } from '@/lib/domain/settings/cron-enablement'
+
 const START_MARKER_RE = /^# --- OTI CRON START ---[ \t\r]*$/
 const END_MARKER_RE = /^# --- OTI CRON END ---[ \t\r]*$/
 
@@ -231,15 +233,16 @@ export function buildOtiCrontabBlock(params: {
   const commandPrefix = secretRef.kind === 'env-file' ? runtimeSecretPrefix(secretRef.envFilePath) : ''
 
   for (const job of jobs) {
-    const cronEnabled = settings.get(`cron_${job.settingKey}_enabled`)
-    let enabled: boolean
-    if (cronEnabled !== undefined) {
-      enabled = cronEnabled === 'true'
-    } else if (job.legacyEnabledKey) {
-      enabled = settings.get(job.legacyEnabledKey) === 'true'
-    } else {
-      enabled = job.defaultEnabled
-    }
+    // THE SHARED RESOLVER (Codex r20 HIGH). This logic was correct and it was the ONLY place that
+    // had it: the backup route and the Backup settings page each read the legacy row alone, so a
+    // diverged pair meant a cron line that ran a no-op, or a screen that said "on" over a job with
+    // no cron line. Behaviour here is unchanged — the extraction is what lets the other two agree.
+    const enabled = resolveCronEnablement({
+      canonical: settings.get(`cron_${job.settingKey}_enabled`),
+      legacy: job.legacyEnabledKey ? settings.get(job.legacyEnabledKey) : undefined,
+      hasLegacyKey: Boolean(job.legacyEnabledKey),
+      defaultEnabled: job.defaultEnabled,
+    })
     if (!enabled) continue
 
     const schedule = settings.get(`cron_${job.settingKey}_schedule`) ?? job.defaultSchedule
