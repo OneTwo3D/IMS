@@ -77,6 +77,7 @@ export const SHIPPED = [
   'db_route_env_effect',
   'db_application_route_env_refusal',
   'db_sslmode_is_supported',
+  'db_sslmode_is_cleartext',
   'db_url_route_query',
   'db_application_route_sslmode',
   'installed_database_password',

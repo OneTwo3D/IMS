@@ -1201,7 +1201,14 @@ url_decode_userinfo() {
 # this round emitted), `require`, `verify-ca` and `verify-full`. `prefer` is deliberately absent:
 # it picks its transport at RUN TIME, so an authentication FAILURE can fall onto a second pg_hba
 # record — the divergence this whole section exists to close.
-DB_SSLMODE="disable"
+# EMPTY, NOT `disable`, AND THAT IS NOT A STYLE CHOICE. prompt() in --non-interactive mode keeps
+# whatever the variable ALREADY HOLDS and falls back to the default only when it is empty, which is
+# how every value in this script can be supplied as an environment variable. A `disable` written
+# here would therefore be indistinguishable from an operator's own `disable` — and it would beat
+# the value recovered from the previous run's DATABASE_URL, so an unattended upgrade of a TLS-only
+# installation would silently re-publish a cleartext URL. Empty means "nobody has said yet"; both
+# prompt branches settle it, and db_sslmode_is_supported() refuses an unsettled one.
+DB_SSLMODE=""
 DB_SSLROOTCERT=""
 
 db_sslmode_is_supported() {
@@ -1209,6 +1216,14 @@ db_sslmode_is_supported() {
     disable|require|verify-ca|verify-full) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+# The transport this run publishes, or nothing at all before either prompt branch has settled it.
+# `disable` and the empty value compose the same URL, which is what every installation before this
+# round emitted; they are NOT the same to db_sslmode_is_supported(), because a route nobody chose
+# is the whole subject of r43-r45 and it must not be derivable.
+db_sslmode_is_cleartext() {
+  [[ -z "${DB_SSLMODE}" || "${DB_SSLMODE}" == "disable" ]]
 }
 
 # The query string the modes above put on the URL, or nothing at all for `disable`.
@@ -1220,7 +1235,7 @@ db_sslmode_is_supported() {
 # for libpq's own parser would be one more reimplementation of somebody else's rules, and the
 # emitted URL is read by three of them.
 db_url_route_query() {
-  [[ "${DB_SSLMODE}" != "disable" ]] || return 0
+  ! db_sslmode_is_cleartext || return 0
   printf '?sslmode=%s&uselibpqcompat=true' "${DB_SSLMODE}"
   [[ -z "${DB_SSLROOTCERT}" ]] || printf '&sslrootcert=%s' "${DB_SSLROOTCERT}"
 }
@@ -1564,7 +1579,7 @@ db_application_route_sslmode() {
     return 1
   fi
   if ! db_sslmode_is_supported "${DB_SSLMODE}"; then
-    printf 'DB_SSLMODE is %s, and the transports this installer can put every probe on are disable, require, verify-ca and verify-full' "$(printf '%q' "${DB_SSLMODE}")"
+    printf 'DB_SSLMODE is %s, and the transports this installer can put every probe on are disable, require, verify-ca and verify-full. An empty value means no prompt branch has settled it yet, which is a route nobody chose' "$(printf '%q' "${DB_SSLMODE}")"
     return 1
   fi
   url="$(compose_database_url "${DB_USER}" "irrelevant" "${DB_HOST}" "${DB_PORT}" "${DB_NAME}")"
@@ -5036,6 +5051,7 @@ prompt_db_sslmode() {
   existing_mode="$(installed_database_sslmode "${existing_url}")" || existing_mode="disable"
   existing_root="$(installed_database_sslrootcert "${existing_url}")" || existing_root=""
   prompt DB_SSLMODE "Database TLS mode (disable, require, verify-ca, verify-full)" "${existing_mode}"
+  [[ -n "${DB_SSLMODE}" ]] || DB_SSLMODE="disable"
   db_sslmode_is_supported "${DB_SSLMODE}" || die \
     "DB_SSLMODE=${DB_SSLMODE} is not a transport this installer can put its probes on. The supported values are 'disable' (no SSLRequest at all — what every installation before this round used), 'require' (encrypted, certificate not verified), 'verify-ca' and 'verify-full' (both require DB_SSLROOTCERT). 'prefer' is deliberately absent: it chooses its transport at run time, so an authentication FAILURE can fall onto a second pg_hba.conf record, and the whole point of pinning is that it cannot."
   case "${DB_SSLMODE}" in

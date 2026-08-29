@@ -2041,9 +2041,10 @@ function runRouteEnv(options: RouteEnvOptions): { status: number; output: string
     lift('unit_execstart_is_exactly'),
     lift('db_service_execstart_expected'),
     lift('url_encode_userinfo'),
+    lift('db_sslmode_is_supported'),
+    lift('db_sslmode_is_cleartext'),
     lift('db_url_route_query'),
     lift('compose_database_url'),
-    lift('db_sslmode_is_supported'),
     lift('db_route_env_variables'),
     lift('db_route_env_alternative'),
     lift('db_route_env_effect'),
@@ -2437,7 +2438,7 @@ test('r45: the start gate refuses a transport the run never authenticated agains
         lift('unit_execstart_is_exactly'), lift('db_service_execstart_expected'),
         lift('unit_env_var_sole_source'), lift('env_file_is_sole_database_url_source'),
         lift('require_env_file_is_sole_definition'), lift('env_file_value'),
-        lift('url_encode_userinfo'), lift('db_url_route_query'), lift('compose_database_url'),
+        lift('url_encode_userinfo'), lift('db_sslmode_is_cleartext'), lift('db_url_route_query'), lift('compose_database_url'),
         lift('db_route_env_variables'), lift('db_route_env_alternative'), lift('db_route_env_effect'),
         lift('db_application_route_env_refusal'), lift('require_start_identity_bound'),
         'if require_start_identity_bound; then echo "BOUND"; else echo "REFUSED=${DB_IDENTITY_SOURCE_REASON}"; fi',
@@ -2725,6 +2726,93 @@ test('r45: a TLS-only external database is installable, and the gate validates t
     assert.match(unsupported.output, /disable, require, verify-ca and verify-full/, 'and names the ones that are')
   } finally {
     cluster?.stop()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 27. AN UPGRADE OF A TLS-ONLY INSTALLATION STAYS ON TLS
+//
+// The transport is not written to `.env` as a variable of its own — it is part of the
+// `DATABASE_URL` the installer composes — so on a re-run it has to be RECOVERED from that URL, for
+// exactly the reason installed_database_password() has to be. If it were not, an unattended
+// upgrade would re-publish a cleartext URL over a database that accepts nothing but TLS, and the
+// service would come back unable to connect at all: a worse failure than a bad first install,
+// because nobody has any reason to suspect the installer.
+// ---------------------------------------------------------------------------
+
+test('r45: an upgrade recovers the transport and the CA from the URL the previous run wrote', () => {
+  // MUTATION ROUTES:
+  //   M1 -- initialise DB_SSLMODE to `disable` at the top of install.sh instead of empty. Under
+  //         --non-interactive, prompt() keeps whatever the variable already holds and reaches its
+  //         default only when it is empty, so the recovered value is never used: RECOVERED_MODE
+  //         becomes `disable` and this fails. That is the shape of the bug, and it is invisible
+  //         interactively.
+  //   M2 -- delete the installed_database_sslrootcert() call: RECOVERED_CA is empty and the
+  //         verify-full validation then dies for want of a CA.
+  //   M3 -- have installed_database_sslmode() accept any query string rather than only the one
+  //         this installer composes: HAND_WRITTEN (a URL with a bare `?sslmode=require`, which is
+  //         NOT what the composer emits and NOT libpq semantics under this driver) is recovered
+  //         instead of ignored.
+  const root = mkdtempSync(join(tmpdir(), 'ims-r45-upgrade-'))
+  try {
+    const ca = join(root, 'ca.pem')
+    writeFileSync(ca, '-- not read by the recovery, only by the validation --\n')
+    const written = (query: string): string =>
+      `NODE_ENV=production\nDATABASE_URL=postgresql://imsuser:pw@db.example.com:5432/one_two_inventory${query}\n`
+
+    // THE GLOBALS ARE LIFTED, NOT DECLARED. The whole of M1 is which value install.sh gives
+    // DB_SSLMODE before the prompts run, so a rig that assigned its own would be measuring the rig.
+    // Same reason CAPTURE_TERMINATOR_ASSIGNMENT is lifted rather than retyped.
+    const source = readFileSync(join(REPO, 'scripts/install.sh'), 'utf8')
+    const globals = ['DB_SSLMODE', 'DB_SSLROOTCERT'].map((name) => {
+      const matches = source.match(new RegExp(`^${name}=.*$`, 'gm')) ?? []
+      assert.equal(matches.length, 1, `precondition: scripts/install.sh must declare ${name} exactly once at top level`)
+      return matches[0]
+    }).join('\n')
+
+    const recover = (query: string, extra = ''): { status: number; output: string } => runShipped(
+      { APP_DIR: root, APP_USER: currentUser(), DB_HOST: 'db.example.com', DB_PORT: '5432', DB_NAME: 'one_two_inventory', DB_USER: 'imsuser' },
+      `
+        ${globals}
+        ${extra}
+        load_existing_env "\${APP_DIR}/.env"
+        prompt_db_sslmode
+        echo "RECOVERED_MODE=\${DB_SSLMODE}"
+        echo "RECOVERED_CA=\${DB_SSLROOTCERT}"
+      `,
+    )
+
+    writeFileSync(join(root, '.env'), written(`?sslmode=verify-full&uselibpqcompat=true&sslrootcert=${ca}`))
+    const verifyFull = recover('')
+    assert.equal(verifyFull.status, 0, verifyFull.output)
+    assert.match(verifyFull.output, /^RECOVERED_MODE=verify-full$/m,
+      `RECOVERED_MODE: an unattended upgrade must keep the transport the last run published:\n${verifyFull.output}`)
+    assert.match(verifyFull.output, new RegExp(`^RECOVERED_CA=${ca}$`, 'm'),
+      'RECOVERED_CA: and the CA it verifies against, or verify-full has nothing to verify with')
+
+    writeFileSync(join(root, '.env'), written('?sslmode=require&uselibpqcompat=true'))
+    assert.match(recover('').output, /^RECOVERED_MODE=require$/m, 'the same for the mode that verifies nothing')
+    assert.match(recover('').output, /^RECOVERED_CA=$/m, 'which carries no CA, and must not acquire one')
+
+    // A CLEARTEXT INSTALLATION STAYS CLEARTEXT — which is every installation that existed before
+    // this round, and the assertion that stops the recovery being "turn TLS on for everybody".
+    writeFileSync(join(root, '.env'), written(''))
+    assert.match(recover('').output, /^RECOVERED_MODE=disable$/m, 'and a URL with no query string recovers `disable`')
+
+    // HAND_WRITTEN: a query string this installer did not compose is not recovered. Under this
+    // driver a bare `?sslmode=require` means verify-full against Node's own CA bundle, so reading
+    // it as "the operator asked for libpq's require" would be the r43 divergence re-introduced by
+    // the recovery path itself.
+    writeFileSync(join(root, '.env'), written('?sslmode=require'))
+    assert.match(recover('').output, /^RECOVERED_MODE=disable$/m,
+      'HAND_WRITTEN: only the shape this installer emits is recognised')
+
+    // AND AN OPERATOR-SUPPLIED VALUE STILL WINS, because that is what --non-interactive means.
+    writeFileSync(join(root, '.env'), written('?sslmode=require&uselibpqcompat=true'))
+    assert.match(recover('', 'DB_SSLMODE=disable').output, /^RECOVERED_MODE=disable$/m,
+      'an explicit DB_SSLMODE beats the recovered one')
+  } finally {
     rmSync(root, { recursive: true, force: true })
   }
 })
