@@ -62,6 +62,7 @@ import {
   describeFollowUpEnqueueRefusals,
   paymentAccountRefusalMessage,
   refusedFollowUpEnqueue,
+  requestedInvoicePaymentAmount,
   type FollowUpEnqueueOutcome,
 } from '@/lib/domain/accounting/followup-enqueue-outcome'
 import {
@@ -7138,6 +7139,25 @@ async function decideInvoicePaymentFollowUp(
   // Nobody asked for a payment, so none is owed. STATED, not inherited from an initialiser.
   if (!payload._registerPayment) return FOLLOW_UPS_ENQUEUED
 
+  /**
+   * THE AMOUNT IS RESOLVED BEFORE ANY CONFIGURATION IS CONSULTED (o3d-batch-ret r7, Codex MEDIUM).
+   *
+   * NOTHING TO MOVE IS NOT A REFUSAL, and it is stated rather than fallen into. A non-positive
+   * amount owes no payment: Xero would reject it, and there is no configuration for an operator to
+   * repair. The distinction this whole function exists for is between "no follow-up is owed" and
+   * "one is owed and was not queued" — this arm is the first, and it says so out loud.
+   *
+   * IT USED TO SIT BELOW THE MAPPING CHECKS, WHICH TURNED ROUND 6'S FIX INTO A FALSE REFUSAL. The
+   * WooCommerce importer sets `_registerPayment` from `date_paid_gmt` alone while
+   * `resolveWcInvoicePaymentAmount` returns `undefined` for a paid ZERO-TOTAL order, so such an
+   * order reached the two configuration arms and was refused for a bank account it would never have
+   * used — keeping its obligation marker indefinitely over a payment nobody was owed. A consumer
+   * may only ask about a mapping once it knows money actually moves. The resolution itself is the
+   * shared `requestedInvoicePaymentAmount`, so the sibling connector cannot drift out of this order.
+   */
+  const amount = requestedInvoicePaymentAmount(payload)
+  if (amount === undefined || !(amount > 0)) return FOLLOW_UPS_ENQUEUED
+
   const paymentMap = await getPaymentAccountMap()
   const method = payload._paymentMethod as string || ''
   const currency = payload.currency as string || 'GBP'
@@ -7154,6 +7174,15 @@ async function decideInvoicePaymentFollowUp(
       referenceId,
       missing,
       configure,
+      // THE DRIVER-AGNOSTIC CLAUSE, AND IT IS AUDITED RATHER THAN COPIED (o3d-batch-ret r7, Codex
+      // MEDIUM). The QuickBooks twin of this refusal has ONE driver — the processor's post path —
+      // so it states what that pass actually does next (`postedRowFollowUpRetryNote`). THIS one has
+      // TWO: `enqueueFollowUps` is handed to `repairXeroBackReferences` BY IDENTITY, so the same
+      // sentence is composed on the sweep's pass, where the row is at rest and no processor retry is
+      // coming. A "the processor retries the posted parent" clause would be false there, and the
+      // registry's note — Xero declares `consumer: 'sweep'`, and that sweep is bound and cron-invoked
+      // — is true on both: on the post path the parent retries and, once its retries are spent, comes
+      // to rest FAILED and marked, which is exactly what the sweep selects.
       recovery: followUpObligationRecoveryNote(followUpObligationRecoveryFor(XERO_CONNECTOR)),
     })
     await logActivity({
@@ -7190,22 +7219,6 @@ async function decideInvoicePaymentFollowUp(
       'Add that mapping under Settings → Accounting → Payment Account Mapping.',
     )
   }
-
-  let amount = payload._paymentAmount as number | undefined
-  if (amount == null && typeof payload._paymentAmount === 'string') {
-    amount = Number(payload._paymentAmount)
-  }
-  if (amount == null) {
-    amount = (payload.lines as Array<{ quantity: number; unitAmount: number }>).reduce((s, l) => s + l.quantity * l.unitAmount, 0)
-      + ((payload.shippingAmount as number) || 0)
-      - ((payload.discountAmount as number) || 0)
-  }
-
-  // NOTHING TO MOVE IS NOT A REFUSAL, and it is stated rather than fallen into. A non-positive
-  // amount owes no payment: Xero would reject it, and there is no configuration for an operator to
-  // repair. The distinction this whole function exists for is between "no follow-up is owed" and
-  // "one is owed and was not queued" — this arm is the first, and it says so out loud.
-  if (!(amount > 0)) return FOLLOW_UPS_ENQUEUED
 
   return await enqueueFollowUpSyncLog('INVOICE_PAYMENT', referenceType, referenceId, {
     accountingInvoiceId: postedInvoiceId,

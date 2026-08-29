@@ -42,7 +42,9 @@ import {
   obligationReleasePrerequisite,
   describeFollowUpEnqueueRefusals,
   paymentAccountRefusalMessage,
+  postedRowFollowUpRetryNote,
   refusedFollowUpEnqueue,
+  requestedInvoicePaymentAmount,
   type FollowUpEnqueueOutcome,
 } from '@/lib/domain/accounting/followup-enqueue-outcome'
 import { isUniqueConstraintViolation } from '@/lib/db/prisma-unique-violation'
@@ -2124,6 +2126,23 @@ async function decideInvoicePaymentFollowUp(
   // Nobody asked for a payment, so none is owed. STATED, not inherited from an initialiser.
   if (!payload._registerPayment) return FOLLOW_UPS_ENQUEUED
 
+  /**
+   * THE AMOUNT IS RESOLVED BEFORE ANY CONFIGURATION IS CONSULTED (o3d-batch-ret r7, Codex MEDIUM) —
+   * THE TWIN OF THE XERO REORDERING, AND THE CONSEQUENCE IS WORSE HERE.
+   *
+   * NOTHING TO MOVE IS NOT A REFUSAL. A non-positive amount owes no payment: QuickBooks would reject
+   * it, and there is no configuration for an operator to correct. The distinction this function
+   * exists for is between "no follow-up is owed" and "one is owed and was not queued".
+   *
+   * BELOW THE MAPPING CHECKS, THAT VERDICT WAS UNREACHABLE FOR THE ROWS THAT NEEDED IT. A paid
+   * ZERO-TOTAL WooCommerce order carries `_registerPayment` with no `_paymentAmount`
+   * (`resolveWcInvoicePaymentAmount` guards on `gross > 0`), so it was refused for a bank account it
+   * would never have used — and on this connector a refusal FAILS the entry, so the posted parent
+   * retried five times over a payment nobody was owed and came to rest FAILED with its marker held.
+   */
+  const amount = requestedInvoicePaymentAmount(payload)
+  if (amount === undefined || !(amount > 0)) return FOLLOW_UPS_ENQUEUED
+
   const paymentMap = await getPaymentAccountMap()
   const method = payload._paymentMethod as string || ''
   const currency = payload.currency as string || 'GBP'
@@ -2140,7 +2159,29 @@ async function decideInvoicePaymentFollowUp(
       referenceId,
       missing,
       configure,
-      recovery: followUpObligationRecoveryNote(QBO_FOLLOW_UP_RECOVERY),
+      /**
+       * THE RECOVERY CLAUSE IS THE ONE TRUE OF THIS CALL SITE, NOT THE ONE TRUE OF THE SWEEP
+       * (o3d-batch-ret r7, Codex MEDIUM).
+       *
+       * Round 6 passed the REGISTRY's note here, and on this connector that note says nothing
+       * re-enqueues the work and a human must READ AND ESCALATE. That is true of a RETAINED MARKER
+       * on a row at rest — which is what the registry describes, and what
+       * `settleFollowUpObligation` and the exception inbox are about — and FALSE of this refusal.
+       * A refusal from here is thrown by `requireFollowUpsEnqueued`, caught on both post arms, and
+       * turned by `markSyncLogForFollowUpRetry` into a PENDING posted parent that the very next
+       * processor pass selects and resumes at the follow-ups. So the operator was told to escalate
+       * a row that was actively retrying, and the asymmetry with Xero that sentence asserts is not
+       * the asymmetry of this path.
+       *
+       * The registry keeps the half it actually answers: `atRest` is what becomes of the row once
+       * the retries are spent, read from the same entry as before. Nothing about this connector's
+       * consumer is written here.
+       */
+      recovery: postedRowFollowUpRetryNote({
+        connector: 'QuickBooks',
+        maxRetries: MAX_RETRIES,
+        atRest: followUpObligationRecoveryNote(QBO_FOLLOW_UP_RECOVERY),
+      }),
     })
     await logActivity({
       entityType: 'SYSTEM',
@@ -2175,22 +2216,6 @@ async function decideInvoicePaymentFollowUp(
       'Add that mapping under Settings → Accounting → Payment Account Mapping.',
     )
   }
-
-  let amount = payload._paymentAmount as number | undefined
-  if (amount == null && typeof payload._paymentAmount === 'string') {
-    amount = Number(payload._paymentAmount)
-  }
-  if (amount == null) {
-    amount = (payload.lines as Array<{ quantity: number; unitAmount: number }>).reduce((s, l) => s + l.quantity * l.unitAmount, 0)
-      + ((payload.shippingAmount as number) || 0)
-      - ((payload.discountAmount as number) || 0)
-  }
-
-  // NOTHING TO MOVE IS NOT A REFUSAL, and it is stated rather than fallen into. A non-positive
-  // amount owes no payment: QuickBooks would reject it, and there is no configuration for an
-  // operator to correct. The distinction this function exists for is between "no follow-up is owed"
-  // and "one is owed and was not queued" — this arm is the first, and it says so out loud.
-  if (!(amount > 0)) return FOLLOW_UPS_ENQUEUED
 
   // Resolve QBO customer ID for the payment request
   let customerRef: string | undefined

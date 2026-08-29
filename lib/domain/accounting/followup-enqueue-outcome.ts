@@ -170,6 +170,95 @@ export function paymentAccountRefusalMessage(input: {
     + `the setting is corrected is a fact about this connector, not a promise made here: ${input.recovery}.`
 }
 
+/**
+ * THE AMOUNT A POSTED INVOICE'S PAYLOAD IS ACTUALLY ASKING TO SETTLE (o3d-batch-ret r7, Codex
+ * MEDIUM) — RESOLVED BEFORE ANY CONFIGURATION IS CONSULTED, AND ON BOTH CONNECTORS.
+ *
+ * ROUND 6 TURNED A SILENT SUCCESS INTO A FALSE REFUSAL. `decideInvoicePaymentFollowUp` validated the
+ * payment-account map FIRST and only then computed the amount, so the explicit `!(amount > 0)`
+ * verdict — "nobody is owed anything, and that is a success" — sat downstream of a check the
+ * no-payment case never needed. The WooCommerce importer sets
+ * `_registerPayment: !!wcOrder.date_paid_gmt && documentTotalsToTheOrder` while
+ * `resolveWcInvoicePaymentAmount` returns `undefined` for a PAID ZERO-TOTAL order (its guard is
+ * `gross > 0`), so a £0 order marked paid asks for a payment worth nothing. With no mapping
+ * configured that order was refused for a bank account it would never have used, kept its obligation
+ * marker for ever, and — on QuickBooks — could carry the posted parent all the way to FAILED.
+ *
+ * THE ORDER OF QUESTIONS IS THE FIX, NOT A NEW BRANCH. A consumer may only ask about a mapping once
+ * it knows a payment is genuinely owed; asking earlier makes a configuration answer stand in for a
+ * money one. Both connectors had the identical ordering and both are reordered, and the resolution
+ * itself is HERE rather than twice, because a rule copied into two files is a rule two files can
+ * disagree about — which is how this pair acquired the same defect in the first place.
+ *
+ * IT RETURNS `undefined` RATHER THAN 0 FOR AN UNUSABLE DECLARATION, and the caller's `!(amount > 0)`
+ * reads both the same way: nothing to move. Note the string arm — the shipped code declared
+ * `amount` as `number | undefined` and then tested `amount == null` before converting, so a numeric
+ * STRING was never converted and was handed to the enqueue as a string. Doing the conversion where
+ * the value's type is actually examined is what makes that arm reachable.
+ */
+export function requestedInvoicePaymentAmount(payload: Record<string, unknown>): number | undefined {
+  const declared = payload._paymentAmount
+  if (typeof declared === 'number') return Number.isFinite(declared) ? declared : undefined
+  if (typeof declared === 'string') {
+    const parsed = Number(declared)
+    return Number.isFinite(parsed) ? parsed : undefined
+  }
+  // Anything else DECLARED is unusable and must not silently fall back to a derived figure: the
+  // payload said what to settle and it cannot be read, which is not the same as it saying nothing.
+  if (declared !== null && declared !== undefined) return undefined
+
+  // Nothing declared: derive the document total the same way both connectors always have. The
+  // `Array.isArray` guard replaces an unguarded cast — a payload with no lines used to throw a
+  // TypeError from inside the follow-up pass, which fails an entry whose invoice has already posted.
+  const lines = Array.isArray(payload.lines) ? payload.lines as Array<{ quantity: number; unitAmount: number }> : []
+  const shipping = typeof payload.shippingAmount === 'number' ? payload.shippingAmount : 0
+  const discount = typeof payload.discountAmount === 'number' ? payload.discountAmount : 0
+  return lines.reduce((sum, line) => sum + line.quantity * line.unitAmount, 0) + shipping - discount
+}
+
+/**
+ * WHAT ACTUALLY HAPPENS TO A POSTED ROW WHOSE PAYMENT WAS REFUSED ON THE PROCESSOR'S OWN POST PATH
+ * (o3d-batch-ret r7, Codex MEDIUM).
+ *
+ * THE SHARED PRODUCER TOOK ITS RECOVERY CLAUSE AS AN ARGUMENT, AND THAT LET A TRUE CLAUSE BE PASSED
+ * WHERE IT IS FALSE. `paymentAccountRefusalMessage` deliberately refuses to write the "what happens
+ * next" half itself, because that half differs by connector — and round 6 filled it in from the
+ * REGISTRY at both call sites. The registry answers a question about a RETAINED MARKER on a row at
+ * rest: on QuickBooks `consumer: 'none'`, i.e. nothing re-reads it, escalate. That is true of the
+ * retained-marker sweep and FALSE of this refusal, which does not leave the row at rest at all:
+ * `requireFollowUpsEnqueued` throws, the connector catches it and `markSyncLogForFollowUpRetry` puts
+ * the POSTED parent back to PENDING with its external id and its marker intact, and the next
+ * processor pass selects it, takes the idempotency short-circuit on that id, and retries only the
+ * follow-ups. So the operator was told to escalate a row that was actively retrying.
+ *
+ * THE REGISTRY FACT IS STILL THE REGISTRY'S, and it is where this clause ENDS rather than what it
+ * replaces: `atRest` is the caller's `followUpObligationRecoveryNote(...)`, describing the row once
+ * the retries are spent. Nothing about a connector's consumer is written here.
+ *
+ * ONLY A CALL SITE WITH ONE DRIVER MAY USE THIS. The Xero twin of this refusal is reached from the
+ * processor's post path AND from `repairXeroBackReferences`, which hands the connector's
+ * `enqueueFollowUps` over by identity; on the sweep's pass the row is at rest and no processor retry
+ * is coming, so this clause would be false there. That call site therefore keeps the
+ * driver-agnostic registry note, which is true on both of its drivers. QuickBooks binds no sweep
+ * (its registry entry is the declaration of that), so its refusal has exactly one driver.
+ */
+export function postedRowFollowUpRetryNote(input: {
+  /** Display name of the accounting package, for the operator: `QuickBooks`. */
+  connector: string
+  /** The processor's own retry bound, read from the connector rather than restated as a number. */
+  maxRetries: number
+  /** The connector's declared fact about a retained marker once the retries are spent. */
+  atRest: string
+}): string {
+  return `this refusal FAILS the entry rather than settling it. The posted parent keeps its external id and its `
+    + `follow-up obligation marker and goes back on the queue, so the main ${input.connector} sync processor selects `
+    + `it again — ${input.maxRetries} attempts in all — takes the idempotency short-circuit on that external id `
+    + 'straight back to the follow-ups instead of posting a second document, and queues the payment as soon as the '
+    + 'mapping names an account for it. Nothing is posted twice and nothing needs to be settled by hand in the '
+    + `meantime. Once those ${input.maxRetries} attempts are spent the row comes to rest FAILED and still marked, `
+    + `and from that point ${input.atRest}`
+}
+
 /** The refusals an outcome carries; empty for an enqueued one. */
 export function followUpEnqueueRefusals(outcome: FollowUpEnqueueOutcome): readonly FollowUpEnqueueRefusal[] {
   return outcome.enqueued ? [] : outcome.refusals
