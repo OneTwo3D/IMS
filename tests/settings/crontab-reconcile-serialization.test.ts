@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { spawn } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import {
   chmodSync,
   existsSync,
@@ -130,8 +130,17 @@ writeFileSync(LOCK_FILE, '')
 // whether it was itself handed the lock descriptor as fd 3.
 writeFileSync(join(HARNESS, 'crontab'), `#!/bin/sh
 if [ "$1" = "-l" ]; then
-  if [ -f '${CRONTAB_FILE}' ]; then cat '${CRONTAB_FILE}'; fi
-  exit 0
+  # $OTI_TEST_CRONTAB_READ puts the READ into the states a real crontab reaches, unset meaning the
+  # ordinary one so every test written before this knob behaves exactly as it did. The diagnostics
+  # are the ones scripts/lib/crontab-lock.sh documents from Debian's Vixie cron, and \`absent\`
+  # names the CALLING user because that is the user the application's own \`crontab -l\` asks about.
+  case "\${OTI_TEST_CRONTAB_READ:-ok}" in
+    ok)      if [ -f '${CRONTAB_FILE}' ]; then cat '${CRONTAB_FILE}'; fi; exit 0 ;;
+    absent)  echo "no crontab for $(id -un)" >&2; exit 1 ;;
+    denied)  echo "must be privileged to use -u" >&2; exit 1 ;;
+    silent)  exit 1 ;;
+    *)       echo "unmodelled read mode" >&2; exit 1 ;;
+  esac
 fi
 echo "write-start" >> '${JOURNAL}'
 if flock --exclusive --timeout 0 '${LOCK_FILE}' true 2>/dev/null; then
@@ -3337,4 +3346,170 @@ test('[o3d-batch-ret] no entrypoint reads the crontab without going through the 
   for (const [name, src] of SHELL_ENTRYPOINTS) {
     assert.doesNotMatch(src, /^read_crontab_for\(\) \{$/m, `${name} must not define its own copy`)
   }
+})
+
+// ---------------------------------------------------------------------------
+// Codex r29 HIGH #1 — THE APPLICATION'S OWN READER FAILS CLOSED TOO
+//
+// The three shell entrypoints and their thirteen `crontab -l` call sites were swept last round.
+// `readOwnCrontab()` in lib/crontab-reconcile.ts — the file this branch is named after — still
+// resolved EVERY `execFile` error as `''`, and `applyCrontabFromSettings` spliced the managed block
+// into that fabricated empty crontab and handed the result to `crontab -`. A read that failed while
+// the WRITE would have succeeded therefore deleted every unmanaged operator line and reported a
+// successful reconciliation.
+//
+// WHAT THESE PIN, and the route each takes:
+//   1. LOAD-BEARING. A reconciliation whose read fails REFUSES: no write at all, and the operator's
+//      crontab is byte-for-byte what it was
+//                     (backup-schedule.tsx -> saveBackupScheduleSettings -> reconcileCrontab
+//                      -> applyCrontabFromSettings -> readOwnCrontabResult)
+//   2. LOAD-BEARING. A genuinely ABSENT crontab still reconciles, so the refusal above is a
+//      decision rather than a reader that refuses everything                     (same route)
+//   3. MUTATION. The pre-fix reader, run against the same failing shim, produces the crontab that
+//      would have been written — and the operator's line is not in it
+//                                        (the shipped spliceOtiBlock over the pre-fix read)
+// ---------------------------------------------------------------------------
+
+/** The operator's own entry: the thing a fabricated empty read deletes. */
+const APP_OPERATOR_LINE = '17 3 * * * /usr/local/bin/operator-only'
+
+// DYNAMIC, like every other import in this file: a static one is hoisted above the `mock.module`
+// calls above, so the real `@/lib/db` would be pulled in before the double is registered.
+const crontabSync = () => import('@/lib/crontab-sync')
+const crontabReconcile = () => import('@/lib/crontab-reconcile')
+
+async function withReadMode<T>(mode: string | null, fn: () => Promise<T>): Promise<T> {
+  const saved = process.env.OTI_TEST_CRONTAB_READ
+  if (mode === null) delete process.env.OTI_TEST_CRONTAB_READ
+  else process.env.OTI_TEST_CRONTAB_READ = mode
+  try {
+    return await fn()
+  } finally {
+    if (saved === undefined) delete process.env.OTI_TEST_CRONTAB_READ
+    else process.env.OTI_TEST_CRONTAB_READ = saved
+  }
+}
+
+test('[o3d-batch-ret] a reconciliation whose crontab READ fails writes nothing, and says so', async () => {
+  // A crontab that already holds an operator entry the app does not manage. This is the whole
+  // stake: it exists nowhere but here.
+  writeFileSync(CRONTAB_FILE, `${APP_OPERATOR_LINE}\n`)
+  rmSync(JOURNAL, { force: true })
+
+  // CONTROL, FIRST. With the read working, this exact save reconciles and the operator line
+  // SURVIVES the splice — so the refusal below is about the failed read and not about the fixture.
+  const control = await withReadMode(null, () => saveBackup(true))
+  assert.deepEqual(control, { status: 'saved' },
+    `precondition: an ordinary save must reconcile:\n${JSON.stringify(control)}`)
+  assert.ok(crontabText().includes(APP_OPERATOR_LINE),
+    `precondition: a working read preserves the operator line:\n${crontabText()}`)
+  assert.ok(backupLineInstalled(), 'precondition: and it installs the managed job')
+  const preserved = crontabText()
+  const writesBefore = journal().filter((l) => l === 'write-start').length
+
+  // THE PROPERTY. `crontab -l` fails — not absent, FAILED — while `crontab -` would still have
+  // worked perfectly. Nothing may be written.
+  const refused = await withReadMode('denied', () => saveBackup(false))
+  assert.equal(refused.status, 'post-commit-failed',
+    `a reconciliation over an unreadable crontab must not report success:\n${JSON.stringify(refused)}`)
+  assert.equal(refused.status === 'post-commit-failed' && refused.step, 'scheduler',
+    'and the operator must be told it is the SCHEDULER that is behind')
+  assert.match(refused.status === 'post-commit-failed' ? refused.error : '', /could not be read/,
+    `and it must say WHY, naming the read:\n${JSON.stringify(refused)}`)
+  assert.equal(crontabText(), preserved,
+    `THE FINDING: the crontab must be untouched, operator line and all:\n${crontabText()}`)
+  assert.equal(journal().filter((l) => l === 'write-start').length, writesBefore,
+    'and `crontab -` must not have been invoked at all — the shim journals every invocation')
+
+  // The same for a failure that says nothing whatsoever, which is the shape a timeout or a killed
+  // child arrives in.
+  const silent = await withReadMode('silent', () => saveBackup(false))
+  assert.equal(silent.status, 'post-commit-failed',
+    `a read that fails silently is still a failed read:\n${JSON.stringify(silent)}`)
+  assert.equal(crontabText(), preserved, `and still writes nothing:\n${crontabText()}`)
+})
+
+test('[o3d-batch-ret] a crontab that is genuinely ABSENT still reconciles — the refusal is a decision', async () => {
+  // The other direction, and it is not decoration: a reader that treated every non-zero exit as a
+  // failure would stop the scheduler working on every fresh box, which have no crontab at all.
+  rmSync(CRONTAB_FILE, { force: true })
+  rmSync(JOURNAL, { force: true })
+
+  const saved = await withReadMode('absent', () => saveBackup(true))
+  assert.deepEqual(saved, { status: 'saved' },
+    `"no crontab for <user>" is an ANSWER and must reconcile:\n${JSON.stringify(saved)}`)
+  assert.ok(backupLineInstalled(),
+    `and the managed job must actually be scheduled:\n${crontabText()}`)
+  assert.ok(crontabText().includes((await crontabSync()).OTI_CRON_START_MARKER),
+    `written as a managed block:\n${crontabText()}`)
+  assert.equal(journal().filter((l) => l === 'write-start').length, 1,
+    'exactly one write, into a crontab that provably had nothing in it')
+})
+
+test('[o3d-batch-ret] MUTATION: the pre-fix reader turns that failure into an empty crontab, and the splice deletes the operator line', async () => {
+  // THE ROUTE, RUN. `readOwnCrontab`'s body as it shipped last round — `resolve(err ? '' : stdout)`
+  // — against the SAME shim in the SAME failing state, feeding the SHIPPED splice. Nothing is
+  // described: the text that would have been handed to `crontab -` is built here and inspected.
+  const preFixRead = (): Promise<string> => new Promise<string>((resolve) => {
+    execFile('crontab', ['-l'], { timeout: 5000 }, (err, stdout) => {
+      resolve(err ? '' : String(stdout))
+    })
+  })
+
+  writeFileSync(CRONTAB_FILE, `${APP_OPERATOR_LINE}\n`)
+  const blockLines = ['# --- OTI CRON START ---', '0 1 * * * /usr/bin/managed', '# --- OTI CRON END ---']
+  const { spliceOtiBlock } = await crontabSync()
+  const { readOwnCrontabResult } = await crontabReconcile()
+
+  // CONTROL. With the read working, the pre-fix reader and the shipped one agree, and the splice
+  // keeps the operator line — so the loss below is caused by the FAILURE, not by the splice.
+  const workingRead = await withReadMode(null, preFixRead)
+  assert.ok(workingRead.includes(APP_OPERATOR_LINE), 'precondition: a working read returns the crontab')
+  assert.ok(spliceOtiBlock(workingRead, blockLines).includes(APP_OPERATOR_LINE),
+    'precondition: and the splice preserves it')
+
+  // THE MUTATION. The read fails; the pre-fix body reports an empty crontab; the splice has nothing
+  // to preserve, and `crontab -` would have installed exactly this.
+  const wouldHaveWritten = await withReadMode('denied', async () =>
+    spliceOtiBlock(await preFixRead(), blockLines))
+  assert.ok(!wouldHaveWritten.includes(APP_OPERATOR_LINE),
+    `THE LOSS: the operator's only copy of ${APP_OPERATOR_LINE} is not in the text that would have been installed:\n${wouldHaveWritten}`)
+
+  // …and the SHIPPED reader, given the identical failure, produces no text to splice at all.
+  const shipped = await withReadMode('denied', () => readOwnCrontabResult())
+  assert.equal(shipped.resolved, false,
+    `the shipped reader must refuse where the pre-fix one fabricated:\n${JSON.stringify(shipped)}`)
+
+  // …while the benign absence still resolves, which is the boundary the whole rule turns on.
+  const absent = await withReadMode('absent', () => readOwnCrontabResult())
+  assert.deepEqual(absent, { resolved: true, text: '', present: false },
+    `and an absent crontab resolves as an empty one:\n${JSON.stringify(absent)}`)
+})
+
+test('[o3d-batch-ret] no application code path reads the crontab without discriminating the failure', async () => {
+  // The repository walk, so the next reader added is not a fourth instance of this. `execFile` /
+  // `spawn` in the app are allowed; resolving one's ERROR to an empty or default value is not.
+  const reconcileSrc = readFileSync(join(REPO_ROOT, 'lib/crontab-reconcile.ts'), 'utf8')
+  assert.doesNotMatch(reconcileSrc, /resolve\(\s*err\s*\?\s*''/,
+    'lib/crontab-reconcile.ts must not resolve a failed read to the empty string')
+  assert.match(reconcileSrc, /isNoCrontabDiagnostic\(/,
+    'and it must decide absence with the SAME rule the shell reader uses')
+
+  // The refusal has to come BEFORE the splice, or it is not a refusal.
+  const refusalAt = reconcileSrc.indexOf('if (!read.resolved)')
+  const spliceAt = reconcileSrc.indexOf('spliceOtiBlock(read.text')
+  assert.ok(refusalAt > 0 && spliceAt > refusalAt,
+    'applyCrontabFromSettings must abort on an unresolved read before spliceOtiBlock')
+
+  // And nothing anywhere still imports the fabricating reader.
+  const walk = (dir: string): string[] => readdirSync(dir, { withFileTypes: true }).flatMap((e) => {
+    if (e.name === 'node_modules' || e.name === '.next' || e.name.startsWith('.')) return []
+    const full = join(dir, e.name)
+    if (e.isDirectory()) return walk(full)
+    return e.name.endsWith('.ts') || e.name.endsWith('.tsx') ? [full] : []
+  })
+  const sources = [...walk(join(REPO_ROOT, 'lib')), ...walk(join(REPO_ROOT, 'app'))]
+  assert.ok(sources.length > 200, `the walk must actually reach the source tree, saw ${sources.length}`)
+  const offenders = sources.filter((f) => /\breadOwnCrontab\b(?!Result)/.test(readFileSync(f, 'utf8')))
+  assert.deepEqual(offenders, [], `these still call the fabricating reader:\n${offenders.join('\n')}`)
 })
