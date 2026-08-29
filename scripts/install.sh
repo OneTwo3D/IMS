@@ -1150,7 +1150,7 @@ provision_database_role_and_privileges() {
   [[ "${INSTALL_POSTGRES}" == "y" ]] || return 0
 
   if ${DB_ROLE_PREEXISTED}; then
-    pg_local_psql -q >/dev/null <<EOSQL || die "Setting the password of the existing role '${DB_USER}' failed, so ${APP_DIR}/.env now names a credential the server does not have. NOTHING HAS BEEN MIGRATED. Fix the role by hand or re-run."
+    pg_local_psql -q >/dev/null <<EOSQL || die "Setting the password of the existing role '${DB_USER}' failed, so the environment file this run wrote for the application names a credential the server does not have. NOTHING HAS BEEN MIGRATED. Fix the role by hand or re-run."
       ALTER USER "${DB_USER}" WITH PASSWORD '${DB_PASSWORD}';
 EOSQL
     DB_ROLE_CREDENTIALS_ROTATED=true
@@ -2990,11 +2990,17 @@ on_cutover_exit() {
     # role work happens once the fence has been proved possible — but a BUILD failure can, and a
     # banner that says "nothing has to be recovered first" over a rotated credential is the same
     # untrue refusal one step further down.
-    if ${DB_ROLE_CREDENTIALS_ROTATED}; then
-      warn "  credentials : the password of the PRE-EXISTING role ${DB_USER} was changed to the one"
-      warn "                in ${APP_DIR}/.env, so those two agree and this host is consistent."
-      warn "                Any OTHER client still using the previous password for ${DB_USER} needs"
-      warn "                the new one. Nothing else about the database was changed."
+    #
+    # DEFAULTED, BECAUSE THIS IS A TRAP. Every variable an exit handler reads has to survive being
+    # read before the assignment that sets it: the whole point of the handler is that it runs on
+    # paths the straight-line code never reached. Under `set -u` an unset name here would abort
+    # the trap mid-banner and skip unwind_arming() below — the cleanup, not just the message.
+    if ${DB_ROLE_CREDENTIALS_ROTATED:-false}; then
+      warn "  credentials : the password of the PRE-EXISTING role ${DB_USER:-<none>} was changed to the"
+      warn "                one this run wrote into the application's environment file, so those two"
+      warn "                agree and this host is consistent. Any OTHER client still using the"
+      warn "                previous password for that role needs the new one. Nothing else about"
+      warn "                the database was changed."
     fi
     unwind_arming
     warn "  Fix the cause and re-run. Nothing has to be recovered first."

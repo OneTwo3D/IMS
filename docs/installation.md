@@ -51,6 +51,31 @@ equally true of one another operator created five minutes ago and is about to mi
 race besides, since content can arrive between the question and the migration. Connection counts
 and `datconnlimit` are the same kind of instant and are not used either.
 
+**...and proof about *which server*, read off the connection that produced it.** A `CREATE
+DATABASE` that succeeds says a database is new; it does not say *where*. `libpq` fills every
+connection value the command leaves out from the environment — `PGHOST`, `PGHOSTADDR`, `PGPORT`,
+`PGDATABASE`, `PGSERVICE`, `PGUSER`, a `pg_service.conf` found through `PGSYSCONFDIR` — and a
+`PSQLRC` can move the session with a `\c` before the statement is even sent. An inherited
+`PGPORT=5433` therefore used to create the database on a second cluster while the installer wrote
+down `localhost:5432` as proven: both halves true, of different servers, and the fence skipped over
+a live database on 5432. So:
+
+* every `psql` the installer runs has each exported `PG*`/`PSQL*` variable removed from its
+  environment, and is then **told** where to go — socket directory, port and maintenance database
+  for the local superuser connection; host, port, user and database for the endpoint one — with
+  `-X` (ignore any `psqlrc`) and `-w` (never block on a password prompt);
+* and the proof is **verified, not composed**. The identity is read on the connection that
+  performed the `CREATE` — `pg_postmaster_start_time()`, the server's own `port`, and the new
+  database's `oid` — and compared with the identity read on a connection opened to
+  `DB_HOST:DB_PORT` the way the application opens its own. Unequal stops the run. This is the same
+  server-identity rule `scripts/fence-db-connections.mjs` already uses to decide whether two
+  connections are the same cluster; the *system identifier* is deliberately **not** used, because a
+  `pg_basebackup` clone inherits its origin's, and it is superuser-only besides.
+
+The endpoint connection is made as a throwaway role this run creates with a random name and
+password and drops immediately. That is what lets the check run **before** anything has been done
+to the application role — see the next section.
+
 **Everything unproven is fenced**, which is every case below. Each requires
 `DEPLOY_ADMIN_DATABASE_URL` and a protected fence artefact, exactly as an upgrade does:
 
@@ -60,6 +85,7 @@ and `datconnlimit` are the same kind of instant and are not used either.
 | `INSTALL_POSTGRES=y` over a database that already existed | `CREATE DATABASE` was refused as a duplicate. The run continues; it simply does not get the exemption. |
 | any indeterminate creation result | `psql` unreachable, or a failure that is not duplication. The run **stops** rather than continuing over a database it cannot describe. |
 | a proof about a different host, port or database name | proof about one database is not proof about another. |
+| a `CREATE` that landed on a **different server** | the endpoint `DATABASE_URL` names answered with a different postmaster, port or database `oid`. The run **stops**: the database it is about to migrate is one it did not create. |
 
 **Supply the digest if you have it, and it is enforced — but only the whole-tree one.** With
 `IMS_FENCE_ARTEFACT_SHA256` on the invocation, a first install *publishes* the protected artefact
@@ -89,6 +115,39 @@ be authenticated by a whole-tree digest that came from the release rather than f
 ([where to get it, on a first-ever install as much as any other](#artefact-digest-first-install)),
 or the source must be one only root can write. Omit it there and the run stops before anything is
 migrated, printing every route to the value it wants.
+
+<a id="database-role-ordering"></a>
+### What the installer may do to the database before it knows it may proceed
+
+**Nothing that another client can feel.** The PostgreSQL section used to create *or alter* the
+application role and its password, decide whether the database was new, then `GRANT` and move the
+database's **owner** — all of it before the run had classified the cutover, and long before
+`require_fenceable_database()` had established that a window could be held closed. On a fresh
+application host pointed at a **pre-existing, live** database, a missing
+`DEPLOY_ADMIN_DATABASE_URL` or a missing fence artefact then aborted the run with *"nothing has
+been stopped and nothing has been migrated"* — over a database whose application role had already
+lost the password its clients were using and whose ownership had already moved.
+
+A refusal is only safe at a point where refusing leaves the system consistent. So the section is
+split along exactly one line — whether a statement can take something away from a client that is
+using this database right now:
+
+| before classification | after it |
+| --- | --- |
+| `CREATE ROLE` **when the role is absent**. Nothing can be connected as a role that does not exist. A role that is already there is left completely alone, and the run records — by SQLSTATE `42710` — that it found one. It has to happen here: `fence-db-connections.mjs --preflight` refuses outright when `--app-user` names a role the server does not have, and that preflight is what gates the fenced path. | `ALTER USER … WITH PASSWORD` on a role this run did **not** create. |
+| `CREATE DATABASE`, which either brings a database with no writers into being or is refused as a duplicate. Neither outcome alters an existing object. | `GRANT ALL PRIVILEGES ON DATABASE` and `ALTER DATABASE … OWNER TO`. |
+
+On the fenced path the second column runs after `require_fenceable_database()` has proved the
+window can be held closed and after any standing fence has been adopted; on the first-install path
+it runs once the exemption has been earned. **Not** after the fence is physically raised, and that
+is deliberate: the fence goes up only after the predecessor has been stopped, while the build runs
+*before* the stop so that a release that will not compile costs no outage — and that build is
+handed `DATABASE_URL` and touches the database. Deferring the rotation past the raise would turn
+"the release does not build" into "the release does not build, on a box that has been stopped".
+
+If a password **was** rotated and a later step fails before the stop, the failure banner says so
+rather than claiming the host is untouched: `.env` and the server agree, and any *other* client
+using the old password for that role needs the new one.
 
 The script performs the following steps:
 

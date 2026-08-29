@@ -220,10 +220,19 @@ ${body}
   }
 }
 
-/** A psqlrc that announces itself, so "-X was passed" is measured and not assumed. */
-function psqlrc(root: string): string {
+/**
+ * A psqlrc that MOVES THE SESSION, rather than one that announces itself.
+ *
+ * The obvious version — `\echo PSQLRC_WAS_READ` — is vacuous here, and that was measured rather
+ * than reasoned about: install.sh CAPTURES psql's output into a shell variable and prints it only
+ * on the refusal paths, so a startup file that merely writes to stdout never reaches anything a
+ * test can assert on. A `\c` does what the finding is actually about: it changes which server the
+ * statements after it run on, before ours is sent. Reaching the decoy through its SOCKET keeps it
+ * on trust auth, so the redirection succeeds instead of failing on a password prompt.
+ */
+function psqlrc(root: string, decoy: Cluster): string {
   const path = join(root, 'psqlrc')
-  writeFileSync(path, "\\echo PSQLRC_WAS_READ\n")
+  writeFileSync(path, `\\c postgres - ${decoy.socket} ${decoy.port}\n`)
   return path
 }
 
@@ -240,7 +249,7 @@ function hostileLibpqEnv(decoy: Cluster, root: string): Record<string, string> {
     PGUSER: execFileSync('id', ['-un'], { encoding: 'utf8' }).trim(),
     PGSERVICE: 'no-such-service',
     PGOPTIONS: '-c search_path=pg_catalog',
-    PSQLRC: psqlrc(root),
+    PSQLRC: psqlrc(root, decoy),
   }
 }
 
@@ -254,9 +263,11 @@ test('r37: a database this run creates on the migration target earns the exempti
   // unconditionally — or died on every invocation — would satisfy all three. This is the run
   // where the answer must be YES.
   //
-  // MUTATION ROUTE (verified): make verify_created_database_endpoint() die unconditionally, which
-  // is what an over-strict identity comparison amounts to. This test fails on status 9 while the
-  // three refusal tests below stay green.
+  // MUTATION ROUTE (measured, not predicted): make verify_created_database_endpoint() die
+  // unconditionally, which is what an over-strict identity comparison amounts to. This test fails
+  // on status 9. The two-cluster test and the HIGH's failure-path test stay GREEN, which is the
+  // point — they assert refusals, and a build that refuses everything satisfies them. (The other
+  // two refusal tests do fail, on the refusal TEXT they assert rather than on the refusal.)
   const root = mkdtempSync(join(tmpdir(), 'ims-pgbind-'))
   let cluster: Cluster | undefined
   try {
@@ -316,15 +327,19 @@ test('r37: inherited libpq settings cannot redirect CREATE DATABASE away from th
   // first_install_exemption_available() returns 0 and the live database on the target is migrated
   // with no fence and no drain, under its own writers.
   //
-  // MUTATION ROUTES (each verified by making the change and re-running):
-  //   1. drop `-p "${DB_PORT}"` from pg_local_psql(): the inherited PGPORT wins, the CREATE lands
-  //      on the decoy, and the DECOY assertion below fails on a database that should not be there.
-  //      (The run also dies at verify_created_database_endpoint rather than exiting 0, so the
-  //      status assertion fails too — the two protections are independent and both fire.)
-  //   2. drop the `libpq_env_unset_args` call from pg_local_psql() and keep the flags: PGSERVICE
-  //      is honoured before them and the run dies unable to resolve `no-such-service`, so the
-  //      status assertion fails.
-  //   3. drop `-X`: PSQLRC_WAS_READ appears in the output and that assertion fails.
+  // MUTATION ROUTES (each measured by making the change and re-running):
+  //   1. restore the pre-fix invocation — `run_as_user postgres psql -v ON_ERROR_STOP=1 -q "$@"`,
+  //      no sanitising, no binding, no -X: every test in this file that reaches a cluster fails.
+  //      This one fails first on the inherited PGSERVICE, which psql refuses before it connects.
+  //      Dropping only `-p "${DB_PORT}"` fails the same five: the port is the one parameter that
+  //      selects a cluster within a socket directory.
+  //   2. drop the `libpq_env_unset_args` call from pg_local_psql() and keep every flag: psql
+  //      refuses before it connects, unable to resolve the inherited PGSERVICE, and this test is
+  //      the ONLY one of the six that fails — the others do not set a hostile environment.
+  //   3. drop BOTH the sanitising and `-X`: the inherited PSQLRC runs its `\c` before our
+  //      statement, the CREATE lands on the decoy, and the decoy assertion fails. Dropping `-X`
+  //      ALONE changes nothing and that was measured, not assumed: the sanitiser has already
+  //      removed PSQLRC by then, and -X is the second lock on the same door.
   const root = mkdtempSync(join(tmpdir(), 'ims-pgbind-'))
   let target: Cluster | undefined
   let decoy: Cluster | undefined
@@ -357,19 +372,18 @@ test('r37: inherited libpq settings cannot redirect CREATE DATABASE away from th
       `,
     )
 
-    assert.equal(run.status, 0, `a pre-existing database is a supported outcome, not a crash:\n${run.output}`)
-    assert.match(run.output, /CREATED=false/, 'the target refused the CREATE as a duplicate, so this run created nothing')
-    assert.match(run.output, /EXEMPTION=1/, 'so the exemption is refused and the run is fenced')
-    assert.doesNotMatch(run.output, /PSQLRC_WAS_READ/, '-X must keep a psqlrc from running SQL before ours')
-
-    // THE ASSERTION THE WHOLE FINDING TURNS ON: the CREATE went to the server the migration will
+    // THE ASSERTION THE WHOLE FINDING TURNS ON, AND IT IS MADE FIRST so that a run which dies for
+    // some other reason cannot skip past it: the CREATE went to the server the migration will
     // use, and NOWHERE ELSE. A decoy holding one_two_inventory is a run that created a database
     // on one server and would have spent the proof on another.
     assert.equal(
       decoy.psql(['-c', "SELECT count(*) FROM pg_database WHERE datname = 'one_two_inventory'"]),
       '0',
-      'nothing may have been created on the cluster the environment pointed at',
+      `nothing may have been created on the cluster the environment pointed at:\n${run.output}`,
     )
+    assert.equal(run.status, 0, `a pre-existing database is a supported outcome, not a crash:\n${run.output}`)
+    assert.match(run.output, /CREATED=false/, 'the target refused the CREATE as a duplicate, so this run created nothing')
+    assert.match(run.output, /EXEMPTION=1/, 'so the exemption is refused and the run is fenced')
   } finally {
     target?.stop()
     decoy?.stop()
@@ -389,11 +403,11 @@ test('r37: a CREATE that lands on another server does not become an exemption, e
   // the connection that PERFORMED the CREATE and compared with a connection opened to
   // ${DB_HOST}:${DB_PORT} the way the application opens its own.
   //
-  // MUTATION ROUTE (verified): delete the `verify_created_database_endpoint "${created_identity}"`
+  // MUTATION ROUTE (measured): delete the `verify_created_database_endpoint "${created_identity}"`
   // call from create_database_and_record_newness(). The run then exits 0 with CREATED=true and
   // EXEMPTION=0 — an unfenced migration licensed by a database created on a server the migration
-  // never touches — and the status, the exemption and the "target is untouched" assertions all
-  // fail together.
+  // never touches. THIS test fails and the other five stay green, so it is this protection that
+  // is being measured and not something else.
   const root = mkdtempSync(join(tmpdir(), 'ims-pgbind-'))
   let target: Cluster | undefined
   let twin: Cluster | undefined
@@ -455,11 +469,12 @@ test('r37: the identity comparison itself refuses, and drops the role it verifie
   // server with an identity that is not the one it will answer with, so the comparison — and
   // nothing else — decides.
   //
-  // MUTATION ROUTES (each verified by making the change and re-running):
-  //   1. change the `!=` in verify_created_database_endpoint() to `=`: the run exits 0 and the
-  //      status assertion fails.
-  //   2. remove the DROP ROLE: the leftover-role assertion fails, and the run leaves a login role
-  //      with a password on the server it was verifying.
+  // MUTATION ROUTES (each measured by making the change and re-running):
+  //   1. make the identity comparison unreachable (`[[ ... == ... ]] && false`): the run exits 0,
+  //      this test fails on its status assertion, and the other five stay green.
+  //   2. delete the DROP ROLE: this test AND the control both fail on their leftover-role
+  //      assertions — the run leaves a login role with a password standing on the server it was
+  //      verifying, on the success path as well as the refusal path.
   const root = mkdtempSync(join(tmpdir(), 'ims-pgbind-'))
   let cluster: Cluster | undefined
   try {
@@ -512,10 +527,10 @@ test('r37: a duplicate database plus a failed fence preflight leaves credentials
   // The assertions are made ON THE DATABASE, not on the installer's output: the live password
   // still authenticates over TCP, and the database still has the owner it had.
   //
-  // MUTATION ROUTE (verified): move `provision_database_role_and_privileges` back in front of
+  // MUTATION ROUTE (measured): move `provision_database_role_and_privileges` back in front of
   // `require_fenceable_database` in the body below — which is exactly what the shipped script did
   // before this round. The login with the live password then fails with "password authentication
-  // failed" and datdba comes back as imsuser, so both assertions fail.
+  // failed for user imsuser", so this test fails and the other five stay green.
   const root = mkdtempSync(join(tmpdir(), 'ims-pgbind-'))
   let cluster: Cluster | undefined
   try {
@@ -573,11 +588,12 @@ test('r37: the shipped order is the tested order — nothing mutating sits befor
   // THE TEST ABOVE RUNS AN ORDER THIS FILE WROTE. This one asserts the SHIPPED script has the
   // same one, so the behavioural test cannot go on passing while install.sh drifts back.
   //
-  // MUTATION ROUTES (each verified by making the change and re-running):
-  //   1. put `ALTER USER ... WITH PASSWORD` back into the database-newness phase: the
-  //      phase-content assertion fails.
-  //   2. move either `provision_database_role_and_privileges` call above its gate: the ordering
-  //      assertion for that call site fails.
+  // MUTATION ROUTES (each measured by making the change and re-running):
+  //   1. put an `ALTER USER ... WITH PASSWORD` line back into the database-newness phase: the
+  //      phase-content assertion fails, and this is the only one of the six that does.
+  //   2. move the fenced path's `provision_database_role_and_privileges` above
+  //      `require_fenceable_database`: the ordering assertion fails, again alone. The behavioural
+  //      test above cannot see either change, which is why this one exists.
   const lines = INSTALL_SOURCE.split('\n')
   const phaseStart = lines.findIndex((line) => line.includes('@install-phase: database-newness'))
   assert.notEqual(phaseStart, -1, 'precondition: install.sh must mark the newness phase')

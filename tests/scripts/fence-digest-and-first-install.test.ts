@@ -238,10 +238,18 @@ function shippedAssignmentValue(source: string, name: string): string {
 function shippedBranch(source: string): string {
   const start = source.indexOf('\nif upgrade_in_place; then\n')
   assert.notEqual(start, -1, 'precondition: the installer must branch on upgrade_in_place')
-  const endMarker = '\nelse\n  first_install_fence_policy\nfi\n'
-  const end = source.indexOf(endMarker, start)
-  assert.notEqual(end, -1, 'precondition: the branch must end with the first-install arm')
-  return source.slice(start + 1, end + endMarker.length)
+  // The first-install arm no longer ENDS the branch: since r37 each arm also does its database
+  // role work, after its own gate. So the arm is located by `else` and the branch runs to the
+  // `fi` that closes it, rather than by matching a fixed three-line tail — which would make every
+  // test that runs this branch fail on a PRECONDITION the moment either arm gained a line, and
+  // hide whatever the test was actually measuring.
+  const elseAt = source.indexOf('\nelse\n', start)
+  assert.notEqual(elseAt, -1, 'precondition: the branch must have a first-install arm')
+  const end = source.indexOf('\nfi\n', elseAt)
+  assert.notEqual(end, -1, 'precondition: the first-install arm must be closed by a fi')
+  const branch = source.slice(start + 1, end + '\nfi\n'.length)
+  assert.match(branch, /first_install_fence_policy/, 'precondition: the first-install arm must reach the policy')
+  return branch
 }
 
 /**
@@ -529,6 +537,9 @@ function runInstallBranch(vars: string): { status: number; output: string } {
     import_legacy_cutover_state() { :; }
     adopt_existing_fence()        { :; }
     first_install_fence_policy()  { echo "EXEMPTION_TAKEN"; }
+    # r37: each arm does its database role work after its own gate. Stubbed with a marker so the
+    # assertions can say WHERE it happened rather than only that it did.
+    provision_database_role_and_privileges() { echo "ROLE_WORK"; }
     ${shippedFunction(INSTALL_SOURCE, 'first_install_exemption_available')}
     ${shippedBranch(INSTALL_SOURCE)}
     echo "UPGRADE_EXISTING=\${UPGRADE_EXISTING}"
@@ -566,6 +577,13 @@ test('r36: a "first install" against a database this run did not create is fence
   assert.doesNotMatch(remote.output, /EXEMPTION_TAKEN/, 'and must never reach the no-fence policy')
   assert.match(remote.output, /UPGRADE_EXISTING=true/, 'so that the stop, drain, fence and release blocks below all run')
   assert.match(remote.output, /db\.internal/, 'and the reason names the database, not this host')
+  // r37: and NOTHING is done to the live database's role until the fence has been proved
+  // possible. MUTATION ROUTE (measured): move `provision_database_role_and_privileges` above
+  // `require_fenceable_database` in the fenced arm — this ordering assertion fails alone.
+  assert.ok(
+    remote.output.indexOf('FENCED_PATH') < remote.output.indexOf('ROLE_WORK'),
+    `the role work must follow the preflight that licensed it:\n${remote.output}`,
+  )
 
   // THE SAME, VIA THE PATH THAT PRODUCES IT: INSTALL_POSTGRES=n creates nothing, so the finding
   // string is the one the installer starts with and never replaces.
@@ -610,6 +628,14 @@ test('r36: a genuine first install still takes the exemption, and still needs no
   assert.match(fresh.output, /EXEMPTION_TAKEN/, 'a database this run created has no other writer to fence out')
   assert.doesNotMatch(fresh.output, /FENCED_PATH/, 'and must not demand an administrative credential to install')
   assert.match(fresh.output, /UPGRADE_EXISTING=false/, 'so nothing below stops, drains or re-fences anything')
+  // r37: and the role work happens on this arm too, AFTER the exemption has been earned.
+  // MUTATION ROUTE (measured): move `provision_database_role_and_privileges` above
+  // `first_install_fence_policy` in the else arm and this ordering assertion fails while every
+  // other assertion in this test stays green.
+  assert.ok(
+    fresh.output.indexOf('EXEMPTION_TAKEN') < fresh.output.indexOf('ROLE_WORK'),
+    `the role work must follow the policy that licensed it:\n${fresh.output}`,
+  )
 
   // AND THE POLICY IT REACHES STILL WORKS WITH NOTHING SUPPLIED — the no-pin path, which the
   // r35 test above measures in full. Here it is only the join: the arm the branch chose is the
@@ -654,18 +680,26 @@ test('r36: the policy refuses to arm an exemption it has not earned, even if som
   }
 })
 
-test('r36: CREATE DATABASE succeeding is the only thing that records the database as new', () => {
+test('r36/r37: CREATE DATABASE succeeding, on the right server, is the only thing that records the database as new', () => {
   // WHAT COUNTS AS PROOF, MEASURED AT THE ONE STATEMENT THAT PRODUCES IT. The old
   // `SELECT ... WHERE NOT EXISTS ... \gexec` succeeded identically in the first two cases below,
   // which is why the exemption downstream could not tell them apart.
   //
-  // MUTATION ROUTES (each verified by making the change and re-running):
+  // The r37 half — that the proof is about the server the migration will use — is measured
+  // against REAL clusters in tests/scripts/install-database-endpoint-binding.test.ts, because a
+  // stub cannot say anything about how libpq resolves a connection. Here that step is stubbed
+  // and what is under test is the CLASSIFICATION of the three outcomes.
+  //
+  // MUTATION ROUTES (each measured by making the change and re-running):
   //   1. set DB_CREATED_BY_THIS_RUN=true in the duplicate branch — i.e. restore the \gexec
   //      semantics, where "already there" and "I made it" are the same outcome: the second case
   //      fails on CREATED=false.
-  //   2. change the final `die` to `warn`: the third case exits 0 and its status assertion fails,
-  //      which is the run continuing over a database it could not describe.
+  //   2. change the final `die` to `warn`: the third and fourth cases exit 0 and their status
+  //      assertions fail — the run continuing over a database it could not describe.
   //   3. drop the DB_CREATED_IDENTITY assignment: the first case fails on IDENTITY=.
+  //   4. put the English match back (`grep -qiE 'already exists|42P04'`): the FOURTH case, a
+  //      localised duplicate message with no SQLSTATE in it, stops being indeterminate and is
+  //      classified as a duplicate — that assertion fails.
   function runCreate(stub: string): { status: number; output: string } {
     const script = `
       exec 2>&1
@@ -679,8 +713,14 @@ test('r36: CREATE DATABASE succeeding is the only thing that records the databas
       DB_PORT=5432
       DB_CREATED_BY_THIS_RUN=false
       DB_CREATED_IDENTITY=""
+      DB_CREATED_SERVER_IDENTITY=""
       DB_NEWNESS_FINDING="unset"
+      # The endpoint check has its own tests, against real clusters. Stubbed to a marker so this
+      # test can assert that it is REACHED on the success path and on no other.
+      verify_created_database_endpoint() { echo "ENDPOINT_VERIFIED $1"; }
       ${stub}
+      ${shippedFunction(INSTALL_SOURCE, 'pg_extract_server_identity')}
+      ${shippedFunction(INSTALL_SOURCE, 'pg_server_identity_select')}
       ${shippedFunction(INSTALL_SOURCE, 'create_database_and_record_newness')}
       create_database_and_record_newness
       echo "CREATED=\${DB_CREATED_BY_THIS_RUN}"
@@ -694,24 +734,49 @@ test('r36: CREATE DATABASE succeeding is the only thing that records the databas
     }
   }
 
-  // THE SERVER ACCEPTED THE STATEMENT. That is the proof, and the only one.
-  const created = runCreate('run_as_user() { return 0; }')
+  // THE SERVER ACCEPTED THE STATEMENT, and answered the identity question on the same
+  // connection. That is the proof, and the only one.
+  const created = runCreate("pg_local_psql() { echo 'IMS_SERVER_IDENTITY 5432 1750000000000000 16384'; return 0; }")
   assert.equal(created.status, 0, created.output)
   assert.match(created.output, /CREATED=true/, 'a CREATE DATABASE that succeeded is the database not having existed')
   assert.match(created.output, /IDENTITY=localhost:5432\/one_two_inventory/, 'bound to the identity it succeeded against')
+  assert.match(
+    created.output,
+    /ENDPOINT_VERIFIED IMS_SERVER_IDENTITY 5432 1750000000000000 16384/,
+    'and the identity the SERVER gave is what the endpoint check is handed — not a string this script composed',
+  )
+
+  // THE SAME STATEMENT, WITH NO IDENTITY COMING BACK. A CREATE that succeeded on a connection
+  // that will not say which server it was is not proof either, and it is not a duplicate.
+  const silent = runCreate('pg_local_psql() { return 0; }')
+  assert.equal(silent.status, 9, `a CREATE with no identity must stop the run:\n${silent.output}`)
+  assert.doesNotMatch(silent.output, /CREATED=/, 'the run must not continue past it')
 
   // THE SERVER REFUSED IT AS A DUPLICATE. Supported, not an error — and NOT proof.
   const duplicate = runCreate(
-    'run_as_user() { echo \'ERROR:  database "one_two_inventory" already exists\' >&2; return 1; }',
+    'pg_local_psql() { echo \'ERROR:  42P04: database "one_two_inventory" already exists\' >&2; return 1; }',
   )
   assert.equal(duplicate.status, 0, `a pre-existing database is a supported outcome:\n${duplicate.output}`)
   assert.match(duplicate.output, /CREATED=false/, 'a database that was already there was not created by this run')
   assert.match(duplicate.output, /IDENTITY=$/m, 'and nothing may be bound to it')
   assert.match(duplicate.output, /WARN:/, 'and the operator is told, because it changes what this run does next')
+  assert.doesNotMatch(duplicate.output, /ENDPOINT_VERIFIED/, 'and nothing is verified, because nothing was created')
+
+  // A DUPLICATE MESSAGE WITH NO SQLSTATE IN IT IS NOT A DUPLICATE ANSWER (o3d-2sm1.5 r37).
+  // `VERBOSITY=verbose` is what puts 42P04 in the ERROR line; a psql that did not emit it — an
+  // older client, a wrapper, a locale this text was translated into — must be INDETERMINATE
+  // rather than pattern-matched in English. Fail closed: the run stops instead of quietly
+  // deciding that a database it cannot classify was already there.
+  const localised = runCreate(
+    'pg_local_psql() { echo \'FEHLER:  Datenbank "one_two_inventory" existiert bereits\' >&2; return 1; }',
+  )
+  assert.equal(localised.status, 9, `a message this run cannot classify must stop it:\n${localised.output}`)
+  assert.doesNotMatch(localised.output, /CREATED=/, 'the run must not continue past it')
+  assert.match(localised.output, /42P04/, 'and must name the SQLSTATE it was looking for')
 
   // ANYTHING ELSE IS INDETERMINATE, AND INDETERMINATE STOPS THE RUN.
   const unreachable = runCreate(
-    'run_as_user() { echo "psql: error: connection to server failed" >&2; return 2; }',
+    'pg_local_psql() { echo "psql: error: connection to server failed" >&2; return 2; }',
   )
   assert.equal(unreachable.status, 9, `an indeterminate result must stop the run:\n${unreachable.output}`)
   assert.doesNotMatch(unreachable.output, /CREATED=/, 'the run must not continue past it')
