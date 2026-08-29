@@ -15,6 +15,10 @@ on:
       - "scripts/deploy.sh"
       - "scripts/install.sh"
       - "scripts/update.sh"
+      - "scripts/check-db-writers.mjs"
+      - "scripts/fence-db-connections.mjs"
+      - "scripts/run-migration-verifications.mjs"
+      - "scripts/check-app-db-object-access.mjs"
   push:
     branches:
       - main
@@ -31,6 +35,10 @@ on:
       - "scripts/deploy.sh"
       - "scripts/install.sh"
       - "scripts/update.sh"
+      - "scripts/check-db-writers.mjs"
+      - "scripts/fence-db-connections.mjs"
+      - "scripts/run-migration-verifications.mjs"
+      - "scripts/check-app-db-object-access.mjs"
 
 jobs:
   migration-scope:
@@ -75,6 +83,27 @@ jobs:
       - run: npx prisma migrate deploy --schema prisma/schema.prisma
       - name: Verify deployed database matches prisma/schema.prisma
         run: node scripts/check-prisma-drift.mjs
+      # The same hook scripts/deploy.sh runs between the migration and the start of
+      # the new build (o3d-2sm1.1). Running it here means a migration's declared
+      # verification queries are exercised against a real migrated database on every
+      # PR, instead of first being executed during a production cutover.
+      #
+      # --strict additionally FAILS when a migration named in
+      # prisma/migrations/verification-required.txt declares no verify.sql. The deploy
+      # scripts run the same hook without it: a missing file in the repository is a
+      # defect for the PR to fix, not a reason to refuse to start a built and migrated
+      # application. Until o3d-2sm1.2 this hook exited 0 having executed nothing at all.
+      - name: Run the migrations' post-migration verification checks
+        run: node scripts/run-migration-verifications.mjs --strict
+      # The check that closes o3d-2sm1.5, exercised against a REAL migrated database rather
+      # than only against its own source text. `has_table_privilege(role, oid, 'SELECT,
+      # INSERT, UPDATE, DELETE')` is ANY and not ALL, so a comma-separated list answers TRUE
+      # for a read-only grant — a green check over a database the application cannot write.
+      # The test creates a role with SELECT and nothing else and requires the check to fail.
+      - name: Prove the application role can use what a migration creates
+        env:
+          RUN_DB_OBJECT_ACCESS_TEST: "1"
+        run: npx tsx --test --experimental-test-module-mocks tests/scripts/app-db-object-access.test.ts
       # THE SESSION-LOCK GUARD NEEDS A ROUTE THAT IS NOT BEHIND DOCKER'S PORT NAT (o3d-2k5r).
       #
       # `services:` publishes the container's 5432 on the runner, and a connection to
