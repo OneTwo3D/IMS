@@ -136,6 +136,53 @@ redis_conf_set_requirepass() {
   rm -f "${tmp}"
 }
 
+# ---------------------------------------------------------------------------
+# COMMAND SUBSTITUTION DELETES TRAILING NEWLINES, AND A PASSWORD IS BYTES
+# (o3d-2sm1.5 r40, Codex HIGH).
+#
+# THE DEFECT. `$( )` strips EVERY trailing newline from what it captures. That is a feature for
+# `$(date)` and a data-loss bug for a credential: an operator whose password ends in a newline —
+# spelled `abc%0A` in the URL, which is exactly what r39's own encoder emits for it — has that
+# byte parsed by node-postgres, held by the server, and DELETED by the shell capture the recovery
+# reads it back through. The mechanism r39 built to preserve exact password bytes corrupted a
+# class of them: a re-install recovers `abc`, sees it differ from the installed `abc\n`, and
+# ROTATES a live credential nobody asked to rotate — or, on the journal path, publishes a `.env`
+# naming a password the server does not have.
+#
+# THE FIX IS A SENTINEL, NOT A NAMEREF. A nameref (`local -n`) cannot be used for these: the
+# producing functions are pure and several of them are also called from the regressions and from
+# other captures, and a nameref would make them unusable in either position. Instead the value is
+# followed INSIDE the substitution by a fixed terminator, so the newlines the shell eats are no
+# longer trailing, and the terminator is removed afterwards with `${var%"..."}` — the SHORTEST
+# matching suffix, so exactly the one byte-string this function appended comes off, whatever the
+# value itself ends with.
+#
+#   capture VAR command args...
+#
+# VAR receives exactly the bytes `command` wrote to stdout, trailing newlines and all, and the
+# return value is the command's own. A command that writes nothing leaves VAR empty. The command
+# runs in a SUBSHELL, as it did under `$( )`, so it must be pure — every caller here is.
+#
+# `set +e` inside the subshell is what makes the terminator unconditional: under the script's
+# `set -e` a non-zero return from the command would leave the subshell before the terminator was
+# written, and the recovery would silently be back to stripping.
+CAPTURE_TERMINATOR='--ims-end-of-captured-value--'
+
+capture() {
+  local __capture_name="$1"
+  shift
+  local __capture_raw __capture_status=0
+  __capture_raw="$(
+    set +e
+    "$@"
+    __capture_inner=$?
+    printf '%s' "${CAPTURE_TERMINATOR}"
+    exit "${__capture_inner}"
+  )" || __capture_status=$?
+  printf -v "${__capture_name}" '%s' "${__capture_raw%"${CAPTURE_TERMINATOR}"}"
+  return "${__capture_status}"
+}
+
 # Print the shape of a URL, never the secret in it. Character-for-character the same
 # function as the one in scripts/provision-ims-tenant.sh, for the same reason the
 # encoder is duplicated: the two scripts share no shell library, and this installer
@@ -1396,8 +1443,32 @@ rotate_database_password_in_fenced_window() {
   # about to replace. It carries BOTH candidates and it says what each outcome means — see the
   # journal's own block above.
   #
+  # AND THE RECORD IS ONLY WORTH WRITING IF SOMETHING CAN READ IT BACK (o3d-2sm1.5 r40, Codex
+  # HIGH). The journal's entire value is that the NEXT run can ask the server which of the two
+  # candidates is live. That question is answerable only on an endpoint whose pg_hba rule actually
+  # checks the password, and only on one the reconciliation will still be able to reach — and the
+  # reconciliation runs with THIS fence still standing over '${DB_NAME}', so the application
+  # database is disqualified by construction. `postgres` is the maintenance database every cluster
+  # has, PUBLIC holds CONNECT on it by default, and no fence in this script touches it.
+  #
+  # So it is proven here, with the negative control, BEFORE the ALTER: refuse a random password,
+  # accept the one this run knows is live. An endpoint that cannot do both cannot be relied on
+  # afterwards, and a rotation that would leave an unreconcilable journal is a rotation this run
+  # must not perform. Refusing costs nothing — no ALTER has been issued.
+  DB_PROBE_REPORT=""
+  DB_ROTATION_PROBE_DATABASE=""
+  if db_endpoint_is_password_sensitive postgres "${DB_PASSWORD_EFFECTIVE}"; then
+    DB_ROTATION_PROBE_DATABASE=postgres
+    info "Rotation endpoint proven: 'postgres' refused a random 32-byte password and accepted the"
+    info "credential '${DB_USER}' is holding right now, so it can tell one password from another."
+    info "That endpoint is recorded in the journal and is what a next run reconciles against."
+  else
+    die "A database credential rotation was requested for '${DB_USER}', and this run cannot show that ANY unfenced endpoint would be able to tell afterwards which password the role has. What it found:${DB_PROBE_REPORT}
+The rotation is the one step here that has no undo, and its only safety net is a journal the next run reconciles by ASKING THE SERVER — so a probe that cannot refuse a password nothing knows, or cannot reach the role at all, turns that net into a guess. The application database '${DB_NAME}' cannot be that endpoint: the connection fence this run is holding revokes CONNECT on it, and a reconciliation runs with that fence still standing. THE ALTER HAS NOT BEEN ISSUED: '${DB_USER}' still has the credential ${APP_DIR}/.env names, the two agree, and starting the old service by hand would work. NOTHING HAS BEEN MIGRATED. Give the role a password-checked route to 'postgres' — \`GRANT CONNECT ON DATABASE postgres TO \"${DB_USER}\";\` and a scram-sha-256 or md5 rule for ${DB_HOST} in pg_hba.conf, NOT \`trust\` — then re-run; or rotate the password by hand and re-run supplying it."
+  fi
+
   # Refusing here costs nothing: nothing has been ALTERed yet, so the sentence below is true.
-  write_role_rotation_journal "${DB_PASSWORD_EFFECTIVE}" "${DB_PASSWORD}" || die "A database credential rotation for '${DB_USER}' could not be journalled durably at ${DB_ROLE_ROTATION_JOURNAL}, so a run interrupted between the ALTER and the environment file would leave nothing able to say which password the server has. The ALTER has NOT been issued: the role still has the credential ${APP_DIR}/.env names, the two agree, and starting the old service by hand would work. NOTHING HAS BEEN MIGRATED. Make ${DB_ENV_SNAPSHOT_DIR} writable and re-run, or re-run without a password change."
+  write_role_rotation_journal "${DB_PASSWORD_EFFECTIVE}" "${DB_PASSWORD}" "${DB_ROTATION_PROBE_DATABASE}" || die "A database credential rotation for '${DB_USER}' could not be journalled durably at ${DB_ROLE_ROTATION_JOURNAL}, so a run interrupted between the ALTER and the environment file would leave nothing able to say which password the server has. The ALTER has NOT been issued: the role still has the credential ${APP_DIR}/.env names, the two agree, and starting the old service by hand would work. NOTHING HAS BEEN MIGRATED. Make ${DB_ENV_SNAPSHOT_DIR} writable and re-run, or re-run without a password change."
 
   local quoted_password
   # THE PASSWORD IS A LITERAL, SQL-QUOTED (o3d-2sm1.5 r39, Codex HIGH). `'${DB_PASSWORD}'` ended
@@ -1841,6 +1912,8 @@ DB_ROLE_ROTATION_JOURNAL="${DB_ENV_SNAPSHOT_DIR}/db-role-rotation.journal"
 # server, which of the two credentials is live.
 DB_ROTATION_JOURNAL_FOUND=false
 DB_ROTATION_RECONCILED_PASSWORD=""
+# `new` or `old` — which of the journal's two candidates the discriminating endpoint accepted.
+DB_ROTATION_RECONCILED_WHICH=""
 
 # Base64 because a password may contain anything, including the `=` and the newlines that a
 # key=value file cannot carry. `base64 -w0` is coreutils; `tr -d '\n'` keeps it honest anywhere.
@@ -1866,7 +1939,7 @@ role_rotation_identity() {
 }
 
 write_role_rotation_journal() {
-  local old_password="$1" new_password="$2"
+  local old_password="$1" new_password="$2" probe_database="${3:-}"
   mkdir -p "${DB_ENV_SNAPSHOT_DIR}" || return 1
   chmod 700 "${DB_ENV_SNAPSHOT_DIR}" 2>/dev/null || return 1
   # `marker_complete=1` is written LAST, so a reader that does not find it is looking at bytes no
@@ -1878,9 +1951,15 @@ write_role_rotation_journal() {
     printf '# %s/.env has been durably published. If this file exists, a run was interrupted\n' "${APP_DIR}"
     printf '# between those two points; the next install run reconciles it by asking the server\n'
     printf '# which of the two passwords below is live. Do not edit it by hand.\n'
-    printf 'journal_version=1\n'
+    printf 'journal_version=2\n'
     printf 'identity=%s\n' "$(role_rotation_identity)"
     printf 'env_file=%s\n' "${APP_DIR}/.env"
+    # THE ENDPOINT THIS RUN PROVED COULD DISCRIMINATE (o3d-2sm1.5 r40, Codex HIGH). Written so the
+    # reconciliation asks the SAME place rather than deriving one of its own, and so an operator
+    # reading this file by hand knows which pg_hba rule the answer depends on. It is `postgres`
+    # for every rotation this installer performs, and it is recorded rather than assumed because
+    # a value that is derived twice is a value that can be derived differently twice.
+    printf 'probe_database=%s\n' "${probe_database}"
     printf 'old_password_b64=%s\n' "$(rotation_journal_encode "${old_password}")"
     printf 'new_password_b64=%s\n' "$(rotation_journal_encode "${new_password}")"
     printf 'marker_complete=1\n'
@@ -1898,23 +1977,143 @@ clear_role_rotation_journal() {
   return 0
 }
 
-# CAN THIS ROLE STILL AUTHENTICATE WITH THIS PASSWORD? Asked of the server, over TCP, the way the
-# application asks.
+# ---------------------------------------------------------------------------
+# A PROBE THAT CANNOT SAY NO IS NOT EVIDENCE (o3d-2sm1.5 r40, Codex HIGH)
+# ---------------------------------------------------------------------------
 #
-# `postgres` FIRST, and that is not arbitrary: an interrupted rotation leaves the CONNECTION FENCE
-# STANDING over ${DB_NAME}, and the fence's whole mechanism is revoking CONNECT — so a probe
-# against the application database would be refused for a role holding exactly the right password.
-# ${DB_NAME} is tried second for the site that has revoked PUBLIC CONNECT on `postgres`.
+# THE DEFECT. `db_password_authenticates` opened a connection with a candidate password and read
+# a successful `SELECT 1` as PROOF that the role holds it. That inference is only valid where the
+# server actually checks the password, and `pg_hba.conf` decides that per database, per host and
+# per role:
 #
-# The verdict is the EXIT STATUS of a `SELECT 1`, never a match on the server's message: `FATAL:
-# password authentication failed` is localised by the server's lc_messages and a guard that reads
-# it is a guard that fails open in a French locale. Success is unambiguous; every other outcome is
-# "not this password", and the caller distinguishes "wrong password" from "cannot ask at all" by
-# the fact that exactly one of two candidates should succeed.
-db_password_authenticates() {
-  local password="$1"
-  pg_endpoint_psql "${DB_USER}" "${password}" postgres -tAc 'SELECT 1' >/dev/null 2>&1 && return 0
-  pg_endpoint_psql "${DB_USER}" "${password}" "${DB_NAME}" -tAc 'SELECT 1' >/dev/null 2>&1 && return 0
+#   * a `trust` rule on the endpoint accepts EVERY password, so the probe cannot fail. It then
+#     "proves" whichever candidate was tried first — `new` — and the reconciliation publishes a
+#     `.env` naming a password the ALTER may never have set. That is the r39 outage with the
+#     recovery mechanism supplying it.
+#   * the CONVERSE is just as bad: an endpoint that refuses the SESSION rather than the password —
+#     a revoked CONNECT, and THE STANDING CONNECTION FENCE IS EXACTLY THAT over ${DB_NAME} — fails
+#     for a role holding precisely the right credential, so both candidates read as dead and an
+#     automatically recoverable installation is stranded.
+#
+# THE FIX IS A NEGATIVE CONTROL, and it is the whole of the fix. An endpoint is admitted as
+# evidence only once it has been shown, in this run, on this endpoint, that it can say BOTH words:
+#
+#   NO   a freshly minted random 32-byte password is REFUSED. Nothing knows that password, so an
+#        endpoint that accepts it accepts anything.
+#   YES  a password we are asserting IS live is ACCEPTED. Without this half, "refused everything"
+#        would pass as password-sensitivity — and a revoked CONNECT refuses everything.
+#
+# Only an endpoint that has done both is allowed to answer the question, and the endpoint that did
+# is RECORDED — in the journal by the rotating run, and in DB_ROTATION_PROBE_DATABASE by the run
+# that reconciles — so the answer and the proof are about the same place rather than two
+# separately-derived ones.
+#
+# AND IT MUST BE UNFENCED. An interrupted rotation leaves the connection fence STANDING over
+# ${DB_NAME}, so the application database is the one endpoint guaranteed to be useless when the
+# reconciliation needs it. `postgres` is the maintenance database every PostgreSQL cluster has,
+# PUBLIC holds CONNECT on it by default, and this installer's fence never touches it — so it is
+# the endpoint a rotation must prove BEFORE it commits, and the first one a reconciliation tries.
+#
+# WHERE AN UNKNOWN LANDS. Every path below that cannot be shown password-sensitive REFUSES. That
+# is this branch's standing rule and it costs nothing on either side: the rotation refuses before
+# the ALTER, so the role still has the credential its clients hold, and the reconciliation refuses
+# before anything is stopped, with the journal left in place carrying both candidates.
+
+# Does this endpoint let ${DB_USER} in with these bytes? The verdict is the EXIT STATUS of a
+# `SELECT 1` and never a match on the server's message, which is localised by lc_messages.
+db_endpoint_accepts_password() {
+  local database="$1" password="$2"
+  pg_endpoint_psql "${DB_USER}" "${password}" "${database}" -tAc 'SELECT 1' >/dev/null 2>&1
+}
+
+# The endpoint that was PROVEN able to discriminate, and the sentence explaining every endpoint
+# that was not. Read by the refusals so an operator is told which rule to look at.
+DB_ROTATION_PROBE_DATABASE=""
+DB_PROBE_REPORT=""
+
+# THE PAIR. Returns 0 only when the endpoint refused a password nothing can know AND accepted one
+# the caller is asserting is live. Appends a line to DB_PROBE_REPORT either way.
+db_endpoint_is_password_sensitive() {
+  local database="$1" positive="$2" control
+  control="$(openssl rand -hex 32)"
+  if db_endpoint_accepts_password "${database}" "${control}"; then
+    DB_PROBE_REPORT+="
+  - '${database}' ACCEPTED a random 32-byte password, so it cannot tell one password from another. A \`trust\` (or otherwise password-independent) rule in pg_hba.conf covers ${DB_USER}@${DB_HOST} on it, and NOTHING it says about a candidate credential is evidence."
+    return 1
+  fi
+  if ! db_endpoint_accepts_password "${database}" "${positive}"; then
+    DB_PROBE_REPORT+="
+  - '${database}' refused the random password AND the candidate, so it has not been shown able to say yes. A revoked CONNECT is indistinguishable from a wrong password here — and this installer's own connection fence revokes CONNECT on '${DB_NAME}', which is why the application database cannot be the endpoint a rotation relies on."
+    return 1
+  fi
+  return 0
+}
+
+# THE ENDPOINTS A RECONCILIATION MAY ASK, most-likely-unfenced first, with the one the rotating
+# run RECORDED ahead of both — that is the "reuse that exact endpoint" half. A journal written by
+# an installer older than r40 carries no probe_database line; the list then starts at `postgres`,
+# which is where that older run would have asked first anyway.
+db_probe_endpoint_candidates() {
+  local -n _endpoints="$1"
+  local recorded="${2:-}" database
+  _endpoints=()
+  for database in "${recorded}" postgres "${DB_NAME}"; do
+    [[ -n "${database}" ]] || continue
+    [[ " ${_endpoints[*]-} " == *" ${database} "* ]] || _endpoints+=("${database}")
+  done
+}
+
+# WHICH OF THE TWO CANDIDATES IS LIVE — asked only of an endpoint that has proven it can answer.
+#
+# Sets DB_ROTATION_RECONCILED_PASSWORD, DB_ROTATION_RECONCILED_WHICH and
+# DB_ROTATION_PROBE_DATABASE and returns 0 on an unambiguous answer. Returns 1 when no endpoint
+# could be shown password-sensitive; returns 2 when one could and said YES TO BOTH, which is not
+# an answer either — it is a server that is not behaving like a password check, and preferring
+# `new` because it connected is the defect this function exists to remove.
+resolve_live_role_password() {
+  local old_password="$1" new_password="$2" recorded="${3:-}"
+  local database new_ok old_ok
+  local -a endpoints=()
+  db_probe_endpoint_candidates endpoints "${recorded}"
+  DB_PROBE_REPORT=""
+  DB_ROTATION_PROBE_DATABASE=""
+  DB_ROTATION_RECONCILED_PASSWORD=""
+  DB_ROTATION_RECONCILED_WHICH=""
+
+  for database in "${endpoints[@]}"; do
+    # THE CANDIDATES FIRST, so that the positive half of the control pair is a password this run
+    # actually cares about rather than a second throwaway role. An endpoint that accepts neither
+    # has not been shown able to say yes and is skipped by the pair test below.
+    new_ok=false; old_ok=false
+    db_endpoint_accepts_password "${database}" "${new_password}" && new_ok=true
+    db_endpoint_accepts_password "${database}" "${old_password}" && old_ok=true
+    if ! ${new_ok} && ! ${old_ok}; then
+      DB_PROBE_REPORT+="
+  - '${database}' refused BOTH recorded candidates. Either neither is live there, or the endpoint refuses the session rather than the password — a revoked CONNECT, which is what this installer's connection fence does to '${DB_NAME}'."
+      continue
+    fi
+    # AND NOW THE CONTROL, against the candidate that connected. This is the half that makes a
+    # success mean something: under `trust` both flags above are true and the endpoint is thrown
+    # out here rather than believed.
+    if ${new_ok}; then
+      db_endpoint_is_password_sensitive "${database}" "${new_password}" || continue
+    else
+      db_endpoint_is_password_sensitive "${database}" "${old_password}" || continue
+    fi
+    if ${new_ok} && ${old_ok}; then
+      DB_ROTATION_PROBE_DATABASE="${database}"
+      return 2
+    fi
+    DB_ROTATION_PROBE_DATABASE="${database}"
+    if ${new_ok}; then
+      DB_ROTATION_RECONCILED_PASSWORD="${new_password}"
+      DB_ROTATION_RECONCILED_WHICH=new
+    else
+      DB_ROTATION_RECONCILED_PASSWORD="${old_password}"
+      DB_ROTATION_RECONCILED_WHICH=old
+    fi
+    return 0
+  done
   return 1
 }
 
@@ -1926,9 +2125,10 @@ db_password_authenticates() {
 reconcile_interrupted_role_rotation() {
   DB_ROTATION_JOURNAL_FOUND=false
   DB_ROTATION_RECONCILED_PASSWORD=""
+  DB_ROTATION_RECONCILED_WHICH=""
   [[ -e "${DB_ROLE_ROTATION_JOURNAL}" ]] || return 0
 
-  local complete identity env_file old_password new_password
+  local complete identity env_file old_password new_password recorded_probe resolution=0
   complete="$(role_rotation_journal_value marker_complete || true)"
   [[ "${complete}" == "1" ]] || die "A database credential rotation journal at ${DB_ROLE_ROTATION_JOURNAL} is incomplete — it has no marker_complete line. Nothing this installer writes can leave it in that state: it is published by rename, so the name only ever appears over finished bytes. Inspect the file, establish which password '${DB_USER}' actually has, and remove it. NOTHING HAS BEEN INSTALLED and nothing has been stopped."
 
@@ -1938,29 +2138,44 @@ reconcile_interrupted_role_rotation() {
 
   [[ "${INSTALL_POSTGRES}" == "y" ]] || die "A database credential rotation was interrupted for ${identity} and this run does not manage a LOCAL PostgreSQL server, so it has no privileged local connection with which to establish which password that role now has. Re-run with the local database, or settle it by hand and remove ${DB_ROLE_ROTATION_JOURNAL}. NOTHING HAS BEEN INSTALLED and nothing has been stopped."
 
-  old_password="$(rotation_journal_decode "$(role_rotation_journal_value old_password_b64 || true)")"
-  new_password="$(rotation_journal_decode "$(role_rotation_journal_value new_password_b64 || true)")"
+  # THE JOURNAL DECODE, THROUGH THE SENTINEL (o3d-2sm1.5 r40, Codex HIGH). base64 is exactly what
+  # makes a newline-terminated password survive the FILE; `$( )` around the decode is what threw it
+  # away again, and this is the path where losing it publishes a `.env` the server will not accept.
+  # The INNER captures need nothing: role_rotation_journal_value() returns base64, whose alphabet
+  # contains no newline, so the only newline `$( )` removes there is sed's own line terminator.
+  capture old_password rotation_journal_decode "$(role_rotation_journal_value old_password_b64 || true)"
+  capture new_password rotation_journal_decode "$(role_rotation_journal_value new_password_b64 || true)"
   [[ -n "${old_password}" && -n "${new_password}" ]] || die "The database credential rotation journal at ${DB_ROLE_ROTATION_JOURNAL} does not carry both candidate passwords, so this run cannot tell which one '${DB_USER}' has. Establish it by hand and remove the file. NOTHING HAS BEEN INSTALLED and nothing has been stopped."
+
+  # The endpoint the ROTATING run proved could discriminate, so this run asks that one first
+  # rather than deriving an endpoint of its own (o3d-2sm1.5 r40, Codex HIGH).
+  recorded_probe="$(role_rotation_journal_value probe_database || true)"
 
   warn "A database credential rotation for ${identity} was INTERRUPTED: ${DB_ROLE_ROTATION_JOURNAL} exists,"
   warn "which means a previous run committed — or was about to commit — an ALTER USER and did not"
-  warn "get as far as publishing ${env_file}. Asking the server which password that role has."
+  warn "get as far as publishing ${env_file}. Asking the server which password that role has —"
+  warn "on an endpoint that has first been shown able to REFUSE a password nothing can know."
 
-  if db_password_authenticates "${new_password}"; then
-    DB_ROTATION_JOURNAL_FOUND=true
-    DB_ROTATION_RECONCILED_PASSWORD="${new_password}"
-    success "The server has the NEW password: the ALTER committed. This run FINISHES the transition — it treats that credential as the installed one, so the environment file it writes names what the server actually has, and the journal is cleared only once that file is on the medium. ${env_file} may currently name the old one; it is complete and it is about to be replaced."
+  resolve_live_role_password "${old_password}" "${new_password}" "${recorded_probe}" || resolution=$?
+
+  if [[ "${resolution}" -eq 2 ]]; then
+    die "A database credential rotation for ${identity} was interrupted, and '${DB_ROTATION_PROBE_DATABASE}' — an endpoint that DID refuse a random password, so it is checking something — accepts BOTH recorded candidates as '${DB_USER}'. Two different passwords cannot both be the role's, so this server is not answering the way a password check answers and no probe here can say which credential is live. This run refuses rather than guess: ${DB_ROLE_ROTATION_JOURNAL} is LEFT IN PLACE so the two candidates are not lost. Establish the role's password by hand, remove that file, and re-run. NOTHING HAS BEEN INSTALLED and nothing has been stopped."
+  fi
+
+  if [[ "${resolution}" -ne 0 ]]; then
+    die "A database credential rotation for ${identity} was interrupted and this run could not find a single endpoint able to tell one password from another for '${DB_USER}', so nothing it asked the server is evidence about which credential is live. What each endpoint did:${DB_PROBE_REPORT}
+A \`trust\` rule makes every candidate succeed and a revoked CONNECT makes every candidate fail, and this run refuses on either rather than adopting a password the probe cannot discriminate. ${DB_ROLE_ROTATION_JOURNAL} is LEFT IN PLACE so the two candidates are not lost. Give '${DB_USER}' a password-checked route to an UNFENCED database — \`GRANT CONNECT ON DATABASE postgres TO \"${DB_USER}\";\` with a scram-sha-256 or md5 rule for ${DB_HOST} in pg_hba.conf is the whole of it — or establish the role's password by hand and remove that file. NOTHING HAS BEEN INSTALLED and nothing has been stopped."
+  fi
+
+  DB_ROTATION_JOURNAL_FOUND=true
+
+  if [[ "${DB_ROTATION_RECONCILED_WHICH}" == "new" ]]; then
+    success "The server has the NEW password: the ALTER committed. Established on '${DB_ROTATION_PROBE_DATABASE}', which refused a random password in the same breath, so the acceptance means the server checked. This run FINISHES the transition — it treats that credential as the installed one, so the environment file it writes names what the server actually has, and the journal is cleared only once that file is on the medium. ${env_file} may currently name the old one; it is complete and it is about to be replaced."
     return 0
   fi
 
-  if db_password_authenticates "${old_password}"; then
-    DB_ROTATION_JOURNAL_FOUND=true
-    DB_ROTATION_RECONCILED_PASSWORD="${old_password}"
-    success "The server still has the OLD password: the ALTER did not commit, so nothing was ever taken away and ${env_file} already agrees with the server. This run treats that credential as the installed one and clears the journal. Supply the new password again to ask for the rotation a second time; it will happen inside the stopped, fenced window."
-    return 0
-  fi
-
-  die "A database credential rotation for ${identity} was interrupted and NEITHER of the two passwords it recorded authenticates as '${DB_USER}' against that server. Somebody rotated the role out of band, or the server is not reachable from here. This run refuses rather than guess: ${DB_ROLE_ROTATION_JOURNAL} is LEFT IN PLACE so the two candidates are not lost. Restore one of them with ALTER USER, or set a password of your own and remove that file, then re-run. NOTHING HAS BEEN INSTALLED and nothing has been stopped."
+  success "The server still has the OLD password: the ALTER did not commit, so nothing was ever taken away and ${env_file} already agrees with the server. Established on '${DB_ROTATION_PROBE_DATABASE}', which refused a random password in the same breath. This run treats that credential as the installed one and clears the journal. Supply the new password again to ask for the rotation a second time; it will happen inside the stopped, fenced window."
+  return 0
 }
 
 # @install-phase: credential-rotation
@@ -3776,10 +3991,16 @@ installed_database_password() {
   userinfo="${rest%@*}"
   location="${rest##*@}"
   case "${userinfo}" in *:*) ;; *) return 1 ;; esac
-  user="$(url_decode_userinfo "${userinfo%%:*}")"
+  # `capture`, NOT `$( )`, on BOTH halves (o3d-2sm1.5 r40, Codex HIGH). A password spelled
+  # `abc%0A` decodes to `abc\n`, and command substitution would hand back `abc` — a DIFFERENT
+  # credential, which classify_database_credential_rotation() then reads as a rotation request
+  # over a live role. The user half goes through the same door for the same reason one level
+  # down: `imsuser%0A` captured as `imsuser` compares EQUAL to a DB_USER of `imsuser`, so a URL
+  # naming a different role would be accepted as "the same connection" and its password recovered.
+  capture user url_decode_userinfo "${userinfo%%:*}"
   password="${userinfo#*:}"
   [[ -n "${password}" ]] || return 1
-  password="$(url_decode_userinfo "${password}")"
+  capture password url_decode_userinfo "${password}"
   [[ -n "${password}" ]] || return 1
   case "${location}" in */*) ;; *) return 1 ;; esac
   database="${location#*/}"
@@ -3805,7 +4026,11 @@ prompt_db_password() {
   # "reconcile" — the file says what the last completed publication said, and the ALTER may have
   # outlived it.
   reconcile_interrupted_role_rotation
-  DB_PASSWORD_INSTALLED="$(installed_database_password "$(existing_env DATABASE_URL)" "${DB_USER}" "${DB_HOST}" "${DB_PORT}" "${DB_NAME}" || true)"
+  # THE OUTER CAPTURE IS THE SAME BOUNDARY (o3d-2sm1.5 r40, Codex HIGH): fixing the decode and
+  # then re-stripping the result here would have preserved nothing. `existing_env` needs no such
+  # protection and is left as it is — it returns a value `mapfile -t` read out of a LINE of
+  # ${APP_DIR}/.env, and a line cannot carry the newline that ends it.
+  capture DB_PASSWORD_INSTALLED installed_database_password "$(existing_env DATABASE_URL)" "${DB_USER}" "${DB_HOST}" "${DB_PORT}" "${DB_NAME}" || DB_PASSWORD_INSTALLED=""
   if ${DB_ROTATION_JOURNAL_FOUND}; then
     DB_PASSWORD_INSTALLED="${DB_ROTATION_RECONCILED_PASSWORD}"
     info "The installed credential for this run is the one the SERVER answered to, not the one"
@@ -3869,10 +4094,14 @@ if [[ -n "${EXISTING_REDIS_USERINFO}" ]]; then
   # Percent-encoding guarantees the password's own `:` is escaped, so the FIRST colon
   # is the user/password delimiter and nothing here has to guess.
   if [[ "${EXISTING_REDIS_USERINFO}" == *":"* ]]; then
-    EXISTING_REDIS_USERNAME="$(urldecode "${EXISTING_REDIS_USERINFO%%:*}")"
-    EXISTING_REDIS_PASSWORD="$(urldecode "${EXISTING_REDIS_USERINFO#*:}")"
+    # THE REDIS CREDENTIAL CROSSES THE SAME BOUNDARY (o3d-2sm1.5 r40, Codex HIGH). This recovery
+    # is the reason `%0A` can be in a URL at all — REDIS_URL has been recovered and re-encoded for
+    # rounds — and a requirepass ending in a newline was truncated here, so the re-run wrote a
+    # redis.conf and a URL that disagreed with the server by one byte.
+    capture EXISTING_REDIS_USERNAME urldecode "${EXISTING_REDIS_USERINFO%%:*}"
+    capture EXISTING_REDIS_PASSWORD urldecode "${EXISTING_REDIS_USERINFO#*:}"
   else
-    EXISTING_REDIS_USERNAME="$(urldecode "${EXISTING_REDIS_USERINFO}")"
+    capture EXISTING_REDIS_USERNAME urldecode "${EXISTING_REDIS_USERINFO}"
   fi
 fi
 # The compatibility line is consulted only when the URL carried no credential at all.

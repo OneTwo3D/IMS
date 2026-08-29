@@ -26,6 +26,10 @@ export const INSTALL_SOURCE = readFileSync(join(REPO, 'scripts/install.sh'), 'ut
  * ordering it is checking proves only that its author can write the ordering twice.
  */
 export const SHIPPED = [
+  // r40 (Codex HIGH): the sentinel that keeps a trailing newline out of the shell's teeth. Every
+  // credential on the recovery path crosses it, so a test that captured through a plain `$( )`
+  // would be measuring bash rather than install.sh.
+  'capture',
   'libpq_env_unset_args',
   'db_local_socket_dir',
   'pg_local_psql',
@@ -53,7 +57,11 @@ export const SHIPPED = [
   'role_rotation_identity',
   'write_role_rotation_journal',
   'clear_role_rotation_journal',
-  'db_password_authenticates',
+  // r40 (Codex HIGH): the probe that has to prove it can say NO before anything believes its YES.
+  'db_endpoint_accepts_password',
+  'db_endpoint_is_password_sensitive',
+  'db_probe_endpoint_candidates',
+  'resolve_live_role_password',
   'reconcile_interrupted_role_rotation',
   'resolve_role_rotation_journal_after_env_publication',
   'prompt_db_password',
@@ -76,6 +84,19 @@ export const SHIPPED = [
  * So they are READ OUT of the shipped function: `NAME="${NAME-}"` leaves anything this rig did
  * set alone, and gives everything else the empty value the heredoc would have written anyway.
  */
+/**
+ * THE SENTINEL, LIFTED RATHER THAN RETYPED (r40).
+ *
+ * `capture()` strips whatever CAPTURE_TERMINATOR holds. A rig that declared its own copy would
+ * pass every test while install.sh used a different string — the two would only disagree in
+ * production, which is the exact shape of failure this whole file exists to make impossible.
+ */
+export const CAPTURE_TERMINATOR_ASSIGNMENT = (() => {
+  const match = /^CAPTURE_TERMINATOR=.*$/m.exec(INSTALL_SOURCE)
+  assert.ok(match, 'precondition: scripts/install.sh must define CAPTURE_TERMINATOR')
+  return match[0]
+})()
+
 export const ENV_HEREDOC_DEFAULTS = [
   ...new Set(
     [...shippedFunction(INSTALL_SOURCE, 'render_app_env_file').matchAll(/\$\{([A-Za-z_][A-Za-z0-9_]*)[^}]*\}/g)]
@@ -123,6 +144,10 @@ FENCE_ARMED=false
 ENV_FILE_STATE=absent
 DB_ROTATION_JOURNAL_FOUND=false
 DB_ROTATION_RECONCILED_PASSWORD=""
+DB_ROTATION_RECONCILED_WHICH=""
+DB_ROTATION_PROBE_DATABASE=""
+DB_PROBE_REPORT=""
+${CAPTURE_TERMINATOR_ASSIGNMENT}
 declare -A EXISTING_ENV=()
 ${assignments}
 # r39: the interrupted-rotation journal, resolved AFTER the caller's assignments because it hangs
