@@ -478,8 +478,11 @@ test('the generic key-value writer is still not a way around the lock', async ()
   )
   // ...and through the multi-key form, including when a plugin key is smuggled in alongside
   // innocent ones.
+  // The innocent neighbour is an ALLOWLISTED preference (Codex r20 HIGH): `public_app_url` stood
+  // here until the allowlist landed, and it is now refused in its own right, which would have made
+  // this assertion pass without the plugin key ever being looked at.
   await assert.rejects(
-    () => setSettings({ public_app_url: 'https://x', plugin_quickbooks_enabled: 'true' }),
+    () => setSettings({ financial_year_start: '04-01', plugin_quickbooks_enabled: 'true' }),
     /must be written atomically and under the connector-selection lock/,
   )
 

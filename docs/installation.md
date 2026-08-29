@@ -392,26 +392,40 @@ For WooCommerce specifically:
 - [ ] `INVOICE_PDF_TOKEN_MAX_TTL_SECONDS` left at or below the 30-day hard cap, or lowered for stricter tenants.
 - [ ] Activity log redaction confirmed (Settings > System > Activity Log shows `[REDACTED]` placeholders, not raw secrets).
 
-**System-managed settings keys are refused by the generic writers.** The `settings` table serves two
-different kinds of row: operator preferences that a screen offers and any value is a legitimate choice
-for, and system-managed rows whose value is a fact the system established — the integration plugin
-flags, the accounting binding pins and the Xero release witness, the maintenance fence and its
-booked-in re-check marker, the Mintsoft token-refresh lease, and the per-connector-per-day claim keys
-the WMS dispatch sweep builds. `setSetting` and `setSettings` are exported Server Actions taking an
-arbitrary key, so each is its own addressable endpoint reachable by any principal holding
-`settings.company`; both now refuse every key in `lib/domain/settings/reserved-setting-keys.ts` before
-opening a transaction. Adding a new system-managed key means adding it to that module — the owning
-module keeps writing its own row exactly as before.
+**The generic settings writers accept an allowlist of operator preferences and refuse everything
+else.** The `settings` table serves two different kinds of row: operator preferences that a screen
+offers and any value is a legitimate choice for, and system-managed rows whose value is a fact the
+system established — the WooCommerce initial-import completion flag and sync cursors, the WooCommerce
+credentials and settings version, the integration plugin flags, the accounting binding pins and the
+Xero release witness, the maintenance fence and its booked-in re-check marker, the Mintsoft
+token-refresh lease, and the per-connector claim and drift keys the WMS dispatch sweep builds at run
+time. `setSetting` and `setSettings` are exported Server Actions taking an arbitrary key, so each is
+its own addressable endpoint reachable by any principal holding `settings.company`.
+
+Both now accept **only** the preference keys listed in
+`lib/domain/settings/writable-setting-keys.ts`, and refuse every other key before opening a
+transaction. That list is grouped by the settings screen that offers each key, and a repository test
+fails unless the screens named in it are exactly the files that import a generic writer — so a
+preference nobody can set from a screen cannot be on it, and a screen cannot save a key that is not.
+
+This is deliberately an allowlist rather than a list of keys to refuse. A denylist is only ever as
+complete as the last search for system-managed keys, and the previous one had already missed the
+WooCommerce sync cursors and completion flag. **Adding a new system-managed key therefore requires no
+change here at all — it is refused because it is not a preference.** What needs a change is adding a
+new *operator preference*: list it with its screen, or that screen's save fails loudly the first time
+it is used. `lib/domain/settings/reserved-setting-keys.ts` survives only as the table that names the
+owning writer in the refusal message for the families we have already documented; it no longer decides
+anything.
 
 That check is application-level. A **database-enforced** version is possible but needs a migration, so
-it is written down here rather than shipped: a `CHECK` constraint cannot express it (reserved keys must
-still be insertable, by the code that owns them), so it would take a `BEFORE INSERT OR UPDATE` trigger
+it is written down here rather than shipped: a `CHECK` constraint cannot express it (system-managed
+keys must still be insertable, by the code that owns them), so it would take a `BEFORE INSERT OR UPDATE` trigger
 on `settings` that raises unless a transaction-local setting is present — `current_setting('ims.system_setting_write', true) = 'on'` — with every owning writer issuing `SET LOCAL ims.system_setting_write = 'on'` first. There is precedent on this table (the
 `xero_pin_write_consumes_release` trigger, migration `20260819210000`). The cost is that `SET LOCAL`
 only scopes to an explicit transaction, and several system writers today are bare `db.setting.upsert`
 calls on the pooled client: adopting the trigger means converting each of them to a transaction, or the
-flag leaks to whatever request next borrows that pooled connection. Until that is done the module above
-is the single enforcement point.
+flag leaks to whatever request next borrows that pooled connection. Until that is done the allowlist
+above is the single enforcement point.
 
 ### Monitoring
 

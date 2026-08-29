@@ -589,14 +589,18 @@ test('a generic settings save that COMMITS and then fails its post-commit step s
   // THE DEFECT, exactly. The write below lands; `logActivity` then throws; the old code rejected.
   state.logActivityThrows = new Error('activity log unavailable')
 
-  const result = await setMany({ public_app_url: 'https://ims.example.com' })
+  // An ALLOWLISTED preference key (Codex r20 HIGH). `public_app_url` used to stand in here, and the
+  // allowlist now refuses it through the generic writer — it has an owning writer, `savePublicAppUrl`,
+  // which validates the URL and reconciles the crontab that embeds it. A refusal would have proved
+  // nothing about the post-commit contract, which is what this test is for.
+  const result = await setMany({ financial_year_start: '04-01' })
 
   assert.deepEqual(result, {
     status: 'post-commit-failed',
     step: 'local',
     error: 'activity log unavailable',
   })
-  assert.equal(store.get('public_app_url'), 'https://ims.example.com', 'and the value really is stored')
+  assert.equal(store.get('financial_year_start'), '04-01', 'and the value really is stored')
 })
 
 test('the Public App URL action refuses an invalid URL BEFORE writing anything', async () => {
