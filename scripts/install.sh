@@ -732,6 +732,35 @@ DB_ENV_SNAPSHOT_DIR="/etc/ims-cutover"
 DB_ENV_SNAPSHOT_FILE="${DB_ENV_SNAPSHOT_DIR}/db-identity-snapshot.env"
 DB_ENV_SNAPSHOT_DROPIN_NAME="zz-deploy-db-identity.conf"
 DB_ENV_SNAPSHOT_DROPIN_FILE="${FENCE_DROPIN_DIR}/${DB_ENV_SNAPSHOT_DROPIN_NAME}"
+# THE TRUST ROOT, AT A PATH ALL THREE PRINCIPALS CAN OPEN (o3d-2sm1.5 r46, Codex MEDIUM).
+#
+# THE FINDING. r45 validated the operator's DB_SSLROOTCERT with `[[ -f && -r ]]`, and this script
+# runs as root — so `-r` proved that ROOT can read it and nothing else. Three different principals
+# open that file: the authentication-request reader runs as root, the `psql` credential probes run
+# as the `postgres` OS user (pg_endpoint_psql() goes through run_as_user), and the SERVICE runs as
+# ${APP_USER}. A CA at mode 0600 under `postgres` passes both checks the installer makes and then
+# fails when the application starts — after the migration, after the cutover, with the fence down.
+# And nothing constrained who could WRITE it, so a CA the application account owns could be
+# replaced between the probe and the start, moving the trust root out from under everything this
+# gate just vouched for.
+#
+# SO THE BYTES ARE PUBLISHED, NOT THE PATHNAME. publish_db_ca() copies the validated file here —
+# root-owned, 0644, in a root-owned 0755 directory — and repoints DB_SSLROOTCERT at THIS path.
+# From that point the URL's `sslrootcert=`, the reader's `--sslrootcert=` and psql's
+# PGSSLROOTCERT are the same three characters, and that file is readable by every UID and
+# writable by root alone. verify_db_ca_published() re-checks the digest and the modes at each
+# principal's boundary; see it for what "stale" means when the operator's own CA changes.
+#
+# A LITERAL, for the reason DB_ENV_SNAPSHOT_DIR is one: a privileged path resolved from a variable
+# the application can set is not a privileged path. The owner is a literal beside it so the
+# regression rigs — which run as an ordinary user with no root to give a file to, and which lift
+# FUNCTIONS rather than these assignments — can measure the mechanism without measuring `chown`.
+DB_CA_PUBLISH_DIR="/etc/ims-db-ca"
+DB_CA_PUBLISHED_FILE="${DB_CA_PUBLISH_DIR}/db-ca.crt"
+DB_CA_PUBLISH_OWNER="root:root"
+# The digest of the bytes this run published, so every later check compares against what was
+# validated rather than against whatever is at the path by then.
+DB_CA_PUBLISHED_DIGEST=""
 # THIS SCRIPT HAS NO --dry-run, AND UNDER `set -u` THAT WAS NOT THE SAME AS `false`
 # (o3d-2sm1.5 r45, found while adding a third reader of it).
 #
@@ -1224,6 +1253,31 @@ url_decode_userinfo() {
 # the value recovered from the previous run's DATABASE_URL, so an unattended upgrade of a TLS-only
 # installation would silently re-publish a cleartext URL. Empty means "nobody has said yet"; both
 # prompt branches settle it, and db_sslmode_is_supported() refuses an unsettled one.
+#
+# AND THE CALLER'S OWN VALUES ARE TAKEN FIRST, BECAUSE THIS ERASES THEM (o3d-2sm1.5 r46, Codex
+# HIGH).
+#
+# THE FINDING. The two assignments below are UNCONDITIONAL and they run at script scope, long
+# before prompt_db_sslmode(). prompt() in --non-interactive mode keeps whatever the variable
+# ALREADY HOLDS — that is how every value in this script is supplied as an environment variable —
+# so by the time it looked, the operator's `DB_SSLMODE=verify-full DB_SSLROOTCERT=/etc/ca.pem
+# bash install.sh --non-interactive` had already been overwritten with the empty string. The
+# transport then fell to the recovered value, which on a FIRST install is nothing, and from there
+# to `disable`. The TLS support r45 added worked only when a human typed it at the prompt; in the
+# mode installations are actually automated in, a TLS-only cluster was uninstallable and a cluster
+# that accepts both transports was contacted in cleartext without a word.
+#
+# THE PRECEDENCE IS THEREFORE WRITTEN OUT AND NOT LEFT TO ORDERING. An ordering that happens to
+# work is what produced this. What is captured here is only the INPUT; prompt_db_sslmode() selects
+# between it, the value recovered from the previous run's DATABASE_URL, and `disable`, in that
+# order, with an `if` an eye can check — and it assigns DB_SSLMODE from that selection rather than
+# relying on prompt() to reach the same answer by falling through.
+#
+# `-` AND NOT `:-`. An operator who exports DB_SSLMODE= (empty) has said nothing, which is exactly
+# what an unset variable says, and both must reach the recovery rather than one of them dying under
+# `set -u`.
+DB_SSLMODE_SUPPLIED="${DB_SSLMODE-}"
+DB_SSLROOTCERT_SUPPLIED="${DB_SSLROOTCERT-}"
 DB_SSLMODE=""
 DB_SSLROOTCERT=""
 
@@ -2426,6 +2480,123 @@ publish_durable_file() {
   fsync_path "$dir" || return 1
   return 0
 }
+
+# ---------------------------------------------------------------------------
+# THE DATABASE TRUST ROOT, PUBLISHED WHERE EVERY PRINCIPAL CAN OPEN IT
+# (o3d-2sm1.5 r46, Codex MEDIUM). See DB_CA_PUBLISH_DIR at the top of this script for the finding.
+# ---------------------------------------------------------------------------
+
+# The bytes, named. Used to prove that what is at the published path is what was validated, and
+# never to decide anything about the certificate's content — this script is not a CA parser.
+file_sha256() {
+  sha256sum "$1" 2>/dev/null | cut -d' ' -f1
+}
+
+# Can a process running as ANY uid open this file? Asked of the permission bits rather than by
+# opening it, because the two principals that matter most cannot be impersonated at the moment the
+# question first has to be answered: the CA is published during configuration, where ${APP_USER}
+# does not exist yet and `postgres` may not be installed. The bits are the whole answer — a 0644
+# file under directories every one of which grants other-execute is readable by every uid on the
+# box, and this walks the ancestry rather than assuming /etc is what it usually is.
+#
+# IT IS ALSO THE OTHER HALF OF THE FINDING: 0644 means writable by the OWNER ALONE, so the trust
+# root cannot be swapped between the probe that vouched for it and the service that uses it.
+db_ca_path_is_open_to_every_uid() {
+  local file="$1" perm dir
+  perm="$(stat -c '%a' "${file}" 2>/dev/null)" || return 1
+  # Other-read is the 4 bit of the last digit; other-write (2) and group-write must be absent, and
+  # `644` states all three at once rather than testing them one at a time.
+  [[ "${perm}" == "644" ]] || return 1
+  dir="$(dirname "${file}")"
+  while :; do
+    perm="$(stat -c '%a' "${dir}" 2>/dev/null)" || return 1
+    # Other-execute is the 1 bit of the last digit: 1, 3, 5 or 7.
+    case "${perm}" in *[1357]) ;; *) return 1 ;; esac
+    [[ "${dir}" != "/" ]] || break
+    dir="$(dirname "${dir}")"
+  done
+  return 0
+}
+
+# Copy the validated CA to the published path, durably, with ownership and mode applied BEFORE the
+# rename — publish_durable_file() is used rather than a second publisher for exactly that property,
+# and because a half-written trust root is the one file on this box that must not be reachable.
+#
+# `< "${source}"` and not a `cat |`: the redirection opens the source before the temporary file is
+# renamed over it, so re-publishing the published file ONTO ITSELF — which is what every re-run of
+# a TLS installation does, because the recovered DB_SSLROOTCERT names this very path — reads the
+# open file description and is a no-op that still proves the digest.
+publish_db_ca() {
+  local source="$1"
+  command -v sha256sum >/dev/null 2>&1 || return 1
+  DB_CA_PUBLISHED_DIGEST="$(file_sha256 "${source}")"
+  [[ -n "${DB_CA_PUBLISHED_DIGEST}" ]] || return 1
+  mkdir -p "${DB_CA_PUBLISH_DIR}" || return 1
+  chown "${DB_CA_PUBLISH_OWNER}" "${DB_CA_PUBLISH_DIR}" || return 1
+  chmod 755 "${DB_CA_PUBLISH_DIR}" || return 1
+  publish_durable_file "${DB_CA_PUBLISHED_FILE}" "${DB_CA_PUBLISH_OWNER}" 644 < "${source}" || return 1
+  return 0
+}
+
+# WHAT WAS PUBLISHED IS STILL THERE, STILL THOSE BYTES, AND STILL OPEN TO THE PRINCIPAL ABOUT TO
+# USE IT. Called once at publication and again at each boundary where a new principal appears, so
+# a failure names the principal rather than surfacing as a connection refused after the cutover.
+#
+# Every argument after the first is an OS user to actually open the file as. A user that does not
+# exist yet is skipped rather than failed: this runs during configuration too, where the honest
+# answer about ${APP_USER} is "not yet", and the bits check above is what stands in until it does.
+#
+# WHEN THE OPERATOR'S CA CHANGES. The published file is a SNAPSHOT, taken from whatever
+# DB_SSLROOTCERT named at the moment of the run that took it. It is refreshed by re-running the
+# installer with DB_SSLROOTCERT= pointing at the new source file — which the r46 precedence makes
+# reachable under --non-interactive, since a supplied value beats the path recovered from the URL.
+# Doing nothing leaves the old trust root in place, and STALE HERE FAILS CLOSED: `verify-ca` and
+# `verify-full` refuse a certificate that does not chain to it, so a rotated cluster CA takes the
+# connection down loudly instead of quietly accepting a chain nobody vouched for.
+verify_db_ca_published() {
+  local user perm owner
+  [[ -n "${DB_CA_PUBLISHED_DIGEST}" ]] || {
+    error "No database CA has been published by this run, so there is nothing to verify. That is a bug in this script's own ordering: verify_db_ca_published() ran before publish_db_ca()."
+    return 1
+  }
+  [[ -f "${DB_CA_PUBLISHED_FILE}" ]] || {
+    error "${DB_CA_PUBLISHED_FILE} is not there. This run published the database CA to that path and something removed it since; the application, the psql probes and the authentication-request reader all name it, so none of them can verify the server."
+    return 1
+  }
+  perm="$(file_sha256 "${DB_CA_PUBLISHED_FILE}")"
+  [[ "${perm}" == "${DB_CA_PUBLISHED_DIGEST}" ]] || {
+    error "${DB_CA_PUBLISHED_FILE} no longer holds the bytes this run validated and published (sha256 ${perm:-unreadable}, expected ${DB_CA_PUBLISHED_DIGEST}). The trust root every connection below is verified against has been replaced since it was checked; nothing here can vouch for what the server presents."
+    return 1
+  }
+  owner="$(stat -c '%U:%G' "${DB_CA_PUBLISHED_FILE}" 2>/dev/null)" || owner=""
+  [[ "${owner}" == "${DB_CA_PUBLISH_OWNER}" ]] || {
+    error "${DB_CA_PUBLISHED_FILE} is owned by ${owner:-nobody this run could read} and not by ${DB_CA_PUBLISH_OWNER}. A trust root its reader can rewrite is not a trust root: it can be replaced between the probe that vouched for it and the service that connects with it."
+    return 1
+  }
+  owner="$(stat -c '%U:%G' "${DB_CA_PUBLISH_DIR}" 2>/dev/null)" || owner=""
+  [[ "${owner}" == "${DB_CA_PUBLISH_OWNER}" ]] || {
+    error "${DB_CA_PUBLISH_DIR} is owned by ${owner:-nobody this run could read} and not by ${DB_CA_PUBLISH_OWNER}. Whoever owns the directory can replace the file in it by rename, whatever the file's own mode says."
+    return 1
+  }
+  perm="$(stat -c '%a' "${DB_CA_PUBLISH_DIR}" 2>/dev/null)" || perm=""
+  [[ "${perm}" == "755" ]] || {
+    error "${DB_CA_PUBLISH_DIR} is mode ${perm:-unreadable} and not 755. 0755 is what makes the CA reachable by ${APP_USER} and by postgres while leaving root the only account that can write it."
+    return 1
+  }
+  db_ca_path_is_open_to_every_uid "${DB_CA_PUBLISHED_FILE}" || {
+    error "${DB_CA_PUBLISHED_FILE} is not readable by every uid on this host, or is writable by more than its owner. The installer runs as root, the psql probes run as postgres and the service runs as ${APP_USER}; a mode that only root can open passes every check this script makes and then fails when the application starts, after the migration."
+    return 1
+  }
+  for user in "$@"; do
+    id "${user}" >/dev/null 2>&1 || continue
+    run_as_user "${user}" test -r "${DB_CA_PUBLISHED_FILE}" >/dev/null 2>&1 || {
+      error "${user} cannot read ${DB_CA_PUBLISHED_FILE}. That account opens the database CA — the service runs as ${APP_USER}, the credential probes run as postgres — so it would fail to verify the server it is about to be pointed at."
+      return 1
+    }
+  done
+  return 0
+}
+
 # ---------------------------------------------------------------------------
 # THE ROTATION JOURNAL: WHAT THE NEXT RUN IS TOLD, AND WHAT IT DOES ABOUT IT
 # (o3d-2sm1.5 r39, Codex HIGH).
@@ -5079,17 +5250,46 @@ installed_database_sslrootcert() {
 # keeps refusing to make. So the set is the one every reader treats literally, and a path outside
 # it is a refusal that says so.
 prompt_db_sslmode() {
-  local existing_url existing_mode existing_root
+  local existing_url existing_mode existing_root chosen_mode chosen_root
   existing_url="$(existing_env DATABASE_URL)"
-  existing_mode="$(installed_database_sslmode "${existing_url}")" || existing_mode="disable"
+  existing_mode="$(installed_database_sslmode "${existing_url}")" || existing_mode=""
   existing_root="$(installed_database_sslrootcert "${existing_url}")" || existing_root=""
-  prompt DB_SSLMODE "Database TLS mode (disable, require, verify-ca, verify-full)" "${existing_mode}"
+  # THE PRECEDENCE, AS AN `if` AND NOT AS AN ORDERING (o3d-2sm1.5 r46, Codex HIGH).
+  #
+  # SUPPLIED > RECOVERED > disable. The supplied value is the one captured at the top of this
+  # script BEFORE the declaration that erases it — see DB_SSLMODE_SUPPLIED there for what reading
+  # DB_SSLMODE here instead cost. `disable` is last rather than being installed_database_sslmode()'s
+  # failure value, so the three sources are three branches an eye can check rather than two
+  # branches and a default hiding inside a `||`.
+  #
+  # AND THE SELECTION IS ASSIGNED, NOT LEFT FOR prompt() TO REACH. Under --non-interactive prompt()
+  # would arrive at the same answer by keeping a non-empty current value and otherwise taking the
+  # default; that is precisely the "ordering that happens to work" this round is about. The variable
+  # is set from the selection first, and prompt() is then only what it is on the interactive path:
+  # the operator's chance to type something else, with the selection shown as what Enter takes.
+  if [[ -n "${DB_SSLMODE_SUPPLIED}" ]]; then
+    chosen_mode="${DB_SSLMODE_SUPPLIED}"
+  elif [[ -n "${existing_mode}" ]]; then
+    chosen_mode="${existing_mode}"
+  else
+    chosen_mode="disable"
+  fi
+  DB_SSLMODE="${chosen_mode}"
+  prompt DB_SSLMODE "Database TLS mode (disable, require, verify-ca, verify-full)" "${chosen_mode}"
   [[ -n "${DB_SSLMODE}" ]] || DB_SSLMODE="disable"
   db_sslmode_is_supported "${DB_SSLMODE}" || die \
     "DB_SSLMODE=${DB_SSLMODE} is not a transport this installer can put its probes on. The supported values are 'disable' (no SSLRequest at all — what every installation before this round used), 'require' (encrypted, certificate not verified), 'verify-ca' and 'verify-full' (both require DB_SSLROOTCERT). 'prefer' is deliberately absent: it chooses its transport at run time, so an authentication FAILURE can fall onto a second pg_hba.conf record, and the whole point of pinning is that it cannot."
   case "${DB_SSLMODE}" in
     verify-ca|verify-full)
-      prompt DB_SSLROOTCERT "Path to the CA certificate the server is verified against" "${existing_root}"
+      # THE SAME THREE-WAY SELECTION, for the same reason. There is no `disable` to fall back to
+      # here: a mode that verifies against a CA and no CA is a refusal, stated below.
+      if [[ -n "${DB_SSLROOTCERT_SUPPLIED}" ]]; then
+        chosen_root="${DB_SSLROOTCERT_SUPPLIED}"
+      else
+        chosen_root="${existing_root}"
+      fi
+      DB_SSLROOTCERT="${chosen_root}"
+      prompt DB_SSLROOTCERT "Path to the CA certificate the server is verified against" "${chosen_root}"
       [[ -n "${DB_SSLROOTCERT}" ]] || die \
         "DB_SSLMODE=${DB_SSLMODE} verifies the server's certificate against a CA, and DB_SSLROOTCERT names no file. Without one, node-postgres would fall back to Node's bundled CA bundle and libpq to ~/.postgresql/root.crt of whichever user opened the connection — two different trust stores, which is exactly the divergence this installer pins its probes to avoid. Supply the CA the cluster's certificate chains to."
       ;;
@@ -5108,8 +5308,22 @@ prompt_db_sslmode() {
     case "${DB_SSLROOTCERT}" in
       *[!A-Za-z0-9._/-]*) die "DB_SSLROOTCERT=${DB_SSLROOTCERT} contains a character outside A-Z a-z 0-9 . _ - /. That path is placed verbatim into a URL query string, into an environment variable and into a command-line argument; escaping it correctly for all three is a reimplementation of three sets of rules, so it is refused instead. Move or link the certificate to a path made only of those characters." ;;
     esac
+    # THIS CHECK IS ABOUT ROOT AND ONLY ROOT, AND IT IS NO LONGER ASKED TO BE MORE (r46, Codex
+    # MEDIUM). The installer runs as root, so `-r` says the INSTALLER can read the operator's file
+    # — which is what it takes to copy it, and nothing at all about the two accounts that open it
+    # later. The readability the service needs is established by publishing the bytes, below.
     [[ -f "${DB_SSLROOTCERT}" && -r "${DB_SSLROOTCERT}" ]] || die \
-      "DB_SSLROOTCERT=${DB_SSLROOTCERT} is not a readable file. DB_SSLMODE=${DB_SSLMODE} verifies the server against it, so a missing CA is not a connection that verifies less — it is a connection that does not open."
+      "DB_SSLROOTCERT=${DB_SSLROOTCERT} is not a file this installer can read. DB_SSLMODE=${DB_SSLMODE} verifies the server against it, so a missing CA is not a connection that verifies less — it is a connection that does not open."
+    # AND FROM HERE ON IT IS THE PUBLISHED COPY THAT IS NAMED, by all three readers at once: this
+    # one assignment is what puts the URL's `sslrootcert=`, the reader's `--sslrootcert=` and
+    # psql's PGSSLROOTCERT on the same file. Publishing BEFORE prompt_db_password() is not
+    # incidental — that function reconciles an interrupted rotation, and reconciling means PROBING,
+    # over this transport and against this CA.
+    publish_db_ca "${DB_SSLROOTCERT}" || die \
+      "The CA at DB_SSLROOTCERT=${DB_SSLROOTCERT} could not be published to ${DB_CA_PUBLISHED_FILE}. DB_SSLMODE=${DB_SSLMODE} verifies the server against a trust root that three different accounts have to open — this installer as root, the credential probes as postgres, and the service as ${APP_USER} — so the bytes are copied to one root-owned, world-readable path rather than the operator's pathname being passed around. Nothing has been changed on this host: make ${DB_CA_PUBLISH_DIR} creatable and re-run."
+    DB_SSLROOTCERT="${DB_CA_PUBLISHED_FILE}"
+    verify_db_ca_published postgres || die \
+      "The database CA published to ${DB_CA_PUBLISHED_FILE} did not verify immediately after publication; the reason is above. DB_SSLMODE=${DB_SSLMODE} is only as good as that file, so this run stops here rather than migrating a database behind a trust root it cannot vouch for. Nothing has been changed on this host."
   fi
 }
 
@@ -5161,6 +5375,17 @@ if [[ "$INSTALL_POSTGRES" == "y" ]]; then
   # chose is the whole subject of r43-r45.
   DB_SSLMODE="disable"
   DB_SSLROOTCERT=""
+  # AND A SUPPLIED VALUE IS DROPPED OUT LOUD, NOT SILENTLY (o3d-2sm1.5 r46, Codex HIGH). This is
+  # the one place the r46 sweep found where a caller-supplied input is deliberately overridden, and
+  # the whole finding that round answers is an override nobody could see. The override is right —
+  # there is no transport question about a cluster this script installs on this host and reaches
+  # over localhost — but an operator who asked for one is told which answer they got.
+  if [[ -n "${DB_SSLMODE_SUPPLIED}" && "${DB_SSLMODE_SUPPLIED}" != "disable" ]]; then
+    warn "DB_SSLMODE=${DB_SSLMODE_SUPPLIED} was supplied, and this run is INSTALLING PostgreSQL on"
+    warn "this host and reaching it over localhost, where the transport is not an operator input."
+    warn "The connection is left on 'disable'. Answer 'n' to 'Install PostgreSQL on this server?'"
+    warn "and give the cluster as an external database if the transport has to be stated."
+  fi
   prompt_db_password
 else
   prompt DB_HOST      "PostgreSQL host"         "localhost"
@@ -5551,6 +5776,19 @@ if ! id "${APP_USER}" &>/dev/null; then
   success "System user '${APP_USER}' created."
 else
   success "System user '${APP_USER}' already exists."
+fi
+
+# THE PRINCIPAL THAT ACTUALLY CONNECTS, ASKED THE MOMENT IT EXISTS (o3d-2sm1.5 r46, Codex MEDIUM).
+#
+# prompt_db_sslmode() published the CA and checked it as root and, where it was installed already,
+# as postgres. ${APP_USER} did not exist then — this block is what creates it — and it is the
+# account the SERVICE runs as, so it is the one whose failure the finding is about: a CA the
+# installer and the probes can read and the application cannot fails after the migration, with the
+# fence down and nothing left to roll back to. It is asked here, which is before the environment
+# file is written and long before anything is started.
+if [[ -n "${DB_SSLROOTCERT}" ]]; then
+  verify_db_ca_published "${APP_USER}" postgres || die \
+    "The database CA at ${DB_CA_PUBLISHED_FILE} is not usable by the account the service runs as; the reason is above. DB_SSLMODE=${DB_SSLMODE} verifies every connection against that file, so an application that cannot open it cannot start. NOTHING HAS BEEN MIGRATED and nothing has been stopped."
 fi
 
 mkdir -p "${DATA_DIR}" "${LOG_DIR}" "${BACKUP_DIR}" \
