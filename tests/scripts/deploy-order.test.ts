@@ -7320,7 +7320,12 @@ test('update.sh never reads a shell variable that only the deleted `source` coul
     // `${NAME}` and `$NAME`, but NOT `${NAME:-…}` / `${NAME-…}` / `${NAME:=…}` / `${#NAME…}` /
     // `${NAME[@]…}` — a default is the script saying "this may be absent", which is the case
     // this test is not about.
-    for (const match of line.matchAll(/\$\{([A-Z][A-Z0-9_]*)\}|\$([A-Z][A-Z0-9_]*)\b/g)) {
+    //
+    // AND NOT `\$NAME`, which is a LITERAL dollar and not an expansion at all (o3d-p9dq). Several
+    // operator-facing messages quote `$STATE_DIRECTORY` and `$BASE_URL` by name; counting those as
+    // reads reports a variable the script never expands, and the fix a reader would then make is
+    // to assign something nothing uses.
+    for (const match of line.matchAll(/(?<!\\)\$\{([A-Z][A-Z0-9_]*)\}|(?<!\\)\$([A-Z][A-Z0-9_]*)\b/g)) {
       const name = match[1] ?? match[2]
       if (!assigned.has(name) && !SHELL_PROVIDED.has(name)) undefined_.push(name)
     }
@@ -7368,7 +7373,8 @@ test('every entrypoint defines what the shared fence library reads', () => {
 
   const needed = new Set<string>()
   for (const line of libCode) {
-    for (const match of line.matchAll(/\$\{([A-Z][A-Z0-9_]*)\}|\$([A-Z][A-Z0-9_]*)\b/g)) {
+    // `\$NAME` is a literal dollar in an operator message, not an expansion — see the scan above.
+    for (const match of line.matchAll(/(?<!\\)\$\{([A-Z][A-Z0-9_]*)\}|(?<!\\)\$([A-Z][A-Z0-9_]*)\b/g)) {
       const name = match[1] ?? match[2]
       if (!libAssigned.has(name)) needed.add(name)
     }

@@ -81,11 +81,27 @@ CRONTAB_LOCK_FD=7
 # local queries, so a legitimate queue clears in well under this. Longer than the app's own
 # 20s wait, deliberately — the entrypoint is the one that cannot simply come back later.
 CRONTAB_LOCK_WAIT_SECONDS="${IMS_CRONTAB_LOCK_WAIT_SECONDS:-60}"
+# UNPARSEABLE FALLS BACK TO THE CONSTANT, rather than to `flock --timeout <garbage>` — which exits
+# non-zero and is indistinguishable here from "the application is reconciling right now", so an
+# operator typo would report a lock conflict that never happened and abort a cutover with a message
+# blaming a process that does not exist. Same rule the application applies to
+# OTI_CRONTAB_LOCK_WAIT_MS (lib/crontab-reconcile-lock.ts).
+if [[ ! "${CRONTAB_LOCK_WAIT_SECONDS}" =~ ^[0-9]+$ ]] || [[ "${CRONTAB_LOCK_WAIT_SECONDS}" -le 0 ]]; then
+  CRONTAB_LOCK_WAIT_SECONDS=60
+fi
 
 # Compose this entrypoint's lock paths from its state directory. The state directory is what
 # systemd hands the service as $STATE_DIRECTORY, which is what the application reads.
+#
+# ABSOLUTE, OR NOTHING. `systemdStateDirectory()` ignores a STATE_DIRECTORY that is not an absolute
+# path — a value that is not absolute is not systemd's, it is something in the environment wearing
+# the name — and falls through to the working directory. An entrypoint composing a relative path
+# here would therefore lock a file the application will never open, which is the "looks locked,
+# excludes nothing" state this whole protocol exists to remove. It is refused rather than resolved.
 crontab_lock_paths() {
   local state_dir="$1"
+  [[ "${state_dir}" == /* ]] || die \
+    "the crontab reconciliation lock cannot be composed from '${state_dir}': the state directory must be an ABSOLUTE path, because the application resolves the same lock from the STATE_DIRECTORY systemd exports and ignores a value that is not absolute. A relative path here would lock a file no other writer will ever open."
   CRONTAB_LOCK_DIR="${state_dir}/${CRONTAB_LOCK_DIRNAME}"
   CRONTAB_LOCK_FILE="${CRONTAB_LOCK_DIR}/${CRONTAB_LOCK_FILENAME}"
 }
