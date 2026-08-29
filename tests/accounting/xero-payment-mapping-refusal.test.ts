@@ -346,3 +346,95 @@ test('[o3d-batch-ret r6] a refused PDF beside an ENQUEUED payment also keeps the
 
   assert.notEqual(marker(), null, 'a refusal on EITHER half keeps the obligation open')
 })
+
+/**
+ * o3d-batch-ret ROUND 7 (Codex MEDIUM) — THE ROUND-6 FIX REFUSED A PAYMENT THAT WAS NEVER OWED.
+ *
+ * `decideInvoicePaymentFollowUp` asked its two CONFIGURATION questions before it asked the MONEY
+ * question. The explicit `!(amount > 0)` verdict — "nobody is owed anything, and that is a success"
+ * — therefore sat downstream of a mapping check the no-payment case never needed.
+ *
+ * AND THE PRODUCER REACHES IT. lib/connectors/woocommerce/sync/order-import.ts sets
+ * `_registerPayment: !!wcOrder.date_paid_gmt && documentTotalsToTheOrder` while
+ * `resolveWcInvoicePaymentAmount` returns `undefined` below `gross > 0`. A £0 order marked paid —
+ * a fully-discounted order, a free sample, a 100% coupon — therefore asks for a payment worth
+ * nothing. Unmapped, it was refused for a bank account it would never have used, and its obligation
+ * marker was retained indefinitely for work that does not exist.
+ *
+ * BOTH INPUT CLASSES ARE WALKED, because they reach the verdict by different routes: the WC shape
+ * DECLARES no `_paymentAmount` at all and the amount is derived from zero-value lines, and an
+ * explicit `_paymentAmount: 0` short-circuits the derivation. A reordering that only moved one of
+ * them would pass a single-shape test.
+ */
+test('[o3d-batch-ret r7] a paid ZERO-TOTAL invoice SETTLES with no mapping configured — it is owed nothing', async () => {
+  // ROUTE: the real `repairXeroBackReferences` over a SYNCED SALES_INVOICE whose payload asks for a
+  // payment, with the payment account map EMPTY — the exact configuration the two refusal arms fire
+  // on, so the only thing that can keep this quiet is the amount being asked about first.
+  //
+  // MUTATION THAT KILLS IT: in lib/connectors/xero/sync-processor.ts, move the
+  // `requestedInvoicePaymentAmount` / `!(amount > 0)` pair back BELOW the two mapping checks (the
+  // round-6 ordering). `xero_payment_skipped` is written and the marker is retained, for a payment
+  // nobody was owed.
+  for (const { what, money } of [
+    { what: 'the WooCommerce shape: `_registerPayment` with NO `_paymentAmount`, over zero-value lines', money: { lines: [{ quantity: 1, unitAmount: 0 }] } },
+    { what: 'an explicitly declared zero amount', money: { _paymentAmount: 0, lines: [{ quantity: 1, unitAmount: 0 }] } },
+  ]) {
+    reset(null)
+    store = createSyncLogStore([syncLogRow({
+      ...SALES_CANDIDATE,
+      payload: {
+        invoiceNumber: 'INV-1',
+        currency: 'GBP',
+        _registerPayment: true,
+        _paymentMethod: 'card',
+        _paymentDate: '2026-08-20',
+        ...money,
+      },
+    })])
+
+    await (await loadSweep())()
+
+    assert.equal(
+      salesOrders.get('order-1')?.accountingInvoiceId, 'XERO-INV-1',
+      `PRECONDITION (${what}): the repair really ran — otherwise nothing below is about the enqueue`,
+    )
+    assert.deepEqual(
+      paymentRefusals(), [],
+      `THE FINDING (${what}): an invoice that owes no payment must not be refused for a mapping it `
+        + 'never needed. A refusal here is an operator sent to configure a bank account for £0',
+    )
+    assert.deepEqual(
+      followUpTypes(), ['INVOICE_PDF'],
+      `and no INVOICE_PAYMENT row is created either (${what}) — "nothing is owed" is not "queue it anyway"`,
+    )
+    assert.equal(
+      marker(), null,
+      `and the obligation is DISCHARGED (${what}): retaining it would leave the row for ever in the `
+        + 'sweep candidate set and in the exception inbox, owing work that does not exist',
+    )
+  }
+})
+
+test('[o3d-batch-ret r7] CONTROL: the same fixture with a POSITIVE amount and no mapping is still refused', async () => {
+  // Without this, the test above could pass on a build that never refuses anything at all — which
+  // is the round-6 defect, not its fix. Same row, same empty map, one number changed.
+  // ROUTE: one real sweep run; `_paymentAmount` omitted so the amount is derived from the lines,
+  // exactly as in the zero arm above.
+  reset(null)
+  store = createSyncLogStore([syncLogRow({
+    ...SALES_CANDIDATE,
+    payload: {
+      invoiceNumber: 'INV-1',
+      currency: 'GBP',
+      _registerPayment: true,
+      _paymentMethod: 'card',
+      _paymentDate: '2026-08-20',
+      lines: [{ quantity: 1, unitAmount: 120 }],
+    },
+  })])
+
+  await (await loadSweep())()
+
+  assert.equal(paymentRefusals().length, 1, 'money that IS owed and cannot be queued is still refused')
+  assert.notEqual(marker(), null, 'and its obligation is still retained')
+})

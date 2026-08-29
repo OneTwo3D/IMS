@@ -26,6 +26,10 @@ import {
   readDeferredReceiptRecovery,
   type DeferredReceiptRecoveryClient,
 } from '@/lib/domain/accounting/invoice-payment-enqueue'
+import {
+  paymentAccountRefusalMessage,
+  postedRowFollowUpRetryNote,
+} from '@/lib/domain/accounting/followup-enqueue-outcome'
 import { ACCOUNTING_CONNECTORS } from '@/lib/connectors/accounting-registry'
 import {
   ACCOUNTING_FOLLOW_UP_RECOVERY,
@@ -2436,6 +2440,42 @@ function activityProducers(): Array<{ what: string; text: string; mustEscalate: 
       })
     }
   }
+
+  // 5. THE PAYMENT-MAPPING REFUSAL (o3d-batch-ret r7, Codex MEDIUM) — THE FIFTH PRODUCER, and the
+  //    one r6 wrote WITHOUT pointing this list at it. It lives in
+  //    lib/domain/accounting/followup-enqueue-outcome.ts, which is in neither the producer walk nor
+  //    the whole-file scan below, so its sentence reached operators on both connectors judged by
+  //    nothing. That is r10's failure and r12's failure, for the fifth time and in a fifth file.
+  //
+  //    BOTH CLAUSE FORMS are walked for EVERY connector, because the producer takes its recovery
+  //    half as an ARGUMENT — which is exactly how r6 came to pass a clause that is true of the
+  //    retained-marker sweep at a call site where it is false. The registry form is what Xero
+  //    passes (two drivers, so it must stay driver-agnostic); the retry form is what QuickBooks
+  //    passes (one driver, the processor's own retry of the posted parent).
+  for (const connector of [...Object.keys(ACCOUNTING_FOLLOW_UP_RECOVERY), UNDECLARED_CONNECTOR]) {
+    const atRest = followUpObligationRecoveryNote(followUpObligationRecoveryFor(connector))
+    const refusal = (recovery: string) => paymentAccountRefusalMessage({
+      connector,
+      referenceType: 'SalesOrder',
+      referenceId: 'so-1',
+      missing: 'no payment account map is configured',
+      configure: 'Set up a bank account for each payment method under Settings → Accounting → Payment Account Mapping.',
+      recovery,
+    })
+    produced.push({
+      what: `paymentAccountRefusalMessage for ${connector}, registry clause `
+        + `(the ${connector}_payment_skipped activity)`,
+      text: refusal(atRest),
+      mustEscalate: false,
+    })
+    produced.push({
+      what: `paymentAccountRefusalMessage for ${connector}, posted-row retry clause `
+        + `(the ${connector}_payment_skipped activity)`,
+      // 5 is MAX_RETRIES on both connectors; the number is not what this list judges, the prose is.
+      text: refusal(postedRowFollowUpRetryNote({ connector, maxRetries: 5, atRest })),
+      mustEscalate: false,
+    })
+  }
   return produced
 }
 
@@ -2448,6 +2488,9 @@ const EXPECTED_ACTIVITY_PRODUCERS =
   + (Object.keys(ACCOUNTING_FOLLOW_UP_RECOVERY).length + 1) * 2
   // the compacted-tombstone discard, over three phases and three classification bases
   + 9
+  // o3d-batch-ret r7: the payment-mapping refusal, in BOTH clause forms, for every registry
+  // connector plus the undeclared fallback
+  + (Object.keys(ACCOUNTING_FOLLOW_UP_RECOVERY).length + 1) * 2
 
 test('[o3d-0bfh r11] every activity string an operator can receive is judged by THE ONE LIST, taken from its producer', () => {
   // Route: xeroRetainedFollowUpObligationDescription() — the function that composes the
@@ -2462,7 +2505,8 @@ test('[o3d-0bfh r11] every activity string an operator can receive is judged by 
   assert.equal(
     produced.length, EXPECTED_ACTIVITY_PRODUCERS,
     'the Xero activity, the shared note and the sweep activity for every registry connector and the '
-      + 'fallback, and the compacted-tombstone discard over every phase and basis',
+      + 'fallback, the compacted-tombstone discard over every phase and basis, and the payment-mapping '
+      + 'refusal in both clause forms for every connector and the fallback',
   )
   for (const { what, text, mustEscalate } of produced) {
     assert.ok(text.length > 0, `${what} must actually produce a string, or this scan reads nothing`)
@@ -2597,6 +2641,13 @@ test('[o3d-0bfh r11/r12] every FILE that writes about a retained obligation is s
     // — and that is asserted below rather than assumed, because a remedy written here would reach an
     // operator through a surface the r9 UI scan does not read.
     readSource(path.join(REPO_ROOT, 'app', 'actions', 'sync-exceptions.ts')),
+    // o3d-batch-ret r7 — THE FIFTH FILE. `paymentAccountRefusalMessage` and
+    // `postedRowFollowUpRetryNote` compose the sentence an operator reads when a requested payment
+    // could not be queued, on BOTH connectors, and r6 shipped it into a module this scan did not
+    // name and the producer walk did not call. Both are now in the walk above; the file is scanned
+    // too, for the reason r12 gives — an unextracted string must not be able to hide behind an
+    // extracted one.
+    readSource(path.join(REPO_ROOT, 'lib', 'domain', 'accounting', 'followup-enqueue-outcome.ts')),
   ]
   for (const source of sources) assertNoBannedInstruction(source.rel, source.code)
 
@@ -2621,6 +2672,14 @@ test('[o3d-0bfh r11/r12] every FILE that writes about a retained obligation is s
   assert.match(
     sources[4]!.code, /describeFollowUpObligationBacklogRow\(row\)/,
     'the exception-inbox loader must pass the registry describer through, not compose a remedy of its own',
+  )
+  // And the r7 file carries its producers rather than prose written at a call site: the refusal
+  // message, and the retry clause whose registry half arrives as an argument.
+  assert.match(sources[5]!.code, /export function paymentAccountRefusalMessage/)
+  assert.match(sources[5]!.code, /export function postedRowFollowUpRetryNote/)
+  assert.match(
+    sources[5]!.code, /\$\{input\.atRest\}/,
+    'the at-rest half must be interpolated from the caller\'s registry answer, never restated here',
   )
 })
 
