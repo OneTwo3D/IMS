@@ -139,8 +139,8 @@ using this database right now:
 
 | before classification | after it |
 | --- | --- |
-| `CREATE ROLE` **when the role is absent**. Nothing can be connected as a role that does not exist. A role that is already there is left completely alone, and the run records — by SQLSTATE `42710` — that it found one. It has to happen here: `fence-db-connections.mjs --preflight` refuses outright when `--app-user` names a role the server does not have, and that preflight is what gates the fenced path. | `ALTER USER … WITH PASSWORD` on a role this run did **not** create. |
-| `CREATE DATABASE`, which either brings a database with no writers into being or is refused as a duplicate. Neither outcome alters an existing object. | `GRANT ALL PRIVILEGES ON DATABASE` and `ALTER DATABASE … OWNER TO`. |
+| `CREATE ROLE` **when the role is absent**. Nothing can be connected as a role that does not exist. A role that is already there is left completely alone, and the run records — by SQLSTATE `42710` — that it found one. It has to happen here: `fence-db-connections.mjs --preflight` refuses outright when `--app-user` names a role the server does not have, and that preflight is what gates the fenced path. | `GRANT ALL PRIVILEGES ON DATABASE` and `ALTER DATABASE … OWNER TO`. |
+| `CREATE DATABASE`, which either brings a database with no writers into being or is refused as a duplicate. Neither outcome alters an existing object. | *(nothing else — see the password, below, which is later still)* |
 
 On the fenced path the second column runs after `require_fenceable_database()` has proved the
 window can be held closed and after any standing fence has been adopted; on the first-install path
@@ -150,15 +150,45 @@ grants `CONNECT`, which is the one privilege the fence exists to take away, and 
 rewrites the owner's ACL entry — either would re-open the door the run is holding shut while it
 still reported the window as closed. A fence can only be standing over a database this run did not
 create, so both are already what the statements would have set them to, and the fence's own
-release is what restores what it revoked. **Not** after the fence is physically raised, and that
-is deliberate: the fence goes up only after the predecessor has been stopped, while the build runs
-*before* the stop so that a release that will not compile costs no outage — and that build is
-handed `DATABASE_URL` and touches the database. Deferring the rotation past the raise would turn
-"the release does not build" into "the release does not build, on a box that has been stopped".
+release is what restores what it revoked.
 
-If a password **was** rotated and a later step fails before the stop, the failure banner says so
-rather than claiming the host is untouched: `.env` and the server agree, and any *other* client
-using the old password for that role needs the new one.
+#### The database password is preserved, and a rotation waits for the fence
+
+**An ordinary re-install does not change the application role's password at all.** The prompt
+defaults to the credential already in `${APP_DIR}/.env` — recovered out of its `DATABASE_URL`, and
+only when that URL names the same **role, host, port and database** this run is about to use, so a
+changed `DB_USER` never inherits another role's secret. Pressing Enter through an upgrade therefore
+changes nothing about the role, exactly as it already did for `REDIS_URL`. (Before this, the
+local-database prompt defaulted to a freshly generated secret, so a routine re-install rotated a
+live credential as a side effect of being run.)
+
+**Supplying a different password asks for a rotation, and that rotation happens only inside the
+stopped, fenced window** — after the reboot fence is installed, cron is fenced, `systemctl stop`
+has returned, the port is free, the connection fence is up and `check-db-writers.mjs` has confirmed
+no other backend is attached. It is refused, loudly, anywhere else.
+
+That is compatible with the build running *before* the stop, because the build is handed a
+credential that **works**, not the one being rotated to: until the `ALTER USER` runs, `DATABASE_URL`,
+`${APP_DIR}/.env` and the `MIGRATION_DATABASE_URL` given to `prisma generate` and `npm run build`
+all carry the **installed** password. A build that fails therefore leaves a predecessor whose
+environment file and whose database still agree. Once the rotation succeeds, the run recomposes
+`DATABASE_URL` and re-writes `${APP_DIR}/.env` with `write_app_env_file()` — the same function that
+wrote it before the build, re-run from the variables this process already holds, so the installer
+never becomes a *reader* of a file the application account owns.
+
+Two things this cannot do, stated plainly:
+
+* `ALTER USER … PASSWORD` is **cluster-wide** and the connection fence is **database-specific**. The
+  window protects the clients of *this* database; any other client on the same server authenticating
+  as that role, against any database, is refused from its next connection onwards. That is why the
+  rotation is opt-in and says so out loud.
+* On the **first-install** path there is no window at all, so a requested rotation is **refused**
+  before the build: the exemption means this run created this database, but the role is cluster-wide
+  and pre-existing. Re-run with the password that role already has.
+
+If a rotation did happen and a later step fails, the post-stop failure banner says so: `.env` and
+the server agree, and any *other* client using the old password for that role needs the new one.
+The pre-stop banner now states the opposite, and can: no credential was rotated.
 
 The script performs the following steps:
 
@@ -245,9 +275,14 @@ running service's environment — or, if this really is a fresh start and the ex
 expendable, re-run with `IMS_INSTALL_REMINT_SECRETS=yes`, which mints them and says out loud what it
 just destroyed.
 
+The **database password** is preserved on the same terms, with one extra condition: the
+`DATABASE_URL` already in `.env` must name the same role, host, port and database this run will use.
+Supplying a different one asks for a deliberate rotation, which happens inside the stopped, fenced
+window — see *The database password is preserved, and a rotation waits for the fence* above.
+
 Prompts NOT preserved across a re-run: the WooCommerce, Xero, Turnstile and SMTP values, and the
-database prompts. Supply them again (or as environment variables) on an upgrade run, or the re-written
-`.env` will blank them.
+database host, port, name and user. Supply them again (or as environment variables) on an upgrade
+run, or the re-written `.env` will blank them.
 
 ### Application
 - **Domain name** — the hostname for your installation (e.g. `ims.yourdomain.com`)
@@ -261,7 +296,10 @@ After installation, sign in and set the organisation base currency in **Settings
 - **Install PostgreSQL** — install on this server, or connect to an external database
 - **Database name** (default: `one_two_inventory`)
 - **Database user** (default: `imsuser`)
-- **Database password** — auto-generated if not provided
+- **Database password** — on a first install, auto-generated if not provided. On a re-install it
+  defaults to the credential already in `${APP_DIR}/.env`, so accepting the default changes nothing
+  about the role. Entering a different one requests a rotation, performed only after the existing
+  installation has been stopped and the database fenced.
 
 ### Redis
 - **Install Redis on this server** — install and configure a local Redis, or point at one you already run

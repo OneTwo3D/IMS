@@ -393,8 +393,9 @@ test('r38: an explicit rotation changes nothing before the stop, and the build g
   //   1. make classify_database_credential_rotation() set DB_PASSWORD_EFFECTIVE="${DB_PASSWORD}"
   //      on the rotation branch — i.e. compose the URL from the target password, which is what
   //      the pre-r38 script effectively did. The composed URL carries the credential the server
-  //      does not have, connectAs() is refused, and THIS TEST FAILS ALONE: it is the only one
-  //      that asks which credential the build is handed.
+  //      does not have, connectAs() is refused, and this test fails on it. Tests 3 and 4 fail
+  //      too, because both of them run this same classification before doing their own work;
+  //      tests 1, 5 and 6 stay green, as does every test in the other two installer files.
   //   2. restore the r37 ALTER inside provision_database_role_and_privileges(). The live password
   //      stops working and this test fails on its live-credential assertion; test 1 fails too,
   //      which is right — both are statements about the same defect.

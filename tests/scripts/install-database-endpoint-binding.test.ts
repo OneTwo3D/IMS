@@ -563,7 +563,7 @@ test('r37/r38: the role work inside an adopted fence grants nothing back, and to
       'the credential the live clients hold must still authenticate: nothing before the stop may rotate it',
     )
     assert.throws(
-      () => cluster.psql(['-c', 'SELECT 1'], { host: '127.0.0.1', user: 'imsuser', password: 'rotated-by-this-run', database: 'postgres' }),
+      () => cluster!.psql(['-c', 'SELECT 1'], { host: '127.0.0.1', user: 'imsuser', password: 'rotated-by-this-run', database: 'postgres' }),
       /password authentication failed/,
       'and the value on the invocation must NOT have become the role password here — that is the rotation, and it belongs after the stop',
     )
