@@ -1,35 +1,40 @@
 /**
- * ONE PLACE THAT CREATES A THROWAWAY DIRECTORY IN `tests/scripts/`, AND REMOVES IT (o3d-tmpleak).
+ * A THROWAWAY DIRECTORY WHOSE REMOVAL IS REGISTERED AT THE MOMENT IT IS CREATED (o3d-tmpleak).
  *
- * WHY THIS EXISTS. Every harness here used to call `mkdtemp` itself and arrange its own removal —
- * some with `t.after`, some with `try`/`finally`, three with nothing at all. A per-harness
- * convention is not a convention: it is a thing each new file gets to decide again, and three of
- * them decided not to. That left ~18,000 directories under /tmp, the oldest six days old, and the
- * count only ever went up because nothing failed when a harness forgot.
+ * WHY THIS EXISTS. `tests/scripts/` accumulated ~18,000 directories under /tmp over six days,
+ * because a harness that forgot to clean up produced no signal at all. Most harnesses here do
+ * clean up, in a `finally` or on a `t.after`; this is for the ones that CANNOT, because the
+ * directory has to outlive the scope that made it — `layoutInvocation` in deploy-order.test.ts
+ * builds a staging directory and returns a COMMAND STRING that will later run out of it, so there
+ * is no `finally` to put an `rmSync` in. That was the one site in this directory that still
+ * leaked, and it is the shape this exists for.
  *
- * So creation and removal are the SAME call. A harness cannot obtain a directory from here without
- * its removal already being registered, and `tests/scripts/temp-dir-discipline.test.ts` fails the
- * build if a `mkdtemp` appears in this directory anywhere but this file.
+ * IT IS NOT THE GUARD. An earlier attempt made it one, by banning `mkdtemp` everywhere in this
+ * directory but here. Measured against the tree, that rule would have failed the build on 151
+ * call sites that already clean up correctly in order to reach the 1 that did not. The guard is
+ * now `tests/temp-dir-sentinel.ts`, which measures what actually survives a test process instead
+ * of reading source, and this file is a convenience that makes the awkward case easy to get right
+ * — so use it where a scope exists too, but a plain `mkdtemp` with a `finally` is not a defect.
  *
  * CLEANUP RUNS ON FAILURE TOO, which is the case that matters — a harness that only removes on the
- * happy path leaks exactly when something went wrong and kept going wrong. Two independent
- * mechanisms, both idempotent, so neither is load-bearing alone:
+ * happy path leaks exactly when something went wrong and kept going wrong. Two idempotent
+ * mechanisms, so neither is load-bearing alone:
  *
  *   • `t.after(...)`, when a TestContext is passed. Node's test runner runs `after` hooks whether
  *     the test passed or threw, and it runs them as soon as that test ends, so a file of 40 tests
- *     holds one directory at a time rather than 40.
+ *     holds one directory at a time rather than 40. PASS `t` WHEREVER THERE IS ONE.
  *   • `process.on('exit')`, always. It fires on a passing run, on a failing run (the runner still
  *     exits normally, with status 1) and on an explicit `process.exit`. It is the whole mechanism
- *     for callers with no TestContext to give — which is what makes this adoptable by an existing
- *     harness as a one-line change, rather than a restructuring nobody will do.
+ *     for callers with no TestContext to give. The sentinel deliberately looks AFTER every exit
+ *     listener has run, so directories drained here are not reported as leaks — an ordinary
+ *     `process.on('exit')` in the sentinel saw all 18 of them mid-removal and reported them.
  *
  * Neither survives SIGKILL. Nothing in a test process does, and that is not the leak that happened.
  *
  * NOTHING HERE IS KEPT ON FAILURE. Keeping the fixture of a failing test is a real debugging aid
  * and a real unbounded leak, and the leak is what this file is about; a harness that wants the
  * evidence should print it, not abandon it in /tmp.
- */
-import { mkdtempSync, rmSync } from 'node:fs'
+ */import { mkdtempSync, rmSync } from 'node:fs'
 import { mkdtemp } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
