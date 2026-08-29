@@ -391,6 +391,12 @@ crontab_unmanaged_lines_missing_from() {
 #
 # Returns 0 for snapshot and merge, non-zero for refuse. It NEVER writes the crontab: the write
 # stays in the entrypoints' `*_locked` bodies, which is where the one-writer census can see it.
+#
+# A status of its own for "the world moved", so a caller can tell it from a failed write and from
+# a lock it could not take — the same reason ${CRONTAB_LOCK_CONFLICT} exists. It is deliberately
+# not 1: an entrypoint that mistook a divergence for an ordinary error would print the wrong
+# recovery.
+CRONTAB_UNFENCE_DIVERGED=76
 CRON_UNFENCE_PLAN=""
 CRON_UNFENCE_TEXT=""
 CRON_UNFENCE_REASON=""

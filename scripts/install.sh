@@ -4644,9 +4644,10 @@ fence_cron_locked() {
     publish_cron_backup "${current}" || die \
       "The ${APP_USER} crontab could not be backed up to ${CRON_BACKUP}, so this run will not fence the cron writers: a fence whose backup cannot be verified is a crontab nobody can put back. Nothing was left behind at ${CRON_BACKUP}. The service IS STOPPED at this point — the fence is taken after the drain, so that no predecessor can write the crontab between the snapshot and the replacement — and NOTHING HAS BEEN MIGRATED. The trap below re-fences and says how to recover."
   fi
-  printf '%s\n' "${current}" \
-    | awk '{ if ($0 ~ /^[[:space:]]*[^#[:space:]]/) print "#DEPLOY-FENCE# " $0; else print $0 }' \
-    | crontab -u "${APP_USER}" -
+  # THROUGH THE SHARED PROJECTION, not a fourth copy of the awk. plan_crontab_unfence() decides
+  # whether the snapshot is still current by re-running THIS transform over the backup and
+  # comparing; a re-typed copy here would let the two drift and make that comparison meaningless.
+  crontab_fence_projection "${current}" | crontab -u "${APP_USER}" -
   CRON_FENCED=true
   success "Cron writers fenced."
 }
@@ -4661,15 +4662,42 @@ unfence_cron() {
   [[ -f "${CRON_BACKUP}" ]] || return 0
   local rc=0
   with_crontab_lock unfence_cron_locked || rc=$?
+  [[ "${rc}" -ne "${CRONTAB_UNFENCE_DIVERGED}" ]] || die \
+    "The ${APP_USER} crontab is still FENCED (every line commented out) and this run will not decide what belongs in it: ${CRON_UNFENCE_REASON}. Neither candidate is safe to install without a human — the backup at ${CRON_BACKUP} would discard whatever rewrote the crontab, and undoing the fence in place would discard the lines listed above. Compare the two (crontab -u ${APP_USER} -l, against ${CRON_BACKUP}) and install the union by hand."
   [[ "${rc}" -eq 0 ]] || die \
     "The ${APP_USER} crontab is still FENCED (every line commented out) because this run could not take ${CRONTAB_LOCK_FILE}$(if [[ "${rc}" -eq "${CRONTAB_LOCK_CONFLICT}" ]]; then printf ' within %ss' "${CRONTAB_LOCK_WAIT_SECONDS}"; fi). The application is up and the migration is complete; put the schedule back by hand once nothing is reconciling:  crontab -u ${APP_USER} ${CRON_BACKUP}"
 }
 
+# NOT A BLIND RESTORE, AND THIS IS THE SITE THE FINDING NAMED (o3d-p9dq, Codex r27 HIGH #1).
+#
+# The new service accepted traffic several sections ago. Between that moment and this one an
+# operator can save a schedule: the application takes the SAME lock, writes its managed block into
+# the fenced crontab, releases, and reports success — correctly, because the settings row is
+# committed. This function then takes the lock in its turn and, until now, installed a snapshot
+# taken before the cutover over the top of it. Perfectly ordered. Completely wrong. The database
+# and the UI went on saying the job was enabled and nothing was scheduled to run it.
+#
+# The lock cannot fix that, because nothing here is out of order. What fixes it is not restoring a
+# snapshot whose world has moved: plan_crontab_unfence() proves the live crontab is still the
+# fence's own projection of the backup before it uses the backup at all, and otherwise undoes the
+# fence WHERE IT WAS APPLIED — which keeps the block the reconciliation projected from the settings
+# rows, the durable record the crontab is only a projection of.
 unfence_cron_locked() {
-  crontab -u "${APP_USER}" "${CRON_BACKUP}"
+  local current backup
+  current="$(crontab -u "${APP_USER}" -l 2>/dev/null || true)"
+  if ! backup="$(cat "${CRON_BACKUP}" 2>/dev/null)"; then
+    CRON_UNFENCE_REASON="the backup at ${CRON_BACKUP} could not be read"
+    return "${CRONTAB_UNFENCE_DIVERGED}"
+  fi
+  plan_crontab_unfence "${backup}" "${current}" || return "${CRONTAB_UNFENCE_DIVERGED}"
+  printf '%s\n' "${CRON_UNFENCE_TEXT}" | crontab -u "${APP_USER}" -
   rm -f "${CRON_BACKUP}"
   CRON_FENCED=false
-  success "Cron writers restored verbatim."
+  if [[ "${CRON_UNFENCE_PLAN}" == "merge" ]]; then
+    warn "Cron writers restored, and ${CRON_UNFENCE_REASON}."
+  else
+    success "Cron writers restored verbatim."
+  fi
 }
 
 # --- adopting somebody else's marker ---------------------------------------
@@ -4701,6 +4729,9 @@ marker_phase() {
 }
 
 RESUME_EVIDENCE=""
+# Why an interrupted arming's crontab could NOT be put back, when the reason is a diverged crontab
+# rather than a lock. Empty means the lock, which is what the message defaults to saying.
+RESUME_CRON_DIVERGED=""
 # IS THE EXISTING INSTALLATION STILL UP? Asked only to decide whether an interrupted ARMING
 # can be resumed, and answered conservatively: a unit systemd reports active, or anything
 # listening on the app's port, counts as "still serving". A `false` sends the run down the
@@ -4730,8 +4761,33 @@ predecessor_is_active() {
 # Order matters: the crontab is restored FIRST and a failure there is fatal BEFORE the fence
 # comes down, so a run that cannot finish the unwind leaves the marker exactly as it found it
 # and the next run adopts the same phase again.
+# A BACKUP IS ONLY SAFE TO INSTALL BLINDLY IF THE WORLD STILL MATCHES WHAT IT WAS TAKEN FROM
+# (o3d-p9dq, Codex r27 HIGH #2).
+#
+# This is the ONE path where the predecessor was never stopped and never held this lock — it is
+# reached only for a marker written by a script older than this protocol — so the divergence here
+# is not bounded by a deploy window at all: the interrupted run's backup may be minutes or hours
+# old, and every schedule saved since then went into the LIVE crontab and into no backup. The lock
+# cannot protect history made by a process that never joined it.
+#
+# So the same comparison as unfence_cron_locked, through the same helper — but the policy on a
+# mismatch is REFUSE rather than merge, and the difference is deliberate. At unfence the window is
+# ours, everything that could have written it holds this lock and writes the projection of the
+# settings rows, so the merge is provably what the database says. Here it is not: an unattributable
+# write over an unbounded interval could be the application's reconciliation or an operator's
+# `crontab -e`, and nothing on this box can tell them apart. Nothing has been stopped at this point
+# and nothing has been migrated, so a refusal costs a re-run and loses nothing — which is the
+# cheapest thing in the room.
 resume_restore_cron_locked() {
-  crontab -u "${APP_USER}" "${CRON_BACKUP}" || return 1
+  local current backup
+  RESUME_CRON_DIVERGED=""
+  current="$(crontab -u "${APP_USER}" -l 2>/dev/null || true)"
+  backup="$(cat "${CRON_BACKUP}" 2>/dev/null)" || return 1
+  if [[ "${current}" != "$(crontab_fence_projection "${backup}")" ]]; then
+    RESUME_CRON_DIVERGED="the live crontab is not the fenced projection of ${CRON_BACKUP}, so something has written it since the interrupted run took that snapshot and installing the snapshot would discard that write"
+    return 1
+  fi
+  printf '%s\n' "${backup}" | crontab -u "${APP_USER}" - || return 1
   rm -f "${CRON_BACKUP}"
   CRON_FENCED=false
   success "The ${APP_USER} crontab is back exactly as the interrupted run found it."
@@ -4750,7 +4806,7 @@ resume_from_interrupted_arming() {
   # at all and this branch only fires for a marker written by an older script.
   if command -v crontab >/dev/null 2>&1 && [[ -f "${CRON_BACKUP}" ]]; then
     with_crontab_lock resume_restore_cron_locked || die \
-      "The interrupted run had fenced the ${APP_USER} crontab and its backup at ${CRON_BACKUP} could not be restored under ${CRONTAB_LOCK_FILE}. Refusing to continue with the cron writers commented out: restore it by hand (crontab -u ${APP_USER} ${CRON_BACKUP}) and re-run. Nothing has been stopped."
+      "The interrupted run had fenced the ${APP_USER} crontab and its backup at ${CRON_BACKUP} could not be restored under ${CRONTAB_LOCK_FILE}.${RESUME_CRON_DIVERGED:+ THE REASON IS NOT THE LOCK: }${RESUME_CRON_DIVERGED} Refusing to continue with the cron writers commented out: settle it by hand (compare ${CRON_BACKUP} against crontab -u ${APP_USER} -l) and re-run. Nothing has been stopped."
   fi
   release_db_connections || die \
     "A connection fence was standing over an UNTOUCHED schema and could not be released. Fix that before re-running; nothing has been stopped."
@@ -5186,8 +5242,17 @@ restore_cron_from_backup() {
   return 0
 }
 
+# THE SAME BLIND RESTORE, ON THE UNWIND PATH (o3d-p9dq, Codex r27 HIGH #1, "deploy and update
+# contain the same blind restore"). This one runs from the exit trap, where something may well be
+# serving — so it is routed through the identical plan rather than being the one restore that
+# still overwrites a committed save. A divergence it cannot merge is reported as a failure and the
+# caller prints the by-hand command, which is what it already did for a lock it could not take.
 restore_cron_from_backup_locked() {
-  crontab -u "${APP_USER}" "${CRON_BACKUP}" || return 1
+  local current backup
+  current="$(crontab -u "${APP_USER}" -l 2>/dev/null || true)"
+  backup="$(cat "${CRON_BACKUP}" 2>/dev/null)" || return 1
+  plan_crontab_unfence "${backup}" "${current}" || return 1
+  printf '%s\n' "${CRON_UNFENCE_TEXT}" | crontab -u "${APP_USER}" - || return 1
   rm -f "${CRON_BACKUP}"
   CRON_FENCED=false
   CRON_BACKUP_CREATED=false
@@ -6699,15 +6764,13 @@ if ${UPGRADE_EXISTING}; then
   # window (o3d-2sm1.4, Codex r3 HIGH).
   stop_legacy_launchers
 
-  if command -v ss >/dev/null 2>&1; then
-    for _ in $(seq 1 15); do
-      ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${APP_PORT}\$" || break
-      sleep 1
-    done
-    if ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${APP_PORT}\$"; then
-      die "Port ${APP_PORT} is still bound. Something is still serving — refusing to migrate."
-    fi
-  fi
+  # AND THE DRAIN IS PROVED, NOT ATTEMPTED (o3d-p9dq, Codex r27 HIGH #3). This block used to run
+  # only `if command -v ss` and fall straight through to the fence when it did not — a missing tool
+  # read as a proof of absence, at the one proof the fence below now rests on. require_port_drained
+  # answers only from a census that actually ran; everything else is fatal here, BEFORE the crontab
+  # is fenced and long before anything is migrated.
+  require_port_drained "${APP_PORT:-}" || die \
+    "The drain could not be PROVED before fencing the cron writers and migrating: ${PORT_DRAIN_REASON}. Since the cron fence moved below the stop, \"nothing is serving\" is the premise it rests on — the exclusion that reaches a predecessor built before the shared lock is that it is not running, and no lock this script takes can substitute for it. Install iproute2, or stop whatever still holds the port, and re-run. NOTHING HAS BEEN MIGRATED."
   success "Nothing is serving ${APP_NAME} any more."
 
   # ---------------------------------------------------------------------------
