@@ -17,6 +17,7 @@ import {
 } from '@/lib/crontab-sync'
 import { getIntegrationPluginState, isIntegrationModuleVisible } from '@/lib/integration-plugins'
 import { getPublicAppUrl } from '@/lib/public-app-url'
+import { withCrontabReconcileLock, type HeldCrontabReconcileLock } from '@/lib/crontab-reconcile-lock'
 
 /**
  * THE CRONTAB RECONCILIATION, SEPARATED FROM ITS PERMISSION GATE (o3d-osl8 round 9, finding 4).
@@ -63,51 +64,31 @@ export type CrontabReconcileResult = {
   followUpError?: string
 }
 
+/**
+ * SERIALIZED, AND THE SERIALIZATION COVERS THE SNAPSHOT (Codex r21 HIGH).
+ *
+ * Everything from reading the settings to writing the crontab happens under ONE cross-process lock,
+ * so two saves committing opposite enablement cannot end with the earlier snapshot writing last —
+ * the state the previous round removed by a different route: an enablement row on, no cron line,
+ * and every caller reporting success. The whole argument, including why a lock taken after the
+ * snapshot would not have helped and why a session advisory lock is the right risk class for a
+ * derived, re-derivable artefact, is in lib/crontab-reconcile-lock.ts.
+ *
+ * THE LOCK IS TAKEN HERE, NOT AT THE CALL SITES, and that is deliberate. Six server actions
+ * reconcile the crontab — `savePublicAppUrl`, `saveBackupScheduleSettings`,
+ * `saveIntegrationPluginState`, `saveCronJobSettings`, `saveOnboardingPluginState` and the gated
+ * `syncCrontab` — and a seventh will be added by someone who has not read this file. A rule that
+ * every caller must remember to wrap is a rule that will be broken; taking it inside the only
+ * function that touches the crontab makes coverage a property of the code rather than of a habit.
+ *
+ * The audit row and the cache revalidation stay OUTSIDE the lock: they observe a write that has
+ * already happened and cannot change it, so holding the exclusion across them would only make every
+ * other reconciliation wait for a log insert.
+ */
 export async function reconcileCrontab(): Promise<CrontabReconcileResult> {
-  const secret = await getCronSecret()
-  if (!secret) {
-    return { success: false, error: 'Cron secret is not configured.' }
-  }
-
-  const baseUrl = await getPublicAppUrl()
-  if (!baseUrl) {
-    return { success: false, error: 'Public app URL is not configured.' }
-  }
-  const pluginState = await getIntegrationPluginState()
-  const jobs = getAllCronJobs().filter((job) => isIntegrationModuleVisible(job.module, pluginState))
-
-  // Read enabled/schedule settings for every registered job, plus legacy keys
-  const settingKeys = jobs.flatMap((j) => [
-    `cron_${j.settingKey}_enabled`,
-    `cron_${j.settingKey}_schedule`,
-  ])
-  const legacyKeys = jobs
-    .filter((j) => j.legacyEnabledKey)
-    .map((j) => j.legacyEnabledKey!)
-
-  const rows = await db.setting.findMany({
-    where: { key: { in: [...settingKeys, ...legacyKeys] } },
-  })
-  const settings = new Map(rows.map((r) => [r.key, r.value]))
-
-  const logPath = process.env.OTI_CRON_LOG_PATH?.trim() || undefined
-  const block = buildOtiCrontabBlock({ jobs, settings, secretRef: resolveSecretRef(secret), baseUrl, logPath })
-  if (!block.ok) return { success: false, error: block.error }
-
-  const existingCrontab = await readOwnCrontab()
-  const newCrontab = spliceOtiBlock(existingCrontab, block.lines)
-
-  const result = await new Promise<{ success: boolean; error?: string }>((resolve) => {
-    const proc = execFile('crontab', ['-'], { timeout: 5000 }, (err) => {
-      if (err) {
-        resolve({ success: false, error: `crontab write failed: ${err.message}` })
-      } else {
-        resolve({ success: true })
-      }
-    })
-    proc.stdin?.write(newCrontab)
-    proc.stdin?.end()
-  })
+  const outcome = await withCrontabReconcileLock(applyCrontabFromSettings)
+  if (!outcome.locked) return { success: false, error: outcome.error }
+  const result = outcome.result
 
   // THE CRONTAB IS ALREADY WRITTEN, OR ALREADY NOT (Codex r20 MEDIUM). Nothing below can change
   // that, so nothing below may turn `result` into a failure. `unstable_rethrow` runs first for the
@@ -141,6 +122,75 @@ export async function reconcileCrontab(): Promise<CrontabReconcileResult> {
   }
 
   return result
+}
+
+/**
+ * The read-modify-write itself: SNAPSHOT the settings, read the crontab, write the crontab.
+ *
+ * Not exported, and called from exactly one place — `reconcileCrontab` above, under the lock. All
+ * three steps belong to one another; a caller that ran this without the lock would reintroduce the
+ * defect in full, which is why there is nothing here for anyone else to reach.
+ */
+async function applyCrontabFromSettings(
+  lock: HeldCrontabReconcileLock,
+): Promise<{ success: boolean; error?: string }> {
+  const secret = await getCronSecret()
+  if (!secret) {
+    return { success: false, error: 'Cron secret is not configured.' }
+  }
+
+  const baseUrl = await getPublicAppUrl()
+  if (!baseUrl) {
+    return { success: false, error: 'Public app URL is not configured.' }
+  }
+  const pluginState = await getIntegrationPluginState()
+  const jobs = getAllCronJobs().filter((job) => isIntegrationModuleVisible(job.module, pluginState))
+
+  // Read enabled/schedule settings for every registered job, plus legacy keys
+  const settingKeys = jobs.flatMap((j) => [
+    `cron_${j.settingKey}_enabled`,
+    `cron_${j.settingKey}_schedule`,
+  ])
+  const legacyKeys = jobs
+    .filter((j) => j.legacyEnabledKey)
+    .map((j) => j.legacyEnabledKey!)
+
+  const rows = await db.setting.findMany({
+    where: { key: { in: [...settingKeys, ...legacyKeys] } },
+  })
+  const settings = new Map(rows.map((r) => [r.key, r.value]))
+
+  const logPath = process.env.OTI_CRON_LOG_PATH?.trim() || undefined
+  const block = buildOtiCrontabBlock({ jobs, settings, secretRef: resolveSecretRef(secret), baseUrl, logPath })
+  if (!block.ok) return { success: false, error: block.error }
+
+  const existingCrontab = await readOwnCrontab()
+  const newCrontab = spliceOtiBlock(existingCrontab, block.lines)
+
+  // THE EXCLUSION MUST STILL EXIST AT THE MOMENT OF THE WRITE. PostgreSQL frees a session advisory
+  // lock the instant its connection dies, so from that instant another reconciliation can be
+  // running — and this one is holding a snapshot it took believing it was alone. Reporting a
+  // failure sends the operator to Save & Apply, which re-derives the crontab from the committed
+  // rows; writing anyway would silently reinstate the interleaving this lock exists to prevent.
+  if (lock.lost) {
+    return {
+      success: false,
+      error: 'The crontab reconciliation lock was lost before the write, so the crontab was not '
+        + 'changed. Re-apply from Settings -> System -> Scheduler.',
+    }
+  }
+
+  return new Promise<{ success: boolean; error?: string }>((resolve) => {
+    const proc = execFile('crontab', ['-'], { timeout: 5000 }, (err) => {
+      if (err) {
+        resolve({ success: false, error: `crontab write failed: ${err.message}` })
+      } else {
+        resolve({ success: true })
+      }
+    })
+    proc.stdin?.write(newCrontab)
+    proc.stdin?.end()
+  })
 }
 
 export function readOwnCrontab(): Promise<string> {
