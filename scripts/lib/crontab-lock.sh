@@ -230,8 +230,22 @@ prepare_crontab_lock() {
 CRONTAB_LOCK_CONFLICT=75
 CRONTAB_LOCK_HELD=false
 
+# THE ONE EXEMPTION, STATED HERE RATHER THAN SPELLED OUT AT EACH CALL SITE. deploy.sh and update.sh
+# have a --dry-run that is documented to work unprivileged: it takes no root action, and every
+# crontab body it reaches returns after PRINTING what it would do and before any `crontab -` write.
+# There is nothing for an exclusion to protect, and taking one would mean requiring root and a
+# prepared lock file for a mode whose whole point is that it needs neither. The entrypoints set this
+# from their own DRY_RUN and it is false everywhere else; tests/settings/crontab-reconcile-
+# serialization.test.ts asserts that this is the ONLY path through with_crontab_lock that does not
+# hold the lock, and that no crontab WRITE is reachable under it.
+CRONTAB_LOCK_DRY_RUN=false
+
 with_crontab_lock() {
   local rc=0
+  if ${CRONTAB_LOCK_DRY_RUN}; then
+    "$@" || rc=$?
+    return "${rc}"
+  fi
   if ${CRONTAB_LOCK_HELD}; then
     "$@" || rc=$?
     return "${rc}"

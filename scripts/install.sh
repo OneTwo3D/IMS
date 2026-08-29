@@ -7539,7 +7539,7 @@ CRON_BOOTSTRAP_WRITTEN=no
 # on fd 9 for the whole run, so `exec 9<` replaced that descriptor — releasing the cutover lock —
 # and `exec 9>&-` then left the run holding no cutover lock at all. with_crontab_lock() scopes its
 # descriptor to a command group and uses fd 7.
-bootstrap_managed_crontab_block() {
+bootstrap_managed_crontab_block_locked() {
   # BOOTSTRAP, NOT RECONCILE (Codex r22 HIGH). The block below carries the INSTALLER's default
   # schedules, not the operator's committed settings, so writing it over an existing managed block
   # would revert every schedule choice made in the app — the same "the crontab disagrees with the
@@ -7596,7 +7596,7 @@ bootstrap_managed_crontab_block() {
 }
 
 CRON_BOOTSTRAP_RC=0
-with_crontab_lock bootstrap_managed_crontab_block || CRON_BOOTSTRAP_RC=$?
+with_crontab_lock bootstrap_managed_crontab_block_locked || CRON_BOOTSTRAP_RC=$?
 if [[ "${CRON_BOOTSTRAP_RC}" -ne 0 ]]; then
   # FAIL SAFE, DO NOT ABORT. Writing without the lock is the defect itself, and a held lock means
   # the app is reconciling right now — which also means the block above would have been skipped.

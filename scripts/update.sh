@@ -681,6 +681,23 @@ source "${IMS_SCRIPT_LIB_DIR}/db-fence-protected.sh" || {
   echo "FATAL: ${IMS_SCRIPT_LIB_DIR}/db-fence-protected.sh could not be sourced. It decides which bytes the connection fence may be executed with, and without it this run cannot fence a migration window. Nothing has been changed." >&2
   exit 1
 }
+# AND THE CRONTAB EXCLUSION (o3d-p9dq, Codex r26 HIGH). Round 22 gave install.sh an flock over the
+# ${APP_USER} crontab and left this script outside it, so every fence, unfence and unwind below was
+# an unserialized read-modify-write racing the six server actions that reconcile the same crontab
+# from a browser. One protocol, stated once, joined by all three entrypoints.
+# shellcheck source=lib/crontab-lock.sh
+source "${IMS_SCRIPT_LIB_DIR}/crontab-lock.sh" || {
+  echo "FATAL: ${IMS_SCRIPT_LIB_DIR}/crontab-lock.sh could not be sourced. It is the only exclusion between this script's crontab writes and the running application's, and without it a cutover can silently discard a schedule an operator has just saved. Nothing has been changed." >&2
+  exit 1
+}
+# The lock lives inside the service's systemd StateDirectory, which is ${DATA_DIR} — the same path
+# scripts/install.sh writes into the unit as StateDirectory= and the same one the application is
+# handed as $STATE_DIRECTORY. The two components come from the library.
+crontab_lock_paths "${DATA_DIR}"
+# --dry-run is documented to work unprivileged, and every crontab body it reaches returns after
+# printing what it would do and before any write. See the library for why that is the one path
+# through with_crontab_lock that does not hold the lock.
+CRONTAB_LOCK_DRY_RUN="${DRY_RUN}"
 
 # ---------------------------------------------------------------------------
 # THE DIGEST-REPORT MODE, AND IT IS THE FIRST THING THAT CAN HAPPEN AFTER THE LIBRARY IS READ
@@ -3080,6 +3097,15 @@ restore_cron_from_backup() {
   command -v crontab >/dev/null 2>&1 || return 0
   $CRON_BACKUP_CREATED || return 0
   [[ -f "${CRON_BACKUP}" ]] || return 1
+  # UNDER THE LOCK, because this one can run while something is serving: the pre-stop branch of the
+  # exit trap calls it through unwind_arming() with the old version untouched. A conflict is a
+  # FAILURE here rather than a skip — the caller prints the by-hand command — because a silent skip
+  # leaves a fenced crontab behind while reporting that everything was undone.
+  with_crontab_lock restore_cron_from_backup_locked || return 1
+  return 0
+}
+
+restore_cron_from_backup_locked() {
   crontab -u "${APP_USER}" "${CRON_BACKUP}" || return 1
   rm -f "${CRON_BACKUP}"
   CRON_FENCED=false
@@ -3320,9 +3346,22 @@ publish_cron_backup() {
   return 0
 }
 
+# FENCE THE CRON WRITERS. Called ONLY where nothing is serving — after `systemctl stop` and after
+# :${APP_PORT} has been proved free — and it still takes the lock. The two cover different sets
+# (o3d-p9dq, Codex r26 HIGH): the DRAIN is the only thing that excludes a PREDECESSOR build, whose
+# reconciliation was written before this flock existed and cannot join it; the LOCK is what excludes
+# every writer that comes after, and it is what makes the `crontab -l` below and the `crontab -` at
+# the end of it ONE critical section rather than two — a reconciliation committing between them is
+# discarded by a backup taken before it, and restored over later.
 fence_cron() {
   command -v crontab >/dev/null 2>&1 || return 0
+  local rc=0
+  with_crontab_lock fence_cron_locked || rc=$?
+  [[ "$rc" -eq 0 ]] || die \
+    "The ${APP_USER} crontab could not be fenced$(if [[ "$rc" -eq "$CRONTAB_LOCK_CONFLICT" ]]; then printf ' because another process held %s for %ss — the application is reconciling the crontab, or a process is wedged holding that lock' "$CRONTAB_LOCK_FILE" "$CRONTAB_LOCK_WAIT_SECONDS"; fi). Fencing it without that lock is the defect this protocol exists to prevent: a reconciliation committing between the snapshot and the replacement would be silently discarded. NOTHING HAS BEEN MIGRATED."
+}
 
+fence_cron_locked() {
   local current active
   current="$(crontab -u "${APP_USER}" -l 2>/dev/null || true)"
   [[ -n "$current" ]] || { info "No crontab for ${APP_USER}."; return 0; }
@@ -3345,7 +3384,7 @@ fence_cron() {
     # THIS run's backup, so the arming unwind may restore from it and delete it — and it is
     # only ever at that path once it is complete, verified and owned.
     publish_cron_backup "$current" || die \
-      "The ${APP_USER} crontab could not be backed up to ${CRON_BACKUP}, so this run will not fence the cron writers: a fence whose backup cannot be verified is a crontab nobody can put back. Nothing was left behind at ${CRON_BACKUP}. Nothing has been stopped and nothing has been migrated."
+      "The ${APP_USER} crontab could not be backed up to ${CRON_BACKUP}, so this run will not fence the cron writers: a fence whose backup cannot be verified is a crontab nobody can put back. Nothing was left behind at ${CRON_BACKUP}. The service IS STOPPED at this point — the fence is taken after the drain, so that no predecessor can write the crontab between the snapshot and the replacement — and NOTHING HAS BEEN MIGRATED."
   fi
   printf '%s\n' "$current" \
     | awk '{ if ($0 ~ /^[[:space:]]*[^#[:space:]]/) print "#DEPLOY-FENCE# " $0; else print $0 }' \
@@ -3354,8 +3393,19 @@ fence_cron() {
   success "Cron writers fenced."
 }
 
+# UNFENCE. Unlike the fence, this runs while the new build IS SERVING — the health check and the
+# build proof are above it — so DRAINING covers nothing here and the lock is the only exclusion
+# there is. It is sufficient, and for a reason the fence cannot rely on: the process that can race
+# this one was built by THIS run, so it participates in this protocol by construction.
 unfence_cron() {
   $CRON_FENCED || return 0
+  local rc=0
+  with_crontab_lock unfence_cron_locked || rc=$?
+  [[ "$rc" -eq 0 ]] || die \
+    "The ${APP_USER} crontab is still FENCED (every line commented out) because this run could not take ${CRONTAB_LOCK_FILE}$(if [[ "$rc" -eq "$CRONTAB_LOCK_CONFLICT" ]]; then printf ' within %ss' "$CRONTAB_LOCK_WAIT_SECONDS"; fi). The application is up and the migration is complete; put the schedule back by hand once nothing is reconciling:  crontab -u ${APP_USER} ${CRON_BACKUP}"
+}
+
+unfence_cron_locked() {
   if $DRY_RUN; then
     echo -e "${YELLOW}[DRY]${RESET}   would restore the ${APP_USER} crontab verbatim from ${CRON_BACKUP}"
     return 0
@@ -3427,13 +3477,26 @@ predecessor_is_active() {
 # Order matters: the crontab is restored FIRST and a failure there is fatal BEFORE the fence
 # comes down, so a run that cannot finish the unwind leaves the marker exactly as it found it
 # and the next run adopts the same phase again.
+resume_restore_cron_locked() {
+  crontab -u "${APP_USER}" "${CRON_BACKUP}" || return 1
+  rm -f "${CRON_BACKUP}"
+  CRON_FENCED=false
+  success "The ${APP_USER} crontab is back exactly as the interrupted run found it."
+  return 0
+}
+
 resume_from_interrupted_arming() {
+  # THE ONE SITE WHERE THE LOCK IS THE ONLY THING AVAILABLE AND IS NOT SUFFICIENT ON ITS OWN, said
+  # plainly (o3d-p9dq). This path exists precisely because the predecessor is STILL SERVING and must
+  # not be stopped, so draining is not on the table; and a crontab backup can only be here if a
+  # PREVIOUS run fenced it, which — on the rollout that introduces this protocol — was a run whose
+  # fence happened before the stop and whose predecessor did not take this lock. From the next
+  # rollout on, the serving process participates and the lock is complete. Since o3d-p9dq the
+  # cutover fence happens AFTER the stop, so an interrupted ARMING no longer leaves a fenced crontab
+  # at all and this branch only fires for a marker written by an older script.
   if command -v crontab >/dev/null 2>&1 && [[ -f "${CRON_BACKUP}" ]]; then
-    crontab -u "${APP_USER}" "${CRON_BACKUP}" || die \
-      "The interrupted run had fenced the ${APP_USER} crontab and its backup at ${CRON_BACKUP} could not be restored. Refusing to continue with the cron writers commented out: restore it by hand (crontab -u ${APP_USER} ${CRON_BACKUP}) and re-run. Nothing has been stopped."
-    rm -f "${CRON_BACKUP}"
-    CRON_FENCED=false
-    success "The ${APP_USER} crontab is back exactly as the interrupted run found it."
+    with_crontab_lock resume_restore_cron_locked || die \
+      "The interrupted run had fenced the ${APP_USER} crontab and its backup at ${CRON_BACKUP} could not be restored under ${CRONTAB_LOCK_FILE}. Refusing to continue with the cron writers commented out: restore it by hand (crontab -u ${APP_USER} ${CRON_BACKUP}) and re-run. Nothing has been stopped."
   fi
   release_db_connections || die \
     "A connection fence was standing over an UNTOUCHED schema and could not be released. Fix that before re-running; nothing has been stopped."
@@ -3453,6 +3516,11 @@ header "Preflight"
 
 if ! $DRY_RUN; then
   acquire_cutover_lock
+  # THE CRONTAB LOCK EXISTS BEFORE ANYTHING TOUCHES THE CRONTAB (o3d-p9dq). The adoption below is
+  # the first thing that does, and on a host installed by a release that predates this protocol
+  # there is no lock file yet — so this script prepares it exactly as scripts/install.sh does, from
+  # the same function, rather than discovering it is missing at the point it needs it.
+  prepare_crontab_lock
 fi
 
 # THE PORT IS RESOLVED HERE and is NOT yet fatal. It is resolved before the adoption below
@@ -3476,6 +3544,18 @@ adopt_cron_fence() {
   fi
   # The backup is the ORIGINAL crontab and must survive until this run finishes.
   CRON_FENCED=true
+  # UNDER THE LOCK, and the read and the re-fence under the SAME hold: the question "are lines
+  # active again?" and the answer "then comment them out" are one read-modify-write, and
+  # with_crontab_lock is reentrant by refusal, so the nested fence_cron below runs on this hold
+  # rather than deadlocking against it. This runs after the re-stop above but before the port has
+  # been proved free, so the lock is doing real work here.
+  local rc=0
+  with_crontab_lock adopt_cron_fence_locked || rc=$?
+  [[ "$rc" -eq 0 ]] || die \
+    "The ${APP_USER} crontab could not be re-fenced under ${CRONTAB_LOCK_FILE} while adopting the previous run's fence. Refusing to continue with cron writers that may be live over a schema the previous run may have moved."
+}
+
+adopt_cron_fence_locked() {
   local current active
   current="$(crontab -u "${APP_USER}" -l 2>/dev/null || true)"
   active="$(printf '%s\n' "${current}" | grep -cE '^[[:space:]]*[^#[:space:]]' || true)"
@@ -3878,7 +3958,23 @@ CUTOVER_ARMING=true
 install_reboot_fence "cutover started $(date -Iseconds)" \
   || die "Refusing to stop the old version without a verified reboot fence: a reboot mid-migration would start it again against a migrated schema."
 
-fence_cron
+# THE CRON FENCE USED TO BE HERE, AND THAT WAS THE RACE (o3d-p9dq, Codex r26 HIGH).
+#
+# `fence_cron` snapshots the crontab, backs the snapshot up verbatim and replaces the crontab with
+# a commented-out copy. Run at this point the old version is still serving, and six server actions
+# can start a reconciliation from a browser at any moment — so a schedule an operator saved between
+# the snapshot and the replacement went into a crontab this run was about to overwrite, and the
+# verbatim backup restored later did not contain it. The database and the UI went on reporting the
+# job enabled and nothing was scheduled to run it.
+#
+# ADDING THE FLOCK HERE WOULD NOT HAVE CLOSED IT. On the rollout that introduces the lock the old
+# version was built before the lock existed: it excludes itself with a PostgreSQL advisory lock, or
+# with nothing, and an flock taken here would have serialized this script against no one. The
+# exclusion that reaches a process built before this protocol is that it is not running.
+#
+# So the fence has moved below the stop and the port-free proof. What stays here is the REBOOT
+# fence, which must be installed before anything is stopped because a fence installed on the way out
+# does not exist for a run that is killed.
 
 # PHASE `stopping`. THIS is where the fence is armed, and not one line earlier: from the next
 # statement on, something has been asked to stop and nothing may start it again. Every failure
@@ -3894,6 +3990,37 @@ fi
 info "Stopping ${SERVICE_UNIT}"
 run systemctl stop "${SERVICE_UNIT}"
 success "Service stopped."
+
+# ...AND NOTHING IS BINDING THE PORT ANY MORE (o3d-p9dq). `systemctl stop` returning says the unit's
+# processes are gone; it says nothing about a listener that was never the unit's. install.sh and
+# deploy.sh have both refused to migrate past a bound port for several rounds and this script did
+# not, which mattered the moment the cron fence moved below the stop: "nothing is serving" is the
+# premise the fence now rests on, so it is established rather than assumed.
+if ! $DRY_RUN && [[ -n "${APP_PORT:-}" ]] && command -v ss >/dev/null 2>&1; then
+  for _ in $(seq 1 15); do
+    ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${APP_PORT}\$" || break
+    sleep 1
+  done
+  if ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${APP_PORT}\$"; then
+    die "Port ${APP_PORT} is still bound after ${SERVICE_UNIT} was stopped. Something is still serving — refusing to fence the crontab or migrate while it can write. (ss -ltnp | grep :${APP_PORT})"
+  fi
+  success "Nothing is listening on :${APP_PORT} any more."
+fi
+
+# ---------------------------------------------------------------------------
+# AND ONLY NOW ARE THE CRON WRITERS FENCED (o3d-p9dq, Codex r26 HIGH).
+#
+# Nothing is serving: the unit is stopped and :${APP_PORT} has just been proved free. That is what
+# makes the snapshot inside fence_cron safe against an OLD build, which no lock of ours can reach.
+# fence_cron additionally holds the shared crontab flock across its own `crontab -l` and
+# `crontab -`, which is what makes it safe against everything that comes after.
+#
+# STILL BEFORE THE DATABASE PROBE BELOW: a cron tick that opens a connection is exactly what
+# check-db-writers.mjs is about to refuse.
+# ---------------------------------------------------------------------------
+CURRENT_STEP="fence-cron"
+header "Fencing the cron writers"
+fence_cron
 
 # ---------------------------------------------------------------------------
 # @deploy-phase: drain-verify
