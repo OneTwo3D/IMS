@@ -1,6 +1,7 @@
 import { db } from '@/lib/db'
 import { DIRECT_CREATE_PENDING_ACTION } from '@/lib/fulfillment/pre-fulfilment-reallocation'
 import { UNRECORDED_POSTED_DOCUMENT_ACTION } from '@/lib/domain/accounting/unrecorded-posted-document'
+import { WC_REFUND_PARK_RECOVERED_ACTION } from '@/lib/domain/sales/refund-park-recovery'
 
 const DEFAULTS: Record<string, number> = {
   INFO: 30,
@@ -33,8 +34,24 @@ const DEFAULTS: Record<string, number> = {
  * for one reference was the accident. Ageing it out does not expire a log line, it converts a recorded
  * duplicate into an invisible one — the exact outcome the branch that writes it exists to prevent.
  *
- * A kind-(2) exemption does NOT need a clearing mechanism, and demanding one would be asking for the
- * wrong thing: the resolution happens in Xero, by a person voiding or crediting the duplicate, and IMS
+ * (3) EVIDENCE A LATER WRITE TO THE ACCUSED ROW CANNOT REACH. `wc_refund_park_recovered` (o3d-xnwu
+ * r14; Codex r14 HIGH) says: an operator moved or dismissed a parked WooCommerce refund on this
+ * `shopping_sync_logs` row. Check 7 of the 20260822120000 migration's verify.sql exists precisely
+ * because THAT ROW CAN AFTERWARDS BE MADE TO LOOK INNOCENT — the predecessor's held-invoice writer
+ * overwrites its payload, externalId, message and status wholesale, and every check that reads the
+ * row alone then returns zero over a destroyed accounting payload. This entry is the only thing
+ * left that says the row was ever recovered, and it is not history: it is the join target of a
+ * correctness check that runs at a cutover, which may be a year after the recovery.
+ *
+ * It is a WARNING, so the default 60-day sweep would have deleted it — silently, and first for the
+ * OLDEST incidents, which are the ones nobody has looked at. A check whose evidence a retention
+ * cron can delete is not a check. Bounded the same way kind (2) is: one row per operator recovery
+ * of a stale cross-order refund park, each of them an exception a human already had to sit in front
+ * of. The other half of the fix is in the writer — `recoverParkedWcRefund` now writes this entry
+ * INSIDE the recovery transaction, so the recovery cannot commit without it.
+ *
+ * A kind-(2) or kind-(3) exemption does NOT need a clearing mechanism, and demanding one would be
+ * asking for the wrong thing: the resolution happens in Xero, by a person voiding or crediting the duplicate, and IMS
  * cannot observe that. What it needs instead is to be bounded, and it is — one row per incident, and an
  * incident requires a claim to age out WHILE its request is on the wire and the replacement to post and
  * record before the displaced worker returns. Each one is an operator-facing exception that somebody is
@@ -44,10 +61,10 @@ const DEFAULTS: Record<string, number> = {
  * The predicate is `<> ALL`, NOT `<> ANY`. `action <> ANY(ARRAY['a','b'])` is true when the
  * action differs from AT LEAST ONE element, so `'a' <> 'b'` alone satisfies it and a row whose
  * action IS exempt gets deleted anyway. With one entry the two forms agree, which is exactly
- * what makes it a landmine: it would work until the day someone added a second action. THIS IS THAT
- * DAY — the array below now has two entries, and `<> ALL` is what makes both of them hold.
+ * what makes it a landmine: it would work until the day someone added a second action. THAT DAY
+ * CAME — the array below now has three entries, and `<> ALL` is what makes all of them hold.
  */
-const RETAINED_ACTIONS = [DIRECT_CREATE_PENDING_ACTION, UNRECORDED_POSTED_DOCUMENT_ACTION]
+const RETAINED_ACTIONS = [DIRECT_CREATE_PENDING_ACTION, UNRECORDED_POSTED_DOCUMENT_ACTION, WC_REFUND_PARK_RECOVERED_ACTION]
 
 const DELETE_BATCH_SIZE = 10_000
 const DEFAULT_CRON_RUN_RETENTION_DAYS = 90

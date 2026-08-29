@@ -407,3 +407,36 @@ test('the recorded attempt reaches the decision as MESSAGE material and nothing 
   assert.ok(!body.includes('ownClaimInvoiceNumber'), 'no parameter may claim the attempt proves ownership')
   assert.ok(!body.includes('invoiceNumberClaim'), 'the claim column and its inference are retired')
 })
+
+test('the hold STAMPS the family it belongs to, and its own queue selects on that stamp (o3d-xnwu r8)', async () => {
+  // o3d-xnwu r8 (Codex HIGH). A hold shares connector, direction, `SalesOrder`, PENDING and a
+  // non-null entityId with a WooCommerce refund park, so the two families were indistinguishable to
+  // every predicate built from this table's scalars — and BOTH predicates were built from them. The
+  // park's recovery inbox listed holds; this queue, which does a findFirst and then UPDATES what it
+  // finds, selected parks on `payload.reason` — a field the store owns.
+  //
+  // The writer and the reader are pinned together because either alone is useless: a hold written
+  // without the stamp is a hold its own release sweep cannot find, i.e. an order that is never
+  // invoiced, which is the exact defect the hold exists to end.
+  const src = source(ORDER_IMPORT)
+  const hold = src.indexOf('async function holdWcSalesInvoiceForMissingNumber(')
+  assert.ok(hold > 0, 'the hold writer must exist')
+  const holdBody = src.slice(hold, src.indexOf('\n/**', hold + 1))
+  assert.ok(
+    holdBody.includes('recordKind: HELD_SALES_INVOICE_RECORD_KIND,'),
+    'the hold must name its own family in a column, not only in the payload the release validates',
+  )
+
+  const { HELD_SALES_INVOICE_RECORD_KIND, heldSalesInvoiceQueueWhere } =
+    await import('@/lib/connectors/woocommerce/sync/held-sales-invoice')
+  const where = heldSalesInvoiceQueueWhere({ salesOrderId: 'so-1' }) as Record<string, unknown>
+  assert.equal(
+    where.recordKind,
+    HELD_SALES_INVOICE_RECORD_KIND,
+    'and the queue must select on the same constant the writer stamps',
+  )
+
+  // The park's constant is a DIFFERENT value, or the column separates nothing.
+  const { WC_REFUND_PARK_RECORD_KIND } = await import('@/lib/domain/sales/refund-park-recovery')
+  assert.notEqual(HELD_SALES_INVOICE_RECORD_KIND, WC_REFUND_PARK_RECORD_KIND)
+})

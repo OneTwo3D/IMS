@@ -1,7 +1,6 @@
 'use server'
 
 import { revalidatePath } from 'next/cache'
-import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { mergeStuckDispatchRows } from '@/lib/domain/wms/exception-inbox'
 import {
@@ -35,7 +34,7 @@ import {
   readFollowUpObligationDatabaseNow,
 } from '@/lib/domain/accounting/follow-up-obligation-registry'
 import { withDispatchSweepLockOrSkip } from '@/lib/domain/wms/dispatch-sweep-lock'
-import { logActivity } from '@/lib/activity-log'
+import { logActivity, logActivityInTransaction } from '@/lib/activity-log'
 import { freshAuthFailureResult, requireFreshPermission, requirePermission } from '@/lib/auth/server'
 import {
   IntegrationOutboxAdminError,
@@ -52,6 +51,7 @@ import { syncRefundsForOrder } from '@/lib/connectors/woocommerce/sync/refund-sy
 import { wcFetch } from '@/lib/connectors/woocommerce/api'
 import {
   RECOVERABLE_REFUND_PARK_STATUSES,
+  activeRefundParkWhere,
   buildRefundParkDismissData,
   buildRefundParkReassignData,
   describeRefundParkRecoverability,
@@ -67,6 +67,7 @@ import {
   type RefundParkRecoveryRefusalCode,
   type RefundParkView,
   type WcOrderRefundEvidence,
+  WC_REFUND_PARK_RECOVERED_ACTION,
 } from '@/lib/domain/sales/refund-park-recovery'
 // o3d-w00 (Codex r7 #3): the pure payload→order-line link, imported from its own module rather than
 // through the sync — the inbox needs the link, not a WooCommerce client.
@@ -489,27 +490,29 @@ const OUTBOX_FAILURE_STATUSES = [
   INTEGRATION_OUTBOX_STATUS.PERMANENT_FAILED,
 ]
 
-// Codex P2: order-import writes FROM_CONNECTOR/SalesOrder rows too (failed
-// imports have NO entityId; the missing-FX queue rows have NO entityId and a
-// payload.reason marker). Refund-sync rows always carry entityId = the IMS
-// order id, so require it — and exclude the FX-queue marker defensively so a
-// future entityId-carrying FX row can never be "retried" as a refund. The
-// exclusion must explicitly admit SQL-NULL payloads (refund-sync's FAILED rows
-// carry none): a JSON-path NOT predicate silently drops NULL rows.
-const REFUND_PARK_WHERE = {
-  connector: 'woocommerce',
-  direction: 'FROM_CONNECTOR' as const,
-  entityType: 'SalesOrder',
-  // QUARANTINED (o3d-w00 #2/#5 / o3d-iup): a monetary-only refund deliberately parked because the order
-  // isn't uniformly taxed. It has no SalesOrderRefund and the sweep skips it, so the exception inbox is
-  // the ONLY way an operator sees and recovers it — it must appear here alongside PENDING/FAILED.
-  status: { in: ['PENDING' as const, 'FAILED' as const, 'QUARANTINED' as const] },
-  entityId: { not: null },
-  OR: [
-    { payload: { equals: Prisma.DbNull } },
-    { NOT: { payload: { path: ['reason'], equals: 'missing_fx_rate' } } },
-  ],
-}
+/**
+ * WHAT COUNTS AS AN ACTIONABLE REFUND PARK — POSITIVELY (o3d-xnwu r7, Codex HIGH).
+ *
+ * This used to carry one more clause: every row whose payload's top-level `reason` equalled the
+ * pending-FX queue marker was EXCLUDED, to keep the missing-FX queue out of the inbox. A refund park
+ * persists the RAW WOOCOMMERCE REFUND, and `reason` on a WooCommerce refund is free text a human
+ * types when they issue it. So an operator who happened to type `missing_fx_rate` as their refund
+ * reason hid their own park from the one page that can recover it — and because a foreign park now
+ * HOLDS the refund delivery (see the cross-order guard in refund-sync.ts), that was not cosmetic: it
+ * was a permanent hold with no visible way to resolve it.
+ *
+ * The clause was also never the thing keeping FX rows out. Those rows carry no `entityId`, which
+ * `entityId: { not: null }` already excludes; the exclusion was a guess added on top, and the guess
+ * was the part that could be wrong. So the whole predicate now lives in one place, made of columns
+ * IMS writes — see `activeRefundParkWhere`, which the refund sync's cross-order guard and the park
+ * upsert use too, and which the pending-FX queue is disjoint from by construction rather than by
+ * inspection of payload contents.
+ *
+ * QUARANTINED (o3d-w00 #2/#5 / o3d-iup) is in the set deliberately: a monetary-only refund parked
+ * because the order isn't uniformly taxed has no SalesOrderRefund and the sweep skips it, so this
+ * inbox is the ONLY way an operator sees and recovers it.
+ */
+const REFUND_PARK_WHERE = activeRefundParkWhere()
 
 /**
  * Stuck dispatch reconciliations have no first-class entity (dispatch-sweep.ts
@@ -2040,11 +2043,18 @@ export async function recordRefundParkManually(
  * name on it; the ownership is evidence, not an assertion. The decision vocabulary — every refusal
  * and every patch — lives in lib/domain/sales/refund-park-recovery.ts as pure functions.
  *
- * THE AUDIT. logActivity is best-effort (it swallows its own errors), which is why the recovery note
- * is written onto the PARK ROW ITSELF in the same transaction as the status change: the fact that a
- * human recovered this park, and what WooCommerce said when they did, survives a logging failure.
- * o3d-batch-settle adds logActivityInTransaction for exactly this problem; when that lands, this
- * activity write should move inside the transaction rather than being duplicated here.
+ * THE AUDIT, AND WHY IT IS NOT BEST-EFFORT (o3d-xnwu r14, Codex HIGH). The recovery note is written
+ * onto the PARK ROW ITSELF in the same transaction as the status change, and so, now, is the
+ * `wc_refund_park_recovered` activity entry — with logActivityInTransaction, which does not catch.
+ *
+ * The two are not redundant, because THE ROW'S OWN NOTE CAN BE OVERWRITTEN. The predecessor's
+ * held-invoice writer takes a recovered park wholesale — payload, externalId, errorMessage, status
+ * — and leaves a row indistinguishable from a legitimate hold; that is the whole reason check 7 of
+ * the 20260822120000 migration's verify.sql looks at HISTORY rather than at the row. The activity
+ * entry is the half of the audit a later write to the row cannot reach, so it has to be exactly as
+ * durable as the recovery: written in the same transaction (this file), and exempt from
+ * activity-log retention (lib/activity-log-cleanup.ts), because a check whose evidence a cleanup
+ * cron deletes at 60 days is not a check.
  */
 export type RecoverRefundSyncParkInput = { observedOrderId: string } & (
   | { outcome: 'REASSIGN'; wcOrderId: number }
@@ -2463,43 +2473,64 @@ export async function recoverRefundSyncPark(
           },
         }
       }
+
+      // THE WITNESS, IN THE SAME TRANSACTION AS THE THING IT WITNESSES (o3d-xnwu r14, Codex HIGH).
+      //
+      // This entry is not a notification. It is the evidence check 7 of the 20260822120000
+      // migration's verify.sql joins to, and check 7 exists because THIS ROW CAN AFTERWARDS BE MADE
+      // TO LOOK INNOCENT: the predecessor's held-invoice writer overwrites the payload, externalId,
+      // message and status of a recovered park wholesale, and every check that reads the row alone
+      // then returns zero over a destroyed accounting payload.
+      //
+      // It used to be written with `logActivity` AFTER this transaction committed — and logActivity
+      // SWALLOWS ITS OWN FAILURES, so an ordinary transient write error, not merely a crash, left
+      // the recovery committed with nothing to join to and the check silently blind on that row.
+      // `logActivityInTransaction` does not catch: a witness that cannot be written takes the
+      // recovery down with it, the operator is told, and they retry. That is the right way round
+      // for a mutation that moves refund evidence between orders and whose only later audit is this
+      // entry. (Its other half — retention — is in lib/activity-log-cleanup.ts, which now exempts
+      // this action: a check whose evidence a cleanup cron deletes at 60 days is not a check.)
+      await logActivityInTransaction(tx, {
+        entityType: 'SYNC',
+        entityId: parkedOrderId,
+        tag: 'sync',
+        action: WC_REFUND_PARK_RECOVERED_ACTION,
+        // WARNING, not INFO: a human correcting an order association on a refund whose money has
+        // already left the business, on evidence the system could not act on by itself.
+        level: 'WARNING',
+        description: assertion.outcome === 'REASSIGN'
+          ? `Reassigned parked WooCommerce refund ${externalRefundId} from order ${parkedOrderId} to order `
+            + `${targetOrderId} after WooCommerce confirmed it on WC order ${evidence.wcOrderId}`
+          : `Dismissed the parked WooCommerce refund ${externalRefundId} on order ${parkedOrderId} after `
+            + `WooCommerce order ${evidence.wcOrderId} did not list it`,
+        metadata: {
+          shoppingSyncLogId: park.id,
+          externalRefundId,
+          outcome: assertion.outcome,
+          parkedOrderId,
+          targetOrderId,
+          // What was asked, and what came back — so the recovery can be re-judged later against the
+          // evidence it was actually made on rather than against WooCommerce as it is by then.
+          wcOrderId: evidence.wcOrderId,
+          wcRefundIds: [...evidence.refundIds],
+          wcFetchedAt: evidence.fetchedAt.toISOString(),
+          // How many complete walks the evidence had to survive. A dismissal is made on two that agreed;
+          // a reassign on one, because presence cannot be produced by a short list. Recorded so the
+          // recovery can be re-judged later on the standard of proof it was actually held to.
+          wcEvidenceReads: assertion.outcome === 'DISMISS' ? 2 : 1,
+          priorStatus: park.status,
+          userId: session.user.id,
+        },
+        // Required by logActivityInTransaction, and deliberately so: the session lookup logActivity
+        // falls back on is a React cache() read, which has no place inside a database transaction.
+        userId: session.user.id,
+      })
+
       return { ok: true as const }
     })
 
     if (!applied.ok) return { success: false, error: applied.refusal.message, code: applied.refusal.code }
 
-    await logActivity({
-      entityType: 'SYNC',
-      entityId: parkedOrderId,
-      tag: 'sync',
-      action: 'wc_refund_park_recovered',
-      // WARNING, not INFO: a human correcting an order association on a refund whose money has
-      // already left the business, on evidence the system could not act on by itself.
-      level: 'WARNING',
-      description: assertion.outcome === 'REASSIGN'
-        ? `Reassigned parked WooCommerce refund ${externalRefundId} from order ${parkedOrderId} to order `
-          + `${targetOrderId} after WooCommerce confirmed it on WC order ${evidence.wcOrderId}`
-        : `Dismissed the parked WooCommerce refund ${externalRefundId} on order ${parkedOrderId} after `
-          + `WooCommerce order ${evidence.wcOrderId} did not list it`,
-      metadata: {
-        shoppingSyncLogId: park.id,
-        externalRefundId,
-        outcome: assertion.outcome,
-        parkedOrderId,
-        targetOrderId,
-        // What was asked, and what came back — so the recovery can be re-judged later against the
-        // evidence it was actually made on rather than against WooCommerce as it is by then.
-        wcOrderId: evidence.wcOrderId,
-        wcRefundIds: [...evidence.refundIds],
-        wcFetchedAt: evidence.fetchedAt.toISOString(),
-        // How many complete walks the evidence had to survive. A dismissal is made on two that agreed;
-        // a reassign on one, because presence cannot be produced by a short list. Recorded so the
-        // recovery can be re-judged later on the standard of proof it was actually held to.
-        wcEvidenceReads: assertion.outcome === 'DISMISS' ? 2 : 1,
-        priorStatus: park.status,
-        userId: session.user.id,
-      },
-    })
     revalidatePath('/sync/exceptions')
     return { success: true, outcome: assertion.outcome, targetOrderId }
   } catch (error) {

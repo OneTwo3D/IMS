@@ -6,6 +6,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { INTERNAL_STATUS_TRANSITION_BYPASS } from '@/lib/sales/status-transition-bypass'
 import { isPermanentStatusTransitionError } from '@/lib/domain/sales/status-transition-errors'
+import type { ExternalFulfillmentRefusal } from '@/lib/fulfillment/external-fulfillment'
 import { wcFetch, wcPut } from '../api'
 import type { WcFullOrder } from './types'
 import { isWcStatus, readWcOrderStatus } from './status-mapping'
@@ -19,8 +20,18 @@ type SalesOrderStatus = string
 /**
  * `permanent: true` means a stable business rule refused the transition, so re-delivering the identical
  * webhook re-hits the identical rule. The caller acknowledges those instead of retrying (o3d-bx9).
+ *
+ * `refusal` is set only when a WC completion was refused by the external-fulfilment rules, and names
+ * WHICH rule. A caller that syncs the order's refunds after this — the order webhook does — must ask
+ * `externalFulfillmentRefusalAwaitsRefunds` before acting on `permanent`, because a coverage
+ * shortfall decided before those refunds land is decided from stale state (o3d-xnwu r2).
  */
-export async function syncWcOrderStatus(wcOrder: WcFullOrder): Promise<{ success: boolean; error?: string; permanent?: boolean }> {
+export async function syncWcOrderStatus(wcOrder: WcFullOrder): Promise<{
+  success: boolean
+  error?: string
+  permanent?: boolean
+  refusal?: ExternalFulfillmentRefusal
+}> {
   try {
     const link = await db.shoppingOrderLink.findUnique({
       where: {
@@ -75,7 +86,24 @@ export async function syncWcOrderStatus(wcOrder: WcFullOrder): Promise<{ success
     // Special case: WC completed → run completion flow
     if (isWcStatus(wcOrder.status, 'completed')) {
       const { processWcCompletion } = await import('./completion-flow')
-      await processWcCompletion(so.id, wcOrder)
+      // CONSUME the outcome (o3d-xnwu). This used to be `await processWcCompletion(...)` followed
+      // by an unconditional `{ success: true }`, so a completion that was REFUSED — the order's
+      // shipment lines under-covering ordered-net-of-refunds demand, or no physical stock to
+      // consume — was reported to the webhook as a clean success. The delivery was acknowledged,
+      // the order-sync cursor advanced, and nothing retried or dead-lettered.
+      const completion = await processWcCompletion(so.id, wcOrder)
+      if (completion.kind === 'refused') {
+        // The refusal CODE travels with the verdict (o3d-xnwu r2): the webhook sweeps this order's
+        // refunds after this call returns, and one of these refusals is answerable only once that
+        // sweep has run. Deciding here which refusals those are would put the knowledge in the
+        // wrong module; the caller asks the module that owns the taxonomy.
+        return {
+          success: false,
+          error: completion.error,
+          permanent: completion.permanent,
+          refusal: completion.refusal,
+        }
+      }
       return { success: true }
     }
 
