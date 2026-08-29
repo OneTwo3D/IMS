@@ -996,8 +996,15 @@ verify_created_database_endpoint() {
     CREATE ROLE "${probe_role}" LOGIN PASSWORD '${probe_password}';
 EOSQL
 
+  # THE SQL ARRIVES ON STDIN AND NOT THROUGH -c. psql performs NO variable interpolation on a
+  # -c string — it is handed to the server verbatim — so `:'dbname'` would reach PostgreSQL as a
+  # syntax error. On stdin it is psql that quotes the identifier and the literal, which is what
+  # keeps an operator-supplied database name out of the SQL grammar.
   probe_output="$(pg_endpoint_psql "${probe_role}" "${probe_password}" "${DB_NAME}" \
-    -q -tA -v dbname="${DB_NAME}" -c "$(pg_server_identity_select)" 2>&1)" || status=$?
+    -q -tA -v dbname="${DB_NAME}" <<EOSQL 2>&1
+$(pg_server_identity_select);
+EOSQL
+  )" || status=$?
   probe_identity="$(pg_extract_server_identity "${probe_output}")"
 
   pg_local_psql -q >/dev/null 2>&1 <<EOSQL || warn "The throwaway verification role ${probe_role} could not be dropped. Remove it by hand: DROP ROLE \"${probe_role}\";"
@@ -1042,9 +1049,15 @@ EOSQL
 # itself, and 42P04 is the same five bytes in every locale.
 create_database_and_record_newness() {
   local output="" status=0 created_identity=""
-  output="$(pg_local_psql -q -tA -v dbname="${DB_NAME}" \
-    -c 'CREATE DATABASE :"dbname"' \
-    -c "$(pg_server_identity_select)" 2>&1)" || status=$?
+  # ONE SESSION, ON STDIN: the identity is read on the connection that performed the CREATE, and
+  # ON_ERROR_STOP means the SELECT never runs if the CREATE did not. -c is not usable here —
+  # psql does no variable interpolation on a -c string, so `:"dbname"` would reach the server as
+  # a syntax error rather than as a quoted identifier.
+  output="$(pg_local_psql -q -tA -v dbname="${DB_NAME}" <<EOSQL 2>&1
+CREATE DATABASE :"dbname";
+$(pg_server_identity_select);
+EOSQL
+  )" || status=$?
   if [[ "${status}" -eq 0 ]]; then
     created_identity="$(pg_extract_server_identity "${output}")"
     [[ -n "${created_identity}" ]] || die "CREATE DATABASE '${DB_NAME}' succeeded but the server did not answer the identity question on the same connection, so this run cannot say WHICH server it created that database on. NOTHING HAS BEEN MIGRATED. psql said: ${output}"
