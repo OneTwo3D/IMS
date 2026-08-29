@@ -2138,6 +2138,14 @@ async function decideInvoicePaymentFollowUp(
    * raw payload expression left here for a default to be attached to, and a field added later has
    * nowhere in this file to acquire one.
    *
+   * o3d-batch-ret r11 (Codex HIGH): AND THE CURRENCY IT IS HANDED IS THE ONE THE DOCUMENT POSTED IN.
+   * The absent-`currency` arm used to be a `GBP` literal. It is now the organisation base currency,
+   * resolved once inside the fold — and that is the same currency this connector's document post
+   * ends up in, because an absent `currency` reaches the builder as `undefined`, the builder omits
+   * the key, the ledger denominates the document in its own base currency, and `connectQuickBooks` refuses to
+   * bind a ledger whose base currency is not `getBaseCurrencyCode()`. Document and payment
+   * therefore name one currency on a EUR-base installation exactly as they did on a GBP one.
+   *
    * The two configuration arms below differ only in WHICH sentence an operator reads. The remedy is
    * a SETTING — safe to repeat, and it cannot double anything — and what follows the correction is
    * read off this connector's registry entry, which says nothing re-drives the row.

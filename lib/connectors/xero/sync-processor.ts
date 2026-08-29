@@ -7151,6 +7151,15 @@ async function decideInvoicePaymentFollowUp(
    * `decideRequestedInvoicePayment`, which hands this caller only values that WERE read; there is no
    * raw payload expression left here for a default to be attached to.
    *
+   * o3d-batch-ret r11 (Codex HIGH): AND THE CURRENCY IT IS HANDED IS THE ONE THE DOCUMENT POSTED IN.
+   * The absent-`currency` arm used to be a `GBP` literal. It is now the organisation base currency,
+   * resolved once inside the fold — and that is the same currency this connector's document post
+   * ends up in, because an absent `currency` reaches the builder as `undefined`, `CurrencyCode` is
+   * dropped from the body, Xero denominates the invoice in the organisation's own base currency,
+   * and `connectXero` refuses to bind a tenant whose base currency is not `getBaseCurrencyCode()`.
+   * Document and payment therefore name one currency on a EUR-base installation exactly as they did
+   * on a GBP one.
+   *
    * The two configuration arms below differ only in WHICH sentence an operator reads. The remedy is
    * a SETTING — safe to repeat, and it cannot double anything — and what happens afterwards comes
    * from the connector's registry entry rather than from a promise written here.

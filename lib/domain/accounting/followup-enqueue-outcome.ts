@@ -477,21 +477,44 @@ function payloadPaymentMethod(payload: Record<string, unknown>): PayloadField<st
     : unreadableField('_paymentMethod', value, 'which is not a payment-method string')
 }
 
-/** The base currency an invoice that names none is settled in. */
-const BASE_PAYMENT_CURRENCY = 'GBP'
+/**
+ * THE ORGANISATION BASE CURRENCY, AS THE CLASSIFIER RECEIVES IT (o3d-batch-ret r11, Codex HIGH).
+ *
+ * It is a {@link PayloadField} for exactly the reason every payload field is one: "the base
+ * currency is EUR" and "the base currency could not be read" are different answers, and only the
+ * first may settle anything. And it ARRIVES as an argument — {@link resolveBasePaymentCurrency}
+ * is called once, in the fold — so the classifier below stays a pure function that cannot acquire
+ * a database read, and every arm of it is reachable from a table.
+ */
+type BasePaymentCurrency = PayloadField<string>
 
 /**
- * `currency` — THE FIELD WHERE THE OLD DEFAULT MOVED MONEY TO THE WRONG PLACE.
+ * `currency` — THE FIELD WHERE THE OLD DEFAULT MOVED MONEY TO THE WRONG PLACE, TWICE.
  *
  * `payload.currency as string || 'GBP'` answered `GBP` for an absent key, for a present `null`, and
- * for a present `''` alike. The first is a legitimate default. The other two are a currency
- * something wrote nothing into, and `lookupPaymentAccount(map, method, currency)` keys the BANK
- * ACCOUNT on it — so a EUR invoice whose currency did not survive persistence was settled into the
- * sterling account, and the amount was written onto the INVOICE_PAYMENT row as sterling too. A
- * present value must therefore NAME a currency; only absence may take the default.
+ * for a present `''` alike. The last two are a currency something wrote nothing into, and
+ * `lookupPaymentAccount(map, method, currency)` keys the BANK ACCOUNT on it — so a EUR invoice
+ * whose currency did not survive persistence was settled into the sterling account, and the amount
+ * was written onto the INVOICE_PAYMENT row as sterling too. Round 10 closed those two.
+ *
+ * ROUND 11 (Codex HIGH) IS THE THIRD ONE, AND IT IS THE DEFAULT NOBODY HAD QUESTIONED. The ABSENT
+ * arm kept a `GBP` LITERAL, and `Organisation.baseCurrency` is configurable. On a EUR-base
+ * installation the document itself posts in the base currency — an absent `currency` reaches the
+ * builders as `undefined`, and both of them omit the key (Xero's `CurrencyCode`, QuickBooks'
+ * `CurrencyRef`), so the ledger denominates the invoice in ITS OWN base currency, which
+ * `connectXero`/`connectQuickBooks` refuse to bind unless it equals `getBaseCurrencyCode()`. This
+ * classifier then called the same absence sterling, so the DOCUMENT was in EUR and its PAYMENT was
+ * looked up and stamped as GBP: either a `method:EUR` mapping was missed, or a `method:GBP` one was
+ * found and the money settled into the sterling account. The literal is gone; the absent arm is the
+ * resolved base currency, which is the same value the document was posted in.
+ *
+ * A PRESENT value must still NAME a currency; only absence may take the base.
  */
-function payloadPaymentCurrency(payload: Record<string, unknown>): PayloadField<string> {
-  if (!declaresField(payload, 'currency')) return { value: BASE_PAYMENT_CURRENCY }
+function payloadPaymentCurrency(
+  payload: Record<string, unknown>,
+  base: BasePaymentCurrency,
+): PayloadField<string> {
+  if (!declaresField(payload, 'currency')) return base
   const value = payload.currency
   return typeof value === 'string' && value.trim() !== ''
     ? { value }
@@ -556,7 +579,7 @@ export type PaymentRefusalContext = {
 }
 
 /**
- * WHICH OF THE THREE THINGS THE PAYLOAD FAILED TO STATE (o3d-batch-ret r10, Codex HIGH).
+ * WHICH OF THE FOUR THINGS THIS PATH COULD NOT ESTABLISH (o3d-batch-ret r10/r11, Codex HIGH).
  *
  * They share one reason code because they share one remedy, and they DO NOT share one sentence.
  * Round 8's message opens "the invoice asked for a payment to be registered and the persisted
@@ -573,6 +596,12 @@ export type UnreadablePaymentFact =
   | 'amount'
   /** A payment of a known amount was asked for and a field the registration is built from cannot be read. */
   | 'field'
+  /**
+   * The payload names NO currency — which is legitimate and the ordinary case — and the
+   * organisation base currency it would therefore be settled in could not be resolved
+   * (o3d-batch-ret r11). Nothing about the payload is wrong here, which is why it is not `field`.
+   */
+  | 'base-currency'
 
 /** A payment the payload asked for, or may have asked for, and could not describe. */
 export type UnreadablePaymentPayload = {
@@ -608,9 +637,12 @@ type InvoicePaymentRequest =
  * is what the refusal's activity-log metadata is built from and a refusal about the AMOUNT should
  * still say which method and currency the row named.
  */
-function invoicePaymentRequest(payload: Record<string, unknown>): InvoicePaymentRequest {
+function invoicePaymentRequest(
+  payload: Record<string, unknown>,
+  base: BasePaymentCurrency,
+): InvoicePaymentRequest {
   const method = payloadPaymentMethod(payload)
-  const currency = payloadPaymentCurrency(payload)
+  const currency = payloadPaymentCurrency(payload, base)
   const known: PaymentRefusalContext = {
     method: 'value' in method ? method.value : null,
     currency: 'value' in currency ? currency.value : null,
@@ -628,7 +660,15 @@ function invoicePaymentRequest(payload: Record<string, unknown>): InvoicePayment
   if (amount.kind === 'none') return { kind: 'none' }
 
   if ('detail' in method) return unreadable('field', method.detail)
-  if ('detail' in currency) return unreadable('field', currency.detail)
+  // WHICH refusal this is depends on WHOSE value could not be read, and `declaresField` is the same
+  // discriminator `payloadPaymentCurrency` used to pick the arm (o3d-batch-ret r11). A present
+  // unreadable `currency` is a corrupt PAYLOAD FIELD; an absent one whose base currency would not
+  // resolve is not a payload fault at all, and telling an operator to look at a field the payload
+  // legitimately omits is the r7/r8 defect — a clause true of one call site read at one where it is
+  // false.
+  if ('detail' in currency) {
+    return unreadable(declaresField(payload, 'currency') ? 'field' : 'base-currency', currency.detail)
+  }
   const paymentDate = payloadPaymentDate(payload)
   if ('detail' in paymentDate) return unreadable('field', paymentDate.detail)
 
@@ -636,6 +676,52 @@ function invoicePaymentRequest(payload: Record<string, unknown>): InvoicePayment
     kind: 'requested',
     payment: { amount: amount.amount, method: method.value, currency: currency.value, paymentDate: paymentDate.value },
   }
+}
+
+/**
+ * THE ONE PLACE THE ORGANISATION BASE CURRENCY IS RESOLVED FOR THIS DECISION (o3d-batch-ret r11,
+ * Codex HIGH).
+ *
+ * IT IS HERE, IN THE FOLD, AND NOT IN EITHER CONNECTOR. Codex asked that the document-post and
+ * follow-up paths agree about the currency, and "both connectors remember to resolve it the same
+ * way" is a convention, which is the thing this whole batch has been replacing with shape. The fold
+ * is already the only door onto the payment decision, so resolving it here makes divergence between
+ * the two connectors unwritable rather than merely unlikely, and a third connector inherits the
+ * agreement instead of having to be told about it.
+ *
+ * IT IS INJECTED INTO THE CLASSIFIER RATHER THAN REACHED FOR BY IT. `invoicePaymentRequest` and
+ * every field classifier under it stay pure functions of their arguments: a database read inside
+ * one of them would make the boundary untestable as a table and would put an I/O failure on a path
+ * that is meant to answer from bytes alone.
+ *
+ * IT IS RESOLVED UNCONDITIONALLY AND CONSULTED ONLY WHERE IT IS USED. A payload that NAMES its
+ * currency is unaffected by a base currency that will not resolve — `payloadPaymentCurrency`
+ * returns this value only on the ABSENT arm — so an installation whose organisation row is
+ * unreadable still settles every payment whose payload states its own currency.
+ *
+ * AND AN UNRESOLVABLE ONE REFUSES; IT DOES NOT FALL BACK. That is the same answer this axis has
+ * given for six rounds: an unknown is not a default. Note what is NOT unknown —
+ * `resolveBaseCurrencyCode` answers `org?.baseCurrency ?? DEFAULT_BASE_CURRENCY`, and that
+ * fallback is ESTABLISHED rather than assumed, because the connect-time guards compare the
+ * ledger's base currency against the very same expression: an installation with no organisation
+ * row cannot have a non-GBP ledger bound to it at all, so document and payment still agree. What
+ * IS unknown is a read that THREW (the row could not be consulted) or a `baseCurrency` holding no
+ * currency code, and neither of those may be spent as sterling.
+ *
+ * The import is dynamic for the reason `getPaymentAccountMap`'s is: this module is the payload
+ * boundary and is pulled in by callers that have no database at all.
+ */
+async function resolveBasePaymentCurrency(): Promise<BasePaymentCurrency> {
+  let code: unknown
+  try {
+    const { getBaseCurrencyCode } = await import('@/lib/base-currency')
+    code = await getBaseCurrencyCode()
+  } catch (error) {
+    return { detail: 'reading the organisation base currency failed: ' + (error instanceof Error ? error.message : String(error)) }
+  }
+  return typeof code === 'string' && code.trim() !== ''
+    ? { value: code }
+    : { detail: `\`Organisation.baseCurrency\` is ${describePresent(code)}, which is not a currency code` }
 }
 
 /**
@@ -689,7 +775,7 @@ export async function decideRequestedInvoicePayment(
     onInvalid: (unreadable: UnreadablePaymentPayload) => Promise<RefusedFollowUpEnqueue>
   },
 ): Promise<FollowUpEnqueueOutcome> {
-  const requested = invoicePaymentRequest(payload)
+  const requested = invoicePaymentRequest(payload, await resolveBasePaymentCurrency())
   switch (requested.kind) {
     case 'none':
       return FOLLOW_UPS_ENQUEUED
@@ -748,6 +834,22 @@ const UNREADABLE_PAYMENT_CLAUSES: Record<UnreadablePaymentFact, { asked: string;
     claim: 'AN UNREADABLE FIELD IS NOT ITS DEFAULT: this row does not state the value that was assumed for it — a '
       + 'currency read as sterling settles the money into the wrong bank account, and a date read as today dates the '
       + 'receipt wrongly in the ledger',
+  },
+  /**
+   * THE ONE WHERE THE PAYLOAD IS FINE AND THE INSTALLATION IS NOT (o3d-batch-ret r11, Codex HIGH).
+   *
+   * Omitting `currency` is the ordinary case, not a corruption: the document itself is then posted
+   * in the ledger's own base currency, which is pinned equal to `Organisation.baseCurrency` at
+   * connect time. So the sentence must NOT send an operator to look at the payload — there is
+   * nothing wrong with it — and it must not promise a payload rebuild will help, which is why this
+   * is a fact of its own rather than the `field` clause reused.
+   */
+  'base-currency': {
+    asked: 'the invoice asked for a payment to be registered, its payload names no currency of its own — which is '
+      + 'ordinary — and the organisation base currency the payment would therefore be settled in could not be resolved',
+    claim: 'AN UNRESOLVED BASE CURRENCY IS NOT STERLING: this row does not say the payment is in GBP, it says the '
+      + 'currency it would be settled in cannot be determined — and the bank account is keyed on that currency, so '
+      + 'assuming one selects an account by a currency nobody stated and stamps it onto the payment',
   },
 }
 
