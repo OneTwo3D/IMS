@@ -490,12 +490,10 @@ LOG_DIR="/var/log/${APP_NAME}"
 BACKUP_DIR="${DATA_DIR}/backups"
 UPLOAD_STORAGE_DIR="${DATA_DIR}/uploads"
 PUBLIC_UPLOAD_STORAGE_DIR="${DATA_DIR}/public-uploads"
-# The crontab reconciliation lock: a ROOT-OWNED file in a ROOT-OWNED subdirectory of the state
-# directory. Both halves are load-bearing and both are explained where the directory is prepared,
-# in section 8 (`prepare_crontab_lock`). The application derives the same two components from
-# $STATE_DIRECTORY (lib/crontab-reconcile-lock.ts).
-CRONTAB_LOCK_DIR="${DATA_DIR}/locks"
-CRONTAB_LOCK_FILE="${CRONTAB_LOCK_DIR}/.crontab-reconcile.lock"
+# The crontab reconciliation lock is composed from ${DATA_DIR} by crontab_lock_paths(), just
+# below the library that defines it — the two components live in scripts/lib/crontab-lock.sh and
+# nowhere else, because deploy.sh and update.sh compose the same path from their own state
+# directory and the application derives it from $STATE_DIRECTORY (lib/crontab-reconcile-lock.ts).
 NGINX_CONF="/etc/nginx/sites-available/${APP_NAME}"
 NODE_VERSION="22"
 DEPLOY_SSH_DIR="${DATA_DIR}/git-ssh"
@@ -890,6 +888,19 @@ source "${IMS_SCRIPT_LIB_DIR}/db-fence-protected.sh" || {
   echo "FATAL: ${IMS_SCRIPT_LIB_DIR}/db-fence-protected.sh could not be sourced. It decides which bytes the connection fence may be executed with, and without it this run cannot fence a migration window. Nothing has been changed." >&2
   exit 1
 }
+# AND THE CRONTAB EXCLUSION, for the same reason and out of the same tree (o3d-p9dq, Codex r26
+# HIGH). Round 25 had the flock in this file and nowhere else, so deploy.sh and update.sh — which
+# fence and unfence the SAME crontab around their own cutovers — wrote it unserialized. One
+# protocol cannot be restated in three scripts and stay one protocol, so it is stated once here:
+# prepare_crontab_lock() creates the root-owned lock, with_crontab_lock() is how every shell
+# read-modify-write of the crontab is performed, and crontab_lock_paths() composes the path all
+# four writers must agree on.
+# shellcheck source=lib/crontab-lock.sh
+source "${IMS_SCRIPT_LIB_DIR}/crontab-lock.sh" || {
+  echo "FATAL: ${IMS_SCRIPT_LIB_DIR}/crontab-lock.sh could not be sourced. It is the only exclusion between this script's crontab writes and the running application's, and without it a cutover can silently discard a schedule an operator has just saved. Nothing has been changed." >&2
+  exit 1
+}
+crontab_lock_paths "${DATA_DIR}"
 DB_OBJECT_ACCESS_SCRIPT="${APP_DIR}/scripts/check-app-db-object-access.mjs"
 # THE APPLICATION'S CONNECTION IDENTITY, WHICH THIS INSTALLER OWNS OUTRIGHT (o3d-2sm1.5 r19).
 #
@@ -4597,8 +4608,26 @@ publish_cron_backup() {
   return 0
 }
 
+# FENCE THE CRON WRITERS. Called ONLY where nothing is serving — after `systemctl stop`, after
+# `stop_legacy_launchers`, and after the port has been proved free — and it still takes the lock.
+#
+# BOTH, BECAUSE THEY COVER DIFFERENT SETS (o3d-p9dq, Codex r26 HIGH). The DRAIN is what excludes a
+# PREDECESSOR build: on the first rollout of this protocol the process that was serving this box
+# was built before the flock existed, so no lock this script takes can reach its reconciliation.
+# Only its being stopped can. The LOCK is what excludes every writer that comes later — a
+# reconciliation from a process running THIS build, and the other two entrypoints — and it is what
+# makes the snapshot and the replacement below one critical section rather than two, which is the
+# interleaving the finding was about: a reconciliation that commits between `crontab -l` and
+# `crontab -` is discarded by a backup taken before it, and restored over later.
 fence_cron() {
   command -v crontab >/dev/null 2>&1 || return 0
+  local rc=0
+  with_crontab_lock fence_cron_locked || rc=$?
+  [[ "${rc}" -eq 0 ]] || die \
+    "The ${APP_USER} crontab could not be fenced$(if [[ "${rc}" -eq "${CRONTAB_LOCK_CONFLICT}" ]]; then printf ' because another process held %s for %ss — the application is reconciling the crontab, or a process is wedged holding that lock' "${CRONTAB_LOCK_FILE}" "${CRONTAB_LOCK_WAIT_SECONDS}"; fi). Fencing it without that lock is the defect this protocol exists to prevent: a reconciliation committing between the snapshot and the replacement would be silently discarded. NOTHING HAS BEEN MIGRATED."
+}
+
+fence_cron_locked() {
   local current active
   current="$(crontab -u "${APP_USER}" -l 2>/dev/null || true)"
   [[ -n "${current}" ]] || { info "No crontab for ${APP_USER}; nothing to fence."; return 0; }
@@ -4613,7 +4642,7 @@ fence_cron() {
     # THIS run's backup, so the arming unwind may restore from it and delete it — and it is
     # only ever at that path once it is complete, verified and owned.
     publish_cron_backup "${current}" || die \
-      "The ${APP_USER} crontab could not be backed up to ${CRON_BACKUP}, so this run will not fence the cron writers: a fence whose backup cannot be verified is a crontab nobody can put back. Nothing was left behind at ${CRON_BACKUP}. Nothing has been stopped and nothing has been migrated."
+      "The ${APP_USER} crontab could not be backed up to ${CRON_BACKUP}, so this run will not fence the cron writers: a fence whose backup cannot be verified is a crontab nobody can put back. Nothing was left behind at ${CRON_BACKUP}. The service IS STOPPED at this point — the fence is taken after the drain, so that no predecessor can write the crontab between the snapshot and the replacement — and NOTHING HAS BEEN MIGRATED. The trap below re-fences and says how to recover."
   fi
   printf '%s\n' "${current}" \
     | awk '{ if ($0 ~ /^[[:space:]]*[^#[:space:]]/) print "#DEPLOY-FENCE# " $0; else print $0 }' \
@@ -4622,9 +4651,21 @@ fence_cron() {
   success "Cron writers fenced."
 }
 
+# UNFENCE. Unlike the fence, this runs while the application IS SERVING — section 12 started it and
+# section 12b proved it is this build — so DRAINING covers nothing here and the lock is the only
+# exclusion there is. It is sufficient, and for a reason the fence cannot rely on: the process that
+# can race this one was built by THIS run, so it participates in this protocol by construction
+# (lib/crontab-reconcile-lock.ts resolves the same inode from $STATE_DIRECTORY).
 unfence_cron() {
   ${CRON_FENCED} || return 0
   [[ -f "${CRON_BACKUP}" ]] || return 0
+  local rc=0
+  with_crontab_lock unfence_cron_locked || rc=$?
+  [[ "${rc}" -eq 0 ]] || die \
+    "The ${APP_USER} crontab is still FENCED (every line commented out) because this run could not take ${CRONTAB_LOCK_FILE}$(if [[ "${rc}" -eq "${CRONTAB_LOCK_CONFLICT}" ]]; then printf ' within %ss' "${CRONTAB_LOCK_WAIT_SECONDS}"; fi). The application is up and the migration is complete; put the schedule back by hand once nothing is reconciling:  crontab -u ${APP_USER} ${CRON_BACKUP}"
+}
+
+unfence_cron_locked() {
   crontab -u "${APP_USER}" "${CRON_BACKUP}"
   rm -f "${CRON_BACKUP}"
   CRON_FENCED=false
@@ -4689,13 +4730,27 @@ predecessor_is_active() {
 # Order matters: the crontab is restored FIRST and a failure there is fatal BEFORE the fence
 # comes down, so a run that cannot finish the unwind leaves the marker exactly as it found it
 # and the next run adopts the same phase again.
+resume_restore_cron_locked() {
+  crontab -u "${APP_USER}" "${CRON_BACKUP}" || return 1
+  rm -f "${CRON_BACKUP}"
+  CRON_FENCED=false
+  success "The ${APP_USER} crontab is back exactly as the interrupted run found it."
+  return 0
+}
+
 resume_from_interrupted_arming() {
+  # THE ONE SITE WHERE THE LOCK IS THE ONLY THING AVAILABLE AND IS NOT SUFFICIENT ON ITS OWN, said
+  # plainly (o3d-p9dq). This path exists precisely because the predecessor is STILL SERVING and must
+  # not be stopped, so draining is not on the table; and a crontab backup can only be here if a
+  # PREVIOUS run fenced it, which — on the rollout that introduces this protocol — was a run of a
+  # script whose fence happened before the stop and whose predecessor did not take this lock. From
+  # the next rollout on, the serving process participates and the lock is complete. The residual is
+  # bounded by that one transition, and it is smaller than what it replaces: since o3d-p9dq the
+  # cutover fence happens AFTER the stop, so an interrupted ARMING no longer leaves a fenced crontab
+  # at all and this branch only fires for a marker written by an older script.
   if command -v crontab >/dev/null 2>&1 && [[ -f "${CRON_BACKUP}" ]]; then
-    crontab -u "${APP_USER}" "${CRON_BACKUP}" || die \
-      "The interrupted run had fenced the ${APP_USER} crontab and its backup at ${CRON_BACKUP} could not be restored. Refusing to continue with the cron writers commented out: restore it by hand (crontab -u ${APP_USER} ${CRON_BACKUP}) and re-run. Nothing has been stopped."
-    rm -f "${CRON_BACKUP}"
-    CRON_FENCED=false
-    success "The ${APP_USER} crontab is back exactly as the interrupted run found it."
+    with_crontab_lock resume_restore_cron_locked || die \
+      "The interrupted run had fenced the ${APP_USER} crontab and its backup at ${CRON_BACKUP} could not be restored under ${CRONTAB_LOCK_FILE}. Refusing to continue with the cron writers commented out: restore it by hand (crontab -u ${APP_USER} ${CRON_BACKUP}) and re-run. Nothing has been stopped."
   fi
   release_db_connections || die \
     "A connection fence was standing over an UNTOUCHED schema and could not be released. Fix that before re-running; nothing has been stopped."
@@ -5123,6 +5178,15 @@ restore_cron_from_backup() {
   command -v crontab >/dev/null 2>&1 || return 0
   ${CRON_BACKUP_CREATED} || return 0
   [[ -f "${CRON_BACKUP}" ]] || return 1
+  # UNDER THE LOCK, because this one can run while something is serving: the pre-stop branch of the
+  # trap calls it through unwind_arming() with the predecessor untouched. A conflict is a FAILURE
+  # here rather than a skip — the caller prints the by-hand command — because a silent skip leaves
+  # a fenced crontab behind while reporting that everything was undone.
+  with_crontab_lock restore_cron_from_backup_locked || return 1
+  return 0
+}
+
+restore_cron_from_backup_locked() {
   crontab -u "${APP_USER}" "${CRON_BACKUP}" || return 1
   rm -f "${CRON_BACKUP}"
   CRON_FENCED=false
@@ -6156,116 +6220,17 @@ find "${DATA_DIR}" -path "${CRONTAB_LOCK_DIR}" -prune -o -exec chown -h "${APP_U
 chown -R "${APP_USER}:${APP_USER}" "${LOG_DIR}"
 chown -R "${APP_USER}:${APP_USER}" "${UPLOAD_STORAGE_DIR}" "${PUBLIC_UPLOAD_STORAGE_DIR}"
 
-# ---------------------------------------------------------------------------
-# THE CRONTAB RECONCILIATION LOCK IS ROOT-OWNED, AND NO ROOT-SIDE STEP FOLLOWS A SYMLINK
-# (Codex r24 CRITICAL).
+# THE CRONTAB RECONCILIATION LOCK, prepared here and defined in scripts/lib/crontab-lock.sh.
 #
-# ${DATA_DIR} is the service's systemd StateDirectory. systemd creates it OWNED BY ${APP_USER}, and
-# it MUST be writable by that user — that is what makes the lock reachable under the hardened unit
-# at all (r23). Round 23 then put the lock file directly in it and, as root, ran `touch`, `chown`
-# and `chmod` on that path on every install and every upgrade. All three follow symlinks. So the
-# unprivileged service account — the one account an attacker who reaches this application gets —
-# could replace the lock with a symlink to /etc/shadow and wait: the next installer run would give
-# the target away as ${APP_USER}:${APP_USER}, mode 0664. A root-side write into a directory the
-# service user controls is not a convenience, it is a privilege-escalation primitive.
+# Root-owned file inside a root-owned directory inside the service's StateDirectory, created with
+# primitives that cannot follow a symlink (Codex r24 CRITICAL). It moved into the library in
+# o3d-p9dq: deploy.sh and update.sh need the identical preparation, because they now take the
+# identical lock, and a rule about a root-side write into a directory the service user owns cannot
+# be restated in three scripts and stay one rule.
 #
-# THE SERVICE USER NEVER NEEDS TO WRITE THIS FILE. `flock(2)` locks the open file DESCRIPTION
-# whatever its access mode, and the application already falls back to a READ-ONLY descriptor when
-# the lock file cannot be opened for writing (lib/crontab-reconcile-lock.ts, `openLockFile`). So the
-# lock can be root's alone and the exclusion still works in both directions:
-#
-#   ${CRONTAB_LOCK_DIR}
-#       root:root, 0755. The service user cannot create, replace or remove ANY entry in it, so the
-#       lock file underneath it cannot be swapped — this directory, not the file's mode, is what
-#       closes the finding.
-#   ${CRONTAB_LOCK_FILE}
-#       root:root, 0644. World-readable so the service can open it read-only and flock it; never
-#       `chown`ed to ${APP_USER}, and never written by anyone — its CONTENTS are meaningless, only
-#       its inode is the lock.
-#
-# NOTHING HERE FOLLOWS A SYMLINK, and each primitive is chosen for that:
-#
-#   • `mkdir` WITHOUT -p — plain mkdir fails with EEXIST on an existing symlink, where `mkdir -p`
-#     succeeds silently and leaves every later step operating inside the link's target.
-#   • `set -C` (noclobber) redirection — open(O_CREAT|O_EXCL), which by POSIX fails with EEXIST when
-#     the final component is a symlink, and so cannot create or truncate the target. `touch`, and a
-#     plain `: >` redirection, both follow.
-#   • `stat` and `[[ -L ]]` — both lstat. `stat -c %F` reports "symbolic link" rather than the
-#     target's type (`stat -L`, which would dereference, is deliberately not used).
-#   • `chown -h` — never dereferences: on a symlink it changes the LINK, so even a path swapped
-#     between the check and the call cannot hand a target away.
-#   • NO `chmod`, anywhere on these two paths. chmod has no --no-dereference on Linux, so a raced
-#     chmod is the same escalation with a different verb. Modes come from `umask` at creation, and a
-#     mode that is already wrong is REFUSED rather than corrected.
-#
-# AND IT IS RE-ASSERTED ON EVERY RUN, not established once. systemd re-owns a StateDirectory
-# RECURSIVELY when the TOP-LEVEL directory's owner does not match `User=` — so a box where
-# ${DATA_DIR} ends up root-owned for any reason will hand this subdirectory to ${APP_USER} at the
-# next service start. Nothing below trusts what a previous run left: it re-takes ownership and
-# re-derives every fact with lstat, so that case ends in a corrected directory or a refused install
-# rather than in a root-side write into a directory the service user can rewrite.
-#
-# WHAT IS STILL POSSIBLE, stated rather than glossed over: ${DATA_DIR} itself belongs to
-# ${APP_USER}, so that user can rename(2) the lock DIRECTORY aside within it — a same-directory
-# rename of a directory does not need write permission on the directory being renamed — and drop a
-# symlink in its place. Which is why every step below re-derives what it is looking at with lstat
-# and DIES: the outcome is a refused install naming the path, never a followed link. Whoever holds
-# the service account can already deny an install a hundred ways; what they must not be able to do
-# is aim a root-side write, and they cannot.
-# ---------------------------------------------------------------------------
-prepare_crontab_lock() {
-  local self dir_meta file_meta dir_kind dir_owner dir_mode file_kind file_owner
-  # 0 — the EUID guard at the top of this script has already refused to run as anything else. It is
-  # asked rather than hardcoded so the check below reads as "owned by the privileged user that owns
-  # this install", which is the property that matters, and so this function can be exercised in a
-  # test harness that is not root.
-  self="$(id -u)"
-
-  # (1) THE DIRECTORY. Plain `mkdir`: a symlink already at this path makes it fail with EEXIST
-  # instead of being followed, and we then refuse below rather than working inside it.
-  if ! (umask 022; mkdir "${CRONTAB_LOCK_DIR}") 2>/dev/null; then
-    [[ "$(stat -c '%F' "${CRONTAB_LOCK_DIR}" 2>/dev/null || true)" == "directory" ]] || die \
-      "${CRONTAB_LOCK_DIR} exists and is not a directory (a symlink there is how a compromised '${APP_USER}' would aim a root-side write). Remove or fix that path, then run the installer again."
-  fi
-  # Take/keep root ownership. `-h` so this is safe even if the path became a symlink just now.
-  chown -h root:root "${CRONTAB_LOCK_DIR}"
-
-  # (2) THE FILE. Created, if missing, with O_CREAT|O_EXCL so a planted symlink is refused rather
-  # than written through; never `touch`ed, and never chowned to the service user.
-  #
-  # The `-e` test is a CONVENIENCE, not the safety: it dereferences, so a symlink to an existing
-  # file reads as "already there", and a DANGLING one reads as "missing" and falls into the
-  # redirection below. `set -C` is what makes both of those safe — O_CREAT|O_EXCL fails with EEXIST
-  # on a symlink and creates nothing, dangling or not — and the lstat that follows is what refuses.
-  if [[ ! -e "${CRONTAB_LOCK_FILE}" ]]; then
-    ( umask 022; set -C; : > "${CRONTAB_LOCK_FILE}" ) 2>/dev/null || true
-  fi
-  # `stat -c %F` says "regular empty file" for a zero-length one, and this file is ALWAYS empty —
-  # nothing ever writes to it. Both spellings are the same st_mode, and neither is a symlink.
-  file_kind="$(stat -c '%F' "${CRONTAB_LOCK_FILE}" 2>/dev/null || true)"
-  [[ "${file_kind}" == "regular file" || "${file_kind}" == "regular empty file" ]] || die \
-    "${CRONTAB_LOCK_FILE} is not a regular file (it is a ${file_kind:-missing path}). The crontab reconciliation lock must be a plain file that only root can replace; refusing to write to that path."
-  chown -h root:root "${CRONTAB_LOCK_FILE}"
-
-  # (3) THE POST-CONDITIONS, re-read with lstat rather than assumed from the steps above.
-  dir_meta="$(stat -c '%F|%u|%a' "${CRONTAB_LOCK_DIR}" 2>/dev/null || true)"
-  IFS='|' read -r dir_kind dir_owner dir_mode <<< "${dir_meta}"
-  [[ "${dir_kind}" == "directory" && "${dir_owner}" == "${self}" ]] || die \
-    "${CRONTAB_LOCK_DIR} must be a directory owned by uid ${self} after preparation, and is '${dir_meta}'."
-  # The whole protection is that the service user cannot write this DIRECTORY. A group- or
-  # other-writable mode would give the lock file back to them, so it is refused, not chmod'ed away.
-  (( (8#${dir_mode:-777} & 0022) == 0 )) || die \
-    "${CRONTAB_LOCK_DIR} is mode ${dir_mode}: group- or other-writable, so '${APP_USER}' could still replace the lock file inside it. Set it to 0755 and run the installer again."
-  file_meta="$(stat -c '%F|%u' "${CRONTAB_LOCK_FILE}" 2>/dev/null || true)"
-  IFS='|' read -r file_kind file_owner <<< "${file_meta}"
-  # No mode assertion on the FILE, deliberately: nothing ever reads or writes its contents, and it
-  # cannot be replaced from inside a directory the service user cannot write. Only "root owns it and
-  # it is a plain file" is load-bearing.
-  [[ ( "${file_kind}" == "regular file" || "${file_kind}" == "regular empty file" ) \
-     && "${file_owner}" == "${self}" ]] || die \
-    "${CRONTAB_LOCK_FILE} must be a regular file owned by uid ${self} after preparation, and is '${file_meta}'."
-}
-
+# BEFORE THE SERVICE IS EVER STARTED, and before anything in this run touches the crontab: the
+# adoption path in section 10a fences and unfences the crontab, and it must find the lock already
+# there.
 prepare_crontab_lock
 
 success "Directories created."
@@ -6699,7 +6664,24 @@ if ${UPGRADE_EXISTING}; then
   install_reboot_fence "install.sh cutover started $(date -Iseconds)" \
     || die "Refusing to stop the existing service without a verified reboot fence: a reboot mid-migration would start it again against a migrated schema."
 
-  fence_cron
+  # THE CRON FENCE USED TO BE HERE, AND THAT WAS THE RACE (o3d-p9dq, Codex r26 HIGH).
+  #
+  # `fence_cron` snapshots the crontab, backs the snapshot up verbatim and replaces the crontab
+  # with a commented-out copy. Run at this point, the predecessor is still serving and six server
+  # actions can start a reconciliation from a browser at any moment — so a schedule an operator
+  # saved between the snapshot and the replacement was written into a crontab this run was about
+  # to overwrite, and the verbatim backup restored later did not contain it. The database and the
+  # UI went on reporting the job enabled and nothing was scheduled to run it.
+  #
+  # AND ADDING THE FLOCK HERE WOULD NOT HAVE CLOSED IT. On the rollout that introduces the lock the
+  # predecessor was built before the lock existed: it excludes itself with a PostgreSQL advisory
+  # lock, or with nothing, and an flock taken here would have serialized this script against no
+  # one. The exclusion that reaches a process built before this protocol is that it is not running.
+  #
+  # So the fence has moved below the stop, the legacy-launcher sweep and the port drain — see
+  # "Fencing the cron writers" further down. What stays here is the REBOOT fence, which must be
+  # installed before anything is stopped because a fence installed on the way out does not exist
+  # for a run that is killed.
 
   # PHASE `stopping`: from the next statement on, something has been asked to stop and
   # nothing may start it again. Every failure before this point takes the reversible branch
@@ -6727,6 +6709,23 @@ if ${UPGRADE_EXISTING}; then
     fi
   fi
   success "Nothing is serving ${APP_NAME} any more."
+
+  # ---------------------------------------------------------------------------
+  # AND ONLY NOW ARE THE CRON WRITERS FENCED (o3d-p9dq, Codex r26 HIGH).
+  #
+  # Nothing is serving: the unit is stopped, the legacy launchers are stopped and the port has just
+  # been proved free. That is what makes the snapshot below safe against a PREDECESSOR build, which
+  # no lock of ours can reach. `fence_cron` additionally holds the shared crontab flock across its
+  # own `crontab -l` and `crontab -`, which is what makes it safe against everything that comes
+  # after — a reconciliation from a process running this build, and the other two entrypoints.
+  #
+  # STILL BEFORE THE DRAIN-VERIFY BELOW: a cron tick that opens a database connection is exactly
+  # what `check-db-writers.mjs` is about to refuse, so the writers are commented out first and the
+  # probe then asks whether the room is empty.
+  # ---------------------------------------------------------------------------
+  CUTOVER_STEP="fence-cron"
+  header "Fencing the cron writers"
+  fence_cron
 
   CUTOVER_STEP="drain-verify"
   # The FENCE shuts the door for the rest of the window; only then does the PROBE
@@ -7058,20 +7057,159 @@ else
   die "Something answered ${INSTALL_HEALTH_URL}, but nothing proved it was BUILD_ID ${NEW_BUILD_ID}. A predecessor still holding port ${APP_PORT} answers that route too, and the schema has already moved. Refusing to declare the installation irreversible on the strength of an open port."
 fi
 
+# ---------------------------------------------------------------------------
+# ...AND IS THAT PROCESS THE UNIT'S? (o3d-p9dq, Codex r26 HIGH)
+#
+# THE ASSET FETCH ABOVE PROVES A PROPERTY NEXT TO THE ONE THIS RUN NEEDS. A 200 on
+# /_next/static/<BUILD_ID>/ proves that whatever holds the port serves the tree this run just
+# built. It does not prove that process is systemd's. A same-build process started by hand out of
+# ${APP_DIR} — by an operator, by a stale PM2 entry, by a test harness — after the port was drained
+# can win the bind while `systemctl start` returns 0 for a unit that then fails to bind at all.
+# That process satisfies the fetch and satisfies nothing else, and the difference is not academic:
+# NOT BEING THE UNIT'S CHILD, IT HAS NO $STATE_DIRECTORY. lib/crontab-reconcile-lock.ts then falls
+# through to `path.join(process.cwd(), 'locks', '.crontab-reconcile.lock')` — a DIFFERENT INODE from
+# the ${CRONTAB_LOCK_FILE} section 16 locks — so the installer and the application would each hold
+# an exclusion against nobody and overwrite each other's managed block.
+#
+# So four facts are established, and the last one is the one that closes the loop because it asks
+# the PROCESS where its lock is rather than asking the installer:
+#
+#   1. systemd reports the unit ACTIVE, and gives a MainPID and a ControlGroup for it.
+#   2. Something is listening on :${APP_PORT}, and `ss` can name the pids that hold those sockets.
+#   3. Every one of those pids — and MainPID itself — is inside the unit's control group. A
+#      cgroup rather than a pid equality because a Next.js unit's listener is routinely a CHILD of
+#      the ExecStart process (`npm start` -> `next start` -> the server), and every one of those is
+#      in the unit's cgroup while only one of them is MainPID.
+#   4. The LISTENER's own effective STATE_DIRECTORY — read out of /proc/<pid>/environ, which is the
+#      only place a process's live environment can be read from — has ${DATA_DIR} as its first
+#      colon-separated element, which is exactly what crontabReconcileLockPath() joins onto.
+#
+# WHEN /proc/<pid>/environ CANNOT BE READ. It is mode 0400 owned by the process's real uid, and
+# this script has already refused to run as anything but root, so the only realistic failures are
+# the process having exited between the `ss` above and the read (ENOENT) and a /proc mounted with
+# hidepid= for a reader that is not root. Both are read as PROOF NOT ESTABLISHED and die: an
+# unreadable environment is precisely the case where the installer cannot tell the unit's process
+# from an impostor, so it must not arm anything. An environ that is readable but has no
+# STATE_DIRECTORY at all is the impostor case itself, and is named separately in the message.
+# ---------------------------------------------------------------------------
+
+# Exact match or a descendant: a unit with Delegate= puts its processes in sub-cgroups of its own.
+process_is_in_cgroup() {
+  local pid="$1" want="$2" line path
+  [[ -r "/proc/${pid}/cgroup" ]] || return 1
+  while IFS= read -r line; do
+    # cgroup v2: "0::/system.slice/x.service"   cgroup v1: "N:controller:/system.slice/x.service"
+    path="${line#*:}"
+    path="${path#*:}"
+    [[ "${path}" == "${want}" || "${path}" == "${want}/"* ]] && return 0
+  done < "/proc/${pid}/cgroup"
+  return 1
+}
+
+# The process's OWN view of its environment. Prints the raw STATE_DIRECTORY value (empty when the
+# process has none); returns non-zero only when the environment could not be read at all, so the
+# caller can tell "no such variable" from "no such answer".
+effective_state_directory() {
+  local pid="$1"
+  [[ -r "/proc/${pid}/environ" ]] || return 1
+  tr '\0' '\n' < "/proc/${pid}/environ" 2>/dev/null \
+    | sed -n 's/^STATE_DIRECTORY=//p' | head -1
+}
+
+LISTENER_PROOF_REASON=""
+LISTENER_PIDS=""
+prove_listener_belongs_to_unit() {
+  local unit="${APP_NAME}.service" main_pid cgroup pids pid state_dir first
+  LISTENER_PROOF_REASON=""
+  LISTENER_PIDS=""
+
+  command -v systemctl >/dev/null 2>&1 || {
+    LISTENER_PROOF_REASON="systemctl is not available on this host, so nothing can say which process systemd owns"
+    return 1
+  }
+  systemctl is-active --quiet "${unit}" 2>/dev/null || {
+    LISTENER_PROOF_REASON="systemd does not report ${unit} active, so the process on the port is not systemd's"
+    return 1
+  }
+  main_pid="$(systemctl show -p MainPID --value "${unit}" 2>/dev/null || true)"
+  [[ "${main_pid}" =~ ^[0-9]+$ ]] && [[ "${main_pid}" -gt 0 ]] || {
+    LISTENER_PROOF_REASON="systemd reports no MainPID for ${unit} (got '${main_pid}')"
+    return 1
+  }
+  cgroup="$(systemctl show -p ControlGroup --value "${unit}" 2>/dev/null || true)"
+  [[ -n "${cgroup}" && "${cgroup}" != "/" ]] || {
+    LISTENER_PROOF_REASON="systemd reports no control group for ${unit} (got '${cgroup}'), so this run cannot tell the unit's processes from anything else on the box"
+    return 1
+  }
+  process_is_in_cgroup "${main_pid}" "${cgroup}" || {
+    LISTENER_PROOF_REASON="${unit}'s own MainPID ${main_pid} is not in its control group ${cgroup} — systemd's answers do not agree with /proc, so neither can be used to identify the listener"
+    return 1
+  }
+
+  command -v ss >/dev/null 2>&1 || {
+    LISTENER_PROOF_REASON="\`ss\` is not available, so this run cannot find out which process holds the listening socket on :${APP_PORT}"
+    return 1
+  }
+  pids="$(ss -ltnp 2>/dev/null | awk -v p=":${APP_PORT}\$" '$4 ~ p' \
+    | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u | tr '\n' ' ')"
+  pids="${pids% }"
+  [[ -n "${pids}" ]] || {
+    LISTENER_PROOF_REASON="\`ss -ltnp\` named no process holding a listening socket on :${APP_PORT}"
+    return 1
+  }
+
+  for pid in ${pids}; do
+    process_is_in_cgroup "${pid}" "${cgroup}" || {
+      LISTENER_PROOF_REASON="pid ${pid} holds a listening socket on :${APP_PORT} but is NOT in ${unit}'s control group ${cgroup} — it serves this build's tree without being this unit's process"
+      return 1
+    }
+    state_dir="$(effective_state_directory "${pid}")" || {
+      LISTENER_PROOF_REASON="/proc/${pid}/environ could not be read, so this run cannot establish where the process on :${APP_PORT} resolves its crontab lock. Either it exited while this check ran, or /proc is mounted with hidepid= for this reader"
+      return 1
+    }
+    [[ -n "${state_dir}" ]] || {
+      LISTENER_PROOF_REASON="pid ${pid} holds :${APP_PORT} with NO STATE_DIRECTORY in its environment, so it resolves its crontab lock under its own working directory instead of ${CRONTAB_LOCK_FILE}"
+      return 1
+    }
+    # The application takes the FIRST colon-separated entry (lib/crontab-reconcile-lock.ts,
+    # systemdStateDirectory), so that is the one compared — not "contains".
+    first="${state_dir%%:*}"
+    [[ "${first}" == "${DATA_DIR}" ]] || {
+      LISTENER_PROOF_REASON="pid ${pid} holds :${APP_PORT} with STATE_DIRECTORY='${state_dir}', whose first entry '${first}' is not ${DATA_DIR}, so it locks a different file from ${CRONTAB_LOCK_FILE}"
+      return 1
+    }
+  done
+
+  LISTENER_PIDS="${pids}"
+  return 0
+}
+
+APP_SERVICE_LISTENER_PROVED=false
+if prove_listener_belongs_to_unit; then
+  APP_SERVICE_LISTENER_PROVED=true
+  success "The listener(s) on :${APP_PORT} (${LISTENER_PIDS}) belong to ${APP_NAME}.service and resolve ${CRONTAB_LOCK_FILE}."
+else
+  die "The new build is answering on port ${APP_PORT}, but this run could NOT establish that the process serving it is ${APP_NAME}.service's own: ${LISTENER_PROOF_REASON}. That matters for one specific reason: the crontab lock this installer is about to take is only an exclusion against a process whose \$STATE_DIRECTORY is ${DATA_DIR}, and a listener that is not this unit's child has none. The migration applied and the service was started; fix the listener (stop whatever else holds :${APP_PORT}, check \`systemctl status ${APP_NAME}.service\`) and re-run, which adopts the state this run left."
+fi
+
 # THE POINT OF NO RETURN (o3d-2sm1.5, Codex r4 HIGH). The new build is serving and everything
 # that could reject this release has passed. Nothing below may stop it, re-fence it or revoke
 # CONNECT again: a failure in the cron restore, the nginx config or the log rotation is
 # something to fix by hand, not a reason to tear down a working installation.
 #
-# ARMED ONLY BY THE PROOF ABOVE: `$NEW_BUILD_SERVING` is false until the build on disk was
-# shown to be the process on the port (o3d-2sm1.5, Codex r5 HIGH).
-if $NEW_BUILD_SERVING; then
+# ARMED ONLY BY THE TWO PROOFS ABOVE, AND BY BOTH (o3d-2sm1.5 Codex r5 HIGH; o3d-p9dq Codex r26
+# HIGH). `$NEW_BUILD_SERVING` is false until the build on disk was shown to be the tree the process
+# on the port serves; `$APP_SERVICE_LISTENER_PROVED` is false until that process was shown to be
+# ${APP_NAME}.service's own, in its control group, with an effective STATE_DIRECTORY that resolves
+# ${CRONTAB_LOCK_FILE}. Neither implies the other: a stray same-build listener passes the first and
+# fails the second, and a correctly-owned process serving a stale tree does the reverse.
+if $NEW_BUILD_SERVING && $APP_SERVICE_LISTENER_PROVED; then
   PAST_POINT_OF_NO_RETURN=true
   # AND THE CRONTAB LOCK MAY NOW BE TAKEN, for the same reason and on the same evidence. The
   # question section 16 asks is "is the process that will contend for this lock the one this run
-  # built", and the /_next/static/<BUILD_ID>/ fetch above is the only thing in this script that
-  # answers it. Set from `$NEW_BUILD_SERVING` rather than beside it, so there is exactly one
-  # place where that proof becomes permission.
+  # built, holding the lock file this run prepared" — and the conjunction above is the only thing
+  # in this script that answers it. Set INSIDE the block rather than beside it, so there is exactly
+  # one place where that proof becomes permission.
   APP_SERVICE_ON_NEW_BUILD=true
 fi
 
@@ -7348,8 +7486,9 @@ trap 'rm -f "${CRON_BLOCK_FILE}"' EXIT
 #
 # The app's exclusion used to be a PostgreSQL session advisory lock, which this script could not
 # possibly take: it is shell, and it gets here long before there is an app session to take a lock
-# on. So the exclusion moved to where the resource is — an `flock` on a host-local file — and what
-# follows is the same two lines the app performs, on the same path.
+# on. So the exclusion moved to where the resource is — an `flock` on a host-local file — and the
+# write below performs it through with_crontab_lock(), on the same path, exactly as this script's
+# cutover fence and unwind now do and as deploy.sh and update.sh do (o3d-p9dq).
 #
 # THAT PATH IS THE SERVICE'S systemd StateDirectory, NOT ${APP_DIR} (Codex r23 HIGH). A lock file
 # beside the app cannot be opened at all under the hardened unit shipped in
@@ -7369,36 +7508,38 @@ trap 'rm -f "${CRON_BLOCK_FILE}"' EXIT
 # THE FILE IS NOT CREATED HERE, AND NOT WRITTEN HERE (Codex r24 CRITICAL). `prepare_crontab_lock`
 # in section 8 made it — root-owned, inside a root-owned directory — before the service was ever
 # started, precisely so that no root-side `touch`/`chown`/`chmod` ever lands on a path the service
-# user can turn into a symlink. All that is left to do here is OPEN it, and it is opened READ-ONLY:
-# `flock(2)` ignores the access mode, so a read-only descriptor takes the same exclusive lock, and
-# an fd that cannot write cannot be steered into writing something else either. That is the same
-# fallback the application relies on (lib/crontab-reconcile-lock.ts, `openLockFile`).
+# user can turn into a symlink. All that is left to do here is OPEN it, which with_crontab_lock()
+# does READ-ONLY: `flock(2)` ignores the access mode, so a read-only descriptor takes the same
+# exclusive lock, and an fd that cannot write cannot be steered into writing something else either.
+# That is the same fallback the application relies on (lib/crontab-reconcile-lock.ts,
+# `openLockFile`).
 #
 # Never rm-and-recreate: the lock lives on the INODE, so replacing the file would hand two writers
 # two different locks and look like it worked.
 # ---------------------------------------------------------------------------
-# SECTION 12b's BUILD PROOF IS WHAT MAKES THIS LOCK MEAN ANYTHING (Codex r25 HIGH, re-pointed at
-# the merge). The flock below excludes exactly one thing: an application process locking the SAME
-# inode. That is only true of a process running the build this run produced, under the unit this
-# run wrote. Section 10c stopped the predecessor, section 12 started the new unit, and section 12b
-# then FETCHED /_next/static/<BUILD_ID>/ from the port and refused to go on unless the process
-# answering identified itself as this build — which is what ${APP_SERVICE_ON_NEW_BUILD} records.
-# Carried here as state rather than as a comment, so reordering the sections fails loudly instead
-# of quietly reopening the race.
+# SECTION 12b's LISTENER PROOF IS WHAT MAKES THIS LOCK MEAN ANYTHING (Codex r25/r26 HIGH). The
+# flock below excludes exactly one thing: an application process locking the SAME inode. That is
+# true only of a process that (a) runs the build this run produced and (b) resolves its lock path
+# from the $STATE_DIRECTORY of the unit this run wrote. Section 10c stopped the predecessor,
+# section 12 started the new unit, and section 12b then proved BOTH halves: it fetched
+# /_next/static/<BUILD_ID>/ from the port for the build identity, and it resolved the unit's
+# MainPID and control group, established that the process holding the listening socket belongs to
+# that unit, and read that process's own effective STATE_DIRECTORY out of /proc/<pid>/environ to
+# confirm it resolves THIS lock file. ${APP_SERVICE_ON_NEW_BUILD} records the conjunction. Carried
+# here as state rather than as a comment, so reordering the sections fails loudly instead of
+# quietly reopening the race.
 [[ "${APP_SERVICE_ON_NEW_BUILD:-false}" == "true" ]] || die \
-  "the application service was not proved to be running this run's build before the crontab section (APP_SERVICE_ON_NEW_BUILD='${APP_SERVICE_ON_NEW_BUILD:-unset}'). Taking the crontab lock now would serialise this script against nothing: a process still running the previous build locks a different file, or none, and the two writers would silently overwrite each other's managed block. This is an ordering bug in the installer itself, not an operator error — the build proof is in section 12b and must precede this section."
-
-[[ -f "${CRONTAB_LOCK_FILE}" ]] || die \
-  "${CRONTAB_LOCK_FILE} is missing or is not a regular file, so this crontab write cannot be serialized against the application's. It is created earlier in this script; re-run the installer."
+  "the application service was not proved to be running this run's build, under this run's unit, before the crontab section (APP_SERVICE_ON_NEW_BUILD='${APP_SERVICE_ON_NEW_BUILD:-unset}'). Taking the crontab lock now would serialise this script against nothing: a process still running the previous build locks a different file, and a process that is not the unit's own has no STATE_DIRECTORY at all and locks a file under its working directory instead — either way the two writers would silently overwrite each other's managed block. This is an ordering bug in the installer itself, not an operator error — the build and listener proofs are in section 12b and must precede this section."
 
 CRON_BOOTSTRAP_WRITTEN=no
-exec 9<"${CRONTAB_LOCK_FILE}"
-if ! flock --exclusive --timeout 30 9; then
-  # FAIL SAFE, DO NOT ABORT. Writing without the lock is the defect itself, and a held lock means
-  # the app is reconciling right now — which also means the block below would have been skipped.
-  warn "Another process is reconciling ${APP_USER}'s crontab; leaving it untouched."
-  warn "If scheduled jobs are missing, open Settings -> System -> Scheduler and press Save & Apply."
-else
+
+# THE BOOTSTRAP WRITE, AS A FUNCTION, SO IT GOES THROUGH THE ONE HELPER EVERY OTHER SHELL CRONTAB
+# WRITE GOES THROUGH (o3d-p9dq). It used to be an inline `exec 9<lock; flock 9; …; exec 9>&-`, which
+# had a second defect nobody had asked about: `acquire_cutover_lock` holds the SHARED CUTOVER LOCK
+# on fd 9 for the whole run, so `exec 9<` replaced that descriptor — releasing the cutover lock —
+# and `exec 9>&-` then left the run holding no cutover lock at all. with_crontab_lock() scopes its
+# descriptor to a command group and uses fd 7.
+bootstrap_managed_crontab_block() {
   # BOOTSTRAP, NOT RECONCILE (Codex r22 HIGH). The block below carries the INSTALLER's default
   # schedules, not the operator's committed settings, so writing it over an existing managed block
   # would revert every schedule choice made in the app — the same "the crontab disagrees with the
@@ -7450,10 +7591,21 @@ else
     }
     if (!emitted) emitBlock()   # no prior block → append at end
   }
-' | crontab -u "${APP_USER}" -
+'  | crontab -u "${APP_USER}" -
   fi
+}
+
+CRON_BOOTSTRAP_RC=0
+with_crontab_lock bootstrap_managed_crontab_block || CRON_BOOTSTRAP_RC=$?
+if [[ "${CRON_BOOTSTRAP_RC}" -ne 0 ]]; then
+  # FAIL SAFE, DO NOT ABORT. Writing without the lock is the defect itself, and a held lock means
+  # the app is reconciling right now — which also means the block above would have been skipped.
+  # This is the ONE crontab site in these three scripts that does not die on a conflict, because
+  # the only thing it would have written is a set of DEFAULT schedules the application replaces on
+  # its first save. Nothing this run needs to put back is left behind.
+  warn "Another process is reconciling ${APP_USER}'s crontab; leaving it untouched."
+  warn "If scheduled jobs are missing, open Settings -> System -> Scheduler and press Save & Apply."
 fi
-exec 9>&-   # release the crontab lock: the fd IS the lock
 rm -f "${CRON_BLOCK_FILE}"
 trap - EXIT   # risky window over; drop the cleanup trap
 
