@@ -1105,24 +1105,52 @@ EOSQL
 #                                              connected as a role that does not exist, so this
 #                                              is safe at any point, and the fence preflight
 #                                              needs it to have happened.
-#   provision_database_role_and_privileges()   rotates the password of a role that WAS already
-#                                              there, grants on the database and moves its
-#                                              OWNER. Every one of those is felt by somebody
-#                                              else's connection, so none of them may run until
-#                                              this run has classified the cutover and, on the
-#                                              fenced path, until require_fenceable_database()
-#                                              has proved the window can be held closed.
+#   provision_database_role_and_privileges()   grants on the database and moves its OWNER. Both
+#                                              are felt by somebody else's connection, so neither
+#                                              may run until this run has classified the cutover
+#                                              and, on the fenced path, until
+#                                              require_fenceable_database() has proved the window
+#                                              can be held closed.
+#   rotate_database_password_in_fenced_window() ALTERs the password of a role that WAS already
+#                                              there. That is the one statement here which takes
+#                                              a working credential AWAY from every client using
+#                                              it, so it does not run on this side of the stop at
+#                                              all — see below.
 #
-# WHY NOT LATER STILL — after the fence is actually RAISED, which is where the finding's wording
-# points. The fence is raised only after the predecessor has been STOPPED, and the build runs
-# before the stop, deliberately, so that a release that will not compile costs no outage. That
-# build is handed DATABASE_URL and touches the database. Moving the password rotation past the
-# raise therefore hands the build a credential the server does not have yet, and turns "the
-# release does not build" into "the release does not build, on a box that has been stopped".
-# The reachable, and correct, boundary is the one below: NO refusal that says "nothing has been
-# stopped and nothing has been migrated" may follow a credential change, and after this call
-# every remaining refusal is about THIS host's artefact — the build, BUILD_ID, the port still
-# being bound — not about whether the run was allowed to touch the database at all.
+# AND THE PASSWORD IS NOT HERE AT ALL ANY MORE (o3d-2sm1.5 r38, Codex HIGH). r37 left the ALTER
+# on this side of the stop and argued the boundary was as late as it could be: the build runs
+# BEFORE the stop, deliberately, so that a release that will not compile costs no outage, and the
+# build is handed DATABASE_URL. Rotating after the raise therefore seemed to hand the build a
+# credential the server does not have.
+#
+# Both halves of that were wrong, and the second one is what made the first matter:
+#
+#   * THE DEFAULT SHOULD NEVER HAVE BEEN A ROTATION. The local-database prompt defaulted
+#     DB_PASSWORD to `openssl rand -hex 16` — a NEW secret every run — so an operator pressing
+#     Enter through an ordinary re-install rotated the live role's password as a side effect of
+#     running the script. REDIS_URL and REDIS_PASSWORD had recovered their installed values for
+#     rounds; DATABASE_URL had not. It does now, in prompt_db_password(), and a re-install that
+#     changes nothing changes nothing.
+#   * "THE BUILD NEEDS THE NEW CREDENTIAL" IS FALSE. The build needs a WORKING one. So when a
+#     rotation IS asked for, DB_PASSWORD_EFFECTIVE — and therefore DATABASE_URL, .env and the
+#     MIGRATION_DATABASE_URL handed to `prisma generate` and `npm run build` — stays the OLD,
+#     installed credential for the whole pre-stop window, and rotate_database_password_in_fenced_window()
+#     performs the ALTER after the service is stopped, the reboot fence is up and the connection
+#     fence is raised, then rewrites the one DATABASE_URL line in .env. The build has a working
+#     credential throughout and the predecessor keeps its own until it is no longer running.
+#
+# So what is left on this side is the GRANT and the OWNER change, and the r37 boundary still
+# holds for those: NO refusal that says "nothing has been stopped and nothing has been migrated"
+# may follow them, and after this call every remaining refusal is about THIS host's artefact —
+# the build, BUILD_ID, the port still being bound — not about whether the run was allowed to
+# touch the database at all.
+#
+# WHAT A FENCE CANNOT DO, STATED SO NOBODY READS MORE INTO IT. `ALTER USER ... PASSWORD` is
+# CLUSTER-WIDE and the connection fence is DATABASE-SPECIFIC. Moving the rotation inside the
+# window protects the clients of THIS database; a client of ANOTHER database on the same server
+# authenticating as the same role is refused from its next connection onwards no matter where in
+# this script the statement sits. That is why the rotation now happens only when an operator
+# asks for it explicitly, and why it says so out loud when it does.
 # ---------------------------------------------------------------------------
 
 # Was the application role already on this server when this run arrived? Decided by the CREATE,
@@ -1132,6 +1160,25 @@ DB_ROLE_PREEXISTED=false
 # Set when this run has changed the password of a role it did not create, so a later banner can
 # say so instead of claiming the box is untouched.
 DB_ROLE_CREDENTIALS_ROTATED=false
+
+# THE CREDENTIAL THE SERVER ALREADY HAS, AND WHETHER THIS RUN WAS ASKED TO REPLACE IT
+# (o3d-2sm1.5 r38, Codex HIGH).
+#
+#   DB_PASSWORD_INSTALLED       the password the PREVIOUS run of this installer wrote into
+#                               ${APP_DIR}/.env, recovered out of the DATABASE_URL there and only
+#                               when that URL names the SAME role, host, port and database this
+#                               run is about to use. Empty whenever it cannot be established.
+#   DB_PASSWORD                 what this run was told to make the credential BE. On a re-install
+#                               where the operator pressed Enter it IS DB_PASSWORD_INSTALLED, and
+#                               nothing is rotated at all.
+#   DB_PASSWORD_EFFECTIVE       the one the server has RIGHT NOW, which is what every connection
+#                               this run opens before the rotation — the fence preflight, prisma
+#                               generate, the build — has to be given.
+#   DB_PASSWORD_ROTATION_PENDING  set when those two differ over a role this run did not create:
+#                               a rotation was ASKED FOR and has NOT happened yet.
+DB_PASSWORD_INSTALLED=""
+DB_PASSWORD_EFFECTIVE=""
+DB_PASSWORD_ROTATION_PENDING=false
 
 ensure_database_role_exists() {
   local output="" status=0
@@ -1163,12 +1210,22 @@ EOSQL
 provision_database_role_and_privileges() {
   [[ "${INSTALL_POSTGRES}" == "y" ]] || return 0
 
+  # NO PASSWORD IS SET HERE, ON EITHER PATH (o3d-2sm1.5 r38, Codex HIGH). A role this run CREATED
+  # already has the password the CREATE gave it; a role that was ALREADY THERE keeps the one its
+  # clients are using, and an explicit rotation is performed by
+  # rotate_database_password_in_fenced_window() after the predecessor has been stopped and the
+  # connection fence raised. Nothing between here and that point can take a working credential
+  # away from anybody.
   if ${DB_ROLE_PREEXISTED}; then
-    pg_local_psql -q >/dev/null <<EOSQL || die "Setting the password of the existing role '${DB_USER}' failed, so the environment file this run wrote for the application names a credential the server does not have. NOTHING HAS BEEN MIGRATED. Fix the role by hand or re-run."
-      ALTER USER "${DB_USER}" WITH PASSWORD '${DB_PASSWORD}';
-EOSQL
-    DB_ROLE_CREDENTIALS_ROTATED=true
-    warn "The password of the PRE-EXISTING role '${DB_USER}' has been changed to the one this run wrote into ${APP_DIR}/.env. Any other client still authenticating as ${DB_USER} with the previous password is refused from its next connection onwards."
+    if ${DB_PASSWORD_ROTATION_PENDING}; then
+      info "Role '${DB_USER}' already existed and a DIFFERENT password was supplied, so a rotation is"
+      info "PENDING. It is NOT performed here: the predecessor is still serving and the build has not"
+      info "run. It happens inside the stopped, fenced window, and until then this run — and the"
+      info "environment file it writes — uses the credential the server already has."
+    else
+      info "Role '${DB_USER}' already existed and keeps the password it already had: this run was not"
+      info "asked to change it, so it does not. Nothing about its clients' credentials moves."
+    fi
   fi
 
   # AND NOT WHILE A FENCE IS STANDING (o3d-2sm1.5 r37). `GRANT ALL PRIVILEGES ON DATABASE`
@@ -1193,6 +1250,79 @@ EOSQL
     ALTER DATABASE "${DB_NAME}" OWNER TO "${DB_USER}";
 EOSQL
   success "Database '${DB_NAME}' and user '${DB_USER}' ready."
+}
+
+# ONE LINE OF ${APP_DIR}/.env, REWRITTEN IN PLACE (o3d-2sm1.5 r38, Codex HIGH).
+#
+# The heredoc that writes .env runs long before the stop, and it has to write a credential that
+# WORKS, because a run that dies at the build leaves the predecessor up and its .env is what the
+# next `systemctl start` — or the next reboot — reads. So .env carries DB_PASSWORD_EFFECTIVE, and
+# the ONE line that has to change when a rotation finally happens is changed here, on its own,
+# after the ALTER has succeeded.
+#
+# `^DATABASE_URL=` is anchored because DEPLOY_ADMIN_DATABASE_URL is in the same file and ends in
+# the same fourteen characters; and the count is asserted rather than assumed, because a
+# substitution that matched nothing would leave .env naming a credential the server no longer has
+# while this function reported success. The value travels through the ENVIRONMENT into awk, so no
+# byte of a password can be read as a regex, a backslash escape or a field separator.
+write_env_database_url() {
+  local url="$1" env_file="${APP_DIR}/.env" tmp matches
+  [[ -f "${env_file}" ]] || die "The credential of '${DB_USER}' has been rotated but ${env_file} does not exist, so nothing names the new one. The database has the NEW password and no environment file states it. Write DATABASE_URL by hand before starting ${APP_NAME}.service."
+  matches="$(grep -c '^DATABASE_URL=' "${env_file}" || true)"
+  [[ "${matches}" == "1" ]] || die "The credential of '${DB_USER}' has been rotated but ${env_file} holds ${matches} lines beginning DATABASE_URL= rather than exactly one, so this run will not guess which to rewrite. The database has the NEW password; set DATABASE_URL by hand before starting ${APP_NAME}.service."
+  tmp="$(mktemp "${env_file}.XXXXXX")" || die "The credential of '${DB_USER}' has been rotated but no temporary file could be created beside ${env_file} to rewrite it. The database has the NEW password; set DATABASE_URL by hand before starting ${APP_NAME}.service."
+  if ! IMS_NEW_DATABASE_URL="${url}" awk '
+      /^DATABASE_URL=/ { print "DATABASE_URL=" ENVIRON["IMS_NEW_DATABASE_URL"]; next }
+      { print }
+    ' "${env_file}" > "${tmp}"; then
+    rm -f "${tmp}"
+    die "The credential of '${DB_USER}' has been rotated but rewriting ${env_file} failed. The database has the NEW password; set DATABASE_URL by hand before starting ${APP_NAME}.service."
+  fi
+  chown "${APP_USER}:${APP_USER}" "${tmp}" 2>/dev/null || true
+  chmod 600 "${tmp}" || { rm -f "${tmp}"; die "The credential of '${DB_USER}' has been rotated but the replacement ${env_file} could not be made mode 600, so it was not installed. The database has the NEW password; set DATABASE_URL by hand before starting ${APP_NAME}.service."; }
+  mv -f "${tmp}" "${env_file}" || { rm -f "${tmp}"; die "The credential of '${DB_USER}' has been rotated but the rewritten ${env_file} could not be moved into place. The database has the NEW password; set DATABASE_URL by hand before starting ${APP_NAME}.service."; }
+}
+
+# @install-phase: credential-rotation
+#
+# THE ONE STATEMENT THAT TAKES A WORKING CREDENTIAL AWAY, AND THE ONLY WINDOW IN WHICH NOBODY IS
+# HOLDING IT (o3d-2sm1.5 r38, Codex HIGH).
+#
+# Reached only from the fenced path, and only after ALL of: the reboot fence is installed, the
+# crontab is fenced, `systemctl stop` has returned, the legacy launchers are stopped, the port is
+# no longer bound, the connection fence is RAISED and check-db-writers.mjs has said there is no
+# other backend on the database. Every one of those is asserted here rather than assumed, because
+# this function's whole value is WHERE it runs: called a few lines earlier it is the r37 defect
+# again, and a guard that cannot fail is not a guard.
+#
+# It is a no-op unless a rotation was explicitly asked for — a password that differs from the one
+# ${APP_DIR}/.env already carried for this exact role, host, port and database.
+rotate_database_password_in_fenced_window() {
+  ${DB_PASSWORD_ROTATION_PENDING} || return 0
+
+  [[ "${INSTALL_POSTGRES}" == "y" ]] || die "A database credential rotation was requested for '${DB_USER}', but this run does not manage a LOCAL PostgreSQL server, so it has no privileged local connection to issue ALTER USER over. Rotate the password on the database server by hand and re-run with the new value. NOTHING HAS BEEN MIGRATED."
+  ${FENCE_ARMED} || die "A database credential rotation was requested for '${DB_USER}' and this run has not stopped anything, so rotating now would take the password away from a predecessor that is still serving — the defect this ordering exists to prevent. NOTHING HAS BEEN MIGRATED and the role's password is UNCHANGED."
+  ${DB_FENCE_UP} || die "A database credential rotation was requested for '${DB_USER}' and the connection fence is NOT up, so a client can attach between now and the end of the migration and be refused mid-window. NOTHING HAS BEEN MIGRATED and the role's password is UNCHANGED."
+
+  header "Rotating the database credential (stopped, fenced)"
+  warn "This is a CLUSTER-WIDE change and the fence is DATABASE-specific: any OTHER client on this"
+  warn "server authenticating as '${DB_USER}' — against any database — is refused from its next"
+  warn "connection onwards. Nothing this installer can do makes that untrue; it is why the rotation"
+  warn "happens only because a password different from the installed one was supplied."
+
+  pg_local_psql -q >/dev/null <<EOSQL || die "Rotating the password of the existing role '${DB_USER}' failed. The service is STOPPED and the connection fence is UP; ${APP_DIR}/.env still names the credential the server already had, so the two agree and starting the old service by hand would work. NOTHING HAS BEEN MIGRATED. Fix the role or re-run without a password change."
+    ALTER USER "${DB_USER}" WITH PASSWORD '${DB_PASSWORD}';
+EOSQL
+
+  DB_ROLE_CREDENTIALS_ROTATED=true
+  DB_PASSWORD_ROTATION_PENDING=false
+  DB_PASSWORD_EFFECTIVE="${DB_PASSWORD}"
+  # The application connection is recomposed BEFORE .env is rewritten, so that a failure inside
+  # write_env_database_url() dies with this run's own DATABASE_URL already pointing at the
+  # credential the server now has, and its message can say exactly which file disagrees.
+  DATABASE_URL="postgresql://${DB_USER}:${DB_PASSWORD_EFFECTIVE}@${DB_HOST}:${DB_PORT}/${DB_NAME}"
+  write_env_database_url "${DATABASE_URL}"
+  success "The password of '${DB_USER}' has been rotated and ${APP_DIR}/.env now names it. The build ran before this, on the previous credential."
 }
 
 # THE EXEMPTION IS EARNED, NEVER INFERRED FROM WHAT IS ABSENT ON THIS HOST. Returns 0 only when
@@ -3017,21 +3147,34 @@ on_cutover_exit() {
     warn "  schema      : untouched — the migration was never invoked."
     warn "  database    : never fenced; the application still has CONNECT."
     # AND IF THIS RUN DID CHANGE A CREDENTIAL, THE BANNER SAYS SO (o3d-2sm1.5 r37, Codex HIGH).
-    # The ordering fix means no DATABASE refusal can reach here after a password change — the
-    # role work happens once the fence has been proved possible — but a BUILD failure can, and a
-    # banner that says "nothing has to be recovered first" over a rotated credential is the same
-    # untrue refusal one step further down.
+    # NOTHING REACHES HERE AFTER A CREDENTIAL CHANGE ANY MORE (o3d-2sm1.5 r38, Codex HIGH). r37
+    # left the rotation on this side of the stop and printed a paragraph here explaining what the
+    # operator now had to reconcile. The rotation has moved past the stop and the fence, so this
+    # banner — which is the REVERSIBLE path, the one that says "nothing has to be recovered
+    # first" — can say the credential is untouched and be telling the truth.
+    #
+    # THE CHECK IS KEPT AND INVERTED, because "always false" is exactly the kind of claim this
+    # branch keeps discovering was quietly no longer true. If a later edit ever moves an ALTER
+    # back in front of the stop, this says so in the failure banner instead of the operator
+    # finding out from their application's logs.
     #
     # DEFAULTED, BECAUSE THIS IS A TRAP. Every variable an exit handler reads has to survive being
     # read before the assignment that sets it: the whole point of the handler is that it runs on
     # paths the straight-line code never reached. Under `set -u` an unset name here would abort
     # the trap mid-banner and skip unwind_arming() below — the cleanup, not just the message.
     if ${DB_ROLE_CREDENTIALS_ROTATED:-false}; then
-      warn "  credentials : the password of the PRE-EXISTING role ${DB_USER:-<none>} was changed to the"
-      warn "                one this run wrote into the application's environment file, so those two"
-      warn "                agree and this host is consistent. Any OTHER client still using the"
-      warn "                previous password for that role needs the new one. Nothing else about"
-      warn "                the database was changed."
+      warn "  credentials : ORDERING DEFECT — the password of the PRE-EXISTING role ${DB_USER:-<none>} was"
+      warn "                changed BEFORE anything was stopped. It should not be possible to reach"
+      warn "                this banner in that state: the rotation belongs inside the stopped,"
+      warn "                fenced window. The application's environment file and the database"
+      warn "                agree, so this host is consistent, but any OTHER client still using the"
+      warn "                previous password for that role needs the new one, and the predecessor"
+      warn "                this run left running may already have lost its reconnect."
+    else
+      warn "  credentials : UNCHANGED. No database password was rotated: a rotation, when one is"
+      warn "                asked for at all, happens only after the stop and behind the connection"
+      warn "                fence, so the predecessor still running here holds a credential that"
+      warn "                works and its environment file still names it."
     fi
     unwind_arming
     warn "  Fix the cause and re-run. Nothing has to be recovered first."
@@ -3065,6 +3208,20 @@ on_cutover_exit() {
     error "                whether that could be put right."
   fi
   error "  cron        : ${APP_USER} entries left FENCED (commented out)."
+  # AND WHETHER THE CREDENTIAL MOVED (o3d-2sm1.5 r38, Codex HIGH). This is the path where a
+  # rotation CAN have happened — it is performed after the stop, behind the fence — so the
+  # operator is told, here, that the role's password is no longer the one anything else on this
+  # server is using. Defaulted for the same `set -u` reason as the banner above.
+  if ${DB_ROLE_CREDENTIALS_ROTATED:-false}; then
+    error "  credentials : the password of the PRE-EXISTING role ${DB_USER:-<none>} WAS ROTATED inside"
+    error "                this window, and ${APP_DIR:-<app dir>}/.env names the new one, so those"
+    error "                two agree. ALTER USER is cluster-wide: any OTHER client on this server"
+    error "                authenticating as that role, against ANY database, needs the new"
+    error "                password. Re-running this installer with the same value changes nothing"
+    error "                further."
+  else
+    error "  credentials : UNCHANGED — no database password was rotated by this run."
+  fi
   error "  Do NOT start ${APP_NAME}.service by hand. Fix the cause and re-run this"
   error "  installer, scripts/update.sh or scripts/deploy.sh — all three read this fence"
   error "  from the same place (${FENCE_FILE}) and adopt it."
@@ -3259,21 +3416,91 @@ if [[ -n "${DEFAULT_ADMIN_EMAIL}" ]]; then
   prompt NOTIFICATION_EMAIL "Email address to receive the login details" "${DEFAULT_ADMIN_EMAIL}"
 fi
 
+# THE INSTALLED DATABASE CREDENTIAL, RECOVERED THE WAY REDIS_URL ALREADY WAS (o3d-2sm1.5 r38,
+# Codex HIGH).
+#
+# The asymmetry this closes: REDIS_URL and REDIS_PASSWORD have been recovered out of the previous
+# ${APP_DIR}/.env for rounds, so an operator pressing Enter through an upgrade keeps both ends of
+# the Redis credential. DATABASE_URL was not, and its prompt defaulted to `openssl rand -hex 16` —
+# a NEW secret on every run. So an ORDINARY RE-INSTALL rotated the live database role's password
+# as a side effect of running the script, over a predecessor that was still serving.
+#
+# AND IT IS RECOVERED ONLY WHEN IT IS THE SAME CONNECTION. A password is not a property of this
+# host, it is a property of one role on one server; offering the previous run's secret back after
+# the operator has changed DB_USER, DB_HOST, DB_PORT or DB_NAME would compose a DATABASE_URL that
+# cannot authenticate and — worse — would make a genuine first credential look like a rotation.
+# So all four are compared, and anything that does not match answers "nothing installed", which
+# takes the same path as a first install.
+#
+# NOTHING IS PERCENT-DECODED. This installer COMPOSES the URL by interpolation and not by
+# encoding, so the bytes between the first `:` of the userinfo and the LAST `@` are exactly the
+# bytes it passed to CREATE USER. Decoding them would invent a different secret, and comparing a
+# decoded value with DB_PASSWORD would report a rotation that nobody asked for. The userinfo ends
+# at the LAST `@` for the reason redact_url_credentials() cuts there: an earlier one may be part
+# of the password itself.
+installed_database_password() {
+  local url="$1" want_user="$2" want_host="$3" want_port="$4" want_db="$5"
+  local rest userinfo location user password host port database
+  case "${url}" in
+    postgres://*|postgresql://*) ;;
+    *) return 1 ;;
+  esac
+  rest="${url#*://}"
+  case "${rest}" in *@*) ;; *) return 1 ;; esac
+  userinfo="${rest%@*}"
+  location="${rest##*@}"
+  case "${userinfo}" in *:*) ;; *) return 1 ;; esac
+  user="${userinfo%%:*}"
+  password="${userinfo#*:}"
+  [[ -n "${password}" ]] || return 1
+  case "${location}" in */*) ;; *) return 1 ;; esac
+  database="${location#*/}"
+  database="${database%%\?*}"
+  location="${location%%/*}"
+  case "${location}" in *:*) ;; *) return 1 ;; esac
+  host="${location%:*}"
+  port="${location##*:}"
+  [[ "${user}" == "${want_user}" ]] || return 1
+  [[ "${host}" == "${want_host}" ]] || return 1
+  [[ "${port}" == "${want_port}" ]] || return 1
+  [[ "${database}" == "${want_db}" ]] || return 1
+  printf '%s' "${password}"
+}
+
+# The prompt, on both branches, so the recovery cannot be true of one and not the other. It runs
+# AFTER DB_USER/DB_HOST/DB_PORT/DB_NAME are known, because whether there is anything to recover
+# is a question about those four.
+prompt_db_password() {
+  DB_PASSWORD_INSTALLED="$(installed_database_password "$(existing_env DATABASE_URL)" "${DB_USER}" "${DB_HOST}" "${DB_PORT}" "${DB_NAME}" || true)"
+  if [[ -n "${DB_PASSWORD_INSTALLED}" ]]; then
+    info "${APP_DIR}/.env already names ${DB_USER}@${DB_HOST}:${DB_PORT}/${DB_NAME}, so the credential it"
+    info "carries is the default here. Pressing Enter changes NOTHING about the role: this installer"
+    info "does not rotate a live database credential as a side effect of being re-run. Supplying a"
+    info "DIFFERENT password asks for a rotation, which is performed after the existing installation"
+    info "has been stopped and the database fenced — never while it is still serving."
+    prompt DB_PASSWORD "Database password" "${DB_PASSWORD_INSTALLED}" "secret" "$(mask_secret "${DB_PASSWORD_INSTALLED}")"
+  elif [[ "${INSTALL_POSTGRES}" == "y" ]]; then
+    prompt DB_PASSWORD "Database password" "$(openssl rand -hex 16)" "secret"
+  else
+    prompt DB_PASSWORD "Database password" "" "secret"
+  fi
+}
+
 echo ""
 info "--- PostgreSQL ---"
 prompt_yn INSTALL_POSTGRES "Install PostgreSQL on this server?" "y"
 if [[ "$INSTALL_POSTGRES" == "y" ]]; then
   prompt DB_NAME      "Database name"           "one_two_inventory"
   prompt DB_USER      "Database user"           "imsuser"
-  prompt DB_PASSWORD  "Database password"       "$(openssl rand -hex 16)" "secret"
   DB_HOST="localhost"
   DB_PORT="5432"
+  prompt_db_password
 else
   prompt DB_HOST      "PostgreSQL host"         "localhost"
   prompt DB_PORT      "PostgreSQL port"         "5432"
   prompt DB_NAME      "Database name"           "one_two_inventory"
   prompt DB_USER      "Database user"           "imsuser"
-  prompt DB_PASSWORD  "Database password"       "" "secret"
+  prompt_db_password
 fi
 
 echo ""
@@ -3516,7 +3743,31 @@ if [[ "$INSTALL_POSTGRES" == "y" ]]; then
   create_database_and_record_newness
 fi
 
-DATABASE_URL="postgresql://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}"
+# WHICH CREDENTIAL EVERY CONNECTION BEFORE THE STOP USES (o3d-2sm1.5 r38, Codex HIGH).
+#
+# A rotation was asked for when all three are true: the role was ALREADY on this server when this
+# run arrived (so somebody may be using it), ${APP_DIR}/.env named a password for this exact
+# connection, and the operator supplied a different one. Anything indeterminate — no recoverable
+# installed password, a role this run created itself, an external database this script does not
+# administer — is NOT a rotation, and nothing is ALTERed at all.
+#
+# When one IS pending, DATABASE_URL keeps the OLD credential for the whole pre-stop window. That
+# is what .env is written with, what `prisma generate` and `npm run build` are handed through
+# MIGRATION_DATABASE_URL, and what the fence preflight opens the application connection with — so
+# a build that fails leaves a predecessor whose environment file and whose database still agree.
+# rotate_database_password_in_fenced_window() replaces both, together, after the stop.
+DB_PASSWORD_EFFECTIVE="${DB_PASSWORD}"
+DB_PASSWORD_ROTATION_PENDING=false
+if ${DB_ROLE_PREEXISTED} && [[ -n "${DB_PASSWORD_INSTALLED}" && "${DB_PASSWORD}" != "${DB_PASSWORD_INSTALLED}" ]]; then
+  DB_PASSWORD_ROTATION_PENDING=true
+  DB_PASSWORD_EFFECTIVE="${DB_PASSWORD_INSTALLED}"
+  warn "A password DIFFERENT from the one ${APP_DIR}/.env carries was supplied for the PRE-EXISTING"
+  warn "role '${DB_USER}', so this run will rotate it — but not yet. Everything up to and including"
+  warn "the build uses the credential the server already has; the ALTER happens once the existing"
+  warn "installation is stopped and the database is fenced."
+fi
+
+DATABASE_URL="postgresql://${DB_USER}:${DB_PASSWORD_EFFECTIVE}@${DB_HOST}:${DB_PORT}/${DB_NAME}"
 
 # THE SAME FOUR VALUES THE URL ABOVE WAS COMPOSED FROM, handed to the connection fence rather
 # than parsed back out of it (o3d-2sm1.5 r19). Nothing is derived, so nothing can be derived
@@ -3968,6 +4219,15 @@ if ${FENCED_CUTOVER}; then
   # unchanged. The fence has been proved possible, and an adopted one is already standing.
   provision_database_role_and_privileges
 else
+  # A ROTATION HAS NOWHERE SAFE TO HAPPEN ON THIS PATH (o3d-2sm1.5 r38, Codex HIGH). The exemption
+  # says THIS run created THIS database, so nothing is serving it — but the ROLE is cluster-wide
+  # and DB_PASSWORD_ROTATION_PENDING is only ever set over a role this run did NOT create. It is
+  # therefore somebody else's role, on some other database, with no window to fence and no service
+  # to stop. Refused here, before the build and before anything is written to the database.
+  if ${DB_PASSWORD_ROTATION_PENDING}; then
+    die "A password different from the installed one was supplied for '${DB_USER}', but this run has taken the first-install exemption: it created database '${DB_NAME}' itself and there is no existing installation to stop and no migration window to fence. The role '${DB_USER}' was ALREADY on this server, so rotating it would take the credential away from whatever else uses it, with nothing held closed. Re-run with the password that role already has, or rotate it deliberately on the server first. NOTHING HAS BEEN MIGRATED and the role's password is UNCHANGED."
+  fi
+
   first_install_fence_policy
 
   # Nothing is serving, no crontab is live, and create_database_and_record_newness() proved this
@@ -4068,6 +4328,13 @@ if ${UPGRADE_EXISTING}; then
       node "${APP_DIR}/scripts/check-db-writers.mjs" ) \
     || die "Another client is still connected to the target database. Stop it and re-run; the migration has NOT been applied."
   success "No other client backends on the target database."
+
+  # AND ONLY NOW MAY A WORKING CREDENTIAL BE TAKEN AWAY (o3d-2sm1.5 r38, Codex HIGH). Nothing is
+  # serving, the reboot fence is standing, the crontab is fenced, the port is free, the connection
+  # fence is up and the database has just said no other backend is attached. This is a no-op
+  # unless the operator supplied a password different from the installed one.
+  CUTOVER_STEP="rotate-credential"
+  rotate_database_password_in_fenced_window
 else
   info "No existing installation: nothing is serving and no crontab is live, so there is"
   info "no writer to stop and no cutover to fence."
