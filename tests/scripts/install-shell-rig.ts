@@ -156,6 +156,12 @@ DB_ROTATION_RECONCILED_PASSWORD=""
 DB_ROTATION_RECONCILED_WHICH=""
 DB_ROTATION_PROBE_DATABASE=""
 DB_PROBE_REPORT=""
+# r42 (Codex HIGH): the route the reader observed, and the endpoint it observed it on. Declared
+# here for the same reason every other global is: the shipped FUNCTIONS are lifted, the assignments
+# beside them are not, and \`set -u\` turns a missing one into a dead shell rather than a red test.
+DB_PROBE_ROUTE_DATABASE=""
+DB_PROBE_SSLMODE=""
+DB_ENDPOINT_ROUTE_SSLMODE=""
 # r41 (Codex HIGH): THE SHIPPED READER, at its real path.
 #
 # In install.sh this resolves from \${IMS_SCRIPT_LIB_DIR}, which is derived from BASH_SOURCE — and
@@ -166,6 +172,29 @@ DB_PROBE_REPORT=""
 # and there is one — can still ask for it by name.
 IMS_AUTH_REQUEST_PROBE="${join(REPO, 'scripts/lib/pg-auth-request.mjs')}"
 ${CAPTURE_TERMINATOR_ASSIGNMENT}
+# r42 (Codex HIGH): ONE PROBE ON A ROUTE THE TEST STATES, AND NO ROUTE LEFT BEHIND.
+#
+# The shipped gate gets its route from the authentication-request reader and from nowhere else, and
+# a probe with no route REFUSES — which is the fix. That makes the credential half of the gate
+# unreachable on its own, and several preconditions in these files exist precisely to measure it on
+# its own: on a trust endpoint, on a RADIUS one, on a cleartext one, all of which the METHOD half
+# refuses one step earlier. So the tests state a route explicitly for those measurements.
+#
+# It cannot weaken anything. It is defined in the RIG and not in install.sh, it is used only by
+# lines that say what they are measuring, and it CLEARS the route again — so a shipped function
+# called afterwards is back to needing the reader, and a test cannot pass on a route left lying
+# about by the line above it. The assignments are written out rather than used as a VAR=x cmd
+# prefix because bash keeps such an assignment after a FUNCTION call.
+on_route() {
+  local database="$1" sslmode="$2" status=0
+  shift 2
+  DB_PROBE_ROUTE_DATABASE="\${database}"
+  DB_PROBE_SSLMODE="\${sslmode}"
+  "$@" || status=$?
+  DB_PROBE_ROUTE_DATABASE=""
+  DB_PROBE_SSLMODE=""
+  return "\${status}"
+}
 declare -A EXISTING_ENV=()
 ${assignments}
 # r39: the interrupted-rotation journal, resolved AFTER the caller's assignments because it hangs

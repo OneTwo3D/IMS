@@ -101,7 +101,20 @@ export function startRadiusVerifier(
   })
 }
 
-/** The pg_hba record that points ONE database at that verifier, and leaves the rest alone. */
-export function radiusHbaLine(database: string, port: number, secret: string): string {
-  return `host ${database} all 127.0.0.1/32 radius radiusservers="127.0.0.1" radiusports="${port}" radiussecrets="${secret}"`
+/**
+ * The pg_hba record that points ONE database at that verifier, and leaves the rest alone.
+ *
+ * `connection` is a parameter since r42 (Codex HIGH), because the finding that round is about the
+ * TRANSPORT a record is matched on: `hostnossl` puts the directory on the cleartext route ONLY,
+ * underneath a `hostssl` record that checks the role's own credential, which is the configuration
+ * where a reader reporting `scram-sha-256` and a probe answered by a directory are both telling
+ * the truth about different connections. `host` — the default — matches either transport.
+ */
+export function radiusHbaLine(
+  database: string,
+  port: number,
+  secret: string,
+  connection: 'host' | 'hostssl' | 'hostnossl' = 'host',
+): string {
+  return `${connection} ${database} all 127.0.0.1/32 radius radiusservers="127.0.0.1" radiusports="${port}" radiussecrets="${secret}"`
 }

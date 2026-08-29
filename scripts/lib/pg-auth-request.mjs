@@ -48,18 +48,29 @@
  *   * It cannot admit `password` (cleartext compared against the role's own secret), because the
  *     wire cannot tell it from `ldap`. That is a deliberate narrowing, and it costs a site running
  *     cleartext-against-PostgreSQL a refusal it did not strictly have to have.
- *   * IT IS A SEPARATE CONNECTION from the one the caller then opens with psql, and there are two
- *     measured ways the two can land on different pg_hba records. The obvious one is a reload
- *     between them. The other was found by running it rather than by reasoning about it:
- *     `sslmode=prefer` does not mean "use TLS", it means try TLS AND RETRY WITHOUT IT IF THAT
- *     CONNECTION FAILS -- so against `hostssl ... scram-sha-256` over `hostnossl ... trust`, a psql
- *     given a wrong password is refused by scram, drops to the clear, and is let in by trust. This
- *     program never fails an authentication, so it stops at the hostssl record and reports an
- *     entirely admissible `scram-sha-256`.
- *     THE CALLER'S NEGATIVE CONTROL IS WHAT CATCHES BOTH, because it opens the connection the
- *     reconciliation will actually open and watches a password nothing can know be accepted. That
- *     is why the control is kept rather than retired as redundant, and there is a regression on
- *     exactly that cluster.
+ *   * IT IS A SEPARATE CONNECTION from the one the caller then opens with psql. That is why this
+ *     program REPORTS THE ROUTE IT TOOK and not only the method it read -- see `sslmode=` below.
+ *     A method observed on one transport is not a statement about another, and libpq's default
+ *     `sslmode=prefer` picks its transport at RUN TIME: it means try TLS AND RETRY WITHOUT IT IF
+ *     THAT CONNECTION FAILS, so against `hostssl ... scram-sha-256` over `hostnossl ... <anything>`
+ *     a psql given a wrong password is refused by scram, drops to the clear, and is answered by
+ *     the other record. This program never fails an authentication, so it stops at the hostssl
+ *     record and reports an entirely admissible `scram-sha-256` -- and where the record underneath
+ *     is `trust` the caller's negative control catches the divergence, while where it is `radius`
+ *     over a directory holding the CURRENT password, the control is satisfied by it too and BOTH
+ *     INSTRUMENTS PASS WHILE THE ANSWER IS FALSE, because they are answering about different
+ *     transports (o3d-2sm1.5 r42, Codex HIGH).
+ *     SO THE DIVERGENCE IS REMOVED RATHER THAN CROSS-CHECKED. `sslmode=` names the libpq setting
+ *     that reproduces the transport this connection actually used, and install.sh pins every
+ *     credential-bearing connection to that endpoint to it -- `require` or `disable`, never
+ *     `prefer` -- so an authentication failure has no second record to select. What remains is a
+ *     pg_hba RELOAD between the two connections, which no pinning can close and which the negative
+ *     control does still catch.
+ *   * IT NEGOTIATES NO GSSAPI ENCRYPTION, and neither may the caller. libpq's `gssencmode=prefer`
+ *     sends a GSSENCRequest BEFORE the SSLRequest wherever a Kerberos credential cache is present,
+ *     and a connection that takes it is matched by `hostgssenc` records this program never sees.
+ *     install.sh therefore pairs the `sslmode=` pin with `gssencmode=disable`; the pin is only a
+ *     pin if it covers every transport decision libpq makes on its own.
  *
  * WHY IT SPEAKS THE PROTOCOL RATHER THAN READING A CATALOGUE. `pg_hba_file_rules` (PostgreSQL 10
  * and later) lists the PARSED RULES. A rule listing is not a match: deciding which record applies
@@ -87,18 +98,18 @@
  * The startup message is the one answer every supported version gives, in the same bytes, and has
  * given since protocol 3.0.
  *
- * SSL. libpq's default `sslmode` is `prefer`, which is what every psql this installer runs uses,
- * and Debian's packaged cluster ships `ssl = on`. So the negotiation here is `prefer`'s, exactly:
+ * SSL. This connection negotiates exactly what libpq's default `sslmode=prefer` negotiates:
  * SSLRequest first, upgrade if the server answers `S`, continue in the clear if it answers `N`,
- * and verify nothing -- `prefer` verifies nothing. Getting this wrong would not produce a wrong
- * answer, it would produce a `hostssl` record matched in one connection and a `hostnossl` record
- * in the other. It is measured on a TLS-only cluster rather than asserted: an `initdb` cluster
- * ships `ssl = off`, so a regression suite that only ever runs one of those leaves the transport
- * every real installation uses entirely untested.
+ * and verify nothing -- `prefer` verifies nothing. Debian's packaged cluster ships `ssl = on`, so
+ * on an ordinary installation that is a TLS connection and a `hostssl` record; an `initdb` cluster
+ * ships `ssl = off` and it is a `hostnossl` one. Both are measured, on real clusters, because a
+ * suite that only ever runs the second leaves the transport every real installation uses untested.
  *
- * WHAT `prefer` DOES NOT DO IS GUARANTEE TLS, and the bullet above is the consequence: it retries
- * in the clear when the TLS connection FAILS, which an authentication this program never performs
- * cannot provoke.
+ * `prefer` IS THE RIGHT THING TO OBSERVE WITH AND THE WRONG THING TO ACT ON. Observing with it is
+ * what makes this connection land where an unpinned psql would have landed, which is the whole
+ * value of reading the route rather than assuming one. Acting on it is what let an authentication
+ * FAILURE select a second pg_hba record -- so the caller acts on `sslmode=` below instead, and the
+ * word `prefer` appears in no connection install.sh opens with a credential.
  *
  * Unix-domain sockets take no SSLRequest, for the same reason libpq sends none.
  */
@@ -114,7 +125,7 @@ const DEFAULT_TIMEOUT_MS = 10_000
 const NUL = '\u0000'
 
 function die(message, status) {
-  process.stdout.write(`method=unknown\nverifier=unknown\ndetail=${message}\n`)
+  process.stdout.write(`sslmode=unknown\nmethod=unknown\nverifier=unknown\ndetail=${message}\n`)
   process.exit(status)
 }
 
@@ -345,8 +356,34 @@ function classify(type, payload) {
   }
 }
 
+/**
+ * THE ROUTE THIS CONNECTION TOOK, AS THE libpq SETTING THAT REPRODUCES IT (r42, Codex HIGH).
+ *
+ * The caller pins every subsequent credential-bearing connection to this endpoint to exactly this
+ * value, so that an authentication failure cannot fall back onto a second pg_hba record. It is
+ * derived from what HAPPENED on the wire and never from what was asked for:
+ *
+ *   `require`   TLS was negotiated. `require` encrypts and verifies nothing, which is what
+ *               `prefer` did here -- so it matches the same `hostssl` record, and it CANNOT retry
+ *               in the clear, which is the whole point.
+ *   `disable`   the server answered `N` and the exchange continued in the clear, so the record
+ *               matched was a `hostnossl`/`host` one. `disable` sends no SSLRequest at all and so
+ *               cannot be upgraded onto the other record either.
+ *               A Unix-domain socket reports `disable` too. libpq ignores sslmode there -- there
+ *               is no SSLRequest on a socket, for either of us -- and `local` records are matched
+ *               by neither `hostssl` nor `hostnossl`, so there is no second record to fall onto.
+ *   `unknown`   nothing was negotiated: the connection failed, or the server refused it before
+ *               the startup message. There is no route to pin to, and the caller refuses.
+ */
+function pinFor(transport, ssl) {
+  if (transport === 'unix') return 'disable'
+  if (ssl === 'yes') return 'require'
+  if (ssl === 'no') return 'disable'
+  return 'unknown'
+}
+
 function report(transport, ssl, verdict) {
-  process.stdout.write(`transport=${transport}\nssl=${ssl}\nmethod=${verdict.method}\nverifier=${verdict.verifier}\ndetail=${verdict.detail}\n`)
+  process.stdout.write(`transport=${transport}\nssl=${ssl}\nsslmode=${pinFor(transport, ssl)}\nmethod=${verdict.method}\nverifier=${verdict.verifier}\ndetail=${verdict.detail}\n`)
 }
 
 async function main() {

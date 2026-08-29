@@ -968,14 +968,36 @@ pg_local_psql() {
     -h "$(db_local_socket_dir)" -p "${DB_PORT}" -d postgres "$@"
 }
 
+# THE ROUTE A CREDENTIAL-BEARING CONNECTION IS PINNED TO (o3d-2sm1.5 r42, Codex HIGH).
+#
+# Empty is libpq's own default, `sslmode=prefer` — which is what the server-identity read below
+# wants, because that connection is opened to be LIKE the application's and not to be evidence
+# about a password. Set to `require` or `disable` it removes libpq's run-time transport choice
+# entirely, and with it the second pg_hba record an authentication FAILURE could otherwise select.
+#
+# IT IS NEVER EXPORTED and its name begins with neither PG nor PSQL, so libpq_env_unset_args()
+# neither strips it nor mistakes it for a libpq setting. The functions that pin it set it inside a
+# SUBSHELL, which is what keeps a `VAR=x function` prefix's well-known persistence out of this.
+DB_ENDPOINT_ROUTE_SSLMODE=""
+
 # A connection opened the way the APPLICATION opens its own: TCP, to the four values
-# DATABASE_URL is composed from. Used only to read a server identity back.
+# DATABASE_URL is composed from. Used only to read a server identity back — and, with the route
+# above pinned, as the one credential-bearing probe on the rotation path.
 pg_endpoint_psql() {
   local role="$1" password="$2" database="$3"
   shift 3
-  local -a unset_args=() keep=()
+  local -a unset_args=() keep=() route=()
   local i=0
   libpq_env_unset_args unset_args
+  # THE PIN, AS TWO libpq SETTINGS AND NOT ONE. `sslmode` decides TLS; `gssencmode` decides GSSAPI
+  # encryption, defaults to `prefer` wherever libpq was built with GSSAPI, and a connection that
+  # takes it is matched by `hostgssenc` records — a third transport, and one the reader never
+  # negotiates. Pinning only the first would leave the divergence open on any host with a Kerberos
+  # credential cache. They come AFTER the `-u` options: env unsets during option parsing and
+  # assigns afterwards, so these win over anything the caller's environment carried.
+  if [[ -n "${DB_ENDPOINT_ROUTE_SSLMODE}" ]]; then
+    route=("PGSSLMODE=${DB_ENDPOINT_ROUTE_SSLMODE}" "PGGSSENCMODE=disable")
+  fi
   # THE ONE VARIABLE THIS CONNECTION SUPPLIES ITSELF IS KEPT OUT OF THE UNSET LIST, and then
   # EXPORTED rather than passed to `env` as an argument. `env PGPASSWORD=... psql` would put the
   # credential in env's argv, where every process on the box can read it out of ps for as long as
@@ -988,7 +1010,7 @@ pg_endpoint_psql() {
   done
   (
     export PGPASSWORD="${password}"
-    run_as_user postgres env "${keep[@]}" psql \
+    run_as_user postgres env "${keep[@]}" "${route[@]}" psql \
       -X -w -v ON_ERROR_STOP=1 -v VERBOSITY=verbose \
       -h "${DB_HOST}" -p "${DB_PORT}" -U "${role}" -d "${database}" "$@"
   )
@@ -1159,6 +1181,27 @@ pg_extract_server_identity() {
 # refusal cannot land after a live role's password has been changed. So this creates a role that
 # by construction nothing else uses, with a random password, reads one row as it, and drops it.
 # It cannot collide with an existing role and it cannot alter one.
+#
+# AND IT IS DELIBERATELY NOT PINNED TO THE READER'S ROUTE (o3d-2sm1.5 r42, Codex HIGH). r42 binds
+# every credential-bearing probe on the ROTATION path to the transport the authentication-request
+# reader observed, and this connection carries a credential and can run after that reader has
+# spoken — so it was asked the same question, and the answer is that it must not be pinned:
+#
+#   * ITS CONCLUSION CANNOT BE FALSIFIED BY A TRANSPORT DIVERGENCE. What it asserts is that the
+#     postmaster answering ${DB_HOST}:${DB_PORT} is the one the CREATE landed on, and it asserts
+#     it by comparing a start time, a port and a database oid. Which pg_hba record admitted the
+#     connection does not change which postmaster answered it, so falling back from TLS to the
+#     clear — or being let in by `trust` — changes nothing about the identity that comes back.
+#     The rotation probes are pinned because their conclusion is ABOUT the authentication; this
+#     one's is about the server behind it.
+#   * AND PINNING IT WOULD MAKE IT LESS LIKE THE APPLICATION, WHICH IS ITS WHOLE POINT. It exists
+#     to reach the endpoint the way DATABASE_URL will be used, and node-postgres opens that
+#     connection with no TLS unless told to. Forcing `sslmode=require` here would refuse installs
+#     on ordinary non-TLS clusters, and forcing `disable` would refuse them on TLS-only ones —
+#     each of them a run stopped by the probe rather than by the endpoint.
+#
+# The route the ROTATION uses is therefore left alone by this function: it neither reads
+# DB_PROBE_SSLMODE nor sets it, and DB_ENDPOINT_ROUTE_SSLMODE is empty on every path into here.
 verify_created_database_endpoint() {
   local created_identity="$1"
   local probe_role probe_password probe_output="" probe_identity="" status=0
@@ -2042,21 +2085,57 @@ clear_role_rotation_journal() {
 # external verifier can only be consulted with the plaintext. Refusing it is a deliberate
 # narrowing, and the refusal below says so and says what to change.
 #
-# NOR IS THE METHOD OBSERVED ON THE SAME CONNECTION psql then opens. It is observed on one stating
-# the same user, database, host, port and SSL preference — and there are two measured ways those
-# can still land on different pg_hba records. A reload between them is the obvious one. The other
-# was found by running it: `sslmode=prefer` means try TLS AND RETRY WITHOUT IT IF THAT CONNECTION
-# FAILS, so against `hostssl ... scram-sha-256` over `hostnossl ... trust` a psql given a wrong
-# password is refused by scram, drops to the clear, and is let in by trust — while the reader,
-# which never fails an authentication, stops at the hostssl record and reports an admissible
-# `scram-sha-256`. THE NEGATIVE CONTROL CATCHES BOTH, because it opens the connection the
-# reconciliation will actually open. That is why it is kept rather than retired as redundant, and
-# there is a regression on exactly that cluster.
+# ---------------------------------------------------------------------------
+# TWO CORRECT INSTRUMENTS, ONE WRONG CONCLUSION, BECAUSE NOTHING PINNED THEM TO THE SAME ROUTE
+# (o3d-2sm1.5 r42, Codex HIGH)
+# ---------------------------------------------------------------------------
+#
+# THE DEFECT r41 LEFT. The method proof and the negative control were kept side by side on the
+# grounds that each covers the other's gap. They were also asking about DIFFERENT TRANSPORTS, and
+# there is a cluster on which both pass and the answer is still false:
+#
+#   `hostssl  all all <host> scram-sha-256`
+#   `hostnossl all all <host> radius`        — over a directory holding the role's CURRENT password
+#
+#   The reader negotiates TLS, stops at the hostssl record and reports `scram-sha-256`. Honestly:
+#   that IS the record it matched. The credential probe then runs under libpq's default
+#   `sslmode=prefer`, which does not mean "use TLS" — it means try TLS, AND IF THAT CONNECTION
+#   FAILS, RETRY WITHOUT IT. The random control fails SCRAM over TLS, drops to the clear, and is
+#   REFUSED by RADIUS too — so the control's NO is satisfied, by the wrong record. The asserted
+#   password succeeds over TLS, so its YES is satisfied by the right one. Both instruments pass.
+#   After the ALTER and an interruption the two records disagree: the NEW password authenticates
+#   over TLS, and the OLD one fails there, falls back, and is ACCEPTED by the directory. The
+#   reconciliation sees both candidates accepted, refuses — correctly, given what it was shown —
+#   and a recoverable installation is left needing a person.
+#
+# THE FIX IS TO REMOVE THE DIVERGENCE, NOT TO ADD A THIRD CHECK. Three mechanisms that can
+# disagree are worse than two. lib/pg-auth-request.mjs now REPORTS THE ROUTE IT TOOK, as the libpq
+# setting that reproduces it — `sslmode=require` when TLS was negotiated, `sslmode=disable` when it
+# was not — and every credential-bearing connection this run then opens to that endpoint is pinned
+# to that value, with `gssencmode=disable` beside it because GSSAPI encryption is a third transport
+# libpq will otherwise negotiate on its own. `prefer` appears in no probe. An authentication
+# failure now has no second record to select, so the method the reader read is the method the
+# password is checked by.
+#
+# WHAT THE NEGATIVE CONTROL IS STILL FOR, having lost that job. It is kept, and not out of
+# caution — it is the only thing that catches two live cases:
+#
+#   THE POSITIVE HALF is the only instrument here that authenticates at all. The reader never
+#   does, so it cannot tell a healthy scram endpoint from one where '${DB_USER}' has no CONNECT —
+#   and THIS INSTALLER'S OWN FENCE REVOKES CONNECT on '${DB_NAME}'. Without the YES, "refused
+#   everything" would read as password-sensitivity and a fenced endpoint would be admitted.
+#   THE NEGATIVE HALF still catches a route that announces `scram-sha-256` and then accepts
+#   anything. Pinning closes the transport divergence; it cannot close a pg_hba RELOAD between the
+#   two connections, and it says nothing about a pooler or proxy on ${DB_HOST}:${DB_PORT} that
+#   speaks SASL itself without verifying. Both end with a password nothing can know being accepted
+#   on the pinned route, which is exactly what the control watches for. There is a regression that
+#   reloads pg_hba between the reader and the probe and requires the control to refuse.
 #
 # THE ORDER IS METHOD FIRST, AND THAT IS NOT AN OPTIMISATION. The positive half of the control
 # sends the application role's real password to the endpoint. Running it before the method is
 # known is handing that credential to a directory server this run has not yet established is not
-# involved. So nothing is sent until the server has said it is checking its own catalogue.
+# involved. It is also what pins the route: until the reader has spoken there is no transport to
+# bind to, and a probe with no route REFUSES rather than falling back to libpq's default.
 #
 # ---------------------------------------------------------------------------
 # A PROBE THAT CANNOT SAY NO IS NOT EVIDENCE (o3d-2sm1.5 r40, Codex HIGH)
@@ -2100,11 +2179,28 @@ clear_role_rotation_journal() {
 # the ALTER, so the role still has the credential its clients hold, and the reconciliation refuses
 # before anything is stopped, with the journal left in place carrying both candidates.
 
+# THE ROUTE THE READER OBSERVED, AND THE ENDPOINT IT OBSERVED IT ON (o3d-2sm1.5 r42, Codex HIGH).
+#
+# Set together by db_endpoint_checks_role_verifier() and cleared together by it, so that a route
+# proven for one database can never be spent on another. Empty means no reader has spoken, and
+# every credential-bearing probe below REFUSES on that rather than opening a connection libpq gets
+# to route for itself.
+DB_PROBE_ROUTE_DATABASE=""
+DB_PROBE_SSLMODE=""
+
 # Does this endpoint let ${DB_USER} in with these bytes? The verdict is the EXIT STATUS of a
 # `SELECT 1` and never a match on the server's message, which is localised by lc_messages.
+#
+# IT GOES OUT ON THE READER'S ROUTE OR IT DOES NOT GO OUT (r42). The pin is set in a SUBSHELL: a
+# `VAR=x function` prefix would survive the call — bash keeps such an assignment after a FUNCTION
+# invocation — and a route left set is a route the next endpoint would inherit.
 db_endpoint_accepts_password() {
   local database="$1" password="$2"
-  pg_endpoint_psql "${DB_USER}" "${password}" "${database}" -tAc 'SELECT 1' >/dev/null 2>&1
+  [[ -n "${DB_PROBE_SSLMODE}" && "${DB_PROBE_ROUTE_DATABASE}" == "${database}" ]] || return 1
+  (
+    DB_ENDPOINT_ROUTE_SSLMODE="${DB_PROBE_SSLMODE}"
+    pg_endpoint_psql "${DB_USER}" "${password}" "${database}" -tAc 'SELECT 1'
+  ) >/dev/null 2>&1
 }
 
 # The endpoint that was PROVEN able to discriminate, and the sentence explaining every endpoint
@@ -2127,12 +2223,20 @@ db_auth_request_probe_path() {
   printf '%s' "${IMS_AUTH_REQUEST_PROBE:-${IMS_SCRIPT_LIB_DIR:-}/pg-auth-request.mjs}"
 }
 
-# THE MATCHED METHOD, AS THE SERVER STATED IT. Returns 0 only when the rule PostgreSQL itself
-# matched for ${DB_USER} on this database, from ${DB_HOST}, over the transport libpq's default
-# `sslmode=prefer` negotiates, checks the secret `ALTER ROLE` writes. Appends to DB_PROBE_REPORT
-# on every refusal. Sends no password.
+# THE MATCHED METHOD, AS THE SERVER STATED IT — AND THE ROUTE IT WAS STATED ON.
+#
+# Returns 0 only when the rule PostgreSQL itself matched for ${DB_USER} on this database, from
+# ${DB_HOST}, over the transport this reader negotiated, checks the secret `ALTER ROLE` writes.
+# Appends to DB_PROBE_REPORT on every refusal. Sends no password.
+#
+# ON SUCCESS IT PUBLISHES THE ROUTE (r42): DB_PROBE_SSLMODE is the libpq setting that reproduces
+# the transport the reader used, read out of the reader's own `sslmode=` line rather than inferred
+# here, and DB_PROBE_ROUTE_DATABASE is the endpoint it belongs to. ON EVERY OTHER PATH IT CLEARS
+# THEM, which is what makes an unproven endpoint unprobeable rather than probeable-by-default.
 db_endpoint_checks_role_verifier() {
-  local database="$1" probe verdict method detail status=0
+  local database="$1" probe verdict method detail sslmode status=0
+  DB_PROBE_ROUTE_DATABASE=""
+  DB_PROBE_SSLMODE=""
   probe="$(db_auth_request_probe_path)"
   if [[ ! -f "${probe}" ]]; then
     DB_PROBE_REPORT+="
@@ -2150,10 +2254,22 @@ db_endpoint_checks_role_verifier() {
     --host="${DB_HOST}" --port="${DB_PORT}" --user="${DB_USER}" --database="${database}" || status=$?
   method="$(printf '%s\n' "${verdict}" | sed -n 's/^method=//p' | head -1)"
   detail="$(printf '%s\n' "${verdict}" | sed -n 's/^detail=//p' | head -1)"
+  sslmode="$(printf '%s\n' "${verdict}" | sed -n 's/^sslmode=//p' | head -1)"
   [[ -n "${method}" ]] || method="unknown"
   [[ -n "${detail}" ]] || detail="the reader printed nothing this run could parse"
   if [[ "${status}" -eq 0 ]]; then
-    return 0
+    # A METHOD WITHOUT A ROUTE IS NOT USABLE (r42). The two are published together or not at all:
+    # a probe pinned to nothing is a probe libpq routes for itself, which is the divergence.
+    case "${sslmode}" in
+      require|disable)
+        DB_PROBE_ROUTE_DATABASE="${database}"
+        DB_PROBE_SSLMODE="${sslmode}"
+        return 0
+        ;;
+    esac
+    DB_PROBE_REPORT+="
+  - '${database}' named an admissible matched method ('${method}') but did not name the TRANSPORT it read it on: its sslmode line says '${sslmode:-nothing at all}'. A pg_hba rule is matched per transport — hostssl and hostnossl are different records — so a method read over an unstated route cannot be pinned to, and this run will not send a credential over one libpq gets to choose for itself. Re-run the installer from a complete release checkout."
+    return 1
   fi
   DB_PROBE_REPORT+="
   - '${database}' does not authenticate '${DB_USER}' against PostgreSQL's own role credential: the matched pg_hba method reads as '${method}', and ${detail}. Only 'scram-sha-256' and 'md5' compare the secret ALTER ROLE writes, so nothing this endpoint says about a candidate password is evidence about the role."
@@ -2164,11 +2280,22 @@ db_endpoint_checks_role_verifier() {
 # the caller is asserting is live. Appends a line to DB_PROBE_REPORT either way.
 #
 # IT IS NO LONGER THE WHOLE GATE (r41) — db_endpoint_checks_role_verifier() runs FIRST and decides
-# whose password is being checked. This half is kept because it is the only thing that would catch
-# the two connections being matched by different pg_hba records, and because a positive that the
-# endpoint refuses still means the role cannot get in there at all.
+# whose password is being checked, and since r42 also pins the transport this runs on. What is
+# left to this half is stated at length in the block above and in two sentences here: the POSITIVE
+# is the only authentication anything in this gate performs, so it is the only thing that can tell
+# a healthy endpoint from one where the role has no CONNECT; and the NEGATIVE is the only thing
+# that catches a route which announces `scram-sha-256` and then accepts anything anyway — a pg_hba
+# reload landing between the two connections, or a pooler that speaks SASL without verifying.
 db_endpoint_discriminates_passwords() {
   local database="$1" positive="$2" control
+  # NO ROUTE, NO PROBE. Reached only when this is called without the method gate in front of it;
+  # the report says which of the two questions was skipped rather than blaming the endpoint for a
+  # refusal this run manufactured.
+  if [[ -z "${DB_PROBE_SSLMODE}" || "${DB_PROBE_ROUTE_DATABASE}" != "${database}" ]]; then
+    DB_PROBE_REPORT+="
+  - '${database}' was not probed with a credential at all, because no reader has established which TRANSPORT its pg_hba rule was matched on. A password sent over a route this run has not observed can be answered by a different record from the one the method was read from, so it is not sent."
+    return 1
+  fi
   control="$(openssl rand -hex 32)"
   if db_endpoint_accepts_password "${database}" "${control}"; then
     DB_PROBE_REPORT+="
@@ -2183,9 +2310,11 @@ db_endpoint_discriminates_passwords() {
   return 0
 }
 
-# THE WHOLE GATE, IN THE ORDER THE ARGUMENT RUNS (r41). Whose password first, then whether this
-# endpoint can tell one from another, then whether the role can get in with the one asserted live.
-# Nothing is sent to the server until the first question has been answered.
+# THE WHOLE GATE, IN THE ORDER THE ARGUMENT RUNS (r41, r42). Whose password AND OVER WHICH
+# TRANSPORT first, then — on that transport and no other — whether this endpoint can tell one
+# password from another, then whether the role can get in with the one asserted live. Nothing is
+# sent to the server until the first question has been answered, and nothing is sent anywhere but
+# the route that answer was given on.
 db_endpoint_is_password_sensitive() {
   local database="$1" positive="$2"
   db_endpoint_checks_role_verifier "${database}" || return 1
@@ -2268,12 +2397,20 @@ resolve_live_role_password() {
   DB_ROTATION_RECONCILED_WHICH=""
 
   for database in "${endpoints[@]}"; do
-    # WHOSE PASSWORD, BEFORE ANY PASSWORD (o3d-2sm1.5 r41, Codex HIGH). The two attempts below send
-    # the journal's candidates to this endpoint. If its rule is `ldap`, `pam`, `radius` or `bsd`
-    # that hands both of the role's credentials to somebody else's directory — and the answer that
-    # came back would be about that directory, not about the role. So the server is asked which
-    # rule it matched first, and an endpoint that is not checking pg_authid.rolpassword is dropped
-    # here, before anything leaves this host.
+    # WHOSE PASSWORD, BEFORE ANY PASSWORD, AND OVER WHICH ROUTE (o3d-2sm1.5 r41 and r42, Codex
+    # HIGH). The two attempts below send the journal's candidates to this endpoint. If its rule is
+    # `ldap`, `pam`, `radius` or `bsd` that hands both of the role's credentials to somebody else's
+    # directory — and the answer that came back would be about that directory, not about the role.
+    # So the server is asked which rule it matched first, and an endpoint that is not checking
+    # pg_authid.rolpassword is dropped here, before anything leaves this host.
+    #
+    # THIS CALL IS ALSO WHAT PINS THE TRANSPORT. It publishes DB_PROBE_SSLMODE for this database,
+    # and the four probes below refuse outright without it — so the record the candidates are
+    # checked against is the record the method was read from. That matters most in exactly the
+    # configuration this loop meets after an interruption: with `hostssl scram-sha-256` over
+    # `hostnossl radius`, an UNPINNED old-password attempt fails SCRAM, drops to the clear and is
+    # accepted by the directory, both candidates read as live, and this function returns 2 on a
+    # rotation that is perfectly reconcilable over TLS.
     db_endpoint_checks_role_verifier "${database}" || continue
     # THE CANDIDATES, so that the positive half of the control pair is a password this run actually
     # cares about rather than a second throwaway role. An endpoint that accepts neither has not
