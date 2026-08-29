@@ -550,6 +550,11 @@ DEPLOY_SSH_KNOWN_HOSTS="${DEPLOY_SSH_DIR}/known_hosts"
 # no crontab and no data, so there is no writer to stop and no cutover to survive.
 # ---------------------------------------------------------------------------
 UPGRADE_EXISTING=false
+# WHY this run is fenced, in the words every refusal on the fenced path prints. Set by the branch
+# below and read by require_fenceable_database(), so an operator who is told the database must be
+# held closed is told WHICH of the two reasons put them there (o3d-2sm1.5 r36, Codex CRITICAL).
+FENCED_CUTOVER=false
+CUTOVER_REASON=""
 # THE FENCE STATE MACHINE (phases added o3d-2sm1.5, Codex r7 HIGH). Four phases, one
 # direction only, and on_cutover_exit does something different in each:
 #
@@ -773,6 +778,114 @@ DB_FENCE_REFENCE_CMD="${DB_FENCE_SUDO_PREFIX}${DB_FENCE_REFENCE_WRAPPER}"
 # a root-owned directory, and failing a fence over it would trade a real protection for a
 # cosmetic one. The path printed in the banners is still the right one to run — a previous run's
 # wrapper is very likely standing there — and the warning says the refresh did not happen.
+# ---------------------------------------------------------------------------
+# WAS THE DATABASE CREATED BY THIS RUN? (o3d-2sm1.5 r36, Codex CRITICAL)
+#
+# THE DEFECT. r35's policy — a first install performs no credentialed fence execution — rested on
+# a premise it never checked: "there is no writer to stop, because the database was created by
+# this run". upgrade_in_place() asks four questions and every one of them is about THIS HOST: the
+# service unit, the crontab, PM2, and processes whose working directory is ${APP_DIR}. None of
+# them is about the database. A fresh application host pointed at an existing, live, REMOTE
+# database answers no to all four, takes the exemption, and migrates a schema other writers are
+# using — which is the corruption the cutover fence exists to prevent, on the one path that skips
+# it. The reasoning was sound and the premise was assumed; so the premise is now PRODUCED by this
+# invocation, or the exemption is not available at all.
+#
+# WHAT COUNTS AS PROOF, AND WHY AN ALREADY-EXISTING DATABASE CANNOT FORGE IT.
+# `CREATE DATABASE <name>` succeeding, issued by this process against this host's local
+# PostgreSQL server. PostgreSQL rejects that statement with 42P04 duplicate_database when the name
+# is taken, so a zero exit is the SERVER stating that the object did not exist an instant earlier
+# and that this statement is what brought it into being. There is nothing an established database
+# can present that produces that exit status: it makes the statement FAIL, and it fails
+# identically whether it is empty, full, quiescent, or carrying a hundred connections. The proof
+# is about an EVENT this run caused, which is why it cannot be staged in advance.
+#
+# WHAT IS DELIBERATELY NOT PROOF, and this is the distinction the whole finding turns on: AN
+# EMPTY SCHEMA IS NOT A DATABASE THIS RUN CREATED. "No tables in public" is a statement about
+# content at one instant. It is true of a brand-new database and equally true of a database
+# another operator created five minutes ago and is about to migrate, of one whose objects live
+# under a different search_path, and of one whose writers are connected and idle right now. It is
+# also a race: content can arrive between the question and the migration. `datconnlimit`, a
+# `pg_stat_activity` headcount and "no other connections at this moment" are the same kind of
+# instant and are not proof either. None of them is used here.
+#
+# WHAT THIS RUN CANNOT ESTABLISH AT ALL, every case of which therefore falls to the fenced path:
+#   * INSTALL_POSTGRES=n — the supported external-database path creates no database, so there is
+#     nothing for this run to have proven. EVERY remote database is in this case.
+#   * INSTALL_POSTGRES=y over a database that already existed — CREATE DATABASE was refused as a
+#     duplicate. That is precisely the outcome the old `SELECT ... WHERE NOT EXISTS ... \gexec`
+#     swallowed while reporting success.
+#   * any indeterminate result — psql could not be reached, or the statement failed for a reason
+#     that is not duplication. That case now stops the run rather than continuing unproven.
+#   * a proof about a DIFFERENT database than the one about to be migrated.
+#
+# There is no fifth answer: the flag below starts false, and exactly one statement in this file
+# sets it true.
+# ---------------------------------------------------------------------------
+DB_CREATED_BY_THIS_RUN=false
+# The host:port/name CREATE DATABASE actually succeeded against, so proof about one database can
+# never be spent on another.
+DB_CREATED_IDENTITY=""
+# What this run established, in the words the refusal prints. Replaced at the creation step.
+DB_NEWNESS_FINDING="this run created no database, so nothing here established that the database it is about to migrate is new"
+# Why the exemption was refused, when it was. Set by first_install_exemption_available().
+FIRST_INSTALL_EXEMPTION_REFUSAL=""
+
+# THE ONE STATEMENT IN THIS FILE THAT CAN SET DB_CREATED_BY_THIS_RUN (o3d-2sm1.5 r36, Codex
+# CRITICAL). Called only on the INSTALL_POSTGRES=y path, which is the only path that creates
+# anything at all.
+#
+# This step used to be one line inside the setup heredoc:
+#
+#   SELECT 'CREATE DATABASE x' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname='x') \gexec
+#
+# which does the right thing and RECORDS NOTHING. It succeeds identically whether it created the
+# database or found one already there, so the exemption downstream had no way to tell the two
+# apart and read "no launcher on this host" as if it meant "no database before this run".
+#
+# So the statement is issued UNCONDITIONALLY and the server is allowed to answer:
+#   exit 0                     -> this statement brought the database into being. PROOF.
+#   42P04 duplicate_database   -> it was already there. A supported outcome, not an error: the
+#                                 install continues, it simply does not get the exemption.
+#   anything else              -> indeterminate. The run stops, exactly as ON_ERROR_STOP did
+#                                 before, rather than continuing over a database it cannot
+#                                 describe.
+create_database_and_record_newness() {
+  local output="" status=0
+  output="$(run_as_user postgres psql -v ON_ERROR_STOP=1 -q -c "CREATE DATABASE \"${DB_NAME}\"" 2>&1)" || status=$?
+  if [[ "${status}" -eq 0 ]]; then
+    DB_CREATED_BY_THIS_RUN=true
+    DB_CREATED_IDENTITY="${DB_HOST}:${DB_PORT}/${DB_NAME}"
+    DB_NEWNESS_FINDING="CREATE DATABASE was issued by this run against the local PostgreSQL server and succeeded, so '${DB_NAME}' did not exist an instant before it and no other writer can have been connected to it"
+    success "Database '${DB_NAME}' was CREATED by this run — the server refused no duplicate, so it did not exist before."
+    return 0
+  fi
+  if printf '%s' "${output}" | grep -qiE 'already exists|42P04'; then
+    DB_CREATED_BY_THIS_RUN=false
+    DB_NEWNESS_FINDING="database '${DB_NAME}' already existed on this server — CREATE DATABASE was refused as a duplicate — so this run did not create it and cannot say who else is using it"
+    warn "Database '${DB_NAME}' already existed. This run did NOT create it, so it is treated as a live database and this run is fenced."
+    return 0
+  fi
+  die "Creating database '${DB_NAME}' failed for a reason that is not 'it already exists', so this run cannot say whether that database exists, is reachable, or is safe to migrate. NOTHING HAS BEEN MIGRATED. psql said: ${output}"
+}
+
+# THE EXEMPTION IS EARNED, NEVER INFERRED FROM WHAT IS ABSENT ON THIS HOST. Returns 0 only when
+# this invocation itself created the database it is about to migrate, and only when that is the
+# same database. Everything else — including everything unknown — returns 1, and the caller fences.
+first_install_exemption_available() {
+  local identity="${DB_HOST}:${DB_PORT}/${DB_NAME}"
+  FIRST_INSTALL_EXEMPTION_REFUSAL=""
+  if ! ${DB_CREATED_BY_THIS_RUN}; then
+    FIRST_INSTALL_EXEMPTION_REFUSAL="No launcher was found on this host — but that is a statement about this host, not about the database: ${DB_NEWNESS_FINDING}. Other writers may be connected to ${identity} right now, so this run is treated as a cutover and the migration window is fenced."
+    return 1
+  fi
+  if [[ "${DB_CREATED_IDENTITY}" != "${identity}" ]]; then
+    FIRST_INSTALL_EXEMPTION_REFUSAL="This run created ${DB_CREATED_IDENTITY}, but it is about to migrate ${identity}. Proof about one database is not proof about another, so this run is treated as a cutover and the migration window is fenced."
+    return 1
+  fi
+  return 0
+}
+
 # WHETHER THIS RUN IS A FIRST INSTALL, AND WHAT THAT FORBIDS (o3d-2sm1.5 r35, Codex MEDIUM).
 #
 # A first install has no service, no crontab, no PM2 instance and no process in ${APP_DIR} — that
@@ -788,6 +901,13 @@ DB_FENCE_REFENCE_CMD="${DB_FENCE_SUDO_PREFIX}${DB_FENCE_REFENCE_WRAPPER}"
 # call to this path now stops the install with the sentence below instead of quietly executing an
 # unauthenticated artefact.
 FIRST_INSTALL_NO_CREDENTIALED_FENCE=false
+
+# THE FIRST-INSTALL PIN CONTRACT, WRITTEN ONCE AND DERIVED FROM HERE (o3d-2sm1.5 r36, Codex
+# MEDIUM). The refusal below prints these exact bytes, docs/installation.md quotes them verbatim,
+# and tests/scripts/fence-digest-and-first-install.test.ts asserts the two strings are identical.
+# This branch has now shipped three pin contracts whose code, runbook and tests said different
+# things; the fix is not a fourth sentence, it is one string with two readers.
+FIRST_INSTALL_PIN_CONTRACT="On a first install, IMS_FENCE_ARTEFACT_SHA256 is the ONLY input that publishes the protected fence artefact. IMS_FENCE_SCRIPT_SHA256 alone is REFUSED here: it authenticates the entry file, while the artefact also vendors that helper's dependency closure out of the application-owned checkout. Supply IMS_FENCE_ARTEFACT_SHA256 -- IMS_FENCE_SCRIPT_SHA256 may accompany it and is then also enforced -- or supply neither, in which case this install fences nothing, publishes nothing, and the first upgrade asks for the digest instead."
 
 resolve_fence_script() {
   local script
@@ -845,9 +965,42 @@ require_db_identity() {
 # AND THE NO-EXECUTION HALF IS A FLAG, NOT A COMMENT. resolve_fence_script() is the sole route to
 # executing the helper in this file, and it refuses while this is set.
 first_install_fence_policy() {
+  # THE PREMISE, ASSERTED WHERE IT IS SPENT (o3d-2sm1.5 r36, Codex CRITICAL). The caller already
+  # routes an unproven database to the fenced path; this is the same question asked again at the
+  # one function that ARMS the exemption, so a later edit that reaches here on an unproven
+  # database stops the install instead of quietly exempting a live database from the fence. It is
+  # the same "enforcement, not comment" discipline the no-execution flag below is written in.
+  first_install_exemption_available || die \
+    "This run was about to take the first-install exemption from the cutover fence and it has not earned it. ${FIRST_INSTALL_EXEMPTION_REFUSAL} NOTHING HAS BEEN MIGRATED and nothing has been started."
+
   FIRST_INSTALL_NO_CREDENTIALED_FENCE=true
 
-  if [[ -z "${DB_FENCE_EXPECTED_ARTEFACT_SHA256}" && -z "${DB_FENCE_EXPECTED_SHA256}" ]]; then
+  # THE PIN CONTRACT, ENFORCED (o3d-2sm1.5 r36, Codex MEDIUM).
+  #
+  # THE DEFECT. The runbook offered EITHER pin as a first-install publication input and this
+  # function treated either as a publication request — but the artefact is assembled out of
+  # ${APP_DIR}, which this installer chowns to ${APP_USER} long before it gets here, so the source
+  # is application-writable on every install this script performs. _fence_stage_and_publish()
+  # refuses an entry-file pin from such a source, by design and correctly: it authenticates one
+  # file out of a vendored closure. The advertised script-pin-only invocation could therefore not
+  # publish on ANY ordinary first install — it deterministically aborted one.
+  #
+  # WHY THE RULE IS UNCONDITIONAL RATHER THAN "when the checkout is application-writable". On this
+  # path it is always application-writable — the chown guarantees it — and a condition that is
+  # always true is one that can go stale unnoticed while inviting the reader to believe there is a
+  # supported case on the other side of it. There is not. Stating it unconditionally is also what
+  # lets the runbook and the tests say the SAME SENTENCE as the code: see
+  # ${FIRST_INSTALL_PIN_CONTRACT}, which is that sentence and is defined once.
+  #
+  # AND IT IS A REFUSAL, NOT A SILENT SKIP. A supplied pin nobody reads is this branch's signature
+  # defect; the operator named the bytes they expected and is owed an answer.
+  if [[ -n "${DB_FENCE_EXPECTED_SHA256}" && -z "${DB_FENCE_EXPECTED_ARTEFACT_SHA256}" ]]; then
+    die "${FIRST_INSTALL_PIN_CONTRACT} NOTHING has been published, NOTHING HAS BEEN MIGRATED and nothing has been started. The closure this run would have vendored comes from ${APP_DIR}, which this installer has already chowned to ${APP_USER}, so it comes from an account other than the one publishing it. ${DB_FENCE_ARTEFACT_SOURCE_TEXT}"
+  fi
+
+  # Reaching here with no whole-tree pin means no pin at all: the refusal above is the only other
+  # way out of it.
+  if [[ -z "${DB_FENCE_EXPECTED_ARTEFACT_SHA256}" ]]; then
     info "First install: nothing is serving, no crontab is live and this run created the database,"
     info "so there is no writer to stop and no migration window to fence. NO fence helper is"
     info "executed on this path and no protected artefact is published."
@@ -2137,7 +2290,7 @@ fence_db_connections() {
 # install never reaches this: there is no existing database to hold closed.
 require_fenceable_database() {
   [[ -n "${DEPLOY_ADMIN_DATABASE_URL}" ]] || die \
-    "An existing installation was detected, so its database must be held closed while the schema moves — but DEPLOY_ADMIN_DATABASE_URL is not set, so this run has no privileged connection that would survive revoking CONNECT from the application role. Set it (a superuser or database-owner connection as a DIFFERENT role from DATABASE_URL; docs/installation.md) and re-run. Nothing has been stopped and nothing has been migrated."
+    "This run is a cutover — ${CUTOVER_REASON:-an existing installation was detected} — so the database must be held closed while the schema moves, but DEPLOY_ADMIN_DATABASE_URL is not set, so this run has no privileged connection that would survive revoking CONNECT from the application role. Set it (a superuser or database-owner connection as a DIFFERENT role from DATABASE_URL; docs/installation.md) and re-run. Nothing has been stopped and nothing has been migrated."
   [[ -f "${DB_FENCE_SCRIPT}" || -f "${DB_FENCE_SCRIPT_COPY}" ]] || die \
     "Neither ${DB_FENCE_SCRIPT} nor the root-owned copy at ${DB_FENCE_SCRIPT_COPY} exists, so the migration window cannot be fenced. Nothing has been stopped and nothing has been migrated."
   [[ -f "${DB_OBJECT_ACCESS_SCRIPT}" ]] || die \
@@ -2994,7 +3147,11 @@ if [[ "$INSTALL_POSTGRES" == "y" ]]; then
       END IF;
     END
     \$\$;
-    SELECT 'CREATE DATABASE ${DB_NAME}' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname='${DB_NAME}') \gexec
+EOSQL
+
+  create_database_and_record_newness
+
+  run_as_user postgres psql -v ON_ERROR_STOP=1 <<-EOSQL
     GRANT ALL PRIVILEGES ON DATABASE "${DB_NAME}" TO "${DB_USER}";
     ALTER DATABASE "${DB_NAME}" OWNER TO "${DB_USER}";
 EOSQL
@@ -3402,18 +3559,40 @@ success "Dependencies installed."
 # ---------------------------------------------------------------------------
 MIGRATION_DATABASE_URL="${DATABASE_URL}"
 
+# WHICH PATH THIS RUN TAKES, AND WHAT HAS TO BE TRUE TO SKIP THE FENCE (o3d-2sm1.5 r36, Codex
+# CRITICAL). TWO independent questions, and EITHER answer sends this run down the fenced path:
+#
+#   1. Is there something on THIS HOST to break?      upgrade_in_place()
+#   2. Did THIS RUN create the database it will migrate?  first_install_exemption_available()
+#
+# The second used to be assumed from the first. It is not implied by it and never was: a fresh
+# application host pointed at an existing remote database answers "nothing here to break" and
+# "someone else's live data" at the same time, and the old branch let that run migrate unfenced.
+# So the exemption is granted only when BOTH come back, and anything the installer cannot
+# positively establish — every external database, every pre-existing local one, every
+# indeterminate result — falls to the fenced path.
 if upgrade_in_place; then
+  FENCED_CUTOVER=true
+  CUTOVER_REASON="an existing installation was found on this host: a service unit, a live crontab, a PM2 instance or a process running in ${APP_DIR}"
+elif ! first_install_exemption_available; then
+  FENCED_CUTOVER=true
+  CUTOVER_REASON="${FIRST_INSTALL_EXEMPTION_REFUSAL}"
+fi
+
+if ${FENCED_CUTOVER}; then
   UPGRADE_EXISTING=true
-  header "Existing installation detected — this run is an upgrade cutover"
+  header "This run is a cutover — the migration window will be fenced"
+  info "${CUTOVER_REASON}"
 
   # Installed before anything is armed, so that a kill or a power cut anywhere below
   # leaves the marker, the drop-in and a stopped service rather than a running one.
   trap on_cutover_exit EXIT
 
-  # BEFORE ANYTHING IS STOPPED, AND BEFORE THE BUILD. An existing installation's database
-  # has to be held closed while its schema moves, and discovering at the drain step that it
-  # cannot be would cost an outage for a missing environment variable — or, once, for a
-  # missing node module.
+  # BEFORE ANYTHING IS STOPPED, AND BEFORE THE BUILD. A database this run did not create has
+  # to be held closed while its schema moves — whether the writer is this host's own previous
+  # installation or somebody else's, which is the case the second branch question added — and
+  # discovering at the drain step that it cannot be would cost an outage for a missing
+  # environment variable, or, once, for a missing node module.
   require_fenceable_database
 
   CUTOVER_STEP="adopt"
