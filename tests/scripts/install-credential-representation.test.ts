@@ -82,6 +82,15 @@ const RESERVED_CHARACTER_PASSWORDS = [
   ';;;',
   '~-._',
   'AAA%25BBB', // raw: the driver sees "AAA%BBB"
+  // r40 (Codex HIGH) — THE BYTES `$( )` DELETES. Every one of these is a password the r39 encoder
+  // and the r39 driver both handled correctly and the r39 SHELL CAPTURE truncated on the way back,
+  // so the recovery reported a password the server does not have. They are in the corpus, not in a
+  // test of their own, because the corpus is what says "these are the representations that work".
+  'ends-with-a-newline\n',
+  'two-trailing-newlines\n\n',
+  '\n', // a password that is ONLY a newline: recovery used to return the empty string
+  'has\na-newline-inside',
+  'crlf-terminated\r\n', // the \r survives a capture and the \n does not, which is the subtle half
 ]
 
 /** Legacy URLs no r39 installer wrote, where the only question is what the DRIVER makes of them. */
@@ -89,6 +98,9 @@ const LEGACY_RAW_USERINFO = [
   'plain', 'a%2Fb', 'a%2fb', 'AAA%25BBB', 'a%b', 'a%', 'a%2', 'a%zz', '%20', 'a b', "it's",
   'abc@def', 'abc:def', '\\back\\slash', '%C3%BC', '%41%42%43', '100%25pure', '50%off', '%%%',
   'a%2Fb%2Fc', '~-._',
+  // r40: a legacy URL whose decoded form ends in a newline. pg-connection-string returns the
+  // newline; a recovery that captures through `$( )` returns the string without it.
+  'a%0A', '%0A', 'a%0D%0A', 'a%0A%0A',
 ]
 
 /**
@@ -102,6 +114,16 @@ const LEGACY_RAW_USERINFO = [
 function base64(value: string): string {
   return Buffer.from(value, 'utf8').toString('base64')
 }
+
+/**
+ * The base64 door into the rig, as a shell function.
+ *
+ * runShipped() JSON-stringifies its variables into a DOUBLE-quoted shell assignment, so a value
+ * containing `$` or a backtick would be evaluated before any shipped function saw it — and a value
+ * containing a NEWLINE would not survive the assignment at all. base64 has no meaning in any layer
+ * it crosses, and `capture` is what brings the decoded bytes back out of the pipeline intact.
+ */
+const DECODE_HELPER = `decode_b64() { printf '%s' "$1" | base64 -d; }`
 
 /** The four values that identify one credential, as the rig's tests supply them. */
 function installVars(cluster: Cluster, root: string): Record<string, string> {
@@ -257,16 +279,25 @@ test('r39: the shipped encoder and the installed node-postgres agree on every re
     seedLiveInstallation(cluster)
 
     const run = runShipped(
-      { ...installVars(cluster, root), CASES_B64: base64(`${RESERVED_CHARACTER_PASSWORDS.join('\n')}\n`) },
+      { ...installVars(cluster, root), CASES_B64: base64(`${RESERVED_CHARACTER_PASSWORDS.map(base64).join('\n')}\n`) },
       `
+        # THE CASES ARE CARRIED AS BASE64, ONE PER LINE (r40). The corpus now contains passwords
+        # that CONTAIN newlines, and a \`while read\` over the raw values would split those into two
+        # cases and measure neither — a transport that silently drops the rows the round is about.
+        ${DECODE_HELPER}
         printf '%s' "\${CASES_B64}" | base64 -d > "\${APP_DIR}/cases"
-        while IFS= read -r pw; do
-          encoded="$(url_encode_userinfo "\${pw}")"
-          decoded="$(url_decode_userinfo "\${encoded}")"
+        while IFS= read -r line; do
+          # AND EVERY MEASUREMENT GOES THROUGH THE SHIPPED \`capture\` (r40, Codex HIGH). Written as
+          # \`encoded="$(url_encode_userinfo ...)"\` this loop deletes exactly the bytes it exists to
+          # prove are kept, and every row passes because both sides were truncated equally.
+          capture pw decode_b64 "\${line}"
+          capture encoded url_encode_userinfo "\${pw}"
+          capture decoded url_decode_userinfo "\${encoded}"
+          capture url compose_database_url "\${DB_USER}" "\${pw}" "\${DB_HOST}" "\${DB_PORT}" "\${DB_NAME}"
           printf 'ROW\\t%s\\t%s\\t%s\\n' \\
             "$(printf '%s' "\${encoded}" | base64 | tr -d '\\n')" \\
             "$(printf '%s' "\${decoded}" | base64 | tr -d '\\n')" \\
-            "$(printf '%s' "$(compose_database_url "\${DB_USER}" "\${pw}" "\${DB_HOST}" "\${DB_PORT}" "\${DB_NAME}")" | base64 | tr -d '\\n')"
+            "$(printf '%s' "\${url}" | base64 | tr -d '\\n')"
         done < "\${APP_DIR}/cases"
       `,
     )
@@ -352,7 +383,11 @@ test('r39: the shipped decoder reaches node-postgres\'s answer for a legacy raw 
       `
         printf '%s' "\${CASES_B64}" | base64 -d > "\${APP_DIR}/cases"
         while IFS= read -r raw; do
-          printf 'ROW\\t%s\\n' "$(printf '%s' "$(url_decode_userinfo "\${raw}")" | base64 | tr -d '\\n')"
+          # \`capture\`, because four of these rows decode to a value ENDING IN A NEWLINE and a
+          # plain command substitution would delete it — agreeing with a broken recovery instead
+          # of with the driver (r40).
+          capture decoded url_decode_userinfo "\${raw}"
+          printf 'ROW\\t%s\\n' "$(printf '%s' "\${decoded}" | base64 | tr -d '\\n')"
         done < "\${APP_DIR}/cases"
       `,
     )
@@ -769,7 +804,13 @@ test('r39: boundary (4) — neither password authenticates: the run refuses and 
 
     const next = runShipped(installVars(cluster, root), NEXT_RUN_BODY)
     assert.equal(next.status, 9, `neither candidate authenticates, so the run must refuse:\n${next.output}`)
-    assert.match(next.output, /NEITHER of the two passwords/, 'for the reason the operator needs')
+    assert.match(next.output, /could not find a single endpoint able to tell one password from another/, 'for the reason the operator needs')
+    assert.match(next.output, /NEITHER of the two passwords it recorded was accepted/, 'and it names the out-of-band rotation this looks like')
+    // r40: the refusal now shows its WORKING — what each endpoint it asked actually did. Without
+    // that, "no endpoint could discriminate" is indistinguishable from "the server is down", and
+    // the operator has nothing to act on.
+    assert.match(next.output, /'postgres' refused BOTH recorded candidates/, 'and it reports what the maintenance database said')
+    assert.match(next.output, /'one_two_inventory' refused BOTH recorded candidates/, 'and what the application database said')
     assert.match(next.output, /LEFT IN PLACE/, 'and it says the record is kept')
     assert.doesNotMatch(next.output, /INSTALLED_B64/, 'and nothing past the refusal ran')
     assert.equal(journalValue(root, 'marker_complete'), '1', 'the two candidate passwords must survive the refusal')
@@ -814,6 +855,272 @@ test('r39: an interrupted rotation for a DIFFERENT connection is refused, not ad
     assert.equal(journalValue(root, 'marker_complete'), '1', 'and the other connection\'s record is untouched')
   } finally {
     cluster?.stop()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 6. r40 (Codex HIGH): THE BYTES THE SHELL CAPTURE DELETED
+// ---------------------------------------------------------------------------
+
+/**
+ * A password ending in a newline is not exotic — it is what an operator gets from a copy-paste,
+ * from `echo secret > pw.txt`, or from any generator that terminates its line. r39 encoded it
+ * correctly (`%0A`), the driver decoded it correctly, the server held it correctly, and the shell
+ * capture in the RECOVERY threw the last byte away.
+ */
+const TERMINAL_NEWLINE_PASSWORD = "p@ss:w/rd?#%2F'ends-with\n"
+
+
+test('r40: a password whose decoded form ends in a newline installs, authenticates, and is recovered whole', async () => {
+  // THE LOAD-BEARING ONE FOR THE FIRST HIGH, and every link in it is real: the shipped
+  // sql_quote_literal() puts the bytes on a real server, the shipped compose_database_url() writes
+  // them into a real `.env`, `pg-connection-string` and `pg.Client` out of node_modules read them
+  // back, and the shipped recovery — running in the shipped prompt_db_password() — has to return
+  // the SAME bytes or the next re-install rotates a live credential nobody asked to rotate.
+  //
+  // WHY THE ASSERTION IS ON A BYTE COUNT AND NOT ONLY ON EQUALITY. The whole failure is the loss of
+  // ONE trailing byte, and a test that compares two values which have both been truncated by the
+  // same capture agrees with the defect. So the value is carried out of the shell as base64 and
+  // compared as a Buffer, and the last byte is asserted to be 0x0a explicitly.
+  //
+  // MUTATION ROUTES (each measured by making the change and re-running):
+  //   1. revert the password decode in installed_database_password() to
+  //      `password="$(url_decode_userinfo "${password}")"`. The recovered value loses its newline,
+  //      so it differs from the installed one and the re-run reports ROTATION_PENDING=true over a
+  //      live role — this test fails on RECOVERED_B64 and on ROTATION_PENDING. Test 7 below fails
+  //      with it; nothing else in the file notices.
+  //   2. revert the OUTER capture to
+  //      `DB_PASSWORD_INSTALLED="$(installed_database_password ... || true)"`. Identical
+  //      symptoms — which is the point of measuring it separately: fixing only one of the two
+  //      leaves the defect exactly where it was.
+  //   3. drop the sentinel from url_decode_userinfo()'s internal sed pipeline: nothing here fails,
+  //      because no value reaching it through a URL carries a LITERAL trailing newline. Recorded so
+  //      the next reader does not go looking for it; that half is asserted directly in test 13.
+  const root = mkdtempSync(join(tmpdir(), 'ims-repr-'))
+  let cluster: Cluster | undefined
+  try {
+    cluster = startCluster(root, 'live', await freePort(), '127.0.0.1')
+    seedLiveInstallation(cluster)
+    writeInstalledEnv(root, cluster.port, 'live-password')
+
+    const target = TERMINAL_NEWLINE_PASSWORD
+    const run = runShipped(
+      { ...installVars(cluster, root), DB_PASSWORD_B64: base64(target) },
+      `
+        ${DECODE_HELPER}
+        capture DB_PASSWORD decode_b64 "\${DB_PASSWORD_B64}"
+        ${REINSTALL_BODY}
+        FENCE_ARMED=true
+        DB_FENCE_UP=true
+        rotate_database_password_in_fenced_window
+        echo "FINAL_ROTATED=\${DB_ROLE_CREDENTIALS_ROTATED}"
+      `,
+    )
+    assert.equal(run.status, 0, run.output)
+    assert.match(run.output, /FINAL_ROTATED=true/, 'the rotation must have happened')
+
+    // (a) THE SERVER HOLDS THE NEWLINE. libpq does no URL parsing, so this is about the bytes
+    //     ALTER USER committed and nothing else.
+    assert.equal(
+      cluster.psql(['-c', 'SELECT 1'], { host: '127.0.0.1', user: 'imsuser', password: target, database: 'one_two_inventory' }),
+      '1',
+      'the server must hold the literal password, terminating newline and all',
+    )
+    // And it is the newline that is load-bearing: the same password WITHOUT it must be refused.
+    assert.throws(
+      () => cluster!.psql(['-c', 'SELECT 1'], { host: '127.0.0.1', user: 'imsuser', password: target.slice(0, -1), database: 'one_two_inventory' }),
+      /password authentication failed/,
+      'precondition: the truncated form must NOT authenticate, or this test proves nothing',
+    )
+
+    // (b) THE URL SPELLS IT `%0A` AND THE INSTALLED PARSER READS IT BACK.
+    const written = envDatabaseUrl(root)
+    assert.match(written, /%0A@/, `the composed URL must percent-encode the terminating newline: ${written}`)
+    assert.equal(parse(written).password, target, 'the driver must read the newline back out of the URL install.sh wrote')
+
+    // (c) AND IT OPENS A CONNECTION.
+    assert.equal(await connectWithDriver(written), 'imsuser', 'node-postgres must authenticate with it')
+
+    // (d) THE RE-RUN RECOVERS IT WHOLE AND ASKS FOR NOTHING. This is the half r39 lost.
+    const rerun = runShipped(installVars(cluster, root), `
+      ${REINSTALL_BODY}
+      echo "RECOVERED_B64=$(printf '%s' "\${DB_PASSWORD_INSTALLED}" | base64 | tr -d '\\n')"
+    `)
+    assert.equal(rerun.status, 0, rerun.output)
+    const recovered = Buffer.from(readVar(rerun.output, 'RECOVERED_B64'), 'base64')
+    assert.equal(recovered.length, Buffer.byteLength(target, 'utf8'), `the recovery must return every byte: got ${JSON.stringify(recovered.toString('utf8'))}`)
+    assert.equal(recovered[recovered.length - 1], 0x0a, 'and the last of them is the newline')
+    assert.equal(recovered.toString('utf8'), target)
+    assert.match(rerun.output, /ROTATION_PENDING=false/, 'so pressing Enter does not rotate a live credential')
+  } finally {
+    cluster?.stop()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('r40: an interrupted rotation to a newline-terminated password reconciles to the exact bytes', async () => {
+  // THE SAME BYTE, ON THE OTHER PATH. The journal carries both candidates as base64 — which is
+  // precisely what makes a newline survive the FILE — and r39 then decoded them through `$( )`,
+  // which threw it away again. On this path the loss is not a spurious rotation but an OUTAGE: the
+  // reconciliation publishes a `.env` naming a password the server does not have, inside the
+  // stopped, fenced window, and the next restart is locked out.
+  //
+  // MUTATION ROUTES (each measured by making the change and re-running):
+  //   1. revert the two journal decodes to
+  //      `old_password="$(rotation_journal_decode "$(...)")"`. The reconciliation adopts the
+  //      truncated form, `.env` names it, and connectWithDriver is refused — this test fails on
+  //      RECONCILED_B64 and at the driver connection. It fails ALONE: every other reconciliation
+  //      test uses a password with no trailing newline, so their decode is unaffected.
+  //   2. revert the outer capture in prompt_db_password(): DB_ROTATION_RECONCILED_PASSWORD is
+  //      assigned to DB_PASSWORD_INSTALLED directly and does not cross a capture, so this test
+  //      stays GREEN and test 6 fails. Recorded because it is the one route this test cannot see.
+  const root = mkdtempSync(join(tmpdir(), 'ims-repr-'))
+  let cluster: Cluster | undefined
+  try {
+    cluster = startCluster(root, 'live', await freePort(), '127.0.0.1')
+    seedLiveInstallation(cluster)
+    writeInstalledEnv(root, cluster.port, 'live-password')
+
+    const target = TERMINAL_NEWLINE_PASSWORD
+    // The rotation runs and is killed one statement before the journal is cleared: the server has
+    // the newline-terminated password and the record names both candidates.
+    const interrupted = runShipped(
+      { ...installVars(cluster, root), DB_PASSWORD_B64: base64(target) },
+      `
+        ${DECODE_HELPER}
+        capture DB_PASSWORD decode_b64 "\${DB_PASSWORD_B64}"
+        ${REINSTALL_BODY}
+        FENCE_ARMED=true
+        DB_FENCE_UP=true
+        DB_PROBE_REPORT=""
+        db_endpoint_is_password_sensitive postgres "\${DB_PASSWORD_EFFECTIVE}" || exit 6
+        DB_ROTATION_PROBE_DATABASE=postgres
+        ${SHIPPED_ROTATION_UP_TO_THE_CLEAR}
+        echo "AT_THE_CLEAR"
+      `,
+    )
+    assert.equal(interrupted.status, 0, interrupted.output)
+    assert.match(interrupted.output, /AT_THE_CLEAR/, 'precondition: the rotation ran except the clear')
+    assert.equal(
+      Buffer.from(journalValue(root, 'new_password_b64')!, 'base64').toString('utf8'),
+      target,
+      'precondition: base64 carried the newline into the journal — the loss is in the DECODE, not the encode',
+    )
+
+    const next = runShipped(installVars(cluster, root), `
+      ${NEXT_RUN_BODY}
+      echo "RECONCILED_B64=$(printf '%s' "\${DB_ROTATION_RECONCILED_PASSWORD}" | base64 | tr -d '\\n')"
+    `)
+    assert.equal(next.status, 0, next.output)
+    assert.match(next.output, /server has the NEW password/, 'the reconciliation must find the rotated credential')
+    const reconciled = Buffer.from(readVar(next.output, 'RECONCILED_B64'), 'base64')
+    assert.equal(reconciled[reconciled.length - 1], 0x0a, 'and it must carry the terminating newline out of the journal')
+    assert.equal(reconciled.toString('utf8'), target)
+    assert.equal(decodeVar(next.output, 'INSTALLED_B64'), target, 'which is the credential the published file is composed from')
+    assert.match(next.output, /JOURNAL_LEFT=no/, 'and the record is cleared')
+
+    const written = envDatabaseUrl(root)
+    assert.match(written, /%0A@/, `the republished URL must still spell the newline: ${written}`)
+    assert.equal(await connectWithDriver(written), 'imsuser', 'and the file the service restarts from opens a connection')
+  } finally {
+    cluster?.stop()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('r40: capture() returns every byte its command wrote, including trailing newlines', async () => {
+  // THE PRIMITIVE, ON ITS OWN, because everything above depends on it and a bug in it would be
+  // invisible in exactly the tests that use it. Three properties, and each is a way the mechanism
+  // could be built wrongly:
+  //
+  //   - trailing newlines survive, however many;
+  //   - a value that ENDS WITH THE SENTINEL'S OWN TEXT loses only the one the capture appended,
+  //     which is what makes `${var%"..."}` (shortest suffix) the right expansion and `${var%%...}`
+  //     the wrong one;
+  //   - a command that FAILS still yields its exit status, so `|| true` at the call sites is a
+  //     decision and not an accident. Under `set -e` without the subshell's `set +e` the sentinel
+  //     is never written and the fix silently reverts to stripping.
+  //
+  // MUTATION ROUTES (each measured by making the change and re-running):
+  //   1. change `${__capture_raw%"${CAPTURE_TERMINATOR}"}` to `%%`: the sentinel-suffixed row
+  //      loses BOTH copies and this test fails on it, alone in the repo.
+  //   2. remove `set +e` from the subshell: the failing-command row loses its output and this test
+  //      fails on it. Nothing else fails, because every production caller is a pure function that
+  //      succeeds — which is why it is measured here.
+  //   3. remove the `exit "${__capture_inner}"`: the status row reports 0 and this test fails on
+  //      it. That one is load-bearing at the call site in prompt_db_password(), where a failed
+  //      recovery has to fall through to `DB_PASSWORD_INSTALLED=""`.
+  const root = mkdtempSync(join(tmpdir(), 'ims-repr-'))
+  try {
+    const run = runShipped({ APP_DIR: root, APP_USER: currentUser() }, `
+      ${DECODE_HELPER}
+      emit() { printf '%s' "$1"; }
+      fails() { printf 'partial-output'; return 3; }
+      for spec in "one-newline:$(printf 'a\\n' | base64 | tr -d '\\n')" \\
+                  "three-newlines:$(printf 'a\\n\\n\\n' | base64 | tr -d '\\n')" \\
+                  "only-newline:$(printf '\\n' | base64 | tr -d '\\n')" \\
+                  "sentinel-suffixed:$(printf 'a%s' "\${CAPTURE_TERMINATOR}" | base64 | tr -d '\\n')"; do
+        name="\${spec%%:*}"
+        capture want decode_b64 "\${spec#*:}"
+        capture got emit "\${want}"
+        printf 'ROW\\t%s\\t%s\\t%s\\n' "\${name}" \\
+          "$(printf '%s' "\${want}" | base64 | tr -d '\\n')" \\
+          "$(printf '%s' "\${got}" | base64 | tr -d '\\n')"
+      done
+      status=0
+      capture failed fails || status=$?
+      echo "FAILED_STATUS=\${status}"
+      echo "FAILED_VALUE_B64=$(printf '%s' "\${failed}" | base64 | tr -d '\\n')"
+    `)
+    assert.equal(run.status, 0, run.output)
+
+    const rows = run.output.split('\n').filter((line) => line.startsWith('ROW\t')).map((line) => line.split('\t').slice(1))
+    assert.equal(rows.length, 4, `precondition: every case must be measured:\n${run.output}`)
+    const expected: Record<string, string> = {
+      'one-newline': 'a\n',
+      'three-newlines': 'a\n\n\n',
+      'only-newline': '\n',
+    }
+    for (const [name, wantB64, gotB64] of rows) {
+      const want = Buffer.from(wantB64, 'base64').toString('utf8')
+      const got = Buffer.from(gotB64, 'base64').toString('utf8')
+      if (name in expected) {
+        assert.equal(want, expected[name], `precondition: the ${name} case must reach the shell intact`)
+      } else {
+        // The sentinel-suffixed row: the value the rig built ends with the terminator's own text,
+        // and it must come back with exactly that text still on it.
+        assert.match(want, /^a--ims-end-of-captured-value--$/, 'precondition: the sentinel-suffixed case must reach the shell intact')
+      }
+      assert.equal(got, want, `capture must return ${name} byte for byte`)
+    }
+
+    // AND THE ONE CAPTURE `capture` CANNOT REACH: the sed pipeline INSIDE url_decode_userinfo().
+    // It is a substitution one layer below the call site, so a userinfo carrying a LITERAL trailing
+    // newline would be truncated there however the caller captures it. No URL read out of a `.env`
+    // line can be in that state, which is why nothing else in this file fails when the sentinel is
+    // removed from it — so it is stated here, directly, as a property of the decoder.
+    //
+    // MUTATION ROUTE: remove the terminator from that pipeline (`printf '%s' "${escaped}" | sed`).
+    // LITERAL_LF_LEN drops from 4 to 3 and this assertion fails, alone in the repo.
+    const literal = runShipped({ APP_DIR: root, APP_USER: currentUser() }, `
+      ${DECODE_HELPER}
+      capture raw decode_b64 "$(printf 'abc\n' | base64 | tr -d '\n')"
+      capture decoded url_decode_userinfo "\${raw}"
+      echo "LITERAL_LF_LEN=\${#decoded}"
+      echo "LITERAL_LF_B64=$(printf '%s' "\${decoded}" | base64 | tr -d '\n')"
+    `)
+    assert.equal(literal.status, 0, literal.output)
+    assert.equal(readVar(literal.output, 'LITERAL_LF_LEN'), '4', 'url_decode_userinfo must not eat a literal trailing newline in its own pipeline')
+    assert.equal(Buffer.from(readVar(literal.output, 'LITERAL_LF_B64'), 'base64').toString('utf8'), 'abc\n')
+
+    assert.equal(readVar(run.output, 'FAILED_STATUS'), '3', 'capture must return its command\'s own exit status')
+    assert.equal(
+      Buffer.from(readVar(run.output, 'FAILED_VALUE_B64'), 'base64').toString('utf8'),
+      'partial-output',
+      'and a failing command\'s output must still reach the caller, terminator removed',
+    )
+  } finally {
     rmSync(root, { recursive: true, force: true })
   }
 })

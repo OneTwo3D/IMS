@@ -19,7 +19,7 @@
  */
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:net'
 import { join } from 'node:path'
 
@@ -95,8 +95,14 @@ export function cleanLibpqEnv(): NodeJS.ProcessEnv {
  * `listen` is a parameter because one test needs TWO clusters on the SAME port — which is only
  * possible if at most one of them binds TCP. That pair is what makes the identity comparison
  * reachable at all: the port alone cannot tell them apart.
+ *
+ * `hbaHostLines` is a parameter for the same class of reason (r40, Codex HIGH): the finding is
+ * that the installer's password probe is only valid under SOME pg_hba configurations, and the
+ * only honest way to test that is to BUILD the other ones. Lines given here are prepended to the
+ * generated pg_hba.conf, so they win over the `--auth-host` default below — which is how a
+ * `trust` rule on one database and scram on the rest is expressed.
  */
-export function startCluster(root: string, name: string, port: number, listen: string): Cluster {
+export function startCluster(root: string, name: string, port: number, listen: string, hbaHostLines: string[] = []): Cluster {
   const bin = pgBinDir()
   const data = join(root, name, 'data')
   const socket = join(root, name, 'sock')
@@ -109,6 +115,12 @@ export function startCluster(root: string, name: string, port: number, listen: s
     '--no-sync',
     '-N',
   ], { stdio: 'pipe' })
+  if (hbaHostLines.length > 0) {
+    const hba = join(data, 'pg_hba.conf')
+    // FIRST, because PostgreSQL takes the FIRST matching record and stops. Appending would be a
+    // test that silently measures the default.
+    writeFileSync(hba, `${hbaHostLines.join('\n')}\n${readFileSync(hba, 'utf8')}`)
+  }
   execFileSync(join(bin, 'pg_ctl'), [
     '-D', data,
     '-l', join(root, name, 'pg.log'),

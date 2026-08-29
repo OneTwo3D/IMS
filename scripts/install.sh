@@ -1080,7 +1080,14 @@ url_encode_userinfo() {
 url_decode_userinfo() {
   local raw="$1" escaped
   escaped="${raw//\\/\\\\}"
-  escaped="$(printf '%s' "${escaped}" | sed -E 's/%([0-9A-Fa-f]{2})/\\x\1/g')"
+  # THE SED STEP IS A CAPTURE TOO (o3d-2sm1.5 r40, Codex HIGH). It is inside this function rather
+  # than around it, so `capture` cannot reach it: a caller that hands in a userinfo containing a
+  # LITERAL trailing newline would have it eaten here, one layer below the fix. No URL read out of
+  # a `.env` line can be in that state — a line ends at the newline — but this function is the
+  # inverse of the encoder and it should be the inverse for every input, not for the reachable
+  # ones. Same sentinel, and it survives the substitution untouched because it contains no `%`.
+  escaped="$(printf '%s%s' "${escaped}" "${CAPTURE_TERMINATOR}" | sed -E 's/%([0-9A-Fa-f]{2})/\\x\1/g')"
+  escaped="${escaped%"${CAPTURE_TERMINATOR}"}"
   printf '%b' "${escaped}"
 }
 
@@ -2164,7 +2171,7 @@ reconcile_interrupted_role_rotation() {
 
   if [[ "${resolution}" -ne 0 ]]; then
     die "A database credential rotation for ${identity} was interrupted and this run could not find a single endpoint able to tell one password from another for '${DB_USER}', so nothing it asked the server is evidence about which credential is live. What each endpoint did:${DB_PROBE_REPORT}
-A \`trust\` rule makes every candidate succeed and a revoked CONNECT makes every candidate fail, and this run refuses on either rather than adopting a password the probe cannot discriminate. ${DB_ROLE_ROTATION_JOURNAL} is LEFT IN PLACE so the two candidates are not lost. Give '${DB_USER}' a password-checked route to an UNFENCED database — \`GRANT CONNECT ON DATABASE postgres TO \"${DB_USER}\";\` with a scram-sha-256 or md5 rule for ${DB_HOST} in pg_hba.conf is the whole of it — or establish the role's password by hand and remove that file. NOTHING HAS BEEN INSTALLED and nothing has been stopped."
+A \`trust\` rule makes every candidate succeed and a revoked CONNECT makes every candidate fail, and this run refuses on either rather than adopting a password the probe cannot discriminate. NEITHER of the two passwords it recorded was accepted anywhere it could ask, which is also what you see when somebody has rotated the role OUT OF BAND or the server is not reachable from here — and nothing this script can ask tells those apart, which is why it stops. ${DB_ROLE_ROTATION_JOURNAL} is LEFT IN PLACE so the two candidates are not lost. Give '${DB_USER}' a password-checked route to an UNFENCED database — \`GRANT CONNECT ON DATABASE postgres TO \"${DB_USER}\";\` with a scram-sha-256 or md5 rule for ${DB_HOST} in pg_hba.conf is the whole of it — or establish the role's password by hand and remove that file. NOTHING HAS BEEN INSTALLED and nothing has been stopped."
   fi
 
   DB_ROTATION_JOURNAL_FOUND=true
