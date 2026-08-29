@@ -65,8 +65,11 @@
  *     password the application's own route has never heard of.
  *
  *     So the caller passes the route the APPLICATION takes, this program takes exactly that one,
- *     and the caller then pins its psql probes to it as well -- `require` or `disable`, never
- *     `prefer`, so an authentication failure has no second record to fall onto. What remains is a
+ *     and the caller then pins its psql probes to it as well -- never `prefer`, so an
+ *     authentication failure has no second record to fall onto. Since r45 that route is a
+ *     DEPLOYMENT INPUT (install.sh's DB_SSLMODE=) rather than always `disable`, and the emitted
+ *     URL carries `uselibpqcompat=true` so that the word means the same thing to node-postgres,
+ *     to libpq and here. What remains is a
  *     pg_hba RELOAD between the connections, which no pinning can close and which the negative
  *     control does still catch.
  *   * IT NEGOTIATES NO GSSAPI ENCRYPTION, and neither may the caller. libpq's `gssencmode=prefer`
@@ -101,19 +104,28 @@
  * The startup message is the one answer every supported version gives, in the same bytes, and has
  * given since protocol 3.0.
  *
- * SSL, AND THE THREE ROUTES `--sslmode=` SELECTS BETWEEN. The value is REQUIRED: there is no
- * default, because a default is the one thing that can put this connection on a transport nobody
- * chose, and that is the whole of the r43 finding.
+ * SSL, AND THE ROUTES `--sslmode=` SELECTS BETWEEN. The value is REQUIRED: there is no default,
+ * because a default is the one thing that can put this connection on a transport nobody chose,
+ * and that is the whole of the r43 finding.
  *
- *   `disable`  no SSLRequest is sent at all. This is what node-postgres does with the URL
- *              install.sh emits, so it is what install.sh asks for, and it is matched by
- *              `hostnossl`/`host` records only.
+ *   `disable`  no SSLRequest is sent at all. Matched by `hostnossl`/`host` records only, and
+ *              what node-postgres does with a URL that carries no `sslmode=`.
  *   `require`  SSLRequest, and an `N` is a FAILURE rather than a fallback. Verifies nothing, as
  *              libpq's `require` verifies nothing -- anything stricter would refuse the
  *              self-signed certificate a Debian cluster ships and that the psql beside it accepts.
+ *   `verify-ca`   as `require`, plus the certificate chain is verified against the CA named by
+ *              `--sslrootcert=`. The hostname is NOT checked, which is what the word means.
+ *   `verify-full` as `verify-ca`, plus node:tls's own hostname check -- the same one `pg` gets,
+ *              since `pg` supplies no checkServerIdentity of its own.
  *   `prefer`   SSLRequest, upgrade on `S`, continue in the clear on `N`. libpq's default, and no
  *              connection install.sh opens uses it: it picks its transport at RUN TIME, which is
  *              what let an authentication FAILURE select a second pg_hba record.
+ *
+ * ALL FOUR TLS MODES ARE MATCHED BY THE SAME `hostssl` RECORD -- an SSLRequest was sent and
+ * accepted, and that is the only thing pg_hba's transport keyword looks at. What separates them is
+ * whether the handshake COMPLETES, which is why the reader takes the application's exact mode
+ * rather than the cheapest one that reaches the same record: a probe that verified less than the
+ * application does would report a method the application will never get to read.
  *
  * Debian's packaged cluster ships `ssl = on` and an `initdb` cluster ships `ssl = off`. Both are
  * measured, on real clusters, because a suite that only ever runs the second leaves the transport
@@ -124,6 +136,7 @@
 import { Buffer } from 'node:buffer'
 import net from 'node:net'
 import process from 'node:process'
+import fs from 'node:fs'
 import tls from 'node:tls'
 
 const PROTOCOL_VERSION_3_0 = 196608
@@ -270,15 +283,43 @@ function connect(host, port, deadline) {
   })
 }
 
-function upgrade(socket, host, deadline) {
+/**
+ * THE TLS OPTIONS FOR ONE MODE, BUILT THE WAY THE APPLICATION'S DRIVER BUILDS THEM
+ * (o3d-2sm1.5 r45, Codex MEDIUM).
+ *
+ * This is not a mapping invented here. It is what pg-connection-string 2.12.0 produces for the
+ * same `sslmode=` under `uselibpqcompat=true` -- the branch install.sh selects by putting that
+ * parameter on the emitted URL -- read out of `node_modules/pg-connection-string/index.js:99-131`
+ * and reproduced field for field:
+ *
+ *   `require`/`prefer`  { rejectUnauthorized: false }. Encrypted, certificate not verified. This
+ *                       is what the reader has always done, and it is what a Debian cluster's
+ *                       self-signed certificate needs.
+ *   `verify-ca`         { ca, checkServerIdentity: () => {} }. The chain is verified against the
+ *                       CA install.sh was given; the HOSTNAME is not, which is what separates
+ *                       verify-ca from verify-full in libpq and in the driver alike.
+ *   `verify-full`       { ca }. Chain and hostname both, by node:tls's own default identity check
+ *                       -- the same one `pg` gets, because `pg` sets none of its own.
+ *
+ * So the reader and the application are the same TLS client on the same options. That is the
+ * closest this program can come to "probe through the driver" without requiring the driver: `pg`
+ * is not on disk at the moment the earliest probe runs (install.sh reconciles an interrupted
+ * rotation while collecting configuration, several hundred lines before it deploys the release or
+ * runs `npm ci`), and on an upgrade the copy that IS on disk belongs to the OLD release -- a
+ * different driver from the one about to be installed, which is the wrong client to measure.
+ */
+function tlsOptionsFor(mode, host, ca) {
+  const servername = net.isIP(host) === 0 ? host : undefined
+  if (mode === 'verify-full') return { servername, ca }
+  if (mode === 'verify-ca') return { servername, ca, checkServerIdentity: () => undefined }
+  return { servername, rejectUnauthorized: false }
+}
+
+function upgrade(socket, host, deadline, mode, ca) {
   return new Promise((resolve, reject) => {
-    // `prefer` VERIFIES NOTHING, so neither does this. Anything stricter would refuse the
-    // self-signed certificate a Debian cluster ships and that the psql beside it accepts, and the
-    // two connections would then be matched by different pg_hba records.
     const secured = tls.connect({
       socket,
-      rejectUnauthorized: false,
-      servername: net.isIP(host) === 0 ? host : undefined,
+      ...tlsOptionsFor(mode, host, ca),
     })
     const timer = setTimeout(() => {
       secured.destroy()
@@ -382,10 +423,19 @@ function classify(type, payload) {
  *               by neither `hostssl` nor `hostnossl`, so there is no second record to fall onto.
  *   `unknown`   nothing was negotiated: the connection failed, or the server refused it before
  *               the startup message. There is no route to pin to, and the caller refuses.
+ *
+ * SINCE r45 A TLS ROUTE REPORTS WHICH TLS, because there are now three of them and they are not
+ * interchangeable: `require`, `verify-ca` and `verify-full` all send an SSLRequest and are all
+ * matched by the same `hostssl` record, but they verify different things, and the caller pins
+ * psql to the word this returns. The value is `applied` -- the mode the tls.connect() options
+ * were actually built from -- and it is passed in only AFTER the handshake completed under them,
+ * so it is still a statement about what happened. A reader too old to know `verify-full` cannot
+ * report it: it dies on the argument, or reports `require`, and either way the caller's
+ * check-back refuses instead of accepting a route it did not get.
  */
-function pinFor(transport, ssl) {
+function pinFor(transport, ssl, applied) {
   if (transport === 'unix') return 'disable'
-  if (ssl === 'yes') return 'require'
+  if (ssl === 'yes') return applied ?? 'unknown'
   if (ssl === 'no' || ssl === 'not-offered') return 'disable'
   return 'unknown'
 }
@@ -395,15 +445,15 @@ function pinFor(transport, ssl) {
  * The caller compares them and refuses if they differ, which is what makes "the route the
  * application takes" a checked claim rather than an argument passed and forgotten.
  */
-function report(requested, transport, ssl, verdict) {
-  process.stdout.write(`requested=${requested}\ntransport=${transport}\nssl=${ssl}\nsslmode=${pinFor(transport, ssl)}\nmethod=${verdict.method}\nverifier=${verdict.verifier}\ndetail=${verdict.detail}\n`)
+function report(requested, transport, ssl, applied, verdict) {
+  process.stdout.write(`requested=${requested}\ntransport=${transport}\nssl=${ssl}\nsslmode=${pinFor(transport, ssl, applied)}\nmethod=${verdict.method}\nverifier=${verdict.verifier}\ndetail=${verdict.detail}\n`)
 }
 
 async function main() {
   const options = new Map()
   for (const argument of process.argv.slice(2)) {
     const match = /^--([a-z][a-z0-9-]*)=([\s\S]*)$/.exec(argument)
-    if (match === null) die(`unrecognised argument ${JSON.stringify(argument)}; expected --host= --port= --user= --database= --sslmode= [--timeout-ms=]`, 2)
+    if (match === null) die(`unrecognised argument ${JSON.stringify(argument)}; expected --host= --port= --user= --database= --sslmode= [--sslrootcert=] [--timeout-ms=]`, 2)
     options.set(match[1], match[2])
   }
   for (const required of ['host', 'port', 'user', 'database', 'sslmode']) {
@@ -413,8 +463,26 @@ async function main() {
   // is to name the transport the APPLICATION takes, and a default is exactly how this program
   // came to be observing one nobody uses.
   const requested = options.get('sslmode')
-  if (requested !== 'disable' && requested !== 'require' && requested !== 'prefer') {
-    die(`--sslmode= must be disable, require or prefer, not ${JSON.stringify(requested)}`, 2)
+  const MODES = ['disable', 'require', 'prefer', 'verify-ca', 'verify-full']
+  if (!MODES.includes(requested)) {
+    die(`--sslmode= must be one of ${MODES.join(', ')}, not ${JSON.stringify(requested)}`, 2)
+  }
+  // THE CA IS REQUIRED BY THE TWO MODES THAT VERIFY ONE, AND REFUSED BY THE ONES THAT DO NOT.
+  // Without it node:tls falls back to its own bundled roots while the psql beside it falls back to
+  // ~/.postgresql/root.crt -- two trust stores, and a probe that verified against neither of the
+  // things the application will.
+  let ca = undefined
+  if (requested === 'verify-ca' || requested === 'verify-full') {
+    if (!options.has('sslrootcert') || options.get('sslrootcert').length === 0) {
+      die(`--sslmode=${requested} verifies the server certificate, so --sslrootcert= is required`, 2)
+    }
+    try {
+      ca = fs.readFileSync(options.get('sslrootcert'))
+    } catch (error) {
+      die(`--sslrootcert=${options.get('sslrootcert')} could not be read: ${String(error && error.message ? error.message : error)}`, 2)
+    }
+  } else if (options.has('sslrootcert')) {
+    die(`--sslmode=${requested} verifies no certificate, so --sslrootcert= would change nothing and is refused rather than ignored`, 2)
   }
   const host = options.get('host')
   const port = Number(options.get('port'))
@@ -426,6 +494,9 @@ async function main() {
   const reader = new Reader()
   const transport = host.startsWith('/') ? 'unix' : 'tcp'
   let ssl = 'n/a'
+  // THE MODE THE HANDSHAKE ACTUALLY COMPLETED UNDER. Assigned after secureConnect and never
+  // before, so a route that was asked for and not taken cannot be reported as one that was.
+  let applied = null
   let socket = null
   let stream = null
   try {
@@ -444,20 +515,21 @@ async function main() {
         // records begin where node:tls will look for them.
         if (reader.buffered() > 0) throw new Error('the server sent data after S and before the TLS handshake')
         reader.detach()
-        stream = await upgrade(socket, host, deadline)
+        stream = await upgrade(socket, host, deadline, requested, ca)
         reader.attach(stream)
+        applied = requested === 'prefer' ? 'require' : requested
         ssl = 'yes'
       } else if (reply === 'N') {
         // `require` DOES NOT FALL BACK, which is the difference between it and `prefer` and the
         // only reason the caller may act on it.
-        if (requested === 'require') throw new Error('the server refused TLS (it answered N to the SSLRequest) and this route does not fall back to the clear')
+        if (requested !== 'prefer') throw new Error('the server refused TLS (it answered N to the SSLRequest) and this route does not fall back to the clear')
         ssl = 'no'
       } else if (reply === 'E') {
         // A pre-negotiation ErrorResponse -- the rest of it is still on the wire, minus the type
         // byte already consumed.
         const length = (await reader.read(4, deadline)).readInt32BE(0)
         const payload = await reader.read(Math.max(0, length - 4), deadline)
-        report(requested, transport, 'refused', classify('E', payload))
+        report(requested, transport, 'refused', applied, classify('E', payload))
         process.exit(1)
       } else {
         throw new Error(`the server answered the SSL request with ${JSON.stringify(reply)}, which is neither S nor N`)
@@ -469,10 +541,10 @@ async function main() {
     // A NoticeResponse may precede anything, and means nothing here.
     while (message.type === 'N') message = await reader.message(deadline)
     const verdict = classify(message.type, message.payload)
-    report(requested, transport, ssl, verdict)
+    report(requested, transport, ssl, applied, verdict)
     process.exit(verdict.verifier === 'role' ? 0 : 1)
   } catch (error) {
-    report(requested, transport, ssl, {
+    report(requested, transport, ssl, applied, {
       method: 'unknown',
       verifier: 'unknown',
       detail: String(error && error.message ? error.message : error).replace(/\s+/g, ' '),

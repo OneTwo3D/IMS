@@ -4992,6 +4992,78 @@ installed_database_password() {
   printf '%s' "${password}"
 }
 
+# THE TRANSPORT AN EARLIER RUN PUBLISHED, recovered from the URL it wrote (o3d-2sm1.5 r45).
+#
+# It matters for the same reason installed_database_password() matters and it fails the same way
+# if it is left out: an upgrade that did not ask would silently re-publish a `disable` URL over a
+# TLS-only external database, and the service would come back unable to connect at all. Only the
+# query string this installer composes is recognised — `?sslmode=<mode>&uselibpqcompat=true`,
+# optionally with `&sslrootcert=` — and anything else answers nothing, which lands on the default
+# and then on the DB_SSLMODE validation below rather than on a guess.
+installed_database_sslmode() {
+  local url="$1" query
+  case "${url}" in *\?*) query="${url#*\?}" ;; *) return 1 ;; esac
+  case "${query}" in
+    "sslmode="*"&uselibpqcompat=true") printf '%s' "${query%%&*}" | sed 's/^sslmode=//' ;;
+    "sslmode="*"&uselibpqcompat=true&sslrootcert="*) printf '%s' "${query%%&*}" | sed 's/^sslmode=//' ;;
+    *) return 1 ;;
+  esac
+}
+
+installed_database_sslrootcert() {
+  local url="$1" query
+  case "${url}" in *\?*) query="${url#*\?}" ;; *) return 1 ;; esac
+  case "${query}" in
+    *"&sslrootcert="*) printf '%s' "${query##*&sslrootcert=}" ;;
+    *) return 1 ;;
+  esac
+}
+
+# THE TRANSPORT, ASKED FOR AND VALIDATED (o3d-2sm1.5 r45, Codex MEDIUM).
+#
+# Asked only where it can matter: an external database. The `INSTALL_POSTGRES=y` path is a cluster
+# THIS SCRIPT installs on THIS host and reaches over `localhost`, and it is left on `disable`
+# explicitly rather than by omission.
+#
+# THE CA PATH IS VALIDATED DOWN TO A CHARACTER SET, not escaped. It goes into a URL query, into a
+# psql environment variable and into a node argument, and an escape correct for one of those three
+# readers is one more reimplementation of somebody else's rules — the mistake this whole branch
+# keeps refusing to make. So the set is the one every reader treats literally, and a path outside
+# it is a refusal that says so.
+prompt_db_sslmode() {
+  local existing_url existing_mode existing_root
+  existing_url="$(existing_env DATABASE_URL)"
+  existing_mode="$(installed_database_sslmode "${existing_url}")" || existing_mode="disable"
+  existing_root="$(installed_database_sslrootcert "${existing_url}")" || existing_root=""
+  prompt DB_SSLMODE "Database TLS mode (disable, require, verify-ca, verify-full)" "${existing_mode}"
+  db_sslmode_is_supported "${DB_SSLMODE}" || die \
+    "DB_SSLMODE=${DB_SSLMODE} is not a transport this installer can put its probes on. The supported values are 'disable' (no SSLRequest at all — what every installation before this round used), 'require' (encrypted, certificate not verified), 'verify-ca' and 'verify-full' (both require DB_SSLROOTCERT). 'prefer' is deliberately absent: it chooses its transport at run time, so an authentication FAILURE can fall onto a second pg_hba.conf record, and the whole point of pinning is that it cannot."
+  case "${DB_SSLMODE}" in
+    verify-ca|verify-full)
+      prompt DB_SSLROOTCERT "Path to the CA certificate the server is verified against" "${existing_root}"
+      [[ -n "${DB_SSLROOTCERT}" ]] || die \
+        "DB_SSLMODE=${DB_SSLMODE} verifies the server's certificate against a CA, and DB_SSLROOTCERT names no file. Without one, node-postgres would fall back to Node's bundled CA bundle and libpq to ~/.postgresql/root.crt of whichever user opened the connection — two different trust stores, which is exactly the divergence this installer pins its probes to avoid. Supply the CA the cluster's certificate chains to."
+      ;;
+    *)
+      # A CA WITHOUT A MODE THAT USES IT IS NOT CARRIED FORWARD. Under `require` the driver's
+      # libpq-compatible branch treats an sslrootcert as an instruction to verify the CA, so
+      # leaving a stale one in place would quietly make `require` stricter than it says.
+      DB_SSLROOTCERT=""
+      ;;
+  esac
+  if [[ -n "${DB_SSLROOTCERT}" ]]; then
+    case "${DB_SSLROOTCERT}" in
+      /*) ;;
+      *) die "DB_SSLROOTCERT=${DB_SSLROOTCERT} is not an absolute path. It is read by the application (as an ssl.ca), by psql (as PGSSLROOTCERT) and by this installer's authentication-request reader, each with a different working directory, so a relative path would name three different files." ;;
+    esac
+    case "${DB_SSLROOTCERT}" in
+      *[!A-Za-z0-9._/-]*) die "DB_SSLROOTCERT=${DB_SSLROOTCERT} contains a character outside A-Z a-z 0-9 . _ - /. That path is placed verbatim into a URL query string, into an environment variable and into a command-line argument; escaping it correctly for all three is a reimplementation of three sets of rules, so it is refused instead. Move or link the certificate to a path made only of those characters." ;;
+    esac
+    [[ -f "${DB_SSLROOTCERT}" && -r "${DB_SSLROOTCERT}" ]] || die \
+      "DB_SSLROOTCERT=${DB_SSLROOTCERT} is not a readable file. DB_SSLMODE=${DB_SSLMODE} verifies the server against it, so a missing CA is not a connection that verifies less — it is a connection that does not open."
+  fi
+}
+
 # The prompt, on both branches, so the recovery cannot be true of one and not the other. It runs
 # AFTER DB_USER/DB_HOST/DB_PORT/DB_NAME are known, because whether there is anything to recover
 # is a question about those four.
@@ -5035,12 +5107,20 @@ if [[ "$INSTALL_POSTGRES" == "y" ]]; then
   prompt DB_USER      "Database user"           "imsuser"
   DB_HOST="localhost"
   DB_PORT="5432"
+  # A CLUSTER THIS SCRIPT INSTALLS, REACHED OVER localhost. Stated rather than defaulted: the
+  # value decides which pg_hba.conf record every probe below is matched by, and a route nobody
+  # chose is the whole subject of r43-r45.
+  DB_SSLMODE="disable"
+  DB_SSLROOTCERT=""
   prompt_db_password
 else
   prompt DB_HOST      "PostgreSQL host"         "localhost"
   prompt DB_PORT      "PostgreSQL port"         "5432"
   prompt DB_NAME      "Database name"           "one_two_inventory"
   prompt DB_USER      "Database user"           "imsuser"
+  # BEFORE THE PASSWORD PROMPT, because prompt_db_password() reconciles an interrupted rotation,
+  # and reconciling means PROBING — over the transport this answers for.
+  prompt_db_sslmode
   prompt_db_password
 fi
 

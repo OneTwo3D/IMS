@@ -56,17 +56,33 @@ export const SHIPPED = [
   // reader is lifted with it because db_application_route_env_refusal() goes through the SHIPPED
   // unit scan rather than through a second reader of its own -- which is the finding r44 answers,
   // so a rig that stubbed the scan would be measuring the defect rather than the fix.
+  //
+  // r45 (Codex HIGH x2, MEDIUM): the transport stops being a survey of the unit and becomes two
+  // PROPERTIES of it -- an UnsetEnvironment= directive systemd applies last, and an ExecStart=
+  // that is exactly what the installer wrote -- plus a supported way to ASK for TLS. All of it is
+  // lifted for the same reason the rest is: a rig that re-implemented the directive check would
+  // be proving that its author can write the directive check.
   'bus_read_strings',
   'bus_array_count',
   'bus_unit_property',
   'bus_element_names_variable',
   'bus_read_env_ignore_flags',
+  'bus_unit_object',
   'unit_env_var_sole_source',
+  'unit_route_env_guaranteed',
+  'unit_execstart_is_exactly',
+  'db_service_execstart_expected',
   'db_route_env_variables',
+  'db_route_env_alternative',
   'db_route_env_effect',
   'db_application_route_env_refusal',
+  'db_sslmode_is_supported',
+  'db_url_route_query',
   'db_application_route_sslmode',
   'installed_database_password',
+  'installed_database_sslmode',
+  'installed_database_sslrootcert',
+  'prompt_db_sslmode',
   // r39 (Codex HIGH): the durable mechanism, and the journal that makes the ALTER recoverable.
   'fsync_path',
   'publish_durable_file',
@@ -179,13 +195,25 @@ DB_PROBE_REPORT=""
 DB_PROBE_ROUTE_DATABASE=""
 DB_PROBE_SSLMODE=""
 DB_ENDPOINT_ROUTE_SSLMODE=""
+DB_ENDPOINT_ROUTE_SSLROOTCERT=""
+# r45 (Codex MEDIUM): the transport is a deployment input now, so it is a variable the shipped
+# functions read. \`disable\` is what every test that says nothing about TLS means, and it is what
+# install.sh's own INSTALL_POSTGRES=y branch sets; the TLS tests override it through \`vars\`.
+DB_SSLMODE=disable
+DB_SSLROOTCERT=""
+UNIT_EXECSTART_REASON=""
+ENV_ROUTE_GUARANTEE_REASON=""
+BUS_UNIT_OBJECT=""
+DB_ROUTE_DROPIN_NAME=zz-deploy-db-route.conf
+APP_PORT=3000
 # r44 (Codex HIGH): what the SHIPPED unit scan needs to exist, for the same reason as everything
 # else in this block -- the functions are lifted, the assignments beside them are not.
 #
 # The unit name the scan is given is \`\${APP_NAME}.service\`, which on this host is
-# \`one-two-inventory.service\` and is NOT a unit systemd has. That is not a hole in the rig, it is
-# the case the \`none\` layer names: a unit systemd does not have defines nothing. The refusal paths
-# are measured against a STUBBED busctl in the r44 tests, where the renderings are systemd's own.
+# \`one-two-inventory.service\` and is NOT a unit systemd has. Since r45 that is a REFUSAL rather
+# than a pass on the transport question too -- the guarantee is a property of a loaded unit, and a
+# unit systemd does not have carries no property. Every route check that must SUCCEED is therefore
+# measured against a STUBBED busctl, where the renderings are systemd's own, taken off this host.
 BUS_STRINGS=()
 BUS_ENV_IGNORE_FLAGS=()
 ENV_VAR_SOURCE_REASON=""
