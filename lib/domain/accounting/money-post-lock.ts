@@ -34,6 +34,15 @@
  * waiters. A crashed holder releases automatically — PostgreSQL drops session advisory locks when
  * the connection closes — which is why this is a lock and not a lease row with an expiry to tune.
  *
+ * SAY THE OTHER HALF OF THAT OUT LOUD (o3d-ic9a). The automatic release is not only the reason no
+ * expiry has to be tuned; it is also the failure mode. The lock ends WITH ITS CONNECTION, so a
+ * dropped socket, a server restart or a `pg_terminate_backend` between the ledger read and the
+ * remote post frees it MID-CALLBACK — no pooler required — and a second worker may acquire it and
+ * post the same document. `assertHeld`/`lost` below detect that only after the fact, and once the
+ * remote system has accepted two requests no exclusion mechanism can undo the duplicate. The lever
+ * for that last window is connector-side IDEMPOTENCY on the post itself, not a stronger lock; both
+ * are tracked on o3d-ic9a.
+ *
  * KEYED ON THE DOCUMENT, NOT THE SCOPE (round 6, Codex CRITICAL #2). It used to be keyed on
  * (connector, type, referenceType, referenceId) — where the row lives in IMS — which meant two
  * rows in different scopes naming the same external document took two different locks and could

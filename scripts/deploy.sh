@@ -265,6 +265,59 @@ FENCE_FILE="${CUTOVER_STATE_DIR}/DEPLOY-FENCED"
 FENCE_DROPIN_NAME="zz-deploy-fence.conf"
 DB_FENCE_DIR="${CUTOVER_STATE_DIR}/deploy"
 DB_FENCE_STATE="${DB_FENCE_DIR}/db-connect-fence.json"
+# THE ENVIRONMENT THE STARTED SERVICE IS BOUND TO (o3d-2sm1.5 r23, Codex HIGH).
+#
+# Rounds 13-22 asked, in eleven spellings, WHICH DATABASE THE SERVICE WILL USE, and every answer
+# was correct and incomplete for one reason: it was a READ of a file the service reads later and
+# somebody else can replace in between. Re-reading closer to the start shortens that window; it
+# cannot close it, because `EnvironmentFile=` is read by systemd at the moment it EXECS.
+#
+# So this round stops checking and BINDS. The value this run validated, fenced and migrated is
+# written to a file under the cutover state directory — root-owned, 0600, in a directory the
+# application user cannot write — and every unit is given a drop-in that loads THAT file, LAST.
+# systemd.exec: "If the same variable is set twice from these files, the files will be read in
+# the order they are specified and the later setting will override the earlier setting", and
+# "Settings from these files override settings made with Environment=". So whatever
+# ${APP_DIR_REAL}/.env has come to say by exec time, DATABASE_URL is the snapshot's.
+#
+# AND IT IS MANDATORY, WITH NO LEADING `-`. A missing snapshot is then a START FAILURE rather
+# than a silent fall-through to the application's own dotenv overlays — the exact difference
+# that made a DELETED .env dangerous, since the shipped units load that one with a `-`.
+#
+# WHY THIS CLOSES THE RACE THE RE-READ COULD NOT. Two systemd reads are involved and they have
+# different timing. The SET of environment files is unit CONFIGURATION, fixed at the last
+# `daemon-reload` and NOT re-read by `systemctl start`; the CONTENTS are read at exec. This run
+# issues the final daemon-reload itself, verifies the loaded list on the bus AFTER it, and
+# nothing between that verification and the start runs a unit-file command at all — not an
+# explicit daemon-reload and not one of the verbs that reloads IMPLICITLY (r24 moved the unmask
+# and the enable above the final reload for exactly that reason) — so the list cannot change
+# under it. The contents can be changed only by root, which is not a position this deploy can
+# defend against and is not the threat model: the file the check-to-exec race was about was
+# writable by the application user and by whatever configuration management writes .env.
+# NOT under ${CUTOVER_STATE_DIR}, which is the application's own data directory and therefore
+# WRITABLE BY THE APPLICATION USER (o3d-2sm1.5 r23). A binding the service can delete is not a
+# binding: the drop-in would then name a file that is gone, and — because it is loaded without a
+# leading `-` — the unit would refuse to start. Fail-closed, but an outage the app user could
+# cause. This directory is created root-owned and 0700 by publish_db_identity_snapshot().
+# AND ITS PATH IS A CONSTANT, NOT AN OVERRIDE (o3d-2sm1.5 r24, Codex HIGH). It used to be
+# ${IMS_CUTOVER_ENV_DIR:-/etc/ims-cutover}, and update.sh sources ${APP_DIR}/.env into the
+# environment AS ROOT before it resolves this line — so the variable that chose where the
+# snapshot goes was one THE APPLICATION USER WRITES. That hands back the entire point of the
+# location. publish_db_identity_snapshot() chowns and chmods only the FINAL directory, so a path
+# under an app-writable parent is secured after the parent has already been chosen: rename the
+# secured child away, put an attacker-owned directory at the same path, and PID 1 reads that
+# instead while the bus check and the mandatory-file check both still pass. The same override
+# aimed at an existing system directory chmods it to 0700 and takes it out.
+#
+# There is no configurable spelling of this that is safe. An override only a root-owned source
+# may set is indistinguishable from no override, and a trust root read out of the very file the
+# snapshot exists to distrust is not a trust root. So it is a literal: a deployment that must
+# move it edits this line, which is a root-owned change to a root-owned file, reviewed like any
+# other. The same reasoning is why nothing else in this script resolves a privileged path from a
+# variable the application can set — see the deploy-control restore after the .env source.
+DB_ENV_SNAPSHOT_DIR="/etc/ims-cutover"
+DB_ENV_SNAPSHOT_FILE="${DB_ENV_SNAPSHOT_DIR}/db-identity-snapshot.env"
+DB_ENV_SNAPSHOT_DROPIN_NAME="zz-deploy-db-identity.conf"
 # The namespace deploy.sh wrote to before this round. Nothing writes here any more, and a
 # run that finds state at these paths IMPORTS it into the canonical namespace before it
 # changes a unit or a crontab — see import_legacy_cutover_state(). An in-flight fence left
@@ -286,6 +339,10 @@ die()   { echo -e "${RED}[ERROR]${RESET} $*" >&2; exit 1; }
 DRY_RUN=false
 SKIP_BUILD=false
 SKIP_MIGRATE=false
+# --restart-only is --skip-migrate PLUS --skip-build, and one arm below has to tell the two
+# apart: a run that delivers new code against a schema nobody checked is the case o3d-1izw is
+# open against, and a run that delivers no new code at all is not.
+RESTART_ONLY=false
 # The flag as the operator typed it, kept so the refusal below can name it rather than
 # talking about a variable they never set.
 SKIP_MIGRATE_FLAG=""
@@ -295,7 +352,7 @@ for arg in "$@"; do
     --dry-run)      DRY_RUN=true ;;
     --skip-build)   SKIP_BUILD=true ;;
     --skip-migrate) SKIP_MIGRATE=true; SKIP_MIGRATE_FLAG="--skip-migrate" ;;
-    --restart-only) SKIP_BUILD=true; SKIP_MIGRATE=true; SKIP_MIGRATE_FLAG="--restart-only" ;;
+    --restart-only) SKIP_BUILD=true; SKIP_MIGRATE=true; SKIP_MIGRATE_FLAG="--restart-only"; RESTART_ONLY=true ;;
     --help|-h)      sed -n '3,226p' "$0"; exit 0 ;;
     *) die "Unknown option: $arg (try --help)" ;;
   esac
@@ -424,6 +481,11 @@ REBOOT_FENCE_INSTALLED=false
 # remove exactly that and leave an already-standing fence alone.
 FENCE_MARKER_PREEXISTED=false
 FENCE_DROPINS_CREATED=()
+# Whether THIS run published the environment snapshot, and which drop-ins it created. The first
+# gates the tolerance in env_file_is_sole_database_url_source(): a snapshot loaded by a unit that
+# this run did not publish is an unexplained pin, and is refused rather than accepted.
+DB_ENV_SNAPSHOT_PUBLISHED=false
+DB_ENV_SNAPSHOT_DROPINS_CREATED=()
 # The point of no return: the new build has answered its health check. Nothing after this may
 # stop it, re-fence it or revoke CONNECT again (o3d-2sm1.5, Codex r4 HIGH).
 PAST_POINT_OF_NO_RETURN=false
@@ -457,7 +519,83 @@ fi
 CRON_BACKUP="${CUTOVER_STATE_DIR}/crontab-${APP_USER}.bak"
 LEGACY_CRON_BACKUP="${LEGACY_CUTOVER_STATE_DIR}/crontab-${APP_USER}.bak"
 DB_FENCE_SCRIPT="${APP_DIR_REAL}/scripts/fence-db-connections.mjs"
-DB_FENCE_RELEASE_CMD="node ${DB_FENCE_SCRIPT} --release --state-file=${DB_FENCE_STATE}"
+# ---------------------------------------------------------------------------
+# WHICH BYTES OF THAT HELPER MAY RUN WITH DEPLOY_ADMIN_DATABASE_URL (o3d-2sm1.5 r31, Codex
+# CRITICAL). ${DB_FENCE_SCRIPT} is under the application-owned checkout, and until this round
+# every mode here — preflight, fence, --print-migration-url, release, and the exit trap's
+# re-fence — executed it from that path with an administrative database credential in its
+# environment. The application account can replace the file between any two of those moments,
+# report a fence it never raised, and let the migration run against live writers.
+#
+# The rule is stated ONCE, in the library below, and shared with update.sh and install.sh: r30
+# inverted the precedence in update.sh alone and left this script and install.sh reading the old
+# one, which is the same one-rule-several-readers shape a third time. Nothing here resolves a
+# fence script of its own; db_fence_script_in_use() does, and it never returns ${DB_FENCE_SCRIPT}.
+#
+# SOURCED FROM THIS SCRIPT'S OWN DIRECTORY. It is read at startup, out of the same tree and in the
+# same instant as the body of this file, so it adds no window this entrypoint does not already
+# have — unlike the helper, which is executed several phases later.
+IMS_SCRIPT_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib"
+# shellcheck source=lib/db-fence-protected.sh
+source "${IMS_SCRIPT_LIB_DIR}/db-fence-protected.sh" || {
+  echo "FATAL: ${IMS_SCRIPT_LIB_DIR}/db-fence-protected.sh could not be sourced. It decides which bytes the connection fence may be executed with, and without it this run cannot fence a migration window. Nothing has been changed." >&2
+  exit 1
+}
+# The identity the fence is TOLD — see resolve_db_identity() below, which is defined after
+# env_file_value() because it reads DATABASE_URL out of the same .env. Starts empty so that a run
+# which cannot read it refuses instead of fencing an unidentified connection.
+#
+# ---------------------------------------------------------------------------
+# WHAT AN OPERATOR IS TOLD TO RUN (o3d-2sm1.5 r32, Codex HIGH x2)
+#
+# NOT A COMMAND LINE. r31 fixed which bytes this script executes and left every printed
+# instruction describing the world before it, which produced two separate defects of the same
+# kind:
+#
+#   * the printed `--release` line named the protected copy but had NO WAY TO OBTAIN
+#     DEPLOY_ADMIN_DATABASE_URL. The helper's `.env` load resolved against its own mirrored
+#     location, and the mirror holds no `.env`; the deploy's own copy of the variable lives in
+#     THIS shell and not in the operator's. Pasted, it failed while the database stayed fenced.
+#   * the re-fence banner — printed at the one moment when the schema has moved and the fence is
+#     down — still said `node ${DB_FENCE_SCRIPT} --fence`, the application-owned path, handing the
+#     admin credential to whatever is at it.
+#
+# So both are now ROOT-OWNED WRAPPERS, written by db_fence_publish_operator_wrappers() out of the
+# artefact this run resolved, with the state file and the four identity values baked in. They take
+# the credential from their own environment or from ${APP_DIR_REAL}/.env with the same reader
+# env_file_value() uses, re-verify the artefact digest before exec, and run as ${APP_USER}. There
+# is nothing to fill in and nothing to paste wrongly.
+#
+# AND THE INSTRUCTION IS NOT THE BARE PATH (o3d-2sm1.5 r33, Codex HIGH). Those wrappers are
+# root-owned and 0700. The operator most likely to be reading this banner launched the cutover
+# with `sudo bash scripts/...` and is back in a NON-ROOT shell, where pasting a bare path gives
+# `Permission denied` while the database is still fenced. ${DB_FENCE_SUDO_PREFIX} carries the
+# privilege transition, and it is empty only on a box with no sudo — which is a box this run
+# cannot have been launched on as anything but root, so the reader is root there.
+#
+# ONE ASSIGNMENT EACH, and every banner in this file prints these two variables rather than
+# composing a command of its own: that is the same "one rule, several readers" discipline the
+# fence library exists for, applied to the text.
+DB_FENCE_RELEASE_CMD="${DB_FENCE_SUDO_PREFIX}${DB_FENCE_RELEASE_WRAPPER}"
+DB_FENCE_REFENCE_CMD="${DB_FENCE_SUDO_PREFIX}${DB_FENCE_REFENCE_WRAPPER}"
+
+# THE ONE PLACE THIS SCRIPT DECIDES WHICH BYTES THE FENCE RUNS, and the one place the recovery
+# wrappers are refreshed — so the file that is executed and the file an operator is pointed at can
+# never be about different artefacts. Prints the script path; the reason for a refusal is already
+# on stderr from the library.
+#
+# A wrapper that could not be written is a WARNING and not a refusal: it is a convenience file in
+# a root-owned directory, and failing a fence over it would trade a real protection for a
+# cosmetic one. The path printed in the banners is still the right one to run — a previous run's
+# wrapper is very likely standing there — and the warning says the refresh did not happen.
+resolve_fence_script() {
+  local script
+  script="$(db_fence_script_in_use)" || return 1
+  db_fence_publish_operator_wrappers "${APP_USER}" "${APP_DIR_REAL}/.env" "${DB_FENCE_STATE}" \
+    "${DB_FENCE_IDENTITY_ARGS[@]:-}" \
+    || echo "The recovery wrappers at ${DB_FENCE_RELEASE_WRAPPER} and ${DB_FENCE_REFENCE_WRAPPER} could not be refreshed for this run. Anything printed below that names them may be a previous run's copy; check it before running it." >&2
+  printf '%s' "$script"
+}
 DB_OBJECT_ACCESS_SCRIPT="${APP_DIR_REAL}/scripts/check-app-db-object-access.mjs"
 
 # Read ONE variable out of .env without `source` (which executes whatever is in the file)
@@ -485,6 +623,28 @@ env_file_value() {
   printf '%s' "$value"
 }
 
+# THE ONE PLACE A TCP PORT IS DECIDED TO BE A TCP PORT (o3d-2sm1.5 r26, Codex HIGH).
+#
+# A port that is not a port is not a cosmetic problem here: it is spliced straight into the URL
+# the health check polls, and a URL that cannot be reached is indistinguishable from a service
+# that did not come up. On the update path that costs a healthy deployment — the poll times out,
+# the script stops the service it just started and re-establishes the post-migration fences.
+#
+# So the shape is checked ONCE, where the value is read, and the run refuses BEFORE anything is
+# stopped rather than discovering it after the schema has moved. Decimal digits only, 1-65535,
+# and `10#` so a leading zero is a decimal port and not a bash octal error under `set -e`.
+valid_tcp_port() {
+  local value="$1"
+  [[ "$value" =~ ^[0-9]{1,5}$ ]] || return 1
+  (( 10#$value >= 1 && 10#$value <= 65535 )) || return 1
+}
+
+# PORT here comes from the deploy invocation (IMS_PORT), not from an application-owned file, so
+# it is not a reader question — but it ends up in HEALTH_URL and in the listener probe exactly as
+# update.sh's APP_PORT does, and an unreachable health URL reads as "the new build did not come
+# up" in both scripts. Checked here, which is before the build, the stop and the fence.
+valid_tcp_port "${PORT}" || die "IMS_PORT must be a decimal TCP port in 1-65535, not '${PORT}'. It becomes ${HEALTH_URL}, which this deploy polls to decide whether the new build came up."
+
 # The connection the migration itself runs through: the privileged URL while the
 # connection fence is up, because the fence shuts the application role out and the
 # migration must not be shut out with it.
@@ -496,6 +656,580 @@ env_file_value() {
 # grant from (o3d-2sm1.5).
 DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL:-$(env_file_value DEPLOY_ADMIN_DATABASE_URL "${APP_DIR_REAL}/.env")}"
 MIGRATION_DATABASE_URL=""
+
+# ---------------------------------------------------------------------------
+# THE APPLICATION'S CONNECTION IDENTITY: SUPPLIED TO THE FENCE, NEVER WORKED OUT BY IT
+# (o3d-2sm1.5 r19).
+#
+# scripts/fence-db-connections.mjs used to derive the host, port, role and database THE
+# APPLICATION connects to — first by reading the URL itself, then through node-postgres's own
+# resolution, then from the deploy shell's PG* variables, then from the service's environment
+# file, then from `systemctl show`. Seven rounds; each answer locally correct; each uncovering
+# another layer beneath it — PassEnvironment=, UnsetEnvironment=, wildcard EnvironmentFile=
+# globs, the .env.development*/.env.test* overlays Next loads in other modes, a unit with no
+# WorkingDirectory=, and DATABASE_URL's own precedence chain. The question is UNBOUNDED, because
+# the composition rules belong to systemd, Next and libpq at once and any of them may add a
+# layer. So it is no longer asked: the four values are REQUIRED on the fence's command line, and
+# a fence that is not given them refuses to fence anything.
+#
+# THIS is where they come from, and the operator types nothing new for it: DATABASE_URL, split by
+# a reader that ACCEPTS ONLY A URL STATING ALL FOUR. That strictness is what CLOSES the question
+# rather than narrowing it — PGHOST, PGPORT, PGUSER and PGDATABASE are consulted by libpq and by
+# `pg` ONLY for values the connection string leaves out, so a URL that states all four cannot be
+# moved by any environment, in any process, under any of those three systems. Everything else —
+# no port, no path, more than one path segment, an identity-bearing query parameter, a
+# percent-escape this refuses to decode — is a REFUSAL that stops the run before anything is
+# stopped or migrated. Never a default, and never a guess at what was meant.
+#
+# On success it sets DB_IDENTITY_HOST/PORT/USER/DATABASE and DB_FENCE_IDENTITY_ARGS. On failure
+# it leaves all of them empty and puts the reason in DB_IDENTITY_REASON; fence_db_connections()
+# then dies with that reason rather than fencing a connection nobody has identified.
+DB_IDENTITY_HOST=""
+DB_IDENTITY_PORT=""
+DB_IDENTITY_USER=""
+DB_IDENTITY_DATABASE=""
+DB_IDENTITY_REASON="DATABASE_URL has not been read yet"
+DB_FENCE_IDENTITY_ARGS=()
+
+resolve_db_identity() {
+  local url="${1:-}" rest authority userinfo hostport path host port user database query
+  local -a pairs
+  DB_IDENTITY_HOST=""; DB_IDENTITY_PORT=""; DB_IDENTITY_USER=""; DB_IDENTITY_DATABASE=""
+  DB_FENCE_IDENTITY_ARGS=()
+
+  if [[ -z "$url" ]]; then
+    DB_IDENTITY_REASON="DATABASE_URL is not set, so there is no application connection to name"
+    return 1
+  fi
+  case "$url" in
+    postgres://*)   rest="${url#postgres://}" ;;
+    postgresql://*) rest="${url#postgresql://}" ;;
+    *) DB_IDENTITY_REASON="DATABASE_URL does not begin with postgres:// or postgresql://"; return 1 ;;
+  esac
+  case "$rest" in
+    */*) authority="${rest%%/*}"; path="${rest#*/}" ;;
+    *)   DB_IDENTITY_REASON="DATABASE_URL states no database: there is no /<database> after the host"; return 1 ;;
+  esac
+  # The userinfo ends at the LAST '@' of the authority, which is the rule both WHATWG URL and
+  # node-postgres follow, and it is the only reason a password containing '@' works at all.
+  case "$authority" in
+    *@*) userinfo="${authority%@*}"; hostport="${authority##*@}" ;;
+    *)   DB_IDENTITY_REASON="DATABASE_URL states no role: there is no user@ in front of the host"; return 1 ;;
+  esac
+  user="${userinfo%%:*}"
+  case "$hostport" in
+    \[*\]:*) host="${hostport%%]:*}]"; port="${hostport##*]:}" ;;
+    \[*)     DB_IDENTITY_REASON="DATABASE_URL states no port for the address ${hostport}"; return 1 ;;
+    *:*)     host="${hostport%:*}";    port="${hostport##*:}" ;;
+    *)       DB_IDENTITY_REASON="DATABASE_URL states no port: without one the connection takes PGPORT, or 5432, and which server it reaches is not stated by the URL"; return 1 ;;
+  esac
+  database="${path%%\?*}"
+  query=""
+  case "$path" in *\?*) query="${path#*\?}" ;; esac
+
+  [[ -n "$user" ]]     || { DB_IDENTITY_REASON="DATABASE_URL states an empty role"; return 1; }
+  [[ -n "$host" ]]     || { DB_IDENTITY_REASON="DATABASE_URL states an empty host"; return 1; }
+  [[ -n "$database" ]] || { DB_IDENTITY_REASON="DATABASE_URL states an empty database name"; return 1; }
+  case "$database" in */*) DB_IDENTITY_REASON="DATABASE_URL has more than one path segment (${path}), so which of them is the database is not stated"; return 1 ;; esac
+  [[ "$port" =~ ^[0-9]{1,5}$ ]] || { DB_IDENTITY_REASON="DATABASE_URL states the port '${port}', which is not a port number"; return 1; }
+  # PERCENT-ESCAPES ARE REFUSED, NOT DECODED. Decoding is a reimplementation, and this reader
+  # exists because reimplementations were the problem; a role or database written with one must
+  # be written plainly, or the fence is not run.
+  case "${user}${host}${database}" in *%*) DB_IDENTITY_REASON="DATABASE_URL percent-escapes part of its role, host or database, and this will not decode it — write them plainly or run with --skip-migrate"; return 1 ;; esac
+  # WHITESPACE would also be a value this cannot hand on unambiguously.
+  case "${user}${host}${database}${port}" in *[[:space:]]*) DB_IDENTITY_REASON="DATABASE_URL states a role, host or database containing whitespace"; return 1 ;; esac
+  # AND NOT ONE PERCENT ESCAPE ANYWHERE IN THE QUERY STRING (o3d-2sm1.5 r20, Codex CRITICAL).
+  # The scan below compares RAW key bytes, and the driver does not: pg-connection-string runs the
+  # query through URLSearchParams, which decodes the KEY as well as the value. Measured against
+  # the installed pg-connection-string, `?ho%73t=other-cluster` yields host=other-cluster,
+  # `?po%72t=6543` yields port=6543 and `?u%73er=other` yields user=other — every one of them past
+  # a scan looking for `host`, `port` and `user`. So the URL's authority would state four values,
+  # this reader would hand those four to the fence, and the application would connect to a
+  # different cluster: the fence, the migration and the release all correct about a database
+  # nothing uses. Decoding it here to compare properly is the reimplementation this reader exists
+  # to avoid, so ANY escape in the query is refused instead — the same answer the role, host and
+  # database already get one check above, applied to the part that names them again.
+  if [[ -n "$query" ]]; then
+    case "$query" in *%*) DB_IDENTITY_REASON="DATABASE_URL percent-escapes something in its query string, and this will not decode it to find out whether the escape spells host, port, user or dbname — node-postgres decodes query KEYS, so ?ho%73t= reaches the driver as host= and moves the connection off the address the URL states. Write the query plainly, or run with --skip-migrate"; return 1 ;; esac
+  fi
+  if [[ -n "$query" ]]; then
+    IFS='&' read -r -a pairs <<<"$query"
+    local pair name
+    for pair in "${pairs[@]}"; do
+      name="${pair%%=*}"
+      case "$name" in
+        host|port|user|dbname|database)
+          DB_IDENTITY_REASON="DATABASE_URL carries ?${name}= in its query string, which node-postgres uses in preference to the authority — so the URL does not connect where it appears to. Delete it"
+          return 1 ;;
+      esac
+    done
+  fi
+
+  DB_IDENTITY_HOST="$host"
+  DB_IDENTITY_PORT="$port"
+  DB_IDENTITY_USER="$user"
+  DB_IDENTITY_DATABASE="$database"
+  DB_IDENTITY_REASON=""
+  DB_FENCE_IDENTITY_ARGS=(
+    "--app-host=${host}"
+    "--app-port=${port}"
+    "--app-user=${user}"
+    "--app-database=${database}"
+  )
+  return 0
+}
+
+# The refusal every fence mode goes through: four values or nothing happens.
+require_db_identity() {
+  [[ "${#DB_FENCE_IDENTITY_ARGS[@]}" -eq 4 ]] && return 0
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# IS THE FILE WE READ THE ONLY THING THAT CAN DEFINE DATABASE_URL FOR THIS SERVICE?
+# (o3d-2sm1.5 r20, Codex CRITICAL; r21 asks systemd's BUS instead of its text output)
+#
+# r19 moved the identity from "worked out by the fence" to "supplied by the entrypoint", and the
+# entrypoint supplies it out of ${APP_DIR_REAL}/.env. That is the PREVIOUS PROBLEM ONE LEVEL UP: an
+# `Environment=DATABASE_URL=...` directive, a drop-in that adds one, a `PassEnvironment=` entry, a
+# `PAMName=` whose PAM stack exports one, or a second `EnvironmentFile=` can put a different URL in
+# the service's environment, and dotenv does NOT overwrite a variable that is already set. The
+# fence, the migration and the release would then all be self-consistent about the .env database
+# while the restarted application connects elsewhere — a migration run on a database nothing was
+# fenced off, and a new build started against a database nothing migrated.
+#
+# THIS DOES NOT REBUILD THE INFERENCE r19 DELETED, and the difference is the whole design. It
+# computes no value and reproduces no precedence. It asks ONE existence question about ONE
+# variable:
+#
+#     can anything other than the file we read define DATABASE_URL for this unit?
+#
+# systemd answers that directly, because it reports the COMPOSED Environment=, EnvironmentFiles=,
+# PassEnvironment=, UnsetEnvironment= and PAMName= with every drop-in already folded in by systemd
+# itself. Asking whether a second definition EXISTS is bounded; working out which of several would
+# WIN is the unbounded question, and it is never asked — any answer but "only that file" is a
+# refusal that names what else defines it and tells the operator to state the identity explicitly.
+# A second environment file is refused WITHOUT being read, for the same reason: that it may define
+# the variable is enough, and reading it to find out would put the precedence question straight
+# back. A non-empty PAMName= is refused without reading PAM configuration, for that same reason
+# again.
+#
+# IT IS ASKED OF THE BUS, NOT OF `systemctl show` (r21, Codex CRITICAL). Two of r20's three
+# findings were text-parsing bugs and only text-parsing bugs: `systemctl show` renders a property
+# as one `Name=` line of space-joined values, so where one entry of an ARRAY ends and the next
+# begins has to be guessed at — and `EnvironmentFiles` is an array of (path, ignore_errors) PAIRS
+# whose rendering the previous reader truncated at the first ` (ignore_errors=`. `busctl` — the
+# same package, on every host that has systemctl — prints the property's SIGNATURE and the array's
+# own ELEMENT COUNT before the elements:
+#
+#     a(sb) 1 "/opt/app/.env" true          as 2 "NODE_ENV=production" "PORT=3000"          s ""
+#
+# so "is there more than one environment file?" is answered by systemd's own data structure. The
+# count is read from the rendering and checked against the number of elements found in it; a
+# disagreement is a refusal. Nothing is inferred from where a space falls, and a string systemd had
+# to escape (busctl prints strings through `cescape()`) is REFUSED rather than decoded — decoding
+# it here would be one more reimplementation of somebody else's rules.
+#
+# EVERY ENVIRONMENT PROPERTY IS THEN MATCHED THE SAME WAY: on the NAME of each element, which is
+# everything before its first `=`. That is what makes `UnsetEnvironment=DATABASE_URL=<the value in
+# the .env>` a refusal (r21, Codex HIGH): systemd.exec takes "a space-separated list of variable
+# names or variable assignments", removes an exact assignment as the FINAL step of composing the
+# environment, and a scan for the bare token `DATABASE_URL` sees no such token in it — after which
+# the application's own dotenv loader supplies whatever `.env.local` says. The same rule applies to
+# Environment=, PassEnvironment= and UnsetEnvironment= alike, so no spelling of any of them is
+# matched by a substring.
+#
+# THE FILE MUST ALSO BE ONE SYSTEMD ITSELF LOADS. If the unit loads no environment file, the
+# variable reaches the application through the application's OWN loader instead, by rules that
+# belong to Next and not to systemd — `.env.local` and the per-mode overlays, which is precisely
+# the layer r19 stopped reproducing. So that is a refusal too, and it says which line to add.
+#
+# WHAT IT CANNOT SEE, STATED RATHER THAN PAPERED OVER: an `ExecStart=` that runs a wrapper which
+# exports DATABASE_URL itself is invisible to systemd's own properties, because that definition
+# lives inside a program rather than in the unit. Closing that would mean reading programs, which
+# is unbounded again. It is the standing argument for making the four values a DEPLOYMENT-OWNED
+# CONFIGURATION INPUT that these scripts read outright, instead of deriving them from a URL that
+# is only probably the one the service uses (o3d-1yvh, docs/installation.md).
+DB_IDENTITY_SOURCE_REASON="the service's environment has not been asked about yet"
+BUS_STRINGS=()
+
+# THE STRINGS IN ONE `busctl` RENDERING, in order, STILL ESCAPED.
+#
+# busctl prints every string through `cescape()`, so a `"` inside a value arrives as `\"` and
+# cannot end it early. This walks the rendering with that one rule and keeps the escapes: the
+# callers compare against names and paths that contain none, and refuse anything that does.
+# Returns 1 for a rendering whose quoting does not close, which is a rendering this cannot read.
+bus_read_strings() {
+  local text="${1:-}" index=0 length char current='' inside=0
+  BUS_STRINGS=()
+  length=${#text}
+  while (( index < length )); do
+    char="${text:index:1}"
+    if (( inside )); then
+      if [[ "$char" == '\' ]]; then
+        (( index + 1 < length )) || return 1
+        index=$(( index + 1 ))
+        current+="\\${text:index:1}"
+      elif [[ "$char" == '"' ]]; then
+        BUS_STRINGS+=("$current")
+        current=''
+        inside=0
+      else
+        current+="$char"
+      fi
+    elif [[ "$char" == '"' ]]; then
+      inside=1
+      current=''
+    fi
+    index=$(( index + 1 ))
+  done
+  (( inside == 0 )) || return 1
+  return 0
+}
+
+# THE ELEMENT COUNT systemd states in front of an array, for the signature we asked for.
+#
+# This is the number that makes the question bounded: it comes from the array, not from counting
+# separators in a line. A rendering of another signature — or none — is not an answer, and the
+# caller refuses.
+bus_array_count() {
+  local text="${1:-}" signature="${2:-}" rest
+  [[ "$text" == "${signature} "* ]] || return 1
+  rest="${text#"${signature}" }"
+  rest="${rest%% *}"
+  [[ "$rest" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$rest"
+}
+
+# One property of one unit, as systemd's own bus states it.
+bus_unit_property() {
+  busctl get-property org.freedesktop.systemd1 "${1:-}" "org.freedesktop.systemd1.${2:-}" "${3:-}" 2>/dev/null
+}
+
+# Does this element of an environment property NAME DATABASE_URL? Everything before the first `=`
+# is the name, so `DATABASE_URL`, `DATABASE_URL=postgresql://...` and an assignment carrying any
+# value at all are one answer, and `NEXT_PUBLIC_DATABASE_URL=...` is not.
+bus_element_names_database_url() {
+  [[ "${1%%=*}" == "DATABASE_URL" ]]
+}
+
+# THE `ignore_errors` HALF OF EnvironmentFiles=, which is an `a(sb)` and not an `as`
+# (o3d-2sm1.5 r23, Codex HIGH). bus_read_strings() reads the paths and drops the booleans; the
+# snapshot check needs them, because a snapshot loaded with a leading `-` is not a binding at
+# all — systemd would SKIP it if it were missing and hand the service back to whatever else
+# defines DATABASE_URL, which is the failure this round exists to remove.
+#
+# Every quoted element is removed first, which leaves the signature, systemd's own element count
+# and the booleans in order. Nothing here reimplements systemd's escaping: the callers already
+# refuse any element that had to be escaped.
+BUS_ENV_IGNORE_FLAGS=()
+bus_read_env_ignore_flags() {
+  local text="${1:-}" stripped word index=0
+  BUS_ENV_IGNORE_FLAGS=()
+  stripped="$(printf '%s' "$text" | sed 's/"\(\\.\|[^"\\]\)*"/ /g')" || return 1
+  local IFS=' '
+  local -a words=()
+  # shellcheck disable=SC2206  # deliberate word split on the space-separated rendering
+  words=($stripped)
+  for (( index = 2; index < ${#words[@]}; index++ )); do
+    word="${words[index]}"
+    case "$word" in
+      true|false) BUS_ENV_IGNORE_FLAGS+=("$word") ;;
+      *) return 1 ;;
+    esac
+  done
+  return 0
+}
+
+# Does the caller also REQUIRE the environment snapshot to be loaded? False everywhere the
+# question is only "is anything else defining DATABASE_URL"; true at the one call site that is
+# about to hand the units to systemd (o3d-2sm1.5 r23).
+DB_IDENTITY_REQUIRE_SNAPSHOT=false
+
+env_file_is_sole_database_url_source() {
+  local env_file="${1:-}"; shift || true
+  local -a units=("$@")
+  local unit object rendering count element expected resolved load_state pam_name snapshot_expected
+
+  DB_IDENTITY_SOURCE_REASON=""
+  expected="$(readlink -f "$env_file" 2>/dev/null || printf '%s' "$env_file")"
+  snapshot_expected="$(readlink -f "$DB_ENV_SNAPSHOT_FILE" 2>/dev/null || printf '%s' "$DB_ENV_SNAPSHOT_FILE")"
+
+  if [[ "${#units[@]}" -eq 0 || -z "${units[0]}" ]]; then
+    DB_IDENTITY_SOURCE_REASON="no systemd unit was identified for the application, so there is nothing that can say whether ${env_file} is what gives it DATABASE_URL"
+    return 1
+  fi
+  if ! command -v busctl >/dev/null 2>&1; then
+    DB_IDENTITY_SOURCE_REASON="busctl — systemd's own bus client, shipped beside systemctl — is not available, so whether anything other than ${env_file} defines DATABASE_URL for the service cannot be established"
+    return 1
+  fi
+
+  for unit in "${units[@]}"; do
+    [[ -n "$unit" ]] || continue
+
+    # LoadUnit, not GetUnit: it answers for a unit the manager has not loaded yet as well, so the
+    # LoadState below is what says whether there is a readable unit there at all. It is the same
+    # load `systemctl show` performs — it starts nothing and queues no job.
+    rendering="$(busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager LoadUnit s "$unit" 2>/dev/null)" || rendering=''
+    if ! bus_read_strings "$rendering" || [[ "${#BUS_STRINGS[@]}" -ne 1 || -z "${BUS_STRINGS[0]}" ]]; then
+      DB_IDENTITY_SOURCE_REASON="systemd would not say where ${unit} lives on its bus, so what defines DATABASE_URL for that service is unknown"
+      return 1
+    fi
+    object="${BUS_STRINGS[0]}"
+
+    rendering="$(bus_unit_property "$object" Unit LoadState)" || rendering=''
+    if ! bus_read_strings "$rendering" || [[ "${#BUS_STRINGS[@]}" -ne 1 ]]; then
+      DB_IDENTITY_SOURCE_REASON="systemd would not answer for ${unit}'s LoadState, so what defines DATABASE_URL for that service is unknown"
+      return 1
+    fi
+    load_state="${BUS_STRINGS[0]}"
+    if [[ "$load_state" != "loaded" ]]; then
+      DB_IDENTITY_SOURCE_REASON="systemd reports ${unit} as '${load_state:-unknown}' rather than loaded, so what defines DATABASE_URL for it cannot be read"
+      return 1
+    fi
+
+    # PAMName=, which the five-property question did not ask (r21, Codex CRITICAL). systemd.exec
+    # lists "variables set by any PAM modules in case PAMName= is in effect" AFTER the
+    # EnvironmentFile= layer and says the later source wins, so a unit naming a PAM profile whose
+    # stack runs pam_env can be handed a DATABASE_URL that beats the file this deploy read — while
+    # every other property here still says "only that file". What a PAM stack supplies is not
+    # knowable without reading PAM configuration, so ANY non-empty value is refused.
+    rendering="$(bus_unit_property "$object" Service PAMName)" || rendering=''
+    if ! bus_read_strings "$rendering" || [[ "${#BUS_STRINGS[@]}" -ne 1 ]]; then
+      DB_IDENTITY_SOURCE_REASON="systemd would not answer for ${unit}'s PAMName=, so whether a PAM stack also defines DATABASE_URL for it is unknown"
+      return 1
+    fi
+    pam_name="${BUS_STRINGS[0]}"
+    if [[ -n "$pam_name" ]]; then
+      DB_IDENTITY_SOURCE_REASON="${unit} sets PAMName=${pam_name}, and systemd applies the variables its PAM modules set AFTER the environment file — the later source wins. Whether that stack exports DATABASE_URL is a question about PAM configuration this will not read, so it is refused rather than guessed at. Remove PAMName=, or state the connection identity explicitly"
+      return 1
+    fi
+
+    # The three environment lists, all matched on the element NAME. UnsetEnvironment= takes a name
+    # OR an exact assignment and is applied as the final composition step, so the assignment form
+    # is the same refusal as the bare name (r21, Codex HIGH).
+    local property description
+    for property in Environment PassEnvironment UnsetEnvironment; do
+      rendering="$(bus_unit_property "$object" Service "$property")" || rendering=''
+      if ! count="$(bus_array_count "$rendering" 'as')" || ! bus_read_strings "$rendering" \
+        || [[ "${#BUS_STRINGS[@]}" -ne "$count" ]]; then
+        DB_IDENTITY_SOURCE_REASON="systemd would not answer readably for ${unit}'s ${property}=, so what defines DATABASE_URL for that service is unknown"
+        return 1
+      fi
+      for element in ${BUS_STRINGS[@]+"${BUS_STRINGS[@]}"}; do
+        bus_element_names_database_url "$element" || continue
+        case "$property" in
+          Environment) description="sets DATABASE_URL in its own Environment= (${element%%=*}=…). systemd puts that in the service's environment and dotenv will not overwrite an already-set variable, so the application connects where THAT says and not where ${env_file} says" ;;
+          PassEnvironment) description="lists DATABASE_URL in PassEnvironment=, so the service inherits whatever the service manager's own environment holds and ${env_file} does not decide where the application connects" ;;
+          *) description="lists DATABASE_URL in UnsetEnvironment= (as '${element}'), so systemd removes the value ${env_file} supplies — as the final step of composing the environment, whether it is written as a name or as an exact assignment — and the application's own loader decides what replaces it" ;;
+        esac
+        DB_IDENTITY_SOURCE_REASON="${unit} ${description}. Remove it, or state the connection identity explicitly"
+        return 1
+      done
+    done
+
+    # EnvironmentFiles=, an array of (path, ignore_errors) pairs. EXACTLY ONE entry, and it must
+    # be ours: the count is systemd's own, so a second file cannot hide behind the rendering.
+    rendering="$(bus_unit_property "$object" Service EnvironmentFiles)" || rendering=''
+    if ! count="$(bus_array_count "$rendering" 'a(sb)')" || ! bus_read_strings "$rendering" \
+      || [[ "${#BUS_STRINGS[@]}" -ne "$count" ]]; then
+      DB_IDENTITY_SOURCE_REASON="systemd would not answer readably for ${unit}'s EnvironmentFiles=, so what defines DATABASE_URL for that service is unknown"
+      return 1
+    fi
+    if [[ "$count" -eq 0 ]]; then
+      DB_IDENTITY_SOURCE_REASON="${unit} does not load ${env_file} with EnvironmentFile=, so DATABASE_URL reaches the application through its own dotenv loader instead — whose .env.local and per-mode overlays are exactly the composition this deploy stopped reproducing. Add EnvironmentFile=${env_file} to the unit, or state the connection identity explicitly"
+      return 1
+    fi
+    # ONE ENVIRONMENT FILE, OR TWO OF WHICH THE SECOND IS THIS RUN'S OWN SNAPSHOT
+    # (o3d-2sm1.5 r23, Codex HIGH). Until this round the answer was "exactly one, and it must be
+    # ${env_file}" — which is the right refusal for somebody ELSE's second file and the wrong one
+    # for the binding this round adds, since publish_db_identity_snapshot() gives every unit a
+    # drop-in that loads ${DB_ENV_SNAPSHOT_FILE} after it. So the shape is stated exactly: the
+    # application's file first, and at most one more, which may only be the snapshot THIS RUN
+    # published. A snapshot left behind by some earlier run is NOT tolerated — DB_ENV_SNAPSHOT_PUBLISHED
+    # is false until this run writes one — because an unexplained pin is a DATABASE_URL nobody
+    # here chose, which is precisely the condition this function exists to refuse.
+    if [[ "$count" -gt 2 ]]; then
+      DB_IDENTITY_SOURCE_REASON="${unit} loads ${count} environment files (${BUS_STRINGS[*]}). Whether any of them but ${env_file} defines DATABASE_URL, and which definition systemd would keep, is composition this will not reproduce — so it is refused rather than guessed at, and without reading them. Load only ${env_file}, or state the connection identity explicitly"
+      return 1
+    fi
+    if ! bus_read_env_ignore_flags "$rendering" || [[ "${#BUS_ENV_IGNORE_FLAGS[@]}" -ne "$count" ]]; then
+      DB_IDENTITY_SOURCE_REASON="systemd would not say readably whether ${unit} loads its environment files with a leading '-'. Whether a missing file is skipped or fatal decides what the service gets when one disappears, so it is refused rather than assumed"
+      return 1
+    fi
+    local index
+    for index in 0 1; do
+      [[ "$index" -lt "$count" ]] || continue
+      element="${BUS_STRINGS[index]}"
+      case "$element" in
+        *'\'*)
+          DB_IDENTITY_SOURCE_REASON="systemd reports one of ${unit}'s environment files as ${element}, a path it had to escape to state. Decoding that here to compare it with ${env_file} is a reimplementation of somebody else's escaping, so it is refused: give the unit an EnvironmentFile= path with no character needing an escape, or state the connection identity explicitly"
+          return 1 ;;
+      esac
+      resolved="$(readlink -f "$element" 2>/dev/null || printf '%s' "$element")"
+      if [[ "$index" -eq 0 ]]; then
+        if [[ "$resolved" != "$expected" ]]; then
+          DB_IDENTITY_SOURCE_REASON="${unit} loads ${element} as its first environment file and not ${env_file}, so the file this deploy read is not the one that gives the service DATABASE_URL. Load ${env_file}, or state the connection identity explicitly"
+          return 1
+        fi
+        continue
+      fi
+      # THE SECOND ENTRY, WHICH MAY ONLY BE THE BINDING. Three things are required of it and each
+      # is load-bearing: it is the snapshot's path (anything else is a source of DATABASE_URL this
+      # deploy did not write), THIS run published it (an old one pins a value nobody re-validated),
+      # and it is loaded WITHOUT a leading '-' (with one, deleting it between here and the exec
+      # takes the binding away silently and hands the service back to ${env_file}).
+      if ! $DB_ENV_SNAPSHOT_PUBLISHED; then
+        DB_IDENTITY_SOURCE_REASON="${unit} loads a second environment file, ${element}, that this run did not publish. A second file can define DATABASE_URL and systemd keeps the LAST definition, so what the service would connect to is not ${env_file}'s answer. Remove it (if it is a ${DB_ENV_SNAPSHOT_DROPIN_NAME} drop-in, an earlier cutover left it behind and it is safe to delete), or state the connection identity explicitly"
+        return 1
+      fi
+      if [[ "$resolved" != "$snapshot_expected" ]]; then
+        DB_IDENTITY_SOURCE_REASON="${unit} loads ${element} as a second environment file, and this run's environment snapshot is ${DB_ENV_SNAPSHOT_FILE}. A second file can define DATABASE_URL and systemd keeps the LAST definition, so the service would connect where that file says. Remove it, or state the connection identity explicitly"
+        return 1
+      fi
+      if [[ "${BUS_ENV_IGNORE_FLAGS[index]}" != "false" ]]; then
+        DB_IDENTITY_SOURCE_REASON="${unit} loads ${element} with a leading '-', so systemd SKIPS it if it is missing instead of failing the start. The whole point of the snapshot is that its absence stops the service rather than handing it back to ${env_file}; drop the '-' from the ${DB_ENV_SNAPSHOT_DROPIN_NAME} drop-in"
+        return 1
+      fi
+    done
+    # AND WHEN THE CALLER IS ABOUT TO START THE SERVICE, THE BINDING MUST BE THERE. Everywhere
+    # else this function is a refusal of extra sources; at the start it is also the proof that the
+    # one source that cannot be replaced under us is loaded.
+    if $DB_IDENTITY_REQUIRE_SNAPSHOT && [[ "$count" -ne 2 ]]; then
+      DB_IDENTITY_SOURCE_REASON="${unit} does not load this run's environment snapshot ${DB_ENV_SNAPSHOT_FILE}, so the DATABASE_URL it gets at exec is whatever ${env_file} says at that moment and not the one this run fenced and migrated"
+      return 1
+    fi
+  done
+  return 0
+}
+
+# The refusal every fence mode goes through, beside require_db_identity: four values, AND a
+# service whose DATABASE_URL nothing but that file can define.
+require_env_file_is_sole_definition() {
+  env_file_is_sole_database_url_source "${APP_DIR_REAL}/.env" "${SERVICE_UNITS[@]:-}"
+}
+
+# Read once, from the file the application itself is given. A failure is NOT fatal here: a
+# --skip-migrate run fences nothing and needs none of this. It is fatal at the point it matters,
+# in fence_db_connections() below, where the reason is printed and the deploy stops before
+# anything is stopped or migrated.
+resolve_db_identity "$(env_file_value DATABASE_URL "${APP_DIR_REAL}/.env")" || true
+
+# ---------------------------------------------------------------------------
+# AND RE-READ, BECAUSE SYSTEMD READS THAT FILE LATER THAN THIS DID
+# (o3d-2sm1.5 r22, Codex HIGH).
+#
+# The line above is the ONLY read, and it happens while the predecessor is still serving —
+# before the build, before the stop, before the migration. `EnvironmentFile=` is read by systemd
+# at the moment it EXECS the service, at the far end of that window. r21's sole-source check
+# closed "is this the file the service uses?" by asking the bus; it compares the configured PATH,
+# and a path is not its contents. So an atomic replacement, a `rm`, or a symlink retarget in
+# between still moves the connection: this run fences and migrates database A, and the service
+# starts on database B. The shipped units load the file with a leading `-`, which makes a MISSING
+# file skipped rather than fatal — so a deletion does not even fail loudly, it hands the
+# application back to its own dotenv overlays, the exact composition r19 stopped reproducing.
+#
+# THIS IS NOT A RETURN TO INFERRING THE ENVIRONMENT. Nothing new is consulted and no precedence
+# is reproduced: the file is still the single configured source, still proven sole by the bus
+# read, and still parsed by the same strict reader with the same refusals. What changes is WHEN.
+# A value read once and used much later is a time-of-check/time-of-use gap, which is the defect
+# class the sibling branch closed on its dispatch fence — and the answer is the same one: re-run
+# the check at the point of use rather than trusting the cached answer.
+#
+# THE PINNED IDENTITY IS THE BASELINE, AND IT NEVER MOVES. Every re-read is compared against
+# these four values and never adopted over them, because everything this run has already done —
+# the fence it raised, the database it migrated, the release command it printed — is about THIS
+# database. A file that has come to say something else is a refusal, not a new instruction.
+DB_IDENTITY_PINNED_HOST="$DB_IDENTITY_HOST"
+DB_IDENTITY_PINNED_PORT="$DB_IDENTITY_PORT"
+DB_IDENTITY_PINNED_USER="$DB_IDENTITY_USER"
+DB_IDENTITY_PINNED_DATABASE="$DB_IDENTITY_DATABASE"
+DB_IDENTITY_DRIFT_REASON="the environment file has not been re-read yet"
+
+# Re-read ${APP_DIR_REAL}/.env and require it to still state the pinned identity.
+#
+# IT RESTORES THE GLOBALS IT BORROWS, unconditionally. resolve_db_identity() writes
+# DB_IDENTITY_* and CLEARS DB_FENCE_IDENTITY_ARGS as its first act, and those arguments are what
+# release_db_connections() and the exit trap's re-fence are built from. A re-read that failed and
+# left them empty would disarm the release on the one path where the fence is standing — turning
+# a detection into the outage it exists to prevent.
+env_file_identity_unchanged() {
+  local env_file="${APP_DIR_REAL}/.env"
+  DB_IDENTITY_DRIFT_REASON=""
+
+  if [[ -z "${DB_IDENTITY_PINNED_HOST}${DB_IDENTITY_PINNED_PORT}${DB_IDENTITY_PINNED_USER}${DB_IDENTITY_PINNED_DATABASE}" ]]; then
+    DB_IDENTITY_DRIFT_REASON="no connection identity was pinned when this run started, so there is nothing to re-read ${env_file} against"
+    return 1
+  fi
+  if [[ ! -e "$env_file" ]]; then
+    DB_IDENTITY_DRIFT_REASON="${env_file} no longer exists. The service units load it with a leading '-', so systemd SKIPS a missing environment file instead of failing on it, and the application would start on whatever its own dotenv overlays supply — not on the database this run fenced and migrated"
+    return 1
+  fi
+  if [[ ! -f "$env_file" || ! -r "$env_file" ]]; then
+    DB_IDENTITY_DRIFT_REASON="${env_file} is no longer a readable regular file, so what it will give the service when systemd execs it cannot be read here"
+    return 1
+  fi
+
+  local saved_host="$DB_IDENTITY_HOST" saved_port="$DB_IDENTITY_PORT"
+  local saved_user="$DB_IDENTITY_USER" saved_database="$DB_IDENTITY_DATABASE"
+  local saved_reason="$DB_IDENTITY_REASON"
+  local -a saved_args=()
+  if [[ "${#DB_FENCE_IDENTITY_ARGS[@]}" -gt 0 ]]; then saved_args=("${DB_FENCE_IDENTITY_ARGS[@]}"); fi
+
+  local rc=0
+  resolve_db_identity "$(env_file_value DATABASE_URL "$env_file")" || rc=$?
+  local now_host="$DB_IDENTITY_HOST" now_port="$DB_IDENTITY_PORT"
+  local now_user="$DB_IDENTITY_USER" now_database="$DB_IDENTITY_DATABASE"
+  local now_reason="$DB_IDENTITY_REASON"
+
+  DB_IDENTITY_HOST="$saved_host"; DB_IDENTITY_PORT="$saved_port"
+  DB_IDENTITY_USER="$saved_user"; DB_IDENTITY_DATABASE="$saved_database"
+  DB_IDENTITY_REASON="$saved_reason"
+  DB_FENCE_IDENTITY_ARGS=()
+  if [[ "${#saved_args[@]}" -gt 0 ]]; then DB_FENCE_IDENTITY_ARGS=("${saved_args[@]}"); fi
+
+  if [[ "$rc" -ne 0 ]]; then
+    DB_IDENTITY_DRIFT_REASON="${env_file} no longer states a connection identity this will accept: ${now_reason}"
+    return 1
+  fi
+  if [[ "$now_host" != "$DB_IDENTITY_PINNED_HOST" || "$now_port" != "$DB_IDENTITY_PINNED_PORT" \
+     || "$now_user" != "$DB_IDENTITY_PINNED_USER" || "$now_database" != "$DB_IDENTITY_PINNED_DATABASE" ]]; then
+    DB_IDENTITY_DRIFT_REASON="${env_file} now names ${now_user}@${now_host}:${now_port}/${now_database}, and this run is fencing and migrating ${DB_IDENTITY_PINNED_USER}@${DB_IDENTITY_PINNED_HOST}:${DB_IDENTITY_PINNED_PORT}/${DB_IDENTITY_PINNED_DATABASE}"
+    return 1
+  fi
+  return 0
+}
+
+# BOTH halves, re-run: the file still says the same thing, AND systemd still says that file is the
+# only thing that can define DATABASE_URL for the service. The second half is not a formality at
+# the later call sites — the unit's loaded configuration is re-read after this run's own final
+# daemon-reload, so a drop-in that appeared during the window is folded in before it is asked.
+require_start_identity_unchanged() {
+  env_file_identity_unchanged || return 1
+  if ! require_env_file_is_sole_definition; then
+    DB_IDENTITY_DRIFT_REASON="$DB_IDENTITY_SOURCE_REASON"
+    return 1
+  fi
+  return 0
+}
+
+# THE SAME TWO HALVES, PLUS THE BINDING (o3d-2sm1.5 r23, Codex HIGH).
+#
+# Used at the ONE call site that is about to hand the units to systemd. The difference from
+# require_start_identity_unchanged() is not a stricter read of the same file — re-reading harder
+# is what rounds 13-22 already exhausted — it is that this one requires the loaded unit
+# configuration to name a file systemd will read at exec AND that this run wrote AND that the
+# application user cannot replace. What the two checks above establish about ${APP_DIR_REAL}/.env
+# is kept because a disagreement there is still worth refusing on: it means the operator's file
+# and this run have parted company, and starting into a snapshot that contradicts the file on
+# disk would be correct-but-astonishing.
+require_start_identity_bound() {
+  local rc=0
+  DB_IDENTITY_REQUIRE_SNAPSHOT=true
+  require_start_identity_unchanged || rc=$?
+  DB_IDENTITY_REQUIRE_SNAPSHOT=false
+  return "$rc"
+}
 
 # ---------------------------------------------------------------------------
 # The reboot fence. The marker file is the condition; the drop-in is what makes
@@ -540,13 +1274,21 @@ fsync_path() {
 #
 # Same directory, so the rename is a rename and not a copy. Every failure path removes the
 # temporary file and returns non-zero, leaving the last durable marker untouched.
+# OWNERSHIP AND MODE ARE PART OF THE PUBLICATION, NOT A STEP AFTER IT (o3d-2sm1.5 r39, Codex
+# HIGH). ${APP_DIR}/.env has to reach the application account readable, and a `chown` issued AFTER
+# the rename is a second observable state: a crash between the two leaves a complete, correct file
+# the application cannot open. Both are applied to the TEMPORARY file, before the barrier and
+# before the rename, so the name is published once and everything about it is already true.
+# `$2` and `$3` are optional and default to what every earlier caller already got: root's own
+# ownership, since this script runs as root, and mode 0600.
 publish_durable_file() {
-  local target="$1" dir tmp
+  local target="$1" owner="${2:-}" mode="${3:-600}" dir tmp
   dir="$(dirname "$target")"
   mkdir -p "$dir" || return 1
   tmp="$(mktemp "${target}.XXXXXX" 2>/dev/null)" || return 1
   if ! cat > "$tmp" 2>/dev/null; then rm -f "$tmp"; return 1; fi
-  if ! chmod 600 "$tmp" 2>/dev/null; then rm -f "$tmp"; return 1; fi
+  if ! chmod "$mode" "$tmp" 2>/dev/null; then rm -f "$tmp"; return 1; fi
+  if [[ -n "$owner" ]] && ! chown "$owner" "$tmp" 2>/dev/null; then rm -f "$tmp"; return 1; fi
   # BARRIER 1: the data, before the name exists. After this the rename can only publish
   # bytes that are already on the medium.
   if ! fsync_path "$tmp"; then rm -f "$tmp"; return 1; fi
@@ -948,6 +1690,129 @@ remove_reboot_fence() {
 }
 
 # ---------------------------------------------------------------------------
+# THE ENVIRONMENT SNAPSHOT: publish, and take it away again (o3d-2sm1.5 r23, Codex HIGH).
+# ---------------------------------------------------------------------------
+snapshot_dropin_file() { echo "/etc/systemd/system/$1.d/${DB_ENV_SNAPSHOT_DROPIN_NAME}"; }
+
+# Publish the DATABASE_URL this run fenced and migrated where only root can change it, and make
+# every unit load it LAST. Called with the connection fence still up and nothing started, so a
+# failure here costs a re-run and no outage.
+publish_db_identity_snapshot() {
+  if $DRY_RUN; then
+    echo -e "${YELLOW}[DRY]${RESET}   would publish ${DB_ENV_SNAPSHOT_FILE} and a ${DB_ENV_SNAPSHOT_DROPIN_NAME} drop-in per unit, daemon-reload, and verify the loaded EnvironmentFiles on the bus"
+    return 0
+  fi
+  command -v systemctl >/dev/null 2>&1 || {
+    echo -e "${RED}[ERROR]${RESET} systemctl is unavailable, so the started service cannot be bound to the database this run migrated." >&2
+    return 1
+  }
+  if [[ "${#SERVICE_UNITS[@]}" -eq 0 ]]; then
+    echo -e "${RED}[ERROR]${RESET} No systemd unit serves ${APP_DIR_REAL}, so there is nothing to bind the environment snapshot to." >&2
+    return 1
+  fi
+
+  # A PATH SYSTEMD WOULD HAVE TO ESCAPE IS REFUSED, not escaped. The bus check compares the
+  # loaded path against this one and refuses any element that had to be escaped, so emitting one
+  # here would guarantee a refusal three lines later — with a message about somebody else's unit.
+  case "$DB_ENV_SNAPSHOT_FILE" in
+    *[$' \t\n\\']*)
+      echo -e "${RED}[ERROR]${RESET} ${DB_ENV_SNAPSHOT_FILE} contains whitespace or a backslash, so systemd could not state it back unescaped and the binding could not be verified. That path is the literal DB_ENV_SNAPSHOT_DIR at the top of this script; edit it there to one with neither." >&2
+      return 1 ;;
+  esac
+
+  # THE VALUE IS THE ONE THIS RUN PINNED, re-read from the file and re-checked against the pin by
+  # the caller a moment ago. It is written SINGLE-QUOTED because that is the one form systemd
+  # documents as verbatim — "can span multiple lines and contain any character verbatim other
+  # than single quote" — so the deploy's reader and systemd's reader cannot disagree about it the
+  # way they can about an unquoted value with a backslash in it.
+  local value
+  value="$(env_file_value DATABASE_URL "${APP_DIR_REAL}/.env")" || value=""
+  if [[ -z "$value" ]]; then
+    echo -e "${RED}[ERROR]${RESET} ${APP_DIR_REAL}/.env no longer states a DATABASE_URL to bind the service to." >&2
+    return 1
+  fi
+  case "$value" in
+    *"'"*|*$'\n'*)
+      echo -e "${RED}[ERROR]${RESET} DATABASE_URL contains a single quote or a newline, which cannot be written into a systemd environment file verbatim. Re-write it without one." >&2
+      return 1 ;;
+  esac
+
+  # The directory first, root-owned and 0700, so that nothing running as the application user can
+  # replace or remove what the unit is about to be pointed at.
+  if ! mkdir -p "$DB_ENV_SNAPSHOT_DIR" \
+     || ! chown root:root "$DB_ENV_SNAPSHOT_DIR" \
+     || ! chmod 700 "$DB_ENV_SNAPSHOT_DIR"; then
+    echo -e "${RED}[ERROR]${RESET} ${DB_ENV_SNAPSHOT_DIR} could not be created root-owned and 0700, so the environment snapshot would sit somewhere the application user can rewrite." >&2
+    return 1
+  fi
+
+  printf "DATABASE_URL='%s'\n" "$value" | publish_durable_file "$DB_ENV_SNAPSHOT_FILE" || {
+    echo -e "${RED}[ERROR]${RESET} ${DB_ENV_SNAPSHOT_FILE} could not be published durably; the service is NOT bound and nothing has been started." >&2
+    return 1
+  }
+  # publish_durable_file() leaves 0600; the owner is root because this script runs as root, and
+  # systemd reads EnvironmentFile= as PID 1 BEFORE it drops to User=. So the application user
+  # never needs to read it — which is the point: the file that decides the connection is not one
+  # the service, or anything running as it, can rewrite.
+  chown root:root "$DB_ENV_SNAPSHOT_FILE" 2>/dev/null || true
+  DB_ENV_SNAPSHOT_PUBLISHED=true
+
+  local unit dropin
+  DB_ENV_SNAPSHOT_DROPINS_CREATED=()
+  for unit in "${SERVICE_UNITS[@]}"; do
+    [[ -n "$unit" ]] || continue
+    dropin="$(snapshot_dropin_file "$unit")"
+    [[ -f "$dropin" ]] || DB_ENV_SNAPSHOT_DROPINS_CREATED+=("$dropin")
+    if ! publish_durable_dropin "$dropin" <<EOF
+[Service]
+# Installed by scripts/deploy.sh (o3d-2sm1.5 r23) for the length of ONE cutover, and removed
+# again before this run exits. It binds the service to the database this run fenced and
+# migrated: systemd reads environment files in order and the LAST definition of a variable
+# wins, so this beats whatever ${APP_DIR_REAL}/.env says at the moment of exec.
+# No leading '-': if the file is gone, the start must FAIL rather than fall back.
+EnvironmentFile=${DB_ENV_SNAPSHOT_FILE}
+EOF
+    then
+      echo -e "${RED}[ERROR]${RESET} ${dropin} could not be published durably, so ${unit} is NOT bound to the database this run migrated." >&2
+      return 1
+    fi
+  done
+
+  if ! systemctl daemon-reload; then
+    echo -e "${RED}[ERROR]${RESET} systemctl daemon-reload failed, so the environment snapshot is not in the units' loaded configuration." >&2
+    return 1
+  fi
+  return 0
+}
+
+# Take the binding away. Called on EVERY exit path, successful or not: a drop-in left standing
+# would pin a DATABASE_URL that a later, legitimate edit of ${APP_DIR_REAL}/.env could not
+# override, and it would do so silently.
+remove_db_identity_snapshot() {
+  if $DRY_RUN; then
+    echo -e "${YELLOW}[DRY]${RESET}   would remove the ${DB_ENV_SNAPSHOT_DROPIN_NAME} drop-ins, daemon-reload, and delete ${DB_ENV_SNAPSHOT_FILE}"
+    return 0
+  fi
+  local unit dropin removed=false
+  for unit in "${SERVICE_UNITS[@]:-}"; do
+    [[ -n "$unit" ]] || continue
+    dropin="$(snapshot_dropin_file "$unit")"
+    if [[ -e "$dropin" ]]; then
+      rm -f "$dropin"
+      removed=true
+    fi
+    rmdir "$(dirname "$dropin")" 2>/dev/null || true
+  done
+  if $removed && command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload || warn "daemon-reload failed while removing the environment snapshot drop-ins."
+  fi
+  rm -f "$DB_ENV_SNAPSHOT_FILE"
+  DB_ENV_SNAPSHOT_PUBLISHED=false
+  DB_ENV_SNAPSHOT_DROPINS_CREATED=()
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # The connection fence. scripts/fence-db-connections.mjs states what it can and
 # cannot promise; what matters here is that failing to RELEASE it leaves an
 # application that cannot reach its database, so every path releases it and any path
@@ -955,17 +1820,44 @@ remove_reboot_fence() {
 # ---------------------------------------------------------------------------
 fence_db_connections() {
   if $DRY_RUN; then
-    echo -e "${YELLOW}[DRY]${RESET}   would run: node scripts/fence-db-connections.mjs --fence  (as ${APP_USER})"
+    echo -e "${YELLOW}[DRY]${RESET}   would run: node ${DB_FENCE_SCRIPT_COPY} --fence  (as ${APP_USER})"
     return 0
   fi
-  [[ -f "$DB_FENCE_SCRIPT" ]] || die \
-    "${DB_FENCE_SCRIPT} is not in this checkout, so this run cannot hold the database closed for the migration window. A snapshot probe is not a fence. Restore the script (it ships with the app) and re-run; nothing has been migrated."
+  # A RECOVERY PATH MAY NOT DEPEND ON THE THING WHOSE LOSS IT RECOVERS FROM: a box that already
+  # has a root-owned copy needs nothing from the checkout to fence with.
+  [[ -f "$DB_FENCE_SCRIPT" || -f "$DB_FENCE_SCRIPT_COPY" ]] || die \
+    "Neither ${DB_FENCE_SCRIPT} nor the root-owned copy at ${DB_FENCE_SCRIPT_COPY} exists, so this run cannot hold the database closed for the migration window. A snapshot probe is not a fence. Restore the script (it ships with the app) and re-run; nothing has been migrated."
+
+  # THE FENCE IS TOLD WHICH CONNECTION IT IS ABOUT, OR IT DOES NOT RUN (o3d-2sm1.5 r19). The
+  # helper refuses without the four values as well; this refuses first, so the reason names the
+  # URL that could not be read rather than the argument that was missing.
+  require_db_identity || die \
+    "The application's connection identity could not be read from ${APP_DIR_REAL}/.env: ${DB_IDENTITY_REASON}. The connection fence is TOLD which host, port, role and database it is closing — it no longer works that out from the environment, because seven rounds of doing so each uncovered another layer of systemd, Next and libpq composition. Write DATABASE_URL as a URL that states all four (postgresql://ROLE:PASSWORD@HOST:PORT/DATABASE, with no host/port/user/dbname query parameter), or re-run with --skip-migrate, which moves no schema and needs no fence. Nothing has been stopped and nothing has been migrated."
+
+  # AND THE FILE IT WAS READ FROM MUST BE THE ONLY THING THAT CAN DEFINE IT (o3d-2sm1.5 r20,
+  # Codex CRITICAL). Four values read out of a file the service may not use are four values about
+  # the wrong database.
+  require_env_file_is_sole_definition || die \
+    "${DB_IDENTITY_SOURCE_REASON}. The fence, the migration and the release would all agree with each other about the database ${APP_DIR_REAL}/.env names, while the application that restarts afterwards connects somewhere else — a migration on a database nothing fenced, and a new build on a database nothing migrated. Re-run with --skip-migrate, which moves no schema and needs no fence. Nothing has been stopped and nothing has been migrated."
+
+  # AND THE FILE MUST STILL SAY WHAT IT SAID WHEN THIS RUN READ IT (o3d-2sm1.5 r22, Codex HIGH).
+  # The identity above was parsed once, before the build and before the stop; this is the last
+  # moment before the fence is aimed. Nothing has been fenced yet, so a disagreement here is the
+  # cheap one — it costs a restart of the predecessor and no schema at all.
+  require_start_identity_unchanged || die \
+    "The connection identity this run pinned is no longer the one ${APP_DIR_REAL}/.env gives the service: ${DB_IDENTITY_DRIFT_REASON}. DATABASE_URL was read once, before the build and the stop, and systemd does not read the environment file until it execs the service — so fencing on the pinned identity now would fence and migrate one database while the application starts on another. NO FENCE HAS BEEN RAISED and nothing has been migrated. Put the file back the way this run found it, or re-run so the identity is pinned from what the file says now."
 
   ensure_cutover_state_dirs
 
-  local rc=0
+  # THE ONLY FILE THIS FUNCTION RUNS IS THE ROOT-OWNED ONE (o3d-2sm1.5 r31, Codex CRITICAL).
+  # Resolved here rather than at the top of the script so that the resolution — which publishes a
+  # protected copy on a box that has none, and refuses one that does not match the recovery
+  # record — happens with the fence about to be raised and not a build ago.
+  local rc=0 fence_script
+  fence_script="$(resolve_fence_script)" || die \
+    "This run has no fence script it is willing to execute (the reason is printed above), so it cannot hold the database closed for the migration window. A snapshot probe is not a fence. Nothing has been migrated."
   as_app_user env DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-    node "$DB_FENCE_SCRIPT" --fence --state-file="$DB_FENCE_STATE" || rc=$?
+    node "$fence_script" --fence --state-file="$DB_FENCE_STATE" "${DB_FENCE_IDENTITY_ARGS[@]:-}" || rc=$?
 
   case "$rc" in
     0)
@@ -978,7 +1870,7 @@ fence_db_connections() {
       # the admin URL, so authentication (and therefore the CONNECT the fence revoked) is
       # still the admin's while ownership is the application's.
       MIGRATION_DATABASE_URL="$(as_app_user env DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-        node "$DB_FENCE_SCRIPT" --print-migration-url)" || die \
+        node "$fence_script" --print-migration-url "${DB_FENCE_IDENTITY_ARGS[@]:-}")" || die \
         "The connection fence is up but the migration URL could not be composed, so the migration would run as the deploy admin and create objects the application cannot use. Nothing has been migrated; release the fence with: ${DB_FENCE_RELEASE_CMD}"
       [[ -n "$MIGRATION_DATABASE_URL" ]] || die \
         "The connection fence is up but --print-migration-url produced nothing. Nothing has been migrated; release the fence with: ${DB_FENCE_RELEASE_CMD}"
@@ -1040,19 +1932,77 @@ require_fenceable_database() {
   # being it: the point of --dry-run is to find out what a real run would do, and "it would
   # refuse, here is why" is the most useful thing it can print.
   if $DRY_RUN; then
-    if [[ -z "$DEPLOY_ADMIN_DATABASE_URL" ]] || [[ ! -f "$DB_FENCE_SCRIPT" ]] || [[ ! -f "$DB_OBJECT_ACCESS_SCRIPT" ]]; then
+    # THE CANDIDATE DIGEST FIRST, BEFORE ANY REFUSAL BELOW CAN RETURN (o3d-2sm1.5 r34, Codex
+    # CRITICAL). IMS_FENCE_ARTEFACT_SHA256 is a REQUIRED input now, not a hardening, and the host
+    # that has to produce it is the release build host — which has no DEPLOY_ADMIN_DATABASE_URL,
+    # no database and no fence to raise. If the value only appeared after those checks passed,
+    # the one machine that is supposed to publish it could never print it.
+    #
+    # AND IT IS COMPUTED BY READING, NOT BY RUNNING (the same finding). db_fence_probe_script()
+    # assembles the checkout's helper and its closure into a root-owned throwaway and hashes it;
+    # it hands back something to EXECUTE only when the standing artefact is the authenticated one
+    # or when IMS_FENCE_ARTEFACT_SHA256 authenticates the candidate. Otherwise
+    # ${DB_FENCE_PROBE_SCRIPT} is empty, and this run preflights nothing rather than handing an
+    # administrative credential to bytes the application account chose.
+    local probe_rc=0 probe_line
+    db_fence_probe_script || probe_rc=1
+    while IFS= read -r probe_line; do warn "$probe_line"; done < <(db_fence_probe_report)
+
+    if [[ -z "$DEPLOY_ADMIN_DATABASE_URL" ]] || { [[ ! -f "$DB_FENCE_SCRIPT" ]] && [[ ! -f "$DB_FENCE_SCRIPT_COPY" ]]; } || [[ ! -f "$DB_OBJECT_ACCESS_SCRIPT" ]]; then
+      db_fence_probe_cleanup
       warn "A REAL RUN WOULD BE REFUSED HERE: the migration window cannot be fenced."
       warn "DEPLOY_ADMIN_DATABASE_URL is not set (or ${DB_FENCE_SCRIPT##*/} is missing), so CONNECT"
       warn "could not be revoked for the window and nothing would stop a client attaching across"
       warn "the migration. See docs/installation.md. Nothing has been changed by this dry run."
       return 0
     fi
+    if ! require_db_identity; then
+      db_fence_probe_cleanup
+      warn "A REAL RUN WOULD BE REFUSED HERE: the application's connection identity could not be"
+      warn "read from ${APP_DIR_REAL}/.env — ${DB_IDENTITY_REASON}."
+      warn "The fence is TOLD which host, port, role and database it closes; it does not work that"
+      warn "out. Write DATABASE_URL as postgresql://ROLE:PASSWORD@HOST:PORT/DATABASE with no"
+      warn "host/port/user/dbname query parameter. Nothing has been changed by this dry run."
+      return 0
+    fi
+    if ! require_env_file_is_sole_definition; then
+      db_fence_probe_cleanup
+      warn "A REAL RUN WOULD BE REFUSED HERE: ${DB_IDENTITY_SOURCE_REASON}."
+      warn "The identity the fence is given is read from ${APP_DIR_REAL}/.env, so anything else that"
+      warn "can define DATABASE_URL for the service means the fence and the application could be"
+      warn "talking about different databases. Nothing has been changed by this dry run."
+      return 0
+    fi
     # The preflight changes nothing, so a dry run may run it for real — and reporting what it
     # actually says is the whole point of --dry-run. It is NOT fatal here: a dry run that
     # cannot reach the database must still exit 0, having said so.
+    #
+    # WHAT IT MAY RUN IT WITH IS NOT THIS SCRIPT'S CHOICE. db_fence_probe_script() decided that
+    # above, and an empty ${DB_FENCE_PROBE_SCRIPT} means "nothing here is authenticated enough to
+    # be handed DEPLOY_ADMIN_DATABASE_URL". r33 answered that case by snapshotting the checkout
+    # into a root-owned throwaway and running it, which froze the bytes without authenticating
+    # them: a substituted `pg` in the checkout stole the credential from an operator following the
+    # printed digest-discovery instructions. So the dry run now reports the refusal instead of
+    # being the vulnerability (o3d-2sm1.5 r34, Codex CRITICAL).
+    if [[ "$probe_rc" -ne 0 ]] || [[ -z "$DB_FENCE_PROBE_SCRIPT" ]]; then
+      warn "A REAL RUN WOULD NOT PREFLIGHT THE DATABASE FROM HERE, AND NEITHER DID THIS ONE:"
+      warn "${DB_FENCE_PROBE_REASON:-there is no fence script this run is willing to execute.}"
+      warn "The preflight is the only part of a dry run that opens the admin connection, so nothing"
+      warn "was executed with DEPLOY_ADMIN_DATABASE_URL. Nothing has been changed by this dry run."
+      db_fence_probe_cleanup
+      return 0
+    fi
     local dry_rc=0
+    if [[ "$DB_FENCE_PROBE_SCRIPT" == "$DB_FENCE_SCRIPT_COPY" ]]; then
+      warn "This dry run probes with the root-owned artefact at ${DB_FENCE_PROBE_SCRIPT}, which is the"
+      warn "tree this box already publishes and verifies — not with the checkout's copy."
+    else
+      warn "This dry run probes with a throwaway copy of the tree IMS_FENCE_ARTEFACT_SHA256 named,"
+      warn "which is the only checkout-derived tree it will execute with the admin credential."
+    fi
     as_app_user env DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-      node "$DB_FENCE_SCRIPT" --preflight || dry_rc=$?
+      node "$DB_FENCE_PROBE_SCRIPT" --preflight "${DB_FENCE_IDENTITY_ARGS[@]:-}" || dry_rc=$?
+    db_fence_probe_cleanup
     if [[ "$dry_rc" -eq 0 ]]; then
       ok "A REAL RUN WOULD BE FENCEABLE: the preflight above asked the database and it answered yes."
     else
@@ -1063,10 +2013,14 @@ require_fenceable_database() {
   fi
   [[ -n "$DEPLOY_ADMIN_DATABASE_URL" ]] || die \
     "DEPLOY_ADMIN_DATABASE_URL is not set, so this deploy has no privileged connection that would survive revoking CONNECT from the application role — the database cannot be held closed for the migration window. Set it (a superuser or database-owner connection as a DIFFERENT role from DATABASE_URL; docs/installation.md) and re-run. Nothing has been stopped and nothing has been migrated."
-  [[ -f "$DB_FENCE_SCRIPT" ]] || die \
-    "${DB_FENCE_SCRIPT} is missing from this checkout, so the migration window cannot be fenced. Nothing has been stopped and nothing has been migrated."
+  [[ -f "$DB_FENCE_SCRIPT" || -f "$DB_FENCE_SCRIPT_COPY" ]] || die \
+    "Neither ${DB_FENCE_SCRIPT} nor the root-owned copy at ${DB_FENCE_SCRIPT_COPY} exists, so the migration window cannot be fenced. Nothing has been stopped and nothing has been migrated."
   [[ -f "$DB_OBJECT_ACCESS_SCRIPT" ]] || die \
     "${DB_OBJECT_ACCESS_SCRIPT} is missing from this checkout, so nothing would check that the application role can use what the migration creates. Nothing has been stopped and nothing has been migrated."
+  require_db_identity || die \
+    "The application's connection identity could not be read from ${APP_DIR_REAL}/.env: ${DB_IDENTITY_REASON}. The connection fence is TOLD which host, port, role and database it is closing — it no longer works that out from the environment. Write DATABASE_URL as a URL that states all four (postgresql://ROLE:PASSWORD@HOST:PORT/DATABASE, with no host/port/user/dbname query parameter), or re-run with --skip-migrate. Nothing has been stopped and nothing has been migrated."
+  require_env_file_is_sole_definition || die \
+    "${DB_IDENTITY_SOURCE_REASON}. The connection identity handed to the fence is read from ${APP_DIR_REAL}/.env, and a service whose DATABASE_URL something else can define is a service the fence may be aimed away from. Re-run with --skip-migrate, which moves no schema and needs no fence. Nothing has been stopped and nothing has been migrated."
 
   # AND IT IS RUN, NOT LOOKED AT (o3d-2sm1.5, Codex r4 HIGH). This used to be `[[ -f ... ]]`
   # and nothing more, which proves the file exists and nothing about whether it works. Its
@@ -1075,9 +2029,16 @@ require_fenceable_database() {
   # stop. An outage for an import. --preflight runs the same imports, opens the same admin
   # connection and asks the same questions as --fence, and revokes, terminates and writes
   # nothing; the only reasons it can fail are the reasons --fence would fail.
-  local rc=0
+  #
+  # AND IT IS RUN FROM THE PROTECTED COPY, LIKE EVERY OTHER MODE (o3d-2sm1.5 r31). This probe
+  # opens the admin connection as the application user; on an ordinary run it is what PUBLISHES
+  # the protected copy, so the bytes preflighted here are the bytes the fence is raised with a few
+  # phases later, and the application account gets no window between the two.
+  local rc=0 preflight_script
+  preflight_script="$(resolve_fence_script)" || die \
+    "This run has no fence script it is willing to execute (the reason is printed above), so the migration window cannot be fenced. Nothing has been stopped and nothing has been migrated."
   as_app_user env DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-    node "$DB_FENCE_SCRIPT" --preflight || rc=$?
+    node "$preflight_script" --preflight "${DB_FENCE_IDENTITY_ARGS[@]:-}" || rc=$?
   [[ "$rc" -eq 0 ]] || die \
     "The migration window could NOT be fenced (fence preflight exit ${rc}); the reason is printed above. Refusing to migrate. Nothing has been stopped and nothing has been migrated."
 
@@ -1098,11 +2059,15 @@ release_db_connections() {
   # CONNECT on its own database. So the script is ALWAYS run, and it is the DATABASE that says
   # what is standing. Its exit codes: 0 released from a record and verified; 4 no record, and
   # the application role's own CONNECT is all that could be proven; anything else, a refusal.
-  [[ -f "$DB_FENCE_SCRIPT" ]] || { echo -e "${RED}[ERROR]${RESET} Cannot release the connection fence: ${DB_FENCE_SCRIPT} is missing, so nothing here can ask the database whether one is standing." >&2; return 1; }
+  # AND THE SCRIPT IT ASKS WITH IS THE PROTECTED ONE (o3d-2sm1.5 r31, Codex CRITICAL). A release
+  # GRANTS CONNECT back from a record of what was revoked, as the application user and with
+  # DEPLOY_ADMIN_DATABASE_URL in its environment; running the checkout's own file for that let the
+  # account being released rewrite what "released" means, and report success without doing it.
+  local rc=0 fence_script
+  fence_script="$(resolve_fence_script)" || { echo -e "${RED}[ERROR]${RESET} Cannot release the connection fence: this run has no fence script it is willing to execute (the reason is printed above), so nothing here can ask the database whether one is standing." >&2; return 1; }
 
-  local rc=0
   as_app_user env DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-    node "$DB_FENCE_SCRIPT" --release --state-file="$DB_FENCE_STATE" || rc=$?
+    node "$fence_script" --release --state-file="$DB_FENCE_STATE" "${DB_FENCE_IDENTITY_ARGS[@]:-}" || rc=$?
 
   if [[ "$rc" -eq 0 ]]; then
     MIGRATION_DATABASE_URL=""
@@ -1142,6 +2107,12 @@ release_db_connections() {
   echo -e "${RED}[ERROR]${RESET} still has no CONNECT on this database and cannot start until this is undone:" >&2
   echo -e "${RED}[ERROR]${RESET}   ${DB_FENCE_RELEASE_CMD}" >&2
   echo -e "${RED}[ERROR]${RESET} or, by hand as a superuser, the GRANTs recorded in ${DB_FENCE_STATE}." >&2
+  # o3d-2sm1.5 r32: every printed instruction gets asked whether it names a path that is still
+  # TRUSTED. This one does not, and says so rather than being quietly dropped: ${DB_FENCE_STATE}
+  # is under the application-owned fence directory by necessity (the fence runs as that account
+  # and has to be able to release it), so what it records is evidence and not a script.
+  echo -e "${RED}[ERROR]${RESET} READ them first: that file is written by the fence AS ${APP_USER} and lives in an" >&2
+  echo -e "${RED}[ERROR]${RESET} application-writable directory, so it is evidence to check, not SQL to paste unseen." >&2
   return 1
 }
 
@@ -1161,12 +2132,44 @@ release_db_connections() {
 refence_db_connections() {
   $DB_FENCE_UP && return 0
   $DRY_RUN && return 1
-  [[ -f "$DB_FENCE_SCRIPT" ]] || return 1
+  [[ -f "$DB_FENCE_SCRIPT" || -f "$DB_FENCE_SCRIPT_COPY" ]] || return 1
   [[ -n "$DEPLOY_ADMIN_DATABASE_URL" ]] || return 1
+  # THE TWO QUESTIONS ARE NOT THE SAME QUESTION, AND ONE OF THEM DOES NOT BELONG HERE
+  # (o3d-2sm1.5 r23, Codex MEDIUM).
+  #
+  # require_db_identity() asks "do I know which connection to aim at" — necessary, and answered
+  # from the PINNED values, which never move. require_env_file_is_sole_definition() asks
+  # something else entirely: "can anything but ${APP_DIR_REAL}/.env define DATABASE_URL for the
+  # service". That is a START gate. It protects the decision to open a database and hand it to an
+  # application, and on the forward path it is exactly right.
+  #
+  # ON THIS PATH IT WAS A CONTRADICTION. The single largest reason control reaches here with the
+  # fence down is that the post-release check REFUSED because a unit had acquired another
+  # environment source — and the banner then promises the fence is being re-established. Calling
+  # the same refusal again necessarily returns 1 on the same still-present disagreement, so the
+  # promised re-fence was never attempted: the reboot fence went back, the banner admitted a
+  # failure it had not actually tried, and the migrated database's CONNECT grants stayed
+  # RELEASED, with remote writers and any second application free to reconnect during recovery.
+  #
+  # So it is asked only where it is a gate. Once this run has already fenced and migrated, the
+  # database to re-close is not in question at all — it is the one in the pinned identity, the
+  # one the standing state file records — and what some unit now claims about its environment
+  # cannot make that database the wrong one to shut. It can make it wrong to START the
+  # application, which is precisely what the refusal upstream has already decided.
+  require_db_identity || return 1
+  if ! $SCHEMA_TOUCHED && ! ${DB_FENCE_RAISED:-false}; then
+    require_env_file_is_sole_definition || return 1
+  fi
 
-  local rc=0
+  # THE EXIT TRAP RUNS THE PROTECTED COPY TOO (o3d-2sm1.5 r31, Codex CRITICAL). This is the path
+  # that runs when everything else has already gone wrong and nothing else is watching, which is
+  # exactly where substituted code would most like to be handed the admin credential. A soft
+  # refusal, like every other refusal in this function: dying inside an exit trap loses the status
+  # and the banner.
+  local rc=0 fence_script
+  fence_script="$(resolve_fence_script)" || return 1
   as_app_user env DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-    node "$DB_FENCE_SCRIPT" --fence --state-file="$DB_FENCE_STATE" || rc=$?
+    node "$fence_script" --fence --state-file="$DB_FENCE_STATE" "${DB_FENCE_IDENTITY_ARGS[@]:-}" || rc=$?
   # EVERY POST-COMMIT RESULT RAISES THE STICKY FLAG (o3d-2sm1.5, Codex r13 HIGH). Exit 5 says
   # the REVOKEs are COMMITTED and standing: this call could not call the database fenced, but it
   # certainly fenced something, and DB_FENCE_RAISED is the flag that decides whether a later
@@ -1194,7 +2197,7 @@ refence_db_connections() {
   # leave it empty instead: the fence is up, and nothing this trap does next needs the URL.
   local url_rc=0
   MIGRATION_DATABASE_URL="$(as_app_user env DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-    node "$DB_FENCE_SCRIPT" --print-migration-url)" || url_rc=$?
+    node "$fence_script" --print-migration-url "${DB_FENCE_IDENTITY_ARGS[@]:-}")" || url_rc=$?
   if [[ "$url_rc" -ne 0 || -z "$MIGRATION_DATABASE_URL" ]]; then
     MIGRATION_DATABASE_URL=""
     warn "--print-migration-url refused to compose a migration URL (exit ${url_rc}); NOT falling back to DEPLOY_ADMIN_DATABASE_URL. The fence is up."
@@ -1604,6 +2607,12 @@ on_exit() {
         [[ -n "$unit" ]] || continue
         systemctl stop "$unit" >/dev/null 2>&1 || true
       done
+      # AND THE BINDING COMES OFF, ALWAYS (o3d-2sm1.5 r23). The environment snapshot pins
+      # DATABASE_URL over ${APP_DIR_REAL}/.env for as long as its drop-in is loaded, and it is
+      # only ever right for the run that published it. Left standing after a failure it would
+      # silently override a later, legitimate edit of the file — and the operator's first move
+      # after reading this banner is usually to edit that file.
+      remove_db_identity_snapshot
       if $FENCE_MASK; then
         if ! install_reboot_fence "deploy failed at ${CURRENT_STEP}"; then
           echo -e "${RED}${BOLD} THE REBOOT FENCE IS NOT IN PLACE. This host may start the predecessor${RESET}" >&2
@@ -1646,7 +2655,7 @@ on_exit() {
           echo -e "${RED}  stopped and fenced against a reboot. Do NOT start it. Close the database by${RESET}" >&2
           echo -e "${RED}  hand, or re-run this script, which re-establishes the fence before it${RESET}" >&2
           echo -e "${RED}  rebuilds:${RESET}" >&2
-          echo -e "${RED}    node ${DB_FENCE_SCRIPT} --fence --state-file=${DB_FENCE_STATE}${RESET}" >&2
+          echo -e "${RED}    ${DB_FENCE_REFENCE_CMD}${RESET}" >&2
         fi
       else
         release_db_connections || true
@@ -2044,7 +3053,39 @@ if ! $SKIP_MIGRATE; then
       die "No systemd unit serves ${APP_DIR_REAL}, so the predecessor cannot be fenced against a reboot — and a reboot mid-migration would start it again against a migrated schema. Refusing to migrate. Name the unit with IMS_SERVICE_UNIT=<unit>, or run with --skip-migrate (which moves no schema and needs no reboot fence). Nothing has been stopped and nothing has been migrated."
     fi
   fi
+  # A SNAPSHOT AN EARLIER RUN LEFT BEHIND IS CLEARED HERE, BEFORE ANYTHING ASKS THE BUS
+  # (o3d-2sm1.5 r23). Every exit path removes the binding, but a SIGKILL has no exit path, and a
+  # drop-in surviving from a run that died would be a second definition of DATABASE_URL that
+  # env_file_is_sole_database_url_source() refuses on sight — correctly, since this run did not
+  # write it and has no idea what is in it. Clearing it is safe at this point: nothing has been
+  # stopped, and removing a drop-in changes no running process's environment.
+  $DRY_RUN || remove_db_identity_snapshot
   require_fenceable_database
+elif ! $RESTART_ONLY; then
+  # o3d-1izw, carried over from the pre-cutover deploy.sh. --skip-migrate applies nothing and
+  # validates nothing, which is how a build reaches an environment whose database does not have
+  # the push states it writes. The narrow check below is cheap enough to run on every such deploy
+  # and refuses rather than shipping code whose first lapsed create claim fails at the database
+  # and keeps failing on every sweep after.
+  #
+  # --restart-only is deliberately exempt: it delivers no new code, so it cannot introduce this
+  # mismatch, and an emergency bounce must not be blocked by a database read. The running build is
+  # covered by the sweep own preflight gate, which refuses before it writes anything.
+  #
+  # IT MOVED INTO validate, AND THAT IS THE SAME INTENT HONOURED BETTER. The old script ran it
+  # where its migrate step would have been; this one has a phase whose whole contract is that
+  # everything able to reject a release rejects it while the predecessor is still up. A
+  # --skip-migrate run stops the predecessor a few phases below, so refusing here costs nothing
+  # where refusing later costs an outage. It is still read-only, still one SELECT over pg_catalog,
+  # and it still runs on exactly the --skip-migrate-but-not---restart-only path.
+  info "Skipping migrations - verifying the database can hold what this build writes..."
+  if $DRY_RUN; then
+    echo -e "${YELLOW}[DRY]${RESET}   would run: node scripts/check-wms-push-state-enum.mjs  (as ${APP_USER})"
+  else
+    as_app_user_db node scripts/check-wms-push-state-enum.mjs \
+      || die "This database does not have the WMS push-state vocabulary this build writes, and ${SKIP_MIGRATE_FLAG} applies no migration that would give it one. Re-run without ${SKIP_MIGRATE_FLAG} (add --skip-build if the build on disk is the one you want). Nothing has been stopped."
+    ok "WMS push-state vocabulary present."
+  fi
 fi
 ok "Artefact validated."
 
@@ -2291,7 +3332,7 @@ step "Prove the writers are gone"
 
 if $DRY_RUN; then
   echo -e "${YELLOW}[DRY]${RESET}   would wait for :${PORT} to be free"
-  echo -e "${YELLOW}[DRY]${RESET}   would run: node scripts/fence-db-connections.mjs --fence  (as ${APP_USER})"
+  echo -e "${YELLOW}[DRY]${RESET}   would run: node ${DB_FENCE_SCRIPT_COPY} --fence  (as ${APP_USER})"
   echo -e "${YELLOW}[DRY]${RESET}   would run: node scripts/check-db-writers.mjs  (as ${APP_USER})"
 else
   for _ in $(seq 1 15); do
@@ -2400,9 +3441,76 @@ step "Start the new build"
 # migration applied, the deployed schema matched prisma/schema.prisma, and every declared
 # verification returned zero — the schema is known good and the new build is about to
 # start. Every other path either never touched the schema or leaves the fence standing.
+
+# BEFORE THE RELEASE, WITH THE FENCE STILL HELD (o3d-2sm1.5 r22, Codex HIGH). The migration
+# window is closing and the whole point of the fence is that the database it is holding shut is
+# the database that is about to be served. If ${APP_DIR_REAL}/.env has been replaced, deleted or
+# retargeted since the pin — or the unit has acquired another definition of DATABASE_URL — then
+# releasing here opens database A and starts the application on database B.
+#
+# SO IT REFUSES, AND THE FENCE STAYS UP. This die reaches on_exit() with FENCE_ARMED and
+# SCHEMA_TOUCHED both true, which is the path that HOLDS the connection fence, re-stops the
+# units, re-installs the reboot fence and prints the release command; the state is stated there
+# rather than claimed here. That is deliberately the expensive answer: a migrated database left
+# closed is recoverable by a re-run, and an application started on the wrong one is not.
+require_start_identity_unchanged || die \
+  "THE CONNECTION FENCE IS BEING HELD AND THE APPLICATION IS NOT BEING STARTED: ${DB_IDENTITY_DRIFT_REASON}. The migration applied and every verification passed, but the identity this run fenced and migrated is no longer the one ${APP_DIR_REAL}/.env will give the service when systemd execs it — so releasing the fence and starting now would open the database this run migrated and start the application on a different one. Restore ${APP_DIR_REAL}/.env to the identity above and re-run this script, which adopts the standing fence; or, once you are certain which database the service should use, release it by hand with the command printed below. Do NOT start the service until one of those is done."
+
+# AND THE IDENTITY IS NOT ONLY CHECKED, IT IS BOUND (o3d-2sm1.5 r23, Codex HIGH). The check
+# above is the last READ, and a read is what rounds 13-22 kept failing to make sufficient: it
+# finishes, and then the timestamp, the unmask, the logging and every earlier unit in the start
+# loop execute before systemd opens the file. So the value it just proved is PUBLISHED where
+# nothing but root can change it and every unit is made to load it last. From here on the
+# question "which database will the service use" has an answer that does not depend on when it
+# is asked.
+#
+# WITH THE CONNECTION FENCE STILL UP, deliberately: a failure here costs a re-run of a deploy
+# whose schema is already migrated and whose database is still closed, which is the recoverable
+# direction. Publishing after the release would leave a window in which the database is open and
+# the service is startable by hand against whatever the file says.
+publish_db_identity_snapshot || die \
+  "THE CONNECTION FENCE IS BEING HELD AND THE APPLICATION IS NOT BEING STARTED: this run could not bind the service to the database it fenced and migrated (the reason is printed above). Without that binding the DATABASE_URL systemd reads at exec is whatever ${APP_DIR_REAL}/.env says at that instant, which is not something this script can hold still. Fix the cause and re-run; the re-run adopts the standing fence."
+
+# THE UNMASK HAPPENS HERE, AHEAD OF THE FINAL RELOAD, AND NOT IN THE START LOOP (o3d-2sm1.5
+# r24, Codex HIGH). `systemctl unmask` RELOADS SYSTEMD IMPLICITLY unless it is given
+# --no-reload, so an unmask sitting between require_start_identity_bound and `systemctl start`
+# re-read every unit file and every drop-in on disk AFTER the proof that the loaded configuration
+# binds this service to this run's snapshot — once per unit, with the remaining units' starts
+# still to come. r22's atomicity argument was sound about EXPLICIT reloads and blind to that one,
+# and a concurrent unit or drop-in change could therefore remove, reorder or weaken the mandatory
+# snapshot in the window the proof claimed to have closed.
+#
+# Moving every unit-file operation upstream of remove_reboot_fence()'s daemon-reload makes
+# "nothing after the verification changes the loaded configuration" true BY CONSTRUCTION rather
+# than by every future caller remembering --no-reload. After the proof the only systemctl verb
+# left is `start`, which acts on the loaded configuration and does not re-read unit files.
+#
+# The unmask itself lifts a mask left by an older revision of this script, which masked from its
+# exit trap; harmless when there is none. It is safe this early because a mask is not what holds
+# the service down during the window — the stop and the reboot fence are — and unmasking starts
+# nothing.
+if [[ "${#SERVICE_UNITS[@]}" -gt 0 ]]; then
+  for unit in "${SERVICE_UNITS[@]}"; do
+    run systemctl unmask "$unit" >/dev/null 2>&1 || true
+  done
+fi
+
 release_db_connections \
   || die "Refusing to start the application while it has no CONNECT on its own database."
 remove_reboot_fence
+
+# AND ONCE MORE AFTER THIS RUN'S FINAL daemon-reload, WHICH remove_reboot_fence() JUST ISSUED,
+# AND WITH EVERY UNIT-FILE COMMAND ALREADY BEHIND IT (o3d-2sm1.5 r24, Codex HIGH)
+# (o3d-2sm1.5 r22, Codex HIGH). That reload is what folds every drop-in written during the
+# window into the unit's loaded configuration, so this is the first moment the LOADED unit can be
+# asked, and the last moment before `systemctl start` hands the file to systemd to read.
+#
+# A refusal here also leaves both fences standing, by the same route and without doing it by
+# hand: the die reaches on_exit() with SCHEMA_TOUCHED true and DB_FENCE_UP false, which is
+# exactly the branch that re-establishes the connection fence through refence_db_connections()
+# and re-installs the reboot fence, and then says which of the two it actually managed.
+require_start_identity_bound || die \
+  "THE APPLICATION IS NOT BEING STARTED, AND BOTH FENCES ARE BEING PUT BACK: ${DB_IDENTITY_DRIFT_REASON}. This was checked after the final daemon-reload, so it is the loaded unit configuration and the current file contents that disagree with the identity this run fenced and migrated. It is also the check that proves the environment snapshot this run published is in that loaded configuration, loaded last and loaded mandatorily — the binding that makes the answer independent of anything that happens between this line and the exec. NOTHING BETWEEN HERE AND THE START RUNS A UNIT-FILE COMMAND AT ALL: the unmask moved above the final reload in r24 because it reloads implicitly, and every command left in the window is a timestamp, a shell test, a loop, an echo and \`systemctl start\` itself, which acts on the loaded configuration and does not re-read unit files. So the list of environment files systemd will read is now fixed. The connection fence was released a moment ago for the start and is being re-established below; the banner that follows says whether that succeeded and what is standing. Restore ${APP_DIR_REAL}/.env and the unit to the identity above and re-run this script, which adopts the fence. Do NOT start the service by hand first."
 
 # The instant the restart was issued. The responder proof below requires the process on the
 # port to post-date it: anything older survived the stop and is not what this run started.
@@ -2410,9 +3518,6 @@ SERVICE_START_EPOCH=$(date +%s)
 
 if [[ "${#SERVICE_UNITS[@]}" -gt 0 ]]; then
   for unit in "${SERVICE_UNITS[@]}"; do
-    # Lifts a mask left by an older revision of this script, which masked from its exit
-    # trap. Harmless when there is none.
-    run systemctl unmask "$unit" >/dev/null 2>&1 || true
     info "systemctl start ${unit}"
     run systemctl start "$unit"
   done
@@ -2577,6 +3682,13 @@ CUTOVER_ARMING=false
 if $PAST_POINT_OF_NO_RETURN; then
   FENCE_ARMED=false
 fi
+
+# THE BINDING COMES OFF HERE, on the success path (o3d-2sm1.5 r23). The service is running and
+# has answered its health check, so it already HAS the environment; the drop-in has nothing left
+# to do and everything to break, because from now on it would override ${APP_DIR_REAL}/.env for
+# every restart, reboot and Restart= until somebody noticed a file in /etc/systemd/system that no
+# document mentions. Removing it does not touch the running process.
+remove_db_identity_snapshot
 
 CURRENT_STEP="unfence-cron"
 step "Restore the cron writers"

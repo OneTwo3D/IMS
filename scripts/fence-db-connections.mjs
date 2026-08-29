@@ -125,13 +125,15 @@
 //     Said here because the state file calls itself a restore of "exactly the grants".
 //
 // WHICH DATABASE ANY OF THIS IS ABOUT. Every mode above connects through
-// DEPLOY_ADMIN_DATABASE_URL when it is set, and asks its questions of `current_database()` on
-// that connection while taking the ROLE from DATABASE_URL. assessDatabaseIdentity() is what
-// binds the two together — same host, same port, same database name, and the live connection
-// attached to it — and no mode fences or releases without it (o3d-2sm1.5, Codex r13 CRITICAL).
-// `--release` goes further on the path where it has no record: the claim "the application can
-// connect" is made by CONNECTING AS THE APPLICATION, because a privilege read taken over the
-// admin connection answers about the admin connection's database.
+// DEPLOY_ADMIN_DATABASE_URL when it is set and asks its questions of `current_database()` on that
+// connection — while the application's own host, port, role and database are SUPPLIED ON ARGV by
+// the caller (`--app-host`, `--app-port`, `--app-user`, `--app-database`) and are never worked out
+// here. assessDatabaseIdentity() binds the two together — same host, same port, same database
+// name, and the live connection attached to it — and no mode fences or releases without it
+// (o3d-2sm1.5, Codex r13 CRITICAL). `--release` goes further on the path where it has no record:
+// the claim "the application can connect" is made by CONNECTING AS THE APPLICATION, because a
+// privilege read taken over the admin connection answers about the admin connection's database —
+// and that probe must land on the SAME POSTMASTER as this run, or it is refused.
 //
 // THE STATE FILE is written BEFORE anything is revoked, and it records what each
 // grantee held beforehand so that `--release` restores that and not "everything".
@@ -145,8 +147,212 @@ import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rm
 import { dirname } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
-import { config as loadDotenv } from 'dotenv'
+// THE ONLY BARE SPECIFIER LEFT, AND THAT IS THE POINT (o3d-2sm1.5 r32, Codex CRITICAL).
+//
+// This file is executed with DEPLOY_ADMIN_DATABASE_URL in its environment out of a root-owned
+// protected mirror (scripts/lib/db-fence-protected.sh), and everything it imports is executed
+// with it too — at module scope, BEFORE main() has a statement to run. The mirror used to reach
+// its `node_modules` through a symlink back into the application-owned checkout, so the account
+// this whole mechanism is built against still chose the bytes of every import. The closure of
+// `pg` is now VENDORED into the mirror and covered by the artefact digest.
+//
+// `dotenv` WAS HERE AND IS GONE. It existed for one call: loading `<app dir>/.env` so that an
+// operator pasting the printed `--release` command by hand would pick up the admin credential.
+// Under the mirror that call read `/etc/ims-cutover-recovery/app/.env`, which does not exist —
+// so it supplied nothing while adding a whole package to what runs with the credential. The
+// shell side reads that file already (env_file_value(), in all three entrypoints) and passes the
+// value through `env`, and the generated operator wrappers do the same. NOTHING HERE READS A
+// FILE OUT OF THE APPLICATION DIRECTORY ANY MORE — the credential arrives in the environment or
+// the run refuses.
+//
+// Adding an import means adding it to DB_FENCE_VENDOR_ROOTS in the library, and a test asserts
+// the two agree, so an unvendored dependency fails the suite rather than the cutover.
 import pg from 'pg'
+
+// ---------------------------------------------------------------------------
+// THE APPLICATION'S CONNECTION IDENTITY IS REQUIRED, NOT INFERRED (o3d-2sm1.5 r19)
+//
+// SEVEN ROUNDS went into deciding WHERE THE APPLICATION CONNECTS by reconstructing what its
+// runtime resolves. Every answer was locally correct and uncovered another layer:
+//
+//   r13-r15  this file's own reading of the URL disagreed with the driver's — authority-versus-
+//            query precedence, `?user=` overriding the authority, repeated parameters.
+//   r16      the driver's STRING PARSER disagreed with the driver's CONNECTION: `pg` fills
+//            PGHOST, PGPORT, PGUSER and PGDATABASE in for everything the URL omits.
+//   r17      the environment those come from is the DEPLOY SHELL'S, not the service's — so the
+//            service's environment file was read instead.
+//   r18      reading that file is reimplementing systemd, so systemd was asked instead. It
+//            answers for the `Environment=` layer and NOT for the file layer, which then had to
+//            be refused on a mention of the name.
+//   r19      and the review of r18 named five more layers: `PassEnvironment=`, `UnsetEnvironment=`,
+//            wildcard `EnvironmentFile=` globs, the `.env.development*` / `.env.test*` overlays
+//            Next loads in other modes, a unit with no `WorkingDirectory=` — and a separate
+//            precedence chain for `DATABASE_URL` itself.
+//
+// THE COUNT WENT 1 -> 4 -> 5, four of them CRITICAL. That is not an implementation problem. THE
+// QUESTION HAS NO BOUNDED ANSWER: the composition rules belong to three different systems
+// (systemd, Next, libpq), each of them is free to add a layer, and a helper that answers it will
+// be wrong again the round after it is made right.
+//
+// SO IT IS NO LONGER ASKED. The four values that decide WHICH CONNECTION this run is talking
+// about — HOST, PORT, USER and DATABASE — arrive on argv, and a run that is not given all four
+// REFUSES. There is no environment reconstruction, no systemd interrogation, no dotenv scanning
+// and no precedence emulation left in this file to be wrong about.
+//
+// WHO SUPPLIES THEM, AND HOW THEY KNOW. The operator is asked for nothing new; the callers
+// already hold everything below.
+//
+//   scripts/install.sh   OWNS the four. It prompts for DB_HOST, DB_PORT, DB_NAME and DB_USER,
+//                        CREATEs the role and the database with them, and COMPOSES DATABASE_URL
+//                        out of them. It passes those same variables. Nothing is parsed at all.
+//   scripts/update.sh    read DATABASE_URL from `<app dir>/.env` — the file they already take
+//   scripts/deploy.sh    DEPLOY_ADMIN_DATABASE_URL from — and split it with a STRICT reader
+//                        (`db_identity_from_url`, the same twenty lines in both) that ACCEPTS
+//                        ONLY A URL STATING ALL FOUR. No port, no path, an identity-bearing query
+//                        parameter, a percent-escape in a component it would have to decode: each
+//                        one is a REFUSAL that stops the deploy before anything is stopped or
+//                        migrated. Never a default.
+//
+// AND THE STRICTNESS IS WHAT CLOSES THE QUESTION RATHER THAN NARROWING IT. `PGHOST`, `PGPORT`,
+// `PGUSER` and `PGDATABASE` are consulted by libpq and by `pg` ONLY for values the connection
+// string leaves out. A URL that states all four cannot be moved by any of them, in any process,
+// under any of the three composition systems above — so for exactly the URLs the callers accept,
+// the environment question has no bearing on the answer, and for every other URL there is a
+// refusal in place of a guess.
+//
+// WHAT IS STILL PROVEN HERE, because being TOLD an identity is not the same as being ON it:
+//
+//   * the admin URL this run opens must reach the SAME database and the SAME server as the four
+//     supplied values, or this refuses (assessDatabaseIdentity);
+//   * the connection actually opened must report that database as `current_database()`, and must
+//     be running as the role it logged in as, or this refuses;
+//   * and in `--release`, the application probe must reach THE SAME POSTMASTER as this
+//     connection — `pg_postmaster_start_time()`, asked of both — before "the application can
+//     connect" is allowed to mean anything about this database.
+//
+// `DATABASE_URL` IS A CREDENTIAL HERE AND NOTHING ELSE. It is no longer read for the role, the
+// host, the port or the database name. The only thing this file does with it is OPEN it, in
+// `--release`, to see whether the application gets in; where that lands is then cross-checked
+// against the supplied identity and against this connection's own postmaster. `.env.local` is no
+// longer loaded either: systemd hands the service `.env`, and reading a file the service never
+// sees was divergence with nothing to gain.
+// ---------------------------------------------------------------------------
+
+/** The argv options a run must be GIVEN before it may claim to know which connection it means. */
+export const REQUIRED_IDENTITY_OPTIONS = ['--app-host', '--app-port', '--app-user', '--app-database']
+
+/**
+ * Pure: the application connection's identity AS SUPPLIED, or the reason this run cannot say
+ * which connection it is about.
+ *
+ * Nothing is defaulted and nothing is filled in from anywhere. A blank value is a missing value:
+ * `--app-host=` with nothing after it is the shape an unset shell variable takes when a caller
+ * interpolates it, and it must not be mistaken for `localhost`.
+ *
+ * The port is checked to be a port because every comparison below prints it and one of them
+ * compares it: `pg` runs a port through `parseInt`, so `--app-port=` carrying a word would make
+ * this run's idea of the server and the driver's differ silently.
+ */
+export function requireSuppliedIdentity(options = {}) {
+  const identity = {
+    host: String(options.appHost ?? '').trim(),
+    port: String(options.appPort ?? '').trim(),
+    user: String(options.appUser ?? '').trim(),
+    database: String(options.appDatabase ?? '').trim(),
+  }
+  const missing = REQUIRED_IDENTITY_OPTIONS.filter((option, index) => identity[['host', 'port', 'user', 'database'][index]] === '')
+  if (missing.length > 0) {
+    return {
+      ok: false,
+      reason: `${missing.join(', ')} ${missing.length === 1 ? 'was' : 'were'} not supplied. This run will NOT work out where the application connects: seven rounds of reconstructing it from URLs, driver defaults, systemd properties and dotenv overlays each produced a locally correct answer and another layer underneath, because the composition rules belong to systemd, Next and libpq at once and are open-ended. The caller states the four values instead — scripts/deploy.sh and scripts/update.sh split them out of DATABASE_URL with a reader that refuses any URL not stating all four, and scripts/install.sh passes the DB_HOST, DB_PORT, DB_USER and DB_NAME it created the database with`,
+    }
+  }
+  if (!/^[0-9]{1,5}$/.test(identity.port) || Number(identity.port) < 1 || Number(identity.port) > 65535) {
+    return {
+      ok: false,
+      reason: `--app-port=${JSON.stringify(identity.port)} is not a port number, so which server this run is talking about cannot be stated`,
+    }
+  }
+  return { ok: true, reason: '', identity }
+}
+
+/**
+ * THE OBJECT THAT DECIDES WHERE THE CONNECTION GOES (o3d-2sm1.5, Codex r16 CRITICAL).
+ *
+ * FOUR rounds on this file have now ended the same way: whatever this script used to work out
+ * "where does DATABASE_URL actually go" was one layer short of what `pg` connects with.
+ *
+ *   r13/r14  a hand-rolled read of the URL -- wrong about authority-vs-query precedence, and
+ *            wrong about `?user=` overriding the authority's username.
+ *   r15      a hand-rolled read of the URL -- wrong about repeated parameters, because
+ *            `URLSearchParams.get()` returns the FIRST value while pg-connection-string copies
+ *            every entry into one config object, so the LAST one wins.
+ *   r16      `pg-connection-string.parse()` -- the driver's own STRING PARSER, but still not the
+ *            driver's connection. `pg/lib/connection-parameters.js` fills every value the URL
+ *            omits from `PGHOST`, `PGPORT`, `PGUSER`, `PGDATABASE` and its own defaults BEFORE
+ *            connecting. With `PGPORT=6432` and an application URL that names no port, the
+ *            parser says 5432 and the application connects to 6432 -- so the fence revokes
+ *            CONNECT on one cluster while the application keeps writing to another, right
+ *            through the migration.
+ *
+ * A fifth reimplementation would find a fifth gap. So identity is no longer RECONSTRUCTED at all:
+ * it is READ OFF THE CLIENT OBJECT THE DRIVER WOULD OPEN. `new pg.Client({ connectionString })`
+ * builds its `ConnectionParameters` in the constructor and touches the network only when
+ * `.connect()` is called, which this never calls. `client.host` and `client.port` are literally
+ * the two arguments handed to `Connection#connect()`, and `client.user` / `client.database` are
+ * the values `getStartupConf()` puts in the startup packet. There is nothing left between these
+ * four fields and the wire for a fifth round to find.
+ *
+ * Consequently this file holds NO opinion about how a URL resolves, and no fallback that could
+ * hold one: a construction that throws is reported as "where it connects is unknown", which is
+ * refused everywhere identity is required.
+ *
+ * The single deliberate subtraction is the OS-account fallback for the login role -- see the body.
+ * It is subtracted rather than corrected, and it is DETECTED BY ASKING THE DRIVER, not by
+ * re-reading the URL, so this is still not a reimplementation of anything.
+ */
+const OS_ACCOUNT_SENTINEL = '\x00fence-os-account-default\x00'
+
+export function resolveDriverIdentity(connectionString) {
+  // NOT connected, and never connected: the constructor resolves ConnectionParameters and
+  // allocates an unconnected socket, nothing more.
+  const client = new pg.Client({ connectionString })
+
+  // WHOSE ENVIRONMENT THIS RESOLVES THROUGH, NOW THAT NOTHING RECONSTRUCTS ONE (o3d-2sm1.5 r19).
+  // THIS PROCESS'S — and that is correct, because the only connection string still resolved here
+  // is the ADMIN URL, which is the connection THIS PROCESS OPENS. `PGHOST`, `PGPORT`, `PGUSER`
+  // and `PGDATABASE` in the deploy shell are settings for the deploy shell's own connection, and
+  // honouring them is what makes `client.host`/`client.port` the two arguments the driver would
+  // dial. Nothing here is a statement about the APPLICATION's connection any more: that identity
+  // is supplied on argv (see the section at the top of the file), and the admin URL is checked
+  // AGAINST it rather than used to derive it.
+  //
+  // `pg`'s LAST fallback for the login role is not a setting at all: it is `process.env.USER`,
+  // the OS account of whichever process happens to be running. It is subtracted here, so an admin
+  // URL naming no role resolves to '' — "unidentified" — rather than to whoever ran the deploy;
+  // `session_user`, read from the connection once it is open, is what actually binds the role.
+  //
+  // Asked of the driver rather than inferred: re-resolve with `pg.defaults.user` swapped for a
+  // sentinel, and if the answer moves, that field came from the OS account and from nothing else.
+  // `ConnectionParameters` also falls the database back to the login role's name, so the same
+  // swap reveals a database that is ambient for the same reason. Either one resolves to '' here,
+  // which every caller already treats as "unidentified", and unidentified is refused.
+  const previousDefault = pg.defaults.user
+  let probe
+  try {
+    pg.defaults.user = OS_ACCOUNT_SENTINEL
+    probe = new pg.Client({ connectionString })
+  } finally {
+    pg.defaults.user = previousDefault
+  }
+
+  return {
+    host: client.host,
+    port: client.port,
+    user: probe.user === OS_ACCOUNT_SENTINEL ? '' : client.user,
+    database: probe.database === OS_ACCOUNT_SENTINEL ? '' : client.database,
+  }
+}
 
 export const EXIT_OK = 0
 export const EXIT_ERROR = 1
@@ -256,6 +462,18 @@ export function parseRoleFromConnectionString(connectionString) {
 /** Hosts that all mean "the machine this is running on", however they are spelled. */
 const LOCAL_HOSTS = new Set(['', 'localhost', '127.0.0.1', '::1', '[::1]'])
 
+/**
+ * ONE SPELLING OF "WHICH SERVER", so the supplied identity and a parsed admin URL are compared on
+ * the same terms. A loopback address, `localhost` and a unix-socket directory are the same
+ * machine; anything else is compared as written, lower-cased, because "probably the same host by
+ * another name" is the reasoning the comparison exists to stop.
+ */
+function serverOf(host, port) {
+  const lowered = String(host).toLowerCase()
+  const family = String(host).startsWith('/') || LOCAL_HOSTS.has(lowered) ? '(this host)' : lowered
+  return `${family}:${port}`
+}
+
 /** Best-effort percent-decoding: a value that will not decode is compared as written. */
 function decodeOrRaw(value) {
   try {
@@ -266,37 +484,61 @@ function decodeOrRaw(value) {
 }
 
 /**
+ * The query parameters that decide WHERE a connection lands and AS WHOM. Repeating any of these
+ * is refused outright (see parseConnectionIdentity).
+ */
+const IDENTITY_PARAMS = ['host', 'port', 'user', 'dbname', 'database']
+
+/**
  * Pure: the (login role, server, database) a libpq connection URL EFFECTIVELY names -- what
  * node-postgres will actually connect as and to, not what the URL's obvious components suggest.
  *
- * THE QUERY STRING WINS OVER THE AUTHORITY, AND IT REDIRECTS THE CONNECTION (o3d-2sm1.5, Codex
- * r14 CRITICAL). This used to read the authority first and consult the query only as a fallback.
- * The installed parser (pg-connection-string, reached through pg) does the opposite: it copies
- * every query parameter into the config FIRST, and only then fills in `host`, `port` and `user`
- * from the authority `if` the query left them unset. So
+ * THE EFFECTIVE VALUES ARE THE DRIVER'S OWN (o3d-2sm1.5, Codex r16 CRITICAL). They are read off
+ * `resolveDriverIdentity()` -- the `pg.Client` the driver would open -- rather than re-derived
+ * here. THREE rounds running, something short of that client disagreed with it, and the fence
+ * proved itself against a connection nobody uses:
  *
- *     postgres://app@localhost:5432/appdb?host=remote.example&port=6432&user=actual
+ *   r14  the authority was read first and the query consulted only as a fallback. The driver
+ *        does the opposite -- it copies every query parameter into the config FIRST and fills
+ *        `host`, `port` and `user` from the authority only `if` the query left them unset -- so
+ *        `postgres://app@localhost:5432/appdb?host=remote.example&port=6432&user=actual` was
+ *        classified as `app` at localhost:5432 while the application authenticated as `actual`
+ *        against remote.example:6432.
+ *   r15  the query was then read with `URLSearchParams.get()`, which returns the FIRST value.
+ *        The driver iterates `searchParams.entries()` into one config object, so the LAST
+ *        duplicate wins: `?host=local&host=remote&port=5432&port=6432&user=app&user=other` read
+ *        here as local:5432/app and connected to remote:6432/other.
+ *   r16  the driver's own string parser was then used -- and a string parser is not a
+ *        connection. `pg/lib/connection-parameters.js` fills in `PGHOST`, `PGPORT`, `PGUSER`,
+ *        `PGDATABASE` and its own defaults for everything the URL omits, so with `PGPORT=6432`
+ *        `postgres://imsapp@localhost/imsdb` read here as (this host):5432 and connected to
+ *        6432. An empty authority plus `PGHOST` moves the whole server the same way.
  *
- * was classified here as `app` at localhost:5432 -- it passed against a local admin URL naming
- * the same database -- while the application's own adapter authenticated as `actual` against
- * remote.example:6432. Preflight, the fence and the release then all succeeded against the wrong
- * cluster and the wrong role, and the application went on writing across the migration through a
- * connection nothing in this script had ever looked at.
+ * So there are now two rules, both fail-closed, and neither of them re-implements libpq:
  *
- * Two rules, both fail-closed:
+ *   * A REPEATED IDENTITY PARAMETER IS REFUSED. Not resolved to the driver's answer -- refused.
+ *     The driver's answer is knowable, but a URL that names two hosts is a URL whose reader and
+ *     whose driver see different databases, and every ambiguity in this file is refused rather
+ *     than resolved (an authority that disagrees with its own query string, below, is refused on
+ *     exactly the same grounds). Refusal is also the one answer that cannot go stale if the
+ *     driver's precedence changes again.
+ *   * ANYTHING ELSE IS WHATEVER THE DRIVER SAYS IT IS. `host`, `port`, `user` and `database` are
+ *     read off the `pg.Client` that would be opened, so `?host=` falling back to the authority,
+ *     the `@/` empty-authority form, percent-decoding, the unconditional overwrite of `database`
+ *     from the pathname, AND the environment defaults (`PGHOST`/`PGPORT`/`PGUSER`/`PGDATABASE`,
+ *     port 5432, host `localhost`, and a database that falls back to the login role's own name)
+ *     are the driver's behaviour by construction rather than by imitation. Nothing here merges
+ *     a parser's output with the environment; that merge is the driver's, and it is done once.
  *
- *   * The EFFECTIVE value is the query parameter when it carries one, exactly as the driver
- *     resolves it (`config.host || authority`, so an EMPTY parameter still falls back).
- *   * A URL that says one thing in its authority and a DIFFERENT thing in its query string is
- *     REFUSED rather than resolved. The driver would take the query value, but an environment
- *     that disagrees with itself about which server or which role it means is not a thing to
- *     pick a winner from -- and this check exists precisely to stop "probably what they meant".
+ * A URL that says one thing in its authority and a DIFFERENT thing in its query string is still
+ * REFUSED rather than resolved. The driver would take the query value, but an environment that
+ * disagrees with itself about which server or which role it means is not a thing to pick a
+ * winner from -- and this check exists precisely to stop "probably what they meant".
  *
- * `database` is deliberately taken from the path alone: the driver overwrites `config.database`
- * from the pathname UNCONDITIONALLY, so `?dbname=`/`?database=` change nothing whatever. Carrying
- * one is a statement about the database that the connection will not honour, and a false
- * statement about WHICH DATABASE is the entire subject of this section -- so it is refused rather
- * than silently ignored.
+ * `?dbname=`/`?database=` are likewise refused when they name something other than the path: the
+ * driver overwrites `config.database` from the pathname UNCONDITIONALLY, so such a parameter is a
+ * statement about the database that the connection will not honour, and a false statement about
+ * WHICH DATABASE is the entire subject of this section.
  */
 export function parseConnectionIdentity(connectionString) {
   if (!connectionString) return { ok: false, reason: 'is not set' }
@@ -318,18 +560,37 @@ export function parseConnectionIdentity(connectionString) {
   }
   const params = url.searchParams
 
+  // A repeated identity parameter, refused BEFORE anything is resolved.
+  for (const name of IDENTITY_PARAMS) {
+    const all = params.getAll(name)
+    if (all.length > 1) {
+      return {
+        ok: false,
+        reason: `carries ?${name}= ${all.length} times (${all.map((value) => JSON.stringify(value)).join(', ')}). node-postgres copies EVERY query parameter into one config object, so the LAST one is the one it connects with, while anything reading the URL a parameter at a time sees the first — which is how a URL passes a check here and opens somewhere else. Refusing to pick a winner; delete all but one`,
+      }
+    }
+  }
+
+  // The effective values, read off the client `pg` would open. Constructing it can throw — an
+  // sslcert/sslkey/sslrootcert it cannot read, a uselibpqcompat conflict — and a URL the driver
+  // will not build a connection from is a URL this cannot identify.
+  let driver
+  try {
+    driver = resolveDriverIdentity(connectionString)
+  } catch {
+    return { ok: false, reason: 'cannot be resolved to a node-postgres connection (pg rejected it), so where it connects is unknown' }
+  }
+
   const authorityHost = !emptyAuthorityHost && url.hostname ? decodeOrRaw(url.hostname) : ''
   const authorityPort = url.port || ''
   const authorityUser = url.username ? decodeOrRaw(url.username) : ''
-  const queryHost = params.get('host') || ''
-  const queryPort = params.get('port') || ''
-  const queryUser = params.get('user') || ''
 
-  for (const [name, authority, query] of [
-    ['host', authorityHost, queryHost],
-    ['port', authorityPort, queryPort],
-    ['user', authorityUser, queryUser],
+  for (const [name, authority] of [
+    ['host', authorityHost],
+    ['port', authorityPort],
+    ['user', authorityUser],
   ]) {
+    const query = params.get(name) || ''
     if (query && authority && query !== authority) {
       return {
         ok: false,
@@ -338,71 +599,80 @@ export function parseConnectionIdentity(connectionString) {
     }
   }
 
-  const database = decodeOrRaw(url.pathname.replace(/^\//, ''))
+  const database = String(driver.database ?? '')
   for (const name of ['dbname', 'database']) {
     const value = params.get(name)
     if (value && value !== database) {
       return {
         ok: false,
-        reason: `carries ?${name}=${value}, which node-postgres IGNORES -- the database always comes from the URL path, which names "${database || '(nothing)'}". A parameter naming a different database from the one the connection actually reaches cannot be left standing here`,
+        reason: `carries ?${name}=${value}, which node-postgres IGNORES -- the database comes from the URL path (or, when the path is empty, from PGDATABASE and then from the login role's own name), and the connection this URL opens reaches "${database || '(nothing)'}". A parameter naming a different database from the one the connection actually reaches cannot be left standing here`,
       }
     }
   }
 
-  const host = queryHost || authorityHost
-  const port = queryPort || authorityPort || '5432'
-  const user = queryUser || authorityUser
-  const lowered = String(host).toLowerCase()
-  const family = String(host).startsWith('/') || LOCAL_HOSTS.has(lowered) ? '(this host)' : lowered
-  return { ok: true, reason: '', host, port, user, database, server: `${family}:${port}` }
+  const host = String(driver.host ?? '')
+  // `ConnectionParameters` runs the port through `parseInt`, so a port that is not a number
+  // reaches the driver as NaN and the server this URL opens is unknown rather than defaulted.
+  if (!Number.isInteger(driver.port)) {
+    return {
+      ok: false,
+      reason: `resolves to the port ${JSON.stringify(String(driver.port))}, which node-postgres cannot read as a port number, so which server it reaches is unknown`,
+    }
+  }
+  const port = String(driver.port)
+  const user = String(driver.user ?? '')
+  return { ok: true, reason: '', host, port, user, database, server: serverOf(host, port) }
 }
 
 /**
  * Pure: may this run treat the connection it opened as the application's own database, opened as
  * the role it was meant to be opened as?
  *
- * `connectedDatabase` is `current_database()` read from that connection — the live half, and the
- * only one that can catch an admin URL whose path is empty. `connectedLoginRole` is `session_user`
- * and `connectedEffectiveRole` is `current_user`, read from the same connection: the role half of
- * the same question, asked of the connection rather than inferred from the URL. `adminUrl` is
- * compared only when it is set, because without it the connection IS the application's URL and
- * there are not two things to bind together.
+ * `app` is the identity the CALLER SUPPLIED on argv, and is never derived here (o3d-2sm1.5 r19).
+ * `connectedDatabase` is `current_database()` read from the open connection — the live half, and
+ * the only one that can catch an admin URL whose path is empty. `connectedLoginRole` is
+ * `session_user` and `connectedEffectiveRole` is `current_user`, read from the same connection:
+ * the role half of the same question, asked of the connection rather than inferred from a URL.
+ * `adminUrl` is compared only when it is set.
+ *
+ * @param {{ adminUrl?: string,
+ *           app?: { appHost?: string, appPort?: string, appUser?: string, appDatabase?: string } | null,
+ *           connectedDatabase?: string,
+ *           connectedLoginRole?: string,
+ *           connectedEffectiveRole?: string }} facts
+ * @returns {{ bound: boolean, reason: string }}
  */
 export function assessDatabaseIdentity({
   adminUrl = '',
-  appUrl = '',
+  app = null,
   connectedDatabase = '',
   connectedLoginRole = '',
   connectedEffectiveRole = '',
 }) {
-  const app = parseConnectionIdentity(appUrl)
-  if (!app.ok) {
+  const supplied = requireSuppliedIdentity(app ?? {})
+  if (!supplied.ok) {
     return {
       bound: false,
-      reason: `DATABASE_URL ${app.reason}, so there is nothing to prove this deploy's connection is the application's own database. Every question this script asks is asked of current_database() on the connection it opened, and without the application's URL that database is unidentified.`,
+      reason: `${supplied.reason}, so there is nothing to prove this run's connection is the application's own database.`,
     }
   }
-  if (!app.database) {
-    return {
-      bound: false,
-      reason: 'DATABASE_URL names no database in its path, so the database the application actually uses is unidentified and nothing can be bound to it.',
-    }
-  }
+  const identity = supplied.identity
+  const appServer = serverOf(identity.host, identity.port)
   if (adminUrl) {
     const admin = parseConnectionIdentity(adminUrl)
     if (!admin.ok) {
-      return { bound: false, reason: `DEPLOY_ADMIN_DATABASE_URL ${admin.reason}, so it cannot be shown to name the same database as DATABASE_URL.` }
+      return { bound: false, reason: `DEPLOY_ADMIN_DATABASE_URL ${admin.reason}, so it cannot be shown to reach the database this run was told the application uses.` }
     }
-    if (admin.database && admin.database !== app.database) {
+    if (admin.database && admin.database !== identity.database) {
       return {
         bound: false,
-        reason: `DEPLOY_ADMIN_DATABASE_URL names the database "${admin.database}" and DATABASE_URL names "${app.database}". Everything this script asks — including whether the application role can connect — would be asked of "${admin.database}", and answered about a database the application does not use.`,
+        reason: `DEPLOY_ADMIN_DATABASE_URL reaches the database "${admin.database}" and --app-database says "${identity.database}". Everything this script asks — including whether the application role can connect — would be asked of "${admin.database}", and answered about a database the application does not use.`,
       }
     }
-    if (admin.server !== app.server) {
+    if (admin.server !== appServer) {
       return {
         bound: false,
-        reason: `DEPLOY_ADMIN_DATABASE_URL points at ${admin.server} and DATABASE_URL at ${app.server}. A privilege read on one server says nothing about the other, so this is refused rather than assumed to be the same host under another name. Make both URLs name the same host and port.`,
+        reason: `DEPLOY_ADMIN_DATABASE_URL points at ${admin.server} and --app-host/--app-port say ${appServer}. A privilege read on one server says nothing about the other, so this is refused rather than assumed to be the same host under another name. Make the admin URL name the same host and port.`,
       }
     }
   }
@@ -412,10 +682,10 @@ export function assessDatabaseIdentity({
       reason: 'the open connection did not report which database it is attached to, so it cannot be shown to be the application\'s.',
     }
   }
-  if (connectedDatabase !== app.database) {
+  if (connectedDatabase !== identity.database) {
     return {
       bound: false,
-      reason: `the connection this run opened is attached to "${connectedDatabase}", and DATABASE_URL names "${app.database}". A connection string with no database in its path connects to the login role's default database, which is how these come apart without either URL looking wrong.`,
+      reason: `the connection this run opened is attached to "${connectedDatabase}", and --app-database says "${identity.database}". A connection string with no database in its path connects to PGDATABASE, or failing that to the login role's own name, which is how these come apart without the admin URL looking wrong.`,
     }
   }
   // THE ROLE HALF, ASKED OF THE CONNECTION (o3d-2sm1.5, Codex r14 CRITICAL). Everything below the
@@ -548,7 +818,7 @@ export function planConnectionFence(facts) {
   } = facts
 
   if (!appRole) {
-    return { fenceable: false, reason: 'DATABASE_URL carries no role name, so there is nothing to revoke CONNECT from.', revoke: [] }
+    return { fenceable: false, reason: '--app-user names no role, so there is nothing to revoke CONNECT from.', revoke: [] }
   }
   if (appRoleIsSuperuser) {
     return {
@@ -630,7 +900,7 @@ export function planConnectionFence(facts) {
  */
 export function assessMigrationRole({ adminRole, appRole, adminIsSuperuser, adminCanSetAppRole }) {
   if (!appRole) {
-    return { usable: false, reason: 'DATABASE_URL carries no role name, so the migration has no role to run as.' }
+    return { usable: false, reason: '--app-user names no role, so the migration has no role to run as.' }
   }
   if (adminIsSuperuser || adminCanSetAppRole) return { usable: true, reason: '' }
   return {
@@ -649,7 +919,8 @@ export function assessMigrationRole({ adminRole, appRole, adminIsSuperuser, admi
  * libpq splits `options` on spaces, so a space inside a role name is backslash-escaped; the
  * whole value is then percent-encoded, because `+` is NOT decoded as a space here and using
  * URLSearchParams would produce exactly that. An `options` already present is preserved and
- * appended to rather than overwritten.
+ * appended to rather than overwritten -- the EFFECTIVE one, which for a repeated parameter is the
+ * last, because that is the one the driver would have applied.
  *
  * IT THROWS RATHER THAN RETURNING THE INPUT (o3d-2sm1.5, Codex r5 MEDIUM). Returning the admin
  * URL unchanged on unparseable input produced a connection with NO `role=` at all — the
@@ -685,7 +956,12 @@ export function buildMigrationConnectionString(adminConnectionString, appRole) {
     )
   }
   const escaped = String(appRole).replace(/([\\ '])/g, '\\$1')
-  const existing = url.searchParams.get('options')
+  // The LAST `options=`, not the first (o3d-2sm1.5, Codex r15 CRITICAL, same shape). The driver
+  // copies every query entry into one config object, so a repeated `options=` resolves to the
+  // last; merging into the first would compose a URL that carries a startup setting the admin
+  // connection never had, and drop the one it did.
+  const allOptions = url.searchParams.getAll('options')
+  const existing = allOptions.length > 0 ? allOptions[allOptions.length - 1] : null
   const merged = existing ? `${existing} -c role=${escaped}` : `-c role=${escaped}`
   url.searchParams.delete('options')
   const query = url.searchParams.toString()
@@ -738,13 +1014,19 @@ export function verifyRelease(datacl, ownerRole, grantees) {
 // I/O
 // ---------------------------------------------------------------------------
 
-function parseArgs(argv) {
-  const options = { mode: '', stateFile: '', appRole: '', timeoutSeconds: 30 }
+export function parseArgs(argv) {
+  const options = { mode: '', stateFile: '', appRole: '', timeoutSeconds: 30, appHost: '', appPort: '', appUser: '', appDatabase: '' }
   for (const arg of argv) {
     if (arg === '--fence' || arg === '--release' || arg === '--preflight' || arg === '--print-migration-url') options.mode = arg.slice(2)
     else if (arg.startsWith('--state-file=')) options.stateFile = arg.slice('--state-file='.length)
     else if (arg.startsWith('--app-role=')) options.appRole = arg.slice('--app-role='.length)
     else if (arg.startsWith('--timeout-seconds=')) options.timeoutSeconds = Number(arg.slice('--timeout-seconds='.length))
+    // THE FOUR THIS RUN IS TOLD RATHER THAN WORKS OUT. Every mode needs them and every mode
+    // refuses without them; see requireSuppliedIdentity() and the section at the top of the file.
+    else if (arg.startsWith('--app-host=')) options.appHost = arg.slice('--app-host='.length)
+    else if (arg.startsWith('--app-port=')) options.appPort = arg.slice('--app-port='.length)
+    else if (arg.startsWith('--app-user=')) options.appUser = arg.slice('--app-user='.length)
+    else if (arg.startsWith('--app-database=')) options.appDatabase = arg.slice('--app-database='.length)
   }
   return options
 }
@@ -879,6 +1161,11 @@ export function publishState(stateFile, state) {
 async function readFacts(client, appRole) {
   const { rows } = await client.query(
     `SELECT current_database()                                  AS database,
+            -- THE POSTMASTER THIS CONNECTION IS ON (o3d-2sm1.5 r19). One stamp per cluster, to
+            -- the microsecond, identical on every backend of it. --release compares it with the
+            -- application probe's, so "the application can connect" is an answer about THIS
+            -- cluster and not about a same-named database on another one.
+            pg_postmaster_start_time()::text                    AS postmaster,
             current_user                                        AS admin_role,
             -- THE ROLE THIS CONNECTION LOGGED IN AS, which is not necessarily current_user and is
             -- not necessarily the URL's username either (o3d-2sm1.5, Codex r14 CRITICAL). CONNECT
@@ -989,21 +1276,21 @@ function requireAdminUrl(what) {
  * Printed as a refusal rather than returned, because there is exactly one thing to do with a
  * "not proven" here and every caller does it.
  */
-function requireBoundDatabaseIdentity(attachment, prefix) {
+function requireBoundDatabaseIdentity(attachment, prefix, options) {
   const verdict = assessDatabaseIdentity({
     adminUrl: process.env.DEPLOY_ADMIN_DATABASE_URL || '',
-    appUrl: process.env.DATABASE_URL || '',
+    app: options,
     connectedDatabase: attachment.database ?? '',
     connectedLoginRole: attachment.loginRole ?? '',
     connectedEffectiveRole: attachment.effectiveRole ?? '',
   })
   if (verdict.bound) return true
   console.error(`${prefix}: ${verdict.reason}`)
-  console.error('This run cannot show that the database it is connected to is the one the application uses,')
-  console.error('and that it is attached to it as the role it believes it is. Every answer it could give —')
-  console.error('"the fence took", "the application can connect" — would be about whichever database it')
-  console.error('reached, as whichever role it reached it as. Align DEPLOY_ADMIN_DATABASE_URL and DATABASE_URL')
-  console.error('on the same host, port and database name, with a role each URL states plainly, and re-run.')
+  console.error('This run cannot show that the database it is connected to is the one it was TOLD the')
+  console.error('application uses, and that it is attached to it as the role it believes it is. Every answer')
+  console.error('it could give — "the fence took", "the application can connect" — would be about whichever')
+  console.error('database it reached, as whichever role it reached it as. Point DEPLOY_ADMIN_DATABASE_URL at')
+  console.error('the host, port and database the --app-* options name, and re-run.')
   return false
 }
 
@@ -1020,19 +1307,35 @@ function attachmentOf(facts) {
  * database. This opens DATABASE_URL itself and reports whether it got in and where it landed, so
  * "the application can connect" is an observation of the application connecting.
  *
+ * DATABASE_URL IS A CREDENTIAL HERE AND NOTHING ELSE (o3d-2sm1.5 r19). Nothing is derived from
+ * this string — not the role, not the host, not the port, not the database name. It is opened,
+ * and then the connection is asked WHERE IT WENT: `current_database()`, and
+ * `pg_postmaster_start_time()`, which is the same microsecond stamp on every backend of one
+ * postmaster and a different one on any other. The caller compares both against the connection
+ * this run already holds, so a DATABASE_URL that resolves — through PGHOST, a dotenv overlay or
+ * anything else — to a same-named database on another cluster is caught rather than believed.
+ *
  * Never throws: a refused connection is the answer, not an error.
  */
 export async function probeApplicationConnection(connectionString) {
   if (!connectionString) {
-    return { attempted: false, connected: false, database: '', error: 'DATABASE_URL is not set, so there is no application connection to test.' }
+    return { attempted: false, connected: false, database: '', postmaster: '', error: 'DATABASE_URL is not set, so there is no application connection to test.' }
   }
   const probe = new pg.Client({ connectionString, application_name: 'ims-deploy-fence-app-probe' })
   try {
     await probe.connect()
-    const { rows } = await probe.query('SELECT current_database() AS connected_database')
-    return { attempted: true, connected: true, database: rows[0]?.connected_database ?? '', error: '' }
+    const { rows } = await probe.query(
+      'SELECT current_database() AS connected_database, pg_postmaster_start_time()::text AS postmaster',
+    )
+    return {
+      attempted: true,
+      connected: true,
+      database: rows[0]?.connected_database ?? '',
+      postmaster: rows[0]?.postmaster ?? '',
+      error: '',
+    }
   } catch (error) {
-    return { attempted: true, connected: false, database: '', error: error instanceof Error ? error.message : String(error) }
+    return { attempted: true, connected: false, database: '', postmaster: '', error: error instanceof Error ? error.message : String(error) }
   } finally {
     await probe.end().catch(() => {})
   }
@@ -1051,16 +1354,16 @@ export async function probeApplicationConnection(connectionString) {
  * kills the preflight instead, while the predecessor is still up.
  */
 async function doPreflight(client, options) {
-  const appRole = options.appRole || parseRoleFromConnectionString(process.env.DATABASE_URL)
+  const appRole = options.appRole || options.appUser
   const { facts, plan, role } = await assessFence(client, appRole)
 
   // THE SAME QUESTIONS ARE ONLY THE SAME QUESTIONS IF THEY ARE ASKED OF THE SAME DATABASE.
   // Asked here as well as in --fence for the reason this whole mode exists: a preflight that
   // skips a check --fence performs is a preflight that passes and then fails after the stop.
-  if (!requireBoundDatabaseIdentity(attachmentOf(facts), 'NOT FENCEABLE')) return EXIT_NOT_FENCEABLE
+  if (!requireBoundDatabaseIdentity(attachmentOf(facts), 'NOT FENCEABLE', options)) return EXIT_NOT_FENCEABLE
 
   if (appRole && !facts.app_role_exists) {
-    console.error(`NOT FENCED: the role ${appRole} from DATABASE_URL does not exist on this server.`)
+    console.error(`NOT FENCED: the role ${appRole} named by --app-user does not exist on this server.`)
     return EXIT_NOT_FENCEABLE
   }
   if (!plan.fenceable) {
@@ -1107,17 +1410,17 @@ export async function doFence(client, options) {
     return EXIT_NOT_FENCEABLE
   }
 
-  const appRole = options.appRole || parseRoleFromConnectionString(process.env.DATABASE_URL)
+  const appRole = options.appRole || options.appUser
   const { facts, plan: freshPlan, role } = await assessFence(client, appRole)
 
   // BEFORE ANYTHING IS REVOKED (o3d-2sm1.5, Codex r13 CRITICAL). A fence raised on a database
   // that is not the application's locks other people's clients out of somewhere else while the
   // application keeps writing across the migration, and every verification below — the ACL read,
   // the effective-CONNECT check, the drain — would be a truthful report about the wrong database.
-  if (!requireBoundDatabaseIdentity(attachmentOf(facts), 'NOT FENCED')) return EXIT_NOT_FENCEABLE
+  if (!requireBoundDatabaseIdentity(attachmentOf(facts), 'NOT FENCED', options)) return EXIT_NOT_FENCEABLE
 
   if (appRole && !facts.app_role_exists) {
-    console.error(`NOT FENCED: the role ${appRole} from DATABASE_URL does not exist on this server.`)
+    console.error(`NOT FENCED: the role ${appRole} named by --app-user does not exist on this server.`)
     return EXIT_NOT_FENCEABLE
   }
 
@@ -1143,6 +1446,25 @@ export async function doFence(client, options) {
     return EXIT_NOT_FENCEABLE
   }
   const existing = read.status === STATE_PRESENT ? read.state : null
+
+  // AND A RECORD FOR ANOTHER DATABASE IS NOT THIS DATABASE'S RECORD (o3d-2sm1.5 r30, Codex
+  // CRITICAL). `--release` has asked this since it was written; `--fence` did not, and the
+  // re-apply path is where it matters most. Re-applying an existing state means reusing the
+  // grantee list that state recorded — the set of roles a fence on THAT database took CONNECT
+  // from — so if this connection is attached somewhere else, the revokes land on roles chosen
+  // for a different ACL, the appended record claims that database as fenced, and the fence the
+  // record was actually written for is left standing with nothing tracking it. That is exactly
+  // the shape a substituted DATABASE_URL produces, and it is refused here even when the caller
+  // above was fooled.
+  if (existing && existing.database && existing.database !== facts.database) {
+    console.error(`NOT FENCED: the fence record at ${options.stateFile} was written for the database "${existing.database}",`)
+    console.error(`but this connection is attached to "${facts.database}". The grantees it lists lost CONNECT on`)
+    console.error(`"${existing.database}", and re-applying them here would revoke CONNECT on a database that fence was`)
+    console.error(`never raised on while leaving "${existing.database}" fenced with nothing recording it.`)
+    console.error('Nothing has been revoked. Point this run at the database the record names, or release that fence first.')
+    return EXIT_NOT_FENCEABLE
+  }
+
   const plan = existing ? { fenceable: true, reason: '', revoke: existing.revoked } : freshPlan
 
   if (!plan.fenceable) {
@@ -1365,8 +1687,9 @@ async function completeFence(client, options, { facts, plan, grants, appRole, re
  *   appRole: string,
  *   stateFile?: string,
  *   appStillConnects: boolean,
- *   appConnection?: { attempted: boolean, connected: boolean, database: string, error: string } | null,
+ *   appConnection?: { attempted: boolean, connected: boolean, database: string, postmaster?: string, error: string } | null,
  *   connectedDatabase?: string,
+ *   connectedPostmaster?: string,
  * }} facts
  */
 export function assessUnrecordedRelease({
@@ -1377,6 +1700,7 @@ export function assessUnrecordedRelease({
   appStillConnects,
   appConnection = null,
   connectedDatabase = '',
+  connectedPostmaster = '',
 }) {
   const where = stateFile || '<no --state-file was given>'
   const what = `${status}${detail ? `: ${detail}` : ''}`
@@ -1386,7 +1710,7 @@ export function assessUnrecordedRelease({
       fenceProvenAbsent: false,
       lines: [
         `No usable connection-fence record (${what}) at ${where}, and no application role to ask about:`,
-        'DATABASE_URL carries no role name and --app-role was not given.',
+        '--app-user names no role and --app-role was not given.',
         'Refusing to report "nothing to release": absence of a record is not absence of a fence, and',
         'without a role there is nothing to prove the database is open to. Pass --app-role=<role> and re-run.',
       ],
@@ -1414,6 +1738,29 @@ export function assessUnrecordedRelease({
           'Refusing to report anything but a failure. Fix the connection or restore CONNECT by hand:',
           '  SELECT datacl FROM pg_database WHERE datname = current_database();',
           `  GRANT CONNECT ON DATABASE <the application's database> TO ${appRole};`,
+        ],
+      }
+    }
+    // AND THE SAME CLUSTER, NOT ONLY THE SAME DATABASE NAME (o3d-2sm1.5 r19). A database name is
+    // not an identity: `imsdb` exists on the staging server too. Nothing here works out where
+    // DATABASE_URL resolves to any more — the connection is asked instead, and
+    // `pg_postmaster_start_time()` is the same microsecond stamp on every backend of one
+    // postmaster and a different one on any other. Refused rather than resolved: a probe that
+    // reached another cluster proves nothing about this one, and the caller is about to start an
+    // application on the strength of it.
+    if (connectedPostmaster && appConnection.postmaster && appConnection.postmaster !== connectedPostmaster) {
+      return {
+        exitCode: EXIT_ERROR,
+        fenceProvenAbsent: false,
+        appRoleConnects: true,
+        lines: [
+          `No usable connection-fence record (${what}) at ${where}, AND THE TWO CONNECTIONS ARE NOT THE SAME SERVER.`,
+          `This run is on the postmaster started ${connectedPostmaster}; DATABASE_URL reached the one started ${appConnection.postmaster}.`,
+          `They may both hold a database called "${connectedDatabase || appConnection.database}", but a privilege read,`,
+          'an ACL and a fence on one of them say nothing whatever about the other. Nothing here can speak',
+          'for the database the application actually uses.',
+          'Point DEPLOY_ADMIN_DATABASE_URL and the --app-host/--app-port options at the same server as',
+          'DATABASE_URL and re-run before this database is treated as open.',
         ],
       }
     }
@@ -1477,8 +1824,8 @@ export function assessUnrecordedRelease({
  * The branch taken when the record cannot answer. Asks the database, which is where the
  * durable half of the fence lives, and reports what it can actually prove.
  */
-async function releaseWithoutRecord(client, options, read, connectedDatabase = '') {
-  const appRole = options.appRole || parseRoleFromConnectionString(process.env.DATABASE_URL)
+async function releaseWithoutRecord(client, options, read, connectedDatabase = '', connectedPostmaster = '') {
+  const appRole = options.appRole || options.appUser
   const effective = appRole ? await readEffectiveConnect(client, appRole) : { stillConnects: false }
   // Only when the privilege read says the application is back inside: that claim is the one this
   // run would let a caller act on, so it is the one that has to be observed rather than inferred.
@@ -1494,6 +1841,7 @@ async function releaseWithoutRecord(client, options, read, connectedDatabase = '
     appStillConnects: effective.stillConnects,
     appConnection,
     connectedDatabase,
+    connectedPostmaster,
   })
   for (const line of verdict.lines) (verdict.exitCode === EXIT_OK ? console.log : console.error)(line)
   return verdict.exitCode
@@ -1505,21 +1853,23 @@ export async function doRelease(client, options) {
   // somebody else's or — worse, because it is silent — reports the application free while the
   // real database still refuses it.
   const { rows: attachment } = await client.query(
-    `SELECT current_database() AS connected_database,
-            session_user        AS connected_login_role,
-            current_user        AS connected_effective_role`,
+    `SELECT current_database()               AS connected_database,
+            session_user                     AS connected_login_role,
+            current_user                     AS connected_effective_role,
+            pg_postmaster_start_time()::text AS connected_postmaster`,
   )
   const connectedDatabase = attachment[0]?.connected_database ?? ''
+  const connectedPostmaster = attachment[0]?.connected_postmaster ?? ''
   const released = {
     database: connectedDatabase,
     loginRole: attachment[0]?.connected_login_role ?? '',
     effectiveRole: attachment[0]?.connected_effective_role ?? '',
   }
-  if (!requireBoundDatabaseIdentity(released, 'NOT RELEASED')) return EXIT_ERROR
+  if (!requireBoundDatabaseIdentity(released, 'NOT RELEASED', options)) return EXIT_ERROR
 
   const read = options.stateFile ? readState(options.stateFile) : { status: STATE_ABSENT, detail: 'no --state-file was given' }
   if (read.status !== STATE_PRESENT) {
-    return releaseWithoutRecord(client, options, read, connectedDatabase)
+    return releaseWithoutRecord(client, options, read, connectedDatabase, connectedPostmaster)
   }
   const state = read.state
 
@@ -1557,15 +1907,51 @@ export async function doRelease(client, options) {
 }
 
 async function main() {
-  loadDotenv({ path: '.env.local', override: false, quiet: true })
-  loadDotenv({ path: '.env', override: false, quiet: true })
-
+  // THIS RUN READS NO FILE OUT OF THE APPLICATION DIRECTORY (o3d-2sm1.5 r32, Codex CRITICAL).
+  //
+  // It used to load `<app dir>/.env` through `dotenv`, resolved from this file's own location, so
+  // that the `--release` command the callers PRINT would pick up DEPLOY_ADMIN_DATABASE_URL from
+  // wherever an operator was standing (Codex r17 HIGH, and r18 dropped `.env.local` from that
+  // load). Both of those were right about the problem and are now solved somewhere better:
+  //
+  //   * the file this executes from is the ROOT-OWNED MIRROR, and `<mirror>/.env` does not exist,
+  //     so the load supplied nothing on the only path that runs — it was dead code holding a
+  //     package open in the import graph;
+  //   * the printed command is no longer a command line at all. It is a root-owned wrapper
+  //     (${DB_FENCE_RELEASE_WRAPPER}) generated at fence time, which reads that same `.env` with
+  //     the same one-key reader the entrypoints use and passes the value in through `env`.
+  //
+  // So credentials arrive in the ENVIRONMENT — DEPLOY_ADMIN_DATABASE_URL, and DIRECT_URL /
+  // DATABASE_URL for `--release` — and a run that is given none refuses and says so. Identity was
+  // already argv-only (see the section at the top), and every claim about the connection that is
+  // opened is proven against the connection itself (assessDatabaseIdentity, and the postmaster
+  // stamp in --release).
   const options = parseArgs(process.argv.slice(2))
   const modes = ['fence', 'release', 'preflight', 'print-migration-url']
   if (!modes.includes(options.mode)) {
-    console.error('Usage: node scripts/fence-db-connections.mjs (--preflight|--fence|--release|--print-migration-url) [--state-file=PATH] [--app-role=ROLE] [--timeout-seconds=N]')
+    console.error('Usage: node scripts/fence-db-connections.mjs (--preflight|--fence|--release|--print-migration-url) --app-host=HOST --app-port=PORT --app-user=ROLE --app-database=NAME [--state-file=PATH] [--app-role=ROLE] [--timeout-seconds=N]')
     process.exit(EXIT_ERROR)
   }
+
+  // BEFORE ANYTHING IS CONNECTED, FENCED, RELEASED OR PRINTED. Every mode of this script answers
+  // a question ABOUT THE APPLICATION'S CONNECTION, and this run is not the application: it does
+  // not share its environment, its dotenv overlay, its systemd unit or its working directory.
+  // Seven rounds of deriving that connection from here each produced a locally correct answer and
+  // another layer beneath it, so the four values are now REQUIRED rather than resolved — see the
+  // section at the top of the file for who supplies them and how they know.
+  //
+  // ON STDERR, NOT STDOUT. `--print-migration-url` writes the URL the deploy captures with
+  // `MIGRATION_DATABASE_URL="$(... --print-migration-url)"`, so stdout is a machine-readable
+  // channel and a diagnostic line on it is a corrupt connection string.
+  const supplied = requireSuppliedIdentity(options)
+  if (!supplied.ok) {
+    console.error(`The application's connection identity was not supplied: ${supplied.reason}.`)
+    console.error('Refusing to act on a connection this run has not been told the identity of.')
+    process.exit(options.mode === 'fence' || options.mode === 'preflight' ? EXIT_NOT_FENCEABLE : EXIT_ERROR)
+  }
+  console.error(
+    `The application connects to ${supplied.identity.database} at ${supplied.identity.host}:${supplied.identity.port} as ${supplied.identity.user}, as supplied by the caller. Nothing here infers it.`,
+  )
 
   // Opens no connection: it is pure string work over two environment variables, and the
   // caller needs it BEFORE the migration runs, from a shell that cannot parse a URL safely.
@@ -1574,9 +1960,9 @@ async function main() {
       console.error('DEPLOY_ADMIN_DATABASE_URL is not set — there is no privileged connection to compose a migration URL from.')
       process.exit(EXIT_ERROR)
     }
-    const appRole = options.appRole || parseRoleFromConnectionString(process.env.DATABASE_URL)
+    const appRole = options.appRole || options.appUser
     if (!appRole) {
-      console.error('DATABASE_URL carries no role name, so the migration has no role to run as. Refusing to emit a URL that would create objects owned by the admin.')
+      console.error('--app-user names no role, so the migration has no role to run as. Refusing to emit a URL that would create objects owned by the admin.')
       process.exit(EXIT_ERROR)
     }
     process.stdout.write(`${buildMigrationConnectionString(process.env.DEPLOY_ADMIN_DATABASE_URL, appRole)}\n`)

@@ -67,8 +67,16 @@ export async function GET(request: Request) {
     // QuickBooks external id is only meaningful inside one realm — after a reconnect to a different
     // company it would write a retired realm's id onto a live document, which the payment poller
     // then acts on as if it were current. Failing to repair is acceptable; repairing onto the wrong
-    // document is not. Precondition for binding it: o3d-s36z (connector-tenant isolation). See the
-    // note at the end of lib/connectors/quickbooks/sync-processor.ts.
+    // document is not.
+    //
+    // THE PRECONDITION THIS LINE USED TO NAME IS THE WRONG ONE (o3d-0bfh r6, Codex MEDIUM). It said
+    // o3d-s36z (connector-tenant isolation); that CLOSED on 2026-08-21, a row's realm IS recorded
+    // now, and a maintainer following this line would have found the condition satisfied and made
+    // the one-line binding — re-enqueueing a realm-local integer against the wrong company. The real
+    // prerequisites are POST-TIME AUTHORIZATION (o3d-8prh: this connector does not carry the
+    // connection verdict to the last statement before the socket) and ORIGIN PROPAGATION (the
+    // follow-up rows a sweep creates here record no connectionProvenance for that check to read).
+    // The order of work is at the end of lib/connectors/quickbooks/sync-processor.ts.
     return NextResponse.json({ ...result, landedCostJournalOutbox })
   }
 

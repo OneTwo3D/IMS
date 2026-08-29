@@ -14,7 +14,7 @@ import { saveView, type SavedView } from '@/app/actions/sales-stats'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { formatMoney } from '@/lib/utils'
-import { filterAndSortRows } from '@/lib/analytics/table-filter-sort'
+import { filterAndSortRows, presentColumns, presentColumnKeys, sanitiseSavedView, resolveSavedViewTab, ownedSavedViews, foreignSavedViewNotice } from '@/lib/analytics/table-filter-sort'
 
 type Tab = 'onhand' | 'movements' | 'allocations' | 'reorder'
 type FilterRule = { id: string; field: string; operator: string; value: string }
@@ -37,6 +37,23 @@ const TABS: { key: Tab; label: string }[] = [
 ]
 
 function makeId() { return Math.random().toString(36).slice(2, 8) }
+
+/**
+ * o3d-8u4h round 2: what a saved view could not bring with it, said out loud.
+ *
+ * A view saved before a column was renamed still names the old key, and a FILTER on a since-renamed
+ * field rejects every row — so the operator used to get an empty report and no reason for it.
+ */
+function SavedViewNotice({ notice, onDismiss }: { notice: string; onDismiss: () => void }) {
+  return (
+    <div data-saved-view-notice="true" className="flex items-start gap-2 rounded-md border border-orange-300 bg-orange-50 dark:bg-orange-950/20 px-3 py-2 text-xs text-orange-900 dark:text-orange-200">
+      <span className="flex-1">{notice}</span>
+      <button type="button" onClick={onDismiss} className="shrink-0 text-orange-900/60 dark:text-orange-200/60 hover:text-orange-900 dark:hover:text-orange-200" aria-label="Dismiss">
+        <X className="h-3 w-3" />
+      </button>
+    </div>
+  )
+}
 
 // ---------------------------------------------------------------------------
 // Field definitions per tab
@@ -98,6 +115,15 @@ const TAB_FIELDS: Record<Tab, FieldDef[]> = {
   allocations: ALLOCATION_FIELDS,
   reorder: REORDER_FIELDS,
 }
+
+/**
+ * o3d-8u4h round 3: the tabs THIS page owns, and the prefix its own saved views are stored under.
+ * Derived from TAB_FIELDS so a retired tab cannot leave the ownership test out of date — and the
+ * membership test matters on top of the prefix, because `inv_<retired tab>` passes `startsWith`
+ * and still indexes TAB_FIELDS with a key that is not there.
+ */
+const TAB_KEYS = Object.keys(TAB_FIELDS) as Tab[]
+const SAVED_VIEW_TAB_PREFIX = 'inv_'
 
 const DEFAULT_COLS: Record<Tab, string[]> = {
   onhand: ['sku', 'name', 'type', 'barcode', 'mpn', 'warehouseCode', 'quantity', 'reservedQty', 'available', 'inventoryValue', 'stockUnit'],
@@ -193,9 +219,12 @@ export function InventoryStatsClient({ stockOnHand, movements, allocations, reor
   const [visibleColsMap, setVisibleColsMap] = useState<Record<Tab, string[]>>({ ...DEFAULT_COLS })
   const [showFilter, setShowFilter] = useState(false); const [showColPicker, setShowColPicker] = useState(false); const [showSaveView, setShowSaveView] = useState(false)
   const [sortCol, setSortCol] = useState<string | null>('sku'); const [sortDir, setSortDir] = useState<SortDir>('asc')
+  const [viewNotice, setViewNotice] = useState<string | null>(null)
 
   const fields = TAB_FIELDS[tab]
   const visibleCols = visibleColsMap[tab]
+  // The saved views this page can actually load — the picker offers no other (o3d-8u4h round 3).
+  const ownViews = ownedSavedViews(savedViews, SAVED_VIEW_TAB_PREFIX, TAB_KEYS)
 
   function setVisibleCols(cols: string[]) {
     setVisibleColsMap((prev) => ({ ...prev, [tab]: cols }))
@@ -204,14 +233,30 @@ export function InventoryStatsClient({ stockOnHand, movements, allocations, reor
   function handleSort(key: string) { if (sortCol === key) setSortDir((d) => d === 'asc' ? 'desc' : 'asc'); else { setSortCol(key); setSortDir('asc') } }
 
   function handleTabChange(t: Tab) {
-    setTab(t); setFilterRules([]); setSortCol(null)
+    setTab(t); setFilterRules([]); setSortCol(null); setViewNotice(null)
   }
 
+  // o3d-8u4h round 2: sanitised on the way in — COLUMNS AND FILTERS ALIKE. A rule on a field these
+  // rows no longer carry reads as an unknown for every row, and an unknown answers no numeric
+  // comparison, so the rule rejects every row and the operator sees an unexplained empty report.
   function loadView(v: SavedView) {
-    const t = v.tab.replace('inv_', '') as Tab
+    // o3d-8u4h round 3: RESOLVED, NOT STRIPPED — see the sales client. `replace('inv_', '')`
+    // answers a key for any string, including one this page has no TAB_FIELDS entry for, and the
+    // crash then happens inside sanitiseSavedView rather than anywhere near the bad key.
+    const t = resolveSavedViewTab(v.tab, SAVED_VIEW_TAB_PREFIX, TAB_KEYS)
+    if (t === null) { setViewNotice(foreignSavedViewNotice(v.name, v.tab)); return }
+    const clean = sanitiseSavedView({ name: v.name, columns: v.columns, filters: v.filters }, TAB_FIELDS[t])
     setTab(t)
+    // COLUMNS ARE PUT INTO STATE VERBATIM, AND FILTERED AT EVERY RENDER PATH INSTEAD. Deliberate,
+    // and the reason is that there must be exactly ONE rule about a key this tab cannot render.
+    // Sanitising here as well would make the per-render-path filters unreachable — dead guards that
+    // no test can exercise and the next reviewer has to take on trust — while the render paths are
+    // where the invariant actually lives: header, body and totals row must read the SAME list. The
+    // notice below still names the columns that will not appear, so the reader is told either way.
     setVisibleColsMap((prev) => ({ ...prev, [t]: v.columns }))
-    setFilterRules(v.filters.map((f) => ({ ...f, id: makeId() })))
+    setFilterRules(clean.filters.map((f) => ({ ...f, id: makeId() })))
+    setSortCol(null)
+    setViewNotice(clean.notice)
   }
 
   function SortIcon({ col }: { col: string }) { return sortCol === col ? (sortDir === 'asc' ? <ArrowUp className="h-3 w-3 inline" /> : <ArrowDown className="h-3 w-3 inline" />) : null }
@@ -318,9 +363,11 @@ export function InventoryStatsClient({ stockOnHand, movements, allocations, reor
         <div className="flex items-center gap-1 overflow-x-auto overflow-y-hidden">
           {TABS.map((t) => (<button key={t.key} type="button" className={`shrink-0 px-3 sm:px-4 py-2 text-sm font-medium border-b-2 transition-colors -mb-px ${tab === t.key ? 'border-primary text-primary' : 'border-transparent text-muted-foreground hover:text-foreground'}`} onClick={() => handleTabChange(t.key)}>{t.label}</button>))}
           <div className="ml-auto flex shrink-0 items-center gap-1.5 pb-1 pl-2">
-            {savedViews.filter((v) => v.tab.startsWith('inv_')).length > 0 && (
+            {/* The `find` searches the FULL list on purpose: an id this page does not own must
+                reach loadView and be refused there with a sentence, not silently ignored. */}
+            {ownViews.length > 0 && (
               <select onChange={(e) => { const v = savedViews.find((sv) => sv.id === e.target.value); if (v) loadView(v); e.target.value = '' }} className="h-7 rounded-md border border-input bg-background px-2 text-xs" defaultValue="">
-                <option value="" disabled>Saved Views…</option>{savedViews.filter((v) => v.tab.startsWith('inv_')).map((v) => <option key={v.id} value={v.id}>{v.name}</option>)}</select>
+                <option value="" disabled>Saved Views…</option>{ownViews.map((v) => <option key={v.id} value={v.id}>{v.name}</option>)}</select>
             )}
             <Button variant={filterRules.length > 0 ? 'default' : 'outline'} size="sm" className="h-7 text-xs" onClick={() => setShowFilter(true)}><Filter className="h-3 w-3 mr-0.5" />Filter{filterRules.length > 0 ? ` (${filterRules.length})` : ''}</Button>
             <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => setShowColPicker(true)}><Settings2 className="h-3 w-3 mr-0.5" />Columns</Button>
@@ -330,101 +377,118 @@ export function InventoryStatsClient({ stockOnHand, movements, allocations, reor
         </div>
       </div>
 
-      {/* Stock on Hand */}
-      {tab === 'onhand' && (
+      {viewNotice && <SavedViewNotice notice={viewNotice} onDismiss={() => setViewNotice(null)} />}
+
+      {/* Stock on Hand. o3d-8u4h round 2: filtered ONCE, before all three loops — header and body
+          already skipped a key the renderer map has no entry for, but the FOOTER emitted a <td> for
+          it unconditionally, so a stale saved key shifted the totals row against the table. */}
+      {tab === 'onhand' && (() => {
+        const cols = presentColumnKeys(visibleCols, Object.keys(onhandColR))
+        return (
         <div className="rounded-md border">
           <div className="px-3 py-1.5 bg-muted/30 border-b text-xs text-muted-foreground">{filteredOnHand.length} of {stockOnHand.length} rows</div>
           <Table className="min-w-[700px]" containerClassName="max-h-[calc(100vh-22rem)]">
             <TableHeader className="bg-muted/50">
               <TableRow>
-                {visibleCols.map((k) => { const c = onhandColR[k]; return c ? <TH key={k} col={k} right={c.align === 'right'}>{c.label}</TH> : null })}
+                {cols.map((k) => { const c = onhandColR[k]; return <TH key={k} col={k} right={c.align === 'right'}>{c.label}</TH> })}
               </TableRow>
             </TableHeader>
             <TableBody className="divide-y">
               {filteredOnHand.map((r) => (
                 <TableRow key={`${r.productId}-${r.warehouseCode}`}>
-                  {visibleCols.map((k) => { const c = onhandColR[k]; return c ? <TableCell key={k} className={c.align === 'right' ? 'text-right' : ''}>{c.render(r)}</TableCell> : null })}
+                  {cols.map((k) => { const c = onhandColR[k]; return <TableCell key={k} className={c.align === 'right' ? 'text-right' : ''}>{c.render(r)}</TableCell> })}
                 </TableRow>
               ))}
             </TableBody>
             <tfoot className="border-t bg-muted/30 font-medium text-sm">
               <tr>
-                {visibleCols.map((k) => { const c = onhandColR[k]; return <td key={k} className={`px-3 py-2 ${c?.align === 'right' ? 'text-right' : ''}`}>{c?.footer?.() ?? ''}</td> })}
+                {cols.map((k) => { const c = onhandColR[k]; return <td key={k} className={`px-3 py-2 ${c.align === 'right' ? 'text-right' : ''}`}>{c.footer?.() ?? ''}</td> })}
               </tr>
             </tfoot>
           </Table>
         </div>
-      )}
+        )
+      })()}
 
       {/* Stock Movements */}
-      {tab === 'movements' && (
+      {tab === 'movements' && (() => {
+        const cols = presentColumns(visibleCols, TAB_FIELDS['movements'])
+        return (
         <div className="rounded-md border">
           <div className="px-3 py-1.5 bg-muted/30 border-b text-xs text-muted-foreground">{filteredMovements.length} of {movements.length} rows</div>
           <Table className="min-w-[700px]" containerClassName="max-h-[calc(100vh-22rem)]">
             <TableHeader className="bg-muted/50">
               <TableRow>
-                {visibleCols.map((k) => <TH key={k} col={k} right={fieldAlign(k) === 'right'}>{fieldLabel(k)}</TH>)}
+                {cols.map((k) => <TH key={k} col={k} right={fieldAlign(k) === 'right'}>{fieldLabel(k)}</TH>)}
               </TableRow>
             </TableHeader>
             <TableBody className="divide-y">
               {filteredMovements.map((m) => (
                 <TableRow key={m.id}>
-                  {visibleCols.map((k) => <TableCell key={k} className={fieldAlign(k) === 'right' ? 'text-right' : ''}>{renderCell(m, k, 'movements')}</TableCell>)}
+                  {cols.map((k) => <TableCell key={k} className={fieldAlign(k) === 'right' ? 'text-right' : ''}>{renderCell(m, k, 'movements')}</TableCell>)}
                 </TableRow>
               ))}
             </TableBody>
           </Table>
           {movements.length === 0 && <p className="text-center text-sm text-muted-foreground py-8">No movements found.</p>}
         </div>
-      )}
+        )
+      })()}
 
       {/* Allocations */}
-      {tab === 'allocations' && (
+      {tab === 'allocations' && (() => {
+        const cols = presentColumns(visibleCols, TAB_FIELDS['allocations'])
+        return (
         <div className="rounded-md border">
           <div className="px-3 py-1.5 bg-muted/30 border-b text-xs text-muted-foreground">{filteredAllocations.length} of {allocations.length} rows</div>
           <Table className="min-w-[700px]" containerClassName="max-h-[calc(100vh-22rem)]">
             <TableHeader className="bg-muted/50">
               <TableRow>
-                {visibleCols.map((k) => <TH key={k} col={k} right={fieldAlign(k) === 'right'}>{fieldLabel(k)}</TH>)}
+                {cols.map((k) => <TH key={k} col={k} right={fieldAlign(k) === 'right'}>{fieldLabel(k)}</TH>)}
               </TableRow>
             </TableHeader>
             <TableBody className="divide-y">
               {filteredAllocations.map((a) => (
                 <TableRow key={`${a.productId}-${a.warehouseCode}`}>
-                  {visibleCols.map((k) => <TableCell key={k} className={fieldAlign(k) === 'right' ? 'text-right' : ''}>{renderCell(a, k, 'allocations')}</TableCell>)}
+                  {cols.map((k) => <TableCell key={k} className={fieldAlign(k) === 'right' ? 'text-right' : ''}>{renderCell(a, k, 'allocations')}</TableCell>)}
                 </TableRow>
               ))}
             </TableBody>
           </Table>
           {allocations.length === 0 && <p className="text-center text-sm text-muted-foreground py-8">No allocations found.</p>}
         </div>
-      )}
+        )
+      })()}
 
       {/* Reorder */}
-      {tab === 'reorder' && (
+      {tab === 'reorder' && (() => {
+        const cols = presentColumns(visibleCols, TAB_FIELDS['reorder'])
+        return (
         <div className="rounded-md border">
           <div className="px-3 py-1.5 bg-muted/30 border-b text-xs text-muted-foreground">{filteredReorder.length} of {reorder.length} rows</div>
           <Table className="min-w-[700px]" containerClassName="max-h-[calc(100vh-22rem)]">
             <TableHeader className="bg-muted/50">
               <TableRow>
-                {visibleCols.map((k) => <TH key={k} col={k} right={fieldAlign(k) === 'right'}>{fieldLabel(k)}</TH>)}
+                {cols.map((k) => <TH key={k} col={k} right={fieldAlign(k) === 'right'}>{fieldLabel(k)}</TH>)}
               </TableRow>
             </TableHeader>
             <TableBody className="divide-y">
               {filteredReorder.map((r) => (
                 <TableRow key={r.productId} className={r.availableStock <= 0 ? 'bg-red-50 dark:bg-red-950/20' : ''}>
-                  {visibleCols.map((k) => <TableCell key={k} className={fieldAlign(k) === 'right' ? 'text-right' : ''}>{renderCell(r, k, 'reorder')}</TableCell>)}
+                  {cols.map((k) => <TableCell key={k} className={fieldAlign(k) === 'right' ? 'text-right' : ''}>{renderCell(r, k, 'reorder')}</TableCell>)}
                 </TableRow>
               ))}
             </TableBody>
           </Table>
           {reorder.length === 0 && <p className="text-center text-sm text-muted-foreground py-8">All products above reorder point.</p>}
         </div>
-      )}
+        )
+      })()}
 
       {showFilter && <FilterDialog fields={fields} rules={filterRules} onApply={setFilterRules} onClose={() => setShowFilter(false)} />}
       {showColPicker && <ColumnPickerDialog fields={fields} visible={visibleCols} onApply={setVisibleCols} onClose={() => setShowColPicker(false)} />}
-      {showSaveView && <SaveViewDialog tab={tab} columns={visibleCols} filters={filterRules} onClose={() => setShowSaveView(false)} />}
+      {/* o3d-8u4h round 2: validated on SAVE as well as on load. */}
+      {showSaveView && <SaveViewDialog tab={tab} columns={presentColumns(visibleCols, fields)} filters={filterRules.filter((r) => fields.some((f) => f.key === r.field))} onClose={() => setShowSaveView(false)} />}
     </div>
   )
 }

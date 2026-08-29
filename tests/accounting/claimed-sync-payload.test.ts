@@ -18,13 +18,32 @@ import { readClaimedSyncLogPayload } from '@/lib/domain/accounting/claimed-sync-
  */
 
 /** A double that resolves by id — a fixed return value could not tell a re-read from a snapshot. */
-function makeClient(rows: Record<string, { payload: unknown } | undefined>) {
+function makeClient(rows: Record<string, {
+  payload: unknown
+  connectionProvenance?: string | null
+  backReferenceEvidenceCompactedAt?: Date | null
+} | undefined>) {
   const reads: string[] = []
   const client = {
     accountingSyncLog: {
-      findUnique: async ({ where, select }: { where: { id: string }; select: { payload: true } }) => {
+      findUnique: async (
+        { where, select }: {
+          where: { id: string }
+          select: { payload: true; connectionProvenance: true; backReferenceEvidenceCompactedAt: true }
+        },
+      ) => {
         reads.push(where.id)
-        assert.deepEqual(select, { payload: true }, 'only the payload is needed')
+        // o3d-dzip: EVERY half of the origin record comes out of THIS read. Selecting them separately
+        // would let a caller hold a payload from one moment and a column from another, which is how a
+        // disagreement — the state that must refuse — gets manufactured out of two honest reads. The
+        // compaction instant joined them in Codex r1 finding 1: it is what tells a payload retention
+        // emptied from one something rewrote, and reading it at a different moment from the payload it
+        // vouches for would be that same manufactured disagreement.
+        assert.deepEqual(
+          select,
+          { payload: true, connectionProvenance: true, backReferenceEvidenceCompactedAt: true },
+          'the payload and its durable origin, together',
+        )
         return rows[where.id] ?? null
       },
     },
@@ -95,7 +114,9 @@ for (const processor of PROCESSORS) {
     const { join } = await import('node:path')
     const src = readFileSync(join(process.cwd(), processor.path), 'utf8')
 
-    const reReads = src.match(/payload = await readClaimedSyncLogPayload\(db, entry\.id\)/g) ?? []
+    // o3d-dzip: the Xero processor reads the origin record (payload + durable column) in one call;
+    // QuickBooks still reads the payload alone, because it has no connection guard to feed yet.
+    const reReads = src.match(/await readClaimedSyncLog(Payload|OriginRecord)\(db, entry\.id\)/g) ?? []
     assert.equal(
       reReads.length,
       processor.claimSites,
@@ -107,5 +128,8 @@ for (const processor of PROCESSORS) {
       /const payload = \(entry\.payload \?\? \{\}\) as SyncPayload/,
       'binding the PRE-CLAIM snapshot as the payload to post IS the o3d-5ct bug',
     )
+    // `let payload = ...` is the SEED, and it is a different statement: it exists only so the failure
+    // path can describe the row when the re-read itself throws, and every claim site overwrites it
+    // from the re-read above before anything is posted. `const` is what makes it the posted value.
   })
 }

@@ -17,6 +17,13 @@ const STATE_TONE: Record<string, string> = {
   HELD: 'bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200',
   CANCELLED: 'bg-muted text-muted-foreground',
   DEAD_LETTER: 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200',
+  // o3d-92fu: amber, not red — nothing failed at the warehouse; the order's own data is
+  // unusable and the remedy is here, not in the connector.
+  VALIDATION_FAILED: 'bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200',
+  // o3d-2k5r r4: red. Something MAY be live in the warehouse under an id IMS never learned, and
+  // the order is neither fulfilled nor deletable until a person or the connector's own duplicate
+  // refusal settles it — that is not an amber "check when you get a moment".
+  AMBIGUOUS_CREATE: 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200',
 }
 
 const STATE_LABEL: Record<string, string> = {
@@ -26,6 +33,8 @@ const STATE_LABEL: Record<string, string> = {
   HELD: 'Held',
   CANCELLED: 'Cancelled',
   DEAD_LETTER: 'Push failed',
+  VALIDATION_FAILED: 'Payload invalid',
+  AMBIGUOUS_CREATE: 'Outcome unknown',
 }
 
 export function WmsOrderPushChip({ orderId, push }: { orderId: string; push: WmsOrderPushStateView }) {
@@ -48,6 +57,9 @@ export function WmsOrderPushChip({ orderId, push }: { orderId: string; push: Wms
     push.externalOrderNumber ? `WMS order ${push.externalOrderNumber}` : null,
     push.attempts ? `Attempts: ${push.attempts}` : null,
     push.lastError ? `Error: ${push.lastError}` : null,
+    // o3d-2k5r r5: the server's own reason for withholding Retry, so a chip with no button still
+    // says what to do instead rather than looking like an oversight.
+    push.retryRefusal,
   ].filter(Boolean).join(' · ')
 
   return (

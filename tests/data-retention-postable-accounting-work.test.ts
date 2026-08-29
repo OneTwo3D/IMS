@@ -57,6 +57,13 @@ function noopDelegate() {
 }
 
 type Where = {
+  /**
+   * o3d-bqw7 r2: the compaction writes ONE ROW AT A TIME, re-asserting the un-compacted predicate in
+   * the same `where`. Without this clause the double ignored the id and every per-row write hit the
+   * whole page — which is the silent-and-wrong failure this file's header warns about, not the loud
+   * one.
+   */
+  id?: string
   createdAt?: { lt: Date }
   status?: { notIn?: string[]; in?: string[] }
   type?: { in?: string[]; notIn?: string[] }
@@ -76,6 +83,7 @@ type Where = {
  * would still have passed.
  */
 function matches(row: SyncRow, where: Where): boolean {
+  if (where.id !== undefined && row.id !== where.id) return false
   if (where.createdAt && !(row.createdAt.getTime() < where.createdAt.lt.getTime())) return false
   if (where.status?.notIn && where.status.notIn.includes(row.status)) return false
   if (where.status?.in && !where.status.in.includes(row.status)) return false
@@ -121,6 +129,13 @@ mock.module('@/lib/db', {
           const hit = store.accounting.filter((row) => matches(row, where))
           for (const row of hit) Object.assign(row, data)
           return { count: hit.length }
+        },
+        // o3d-bqw7 r2: the compaction now READS before it writes — it derives a per-row record of
+        // what the row owed from the payload it is about to erase. Modelled against the same store,
+        // so "the row survives compaction" and "the row was never selected for it" stay distinct.
+        findMany: async ({ where, take }: { where: Where; take?: number }) => {
+          const hit = store.accounting.filter((row) => matches(row, where))
+          return (take ? hit.slice(0, take) : hit).map((row) => ({ ...row }))
         },
         count: async ({ where }: { where: { status: { in: string[] } } }) =>
           store.accounting.filter((row) => where.status.in.includes(row.status)).length,

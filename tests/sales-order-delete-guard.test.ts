@@ -67,7 +67,14 @@ function matches(row: SyncLogRow, where: WhereNode): boolean {
 }
 
 function makeTx(seed: {
-  pushLink?: { state: string; externalOrderId: string | null; externalOrderNumber: string | null } | null
+  pushLink?: {
+    state: string
+    externalOrderId: string | null
+    externalOrderNumber: string | null
+    /** o3d-92fu: REMOTE attempts. Defaults to 0/null so every pre-existing case is unchanged. */
+    attempts?: number
+    pushedAt?: Date | null
+  } | null
   /**
    * Shipment ids, or full rows when the test cares about Group B staging (o3d-0qoo) or about the
    * committed-shipment blocker (o3d-2y1c). A bare id means "a never-journalled PENDING draft",
@@ -102,7 +109,9 @@ function makeTx(seed: {
         invoicedAt: seed.order?.invoicedAt ?? null,
       }),
     },
-    wmsOrderPushLink: { findUnique: async () => seed.pushLink ?? null },
+    wmsOrderPushLink: {
+      findUnique: async () => (seed.pushLink ? { attempts: 0, pushedAt: null, ...seed.pushLink } : null),
+    },
     shipment: {
       // `status` is served because the guard now SELECTS it (o3d-2y1c). It defaults to PENDING —
       // the schema default, and the status at which a shipment is still only a draft — so a
@@ -195,6 +204,149 @@ test('a WMS push link — even a pre-push PENDING_CREATE claim — blocks the de
   )
   assert.equal(blocker?.code, 'wms_order_push_link')
   assert.match(blocker!.message, /warehouse management system/i)
+})
+
+test('o3d-92fu: a VALIDATION_FAILED link with NO remote attempts does NOT block the delete', async () => {
+  // The push sweep writes this disposition BEFORE it claims anything and BEFORE it calls the
+  // connector — buildPushInput threw on local data, so pushOrder was never invoked and no
+  // remote side effect is possible. Blocking on it made a purely local data error (a line with
+  // no SKU) an unrecoverable, permanently undeletable order.
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({ pushLink: { state: 'VALIDATION_FAILED', externalOrderId: null, externalOrderNumber: null, attempts: 0, pushedAt: null } }),
+    'order-1',
+    STAMPS,
+  )
+  assert.equal(blocker, null)
+})
+
+test('o3d-92fu: a VALIDATION_FAILED link that ALREADY spent remote attempts still blocks', async () => {
+  // The state alone is not the licence. A link can reach VALIDATION_FAILED having pushed and
+  // failed remotely first and only later stopped building; those calls are exactly as ambiguous
+  // as any other dead letter, and the refusal must say so rather than citing the state.
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({ pushLink: { state: 'VALIDATION_FAILED', externalOrderId: null, externalOrderNumber: null, attempts: 3, pushedAt: null } }),
+    'order-1',
+    STAMPS,
+  )
+  assert.equal(blocker?.code, 'wms_order_push_link')
+  assert.match(blocker!.message, /3 push attempt\(s\) may already have been dispatched/)
+})
+
+test('o3d-2k5r: a VALIDATION_FAILED link with a pushedAt STAMP blocks, even at attempts 0', async () => {
+  // The condition that protects a RELEASED link, and the one nothing was asserting: the release
+  // pass resets attempts and nulls the external id on a link whose WMS order really was created,
+  // so `pushedAt` is the sole surviving discriminator. Dropping it from the predicate — reading
+  // it as always-null — hands the deleter an order the warehouse holds.
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({
+      pushLink: {
+        state: 'VALIDATION_FAILED', externalOrderId: null, externalOrderNumber: null,
+        attempts: 0, pushedAt: new Date('2026-08-01T10:00:00.000Z'),
+      },
+    }),
+    'order-1',
+    STAMPS,
+  )
+  assert.equal(blocker?.code, 'wms_order_push_link')
+  // And it must not cite the attempts counter, which here reads 0 and argues for the delete.
+  assert.match(blocker!.message, /a push to the warehouse is recorded against it/)
+  assert.doesNotMatch(blocker!.message, /0 push attempt/)
+})
+
+test('o3d-2k5r: a VALIDATION_FAILED link converted from a CLAIM (attempts 1) blocks', async () => {
+  // The critical case. claimForCreate writes PENDING_CREATE at the schema default of attempts 0
+  // BEFORE the remote call; the increment lives in a catch that a process kill never reaches. The
+  // disposition write is what marks such a converted claim ambiguous, and this is the guard reading
+  // that mark rather than the silence it replaced.
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({ pushLink: { state: 'VALIDATION_FAILED', externalOrderId: null, externalOrderNumber: null, attempts: 1, pushedAt: null } }),
+    'order-1',
+    STAMPS,
+  )
+  assert.equal(blocker?.code, 'wms_order_push_link')
+  assert.match(blocker!.message, /may already have reached the warehouse management system/)
+})
+
+test('o3d-2k5r: provesNoRemoteWmsCall — an ABSENT link is the ONLY unconditional proof', async () => {
+  const { provesNoRemoteWmsCall } = await import('@/lib/domain/wms/order-push-sweep')
+  const clean = { state: 'VALIDATION_FAILED', attempts: 0, pushedAt: null, externalOrderId: null }
+
+  // No link at all: nothing was ever claimed, so nothing was ever called.
+  assert.equal(provesNoRemoteWmsCall(null), true)
+  // A disposition the pre-call path CREATED is the single exception.
+  assert.equal(provesNoRemoteWmsCall(clean), true)
+  // A bare claim is NOT proof — it is written immediately before the remote call.
+  assert.equal(provesNoRemoteWmsCall({ ...clean, state: 'PENDING_CREATE' }), false)
+  // Nor is a dead letter, which has exactly the same three columns as the clean case.
+  assert.equal(provesNoRemoteWmsCall({ ...clean, state: 'DEAD_LETTER' }), false)
+  // ATTEMPTS is the conjunct that decides real rows: every conversion of a pre-existing link
+  // raises it to at least AMBIGUOUS_ATTEMPTS, which is the whole mechanism by which "a claim was
+  // taken and we never learned the outcome" stops reading as proof.
+  assert.equal(provesNoRemoteWmsCall({ ...clean, attempts: 1 }), false)
+
+  // o3d-2k5r r2. The other two are NOT "load-bearing on their own" for THIS reader, and the
+  // comment that said so was wrong. No writer in order-push-sweep.ts can produce a
+  // VALIDATION_FAILED link carrying a pushedAt or an externalOrderId AT ATTEMPTS 0: the create
+  // branch of recordValidationFailure mints all three columns together from
+  // NO_REMOTE_WMS_CALL_COLUMNS, and every conversion path raises attempts first. So these two
+  // assertions pin FAIL-CLOSED behaviour against a shape this file cannot currently produce —
+  // a row written by a future path, a migration, or a hand-edit — and they are kept for exactly
+  // that. They are not the justification for the conjuncts existing.
+  assert.equal(provesNoRemoteWmsCall({ ...clean, pushedAt: new Date() }), false)
+  assert.equal(provesNoRemoteWmsCall({ ...clean, externalOrderId: 'wms-1' }), false)
+})
+
+test('o3d-2k5r r3: the three predicates are ONE LADDER — an order exists, may exist, or provably never did', async () => {
+  // The r2 version of this test asserted the opposite of the middle rung: that spent attempts
+  // alone do NOT block a re-queue, because a re-queue is "bounded and reversible". It is bounded;
+  // a second physical fulfilment is not reversible. That is the finding, and this is the rule
+  // that replaced it.
+  const { wmsOrderMayExist, wmsCreateOutcomeIsAmbiguous, provesNoRemoteWmsCall } = await import('@/lib/domain/wms/order-push-sweep')
+
+  const spent = { state: 'VALIDATION_FAILED', attempts: 1, pushedAt: null, externalOrderId: null }
+  const clean = { ...spent, attempts: 0 }
+  const withId = { ...spent, externalOrderId: 'wms-1' }
+  const withStamp = { ...spent, pushedAt: new Date() }
+
+  // TOP RUNG — an id or a push stamp RECORDS a warehouse order. Nothing may re-open a create, and
+  // the delete guard will not erase the last local reference to it.
+  assert.equal(wmsOrderMayExist(withId), true)
+  assert.equal(provesNoRemoteWmsCall(withId), false)
+  assert.equal(wmsOrderMayExist(withStamp), true)
+  assert.equal(provesNoRemoteWmsCall(withStamp), false)
+  // ...and such a link is NOT reported as merely ambiguous: a probe would change nothing, and
+  // offering one would invite a re-queue on a FOUND that was never in doubt.
+  assert.equal(wmsCreateOutcomeIsAmbiguous(withId), false)
+  assert.equal(wmsCreateOutcomeIsAmbiguous(withStamp), false)
+
+  // MIDDLE RUNG — no record of an order, but a call MAY have been dispatched. This is what
+  // recordValidationFailure mints when it converts an expired claim. A re-queue here needs the
+  // warehouse's own word (probeOrderPresence === 'MISSING'); it is not this rule's to grant.
+  assert.equal(wmsOrderMayExist(spent), false)
+  assert.equal(wmsCreateOutcomeIsAmbiguous(spent), true)
+  assert.equal(provesNoRemoteWmsCall(spent), false)
+
+  // BOTTOM RUNG — the disposition minted from an ABSENT link. The only shape re-queued on IMS's
+  // own authority, and the only one the hard delete may let go of.
+  assert.equal(wmsCreateOutcomeIsAmbiguous(clean), false)
+  assert.equal(provesNoRemoteWmsCall(clean), true)
+})
+
+test('o3d-92fu: a VALIDATION_FAILED link carrying an external id blocks, and the REFUSAL NAMES THE ORDER', async () => {
+  // o3d-2k5r r2: attempts 1, not 0. The attempts-0 variant this used to assert is a row no
+  // writer in order-push-sweep.ts can produce (every conversion raises attempts first), so the
+  // test proved the guard held for a shape it will never meet. At attempts 1 the row is the one
+  // production actually makes — a converted claim whose payload later stopped building — and
+  // the assertion that still bites is the EVIDENCE the message cites: naming the count instead
+  // of the id printed "0 push attempt(s) may already have been dispatched" for a link carrying
+  // a real warehouse order, a refusal whose own stated reason argued for the delete.
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({ pushLink: { state: 'VALIDATION_FAILED', externalOrderId: 'wms-77', externalOrderNumber: 'WN-77', attempts: 1, pushedAt: null } }),
+    'order-1',
+    STAMPS,
+  )
+  assert.equal(blocker?.code, 'wms_order_push_link')
+  assert.match(blocker!.message, /WN-77/)
 })
 
 test('a SYNCED WMS link names the external order in the refusal', async () => {
@@ -877,6 +1029,9 @@ test('o3d-2y1c: a PICKING shipment is refused with a reason instead of hitting t
   // ...and what the operator can actually do about it. Cancellation is a real remedy here:
   // cancelSalesOrderFulfillmentState deletes PICKING/PACKED shipments with the allocation release.
   assert.match(blocker!.message, /Cancel the order instead/)
+  // o3d-2k5: and the remedy that KEEPS the order — reopening reverts the shipment to a PENDING
+  // draft, and PENDING is deliberately not a blocker here, so this genuinely clears it.
+  assert.match(blocker!.message, /"Reopen for repack"/)
 })
 
 test('o3d-2y1c: a PACKED shipment blocks too, and several are summarised by status', async () => {
@@ -997,4 +1152,31 @@ test('[o3d-anu8] a connector-confirmed posted document outranks an asserted one'
 
   assert.equal(blocker?.code, 'accounting_sync_live')
   assert.match(blocker!.message, /is already POSTED as INV-REAL/)
+})
+
+test('o3d-2k5r r4: an AMBIGUOUS_CREATE park blocks the delete, and does not prescribe a cancel it cannot perform', async () => {
+  // The park is the state whose whole content is "a create left and we never learned the outcome".
+  // provesNoRemoteWmsCall must refuse it — the ONLY state that proves anything is a
+  // recordValidationFailure-CREATED disposition — and the refusal must not tell the operator to
+  // cancel the order "so the WMS order is withdrawn", because there is no id to withdraw.
+  const { provesNoRemoteWmsCall } = await import('@/lib/domain/wms/order-push-sweep')
+  assert.equal(
+    provesNoRemoteWmsCall({ state: 'AMBIGUOUS_CREATE', attempts: 1, pushedAt: null, externalOrderId: null }),
+    false,
+  )
+  // ...and at attempts 0 as well: the state alone is disqualifying, so a park written by a future
+  // writer that forgot the attempts floor still cannot be read as proof.
+  assert.equal(
+    provesNoRemoteWmsCall({ state: 'AMBIGUOUS_CREATE', attempts: 0, pushedAt: null, externalOrderId: null }),
+    false,
+  )
+
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({ pushLink: { state: 'AMBIGUOUS_CREATE', externalOrderId: null, externalOrderNumber: null, attempts: 1, pushedAt: null } }),
+    'order-1',
+    STAMPS,
+  )
+  assert.equal(blocker?.code, 'wms_order_push_link', 'the delete is refused')
+  assert.match(blocker!.message, /no recorded outcome/i)
+  assert.doesNotMatch(blocker!.message, /so the WMS order is withdrawn/)
 })

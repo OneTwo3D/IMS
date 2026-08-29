@@ -33,7 +33,10 @@ import {
 import { scheduleXeroAccountingOutbox } from '@/lib/connectors/xero/outbox'
 import { stampingCustodyOnCreate } from '@/lib/domain/accounting/money-attempt-provenance'
 import { activeAccountingIdProvenance } from '@/lib/connectors/accounting-id-provenance'
-import { stampAccountingPayloadConnection } from '@/lib/connectors/accounting-connection-provenance'
+import {
+  mintAccountingConnectionProvenanceColumn,
+  stampAccountingPayloadConnection,
+} from '@/lib/connectors/accounting-connection-provenance'
 import {
   accountedAllocationQty,
   parseCostLayerSnapshot,
@@ -54,6 +57,7 @@ import { buildCogsReconciliationSweepJournal, loadCogsGlReconciliation } from '@
 import { buildTransitReconciliationSweepJournal, loadTransitGlReconciliation } from '@/lib/domain/accounting/transit-gl-reconciliation'
 import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subledger-movement'
 import { recreateJournaledDateFilter } from '@/lib/domain/accounting/daily-batch-retention'
+import { isOperatorAssertedSettlement } from '@/lib/domain/accounting/sync-row-settlement'
 import {
   dailyBatchLiveRefs,
   foldDailyBatchRow,
@@ -389,6 +393,12 @@ async function createPendingSyncLog(
       // would drop the stamp the const above exists to add, and the processor would refuse the row
       // at post time as 'no-origin-recorded'.
       payload: payload as never,
+      // o3d-dzip: the DURABLE half of the same origin record, minted from the stamp in the payload
+      // this statement is writing. Retention compacts the payload to `{}` and keeps the external id,
+      // so a stamp that lives only in the payload is missing from exactly the rows whose realm is
+      // least knowable. Minted here and nowhere else — see mintAccountingConnectionProvenanceColumn
+      // for why this is not a back-fill.
+      connectionProvenance: mintAccountingConnectionProvenanceColumn(payload),
       // o3d-0m56 r10: created INSIDE attempt-stamping custody. That is what later lets a revival
       // read this row's unset `remoteAttemptedAt` as proof no remote call ever left it — see
       // money-attempt-provenance.ts. A row created without it is never recycled again.
@@ -622,6 +632,26 @@ const LIVE_DAILY_BATCH_STATUSES = ['PENDING', 'PROCESSING', 'SYNCED'] as const
  * because the remote call returned, so it is the ledger's own receipt and outranks any later
  * abandonment written over the top of it.
  *
+ * ...UNLESS A PERSON TYPED IT (o3d-jit6 r2, Codex finding 2). The sentence above is true of an id the
+ * CONNECTOR recorded, and false of one the per-row settlement action wrote: there, a human looked in
+ * the ledger, typed a document id, and IMS accepted it without reading the document, checking which
+ * organisation it belongs to, or comparing a single line of it. The row lands SYNCED all the same, and
+ * SYNCED is the first entry in LIVE_DAILY_BATCH_STATUSES — so an assertion used to reach this reader
+ * as an indistinguishable "the journal is in the ledger", and blocked the recreate SILENTLY, exactly
+ * as a confirmed post does. That is o3d-anu8's defect (an operator assertion promoted into system
+ * evidence) arriving through the settlement action, and o3d-nf9i's `settlementBasis` column is the
+ * vocabulary for it.
+ *
+ * The BLOCK is right and stays — a recreate on top of a journal that really is there posts it twice,
+ * and this reader must never move money on anything weaker than positive evidence. What changes is
+ * that it stops being SILENT: an asserted row now returns a REFUSAL, which the caller surfaces on the
+ * run, every run, until somebody confirms the journal. The two outcomes an operator has to be able to
+ * tell apart are "this batch is in the accounts" and "this batch is BELIEVED to be in the accounts,
+ * and if the belief is wrong its value is missing from them and nothing will ever raise it again".
+ *
+ * A connector-written SYNCED row has `settlementBasis` null and is unaffected: absence of an assertion
+ * IS the confirmation case, and nothing is back-filled.
+ *
  * `refs` is either a single derived `<group>-<date>` key (the reconciliation sweeps, whose identity
  * is `<PREFIX>-<date>` by construction and never persisted) or a bucket's full set of candidate
  * referenceIds. Every candidate is ORed together, and a bucket with NO candidates at all is blocked
@@ -660,11 +690,40 @@ async function dailyBatchRecreateVerdict(
       type,
       OR: alternatives,
     },
-    select: { id: true, referenceId: true, status: true, externalTransactionId: true, abandonedBeforeRemoteCall: true },
+    select: {
+      id: true,
+      referenceId: true,
+      status: true,
+      externalTransactionId: true,
+      abandonedBeforeRemoteCall: true,
+      // o3d-jit6 r2 #2: REQUIRED, not decorative. Dropping it would make every row arrive with
+      // `settlementBasis` undefined, which `settlementBasisOf` reads as CONNECTOR_CONFIRMED — so a
+      // forgotten column here silently restores the laundering rather than failing.
+      settlementBasis: true,
+    },
   })
   if (rows.length === 0) return { blocked: false, refusal: null }
-  if (rows.some((row) => LIVE_DAILY_BATCH_STATUSES.includes(row.status as typeof LIVE_DAILY_BATCH_STATUSES[number]))) {
-    return { blocked: true, refusal: null }
+  const live = rows.filter((row) => LIVE_DAILY_BATCH_STATUSES.includes(row.status as typeof LIVE_DAILY_BATCH_STATUSES[number]))
+  if (live.length > 0) {
+    const asserted = live.filter((row) => isOperatorAssertedSettlement(row.settlementBasis))
+    // Worst-first: one asserted row among the live ones is enough to make the whole block rest on an
+    // assertion, because the batch is one journal and it is that row that claims to be it.
+    if (asserted.length === 0) return { blocked: true, refusal: null }
+    const describeAsserted = asserted
+      .map((row) => `${row.referenceId} (${row.id}, ${row.status}${row.externalTransactionId ? `, external id ${row.externalTransactionId}` : ''})`)
+      .join(', ')
+    return {
+      blocked: true,
+      refusal:
+        `Daily batch ${type} not recreated: ${describeAsserted} — that row was settled BY HAND as ` +
+        '"it DID post". The document id on it is what an operator typed after looking in the accounting ' +
+        'system; IMS never read the document, never checked which organisation holds it and never ' +
+        'compared its lines. The batch is deliberately NOT recreated, because if the journal really is ' +
+        'there a rebuild posts it twice — but nothing has confirmed that it is. Open that document in ' +
+        'the accounting system and check it covers this batch. If it does not exist, this batch\'s ' +
+        'value is missing from the accounts and no sweep will ever raise it again: post it there from ' +
+        'the row\'s own lines and correct the id.',
+    }
   }
   const unproved = rows.filter((row) => row.abandonedBeforeRemoteCall !== true || row.externalTransactionId)
   if (unproved.length === 0) return { blocked: false, refusal: null }

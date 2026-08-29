@@ -376,18 +376,34 @@ test('dotenv is a runtime dependency, because `npm ci --omit=dev` has to be able
   assert.equal(pkg.devDependencies?.dotenv, undefined, 'and must not also be a devDependency')
 })
 
-function runScript(args: string[], env: Record<string, string | undefined>) {
+function runScript(args: string[], env: Record<string, string | undefined>, identity?: string[]) {
+  // THE DIRECTORY IS REMOVED IN A `finally` (o3d-2sm1.5). This harness created one per call and
+  // removed none, so every run of this file left a pile under /tmp. The `try` below already
+  // existed to turn a non-zero exit into a value rather than a throw; the removal goes in a
+  // `finally` around BOTH of its arms, because a run that threw for some third reason — node
+  // missing, ENOENT on the script — is exactly the one an unwound `catch` would leak.
+  const cwd = mkdtempSync(join(tmpdir(), 'ims-noenv-'))
+  // THE APPLICATION'S IDENTITY IS ON THE COMMAND LINE (o3d-2sm1.5 r19). scripts/fence-db-connections.mjs
+  // no longer works out where the application connects — from this process's environment, from a
+  // dotenv overlay or from systemd — so every run of it here supplies the four values the way the
+  // deploy scripts do, and a run without them would be refused before anything is opened.
+  const isFence = args[0].endsWith('fence-db-connections.mjs')
+  const extra = isFence
+    ? (identity ?? ['--app-host=127.0.0.1', '--app-port=5432', '--app-user=imsapp', '--app-database=ims'])
+    : []
   try {
-    const stdout = execFileSync('node', [join(process.cwd(), ...args[0].split('/')), ...args.slice(1)], {
+    const stdout = execFileSync('node', [join(process.cwd(), ...args[0].split('/')), ...args.slice(1), ...extra], {
       encoding: 'utf8',
       env: { ...process.env, ...env },
-      cwd: mkdtempSync(join(tmpdir(), 'ims-noenv-')),
+      cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
     })
     return { status: 0, output: stdout }
   } catch (error) {
     const failure = error as { status?: number; stdout?: string; stderr?: string }
     return { status: failure.status ?? -1, output: `${failure.stdout ?? ''}${failure.stderr ?? ''}` }
+  } finally {
+    try { rmSync(cwd, { recursive: true, force: true }) } catch { /* already gone */ }
   }
 }
 
@@ -417,13 +433,17 @@ test('--print-migration-url composes the URL the migration runs through, and ope
 })
 
 test('--print-migration-url refuses rather than emitting a URL that would create admin-owned objects', () => {
+  // THE ROLE THE MIGRATION RUNS AS IS THE SUPPLIED --app-user (o3d-2sm1.5 r19), so the refusal is
+  // now the case where the caller supplied no role at all — and `-c role=` is still never emitted
+  // empty. A run that supplies three of four is refused before any URL is composed.
   const noRole = runScript(['scripts/fence-db-connections.mjs', '--print-migration-url'], {
     DEPLOY_ADMIN_DATABASE_URL: 'postgresql://deployadmin@127.0.0.1:5432/ims',
     DATABASE_URL: 'postgresql://127.0.0.1:5432/ims',
+    USER: '',
     DIRECT_URL: '',
-  })
+  }, ['--app-host=127.0.0.1', '--app-port=5432', '--app-user=', '--app-database=ims'])
   assert.notEqual(noRole.status, 0)
-  assert.match(noRole.output, /owned by the admin/)
+  assert.match(noRole.output, /--app-user was not supplied/)
 
   const noAdmin = runScript(['scripts/fence-db-connections.mjs', '--print-migration-url'], {
     DEPLOY_ADMIN_DATABASE_URL: '',

@@ -5,6 +5,8 @@ import { randomUUID } from 'node:crypto'
 import { config as loadDotenv } from 'dotenv'
 import pg from 'pg'
 
+import { pgConnectionConfig } from '../lib/db/database-url-schema.mjs'
+
 loadDotenv({ path: '.env.local', override: false, quiet: true })
 loadDotenv({ path: '.env', override: false, quiet: true })
 
@@ -14,7 +16,13 @@ if (!databaseUrl) {
   process.exit(1)
 }
 
-const pool = new pg.Pool({ connectionString: databaseUrl, max: 1 })
+// Every statement below names its tables UNQUALIFIED, so the schema they are probed in is the one
+// the connection's search path resolves — and `?schema=` is a Prisma-only parameter that `pg`
+// discards. Pinned through the shared resolver so this checks the CONSTRAINTS THE APPLICATION
+// WRITES THROUGH, not a same-named table in whatever schema the login role defaults to
+// (o3d-2k5r r12). The spread comes first: `pg` parses `connectionString` after the surrounding
+// config, so an `options=` left in the URL would overwrite a search path set beside it.
+const pool = new pg.Pool({ ...pgConnectionConfig(databaseUrl), max: 1 })
 const client = await pool.connect()
 
 const probeId = randomUUID().replace(/-/g, '')

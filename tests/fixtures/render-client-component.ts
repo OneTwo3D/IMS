@@ -60,7 +60,16 @@ export type Control = {
    * row the control belongs to. Two controls with identical labels are told apart by this.
    */
   scope: string
-  onClick: () => void
+  onClick?: () => void
+  /**
+   * o3d-8u4h round 2: SOME CONTROLS ARE NOT BUTTONS.
+   *
+   * The analytics stat pages load a saved view from a `<select onChange>`, and that is the only
+   * path by which a saved view — including one that outlived a column it names — reaches the table.
+   * A harness that collects `onClick` alone can never model it, so a test of that path could only
+   * call an internal helper and assert about a list, rather than about the table an operator reads.
+   */
+  onChange?: (event: { target: { value: string } }) => void
 }
 
 function collectControls(node: ReactNodeish, scope: string, found: Control[]): Control[] {
@@ -72,8 +81,14 @@ function collectControls(node: ReactNodeish, scope: string, found: Control[]): C
   if (!element?.props) return found
   const nextScope = element.key !== null && element.key !== undefined ? textOf(element) : scope
   const onClick = element.props.onClick
-  if (typeof onClick === 'function') {
-    found.push({ label: textOf(element.props.children), scope: nextScope, onClick: onClick as () => void })
+  const onChange = element.props.onChange
+  if (typeof onClick === 'function' || typeof onChange === 'function') {
+    found.push({
+      label: textOf(element.props.children),
+      scope: nextScope,
+      onClick: typeof onClick === 'function' ? (onClick as () => void) : undefined,
+      onChange: typeof onChange === 'function' ? (onChange as (event: { target: { value: string } }) => void) : undefined,
+    })
   }
   if ('children' in element.props) collectControls(element.props.children, nextScope, found)
   return found
@@ -93,6 +108,12 @@ export type Mounted<P = unknown> = {
    * nothing when the control is absent — a missing control is the failure mode under test.
    */
   click: (control: Control | undefined) => Promise<void>
+  /**
+   * Choose a value in a `<select>` (or type into an input), and wait for any transition it started.
+   * The event target is a real mutable object because handlers in this tree write back to it —
+   * `e.target.value = ''` is how the saved-view pickers reset themselves.
+   */
+  select: (control: Control | undefined, value: string) => Promise<void>
   /**
    * Deliver NEW props, as a fresh server payload would (o3d-osl8 round 7, finding 3).
    *
@@ -153,7 +174,15 @@ export function mountClientComponent<P>(Component: (props: P) => ReactNodeish, i
 
   async function click(control: Control | undefined): Promise<void> {
     if (!control) throw new Error('mountClientComponent: no such control was rendered')
+    if (!control.onClick) throw new Error('mountClientComponent: that control has no onClick')
     control.onClick()
+    while (transitions.length > 0) await transitions.shift()
+  }
+
+  async function select(control: Control | undefined, value: string): Promise<void> {
+    if (!control) throw new Error('mountClientComponent: no such control was rendered')
+    if (!control.onChange) throw new Error('mountClientComponent: that control has no onChange')
+    control.onChange({ target: { value } })
     while (transitions.length > 0) await transitions.shift()
   }
 
@@ -161,5 +190,5 @@ export function mountClientComponent<P>(Component: (props: P) => ReactNodeish, i
     props = next
   }
 
-  return { render, click, setProps }
+  return { render, click, select, setProps }
 }

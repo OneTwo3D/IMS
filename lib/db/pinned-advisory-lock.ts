@@ -1,4 +1,6 @@
-import { Pool, type PoolClient } from 'pg'
+import { type Pool, type PoolClient } from 'pg'
+
+import { createSessionAdvisoryLockPool } from './session-lock-pool'
 
 /**
  * A SESSION-level advisory lock, held on one pinned connection (o3d-4ajo).
@@ -20,14 +22,32 @@ import { Pool, type PoolClient } from 'pg'
  * lock; this is the same shape, callable by any job.
  */
 
+/**
+ * THE LOCK POOL IS BUILT BY `createSessionAdvisoryLockPool()`, NOT FROM `DATABASE_URL` AND NOT FROM
+ * `pgConnectionConfig()` EITHER (o3d-2k5r r23 and r25, Codex HIGH; o3d-a5zz).
+ *
+ * r23 closed the first half: a `new Pool({ connectionString })` is a second, unguarded route to the
+ * database inside a process whose Prisma pool is guarded — no `search_path` pin, so its raw
+ * statements resolve through the server-default schema rather than the one the application writes
+ * to, and none of the per-connection backend checks, so on a deployment whose schema needs a
+ * non-ASCII startup option it can be served by a backend the deployment probe never measured. An
+ * exclusion taken somewhere other than where the work happens is not an exclusion.
+ *
+ * r25 closes the half that `pgConnectionConfig()` alone left open, and it is the half this file is
+ * about. That config attaches its per-connection check only for a NON-ASCII startup option, so on an
+ * ASCII schema — every ordinary deployment — the connection this lock lives on was never shown to
+ * reach the backend directly. Behind a transaction pooler it does not: measured against Odyssey
+ * 1.5.3-rc1, two clients each got `true` from the same `pg_try_advisory_lock` and the first's own
+ * `pg_locks` showed nothing. `lost` cannot see that — it reports a DEAD connection, not a live one
+ * whose backend was swapped. `createSessionAdvisoryLockPool()` makes the affinity proof a property
+ * of the pool every lock holder builds; see `lib/db/session-lock-pool.ts`.
+ *
+ * Small on purpose: these are a handful of low-frequency, long-lived jobs, which is why the extra
+ * round trip per new physical connection costs nothing that matters here.
+ */
 let lockPool: Pool | null = null
 function getLockPool(): Pool {
-  if (!lockPool) {
-    const connectionString = process.env.DATABASE_URL
-    if (!connectionString) throw new Error('DATABASE_URL is required for advisory locks')
-    // Small: these are a handful of low-frequency, long-lived jobs.
-    lockPool = new Pool({ connectionString, max: 4 })
-  }
+  if (!lockPool) lockPool = createSessionAdvisoryLockPool('advisory locks', 4)
   return lockPool
 }
 

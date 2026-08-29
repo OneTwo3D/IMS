@@ -4,6 +4,9 @@ import { db } from '@/lib/db'
 import { requirePermission } from '@/lib/auth/server'
 import { COMMITTED_PURCHASE_ORDER_WHERE, INCOMING_PO_STATUSES } from '@/lib/domain/inventory/po-status-sets'
 import { headerDiscountedReturnCreditBase } from '@/lib/domain/purchasing/return-credit-basis'
+import { hasPaymentMarker } from '@/lib/domain/purchasing/supplier-payment-basis'
+import { reconcileMinorUnits, roundToMinorUnit } from '@/lib/analytics/minor-unit-reconciliation'
+import { Prisma } from '@/app/generated/prisma/client'
 
 // ---------------------------------------------------------------------------
 // Product purchase stats (Products tab)
@@ -261,7 +264,13 @@ export type SupplierAgingRow = {
   supplierName: string
   /** VAT-INCLUSIVE committed spend: PurchaseOrder.totalBase, which is net goods + VAT + freight. */
   grossAmount: number
-  discounts: number
+  /**
+   * ALWAYS WITHHELD (o3d-8u4h). Was a hardcoded `0`. A discount TOTAL cannot be assembled: the
+   * per-line part is already folded into the stored line totals and survives only in foreign
+   * currency under the order's own tax convention, and the header part alone is a part, not a
+   * total. See SUPPLIER_DISCOUNT_TOTAL_NOT_RECORDED.
+   */
+  discounts: number | null
   /** Returned value at the EX-VAT line cost — PurchaseOrderLine.unitCostBase is always net. */
   refunds: number
   /**
@@ -272,13 +281,52 @@ export type SupplierAgingRow = {
   landedCosts: number
   tax: number
   totalAmount: number
+  /** Sum of PurchaseInvoice.totalBase — VAT-INCLUSIVE, and every bill, marked or not. */
   billedAmount: number
-  paidAmount: number
-  dueAmount: number
-  overdue0_30: number
-  overdue31_60: number
-  overdue61_90: number
-  overdue91plus: number
+  /**
+   * o3d-8u4h. The two halves of `billedAmount`, grouped on THE RAW EVIDENCE: whether the bill
+   * carries a payment marker (`PurchaseInvoice.paidAt`) or does not. Amounts BILLED, on the same
+   * VAT-inclusive basis as `billedAmount`.
+   *
+   * Round 2 renamed these from `settledBilledAmount`/`unsettledBilledAmount`. "Settled" published a
+   * settlement relation the marker does not prove: `markBillPaid` accepts a partial amount and
+   * stamps `paidAt` anyway, so a part-paid bill was being reported as fully settled AND dropped out
+   * of every age band. The marker is the only fact; these names claim only the marker.
+   *
+   * `billedAmount === billedWithPaymentMarker + billedWithoutPaymentMarker`, which the reader can
+   * check across the row — EXACTLY, in the minor unit. o3d-8u4h round 3: it used not to, because
+   * the total and the two halves were rounded independently from a four-decimal source. The
+   * rounding residue is now placed by an explicit rule (the largest component absorbs it); see
+   * SUPPLIER_BILLED_ROUNDING_RECONCILIATION and lib/analytics/minor-unit-reconciliation.
+   */
+  billedWithPaymentMarker: number
+  billedWithoutPaymentMarker: number
+  /**
+   * ALWAYS WITHHELD (o3d-8u4h). Was a hardcoded `0`, which asserted that nothing had ever been
+   * paid to this supplier. No amount paid to a supplier is recorded anywhere in the schema.
+   * See SUPPLIER_PAYMENT_AMOUNT_NOT_RECORDED.
+   */
+  paidAmount: number | null
+  /**
+   * ALWAYS WITHHELD (o3d-8u4h). Was `billedAmount` — i.e. the whole bill, forever. Due is billed
+   * less paid, and paid is not a recorded quantity; supplier credit notes reduce what is owed too.
+   * `billedWithoutPaymentMarker` is the nearest thing that IS known, and says what it is.
+   */
+  dueAmount: number | null
+  /**
+   * o3d-8u4h: was `overdue0_30`/`31_60`/`61_90`/`91plus`. Same four age bands, cut from the INVOICE
+   * date, but now over the bills carrying NO payment marker — a marked bill no longer ages forever
+   * — and no longer called "overdue", because that is a relation to a DUE DATE which this report
+   * does not measure. See SUPPLIER_BILLED_WITHOUT_PAYMENT_MARKER_BASIS.
+   *
+   * The four add back to `billedWithoutPaymentMarker` exactly, in the minor unit: they are a
+   * partition of the same bills, reconciled to the PUBLISHED without-marker figure (o3d-8u4h
+   * round 3).
+   */
+  billedWithoutPaymentMarker0_30: number
+  billedWithoutPaymentMarker31_60: number
+  billedWithoutPaymentMarker61_90: number
+  billedWithoutPaymentMarker91plus: number
   poCount: number
   avgLeadTimeDays: number | null
 }
@@ -299,7 +347,9 @@ export async function getSupplierAging(): Promise<SupplierAgingRow[]> {
           // discount was not merely mishandled — it was NOT VISIBLE to this query at all.
           subtotalBase: true,
           lines: { select: { totalBase: true } },
-          invoices: { select: { totalBase: true, invoiceDate: true } },
+          // o3d-8u4h: `paidAt` is the ONLY settlement fact the schema holds for a supplier bill.
+          // Without it in the select, every bill aged forever and Due was the whole ledger.
+          invoices: { select: { totalBase: true, invoiceDate: true, paidAt: true } },
           returns: { select: { lines: { select: { qtyReturned: true, poLine: { select: { unitCostBase: true } } } } } },
         },
       },
@@ -308,19 +358,44 @@ export async function getSupplierAging(): Promise<SupplierAgingRow[]> {
 
   const now = Date.now()
   return suppliers.map((s) => {
-    let grossAmount = 0, tax = 0, landedCosts = 0, billedAmount = 0, refunds = 0
-    let overdue0_30 = 0, overdue31_60 = 0, overdue61_90 = 0, overdue91plus = 0
+    // o3d-8u4h round 3: EVERY ACCUMULATOR IS AN EXACT DECIMAL. `PurchaseInvoice.totalBase` is
+    // stored to four decimal places and these figures are published to two, so the arithmetic has
+    // to happen before the rounding does — and it has to happen in a type that adds without drift,
+    // or the "sum once, round once" rule the split relies on is only approximately true.
+    const zero = new Prisma.Decimal(0)
+    let grossAmount = zero, tax = zero, landedCosts = zero, billedAmount = zero, refunds = zero
+    let billedMarked = zero, billedUnmarked = zero
+    let unmarked0_30 = zero, unmarked31_60 = zero, unmarked61_90 = zero, unmarked91plus = zero
     const leadTimes: number[] = []
 
     for (const po of s.purchaseOrders) {
-      grossAmount += Number(po.totalBase)
-      tax += Number(po.taxBase)
-      landedCosts += Number(po.directFreightBase)
-      refunds += headerDiscountedReturnCreditBase(po)
+      grossAmount = grossAmount.add(new Prisma.Decimal(po.totalBase))
+      tax = tax.add(new Prisma.Decimal(po.taxBase))
+      landedCosts = landedCosts.add(new Prisma.Decimal(po.directFreightBase))
+      // The one figure that arrives as a `number`: the credit is scaled by a stored ratio, which is
+      // a non-terminating decimal in the general case, so it is computed in double precision in
+      // lib/domain/purchasing/return-credit-basis and taken at that precision here. Unchanged by
+      // this round, and it is not part of a published add-back — nothing is split out of it.
+      refunds = refunds.add(new Prisma.Decimal(headerDiscountedReturnCreditBase(po)))
       for (const inv of po.invoices) {
-        const t = Number(inv.totalBase); billedAmount += t
+        const t = new Prisma.Decimal(inv.totalBase)
+        billedAmount = billedAmount.add(t)
+        if (hasPaymentMarker(inv)) { billedMarked = billedMarked.add(t); continue }
+        billedUnmarked = billedUnmarked.add(t)
+        // o3d-8u4h: A BILL CARRYING A PAYMENT MARKER STOPS AGEING. It used to age forever, because
+        // nothing in this loop had ever looked at `paidAt`, so a bill paid two years ago sat in the
+        // 91+ column for good. The buckets are the billed value of the UNMARKED bills now, and are
+        // named for that — not for a settlement the marker cannot prove.
+        //
+        // Round 3 folded the marker split into this same loop. Two loops over the same bills, each
+        // applying its own copy of the marker test, is how the two populations could drift apart;
+        // now a bill is classified exactly once and the bands are, by construction, a partition of
+        // `billedUnmarked` — which is the property the reconciliation below relies on.
         const d = Math.round((now - inv.invoiceDate.getTime()) / 86400000)
-        if (d > 90) overdue91plus += t; else if (d > 60) overdue61_90 += t; else if (d > 30) overdue31_60 += t; else overdue0_30 += t
+        if (d > 90) unmarked91plus = unmarked91plus.add(t)
+        else if (d > 60) unmarked61_90 = unmarked61_90.add(t)
+        else if (d > 30) unmarked31_60 = unmarked31_60.add(t)
+        else unmarked0_30 = unmarked0_30.add(t)
       }
       if (po.poSentAt && po.receivedAt) { const d = Math.round((po.receivedAt.getTime() - po.poSentAt.getTime()) / 86400000); if (d > 0 && d < 365) leadTimes.push(d) }
     }
@@ -357,16 +432,75 @@ export async function getSupplierAging(): Promise<SupplierAgingRow[]> {
     // round 3 had just repaired (an order total on one basis, a credit on another), only the
     // mismatched axis was the DISCOUNT rather than the VAT, so leaving it produced a `netAmount`
     // that was again neither convention.
+    //
+    // o3d-8u4h: AND THREE OF THE FIGURES BELOW WERE NOT CALCULATIONS AT ALL.
+    //
+    // `paidAmount: 0`, `discounts: 0` and `dueAmount: billedAmount` were not calculations that came
+    // out wrong. They were quantities THIS SYSTEM DOES NOT HOLD, published as measurements — and a
+    // zero in a Paid column is the strongest claim available: "nothing has ever been paid to this
+    // supplier". They are `null` now, which is o3d-iigc's rule applied unchanged: a figure that
+    // cannot be stated publishes nothing, while the related total that IS known stays on the row.
+    //
+    // What is known is what was BILLED, so `billedAmount` is untouched and is now split on THE RAW
+    // EVIDENCE — the bills carrying a payment marker and the bills carrying none. Round 2's
+    // correction: calling those halves "settled" and "unsettled" published a settlement relation
+    // `paidAt` does not prove, because `markBillPaid` stamps it on a part-payment too, so a
+    // part-paid bill was reported as fully settled AND vanished from every age band. Both halves
+    // are amounts billed, grouped by a marker, and are named for exactly that.
+    // lib/domain/purchasing/supplier-payment-basis.ts carries the whole reasoning and the sentences
+    // the page and the CSV show the reader.
+    // o3d-8u4h ROUND 3: THE ADD-BACK THE COLUMNS PROMISE IS NOW ARITHMETIC, NOT LUCK.
+    //
+    // The split above was published with the sentence "billedAmount = billedWithPaymentMarker +
+    // billedWithoutPaymentMarker, which the reader can check across the row", and the four age bands
+    // with the same promise against the without-marker total. But every one of those figures was
+    // rounded to the penny INDEPENDENTLY, from a source stored to four decimal places — and
+    // independent rounding does not distribute over addition. Two bills of 5.005 and 10.005 total
+    // 15.01 and their halves round to 5.01 and 10.01, which is 15.02. The row invited a check it
+    // could fail.
+    //
+    // The policy, in full, is in lib/analytics/minor-unit-reconciliation and in the sentence the
+    // page and the CSV show the reader (SUPPLIER_BILLED_ROUNDING_RECONCILIATION). In one line: sum
+    // exactly, round the parent once, round each component once, and add the whole residue to the
+    // LARGEST component — so the residue lands in `billedWithPaymentMarker` or
+    // `billedWithoutPaymentMarker` (whichever is bigger) for the marker split, and in the biggest
+    // age band for the bands.
+    //
+    // THE BANDS RECONCILE TO THE PUBLISHED without-marker figure, not to its exact sum, which is why
+    // the second call is fed `billed.components[1]`. Reconciling them to the exact sum would leave
+    // the bands adding up to a number that appears nowhere on the page.
+    const billed = reconcileMinorUnits(billedAmount, [billedMarked, billedUnmarked])
+    const bands = reconcileMinorUnits(new Prisma.Decimal(billed.components[1]), [unmarked0_30, unmarked31_60, unmarked61_90, unmarked91plus])
+
+    // NET IS NOT RECONCILED, AND THAT IS THE OTHER HALF OF THE SAME POLICY.
+    //
+    // A reconciliation is for a PARTITION: the marker groups are the same bills sorted into two
+    // heaps, the age bands the same bills sorted into four, so there is a parent that the parts are
+    // parts OF, and a residue that has to land somewhere. Gross, Tax and Refunds are not parts of
+    // Net — they are three independently measured quantities that Net is a DIFFERENCE of, and the
+    // most accurate difference is the one taken before any of them is rounded. o3d-iigc round 2
+    // settled that and its test pins the figure: 399.99 - 66.67 - 11.115 on the exact accumulators
+    // is 322.205 -> 322.21, where subtracting the three published columns gives 322.20.
+    //
+    // So: sum exactly and round once, for each of the four figures independently. What the minor
+    // unit cannot always give you is a subtraction of DISPLAYED figures that reproduces a DISPLAYED
+    // difference to the penny, and this report prefers the accurate difference to the tidy one.
+    const grossPublished = roundToMinorUnit(grossAmount)
+
     return {
       supplierId: s.id, supplierName: s.name,
-      grossAmount: Math.round(grossAmount * 100) / 100, discounts: 0,
-      refunds: Math.round(refunds * 100) / 100, netAmount: Math.round((grossAmount - tax - refunds) * 100) / 100,
-      landedCosts: Math.round(landedCosts * 100) / 100, tax: Math.round(tax * 100) / 100,
-      totalAmount: Math.round(grossAmount * 100) / 100,
-      billedAmount: Math.round(billedAmount * 100) / 100, paidAmount: 0,
-      dueAmount: Math.round(billedAmount * 100) / 100,
-      overdue0_30: Math.round(overdue0_30 * 100) / 100, overdue31_60: Math.round(overdue31_60 * 100) / 100,
-      overdue61_90: Math.round(overdue61_90 * 100) / 100, overdue91plus: Math.round(overdue91plus * 100) / 100,
+      grossAmount: grossPublished, discounts: null,
+      refunds: roundToMinorUnit(refunds),
+      netAmount: roundToMinorUnit(grossAmount.sub(tax).sub(refunds)),
+      landedCosts: roundToMinorUnit(landedCosts), tax: roundToMinorUnit(tax),
+      totalAmount: grossPublished,
+      billedAmount: billed.parent,
+      billedWithPaymentMarker: billed.components[0],
+      billedWithoutPaymentMarker: billed.components[1],
+      paidAmount: null,
+      dueAmount: null,
+      billedWithoutPaymentMarker0_30: bands.components[0], billedWithoutPaymentMarker31_60: bands.components[1],
+      billedWithoutPaymentMarker61_90: bands.components[2], billedWithoutPaymentMarker91plus: bands.components[3],
       poCount: s.purchaseOrders.length,
       avgLeadTimeDays: leadTimes.length ? Math.round(leadTimes.reduce((a, b) => a + b, 0) / leadTimes.length) : null,
     }

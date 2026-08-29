@@ -136,6 +136,56 @@ redis_conf_set_requirepass() {
   rm -f "${tmp}"
 }
 
+# ---------------------------------------------------------------------------
+# COMMAND SUBSTITUTION DELETES TRAILING NEWLINES, AND A PASSWORD IS BYTES
+# (o3d-2sm1.5 r40, Codex HIGH).
+#
+# THE DEFECT. `$( )` strips EVERY trailing newline from what it captures. That is a feature for
+# `$(date)` and a data-loss bug for a credential: an operator whose password ends in a newline —
+# spelled `abc%0A` in the URL, which is exactly what r39's own encoder emits for it — has that
+# byte parsed by node-postgres, held by the server, and DELETED by the shell capture the recovery
+# reads it back through. The mechanism r39 built to preserve exact password bytes corrupted a
+# class of them: a re-install recovers `abc`, sees it differ from the installed `abc\n`, and
+# ROTATES a live credential nobody asked to rotate — or, on the journal path, publishes a `.env`
+# naming a password the server does not have.
+#
+# THE FIX IS A SENTINEL, NOT A NAMEREF. A nameref (`local -n`) cannot be used for these: the
+# producing functions are pure and several of them are also called from the regressions and from
+# other captures, and a nameref would make them unusable in either position. Instead the value is
+# followed INSIDE the substitution by a fixed terminator, so the newlines the shell eats are no
+# longer trailing, and the terminator is removed afterwards with `${var%"..."}` — the SHORTEST
+# matching suffix, so exactly the one byte-string this function appended comes off, whatever the
+# value itself ends with.
+#
+#   capture VAR command args...
+#
+# VAR receives exactly the bytes `command` wrote to stdout, trailing newlines and all, and the
+# return value is the command's own. A command that writes nothing leaves VAR empty. The command
+# runs in a SUBSHELL, as it did under `$( )`, so it must be pure — every caller here is.
+#
+# THERE IS NO `set +e` IN HERE, AND THAT WAS MEASURED RATHER THAN ASSUMED. The obvious worry is
+# that under this script's `set -e` a non-zero return from the command would leave the subshell
+# before the terminator was written — silently back to stripping. It cannot: the assignment below
+# is ALWAYS in a `|| __capture_status=$?` context, and errexit is suppressed for a command whose
+# failure is tested, all the way into the substitution. That holds with `shopt -s inherit_errexit`
+# set as well as unset (bash 5.2, both measured). A `set +e` here would be a line that cannot
+# change what this function does, and a guard that cannot fail is not a guard.
+CAPTURE_TERMINATOR='--ims-end-of-captured-value--'
+
+capture() {
+  local __capture_name="$1"
+  shift
+  local __capture_raw __capture_status=0
+  __capture_raw="$(
+    "$@"
+    __capture_inner=$?
+    printf '%s' "${CAPTURE_TERMINATOR}"
+    exit "${__capture_inner}"
+  )" || __capture_status=$?
+  printf -v "${__capture_name}" '%s' "${__capture_raw%"${CAPTURE_TERMINATOR}"}"
+  return "${__capture_status}"
+}
+
 # Print the shape of a URL, never the secret in it. Character-for-character the same
 # function as the one in scripts/provision-ims-tenant.sh, for the same reason the
 # encoder is duplicated: the two scripts share no shell library, and this installer
@@ -550,6 +600,11 @@ DEPLOY_SSH_KNOWN_HOSTS="${DEPLOY_SSH_DIR}/known_hosts"
 # no crontab and no data, so there is no writer to stop and no cutover to survive.
 # ---------------------------------------------------------------------------
 UPGRADE_EXISTING=false
+# WHY this run is fenced, in the words every refusal on the fenced path prints. Set by the branch
+# below and read by require_fenceable_database(), so an operator who is told the database must be
+# held closed is told WHICH of the two reasons put them there (o3d-2sm1.5 r36, Codex CRITICAL).
+FENCED_CUTOVER=false
+CUTOVER_REASON=""
 # THE FENCE STATE MACHINE (phases added o3d-2sm1.5, Codex r7 HIGH). Four phases, one
 # direction only, and on_cutover_exit does something different in each:
 #
@@ -621,6 +676,179 @@ FENCE_DROPIN_DIR="/etc/systemd/system/${APP_NAME}.service.d"
 FENCE_DROPIN_FILE="${FENCE_DROPIN_DIR}/zz-deploy-fence.conf"
 DB_FENCE_DIR="${CUTOVER_STATE_DIR}/deploy"
 DB_FENCE_STATE="${DB_FENCE_DIR}/db-connect-fence.json"
+# THE ENVIRONMENT THE STARTED SERVICE IS BOUND TO (o3d-2sm1.5 r23, Codex HIGH).
+#
+# Rounds 13-22 asked, in eleven spellings, WHICH DATABASE THE SERVICE WILL USE, and every answer
+# was correct and incomplete for one reason: it was a READ of a file the service reads later and
+# somebody else can replace in between. Re-reading closer to the start shortens that window; it
+# cannot close it, because `EnvironmentFile=` is read by systemd at the moment it EXECS.
+#
+# So this round stops checking and BINDS. The value this run validated, fenced and migrated is
+# written to a file under the cutover state directory — root-owned, 0600, in a directory the
+# application user cannot write — and every unit is given a drop-in that loads THAT file, LAST.
+# systemd.exec: "If the same variable is set twice from these files, the files will be read in
+# the order they are specified and the later setting will override the earlier setting", and
+# "Settings from these files override settings made with Environment=". So whatever
+# ${APP_DIR}/.env has come to say by exec time, DATABASE_URL is the snapshot's.
+#
+# AND IT IS MANDATORY, WITH NO LEADING `-`. A missing snapshot is then a START FAILURE rather
+# than a silent fall-through to the application's own dotenv overlays — the exact difference
+# that made a DELETED .env dangerous, since the shipped units load that one with a `-`.
+#
+# WHY THIS CLOSES THE RACE THE RE-READ COULD NOT. Two systemd reads are involved and they have
+# different timing. The SET of environment files is unit CONFIGURATION, fixed at the last
+# `daemon-reload` and NOT re-read by `systemctl start`; the CONTENTS are read at exec. This run
+# issues the final daemon-reload itself, verifies the loaded list on the bus AFTER it, and
+# nothing between that verification and the start runs a unit-file command at all — not an
+# explicit daemon-reload and not one of the verbs that reloads IMPLICITLY (r24 moved the unmask
+# and the enable above the final reload for exactly that reason) — so the list cannot change
+# under it. The contents can be changed only by root, which is not a position this deploy can
+# defend against and is not the threat model: the file the check-to-exec race was about was
+# writable by the application user and by whatever configuration management writes .env.
+# NOT under ${CUTOVER_STATE_DIR}, which is the application's own data directory and therefore
+# WRITABLE BY THE APPLICATION USER (o3d-2sm1.5 r23). A binding the service can delete is not a
+# binding: the drop-in would then name a file that is gone, and — because it is loaded without a
+# leading `-` — the unit would refuse to start. Fail-closed, but an outage the app user could
+# cause. This directory is created root-owned and 0700 by publish_db_identity_snapshot().
+# AND ITS PATH IS A CONSTANT, NOT AN OVERRIDE (o3d-2sm1.5 r24, Codex HIGH). It used to be
+# ${IMS_CUTOVER_ENV_DIR:-/etc/ims-cutover}, and update.sh sources ${APP_DIR}/.env into the
+# environment AS ROOT before it resolves this line — so the variable that chose where the
+# snapshot goes was one THE APPLICATION USER WRITES. That hands back the entire point of the
+# location. publish_db_identity_snapshot() chowns and chmods only the FINAL directory, so a path
+# under an app-writable parent is secured after the parent has already been chosen: rename the
+# secured child away, put an attacker-owned directory at the same path, and PID 1 reads that
+# instead while the bus check and the mandatory-file check both still pass. The same override
+# aimed at an existing system directory chmods it to 0700 and takes it out.
+#
+# There is no configurable spelling of this that is safe. An override only a root-owned source
+# may set is indistinguishable from no override, and a trust root read out of the very file the
+# snapshot exists to distrust is not a trust root. So it is a literal: a deployment that must
+# move it edits this line, which is a root-owned change to a root-owned file, reviewed like any
+# other. The same reasoning is why nothing else in this script resolves a privileged path from a
+# variable the application can set. This script never put ${APP_DIR}/.env into its environment at
+# all — it reads one key at a time with env_file_value() — and since r25 update.sh does the same,
+# so no IMS_* line in that file becomes a variable in any of the three entrypoints.
+DB_ENV_SNAPSHOT_DIR="/etc/ims-cutover"
+DB_ENV_SNAPSHOT_FILE="${DB_ENV_SNAPSHOT_DIR}/db-identity-snapshot.env"
+DB_ENV_SNAPSHOT_DROPIN_NAME="zz-deploy-db-identity.conf"
+DB_ENV_SNAPSHOT_DROPIN_FILE="${FENCE_DROPIN_DIR}/${DB_ENV_SNAPSHOT_DROPIN_NAME}"
+# THE TRUST ROOT, AT A PATH ALL THREE PRINCIPALS CAN OPEN (o3d-2sm1.5 r46, Codex MEDIUM).
+#
+# THE FINDING. r45 validated the operator's DB_SSLROOTCERT with `[[ -f && -r ]]`, and this script
+# runs as root — so `-r` proved that ROOT can read it and nothing else. Three different principals
+# open that file: the authentication-request reader runs as root, the `psql` credential probes run
+# as the `postgres` OS user (pg_endpoint_psql() goes through run_as_user), and the SERVICE runs as
+# ${APP_USER}. A CA at mode 0600 under `postgres` passes both checks the installer makes and then
+# fails when the application starts — after the migration, after the cutover, with the fence down.
+# And nothing constrained who could WRITE it, so a CA the application account owns could be
+# replaced between the probe and the start, moving the trust root out from under everything this
+# gate just vouched for.
+#
+# SO THE BYTES ARE PUBLISHED, NOT THE PATHNAME. publish_db_ca() parses the operator's file, writes
+# the certificates it found here — root-owned, 0644, in a root-owned 0755 directory — and repoints
+# DB_SSLROOTCERT at THAT path. From that point the URL's `sslrootcert=`, the reader's
+# `--sslrootcert=` and psql's PGSSLROOTCERT are the same characters, and that file is readable by
+# every UID and writable by root alone. verify_db_ca_published() re-checks the digest and the modes
+# at each principal's boundary.
+#
+# AND THE PATH IS THE DIGEST OF WHAT IS IN IT (o3d-2sm1.5 r47, Codex HIGH). It was one fixed
+# `db-ca.crt`, and on an UPGRADE the installed DATABASE_URL already names that file. Publishing a
+# candidate therefore REPLACED the trust root the running installation verifies against, before any
+# connection had proved the candidate — so a wrong, stale or malformed CA, or any later refusal,
+# left the box with a durable trust root nothing could connect through, while the refusal said
+# "nothing has been changed on this host". That is this branch's oldest shape: the irreversible act
+# before the proof, exactly as the fence adoption and the credential rotation had it.
+#
+# A content-addressed name removes the act rather than merely re-ordering it. `db-ca-<sha256>.crt`
+# is derived from the published bytes, so a candidate whose bytes differ from the installed
+# generation's CANNOT land on the installed generation's path — there is no ordering to get wrong
+# and no window to be killed in. A candidate whose bytes are identical lands on the same path and
+# writes the same content, which is what makes re-running an unchanged installation a no-op. The
+# persisted URL is what selects a generation, and it is rewritten only where it always was: at the
+# environment-file publication and the identity snapshot, both far below every probe.
+#
+# THE OLD GENERATIONS ARE KEPT SO A ROLLBACK HAS SOMETHING TO ROLL BACK TO. prune_db_ca_generations()
+# runs at the END of a successful install and keeps: the generation this run published, the
+# generation the PREVIOUS installed DATABASE_URL named (unconditionally — that is the rollback
+# target), and the ${DB_CA_GENERATIONS_RETAINED} most recently modified of the rest. `ls -lt
+# /etc/ims-db-ca/` lists them newest first; re-running the installer with DB_SSLROOTCERT= naming one
+# of them republishes it — idempotently, onto its own path — and the next environment file names it
+# again. A failed run prunes nothing at all.
+#
+# A LITERAL, for the reason DB_ENV_SNAPSHOT_DIR is one: a privileged path resolved from a variable
+# the application can set is not a privileged path. The owner is a literal beside it so the
+# regression rigs — which run as an ordinary user with no root to give a file to, and which lift
+# FUNCTIONS rather than these assignments — can measure the mechanism without measuring `chown`.
+DB_CA_PUBLISH_DIR="/etc/ims-db-ca"
+DB_CA_PUBLISH_OWNER="root:root"
+# The generation name, in two halves so prune_db_ca_generations() can glob exactly what
+# db_ca_generation_file() emits and nothing else — the publication's own temporary files live in
+# the same directory and must not match.
+DB_CA_GENERATION_PREFIX="db-ca-"
+DB_CA_GENERATION_SUFFIX=".crt"
+# How many generations survive a prune BEYOND the two that are never pruned (this run's, and the one
+# the previous installation was using). Three is two rotations of headroom on a cluster whose CA
+# turns over yearly, and every one of them is a public certificate at 0644 — the cost of keeping
+# them is a few kilobytes, and the cost of not keeping them is an operator with no way back.
+DB_CA_GENERATIONS_RETAINED=3
+# WHICH GENERATION THIS RUN PUBLISHED, AND ITS DIGEST. Both are EMPTY until publish_db_ca() succeeds,
+# because that is the honest answer before it does — and because every refusal below quotes the
+# path, and a path quoted before anything was written there names a file that does not exist.
+DB_CA_PUBLISHED_FILE=""
+DB_CA_PUBLISHED_DIGEST=""
+# WHAT AN OPERATOR DOES WHEN A REFRESH REFUSES. Every refusal on the CA path ends with this, because
+# "nothing has been changed on this host" is a claim an operator has to be able to ACT on, and the
+# action is different from the one a first install takes. It is a single line so the two `die`
+# messages that quote it cannot drift apart.
+DB_CA_REFRESH_FAILURE_ADVICE="NO TRUST ROOT HAS BEEN REPLACED: each CA is published to its own generation under ${DB_CA_PUBLISH_DIR}, named after the digest of its contents, so a candidate can never be written over the generation an installed DATABASE_URL names. If this host already had a working installation it still has one — its environment file still names the generation it named before this run, that file is untouched, and 'systemctl start ${APP_NAME}.service' brings it back exactly as it was. Fix the certificate file and re-run; or, to go back to an earlier CA, 'ls -lt ${DB_CA_PUBLISH_DIR}' lists the retained generations newest first and re-running with DB_SSLROOTCERT= naming one of them republishes it."
+# THIS SCRIPT HAS NO --dry-run, AND UNDER `set -u` THAT WAS NOT THE SAME AS `false`
+# (o3d-2sm1.5 r45, found while adding a third reader of it).
+#
+# publish_db_identity_snapshot() and remove_db_identity_snapshot() were lifted from deploy.sh at
+# r23, and deploy.sh declares DRY_RUN beside its argument parser. install.sh has no such flag and
+# never declared the variable — so line 1 of the publisher expanded an unset name under
+# `set -euo pipefail`, and bash EXITS on that rather than returning non-zero. `f || die "..."`
+# does not catch it: `set -e` is suppressed for the left-hand side of `||`, `set -u` is not.
+#
+# The reachable effect was an install that died with `DRY_RUN: unbound variable` at "Setting up
+# application service" — unit written, database migrated, connection fence held, nothing started
+# and no explanation. It is declared here, `false`, because that is what this script always is.
+DRY_RUN=false
+# THE ROUTE GUARANTEE'S DROP-IN (o3d-2sm1.5 r45, Codex HIGH).
+#
+# The identity snapshot above binds WHICH DATABASE the service connects to. This one binds HOW it
+# gets there, and it is a different KIND of instrument: the snapshot is a value this run publishes
+# and the service reads, whereas this states a PROPERTY systemd itself enforces —
+#
+#     UnsetEnvironment=PGSSLMODE PGREPLICATION NODE_PG_FORCE_NATIVE
+#
+# — which systemd.exec(5) applies "as the final step ... immediately before it is passed to the
+# executed process", after every one of the six sources it lists (DefaultEnvironment=,
+# systemctl set-environment, the manager's own block, Environment=, EnvironmentFile= and PAM).
+#
+# THAT IS WHY IT REPLACES THE SURVEY r44 SHIPPED. r44 answered "is any of these three set?" by
+# reading the unit's properties and OPENING its environment files. Two things were wrong with
+# that and both are the same mistake. An EnvironmentFile= may be a WILDCARD — systemd.exec
+# documents the path as one — and `[[ -e "/etc/ims/*.env" ]]` is false for a glob that matches
+# files; so a file that sets PGSSLMODE read as absent. And even a literal path was a POINT-IN-TIME
+# read: systemd opens it at exec, minutes later, at the far end of a build and a migration, and
+# a line added in that window changes the route after the gate has passed. A directive removes
+# the variable whatever set it and whenever it was set, so neither question needs asking.
+#
+# `zz-` SO IT SORTS LAST. systemd applies drop-ins in lexicographic order and an EMPTY
+# `UnsetEnvironment=` RESETS the list; a later drop-in could therefore undo this one. The name
+# puts it after anything a person is likely to write — and the point is not the name anyway: the
+# directive is VERIFIED on the bus, on the COMPOSED unit, after the last daemon-reload, so a
+# drop-in that did reset the list is a refusal rather than a silent hole.
+#
+# IT IS PERMANENT, unlike the identity snapshot. The snapshot pins ONE run's database and is
+# removed again before this script exits; there is no run in which the application is supposed to
+# take its transport from an ambient variable, so this stays on the host. That is also what covers
+# the OTHER two entrypoints: deploy.sh and update.sh start the same unit and neither composes a
+# DATABASE_URL of its own, so neither has a transport to derive — what they need is that the
+# service they start cannot pick one up, and the directive left here is what gives them that.
+DB_ROUTE_DROPIN_NAME="zz-deploy-db-route.conf"
+DB_ROUTE_DROPIN_FILE="${FENCE_DROPIN_DIR}/${DB_ROUTE_DROPIN_NAME}"
 # ONE lock for all three entrypoints. deploy.sh and update.sh each held their own and this
 # script took none at all, so an install could run straight through another cutover.
 LOCK_FILE="${CUTOVER_STATE_DIR}/cutover.lock"
@@ -632,8 +860,1474 @@ LEGACY_FENCE_FILE="${LEGACY_CUTOVER_STATE_DIR}/FENCED"
 LEGACY_CRON_BACKUP="${LEGACY_CUTOVER_STATE_DIR}/crontab-${APP_USER}.bak"
 LEGACY_DB_FENCE_STATE="${LEGACY_CUTOVER_STATE_DIR}/db-connect-fence.json"
 DB_FENCE_SCRIPT="${APP_DIR}/scripts/fence-db-connections.mjs"
+# ---------------------------------------------------------------------------
+# WHICH BYTES OF THAT HELPER MAY RUN WITH DEPLOY_ADMIN_DATABASE_URL (o3d-2sm1.5 r31, Codex
+# CRITICAL). ${DB_FENCE_SCRIPT} is under the application-owned checkout this installer clones or
+# copies into place, and until this round every mode here — preflight, fence,
+# --print-migration-url, release, and the exit trap's re-fence — executed it from that path with
+# an administrative database credential in its environment. On an UPGRADE the checkout is an
+# existing installation's tree, owned by the application account, and that account can replace the
+# file between any two of those moments.
+#
+# The rule is stated ONCE, in the library below, and shared with update.sh and deploy.sh: r30
+# inverted the precedence in update.sh alone and left this script and deploy.sh reading the old
+# one. Nothing here resolves a fence script of its own; db_fence_script_in_use() does, and it
+# never returns ${DB_FENCE_SCRIPT}.
+#
+# SOURCED FROM THIS SCRIPT'S OWN DIRECTORY, WHICH ON AN UPGRADE IS NOT ${APP_DIR}: the installer
+# is run from the release being installed, and that is the more trustworthy of the two trees. It
+# is read at startup, in the same instant as the body of this file, so it adds no window this
+# entrypoint does not already have — unlike the helper, which is executed much later.
+IMS_SCRIPT_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib"
+# shellcheck source=lib/db-fence-protected.sh
+source "${IMS_SCRIPT_LIB_DIR}/db-fence-protected.sh" || {
+  echo "FATAL: ${IMS_SCRIPT_LIB_DIR}/db-fence-protected.sh could not be sourced. It decides which bytes the connection fence may be executed with, and without it this run cannot fence a migration window. Nothing has been changed." >&2
+  exit 1
+}
 DB_OBJECT_ACCESS_SCRIPT="${APP_DIR}/scripts/check-app-db-object-access.mjs"
-DB_FENCE_RELEASE_CMD="node ${DB_FENCE_SCRIPT} --release --state-file=${DB_FENCE_STATE}"
+# THE APPLICATION'S CONNECTION IDENTITY, WHICH THIS INSTALLER OWNS OUTRIGHT (o3d-2sm1.5 r19).
+#
+# scripts/fence-db-connections.mjs no longer works out where the application connects. Seven
+# rounds of deriving it — from the URL, from node-postgres's own resolution, from the deploy
+# shell's PG* variables, from the service's environment file, from `systemctl show` — each gave a
+# locally correct answer and uncovered another layer beneath it (PassEnvironment=,
+# UnsetEnvironment=, wildcard EnvironmentFile= globs, Next's per-mode dotenv overlays, a unit
+# with no WorkingDirectory=, DATABASE_URL's own precedence chain). The question is unbounded,
+# because the composition rules belong to systemd, Next and libpq at once. So the fence is TOLD,
+# and refuses if it is not.
+#
+# HERE THERE IS NOTHING TO PARSE AND NOTHING TO GUESS. This script PROMPTS for DB_HOST, DB_PORT,
+# DB_NAME and DB_USER, CREATEs the role and the database with them, and COMPOSES DATABASE_URL out
+# of them further down. The four values below are those same variables, and they are filled in at
+# that point — deliberately EMPTY until then, so a fence reached before the database exists (an
+# exit trap on an early failure) refuses rather than fencing an unnamed connection.
+DB_FENCE_IDENTITY_ARGS=()
+# ---------------------------------------------------------------------------
+# WHAT AN OPERATOR IS TOLD TO RUN (o3d-2sm1.5 r32, Codex HIGH x2)
+#
+# NOT A COMMAND LINE. r31 fixed which bytes this script executes and left every printed
+# instruction describing the world before it, which produced two separate defects of the same
+# kind:
+#
+#   * the printed `--release` line named the protected copy but had NO WAY TO OBTAIN
+#     DEPLOY_ADMIN_DATABASE_URL. The helper's `.env` load resolved against its own mirrored
+#     location, and the mirror holds no `.env`; this script's own copy of the variable lives in
+#     THIS shell and not in the operator's. Pasted, it failed while the database stayed fenced.
+#   * the re-fence banner — printed at the one moment when the schema has moved and the fence is
+#     down — still said `node ${DB_FENCE_SCRIPT} --fence`, the application-owned path, handing the
+#     admin credential to whatever is at it.
+#
+# So both are now ROOT-OWNED WRAPPERS, written by db_fence_publish_operator_wrappers() out of the
+# artefact this run resolved, with the state file and the four identity values baked in. They take
+# the credential from their own environment or from ${APP_DIR}/.env with the same reader
+# env_file_value() uses, re-verify the artefact digest before exec, and run as ${APP_USER}. There
+# is nothing to fill in and nothing to paste wrongly.
+#
+# AND THE INSTRUCTION IS NOT THE BARE PATH (o3d-2sm1.5 r33, Codex HIGH). Those wrappers are
+# root-owned and 0700. The operator most likely to be reading this banner launched the cutover
+# with `sudo bash scripts/...` and is back in a NON-ROOT shell, where pasting a bare path gives
+# `Permission denied` while the database is still fenced. ${DB_FENCE_SUDO_PREFIX} carries the
+# privilege transition, and it is empty only on a box with no sudo — which is a box this run
+# cannot have been launched on as anything but root, so the reader is root there.
+#
+# ONE ASSIGNMENT EACH, and every banner in this file prints these two variables rather than
+# composing a command of its own: that is the same "one rule, several readers" discipline the
+# fence library exists for, applied to the text.
+DB_FENCE_RELEASE_CMD="${DB_FENCE_SUDO_PREFIX}${DB_FENCE_RELEASE_WRAPPER}"
+DB_FENCE_REFENCE_CMD="${DB_FENCE_SUDO_PREFIX}${DB_FENCE_REFENCE_WRAPPER}"
+
+# THE ONE PLACE THIS SCRIPT DECIDES WHICH BYTES THE FENCE RUNS, and the one place the recovery
+# wrappers are refreshed — so the file that is executed and the file an operator is pointed at can
+# never be about different artefacts. Prints the script path; the reason for a refusal is already
+# on stderr from the library.
+#
+# A wrapper that could not be written is a WARNING and not a refusal: it is a convenience file in
+# a root-owned directory, and failing a fence over it would trade a real protection for a
+# cosmetic one. The path printed in the banners is still the right one to run — a previous run's
+# wrapper is very likely standing there — and the warning says the refresh did not happen.
+# ---------------------------------------------------------------------------
+# WAS THE DATABASE CREATED BY THIS RUN? (o3d-2sm1.5 r36, Codex CRITICAL)
+#
+# THE DEFECT. r35's policy — a first install performs no credentialed fence execution — rested on
+# a premise it never checked: "there is no writer to stop, because the database was created by
+# this run". upgrade_in_place() asks four questions and every one of them is about THIS HOST: the
+# service unit, the crontab, PM2, and processes whose working directory is ${APP_DIR}. None of
+# them is about the database. A fresh application host pointed at an existing, live, REMOTE
+# database answers no to all four, takes the exemption, and migrates a schema other writers are
+# using — which is the corruption the cutover fence exists to prevent, on the one path that skips
+# it. The reasoning was sound and the premise was assumed; so the premise is now PRODUCED by this
+# invocation, or the exemption is not available at all.
+#
+# WHAT COUNTS AS PROOF, AND WHY AN ALREADY-EXISTING DATABASE CANNOT FORGE IT.
+# `CREATE DATABASE <name>` succeeding, issued by this process against this host's local
+# PostgreSQL server. PostgreSQL rejects that statement with 42P04 duplicate_database when the name
+# is taken, so a zero exit is the SERVER stating that the object did not exist an instant earlier
+# and that this statement is what brought it into being. There is nothing an established database
+# can present that produces that exit status: it makes the statement FAIL, and it fails
+# identically whether it is empty, full, quiescent, or carrying a hundred connections. The proof
+# is about an EVENT this run caused, which is why it cannot be staged in advance.
+#
+# WHAT IS DELIBERATELY NOT PROOF, and this is the distinction the whole finding turns on: AN
+# EMPTY SCHEMA IS NOT A DATABASE THIS RUN CREATED. "No tables in public" is a statement about
+# content at one instant. It is true of a brand-new database and equally true of a database
+# another operator created five minutes ago and is about to migrate, of one whose objects live
+# under a different search_path, and of one whose writers are connected and idle right now. It is
+# also a race: content can arrive between the question and the migration. `datconnlimit`, a
+# `pg_stat_activity` headcount and "no other connections at this moment" are the same kind of
+# instant and are not proof either. None of them is used here.
+#
+# WHAT THIS RUN CANNOT ESTABLISH AT ALL, every case of which therefore falls to the fenced path:
+#   * INSTALL_POSTGRES=n — the supported external-database path creates no database, so there is
+#     nothing for this run to have proven. EVERY remote database is in this case.
+#   * INSTALL_POSTGRES=y over a database that already existed — CREATE DATABASE was refused as a
+#     duplicate. That is precisely the outcome the old `SELECT ... WHERE NOT EXISTS ... \gexec`
+#     swallowed while reporting success.
+#   * any indeterminate result — psql could not be reached, or the statement failed for a reason
+#     that is not duplication. That case now stops the run rather than continuing unproven.
+#   * a proof about a DIFFERENT database than the one about to be migrated.
+#
+# There is no fifth answer: the flag below starts false, and exactly one statement in this file
+# sets it true.
+# ---------------------------------------------------------------------------
+DB_CREATED_BY_THIS_RUN=false
+# The host:port/name CREATE DATABASE actually succeeded against, so proof about one database can
+# never be spent on another.
+DB_CREATED_IDENTITY=""
+# The identity the SERVER answered with on the connection that performed the CREATE: postmaster
+# start time, port and the new database's oid. Verified against the endpoint DATABASE_URL names.
+DB_CREATED_SERVER_IDENTITY=""
+# What this run established, in the words the refusal prints. Replaced at the creation step.
+DB_NEWNESS_FINDING="this run created no database, so nothing here established that the database it is about to migrate is new"
+# Why the exemption was refused, when it was. Set by first_install_exemption_available().
+FIRST_INSTALL_EXEMPTION_REFUSAL=""
+
+# ---------------------------------------------------------------------------
+# EVERY psql THIS SCRIPT RUNS IS TOLD WHERE TO GO, AND THE PROOF IS READ OFF THE
+# CONNECTION THAT PRODUCED IT (o3d-2sm1.5 r37, Codex CRITICAL)
+#
+# THE DEFECT. `create_database_and_record_newness` ran `run_as_user postgres psql -c "CREATE
+# DATABASE ..."` with no host, no port and no maintenance database, and then RECORDED
+# "${DB_HOST}:${DB_PORT}/${DB_NAME}" as the thing it had proven. Neither half was observed.
+# libpq fills every absent connection value from the environment — PGHOST, PGHOSTADDR, PGPORT,
+# PGDATABASE, PGSERVICE, PGUSER, and a pg_service.conf found through PGSYSCONFDIR — and
+# `run_as_user` preserves the environment on two of its three branches (`runuser -u ... --` and
+# the `su -s` fallback; only the `sudo` branch resets it, so the behaviour was not even uniform
+# across boxes). With PGPORT=5433 inherited from the invoking shell, the statement creates the
+# database on a SECOND cluster, exits 0, and this script writes down `localhost:5432` as proven.
+# Both halves are then true of DIFFERENT SERVERS, and the exemption skips the fence over a live
+# database on 5432 that this run never touched. `PSQLRC` is the same hole with a different shape:
+# a `\c` in a startup file moves the session before our statement runs.
+#
+# THIS BRANCH ESTABLISHED THAT FACT ITSELF, for the connection fence: DB_FENCE_IDENTITY_ARGS
+# exists because "no PGHOST/PGPORT/PGUSER/PGDATABASE in any process can move the connection away
+# from them". The same rule, a new reader, unapplied. So:
+#
+#   1. SANITISE. Every psql this script runs has every PG*/PSQL* variable removed from its
+#      environment first, so nothing inherited can supply a value we did not state.
+#   2. BIND. The superuser connection states its socket directory, its port and its maintenance
+#      database; the endpoint connection states host, port, user and database. -X ignores any
+#      psqlrc, -w refuses to block on a password prompt.
+#   3. PROVE. Sanitising is necessary and it is not sufficient — it makes the connection
+#      DETERMINISTIC, not CORRECT, and a wrong DB_LOCAL_SOCKET_DIR or a second cluster sharing a
+#      port would still land the CREATE somewhere else. So the identity is READ OFF THE
+#      CONNECTION THAT PERFORMED THE CREATE and compared with the identity read off a connection
+#      opened exactly the way the migration opens its own: TCP to ${DB_HOST}:${DB_PORT}. The
+#      exemption is licensed by that comparison, not by where this script believes it connected.
+# ---------------------------------------------------------------------------
+
+# The variables that can move a libpq connection, silence its refusal, or run SQL before ours.
+# Computed from the ACTUAL environment rather than from a list somebody has to keep current: any
+# exported PG*/PSQL* name is removed, which covers PGSERVICE, PGSYSCONFDIR, PGOPTIONS, PGSSL*,
+# PGTARGETSESSIONATTRS, PGLOADBALANCEHOSTS and whatever libpq adds next. Names are read from
+# `compgen -e`, so nothing here has to trust a caller-supplied string.
+#
+# Fills the caller's named array; `env -u X -u Y ... psql` then starts psql with them gone.
+libpq_env_unset_args() {
+  local -n _out="$1"
+  local var
+  _out=()
+  while IFS= read -r var; do
+    case "${var}" in
+      PG*|PSQL*) _out+=(-u "${var}") ;;
+    esac
+  done < <(compgen -e)
+}
+
+# WHERE THE LOCAL SUPERUSER CONNECTION GOES, STATED RATHER THAN INHERITED.
+#
+# It is a SOCKET directory and not a host, and that is deliberate: the CREATE is issued as the
+# `postgres` OS user, which Debian's default pg_hba admits by `peer` on the local socket and by
+# `scram-sha-256` over TCP — where that role has no password. Forcing -h localhost would
+# therefore break every ordinary install. The port still pins the CLUSTER (a socket is
+# .s.PGSQL.<port>), and the identity comparison below is what pins the SERVER.
+#
+# IMS_PG_SOCKET_DIR exists because the regression that proves this cannot use the machine's real
+# socket directory. It cannot weaken the proof: pointing it at another cluster does not produce
+# an exemption, it produces the refusal in verify_created_database_endpoint().
+db_local_socket_dir() {
+  if [[ -n "${IMS_PG_SOCKET_DIR:-}" ]]; then
+    printf '%s' "${IMS_PG_SOCKET_DIR}"
+  elif [[ -d /var/run/postgresql ]]; then
+    printf '%s' /var/run/postgresql
+  else
+    printf '%s' /tmp
+  fi
+}
+
+# The local superuser connection: sanitised, bound to this host's socket directory, this run's
+# port and the `postgres` maintenance database. Every psql in this file goes through here or
+# through pg_endpoint_psql below.
+pg_local_psql() {
+  local -a unset_args=()
+  libpq_env_unset_args unset_args
+  run_as_user postgres env "${unset_args[@]}" psql \
+    -X -w -v ON_ERROR_STOP=1 -v VERBOSITY=verbose \
+    -h "$(db_local_socket_dir)" -p "${DB_PORT}" -d postgres "$@"
+}
+
+# THE ROUTE A CREDENTIAL-BEARING CONNECTION IS PINNED TO (o3d-2sm1.5 r42, r43).
+#
+# Empty is libpq's own default, `sslmode=prefer` — which is what the server-identity read below
+# wants, for the reasons argued at length there. Set to `require` or `disable` it removes libpq's
+# run-time transport choice entirely, and with it the second pg_hba record an authentication
+# FAILURE could otherwise select. Since r43 the value it is set to is the APPLICATION'S route and
+# not a probe's, so a psql running under this pin is matched by the record that will match the
+# application.
+#
+# IT IS NEVER EXPORTED and its name begins with neither PG nor PSQL, so libpq_env_unset_args()
+# neither strips it nor mistakes it for a libpq setting. The functions that pin it set it inside a
+# SUBSHELL, which is what keeps a `VAR=x function` prefix's well-known persistence out of this.
+DB_ENDPOINT_ROUTE_SSLMODE=""
+# AND THE TRUST ROOT THE STRICTER MODES VERIFY AGAINST (r45). `verify-ca` and `verify-full` are
+# not a route on their own: libpq reads the CA from ~/.postgresql/root.crt when nothing names one,
+# and the probes run as the `postgres` OS user, whose home is not the operator's. So the CA travels
+# with the mode, from the same DB_SSLROOTCERT that went into the URL — which is what makes the
+# psql and the application verify against the same file rather than against two default stores.
+DB_ENDPOINT_ROUTE_SSLROOTCERT=""
+
+# A connection opened the way the APPLICATION opens its own: TCP, to the four values
+# DATABASE_URL is composed from. Used only to read a server identity back — and, with the route
+# above pinned, as the one credential-bearing probe on the rotation path.
+pg_endpoint_psql() {
+  local role="$1" password="$2" database="$3"
+  shift 3
+  local -a unset_args=() keep=() route=()
+  local i=0
+  libpq_env_unset_args unset_args
+  # THE PIN, AS TWO libpq SETTINGS AND NOT ONE. `sslmode` decides TLS; `gssencmode` decides GSSAPI
+  # encryption, defaults to `prefer` wherever libpq was built with GSSAPI, and a connection that
+  # takes it is matched by `hostgssenc` records — a third transport, and one the reader never
+  # negotiates. Pinning only the first would leave the divergence open on any host with a Kerberos
+  # credential cache. They come AFTER the `-u` options: env unsets during option parsing and
+  # assigns afterwards, so these win over anything the caller's environment carried.
+  # `:-` AND NOT A BARE EXPANSION. The default is "libpq's own", so the absence of the variable and
+  # its emptiness must mean the same thing — and this function is lifted whole by three separate
+  # regression rigs, only one of which has any reason to know the knob exists. Under `set -u` a bare
+  # expansion turns the other two into dead shells that report an unbound variable from inside a
+  # refusal message, which is how this landed the first time.
+  if [[ -n "${DB_ENDPOINT_ROUTE_SSLMODE:-}" ]]; then
+    route=("PGSSLMODE=${DB_ENDPOINT_ROUTE_SSLMODE}" "PGGSSENCMODE=disable")
+    [[ -z "${DB_ENDPOINT_ROUTE_SSLROOTCERT:-}" ]] || route+=("PGSSLROOTCERT=${DB_ENDPOINT_ROUTE_SSLROOTCERT}")
+  fi
+  # THE ONE VARIABLE THIS CONNECTION SUPPLIES ITSELF IS KEPT OUT OF THE UNSET LIST, and then
+  # EXPORTED rather than passed to `env` as an argument. `env PGPASSWORD=... psql` would put the
+  # credential in env's argv, where every process on the box can read it out of ps for as long as
+  # the connection lasts. Exporting it inside a subshell puts it in the environment instead,
+  # which is readable only by root — and leaves the caller's shell untouched, which a
+  # `VAR=x function` prefix would not: bash keeps such an assignment after a FUNCTION call.
+  while [[ "${i}" -lt "${#unset_args[@]}" ]]; do
+    [[ "${unset_args[$((i + 1))]}" == "PGPASSWORD" ]] || keep+=("${unset_args[${i}]}" "${unset_args[$((i + 1))]}")
+    i=$((i + 2))
+  done
+  (
+    export PGPASSWORD="${password}"
+    run_as_user postgres env "${keep[@]}" "${route[@]}" psql \
+      -X -w -v ON_ERROR_STOP=1 -v VERBOSITY=verbose \
+      -h "${DB_HOST}" -p "${DB_PORT}" -U "${role}" -d "${database}" "$@"
+  )
+}
+
+# ---------------------------------------------------------------------------
+# THE PASSWORD IS ONE STRING AND IT TRAVELS THROUGH TWO GRAMMARS (o3d-2sm1.5 r39, Codex HIGH).
+#
+# THE DEFECT. `ALTER USER "x" WITH PASSWORD '${DB_PASSWORD}'` set the role's password to the
+# LITERAL bytes of DB_PASSWORD, and the very next statement interpolated those same bytes RAW
+# into `postgresql://user:${DB_PASSWORD}@host:port/db`. Two different grammars, one substitution,
+# and the application does not read the URL the way this script wrote it. It reads it with
+# node-postgres, whose pg-connection-string does `decodeURIComponent(new URL(str).password)`.
+# Measured against the copy in this repo's node_modules (pg 8.20.0, pg-connection-string 2.12.0):
+#
+#   installed password   what the raw URL gives the driver
+#   ------------------   ----------------------------------------------------------------
+#   abc%2Fdef            "abc/def"   — authenticates as a DIFFERENT string than ALTER set
+#   AAA%25BBB            "AAA%BBB"   — likewise
+#   abc/def              THROWS "Invalid URL" — the URL is not parseable at all
+#   abc?def              THROWS "Invalid URL"
+#   abc#def              THROWS "Invalid URL"
+#   %FF                  THROWS "URI malformed"
+#
+# and that happens AFTER the predecessor has been stopped and its password taken away, so the
+# outage is total and the ALTER succeeded. A password with an apostrophe did not even get that
+# far: it broke out of the SQL literal.
+#
+# THE RULE, AND IT IS THE ONLY ONE THAT MAKES THE TWO HALVES INVERSES:
+#
+#   DB_PASSWORD is the LITERAL SERVER SECRET. It is SQL-quoted for the statement and
+#   PERCENT-ENCODED for the URL, and a URL found on disk is DECODED before it is compared with
+#   anything or used as a credential.
+#
+# `url_encode_userinfo` escapes everything outside RFC 3986 unreserved (ALPHA DIGIT - . _ ~), so
+# every byte it emits is either unreserved or a `%XX` with two hex digits. That set is what makes
+# the round trip exact rather than approximately exact: it leaves no character that WHATWG URL
+# parsing would re-encode, no `%` that pg-connection-string's malformed-escape pre-pass would
+# rewrite, and no `/`, `?`, `#`, `@` or `:` that could move a byte out of the userinfo altogether.
+#
+# VERIFIED AGAINST THE INSTALLED DRIVER, NOT AGAINST THE SPECIFICATION — the discipline this
+# branch used for the pooler and the clone. tests/scripts/install-credential-representation.test.ts
+# runs these two shell functions and hands their output to the `pg` in node_modules, on a real
+# cluster: 28 reserved-character passwords encode, parse back to the literal, and open a
+# connection the server accepts.
+# ---------------------------------------------------------------------------
+
+# A PostgreSQL string literal for an arbitrary byte string. Doubling `'` is the whole of the
+# escaping ONLY while standard_conforming_strings is on, which is the default since 9.1 and which
+# every caller SETs on the same connection immediately before the statement rather than assuming.
+# With it off, a backslash escapes, and `\'` inside a doubled literal reopens the quote.
+sql_quote_literal() {
+  local raw="$1"
+  printf "'%s'" "${raw//\'/\'\'}"
+}
+
+# Percent-encode for the userinfo of a URL, RFC 3986 unreserved set kept.
+#
+# LC_ALL=C is what makes this BYTE-wise: without it `${raw:i:1}` yields a CHARACTER in the
+# ambient locale and `printf "'%c"` yields its code point, so `ü` would be encoded as `%FC`
+# (Latin-1) rather than the `%C3%BC` the UTF-8 bytes require, and decodeURIComponent would throw
+# on it. Multibyte input is encoded one byte at a time, which is exactly what encodeURIComponent
+# does.
+url_encode_userinfo() {
+  local raw="$1" out="" i c
+  local LC_ALL=C LANG=C
+  for (( i = 0; i < ${#raw}; i++ )); do
+    c="${raw:i:1}"
+    case "${c}" in
+      [A-Za-z0-9._~-]) out+="${c}" ;;
+      *) out+="$(printf '%%%02X' "'${c}")" ;;
+    esac
+  done
+  printf '%s' "${out}"
+}
+
+# The inverse, and — for a URL this installer did NOT write — the same answer node-postgres
+# reaches. `%XX` with two hex digits becomes that byte; anything else, including a `%` that is
+# not followed by two hex digits, stays literal. That is not a simplification of the driver, it
+# is what the driver does: pg-connection-string pre-encodes a malformed escape to `%25` before
+# `new URL()` sees it, and decodeURIComponent then turns it back into a literal `%`.
+# tests/scripts/install-credential-representation.test.ts asserts the two agree on 25 legacy
+# spellings including `a%b`, `a%`, `a%2`, `a%zz`, `%%%`, `100%25pure`, `\back\slash` and — since
+# r40 — `a%0A`, whose decoded form ends in the byte a command substitution deletes.
+#
+# THE ONE DIVERGENCE, STATED. decodeURIComponent THROWS on a `%XX` sequence that is not valid
+# UTF-8 (`%FF`), where this returns the byte. A URL in that state cannot start the application at
+# all — the driver refuses to parse it — so the recovered value is used only to answer "is this a
+# rotation?", and the answer it gives (yes, because the two differ) is the safe one.
+#
+# The literal backslashes are protected BEFORE the `%XX` rewrite, so `printf '%b'` cannot
+# interpret a `\b` or a `\0` that was part of the password.
+url_decode_userinfo() {
+  local raw="$1" escaped
+  escaped="${raw//\\/\\\\}"
+  # THE SED STEP IS A CAPTURE TOO (o3d-2sm1.5 r40, Codex HIGH). It is inside this function rather
+  # than around it, so `capture` cannot reach it: a caller that hands in a userinfo containing a
+  # LITERAL trailing newline would have it eaten here, one layer below the fix. No URL read out of
+  # a `.env` line can be in that state — a line ends at the newline — but this function is the
+  # inverse of the encoder and it should be the inverse for every input, not for the reachable
+  # ones. Same sentinel, and it survives the substitution untouched because it contains no `%`.
+  escaped="$(printf '%s%s' "${escaped}" "${CAPTURE_TERMINATOR}" | sed -E 's/%([0-9A-Fa-f]{2})/\\x\1/g')"
+  escaped="${escaped%"${CAPTURE_TERMINATOR}"}"
+  printf '%b' "${escaped}"
+}
+
+# THE TRANSPORT, AS A DEPLOYMENT INPUT (o3d-2sm1.5 r45, Codex MEDIUM).
+#
+# THE FINDING. r44 refused every PGSSLMODE from every source and emitted a URL with no TLS
+# configuration in it. The installer documents external PostgreSQL as supported, and a great many
+# external clusters — every managed one — accept nothing but TLS. So the refusal made a documented
+# deployment impossible and its remediation ("remove PGSSLMODE") either left the application
+# unable to connect or asked an operator to give up a required trust boundary.
+#
+# THE REFUSAL WAS RIGHT ABOUT THE MECHANISM AND WRONG ABOUT THE WAY OUT. An AMBIENT PGSSLMODE is
+# still refused, for exactly the reason r44 gave: it moves the application onto a `hostssl` record
+# while the gate reads, probes and rotates against `hostnossl`, and it is invisible in the URL
+# this run publishes. What r44 was missing is a SUPPORTED spelling — a place to state the
+# transport where the gate can see it, and where the probes can be put on it. That place is the
+# URL, and it is stated here.
+#
+# AND THE SEMANTICS ARE THE DRIVER'S OWN, NOT A MAPPING THIS SCRIPT INVENTS. That was the whole
+# objection to deriving a route: node-postgres's `sslmode=` is NOT libpq's, so no psql pin
+# reproduces it. Measured against the installed pg-connection-string (2.12.0,
+# `node_modules/pg-connection-string/index.js:99-151`), the driver has TWO switch statements over
+# `sslmode` and picks between them on ONE query parameter:
+#
+#   without `uselibpqcompat`   `require` falls through to the default branch, leaving `ssl = {}` —
+#                              Node's `rejectUnauthorized: true` against Node's own CA bundle,
+#                              i.e. verify-full. That is the spelling r43 measured and refused.
+#   with `uselibpqcompat=true` `disable` -> ssl false; `prefer`/`require` -> rejectUnauthorized
+#                              false; `require` WITH an sslrootcert -> CA checked, hostname not;
+#                              `verify-ca` -> CA checked, hostname not; `verify-full` -> both.
+#                              Those are libpq's five, and the driver says so in its own comments.
+#
+# So the emitted URL carries `uselibpqcompat=true` beside `sslmode=`, and from that point on the
+# application's driver, the `psql` probes and the authentication-request reader are all describing
+# the same thing with the same word. The mapping is not reproduced here; it is SELECTED, by the
+# switch the driver ships for exactly this purpose.
+#
+# WHAT IS SUPPORTED, AND WHY NOT MORE. `disable` (the default, and what every installation before
+# this round emitted), `require`, `verify-ca` and `verify-full`. `prefer` is deliberately absent:
+# it picks its transport at RUN TIME, so an authentication FAILURE can fall onto a second pg_hba
+# record — the divergence this whole section exists to close.
+# EMPTY, NOT `disable`, AND THAT IS NOT A STYLE CHOICE. prompt() in --non-interactive mode keeps
+# whatever the variable ALREADY HOLDS and falls back to the default only when it is empty, which is
+# how every value in this script can be supplied as an environment variable. A `disable` written
+# here would therefore be indistinguishable from an operator's own `disable` — and it would beat
+# the value recovered from the previous run's DATABASE_URL, so an unattended upgrade of a TLS-only
+# installation would silently re-publish a cleartext URL. Empty means "nobody has said yet"; both
+# prompt branches settle it, and db_sslmode_is_supported() refuses an unsettled one.
+#
+# AND THE CALLER'S OWN VALUES ARE TAKEN FIRST, BECAUSE THIS ERASES THEM (o3d-2sm1.5 r46, Codex
+# HIGH).
+#
+# THE FINDING. The two assignments below are UNCONDITIONAL and they run at script scope, long
+# before prompt_db_sslmode(). prompt() in --non-interactive mode keeps whatever the variable
+# ALREADY HOLDS — that is how every value in this script is supplied as an environment variable —
+# so by the time it looked, the operator's `DB_SSLMODE=verify-full DB_SSLROOTCERT=/etc/ca.pem
+# bash install.sh --non-interactive` had already been overwritten with the empty string. The
+# transport then fell to the recovered value, which on a FIRST install is nothing, and from there
+# to `disable`. The TLS support r45 added worked only when a human typed it at the prompt; in the
+# mode installations are actually automated in, a TLS-only cluster was uninstallable and a cluster
+# that accepts both transports was contacted in cleartext without a word.
+#
+# THE PRECEDENCE IS THEREFORE WRITTEN OUT AND NOT LEFT TO ORDERING. An ordering that happens to
+# work is what produced this. What is captured here is only the INPUT; prompt_db_sslmode() selects
+# between it, the value recovered from the previous run's DATABASE_URL, and `disable`, in that
+# order, with an `if` an eye can check — and it assigns DB_SSLMODE from that selection rather than
+# relying on prompt() to reach the same answer by falling through.
+#
+# `-` AND NOT `:-`. An operator who exports DB_SSLMODE= (empty) has said nothing, which is exactly
+# what an unset variable says, and both must reach the recovery rather than one of them dying under
+# `set -u`.
+DB_SSLMODE_SUPPLIED="${DB_SSLMODE-}"
+DB_SSLROOTCERT_SUPPLIED="${DB_SSLROOTCERT-}"
+DB_SSLMODE=""
+DB_SSLROOTCERT=""
+
+db_sslmode_is_supported() {
+  case "${1:-}" in
+    disable|require|verify-ca|verify-full) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# The transport this run publishes, or nothing at all before either prompt branch has settled it.
+# `disable` and the empty value compose the same URL, which is what every installation before this
+# round emitted; they are NOT the same to db_sslmode_is_supported(), because a route nobody chose
+# is the whole subject of r43-r45 and it must not be derivable.
+db_sslmode_is_cleartext() {
+  [[ -z "${DB_SSLMODE}" || "${DB_SSLMODE}" == "disable" ]]
+}
+
+# The query string the modes above put on the URL, or nothing at all for `disable`.
+#
+# NOTHING IS PERCENT-ENCODED HERE AND NOTHING NEEDS TO BE. The mode is one of four literal words
+# and the CA path is validated (below) down to a character set that is unreserved in a URL query,
+# so there is no value in this string that could carry a `&`, a `?` or a space into it. That is a
+# validation rather than an escape on purpose: an escape that is right for `new URL()` and wrong
+# for libpq's own parser would be one more reimplementation of somebody else's rules, and the
+# emitted URL is read by three of them.
+db_url_route_query() {
+  ! db_sslmode_is_cleartext || return 0
+  printf '?sslmode=%s&uselibpqcompat=true' "${DB_SSLMODE}"
+  [[ -z "${DB_SSLROOTCERT}" ]] || printf '&sslrootcert=%s' "${DB_SSLROOTCERT}"
+}
+
+# THE ONE PLACE A DATABASE_URL IS COMPOSED. Both writers — the pre-stop classification and the
+# rotation inside the fenced window — go through here, so the encoding cannot be right in one and
+# missing in the other, which is the shape the r38 defect took.
+compose_database_url() {
+  local user="$1" password="$2" host="$3" port="$4" database="$5"
+  printf 'postgresql://%s:%s@%s:%s/%s%s' \
+    "$(url_encode_userinfo "${user}")" \
+    "$(url_encode_userinfo "${password}")" \
+    "${host}" "${port}" "${database}" \
+    "$(db_url_route_query)"
+}
+
+# THE ROUTE THE APPLICATION TAKES, AS THE libpq SETTING THAT REPRODUCES IT (o3d-2sm1.5 r43,
+# Codex HIGH).
+#
+# THE FINDING. Every alignment through r42 used a PROBE as the reference point: the reader observed
+# on libpq's `sslmode=prefer` and published what it got, and the psql probes were pinned to that.
+# The probes then agreed with each other and with nothing else — because the connection this whole
+# gate exists to vouch for is the APPLICATION'S, and the application does not use libpq at all.
+#
+# WHAT node-postgres DOES WITH THE URL compose_database_url() PRODUCES, MEASURED. Against the
+# installed `pg` (8.20.0) and `pg-connection-string` (2.12.0), a URL with no query string parses to
+# `ssl: undefined` and the driver's first bytes on the wire are the StartupMessage itself: NO
+# SSLRequest, no GSSENCRequest. That is libpq's `sslmode=disable`, and it is matched by
+# `hostnossl`/`host` records and never by a `hostssl` one. It is still what DB_SSLMODE=disable — the
+# default, and every installation that existed before r45 — emits.
+#
+# SO THE REFERENCE IS THE APPLICATION'S CONNECTION, AND EVERY OBSERVATION AND EVERY PROBE IS PUT ON
+# IT. r43 also measured the alternative — emitting `?sslmode=require` — and refused it: on the
+# installed pg-connection-string `require` is an ALIAS FOR verify-full (the driver says so itself,
+# on stderr), so it would demand a CA-verified certificate where the reader deliberately verifies
+# nothing and where a Debian cluster ships a self-signed one.
+#
+# THAT OBJECTION WAS RIGHT ABOUT THAT SPELLING AND r45 DOES NOT USE IT. The emitted URL carries
+# `uselibpqcompat=true` beside `sslmode=`, which is the driver's own switch into its
+# libpq-compatible branch, where `require` means encrypt-and-verify-nothing exactly as libpq's does
+# — see compose_database_url() above, where the two branches are read out of the driver line for
+# line. Nothing is reproduced here; a branch the driver ships is selected. And it changes what an
+# existing installation does at its next upgrade only if the operator asks: DB_SSLMODE defaults to
+# `disable`, and an upgrade recovers whatever the previous run published.
+#
+# IT ASKS THE COMPOSER RATHER THAN ASSERTING A CONSTANT, so the two cannot drift: the query string
+# the derivation expects is the one db_url_route_query() would compose, and a URL that does not end
+# in it stops the answer rather than answering the old one. The password is a placeholder because
+# url_encode_userinfo() percent-encodes everything outside the RFC 3986 unreserved set — a `?` in a
+# password reaches the URL as `%3F` — so no credential can put a query string there, and none is
+# needed to ask this question.
+# AND THE URL IS ONLY HALF OF THE DRIVER'S CONFIGURATION (o3d-2sm1.5 r44, Codex HIGH).
+#
+# THE FINDING. r43 answered `disable` BECAUSE THE COMPOSED URL HAS NO QUERY STRING. That is not
+# why node-postgres connects in the clear. The URL leaves `ssl` UNDEFINED, and the driver then
+# reads `process.env.PGSSLMODE` (`node_modules/pg/lib/connection-parameters.js:25-37,85`): a
+# service carrying `Environment=PGSSLMODE=…` takes a `hostssl` record while this gate reads,
+# probes and rotates against `hostnossl`. It is the defect this branch ALREADY FIXED one layer
+# down — libpq_env_unset_args() exists because libpq fills every absent connection value from the
+# environment — reaching a second driver the rule was never applied to.
+#
+# THE SET, MEASURED AND NOT LOOKED UP. `process.env` was replaced with a recording Proxy and a
+# ConnectionParameters built from exactly the URL compose_database_url() emits, against the
+# installed pg 8.20.0 and pg-connection-string 2.12.0. The driver consults these and no others:
+#
+#   PGSSLMODE                                       the SSL layer
+#   PGREPLICATION  PGOPTIONS                        the startup packet
+#   PGAPPNAME  PGBINARY  PGCLIENT_ENCODING  PGCONNECT_TIMEOUT
+#   NODE_PG_FORCE_NATIVE                            read at module load, `pg/lib/index.js:41`
+#
+# PGHOST, PGPORT, PGUSER, PGDATABASE and PGPASSWORD are NOT among them, and that is not luck: the
+# driver's `val()` takes the config value whenever it is truthy, and this URL states all five. The
+# r37 measurement therefore still holds — it just never covered the layer that has no URL field.
+#
+# OF THOSE, THE ONES THAT MOVE WHICH pg_hba RECORD ANSWERS, each measured against a real cluster
+# carrying `hostssl … trust` over `hostnossl … scram-sha-256`:
+#
+#   PGSSLMODE=no-verify   the driver completes TLS; pg_stat_ssl says ssl=true; the hostssl record
+#                         answers. That is the OPPOSITE record from the one r43 validates.
+#   PGSSLMODE=require     the driver demands a CA-verified certificate — its `require` is
+#                         verify-full, which r43 recorded from the other direction — and against a
+#                         self-signed cluster certificate it never authenticates at all.
+#   PGREPLICATION=…       the backend becomes a WAL sender, and pg_hba matches a WAL sender on the
+#                         `replication` keyword rather than on the database name.
+#   NODE_PG_FORCE_NATIVE  swaps the whole driver for libpq, which reopens PGSSLMODE, PGGSSENCMODE,
+#                         PGSERVICE, PGSYSCONFDIR and everything else this gate has bounded.
+#
+# The rest are read AFTER the record has been matched and move nothing: PGOPTIONS, PGAPPNAME,
+# PGBINARY, PGCLIENT_ENCODING, PGCONNECT_TIMEOUT. They are named here and deliberately not refused.
+#
+# AND THE ANSWER IS STILL REFUSE RATHER THAN DERIVE — BUT THE REFUSAL NOW HAS A WAY OUT (r45,
+# Codex MEDIUM). Deriving would mean reproducing node-postgres's TLS semantics for every value of
+# every variable above, and r43 and r44 were right that this script cannot: the driver's `require`
+# is not libpq's. What r44 got wrong was concluding that an operator who NEEDS a transport
+# therefore has nothing to do but delete a line. There is something to do, and it is one line in
+# the other direction: DB_SSLMODE=. Stating the transport there puts it in the URL, where the
+# derivation reads it and every probe is pinned to it, under `uselibpqcompat=true` so the word
+# means the same thing to all three clients — see compose_database_url() above. So an AMBIENT
+# value is refused (it is invisible to the URL and therefore to the probes) and a STATED one is
+# supported, and the refusal below says which is which.
+db_route_env_variables() {
+  printf '%s\n' PGSSLMODE PGREPLICATION NODE_PG_FORCE_NATIVE
+}
+
+# THE SUPPORTED SPELLING OF THE SAME INTENT, where there is one (r45). PGSSLMODE has one —
+# DB_SSLMODE puts the transport in the URL, where the derivation reads it and every probe is
+# pinned to it. The other two have none, and saying so is the point: a WAL-sender backend and a
+# libpq-instead-of-node-postgres swap are not deployment options this installer offers, so a
+# refusal that offered a way out would be inventing one.
+db_route_env_alternative() {
+  case "${1}" in
+    PGSSLMODE) printf ' — and if this deployment NEEDS an encrypted transport, state it as DB_SSLMODE=require (or verify-ca / verify-full with DB_SSLROOTCERT=) instead of exporting a variable: that puts it in the DATABASE_URL this run publishes, where the authentication-request reader and every credential probe are pinned to it' ;;
+    *) printf '' ;;
+  esac
+}
+
+# What each one does to the record, in the words the refusal prints.
+db_route_env_effect() {
+  case "${1}" in
+    PGSSLMODE) printf 'it decides whether node-postgres sends an SSLRequest, and a hostssl record is a different pg_hba record from a hostnossl one' ;;
+    PGREPLICATION) printf 'it turns the backend into a WAL sender, which pg_hba matches on the replication keyword rather than on the database name' ;;
+    NODE_PG_FORCE_NATIVE) printf 'it replaces node-postgres with libpq, which fills sslmode, gssencmode, service and host from the environment all over again' ;;
+    *) printf 'it is consulted by the driver when the URL leaves that field undefined' ;;
+  esac
+}
+
+# WHERE ONE CAN COME FROM, AND WHICH OF THOSE PLACES CAN BE CLOSED RATHER THAN SURVEYED
+# (o3d-2sm1.5 r45, Codex HIGH).
+#
+# r44 read THREE sources and called an absence in all three a proof: this process's environment,
+# the service manager's own block, and the unit — the unit's Environment=, PassEnvironment=,
+# UnsetEnvironment=, PAMName= and every EnvironmentFile=, which it OPENED and grepped. Two of the
+# three were surveys of MUTABLE state, and a survey answers about the moment it ran:
+#
+#   * an `EnvironmentFile=` may be a WILDCARD. systemd.exec(5) documents the path as one, and
+#     `[[ -e "/etc/ims/*.env" ]]` is false for a glob no matter how many files it matches. A file
+#     that set PGSSLMODE was read as absent.
+#   * and a LITERAL path was read HERE while systemd opens it THERE — at exec, past a git clone,
+#     an npm install, a Next build and a migration. A line added in that window moved the route
+#     after the gate had passed.
+#
+# SO THE TWO SOURCES SYSTEMD OWNS ARE NO LONGER SURVEYED. They are CLOSED, by a directive systemd
+# applies to every one of them (see DB_ROUTE_DROPIN_FILE and publish_db_route_guarantee):
+#
+#     UnsetEnvironment=PGSSLMODE PGREPLICATION NODE_PG_FORCE_NATIVE
+#
+# systemd.exec(5) is explicit about when that runs — "as the final step all variables listed in
+# UnsetEnvironment= are removed from the compiled environment variable list, immediately before it
+# is passed to the executed process" — and the list it is final over is the same six-item list
+# that names DefaultEnvironment=, `systemctl set-environment`, the manager's block, Environment=,
+# EnvironmentFile= and PAM. Wildcards, files written after this line ran, a PAM stack, a drop-in
+# from another tool: none of them survive it, and none of them has to be looked at.
+#
+# WHAT IS LEFT IS A PROPERTY, AND IT IS VERIFIED ON THE COMPOSED UNIT — on the bus, after the last
+# daemon-reload, immediately before the start. An empty `UnsetEnvironment=` in a later drop-in
+# RESETS the list, so the directive is not trusted because it was written; it is trusted because
+# systemd states it back.
+#
+# THE ONE SOURCE THAT CANNOT BE CLOSED THIS WAY IS THIS PROCESS. The migration, the build and
+# scripts/fence-db-connections.mjs are node processes THIS script starts, running the
+# application's own driver and inheriting this environment verbatim. No unit directive reaches
+# them, so an exported PGSSLMODE here is still a refusal — and now one with somewhere to go:
+# DB_SSLMODE= states the same intent where the whole gate can act on it.
+ENV_ROUTE_GUARANTEE_REASON=""
+
+# THE UNIT OBJECT ON THE BUS, or a sentence saying why there isn't one. Lifted out of
+# unit_env_var_sole_source() at r45 because two more callers needed the same six lines, and a
+# second copy of "how do I address a unit" is a second place for it to be got wrong.
+BUS_UNIT_OBJECT=""
+bus_unit_object() {
+  local unit="${1:-}" rendering load_state
+  BUS_UNIT_OBJECT=""
+  ENV_ROUTE_GUARANTEE_REASON=""
+  if ! command -v busctl >/dev/null 2>&1; then
+    ENV_ROUTE_GUARANTEE_REASON="busctl — systemd's own bus client, shipped beside systemctl — is not available, so ${unit}'s composed configuration cannot be read"
+    return 1
+  fi
+  rendering="$(busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager LoadUnit s "$unit" 2>/dev/null)" || rendering=''
+  if ! bus_read_strings "$rendering" || [[ "${#BUS_STRINGS[@]}" -ne 1 || -z "${BUS_STRINGS[0]}" ]]; then
+    ENV_ROUTE_GUARANTEE_REASON="systemd would not say where ${unit} lives on its bus, so its composed configuration cannot be read"
+    return 1
+  fi
+  BUS_UNIT_OBJECT="${BUS_STRINGS[0]}"
+  rendering="$(bus_unit_property "$BUS_UNIT_OBJECT" Unit LoadState)" || rendering=''
+  if ! bus_read_strings "$rendering" || [[ "${#BUS_STRINGS[@]}" -ne 1 ]]; then
+    ENV_ROUTE_GUARANTEE_REASON="systemd would not answer for ${unit}'s LoadState, so its composed configuration cannot be read"
+    return 1
+  fi
+  load_state="${BUS_STRINGS[0]}"
+  if [[ "$load_state" != "loaded" ]]; then
+    ENV_ROUTE_GUARANTEE_REASON="systemd reports ${unit} as '${load_state:-unknown}' rather than loaded, so its composed configuration cannot be read"
+    return 1
+  fi
+  return 0
+}
+
+# IS THE ROUTE GUARANTEE IN THE UNIT SYSTEMD HAS LOADED?
+#
+# Every route variable must appear in the composed UnsetEnvironment= as a BARE NAME. The
+# assignment form is NOT accepted and the difference is the whole of the r21 finding read the
+# other way round: systemd.exec takes "a space-separated list of variable names or variable
+# assignments", and an assignment removes ONLY that exact pair — `UnsetEnvironment=PGSSLMODE=require`
+# leaves `PGSSLMODE=no-verify` standing. A bare name removes the variable whatever its value.
+unit_route_env_guaranteed() {
+  local unit="${1:-}" rendering count name element found
+  bus_unit_object "$unit" || return 1
+  rendering="$(bus_unit_property "$BUS_UNIT_OBJECT" Service UnsetEnvironment)" || rendering=''
+  if ! count="$(bus_array_count "$rendering" 'as')" || ! bus_read_strings "$rendering" \
+    || [[ "${#BUS_STRINGS[@]}" -ne "$count" ]]; then
+    ENV_ROUTE_GUARANTEE_REASON="systemd would not answer readably for ${unit}'s UnsetEnvironment=, so whether the transport variables are removed from the service's environment at exec is unknown"
+    return 1
+  fi
+  local -a unset_names=()
+  unset_names=(${BUS_STRINGS[@]+"${BUS_STRINGS[@]}"})
+  while IFS= read -r name; do
+    found=false
+    for element in ${unset_names[@]+"${unset_names[@]}"}; do
+      [[ "$element" == "$name" ]] || continue
+      found=true
+      break
+    done
+    if ! $found; then
+      # CONCATENATION AND NOT `printf -v`. The sentence quotes systemd's own composed list back,
+      # and a `%` anywhere in it — in an assignment's VALUE, which UnsetEnvironment= may carry —
+      # would be read as a conversion by a format string, so the refusal would either lose text or
+      # print a literal it never saw.
+      ENV_ROUTE_GUARANTEE_REASON="${unit}'s loaded configuration does not list ${name} as a bare name in UnsetEnvironment= (systemd composes it as: ${unset_names[*]:-nothing at all}), so systemd does not remove it from the service's environment at exec — and ${name} reaching the application means $(db_route_env_effect "${name}"). The ${DB_ROUTE_DROPIN_NAME} drop-in this installer writes states exactly that directive; a later drop-in whose own UnsetEnvironment= is EMPTY resets the list and is the usual cause"
+      return 1
+    fi
+  done < <(db_route_env_variables)
+  return 0
+}
+
+# THE COMPOSED ExecStart, WHICH IS THE ONE LAYER UnsetEnvironment= CANNOT REACH (r45, Codex HIGH).
+#
+# UnsetEnvironment= is final over the environment systemd COMPOSES. It is not final over what the
+# launched program does to its own environment afterwards, and
+#
+#     ExecStart=/usr/bin/env PGSSLMODE=no-verify /opt/app/node_modules/.bin/next start -p 3000
+#
+# is a drop-in that sets the variable AFTER systemd has finished — inside the process, one exec
+# later. It appears in no Environment=, no PassEnvironment=, no UnsetEnvironment= and no
+# EnvironmentFile=, it survives a rewrite of the base unit, and it puts the application on the
+# `hostssl` record this run never authenticated against. The file already admitted this blind spot
+# for DATABASE_URL and left it open; here it is closed, and it is closed the only way an
+# unbounded question ever gets closed on this branch — by asking a BOUNDED one instead.
+#
+# THE BOUNDED QUESTION IS NOT "does this ExecStart set a variable?" (that means reading programs)
+# BUT "is this the ExecStart this installer wrote?". The unit is written by this script a few
+# lines above the start, so the expected command is not inferred from anything: it is the same
+# five strings the here-doc emitted. Anything else — a wrapper, an override, a second command, a
+# path systemd had to escape to state — is a refusal that prints both.
+#
+# systemd renders ExecStart as `a(sasbttttuii)`: for each command a path, an argv ARRAY, an
+# ignore-failure boolean and seven counters. bus_read_strings() returns the path followed by the
+# argv, in order, and bus_array_count() gives systemd's own count of COMMANDS — so "exactly one,
+# and it is this one" is answered from the data structure and not from where a space falls.
+UNIT_EXECSTART_REASON=""
+unit_execstart_is_exactly() {
+  local unit="${1:-}"; shift
+  local -a expected=("$@")
+  local rendering count index
+  UNIT_EXECSTART_REASON=""
+  if ! bus_unit_object "$unit"; then
+    UNIT_EXECSTART_REASON="$ENV_ROUTE_GUARANTEE_REASON"
+    return 1
+  fi
+  rendering="$(bus_unit_property "$BUS_UNIT_OBJECT" Service ExecStart)" || rendering=''
+  if ! count="$(bus_array_count "$rendering" 'a(sasbttttuii)')" || ! bus_read_strings "$rendering"; then
+    UNIT_EXECSTART_REASON="systemd would not answer readably for ${unit}'s ExecStart=, so what the service is about to run — and therefore whether anything wraps it — is unknown"
+    return 1
+  fi
+  if [[ "$count" -ne 1 ]]; then
+    UNIT_EXECSTART_REASON="${unit} is composed with ${count} ExecStart= commands and this installer writes exactly one. A second command is a program this run has not read, and a program can set any environment variable it likes after systemd has finished composing one — including the transport variables. Remove the drop-in that adds it"
+    return 1
+  fi
+  if [[ "${#BUS_STRINGS[@]}" -ne "${#expected[@]}" ]]; then
+    UNIT_EXECSTART_REASON="${unit} is composed with ExecStart=${BUS_STRINGS[*]:-nothing at all}, and this installer wrote ExecStart=${expected[*]}. A different command line is a program this run has not read — the shape that matters is a wrapper such as \`/usr/bin/env PGSSLMODE=no-verify …\`, which sets the transport INSIDE the launched process, where no systemd property and no UnsetEnvironment= can reach it. Remove the drop-in that overrides ExecStart=, or re-run the installer"
+    return 1
+  fi
+  for (( index = 0; index < ${#expected[@]}; index++ )); do
+    [[ "${BUS_STRINGS[index]}" == "${expected[index]}" ]] && continue
+    UNIT_EXECSTART_REASON="${unit} is composed with ExecStart=${BUS_STRINGS[*]}, and this installer wrote ExecStart=${expected[*]} (they differ at element $((index + 1))). A different command line is a program this run has not read — the shape that matters is a wrapper such as \`/usr/bin/env PGSSLMODE=no-verify …\`, which sets the transport INSIDE the launched process, where no systemd property and no UnsetEnvironment= can reach it. Remove the drop-in that overrides ExecStart=, or re-run the installer"
+    return 1
+  done
+  return 0
+}
+
+# The five strings the unit's own here-doc emits, in the order systemd states them back: the
+# binary, then argv. Written once and read by both the writer and the check, so a change to one
+# is a change to the other.
+db_service_execstart_expected() {
+  printf '%s\n' "${APP_DIR}/node_modules/.bin/next" "${APP_DIR}/node_modules/.bin/next" start -p "${APP_PORT}"
+}
+
+# THE REASON COMES OUT ON STDOUT and not in a global, because every consumer of the route reads it
+# through `$( )` and a global set inside a command substitution does not survive the subshell.
+# That is how a refusal comes to be silently generic, and this branch has shipped that once.
+#
+# TWO MOMENTS, AND THEY ASK DIFFERENT QUESTIONS (r45).
+#
+#   installer  the reconciliation and the rotation. What matters here is the connection THIS
+#              SCRIPT's own node processes make, because they are the ones the gate observes on.
+#              The service's future environment is not surveyed at all any more: it is closed by
+#              the directive, which is installed and verified before anything starts.
+#   service    the start. The installer's own environment still matters — it is the same refusal —
+#              and on top of it systemd must STATE that it removes the three at exec, and the
+#              composed ExecStart must be the one this run wrote.
+#
+# NOTHING HERE WRITES ANYTHING: three environment reads and, in `service` mode, two `busctl`
+# get-property calls.
+db_application_route_env_refusal() {
+  local mode="${1:-installer}" name
+  while IFS= read -r name; do
+    # THIS PROCESS. Not a proxy for the service's environment — a source in its own right, and the
+    # one source no unit directive can close. The MIGRATION, the BUILD and
+    # scripts/fence-db-connections.mjs are node processes this script starts, they run the
+    # application's own driver, and they inherit this environment verbatim.
+    if [[ -n "${!name+is-set}" ]]; then
+      printf 'this installer is running with %s=%s in its own environment, and %s. The migration, the build and the connection fence are started from here and inherit it, so the connection this gate vouches for is not the one it observed. Unset %s and re-run%s' \
+        "${name}" "${!name}" "$(db_route_env_effect "${name}")" "${name}" "$(db_route_env_alternative "${name}")"
+      return 1
+    fi
+  done < <(db_route_env_variables)
+  # THE MODE IS ENUMERATED, NOT DEFAULTED PAST. `|| return 0` on a `== "service"` test would make
+  # every misspelling of the stricter mode silently take the weaker one — a start gate that
+  # checked nothing, and looked exactly like one that passed.
+  case "${mode}" in
+    installer) return 0 ;;
+    service) ;;
+    *) printf 'db_application_route_env_refusal was asked for a %s check, and the only questions it answers are the installer one (this process) and the service one (this process, plus the properties of the composed unit). That is a programming error in this script, not a condition of this host' "$(printf '%q' "${mode}")"; return 1 ;;
+  esac
+  if ! unit_route_env_guaranteed "${APP_NAME}.service"; then
+    printf '%s' "${ENV_ROUTE_GUARANTEE_REASON}"
+    return 1
+  fi
+  local -a expected_execstart=()
+  mapfile -t expected_execstart < <(db_service_execstart_expected)
+  if ! unit_execstart_is_exactly "${APP_NAME}.service" ${expected_execstart[@]+"${expected_execstart[@]}"}; then
+    printf '%s' "${UNIT_EXECSTART_REASON}"
+    return 1
+  fi
+  return 0
+}
+
+# THE ROUTE, AS THE libpq `sslmode=` EVERY PROBE IS PINNED TO.
+#
+# It is DB_SSLMODE, checked back against the URL this run would actually publish rather than
+# asserted from the variable: if a later round ever changes what compose_database_url() puts on
+# the end, this stops answering instead of answering the old answer. The three words it can return
+# are libpq's own AND — because the emitted URL carries `uselibpqcompat=true` — node-postgres's
+# own, which is what makes a psql pinned to them the same transport decision the application makes.
+db_application_route_sslmode() {
+  local url reason expected_query
+  # THE ENVIRONMENT FIRST, because an ambient value is invisible in the URL and beats it.
+  if ! reason="$(db_application_route_env_refusal installer)"; then
+    printf '%s' "${reason}"
+    return 1
+  fi
+  if ! db_sslmode_is_supported "${DB_SSLMODE}"; then
+    printf 'DB_SSLMODE is %s, and the transports this installer can put every probe on are disable, require, verify-ca and verify-full. An empty value means no prompt branch has settled it yet, which is a route nobody chose' "$(printf '%q' "${DB_SSLMODE}")"
+    return 1
+  fi
+  url="$(compose_database_url "${DB_USER}" "irrelevant" "${DB_HOST}" "${DB_PORT}" "${DB_NAME}")"
+  case "${url}" in
+    postgresql://*) ;;
+    *) printf 'the DATABASE_URL this run would publish is not a postgresql:// URL, so what node-postgres does with it has not been measured'; return 1 ;;
+  esac
+  expected_query="$(db_url_route_query)"
+  if [[ -z "${expected_query}" ]]; then
+    case "${url}" in
+      *\?*) printf 'the DATABASE_URL this run would publish carries a query string this run did not compose, and a query string is what gives node-postgres an ssl setting of its own — so the URL is not of the shape the driver was measured against and the route it would take is unknown'; return 1 ;;
+    esac
+  elif [[ "${url}" != *"${expected_query}" ]]; then
+    printf 'the DATABASE_URL this run would publish does not end in the transport query string DB_SSLMODE=%s composes (%s), so what node-postgres does with it has not been measured' "${DB_SSLMODE}" "${expected_query}"
+    return 1
+  fi
+  printf '%s' "${DB_SSLMODE}"
+}
+
+# WHAT "THE SAME SERVER" MEANS HERE, IN ONE PLACE, READ BY BOTH CONNECTIONS.
+#
+#   pg_postmaster_start_time()  the same microsecond stamp on every backend of one postmaster and
+#                               a different one on any other. THE FENCE LIBRARY ALREADY USES
+#                               EXACTLY THIS as its "are these two connections the same cluster?"
+#                               test (assessUnrecordedRelease); this is that rule applied at the
+#                               statement that produces the newness proof.
+#   current_setting('port')     the port the server itself believes it is on, which is not the
+#                               port we dialled and can disagree with it.
+#   the database's oid          assigned by this server when the CREATE ran. Two clusters that
+#                               both hold a database of this name will almost never agree on it,
+#                               and it ties the identity to the OBJECT rather than to the server
+#                               alone.
+#
+# WHY NOT system_identifier, which is the obvious candidate: a pg_basebackup clone INHERITS its
+# origin's system identifier, so a clone and its origin — the two servers most likely to be
+# running side by side on a box being cut over — are indistinguishable by it. It is also
+# superuser-only (pg_control_system), and the endpoint connection is deliberately NOT a
+# superuser, so it could not be compared even if it discriminated. The postmaster start time
+# separates a clone from its origin; every field here is readable by an ordinary login role.
+#
+# All three are emitted as ONE marked line, so a psql notice or a wrapper's banner cannot be
+# mistaken for the identity.
+pg_server_identity_select() {
+  cat <<'IMS_IDENTITY_SQL'
+SELECT 'IMS_SERVER_IDENTITY '
+       || current_setting('port') || ' '
+       || (EXTRACT(EPOCH FROM pg_postmaster_start_time()) * 1000000)::bigint::text || ' '
+       || coalesce((SELECT oid FROM pg_database WHERE datname = :'dbname')::text, 'absent')
+IMS_IDENTITY_SQL
+}
+
+# The IMS_SERVER_IDENTITY line out of a psql run, and nothing else.
+pg_extract_server_identity() {
+  printf '%s\n' "$1" | grep -m1 '^IMS_SERVER_IDENTITY ' || true
+}
+
+# THE PROOF IS ABOUT THE SERVER THE MIGRATION WILL USE, OR IT IS NOT PROOF (o3d-2sm1.5 r37,
+# Codex CRITICAL). Called with the identity read on the connection that performed the CREATE.
+#
+# It opens a SECOND connection — TCP, to the four values DATABASE_URL is composed from, which is
+# the endpoint the application will use — and asks it the same question. Equal answers mean one
+# postmaster, on the port this run will dial, holding the database object this run created.
+# Anything else stops the run: a CREATE that landed somewhere else means the endpoint the
+# migration is about to use holds a database this run did NOT create, which is the live database
+# the fence exists for.
+#
+# WHY A THROWAWAY ROLE. The endpoint has to be reached as SOMEBODY, and at this point in the run
+# there is deliberately no usable application credential: the role work now happens after
+# cutover classification (see provision_database_role_and_privileges), precisely so that a
+# refusal cannot land after a live role's password has been changed. So this creates a role that
+# by construction nothing else uses, with a random password, reads one row as it, and drops it.
+# It cannot collide with an existing role and it cannot alter one.
+#
+# AND IT IS DELIBERATELY NOT PINNED — RE-ARGUED AGAINST THE NEW REFERENCE POINT (r42, and r43,
+# Codex HIGH). r42 bound every credential-bearing probe on the ROTATION path to the transport the
+# authentication-request reader observed; r43 moved the reference from that reader to the
+# APPLICATION'S own connection, which is `sslmode=disable`. This connection carries a credential
+# and runs at a point where that route is perfectly well known, so the question was put a second
+# time. The first half of the r42 answer survives the change; the second half did not, and is
+# replaced:
+#
+#   * ITS CONCLUSION CANNOT BE FALSIFIED BY A TRANSPORT DIVERGENCE — UNCHANGED, AND IT IS THE
+#     WHOLE ARGUMENT. What it asserts is that the postmaster answering ${DB_HOST}:${DB_PORT} is
+#     the one the CREATE landed on, and it asserts it by comparing a start time, a port and a
+#     database oid. Which pg_hba record admitted the connection does not change which postmaster
+#     answered it, so falling back from TLS to the clear — or being let in by `trust` — changes
+#     nothing about the identity that comes back. The rotation probes are pinned because their
+#     conclusion is ABOUT the authentication; this one's is about the server behind it, and a pin
+#     could therefore only change whether it CONNECTS, never what it concludes.
+#   * WHAT r42 SAID SECOND WAS THAT PINNING WOULD MAKE IT LESS LIKE THE APPLICATION. That reason
+#     is now the wrong way round and is withdrawn: since r43 "like the application" has a definite
+#     value, `disable`, and pinning would make this connection MORE like it. It is still not
+#     pinned, for the reason the first bullet gives plus one this function's failure mode makes
+#     decisive: EVERY REFUSAL HERE IS A die(). It authenticates as a THROWAWAY ROLE, not as
+#     ${DB_USER}, and pg_hba records may name a role — `hostnossl <db> imsuser ... scram` beside
+#     `hostssl <db> all ... scram` is a legal and ordinary file. Under a pin that role-specific
+#     layout turns a run that would have completed into a stopped install, and it would buy
+#     nothing, because the identity that comes back is the same on either transport.
+#
+# The route the ROTATION uses is therefore left alone by this function: it neither reads
+# DB_PROBE_SSLMODE nor sets it, and DB_ENDPOINT_ROUTE_SSLMODE is empty on every path into here.
+verify_created_database_endpoint() {
+  local created_identity="$1"
+  local probe_role probe_password probe_output="" probe_identity="" status=0
+
+  probe_role="ims_newness_probe_$(openssl rand -hex 6)"
+  probe_password="$(openssl rand -hex 24)"
+
+  # Hex by construction, so nothing here interpolates an operator-supplied byte into SQL, and
+  # neither value reaches argv.
+  pg_local_psql -q >/dev/null 2>&1 <<EOSQL || die "This run created database '${DB_NAME}' but could not create the throwaway role it verifies the connection with, so it cannot show that the database it created is on the server the migration will use. NOTHING HAS BEEN MIGRATED."
+    CREATE ROLE "${probe_role}" LOGIN PASSWORD '${probe_password}';
+EOSQL
+
+  # THE SQL ARRIVES ON STDIN AND NOT THROUGH -c. psql performs NO variable interpolation on a
+  # -c string — it is handed to the server verbatim — so `:'dbname'` would reach PostgreSQL as a
+  # syntax error. On stdin it is psql that quotes the identifier and the literal, which is what
+  # keeps an operator-supplied database name out of the SQL grammar.
+  probe_output="$(pg_endpoint_psql "${probe_role}" "${probe_password}" "${DB_NAME}" \
+    -q -tA -v dbname="${DB_NAME}" <<EOSQL 2>&1
+$(pg_server_identity_select);
+EOSQL
+  )" || status=$?
+  probe_identity="$(pg_extract_server_identity "${probe_output}")"
+
+  pg_local_psql -q >/dev/null 2>&1 <<EOSQL || warn "The throwaway verification role ${probe_role} could not be dropped. Remove it by hand: DROP ROLE \"${probe_role}\";"
+    DROP ROLE IF EXISTS "${probe_role}";
+EOSQL
+
+  if [[ "${status}" -ne 0 || -z "${probe_identity}" ]]; then
+    die "This run created database '${DB_NAME}', but could not then reach ${DB_HOST}:${DB_PORT}/${DB_NAME} the way the application will, so it cannot show that the database it created is the one about to be migrated. The migration uses that same endpoint and would fail here too. NOTHING HAS BEEN MIGRATED. psql said: ${probe_output}"
+  fi
+
+  if [[ "${probe_identity}" != "${created_identity}" ]]; then
+    die "THE DATABASE THIS RUN CREATED IS NOT ON THE SERVER IT IS ABOUT TO MIGRATE. CREATE DATABASE succeeded on the server that answered '${created_identity}' (postmaster start time, port and database oid), and ${DB_HOST}:${DB_PORT}/${DB_NAME} — the endpoint DATABASE_URL names — answered '${probe_identity}'. Those are different servers, so the CREATE proves nothing about the database about to be migrated, and that database is one this run did not create: it may have writers on it right now. A stray PGHOST/PGPORT/PGSERVICE in the invoking environment is the usual cause, and IMS_PG_SOCKET_DIR is the other. NOTHING HAS BEEN MIGRATED. An empty database was created on the other server and can be dropped."
+  fi
+}
+
+# THE ONE STATEMENT IN THIS FILE THAT CAN SET DB_CREATED_BY_THIS_RUN (o3d-2sm1.5 r36, Codex
+# CRITICAL). Called only on the INSTALL_POSTGRES=y path, which is the only path that creates
+# anything at all.
+#
+# This step used to be one line inside the setup heredoc:
+#
+#   SELECT 'CREATE DATABASE x' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname='x') \gexec
+#
+# which does the right thing and RECORDS NOTHING. It succeeds identically whether it created the
+# database or found one already there, so the exemption downstream had no way to tell the two
+# apart and read "no launcher on this host" as if it meant "no database before this run".
+#
+# So the statement is issued UNCONDITIONALLY and the server is allowed to answer:
+#   exit 0                     -> this statement brought the database into being. PROOF, once
+#                                 verify_created_database_endpoint() has shown it is proof about
+#                                 the server the migration will use.
+#   42P04 duplicate_database   -> it was already there. A supported outcome, not an error: the
+#                                 install continues, it simply does not get the exemption.
+#   anything else              -> indeterminate. The run stops, exactly as ON_ERROR_STOP did
+#                                 before, rather than continuing over a database it cannot
+#                                 describe.
+#
+# THE DUPLICATE IS RECOGNISED BY SQLSTATE, NOT BY ENGLISH (o3d-2sm1.5 r37, Codex HIGH). This used
+# to match /already exists/i, which is a message the server localises: on a cluster with
+# lc_messages set to anything but English, the ONE outcome that means "there is a live database
+# here" was classified as indeterminate. `VERBOSITY=verbose` puts the SQLSTATE in the ERROR line
+# itself, and 42P04 is the same five bytes in every locale.
+create_database_and_record_newness() {
+  local output="" status=0 created_identity=""
+  # ONE SESSION, ON STDIN: the identity is read on the connection that performed the CREATE, and
+  # ON_ERROR_STOP means the SELECT never runs if the CREATE did not. -c is not usable here —
+  # psql does no variable interpolation on a -c string, so `:"dbname"` would reach the server as
+  # a syntax error rather than as a quoted identifier.
+  output="$(pg_local_psql -q -tA -v dbname="${DB_NAME}" <<EOSQL 2>&1
+CREATE DATABASE :"dbname";
+$(pg_server_identity_select);
+EOSQL
+  )" || status=$?
+  if [[ "${status}" -eq 0 ]]; then
+    created_identity="$(pg_extract_server_identity "${output}")"
+    [[ -n "${created_identity}" ]] || die "CREATE DATABASE '${DB_NAME}' succeeded but the server did not answer the identity question on the same connection, so this run cannot say WHICH server it created that database on. NOTHING HAS BEEN MIGRATED. psql said: ${output}"
+    verify_created_database_endpoint "${created_identity}"
+    DB_CREATED_BY_THIS_RUN=true
+    DB_CREATED_IDENTITY="${DB_HOST}:${DB_PORT}/${DB_NAME}"
+    DB_CREATED_SERVER_IDENTITY="${created_identity}"
+    DB_NEWNESS_FINDING="CREATE DATABASE was issued by this run on the server that answered '${created_identity}' and succeeded, and a connection opened to ${DB_HOST}:${DB_PORT}/${DB_NAME} the way the application opens its own answered with the same identity — so '${DB_NAME}' did not exist an instant before this run created it, on the server about to be migrated"
+    success "Database '${DB_NAME}' was CREATED by this run — the server refused no duplicate, so it did not exist before."
+    success "And it is the server the migration will use: the connection that created it and a connection to ${DB_HOST}:${DB_PORT} report the same postmaster, port and database oid."
+    return 0
+  fi
+  if printf '%s' "${output}" | grep -q '42P04'; then
+    DB_CREATED_BY_THIS_RUN=false
+    DB_NEWNESS_FINDING="database '${DB_NAME}' already existed on this server — CREATE DATABASE was refused as a duplicate (SQLSTATE 42P04) — so this run did not create it and cannot say who else is using it"
+    warn "Database '${DB_NAME}' already existed. This run did NOT create it, so it is treated as a live database and this run is fenced."
+    return 0
+  fi
+  die "Creating database '${DB_NAME}' failed for a reason that is not SQLSTATE 42P04 duplicate_database, so this run cannot say whether that database exists, is reachable, or is safe to migrate. NOTHING HAS BEEN MIGRATED. psql said: ${output}"
+}
+
+
+# ---------------------------------------------------------------------------
+# THE APPLICATION ROLE: WHAT MAY HAPPEN BEFORE THE RUN KNOWS IT MAY PROCEED, AND WHAT MAY NOT
+# (o3d-2sm1.5 r37, Codex HIGH)
+#
+# Split in two, along exactly one line: whether the statement can take something away from a
+# client that is using this database right now.
+#
+#   ensure_database_role_exists()              creates the role IF IT IS ABSENT. Nothing can be
+#                                              connected as a role that does not exist, so this
+#                                              is safe at any point, and the fence preflight
+#                                              needs it to have happened.
+#   provision_database_role_and_privileges()   grants on the database and moves its OWNER. Both
+#                                              are felt by somebody else's connection, so neither
+#                                              may run until this run has classified the cutover
+#                                              and, on the fenced path, until
+#                                              require_fenceable_database() has proved the window
+#                                              can be held closed.
+#   rotate_database_password_in_fenced_window() ALTERs the password of a role that WAS already
+#                                              there. That is the one statement here which takes
+#                                              a working credential AWAY from every client using
+#                                              it, so it does not run on this side of the stop at
+#                                              all — see below.
+#
+# AND THE PASSWORD IS NOT HERE AT ALL ANY MORE (o3d-2sm1.5 r38, Codex HIGH). r37 left the ALTER
+# on this side of the stop and argued the boundary was as late as it could be: the build runs
+# BEFORE the stop, deliberately, so that a release that will not compile costs no outage, and the
+# build is handed DATABASE_URL. Rotating after the raise therefore seemed to hand the build a
+# credential the server does not have.
+#
+# Both halves of that were wrong, and the second one is what made the first matter:
+#
+#   * THE DEFAULT SHOULD NEVER HAVE BEEN A ROTATION. The local-database prompt defaulted
+#     DB_PASSWORD to `openssl rand -hex 16` — a NEW secret every run — so an operator pressing
+#     Enter through an ordinary re-install rotated the live role's password as a side effect of
+#     running the script. REDIS_URL and REDIS_PASSWORD had recovered their installed values for
+#     rounds; DATABASE_URL had not. It does now, in prompt_db_password(), and a re-install that
+#     changes nothing changes nothing.
+#   * "THE BUILD NEEDS THE NEW CREDENTIAL" IS FALSE. The build needs a WORKING one. So when a
+#     rotation IS asked for, DB_PASSWORD_EFFECTIVE — and therefore DATABASE_URL, .env and the
+#     MIGRATION_DATABASE_URL handed to `prisma generate` and `npm run build` — stays the OLD,
+#     installed credential for the whole pre-stop window, and rotate_database_password_in_fenced_window()
+#     performs the ALTER after the service is stopped, the reboot fence is up and the connection
+#     fence is raised, then rewrites the one DATABASE_URL line in .env. The build has a working
+#     credential throughout and the predecessor keeps its own until it is no longer running.
+#
+# So what is left on this side is the GRANT and the OWNER change, and the r37 boundary still
+# holds for those: NO refusal that says "nothing has been stopped and nothing has been migrated"
+# may follow them, and after this call every remaining refusal is about THIS host's artefact —
+# the build, BUILD_ID, the port still being bound — not about whether the run was allowed to
+# touch the database at all.
+#
+# WHAT A FENCE CANNOT DO, STATED SO NOBODY READS MORE INTO IT. `ALTER USER ... PASSWORD` is
+# CLUSTER-WIDE and the connection fence is DATABASE-SPECIFIC. Moving the rotation inside the
+# window protects the clients of THIS database; a client of ANOTHER database on the same server
+# authenticating as the same role is refused from its next connection onwards no matter where in
+# this script the statement sits. That is why the rotation now happens only when an operator
+# asks for it explicitly, and why it says so out loud when it does.
+# ---------------------------------------------------------------------------
+
+# Was the application role already on this server when this run arrived? Decided by the CREATE,
+# on the same "let the server answer" principle as the database: a SELECT beforehand would be a
+# statement about an instant, and the role can appear between the question and the statement.
+DB_ROLE_PREEXISTED=false
+# Set when this run has changed the password of a role it did not create, so a later banner can
+# say so instead of claiming the box is untouched.
+DB_ROLE_CREDENTIALS_ROTATED=false
+
+# THE CREDENTIAL THE SERVER ALREADY HAS, AND WHETHER THIS RUN WAS ASKED TO REPLACE IT
+# (o3d-2sm1.5 r38, Codex HIGH).
+#
+#   DB_PASSWORD_INSTALLED       the password the PREVIOUS run of this installer wrote into
+#                               ${APP_DIR}/.env, recovered out of the DATABASE_URL there and only
+#                               when that URL names the SAME role, host, port and database this
+#                               run is about to use. Empty whenever it cannot be established.
+#   DB_PASSWORD                 what this run was told to make the credential BE. On a re-install
+#                               where the operator pressed Enter it IS DB_PASSWORD_INSTALLED, and
+#                               nothing is rotated at all.
+#   DB_PASSWORD_EFFECTIVE       the one the server has RIGHT NOW, which is what every connection
+#                               this run opens before the rotation — the fence preflight, prisma
+#                               generate, the build — has to be given.
+#   DB_PASSWORD_ROTATION_PENDING  set when those two differ over a role this run did not create:
+#                               a rotation was ASKED FOR and has NOT happened yet.
+DB_PASSWORD_INSTALLED=""
+DB_PASSWORD_EFFECTIVE=""
+DB_PASSWORD_ROTATION_PENDING=false
+
+ensure_database_role_exists() {
+  local output="" status=0 quoted_password
+  # THE PASSWORD IS A LITERAL, NOT A FRAGMENT OF SQL (o3d-2sm1.5 r39, Codex HIGH). `'${DB_PASSWORD}'`
+  # ended the string literal on the first apostrophe the operator's password contained and read the
+  # rest as statement text. The SET is issued on the same connection rather than assumed, because
+  # doubling `'` is complete escaping only while backslashes are ordinary characters.
+  quoted_password="$(sql_quote_literal "${DB_PASSWORD}")"
+  output="$(pg_local_psql -q <<EOSQL 2>&1
+    SET standard_conforming_strings = on;
+    CREATE USER "${DB_USER}" WITH PASSWORD ${quoted_password};
+EOSQL
+  )" || status=$?
+  if [[ "${status}" -eq 0 ]]; then
+    DB_ROLE_PREEXISTED=false
+    success "Role '${DB_USER}' was CREATED by this run — it did not exist before, so nothing was connected as it."
+    return 0
+  fi
+  # 42710 duplicate_object: the role was already there. Recognised by SQLSTATE and not by the
+  # message, for the reason 42P04 is: the message is localised, the SQLSTATE is not.
+  if printf '%s' "${output}" | grep -q '42710'; then
+    DB_ROLE_PREEXISTED=true
+    info "Role '${DB_USER}' already exists on this server. Its password is NOT changed here: that is"
+    info "deferred until this run has classified the cutover, so a refusal cannot land after it."
+    return 0
+  fi
+  die "Creating the application role '${DB_USER}' failed for a reason that is not SQLSTATE 42710 duplicate_object, so this run cannot say whether that role exists or what it can do. NOTHING HAS BEEN MIGRATED and no password has been changed. psql said: ${output}"
+}
+
+# @install-phase: database-provision
+#
+# The mutating half, run only once the run knows it may proceed. Idempotent: on an ordinary
+# re-install the GRANT and the OWNER change are already true and the ALTER sets the password to
+# the value that is about to be written into .env.
+provision_database_role_and_privileges() {
+  [[ "${INSTALL_POSTGRES}" == "y" ]] || return 0
+
+  # NO PASSWORD IS SET HERE, ON EITHER PATH (o3d-2sm1.5 r38, Codex HIGH). A role this run CREATED
+  # already has the password the CREATE gave it; a role that was ALREADY THERE keeps the one its
+  # clients are using, and an explicit rotation is performed by
+  # rotate_database_password_in_fenced_window() after the predecessor has been stopped and the
+  # connection fence raised. Nothing between here and that point can take a working credential
+  # away from anybody.
+  if ${DB_ROLE_PREEXISTED}; then
+    if ${DB_PASSWORD_ROTATION_PENDING}; then
+      info "Role '${DB_USER}' already existed and a DIFFERENT password was supplied, so a rotation is"
+      info "PENDING. It is NOT performed here: the predecessor is still serving and the build has not"
+      info "run. It happens inside the stopped, fenced window, and until then this run — and the"
+      info "environment file it writes — uses the credential the server already has."
+    else
+      info "Role '${DB_USER}' already existed and keeps the password it already had: this run was not"
+      info "asked to change it, so it does not. Nothing about its clients' credentials moves."
+    fi
+  fi
+
+  # AND NOT WHILE A FENCE IS STANDING (o3d-2sm1.5 r37). `GRANT ALL PRIVILEGES ON DATABASE`
+  # grants CONNECT, which is the ONE privilege the connection fence exists to take away — so
+  # issuing it inside an adopted fence would re-open the door this run is holding shut, while
+  # DB_FENCE_UP goes on saying the window is closed. `ALTER DATABASE ... OWNER TO` is skipped for
+  # the same reason and not because it is harmless: changing the owner rewrites the owner's ACL
+  # entry, and a role that was revoked can come back through it.
+  #
+  # Skipping costs nothing real. A fence can only be standing over a database this run did NOT
+  # create — a previous run of this installer left it there — so the grant and the ownership are
+  # already what this statement would set them to, and the fence's own release is what restores
+  # what the fence revoked. The one thing above that IS still done is the password, which no
+  # fence has an opinion about.
+  if ${DB_FENCE_UP:-false}; then
+    warn "A connection fence is standing over '${DB_NAME}', so this run is NOT issuing GRANT ALL PRIVILEGES or ALTER DATABASE ... OWNER: the GRANT would give CONNECT back and lift the fence this run is holding. The fence's release restores what it revoked. If '${DB_USER}' turns out not to own this database, release the fence and re-run."
+    return 0
+  fi
+
+  pg_local_psql -q >/dev/null <<EOSQL || die "Granting '${DB_USER}' on database '${DB_NAME}' failed. NOTHING HAS BEEN MIGRATED."
+    GRANT ALL PRIVILEGES ON DATABASE "${DB_NAME}" TO "${DB_USER}";
+    ALTER DATABASE "${DB_NAME}" OWNER TO "${DB_USER}";
+EOSQL
+  success "Database '${DB_NAME}' and user '${DB_USER}' ready."
+}
+
+# @install-phase: credential-rotation
+#
+# THE ONE STATEMENT THAT TAKES A WORKING CREDENTIAL AWAY, AND THE ONLY WINDOW IN WHICH NOBODY IS
+# HOLDING IT (o3d-2sm1.5 r38, Codex HIGH).
+#
+# Reached only from the fenced path, and only after ALL of: the reboot fence is installed, the
+# crontab is fenced, `systemctl stop` has returned, the legacy launchers are stopped, the port is
+# no longer bound, the connection fence is RAISED and check-db-writers.mjs has said there is no
+# other backend on the database. Every one of those is asserted here rather than assumed, because
+# this function's whole value is WHERE it runs: called a few lines earlier it is the r37 defect
+# again, and a guard that cannot fail is not a guard.
+#
+# It is a no-op unless a rotation was explicitly asked for — a password that differs from the one
+# ${APP_DIR}/.env already carried for this exact role, host, port and database.
+rotate_database_password_in_fenced_window() {
+  ${DB_PASSWORD_ROTATION_PENDING} || return 0
+
+  [[ "${INSTALL_POSTGRES}" == "y" ]] || die "A database credential rotation was requested for '${DB_USER}', but this run does not manage a LOCAL PostgreSQL server, so it has no privileged local connection to issue ALTER USER over. Rotate the password on the database server by hand and re-run with the new value. NOTHING HAS BEEN MIGRATED."
+  ${FENCE_ARMED} || die "A database credential rotation was requested for '${DB_USER}' and this run has not stopped anything, so rotating now would take the password away from a predecessor that is still serving — the defect this ordering exists to prevent. NOTHING HAS BEEN MIGRATED and the role's password is UNCHANGED."
+  ${DB_FENCE_UP} || die "A database credential rotation was requested for '${DB_USER}' and the connection fence is NOT up, so a client can attach between now and the end of the migration and be refused mid-window. NOTHING HAS BEEN MIGRATED and the role's password is UNCHANGED."
+
+  header "Rotating the database credential (stopped, fenced)"
+  warn "This is a CLUSTER-WIDE change and the fence is DATABASE-specific: any OTHER client on this"
+  warn "server authenticating as '${DB_USER}' — against any database — is refused from its next"
+  warn "connection onwards. Nothing this installer can do makes that untrue; it is why the rotation"
+  warn "happens only because a password different from the installed one was supplied."
+
+  # THE RECORD GOES DOWN BEFORE THE DURABLE ACT, NOT AFTER IT (o3d-2sm1.5 r39, Codex HIGH). The
+  # ALTER below COMMITS; everything that makes the new credential usable comes after it. Until
+  # this journal is on the medium there is no interruption point between the two that the next run
+  # can reconcile, because the only other record of the old password is the file this function is
+  # about to replace. It carries BOTH candidates and it says what each outcome means — see the
+  # journal's own block above.
+  #
+  # AND THE RECORD IS ONLY WORTH WRITING IF SOMETHING CAN READ IT BACK (o3d-2sm1.5 r40, Codex
+  # HIGH). The journal's entire value is that the NEXT run can ask the server which of the two
+  # candidates is live. That question is answerable only on an endpoint whose pg_hba rule actually
+  # checks the password, and only on one the reconciliation will still be able to reach — and the
+  # reconciliation runs with THIS fence still standing over '${DB_NAME}', so the application
+  # database is disqualified by construction — which is exactly what db_unfenced_probe_candidates()
+  # excludes. `postgres` leads that list because PUBLIC holds CONNECT on it by default and no fence
+  # here touches it; the rest of the list is READ FROM THE SERVER, so a site that has hardened the
+  # maintenance database still has somewhere this question can be asked.
+  #
+  # So it is proven here, BEFORE the ALTER, in three parts (r41 added the first of them): the
+  # SERVER names the pg_hba method it matched and it is one that compares pg_authid.rolpassword;
+  # the endpoint then refuses a random password; and it accepts the one this run knows is live.
+  # The FIRST endpoint that does all three is the one recorded — an endpoint that cannot cannot be
+  # relied on afterwards, and a rotation that would leave an unreconcilable journal is a rotation
+  # this run must not perform. Refusing costs nothing — no ALTER has been issued.
+  DB_PROBE_REPORT=""
+  DB_ROTATION_PROBE_DATABASE=""
+  local -a rotation_probe_candidates=()
+  local rotation_probe_candidate
+  db_unfenced_probe_candidates rotation_probe_candidates
+  for rotation_probe_candidate in "${rotation_probe_candidates[@]}"; do
+    if db_endpoint_is_password_sensitive "${rotation_probe_candidate}" "${DB_PASSWORD_EFFECTIVE}"; then
+      DB_ROTATION_PROBE_DATABASE="${rotation_probe_candidate}"
+      break
+    fi
+  done
+  if [[ -n "${DB_ROTATION_PROBE_DATABASE}" ]]; then
+    info "Rotation endpoint proven: on '${DB_ROTATION_PROBE_DATABASE}' the server itself named a"
+    info "matched pg_hba method that compares pg_authid.rolpassword — the secret ALTER ROLE writes —"
+    info "and that endpoint then refused a random 32-byte password and accepted the credential"
+    info "'${DB_USER}' is holding right now. It is recorded in the journal and is what a next run"
+    info "reconciles against — the application database is never it, because the fence stands over"
+    info "that one."
+  else
+    # ONE PHYSICAL LINE, AND THE REPORT LAST. deploy-order.test.ts classifies every source line that
+    # names an application-owned path, and a literal newline inside this string makes its second half
+    # a separate line with no declared shape. Keeping ${DB_PROBE_REPORT} — which carries its own
+    # leading newlines — at the very end is what keeps the sentence readable and the line singular.
+    die "A database credential rotation was requested for '${DB_USER}', and this run cannot show that ANY unfenced endpoint would be able to tell afterwards which password the role has. The rotation is the one step here that has no undo, and its only safety net is a journal the next run reconciles by ASKING THE SERVER — so a probe that cannot refuse a password nothing knows, or cannot reach the role at all, or is not checking POSTGRESQL'S OWN role credential in the first place, turns that net into a guess. The application database '${DB_NAME}' cannot be that endpoint: the connection fence this run is holding revokes CONNECT on it, and a reconciliation runs with that fence still standing. THE ALTER HAS NOT BEEN ISSUED: '${DB_USER}' still has the credential ${APP_DIR}/.env names, the two agree, and starting the old service by hand would work. NOTHING HAS BEEN MIGRATED. Give the role a password-checked route to 'postgres': GRANT CONNECT ON DATABASE postgres TO that role, and a pg_hba.conf rule for ${DB_HOST} that is scram-sha-256 or md5. Those two are the only methods accepted, because they are the only ones that compare the secret ALTER ROLE writes: 'trust' checks nothing, and 'password', 'ldap', 'pam', 'radius' and 'bsd' all ask for a cleartext password over the same protocol message, so the four that consult an outside directory cannot be told from the one that does not — an answer from any of them may be about a credential this installer has no way to change. Then re-run; or rotate the password by hand and re-run supplying it. What this run asked, and what each endpoint did:${DB_PROBE_REPORT}"
+  fi
+
+  # Refusing here costs nothing: nothing has been ALTERed yet, so the sentence below is true.
+  write_role_rotation_journal "${DB_PASSWORD_EFFECTIVE}" "${DB_PASSWORD}" "${DB_ROTATION_PROBE_DATABASE}" || die "A database credential rotation for '${DB_USER}' could not be journalled durably at ${DB_ROLE_ROTATION_JOURNAL}, so a run interrupted between the ALTER and the environment file would leave nothing able to say which password the server has. The ALTER has NOT been issued: the role still has the credential ${APP_DIR}/.env names, the two agree, and starting the old service by hand would work. NOTHING HAS BEEN MIGRATED. Make ${DB_ENV_SNAPSHOT_DIR} writable and re-run, or re-run without a password change."
+
+  local quoted_password
+  # THE PASSWORD IS A LITERAL, SQL-QUOTED (o3d-2sm1.5 r39, Codex HIGH). `'${DB_PASSWORD}'` ended
+  # the literal on the first apostrophe and read the rest of the operator's password as statement
+  # text — inside the one window in which nobody holds a working credential.
+  quoted_password="$(sql_quote_literal "${DB_PASSWORD}")"
+  pg_local_psql -q >/dev/null <<EOSQL || die "Rotating the password of the existing role '${DB_USER}' failed. The service is STOPPED and the connection fence is UP; the application environment file this run wrote still names the credential the server already had, so the two agree and starting the old service by hand would work. The rotation journal at ${DB_ROLE_ROTATION_JOURNAL} records both candidates and the next run reconciles from it. NOTHING HAS BEEN MIGRATED. Fix the role or re-run without a password change."
+    SET standard_conforming_strings = on;
+    ALTER USER "${DB_USER}" WITH PASSWORD ${quoted_password};
+EOSQL
+
+  DB_ROLE_CREDENTIALS_ROTATED=true
+  DB_PASSWORD_ROTATION_PENDING=false
+  DB_PASSWORD_EFFECTIVE="${DB_PASSWORD}"
+  # The application connection is recomposed BEFORE the environment file is rewritten, so that
+  # write_app_env_file() emits the credential the server now has. The two are set together, in
+  # that order, and nothing between them can fail into a state where only one of them moved.
+  DATABASE_URL="$(compose_database_url "${DB_USER}" "${DB_PASSWORD_EFFECTIVE}" "${DB_HOST}" "${DB_PORT}" "${DB_NAME}")"
+  # AND THE WRITE IS CHECKED, because this is the point past which the flags above are lies if it
+  # failed. The file is published by rename, so a failure leaves the PREVIOUS environment file
+  # complete and naming the old password — which the server no longer has. That is the outage the
+  # journal exists for, and the refusal says so and leaves the journal standing.
+  write_app_env_file || die "The password of '${DB_USER}' HAS BEEN ROTATED on the server, and ${APP_DIR}/.env could not be replaced. That file is complete and unchanged — it is published by rename, so it is not truncated — but it names the OLD password, which no longer works. The service is STOPPED and the connection fence is UP. DO NOT hand-edit that file: re-run this installer and it will reconcile from the journal at ${DB_ROLE_ROTATION_JOURNAL}, which records both candidates; it will ask the server which one is live, find the new one, and publish an environment file naming it. NOTHING HAS BEEN MIGRATED."
+  # LAST, so that a run killed anywhere above leaves a journal rather than none. A journal that
+  # outlives the transition costs the next run one probe; a missing one costs the outage.
+  clear_role_rotation_journal || die "The password of '${DB_USER}' has been rotated and ${APP_DIR}/.env names it — the two agree and the transition is COMPLETE — but the journal at ${DB_ROLE_ROTATION_JOURNAL} could not be removed durably. Delete it by hand; leaving it costs the next run one probe and nothing else. NOTHING HAS BEEN MIGRATED."
+  success "The password of '${DB_USER}' has been rotated and ${APP_DIR}/.env now names it. The build ran before this, on the previous credential."
+}
+
+# THE EXEMPTION IS EARNED, NEVER INFERRED FROM WHAT IS ABSENT ON THIS HOST. Returns 0 only when
+# this invocation itself created the database it is about to migrate, and only when that is the
+# same database. Everything else — including everything unknown — returns 1, and the caller fences.
+first_install_exemption_available() {
+  local identity="${DB_HOST}:${DB_PORT}/${DB_NAME}"
+  FIRST_INSTALL_EXEMPTION_REFUSAL=""
+  if ! ${DB_CREATED_BY_THIS_RUN}; then
+    FIRST_INSTALL_EXEMPTION_REFUSAL="No launcher was found on this host — but that is a statement about this host, not about the database: ${DB_NEWNESS_FINDING}. Other writers may be connected to ${identity} right now, so this run is treated as a cutover and the migration window is fenced."
+    return 1
+  fi
+  if [[ "${DB_CREATED_IDENTITY}" != "${identity}" ]]; then
+    FIRST_INSTALL_EXEMPTION_REFUSAL="This run created ${DB_CREATED_IDENTITY}, but it is about to migrate ${identity}. Proof about one database is not proof about another, so this run is treated as a cutover and the migration window is fenced."
+    return 1
+  fi
+  return 0
+}
+
+# WHETHER THIS RUN IS A FIRST INSTALL, AND WHAT THAT FORBIDS (o3d-2sm1.5 r35, Codex MEDIUM).
+#
+# A first install has no service, no crontab, no PM2 instance and no process in ${APP_DIR} — that
+# is what upgrade_in_place() asks — and it has just created the database it is about to migrate.
+# There is no writer to stop, so there is no window to hold closed, so the fence helper is never
+# executed and DEPLOY_ADMIN_DATABASE_URL is never handed to bytes out of this checkout. That is
+# the POLICY, stated in docs/installation.md in those words, and this flag is what makes it a
+# property of the code rather than a description of it: set on the first-install branch, and
+# refused by resolve_fence_script() below, which is the sole route to executing the helper.
+#
+# It is an ENFORCEMENT and not a comment because the alternative is what the previous round
+# shipped: a runbook asserting a requirement nothing checked. A later change that adds a fence
+# call to this path now stops the install with the sentence below instead of quietly executing an
+# unauthenticated artefact.
+FIRST_INSTALL_NO_CREDENTIALED_FENCE=false
+
+# THE FIRST-INSTALL PIN CONTRACT, WRITTEN ONCE AND DERIVED FROM HERE (o3d-2sm1.5 r36, Codex
+# MEDIUM). The refusal below prints these exact bytes, docs/installation.md quotes them verbatim,
+# and tests/scripts/fence-digest-and-first-install.test.ts asserts the two strings are identical.
+# This branch has now shipped three pin contracts whose code, runbook and tests said different
+# things; the fix is not a fourth sentence, it is one string with two readers.
+FIRST_INSTALL_PIN_CONTRACT="On a first install, IMS_FENCE_ARTEFACT_SHA256 is the ONLY input that publishes the protected fence artefact. IMS_FENCE_SCRIPT_SHA256 alone is REFUSED here: it authenticates the entry file, while the artefact also vendors that helper's dependency closure out of the application-owned checkout. Supply IMS_FENCE_ARTEFACT_SHA256 -- IMS_FENCE_SCRIPT_SHA256 may accompany it and is then also enforced -- or supply neither, in which case this install fences nothing, publishes nothing, and the first upgrade asks for the digest instead."
+
+resolve_fence_script() {
+  local script
+  if ${FIRST_INSTALL_NO_CREDENTIALED_FENCE}; then
+    echo "This run is a FIRST INSTALL — no service, no crontab and no other launcher was found, and the database was created by this run — so it performs NO credentialed fence execution: there is no writer to drain and nothing to hold closed. Something on this path asked for the fence helper anyway, and it will not be handed DEPLOY_ADMIN_DATABASE_URL: the tree it would run is assembled out of an application-owned checkout, and a first install is exactly the run with no standing artefact to authenticate it against. Nothing has been migrated." >&2
+    return 1
+  fi
+  script="$(db_fence_script_in_use)" || return 1
+  db_fence_publish_operator_wrappers "${APP_USER}" "${APP_DIR}/.env" "${DB_FENCE_STATE}" \
+    "${DB_FENCE_IDENTITY_ARGS[@]:-}" \
+    || echo "The recovery wrappers at ${DB_FENCE_RELEASE_WRAPPER} and ${DB_FENCE_REFENCE_WRAPPER} could not be refreshed for this run. Anything printed below that names them may be a previous run's copy; check it before running it." >&2
+  printf '%s' "$script"
+}
+require_db_identity() {
+  [[ "${#DB_FENCE_IDENTITY_ARGS[@]}" -eq 4 ]] && return 0
+  return 1
+}
+
+# ---------------------------------------------------------------------------
+# WHAT A FIRST INSTALL DOES ABOUT THE FENCE — ONE POLICY, ENFORCED (o3d-2sm1.5 r35, Codex MEDIUM).
+#
+# THE DEFECT. r34 made IMS_FENCE_ARTEFACT_SHA256 a required input and said so on the first command
+# in docs/installation.md: "required on an ordinary install and the run refuses without it". The
+# code did no such thing. require_fenceable_database() and resolve_fence_script() are reached only
+# inside the upgrade branch, so on a first install the variable was read by the library, compared
+# against nothing, and ignored: omitting it produced no refusal, supplying it published no
+# artefact, and the first later cutover discovered that the authenticated bootstrap was still
+# outstanding. A runbook asserting a requirement the code ignores is the same defect as a comment
+# describing behaviour the code does not have, and this branch has now shipped it three times.
+#
+# THE POLICY, CHOSEN ON THE MERITS AND STATED IN THE RUNBOOK IN THESE WORDS:
+#
+#   A FIRST INSTALL PERFORMS NO CREDENTIALED FENCE EXECUTION.
+#
+# It is what is actually true and it is what should be true. upgrade_in_place() returning false
+# means no unit, no crontab entry, no PM2 instance and no process in ${APP_DIR}; the database was
+# created by this run moments ago. There is no writer to stop, so there is no window to hold
+# closed, so nothing is fenced and the helper — whose whole risk is that it is executed with
+# DEPLOY_ADMIN_DATABASE_URL beside it — is never executed at all. REQUIRING a pin for an execution
+# that does not happen is theatre, and it is the "refusal whose precondition nobody can satisfy"
+# shape this round is explicitly under instructions to avoid: it would stop every first install on
+# a fresh box until the operator had gone and found a release digest, and buy nothing.
+#
+# So the pin is NOT required here, and the runbook no longer says it is.
+#
+# BUT IT IS NOT IGNORED EITHER, because a supplied value that nothing reads is the defect in its
+# other form. When the operator does pass one — they have it, it ships with the release, and they
+# will need it on the first upgrade — this run PUBLISHES the artefact under it, before the
+# migration. That is a read and a copy performed by root; nothing is executed, so it is safe on
+# exactly the reasoning above, and it means the first cutover finds a standing, authenticated
+# artefact instead of discovering the bootstrap is still outstanding at the worst moment. A pin
+# that does NOT authenticate this checkout is a REFUSAL and never a warning: it is the operator
+# saying which bytes they expect, over bytes the application account owns.
+#
+# AND THE NO-EXECUTION HALF IS A FLAG, NOT A COMMENT. resolve_fence_script() is the sole route to
+# executing the helper in this file, and it refuses while this is set.
+first_install_fence_policy() {
+  # THE PREMISE, ASSERTED WHERE IT IS SPENT (o3d-2sm1.5 r36, Codex CRITICAL). The caller already
+  # routes an unproven database to the fenced path; this is the same question asked again at the
+  # one function that ARMS the exemption, so a later edit that reaches here on an unproven
+  # database stops the install instead of quietly exempting a live database from the fence. It is
+  # the same "enforcement, not comment" discipline the no-execution flag below is written in.
+  first_install_exemption_available || die \
+    "This run was about to take the first-install exemption from the cutover fence and it has not earned it. ${FIRST_INSTALL_EXEMPTION_REFUSAL} NOTHING HAS BEEN MIGRATED and nothing has been started."
+
+  FIRST_INSTALL_NO_CREDENTIALED_FENCE=true
+
+  # THE PIN CONTRACT, ENFORCED (o3d-2sm1.5 r36, Codex MEDIUM).
+  #
+  # THE DEFECT. The runbook offered EITHER pin as a first-install publication input and this
+  # function treated either as a publication request — but the artefact is assembled out of
+  # ${APP_DIR}, which this installer chowns to ${APP_USER} long before it gets here, so the source
+  # is application-writable on every install this script performs. _fence_stage_and_publish()
+  # refuses an entry-file pin from such a source, by design and correctly: it authenticates one
+  # file out of a vendored closure. The advertised script-pin-only invocation could therefore not
+  # publish on ANY ordinary first install — it deterministically aborted one.
+  #
+  # WHY THE RULE IS UNCONDITIONAL RATHER THAN "when the checkout is application-writable". On this
+  # path it is always application-writable — the chown guarantees it — and a condition that is
+  # always true is one that can go stale unnoticed while inviting the reader to believe there is a
+  # supported case on the other side of it. There is not. Stating it unconditionally is also what
+  # lets the runbook and the tests say the SAME SENTENCE as the code: see
+  # ${FIRST_INSTALL_PIN_CONTRACT}, which is that sentence and is defined once.
+  #
+  # AND IT IS A REFUSAL, NOT A SILENT SKIP. A supplied pin nobody reads is this branch's signature
+  # defect; the operator named the bytes they expected and is owed an answer.
+  if [[ -n "${DB_FENCE_EXPECTED_SHA256}" && -z "${DB_FENCE_EXPECTED_ARTEFACT_SHA256}" ]]; then
+    die "${FIRST_INSTALL_PIN_CONTRACT} NOTHING has been published, NOTHING HAS BEEN MIGRATED and nothing has been started. The closure this run would have vendored comes from ${APP_DIR}, which this installer has already chowned to ${APP_USER}, so it comes from an account other than the one publishing it. ${DB_FENCE_ARTEFACT_SOURCE_TEXT}"
+  fi
+
+  # Reaching here with no whole-tree pin means no pin at all: the refusal above is the only other
+  # way out of it.
+  if [[ -z "${DB_FENCE_EXPECTED_ARTEFACT_SHA256}" ]]; then
+    info "First install: nothing is serving, no crontab is live and this run created the database,"
+    info "so there is no writer to stop and no migration window to fence. NO fence helper is"
+    info "executed on this path and no protected artefact is published."
+    info "IMS_FENCE_ARTEFACT_SHA256 is therefore NOT required here, and was not supplied. The FIRST"
+    info "UPGRADE of this box does require it — that run fences a real window — so obtain it with"
+    info "the release (bash scripts/update.sh --print-fence-digest on a clean checkout of the tag)"
+    info "and pass it then, or pass it to this installer to have the artefact published now."
+    return 0
+  fi
+
+  header "Publishing the protected fence artefact (pinned on this invocation)"
+  info "A first install fences nothing, so this publishes rather than executes: the artefact is"
+  info "assembled from this checkout by root, authenticated against the digest on the invocation,"
+  info "and left standing so the first upgrade cutover has one already."
+  publish_fence_script_copy || die \
+    "The protected fence artefact could not be published under the digest this invocation supplied: ${DB_FENCE_ROTATION_NOTE:-no reason was recorded}. A pin names the bytes you expect, so this is a refusal and not a warning. NOTHING HAS BEEN MIGRATED and nothing has been started; re-run with a digest that matches this release, or with neither pin, in which case this install fences nothing, publishes nothing and the first upgrade asks for the digest instead."
+  if [[ -n "${DB_FENCE_ROTATION_NOTE}" ]]; then info "${DB_FENCE_ROTATION_NOTE}"; fi
+  success "The protected fence artefact at ${DB_FENCE_PROTECTED_APP_DIR} is standing and authenticated."
+  return 0
+}
 # Is the reboot fence ACTUALLY loaded by systemd right now? Distinct from FENCE_ARMED, which
 # only says this run has stopped something: the failure banner used to describe a drop-in that
 # may never have been installed (o3d-2sm1.5, Codex r4 HIGH).
@@ -642,6 +2336,13 @@ REBOOT_FENCE_INSTALLED=false
 # remove exactly that and leave an already-standing fence alone.
 FENCE_MARKER_PREEXISTED=false
 FENCE_DROPIN_CREATED=false
+# Whether THIS run published the environment snapshot. It gates the tolerance in
+# env_file_is_sole_database_url_source(): a snapshot the unit loads that this run did not
+# publish is an unexplained pin, and is refused rather than accepted.
+DB_ENV_SNAPSHOT_PUBLISHED=false
+DB_ENV_SNAPSHOT_DROPINS_CREATED=()
+# Why the composed unit was refused, when it was.
+DB_IDENTITY_SOURCE_REASON=""
 # The point of no return: the new build has answered its health check AND been shown to be
 # the process that answered. Nothing after this may stop it, re-fence it or revoke CONNECT
 # again (o3d-2sm1.5, Codex r4 HIGH).
@@ -789,13 +2490,21 @@ fsync_path() {
 #
 # Same directory, so the rename is a rename and not a copy. Every failure path removes the
 # temporary file and returns non-zero, leaving the last durable marker untouched.
+# OWNERSHIP AND MODE ARE PART OF THE PUBLICATION, NOT A STEP AFTER IT (o3d-2sm1.5 r39, Codex
+# HIGH). ${APP_DIR}/.env has to reach the application account readable, and a `chown` issued AFTER
+# the rename is a second observable state: a crash between the two leaves a complete, correct file
+# the application cannot open. Both are applied to the TEMPORARY file, before the barrier and
+# before the rename, so the name is published once and everything about it is already true.
+# `$2` and `$3` are optional and default to what every earlier caller already got: root's own
+# ownership, since this script runs as root, and mode 0600.
 publish_durable_file() {
-  local target="$1" dir tmp
+  local target="$1" owner="${2:-}" mode="${3:-600}" dir tmp
   dir="$(dirname "$target")"
   mkdir -p "$dir" || return 1
   tmp="$(mktemp "${target}.XXXXXX" 2>/dev/null)" || return 1
   if ! cat > "$tmp" 2>/dev/null; then rm -f "$tmp"; return 1; fi
-  if ! chmod 600 "$tmp" 2>/dev/null; then rm -f "$tmp"; return 1; fi
+  if ! chmod "$mode" "$tmp" 2>/dev/null; then rm -f "$tmp"; return 1; fi
+  if [[ -n "$owner" ]] && ! chown "$owner" "$tmp" 2>/dev/null; then rm -f "$tmp"; return 1; fi
   # BARRIER 1: the data, before the name exists. After this the rename can only publish
   # bytes that are already on the medium.
   if ! fsync_path "$tmp"; then rm -f "$tmp"; return 1; fi
@@ -810,6 +2519,1074 @@ publish_durable_file() {
   # instead reads the new content and concludes a durability it was never given.
   fsync_path "$dir" || return 1
   return 0
+}
+
+# ---------------------------------------------------------------------------
+# THE DATABASE TRUST ROOT, PUBLISHED WHERE EVERY PRINCIPAL CAN OPEN IT
+# (o3d-2sm1.5 r46, Codex MEDIUM). See DB_CA_PUBLISH_DIR at the top of this script for the finding.
+# ---------------------------------------------------------------------------
+
+# The bytes, named. Used to prove that what is at the published path is what was validated, and
+# never to decide anything about the certificate's content — this script is not a CA parser.
+file_sha256() {
+  sha256sum "$1" 2>/dev/null | cut -d' ' -f1
+}
+
+# Can a process running as ANY uid open this file? Asked of the permission bits rather than by
+# opening it, because the two principals that matter most cannot be impersonated at the moment the
+# question first has to be answered: the CA is published during configuration, where ${APP_USER}
+# does not exist yet and `postgres` may not be installed. The bits are the whole answer — a 0644
+# file under directories every one of which grants other-execute is readable by every uid on the
+# box, and this walks the ancestry rather than assuming /etc is what it usually is.
+#
+# IT IS ALSO THE OTHER HALF OF THE FINDING: 0644 means writable by the OWNER ALONE, so the trust
+# root cannot be swapped between the probe that vouched for it and the service that uses it.
+db_ca_path_is_open_to_every_uid() {
+  local file="$1" perm dir
+  perm="$(stat -c '%a' "${file}" 2>/dev/null)" || return 1
+  # Other-read is the 4 bit of the last digit; other-write (2) and group-write must be absent, and
+  # `644` states all three at once rather than testing them one at a time.
+  [[ "${perm}" == "644" ]] || return 1
+  dir="$(dirname "${file}")"
+  while :; do
+    perm="$(stat -c '%a' "${dir}" 2>/dev/null)" || return 1
+    # Other-execute is the 1 bit of the last digit: 1, 3, 5 or 7.
+    case "${perm}" in *[1357]) ;; *) return 1 ;; esac
+    [[ "${dir}" != "/" ]] || break
+    dir="$(dirname "${dir}")"
+  done
+  return 0
+}
+
+# WHAT A TRUST-ANCHOR FILE MAY CONTAIN, ENUMERATED (o3d-2sm1.5 r47, Codex HIGH).
+#
+# THE FINDING. The publisher took any file it could hash and copied its exact bytes out at mode
+# 0644. The caller had checked only that the source was a regular file root could read — and this
+# script runs as root, so THAT IS EVERY FILE ON THE BOX. `DB_SSLROOTCERT=/etc/ssl/private/db.key`,
+# a fat-fingered tab-completion, or a `fullchain+key.pem` an operator assembled for a web server,
+# and the private key is published world-readable to a well-known path before TLS ever parses it.
+# An arbitrary-file-disclosure primitive, reachable by a typo, with root's read privilege behind it.
+#
+# THE ACCEPT-LIST, AND HOW IT WAS ESTABLISHED (o3d-2sm1.5 r48, Codex MEDIUM). DB_SSLROOTCERT is
+# handed to three readers and all three end in the same place: node-postgres passes it as `ssl.ca`
+# to Node's tls, which hands it to OpenSSL's X509_STORE; libpq passes it to
+# SSL_CTX_load_verify_locations(); psql IS libpq. That store loads a file with
+# PEM_read_bio_X509_AUX(), NOT PEM_read_bio_X509() — and the two do not accept the same armour.
+#
+# r47 asserted the accepted set was the single label `CERTIFICATE` from the same reasoning, and the
+# reasoning was right about WHICH READER to ask and wrong about its ANSWER, which is the failure a
+# list arrived at by argument keeps having. So r48 MEASURED it instead: every PEM label OpenSSL 3.x
+# defines a PEM_STRING_* constant for, wrapped around one real CA's DER, offered to `openssl verify
+# -CAfile` and to a Node `tls` client verifying a real handshake. EXACTLY THREE of the twenty-nine
+# are consumed by either reader, and the two readers agree on all twenty-nine:
+#
+#   CERTIFICATE  ·  X509 CERTIFICATE  ·  TRUSTED CERTIFICATE
+#
+# Everything else — `CERTIFICATE PAIR`, `X509 CRL`, `PKCS7`, `ATTRIBUTE CERTIFICATE`, every key and
+# every parameter block — is skipped by the store as if it were not in the file. A revocation list
+# is a different parameter (`sslcrl`/`sslcrldir`) against a different store, and a private key has no
+# reader here at all. So this is still not a denylist with the dangerous labels enumerated — the
+# shape that keeps failing on this branch, because the next dangerous label is always the one nobody
+# listed. It is the measured list of what the readers of this file actually consume, and everything
+# outside it is refused whether or not this script has heard of it.
+#
+# AND `TRUSTED CERTIFICATE` IS NOT MERELY ANOTHER SPELLING. Its X509_AUX block carries trust and
+# reject OIDs that RESTRICT what the anchor may vouch for, and the restriction is live in both
+# readers: a CA published with `-addreject serverAuth` makes `openssl verify -purpose sslserver`
+# fail with error 28 (certificate rejected) and makes Node's TLS client fail with INVALID_PURPOSE.
+# Re-encoding it with plain `openssl x509 -outform PEM` STRIPS the aux — measured, and the stripped
+# file then verifies the very leaf the operator's anchor was configured to refuse. Accepting the
+# label while re-encoding it that way would be worse than refusing it: it would silently WIDEN a
+# deliberately narrowed trust root. `-trustout` preserves the aux byte-identically (the re-encoding
+# of a re-encoding has the same sha256 as the source), so a trusted block is re-encoded with it and
+# the published block is then CHECKED to still be a `TRUSTED CERTIFICATE` before it is kept.
+#
+# AND IT IS PARSED, NOT MATCHED. `grep -q 'PRIVATE KEY'` would be the denylist again, and it is also
+# wrong about its own subject: a block LABELLED `CERTIFICATE` carrying key material would pass it.
+# Each block is decoded by `openssl x509`, which base64-decodes it and then parses the DER as an
+# X.509 certificate — so a block that is not a certificate is refused no matter what its armour
+# says. The published bytes are then openssl's own re-encoding of the certificate it parsed, so what
+# reaches the world-readable path is CONSTRUCTED from parsed public material rather than copied from
+# the source. Nothing in the source that was not a certificate can survive into the published file,
+# including bytes this parser did not understand.
+#
+# The output goes to "$2", which every caller makes a private temporary file, and a failure at any
+# point leaves that temporary file to be removed: NOTHING IS PUBLISHED unless the whole source
+# parsed. A refusal mid-file — a bundle whose second block is a key — therefore discloses nothing,
+# which is the difference between this and rejecting the file after it has been copied out.
+# The measured set, for the refusals to quote. db_ca_pem_label_encoding() below is the GATE; this is
+# only how a refusal spells the gate out to an operator, and a regression asserts the two agree over
+# every PEM label OpenSSL defines rather than over the three someone remembered to type here.
+DB_CA_ACCEPTED_PEM_LABELS="CERTIFICATE, X509 CERTIFICATE, TRUSTED CERTIFICATE"
+
+# WHICH RE-ENCODING A LABEL GETS, or non-zero for a label no reader of this file consumes.
+#
+# The two answers are not interchangeable. `plain` drops any X509_AUX block, which is right for the
+# two labels that cannot carry one and wrong for the one that can; `trusted` keeps it. This is a
+# function rather than a list because the accept decision and the re-encoding decision are the SAME
+# decision — a label admitted without an encoding chosen for it is the widening defect.
+db_ca_pem_label_encoding() {
+  case "$1" in
+    'CERTIFICATE'|'X509 CERTIFICATE') printf 'plain' ;;
+    'TRUSTED CERTIFICATE') printf 'trusted' ;;
+    *) return 1 ;;
+  esac
+}
+
+normalize_db_ca_pem() {
+  local source="$1" dest="$2" line label block="" in_block=false certificates=0
+  local open_label="" encoding="" decoded=""
+  command -v openssl >/dev/null 2>&1 || {
+    error "openssl is not on this host's PATH, and the database CA is published by PARSING the operator's file rather than by copying its bytes. Without a parser this script cannot tell a certificate from a private key, and copying unparsed bytes to a world-readable path is the defect this check exists to close. Install openssl and re-run."
+    return 1
+  }
+  : > "${dest}" || return 1
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    # A PEM file written on Windows arrives CRLF-terminated, and the boundary is a WHOLE line.
+    line="${line%$'\r'}"
+    case "${line}" in
+      '-----BEGIN '*'-----')
+        label="${line#-----BEGIN }"
+        label="${label%-----}"
+        if ${in_block}; then
+          error "${source} opens a '${label}' PEM block while a '${open_label}' block is still open. That is not a file any TLS client can parse, and this installer will not guess where one block was meant to end and the next begin."
+          return 1
+        fi
+        encoding="$(db_ca_pem_label_encoding "${label}")" || {
+          error "${source} contains a '${label}' PEM block. A database trust root is a bundle of X.509 certificates and nothing else — the OpenSSL verification store behind all three readers of this file (node-postgres via Node's tls, libpq, and psql, which IS libpq) consumes exactly these labels and skips every other one: ${DB_CA_ACCEPTED_PEM_LABELS}. This file is published WORLD-READABLE so all three accounts can open it, so a '${label}' block is either private material that must never be published or something no reader of this file will use, and it is refused rather than copied. NOTHING HAS BEEN PUBLISHED: if this is a combined key-and-certificate file, extract the certificates into a file of their own and name that instead."
+          return 1
+        }
+        in_block=true
+        open_label="${label}"
+        block="${line}"
+        ;;
+      '-----END '*'-----')
+        label="${line#-----END }"
+        label="${label%-----}"
+        ${in_block} || {
+          error "${source} closes a '${label}' PEM block that was never opened. A truncated or spliced certificate file is refused rather than partly published."
+          return 1
+        }
+        [[ "${label}" == "${open_label}" ]] || {
+          error "${source} opens a '${open_label}' PEM block and closes it as '${label}'. The armour disagrees with itself, so nothing here can say what the block holds; it is refused rather than published to a world-readable path."
+          return 1
+        }
+        block="${block}"$'\n'"${line}"
+        # THE PARSE. openssl decodes the base64 and reads the DER as an X.509 certificate; a block
+        # that is not one fails here whatever its label claimed. `-outform PEM` is what makes the
+        # published bytes openssl's re-encoding of the certificate rather than the source's bytes,
+        # and `-trustout` — for the one label that can carry them — is what makes the re-encoding
+        # keep the X509_AUX trust and reject OIDs instead of quietly dropping them.
+        if [[ "${encoding}" == "trusted" ]]; then
+          decoded="$(printf '%s\n' "${block}" | openssl x509 -inform PEM -outform PEM -trustout 2>/dev/null)" || decoded=""
+        else
+          decoded="$(printf '%s\n' "${block}" | openssl x509 -inform PEM -outform PEM 2>/dev/null)" || decoded=""
+        fi
+        [[ -n "${decoded}" ]] || {
+          error "A '${open_label}' block in ${source} is not an X.509 certificate — openssl could not parse it. The label on a PEM block is not evidence about its contents, which is why this installer decodes every block instead of reading its armour, and a block it cannot decode is not published."
+          return 1
+        }
+        # THE TRUST METADATA HAS TO HAVE SURVIVED. A 'TRUSTED CERTIFICATE' re-encoded as a plain one
+        # is a DIFFERENT trust anchor: the aux block's reject OIDs are what stop it vouching for
+        # purposes the operator excluded, and both readers enforce them. If this openssl emitted
+        # anything but a trusted block the anchor would be published WIDER than the one supplied, so
+        # it is refused instead — publishing nothing is recoverable, silently widening is not.
+        if [[ "${encoding}" == "trusted" && "${decoded}" != '-----BEGIN TRUSTED CERTIFICATE-----'* ]]; then
+          error "A 'TRUSTED CERTIFICATE' block in ${source} did not survive re-encoding as one — this openssl dropped the X509_AUX trust and reject settings that block carries. Publishing it would install a trust anchor WIDER than the one you supplied, vouching for purposes your CA file excludes, so nothing has been published."
+          return 1
+        fi
+        printf '%s\n' "${decoded}" >> "${dest}" || return 1
+        certificates=$((certificates + 1))
+        in_block=false
+        block=""
+        ;;
+      *)
+        # Outside a block this is commentary — the subject/issuer preambles a great many vendor
+        # bundles ship with — and it is DROPPED rather than refused, because it is not published.
+        # Inside one it is the payload openssl is about to be handed.
+        ${in_block} && block="${block}"$'\n'"${line}"
+        ;;
+    esac
+  done < "${source}"
+  ${in_block} && {
+    error "${source} ends inside an unterminated '${open_label}' block. A truncated certificate file is refused rather than partly published."
+    return 1
+  }
+  [[ "${certificates}" -gt 0 ]] || {
+    error "${source} contains no PEM certificate at all. DB_SSLMODE verifies the server against the certificates in this file, and a file with none in it is not a trust root — it is a path that names something else. (A DER-encoded certificate is not accepted: none of the three clients that read this file parse one. Convert it with 'openssl x509 -inform DER -in <file> -out <file>.pem'.)"
+    return 1
+  }
+  return 0
+}
+
+# The generation path for a set of published bytes. The digest is 64 hex characters, so the whole
+# path stays inside the [A-Za-z0-9._/-] set DB_SSLROOTCERT is validated against — which matters
+# because this path, unlike the operator's, goes into the URL and the two probe command lines
+# without passing that validation again.
+db_ca_generation_file() {
+  printf '%s/%s%s%s' "${DB_CA_PUBLISH_DIR}" "${DB_CA_GENERATION_PREFIX}" "$1" "${DB_CA_GENERATION_SUFFIX}"
+}
+
+# THE INVERSE, and the only thing allowed to decide that a file is a generation (o3d-2sm1.5 r48,
+# Codex MEDIUM). Prints the digest a path's BASENAME claims, or returns non-zero if the basename is
+# not one db_ca_generation_file() could have produced.
+#
+# `db-ca-*.crt` is not that test. It matches `db-ca-manual.crt`, `db-ca-old.crt`, `db-ca-2024.crt` —
+# the names an operator reaches for — and prune_db_ca_generations() would then count them as
+# generations and DELETE them, which is the opposite of the guarantee the prune advertises. The
+# generation name is not a convention this publisher follows loosely: it is 64 lowercase hex
+# characters produced by sha256sum, and nothing else is one.
+db_ca_generation_digest() {
+  local name="${1##*/}" rest
+  rest="${name#"${DB_CA_GENERATION_PREFIX}"}"
+  [[ "${rest}" != "${name}" ]] || return 1
+  name="${rest}"
+  rest="${name%"${DB_CA_GENERATION_SUFFIX}"}"
+  [[ "${rest}" != "${name}" ]] || return 1
+  [[ "${rest}" =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s' "${rest}"
+}
+
+# Publish the CERTIFICATES in "$1" to the generation their own bytes name, durably, with ownership
+# and mode applied BEFORE the rename — publish_durable_file() is used rather than a second publisher
+# for exactly that property, and because a half-written trust root is the one file on this box that
+# must not be reachable.
+#
+# THE CANDIDATE IS BUILT IN A 0600 TEMPORARY FILE FIRST, and only bytes that parsed reach it. That
+# is what makes a refusal disclose nothing, and it is also what makes re-publishing the published
+# file ONTO ITSELF safe — which is what every re-run of a TLS installation does, because the
+# recovered DB_SSLROOTCERT names a generation this same function wrote. Normalisation is idempotent
+# (openssl's re-encoding of a certificate it re-encoded is the same DER), so that re-run computes
+# the same digest, lands on the same path and writes the same content.
+#
+# NOTHING EXISTING IS REPLACED. The target is derived from the content, so a candidate that differs
+# from the installed generation cannot be written over it, and one that does not differ writes what
+# is already there.
+publish_db_ca() {
+  local source="$1" candidate digest
+  command -v sha256sum >/dev/null 2>&1 || {
+    error "sha256sum is not on this host's PATH. The published database CA is named and re-checked by the digest of its own bytes, so without it nothing here can say which generation was published or whether it is still the one that was validated."
+    return 1
+  }
+  mkdir -p "${DB_CA_PUBLISH_DIR}" || return 1
+  chown "${DB_CA_PUBLISH_OWNER}" "${DB_CA_PUBLISH_DIR}" || return 1
+  chmod 755 "${DB_CA_PUBLISH_DIR}" || return 1
+  # In the publish directory so the rename below is a rename; dot-prefixed and outside the
+  # generation glob so a prune cannot see it; 0600 so the bytes being parsed are never readable by
+  # anyone but root even for the moment they are unparsed.
+  candidate="$(mktemp "${DB_CA_PUBLISH_DIR}/.db-ca-candidate.XXXXXX" 2>/dev/null)" || return 1
+  chmod 600 "${candidate}" 2>/dev/null || { rm -f "${candidate}"; return 1; }
+  normalize_db_ca_pem "${source}" "${candidate}" || { rm -f "${candidate}"; return 1; }
+  digest="$(file_sha256 "${candidate}")"
+  [[ "${digest}" =~ ^[0-9a-f]{64}$ ]] || { rm -f "${candidate}"; return 1; }
+  # ASSIGNED ONLY ONCE BOTH ARE TRUE. A digest set before the file exists would make every refusal
+  # below quote a generation nobody wrote.
+  publish_durable_file "$(db_ca_generation_file "${digest}")" "${DB_CA_PUBLISH_OWNER}" 644 < "${candidate}" || {
+    rm -f "${candidate}"
+    return 1
+  }
+  rm -f "${candidate}"
+  DB_CA_PUBLISHED_DIGEST="${digest}"
+  DB_CA_PUBLISHED_FILE="$(db_ca_generation_file "${digest}")"
+  return 0
+}
+
+# WHAT SURVIVES A PRUNE, AND WHEN ONE HAPPENS (o3d-2sm1.5 r47, Codex HIGH).
+#
+# Called ONCE, at the end of a run that finished — never on a failure path, because the generation a
+# failed run would delete is the one an operator is about to need. Two files are exempt whatever
+# their age: the generation THIS run published, and the generation the PREVIOUS installed
+# DATABASE_URL named. The second is the rollback target and it is protected unconditionally rather
+# than by being recent enough, because "recent enough" is exactly the property an operator cannot
+# check before they need it. Of the rest, the ${DB_CA_GENERATIONS_RETAINED} most recently modified
+# stay and the older ones go.
+#
+# AND IT ONLY EVER SEES GENERATIONS (r48, Codex MEDIUM). A `db-ca-*.crt` glob is not a test for
+# "a file this publisher wrote": it matches `db-ca-manual.crt` and every other name an operator
+# reaches for, and this function DELETES. So membership is decided by db_ca_generation_digest() —
+# the exact inverse of db_ca_generation_file(), 64 lowercase hex characters and nothing else — and
+# then by re-hashing the file to check the digest its own name claims. Anything that fails either
+# test is not deleted AND does not count against the retention window; the glob below survives only
+# as a cheap prefilter, so the decision is never made by a wildcard.
+#
+# `existing_env` reads the environment file as it was when this run STARTED — load_existing_env()
+# ran during configuration, long before the new one was written — so it names the previous
+# generation and not the one just installed.
+#
+# IT NEVER FAILS THE INSTALL. Everything here is housekeeping over public certificates; a directory
+# that cannot be listed or a file that cannot be removed costs some kilobytes and nothing else.
+prune_db_ca_generations() {
+  local current="${DB_CA_PUBLISHED_FILE}" previous file named kept=0
+  [[ -d "${DB_CA_PUBLISH_DIR}" ]] || return 0
+  previous="$(installed_database_sslrootcert "$(existing_env DATABASE_URL)")" || previous=""
+  while IFS= read -r file; do
+    [[ -n "${file}" ]] || continue
+    # IS THIS A GENERATION THIS PUBLISHER WROTE? Two questions, and a no to either takes the file
+    # out of the prune entirely — not deleted, and not counted against the retention window either,
+    # because a file the prune does not understand must not shorten the retention it advertises.
+    #
+    # First the NAME, which must be exactly ${DB_CA_GENERATION_PREFIX}<64 lowercase hex>${DB_CA_GENERATION_SUFFIX}.
+    named="$(db_ca_generation_digest "${file}")" || continue
+    # Then the BYTES, because the name is a claim and the whole point of content-addressing is that
+    # the claim is checkable. A file whose contents do not hash to the digest in its own name was not
+    # written by publish_db_ca(), whatever it is called — an operator's copy, a hand-edited bundle,
+    # a restored backup — and this is the one place on the CA path that DELETES, so it acts only on
+    # files it can prove it produced.
+    [[ "$(file_sha256 "${file}")" == "${named}" ]] || continue
+    [[ "${file}" != "${current}" ]] || continue
+    [[ "${file}" != "${previous}" ]] || continue
+    kept=$((kept + 1))
+    [[ "${kept}" -gt "${DB_CA_GENERATIONS_RETAINED}" ]] || continue
+    rm -f "${file}" 2>/dev/null && info "Removed superseded database CA generation ${file}."
+  # A PREFILTER, NOT THE SELECTOR — db_ca_generation_digest() and the re-hash above decide.
+  done < <(find "${DB_CA_PUBLISH_DIR}" -maxdepth 1 -type f \
+             -name "${DB_CA_GENERATION_PREFIX}*${DB_CA_GENERATION_SUFFIX}" \
+             -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2-)
+  return 0
+}
+
+# WHAT WAS PUBLISHED IS STILL THERE, STILL THOSE BYTES, AND STILL OPEN TO THE PRINCIPAL ABOUT TO
+# USE IT. Called once at publication and again at each boundary where a new principal appears, so
+# a failure names the principal rather than surfacing as a connection refused after the cutover.
+#
+# Every argument after the first is an OS user to actually open the file as. A user that does not
+# exist yet is skipped rather than failed: this runs during configuration too, where the honest
+# answer about ${APP_USER} is "not yet", and the bits check above is what stands in until it does.
+#
+# WHEN THE OPERATOR'S CA CHANGES. Each published file is a SNAPSHOT of whatever DB_SSLROOTCERT named
+# at the moment of the run that took it, and it is a GENERATION: a new CA is a new file at a new
+# path, published beside the old one rather than over it. The refresh is a re-run of the installer
+# with DB_SSLROOTCERT= pointing at the new source — which the r46 precedence makes reachable under
+# --non-interactive, since a supplied value beats the path recovered from the URL — and the switch
+# from one generation to the next is the new DATABASE_URL, written at the environment-file
+# publication far below every probe in this script. A run that refuses anywhere before that has
+# changed no trust root: the installed URL still names the generation it named this morning, that
+# file is still on disk with the same bytes, and starting the old service by hand still works.
+#
+# Doing nothing leaves the old trust root in place, and STALE HERE FAILS CLOSED: `verify-ca` and
+# `verify-full` refuse a certificate that does not chain to it, so a rotated cluster CA takes the
+# connection down loudly instead of quietly accepting a chain nobody vouched for.
+verify_db_ca_published() {
+  local user perm owner
+  [[ -n "${DB_CA_PUBLISHED_DIGEST}" ]] || {
+    error "No database CA has been published by this run, so there is nothing to verify. That is a bug in this script's own ordering: verify_db_ca_published() ran before publish_db_ca()."
+    return 1
+  }
+  [[ -f "${DB_CA_PUBLISHED_FILE}" ]] || {
+    error "${DB_CA_PUBLISHED_FILE} is not there. This run published the database CA to that path and something removed it since; the application, the psql probes and the authentication-request reader all name it, so none of them can verify the server."
+    return 1
+  }
+  perm="$(file_sha256 "${DB_CA_PUBLISHED_FILE}")"
+  [[ "${perm}" == "${DB_CA_PUBLISHED_DIGEST}" ]] || {
+    error "${DB_CA_PUBLISHED_FILE} no longer holds the bytes this run validated and published (sha256 ${perm:-unreadable}, expected ${DB_CA_PUBLISHED_DIGEST}). The trust root every connection below is verified against has been replaced since it was checked; nothing here can vouch for what the server presents."
+    return 1
+  }
+  owner="$(stat -c '%U:%G' "${DB_CA_PUBLISHED_FILE}" 2>/dev/null)" || owner=""
+  [[ "${owner}" == "${DB_CA_PUBLISH_OWNER}" ]] || {
+    error "${DB_CA_PUBLISHED_FILE} is owned by ${owner:-nobody this run could read} and not by ${DB_CA_PUBLISH_OWNER}. A trust root its reader can rewrite is not a trust root: it can be replaced between the probe that vouched for it and the service that connects with it."
+    return 1
+  }
+  owner="$(stat -c '%U:%G' "${DB_CA_PUBLISH_DIR}" 2>/dev/null)" || owner=""
+  [[ "${owner}" == "${DB_CA_PUBLISH_OWNER}" ]] || {
+    error "${DB_CA_PUBLISH_DIR} is owned by ${owner:-nobody this run could read} and not by ${DB_CA_PUBLISH_OWNER}. Whoever owns the directory can replace the file in it by rename, whatever the file's own mode says."
+    return 1
+  }
+  perm="$(stat -c '%a' "${DB_CA_PUBLISH_DIR}" 2>/dev/null)" || perm=""
+  [[ "${perm}" == "755" ]] || {
+    error "${DB_CA_PUBLISH_DIR} is mode ${perm:-unreadable} and not 755. 0755 is what makes the CA reachable by ${APP_USER} and by postgres while leaving root the only account that can write it."
+    return 1
+  }
+  db_ca_path_is_open_to_every_uid "${DB_CA_PUBLISHED_FILE}" || {
+    error "${DB_CA_PUBLISHED_FILE} is not readable by every uid on this host, or is writable by more than its owner. The installer runs as root, the psql probes run as postgres and the service runs as ${APP_USER}; a mode that only root can open passes every check this script makes and then fails when the application starts, after the migration."
+    return 1
+  }
+  for user in "$@"; do
+    id "${user}" >/dev/null 2>&1 || continue
+    run_as_user "${user}" test -r "${DB_CA_PUBLISHED_FILE}" >/dev/null 2>&1 || {
+      error "${user} cannot read ${DB_CA_PUBLISHED_FILE}. That account opens the database CA — the service runs as ${APP_USER}, the credential probes run as postgres — so it would fail to verify the server it is about to be pointed at."
+      return 1
+    }
+  done
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# THE ROTATION JOURNAL: WHAT THE NEXT RUN IS TOLD, AND WHAT IT DOES ABOUT IT
+# (o3d-2sm1.5 r39, Codex HIGH).
+#
+# THE DEFECT. `ALTER USER ... WITH PASSWORD` COMMITS. Everything that made the new credential
+# usable came after it and none of it was durable: two in-memory flags, a recomposed
+# DATABASE_URL, and a `cat > ${APP_DIR}/.env` that TRUNCATED the only environment file the
+# application has before writing a byte of the replacement. A SIGKILL, a power loss, an ENOSPC or
+# a refused chown anywhere in that sequence left PostgreSQL holding the new password while `.env`
+# held the old one — or held nothing. The service is stopped and the database is fenced at that
+# moment, so the operator's only move is to re-run, and the re-run read the stale `.env`, believed
+# the old password was installed, and either did nothing or refused. The window is short and the
+# outage it produces is not.
+#
+# IT IS THIS BRANCH'S OWN DOCTRINE, APPLIED WHERE IT WAS MISSING. The fence recovery record exists
+# because "a record written after the durable act is absent on the run that is killed in between".
+# The rotation did the durable act first.
+#
+# SO: A JOURNAL BEFORE THE ALTER, AND IT SAYS WHAT TO DO — not merely that something happened.
+# A journal that records a fact without telling the next run how to reconcile it is half the fix.
+# It carries BOTH candidate passwords, so the next run does not have to guess which of them the
+# server has: it ASKS THE SERVER, which is the only party that knows, and every outcome below is
+# decided by that answer rather than by inferring one from what is present on disk.
+#
+#   THE THREE INTERRUPTION POINTS, AND WHAT RECONCILES EACH
+#
+#   (1) THE JOURNAL IS WRITTEN AND THE `ALTER` HAS NOT RUN.
+#       The server still has the OLD password and ${APP_DIR}/.env still names it; the two agree
+#       and nothing is broken. The next run's probe finds the OLD password live, offers it as the
+#       installed credential, rewrites `.env` with it — the same bytes — and clears the journal.
+#       If the operator supplies the new password again, that is an ordinary pending rotation and
+#       it happens in the fenced window as it should have the first time.
+#
+#   (2) THE `ALTER` HAS RUN AND `.env` HAS NOT BEEN PUBLISHED.
+#       This is the outage. The server has the NEW password; `.env` names the OLD one, complete
+#       and untruncated — publish_durable_file() renames, so no partial state is reachable. The
+#       next run's probe finds the NEW password live and treats IT as the installed credential in
+#       place of what `.env` says; the run's own pre-build `write_app_env_file` therefore
+#       publishes an environment file naming the credential the server actually has, and the
+#       journal is cleared only after that publication has returned success. FINISHING the
+#       transition, which is the only direction that is safe: the old password is gone from the
+#       server and this script will not put it back.
+#
+#   (3) BOTH ARE DONE AND THE RUN DIED BEFORE THE JOURNAL WAS CLEARED.
+#       Indistinguishable from (2) to the probe, and it does not need to be distinguished: the
+#       answer is the same. The probe finds the NEW password live, `.env` already names it, the
+#       rewrite is byte-identical and the journal is cleared. The journal is removed LAST for
+#       exactly this reason — a spurious journal costs one probe, a missing one costs the outage.
+#
+#   (4) NEITHER PASSWORD AUTHENTICATES.
+#       Somebody rotated the role out of band, or the server is unreachable. The run REFUSES,
+#       before it has prompted for anything else and before anything is stopped, and it leaves the
+#       journal in place: this script cannot tell those two apart and guessing is how a credential
+#       gets lost. The refusal prints the journal path and both psql answers.
+#
+# WHERE IT LIVES. /etc/ims-cutover, not ${CUTOVER_STATE_DIR}: the cutover state directory is the
+# application's own data directory and therefore WRITABLE BY THE APPLICATION USER, and a record
+# that says which password to install is not a record that account may edit. The directory is a
+# literal for the reason DB_ENV_SNAPSHOT_DIR is one — a privileged path resolved from a variable
+# the application can set is not a privileged path.
+#
+# The file is created by this script, which refuses to run as anything but root, and
+# publish_durable_file() gives it mode 0600 before the rename — so it is root-owned and 0600 from
+# the instant its name exists.
+# ---------------------------------------------------------------------------
+DB_ROLE_ROTATION_JOURNAL="${DB_ENV_SNAPSHOT_DIR}/db-role-rotation.journal"
+# Set by reconcile_interrupted_role_rotation() when it found a journal and established, from the
+# server, which of the two credentials is live.
+DB_ROTATION_JOURNAL_FOUND=false
+DB_ROTATION_RECONCILED_PASSWORD=""
+# `new` or `old` — which of the journal's two candidates the discriminating endpoint accepted.
+DB_ROTATION_RECONCILED_WHICH=""
+
+# Base64 because a password may contain anything, including the `=` and the newlines that a
+# key=value file cannot carry. `base64 -w0` is coreutils; `tr -d '\n'` keeps it honest anywhere.
+rotation_journal_encode() {
+  printf '%s' "$1" | base64 | tr -d '\n'
+}
+
+rotation_journal_decode() {
+  printf '%s' "$1" | base64 -d 2>/dev/null
+}
+
+# One key, first occurrence, read WITHOUT sourcing: this file names two passwords and sourcing it
+# would execute whatever a `$(` in one of them spelled.
+role_rotation_journal_value() {
+  local key="$1"
+  [[ -f "${DB_ROLE_ROTATION_JOURNAL}" ]] || return 1
+  sed -n "s/^${key}=//p" "${DB_ROLE_ROTATION_JOURNAL}" 2>/dev/null | head -1
+}
+
+# The four values that make a credential a credential, in the spelling the refusals print.
+role_rotation_identity() {
+  printf '%s@%s:%s/%s' "${DB_USER}" "${DB_HOST}" "${DB_PORT}" "${DB_NAME}"
+}
+
+write_role_rotation_journal() {
+  local old_password="$1" new_password="$2" probe_database="${3:-}"
+  mkdir -p "${DB_ENV_SNAPSHOT_DIR}" || return 1
+  chmod 700 "${DB_ENV_SNAPSHOT_DIR}" 2>/dev/null || return 1
+  # `marker_complete=1` is written LAST, so a reader that does not find it is looking at bytes no
+  # publication produced — see read_role_rotation_journal(). publish_durable_file() renames, so
+  # that can only be a hand-made file, and this script says so rather than guessing at it.
+  {
+    printf '# One Two Inventory — an application role password rotation is IN FLIGHT.\n'
+    printf '# Written by scripts/install.sh BEFORE the ALTER, removed only after the matching\n'
+    printf '# %s/.env has been durably published. If this file exists, a run was interrupted\n' "${APP_DIR}"
+    printf '# between those two points; the next install run reconciles it by asking the server\n'
+    printf '# which of the two passwords below is live. Do not edit it by hand.\n'
+    printf 'journal_version=2\n'
+    printf 'identity=%s\n' "$(role_rotation_identity)"
+    printf 'env_file=%s\n' "${APP_DIR}/.env"
+    # THE ENDPOINT THIS RUN PROVED COULD DISCRIMINATE (o3d-2sm1.5 r40, Codex HIGH). Written so the
+    # reconciliation asks the SAME place rather than deriving one of its own, and so an operator
+    # reading this file by hand knows which pg_hba rule the answer depends on. It is `postgres`
+    # for every rotation this installer performs, and it is recorded rather than assumed because
+    # a value that is derived twice is a value that can be derived differently twice.
+    printf 'probe_database=%s\n' "${probe_database}"
+    printf 'old_password_b64=%s\n' "$(rotation_journal_encode "${old_password}")"
+    printf 'new_password_b64=%s\n' "$(rotation_journal_encode "${new_password}")"
+    printf 'marker_complete=1\n'
+  } | publish_durable_file "${DB_ROLE_ROTATION_JOURNAL}" || return 1
+  return 0
+}
+
+clear_role_rotation_journal() {
+  [[ -e "${DB_ROLE_ROTATION_JOURNAL}" ]] || return 0
+  rm -f "${DB_ROLE_ROTATION_JOURNAL}" || return 1
+  # The unlink needs the same directory barrier the rename got, or a power loss can restore the
+  # name and the next run reconciles a rotation that is already finished. That is harmless — case
+  # (3) — but a durability claim this script does not have is not one it should make.
+  fsync_path "${DB_ENV_SNAPSHOT_DIR}" || return 1
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# AND A PROBE THAT CAN SAY NO IS NOT EVIDENCE EITHER, UNTIL IT SAYS WHOSE PASSWORD IT CHECKED
+# (o3d-2sm1.5 r41, Codex HIGH)
+# ---------------------------------------------------------------------------
+#
+# THE DEFECT r40 LEFT. The negative control below proves an endpoint discriminates BETWEEN
+# PASSWORDS. It does not prove the password it discriminates on is POSTGRESQL'S ROLE CREDENTIAL,
+# which is the only thing `ALTER ROLE ... PASSWORD` changes. `pg_hba.conf` has password-dependent
+# methods that consult somebody else's store — `ldap`, `pam`, `radius`, `bsd` — and under every one
+# of them both halves of the control behave exactly as a healthy scram endpoint would:
+#
+#   `postgres` authenticates through RADIUS while '${DB_NAME}' uses scram. Before the rotation the
+#   RADIUS endpoint accepts the credential `.env` names and refuses the random control, so it is
+#   admitted and recorded. The run dies after the ALTER. The next run re-proves that same endpoint,
+#   RADIUS still accepts only the OLD password — it never heard of the ALTER — so the
+#   reconciliation concludes the ALTER did not commit, publishes the OLD password and CLEARS THE
+#   JOURNAL. The application database now wants the NEW one. The service cannot connect and the
+#   evidence for recovering it has been deleted.
+#
+# THE FIX IS TO STOP INFERRING THE METHOD AND ASK FOR IT. An endpoint is admitted only when the
+# SERVER ITSELF named a matched rule that checks `pg_authid.rolpassword`, and the server names it
+# in the ordinary v3 startup exchange: it performs its own pg_hba match and announces the
+# consequence as an Authentication request message, which is one value for `scram-sha-256`/`md5`
+# and a different value for everything else. lib/pg-auth-request.mjs reads that one message and
+# exits 0 only for the two, sending no password at all. Its header documents the mapping, the two
+# routes that were measured and rejected (`pg_hba_file_rules` is a rule LISTING and not a match;
+# libpq's `require_auth` does not exist before libpq 16), and what the answer does not cover.
+#
+# WHAT THIS ESTABLISHES: that the secret this endpoint is about to compare is the one ALTER ROLE
+# writes, for this role, on this database, from this address, over this transport.
+#
+# WHAT IT DOES NOT: it cannot admit the `password` method — cleartext compared against the role's
+# own secret — because on the wire that is the same message `ldap` sends, and it must be: an
+# external verifier can only be consulted with the plaintext. Refusing it is a deliberate
+# narrowing, and the refusal below says so and says what to change.
+#
+# ---------------------------------------------------------------------------
+# TWO CORRECT INSTRUMENTS, ONE WRONG CONCLUSION, BECAUSE NOTHING PINNED THEM TO THE SAME ROUTE
+# (o3d-2sm1.5 r42, Codex HIGH)
+# ---------------------------------------------------------------------------
+#
+# THE DEFECT r41 LEFT. The method proof and the negative control were kept side by side on the
+# grounds that each covers the other's gap. They were also asking about DIFFERENT TRANSPORTS, and
+# there is a cluster on which both pass and the answer is still false:
+#
+#   `hostssl  all all <host> scram-sha-256`
+#   `hostnossl all all <host> radius`        — over a directory holding the role's CURRENT password
+#
+#   The reader negotiates TLS, stops at the hostssl record and reports `scram-sha-256`. Honestly:
+#   that IS the record it matched. The credential probe then runs under libpq's default
+#   `sslmode=prefer`, which does not mean "use TLS" — it means try TLS, AND IF THAT CONNECTION
+#   FAILS, RETRY WITHOUT IT. The random control fails SCRAM over TLS, drops to the clear, and is
+#   REFUSED by RADIUS too — so the control's NO is satisfied, by the wrong record. The asserted
+#   password succeeds over TLS, so its YES is satisfied by the right one. Both instruments pass.
+#   After the ALTER and an interruption the two records disagree: the NEW password authenticates
+#   over TLS, and the OLD one fails there, falls back, and is ACCEPTED by the directory. The
+#   reconciliation sees both candidates accepted, refuses — correctly, given what it was shown —
+#   and a recoverable installation is left needing a person.
+#
+# THE FIX IS TO REMOVE THE DIVERGENCE, NOT TO ADD A THIRD CHECK. Three mechanisms that can
+# disagree are worse than two. lib/pg-auth-request.mjs now REPORTS THE ROUTE IT TOOK, as the libpq
+# setting that reproduces it — `sslmode=require` when TLS was negotiated, `sslmode=disable` when it
+# was not — and every credential-bearing connection this run then opens to that endpoint is pinned
+# to that value, with `gssencmode=disable` beside it because GSSAPI encryption is a third transport
+# libpq will otherwise negotiate on its own. `prefer` appears in no probe. An authentication
+# failure now has no second record to select, so the method the reader read is the method the
+# password is checked by.
+#
+# WHAT THE NEGATIVE CONTROL IS STILL FOR, having lost that job. It is kept, and not out of
+# caution — it is the only thing that catches two live cases:
+#
+#   THE POSITIVE HALF is the only instrument here that authenticates at all. The reader never
+#   does, so it cannot tell a healthy scram endpoint from one where '${DB_USER}' has no CONNECT —
+#   and THIS INSTALLER'S OWN FENCE REVOKES CONNECT on '${DB_NAME}'. Without the YES, "refused
+#   everything" would read as password-sensitivity and a fenced endpoint would be admitted.
+#   THE NEGATIVE HALF still catches a route that announces `scram-sha-256` and then accepts
+#   anything. Pinning closes the transport divergence; it cannot close a pg_hba RELOAD between the
+#   two connections, and it says nothing about a pooler or proxy on ${DB_HOST}:${DB_PORT} that
+#   speaks SASL itself without verifying. Both end with a password nothing can know being accepted
+#   on the pinned route, which is exactly what the control watches for. There is a regression that
+#   reloads pg_hba between the reader and the probe and requires the control to refuse.
+#
+# THE ORDER IS METHOD FIRST, AND THAT IS NOT AN OPTIMISATION. The positive half of the control
+# sends the application role's real password to the endpoint. Running it before the method is
+# known is handing that credential to a directory server this run has not yet established is not
+# involved. It is also what pins the route: until the reader has spoken there is no transport to
+# bind to, and a probe with no route REFUSES rather than falling back to libpq's default.
+#
+# ---------------------------------------------------------------------------
+# A PROBE THAT CANNOT SAY NO IS NOT EVIDENCE (o3d-2sm1.5 r40, Codex HIGH)
+# ---------------------------------------------------------------------------
+#
+# THE DEFECT. `db_password_authenticates` opened a connection with a candidate password and read
+# a successful `SELECT 1` as PROOF that the role holds it. That inference is only valid where the
+# server actually checks the password, and `pg_hba.conf` decides that per database, per host and
+# per role:
+#
+#   * a `trust` rule on the endpoint accepts EVERY password, so the probe cannot fail. It then
+#     "proves" whichever candidate was tried first — `new` — and the reconciliation publishes a
+#     `.env` naming a password the ALTER may never have set. That is the r39 outage with the
+#     recovery mechanism supplying it.
+#   * the CONVERSE is just as bad: an endpoint that refuses the SESSION rather than the password —
+#     a revoked CONNECT, and THE STANDING CONNECTION FENCE IS EXACTLY THAT over ${DB_NAME} — fails
+#     for a role holding precisely the right credential, so both candidates read as dead and an
+#     automatically recoverable installation is stranded.
+#
+# THE FIX IS A NEGATIVE CONTROL, and it is the whole of the fix. An endpoint is admitted as
+# evidence only once it has been shown, in this run, on this endpoint, that it can say BOTH words:
+#
+#   NO   a freshly minted random 32-byte password is REFUSED. Nothing knows that password, so an
+#        endpoint that accepts it accepts anything.
+#   YES  a password we are asserting IS live is ACCEPTED. Without this half, "refused everything"
+#        would pass as password-sensitivity — and a revoked CONNECT refuses everything.
+#
+# Only an endpoint that has done both is allowed to answer the question, and the endpoint that did
+# is RECORDED — in the journal by the rotating run, and in DB_ROTATION_PROBE_DATABASE by the run
+# that reconciles — so the answer and the proof are about the same place rather than two
+# separately-derived ones.
+#
+# AND IT MUST BE UNFENCED. An interrupted rotation leaves the connection fence STANDING over
+# ${DB_NAME}, so the application database is the one endpoint guaranteed to be useless when the
+# reconciliation needs it. `postgres` is the maintenance database every PostgreSQL cluster has,
+# PUBLIC holds CONNECT on it by default, and this installer's fence never touches it — so it is
+# the endpoint a rotation must prove BEFORE it commits, and the first one a reconciliation tries.
+#
+# WHERE AN UNKNOWN LANDS. Every path below that cannot be shown password-sensitive REFUSES. That
+# is this branch's standing rule and it costs nothing on either side: the rotation refuses before
+# the ALTER, so the role still has the credential its clients hold, and the reconciliation refuses
+# before anything is stopped, with the journal left in place carrying both candidates.
+
+# THE ROUTE THE READER OBSERVED, AND THE ENDPOINT IT OBSERVED IT ON (o3d-2sm1.5 r42, r43).
+#
+# Set together by db_endpoint_checks_role_verifier() and cleared together by it, so that a route
+# proven for one database can never be spent on another. Empty means no reader has spoken, and
+# every credential-bearing probe below REFUSES on that rather than opening a connection libpq gets
+# to route for itself.
+#
+# SINCE r43 THIS IS THE APPLICATION'S ROUTE. The reader is told to take it (see
+# db_application_route_sslmode()) and its answer is checked back against it, so what is published
+# here is not "what libpq happened to negotiate" but "what node-postgres does with the URL this run
+# will write". Every probe below therefore runs on the transport the application runs on, which is
+# the connection all of this exists to vouch for.
+DB_PROBE_ROUTE_DATABASE=""
+DB_PROBE_SSLMODE=""
+
+# Does this endpoint let ${DB_USER} in with these bytes? The verdict is the EXIT STATUS of a
+# `SELECT 1` and never a match on the server's message, which is localised by lc_messages.
+#
+# IT GOES OUT ON THE APPLICATION'S ROUTE OR IT DOES NOT GO OUT (r42, r43) — which is the route the
+# reader was told to take and reported back. The pin is set in a SUBSHELL: a
+# `VAR=x function` prefix would survive the call — bash keeps such an assignment after a FUNCTION
+# invocation — and a route left set is a route the next endpoint would inherit.
+db_endpoint_accepts_password() {
+  local database="$1" password="$2"
+  [[ -n "${DB_PROBE_SSLMODE}" && "${DB_PROBE_ROUTE_DATABASE}" == "${database}" ]] || return 1
+  (
+    DB_ENDPOINT_ROUTE_SSLMODE="${DB_PROBE_SSLMODE}"
+    DB_ENDPOINT_ROUTE_SSLROOTCERT="${DB_SSLROOTCERT}"
+    pg_endpoint_psql "${DB_USER}" "${password}" "${database}" -tAc 'SELECT 1'
+  ) >/dev/null 2>&1
+}
+
+# The endpoint that was PROVEN able to discriminate, and the sentence explaining every endpoint
+# that was not. Read by the refusals so an operator is told which rule to look at.
+DB_ROTATION_PROBE_DATABASE=""
+DB_PROBE_REPORT=""
+
+# WHERE THE AUTHENTICATION-REQUEST READER LIVES (o3d-2sm1.5 r41, Codex HIGH).
+#
+# ${IMS_SCRIPT_LIB_DIR} is THIS SCRIPT'S OWN lib directory, resolved from BASH_SOURCE at startup —
+# the release being installed, not ${APP_DIR}. That distinction is the whole of r31's finding and
+# it is why db-fence-protected.sh is sourced from there; this helper is held to the same rule. It
+# is also handed NO credential of any kind: it reads one message and drops the connection, so even
+# the hazard that made the fence helper's provenance load-bearing does not arise here.
+#
+# IMS_AUTH_REQUEST_PROBE exists for the regressions, which run the shipped functions outside the
+# shipped file and so have no BASH_SOURCE to resolve from. It cannot weaken anything: pointing it
+# somewhere else does not produce an exemption, it produces the refusal below.
+db_auth_request_probe_path() {
+  printf '%s' "${IMS_AUTH_REQUEST_PROBE:-${IMS_SCRIPT_LIB_DIR:-}/pg-auth-request.mjs}"
+}
+
+# THE MATCHED METHOD, AS THE SERVER STATED IT — AND THE ROUTE IT WAS STATED ON.
+#
+# Returns 0 only when the rule PostgreSQL itself matched for ${DB_USER} on this database, from
+# ${DB_HOST}, over the transport this reader negotiated, checks the secret `ALTER ROLE` writes.
+# Appends to DB_PROBE_REPORT on every refusal. Sends no password.
+#
+# ON SUCCESS IT PUBLISHES THE ROUTE (r42, r43): DB_PROBE_SSLMODE is the libpq setting that
+# reproduces the transport the reader used, read out of the reader's own `sslmode=` line rather
+# than inferred here, and DB_PROBE_ROUTE_DATABASE is the endpoint it belongs to. ON EVERY OTHER
+# PATH IT CLEARS THEM, which is what makes an unproven endpoint unprobeable rather than
+# probeable-by-default.
+#
+# AND THE ROUTE IS THE APPLICATION'S, DECIDED HERE AND CHECKED BACK (r43). This function asks
+# db_application_route_sslmode() what node-postgres does with the URL this run will publish, hands
+# that to the reader as `--sslmode=`, and admits the answer only if the reader's own `sslmode=`
+# line names the same route. So the method is read on the transport the application uses, and the
+# probes below are pinned to it — instead of every instrument agreeing with each other about a
+# connection nobody makes, which is what r42 left behind.
+db_endpoint_checks_role_verifier() {
+  local database="$1" probe verdict method detail sslmode route status=0
+  DB_PROBE_ROUTE_DATABASE=""
+  DB_PROBE_SSLMODE=""
+  # THE ROUTE IS DECIDED BEFORE THE READER IS RUN, AND BY THE APPLICATION (r43). Not by libpq, not
+  # by whatever the reader would have negotiated on its own: the question this gate answers is
+  # about the connection ${APP_DIR}/.env will name, so the observation is made on that connection's
+  # transport or it is not made at all.
+  if ! route="$(db_application_route_sslmode)"; then
+    # THE DERIVATION'S OWN SENTENCE, NOT A SUMMARY OF IT (r44). It is the only thing that knows
+    # WHICH of the several ways the route can be unknowable this host is in, and the summary that
+    # used to stand here named exactly one of them — the query string — while r44's finding was
+    # that the commonest is a PGSSLMODE this reader had never looked for.
+    DB_PROBE_REPORT+="
+  - '${database}' was not asked which pg_hba rule matches it, because this run cannot say which TRANSPORT the application's own connection takes: ${route}. A pg_hba rule is matched per transport — hostssl and hostnossl are different records — so a method read over an unknown route is not evidence about the connection the application makes."
+    return 1
+  fi
+  probe="$(db_auth_request_probe_path)"
+  if [[ ! -f "${probe}" ]]; then
+    DB_PROBE_REPORT+="
+  - '${database}' was not asked which pg_hba rule matches it, because the reader that asks — ${probe} — is not there. Without it this run cannot tell a 'scram-sha-256' endpoint from an 'ldap' one, and an ldap endpoint answers about a directory rather than about the password ALTER ROLE writes. Re-run the installer from a complete release checkout."
+    return 1
+  fi
+  if ! command -v node >/dev/null 2>&1; then
+    DB_PROBE_REPORT+="
+  - '${database}' was not asked which pg_hba rule matches it, because there is no 'node' on this PATH to run ${probe} with. Install Node.js — this installer installs it further down its own run, so a host that reached a credential rotation has it — and re-run."
+    return 1
+  fi
+  # The reader's own answer, whatever it is, on stdout. Its EXIT STATUS is the verdict; the
+  # `method=` and `detail=` lines are what the refusal quotes back to the operator.
+  local -a probe_args=(
+    "--host=${DB_HOST}" "--port=${DB_PORT}" "--user=${DB_USER}" "--database=${database}"
+    "--sslmode=${route}"
+  )
+  # THE SAME FILE THE APPLICATION VERIFIES AGAINST, not this reader's own idea of a trust store
+  # (r45). Under `verify-ca`/`verify-full` the driver is handed `ssl.ca` read from DB_SSLROOTCERT
+  # by pg-connection-string; the reader is handed the same path, and psql is handed it as
+  # PGSSLROOTCERT. Three clients, one CA.
+  [[ -z "${DB_SSLROOTCERT}" ]] || probe_args+=("--sslrootcert=${DB_SSLROOTCERT}")
+  capture verdict node "${probe}" "${probe_args[@]}" || status=$?
+  method="$(printf '%s\n' "${verdict}" | sed -n 's/^method=//p' | head -1)"
+  detail="$(printf '%s\n' "${verdict}" | sed -n 's/^detail=//p' | head -1)"
+  sslmode="$(printf '%s\n' "${verdict}" | sed -n 's/^sslmode=//p' | head -1)"
+  [[ -n "${method}" ]] || method="unknown"
+  [[ -n "${detail}" ]] || detail="the reader printed nothing this run could parse"
+  if [[ "${status}" -eq 0 ]]; then
+    # A METHOD WITHOUT A ROUTE IS NOT USABLE (r42). The two are published together or not at all:
+    # a probe pinned to nothing is a probe libpq routes for itself, which is the divergence.
+    # THE ROUTE IS CHECKED BACK, NOT ASSUMED (r43). The reader is TOLD which transport to take and
+    # REPORTS which one it took; those are two different lines and this compares them, so an
+    # argument passed and quietly ignored cannot look like a route observed. Anything but the
+    # application's own route — including a reader too old to have been given one — refuses here.
+    if [[ "${sslmode}" == "${route}" ]]; then
+      DB_PROBE_ROUTE_DATABASE="${database}"
+      DB_PROBE_SSLMODE="${sslmode}"
+      return 0
+    fi
+    DB_PROBE_REPORT+="
+  - '${database}' named an admissible matched method ('${method}') but not on the transport the APPLICATION uses: it was asked to read the rule on '${route}' — which is what node-postgres does with the DATABASE_URL this installer emits — and its sslmode line says '${sslmode:-nothing at all}'. A pg_hba rule is matched per transport, hostssl and hostnossl being different records, so a method read on any other route is not evidence about the connection the application will make. Re-run the installer from a complete release checkout."
+    return 1
+  fi
+  DB_PROBE_REPORT+="
+  - '${database}' does not authenticate '${DB_USER}' against PostgreSQL's own role credential: the matched pg_hba method reads as '${method}', and ${detail}. Only 'scram-sha-256' and 'md5' compare the secret ALTER ROLE writes, so nothing this endpoint says about a candidate password is evidence about the role."
+  return 1
+}
+
+# THE PAIR. Returns 0 only when the endpoint refused a password nothing can know AND accepted one
+# the caller is asserting is live. Appends a line to DB_PROBE_REPORT either way.
+#
+# IT IS NO LONGER THE WHOLE GATE (r41) — db_endpoint_checks_role_verifier() runs FIRST and decides
+# whose password is being checked, and since r42 also pins the transport this runs on. What is
+# left to this half is stated at length in the block above and in two sentences here: the POSITIVE
+# is the only authentication anything in this gate performs, so it is the only thing that can tell
+# a healthy endpoint from one where the role has no CONNECT; and the NEGATIVE is the only thing
+# that catches a route which announces `scram-sha-256` and then accepts anything anyway — a pg_hba
+# reload landing between the two connections, or a pooler that speaks SASL without verifying.
+db_endpoint_discriminates_passwords() {
+  local database="$1" positive="$2" control
+  # NO ROUTE, NO PROBE. Reached only when this is called without the method gate in front of it;
+  # the report says which of the two questions was skipped rather than blaming the endpoint for a
+  # refusal this run manufactured.
+  if [[ -z "${DB_PROBE_SSLMODE}" || "${DB_PROBE_ROUTE_DATABASE}" != "${database}" ]]; then
+    DB_PROBE_REPORT+="
+  - '${database}' was not probed with a credential at all, because no reader has established which TRANSPORT its pg_hba rule was matched on. A password sent over a route this run has not observed can be answered by a different record from the one the method was read from, so it is not sent."
+    return 1
+  fi
+  control="$(openssl rand -hex 32)"
+  if db_endpoint_accepts_password "${database}" "${control}"; then
+    DB_PROBE_REPORT+="
+  - '${database}' ACCEPTED a random 32-byte password, so it cannot tell one password from another. A \`trust\` (or otherwise password-independent) rule in pg_hba.conf covers ${DB_USER}@${DB_HOST} on it, and NOTHING it says about a candidate credential is evidence."
+    return 1
+  fi
+  if ! db_endpoint_accepts_password "${database}" "${positive}"; then
+    DB_PROBE_REPORT+="
+  - '${database}' refused the random password AND the candidate, so it has not been shown able to say yes. A revoked CONNECT is indistinguishable from a wrong password here — and this installer's own connection fence revokes CONNECT on '${DB_NAME}', which is why the application database cannot be the endpoint a rotation relies on."
+    return 1
+  fi
+  return 0
+}
+
+# THE WHOLE CHAIN, AGAINST ONE REFERENCE — THE APPLICATION'S CONNECTION (o3d-2sm1.5 r43).
+#
+# Written out because every previous round aligned these to each other and called it alignment.
+# The reference is what node-postgres does with the DATABASE_URL this run will publish, which
+# db_application_route_sslmode() derives from the composer itself.
+#
+#   the authentication-request reader   ON IT. Told the route as `--sslmode=`, and admitted only
+#                                       when it reports having taken that route.
+#   db_endpoint_accepts_password()      ON IT. psql pinned to DB_PROBE_SSLMODE, which is that same
+#                                       route, plus `gssencmode=disable`.
+#   db_endpoint_discriminates_passwords()
+#                                       ON IT, both halves — the negative control and the positive
+#                                       both go through the function above and nothing else.
+#   resolve_live_role_password()        ON IT. Its four credential attempts are those two functions.
+#   the ALTER, and every local statement DELIBERATELY NOT. pg_local_psql() goes over the Unix socket
+#                                       as the `postgres` superuser: it is not evidence about the
+#                                       application's credential, and it has to keep working when
+#                                       the application's route is exactly what is broken —
+#                                       otherwise a misconfigured pg_hba could not be repaired.
+#   verify_created_database_endpoint()  DELIBERATELY NOT, argued in full at that function: its
+#                                       conclusion is about which postmaster answered, which no
+#                                       transport can change, and it authenticates as a throwaway
+#                                       role rather than as ${DB_USER}, so a pin could only turn a
+#                                       role-specific pg_hba layout into a stopped install.
+#   the migration and the build         ON IT BY CONSTRUCTION. They are handed DATABASE_URL and run
+#                                       the application's own driver, which is the reference itself.
+
+# THE WHOLE GATE, IN THE ORDER THE ARGUMENT RUNS (r41, r42). Whose password AND OVER WHICH
+# TRANSPORT first, then — on that transport and no other — whether this endpoint can tell one
+# password from another, then whether the role can get in with the one asserted live. Nothing is
+# sent to the server until the first question has been answered, and nothing is sent anywhere but
+# the route that answer was given on.
+db_endpoint_is_password_sensitive() {
+  local database="$1" positive="$2"
+  db_endpoint_checks_role_verifier "${database}" || return 1
+  db_endpoint_discriminates_passwords "${database}" "${positive}" || return 1
+  return 0
+}
+
+# THE DATABASES ON THIS SERVER THAT COULD SERVE AS AN UNFENCED PROBE, most-likely-first.
+#
+# `postgres` LEADS because PUBLIC holds CONNECT on it by default and no fence in this script
+# touches it. THE REST ARE READ FROM THE SERVER RATHER THAN ASSUMED, and that is not decoration: a
+# site that has revoked PUBLIC CONNECT on the maintenance database — which is ordinary hardening —
+# has nowhere on the fixed list left to ask, and refusing every rotation on such a site would be
+# this round trading a wrong answer for a wrong refusal. So the question is put to the server.
+#
+# ${DB_NAME} IS EXCLUDED BY CONSTRUCTION. The connection fence revokes CONNECT on it and a
+# reconciliation runs with that fence still standing, so an endpoint chosen here must not be it.
+# Templates are excluded because they are not ordinary connection targets, and `datallowconn`
+# because a database that refuses every connection cannot discriminate anything. The list is
+# capped: each candidate costs up to two connection attempts, and a cluster with two hundred
+# databases must not turn one rotation into four hundred.
+db_connectable_databases_except_app() {
+  pg_local_psql -tA -v dbname="${DB_NAME}" <<'EOSQL' 2>/dev/null
+SELECT datname
+  FROM pg_database
+ WHERE datallowconn
+   AND NOT datistemplate
+   AND datname <> :'dbname'
+ ORDER BY (datname = 'postgres') DESC, datname
+ LIMIT 8;
+EOSQL
+}
+
+db_unfenced_probe_candidates() {
+  local -n _unfenced="$1"
+  local line
+  _unfenced=(postgres)
+  while IFS= read -r line; do
+    [[ -n "${line}" && "${line}" != "postgres" ]] || continue
+    _unfenced+=("${line}")
+  done < <(db_connectable_databases_except_app || true)
+}
+
+# THE ENDPOINTS A RECONCILIATION MAY ASK, with the one the rotating run RECORDED ahead of every
+# other — that is the "reuse that exact endpoint" half, and on a site whose only password-checked
+# endpoint is a database this list would not otherwise reach, it is the only thing that answers.
+# A journal written by an installer older than r40 carries no probe_database line; the list then
+# starts at `postgres`, which is where that older run would have asked first anyway.
+#
+# ${DB_NAME} COMES LAST, and it is here at all only as a last resort: it is normally behind the
+# fence, but a fence that has been released by hand, or a rotation interrupted before the fence
+# went up, leaves it the one endpoint that can still answer.
+db_probe_endpoint_candidates() {
+  local -n _endpoints="$1"
+  local recorded="${2:-}" database
+  local -a unfenced=()
+  db_unfenced_probe_candidates unfenced
+  _endpoints=()
+  for database in "${recorded}" "${unfenced[@]}" "${DB_NAME}"; do
+    [[ -n "${database}" ]] || continue
+    [[ " ${_endpoints[*]-} " == *" ${database} "* ]] || _endpoints+=("${database}")
+  done
+}
+
+# WHICH OF THE TWO CANDIDATES IS LIVE — asked only of an endpoint that has proven it can answer.
+#
+# Sets DB_ROTATION_RECONCILED_PASSWORD, DB_ROTATION_RECONCILED_WHICH and
+# DB_ROTATION_PROBE_DATABASE and returns 0 on an unambiguous answer. Returns 1 when no endpoint
+# could be shown password-sensitive; returns 2 when one could and said YES TO BOTH, which is not
+# an answer either — it is a server that is not behaving like a password check, and preferring
+# `new` because it connected is the defect this function exists to remove.
+resolve_live_role_password() {
+  local old_password="$1" new_password="$2" recorded="${3:-}"
+  local database new_ok old_ok
+  local -a endpoints=()
+  db_probe_endpoint_candidates endpoints "${recorded}"
+  DB_PROBE_REPORT=""
+  DB_ROTATION_PROBE_DATABASE=""
+  DB_ROTATION_RECONCILED_PASSWORD=""
+  DB_ROTATION_RECONCILED_WHICH=""
+
+  for database in "${endpoints[@]}"; do
+    # WHOSE PASSWORD, BEFORE ANY PASSWORD, AND OVER WHICH ROUTE (o3d-2sm1.5 r41 and r42, Codex
+    # HIGH). The two attempts below send the journal's candidates to this endpoint. If its rule is
+    # `ldap`, `pam`, `radius` or `bsd` that hands both of the role's credentials to somebody else's
+    # directory — and the answer that came back would be about that directory, not about the role.
+    # So the server is asked which rule it matched first, and an endpoint that is not checking
+    # pg_authid.rolpassword is dropped here, before anything leaves this host.
+    #
+    # THIS CALL IS ALSO WHAT PINS THE TRANSPORT. It publishes DB_PROBE_SSLMODE for this database,
+    # and the four probes below refuse outright without it — so the record the candidates are
+    # checked against is the record the method was read from. That matters most in exactly the
+    # configuration this loop meets after an interruption: with `hostssl scram-sha-256` over
+    # `hostnossl radius`, an UNPINNED old-password attempt fails SCRAM, drops to the clear and is
+    # accepted by the directory, both candidates read as live, and this function returns 2 on a
+    # rotation that is perfectly reconcilable over TLS.
+    db_endpoint_checks_role_verifier "${database}" || continue
+    # THE CANDIDATES, so that the positive half of the control pair is a password this run actually
+    # cares about rather than a second throwaway role. An endpoint that accepts neither has not
+    # been shown able to say yes and is skipped by the pair test below.
+    new_ok=false; old_ok=false
+    db_endpoint_accepts_password "${database}" "${new_password}" && new_ok=true
+    db_endpoint_accepts_password "${database}" "${old_password}" && old_ok=true
+    if ! ${new_ok} && ! ${old_ok}; then
+      DB_PROBE_REPORT+="
+  - '${database}' refused BOTH recorded candidates. Either neither is live there, or the endpoint refuses the session rather than the password — a revoked CONNECT, which is what this installer's connection fence does to '${DB_NAME}'."
+      continue
+    fi
+    # AND NOW THE CONTROL, against the candidate that connected. This is the half that makes a
+    # success mean something: under `trust` both flags above are true and the endpoint is thrown
+    # out here rather than believed. The method half of the gate already ran, at the top of this
+    # iteration, which is why this calls the discrimination half rather than the pair.
+    if ${new_ok}; then
+      db_endpoint_discriminates_passwords "${database}" "${new_password}" || continue
+    else
+      db_endpoint_discriminates_passwords "${database}" "${old_password}" || continue
+    fi
+    if ${new_ok} && ${old_ok}; then
+      DB_ROTATION_PROBE_DATABASE="${database}"
+      return 2
+    fi
+    DB_ROTATION_PROBE_DATABASE="${database}"
+    if ${new_ok}; then
+      DB_ROTATION_RECONCILED_PASSWORD="${new_password}"
+      DB_ROTATION_RECONCILED_WHICH=new
+    else
+      DB_ROTATION_RECONCILED_PASSWORD="${old_password}"
+      DB_ROTATION_RECONCILED_WHICH=old
+    fi
+    return 0
+  done
+  return 1
+}
+
+# @install-phase: credential-rotation
+#
+# Called from prompt_db_password(), which is the first point at which all four identity values are
+# known — and a point at which NOTHING HAS BEEN TOUCHED, so a refusal here leaves the system
+# exactly as it found it. That is the same rule the r37 reordering was about.
+reconcile_interrupted_role_rotation() {
+  DB_ROTATION_JOURNAL_FOUND=false
+  DB_ROTATION_RECONCILED_PASSWORD=""
+  DB_ROTATION_RECONCILED_WHICH=""
+  [[ -e "${DB_ROLE_ROTATION_JOURNAL}" ]] || return 0
+
+  local complete identity env_file old_password new_password recorded_probe resolution=0
+  complete="$(role_rotation_journal_value marker_complete || true)"
+  [[ "${complete}" == "1" ]] || die "A database credential rotation journal at ${DB_ROLE_ROTATION_JOURNAL} is incomplete — it has no marker_complete line. Nothing this installer writes can leave it in that state: it is published by rename, so the name only ever appears over finished bytes. Inspect the file, establish which password '${DB_USER}' actually has, and remove it. NOTHING HAS BEEN INSTALLED and nothing has been stopped."
+
+  identity="$(role_rotation_journal_value identity || true)"
+  env_file="$(role_rotation_journal_value env_file || true)"
+  [[ "${identity}" == "$(role_rotation_identity)" ]] || die "A database credential rotation was interrupted for ${identity} and this run is installing $(role_rotation_identity). A password is a property of one role on one server, so this run cannot finish that transition and must not clear its record: doing either would leave ${identity} with a credential nothing on this host names. Reconcile it — re-run the installer against ${identity}, or establish its password by hand and remove ${DB_ROLE_ROTATION_JOURNAL}. NOTHING HAS BEEN INSTALLED and nothing has been stopped."
+
+  [[ "${INSTALL_POSTGRES}" == "y" ]] || die "A database credential rotation was interrupted for ${identity} and this run does not manage a LOCAL PostgreSQL server, so it has no privileged local connection with which to establish which password that role now has. Re-run with the local database, or settle it by hand and remove ${DB_ROLE_ROTATION_JOURNAL}. NOTHING HAS BEEN INSTALLED and nothing has been stopped."
+
+  # THE JOURNAL DECODE, THROUGH THE SENTINEL (o3d-2sm1.5 r40, Codex HIGH). base64 is exactly what
+  # makes a newline-terminated password survive the FILE; `$( )` around the decode is what threw it
+  # away again, and this is the path where losing it publishes a `.env` the server will not accept.
+  # The INNER captures need nothing: role_rotation_journal_value() returns base64, whose alphabet
+  # contains no newline, so the only newline `$( )` removes there is sed's own line terminator.
+  capture old_password rotation_journal_decode "$(role_rotation_journal_value old_password_b64 || true)"
+  capture new_password rotation_journal_decode "$(role_rotation_journal_value new_password_b64 || true)"
+  [[ -n "${old_password}" && -n "${new_password}" ]] || die "The database credential rotation journal at ${DB_ROLE_ROTATION_JOURNAL} does not carry both candidate passwords, so this run cannot tell which one '${DB_USER}' has. Establish it by hand and remove the file. NOTHING HAS BEEN INSTALLED and nothing has been stopped."
+
+  # The endpoint the ROTATING run proved could discriminate, so this run asks that one first
+  # rather than deriving an endpoint of its own (o3d-2sm1.5 r40, Codex HIGH).
+  recorded_probe="$(role_rotation_journal_value probe_database || true)"
+
+  warn "A database credential rotation for ${identity} was INTERRUPTED: ${DB_ROLE_ROTATION_JOURNAL} exists,"
+  warn "which means a previous run committed — or was about to commit — an ALTER USER and did not"
+  warn "get as far as publishing ${env_file}. Asking the server which password that role has —"
+  warn "on an endpoint whose matched pg_hba rule the SERVER named as one that compares the secret"
+  warn "ALTER ROLE writes, and which has then been shown able to REFUSE a password nothing knows."
+
+  resolve_live_role_password "${old_password}" "${new_password}" "${recorded_probe}" || resolution=$?
+
+  if [[ "${resolution}" -eq 2 ]]; then
+    die "A database credential rotation for ${identity} was interrupted, and '${DB_ROTATION_PROBE_DATABASE}' — an endpoint that DID refuse a random password, so it is checking something — accepts BOTH recorded candidates as '${DB_USER}'. Two different passwords cannot both be the role's, so this server is not answering the way a password check answers and no probe here can say which credential is live. This run refuses rather than guess: ${DB_ROLE_ROTATION_JOURNAL} is LEFT IN PLACE so the two candidates are not lost. Establish the role's password by hand, remove that file, and re-run. NOTHING HAS BEEN INSTALLED and nothing has been stopped."
+  fi
+
+  if [[ "${resolution}" -ne 0 ]]; then
+    die "A database credential rotation for ${identity} was interrupted and this run could not find a single endpoint that both checks POSTGRESQL'S OWN role credential for '${DB_USER}' and can tell one password from another, so nothing it asked the server is evidence about which credential is live. A trust rule makes every candidate succeed; a revoked CONNECT makes every candidate fail; and an ldap, pam, radius or bsd rule answers confidently about a password held somewhere ALTER ROLE cannot reach — this run refuses on any of them rather than adopting a credential the probe cannot speak for. It may also be that NEITHER of the two passwords it recorded was accepted anywhere it could ask, which is what you see when somebody has rotated the role OUT OF BAND or the server is not reachable from here — and nothing this script can ask tells those apart, which is why it stops. ${DB_ROLE_ROTATION_JOURNAL} is LEFT IN PLACE so the two candidates are not lost. Give '${DB_USER}' a password-checked route to an UNFENCED database — GRANT CONNECT ON DATABASE postgres TO that role, with a scram-sha-256 or md5 rule for ${DB_HOST} in pg_hba.conf, is the whole of it — or establish the role's password by hand and remove that file. NOTHING HAS BEEN INSTALLED and nothing has been stopped. What this run asked, and what each endpoint did:${DB_PROBE_REPORT}"
+  fi
+
+  DB_ROTATION_JOURNAL_FOUND=true
+
+  if [[ "${DB_ROTATION_RECONCILED_WHICH}" == "new" ]]; then
+    success "The server has the NEW password: the ALTER committed. Established on '${DB_ROTATION_PROBE_DATABASE}', whose matched pg_hba rule the server named as scram-sha-256 or md5 — so the secret it compared is the one ALTER ROLE writes — and which refused a random password in the same breath. This run FINISHES the transition — it treats that credential as the installed one, so the environment file it writes names what the server actually has, and the journal is cleared only once that file is on the medium. ${env_file} may currently name the old one; it is complete and it is about to be replaced."
+    return 0
+  fi
+
+  success "The server still has the OLD password: the ALTER did not commit, so nothing was ever taken away and ${env_file} already agrees with the server. Established on '${DB_ROTATION_PROBE_DATABASE}', whose matched pg_hba rule the server named as scram-sha-256 or md5, and which refused a random password in the same breath. This run treats that credential as the installed one and clears the journal. Supply the new password again to ask for the rotation a second time; it will happen inside the stopped, fenced window."
+  return 0
+}
+
+# @install-phase: credential-rotation
+#
+# Called immediately after the pre-build write_app_env_file(), which is the publication the
+# journal was waiting for. NOT before it: the journal's whole job is to survive until an
+# environment file naming the live credential is on the medium.
+resolve_role_rotation_journal_after_env_publication() {
+  [[ -e "${DB_ROLE_ROTATION_JOURNAL}" ]] || return 0
+  if ${DB_PASSWORD_ROTATION_PENDING}; then
+    info "An interrupted rotation is recorded at ${DB_ROLE_ROTATION_JOURNAL} and THIS run has a"
+    info "rotation of its own pending, so the record stays: the fenced-window rotation supersedes"
+    info "it in the same step that performs the ALTER."
+    return 0
+  fi
+  clear_role_rotation_journal || die "The interrupted rotation recorded at ${DB_ROLE_ROTATION_JOURNAL} is reconciled — ${APP_DIR}/.env now names the credential the server has — but the record could not be removed durably. It is safe to delete by hand; leaving it costs the next run one probe. NOTHING HAS BEEN MIGRATED."
+  success "The interrupted rotation recorded at ${DB_ROLE_ROTATION_JOURNAL} is reconciled and the record is cleared: ${APP_DIR}/.env names the credential the server has."
 }
 
 # PUBLISH A SYSTEMD DROP-IN DURABLY (o3d-2sm1.5, Codex r11 CRITICAL).
@@ -1064,6 +3841,631 @@ rollback_reboot_fence_install() {
   return 0
 }
 
+
+# Read ONE variable out of .env without `source` (which executes whatever is in the file)
+# and without `grep | cut` (which is what this used to be: it kept the surrounding quotes
+# and any trailing comment, so an ordinary `KEY="postgres://u:p@h/db"  # deploy admin`
+# reached psql complete with a double quote at each end and the word "deploy" on the end).
+# The quoting rules followed are dotenv's own, because dotenv is what reads this file
+# everywhere else: a quoted value ends at its closing quote, an unquoted one ends at the
+# first whitespace-preceded `#`, and later definitions win.
+env_file_value() {
+  local key="$1" file="$2" line value
+  [[ -f "$file" ]] || return 0
+  line="$(grep -E "^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=" "$file" 2>/dev/null | tail -1 || true)"
+  [[ -n "$line" ]] || return 0
+  value="${line#*=}"
+  value="${value#"${value%%[![:space:]]*}"}"
+  case "$value" in
+    \"*) value="${value#\"}"; value="${value%%\"*}" ;;
+    \'*) value="${value#\'}"; value="${value%%\'*}" ;;
+    *)
+      value="${value%%[[:space:]]#*}"
+      value="${value%"${value##*[![:space:]]}"}"
+      ;;
+  esac
+  printf '%s' "$value"
+}
+
+# THE ONE PLACE A TCP PORT IS DECIDED TO BE A TCP PORT (o3d-2sm1.5 r26, Codex HIGH).
+#
+# A port that is not a port is not a cosmetic problem here: it is spliced straight into the URL
+# the health check polls, and a URL that cannot be reached is indistinguishable from a service
+# that did not come up. On the update path that costs a healthy deployment — the poll times out,
+# the script stops the service it just started and re-establishes the post-migration fences.
+#
+# So the shape is checked ONCE, where the value is read, and the run refuses BEFORE anything is
+# stopped rather than discovering it after the schema has moved. Decimal digits only, 1-65535,
+# and `10#` so a leading zero is a decimal port and not a bash octal error under `set -e`.
+valid_tcp_port() {
+  local value="$1"
+  [[ "$value" =~ ^[0-9]{1,5}$ ]] || return 1
+  (( 10#$value >= 1 && 10#$value <= 65535 )) || return 1
+}
+
+# ---------------------------------------------------------------------------
+# IS THE FILE WE READ THE ONLY THING THAT CAN DEFINE DATABASE_URL FOR THIS SERVICE?
+# (o3d-2sm1.5 r20, Codex CRITICAL; r21 asks systemd's BUS instead of its text output)
+#
+# r19 moved the identity from "worked out by the fence" to "supplied by the entrypoint", and the
+# entrypoint supplies it out of ${APP_DIR}/.env. That is the PREVIOUS PROBLEM ONE LEVEL UP: an
+# `Environment=DATABASE_URL=...` directive, a drop-in that adds one, a `PassEnvironment=` entry, a
+# `PAMName=` whose PAM stack exports one, or a second `EnvironmentFile=` can put a different URL in
+# the service's environment, and dotenv does NOT overwrite a variable that is already set. The
+# fence, the migration and the release would then all be self-consistent about the .env database
+# while the restarted application connects elsewhere — a migration run on a database nothing was
+# fenced off, and a new build started against a database nothing migrated.
+#
+# THIS DOES NOT REBUILD THE INFERENCE r19 DELETED, and the difference is the whole design. It
+# computes no value and reproduces no precedence. It asks ONE existence question about ONE
+# variable:
+#
+#     can anything other than the file we read define DATABASE_URL for this unit?
+#
+# systemd answers that directly, because it reports the COMPOSED Environment=, EnvironmentFiles=,
+# PassEnvironment=, UnsetEnvironment= and PAMName= with every drop-in already folded in by systemd
+# itself. Asking whether a second definition EXISTS is bounded; working out which of several would
+# WIN is the unbounded question, and it is never asked — any answer but "only that file" is a
+# refusal that names what else defines it and tells the operator to state the identity explicitly.
+# A second environment file is refused WITHOUT being read, for the same reason: that it may define
+# the variable is enough, and reading it to find out would put the precedence question straight
+# back. A non-empty PAMName= is refused without reading PAM configuration, for that same reason
+# again.
+#
+# IT IS ASKED OF THE BUS, NOT OF `systemctl show` (r21, Codex CRITICAL). Two of r20's three
+# findings were text-parsing bugs and only text-parsing bugs: `systemctl show` renders a property
+# as one `Name=` line of space-joined values, so where one entry of an ARRAY ends and the next
+# begins has to be guessed at — and `EnvironmentFiles` is an array of (path, ignore_errors) PAIRS
+# whose rendering the previous reader truncated at the first ` (ignore_errors=`. `busctl` — the
+# same package, on every host that has systemctl — prints the property's SIGNATURE and the array's
+# own ELEMENT COUNT before the elements:
+#
+#     a(sb) 1 "/opt/app/.env" true          as 2 "NODE_ENV=production" "PORT=3000"          s ""
+#
+# so "is there more than one environment file?" is answered by systemd's own data structure. The
+# count is read from the rendering and checked against the number of elements found in it; a
+# disagreement is a refusal. Nothing is inferred from where a space falls, and a string systemd had
+# to escape (busctl prints strings through `cescape()`) is REFUSED rather than decoded — decoding
+# it here would be one more reimplementation of somebody else's rules.
+#
+# EVERY ENVIRONMENT PROPERTY IS THEN MATCHED THE SAME WAY: on the NAME of each element, which is
+# everything before its first `=`. That is what makes `UnsetEnvironment=DATABASE_URL=<the value in
+# the .env>` a refusal (r21, Codex HIGH): systemd.exec takes "a space-separated list of variable
+# names or variable assignments", removes an exact assignment as the FINAL step of composing the
+# environment, and a scan for the bare token `DATABASE_URL` sees no such token in it — after which
+# the application's own dotenv loader supplies whatever `.env.local` says. The same rule applies to
+# Environment=, PassEnvironment= and UnsetEnvironment= alike, so no spelling of any of them is
+# matched by a substring.
+#
+# THE FILE MUST ALSO BE ONE SYSTEMD ITSELF LOADS. If the unit loads no environment file, the
+# variable reaches the application through the application's OWN loader instead, by rules that
+# belong to Next and not to systemd — `.env.local` and the per-mode overlays, which is precisely
+# the layer r19 stopped reproducing. So that is a refusal too, and it says which line to add.
+#
+# WHAT IT CANNOT SEE, STATED RATHER THAN PAPERED OVER: an `ExecStart=` that runs a wrapper which
+# exports DATABASE_URL itself is invisible to systemd's own properties, because that definition
+# lives inside a program rather than in the unit. Closing that would mean reading programs, which
+# is unbounded again. It is the standing argument for making the four values a DEPLOYMENT-OWNED
+# CONFIGURATION INPUT that these scripts read outright, instead of deriving them from a URL that
+# is only probably the one the service uses (o3d-1yvh, docs/installation.md).
+DB_IDENTITY_SOURCE_REASON="the service's environment has not been asked about yet"
+BUS_STRINGS=()
+
+# THE STRINGS IN ONE `busctl` RENDERING, in order, STILL ESCAPED.
+#
+# busctl prints every string through `cescape()`, so a `"` inside a value arrives as `\"` and
+# cannot end it early. This walks the rendering with that one rule and keeps the escapes: the
+# callers compare against names and paths that contain none, and refuse anything that does.
+# Returns 1 for a rendering whose quoting does not close, which is a rendering this cannot read.
+bus_read_strings() {
+  local text="${1:-}" index=0 length char current='' inside=0
+  BUS_STRINGS=()
+  length=${#text}
+  while (( index < length )); do
+    char="${text:index:1}"
+    if (( inside )); then
+      if [[ "$char" == '\' ]]; then
+        (( index + 1 < length )) || return 1
+        index=$(( index + 1 ))
+        current+="\\${text:index:1}"
+      elif [[ "$char" == '"' ]]; then
+        BUS_STRINGS+=("$current")
+        current=''
+        inside=0
+      else
+        current+="$char"
+      fi
+    elif [[ "$char" == '"' ]]; then
+      inside=1
+      current=''
+    fi
+    index=$(( index + 1 ))
+  done
+  (( inside == 0 )) || return 1
+  return 0
+}
+
+# THE ELEMENT COUNT systemd states in front of an array, for the signature we asked for.
+#
+# This is the number that makes the question bounded: it comes from the array, not from counting
+# separators in a line. A rendering of another signature — or none — is not an answer, and the
+# caller refuses.
+bus_array_count() {
+  local text="${1:-}" signature="${2:-}" rest
+  [[ "$text" == "${signature} "* ]] || return 1
+  rest="${text#"${signature}" }"
+  rest="${rest%% *}"
+  [[ "$rest" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$rest"
+}
+
+# One property of one unit, as systemd's own bus states it.
+bus_unit_property() {
+  busctl get-property org.freedesktop.systemd1 "${1:-}" "org.freedesktop.systemd1.${2:-}" "${3:-}" 2>/dev/null
+}
+
+# Does this element of an environment property NAME the variable being asked about? Everything
+# before the first `=` is the name, so `DATABASE_URL`, `DATABASE_URL=postgresql://...` and an
+# assignment carrying any value at all are one answer, and `NEXT_PUBLIC_DATABASE_URL=...` is not.
+# The variable is an ARGUMENT since r44, for the same reason it became one in update.sh at r28:
+# the transport question below asks it of PGSSLMODE, and a second matcher written for that is a
+# second place for the rule to be got wrong.
+bus_element_names_variable() {
+  [[ "${1%%=*}" == "${2}" ]]
+}
+
+# THE `ignore_errors` HALF OF EnvironmentFiles=, which is an `a(sb)` and not an `as`
+# (o3d-2sm1.5 r23, Codex HIGH). bus_read_strings() reads the paths and drops the booleans; the
+# snapshot check needs them, because a snapshot loaded with a leading `-` is not a binding at
+# all — systemd would SKIP it if it were missing and hand the service back to whatever else
+# defines DATABASE_URL, which is the failure this round exists to remove.
+#
+# Every quoted element is removed first, which leaves the signature, systemd's own element count
+# and the booleans in order. Nothing here reimplements systemd's escaping: the callers already
+# refuse any element that had to be escaped.
+BUS_ENV_IGNORE_FLAGS=()
+bus_read_env_ignore_flags() {
+  local text="${1:-}" stripped word index=0
+  BUS_ENV_IGNORE_FLAGS=()
+  stripped="$(printf '%s' "$text" | sed 's/"\(\\.\|[^"\\]\)*"/ /g')" || return 1
+  local IFS=' '
+  local -a words=()
+  # shellcheck disable=SC2206  # deliberate word split on the space-separated rendering
+  words=($stripped)
+  for (( index = 2; index < ${#words[@]}; index++ )); do
+    word="${words[index]}"
+    case "$word" in
+      true|false) BUS_ENV_IGNORE_FLAGS+=("$word") ;;
+      *) return 1 ;;
+    esac
+  done
+  return 0
+}
+
+# Does the caller also REQUIRE the environment snapshot to be loaded? False everywhere the
+# question is only "is anything else defining DATABASE_URL"; true at the one call site that is
+# about to hand the units to systemd (o3d-2sm1.5 r23).
+DB_IDENTITY_REQUIRE_SNAPSHOT=false
+
+# THE SCAN, TOLD WHICH VARIABLE TO ASK ABOUT (o3d-2sm1.5 r44, narrowed again at r45).
+#
+# It was `env_file_is_sole_database_url_source` and nothing else until r44, which is exactly the
+# shape update.sh was in when r28 found a second reader beside it. The variable stays an argument
+# so the two files hold ONE rule rather than two that drift.
+#
+# THE SECOND `layer` PARAMETER IS GONE AGAIN (r45, Codex HIGH). r44 gave this function a `none`
+# layer for the TRANSPORT question, and that layer OPENED the unit's environment files and
+# grepped them. Both halves of that were the finding: a wildcard `EnvironmentFile=` path is not a
+# file, so `[[ -e ]]` said absent; and a file read here is read again by systemd at exec, minutes
+# later, so an absence established here is not an absence there. The transport question is now
+# answered by a systemd DIRECTIVE that removes the variables outright — unit_route_env_guaranteed()
+# — and with the only caller of `none` gone the layer goes with it rather than sitting here as a
+# second, broken way to ask.
+#
+# WHAT IS LEFT IS THE DATABASE_URL QUESTION AND ONLY IT: ${env_file} is the PERMITTED source, an
+# `Environment=` directive is a competing definition and a refusal, and this run's own snapshot may
+# be the second environment file and nothing else may. No environment file is opened on this path,
+# for the reason r19 and r28 gave: WHICH of several definitions systemd would keep is composition
+# this script does not reproduce.
+ENV_VAR_SOURCE_REASON="the service environment has not been asked about yet"
+
+unit_env_var_sole_source() {
+  local variable="${1:-}" env_file="${2:-}"; shift 2 2>/dev/null || true
+  local -a units=("$@")
+  local unit object rendering count element expected resolved load_state pam_name snapshot_expected
+
+  ENV_VAR_SOURCE_REASON=""
+  expected="$(readlink -f "$env_file" 2>/dev/null || printf '%s' "$env_file")"
+  snapshot_expected="$(readlink -f "$DB_ENV_SNAPSHOT_FILE" 2>/dev/null || printf '%s' "$DB_ENV_SNAPSHOT_FILE")"
+
+  if [[ "${#units[@]}" -eq 0 || -z "${units[0]}" ]]; then
+    ENV_VAR_SOURCE_REASON="no systemd unit was identified for the application, so there is nothing that can say whether ${env_file} is what gives it ${variable}"
+    return 1
+  fi
+  if ! command -v busctl >/dev/null 2>&1; then
+    ENV_VAR_SOURCE_REASON="busctl — systemd's own bus client, shipped beside systemctl — is not available, so whether anything other than ${env_file} defines ${variable} for the service cannot be established"
+    return 1
+  fi
+
+  for unit in "${units[@]}"; do
+    [[ -n "$unit" ]] || continue
+
+    # LoadUnit, not GetUnit: it answers for a unit the manager has not loaded yet as well, so the
+    # LoadState below is what says whether there is a readable unit there at all. It is the same
+    # load `systemctl show` performs — it starts nothing and queues no job.
+    rendering="$(busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager LoadUnit s "$unit" 2>/dev/null)" || rendering=''
+    if ! bus_read_strings "$rendering" || [[ "${#BUS_STRINGS[@]}" -ne 1 || -z "${BUS_STRINGS[0]}" ]]; then
+      ENV_VAR_SOURCE_REASON="systemd would not say where ${unit} lives on its bus, so what defines ${variable} for that service is unknown"
+      return 1
+    fi
+    object="${BUS_STRINGS[0]}"
+
+    rendering="$(bus_unit_property "$object" Unit LoadState)" || rendering=''
+    if ! bus_read_strings "$rendering" || [[ "${#BUS_STRINGS[@]}" -ne 1 ]]; then
+      ENV_VAR_SOURCE_REASON="systemd would not answer for ${unit}'s LoadState, so what defines ${variable} for that service is unknown"
+      return 1
+    fi
+    load_state="${BUS_STRINGS[0]}"
+    # ANY STATE BUT `loaded` IS A REFUSAL HERE, INCLUDING `not-found`: the question this function
+    # asks is "does THIS file give the service its DATABASE_URL", and a service systemd does not
+    # have has not been shown to be given it by anything.
+    if [[ "$load_state" != "loaded" ]]; then
+      ENV_VAR_SOURCE_REASON="systemd reports ${unit} as '${load_state:-unknown}' rather than loaded, so what defines ${variable} for it cannot be read"
+      return 1
+    fi
+
+    # PAMName=, which the five-property question did not ask (r21, Codex CRITICAL). systemd.exec
+    # lists "variables set by any PAM modules in case PAMName= is in effect" AFTER the
+    # EnvironmentFile= layer and says the later source wins, so a unit naming a PAM profile whose
+    # stack runs pam_env can be handed a ${variable} that beats the file this deploy read — while
+    # every other property here still says "only that file". What a PAM stack supplies is not
+    # knowable without reading PAM configuration, so ANY non-empty value is refused.
+    rendering="$(bus_unit_property "$object" Service PAMName)" || rendering=''
+    if ! bus_read_strings "$rendering" || [[ "${#BUS_STRINGS[@]}" -ne 1 ]]; then
+      ENV_VAR_SOURCE_REASON="systemd would not answer for ${unit}'s PAMName=, so whether a PAM stack also defines ${variable} for it is unknown"
+      return 1
+    fi
+    pam_name="${BUS_STRINGS[0]}"
+    if [[ -n "$pam_name" ]]; then
+      ENV_VAR_SOURCE_REASON="${unit} sets PAMName=${pam_name}, and systemd applies the variables its PAM modules set AFTER the environment file — the later source wins. Whether that stack exports ${variable} is a question about PAM configuration this will not read, so it is refused rather than guessed at. Remove PAMName=, or state the connection identity explicitly"
+      return 1
+    fi
+
+    # The three environment lists, all matched on the element NAME. UnsetEnvironment= takes a name
+    # OR an exact assignment and is applied as the final composition step, so the assignment form
+    # is the same refusal as the bare name (r21, Codex HIGH).
+    local property description
+    for property in Environment PassEnvironment UnsetEnvironment; do
+      rendering="$(bus_unit_property "$object" Service "$property")" || rendering=''
+      if ! count="$(bus_array_count "$rendering" 'as')" || ! bus_read_strings "$rendering" \
+        || [[ "${#BUS_STRINGS[@]}" -ne "$count" ]]; then
+        ENV_VAR_SOURCE_REASON="systemd would not answer readably for ${unit}'s ${property}=, so what defines ${variable} for that service is unknown"
+        return 1
+      fi
+      for element in ${BUS_STRINGS[@]+"${BUS_STRINGS[@]}"}; do
+        bus_element_names_variable "$element" "$variable" || continue
+        case "$property" in
+          Environment) description="sets ${variable} in its own Environment= (${element%%=*}=…). systemd puts that in the service's environment and dotenv will not overwrite an already-set variable, so the application connects where THAT says and not where ${env_file} says" ;;
+          PassEnvironment) description="lists ${variable} in PassEnvironment=, so the service inherits whatever the service manager's own environment holds and ${env_file} does not decide where the application connects" ;;
+          *) description="lists ${variable} in UnsetEnvironment= (as '${element}'), so systemd removes the value ${env_file} supplies — as the final step of composing the environment, whether it is written as a name or as an exact assignment — and the application's own loader decides what replaces it" ;;
+        esac
+        ENV_VAR_SOURCE_REASON="${unit} ${description}. Remove it, or state the connection identity explicitly"
+        return 1
+      done
+    done
+
+    # EnvironmentFiles=, an array of (path, ignore_errors) pairs. EXACTLY ONE entry, and it must
+    # be ours: the count is systemd's own, so a second file cannot hide behind the rendering.
+    rendering="$(bus_unit_property "$object" Service EnvironmentFiles)" || rendering=''
+    if ! count="$(bus_array_count "$rendering" 'a(sb)')" || ! bus_read_strings "$rendering" \
+      || [[ "${#BUS_STRINGS[@]}" -ne "$count" ]]; then
+      ENV_VAR_SOURCE_REASON="systemd would not answer readably for ${unit}'s EnvironmentFiles=, so what defines ${variable} for that service is unknown"
+      return 1
+    fi
+    if [[ "$count" -eq 0 ]]; then
+      ENV_VAR_SOURCE_REASON="${unit} does not load ${env_file} with EnvironmentFile=, so ${variable} reaches the application through its own dotenv loader instead — whose .env.local and per-mode overlays are exactly the composition this deploy stopped reproducing. Add EnvironmentFile=${env_file} to the unit, or state the connection identity explicitly"
+      return 1
+    fi
+    # ONE ENVIRONMENT FILE, OR TWO OF WHICH THE SECOND IS THIS RUN'S OWN SNAPSHOT
+    # (o3d-2sm1.5 r23, Codex HIGH). Until this round the answer was "exactly one, and it must be
+    # ${env_file}" — which is the right refusal for somebody ELSE's second file and the wrong one
+    # for the binding this round adds, since publish_db_identity_snapshot() gives every unit a
+    # drop-in that loads ${DB_ENV_SNAPSHOT_FILE} after it. So the shape is stated exactly: the
+    # application's file first, and at most one more, which may only be the snapshot THIS RUN
+    # published. A snapshot left behind by some earlier run is NOT tolerated — DB_ENV_SNAPSHOT_PUBLISHED
+    # is false until this run writes one — because an unexplained pin is a ${variable} nobody
+    # here chose, which is precisely the condition this function exists to refuse.
+    if [[ "$count" -gt 2 ]]; then
+      ENV_VAR_SOURCE_REASON="${unit} loads ${count} environment files (${BUS_STRINGS[*]}). Whether any of them but ${env_file} defines ${variable}, and which definition systemd would keep, is composition this will not reproduce — so it is refused rather than guessed at, and without reading them. Load only ${env_file}, or state the connection identity explicitly"
+      return 1
+    fi
+    if ! bus_read_env_ignore_flags "$rendering" || [[ "${#BUS_ENV_IGNORE_FLAGS[@]}" -ne "$count" ]]; then
+      ENV_VAR_SOURCE_REASON="systemd would not say readably whether ${unit} loads its environment files with a leading '-'. Whether a missing file is skipped or fatal decides what the service gets when one disappears, so it is refused rather than assumed"
+      return 1
+    fi
+    local index
+    for index in 0 1; do
+      [[ "$index" -lt "$count" ]] || continue
+      element="${BUS_STRINGS[index]}"
+      case "$element" in
+        *'\'*)
+          ENV_VAR_SOURCE_REASON="systemd reports one of ${unit}'s environment files as ${element}, a path it had to escape to state. Decoding that here to compare it with ${env_file} is a reimplementation of somebody else's escaping, so it is refused: give the unit an EnvironmentFile= path with no character needing an escape, or state the connection identity explicitly"
+          return 1 ;;
+      esac
+      resolved="$(readlink -f "$element" 2>/dev/null || printf '%s' "$element")"
+      if [[ "$index" -eq 0 ]]; then
+        if [[ "$resolved" != "$expected" ]]; then
+          ENV_VAR_SOURCE_REASON="${unit} loads ${element} as its first environment file and not ${env_file}, so the file this deploy read is not the one that gives the service ${variable}. Load ${env_file}, or state the connection identity explicitly"
+          return 1
+        fi
+        continue
+      fi
+      # THE SECOND ENTRY, WHICH MAY ONLY BE THE BINDING. Three things are required of it and each
+      # is load-bearing: it is the snapshot's path (anything else is a source of ${variable} this
+      # deploy did not write), THIS run published it (an old one pins a value nobody re-validated),
+      # and it is loaded WITHOUT a leading '-' (with one, deleting it between here and the exec
+      # takes the binding away silently and hands the service back to ${env_file}).
+      if ! $DB_ENV_SNAPSHOT_PUBLISHED; then
+        ENV_VAR_SOURCE_REASON="${unit} loads a second environment file, ${element}, that this run did not publish. A second file can define ${variable} and systemd keeps the LAST definition, so what the service would connect to is not ${env_file}'s answer. Remove it (if it is a ${DB_ENV_SNAPSHOT_DROPIN_NAME} drop-in, an earlier cutover left it behind and it is safe to delete), or state the connection identity explicitly"
+        return 1
+      fi
+      if [[ "$resolved" != "$snapshot_expected" ]]; then
+        ENV_VAR_SOURCE_REASON="${unit} loads ${element} as a second environment file, and this run's environment snapshot is ${DB_ENV_SNAPSHOT_FILE}. A second file can define ${variable} and systemd keeps the LAST definition, so the service would connect where that file says. Remove it, or state the connection identity explicitly"
+        return 1
+      fi
+      if [[ "${BUS_ENV_IGNORE_FLAGS[index]}" != "false" ]]; then
+        ENV_VAR_SOURCE_REASON="${unit} loads ${element} with a leading '-', so systemd SKIPS it if it is missing instead of failing the start. The whole point of the snapshot is that its absence stops the service rather than handing it back to ${env_file}; drop the '-' from the ${DB_ENV_SNAPSHOT_DROPIN_NAME} drop-in"
+        return 1
+      fi
+    done
+    # AND WHEN THE CALLER IS ABOUT TO START THE SERVICE, THE BINDING MUST BE THERE. Everywhere
+    # else this function is a refusal of extra sources; at the start it is also the proof that the
+    # one source that cannot be replaced under us is loaded.
+    if $DB_IDENTITY_REQUIRE_SNAPSHOT && [[ "$count" -ne 2 ]]; then
+      ENV_VAR_SOURCE_REASON="${unit} does not load this run's environment snapshot ${DB_ENV_SNAPSHOT_FILE}, so the ${variable} it gets at exec is whatever ${env_file} says at that moment and not the one this run fenced and migrated"
+      return 1
+    fi
+  done
+  return 0
+}
+
+# THE DATABASE IDENTITY'S NAME FOR THE QUESTION, and all that is left of the function that used to
+# BE it: the same scan, told which variable to ask about. Its
+# four call sites read `require_env_file_is_sole_definition` exactly as they always did.
+env_file_is_sole_database_url_source() {
+  local rc=0
+  unit_env_var_sole_source DATABASE_URL "$@" || rc=$?
+  DB_IDENTITY_SOURCE_REASON="$ENV_VAR_SOURCE_REASON"
+  return "$rc"
+}
+
+# The refusal the start goes through: a service whose DATABASE_URL nothing but that file (and
+# this run's own snapshot) can define.
+require_env_file_is_sole_definition() {
+  env_file_is_sole_database_url_source "${APP_DIR}/.env" "${APP_NAME}.service"
+}
+
+# THE SAME TWO HALVES, PLUS THE BINDING (o3d-2sm1.5 r23, Codex HIGH).
+#
+# Used at the ONE call site that is about to hand the units to systemd. The difference from
+# require_start_identity_unchanged() is not a stricter read of the same file — re-reading harder
+# is what rounds 13-22 already exhausted — it is that this one requires the loaded unit
+# configuration to name a file systemd will read at exec AND that this run wrote AND that the
+# application user cannot replace. What the two checks above establish about ${APP_DIR}/.env
+# is kept because a disagreement there is still worth refusing on: it means the operator's file
+# and this run have parted company, and starting into a snapshot that contradicts the file on
+# disk would be correct-but-astonishing.
+require_start_identity_bound() {
+  local rc=0 route_reason
+  # AND THE ROUTE THE SERVICE IS ABOUT TO TAKE IS THE ONE THIS RUN VOUCHED FOR (r44, r45).
+  #
+  # This is the startup half of the transport question and it is a DIFFERENT MOMENT from the
+  # reconciliation: the gate probed and rotated against one pg_hba record, and a transport the
+  # service acquires between then and its exec puts the application on another one that nothing
+  # here has checked — the same post-upgrade outage, arriving after every check has passed.
+  #
+  # IT IS ALSO A DIFFERENT QUESTION SINCE r45, and the difference is the finding. Until now this
+  # SURVEYED the unit for a definition. Now it asks systemd for two PROPERTIES of the composed
+  # unit — the UnsetEnvironment= directive that removes all three variables as the final step of
+  # composing the environment, and an ExecStart= that is exactly the command this run wrote, with
+  # no wrapper in front of it to set them again one exec later. The first covers every source
+  # systemd owns, whatever it is and whenever it appeared; the second covers the one source
+  # systemd does not own. Neither is an inference from mutable state.
+  #
+  # IT IS ASKED HERE AND NOWHERE EARLIER because "composed" means after the last daemon-reload,
+  # which remove_reboot_fence() has just issued, and because `systemctl start` — the only command
+  # between this line and the exec — acts on the loaded configuration and re-reads no unit file.
+  if ! route_reason="$(db_application_route_env_refusal service)"; then
+    DB_IDENTITY_SOURCE_REASON="${route_reason}. This run established which pg_hba record the application would be matched by over the transport DB_SSLMODE=${DB_SSLMODE} names and rotated its credential against that record, so starting it onto another transport is starting it onto a rule nothing here has checked"
+    return 1
+  fi
+  DB_IDENTITY_REQUIRE_SNAPSHOT=true
+  require_env_file_is_sole_definition || rc=$?
+  DB_IDENTITY_REQUIRE_SNAPSHOT=false
+  [[ "$rc" -eq 0 ]] || return "$rc"
+  # AND THE FILE STILL SAYS WHAT THIS RUN WROTE. install.sh does not READ its identity out of
+  # ${APP_DIR}/.env — it composed the value and wrote the file — so there is no four-value parse
+  # to re-run here, and an exact string comparison is stronger than one. A disagreement means the
+  # file was replaced during the build/migration window: the snapshot makes the START safe either
+  # way, and this refusal is what stops a correct-but-astonishing start into a database the file
+  # on disk no longer names.
+  local current
+  current="$(env_file_value DATABASE_URL "${APP_DIR}/.env")" || current=""
+  if [[ "$current" != "${DATABASE_URL}" ]]; then
+    DB_IDENTITY_SOURCE_REASON="${APP_DIR}/.env no longer states the DATABASE_URL this run fenced and migrated with. The service would still start on the right database — the environment snapshot is loaded last and wins — but the file on disk and this run have parted company, and starting into that disagreement silently is how the next operator is misled"
+    return 1
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# THE ROUTE GUARANTEE: install the directive that makes the transport a property (r45, Codex HIGH)
+# ---------------------------------------------------------------------------
+# Called from the same place as the identity snapshot — unit written, fences still up, nothing
+# started — so a failure here costs a re-run and no outage. Unlike the snapshot it is PERMANENT:
+# there is no run in which the application is meant to take its transport from an ambient
+# variable, so it stays on the host and every later start is covered by it too.
+#
+# THE VERIFICATION IS NOT HERE. Publishing is a write; the proof is a read of the COMPOSED unit
+# after the last daemon-reload, and that happens in require_start_identity_bound() a few steps
+# further on. Splitting them is deliberate: a check that runs before the reloads that follow it
+# proves nothing about what systemd will act on, which is the r24 finding.
+publish_db_route_guarantee() {
+  if $DRY_RUN; then
+    echo -e "${YELLOW}[DRY]${RESET}   would publish the ${DB_ROUTE_DROPIN_NAME} drop-in (UnsetEnvironment= for the transport variables) and verify it on the bus before the start"
+    return 0
+  fi
+  command -v systemctl >/dev/null 2>&1 || {
+    error "systemctl is unavailable, so the started service cannot be made to drop the transport variables at exec."
+    return 1
+  }
+  if [[ -z "${APP_NAME}" ]]; then
+    error "No systemd unit is named for the application, so there is nothing to install the route guarantee on."
+    return 1
+  fi
+  local names
+  names="$(db_route_env_variables | tr '\n' ' ')"
+  names="${names% }"
+  if ! publish_durable_dropin "${DB_ROUTE_DROPIN_FILE}" <<EOF
+[Service]
+# Installed by scripts/install.sh (o3d-2sm1.5 r45). systemd.exec(5): "as the final step all
+# variables listed in UnsetEnvironment= are removed from the compiled environment variable list,
+# immediately before it is passed to the executed process" — after DefaultEnvironment=,
+# \`systemctl set-environment\`, the manager's own block, Environment=, EnvironmentFile= (wildcards
+# included) and PAM alike.
+#
+# These three move which pg_hba.conf record answers the application's connection. The installer
+# probes and rotates the database credential against ONE record; a value acquired from anywhere
+# else would put the application on another. The transport is a deployment input instead — state
+# it as DB_SSLMODE= when running the installer and it goes into DATABASE_URL, where the installer
+# can see it and pin its probes to it.
+#
+# BARE NAMES, NOT ASSIGNMENTS: an assignment removes only that exact pair.
+# \`zz-\` so this sorts after any other drop-in, because an EMPTY UnsetEnvironment= resets the list.
+UnsetEnvironment=${names}
+EOF
+  then
+    error "${DB_ROUTE_DROPIN_FILE} could not be published durably, so ${APP_NAME}.service is NOT guaranteed to drop ${names} at exec."
+    return 1
+  fi
+  systemctl daemon-reload 2>/dev/null || true
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# THE ENVIRONMENT SNAPSHOT: publish, and take it away again (o3d-2sm1.5 r23, Codex HIGH).
+# ---------------------------------------------------------------------------
+# Publish the DATABASE_URL this run fenced and migrated where only root can change it, and make
+# every unit load it LAST. Called with the connection fence still up and nothing started, so a
+# failure here costs a re-run and no outage.
+publish_db_identity_snapshot() {
+  if $DRY_RUN; then
+    echo -e "${YELLOW}[DRY]${RESET}   would publish ${DB_ENV_SNAPSHOT_FILE} and the ${DB_ENV_SNAPSHOT_DROPIN_NAME} drop-in, daemon-reload, and verify the loaded EnvironmentFiles on the bus"
+    return 0
+  fi
+  command -v systemctl >/dev/null 2>&1 || {
+    error "systemctl is unavailable, so the started service cannot be bound to the database this run migrated."
+    return 1
+  }
+  if [[ -z "${APP_NAME}" ]]; then
+    error "No systemd unit is named for the application, so there is nothing to bind the environment snapshot to."
+    return 1
+  fi
+
+  # A PATH SYSTEMD WOULD HAVE TO ESCAPE IS REFUSED, not escaped. The bus check compares the
+  # loaded path against this one and refuses any element that had to be escaped, so emitting one
+  # here would guarantee a refusal three lines later — with a message about somebody else's unit.
+  case "$DB_ENV_SNAPSHOT_FILE" in
+    *[$' \t\n\\']*)
+      error "${DB_ENV_SNAPSHOT_FILE} contains whitespace or a backslash, so systemd could not state it back unescaped and the binding could not be verified. That path is the literal DB_ENV_SNAPSHOT_DIR at the top of this script; edit it there to one with neither."
+      return 1 ;;
+  esac
+
+  # THE VALUE IS THE ONE THIS RUN PINNED, re-read from the file and re-checked against the pin by
+  # the caller a moment ago. It is written SINGLE-QUOTED because that is the one form systemd
+  # documents as verbatim — "can span multiple lines and contain any character verbatim other
+  # than single quote" — so the deploy's reader and systemd's reader cannot disagree about it the
+  # way they can about an unquoted value with a backslash in it.
+  # AND IT IS THE SHELL VALUE, NOT A RE-READ OF THE FILE. install.sh composed DATABASE_URL and
+  # fenced and migrated with it; the file is something it WROTE. Binding to the file's current
+  # contents would re-introduce the very indirection this removes.
+  local value="${DATABASE_URL}"
+  if [[ -z "$value" ]]; then
+    error "This run has no DATABASE_URL to bind the service to."
+    return 1
+  fi
+  case "$value" in
+    *"'"*|*$'\n'*)
+      error "DATABASE_URL contains a single quote or a newline, which cannot be written into a systemd environment file verbatim. Re-write it without one."
+      return 1 ;;
+  esac
+
+  # The directory first, root-owned and 0700, so that nothing running as the application user can
+  # replace or remove what the unit is about to be pointed at.
+  if ! mkdir -p "$DB_ENV_SNAPSHOT_DIR" \
+     || ! chown root:root "$DB_ENV_SNAPSHOT_DIR" \
+     || ! chmod 700 "$DB_ENV_SNAPSHOT_DIR"; then
+    error "${DB_ENV_SNAPSHOT_DIR} could not be created root-owned and 0700, so the environment snapshot would sit somewhere the application user can rewrite."
+    return 1
+  fi
+
+  printf "DATABASE_URL='%s'\n" "$value" | publish_durable_file "$DB_ENV_SNAPSHOT_FILE" || {
+    error "${DB_ENV_SNAPSHOT_FILE} could not be published durably; the service is NOT bound and nothing has been started."
+    return 1
+  }
+  # publish_durable_file() leaves 0600; the owner is root because this script runs as root, and
+  # systemd reads EnvironmentFile= as PID 1 BEFORE it drops to User=. So the application user
+  # never needs to read it — which is the point: the file that decides the connection is not one
+  # the service, or anything running as it, can rewrite.
+  chown root:root "$DB_ENV_SNAPSHOT_FILE" 2>/dev/null || true
+  DB_ENV_SNAPSHOT_PUBLISHED=true
+
+  DB_ENV_SNAPSHOT_DROPINS_CREATED=()
+  [[ -f "${DB_ENV_SNAPSHOT_DROPIN_FILE}" ]] || DB_ENV_SNAPSHOT_DROPINS_CREATED+=("${DB_ENV_SNAPSHOT_DROPIN_FILE}")
+  if ! publish_durable_dropin "${DB_ENV_SNAPSHOT_DROPIN_FILE}" <<EOF
+[Service]
+# Installed by scripts/install.sh (o3d-2sm1.5 r23) for the length of ONE cutover, and removed
+# again before this run exits. It binds the service to the database this run fenced and
+# migrated: systemd reads environment files in order and the LAST definition of a variable
+# wins, so this beats whatever ${APP_DIR}/.env says at the moment of exec.
+# No leading '-': if the file is gone, the start must FAIL rather than fall back.
+EnvironmentFile=${DB_ENV_SNAPSHOT_FILE}
+EOF
+  then
+    error "${DB_ENV_SNAPSHOT_DROPIN_FILE} could not be published durably, so ${APP_NAME}.service is NOT bound to the database this run migrated."
+    return 1
+  fi
+
+  if ! systemctl daemon-reload; then
+    error "systemctl daemon-reload failed, so the environment snapshot is not in the unit's loaded configuration."
+    return 1
+  fi
+  return 0
+}
+
+# Take the binding away. Called on EVERY exit path, successful or not: a drop-in left standing
+# would pin a DATABASE_URL that a later, legitimate edit of ${APP_DIR}/.env could not
+# override, and it would do so silently.
+remove_db_identity_snapshot() {
+  if $DRY_RUN; then
+    echo -e "${YELLOW}[DRY]${RESET}   would remove the ${DB_ENV_SNAPSHOT_DROPIN_NAME} drop-ins, daemon-reload, and delete ${DB_ENV_SNAPSHOT_FILE}"
+    return 0
+  fi
+  local removed=false
+  if [[ -e "${DB_ENV_SNAPSHOT_DROPIN_FILE}" ]]; then
+    rm -f "${DB_ENV_SNAPSHOT_DROPIN_FILE}"
+    removed=true
+  fi
+  rmdir "${FENCE_DROPIN_DIR}" 2>/dev/null || true
+  if $removed && command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload || warn "daemon-reload failed while removing the environment snapshot drop-ins."
+  fi
+  rm -f "$DB_ENV_SNAPSHOT_FILE"
+  DB_ENV_SNAPSHOT_PUBLISHED=false
+  DB_ENV_SNAPSHOT_DROPINS_CREATED=()
+  return 0
+}
+
 install_reboot_fence() {
   local reason="$1"
   FENCE_MARKER_PREEXISTED=false
@@ -1296,17 +4698,27 @@ resume_from_interrupted_arming() {
 # The continuous half of the drain. check-db-writers.mjs snapshots pg_stat_activity and
 # closes; the migration opens its own connection afterwards with nothing holding the gap.
 fence_db_connections() {
-  [[ -f "${DB_FENCE_SCRIPT}" ]] || die \
-    "${DB_FENCE_SCRIPT} is not in this checkout, so this run cannot hold the database closed for the migration window. A snapshot probe is not a fence. Restore the script (it ships with the app) and re-run; nothing has been migrated."
+  # A RECOVERY PATH MAY NOT DEPEND ON THE THING WHOSE LOSS IT RECOVERS FROM: a box that already
+  # has a root-owned copy needs nothing from the checkout to fence with.
+  [[ -f "${DB_FENCE_SCRIPT}" || -f "${DB_FENCE_SCRIPT_COPY}" ]] || die \
+    "Neither ${DB_FENCE_SCRIPT} nor the root-owned copy at ${DB_FENCE_SCRIPT_COPY} exists, so this run cannot hold the database closed for the migration window. A snapshot probe is not a fence. Restore the script (it ships with the app) and re-run; nothing has been migrated."
+  # THE FENCE IS TOLD WHICH CONNECTION IT IS ABOUT, OR IT DOES NOT RUN (o3d-2sm1.5 r19). Reaching
+  # here before the PostgreSQL section has filled these in means this run has no database of its
+  # own yet, and a fence over an unnamed connection is exactly what this round removed.
+  require_db_identity || die \
+    "The application's database has not been set up yet in this run, so there is no host, port, role and database to tell the connection fence about. The fence is TOLD which connection it closes — it no longer works that out from the environment. Nothing has been migrated."
   mkdir -p "${DB_FENCE_DIR}"
   chown "${APP_USER}:${APP_USER}" "${DB_FENCE_DIR}"
   chmod 700 "${DB_FENCE_DIR}"
 
-  local rc=0
+  # THE ONLY FILE THIS FUNCTION RUNS IS THE ROOT-OWNED ONE (o3d-2sm1.5 r31, Codex CRITICAL).
+  local rc=0 fence_script
+  fence_script="$(resolve_fence_script)" || die \
+    "This run has no fence script it is willing to execute (the reason is printed above), so it cannot hold the database closed for the migration window. A snapshot probe is not a fence. Nothing has been migrated."
   ( cd "${APP_DIR}" && run_as_user "${APP_USER}" env \
       DATABASE_URL="${DATABASE_URL}" \
       DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-      node "${DB_FENCE_SCRIPT}" --fence --state-file="${DB_FENCE_STATE}" ) || rc=$?
+      node "${fence_script}" --fence --state-file="${DB_FENCE_STATE}" "${DB_FENCE_IDENTITY_ARGS[@]:-}" ) || rc=$?
 
   case "${rc}" in
     0)
@@ -1320,7 +4732,7 @@ fence_db_connections() {
       MIGRATION_DATABASE_URL="$( cd "${APP_DIR}" && run_as_user "${APP_USER}" env \
         DATABASE_URL="${DATABASE_URL}" \
         DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-        node "${DB_FENCE_SCRIPT}" --print-migration-url )" || die \
+        node "${fence_script}" --print-migration-url "${DB_FENCE_IDENTITY_ARGS[@]:-}" )" || die \
         "The connection fence is up but the migration URL could not be composed, so the migration would run as the deploy admin and create objects the application cannot use. Nothing has been migrated; release the fence with: ${DB_FENCE_RELEASE_CMD}"
       [[ -n "${MIGRATION_DATABASE_URL}" ]] || die \
         "The connection fence is up but --print-migration-url produced nothing. Nothing has been migrated; release the fence with: ${DB_FENCE_RELEASE_CMD}"
@@ -1375,11 +4787,13 @@ fence_db_connections() {
 # install never reaches this: there is no existing database to hold closed.
 require_fenceable_database() {
   [[ -n "${DEPLOY_ADMIN_DATABASE_URL}" ]] || die \
-    "An existing installation was detected, so its database must be held closed while the schema moves — but DEPLOY_ADMIN_DATABASE_URL is not set, so this run has no privileged connection that would survive revoking CONNECT from the application role. Set it (a superuser or database-owner connection as a DIFFERENT role from DATABASE_URL; docs/installation.md) and re-run. Nothing has been stopped and nothing has been migrated."
-  [[ -f "${DB_FENCE_SCRIPT}" ]] || die \
-    "${DB_FENCE_SCRIPT} is missing from this checkout, so the migration window cannot be fenced. Nothing has been stopped and nothing has been migrated."
+    "This run is a cutover — ${CUTOVER_REASON:-an existing installation was detected} — so the database must be held closed while the schema moves, but DEPLOY_ADMIN_DATABASE_URL is not set, so this run has no privileged connection that would survive revoking CONNECT from the application role. Set it (a superuser or database-owner connection as a DIFFERENT role from DATABASE_URL; docs/installation.md) and re-run. Nothing has been stopped and nothing has been migrated."
+  [[ -f "${DB_FENCE_SCRIPT}" || -f "${DB_FENCE_SCRIPT_COPY}" ]] || die \
+    "Neither ${DB_FENCE_SCRIPT} nor the root-owned copy at ${DB_FENCE_SCRIPT_COPY} exists, so the migration window cannot be fenced. Nothing has been stopped and nothing has been migrated."
   [[ -f "${DB_OBJECT_ACCESS_SCRIPT}" ]] || die \
     "${DB_OBJECT_ACCESS_SCRIPT} is missing from this checkout, so nothing would check that the application role can use what the migration creates. Nothing has been stopped and nothing has been migrated."
+  require_db_identity || die \
+    "The application's database has not been set up yet in this run, so there is no host, port, role and database to tell the connection fence about. The fence is TOLD which connection it closes — it no longer works that out from the environment. Nothing has been stopped and nothing has been migrated."
 
   # AND IT IS RUN, NOT LOOKED AT (o3d-2sm1.5, Codex r4 HIGH). This used to be `[[ -f ... ]]`,
   # which proves a file exists and nothing about whether it works — and its own dependency was
@@ -1387,11 +4801,18 @@ require_fenceable_database() {
   # died with a missing module at drain-verify, AFTER the stop. --preflight runs the same
   # imports, opens the same admin connection and asks the same questions as --fence, and
   # revokes, terminates and writes nothing.
-  local rc=0
+  #
+  # AND IT IS RUN FROM THE PROTECTED COPY, LIKE EVERY OTHER MODE (o3d-2sm1.5 r31). This probe
+  # opens the admin connection as the application user; on an ordinary upgrade it is what
+  # PUBLISHES the protected copy, so the bytes preflighted here are the bytes the fence is raised
+  # with later, and the application account gets no window between the two.
+  local rc=0 preflight_script
+  preflight_script="$(resolve_fence_script)" || die \
+    "This run has no fence script it is willing to execute (the reason is printed above), so the migration window cannot be fenced. Nothing has been stopped and nothing has been migrated."
   ( cd "${APP_DIR}" && run_as_user "${APP_USER}" env \
       DATABASE_URL="${DATABASE_URL}" \
       DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-      node "${DB_FENCE_SCRIPT}" --preflight ) || rc=$?
+      node "${preflight_script}" --preflight "${DB_FENCE_IDENTITY_ARGS[@]:-}" ) || rc=$?
   [[ "${rc}" -eq 0 ]] || die \
     "The migration window could NOT be fenced (fence preflight exit ${rc}); the reason is printed above. Refusing to migrate an EXISTING installation. Nothing has been stopped and nothing has been migrated."
 
@@ -1408,12 +4829,16 @@ release_db_connections() {
   # own database. So the script is ALWAYS run, and the DATABASE says what is standing. Its exit
   # codes: 0 released from a record and verified; 4 no record, and the application role's own
   # CONNECT is all that could be proven; anything else, a refusal.
-  [[ -f "${DB_FENCE_SCRIPT}" ]] || { error "Cannot release the connection fence: ${DB_FENCE_SCRIPT} is missing, so nothing here can ask the database whether one is standing."; return 1; }
-  local rc=0
+  # AND THE SCRIPT IT ASKS WITH IS THE PROTECTED ONE (o3d-2sm1.5 r31, Codex CRITICAL). A release
+  # GRANTS CONNECT back from a record of what was revoked, as the application user and with
+  # DEPLOY_ADMIN_DATABASE_URL in its environment; running the checkout's own file for that let the
+  # account being released rewrite what "released" means, and report success without doing it.
+  local rc=0 fence_script
+  fence_script="$(resolve_fence_script)" || { error "Cannot release the connection fence: this run has no fence script it is willing to execute (the reason is printed above), so nothing here can ask the database whether one is standing."; return 1; }
   ( cd "${APP_DIR}" && run_as_user "${APP_USER}" env \
       DATABASE_URL="${DATABASE_URL}" \
       DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-      node "${DB_FENCE_SCRIPT}" --release --state-file="${DB_FENCE_STATE}" ) || rc=$?
+      node "${fence_script}" --release --state-file="${DB_FENCE_STATE}" "${DB_FENCE_IDENTITY_ARGS[@]:-}" ) || rc=$?
 
   if [[ "${rc}" -eq 0 ]]; then
     MIGRATION_DATABASE_URL="${DATABASE_URL}"
@@ -1453,6 +4878,10 @@ release_db_connections() {
   error "no CONNECT on this database and cannot start until this is undone:"
   error "  ${DB_FENCE_RELEASE_CMD}"
   error "or, by hand as a superuser, the GRANT statements recorded in ${DB_FENCE_STATE}."
+  # o3d-2sm1.5 r32: see the same lines in scripts/deploy.sh. The state file is application-owned
+  # by necessity, so an instruction to run what it holds has to say what it is.
+  error "READ them first: that file is written by the fence AS ${APP_USER} and lives in an"
+  error "application-writable directory, so it is evidence to check, not SQL to paste unseen."
   return 1
 }
 
@@ -1464,13 +4893,20 @@ release_db_connections() {
 # and dying inside an exit trap loses the status and the banner.
 refence_db_connections() {
   ${DB_FENCE_UP} && return 0
-  [[ -f "${DB_FENCE_SCRIPT}" ]] || return 1
+  [[ -f "${DB_FENCE_SCRIPT}" || -f "${DB_FENCE_SCRIPT_COPY}" ]] || return 1
   [[ -n "${DEPLOY_ADMIN_DATABASE_URL}" ]] || return 1
-  local rc=0
+  # No identity, no fence (o3d-2sm1.5 r19). A soft refusal — this runs inside the exit trap, and
+  # aborting there would lose the status and the banner.
+  require_db_identity || return 1
+  # THE EXIT TRAP RUNS THE PROTECTED COPY TOO (o3d-2sm1.5 r31, Codex CRITICAL). This is the path
+  # that runs when everything else has already gone wrong and nothing else is watching, which is
+  # exactly where substituted code would most like to be handed the admin credential.
+  local rc=0 fence_script
+  fence_script="$(resolve_fence_script)" || return 1
   ( cd "${APP_DIR}" && run_as_user "${APP_USER}" env \
       DATABASE_URL="${DATABASE_URL}" \
       DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-      node "${DB_FENCE_SCRIPT}" --fence --state-file="${DB_FENCE_STATE}" ) || rc=$?
+      node "${fence_script}" --fence --state-file="${DB_FENCE_STATE}" "${DB_FENCE_IDENTITY_ARGS[@]:-}" ) || rc=$?
   # EVERY POST-COMMIT RESULT RAISES THE STICKY FLAG (o3d-2sm1.5, Codex r13 HIGH). Exit 5 says
   # the REVOKEs are COMMITTED and standing: this call could not call the database fenced, but it
   # certainly fenced something, and DB_FENCE_RAISED is the flag that decides whether a later
@@ -1500,7 +4936,7 @@ refence_db_connections() {
   MIGRATION_DATABASE_URL="$( cd "${APP_DIR}" && run_as_user "${APP_USER}" env \
     DATABASE_URL="${DATABASE_URL}" \
     DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-    node "${DB_FENCE_SCRIPT}" --print-migration-url )" || url_rc=$?
+    node "${fence_script}" --print-migration-url "${DB_FENCE_IDENTITY_ARGS[@]:-}" )" || url_rc=$?
   if [[ "${url_rc}" -ne 0 || -z "${MIGRATION_DATABASE_URL}" ]]; then
     MIGRATION_DATABASE_URL=""
     warn "--print-migration-url refused to compose a migration URL (exit ${url_rc}); NOT falling back to DEPLOY_ADMIN_DATABASE_URL. The fence is up."
@@ -1751,6 +5187,36 @@ on_cutover_exit() {
     warn "  service     : UNTOUCHED. Nothing was stopped, so nothing needs starting."
     warn "  schema      : untouched — the migration was never invoked."
     warn "  database    : never fenced; the application still has CONNECT."
+    # AND IF THIS RUN DID CHANGE A CREDENTIAL, THE BANNER SAYS SO (o3d-2sm1.5 r37, Codex HIGH).
+    # NOTHING REACHES HERE AFTER A CREDENTIAL CHANGE ANY MORE (o3d-2sm1.5 r38, Codex HIGH). r37
+    # left the rotation on this side of the stop and printed a paragraph here explaining what the
+    # operator now had to reconcile. The rotation has moved past the stop and the fence, so this
+    # banner — which is the REVERSIBLE path, the one that says "nothing has to be recovered
+    # first" — can say the credential is untouched and be telling the truth.
+    #
+    # THE CHECK IS KEPT AND INVERTED, because "always false" is exactly the kind of claim this
+    # branch keeps discovering was quietly no longer true. If a later edit ever moves an ALTER
+    # back in front of the stop, this says so in the failure banner instead of the operator
+    # finding out from their application's logs.
+    #
+    # DEFAULTED, BECAUSE THIS IS A TRAP. Every variable an exit handler reads has to survive being
+    # read before the assignment that sets it: the whole point of the handler is that it runs on
+    # paths the straight-line code never reached. Under `set -u` an unset name here would abort
+    # the trap mid-banner and skip unwind_arming() below — the cleanup, not just the message.
+    if ${DB_ROLE_CREDENTIALS_ROTATED:-false}; then
+      warn "  credentials : ORDERING DEFECT — the password of the PRE-EXISTING role ${DB_USER:-<none>} was"
+      warn "                changed BEFORE anything was stopped. It should not be possible to reach"
+      warn "                this banner in that state: the rotation belongs inside the stopped,"
+      warn "                fenced window. The application's environment file and the database"
+      warn "                agree, so this host is consistent, but any OTHER client still using the"
+      warn "                previous password for that role needs the new one, and the predecessor"
+      warn "                this run left running may already have lost its reconnect."
+    else
+      warn "  credentials : UNCHANGED. No database password was rotated: a rotation, when one is"
+      warn "                asked for at all, happens only after the stop and behind the connection"
+      warn "                fence, so the predecessor still running here holds a credential that"
+      warn "                works and its environment file still names it."
+    fi
     unwind_arming
     warn "  Fix the cause and re-run. Nothing has to be recovered first."
     exit "${status}"
@@ -1783,11 +5249,31 @@ on_cutover_exit() {
     error "                whether that could be put right."
   fi
   error "  cron        : ${APP_USER} entries left FENCED (commented out)."
+  # AND WHETHER THE CREDENTIAL MOVED (o3d-2sm1.5 r38, Codex HIGH). This is the path where a
+  # rotation CAN have happened — it is performed after the stop, behind the fence — so the
+  # operator is told, here, that the role's password is no longer the one anything else on this
+  # server is using. Defaulted for the same `set -u` reason as the banner above.
+  if ${DB_ROLE_CREDENTIALS_ROTATED:-false}; then
+    error "  credentials : the password of the PRE-EXISTING role ${DB_USER:-<none>} WAS ROTATED inside"
+    error "                this window, and ${APP_DIR:-<app dir>}/.env names the new one, so those"
+    error "                two agree. ALTER USER is cluster-wide: any OTHER client on this server"
+    error "                authenticating as that role, against ANY database, needs the new"
+    error "                password. Re-running this installer with the same value changes nothing"
+    error "                further."
+  else
+    error "  credentials : UNCHANGED — no database password was rotated by this run."
+  fi
   error "  Do NOT start ${APP_NAME}.service by hand. Fix the cause and re-run this"
   error "  installer, scripts/update.sh or scripts/deploy.sh — all three read this fence"
   error "  from the same place (${FENCE_FILE}) and adopt it."
 
   systemctl stop "${APP_NAME}.service" >/dev/null 2>&1 || true
+  # AND THE BINDING COMES OFF, ALWAYS (o3d-2sm1.5 r23). The environment snapshot pins
+  # DATABASE_URL over ${APP_DIR}/.env for as long as its drop-in is loaded, and it is only ever
+  # right for the run that published it. Left standing after a failure it would silently override
+  # a later, legitimate edit of the file — and the operator's first move after reading this
+  # banner is usually to edit that file.
+  remove_db_identity_snapshot
   install_reboot_fence "install failed at ${CUTOVER_STEP}" >/dev/null 2>&1 \
     || error "THE REBOOT FENCE IS NOT IN PLACE. This host may start the old version against a migrated schema on its next boot. Stop it by hand."
   # "HELD" IS A CLAIM, SO IT IS MADE TRUE BEFORE IT IS PRINTED (Codex r3 HIGH). The start
@@ -1809,7 +5295,7 @@ on_cutover_exit() {
       error "  The only thing keeping it off is that ${APP_NAME}.service is stopped and fenced"
       error "  against a reboot. Do NOT start it. Close the database by hand, or re-run this"
       error "  installer, which re-establishes the fence before it migrates:"
-      error "    node ${DB_FENCE_SCRIPT} --fence --state-file=${DB_FENCE_STATE}"
+      error "    ${DB_FENCE_REFENCE_CMD}"
     fi
   else
     release_db_connections || true
@@ -1953,6 +5439,13 @@ echo ""
 info "--- Application ---"
 prompt APP_DOMAIN      "Domain name (e.g. ims.yourdomain.com)" "ims.localhost"
 prompt APP_PORT        "Internal port the app listens on"       "3000"
+# The same shape check update.sh applies to the value it reads back out of .env (o3d-2sm1.5 r26,
+# Codex HIGH). Here it is not a parsing question — the value came from a prompt or, under
+# --non-interactive, from the invocation's own environment — but it lands in exactly the same
+# places: `next start -p ${APP_PORT}` in the unit, the nginx upstream, the crontab base URL and
+# the health URL this script polls before declaring the install irreversible. Refusing at the
+# prompt costs a re-run; refusing later costs a half-installed host.
+valid_tcp_port "${APP_PORT}" || die "APP_PORT must be a decimal TCP port in 1-65535, not '${APP_PORT}'. It is written into the systemd unit's \`next start -p\`, the nginx upstream, the cron base URL and the health check this installer polls."
 prompt_yn INSTALL_SSHD "Install OpenSSH server on this system?" "n"
 if [[ "$INSTALL_SSHD" == "y" ]]; then
   prompt SSH_AUTHORIZED_KEY "Authorized SSH public key for root login (leave blank to skip key install)" ""
@@ -1964,21 +5457,258 @@ if [[ -n "${DEFAULT_ADMIN_EMAIL}" ]]; then
   prompt NOTIFICATION_EMAIL "Email address to receive the login details" "${DEFAULT_ADMIN_EMAIL}"
 fi
 
+# THE INSTALLED DATABASE CREDENTIAL, RECOVERED THE WAY REDIS_URL ALREADY WAS (o3d-2sm1.5 r38,
+# Codex HIGH).
+#
+# The asymmetry this closes: REDIS_URL and REDIS_PASSWORD have been recovered out of the previous
+# ${APP_DIR}/.env for rounds, so an operator pressing Enter through an upgrade keeps both ends of
+# the Redis credential. DATABASE_URL was not, and its prompt defaulted to `openssl rand -hex 16` —
+# a NEW secret on every run. So an ORDINARY RE-INSTALL rotated the live database role's password
+# as a side effect of running the script, over a predecessor that was still serving.
+#
+# AND IT IS RECOVERED ONLY WHEN IT IS THE SAME CONNECTION. A password is not a property of this
+# host, it is a property of one role on one server; offering the previous run's secret back after
+# the operator has changed DB_USER, DB_HOST, DB_PORT or DB_NAME would compose a DATABASE_URL that
+# cannot authenticate and — worse — would make a genuine first credential look like a rotation.
+# So all four are compared, and anything that does not match answers "nothing installed", which
+# takes the same path as a first install.
+#
+# THE USERINFO IS PERCENT-DECODED, AND THAT IS A CORRECTION (o3d-2sm1.5 r39, Codex HIGH). r38
+# deliberately did NOT decode, reasoning that this installer composed the URL by raw interpolation
+# so decoding would invent a different secret. That was an accurate description of the shipped code
+# and the shipped code was wrong: raw interpolation IS the defect, because node-postgres decodes
+# what it reads. The credential the application actually authenticates with is the DECODED one, so
+# that is the value this function must return — otherwise "has the operator asked for a rotation?"
+# is answered by comparing a literal against URL bytes, and an ordinary re-install over a password
+# containing `%2F` reports a rotation nobody asked for. Since r39 the composer percent-encodes, so
+# for anything this installer wrote the decode is the exact inverse of the encode; for a URL an
+# older run left behind it reproduces what pg-connection-string does with the same bytes.
+#
+# The userinfo ends at the LAST `@` for the reason redact_url_credentials() cuts there: an earlier
+# one may be part of the password itself — and WHATWG URL parsing agrees, which is why a legacy
+# raw `user:abc@def@host` still recovers `abc@def`.
+installed_database_password() {
+  local url="$1" want_user="$2" want_host="$3" want_port="$4" want_db="$5"
+  local rest userinfo location user password host port database
+  case "${url}" in
+    postgres://*|postgresql://*) ;;
+    *) return 1 ;;
+  esac
+  rest="${url#*://}"
+  case "${rest}" in *@*) ;; *) return 1 ;; esac
+  userinfo="${rest%@*}"
+  location="${rest##*@}"
+  case "${userinfo}" in *:*) ;; *) return 1 ;; esac
+  # `capture`, NOT `$( )`, on BOTH halves (o3d-2sm1.5 r40, Codex HIGH). A password spelled
+  # `abc%0A` decodes to `abc\n`, and command substitution would hand back `abc` — a DIFFERENT
+  # credential, which classify_database_credential_rotation() then reads as a rotation request
+  # over a live role. The user half goes through the same door for the same reason one level
+  # down: `imsuser%0A` captured as `imsuser` compares EQUAL to a DB_USER of `imsuser`, so a URL
+  # naming a different role would be accepted as "the same connection" and its password recovered.
+  capture user url_decode_userinfo "${userinfo%%:*}"
+  password="${userinfo#*:}"
+  [[ -n "${password}" ]] || return 1
+  capture password url_decode_userinfo "${password}"
+  [[ -n "${password}" ]] || return 1
+  case "${location}" in */*) ;; *) return 1 ;; esac
+  database="${location#*/}"
+  database="${database%%\?*}"
+  location="${location%%/*}"
+  case "${location}" in *:*) ;; *) return 1 ;; esac
+  host="${location%:*}"
+  port="${location##*:}"
+  [[ "${user}" == "${want_user}" ]] || return 1
+  [[ "${host}" == "${want_host}" ]] || return 1
+  [[ "${port}" == "${want_port}" ]] || return 1
+  [[ "${database}" == "${want_db}" ]] || return 1
+  printf '%s' "${password}"
+}
+
+# THE TRANSPORT AN EARLIER RUN PUBLISHED, recovered from the URL it wrote (o3d-2sm1.5 r45).
+#
+# It matters for the same reason installed_database_password() matters and it fails the same way
+# if it is left out: an upgrade that did not ask would silently re-publish a `disable` URL over a
+# TLS-only external database, and the service would come back unable to connect at all. Only the
+# query string this installer composes is recognised — `?sslmode=<mode>&uselibpqcompat=true`,
+# optionally with `&sslrootcert=` — and anything else answers nothing, which lands on the default
+# and then on the DB_SSLMODE validation below rather than on a guess.
+installed_database_sslmode() {
+  local url="$1" query
+  case "${url}" in *\?*) query="${url#*\?}" ;; *) return 1 ;; esac
+  case "${query}" in
+    "sslmode="*"&uselibpqcompat=true") printf '%s' "${query%%&*}" | sed 's/^sslmode=//' ;;
+    "sslmode="*"&uselibpqcompat=true&sslrootcert="*) printf '%s' "${query%%&*}" | sed 's/^sslmode=//' ;;
+    *) return 1 ;;
+  esac
+}
+
+installed_database_sslrootcert() {
+  local url="$1" query
+  case "${url}" in *\?*) query="${url#*\?}" ;; *) return 1 ;; esac
+  case "${query}" in
+    *"&sslrootcert="*) printf '%s' "${query##*&sslrootcert=}" ;;
+    *) return 1 ;;
+  esac
+}
+
+# THE TRANSPORT, ASKED FOR AND VALIDATED (o3d-2sm1.5 r45, Codex MEDIUM).
+#
+# Asked only where it can matter: an external database. The `INSTALL_POSTGRES=y` path is a cluster
+# THIS SCRIPT installs on THIS host and reaches over `localhost`, and it is left on `disable`
+# explicitly rather than by omission.
+#
+# THE CA PATH IS VALIDATED DOWN TO A CHARACTER SET, not escaped. It goes into a URL query, into a
+# psql environment variable and into a node argument, and an escape correct for one of those three
+# readers is one more reimplementation of somebody else's rules — the mistake this whole branch
+# keeps refusing to make. So the set is the one every reader treats literally, and a path outside
+# it is a refusal that says so.
+prompt_db_sslmode() {
+  local existing_url existing_mode existing_root chosen_mode chosen_root
+  existing_url="$(existing_env DATABASE_URL)"
+  existing_mode="$(installed_database_sslmode "${existing_url}")" || existing_mode=""
+  existing_root="$(installed_database_sslrootcert "${existing_url}")" || existing_root=""
+  # THE PRECEDENCE, AS AN `if` AND NOT AS AN ORDERING (o3d-2sm1.5 r46, Codex HIGH).
+  #
+  # SUPPLIED > RECOVERED > disable. The supplied value is the one captured at the top of this
+  # script BEFORE the declaration that erases it — see DB_SSLMODE_SUPPLIED there for what reading
+  # DB_SSLMODE here instead cost. `disable` is last rather than being installed_database_sslmode()'s
+  # failure value, so the three sources are three branches an eye can check rather than two
+  # branches and a default hiding inside a `||`.
+  #
+  # AND THE SELECTION IS ASSIGNED, NOT LEFT FOR prompt() TO REACH. Under --non-interactive prompt()
+  # would arrive at the same answer by keeping a non-empty current value and otherwise taking the
+  # default; that is precisely the "ordering that happens to work" this round is about. The variable
+  # is set from the selection first, and prompt() is then only what it is on the interactive path:
+  # the operator's chance to type something else, with the selection shown as what Enter takes.
+  if [[ -n "${DB_SSLMODE_SUPPLIED}" ]]; then
+    chosen_mode="${DB_SSLMODE_SUPPLIED}"
+  elif [[ -n "${existing_mode}" ]]; then
+    chosen_mode="${existing_mode}"
+  else
+    chosen_mode="disable"
+  fi
+  DB_SSLMODE="${chosen_mode}"
+  prompt DB_SSLMODE "Database TLS mode (disable, require, verify-ca, verify-full)" "${chosen_mode}"
+  [[ -n "${DB_SSLMODE}" ]] || DB_SSLMODE="disable"
+  db_sslmode_is_supported "${DB_SSLMODE}" || die \
+    "DB_SSLMODE=${DB_SSLMODE} is not a transport this installer can put its probes on. The supported values are 'disable' (no SSLRequest at all — what every installation before this round used), 'require' (encrypted, certificate not verified), 'verify-ca' and 'verify-full' (both require DB_SSLROOTCERT). 'prefer' is deliberately absent: it chooses its transport at run time, so an authentication FAILURE can fall onto a second pg_hba.conf record, and the whole point of pinning is that it cannot."
+  case "${DB_SSLMODE}" in
+    verify-ca|verify-full)
+      # THE SAME THREE-WAY SELECTION, for the same reason. There is no `disable` to fall back to
+      # here: a mode that verifies against a CA and no CA is a refusal, stated below.
+      if [[ -n "${DB_SSLROOTCERT_SUPPLIED}" ]]; then
+        chosen_root="${DB_SSLROOTCERT_SUPPLIED}"
+      else
+        chosen_root="${existing_root}"
+      fi
+      DB_SSLROOTCERT="${chosen_root}"
+      prompt DB_SSLROOTCERT "Path to the CA certificate the server is verified against" "${chosen_root}"
+      [[ -n "${DB_SSLROOTCERT}" ]] || die \
+        "DB_SSLMODE=${DB_SSLMODE} verifies the server's certificate against a CA, and DB_SSLROOTCERT names no file. Without one, node-postgres would fall back to Node's bundled CA bundle and libpq to ~/.postgresql/root.crt of whichever user opened the connection — two different trust stores, which is exactly the divergence this installer pins its probes to avoid. Supply the CA the cluster's certificate chains to."
+      ;;
+    *)
+      # A CA WITHOUT A MODE THAT USES IT IS NOT CARRIED FORWARD. Under `require` the driver's
+      # libpq-compatible branch treats an sslrootcert as an instruction to verify the CA, so
+      # leaving a stale one in place would quietly make `require` stricter than it says.
+      DB_SSLROOTCERT=""
+      ;;
+  esac
+  if [[ -n "${DB_SSLROOTCERT}" ]]; then
+    case "${DB_SSLROOTCERT}" in
+      /*) ;;
+      *) die "DB_SSLROOTCERT=${DB_SSLROOTCERT} is not an absolute path. It is read by the application (as an ssl.ca), by psql (as PGSSLROOTCERT) and by this installer's authentication-request reader, each with a different working directory, so a relative path would name three different files." ;;
+    esac
+    case "${DB_SSLROOTCERT}" in
+      *[!A-Za-z0-9._/-]*) die "DB_SSLROOTCERT=${DB_SSLROOTCERT} contains a character outside A-Z a-z 0-9 . _ - /. That path is placed verbatim into a URL query string, into an environment variable and into a command-line argument; escaping it correctly for all three is a reimplementation of three sets of rules, so it is refused instead. Move or link the certificate to a path made only of those characters." ;;
+    esac
+    # THIS CHECK IS ABOUT ROOT AND ONLY ROOT, AND IT IS NO LONGER ASKED TO BE MORE (r46, Codex
+    # MEDIUM). The installer runs as root, so `-r` says the INSTALLER can read the operator's file
+    # — which is what it takes to copy it, and nothing at all about the two accounts that open it
+    # later. The readability the service needs is established by publishing the bytes, below.
+    [[ -f "${DB_SSLROOTCERT}" && -r "${DB_SSLROOTCERT}" ]] || die \
+      "DB_SSLROOTCERT=${DB_SSLROOTCERT} is not a file this installer can read. DB_SSLMODE=${DB_SSLMODE} verifies the server against it, so a missing CA is not a connection that verifies less — it is a connection that does not open."
+    # AND FROM HERE ON IT IS THE PUBLISHED COPY THAT IS NAMED, by all three readers at once: this
+    # one assignment is what puts the URL's `sslrootcert=`, the reader's `--sslrootcert=` and
+    # psql's PGSSLROOTCERT on the same file. Publishing BEFORE prompt_db_password() is not
+    # incidental — that function reconciles an interrupted rotation, and reconciling means PROBING,
+    # over this transport and against this CA.
+    publish_db_ca "${DB_SSLROOTCERT}" || die \
+      "The CA at DB_SSLROOTCERT=${DB_SSLROOTCERT} could not be published under ${DB_CA_PUBLISH_DIR}; the reason is above. DB_SSLMODE=${DB_SSLMODE} verifies the server against a trust root that three different accounts have to open — this installer as root, the credential probes as postgres, and the service as ${APP_USER} — so the CERTIFICATES IN that file are parsed and re-published to one root-owned, world-readable generation rather than the operator's pathname being passed around, and a source that is not a bundle of X.509 certificates is refused before anything is written. ${DB_CA_REFRESH_FAILURE_ADVICE}"
+    DB_SSLROOTCERT="${DB_CA_PUBLISHED_FILE}"
+    verify_db_ca_published postgres || die \
+      "The database CA published to ${DB_CA_PUBLISHED_FILE} did not verify immediately after publication; the reason is above. DB_SSLMODE=${DB_SSLMODE} is only as good as that file, so this run stops here rather than migrating a database behind a trust root it cannot vouch for. ${DB_CA_REFRESH_FAILURE_ADVICE}"
+  fi
+}
+
+# The prompt, on both branches, so the recovery cannot be true of one and not the other. It runs
+# AFTER DB_USER/DB_HOST/DB_PORT/DB_NAME are known, because whether there is anything to recover
+# is a question about those four.
+prompt_db_password() {
+  # FIRST, BECAUSE A STALE .env IS EXACTLY WHAT AN INTERRUPTED ROTATION LEAVES (o3d-2sm1.5 r39,
+  # Codex HIGH). Nothing has been touched at this point, so a refusal in here is safe; and where it
+  # does not refuse, the SERVER's answer replaces the file's, which is the whole content of
+  # "reconcile" — the file says what the last completed publication said, and the ALTER may have
+  # outlived it.
+  reconcile_interrupted_role_rotation
+  # THE OUTER CAPTURE IS THE SAME BOUNDARY (o3d-2sm1.5 r40, Codex HIGH): fixing the decode and
+  # then re-stripping the result here would have preserved nothing. `existing_env` needs no such
+  # protection and is left as it is — it returns a value `mapfile -t` read out of a LINE of
+  # ${APP_DIR}/.env, and a line cannot carry the newline that ends it.
+  capture DB_PASSWORD_INSTALLED installed_database_password "$(existing_env DATABASE_URL)" "${DB_USER}" "${DB_HOST}" "${DB_PORT}" "${DB_NAME}" || DB_PASSWORD_INSTALLED=""
+  if ${DB_ROTATION_JOURNAL_FOUND}; then
+    DB_PASSWORD_INSTALLED="${DB_ROTATION_RECONCILED_PASSWORD}"
+    info "The installed credential for this run is the one the SERVER answered to, not the one"
+    info "${APP_DIR}/.env carries: an interrupted rotation was reconciled above. Pressing Enter"
+    info "finishes that transition — the environment file this run writes will name it."
+  fi
+  if [[ -n "${DB_PASSWORD_INSTALLED}" ]]; then
+    info "${APP_DIR}/.env already names ${DB_USER}@${DB_HOST}:${DB_PORT}/${DB_NAME}, so the credential it"
+    info "carries is the default here. Pressing Enter changes NOTHING about the role: this installer"
+    info "does not rotate a live database credential as a side effect of being re-run. Supplying a"
+    info "DIFFERENT password asks for a rotation, which is performed after the existing installation"
+    info "has been stopped and the database fenced — never while it is still serving."
+    prompt DB_PASSWORD "Database password" "${DB_PASSWORD_INSTALLED}" "secret" "$(mask_secret "${DB_PASSWORD_INSTALLED}")"
+  elif [[ "${INSTALL_POSTGRES}" == "y" ]]; then
+    prompt DB_PASSWORD "Database password" "$(openssl rand -hex 16)" "secret"
+  else
+    prompt DB_PASSWORD "Database password" "" "secret"
+  fi
+}
+
 echo ""
 info "--- PostgreSQL ---"
 prompt_yn INSTALL_POSTGRES "Install PostgreSQL on this server?" "y"
 if [[ "$INSTALL_POSTGRES" == "y" ]]; then
   prompt DB_NAME      "Database name"           "one_two_inventory"
   prompt DB_USER      "Database user"           "imsuser"
-  prompt DB_PASSWORD  "Database password"       "$(openssl rand -hex 16)" "secret"
   DB_HOST="localhost"
   DB_PORT="5432"
+  # A CLUSTER THIS SCRIPT INSTALLS, REACHED OVER localhost. Stated rather than defaulted: the
+  # value decides which pg_hba.conf record every probe below is matched by, and a route nobody
+  # chose is the whole subject of r43-r45.
+  DB_SSLMODE="disable"
+  DB_SSLROOTCERT=""
+  # AND A SUPPLIED VALUE IS DROPPED OUT LOUD, NOT SILENTLY (o3d-2sm1.5 r46, Codex HIGH). This is
+  # the one place the r46 sweep found where a caller-supplied input is deliberately overridden, and
+  # the whole finding that round answers is an override nobody could see. The override is right —
+  # there is no transport question about a cluster this script installs on this host and reaches
+  # over localhost — but an operator who asked for one is told which answer they got.
+  if [[ -n "${DB_SSLMODE_SUPPLIED}" && "${DB_SSLMODE_SUPPLIED}" != "disable" ]]; then
+    warn "DB_SSLMODE=${DB_SSLMODE_SUPPLIED} was supplied, and this run is INSTALLING PostgreSQL on"
+    warn "this host and reaching it over localhost, where the transport is not an operator input."
+    warn "The connection is left on 'disable'. Answer 'n' to 'Install PostgreSQL on this server?'"
+    warn "and give the cluster as an external database if the transport has to be stated."
+  fi
+  prompt_db_password
 else
   prompt DB_HOST      "PostgreSQL host"         "localhost"
   prompt DB_PORT      "PostgreSQL port"         "5432"
   prompt DB_NAME      "Database name"           "one_two_inventory"
   prompt DB_USER      "Database user"           "imsuser"
-  prompt DB_PASSWORD  "Database password"       "" "secret"
+  # BEFORE THE PASSWORD PROMPT, because prompt_db_password() reconciles an interrupted rotation,
+  # and reconciling means PROBING — over the transport this answers for.
+  prompt_db_sslmode
+  prompt_db_password
 fi
 
 echo ""
@@ -2007,10 +5737,14 @@ if [[ -n "${EXISTING_REDIS_USERINFO}" ]]; then
   # Percent-encoding guarantees the password's own `:` is escaped, so the FIRST colon
   # is the user/password delimiter and nothing here has to guess.
   if [[ "${EXISTING_REDIS_USERINFO}" == *":"* ]]; then
-    EXISTING_REDIS_USERNAME="$(urldecode "${EXISTING_REDIS_USERINFO%%:*}")"
-    EXISTING_REDIS_PASSWORD="$(urldecode "${EXISTING_REDIS_USERINFO#*:}")"
+    # THE REDIS CREDENTIAL CROSSES THE SAME BOUNDARY (o3d-2sm1.5 r40, Codex HIGH). This recovery
+    # is the reason `%0A` can be in a URL at all — REDIS_URL has been recovered and re-encoded for
+    # rounds — and a requirepass ending in a newline was truncated here, so the re-run wrote a
+    # redis.conf and a URL that disagreed with the server by one byte.
+    capture EXISTING_REDIS_USERNAME urldecode "${EXISTING_REDIS_USERINFO%%:*}"
+    capture EXISTING_REDIS_PASSWORD urldecode "${EXISTING_REDIS_USERINFO#*:}"
   else
-    EXISTING_REDIS_USERNAME="$(urldecode "${EXISTING_REDIS_USERINFO}")"
+    capture EXISTING_REDIS_USERNAME urldecode "${EXISTING_REDIS_USERINFO}"
   fi
 fi
 # The compatibility line is consulted only when the URL carried no credential at all.
@@ -2184,25 +5918,86 @@ if [[ "$INSTALL_POSTGRES" == "y" ]]; then
     success "PostgreSQL already installed."
   fi
 
+  # @install-phase: database-newness
+  #
+  # EVERYTHING HERE IS EITHER A QUESTION OR A CREATION (o3d-2sm1.5 r37, Codex HIGH). This block
+  # used to CREATE OR ALTER the application role and its password, then decide newness, then
+  # GRANT and change the database's OWNER — all of it before this run had asked whether it is a
+  # cutover and long before it had established that it could fence one. On a fresh application
+  # host pointed at a PRE-EXISTING, LIVE database, a missing DEPLOY_ADMIN_DATABASE_URL or a
+  # missing fence artefact then aborted the run 400 lines later, saying "nothing has been stopped
+  # and nothing has been migrated" — over a database whose application role had already had its
+  # password changed and whose ownership had already moved. Existing writers lost their
+  # reconnect, and the refusal claimed the box was untouched.
+  #
+  # It is the principle this file already applies everywhere else, arriving late at the one place
+  # that needed it most: A REFUSAL IS ONLY SAFE AT A POINT WHERE REFUSING LEAVES THE SYSTEM
+  # CONSISTENT. So what stays here is only what a run must do to ANSWER the question, and only
+  # what cannot take anything away from anybody:
+  #
+  #   ensure_database_role_exists         CREATEs the role when it is absent; an absent role has
+  #                                       no clients, so creating it changes nothing for anyone.
+  #                                       On a role that is ALREADY there it does nothing at all
+  #                                       and records that fact. It is here rather than later
+  #                                       because fence-db-connections.mjs --preflight refuses
+  #                                       outright when --app-user names a role that does not
+  #                                       exist, so the preflight that gates the fenced path
+  #                                       needs the role to be present to answer.
+  #   create_database_and_record_newness  CREATE DATABASE, which either creates a database that
+  #                                       by definition had no writers, or is refused as a
+  #                                       duplicate. Neither outcome alters an existing object.
+  #
+  # THE ALTER, THE GRANT AND THE OWNER CHANGE MOVED to provision_database_role_and_privileges(),
+  # which runs after this run knows which path it is on and — on a cutover — after
+  # require_fenceable_database() has proved a fence is possible.
   info "Creating database '${DB_NAME}' and user '${DB_USER}'..."
-  run_as_user postgres psql -v ON_ERROR_STOP=1 <<-EOSQL
-    DO \$\$
-    BEGIN
-      IF NOT EXISTS (SELECT FROM pg_catalog.pg_user WHERE usename = '${DB_USER}') THEN
-        CREATE USER "${DB_USER}" WITH PASSWORD '${DB_PASSWORD}';
-      ELSE
-        ALTER USER "${DB_USER}" WITH PASSWORD '${DB_PASSWORD}';
-      END IF;
-    END
-    \$\$;
-    SELECT 'CREATE DATABASE ${DB_NAME}' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname='${DB_NAME}') \gexec
-    GRANT ALL PRIVILEGES ON DATABASE "${DB_NAME}" TO "${DB_USER}";
-    ALTER DATABASE "${DB_NAME}" OWNER TO "${DB_USER}";
-EOSQL
-  success "Database '${DB_NAME}' and user '${DB_USER}' ready."
+  ensure_database_role_exists
+  create_database_and_record_newness
 fi
 
-DATABASE_URL="postgresql://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}"
+# WHICH CREDENTIAL EVERY CONNECTION BEFORE THE STOP USES (o3d-2sm1.5 r38, Codex HIGH).
+#
+# A rotation was asked for when all three are true: the role was ALREADY on this server when this
+# run arrived (so somebody may be using it), ${APP_DIR}/.env named a password for this exact
+# connection, and the operator supplied a different one. Anything indeterminate — no recoverable
+# installed password, a role this run created itself, an external database this script does not
+# administer — is NOT a rotation, and nothing is ALTERed at all.
+#
+# When one IS pending, DATABASE_URL keeps the OLD credential for the whole pre-stop window. That
+# is what .env is written with, what `prisma generate` and `npm run build` are handed through
+# MIGRATION_DATABASE_URL, and what the fence preflight opens the application connection with — so
+# a build that fails leaves a predecessor whose environment file and whose database still agree.
+# rotate_database_password_in_fenced_window() replaces both, together, after the stop.
+#
+# IT IS A FUNCTION AND NOT FOUR STRAIGHT-LINE STATEMENTS so the tests can run these bytes instead
+# of a copy of them: a regression that re-implements the decision it is checking proves only that
+# its author can write the decision twice.
+classify_database_credential_rotation() {
+  DB_PASSWORD_EFFECTIVE="${DB_PASSWORD}"
+  DB_PASSWORD_ROTATION_PENDING=false
+  if ${DB_ROLE_PREEXISTED} && [[ -n "${DB_PASSWORD_INSTALLED}" && "${DB_PASSWORD}" != "${DB_PASSWORD_INSTALLED}" ]]; then
+    DB_PASSWORD_ROTATION_PENDING=true
+    DB_PASSWORD_EFFECTIVE="${DB_PASSWORD_INSTALLED}"
+    warn "A password DIFFERENT from the one ${APP_DIR}/.env carries was supplied for the PRE-EXISTING"
+    warn "role '${DB_USER}', so this run will rotate it — but not yet. Everything up to and including"
+    warn "the build uses the credential the server already has; the ALTER happens once the existing"
+    warn "installation is stopped and the database is fenced."
+  fi
+  DATABASE_URL="$(compose_database_url "${DB_USER}" "${DB_PASSWORD_EFFECTIVE}" "${DB_HOST}" "${DB_PORT}" "${DB_NAME}")"
+}
+
+classify_database_credential_rotation
+
+# THE SAME FOUR VALUES THE URL ABOVE WAS COMPOSED FROM, handed to the connection fence rather
+# than parsed back out of it (o3d-2sm1.5 r19). Nothing is derived, so nothing can be derived
+# wrongly; and because the URL states all four, no PGHOST/PGPORT/PGUSER/PGDATABASE in any
+# process can move the connection away from them.
+DB_FENCE_IDENTITY_ARGS=(
+  "--app-host=${DB_HOST}"
+  "--app-port=${DB_PORT}"
+  "--app-user=${DB_USER}"
+  "--app-database=${DB_NAME}"
+)
 
 # ---------------------------------------------------------------------------
 # 6. SSH
@@ -2294,6 +6089,19 @@ if ! id "${APP_USER}" &>/dev/null; then
   success "System user '${APP_USER}' created."
 else
   success "System user '${APP_USER}' already exists."
+fi
+
+# THE PRINCIPAL THAT ACTUALLY CONNECTS, ASKED THE MOMENT IT EXISTS (o3d-2sm1.5 r46, Codex MEDIUM).
+#
+# prompt_db_sslmode() published the CA and checked it as root and, where it was installed already,
+# as postgres. ${APP_USER} did not exist then — this block is what creates it — and it is the
+# account the SERVICE runs as, so it is the one whose failure the finding is about: a CA the
+# installer and the probes can read and the application cannot fails after the migration, with the
+# fence down and nothing left to roll back to. It is asked here, which is before the environment
+# file is written and long before anything is started.
+if [[ -n "${DB_SSLROOTCERT}" ]]; then
+  verify_db_ca_published "${APP_USER}" postgres || die \
+    "The database CA at ${DB_CA_PUBLISHED_FILE} is not usable by the account the service runs as; the reason is above. DB_SSLMODE=${DB_SSLMODE} verifies every connection against that file, so an application that cannot open it cannot start. NOTHING HAS BEEN MIGRATED and nothing has been stopped. ${DB_CA_REFRESH_FAILURE_ADVICE}"
 fi
 
 mkdir -p "${DATA_DIR}" "${LOG_DIR}" "${BACKUP_DIR}" \
@@ -2489,12 +6297,41 @@ DEPLOY_ADMIN_DATABASE_URL="$(unquote_env_value "${DEPLOY_ADMIN_DATABASE_URL:-$(e
 # `existing_env` cannot tell those apart: it answers "not present" identically for both.
 require_preserved_secrets
 
-cat > "${APP_DIR}/.env" <<EOF
-# One Two Inventory — generated by install.sh on $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+# THE FILE THIS INSTALLER OWNS, WRITTEN FROM THE VARIABLES IT HOLDS — AND WRITABLE TWICE
+# (o3d-2sm1.5 r38, Codex HIGH).
+#
+# It is a function because a credential rotation happens LATER, after the predecessor has been
+# stopped and the database fenced, and the file then has to name the new credential. The obvious
+# alternative — reach into ${APP_DIR}/.env and substitute the one line — makes install.sh a
+# SECOND READER of an application-owned file, which is the thing tests/scripts/deploy-order.test.ts
+# forbids outright and for good reason: the account that owns that file is the account this script
+# is protecting the database from. Re-running the write is not a read at all. Every value in it is
+# a variable this process is already holding, so the second write differs from the first in
+# exactly the bytes the rotation changed.
+#
+# WHICH IS WHY THE STAMP IS HOISTED. `$(date ...)` inline made the two writes differ in a line
+# that has nothing to do with the change, and "exactly one line moved" is an assertion the
+# regressions make.
+ENV_FILE_GENERATED_AT="$(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+
+# RENDERED WHOLE FROM HELD VARIABLES, THEN PUBLISHED BY RENAME (o3d-2sm1.5 r39, Codex HIGH).
+#
+# `cat > "${APP_DIR}/.env"` TRUNCATED the application's only environment file and then filled it,
+# so every instant of the write was a state in which the file existed and did not say what the
+# database needed. That is the same defect publish_durable_file() was written for, in the one file
+# that is read by a service the installer has just stopped and is about to start.
+#
+# The render happens FIRST and INTO A VARIABLE, so a failure while producing the content cannot
+# reach the publication at all — a pipeline would have renamed whatever bytes it had received
+# before the producer died. Command substitution strips trailing newlines and `printf '%s\n'`
+# restores the single one the heredoc ends with, so the published bytes are the rendered bytes.
+render_app_env_file() {
+cat <<EOF
+# One Two Inventory — generated by install.sh on ${ENV_FILE_GENERATED_AT}
 
 NODE_ENV=production
 # What this deployment IS, as opposed to what it was built as. NODE_ENV is set
-# by the build and says `production` on stage and on a test rig too, so it
+# by the build and says "production" on stage and on a test rig too, so it
 # cannot be the thing that exempts production from a guard (o3d-l89a).
 IMS_INSTANCE_ROLE=production
 APP_PORT=${APP_PORT}
@@ -2560,10 +6397,31 @@ FILE_SCAN_NAME=
 FILE_SCAN_ENV_ALLOWLIST=PATH,HOME,TMPDIR,TEMP,TMP,LANG,LC_ALL
 FILE_SCAN_TIMEOUT_MS=30000
 EOF
+}
 
-chown "${APP_USER}:${APP_USER}" "${APP_DIR}/.env"
-chmod 600 "${APP_DIR}/.env"
+# Ownership and mode travel with the publication rather than following it: publish_durable_file()
+# applies both to the temporary file, before the barrier and before the rename, so there is no
+# instant at which ${APP_DIR}/.env exists as a file the application account cannot read.
+#
+# IT RETURNS A STATUS AND EVERY CALLER ACTS ON IT. The old writer could not fail visibly — `cat >`
+# under `set -e` aborted the script from wherever it stood, and the `chown` and `chmod` after it
+# were not checked at all, so a refused chown left the trap claiming the file agreed with the
+# server.
+write_app_env_file() {
+  local rendered
+  rendered="$(render_app_env_file)" || return 1
+  [[ -n "${rendered}" ]] || return 1
+  printf '%s\n' "${rendered}" | publish_durable_file "${APP_DIR}/.env" "${APP_USER}:${APP_USER}" 600 || return 1
+  return 0
+}
+
+write_app_env_file || die "${APP_DIR}/.env could not be written. Nothing has been stopped and nothing has been migrated; the file at that path is whatever the previous run left there, complete and unchanged — it is published by rename, so there is no half-written state to clean up."
 success ".env written to ${APP_DIR}/.env"
+# The publication the interrupted-rotation journal was waiting for has now happened, and it named
+# DB_PASSWORD_EFFECTIVE — which reconcile_interrupted_role_rotation() has already set to the
+# credential the SERVER answered to. Cases (2) and (3) end here; case (1) ends here having changed
+# nothing.
+resolve_role_rotation_journal_after_env_publication
 
 # ---------------------------------------------------------------------------
 # 11. Install dependencies and build
@@ -2592,18 +6450,40 @@ success "Dependencies installed."
 # ---------------------------------------------------------------------------
 MIGRATION_DATABASE_URL="${DATABASE_URL}"
 
+# WHICH PATH THIS RUN TAKES, AND WHAT HAS TO BE TRUE TO SKIP THE FENCE (o3d-2sm1.5 r36, Codex
+# CRITICAL). TWO independent questions, and EITHER answer sends this run down the fenced path:
+#
+#   1. Is there something on THIS HOST to break?      upgrade_in_place()
+#   2. Did THIS RUN create the database it will migrate?  first_install_exemption_available()
+#
+# The second used to be assumed from the first. It is not implied by it and never was: a fresh
+# application host pointed at an existing remote database answers "nothing here to break" and
+# "someone else's live data" at the same time, and the old branch let that run migrate unfenced.
+# So the exemption is granted only when BOTH come back, and anything the installer cannot
+# positively establish — every external database, every pre-existing local one, every
+# indeterminate result — falls to the fenced path.
 if upgrade_in_place; then
+  FENCED_CUTOVER=true
+  CUTOVER_REASON="an existing installation was found on this host: a service unit, a live crontab, a PM2 instance or a process running in ${APP_DIR}"
+elif ! first_install_exemption_available; then
+  FENCED_CUTOVER=true
+  CUTOVER_REASON="${FIRST_INSTALL_EXEMPTION_REFUSAL}"
+fi
+
+if ${FENCED_CUTOVER}; then
   UPGRADE_EXISTING=true
-  header "Existing installation detected — this run is an upgrade cutover"
+  header "This run is a cutover — the migration window will be fenced"
+  info "${CUTOVER_REASON}"
 
   # Installed before anything is armed, so that a kill or a power cut anywhere below
   # leaves the marker, the drop-in and a stopped service rather than a running one.
   trap on_cutover_exit EXIT
 
-  # BEFORE ANYTHING IS STOPPED, AND BEFORE THE BUILD. An existing installation's database
-  # has to be held closed while its schema moves, and discovering at the drain step that it
-  # cannot be would cost an outage for a missing environment variable — or, once, for a
-  # missing node module.
+  # BEFORE ANYTHING IS STOPPED, AND BEFORE THE BUILD. A database this run did not create has
+  # to be held closed while its schema moves — whether the writer is this host's own previous
+  # installation or somebody else's, which is the case the second branch question added — and
+  # discovering at the drain step that it cannot be would cost an outage for a missing
+  # environment variable, or, once, for a missing node module.
   require_fenceable_database
 
   CUTOVER_STEP="adopt"
@@ -2612,6 +6492,30 @@ if upgrade_in_place; then
   acquire_cutover_lock
   import_legacy_cutover_state
   adopt_existing_fence
+
+  # AND ONLY NOW IS THE DATABASE'S ROLE TOUCHED (o3d-2sm1.5 r37, Codex HIGH). Everything above
+  # this line either asked a question or created something that did not exist; every refusal
+  # above it — no DEPLOY_ADMIN_DATABASE_URL, no fence artefact, a preflight the database itself
+  # rejected, a cutover lock somebody else holds — therefore lands on a database whose
+  # application role still has the password its existing clients are using, and whose owner is
+  # unchanged. The fence has been proved possible, and an adopted one is already standing.
+  provision_database_role_and_privileges
+else
+  # A ROTATION HAS NOWHERE SAFE TO HAPPEN ON THIS PATH (o3d-2sm1.5 r38, Codex HIGH). The exemption
+  # says THIS run created THIS database, so nothing is serving it — but the ROLE is cluster-wide
+  # and DB_PASSWORD_ROTATION_PENDING is only ever set over a role this run did NOT create. It is
+  # therefore somebody else's role, on some other database, with no window to fence and no service
+  # to stop. Refused here, before the build and before anything is written to the database.
+  if ${DB_PASSWORD_ROTATION_PENDING}; then
+    die "A password different from the installed one was supplied for '${DB_USER}', but this run has taken the first-install exemption: it created database '${DB_NAME}' itself and there is no existing installation to stop and no migration window to fence. The role '${DB_USER}' was ALREADY on this server, so rotating it would take the credential away from whatever else uses it, with nothing held closed. Re-run with the password that role already has, or rotate it deliberately on the server first. NOTHING HAS BEEN MIGRATED and the role's password is UNCHANGED."
+  fi
+
+  first_install_fence_policy
+
+  # Nothing is serving, no crontab is live, and create_database_and_record_newness() proved this
+  # run created the database on the server it is about to migrate — so there is no client whose
+  # credentials this can take away.
+  provision_database_role_and_privileges
 fi
 
 # ---------------------------------------------------------------------------
@@ -2706,6 +6610,13 @@ if ${UPGRADE_EXISTING}; then
       node "${APP_DIR}/scripts/check-db-writers.mjs" ) \
     || die "Another client is still connected to the target database. Stop it and re-run; the migration has NOT been applied."
   success "No other client backends on the target database."
+
+  # AND ONLY NOW MAY A WORKING CREDENTIAL BE TAKEN AWAY (o3d-2sm1.5 r38, Codex HIGH). Nothing is
+  # serving, the reboot fence is standing, the crontab is fenced, the port is free, the connection
+  # fence is up and the database has just said no other backend is attached. This is a no-op
+  # unless the operator supplied a password different from the installed one.
+  CUTOVER_STEP="rotate-credential"
+  rotate_database_password_in_fenced_window
 else
   info "No existing installation: nothing is serving and no crontab is live, so there is"
   info "no writer to stop and no cutover to fence."
@@ -2836,7 +6747,30 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-systemctl daemon-reload
+# BIND THE SERVICE TO THE DATABASE THIS RUN MIGRATED, BEFORE THE RELOAD THAT LOADS THE UNIT
+# (o3d-2sm1.5 r23, Codex HIGH). The unit above loads ${APP_DIR}/.env with a leading `-`, and
+# systemd does not read it until it EXECS — at the far end of a window that has held a git
+# clone, an npm install, a Next build and a migration. Nothing in this script re-read it, and
+# re-reading it would not have helped: a read cannot bind a file somebody else can replace.
+#
+# So the value THIS RUN fenced and migrated with — the shell variable, not a re-read — is
+# published under the cutover state directory, root-owned and 0600, and the unit is given a
+# drop-in that loads it LAST. systemd keeps the last definition of a variable across environment
+# files, so it beats whatever ${APP_DIR}/.env has come to say; and it is loaded with NO leading
+# `-`, so if it is gone the start fails instead of falling back.
+# AND BIND ITS TRANSPORT THE SAME WAY (o3d-2sm1.5 r45, Codex HIGH). The snapshot below says
+# WHICH database; this says HOW the application gets to it — by removing from the service's
+# environment the three variables that would otherwise choose a different pg_hba record from the
+# one this run probed and rotated against. It is written before the snapshot because both are
+# unit-file operations and every one of those must be upstream of remove_reboot_fence()'s
+# daemon-reload; the proof that systemd LOADED it is taken after that reload, in
+# require_start_identity_bound().
+publish_db_route_guarantee || die \
+  "The application service could not be made to drop the database transport variables at exec (the reason is printed above). The connection fence is still up and nothing has been started. Without that directive an ambient PGSSLMODE, PGREPLICATION or NODE_PG_FORCE_NATIVE — from the systemd manager's environment block, from a drop-in, or from any environment file the unit loads, including a wildcard one — puts the application on a pg_hba.conf record this run never authenticated against. Fix the cause and re-run; the re-run adopts the standing fence."
+
+publish_db_identity_snapshot || die \
+  "The application service could not be bound to the database this run fenced and migrated (the reason is printed above). The connection fence is still up and nothing has been started. Without the binding, the DATABASE_URL systemd reads at exec is whatever ${APP_DIR}/.env says at that instant, which is not something this script can hold still. Fix the cause and re-run; the re-run adopts the standing fence."
+
 # Legacy PM2 instances are stopped, disabled and deleted by stop_legacy_launchers() in the
 # cutover above — BEFORE the migration, not here. Removing them at this point meant a
 # PM2-run installation kept writing for the whole length of the schema change (o3d-2sm1.4).
@@ -2856,11 +6790,49 @@ stop_legacy_launchers
 # the schema or leaves the fence standing.
 # ---------------------------------------------------------------------------
 CUTOVER_STEP="start"
+
+# THE ENABLE HAPPENS HERE, AHEAD OF THE FINAL RELOAD, AND ONLY THE START COMES AFTER THE PROOF
+# (o3d-2sm1.5 r24, Codex HIGH). This used to be one `systemctl enable --now` below
+# require_start_identity_bound, and `systemctl enable` RELOADS SYSTEMD IMPLICITLY unless it is
+# given --no-reload — so the command that started the service also re-read every unit file and
+# every drop-in on disk AFTER the proof that the loaded configuration binds it to this run's
+# snapshot, which is the one thing that proof claimed nothing between it and the start could do.
+#
+# Splitting it puts every unit-file operation upstream of remove_reboot_fence()'s daemon-reload
+# and leaves `start` as the only systemctl verb after the verification; `start` acts on the
+# loaded configuration and does not re-read unit files. It is done BY CONSTRUCTION rather than
+# with --no-reload, which would leave the invariant depending on every future caller remembering
+# a flag.
+#
+# Enabling this early starts nothing — it writes the multi-user.target wants symlink — and the
+# reboot fence is still standing, so a machine that reboots in this window still refuses to bring
+# the service up.
+systemctl enable "${APP_NAME}.service"
+
 release_db_connections \
   || die "Refusing to start the application while it has no CONNECT on its own database."
 remove_reboot_fence
 
-systemctl enable --now "${APP_NAME}.service"
+# THE COMPOSED UNIT, ASKED OF SYSTEMD AFTER THE LAST daemon-reload (o3d-2sm1.5 r23, Codex HIGH).
+# remove_reboot_fence() has just issued it, so this is the first moment the LOADED configuration
+# can be read and the last before the start. Three things are proved here and nothing is assumed:
+# nothing but ${APP_DIR}/.env and this run's snapshot can define DATABASE_URL for the service
+# (no Environment=, PassEnvironment=, UnsetEnvironment=, PAMName= or third environment file — a
+# drop-in that survived from some other tool included); the snapshot is loaded LAST and
+# MANDATORILY; and ${APP_DIR}/.env still states the value this run migrated with.
+#
+# It is atomic with respect to the start in the one way that matters: the SET of environment
+# files is unit configuration, fixed at daemon-reload and not re-read by `systemctl start`, and
+# nothing between this line and the start runs a unit-file command at all. That claim was FALSE
+# until r24 — this was `systemctl enable --now`, and `enable` reloads systemd IMPLICITLY unless
+# it is given --no-reload, so the command that started the service also re-read every unit file
+# and drop-in on disk after the proof. The enable now happens above remove_reboot_fence()'s
+# reload and only `start` is left here; the complete list of commands in the window is this
+# `success` line and that start.
+require_start_identity_bound || die \
+  "THE APPLICATION IS NOT BEING STARTED: ${DB_IDENTITY_SOURCE_REASON}. This was checked after the final daemon-reload, so it is the unit's loaded configuration that systemd is about to act on. The migration applied and every verification passed; fix the unit (or ${APP_DIR}/.env) and re-run, which adopts the state this run left. Do NOT start the service by hand first."
+
+systemctl start "${APP_NAME}.service"
 
 success "Application service started and registered with systemd."
 
@@ -2947,6 +6919,13 @@ CUTOVER_ARMING=false
 if ${PAST_POINT_OF_NO_RETURN}; then
   FENCE_ARMED=false
 fi
+
+# THE BINDING COMES OFF HERE, on the success path (o3d-2sm1.5 r23). The service is running and
+# has answered its health check, so it already HAS the environment; the drop-in has nothing left
+# to do and everything to break, because from now on it would override ${APP_DIR}/.env for every
+# restart, reboot and Restart= until somebody noticed a file in /etc/systemd/system that no
+# document mentions. Removing it does not touch the running process.
+remove_db_identity_snapshot
 
 # Cron goes back only once the new build is running, and BEFORE the crontab block below
 # is spliced in — splicing into a fenced crontab would preserve the commented-out lines
@@ -3247,6 +7226,21 @@ if command -v ufw &>/dev/null && ufw status | grep -q "Status: active"; then
   ufw allow 443/tcp comment "${APP_NAME} HTTPS" 2>/dev/null || true
   success "ufw rules added for required public ports."
 fi
+
+# ---------------------------------------------------------------------------
+# 17b. SUPERSEDED DATABASE CA GENERATIONS (o3d-2sm1.5 r47, Codex HIGH)
+#
+# HERE AND NOWHERE EARLIER. Every generation under ${DB_CA_PUBLISH_DIR} is a trust root some
+# installation may still be verifying against, and a run that has not finished cannot say which. So
+# the prune is the last thing this script does before it prints, after the migration, after the
+# service was started and after the health check answered — by which point the environment file
+# names this run's generation and the box has demonstrably connected through it.
+#
+# It never removes the generation the PREVIOUS environment file named, whatever its age, so the one
+# step back an operator is most likely to want is always there to take. See
+# prune_db_ca_generations() for the rest of the rule.
+# ---------------------------------------------------------------------------
+prune_db_ca_generations
 
 # ---------------------------------------------------------------------------
 # 18. Post-install summary

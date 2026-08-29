@@ -1,4 +1,6 @@
-import { Pool, type PoolClient } from 'pg'
+import { type Pool, type PoolClient } from 'pg'
+
+import { createSessionAdvisoryLockPool } from '@/lib/db/session-lock-pool'
 
 /**
  * Serializes the two jobs that write `paidAt` from Xero — the 15-minute payment poll and the daily
@@ -28,13 +30,23 @@ export const LOCK_SKIPPED: LockSkipped = { lockSkipped: true }
 // every other session — it does not need to be the connection the writes happen on, only a stable
 // one held for the lock's lifetime. Lazily created; a handful of connections is plenty for two
 // low-frequency jobs.
+/**
+ * THE LOCK POOL IS BUILT BY `createSessionAdvisoryLockPool()` (o3d-2k5r r23 and r25, Codex HIGH;
+ * o3d-a5zz).
+ *
+ * r23 stopped it being a `new Pool({ connectionString })` — a second, unguarded route into the
+ * database inside a process whose Prisma pool is guarded, carrying no `search_path` pin and none of
+ * the per-connection backend checks. r25 stopped `pgConnectionConfig()` alone being enough: that
+ * config attaches its per-connection check only where the startup options carry a non-ASCII byte,
+ * so on an ASCII schema this pool's connections were never shown to reach the backend DIRECTLY —
+ * and a session advisory lock behind a transaction pooler excludes nothing (measured: Odyssey
+ * 1.5.3-rc1, two clients both told `true` for the same key, neither actually holding it). The
+ * affinity proof is now a property of the pool factory rather than of this call site; see
+ * `lib/db/session-lock-pool.ts`.
+ */
 let lockPool: Pool | null = null
 function getLockPool(): Pool {
-  if (!lockPool) {
-    const connectionString = process.env.DATABASE_URL
-    if (!connectionString) throw new Error('DATABASE_URL is required for the payment-write lock')
-    lockPool = new Pool({ connectionString, max: 4 })
-  }
+  if (!lockPool) lockPool = createSessionAdvisoryLockPool('the payment-write lock', 4)
   return lockPool
 }
 

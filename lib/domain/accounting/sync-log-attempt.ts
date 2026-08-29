@@ -123,12 +123,24 @@ export async function applyFencedAttemptDecision(
      * remove — every path returns a row to a status it already held, so the decision can land on a
      * LATER attempt than the one that was judged.
      *
-     * It is sound in ONE case, and the caller must have established it: NOTHING THAT PARTICIPATES IN
-     * THE FENCE CAN EVER CLAIM THIS ROW — a row on a connector that is not the active one, which no
-     * processor and no retry path touches. Such a row has exactly one attempt, ever, so there is no
-     * later attempt for the decision to land on and status is a sufficient identity for it. Without
-     * this door those rows are refused for ever, and the per-row remedy does not exist for the very
-     * population it was built for.
+     * It is sound in TWO cases, and the caller must have established one of them. Both exist because
+     * without a door the per-row remedy does not exist for the very population it was built for, and a
+     * refusal that names a claim which is never coming is a refusal with no remedy.
+     *
+     *  1. NOTHING THAT PARTICIPATES IN THE FENCE CAN EVER CLAIM THIS ROW — a row on a connector that
+     *     is not the active one, which no processor and no retry path touches (o3d-nf9i r3;
+     *     app/actions/accounting-settlement.ts). Such a row has exactly one attempt, ever, so there is
+     *     no later attempt for the decision to land on.
+     *
+     *  2. THE REVISION ITSELF IS THE FENCE (o3d-psvi r2; app/actions/accounting-sync.ts). Revision 0
+     *     is not merely "unidentified": `nextAttemptRevision` is the only writer and it only ever
+     *     ADDS, so a row that is still at 0 when the swap evaluates is a row nothing has claimed in
+     *     the meantime. `(id, expectedStatus, revision 0)` is then STRICTLY STRONGER than the
+     *     `(id, expectedStatus)` identity check adoption is accused of degrading to: it refuses
+     *     everything that would refuse, plus every row that has since been claimed. What the caller
+     *     must establish for this reading is that its DECISION does not rest on anything the revision
+     *     would have to testify about — i.e. that it re-reads the row's shape inside the transaction
+     *     that writes, rather than trusting a snapshot taken outside it.
      *
      * The adoption is still a CAS — (id, revision 0, expectedStatus) — so a second operator, or a
      * sweep that moves the status first, loses and is told which. It bumps to 1 exactly as a

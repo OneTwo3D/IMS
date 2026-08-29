@@ -48,8 +48,28 @@ test('[o3d-4ajo] every key is a positive safe integer pg can hold', () => {
 test('[o3d-4ajo] no module declares an advisory key of its own', () => {
   // The registry is only authoritative if it is the ONLY place a bare key is
   // written down. A module-local constant is exactly how the collision arose.
+  //
+  // o3d-2k5r r26: `.mjs` is walked too. The session-lock-space probe's namespace
+  // HAS to be declared in `lib/db/database-url-schema.mjs` — that module is
+  // `.mjs` and cannot import this `.ts` registry, the dependency runs the other
+  // way — and a keyspace the walker could not see is precisely the unregistered
+  // constant this test exists to prevent. So the rule is not "only .ts files",
+  // it is "the registry must RE-EXPORT the name", which is checkable and is
+  // what keeps the value single-sourced.
   const roots = ['lib', 'app']
+  const registryPath = 'lib/db/advisory-locks.ts'
+  const registry = readFileSync(registryPath, 'utf8')
+  // A declaration that assigns a numeric literal to a lock KEY or NAMESPACE
+  // name. Both keyspaces, and hex as well as decimal: DISPATCH_SWEEP_LOCK_NAMESPACE
+  // was written 0x77_6d_73_64, which a decimal-only pattern would miss. The
+  // qualifier is `LOCK` anywhere in the name and `_KEY`/`_NAMESPACE` at the end,
+  // not the contiguous `LOCK_KEY`/`LOCK_NAMESPACE` r25 matched on:
+  // SESSION_LOCK_SPACE_PROBE_NAMESPACE is a lock namespace that the narrower
+  // pattern reads straight past.
+  const declaration = /(?:const|let|var)\s+(\w*LOCK\w*_(?:KEY|NAMESPACE))\s*(?::\s*number\s*)?=\s*(?:0x)?[\da-fA-F_]+/
   const offenders: string[] = []
+  let declarations = 0
+  let files = 0
   const walk = (dir: string) => {
     for (const entry of readdirSync(dir)) {
       const path = join(dir, entry)
@@ -58,21 +78,46 @@ test('[o3d-4ajo] no module declares an advisory key of its own', () => {
         walk(path)
         continue
       }
-      if (!path.endsWith('.ts') && !path.endsWith('.tsx')) continue
-      if (path.endsWith('lib/db/advisory-locks.ts')) continue
+      if (!path.endsWith('.ts') && !path.endsWith('.tsx') && !path.endsWith('.mjs')) continue
+      if (path.endsWith(registryPath)) continue
+      files += 1
       const src = readFileSync(path, 'utf8')
       for (const line of src.split('\n')) {
-        // A declaration that assigns a numeric literal to a *_LOCK_KEY name.
-        // Both keyspaces, and hex as well as decimal: DISPATCH_SWEEP_LOCK_NAMESPACE
-        // was written 0x77_6d_73_64, which a decimal-only pattern would miss.
-        if (/(?:const|let|var)\s+\w*LOCK_(?:KEY|NAMESPACE)\w*\s*(?::\s*number\s*)?=\s*(?:0x)?[\da-fA-F_]+/.test(line)) {
-          offenders.push(`${path}: ${line.trim()}`)
-        }
+        const declared = declaration.exec(line)
+        if (!declared) continue
+        declarations += 1
+        // Single-sourced is the property, not the file extension: a name the
+        // registry re-exports has ONE value, and the distinctness tests above
+        // see it. A name it does not is a key nothing knows about.
+        if (new RegExp(`\\b${declared[1]}\\b`).test(registry)) continue
+        offenders.push(`${path}: ${line.trim()}`)
       }
     }
   }
   for (const root of roots) walk(root)
+  // THE DETECTOR MUST BE ALIVE. An empty offender list is what a pattern that
+  // matches nothing returns as readily as a clean tree, and r25's pattern in
+  // fact matched NOTHING outside the registry — it had been vacuous since the
+  // day every key moved into the registry. Two preconditions, both about this
+  // run rather than about the tree: the walk reached files, and the pattern
+  // still recognises the very declarations the registry is made of.
+  assert.ok(files > 100, `PRECONDITION: the walk reached the source tree; it read ${files} files`)
+  const inRegistry = registry.split('\n').filter((line) => declaration.test(line)).length
+  assert.ok(inRegistry >= 10, `PRECONDITION: the pattern recognises a lock-key declaration; it found ${inRegistry} in ${registryPath}`)
+  assert.ok(declarations > 0, `PRECONDITION: the walk found a declaration outside the registry to judge; it found ${declarations}`)
   assert.deepEqual(offenders, [], `declare these in lib/db/advisory-locks.ts instead:\n${offenders.join('\n')}`)
+})
+
+test('[o3d-2k5r r26] the probe namespace the registry lists is the one the prober actually takes', async () => {
+  // The registry re-exports it, so the distinctness test above is about the
+  // real value. MUTATION ROUTE: give `SESSION_LOCK_SPACE_PROBE_NAMESPACE` its
+  // own literal in `lib/db/advisory-locks.ts` instead of re-exporting. This
+  // fails the moment the two drift, which is exactly the o3d-4ajo failure
+  // (a second copy of a key that nothing compares).
+  const { SESSION_LOCK_SPACE_PROBE_NAMESPACE: fromRegistry } = await import('../../lib/db/advisory-locks.ts')
+  const { SESSION_LOCK_SPACE_PROBE_NAMESPACE: fromProber } = await import('../../lib/db/database-url-schema.mjs')
+  assert.equal(fromRegistry, fromProber)
+  assert.ok(Object.values(TWO_INT_ADVISORY_LOCK_NAMESPACES).includes(fromProber), 'and it is registered in the two-int keyspace it uses')
 })
 
 test('[o3d-4ajo] the deliberately-shared domains still share, and say so', () => {

@@ -18,6 +18,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
+import { FOLLOW_UP_OBLIGATION_OUTCOME_IS_UNKNOWN } from '@/lib/domain/accounting/follow-up-obligation-registry'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { useStepUpReauth, isFreshAuthFailure, type MaybeFreshAuthFailure } from '@/components/auth/use-step-up-reauth'
 import { replayWmsOrderPush } from '@/app/actions/wms-order-push'
@@ -226,8 +227,8 @@ export function ExceptionsClient({ data }: Props) {
       {data.wmsPushDeadLetters.length > 0 ? (
         <Card className="p-4 space-y-3">
           <SectionHeading
-            title={`WMS order pushes — dead-lettered (${data.summary.wmsPushDeadLetters})`}
-            detail="These orders never reached the warehouse (or a hold/cancel conflicted). They will not fulfil until replayed or resolved."
+            title={`WMS order pushes — blocked (${data.summary.wmsPushDeadLetters})`}
+            detail="These orders never reached the warehouse (or a hold/cancel conflicted). They will not fulfil until replayed or resolved. A payload-invalid row cannot be replayed — fix the order data and the sweep re-queues it by itself (o3d-92fu)."
             shown={data.wmsPushDeadLetters.length}
             total={data.summary.wmsPushDeadLetters}
           />
@@ -236,6 +237,7 @@ export function ExceptionsClient({ data }: Props) {
               <TableRow>
                 <TableHead>Order</TableHead>
                 <TableHead>Connector</TableHead>
+                <TableHead>Why</TableHead>
                 <TableHead>Attempts</TableHead>
                 <TableHead>Last error</TableHead>
                 <TableHead>Last attempt</TableHead>
@@ -249,19 +251,36 @@ export function ExceptionsClient({ data }: Props) {
                     <Link className="underline underline-offset-2" href={`/sales/${row.orderId}`}>{row.orderNumber ?? row.orderId}</Link>
                   </TableCell>
                   <TableCell className="text-xs">{row.connector}</TableCell>
+                  {/* o3d-2k5r r5: derived on the server from the link's evidence. "Push failed" is
+                      the one thing an AMBIGUOUS_CREATE row is not — nothing is known to have failed,
+                      and the hazard is that the create SUCCEEDED and IMS never heard. */}
+                  <TableCell className="text-xs">{row.why}</TableCell>
                   <TableCell className="text-xs">{row.attempts}</TableCell>
                   <TableCell className="text-xs text-muted-foreground max-w-[320px] truncate" title={row.lastError ?? ''}>{row.lastError ?? '—'}</TableCell>
                   <TableCell className="text-xs text-muted-foreground">{row.lastAttemptAt ? formatDateTime(row.lastAttemptAt) : '—'}</TableCell>
                   <TableCell className="text-right">
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      disabled={isPending}
-                      onClick={() => runAction(() => replayWmsOrderPush(row.orderId), `Re-queued the WMS push for ${row.orderNumber ?? row.orderId}.`)}
-                    >
-                      <RotateCcw className="h-3 w-3 mr-1" />Replay
-                    </Button>
+                    {/* o3d-2k5r r5 — THE AFFORDANCE IS THE ACTION'S OWN ANSWER (`replayable`,
+                        from `decideWmsPushReplay` on the server), never a state name read here.
+                        This condition used to be `state === 'VALIDATION_FAILED'`, which meant every
+                        other blocked state got a button — including an AMBIGUOUS_CREATE row on a
+                        connector whose create cannot be repeated safely, which `replayWmsOrderPush`
+                        refuses every single time and which the docs already promised had no button.
+                        Where there is no button there is the
+                        manual reconciliation instead, so the row still tells the operator what to
+                        do. */}
+                    {row.replayable ? (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        disabled={isPending}
+                        onClick={() => runAction(() => replayWmsOrderPush(row.orderId), `Re-queued the WMS push for ${row.orderNumber ?? row.orderId}.`)}
+                      >
+                        <RotateCcw className="h-3 w-3 mr-1" />Replay
+                      </Button>
+                    ) : (
+                      <span className="text-xs text-muted-foreground block text-left whitespace-normal">{row.replayRefusal}</span>
+                    )}
                   </TableCell>
                 </TableRow>
               ))}
@@ -758,7 +777,10 @@ export function ExceptionsClient({ data }: Props) {
                   <TableCell className="text-xs text-muted-foreground max-w-[320px] truncate" title={row.detail ?? ''}>{row.detail ?? '—'}</TableCell>
                   <TableCell className="text-xs text-muted-foreground">{row.foundAt ? formatDateTime(row.foundAt) : '—'}</TableCell>
                   <TableCell className="text-right">
-                    {row.category === 'MISSING_IN_WMS' ? (
+                    {/* o3d-2k5r r5: `repushable` is `decideWmsMissingRepush` — the same call the
+                        action refuses on. A connector whose create does not refuse a duplicate gets
+                        the reconciliation guidance rather than a button that cannot be pressed. */}
+                    {row.repushable ? (
                       <Button
                         type="button"
                         variant="outline"
@@ -768,6 +790,8 @@ export function ExceptionsClient({ data }: Props) {
                       >
                         <RotateCcw className="h-3 w-3 mr-1" />Re-push
                       </Button>
+                    ) : row.repushRefusal ? (
+                      <span className="text-xs text-muted-foreground block text-left whitespace-normal">{row.repushRefusal}</span>
                     ) : null}
                   </TableCell>
                 </TableRow>
@@ -813,6 +837,59 @@ export function ExceptionsClient({ data }: Props) {
                       <CheckCircle2 className="h-3 w-3 mr-1" />Clear
                     </Button>
                   </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </Card>
+      ) : null}
+
+      {data.accountingFollowUpObligations.length > 0 ? (
+        <Card className="p-4 space-y-3">
+          <SectionHeading
+            title={`Accounting follow-ups owed, with nothing to re-drive them (${data.summary.accountingFollowUpObligations})`}
+            /*
+             * RENDERED FROM THE REGISTRY, NOT RESTATED (o3d-0bfh r9, Codex HIGH).
+             *
+             * This prop used to hold its own paragraph, and that paragraph still ended "create only
+             * what is verifiably absent" three rounds after the registry remedy stopped saying it.
+             * One rule with two authors: correcting the registry protected nobody, because THIS is
+             * the sentence an operator reads. A payment can be PENDING in the local queue while
+             * QuickBooks shows none — INVOICE_PAYMENT is enqueued before INVOICE_PDF, in separate
+             * transactions — so an operator who creates on a clean read races the queued row, and a
+             * second payment against an invoice is not undoable.
+             *
+             * There is now no second copy to go stale: the section text IS the registry's own
+             * string, and each row's cell below carries that connector's own `operatorRemedy`, also
+             * straight from the registry via `describeFollowUpObligationBacklogRow`. No operator
+             * instruction is authored in this file at all, and
+             * tests/accounting/follow-up-recovery-registry.test.ts scans this file to keep it that
+             * way.
+             */
+            detail={FOLLOW_UP_OBLIGATION_OUTCOME_IS_UNKNOWN}
+            shown={data.accountingFollowUpObligations.length}
+            total={data.summary.accountingFollowUpObligations}
+          />
+          <Table containerClassName="rounded-lg border" className="min-w-[860px]">
+            <TableHeader className="bg-muted/40">
+              <TableRow>
+                <TableHead>Connector</TableHead>
+                <TableHead>Document</TableHead>
+                <TableHead>Reference</TableHead>
+                <TableHead>External id</TableHead>
+                <TableHead>Owed since</TableHead>
+                <TableHead>Why nothing re-drives it</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {data.accountingFollowUpObligations.map((row) => (
+                <TableRow key={row.id}>
+                  <TableCell className="text-xs">{row.connector}</TableCell>
+                  <TableCell className="text-xs">{row.type} <span className="text-muted-foreground">({row.status})</span></TableCell>
+                  <TableCell className="text-xs font-mono">{row.referenceType}/{row.referenceId}</TableCell>
+                  <TableCell className="text-xs font-mono">{row.externalTransactionId ?? '—'}</TableCell>
+                  <TableCell className="text-xs">{row.owedSince ? new Date(row.owedSince).toLocaleString() : '—'}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground">{row.blockedBy} — {row.operatorRemedy}</TableCell>
                 </TableRow>
               ))}
             </TableBody>

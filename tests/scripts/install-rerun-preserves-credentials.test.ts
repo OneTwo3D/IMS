@@ -43,6 +43,63 @@ function renderOnPty(command: string): Promise<string> {
 
 const SCRIPT = 'scripts/install.sh'
 
+/**
+ * WHERE THE `.env` WRITE BEGINS, IN EITHER SHAPE OF THE SCRIPT (o3d-2sm1.5 r38).
+ *
+ * The heredoc used to be four straight-line statements; r38 wrapped it in write_app_env_file() so
+ * that a credential rotation performed after the stop can re-write the file install.sh owns
+ * instead of reading a file the application account owns. These two helpers keep this rig bounded
+ * by lines that exist in BOTH shapes — which is the property the slicing here is built on, so that
+ * reverting the change under test runs the OLD code and this file fails on what the second run
+ * PRODUCED rather than on a marker that moved.
+ */
+function envWriteStartMarker(source: string): string {
+  // r39 split the writer in two: render_app_env_file() holds the heredoc and write_app_env_file()
+  // publishes its output durably. The RENDER is what this file is about, and it is the earlier of
+  // the two, so it is the boundary the preceding slice must stop at.
+  if (source.includes('render_app_env_file() {')) return 'render_app_env_file() {'
+  return source.includes('write_app_env_file() {') ? 'write_app_env_file() {' : 'cat > "${APP_DIR}/.env"'
+}
+
+/**
+ * The write itself: the shipped renderer plus a redirect, the shipped function plus its call, or
+ * the bare statements that preceded either.
+ *
+ * WHAT THIS RIG IS ABOUT IS THE CONTENT, and it says so in three shapes of the script. r38 wrapped
+ * the heredoc in write_app_env_file(); r39 (Codex HIGH) split THAT into render_app_env_file(),
+ * which produces the bytes from held variables, and write_app_env_file(), which publishes them by
+ * rename with ownership and mode applied before the rename. Ownership is exactly what this rig
+ * cannot exercise — it runs as an ordinary user with no APP_USER to give a file to — so it takes
+ * the renderer and redirects it, the same way the pre-r38 slice dropped the chown/chmod pair.
+ *
+ * The publication half is asserted where it can be: install-credential-representation.test.ts
+ * proves the rename by hard link and asserts the mode, and install-credential-preservation.test.ts
+ * checks the mode after a rotation.
+ */
+function envWriteBlock(source: string): string {
+  const rendered = sliceOptionalBlock(source, 'render_app_env_file() {')
+  if (rendered !== null) return `${rendered}\nrender_app_env_file > "\${APP_DIR}/.env"`
+  const wrapped = sliceOptionalBlock(source, 'write_app_env_file() {')
+  if (wrapped !== null) {
+    const body = wrapped.split('\n').filter((line) => !/^\s*(chown|chmod) /.test(line))
+    return `${body.join('\n')}\nwrite_app_env_file`
+  }
+  return sliceRange(source, 'cat > "${APP_DIR}/.env" <<EOF', 'chown "${APP_USER}:${APP_USER}" "${APP_DIR}/.env"')
+}
+
+/**
+ * THE SENTINEL AND THE CAPTURE PRIMITIVE, OPTIONALLY (o3d-2sm1.5 r40, Codex HIGH).
+ *
+ * The Redis recovery this file exercises now reads its userinfo through the shipped `capture`,
+ * because command substitution deletes a trailing newline out of a credential. Both are lifted
+ * OPTIONALLY, like every other slice here: reverting r40 removes them from install.sh and this rig
+ * then runs the old code and fails on what the second run PRODUCED, which is the property the
+ * slicing is built on.
+ */
+function captureTerminatorAssignment(source: string): string {
+  return /^CAPTURE_TERMINATOR=.*$/m.exec(source)?.[0] ?? ''
+}
+
 async function readScript(): Promise<string> {
   return readFile(path.join(SCRIPT), 'utf8')
 }
@@ -98,6 +155,8 @@ async function runInstallerCapturing(
     DATABASE_URL=postgresql://imsuser:pw@localhost:5432/one_two_inventory
     ${UNRELATED_VARS.map((name) => `${name}=''`).join('\n    ')}
     ${hasEnvTable ? 'declare -A EXISTING_ENV=()' : ''}
+    ${captureTerminatorAssignment(source)}
+    ${sliceOptionalBlock(source, 'capture() {') ?? ''}
     ${sliceOptionalBlock(source, 'urlencode() {') ?? ''}
     ${sliceOptionalBlock(source, 'urldecode() {') ?? ''}
     ${sliceOptionalBlock(source, 'mask_secret() {') ?? ''}
@@ -112,8 +171,8 @@ async function runInstallerCapturing(
     ${source.includes('\nload_existing_env "${APP_DIR}/.env"') ? 'load_existing_env "${APP_DIR}/.env"' : ''}
     ${env}
     ${sliceRange(source, 'prompt_yn INSTALL_REDIS', 'info "--- WooCommerce')}
-    ${sliceRange(source, 'AUTH_SECRET=', 'cat > "${APP_DIR}/.env"')}
-    ${sliceRange(source, 'cat > "${APP_DIR}/.env" <<EOF', 'chown "${APP_USER}:${APP_USER}" "${APP_DIR}/.env"')}
+    ${sliceRange(source, 'AUTH_SECRET=', envWriteStartMarker(source))}
+    ${envWriteBlock(source)}
   `
   const { stderr } = await execFileAsync('bash', ['-c', script])
   return { values: parseEnvFile(await readFile(path.join(appDir, '.env'), 'utf8')), stderr }
@@ -304,6 +363,8 @@ test('a preserved credential is never echoed as a prompt default', async () => {
       die() { echo "DIE: $*" >&2; exit 9; }
       APP_DIR=${JSON.stringify(appDir)}
       ${source.includes('declare -A EXISTING_ENV=()') ? 'declare -A EXISTING_ENV=()' : ''}
+      ${captureTerminatorAssignment(source)}
+      ${sliceOptionalBlock(source, 'capture() {') ?? ''}
       ${sliceOptionalBlock(source, 'urlencode() {') ?? ''}
       ${sliceOptionalBlock(source, 'urldecode() {') ?? ''}
       ${sliceOptionalBlock(source, 'mask_secret() {') ?? ''}
