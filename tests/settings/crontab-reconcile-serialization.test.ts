@@ -2963,6 +2963,24 @@ test('[o3d-batch-ret] MUTATION: with the failure suppressed, every one of those 
     assert.match(run.stdout, /^RESOLVED present=false$/m,
       `without the diagnostic rule, \`${mode}\` reports an absent crontab:\n${run.stdout}${run.stderr}`)
   }
+
+  // AND THE OTHER WAY, because a fix that trades one failure for another is not a fix. With the
+  // absence rule removed entirely — "any non-zero exit is a failure" — a fresh box, which has no
+  // crontab at all and says so, becomes an unresolved read and every fence stops on it.
+  const refuseEverything = libraryWith([[
+    '  if [[ -z "${out}" ]] && crontab_read_says_no_crontab "${user}" "${err}"; then',
+    '  if false; then',
+  ]])
+  const absent = await sh([
+    'set -uo pipefail',
+    `PATH='${FAULT_BIN}':"$PATH"`,
+    'die(){ echo "DIE: $*" >&2; exit 9; }',
+    `source '${refuseEverything}'`,
+    "export FAKE_CRONTAB_READ='absent'",
+    'if read_crontab_for appuser; then echo "RESOLVED present=${CRONTAB_READ_PRESENT}"; else echo UNRESOLVED; fi',
+  ].join('\n'))
+  assert.match(absent.stdout, /^UNRESOLVED$/m,
+    `without the absence rule a box with no crontab cannot be read at all:\n${absent.stdout}${absent.stderr}`)
 })
 
 for (const [where, src, user] of FAULT_ENTRYPOINTS) {
@@ -3274,6 +3292,21 @@ crontab_unmanaged_lines_missing_from() {
     `and says nothing is missing while the job now runs in a different timezone:\n${reordered.stdout}`)
 })
 
+/** Every crontab read in <src> whose own failure is suppressed. The rule, as a function. */
+function suppressedCrontabReadsIn(name: string, src: string): string[] {
+  const faults: string[] = []
+  src.split('\n').forEach((line, i) => {
+    if (/^\s*#/.test(line)) return
+    if (!/\bcrontab\b.*\s-l\b/.test(line)) return
+    if (/2>\/dev\/null/.test(line)) {
+      faults.push(`${name}:${i + 1} reads the crontab with its diagnostic discarded: ${line.trim()}`)
+    } else if (/\|\|\s*(true|:)\b/.test(line)) {
+      faults.push(`${name}:${i + 1} reads the crontab with its failure suppressed: ${line.trim()}`)
+    }
+  })
+  return faults
+}
+
 test('[o3d-batch-ret] no entrypoint reads the crontab without going through the one reader', () => {
   const faults: string[] = []
   let reads = 0
@@ -3282,14 +3315,21 @@ test('[o3d-batch-ret] no entrypoint reads the crontab without going through the 
     reads += calls.length
     assert.ok(calls.length >= 5,
       `${name} must route its crontab reads through read_crontab_for (found ${calls.length})`)
-    src.split('\n').forEach((line, i) => {
-      if (/^\s*#/.test(line)) return
-      if (/crontab\b[^"']*-l\b[^"']*2>\/dev\/null/.test(line)) {
-        faults.push(`${name}:${i + 1} reads the crontab with its diagnostic discarded: ${line.trim()}`)
-      }
-    })
+    faults.push(...suppressedCrontabReadsIn(name, src))
   }
   assert.deepEqual(faults, [], faults.join('\n'))
+
+  // MUTATION, against the same rule: each way of putting one back is rejected, so the clean result
+  // above is the rule working rather than a regex that matches nothing.
+  for (const [what, snippet] of [
+    ['the fence read', '  current="$(crontab -u "${APP_USER}" -l 2>/dev/null || true)"'],
+    ['a piped read', '  if crontab -u "${APP_USER}" -l 2>/dev/null | grep -q foo; then :; fi'],
+    ['a read whose only suppression is `|| true`', '  current="$(crontab -u "${APP_USER}" -l || true)"'],
+    ['a brace-grouped read', '  { crontab -u "${APP_USER}" -l 2>/dev/null || true; } | awk "{print}"'],
+  ] as Array<[string, string]>) {
+    assert.notDeepEqual(suppressedCrontabReadsIn('scripts/install.sh', `${INSTALL_SH}\n${snippet}\n`), [],
+      `the sweep must reject ${what}`)
+  }
   // NOT VACUOUS: the walk really did reach the reads it is a rule about.
   assert.ok(reads >= 15, `the sweep must have found the shipped reads, and found ${reads}`)
   assert.match(CRONTAB_LOCK_LIB_SRC, /^read_crontab_for\(\) \{$/m,
