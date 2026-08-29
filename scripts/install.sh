@@ -7109,11 +7109,17 @@ process_is_in_cgroup() {
 # The process's OWN view of its environment. Prints the raw STATE_DIRECTORY value (empty when the
 # process has none); returns non-zero only when the environment could not be read at all, so the
 # caller can tell "no such variable" from "no such answer".
+#
+# `awk` WITH A FLAG RATHER THAN `sed | head -1`. This script runs under `set -o pipefail`, and a
+# `head` that closes the pipe after the first line SIGPIPEs the writer behind it — which makes the
+# pipeline's status 141 on a large environment and 0 on a small one, i.e. an unreadable-environ
+# refusal that depends on how many variables the service happens to have. awk consumes the whole
+# stream and prints at most one line, so the status is the same either way.
 effective_state_directory() {
   local pid="$1"
   [[ -r "/proc/${pid}/environ" ]] || return 1
   tr '\0' '\n' < "/proc/${pid}/environ" 2>/dev/null \
-    | sed -n 's/^STATE_DIRECTORY=//p' | head -1
+    | awk 'found { next } /^STATE_DIRECTORY=/ { sub(/^STATE_DIRECTORY=/, ""); print; found = 1 }'
 }
 
 LISTENER_PROOF_REASON=""

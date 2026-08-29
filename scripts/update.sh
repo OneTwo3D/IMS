@@ -4005,6 +4005,12 @@ if ! $DRY_RUN && [[ -n "${APP_PORT:-}" ]] && command -v ss >/dev/null 2>&1; then
     die "Port ${APP_PORT} is still bound after ${SERVICE_UNIT} was stopped. Something is still serving — refusing to fence the crontab or migrate while it can write. (ss -ltnp | grep :${APP_PORT})"
   fi
   success "Nothing is listening on :${APP_PORT} any more."
+elif ! $DRY_RUN; then
+  # SAID, NOT SWALLOWED. Without `ss` (or without a resolved port) the premise the cron fence
+  # below rests on is `systemctl stop` returning, and nothing here can see a listener that was
+  # never the unit's. That is a weaker claim than the one the comment above makes, so the run
+  # says which one it is actually making rather than printing nothing.
+  warn "Cannot check :${APP_PORT:-<unresolved>} — ${APP_PORT:+ss is not installed}${APP_PORT:-the port could not be resolved}. \"Nothing is serving\" rests on ${SERVICE_UNIT} having stopped, and a listener that was never this unit's would not be seen."
 fi
 
 # ---------------------------------------------------------------------------
