@@ -483,7 +483,14 @@ test('r13 — the PULL route refuses an order whose currency WooCommerce omitted
 
 test('r13 — a currency key present but EMPTY is the same refusal, told apart in the record', async () => {
   // A blank string is the value the `|| 'GBP'` default was most likely to swallow, since it is
-  // falsy and typed `string`. MUTATION: widen the reader to `stated !== undefined` and this fails.
+  // falsy and typed `string`.
+  //
+  // MUTATIONS, both verified to kill this: restoring `wcOrder.currency || 'GBP'` and dropping the
+  // gate (the pre-r13 shape); and dropping `currency: statedCurrency` from the recorded queue
+  // payload, which leaves the refusal correct but makes it unfixable — an operator cannot repair a
+  // field without being told what IMS read in it. Note that widening the READER to
+  // `stated !== undefined` does NOT kill it: an empty string is still falsy at the gate, so that
+  // mutation is caught by the malformed-code case below rather than here.
   reset()
 
   const result = await importOrder(wcOrder(221, 'processing', ''))
