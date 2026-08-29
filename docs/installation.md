@@ -522,19 +522,35 @@ that account** before it writes any environment file or starts anything.
 ##### What the file may contain
 
 The installer does not copy the bytes it is given. It **parses** them, and it publishes only what it
-parsed. A trust root is a bundle of PEM `CERTIFICATE` blocks and nothing else — that is all
-node-postgres, libpq and `psql` read out of the file `DB_SSLROOTCERT` names, and a revocation list
-is a different parameter (`sslcrl`) against a different store — so that is the whole accept-list.
-Every block is decoded with `openssl x509`, and what is written out is OpenSSL's own re-encoding of
-the certificates it decoded:
+parsed. A trust root is a bundle of PEM certificate blocks and nothing else, and the accepted labels
+are exactly the three the OpenSSL verification store behind all three readers of this file consumes:
 
-- a `PRIVATE KEY` block, of any flavour, is **refused** — as is any other label;
+```
+CERTIFICATE        X509 CERTIFICATE        TRUSTED CERTIFICATE
+```
+
+That set was **measured, not assumed**: every PEM label OpenSSL defines a constant for was wrapped
+around one real CA and offered to `openssl verify -CAfile`, to a Node TLS client and to `libpq`.
+Three of them are consumed; the store skips every other label as if it were not in the file. (A
+revocation list is a different parameter, `sslcrl`, against a different store.) Every block is
+decoded with `openssl x509`, and what is written out is OpenSSL's own re-encoding of the
+certificates it decoded:
+
+- a `PRIVATE KEY` block, of any flavour, is **refused** — as is any label outside the three above;
 - a combined key-and-certificate file is **refused**, and nothing is written, not even the
   certificates that came before the key;
-- a block *labelled* `CERTIFICATE` that is not one is **refused**, because the label is not evidence;
+- a block *labelled* as a certificate that is not one is **refused**, because the label is not
+  evidence;
 - a file with no certificate in it at all is **refused**;
 - the subject/issuer commentary many vendor bundles carry around their certificates is simply
   dropped, because it is not published.
+
+**`TRUSTED CERTIFICATE` blocks keep their trust settings.** The X509_AUX block such a certificate
+carries (`openssl x509 -addtrust`/`-addreject`) *narrows* what the anchor may vouch for, and all
+three readers enforce it. Re-encoding it as a plain `CERTIFICATE` would silently install a **wider**
+trust root than you supplied, so the installer re-encodes it with `-trustout` and refuses to publish
+if the result is not still a trusted block. A restricted anchor is byte-identical after publication,
+and still refuses exactly what it refused before.
 
 This matters because the installer runs as **root** and the published file is **world-readable**: a
 mistyped `DB_SSLROOTCERT` naming a private key would otherwise disclose it to every account on the
@@ -573,6 +589,13 @@ republishing it lands on its own path again. At the **end of a successful instal
 failure — the installer removes superseded generations, keeping the one this run published, the one
 the previous environment file named (whatever its age: that is the rollback target), and the three
 most recently written of the rest. Each removal is printed.
+
+**Only files the installer itself wrote are ever removed.** A generation is recognised by its exact
+name — `db-ca-` followed by 64 lowercase hex characters and `.crt` — *and* by re-hashing the file to
+check it really holds the bytes that name claims. Anything else in `/etc/ims-db-ca` is neither
+deleted nor counted against the retention window, including files whose names look close: a
+`db-ca-manual.crt` you put there yourself, or a copy restored under a generation's name whose
+contents no longer match it. Both survive every prune, however old they are.
 
 The postmaster-identity read performed just after `CREATE DATABASE` is the one credential-bearing
 connection deliberately **left unpinned**. What it concludes — that the server answering

@@ -13,6 +13,7 @@ import { execFileSync, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { chmodSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import tls from 'node:tls'
 
 import pg from 'pg'
 
@@ -636,8 +637,15 @@ export function writeCertificate(path: string, commonName: string): string {
  * published bytes are the NORMALISED ones. The `db-ca-`/`.crt` halves are read out of install.sh
  * for the same reason the shell rig lifts them.
  */
-export function caGenerationPath(publishDir: string, caFile: string): string {
-  const normalized = execFileSync('openssl', ['x509', '-inform', 'PEM', '-outform', 'PEM', '-in', caFile], {
+export function caGenerationPath(publishDir: string, caFile: string, trusted = false): string {
+  const normalized = execFileSync('openssl', [
+    'x509', '-inform', 'PEM', '-outform', 'PEM', '-in', caFile,
+    // r48: the re-encoding a `TRUSTED CERTIFICATE` block gets, because it is a DIFFERENT one — it
+    // keeps the X509_AUX trust and reject OIDs, so it produces different bytes and a different
+    // generation from the same certificate stripped of them. A helper that always used the plain
+    // form would compute the digest of the anchor the publisher must NOT write.
+    ...(trusted ? ['-trustout'] : []),
+  ], {
     stdio: ['ignore', 'pipe', 'pipe'],
   })
   const digest = createHash('sha256').update(normalized).digest('hex')
@@ -645,4 +653,119 @@ export function caGenerationPath(publishDir: string, caFile: string): string {
   const suffix = /^DB_CA_GENERATION_SUFFIX="([^"]*)"$/m.exec(INSTALL_SOURCE)
   assert.ok(prefix && suffix, 'precondition: scripts/install.sh must spell the generation name in two literals')
   return join(publishDir, `${prefix[1]}${digest}${suffix[1]}`)
+}
+
+/**
+ * EVERY PEM LABEL OpenSSL 3.x DEFINES A `PEM_STRING_*` CONSTANT FOR (o3d-2sm1.5 r48, Codex MEDIUM).
+ *
+ * This list is the SEARCH SPACE, not the answer. r47 arrived at its accept-list by argument and was
+ * two labels short; r48 arrives at it by asking the readers, and this is what they are asked about.
+ * It is complete over the strings the readers can possibly match, because the OpenSSL store's
+ * `check_pem()` decides acceptance by `strcmp` against `PEM_STRING_*` constants and nothing else —
+ * so a label outside this list cannot be accepted by any arm of it.
+ *
+ * The last three are deliberate near-misses that are NOT OpenSSL constants: two labels from other
+ * ecosystems and one lowercase spelling of an accepted label. They exist so the sweep can show the
+ * gate refusing something the readers also refuse, rather than only agreeing on the easy cases.
+ */
+export const OPENSSL_PEM_LABELS: readonly string[] = [
+  'CERTIFICATE',
+  'X509 CERTIFICATE',
+  'TRUSTED CERTIFICATE',
+  'CERTIFICATE PAIR',
+  'CERTIFICATE REQUEST',
+  'NEW CERTIFICATE REQUEST',
+  'X509 CRL',
+  'PKCS7',
+  'PKCS #7 SIGNED DATA',
+  'CMS',
+  'PUBLIC KEY',
+  'RSA PUBLIC KEY',
+  'DSA PUBLIC KEY',
+  'ECDSA PUBLIC KEY',
+  'ANY PRIVATE KEY',
+  'PRIVATE KEY',
+  'ENCRYPTED PRIVATE KEY',
+  'RSA PRIVATE KEY',
+  'DSA PRIVATE KEY',
+  'EC PRIVATE KEY',
+  'DH PARAMETERS',
+  'X9.42 DH PARAMETERS',
+  'DSA PARAMETERS',
+  'EC PARAMETERS',
+  'SM2 PARAMETERS',
+  'PARAMETERS',
+  'SSL SESSION PARAMETERS',
+  'ATTRIBUTE CERTIFICATE',
+  'PKCS12',
+  'CERT',
+  'certificate',
+]
+
+/** The same DER, re-armoured under `label`. The base64 payload is untouched. */
+export function relabelPem(pem: string, label: string): string {
+  const body = pem
+    .split('\n')
+    .filter((line) => !line.startsWith('-----'))
+    .join('\n')
+    .trim()
+  return `-----BEGIN ${label}-----\n${body}\n-----END ${label}-----\n`
+}
+
+/**
+ * DOES THE SHARED OpenSSL VERIFICATION STORE CONSUME THIS FILE AS A TRUST ANCHOR?
+ *
+ * `openssl verify -CAfile` is the store itself: `-CAfile` reaches `X509_STORE_load_locations()`,
+ * which is what `SSL_CTX_load_verify_locations()` — libpq's call, and Node's — ends in. A label the
+ * store skips leaves the anchor absent and the verification fails, which is the observation.
+ */
+export function opensslVerifies(caFile: string, certFile: string, purpose?: string): boolean {
+  try {
+    execFileSync('openssl', [
+      'verify', ...(purpose === undefined ? [] : ['-purpose', purpose]), '-CAfile', caFile, certFile,
+    ], { stdio: 'pipe' })
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * WHAT NODE'S TLS MAKES OF THE SAME FILE — the reader node-postgres is, since `ssl.ca` goes straight
+ * to `tls.connect()`.
+ *
+ * A REAL HANDSHAKE, against a server presenting `serverCert`, rather than a call to
+ * `createSecureContext()` that would only prove the string was accepted syntactically. Hostname
+ * verification is disabled ON PURPOSE: the subject under test is the CHAIN and the anchor's purpose
+ * restrictions, and a certificate that failed on its CN would report the same failure for both.
+ *
+ * Returns `AUTHORIZED` or `ERROR=<code>`, so a purpose refusal (`INVALID_PURPOSE`) is distinguishable
+ * from an absent anchor (`UNABLE_TO_VERIFY_LEAF_SIGNATURE`) — the two are the whole difference
+ * between "the label was consumed" and "the restriction was kept".
+ */
+export async function nodeTlsVerdict(caPem: string, serverKey: string, serverCert: string): Promise<string> {
+  const server = tls.createServer({ key: serverKey, cert: serverCert }, (socket) => socket.end('ok'))
+  try {
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const address = server.address()
+    assert.ok(address !== null && typeof address !== 'string', 'precondition: the probe server must have a port')
+    return await new Promise<string>((resolve) => {
+      const socket = tls.connect(
+        {
+          port: address.port,
+          host: '127.0.0.1',
+          ca: caPem,
+          rejectUnauthorized: true,
+          checkServerIdentity: () => undefined,
+        },
+        () => {
+          resolve(socket.authorized ? 'AUTHORIZED' : `ERROR=${socket.authorizationError}`)
+          socket.destroy()
+        },
+      )
+      socket.on('error', (error: NodeJS.ErrnoException) => resolve(`ERROR=${error.code ?? error.message}`))
+    })
+  } finally {
+    server.close()
+  }
 }

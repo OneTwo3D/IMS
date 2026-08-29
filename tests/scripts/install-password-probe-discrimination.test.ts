@@ -42,7 +42,9 @@ import { dirname, join, resolve } from 'node:path'
 import test from 'node:test'
 
 import {
+  INSTALL_SOURCE,
   NEXT_RUN_BODY,
+  OPENSSL_PEM_LABELS,
   REINSTALL_BODY,
   REPO,
   SHIPPED_ROTATION_UP_TO_THE_CLEAR,
@@ -52,13 +54,44 @@ import {
   envDatabaseUrl,
   installVars,
   journalValue,
+  nodeTlsVerdict,
+  opensslVerifies,
   readVar,
+  relabelPem,
   runShipped,
   seedLiveInstallation,
   writeCertificate,
   writeInstalledEnv,
 } from './install-shell-rig.ts'
 import { type Cluster, cleanLibpqEnv, currentUser, freePort, pgBinDir, startCluster } from './real-postgres-cluster.ts'
+
+/**
+ * WHAT libpq MAKES OF A TRUST ROOT (o3d-2sm1.5 r48, Codex MEDIUM).
+ *
+ * The third reader of `DB_SSLROOTCERT`, and the one the installer's own credential probes are: psql
+ * IS libpq. `sslmode=verify-full` is what the installations under test use, so the anchor is asked
+ * for exactly what production asks it for. The cluster's `pg_hba` says `trust` on this host record,
+ * so a connection that gets as far as authentication has already VERIFIED the chain — which makes
+ * `CONNECTED` an unambiguous statement about TLS and not about a password.
+ */
+function psqlSslVerdict(cluster: Cluster, caFile: string): string {
+  const conninfo = [
+    'host=127.0.0.1',
+    `port=${cluster.port}`,
+    'dbname=postgres',
+    `user=${currentUser()}`,
+    'sslmode=verify-full',
+    `sslrootcert=${caFile}`,
+  ].join(' ')
+  try {
+    execFileSync('psql', ['-X', '-w', '-q', '-tA', '-v', 'ON_ERROR_STOP=1', '-c', 'select 1', conninfo], {
+      encoding: 'utf8', env: cleanLibpqEnv(), stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    return 'CONNECTED'
+  } catch {
+    return 'REFUSED'
+  }
+}
 import { sliceRange } from './redis-url-wire-harness.ts'
 import { type RadiusVerifier, radiusHbaLine, startRadiusVerifier } from './radius-verifier.ts'
 
@@ -3438,10 +3471,23 @@ test('r47: a prune keeps this run’s generation, the previous installation’s,
   //         generations and the assertion names exactly which.
   //   M4 -- glob `*` instead of `${DB_CA_GENERATION_PREFIX}*${DB_CA_GENERATION_SUFFIX}`: SURVIVORS
   //         fails, and NOT the way it reads. BYSTANDERS_KEPT still passes — the publisher's own
-  //         dot-prefixed temporary and the operator's file are the NEWEST things in the directory,
-  //         so they sit inside the retention window and are kept. What they do is CONSUME it:
-  //         three real generations are removed instead of one. A prune that counts files it does
-  //         not understand silently shortens the retention it advertises.
+  //         dot-prefixed temporary and the operator's `README` are the NEWEST things in the
+  //         directory, so they sit inside the retention window and are kept. What they do is
+  //         CONSUME it: three real generations are removed instead of one. A prune that counts files
+  //         it does not understand silently shortens the retention it advertises.
+  //   M5 -- r48 (Codex MEDIUM): revert to the r47 selector, the `db-ca-*.crt` glob alone — delete
+  //         BOTH the `db_ca_generation_digest() || continue` line and the re-hash after it.
+  //         OPERATOR_FILE_KEPT fails: `db-ca-manual.crt` is an old file matching the glob, so it is
+  //         counted as a generation and REMOVED. That is an operator's own CA file, possibly still
+  //         named by another consumer, deleted by a run that promises not to touch it. The r47 test
+  //         could not reach this: its only bystanders were `README` and a dot-prefixed temporary,
+  //         neither of which the glob matched, so the glob's width was invisible to it.
+  //   M6 -- r48: keep the name test and delete ONLY the re-hash
+  //         (`[[ "$(file_sha256 ...)" == "${named}" ]] || continue`). OPERATOR_FILE_KEPT now passes
+  //         and IMPOSTOR_KEPT fails: a file whose NAME is generation-shaped but whose BYTES hash to
+  //         something else — a restored backup, a hand-edited bundle, a copy made under a
+  //         generation's name — is deleted. The name is a claim; content-addressing exists so that
+  //         the claim can be checked, and this is the one place on the CA path that deletes.
   const root = mkdtempSync(join(tmpdir(), 'ims-r47-prune-'))
   chmodSync(root, 0o755)
   try {
@@ -3457,6 +3503,18 @@ test('r47: a prune keeps this run’s generation, the previous installation’s,
     const generations = cas.map((ca) => caGenerationPath(publishDir, ca))
     assert.equal(new Set(generations).size, 6, 'precondition: six certificates must produce six generations')
 
+    // A SEVENTH real certificate, which is the operator's own — never published by this installer,
+    // and copied into the directory under two names the prune must refuse for two different
+    // reasons: one whose basename is not a digest, one whose basename is a digest that is not its
+    // own. Both are real PEM, because a bystander that is not a certificate would be refused by the
+    // publisher and would tell us nothing about a prune that never parses anything.
+    const operatorCa = join(root, 'operator-ca.pem')
+    writeCertificate(operatorCa, 'r48-operator-ca')
+    const operatorFile = join(publishDir, 'db-ca-manual.crt')
+    const impostorFile = join(publishDir, `db-ca-${'a'.repeat(64)}.crt`)
+    assert.notEqual(caGenerationPath(publishDir, operatorCa), impostorFile,
+      'precondition: the impostor\u2019s name must NOT be the digest of its own bytes, or the re-hash has nothing to catch')
+
     const run = runShipped(
       { APP_DIR: root, APP_USER: currentUser(), DB_CA_PUBLISH_DIR: publishDir },
       `
@@ -3465,10 +3523,25 @@ test('r47: a prune keeps this run’s generation, the previous installation’s,
         # made the OLDEST so its exemption is load-bearing rather than true by accident.
         ${generations.map((gen, i) => `touch -d "2026-01-0${i + 1}T00:00:00Z" ${JSON.stringify(gen)}`).join('\n        ')}
 
-        # Two files a prune must not touch: the publisher's own dot-prefixed temporary shape, and
-        # something an operator left in the directory.
+        # Four files a prune must not touch, and their ages are the point: each is OLDER than every
+        # generation above, so a prune that counted them would delete them outright rather than
+        # merely letting them consume the retention window.
+        #
+        #   .db-ca-candidate.abc123  the publisher's own temporary shape
+        #   README                   something an operator left in the directory
+        #   db-ca-manual.crt         AN OPERATOR'S OWN CA FILE, WHICH THE GENERATION GLOB MATCHES
+        #   db-ca-<64 hex>.crt       generation-SHAPED, but its bytes are not that digest
+        #
+        # The third is the r48 finding (Codex MEDIUM): the db-ca-*.crt glob matches the name an
+        # operator reaches for, and the prune DELETES. The fourth is the half a name check alone
+        # cannot reach.
         : > ${JSON.stringify(join(publishDir, '.db-ca-candidate.abc123'))}
         : > ${JSON.stringify(join(publishDir, 'README'))}
+        cp ${JSON.stringify(operatorCa)} ${JSON.stringify(operatorFile)}
+        cp ${JSON.stringify(operatorCa)} ${JSON.stringify(impostorFile)}
+        touch -d "2025-01-01T00:00:00Z" ${JSON.stringify(join(publishDir, '.db-ca-candidate.abc123'))} \
+          ${JSON.stringify(join(publishDir, 'README'))} \
+          ${JSON.stringify(operatorFile)} ${JSON.stringify(impostorFile)}
 
         # WHAT THE PREVIOUS INSTALLATION WAS USING, read the way prune_db_ca_generations() reads it:
         # out of the environment file as it was when this run started.
@@ -3479,6 +3552,8 @@ test('r47: a prune keeps this run’s generation, the previous installation’s,
         prune_db_ca_generations
         echo "SURVIVORS=$(ls -1 ${JSON.stringify(publishDir)} | sort | tr '\\n' ' ')"
         echo "BYSTANDERS=$(ls -1A ${JSON.stringify(publishDir)} | grep -c -e '^\\.db-ca-candidate' -e '^README' || true)"
+        echo "OPERATOR_FILE=$([[ -f ${JSON.stringify(operatorFile)} ]] && echo present || echo GONE)"
+        echo "IMPOSTOR=$([[ -f ${JSON.stringify(impostorFile)} ]] && echo present || echo GONE)"
       `,
     )
 
@@ -3496,13 +3571,302 @@ test('r47: a prune keeps this run’s generation, the previous installation’s,
       `PREVIOUS_KEPT: and so does the one the previous environment file named — that is the rollback target:\n${run.output}`)
     assert.ok(!survivors.includes(name(generations[2])),
       `PRUNED: while the oldest unreferenced generation beyond the retention count is removed, or the prune does nothing:\n${run.output}`)
+    assert.equal(readVar(run.output, 'OPERATOR_FILE'), 'present',
+      `OPERATOR_FILE_KEPT: db-ca-manual.crt matches the generation GLOB and is older than everything else in the directory, and it is still an operator's file — the prune must decide by the generation NAME (64 lowercase hex) and not by a wildcard:\n${run.output}`)
+    assert.equal(readVar(run.output, 'IMPOSTOR'), 'present',
+      `IMPOSTOR_KEPT: and a file whose name is generation-shaped but whose bytes hash to something else was not written by this publisher — the name is a claim, and the prune re-checks it before deleting:\n${run.output}`)
     assert.deepEqual(
       survivors.filter((entry) => entry.startsWith('db-ca-')).sort(),
-      [generations[0], generations[1], generations[3], generations[4], generations[5]].map(name).sort(),
-      `SURVIVORS: exactly this run's generation, the previous installation's, and the three newest of the rest:\n${run.output}`)
+      [
+        generations[0], generations[1], generations[3], generations[4], generations[5],
+        // r48: and both `db-ca-`-shaped bystanders, which are the OLDEST files in the directory and
+        // would be the first two removed by a prune that trusted the glob. Naming them here rather
+        // than filtering them out is deliberate: this list is the whole of what survives, so a
+        // deletion cannot hide in a filter.
+        operatorFile, impostorFile,
+      ].map(name).sort(),
+      `SURVIVORS: exactly this run's generation, the previous installation's, the three newest of the rest, and every file this publisher did not write:\n${run.output}`)
     assert.equal(readVar(run.output, 'BYSTANDERS'), '2',
       `BYSTANDERS_KEPT: the prune globs generations and nothing else — the publisher's own temporary shape and an operator's file both survive:\n${run.output}`)
   } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 27g. WHICH PEM LABELS THE READERS ACTUALLY CONSUME (o3d-2sm1.5 r48, Codex MEDIUM)
+//
+// r47 argued its way to an accept-list of one label and was two labels short. The argument named
+// the right readers and got their answer wrong, which is what an accept-list arrived at by
+// reasoning does: it is a claim about someone else's parser, made without running it.
+//
+// So this test does not argue. It takes ONE real CA's DER, re-armours it under every PEM label
+// OpenSSL 3.x defines a PEM_STRING_* constant for — plus three deliberate near-misses that are not
+// constants at all — and asks three questions of each: does the shipped gate accept it, does the
+// shared OpenSSL verification store consume it, does Node's TLS consume it. The assertion is that
+// all three answers agree, label by label, over the whole space.
+//
+// WHY THAT SPACE IS THE WHOLE SPACE. The store loads a trust file with PEM_read_bio_X509_AUX(),
+// whose name matching is `check_pem()` — a fixed sequence of strcmp() against PEM_STRING_*
+// constants. A label outside that list cannot match any arm of it, so a sweep over the constants
+// is exhaustive over what the reader can possibly accept, not merely over what an author happened
+// to think of. That is the difference between this and r47's list.
+// ---------------------------------------------------------------------------
+
+test('r48: the accept-list is exactly the set of PEM labels the shared readers consume', async () => {
+  // MUTATION ROUTES (each applied to scripts/install.sh and this file re-run):
+  //   M1 -- drop `'X509 CERTIFICATE'` from db_ca_pem_label_encoding()'s case: GATE_MATCHES_READERS
+  //         fails on that label, naming it. Both readers consume it and the installer refuses it,
+  //         which is r47's defect exactly — an r46 installation whose bundle uses the legacy label
+  //         cannot upgrade.
+  //   M2 -- drop `'TRUSTED CERTIFICATE'`: the same failure on that label.
+  //   M3 -- widen the case to `*) printf 'plain' ;;`: GATE_MATCHES_READERS fails on the first label
+  //         the store skips — the installer would publish a `PRIVATE KEY` block's armour to a
+  //         world-readable path, and the openssl decode is the only thing left standing between it
+  //         and disclosure.
+  //   M4 -- edit DB_CA_ACCEPTED_PEM_LABELS to drop or add a label: ENUMERATION_MATCHES_GATE fails.
+  //         The refusal an operator reads and the gate that produced it cannot disagree, and this
+  //         is what stops the message drifting away from the case statement beside it.
+  //   M5 -- (control, applied to this file) assert the readers agree with each other and remove the
+  //         gate arm of the comparison: the test still passes, so READERS_AGREE alone is vacuous as
+  //         a check on install.sh. It is asserted anyway, because the whole accept-list rests on
+  //         the two readers wanting the same thing, and if that ever stops being true this test is
+  //         where it surfaces rather than in an installation.
+  const root = mkdtempSync(join(tmpdir(), 'ims-r48-labels-'))
+  chmodSync(root, 0o755)
+  try {
+    const ca = join(root, 'ca.pem')
+    const caKey = writeCertificate(ca, 'r48-label-sweep')
+    const caPem = readFileSync(ca, 'utf8')
+    const serverKey = readFileSync(caKey, 'utf8')
+    assert.ok(OPENSSL_PEM_LABELS.length >= 25,
+      'precondition: the sweep must cover the PEM_STRING_* space, not a handful of labels')
+
+    // THE SHIPPED GATE, asked about every label in one shell so the answers cannot drift between
+    // invocations. `db_ca_pem_label_encoding` prints the re-encoding it chose and returns non-zero
+    // for a label no reader consumes.
+    const gate = runShipped(
+      { APP_DIR: root, APP_USER: currentUser() },
+      OPENSSL_PEM_LABELS
+        .map((label, index) => `echo "GATE${index}=$(db_ca_pem_label_encoding ${JSON.stringify(label)} || echo REFUSED)"`)
+        .join('\n'),
+    )
+    assert.equal(gate.status, 0, gate.output)
+
+    const accepted: string[] = []
+    for (const [index, label] of OPENSSL_PEM_LABELS.entries()) {
+      const file = join(root, `label-${index}.pem`)
+      const armoured = relabelPem(caPem, label)
+      writeFileSync(file, armoured)
+
+      const store = opensslVerifies(file, ca, 'sslserver')
+      const node = await nodeTlsVerdict(armoured, serverKey, caPem)
+      const encoding = readVar(gate.output, `GATE${index}`)
+
+      assert.equal(store, node === 'AUTHORIZED',
+        `READERS_AGREE: the two shared readers must make the same thing of a '${label}' block — openssl store ${store}, node ${node}. The accept-list is one list because they are one store; if they diverge it is not.`)
+      assert.equal(encoding !== 'REFUSED', store,
+        `GATE_MATCHES_READERS: install.sh ${encoding === 'REFUSED' ? 'REFUSES' : `accepts (${encoding})`} a '${label}' block and the readers ${store ? 'CONSUME' : 'skip'} it. An accept-list narrower than the store refuses a bundle that works; one wider publishes armour no reader will look at.`)
+      if (store) accepted.push(label)
+    }
+
+    // WHAT THE MEASUREMENT SAYS, stated so a future reader does not have to re-derive it.
+    assert.deepEqual(accepted, ['CERTIFICATE', 'X509 CERTIFICATE', 'TRUSTED CERTIFICATE'],
+      `MEASURED_SET: exactly three of the ${OPENSSL_PEM_LABELS.length} labels swept are consumed by the verification store`)
+    assert.equal(readVar(gate.output, 'GATE2'), 'trusted',
+      'TRUSTED_GETS_ITS_OWN_ENCODING: and the one that can carry X509_AUX metadata must not be re-encoded as a plain certificate')
+
+    // AND THE REFUSAL SAYS THE SAME THING THE GATE DOES.
+    const enumeration = /^DB_CA_ACCEPTED_PEM_LABELS="([^"]*)"$/m.exec(INSTALL_SOURCE)
+    assert.ok(enumeration, 'precondition: install.sh must enumerate the accepted labels for its refusals to quote')
+    assert.deepEqual(enumeration[1].split(', '), accepted,
+      'ENUMERATION_MATCHES_GATE: the labels a refusal lists are the labels the gate accepts — an operator acts on the message, not on the case statement')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 27h. EVERY ACCEPTED LABEL PUBLISHES, AND ALL THREE READERS ACCEPT THE RESULT (r48, Codex MEDIUM)
+//
+// 27g measures the READERS. This measures the INSTALLER against them end to end: a CA bundle
+// written in each of the three accepted labels goes through the shipped publisher, and the file it
+// publishes is then handed to all three consumers of `DB_SSLROOTCERT` — the OpenSSL store, Node's
+// TLS (which is node-postgres's `ssl.ca`), and libpq (which is psql, and the credential probes)
+// against a REAL TLS cluster.
+//
+// The two spellings of a plain certificate normalise to the SAME generation, which is the property
+// that makes the legacy label a spelling rather than a second trust root.
+// ---------------------------------------------------------------------------
+
+test('r48: a bundle in any accepted label publishes, and all three readers accept the generation', async () => {
+  // MUTATION ROUTES:
+  //   M1 -- drop `'X509 CERTIFICATE'` from db_ca_pem_label_encoding(): LEGACY_RC fails at 1. The
+  //         upgrade path r47 closed for an r46 installation using that bundle.
+  //   M2 -- drop `'TRUSTED CERTIFICATE'`: TRUSTED_RC fails at 1.
+  //   M3 -- delete `-trustout` from the trusted arm of normalize_db_ca_pem(), leaving the guard:
+  //         TRUSTED_RC comes back 1. openssl emits a plain block, the guard sees it and refuses
+  //         rather than publishing an anchor wider than the source. Nothing is published, which is
+  //         the safe direction — this route proves the guard is load-bearing and not decoration.
+  //   M4 -- delete `-trustout` AND the guard together: TRUSTED_GENERATION fails, because the
+  //         published path is now the PLAIN certificate's generation — the aux block was dropped and
+  //         the bytes are the stripped ones. All three readers still ACCEPT it, which is the whole
+  //         danger: the anchor is wider and nothing about the outcome says so. 27i is where that
+  //         becomes a failure rather than a surprise.
+  const root = mkdtempSync(join(tmpdir(), 'ims-r48-publish-'))
+  chmodSync(root, 0o755)
+  pgBinDir()
+  let cluster: Cluster | undefined
+  try {
+    const publishDir = join(root, 'published')
+    cluster = startCluster(root, 'tls', await freePort(), '127.0.0.1', ['host all all 127.0.0.1/32 trust'], { ssl: true })
+    const serverCert = join(cluster.data, 'server.crt')
+    const serverKey = readFileSync(join(cluster.data, 'server.key'), 'utf8')
+    const serverPem = readFileSync(serverCert, 'utf8')
+
+    // THE THREE SPELLINGS OF THE SAME TRUST ROOT. The cluster's certificate is self-signed, so it
+    // IS its own anchor — which is exactly how `sslrootcert=server.crt` is used against it.
+    const plain = join(root, 'bundle-plain.pem')
+    writeFileSync(plain, serverPem)
+    const legacy = join(root, 'bundle-legacy.pem')
+    writeFileSync(legacy, relabelPem(serverPem, 'X509 CERTIFICATE'))
+    const trusted = join(root, 'bundle-trusted.pem')
+    execFileSync('openssl', ['x509', '-in', serverCert, '-addtrust', 'serverAuth', '-trustout', '-out', trusted], { stdio: 'pipe' })
+    assert.match(readFileSync(trusted, 'utf8'), /^-----BEGIN TRUSTED CERTIFICATE-----/,
+      'precondition: the trusted bundle must actually be armoured as one')
+
+    const run = runShipped(
+      { APP_DIR: root, APP_USER: currentUser(), DB_CA_PUBLISH_DIR: publishDir },
+      [['PLAIN', plain], ['LEGACY', legacy], ['TRUSTED', trusted]]
+        .map(([name, source]) => `
+        DB_CA_PUBLISHED_FILE=""
+        publish_db_ca ${JSON.stringify(source)} >/dev/null 2>&1; echo "${name}_RC=$?"
+        echo "${name}_FILE=\${DB_CA_PUBLISHED_FILE}"`)
+        .join('\n'),
+    )
+    assert.equal(run.status, 0, run.output)
+
+    const expected: Record<string, string> = {
+      // The two plain spellings are the SAME certificate, so they are the same generation.
+      PLAIN: caGenerationPath(publishDir, serverCert),
+      LEGACY: caGenerationPath(publishDir, serverCert),
+      // The trusted one is NOT: its X509_AUX block is part of the bytes, and part of what the
+      // anchor means.
+      TRUSTED: caGenerationPath(publishDir, trusted, true),
+    }
+    assert.notEqual(expected.TRUSTED, expected.PLAIN,
+      'precondition: a trusted certificate and the same certificate stripped of its trust settings are different bytes, or this test cannot tell the re-encodings apart')
+
+    for (const label of ['PLAIN', 'LEGACY', 'TRUSTED']) {
+      assert.equal(readVar(run.output, `${label}_RC`), '0',
+        `${label}_RC: a bundle the readers consume must publish — an accept-list narrower than the store strands a working installation:\n${run.output}`)
+      const published = readVar(run.output, `${label}_FILE`)
+      assert.equal(published, expected[label],
+        `${label}_GENERATION: and it lands on the generation ITS OWN published bytes name:\n${run.output}`)
+
+      // ALL THREE READERS, on the file that was actually published.
+      assert.ok(opensslVerifies(published, serverCert, 'sslserver'),
+        `${label}_OPENSSL: the shared verification store must accept the published generation as an anchor`)
+      assert.equal(await nodeTlsVerdict(readFileSync(published, 'utf8'), serverKey, serverPem), 'AUTHORIZED',
+        `${label}_NODE: and so must Node's TLS — this is node-postgres's ssl.ca, the route the application itself takes`)
+      assert.equal(psqlSslVerdict(cluster, published), 'CONNECTED',
+        `${label}_LIBPQ: and so must libpq, against a real TLS cluster — psql IS libpq, and it is what the installer's own credential probes use`)
+    }
+  } finally {
+    cluster?.stop()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 27i. A RESTRICTED ANCHOR IS STILL RESTRICTED AFTER PUBLICATION (r48, Codex MEDIUM)
+//
+// `TRUSTED CERTIFICATE` is not a second spelling of `CERTIFICATE`. The X509_AUX block it carries
+// holds trust and reject OIDs that NARROW what the anchor may vouch for, and all three readers
+// enforce them. Publishing such a bundle by re-encoding it as a plain certificate would accept the
+// operator's file and install a WIDER trust root than the one they supplied — quietly, with a
+// successful run and a generation to point at.
+//
+// So the property under test is not "it published". It is that the same leaf the operator's anchor
+// refuses is still refused THROUGH THE PUBLISHED FILE, in all three readers, and that the only
+// thing separating that from acceptance is the metadata: the control publishes the identical
+// certificate without the restriction and every reader accepts it.
+// ---------------------------------------------------------------------------
+
+test('r48: an X509_AUX-restricted anchor is still restricted after publication, in all three readers', async () => {
+  // MUTATION ROUTES:
+  //   M1 -- delete `-trustout` from the trusted arm of normalize_db_ca_pem(), leaving the guard:
+  //         RESTRICTED_RC comes back 1. Nothing is published, which is the safe direction.
+  //   M2 -- delete `-trustout` AND the guard together (the shape r47 would have had if it had
+  //         merely widened its label list): RESTRICTED_RC is 0 and RESTRICTED_OPENSSL fails first,
+  //         with RESTRICTED_NODE and RESTRICTED_LIBPQ behind it — every reader now ACCEPTS the
+  //         connection the operator's anchor was configured to refuse, and the restricted bundle
+  //         collapses onto the SAME generation as the unrestricted one. That is the silent
+  //         widening, and it is the reason the label could not simply be added to the list.
+  //   M3 -- (vacuity control, applied to THIS file) build the source bundle with `-addtrust
+  //         serverAuth` instead of `-addreject serverAuth`: the precondition assert fires — a
+  //         source that never refused this leaf cannot show a publisher losing the refusal, so the
+  //         test cannot pass by measuring a bundle with nothing to preserve.
+  const root = mkdtempSync(join(tmpdir(), 'ims-r48-trust-'))
+  chmodSync(root, 0o755)
+  pgBinDir()
+  let cluster: Cluster | undefined
+  try {
+    const publishDir = join(root, 'published')
+    cluster = startCluster(root, 'tls', await freePort(), '127.0.0.1', ['host all all 127.0.0.1/32 trust'], { ssl: true })
+    const serverCert = join(cluster.data, 'server.crt')
+    const serverKey = readFileSync(join(cluster.data, 'server.key'), 'utf8')
+    const serverPem = readFileSync(serverCert, 'utf8')
+
+    // THE SAME CERTIFICATE, TWICE: once as the operator restricted it, once as the plain anchor.
+    const restricted = join(root, 'restricted.pem')
+    execFileSync('openssl', ['x509', '-in', serverCert, '-addreject', 'serverAuth', '-trustout', '-out', restricted], { stdio: 'pipe' })
+    const unrestricted = join(root, 'unrestricted.pem')
+    writeFileSync(unrestricted, serverPem)
+    assert.ok(!opensslVerifies(restricted, serverCert, 'sslserver'),
+      'precondition: the SOURCE bundle must already refuse this leaf, or there is no restriction for the publisher to lose')
+    assert.ok(opensslVerifies(unrestricted, serverCert, 'sslserver'),
+      'precondition: and the same certificate without the restriction must accept it')
+
+    const run = runShipped(
+      { APP_DIR: root, APP_USER: currentUser(), DB_CA_PUBLISH_DIR: publishDir },
+      [['RESTRICTED', restricted], ['CONTROL', unrestricted]]
+        .map(([name, source]) => `
+        DB_CA_PUBLISHED_FILE=""
+        publish_db_ca ${JSON.stringify(source)} >/dev/null 2>&1; echo "${name}_RC=$?"
+        echo "${name}_FILE=\${DB_CA_PUBLISHED_FILE}"`)
+        .join('\n'),
+    )
+    assert.equal(run.status, 0, run.output)
+    assert.equal(readVar(run.output, 'RESTRICTED_RC'), '0',
+      `RESTRICTED_RC: a restricted trust anchor is a legitimate CA bundle and must publish:\n${run.output}`)
+    assert.equal(readVar(run.output, 'CONTROL_RC'), '0', `CONTROL_RC: so must the plain one:\n${run.output}`)
+
+    const published = readVar(run.output, 'RESTRICTED_FILE')
+    const control = readVar(run.output, 'CONTROL_FILE')
+
+    // THE RESTRICTION, THROUGH THE PUBLISHED FILE, IN EVERY READER.
+    assert.ok(!opensslVerifies(published, serverCert, 'sslserver'),
+      'RESTRICTED_OPENSSL: the published anchor must still refuse the leaf its trust settings exclude')
+    assert.equal(await nodeTlsVerdict(readFileSync(published, 'utf8'), serverKey, serverPem), 'ERROR=INVALID_PURPOSE',
+      "RESTRICTED_NODE: and Node's TLS must still refuse it, naming the purpose — this is the driver the application connects with")
+    assert.equal(psqlSslVerdict(cluster, published), 'REFUSED',
+      'RESTRICTED_LIBPQ: and libpq must still refuse it, against a real TLS cluster')
+
+    assert.notEqual(published, control,
+      'the two are different anchors and must be different generations — the trust settings are part of the bytes')
+    assert.equal(readFileSync(published, 'utf8'), readFileSync(restricted, 'utf8'),
+      `RESTRICTED_BYTES: the published generation must be byte-identical to the trusted PEM it came from — that is what preserving X509_AUX means, and it is what makes republishing it idempotent:\n${run.output}`)
+
+    // AND THE CONTROL, so the refusals above are the METADATA and not the certificate.
+    assert.ok(opensslVerifies(control, serverCert, 'sslserver'),
+      'CONTROL_OPENSSL: the same certificate published without the restriction must be accepted')
+    assert.equal(await nodeTlsVerdict(readFileSync(control, 'utf8'), serverKey, serverPem), 'AUTHORIZED',
+      'CONTROL_NODE: in Node too')
+    assert.equal(psqlSslVerdict(cluster, control), 'CONNECTED',
+      'CONTROL_LIBPQ: and in libpq — so the three refusals above are about the trust settings, not about this certificate')
+  } finally {
+    cluster?.stop()
     rmSync(root, { recursive: true, force: true })
   }
 })
