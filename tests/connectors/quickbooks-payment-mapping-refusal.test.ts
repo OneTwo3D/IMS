@@ -482,7 +482,7 @@ test('[o3d-batch-ret r7] the refusal describes what the SECOND processor pass ac
  * re-reads a cleared marker, so a payment that was really taken is gone with no record that it was
  * ever owed.
  *
- * ABSENCE IS NOT A NEGATIVE ANSWER. `requestedInvoicePayment` answers `none | amount | invalid`,
+ * ABSENCE IS NOT A NEGATIVE ANSWER. The module-private resolver answers `none | amount | invalid`,
  * `decideRequestedInvoicePayment` settles only `none`, and the `invalid` handler is typed to return
  * a REFUSED outcome — so this connector cannot settle an unreadable payload even by accident.
  */
@@ -631,4 +631,181 @@ test('[o3d-batch-ret r8] CONTROL: a DECLARED zero still settles, with no `lines`
   assert.deepEqual(followUpTypes(), ['INVOICE_PDF'], 'and no INVOICE_PAYMENT row is created')
   assert.deepEqual(released, ['entry-invoice'], 'and the obligation IS discharged')
   assert.equal(store.get('entry-invoice')?.status, 'SYNCED', 'and the posted parent is not failed for retry')
+})
+
+/**
+ * o3d-batch-ret ROUND 9 (Codex HIGH) — A PRESENT `null` IS NOT AN ABSENT FIELD, ON THIS CONNECTOR TOO.
+ *
+ * Round 8 gave the shared resolver an `invalid` arm for a value it cannot read, and then went on
+ * using `x === undefined || x === null` to decide whether the payload USES a field at all. So the
+ * shape that most needs the new arm — a key that is present holding a null, because something wrote
+ * nothing into it — took the ABSENT path: `{_paymentAmount: null, lines: []}` derived a zero and
+ * SETTLED, and a null `shippingAmount`/`discountAmount` was spent as a real zero.
+ *
+ * IT IS WORST HERE. The registry declares `consumer: 'none'` for QuickBooks: nothing re-reads a
+ * cleared marker, so a payment discharged over a null is gone with no record it was ever owed.
+ */
+test('[o3d-batch-ret r9] a PRESENT null is refused on every field that had a default, and the obligation is NOT discharged', async () => {
+  // ROUTE: the real `processPendingQuickBooksSync` over a PENDING SALES_INVOICE asking for a
+  // payment, with the mapping CORRECTLY CONFIGURED (`card: QBO-BANK-1`) — so nothing below can be
+  // the mapping refusal. `released` is populated only by a real `releaseFollowUpObligation` call
+  // carrying the generation this pass claimed.
+  //
+  // MUTATION THAT KILLS IT: in lib/domain/accounting/followup-enqueue-outcome.ts, restore the
+  // round-8 presence tests — `if (declared !== null && declared !== undefined)` for
+  // `_paymentAmount`, and `payload.shippingAmount === null || payload.shippingAmount === undefined
+  // ? 0 : ...` for the two adjustments. The first arm then derives a zero, refuses nothing and
+  // RELEASES; the other two spend the null as a zero and enqueue an INVOICE_PAYMENT for the derived
+  // 120, releasing as well. Every arm fails on `followUpTypes`, on the refusal count and on
+  // `released`.
+  //
+  // ALL THREE FIELDS ARE WALKED because the shortcut was written out three times.
+  for (const { what, money, detail } of [
+    {
+      what: 'a DECLARED `_paymentAmount` holding null, with an empty `lines` to derive a zero from',
+      money: { _paymentAmount: null, lines: [] },
+      detail: /`_paymentAmount` is null, which is not a finite amount/,
+    },
+    {
+      what: 'a present `_paymentAmount` holding an explicit `undefined` — present, and not absent',
+      money: { _paymentAmount: undefined, lines: [] },
+      detail: /`_paymentAmount` is present and holds `undefined`, which is not a finite amount/,
+    },
+    {
+      what: 'a present `shippingAmount` holding null, over lines that DO derive',
+      money: { lines: [{ quantity: 1, unitAmount: 120 }], shippingAmount: null },
+      detail: /`shippingAmount` is null, which is not a finite number/,
+    },
+    {
+      what: 'a present `discountAmount` holding null, over lines that DO derive',
+      money: { lines: [{ quantity: 1, unitAmount: 120 }], discountAmount: null },
+      detail: /`discountAmount` is null, which is not a finite number/,
+    },
+  ]) {
+    reset({ card: 'QBO-BANK-1' })
+    store = createSyncLogStore([syncLogRow({
+      id: 'entry-invoice',
+      connector: 'quickbooks',
+      type: 'SALES_INVOICE',
+      status: 'PENDING',
+      referenceType: 'SalesOrder',
+      referenceId: 'order-1',
+      payload: {
+        currency: 'GBP',
+        _registerPayment: true,
+        _paymentMethod: 'card',
+        _paymentDate: '2026-08-20',
+        ...money,
+      },
+      attemptStampingCustodyAt: new Date('2026-08-20T09:00:00.000Z'),
+    })])
+
+    await runQuickBooks()
+
+    assert.equal(
+      order.accountingInvoiceId, 'QBINV-9',
+      `PRECONDITION (${what}): the invoice really did post — otherwise nothing below is about the enqueue`,
+    )
+    assert.deepEqual(
+      followUpTypes(), ['INVOICE_PDF'],
+      `no INVOICE_PAYMENT row is created (${what}) — an amount derived AROUND an unreadable field is `
+        + 'not the amount the payload states',
+    )
+
+    const refusal = paymentRefusals()
+    assert.equal(refusal.length, 1, `the operator is told once, and told why (${what})`)
+    assert.equal(
+      refusal[0].metadata?.reason, 'payment_amount_unreadable',
+      `and it is the CORRUPT-PAYLOAD refusal (${what}), not the mapping one — the mapping is correct here`,
+    )
+    assert.match(String(refusal[0].description), detail, `the sentence names the field and what it holds (${what})`)
+    assert.match(
+      String(refusal[0].description), /AN UNREADABLE AMOUNT IS NOT A ZERO/,
+      `and says which fact this is (${what})`,
+    )
+
+    assert.deepEqual(
+      released, [],
+      `THE FINDING (${what}): the row must go on saying it owes follow-ups. Nothing on this connector `
+        + 're-reads a cleared marker, so settling over a null loses the payment permanently',
+    )
+    assert.equal(
+      claimed.length, 1,
+      `PRECONDITION (${what}): a generation WAS claimed, so "released is empty" is a WITHHELD release `
+        + 'rather than a pass that never had anything to release',
+    )
+    assert.equal(
+      store.get('entry-invoice')?.status, 'PENDING',
+      `and the posted parent is failed for retry (${what}) — the visible state this refusal buys`,
+    )
+  }
+})
+
+test('[o3d-batch-ret r9] CONTROL: ABSENT and READABLE-ZERO fields still take their old paths', async () => {
+  // Without this, the test above passes on a build that refuses every payload carrying an optional
+  // field at all — which would refuse ordinary invoices (no shipping leg, no discount) and is a
+  // worse failure than the one being fixed.
+  //
+  // THREE ARMS: an ABSENT adjustment is still a real zero and the derivation still runs over it; a
+  // PRESENT but READABLE zero is not refused for being present; and a DECLARED readable zero is
+  // still FINAL and still settles, even with lines beside it that would have derived 120.
+  //
+  // ROUTE: one real `processPendingQuickBooksSync` pass per arm, mapping configured.
+  // MUTATIONS THAT KILL IT: make `optionalAdjustment` return a `detail` when the key is absent —
+  // arms 1 and 2 then refuse; or make `readableAmount` answer `invalid` for a non-positive amount —
+  // arm 3 then refuses instead of settling.
+  for (const { what, money, expected, amount } of [
+    {
+      what: 'no `shippingAmount` or `discountAmount` key at all',
+      money: { lines: [{ quantity: 2, unitAmount: 60 }] },
+      expected: ['INVOICE_PAYMENT', 'INVOICE_PDF'],
+      amount: 120,
+    },
+    {
+      what: 'both adjustments present and readably zero',
+      money: { lines: [{ quantity: 2, unitAmount: 60 }], shippingAmount: 0, discountAmount: 0 },
+      expected: ['INVOICE_PAYMENT', 'INVOICE_PDF'],
+      amount: 120,
+    },
+    {
+      what: 'a declared readable ZERO `_paymentAmount`, with lines that would have derived 120',
+      money: { _paymentAmount: 0, lines: [{ quantity: 2, unitAmount: 60 }] },
+      expected: ['INVOICE_PDF'],
+      amount: null,
+    },
+  ]) {
+    reset({ card: 'QBO-BANK-1' })
+    store = createSyncLogStore([syncLogRow({
+      id: 'entry-invoice',
+      connector: 'quickbooks',
+      type: 'SALES_INVOICE',
+      status: 'PENDING',
+      referenceType: 'SalesOrder',
+      referenceId: 'order-1',
+      payload: {
+        currency: 'GBP',
+        _registerPayment: true,
+        _paymentMethod: 'card',
+        _paymentDate: '2026-08-20',
+        ...money,
+      },
+      attemptStampingCustodyAt: new Date('2026-08-20T09:00:00.000Z'),
+    })])
+
+    await runQuickBooks()
+
+    assert.equal(order.accountingInvoiceId, 'QBINV-9', `PRECONDITION (${what}): the invoice really did post`)
+    assert.deepEqual(paymentRefusals(), [], `a payload every field of which CAN be read is not refused (${what})`)
+    assert.deepEqual(followUpTypes(), expected, `and the follow-ups are the ones the amount calls for (${what})`)
+    if (amount !== null) {
+      const payment = store.rows.find((row) => row.type === 'INVOICE_PAYMENT')
+      assert.equal(
+        (payment?.payload as { amount?: unknown } | undefined)?.amount, amount,
+        `the derivation really ran and the absent adjustment really was a ZERO (${what}) — a refusal `
+          + 'would have queued nothing, and a wrong default would put a different number on the row',
+      )
+    }
+    assert.deepEqual(released, ['entry-invoice'], `and the obligation IS discharged (${what})`)
+    assert.equal(store.get('entry-invoice')?.status, 'SYNCED', `and the posted parent is not failed for retry (${what})`)
+  }
 })

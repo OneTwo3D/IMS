@@ -449,7 +449,7 @@ test('[o3d-batch-ret r7] CONTROL: the same fixture with a POSITIVE amount and no
  * that settles. The marker was cleared, the sweep stopped selecting the row, and a payment that was
  * really requested was reported as work that never existed.
  *
- * ABSENCE IS NOT A NEGATIVE ANSWER. `requestedInvoicePayment` answers `none | amount | invalid`,
+ * ABSENCE IS NOT A NEGATIVE ANSWER. The module-private resolver answers `none | amount | invalid`,
  * `decideRequestedInvoicePayment` settles only `none`, and the `invalid` handler is typed to return
  * a REFUSED outcome, so neither connector can settle a payload whose amount it could not read.
  */
@@ -583,4 +583,179 @@ test('[o3d-batch-ret r8] CONTROL: a DECLARED zero still settles, with no `lines`
   assert.deepEqual(paymentRefusals(), [], 'an invoice that says it owes nothing is not refused')
   assert.deepEqual(followUpTypes(), ['INVOICE_PDF'], 'and no INVOICE_PAYMENT row is created')
   assert.equal(marker(), null, 'and the obligation IS discharged')
+})
+
+/**
+ * o3d-batch-ret ROUND 9 (Codex HIGH) — A PRESENT `null` IS NOT AN ABSENT FIELD.
+ *
+ * Round 8 gave the resolver an `invalid` arm for a value it cannot read. It then went on asking
+ * `x === undefined || x === null` to decide whether the payload USES a field at all, so the one
+ * shape that most obviously needs the new arm — a key that is there holding a null, because
+ * something wrote nothing into it — took the ABSENT path instead:
+ *
+ *   • `{_paymentAmount: null, lines: []}` fell through to the derivation, derived a zero, and
+ *     SETTLED. A declaration nobody could read was answered "no payment was owed".
+ *   • a null `shippingAmount` or `discountAmount` was spent as a REAL zero, so the amount the
+ *     customer is recorded as having paid silently moved by whatever the null was hiding.
+ *
+ * `Object.hasOwn` is the only thing that separates the two facts, and every optional monetary field
+ * now asks it before it looks at the value. Absence still selects the other path — that is what
+ * makes an ordinary invoice with no shipping leg readable — and presence must be READ or REFUSED.
+ */
+test('[o3d-batch-ret r9] a PRESENT null is refused on every field that had a default, and the marker SURVIVES', async () => {
+  // ROUTE: the real `repairXeroBackReferences` over a SYNCED SALES_INVOICE asking for a payment,
+  // with the mapping CORRECTLY CONFIGURED (`card: BANK-1`) — so nothing below can be the mapping
+  // refusal, and the only thing between this row and a settlement is the null being a value the
+  // resolver refuses to guess at. The real receipt fence runs; `releaseFollowUpObligation` is the
+  // only thing that can clear the marker read at the foot of each arm.
+  //
+  // MUTATION THAT KILLS IT: in lib/domain/accounting/followup-enqueue-outcome.ts, put the round-8
+  // presence tests back — `if (declared !== null && declared !== undefined)` for `_paymentAmount`,
+  // and `payload.shippingAmount === null || payload.shippingAmount === undefined ? 0 : ...` for the
+  // two adjustments. The first arm then derives a zero and CLEARS the marker with no refusal at
+  // all; the other two spend the null as a zero, enqueue an INVOICE_PAYMENT for the derived 120 and
+  // clear the marker as well. Every arm fails on `followUpTypes`, on the refusal count and on the
+  // marker.
+  //
+  // ALL THREE FIELDS ARE WALKED because the shortcut was written out three times, and a fix applied
+  // only to the field Codex named in its probe would pass a one-shape test.
+  for (const { what, money, detail } of [
+    {
+      what: 'a DECLARED `_paymentAmount` holding null, with an empty `lines` to derive a zero from',
+      money: { _paymentAmount: null, lines: [] },
+      detail: /`_paymentAmount` is null, which is not a finite amount/,
+    },
+    {
+      what: 'a present `_paymentAmount` holding an explicit `undefined` — present, and not absent',
+      money: { _paymentAmount: undefined, lines: [] },
+      detail: /`_paymentAmount` is present and holds `undefined`, which is not a finite amount/,
+    },
+    {
+      what: 'a present `shippingAmount` holding null, over lines that DO derive',
+      money: { lines: [{ quantity: 1, unitAmount: 120 }], shippingAmount: null },
+      detail: /`shippingAmount` is null, which is not a finite number/,
+    },
+    {
+      what: 'a present `discountAmount` holding null, over lines that DO derive',
+      money: { lines: [{ quantity: 1, unitAmount: 120 }], discountAmount: null },
+      detail: /`discountAmount` is null, which is not a finite number/,
+    },
+  ]) {
+    reset({ card: 'BANK-1' })
+    store = createSyncLogStore([syncLogRow({
+      ...SALES_CANDIDATE,
+      payload: {
+        invoiceNumber: 'INV-1',
+        currency: 'GBP',
+        _registerPayment: true,
+        _paymentMethod: 'card',
+        _paymentDate: '2026-08-20',
+        ...money,
+      },
+    })])
+
+    await (await loadSweep())()
+
+    assert.equal(
+      salesOrders.get('order-1')?.accountingInvoiceId, 'XERO-INV-1',
+      `PRECONDITION (${what}): the repair really ran — otherwise nothing below is about the enqueue`,
+    )
+    assert.deepEqual(
+      followUpTypes(), ['INVOICE_PDF'],
+      `no INVOICE_PAYMENT row is created (${what}) — an amount derived AROUND an unreadable field is `
+        + 'not the amount the payload states, and queueing it would register the wrong money',
+    )
+
+    const refusal = paymentRefusals()
+    assert.equal(refusal.length, 1, `the operator is told once, and told why (${what})`)
+    assert.equal(
+      refusal[0].metadata?.reason, 'payment_amount_unreadable',
+      `and it is the CORRUPT-PAYLOAD refusal (${what}), not the mapping one — the mapping is correct here`,
+    )
+    assert.match(refusal[0].description, detail, `the sentence names the field and what it holds (${what})`)
+    assert.match(
+      refusal[0].description, /AN UNREADABLE AMOUNT IS NOT A ZERO/,
+      `and says which fact this is (${what}) — the exact conflation the null took advantage of`,
+    )
+
+    assert.notEqual(
+      marker(), null,
+      `THE FINDING (${what}): the row must still say it owes follow-ups. A cleared marker here is a `
+        + 'payment that was requested, never queued, and looks reconciled',
+    )
+    assert.equal(
+      store.get('log-1')?.backReferenceCheckedAt, null,
+      `and it is left in the sweep candidate set (${what})`,
+    )
+  }
+})
+
+test('[o3d-batch-ret r9] CONTROL: ABSENT and READABLE-ZERO fields still take their old paths', async () => {
+  // Without this, the test above passes on a build that refuses every payload carrying an optional
+  // field at all — which would refuse ordinary invoices (no shipping leg, no discount) and is a
+  // worse failure than the one being fixed.
+  //
+  // THREE ARMS, BECAUSE THREE DIFFERENT THINGS MUST STILL BE TRUE:
+  //   1. an ABSENT adjustment is a real zero and the derivation still happens over it;
+  //   2. a PRESENT but READABLE zero is not refused for being present — presence is not the defect,
+  //      unreadable presence is;
+  //   3. a DECLARED readable zero is still FINAL and still settles, even with lines beside it that
+  //      would have derived 120.
+  //
+  // ROUTE: one real sweep run per arm, mapping configured, so an enqueue is possible and a refusal
+  // would be loud.
+  // MUTATIONS THAT KILL IT: make `optionalAdjustment` return a `detail` when the key is absent (the
+  // over-correction) — arms 1 and 2 then refuse; or make `readableAmount` answer `invalid` for a
+  // non-positive amount — arm 3 then refuses instead of settling.
+  for (const { what, money, expected, amount } of [
+    {
+      what: 'no `shippingAmount` or `discountAmount` key at all',
+      money: { lines: [{ quantity: 2, unitAmount: 60 }] },
+      expected: ['INVOICE_PAYMENT', 'INVOICE_PDF'],
+      amount: 120,
+    },
+    {
+      what: 'both adjustments present and readably zero',
+      money: { lines: [{ quantity: 2, unitAmount: 60 }], shippingAmount: 0, discountAmount: 0 },
+      expected: ['INVOICE_PAYMENT', 'INVOICE_PDF'],
+      amount: 120,
+    },
+    {
+      what: 'a declared readable ZERO `_paymentAmount`, with lines that would have derived 120',
+      money: { _paymentAmount: 0, lines: [{ quantity: 2, unitAmount: 60 }] },
+      expected: ['INVOICE_PDF'],
+      amount: null,
+    },
+  ]) {
+    reset({ card: 'BANK-1' })
+    store = createSyncLogStore([syncLogRow({
+      ...SALES_CANDIDATE,
+      payload: {
+        invoiceNumber: 'INV-1',
+        currency: 'GBP',
+        _registerPayment: true,
+        _paymentMethod: 'card',
+        _paymentDate: '2026-08-20',
+        ...money,
+      },
+    })])
+
+    await (await loadSweep())()
+
+    assert.equal(
+      salesOrders.get('order-1')?.accountingInvoiceId, 'XERO-INV-1',
+      `PRECONDITION (${what}): the repair really ran`,
+    )
+    assert.deepEqual(paymentRefusals(), [], `a payload every field of which CAN be read is not refused (${what})`)
+    assert.deepEqual(followUpTypes(), expected, `and the follow-ups are the ones the amount calls for (${what})`)
+    if (amount !== null) {
+      const payment = store.rows.find((row) => row.type === 'INVOICE_PAYMENT')
+      assert.equal(
+        (payment?.payload as { amount?: unknown } | undefined)?.amount, amount,
+        `the derivation really ran and the absent adjustment really was a ZERO (${what}) — a refusal `
+          + 'would have queued nothing, and a wrong default would put a different number on the row',
+      )
+    }
+    assert.equal(marker(), null, `and the obligation IS discharged (${what})`)
+  }
 })
