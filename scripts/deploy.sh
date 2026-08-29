@@ -339,6 +339,10 @@ die()   { echo -e "${RED}[ERROR]${RESET} $*" >&2; exit 1; }
 DRY_RUN=false
 SKIP_BUILD=false
 SKIP_MIGRATE=false
+# --restart-only is --skip-migrate PLUS --skip-build, and one arm below has to tell the two
+# apart: a run that delivers new code against a schema nobody checked is the case o3d-1izw is
+# open against, and a run that delivers no new code at all is not.
+RESTART_ONLY=false
 # The flag as the operator typed it, kept so the refusal below can name it rather than
 # talking about a variable they never set.
 SKIP_MIGRATE_FLAG=""
@@ -348,7 +352,7 @@ for arg in "$@"; do
     --dry-run)      DRY_RUN=true ;;
     --skip-build)   SKIP_BUILD=true ;;
     --skip-migrate) SKIP_MIGRATE=true; SKIP_MIGRATE_FLAG="--skip-migrate" ;;
-    --restart-only) SKIP_BUILD=true; SKIP_MIGRATE=true; SKIP_MIGRATE_FLAG="--restart-only" ;;
+    --restart-only) SKIP_BUILD=true; SKIP_MIGRATE=true; SKIP_MIGRATE_FLAG="--restart-only"; RESTART_ONLY=true ;;
     --help|-h)      sed -n '3,226p' "$0"; exit 0 ;;
     *) die "Unknown option: $arg (try --help)" ;;
   esac
@@ -3057,7 +3061,7 @@ if ! $SKIP_MIGRATE; then
   # stopped, and removing a drop-in changes no running process's environment.
   $DRY_RUN || remove_db_identity_snapshot
   require_fenceable_database
-elif [[ "$SKIP_MIGRATE_FLAG" != "--restart-only" ]]; then
+elif ! $RESTART_ONLY; then
   # o3d-1izw, carried over from the pre-cutover deploy.sh. --skip-migrate applies nothing and
   # validates nothing, which is how a build reaches an environment whose database does not have
   # the push states it writes. The narrow check below is cheap enough to run on every such deploy
