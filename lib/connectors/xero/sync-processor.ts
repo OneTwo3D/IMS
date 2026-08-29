@@ -65,6 +65,7 @@ import {
   decideRequestedInvoicePayment,
   unreadablePaymentAmountRefusalMessage,
   type FollowUpEnqueueOutcome,
+  type PaymentRefusalContext,
   type RefusedFollowUpEnqueue,
 } from '@/lib/domain/accounting/followup-enqueue-outcome'
 import {
@@ -7138,18 +7139,27 @@ async function decideInvoicePaymentFollowUp(
   postedInvoiceId: string,
   origin: AccountingOriginRecord,
 ): Promise<FollowUpEnqueueOutcome> {
-  // Nobody asked for a payment, so none is owed. STATED, not inherited from an initialiser.
-  if (!payload._registerPayment) return FOLLOW_UPS_ENQUEUED
-
-  const method = payload._paymentMethod as string || ''
-  const currency = payload.currency as string || 'GBP'
-
   /**
-   * The two configuration arms, which differ only in WHICH sentence an operator reads. The remedy is
+   * o3d-batch-ret r10 (Codex HIGH), CROSS-PORTED WITH THE QUICKBOOKS PATH — THIS FUNCTION NO LONGER
+   * READS THE PAYLOAD AT ALL.
+   *
+   * It opened with `if (!payload._registerPayment) return FOLLOW_UPS_ENQUEUED` and then
+   * `payload._paymentMethod as string || ''` / `payload.currency as string || 'GBP'`. Those three
+   * lines were the last ad-hoc reads on this path, and each conflated an absent key with a present
+   * value nothing could read — the flag settling the obligation over a `null`, the currency settling
+   * a EUR payment into the sterling bank account. Every field is now classified by
+   * `decideRequestedInvoicePayment`, which hands this caller only values that WERE read; there is no
+   * raw payload expression left here for a default to be attached to.
+   *
+   * The two configuration arms below differ only in WHICH sentence an operator reads. The remedy is
    * a SETTING — safe to repeat, and it cannot double anything — and what happens afterwards comes
    * from the connector's registry entry rather than from a promise written here.
    */
-  const refuse = async (missing: string, configure: string): Promise<RefusedFollowUpEnqueue> => {
+  const refuse = async (
+    { method, currency }: PaymentRefusalContext,
+    missing: string,
+    configure: string,
+  ): Promise<RefusedFollowUpEnqueue> => {
     const message = paymentAccountRefusalMessage({
       connector: 'Xero',
       referenceType,
@@ -7198,7 +7208,10 @@ async function decideInvoicePaymentFollowUp(
    * and the producer says the part that is true of this refusal on both drivers: a re-read cannot
    * make the amount readable, so every pass refuses again until the payload itself is rebuilt.
    */
-  const refuseUnreadable = async (detail: string): Promise<RefusedFollowUpEnqueue> => {
+  const refuseUnreadable = async (
+    detail: string,
+    { method, currency }: PaymentRefusalContext,
+  ): Promise<RefusedFollowUpEnqueue> => {
     const message = unreadablePaymentAmountRefusalMessage({
       connector: 'Xero',
       referenceType,
@@ -7246,10 +7259,11 @@ async function decideInvoicePaymentFollowUp(
    */
   return await decideRequestedInvoicePayment(payload, {
     onInvalid: refuseUnreadable,
-    onAmount: async (amount) => {
+    onAmount: async ({ amount, method, currency, paymentDate }) => {
       const paymentMap = await getPaymentAccountMap()
       if (!paymentMap || Object.keys(paymentMap).length === 0) {
         return await refuse(
+          { method, currency },
           'no payment account map is configured',
           'Set up a bank account for each payment method under Settings → Accounting → Payment Account Mapping.',
         )
@@ -7257,6 +7271,7 @@ async function decideInvoicePaymentFollowUp(
       const stored = lookupPaymentAccount(paymentMap, method, currency)
       if (!stored) {
         return await refuse(
+          { method, currency },
           `no bank account is mapped for method "${method}" / currency "${currency}"`,
           'Add that mapping under Settings → Accounting → Payment Account Mapping.',
         )
@@ -7266,7 +7281,7 @@ async function decideInvoicePaymentFollowUp(
         accountingInvoiceId: postedInvoiceId,
         bankAccountId: stored,
         amount,
-        paymentDate: (payload._paymentDate as string)?.slice(0, 10) || new Date().toISOString().slice(0, 10),
+        paymentDate,
         currency,
         method,
         sourceEntryId: entryId,

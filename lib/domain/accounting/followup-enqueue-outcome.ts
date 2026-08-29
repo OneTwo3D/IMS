@@ -401,8 +401,231 @@ function requestedInvoicePayment(payload: Record<string, unknown>): RequestedInv
 }
 
 /**
- * THE ONLY WAY EITHER CONNECTOR ASKS THE QUESTION — AND THE REASON IT IS A FOLD RATHER THAN A
- * `switch` EACH OF THEM WRITES (o3d-batch-ret r8, Codex HIGH).
+ * ONE FIELD'S ANSWER: the value it states, or the operator clause saying why it could not be read
+ * (o3d-batch-ret r10, Codex HIGH).
+ *
+ * It is the shape {@link OptionalAdjustment} already had, generalised, and it is deliberately NOT a
+ * `T | null`: a `null`/`undefined` answer is exactly the conflation five rounds have been chasing —
+ * the caller has to discriminate before it can read a value, and the arm it must handle carries the
+ * sentence an operator will read rather than a bare absence.
+ */
+type PayloadField<T> = { readonly value: T } | { readonly detail: string }
+
+/** The one wording for "this key is there and what it holds cannot be read". */
+function unreadableField(field: string, value: unknown, expectation: string): { readonly detail: string } {
+  return { detail: `\`${field}\` is ${describePresent(value)}, ${expectation}` }
+}
+
+/**
+ * `_registerPayment` — THE FLAG CODEX NAMED, AND THE ONLY THREE ANSWERS IT HAS.
+ *
+ * ABSENT means this payload does not use the mechanism: the ordinary sales path composes payloads
+ * without the key at all, so absence must mean "no payment requested" or every invoice IMS raises
+ * itself would be refused. A LITERAL `false` is the same statement made explicitly — the WooCommerce
+ * importer writes `!!wcOrder.date_paid_gmt && documentTotalsToTheOrder`, so an unpaid order really
+ * does persist `false`.
+ *
+ * EVERY OTHER PRESENT VALUE IS UNREADABLE, IN BOTH DIRECTIONS. `null`, `0`, `''` and an explicit
+ * `undefined` are values something WROTE, and the truthiness test spent all four as "nobody asked" —
+ * which on QuickBooks (`consumer: 'none'`) clears the only evidence the money is owed. `'false'`,
+ * `'0'`, `1` and `{}` are the mirror: they are not a request either, and truthiness let them enter
+ * payment registration and queue a receipt against an invoice on the strength of a corrupt byte.
+ * Neither direction is safe to guess, so both refuse.
+ */
+function payloadPaymentRequested(payload: Record<string, unknown>): PayloadField<boolean> {
+  if (!declaresField(payload, '_registerPayment')) return { value: false }
+  const value = payload._registerPayment
+  if (value === true || value === false) return { value }
+  return unreadableField('_registerPayment', value, 'which is neither `true` nor `false`')
+}
+
+/**
+ * `_registerPayment`, ASKED BY THE READERS WHOSE FAIL-SAFE DIRECTION IS THE OPPOSITE ONE.
+ *
+ * `followUpObligationsOwedBy` records what a row owed while its payload still exists to be read, and
+ * that record is allowed to be BROADER than the enqueue's gate but never narrower: an obligation
+ * recorded that the enqueue would have skipped costs a line of noise, one it failed to record lets a
+ * genuinely lost payment be classified as nothing at all. So an unreadable flag answers TRUE there,
+ * where the connectors refuse — the same classification, read for the safe direction of a different
+ * question, instead of a second truthiness test written out beside the first.
+ */
+export function payloadMayOweInvoicePayment(payload: Record<string, unknown>): boolean {
+  const requested = payloadPaymentRequested(payload)
+  return 'detail' in requested || requested.value
+}
+
+/**
+ * `_paymentMethod` — ABSENT IS A REAL STATE AND IT IS NOT AN ERROR.
+ *
+ * The importer writes `wcOrder.payment_method || undefined`, which JSON drops, so an order Woo
+ * recorded no method for persists no key. That must not refuse: it resolves to `''`, the mapping is
+ * asked about `":GBP"`, and the answer is the ORDINARY mapping refusal naming an empty method —
+ * which is a true sentence an operator can act on. A present non-string is different: `as string`
+ * made a number or an object into a mapping-lookup key with no cast at runtime at all.
+ */
+function payloadPaymentMethod(payload: Record<string, unknown>): PayloadField<string> {
+  if (!declaresField(payload, '_paymentMethod')) return { value: '' }
+  const value = payload._paymentMethod
+  return typeof value === 'string'
+    ? { value }
+    : unreadableField('_paymentMethod', value, 'which is not a payment-method string')
+}
+
+/** The base currency an invoice that names none is settled in. */
+const BASE_PAYMENT_CURRENCY = 'GBP'
+
+/**
+ * `currency` — THE FIELD WHERE THE OLD DEFAULT MOVED MONEY TO THE WRONG PLACE.
+ *
+ * `payload.currency as string || 'GBP'` answered `GBP` for an absent key, for a present `null`, and
+ * for a present `''` alike. The first is a legitimate default. The other two are a currency
+ * something wrote nothing into, and `lookupPaymentAccount(map, method, currency)` keys the BANK
+ * ACCOUNT on it — so a EUR invoice whose currency did not survive persistence was settled into the
+ * sterling account, and the amount was written onto the INVOICE_PAYMENT row as sterling too. A
+ * present value must therefore NAME a currency; only absence may take the default.
+ */
+function payloadPaymentCurrency(payload: Record<string, unknown>): PayloadField<string> {
+  if (!declaresField(payload, 'currency')) return { value: BASE_PAYMENT_CURRENCY }
+  const value = payload.currency
+  return typeof value === 'string' && value.trim() !== ''
+    ? { value }
+    : unreadableField('currency', value, 'which is not a currency code')
+}
+
+/** `YYYY-MM-DD`, which is the form both ledgers are given and the form `slice(0, 10)` assumed. */
+const LEDGER_DATE = /^\d{4}-\d{2}-\d{2}$/
+
+/**
+ * `_paymentDate` — WHERE THE UNREADABLE VALUE DID NOT DEFAULT, IT THREW.
+ *
+ * `(payload._paymentDate as string)?.slice(0, 10) || <today>` has three behaviours and only one of
+ * them was intended: absent (and present `null`) took today's date, a present NUMBER or object
+ * raised `TypeError: .slice is not a function` out of an invoice that had ALREADY POSTED — failing
+ * the entry after the ledger write — and a present string was sliced with no validation at all, so
+ * `"20/08/2026"` was handed to the ledger as the day `"20/08/2026"`.
+ *
+ * Absence keeps the default: a payment whose date was not recorded is registered today, which is
+ * what both connectors have always done. A present value must be a string whose first ten characters
+ * are a real calendar day — `2026-13-45` parses to `NaN` and is refused rather than sent.
+ */
+function payloadPaymentDate(payload: Record<string, unknown>): PayloadField<string> {
+  const today = new Date().toISOString().slice(0, 10)
+  if (!declaresField(payload, '_paymentDate')) return { value: today }
+  const value = payload._paymentDate
+  if (typeof value !== 'string') {
+    return unreadableField('_paymentDate', value, 'which is not a date string')
+  }
+  const day = value.slice(0, 10)
+  if (!LEDGER_DATE.test(day) || Number.isNaN(Date.parse(day))) {
+    return unreadableField('_paymentDate', value, 'whose first ten characters are not a YYYY-MM-DD date')
+  }
+  return { value: day }
+}
+
+/**
+ * EVERYTHING THE ENQUEUE PUTS ON THE INVOICE_PAYMENT ROW, once every field it came from was READ.
+ *
+ * The connectors receive this and nothing else: there is no raw payload value left in their hands to
+ * apply an `as string || <default>` to, which is the structural half of the round-10 fix.
+ */
+export type InvoicePaymentToRegister = {
+  /** Finite and positive — {@link requestedInvoicePayment} owns the rest of that decision. */
+  readonly amount: number
+  readonly method: string
+  readonly currency: string
+  /** `YYYY-MM-DD`. */
+  readonly paymentDate: string
+}
+
+/**
+ * WHAT A REFUSAL LOG CAN STILL SAY ABOUT THE ROW when the payload is the thing that is broken.
+ *
+ * `null` where the field itself is the unreadable one. It exists for the activity-log metadata and
+ * carries NO decision: a caller cannot reach a settlement through it, which is why it is safe to
+ * export where {@link InvoicePaymentRequest} is not.
+ */
+export type PaymentRefusalContext = {
+  readonly method: string | null
+  readonly currency: string | null
+}
+
+/** The whole payload boundary's answer for this path. */
+type InvoicePaymentRequest =
+  /** Readably, no payment is owed. The ONLY arm that may settle. */
+  | { readonly kind: 'none' }
+  /** Every field read, and a payment to queue. */
+  | { readonly kind: 'requested'; readonly payment: InvoicePaymentToRegister }
+  /** Some field is present and cannot be read. NOT a zero, and not a mapping problem. */
+  | { readonly kind: 'invalid'; readonly detail: string; readonly known: PaymentRefusalContext }
+
+/**
+ * THE WHOLE BOUNDARY, IN ORDER — AND THE ORDER IS ITSELF A DECISION (o3d-batch-ret r10, Codex HIGH).
+ *
+ * 1. THE FLAG FIRST, UNCONDITIONALLY. An unreadable `_registerPayment` refuses even over a payload
+ *    whose amount reads as zero: we do not know whether a payment was asked for, and "settle because
+ *    the money question happens to answer nothing" would be guessing the very thing that is corrupt.
+ * 2. THE AMOUNT NEXT — round 7's ordering, which the mapping arms depend on. A readable non-positive
+ *    amount SETTLES here, before `_paymentMethod`, `currency` or `_paymentDate` are judged at all:
+ *    an invoice that owes nothing queues no row, so no field that only a queued row uses can refuse
+ *    it. A paid £0 WooCommerce order must not be refused over a currency it will never spend.
+ * 3. THEN THE THREE FIELDS THE ENQUEUE ACTUALLY WRITES.
+ *
+ * `method` and `currency` are classified up front regardless, because {@link PaymentRefusalContext}
+ * is what the refusal's activity-log metadata is built from and a refusal about the AMOUNT should
+ * still say which method and currency the row named.
+ */
+function invoicePaymentRequest(payload: Record<string, unknown>): InvoicePaymentRequest {
+  const method = payloadPaymentMethod(payload)
+  const currency = payloadPaymentCurrency(payload)
+  const known: PaymentRefusalContext = {
+    method: 'value' in method ? method.value : null,
+    currency: 'value' in currency ? currency.value : null,
+  }
+
+  const requested = payloadPaymentRequested(payload)
+  if ('detail' in requested) return { kind: 'invalid', detail: requested.detail, known }
+  if (!requested.value) return { kind: 'none' }
+
+  const amount = requestedInvoicePayment(payload)
+  if (amount.kind === 'invalid') return { kind: 'invalid', detail: amount.detail, known }
+  if (amount.kind === 'none') return { kind: 'none' }
+
+  if ('detail' in method) return { kind: 'invalid', detail: method.detail, known }
+  if ('detail' in currency) return { kind: 'invalid', detail: currency.detail, known }
+  const paymentDate = payloadPaymentDate(payload)
+  if ('detail' in paymentDate) return { kind: 'invalid', detail: paymentDate.detail, known }
+
+  return {
+    kind: 'requested',
+    payment: { amount: amount.amount, method: method.value, currency: currency.value, paymentDate: paymentDate.value },
+  }
+}
+
+/**
+ * o3d-batch-ret ROUND 10 (Codex HIGH) — THE FIELD THAT GATES THE WHOLE DECISION WAS STILL READ BY
+ * TRUTHINESS, AND THAT IS THE FIFTH ROUND ON ONE AXIS.
+ *
+ * Rounds 6–9 each moved this conflation one frame outward: a default that meant success, then a
+ * resolver that merged "unknown" with "nothing owed", then a present `null` read as an absent key —
+ * and each fix was aimed at the field Codex had just named. The field that decides whether ANY of
+ * that runs was never one of them. Both connectors opened with `if (!payload._registerPayment)
+ * return FOLLOW_UPS_ENQUEUED`, so an absent flag, a literal `false`, a present `null`, a `0`, an
+ * `''` and an explicit `undefined` were ONE answer — "nobody asked for a payment" — and a truthy
+ * malformed value such as the string `'false'` went the other way and ENTERED payment registration.
+ *
+ * SO THIS ROUND CHANGES SHAPE INSTEAD OF FIXING A FIELD. Everything the two connectors read out of
+ * the persisted payload on this path is classified HERE, by field, with absence and
+ * present-but-unreadable answered separately for each — and the connectors read NOTHING out of the
+ * payload themselves. `_registerPayment` is the flag, `_paymentAmount`/`lines`/`shippingAmount`/
+ * `discountAmount` are the money (rounds 8–9, unchanged), and `_paymentMethod`, `currency` and
+ * `_paymentDate` were the three fields still being read inline with `as string || <default>` —
+ * where a present unreadable `currency` silently became `GBP` and settled the payment against the
+ * wrong bank account, and a non-string `_paymentDate` threw a TypeError out of an already-posted
+ * invoice. A field added later cannot get an ad-hoc truthiness test, because there is nowhere in
+ * either connector left to write one.
+ *
+ * THE FOLD IS THE ONLY WAY EITHER CONNECTOR ASKS THE QUESTION — AND THAT IS WHY IT IS A FOLD RATHER
+ * THAN A `switch` EACH OF THEM WRITES (o3d-batch-ret r8, Codex HIGH).
  *
  * A union alone leaves the conflation available to a caller who wants it: `if (r.kind !== 'amount')
  * return FOLLOW_UPS_ENQUEUED` type-checks perfectly and is exactly the round-7 defect written out
@@ -415,27 +638,28 @@ function requestedInvoicePayment(payload: Record<string, unknown>): RequestedInv
  *     caller CANNOT return `FOLLOW_UPS_ENQUEUED` from it. An unreadable payload cannot reach the
  *     settle path, and that is a compile error rather than a convention, which is the same move
  *     that made a missing verdict a ts2366 two rounds ago.
- *   • `onAmount` gets the number, and only ever a finite positive one, so a mapping may finally be
- *     asked about — the round-7 ordering, preserved by construction rather than by comment.
+ *   • `onAmount` gets a fully-read {@link InvoicePaymentToRegister} — a finite positive amount and
+ *     the three fields the enqueue puts on the row — so a mapping may finally be asked about (the
+ *     round-7 ordering) and there is no raw payload value left for the caller to default.
  *
  * The `switch` is exhaustive against a declared return type, so a fourth arm added to
- * `RequestedInvoicePayment` fails to build here (ts2366) instead of falling out as `undefined`.
+ * `InvoicePaymentRequest` fails to build here (ts2366) instead of falling out as `undefined`.
  */
 export async function decideRequestedInvoicePayment(
   payload: Record<string, unknown>,
   handle: {
-    onAmount: (amount: number) => Promise<FollowUpEnqueueOutcome>
-    onInvalid: (detail: string) => Promise<RefusedFollowUpEnqueue>
+    onAmount: (payment: InvoicePaymentToRegister) => Promise<FollowUpEnqueueOutcome>
+    onInvalid: (detail: string, known: PaymentRefusalContext) => Promise<RefusedFollowUpEnqueue>
   },
 ): Promise<FollowUpEnqueueOutcome> {
-  const requested = requestedInvoicePayment(payload)
+  const requested = invoicePaymentRequest(payload)
   switch (requested.kind) {
     case 'none':
       return FOLLOW_UPS_ENQUEUED
-    case 'amount':
-      return await handle.onAmount(requested.amount)
+    case 'requested':
+      return await handle.onAmount(requested.payment)
     case 'invalid':
-      return await handle.onInvalid(requested.detail)
+      return await handle.onInvalid(requested.detail, requested.known)
   }
 }
 
