@@ -734,7 +734,7 @@ test('[o3d-batch-ret] every crontab writer in the repository is inside the one e
   //     commented out while the OLD build is still serving, and restored after the NEW one is,
   //     so the application is live at both ends of the window.
   //
-  //     Tracked as o3d-batch-ret follow-up "extend the crontab flock to the fenced cutover".
+  //     Tracked as o3d-p9dq — extend the crontab flock to the fenced cutover.
   //     Listed rather than tolerated: a writer that is NOT one of these fails this test, and so
   //     does closing the gap, which is the point — either change has to come back through here.
   const OUTSIDE_THE_PROTOCOL: Record<string, number> = {
