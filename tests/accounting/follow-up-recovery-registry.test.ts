@@ -29,6 +29,7 @@ import {
 import {
   paymentAccountRefusalMessage,
   postedRowFollowUpRetryNote,
+  unreadablePaymentAmountRefusalMessage,
 } from '@/lib/domain/accounting/followup-enqueue-outcome'
 import { ACCOUNTING_CONNECTORS } from '@/lib/connectors/accounting-registry'
 import {
@@ -2476,6 +2477,30 @@ function activityProducers(): Array<{ what: string; text: string; mustEscalate: 
       mustEscalate: false,
     })
   }
+
+  // 6. THE UNREADABLE-AMOUNT REFUSAL (o3d-batch-ret r8, Codex HIGH) — THE SIXTH PRODUCER, in the
+  //    same file as the fifth, and the one r7 would have shipped judged by nothing had this list
+  //    not been pointed at it. It is a DIFFERENT sentence from the mapping refusal: there is no
+  //    setting to correct, so its remedy is escalation and it must SAY so — `mustEscalate` is true
+  //    here and false for the mapping refusal, whose remedy is a screen an operator can go to.
+  //
+  //    Walked for every registry connector plus the undeclared fallback, because the recovery half
+  //    arrives as an ARGUMENT here exactly as it does above, and the r6 lesson is that an argument
+  //    is where a clause true of one call site gets passed to one where it is false.
+  for (const connector of [...Object.keys(ACCOUNTING_FOLLOW_UP_RECOVERY), UNDECLARED_CONNECTOR]) {
+    produced.push({
+      what: `unreadablePaymentAmountRefusalMessage for ${connector} `
+        + `(the ${connector}_payment_skipped activity, reason payment_amount_unreadable)`,
+      text: unreadablePaymentAmountRefusalMessage({
+        connector,
+        referenceType: 'SalesOrder',
+        referenceId: 'so-1',
+        detail: '`_paymentAmount` is the string "not-a-number", which is not a finite amount',
+        recovery: followUpObligationRecoveryNote(followUpObligationRecoveryFor(connector)),
+      }),
+      mustEscalate: true,
+    })
+  }
   return produced
 }
 
@@ -2491,6 +2516,8 @@ const EXPECTED_ACTIVITY_PRODUCERS =
   // o3d-batch-ret r7: the payment-mapping refusal, in BOTH clause forms, for every registry
   // connector plus the undeclared fallback
   + (Object.keys(ACCOUNTING_FOLLOW_UP_RECOVERY).length + 1) * 2
+  // o3d-batch-ret r8: the unreadable-amount refusal, for every registry connector plus the fallback
+  + (Object.keys(ACCOUNTING_FOLLOW_UP_RECOVERY).length + 1)
 
 test('[o3d-0bfh r11] every activity string an operator can receive is judged by THE ONE LIST, taken from its producer', () => {
   // Route: xeroRetainedFollowUpObligationDescription() — the function that composes the
@@ -2506,7 +2533,8 @@ test('[o3d-0bfh r11] every activity string an operator can receive is judged by 
     produced.length, EXPECTED_ACTIVITY_PRODUCERS,
     'the Xero activity, the shared note and the sweep activity for every registry connector and the '
       + 'fallback, the compacted-tombstone discard over every phase and basis, and the payment-mapping '
-      + 'refusal in both clause forms for every connector and the fallback',
+      + 'refusal in both clause forms for every connector and the fallback, and the unreadable-amount '
+      + 'refusal for each of them',
   )
   for (const { what, text, mustEscalate } of produced) {
     assert.ok(text.length > 0, `${what} must actually produce a string, or this scan reads nothing`)
@@ -2677,6 +2705,9 @@ test('[o3d-0bfh r11/r12] every FILE that writes about a retained obligation is s
   // message, and the retry clause whose registry half arrives as an argument.
   assert.match(sources[5]!.code, /export function paymentAccountRefusalMessage/)
   assert.match(sources[5]!.code, /export function postedRowFollowUpRetryNote/)
+  // r8: and the third producer in that file, which says what the other two cannot — that there is
+  // nothing to configure and no retry that repairs it.
+  assert.match(sources[5]!.code, /export function unreadablePaymentAmountRefusalMessage/)
   assert.match(
     sources[5]!.code, /\$\{input\.atRest\}/,
     'the at-rest half must be interpolated from the caller\'s registry answer, never restated here',

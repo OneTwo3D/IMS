@@ -372,7 +372,7 @@ test('[o3d-batch-ret r7] a paid ZERO-TOTAL invoice SETTLES with no mapping confi
   // on, so the only thing that can keep this quiet is the amount being asked about first.
   //
   // MUTATION THAT KILLS IT: in lib/connectors/xero/sync-processor.ts, move the
-  // `requestedInvoicePaymentAmount` / `!(amount > 0)` pair back BELOW the two mapping checks (the
+  // `decideRequestedInvoicePayment` call back BELOW the two mapping checks (the
   // round-6 ordering). `xero_payment_skipped` is written and the marker is retained, for a payment
   // nobody was owed.
   for (const { what, money } of [
@@ -437,4 +437,150 @@ test('[o3d-batch-ret r7] CONTROL: the same fixture with a POSITIVE amount and no
 
   assert.equal(paymentRefusals().length, 1, 'money that IS owed and cannot be queued is still refused')
   assert.notEqual(marker(), null, 'and its obligation is still retained')
+})
+
+/**
+ * o3d-batch-ret ROUND 8 (Codex HIGH) — AND ROUND 7'S RESOLVER READ "UNKNOWN" AS "NOTHING OWED".
+ *
+ * The round-7 fix asked the money question first and answered it with `number | undefined`. Both
+ * connectors then wrote `if (amount === undefined || !(amount > 0)) return FOLLOW_UPS_ENQUEUED`, so
+ * a `_paymentAmount` that could not be parsed, an absent `lines`, a `lines` that is not an array, a
+ * line with no readable quantity, and a derived total that overflowed all produced the ONE value
+ * that settles. The marker was cleared, the sweep stopped selecting the row, and a payment that was
+ * really requested was reported as work that never existed.
+ *
+ * ABSENCE IS NOT A NEGATIVE ANSWER. `requestedInvoicePayment` answers `none | amount | invalid`,
+ * `decideRequestedInvoicePayment` settles only `none`, and the `invalid` handler is typed to return
+ * a REFUSED outcome, so neither connector can settle a payload whose amount it could not read.
+ */
+test('[o3d-batch-ret r8] a payment amount that cannot be READ is refused on every route, and the marker SURVIVES', async () => {
+  // ROUTE: the real `repairXeroBackReferences` over a SYNCED SALES_INVOICE whose payload asks for a
+  // payment, with the mapping CORRECTLY CONFIGURED — so no arm below can be mistaken for the mapping
+  // refusal, and the only thing between the row and a settlement is the amount being unreadable. The
+  // real receipt fence runs and the real `releaseFollowUpObligation` is the only thing that can clear
+  // the marker column read below.
+  //
+  // MUTATION THAT KILLS IT: in lib/domain/accounting/followup-enqueue-outcome.ts, make
+  // `unreadableAmount()` return `NOTHING_OWED` — round 7's `undefined`, which this connector read as
+  // "nothing to move". Every arm below then refuses nothing and the marker is CLEARED.
+  //
+  // EVERY ROUTE INTO `invalid` IS WALKED: they are five different branches of the resolver, and a
+  // guard added for only the one Codex named would pass a single-shape test.
+  for (const { what, money, detail } of [
+    {
+      what: 'no `lines` key at all — the shape round 7 turned from a TypeError into an empty array',
+      money: {},
+      detail: /declares no `_paymentAmount` and its `lines` is absent rather than an array/,
+    },
+    {
+      what: 'a `lines` that is not an array',
+      money: { lines: { quantity: 1, unitAmount: 120 } },
+      detail: /its `lines` is an object rather than an array/,
+    },
+    {
+      what: 'a declared `_paymentAmount` that is not a number',
+      money: { _paymentAmount: 'one hundred and twenty', lines: [{ quantity: 1, unitAmount: 120 }] },
+      detail: /`_paymentAmount` is the string "one hundred and twenty", which is not a finite amount/,
+    },
+    {
+      what: 'a line whose unit amount cannot be read',
+      money: { lines: [{ quantity: 1, unitAmount: null }] },
+      detail: /`lines\[0\]\.unitAmount` is null, which is not a finite number/,
+    },
+    {
+      what: 'a derived total that is not finite',
+      money: { lines: [{ quantity: 1e308, unitAmount: 10 }] },
+      detail: /the amount derived from the payload lines is not a finite number/,
+    },
+  ]) {
+    reset({ card: 'BANK-1' })
+    store = createSyncLogStore([syncLogRow({
+      ...SALES_CANDIDATE,
+      payload: {
+        invoiceNumber: 'INV-1',
+        currency: 'GBP',
+        _registerPayment: true,
+        _paymentMethod: 'card',
+        _paymentDate: '2026-08-20',
+        ...money,
+      },
+    })])
+
+    await (await loadSweep())()
+
+    assert.equal(
+      salesOrders.get('order-1')?.accountingInvoiceId, 'XERO-INV-1',
+      `PRECONDITION (${what}): the repair really ran — otherwise nothing below is about the enqueue`,
+    )
+    assert.deepEqual(
+      followUpTypes(), ['INVOICE_PDF'],
+      `no INVOICE_PAYMENT row is created (${what}) — the amount to put on it is not known`,
+    )
+
+    const refusal = paymentRefusals()
+    assert.equal(refusal.length, 1, `the operator is told once, and told why (${what})`)
+    assert.equal(
+      refusal[0].metadata?.reason, 'payment_amount_unreadable',
+      `and it is NOT reported as the mapping refusal (${what}) — the mapping here is correct, and a `
+        + 'bank-account screen is no remedy for a corrupt payload',
+    )
+    assert.match(refusal[0].description, detail, `the sentence names what could not be read (${what})`)
+    assert.match(
+      refusal[0].description, /AN UNREADABLE AMOUNT IS NOT A ZERO/,
+      `and says which fact this is (${what})`,
+    )
+    assert.match(
+      refusal[0].description, /a later sweep re-reads the marker and re-enqueues them idempotently/,
+      `the recovery half is still the REGISTRY's declared fact for this connector (${what}), never a `
+        + 'sentence written in the processor — this call site has two drivers',
+    )
+    assert.match(
+      refusal[0].description, /that re-read changes nothing until the payload itself is rebuilt/,
+      `and the producer says the part the registry cannot (${what}): the sweep will come back and `
+        + 'refuse again, so the re-read is not the remedy',
+    )
+    assert.match(refusal[0].description, /ESCALATE/, `the remedy is escalation, not a setting (${what})`)
+
+    assert.notEqual(
+      marker(), null,
+      `THE FINDING (${what}): the row must still say it owes follow-ups. A cleared marker here is a `
+        + 'payment that was requested, never queued, and looks reconciled',
+    )
+    assert.equal(
+      store.get('log-1')?.backReferenceCheckedAt, null,
+      `and it is left in the sweep candidate set (${what})`,
+    )
+  }
+})
+
+test('[o3d-batch-ret r8] CONTROL: a DECLARED zero still settles, with no `lines` to derive from at all', async () => {
+  // Without this the test above could pass on a build that refuses every payload — the round-7
+  // regression (a paid £0 order refused for a bank account it would never use), not its fix.
+  //
+  // And it is the sharpest statement of the rule: the SAME shape refused above for carrying no
+  // `lines` SETTLES here, because a readable `_paymentAmount` is final and the derivation is never
+  // reached. "No lines" is unreadable only when the amount has to be derived from them.
+  //
+  // ROUTE: one real sweep run, mapping deliberately absent so a refusal of any kind would be loud.
+  // MUTATION THAT KILLS IT: make `readableAmount()` answer `invalid` for a non-positive amount —
+  // the over-correction. This fails on the refusal count and on the marker.
+  reset(null)
+  store = createSyncLogStore([syncLogRow({
+    ...SALES_CANDIDATE,
+    payload: {
+      invoiceNumber: 'INV-1',
+      currency: 'GBP',
+      _registerPayment: true,
+      _paymentMethod: 'card',
+      _paymentDate: '2026-08-20',
+      _paymentAmount: 0,
+    },
+  })])
+
+  await (await loadSweep())()
+
+  assert.equal(salesOrders.get('order-1')?.accountingInvoiceId, 'XERO-INV-1', 'PRECONDITION: the repair ran')
+  assert.deepEqual(paymentRefusals(), [], 'an invoice that says it owes nothing is not refused')
+  assert.deepEqual(followUpTypes(), ['INVOICE_PDF'], 'and no INVOICE_PAYMENT row is created')
+  assert.equal(marker(), null, 'and the obligation IS discharged')
 })
