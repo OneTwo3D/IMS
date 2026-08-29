@@ -46,6 +46,7 @@ import {
   REINSTALL_BODY,
   REPO,
   SHIPPED_ROTATION_UP_TO_THE_CLEAR,
+  caGenerationPath,
   connectWithDriver,
   decodeVar,
   envDatabaseUrl,
@@ -54,6 +55,7 @@ import {
   readVar,
   runShipped,
   seedLiveInstallation,
+  writeCertificate,
   writeInstalledEnv,
 } from './install-shell-rig.ts'
 import { type Cluster, cleanLibpqEnv, currentUser, freePort, pgBinDir, startCluster } from './real-postgres-cluster.ts'
@@ -2772,12 +2774,14 @@ test('r45: an upgrade recovers the transport and the CA from the URL the previou
   chmodSync(root, 0o755)
   try {
     const ca = join(root, 'ca.pem')
-    // DISTINCTIVE BYTES, because since r46 the recovered pathname is not what comes back out:
-    // prompt_db_sslmode() publishes the CA and repoints DB_SSLROOTCERT at the published copy. The
-    // only way left to prove WHICH file the recovery read is to read the bytes it published.
-    const CA_BYTES = '-- the CA the previous run of this installer verified against --\n'
-    writeFileSync(ca, CA_BYTES)
-    const publishedCa = join(root, 'db-ca-published/db-ca.crt')
+    // A REAL CERTIFICATE, AND A DISTINCTIVE ONE (r47). Since r47 the publisher PARSES its input, so
+    // a line of prose in a `.pem` no longer publishes at all; and since r46 the recovered pathname
+    // is not what comes back out — prompt_db_sslmode() publishes the CA and repoints DB_SSLROOTCERT
+    // at the published generation. The only way left to prove WHICH file the recovery read is to
+    // read the bytes it published, so the certificate carries a CN nothing else in this file uses.
+    writeCertificate(ca, 'r45-upgrade-recovered-ca')
+    const CA_BYTES = readFileSync(ca, 'utf8')
+    const publishedCa = caGenerationPath(join(root, 'db-ca-published'), ca)
     const written = (query: string): string =>
       `NODE_ENV=production\nDATABASE_URL=postgresql://imsuser:pw@db.example.com:5432/one_two_inventory${query}\n`
 
@@ -2818,6 +2822,10 @@ test('r45: an upgrade recovers the transport and the CA from the URL the previou
       'RECOVERED_CA: and it names the PUBLISHED copy, which is the one file all three readers open')
     assert.equal(readFileSync(publishedCa, 'utf8'), CA_BYTES,
       'RECOVERED_CA: and the bytes there are the ones the recovered path held, or the recovery read some other file')
+    // AND THE GENERATION IS NAMED AFTER THEM (r47). caGenerationPath() derives the path from the
+    // digest of openssl's re-encoding of this certificate, so a publication that landed anywhere
+    // else — a fixed `db-ca.crt`, or the digest of some other file — has no file at this path at all.
+    assert.ok(existsSync(publishedCa), `the published generation must be named after its own contents: ${publishedCa}`)
 
     writeFileSync(join(root, '.env'), written('?sslmode=require&uselibpqcompat=true'))
     assert.match(recover().output, /^RECOVERED_MODE=require$/m, 'the same for the mode that verifies nothing')
@@ -2906,7 +2914,9 @@ test('r46: a full --non-interactive install carries verify-full and its CA from 
   try {
     const source = readFileSync(join(REPO, 'scripts/install.sh'), 'utf8')
     const ca = join(root, 'operator-ca.pem')
-    writeFileSync(ca, '-- the operator’s own certificate authority --\n')
+    // A REAL CERTIFICATE (r47): the publisher parses its input now, and a `.pem` that is not one is
+    // refused before anything is written.
+    writeCertificate(ca, 'r46-operator-ca')
 
     // The entrypoint's own statements: how it decides it is non-interactive, what it declares
     // before any prompt runs, and the block that asks the question.
@@ -2949,9 +2959,9 @@ test('r46: a full --non-interactive install carries verify-full and its CA from 
     assert.match(run.output, /^MODE=verify-full$/m,
       `MODE: the transport the caller exported must survive the declarations that used to erase it:\n${run.output}`)
 
-    const published = join(root, 'published/db-ca.crt')
+    const published = caGenerationPath(join(root, 'published'), ca)
     assert.match(run.output, new RegExp(`^CA=${published}$`, 'm'),
-      'CA: and it names the published copy, which is the file all three readers open')
+      'CA: and it names the published generation, which is the file all three readers open')
     assert.equal(readFileSync(published, 'utf8'), readFileSync(ca, 'utf8'),
       'CA: whose bytes are the operator’s, or the CA that was validated is not the CA that is used')
 
@@ -2967,10 +2977,17 @@ test('r46: a full --non-interactive install carries verify-full and its CA from 
     // the environment override above exists so a rig with no root can run this at all, and this
     // asserts the production path is the one the production run would use.
     const shippedDir = shippedLiteral(source, 'DB_CA_PUBLISH_DIR')
-    assert.equal(shippedLiteral(source, 'DB_CA_PUBLISHED_FILE'), `\${DB_CA_PUBLISH_DIR}/db-ca.crt`,
-      'the published file hangs off the published directory')
+    assert.equal(shippedLiteral(source, 'DB_CA_PUBLISHED_FILE'), '',
+      'r47: the published file is EMPTY until publish_db_ca() sets it — a fixed name is the overwrite defect itself')
     assert.match(shippedDir, /^\/[A-Za-z0-9._/-]+$/,
       'the published directory must be absolute and inside the character set DB_SSLROOTCERT is validated against')
+    // AND A GENERATION PATH KEEPS THE WHOLE THING INSIDE THAT SET. The operator's own path is
+    // validated character by character before publication; THIS path is never validated again and
+    // goes into a URL query, an environment variable and two command lines, so it has to be inside
+    // the set by construction. A sha256 is 64 hex characters, and the two literals are the rest.
+    assert.match(`${shippedDir}/${shippedLiteral(source, 'DB_CA_GENERATION_PREFIX')}${'0'.repeat(64)}${shippedLiteral(source, 'DB_CA_GENERATION_SUFFIX')}`,
+      /^\/[A-Za-z0-9._/-]+$/,
+      'a generation path must be inside the character set DB_SSLROOTCERT is validated against')
     assert.equal(shippedLiteral(source, 'DB_CA_PUBLISH_OWNER'), 'root:root',
       'and the published CA is root-owned, which is the whole of the immutability half of the finding')
   } finally {
@@ -3012,13 +3029,15 @@ test('r46: a CA readable only by its owner is published as a copy every uid can 
   chmodSync(root, 0o755)
   try {
     const ca = join(root, 'root-only-ca.pem')
-    writeFileSync(ca, '-- a CA the installer can read and nobody else can --\n')
+    // A REAL CERTIFICATE (r47), at a mode nobody but its owner can open — which is the input the
+    // finding is about, and which the publisher must now also PARSE before it copies anything.
+    writeCertificate(ca, 'r46-root-only-ca')
     chmodSync(ca, 0o600)
     assert.equal(statSync(ca).mode & 0o077, 0,
       'precondition: the source CA must be unreadable by every uid but its owner — that is the defect’s input')
 
     const publishDir = join(root, 'published')
-    const published = join(publishDir, 'db-ca.crt')
+    const published = caGenerationPath(publishDir, ca)
     const run = runShipped(
       { APP_DIR: root, APP_USER: currentUser(), DB_CA_PUBLISH_DIR: publishDir },
       `
@@ -3084,6 +3103,405 @@ test('r46: a CA readable only by its owner is published as a copy every uid can 
         `${dir} must grant other-execute or no other uid can reach the published CA`)
       if (dir === '/') break
     }
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 27d. THE PUBLISHER IS NOT AN ARBITRARY-FILE-DISCLOSURE PRIMITIVE
+//      (o3d-2sm1.5 r47, Codex HIGH)
+//
+// THE FINDING, AND IT IS A CONSEQUENCE OF r46's OWN REMEDY. r46 fixed "the CA is validated as the
+// wrong principal" by copying the operator's file to a fixed path at mode 0644. The publisher took
+// any file it could hash and copied its EXACT BYTES; the caller had checked only that the source
+// was a regular file root could read — and this installer runs as root, so that is every file on
+// the box. `DB_SSLROOTCERT=/etc/ssl/private/db.key`, a tab-completion that landed one entry early,
+// or a `fullchain+key.pem` an operator assembled for a web server, and privileged bytes are
+// world-readable at a well-known path before TLS ever looks at them.
+//
+// WHAT IS ASSERTED HERE IS AN ACCEPT-LIST, NOT A DENYLIST. `grep -q 'PRIVATE KEY'` is the shape
+// that has failed repeatedly on this branch: the next dangerous label is always the one nobody
+// listed, and it is wrong about its own subject anyway — a block LABELLED `CERTIFICATE` carrying
+// key material passes it. So the file is parsed: every PEM block is decoded by `openssl x509`, only
+// blocks that decode as X.509 certificates are kept, and the PUBLISHED bytes are openssl's own
+// re-encoding of what it parsed rather than any part of the source. MISLABELLED below is the
+// measurement that separates the two — a private key wearing a certificate's armour, which no
+// pattern over labels can catch and the parser refuses.
+// ---------------------------------------------------------------------------
+
+test('r47: a source that is not a bundle of certificates is refused, and nothing is published', () => {
+  // MUTATION ROUTES (each applied to scripts/install.sh and this file re-run):
+  //   M1 -- restore the r46 publisher: `publish_durable_file ... 644 < "${source}"` with no parse.
+  //         KEY_PUBLISHED, MIXED_PUBLISHED and MISLABELLED_PUBLISHED all come back with a file, and
+  //         NO_KEY_MATERIAL_ANYWHERE fails on the first of them — the private key is on disk at
+  //         0644. That is the finding, reproduced.
+  //   M2 -- replace the openssl decode with a label test (`[[ "${label}" == CERTIFICATE ]]` and
+  //         nothing more): KEY_RC and MIXED_RC still refuse, and MISLABELLED_RC comes back 0 with
+  //         the key's own base64 published at 0644 under a CERTIFICATE header. This is the route
+  //         that says the accept-list has to be enforced by a PARSER and not by reading armour.
+  //   M3 -- accept any label rather than only CERTIFICATE (`if false; then ... refuse`). MEASURED,
+  //         AND IT IS NOT WHERE THE REFUSAL COMES FROM: KEY_RC, MIXED_RC and MISLABELLED_RC all
+  //         still refuse, because the openssl decode one step later refuses a private key whatever
+  //         its armour said. What changes is KEY_REFUSAL — an operator who mistyped a path is told
+  //         "openssl could not parse a CERTIFICATE block" instead of "this file contains a PRIVATE
+  //         KEY block", which is the difference between re-running with the right file and
+  //         re-running with the same one. The accept-list is asserted through the message it
+  //         produces rather than through an outcome it does not change.
+  //   M4 -- drop the `rm -f "${candidate}"` on the refusal paths: CANDIDATES_LEFT is non-zero, and
+  //         the bytes the parse got through before it refused stay in the publish directory. The
+  //         parse writing into a 0600 temporary rather than into the generation is what makes a
+  //         mid-file refusal — a bundle whose SECOND block is a key — disclose nothing; without the
+  //         cleanup the temporary is still there for the next thing that reads the directory.
+  //   M5 -- digest the SOURCE file instead of the normalised bytes: ANNOTATED_PUBLISHED fails with a
+  //         SECOND generation for the same certificate, because the vendor preamble changed the
+  //         source bytes and not the certificate. That is also the route that measures
+  //         content-addressing itself — test 27e cannot, because the CA it uses is a cluster
+  //         certificate openssl already wrote in canonical form, so there the two digests coincide
+  //         and the mutation comes back vacuous.
+  const root = mkdtempSync(join(tmpdir(), 'ims-r47-disclosure-'))
+  chmodSync(root, 0o755)
+  try {
+    const publishDir = join(root, 'published')
+    const ca = join(root, 'real-ca.pem')
+    const key = writeCertificate(ca, 'r47-real-ca')
+    const KEY_BYTES = readFileSync(key, 'utf8')
+    assert.match(KEY_BYTES, /-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----/,
+      'precondition: the private key must actually be a private key — it is the material this test must never find published')
+
+    // THE FOUR SOURCES A TYPO CAN NAME. Each is a real file root can read, which is the whole of
+    // what the r46 caller checked before copying it out world-readable.
+    const mixed = join(root, 'fullchain-and-key.pem')
+    writeFileSync(mixed, `${readFileSync(ca, 'utf8')}${KEY_BYTES}`)
+    const shadowish = join(root, 'not-a-pem-at-all')
+    writeFileSync(shadowish, 'root:$6$averysecrethash:19000:0:99999:7:::\n')
+    // MISLABELLED: the private key with a certificate's armour. No test over labels can refuse it;
+    // openssl refuses it because the DER inside is not a certificate.
+    const mislabelled = join(root, 'mislabelled.pem')
+    writeFileSync(mislabelled, KEY_BYTES.replace(/PRIVATE KEY/g, 'CERTIFICATE'))
+    // And one that MUST be accepted, or the accept-list is just a refusal: a vendor bundle with the
+    // subject/issuer preamble such files habitually carry. The commentary is dropped, not refused,
+    // because it is never published.
+    const annotated = join(root, 'annotated-bundle.pem')
+    writeFileSync(annotated, `Subject: CN=r47-real-ca\nIssuer: CN=r47-real-ca\n\n${readFileSync(ca, 'utf8')}`)
+
+    const run = runShipped(
+      { APP_DIR: root, APP_USER: currentUser(), DB_CA_PUBLISH_DIR: publishDir },
+      `
+        publish_db_ca ${JSON.stringify(ca)} >/dev/null 2>&1; echo "CA_RC=$?"
+        echo "CA_PUBLISHED=\${DB_CA_PUBLISHED_FILE}"
+
+        # EVERY REFUSAL IS MEASURED THE SAME WAY: the return value, and what the publish directory
+        # holds afterwards. A refusal that has already written something is not a refusal.
+        for source in ${JSON.stringify(key)} ${JSON.stringify(mixed)} ${JSON.stringify(shadowish)} ${JSON.stringify(mislabelled)}; do
+          before="$(ls -A ${JSON.stringify(publishDir)} | wc -l)"
+          DB_CA_PUBLISHED_FILE=""
+          publish_db_ca "\${source}" >/dev/null 2>&1; rc=$?
+          after="$(ls -A ${JSON.stringify(publishDir)} | wc -l)"
+          echo "RC:\${source}=\${rc}"
+          echo "SET:\${source}=\${DB_CA_PUBLISHED_FILE}"
+          echo "GREW:\${source}=$(( after - before ))"
+        done
+
+        # WHAT THE REFUSAL SAYS, for the source an operator is most likely to have named by mistake.
+        # A refusal that does not name the block type it found leaves them re-running the installer
+        # with the same file, and it is also what makes the accept-list load-bearing rather than
+        # decorative: the openssl decode below would refuse a private key anyway, so this message is
+        # the only observable difference between checking the label and not checking it.
+        DB_CA_PUBLISHED_FILE=""
+        echo "KEY_REFUSAL_B64=$( { publish_db_ca ${JSON.stringify(key)} >/dev/null; } 2>&1 | base64 -w0 )"
+
+        # AND THE ONE THAT MUST STILL WORK, or the accept-list has simply banned certificates too.
+        DB_CA_PUBLISHED_FILE=""
+        publish_db_ca ${JSON.stringify(annotated)} >/dev/null 2>&1; echo "ANNOTATED_RC=$?"
+        echo "ANNOTATED_PUBLISHED=\${DB_CA_PUBLISHED_FILE}"
+
+        # NORMALISATION IS IDEMPOTENT, which is what makes re-running an unchanged TLS installation
+        # a no-op rather than a new generation every time.
+        DB_CA_PUBLISHED_FILE=""
+        publish_db_ca "$(ls ${JSON.stringify(publishDir)}/db-ca-*.crt | head -1)" >/dev/null 2>&1; echo "REPUBLISH_RC=$?"
+        echo "REPUBLISH_PUBLISHED=\${DB_CA_PUBLISHED_FILE}"
+
+        echo "GENERATION_COUNT=$(ls -1 ${JSON.stringify(publishDir)}/db-ca-*.crt 2>/dev/null | wc -l)"
+        echo "CANDIDATES_LEFT=$(ls -1A ${JSON.stringify(publishDir)} | grep -c candidate || true)"
+        echo "KEY_MATERIAL_HITS=$(grep -rlF 'PRIVATE KEY' ${JSON.stringify(publishDir)} 2>/dev/null | wc -l)"
+      `,
+    )
+
+    assert.equal(run.status, 0, run.output)
+    assert.match(run.output, /^CA_RC=0$/m, `precondition: a real certificate must still publish:\n${run.output}`)
+    const generation = readVar(run.output, 'CA_PUBLISHED')
+    assert.equal(generation, caGenerationPath(publishDir, ca),
+      'precondition: and it lands on the generation its own normalised bytes name')
+
+    for (const [label, source] of [
+      ['KEY', key], ['MIXED', mixed], ['NOT_PEM', shadowish], ['MISLABELLED', mislabelled],
+    ] as ReadonlyArray<[string, string]>) {
+      assert.equal(readVar(run.output, `RC:${source}`), '1',
+        `${label}_RC: ${source} must be refused — the installer runs as root, so any file it is handed is a file it can read:\n${run.output}`)
+      assert.equal(readVar(run.output, `SET:${source}`), '',
+        `${label}_PUBLISHED: and a refusal must leave no generation named, or the caller repoints DATABASE_URL at one`)
+      assert.equal(readVar(run.output, `GREW:${source}`), '0',
+        `${label}_PUBLISHED_COUNT: and must add no file to ${publishDir} — the disclosure happens at the write, not at the return`)
+    }
+
+    const refusal = Buffer.from(readVar(run.output, 'KEY_REFUSAL_B64'), 'base64').toString('utf8')
+    assert.match(refusal, /PRIVATE KEY/,
+      `KEY_REFUSAL: the refusal must name the block type it found, or the operator who mistyped a path is told only that "something" failed to parse:\n${refusal}`)
+    assert.match(refusal, /NOTHING HAS BEEN PUBLISHED/,
+      'KEY_REFUSAL: and must say so, because "it was refused" and "it was refused after being copied out" are the two answers this finding is about')
+
+    assert.match(run.output, /^ANNOTATED_RC=0$/m,
+      `ANNOTATED: a bundle with the subject/issuer preamble vendors ship must still publish — an accept-list that refuses real CA files is not a fix:\n${run.output}`)
+    assert.equal(readVar(run.output, 'ANNOTATED_PUBLISHED'), generation,
+      'ANNOTATED: and the commentary is DROPPED, not published — the same certificate normalises to the same generation')
+    assert.match(run.output, /^REPUBLISH_RC=0$/m, 'a published generation must republish')
+    assert.equal(readVar(run.output, 'REPUBLISH_PUBLISHED'), generation,
+      'REPUBLISH: onto itself — normalisation is idempotent, so re-running an unchanged TLS installation writes what is already there')
+    assert.equal(readVar(run.output, 'GENERATION_COUNT'), '1',
+      `GENERATION_COUNT: one certificate, one generation, however many times it was published:\n${run.output}`)
+    assert.equal(readVar(run.output, 'CANDIDATES_LEFT'), '0',
+      `CANDIDATES_LEFT: the 0600 temporary the parse writes into must be removed on every path:\n${run.output}`)
+    assert.equal(readVar(run.output, 'KEY_MATERIAL_HITS'), '0',
+      `NO_KEY_MATERIAL_ANYWHERE: not one byte of private-key armour may exist anywhere under the world-readable publish directory:\n${run.output}`)
+
+    // AND FROM OUTSIDE THE SHELL: the published bytes are openssl's re-encoding of the certificate,
+    // so nothing the source carried alongside it can have survived.
+    assert.equal(
+      readFileSync(generation, 'utf8'),
+      execFileSync('openssl', ['x509', '-inform', 'PEM', '-outform', 'PEM', '-in', ca], { encoding: 'utf8' }),
+      'the published generation must be the certificate openssl parsed, not the bytes the source held')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 27e. THE LOAD-BEARING ONE FOR r47's SECOND HIGH: A FAILED REFRESH LEAVES THE WORKING
+//      INSTALLATION CONNECTING (o3d-2sm1.5 r47, Codex HIGH)
+//
+// THE FINDING, AND IT IS THE OTHER CONSEQUENCE OF r46's REMEDY. r46 published to ONE FIXED PATH,
+// and on an upgrade the installed DATABASE_URL already names it. So publishing a candidate
+// REPLACED the trust root the running installation verifies against — atomically, durably, and
+// BEFORE any database connection had proved the candidate. A wrong or stale CA, or any later
+// refusal in a script that has a hundred of them, and the box was left with a durable trust root
+// nothing could connect through, while the refusal printed "Nothing has been changed on this host."
+// The loaded process kept its CA bytes in memory, so the outage arrived at the next restart —
+// hours or weeks later, with nothing left on the box pointing at the cause.
+//
+// IT IS THIS BRANCH'S OLDEST SHAPE: the irreversible act before the proof, exactly as the fence
+// adoption had it, and the credential rotation, and the ALTER before the journal.
+//
+// THE FIX REMOVES THE ACT RATHER THAN RE-ORDERING IT. A generation is named by the sha256 of its
+// own published bytes, so a candidate whose bytes differ from the installed generation's CANNOT be
+// written over it — there is no ordering to get wrong and no window to be killed in — and one whose
+// bytes are identical writes what is already there. The persisted URL still selects the generation,
+// and it is still rewritten only at the environment-file publication, far below every probe.
+//
+// MEASURED AGAINST A REAL TLS-ONLY CLUSTER, with the installed driver, because the claim is not
+// about paths: it is that the previously working installation STILL CONNECTS afterwards.
+// ---------------------------------------------------------------------------
+
+test('r47: an upgrade whose candidate CA cannot verify the server leaves the installed one connecting', async () => {
+  // MUTATION ROUTES (each applied to scripts/install.sh and this file re-run):
+  //   M1 -- restore the fixed path: publish to `${DB_CA_PUBLISH_DIR}/db-ca.crt` and report that.
+  //         INSTALLED_STILL_CONNECTS is the assertion that fails, and it fails with
+  //         `refused:DEPTH_ZERO_SELF_SIGNED_CERT` — the installed URL names db-ca.crt, the refresh
+  //         overwrote it with a CA the cluster's certificate does not chain to, and the working
+  //         installation is down. That is the finding, and it is the whole reason this test opens
+  //         a real connection instead of comparing pathnames.
+  //   M2 -- delete the `DB_SSLROOTCERT="${DB_CA_PUBLISHED_FILE}"` assignment in prompt_db_sslmode():
+  //         CANDIDATE_IS_A_NEW_GENERATION fails with the operator's own pathname, because the
+  //         published generation is then named nowhere and the URL carries the 0600 source instead.
+  //
+  // AND ONE ROUTE THAT COMES BACK VACUOUS HERE, measured and recorded rather than predicted:
+  // digesting the SOURCE instead of the normalised bytes changes nothing in this test, because the
+  // CA it uses is a cluster certificate openssl itself wrote in canonical form, so the two digests
+  // are equal. Test 27d catches it, on a bundle with a vendor preamble.
+  //
+  // AND WHY CONTENT-ADDRESSING RATHER THAN A COUNTER. A generation numbered by a counter has to
+  // read the directory to know what the next number is, so a fresh or partly cleaned directory
+  // re-issues a number some installed URL is still using — the same overwrite, reached by a
+  // different route. A name derived from the bytes cannot collide with a different trust root at
+  // all, which is why this is a removal of the irreversible act and not a re-ordering of it.
+  const root = mkdtempSync(join(tmpdir(), 'ims-r47-refresh-'))
+  chmodSync(root, 0o755)
+  let cluster: Cluster | undefined
+  try {
+    cluster = startCluster(root, 'live', await freePort(), '127.0.0.1', [
+      'hostssl all all 127.0.0.1/32 scram-sha-256',
+      'hostnossl all all 127.0.0.1/32 reject',
+    ], { ssl: true })
+    seedLiveInstallation(cluster)
+    const publishDir = join(root, 'published')
+    const serverCa = join(cluster.data, 'server.crt')
+    // A CA THAT IS PERFECTLY VALID AND IS NOT THIS CLUSTER'S. This is the realistic failure: an
+    // operator refreshing a rotated CA and naming last year's file, or the wrong cluster's.
+    const wrongCa = join(root, 'wrong-ca.pem')
+    writeCertificate(wrongCa, 'some-other-cluster')
+
+    // ---- THE INSTALLATION THAT ALREADY WORKS. Its generation is read out of the shipped
+    // publisher rather than computed here, so the mutations above are measured on the real path.
+    const first = runShipped(
+      { APP_DIR: root, APP_USER: currentUser(), DB_CA_PUBLISH_DIR: publishDir },
+      `publish_db_ca ${JSON.stringify(serverCa)} >/dev/null 2>&1; echo "RC=$?"; echo "GEN=\${DB_CA_PUBLISHED_FILE}"`,
+    )
+    assert.equal(first.status, 0, first.output)
+    assert.match(first.output, /^RC=0$/m, `precondition: the cluster's own CA must publish:\n${first.output}`)
+    // READ OUT OF THE SHIPPED PUBLISHER, not computed here. Under M1 and M2 below this IS whatever
+    // the mutated publisher chose, so the installed URL names it and the mutation gets to do its
+    // damage — a test that computed the path itself would fail on the path and never reach the
+    // connection, which is the assertion the finding is about.
+    const installedGeneration = readVar(first.output, 'GEN')
+    const installedBytes = readFileSync(installedGeneration, 'utf8')
+
+    const installedUrl = `postgresql://imsuser:live-password@127.0.0.1:${cluster.port}/one_two_inventory`
+      + `?sslmode=verify-full&uselibpqcompat=true&sslrootcert=${installedGeneration}`
+    writeFileSync(join(root, '.env'), `NODE_ENV=production\nDATABASE_URL=${installedUrl}\n`)
+    assert.equal(await driverRoute(installedUrl), 'tls',
+      'precondition: the installation this test is about must actually work before the refresh — verify-full, against the generation its URL names')
+    // AND THE CANDIDATE GENUINELY CANNOT VERIFY THIS SERVER, established BEFORE the refresh so that
+    // everything below is a measurement of a FAILED refresh and not of a successful one.
+    assert.match(
+      await driverRoute(`postgresql://imsuser:live-password@127.0.0.1:${cluster.port}/one_two_inventory`
+        + `?sslmode=verify-full&uselibpqcompat=true&sslrootcert=${wrongCa}`),
+      /^refused:/,
+      'precondition: the CA the operator is about to supply must be unable to verify this cluster')
+
+    // ---- THE REFRESH THAT MUST NOT DESTROY IT. The operator supplies a new CA the way an
+    // unattended upgrade supplies one: through the process environment, which since r46 beats the
+    // path recovered from the installed URL.
+    const source = readFileSync(join(REPO, 'scripts/install.sh'), 'utf8')
+    const refresh = runShipped(
+      { APP_DIR: root, APP_USER: currentUser(), DB_HOST: '127.0.0.1', DB_PORT: String(cluster.port), DB_NAME: 'one_two_inventory', DB_USER: 'imsuser' },
+      `
+        ${shippedTlsGlobals(source)}
+        load_existing_env "\${APP_DIR}/.env"
+        prompt_db_sslmode
+        echo "CANDIDATE=\${DB_SSLROOTCERT}"
+      `,
+      { env: { DB_SSLMODE: 'verify-full', DB_SSLROOTCERT: wrongCa, DB_CA_PUBLISH_DIR: publishDir } },
+    )
+    assert.equal(refresh.status, 0, refresh.output)
+
+    // ---- THE ASSERTION THE WHOLE TEST EXISTS FOR, AND IT COMES FIRST. Everything below it is
+    // supporting evidence about paths and bytes; this is the outage.
+    assert.equal(await driverRoute(installedUrl), 'tls',
+      `INSTALLED_STILL_CONNECTS: after a refresh with a CA that cannot verify this server, the installation that worked before it must still work:\n${refresh.output}`)
+
+    // ---- AND THE INSTALLATION IS EXACTLY WHERE IT WAS.
+    assert.ok(existsSync(installedGeneration),
+      'INSTALLED_GENERATION_SURVIVES: the trust root the installed DATABASE_URL names must still be on disk')
+    assert.equal(readFileSync(installedGeneration, 'utf8'), installedBytes,
+      'INSTALLED_BYTES_UNCHANGED: and hold the bytes it held — a publication may not write through a generation in use')
+    assert.equal(envDatabaseUrl(root), installedUrl,
+      'INSTALLED_URL_UNCHANGED: and the persisted URL still names it; the switch belongs to the environment-file publication, which a refused run never reaches')
+
+    const candidate = readVar(refresh.output, 'CANDIDATE')
+    assert.notEqual(candidate, installedGeneration,
+      'CANDIDATE_IS_A_NEW_GENERATION: the candidate cannot be the generation the installed URL names')
+    assert.equal(candidate, caGenerationPath(publishDir, wrongCa),
+      `CANDIDATE_IS_A_NEW_GENERATION: it is the generation ITS OWN normalised bytes name:\n${refresh.output}`)
+    assert.equal(installedGeneration, caGenerationPath(publishDir, serverCa),
+      'PUBLISHED_IS_CONTENT_ADDRESSED: and so was the one the working installation is using')
+  } finally {
+    cluster?.stop()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 27f. WHAT "RETAIN THE PREVIOUS GENERATION" MEANS ON DISK (o3d-2sm1.5 r47, Codex HIGH)
+//
+// A retained generation nobody can find or use is not retention. So the rule is small enough to
+// state and it is enforced here: the generation THIS run published and the generation the PREVIOUS
+// environment file named are never pruned, whatever their age; of the rest, the newest
+// DB_CA_GENERATIONS_RETAINED survive. `ls -lt /etc/ims-db-ca` lists them newest first, they are
+// ordinary PEM files, and re-running the installer with DB_SSLROOTCERT= naming one republishes it
+// onto its own path — so a rollback is the same command as an install.
+//
+// AND IT RUNS ONLY AT THE END OF A RUN THAT FINISHED. The generation a failed run would delete is
+// the one an operator is about to need.
+// ---------------------------------------------------------------------------
+
+test('r47: a prune keeps this run’s generation, the previous installation’s, and the newest of the rest', () => {
+  // MUTATION ROUTES (each applied to scripts/install.sh and this file re-run):
+  //   M1 -- delete the `[[ "${file}" != "${previous}" ]]` exemption: PREVIOUS_KEPT fails. The
+  //         rollback target is removed by the very run that made it a rollback target, and the
+  //         advice both refusals print becomes a lie.
+  //   M2 -- delete the `[[ "${file}" != "${current}" ]]` exemption: CURRENT_KEPT fails. In
+  //         production publish_durable_file() always renames a fresh file into place, so the current
+  //         generation is always the newest and this exemption is defence in depth; the test forces
+  //         the condition with an explicit mtime, because a rule that is only true by accident of
+  //         timing is a rule nobody can rely on when the timing changes.
+  //   M3 -- change DB_CA_GENERATIONS_RETAINED from 3 to 1: SURVIVORS comes back with two fewer
+  //         generations and the assertion names exactly which.
+  //   M4 -- glob `*` instead of `${DB_CA_GENERATION_PREFIX}*${DB_CA_GENERATION_SUFFIX}`: SURVIVORS
+  //         fails, and NOT the way it reads. BYSTANDERS_KEPT still passes — the publisher's own
+  //         dot-prefixed temporary and the operator's file are the NEWEST things in the directory,
+  //         so they sit inside the retention window and are kept. What they do is CONSUME it:
+  //         three real generations are removed instead of one. A prune that counts files it does
+  //         not understand silently shortens the retention it advertises.
+  const root = mkdtempSync(join(tmpdir(), 'ims-r47-prune-'))
+  chmodSync(root, 0o755)
+  try {
+    const publishDir = join(root, 'published')
+    // Six distinct certificates, so six distinct generations. They are published by the SHIPPED
+    // publisher; only their mtimes are set here, because "newest" is the only thing the rule reads
+    // that a test can otherwise only observe by waiting.
+    const cas = [1, 2, 3, 4, 5, 6].map((n) => {
+      const path = join(root, `ca-${n}.pem`)
+      writeCertificate(path, `r47-generation-${n}`)
+      return path
+    })
+    const generations = cas.map((ca) => caGenerationPath(publishDir, ca))
+    assert.equal(new Set(generations).size, 6, 'precondition: six certificates must produce six generations')
+
+    const run = runShipped(
+      { APP_DIR: root, APP_USER: currentUser(), DB_CA_PUBLISH_DIR: publishDir },
+      `
+        ${cas.map((ca) => `publish_db_ca ${JSON.stringify(ca)} >/dev/null 2>&1 || echo "PUBLISH_FAILED=${ca}"`).join('\n        ')}
+        # THE AGES, STATED. Oldest first, and the generation this run "published" is deliberately
+        # made the OLDEST so its exemption is load-bearing rather than true by accident.
+        ${generations.map((gen, i) => `touch -d "2026-01-0${i + 1}T00:00:00Z" ${JSON.stringify(gen)}`).join('\n        ')}
+
+        # Two files a prune must not touch: the publisher's own dot-prefixed temporary shape, and
+        # something an operator left in the directory.
+        : > ${JSON.stringify(join(publishDir, '.db-ca-candidate.abc123'))}
+        : > ${JSON.stringify(join(publishDir, 'README'))}
+
+        # WHAT THE PREVIOUS INSTALLATION WAS USING, read the way prune_db_ca_generations() reads it:
+        # out of the environment file as it was when this run started.
+        printf 'DATABASE_URL=postgresql://u:p@h:5432/d?sslmode=verify-full&uselibpqcompat=true&sslrootcert=%s\\n' ${JSON.stringify(generations[1])} > "\${APP_DIR}/.env"
+        load_existing_env "\${APP_DIR}/.env"
+
+        DB_CA_PUBLISHED_FILE=${JSON.stringify(generations[0])}
+        prune_db_ca_generations
+        echo "SURVIVORS=$(ls -1 ${JSON.stringify(publishDir)} | sort | tr '\\n' ' ')"
+        echo "BYSTANDERS=$(ls -1A ${JSON.stringify(publishDir)} | grep -c -e '^\\.db-ca-candidate' -e '^README' || true)"
+      `,
+    )
+
+    assert.equal(run.status, 0, run.output)
+    assert.doesNotMatch(run.output, /^PUBLISH_FAILED=/m, `precondition: all six generations must publish:\n${run.output}`)
+
+    const survivors = readVar(run.output, 'SURVIVORS').trim().split(/\s+/).filter(Boolean)
+    const name = (path: string): string => path.slice(publishDir.length + 1)
+    // generations[0] is the oldest AND the current one; generations[1] is the oldest but one AND
+    // the one the previous environment file named. Both are exempt. Of the remaining four, the
+    // three newest — 6, 5, 4 — survive, and generation 3 is the one that goes.
+    assert.ok(survivors.includes(name(generations[0])),
+      `CURRENT_KEPT: the generation this run published survives even as the oldest file in the directory:\n${run.output}`)
+    assert.ok(survivors.includes(name(generations[1])),
+      `PREVIOUS_KEPT: and so does the one the previous environment file named — that is the rollback target:\n${run.output}`)
+    assert.ok(!survivors.includes(name(generations[2])),
+      `PRUNED: while the oldest unreferenced generation beyond the retention count is removed, or the prune does nothing:\n${run.output}`)
+    assert.deepEqual(
+      survivors.filter((entry) => entry.startsWith('db-ca-')).sort(),
+      [generations[0], generations[1], generations[3], generations[4], generations[5]].map(name).sort(),
+      `SURVIVORS: exactly this run's generation, the previous installation's, and the three newest of the rest:\n${run.output}`)
+    assert.equal(readVar(run.output, 'BYSTANDERS'), '2',
+      `BYSTANDERS_KEPT: the prune globs generations and nothing else — the publisher's own temporary shape and an operator's file both survive:\n${run.output}`)
   } finally {
     rmSync(root, { recursive: true, force: true })
   }

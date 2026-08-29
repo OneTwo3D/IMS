@@ -10,6 +10,7 @@
  */
 import assert from 'node:assert/strict'
 import { execFileSync, spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { chmodSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
@@ -85,7 +86,14 @@ export const SHIPPED = [
   // author can re-implement the publication.
   'file_sha256',
   'db_ca_path_is_open_to_every_uid',
+  // r47 (Codex HIGH x2): the parser that decides what may be published, the generation name derived
+  // from what was published, and the prune that decides what survives. Lifted for the same reason:
+  // a rig that re-implemented the PEM walk would be proving that its author can walk a PEM file,
+  // and a rig that re-implemented the generation name would agree with itself and with nothing else.
+  'normalize_db_ca_pem',
+  'db_ca_generation_file',
   'publish_db_ca',
+  'prune_db_ca_generations',
   'verify_db_ca_published',
   'db_application_route_sslmode',
   'installed_database_password',
@@ -147,6 +155,29 @@ export const CAPTURE_TERMINATOR_ASSIGNMENT = (() => {
   assert.ok(match, 'precondition: scripts/install.sh must define CAPTURE_TERMINATOR')
   return match[0]
 })()
+
+/**
+ * THE CA PUBLISHER'S OWN TOP-LEVEL ASSIGNMENTS, LIFTED IN SOURCE ORDER (o3d-2sm1.5 r47).
+ *
+ * `shippedFunction()` lifts functions; these are the four literals the lifted functions READ —
+ * the one PEM label a trust root may contain, the two halves of the generation name, and how many
+ * superseded generations survive a prune — plus the refusal advice both `die`s on the CA path quote.
+ * A rig that declared its own copies would agree with itself and with nothing else: the accept-list
+ * is the whole of the disclosure fix, and the generation name is the whole of the overwrite fix.
+ */
+export const DB_CA_ASSIGNMENTS = [
+  'DB_CA_ACCEPTED_PEM_LABEL',
+  'DB_CA_GENERATION_PREFIX',
+  'DB_CA_GENERATION_SUFFIX',
+  'DB_CA_GENERATIONS_RETAINED',
+  'DB_CA_REFRESH_FAILURE_ADVICE',
+]
+  .map((name) => {
+    const match = new RegExp(`^${name}=.*$`, 'm').exec(INSTALL_SOURCE)
+    assert.ok(match, `precondition: scripts/install.sh must define ${name} at top level`)
+    return match[0]
+  })
+  .join('\n')
 
 export const ENV_HEREDOC_DEFAULTS = [
   ...new Set(
@@ -306,7 +337,16 @@ DB_ROLE_ROTATION_JOURNAL="\${DB_ROLE_ROTATION_JOURNAL:-\${DB_ENV_SNAPSHOT_DIR}/d
 # ordinary user has no root to give a file to. What that leaves measurable is everything the
 # finding is actually about: the digest, the mode, and who can open the result.
 DB_CA_PUBLISH_DIR="\${DB_CA_PUBLISH_DIR:-\${APP_DIR}/db-ca-published}"
-DB_CA_PUBLISHED_FILE="\${DB_CA_PUBLISHED_FILE:-\${DB_CA_PUBLISH_DIR}/db-ca.crt}"
+# r47 (Codex HIGH): AND IT IS EMPTY UNTIL publish_db_ca() SETS IT. The fixed \`db-ca.crt\` this line
+# used to default to is the whole first half of the finding — one path, overwritten in place, which
+# on an upgrade is the trust root the running installation is verifying against. A rig that kept
+# defaulting it would hand every test a path the shipped code no longer chooses, and the generation
+# scheme would be measured nowhere.
+DB_CA_PUBLISHED_FILE="\${DB_CA_PUBLISHED_FILE-}"
+# The generation grammar, the retention count and the accepted PEM label, LIFTED rather than
+# retyped: a rig that spelled the prefix itself would pass while install.sh used another one, and
+# the two would disagree only in production.
+${DB_CA_ASSIGNMENTS}
 ${ENV_HEREDOC_DEFAULTS}
 ${SHIPPED}
 ${body}
@@ -563,4 +603,43 @@ EOSQL
 
 export function decodeVar(output: string, name: string): string {
   return Buffer.from(readVar(output, name), 'base64').toString('utf8')
+}
+
+/**
+ * A REAL X.509 CERTIFICATE ON DISK (o3d-2sm1.5 r47).
+ *
+ * Before r47 the CA tests wrote a line of prose to a `.pem` and the publisher copied it: the whole
+ * finding is that it copied ANY bytes. Since the publisher PARSES its input, a test whose CA is not
+ * a certificate is a test of the refusal path, and every test that means to measure a SUCCESSFUL
+ * publication needs a certificate openssl can decode. The private key is written beside it — at
+ * 0600, and it is the material a mixed-PEM or wrong-file test needs to have to hand.
+ */
+export function writeCertificate(path: string, commonName: string): string {
+  execFileSync('openssl', [
+    'req', '-new', '-x509', '-days', '2', '-nodes',
+    '-subj', `/CN=${commonName}`,
+    '-keyout', `${path}.key`,
+    '-out', path,
+  ], { stdio: 'pipe' })
+  chmodSync(`${path}.key`, 0o600)
+  return `${path}.key`
+}
+
+/**
+ * The generation path publishing `caFile` lands on.
+ *
+ * Derived the way the shipped publisher derives it — the sha256 of openssl's re-encoding of the
+ * certificate, not of the source file — so a test that asserts this path is asserting that the
+ * published bytes are the NORMALISED ones. The `db-ca-`/`.crt` halves are read out of install.sh
+ * for the same reason the shell rig lifts them.
+ */
+export function caGenerationPath(publishDir: string, caFile: string): string {
+  const normalized = execFileSync('openssl', ['x509', '-inform', 'PEM', '-outform', 'PEM', '-in', caFile], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  const digest = createHash('sha256').update(normalized).digest('hex')
+  const prefix = /^DB_CA_GENERATION_PREFIX="([^"]*)"$/m.exec(INSTALL_SOURCE)
+  const suffix = /^DB_CA_GENERATION_SUFFIX="([^"]*)"$/m.exec(INSTALL_SOURCE)
+  assert.ok(prefix && suffix, 'precondition: scripts/install.sh must spell the generation name in two literals')
+  return join(publishDir, `${prefix[1]}${digest}${suffix[1]}`)
 }

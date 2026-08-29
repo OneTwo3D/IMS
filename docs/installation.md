@@ -506,10 +506,10 @@ root: the installer and its authentication-request reader as **root**, the `psql
 as **postgres**, and the running service as **`imsapp`**. A CA that only root can read passes every
 check an installer makes and then fails when the application starts — after the migration.
 
-So the installer copies the validated bytes to a fixed path:
+So the installer publishes the certificates to a path of its own:
 
 ```
-/etc/ims-db-ca/db-ca.crt     root:root  0644   (in /etc/ims-db-ca, root:root 0755)
+/etc/ims-db-ca/db-ca-<sha256>.crt    root:root  0644   (in /etc/ims-db-ca, root:root 0755)
 ```
 
 and repoints everything at it. From that moment the `sslrootcert=` in `DATABASE_URL`, the reader's
@@ -519,12 +519,60 @@ the service that connects with it. The installer records its SHA-256 at publicat
 the digest, the ownership and the mode again once the `imsapp` account exists, opening the file **as
 that account** before it writes any environment file or starts anything.
 
-**When the cluster's CA changes**, the published copy is a *snapshot* and does not follow it.
-Re-run the installer with `DB_SSLROOTCERT=` pointing at the new source file — a supplied value beats
-the recovered one, so the snapshot is replaced. Doing nothing leaves the old trust root in place,
-and that fails **closed**: under `verify-ca`/`verify-full` a certificate that no longer chains to it
-is refused, so a rotated CA takes connections down loudly rather than quietly accepting a chain
+##### What the file may contain
+
+The installer does not copy the bytes it is given. It **parses** them, and it publishes only what it
+parsed. A trust root is a bundle of PEM `CERTIFICATE` blocks and nothing else — that is all
+node-postgres, libpq and `psql` read out of the file `DB_SSLROOTCERT` names, and a revocation list
+is a different parameter (`sslcrl`) against a different store — so that is the whole accept-list.
+Every block is decoded with `openssl x509`, and what is written out is OpenSSL's own re-encoding of
+the certificates it decoded:
+
+- a `PRIVATE KEY` block, of any flavour, is **refused** — as is any other label;
+- a combined key-and-certificate file is **refused**, and nothing is written, not even the
+  certificates that came before the key;
+- a block *labelled* `CERTIFICATE` that is not one is **refused**, because the label is not evidence;
+- a file with no certificate in it at all is **refused**;
+- the subject/issuer commentary many vendor bundles carry around their certificates is simply
+  dropped, because it is not published.
+
+This matters because the installer runs as **root** and the published file is **world-readable**: a
+mistyped `DB_SSLROOTCERT` naming a private key would otherwise disclose it to every account on the
+host. If your CA file is a combined one, extract the certificates into a file of their own and name
+that. A DER-encoded certificate is not accepted — convert it first with
+`openssl x509 -inform DER -in <file> -out <file>.pem`.
+
+##### Generations, and how to go back
+
+The published name is the SHA-256 of the published bytes, so **a new CA is a new file**. Nothing is
+ever written over the generation an installed `DATABASE_URL` names, and re-running an unchanged TLS
+installation republishes onto the same path with the same content. Which generation is in use is
+decided by `DATABASE_URL`, and that is rewritten only when the installer writes the environment
+file — long after every probe.
+
+**A failed refresh therefore changes no trust root.** If the CA you supplied is wrong, stale or
+malformed, or the run refuses anywhere afterwards, the environment file still names the generation it
+named before, that file is untouched, and `systemctl start one-two-inventory.service` brings the
+installation back exactly as it was. Fix the certificate and re-run.
+
+**When the cluster's CA changes**, re-run the installer with `DB_SSLROOTCERT=` pointing at the new
+source file — a supplied value beats the recovered one. Doing nothing leaves the old trust root in
+place, and that fails **closed**: under `verify-ca`/`verify-full` a certificate that no longer chains
+to it is refused, so a rotated CA takes connections down loudly rather than quietly accepting a chain
 nothing vouched for.
+
+**To roll back to an earlier CA**, list the retained generations newest first and republish one:
+
+```bash
+ls -lt /etc/ims-db-ca/
+DB_SSLMODE=verify-full DB_SSLROOTCERT=/etc/ims-db-ca/db-ca-<sha256>.crt bash install.sh --non-interactive
+```
+
+A generation is an ordinary PEM file, so it is a valid `DB_SSLROOTCERT` in its own right and
+republishing it lands on its own path again. At the **end of a successful install** — never on a
+failure — the installer removes superseded generations, keeping the one this run published, the one
+the previous environment file named (whatever its age: that is the rollback target), and the three
+most recently written of the rest. Each removal is printed.
 
 The postmaster-identity read performed just after `CREATE DATABASE` is the one credential-bearing
 connection deliberately **left unpinned**. What it concludes — that the server answering
@@ -677,7 +725,8 @@ After installation, sign in and set the organisation base currency in **Settings
   `disable`, `require`, `verify-ca` or `verify-full`; the last two also ask for
   **`DB_SSLROOTCERT`**, the CA the server's certificate is verified against. It is recovered from
   the previous run's `DATABASE_URL` on an upgrade, so an existing TLS-only installation stays on
-  TLS when the prompts are accepted, and the CA itself is copied to `/etc/ims-db-ca/db-ca.crt` so
+  TLS when the prompts are accepted, and the certificates in it are parsed and republished to
+  `/etc/ims-db-ca/db-ca-<sha256>.crt` so
   the service account can read the same trust root the probes used. Under `--non-interactive` both
   are read from the environment, where a supplied value beats the recovered one. See
   *TLS: `DB_SSLMODE`* above for what each mode means, how the CA is published and refreshed, and why
