@@ -18,6 +18,13 @@
  * been shown, on that endpoint, in that run, to REFUSE a freshly minted random password and ACCEPT
  * one asserted live. A probe that has not demonstrated it can reject is not evidence.
  *
+ * AND r41 PUT A SECOND QUESTION IN FRONT OF THAT ONE — whose password the endpoint is checking,
+ * asked of the server. It changed what these first nine tests measure, so their mutation notes were
+ * re-measured rather than re-read: a `trust` endpoint is now dropped by the method gate before the
+ * control is reached, so removing the control no longer breaks any of them. Test 15 is the only
+ * test in this file that still catches that removal, and it exists for exactly that reason. The
+ * r41 block below the ninth test says the rest.
+ *
  * WHY THIS FILE BUILDS ITS OWN pg_hba RULES. The finding is that the installer's model of what a
  * successful connection means was wrong across supported configurations. A test written from the
  * same model — one that only ever runs against the default scram cluster — agrees with the defect
@@ -89,14 +96,15 @@ test('r40: a trust rule on the probe endpoint makes the rotation REFUSE, not pro
   //   1. disable the gate in rotate_database_password_in_fenced_window() (`if true; then` over
   //      the endpoint search): the rotation proceeds, and this test fails on its status assertion,
   //      on ROTATED_ANYWAY and on the live-credential assertion. Tests 5 and 8 fail with it.
-  //   2. keep the gate but drop the NEGATIVE CONTROL from db_endpoint_is_password_sensitive() —
-  //      i.e. return 0 as soon as the positive password connects. Under `trust` the positive
-  //      always connects, so the gate passes and the rotation proceeds: same three failures here,
-  //      and tests 2 and 3 fail with it. THIS IS THE ROUTE THAT MATTERS, because it is the one a
-  //      fix that "looks right" takes.
+  //   2. keep the gate but drop the NEGATIVE CONTROL from db_endpoint_discriminates_passwords() —
+  //      i.e. return 0 as soon as the positive password connects. NOTHING HERE FAILS ANY MORE, and
+  //      that is r41's doing: `trust` is refused one step earlier, by the method gate, because the
+  //      server answers AuthenticationOk and names a rule that checks no password at all. This was
+  //      the route that mattered in r40 and it is now covered by test 15 ALONE — measured, and
+  //      recorded here so the next reader does not look for it in this test.
   //   3. keep the control but drop the POSITIVE half: the gate then passes on any endpoint that
   //      refuses a random password, including one behind a revoked CONNECT. Nothing here fails;
-  //      tests 5 and 8 are what catch it.
+  //      tests 5, 8 and 10 are what catch it.
   //   4. drop the `datname <> :'dbname'` exclusion from db_connectable_databases_except_app(): the
   //      application database — which still checks passwords — becomes a candidate, the gate is
   //      satisfied by it, and the rotation proceeds. Same three failures here, and test 5 with it.
@@ -188,16 +196,15 @@ test('r40: under trust the reconciliation REFUSES rather than adopting the candi
   //      measured on this branch — SEVEN tests fail, including r39's own boundary (4) and every
   //      probe test that depends on WHICH endpoint answered — which is the right shape for
   //      reverting the finding itself.
-  //   2. drop the negative control from db_endpoint_is_password_sensitive(): both candidates
-  //      connect, the endpoint is admitted, and resolve_live_role_password() returns the AMBIGUOUS
-  //      verdict instead. The run still refuses, but with the wrong message — this test fails on
-  //      its "cannot tell one password from another" assertion and not on its status, together
-  //      with tests 1 and 3. Recorded because the distinction is the finding: refusing by luck is
-  //      not refusing by rule.
-  //   3. turn the `|| continue` in resolve_live_role_password() into `|| return 1`: the loop stops
-  //      at the first endpoint it cannot use, which here is `postgres`, so the run refuses for the
-  //      right reason and the wrong endpoints are never reported. This test fails on its
-  //      "one_two_inventory ACCEPTED" assertion, with test 3.
+  //   2. drop the negative control from db_endpoint_discriminates_passwords(): NOTHING here fails
+  //      any more. In r40 both candidates connected under `trust`, the endpoint was admitted and
+  //      the run refused with the wrong message; in r41 the method gate has already dropped a
+  //      `trust` endpoint before the control is reached. Test 15 is the only test in this file that
+  //      still catches that removal — measured.
+  //   3. turn BOTH `|| continue`s in resolve_live_role_password() into `|| return 1`: the loop
+  //      stops at the first endpoint it cannot use, which here is `postgres`, so the run refuses
+  //      for the right reason and the wrong endpoints are never reported. This test fails on its
+  //      second endpoint assertion, with tests 3 and 10.
   const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
   let cluster: Cluster | undefined
   try {
@@ -261,17 +268,16 @@ test('r40: a recorded probe endpoint that has gone trust is discarded, and a dis
   //
   // MUTATION ROUTES (each measured by making the change and re-running):
   //   1. make resolve_live_role_password() `return 1` instead of `continue` when an endpoint fails
-  //      the sensitivity pair: the recorded endpoint is trust, the loop stops there, and the run
-  //      refuses. This test fails on its status assertion, with test 2.
+  //      the method gate or the sensitivity pair: the recorded endpoint is trust, the loop stops
+  //      there, and the run refuses. This test fails on its status assertion, with tests 2 and 10.
   //   2. drop the recorded endpoint from db_probe_endpoint_candidates(): NOTHING here fails,
   //      because the recorded endpoint is `postgres`, which the derived list reaches first anyway.
   //      Test 9 is the one that discriminates the record from the derivation; recorded here so the
   //      next reader does not look for it in this test.
-  //   3. drop the negative control: `postgres` is admitted on its trust acceptance, and under
-  //      trust it accepts BOTH candidates — so resolve_live_role_password() returns the AMBIGUOUS
-  //      verdict and the run REFUSES. This test fails on its status assertion (expected 0, got 9),
-  //      with tests 1 and 2. Refusing for the wrong reason is still the wrong behaviour: the
-  //      endpoint should have been discarded, not consulted and then found confusing.
+  //   3. drop the negative control: NOTHING here fails any more. In r40 `postgres` was admitted on
+  //      its trust acceptance and the run refused with the AMBIGUOUS verdict; in r41 the method
+  //      gate drops it first, so the control never sees it. Test 15 is the only test left that
+  //      catches the control's removal — measured, and recorded so it is not looked for here.
   const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
   let cluster: Cluster | undefined
   try {
@@ -325,8 +331,8 @@ test('r40: a revoked CONNECT on the maintenance database does not strand a recov
   //      assertion here that can see the difference. Six other tests fail with it.
   //   3. drop the POSITIVE half of the sensitivity pair: nothing here fails. `postgres` refuses
   //      the control AND both candidates, so `resolve_live_role_password` skips it before the pair
-  //      is consulted at all. Tests 5 and 8 are what catch that route; recorded so the next reader
-  //      does not look for it here.
+  //      is consulted at all. Tests 5, 8 and 10 are what catch that route; recorded so the next
+  //      reader does not look for it here.
   const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
   let cluster: Cluster | undefined
   try {
@@ -734,7 +740,7 @@ test('r41: an endpoint whose rule is an EXTERNAL verifier is not admitted, and t
   //      resolve_live_role_password(): `postgres` is admitted on r40's pair, answers `old`, and the
   //      run publishes `live-password` and clears the journal. This test fails on PROBE_DB, on
   //      INSTALLED_B64, and on the driver connection at the end — which is the outage itself.
-  //      Test 11 fails with it.
+  //      Tests 2 and 11 fail with it.
   //   2. admit AuthenticationCleartextPassword in scripts/lib/pg-auth-request.mjs (return
   //      verifier 'role' for code 3): identical failures. This is the route a fix that "looks
   //      right" takes, because cleartext-against-postgres really is role-credential-checked — and
@@ -894,8 +900,9 @@ test('r41: an ordinary scram-sha-256 endpoint still qualifies and the rotation p
   // MUTATION ROUTES (each measured by making the change and re-running):
   //   1. make db_endpoint_checks_role_verifier() `return 1` unconditionally: no endpoint qualifies,
   //      the rotation refuses before the ALTER, and this test fails on the run's status, on ROTATED
-  //      and on the driver connection. Ten other tests fail with it, which is the correct blast
-  //      radius for disabling the gate.
+  //      and on the driver connection. EVERY OTHER TEST IN THIS FILE FAILS WITH IT — sixteen of
+  //      sixteen, measured — which is the correct blast radius for disabling the gate, and is why
+  //      no other route can be mistaken for this one.
   //   2. require `verifier=external` instead of `verifier=role` in the reader's exit status: same
   //      failures here.
   //   3. point db_auth_request_probe_path() at ${APP_DIR} instead of the release's own lib
@@ -1018,8 +1025,8 @@ test('r41: the reader negotiates TLS the way libpq prefers, so it reads the host
   //   1. skip the SSLRequest in scripts/lib/pg-auth-request.mjs and send the startup message
   //      straight down the socket: the server refuses the connection outright, the reader answers
   //      method=none, the gate refuses and the rotation refuses. This test fails on the reader
-  //      assertions, on the run's status and on ROTATED. Nothing else fails, because nothing else
-  //      in this suite runs a TLS-capable cluster -- which is exactly why this test exists.
+  //      assertions, on the run's status and on ROTATED, and test 15 fails with it — those two are
+  //      the only TLS-capable clusters in the suite, which is exactly why they exist.
   //   2. answer `N` unconditionally instead of reading the server's byte: identical failures.
   const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
   let cluster: Cluster | undefined
@@ -1097,7 +1104,10 @@ test('r41: a hostssl/hostnossl split where libpq falls back is caught by the neg
   //   1. drop the negative control from db_endpoint_discriminates_passwords() — return 0 as soon as
   //      the positive password connects: the endpoint is admitted on the reader's word alone, the
   //      rotation proceeds against an endpoint that in practice accepts anything, and this test
-  //      fails on its status assertion and on ROTATED_ANYWAY. Tests 1, 2 and 3 fail with it.
+  //      fails on its status assertion and on ROTATED_ANYWAY. NOTHING ELSE FAILS: measured, and it
+  //      is the reason this cluster had to be built. Since r41 refuses `trust` at the method gate,
+  //      the three r40 tests that used to catch a missing control no longer reach it, and this is
+  //      the ONLY test in the suite that still does.
   //   2. delete the method gate instead: nothing here changes — the control already refuses this
   //      endpoint. Recorded so the next reader does not look for it here.
   const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
