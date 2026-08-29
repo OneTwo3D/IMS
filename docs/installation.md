@@ -327,13 +327,40 @@ Two consequences worth knowing before you meet them:
   incomplete checkout so `scripts/lib/pg-auth-request.mjs` is missing — that is an unknown, and an
   unknown **refuses**, before the `ALTER`.
 
-The negative control is *kept* alongside this, and is not redundant: the method is read on a
-connection of the reader's own, and two things can still make `psql` land on a different record.
-`pg_hba.conf` can be reloaded between them; and `sslmode=prefer` — libpq's default — does not mean
-"use TLS", it means *try TLS and retry without it if that connection fails*, so against
-`hostssl … scram-sha-256` over `hostnossl … trust` a wrong password is refused by scram, drops to
-the clear, and is let in by trust. The control opens the connection the reconciliation will
-actually open, so it catches both.
+### The route, and why the method alone was not enough
+
+The method is read on a connection of the reader's own, and until this round every probe that
+followed was opened on libpq's default `sslmode=prefer` — which does not mean "use TLS". It means
+*try TLS, and if that connection fails, retry without it*. `hostssl` and `hostnossl` are **different
+records**, so an authentication failure could select a second one, and the two instruments then
+answer about two different transports:
+
+> `hostssl … scram-sha-256` over `hostnossl … radius`, with the directory holding the role's current
+> password. The reader negotiates TLS, stops at the `hostssl` record and reports `scram-sha-256` —
+> truthfully. The negative control's random password fails scram, drops to the clear and is refused
+> by the directory too, so its **no** is satisfied. The asserted password succeeds over TLS, so its
+> **yes** is satisfied. Both pass. After an interrupted rotation the new password is accepted by
+> scram and the old one by the directory, both candidates read as live, and the reconciliation
+> refuses — leaving a stopped, fenced installation that needs a person.
+
+So the reader now **reports the route it took**, as the libpq setting that reproduces it —
+`sslmode=require` where TLS was negotiated, `sslmode=disable` where it was not — and every
+credential-bearing connection the installer then opens to that endpoint is pinned to that value,
+with `gssencmode=disable` beside it so GSSAPI encryption cannot select a `hostgssenc` record
+either. `prefer` appears in no probe. A method read over a route that cannot be pinned to is
+refused, exactly as an unestablished method is.
+
+The negative control is *kept* alongside all of this, and is not redundant — but for two reasons
+rather than the transport one:
+
+* **its positive half is the only authentication in the gate.** The reader never completes one, so
+  nothing else can tell a healthy `scram-sha-256` endpoint from one where the role has no
+  `CONNECT` — and this installer's own connection fence revokes `CONNECT` on the application
+  database.
+* **its negative half is the only thing that catches a route that announces `scram-sha-256` and
+  then accepts anything.** Pinning closes the transport divergence; it cannot close a `pg_hba.conf`
+  **reload** landing between the two connections, and it says nothing about a pooler or proxy on
+  the same host and port that speaks SASL without verifying.
 
 **Before the `ALTER`**, the rotation searches for such an endpoint and records it in the journal.
 The candidates are read from the server — every connectable, non-template database except the

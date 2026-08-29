@@ -36,7 +36,7 @@
  */
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -55,7 +55,7 @@ import {
   seedLiveInstallation,
   writeInstalledEnv,
 } from './install-shell-rig.ts'
-import { type Cluster, cleanLibpqEnv, freePort, startCluster } from './real-postgres-cluster.ts'
+import { type Cluster, cleanLibpqEnv, currentUser, freePort, pgBinDir, startCluster } from './real-postgres-cluster.ts'
 import { type RadiusVerifier, radiusHbaLine, startRadiusVerifier } from './radius-verifier.ts'
 
 /** A `trust` rule covering ONLY the maintenance database — the endpoint the rotation relies on. */
@@ -702,6 +702,22 @@ test('r40: the reconciliation asks the RECORDED endpoint, not the one it would h
 /** The RADIUS secret and the two databases every test below is arranged around. */
 const RADIUS_SECRET = 'a-radius-shared-secret'
 
+/**
+ * r41's db_endpoint_accepts_password(), RESTORED — the pin removed and nothing else changed.
+ *
+ * It is a copy of shipped bytes, which this file otherwise refuses to make. It is here as a
+ * MUTATION and not as a model: test 17 runs it beside the shipped one, on one cluster, so that
+ * "the pin is what makes the difference" is a measurement rather than a sentence in a comment. If
+ * it ever drifts from what r41 shipped the test simply measures a different unpinned probe, which
+ * is still an unpinned probe.
+ */
+const R41_UNPINNED_PROBE = `
+db_endpoint_accepts_password() {
+  local database="$1" password="$2"
+  pg_endpoint_psql "\${DB_USER}" "\${password}" "\${database}" -tAc 'SELECT 1' >/dev/null 2>&1
+}
+`
+
 /** A connection that states its sslmode, which pg_endpoint_psql cannot: `hostnossl` needs one. */
 function psqlWithSslMode(port: number, password: string, database: string, sslmode: string): boolean {
   try {
@@ -1109,9 +1125,11 @@ test('r42: on a hostssl/hostnossl split the pinned probe does not fall back, and
   //   2. pin `sslmode` but not `gssencmode`: nothing here changes — this cluster negotiates no
   //      GSSAPI. Recorded so the next reader does not look for that half here; it is covered by
   //      the shape of the code and by test 16's report assertion, not by a cluster.
-  //   3. make pinFor() in scripts/lib/pg-auth-request.mjs return 'prefer': the gate refuses,
-  //      because db_endpoint_checks_role_verifier() admits only `require` and `disable` — this
-  //      test fails on status and ROTATED, and tests 12 and 14 fail with it.
+  //   3. make pinFor() in scripts/lib/pg-auth-request.mjs return 'prefer': the gate refuses every
+  //      endpoint, because db_endpoint_checks_role_verifier() admits only `require` and `disable`
+  //      — a route it cannot pin to is not a route. This test fails on status, GATE_PROBE_DB and
+  //      ROTATED, and so does every other test in the file whose rotation or reconciliation has to
+  //      SUCCEED: 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 17 and 18 (thirteen in all, measured).
   const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
   let cluster: Cluster | undefined
   try {
@@ -1226,6 +1244,356 @@ test('r41: a rotation refuses when the matched method cannot be established at a
     assert.equal(await connectWithDriver(envDatabaseUrl(root)), 'imsuser')
   } finally {
     cluster?.stop()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 17. THE LOAD-BEARING ONE FOR r42: two instruments pass, and the answer is false
+// ---------------------------------------------------------------------------
+
+test('r42: encrypted SCRAM over cleartext RADIUS is reconciled automatically, and is NOT with the pin removed', async () => {
+  // CODEX'S SCENARIO, BUILT. Every earlier test in this file has ONE record per endpoint, so the
+  // reader and the probe could not disagree about which one they met. This cluster has two, split
+  // by transport, and both of r41's instruments behave impeccably on it:
+  //
+  //   hostssl  all all 127.0.0.1/32 scram-sha-256     <- the role's own credential
+  //   hostnossl all all 127.0.0.1/32 radius           <- a directory holding the CURRENT password
+  //
+  //   The reader negotiates TLS, stops at the hostssl record and reports `scram-sha-256`, which is
+  //   true. The negative control's random password fails scram over TLS, libpq drops to the clear,
+  //   and RADIUS refuses it too -- so the NO is satisfied, by the other record. The positive is
+  //   accepted over TLS -- so the YES is satisfied, by the first. THE GATE PASSES.
+  //
+  //   Then the ALTER commits and the run dies before `.env` is published. Under r41 the next run
+  //   asks the same endpoint about both candidates on `sslmode=prefer`: the NEW password is
+  //   accepted by scram over TLS, and the OLD one fails scram, falls back, and is accepted by the
+  //   DIRECTORY, which never heard of an ALTER ROLE. Both candidates read as live,
+  //   resolve_live_role_password() returns 2, and the run refuses -- correctly, given what it was
+  //   shown. The installation is stopped, fenced, and now needs a person, off the back of a
+  //   pre-ALTER gate that said the journal would be reconcilable.
+  //
+  // BOTH OUTCOMES ARE MEASURED HERE, ON ONE CLUSTER, IN THIS ORDER: the r41 code path refuses (the
+  // outage), and the shipped one resolves. The refusal runs FIRST because it leaves the journal in
+  // place -- the die() says so -- which is exactly the state the second run must recover from.
+  //
+  // MUTATION ROUTES (each measured by making the change and re-running):
+  //   1. delete the `route=(...)` assignment from pg_endpoint_psql(): the shipped run becomes the
+  //      unpinned run, and this test fails on the second run's status, on PROBE_DB, on
+  //      INSTALLED_B64 and on JOURNAL_LEFT. Test 14b fails with it.
+  //   2. drop the route guard from db_endpoint_accepts_password() but keep the pin: no change --
+  //      the guard is what makes an UNPROVEN endpoint unprobeable, and here the method gate has
+  //      proven it. Test 16's report assertion is what covers that line.
+  //   3. make db_endpoint_checks_role_verifier() accept an `unknown` sslmode: no change here
+  //      either, since this reader reports `require`. Recorded so the next reader does not look
+  //      for it in this test.
+  const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
+  let cluster: Cluster | undefined
+  let radius: RadiusVerifier | undefined
+  try {
+    radius = await startRadiusVerifier(root, RADIUS_SECRET, 'imsuser', 'live-password')
+    cluster = startCluster(root, 'live', await freePort(), '127.0.0.1', [
+      'hostssl all all 127.0.0.1/32 scram-sha-256',
+      radiusHbaLine('all', radius.port, RADIUS_SECRET, 'hostnossl'),
+    ], { ssl: true })
+    seedLiveInstallation(cluster)
+    writeInstalledEnv(root, cluster.port, 'live-password')
+
+    // PRECONDITIONS, MEASURED FROM OUTSIDE THE SHELL: the two transports are two records, and the
+    // one underneath is a directory that knows the CURRENT password and only that.
+    assert.equal(psqlWithSslMode(cluster.port, 'live-password', 'postgres', 'require'), true,
+      'precondition: the hostssl record must check the role\'s own credential and accept it')
+    assert.equal(psqlWithSslMode(cluster.port, 'live-password', 'postgres', 'disable'), true,
+      'precondition: and the hostnossl record must be a directory holding that same password')
+    assert.equal(psqlWithSslMode(cluster.port, 'a-password-nothing-has-ever-set', 'postgres', 'disable'), false,
+      'precondition: which refuses everything else, so the negative control is satisfied by it')
+
+    const interrupted = writeInterruptedJournal(cluster, root, 'rotated-secret', 'postgres')
+    assert.equal(interrupted.status, 0, interrupted.output)
+    // The ALTER committed; the run died before `.env` was replaced. Boundary (2): the only safe
+    // answer is to FINISH the transition.
+    cluster.psql(['-c', "ALTER USER imsuser WITH PASSWORD 'rotated-secret'"])
+
+    // AND NOW THE TWO RECORDS DISAGREE, which is the whole finding.
+    assert.equal(psqlWithSslMode(cluster.port, 'rotated-secret', 'postgres', 'require'), true,
+      'precondition: scram has the new password')
+    assert.equal(psqlWithSslMode(cluster.port, 'live-password', 'postgres', 'require'), false,
+      'precondition: and not the old one')
+    assert.equal(psqlWithSslMode(cluster.port, 'live-password', 'postgres', 'disable'), true,
+      'precondition: while the directory still has the old one, because it never heard of the ALTER')
+
+    // ---- RUN 1: r41's probe, restored verbatim. THIS IS THE OUTAGE.
+    const unpinned = runShipped(installVars(cluster, root), `
+      ${R41_UNPINNED_PROBE}
+      ${NEXT_RUN_BODY}
+      echo "PROBE_DB=\${DB_ROTATION_PROBE_DATABASE}"
+    `)
+    assert.equal(unpinned.status, 9, `unpinned, both candidates are accepted and the run must refuse:\n${unpinned.output}`)
+    assert.match(unpinned.output, /accepts BOTH recorded candidates/, 'and say that is what it saw')
+    assert.match(unpinned.output, /LEFT IN PLACE/, 'leaving the journal, which is what makes run 2 possible')
+    assert.equal(journalValue(root, 'probe_database'), 'postgres', 'and the record is still there to be read')
+
+    // ---- RUN 2: the shipped probe, pinned to the reader's route.
+    const pinned = runShipped(installVars(cluster, root), `
+      node "$(db_auth_request_probe_path)" --host="\${DB_HOST}" --port="\${DB_PORT}" --user="\${DB_USER}" --database=postgres > "\${APP_DIR}/reader.out" 2>&1 || true
+      echo "READER_B64=$(base64 -w0 < "\${APP_DIR}/reader.out")"
+      ${NEXT_RUN_BODY}
+      echo "PROBE_DB=\${DB_ROTATION_PROBE_DATABASE}"
+    `)
+    const reader = Buffer.from(readVar(pinned.output, 'READER_B64'), 'base64').toString('utf8')
+    assert.match(reader, /^method=scram-sha-256$/m, 'the reader reads the hostssl record')
+    assert.match(reader, /^sslmode=require$/m, 'and names the route that reproduces it')
+
+    assert.equal(pinned.status, 0, `pinned to that route, only scram answers and the ALTER is visible:\n${pinned.output}`)
+    assert.match(pinned.output, /PROBE_DB=postgres/, 'the same endpoint answers')
+    assert.match(pinned.output, /has the NEW password: the ALTER committed/, 'and it reaches the right answer')
+    assert.equal(decodeVar(pinned.output, 'INSTALLED_B64'), 'rotated-secret')
+    assert.match(pinned.output, /JOURNAL_LEFT=no/, 'the transition is finished, so the record is cleared')
+    assert.match(envDatabaseUrl(root), /rotated-secret/, 'and the published file names what the server has')
+  } finally {
+    await radius?.stop()
+    cluster?.stop()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 18. WHAT THE NEGATIVE CONTROL IS STILL FOR: a reload between the two connections
+// ---------------------------------------------------------------------------
+
+test('r42: a pg_hba reload between the reader and the probe is caught by the negative control', async () => {
+  // THE PIN CLOSES THE TRANSPORT DIVERGENCE AND NOTHING ELSE. The reader and the probe are still
+  // two connections, and pg_hba.conf can change between them: `pg_ctl reload` is how every
+  // configuration-management run on every host applies one. After it, the server that answered the
+  // reader with `scram-sha-256` answers the probe with `trust` -- on the SAME transport, so no pin
+  // can see it. A proxy or pooler on ${DB_HOST}:${DB_PORT} that speaks SASL without verifying
+  // lands in the same place, and neither is reachable by any amount of route-binding.
+  //
+  // SO THIS IS THE TEST THAT KEEPS THE NEGATIVE CONTROL IN THE CODE. Since r41 the method gate
+  // refuses a `trust` endpoint one step earlier, so the r40 tests no longer reach the control;
+  // since r42 the fallback that test 14b used to exercise no longer happens. Without this test,
+  // deleting the control would break nothing in the suite -- measured, which is why it is here.
+  //
+  // THE RELOAD IS INJECTED AT THE ONE INSTANT THAT MATTERS, by wrapping the SHIPPED method gate:
+  // it runs, it succeeds, and only then is pg_hba rewritten and reloaded. Nothing about the gate
+  // itself is replaced -- `declare -f` copies the shipped bytes -- and the flip happens once.
+  //
+  // MUTATION ROUTES (each measured by making the change and re-running):
+  //   1. drop the negative control from db_endpoint_discriminates_passwords() -- return 0 as soon
+  //      as the positive password connects: `postgres` is admitted on the reader's word alone, the
+  //      rotation proceeds against an endpoint that by then accepts anything, and this test fails
+  //      on its status assertion, on ROTATED_ANYWAY and on the stored verifier having changed.
+  //      NOTHING ELSE IN THE SUITE FAILS: measured, and it is the reason this test exists.
+  //   2. drop the POSITIVE half instead: nothing here fails -- the random control already refuses
+  //      this endpoint. Tests 5, 8 and 10 are what catch that.
+  //   3. delete the method gate: nothing here fails either, for the same reason. Recorded so the
+  //      next reader does not look for it here.
+  const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
+  let cluster: Cluster | undefined
+  try {
+    cluster = startCluster(root, 'live', await freePort(), '127.0.0.1')
+    seedLiveInstallation(cluster)
+    writeInstalledEnv(root, cluster.port, 'live-password')
+
+    // THE ROLE'S STORED VERIFIER, BEFORE. Read over the socket as the cluster superuser, so that
+    // "the ALTER did not happen" is an assertion about pg_authid and not about a log line.
+    const verifierBefore = cluster.psql(['-tAc', "SELECT rolpassword FROM pg_authid WHERE rolname = 'imsuser'"])
+    assert.ok(verifierBefore.startsWith('SCRAM-SHA-256$'), `precondition: the role must hold a SCRAM verifier: ${verifierBefore}`)
+
+    const run = runShipped({
+      ...installVars(cluster, root),
+      DB_PASSWORD: 'rotated-secret',
+      IMS_TEST_HBA: join(cluster.data, 'pg_hba.conf'),
+      IMS_TEST_PGCTL: join(pgBinDir(), 'pg_ctl'),
+      IMS_TEST_PGDATA: cluster.data,
+    }, `
+      # THE SHIPPED GATE, COPIED RATHER THAN REWRITTEN, and then wrapped.
+      eval "shipped_checks_role_verifier() $(declare -f db_endpoint_checks_role_verifier | tail -n +2)"
+      db_endpoint_checks_role_verifier() {
+        local status=0
+        shipped_checks_role_verifier "$@" || status=\${?}
+        if [[ "\${status}" -eq 0 && ! -e "\${APP_DIR}/reloaded" ]]; then
+          : > "\${APP_DIR}/reloaded"
+          printf 'host all all 127.0.0.1/32 trust\\n' | cat - "\${IMS_TEST_HBA}" > "\${IMS_TEST_HBA}.new"
+          mv "\${IMS_TEST_HBA}.new" "\${IMS_TEST_HBA}"
+          "\${IMS_TEST_PGCTL}" -D "\${IMS_TEST_PGDATA}" reload >/dev/null 2>&1
+          # A RELOAD IS ASYNCHRONOUS: SIGHUP returns before the postmaster has re-read the file.
+          # Poll until a password nothing can know is accepted, so the test measures the control
+          # and never a race. The connection is deliberately unpinned -- this cluster has one
+          # record per transport, so it is a readiness probe and not a route.
+          for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+            if ( DB_ENDPOINT_ROUTE_SSLMODE=""; pg_endpoint_psql "\${DB_USER}" "definitely-not-the-password" postgres -tAc 'SELECT 1' ) >/dev/null 2>&1; then
+              echo "RELOADED_TO_TRUST=yes"
+              break
+            fi
+            sleep 0.2
+          done
+        fi
+        return "\${status}"
+      }
+      node "$(db_auth_request_probe_path)" --host="\${DB_HOST}" --port="\${DB_PORT}" --user="\${DB_USER}" --database=postgres > "\${APP_DIR}/reader.out" 2>&1 || true
+      echo "READER_B64=$(base64 -w0 < "\${APP_DIR}/reader.out")"
+      ${REINSTALL_BODY}
+      FENCE_ARMED=true
+      DB_FENCE_UP=true
+      rotate_database_password_in_fenced_window
+      echo "ROTATED_ANYWAY"
+    `)
+    const reader = Buffer.from(readVar(run.output, 'READER_B64'), 'base64').toString('utf8')
+    assert.match(reader, /^method=scram-sha-256$/m, 'precondition: before the reload the endpoint is a healthy scram one')
+    assert.match(reader, /^sslmode=disable$/m, 'on the one transport this cluster has, so no pin could tell the two records apart')
+    assert.match(run.output, /RELOADED_TO_TRUST=yes/, 'precondition: and the reload really did land between the reader and the probe')
+
+    assert.equal(run.status, 9, `the control must refuse an endpoint that has become trust since the reader saw it:\n${run.output}`)
+    assert.doesNotMatch(run.output, /ROTATED_ANYWAY/, 'and nothing past the refusal ran')
+    assert.match(run.output, /'postgres' ACCEPTED a random 32-byte password/, 'naming the half of the gate that caught it')
+    assert.match(run.output, /THE ALTER HAS NOT BEEN ISSUED/, 'and saying the role is untouched')
+    assert.equal(
+      cluster.psql(['-tAc', "SELECT rolpassword FROM pg_authid WHERE rolname = 'imsuser'"]),
+      verifierBefore,
+      'which pg_authid must agree with: the stored verifier is byte for byte what it was',
+    )
+    assert.match(envDatabaseUrl(root), /live-password/, 'and the environment file still names it')
+  } finally {
+    cluster?.stop()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 19. NO ROUTE, NO PROBE — and the refusal is the guard's, not the endpoint's
+// ---------------------------------------------------------------------------
+
+test('r42: a credential probe with no route established refuses, on an endpoint that accepts everything', async () => {
+  // THE RULE r42 ADDS IS "PIN OR REFUSE", and both halves of it have to be a property of the CODE
+  // rather than of the order the two callers in install.sh happen to use. Measured: with the
+  // guards deleted and everything else left alone, the whole of the rest of this file still
+  // passes — so without this test they would be exactly the thing this branch keeps calling out,
+  // a guard that cannot fail.
+  //
+  // THE CLUSTER IS WHAT MAKES THE MEASUREMENT MEAN ANYTHING. `host all all 127.0.0.1/32 trust`
+  // accepts every password on every database, so a connection opened here CANNOT be refused by the
+  // server. A refusal is therefore the guard's, and the first line below measures that rather than
+  // assuming it: routed, the very same call on the very same bytes succeeds.
+  //
+  // MUTATION ROUTES (each measured by making the change and re-running):
+  //   1. delete the `[[ -n "${DB_PROBE_SSLMODE}" ... ]] || return 1` line from
+  //      db_endpoint_accepts_password(): UNROUTED_ACCEPTS becomes `yes` and this test fails on it.
+  //      Nothing else in the suite fails — measured, on all eighteen other tests.
+  //   2. delete the route check from db_endpoint_discriminates_passwords(): the pair still returns
+  //      1, because its own two probes are refused by the guard above — so UNROUTED_PAIR does NOT
+  //      move. What moves is the REPORT: it blames the endpoint for refusing both candidates
+  //      instead of naming the question that was skipped, and this test fails on the report
+  //      assertion. Nothing else in the suite fails.
+  //   3. delete both: UNROUTED_ACCEPTS becomes `yes`, the pair is then satisfied by a `trust`
+  //      endpoint, and this test fails on three assertions at once.
+  const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
+  let cluster: Cluster | undefined
+  try {
+    cluster = startCluster(root, 'live', await freePort(), '127.0.0.1', TRUST_EVERYTHING)
+    seedLiveInstallation(cluster)
+    writeInstalledEnv(root, cluster.port, 'live-password')
+
+    const run = runShipped(installVars(cluster, root), `
+      # PRECONDITION, MEASURED: with a route stated, this endpoint accepts a password nothing has
+      # ever set. So every refusal below is manufactured here and not by the server.
+      if on_route postgres disable db_endpoint_accepts_password postgres "a-password-nothing-has-ever-set"; then
+        echo "ROUTED_ACCEPTS=yes"
+      else
+        echo "ROUTED_ACCEPTS=no"
+      fi
+      # AND WITH NO READER HAVING SPOKEN, the same call on the same bytes refuses.
+      if db_endpoint_accepts_password postgres "a-password-nothing-has-ever-set"; then
+        echo "UNROUTED_ACCEPTS=yes"
+      else
+        echo "UNROUTED_ACCEPTS=no"
+      fi
+      DB_PROBE_REPORT=""
+      if db_endpoint_discriminates_passwords postgres "a-password-nothing-has-ever-set"; then
+        echo "UNROUTED_PAIR=yes"
+      else
+        echo "UNROUTED_PAIR=no"
+      fi
+      echo "REPORT_B64=$(printf '%s' "\${DB_PROBE_REPORT}" | base64 -w0)"
+    `)
+    assert.equal(run.status, 0, run.output)
+    assert.match(run.output, /ROUTED_ACCEPTS=yes/, 'precondition: routed, this endpoint accepts anything')
+    assert.match(run.output, /UNROUTED_ACCEPTS=no/, 'and unrouted the probe refuses rather than sending a credential')
+    assert.match(run.output, /UNROUTED_PAIR=no/, 'so the pair cannot be satisfied by it either')
+    const report = Buffer.from(readVar(run.output, 'REPORT_B64'), 'base64').toString('utf8')
+    assert.match(report, /was not probed with a credential at all, because no reader has established which TRANSPORT/,
+      'and the report names the question that was skipped, rather than blaming the endpoint for a refusal this run made')
+  } finally {
+    cluster?.stop()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 20. A METHOD WITHOUT A TRANSPORT IS NOT AN ADMISSION
+// ---------------------------------------------------------------------------
+
+test('r42: an admissible method read over an unstated route is refused, and the report says which half was missing', () => {
+  // THE ONE CASE THE SHIPPED READER CANNOT PRODUCE TODAY, WHICH IS WHY IT NEEDS A TEST. pinFor()
+  // answers `require`, `disable` or `unknown`, and `unknown` only on a connection that failed —
+  // where the exit status already refuses. So the branch in db_endpoint_checks_role_verifier() that
+  // refuses an admissible METHOD carrying an unusable ROUTE is unreachable through the shipped
+  // reader, and would sit there unexercised until somebody taught the reader a fourth answer.
+  //
+  // A READER IS EXACTLY WHAT THAT CONTRACT IS WITH, so the test supplies one. Two stubs, differing
+  // in ONE LINE — the route — through IMS_AUTH_REQUEST_PROBE, which the shipped path already
+  // exposes for the regressions and which cannot produce an exemption: pointing it somewhere else
+  // produces a refusal, never an admission.
+  //
+  // NO CLUSTER AND NO CONNECTION. db_endpoint_checks_role_verifier() runs a program and parses its
+  // output; it sends no password and opens no psql. The port below is deliberately one nothing is
+  // listening on, so a version of this that DID connect would fail rather than quietly pass.
+  //
+  // MUTATION ROUTES (each measured by making the change and re-running):
+  //   1. add `prefer` to the `case` in db_endpoint_checks_role_verifier(): PREFER_ADMITTED becomes
+  //      `yes`, PREFER_ROUTE becomes `prefer`, and this test fails on both. Nothing else in the
+  //      suite fails, because the shipped reader never says `prefer` — which is the point.
+  //   2. drop the `case` entirely and publish whatever the reader said: identical failures, and
+  //      the report assertion fails too.
+  const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
+  try {
+    const reader = (sslmode: string) =>
+      `process.stdout.write('transport=tcp\\nssl=yes\\nsslmode=${sslmode}\\nmethod=scram-sha-256\\nverifier=role\\ndetail=a stub reader\\n')\n`
+    writeFileSync(join(root, 'reader-prefer.mjs'), reader('prefer'))
+    writeFileSync(join(root, 'reader-require.mjs'), reader('require'))
+
+    const run = runShipped({
+      APP_DIR: root,
+      APP_USER: currentUser(),
+      DB_HOST: '127.0.0.1',
+      // A port nothing holds: this path must not open a connection, and if it ever does it fails.
+      DB_PORT: '1',
+      DB_NAME: 'one_two_inventory',
+      DB_USER: 'imsuser',
+    }, `
+      DB_PROBE_REPORT=""
+      IMS_AUTH_REQUEST_PROBE="\${APP_DIR}/reader-prefer.mjs"
+      if db_endpoint_checks_role_verifier postgres; then echo "PREFER_ADMITTED=yes"; else echo "PREFER_ADMITTED=no"; fi
+      echo "PREFER_ROUTE=\${DB_PROBE_SSLMODE}"
+      echo "REPORT_B64=$(printf '%s' "\${DB_PROBE_REPORT}" | base64 -w0)"
+      # THE CONTROL: the SAME stub with one word changed. If this did not qualify, the refusal
+      # above would be about something else entirely.
+      IMS_AUTH_REQUEST_PROBE="\${APP_DIR}/reader-require.mjs"
+      if db_endpoint_checks_role_verifier postgres; then echo "REQUIRE_ADMITTED=yes"; else echo "REQUIRE_ADMITTED=no"; fi
+      echo "REQUIRE_ROUTE=\${DB_PROBE_SSLMODE}"
+      echo "REQUIRE_ENDPOINT=\${DB_PROBE_ROUTE_DATABASE}"
+    `)
+    assert.equal(run.status, 0, run.output)
+    assert.match(run.output, /PREFER_ADMITTED=no/, 'a route that cannot be pinned to is not a route')
+    assert.match(run.output, /PREFER_ROUTE=$/m, 'and nothing is published, so no probe can run on it')
+    const report = Buffer.from(readVar(run.output, 'REPORT_B64'), 'base64').toString('utf8')
+    assert.match(report, /did not name the TRANSPORT it read it on/, 'the report names the half that was missing')
+    assert.match(report, /hostssl and hostnossl are different records/, 'and why that is not a formality')
+
+    assert.match(run.output, /REQUIRE_ADMITTED=yes/, 'control: the same method with a usable route qualifies')
+    assert.match(run.output, /REQUIRE_ROUTE=require/, 'and the route is published as the reader stated it')
+    assert.match(run.output, /REQUIRE_ENDPOINT=postgres/, 'bound to the endpoint it was read on')
+  } finally {
     rmSync(root, { recursive: true, force: true })
   }
 })
