@@ -6,7 +6,7 @@ import { WEBHOOK_ORIGIN_NOT_APPLICABLE } from '@/lib/connectors/webhook-origin'
 import { parsePositiveIntegerEnv } from '@/lib/env'
 import type { ShoppingWebhookResource } from '@/lib/shopping'
 
-const WOOCOMMERCE_CONNECTOR = 'woocommerce' as const
+export const WOOCOMMERCE_CONNECTOR = 'woocommerce' as const
 const SHOPIFY_CONNECTOR = 'shopify' as const
 
 export type ShoppingWebhookEventConnector = typeof WOOCOMMERCE_CONNECTOR | typeof SHOPIFY_CONNECTOR

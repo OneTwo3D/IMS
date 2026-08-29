@@ -2,6 +2,10 @@ import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
 import { WC_WEBHOOK_EVENT_STATUS } from '@/lib/connectors/shopping-webhook-inbox'
+import {
+  PRESERVED_WC_ORDER_EVIDENCE_WHERE,
+  compactableShoppingWebhookEventWhere,
+} from '@/lib/connectors/shopping-webhook-retention'
 
 // o3d-ahk: purgeExpiredData COMPACTS succeeded shopping-webhook-inbox rows past the cutoff — it clears
 // the bulky payloadJson but KEEPS the row (the connector/resource/payloadHash idempotency tombstone).
@@ -93,4 +97,39 @@ test('a 0-month webhook retention setting disables compaction', async () => {
 
   assert.equal(result.webhookEventsCompacted, 0)
   assert.equal(capture.last, undefined, 'updateMany must not be called when retention is 0')
+})
+
+/**
+ * o3d-j7y4 (Codex r17 HIGH): the archived WooCommerce ORDER deliveries are the only positive evidence
+ * that an order was created on a currency the store never stated, and this compaction was emptying them
+ * three months in while the work that needs them is still deferred. They are held back until it closes.
+ *
+ * What these two pin is that the purge asks the SHARED predicate — the one
+ * tests/db/shopping-webhook-retention-evidence.test.ts then proves against a real Postgres — and that
+ * the held-back set is named on columns that cannot make the negation ambiguous.
+ */
+test('the compaction holds back WooCommerce ORDER deliveries while o3d-j7y4 is open', async () => {
+  const purgeExpiredData = await loadPurge()
+  capture.settingRows = [{ key: 'retention_webhook_events_months', value: '3' }]
+  capture.last = undefined
+  capture.count = 3
+
+  await purgeExpiredData()
+
+  if (!capture.last) throw new Error('updateMany was not called')
+  const args: UpdateArgs = capture.last
+  const cutoff = (args.where.updatedAt as { lt: Date }).lt
+  // The purge must issue exactly the shared predicate — not a copy of it that can drift.
+  assert.deepEqual(args.where, compactableShoppingWebhookEventWhere(cutoff))
+  // And that predicate must currently carry the hold.
+  assert.deepEqual(args.where.AND, [{ NOT: PRESERVED_WC_ORDER_EVIDENCE_WHERE }])
+})
+
+test('the held-back set is named on NOT NULL columns, so the negation cannot go three-valued (o3d-j7y4)', () => {
+  // `resource` and `connector` are NOT NULL and IMS writes both itself. `topic` is a nullable header
+  // value the store supplies: Postgres evaluates `NOT (... AND topic IN (...))` to NULL for a row whose
+  // topic is NULL, which silently drops that row from the compaction set as well. Naming the set on
+  // `topic` would therefore hold back rows nobody decided to hold back.
+  assert.deepEqual(PRESERVED_WC_ORDER_EVIDENCE_WHERE, { connector: 'woocommerce', resource: 'orders' })
+  assert.equal('topic' in PRESERVED_WC_ORDER_EVIDENCE_WHERE, false)
 })

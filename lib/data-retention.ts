@@ -1,7 +1,7 @@
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { WC_WEBHOOK_EVENT_STATUS } from '@/lib/connectors/shopping-webhook-inbox'
+import { compactableShoppingWebhookEventWhere } from '@/lib/connectors/shopping-webhook-retention'
 import { alignmentDryRunEvidenceQuery } from '@/lib/domain/wms/alignment-dry-run'
 import {
   UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE,
@@ -461,15 +461,16 @@ export async function purgeExpiredData(): Promise<{
   // PENDING/FAILED (undelivered work) are left fully intact. The `payloadJson != {}` predicate
   // PERMANENTLY excludes already-compacted rows, so each daily run only touches the newly-eligible set
   // (a day's worth of rows crossing the cutoff) rather than rewriting the whole retained tombstone set.
+  //
+  // ONE SET IS HELD BACK: WooCommerce ORDER deliveries, while `o3d-j7y4` is open (Codex r17 HIGH). Their
+  // payloads are the only positive evidence of an order created on a currency WooCommerce never stated,
+  // and emptying one destroys that evidence for good. The predicate and the whole of the reasoning live
+  // in lib/connectors/shopping-webhook-retention.ts, next to the constant that lifts the hold.
   const webhookMonths = settings.retention_webhook_events_months
   if (webhookMonths > 0) {
     const cutoff = monthsAgo(webhookMonths)
     const { count } = await db.shoppingWebhookEvent.updateMany({
-      where: {
-        status: WC_WEBHOOK_EVENT_STATUS.processed,
-        updatedAt: { lt: cutoff },
-        NOT: { payloadJson: { equals: {} } },
-      },
+      where: compactableShoppingWebhookEventWhere(cutoff),
       data: { payloadJson: {}, lastError: null },
     })
     webhookEventsCompacted = count
