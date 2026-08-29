@@ -574,10 +574,21 @@ async function setMany(values: Record<string, string>) {
 }
 
 test('a generic settings save writes every key in ONE transaction', async () => {
-  const result = await setMany({ backup_retention_days: '30', backup_max_count: '10', backup_auto_upload: 'true' })
+  // Three ALLOWLISTED preference keys (Codex r20 HIGH #2). These used to be the backup schedule's
+  // keys; that panel now saves through saveBackupScheduleSettings, because its enable switch is a
+  // crontab line rather than a preference, so the generic writer refuses them.
+  const result = await setMany({
+    activity_log_retention_info: '30',
+    activity_log_retention_warning: '90',
+    activity_log_retention_error: '365',
+  })
 
   assert.deepEqual(result, { status: 'saved' })
-  assert.deepEqual(state.writes, ['backup_retention_days=30', 'backup_max_count=10', 'backup_auto_upload=true'])
+  assert.deepEqual(state.writes, [
+    'activity_log_retention_info=30',
+    'activity_log_retention_warning=90',
+    'activity_log_retention_error=365',
+  ])
   assert.equal(
     state.maxConcurrentTransactions,
     1,
