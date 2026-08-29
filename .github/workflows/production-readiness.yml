@@ -214,10 +214,48 @@ jobs:
       - run: npm ci
       - run: npx prisma generate --schema prisma/schema.prisma
       - run: npm run build
+      # THIS LEG'S PROBE HAS TO REACH THE BACKEND DIRECTLY, AND THE PUBLISHED PORT DOES NOT (o3d-2k5r).
+      #
+      # `services:` publishes the container's 5432 on the runner, and docker-proxy carries the
+      # connection: it terminates our socket and opens its own, so the backend names its client as
+      # 172.18.0.1:<proxy's port> while this process's socket is 127.0.0.1:<our port>. The
+      # deployment probe -- the one that measures whether a non-ASCII schema's startup bytes
+      # survive the server's tokenizer -- will not grant a verdict over a connection whose far end
+      # cannot be shown to be ours, so the built server refused the Unicode schema and the leg
+      # failed with "the connection the measurement was made on does not reach the backend
+      # directly". Nothing about the artifact was wrong; the route was.
+      #
+      # NOT a DATABASE_SESSION_LOCK_URL. The refusal here comes from the DATA path's own probe, so
+      # the DATA path is what needs the direct route; an override would leave this leg failing
+      # exactly as it was. It would also be a latent mismatch rather than a help: the check creates
+      # a THROWAWAY database and starts the built server against it while inheriting the rest of
+      # the environment, so an override still naming ims_ci would name a different database from
+      # DATABASE_URL -- a configuration the module refuses by design the moment any session lock is
+      # taken. Measured, so it is not overstated: with an override set, this leg still passes,
+      # because /api/notifications takes no session lock. It is wrong-but-quiet, not broken.
+      #
+      # The container's own bridge address is that direct route: host-to-container traffic leaves
+      # via the bridge interface and Docker's MASQUERADE rule excludes it (`! -o <bridge>`), so the
+      # backend sees our own socket. Scoped to this step, so `prisma generate` and the build keep
+      # the published port they already work over.
+      - name: Resolve the postgres service's direct, non-NAT address
+        id: direct-db
+        run: |
+          ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' '${{ job.services.postgres.id }}')"
+          if [ -z "$ip" ]; then
+            echo "could not read the postgres service container's bridge address" >&2
+            exit 1
+          fi
+          if ! timeout 10 bash -c "until </dev/tcp/${ip}/5432; do sleep 1; done" 2>/dev/null; then
+            echo "the postgres service container is not reachable at ${ip}:5432" >&2
+            exit 1
+          fi
+          echo "url=${DATABASE_URL/@127.0.0.1:5432/@${ip}:5432}" >> "$GITHUB_OUTPUT"
       # AFTER the build, in the SAME workspace, against what the bundler actually emitted.
       - name: Build-level DB startup-option checks (artifact + built server)
         env:
           IMS_REQUIRE_BUILD_ARTIFACT: "1"
+          DATABASE_URL: ${{ steps.direct-db.outputs.url }}
         run: npx tsx --test --experimental-test-module-mocks tests/db/startup-option-verdict-across-bundles.test.ts
 
   e2e-select:
