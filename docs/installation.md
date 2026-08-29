@@ -373,6 +373,50 @@ Two things follow, and they are the point rather than a side effect:
   change in the driver's next major version, and adding one would change what every existing
   installation's application connection does at its next upgrade.
 
+### The URL is only half of what decides that route
+
+Working the route out from the `DATABASE_URL` alone is not enough, and the reason is the same one
+that made every `psql` this installer runs go through an environment scrub. node-postgres leaves
+its `ssl` setting **undefined** when the URL says nothing about it, and then reads
+`PGSSLMODE` out of the process environment. A service started with `Environment=PGSSLMODE=require`
+— or an operator who exports it before running the installer — therefore has an application on a
+`hostssl` record while the gate reads, probes and rotates against `hostnossl`. That is the outage
+this whole section exists to prevent, arriving through the one door the derivation did not look at.
+
+Measured against the driver the release installs, the variables it consults for a URL of this shape
+are `PGSSLMODE`, `PGREPLICATION`, `PGOPTIONS`, `PGAPPNAME`, `PGBINARY`, `PGCLIENT_ENCODING`,
+`PGCONNECT_TIMEOUT` and `NODE_PG_FORCE_NATIVE`. `PGHOST`, `PGPORT`, `PGUSER`, `PGDATABASE` and
+`PGPASSWORD` are **not** among them, because the emitted URL states all five. Three of the eight
+change which `pg_hba.conf` record answers:
+
+| variable | what it does to the record |
+| --- | --- |
+| `PGSSLMODE` | decides whether an `SSLRequest` is sent at all, so it chooses between `hostssl` and `hostnossl` |
+| `PGREPLICATION` | turns the backend into a WAL sender, which `pg_hba.conf` matches on the `replication` keyword rather than on the database name |
+| `NODE_PG_FORCE_NATIVE` | replaces node-postgres with libpq, which fills `sslmode`, `gssencmode`, `service` and `host` from the environment all over again |
+
+**Any of those three, from any source that can reach the application, is a refusal** — before the
+reconciliation and again before the service is started. Deriving a route from them instead was
+rejected for the reason the previous section gives: node-postgres's TLS semantics are not libpq's,
+so there is no `sslmode=` a probe could be pinned to that reproduces `require`'s
+verify-full-against-the-system-store, and a value missed in such a mapping is this defect again.
+
+Three places are read, all read-only:
+
+* **this installer's own environment**, because the migration, the build and the connection fence
+  are Node processes started from it and inherit it verbatim;
+* **the service manager's environment block** (`systemctl show-environment`), which systemd passes
+  to every service it starts and which appears in no unit property at all;
+* **the unit**, through the same scan that answers "is this `.env` the only thing defining
+  `DATABASE_URL`" — its `Environment=`, `PassEnvironment=`, `UnsetEnvironment=`, `PAMName=` and
+  every `EnvironmentFile=` it loads. For this question there is no permitted source, so unlike the
+  `DATABASE_URL` scan the environment files are opened and checked for the name.
+
+If a refusal names one of these, remove the setting rather than working around it: with
+`PGSSLMODE` in play the installer cannot say which record the application will be matched by, and
+a credential rotated against the wrong record is an outage that only shows up after the restart.
+
+
 The postmaster-identity read performed just after `CREATE DATABASE` is the one credential-bearing
 connection deliberately **left unpinned**. What it concludes — that the server answering
 `DB_HOST:DB_PORT` is the one the `CREATE` landed on — is established from a start time, a port and
