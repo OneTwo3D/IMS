@@ -4,6 +4,7 @@ import {
   chmodSync,
   existsSync,
   lstatSync,
+  mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
@@ -1862,4 +1863,324 @@ test('[o3d-batch-ret] the crontab section REFUSES to take the lock unless the bu
   const allowed = await sh(`${prelude}APP_SERVICE_ON_NEW_BUILD=true\n${guard}\necho REACHED-THE-LOCK`)
   assert.equal(allowed.code, 0, allowed.stderr)
   assert.match(allowed.stdout, /REACHED-THE-LOCK/)
+})
+
+// ---------------------------------------------------------------------------
+// 15 — LOAD-BEARING: a reconciliation committing between a cutover SNAPSHOT and its
+//      RESTORE is not lost
+//
+// This is Codex r26's HIGH stated as an experiment rather than as an argument. The cutover reads
+// the crontab, backs the reading up verbatim, writes a commented-out copy over it, and much later
+// restores the backup. If an application reconciliation can commit ANYWHERE in that window, its
+// block is inside a crontab the cutover is about to overwrite and outside the backup the cutover
+// will restore: the settings rows and the UI go on saying the job is enabled and nothing is
+// scheduled to run it, with no error anywhere.
+//
+// The window is opened FOR REAL here: a `crontab` shim parks the cutover's write between the
+// snapshot and the replacement, and the application is asked to save a schedule at exactly that
+// instant. Both directions are run — the shipped `fence_cron`, which must refuse the application;
+// and `fence_cron_locked` invoked directly, which is the body WITHOUT the lock and is precisely
+// what all fourteen of round 25's exceptions were. The second is the mutation route for the first,
+// and it is executed rather than described.
+// ---------------------------------------------------------------------------
+
+/** A shell function lifted out of a shipped script by name, so the tests run what ships. */
+function shellFunctionFrom(src: string, name: string, where: string): string {
+  const lines = src.split('\n')
+  const start = lines.indexOf(`${name}() {`)
+  assert.notEqual(start, -1, `${where} must define ${name}()`)
+  const end = lines.indexOf('}', start)
+  assert.ok(end > start, `${name}() must be closed by a \`}\` on its own line`)
+  return lines.slice(start, end + 1).join('\n')
+}
+
+const CUTOVER_DIR = join(HARNESS, 'cutover')
+const CUTOVER_BIN = join(HARNESS, 'cutover-bin')
+const CUTOVER_BACKUP = join(CUTOVER_DIR, 'crontab-appuser.bak')
+mkdirSync(CUTOVER_DIR, { recursive: true })
+mkdirSync(CUTOVER_BIN, { recursive: true })
+
+// The entrypoints call `crontab -u <user> …`, which the application never does, so they get their
+// own shim — writing the SAME crontab file, journal and gate as the application's, because the
+// whole point is that the two writers are contending for one artefact.
+writeFileSync(join(CUTOVER_BIN, 'crontab'), `#!/bin/sh
+if [ "$1" = "-u" ]; then shift 2; fi
+if [ "$1" = "-l" ]; then
+  if [ -f '${CRONTAB_FILE}' ]; then cat '${CRONTAB_FILE}'; fi
+  exit 0
+fi
+src="$1"
+if [ -f '${WRITE_GATE}' ]; then
+  rm -f '${WRITE_GATE}'
+  echo parked > '${READY_FIFO}'
+  head -n 1 '${GO_FIFO}' > /dev/null
+fi
+if [ "$src" = "-" ]; then cat > '${CRONTAB_FILE}'; else cat "$src" > '${CRONTAB_FILE}'; fi
+`)
+chmodSync(join(CUTOVER_BIN, 'crontab'), 0o755)
+
+function cutoverProgram(body: string): string {
+  return [
+    'set -uo pipefail',
+    `PATH='${CUTOVER_BIN}':"$PATH"`,
+    'IMS_CRONTAB_LOCK_WAIT_SECONDS=30',
+    `source '${CRONTAB_LOCK_LIB}'`,
+    `CRONTAB_LOCK_DIR='${dirname(LOCK_FILE)}'`,
+    `CRONTAB_LOCK_FILE='${LOCK_FILE}'`,
+    'APP_USER=appuser',
+    `DATA_DIR='${CUTOVER_DIR}'`,
+    `CRON_BACKUP='${CUTOVER_BACKUP}'`,
+    'CRON_FENCED=false',
+    'CRON_BACKUP_CREATED=false',
+    'info(){ :; }; success(){ :; }; warn(){ :; }',
+    'die(){ echo "DIE: $*" >&2; exit 9; }',
+    shellFunctionFrom(INSTALL_SH, 'fsync_path', 'scripts/install.sh'),
+    shellFunctionFrom(INSTALL_SH, 'publish_cron_backup', 'scripts/install.sh'),
+    shellFunctionFrom(INSTALL_SH, 'fence_cron_locked', 'scripts/install.sh'),
+    shellFunctionFrom(INSTALL_SH, 'fence_cron', 'scripts/install.sh'),
+    shellFunctionFrom(INSTALL_SH, 'unfence_cron_locked', 'scripts/install.sh'),
+    shellFunctionFrom(INSTALL_SH, 'unfence_cron', 'scripts/install.sh'),
+    body,
+  ].join('\n')
+}
+
+const CUTOVER_ORIGINAL = '# an operator line the cutover must put back\n*/5 * * * * /usr/bin/true\n'
+
+/**
+ * Run the cutover's fence with its write PARKED between the snapshot and the replacement, and ask
+ * the application to commit a schedule change while it is parked.
+ */
+async function reconcileInsideTheCutoverWindow(fenceCall: string) {
+  writeFileSync(CRONTAB_FILE, CUTOVER_ORIGINAL)
+  rmSync(CUTOVER_BACKUP, { force: true })
+  writeFileSync(WRITE_GATE, '')
+
+  const fence = spawn('bash', ['-c', cutoverProgram(fenceCall)], { stdio: ['ignore', 'pipe', 'pipe'] })
+  let fenceErr = ''
+  fence.stderr.on('data', (c) => { fenceErr += String(c) })
+  fence.stdout.on('data', () => {})
+  await awaitFifo(READY_FIFO)
+
+  // THE WINDOW. The snapshot has been taken and backed up; the replacement has not landed.
+  process.env.OTI_CRONTAB_LOCK_WAIT_MS = '100'
+  const saved = await saveBackup(true)
+  delete process.env.OTI_CRONTAB_LOCK_WAIT_MS
+  const crontabDuringWindow = crontabText()
+
+  await writeFile(GO_FIFO, 'go\n')
+  const fenceCode: number | null = await new Promise((resolve) => fence.on('exit', resolve))
+
+  const restore = await sh(cutoverProgram('CRON_FENCED=true\nunfence_cron'))
+  return { saved, crontabDuringWindow, fenceCode, fenceErr, restore, final: crontabText() }
+}
+
+test('[o3d-batch-ret] a reconciliation cannot commit between a cutover SNAPSHOT and its RESTORE', async () => {
+  const run = await reconcileInsideTheCutoverWindow('fence_cron')
+
+  assert.equal(run.fenceCode, 0, `the shipped fence must complete:\n${run.fenceErr}`)
+
+  // THE PROPERTY. The application was asked to save inside the window and was REFUSED — it did not
+  // even snapshot the settings, so there is no committed schedule for the restore to discard.
+  assert.equal(run.saved.status, 'post-commit-failed',
+    `a save inside the cutover window must be refused, and it returned ${JSON.stringify(run.saved)}`)
+  assert.equal(run.saved.status === 'post-commit-failed' && run.saved.step, 'scheduler')
+  assert.match(run.saved.status === 'post-commit-failed' ? run.saved.error : '',
+    /Another crontab reconciliation is still running/)
+  assert.equal(snapshots.length, 0,
+    'the reconciliation must not even read the settings while the cutover holds the lock')
+  assert.equal(run.crontabDuringWindow, CUTOVER_ORIGINAL,
+    'and nothing may have been written into the crontab inside the window')
+
+  // The fence really did happen — this is not a run in which nothing was exercised.
+  assert.equal(run.restore.code, 0, `the restore must complete:\n${run.restore.stderr}`)
+  assert.equal(run.final, CUTOVER_ORIGINAL,
+    'and the restore puts back exactly what the snapshot read, byte for byte')
+  assert.equal(backupLineInstalled(), false,
+    'the refused save left no block; the crontab and the settings agree because the save FAILED')
+})
+
+test('[o3d-batch-ret] MUTATION: without the lock, the same window loses the reconciliation silently', async () => {
+  // THE ROUTE, RUN. `fence_cron_locked` is the shipped body with the acquisition removed — exactly
+  // the shape every one of round 25's fourteen exceptions had, and exactly what deploy.sh and
+  // update.sh did until o3d-p9dq. If this test ever starts reporting the same outcome as the one
+  // above, the lock has stopped excluding anything and the test above has gone vacuous.
+  const run = await reconcileInsideTheCutoverWindow('fence_cron_locked')
+
+  assert.equal(run.fenceCode, 0, `the unlocked body must complete too:\n${run.fenceErr}`)
+
+  // The application is NOT refused: it takes the lock nobody is holding, commits, and writes its
+  // block into the crontab the cutover has already snapshotted.
+  assert.deepEqual(run.saved, { status: 'saved' },
+    'without the lock the save succeeds — that is the whole defect: it reports success')
+  assert.match(run.crontabDuringWindow, /\$BASE_URL\/backup"/,
+    'and its block really did reach the crontab inside the window')
+
+  // …and then the cutover's replacement overwrites it, and the restore puts back a snapshot taken
+  // BEFORE it. The row says enabled. Nothing is scheduled. Nothing reported an error.
+  assert.equal(run.restore.code, 0, `the restore must complete:\n${run.restore.stderr}`)
+  assert.equal(run.final, CUTOVER_ORIGINAL)
+  assert.equal(backupLineInstalled(), false,
+    'THE LOST UPDATE: the save returned `saved`, and the schedule it committed is not in the crontab')
+})
+
+// ---------------------------------------------------------------------------
+// 16 — LOAD-BEARING: a listener that serves the new build but is NOT the unit's process
+//      does not arm the crontab guard
+//
+// Codex r26's second HIGH. The asset fetch proves the tree; it cannot prove the process. A
+// same-build process launched straight out of the app directory after the port was drained wins
+// the bind while `systemctl start` returns for a unit that then fails to bind — and, not being the
+// unit's child, it has no $STATE_DIRECTORY, so lib/crontab-reconcile-lock.ts resolves its lock
+// under `process.cwd()` instead. The installer would then hold an exclusive lock on one inode
+// while the application held one on another.
+//
+// The shipped `prove_listener_belongs_to_unit` is executed against REAL processes and REAL /proc
+// entries; only `systemctl` and `ss` are doubled, because they are the two answers this host
+// cannot be made to give on demand.
+// ---------------------------------------------------------------------------
+
+const PROOF_BIN = join(HARNESS, 'proof-bin')
+const PROOF_STATE = join(HARNESS, 'proof-state')
+mkdirSync(PROOF_BIN, { recursive: true })
+mkdirSync(join(PROOF_STATE, 'locks'), { recursive: true })
+
+writeFileSync(join(PROOF_BIN, 'systemctl'), `#!/bin/sh
+if [ "$1" = "is-active" ]; then exit "\${FAKE_IS_ACTIVE:-0}"; fi
+if [ "$1" = "show" ]; then
+  case "$*" in
+    *MainPID*) printf '%s\\n' "\${FAKE_MAIN_PID}" ;;
+    *ControlGroup*) printf '%s\\n' "\${FAKE_CGROUP}" ;;
+  esac
+  exit 0
+fi
+exit 0
+`)
+writeFileSync(join(PROOF_BIN, 'ss'), `#!/bin/sh
+[ -n "\${FAKE_LISTENER_PID}" ] || exit 0
+printf 'LISTEN 0 511 *:%s *:* users:(("node",pid=%s,fd=21))\\n' "\${FAKE_PORT}" "\${FAKE_LISTENER_PID}"
+`)
+chmodSync(join(PROOF_BIN, 'systemctl'), 0o755)
+chmodSync(join(PROOF_BIN, 'ss'), 0o755)
+
+function listenerProofProgram(): string {
+  return [
+    'set -uo pipefail',
+    `PATH='${PROOF_BIN}':"$PATH"`,
+    'APP_NAME=app',
+    'APP_PORT="${FAKE_PORT}"',
+    `DATA_DIR='${PROOF_STATE}'`,
+    `CRONTAB_LOCK_FILE='${join(PROOF_STATE, 'locks', '.crontab-reconcile.lock')}'`,
+    shellFunctionFrom(INSTALL_SH, 'process_is_in_cgroup', 'scripts/install.sh'),
+    shellFunctionFrom(INSTALL_SH, 'effective_state_directory', 'scripts/install.sh'),
+    shellFunctionFrom(INSTALL_SH, 'prove_listener_belongs_to_unit', 'scripts/install.sh'),
+    'if prove_listener_belongs_to_unit; then',
+    '  echo "PROVEN=${LISTENER_PIDS}"',
+    'else',
+    '  echo "UNPROVEN=${LISTENER_PROOF_REASON}"',
+    'fi',
+  ].join('\n')
+}
+
+function runListenerProof(env: Record<string, string>): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  const assignments = Object.entries(env)
+    .map(([k, v]) => `${k}='${v}'`)
+    .join('\n')
+  return sh(`${assignments}\nexport ${Object.keys(env).join(' ')}\n${listenerProofProgram()}`)
+}
+
+function cgroupOf(pid: number): string {
+  const line = readFileSync(`/proc/${pid}/cgroup`, 'utf8').split('\n').filter(Boolean)[0]
+  return line.split(':').slice(2).join(':')
+}
+
+test('[o3d-batch-ret] a listener serving the new build that is NOT the unit\'s process is refused', async () => {
+  const ownCgroup = cgroupOf(process.pid)
+  const initCgroup = cgroupOf(1)
+  assert.notEqual(ownCgroup, initCgroup,
+    'precondition: this process and pid 1 must be in different control groups, or the impostor '
+    + 'case below cannot be constructed')
+
+  const spawnListener = (stateDirectory?: string) => {
+    const env = { ...process.env } as Record<string, string>
+    if (stateDirectory === undefined) delete env.STATE_DIRECTORY
+    else env.STATE_DIRECTORY = stateDirectory
+    return spawn('sleep', ['120'], { env, stdio: 'ignore' })
+  }
+
+  const impostor = spawnListener(undefined)
+  const insider = spawnListener(`${PROOF_STATE}:/var/lib/something-else`)
+  const wrongState = spawnListener('/var/lib/somewhere-else')
+  const noState = spawnListener(undefined)
+  try {
+    const base = { FAKE_PORT: '3000' }
+
+    // (a) THE FINDING ITSELF. The unit is active with a MainPID inside its own control group, and
+    //     the process on the port is a real one that is NOT in that control group.
+    const outsider = await runListenerProof({
+      ...base, FAKE_MAIN_PID: '1', FAKE_CGROUP: initCgroup, FAKE_LISTENER_PID: String(impostor.pid),
+    })
+    assert.match(outsider.stdout, /^UNPROVEN=/m,
+      `a listener outside the unit's control group must not be proved:\n${outsider.stdout}`)
+    assert.match(outsider.stdout, /is NOT in app\.service's control group/,
+      'and the refusal must say which property failed')
+
+    // (b) IN THE CONTROL GROUP, BUT WITH NO STATE_DIRECTORY. This is the case that decides the
+    //     lock path: without it the application joins `process.cwd()/locks/…`, a different inode.
+    const stateless = await runListenerProof({
+      ...base, FAKE_MAIN_PID: String(noState.pid), FAKE_CGROUP: ownCgroup, FAKE_LISTENER_PID: String(noState.pid),
+    })
+    assert.match(stateless.stdout, /^UNPROVEN=/m, stateless.stdout)
+    assert.match(stateless.stdout, /NO STATE_DIRECTORY in its environment/,
+      'and it must name the reason the lock would be a different file')
+
+    // (c) A STATE_DIRECTORY THAT IS NOT THIS ONE.
+    const elsewhere = await runListenerProof({
+      ...base, FAKE_MAIN_PID: String(wrongState.pid), FAKE_CGROUP: ownCgroup, FAKE_LISTENER_PID: String(wrongState.pid),
+    })
+    assert.match(elsewhere.stdout, /^UNPROVEN=/m, elsewhere.stdout)
+    assert.match(elsewhere.stdout, /STATE_DIRECTORY='\/var\/lib\/somewhere-else'/, elsewhere.stdout)
+
+    // (d) THE UNIT IS NOT ACTIVE, whatever is on the port.
+    const inactive = await runListenerProof({
+      ...base, FAKE_IS_ACTIVE: '3', FAKE_MAIN_PID: String(insider.pid), FAKE_CGROUP: ownCgroup,
+      FAKE_LISTENER_PID: String(insider.pid),
+    })
+    assert.match(inactive.stdout, /does not report app\.service active/, inactive.stdout)
+
+    // (e) NOTHING HOLDS THE PORT — `systemctl start` returned but nothing bound.
+    const nobody = await runListenerProof({
+      ...base, FAKE_MAIN_PID: String(insider.pid), FAKE_CGROUP: ownCgroup, FAKE_LISTENER_PID: '',
+    })
+    assert.match(nobody.stdout, /named no process holding a listening socket/, nobody.stdout)
+
+    // (f) CONTROL. The unit's own process, in its control group, with this run's state directory
+    //     first in a colon-separated $STATE_DIRECTORY — which is what systemd hands a unit with
+    //     several StateDirectory= entries, and what lib/crontab-reconcile-lock.ts takes the first
+    //     of. Without this the five refusals above could be a proof that refuses everything.
+    const proven = await runListenerProof({
+      ...base, FAKE_MAIN_PID: String(insider.pid), FAKE_CGROUP: ownCgroup, FAKE_LISTENER_PID: String(insider.pid),
+    })
+    assert.match(proven.stdout, new RegExp(`^PROVEN=${insider.pid}$`, 'm'),
+      `the unit's own listener must be proved:\n${proven.stdout}${proven.stderr}`)
+  } finally {
+    for (const child of [impostor, insider, wrongState, noState]) child.kill('SIGKILL')
+  }
+})
+
+test('[o3d-batch-ret] an UNREADABLE /proc/<pid>/environ is proof not established, not proof', async () => {
+  // The clause that closes the loop is a read of another process's environment, so what happens
+  // when it cannot be read has to be an answer rather than an omission. Constructed for real: pid 1
+  // is root's, its /proc/<pid>/cgroup is world-readable and its /proc/<pid>/environ is not — so the
+  // control-group half passes and the STATE_DIRECTORY half cannot be asked.
+  assert.notEqual(process.getuid?.(), 0,
+    'this case models a process this run cannot read the environment of, which does not apply to '
+    + 'root — run the unit tests as an unprivileged user')
+
+  const result = await runListenerProof({
+    FAKE_PORT: '3000', FAKE_MAIN_PID: '1', FAKE_CGROUP: cgroupOf(1), FAKE_LISTENER_PID: '1',
+  })
+  assert.match(result.stdout, /^UNPROVEN=/m,
+    `an environment that cannot be read must not be treated as a pass:\n${result.stdout}`)
+  assert.match(result.stdout, /\/proc\/1\/environ could not be read/, result.stdout)
+  assert.match(result.stdout, /hidepid/, 'and it must say what the two realistic causes are')
 })
