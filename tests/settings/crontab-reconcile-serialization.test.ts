@@ -10,6 +10,7 @@ import {
   readFileSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs'
 import { writeFile } from 'node:fs/promises'
@@ -3512,4 +3513,172 @@ test('[o3d-batch-ret] no application code path reads the crontab without discrim
   assert.ok(sources.length > 200, `the walk must actually reach the source tree, saw ${sources.length}`)
   const offenders = sources.filter((f) => /\breadOwnCrontab\b(?!Result)/.test(readFileSync(f, 'utf8')))
   assert.deepEqual(offenders, [], `these still call the fabricating reader:\n${offenders.join('\n')}`)
+})
+
+// ---------------------------------------------------------------------------
+// Codex r29 HIGH #2 — A MISSING `crontab` BINARY IS NOT AN ABSENT SCHEDULE
+//
+// `command -v crontab >/dev/null 2>&1 || return 0` opened every cutover fence, on the reasoning
+// that a host with no client binary has no per-user crontabs. That reasoning is wrong, and the
+// mistake is the point: `crontab(1)` is an EDITOR. The daemon reads the spool directly and keeps
+// what it read in memory, so removing the client unschedules nothing — the run walked into the
+// database fence and the migration with the schedule fully live.
+//
+// WHAT THESE PIN, and the route each takes:
+//   1. LOAD-BEARING. The cutover fence ABORTS when `crontab` is unavailable and the absence of a
+//      schedule cannot be proved, in all three entrypoints        (fence_cron -> require_crontab_command)
+//   2. the proof is not vacuous in either direction: it can RETURN 2 (proved), and each of the
+//      three things it checks can independently withhold that                (require_crontab_command)
+//   3. MUTATION. With the old guard restored, the fence reports success over a live spool entry
+// ---------------------------------------------------------------------------
+
+// THE HOST BEING MODELLED IS ONE THAT LOST `crontab`, NOT ONE THAT HAS NOTHING. Everything the
+// proof needs to run is here and real; only the client binary is absent. A PATH stripped of `pgrep`
+// and `ls` as well would make every probe below refuse for the wrong reason, and the proof branch
+// would never be reached at all.
+const NO_CRONTAB_BIN = join(FAULT_DIR, 'bin-without-crontab')
+mkdirSync(NO_CRONTAB_BIN, { recursive: true })
+for (const tool of ['pgrep', 'ls', 'id', 'mktemp', 'cat', 'rm', 'sed', 'tr', 'awk', 'grep', 'flock']) {
+  const real = ['/usr/bin', '/bin', '/usr/sbin', '/sbin'].map((d) => join(d, tool)).find((c) => existsSync(c))
+  if (real) symlinkSync(real, join(NO_CRONTAB_BIN, tool))
+}
+assert.ok(existsSync(join(NO_CRONTAB_BIN, 'pgrep')) && existsSync(join(NO_CRONTAB_BIN, 'ls')),
+  'the no-crontab host must still have the tools the absence proof is made of')
+assert.ok(!existsSync(join(NO_CRONTAB_BIN, 'crontab')), 'and it must NOT have a crontab client')
+
+/** Same shipped prelude, with `crontab` genuinely absent from PATH rather than stubbed to fail. */
+function withoutCrontabOnPath(program: string): string {
+  const line = `PATH='${FAULT_BIN}':"$PATH"`
+  assert.equal(program.split(line).length - 1, 1, 'the harness must set PATH exactly once')
+  return program.replace(line, `PATH='${NO_CRONTAB_BIN}'`)
+}
+
+for (const [where, src] of FAULT_ENTRYPOINTS.map(([w, s]) => [w, s] as [string, string])) {
+  test(`[o3d-batch-ret] ${where}: an unavailable \`crontab\` ABORTS the cutover fence`, async () => {
+    // PRECONDITION. `crontab` really is unreachable on the PATH this runs with — otherwise the
+    // abort below would be about something else entirely.
+    const gone = await sh(`PATH='${NO_CRONTAB_BIN}' command -v crontab`)
+    assert.notEqual(gone.code, 0, 'the empty bin directory must not resolve a crontab')
+
+    const run = await sh(faultProgram(where, src, 'fence_cron', {
+      functions: ['fence_cron'],
+      mutate: withoutCrontabOnPath,
+    }))
+    assert.equal(run.code, 9,
+      `the fence must die rather than return success:\n${run.stdout}${run.stderr}`)
+    assert.match(run.stderr, /NOTHING HAS BEEN MIGRATED/,
+      `and it must say the migration did not happen:\n${run.stderr}`)
+    assert.match(run.stderr, /crontab.*not installed/,
+      `naming what could not be established:\n${run.stderr}`)
+
+    // CONTROL. With `crontab` on PATH the same function does NOT die here, so the abort is caused
+    // by the missing binary and not by a fence that refuses everything.
+    writeFileSync(FAULT_CRONTAB, FAULT_ORIGINAL)
+    const present = await sh(`export FAKE_CRONTAB_READ=ok\n${faultProgram(where, src,
+      'require_crontab_command "$APP_USER"; echo "RC=$?"', { functions: [] })}`)
+    assert.match(present.stdout, /^RC=0$/m,
+      `with the binary present nothing is refused:\n${present.stdout}${present.stderr}`)
+  })
+}
+
+/**
+ * The shipped library with the ROOT gate stood down, so the spool search below actually runs.
+ * `EUID` is readonly in bash and cannot be assigned, and the alternative — a test-only environment
+ * hook in the shipped helper — would be a branch production can take. This edits the real source,
+ * the same way every other mutation in this file does, and `libraryWith` fails if the line it is
+ * asked to replace is not there exactly once.
+ */
+const ROOT_GATE = '  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then'
+const asRootLib = () => libraryWith([[ROOT_GATE, '  if false; then']])
+
+test('[o3d-batch-ret] MUTATION: the old guard reports "no cron writers to fence" over a live spool entry', async () => {
+  // THE ROUTE, RUN. The exact line every entrypoint opened its fence with, put back.
+  const spool = mkdtempSync(join(FAULT_DIR, 'spool-'))
+  writeFileSync(join(spool, 'appuser'), '*/5 * * * * /usr/bin/still-scheduled\n')
+
+  const preFix = (program: string): string =>
+    withoutCrontabOnPath(program) + '\nfence_cron() { command -v crontab >/dev/null 2>&1 || return 0; echo UNREACHED; }'
+  const run = await sh(faultProgram('scripts/deploy.sh', DEPLOY_SH,
+    'fence_cron\necho "FENCE_RC=$?"', { functions: [], mutate: preFix }))
+  assert.match(run.stdout, /^FENCE_RC=0$/m,
+    `THE FINDING: the fence reports success and the cutover proceeds:\n${run.stdout}${run.stderr}`)
+  assert.doesNotMatch(run.stdout, /UNREACHED/, 'and it returned at the guard, having fenced nothing')
+
+  // …and the shipped helper, asked about the same host, refuses and NAMES the spool entry that
+  // makes the absence unprovable.
+  const shipped = await sh(faultProgram('scripts/deploy.sh', DEPLOY_SH,
+    `CRON_SPOOL_ROOTS=('${spool}')\nCRON_DAEMON_NAMES=(no-such-daemon-xyz)\nrequire_crontab_command appuser; echo "RC=$?"\necho "WHY=${'$'}{CRONTAB_COMMAND_REASON}"`,
+    { functions: [], mutate: withoutCrontabOnPath, lib: asRootLib() }))
+  assert.match(shipped.stdout, /^RC=1$/m,
+    `the shipped helper must refuse:\n${shipped.stdout}${shipped.stderr}`)
+  assert.match(shipped.stdout, new RegExp(`WHY=.*${spool}/appuser EXISTS`),
+    `naming the spooled schedule the missing client cannot reach:\n${shipped.stdout}`)
+})
+
+test('[o3d-batch-ret] the no-binary proof is not vacuous: each thing it checks can independently withhold it', async () => {
+  const emptySpool = mkdtempSync(join(FAULT_DIR, 'spool-empty-'))
+  const NO_DAEMON = 'CRON_DAEMON_NAMES=(no-such-daemon-xyz)'
+  const probe = (body: string, lib: string) => sh(faultProgram('scripts/deploy.sh', DEPLOY_SH,
+    `${body}\nrequire_crontab_command appuser; echo "RC=$?"\necho "WHY=${'$'}{CRONTAB_COMMAND_REASON}"`,
+    { functions: [], mutate: withoutCrontabOnPath, lib }))
+
+  // THE PROVED CASE, so the refusals below are decisions rather than a helper that always refuses.
+  // Root, no spool entry, and a daemon name nothing is running under.
+  const proved = await probe(`CRON_SPOOL_ROOTS=('${emptySpool}')\n${NO_DAEMON}`, asRootLib())
+  assert.match(proved.stdout, /^RC=2$/m,
+    `a genuinely cron-less host must be PROVABLE, or the fence can never run without the binary:\n${proved.stdout}${proved.stderr}`)
+
+  // (a) NOT ROOT — the spool is mode 1730 and an unlistable directory reads as an empty one. This
+  // one needs no mutation at all: the test runner is not root, and the SHIPPED library refuses.
+  const unprivileged = await probe(`CRON_SPOOL_ROOTS=('${emptySpool}')\n${NO_DAEMON}`, CRONTAB_LOCK_LIB)
+  assert.match(unprivileged.stdout, /^RC=1$/m, `not being root must withhold the proof:\n${unprivileged.stdout}`)
+  assert.match(unprivileged.stdout, /WHY=.*not running as root/, unprivileged.stdout)
+
+  // (b) A DAEMON IS RUNNING. `sleep` stands in for `cron` here, and it is a real running process
+  // found by the real `pgrep` — the check is exercised, not simulated.
+  const daemon = spawn('sleep', ['30'], { stdio: 'ignore' })
+  try {
+    await new Promise((r) => setTimeout(r, 200))
+    const running = await probe(`CRON_SPOOL_ROOTS=('${emptySpool}')\nCRON_DAEMON_NAMES=(sleep)`, asRootLib())
+    assert.match(running.stdout, /^RC=1$/m,
+      `a running daemon holds the loaded schedule in memory and must withhold the proof:\n${running.stdout}${running.stderr}`)
+    assert.match(running.stdout, /WHY=.*daemon IS running/, running.stdout)
+  } finally {
+    daemon.kill('SIGKILL')
+  }
+
+  // (c) A SPOOL DIRECTORY THAT CANNOT BE LISTED. An unreadable directory is not an empty one.
+  const sealed = mkdtempSync(join(FAULT_DIR, 'spool-sealed-'))
+  chmodSync(sealed, 0o000)
+  try {
+    const unreadable = await probe(`CRON_SPOOL_ROOTS=('${sealed}')\n${NO_DAEMON}`, asRootLib())
+    assert.match(unreadable.stdout, /^RC=1$/m,
+      `an unlistable spool must withhold the proof:\n${unreadable.stdout}${unreadable.stderr}`)
+    assert.match(unreadable.stdout, /WHY=.*could not be listed/, unreadable.stdout)
+  } finally {
+    chmodSync(sealed, 0o700)
+  }
+
+  // (d) A SPOOL ROOT THAT DOES NOT EXIST contributes nothing and is not a failure — otherwise the
+  // proof could never be given on any real host, since no box has all three roots.
+  const absentRoot = await probe(
+    `CRON_SPOOL_ROOTS=('${emptySpool}' '${join(FAULT_DIR, 'no-such-spool-root')}')\n${NO_DAEMON}`, asRootLib())
+  assert.match(absentRoot.stdout, /^RC=2$/m,
+    `a spool root that is not there must not be read as a failure:\n${absentRoot.stdout}${absentRoot.stderr}`)
+})
+
+test('[o3d-batch-ret] no cutover fence, adoption or restore path still skips on a missing `crontab`', async () => {
+  // The repository walk, so the fourth instance is not written next week. The bare guard is allowed
+  // in exactly one place — inside require_crontab_command, which is what asks the question properly.
+  for (const [where, src] of FAULT_ENTRYPOINTS.map(([w, s]) => [w, s] as [string, string])) {
+    const skipping = src.split('\n')
+      .map((line, i) => [i + 1, line] as [number, string])
+      .filter(([, line]) => /command -v crontab >\/dev\/null 2>&1 \|\| (return 0|\{)/.test(line))
+    assert.deepEqual(skipping, [],
+      `${where} still reads a missing crontab client as an absent schedule:\n`
+      + skipping.map(([n, l]) => `  ${n}: ${l.trim()}`).join('\n'))
+  }
+  // …and the one legitimate holder of the bare guard is the helper itself.
+  assert.match(CRONTAB_LOCK_LIB_SRC, /if ! command -v crontab >\/dev\/null 2>&1; then/,
+    'require_crontab_command / read_crontab_for must still be the place the question is asked')
 })
