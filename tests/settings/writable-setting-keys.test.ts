@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { readFileSync, readdirSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { join, relative } from 'node:path'
 import test, { mock } from 'node:test'
 
@@ -295,7 +295,10 @@ test('the allowlist names exactly the screens that call a generic settings write
   // The list only stays honest if it cannot drift from the UI in EITHER direction: a new screen
   // that saves a key nobody listed would fail at run time in front of the operator, and a key left
   // behind by a deleted screen would be an endpoint nothing can reach and nobody would remove.
-  const roots = ['app', 'components']
+  // Every root a caller could live in, not just the two the screens happen to occupy today. A
+  // `lib/` or `scripts/` module that reached for a generic writer would be a caller with no screen
+  // at all, and the point of this test is that it cannot arrive unannounced.
+  const roots = ['app', 'components', 'lib', 'scripts', 'hooks'].filter((root) => existsSync(join(REPO, root)))
   const importers: string[] = []
   let scanned = 0
 
