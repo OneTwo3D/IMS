@@ -30,8 +30,9 @@ import { reservedSettingKeyRefusal } from '@/lib/domain/settings/reserved-settin
  *
  * THE LIST IS DERIVED FROM THE SETTINGS UI, and grouped by the screen that offers each key. A
  * preference no screen can set has no business arriving at this endpoint, so the grouping is not
- * decoration: `tests/settings/writable-setting-keys.test.ts` walks `app/` and `components/` for
- * every file that imports `setSetting`/`setSettings`, and fails unless the set of importing files is
+ * decoration: `tests/settings/writable-setting-keys.test.ts` walks every source root — `app/`,
+ * `components/`, `lib/`, `scripts/`, `hooks/`, not just the two the screens occupy today — for every
+ * file that imports `setSetting`/`setSettings`, and fails unless the set of importing files is
  * EXACTLY the set of screens named below — a new screen cannot be added without declaring its keys,
  * and a screen that is deleted cannot leave its keys behind. It also asserts each key really appears
  * in the file it is filed under.
