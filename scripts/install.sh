@@ -923,11 +923,25 @@ pg_local_psql() {
 pg_endpoint_psql() {
   local role="$1" password="$2" database="$3"
   shift 3
-  local -a unset_args=()
+  local -a unset_args=() keep=()
+  local i=0
   libpq_env_unset_args unset_args
-  run_as_user postgres env "${unset_args[@]}" PGPASSWORD="${password}" psql \
-    -X -w -v ON_ERROR_STOP=1 -v VERBOSITY=verbose \
-    -h "${DB_HOST}" -p "${DB_PORT}" -U "${role}" -d "${database}" "$@"
+  # THE ONE VARIABLE THIS CONNECTION SUPPLIES ITSELF IS KEPT OUT OF THE UNSET LIST, and then
+  # EXPORTED rather than passed to `env` as an argument. `env PGPASSWORD=... psql` would put the
+  # credential in env's argv, where every process on the box can read it out of ps for as long as
+  # the connection lasts. Exporting it inside a subshell puts it in the environment instead,
+  # which is readable only by root — and leaves the caller's shell untouched, which a
+  # `VAR=x function` prefix would not: bash keeps such an assignment after a FUNCTION call.
+  while [[ "${i}" -lt "${#unset_args[@]}" ]]; do
+    [[ "${unset_args[$((i + 1))]}" == "PGPASSWORD" ]] || keep+=("${unset_args[${i}]}" "${unset_args[$((i + 1))]}")
+    i=$((i + 2))
+  done
+  (
+    export PGPASSWORD="${password}"
+    run_as_user postgres env "${keep[@]}" psql \
+      -X -w -v ON_ERROR_STOP=1 -v VERBOSITY=verbose \
+      -h "${DB_HOST}" -p "${DB_PORT}" -U "${role}" -d "${database}" "$@"
+  )
 }
 
 # WHAT "THE SAME SERVER" MEANS HERE, IN ONE PLACE, READ BY BOTH CONNECTIONS.

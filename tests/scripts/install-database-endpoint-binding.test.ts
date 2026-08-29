@@ -281,7 +281,11 @@ test('r37: a database this run creates on the migration target earns the exempti
         DB_PASSWORD: 'installer-generated',
         IMS_PG_SOCKET_DIR: cluster.socket,
       },
-      {},
+      // AND AN INHERITED PGPASSWORD, which is the one libpq variable the endpoint connection
+      // supplies for itself. It has to be kept OUT of the unset list and exported, or the
+      // sanitiser strips the credential this run is connecting with and the verification fails
+      // for a reason that has nothing to do with the server. A broken filter fails this test.
+      { PGPASSWORD: 'a-password-from-the-invoking-shell' },
       `
         ensure_database_role_exists
         create_database_and_record_newness
