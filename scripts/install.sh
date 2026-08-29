@@ -944,6 +944,110 @@ pg_endpoint_psql() {
   )
 }
 
+# ---------------------------------------------------------------------------
+# THE PASSWORD IS ONE STRING AND IT TRAVELS THROUGH TWO GRAMMARS (o3d-2sm1.5 r39, Codex HIGH).
+#
+# THE DEFECT. `ALTER USER "x" WITH PASSWORD '${DB_PASSWORD}'` set the role's password to the
+# LITERAL bytes of DB_PASSWORD, and the very next statement interpolated those same bytes RAW
+# into `postgresql://user:${DB_PASSWORD}@host:port/db`. Two different grammars, one substitution,
+# and the application does not read the URL the way this script wrote it. It reads it with
+# node-postgres, whose pg-connection-string does `decodeURIComponent(new URL(str).password)`.
+# Measured against the copy in this repo's node_modules (pg 8.20.0, pg-connection-string 2.12.0):
+#
+#   installed password   what the raw URL gives the driver
+#   ------------------   ----------------------------------------------------------------
+#   abc%2Fdef            "abc/def"   — authenticates as a DIFFERENT string than ALTER set
+#   AAA%25BBB            "AAA%BBB"   — likewise
+#   abc/def              THROWS "Invalid URL" — the URL is not parseable at all
+#   abc?def              THROWS "Invalid URL"
+#   abc#def              THROWS "Invalid URL"
+#   %FF                  THROWS "URI malformed"
+#
+# and that happens AFTER the predecessor has been stopped and its password taken away, so the
+# outage is total and the ALTER succeeded. A password with an apostrophe did not even get that
+# far: it broke out of the SQL literal.
+#
+# THE RULE, AND IT IS THE ONLY ONE THAT MAKES THE TWO HALVES INVERSES:
+#
+#   DB_PASSWORD is the LITERAL SERVER SECRET. It is SQL-quoted for the statement and
+#   PERCENT-ENCODED for the URL, and a URL found on disk is DECODED before it is compared with
+#   anything or used as a credential.
+#
+# `url_encode_userinfo` escapes everything outside RFC 3986 unreserved (ALPHA DIGIT - . _ ~), so
+# every byte it emits is either unreserved or a `%XX` with two hex digits. That set is what makes
+# the round trip exact rather than approximately exact: it leaves no character that WHATWG URL
+# parsing would re-encode, no `%` that pg-connection-string's malformed-escape pre-pass would
+# rewrite, and no `/`, `?`, `#`, `@` or `:` that could move a byte out of the userinfo altogether.
+#
+# VERIFIED AGAINST THE INSTALLED DRIVER, NOT AGAINST THE SPECIFICATION — the discipline this
+# branch used for the pooler and the clone. tests/scripts/install-credential-representation.test.ts
+# runs these two shell functions and hands their output to the `pg` in node_modules, on a real
+# cluster: 23 reserved-character passwords encode, parse back to the literal, and open a
+# connection the server accepts.
+# ---------------------------------------------------------------------------
+
+# A PostgreSQL string literal for an arbitrary byte string. Doubling `'` is the whole of the
+# escaping ONLY while standard_conforming_strings is on, which is the default since 9.1 and which
+# every caller SETs on the same connection immediately before the statement rather than assuming.
+# With it off, a backslash escapes, and `\'` inside a doubled literal reopens the quote.
+sql_quote_literal() {
+  local raw="$1"
+  printf "'%s'" "${raw//\'/\'\'}"
+}
+
+# Percent-encode for the userinfo of a URL, RFC 3986 unreserved set kept.
+#
+# LC_ALL=C is what makes this BYTE-wise: without it `${raw:i:1}` yields a CHARACTER in the
+# ambient locale and `printf "'%c"` yields its code point, so `ü` would be encoded as `%FC`
+# (Latin-1) rather than the `%C3%BC` the UTF-8 bytes require, and decodeURIComponent would throw
+# on it. Multibyte input is encoded one byte at a time, which is exactly what encodeURIComponent
+# does.
+url_encode_userinfo() {
+  local raw="$1" out="" i c
+  local LC_ALL=C LANG=C
+  for (( i = 0; i < ${#raw}; i++ )); do
+    c="${raw:i:1}"
+    case "${c}" in
+      [A-Za-z0-9._~-]) out+="${c}" ;;
+      *) out+="$(printf '%%%02X' "'${c}")" ;;
+    esac
+  done
+  printf '%s' "${out}"
+}
+
+# The inverse, and — for a URL this installer did NOT write — the same answer node-postgres
+# reaches. `%XX` with two hex digits becomes that byte; anything else, including a `%` that is
+# not followed by two hex digits, stays literal. That is not a simplification of the driver, it
+# is what the driver does: pg-connection-string pre-encodes a malformed escape to `%25` before
+# `new URL()` sees it, and decodeURIComponent then turns it back into a literal `%`.
+# tests/scripts/install-credential-representation.test.ts asserts the two agree on 21 legacy
+# spellings including `a%b`, `a%`, `a%2`, `a%zz`, `%%%`, `100%25pure` and `\back\slash`.
+#
+# THE ONE DIVERGENCE, STATED. decodeURIComponent THROWS on a `%XX` sequence that is not valid
+# UTF-8 (`%FF`), where this returns the byte. A URL in that state cannot start the application at
+# all — the driver refuses to parse it — so the recovered value is used only to answer "is this a
+# rotation?", and the answer it gives (yes, because the two differ) is the safe one.
+#
+# The literal backslashes are protected BEFORE the `%XX` rewrite, so `printf '%b'` cannot
+# interpret a `\b` or a `\0` that was part of the password.
+url_decode_userinfo() {
+  local raw="$1" escaped
+  escaped="${raw//\\/\\\\}"
+  escaped="$(printf '%s' "${escaped}" | sed -E 's/%([0-9A-Fa-f]{2})/\\x\1/g')"
+  printf '%b' "${escaped}"
+}
+
+# THE ONE PLACE A DATABASE_URL IS COMPOSED. Both writers — the pre-stop classification and the
+# rotation inside the fenced window — go through here, so the encoding cannot be right in one and
+# missing in the other, which is the shape the r38 defect took.
+compose_database_url() {
+  local user="$1" password="$2" host="$3" port="$4" database="$5"
+  printf 'postgresql://%s:%s@%s:%s/%s' \
+    "$(url_encode_userinfo "${user}")" \
+    "$(url_encode_userinfo "${password}")" \
+    "${host}" "${port}" "${database}"
+}
+
 # WHAT "THE SAME SERVER" MEANS HERE, IN ONE PLACE, READ BY BOTH CONNECTIONS.
 #
 #   pg_postmaster_start_time()  the same microsecond stamp on every backend of one postmaster and
@@ -1181,9 +1285,15 @@ DB_PASSWORD_EFFECTIVE=""
 DB_PASSWORD_ROTATION_PENDING=false
 
 ensure_database_role_exists() {
-  local output="" status=0
+  local output="" status=0 quoted_password
+  # THE PASSWORD IS A LITERAL, NOT A FRAGMENT OF SQL (o3d-2sm1.5 r39, Codex HIGH). `'${DB_PASSWORD}'`
+  # ended the string literal on the first apostrophe the operator's password contained and read the
+  # rest as statement text. The SET is issued on the same connection rather than assumed, because
+  # doubling `'` is complete escaping only while backslashes are ordinary characters.
+  quoted_password="$(sql_quote_literal "${DB_PASSWORD}")"
   output="$(pg_local_psql -q <<EOSQL 2>&1
-    CREATE USER "${DB_USER}" WITH PASSWORD '${DB_PASSWORD}';
+    SET standard_conforming_strings = on;
+    CREATE USER "${DB_USER}" WITH PASSWORD ${quoted_password};
 EOSQL
   )" || status=$?
   if [[ "${status}" -eq 0 ]]; then
@@ -1279,8 +1389,24 @@ rotate_database_password_in_fenced_window() {
   warn "connection onwards. Nothing this installer can do makes that untrue; it is why the rotation"
   warn "happens only because a password different from the installed one was supplied."
 
-  pg_local_psql -q >/dev/null <<EOSQL || die "Rotating the password of the existing role '${DB_USER}' failed. The service is STOPPED and the connection fence is UP; the application environment file this run wrote still names the credential the server already had, so the two agree and starting the old service by hand would work. NOTHING HAS BEEN MIGRATED. Fix the role or re-run without a password change."
-    ALTER USER "${DB_USER}" WITH PASSWORD '${DB_PASSWORD}';
+  # THE RECORD GOES DOWN BEFORE THE DURABLE ACT, NOT AFTER IT (o3d-2sm1.5 r39, Codex HIGH). The
+  # ALTER below COMMITS; everything that makes the new credential usable comes after it. Until
+  # this journal is on the medium there is no interruption point between the two that the next run
+  # can reconcile, because the only other record of the old password is the file this function is
+  # about to replace. It carries BOTH candidates and it says what each outcome means — see the
+  # journal's own block above.
+  #
+  # Refusing here costs nothing: nothing has been ALTERed yet, so the sentence below is true.
+  write_role_rotation_journal "${DB_PASSWORD_EFFECTIVE}" "${DB_PASSWORD}" || die "A database credential rotation for '${DB_USER}' could not be journalled durably at ${DB_ROLE_ROTATION_JOURNAL}, so a run interrupted between the ALTER and the environment file would leave nothing able to say which password the server has. The ALTER has NOT been issued: the role still has the credential ${APP_DIR}/.env names, the two agree, and starting the old service by hand would work. NOTHING HAS BEEN MIGRATED. Make ${DB_ENV_SNAPSHOT_DIR} writable and re-run, or re-run without a password change."
+
+  local quoted_password
+  # THE PASSWORD IS A LITERAL, SQL-QUOTED (o3d-2sm1.5 r39, Codex HIGH). `'${DB_PASSWORD}'` ended
+  # the literal on the first apostrophe and read the rest of the operator's password as statement
+  # text — inside the one window in which nobody holds a working credential.
+  quoted_password="$(sql_quote_literal "${DB_PASSWORD}")"
+  pg_local_psql -q >/dev/null <<EOSQL || die "Rotating the password of the existing role '${DB_USER}' failed. The service is STOPPED and the connection fence is UP; the application environment file this run wrote still names the credential the server already had, so the two agree and starting the old service by hand would work. The rotation journal at ${DB_ROLE_ROTATION_JOURNAL} records both candidates and the next run reconciles from it. NOTHING HAS BEEN MIGRATED. Fix the role or re-run without a password change."
+    SET standard_conforming_strings = on;
+    ALTER USER "${DB_USER}" WITH PASSWORD ${quoted_password};
 EOSQL
 
   DB_ROLE_CREDENTIALS_ROTATED=true
@@ -1289,8 +1415,15 @@ EOSQL
   # The application connection is recomposed BEFORE the environment file is rewritten, so that
   # write_app_env_file() emits the credential the server now has. The two are set together, in
   # that order, and nothing between them can fail into a state where only one of them moved.
-  DATABASE_URL="postgresql://${DB_USER}:${DB_PASSWORD_EFFECTIVE}@${DB_HOST}:${DB_PORT}/${DB_NAME}"
-  write_app_env_file
+  DATABASE_URL="$(compose_database_url "${DB_USER}" "${DB_PASSWORD_EFFECTIVE}" "${DB_HOST}" "${DB_PORT}" "${DB_NAME}")"
+  # AND THE WRITE IS CHECKED, because this is the point past which the flags above are lies if it
+  # failed. The file is published by rename, so a failure leaves the PREVIOUS environment file
+  # complete and naming the old password — which the server no longer has. That is the outage the
+  # journal exists for, and the refusal says so and leaves the journal standing.
+  write_app_env_file || die "The password of '${DB_USER}' HAS BEEN ROTATED on the server, and ${APP_DIR}/.env could not be replaced. That file is complete and unchanged — it is published by rename, so it is not truncated — but it names the OLD password, which no longer works. The service is STOPPED and the connection fence is UP. DO NOT hand-edit that file: re-run this installer and it will reconcile from the journal at ${DB_ROLE_ROTATION_JOURNAL}, which records both candidates; it will ask the server which one is live, find the new one, and publish an environment file naming it. NOTHING HAS BEEN MIGRATED."
+  # LAST, so that a run killed anywhere above leaves a journal rather than none. A journal that
+  # outlives the transition costs the next run one probe; a missing one costs the outage.
+  clear_role_rotation_journal || die "The password of '${DB_USER}' has been rotated and ${APP_DIR}/.env names it — the two agree and the transition is COMPLETE — but the journal at ${DB_ROLE_ROTATION_JOURNAL} could not be removed durably. Delete it by hand; leaving it costs the next run one probe and nothing else. NOTHING HAS BEEN MIGRATED."
   success "The password of '${DB_USER}' has been rotated and ${APP_DIR}/.env now names it. The build ran before this, on the previous credential."
 }
 
@@ -1608,13 +1741,21 @@ fsync_path() {
 #
 # Same directory, so the rename is a rename and not a copy. Every failure path removes the
 # temporary file and returns non-zero, leaving the last durable marker untouched.
+# OWNERSHIP AND MODE ARE PART OF THE PUBLICATION, NOT A STEP AFTER IT (o3d-2sm1.5 r39, Codex
+# HIGH). ${APP_DIR}/.env has to reach the application account readable, and a `chown` issued AFTER
+# the rename is a second observable state: a crash between the two leaves a complete, correct file
+# the application cannot open. Both are applied to the TEMPORARY file, before the barrier and
+# before the rename, so the name is published once and everything about it is already true.
+# `$2` and `$3` are optional and default to what every earlier caller already got: root's own
+# ownership, since this script runs as root, and mode 0600.
 publish_durable_file() {
-  local target="$1" dir tmp
+  local target="$1" owner="${2:-}" mode="${3:-600}" dir tmp
   dir="$(dirname "$target")"
   mkdir -p "$dir" || return 1
   tmp="$(mktemp "${target}.XXXXXX" 2>/dev/null)" || return 1
   if ! cat > "$tmp" 2>/dev/null; then rm -f "$tmp"; return 1; fi
-  if ! chmod 600 "$tmp" 2>/dev/null; then rm -f "$tmp"; return 1; fi
+  if ! chmod "$mode" "$tmp" 2>/dev/null; then rm -f "$tmp"; return 1; fi
+  if [[ -n "$owner" ]] && ! chown "$owner" "$tmp" 2>/dev/null; then rm -f "$tmp"; return 1; fi
   # BARRIER 1: the data, before the name exists. After this the rename can only publish
   # bytes that are already on the medium.
   if ! fsync_path "$tmp"; then rm -f "$tmp"; return 1; fi
@@ -1629,6 +1770,214 @@ publish_durable_file() {
   # instead reads the new content and concludes a durability it was never given.
   fsync_path "$dir" || return 1
   return 0
+}
+# ---------------------------------------------------------------------------
+# THE ROTATION JOURNAL: WHAT THE NEXT RUN IS TOLD, AND WHAT IT DOES ABOUT IT
+# (o3d-2sm1.5 r39, Codex HIGH).
+#
+# THE DEFECT. `ALTER USER ... WITH PASSWORD` COMMITS. Everything that made the new credential
+# usable came after it and none of it was durable: two in-memory flags, a recomposed
+# DATABASE_URL, and a `cat > ${APP_DIR}/.env` that TRUNCATED the only environment file the
+# application has before writing a byte of the replacement. A SIGKILL, a power loss, an ENOSPC or
+# a refused chown anywhere in that sequence left PostgreSQL holding the new password while `.env`
+# held the old one — or held nothing. The service is stopped and the database is fenced at that
+# moment, so the operator's only move is to re-run, and the re-run read the stale `.env`, believed
+# the old password was installed, and either did nothing or refused. The window is short and the
+# outage it produces is not.
+#
+# IT IS THIS BRANCH'S OWN DOCTRINE, APPLIED WHERE IT WAS MISSING. The fence recovery record exists
+# because "a record written after the durable act is absent on the run that is killed in between".
+# The rotation did the durable act first.
+#
+# SO: A JOURNAL BEFORE THE ALTER, AND IT SAYS WHAT TO DO — not merely that something happened.
+# A journal that records a fact without telling the next run how to reconcile it is half the fix.
+# It carries BOTH candidate passwords, so the next run does not have to guess which of them the
+# server has: it ASKS THE SERVER, which is the only party that knows, and every outcome below is
+# decided by that answer rather than by inferring one from what is present on disk.
+#
+#   THE THREE INTERRUPTION POINTS, AND WHAT RECONCILES EACH
+#
+#   (1) THE JOURNAL IS WRITTEN AND THE `ALTER` HAS NOT RUN.
+#       The server still has the OLD password and ${APP_DIR}/.env still names it; the two agree
+#       and nothing is broken. The next run's probe finds the OLD password live, offers it as the
+#       installed credential, rewrites `.env` with it — the same bytes — and clears the journal.
+#       If the operator supplies the new password again, that is an ordinary pending rotation and
+#       it happens in the fenced window as it should have the first time.
+#
+#   (2) THE `ALTER` HAS RUN AND `.env` HAS NOT BEEN PUBLISHED.
+#       This is the outage. The server has the NEW password; `.env` names the OLD one, complete
+#       and untruncated — publish_durable_file() renames, so no partial state is reachable. The
+#       next run's probe finds the NEW password live and treats IT as the installed credential in
+#       place of what `.env` says; the run's own pre-build `write_app_env_file` therefore
+#       publishes an environment file naming the credential the server actually has, and the
+#       journal is cleared only after that publication has returned success. FINISHING the
+#       transition, which is the only direction that is safe: the old password is gone from the
+#       server and this script will not put it back.
+#
+#   (3) BOTH ARE DONE AND THE RUN DIED BEFORE THE JOURNAL WAS CLEARED.
+#       Indistinguishable from (2) to the probe, and it does not need to be distinguished: the
+#       answer is the same. The probe finds the NEW password live, `.env` already names it, the
+#       rewrite is byte-identical and the journal is cleared. The journal is removed LAST for
+#       exactly this reason — a spurious journal costs one probe, a missing one costs the outage.
+#
+#   (4) NEITHER PASSWORD AUTHENTICATES.
+#       Somebody rotated the role out of band, or the server is unreachable. The run REFUSES,
+#       before it has prompted for anything else and before anything is stopped, and it leaves the
+#       journal in place: this script cannot tell those two apart and guessing is how a credential
+#       gets lost. The refusal prints the journal path and both psql answers.
+#
+# WHERE IT LIVES. /etc/ims-cutover, not ${CUTOVER_STATE_DIR}: the cutover state directory is the
+# application's own data directory and therefore WRITABLE BY THE APPLICATION USER, and a record
+# that says which password to install is not a record that account may edit. The directory is a
+# literal for the reason DB_ENV_SNAPSHOT_DIR is one — a privileged path resolved from a variable
+# the application can set is not a privileged path.
+#
+# The file is created by this script, which refuses to run as anything but root, and
+# publish_durable_file() gives it mode 0600 before the rename — so it is root-owned and 0600 from
+# the instant its name exists.
+# ---------------------------------------------------------------------------
+DB_ROLE_ROTATION_JOURNAL="${DB_ENV_SNAPSHOT_DIR}/db-role-rotation.journal"
+# Set by reconcile_interrupted_role_rotation() when it found a journal and established, from the
+# server, which of the two credentials is live.
+DB_ROTATION_JOURNAL_FOUND=false
+DB_ROTATION_RECONCILED_PASSWORD=""
+
+# Base64 because a password may contain anything, including the `=` and the newlines that a
+# key=value file cannot carry. `base64 -w0` is coreutils; `tr -d '\n'` keeps it honest anywhere.
+rotation_journal_encode() {
+  printf '%s' "$1" | base64 | tr -d '\n'
+}
+
+rotation_journal_decode() {
+  printf '%s' "$1" | base64 -d 2>/dev/null
+}
+
+# One key, first occurrence, read WITHOUT sourcing: this file names two passwords and sourcing it
+# would execute whatever a `$(` in one of them spelled.
+role_rotation_journal_value() {
+  local key="$1"
+  [[ -f "${DB_ROLE_ROTATION_JOURNAL}" ]] || return 1
+  sed -n "s/^${key}=//p" "${DB_ROLE_ROTATION_JOURNAL}" 2>/dev/null | head -1
+}
+
+# The four values that make a credential a credential, in the spelling the refusals print.
+role_rotation_identity() {
+  printf '%s@%s:%s/%s' "${DB_USER}" "${DB_HOST}" "${DB_PORT}" "${DB_NAME}"
+}
+
+write_role_rotation_journal() {
+  local old_password="$1" new_password="$2"
+  mkdir -p "${DB_ENV_SNAPSHOT_DIR}" || return 1
+  chmod 700 "${DB_ENV_SNAPSHOT_DIR}" 2>/dev/null || return 1
+  # `marker_complete=1` is written LAST, so a reader that does not find it is looking at bytes no
+  # publication produced — see read_role_rotation_journal(). publish_durable_file() renames, so
+  # that can only be a hand-made file, and this script says so rather than guessing at it.
+  {
+    printf '# One Two Inventory — an application role password rotation is IN FLIGHT.\n'
+    printf '# Written by scripts/install.sh BEFORE the ALTER, removed only after the matching\n'
+    printf '# %s/.env has been durably published. If this file exists, a run was interrupted\n' "${APP_DIR}"
+    printf '# between those two points; the next install run reconciles it by asking the server\n'
+    printf '# which of the two passwords below is live. Do not edit it by hand.\n'
+    printf 'journal_version=1\n'
+    printf 'identity=%s\n' "$(role_rotation_identity)"
+    printf 'env_file=%s\n' "${APP_DIR}/.env"
+    printf 'old_password_b64=%s\n' "$(rotation_journal_encode "${old_password}")"
+    printf 'new_password_b64=%s\n' "$(rotation_journal_encode "${new_password}")"
+    printf 'marker_complete=1\n'
+  } | publish_durable_file "${DB_ROLE_ROTATION_JOURNAL}" || return 1
+  return 0
+}
+
+clear_role_rotation_journal() {
+  [[ -e "${DB_ROLE_ROTATION_JOURNAL}" ]] || return 0
+  rm -f "${DB_ROLE_ROTATION_JOURNAL}" || return 1
+  # The unlink needs the same directory barrier the rename got, or a power loss can restore the
+  # name and the next run reconciles a rotation that is already finished. That is harmless — case
+  # (3) — but a durability claim this script does not have is not one it should make.
+  fsync_path "${DB_ENV_SNAPSHOT_DIR}" || return 1
+  return 0
+}
+
+# CAN THIS ROLE STILL AUTHENTICATE WITH THIS PASSWORD? Asked of the server, over TCP, the way the
+# application asks.
+#
+# `postgres` FIRST, and that is not arbitrary: an interrupted rotation leaves the CONNECTION FENCE
+# STANDING over ${DB_NAME}, and the fence's whole mechanism is revoking CONNECT — so a probe
+# against the application database would be refused for a role holding exactly the right password.
+# ${DB_NAME} is tried second for the site that has revoked PUBLIC CONNECT on `postgres`.
+#
+# The verdict is the EXIT STATUS of a `SELECT 1`, never a match on the server's message: `FATAL:
+# password authentication failed` is localised by the server's lc_messages and a guard that reads
+# it is a guard that fails open in a French locale. Success is unambiguous; every other outcome is
+# "not this password", and the caller distinguishes "wrong password" from "cannot ask at all" by
+# the fact that exactly one of two candidates should succeed.
+db_password_authenticates() {
+  local password="$1"
+  pg_endpoint_psql "${DB_USER}" "${password}" postgres -tAc 'SELECT 1' >/dev/null 2>&1 && return 0
+  pg_endpoint_psql "${DB_USER}" "${password}" "${DB_NAME}" -tAc 'SELECT 1' >/dev/null 2>&1 && return 0
+  return 1
+}
+
+# @install-phase: credential-rotation
+#
+# Called from prompt_db_password(), which is the first point at which all four identity values are
+# known — and a point at which NOTHING HAS BEEN TOUCHED, so a refusal here leaves the system
+# exactly as it found it. That is the same rule the r37 reordering was about.
+reconcile_interrupted_role_rotation() {
+  DB_ROTATION_JOURNAL_FOUND=false
+  DB_ROTATION_RECONCILED_PASSWORD=""
+  [[ -e "${DB_ROLE_ROTATION_JOURNAL}" ]] || return 0
+
+  local complete identity env_file old_password new_password
+  complete="$(role_rotation_journal_value marker_complete || true)"
+  [[ "${complete}" == "1" ]] || die "A database credential rotation journal at ${DB_ROLE_ROTATION_JOURNAL} is incomplete — it has no marker_complete line. Nothing this installer writes can leave it in that state: it is published by rename, so the name only ever appears over finished bytes. Inspect the file, establish which password '${DB_USER}' actually has, and remove it. NOTHING HAS BEEN INSTALLED and nothing has been stopped."
+
+  identity="$(role_rotation_journal_value identity || true)"
+  env_file="$(role_rotation_journal_value env_file || true)"
+  [[ "${identity}" == "$(role_rotation_identity)" ]] || die "A database credential rotation was interrupted for ${identity} and this run is installing $(role_rotation_identity). A password is a property of one role on one server, so this run cannot finish that transition and must not clear its record: doing either would leave ${identity} with a credential nothing on this host names. Reconcile it — re-run the installer against ${identity}, or establish its password by hand and remove ${DB_ROLE_ROTATION_JOURNAL}. NOTHING HAS BEEN INSTALLED and nothing has been stopped."
+
+  [[ "${INSTALL_POSTGRES}" == "y" ]] || die "A database credential rotation was interrupted for ${identity} and this run does not manage a LOCAL PostgreSQL server, so it has no privileged local connection with which to establish which password that role now has. Re-run with the local database, or settle it by hand and remove ${DB_ROLE_ROTATION_JOURNAL}. NOTHING HAS BEEN INSTALLED and nothing has been stopped."
+
+  old_password="$(rotation_journal_decode "$(role_rotation_journal_value old_password_b64 || true)")"
+  new_password="$(rotation_journal_decode "$(role_rotation_journal_value new_password_b64 || true)")"
+  [[ -n "${old_password}" && -n "${new_password}" ]] || die "The database credential rotation journal at ${DB_ROLE_ROTATION_JOURNAL} does not carry both candidate passwords, so this run cannot tell which one '${DB_USER}' has. Establish it by hand and remove the file. NOTHING HAS BEEN INSTALLED and nothing has been stopped."
+
+  warn "A database credential rotation for ${identity} was INTERRUPTED: ${DB_ROLE_ROTATION_JOURNAL} exists,"
+  warn "which means a previous run committed — or was about to commit — an ALTER USER and did not"
+  warn "get as far as publishing ${env_file}. Asking the server which password that role has."
+
+  if db_password_authenticates "${new_password}"; then
+    DB_ROTATION_JOURNAL_FOUND=true
+    DB_ROTATION_RECONCILED_PASSWORD="${new_password}"
+    success "The server has the NEW password: the ALTER committed. This run FINISHES the transition — it treats that credential as the installed one, so the environment file it writes names what the server actually has, and the journal is cleared only once that file is on the medium. ${env_file} may currently name the old one; it is complete and it is about to be replaced."
+    return 0
+  fi
+
+  if db_password_authenticates "${old_password}"; then
+    DB_ROTATION_JOURNAL_FOUND=true
+    DB_ROTATION_RECONCILED_PASSWORD="${old_password}"
+    success "The server still has the OLD password: the ALTER did not commit, so nothing was ever taken away and ${env_file} already agrees with the server. This run treats that credential as the installed one and clears the journal. Supply the new password again to ask for the rotation a second time; it will happen inside the stopped, fenced window."
+    return 0
+  fi
+
+  die "A database credential rotation for ${identity} was interrupted and NEITHER of the two passwords it recorded authenticates as '${DB_USER}' against that server. Somebody rotated the role out of band, or the server is not reachable from here. This run refuses rather than guess: ${DB_ROLE_ROTATION_JOURNAL} is LEFT IN PLACE so the two candidates are not lost. Restore one of them with ALTER USER, or set a password of your own and remove that file, then re-run. NOTHING HAS BEEN INSTALLED and nothing has been stopped."
+}
+
+# @install-phase: credential-rotation
+#
+# Called immediately after the pre-build write_app_env_file(), which is the publication the
+# journal was waiting for. NOT before it: the journal's whole job is to survive until an
+# environment file naming the live credential is on the medium.
+resolve_role_rotation_journal_after_env_publication() {
+  [[ -e "${DB_ROLE_ROTATION_JOURNAL}" ]] || return 0
+  if ${DB_PASSWORD_ROTATION_PENDING}; then
+    info "An interrupted rotation is recorded at ${DB_ROLE_ROTATION_JOURNAL} and THIS run has a"
+    info "rotation of its own pending, so the record stays: the fenced-window rotation supersedes"
+    info "it in the same step that performs the ALTER."
+    return 0
+  fi
+  clear_role_rotation_journal || die "The interrupted rotation recorded at ${DB_ROLE_ROTATION_JOURNAL} is reconciled — ${APP_DIR}/.env now names the credential the server has — but the record could not be removed durably. It is safe to delete by hand; leaving it costs the next run one probe. NOTHING HAS BEEN MIGRATED."
+  success "The interrupted rotation recorded at ${DB_ROLE_ROTATION_JOURNAL} is reconciled and the record is cleared: ${APP_DIR}/.env names the credential the server has."
 }
 
 # PUBLISH A SYSTEMD DROP-IN DURABLY (o3d-2sm1.5, Codex r11 CRITICAL).
@@ -3401,12 +3750,20 @@ fi
 # So all four are compared, and anything that does not match answers "nothing installed", which
 # takes the same path as a first install.
 #
-# NOTHING IS PERCENT-DECODED. This installer COMPOSES the URL by interpolation and not by
-# encoding, so the bytes between the first `:` of the userinfo and the LAST `@` are exactly the
-# bytes it passed to CREATE USER. Decoding them would invent a different secret, and comparing a
-# decoded value with DB_PASSWORD would report a rotation that nobody asked for. The userinfo ends
-# at the LAST `@` for the reason redact_url_credentials() cuts there: an earlier one may be part
-# of the password itself.
+# THE USERINFO IS PERCENT-DECODED, AND THAT IS A CORRECTION (o3d-2sm1.5 r39, Codex HIGH). r38
+# deliberately did NOT decode, reasoning that this installer composed the URL by raw interpolation
+# so decoding would invent a different secret. That was an accurate description of the shipped code
+# and the shipped code was wrong: raw interpolation IS the defect, because node-postgres decodes
+# what it reads. The credential the application actually authenticates with is the DECODED one, so
+# that is the value this function must return — otherwise "has the operator asked for a rotation?"
+# is answered by comparing a literal against URL bytes, and an ordinary re-install over a password
+# containing `%2F` reports a rotation nobody asked for. Since r39 the composer percent-encodes, so
+# for anything this installer wrote the decode is the exact inverse of the encode; for a URL an
+# older run left behind it reproduces what pg-connection-string does with the same bytes.
+#
+# The userinfo ends at the LAST `@` for the reason redact_url_credentials() cuts there: an earlier
+# one may be part of the password itself — and WHATWG URL parsing agrees, which is why a legacy
+# raw `user:abc@def@host` still recovers `abc@def`.
 installed_database_password() {
   local url="$1" want_user="$2" want_host="$3" want_port="$4" want_db="$5"
   local rest userinfo location user password host port database
@@ -3419,8 +3776,10 @@ installed_database_password() {
   userinfo="${rest%@*}"
   location="${rest##*@}"
   case "${userinfo}" in *:*) ;; *) return 1 ;; esac
-  user="${userinfo%%:*}"
+  user="$(url_decode_userinfo "${userinfo%%:*}")"
   password="${userinfo#*:}"
+  [[ -n "${password}" ]] || return 1
+  password="$(url_decode_userinfo "${password}")"
   [[ -n "${password}" ]] || return 1
   case "${location}" in */*) ;; *) return 1 ;; esac
   database="${location#*/}"
@@ -3440,7 +3799,19 @@ installed_database_password() {
 # AFTER DB_USER/DB_HOST/DB_PORT/DB_NAME are known, because whether there is anything to recover
 # is a question about those four.
 prompt_db_password() {
+  # FIRST, BECAUSE A STALE .env IS EXACTLY WHAT AN INTERRUPTED ROTATION LEAVES (o3d-2sm1.5 r39,
+  # Codex HIGH). Nothing has been touched at this point, so a refusal in here is safe; and where it
+  # does not refuse, the SERVER's answer replaces the file's, which is the whole content of
+  # "reconcile" — the file says what the last completed publication said, and the ALTER may have
+  # outlived it.
+  reconcile_interrupted_role_rotation
   DB_PASSWORD_INSTALLED="$(installed_database_password "$(existing_env DATABASE_URL)" "${DB_USER}" "${DB_HOST}" "${DB_PORT}" "${DB_NAME}" || true)"
+  if ${DB_ROTATION_JOURNAL_FOUND}; then
+    DB_PASSWORD_INSTALLED="${DB_ROTATION_RECONCILED_PASSWORD}"
+    info "The installed credential for this run is the one the SERVER answered to, not the one"
+    info "${APP_DIR}/.env carries: an interrupted rotation was reconciled above. Pressing Enter"
+    info "finishes that transition — the environment file this run writes will name it."
+  fi
   if [[ -n "${DB_PASSWORD_INSTALLED}" ]]; then
     info "${APP_DIR}/.env already names ${DB_USER}@${DB_HOST}:${DB_PORT}/${DB_NAME}, so the credential it"
     info "carries is the default here. Pressing Enter changes NOTHING about the role: this installer"
@@ -3740,7 +4111,7 @@ classify_database_credential_rotation() {
     warn "the build uses the credential the server already has; the ALTER happens once the existing"
     warn "installation is stopped and the database is fenced."
   fi
-  DATABASE_URL="postgresql://${DB_USER}:${DB_PASSWORD_EFFECTIVE}@${DB_HOST}:${DB_PORT}/${DB_NAME}"
+  DATABASE_URL="$(compose_database_url "${DB_USER}" "${DB_PASSWORD_EFFECTIVE}" "${DB_HOST}" "${DB_PORT}" "${DB_NAME}")"
 }
 
 classify_database_credential_rotation
@@ -4058,8 +4429,19 @@ require_preserved_secrets
 # regressions make.
 ENV_FILE_GENERATED_AT="$(date -u +"%Y-%m-%d %H:%M:%S UTC")"
 
-write_app_env_file() {
-cat > "${APP_DIR}/.env" <<EOF
+# RENDERED WHOLE FROM HELD VARIABLES, THEN PUBLISHED BY RENAME (o3d-2sm1.5 r39, Codex HIGH).
+#
+# `cat > "${APP_DIR}/.env"` TRUNCATED the application's only environment file and then filled it,
+# so every instant of the write was a state in which the file existed and did not say what the
+# database needed. That is the same defect publish_durable_file() was written for, in the one file
+# that is read by a service the installer has just stopped and is about to start.
+#
+# The render happens FIRST and INTO A VARIABLE, so a failure while producing the content cannot
+# reach the publication at all — a pipeline would have renamed whatever bytes it had received
+# before the producer died. Command substitution strips trailing newlines and `printf '%s\n'`
+# restores the single one the heredoc ends with, so the published bytes are the rendered bytes.
+render_app_env_file() {
+cat <<EOF
 # One Two Inventory — generated by install.sh on ${ENV_FILE_GENERATED_AT}
 
 NODE_ENV=production
@@ -4130,13 +4512,31 @@ FILE_SCAN_NAME=
 FILE_SCAN_ENV_ALLOWLIST=PATH,HOME,TMPDIR,TEMP,TMP,LANG,LC_ALL
 FILE_SCAN_TIMEOUT_MS=30000
 EOF
-
-chown "${APP_USER}:${APP_USER}" "${APP_DIR}/.env"
-chmod 600 "${APP_DIR}/.env"
 }
 
-write_app_env_file
+# Ownership and mode travel with the publication rather than following it: publish_durable_file()
+# applies both to the temporary file, before the barrier and before the rename, so there is no
+# instant at which ${APP_DIR}/.env exists as a file the application account cannot read.
+#
+# IT RETURNS A STATUS AND EVERY CALLER ACTS ON IT. The old writer could not fail visibly — `cat >`
+# under `set -e` aborted the script from wherever it stood, and the `chown` and `chmod` after it
+# were not checked at all, so a refused chown left the trap claiming the file agreed with the
+# server.
+write_app_env_file() {
+  local rendered
+  rendered="$(render_app_env_file)" || return 1
+  [[ -n "${rendered}" ]] || return 1
+  printf '%s\n' "${rendered}" | publish_durable_file "${APP_DIR}/.env" "${APP_USER}:${APP_USER}" 600 || return 1
+  return 0
+}
+
+write_app_env_file || die "${APP_DIR}/.env could not be written. Nothing has been stopped and nothing has been migrated; the file at that path is whatever the previous run left there, complete and unchanged — it is published by rename, so there is no half-written state to clean up."
 success ".env written to ${APP_DIR}/.env"
+# The publication the interrupted-rotation journal was waiting for has now happened, and it named
+# DB_PASSWORD_EFFECTIVE — which reconcile_interrupted_role_rotation() has already set to the
+# credential the SERVER answered to. Cases (2) and (3) end here; case (1) ends here having changed
+# nothing.
+resolve_role_rotation_journal_after_env_publication
 
 # ---------------------------------------------------------------------------
 # 11. Install dependencies and build
