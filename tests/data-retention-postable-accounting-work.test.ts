@@ -135,7 +135,23 @@ mock.module('@/lib/activity-log', { namedExports: { logActivity: async () => {} 
 mock.module('@/lib/db', {
   namedExports: {
     db: {
-      setting: { findMany: async () => store.settingRows },
+      // o3d-j7y4 r18: purgeExpiredData records this installation's evidence cutoff (insert-only)
+      // before the shopping-inbox compaction. Modelled here so the pass runs; what it records is
+      // asserted in tests/data-retention-webhook-events.test.ts.
+      setting: {
+        findMany: async () => store.settingRows,
+        findUnique: async ({ where }: { where: { key: string } }) =>
+          store.settingRows.find((r: { key: string }) => r.key === where.key) ?? null,
+        createMany: async ({ data }: { data: Array<{ key: string; value: string }> }) => {
+          let created = 0
+          for (const row of data) {
+            if (store.settingRows.some((r: { key: string }) => r.key === row.key)) continue
+            store.settingRows.push({ ...row })
+            created += 1
+          }
+          return { count: created }
+        },
+      },
       shoppingSyncLog: noopDelegate(),
       accountingSyncLog: {
         ...noopDelegate(),
