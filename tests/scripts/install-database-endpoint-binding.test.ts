@@ -263,11 +263,15 @@ test('r37: a database this run creates on the migration target earns the exempti
   // unconditionally — or died on every invocation — would satisfy all three. This is the run
   // where the answer must be YES.
   //
-  // MUTATION ROUTE (measured, not predicted): make verify_created_database_endpoint() die
-  // unconditionally, which is what an over-strict identity comparison amounts to. This test fails
-  // on status 9. The two-cluster test and the HIGH's failure-path test stay GREEN, which is the
-  // point — they assert refusals, and a build that refuses everything satisfies them. (The other
-  // two refusal tests do fail, on the refusal TEXT they assert rather than on the refusal.)
+  // MUTATION ROUTES (measured, not predicted):
+  //   1. delete the PGPASSWORD exemption from pg_endpoint_psql()'s filter, so the sanitiser
+  //      strips the very credential this run is connecting with: this test fails alone. It is
+  //      the only one that inherits a PGPASSWORD, and without one the filter is unreachable.
+  //   2. make verify_created_database_endpoint() die unconditionally, which is what an
+  //      over-strict identity comparison amounts to. This test fails on status 9. The two-cluster
+  //      test and the HIGH's failure-path test stay GREEN, which is the point — they assert
+  //      refusals, and a build that refuses everything satisfies them. (The other two refusal
+  //      tests do fail, on the refusal TEXT they assert rather than on the refusal.)
   const root = mkdtempSync(join(tmpdir(), 'ims-pgbind-'))
   let cluster: Cluster | undefined
   try {
