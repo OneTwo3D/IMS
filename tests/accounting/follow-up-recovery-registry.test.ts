@@ -257,13 +257,13 @@ function importBindings(sourceFile: ts.SourceFile): ImportBinding[] {
         && initializer.arguments[0]
         && ts.isStringLiteral(initializer.arguments[0])
       ) {
-        const module = (initializer.arguments[0] as ts.StringLiteral).text
+        const moduleSpecifier = (initializer.arguments[0] as ts.StringLiteral).text
         for (const element of node.name.elements) {
           if (!ts.isIdentifier(element.name)) continue
           const imported = element.propertyName && ts.isIdentifier(element.propertyName)
             ? element.propertyName.text
             : element.name.text
-          bindings.push({ local: element.name.text, imported, module })
+          bindings.push({ local: element.name.text, imported, module: moduleSpecifier })
         }
       }
     }
