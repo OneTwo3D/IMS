@@ -1,0 +1,819 @@
+/**
+ * o3d-2sm1.5 r39 — THE ROTATED PASSWORD COULD BE ONE THE APPLICATION CANNOT REPRESENT, AND A
+ * FAILURE AFTER `ALTER ROLE` LEFT NO WAY BACK. Two Codex HIGHs, both about the same eleven lines.
+ *
+ * FINDING 1. `ALTER USER "x" WITH PASSWORD '${DB_PASSWORD}'` set the role's password to the
+ * LITERAL bytes of DB_PASSWORD, and the next statement interpolated those same bytes RAW into
+ * `postgresql://user:${DB_PASSWORD}@host:port/db`. The application does not read that URL the way
+ * the installer wrote it: node-postgres percent-DECODES the userinfo. So `abc%2Fdef` was committed
+ * on the role and `abc/def` was handed to the driver; a raw `/`, `?` or `#` made the URL
+ * unparseable altogether; and an apostrophe never reached the URL at all, because it ended the SQL
+ * literal. All of it happens AFTER the predecessor has been stopped and its credential taken away.
+ *
+ * FINDING 2. The `ALTER` COMMITS, and everything that made the new credential usable came after
+ * it: two in-memory flags, a recomposed URL, and a `cat >` that TRUNCATED the application's only
+ * environment file before writing a byte of the replacement. A kill, a power loss, an ENOSPC or a
+ * refused chown anywhere in that sequence left PostgreSQL on the new password and `.env` on the old
+ * one — inside the stopped, fenced window, with no record of what had happened.
+ *
+ * WHAT THIS FILE PROVES, against real PostgreSQL clusters and the real `pg` in node_modules:
+ *
+ *   1. the shipped encoder and the INSTALLED driver agree, byte for byte, on 23 reserved-character
+ *      passwords — the URL install.sh composes parses back to the literal the ALTER set, and opens
+ *      a connection the server accepts;
+ *   2. an explicit rotation to a password full of reserved characters ends with the server holding
+ *      that password, `.env` naming it, and node-postgres connecting with it;
+ *   3. the shipped decoder reaches the same answer node-postgres does for 21 legacy raw URLs,
+ *      including every malformed-escape spelling;
+ *   4. `.env` is PUBLISHED BY RENAME and never truncated in place;
+ *   5. each of the four interruption outcomes between the ALTER and the environment file is
+ *      reconciled by the next run, and the one that cannot be is refused with the journal intact.
+ *
+ * THE DRIVER, NOT THE SPECIFICATION. Every encoding assertion here goes through
+ * `pg-connection-string` and `pg.Client` out of this repo's node_modules, for the reason the
+ * clusters are real: the finding is that the installer's model of what the application reads was
+ * wrong, and a test written from the same model would agree with it.
+ */
+import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
+import { chmodSync, linkSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import test from 'node:test'
+
+import pg from 'pg'
+import { parse } from 'pg-connection-string'
+
+import {
+  REINSTALL_BODY,
+  envDatabaseUrl,
+  readVar,
+  runShipped,
+  seedLiveInstallation,
+  writeInstalledEnv,
+} from './install-shell-rig.ts'
+import { type Cluster, currentUser, freePort, startCluster } from './real-postgres-cluster.ts'
+
+/**
+ * PASSWORDS THAT BREAK ONE OF THE TWO GRAMMARS. Every one of these is a password an operator can
+ * type, and every one of them was mis-installed, mis-read or refused before r39.
+ */
+const RESERVED_CHARACTER_PASSWORDS = [
+  'plain',
+  'abc/def', // raw: "Invalid URL"
+  'abc?def', // raw: "Invalid URL"
+  'abc#def', // raw: "Invalid URL"
+  'abc@def',
+  'abc:def',
+  "it's", // raw: ends the SQL literal
+  'a b',
+  'a%2Fb', // raw: the driver sees "a/b"
+  'a%b',
+  'a%',
+  'a%2',
+  '%FF', // raw: "URI malformed"
+  'p@ss:w/rd?#%',
+  '\\back\\slash',
+  'unicode-ünïcodé',
+  'a"b`c$d',
+  '[]{}<>|^',
+  'a+b',
+  'a=b&c',
+  ';;;',
+  '~-._',
+  'AAA%25BBB', // raw: the driver sees "AAA%BBB"
+]
+
+/** Legacy URLs no r39 installer wrote, where the only question is what the DRIVER makes of them. */
+const LEGACY_RAW_USERINFO = [
+  'plain', 'a%2Fb', 'a%2fb', 'AAA%25BBB', 'a%b', 'a%', 'a%2', 'a%zz', '%20', 'a b', "it's",
+  'abc@def', 'abc:def', '\\back\\slash', '%C3%BC', '%41%42%43', '100%25pure', '50%off', '%%%',
+  'a%2Fb%2Fc', '~-._',
+]
+
+/**
+ * Values reach the rig as base64, decoded inside the shell.
+ *
+ * NOT as `KEY="value"`: runShipped() JSON-stringifies its variables into a DOUBLE-quoted shell
+ * assignment, and JSON escapes neither `$` nor a backtick — so `a"b\`c$d` would be command
+ * substitution before any shipped function saw it, and the test would be measuring bash. base64 is
+ * `[A-Za-z0-9+/=]`, which has no meaning in any of the three layers it passes through.
+ */
+function base64(value: string): string {
+  return Buffer.from(value, 'utf8').toString('base64')
+}
+
+/** The four values that identify one credential, as the rig's tests supply them. */
+function installVars(cluster: Cluster, root: string): Record<string, string> {
+  return {
+    APP_DIR: root,
+    APP_USER: currentUser(),
+    DB_HOST: '127.0.0.1',
+    DB_PORT: String(cluster.port),
+    DB_NAME: 'one_two_inventory',
+    DB_USER: 'imsuser',
+    IMS_PG_SOCKET_DIR: cluster.socket,
+  }
+}
+
+const JOURNAL = 'cutover-private/db-role-rotation.journal'
+
+/** Does the shipped script's journal exist at the path the rig gives it? */
+function journalPath(root: string): string {
+  return join(root, JOURNAL)
+}
+
+function journalValue(root: string, key: string): string | null {
+  const match = new RegExp(`^${key}=(.*)$`, 'm').exec(readFileSync(journalPath(root), 'utf8'))
+  return match === null ? null : match[1]
+}
+
+/** THE APPLICATION'S OWN CONNECTION: the installed driver, the composed URL, the real server. */
+async function connectWithDriver(url: string): Promise<string> {
+  const client = new pg.Client({ connectionString: url })
+  await client.connect()
+  try {
+    const result = await client.query('SELECT current_user AS who')
+    return String(result.rows[0].who)
+  } finally {
+    await client.end()
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 1. THE LOAD-BEARING ONE: what the installer writes is what the driver reads
+// ---------------------------------------------------------------------------
+
+test('r39: a password of reserved characters survives SQL, the URL and the installed driver', async () => {
+  // THE FINDING, MEASURED END TO END, ON THE ONE PASSWORD THE OLD CODE COULD BREAK IN EVERY WAY AT
+  // ONCE: an apostrophe (SQL), a slash, a question mark and a hash (URL structure), a percent
+  // (URL decoding) and an at-sign and colon (userinfo delimiters).
+  //
+  // THE CHAIN IS UNBROKEN AND EVERY LINK IS REAL: sql_quote_literal() puts it on a real server,
+  // compose_database_url() writes it into a real .env, and `pg.Client` — the driver the application
+  // uses, out of this repo's node_modules — opens a connection with what it reads back out.
+  //
+  // MUTATION ROUTES (each measured by making the change and re-running):
+  //   1. drop the encode: make compose_database_url() interpolate `${password}` raw. This test
+  //      fails at connectWithDriver with "Invalid URL", and test 2 fails with it too. Tests 3, 4
+  //      and 5 stay green (3 is about DEcoding a URL this installer did not write, 4 is about
+  //      rename semantics, 5 supplies no reserved characters).
+  //   2. drop the SQL quote: put `'${DB_PASSWORD}'` back in the ALTER. The rotation refuses with a
+  //      syntax error at the apostrophe and this test fails on the run status, alone.
+  //   3. drop the decode from installed_database_password(): the recovered value is the URL's
+  //      BYTES, so the second run below reads a different password than the one installed and
+  //      reports a rotation nobody asked for — this test fails on ROTATION_PENDING, alone.
+  const root = mkdtempSync(join(tmpdir(), 'ims-repr-'))
+  let cluster: Cluster | undefined
+  try {
+    cluster = startCluster(root, 'live', await freePort(), '127.0.0.1')
+    seedLiveInstallation(cluster)
+    writeInstalledEnv(root, cluster.port, 'live-password')
+
+    const target = "p@ss:w/rd?#%2F'and-a-space [x]"
+    const run = runShipped(
+      { ...installVars(cluster, root), DB_PASSWORD_B64: base64(target) },
+      `
+        DB_PASSWORD="$(printf '%s' "\${DB_PASSWORD_B64}" | base64 -d)"
+        ${REINSTALL_BODY}
+        FENCE_ARMED=true
+        DB_FENCE_UP=true
+        rotate_database_password_in_fenced_window
+        echo "FINAL_ROTATED=\${DB_ROLE_CREDENTIALS_ROTATED}"
+      `,
+    )
+    assert.equal(run.status, 0, run.output)
+    assert.match(run.output, /FINAL_ROTATED=true/, 'the rotation must have happened')
+
+    // (a) THE SERVER HAS THE LITERAL. Asked with libpq, which does no URL parsing at all, so this
+    //     is a statement about the bytes ALTER USER committed and nothing else.
+    assert.equal(
+      cluster.psql(['-c', 'SELECT 1'], { host: '127.0.0.1', user: 'imsuser', password: target, database: 'one_two_inventory' }),
+      '1',
+      'the server must hold the literal password, apostrophe and all',
+    )
+
+    // (b) THE URL THE INSTALLER WROTE PARSES BACK TO THAT LITERAL, through the installed parser.
+    const written = envDatabaseUrl(root)
+    const parsed = parse(written)
+    assert.equal(parsed.password, target, `the driver must read back the literal from ${written}`)
+    assert.equal(parsed.user, 'imsuser')
+    assert.equal(parsed.host, '127.0.0.1')
+    assert.equal(parsed.port, String(cluster.port))
+    assert.equal(parsed.database, 'one_two_inventory')
+
+    // (c) AND IT OPENS A CONNECTION. The application's own driver, the application's own file.
+    assert.equal(await connectWithDriver(written), 'imsuser', 'node-postgres must authenticate with the URL install.sh wrote')
+
+    // (d) A RE-RUN READS IT BACK AS THE INSTALLED CREDENTIAL AND ASKS FOR NOTHING. This is the
+    //     decode half: without it the recovered value is the percent-encoded bytes, which differ
+    //     from the literal, and an ordinary re-install would rotate a live credential again.
+    const rerun = runShipped(installVars(cluster, root), `
+      ${REINSTALL_BODY}
+      echo "RECOVERED_B64=$(printf '%s' "\${DB_PASSWORD_INSTALLED}" | base64 | tr -d '\\n')"
+    `)
+    assert.equal(rerun.status, 0, rerun.output)
+    assert.match(rerun.output, /ROTATION_PENDING=false/, 'pressing Enter over a reserved-character password must not ask for a rotation')
+    assert.equal(
+      Buffer.from(readVar(rerun.output, 'RECOVERED_B64'), 'base64').toString('utf8'),
+      target,
+      'and the credential it recovered is the literal the server has',
+    )
+  } finally {
+    cluster?.stop()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 2. The encoder and the installed driver, across the whole reserved set
+// ---------------------------------------------------------------------------
+
+test('r39: the shipped encoder and the installed node-postgres agree on every reserved character', async () => {
+  // ONE PASSWORD PROVES THE CHAIN; THIS PROVES THE SET. Every value in RESERVED_CHARACTER_PASSWORDS
+  // is encoded by the SHIPPED url_encode_userinfo(), composed by the SHIPPED
+  // compose_database_url(), parsed by the INSTALLED pg-connection-string, and — for the subset a
+  // role can hold — used to open a real connection.
+  //
+  // THE DECODE IS ASSERTED AS THE INVERSE OF THE ENCODE, not as a second implementation of it: the
+  // shipped url_decode_userinfo() is run over the shipped encoder's own output, in the same shell,
+  // and must return the input. An encoder and a decoder that are wrong in the same direction pass
+  // that; the driver comparison beside it is what makes it load-bearing.
+  //
+  // MUTATION ROUTES (each measured by making the change and re-running):
+  //   1. narrow the encoder's kept set to `[A-Za-z0-9]` — i.e. encode `-._~` as well. Everything
+  //      still round-trips (those four are unreserved, so decodeURIComponent restores them) and
+  //      this test stays GREEN, correctly: it is a statement about agreement, not about minimality.
+  //   2. widen it to keep `/` as well (`[A-Za-z0-9._~/-]`). `abc/def` then ends the authority and
+  //      pg-connection-string reads the host as `def`; this test fails on that row, and test 1
+  //      fails at connectWithDriver. Nothing else in either installer file notices.
+  //   3. make url_decode_userinfo() decode `%` sequences that are not two hex digits (drop the
+  //      `{2}` from the sed pattern): `a%2` and `a%` stop round-tripping and this test fails on
+  //      those rows, and test 3 fails on four legacy rows. Alone in this file otherwise.
+  const root = mkdtempSync(join(tmpdir(), 'ims-repr-'))
+  let cluster: Cluster | undefined
+  try {
+    cluster = startCluster(root, 'live', await freePort(), '127.0.0.1')
+    seedLiveInstallation(cluster)
+
+    const run = runShipped(
+      { ...installVars(cluster, root), CASES_B64: base64(`${RESERVED_CHARACTER_PASSWORDS.join('\n')}\n`) },
+      `
+        printf '%s' "\${CASES_B64}" | base64 -d > "\${APP_DIR}/cases"
+        while IFS= read -r pw; do
+          encoded="$(url_encode_userinfo "\${pw}")"
+          decoded="$(url_decode_userinfo "\${encoded}")"
+          printf 'ROW\\t%s\\t%s\\t%s\\n' \\
+            "$(printf '%s' "\${encoded}" | base64 | tr -d '\\n')" \\
+            "$(printf '%s' "\${decoded}" | base64 | tr -d '\\n')" \\
+            "$(printf '%s' "$(compose_database_url "\${DB_USER}" "\${pw}" "\${DB_HOST}" "\${DB_PORT}" "\${DB_NAME}")" | base64 | tr -d '\\n')"
+        done < "\${APP_DIR}/cases"
+      `,
+    )
+    assert.equal(run.status, 0, run.output)
+
+    const rows = run.output.split('\n').filter((line) => line.startsWith('ROW\t')).map((line) => line.split('\t').slice(1))
+    assert.equal(rows.length, RESERVED_CHARACTER_PASSWORDS.length, `precondition: every case must be measured:\n${run.output}`)
+
+    for (const [index, password] of RESERVED_CHARACTER_PASSWORDS.entries()) {
+      const [encodedB64, decodedB64, urlB64] = rows[index]
+      const encoded = Buffer.from(encodedB64, 'base64').toString('utf8')
+      const decoded = Buffer.from(decodedB64, 'base64').toString('utf8')
+      const url = Buffer.from(urlB64, 'base64').toString('utf8')
+
+      // The encoder emits nothing that any of the three layers reads as structure.
+      assert.match(encoded, /^[A-Za-z0-9._~%-]*$/, `${JSON.stringify(password)} encoded to ${encoded}, which is not unreserved-plus-percent`)
+      assert.doesNotMatch(encoded, /%(?![0-9A-F]{2})/, `${JSON.stringify(password)} encoded to a malformed escape: ${encoded}`)
+
+      // The shipped decoder inverts the shipped encoder...
+      assert.equal(decoded, password, `the shipped decoder must invert the shipped encoder for ${JSON.stringify(password)}`)
+
+      // ...and so does the INSTALLED driver, which is the half that matters.
+      const parsed = parse(url)
+      assert.equal(parsed.password, password, `node-postgres must read ${JSON.stringify(password)} back out of ${url}`)
+      assert.equal(parsed.user, 'imsuser', `the userinfo must not leak into the role for ${JSON.stringify(password)}: ${url}`)
+      assert.equal(parsed.host, '127.0.0.1', `the userinfo must not leak into the host for ${JSON.stringify(password)}: ${url}`)
+      assert.equal(parsed.port, String(cluster.port), `the userinfo must not leak into the port for ${JSON.stringify(password)}: ${url}`)
+      assert.equal(parsed.database, 'one_two_inventory', `the userinfo must not leak into the database for ${JSON.stringify(password)}: ${url}`)
+    }
+
+    // AND THREE OF THEM ARE PUT ON A REAL ROLE AND CONNECTED WITH. The parse assertions above are
+    // about a string; these are about a server accepting it, which is the thing the finding says
+    // stopped happening.
+    for (const password of ["it's", 'a%2Fb', 'p@ss:w/rd?#%']) {
+      const set = runShipped(
+        { ...installVars(cluster, root), DB_PASSWORD_B64: base64(password) },
+        `
+          DB_PASSWORD="$(printf '%s' "\${DB_PASSWORD_B64}" | base64 -d)"
+          quoted="$(sql_quote_literal "\${DB_PASSWORD}")"
+          pg_local_psql -q >/dev/null <<EOSQL || exit 7
+            SET standard_conforming_strings = on;
+            ALTER USER "\${DB_USER}" WITH PASSWORD \${quoted};
+EOSQL
+          echo "URL_B64=$(printf '%s' "$(compose_database_url "\${DB_USER}" "\${DB_PASSWORD}" "\${DB_HOST}" "\${DB_PORT}" "\${DB_NAME}")" | base64 | tr -d '\\n')"
+        `,
+      )
+      assert.equal(set.status, 0, `${JSON.stringify(password)} must be settable as a SQL literal:\n${set.output}`)
+      const url = Buffer.from(readVar(set.output, 'URL_B64'), 'base64').toString('utf8')
+      assert.equal(await connectWithDriver(url), 'imsuser', `node-postgres must authenticate as imsuser with ${JSON.stringify(password)}`)
+    }
+  } finally {
+    cluster?.stop()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 3. The decoder against a URL this installer did not write
+// ---------------------------------------------------------------------------
+
+test('r39: the shipped decoder reaches node-postgres\'s answer for a legacy raw URL', () => {
+  // WHY THIS IS NOT THE SAME TEST AS 2. Test 2 asks whether the pair is self-consistent over bytes
+  // the encoder produced. This asks what happens to a `.env` an OLDER installer wrote by raw
+  // interpolation, which is what every existing installation has: the recovered value has to be the
+  // credential the APPLICATION has been authenticating with — the DECODED one — or the next re-run
+  // compares a literal against URL bytes and reports a rotation nobody asked for.
+  //
+  // The comparison is against the installed pg-connection-string, evaluated here, on the same
+  // inputs. There is no second decoder in this file.
+  //
+  // MUTATION ROUTES (each measured by making the change and re-running):
+  //   1. stop decoding — return the raw userinfo, which is what r38 shipped. Rows `a%2Fb`, `a%2fb`,
+  //      `AAA%25BBB`, `%20`, `%C3%BC`, `%41%42%43`, `100%25pure` and `a%2Fb%2Fc` all disagree with
+  //      the driver and this test fails on the first of them. Test 1's re-run assertion fails too.
+  //   2. decode with `printf '%b'` WITHOUT protecting literal backslashes first: `\back\slash`
+  //      becomes a backspace and a `\s`, and this test fails on that row alone.
+  //   3. drop the `{2}` from the hex pattern so a single hex digit decodes: `a%2` disagrees and
+  //      this test fails on it; test 2 fails on `a%` and `a%2` as well.
+  const root = mkdtempSync(join(tmpdir(), 'ims-repr-'))
+  try {
+    const run = runShipped(
+      { APP_DIR: root, APP_USER: currentUser(), CASES_B64: base64(`${LEGACY_RAW_USERINFO.join('\n')}\n`) },
+      `
+        printf '%s' "\${CASES_B64}" | base64 -d > "\${APP_DIR}/cases"
+        while IFS= read -r raw; do
+          printf 'ROW\\t%s\\n' "$(printf '%s' "$(url_decode_userinfo "\${raw}")" | base64 | tr -d '\\n')"
+        done < "\${APP_DIR}/cases"
+      `,
+    )
+    assert.equal(run.status, 0, run.output)
+    const rows = run.output.split('\n').filter((line) => line.startsWith('ROW\t')).map((line) => line.slice(4))
+    assert.equal(rows.length, LEGACY_RAW_USERINFO.length, `precondition: every case must be measured:\n${run.output}`)
+
+    let differed = 0
+    for (const [index, raw] of LEGACY_RAW_USERINFO.entries()) {
+      const shipped = Buffer.from(rows[index], 'base64').toString('utf8')
+      const driver = parse(`postgresql://imsuser:${raw}@127.0.0.1:5432/one_two_inventory`).password
+      assert.equal(shipped, driver, `install.sh and node-postgres must agree on the userinfo ${JSON.stringify(raw)}`)
+      if (shipped !== raw) differed += 1
+    }
+    // PRECONDITION: the comparison is not vacuous. If decoding were the identity function these
+    // rows would all agree with a decoder that does nothing, and this test would pass on r38's
+    // code. Eight of the twenty-one differ from their input.
+    assert.ok(differed >= 8, `precondition: the corpus must contain rows a non-decoding recovery gets wrong, found ${differed}`)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 4. The environment file is published, not truncated
+// ---------------------------------------------------------------------------
+
+test('r39: .env is published by rename, so the previous file is never truncated', async () => {
+  // THE PROOF IS A HARD LINK, and it is deterministic. A second name for the SAME INODE cannot be
+  // moved by a rename, so after the write it holds whatever the old inode holds. With `cat >` the
+  // old inode is truncated and refilled in place, and the witness sees the NEW content — which is
+  // exactly the state a crash mid-write leaves behind, only permanent. With publish_durable_file()
+  // the old inode is never opened for writing at all.
+  //
+  // A racing reader would prove the same thing and would prove it flakily. This does not race.
+  //
+  // MUTATION ROUTES (each measured by making the change and re-running):
+  //   1. revert write_app_env_file() to `cat > "${APP_DIR}/.env" <<EOF`: the witness holds the NEW
+  //      content and the inode is unchanged; this test fails on both, ALONE in every installer
+  //      file — the preservation tests read `.env` by name and cannot see which inode it is.
+  //   2. move the chmod after the rename (`publish_durable_file` then `chmod 600`): the mode
+  //      assertion still passes, because the end state is the same; that half is asserted here
+  //      only as a statement about the end state, and the ATOMICITY of it is what route 1 covers.
+  //   3. drop the `[[ -n "${rendered}" ]]` guard: nothing here fails. It is asserted below by
+  //      rendering into a variable and checking the published bytes equal it exactly.
+  const root = mkdtempSync(join(tmpdir(), 'ims-repr-'))
+  let cluster: Cluster | undefined
+  try {
+    cluster = startCluster(root, 'live', await freePort(), '127.0.0.1')
+    seedLiveInstallation(cluster)
+    const previous = writeInstalledEnv(root, cluster.port, 'live-password')
+
+    // A SECOND NAME FOR THE FILE THAT IS THERE NOW.
+    const witness = join(root, 'env.witness')
+    linkSync(join(root, '.env'), witness)
+    const before = statSync(join(root, '.env'))
+    assert.equal(statSync(witness).ino, before.ino, 'precondition: the witness must be the same inode')
+
+    const run = runShipped(installVars(cluster, root), `
+      ${REINSTALL_BODY}
+      echo "RENDERED_B64=$(render_app_env_file | base64 | tr -d '\\n')"
+    `)
+    assert.equal(run.status, 0, run.output)
+
+    // THE OLD BYTES ARE STILL THERE, WHOLE, under the name that still points at the old inode.
+    assert.equal(readFileSync(witness, 'utf8'), previous, 'the previous inode must be untouched: publication is a rename, not a truncation')
+    // And .env is a DIFFERENT inode, with the new content.
+    const after = statSync(join(root, '.env'))
+    assert.notEqual(after.ino, before.ino, 'the published file must be a new inode')
+    assert.equal(after.mode & 0o777, 0o600, 'and it must arrive at mode 0600')
+    assert.equal(after.uid, statSync(root).uid, 'and owned by the account the installer gives it to')
+
+    // THE PUBLISHED BYTES ARE THE RENDERED BYTES, exactly — which is what makes the render-then-
+    // publish split honest. A pipeline would have published whatever it had received before a
+    // failing producer died; this compares the whole file against the whole render.
+    const rendered = Buffer.from(readVar(run.output, 'RENDERED_B64'), 'base64').toString('utf8')
+    assert.equal(readFileSync(join(root, '.env'), 'utf8'), rendered, 'the published file must be exactly the rendered content')
+  } finally {
+    cluster?.stop()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 5. THE OTHER HIGH: every boundary between ALTER ROLE and durable publication
+// ---------------------------------------------------------------------------
+
+/**
+ * THE RUN THAT COMES AFTER THE INTERRUPTED ONE, with no password supplied — which under
+ * `--non-interactive`, and under an operator pressing Enter, is the same thing. It is the shipped
+ * pre-stop sequence: recover, classify, provision, publish, resolve.
+ *
+ * WHAT IT PRINTS IS WHAT THE RECONCILIATION DECIDED. DB_PASSWORD_INSTALLED is the credential this
+ * run believes the server has; DB_PASSWORD_EFFECTIVE is what it composed the URL from; and
+ * JOURNAL_LEFT says whether the record was cleared, which is the difference between "reconciled"
+ * and "still in flight".
+ */
+const NEXT_RUN_BODY = `
+  load_existing_env "\${APP_DIR}/.env"
+  prompt_db_password
+  ensure_database_role_exists
+  classify_database_credential_rotation
+  provision_database_role_and_privileges
+  write_app_env_file
+  resolve_role_rotation_journal_after_env_publication
+  echo "INSTALLED_B64=$(printf '%s' "\${DB_PASSWORD_INSTALLED}" | base64 | tr -d '\\n')"
+  echo "EFFECTIVE_B64=$(printf '%s' "\${DB_PASSWORD_EFFECTIVE}" | base64 | tr -d '\\n')"
+  echo "PENDING=\${DB_PASSWORD_ROTATION_PENDING}"
+  echo "RECONCILED=\${DB_ROTATION_JOURNAL_FOUND}"
+  echo "JOURNAL_LEFT=$([[ -e "\${DB_ROLE_ROTATION_JOURNAL}" ]] && echo yes || echo no)"
+`
+
+/** The shipped rotation, TRUNCATED at one interruption point. Nothing here re-implements it. */
+const SHIPPED_ROTATION_UP_TO_THE_CLEAR = `
+  write_role_rotation_journal "\${DB_PASSWORD_EFFECTIVE}" "\${DB_PASSWORD}" || exit 7
+  quoted="$(sql_quote_literal "\${DB_PASSWORD}")"
+  pg_local_psql -q >/dev/null <<EOSQL || exit 8
+    SET standard_conforming_strings = on;
+    ALTER USER "\${DB_USER}" WITH PASSWORD \${quoted};
+EOSQL
+  DB_PASSWORD_EFFECTIVE="\${DB_PASSWORD}"
+  DATABASE_URL="$(compose_database_url "\${DB_USER}" "\${DB_PASSWORD_EFFECTIVE}" "\${DB_HOST}" "\${DB_PORT}" "\${DB_NAME}")"
+  write_app_env_file || exit 9
+`
+
+function decodeVar(output: string, name: string): string {
+  return Buffer.from(readVar(output, name), 'base64').toString('utf8')
+}
+
+test('r39: a rotation that cannot be journalled does not ALTER anything', async () => {
+  // THE ORDER IS THE POINT. The journal is not bookkeeping the rotation does on its way past; it is
+  // the thing that makes the ALTER recoverable, so a run that cannot write it must not ALTER. If
+  // the record went down AFTER — or not at all — this refusal would be the r39 defect wearing a
+  // different message.
+  //
+  // MUTATION ROUTES (each measured by making the change and re-running):
+  //   1. move the write_role_rotation_journal call to AFTER the ALTER: this test fails on its
+  //      status assertion (the run gets past the journal and rotates) and on its live-credential
+  //      assertion. It fails ALONE — the reconciliation tests below still pass, because on their
+  //      paths the journal does get written.
+  //   2. drop the `|| die` from it: same two failures, same test, alone.
+  const root = mkdtempSync(join(tmpdir(), 'ims-repr-'))
+  let cluster: Cluster | undefined
+  try {
+    cluster = startCluster(root, 'live', await freePort(), '127.0.0.1')
+    seedLiveInstallation(cluster)
+    writeInstalledEnv(root, cluster.port, 'live-password')
+
+    const run = runShipped({ ...installVars(cluster, root), DB_PASSWORD: 'rotated-secret' }, `
+      ${REINSTALL_BODY}
+      # The journal's directory cannot be created: a read-only parent is the ENOSPC/EROFS class of
+      # failure the finding names, reached deterministically.
+      DB_ENV_SNAPSHOT_DIR="\${APP_DIR}/unwritable/journal"
+      DB_ROLE_ROTATION_JOURNAL="\${DB_ENV_SNAPSHOT_DIR}/db-role-rotation.journal"
+      mkdir -p "\${APP_DIR}/unwritable"
+      chmod 500 "\${APP_DIR}/unwritable"
+      FENCE_ARMED=true
+      DB_FENCE_UP=true
+      rotate_database_password_in_fenced_window
+      echo "ROTATED_ANYWAY"
+    `)
+    assert.equal(run.status, 9, `a rotation that cannot journal must refuse:\n${run.output}`)
+    assert.doesNotMatch(run.output, /ROTATED_ANYWAY/, 'and must not continue past the refusal')
+    assert.match(run.output, /could not be journalled durably/, 'for the reason the finding names')
+    assert.match(run.output, /The ALTER has NOT been issued/, 'and it says what state the role is in')
+
+    // AND THE REFUSAL IS TRUE.
+    assert.equal(
+      cluster.psql(['-c', 'SELECT 1'], { host: '127.0.0.1', user: 'imsuser', password: 'live-password', database: 'one_two_inventory' }),
+      '1',
+      'the role must still have the credential its clients hold',
+    )
+    assert.throws(
+      () => cluster!.psql(['-c', 'SELECT 1'], { host: '127.0.0.1', user: 'imsuser', password: 'rotated-secret', database: 'one_two_inventory' }),
+      /password authentication failed/,
+      'and the requested password must not have reached the server',
+    )
+    assert.equal(envDatabaseUrl(root), `postgresql://imsuser:live-password@127.0.0.1:${cluster.port}/one_two_inventory`, 'and the environment file still agrees with it')
+  } finally {
+    chmodSync(join(root, 'unwritable'), 0o700)
+    cluster?.stop()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('r39: boundary (1) — journalled, ALTER not run: the next run finds the OLD password and clears the record', async () => {
+  // THE FIRST OF THE THREE INTERRUPTION POINTS. Nothing has been taken away: the server has the old
+  // password, `.env` names it, and the two agree. The next run must NOT assume a rotation happened
+  // just because a record exists — it asks the server, gets the old password, and clears the record
+  // it can now account for.
+  //
+  // CONSTRUCTED, AND SAID SO. There is no statement between the journal and the ALTER that can be
+  // made to fail, so this point is reached by running the journal write alone. The other two use
+  // the shipped sequence.
+  //
+  // MUTATION ROUTES (each measured by making the change and re-running):
+  //   1. delete the old-password probe from reconcile_interrupted_role_rotation() (leave only the
+  //      new one): the run refuses with "NEITHER of the two passwords", and this test fails on its
+  //      status assertion, alone.
+  //   2. delete the clear_role_rotation_journal() call from
+  //      resolve_role_rotation_journal_after_env_publication(): JOURNAL_LEFT is `yes` and this test
+  //      fails on it — as do the two boundary tests below, which is right: they are three
+  //      statements about the same clear.
+  const root = mkdtempSync(join(tmpdir(), 'ims-repr-'))
+  let cluster: Cluster | undefined
+  try {
+    cluster = startCluster(root, 'live', await freePort(), '127.0.0.1')
+    seedLiveInstallation(cluster)
+    writeInstalledEnv(root, cluster.port, 'live-password')
+
+    const interrupted = runShipped({ ...installVars(cluster, root), DB_PASSWORD: 'rotated-secret' }, `
+      ${REINSTALL_BODY}
+      FENCE_ARMED=true
+      DB_FENCE_UP=true
+      write_role_rotation_journal "\${DB_PASSWORD_EFFECTIVE}" "\${DB_PASSWORD}" || exit 7
+      # THE RUN DIES HERE, between the journal and the ALTER.
+    `)
+    assert.equal(interrupted.status, 0, interrupted.output)
+    assert.equal(journalValue(root, 'marker_complete'), '1', 'precondition: a complete journal was published')
+    assert.equal(journalValue(root, 'identity'), `imsuser@127.0.0.1:${cluster.port}/one_two_inventory`)
+    assert.equal(statSync(journalPath(root)).mode & 0o777, 0o600, 'and it is mode 0600')
+    assert.equal(Buffer.from(journalValue(root, 'old_password_b64')!, 'base64').toString('utf8'), 'live-password')
+    assert.equal(Buffer.from(journalValue(root, 'new_password_b64')!, 'base64').toString('utf8'), 'rotated-secret')
+
+    const next = runShipped(installVars(cluster, root), NEXT_RUN_BODY)
+    assert.equal(next.status, 0, next.output)
+    assert.match(next.output, /RECONCILED=true/, 'the next run must notice the interrupted rotation')
+    assert.match(next.output, /still has the OLD password/, 'and say which way it reconciled')
+    assert.equal(decodeVar(next.output, 'INSTALLED_B64'), 'live-password', 'the credential the server actually has')
+    assert.equal(decodeVar(next.output, 'EFFECTIVE_B64'), 'live-password', 'and the one everything before the stop uses')
+    assert.match(next.output, /PENDING=false/, 'pressing Enter asks for no rotation')
+    assert.match(next.output, /JOURNAL_LEFT=no/, 'and the record is cleared, because it is accounted for')
+
+    const written = envDatabaseUrl(root)
+    assert.equal(written, `postgresql://imsuser:live-password@127.0.0.1:${cluster.port}/one_two_inventory`)
+    assert.equal(await connectWithDriver(written), 'imsuser', 'and the file the service restarts from opens a connection')
+  } finally {
+    cluster?.stop()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('r39: boundary (2) — the ALTER commits and .env cannot be written: the next run finishes the transition', async () => {
+  // THE OUTAGE, AND THE WRITE FAILURE, IN ONE RUN. The environment file is made unwritable AFTER
+  // the build window and BEFORE the rotation, so the shipped rotate_database_password_in_fenced_
+  // window() reaches its own publication and fails there — the exact boundary Codex names. The
+  // service is stopped, the fence is up, the server has a password nothing on disk knows.
+  //
+  // TWO THINGS ARE ASSERTED ABOUT THE FAILED WRITE ITSELF, and they are the two `cat >` could not
+  // give: the previous environment file is COMPLETE (not truncated to nothing on its way to being
+  // refilled), and the run REFUSED rather than carrying on with flags that say the file agrees.
+  //
+  // MUTATION ROUTES (each measured by making the change and re-running):
+  //   1. revert write_app_env_file() to `cat > "${APP_DIR}/.env" <<EOF`. The write still fails —
+  //      the file is mode 0400 — but nothing checks it, so the rotation reports SUCCESS with the
+  //      server on the new password and `.env` on the old one. This test fails on its status
+  //      assertion and on "ROTATED_ANYWAY", alone in this file. (Test 4 is what catches the
+  //      truncation itself, by hard link.)
+  //   2. delete the write_role_rotation_journal call: the first half still passes and the SECOND
+  //      RUN strands — it recovers `live-password` out of the stale `.env`, which the server no
+  //      longer has, and publishes a file naming it. This test fails on RECONCILED, on
+  //      INSTALLED_B64 and on connectWithDriver. That is the finding, and it fails here alone.
+  //   3. make reconcile_interrupted_role_rotation() prefer the OLD password (swap the two probes):
+  //      the same three assertions fail, and boundary (3) fails with them.
+  const root = mkdtempSync(join(tmpdir(), 'ims-repr-'))
+  let cluster: Cluster | undefined
+  try {
+    cluster = startCluster(root, 'live', await freePort(), '127.0.0.1')
+    seedLiveInstallation(cluster)
+    writeInstalledEnv(root, cluster.port, 'live-password')
+
+    const interrupted = runShipped({ ...installVars(cluster, root), DB_PASSWORD: 'rotated-secret' }, `
+      ${REINSTALL_BODY}
+      cp "\${APP_DIR}/.env" "\${APP_DIR}/env.before"
+      # The journal's directory has to exist before the application directory is sealed: in
+      # production it is /etc/ims-cutover and is not under \${APP_DIR} at all.
+      mkdir -p "\${DB_ENV_SNAPSHOT_DIR}"
+      # THE WRITE FAILURE, deterministic: neither the file nor its directory can be written, so
+      # both \`cat >\` and publish_durable_file()'s mktemp fail.
+      chmod 400 "\${APP_DIR}/.env"
+      chmod 500 "\${APP_DIR}"
+      FENCE_ARMED=true
+      DB_FENCE_UP=true
+      rotate_database_password_in_fenced_window
+      echo "ROTATED_ANYWAY"
+    `)
+    assert.equal(interrupted.status, 9, `the rotation must refuse when it cannot publish:\n${interrupted.output}`)
+    assert.doesNotMatch(interrupted.output, /ROTATED_ANYWAY/, 'and must not report success')
+    assert.match(interrupted.output, /HAS BEEN ROTATED on the server/, 'the refusal must say the ALTER committed')
+    assert.match(interrupted.output, /reconcile from the journal/, 'and tell the operator what fixes it')
+
+    chmodSync(root, 0o700)
+    chmodSync(join(root, '.env'), 0o600)
+
+    // THE SERVER MOVED AND THE FILE DID NOT — and the file is WHOLE.
+    assert.equal(
+      cluster.psql(['-c', 'SELECT 1'], { host: '127.0.0.1', user: 'imsuser', password: 'rotated-secret', database: 'one_two_inventory' }),
+      '1',
+      'precondition: the ALTER committed',
+    )
+    assert.equal(
+      readFileSync(join(root, '.env'), 'utf8'),
+      readFileSync(join(root, 'env.before'), 'utf8'),
+      'the previous environment file must be complete and unchanged: a failed publication is a rename that did not happen',
+    )
+    assert.equal(envDatabaseUrl(root), `postgresql://imsuser:live-password@127.0.0.1:${cluster.port}/one_two_inventory`, 'precondition: it names the password the server no longer has')
+    assert.equal(journalValue(root, 'marker_complete'), '1', 'and the journal is standing')
+
+    // THE NEXT RUN FINISHES THE TRANSITION.
+    const next = runShipped(installVars(cluster, root), NEXT_RUN_BODY)
+    assert.equal(next.status, 0, next.output)
+    assert.match(next.output, /RECONCILED=true/, 'the next run must notice the interrupted rotation')
+    assert.match(next.output, /server has the NEW password/, 'and say which way it reconciled')
+    assert.equal(decodeVar(next.output, 'INSTALLED_B64'), 'rotated-secret', 'the installed credential is what the SERVER has, not what .env said')
+    assert.equal(decodeVar(next.output, 'EFFECTIVE_B64'), 'rotated-secret')
+    assert.match(next.output, /PENDING=false/, 'finishing a transition is not a second rotation')
+    assert.match(next.output, /JOURNAL_LEFT=no/, 'and the record is cleared only after the publication succeeded')
+
+    const written = envDatabaseUrl(root)
+    assert.equal(written, `postgresql://imsuser:rotated-secret@127.0.0.1:${cluster.port}/one_two_inventory`)
+    assert.equal(await connectWithDriver(written), 'imsuser', 'and the file the service restarts from opens a connection')
+  } finally {
+    try { chmodSync(root, 0o700) } catch { /* already restored */ }
+    cluster?.stop()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('r39: boundary (3) — both done, the record not cleared: the next run confirms and clears it', async () => {
+  // THE CHEAP ONE, AND IT HAS TO BE CHEAP. The journal is removed LAST precisely so that this is
+  // the outcome a crash produces most often, and it must cost one probe and nothing else: the
+  // server has the new password, `.env` already names it, the rewrite is byte-identical.
+  //
+  // The setup is the SHIPPED rotation truncated one statement before clear_role_rotation_journal(),
+  // so what is interrupted is the real sequence and not a model of it.
+  //
+  // MUTATION ROUTES (each measured by making the change and re-running):
+  //   1. move clear_role_rotation_journal() to BEFORE write_app_env_file() in the shipped function.
+  //      Nothing here fails — this test constructs the truncation itself — but boundary (2) fails
+  //      on its journal assertion, which is where that ordering is load-bearing. Recorded so the
+  //      next reader does not look for it here.
+  //   2. delete the clear from resolve_role_rotation_journal_after_env_publication(): JOURNAL_LEFT
+  //      is `yes` and this test fails on it, with boundary (1) and (2).
+  //   3. make the reconciliation trust `.env` over the server (drop the DB_ROTATION_JOURNAL_FOUND
+  //      branch in prompt_db_password): the recovered value here happens to be the same either way,
+  //      so this test stays GREEN and boundary (2) fails. Recorded because it is the one route this
+  //      test cannot see.
+  const root = mkdtempSync(join(tmpdir(), 'ims-repr-'))
+  let cluster: Cluster | undefined
+  try {
+    cluster = startCluster(root, 'live', await freePort(), '127.0.0.1')
+    seedLiveInstallation(cluster)
+    writeInstalledEnv(root, cluster.port, 'live-password')
+
+    const interrupted = runShipped({ ...installVars(cluster, root), DB_PASSWORD: 'rotated-secret' }, `
+      ${REINSTALL_BODY}
+      FENCE_ARMED=true
+      DB_FENCE_UP=true
+      ${SHIPPED_ROTATION_UP_TO_THE_CLEAR}
+      # THE RUN DIES HERE, one statement before clear_role_rotation_journal().
+      echo "AT_THE_CLEAR"
+    `)
+    assert.equal(interrupted.status, 0, interrupted.output)
+    assert.match(interrupted.output, /AT_THE_CLEAR/, 'precondition: the whole rotation ran except the clear')
+    assert.equal(journalValue(root, 'marker_complete'), '1', 'precondition: the record is still standing')
+    const settled = readFileSync(join(root, '.env'), 'utf8')
+    assert.match(settled, new RegExp(`^DATABASE_URL=postgresql://imsuser:rotated-secret@127\\.0\\.0\\.1:${cluster.port}/one_two_inventory$`, 'm'), 'precondition: .env already names the new credential')
+
+    const next = runShipped(installVars(cluster, root), NEXT_RUN_BODY)
+    assert.equal(next.status, 0, next.output)
+    assert.match(next.output, /RECONCILED=true/)
+    assert.match(next.output, /server has the NEW password/, 'the probe cannot tell (2) from (3), and does not need to')
+    assert.equal(decodeVar(next.output, 'INSTALLED_B64'), 'rotated-secret')
+    assert.match(next.output, /PENDING=false/)
+    assert.match(next.output, /JOURNAL_LEFT=no/, 'and the record is cleared')
+    assert.equal(readFileSync(join(root, '.env'), 'utf8'), settled, 'the rewrite is byte-identical: nothing moved')
+    assert.equal(await connectWithDriver(envDatabaseUrl(root)), 'imsuser')
+  } finally {
+    cluster?.stop()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('r39: boundary (4) — neither password authenticates: the run refuses and keeps the record', async () => {
+  // THE ONE OUTCOME THAT CANNOT BE RECONCILED, and the one where guessing loses a credential.
+  // Somebody has rotated the role out of band. This script cannot tell that from an unreachable
+  // server, so it stops before it has prompted for anything else, before anything is stopped, and
+  // it LEAVES THE JOURNAL — which is the only remaining record of the two candidate passwords.
+  //
+  // MUTATION ROUTES (each measured by making the change and re-running):
+  //   1. make the final `die` a `warn` and return 0: the run continues with DB_PASSWORD_INSTALLED
+  //      empty, mints a fresh password nothing has, and publishes a `.env` naming it. This test
+  //      fails on its status assertion and on JOURNAL_LEFT, alone.
+  //   2. delete the journal from the failure path (add clear_role_rotation_journal before the die):
+  //      this test fails on its journal assertion, alone — the two candidate passwords would be
+  //      gone and no re-run could ever reconcile.
+  const root = mkdtempSync(join(tmpdir(), 'ims-repr-'))
+  let cluster: Cluster | undefined
+  try {
+    cluster = startCluster(root, 'live', await freePort(), '127.0.0.1')
+    seedLiveInstallation(cluster)
+    writeInstalledEnv(root, cluster.port, 'live-password')
+
+    const interrupted = runShipped({ ...installVars(cluster, root), DB_PASSWORD: 'rotated-secret' }, `
+      ${REINSTALL_BODY}
+      FENCE_ARMED=true
+      DB_FENCE_UP=true
+      write_role_rotation_journal "\${DB_PASSWORD_EFFECTIVE}" "\${DB_PASSWORD}" || exit 7
+    `)
+    assert.equal(interrupted.status, 0, interrupted.output)
+
+    // Somebody else moves the role to a third password.
+    cluster.psql(['-c', "ALTER USER imsuser WITH PASSWORD 'somebody-elses-idea'"])
+
+    const next = runShipped(installVars(cluster, root), NEXT_RUN_BODY)
+    assert.equal(next.status, 9, `neither candidate authenticates, so the run must refuse:\n${next.output}`)
+    assert.match(next.output, /NEITHER of the two passwords/, 'for the reason the operator needs')
+    assert.match(next.output, /LEFT IN PLACE/, 'and it says the record is kept')
+    assert.doesNotMatch(next.output, /INSTALLED_B64/, 'and nothing past the refusal ran')
+    assert.equal(journalValue(root, 'marker_complete'), '1', 'the two candidate passwords must survive the refusal')
+    assert.equal(Buffer.from(journalValue(root, 'old_password_b64')!, 'base64').toString('utf8'), 'live-password')
+    assert.equal(Buffer.from(journalValue(root, 'new_password_b64')!, 'base64').toString('utf8'), 'rotated-secret')
+  } finally {
+    cluster?.stop()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('r39: an interrupted rotation for a DIFFERENT connection is refused, not adopted and not cleared', async () => {
+  // A PASSWORD IS A PROPERTY OF ONE ROLE ON ONE SERVER — the rule installed_database_password()
+  // already applies to recovery, applied to reconciliation. A run installing a different database
+  // cannot finish this transition and must not delete its record on the way past: doing either
+  // leaves the connection the journal is about with a credential nothing on the host names.
+  //
+  // MUTATION ROUTES (each measured by making the change and re-running):
+  //   1. delete the identity comparison from reconcile_interrupted_role_rotation(): the run probes
+  //      a role on a database it is not installing, both probes fail, and it dies with "NEITHER of
+  //      the two passwords" — this test fails on its message assertion, alone.
+  //   2. replace the die with a `clear_role_rotation_journal`: the journal assertion fails, alone.
+  const root = mkdtempSync(join(tmpdir(), 'ims-repr-'))
+  let cluster: Cluster | undefined
+  try {
+    cluster = startCluster(root, 'live', await freePort(), '127.0.0.1')
+    seedLiveInstallation(cluster)
+    writeInstalledEnv(root, cluster.port, 'live-password')
+
+    const interrupted = runShipped({ ...installVars(cluster, root), DB_PASSWORD: 'rotated-secret' }, `
+      ${REINSTALL_BODY}
+      FENCE_ARMED=true
+      DB_FENCE_UP=true
+      write_role_rotation_journal "\${DB_PASSWORD_EFFECTIVE}" "\${DB_PASSWORD}" || exit 7
+    `)
+    assert.equal(interrupted.status, 0, interrupted.output)
+
+    const elsewhere = runShipped({ ...installVars(cluster, root), DB_NAME: 'a_different_database' }, NEXT_RUN_BODY)
+    assert.equal(elsewhere.status, 9, `a journal for another connection must stop the run:\n${elsewhere.output}`)
+    assert.match(elsewhere.output, /was interrupted for imsuser@127\.0\.0\.1:\d+\/one_two_inventory and this run is installing imsuser@127\.0\.0\.1:\d+\/a_different_database/, 'and it must name both connections')
+    assert.doesNotMatch(elsewhere.output, /INSTALLED_B64/, 'nothing past the refusal ran')
+    assert.equal(journalValue(root, 'marker_complete'), '1', 'and the other connection\'s record is untouched')
+  } finally {
+    cluster?.stop()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
