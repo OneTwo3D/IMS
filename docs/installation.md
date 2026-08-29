@@ -190,6 +190,61 @@ If a rotation did happen and a later step fails, the post-stop failure banner sa
 the server agree, and any *other* client using the old password for that role needs the new one.
 The pre-stop banner now states the opposite, and can: no credential was rotated.
 
+##### The password is a literal, and the URL is percent-encoded
+
+`DB_PASSWORD` is the **literal server secret**. It is SQL-quoted for `CREATE USER`/`ALTER USER`
+(with `standard_conforming_strings` SET on the same connection, so doubling the apostrophe is
+complete escaping) and **percent-encoded** into `DATABASE_URL`, keeping only the RFC 3986
+unreserved set `A-Z a-z 0-9 - . _ ~`. A `DATABASE_URL` found in an existing `${APP_DIR}/.env` is
+**decoded** with the same semantics before it is compared with anything or used as a credential.
+
+That matters because the application does not read the URL the way a naive installer writes it:
+node-postgres percent-decodes the userinfo. Interpolating the password raw meant `abc%2Fdef` was
+committed on the role and `abc/def` was handed to the driver; a raw `/`, `?` or `#` made the URL
+unparseable altogether; `%FF` threw; and an apostrophe never reached the URL at all, because it
+ended the SQL literal. All of it after the predecessor had been stopped.
+
+The encode/decode pair is verified against the `pg` in this repo's `node_modules` rather than
+against the specification — `tests/scripts/install-credential-representation.test.ts` runs the
+shipped shell functions over 23 reserved-character passwords, parses their output with the
+installed `pg-connection-string`, and opens real connections with `pg.Client`.
+
+**Any password you can type is now installable.** If you are choosing one, a hex or base64 secret
+still travels through the fewest layers.
+
+##### An interrupted rotation is recorded, and the next run finishes it
+
+`ALTER USER … PASSWORD` **commits**. Everything that makes the new credential usable happens after
+it, so a kill, a power loss, an `ENOSPC` or a refused `chown` in between could leave PostgreSQL on
+the new password and `${APP_DIR}/.env` on the old one — inside the stopped, fenced window.
+
+Two things close that:
+
+* **`${APP_DIR}/.env` is published by rename.** It is rendered whole from the variables this
+  process holds, written to a temporary file, given its ownership and mode, flushed, renamed, and
+  the directory flushed. The path never names a partial file, and the write is **checked** — a
+  failure is a refusal, not a flag that says the file agrees.
+* **A rotation journal is written before the `ALTER`.** Root-owned, mode `0600`, at
+  `/etc/ims-cutover/db-role-rotation.journal` (*not* under the cutover state directory, which the
+  application account can write). It carries the connection's identity and **both** candidate
+  passwords, and it is removed **last** — only after an environment file naming the live credential
+  is on the medium.
+
+On the next run, `prompt_db_password` reconciles it before anything has been touched, by **asking
+the server** which of the two passwords is live:
+
+| what the interrupted run got as far as | what the next run does |
+| --- | --- |
+| the journal, not the `ALTER` | the OLD password answers. Nothing was taken away and `.env` already agrees; the run adopts it as the installed credential and clears the journal. Supply the new password again to ask for the rotation a second time. |
+| the `ALTER`, not the environment file | the NEW password answers. The run **finishes the transition**: it treats that credential as the installed one in place of what `.env` says, so the environment file it writes names what the server actually has, and the journal is cleared only once that file is published. |
+| both, but not the clear | indistinguishable from the row above, and it does not need to be distinguished. The rewrite is byte-identical and the journal is cleared. |
+| neither password answers | the run **refuses**, before anything is stopped, and **leaves the journal** — it is the only remaining record of the two candidates. Restore one with `ALTER USER`, or set a password of your own and delete the file, then re-run. |
+
+A journal naming a **different** role, host, port or database is also a refusal: this run cannot
+finish that transition and must not delete its record on the way past.
+
+A rotation that cannot journal durably does **not** issue the `ALTER` at all.
+
 The script performs the following steps:
 
 1. **Pre-flight checks** — verifies root access, detects the OS, and checks internet connectivity
