@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import test, { type TestContext } from 'node:test'
+
+import { createTempDirSync } from './temp-dir.ts'
 
 const SCRIPT = join(process.cwd(), 'scripts/check-connector-fetch-boundaries.mjs')
 
@@ -26,9 +27,7 @@ function runGuardWithArgs(root: string, args: string[]) {
 }
 
 function createRoot(t: TestContext) {
-  const root = mkdtempSync(join(tmpdir(), 'connector-fetch-boundary-'))
-  t.after(() => rmSync(root, { recursive: true, force: true }))
-  return root
+  return createTempDirSync('connector-fetch-boundary-', t)
 }
 
 function writeFixture(root: string, path: string, content: string) {

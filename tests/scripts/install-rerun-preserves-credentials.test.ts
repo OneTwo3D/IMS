@@ -1,7 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFile, spawn } from 'node:child_process'
-import { access, chmod, constants, mkdir, mkdtemp, readFile, symlink, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { access, chmod, constants, mkdir, readFile, symlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import test from 'node:test'
 import { promisify } from 'node:util'
@@ -13,6 +12,7 @@ import {
   sliceOptionalBlock,
   sliceRange,
 } from './redis-url-wire-harness.ts'
+import { createTempDir } from './temp-dir.ts'
 
 const execFileAsync = promisify(execFile)
 
@@ -132,7 +132,7 @@ function parseEnvFile(contents: string): Record<string, string> {
 
 /** Run the shipped redis.conf write for a password, and report what redis would require. */
 async function requirepassAfterInstall(source: string, password: string): Promise<Buffer | null> {
-  const dir = await mkdtemp(path.join(tmpdir(), 'ims-rerun-conf-'))
+  const dir = await createTempDir('ims-rerun-conf-')
   const conf = path.join(dir, 'redis.conf')
   await writeFile(conf, 'port 6379\nbind 127.0.0.1 -::1\n# requirepass foobared\n', 'latin1')
   await execFileAsync('bash', [
@@ -152,7 +152,7 @@ async function requirepassAfterInstall(source: string, password: string): Promis
 }
 
 async function appDirectory(): Promise<string> {
-  return mkdtemp(path.join(tmpdir(), 'ims-install-rerun-'))
+  return createTempDir('ims-install-rerun-')
 }
 
 // ---------------------------------------------------------------------------

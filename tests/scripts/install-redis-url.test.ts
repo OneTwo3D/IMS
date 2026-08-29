@@ -1,9 +1,8 @@
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
-import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
-import test from 'node:test'
+import test, { type TestContext } from 'node:test'
 import { promisify } from 'node:util'
 
 import {
@@ -13,6 +12,7 @@ import {
   sliceOptionalBlock,
   sliceRange,
 } from './redis-url-wire-harness.ts'
+import { createTempDir } from './temp-dir.ts'
 
 const execFileAsync = promisify(execFile)
 
@@ -102,8 +102,8 @@ async function runRedisBlockExpectingFailure(source: string, env: string): Promi
  * test fails on the bytes it PRODUCED — not on a missing marker, and never against a real
  * /etc/redis/redis.conf.
  */
-async function runRedisConfBlock(source: string, password: string): Promise<string> {
-  const dir = await mkdtemp(path.join(tmpdir(), 'ims-redis-conf-'))
+async function runRedisConfBlock(t: TestContext, source: string, password: string): Promise<string> {
+  const dir = await createTempDir('ims-redis-conf-', t)
   const conf = path.join(dir, 'redis.conf')
   await writeFile(
     conf,
@@ -390,7 +390,7 @@ test('o3d-l89a r4: the credential-state rule answers only when the answer is for
 // The server side of the same credential.
 // ---------------------------------------------------------------------------
 
-test('the requirepass redis.conf is configured with decodes to the same bytes the client sends in AUTH', async () => {
+test('the requirepass redis.conf is configured with decodes to the same bytes the client sends in AUTH', async (t) => {
   // BOTH ENDS, MEASURED SEPARATELY AND COMPARED. The URL end is read off a real socket by the
   // production client; the config end is read by a port of redis's own sdssplitargs(), which knows
   // nothing about how the installer writes a password. Neither measurement is the inverse of the
@@ -400,7 +400,7 @@ test('the requirepass redis.conf is configured with decodes to the same bytes th
     source,
     `INSTALL_REDIS=y; REDIS_PORT=__PORT__; REDIS_PASSWORD=${JSON.stringify(AWKWARD_PASSWORD)}`,
   )
-  const conf = await runRedisConfBlock(source, AWKWARD_PASSWORD)
+  const conf = await runRedisConfBlock(t, source, AWKWARD_PASSWORD)
 
   const stored = requirepassBytesFrom(conf)
   assert.ok(stored, 'redis.conf carries no active requirepass, so the server would accept anyone')
@@ -415,24 +415,24 @@ test('the requirepass redis.conf is configured with decodes to the same bytes th
   assert.equal(stored.toString('utf8'), AWKWARD_PASSWORD, 'and both must be what the operator actually typed')
 })
 
-test('a Redis installed with no password gets no active requirepass — an empty credential must not become an empty password', async () => {
+test('a Redis installed with no password gets no active requirepass — an empty credential must not become an empty password', async (t) => {
   // A GUARD, NOT A WITNESS: passes under revert, because commenting the directive out is the half of
   // the old write that was correct. It pins that the new writer did not turn "no password" into
   // `requirepass ""`, which would lock out a client that sends no AUTH at all.
   const source = await readScript()
-  const conf = await runRedisConfBlock(source, '')
+  const conf = await runRedisConfBlock(t, source, '')
 
   assert.equal(requirepassBytesFrom(conf), null)
   assert.match(conf, /^# requirepass foobared$/m, 'the directive is left commented, the way redis ships it')
 })
 
-test('re-writing redis.conf with the same password is idempotent — a re-run must not leave two directives', async () => {
+test('re-writing redis.conf with the same password is idempotent — a re-run must not leave two directives', async (t) => {
   // `requirepass` is last-one-wins in redis, so a stacked file still starts; the reason this matters is
   // that the old write appended a fresh line on every run whose grep missed, and an operator reading
   // the config could not tell which password the server was actually using.
   const source = await readScript()
-  const first = await runRedisConfBlock(source, AWKWARD_PASSWORD)
-  const dir = await mkdtemp(path.join(tmpdir(), 'ims-redis-rerun-'))
+  const first = await runRedisConfBlock(t, source, AWKWARD_PASSWORD)
+  const dir = await createTempDir('ims-redis-rerun-', t)
   const conf = path.join(dir, 'redis.conf')
   await writeFile(conf, first, 'latin1')
 
@@ -457,12 +457,12 @@ test('re-writing redis.conf with the same password is idempotent — a re-run mu
   )
 })
 
-test('the interpolated write this replaced stores something other than the password — pinned, not a witness', async () => {
+test('the interpolated write this replaced stores something other than the password — pinned, not a witness', async (t) => {
   // THIS TEST PASSES WITH THE PRODUCTION CHANGE REVERTED, BY DESIGN. It is not evidence that the fix
   // works — the test above is. It is a guard on the shape of the fix, so that "just interpolate it into
   // sed, it is only a config file" cannot come back. It runs the exact two-branch write that shipped
   // before, against a real config, and asserts redis could not have got the password out of it.
-  const dir = await mkdtemp(path.join(tmpdir(), 'ims-redis-old-'))
+  const dir = await createTempDir('ims-redis-old-', t)
 
   const viaSed = path.join(dir, 'sed.conf')
   await writeFile(viaSed, 'port 6379\n# requirepass foobared\n', 'latin1')
