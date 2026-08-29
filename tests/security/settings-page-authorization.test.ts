@@ -51,14 +51,14 @@ mock.module('@/app/actions/settings', {
 mock.module('@/app/actions/cron', {
   namedExports: { getCrontabStatus: async () => null },
 })
-// o3d-j7y4 r18: the retention tab also reads the evidence hold DIRECTLY from the database (the
-// cutoff row and a count of the held deliveries), so it is a page read like any other — it is
-// fingerprinted here too, which makes the denial cases above assert that it did not run either.
+// o3d-j7y4 r18: the retention tab also reads the evidence hold DIRECTLY from the database (counts
+// over the shopping inbox), so it is a page read like any other — it is fingerprinted here too,
+// which makes the denial cases above assert that it did not run either.
 mock.module('@/lib/connectors/shopping-webhook-evidence-hold', {
   namedExports: {
     describeLegacyWcOrderEvidenceHold: async () => {
       settingReads.push('evidenceHold')
-      return { issue: 'o3d-j7y4', cutoffAt: new Date('2026-08-30T06:48:00.000Z'), heldRows: 451 }
+      return { issue: 'o3d-j7y4', retentionMonths: 3, retainedByOverride: 120, evidenceRowsWithPayload: 451 }
     },
   },
 })

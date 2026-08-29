@@ -331,15 +331,9 @@ async function loadCronJobs(): Promise<CronJobState[]> {
 }
 
 /**
- * o3d-j7y4 (Codex r18 MEDIUM): the shopping-inbox retention window is being OVERRIDDEN for one set of
- * rows, and an override an operator cannot see is not a bounded one. Formatted here, in UTC, rather
- * than in the client component: the cutoff is a system fact rather than a local one, and a
- * locale-formatted date rendered in the browser would not match what the server sent.
+ * o3d-j7y4 (Codex r18 MEDIUM, count corrected in r19): the shopping-inbox retention window is being
+ * OVERRIDDEN for one set of rows, and an override an operator cannot see is not a bounded one.
  */
-function formatUtcMinute(at: Date): string {
-  return `${at.toISOString().slice(0, 16).replace('T', ' ')} UTC`
-}
-
 async function loadRetentionData() {
   const evidenceHold = await describeLegacyWcOrderEvidenceHold()
   const [retInfo, retWarn, retError, drSales, drPurchase, drCustomers, drMovements, drSyncLogs, drWebhookEvents, drWmsEvents, drWmsSyncJobs] = await Promise.all([
@@ -360,8 +354,9 @@ async function loadRetentionData() {
     evidenceHold: evidenceHold
       ? {
           issue: evidenceHold.issue,
-          cutoffLabel: evidenceHold.cutoffAt ? formatUtcMinute(evidenceHold.cutoffAt) : null,
-          heldRows: evidenceHold.heldRows,
+          retentionMonths: evidenceHold.retentionMonths,
+          retainedByOverride: evidenceHold.retainedByOverride,
+          evidenceRowsWithPayload: evidenceHold.evidenceRowsWithPayload,
         }
       : null,
   }

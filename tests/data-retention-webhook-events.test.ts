@@ -3,8 +3,6 @@ import test, { mock } from 'node:test'
 
 import { WC_WEBHOOK_EVENT_STATUS } from '@/lib/connectors/shopping-webhook-inbox'
 import {
-  LEGACY_IMPORTER_DRAIN_GRACE_MS,
-  LEGACY_WC_ORDER_EVIDENCE_CUTOFF_SETTING,
   compactableShoppingWebhookEventWhere,
   preservedWcOrderEvidenceWhere,
 } from '@/lib/connectors/shopping-webhook-retention'
@@ -31,11 +29,6 @@ const capture: {
   count: 0,
 }
 
-/** The stored value of a setting after the run, or undefined. */
-function settingValue(key: string): string | undefined {
-  return capture.settingRows.find((r) => r.key === key)?.value
-}
-
 function noopDelegate() {
   return {
     deleteMany: async () => ({ count: 0 }),
@@ -48,35 +41,20 @@ mock.module('@/lib/activity-log', { namedExports: { logActivity: async () => {} 
 mock.module('@/lib/db', {
   namedExports: {
     db: {
+      // THE PURGE MUST NOT WRITE SETTINGS AT ALL (o3d-j7y4 r19). Round 18 had it record an evidence
+      // cutoff here, insert-only; r19 withdrew the cutoff, and a harness that still tolerated the
+      // write would let a half-removed version of it back in unnoticed.
       setting: {
         findMany: async () => capture.settingRows,
         findUnique: async ({ where }: { where: { key: string } }) =>
           capture.settingRows.find((r) => r.key === where.key) ?? null,
-        // Insert-only, exactly like Postgres under `skipDuplicates`: an existing key is left alone.
         createMany: async (args: CreateManyArgs) => {
           capture.settingWrites.push(args)
-          let created = 0
-          for (const row of args.data) {
-            if (capture.settingRows.some((r) => r.key === row.key)) {
-              if (!args.skipDuplicates) throw new Error(`duplicate key ${row.key}`)
-              continue
-            }
-            capture.settingRows.push({ ...row })
-            created += 1
-          }
-          return { count: created }
+          throw new Error('the retention pass must not write any setting')
         },
-        // o3d-j7y4: a recorded evidence cutoff is a historical fact about this installation. Any
-        // write that could MOVE it is a bug, so the harness refuses to model one.
-        update: async () => {
-          throw new Error('a recorded setting must never be moved by the retention pass')
-        },
-        updateMany: async () => {
-          throw new Error('a recorded setting must never be moved by the retention pass')
-        },
-        upsert: async () => {
-          throw new Error('a recorded setting must never be moved by the retention pass')
-        },
+        update: async () => { throw new Error('the retention pass must not write any setting') },
+        updateMany: async () => { throw new Error('the retention pass must not write any setting') },
+        upsert: async () => { throw new Error('the retention pass must not write any setting') },
       },
       shoppingSyncLog: noopDelegate(),
       accountingSyncLog: noopDelegate(),
@@ -145,37 +123,31 @@ test('a 0-month webhook retention setting disables compaction', async () => {
 
   assert.equal(result.webhookEventsCompacted, 0)
   assert.equal(capture.last, undefined, 'updateMany must not be called when retention is 0')
-  // o3d-j7y4 r18: the evidence cutoff is recorded ANYWAY. It marks when this installation stopped
-  // running the old importer, which has nothing to do with whether the operator has this compaction
-  // switched on — and an installation that turns the compaction on a year from now must not then
-  // record a year-late cutoff and hold its whole history under the exemption.
-  assert.ok(
-    settingValue(LEGACY_WC_ORDER_EVIDENCE_CUTOFF_SETTING),
-    'the evidence cutoff must be recorded even when webhook compaction is disabled',
-  )
 })
 
 /**
- * o3d-j7y4 (Codex r17 HIGH, bounded in r18): the archived WooCommerce ORDER deliveries are the only
- * positive evidence that an order was created on a currency the store never stated, and this compaction
- * was emptying them three months in while the work that needs them is still deferred. The ones that
- * could be that evidence — the ones received before this installation stopped running the old importer
- * — are held back until it closes. The ones received after it are not, because by then no order this
- * installation imported could be affected.
+ * THE HOLD, AND WHERE ITS BOUNDARY ACTUALLY IS (o3d-j7y4, Codex r17 HIGH; r18 bounded it, r19 removed
+ * the bound again).
  *
- * What these pin is that the purge asks the SHARED predicate — the one
- * tests/db/shopping-webhook-retention-evidence.test.ts then proves against a real Postgres — that the
- * exemption is BOUNDED by the recorded cutoff, and that the held-back set is named on columns that
- * cannot make the negation ambiguous.
+ * The archived WooCommerce ORDER deliveries are the only positive evidence that an order was created on
+ * a currency the store never stated, and this compaction was emptying them three months in while the
+ * work that needs them is still deferred. So EVERY WooCommerce order delivery is held, at any age.
+ *
+ * Round 18 bounded that to deliveries received before a recorded per-installation instant. r19 withdrew
+ * it: the bound saved nothing for a whole retention window, and it could be made to say the wrong thing
+ * — by a rollback, on a fresh install, or by anyone able to write the settings row — in the one
+ * direction that destroys evidence irreversibly. The reasoning is in
+ * lib/connectors/shopping-webhook-retention.ts.
+ *
+ * WHAT THESE PIN. The boundary is now a two-column one, so the tests state it as such: which columns
+ * name the held set, that nothing else names it (no time bound, no status bound), that the purge issues
+ * the SHARED predicate rather than a copy, and that the removal is complete — the pass writes no
+ * setting at all.
  */
-const RECORDED_CUTOFF = '2026-08-30T06:48:00.000Z'
 
-test('the compaction holds back PRE-CUTOFF WooCommerce ORDER deliveries while o3d-j7y4 is open', async () => {
+test('the compaction holds back EVERY WooCommerce ORDER delivery while o3d-j7y4 is open', async () => {
   const purgeExpiredData = await loadPurge()
-  capture.settingRows = [
-    { key: 'retention_webhook_events_months', value: '3' },
-    { key: LEGACY_WC_ORDER_EVIDENCE_CUTOFF_SETTING, value: RECORDED_CUTOFF },
-  ]
+  capture.settingRows = [{ key: 'retention_webhook_events_months', value: '3' }]
   capture.last = undefined
   capture.settingWrites = []
   capture.count = 3
@@ -186,25 +158,14 @@ test('the compaction holds back PRE-CUTOFF WooCommerce ORDER deliveries while o3
   const args: UpdateArgs = capture.last
   const cutoff = (args.where.updatedAt as { lt: Date }).lt
   // The purge must issue exactly the shared predicate — not a copy of it that can drift.
-  assert.deepEqual(args.where, compactableShoppingWebhookEventWhere(cutoff, new Date(RECORDED_CUTOFF)))
-  // And that predicate must currently carry the hold, bounded by THIS installation's cutoff.
-  assert.deepEqual(args.where.AND, [
-    {
-      NOT: {
-        connector: 'woocommerce',
-        resource: 'orders',
-        receivedAt: { lt: new Date(RECORDED_CUTOFF) },
-      },
-    },
-  ])
+  assert.deepEqual(args.where, compactableShoppingWebhookEventWhere(cutoff))
+  // And that predicate must currently carry the hold.
+  assert.deepEqual(args.where.AND, [{ NOT: { connector: 'woocommerce', resource: 'orders' } }])
 })
 
-test('an ORDER delivery received AFTER the cutoff is outside the hold, so it compacts normally (o3d-j7y4)', async () => {
+test('the hold has NO time bound — an order delivery is held however old it is (o3d-j7y4 r19)', async () => {
   const purgeExpiredData = await loadPurge()
-  capture.settingRows = [
-    { key: 'retention_webhook_events_months', value: '3' },
-    { key: LEGACY_WC_ORDER_EVIDENCE_CUTOFF_SETTING, value: RECORDED_CUTOFF },
-  ]
+  capture.settingRows = [{ key: 'retention_webhook_events_months', value: '3' }]
   capture.last = undefined
   capture.settingWrites = []
   capture.count = 1
@@ -214,109 +175,49 @@ test('an ORDER delivery received AFTER the cutoff is outside the hold, so it com
   if (!capture.last) throw new Error('updateMany was not called')
   const args: UpdateArgs = capture.last
   const exemption = (args.where.AND as Array<{ NOT: Record<string, unknown> }>)[0].NOT
-  // The exemption must NAME an upper bound on receipt. Without this conjunct the hold covers every
-  // order delivery this installation will ever receive, which is the finding this round is about.
-  const receivedAt = exemption.receivedAt as { lt?: Date } | undefined
-  assert.ok(receivedAt?.lt instanceof Date, 'the hold must be bounded by the delivery receipt instant')
-  assert.deepEqual(receivedAt.lt, new Date(RECORDED_CUTOFF))
-  // A delivery received AFTER that instant does not satisfy the exemption, so the negation does not
-  // exclude it: it is compacted on the operator's schedule like a product delivery.
-  // (What the predicate then does to real rows is proven against Postgres in
-  //  tests/db/shopping-webhook-retention-evidence.test.ts.)
-  assert.equal(Object.keys(exemption).length, 3, 'connector + resource + receivedAt, nothing else')
+  // THE BOUNDARY, STATED. connector and resource, and NOTHING else. A `receivedAt` conjunct here —
+  // r18's cutoff, or any successor to it — would release every order delivery on the far side of some
+  // instant, which is exactly what r19 decided against; a `status` conjunct would release the
+  // dead-letter and pending rows the hold is also meant to cover.
+  assert.deepEqual(exemption, { connector: 'woocommerce', resource: 'orders' })
+  assert.equal(Object.keys(exemption).length, 2, 'connector + resource, nothing else')
+  assert.equal('receivedAt' in exemption, false, 'no time bound')
+  assert.equal('status' in exemption, false, 'no status bound')
+  // The AGE bound that does remain applies to the compaction, never to the exemption: a row's age
+  // decides whether it is eligible, and the exemption then removes it whatever that decided.
+  assert.ok((args.where.updatedAt as { lt?: Date })?.lt instanceof Date)
 })
 
-test('a run that finds NO recorded cutoff records one, insert-only, and holds everything meanwhile (o3d-j7y4)', async () => {
+test('the retention pass records NOTHING in settings (o3d-j7y4 r19 — the cutoff removal is complete)', async () => {
+  // Round 18's pass stamped `legacy_wc_order_evidence_cutoff_at` before the compaction, unconditionally
+  // and outside the `webhookMonths > 0` test. Both of those runs are exercised here; the harness's
+  // settings delegate throws on any write, so a surviving stamp fails loudly rather than being
+  // tolerated as an implementation detail.
   const purgeExpiredData = await loadPurge()
-  capture.settingRows = [{ key: 'retention_webhook_events_months', value: '3' }]
-  capture.last = undefined
-  capture.settingWrites = []
-  capture.count = 2
-  const before = Date.now()
 
-  await purgeExpiredData()
+  for (const months of ['3', '0']) {
+    capture.settingRows = [{ key: 'retention_webhook_events_months', value: months }]
+    capture.settingWrites = []
+    capture.last = undefined
+    capture.count = 2
 
-  // ONE insert, and it must be an insert: moving a recorded cutoff would drag the boundary forward
-  // every night. `skipDuplicates` is what makes two concurrent passes produce one cutoff.
-  assert.equal(capture.settingWrites.length, 1, 'exactly one settings write')
-  assert.equal(capture.settingWrites[0].skipDuplicates, true, 'insert-only')
-  assert.deepEqual(
-    capture.settingWrites[0].data.map((r) => r.key),
-    [LEGACY_WC_ORDER_EVIDENCE_CUTOFF_SETTING],
-  )
+    await purgeExpiredData()
 
-  // What was recorded: the moment the guarded build was observed running, plus the drain margin.
-  const recorded = settingValue(LEGACY_WC_ORDER_EVIDENCE_CUTOFF_SETTING)
-  assert.ok(recorded, 'a cutoff must be recorded')
-  const recordedAt = new Date(recorded).getTime()
-  assert.ok(Number.isFinite(recordedAt), 'the recorded cutoff must be a readable instant')
-  assert.ok(recordedAt >= before + LEGACY_IMPORTER_DRAIN_GRACE_MS, 'observation + the drain margin')
-  assert.ok(recordedAt <= Date.now() + LEGACY_IMPORTER_DRAIN_GRACE_MS)
-
-  // AND, in the run that recorded it, the cutoff is in the FUTURE — so every order delivery this
-  // installation already holds is on the held side of it. An installation with no cutoff yet retains
-  // all of them; it never destroys evidence it cannot date.
-  assert.ok(recordedAt > Date.now(), 'the freshly recorded cutoff is ahead of every existing delivery')
-  if (!capture.last) throw new Error('updateMany was not called')
-  const args: UpdateArgs = capture.last
-  assert.deepEqual(args.where, compactableShoppingWebhookEventWhere(
-    (args.where.updatedAt as { lt: Date }).lt,
-    new Date(recorded),
-  ))
-})
-
-test('a recorded cutoff is never moved by a later run (o3d-j7y4)', async () => {
-  const purgeExpiredData = await loadPurge()
-  capture.settingRows = [
-    { key: 'retention_webhook_events_months', value: '3' },
-    { key: LEGACY_WC_ORDER_EVIDENCE_CUTOFF_SETTING, value: RECORDED_CUTOFF },
-  ]
-  capture.last = undefined
-  capture.settingWrites = []
-  capture.count = 4
-
-  await purgeExpiredData()
-
-  // No write at all — not an insert that the database would discard, and (the harness throws on
-  // update/updateMany/upsert) certainly not a restamp.
-  assert.deepEqual(capture.settingWrites, [])
-  assert.equal(settingValue(LEGACY_WC_ORDER_EVIDENCE_CUTOFF_SETTING), RECORDED_CUTOFF)
-})
-
-test('an UNREADABLE recorded cutoff holds everything and is never overwritten (o3d-j7y4)', async () => {
-  const purgeExpiredData = await loadPurge()
-  capture.settingRows = [
-    { key: 'retention_webhook_events_months', value: '3' },
-    { key: LEGACY_WC_ORDER_EVIDENCE_CUTOFF_SETTING, value: 'not-an-instant' },
-  ]
-  capture.last = undefined
-  capture.settingWrites = []
-  capture.count = 5
-
-  await purgeExpiredData()
-
-  if (!capture.last) throw new Error('updateMany was not called')
-  const args: UpdateArgs = capture.last
-  // A cutoff nobody can read is not a licence to destroy: the hold falls back to every order
-  // delivery, at any age, and the stored value is left exactly as it was found.
-  assert.deepEqual(args.where.AND, [{ NOT: { connector: 'woocommerce', resource: 'orders' } }])
-  assert.deepEqual(capture.settingWrites, [])
-  assert.equal(settingValue(LEGACY_WC_ORDER_EVIDENCE_CUTOFF_SETTING), 'not-an-instant')
+    assert.deepEqual(capture.settingWrites, [], `retention=${months}: no settings write was even attempted`)
+    assert.deepEqual(
+      capture.settingRows.map((r) => r.key),
+      ['retention_webhook_events_months'],
+      `retention=${months}: the settings table is left exactly as it was found`,
+    )
+  }
 })
 
 test('the held-back set is named on NOT NULL columns, so the negation cannot go three-valued (o3d-j7y4)', () => {
-  // `resource` and `connector` are NOT NULL and IMS writes both itself, and `receivedAt` is NOT NULL
-  // with a `now()` default. `topic` is a nullable header value the store supplies: Postgres evaluates
-  // `NOT (... AND topic IN (...))` to NULL for a row whose topic is NULL, which silently drops that row
-  // from the compaction set as well. Naming the set on `topic` would therefore hold back rows nobody
-  // decided to hold back.
-  const bounded = preservedWcOrderEvidenceWhere(new Date(RECORDED_CUTOFF))
-  assert.deepEqual(bounded, {
-    connector: 'woocommerce',
-    resource: 'orders',
-    receivedAt: { lt: new Date(RECORDED_CUTOFF) },
-  })
-  assert.equal('topic' in bounded, false)
-  // With no cutoff recorded the same set is unbounded in time, and only in time.
-  assert.deepEqual(preservedWcOrderEvidenceWhere(null), { connector: 'woocommerce', resource: 'orders' })
+  // `resource` and `connector` are NOT NULL and IMS writes both itself. `topic` is a nullable header
+  // value the store supplies: Postgres evaluates `NOT (... AND topic IN (...))` to NULL for a row whose
+  // topic is NULL, which silently drops that row from the compaction set as well. Naming the set on
+  // `topic` would therefore hold back rows nobody decided to hold back.
+  const held = preservedWcOrderEvidenceWhere()
+  assert.deepEqual(held, { connector: 'woocommerce', resource: 'orders' })
+  assert.equal('topic' in held, false)
 })

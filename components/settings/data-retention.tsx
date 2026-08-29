@@ -8,18 +8,24 @@ import { Label } from '@/components/ui/label'
 import { setSettings } from '@/app/actions/settings'
 
 /**
- * o3d-j7y4 (Codex r18 MEDIUM): the shopping-inbox retention window is OVERRIDDEN for one set of rows
- * while the currency-evidence hold stands, and until this notice existed the only statement this
- * screen made about them was that processed webhook payloads are cleared on the schedule below —
- * which, for those rows, was not true. `null` when no override is in force.
+ * o3d-j7y4 (Codex r18 MEDIUM; count corrected r19): the shopping-inbox retention window is OVERRIDDEN
+ * for one set of rows while the currency-evidence hold stands, and until this notice existed the only
+ * statement this screen made about them was that processed webhook payloads are cleared on the
+ * schedule below — which, for those rows, was not true. `null` when no override is in force.
  */
 export type EvidenceHoldNotice = {
-  /** The issue that owns the hold and is the only thing that lifts it. */
+  /** The issue that owns the hold, owns its data-minimisation cost, and is the only thing that lifts it. */
   issue: string
-  /** Formatted cutoff, or null when this installation has not recorded one yet. */
-  cutoffLabel: string | null
-  /** Held rows that still carry a payload — what the override is actually keeping alive. */
-  heldRows: number
+  /** The configured window this exemption overrides, in months. 0 means the compaction is off anyway. */
+  retentionMonths: number
+  /**
+   * Payloads that survive SOLELY because of the override — held AND otherwise past the window AND
+   * still compactable. Round 18 showed the whole held set here and called it what the exemption was
+   * retaining, which counted young rows and never-compacted statuses as compliance impact.
+   */
+  retainedByOverride: number
+  /** The whole held population that still carries a payload, labelled as the evidence it is. */
+  evidenceRowsWithPayload: number
 }
 
 type Props = {
@@ -113,37 +119,41 @@ export function DataRetentionSetting({
             Webhook Events: an exemption is currently overriding this window
           </p>
           <p className="text-xs text-muted-foreground leading-relaxed">
-            WooCommerce <strong>order</strong> deliveries{' '}
-            {evidenceHold.cutoffLabel
-              ? <>received before <strong>{evidenceHold.cutoffLabel}</strong></>
-              : <>— <strong>all of them, at any age</strong></>}{' '}
-            are <strong>not</strong> cleared by the schedule above.{' '}
-            <strong>{evidenceHold.heldRows.toLocaleString()}</strong>{' '}
-            {evidenceHold.heldRows === 1 ? 'delivery is' : 'deliveries are'} being retained by it today.
-            Their payloads are the only evidence of whether the store stated a currency on orders imported
-            before IMS began requiring one, and clearing one destroys that evidence permanently. Everything
-            else in the inbox — product deliveries, the bulk of it — is cleared exactly as configured.
+            WooCommerce <strong>order</strong> deliveries — <strong>all of them, at any age</strong> — are{' '}
+            <strong>not</strong> cleared by the schedule above. Their payloads are the only evidence of
+            whether the store stated a currency on orders imported before IMS began requiring one, and
+            clearing one destroys that evidence permanently. Everything else in the inbox — product
+            deliveries, the bulk of it — is cleared exactly as configured, and lowering the window does not
+            reach the held-back orders.
           </p>
           <p className="text-xs text-muted-foreground leading-relaxed">
-            {evidenceHold.cutoffLabel ? (
+            {evidenceHold.retentionMonths > 0 ? (
               <>
-                The exemption <strong>does not grow</strong>: order deliveries received after that instant —
-                by which point this installation was running the currency guard, so no order it imports can
-                be affected — are cleared on your schedule like any other. The instant was recorded
-                automatically the first time the nightly cleanup ran on a version carrying the guard, and it
-                is not editable.
+                <strong>{evidenceHold.retainedByOverride.toLocaleString()}</strong>{' '}
+                {evidenceHold.retainedByOverride === 1 ? 'payload is' : 'payloads are'} being kept alive by
+                this exemption today — that is, {evidenceHold.retainedByOverride === 1 ? 'it is' : 'they are'}{' '}
+                past your {evidenceHold.retentionMonths}-month window and would already be cleared without
+                it.
               </>
             ) : (
               <>
-                No cutoff has been recorded for this installation yet, so the exemption currently covers
-                every WooCommerce order delivery. The nightly cleanup records one the first time it runs,
-                after which only deliveries received before that instant stay exempt.
+                Your Webhook Events window is set to <strong>0</strong>, so this compaction is switched off
+                entirely and the exemption is currently keeping <strong>nothing</strong> alive that your own
+                settings would clear.
               </>
             )}{' '}
-            It ends when <strong>{evidenceHold.issue}</strong> is closed — there is no automatic expiry, and
-            it is deliberately not a setting: re-enabling the deletion is a reviewed code change, not a
-            toggle. Until then these payloads are retained past your window, and they carry billing and
-            delivery names and addresses.
+            <strong>{evidenceHold.evidenceRowsWithPayload.toLocaleString()}</strong> order{' '}
+            {evidenceHold.evidenceRowsWithPayload === 1 ? 'delivery' : 'deliveries'} still carry a payload in
+            total, most of them inside your window and held back by nothing.
+          </p>
+          <p className="text-xs text-muted-foreground leading-relaxed">
+            <strong>There is no automatic expiry, and that is deliberate.</strong> A version of this
+            exemption that stopped at a recorded instant was tried and withdrawn: it saved nothing for a
+            whole retention window, and it could be made to say the wrong thing — by a rollback, on a fresh
+            installation — in the one direction that destroys evidence irreversibly. The exemption
+            therefore grows while it is on, and the payloads it retains carry billing and delivery names and
+            addresses. It ends when <strong>{evidenceHold.issue}</strong> is closed, which owns that cost as
+            an accepted constraint; re-enabling the deletion is a reviewed code change, not a toggle.
           </p>
         </div>
       )}
