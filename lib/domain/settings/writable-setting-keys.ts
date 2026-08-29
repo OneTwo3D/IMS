@@ -46,6 +46,16 @@ import { reservedSettingKeyRefusal } from '@/lib/domain/settings/reserved-settin
  *     refusal MESSAGE names that writer.
  *   • onboarding progress rows — `app/actions/onboarding.ts`, key-specific writers of their own.
  *
+ * SECRETS ARE ON THIS LIST, DELIBERATELY. The backup S3/SFTP credentials and the TrackShip API key
+ * are secrets, and they are allowlisted because THIS SCREEN IS THEIR WRITER — there is no other path
+ * that stores them, so refusing them here would simply break the panel. They are unlike the
+ * WooCommerce credentials in the one way that matters: `saveWcCredentials` exists, it does work a
+ * generic upsert cannot (validation, fresh authentication, the sync lock, the version bump), and
+ * reaching `wc_consumer_secret` through this endpoint SKIPS that work. Nothing is skipped here. The
+ * allowlist neither widens nor narrows what a `settings.company` principal could already write to
+ * these rows; if that gate is judged too weak for them, the fix is a fresh-authentication gate on the
+ * backup panel, not an entry on this list.
+ *
  * WHAT THIS IS NOT. It is an application-level choke point on the two writers that accept a
  * caller-supplied key. It does not stop an owning module writing its own row — that is the point —
  * and it is not a database constraint. See `docs/installation.md`.
