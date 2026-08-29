@@ -233,9 +233,19 @@ Remote upload and delete actions apply to both the SQL backup and the `.manifest
 Automate your backup routine by enabling scheduled backups:
 
 - **Enable/disable** the schedule
-- **Retention days** — automatically delete backups older than this many days
-- **Max backup count** — limit the total number of backups kept on the server
+- **Retention days** — automatically delete backups older than this many days (whole number, minimum 1)
+- **Max backup count** — limit the total number of backups kept on the server (whole number, minimum 1)
 - **Auto-upload** — optionally upload each scheduled backup to S3 or SFTP automatically
+
+Saving this panel rewrites the managed crontab. The enable switch is the same enablement the
+**Database Backup** job uses in Settings → System → Scheduled Jobs, so the two screens cannot
+disagree: whichever one you save writes both the scheduler's row (`cron_backup_enabled`) and the row
+the backup route checks before it does any work (`backup_schedule_enabled`). Choose the *time* the
+backup runs on the Scheduled Jobs page — this panel does not set it.
+
+If the crontab cannot be written, the panel reports the values as saved and warns that the scheduler
+is behind, rather than reporting a failed save over values that are stored. Recover with **Save &
+Apply** on the Scheduled Jobs page.
 
 ## Cron Endpoint
 

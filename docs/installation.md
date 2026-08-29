@@ -408,6 +408,15 @@ transaction. That list is grouped by the settings screen that offers each key, a
 fails unless the screens named in it are exactly the files that import a generic writer — so a
 preference nobody can set from a screen cannot be on it, and a screen cannot save a key that is not.
 
+"A screen offers it" is necessary but not sufficient. A control can be on a screen and still not be
+an operator preference: the backup and FX schedule switches were, and both duplicated enablement the
+cron registry owns. The backup schedule is now saved by `saveBackupScheduleSettings`, which writes
+the scheduler's `cron_backup_enabled` and the route's `backup_schedule_enabled` together and
+reconciles the crontab; the Scheduled Jobs editor mirrors the legacy row in the other direction. The
+FX panel's switch and interval were removed — nothing in the application ever read them. The
+repository test therefore cross-checks the allowlist against the cron registry's canonical and legacy
+enablement keys as well as against the screens.
+
 This is deliberately an allowlist rather than a list of keys to refuse. A denylist is only ever as
 complete as the last search for system-managed keys, and the previous one had already missed the
 WooCommerce sync cursors and completion flag. **Adding a new system-managed key therefore requires no
