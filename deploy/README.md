@@ -74,9 +74,12 @@ sudo systemctl restart ims-stage
   via `UPLOAD_STORAGE_DIR` / `PUBLIC_UPLOAD_STORAGE_DIR`, update `ReadWritePaths`
   (or add another `StateDirectory`) to match.
 - **`StateDirectory` is load-bearing beyond backups**: the crontab reconciliation
-  lock lives at `$STATE_DIRECTORY/.crontab-reconcile.lock`
+  lock lives at `$STATE_DIRECTORY/locks/.crontab-reconcile.lock`
   (`lib/crontab-reconcile-lock.ts`, and the matching `flock` in
-  `scripts/install.sh`). systemd creates the directory, owns it to `User=`, and
+  `scripts/install.sh`). The `locks/` directory and the file in it are
+  `root:root` on an installed host — the service opens the lock read-only,
+  because `flock(2)` ignores the access mode, and so nothing root writes there
+  sits on a path the service user could replace with a symlink. systemd creates the directory, owns it to `User=`, and
   adds it to `ReadWritePaths` implicitly, so it is the only path both the
   application and the installer can derive *and* write under
   `ProtectSystem=strict` — a lock beside the app cannot be created at all.

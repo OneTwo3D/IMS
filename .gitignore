@@ -38,8 +38,9 @@ yarn-error.log*
 .env.bak*
 scripts/*.env
 
-# The crontab reconciliation lock (lib/crontab-reconcile-lock.ts) — an flock target created
-# beside the app at runtime; the installer creates the deployed one under APP_DIR.
+# The crontab reconciliation lock (lib/crontab-reconcile-lock.ts) — an flock target created in a
+# `locks/` directory under the working directory when there is no systemd $STATE_DIRECTORY to put it
+# in. On a real install it lives under the state directory and is root-owned, not here.
 .crontab-reconcile.lock
 
 # vercel

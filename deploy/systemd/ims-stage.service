@@ -69,10 +69,15 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 #
 # LOAD-BEARING beyond the backups above: the crontab reconciliation lock
 # (lib/crontab-reconcile-lock.ts, and the matching `flock` in scripts/install.sh) lives at
-# $STATE_DIRECTORY/.crontab-reconcile.lock. It has to — ProtectSystem=strict below leaves the app
-# tree read-only apart from the three ReadWritePaths=, so a lock file next to the app cannot even be
-# created, and the app and the installer would otherwise have no writable path they both derive.
+# $STATE_DIRECTORY/locks/.crontab-reconcile.lock. It has to — ProtectSystem=strict below leaves the
+# app tree read-only apart from the three ReadWritePaths=, so a lock file next to the app cannot even
+# be created, and the app and the installer would otherwise have no writable path they both derive.
 # systemd implicitly adds a StateDirectory to ReadWritePaths=, so this needs no entry of its own.
+#
+# The `locks` subdirectory and the file in it are root:root where scripts/install.sh created them —
+# this directory is owned by User= and must be, so a root-side write directly into it could be aimed
+# at any path by whoever holds that account (r24). The service opens the lock READ-ONLY; flock(2)
+# ignores the access mode. Where there was no installer the service creates both itself.
 # Removing this directive does not fail at deploy time: it fails at the first scheduler save, which
 # then refuses and reports that the scheduler may be behind.
 StateDirectory=onetwoinventory
