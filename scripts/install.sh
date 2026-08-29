@@ -826,10 +826,192 @@ DB_CREATED_BY_THIS_RUN=false
 # The host:port/name CREATE DATABASE actually succeeded against, so proof about one database can
 # never be spent on another.
 DB_CREATED_IDENTITY=""
+# The identity the SERVER answered with on the connection that performed the CREATE: postmaster
+# start time, port and the new database's oid. Verified against the endpoint DATABASE_URL names.
+DB_CREATED_SERVER_IDENTITY=""
 # What this run established, in the words the refusal prints. Replaced at the creation step.
 DB_NEWNESS_FINDING="this run created no database, so nothing here established that the database it is about to migrate is new"
 # Why the exemption was refused, when it was. Set by first_install_exemption_available().
 FIRST_INSTALL_EXEMPTION_REFUSAL=""
+
+# ---------------------------------------------------------------------------
+# EVERY psql THIS SCRIPT RUNS IS TOLD WHERE TO GO, AND THE PROOF IS READ OFF THE
+# CONNECTION THAT PRODUCED IT (o3d-2sm1.5 r37, Codex CRITICAL)
+#
+# THE DEFECT. `create_database_and_record_newness` ran `run_as_user postgres psql -c "CREATE
+# DATABASE ..."` with no host, no port and no maintenance database, and then RECORDED
+# "${DB_HOST}:${DB_PORT}/${DB_NAME}" as the thing it had proven. Neither half was observed.
+# libpq fills every absent connection value from the environment — PGHOST, PGHOSTADDR, PGPORT,
+# PGDATABASE, PGSERVICE, PGUSER, and a pg_service.conf found through PGSYSCONFDIR — and
+# `run_as_user` preserves the environment on two of its three branches (`runuser -u ... --` and
+# the `su -s` fallback; only the `sudo` branch resets it, so the behaviour was not even uniform
+# across boxes). With PGPORT=5433 inherited from the invoking shell, the statement creates the
+# database on a SECOND cluster, exits 0, and this script writes down `localhost:5432` as proven.
+# Both halves are then true of DIFFERENT SERVERS, and the exemption skips the fence over a live
+# database on 5432 that this run never touched. `PSQLRC` is the same hole with a different shape:
+# a `\c` in a startup file moves the session before our statement runs.
+#
+# THIS BRANCH ESTABLISHED THAT FACT ITSELF, for the connection fence: DB_FENCE_IDENTITY_ARGS
+# exists because "no PGHOST/PGPORT/PGUSER/PGDATABASE in any process can move the connection away
+# from them". The same rule, a new reader, unapplied. So:
+#
+#   1. SANITISE. Every psql this script runs has every PG*/PSQL* variable removed from its
+#      environment first, so nothing inherited can supply a value we did not state.
+#   2. BIND. The superuser connection states its socket directory, its port and its maintenance
+#      database; the endpoint connection states host, port, user and database. -X ignores any
+#      psqlrc, -w refuses to block on a password prompt.
+#   3. PROVE. Sanitising is necessary and it is not sufficient — it makes the connection
+#      DETERMINISTIC, not CORRECT, and a wrong DB_LOCAL_SOCKET_DIR or a second cluster sharing a
+#      port would still land the CREATE somewhere else. So the identity is READ OFF THE
+#      CONNECTION THAT PERFORMED THE CREATE and compared with the identity read off a connection
+#      opened exactly the way the migration opens its own: TCP to ${DB_HOST}:${DB_PORT}. The
+#      exemption is licensed by that comparison, not by where this script believes it connected.
+# ---------------------------------------------------------------------------
+
+# The variables that can move a libpq connection, silence its refusal, or run SQL before ours.
+# Computed from the ACTUAL environment rather than from a list somebody has to keep current: any
+# exported PG*/PSQL* name is removed, which covers PGSERVICE, PGSYSCONFDIR, PGOPTIONS, PGSSL*,
+# PGTARGETSESSIONATTRS, PGLOADBALANCEHOSTS and whatever libpq adds next. Names are read from
+# `compgen -e`, so nothing here has to trust a caller-supplied string.
+#
+# Fills the caller's named array; `env -u X -u Y ... psql` then starts psql with them gone.
+libpq_env_unset_args() {
+  local -n _out="$1"
+  local var
+  _out=()
+  while IFS= read -r var; do
+    case "${var}" in
+      PG*|PSQL*) _out+=(-u "${var}") ;;
+    esac
+  done < <(compgen -e)
+}
+
+# WHERE THE LOCAL SUPERUSER CONNECTION GOES, STATED RATHER THAN INHERITED.
+#
+# It is a SOCKET directory and not a host, and that is deliberate: the CREATE is issued as the
+# `postgres` OS user, which Debian's default pg_hba admits by `peer` on the local socket and by
+# `scram-sha-256` over TCP — where that role has no password. Forcing -h localhost would
+# therefore break every ordinary install. The port still pins the CLUSTER (a socket is
+# .s.PGSQL.<port>), and the identity comparison below is what pins the SERVER.
+#
+# IMS_PG_SOCKET_DIR exists because the regression that proves this cannot use the machine's real
+# socket directory. It cannot weaken the proof: pointing it at another cluster does not produce
+# an exemption, it produces the refusal in verify_created_database_endpoint().
+db_local_socket_dir() {
+  if [[ -n "${IMS_PG_SOCKET_DIR:-}" ]]; then
+    printf '%s' "${IMS_PG_SOCKET_DIR}"
+  elif [[ -d /var/run/postgresql ]]; then
+    printf '%s' /var/run/postgresql
+  else
+    printf '%s' /tmp
+  fi
+}
+
+# The local superuser connection: sanitised, bound to this host's socket directory, this run's
+# port and the `postgres` maintenance database. Every psql in this file goes through here or
+# through pg_endpoint_psql below.
+pg_local_psql() {
+  local -a unset_args=()
+  libpq_env_unset_args unset_args
+  run_as_user postgres env "${unset_args[@]}" psql \
+    -X -w -v ON_ERROR_STOP=1 -v VERBOSITY=verbose \
+    -h "$(db_local_socket_dir)" -p "${DB_PORT}" -d postgres "$@"
+}
+
+# A connection opened the way the APPLICATION opens its own: TCP, to the four values
+# DATABASE_URL is composed from. Used only to read a server identity back.
+pg_endpoint_psql() {
+  local role="$1" password="$2" database="$3"
+  shift 3
+  local -a unset_args=()
+  libpq_env_unset_args unset_args
+  run_as_user postgres env "${unset_args[@]}" PGPASSWORD="${password}" psql \
+    -X -w -v ON_ERROR_STOP=1 -v VERBOSITY=verbose \
+    -h "${DB_HOST}" -p "${DB_PORT}" -U "${role}" -d "${database}" "$@"
+}
+
+# WHAT "THE SAME SERVER" MEANS HERE, IN ONE PLACE, READ BY BOTH CONNECTIONS.
+#
+#   pg_postmaster_start_time()  the same microsecond stamp on every backend of one postmaster and
+#                               a different one on any other. THE FENCE LIBRARY ALREADY USES
+#                               EXACTLY THIS as its "are these two connections the same cluster?"
+#                               test (assessUnrecordedRelease); this is that rule applied at the
+#                               statement that produces the newness proof.
+#   current_setting('port')     the port the server itself believes it is on, which is not the
+#                               port we dialled and can disagree with it.
+#   the database's oid          assigned by this server when the CREATE ran. Two clusters that
+#                               both hold a database of this name will almost never agree on it,
+#                               and it ties the identity to the OBJECT rather than to the server
+#                               alone.
+#
+# WHY NOT system_identifier, which is the obvious candidate: a pg_basebackup clone INHERITS its
+# origin's system identifier, so a clone and its origin — the two servers most likely to be
+# running side by side on a box being cut over — are indistinguishable by it. It is also
+# superuser-only (pg_control_system), and the endpoint connection is deliberately NOT a
+# superuser, so it could not be compared even if it discriminated. The postmaster start time
+# separates a clone from its origin; every field here is readable by an ordinary login role.
+#
+# All three are emitted as ONE marked line, so a psql notice or a wrapper's banner cannot be
+# mistaken for the identity.
+pg_server_identity_select() {
+  cat <<'IMS_IDENTITY_SQL'
+SELECT 'IMS_SERVER_IDENTITY '
+       || current_setting('port') || ' '
+       || (EXTRACT(EPOCH FROM pg_postmaster_start_time()) * 1000000)::bigint::text || ' '
+       || coalesce((SELECT oid FROM pg_database WHERE datname = :'dbname')::text, 'absent')
+IMS_IDENTITY_SQL
+}
+
+# The IMS_SERVER_IDENTITY line out of a psql run, and nothing else.
+pg_extract_server_identity() {
+  printf '%s\n' "$1" | grep -m1 '^IMS_SERVER_IDENTITY ' || true
+}
+
+# THE PROOF IS ABOUT THE SERVER THE MIGRATION WILL USE, OR IT IS NOT PROOF (o3d-2sm1.5 r37,
+# Codex CRITICAL). Called with the identity read on the connection that performed the CREATE.
+#
+# It opens a SECOND connection — TCP, to ${DB_HOST}:${DB_PORT}, to the database just created,
+# exactly as the application will — and asks it the same question. Equal answers mean one
+# postmaster, on the port this run will dial, holding the database object this run created.
+# Anything else stops the run: a CREATE that landed somewhere else means the endpoint the
+# migration is about to use holds a database this run did NOT create, which is the live database
+# the fence exists for.
+#
+# WHY A THROWAWAY ROLE. The endpoint has to be reached as SOMEBODY, and at this point in the run
+# there is deliberately no usable application credential: the role work now happens after
+# cutover classification (see provision_database_role_and_privileges), precisely so that a
+# refusal cannot land after a live role's password has been changed. So this creates a role that
+# by construction nothing else uses, with a random password, reads one row as it, and drops it.
+# It cannot collide with an existing role and it cannot alter one.
+verify_created_database_endpoint() {
+  local created_identity="$1"
+  local probe_role probe_password probe_output="" probe_identity="" status=0
+
+  probe_role="ims_newness_probe_$(openssl rand -hex 6)"
+  probe_password="$(openssl rand -hex 24)"
+
+  # Hex by construction, so nothing here interpolates an operator-supplied byte into SQL, and
+  # neither value reaches argv.
+  pg_local_psql -q >/dev/null 2>&1 <<EOSQL || die "This run created database '${DB_NAME}' but could not create the throwaway role it verifies the connection with, so it cannot show that the database it created is on the server the migration will use. NOTHING HAS BEEN MIGRATED."
+    CREATE ROLE "${probe_role}" LOGIN PASSWORD '${probe_password}';
+EOSQL
+
+  probe_output="$(pg_endpoint_psql "${probe_role}" "${probe_password}" "${DB_NAME}" \
+    -q -tA -v dbname="${DB_NAME}" -c "$(pg_server_identity_select)" 2>&1)" || status=$?
+  probe_identity="$(pg_extract_server_identity "${probe_output}")"
+
+  pg_local_psql -q >/dev/null 2>&1 <<EOSQL || warn "The throwaway verification role ${probe_role} could not be dropped. Remove it by hand: DROP ROLE \"${probe_role}\";"
+    DROP ROLE IF EXISTS "${probe_role}";
+EOSQL
+
+  if [[ "${status}" -ne 0 || -z "${probe_identity}" ]]; then
+    die "This run created database '${DB_NAME}', but could not then reach ${DB_HOST}:${DB_PORT}/${DB_NAME} the way the application will, so it cannot show that the database it created is the one about to be migrated. The migration uses that same endpoint and would fail here too. NOTHING HAS BEEN MIGRATED. psql said: ${probe_output}"
+  fi
+
+  if [[ "${probe_identity}" != "${created_identity}" ]]; then
+    die "THE DATABASE THIS RUN CREATED IS NOT ON THE SERVER IT IS ABOUT TO MIGRATE. CREATE DATABASE succeeded on the server that answered '${created_identity}' (postmaster start time, port and database oid), and ${DB_HOST}:${DB_PORT}/${DB_NAME} — the endpoint DATABASE_URL names — answered '${probe_identity}'. Those are different servers, so the CREATE proves nothing about the database about to be migrated, and that database is one this run did not create: it may have writers on it right now. A stray PGHOST/PGPORT/PGSERVICE in the invoking environment is the usual cause, and IMS_PG_SOCKET_DIR is the other. NOTHING HAS BEEN MIGRATED. An empty database was created on the other server and can be dropped."
+  fi
+}
 
 # THE ONE STATEMENT IN THIS FILE THAT CAN SET DB_CREATED_BY_THIS_RUN (o3d-2sm1.5 r36, Codex
 # CRITICAL). Called only on the INSTALL_POSTGRES=y path, which is the only path that creates
@@ -844,29 +1026,129 @@ FIRST_INSTALL_EXEMPTION_REFUSAL=""
 # apart and read "no launcher on this host" as if it meant "no database before this run".
 #
 # So the statement is issued UNCONDITIONALLY and the server is allowed to answer:
-#   exit 0                     -> this statement brought the database into being. PROOF.
+#   exit 0                     -> this statement brought the database into being. PROOF, once
+#                                 verify_created_database_endpoint() has shown it is proof about
+#                                 the server the migration will use.
 #   42P04 duplicate_database   -> it was already there. A supported outcome, not an error: the
 #                                 install continues, it simply does not get the exemption.
 #   anything else              -> indeterminate. The run stops, exactly as ON_ERROR_STOP did
 #                                 before, rather than continuing over a database it cannot
 #                                 describe.
+#
+# THE DUPLICATE IS RECOGNISED BY SQLSTATE, NOT BY ENGLISH (o3d-2sm1.5 r37, Codex HIGH). This used
+# to match /already exists/i, which is a message the server localises: on a cluster with
+# lc_messages set to anything but English, the ONE outcome that means "there is a live database
+# here" was classified as indeterminate. `VERBOSITY=verbose` puts the SQLSTATE in the ERROR line
+# itself, and 42P04 is the same five bytes in every locale.
 create_database_and_record_newness() {
-  local output="" status=0
-  output="$(run_as_user postgres psql -v ON_ERROR_STOP=1 -q -c "CREATE DATABASE \"${DB_NAME}\"" 2>&1)" || status=$?
+  local output="" status=0 created_identity=""
+  output="$(pg_local_psql -q -tA -v dbname="${DB_NAME}" \
+    -c 'CREATE DATABASE :"dbname"' \
+    -c "$(pg_server_identity_select)" 2>&1)" || status=$?
   if [[ "${status}" -eq 0 ]]; then
+    created_identity="$(pg_extract_server_identity "${output}")"
+    [[ -n "${created_identity}" ]] || die "CREATE DATABASE '${DB_NAME}' succeeded but the server did not answer the identity question on the same connection, so this run cannot say WHICH server it created that database on. NOTHING HAS BEEN MIGRATED. psql said: ${output}"
+    verify_created_database_endpoint "${created_identity}"
     DB_CREATED_BY_THIS_RUN=true
     DB_CREATED_IDENTITY="${DB_HOST}:${DB_PORT}/${DB_NAME}"
-    DB_NEWNESS_FINDING="CREATE DATABASE was issued by this run against the local PostgreSQL server and succeeded, so '${DB_NAME}' did not exist an instant before it and no other writer can have been connected to it"
+    DB_CREATED_SERVER_IDENTITY="${created_identity}"
+    DB_NEWNESS_FINDING="CREATE DATABASE was issued by this run on the server that answered '${created_identity}' and succeeded, and a connection opened to ${DB_HOST}:${DB_PORT}/${DB_NAME} the way the application opens its own answered with the same identity — so '${DB_NAME}' did not exist an instant before this run created it, on the server about to be migrated"
     success "Database '${DB_NAME}' was CREATED by this run — the server refused no duplicate, so it did not exist before."
+    success "And it is the server the migration will use: the connection that created it and a connection to ${DB_HOST}:${DB_PORT} report the same postmaster, port and database oid."
     return 0
   fi
-  if printf '%s' "${output}" | grep -qiE 'already exists|42P04'; then
+  if printf '%s' "${output}" | grep -q '42P04'; then
     DB_CREATED_BY_THIS_RUN=false
-    DB_NEWNESS_FINDING="database '${DB_NAME}' already existed on this server — CREATE DATABASE was refused as a duplicate — so this run did not create it and cannot say who else is using it"
+    DB_NEWNESS_FINDING="database '${DB_NAME}' already existed on this server — CREATE DATABASE was refused as a duplicate (SQLSTATE 42P04) — so this run did not create it and cannot say who else is using it"
     warn "Database '${DB_NAME}' already existed. This run did NOT create it, so it is treated as a live database and this run is fenced."
     return 0
   fi
-  die "Creating database '${DB_NAME}' failed for a reason that is not 'it already exists', so this run cannot say whether that database exists, is reachable, or is safe to migrate. NOTHING HAS BEEN MIGRATED. psql said: ${output}"
+  die "Creating database '${DB_NAME}' failed for a reason that is not SQLSTATE 42P04 duplicate_database, so this run cannot say whether that database exists, is reachable, or is safe to migrate. NOTHING HAS BEEN MIGRATED. psql said: ${output}"
+}
+
+
+# ---------------------------------------------------------------------------
+# THE APPLICATION ROLE: WHAT MAY HAPPEN BEFORE THE RUN KNOWS IT MAY PROCEED, AND WHAT MAY NOT
+# (o3d-2sm1.5 r37, Codex HIGH)
+#
+# Split in two, along exactly one line: whether the statement can take something away from a
+# client that is using this database right now.
+#
+#   ensure_database_role_exists()              creates the role IF IT IS ABSENT. Nothing can be
+#                                              connected as a role that does not exist, so this
+#                                              is safe at any point, and the fence preflight
+#                                              needs it to have happened.
+#   provision_database_role_and_privileges()   rotates the password of a role that WAS already
+#                                              there, grants on the database and moves its
+#                                              OWNER. Every one of those is felt by somebody
+#                                              else's connection, so none of them may run until
+#                                              this run has classified the cutover and, on the
+#                                              fenced path, until require_fenceable_database()
+#                                              has proved the window can be held closed.
+#
+# WHY NOT LATER STILL — after the fence is actually RAISED, which is where the finding's wording
+# points. The fence is raised only after the predecessor has been STOPPED, and the build runs
+# before the stop, deliberately, so that a release that will not compile costs no outage. That
+# build is handed DATABASE_URL and touches the database. Moving the password rotation past the
+# raise therefore hands the build a credential the server does not have yet, and turns "the
+# release does not build" into "the release does not build, on a box that has been stopped".
+# The reachable, and correct, boundary is the one below: NO refusal that says "nothing has been
+# stopped and nothing has been migrated" may follow a credential change, and after this call
+# every remaining refusal is about THIS host's artefact — the build, BUILD_ID, the port still
+# being bound — not about whether the run was allowed to touch the database at all.
+# ---------------------------------------------------------------------------
+
+# Was the application role already on this server when this run arrived? Decided by the CREATE,
+# on the same "let the server answer" principle as the database: a SELECT beforehand would be a
+# statement about an instant, and the role can appear between the question and the statement.
+DB_ROLE_PREEXISTED=false
+# Set when this run has changed the password of a role it did not create, so a later banner can
+# say so instead of claiming the box is untouched.
+DB_ROLE_CREDENTIALS_ROTATED=false
+
+ensure_database_role_exists() {
+  local output="" status=0
+  output="$(pg_local_psql -q <<EOSQL 2>&1
+    CREATE USER "${DB_USER}" WITH PASSWORD '${DB_PASSWORD}';
+EOSQL
+  )" || status=$?
+  if [[ "${status}" -eq 0 ]]; then
+    DB_ROLE_PREEXISTED=false
+    success "Role '${DB_USER}' was CREATED by this run — it did not exist before, so nothing was connected as it."
+    return 0
+  fi
+  # 42710 duplicate_object: the role was already there. Recognised by SQLSTATE and not by the
+  # message, for the reason 42P04 is: the message is localised, the SQLSTATE is not.
+  if printf '%s' "${output}" | grep -q '42710'; then
+    DB_ROLE_PREEXISTED=true
+    info "Role '${DB_USER}' already exists on this server. Its password is NOT changed here: that is"
+    info "deferred until this run has classified the cutover, so a refusal cannot land after it."
+    return 0
+  fi
+  die "Creating the application role '${DB_USER}' failed for a reason that is not SQLSTATE 42710 duplicate_object, so this run cannot say whether that role exists or what it can do. NOTHING HAS BEEN MIGRATED and no password has been changed. psql said: ${output}"
+}
+
+# @install-phase: database-provision
+#
+# The mutating half, run only once the run knows it may proceed. Idempotent: on an ordinary
+# re-install the GRANT and the OWNER change are already true and the ALTER sets the password to
+# the value that is about to be written into .env.
+provision_database_role_and_privileges() {
+  [[ "${INSTALL_POSTGRES}" == "y" ]] || return 0
+
+  if ${DB_ROLE_PREEXISTED}; then
+    pg_local_psql -q >/dev/null <<EOSQL || die "Setting the password of the existing role '${DB_USER}' failed, so ${APP_DIR}/.env now names a credential the server does not have. NOTHING HAS BEEN MIGRATED. Fix the role by hand or re-run."
+      ALTER USER "${DB_USER}" WITH PASSWORD '${DB_PASSWORD}';
+EOSQL
+    DB_ROLE_CREDENTIALS_ROTATED=true
+    warn "The password of the PRE-EXISTING role '${DB_USER}' has been changed to the one this run wrote into ${APP_DIR}/.env. Any other client still authenticating as ${DB_USER} with the previous password is refused from its next connection onwards."
+  fi
+
+  pg_local_psql -q >/dev/null <<EOSQL || die "Granting '${DB_USER}' on database '${DB_NAME}' failed. NOTHING HAS BEEN MIGRATED."
+    GRANT ALL PRIVILEGES ON DATABASE "${DB_NAME}" TO "${DB_USER}";
+    ALTER DATABASE "${DB_NAME}" OWNER TO "${DB_USER}";
+EOSQL
+  success "Database '${DB_NAME}' and user '${DB_USER}' ready."
 }
 
 # THE EXEMPTION IS EARNED, NEVER INFERRED FROM WHAT IS ABSENT ON THIS HOST. Returns 0 only when
@@ -2690,6 +2972,17 @@ on_cutover_exit() {
     warn "  service     : UNTOUCHED. Nothing was stopped, so nothing needs starting."
     warn "  schema      : untouched — the migration was never invoked."
     warn "  database    : never fenced; the application still has CONNECT."
+    # AND IF THIS RUN DID CHANGE A CREDENTIAL, THE BANNER SAYS SO (o3d-2sm1.5 r37, Codex HIGH).
+    # The ordering fix means no DATABASE refusal can reach here after a password change — the
+    # role work happens once the fence has been proved possible — but a BUILD failure can, and a
+    # banner that says "nothing has to be recovered first" over a rotated credential is the same
+    # untrue refusal one step further down.
+    if ${DB_ROLE_CREDENTIALS_ROTATED}; then
+      warn "  credentials : the password of the PRE-EXISTING role ${DB_USER} was changed to the one"
+      warn "                in ${APP_DIR}/.env, so those two agree and this host is consistent."
+      warn "                Any OTHER client still using the previous password for ${DB_USER} needs"
+      warn "                the new one. Nothing else about the database was changed."
+    fi
     unwind_arming
     warn "  Fix the cause and re-run. Nothing has to be recovered first."
     exit "${status}"
@@ -3136,26 +3429,41 @@ if [[ "$INSTALL_POSTGRES" == "y" ]]; then
     success "PostgreSQL already installed."
   fi
 
+  # @install-phase: database-newness
+  #
+  # EVERYTHING HERE IS EITHER A QUESTION OR A CREATION (o3d-2sm1.5 r37, Codex HIGH). This block
+  # used to CREATE OR ALTER the application role and its password, then decide newness, then
+  # GRANT and change the database's OWNER — all of it before this run had asked whether it is a
+  # cutover and long before it had established that it could fence one. On a fresh application
+  # host pointed at a PRE-EXISTING, LIVE database, a missing DEPLOY_ADMIN_DATABASE_URL or a
+  # missing fence artefact then aborted the run 400 lines later, saying "nothing has been stopped
+  # and nothing has been migrated" — over a database whose application role had already had its
+  # password changed and whose ownership had already moved. Existing writers lost their
+  # reconnect, and the refusal claimed the box was untouched.
+  #
+  # It is the principle this file already applies everywhere else, arriving late at the one place
+  # that needed it most: A REFUSAL IS ONLY SAFE AT A POINT WHERE REFUSING LEAVES THE SYSTEM
+  # CONSISTENT. So what stays here is only what a run must do to ANSWER the question, and only
+  # what cannot take anything away from anybody:
+  #
+  #   ensure_database_role_exists         CREATEs the role when it is absent; an absent role has
+  #                                       no clients, so creating it changes nothing for anyone.
+  #                                       On a role that is ALREADY there it does nothing at all
+  #                                       and records that fact. It is here rather than later
+  #                                       because fence-db-connections.mjs --preflight refuses
+  #                                       outright when --app-user names a role that does not
+  #                                       exist, so the preflight that gates the fenced path
+  #                                       needs the role to be present to answer.
+  #   create_database_and_record_newness  CREATE DATABASE, which either creates a database that
+  #                                       by definition had no writers, or is refused as a
+  #                                       duplicate. Neither outcome alters an existing object.
+  #
+  # THE ALTER, THE GRANT AND THE OWNER CHANGE MOVED to provision_database_role_and_privileges(),
+  # which runs after this run knows which path it is on and — on a cutover — after
+  # require_fenceable_database() has proved a fence is possible.
   info "Creating database '${DB_NAME}' and user '${DB_USER}'..."
-  run_as_user postgres psql -v ON_ERROR_STOP=1 <<-EOSQL
-    DO \$\$
-    BEGIN
-      IF NOT EXISTS (SELECT FROM pg_catalog.pg_user WHERE usename = '${DB_USER}') THEN
-        CREATE USER "${DB_USER}" WITH PASSWORD '${DB_PASSWORD}';
-      ELSE
-        ALTER USER "${DB_USER}" WITH PASSWORD '${DB_PASSWORD}';
-      END IF;
-    END
-    \$\$;
-EOSQL
-
+  ensure_database_role_exists
   create_database_and_record_newness
-
-  run_as_user postgres psql -v ON_ERROR_STOP=1 <<-EOSQL
-    GRANT ALL PRIVILEGES ON DATABASE "${DB_NAME}" TO "${DB_USER}";
-    ALTER DATABASE "${DB_NAME}" OWNER TO "${DB_USER}";
-EOSQL
-  success "Database '${DB_NAME}' and user '${DB_USER}' ready."
 fi
 
 DATABASE_URL="postgresql://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}"
@@ -3601,8 +3909,21 @@ if ${FENCED_CUTOVER}; then
   acquire_cutover_lock
   import_legacy_cutover_state
   adopt_existing_fence
+
+  # AND ONLY NOW IS THE DATABASE'S ROLE TOUCHED (o3d-2sm1.5 r37, Codex HIGH). Everything above
+  # this line either asked a question or created something that did not exist; every refusal
+  # above it — no DEPLOY_ADMIN_DATABASE_URL, no fence artefact, a preflight the database itself
+  # rejected, a cutover lock somebody else holds — therefore lands on a database whose
+  # application role still has the password its existing clients are using, and whose owner is
+  # unchanged. The fence has been proved possible, and an adopted one is already standing.
+  provision_database_role_and_privileges
 else
   first_install_fence_policy
+
+  # Nothing is serving, no crontab is live, and create_database_and_record_newness() proved this
+  # run created the database on the server it is about to migrate — so there is no client whose
+  # credentials this can take away.
+  provision_database_role_and_privileges
 fi
 
 # ---------------------------------------------------------------------------
