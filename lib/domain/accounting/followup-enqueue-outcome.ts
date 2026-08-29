@@ -45,7 +45,7 @@
  * all: it advertises a branch that never runs and describes a refusal an operator will never see.
  * See the header on `slot_lost`, which was exactly that.
  */
-export type FollowUpEnqueueRefusalReason =
+export type FollowUpEnqueueDeclineReason =
   /** `planFollowUpEnqueue` refused: several FAILED rows for this scope under DIFFERENT tokens. */
   | 'plan_refused'
   /** o3d-0m56: the ledger would not confirm the attempt is absent, so re-posting could duplicate it. */
@@ -65,6 +65,38 @@ export type FollowUpEnqueueRefusalReason =
    * replacement does not cover is kept: the revival is refused, visibly, with a remedy.
    */
   | 'unprobed_unfenced_reuse'
+
+/**
+ * o3d-batch-ret ROUND 6 (Codex HIGH) — A REFUSAL THAT HAPPENS BEFORE THE ENQUEUE IS EVER CALLED.
+ *
+ * The three above are the enqueue's own: `enqueueFollowUpSyncLog` was reached, looked at the row
+ * history or the ledger, and declined. This one is raised by the CONNECTOR, one frame up, when the
+ * post path was asked for a payment (`_registerPayment`) and the payment-account configuration
+ * cannot name an account to register it against — so the enqueue is never attempted at all.
+ *
+ * IT IS A SEPARATE SUB-VOCABULARY BECAUSE THE COUNT IS LOAD-BEARING. Three prose sites state how
+ * many ways THE ENQUEUE declines, and `followup-enqueue-refusal-vocabulary.test.ts` holds them to
+ * the declaration. Folding a caller-side refusal into that union would have made all three sites
+ * wrong in the safe-looking direction — a number that is too big describes refusals the enqueue does
+ * not have — so the two sets are named separately and each is counted against what it is about.
+ */
+export type FollowUpPreEnqueueRefusalReason =
+  /**
+   * `_registerPayment` was requested and no bank account could be resolved for it: either no payment
+   * account map is configured at all, or none maps this method/currency pair. Nothing was queued.
+   *
+   * BEFORE THIS EXISTED THE SKIP WAS REPORTED AS SUCCESS. `paymentOutcome` was initialised to
+   * `FOLLOW_UPS_ENQUEUED` and these two branches only wrote a WARNING to the activity log, so the
+   * aggregate verdict said `enqueued: true`, `obligationReleasePrerequisite` handed the fence no
+   * prerequisite, and the fence CLEARED the obligation generation over a payment that had been
+   * requested and never queued. On Xero the sweep could no longer find the row; on QuickBooks, whose
+   * registry entry declares no consumer at all, the money was lost permanently. Repairing the
+   * mapping afterwards could not re-drive a marker that no longer existed.
+   */
+  'payment_account_unmapped'
+
+/** Every reason a follow-up can be reported as still owed — the enqueue's own, and the caller's. */
+export type FollowUpEnqueueRefusalReason = FollowUpEnqueueDeclineReason | FollowUpPreEnqueueRefusalReason
 
 export type FollowUpEnqueueRefusal = {
   type: string
@@ -100,6 +132,42 @@ export const FOLLOW_UPS_ENQUEUED: FollowUpEnqueueOutcome = { enqueued: true }
 export function refusedFollowUpEnqueue(...refusals: FollowUpEnqueueRefusal[]): FollowUpEnqueueOutcome {
   if (refusals.length === 0) throw new Error('refusedFollowUpEnqueue requires at least one refusal')
   return { enqueued: false, refusals }
+}
+
+/**
+ * THE ONE SENTENCE BOTH CONNECTORS SAY WHEN A REQUESTED PAYMENT CANNOT BE QUEUED (o3d-batch-ret r6,
+ * Codex HIGH).
+ *
+ * Written here rather than twice, because the two connectors had the identical defect and the r7/r8
+ * lesson is that a message duplicated across surfaces drifts until one of the copies authorises
+ * something the other forbids. What CANNOT be shared is what happens next: on Xero the marker is
+ * re-read by a sweep, on QuickBooks nothing re-reads it at all. That difference is a declared fact
+ * about the connector, so `recovery` comes in from
+ * `followUpObligationRecoveryNote(followUpObligationRecoveryFor(...))` and is never written here —
+ * the same rule `xeroRetainedFollowUpObligationDescription` follows.
+ *
+ * IT NAMES NO HAND-MADE PAYMENT. The remedy is a SETTING, which is safe to repeat and cannot double
+ * anything; the recovery note then says whether the queued work comes back on its own. Telling an
+ * operator to register the receipt in the accounting package instead would be the o3d-0bfh r11
+ * defect on a new surface — no request id can deduplicate a payment a human entered by hand.
+ */
+export function paymentAccountRefusalMessage(input: {
+  /** Display name of the accounting package, for the operator: `Xero`, `QuickBooks`. */
+  connector: string
+  referenceType: string
+  referenceId: string
+  /** What the configuration failed to yield, as a clause: "no payment account map is configured". */
+  missing: string
+  /** Where the operator sets it, as a sentence. */
+  configure: string
+  /** The connector's declared recovery note — what re-reads the retained marker, if anything. */
+  recovery: string
+}): string {
+  return `Refused to enqueue the ${input.connector} INVOICE_PAYMENT for ${input.referenceType} ${input.referenceId}: `
+    + `the invoice asked for a payment to be registered and ${input.missing}. NOTHING WAS QUEUED, and the row is `
+    + 'deliberately left marked as owing follow-ups so the money is not reported as settled — it is SYNCED and '
+    + `carries its external id exactly like a row that completed. ${input.configure} What happens to this row once `
+    + `the setting is corrected is a fact about this connector, not a promise made here: ${input.recovery}.`
 }
 
 /** The refusals an outcome carries; empty for an enqueued one. */

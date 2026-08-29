@@ -41,6 +41,7 @@ import {
   combineFollowUpEnqueueOutcomes,
   obligationReleasePrerequisite,
   describeFollowUpEnqueueRefusals,
+  paymentAccountRefusalMessage,
   refusedFollowUpEnqueue,
   type FollowUpEnqueueOutcome,
 } from '@/lib/domain/accounting/followup-enqueue-outcome'
@@ -59,6 +60,7 @@ import {
   backReferenceHolder,
   findExternalDocumentIdClaim,
   claimFollowUpObligation,
+  followUpObligationRecoveryNote,
   isExternalDocumentIdConflict,
   releaseFollowUpObligation,
 } from '@/lib/domain/accounting/back-reference'
@@ -2087,6 +2089,132 @@ type FollowUpOutcome = FollowUpEnqueueOutcome & {
   obligationFenced: boolean
 }
 
+/**
+ * WHAT THE PAYMENT HALF OF THIS POST OWES — AND EVERY PATH OUT OF IT SAYS SO (o3d-batch-ret r6,
+ * Codex HIGH). THE TWIN OF THE XERO FUNCTION OF THE SAME NAME, AND THE DEFECT WAS WHOLE HERE TOO.
+ *
+ * THE DEFECT WAS THE INITIAL VALUE, NOT THE BRANCH. This was inline in `enqueueSalesInvoiceFollowUps`
+ * as `let paymentOutcome: FollowUpEnqueueOutcome = FOLLOW_UPS_ENQUEUED`, narrowed only by the arm
+ * that actually reached `enqueueFollowUpSyncLog`. The two configuration arms — no payment account map
+ * at all, and no account mapped for this method/currency — wrote a WARNING and fell out without
+ * touching it, so a payload that asked for a payment and queued NOTHING still reported
+ * `enqueued: true`, the fence was handed no prerequisite, and it CLEARED the obligation generation.
+ *
+ * AND THE BLAST RADIUS IS LARGER HERE THAN ON XERO. This connector's registry entry declares
+ * `consumer: 'none'`: nothing re-reads a retained marker, so the marker is not a deferral, it is the
+ * only EVIDENCE that the money is owed. Clearing it early does not delay the payment, it ends the
+ * trail — which is why the operator sentence below is composed out of that registry entry rather
+ * than out of Xero's "the next sweep will pick it up", and why correcting the mapping afterwards
+ * cannot recover a row this already cleared.
+ *
+ * A DEFAULT THAT MEANS SUCCESS ACQUIRES EVERY BRANCH THAT FORGETS TO NARROW IT. That is a class, not
+ * an instance. The decision is therefore a FUNCTION with a declared `Promise<FollowUpEnqueueOutcome>`
+ * return type and no accumulator to inherit: under `strict`, a path that reaches the end without
+ * returning is a COMPILE ERROR (ts2366), not a silent claim of success.
+ *
+ * Behaviourally instrumented in tests/connectors/quickbooks-payment-mapping-refusal.test.ts, which
+ * drives the real `processPendingQuickBooksSync` and asserts the marker SURVIVES the pass.
+ */
+async function decideInvoicePaymentFollowUp(
+  referenceType: string,
+  referenceId: string,
+  payload: SyncPayload,
+  postedInvoiceId: string,
+): Promise<FollowUpEnqueueOutcome> {
+  // Nobody asked for a payment, so none is owed. STATED, not inherited from an initialiser.
+  if (!payload._registerPayment) return FOLLOW_UPS_ENQUEUED
+
+  const paymentMap = await getPaymentAccountMap()
+  const method = payload._paymentMethod as string || ''
+  const currency = payload.currency as string || 'GBP'
+
+  /**
+   * The two configuration arms, which differ only in WHICH sentence an operator reads. The remedy is
+   * a SETTING — safe to repeat, and it cannot double anything — and what follows the correction is
+   * read off this connector's registry entry, which says nothing re-drives the row.
+   */
+  const refuse = async (missing: string, configure: string): Promise<FollowUpEnqueueOutcome> => {
+    const message = paymentAccountRefusalMessage({
+      connector: 'QuickBooks',
+      referenceType,
+      referenceId,
+      missing,
+      configure,
+      recovery: followUpObligationRecoveryNote(QBO_FOLLOW_UP_RECOVERY),
+    })
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'quickbooks_payment_skipped',
+      tag: 'sync',
+      level: 'WARNING',
+      description: message,
+      metadata: {
+        type: 'INVOICE_PAYMENT',
+        referenceType,
+        referenceId,
+        reason: 'payment_account_unmapped',
+        method,
+        currency,
+      },
+    })
+    return refusedFollowUpEnqueue({
+      type: 'INVOICE_PAYMENT', referenceType, referenceId, reason: 'payment_account_unmapped', message,
+    })
+  }
+
+  if (!paymentMap || Object.keys(paymentMap).length === 0) {
+    return await refuse(
+      'no payment account map is configured',
+      'Set up a bank account for each payment method under Settings → Accounting → Payment Account Mapping.',
+    )
+  }
+  const stored = lookupPaymentAccount(paymentMap, method, currency)
+  if (!stored) {
+    return await refuse(
+      `no bank account is mapped for method "${method}" / currency "${currency}"`,
+      'Add that mapping under Settings → Accounting → Payment Account Mapping.',
+    )
+  }
+
+  let amount = payload._paymentAmount as number | undefined
+  if (amount == null && typeof payload._paymentAmount === 'string') {
+    amount = Number(payload._paymentAmount)
+  }
+  if (amount == null) {
+    amount = (payload.lines as Array<{ quantity: number; unitAmount: number }>).reduce((s, l) => s + l.quantity * l.unitAmount, 0)
+      + ((payload.shippingAmount as number) || 0)
+      - ((payload.discountAmount as number) || 0)
+  }
+
+  // NOTHING TO MOVE IS NOT A REFUSAL, and it is stated rather than fallen into. A non-positive
+  // amount owes no payment: QuickBooks would reject it, and there is no configuration for an
+  // operator to correct. The distinction this function exists for is between "no follow-up is owed"
+  // and "one is owed and was not queued" — this arm is the first, and it says so out loud.
+  if (!(amount > 0)) return FOLLOW_UPS_ENQUEUED
+
+  // Resolve QBO customer ID for the payment request
+  let customerRef: string | undefined
+  if (referenceType === 'SalesOrder') {
+    const order = await db.salesOrder.findUnique({
+      where: { id: referenceId },
+      select: { customer: { select: { accountingContactId: true, accountingContactProvenance: true } } },
+    })
+    // Provenance-guarded (o3d-6nd): only enqueue an id that belongs to the active company, so a
+    // follow-up queued now cannot carry a former realm's id.
+    customerRef = (await customerContactIdIfCurrent(order?.customer)) ?? undefined
+  }
+
+  return await enqueueFollowUpSyncLog('INVOICE_PAYMENT', referenceType, referenceId, {
+    accountingInvoiceId: postedInvoiceId,
+    bankAccountId: stored,
+    amount,
+    paymentDate: (payload._paymentDate as string)?.slice(0, 10) || new Date().toISOString().slice(0, 10),
+    currency,
+    method,
+    customerRef,
+  })
+}
+
 async function enqueueSalesInvoiceFollowUps(
   /** o3d-0bfh r15: the sync-log row that carries the obligation marker this pass may clear. */
   entryId: string,
@@ -2109,68 +2237,10 @@ async function enqueueSalesInvoiceFollowUps(
   const postedInvoiceId: string = syncResult.externalId
   // o3d-peh1: the PAYMENT's outcome is kept and folded in with the PDF's at the end. Both are still
   // attempted; a refused payment is no reason to withhold the PDF.
-  let paymentOutcome: FollowUpEnqueueOutcome = FOLLOW_UPS_ENQUEUED
-
-  if (payload._registerPayment) {
-    const paymentMap = await getPaymentAccountMap()
-    const method = payload._paymentMethod as string || ''
-    const currency = payload.currency as string || 'GBP'
-
-    if (!paymentMap || Object.keys(paymentMap).length === 0) {
-      await logActivity({
-        entityType: 'SYSTEM',
-        action: 'quickbooks_payment_skipped',
-        tag: 'sync',
-        level: 'WARNING',
-        description: 'Skipped QuickBooks payment registration: no payment account map configured.',
-      })
-    } else {
-      const stored = lookupPaymentAccount(paymentMap, method, currency)
-      if (!stored) {
-        await logActivity({
-          entityType: 'SYSTEM',
-          action: 'quickbooks_payment_skipped',
-          tag: 'sync',
-          level: 'WARNING',
-          description: `Skipped QuickBooks payment registration: no bank account mapped for method "${method}" / currency "${currency}".`,
-        })
-      } else {
-        let amount = payload._paymentAmount as number | undefined
-        if (amount == null && typeof payload._paymentAmount === 'string') {
-          amount = Number(payload._paymentAmount)
-        }
-        if (amount == null) {
-          amount = (payload.lines as Array<{ quantity: number; unitAmount: number }>).reduce((s, l) => s + l.quantity * l.unitAmount, 0)
-            + ((payload.shippingAmount as number) || 0)
-            - ((payload.discountAmount as number) || 0)
-        }
-
-        if (amount > 0) {
-          // Resolve QBO customer ID for the payment request
-          let customerRef: string | undefined
-          if (referenceType === 'SalesOrder') {
-            const order = await db.salesOrder.findUnique({
-              where: { id: referenceId },
-              select: { customer: { select: { accountingContactId: true, accountingContactProvenance: true } } },
-            })
-            // Provenance-guarded (o3d-6nd): only enqueue an id that belongs to the active company, so a
-            // follow-up queued now cannot carry a former realm's id.
-            customerRef = (await customerContactIdIfCurrent(order?.customer)) ?? undefined
-          }
-
-          paymentOutcome = await enqueueFollowUpSyncLog('INVOICE_PAYMENT', referenceType, referenceId, {
-            accountingInvoiceId: syncResult.externalId,
-            bankAccountId: stored,
-            amount,
-            paymentDate: (payload._paymentDate as string)?.slice(0, 10) || new Date().toISOString().slice(0, 10),
-            currency,
-            method,
-            customerRef,
-          })
-        }
-      }
-    }
-  }
+  //
+  // o3d-batch-ret r6 (Codex HIGH), CROSS-PORTED WITH THE XERO PATH: a `const` from a function that
+  // must return, never a `let` seeded with success. See `decideInvoicePaymentFollowUp`.
+  const paymentOutcome = await decideInvoicePaymentFollowUp(referenceType, referenceId, payload, postedInvoiceId)
 
   const pdfOutcome = await enqueueFollowUpSyncLog('INVOICE_PDF', referenceType, referenceId, {
     accountingInvoiceId: syncResult.externalId,

@@ -60,6 +60,7 @@ import {
   combineFollowUpEnqueueOutcomes,
   obligationReleasePrerequisite,
   describeFollowUpEnqueueRefusals,
+  paymentAccountRefusalMessage,
   refusedFollowUpEnqueue,
   type FollowUpEnqueueOutcome,
 } from '@/lib/domain/accounting/followup-enqueue-outcome'
@@ -7097,6 +7098,124 @@ export function xeroRetainedFollowUpObligationDescription(entryId: string): stri
     + 'accounting-sync run, READ the invoice in Xero, record what is actually present, and ESCALATE that reading.'
 }
 
+/**
+ * WHAT THE PAYMENT HALF OF THIS POST OWES — AND EVERY PATH OUT OF IT SAYS SO (o3d-batch-ret r6,
+ * Codex HIGH).
+ *
+ * THE DEFECT WAS THE INITIAL VALUE, NOT THE BRANCH. This was inline in `enqueueSalesInvoiceFollowUps`
+ * as `let paymentOutcome: FollowUpEnqueueOutcome = FOLLOW_UPS_ENQUEUED`, narrowed only by the arm
+ * that actually reached `enqueueFollowUpSyncLog`. The two configuration arms — no payment account map
+ * at all, and no account mapped for this method/currency — wrote a WARNING and fell out without
+ * touching it, so a payload that asked for a payment (`_registerPayment`) and queued NOTHING still
+ * produced `enqueued: true`. `combineFollowUpEnqueueOutcomes` then reported success,
+ * `obligationReleasePrerequisite` handed the fence no prerequisite, and the fence CLEARED the
+ * obligation generation — leaving a SYNCED, linked, marker-null row that the sweep reads as
+ * reconciled, with the payment never enqueued and no way for a repaired mapping to re-drive it.
+ *
+ * A DEFAULT THAT MEANS SUCCESS ACQUIRES EVERY BRANCH THAT FORGETS TO NARROW IT. That is a class, not
+ * an instance, and this is the shape that removes the class rather than this one member of it: the
+ * decision is a FUNCTION whose declared return type is `Promise<FollowUpEnqueueOutcome>` and whose
+ * body holds no accumulator at all. There is nothing to inherit, and under `strict` a path that
+ * reaches the end without returning is a COMPILE ERROR (ts2366, "lacks ending return statement"),
+ * not a silent claim of success. Adding a new configuration case here cannot repeat the defect: it
+ * either states its own verdict or it does not build.
+ *
+ * REFUSING IS THE FAIL-SAFE DIRECTION, AND IT IS NOT A STALL. The row keeps its obligation marker,
+ * which is exactly the state the Xero sweep re-reads: fix the mapping and the next accounting-sync
+ * run enqueues the payment and clears the generation then. That deferral is asserted behaviourally
+ * in tests/accounting/xero-payment-mapping-refusal.test.ts.
+ */
+async function decideInvoicePaymentFollowUp(
+  entryId: string,
+  referenceType: string,
+  referenceId: string,
+  payload: SyncPayload,
+  postedInvoiceId: string,
+  origin: AccountingOriginRecord,
+): Promise<FollowUpEnqueueOutcome> {
+  // Nobody asked for a payment, so none is owed. STATED, not inherited from an initialiser.
+  if (!payload._registerPayment) return FOLLOW_UPS_ENQUEUED
+
+  const paymentMap = await getPaymentAccountMap()
+  const method = payload._paymentMethod as string || ''
+  const currency = payload.currency as string || 'GBP'
+
+  /**
+   * The two configuration arms, which differ only in WHICH sentence an operator reads. The remedy is
+   * a SETTING — safe to repeat, and it cannot double anything — and what happens afterwards comes
+   * from the connector's registry entry rather than from a promise written here.
+   */
+  const refuse = async (missing: string, configure: string): Promise<FollowUpEnqueueOutcome> => {
+    const message = paymentAccountRefusalMessage({
+      connector: 'Xero',
+      referenceType,
+      referenceId,
+      missing,
+      configure,
+      recovery: followUpObligationRecoveryNote(followUpObligationRecoveryFor(XERO_CONNECTOR)),
+    })
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'xero_payment_skipped',
+      tag: 'sync',
+      level: 'WARNING',
+      description: message,
+      metadata: {
+        type: 'INVOICE_PAYMENT',
+        referenceType,
+        referenceId,
+        reason: 'payment_account_unmapped',
+        method,
+        currency,
+        sourceEntryId: entryId,
+      },
+    })
+    return refusedFollowUpEnqueue({
+      type: 'INVOICE_PAYMENT', referenceType, referenceId, reason: 'payment_account_unmapped', message,
+    })
+  }
+
+  if (!paymentMap || Object.keys(paymentMap).length === 0) {
+    return await refuse(
+      'no payment account map is configured',
+      'Set up a bank account for each payment method under Settings → Accounting → Payment Account Mapping.',
+    )
+  }
+  const stored = lookupPaymentAccount(paymentMap, method, currency)
+  if (!stored) {
+    return await refuse(
+      `no bank account is mapped for method "${method}" / currency "${currency}"`,
+      'Add that mapping under Settings → Accounting → Payment Account Mapping.',
+    )
+  }
+
+  let amount = payload._paymentAmount as number | undefined
+  if (amount == null && typeof payload._paymentAmount === 'string') {
+    amount = Number(payload._paymentAmount)
+  }
+  if (amount == null) {
+    amount = (payload.lines as Array<{ quantity: number; unitAmount: number }>).reduce((s, l) => s + l.quantity * l.unitAmount, 0)
+      + ((payload.shippingAmount as number) || 0)
+      - ((payload.discountAmount as number) || 0)
+  }
+
+  // NOTHING TO MOVE IS NOT A REFUSAL, and it is stated rather than fallen into. A non-positive
+  // amount owes no payment: Xero would reject it, and there is no configuration for an operator to
+  // repair. The distinction this whole function exists for is between "no follow-up is owed" and
+  // "one is owed and was not queued" — this arm is the first, and it says so out loud.
+  if (!(amount > 0)) return FOLLOW_UPS_ENQUEUED
+
+  return await enqueueFollowUpSyncLog('INVOICE_PAYMENT', referenceType, referenceId, {
+    accountingInvoiceId: postedInvoiceId,
+    bankAccountId: stored,
+    amount,
+    paymentDate: (payload._paymentDate as string)?.slice(0, 10) || new Date().toISOString().slice(0, 10),
+    currency,
+    method,
+    sourceEntryId: entryId,
+  }, { from: 'postedRow', record: origin })
+}
+
 async function enqueueSalesInvoiceFollowUps(
   entryId: string,
   referenceType: string,
@@ -7129,56 +7248,10 @@ async function enqueueSalesInvoiceFollowUps(
   // o3d-peh1: the PAYMENT's outcome is kept and folded in at the end. Both follow-ups are still
   // attempted — a refused payment is no reason to withhold the PDF, which is separate work — but the
   // caller must not be told the row is settled while the money half is still owed.
-  let paymentOutcome: FollowUpEnqueueOutcome = FOLLOW_UPS_ENQUEUED
-
-  if (payload._registerPayment) {
-    const paymentMap = await getPaymentAccountMap()
-    const method = payload._paymentMethod as string || ''
-    const currency = payload.currency as string || 'GBP'
-
-    if (!paymentMap || Object.keys(paymentMap).length === 0) {
-      await logActivity({
-        entityType: 'SYSTEM',
-        action: 'xero_payment_skipped',
-        tag: 'sync',
-        level: 'WARNING',
-        description: 'Skipped Xero payment registration: no payment account map configured. Go to Settings → Accounting → Payment Account Mapping to set up bank accounts for each payment method.',
-      })
-    } else {
-      const stored = lookupPaymentAccount(paymentMap, method, currency)
-      if (!stored) {
-        await logActivity({
-          entityType: 'SYSTEM',
-          action: 'xero_payment_skipped',
-          tag: 'sync',
-          level: 'WARNING',
-          description: `Skipped Xero payment registration: no bank account mapped for method "${method}" / currency "${currency}". Add a mapping in Settings → Accounting → Payment Account Mapping.`,
-        })
-      } else {
-        let amount = payload._paymentAmount as number | undefined
-        if (amount == null && typeof payload._paymentAmount === 'string') {
-          amount = Number(payload._paymentAmount)
-        }
-        if (amount == null) {
-          amount = (payload.lines as Array<{ quantity: number; unitAmount: number }>).reduce((s, l) => s + l.quantity * l.unitAmount, 0)
-            + ((payload.shippingAmount as number) || 0)
-            - ((payload.discountAmount as number) || 0)
-        }
-
-        if (amount > 0) {
-          paymentOutcome = await enqueueFollowUpSyncLog('INVOICE_PAYMENT', referenceType, referenceId, {
-            accountingInvoiceId: syncResult.externalId,
-            bankAccountId: stored,
-            amount,
-            paymentDate: (payload._paymentDate as string)?.slice(0, 10) || new Date().toISOString().slice(0, 10),
-            currency,
-            method,
-            sourceEntryId: entryId,
-          }, { from: 'postedRow', record: origin })
-        }
-      }
-    }
-  }
+  //
+  // o3d-batch-ret r6 (Codex HIGH): IT IS A `const` FROM A FUNCTION THAT MUST RETURN, NOT A `let`
+  // SEEDED WITH SUCCESS. See `decideInvoicePaymentFollowUp`.
+  const paymentOutcome = await decideInvoicePaymentFollowUp(entryId, referenceType, referenceId, payload, postedInvoiceId, origin)
 
   const pdfOutcome = await enqueueFollowUpSyncLog('INVOICE_PDF', referenceType, referenceId, {
     accountingInvoiceId: syncResult.externalId,
