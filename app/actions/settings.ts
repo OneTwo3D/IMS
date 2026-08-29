@@ -16,7 +16,7 @@ import { completePluginSelectionSave, type PluginSelectionSaveResult } from '@/l
 import { runPostCommit } from '@/lib/domain/post-commit'
 import { uniqueViolationTargetsField } from '@/lib/db/prisma-unique-violation'
 import type { SettingSaveResult } from '@/lib/domain/settings/setting-save-outcome'
-import { assertWritableSettingKeys } from '@/lib/domain/settings/reserved-setting-keys'
+import { assertWritableSettingKeys } from '@/lib/domain/settings/writable-setting-keys'
 import { reconcileCrontab } from '@/lib/crontab-reconcile'
 import { normalizePublicAppUrl } from '@/lib/domain/settings/public-app-url-input'
 import { toIsoCountryCode } from '@/lib/countries'
@@ -905,12 +905,12 @@ export async function getUsers(): Promise<UserOption[]> {
  * action has an outer `catch` that renders a rejection as a failed save. See `setSettings`.
  */
 export async function setSetting(key: string, value: string): Promise<SettingSaveResult> {
-  // The reserved-key refusal is asserted HERE TOO, not left to the delegation (Codex r19 HIGH).
+  // The allowlist is asserted HERE TOO, not left to the delegation (Codex r19 HIGH, r20 HIGH).
   // `setSettings` runs the same check and this call would reach it — today. Both are exported
   // server actions, i.e. two separately addressable endpoints, and an endpoint whose authorization
   // depends on where it happens to forward to is one refactor away from having none. The cost is
-  // one duplicated line; `tests/settings/reserved-setting-keys.test.ts` proves each route refuses
-  // on its own.
+  // one duplicated line; `tests/settings/writable-setting-keys.test.ts` proves each route refuses
+  // on its own, for every family.
   assertWritableSettingKeys([key])
   return setSettings({ [key]: value })
 }
@@ -955,23 +955,24 @@ export async function setSettings(values: Record<string, string>): Promise<Setti
   const entries = Object.entries(values)
   if (entries.length === 0) return { status: 'saved' }
 
-  // RESERVED KEYS ARE REFUSED BEFORE ANYTHING IS COMMITTED (Codex r19 HIGH).
+  // ONLY ALLOWLISTED PREFERENCE KEYS ARE WRITTEN, AND THE CHECK IS BEFORE THE COMMIT
+  // (Codex r19 HIGH; the shape corrected r20 HIGH).
   //
-  // This was, until r19, a hand-written loop over the integration plugin flags alone — round 5's
-  // finding, fixed at the family that was being looked at that round. The flags are refused for a
-  // reason that generalises exactly: they are SYSTEM-MANAGED, other writers make destructive
-  // decisions from their value, and changing one through a generic key/value writer is neither
-  // atomic nor serialized against those readers. Every system-managed key added since (the
-  // accounting binding pins, the maintenance fence, the lock leases) had the same property and none
-  // of them was listed, because the list was inline here rather than somewhere a new key could join
-  // it. `setSetting` and `setSettings` are both exported server actions taking an arbitrary key, so
-  // a principal with 'settings.company' could name any of them.
+  // This was, until r19, a hand-written loop over the integration plugin flags alone. r19 replaced
+  // it with a DENYLIST of the system-managed families — and that was still the wrong shape, because
+  // a denylist over a growing key space is only as complete as the last search for keys. It was
+  // already incomplete when it was written: `MACHINE_MANAGED_SYNC_KEYS` in `app/actions/wc-sync.ts`
+  // was not in it, so `wc_initial_import_completed` — the completion flag THIS BRANCH had just made
+  // refusal-blocking — and the WooCommerce sync cursors were writable by any principal holding
+  // `settings.company`, as were the `wc_url`/`wc_consumer_*` credential rows that `saveWcCredentials`
+  // guards with validation, a fresh-auth gate, a lock and a version bump.
   //
-  // The set, and the reason each family is in it, now live in
-  // lib/domain/settings/reserved-setting-keys.ts. THROWN, not returned, for the reason the plugin
-  // check was: no screen offers these keys, so reaching here is a call-site bug or a hand-invoked
-  // action, not an outcome an operator can act on — and it happens before the transaction, so
-  // nothing is committed.
+  // So the rule is inverted. `lib/domain/settings/writable-setting-keys.ts` enumerates the ordinary
+  // operator preferences the settings screens offer, and EVERYTHING ELSE IS REFUSED — including a
+  // key nobody has thought about yet, which is the case the denylist could never cover. THROWN, not
+  // returned: no screen offers an unlisted key, so reaching here is a call-site bug or a
+  // hand-invoked action, not an outcome an operator can act on — and it happens before the
+  // transaction, so nothing is committed.
   assertWritableSettingKeys(entries.map(([key]) => key))
 
   await db.$transaction(async (tx) => {

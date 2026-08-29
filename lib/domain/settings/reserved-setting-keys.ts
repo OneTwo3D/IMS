@@ -2,35 +2,29 @@ import { INTEGRATION_PLUGIN_KEYS_IN_LOCK_ORDER } from '@/lib/integration-plugin-
 import { ACCOUNTING_BINDING_SETTING_KEYS } from '@/lib/connectors/accounting-binding-lock-order'
 
 /**
- * THE `settings` KEYS A GENERIC WRITER MAY NOT WRITE (Codex r19 HIGH).
+ * WHICH WRITER OWNS A SYSTEM-MANAGED `settings` KEY — A MESSAGE TABLE, NOT A GATE (Codex r20 HIGH).
  *
- * `settings` is one key/value table serving two completely different kinds of row, and until this
- * module existed only one of them was defended:
+ * THIS MODULE NO LONGER DECIDES ANYTHING. Round 19 made it the generic writers' guard: a DENYLIST of
+ * the system-managed families, joined from the modules that own them. Round 20 showed the shape was
+ * wrong rather than the contents — a denylist over a growing key space is only ever as complete as
+ * the last search for keys, and this one had already missed `MACHINE_MANAGED_SYNC_KEYS`
+ * (`wc_initial_import_completed`, the WooCommerce sync cursors) and the WooCommerce credential rows.
  *
- *   • OPERATOR PREFERENCES — a retention window, a financial year start, an invoice trigger. A
- *     screen offers them, an operator chooses a value, and `setSettings` writes whatever was chosen.
- *     Any value is as legitimate as any other.
- *   • SYSTEM-MANAGED ROWS — a lock lease, a connector binding pin, a maintenance fence, a record of
- *     something that happened. No screen offers them. Their value is a FACT the system established,
- *     and a caller-supplied value is not a choice, it is a falsified fact.
+ * The gate is now an ALLOWLIST of the ordinary operator preferences, in
+ * `lib/domain/settings/writable-setting-keys.ts`, and it SUPERSEDES this list completely: every key
+ * named here was already refused by not being a listed preference, before this file was consulted.
+ * There are not two half-guards. There is one guard, and this is the table it looks a refused key up
+ * in to say WHICH WRITER may make the change — because a refusal that only says "no" sends the next
+ * caller looking for a way around it.
  *
- * `setSetting`/`setSettings` are exported server actions taking an arbitrary key, so they are their
- * own addressable endpoints: a principal holding `settings.company` — the gate the retention screen
- * needs — could name a system-managed key and write it. Round 18's cutoff row was found that way,
- * but the hole was never about that row. It is that the generic writer had a list of exactly ONE
- * refused family (the integration plugin flags), hand-written inline, so every system-managed key
- * added since has been writable and every one added next would be too.
+ * WHAT THAT MEANS FOR MAINTENANCE. A new system-managed key does NOT need an entry here to be safe;
+ * it is safe by default. An entry here buys one thing: a better sentence when someone tries. Add one
+ * when the owning writer is non-obvious, and do not treat a missing entry as a hole.
  *
- * SO THE RULE IS A LIST, JOINED, NOT A MEMORY. Each family below is imported from the module that
- * already owns it wherever that module is import-free, and stated as a literal (checked by
- * `tests/settings/reserved-setting-keys.test.ts` against the owning constant) where importing it
- * would drag `@/lib/db` into a module the server actions load eagerly. Protecting a NEW
- * system-managed key is one line here, not a rediscovery of this reasoning.
- *
- * WHAT THIS IS NOT. It is an application-level choke point on the two writers that accept a
- * caller-supplied key. It does not stop the owning module writing its own row — that is the point —
- * and it is not a database constraint. See `docs/installation.md` for why a database-enforced
- * version needs a migration, and what that migration would have to be.
+ * Each family below is imported from the module that already owns it wherever that module is
+ * import-free, and stated as a literal (checked by `tests/settings/reserved-setting-keys.test.ts`
+ * against the owning constant) where importing it would drag `@/lib/db` into a module the server
+ * actions load eagerly.
  */
 
 /**
@@ -60,15 +54,27 @@ const MAINTENANCE_FENCE_SETTING_KEYS = [
 const LEASE_SETTING_KEYS = ['mintsoft_auth_lock'] as const
 
 /**
- * Families whose keys are BUILT at run time and so cannot appear in any exact list.
+ * Families whose keys are BUILT at run time and so can never appear in any exact list.
  *
- * The dispatch sweep claims one alert per connector per UTC day by inserting
- * `wms_dispatch_unresolved_drift:<connector>:<date>` (`lib/domain/wms/dispatch-sweep.ts`). Writing
- * one by hand silences that day's primary-admin alert while inbound sync stays held back. An exact
- * list cannot hold a key that does not exist until the day it is claimed, so the prefix is what
- * joins the list instead.
+ * These are the clearest illustration of why the gate had to be inverted: an exact denylist cannot
+ * hold a key that does not exist until the moment a process claims it, and BOTH of these families
+ * were being written by a running system while no list named them.
+ *
+ *   • `wms_dispatch_unresolved_drift:<connector>:<date>` — the dispatch sweep claims one alert per
+ *     connector per UTC day (`lib/domain/wms/dispatch-sweep.ts`). Writing one by hand silences that
+ *     day's primary-admin alert while inbound sync stays held back.
+ *   • `wms_dispatch_unresolved_streak:<connector>` — the persisted drift incident itself
+ *     (`unresolvedDriftStateKey`, `lib/domain/wms/unresolved-drift.ts`). Its stored value is what the
+ *     operator's isolate action compare-and-sets against, so a hand-written one either fabricates a
+ *     cohort to isolate or invalidates the page of an operator about to act on a real one.
+ *
+ * Both are refused because they are not listed preferences. The prefixes are here so the refusal
+ * names the family instead of ending at "unrecognised".
  */
-const RESERVED_SETTING_KEY_PREFIXES: readonly string[] = ['wms_dispatch_unresolved_drift:']
+const RESERVED_SETTING_KEY_PREFIXES: readonly string[] = [
+  'wms_dispatch_unresolved_drift:',
+  'wms_dispatch_unresolved_streak:',
+]
 
 /**
  * Every reserved key, mapped to the sentence a refusal states.
@@ -103,7 +109,12 @@ export const RESERVED_SETTING_KEYS: readonly string[] = [...RESERVED_SETTING_KEY
 export { RESERVED_SETTING_KEY_PREFIXES }
 
 /**
- * The refusal for `key`, or `null` when a generic writer may write it.
+ * The sentence to refuse `key` with when a named writer owns it, or `null` when no entry here does.
+ *
+ * `null` DOES NOT MEAN WRITABLE. Since round 20 the decision belongs entirely to
+ * `settingKeyWriteRefusal` in `writable-setting-keys.ts`, which refuses everything outside its
+ * allowlist and calls this only to improve the message. A key this returns `null` for is still
+ * refused — it just gets the generic sentence.
  *
  * Exact match first, then prefix — a run-time-built key has no entry of its own, so its family's
  * reason is the one that applies.
@@ -116,19 +127,4 @@ export function reservedSettingKeyRefusal(key: string): string | null {
     return `${key} belongs to the system-managed '${prefix}*' family and is written only by the process that claims it.`
   }
   return null
-}
-
-/**
- * Refuse a write that names a reserved key, BEFORE anything is committed.
- *
- * THROWN, not returned, for the reason the integration-plugin check was: no screen offers any of
- * these keys, so reaching here is either a call-site bug or a server action invoked directly by
- * hand. Neither is an outcome an operator can act on, and a returned `refused` would ask fourteen
- * settings screens to render a message none of them can ever produce.
- */
-export function assertWritableSettingKeys(keys: Iterable<string>): void {
-  for (const key of keys) {
-    const refusal = reservedSettingKeyRefusal(key)
-    if (refusal) throw new Error(refusal)
-  }
 }
