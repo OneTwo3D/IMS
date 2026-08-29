@@ -320,6 +320,18 @@ export function seedLiveInstallation(cluster: Cluster): void {
 // ---------------------------------------------------------------------------
 
 /**
+ * Values reach the rig as base64, decoded inside the shell.
+ *
+ * NOT as `KEY="value"`: runShipped() JSON-stringifies its variables into a DOUBLE-quoted shell
+ * assignment, and JSON escapes neither `$` nor a backtick — so `a"b\`c$d` would be command
+ * substitution before any shipped function saw it, and the test would be measuring bash. base64 is
+ * `[A-Za-z0-9+/=]`, which has no meaning in any of the three layers it passes through.
+ */
+export function base64(value: string): string {
+  return Buffer.from(value, 'utf8').toString('base64')
+}
+
+/**
  * The base64 door into the rig, as a shell function.
  *
  * runShipped() JSON-stringifies its variables into a DOUBLE-quoted shell assignment, so a value

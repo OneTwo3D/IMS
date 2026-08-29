@@ -206,8 +206,26 @@ ended the SQL literal. All of it after the predecessor had been stopped.
 
 The encode/decode pair is verified against the `pg` in this repo's `node_modules` rather than
 against the specification — `tests/scripts/install-credential-representation.test.ts` runs the
-shipped shell functions over 23 reserved-character passwords, parses their output with the
+shipped shell functions over 28 reserved-character passwords, parses their output with the
 installed `pg-connection-string`, and opens real connections with `pg.Client`.
+
+**A password ending in a newline is one of those 28, and it used to be truncated.** Command
+substitution — `VALUE="$(some_function)"` — deletes every trailing newline from what it captures.
+The encoder wrote such a password correctly (`%0A`), the driver read it back correctly, and the
+server held it correctly; the *recovery* then dropped the last byte, so a re-install compared
+`abc` against an installed `abc\n`, saw a difference, and asked to rotate a live credential nobody
+had asked to rotate. On the journal path the same loss published a `.env` naming a password the
+server does not have.
+
+Every value on the credential path that crosses a command substitution now goes through a
+`capture` helper, which appends a sentinel inside the substitution and removes it afterwards, so
+the trailing newlines are no longer trailing. That covers the URL recovery (both the role and the
+password halves), the outer `installed_database_password` capture, the two rotation-journal
+decodes, the Redis userinfo recovery, and the `sed` pipeline inside the URL decoder itself. The
+remaining substitutions on that path cannot carry a trailing newline: percent-encoders and
+`base64 | tr -d '\n'` emit alphabets that exclude it, `sql_quote_literal` ends with an apostrophe,
+the URL composer ends with the database name, and everything read from `.env` came out of a *line*,
+which ends at the newline it cannot contain.
 
 **Any password you can type is now installable.** If you are choosing one, a hex or base64 secret
 still travels through the fewest layers.
@@ -230,20 +248,61 @@ Two things close that:
   passwords, and it is removed **last** — only after an environment file naming the live credential
   is on the medium.
 
+* **The endpoint the reconciliation will ask is proven before the `ALTER`, and recorded.** See
+  *A probe that cannot say no is not evidence* below.
+
 On the next run, `prompt_db_password` reconciles it before anything has been touched, by **asking
-the server** which of the two passwords is live:
+the server** which of the two passwords is live — on an endpoint that has first been shown able to
+**refuse** a password nothing can know:
 
 | what the interrupted run got as far as | what the next run does |
 | --- | --- |
 | the journal, not the `ALTER` | the OLD password answers. Nothing was taken away and `.env` already agrees; the run adopts it as the installed credential and clears the journal. Supply the new password again to ask for the rotation a second time. |
 | the `ALTER`, not the environment file | the NEW password answers. The run **finishes the transition**: it treats that credential as the installed one in place of what `.env` says, so the environment file it writes names what the server actually has, and the journal is cleared only once that file is published. |
 | both, but not the clear | indistinguishable from the row above, and it does not need to be distinguished. The rewrite is byte-identical and the journal is cleared. |
-| neither password answers | the run **refuses**, before anything is stopped, and **leaves the journal** — it is the only remaining record of the two candidates. Restore one with `ALTER USER`, or set a password of your own and delete the file, then re-run. |
+| neither password answers anywhere that could discriminate | the run **refuses**, before anything is stopped, and **leaves the journal** — it is the only remaining record of the two candidates. Restore one with `ALTER USER`, or set a password of your own and delete the file, then re-run. |
+| an endpoint that can discriminate accepts **both** | also a refusal. Two passwords cannot both be the role's, so the server is not answering the way a password check answers, and preferring one of them would be a guess. |
 
 A journal naming a **different** role, host, port or database is also a refusal: this run cannot
 finish that transition and must not delete its record on the way past.
 
 A rotation that cannot journal durably does **not** issue the `ALTER` at all.
+
+##### A probe that cannot say no is not evidence
+
+Reconciliation asks the server whether a candidate password authenticates. Whether a **successful**
+connection proves anything is not a property of this installer — `pg_hba.conf` decides it, per
+database, per host, per role, and PostgreSQL supports rules under which it proves nothing:
+
+* a **`trust`** rule on the endpoint accepts *every* password. The probe cannot fail, so it would
+  "prove" whichever candidate was tried first and could publish a credential the `ALTER` never set;
+* a **revoked `CONNECT`** refuses the *session* rather than the password, so a role holding exactly
+  the right credential reads as dead. **The connection fence does this to the application
+  database**, and an interrupted rotation leaves that fence standing.
+
+So an endpoint is admitted as evidence only after it has been shown, on that endpoint, in that run,
+to **refuse** a freshly minted random 32-byte password **and accept** one asserted live. Both
+halves: an endpoint that refuses everything has not been shown able to say yes.
+
+**Before the `ALTER`**, the rotation searches for such an endpoint and records it in the journal.
+The candidates are read from the server — every connectable, non-template database except the
+application one, capped at eight, with `postgres` first — because the application database will be
+behind the fence when a reconciliation runs, and a rotation whose journal could not be reconciled
+must not happen. **If no endpoint can be shown password-sensitive, the rotation refuses**: nothing
+has been `ALTER`ed, the role still holds the credential `.env` names, and the two agree.
+
+The usual cause of that refusal is a `trust` rule for this host, or `PUBLIC` `CONNECT` revoked on
+every database this role could reach. Either is fixed before re-running:
+
+```sql
+GRANT CONNECT ON DATABASE postgres TO "imsuser";   -- or any database that is not the application one
+```
+
+together with a `scram-sha-256` or `md5` rule for the installer's host in `pg_hba.conf`.
+
+The reconciliation asks the **recorded** endpoint first, then re-derives the same list, then the
+application database as a last resort — and it re-establishes the proof every time, because
+`pg_hba.conf` can change between the two runs.
 
 The script performs the following steps:
 
