@@ -79,6 +79,14 @@ export const SHIPPED = [
   'db_sslmode_is_supported',
   'db_sslmode_is_cleartext',
   'db_url_route_query',
+  // r46 (Codex MEDIUM): the trust root stops being a pathname that is passed around and becomes
+  // BYTES published at one root-owned path every principal can open. Lifted for the same reason
+  // publish_durable_file() is: a rig that re-implemented the publication would be proving that its
+  // author can re-implement the publication.
+  'file_sha256',
+  'db_ca_path_is_open_to_every_uid',
+  'publish_db_ca',
+  'verify_db_ca_published',
   'db_application_route_sslmode',
   'installed_database_password',
   'installed_database_sslmode',
@@ -154,8 +162,22 @@ export interface Run {
   readonly output: string
 }
 
+/**
+ * How a caller reaches the script from OUTSIDE it (o3d-2sm1.5 r46, Codex HIGH).
+ *
+ * `env` is the PROCESS environment the shell is started with, and `argv` is what lands in `$1`.
+ * They exist because the r46 finding is unreachable through `vars`: those are assignments the rig
+ * makes INSIDE the shell, and the defect was install.sh overwriting the caller's exported value
+ * before it ever read it. Only a value that is in the environment when bash starts can prove that
+ * the declarations at the top of the script preserved it.
+ */
+export interface RunOptions {
+  readonly env?: Record<string, string>
+  readonly argv?: readonly string[]
+}
+
 /** The shipped functions, in a shell given exactly the variables install.sh gives them. */
-export function runShipped(vars: Record<string, string>, body: string): Run {
+export function runShipped(vars: Record<string, string>, body: string, options: RunOptions = {}): Run {
   const assignments = Object.entries(vars)
     .map(([key, value]) => `${key}=${JSON.stringify(value)}`)
     .join('\n')
@@ -174,7 +196,7 @@ run_as_user() { shift; "$@"; }
 BOLD=""
 RESET=""
 NON_INTERACTIVE=true
-INSTALL_POSTGRES=y
+INSTALL_POSTGRES="\${INSTALL_POSTGRES-y}"
 APP_NAME="one-two-inventory"
 DATABASE_URL=""
 DB_ROLE_PREEXISTED=false
@@ -200,8 +222,19 @@ DB_ENDPOINT_ROUTE_SSLROOTCERT=""
 # r45 (Codex MEDIUM): the transport is a deployment input now, so it is a variable the shipped
 # functions read. \`disable\` is what every test that says nothing about TLS means, and it is what
 # install.sh's own INSTALL_POSTGRES=y branch sets; the TLS tests override it through \`vars\`.
-DB_SSLMODE=disable
-DB_SSLROOTCERT=""
+#
+# r46 (Codex HIGH): AND THE DEFAULT DEFERS TO THE PROCESS ENVIRONMENT, because that is what the
+# finding is about. install.sh's own declarations capture DB_SSLMODE from the environment before
+# erasing it, so a rig that ASSIGNED the variable here would overwrite the caller's input exactly
+# as the defect did and no entrypoint test could ever see past it. \`-\` and not \`:-\`, so a test
+# that supplies an EMPTY value is supplying one.
+DB_SSLMODE="\${DB_SSLMODE-disable}"
+DB_SSLROOTCERT="\${DB_SSLROOTCERT-}"
+# r46 (Codex MEDIUM): the owner the published trust root is given. In install.sh this is the
+# literal \`root:root\`; a rig running as an ordinary user has no root to give a file to, so it
+# publishes to itself and still measures the digest, the mode and who can open the result.
+DB_CA_PUBLISH_OWNER="\${DB_CA_PUBLISH_OWNER:-\$(id -un):\$(id -gn)}"
+DB_CA_PUBLISHED_DIGEST="\${DB_CA_PUBLISHED_DIGEST-}"
 UNIT_EXECSTART_REASON=""
 ENV_ROUTE_GUARANTEE_REASON=""
 BUS_UNIT_OBJECT=""
@@ -265,15 +298,24 @@ ${assignments}
 # journal REFUSES, so a rig with no path would quietly be testing that refusal instead.
 DB_ENV_SNAPSHOT_DIR="\${DB_ENV_SNAPSHOT_DIR:-\${APP_DIR}/cutover-private}"
 DB_ROLE_ROTATION_JOURNAL="\${DB_ROLE_ROTATION_JOURNAL:-\${DB_ENV_SNAPSHOT_DIR}/db-role-rotation.journal}"
+# r46 (Codex MEDIUM): and the published trust root, for the same reason and in the same shape. In
+# install.sh this is /etc/ims-db-ca, root-owned — a literal, because a privileged path resolved
+# from a variable the application can set is not a privileged path. These are top-level
+# ASSIGNMENTS rather than functions, so they are not lifted, and the rig gives itself a directory
+# of this run's own; the OWNER is likewise this run's own user, because a rig running as an
+# ordinary user has no root to give a file to. What that leaves measurable is everything the
+# finding is actually about: the digest, the mode, and who can open the result.
+DB_CA_PUBLISH_DIR="\${DB_CA_PUBLISH_DIR:-\${APP_DIR}/db-ca-published}"
+DB_CA_PUBLISHED_FILE="\${DB_CA_PUBLISHED_FILE:-\${DB_CA_PUBLISH_DIR}/db-ca.crt}"
 ${ENV_HEREDOC_DEFAULTS}
 ${SHIPPED}
 ${body}
 `
-  const env = cleanLibpqEnv()
+  const env = { ...cleanLibpqEnv(), ...(options.env ?? {}) }
   try {
     return {
       status: 0,
-      output: execFileSync('bash', ['-c', script], {
+      output: execFileSync('bash', ['-c', script, 'install.sh', ...(options.argv ?? [])], {
         encoding: 'utf8',
         env,
         stdio: ['ignore', 'pipe', 'pipe'],

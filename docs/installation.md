@@ -481,6 +481,51 @@ argument, and escaping it correctly for all three would be three more sets of so
 On an upgrade the mode and the CA are recovered from the `DATABASE_URL` the previous run wrote, so
 pressing Enter through the prompts keeps a TLS-only installation on TLS.
 
+#### Under `--non-interactive`
+
+Both values are read from the process environment, and the precedence is explicit:
+
+```
+DB_SSLMODE=verify-full DB_SSLROOTCERT=/etc/pki/db-ca.pem bash install.sh --non-interactive
+```
+
+1. **what the caller supplied** — `DB_SSLMODE=` / `DB_SSLROOTCERT=` in the environment;
+2. **what the previous run published** — recovered from the installed `DATABASE_URL`;
+3. **`disable`**, on a first install where nobody said anything.
+
+A supplied value therefore beats a recovered one, which is what makes it possible to *change* the
+transport, or the CA, on an unattended upgrade. On the local-database path (`INSTALL_POSTGRES=y`)
+a supplied `DB_SSLMODE` other than `disable` is refused as an input and the run says so: that
+cluster is installed on this host and reached over `localhost`, where there is no transport
+question to answer.
+
+#### The CA is published, not merely named
+
+`DB_SSLROOTCERT` names the operator's own file, and three different accounts have to open the trust
+root: the installer and its authentication-request reader as **root**, the `psql` credential probes
+as **postgres**, and the running service as **`imsapp`**. A CA that only root can read passes every
+check an installer makes and then fails when the application starts — after the migration.
+
+So the installer copies the validated bytes to a fixed path:
+
+```
+/etc/ims-db-ca/db-ca.crt     root:root  0644   (in /etc/ims-db-ca, root:root 0755)
+```
+
+and repoints everything at it. From that moment the `sslrootcert=` in `DATABASE_URL`, the reader's
+`--sslrootcert=` and `psql`'s `PGSSLROOTCERT` are the same file — readable by every account that
+needs it, writable by root alone, so it cannot be swapped between the probe that vouched for it and
+the service that connects with it. The installer records its SHA-256 at publication and re-checks
+the digest, the ownership and the mode again once the `imsapp` account exists, opening the file **as
+that account** before it writes any environment file or starts anything.
+
+**When the cluster's CA changes**, the published copy is a *snapshot* and does not follow it.
+Re-run the installer with `DB_SSLROOTCERT=` pointing at the new source file — a supplied value beats
+the recovered one, so the snapshot is replaced. Doing nothing leaves the old trust root in place,
+and that fails **closed**: under `verify-ca`/`verify-full` a certificate that no longer chains to it
+is refused, so a rotated CA takes connections down loudly rather than quietly accepting a chain
+nothing vouched for.
+
 The postmaster-identity read performed just after `CREATE DATABASE` is the one credential-bearing
 connection deliberately **left unpinned**. What it concludes — that the server answering
 `DB_HOST:DB_PORT` is the one the `CREATE` landed on — is established from a start time, a port and
@@ -632,7 +677,10 @@ After installation, sign in and set the organisation base currency in **Settings
   `disable`, `require`, `verify-ca` or `verify-full`; the last two also ask for
   **`DB_SSLROOTCERT`**, the CA the server's certificate is verified against. It is recovered from
   the previous run's `DATABASE_URL` on an upgrade, so an existing TLS-only installation stays on
-  TLS when the prompts are accepted. See *TLS: `DB_SSLMODE`* above for what each mode means and why
+  TLS when the prompts are accepted, and the CA itself is copied to `/etc/ims-db-ca/db-ca.crt` so
+  the service account can read the same trust root the probes used. Under `--non-interactive` both
+  are read from the environment, where a supplied value beats the recovered one. See
+  *TLS: `DB_SSLMODE`* above for what each mode means, how the CA is published and refreshed, and why
   an ambient `PGSSLMODE` is refused instead.
 - **Database password** — on a first install, auto-generated if not provided. On a re-install it
   defaults to the credential already in `${APP_DIR}/.env`, so accepting the default changes nothing

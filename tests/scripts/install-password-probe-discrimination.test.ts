@@ -36,9 +36,9 @@
  */
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import test from 'node:test'
 
 import {
@@ -57,6 +57,7 @@ import {
   writeInstalledEnv,
 } from './install-shell-rig.ts'
 import { type Cluster, cleanLibpqEnv, currentUser, freePort, pgBinDir, startCluster } from './real-postgres-cluster.ts'
+import { sliceRange } from './redis-url-wire-harness.ts'
 import { type RadiusVerifier, radiusHbaLine, startRadiusVerifier } from './radius-verifier.ts'
 
 /** A `trust` rule covering ONLY the maintenance database — the endpoint the rotation relies on. */
@@ -2765,63 +2766,311 @@ test('r45: an upgrade recovers the transport and the CA from the URL the previou
   //         NOT what the composer emits and NOT libpq semantics under this driver) is recovered
   //         instead of ignored.
   const root = mkdtempSync(join(tmpdir(), 'ims-r45-upgrade-'))
+  // mkdtemp gives 0700, and the published CA has to be reachable by every uid — which on a
+  // production host it is, because /etc is 0755. Without this the ancestry walk is measuring the
+  // temporary directory rather than the publication.
+  chmodSync(root, 0o755)
   try {
     const ca = join(root, 'ca.pem')
-    writeFileSync(ca, '-- not read by the recovery, only by the validation --\n')
+    // DISTINCTIVE BYTES, because since r46 the recovered pathname is not what comes back out:
+    // prompt_db_sslmode() publishes the CA and repoints DB_SSLROOTCERT at the published copy. The
+    // only way left to prove WHICH file the recovery read is to read the bytes it published.
+    const CA_BYTES = '-- the CA the previous run of this installer verified against --\n'
+    writeFileSync(ca, CA_BYTES)
+    const publishedCa = join(root, 'db-ca-published/db-ca.crt')
     const written = (query: string): string =>
       `NODE_ENV=production\nDATABASE_URL=postgresql://imsuser:pw@db.example.com:5432/one_two_inventory${query}\n`
 
     // THE GLOBALS ARE LIFTED, NOT DECLARED. The whole of M1 is which value install.sh gives
     // DB_SSLMODE before the prompts run, so a rig that assigned its own would be measuring the rig.
     // Same reason CAPTURE_TERMINATOR_ASSIGNMENT is lifted rather than retyped.
+    //
+    // r46: there are FOUR of them now — the two captures that take the caller's input and the two
+    // declarations that erase it — and they are lifted IN SOURCE ORDER, because the order is the
+    // subject. A capture written after the erase captures nothing.
     const source = readFileSync(join(REPO, 'scripts/install.sh'), 'utf8')
-    const globals = ['DB_SSLMODE', 'DB_SSLROOTCERT'].map((name) => {
-      const matches = source.match(new RegExp(`^${name}=.*$`, 'gm')) ?? []
-      assert.equal(matches.length, 1, `precondition: scripts/install.sh must declare ${name} exactly once at top level`)
-      return matches[0]
-    }).join('\n')
+    const globals = source.match(/^DB_SSL(?:MODE|ROOTCERT)(?:_SUPPLIED)?=.*$/gm) ?? []
+    assert.equal(globals.length, 4,
+      'precondition: scripts/install.sh must declare the two TLS inputs and the two captures of them, once each, at top level')
 
-    const recover = (query: string, extra = ''): { status: number; output: string } => runShipped(
+    // THE TRANSPORT IS SUPPLIED — OR NOT SUPPLIED — WHERE A CALLER SUPPLIES IT (r46): the PROCESS
+    // ENVIRONMENT. Empty is the default here because "the operator said nothing" is the precondition
+    // of every recovery assertion below, and because a `vars` assignment would land AFTER the
+    // declarations that read the environment and so measure the rig instead of the script.
+    const recover = (env: Record<string, string> = {}): { status: number; output: string } => runShipped(
       { APP_DIR: root, APP_USER: currentUser(), DB_HOST: 'db.example.com', DB_PORT: '5432', DB_NAME: 'one_two_inventory', DB_USER: 'imsuser' },
       `
-        ${globals}
-        ${extra}
+        ${globals.join('\n')}
         load_existing_env "\${APP_DIR}/.env"
         prompt_db_sslmode
         echo "RECOVERED_MODE=\${DB_SSLMODE}"
         echo "RECOVERED_CA=\${DB_SSLROOTCERT}"
       `,
+      { env: { DB_SSLMODE: '', DB_SSLROOTCERT: '', ...env } },
     )
 
     writeFileSync(join(root, '.env'), written(`?sslmode=verify-full&uselibpqcompat=true&sslrootcert=${ca}`))
-    const verifyFull = recover('')
+    const verifyFull = recover()
     assert.equal(verifyFull.status, 0, verifyFull.output)
     assert.match(verifyFull.output, /^RECOVERED_MODE=verify-full$/m,
       `RECOVERED_MODE: an unattended upgrade must keep the transport the last run published:\n${verifyFull.output}`)
-    assert.match(verifyFull.output, new RegExp(`^RECOVERED_CA=${ca}$`, 'm'),
-      'RECOVERED_CA: and the CA it verifies against, or verify-full has nothing to verify with')
+    assert.match(verifyFull.output, new RegExp(`^RECOVERED_CA=${publishedCa}$`, 'm'),
+      'RECOVERED_CA: and it names the PUBLISHED copy, which is the one file all three readers open')
+    assert.equal(readFileSync(publishedCa, 'utf8'), CA_BYTES,
+      'RECOVERED_CA: and the bytes there are the ones the recovered path held, or the recovery read some other file')
 
     writeFileSync(join(root, '.env'), written('?sslmode=require&uselibpqcompat=true'))
-    assert.match(recover('').output, /^RECOVERED_MODE=require$/m, 'the same for the mode that verifies nothing')
-    assert.match(recover('').output, /^RECOVERED_CA=$/m, 'which carries no CA, and must not acquire one')
+    assert.match(recover().output, /^RECOVERED_MODE=require$/m, 'the same for the mode that verifies nothing')
+    assert.match(recover().output, /^RECOVERED_CA=$/m, 'which carries no CA, and must not acquire one')
 
     // A CLEARTEXT INSTALLATION STAYS CLEARTEXT — which is every installation that existed before
     // this round, and the assertion that stops the recovery being "turn TLS on for everybody".
     writeFileSync(join(root, '.env'), written(''))
-    assert.match(recover('').output, /^RECOVERED_MODE=disable$/m, 'and a URL with no query string recovers `disable`')
+    assert.match(recover().output, /^RECOVERED_MODE=disable$/m, 'and a URL with no query string recovers `disable`')
 
     // HAND_WRITTEN: a query string this installer did not compose is not recovered. Under this
     // driver a bare `?sslmode=require` means verify-full against Node's own CA bundle, so reading
     // it as "the operator asked for libpq's require" would be the r43 divergence re-introduced by
     // the recovery path itself.
     writeFileSync(join(root, '.env'), written('?sslmode=require'))
-    assert.match(recover('').output, /^RECOVERED_MODE=disable$/m,
+    assert.match(recover().output, /^RECOVERED_MODE=disable$/m,
       'HAND_WRITTEN: only the shape this installer emits is recognised')
 
-    // AND AN OPERATOR-SUPPLIED VALUE STILL WINS, because that is what --non-interactive means.
+    // AND AN OPERATOR-SUPPLIED VALUE STILL WINS, because that is what --non-interactive means —
+    // supplied through the PROCESS ENVIRONMENT (r46), which is the only place it can be supplied
+    // from and the only place the erase this round removes could ever have been seen.
     writeFileSync(join(root, '.env'), written('?sslmode=require&uselibpqcompat=true'))
-    assert.match(recover('', 'DB_SSLMODE=disable').output, /^RECOVERED_MODE=disable$/m,
+    assert.match(recover({ DB_SSLMODE: 'disable' }).output, /^RECOVERED_MODE=disable$/m,
       'an explicit DB_SSLMODE beats the recovered one')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 27b. THE MODE INSTALLATIONS ARE ACTUALLY AUTOMATED IN (o3d-2sm1.5 r46, Codex HIGH)
+//
+// Everything above measured prompt_db_sslmode() with the shell already carrying whatever the test
+// wanted it to carry. The defect was one layer OUTSIDE that: `DB_SSLMODE=""` at script scope
+// erased the caller's exported value before any prompt looked at it, so the whole of r45 was
+// reachable by typing and by nothing else. `--non-interactive` is how an install is automated, so
+// the supported configuration was unreachable in the mode that matters.
+//
+// This runs the SCRIPT'S OWN top-level statements — the argv parse that sets NON_INTERACTIVE, the
+// four declarations in source order, and the whole `--- PostgreSQL ---` block — and supplies the
+// transport SOLELY through the process environment the shell is started with. Nothing here assigns
+// DB_SSLMODE inside the shell, because an assignment inside the shell is the thing that hid this.
+// ---------------------------------------------------------------------------
+
+/** The literal path install.sh publishes the CA to, read out of the script rather than retyped. */
+function shippedLiteral(source: string, name: string): string {
+  const match = new RegExp(`^${name}="([^"]*)"$`, 'm').exec(source)
+  assert.ok(match, `precondition: scripts/install.sh must define ${name} as a double-quoted literal`)
+  return match[1]
+}
+
+/**
+ * The four top-level TLS statements, in source order.
+ *
+ * ORDER IS THE SUBJECT. A capture written after the erase captures the empty string, which is the
+ * defect exactly; lifting them as a set and re-emitting them sorted would pass either way.
+ */
+function shippedTlsGlobals(source: string): string {
+  const globals = source.match(/^DB_SSL(?:MODE|ROOTCERT)(?:_SUPPLIED)?=.*$/gm) ?? []
+  assert.equal(globals.length, 4,
+    'precondition: scripts/install.sh must declare the two TLS inputs and the two captures of them, once each, at top level')
+  return globals.join('\n')
+}
+
+test('r46: a full --non-interactive install carries verify-full and its CA from the environment into the URL', () => {
+  // MUTATION ROUTES:
+  //   M1 -- restore the defect: delete the two DB_SSL*_SUPPLIED capture lines and read DB_SSLMODE
+  //         directly in prompt_db_sslmode(). The declarations still erase the environment's value,
+  //         the precedence selects the recovered one (nothing, on a first install) and then
+  //         `disable`, and MODE= comes back `disable` with a URL carrying no TLS at all.
+  //   M2 -- move the captures BELOW the two declarations. Same failure, and this is the shape the
+  //         mistake actually takes when someone tidies the block.
+  //   M3 -- delete `DB_SSLROOTCERT="${DB_CA_PUBLISHED_FILE}"`: CA= comes back as the operator's own
+  //         0600 file, the published copy is never named, and the URL carries a trust root only
+  //         root can open. (Test 27 fails on it too, on the same line.)
+  //
+  // AND THE ROUTE THAT LANDS ON TEST 27 INSTEAD, stated here because the two tests are one pair:
+  // reversing the precedence so the RECOVERED value beats the supplied one passes here — a first
+  // install has nothing to recover — and fails 27, where an explicit DB_SSLMODE must beat the URL
+  // the previous run wrote. Neither test covers the precedence alone; both of them do.
+  const root = mkdtempSync(join(tmpdir(), 'ims-r46-noninteractive-'))
+  // mkdtemp gives 0700, and the published CA has to be reachable by every uid — which on a
+  // production host it is, because /etc is 0755. Without this the ancestry walk is measuring the
+  // temporary directory rather than the publication.
+  chmodSync(root, 0o755)
+  try {
+    const source = readFileSync(join(REPO, 'scripts/install.sh'), 'utf8')
+    const ca = join(root, 'operator-ca.pem')
+    writeFileSync(ca, '-- the operator’s own certificate authority --\n')
+
+    // The entrypoint's own statements: how it decides it is non-interactive, what it declares
+    // before any prompt runs, and the block that asks the question.
+    const argvParse = sliceRange(source, 'NON_INTERACTIVE=false', '# ---------------------------------------------------------------------------')
+    assert.match(argvParse, /--non-interactive/, 'precondition: the argv parse must be what sets NON_INTERACTIVE')
+    const postgresBlock = sliceRange(source, 'info "--- PostgreSQL ---"', 'info "--- Redis ---"')
+    assert.match(postgresBlock, /prompt_db_sslmode/, 'precondition: the PostgreSQL block must be where the transport is asked')
+
+    const run = runShipped(
+      { APP_DIR: root, APP_USER: currentUser() },
+      `
+        ${argvParse}
+        ${shippedTlsGlobals(source)}
+        ${postgresBlock}
+        classify_database_credential_rotation
+        echo "NON_INTERACTIVE=\${NON_INTERACTIVE}"
+        echo "MODE=\${DB_SSLMODE}"
+        echo "CA=\${DB_SSLROOTCERT}"
+        echo "URL=\${DATABASE_URL}"
+      `,
+      {
+        argv: ['--non-interactive'],
+        env: {
+          INSTALL_POSTGRES: 'n',
+          DB_HOST: 'db.example.com',
+          DB_PORT: '5432',
+          DB_NAME: 'one_two_inventory',
+          DB_USER: 'imsuser',
+          DB_PASSWORD: 'a-password',
+          DB_SSLMODE: 'verify-full',
+          DB_SSLROOTCERT: ca,
+          DB_CA_PUBLISH_DIR: join(root, 'published'),
+        },
+      },
+    )
+
+    assert.equal(run.status, 0, run.output)
+    assert.match(run.output, /^NON_INTERACTIVE=true$/m,
+      `precondition: --non-interactive must be what this run is in:\n${run.output}`)
+    assert.match(run.output, /^MODE=verify-full$/m,
+      `MODE: the transport the caller exported must survive the declarations that used to erase it:\n${run.output}`)
+
+    const published = join(root, 'published/db-ca.crt')
+    assert.match(run.output, new RegExp(`^CA=${published}$`, 'm'),
+      'CA: and it names the published copy, which is the file all three readers open')
+    assert.equal(readFileSync(published, 'utf8'), readFileSync(ca, 'utf8'),
+      'CA: whose bytes are the operator’s, or the CA that was validated is not the CA that is used')
+
+    // BOTH TLS PARAMETERS, ON THE URL THE APPLICATION IS ACTUALLY HANDED. `uselibpqcompat=true` is
+    // the half that makes `verify-full` mean libpq's verify-full rather than the driver's own
+    // reading of it, so a URL with only `sslmode=` is a different transport wearing the same word.
+    const url = readVar(run.output, 'URL')
+    assert.ok(url.includes('sslmode=verify-full'), `URL must state the mode: ${url}`)
+    assert.ok(url.includes('uselibpqcompat=true'), `URL must state the driver branch the mode is read in: ${url}`)
+    assert.ok(url.includes(`sslrootcert=${published}`), `URL must state the published CA: ${url}`)
+
+    // AND THE PATH IN THE URL IS THE LITERAL THE SCRIPT SHIPS, not whatever the test asked for:
+    // the environment override above exists so a rig with no root can run this at all, and this
+    // asserts the production path is the one the production run would use.
+    const shippedDir = shippedLiteral(source, 'DB_CA_PUBLISH_DIR')
+    assert.equal(shippedLiteral(source, 'DB_CA_PUBLISHED_FILE'), `\${DB_CA_PUBLISH_DIR}/db-ca.crt`,
+      'the published file hangs off the published directory')
+    assert.match(shippedDir, /^\/[A-Za-z0-9._/-]+$/,
+      'the published directory must be absolute and inside the character set DB_SSLROOTCERT is validated against')
+    assert.equal(shippedLiteral(source, 'DB_CA_PUBLISH_OWNER'), 'root:root',
+      'and the published CA is root-owned, which is the whole of the immutability half of the finding')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 27c. THE CA IS VALIDATED AS THE WRONG PRINCIPAL (o3d-2sm1.5 r46, Codex MEDIUM)
+//
+// `[[ -r ]]` in a script that runs as root proves root can read the file. Three principals open
+// this one: the authentication-request reader as root, the psql credential probes as `postgres`,
+// and the SERVICE as ${APP_USER}. A CA at mode 0600 passes every check the installer makes and
+// then fails when the application starts — after the migration, with the fence down.
+//
+// So the bytes are published rather than the pathname passed around, and what is asserted here is
+// the property the finding is about: a source file NO OTHER UID CAN OPEN produces a published copy
+// EVERY UID CAN OPEN, at a path only its owner can write. The permission bits are the whole answer
+// and they are checkable without being root, which is what lets this run in CI at all.
+// ---------------------------------------------------------------------------
+
+test('r46: a CA readable only by its owner is published as a copy every uid can read and only root can write', () => {
+  // MUTATION ROUTES:
+  //   M1 -- publish with mode 600 instead of 644 (the mode publish_durable_file() defaults to, so
+  //         this is what dropping the argument does): db_ca_path_is_open_to_every_uid() refuses,
+  //         PUBLISH= is non-zero, and the run dies naming ${APP_USER}. That is the finding.
+  //   M2 -- publish with mode 666: the same function refuses, because a trust root anyone can
+  //         rewrite is the other half of the finding.
+  //   M3 -- delete the digest comparison from verify_db_ca_published(): DIGEST_AFTER_TAMPER= comes
+  //         back 0 and the tampered CA is accepted.
+  //   M4 -- make verify_db_ca_published() iterate over nothing instead of over "$@": CALLED= comes
+  //         back empty and UNREADABLE= comes back 0, so a principal that cannot open the CA is
+  //         reported as one that can.
+  const root = mkdtempSync(join(tmpdir(), 'ims-r46-ca-principal-'))
+  // mkdtemp gives 0700, and the published CA has to be reachable by every uid — which on a
+  // production host it is, because /etc is 0755. Without this the ancestry walk is measuring the
+  // temporary directory rather than the publication.
+  chmodSync(root, 0o755)
+  try {
+    const ca = join(root, 'root-only-ca.pem')
+    writeFileSync(ca, '-- a CA the installer can read and nobody else can --\n')
+    chmodSync(ca, 0o600)
+    assert.equal(statSync(ca).mode & 0o077, 0,
+      'precondition: the source CA must be unreadable by every uid but its owner — that is the defect’s input')
+
+    const publishDir = join(root, 'published')
+    const published = join(publishDir, 'db-ca.crt')
+    const run = runShipped(
+      { APP_DIR: root, APP_USER: currentUser(), DB_CA_PUBLISH_DIR: publishDir },
+      `
+        publish_db_ca ${JSON.stringify(ca)}; echo "PUBLISH=$?"
+        echo "DIGEST=\${DB_CA_PUBLISHED_DIGEST}"
+        verify_db_ca_published "\${APP_USER}"; echo "VERIFY=$?"
+
+        # THE PRINCIPAL LOOP IS NOT VACUOUS, PROVED IN TWO HALVES.
+        #
+        # First, that it reaches the account the service runs as with the published path: an
+        # instrumented run_as_user records the user it was asked to become, then does what the rig's
+        # own stub does. A loop that never ran leaves CALLED empty.
+        CALLS=""
+        run_as_user() { CALLS="\${CALLS} $1"; shift; "$@"; }
+        verify_db_ca_published "\${APP_USER}" >/dev/null 2>&1; echo "CALLED=\${CALLS}"
+
+        # Second, that the loop ACTS on the answer. This host cannot make a 0644 file unreadable to
+        # one uid and readable to another — that is what 0644 means — so the account's inability to
+        # open it is modelled where the account is impersonated, which is exactly the failure the
+        # finding describes: a CA the installer and the probes can read and the service cannot.
+        run_as_user() { shift; return 1; }
+        verify_db_ca_published "\${APP_USER}" >/dev/null 2>&1; echo "UNREADABLE=$?"
+        run_as_user() { shift; "$@"; }
+
+        # AND THE DIGEST IS WHAT SAYS THE BYTES ARE STILL THE ONES THAT WERE VALIDATED.
+        printf '%s' "-- a different certificate authority --" > ${JSON.stringify(published)}
+        verify_db_ca_published >/dev/null 2>&1; echo "DIGEST_AFTER_TAMPER=$?"
+      `,
+    )
+
+    assert.equal(run.status, 0, run.output)
+    assert.match(run.output, /^PUBLISH=0$/m, `the validated CA must publish:\n${run.output}`)
+    assert.match(run.output, /^VERIFY=0$/m,
+      `VERIFY: the published copy must verify for the account the service runs as:\n${run.output}`)
+    assert.match(run.output, /^DIGEST=[0-9a-f]{64}$/m, 'the publication must record the digest of what it published')
+    assert.match(run.output, /^DIGEST_AFTER_TAMPER=1$/m,
+      `DIGEST_AFTER_TAMPER: a trust root replaced after publication must be refused:\n${run.output}`)
+
+    assert.equal(readVar(run.output, 'CALLED').trim(), currentUser(),
+      `CALLED: the check must actually be performed AS the account the service runs as:\n${run.output}`)
+    assert.match(run.output, /^UNREADABLE=1$/m,
+      `UNREADABLE: a principal that cannot open the published CA must be refused:\n${run.output}`)
+
+    // THE BITS, ASSERTED FROM OUTSIDE THE SHELL TOO. The shipped function checks them; this checks
+    // that what it checked is what the finding asked for — 0644, and every directory component
+    // other-executable, so every uid on the box can open the file and only its owner can write it.
+    const mode = statSync(published).mode & 0o777
+    assert.equal(mode, 0o644, `the published CA must be 0644, was 0${mode.toString(8)}`)
+    for (let dir = resolve(publishDir); ; dir = dirname(dir)) {
+      assert.notEqual(statSync(dir).mode & 0o001, 0,
+        `${dir} must grant other-execute or no other uid can reach the published CA`)
+      if (dir === '/') break
+    }
   } finally {
     rmSync(root, { recursive: true, force: true })
   }
