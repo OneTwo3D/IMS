@@ -145,9 +145,16 @@ export function startCluster(
   if (options.ssl === true) {
     // The default ssl_cert_file/ssl_key_file are `server.crt`/`server.key` in the data directory,
     // so naming them is enough; the key must be 0600 or the postmaster refuses to start.
+    // SUBJECT ALTERNATIVE NAMES, so the certificate can be VERIFIED and not merely negotiated
+    // (o3d-2sm1.5 r45). Without them a `verify-full` client -- the application's driver, libpq and
+    // this suite's reader alike -- rejects the connection on the hostname even when the chain is
+    // trusted, and a test for TLS-only external databases could then only ever exercise the mode
+    // that verifies nothing. The certificate is its own CA, so `sslrootcert=server.crt` is a
+    // complete trust root for it.
     execFileSync('openssl', [
       'req', '-new', '-x509', '-days', '2', '-nodes',
       '-subj', '/CN=localhost',
+      '-addext', 'subjectAltName=IP:127.0.0.1,DNS:localhost',
       '-keyout', join(data, 'server.key'),
       '-out', join(data, 'server.crt'),
     ], { stdio: 'pipe' })

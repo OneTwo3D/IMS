@@ -36,7 +36,7 @@
  */
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -1998,15 +1998,14 @@ test('r44: a PGSSLMODE in the environment puts the application on a record the g
 
 interface RouteEnvOptions {
   readonly processEnv?: Record<string, string>
-  readonly managerEnv?: string
-  readonly environment?: string
-  readonly passEnvironment?: string
   readonly unsetEnvironment?: string
-  readonly environmentFiles?: string
-  readonly pamName?: string
+  readonly execStart?: string
   readonly loadState?: string
-  readonly envFile?: { path: string; contents: string }
+  readonly mode?: 'installer' | 'service'
 }
+
+const HOST_EXECSTART = 'a(sasbttttuii) 1 "/opt/app/node_modules/.bin/next" 4 "/opt/app/node_modules/.bin/next" "start" "-p" "3000" false 0 0 0 0 0 0 0'
+const HOST_UNSET = 'as 3 "PGSSLMODE" "PGREPLICATION" "NODE_PG_FORCE_NATIVE"'
 
 function runRouteEnv(options: RouteEnvOptions): { status: number; output: string } {
   const source = readFileSync(join(REPO, 'scripts/install.sh'), 'utf8')
@@ -2016,45 +2015,43 @@ function runRouteEnv(options: RouteEnvOptions): { status: number; output: string
     const end = source.indexOf('\n}\n', start)
     return source.slice(start + 1, end + 3)
   }
-  if (options.envFile !== undefined) writeFileSync(options.envFile.path, options.envFile.contents)
   const program = [
     'set -uo pipefail',
-    'APP_NAME="one-two-inventory"',
+    'APP_NAME="one-two-inventory"; APP_DIR=/opt/app; APP_PORT=3000',
     'DB_USER=imsuser; DB_HOST=127.0.0.1; DB_PORT=5432; DB_NAME=one_two_inventory',
-    'BUS_STRINGS=(); BUS_ENV_IGNORE_FLAGS=(); ENV_VAR_SOURCE_REASON=""',
-    'DB_ENV_SNAPSHOT_FILE=/var/lib/one-two-inventory/deploy/db-identity.env',
-    'DB_ENV_SNAPSHOT_DROPIN_NAME=zz-deploy-db-identity.conf',
-    'DB_ENV_SNAPSHOT_PUBLISHED=false; DB_IDENTITY_REQUIRE_SNAPSHOT=false',
+    'DB_SSLMODE=disable; DB_SSLROOTCERT=""',
+    'BUS_STRINGS=(); BUS_UNIT_OBJECT=""',
+    'ENV_ROUTE_GUARANTEE_REASON=""; UNIT_EXECSTART_REASON=""',
+    'DB_ROUTE_DROPIN_NAME=zz-deploy-db-route.conf',
     ...Object.entries(options.processEnv ?? {}).map(([key, value]) => `export ${key}=${JSON.stringify(value)}`),
-    // systemd’s own answer for the block it passes to every service.
-    // `%b`, so the \n in the JSON-quoted string becomes the line break systemd prints.
-    `systemctl(){ case "$*" in show-environment) printf '%b\\n' ${JSON.stringify(options.managerEnv ?? 'LANG=C\nPATH=/usr/bin')} ;; *) return 1 ;; esac; }`,
     'busctl(){',
     '  case "$*" in',
     `    *LoadUnit*) printf '%s\\n' 'o "/org/freedesktop/systemd1/unit/one_2dtwo_2dinventory_2eservice"' ;;`,
     `    *Unit\\ LoadState*) printf '%s\\n' '${options.loadState ?? 's "loaded"'}' ;;`,
-    // EnvironmentFiles FIRST: `*Service\ Environment*` is a prefix of it.
-    `    *Service\\ EnvironmentFiles*) printf '%s\\n' '${options.environmentFiles ?? 'a(sb) 0'}' ;;`,
-    `    *Service\\ Environment*) printf '%s\\n' '${options.environment ?? 'as 0'}' ;;`,
-    `    *Service\\ PassEnvironment*) printf '%s\\n' '${options.passEnvironment ?? 'as 0'}' ;;`,
-    `    *Service\\ UnsetEnvironment*) printf '%s\\n' '${options.unsetEnvironment ?? 'as 0'}' ;;`,
-    `    *Service\\ PAMName*) printf '%s\\n' '${options.pamName ?? 's ""'}' ;;`,
+    `    *Service\\ UnsetEnvironment*) printf '%s\\n' '${options.unsetEnvironment ?? HOST_UNSET}' ;;`,
+    `    *Service\\ ExecStart*) printf '%s\\n' '${options.execStart ?? HOST_EXECSTART}' ;;`,
     '    *) return 1 ;;',
     '  esac',
     '}',
     lift('bus_read_strings'),
     lift('bus_array_count'),
     lift('bus_unit_property'),
-    lift('bus_element_names_variable'),
-    lift('bus_read_env_ignore_flags'),
-    lift('unit_env_var_sole_source'),
+    lift('bus_unit_object'),
+    lift('unit_route_env_guaranteed'),
+    lift('unit_execstart_is_exactly'),
+    lift('db_service_execstart_expected'),
     lift('url_encode_userinfo'),
+    lift('db_url_route_query'),
     lift('compose_database_url'),
+    lift('db_sslmode_is_supported'),
     lift('db_route_env_variables'),
+    lift('db_route_env_alternative'),
     lift('db_route_env_effect'),
     lift('db_application_route_env_refusal'),
     lift('db_application_route_sslmode'),
-    'if route="$(db_application_route_sslmode)"; then echo "ROUTE=${route}"; else echo "REFUSED=${route}"; fi',
+    options.mode === 'service'
+      ? 'if reason="$(db_application_route_env_refusal service)"; then echo "GUARANTEED"; else echo "REFUSED=${reason}"; fi'
+      : 'if route="$(db_application_route_sslmode)"; then echo "ROUTE=${route}"; else echo "REFUSED=${route}"; fi',
   ].join('\n')
   try {
     return {
@@ -2067,74 +2064,240 @@ function runRouteEnv(options: RouteEnvOptions): { status: number; output: string
   }
 }
 
-test('r44: every environment source that can reach the service is refused, not just this process’s', () => {
-  // MUTATION ROUTES, one per source (each made locally and re-run):
-  //   - delete the `${!name+is-set}` branch: the four `this process` cases resolve to disable.
-  //   - delete the `systemctl show-environment` branch: the manager case resolves.
-  //   - delete the `unit_env_var_sole_source` call: all five unit cases resolve.
-  //   - give the `none` layer the `file` layer’s EnvironmentFile= handling (do not open them):
-  //     the environment-file case resolves, which is the case a reader that only looked at
-  //     directives would have missed.
-  // THE CONTROLS at the end are what stop any of those mutations being answered by "just refuse
-  // everything": a clean unit, a unit systemd does not have, and a file that names something else
-  // must all still resolve to `disable`.
-  const root = mkdtempSync(join(tmpdir(), 'ims-r44-src-'))
-  try {
-    const envPath = join(root, '.env')
-    const cases: ReadonlyArray<{ label: string; options: RouteEnvOptions; says: RegExp }> = [
-      { label: 'this process, PGSSLMODE', options: { processEnv: { PGSSLMODE: 'require' } }, says: /running with PGSSLMODE=require in its own environment/ },
-      { label: 'this process, PGREPLICATION', options: { processEnv: { PGREPLICATION: 'true' } }, says: /WAL sender, which pg_hba matches on the replication keyword/ },
-      { label: 'this process, NODE_PG_FORCE_NATIVE', options: { processEnv: { NODE_PG_FORCE_NATIVE: '1' } }, says: /replaces node-postgres with libpq/ },
-      { label: 'the manager environment block', options: { managerEnv: 'LANG=C\nPGSSLMODE=require\nPATH=/usr/bin' }, says: /systemd manager passes PGSSLMODE to every service/ },
-      { label: 'the unit’s Environment=', options: { environment: 'as 2 "NODE_ENV=production" "PGSSLMODE=require"' }, says: /sets PGSSLMODE in its own Environment=/ },
-      { label: 'the unit’s PassEnvironment=', options: { passEnvironment: 'as 1 "PGSSLMODE"' }, says: /lists PGSSLMODE in PassEnvironment=/ },
-      { label: 'the unit’s UnsetEnvironment=', options: { unsetEnvironment: 'as 1 "PGSSLMODE"' }, says: /lists PGSSLMODE in UnsetEnvironment=/ },
-      { label: 'the unit’s PAMName=', options: { pamName: 's "login"' }, says: /sets PAMName=login/ },
-      {
-        label: 'an environment file the unit loads',
-        options: {
-          environmentFiles: `a(sb) 1 "${envPath}" true`,
-          envFile: { path: envPath, contents: 'NODE_ENV=production\nPGSSLMODE=no-verify\n' },
-        },
-        says: new RegExp(`loads the environment file ${envPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}, and that file has a line naming PGSSLMODE`),
-      },
-      {
-        label: 'an environment file that exports it',
-        options: {
-          environmentFiles: `a(sb) 1 "${envPath}" true`,
-          envFile: { path: envPath, contents: '  export PGSSLMODE = require\n' },
-        },
-        says: /has a line naming PGSSLMODE/,
-      },
-      {
-        label: 'an environment file systemd had to escape',
-        options: { environmentFiles: 'a(sb) 1 "/opt/app/a\\"b.env" false' },
-        says: /a path it had to escape to state/,
-      },
-    ]
-    for (const scenario of cases) {
-      const result = runRouteEnv(scenario.options)
-      assert.match(result.output, /^REFUSED=/m, `${scenario.label}: this must refuse, not resolve:\n${result.output}`)
-      assert.match(result.output, scenario.says, `${scenario.label}: the refusal must name the source:\n${result.output}`)
-      assert.match(result.output, /pg_hba record|WAL sender|libpq/, `${scenario.label}: and say what it does to the route:\n${result.output}`)
-    }
+// ---------------------------------------------------------------------------
+// 23a. THE HOST'S OWN RENDERINGS, so the stubs above are systemd's shapes and not this file's
+//
+// Everything in 23b-23d is decided by the SHIPPED parsers reading a STUBBED busctl. That is only
+// evidence if the strings the stub prints are the strings systemd prints. So they are taken here,
+// READ-ONLY, off a unit this host really has: two `busctl get-property` calls, which start
+// nothing and queue no job.
+// ---------------------------------------------------------------------------
 
-    // THE CONTROLS.
-    assert.match(runRouteEnv({}).output, /^ROUTE=disable$/m, 'a unit that carries none of them resolves')
-    assert.match(
-      runRouteEnv({ loadState: 's "not-found"' }).output, /^ROUTE=disable$/m,
-      'and a unit systemd does not have defines nothing — which is a first install, and every one of this file’s other tests')
-    assert.match(
-      runRouteEnv({
-        environment: 'as 7 "NODE_ENV=development" "NEXT_PUBLIC_APP_URL=https://x" "AUTH_URL=https://x" "PORT=3000" "HOSTNAME=0.0.0.0" "HOME=/opt/ims/onetwo3d-ims" "NPM_CONFIG_CACHE=/opt/ims/onetwo3d-ims/.npm-cache"',
-        environmentFiles: `a(sb) 1 "${envPath}" true`,
-        envFile: { path: envPath, contents: 'NODE_ENV=production\nDATABASE_URL=postgresql://a:b@127.0.0.1:5432/c\nNEXT_PUBLIC_PGSSLMODE=require\n' },
-      }).output,
-      /^ROUTE=disable$/m,
-      'and THIS HOST’s real unit shape — read off ims-stage-dev.service — resolves, including a file whose only near miss is a differently-named variable')
+function hostUnitProperty(unit: string, property: string): string | null {
+  try {
+    const object = execFileSync('busctl', [
+      'call', 'org.freedesktop.systemd1', '/org/freedesktop/systemd1',
+      'org.freedesktop.systemd1.Manager', 'LoadUnit', 's', unit,
+    ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim().replace(/^o /, '').replace(/"/g, '')
+    return execFileSync('busctl', [
+      'get-property', 'org.freedesktop.systemd1', object, 'org.freedesktop.systemd1.Service', property,
+    ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
+  } catch {
+    return null
+  }
+}
+
+test('r45: the ExecStart and UnsetEnvironment renderings the parsers are given are the ones systemd prints', () => {
+  // MUTATION ROUTE: change the signature `unit_execstart_is_exactly()` asks bus_array_count() for
+  // (say to `as`, the signature of the environment lists) and the first assertion fails, because
+  // systemd's own rendering does not begin with it. That is the r21 finding held in place: the
+  // element count is read from the data structure, and a rendering of another shape is not an
+  // answer.
+  //
+  // IT IS SKIPPED, NOT FAILED, WHERE THERE IS NO SYSTEM BUS — CI containers without systemd are a
+  // real place this suite runs, and a precondition that cannot be taken is not a defect. The
+  // assertion that it WAS taken is the `probed` counter: a version of this that silently probed
+  // nothing would report zero units and fail.
+  const units = ['ims-stage-dev.service', 'ssh.service', 'cron.service', 'systemd-journald.service']
+  let probed = 0
+  for (const unit of units) {
+    const execStart = hostUnitProperty(unit, 'ExecStart')
+    const unsetEnvironment = hostUnitProperty(unit, 'UnsetEnvironment')
+    if (execStart === null || unsetEnvironment === null) continue
+    probed += 1
+    assert.match(execStart, /^a\(sasbttttuii\) \d+ /,
+      `${unit}: systemd renders ExecStart with the signature the shipped reader asks bus_array_count() for`)
+    assert.match(unsetEnvironment, /^as \d+/,
+      `${unit}: and UnsetEnvironment as a plain string array, which is what unit_route_env_guaranteed() parses`)
+  }
+  if (probed === 0) {
+    console.log('# skipped: no systemd bus on this host, so the renderings could not be taken from it')
+    return
+  }
+  assert.ok(probed > 0, 'at least one real unit must have answered, or this test proved nothing')
+
+  // AND THE STUB SHAPE MATCHES ONE OF THEM, field for field. `ims-stage-dev.service` on this host
+  // renders `a(sasbttttuii) 1 "/usr/bin/npm" 8 "/usr/bin/npm" "run" "dev" ... false 0 0 0 0 0 0 0`;
+  // HOST_EXECSTART is that shape with this installer's own command in it.
+  assert.match(HOST_EXECSTART, /^a\(sasbttttuii\) 1 "\S+" \d+ (?:"[^"]*" )+false(?: 0){7}$/,
+    'the stubbed ExecStart rendering is the shape systemd prints, not an approximation of it')
+})
+
+// ---------------------------------------------------------------------------
+// 23b. THE INSTALLER'S OWN ENVIRONMENT is still refused — and nothing else is surveyed
+//
+// r44 refused three sources. Two of them (the manager's block, the unit's own directives and
+// files) are now CLOSED rather than surveyed, by the UnsetEnvironment= directive systemd applies
+// as the final step of composing the environment. What is left in `installer` mode is the one
+// source no unit directive can reach: this process, whose environment the migration, the build
+// and the connection fence inherit verbatim.
+// ---------------------------------------------------------------------------
+
+test('r45: the installer’s own environment still refuses, and now names the supported spelling', () => {
+  // MUTATION ROUTES:
+  //   M1 -- delete the `${!name+is-set}` branch from db_application_route_env_refusal(): all three
+  //         refusal cases resolve to `ROUTE=disable`, which is r44's finding restored.
+  //   M2 -- remove PGSSLMODE from db_route_env_variables(): the first case resolves, which is what
+  //         makes the LIST a checked claim rather than a comment.
+  //   M3 -- make db_route_env_alternative() return the same sentence for every name: the last
+  //         assertion fails, because a WAL-sender variable would be offered a TLS spelling that
+  //         does not exist.
+  const cases: ReadonlyArray<{ label: string; env: Record<string, string>; says: RegExp }> = [
+    { label: 'PGSSLMODE', env: { PGSSLMODE: 'require' }, says: /running with PGSSLMODE=require in its own environment/ },
+    { label: 'PGREPLICATION', env: { PGREPLICATION: 'true' }, says: /WAL sender, which pg_hba matches on the replication keyword/ },
+    { label: 'NODE_PG_FORCE_NATIVE', env: { NODE_PG_FORCE_NATIVE: '1' }, says: /replaces node-postgres with libpq/ },
+  ]
+  for (const scenario of cases) {
+    const result = runRouteEnv({ processEnv: scenario.env })
+    assert.match(result.output, /^REFUSED=/m, `${scenario.label}: this must refuse, not resolve:\n${result.output}`)
+    assert.match(result.output, scenario.says, `${scenario.label}: the refusal must name the source:\n${result.output}`)
+  }
+
+  // THE WAY OUT IS NAMED, and only where there is one. That is the whole of the r45 MEDIUM: a
+  // refusal whose only remediation is "delete the line that makes your database reachable" is not
+  // a remediation.
+  assert.match(runRouteEnv({ processEnv: { PGSSLMODE: 'require' } }).output,
+    /state it as DB_SSLMODE=require \(or verify-ca \/ verify-full with DB_SSLROOTCERT=\)/,
+    'the PGSSLMODE refusal names the supported spelling of the same intent')
+  assert.doesNotMatch(runRouteEnv({ processEnv: { PGREPLICATION: 'true' } }).output,
+    /DB_SSLMODE/,
+    'and the two that have no supported spelling do not invent one')
+
+  // THE CONTROL: a clean environment resolves, and it resolves to the route DB_SSLMODE names.
+  assert.match(runRouteEnv({}).output, /^ROUTE=disable$/m, 'nothing set, and the derivation answers')
+})
+
+// ---------------------------------------------------------------------------
+// 23c. THE LOAD-BEARING ONE FOR r45's FIRST HIGH: a WILDCARD EnvironmentFile
+//
+// THE FINDING (Codex HIGH). r44 concluded "nothing sets PGSSLMODE" by opening every path in the
+// unit's EnvironmentFiles= and grepping it. systemd.exec(5) documents that path as one that MAY BE
+// A WILDCARD, and `[[ -e "/etc/ims/*.env" ]]` is false for a glob however many files it matches --
+// so a file that DID set PGSSLMODE was read as absent. The same reader was also a point-in-time
+// read of a mutable file: systemd opens it at exec, at the far end of a build and a migration.
+//
+// THE ANSWER IS NOT A BETTER READER. It is that nothing reads those files any more: the composed
+// unit must carry `UnsetEnvironment=` naming all three, which systemd.exec(5) applies "as the
+// final step ... immediately before it is passed to the executed process" -- after
+// DefaultEnvironment=, `systemctl set-environment`, the manager's block, Environment=,
+// EnvironmentFile= (wildcards included) and PAM alike.
+// ---------------------------------------------------------------------------
+
+test('r45: a wildcard EnvironmentFile that sets PGSSLMODE cannot reach the application', () => {
+  // MUTATION ROUTES:
+  //   M1 -- have unit_route_env_guaranteed() return 0 unconditionally: WILDCARD_NO_DIRECTIVE
+  //         reports GUARANTEED, which is the shipped r44 behaviour and the defect.
+  //   M2 -- accept an assignment as well as a bare name (drop the `== "$name"` to a prefix match):
+  //         ASSIGNMENT_FORM reports GUARANTEED, and systemd would remove only `PGSSLMODE=require`
+  //         while `PGSSLMODE=no-verify` from the wildcard file survived.
+  //   M3 -- drop NODE_PG_FORCE_NATIVE from the directive the installer writes: TWO_OF_THREE
+  //         reports GUARANTEED.
+  const root = mkdtempSync(join(tmpdir(), 'ims-r45-wild-'))
+  try {
+    // PRECONDITION, MEASURED: this is exactly why the r44 reader said "absent". The glob is not a
+    // path; the file it matches is, and it sets the variable.
+    const glob = join(root, '*.env')
+    writeFileSync(join(root, 'transport.env'), 'PGSSLMODE=no-verify\n')
+    assert.equal(existsSync(glob), false,
+      'precondition: a wildcard EnvironmentFile= path is not a file, so the r44 `[[ -e ]]` test was false for it')
+    assert.equal(
+      execFileSync('bash', ['-c', `shopt -s nullglob; for f in ${glob}; do grep -c '^PGSSLMODE=' "$f"; done`], { encoding: 'utf8' }).trim(),
+      '1',
+      'precondition: and the file it matches DOES set PGSSLMODE — so r44 read an absence that was not one')
+
+    // AND THE SHIPPED GATE NO LONGER ASKS. The unit below loads that wildcard; what decides is
+    // whether systemd states the directive back.
+    const withoutDirective = runRouteEnv({ mode: 'service', unsetEnvironment: 'as 0' })
+    assert.match(withoutDirective.output, /^REFUSED=/m,
+      `WILDCARD_NO_DIRECTIVE: without the directive the start must refuse:\n${withoutDirective.output}`)
+    assert.match(withoutDirective.output, /does not list PGSSLMODE as a bare name in UnsetEnvironment=/,
+      'and say exactly which property is missing')
+    assert.match(withoutDirective.output, /zz-deploy-db-route\.conf/, 'and which drop-in states it')
+
+    const assignmentForm = runRouteEnv({ mode: 'service', unsetEnvironment: 'as 3 "PGSSLMODE=require" "PGREPLICATION" "NODE_PG_FORCE_NATIVE"' })
+    assert.match(assignmentForm.output, /^REFUSED=/m,
+      `ASSIGNMENT_FORM: UnsetEnvironment=PGSSLMODE=require removes ONE assignment, not the variable:\n${assignmentForm.output}`)
+
+    const twoOfThree = runRouteEnv({ mode: 'service', unsetEnvironment: 'as 2 "PGSSLMODE" "PGREPLICATION"' })
+    assert.match(twoOfThree.output, /^REFUSED=/m, 'TWO_OF_THREE: all three or none')
+    assert.match(twoOfThree.output, /does not list NODE_PG_FORCE_NATIVE as a bare name/, 'and it names the one that is missing')
+
+    // THE CONTROL, and the property the whole answer rests on: with the directive systemd states
+    // back, the same unit — wildcard environment file and all — passes, because the variable is
+    // removed from the composed environment whatever put it there.
+    assert.match(runRouteEnv({ mode: 'service' }).output, /^GUARANTEED$/m,
+      'control: the directive this installer writes is what makes the start admissible')
+
+    // AND THE DIRECTIVE THE INSTALLER WRITES IS THE BARE-NAME FORM, checked against the shipped
+    // here-doc rather than against this file's idea of it.
+    const source = readFileSync(join(REPO, 'scripts/install.sh'), 'utf8')
+    assert.match(source, /^UnsetEnvironment=\$\{names\}$/m,
+      'the drop-in emits UnsetEnvironment= with the names db_route_env_variables() lists')
+    assert.match(source, /names="\$\(db_route_env_variables \| tr '\\n' ' '\)"/,
+      'and those names come from the same list the check reads, so the two cannot drift')
   } finally {
     rmSync(root, { recursive: true, force: true })
   }
+})
+
+// ---------------------------------------------------------------------------
+// 23d. THE LOAD-BEARING ONE FOR r45's SECOND HIGH: ExecStart is the layer the directive misses
+//
+// THE FINDING (Codex HIGH). UnsetEnvironment= is final over the environment systemd COMPOSES. It
+// is not final over what the launched program does to its own environment one exec later, and
+// `ExecStart=/usr/bin/env PGSSLMODE=no-verify …` is a drop-in that does exactly that. It appears
+// in no Environment=, no PassEnvironment=, no UnsetEnvironment= and no EnvironmentFile=; it
+// survives a rewrite of the base unit; and it puts the application on the `hostssl` record this
+// run never authenticated against.
+//
+// So the two HIGHs need two mechanisms, and this is the second one: the composed ExecStart must be
+// the command this installer wrote, string for string.
+// ---------------------------------------------------------------------------
+
+test('r45: a drop-in that wraps ExecStart in `env PGSSLMODE=…` is refused', () => {
+  // MUTATION ROUTES:
+  //   M1 -- delete the unit_execstart_is_exactly() call from db_application_route_env_refusal():
+  //         every wrapper case reports GUARANTEED. That is the blind spot the file used to name
+  //         and leave open.
+  //   M2 -- compare only the command PATH and not the argv: WRAPPED_ARGV reports GUARANTEED,
+  //         because `/usr/bin/env` is not the path — but `next start -p 3000 --keepAliveTimeout`
+  //         style tampering, and any wrapper reached through the same binary, would not be caught.
+  //   M3 -- drop the `count -ne 1` check: TWO_COMMANDS reports GUARANTEED, and systemd would run
+  //         both.
+  const wrapped = 'a(sasbttttuii) 1 "/usr/bin/env" 6 "/usr/bin/env" "PGSSLMODE=no-verify" "/opt/app/node_modules/.bin/next" "start" "-p" "3000" false 0 0 0 0 0 0 0'
+  const wrapper = runRouteEnv({ mode: 'service', execStart: wrapped })
+  assert.match(wrapper.output, /^REFUSED=/m, `WRAPPED: the start must refuse:\n${wrapper.output}`)
+  assert.match(wrapper.output, /\/usr\/bin\/env/, 'and quote the command systemd would actually run')
+  assert.match(wrapper.output, /PGSSLMODE=no-verify/, 'including the assignment the wrapper carries')
+  assert.match(wrapper.output, /this installer wrote ExecStart=/, 'and say what it expected instead')
+
+  // A WRAPPER REACHED THROUGH THE SAME BINARY: same path, different argv. This is what M2 misses.
+  const sameBinary = 'a(sasbttttuii) 1 "/opt/app/node_modules/.bin/next" 5 "/opt/app/node_modules/.bin/next" "start" "-p" "3000" "--experimental-https" false 0 0 0 0 0 0 0'
+  assert.match(runRouteEnv({ mode: 'service', execStart: sameBinary }).output, /^REFUSED=/m,
+    'WRAPPED_ARGV: an argv this run did not write is a command this run has not read, whatever the binary is')
+
+  // TWO COMMANDS: systemd runs both, and the first is a program nobody here read.
+  const two = 'a(sasbttttuii) 2 "/usr/bin/env" 2 "/usr/bin/env" "PGSSLMODE=no-verify" false 0 0 0 0 0 0 0 "/opt/app/node_modules/.bin/next" 4 "/opt/app/node_modules/.bin/next" "start" "-p" "3000" false 0 0 0 0 0 0 0'
+  const twoRun = runRouteEnv({ mode: 'service', execStart: two })
+  assert.match(twoRun.output, /^REFUSED=/m, 'TWO_COMMANDS: this installer writes exactly one')
+  assert.match(twoRun.output, /composed with 2 ExecStart= commands/, 'and the count comes from systemd’s own array')
+
+  // AN UNREADABLE ANSWER IS AN UNKNOWN, AND UNKNOWNS REFUSE. `as 1 "..."` is the signature of the
+  // ENVIRONMENT lists, so this is the shape a reader that asked the wrong property would get.
+  const wrongSignature = runRouteEnv({ mode: 'service', execStart: 'as 1 "/opt/app/node_modules/.bin/next"' })
+  assert.match(wrongSignature.output, /^REFUSED=/m, 'a rendering of another signature is not an answer')
+  assert.match(wrongSignature.output, /would not answer readably for .* ExecStart=/, 'and it says so rather than comparing what it could not read')
+
+  // A UNIT SYSTEMD DOES NOT HAVE CARRIES NO PROPERTY, so it cannot be started onto a checked one.
+  assert.match(runRouteEnv({ mode: 'service', loadState: 's "not-found"' }).output, /^REFUSED=/m,
+    'and a unit systemd has not loaded is a refusal, not a pass')
+
+  // THE CONTROL: the exact command the installer's own here-doc writes.
+  assert.match(runRouteEnv({ mode: 'service' }).output, /^GUARANTEED$/m,
+    'control: the ExecStart this installer wrote is admitted')
+  const source = readFileSync(join(REPO, 'scripts/install.sh'), 'utf8')
+  assert.match(source, /^ExecStart=\$\{APP_DIR\}\/node_modules\/\.bin\/next start -p \$\{APP_PORT\}$/m,
+    'and the expectation db_service_execstart_expected() states is the line the unit here-doc emits')
 })
 
 // ---------------------------------------------------------------------------
@@ -2198,43 +2361,54 @@ test('r44: the variables the installed driver consults are exactly the ones this
 })
 
 // ---------------------------------------------------------------------------
-// 25. THE OTHER HALF OF "BEFORE RECONCILIATION AND STARTUP"
+// 25. THE OTHER HALF OF "BEFORE RECONCILIATION AND STARTUP", THROUGH THE WHOLE START GATE
+//
+// 23c and 23d exercise the two new checks on their own. This runs them where they actually sit —
+// inside require_start_identity_bound(), the one call site that is about to hand the units to
+// systemd — so that "the start refuses" is a claim about the shipped start and not about a
+// helper. The DATABASE_URL half (the snapshot binding, the file agreement) is unchanged and is
+// asserted here as the control: it must still pass, or the transport checks would be masking it.
 // ---------------------------------------------------------------------------
 
-test('r44: a PGSSLMODE the service would be started with stops the start too', () => {
-  // The reconciliation half is test 22. This is the START: by then the gate has already rotated
-  // the credential against the record a CLEARTEXT connection is matched by, so a PGSSLMODE the
-  // service acquires between then and its exec is the same outage arriving after every check has
-  // passed.
-  //
-  // MUTATION ROUTE: delete the db_application_route_env_refusal() call from
-  // require_start_identity_bound() and the first case reports BOUND instead of REFUSED. The
-  // control below is what stops that mutation being answered by refusing everything.
+test('r45: the start gate refuses a transport the run never authenticated against', () => {
+  // MUTATION ROUTES:
+  //   M1 -- pass `installer` instead of `service` in require_start_identity_bound(): NO_DIRECTIVE
+  //         and WRAPPED both report BOUND, because the installer half only looks at this process.
+  //         That is r44's shipped behaviour and it is the finding.
+  //   M2 -- delete the db_application_route_env_refusal() call entirely: PROCESS_ENV also reports
+  //         BOUND.
+  //   M3 -- move the transport check AFTER require_env_file_is_sole_definition(): every assertion
+  //         here still passes, which is why the ORDER is not what this test claims — the claim is
+  //         that all four refuse, and the control is that a clean unit binds.
   const source = readFileSync(join(REPO, 'scripts/install.sh'), 'utf8')
   const lift = (name: string): string => {
     const start = source.indexOf(`\n${name}() {\n`)
     assert.notEqual(start, -1, `precondition: scripts/install.sh must define ${name}()`)
     return source.slice(start + 1, source.indexOf('\n}\n', start) + 3)
   }
-  const root = mkdtempSync(join(tmpdir(), 'ims-r44-start-'))
+  const root = mkdtempSync(join(tmpdir(), 'ims-r45-start-'))
   try {
     const envPath = join(root, '.env')
     const snapshot = join(root, 'db-identity.env')
     const url = 'postgresql://imsuser:pw@127.0.0.1:5432/one_two_inventory'
     writeFileSync(envPath, `NODE_ENV=production\nDATABASE_URL=${url}\n`)
     writeFileSync(snapshot, `DATABASE_URL=${url}\n`)
-    const run = (extra: string): string => {
+    const run = (extra: string, unsetEnvironment = HOST_UNSET, execStart?: string): string => {
+      const exec = (execStart ?? HOST_EXECSTART).replace(/\/opt\/app/g, root)
       const program = [
         'set -uo pipefail',
-        `APP_NAME="one-two-inventory"; APP_DIR=${JSON.stringify(root)}`,
+        `APP_NAME="one-two-inventory"; APP_DIR=${JSON.stringify(root)}; APP_PORT=3000`,
         'DB_USER=imsuser; DB_HOST=127.0.0.1; DB_PORT=5432; DB_NAME=one_two_inventory',
+        'DB_SSLMODE=disable; DB_SSLROOTCERT=""',
         `DATABASE_URL=${JSON.stringify(url)}`,
-        'BUS_STRINGS=(); BUS_ENV_IGNORE_FLAGS=(); ENV_VAR_SOURCE_REASON=""; DB_IDENTITY_SOURCE_REASON=""',
+        'BUS_STRINGS=(); BUS_ENV_IGNORE_FLAGS=(); BUS_UNIT_OBJECT=""',
+        'ENV_VAR_SOURCE_REASON=""; DB_IDENTITY_SOURCE_REASON=""',
+        'ENV_ROUTE_GUARANTEE_REASON=""; UNIT_EXECSTART_REASON=""',
+        'DB_ROUTE_DROPIN_NAME=zz-deploy-db-route.conf',
         `DB_ENV_SNAPSHOT_FILE=${JSON.stringify(snapshot)}`,
         'DB_ENV_SNAPSHOT_DROPIN_NAME=zz-deploy-db-identity.conf',
         'DB_ENV_SNAPSHOT_PUBLISHED=true; DB_IDENTITY_REQUIRE_SNAPSHOT=false',
         extra,
-        `systemctl(){ case "$*" in show-environment) printf 'LANG=C\\n' ;; *) return 1 ;; esac; }`,
         'busctl(){',
         '  case "$*" in',
         `    *LoadUnit*) printf '%s\\n' 'o "/x"' ;;`,
@@ -2242,17 +2416,20 @@ test('r44: a PGSSLMODE the service would be started with stops the start too', (
         `    *Service\\ EnvironmentFiles*) printf '%s\\n' 'a(sb) 2 "${envPath}" false "${snapshot}" false' ;;`,
         `    *Service\\ Environment*) printf '%s\\n' 'as 0' ;;`,
         `    *Service\\ PassEnvironment*) printf '%s\\n' 'as 0' ;;`,
-        `    *Service\\ UnsetEnvironment*) printf '%s\\n' 'as 0' ;;`,
+        `    *Service\\ UnsetEnvironment*) printf '%s\\n' '${unsetEnvironment}' ;;`,
+        `    *Service\\ ExecStart*) printf '%s\\n' '${exec}' ;;`,
         `    *Service\\ PAMName*) printf '%s\\n' 's ""' ;;`,
         '    *) return 1 ;;',
         '  esac',
         '}',
         lift('bus_read_strings'), lift('bus_array_count'), lift('bus_unit_property'),
         lift('bus_element_names_variable'), lift('bus_read_env_ignore_flags'),
+        lift('bus_unit_object'), lift('unit_route_env_guaranteed'),
+        lift('unit_execstart_is_exactly'), lift('db_service_execstart_expected'),
         lift('unit_env_var_sole_source'), lift('env_file_is_sole_database_url_source'),
         lift('require_env_file_is_sole_definition'), lift('env_file_value'),
-        lift('url_encode_userinfo'), lift('compose_database_url'),
-        lift('db_route_env_variables'), lift('db_route_env_effect'),
+        lift('url_encode_userinfo'), lift('db_url_route_query'), lift('compose_database_url'),
+        lift('db_route_env_variables'), lift('db_route_env_alternative'), lift('db_route_env_effect'),
         lift('db_application_route_env_refusal'), lift('require_start_identity_bound'),
         'if require_start_identity_bound; then echo "BOUND"; else echo "REFUSED=${DB_IDENTITY_SOURCE_REASON}"; fi',
       ].join('\n')
@@ -2263,13 +2440,212 @@ test('r44: a PGSSLMODE the service would be started with stops the start too', (
         return `${failure.stdout ?? ''}${failure.stderr ?? ''}`
       }
     }
+
+    // PROCESS_ENV: the source no unit directive can close.
     const withMode = run('export PGSSLMODE=require')
-    assert.match(withMode, /^REFUSED=/m, `the start must refuse:\n${withMode}`)
+    assert.match(withMode, /^REFUSED=/m, `PROCESS_ENV: the start must refuse:\n${withMode}`)
     assert.match(withMode, /PGSSLMODE=require/, 'and name the variable')
     assert.match(withMode, /rotated its credential against that record/, 'and say why the start is the wrong moment to discover it')
+    assert.match(withMode, /DB_SSLMODE=require/, 'and name the supported spelling of the same intent')
+
+    // NO_DIRECTIVE: the unit systemd has loaded does not remove the transport variables, so what
+    // any environment file, wildcard or not, says at exec is still the route.
+    const noDirective = run('true', 'as 0')
+    assert.match(noDirective, /^REFUSED=/m, `NO_DIRECTIVE: the start must refuse:\n${noDirective}`)
+    assert.match(noDirective, /does not list PGSSLMODE as a bare name in UnsetEnvironment=/, 'and say which property is missing')
+
+    // WRAPPED: the layer the directive cannot reach.
+    const wrapped = run('true', HOST_UNSET,
+      'a(sasbttttuii) 1 "/usr/bin/env" 6 "/usr/bin/env" "PGSSLMODE=no-verify" "/opt/app/node_modules/.bin/next" "start" "-p" "3000" false 0 0 0 0 0 0 0')
+    assert.match(wrapped, /^REFUSED=/m, `WRAPPED: the start must refuse:\n${wrapped}`)
+    assert.match(wrapped, /PGSSLMODE=no-verify/, 'and quote the assignment the wrapper carries')
+
+    // THE CONTROL, and it is what stops any of the mutations above being answered by "refuse
+    // everything": the unit this installer actually writes, with this run's snapshot loaded last,
+    // still binds.
     const clean = run('true')
-    assert.match(clean, /^BOUND$/m, `control: the same unit with nothing set still binds:\n${clean}`)
+    assert.match(clean, /^BOUND$/m, `control: the unit this installer writes still binds:\n${clean}`)
+
+    // AND THE DATABASE_URL HALF IS STILL LOAD-BEARING, so the transport checks are not masking it.
+    writeFileSync(envPath, 'NODE_ENV=production\nDATABASE_URL=postgresql://imsuser:other@127.0.0.1:5432/one_two_inventory\n')
+    const drifted = run('true')
+    assert.match(drifted, /^REFUSED=/m, `control: a .env that no longer states this run's URL still refuses:\n${drifted}`)
+    assert.match(drifted, /no longer states the DATABASE_URL this run fenced and migrated with/, 'for the reason it always did')
   } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 26. THE LOAD-BEARING ONE FOR r45's MEDIUM: a TLS-ONLY EXTERNAL DATABASE, INSTALLED
+//
+// THE FINDING (Codex MEDIUM, and it blocks as hard as the two HIGHs). r44 refused every PGSSLMODE
+// from every source and emitted a URL with no TLS configuration in it. docs/installation.md
+// documents external PostgreSQL as supported, and a great many external clusters -- every managed
+// one -- accept nothing but TLS. So a documented deployment became impossible, and the remediation
+// the refusal printed ("remove PGSSLMODE") either left the application unable to connect at all or
+// asked an operator to abandon a required trust boundary.
+//
+// WHAT WAS RIGHT ABOUT THE REFUSAL IS KEPT: an AMBIENT value is still refused, because it is
+// invisible in the URL and therefore to every probe (23b). What is added is the supported
+// spelling -- DB_SSLMODE -- which puts the transport IN the URL, where the derivation reads it and
+// the reader and the psql probes are pinned to it.
+//
+// AND THE SEMANTICS QUESTION IS ANSWERED BY SELECTING THE DRIVER'S OWN, NOT BY REPRODUCING IT.
+// r43 refused to emit `?sslmode=require` because on pg-connection-string that word means
+// verify-full-against-Node's-CA-bundle, which is not libpq's `require` and which no psql pin
+// reproduces. The emitted URL therefore also carries `uselibpqcompat=true`, the parameter the
+// driver ships for exactly this purpose: it switches pg-connection-string to its libpq-compatible
+// branch, where `require`, `verify-ca` and `verify-full` mean what libpq and psql mean by them.
+// Every claim in the next test is MEASURED against the installed driver, on a real cluster on
+// which the cleartext record REJECTS -- so a mistake anywhere in that chain is a failure here.
+// ---------------------------------------------------------------------------
+
+/** What the INSTALLED driver does with one URL: which user got in, over what transport, or why not. */
+async function driverRoute(url: string): Promise<string> {
+  const { default: pgModule } = await import('pg')
+  const client = new pgModule.Client({ connectionString: url })
+  try {
+    await client.connect()
+    const result = await client.query('SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()')
+    await client.end()
+    return result.rows[0].ssl === true ? 'tls' : 'cleartext'
+  } catch (error) {
+    return `refused:${(error as { code?: string }).code ?? (error as Error).message}`
+  }
+}
+
+test('r45: a TLS-only external database is installable, and the gate validates the route it actually takes', async () => {
+  // MUTATION ROUTES (each applied to scripts/install.sh and this file re-run):
+  //   M1 -- drop `&uselibpqcompat=true` from db_url_route_query(). PRECONDITION_COMPAT fails
+  //         immediately: the driver's `require` becomes verify-full against Node's CA bundle and
+  //         the application connection is refused DEPTH_ZERO_SELF_SIGNED_CERT, while the psql
+  //         probes -- which ARE libpq -- sail through. That is r43's divergence restored, and it
+  //         is why the parameter is not decoration.
+  //   M2 -- have db_application_route_sslmode() return `disable` regardless of DB_SSLMODE: the
+  //         gate is REFUSED (the reader is told `disable`, the hostnossl record rejects, no method
+  //         is read) and REQUIRE_ADMITTED fails. The run refuses rather than rotating, which is
+  //         the safe direction -- but the deployment is impossible again, which is the finding.
+  //   M3 -- remove PGSSLROOTCERT from pg_endpoint_psql()'s route array: VERIFY_FULL_ADMITTED
+  //         fails, because the credential probe then verifies against libpq's default trust store
+  //         (~/.postgresql/root.crt of the probing user) and cannot complete the handshake at all.
+  //   M4 -- accept `no-verify` in db_sslmode_is_supported() and pass it through: the URL parses,
+  //         but the reader dies on `--sslmode=no-verify` (it is not a libpq word) and the gate
+  //         refuses. The supported set is the intersection of three clients on purpose.
+  const root = mkdtempSync(join(tmpdir(), 'ims-r45-tls-'))
+  let cluster: Cluster | undefined
+  try {
+    cluster = startCluster(root, 'live', await freePort(), '127.0.0.1', [
+      'hostssl all all 127.0.0.1/32 scram-sha-256',
+      'hostnossl all all 127.0.0.1/32 reject',
+    ], { ssl: true })
+    seedLiveInstallation(cluster)
+    const ca = join(cluster.data, 'server.crt')
+    const plain = `postgresql://imsuser:live-password@127.0.0.1:${cluster.port}/postgres`
+
+    // PRECONDITION 1: this is a database r44 could not install. The URL r44 emitted is REFUSED by
+    // the cluster, so no credential this installer could publish would start the application.
+    assert.match(await driverRoute(plain), /^refused:/,
+      'precondition: the query-less URL r44 emitted is rejected by a TLS-only cluster — this is the deployment the blanket refusal stranded')
+
+    // PRECONDITION 2, PRECONDITION_COMPAT: the difference the compatibility parameter makes,
+    // measured with the installed driver rather than read out of its documentation.
+    assert.match(await driverRoute(`${plain}?sslmode=require`), /^refused:DEPTH_ZERO_SELF_SIGNED_CERT$/,
+      'precondition: without uselibpqcompat, pg’s `require` is verify-full against Node’s own CA bundle — r43 measured this and it still holds')
+    assert.equal(await driverRoute(`${plain}?sslmode=require&uselibpqcompat=true`), 'tls',
+      'PRECONDITION_COMPAT: with it, `require` means what libpq means — encrypted, certificate not verified — and the hostssl record answers')
+    assert.equal(await driverRoute(`${plain}?sslmode=verify-full&uselibpqcompat=true&sslrootcert=${ca}`), 'tls',
+      'and verify-full against the cluster’s own certificate completes, chain and hostname both')
+    assert.match(await driverRoute(`${plain}?sslmode=verify-full&uselibpqcompat=true`), /^refused:/,
+      'while verify-full WITHOUT the CA is refused — so the CA is load-bearing and not decoration')
+
+    // AND THE URL THE SHIPPED COMPOSER EMITS IS EXACTLY THE ONE MEASURED ABOVE. This is what stops
+    // the preconditions being a statement about strings this file invented.
+    for (const [mode, rootcert, expected] of [
+      ['require', '', `?sslmode=require&uselibpqcompat=true`],
+      ['verify-full', ca, `?sslmode=verify-full&uselibpqcompat=true&sslrootcert=${ca}`],
+      ['disable', '', ''],
+    ] as ReadonlyArray<[string, string, string]>) {
+      const composed = runShipped({ ...installVars(cluster, root), DB_SSLMODE: mode, DB_SSLROOTCERT: rootcert }, `
+        echo "URL=$(compose_database_url "\${DB_USER}" "live-password" "\${DB_HOST}" "\${DB_PORT}" postgres)"
+      `)
+      assert.equal(composed.status, 0, composed.output)
+      assert.match(readVar(composed.output, 'URL'), new RegExp(`${expected.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`),
+        `the shipped composer emits the ${mode} URL the driver was measured on:\n${composed.output}`)
+    }
+
+    // REQUIRE_ADMITTED: the whole gate, on the route the application takes.
+    const requireRun = runShipped({ ...installVars(cluster, root), DB_SSLMODE: 'require' }, `
+      DB_PROBE_REPORT=""
+      echo "ROUTE=$(db_application_route_sslmode)"
+      if db_endpoint_checks_role_verifier postgres; then echo "GATE=admitted"; else echo "GATE=refused"; fi
+      echo "PIN=\${DB_PROBE_SSLMODE}"
+      if db_endpoint_is_password_sensitive postgres live-password; then echo "SENSITIVE=yes"; else echo "SENSITIVE=no"; fi
+      echo "REPORT_B64=$(printf '%s' "\${DB_PROBE_REPORT}" | base64 -w0)"
+    `)
+    assert.equal(requireRun.status, 0, requireRun.output)
+    assert.match(requireRun.output, /^ROUTE=require$/m, 'the derivation answers the transport DB_SSLMODE names')
+    assert.match(requireRun.output, /^GATE=admitted$/m,
+      `REQUIRE_ADMITTED: the method is read on the hostssl record the application will be matched by:\n${requireRun.output}`)
+    assert.match(requireRun.output, /^PIN=require$/m, 'and the credential probes are pinned to that same route')
+    assert.match(requireRun.output, /^SENSITIVE=yes$/m,
+      `and the negative control and the positive both run on it, over TLS:\n${Buffer.from(readVar(requireRun.output, 'REPORT_B64'), 'base64').toString('utf8')}`)
+
+    // AND THE READER REPORTS THE ROUTE IT TOOK, which is what makes the pin a checked claim.
+    const onRequire = readerOn(cluster.port, 'require')
+    assert.match(onRequire, /^sslmode=require$/m, 'the reader states the route back')
+    assert.match(onRequire, /^method=scram-sha-256$/m, 'and reads the hostssl record on it')
+
+    // VERIFY_FULL_ADMITTED: the same, with the certificate actually verified — the case Codex
+    // named as "certificate-verified transport", and the one that needs the CA to travel with the
+    // mode into all three clients.
+    const verifyRun = runShipped({ ...installVars(cluster, root), DB_SSLMODE: 'verify-full', DB_SSLROOTCERT: ca }, `
+      DB_PROBE_REPORT=""
+      echo "ROUTE=$(db_application_route_sslmode)"
+      if db_endpoint_checks_role_verifier postgres; then echo "GATE=admitted"; else echo "GATE=refused"; fi
+      echo "PIN=\${DB_PROBE_SSLMODE}"
+      if db_endpoint_is_password_sensitive postgres live-password; then echo "SENSITIVE=yes"; else echo "SENSITIVE=no"; fi
+      echo "REPORT_B64=$(printf '%s' "\${DB_PROBE_REPORT}" | base64 -w0)"
+    `)
+    assert.equal(verifyRun.status, 0, verifyRun.output)
+    assert.match(verifyRun.output, /^ROUTE=verify-full$/m, 'the derivation answers verify-full')
+    assert.match(verifyRun.output, /^GATE=admitted$/m,
+      `VERIFY_FULL_ADMITTED: the method is read over a VERIFIED connection:\n${Buffer.from(readVar(verifyRun.output, 'REPORT_B64'), 'base64').toString('utf8')}`)
+    assert.match(verifyRun.output, /^PIN=verify-full$/m, 'and psql is pinned to verify-full with the same CA')
+    assert.match(verifyRun.output, /^SENSITIVE=yes$/m, 'and the credential probes complete on it')
+
+    // AND THE READER VERIFIES THE CERTIFICATE WHEN IT IS TOLD TO, rather than reporting a route it
+    // did not take. Without the CA it cannot complete the handshake at all, which is the proof
+    // that `verify-full` is not `require` wearing a different label.
+    const verified = execFileSync('node', [
+      join(REPO, 'scripts/lib/pg-auth-request.mjs'),
+      '--host=127.0.0.1', `--port=${cluster.port}`, '--user=imsuser', '--database=postgres',
+      '--sslmode=verify-full', `--sslrootcert=${ca}`,
+    ], { encoding: 'utf8', env: cleanLibpqEnv(), stdio: ['ignore', 'pipe', 'pipe'] })
+    assert.match(verified, /^sslmode=verify-full$/m, 'the reader states verify-full back only when it took it')
+    assert.match(verified, /^method=scram-sha-256$/m, 'and reads the record on it')
+    let withoutCa = ''
+    try {
+      execFileSync('node', [
+        join(REPO, 'scripts/lib/pg-auth-request.mjs'),
+        '--host=127.0.0.1', `--port=${cluster.port}`, '--user=imsuser', '--database=postgres',
+        '--sslmode=verify-full',
+      ], { encoding: 'utf8', env: cleanLibpqEnv(), stdio: ['ignore', 'pipe', 'pipe'] })
+    } catch (error) {
+      withoutCa = String((error as { stdout?: string }).stdout ?? '')
+    }
+    assert.match(withoutCa, /--sslrootcert= is required/, 'and it refuses to verify against a trust store nobody named')
+
+    // THE REFUSAL THAT REMAINS, AND ITS WAY OUT. An unsupported spelling is still refused — and the
+    // message names the four that are supported rather than telling the operator to remove their
+    // transport.
+    const unsupported = runShipped({ ...installVars(cluster, root), DB_SSLMODE: 'no-verify' }, `
+      if route="$(db_application_route_sslmode)"; then echo "ROUTE=\${route}"; else echo "REFUSED=\${route}"; fi
+    `)
+    assert.match(unsupported.output, /^REFUSED=/m, 'an unsupported mode refuses')
+    assert.match(unsupported.output, /disable, require, verify-ca and verify-full/, 'and names the ones that are')
+  } finally {
+    cluster?.stop()
     rmSync(root, { recursive: true, force: true })
   }
 })
