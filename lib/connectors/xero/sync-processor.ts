@@ -63,9 +63,9 @@ import {
   paymentAccountRefusalMessage,
   refusedFollowUpEnqueue,
   decideRequestedInvoicePayment,
-  unreadablePaymentAmountRefusalMessage,
+  unreadablePaymentPayloadRefusalMessage,
   type FollowUpEnqueueOutcome,
-  type PaymentRefusalContext,
+  type UnreadablePaymentPayload,
   type RefusedFollowUpEnqueue,
 } from '@/lib/domain/accounting/followup-enqueue-outcome'
 import {
@@ -7156,7 +7156,7 @@ async function decideInvoicePaymentFollowUp(
    * from the connector's registry entry rather than from a promise written here.
    */
   const refuse = async (
-    { method, currency }: PaymentRefusalContext,
+    { method, currency }: { method: string; currency: string },
     missing: string,
     configure: string,
   ): Promise<RefusedFollowUpEnqueue> => {
@@ -7209,13 +7209,13 @@ async function decideInvoicePaymentFollowUp(
    * make the amount readable, so every pass refuses again until the payload itself is rebuilt.
    */
   const refuseUnreadable = async (
-    detail: string,
-    { method, currency }: PaymentRefusalContext,
+    { fact, detail, known: { method, currency } }: UnreadablePaymentPayload,
   ): Promise<RefusedFollowUpEnqueue> => {
-    const message = unreadablePaymentAmountRefusalMessage({
+    const message = unreadablePaymentPayloadRefusalMessage({
       connector: 'Xero',
       referenceType,
       referenceId,
+      fact,
       detail,
       recovery: followUpObligationRecoveryNote(followUpObligationRecoveryFor(XERO_CONNECTOR)),
     })
@@ -7229,14 +7229,14 @@ async function decideInvoicePaymentFollowUp(
         type: 'INVOICE_PAYMENT',
         referenceType,
         referenceId,
-        reason: 'payment_amount_unreadable',
+        reason: 'payment_payload_unreadable',
         method,
         currency,
         sourceEntryId: entryId,
       },
     })
     return refusedFollowUpEnqueue({
-      type: 'INVOICE_PAYMENT', referenceType, referenceId, reason: 'payment_amount_unreadable', message,
+      type: 'INVOICE_PAYMENT', referenceType, referenceId, reason: 'payment_payload_unreadable', message,
     })
   }
 

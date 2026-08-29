@@ -520,7 +520,7 @@ test('[o3d-batch-ret r8] a payment amount that cannot be READ is refused on ever
     const refusal = paymentRefusals()
     assert.equal(refusal.length, 1, `the operator is told once, and told why (${what})`)
     assert.equal(
-      refusal[0].metadata?.reason, 'payment_amount_unreadable',
+      refusal[0].metadata?.reason, 'payment_payload_unreadable',
       `and it is NOT reported as the mapping refusal (${what}) — the mapping here is correct, and a `
         + 'bank-account screen is no remedy for a corrupt payload',
     )
@@ -669,7 +669,7 @@ test('[o3d-batch-ret r9] a PRESENT null is refused on every field that had a def
     const refusal = paymentRefusals()
     assert.equal(refusal.length, 1, `the operator is told once, and told why (${what})`)
     assert.equal(
-      refusal[0].metadata?.reason, 'payment_amount_unreadable',
+      refusal[0].metadata?.reason, 'payment_payload_unreadable',
       `and it is the CORRUPT-PAYLOAD refusal (${what}), not the mapping one — the mapping is correct here`,
     )
     assert.match(refusal[0].description, detail, `the sentence names the field and what it holds (${what})`)

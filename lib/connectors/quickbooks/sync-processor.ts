@@ -45,9 +45,9 @@ import {
   postedRowFollowUpRetryNote,
   refusedFollowUpEnqueue,
   decideRequestedInvoicePayment,
-  unreadablePaymentAmountRefusalMessage,
+  unreadablePaymentPayloadRefusalMessage,
   type FollowUpEnqueueOutcome,
-  type PaymentRefusalContext,
+  type UnreadablePaymentPayload,
   type RefusedFollowUpEnqueue,
 } from '@/lib/domain/accounting/followup-enqueue-outcome'
 import { isUniqueConstraintViolation } from '@/lib/db/prisma-unique-violation'
@@ -2143,7 +2143,7 @@ async function decideInvoicePaymentFollowUp(
    * read off this connector's registry entry, which says nothing re-drives the row.
    */
   const refuse = async (
-    { method, currency }: PaymentRefusalContext,
+    { method, currency }: { method: string; currency: string },
     missing: string,
     configure: string,
   ): Promise<RefusedFollowUpEnqueue> => {
@@ -2207,13 +2207,13 @@ async function decideInvoicePaymentFollowUp(
    * retry, so the honest clause is the registry's at-rest fact and the message says the rest itself.
    */
   const refuseUnreadable = async (
-    detail: string,
-    { method, currency }: PaymentRefusalContext,
+    { fact, detail, known: { method, currency } }: UnreadablePaymentPayload,
   ): Promise<RefusedFollowUpEnqueue> => {
-    const message = unreadablePaymentAmountRefusalMessage({
+    const message = unreadablePaymentPayloadRefusalMessage({
       connector: 'QuickBooks',
       referenceType,
       referenceId,
+      fact,
       detail,
       recovery: followUpObligationRecoveryNote(QBO_FOLLOW_UP_RECOVERY),
     })
@@ -2227,13 +2227,13 @@ async function decideInvoicePaymentFollowUp(
         type: 'INVOICE_PAYMENT',
         referenceType,
         referenceId,
-        reason: 'payment_amount_unreadable',
+        reason: 'payment_payload_unreadable',
         method,
         currency,
       },
     })
     return refusedFollowUpEnqueue({
-      type: 'INVOICE_PAYMENT', referenceType, referenceId, reason: 'payment_amount_unreadable', message,
+      type: 'INVOICE_PAYMENT', referenceType, referenceId, reason: 'payment_payload_unreadable', message,
     })
   }
 

@@ -29,7 +29,7 @@ import {
 import {
   paymentAccountRefusalMessage,
   postedRowFollowUpRetryNote,
-  unreadablePaymentAmountRefusalMessage,
+  unreadablePaymentPayloadRefusalMessage,
 } from '@/lib/domain/accounting/followup-enqueue-outcome'
 import { ACCOUNTING_CONNECTORS } from '@/lib/connectors/accounting-registry'
 import {
@@ -2487,19 +2487,33 @@ function activityProducers(): Array<{ what: string; text: string; mustEscalate: 
   //    Walked for every registry connector plus the undeclared fallback, because the recovery half
   //    arrives as an ARGUMENT here exactly as it does above, and the r6 lesson is that an argument
   //    is where a clause true of one call site gets passed to one where it is false.
+  //
+  //    o3d-batch-ret ROUND 10: AND IT IS THREE SENTENCES NOW, NOT ONE. Round 8's single opening
+  //    clause asserted "the invoice asked for a payment to be registered", which is FALSE on a
+  //    `_registerPayment` refusal — whether the invoice asked is the very fact that could not be
+  //    read. `UnreadablePaymentFact` selects the clause, so every FORM is walked here rather than
+  //    the one form somebody happened to point the list at: that is the r8 lesson applied to the
+  //    producer this round widened.
   for (const connector of [...Object.keys(ACCOUNTING_FOLLOW_UP_RECOVERY), UNDECLARED_CONNECTOR]) {
-    produced.push({
-      what: `unreadablePaymentAmountRefusalMessage for ${connector} `
-        + `(the ${connector}_payment_skipped activity, reason payment_amount_unreadable)`,
-      text: unreadablePaymentAmountRefusalMessage({
-        connector,
-        referenceType: 'SalesOrder',
-        referenceId: 'so-1',
-        detail: '`_paymentAmount` is the string "not-a-number", which is not a finite amount',
-        recovery: followUpObligationRecoveryNote(followUpObligationRecoveryFor(connector)),
-      }),
-      mustEscalate: true,
-    })
+    for (const { fact, detail } of [
+      { fact: 'request' as const, detail: '`_registerPayment` is null, which is neither `true` nor `false`' },
+      { fact: 'amount' as const, detail: '`_paymentAmount` is the string "not-a-number", which is not a finite amount' },
+      { fact: 'field' as const, detail: '`currency` is null, which is not a currency code' },
+    ]) {
+      produced.push({
+        what: `unreadablePaymentPayloadRefusalMessage for ${connector}, ${fact} clause `
+          + `(the ${connector}_payment_skipped activity, reason payment_payload_unreadable)`,
+        text: unreadablePaymentPayloadRefusalMessage({
+          connector,
+          referenceType: 'SalesOrder',
+          referenceId: 'so-1',
+          fact,
+          detail,
+          recovery: followUpObligationRecoveryNote(followUpObligationRecoveryFor(connector)),
+        }),
+        mustEscalate: true,
+      })
+    }
   }
   return produced
 }
@@ -2516,8 +2530,9 @@ const EXPECTED_ACTIVITY_PRODUCERS =
   // o3d-batch-ret r7: the payment-mapping refusal, in BOTH clause forms, for every registry
   // connector plus the undeclared fallback
   + (Object.keys(ACCOUNTING_FOLLOW_UP_RECOVERY).length + 1) * 2
-  // o3d-batch-ret r8: the unreadable-amount refusal, for every registry connector plus the fallback
-  + (Object.keys(ACCOUNTING_FOLLOW_UP_RECOVERY).length + 1)
+  // o3d-batch-ret r8: the unreadable-payload refusal, for every registry connector plus the
+  // fallback — and since r10 in all THREE of its clause forms (request / amount / field)
+  + (Object.keys(ACCOUNTING_FOLLOW_UP_RECOVERY).length + 1) * 3
 
 test('[o3d-0bfh r11] every activity string an operator can receive is judged by THE ONE LIST, taken from its producer', () => {
   // Route: xeroRetainedFollowUpObligationDescription() — the function that composes the
@@ -2707,7 +2722,7 @@ test('[o3d-0bfh r11/r12] every FILE that writes about a retained obligation is s
   assert.match(sources[5]!.code, /export function postedRowFollowUpRetryNote/)
   // r8: and the third producer in that file, which says what the other two cannot — that there is
   // nothing to configure and no retry that repairs it.
-  assert.match(sources[5]!.code, /export function unreadablePaymentAmountRefusalMessage/)
+  assert.match(sources[5]!.code, /export function unreadablePaymentPayloadRefusalMessage/)
   assert.match(
     sources[5]!.code, /\$\{input\.atRest\}/,
     'the at-rest half must be interpolated from the caller\'s registry answer, never restated here',

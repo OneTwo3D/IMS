@@ -95,23 +95,29 @@ export type FollowUpPreEnqueueRefusalReason =
    */
   | 'payment_account_unmapped'
   /**
-   * o3d-batch-ret ROUND 8 (Codex HIGH): `_registerPayment` was requested and the persisted payload
-   * CANNOT SAY HOW MUCH — a `_paymentAmount` that is not a finite amount, an absent or non-array
-   * `lines` to derive one from, a line whose quantity or unit amount cannot be read, or a derived
-   * total that is not finite.
+   * o3d-batch-ret ROUND 8 (Codex HIGH), WIDENED IN ROUND 10: A FIELD THE PAYMENT DECISION IS BUILT
+   * FROM IS PRESENT AND CANNOT BE READ.
+   *
+   * Round 8 named it `payment_amount_unreadable`, because the amount was the only field that had
+   * been given the treatment. Round 10 classified the whole boundary — the `_registerPayment` flag,
+   * the amount (`_paymentAmount`/`lines`/`shippingAmount`/`discountAmount`), and the
+   * `_paymentMethod`, `currency` and `_paymentDate` the enqueue writes onto the row — and every one
+   * of them can now be present holding something nothing can read. They share this code because they
+   * share a REMEDY, which is what a reason code is for: there is nothing to configure, retrying
+   * reads the same bytes, and the payload itself has to be rebuilt. Which field it was is in the
+   * refusal's `detail` and in {@link UnreadablePaymentFact}, not in a fan of near-identical codes.
    *
    * IT IS A SECOND, DIFFERENT PRE-ENQUEUE REFUSAL AND NOT A CASE OF THE FIRST. The one above is a
    * SETTING an operator can correct, and correcting it makes the next pass queue the payment. This
-   * one is a corrupt payload at rest: there is nothing to configure, retrying reads the same bytes,
-   * and the remedy is to have the payload rebuilt. Folding it into `payment_account_unmapped` would
-   * send an operator to a bank-account screen that has nothing to do with it.
+   * one is a corrupt payload at rest, and folding it into `payment_account_unmapped` would send an
+   * operator to a bank-account screen that has nothing to do with it.
    *
    * BEFORE THIS EXISTED IT WAS REPORTED AS SUCCESS, one level below where round 6 found the same
    * class: `requestedInvoicePaymentAmount` answered `number | undefined`, and both connectors read
    * the undefined and the derived zero the same way — FOLLOW_UPS_ENQUEUED. See
    * {@link RequestedInvoicePayment}.
    */
-  | 'payment_amount_unreadable'
+  | 'payment_payload_unreadable'
 
 /** Every reason a follow-up can be reported as still owed — the enqueue's own, and the caller's. */
 export type FollowUpEnqueueRefusalReason = FollowUpEnqueueDeclineReason | FollowUpPreEnqueueRefusalReason
@@ -549,6 +555,34 @@ export type PaymentRefusalContext = {
   readonly currency: string | null
 }
 
+/**
+ * WHICH OF THE THREE THINGS THE PAYLOAD FAILED TO STATE (o3d-batch-ret r10, Codex HIGH).
+ *
+ * They share one reason code because they share one remedy, and they DO NOT share one sentence.
+ * Round 8's message opens "the invoice asked for a payment to be registered and the persisted
+ * payload cannot say how much", and the round-7/r8 lesson is precisely that a clause true of one
+ * call site becomes a lie at the next: on a `request` refusal we do not know that the invoice asked
+ * for anything — that is the very fact that could not be read — and on a `field` refusal the amount
+ * read perfectly well. `unreadablePaymentPayloadRefusalMessage` composes the opening clause and the
+ * "X IS NOT Y" claim from this, and the registry test walks all three forms.
+ */
+export type UnreadablePaymentFact =
+  /** `_registerPayment` is present and is neither `true` nor `false`. */
+  | 'request'
+  /** A payment was asked for and how much cannot be read. */
+  | 'amount'
+  /** A payment of a known amount was asked for and a field the registration is built from cannot be read. */
+  | 'field'
+
+/** A payment the payload asked for, or may have asked for, and could not describe. */
+export type UnreadablePaymentPayload = {
+  readonly fact: UnreadablePaymentFact
+  /** Which field could not be read, and what it holds, as a clause. */
+  readonly detail: string
+  /** Whatever else about the row the log can still name truthfully. */
+  readonly known: PaymentRefusalContext
+}
+
 /** The whole payload boundary's answer for this path. */
 type InvoicePaymentRequest =
   /** Readably, no payment is owed. The ONLY arm that may settle. */
@@ -556,7 +590,7 @@ type InvoicePaymentRequest =
   /** Every field read, and a payment to queue. */
   | { readonly kind: 'requested'; readonly payment: InvoicePaymentToRegister }
   /** Some field is present and cannot be read. NOT a zero, and not a mapping problem. */
-  | { readonly kind: 'invalid'; readonly detail: string; readonly known: PaymentRefusalContext }
+  | { readonly kind: 'invalid'; readonly unreadable: UnreadablePaymentPayload }
 
 /**
  * THE WHOLE BOUNDARY, IN ORDER — AND THE ORDER IS ITSELF A DECISION (o3d-batch-ret r10, Codex HIGH).
@@ -582,18 +616,21 @@ function invoicePaymentRequest(payload: Record<string, unknown>): InvoicePayment
     currency: 'value' in currency ? currency.value : null,
   }
 
+  const unreadable = (fact: UnreadablePaymentFact, detail: string): InvoicePaymentRequest =>
+    ({ kind: 'invalid', unreadable: { fact, detail, known } })
+
   const requested = payloadPaymentRequested(payload)
-  if ('detail' in requested) return { kind: 'invalid', detail: requested.detail, known }
+  if ('detail' in requested) return unreadable('request', requested.detail)
   if (!requested.value) return { kind: 'none' }
 
   const amount = requestedInvoicePayment(payload)
-  if (amount.kind === 'invalid') return { kind: 'invalid', detail: amount.detail, known }
+  if (amount.kind === 'invalid') return unreadable('amount', amount.detail)
   if (amount.kind === 'none') return { kind: 'none' }
 
-  if ('detail' in method) return { kind: 'invalid', detail: method.detail, known }
-  if ('detail' in currency) return { kind: 'invalid', detail: currency.detail, known }
+  if ('detail' in method) return unreadable('field', method.detail)
+  if ('detail' in currency) return unreadable('field', currency.detail)
   const paymentDate = payloadPaymentDate(payload)
-  if ('detail' in paymentDate) return { kind: 'invalid', detail: paymentDate.detail, known }
+  if ('detail' in paymentDate) return unreadable('field', paymentDate.detail)
 
   return {
     kind: 'requested',
@@ -649,7 +686,7 @@ export async function decideRequestedInvoicePayment(
   payload: Record<string, unknown>,
   handle: {
     onAmount: (payment: InvoicePaymentToRegister) => Promise<FollowUpEnqueueOutcome>
-    onInvalid: (detail: string, known: PaymentRefusalContext) => Promise<RefusedFollowUpEnqueue>
+    onInvalid: (unreadable: UnreadablePaymentPayload) => Promise<RefusedFollowUpEnqueue>
   },
 ): Promise<FollowUpEnqueueOutcome> {
   const requested = invoicePaymentRequest(payload)
@@ -659,12 +696,21 @@ export async function decideRequestedInvoicePayment(
     case 'requested':
       return await handle.onAmount(requested.payment)
     case 'invalid':
-      return await handle.onInvalid(requested.detail, requested.known)
+      return await handle.onInvalid(requested.unreadable)
   }
 }
 
 /**
- * WHAT AN OPERATOR IS TOLD WHEN THE PAYLOAD CANNOT SAY WHAT IS OWED (o3d-batch-ret r8, Codex HIGH).
+ * WHAT AN OPERATOR IS TOLD WHEN THE PAYLOAD CANNOT SAY WHAT IS OWED (o3d-batch-ret r8, Codex HIGH),
+ * IN THE THREE FORMS THE BOUNDARY ACTUALLY PRODUCES (r10).
+ *
+ * Round 8 wrote ONE sentence because the amount was the only field classified. Round 10 classified
+ * the flag and the three registration fields as well, and the opening clause it inherited —
+ * "the invoice asked for a payment to be registered" — is FALSE of a `_registerPayment` refusal,
+ * where whether the invoice asked is the fact that could not be read. That is the r7 finding again
+ * (a clause true of one call site passed to one where it is false), so the clause is selected from
+ * {@link UnreadablePaymentFact} rather than written once and reused. The rest of the message is
+ * true of all three and stays shared.
  *
  * A payload the code cannot read is a REAL STATE an operator needs to see. It is not a mapping
  * problem — there is no setting to correct — and it is not "nothing was owed", so neither of the
@@ -680,21 +726,49 @@ export async function decideRequestedInvoicePayment(
  * it and ESCALATE what they read, and nothing more — a receipt entered by hand would be a second
  * one that no request id can deduplicate (the o3d-0bfh r11 rule).
  */
-export function unreadablePaymentAmountRefusalMessage(input: {
+const UNREADABLE_PAYMENT_CLAUSES: Record<UnreadablePaymentFact, { asked: string; claim: string }> = {
+  /**
+   * THE ONE THAT COULD NOT BORROW ROUND 8'S SENTENCE (o3d-batch-ret r10). Every other refusal on
+   * this path opens "the invoice asked for a payment to be registered" — and here that is the fact
+   * that could not be read. Saying it anyway would assert the thing the row is refusing over.
+   */
+  request: {
+    asked: 'the persisted payload does not say whether a payment was asked for at all',
+    claim: 'AN UNREADABLE REQUEST IS NOT A "NO": this row does not say no payment was owed, it says whether one is '
+      + 'owed cannot be read from it — and it is equally not a YES, so registering one on the strength of it would '
+      + 'be a receipt against an invoice nothing asked to settle',
+  },
+  amount: {
+    asked: 'the invoice asked for a payment to be registered and the persisted payload cannot say how much',
+    claim: 'AN UNREADABLE AMOUNT IS NOT A ZERO: this row does not say no payment was owed, it says how much is owed '
+      + 'cannot be read from it',
+  },
+  field: {
+    asked: 'the invoice asked for a payment to be registered and a field the registration is built from cannot be read',
+    claim: 'AN UNREADABLE FIELD IS NOT ITS DEFAULT: this row does not state the value that was assumed for it — a '
+      + 'currency read as sterling settles the money into the wrong bank account, and a date read as today dates the '
+      + 'receipt wrongly in the ledger',
+  },
+}
+
+export function unreadablePaymentPayloadRefusalMessage(input: {
   /** Display name of the accounting package, for the operator: `Xero`, `QuickBooks`. */
   connector: string
   referenceType: string
   referenceId: string
+  /** Which of the three things the payload failed to state. */
+  fact: UnreadablePaymentFact
   /** Which field could not be read, and what it holds, as a clause. */
   detail: string
   /** The connector's declared recovery note — what re-reads the retained marker, if anything. */
   recovery: string
 }): string {
+  const { asked, claim } = UNREADABLE_PAYMENT_CLAUSES[input.fact]
   return `Refused to enqueue the ${input.connector} INVOICE_PAYMENT for ${input.referenceType} ${input.referenceId}: `
-    + `the invoice asked for a payment to be registered and the persisted payload cannot say how much — ${input.detail}. `
+    + `${asked} — ${input.detail}. `
     + 'NOTHING WAS QUEUED, and the row is deliberately left marked as owing follow-ups so the money is not reported as '
-    + 'settled. AN UNREADABLE AMOUNT IS NOT A ZERO: this row does not say no payment was owed, it says how much is owed '
-    + 'cannot be read from it, and settling those two the same way is how a receipt that was really taken disappears. '
+    + `settled. ${claim}, `
+    + 'and settling that the same way as a row that owes nothing is how a receipt that was really taken disappears. '
     + 'There is no setting to correct and no further attempt at this row can repair it — the payload is at rest, so every '
     + `pass reads the same bytes and refuses again. What re-reads the marker on this connector is a fact about the `
     + `connector rather than a promise made here: ${input.recovery}; that re-read changes nothing until the payload `
