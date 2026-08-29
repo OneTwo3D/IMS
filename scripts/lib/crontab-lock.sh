@@ -294,3 +294,221 @@ with_crontab_lock() {
   } 7<"${CRONTAB_LOCK_FILE}"
   return "${rc}"
 }
+
+# =============================================================================
+# EXCLUSION ESTABLISHED ORDER. IT DID NOT ESTABLISH CORRECTNESS.
+# (o3d-p9dq, Codex r27 HIGH x3 — all three are this one defect reached by three routes.)
+# =============================================================================
+# Round 26 put every writer of this crontab behind one flock, and that is what it does: two
+# writers now take turns. What it cannot do is decide which of the two turns SHOULD win. A
+# cutover that restores a snapshot it took before the new build began serving is a PERFECTLY
+# ORDERED write of STALE CONTENT — it acquires the lock properly, writes properly, and discards
+# a schedule change the application had already committed and already reported as saved. The
+# operator was told the save succeeded. It did succeed. Then it was thrown away.
+#
+# So there are two facts about the crontab and they are not the same fact:
+#
+#   ORDER      no two writers interleave inside one read-modify-write   (the flock; round 26)
+#   CORRECTNESS  the content that lands last is the content that is true (this section)
+#
+# WHERE THE TRUTH LIVES. The `cron_*` settings rows are the DURABLE RECORD of the managed
+# schedule; the OTI block in the crontab is a PROJECTION of them, rebuilt from scratch by
+# lib/crontab-reconcile.ts on every save. The unmanaged lines around it — operator entries,
+# PATH/SHELL assignments, comments — are the opposite: the crontab is their only record and the
+# database has never heard of them. Neither source is complete on its own, which is why a
+# restore is a MERGE of two authorities and not a copy of one file:
+#
+#   the managed block          from whatever last projected the database  (the live crontab)
+#   everything around it       from the pre-fence backup                  (the snapshot)
+#
+# THE FENCE IS UNDONE WHERE IT WAS APPLIED, NOT REPLAYED FROM A SNAPSHOT. The fence's whole
+# effect is a prefix on the lines that were active; removing that prefix from the crontab AS IT
+# STANDS is its exact inverse, and it carries forward every write that happened in between —
+# including the block a reconciliation projected from a commit the snapshot predates. When
+# nothing wrote, the two routes produce identical bytes, and `plan_crontab_unfence` proves that
+# rather than assuming it: it compares the live crontab against the fence's own projection of the
+# backup and only calls the snapshot route when they match exactly.
+#
+# AND WHEN THE MERGE WOULD LOSE SOMETHING, IT REFUSES. The subset check below is the half that
+# makes this safe: an unmanaged line present in the backup and absent from the merge candidate is
+# a line no other record holds, so the merge is abandoned and the caller says so. A backup is
+# only safe to install blindly if the world still matches what it was taken from; when it does
+# not, "refuse loudly" beats both "restore the old one" and "guess".
+
+# The mark the fence puts in front of every active line, stated ONCE so that the projection, its
+# inverse and every message quote the same string. Three copies of a sentinel is three sentinels.
+CRON_FENCE_PREFIX='#DEPLOY-FENCE# '
+
+# THE FENCE, AS A PURE FUNCTION. `fence_cron_locked` in all three entrypoints runs its crontab
+# through THIS, so the comparison in plan_crontab_unfence() below is asking about the transform
+# that was actually applied rather than about a re-typed copy of it that can drift.
+#
+# Comment lines and blank lines pass through untouched: they are already inert, and prefixing
+# them would make the inverse ambiguous.
+crontab_fence_projection() {
+  printf '%s\n' "$1" \
+    | awk '{ if ($0 ~ /^[[:space:]]*[^#[:space:]]/) print "#DEPLOY-FENCE# " $0; else print $0 }'
+}
+
+# ITS EXACT INVERSE: remove the mark this protocol added, and nothing else. Anchored, and it
+# strips ONE occurrence from the front of the line, so a line an operator wrote that happens to
+# contain the sentinel further along is untouched.
+crontab_unfence_projection() {
+  printf '%s\n' "$1" | awk '{ sub(/^#DEPLOY-FENCE# /, ""); print }'
+}
+
+# WHICH LINES ONLY THE CRONTAB REMEMBERS — and are they still there?
+#
+#   crontab_unmanaged_lines_missing_from <backup-text> <candidate-text>
+#
+# Prints every line of <backup> that lives OUTSIDE an OTI managed block and does not appear in
+# <candidate>. Returns 0 when nothing is missing.
+#
+# The managed block is deliberately EXCLUDED from the comparison: replacing it is the entire
+# point of a merge, and its truth is the settings rows rather than these bytes. Blank lines are
+# ignored because neither writer preserves how many there were. Everything else is compared as a
+# whole line, exactly, because an operator's cron entry is not a thing to approximate.
+crontab_unmanaged_lines_missing_from() {
+  local backup="$1" candidate="$2"
+  awk '
+    NR == FNR { have[$0] = 1; next }
+    /^# --- OTI CRON START ---[ \t\r]*$/ { in_block = 1; next }
+    /^# --- OTI CRON END ---[ \t\r]*$/   { in_block = 0; next }
+    in_block { next }
+    /^[[:space:]]*$/ { next }
+    !($0 in have) { print }
+  ' <(printf '%s\n' "${candidate}") <(printf '%s\n' "${backup}")
+}
+
+# HOW A FENCED CRONTAB IS PUT BACK.
+#
+#   plan_crontab_unfence <backup-text> <live-crontab-text>
+#
+# Sets, and the caller reads:
+#   CRON_UNFENCE_PLAN    snapshot | merge | refuse
+#   CRON_UNFENCE_TEXT    what to install (snapshot and merge only)
+#   CRON_UNFENCE_REASON  why it refused, or what the merge carried forward
+#
+# Returns 0 for snapshot and merge, non-zero for refuse. It NEVER writes the crontab: the write
+# stays in the entrypoints' `*_locked` bodies, which is where the one-writer census can see it.
+CRON_UNFENCE_PLAN=""
+CRON_UNFENCE_TEXT=""
+CRON_UNFENCE_REASON=""
+plan_crontab_unfence() {
+  local backup="$1" live="$2" merged missing
+  CRON_UNFENCE_PLAN=""
+  CRON_UNFENCE_TEXT=""
+  CRON_UNFENCE_REASON=""
+
+  # (1) DID ANYTHING WRITE? Asked by comparing the live crontab with the fence's OWN projection of
+  # the backup, byte for byte. Equal means the only write since the snapshot was the fence itself,
+  # so the snapshot is provably current and goes back verbatim — the pre-existing behaviour, now
+  # with a proof under it instead of an assumption.
+  if [[ "${live}" == "$(crontab_fence_projection "${backup}")" ]]; then
+    CRON_UNFENCE_PLAN="snapshot"
+    CRON_UNFENCE_TEXT="${backup}"
+    return 0
+  fi
+
+  # (2) SOMETHING WROTE. Undo the fence where it was applied: the live crontab minus the marks.
+  # That keeps the managed block whoever wrote it last projected from the settings rows, and it
+  # keeps any unmanaged line added while the fence was up.
+  merged="$(crontab_unfence_projection "${live}")"
+  missing="$(crontab_unmanaged_lines_missing_from "${backup}" "${merged}")"
+  if [[ -z "${missing}" ]]; then
+    CRON_UNFENCE_PLAN="merge"
+    CRON_UNFENCE_TEXT="${merged}"
+    CRON_UNFENCE_REASON="the crontab changed while it was fenced; the managed block that was written over it has been kept and the fence marks removed from the lines around it"
+    return 0
+  fi
+
+  # (3) THE MERGE WOULD DROP A LINE NOTHING ELSE HOLDS. Neither candidate is safe to install —
+  # the backup would discard whatever wrote, the merge would discard these — so nothing is
+  # installed and the divergence is named.
+  CRON_UNFENCE_PLAN="refuse"
+  CRON_UNFENCE_REASON="the crontab was rewritten while it was fenced, by something that dropped $(printf '%s\n' "${missing}" | grep -c . || true) line(s) present in the backup and held in no other record:
+$(printf '%s\n' "${missing}" | sed 's/^/    /')"
+  return 1
+}
+
+# =============================================================================
+# THE DRAIN IS A PROOF, AND A PROOF THAT COULD NOT BE TAKEN IS NOT A NEGATIVE ANSWER
+# (o3d-p9dq, Codex r27 HIGH #3)
+# =============================================================================
+# The cutover fence moved BELOW the stop in round 26 for the reason this file's header gives: on
+# the first rollout the process serving the box was built before the flock existed, so the only
+# exclusion that reaches it is that it is not running. "Nothing is serving" therefore stopped
+# being a remark and became the PREMISE the fence rests on.
+#
+# The first implementation of that premise established it like this:
+#
+#     if command -v ss >/dev/null 2>&1; then …refuse if :PORT is bound…; fi
+#     warn "cannot check :PORT"          # …and then fence anyway
+#
+# which reads a MISSING TOOL as a proof of absence. So does `ss -ltn 2>/dev/null | grep -q` when
+# `ss` exits non-zero: the pipeline yields nothing, the grep fails to match, and an unanswerable
+# question is recorded as the answer "nobody is there". This branch has closed that same shape —
+# absence of evidence read as evidence of absence — at the responder attribution, at the listener
+# census and at the marker sentinel. It does not get to stay open at the one proof the crontab
+# fence now depends on.
+#
+#   require_port_drained <port>
+#
+# Returns 0 ONLY when a socket census actually RAN and reported no listener on <port>. A port that
+# could not be resolved, an `ss` that is not installed, an `ss` that exits non-zero, and an `ss`
+# that produces no output at all — not even the header row it always prints — are all failures
+# with PORT_DRAIN_REASON set. The caller dies; it does not warn and proceed.
+PORT_DRAIN_REASON=""
+PORT_DRAIN_LISTENERS=""
+PORT_DRAIN_WAIT_SECONDS="${IMS_PORT_DRAIN_WAIT_SECONDS:-15}"
+# Same rule the lock wait applies to its own knob: an unparseable value falls back to the constant
+# rather than being handed to arithmetic, where it would abort the run blaming a listener nobody saw.
+if [[ ! "${PORT_DRAIN_WAIT_SECONDS}" =~ ^[0-9]+$ ]]; then
+  PORT_DRAIN_WAIT_SECONDS=15
+fi
+
+# THE CENSUS, CAPTURED AND VALIDATED SEPARATELY FROM THE EMPTY-LISTENER TEST. `ss` output goes
+# into a variable whose exit status is checked on its own line; only then is it counted. A single
+# `ss … | awk` pipeline cannot tell the two apart, which is the whole finding.
+#   0  census taken; PORT_DRAIN_LISTENERS holds the count for <port>
+#   1  census could NOT be taken; PORT_DRAIN_REASON says why
+port_listener_census() {
+  local port="$1" out rc=0
+  PORT_DRAIN_LISTENERS=""
+  out="$(ss -ltn 2>/dev/null)" || rc=$?
+  if [[ "${rc}" -ne 0 ]]; then
+    PORT_DRAIN_REASON="\`ss -ltn\` exited ${rc}, so the socket census FAILED. An empty reading from a failed query is not an absent listener"
+    return 1
+  fi
+  # `ss -ltn` always prints its header row. Nothing at all means the command did not do what it
+  # was asked, whatever it exited with — a shim, a seccomp denial, a truncated pipe.
+  if [[ -z "${out//[[:space:]]/}" ]]; then
+    PORT_DRAIN_REASON="\`ss -ltn\` exited 0 but produced no output at all, not even its header row, so its silence cannot be read as an absent listener"
+    return 1
+  fi
+  PORT_DRAIN_LISTENERS="$(printf '%s\n' "${out}" \
+    | awk -v p=":${port}\$" '$4 ~ p { n += 1 } END { print n + 0 }')"
+  return 0
+}
+
+require_port_drained() {
+  local port="$1" waited=0
+  PORT_DRAIN_REASON=""
+  if [[ -z "${port}" ]]; then
+    PORT_DRAIN_REASON="the application port could not be resolved, so no socket census can be taken and nothing can establish that the port is free"
+    return 1
+  fi
+  if ! command -v ss >/dev/null 2>&1; then
+    PORT_DRAIN_REASON="\`ss\` is not installed (iproute2), so this host cannot be asked whether anything is still listening on :${port}"
+    return 1
+  fi
+  while :; do
+    port_listener_census "${port}" || return 1
+    [[ "${PORT_DRAIN_LISTENERS}" -eq 0 ]] && return 0
+    [[ "${waited}" -ge "${PORT_DRAIN_WAIT_SECONDS}" ]] && break
+    sleep 1
+    waited=$(( waited + 1 ))
+  done
+  PORT_DRAIN_REASON="${PORT_DRAIN_LISTENERS} socket(s) are still listening on :${port} ${PORT_DRAIN_WAIT_SECONDS}s after the stop, so something is still serving (ss -ltnp | grep :${port})"
+  return 1
+}
