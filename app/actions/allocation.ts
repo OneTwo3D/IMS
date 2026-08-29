@@ -49,18 +49,49 @@ import {
   confirmSalesOrderShipments,
   discardCancelledOrderShipmentsInTx,
   reconcileOrderAfterShipment,
+  reopenShipmentForRepack,
   transitionShipmentStatus,
   type OrderCompletionAuthority,
 } from '@/lib/domain/sales/shipment-service'
+import { countResumableRefundReservationReleases, resolveRefundReservationReleaseOutbox } from '@/lib/domain/sales/refund-reservation-release-outbox'
+import { describeRepackReallocation } from '@/lib/domain/sales/repack-recovery-report'
+import { shipmentIsUnreopenableCommitment, summariseRepackBlockers } from '@/lib/domain/sales/repack-recovery-affordance'
+import { describeAllocationAttempt } from '@/lib/domain/sales/allocation-activity'
 import {
   allocationScopeKey,
   dispatchedAllocationLines,
   loadCommittedAllocationLines,
   residualAllocationQty,
   sumDispatchedQtyByAllocationScope,
+  UNCOMMITTED_SHIPMENT_STATUS,
 } from '@/lib/domain/inventory/reservation-residual'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
+/**
+ * o3d-2k5r r3: the repack recovery holds the order lock across a reopen AND a full re-allocation,
+ * so it gets the allocation service's own budget rather than a tighter one.
+ */
+const REPACK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
+
+/**
+ * Thrown to ROLL BACK a repack recovery whose re-allocation never ran. Distinct from a crash: the
+ * caller reports it as "nothing changed", which is the truth the rollback creates.
+ *
+ * NOT exported — this is a `'use server'` module, where every export is a server action.
+ */
+class RepackRecoveryAborted extends Error {}
+
+/**
+ * Thrown to ROLL BACK a repack recovery that COULD NOT LEAD ANYWHERE — the re-allocation was
+ * refused by a blocker that can never be reopened (o3d-2k5r r6 / o3d-flxt).
+ *
+ * Separate from `RepackRecoveryAborted` because the operator message is a different one: nothing is
+ * wrong with this order's data and re-running changes nothing, so it must not read as a transient
+ * failure to retry.
+ *
+ * NOT exported — this is a `'use server'` module, where every export is a server action.
+ */
+class RepackRecoveryDeadEnd extends Error {}
 
 function revalidateSalesAllocationPaths(orderId: string) {
   try {
@@ -171,6 +202,39 @@ export type AllocationRow = {
 
 export type ShipmentRow = {
   id: string
+  /**
+   * o3d-2k5r r4 — an ORDER-level fact, carried on every row on purpose.
+   *
+   * The detail client refreshes shipments through `getOrderShipments` and has no other refresh
+   * channel, so a separate order-scoped fetch would go stale the moment a recovery ran and would
+   * leave the "Finish repack recovery" control on screen after there was nothing left to finish.
+   * Riding this payload means the control appears and disappears with the same round trip that
+   * moves the shipment.
+   */
+  repackRecoveryOutstanding: boolean
+  /**
+   * o3d-2k5r r5 — the other half of the same ORDER-level question, and carried the same way and for
+   * the same reason.
+   *
+   * `reopenShipmentForRepackAction` runs its re-allocation with `refuseIfCommittedShipmentsExist`,
+   * which refuses while any shipment on the order is not a draft. The Finish-recovery control was
+   * gated on the outstanding-work evidence alone, so it rendered on a draft whose sibling was still
+   * PACKED — where the action re-allocates nothing, resolves no backstop row and reports success.
+   * The affordance has to know what the action knows.
+   */
+  orderHasCommittedShipment: boolean
+  /**
+   * o3d-2k5r r6 / o3d-flxt — the NARROWER order-level fact, and the one that decides whether the
+   * REOPEN control may render at all.
+   *
+   * `orderHasCommittedShipment` above says the recovery cannot be FINISHED right now; it is true of
+   * two packed shipments, which is a recoverable state (reopen the other one). This says the
+   * recovery can never be finished at all, because the order holds a commitment nothing can turn
+   * back into a draft. Reopening anything on such an order does not move it one step closer — it
+   * converts a still-dispatchable shipment into a draft no control can finish. Carried on the row
+   * for the same reason as the field above: one refresh channel, so the controls cannot go stale.
+   */
+  orderHasUnreopenableCommitment: boolean
   warehouseId: string
   warehouseCode: string
   warehouseName: string
@@ -234,6 +298,15 @@ export async function getOrderAllocations(orderId: string): Promise<AllocationRo
 
 export async function getOrderShipments(orderId: string): Promise<ShipmentRow[]> {
   await requireInternalUser()
+  // o3d-2k5r r4: the durable evidence that this order still owes the repack recovery's
+  // re-allocation and refund-backstop steps. One count for the order, not one per shipment.
+  //
+  // o3d-2k5r r8: the RESUMABLE read, deliberately narrower than the dispatch fence's
+  // (`countUnfinishedRefundReservationReleases`). This one decides whether to render a BUTTON, so a
+  // row the drain currently holds (PROCESSING) is not evidence for it — there is nothing the
+  // operator can do with a row a worker owns, and the resolver would refuse to clear it. The fence
+  // asks the opposite question and gets the opposite answer for that same row.
+  const outstandingReleases = await countResumableRefundReservationReleases(orderId)
   const rows = await db.shipment.findMany({
     where: { orderId },
     include: {
@@ -247,8 +320,18 @@ export async function getOrderShipments(orderId: string): Promise<ShipmentRow[]>
     },
     orderBy: { createdAt: 'asc' },
   })
+  // The same predicates `allocateSalesOrder` and `reopenShipmentForRepack` apply, computed by the
+  // shared helper the write path uses and read off the rows already in hand rather than as a second
+  // query — the page must not be able to disagree with itself, or with the action, about which
+  // shipments the order holds.
+  const { orderHasCommittedShipment, orderHasUnreopenableCommitment } = summariseRepackBlockers(
+    rows.map((s) => String(s.status)),
+  )
   return rows.map((s) => ({
     id: s.id,
+    repackRecoveryOutstanding: outstandingReleases > 0,
+    orderHasCommittedShipment,
+    orderHasUnreopenableCommitment,
     warehouseId: s.warehouseId,
     warehouseCode: s.warehouse.code,
     warehouseName: s.warehouse.name,
@@ -388,44 +471,12 @@ export async function autoAllocateOrder(
     }
 
     revalidateSalesAllocationPaths(orderId)
-    if (allocationResult.logAttempt && allocationResult.orderRef) {
-      const hasUnallocatedDemand = allocationResult.unallocatedQty > 0
-      const action = !allocationResult.success
-        ? 'allocation_failed'
-        : allocationResult.allocationCount > 0
-        ? 'allocated'
-        : hasUnallocatedDemand
-          ? 'backorder_recorded'
-          : 'allocation_failed'
-      const level = allocationResult.success ? 'INFO' : 'WARNING'
-      const description = !allocationResult.success
-        ? allocationResult.allocationCount > 0
-          ? `Partially allocated stock for order ${allocationResult.orderRef} — ${allocationResult.allocationCount} allocation(s), but some lines are not oversell-eligible`
-          : `No stock available to allocate for order ${allocationResult.orderRef}`
-        : allocationResult.allocationCount > 0
-        ? hasUnallocatedDemand
-          ? `Auto-allocated stock for order ${allocationResult.orderRef} — ${allocationResult.allocationCount} allocation(s), ${allocationResult.unallocatedQty} unit(s) left unallocated`
-          : `Auto-allocated stock for order ${allocationResult.orderRef} — ${allocationResult.allocationCount} allocation(s)`
-        : hasUnallocatedDemand
-          ? `Recorded ${allocationResult.unallocatedQty} unit(s) as backorder demand for order ${allocationResult.orderRef}`
-          : `No stock available to allocate for order ${allocationResult.orderRef}`
-      await logActivity({
-        entityType: 'SALES_ORDER',
-        entityId: orderId,
-        action,
-        tag: 'sales',
-        level,
-        description,
-        metadata: {
-          orderNumber: allocationResult.orderRef,
-          isShoppingOrder: allocationResult.isShoppingOrder,
-          shipFromWarehouseId: allocationResult.shipFromWarehouseId,
-          allocations: allocationResult.allocationCount,
-          unallocatedQty: allocationResult.unallocatedQty,
-          backorderLineCount: allocationResult.backorderLineCount,
-          unallocatedLines: allocationResult.unallocatedLines,
-        },
-      })
+    // o3d-2k5r r3: the classification lives in describeAllocationAttempt, shared with the repack
+    // recovery, which runs the same allocation inside its own transaction and so cannot reach it
+    // through this function.
+    const activity = describeAllocationAttempt(allocationResult)
+    if (activity) {
+      await logActivity({ entityType: 'SALES_ORDER', entityId: orderId, tag: 'sales', ...activity })
     }
     if (!allocationResult.success) {
       if (!options?.deferStockSync && allocationResult.syncProductIds.length > 0) {
@@ -1223,6 +1274,218 @@ export async function discardCancelledOrderShipments(
     return { success: true, discardedCount: result.discarded.length }
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e)
+    return { success: false, error: message }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Reopen a committed (PICKING/PACKED) shipment so it can be rebuilt (o3d-2k5)
+// ---------------------------------------------------------------------------
+
+/**
+ * The exit the o3d-339 dispatch refusal names, and the reason it can name one at all.
+ *
+ * A partial refund landing AFTER a shipment was packed leaves the shipment shipping more than
+ * remains. `validateActiveShipmentTotalsWithinOrder` refuses that dispatch — correctly; it is the
+ * money fix — but `confirmSalesOrderShipments` only replaces PENDING shipments, so nothing could
+ * rebuild the packed one, and `releaseReservationsAfterRefund` refuses the reservation release while
+ * a shipment exists, so the unrefunded remainder stayed unshippable with its backstop row deferred.
+ *
+ * THE THREE STEPS, in ONE TRANSACTION, because each depends on the one before and a recovery that
+ * stops between them is worse than one that never started:
+ *
+ *  1. `reopenShipmentForRepack` reverts the shipment to PENDING under the order lock. Preserves the
+ *     tracking number, touches no reservation (see its doc comment for why re-reserving would
+ *     double-count), and records the physical un-pack the warehouse now owes as a WARNING.
+ *  2. re-allocation with `refuseIfCommittedShipmentsExist` — the NARROW refusal. It is only passable
+ *     BECAUSE step 1 turned the last committed shipment into a draft; the strict
+ *     `refuseIfShipmentsExist` the refund backstop uses would still decline, which is exactly why
+ *     the backstop cron could never heal this on its own. The rebuild nets the refund into
+ *     `OrderAllocation`, releases the refunded units' reservation, and `reconcilePendingShipments`
+ *     retires the now-unbacked draft, reporting the label it carried.
+ *  3. resolving the deferred refund-reservation-release backstop rows INSIDE that allocation
+ *     transaction (`onReconciledInTx`, committed path only) — so a crash between commit and resolve
+ *     cannot leave a redundant re-allocation queued.
+ *
+ * o3d-2k5r r3 — WHY ONE TRANSACTION, AND WHAT THAT COST.
+ *
+ * The reopen used to be its own committed transaction, on the argument that `allocateSalesOrder`
+ * takes the same order lock and therefore could not run inside it. That argument was wrong twice
+ * over: a Postgres row lock is re-entrant within one transaction, and `allocateSalesOrder` is
+ * transaction-CAPABLE — handed a transaction client it runs `runAllocation` inline instead of
+ * opening its own. What the old shape actually bought was a kill point: a worker killed between the
+ * reopen's commit and the allocation left the shipment a PENDING draft with the order's reservation
+ * still holding the pre-refund quantity and the refund backstop still deferred — the one-third
+ * state the reverse-edge argument in `SHIPMENT_TRANSITIONS` says generic transitions must not
+ * permit, reached through the one door that was supposed to make it impossible. Retrying the
+ * advertised action did not resume it either, because reopening refuses an already-pending
+ * shipment, and "Create Shipments" would then rebuild from the netted quantity without ever
+ * releasing the stale excess reservation.
+ *
+ * So the three steps share one transaction: either the whole recovery is on the order, or none of
+ * it is. Everything that cannot be transactional — cache revalidation, the storefront stock push,
+ * the allocation's own activity row — happens strictly AFTER the commit.
+ *
+ * TWO OUTCOMES DELIBERATELY DO NOT ROLL BACK OR DO NOT COMMIT:
+ *
+ *  - A REFUSED re-allocation (the order carries ANOTHER committed shipment) keeps the reopen. It
+ *    must: with shipments A and B both packed, rolling back would refuse A because B is committed
+ *    and refuse B because A is, and neither could ever be reopened first. The operator reopens the
+ *    other one, and THAT call's transaction does the netting for the whole order.
+ *  - Anything else that did not commit — a pre-transaction bail such as "no eligible warehouse", or
+ *    a throw — aborts the whole thing, reopen included. There is no sequencing reason to keep a
+ *    revert whose second half cannot run, and keeping it is precisely the stranded state above.
+ *
+ * AND IT IS RESUMABLE. Called on a shipment that is ALREADY a pending draft, this action does not
+ * refuse: it runs steps 2 and 3 alone against the existing draft. That is what lets an operator
+ * finish a recovery the refusal above left half-open (reopen A, refused because B was committed;
+ * B is then dispatched rather than reopened; re-running on A completes the netting), and it heals
+ * any order left mid-recovery by the previous non-transactional shape. It is safe to invoke on any
+ * draft: re-netting an order and resolving its refund backstop is idempotent repair, and it is what
+ * the backstop cron would do if a shipment were not standing in its way.
+ *
+ * The operator then presses "Create Shipments" (the Stock Allocation panel's own button, which
+ * calls `confirmAllocations` below), and it builds a fresh shipment at the reduced quantity. That step is deliberately NOT done here: rebuilding is a decision about what goes in
+ * the box, and the box has to be physically unpacked first.
+ *
+ * PERMISSION. `sales.process` — the same permission that already moves a shipment PENDING → PICKING
+ * → PACKED and dispatches it. Reopening is strictly less consequential than the dispatch that
+ * permission already allows (a dispatch writes stock movements and COGS and is reversed only by a
+ * refund or a return), so refusing the undo to the person trusted with the do is not a defensible
+ * line. Recorded as a decision, not an inference: if this should be manager-gated instead, it is one
+ * `requirePermission` call here, because the reverse edge was deliberately kept out of
+ * `SHIPMENT_TRANSITIONS` and there is no other door.
+ */
+export async function reopenShipmentForRepackAction(
+  shipmentId: string,
+): Promise<{ success: boolean; error?: string; warning?: string; orderId?: string }> {
+  try {
+    const session = await requirePermission('sales.process')
+
+    const outcome = await db.$transaction(async (tx) => {
+      const reopened = await reopenShipmentForRepack(tx, shipmentId, { userId: session.user.id })
+
+      let orderId: string
+      let orderRef: string
+      let resumed = false
+      if (reopened.success) {
+        orderId = reopened.orderId
+        orderRef = reopened.orderRef
+      } else if (reopened.code === 'ALREADY_PENDING' && reopened.orderId && reopened.orderRef) {
+        // The RESUME point. Step 1 is already done (by an earlier run of this action, or by a
+        // refused one); steps 2 and 3 are what is missing, and they are exactly what runs below.
+        orderId = reopened.orderId
+        orderRef = reopened.orderRef
+        resumed = true
+      } else {
+        return { kind: 'refused' as const, error: reopened.error }
+      }
+
+      // Read inside the transaction, and before the allocation call: the resolve runs inside
+      // `runAllocation`, which takes the order lock, so this read must not be made from there.
+      const refunds = await tx.salesOrderRefund.findMany({ where: { orderId }, select: { id: true } })
+
+      const realloc = await allocateSalesOrder(tx, {
+        orderId,
+        refuseIfCommittedShipmentsExist: true,
+        userId: session.user.id ?? null,
+        onReconciledInTx: async (inner) => {
+          for (const refund of refunds) {
+            await resolveRefundReservationReleaseOutbox(refund.id, { client: inner })
+          }
+        },
+      })
+
+      // `logAttempt` is set only on the path where `runAllocation` actually ran, so it is the one
+      // honest answer to "did the netting happen". A refusal is a decision and MAY keep the reopen;
+      // anything else that did not run rolls the whole recovery back rather than leaving a third
+      // of it on the order.
+      if (realloc.logAttempt !== true && !realloc.refused) {
+        throw new RepackRecoveryAborted(realloc.error ?? 'the re-allocation did not run')
+      }
+
+      // o3d-2k5r r6 / o3d-flxt — WHICH REFUSALS THE PARTIAL COMMIT IS ACTUALLY FOR.
+      //
+      // Keeping the reopen through a refusal is justified by a DEADLOCK: A and B both PACKED refuse
+      // each other, so rolling back would mean neither could ever go first. That argument holds
+      // only while every blocker is itself reopenable. A DISPATCHED blocker is not a deadlock and
+      // never becomes one — the refusal it causes is permanent — so the partial commit buys no next
+      // step and spends the order's last recoverable state on nothing.
+      //
+      // Re-read here rather than trusted from the reopen: this transaction holds the order lock
+      // (taken by `reopenShipmentForRepack`), so this is the authoritative answer, and it also
+      // covers the RESUME path, where no reopen ran to check anything.
+      if (realloc.refused) {
+        const blockers = await tx.shipment.findMany({
+          where: { orderId, status: { not: UNCOMMITTED_SHIPMENT_STATUS } },
+          select: { status: true },
+        })
+        const unreopenable = blockers.filter((b) => shipmentIsUnreopenableCommitment(String(b.status)))
+        if (unreopenable.length > 0) {
+          throw new RepackRecoveryDeadEnd(
+            `order ${orderRef} holds ${unreopenable.length} dispatched shipment(s), which cannot be reopened`,
+          )
+        }
+      }
+
+      return { kind: 'ran' as const, orderId, orderRef, realloc, resumed }
+    }, REPACK_TX_OPTIONS)
+
+    if (outcome.kind === 'refused') return { success: false, error: outcome.error }
+
+    const { orderId, orderRef, realloc, resumed } = outcome
+    revalidateSalesAllocationPaths(orderId)
+
+    // Post-commit only. A failure here cannot un-do the recovery and must not report one.
+    const activity = describeAllocationAttempt(realloc)
+    if (activity) {
+      await logActivity({ entityType: 'SALES_ORDER', entityId: orderId, tag: 'sales', ...activity })
+    }
+    if (realloc.syncProductIds.length > 0) {
+      try {
+        await enqueueStockSync(realloc.syncProductIds, 'IMS_CHANGE')
+      } catch (syncError) {
+        console.error(syncError)
+      }
+    }
+
+    // Which of the outcomes it was cannot be read off `success` alone. `success: false` on a run
+    // that COMMITTED is the BACKORDER path — the refunded units' reservation was released and
+    // `onReconciledInTx` (immediately before that commit) already resolved the durable backstop
+    // rows — and telling the operator to "run allocation again" there points them at a retry whose
+    // driver has just been consumed. The decision lives in describeRepackReallocation, where it is
+    // tested. `committed` is passed from `logAttempt` for the same reason it is checked above.
+    const warning = describeRepackReallocation(orderRef, {
+      refused: realloc.refused,
+      success: realloc.success,
+      committed: realloc.logAttempt === true,
+      error: realloc.error,
+      unallocatedQty: realloc.unallocatedQty,
+      resumed,
+    })
+    return warning ? { success: true, orderId, warning } : { success: true, orderId }
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e)
+    // The abort is the DESIGNED outcome for "the netting could not run", not a crash: say what was
+    // rolled back, so nobody goes looking for a half-reopened shipment that is not there.
+    if (e instanceof RepackRecoveryDeadEnd) {
+      return {
+        success: false,
+        error: `This recovery cannot be completed: ${message}. Nothing on this order changed — reopening `
+          + 'this shipment would only turn it into a draft that stock can never be re-allocated to, because '
+          + 'the re-allocation is refused while any shipment on the order is not a draft and a dispatched '
+          + 'one can never go back to being one. Reconcile the outstanding refund reservation against the '
+          + 'dispatched shipment instead; it stays visible as a failed refund.reservation-release row on the '
+          + 'Sync Exceptions page.',
+      }
+    }
+    if (e instanceof RepackRecoveryAborted) {
+      return {
+        success: false,
+        error: `The shipment was NOT reopened: ${message}. Nothing on this order changed — the reopen, the `
+          + 're-allocation and the refund reconciliation are applied together or not at all.',
+      }
+    }
     return { success: false, error: message }
   }
 }

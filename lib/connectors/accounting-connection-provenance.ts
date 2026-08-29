@@ -182,6 +182,178 @@ export function readAccountingPayloadConnection(payload: unknown): string | null
 }
 
 /**
+ * THE DURABLE HALF OF THE SAME RECORD (o3d-dzip).
+ *
+ * `AccountingSyncLog.connectionProvenance` holds what the payload stamp holds, in a column retention
+ * cannot reach. It is MINTED FROM the stamp by {@link mintAccountingConnectionProvenanceColumn}, in the
+ * INSERT that writes the payload, so the two are one fact written twice rather than two facts kept in
+ * step by hand — and a database trigger then clears the column on any UPDATE that changes it, so after
+ * the INSERT only the payload can move.
+ *
+ * NOTHING MAY READ EITHER HALF ALONE. Reading the column alone would refuse every row queued before it
+ * existed — a rollout cliff, and a queue's worth of legitimate work cancelled by hand. Reading the
+ * payload alone is the defect: `backReferenceEvidenceTombstone` compacts an expired unresolved row to
+ * `payload: {}` and KEEPS its external id, so the rows whose realm is least knowable are exactly the
+ * ones with nothing left to read. {@link readAccountingOriginRecord} is the only reader.
+ */
+export type AccountingOriginRecord = {
+  /** The stored payload, exactly as it came out of the database. */
+  payload: unknown
+  /** `AccountingSyncLog.connectionProvenance`. `null`/`undefined` = this row has no durable record. */
+  connectionProvenance: string | null | undefined
+  /**
+   * `AccountingSyncLog.backReferenceEvidenceCompactedAt` — THE DATABASE'S OWN RECORD THAT RETENTION
+   * EMPTIED THIS PAYLOAD (o3d-dzip; Codex r1 finding 1, CRITICAL).
+   *
+   * Without it the column-only branch below reads "the payload does not carry the key" as "retention
+   * took the key away", and those are not the same row. A row whose payload was REWRITTEN — by a
+   * repair, a seed, a hand-run database console, a release that has not heard of the stamp — also lacks the key,
+   * and authorising it from the column would have the column vouch for content it never saw: the
+   * column describes the INSERT, and a rewritten payload is no longer what the INSERT wrote.
+   *
+   * `backReferenceEvidenceCompactedAt` is written by exactly one statement — retention's compaction,
+   * which is also the statement that writes `payload: {}` — so it is the one durable fact that tells
+   * the two apart. `null`/`undefined` means this row was never compacted.
+   */
+  backReferenceEvidenceCompactedAt?: Date | null
+}
+
+/**
+ * The value to write into `connectionProvenance` for a row being INSERTED with `payload`.
+ *
+ * MINTING, NOT BACKFILLING, and the distinction is the whole of why this is allowed to exist. This runs
+ * in the same statement as the INSERT, over the payload that statement is writing, which the enqueue
+ * that OBSERVED the connection composed moments earlier. Running the same derivation over rows already
+ * in the table would be the database vouching for stamps it did not witness — the shortcut o3d-s36z
+ * refused — so there is no back-fill and this function must never be used to write one.
+ *
+ * An unreadable or unstamped payload mints NOTHING. A row that records no origin in its payload must
+ * not acquire one in its column: absence is the honest answer and it already refuses.
+ */
+export function mintAccountingConnectionProvenanceColumn(payload: unknown): string | null {
+  const stamp = readAccountingPayloadConnectionStamp(payload)
+  if (stamp.state === 'stamped') return stamp.provenance
+  if (stamp.state === 'raised-disconnected') return ACCOUNTING_CONNECTION_RAISED_DISCONNECTED
+  return null
+}
+
+/**
+ * IS THIS ROW VERIFIABLY COMPACTED — i.e. is its payload silent because RETENTION emptied it?
+ *
+ * TWO INDEPENDENT FACTS, BOTH WRITTEN BY THE ONE STATEMENT THAT IS ALLOWED TO EMPTY A PAYLOAD, and
+ * both are required because either alone is something an ordinary rewrite can also produce:
+ *
+ *   • `backReferenceEvidenceCompactedAt` is set. `backReferenceEvidenceTombstone` writes it in the
+ *     same `data` object as `payload: {}`, so a compacted row always carries it and nothing else in
+ *     this repository writes it at all.
+ *   • the payload is the EMPTY OBJECT the tombstone leaves behind — not merely an object that
+ *     happens to lack the stamp key. A payload with other keys and no stamp is a document somebody
+ *     rebuilt without knowing about the stamp, which is precisely the case that must NOT be
+ *     authorised from the column.
+ *
+ * A row that satisfies neither is not "probably fine"; it is a row whose payload and column describe
+ * two different moments, and {@link readAccountingOriginRecord} answers that the only honest way it
+ * can — unreadable, which refuses.
+ */
+export function accountingOriginRecordWasCompacted(record: AccountingOriginRecord): boolean {
+  const compactedAt = record.backReferenceEvidenceCompactedAt
+  if (!(compactedAt instanceof Date) || Number.isNaN(compactedAt.getTime())) return false
+  const payload = record.payload
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return false
+  return Object.keys(payload).length === 0
+}
+
+/** Read the durable column with the same four states, so it can be compared with the payload's. */
+function readAccountingConnectionColumn(value: string | null | undefined): AccountingConnectionStamp {
+  if (value === null || value === undefined) return { state: 'absent' }
+  if (typeof value !== 'string') {
+    return { state: 'unreadable', detail: `the durable connection column is a ${typeof value}, not a string` }
+  }
+  const trimmed = value.trim()
+  if (trimmed === '') return { state: 'unreadable', detail: 'the durable connection column is blank' }
+  if (trimmed === ACCOUNTING_CONNECTION_RAISED_DISCONNECTED) return { state: 'raised-disconnected' }
+  return { state: 'stamped', provenance: trimmed }
+}
+
+/**
+ * WHAT THIS ROW RECORDS ABOUT THE ORGANISATION IT WAS RAISED AGAINST — column and payload together.
+ *
+ * The combining rule, and what each line is for:
+ *
+ *   payload UNREADABLE            unreadable, whatever the column says. A payload something we do not
+ *                                 recognise has written is not one this row's column can vouch for; the
+ *                                 column describes an INSERT, and that payload is no longer the one the
+ *                                 INSERT wrote.
+ *   column UNREADABLE             unreadable. Same reason, other half.
+ *   both ABSENT                   absent — `no-origin-recorded`, which refuses.
+ *   column present, payload absent  THE COLUMN, BUT ONLY FOR A VERIFIABLY COMPACTED ROW
+ *                                 ({@link accountingOriginRecordWasCompacted}). That is the case the
+ *                                 column exists for: a retention-compacted tombstone still names its
+ *                                 organisation. For any OTHER silent payload it is UNREADABLE — see
+ *                                 the paragraph below, which is Codex r1 finding 1.
+ *   payload present, column absent  THE PAYLOAD. Every row queued before the column shipped, answering
+ *                                 exactly as it does today.
+ *   both present, AGREEING        the record.
+ *   both present, DISAGREEING     UNREADABLE. One of the two was rewritten by a writer that did not
+ *                                 know about the other, and nothing here can say which is the truth.
+ *                                 "I cannot tell" is never "the same" — the rule
+ *                                 {@link accountingOriginRecordsMatch} already states for two rows.
+ *
+ * WHY THE COLUMN-ONLY LINE NEEDS A PRECONDITION AND NOT JUST AN ABSENCE (Codex r1 finding 1,
+ * CRITICAL). The first cut of this rule accepted the column for ANY row whose payload lacked the
+ * stamp. Compaction is not the only way a payload loses a key: a POST-MIGRATION row whose payload is
+ * rewritten — a repair that rebuilds the document, a seed, a hand-run database console, a rolling deploy of a
+ * release that has never heard of `_connectionProvenance` — also lacks it, and the column then
+ * authorised content it had never seen. That is the two-source design giving away the very thing it
+ * was built to protect: the column is a claim about the INSERT, and a rewritten payload is not what
+ * the INSERT wrote.
+ *
+ * The two states are distinguishable, but only from DURABLE EVIDENCE OF THE COMPACTION ITSELF — the
+ * `backReferenceEvidenceCompactedAt` instant retention writes in the same statement as `payload: {}`.
+ * Where that evidence exists the column is the record; where it does not, the honest answer is that
+ * this row's two halves describe two different moments and nothing here can say which is current, so
+ * it takes the SAME outcome as an outright disagreement: unreadable, refuse, nothing sent.
+ *
+ * AND IT MUST NOT OVER-REFUSE. A genuine PRE-MIGRATION row — payload stamped, column null — is
+ * decided from its payload by the line above and never reaches this precondition, so the rollout
+ * property (no cliff, no queue drained by hand) is untouched.
+ */
+export function readAccountingOriginRecord(record: AccountingOriginRecord): AccountingConnectionStamp {
+  const fromPayload = readAccountingPayloadConnectionStamp(record.payload)
+  if (fromPayload.state === 'unreadable') return fromPayload
+  const fromColumn = readAccountingConnectionColumn(record.connectionProvenance)
+  if (fromColumn.state === 'unreadable') return fromColumn
+  if (fromColumn.state === 'absent') return fromPayload
+  if (fromPayload.state === 'absent') {
+    if (accountingOriginRecordWasCompacted(record)) return fromColumn
+    return {
+      state: 'unreadable',
+      detail: 'its durable column records an origin ('
+        + `${fromColumn.state === 'stamped' ? fromColumn.provenance : ACCOUNTING_CONNECTION_RAISED_DISCONNECTED})`
+        + ' but the payload beside it carries no origin at all, and this row carries no record of having'
+        + ' been compacted by retention — so the payload was REWRITTEN after the insert that minted the'
+        + ' column, and the column cannot speak for content it never saw',
+    }
+  }
+  if (fromColumn.state === 'stamped' && fromPayload.state === 'stamped') {
+    if (fromColumn.provenance === fromPayload.provenance) return fromColumn
+    return {
+      state: 'unreadable',
+      detail: `this row records TWO different origins — the durable column says ${fromColumn.provenance} `
+        + `and the payload says ${fromPayload.provenance}`,
+    }
+  }
+  if (fromColumn.state === fromPayload.state) return fromColumn
+  return {
+    state: 'unreadable',
+    detail: 'this row records TWO different origins — the durable column says '
+      + `${fromColumn.state === 'stamped' ? fromColumn.provenance : ACCOUNTING_CONNECTION_RAISED_DISCONNECTED} `
+      + `and the payload says `
+      + `${fromPayload.state === 'stamped' ? fromPayload.provenance : ACCOUNTING_CONNECTION_RAISED_DISCONNECTED}`,
+  }
+}
+
+/**
  * Do two payloads RECORD THE SAME ORIGIN? (o3d-19gy, the repair paths — Codex r1 finding 2)
  *
  * NOT a permission and deliberately not `accountingPayloadConnectionVerdict`: this compares two records
@@ -247,6 +419,52 @@ export function carryAccountingOriginRecord<T extends Record<string, unknown>>(
   }
 }
 
+/**
+ * THE SAME INHERITANCE, FROM A COMPLETE DURABLE RECORD (o3d-bqw7 r2, Codex HIGH).
+ *
+ * `carryAccountingOriginRecord` inherits from the source PAYLOAD, and that is the whole record for
+ * every ordinary row. It is not the whole record for a RETENTION TOMBSTONE: compaction writes
+ * `payload: {}` and keeps `connection_provenance`, so the payload of the very rows whose realm is
+ * least knowable says nothing at all. Handing that payload on as origin evidence produced a follow-up
+ * born with NO record, which `accountingPayloadConnectionVerdict` refuses as `no-origin-recorded`.
+ *
+ * That is why this exists. `compacted-followup-loss.ts` classifies a tombstone's invoice PDF as
+ * REBUILT — built from columns compaction keeps — and the processor duly enqueues one, but the row it
+ * enqueued could never post: the classification was a claim the pipeline did not honour. Carrying the
+ * COMPLETE record makes the claim true.
+ *
+ * IT ADDS NO NEW READER. Where the payload speaks it is copied verbatim, byte for byte, by the
+ * function above — nothing about a non-compacted source changes. Where it is silent the answer comes
+ * from {@link readAccountingOriginRecord}, which is already the only thing allowed to combine the two
+ * halves, and which accepts the column ALONE only for a verifiably compacted row.
+ *
+ * A record that is `absent` or `unreadable` inherits NOTHING, and the follow-up is born unstamped and
+ * refuses. That is the same answer the source row itself would get, which is the property that keeps
+ * the chain sound: a follow-up can never be MORE permitted than the post it descends from.
+ */
+export function carryAccountingOriginRecordFrom<T extends Record<string, unknown>>(
+  body: T,
+  source: AccountingOriginRecord,
+): Record<string, unknown> {
+  // The payload still speaks for itself wherever it can — including UNREADABLY, which must travel so
+  // the follow-up refuses for the same reason its parent would.
+  if (readAccountingPayloadConnectionStamp(source.payload).state !== 'absent') {
+    return carryAccountingOriginRecord(body, source.payload)
+  }
+  const { [ACCOUNTING_PAYLOAD_CONNECTION_KEY]: _stampedByTheCaller, ...withoutCallerOrigin } = body
+  const stamp = readAccountingOriginRecord(source)
+  if (stamp.state === 'stamped') {
+    return { ...withoutCallerOrigin, [ACCOUNTING_PAYLOAD_CONNECTION_KEY]: stamp.provenance }
+  }
+  if (stamp.state === 'raised-disconnected') {
+    return { ...withoutCallerOrigin, [ACCOUNTING_PAYLOAD_CONNECTION_KEY]: ACCOUNTING_CONNECTION_RAISED_DISCONNECTED }
+  }
+  // `absent` (nothing recorded anywhere) and `unreadable` (the two halves describe two different
+  // moments) both inherit nothing. Absence already refuses; writing a marker to say "I looked and
+  // found nothing" would be the repair stamping a claim about itself rather than about the origin.
+  return withoutCallerOrigin
+}
+
 /** Why a queued payload may or may not be posted to the connection now in hand. */
 export type AccountingConnectionDecision =
   /** The stamp names the connection the request is about to use. */
@@ -297,12 +515,29 @@ export type AccountingConnectionVerdict = {
  */
 export function accountingPayloadConnectionVerdict(params: {
   payload: unknown
+  /**
+   * o3d-dzip: `AccountingSyncLog.connectionProvenance`, the half of this record that survives
+   * retention. Optional ONLY so callers with no row in hand (the module's own unit tests, a future
+   * caller holding a payload alone) stay expressible; every production caller passes it, and omitting
+   * it silently narrows the verdict to the payload — which is the defect, not a default.
+   */
+  connectionProvenance?: string | null
+  /**
+   * o3d-dzip (Codex r1 finding 1): `AccountingSyncLog.backReferenceEvidenceCompactedAt`, read in the
+   * same statement as the other two. It is what lets a retention-compacted row be decided from its
+   * column; without it a silent payload beside a populated column is unreadable, which refuses.
+   */
+  backReferenceEvidenceCompactedAt?: Date | null
   activeProvenance: string | null
   type: string
   referenceType: string
   referenceId: string
 }): AccountingConnectionVerdict {
-  const stamp = readAccountingPayloadConnectionStamp(params.payload)
+  const stamp = readAccountingOriginRecord({
+    payload: params.payload,
+    connectionProvenance: params.connectionProvenance,
+    backReferenceEvidenceCompactedAt: params.backReferenceEvidenceCompactedAt,
+  })
   const stamped = stamp.state === 'stamped' ? stamp.provenance : null
   const active = params.activeProvenance
   const what = `${params.type} for ${params.referenceType} ${params.referenceId}`
@@ -387,6 +622,8 @@ export function accountingPayloadConnectionVerdict(params: {
  */
 export function accountingPayloadConnectionRefusal(params: {
   payload: unknown
+  connectionProvenance?: string | null
+  backReferenceEvidenceCompactedAt?: Date | null
   activeProvenance: string | null
   type: string
   referenceType: string

@@ -23,6 +23,113 @@ const XERO_CONNECTOR = 'xero'
 const XERO_NOT_SENT_STATUS = 0
 
 /**
+ * WHICH PRE-EGRESS REFUSAL THIS WAS — ENUMERATED AT THE SITE THAT MADE IT (o3d-gvzu).
+ *
+ * `status: 0` and a 429 both already say "this call produced no reply". Neither says WHY, and the
+ * difference matters to exactly one caller: the manual-journal poster, which holds a durable dispatch
+ * marker it may release only on PROOF THAT NOTHING LEFT THIS PROCESS. "We got no answer" is not that
+ * proof — a timeout, a socket reset mid-write and a 5xx are all cases where the request may have
+ * arrived — so the marker may not be released on the absence of a reply, only on the presence of a
+ * refusal that is provably above the socket.
+ *
+ * SO IT IS A NAMED SET, NOT A PREDICATE OVER ERROR SHAPES. Each member is written by the one
+ * statement that performs that refusal, and each is provable by WHERE THAT STATEMENT SITS rather than
+ * by what it says:
+ *
+ *  • `no-connection`          `getAccessToken()` returned null, so no token, no tenant header and no
+ *                             request object were ever built. `performRequest` is not reached at all;
+ *                             there is nothing to send and nothing that could have been sent.
+ *  • `posting-intent-refused` `accountingPostingIntentRefusal` refuses ABOVE the retry loop, before
+ *                             the first `waitForBudget`. It returns straight out of `performRequest`
+ *                             with no `connectorFetch` between it and the caller.
+ *  • `egress-unauthorised`    `accountingEgressRefusal` is the last statement before `noteRequest`,
+ *                             and nothing between it and `connectorFetch` awaits. On the attempt it
+ *                             refuses, `connectorFetch` is never called.
+ *  • `rate-budget-refused`    every budget refusal — the minute wait, the rolling-day cap, and both
+ *                             idempotency-window bounds — returns BEFORE `noteRequest`, which is why
+ *                             a refusal consumes no Xero budget.
+ *
+ * AND EVERY ONE OF THEM IS ADDITIONALLY GATED ON `firstCallAt === null`, per call. Three of these can
+ * be reached on a LATER pass of the retry loop, after an earlier attempt has already gone out — an
+ * egress authorisation re-evaluated per attempt, a budget bound checked after a 429 sleep. Such a
+ * refusal is pre-egress for its own attempt and says nothing whatever about the request that already
+ * left, so it is NOT tagged. `firstCallAt` is set on the statement after `noteRequest` and before
+ * `connectorFetch`, so "still null" is the machine-checked form of "this call has sent nothing".
+ *
+ * ------------------------------------------------------------------------------------------------
+ * AN ENUMERATION OF RETURNS IS NOT AN ENUMERATION OF EXITS (o3d-2w2j r2, Codex HIGH)
+ * ------------------------------------------------------------------------------------------------
+ *
+ * The four members above are the ways a pre-egress statement can RETURN a refusal. A statement can
+ * also leave by THROWING, and the first round enumerated only the first kind. `getAccessToken()` is
+ * the exact case: it reads the token row, reads settings and decrypts, and any of those can reject.
+ * The exception then produced no member and no outcome at all — the post threw, the processor's
+ * ordinary failure path took the row with the dispatch marker still standing, and once the replay
+ * window closed the row was permanently refused for a create that provably never reached the
+ * transport. That is the original wedge, arriving through an unenumerated door.
+ *
+ * So each pre-request statement that can throw now has a member of its own, written by a catch at
+ * that exact statement, and each is provable by the same rule — WHERE THE STATEMENT SITS:
+ *
+ *  • `connection-unresolvable`  `getAccessToken()` THREW. Same position as `no-connection`: no token,
+ *                               no tenant header, no request object, and `performRequest` is not
+ *                               entered. The only difference between the two is how the resolver
+ *                               declined to produce an auth.
+ *  • `request-unbuildable`      building the request object threw — the `If-Modified-Since`
+ *                               formatting or the body serialisation. After the auth is resolved and
+ *                               strictly before `performRequest` is called, so no socket exists yet.
+ *  • `posting-intent-unavailable`
+ *                               `accountingPostingIntentRefusal` threw rather than answering. Same
+ *                               statement as `posting-intent-refused`, above the retry loop.
+ *  • `rate-budget-unavailable`  `waitForBudget` threw. Same statement as the budget refusals, and
+ *                               like them it returns before `noteRequest`, so it costs no budget.
+ *  • `egress-authorisation-unavailable`
+ *                               `accountingEgressRefusal` threw. Its `authorize` callbacks read AND
+ *                               WRITE the database, so this is the likeliest throw of the five. Same
+ *                               statement as `egress-unauthorised`, and `connectorFetch` is the next
+ *                               statement but one.
+ *
+ * WHERE THE LINE IS DRAWN, AND IT IS DRAWN AT THE SOCKET, NOT AT THE FUNCTION BOUNDARY. Every catch
+ * above ends BEFORE the statement that can send. `performRequest` is called outside the
+ * request-building catch; `connectorFetch` is called outside all of them. An exception from
+ * `connectorFetch` — or from anything after it — propagates exactly as it did before, untagged,
+ * because the request was already handed to the transport.
+ *
+ * `noteRequest` IS DELIBERATELY NOT WRAPPED. It sits between the last refusal and `connectorFetch`,
+ * and its FIRST statement increments the attempt counter — so a throw from it leaves the caller's
+ * counter delta non-zero, `reachedTheWire` true, and the release refused by the conjunction whatever
+ * this tag said. Leaving it untagged errs towards "sent", which is the direction this whole type errs
+ * in; wrapping it would add the one member that could never license anything.
+ *
+ * WHAT IS DELIBERATELY ABSENT. There is no member for a timeout, a reset, a 5xx, an unparseable body
+ * or a `connectorFetch` throw. Those are ANSWERS THAT DID NOT ARRIVE, not refusals that did not send,
+ * and the whole value of this type is that it cannot be widened to cover them without someone adding
+ * a member and writing down where the statement sits.
+ */
+export type XeroNotSentReason =
+  | 'no-connection'
+  | 'posting-intent-refused'
+  | 'egress-unauthorised'
+  | 'rate-budget-refused'
+  | 'connection-unresolvable'
+  | 'request-unbuildable'
+  | 'posting-intent-unavailable'
+  | 'rate-budget-unavailable'
+  | 'egress-authorisation-unavailable'
+
+/**
+ * How the reason travels from `performRequest` (which returns a `Response`) to `xeroFetchWithAuth`
+ * (which builds the `XeroResponse`). A symbol rather than a field so it cannot collide with anything
+ * on a real `Response`, and so a genuine Xero reply can never carry one.
+ */
+const XERO_NOT_SENT_REASON = Symbol('xero.notSentReason')
+
+/** Read the tag off a refusal built by {@link markNotSent}. Undefined on every real reply. */
+function xeroNotSentReason(res: Response): XeroNotSentReason | undefined {
+  return (res as Response & { [XERO_NOT_SENT_REASON]?: XeroNotSentReason })[XERO_NOT_SENT_REASON]
+}
+
+/**
  * In-request 429 retries. Exported because it is half of the only retry Xero's six-minute
  * Idempotency-Key window actually covers — see lib/domain/accounting/idempotency-retention.ts.
  */
@@ -92,6 +199,16 @@ export type XeroResponse<T = unknown> = {
   status: number
   data?: T
   error?: string
+  /**
+   * PRESENT ONLY WHEN THIS PROCESS PROVED IT SENT NOTHING (o3d-gvzu). See {@link XeroNotSentReason}
+   * for the enumeration and for why each member is provable from where its statement sits.
+   *
+   * `undefined` is not "we sent it". It is "nothing here proves we did not" — which covers a real
+   * reply, a timeout, a reset mid-write, a 5xx, and a per-attempt refusal that followed an attempt
+   * which had already gone out. Callers that hold a durable record of a dispatch must treat
+   * `undefined` as SENT.
+   */
+  notSent?: XeroNotSentReason
   /**
    * The Xero organisation this request was actually ADDRESSED TO — the tenantId that went out in the
    * `Xero-Tenant-Id` header, resolved BEFORE the request was made (o3d-gfh, o3d-s36z).
@@ -293,7 +410,22 @@ async function performRequest(auth: { accessToken: string; tenantId: string }, i
   /** What is left of XERO_IN_REQUEST_RETRY_BUDGET_MS, from the first call. */
   const budgetRemainingMs = () =>
     firstCallAt === null ? Number.POSITIVE_INFINITY : XERO_IN_REQUEST_RETRY_BUDGET_MS - (Date.now() - firstCallAt)
-  const outOfBudgetResponse = (waitMs: number, elapsedMs: number) => ({
+  /**
+   * TAG A REFUSAL AS PROVABLY PRE-EGRESS — and refuse to tag it once anything has gone out (o3d-gvzu).
+   *
+   * `firstCallAt` is assigned on the statement AFTER `noteRequest` and BEFORE `connectorFetch`, and it
+   * is the only thing in this function that records "a request has left". So `firstCallAt === null` is
+   * a mechanical proof that no `connectorFetch` has been entered on this call, and it is checked HERE,
+   * at the moment of return, rather than at the site that decided to refuse — several of these
+   * refusals are re-evaluated per retry attempt, and the same refusal is pre-egress on attempt 0 and
+   * says nothing at all about attempt 1.
+   *
+   * IT ERRS ONLY TOWARDS "SENT". Losing a tag costs a marker that is not released and a refusal an
+   * operator resolves; adding one that is not true costs a duplicate document in a live ledger.
+   */
+  const markNotSent = <T extends object>(reason: XeroNotSentReason, res: T): T =>
+    firstCallAt === null ? Object.assign(res, { [XERO_NOT_SENT_REASON]: reason }) : res
+  const outOfBudgetResponse = (waitMs: number, elapsedMs: number) => markNotSent('rate-budget-refused', {
     ok: false,
     status: 429,
     text: async () =>
@@ -311,7 +443,7 @@ async function performRequest(auth: { accessToken: string; tenantId: string }, i
    * by an exact-boundary sleep or by a timer that woke late. Its own message, so a test can tell which
    * of the two refused and an operator can tell which bound was hit.
    */
-  const budgetSpentResponse = (elapsedMs: number) => ({
+  const budgetSpentResponse = (elapsedMs: number) => markNotSent('rate-budget-refused', {
     ok: false,
     status: 429,
     text: async () =>
@@ -334,24 +466,64 @@ async function performRequest(auth: { accessToken: string; tenantId: string }, i
   // xeroUploadAttachment all call it — so there is no arm left to forget it. Evaluated once rather than
   // per retry attempt on purpose: `auth` is fixed for the whole call, so the verdict cannot change
   // across the retry loop, and re-asking would be a second evaluation of a settled permission.
-  const intentRefusal = accountingPostingIntentRefusal(XERO_CONNECTOR, auth.tenantId)
+  //
+  // AND IT IS ASKED INSIDE A CATCH (o3d-2w2j r2). The verdict is computed from the row's stored
+  // payload and its provenance stamps; a payload that will not deserialise, or a provenance shape it
+  // cannot read, throws rather than refusing. That exception is as pre-egress as the refusal beside
+  // it — this is the statement above the retry loop, and `connectorFetch` has not been entered — so
+  // it is reported as a named refusal rather than escaping the transport untagged.
+  let intentRefusal: string | null
+  try {
+    intentRefusal = accountingPostingIntentRefusal(XERO_CONNECTOR, auth.tenantId)
+  } catch (error) {
+    return markNotSent('posting-intent-unavailable', {
+      ok: false,
+      status: XERO_NOT_SENT_STATUS,
+      text: async () =>
+        `Xero's posting intent for organisation ${auth.tenantId} could not be evaluated — `
+        + `${String(error)}. NOTHING WAS SENT: this check sits above the retry loop, so no attempt `
+        + 'had been made when it failed.',
+    }) as Response
+  }
   if (intentRefusal) {
-    return { ok: false, status: XERO_NOT_SENT_STATUS, text: async () => intentRefusal } as Response
+    return markNotSent('posting-intent-refused', {
+      ok: false, status: XERO_NOT_SENT_STATUS, text: async () => intentRefusal,
+    }) as Response
   }
 
   for (let attempt = 0; attempt <= XERO_MAX_RETRIES; attempt++) {
     const remainingBeforeCall = budgetRemainingMs()
-    const budget = await waitForBudget(auth.tenantId, remainingBeforeCall)
+    // Wrapped for the same reason the two authorisations are: it is a statement that can leave by
+    // throwing as well as by answering, and every exit above the socket has to be enumerated. It
+    // cannot throw at today's body (in-memory buckets and a `setTimeout`), and that is precisely the
+    // kind of claim the first round made about the token resolver — so the catch is here on the
+    // strength of WHERE THE STATEMENT SITS, which does not change when the body does.
+    let budget: Awaited<ReturnType<typeof waitForBudget>>
+    try {
+      budget = await waitForBudget(auth.tenantId, remainingBeforeCall)
+    } catch (error) {
+      return markNotSent('rate-budget-unavailable', {
+        ok: false,
+        // NOT a 429: nothing rate-limited this request. Zero, like every other refusal that reports
+        // no reply because there was no request — and it keeps "a 429 above the socket is a budget
+        // refusal" exactly as true as it was.
+        status: XERO_NOT_SENT_STATUS,
+        text: async () =>
+          `Xero's rate budget for organisation ${auth.tenantId} could not be evaluated — `
+          + `${String(error)}. NOTHING WAS SENT: this runs before \`noteRequest\`, so no attempt was `
+          + 'made and none was counted.',
+      }) as Response
+    }
     if (!budget.ok) {
       if (budget.reason === 'budget') return outOfBudgetResponse(budget.waitMs, XERO_IN_REQUEST_RETRY_BUDGET_MS - remainingBeforeCall)
-      return {
+      return markNotSent('rate-budget-refused', {
         ok: false,
         status: 429,
         text: async () =>
           `Xero day budget exhausted for this tenant: ${XERO_DAY_LIMIT} calls used within the rolling ` +
           `24h window, oldest falls out in ${Math.round(budget.waitMs / 60_000)} min. Not waiting — ` +
           `the work must be deferred. (Xero's real cap is 1,000/org/rolling-24h since 2026-03-02.)`,
-      } as Response
+      } as Response)
     }
 
     // THE LAST STATEMENT BEFORE THE SOCKET, AND THE ONE PLACE ANY PRE-EGRESS PERMISSION IS SPENT
@@ -374,9 +546,29 @@ async function performRequest(auth: { accessToken: string; tenantId: string }, i
     // organisation it asked against the organisation about to be written to, here, with no second
     // token resolution able to intervene. That comparison used to be impossible to make correctly at
     // any other point, so it was not made at all.
-    const egressRefusal = await accountingEgressRefusal(XERO_CONNECTOR, { tenantId: auth.tenantId })
+    //
+    // AND IT IS THE LIKELIEST OF THE FIVE TO THROW (o3d-2w2j r2), which is why the catch matters most
+    // here: an `authorize` callback may READ AND WRITE the database and one of them takes an
+    // exclusive slot, so a lock timeout, a serialisation failure or a dropped connection all reject.
+    // The catch adds no await of its own, so "nothing between here and `connectorFetch` awaits"
+    // still holds, and it ends before `noteRequest` — nothing was sent, and nothing was counted.
+    let egressRefusal: string | null
+    try {
+      egressRefusal = await accountingEgressRefusal(XERO_CONNECTOR, { tenantId: auth.tenantId })
+    } catch (error) {
+      return markNotSent('egress-authorisation-unavailable', {
+        ok: false,
+        status: XERO_NOT_SENT_STATUS,
+        text: async () =>
+          `The egress authorisation for organisation ${auth.tenantId} could not be evaluated — `
+          + `${String(error)}. NOTHING WAS SENT: the authorisation is the last statement before the `
+          + 'attempt is counted, and it never returned a permission.',
+      }) as Response
+    }
     if (egressRefusal) {
-      return { ok: false, status: XERO_NOT_SENT_STATUS, text: async () => egressRefusal } as Response
+      return markNotSent('egress-unauthorised', {
+        ok: false, status: XERO_NOT_SENT_STATUS, text: async () => egressRefusal,
+      }) as Response
     }
 
     /**
@@ -467,7 +659,48 @@ export function formatIfModifiedSince(value: Date | string): string {
  */
 async function notConnectedResponse<T = unknown>(): Promise<XeroResponse<T>> {
   const blocked = await getStoredTenantBlockReason().catch(() => null)
-  return { ok: false, status: 0, error: blocked ?? 'Not connected to Xero' }
+  // PROVABLY PRE-EGRESS BY CONSTRUCTION, and the strongest of the four: `getAccessToken()` answered
+  // null, so there is no access token, no `Xero-Tenant-Id` and no request object. `performRequest` is
+  // never entered. This is the "Not connected to Xero" blip o3d-gvzu names — one of which used to
+  // wedge a manual-journal row for good.
+  return { ok: false, status: 0, error: blocked ?? 'Not connected to Xero', notSent: 'no-connection' }
+}
+
+/**
+ * The resolver THREW (o3d-2w2j r2). Sibling of {@link notConnectedResponse} — same position, same
+ * proof — reported separately because "no connection is stored" and "the stored connection could not
+ * be read" send an operator to different places.
+ *
+ * No `tenantId`: none was ever resolved. That is the same `undefined` a disconnected call already
+ * produces, and it is the truth here for the same reason.
+ */
+function connectionUnresolvableResponse<T = unknown>(error: unknown): XeroResponse<T> {
+  return {
+    ok: false,
+    status: XERO_NOT_SENT_STATUS,
+    error: `Could not resolve a Xero connection: ${String(error)}. NOTHING WAS SENT — no token was `
+      + 'obtained, so no request was ever built.',
+    notSent: 'connection-unresolvable',
+  }
+}
+
+/**
+ * BUILDING THE REQUEST THREW (o3d-2w2j r2).
+ *
+ * The two statements that can: `formatIfModifiedSince`, which calls `toISOString()` and answers a
+ * RangeError for an unparseable date, and `JSON.stringify`, which throws on a cycle or a BigInt. Both
+ * sit after the auth is resolved and strictly before `performRequest` is called, so the proof is
+ * positional in the same way every other member's is.
+ */
+function requestUnbuildableResponse<T = unknown>(tenantId: string, error: unknown): XeroResponse<T> {
+  return {
+    ok: false,
+    status: XERO_NOT_SENT_STATUS,
+    error: `Could not build the Xero request: ${String(error)}. NOTHING WAS SENT — the failure is in `
+      + 'assembling the request object, one statement above the transport.',
+    notSent: 'request-unbuildable',
+    tenantId,
+  }
 }
 
 async function xeroFetch<T = unknown>(
@@ -476,7 +709,24 @@ async function xeroFetch<T = unknown>(
   body?: unknown,
   opts?: { idempotencyKey?: string; ifModifiedSince?: Date | string },
 ): Promise<XeroResponse<T>> {
-  const auth = await getAccessToken()
+  let auth: Awaited<ReturnType<typeof getAccessToken>>
+  try {
+    auth = await getAccessToken()
+  } catch (error) {
+    // THE RESOLVER CAN THROW, AND THE FIRST ROUND ONLY HANDLED IT RETURNING NULL (o3d-2w2j r2).
+    //
+    // `getAccessToken()` reads the token row, reads settings and decrypts; a database blip, a
+    // settings read that fails or a decryption error all reject rather than answer null. The
+    // exception used to leave this function entirely, so the manual-journal poster produced neither
+    // an outcome nor a reason and the row fell into ordinary backoff with its dispatch marker
+    // standing — the wedge this branch exists to close, through a door the enumeration had not
+    // named.
+    //
+    // PROVABLY PRE-EGRESS BY CONSTRUCTION, and for exactly the reason `no-connection` is: there is
+    // no access token, no `Xero-Tenant-Id` and no request object, and `performRequest` is never
+    // entered. Which of the two applies depends only on how the resolver declined.
+    return connectionUnresolvableResponse(error)
+  }
   if (!auth) return await notConnectedResponse()
   return xeroFetchWithAuth<T>(auth, method, path, body, opts)
 }
@@ -492,38 +742,63 @@ async function xeroFetchWithAuth<T = unknown>(
   body?: unknown,
   opts?: { idempotencyKey?: string; ifModifiedSince?: Date | string },
 ): Promise<XeroResponse<T>> {
-  const url = path.startsWith('http') ? path : `${XERO_BASE_URL}/${path}`
+  // EVERY STATEMENT THAT ASSEMBLES THE REQUEST, IN ONE BLOCK THAT CANNOT THROW PAST ITSELF
+  // (o3d-2w2j r2). Two of them can throw today — `formatIfModifiedSince` on an unparseable date and
+  // `JSON.stringify` on a cycle or a BigInt — and the block rather than the two statements is
+  // deliberate: the property being kept is that NOTHING between the resolved auth and
+  // `performRequest` may leave this function untagged, and a block keeps it for statements added
+  // later that nobody thought to wrap.
+  //
+  // IT ENDS BEFORE `performRequest`, which is the whole of the rule. The transport has its own
+  // pre-egress tags, its own per-attempt guard and, below them, a socket whose exceptions must stay
+  // untagged; folding it in here would tag them all.
+  let url: string
+  let init: RequestInit
+  try {
+    url = path.startsWith('http') ? path : `${XERO_BASE_URL}/${path}`
 
-  const headers: Record<string, string> = {
-    'Authorization': `Bearer ${auth.accessToken}`,
-    'Xero-Tenant-Id': auth.tenantId,
-    'Accept': 'application/json',
-  }
-  if (opts?.idempotencyKey && method !== 'GET') {
-    headers['Idempotency-Key'] = opts.idempotencyKey
-  }
-  // The Accounting API's modified-since filter is THIS HEADER. There is no `ModifiedAfter` query
-  // param — the poller passed one for months and Xero, which ignores unknown query params rather
-  // than rejecting them, dropped it on the floor (o3d-5gm). `?since=` is Payroll, not Accounting.
-  if (opts?.ifModifiedSince) {
-    headers['If-Modified-Since'] = formatIfModifiedSince(opts.ifModifiedSince)
-  }
+    const headers: Record<string, string> = {
+      'Authorization': `Bearer ${auth.accessToken}`,
+      'Xero-Tenant-Id': auth.tenantId,
+      'Accept': 'application/json',
+    }
+    if (opts?.idempotencyKey && method !== 'GET') {
+      headers['Idempotency-Key'] = opts.idempotencyKey
+    }
+    // The Accounting API's modified-since filter is THIS HEADER. There is no `ModifiedAfter` query
+    // param — the poller passed one for months and Xero, which ignores unknown query params rather
+    // than rejecting them, dropped it on the floor (o3d-5gm). `?since=` is Payroll, not Accounting.
+    if (opts?.ifModifiedSince) {
+      headers['If-Modified-Since'] = formatIfModifiedSince(opts.ifModifiedSince)
+    }
 
-  const init: RequestInit = { method, headers }
+    init = { method, headers }
 
-  if (body) {
-    headers['Content-Type'] = 'application/json'
-    init.body = JSON.stringify(body)
+    if (body) {
+      headers['Content-Type'] = 'application/json'
+      init.body = JSON.stringify(body)
+    }
+  } catch (error) {
+    return requestUnbuildableResponse<T>(auth.tenantId, error)
   }
 
   const res = await performRequest(auth, init, url)
   // Refused before sending. Reported verbatim rather than falling through to the `!res.ok` branch,
   // which would prefix it with "HTTP 0:" and so describe a reply Xero never made.
   if (res.status === XERO_NOT_SENT_STATUS) {
-    return { ok: false, status: XERO_NOT_SENT_STATUS, error: await res.text(), tenantId: auth.tenantId }
+    return {
+      ok: false, status: XERO_NOT_SENT_STATUS, error: await res.text(), tenantId: auth.tenantId,
+      notSent: xeroNotSentReason(res),
+    }
   }
   if (res.status === 429) {
-    return { ok: false, status: 429, error: await res.text().catch(() => 'Rate limited'), tenantId: auth.tenantId }
+    // A 429 is the one status that appears on BOTH sides of the socket — the budget refusals below
+    // the fence report it without sending, and Xero itself answers it after a real send. So the tag
+    // is what separates them, never the status (o3d-gvzu).
+    return {
+      ok: false, status: 429, error: await res.text().catch(() => 'Rate limited'), tenantId: auth.tenantId,
+      notSent: xeroNotSentReason(res),
+    }
   }
 
   if (!res.ok) {
@@ -628,7 +903,17 @@ export async function xeroGetCached<T = unknown>(
   // Resolve auth ONCE and use it for both the key and the request. Never touch the cache when
   // disconnected — no read from and no write to a 'no-tenant' key, so a disconnected call can neither
   // serve nor create connected data.
-  const auth = await getAccessToken()
+  //
+  // The resolver can throw as well as answer null (o3d-2w2j r2), and this arm answers the same
+  // `XeroResponse` the others do, so it reports the same named refusal. Nothing here holds a dispatch
+  // marker — these are reference GETs — but a rule with an exception in it is a rule nobody can
+  // check, and the cache is deliberately left untouched on both arms alike.
+  let auth: Awaited<ReturnType<typeof getAccessToken>>
+  try {
+    auth = await getAccessToken()
+  } catch (error) {
+    return connectionUnresolvableResponse<T>(error)
+  }
   if (!auth) return await notConnectedResponse()
 
   const key = `${auth.tenantId}:${path}`
@@ -672,6 +957,13 @@ export async function xeroGetRaw(
   path: string,
   accept: string = 'application/pdf',
 ): Promise<{ ok: boolean; status: number; buffer?: Buffer; error?: string }> {
+  // THE ONE ARM THAT STILL LETS A RESOLVER EXCEPTION THROUGH, AND IT IS SAID OUT LOUD (o3d-2w2j r2).
+  //
+  // Its return type has no `notSent` field to carry a tag on, because nothing it is used for holds a
+  // durable dispatch record: it downloads PDFs. Widening the shape to add a channel with no reader
+  // would be a wider change than the one being made, and an untagged exception here costs a failed
+  // download that is retried, not a wedged row. The next caller that needs the proof should move to
+  // `XeroResponse` rather than add a second, weaker tag here.
   const auth = await getAccessToken()
   if (!auth) return await notConnectedResponse()
 
@@ -714,10 +1006,23 @@ export async function xeroUploadAttachment(
   fileBuffer: Buffer,
   contentType: string,
 ): Promise<XeroResponse> {
-  const auth = await getAccessToken()
+  let auth: Awaited<ReturnType<typeof getAccessToken>>
+  try {
+    auth = await getAccessToken()
+  } catch (error) {
+    return connectionUnresolvableResponse(error)
+  }
   if (!auth) return await notConnectedResponse()
 
-  const url = `${XERO_BASE_URL}/${endpoint}/${objectId}/Attachments/${encodeURIComponent(filename)}`
+  // `encodeURIComponent` throws a URIError on a lone surrogate, and a filename arrives from
+  // user-supplied data. Same block, same rule as `xeroFetchWithAuth`: it ends before
+  // `performRequest`.
+  let url: string
+  try {
+    url = `${XERO_BASE_URL}/${endpoint}/${objectId}/Attachments/${encodeURIComponent(filename)}`
+  } catch (error) {
+    return requestUnbuildableResponse(auth.tenantId, error)
+  }
 
   const res = await performRequest(auth, {
     method: 'PUT',

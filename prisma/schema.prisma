@@ -2345,6 +2345,12 @@ model AccountingSyncLog {
   /// outcome (app/actions/accounting-settlement.ts) and IMS verified NOTHING about it — no call was
   /// made, no figure was compared, only a document id was typed in.
   ///
+  /// o3d-psvi r3: 'OPERATOR_RELEASE' is the third value — a row the sweep retired to CANCELLED that
+  /// an operator put back in front of it (releaseRetiredAccountingSyncRowForLiveSale). The STATUS
+  /// was reached by a human, so it must not read as a connector writeback; the DOCUMENT ID was not,
+  /// because that control refuses an asserted row outright, so the readers that fail closed on an
+  /// unverified id must not fire for it. See lib/domain/accounting/sync-row-settlement.ts.
+  ///
   /// It exists because a verdict has to carry its basis. Without this column a settled row is
   /// byte-identical to a connector-confirmed one, and every reader that asks "did this post?" —
   /// most importantly lib/domain/accounting/settlement-status.ts, which then compares the amount
@@ -2428,6 +2434,36 @@ model AccountingSyncLog {
   // Not a candidate-query predicate: an unstamped row is a candidate already. It only widens the
   // "back-reference done, follow-ups outstanding" pass that used to be FAILED-only.
   backReferenceFollowUpsPendingAt DateTime?
+  // o3d-0bfh r8 (Codex HIGH): WHEN THE CURRENT OBLIGATION WAS CLAIMED, STAMPED BY THE DATABASE.
+  //
+  // `backReferenceFollowUpsPendingAt` above is a GENERATION, not a time — minted as
+  // max(now, observed + 1ms), so under contention it is deliberately ahead of every clock and no
+  // reader outside the claim/release protocol may compare it to one. The backlog in the exception
+  // inbox still needs an AGE, and r7 measured it on `syncedAt`, which the connectors write with the
+  // application host's `new Date()`. Both ends of that comparison were then application clocks from
+  // possibly different hosts: if the minting host ran ahead, or its clock was corrected backwards
+  // afterwards, a genuinely stranded payment stayed BELOW the cutoff and was hidden from the only
+  // surface that reports it — the same host-clock disagreement `syncedAtDatabaseClock` above exists
+  // because this codebase already anticipates.
+  //
+  // This column is written by the DATABASE, not by any writer: a trigger on the marker column
+  // (migration 20260827120000) stamps `clock_timestamp()` in the same statement that mints a new
+  // generation, clears it when the marker is cleared, and carries the old value over otherwise — so
+  // no application host can supply a value for it and no claim site can forget it. The backlog ages
+  // it against a `clock_timestamp()` read from the SAME database, so both ends of the comparison are
+  // readings of one clock and no application host's `new Date()` is involved at all. Triggers are
+  // invisible to this schema; the migration is where the rule lives.
+  //
+  // NOT stamped by the application also because the connectors' claim rides inside the transaction
+  // that records the invoice's external id: an extra statement there is an extra way to abort it,
+  // and a rolled-back SYNCED write means the invoice is posted to QuickBooks a second time.
+  //
+  // NULL is a real state, not a missing value: a marker minted by a build that predates this column,
+  // or one whose stamp statement failed after the CAS committed. Such a row CANNOT be aged against
+  // database time, so the backlog falls back to `createdAt` — which is a database `now()` DEFAULT,
+  // and therefore still not an application clock. That fallback is the fail-safe direction: it lists
+  // sooner, and the failure this whole column addresses is a row being HIDDEN.
+  backReferenceFollowUpsClaimedAtDatabaseClock DateTime?
   // o3d-0m56: when this row first made a REMOTE money call. Set once, immediately BEFORE the
   // call, and NEVER cleared — not by the manual retry, not by an automatic revival, both of
   // which reset retryCount to 0 and so cannot be used to answer "has this been sent before?".
@@ -2506,6 +2542,99 @@ model AccountingSyncLog {
   // manufacturing the confidence this column exists to stop being assumed. It is never written on
   // any path that posts, so it can only ever be set by a writer that knows the negative.
   abandonedBeforeRemoteCall Boolean? @map("abandoned_before_remote_call")
+
+  /// o3d-dzip — WHICH ACCOUNTING ORGANISATION THIS ROW WAS RAISED AGAINST, in a place retention
+  /// cannot reach. o3d-s36z records the same fact in the payload (`_connectionProvenance`), and
+  /// `backReferenceEvidenceTombstone` compacts an expired-but-unresolved row to `payload: {}` while
+  /// KEEPING `externalTransactionId` — so the rows whose realm is least knowable are precisely the
+  /// ones that lose the stamp. This column is MINTED FROM that stamp, in the same INSERT statement,
+  /// so the two cannot disagree at birth.
+  ///
+  /// Readers must go through `readAccountingOriginRecord`, never this column alone and never the
+  /// payload alone: column-only ignores every row queued before this shipped, payload-only ignores
+  /// every tombstone, and a DISAGREEMENT between the two is undecidable and must refuse.
+  ///
+  /// NULL is not a missing value, it is "this row records no origin" — which already refuses at the
+  /// socket. Never backfilled from the payload: that would be the database vouching for every
+  /// historical stamp at once, which is the shortcut o3d-s36z refused.
+  ///
+  /// A trigger in the same migration CLEARS this column on any UPDATE that changes it, so it can be
+  /// minted by the enqueue that observed the connection and by nothing else — not the previous
+  /// release, not a repair script, not `psql`. Triggers are invisible to this schema; the migration
+  /// is where the rule lives.
+  connectionProvenance String? @map("connection_provenance")
+
+  /// o3d-jit6 — WHEN A CREATE FOR THIS ROW WAS FIRST PUT ON THE WIRE, and under which
+  /// `Idempotency-Key`. Written and COMMITTED before the request leaves, from the DATABASE's clock;
+  /// a failure to write it REFUSES the post, because a create whose local record cannot be written
+  /// is a create whose outcome cannot be recorded either (the o3d-k26m.5 rule).
+  ///
+  /// It exists because the transaction that settles the row with the id Xero returned can fail AT
+  /// COMMIT, taking a real, freshly created document down with it. Nothing written inside that
+  /// transaction is evidence of anything afterwards; only a record that committed FIRST survives.
+  ///
+  /// The key is stored, not a bare flag, so a retry can PROVE its re-post is a replay of the same
+  /// request rather than a new one — which is the whole of what Xero's six-minute idempotency
+  /// window is worth. Past that window a ManualJournal create has no natural key and no remedy, and
+  /// the poster refuses instead of guessing (lib/domain/accounting/create-dispatch-record.ts).
+  ///
+  /// Write-once, and the database enforces it: a trigger in the same migration RESTORES the pair on
+  /// any UPDATE that clears, moves or splits it, and refuses one supplied by an INSERT. Note the
+  /// direction is the opposite of `syncedAtDatabaseClock`'s trigger, deliberately — that marker is a
+  /// permission, so tampering clears it; this one is a prohibition, so tampering must not.
+  createDispatchedAt           DateTime? @map("create_dispatched_at")
+  createDispatchIdempotencyKey String?   @map("create_dispatch_idempotency_key")
+
+  /// o3d-gvzu — POSITIVE EVIDENCE THAT THE DISPATCH ABOVE PUT NOTHING ON THE WIRE, written after the
+  /// fact by the attempt that proved it.
+  ///
+  /// The marker above is minted inside the claim fence, one statement before the socket — and the
+  /// transport has refusals of its own BELOW it: an unresolvable connection, a posting-intent refusal,
+  /// an egress authorisation, an exhausted rate budget. Each of those leaves the marker standing over
+  /// a create nobody made, and one "Not connected to Xero" blip therefore used to wedge the row for
+  /// good once Xero's six-minute idempotency window closed under it.
+  ///
+  /// The pair above cannot be cleared to fix that, and must not be: it is a PROHIBITION, and a
+  /// prohibition that tampering clears hands the tamperer exactly what they wanted. So the release is
+  /// a column of its own, and it is only ever written on a NAMED, enumerated refusal that is provable
+  /// from where its statement sits (lib/connectors/xero/api.ts, `XeroNotSentReason`). "We got no
+  /// answer" is not such a proof: a timeout, a socket reset mid-write and a 5xx all leave the marker
+  /// standing, deliberately, because the request may have arrived.
+  ///
+  /// A ONE-SHOT PERMISSION. The attempt that proceeds on it CLEARS it in the same statement that
+  /// re-proves the claim and sends, so a release can never outlive the request it permitted. NULL
+  /// therefore means "no release stands", which is what every row before this column said and how
+  /// they all continue to behave.
+  ///
+  /// A trigger in the same migration refuses one supplied by an INSERT, and refuses one written onto a
+  /// row that carried no marker before the statement — so nothing can mint a marker and release it at
+  /// once. Clearing is always allowed: this is a permission, so narrowing is the safe direction, which
+  /// is the OPPOSITE of the pair above and deliberately so. Triggers are invisible to this schema; the
+  /// migration is where the rule lives.
+  createDispatchReleasedAt     DateTime? @map("create_dispatch_released_at")
+
+  /// o3d-bqw7 r2 — WHAT THIS ROW ACTUALLY OWED, recorded before retention erased the payload it was
+  /// owed from.
+  ///
+  /// The discard warning claims "this row's outstanding follow-ups can no longer be enqueued". r1
+  /// answered that from the row's TYPE, which was already a narrowing of answering it from the
+  /// compaction stamp — but a type is still coarser than the truth. A SALES_INVOICE does not
+  /// inherently owe a payment registration: the enqueue is gated on `payload._registerPayment`, and
+  /// the ordinary sales path composes payloads without it. So a type-level answer goes on warning
+  /// about rows that lost nothing, and because the warning GATES the obligation release, a false
+  /// warning that is also unwritable holds an already-posted row at PENDING for ever.
+  ///
+  /// This is the per-ROW answer: a JSON array of obligation KEYS, written by retention's compaction
+  /// in the same statement that empties the payload — computed FROM that payload, while it is still
+  /// there to be read. It is a record of what was OWED, never a copy of what was sent: no names, no
+  /// addresses, no amounts, no document text. That is what lets it survive a compaction whose whole
+  /// purpose is to remove exactly those things.
+  ///
+  /// NULL is not an empty list. NULL means NO RECORD — every row compacted before this column
+  /// existed, and every row that was never compacted at all — and readers fall back to the type
+  /// table for those, which OVER-reports. That direction is deliberate and permanent: an over-broad
+  /// warning is noise, an under-broad one loses a payment in silence.
+  followUpObligations Json? @map("follow_up_obligations")
 
   // Polymorphic reference: use referenceType + referenceId for application-level lookups.
   // No FK constraints — referenceId may point to PurchaseOrder, SalesOrder, etc. based on referenceType.
@@ -2966,6 +3095,31 @@ enum WmsOrderPushState {
   DEAD_LETTER
   HELD
   MERGED
+  /// o3d-2k5r r4: a create request WAS dispatched for this order and its outcome
+  /// was never recorded — the shape a worker killed mid-push leaves behind, since
+  /// claimForCreate writes its claim immediately before the remote call. Distinct
+  /// from PENDING_CREATE because the queue is precisely what such a link must be
+  /// taken out of (re-pushing is a second warehouse order); distinct from
+  /// DEAD_LETTER because no failure was ever observed; distinct from
+  /// VALIDATION_FAILED because the payload is fine. It leaves the create queue and
+  /// re-enters it only where the connector's own create REFUSES a duplicate — see
+  /// lib/domain/wms/create-replay-policy.ts — and otherwise waits for a person.
+  AMBIGUOUS_CREATE
+  /// o3d-92fu: the push payload could not be BUILT from local data (a line with
+  /// no SKU, say), so pushOrder was never invoked and no remote side effect is
+  /// possible. Distinct from DEAD_LETTER, which spans repeated REMOTE failures
+  /// whose outcome is unknown — both have externalOrderId = null and pushedAt =
+  /// null, so nothing else on this row could tell them apart, and the hard-delete
+  /// guard has to. It is NOT a create candidate (that is what stops batchSize
+  /// malformed orders starving the create queue every sweep) and the revalidation
+  /// pass returns it to PENDING_CREATE for free — no remote call — the moment the
+  /// payload builds again.
+  ///
+  /// SAFE-TO-DELETE ONLY WITH attempts = 0. A link that already spent remote
+  /// attempts and only THEN failed to build keeps this state to stay out of the
+  /// queue, but its earlier calls may have partially succeeded, so the guard
+  /// still refuses on it.
+  VALIDATION_FAILED
 }
 
 model WmsOrderPushLink {

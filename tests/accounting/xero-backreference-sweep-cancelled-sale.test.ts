@@ -202,6 +202,48 @@ mock.module('@/lib/connectors/xero/auth', { namedExports: { getGrantedScopes: as
 mock.module('@/lib/connectors/woocommerce/sync/invoice-note', {
   namedExports: { pushInvoiceNoteToWc: async () => ({ success: true }) },
 })
+/**
+ * THE DEFERRED-RECEIPT RE-DRIVE, STUBBED AS SETTLED (o3d-0bfh).
+ *
+ * This file is about the CANCELLATION gate, and every fixture below is a live or cancelled sale with
+ * no deferred receipt in it. The real `registerDeferredOrderReceipts` was previously left to run
+ * against `dbStub`, which models only the columns the cancellation gate reads — so it answered from
+ * an incomplete fixture rather than from anything these tests set up. That was harmless while the
+ * sweep discarded the answer, and stopped being harmless the moment it started reading it: the
+ * live-sale twins began reporting an outstanding receipt that no test had asked for, which would
+ * have masked the release they exist to prove.
+ *
+ * Stated as an explicit assumption instead. The receipt gate has its own tests
+ * (tests/accounting/back-reference-sweep.test.ts, [o3d-0bfh]); this one holds it at "nothing owed"
+ * so the only variable left in these fixtures is `SalesOrder.status`.
+ */
+mock.module('@/lib/domain/accounting/invoice-payment-enqueue', {
+  namedExports: {
+    registerDeferredOrderReceipts: async (
+      _orderId: string,
+      _posted: unknown,
+      obligation: { syncLogId: string; generation: Date | null } | null,
+    ) => {
+      // o3d-0bfh r15: AND IT CLEARS THE GENERATION IT WAS HANDED. The production re-drive takes the
+      // sales-order lock, re-reads the receipts, and releases the obligation IN THAT SAME
+      // TRANSACTION — so by the time the sweep writes its settlement stamp the marker column is
+      // already null. A stub that answered "settled" without doing so would leave the sweep fencing
+      // its stamp on a generation nothing holds any more, and every live-sale twin below would
+      // report a deferral that production never produces.
+      if (obligation?.generation) {
+        await store.delegate.updateMany({
+          where: { id: obligation.syncLogId, backReferenceFollowUpsPendingAt: obligation.generation },
+          data: { backReferenceFollowUpsPendingAt: null },
+        } as never)
+      }
+      return {
+        settled: true,
+        reason: 'no-receipts',
+        release: obligation?.generation ? 'released' : 'not-held',
+      }
+    },
+  },
+})
 
 async function loadSweep() {
   return (await import('@/lib/connectors/xero/sync-processor')).repairXeroBackReferences
@@ -267,7 +309,7 @@ test('o3d-e2mz r8: the sweep RETIRES a candidate whose SALE is cancelled instead
 
   assert.deepEqual(result, {
     scanned: 1, checked: 0, repaired: 0, failed: 0, skippedAmbiguous: 0,
-    followUpsDiscarded: 0, skippedUnverified: 0, retiredCancelledSale: 1,
+    followUpsDiscarded: 0, skippedUnverified: 0, retiredCancelledSale: 1, followUpsUnsettled: 0, settlementDeferred: 0,
   })
   const escalation = activity.find((entry) => entry.action === 'xero_backreference_repair_cancelled_sale')
   assert.equal(escalation?.level, 'ERROR')
@@ -292,7 +334,7 @@ test('o3d-e2mz r8: the SAME candidate on a LIVE sale is still repaired — the s
   assert.equal(store.get('log-1')?.status, 'SYNCED', 'a SYNCED row stays SYNCED')
   assert.deepEqual(result, {
     scanned: 1, checked: 1, repaired: 1, failed: 0, skippedAmbiguous: 0,
-    followUpsDiscarded: 0, skippedUnverified: 0, retiredCancelledSale: 0,
+    followUpsDiscarded: 0, skippedUnverified: 0, retiredCancelledSale: 0, followUpsUnsettled: 0, settlementDeferred: 0,
   })
 })
 
@@ -340,7 +382,7 @@ test('o3d-e2mz r8: a LOCK the sweep cannot take DEFERS the repair — nothing re
   assert.deepEqual(followUpRows(), [], 'and nothing is released while the sale cannot be proved live')
   assert.deepEqual(result, {
     scanned: 1, checked: 0, repaired: 0, failed: 1, skippedAmbiguous: 0,
-    followUpsDiscarded: 0, skippedUnverified: 0, retiredCancelledSale: 0,
+    followUpsDiscarded: 0, skippedUnverified: 0, retiredCancelledSale: 0, followUpsUnsettled: 0, settlementDeferred: 0,
   })
   const deferral = activity.find((entry) => entry.action === 'xero_backreference_repair_sale_unreadable')
   assert.equal(deferral?.level, 'WARNING')
@@ -371,7 +413,7 @@ test('o3d-e2mz r8: a locked status read that fails defers in the same way, and n
   assert.equal(store.get('log-1')?.status, 'SYNCED')
   assert.deepEqual(result, {
     scanned: 1, checked: 0, repaired: 0, failed: 1, skippedAmbiguous: 0,
-    followUpsDiscarded: 0, skippedUnverified: 0, retiredCancelledSale: 0,
+    followUpsDiscarded: 0, skippedUnverified: 0, retiredCancelledSale: 0, followUpsUnsettled: 0, settlementDeferred: 0,
   })
   assert.deepEqual(journal, ['probe:order-1', 'lock:order-1', 'read-status:order-1'])
 })
@@ -393,7 +435,7 @@ test('o3d-e2mz r8: a DELETED sales order is treated as cancelled, not as licence
   assert.equal(store.get('log-1')?.status, 'CANCELLED')
   assert.deepEqual(result, {
     scanned: 1, checked: 0, repaired: 0, failed: 0, skippedAmbiguous: 0,
-    followUpsDiscarded: 0, skippedUnverified: 0, retiredCancelledSale: 1,
+    followUpsDiscarded: 0, skippedUnverified: 0, retiredCancelledSale: 1, followUpsUnsettled: 0, settlementDeferred: 0,
   })
 })
 
@@ -416,7 +458,7 @@ test('o3d-e2mz r8: a FAILED row whose back-reference is already applied is retir
   assert.equal(store.get('log-1')?.attemptRevision, 5)
   assert.deepEqual(result, {
     scanned: 1, checked: 0, repaired: 0, failed: 0, skippedAmbiguous: 0,
-    followUpsDiscarded: 0, skippedUnverified: 0, retiredCancelledSale: 1,
+    followUpsDiscarded: 0, skippedUnverified: 0, retiredCancelledSale: 1, followUpsUnsettled: 0, settlementDeferred: 0,
   })
 })
 
@@ -431,7 +473,7 @@ test('o3d-e2mz r8: the same FAILED row on a LIVE sale still gets its outstanding
   assert.equal(store.get('log-1')?.status, 'SYNCED', 'and the reconciled row is settled')
   assert.deepEqual(result, {
     scanned: 1, checked: 1, repaired: 0, failed: 0, skippedAmbiguous: 0,
-    followUpsDiscarded: 0, skippedUnverified: 0, retiredCancelledSale: 0,
+    followUpsDiscarded: 0, skippedUnverified: 0, retiredCancelledSale: 0, followUpsUnsettled: 0, settlementDeferred: 0,
   })
   assert.ok(activity.some((entry) => entry.action === 'xero_backreference_followups_recovered'))
 })

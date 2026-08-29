@@ -197,7 +197,15 @@ export function isFxGainLossJournalSuppressed(
  */
 export type ConnectorEnqueueOutcome = {
   queued: boolean
-  reason?: 'not-configured' | 'refused'
+  /**
+   * `already-queued` (o3d-ekn8 r4, Codex MEDIUM) — `queued: true` WITHOUT A WRITE. The idempotency
+   * short-circuit finds a live row carrying the same key and reports success, which is right for the
+   * fourteen callers that only ask "is this work on the queue". It is NOT right for a caller that
+   * then decides to ROLL THE WRITE BACK: there was no write, the pre-existing row is still live and
+   * still going to post, and rolling back an empty transaction while telling the operator "nothing
+   * was sent" is the one message that guarantees nobody goes looking for it.
+   */
+  reason?: 'not-configured' | 'refused' | 'already-queued'
 }
 
 export type AccountingEnqueueOutcome = ConnectorEnqueueOutcome & {
@@ -416,7 +424,7 @@ export async function queueAccountingSyncTx(
   // yet still costs nothing and means the evidence exists on the rows written from now on, rather than
   // starting from zero on the day the other half lands.
   const { activeAccountingIdProvenance } = await import('@/lib/connectors/accounting-id-provenance')
-  const { stampAccountingPayloadConnection } = await import('@/lib/connectors/accounting-connection-provenance')
+  const { stampAccountingPayloadConnection, mintAccountingConnectionProvenanceColumn } = await import('@/lib/connectors/accounting-connection-provenance')
   const payload = stampAccountingPayloadConnection({
     ...params.payload,
     _postingMode: context.postingMode,
@@ -446,7 +454,9 @@ export async function queueAccountingSyncTx(
       },
       select: { id: true },
     })
-    if (existing) return answer({ queued: true }, context.connector)
+    // NOTHING IS WRITTEN HERE. `queued: true` means "the work is on the queue", not "this call put
+    // it there" — see ConnectorEnqueueOutcome.reason (o3d-ekn8 r4).
+    if (existing) return answer({ queued: true, reason: 'already-queued' }, context.connector)
   }
 
   try {
@@ -463,6 +473,12 @@ export async function queueAccountingSyncTx(
         referenceType: params.referenceType,
         referenceId: params.referenceId,
         payload: payload as never,
+        // o3d-dzip: the DURABLE half of the same origin record, minted from the stamp in the
+        // payload this statement is writing. Retention compacts the payload to `{}` and keeps the
+        // external id, so a stamp that lives only in the payload is missing from exactly the rows
+        // whose realm is least knowable. Minted here and nowhere else — see
+        // mintAccountingConnectionProvenanceColumn for why this is not a back-fill.
+        connectionProvenance: mintAccountingConnectionProvenanceColumn(payload),
         // o3d-0m56 r10: created INSIDE attempt-stamping custody. That is what later lets a revival
         // read this row's unset `remoteAttemptedAt` as proof no remote call ever left it — see
         // money-attempt-provenance.ts. A row created without it is never recycled again.

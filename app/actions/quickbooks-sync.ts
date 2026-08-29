@@ -345,8 +345,13 @@ export async function triggerQuickBooksSync(): Promise<{ success: boolean; resul
     // the connector-agnostic sweep is scoped by connector alone, and a QuickBooks external id only
     // means anything inside one realm, so it could stamp a previous company's id onto a live
     // document. The ambiguity warnings this connector writes say plainly that the link must be made
-    // by hand rather than pointing at a sweep. Precondition for binding it: o3d-s36z. See the note
-    // at the end of lib/connectors/quickbooks/sync-processor.ts.
+    // by hand rather than pointing at a sweep.
+    //
+    // THE PRECONDITION THIS LINE USED TO NAME IS THE WRONG ONE (o3d-0bfh r6, Codex MEDIUM). It said
+    // o3d-s36z; that has CLOSED, and a maintainer checking it would have found it satisfied and
+    // bound the sweep here in one line. The real prerequisites are POST-TIME AUTHORIZATION (o3d-8prh)
+    // and ORIGIN PROPAGATION on the follow-up rows a sweep would create. See the note at the end of
+    // lib/connectors/quickbooks/sync-processor.ts.
     await logActivity({
       entityType: 'SYSTEM',
       action: 'quickbooks_manual_sync',

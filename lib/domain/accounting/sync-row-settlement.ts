@@ -62,7 +62,7 @@ import type { MirroredEventWriteGuard } from '@/lib/domain/accounting/accounting
  *   can honestly offer.
  *
  * WHAT IS STILL REFUSED, and none of it is arbitrary: see SETTLEABLE_ACCOUNTING_SYNC_STATUSES
- * (PENDING, SYNCED, CANCELLED), isSettleableAccountingSyncType (DAILY_BATCH_*), and the fence's own
+ * (PENDING, SYNCED, CANCELLED), settleableSettlementOutcomes (DAILY_BATCH_*), and the fence's own
  * UNFENCED_ATTEMPT — which is what refuses every QuickBooks row, because that processor stamps no
  * attempt revision and its rows therefore stay at 0 forever. That is not a regression: a QuickBooks
  * row cannot be settled today either, and settling one under a one-sided fence would prove nothing.
@@ -124,11 +124,12 @@ export function isFencedAttemptRevision(attemptRevision: number | null | undefin
 }
 
 /**
- * DAILY_BATCH_* rows are NOT settleable, whatever their status or attempt.
+ * A DAILY_BATCH_* row may be settled POSTED, and may NEVER be settled NOT_POSTED.
  *
- * A daily-batch row is not keyed by an order: it is keyed by `referenceType='DailyBatch'` and a
- * synthetic `<group>-<date>[-digest]` referenceId covering EVERY order staged into that batch.
- * CANCELLED is read as "this batch never posted" by two readers that do not coordinate:
+ * WHY NOT_POSTED IS REFUSED. A daily-batch row is not keyed by an order: it is keyed by
+ * `referenceType='DailyBatch'` and a synthetic `<group>-<date>[-digest]` referenceId covering EVERY
+ * order staged into that batch. CANCELLED is read as "this batch never posted" by two readers that do
+ * not coordinate:
  *
  *   1. the daily-batch RECREATORS, which take the absence of a live batch row as licence to
  *      re-derive and re-post the journal from the staged orders, and
@@ -141,13 +142,33 @@ export function isFencedAttemptRevision(attemptRevision: number | null | undefin
  * nothing can un-post. The attempt fence does not help here: it fences the ROW against a competing
  * writer, and this race is between two OTHER subsystems reading the row's status.
  *
- * A batch is a finance-level correction (reverse the journal in the ledger, let the sweep re-derive)
- * rather than a per-row operator assertion, so the whole family is refused.
+ * WHY POSTED IS NOT THAT, AND IS SAFE (o3d-jit6, Codex r1 finding 3). Every sentence above is about
+ * CANCELLED. A POSTED settlement writes SYNCED plus the document id, and SYNCED is a LIVE status to
+ * both of the readers named: it is in `LIVE_DAILY_BATCH_STATUSES`, so `dailyBatchRecreateVerdict`
+ * BLOCKS the recreate outright, and it is in the delete guard's live set, so the orders staged into
+ * the batch stay undeletable. Refusing it does not make the system safer — it makes it stuck.
+ *
+ * AND THE STUCK STATE IS REAL, WHICH IS WHY THIS CHANGED. o3d-jit6's dispatch fence refuses a manual
+ * journal whose create is on record with no document id, and the eighteen ManualJournal types include
+ * six DAILY_BATCH ones. That refusal's remedy is "record the journal's id against this row". A FAILED
+ * daily-batch row is revived to PENDING by `resetFailedDailyBatchLogs` on every daily run, so it
+ * refuses, fails and revives for ever; and while it lives it BLOCKS its own batch's recreate. With no
+ * POSTED settlement there was no exit at all — which is the o3d-s36z lesson (a refusal whose remedy
+ * cannot be performed is not a remedy) reappearing one branch later.
  */
 export const DAILY_BATCH_SYNC_TYPE_PREFIX = 'DAILY_BATCH_'
 
-export function isSettleableAccountingSyncType(type: string): boolean {
-  return !type.startsWith(DAILY_BATCH_SYNC_TYPE_PREFIX)
+export function isDailyBatchSyncType(type: string): boolean {
+  return type.startsWith(DAILY_BATCH_SYNC_TYPE_PREFIX)
+}
+
+/**
+ * Which assertions this TYPE admits. Never a permission on its own — status, attempt and the row's
+ * own evidence still decide — but the one place the type dimension is expressed, so the write-time
+ * refusal and the UI affordance cannot disagree about it.
+ */
+export function settleableSettlementOutcomes(type: string): readonly SettlementOutcome[] {
+  return isDailyBatchSyncType(type) ? ['POSTED'] : ['POSTED', 'NOT_POSTED']
 }
 
 /**
@@ -172,6 +193,12 @@ export function isSettleableAccountingSyncType(type: string): boolean {
  * MONETARY-ONLY COMPARISON MUST FAIL CLOSED on an asserted row: see lib/domain/accounting/
  * settlement-status.ts, which refuses to return SETTLED for one whatever the amounts say.
  *
+ * WHO READS IT (r2, Codex finding 2 added the last two). `settlementStatus` refuses to return a clean
+ * SETTLED from a monetary-only comparison; the back-reference sweep refuses to stamp an asserted id
+ * onto a sale; `dailyBatchRecreateVerdict` still blocks the recreate but REPORTS the batch instead of
+ * skipping it silently; and the order delete guard still refuses the delete but under its own blocker
+ * code, with a message that does not claim the document exists.
+ *
  * Written on BOTH outcomes, not only POSTED. A CANCELLED row is read as "nothing posted" by the
  * delete guard and by the follow-up ambiguity set, and "nothing posted because a human looked" is a
  * weaker fact than "nothing posted because the connector never got a document id" in exactly the
@@ -183,7 +210,38 @@ export function isSettleableAccountingSyncType(type: string): boolean {
  */
 export const OPERATOR_ASSERTION_SETTLEMENT_BASIS = 'OPERATOR_ASSERTION'
 
-export type SettlementBasis = 'CONNECTOR_CONFIRMED' | 'OPERATOR_ASSERTION'
+/**
+ * o3d-psvi r3 (Codex MEDIUM) — THE OTHER OPERATOR-DRIVEN STATUS WRITE ON THIS TABLE.
+ *
+ * `releaseRetiredAccountingSyncRowForLiveSale` moves a row the sweep retired back to SYNCED so the
+ * repair sweep can finish it. That write is made BY AN OPERATOR, and the retirement it undoes is
+ * reachable from EITHER SYNCED or FAILED without recording which — so the released row's SYNCED is
+ * not, and cannot be, a restatement of what the connector said. Left unmarked it is
+ * indistinguishable from a connector writeback, and this column exists precisely so that a status
+ * an operator reached is never read as one the connector reached.
+ *
+ * IT IS NOT `OPERATOR_ASSERTION`, and the difference is what the two words mean rather than who
+ * pressed the button:
+ *
+ *   • OPERATOR_ASSERTION means the DOCUMENT EVIDENCE came from a human — a document id typed in
+ *     after looking at a screen, with no call made and no figure compared. Every reader that fails
+ *     closed on this basis does so about the ID: `settlementStatus` will not call a monetary-only
+ *     comparison settled, the back-reference sweep will not stamp the id onto a sale or build a
+ *     PDF/PAYMENT from it, the delete guard will not claim the document exists.
+ *   • OPERATOR_RELEASE means the row's STATUS was reached by an operator while the document id on
+ *     it is the CONNECTOR's own. The release refuses an asserted row outright
+ *     (`describeCancelledSaleRelease`), so this basis can only ever sit on connector-issued
+ *     evidence.
+ *
+ * Folding the second into the first would therefore be a bug, not extra caution: it would make the
+ * sweep refuse to repair the very row the release exists to hand it, which is the "remedy nothing
+ * performs" failure this issue is named for. `isOperatorAssertedSettlement` is consequently FALSE
+ * for it, and every existing reader behaves exactly as it did for NULL — what changes is that the
+ * fact is now RECORDED and a reader that wants it can ask for it.
+ */
+export const OPERATOR_RELEASE_SETTLEMENT_BASIS = 'OPERATOR_RELEASE'
+
+export type SettlementBasis = 'CONNECTOR_CONFIRMED' | 'OPERATOR_ASSERTION' | 'OPERATOR_RELEASE'
 
 /**
  * The basis a row's recorded outcome rests on. Reads the column rather than the errorMessage text:
@@ -191,11 +249,18 @@ export type SettlementBasis = 'CONNECTOR_CONFIRMED' | 'OPERATOR_ASSERTION'
  * the remote system's own words — so a settlement note is not something a reader may key on.
  */
 export function settlementBasisOf(settlementBasis: string | null | undefined): SettlementBasis {
-  return settlementBasis === OPERATOR_ASSERTION_SETTLEMENT_BASIS ? 'OPERATOR_ASSERTION' : 'CONNECTOR_CONFIRMED'
+  if (settlementBasis === OPERATOR_ASSERTION_SETTLEMENT_BASIS) return 'OPERATOR_ASSERTION'
+  if (settlementBasis === OPERATOR_RELEASE_SETTLEMENT_BASIS) return 'OPERATOR_RELEASE'
+  return 'CONNECTOR_CONFIRMED'
 }
 
 export function isOperatorAssertedSettlement(settlementBasis: string | null | undefined): boolean {
   return settlementBasisOf(settlementBasis) === 'OPERATOR_ASSERTION'
+}
+
+/** Whether this row's STATUS was reached by an operator release rather than by the connector. */
+export function isOperatorReleasedSettlement(settlementBasis: string | null | undefined): boolean {
+  return settlementBasisOf(settlementBasis) === 'OPERATOR_RELEASE'
 }
 
 export type SettlementOutcome = 'POSTED' | 'NOT_POSTED'
@@ -233,11 +298,17 @@ const PENDING_REFUSAL_MESSAGE =
   + 'processed, retried, or retired by the ordinary sweeps.'
 
 function describeDailyBatchRefusal(type: string): string {
-  return `${type} is a DAILY BATCH row and cannot be settled by hand. A batch row is keyed by the `
-    + 'batch, not by one order, and CANCELLED reads as "never posted" BOTH to the batch recreators '
-    + 'and to the order delete guard. Settling it would let an order be hard-deleted while a '
-    + 'recreate is already building a journal that still contains that order\'s value. Reverse the '
-    + 'journal in the accounting system and let the batch sweep re-derive it instead.'
+  return `${type} is a DAILY BATCH row and cannot be settled as NOT POSTED. A batch row is keyed by `
+    + 'the batch, not by one order, and CANCELLED reads as "never posted" BOTH to the batch recreators '
+    + 'and to the order delete guard. Settling it that way would let an order be hard-deleted while a '
+    + 'recreate is already building a journal that still contains that order\'s value. What you CAN do '
+    + 'is settle it POSTED with the journal id: that leaves the row SYNCED, which blocks both of those '
+    + 'readers, so the recreate stays blocked and the orders stay protected. It is recorded as an '
+    + 'ASSERTION rather than as a confirmed post — both readers say so, and the daily run keeps '
+    + 'reporting the batch until the journal is confirmed. If the journal is genuinely not in the '
+    + 'accounting system, post it there from this '
+    + 'row\'s own lines and record that id here — a batch is a finance-level correction, and there is '
+    + 'no per-row cancel for one.'
 }
 
 /**
@@ -287,15 +358,17 @@ export function describeSettlementCaveat(status: string): string | null {
  *  1. STATUS. Only FAILED and PROCESSING admit an operator assertion. A PENDING row has sent
  *     nothing, so there is nothing to assert about; the sweeps retire it correctly by themselves,
  *     and SYNCED/CANCELLED are already recorded outcomes.
- *  2. TYPE. DAILY_BATCH_* is refused whatever its status, because CANCELLED reads as "never posted"
- *     to both the batch recreators and the order delete guard.
+ *  2. TYPE. DAILY_BATCH_* admits POSTED and refuses NOT_POSTED, because CANCELLED — and only
+ *     CANCELLED — reads as "never posted" to both the batch recreators and the order delete guard.
+ *     This NARROWS the control rather than removing it; see settleableSettlementOutcomes.
  *  3. ATTEMPT. A row at revision 0 carries no attempt an assertion could be fenced to, so
  *     applyFencedAttemptDecision would refuse it as UNFENCED_ATTEMPT. Offering a control whose only
  *     possible answer is a refusal is worse than not offering one, so it is disabled WITH the reason
  *     — permanent for a QuickBooks row, and "not claimed yet" for a Xero one.
  *
- * The type gate is checked before the attempt gate deliberately: a DAILY_BATCH row can never be
- * settled at any revision, so telling the operator to wait for an attempt would mislead them.
+ * The type gate is a CAVEAT rather than a gate now: a DAILY_BATCH row is settleable exactly as far as
+ * its status and attempt allow, for the POSTED assertion only, and the caveat says which half is
+ * missing and why.
  *
  * This is a UI AFFORDANCE, not a permission and not a guarantee. Whether an assertion actually lands
  * is decided by applyFencedAttemptDecision at write time against the state then — never by this.
@@ -304,6 +377,12 @@ export type SyncRowSettleability = {
   settleable: boolean
   notSettleableReason: string | null
   settlementCaveat: string | null
+  /**
+   * Which assertions this row admits (o3d-jit6, Codex r1 finding 3). `['POSTED']` for a DAILY_BATCH
+   * row, both for everything else. Carried rather than re-derived at the call site so the control the
+   * operator is offered and the refusal the server would give are one decision.
+   */
+  settleableOutcomes: readonly SettlementOutcome[]
   /**
    * True when the only thing letting this row be settled is ADOPTION — it carries no attempt
    * revision, and it is settleable solely because nothing can ever claim it. Carried so the operator
@@ -361,24 +440,19 @@ export function describeSyncRowSettleability(
     connector?: string
   },
 ): SyncRowSettleability {
+  const outcomes = settleableSettlementOutcomes(row.type)
+  // The type no longer removes the control, it NARROWS it: a DAILY_BATCH row admits POSTED and refuses
+  // NOT_POSTED. Stated as a caveat rather than as a missing button, because "you may record the id but
+  // you may not cancel it" is the fact the operator has to act on.
+  const typeCaveat = outcomes.includes('NOT_POSTED') ? null : describeDailyBatchRefusal(row.type)
+
   if (!isSettleableAccountingSyncStatus(row.status)) {
     return {
       settleable: false,
       notSettleableReason: describeUnsettleableStatus(row.status),
       settlementCaveat: null,
+      settleableOutcomes: outcomes,
       requiresAttemptAdoption: false,
-    }
-  }
-  if (!isSettleableAccountingSyncType(row.type)) {
-    return {
-      settleable: false,
-      settlementCaveat: null,
-      requiresAttemptAdoption: false,
-      notSettleableReason:
-        `${row.type} is a DAILY BATCH row and cannot be settled by hand at any attempt. A batch row covers `
-        + 'every order staged into it, and cancelling it would let one of those orders be deleted while a '
-        + 'recreate is still building a journal containing its value. Reverse the journal in the accounting '
-        + 'system and let the batch sweep re-derive it.',
     }
   }
   if (!isFencedAttemptRevision(row.attemptRevision)) {
@@ -389,7 +463,8 @@ export function describeSyncRowSettleability(
         settleable: true,
         notSettleableReason: null,
         requiresAttemptAdoption: true,
-        settlementCaveat: [describeAttemptAdoptionCaveat(row.connector ?? 'this'), describeSettlementCaveat(row.status)]
+        settleableOutcomes: outcomes,
+        settlementCaveat: [typeCaveat, describeAttemptAdoptionCaveat(row.connector ?? 'this'), describeSettlementCaveat(row.status)]
           .filter((part): part is string => !!part)
           .join(' '),
       }
@@ -397,6 +472,7 @@ export function describeSyncRowSettleability(
     return {
       settleable: false,
       settlementCaveat: null,
+      settleableOutcomes: outcomes,
       requiresAttemptAdoption: false,
       notSettleableReason:
         'This row carries no attempt revision, so a decision cannot be tied to the attempt it would be made '
@@ -409,7 +485,10 @@ export function describeSyncRowSettleability(
     settleable: true,
     notSettleableReason: null,
     requiresAttemptAdoption: false,
-    settlementCaveat: describeSettlementCaveat(row.status),
+    settleableOutcomes: outcomes,
+    settlementCaveat: [typeCaveat, describeSettlementCaveat(row.status)]
+      .filter((part): part is string => !!part)
+      .join(' ') || null,
   }
 }
 
@@ -433,9 +512,11 @@ export function refuseSettlement(row: SettlementRowView, assertion: SettlementAs
   if (!isSettleableAccountingSyncStatus(row.status)) {
     return { code: 'status_not_settleable', message: describeUnsettleableStatus(row.status) }
   }
-  // Type check AFTER status: a DAILY_BATCH row is refused on its type even when its status is
-  // otherwise settleable, and the message must name the batch race rather than the status.
-  if (!isSettleableAccountingSyncType(row.type)) {
+  // Type check AFTER status, and scoped to the ASSERTION: a DAILY_BATCH row is refused the NOT_POSTED
+  // half on its type even when its status is otherwise settleable, and the message must name the batch
+  // race rather than the status. POSTED is admitted — see settleableSettlementOutcomes for why the
+  // race is entirely a property of CANCELLED.
+  if (!settleableSettlementOutcomes(row.type).includes(assertion.outcome)) {
     return { code: 'daily_batch_not_settleable', message: describeDailyBatchRefusal(row.type) }
   }
 

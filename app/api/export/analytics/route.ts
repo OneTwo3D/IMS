@@ -7,6 +7,12 @@ import { toCsv, csvResponse } from '@/lib/csv'
 import { requireApiAuth } from '@/lib/auth/server'
 import { hasPermission } from '@/lib/permissions'
 import { netLinearFigureBound } from '@/lib/domain/sales/refund-basis-analytics'
+import {
+  SUPPLIER_PAYMENT_AMOUNT_NOT_RECORDED,
+  SUPPLIER_BILLED_WITH_PAYMENT_MARKER_BASIS,
+  SUPPLIER_BILLED_WITHOUT_PAYMENT_MARKER_BASIS,
+  SUPPLIER_BILLED_ROUNDING_RECONCILIATION,
+} from '@/lib/domain/purchasing/supplier-payment-basis'
 
 export async function GET(req: NextRequest) {
   const session = await requireApiAuth()
@@ -159,14 +165,50 @@ export async function GET(req: NextRequest) {
     }
     case 'po_aging': {
       const rows = await getSupplierAging()
+      // o3d-8u4h: THE WITHHELD FIGURE REACHES THE FILE AS AN EMPTY CELL, NOT AS A ZERO.
+      //
+      // `dueAmount` used to export the whole billed ledger, forever, because nothing had ever
+      // looked at a settlement. It is withheld now — due is billed less paid, and no amount paid to
+      // a supplier is recorded anywhere — and `?? ''` is the same treatment the customer-aging
+      // export already gives its withheld `netTotal`: empty, so a spreadsheet does not sum it, and
+      // so nobody mistakes it for a measured nought.
+      //
+      // The two columns that replace it are amounts BILLED, grouped on the raw evidence — the bill
+      // carries a payment marker (`PurchaseInvoice.paidAt`) or it does not — and
+      // `billedWithPaymentMarker + billedWithoutPaymentMarker === billedAmount` in the file. Round 2
+      // renamed them from `settled*`/`unsettled*`, which published a settlement the marker cannot
+      // prove: `markBillPaid` stamps it on a part-payment too, so a part-paid bill was exported as
+      // fully settled and dropped out of every age band. The four bands are the without-marker
+      // billed value; they are no longer called `overdue`, because a file reader has no tooltip
+      // either and "overdue" claims a relation to a due date this report does not measure.
       const data = rows.map((r) => ({ supplierName: r.supplierName, grossAmount: r.grossAmount.toFixed(2),
         // o3d-iigc round 4: `refunds` is the credit ON THE NET AMOUNT'S OWN BASIS — ex-VAT line cost
         // reduced by the order's header discount — so grossAmount - tax - refunds still reproduces
         // netAmountExVat in the spreadsheet.
         refunds: r.refunds.toFixed(2),
         // o3d-iigc round 2: the basis travels with the figure — a CSV reader has no tooltip.
-        netAmountExVat: r.netAmount.toFixed(2), landedCosts: r.landedCosts.toFixed(2), tax: r.tax.toFixed(2), totalAmount: r.totalAmount.toFixed(2), billedAmount: r.billedAmount.toFixed(2), dueAmount: r.dueAmount.toFixed(2), overdue0_30: r.overdue0_30.toFixed(2), overdue31_60: r.overdue31_60.toFixed(2), overdue61_90: r.overdue61_90.toFixed(2), overdue91plus: r.overdue91plus.toFixed(2), poCount: r.poCount, avgLeadTimeDays: r.avgLeadTimeDays }))
-      return csvResponse(toCsv(data, ['supplierName', 'grossAmount', 'refunds', 'netAmountExVat', 'landedCosts', 'tax', 'totalAmount', 'billedAmount', 'dueAmount', 'overdue0_30', 'overdue31_60', 'overdue61_90', 'overdue91plus', 'poCount', 'avgLeadTimeDays']), `supplier-aging-${date}.csv`)
+        netAmountExVat: r.netAmount.toFixed(2), landedCosts: r.landedCosts.toFixed(2), tax: r.tax.toFixed(2), totalAmount: r.totalAmount.toFixed(2),
+        billedAmount: r.billedAmount.toFixed(2),
+        billedWithPaymentMarker: r.billedWithPaymentMarker.toFixed(2), billedWithoutPaymentMarker: r.billedWithoutPaymentMarker.toFixed(2),
+        dueAmount: r.dueAmount?.toFixed(2) ?? '',
+        billedWithoutPaymentMarker0_30: r.billedWithoutPaymentMarker0_30.toFixed(2), billedWithoutPaymentMarker31_60: r.billedWithoutPaymentMarker31_60.toFixed(2),
+        billedWithoutPaymentMarker61_90: r.billedWithoutPaymentMarker61_90.toFixed(2), billedWithoutPaymentMarker91plus: r.billedWithoutPaymentMarker91plus.toFixed(2),
+        poCount: r.poCount, avgLeadTimeDays: r.avgLeadTimeDays }))
+      return csvResponse(
+        toCsv(data, ['supplierName', 'grossAmount', 'refunds', 'netAmountExVat', 'landedCosts', 'tax', 'totalAmount', 'billedAmount', 'billedWithPaymentMarker', 'billedWithoutPaymentMarker', 'dueAmount', 'billedWithoutPaymentMarker0_30', 'billedWithoutPaymentMarker31_60', 'billedWithoutPaymentMarker61_90', 'billedWithoutPaymentMarker91plus', 'poCount', 'avgLeadTimeDays']),
+        `supplier-aging-${date}.csv`,
+        // Report-level, because the reason is the same on every row: the export metadata rides both
+        // the X-IMS-Export-Metadata header and `#` comment rows at the foot of the file, so an empty
+        // cell in a downloaded spreadsheet still comes with the sentence explaining it.
+        {
+          dueAmount: SUPPLIER_PAYMENT_AMOUNT_NOT_RECORDED,
+          billedWithPaymentMarker: SUPPLIER_BILLED_WITH_PAYMENT_MARKER_BASIS,
+          billedWithoutPaymentMarker: SUPPLIER_BILLED_WITHOUT_PAYMENT_MARKER_BASIS,
+          // o3d-8u4h round 3: a spreadsheet reader is the one most likely to sum the columns, and
+          // the only one who cannot ask why the sum came out to the penny it did.
+          billedAmount: SUPPLIER_BILLED_ROUNDING_RECONCILIATION,
+        },
+      )
     }
     case 'po_details': {
       const rows = await getPurchaseDetails(dateFrom, dateTo)

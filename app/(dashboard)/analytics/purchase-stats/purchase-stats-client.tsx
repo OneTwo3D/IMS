@@ -11,11 +11,19 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { ProductLink } from '@/components/inventory/product-link'
 import type { PurchaseProductRow, ReceivedGoodsRow, BillRow, SupplierAgingRow, PurchaseDetailRow } from '@/app/actions/purchase-stats'
+import {
+  SUPPLIER_DISCOUNT_TOTAL_NOT_RECORDED,
+  SUPPLIER_PAYMENT_AMOUNT_NOT_RECORDED,
+  SUPPLIER_BILLED_WITH_PAYMENT_MARKER_BASIS,
+  SUPPLIER_BILLED_WITHOUT_PAYMENT_MARKER_BASIS,
+  SUPPLIER_BILLED_ROUNDING_RECONCILIATION,
+} from '@/lib/domain/purchasing/supplier-payment-basis'
 import { saveView, type SavedView } from '@/app/actions/sales-stats'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { formatMoney } from '@/lib/utils'
-import { filterAndSortRows } from '@/lib/analytics/table-filter-sort'
+import { filterAndSortRows, presentColumns, presentColumnKeys, sanitiseSavedView, resolveSavedViewTab, ownedSavedViews, foreignSavedViewNotice } from '@/lib/analytics/table-filter-sort'
+import { WITHHELD_CELL_TEXT, MEASURED_ZERO_CELL_TEXT, WITHHELD_HEADING_SUFFIX } from '@/lib/analytics/withheld-figure-cell'
 
 type Tab = 'products' | 'received' | 'bills' | 'aging' | 'details'
 type FilterRule = { id: string; field: string; operator: string; value: string }
@@ -29,6 +37,36 @@ const TABS: { key: Tab; label: string }[] = [
 ]
 
 function makeId() { return Math.random().toString(36).slice(2, 8) }
+
+/**
+ * o3d-8u4h round 2: A WITHHELD FIGURE, RENDERED SO A READER CAN TELL.
+ *
+ * It used to be an em dash — the same mark this table prints for a measured zero (`v > 0 ? … : '—'`
+ * on Refunds, Tax, Landed Costs and every age band) — with the reason in a `title`. Two opposite
+ * claims, one glyph, and the only thing separating them was a hover that a keyboard user, a
+ * screenshot and a hurried reader all lack. The word is visible now; the tooltip and the qualified
+ * column heading carry the reason, and the notice above the table carries it in full.
+ */
+function WithheldCell({ reason }: { reason: string }) {
+  return <span data-withheld="true" className="text-xs italic text-muted-foreground" title={reason}>{WITHHELD_CELL_TEXT}</span>
+}
+
+/**
+ * o3d-8u4h round 2: what a saved view could not bring with it, said out loud.
+ *
+ * A view saved before a column was renamed still names the old key, and a FILTER on a since-renamed
+ * field rejects every row — so the operator used to get an empty report and no reason for it.
+ */
+function SavedViewNotice({ notice, onDismiss }: { notice: string; onDismiss: () => void }) {
+  return (
+    <div data-saved-view-notice="true" className="flex items-start gap-2 rounded-md border border-orange-300 bg-orange-50 dark:bg-orange-950/20 px-3 py-2 text-xs text-orange-900 dark:text-orange-200">
+      <span className="flex-1">{notice}</span>
+      <button type="button" onClick={onDismiss} className="shrink-0 text-orange-900/60 dark:text-orange-200/60 hover:text-orange-900 dark:hover:text-orange-200" aria-label="Dismiss">
+        <X className="h-3 w-3" />
+      </button>
+    </div>
+  )
+}
 
 // ---------------------------------------------------------------------------
 // Field definitions per tab
@@ -65,12 +103,39 @@ const BILL_FIELDS: FieldDef[] = [
 
 const AGING_FIELDS: FieldDef[] = [
   { key: 'supplierName', label: 'Supplier', type: 'text' }, { key: 'grossAmount', label: 'Gross Amount', type: 'number' },
-  { key: 'discounts', label: 'Discounts', type: 'number' }, { key: 'refunds', label: 'Refunds', type: 'number' },
+  { key: 'discounts', label: `Discounts${WITHHELD_HEADING_SUFFIX}`, type: 'number' }, { key: 'refunds', label: 'Refunds', type: 'number' },
   { key: 'netAmount', label: 'Net Amount (ex-VAT)', type: 'number' }, { key: 'landedCosts', label: 'Landed Costs', type: 'number' },
   { key: 'tax', label: 'Tax', type: 'number' }, { key: 'totalAmount', label: 'Total', type: 'number' },
-  { key: 'billedAmount', label: 'Billed', type: 'number' }, { key: 'dueAmount', label: 'Due', type: 'number' },
-  { key: 'overdue0_30', label: '0-30d', type: 'number' }, { key: 'overdue31_60', label: '31-60d', type: 'number' },
-  { key: 'overdue61_90', label: '61-90d', type: 'number' }, { key: 'overdue91plus', label: '91d+', type: 'number' },
+  { key: 'billedAmount', label: 'Billed', type: 'number' },
+  // o3d-8u4h round 2: the two halves of Billed, grouped on THE RAW EVIDENCE — the bill carries a
+  // payment marker (PurchaseInvoice.paidAt) or it does not. They were 'Settled'/'Unsettled', which
+  // published a settlement the marker cannot prove: markBillPaid stamps it on a part-payment too.
+  // Both are amounts BILLED and the headings say only that. Paid stays off this table entirely.
+  { key: 'billedWithPaymentMarker', label: 'Billed w/ payment marker', type: 'number' },
+  { key: 'billedWithoutPaymentMarker', label: 'Billed w/o payment marker', type: 'number' },
+  // o3d-8u4h round 2: the heading carries the withholding, because a heading is read and a tooltip
+  // is not. See lib/analytics/withheld-figure-cell.ts.
+  { key: 'dueAmount', label: `Due${WITHHELD_HEADING_SUFFIX}`, type: 'number' },
+  { key: 'billedWithoutPaymentMarker0_30', label: 'No marker 0-30d', type: 'number' }, { key: 'billedWithoutPaymentMarker31_60', label: 'No marker 31-60d', type: 'number' },
+  { key: 'billedWithoutPaymentMarker61_90', label: 'No marker 61-90d', type: 'number' }, { key: 'billedWithoutPaymentMarker91plus', label: 'No marker 91d+', type: 'number' },
+]
+
+/**
+ * o3d-8u4h round 2: THE REASONS, WHERE THEY ARE READ.
+ *
+ * These sentences were only in `title` attributes. A withheld figure that a reader cannot tell from
+ * a measured zero is the defect the withholding was meant to fix, and a native tooltip reaches
+ * neither a keyboard user, nor a screenshot, nor anyone reading quickly. They are rendered as a
+ * persistent block above the table now, and the tooltips are kept as a bonus rather than as the
+ * only channel.
+ */
+const AGING_NOTICES: { heading: string; body: string }[] = [
+  { heading: `Discounts${WITHHELD_HEADING_SUFFIX}`, body: SUPPLIER_DISCOUNT_TOTAL_NOT_RECORDED },
+  { heading: `Due${WITHHELD_HEADING_SUFFIX}`, body: SUPPLIER_PAYMENT_AMOUNT_NOT_RECORDED },
+  { heading: 'Billed w/ payment marker', body: SUPPLIER_BILLED_WITH_PAYMENT_MARKER_BASIS },
+  { heading: 'Billed w/o payment marker, and the four age bands', body: SUPPLIER_BILLED_WITHOUT_PAYMENT_MARKER_BASIS },
+  // o3d-8u4h round 3: the row asks to be added up, so how it was made to add up is on the page too.
+  { heading: 'How the split adds up', body: SUPPLIER_BILLED_ROUNDING_RECONCILIATION },
 ]
 
 const DETAIL_FIELDS: FieldDef[] = [
@@ -92,11 +157,20 @@ const TAB_FIELDS: Record<Tab, FieldDef[]> = {
   details: DETAIL_FIELDS,
 }
 
+/**
+ * o3d-8u4h round 3: the tabs THIS page owns, and the prefix its own saved views are stored under.
+ * Derived from TAB_FIELDS so a retired tab cannot leave the ownership test out of date — and the
+ * membership test matters on top of the prefix, because `po_<retired tab>` passes `startsWith`
+ * and still indexes TAB_FIELDS with a key that is not there.
+ */
+const TAB_KEYS = Object.keys(TAB_FIELDS) as Tab[]
+const SAVED_VIEW_TAB_PREFIX = 'po_'
+
 const DEFAULT_COLS: Record<Tab, string[]> = {
   products: ['sku', 'name', 'type', 'barcode', 'mpn', 'supplierName', 'qtyOrdered', 'qtyReceived', 'totalBase', 'avgUnitCostBase', 'incomingQty', 'poCount', 'createdAt'],
   received: ['productName', 'poReference', 'supplierName', 'grnReference', 'sku', 'warehouseCode', 'qtyReceived', 'status', 'totalBase', 'landedUnitCostBase', 'unitCostBase', 'receivedAt'],
   bills: ['poReference', 'supplierName', 'invoiceNumber', 'productName', 'sku', 'qtyBilled', 'invoiceDate', 'status', 'totalForeign', 'totalBase', 'supplierInvoiceUrl'],
-  aging: ['supplierName', 'grossAmount', 'discounts', 'refunds', 'netAmount', 'landedCosts', 'tax', 'totalAmount', 'billedAmount', 'dueAmount', 'overdue0_30', 'overdue31_60', 'overdue61_90', 'overdue91plus'],
+  aging: ['supplierName', 'grossAmount', 'discounts', 'refunds', 'netAmount', 'landedCosts', 'tax', 'totalAmount', 'billedAmount', 'billedWithPaymentMarker', 'billedWithoutPaymentMarker', 'dueAmount', 'billedWithoutPaymentMarker0_30', 'billedWithoutPaymentMarker31_60', 'billedWithoutPaymentMarker61_90', 'billedWithoutPaymentMarker91plus'],
   details: ['productName', 'reference', 'sku', 'barcode', 'mpn', 'type', 'supplierName', 'status', 'qty', 'totalBase', 'createdAt'],
 }
 
@@ -151,9 +225,12 @@ export function PurchaseStatsClient({ products, received, bills, aging, details,
   const [showFilter, setShowFilter] = useState(false); const [showColPicker, setShowColPicker] = useState(false); const [showSaveView, setShowSaveView] = useState(false)
   const [visibleColsMap, setVisibleColsMap] = useState<Record<Tab, string[]>>({ ...DEFAULT_COLS })
   const [sortCol, setSortCol] = useState<string | null>('totalBase'); const [sortDir, setSortDir] = useState<SortDir>('desc')
+  const [viewNotice, setViewNotice] = useState<string | null>(null)
 
   const fields = TAB_FIELDS[tab]
   const visibleCols = visibleColsMap[tab]
+  // The saved views this page can actually load — the picker offers no other (o3d-8u4h round 3).
+  const ownViews = ownedSavedViews(savedViews, SAVED_VIEW_TAB_PREFIX, TAB_KEYS)
 
   function setVisibleCols(cols: string[]) {
     setVisibleColsMap((prev) => ({ ...prev, [tab]: cols }))
@@ -162,14 +239,35 @@ export function PurchaseStatsClient({ products, received, bills, aging, details,
   function handleSort(k: string) { if (sortCol === k) setSortDir((d) => d === 'asc' ? 'desc' : 'asc'); else { setSortCol(k); setSortDir('desc') } }
 
   function handleTabChange(t: Tab) {
-    setTab(t); setFilterRules([]); setSortCol(null)
+    setTab(t); setFilterRules([]); setSortCol(null); setViewNotice(null)
   }
 
+  // o3d-8u4h round 2: A SAVED VIEW IS SANITISED ON THE WAY IN, COLUMNS AND FILTERS ALIKE.
+  //
+  // Round 1 filtered the COLUMNS at render and left the FILTERS untouched, which is the half that
+  // silently empties the report: a rule on a field the rows no longer carry reads as an unknown for
+  // every row, an unknown answers no numeric comparison, so the rule rejects every supplier. The
+  // operator saw "0 rows" and nothing else. Dropped now, with a notice that names the field.
   function loadView(v: SavedView) {
-    const t = v.tab.replace('po_', '') as Tab
+    // o3d-8u4h round 3: RESOLVED, NOT STRIPPED. `replace('po_', '')` answered a key for any string
+    // — a sales view, or a `po_` view naming a tab that has since been retired — and the result
+    // then indexed TAB_FIELDS, which is `undefined` for both and crashes the page in
+    // `sanitiseSavedView`. This page was already filtering its picker on the prefix; the prefix is
+    // not the whole test.
+    const t = resolveSavedViewTab(v.tab, SAVED_VIEW_TAB_PREFIX, TAB_KEYS)
+    if (t === null) { setViewNotice(foreignSavedViewNotice(v.name, v.tab)); return }
+    const clean = sanitiseSavedView({ name: v.name, columns: v.columns, filters: v.filters }, TAB_FIELDS[t])
     setTab(t)
+    // COLUMNS ARE PUT INTO STATE VERBATIM, AND FILTERED AT EVERY RENDER PATH INSTEAD. Deliberate,
+    // and the reason is that there must be exactly ONE rule about a key this tab cannot render.
+    // Sanitising here as well would make the per-render-path filters unreachable — dead guards that
+    // no test can exercise and the next reviewer has to take on trust — while the render paths are
+    // where the invariant actually lives: header, body and totals row must read the SAME list. The
+    // notice below still names the columns that will not appear, so the reader is told either way.
     setVisibleColsMap((prev) => ({ ...prev, [t]: v.columns }))
-    setFilterRules(v.filters.map((f) => ({ ...f, id: makeId() })))
+    setFilterRules(clean.filters.map((f) => ({ ...f, id: makeId() })))
+    setSortCol(null)
+    setViewNotice(clean.notice)
   }
 
   // Generic filter + sort for any tab data — shared with the sales and inventory stat pages, so a
@@ -226,7 +324,7 @@ export function PurchaseStatsClient({ products, received, bills, aging, details,
   function isRightAligned(key: string): boolean {
     const f = fields.find((fd) => fd.key === key)
     if (f?.type === 'number') return true
-    if (['totalBase', 'totalForeign', 'qtyReceived', 'qtyBilled', 'unitCostBase', 'landedUnitCostBase', 'grossAmount', 'discounts', 'refunds', 'netAmount', 'landedCosts', 'tax', 'totalAmount', 'billedAmount', 'dueAmount', 'overdue0_30', 'overdue31_60', 'overdue61_90', 'overdue91plus', 'qty', 'unitCostForeign'].includes(key)) return true
+    if (['totalBase', 'totalForeign', 'qtyReceived', 'qtyBilled', 'unitCostBase', 'landedUnitCostBase', 'grossAmount', 'discounts', 'refunds', 'netAmount', 'landedCosts', 'tax', 'totalAmount', 'billedAmount', 'billedWithPaymentMarker', 'billedWithoutPaymentMarker', 'dueAmount', 'billedWithoutPaymentMarker0_30', 'billedWithoutPaymentMarker31_60', 'billedWithoutPaymentMarker61_90', 'billedWithoutPaymentMarker91plus', 'qty', 'unitCostForeign'].includes(key)) return true
     return false
   }
 
@@ -260,18 +358,28 @@ export function PurchaseStatsClient({ products, received, bills, aging, details,
       // o3d-iigc round 2: WHICH total this is, on the figure itself — 'net' beside a Gross column
       // and a Tax column otherwise reads as either net-of-VAT or net-of-returns, and it is both.
       if (key === 'netAmount') return <span className="tabular-nums text-xs font-mono font-medium" title="Ex-VAT: the gross total less its own VAT, less returns valued at the ex-VAT line cost AFTER the order's header discount">{fmtBase(v)}</span>
-      if (key === 'discounts') return <span className="tabular-nums text-xs font-mono text-muted-foreground">{v > 0 ? fmtBase(v) : '—'}</span>
+      // o3d-8u4h: WITHHELD, AND THE CELL SAYS SO WHEN YOU ASK IT. `v > 0 ? … : '—'` used to render a
+      // hardcoded 0 as a dash, which looked identical to this and meant the opposite: it claimed the
+      // supplier gave no discount. A withheld figure is `null` now, and the tooltip carries the
+      // reason rather than leaving the reader to guess which of the two dashes they are looking at.
+      if (key === 'discounts') return v == null ? <WithheldCell reason={SUPPLIER_DISCOUNT_TOTAL_NOT_RECORDED} /> : <span className="tabular-nums text-xs font-mono text-muted-foreground">{fmtBase(v)}</span>
       // o3d-iigc round 4: this is the credit AS THE NET AMOUNT SUBTRACTS IT — scaled onto the order's
       // post-header-discount goods value — so the three columns a reader can see (Gross, Tax,
       // Refunds) still subtract to the Net Amount printed beside them.
       if (key === 'refunds') return <span className="tabular-nums text-xs font-mono text-orange-600" title="Return credit at the ex-VAT line cost, reduced by the order's header discount so it is on the same basis as the Net Amount it is subtracted from">{v > 0 ? fmtBase(v) : '—'}</span>
       if (key === 'landedCosts' || key === 'tax') return <span className="tabular-nums text-xs font-mono text-muted-foreground">{v > 0 ? fmtBase(v) : '—'}</span>
-      if (key === 'billedAmount') return <span className="tabular-nums text-xs font-mono">{fmtBase(v)}</span>
-      if (key === 'dueAmount') return <span className={`tabular-nums text-xs font-mono ${v > 0 ? 'text-destructive font-medium' : ''}`}>{v > 0 ? fmtBase(v) : '—'}</span>
-      if (key === 'overdue0_30') return <span className="tabular-nums text-xs font-mono">{v > 0 ? fmtBase(v) : '—'}</span>
-      if (key === 'overdue31_60') return <span className="tabular-nums text-xs font-mono">{v > 0 ? fmtBase(v) : '—'}</span>
-      if (key === 'overdue61_90') return <span className={`tabular-nums text-xs font-mono ${v > 0 ? 'text-orange-600' : ''}`}>{v > 0 ? fmtBase(v) : '—'}</span>
-      if (key === 'overdue91plus') return <span className={`tabular-nums text-xs font-mono ${v > 0 ? 'text-destructive font-medium' : ''}`}>{v > 0 ? fmtBase(v) : '—'}</span>
+      if (key === 'billedAmount') return <span className="tabular-nums text-xs font-mono" title="VAT-inclusive value of every supplier bill on this supplier's committed POs, marked or not">{fmtBase(v)}</span>
+      if (key === 'billedWithPaymentMarker') return <span className="tabular-nums text-xs font-mono text-muted-foreground" title={SUPPLIER_BILLED_WITH_PAYMENT_MARKER_BASIS}>{v > 0 ? fmtBase(v) : MEASURED_ZERO_CELL_TEXT}</span>
+      if (key === 'billedWithoutPaymentMarker') return <span className={`tabular-nums text-xs font-mono ${v > 0 ? 'text-destructive font-medium' : ''}`} title={SUPPLIER_BILLED_WITHOUT_PAYMENT_MARKER_BASIS}>{v > 0 ? fmtBase(v) : MEASURED_ZERO_CELL_TEXT}</span>
+      // o3d-8u4h: WITHHELD. This cell used to print the whole billed ledger in red, forever, under
+      // the word "Due" — the report had no payment offset of any kind, so it was asserting that
+      // every bill ever raised was still owed. Due is billed less paid; paid is not a quantity this
+      // system holds. Unsettled (billed) beside it is what IS known, and is named for what it is.
+      if (key === 'dueAmount') return v == null ? <WithheldCell reason={SUPPLIER_PAYMENT_AMOUNT_NOT_RECORDED} /> : <span className="tabular-nums text-xs font-mono text-muted-foreground">{fmtBase(v)}</span>
+      if (key === 'billedWithoutPaymentMarker0_30') return <span className="tabular-nums text-xs font-mono" title={SUPPLIER_BILLED_WITHOUT_PAYMENT_MARKER_BASIS}>{v > 0 ? fmtBase(v) : MEASURED_ZERO_CELL_TEXT}</span>
+      if (key === 'billedWithoutPaymentMarker31_60') return <span className="tabular-nums text-xs font-mono" title={SUPPLIER_BILLED_WITHOUT_PAYMENT_MARKER_BASIS}>{v > 0 ? fmtBase(v) : MEASURED_ZERO_CELL_TEXT}</span>
+      if (key === 'billedWithoutPaymentMarker61_90') return <span className={`tabular-nums text-xs font-mono ${v > 0 ? 'text-orange-600' : ''}`} title={SUPPLIER_BILLED_WITHOUT_PAYMENT_MARKER_BASIS}>{v > 0 ? fmtBase(v) : MEASURED_ZERO_CELL_TEXT}</span>
+      if (key === 'billedWithoutPaymentMarker91plus') return <span className={`tabular-nums text-xs font-mono ${v > 0 ? 'text-destructive font-medium' : ''}`} title={SUPPLIER_BILLED_WITHOUT_PAYMENT_MARKER_BASIS}>{v > 0 ? fmtBase(v) : MEASURED_ZERO_CELL_TEXT}</span>
       if (key === 'supplierName') return <span className="font-medium whitespace-nowrap text-xs">{v}</span>
     }
     if (tabKey === 'details') {
@@ -291,17 +399,34 @@ export function PurchaseStatsClient({ products, received, bills, aging, details,
 
   // Render helper for non-product tabs (not a component — avoids re-creation during render)
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  function renderGenericTable(data: any[], tabKey: Tab, emptyMsg: string) {
-    const cols = visibleColsMap[tabKey]
+  function renderGenericTable(data: any[], tabKey: Tab, emptyMsg: string, notices?: { heading: string; body: string }[]) {
+    // o3d-8u4h: ONLY THE COLUMNS THIS TAB STILL HAS. A saved view stores column keys verbatim, so a
+    // view saved before the supplier-aging renames still asks for `overdue0_30`. The header skipped
+    // the unknown key and the BODY still emitted a cell for it, so every column after it in that row
+    // shifted one place left and its figures were read under the wrong heading.
+    const cols = presentColumns(visibleColsMap[tabKey], TAB_FIELDS[tabKey])
     return (
       <div className="rounded-md border">
         <div className="flex items-center justify-between px-3 py-1.5 bg-muted/30 border-b">
           <span className="text-xs text-muted-foreground">{data.length} rows</span>
         </div>
+        {/* o3d-8u4h round 2: the reasons live HERE, on the page, not in a hover. */}
+        {notices && notices.length > 0 && (
+          <dl data-column-notices="true" className="px-3 py-2 border-b bg-muted/10 space-y-1 text-[11px] leading-snug text-muted-foreground">
+            {notices.map((n) => (
+              <div key={n.heading} className="sm:flex sm:gap-2">
+                <dt className="font-medium text-foreground shrink-0">{n.heading}</dt>
+                <dd>{n.body}</dd>
+              </div>
+            ))}
+          </dl>
+        )}
         <Table className="min-w-[700px]" containerClassName="max-h-[calc(100vh-20rem)]">
           <TableHeader className="bg-muted/50">
             <TableRow>
               {cols.map((key) => {
+                // `cols` was filtered against this same field list, so the lookup cannot miss; the
+                // guard is the type narrowing, not a second, divergent skip rule.
                 const f = TAB_FIELDS[tabKey].find((fd) => fd.key === key)
                 if (!f) return null
                 return <ColHeader key={key} colKey={key} label={f.label} align={isRightAligned(key) ? 'right' : 'left'} />
@@ -336,7 +461,9 @@ export function PurchaseStatsClient({ products, received, bills, aging, details,
         <div className="flex items-center gap-1 overflow-x-auto overflow-y-hidden">
           {TABS.map((t) => (<button key={t.key} type="button" className={`shrink-0 px-3 sm:px-4 py-2 text-sm font-medium border-b-2 transition-colors -mb-px ${tab === t.key ? 'border-primary text-primary' : 'border-transparent text-muted-foreground hover:text-foreground'}`} onClick={() => handleTabChange(t.key)}>{t.label}</button>))}
           <div className="ml-auto flex shrink-0 items-center gap-1.5 pb-1 pl-2">
-            {savedViews.filter((v) => v.tab.startsWith('po_')).length > 0 && (<select onChange={(e) => { const v = savedViews.find((sv) => sv.id === e.target.value); if (v) loadView(v); e.target.value = '' }} className="h-7 rounded-md border border-input bg-background px-2 text-xs" defaultValue=""><option value="" disabled>Saved Views…</option>{savedViews.filter((v) => v.tab.startsWith('po_')).map((v) => <option key={v.id} value={v.id}>{v.name}</option>)}</select>)}
+            {/* The `find` searches the FULL list on purpose: an id this page does not own must
+                reach loadView and be refused there with a sentence, not silently ignored. */}
+            {ownViews.length > 0 && (<select onChange={(e) => { const v = savedViews.find((sv) => sv.id === e.target.value); if (v) loadView(v); e.target.value = '' }} className="h-7 rounded-md border border-input bg-background px-2 text-xs" defaultValue=""><option value="" disabled>Saved Views…</option>{ownViews.map((v) => <option key={v.id} value={v.id}>{v.name}</option>)}</select>)}
             <Button variant={filterRules.length > 0 ? 'default' : 'outline'} size="sm" className="h-7 text-xs" onClick={() => setShowFilter(true)}><Filter className="h-3 w-3 mr-0.5" />Filter{filterRules.length > 0 ? ` (${filterRules.length})` : ''}</Button>
             <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => setShowColPicker(true)}><Settings2 className="h-3 w-3 mr-0.5" />Columns</Button>
             <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => setShowSaveView(true)}><Save className="h-3 w-3 mr-0.5" />Save View</Button>
@@ -345,39 +472,49 @@ export function PurchaseStatsClient({ products, received, bills, aging, details,
         </div>
       </div>
 
-      {/* Products */}
-      {tab === 'products' && (<div className="rounded-md border">
+      {viewNotice && <SavedViewNotice notice={viewNotice} onDismiss={() => setViewNotice(null)} />}
+
+      {/* Products. o3d-8u4h round 2: the same one-filter-then-loop shape as the generic tables. The
+          header and body already skipped a key `colR` has no entry for — but the FOOTER emitted a
+          <td> for it unconditionally, so a stale saved key gave the totals row one cell more than
+          the table above it and shifted every total right of the gap. Filtered once, here. */}
+      {tab === 'products' && (() => {
+        const cols = presentColumnKeys(visibleCols, Object.keys(colR))
+        return (<div className="rounded-md border">
         <div className="px-3 py-1.5 bg-muted/30 border-b text-xs text-muted-foreground">{fp.length} of {products.length} products</div>
         <Table className="min-w-[700px]" containerClassName="max-h-[calc(100vh-22rem)]">
           <TableHeader className="bg-muted/50">
             <TableRow>
-              {visibleCols.map((k) => { const c = colR[k]; return c ? <ColHeader key={k} colKey={k} label={c.label} align={c.align === 'right' ? 'right' : 'left'} /> : null })}
+              {cols.map((k) => { const c = colR[k]; return <ColHeader key={k} colKey={k} label={c.label} align={c.align === 'right' ? 'right' : 'left'} /> })}
             </TableRow>
           </TableHeader>
           <TableBody className="divide-y">
             {fp.map((r) => (
               <TableRow key={r.productId}>
-                {visibleCols.map((k) => { const c = colR[k]; return c ? <TableCell key={k} className={c.align === 'right' ? 'text-right' : ''}>{c.render(r)}</TableCell> : null })}
+                {cols.map((k) => { const c = colR[k]; return <TableCell key={k} className={c.align === 'right' ? 'text-right' : ''}>{c.render(r)}</TableCell> })}
               </TableRow>
             ))}
           </TableBody>
           <tfoot className="border-t bg-muted/30 font-medium text-sm">
             <tr>
-              {visibleCols.map((k) => { const c = colR[k]; return <td key={k} className={`px-3 py-2 ${c?.align === 'right' ? 'text-right' : ''}`}>{c?.footer?.() ?? ''}</td> })}
+              {cols.map((k) => { const c = colR[k]; return <td key={k} className={`px-3 py-2 ${c.align === 'right' ? 'text-right' : ''}`}>{c.footer?.() ?? ''}</td> })}
             </tr>
           </tfoot>
         </Table>
-      </div>)}
+      </div>)
+      })()}
 
       {/* Other tabs — generic filterable/sortable tables */}
       {tab === 'received' && renderGenericTable(filteredReceived, 'received', 'No receipts.')}
       {tab === 'bills' && renderGenericTable(filteredBills, 'bills', 'No bills.')}
-      {tab === 'aging' && renderGenericTable(filteredAging, 'aging', 'No data.')}
+      {tab === 'aging' && renderGenericTable(filteredAging, 'aging', 'No data.', AGING_NOTICES)}
       {tab === 'details' && renderGenericTable(filteredDetails, 'details', 'No POs.')}
 
       {showFilter && <FilterDialog fields={fields} rules={filterRules} onApply={setFilterRules} onClose={() => setShowFilter(false)} />}
       {showColPicker && <ColumnPickerDialog fields={fields} visible={visibleCols} onApply={setVisibleCols} onClose={() => setShowColPicker(false)} />}
-      {showSaveView && <SaveViewDialog tab={tab} columns={visibleCols} filters={filterRules} onClose={() => setShowSaveView(false)} />}
+      {/* o3d-8u4h round 2: validated on SAVE as well as on load — a view is only worth as much as
+          the keys in it, and a key that was already dead should not be written back to the row. */}
+      {showSaveView && <SaveViewDialog tab={tab} columns={presentColumns(visibleCols, fields)} filters={filterRules.filter((r) => fields.some((f) => f.key === r.field))} onClose={() => setShowSaveView(false)} />}
     </div>
   )
 }

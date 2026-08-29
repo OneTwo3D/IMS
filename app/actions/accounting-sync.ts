@@ -24,6 +24,15 @@ import { effectiveTokenFor, isMoneyMovingSyncType } from '@/lib/domain/accountin
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 import { decideSettledRowReconciliation } from '@/lib/domain/accounting/settled-row-reconciliation'
 import {
+  cancelledSaleReleaseNote,
+  describeCancelledSaleRelease,
+  SALE_SCOPED_RELEASE_REFERENCE_TYPE,
+  type ReleaseSaleState,
+} from '@/lib/domain/accounting/cancelled-sale-release'
+import { UNCLAIMED_ATTEMPT_REVISION, applyFencedAttemptDecision } from '@/lib/domain/accounting/sync-log-attempt'
+import { OPERATOR_RELEASE_SETTLEMENT_BASIS } from '@/lib/domain/accounting/sync-row-settlement'
+import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
+import {
   summarizeCrossConnectorOrphans,
   type ConnectorOrphanSummary,
 } from '@/lib/domain/accounting/connector-orphans'
@@ -800,6 +809,216 @@ export async function reconcileSettledAccountingSyncRow(
     })
     revalidatePath('/sync')
     return { success: true, externalTransactionId: decision.externalTransactionId }
+  } catch (e) {
+    return { success: false, error: String(e) }
+  }
+}
+
+/**
+ * RE-CHECK THE SALE AND RELEASE A ROW THE SWEEP RETIRED (o3d-psvi).
+ *
+ * The one exit from the state described at the top of
+ * lib/domain/accounting/cancelled-sale-release.ts: a sales-order document that really did post, whose
+ * sync row was retired to CANCELLED because the sale was not live at the time, and whose sale is live
+ * again. Without it the operator can see a real invoice sitting unlinked in the ledger and has no
+ * button that changes anything, while every other control answers "already CANCELLED".
+ *
+ * IT POSTS NOTHING AND ASSERTS NOTHING. It reads the sale under the sale's own row lock, inside the
+ * transaction that writes, and on that evidence alone moves the row back to SYNCED so the ordinary
+ * back-reference repair sweep can finish the link and the outstanding follow-ups. Every judgement
+ * about WHETHER the work is owed stays where it already lives — the sweep re-reads the sale itself
+ * before it releases anything, so a sale that is cancelled again between this call and the next pass
+ * is retired again rather than repaired.
+ *
+ * THE READ IS INSIDE THE WRITE'S TRANSACTION AND UNDER THE ORDER LOCK. Reading the sale first and
+ * writing afterwards is the check/use race the sweep's own gate was rewritten to close: a
+ * cancellation landing in between would be overwritten by a decision taken before it.
+ *
+ * FENCED ON THE ATTEMPT the operator was shown, and on `expectedStatus: 'CANCELLED'`, so a row that
+ * moved under them — released by somebody else, retired again, re-driven — is refused rather than
+ * written over. Both existing entry points (per-row retry and Retry All) stay FAILED-only; this is a
+ * separate affordance because the two CANCELLED terminal states it has to tell apart are
+ * indistinguishable to a status filter.
+ */
+export async function releaseRetiredAccountingSyncRowForLiveSale(
+  entryId: string,
+  expectedAttemptRevision: number,
+): Promise<{ success: boolean; error?: string }> {
+  await requirePermission('settings')
+  try {
+    const row = await db.accountingSyncLog.findUnique({
+      where: { id: entryId },
+      select: {
+        id: true, connector: true, type: true, status: true, referenceType: true, referenceId: true,
+        externalTransactionId: true, settlementBasis: true, backReferenceCheckedAt: true,
+      },
+    })
+    if (!row) return { success: false, error: 'That sync entry no longer exists.' }
+
+    const now = new Date()
+    // o3d-psvi r3 (Codex HIGH) — THE TRY IS OUTSIDE THE TRANSACTION, NOT INSIDE IT.
+    //
+    // The lock is a raw `SELECT … FOR UPDATE`. Inside a Prisma interactive transaction a FAILED
+    // STATEMENT ABORTS THE POSTGRES TRANSACTION: every statement after it raises 25P02
+    // ("current transaction is aborted, commands ignored until end of transaction block") whatever
+    // the application code does with the first error. So catching the lock failure INSIDE the
+    // transaction and carrying on to the row re-read did not produce the UNREADABLE refusal this
+    // module argues for — it produced a raw Prisma 25P02 escaping to the operator, and the third
+    // state could not occur in production at all.
+    //
+    // `decideSaleRelease` in the Xero sync processor has had this right from the start: it wraps the
+    // whole `db.$transaction` call and maps ANY throw to SALE_UNREADABLE. Same shape here. The
+    // guarantee the refusal makes — "NOTHING was changed, the row is exactly as it was" — is
+    // strictly stronger this way, because it is the transaction ROLLBACK that provides it rather
+    // than an argument about which statements ran.
+    let outcome: { released: true } | { released: false; reason: string }
+    try {
+      outcome = await db.$transaction(async (tx) => {
+        // The sale is read HERE, not before the transaction: `describeCancelledSaleRelease` refuses on
+        // what the sale says, and a decision taken outside the lock is a decision about a row that can
+        // move before it is spent.
+        //
+        // FIRST of the three steps, and the order is the point (o3d-psvi r2): lock the sale, prove it
+        // live, THEN re-read the row — so the row's shape is read after everything that could have been
+        // waiting on the lock has finished writing.
+        let sale: ReleaseSaleState
+        if (row.referenceType !== SALE_SCOPED_RELEASE_REFERENCE_TYPE) {
+          // Not a sale-scoped row at all; the decision refuses on the reference type and never reads a
+          // state, so nothing is locked for it. Naming it UNREADABLE would be a different, wrong reason.
+          sale = 'MISSING'
+        } else {
+          // No local try. A lock timeout, a lost deadlock or a dropped connection ABORTS this
+          // transaction, so there is nothing left for this scope to do with the error except let it
+          // reach the handler below, which is the only place that can honestly answer "nothing was
+          // changed".
+          await lockSalesOrder(tx, row.referenceId)
+          const order = await tx.salesOrder.findUnique({ where: { id: row.referenceId }, select: { status: true } })
+          sale = order === null ? 'MISSING' : order.status === 'CANCELLED' ? 'CANCELLED' : 'LIVE'
+        }
+
+        // o3d-psvi r2 (Codex HIGH) — AND THE ROW'S SHAPE IS RE-READ INSIDE THE TRANSACTION THAT WRITES,
+        // AFTER THE LOCK.
+        //
+        // The read above the transaction is what the operator was SHOWN, and it is what the fence is
+        // aimed at; it is not evidence about the row at the moment of the write. Every refusal here —
+        // the basis column, the already-stamped verdict, the document id, the type pair — is about the
+        // row's SHAPE, and a shape read outside the transaction is one a concurrent sweep can have moved
+        // since. That mattered less while the revision alone had to move for a decision to be refused;
+        // it matters now, because the adoption below deliberately accepts a revision that has NOT moved,
+        // so the row's own columns are the only witness left. Releasing a row the sweep has meanwhile
+        // stamped would produce exactly the thing this issue is named for: a remedy nothing performs.
+        const fresh = await tx.accountingSyncLog.findUnique({
+          where: { id: entryId },
+          select: {
+            id: true, connector: true, type: true, status: true, referenceType: true, referenceId: true,
+            externalTransactionId: true, settlementBasis: true, backReferenceCheckedAt: true,
+          },
+        })
+        if (!fresh) {
+          return { released: false as const, reason: 'That sync entry no longer exists.' }
+        }
+        // The sale that was locked is the sale this decision is about. `referenceType`/`referenceId` are
+        // never rewritten on a sync row, so this cannot fire in practice — which is the reason to assert
+        // it rather than to assume it, because if it ever did the lock would be protecting another sale.
+        if (fresh.referenceType !== row.referenceType || fresh.referenceId !== row.referenceId) {
+          return {
+            released: false as const,
+            reason: 'This sync entry now points at a different document, so the sales order that was checked is not '
+              + 'the one it belongs to. Nothing was changed. Reload the sync log and look at what it shows.',
+          }
+        }
+
+        const decision = describeCancelledSaleRelease(fresh, sale)
+        if (!decision.release) return { released: false as const, reason: decision.reason }
+
+        // o3d-psvi r2 (Codex HIGH) — A REFUSAL MUST CARRY A REMEDY AN OPERATOR CAN PERFORM, AND THIS
+        // ONE COULD NOT BE PERFORMED AT ALL FOR THE POPULATION IT WAS WRITTEN FOR.
+        //
+        // `applyFencedAttemptDecision` refuses revision 0 as UNFENCED_ATTEMPT unless adoption is asked
+        // for, and this action never asked. Revision 0 means no processor that participates in the
+        // fence has ever claimed the row — which is the state the attempt-revision migration
+        // deliberately left EVERY pre-existing row in, and the state a row retired by the sweep before
+        // any claim stays in for ever. So the one control written to rescue a retired row refused
+        // exactly the retired rows there are, and its refusal named a claim that is never coming.
+        //
+        // ADOPTION IS SOUND HERE, and the argument is about the revision rather than about the
+        // connector (which is what accounting-settlement.ts's narrower door rests on). `attemptRevision`
+        // only ever MOVES UP — `nextAttemptRevision` is the only writer and every claim increments it —
+        // so a row that is still at 0 at the instant of the write is a row nothing has ever claimed,
+        // and there is no later attempt for this decision to land on. `(id, status CANCELLED,
+        // revision 0)` is therefore STRICTLY STRONGER than the `(id, status)` identity check it
+        // replaces: it refuses everything that would refuse, plus every row that has since been
+        // claimed. It bumps to 1 exactly as a processor's first claim would, so a second operator, or
+        // a sweep that moves the status first, loses the swap and is told what moved.
+        //
+        // Narrow on purpose: adoption is offered only when the operator was ALSO looking at revision 0.
+        // A row shown at a real attempt that has since fallen back to 0 cannot exist — the revision does
+        // not go down — so this can only ever widen the door for the population that has no other one.
+        const adoptUnfencedAttempt = expectedAttemptRevision === UNCLAIMED_ATTEMPT_REVISION
+
+        const applied = await applyFencedAttemptDecision(tx, {
+          id: fresh.id,
+          expectedAttemptRevision,
+          expectedStatus: 'CANCELLED',
+          adoptUnfencedAttempt,
+          data: {
+            status: 'SYNCED',
+            // The retirement cleared this. The row is being recorded as posted again, and the only
+            // instant this code can honestly name is now — the original post time did not survive.
+            syncedAt: now,
+            errorMessage: cancelledSaleReleaseNote(fresh.externalTransactionId ?? '', now),
+            // o3d-psvi r3 (Codex MEDIUM) — WHO REACHED THIS STATUS, IN THE COLUMN AND NOT IN THE NOTE.
+            //
+            // The retirement this undoes is reachable from EITHER SYNCED or FAILED and preserves
+            // neither, so the SYNCED written here is not a restatement of anything the connector said
+            // — it is an operator's write. Unmarked it would be byte-identical to a connector
+            // writeback, which is the exact condition `settlementBasis` exists to prevent, and this
+            // branch's own refusal above reads that column rather than the note for precisely that
+            // reason. The note is for a human; the column is what a reader may key on.
+            //
+            // OPERATOR_RELEASE, not OPERATOR_ASSERTION: the document id on this row is the
+            // CONNECTOR's (an asserted row is refused before we get here), so the readers that fail
+            // closed on an asserted id must not fire — see the constant for the full argument.
+            settlementBasis: OPERATOR_RELEASE_SETTLEMENT_BASIS,
+          },
+        })
+        if (!applied.ok) return { released: false as const, reason: applied.message }
+        return { released: true as const }
+      })
+    } catch {
+      // The transaction rolled back, so the row is exactly as it was — which is the only claim the
+      // UNREADABLE refusal makes. Its WORDING is single-sourced from the decision function rather
+      // than restated here, so the refusal an operator reads is the same one the pure tests pin.
+      const refusal = describeCancelledSaleRelease(row, 'UNREADABLE')
+      outcome = refusal.release
+        // Unreachable: `describeCancelledSaleRelease` never releases on an UNREADABLE sale. Kept as a
+        // refusal rather than a throw so a future edit to that function cannot turn a failed
+        // transaction into a success here.
+        ? { released: false, reason: 'The sales order could not be read, so nothing was changed. Try again.' }
+        : { released: false, reason: refusal.reason }
+    }
+
+    if (!outcome.released) return { success: false, error: outcome.reason }
+
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'accounting_sync_row_released_for_live_sale',
+      tag: 'sync',
+      level: 'WARNING',
+      description: `Released the retired ${row.type} sync row for ${row.referenceType} ${row.referenceId}: the sales `
+        + 'order is live again, so the document it already posted can be linked. Nothing was sent to the accounting '
+        + 'system; the back-reference repair sweep will write the link and enqueue the outstanding follow-ups.',
+      metadata: {
+        syncLogId: row.id,
+        connector: row.connector,
+        type: row.type,
+        referenceType: row.referenceType,
+        referenceId: row.referenceId,
+        externalTransactionId: row.externalTransactionId,
+      },
+    })
+    revalidatePath('/sync')
+    return { success: true }
   } catch (e) {
     return { success: false, error: String(e) }
   }

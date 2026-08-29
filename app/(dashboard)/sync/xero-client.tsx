@@ -2,7 +2,7 @@
 
 import { useState, useTransition, useEffect } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
-import { RefreshCw, Loader2, Link2, Link2Off, ArrowUpFromLine, CheckCircle2, Plus, Trash2, AlertTriangle, Receipt, RotateCcw, ChevronLeft, ChevronRight, ChevronDown } from 'lucide-react'
+import { RefreshCw, Loader2, Link2, Link2Off, ArrowUpFromLine, CheckCircle2, Plus, Trash2, AlertTriangle, Receipt, RotateCcw, ChevronLeft, ChevronRight, ChevronDown, Undo2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { useStepUpReauth, isFreshAuthFailure, type MaybeFreshAuthFailure } from '@/components/auth/use-step-up-reauth'
 import { Input } from '@/components/ui/input'
@@ -16,6 +16,7 @@ import {
   disconnectAccountingConnector,
   fetchAccountingTaxRates,
   reconcileSettledAccountingSyncRow,
+  releaseRetiredAccountingSyncRowForLiveSale,
   retryFailedAccountingSync,
   saveAccountingConnectionSettings,
   saveAccountingSettings,
@@ -80,6 +81,10 @@ const STATUS_BADGE: Record<string, { variant: 'default' | 'secondary' | 'outline
   PROCESSING: { variant: 'secondary', label: 'Processing' },
   SYNCED: { variant: 'default', label: 'Synced' },
   FAILED: { variant: 'destructive', label: 'Failed' },
+  // o3d-psvi: CANCELLED used to fall through to the raw enum name, which is the only status on this
+  // table that also carries a real posted document. A row an operator has to act on must not be the
+  // one rendered least like the others.
+  CANCELLED: { variant: 'secondary', label: 'Retired' },
 }
 
 // ---------------------------------------------------------------------------
@@ -173,6 +178,8 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
   const [retryingId, setRetryingId] = useState<string | null>(null)
   const [retryingAll, setRetryingAll] = useState(false)
   const [reconcilingId, setReconcilingId] = useState<string | null>(null)
+  /** o3d-psvi: the row whose sale is being re-checked. */
+  const [releasingId, setReleasingId] = useState<string | null>(null)
   const [retryMsg, setRetryMsg] = useState<string | null>(null)
   const searchParams = useSearchParams()
   const connectorId: AccountingConnectorId = searchParams.get('connector') === 'quickbooks' ? 'quickbooks' : 'xero'
@@ -432,6 +439,31 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
       router.refresh()
     } else {
       setRetryMsg(result.error ?? 'Could not reconcile that entry.')
+    }
+  }
+
+  /**
+   * o3d-psvi. The sweep retires a row to CANCELLED when the sale behind it is not live, keeping the
+   * id of a document that really did post. Every other control on this page is FAILED-only, so once
+   * that happens there is nothing to press — and the sale CAN come back, because a reinstated
+   * storefront order is pushed into IMS through the full status-transition bypass.
+   *
+   * The server re-reads the sale under its own row lock and refuses unless it is live; this only
+   * carries the answer back. Nothing is sent to the accounting system either way.
+   */
+  async function handleReleaseRetired(entryId: string, attemptRevision: number | undefined) {
+    setRetryMsg(null)
+    setReleasingId(entryId)
+    const result = await releaseRetiredAccountingSyncRowForLiveSale(entryId, attemptRevision ?? 0)
+    setReleasingId(null)
+    if (result.success) {
+      setRetryMsg(
+        'Released: the sales order is live, so the document it already posted is back in front of the repair '
+        + 'sweep. The link and the outstanding follow-ups run on the next sweep; nothing was posted.',
+      )
+      router.refresh()
+    } else {
+      setRetryMsg(result.error ?? 'Could not release that entry.')
     }
   }
 
@@ -1171,6 +1203,30 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
                                 </>
                               )}
                               {/*
+                                o3d-psvi — THE EXIT FROM A RETIRED ROW. Shown only where one could
+                                exist: a CANCELLED sales-order row that still names a document. The
+                                server re-reads the sale under its lock and refuses unless it is live,
+                                so this button asks a question rather than asserting an answer — which
+                                is why it is offered on rows whose sale is still cancelled too, and
+                                answers with the reason (void or credit-note the document) instead of
+                                being hidden and leaving the operator with nothing at all.
+                              */}
+                              {log.status === 'CANCELLED'
+                                && log.referenceType === 'SalesOrder'
+                                && log.externalTransactionId
+                                && !assertedBasis && (
+                                <Button
+                                  variant="ghost"
+                                  size="sm"
+                                  className="h-7 w-7 p-0"
+                                  title="Sales order live again? Re-check the sale and release this document for linking"
+                                  onClick={() => handleReleaseRetired(log.id, log.attemptRevision)}
+                                  disabled={releasingId === log.id}
+                                >
+                                  {releasingId === log.id ? <Loader2 className="h-3 w-3 animate-spin" /> : <Undo2 className="h-3 w-3" />}
+                                </Button>
+                              )}
+                              {/*
                                 o3d-nf9i — the settlement control, beside Retry rather than instead of it.
                                 The two are opposites and the operator has to be able to choose: Retry
                                 re-attempts work the system already decided to do, and o3d-0m56 REFUSES it
@@ -1178,8 +1234,9 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
                                 tokens. Until now that refusal was a dead end — "resolve these rows
                                 manually" with no manual path in the app. This is that path.
                                 Rendered only where a settlement could actually land: the helper returns
-                                `settleable: false` for PENDING/terminal rows, DAILY_BATCH types and rows
-                                at attempt revision 0, and the component then shows the reason instead.
+                                `settleable: false` for PENDING/terminal rows and rows at attempt revision
+                                0, and the component then shows the reason instead. A DAILY_BATCH row is
+                                settleable POSTED only — see settleableSettlementOutcomes.
                               */}
                               {settlementApplies && (
                                 <SettleSyncRowControl
@@ -1191,6 +1248,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
                                   referenceId={log.referenceId}
                                   settleable={settlement.settleable}
                                   notSettleableReason={settlement.notSettleableReason}
+                                  settleableOutcomes={settlement.settleableOutcomes}
                                   caveat={settlement.settlementCaveat}
                                   onSettled={() => router.refresh()}
                                 />

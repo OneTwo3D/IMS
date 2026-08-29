@@ -5,7 +5,10 @@
 
 import { db } from '@/lib/db'
 import { activeAccountingIdProvenance } from '@/lib/connectors/accounting-id-provenance'
-import { stampAccountingPayloadConnection } from '@/lib/connectors/accounting-connection-provenance'
+import {
+  mintAccountingConnectionProvenanceColumn,
+  stampAccountingPayloadConnection,
+} from '@/lib/connectors/accounting-connection-provenance'
 import { logActivity } from '@/lib/activity-log'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { mirrorAccountingSyncLogToEvent } from '@/lib/domain/accounting/accounting-event-mirror'
@@ -138,6 +141,12 @@ export async function queueXeroSync(params: {
           referenceType: params.referenceType,
           referenceId: params.referenceId,
           payload: payload as never,
+          // o3d-dzip: the DURABLE half of the same origin record, minted from the stamp in the
+          // payload this statement is writing. Retention compacts the payload to `{}` and keeps the
+          // external id, so a stamp that lives only in the payload is missing from exactly the rows
+          // whose realm is least knowable. Minted here and nowhere else — see
+          // mintAccountingConnectionProvenanceColumn for why this is not a back-fill.
+          connectionProvenance: mintAccountingConnectionProvenanceColumn(payload),
           // o3d-0m56 r10: created INSIDE attempt-stamping custody. That is what later lets a revival
           // read this row's unset `remoteAttemptedAt` as proof no remote call ever left it — see
           // money-attempt-provenance.ts. A row created without it is never recycled again.

@@ -324,7 +324,11 @@ export function buildNotPushedDriftWhere(input: {
       // the link's own updatedAt is churned by check C's reconcileCheckedAt
       // stamp, which would make a stale HELD finding self-resolve mid-run
       // (Codex r7). cancelledAt only moves when the hold state itself does.
-      { wmsOrderPush: { state: 'HELD' as const, cancelledAt: { lt: input.cutoff } } },
+      // o3d-2k5r r6: `cancelledAt` is now stamped on a HELD link ONLY where the WMS CONFIRMED the
+      // cancellation, so a null one is not "recently held" — it is a hold whose remote outcome was
+      // never established, which needs this check MORE than a confirmed one does. Without the null
+      // arm such a link would be invisible to the stale-hold finding for ever.
+      { wmsOrderPush: { state: 'HELD' as const, OR: [{ cancelledAt: { lt: input.cutoff } }, { cancelledAt: null }] } },
       // A ready+paid order parked on a CANCELLED link is unreachable by the
       // push sweep entirely (its release pass only covers HELD) — e.g. an order
       // restored to PROCESSING through a storefront status sync after its WMS

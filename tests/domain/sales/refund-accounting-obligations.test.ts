@@ -316,10 +316,34 @@ test('o3d-2sm1 r8: the transactional enqueue names the connector it resolved, on
   // AND THE QUEUED ANSWERS NAME `context.connector` — the connector the row is actually written
   // under — rather than resolving the active connector a second time. A second read could agree with
   // the pin while the write did not, which is the race being closed, not a check of it.
+  //
+  // Read as CALL SITES rather than as one exact literal (o3d-ekn8 r4). The previous form counted
+  // occurrences of a fixed string, so adding a field to one of the three outcomes failed this
+  // assertion while the property it names — every queued answer carries the write's connector —
+  // still held. What is asserted is the property.
+  const queuedAnswers = [...body.matchAll(/return answer\(\{ queued: true[^}]*\}, ([^)]*)\)/g)]
   assert.equal(
-    body.split('return answer({ queued: true }, context.connector)').length - 1,
+    queuedAnswers.length,
     3,
-    'the idempotency hit, the create, and the unique-key collision all name the write’s connector',
+    'the idempotency hit, the create, and the unique-key collision are the three queued exits',
+  )
+  for (const answer of queuedAnswers) {
+    assert.equal(
+      answer[1],
+      'context.connector',
+      `every queued answer must name the write’s connector, not a second resolution: ${answer[0]}`,
+    )
+  }
+
+  // o3d-ekn8 r4: and the ONE of the three that writes nothing says so. `queued: true` from the
+  // idempotency short-circuit means "the work is on the queue", not "this call put it there" — a
+  // caller that rolls its write back on that answer rolls back an empty transaction while a live row
+  // is still going to post. Executed against the real enqueue in
+  // tests/accounting/enqueue-idempotency-short-circuit.test.ts; pinned here beside its siblings.
+  assert.equal(
+    queuedAnswers.filter((answer) => answer[0].includes("reason: 'already-queued'")).length,
+    1,
+    'exactly one queued exit — the short-circuit — reports that it wrote nothing',
   )
   assert.match(body, /return answer\(\{ queued: false, reason: 'refused' \}\)/, 'a deleted order scope is REFUSED, not decided')
 

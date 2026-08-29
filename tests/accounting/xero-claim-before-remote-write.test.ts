@@ -89,7 +89,17 @@ function makeDbDouble(): Record<string, unknown> {
       //    of #639. Un-taught, the cancelled-order guard failed with "could not read sales order",
       //    which this file reported as "nothing was posted" — i.e. as a claim failure, which it isn't.
       //  • `$executeRaw` — o3d-clxw r4's database-clock stamp on the SYNCED transition.
-      if (key === '$queryRaw' || key === '$queryRawUnsafe') return async () => []
+      if (key === '$queryRaw' || key === '$queryRawUnsafe') {
+        // o3d-jit6: ONE of these raw reads has a meaningful answer — `planCreateDispatch` asks the
+        // DATABASE for `clock_timestamp()` and REFUSES the create when it cannot have it. Answering
+        // every raw read with `[]` therefore stopped the manual-journal branch one statement before
+        // the claim fence, so no dispatch record was ever minted and any test asserting that one was
+        // NOT minted passed vacuously — including with the defect reintroduced.
+        return async (query?: TemplateStringsArray) => {
+          const sql = Array.isArray(query) ? query.join(' ') : String(query ?? '')
+          return sql.includes('clock_timestamp') ? [{ now: new Date() }] : []
+        }
+      }
       if (key === '$executeRaw' || key === '$executeRawUnsafe') return async () => 1
       // o3d-5ct (#618): the sweep no longer posts from the row object the batch `findMany` returned.
       // Once the claim lands it RE-READS the payload by id, because the snapshot was taken before the
@@ -259,7 +269,10 @@ test('both sweep paths open the lease before posting and anchor the persist to t
     // o3d-e2mz: the call now carries the ATTEMPT as well as the lease — two fences answering two
     // different questions (do I still own this row / is this still the attempt I claimed). The lease
     // must still be there, and must still be the LEASE rather than a snapshot of it.
-    assert.match(lines[index], /payload, lease, attempt\)/,
+    // o3d-dzip added the durable origin record to the arguments (the column plus retention's
+    // compaction instant, Codex r1 finding 1); the LEASE and the ATTEMPT must still be the last two,
+    // and must still be the lease itself rather than a snapshot of it.
+    assert.match(lines[index], /payload, origin, lease, attempt\)/,
       `and everything downstream must fence on the lease, not on the claim taken before the deferral checks`)
   }
 
@@ -301,7 +314,15 @@ test('r5 #1: EVERY remote mutation in processEntry is fenced immediately before 
     'return pushCreditNote(',
     'return pushPurchaseCreditNote(',
     'await allocatePurchaseCreditNote(',
-    'return pushManualJournal(',
+    // o3d-jit6 r2 #1: the journal's own gates were lifted out of the post (`prepareManualJournal`,
+    // pure and above the mint), so what remains below the fence is a body that has already cleared
+    // every check. The MUTATION is still exactly one call, in exactly one place.
+    //
+    // r3: awaited into a local rather than returned directly, because the branch now READS what the
+    // post reports about whether it reached the wire (`reachedTheWire`) before it decides what kind
+    // of failure this was. That is an observation, not a gate: it refuses nothing and it is still
+    // this one call that mutates Xero, still immediately below the fence.
+    'await postPreparedManualJournal(',
     'await putXeroTaxRate(',
   ]
   // The two `xeroPost('Payments'` sites are matched separately: the same text appears twice.
@@ -352,6 +373,62 @@ test('the sweep POSTS NOTHING when the claim was taken between claiming and post
   const warning = state.activity.find((a) => a.action === 'xero_sync_claim_lost_before_post')
   assert.ok(warning, 'the lost claim is recorded, not swallowed')
   assert.match(warning.description ?? '', /posting would have created a second document/)
+})
+
+test('o3d-jit6 r2#1: an UNBALANCED journal writes no dispatch marker — the sweep refuses it before the mint', async () => {
+  // CODEX ROUND 2, FINDING 1, driven through the real `processEntry`.
+  //
+  // The manual-journal branch mints a durable "a create for this row is on the wire" record inside
+  // the claim fence, because that record is the only thing that survives a commit failure after a
+  // successful post. `pushManualJournal` then refused an unbalanced journal WITHOUT CALLING XERO —
+  // past the fence. The marker stood over a post nobody made, and every later attempt on this row
+  // read it and refused: "IMS already dispatched a create ... and never recorded a document id".
+  //
+  // The assertion is on the WRITES, not on the error, because the error is the same either way. A
+  // fence that mints appends `createDispatchedAt` + `createDispatchIdempotencyKey` to its claim
+  // renewal — one `updateMany`, by construction (see the r1#2 structural test) — so their absence
+  // from every statement this sweep made IS "no marker was written".
+  reset()
+  process.env.XERO_ACCOUNTING_OUTBOX_ENABLED = 'false'
+  state.pending = [{
+    id: 'log-j1',
+    connector: 'xero',
+    type: 'COGS_JOURNAL',
+    status: 'PENDING',
+    referenceType: 'Shipment',
+    referenceId: 'ship-1',
+    externalTransactionId: null,
+    retryCount: 0,
+    errorMessage: null,
+    processingStartedAt: null,
+    createDispatchedAt: null,
+    createDispatchIdempotencyKey: null,
+    payload: {
+      date: '2026-08-20',
+      reference: 'COGS ship-1',
+      narration: 'COGS for ship-1',
+      // Debits £40, credits £25. Xero is never asked about this journal — and neither is the
+      // database, which is the property under test.
+      lines: [
+        { accountCode: '310', description: 'COGS', debit: 40 },
+        { accountCode: '630', description: 'Inventory', credit: 25 },
+      ],
+    },
+  }]
+  state.updateManyCounts = [1, 1]
+
+  const { processPendingXeroSync } = await processor()
+  const result = await processPendingXeroSync()
+
+  assert.equal(result.succeeded, 0, 'an unbalanced journal is refused, as it always was')
+  for (const { data } of state.updateMany) {
+    assert.ok(!('createDispatchedAt' in data),
+      'NO STATEMENT may record a dispatch for a create that stopped before the socket')
+    assert.ok(!('createDispatchIdempotencyKey' in data))
+  }
+  // And the refusal is the journal's own, not the dispatch fence's — the row can be re-queued with
+  // corrected lines and post normally, which a marker would have made impossible for ever.
+  assert.equal(state.activity.some((a) => a.action === 'xero_sync_dispatch_unrecorded'), false)
 })
 
 test('control: with the claim still held, the sweep posts exactly once', async () => {

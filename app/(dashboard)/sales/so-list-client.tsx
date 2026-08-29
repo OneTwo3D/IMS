@@ -99,6 +99,8 @@ const WMS_PUSH_TONE: Record<string, string> = {
 }
 const WMS_PUSH_LABEL: Record<string, string> = {
   SYNCED: 'Pushed', PENDING_CREATE: 'Queued', PENDING_CANCEL: 'Cancelling', HELD: 'Held', CANCELLED: 'Cancelled', DEAD_LETTER: 'Failed',
+  // o3d-92fu: the payload could not be built from this order's own data — no push was attempted.
+  VALIDATION_FAILED: 'Payload invalid',
 }
 
 const DEFAULT_VISIBLE: ColKey[] = ['order', 'customer', 'status', 'total', 'warehouse', 'created', 'items']

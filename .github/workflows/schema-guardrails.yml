@@ -104,5 +104,48 @@ jobs:
         env:
           RUN_DB_OBJECT_ACCESS_TEST: "1"
         run: npx tsx --test --experimental-test-module-mocks tests/scripts/app-db-object-access.test.ts
+      # THE SESSION-LOCK GUARD NEEDS A ROUTE THAT IS NOT BEHIND DOCKER'S PORT NAT (o3d-2k5r).
+      #
+      # `services:` publishes the container's 5432 on the runner, and a connection to
+      # 127.0.0.1:5432 is carried by docker-proxy: it TERMINATES our socket and opens its own to
+      # the container. The backend then names its client as 172.18.0.1:<proxy's port> while this
+      # process's own socket is 127.0.0.1:<our port>, and `pgSessionLockConnectionConfig()`
+      # refuses -- a peer that is not ours is the same evidence a transaction-pooling proxy
+      # presents, and the module cannot tell the two apart from SQL or from Node, so it refuses
+      # both rather than trust a socket that may be re-pointed. That is this repository's own
+      # documented false positive on a NAT, and it landed on this repository's own pipeline: the
+      # payment-write lock regression failed here on every run.
+      #
+      # THE FIX IS THE ONE THE REFUSAL PRESCRIBES, and it is not to weaken the check. The service
+      # container's OWN bridge address is a direct route: host-to-container traffic leaves via the
+      # bridge interface and Docker's MASQUERADE rule excludes it (`! -o <bridge>`), so the
+      # backend sees 172.18.0.1:<our own port> -- our socket, byte for byte -- and the peer
+      # comparison passes. It is the same PostgreSQL as DATABASE_URL, so the override's
+      # shared-lock-space probe (an advisory lock taken over here must block a witness over there)
+      # passes too. DATABASE_URL stays on the published port, which is what the override is FOR:
+      # ordinary query traffic keeps its route, only the advisory-lock pools take the direct one.
+      #
+      # Verified before it was written, against a stand-in for the NAT: a plain TCP relay in front
+      # of a local PostgreSQL reproduces the refusal verbatim ("something between the two
+      # terminated the connection"), and adding DATABASE_SESSION_LOCK_URL for the same database on
+      # the direct port turns all 32 concurrency tests green.
+      - name: Resolve the postgres service's direct, non-NAT address
+        id: direct-db
+        run: |
+          ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' '${{ job.services.postgres.id }}')"
+          if [ -z "$ip" ]; then
+            echo "could not read the postgres service container's bridge address" >&2
+            exit 1
+          fi
+          if ! timeout 10 bash -c "until </dev/tcp/${ip}/5432; do sleep 1; done" 2>/dev/null; then
+            echo "the postgres service container is not reachable at ${ip}:5432" >&2
+            exit 1
+          fi
+          echo "url=${DATABASE_URL/@127.0.0.1:5432/@${ip}:5432}" >> "$GITHUB_OUTPUT"
       - name: Run DB-backed concurrency regressions
+        env:
+          # Scoped to THIS step on purpose. It must not reach a step that re-points DATABASE_URL at
+          # another database -- an override naming a different database is refused outright, by
+          # design, so a job-wide value would break such a step rather than help it.
+          DATABASE_SESSION_LOCK_URL: ${{ steps.direct-db.outputs.url }}
         run: npm run test:concurrency

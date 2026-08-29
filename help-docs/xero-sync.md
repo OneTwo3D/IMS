@@ -1420,19 +1420,55 @@ document in Xero: until you do, that sale is in no reporting period. An invoice 
 already has is never overwritten.
 
 **The sweep runs for Xero only.** There is deliberately no QuickBooks equivalent, and that is not an
-oversight to be reported. A QuickBooks document id is a per-company integer, and disconnecting clears
-the company pin, so a sweep scoped to "the QuickBooks connector" could not tell an id issued by a
-previously connected company from one issued by the current one — it would write a retired company's
-integer onto a live order or bill, and payment polling would then act on it as if it were current.
-Failing to repair is acceptable; repairing onto the wrong document is not. On QuickBooks, a
-back-reference that fails to write is therefore **not retried by anything**: the warning in the
-activity log (`quickbooks_backreference_failed` or `quickbooks_backreference_ambiguous`) says so, and
-the link has to be made by hand. The external id is on the sync row, so nothing is lost — only
-automatic. See *Connecting a different company* below for why the company boundary is the blocker.
+oversight to be reported. A QuickBooks document id is a per-company integer, so a repair that ran
+against the wrong company would write a retired company's integer onto a live order or bill, and
+payment polling would then act on it as if it were current. Failing to repair is acceptable;
+repairing onto the wrong document is not.
+
+**The company boundary is no longer what is missing.** Every sync row now records which connected
+company it was raised against, so a QuickBooks sweep *could* select only the current company's rows.
+What is still missing is on the other side of the repair, and it is why the sweep stays unbound: IMS
+does not yet check **at post time** — as the last thing it does before sending — that the company
+connected at that moment is the company the row was raised against, and the follow-up rows a repair
+would create carry no record of their own origin for such a check to read. A correctly selected row
+could therefore still be posted against whatever company happens to be connected when the sync
+processor reaches it. Both of those — the **post time** check and the origin record — have to land before a QuickBooks sweep is safe to bind.
+
+On QuickBooks, a back-reference that fails to write is therefore **not retried by anything**: the
+warning in the activity log (`quickbooks_backreference_failed` or
+`quickbooks_backreference_ambiguous`) says so, and the link has to be made by hand. The external id
+is on the sync row, so nothing is lost — only automatic. See *Connecting a different company* below
+for what a company switch leaves behind.
+
 (QuickBooks *does* record outstanding follow-ups the same way Xero does — that costs nothing and
 crosses no company boundary — so the work is recoverable the day a QuickBooks sweep becomes safe to
-run. Until then it is a record, not a repair: a QuickBooks follow-up that fails still has to be
-re-driven by hand, and `quickbooks_followup_error` in the activity log is the notice that it does.)
+run. Until then it is a record, not a repair. **Every such row is listed on Sync → Exceptions, under
+"Accounting follow-ups owed, with nothing to re-drive them"** — that list, not the activity log, is
+the reliable place to find them, because it is read straight off the sync rows themselves rather than
+depending on a log entry having been written. `quickbooks_followup_error` in the activity log is the
+same news, when it could be recorded.
+
+**Do not settle one of these rows by hand.** The marker does not say the follow-up work never ran —
+it survives a pass whose follow-ups all succeeded and whose last write failed, and it survives a pass
+in which the payment was enqueued and the PDF was not, leaving a payment sitting `PENDING` in the
+local queue right now. Reading QuickBooks does not separate those cases: you can find no payment,
+create one, and have the queued row post its own minutes later, against the same invoice, with a
+request id that cannot deduplicate what a human made in the QuickBooks UI. Open the document, record
+what is actually there, and hand that reading to accounting. The page states the same rule at the top
+of the list, and each row carries the connector's own wording — both read from
+`lib/domain/accounting/follow-up-obligation-registry.ts`, which is the only place this instruction is
+written down.)
+
+**On Xero the same marker means something different — and still nothing to do.** Xero *does* have a
+back-reference repair sweep bound (`repairXeroBackReferences`, run by the accounting-sync cron and by
+a manual sync), so a Xero row whose deferred receipt is still unregistered is retained *work* rather
+than stranded work: the sweep re-reads the marker and re-enqueues the follow-ups idempotently, and
+the `xero_followup_obligation_retained` activity now says exactly that. It used to tell the operator
+to drive the sync for that reference again or settle the receipt themselves — which on this connector
+is the *worse* advice, because the automatic retry really does exist and a settlement made in the
+Xero UI races work already queued, producing a second payment no request id can deduplicate. If a row
+is still marked after the next accounting-sync run, read the invoice in Xero, record what is present,
+and escalate that reading.
 
 **When the id itself is the blocker.** One case cannot be resolved by linking the document by hand:
 the write was refused because *another local record already holds that id* — typically a bill from a
@@ -1583,8 +1619,11 @@ succeeded is safe: it reports that the id is already on the document and does no
 row once it is older than the sync-log retention period, keeping only the identifying record. Such a
 row is still repaired — the external id can still be written onto the order or bill — but its
 outstanding follow-ups (PDF, payment, attachment) can no longer be rebuilt. When that happens the
-sweep logs `xero_backreference_followups_discarded` naming the document, so you can check for a
-missing PDF, payment or credit allocation and re-drive it manually.
+sweep logs `xero_backreference_followups_discarded` naming the document. That line is a notice, not a
+work order: the interrupted pass enqueues each follow-up as its own sync row, so one for the part it
+names may already be sitting in the queue, and a payment or attachment created by hand afterwards
+cannot be deduplicated against it. Open the document in Xero, record what is actually present, and
+escalate that reading to accounting. Do not settle one of these rows by hand.
 
 ## Connecting a different company
 
@@ -1608,10 +1647,11 @@ read a stored external id — payment matching, reconciliation, document updates
 tell two companies' ids apart, and orders, refunds and credit notes do not record an issuing company
 at all. A refused link is visible and fixable; a payment settling the wrong document is neither.
 
-It is also why there is no back-reference repair sweep on QuickBooks (see *Back-Reference Repair*
-above). The refusal only fires when some local record still holds the id; after a company switch the
-usual case is that **nothing** holds it, and an automatic repair would then link a retired company's
-document with no constraint to stop it.
+It is part of why there is no back-reference repair sweep on QuickBooks (see *Back-Reference Repair*
+above, which describes what a sweep is actually waiting on: a check, at post time, that the company
+connected now is the company the row was raised against). The refusal only fires when some local
+record still holds the id; after a company switch the usual case is that **nothing** holds it, and an
+automatic repair would then link a retired company's document with no constraint to stop it.
 
 **Practically:** if you need to move a QuickBooks connection to a different company, treat it as a
 migration, not a reconnect. Export the existing links first (they are financial records), then clear
@@ -1667,7 +1707,29 @@ about what it could not do: check the activity log after a bulk retry over old f
 The follow-ups that **do** survive compaction are still queued in that situation. A sales invoice
 tombstone, for example, keeps everything the invoice-PDF job needs, so the retry enqueues it even
 when the warning itself could not be written down — only the *settling* of the row waits for the
-warning, never the work.
+warning, never the work. **The repair sweep queues them too**, which it previously did not: it used
+to announce the loss and settle a tombstone without calling the enqueue at all, which threw away the
+same PDF the warning was telling you had survived.
+
+**The warning names what the row actually owed, not what its type could owe.** A sales invoice only
+owes a payment registration when the payment was recorded on it at the time it was queued — an order
+invoiced with no receipt against it never owed one, and a tombstone of it lost nothing. Retention
+therefore writes down what each row owed at the moment it compacts it, from the payload it is about
+to erase, and the warning is raised only for what that record names. Two consequences worth knowing:
+
+- rows compacted **before this shipped** carry no such record, and there is no way to give them one —
+  the payload it would be derived from is exactly what was thrown away. Those rows keep the older,
+  broader answer, so a sales invoice tombstone from before the change is still reported as having
+  lost a payment registration even when it never owed one. The activity entry says which it was:
+  `classificationBasis` is `row-record` for a row that answered for itself and `type-table` for one
+  that could not;
+- a row that owed nothing recoverable is now **settled silently**, with no warning at all. That is
+  the intended outcome, not a missing alarm: there was nothing to lose.
+
+A follow-up rebuilt from a tombstone also carries the organisation the original row was raised
+against — recorded in a column retention does not touch — so it can be posted. Before, it was queued
+carrying nothing and refused at the socket, which meant the PDF the table promised never actually
+went out.
 
 **Do not cancel one of these rows to tidy it away.** Cancelling is irreversible in two ways the row
 gives no warning about: a cancelled row is no longer a repair candidate, so the link that was still
@@ -1741,9 +1803,32 @@ The sync log at **Integrations → Xero** shows queued transactions for the **cu
 - **Synced** — Successfully pushed to Xero (shows Xero transaction ID)
 - **Failed** — Failed after 5 retries (shows error message)
 
-- **Cancelled** — Retired without posting (for example the sales order was cancelled before its invoice went out). Not an error, and not re-queued by any sweep.
+- **Cancelled** (shown as **Retired**) — the row was taken out of the queue rather than completed. Usually nothing was posted (a sales order cancelled before its invoice went out, an orphaned queue row swept up). **Sometimes something was**: when the repair sweep retires a row because the sale is not live, the Xero document it names is real and is kept on the row on purpose. No sweep re-queues a retired row.
 
 Failed entries can be investigated via the error message and retried by resetting their status in the database.
+
+#### Releasing a retired row after the sale comes back
+
+If a retired row still shows a **Xero document id** and its sales order is **live again** — an order cancelled by mistake in WooCommerce and then reinstated, which pushes the live status back into IMS — the document is sitting in Xero with nothing linking it to the order, and no other control on this page applies: Retry and Retry All only ever touch `FAILED` rows, and the settle control answers that a recorded outcome cannot be rewritten.
+
+The **release** button (the undo arrow) on that row is the way out. It:
+
+- re-reads the sales order **under that order's row lock, inside the transaction that writes**, so a cancellation landing at the same moment cannot be overwritten by a decision taken just before it;
+- releases the row back to `SYNCED` **only if the order is live**, so the ordinary back-reference repair sweep picks it up on its next run and writes the link and the outstanding follow-ups (PDF, email, storefront note, payment);
+- **sends nothing to Xero**, either way. The document already posted; this only decides whether IMS may finish linking it.
+
+It refuses, naming what to do instead, when:
+
+- the order is **still cancelled** — the document must not be revived. Void or credit-note it in Xero, or reinstate the order first;
+- the order **no longer exists** — same answer: the document is real, undo it in Xero;
+- the order **could not be read** — nothing was changed and this is not a verdict about the sale, only about that moment. Try again;
+- the row's outcome was recorded by an **operator assertion** rather than by Xero — the document id is unverified, so open it in Xero and link it to the order by hand;
+- the **repair sweep has already reached a verdict** on the row — releasing it would produce a row no later pass looks at. Use the external-id release command instead. The row is re-read under the order's lock inside the transaction that writes, so a sweep verdict landing while you press the button is caught rather than overwritten;
+- the row has **moved on to a different attempt** since the page was rendered. Reload and judge what the list shows.
+
+**Rows that have never been picked up by a processor can be released too.** Historic rows — and any row the sweep retires before a processor ever claimed it — carry no attempt of their own. The release adopts such a row instead of refusing it: the write is still a compare-and-swap, so if anything claims or moves the row first, the release loses and tells you what changed.
+
+Releasing needs the **settings** permission.
 
 ### Payments IMS refuses to send
 
@@ -1763,6 +1848,29 @@ is why a Failed row keeps its sales order from being deleted, and it is also why
 must never be retried: when several rows for one reference posted under different idempotency
 tokens, IMS refuses the retry outright, because a manual retry is far too late for Xero to
 deduplicate it.
+
+**Journals go further than that, because a journal create has no natural key.** Before a manual
+journal (COGS, inventory adjustment, stock-in-transit, the daily batches and the rest) is put on the
+wire, IMS commits a note on the row saying a create is about to be dispatched, together with the
+idempotency token it will carry. If the post lands and the write-back then fails at commit, that
+note is the only thing left saying a document may exist — so a later attempt is **refused** rather
+than sent, once Xero's six-minute idempotency window has passed.
+
+Read the refusal carefully, because it names **two** things that produce the same row, and IMS
+cannot tell them apart from the row alone:
+
+- the post landed and the write-back failed — **a real journal is in Xero**; or
+- IMS recorded the dispatch and then **refused to send it itself**, before anything left the
+  process: no usable Xero connection, posting paused for the organisation, an egress authorisation
+  refusing the write, or the day's API budget exhausted. **Nothing is in Xero.**
+
+The second case leaves a warning in the Activity log —
+`xero_sync_transport_refused_before_post`, naming the sync row and the reason. **Look for that
+first**: if it is there, IMS refused to send and the ledger should be empty. An attempt refused that
+way does not fail the row or spend a retry; it is handed back and re-run, and only the note it left
+behind persists. The note itself is never cleared — it is a prohibition, and one that could be
+cleared would be no protection at all — so resolve the row with the **Settle** control below, or (for
+an ordinary journal) cancel it and re-queue the work, which raises a fresh row with no note on it.
 
 Rows in that position — and **Processing** rows whose connector was switched off while a worker held
 them — now carry a **Settle** control (the gavel icon) beside Retry, both in the sync log and in the
@@ -1801,6 +1909,8 @@ there is nothing to settle, and if it is not, reverse it in Xero before recordin
 - **live** — repairs it, exactly as before;
 - **cancelled** — retires the row to `CANCELLED` instead, writes nothing onto the order, enqueues no follow-ups, and raises an ERROR naming the Xero document that is now the only thing left to undo;
 - **unreadable** — defers: nothing is written, nothing is retired, the row keeps its status and the next sweep asks again. A WARNING records the deferral.
+
+A retirement is **not** the end of the story if the sale comes back: see *Releasing a retired row after the sale comes back* above. The retirement is deliberately fail-closed, and the release is the operator's way to answer it once the sale can be proved live again.
 
 Only rows whose reference is a **sales order** are gated this way. A supplier bill has no sale behind it, and a refund credit note is very often the direct consequence of the cancellation — refusing to finish *that* back-reference would strand the very document the cancellation created.
 
@@ -1850,7 +1960,10 @@ cancelled. Reverse the document in Xero instead.
 **What cannot be settled, and why the control says so instead of disappearing:**
 
 - **Pending** rows — nothing was sent, so there is nothing to assert. The ordinary sweeps retire them.
-- **Synced** and **Cancelled** rows — the outcome is already recorded and must not be rewritten.
+- **Synced** and **Cancelled** rows — the outcome is already recorded and must not be rewritten. A
+  **Cancelled** row that still names a Xero document, on a sales order that is live again, has its own
+  control — see *Releasing a retired row after the sale comes back*. It does not settle the row; it
+  hands it back to the repair sweep.
 - **Daily batch** rows — a batch row covers every order staged into it, so cancelling one could let an
   order be deleted while a recreate is still building a journal containing its value. Reverse the
   journal in Xero and let the batch sweep re-derive it.

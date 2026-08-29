@@ -14,7 +14,8 @@ import {
   findMirrorOwnershipConflict,
   isFencedAttemptRevision,
   isSettleableAccountingSyncStatus,
-  isSettleableAccountingSyncType,
+  isDailyBatchSyncType,
+  settleableSettlementOutcomes,
   isOperatorAssertedSettlement,
   isSaleScopedSettlementRow,
   refuseSettlement,
@@ -79,17 +80,47 @@ test('a status outside the vocabulary is refused, not silently allowed', () => {
   assert.match(describeUnsettleableStatus('WHATEVER'), /Only FAILED and PROCESSING rows can/)
 })
 
-test('DAILY_BATCH_* is refused on its TYPE, whatever its status — and the message names the batch race', () => {
+test('DAILY_BATCH_* refuses NOT_POSTED on its TYPE, whatever its status — and the message names the batch race', () => {
   // The attempt fence does not help here: it fences the row against a competing WRITER, and this
   // race is between two OTHER readers of the row's status — the batch recreators and the order
   // delete guard — which is why the type gate survives o3d-e2mz.
-  assert.equal(isSettleableAccountingSyncType(`${DAILY_BATCH_SYNC_TYPE_PREFIX}GROUP_B`), false)
-  assert.equal(isSettleableAccountingSyncType('SALES_INVOICE'), true)
+  assert.equal(isDailyBatchSyncType(`${DAILY_BATCH_SYNC_TYPE_PREFIX}GROUP_B`), true)
+  assert.equal(isDailyBatchSyncType('SALES_INVOICE'), false)
+  assert.deepEqual(settleableSettlementOutcomes('DAILY_BATCH_GROUP_B'), ['POSTED'])
+  assert.deepEqual(settleableSettlementOutcomes('SALES_INVOICE'), ['POSTED', 'NOT_POSTED'])
   for (const status of ['FAILED', 'PROCESSING']) {
     const refusal = refuseSettlement(row({ status, type: 'DAILY_BATCH_GROUP_B' }), NOT_POSTED)
     assert.equal(refusal?.code, 'daily_batch_not_settleable', status)
     assert.match(refusal?.message ?? '', /journal that still contains that order's value/)
   }
+})
+
+test('o3d-jit6 r1#3: DAILY_BATCH_* ADMITS the POSTED assertion — it is the only exit such a row has', () => {
+  // CODEX ROUND 1, FINDING 3. The whole argument for refusing the family is an argument about
+  // CANCELLED: it reads as "never posted" to the batch recreators and to the order delete guard.
+  // SYNCED reads as "posted" to both, so recording the journal's id blocks the duplicate recreate and
+  // keeps the staged orders protected — it is strictly safer than leaving the row where it was.
+  //
+  // And leaving it where it was is not neutral. o3d-jit6's dispatch fence refuses a batch journal
+  // whose create is on record with no id; a FAILED batch row is revived to PENDING by
+  // `resetFailedDailyBatchLogs` every daily run, so with no POSTED settlement it refuses, fails and
+  // revives for ever while blocking its own batch's recreate. That is a refusal with no remedy.
+  for (const status of ['FAILED', 'PROCESSING']) {
+    assert.equal(
+      refuseSettlement(row({ status, type: 'DAILY_BATCH_GROUP_B' }), { outcome: 'POSTED', externalTransactionId: 'MJ-1' }),
+      null,
+      status,
+    )
+  }
+  // The other gates still apply to it exactly as they do to any row.
+  assert.equal(
+    refuseSettlement(row({ status: 'FAILED', type: 'DAILY_BATCH_GROUP_B' }), { outcome: 'POSTED', externalTransactionId: '  ' })?.code,
+    'missing_external_id',
+  )
+  assert.equal(
+    refuseSettlement(row({ status: 'PENDING', type: 'DAILY_BATCH_GROUP_B' }), { outcome: 'POSTED', externalTransactionId: 'MJ-1' })?.code,
+    'pending_not_settleable',
+  )
 })
 
 // ---------------------------------------------------------------------------
@@ -290,13 +321,26 @@ test('a row with no attempt is disabled WITH the reason, not silently omitted', 
   assert.equal(unfenced.settlementCaveat, null)
 })
 
-test('a DAILY_BATCH row is refused on its type BEFORE its attempt — it can never be settled at any revision', () => {
-  // Order matters: telling an operator to wait for an attempt on a row that can never be settled
-  // would be a false promise.
-  const batch = describeSyncRowSettleability({ status: 'FAILED', type: 'DAILY_BATCH_GROUP_B', attemptRevision: 0 })
-  assert.equal(batch.settleable, false)
-  assert.match(batch.notSettleableReason ?? '', /DAILY BATCH row and cannot be settled by hand at any attempt/)
-  assert.doesNotMatch(batch.notSettleableReason ?? '', /carries no attempt revision/)
+test('o3d-jit6 r1#3: a DAILY_BATCH row is offered the control NARROWED to POSTED, with the reason said out loud', () => {
+  // The type no longer removes the control; it removes one of its two buttons and explains why. An
+  // affordance that silently offered "It did NOT post" and then had the server refuse it would be the
+  // dead end the settlement action was built to remove.
+  const batch = describeSyncRowSettleability({ status: 'FAILED', type: 'DAILY_BATCH_GROUP_B', attemptRevision: 4 })
+  assert.equal(batch.settleable, true)
+  assert.equal(batch.notSettleableReason, null)
+  assert.deepEqual(batch.settleableOutcomes, ['POSTED'])
+  assert.match(batch.settlementCaveat ?? '', /cannot be settled as NOT POSTED/)
+  assert.match(batch.settlementCaveat ?? '', /settle it POSTED with the journal id/)
+
+  // An ordinary row keeps both, and says nothing about batches.
+  const ordinary = describeSyncRowSettleability({ status: 'FAILED', type: 'SALES_INVOICE', attemptRevision: 4 })
+  assert.deepEqual(ordinary.settleableOutcomes, ['POSTED', 'NOT_POSTED'])
+  assert.doesNotMatch(ordinary.settlementCaveat ?? '', /DAILY BATCH/)
+
+  // The STATUS gate still outranks it: a PENDING batch row has sent nothing to assert about.
+  const pending = describeSyncRowSettleability({ status: 'PENDING', type: 'DAILY_BATCH_GROUP_B', attemptRevision: 4 })
+  assert.equal(pending.settleable, false)
+  assert.match(pending.notSettleableReason ?? '', /nothing has been sent/)
 })
 
 test('a status that admits no assertion says so on the status, not the attempt', () => {
@@ -445,13 +489,15 @@ test('a revision-0 row on the ACTIVE connector is still refused — and told the
   assert.match(s.notSettleableReason ?? '', /retry the row, and settle it once it shows an attempt/)
 })
 
-test('adoption never overrides the TYPE gate — a DAILY_BATCH row is unsettleable at any revision', () => {
+test('adoption carries the TYPE narrowing with it — an adopted DAILY_BATCH row is still POSTED-only', () => {
   const s = describeSyncRowSettleability({
     status: 'FAILED', type: 'DAILY_BATCH_GROUP_B', attemptRevision: 0, unclaimable: true, connector: 'quickbooks',
   })
-  assert.equal(s.settleable, false)
-  assert.equal(s.requiresAttemptAdoption, false)
-  assert.match(s.notSettleableReason ?? '', /DAILY BATCH row/)
+  assert.equal(s.settleable, true)
+  assert.equal(s.requiresAttemptAdoption, true)
+  assert.deepEqual(s.settleableOutcomes, ['POSTED'])
+  assert.match(s.settlementCaveat ?? '', /cannot be settled as NOT POSTED/)
+  assert.match(s.settlementCaveat ?? '', /MINTS one/, 'and the adoption is still said out loud')
 })
 
 test('adoption never overrides the STATUS gate — a PENDING stranded row is still the sweeps\' work', () => {

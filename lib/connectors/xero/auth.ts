@@ -14,6 +14,7 @@ import { decryptSecret, encryptSecret, hasEncryptionKey, isEncryptedValue } from
 import { deserializeSettingValue, getSettingValue, serializeSettingValue } from '@/lib/settings-store'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { connectorFetch } from '@/lib/security/connector-fetch'
+import { orderedAccountingBindingWrites, runOrderedAccountingBindingWrites } from '@/lib/connectors/accounting-binding-lock-order'
 import { clearXeroReferenceCache } from './api'
 import { parseGrantedScopes, scopesFromTokenResponse, XERO_SCOPE_STRING } from './scopes'
 import {
@@ -402,50 +403,64 @@ async function bindXeroTenant(params: {
 
   try {
     await db.$transaction(async (tx) => {
-      const existing = await tx.setting.findUnique({ where: { key: XERO_EXPECTED_TENANT_KEY } })
-      if (existing) {
-        const pinned = deserializeSettingValue(XERO_EXPECTED_TENANT_KEY, existing.value)
-        if (pinned !== token.tenantId) throw new XeroBindingRace(pinned)
-        await tx.setting.update({ where: { key: XERO_EXPECTED_TENANT_KEY }, data: { value: pinValue } })
-      } else {
-        // The arbiter. Not an upsert: an upsert is exactly the check-then-write this must not be.
-        //
-        // The P2002 is caught HERE rather than around the whole transaction. The token upsert below has
-        // unique constraints of its own, and a duplicate-key error from that statement means something
-        // entirely different; treating any P2002 in this block as "another callback won the race" would
-        // report the wrong cause with a remedy that does not fit it.
-        try {
-          await tx.setting.create({ data: { key: XERO_EXPECTED_TENANT_KEY, value: pinValue } })
-        } catch (error) {
-          if (!isUniqueViolation(error)) throw error
-          throw new XeroBindingRace(null)
-        }
-      }
-      // A fresh generation, minted inside the transaction that establishes the binding. This is what
-      // makes "the connection a refresh belongs to" a thing the database can compare, rather than
-      // something only the tenant id stands in for — and it changes on the update path as well as the
-      // insert path, because a re-consent to the same organisation is a new connection too (r5).
-      // ...and no release: a binding writes a pin, so whatever release was outstanding is over. It is
-      // cleared HERE, in the transaction that writes the pin, rather than by the recovery script, so the
-      // exemption lasts exactly as long as the state it describes (r6).
-      const data = storedTokenRow(token, {
-        connectionGeneration: newConnectionGeneration(),
-        pinReleasedAt: null,
-        pinReleasedGeneration: null,
-        pinReleasedTenantId: null,
+      // THE THREE ACQUISITIONS, THROUGH THE ONE ORDERING (o3d-2w2j). This transaction is interactive
+      // — it reads, branches and throws between its writes — so the steps are thunks and the runner
+      // awaits them in `ACCOUNTING_BINDING_ROW_ORDER`. The pin step must still be the one that throws
+      // `XeroBindingRace`, and it is: the runner awaits each step, so a rejection from the pin
+      // propagates out of the transaction with the token row never having been touched, which is what
+      // lets the refusal say "nothing was stored" truthfully.
+      await runOrderedAccountingBindingWrites({
+        pin: async () => {
+          const existing = await tx.setting.findUnique({ where: { key: XERO_EXPECTED_TENANT_KEY } })
+          if (existing) {
+            const pinned = deserializeSettingValue(XERO_EXPECTED_TENANT_KEY, existing.value)
+            if (pinned !== token.tenantId) throw new XeroBindingRace(pinned)
+            await tx.setting.update({ where: { key: XERO_EXPECTED_TENANT_KEY }, data: { value: pinValue } })
+          } else {
+            // The arbiter. Not an upsert: an upsert is exactly the check-then-write this must not be.
+            //
+            // The P2002 is caught HERE rather than around the whole transaction. The token upsert below has
+            // unique constraints of its own, and a duplicate-key error from that statement means something
+            // entirely different; treating any P2002 in this block as "another callback won the race" would
+            // report the wrong cause with a remedy that does not fit it.
+            try {
+              await tx.setting.create({ data: { key: XERO_EXPECTED_TENANT_KEY, value: pinValue } })
+            } catch (error) {
+              if (!isUniqueViolation(error)) throw error
+              throw new XeroBindingRace(null)
+            }
+          }
+        },
+        token: async () => {
+          // A fresh generation, minted inside the transaction that establishes the binding. This is what
+          // makes "the connection a refresh belongs to" a thing the database can compare, rather than
+          // something only the tenant id stands in for — and it changes on the update path as well as the
+          // insert path, because a re-consent to the same organisation is a new connection too (r5).
+          // ...and no release: a binding writes a pin, so whatever release was outstanding is over. It is
+          // cleared HERE, in the transaction that writes the pin, rather than by the recovery script, so the
+          // exemption lasts exactly as long as the state it describes (r6).
+          const data = storedTokenRow(token, {
+            connectionGeneration: newConnectionGeneration(),
+            pinReleasedAt: null,
+            pinReleasedGeneration: null,
+            pinReleasedTenantId: null,
+          })
+          await tx.accountingToken.upsert({ where: { connector: XERO_CONNECTOR }, create: data, update: data })
+        },
+        witness: async () => {
+          // ...and the witness in `settings` goes with the receipt it corroborates, inside the same
+          // transaction (r8). Both halves of a release are written together and cleared together; a writer
+          // that cleared only one would leave the other to be read as evidence about a state that has ended,
+          // which is the whole shape of r7 and r8.
+          //
+          // Since r9 this is no longer the only thing keeping that true, and it was never enough on its
+          // own: the `setting.create`/`update` above ALSO fires the trigger that consumes the release
+          // (20260819210000), because r7's "the receipt is consumed by the next binding" was a promise
+          // about the pin that only this writer was keeping. Both statements are kept — this one is what a
+          // reader of the binding sees, and they are idempotent with each other.
+          await tx.setting.deleteMany({ where: { key: XERO_PIN_RELEASE_WITNESS_KEY } })
+        },
       })
-      await tx.accountingToken.upsert({ where: { connector: XERO_CONNECTOR }, create: data, update: data })
-      // ...and the witness in `settings` goes with the receipt it corroborates, inside the same
-      // transaction (r8). Both halves of a release are written together and cleared together; a writer
-      // that cleared only one would leave the other to be read as evidence about a state that has ended,
-      // which is the whole shape of r7 and r8.
-      //
-      // Since r9 this is no longer the only thing keeping that true, and it was never enough on its
-      // own: the `setting.create`/`update` above ALSO fires the trigger that consumes the release
-      // (20260819210000), because r7's "the receipt is consumed by the next binding" was a promise
-      // about the pin that only this writer was keeping. Both statements are kept — this one is what a
-      // reader of the binding sees, and they are idempotent with each other.
-      await tx.setting.deleteMany({ where: { key: XERO_PIN_RELEASE_WITNESS_KEY } })
     })
     return { ok: true }
   } catch (error) {
@@ -1086,23 +1101,38 @@ export async function refreshToken(): Promise<{ accessToken: string; tenantId: s
  * `xeroMissingPinRefusal` reads it as. Splitting these two statements would make a deleted pin
  * indistinguishable from an interrupted disconnect and re-open the hole from inside IMS.
  *
- * AND THE ORDER INSIDE IT IS THE PIN WRITERS' ORDER (o3d-2w2j): pin, then token row, then witness. Every
- * other writer of both halves of a binding already acquires them that way — `bindXeroTenant` above,
- * `xeroPinEstablishmentStatements`, the provisioner's `clearTenantPin`, and `resetDatabase`, which
- * documents its own pin-before-token ordering under o3d-9tbz r7. This function used to take the token
- * row FIRST, which is a lock-ordering inversion: a disconnect and a concurrent consent each held the row
- * the other needed next, and Postgres resolves that by killing one of them as a deadlock. Nothing about
- * the pin/receipt/witness logic depended on the old order — atomicity is what this transaction is for —
- * but the auth path is what an operator reaches for when they are already mid-incident, so it is the
- * last place to leave a liveness hazard. ONE canonical order everywhere; this was the only exception.
+ * AND THE ORDER INSIDE IT IS NOT DECIDED HERE AT ALL (o3d-2w2j). It comes from
+ * `orderedAccountingBindingWrites`, which is the one place the canonical order — pin, token row,
+ * witness — is written down, and which every writer of more than one binding row now calls:
+ * `bindXeroTenant` above, this function, `xeroPinEstablishmentStatements` for the raw-SQL writers, and
+ * the QuickBooks disconnect. This function used to take the token row FIRST, which is a lock-ordering
+ * inversion: a disconnect and a concurrent consent each held the row the other needed next, and
+ * Postgres resolves that by killing one of them as a deadlock. Nothing about the pin/receipt/witness
+ * logic depended on the old order — atomicity is what this transaction is for — but the auth path is
+ * what an operator reaches for when they are already mid-incident, so it is the last place to leave a
+ * liveness hazard.
+ *
+ * The FIRST fix reordered the statements and left a comment asking the next writer to remember. Two
+ * writers had already failed to remember (this one, and QuickBooks', which took its token row before
+ * its realm pin), which is why the order now lives in a function that returns the statements in it
+ * rather than in prose beside them. `resetDatabase` is the one writer that stays hand-ordered, and
+ * deliberately: it deletes whole TABLES rather than the named rows of one binding, so there is nothing
+ * for this helper to key on — it has its own argument under o3d-9tbz r7 and its own test.
  */
 export async function disconnect(): Promise<void> {
   await db.$transaction([
-    db.setting.deleteMany({ where: { key: XERO_EXPECTED_TENANT_KEY } }),
-    db.accountingToken.deleteMany({ where: { connector: XERO_CONNECTOR } }),
-    // The release witness goes with them (r8): a disconnect ends the binding, and a witness left behind
-    // would be a half-receipt waiting for a token row to corroborate. Last, as in every other writer.
-    db.setting.deleteMany({ where: { key: XERO_PIN_RELEASE_WITNESS_KEY } }),
+    // ORDERED BY THE HELPER, NOT BY THE ORDER THEY ARE WRITTEN HERE (o3d-2w2j). Prisma promises are
+    // lazy, so nothing has run when this object is built and the array `$transaction` receives is the
+    // canonical sequence whatever order the properties are spelt in. That is the difference between a
+    // rule and a habit: a future editor who moves these lines around cannot change the acquisition
+    // order, because they are not what decides it.
+    ...orderedAccountingBindingWrites({
+      pin: db.setting.deleteMany({ where: { key: XERO_EXPECTED_TENANT_KEY } }),
+      token: db.accountingToken.deleteMany({ where: { connector: XERO_CONNECTOR } }),
+      // The release witness goes with them (r8): a disconnect ends the binding, and a witness left
+      // behind would be a half-receipt waiting for a token row to corroborate.
+      witness: db.setting.deleteMany({ where: { key: XERO_PIN_RELEASE_WITNESS_KEY } }),
+    }),
     db.customer.updateMany({
       where: { accountingContactId: { not: null } },
       data: { accountingContactId: null, accountingContactProvenance: null },

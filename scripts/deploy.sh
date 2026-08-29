@@ -3057,6 +3057,31 @@ if ! $SKIP_MIGRATE; then
   # stopped, and removing a drop-in changes no running process's environment.
   $DRY_RUN || remove_db_identity_snapshot
   require_fenceable_database
+elif [[ "$SKIP_MIGRATE_FLAG" != "--restart-only" ]]; then
+  # o3d-1izw, carried over from the pre-cutover deploy.sh. --skip-migrate applies nothing and
+  # validates nothing, which is how a build reaches an environment whose database does not have
+  # the push states it writes. The narrow check below is cheap enough to run on every such deploy
+  # and refuses rather than shipping code whose first lapsed create claim fails at the database
+  # and keeps failing on every sweep after.
+  #
+  # --restart-only is deliberately exempt: it delivers no new code, so it cannot introduce this
+  # mismatch, and an emergency bounce must not be blocked by a database read. The running build is
+  # covered by the sweep own preflight gate, which refuses before it writes anything.
+  #
+  # IT MOVED INTO validate, AND THAT IS THE SAME INTENT HONOURED BETTER. The old script ran it
+  # where its migrate step would have been; this one has a phase whose whole contract is that
+  # everything able to reject a release rejects it while the predecessor is still up. A
+  # --skip-migrate run stops the predecessor a few phases below, so refusing here costs nothing
+  # where refusing later costs an outage. It is still read-only, still one SELECT over pg_catalog,
+  # and it still runs on exactly the --skip-migrate-but-not---restart-only path.
+  info "Skipping migrations - verifying the database can hold what this build writes..."
+  if $DRY_RUN; then
+    echo -e "${YELLOW}[DRY]${RESET}   would run: node scripts/check-wms-push-state-enum.mjs  (as ${APP_USER})"
+  else
+    as_app_user_db node scripts/check-wms-push-state-enum.mjs \
+      || die "This database does not have the WMS push-state vocabulary this build writes, and ${SKIP_MIGRATE_FLAG} applies no migration that would give it one. Re-run without ${SKIP_MIGRATE_FLAG} (add --skip-build if the build on disk is the one you want). Nothing has been stopped."
+    ok "WMS push-state vocabulary present."
+  fi
 fi
 ok "Artefact validated."
 

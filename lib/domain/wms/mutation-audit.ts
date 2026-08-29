@@ -158,6 +158,10 @@ export const WMS_MUTATION_ACTIONS = [
   'order_hold',
   'order_release',
   'order_update',
+  /// o3d-92fu: a purely LOCAL payload-validation verdict. Not order_create — no remote
+  /// call is made on this path, and an operator filtering for create attempts must not be
+  /// shown one that never happened.
+  'order_validate',
   'product_upsert',
   'return_inbox',
 ] as const

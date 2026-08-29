@@ -19,20 +19,25 @@ import { logActivity, logActivityInTransaction, logActivityPersisted, redactActi
 import { pushSalesInvoice, updateSalesInvoice, type BeforeRemoteWrite } from './invoices'
 import { pushPurchaseBill, updatePurchaseBill } from './bills'
 import { allocatePurchaseCreditNote, pushCreditNote, pushPurchaseCreditNote } from './credit-notes'
-import { pushManualJournal } from './journals'
+import { prepareManualJournal, postPreparedManualJournal } from './journals'
 import { getGrantedScopes } from './auth'
 import { blockingScopeFor, scopeBlockedError } from './scopes'
 import {
   carryAccountingOriginRecord,
+  carryAccountingOriginRecordFrom,
+  mintAccountingConnectionProvenanceColumn,
   readAccountingPayloadConnectionStamp,
   type AccountingConnectionStamp,
+  type AccountingOriginRecord,
 } from '@/lib/connectors/accounting-connection-provenance'
 import { withAccountingPostingIntent } from '@/lib/connectors/accounting-posting-intent'
 import { xeroUploadAttachment, xeroPost } from './api'
 import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import { retireSalesInvoiceForCancelledOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
-import { readClaimedSyncLogPayload } from '@/lib/domain/accounting/claimed-sync-payload'
+import { readClaimedSyncLogOriginRecord } from '@/lib/domain/accounting/claimed-sync-payload'
+import { CREATE_DISPATCH_REPLAY_MARGIN_MS, decideCreateDispatchRelease, describeCreateDispatchNotSent, planCreateDispatch, readCreateDispatchAge, type CreateDispatchAge, type CreateDispatchFenceWrite } from '@/lib/domain/accounting/create-dispatch-record'
+import { XERO_IDEMPOTENCY_KEY_RETENTION_MS } from '@/lib/domain/accounting/idempotency-retention'
 import { decideInvoiceNumberPost, xeroInvoiceNumberIdentity } from '@/lib/domain/accounting/invoice-number-ownership'
 import { lookupXeroInvoiceNumberClaim } from './invoice-number-claim'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
@@ -41,10 +46,12 @@ import {
   BACK_REFERENCE_REPAIRABLE_STATUSES,
   applyBackReference,
   backReferenceIsMissing,
-  followUpObligationClaim,
+  claimFollowUpObligation,
+  followUpObligationRecoveryNote,
   releaseFollowUpObligation,
   syncTypeWritesBackReference,
 } from '@/lib/domain/accounting/back-reference'
+import { followUpObligationRecoveryFor } from '@/lib/domain/accounting/follow-up-obligation-registry'
 import { stampSyncedAtFromDatabaseClock } from './synced-at-clock'
 import { claimHeldFrom, heldClaimWhere, releaseClaimForRetry, type HeldClaim } from '@/lib/domain/accounting/sync-claim-fence'
 import {
@@ -78,7 +85,7 @@ import { moneyPostDateToSend, settlementMarkerFor } from '@/lib/domain/accountin
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 import {
   buildCompactedFollowUpLossActivity,
-  isCompactedFollowUpEvidence,
+  compactionDiscardedFollowUps,
 } from '@/lib/domain/accounting/compacted-followup-loss'
 import {
   guardInvoicePaymentCapacity,
@@ -156,6 +163,26 @@ class CompactedFollowUpLossUnrecorded extends Error {}
  * r4 finding 1: it runs AFTER `enqueueFollowUps`, not before. Throwing from here is how the release
  * is withheld, and putting it first made that throw withhold the ENQUEUE as well — including the
  * follow-ups that survive compaction and would have gone out fine. The gate is on the release only.
+ *
+ * o3d-bqw7 / o3d-kemx — AND THE STAMP IS NOT THE LOSS. r4 warned whenever the compaction stamp was
+ * set, which says the payload was thrown away; the warning claims the row's outstanding follow-ups
+ * can no longer be enqueued. Those are different facts, and the module header above says so: some
+ * follow-ups are rebuilt from columns compaction KEEPS, and some types owe none at all — a
+ * `CREDIT_NOTE` tombstone was warned about on every pass while having nothing to lose.
+ *
+ * Two costs, and the second is the one that moves work rather than noise. Because this announcement
+ * gates the RELEASE, a warning that is both FALSE and unwritable holds an already-posted row at
+ * PENDING and re-drives it every pass, for ever. So the guard is now `compactionDiscardedFollowUps`,
+ * which answers per type from an exhaustive table — see compacted-followup-loss.ts for why it fails
+ * towards WARNING on a type it does not recognise.
+ *
+ * r2 (Codex HIGH) — AND A TYPE IS STILL COARSER THAN THE TRUTH. A SALES_INVOICE owes a payment
+ * registration only when its payload carried `_registerPayment`, and the ordinary sales path composes
+ * payloads without it, so a type-level answer went on warning about tombstones that lost nothing. The
+ * guard now reads the row's OWN record of what it owed, written by retention's compaction in the same
+ * statement that emptied the payload it was derived from; a row compacted before that record existed
+ * has none and keeps the over-broad type answer, for ever, because the payload it would have to be
+ * derived from is exactly what was thrown away.
  */
 async function announceCompactedFollowUpLoss(entry: {
   id: string
@@ -164,8 +191,14 @@ async function announceCompactedFollowUpLoss(entry: {
   referenceId: string
   externalTransactionId: string | null
   backReferenceEvidenceCompactedAt: Date | null
+  /**
+   * o3d-bqw7 r2: what this row RECORDED that it owed, written by the compaction that erased the
+   * payload it was owed from. NULL means no record — the classification falls back to the type table,
+   * which over-reports, which is the safe direction.
+   */
+  followUpObligations?: unknown
 }): Promise<void> {
-  if (!isCompactedFollowUpEvidence(entry)) return
+  if (compactionDiscardedFollowUps(entry).length === 0) return
   // logActivityPersisted, NOT logActivity: the release below is conditional on having warned, and
   // logActivity swallows its own write failures and resolves regardless — which is the same
   // "reported success, did nothing" shape as the empty enqueue this exists to catch.
@@ -327,7 +360,14 @@ export { claimHeldFrom, heldClaimWhere, type HeldClaim } from '@/lib/domain/acco
  * instead — in the same transaction, which is what `evidence` on the refusal variants is proof of.
  */
 export type PostedSyncRecord =
-  | { recorded: true }
+  /**
+   * `followUpObligation` is the marker GENERATION this write took (o3d-0bfh r4, Codex HIGH), and it
+   * is carried all the way down to the release. `null` means the claim did not land — a peer holds
+   * the obligation, or the database refused the claim statement — and a caller holding `null`
+   * releases NOTHING, which is the safe direction: the marker stays set and the next sweep
+   * re-enqueues idempotently.
+   */
+  | { recorded: true; followUpObligation: Date | null }
   | { recorded: false; reason: 'ANOTHER_DOCUMENT_NAMED'; namedExternalId: string | null; evidence: string }
   | { recorded: false; reason: 'ROW_MISSING'; evidence: string }
 
@@ -395,9 +435,11 @@ export async function recordPostedSyncResult(
       syncedAt: new Date(),
       errorMessage: null,
       processingStartedAt: null,
-      // Claimed IN this transaction, so the row can never be SYNCED-with-an-id and silent about the
-      // follow-ups it still owes (r10 finding 1).
-      ...followUpObligationClaim(),
+      // NO obligation claim in this statement any more (o3d-0bfh r4). It is claimed a few lines
+      // below, in THIS transaction — so the row still can never be SYNCED-with-an-id and silent
+      // about the follow-ups it owes (r10 finding 1) — but as a compare-and-set that READS the
+      // generation it is replacing and hands back the one it minted. A `data` fragment cannot read,
+      // and a claim that cannot read cannot be released exclusively: that was the whole defect.
     },
   })
   if (written.count === 0) {
@@ -425,6 +467,17 @@ export async function recordPostedSyncResult(
   // the provenance marker, so it trips the trigger that clears the marker; this statement then mints
   // the new pair. Swapped, the transaction would erase its own stamp.
   await stampSyncedAtFromDatabaseClock(tx, entry.id)
+  /**
+   * AND THE OBLIGATION IS CLAIMED HERE (o3d-0bfh r4, Codex HIGH), in this transaction and after the
+   * write above has taken the row's exclusive lock — which is what makes the read-then-CAS inside it
+   * unlosable and the generation it mints exclusive. See {@link claimFollowUpObligation}.
+   *
+   * AFTER the database-clock stamp as well, and that ordering is free rather than lucky: this
+   * statement touches only `backReferenceFollowUpsPendingAt`, and the provenance trigger fires on
+   * `status` / `syncedAt` / `externalTransactionId` / `processingStartedAt`. It cannot clear the
+   * stamp the line above just minted.
+   */
+  const obligation = await claimFollowUpObligation(tx, { syncLogId: entry.id, connector: XERO_CONNECTOR })
   await updateMirroredEventForSyncLog(tx, {
     syncLogId: entry.id,
     type: entry.type,
@@ -438,7 +491,7 @@ export async function recordPostedSyncResult(
     // an earlier write established alone rather than wiping it.
     ...(params.externalRevisionAt !== undefined ? { externalRevisionAt: params.externalRevisionAt } : {}),
   })
-  return { recorded: true }
+  return { recorded: true, followUpObligation: obligation.claimed ? obligation.generation : null }
 }
 
 /**
@@ -988,10 +1041,16 @@ export function isUniqueConstraintViolation(error: unknown): boolean {
  */
 type FollowUpOriginEvidence =
   /**
-   * The stored payload of the row whose post issued the ids in this follow-up. Its record is carried
-   * VERBATIM — including its absence, which then refuses.
+   * The COMPLETE DURABLE ORIGIN RECORD of the row whose post issued the ids in this follow-up — its
+   * payload, its `connectionProvenance` column and retention's `backReferenceEvidenceCompactedAt`.
+   * Carried VERBATIM where the payload speaks, including its absence, which then refuses.
+   *
+   * o3d-bqw7 r2 (Codex HIGH): the payload ALONE was not the record. Compaction writes `payload: {}`
+   * and keeps the column, so on a tombstone — precisely the rows this pipeline classifies as still
+   * having a REBUILDABLE invoice PDF — the payload said nothing, the follow-up was created unstamped,
+   * and it could never post. The classification was a claim the code did not honour.
    */
-  | { from: 'postedRow'; payload: unknown }
+  | { from: 'postedRow'; record: AccountingOriginRecord }
   /** Nothing in hand observed the origin. The row is created carrying no record, and cannot post. */
   | { from: 'unobserved' }
 
@@ -1081,10 +1140,11 @@ export async function enqueueFollowUpSyncLog(
   // So there is no read of the live connection on this path at all. A caller that took the post hands
   // over that row's payload and its record travels; a caller that did not hands over nothing and the row
   // is born with no record, which `accountingPayloadConnectionVerdict` refuses rather than assumes.
-  payload = carryAccountingOriginRecord(
-    payload,
-    origin.from === 'postedRow' ? origin.payload : undefined,
-  ) as SyncPayload
+  payload = (origin.from === 'postedRow'
+    // o3d-bqw7 r2: the COMPLETE record, so a retention tombstone hands on the organisation its
+    // durable column still names instead of handing on the silence its emptied payload holds.
+    ? carryAccountingOriginRecordFrom(payload, origin.record)
+    : carryAccountingOriginRecord(payload, undefined)) as SyncPayload
   // Fast-path check; the partial unique index (audit-42co) is the atomic backstop
   // for the check-then-create race between concurrent sync runs.
   const live = await hasExistingSyncLog(type, referenceType, referenceId, payload)
@@ -1292,6 +1352,12 @@ export async function enqueueFollowUpSyncLog(
           referenceType,
           referenceId,
           payload: plan.payload as never,
+          // o3d-dzip: the DURABLE half of the same origin record, minted from the stamp in the
+          // payload this statement is writing — which for a follow-up is the origin INHERITED from the
+          // row whose post issued these ids (carryAccountingOriginRecord above), never the connection
+          // that happens to be live now. A repair that witnessed nothing mints nothing, and that
+          // absence refuses.
+          connectionProvenance: mintAccountingConnectionProvenanceColumn(plan.payload),
           // o3d-0m56 r10: created INSIDE attempt-stamping custody. That is what later lets a revival
           // read this row's unset `remoteAttemptedAt` as proof no remote call ever left it — see
           // money-attempt-provenance.ts. A row created without it is never recycled again.
@@ -1323,7 +1389,7 @@ export async function enqueueFollowUpSyncLog(
           // asking again — asking again is what "look it up" would reintroduce.
           retry: () => enqueueFollowUpSyncLog(
             type, referenceType, referenceId, plan.payload,
-            { from: 'postedRow', payload: plan.payload }, attempt + 1,
+            { from: 'postedRow', record: { payload: plan.payload, connectionProvenance: null } }, attempt + 1,
           ),
       })
       return
@@ -1347,7 +1413,7 @@ export async function enqueueFollowUpSyncLog(
         attempt,
         retry: () => enqueueFollowUpSyncLog(
           type, referenceType, referenceId, plan.payload,
-          { from: 'postedRow', payload: plan.payload }, attempt + 1,
+          { from: 'postedRow', record: { payload: plan.payload, connectionProvenance: null } }, attempt + 1,
         ),
       })
       return
@@ -1956,14 +2022,38 @@ function accountingSyncLogClaimWhere(id: string, staleClaimCutoff: Date, observe
  */
 // Exported for tests/accounting/xero-claim-before-remote-write.test.ts: "we did not post" is the
 // outcome under test, and it is only observable at this seam.
-export async function renewClaimForRemoteWrite(entryId: string, held: HeldClaim): Promise<Date | null> {
+export async function renewClaimForRemoteWrite(
+  entryId: string,
+  held: HeldClaim,
+  /**
+   * o3d-jit6 (Codex r1 finding 2): the durable "a create for this row is on the wire" record, minted
+   * IN THIS STATEMENT rather than in one of its own.
+   *
+   * The record has to be committed before the request leaves, and the claim has to be the last thing
+   * proven before it — and those two requirements only fit together if they are the same write. A
+   * separate statement before the fence writes the marker on paths that then send nothing (the defect);
+   * a separate statement after it puts an await between proving the claim and using it (o3d-xl63
+   * r5 #1). One statement is both: the marker lands if and only if this worker still holds the row.
+   *
+   * Absent for every other remote mutation, which mint nothing.
+   */
+  write?: CreateDispatchFenceWrite,
+): Promise<Date | null> {
   const renewedAt = new Date()
   const renewed = await db.accountingSyncLog.updateMany({
     // The shared claim-identity fence (see heldClaimWhere), narrowed to this connector. `held` is
     // asked for its instant HERE, as the statement is built — so a renewal that has happened since
     // the caller obtained the claim is the instant this re-take fences on (o3d-xl63 r6).
     where: { ...heldClaimWhere(entryId, held), connector: XERO_CONNECTOR },
-    data: { processingStartedAt: renewedAt },
+    // `processingStartedAt` is this host's clock and `createDispatchedAt` is the DATABASE's, read by
+    // `planCreateDispatch` one statement ago. They are deliberately not the same instant: the claim is
+    // only ever compared against itself, while the dispatch instant is aged against `clock_timestamp()`
+    // by the next attempt, and mixing the two clocks there is the o3d-clxw defect.
+    // o3d-gvzu: `write` is the MINT on a first dispatch and the release CONSUMPTION on an attempt
+    // proceeding under a release. Both belong in this statement for the same reason — the fact and the
+    // claim proof must land together, or not at all — and the union means the fence can never be
+    // handed both at once.
+    data: write ? { processingStartedAt: renewedAt, ...write } : { processingStartedAt: renewedAt },
   })
   return renewed.count === 1 ? renewedAt : null
 }
@@ -2022,8 +2112,14 @@ export type RemoteWriteLease = HeldClaim & {
   heldFrom: () => Date
   /** Wall-clock instant past which no further remote mutation may BEGIN. Never moves. */
   deadlineAt: number
-  /** Re-take the claim immediately before a remote mutation, or refuse to make it. */
-  fenceBeforeRemoteWrite: (operation: string) => Promise<RemoteWriteFence>
+  /**
+   * Re-take the claim immediately before a remote mutation, or refuse to make it.
+   *
+   * `mintCreateDispatch` (o3d-jit6) makes the SAME statement record that a create is going out. It is
+   * written only on the path that actually reaches the socket, and it is written before it — see
+   * {@link renewClaimForRemoteWrite}.
+   */
+  fenceBeforeRemoteWrite: (operation: string, createDispatchWrite?: CreateDispatchFenceWrite) => Promise<RemoteWriteFence>
 }
 
 /**
@@ -2081,7 +2177,7 @@ export async function openRemoteWriteLease(
     entryId,
     heldFrom: () => heldFrom,
     deadlineAt,
-    async fenceBeforeRemoteWrite(operation: string): Promise<RemoteWriteFence> {
+    async fenceBeforeRemoteWrite(operation: string, createDispatchWrite?: CreateDispatchFenceWrite): Promise<RemoteWriteFence> {
       // The deadline is checked BEFORE the renewal, so an entry that has run out of lease does not
       // extend its own claim on the way to refusing. Nothing is sent either way.
       if (now() >= deadlineAt) {
@@ -2101,7 +2197,29 @@ export async function openRemoteWriteLease(
         return { ok: false, result: { success: false, error: message, notPosted: { reason: 'claim-lost', operation, message } } }
       }
 
-      const again = await renewClaimForRemoteWrite(entryId, claim)
+      // THE CLAIM PROOF AND THE DISPATCH RECORD, ONE STATEMENT (o3d-jit6, Codex r1 finding 2). Every
+      // gate that can refuse — the deadline, the outbox lock — has already refused above, without
+      // writing anything. From here the only outcomes are "this worker still owns the row, the record
+      // is committed, send" and "it does not, nothing was written, nothing is sent".
+      let again: Date | null
+      try {
+        again = await renewClaimForRemoteWrite(entryId, claim, createDispatchWrite)
+      } catch (error) {
+        // A create whose local record cannot be written is a create whose OUTCOME cannot be recorded
+        // either (o3d-k26m.5), so it is refused rather than sent unrecorded. Only the minting fence
+        // catches: without a record to write, a failed renewal is an ordinary error and belongs to the
+        // per-entry catch exactly as it did before.
+        // o3d-gvzu: the release CONSUMPTION fails closed for the same reason the mint does, and the
+        // reason is if anything sharper. A send that leaves without having spent the release leaves a
+        // permission standing over a request that may have landed — so the next attempt would post
+        // again on top of it. Both kinds of write are therefore covered by this branch.
+        if (!createDispatchWrite) throw error
+        const message = `Xero sync log ${entryId} was not posted: IMS could not record that a create `
+          + `(${operation}) was about to be dispatched — ${String(error)}. NOTHING WAS SENT, because a `
+          + 'create whose dispatch cannot be written down is one whose outcome cannot be written down '
+          + 'either, which is the state that produces a duplicate document.'
+        return { ok: false, result: { success: false, error: message, notPosted: { reason: 'dispatch-unrecorded', operation, message } } }
+      }
       if (!again) {
         const message = lostClaimMessage(entryId, operation)
         return { ok: false, result: { success: false, error: message, notPosted: { reason: 'claim-lost', operation, message } } }
@@ -2115,7 +2233,8 @@ export async function openRemoteWriteLease(
 // Exported for tests/accounting/xero-unrecorded-remote-write.test.ts: the give-up path is the one
 // that runs when the database is unreachable, so it has to be drivable without one.
 export type PostedDocumentPersistOutcome =
-  | { persisted: true }
+  /** o3d-0bfh r4: the obligation generation the persist took, carried down to the release that clears it. */
+  | { persisted: true; followUpObligation: Date | null }
   /**
    * THE POOL refused this attempt for the whole deadline (o3d-xl63 r3). The identifier has already
    * been reported on a channel that does not need a connection, and the caller must NOT touch the
@@ -2186,7 +2305,7 @@ export async function persistPostedXeroDocument(input: {
     // Not a pool problem and not this branch's to report: a newer claim posted its own document while
     // this attempt was on the wire, and o3d-550x has already made both identifiers durable.
     if (!record.recorded) return { persisted: false, reason: 'not-recorded', evidence: record.evidence }
-    return { persisted: true }
+    return { persisted: true, followUpObligation: record.followUpObligation }
   } catch (error) {
     // Only the pool's own give-up is handled here. Everything else — including the unwritten-evidence
     // throw o3d-550x raises when it cannot file a conflict — is left to the runner, untouched.
@@ -2363,7 +2482,18 @@ async function reportUnrecordedXeroWrite(input: {
   }
 }
 
-async function deferOutboxForRateLimit(
+/**
+ * Hand an outbox job back at an instant THIS CALLER chooses, without spending one of its attempts.
+ *
+ * The difference from {@link markXeroOutboxRetry} is the whole reason both exist, and r4 gives it a
+ * second caller so the name no longer says "rate limit". `markXeroOutboxRetry` is the FAILURE path:
+ * it counts the attempt against `MAX_RETRIES` and computes its own backoff, whose floor for the first
+ * retry is `DEFAULT_RETRY_BASE_DELAY_MS` = five minutes. That is right for a job that really failed
+ * and wrong for one that never ran — a rate-limit backoff must sit exactly as long as Xero asked, and
+ * an attempt that provably sent nothing must not be charged an attempt at all, nor deferred past the
+ * window inside which it can still be replayed safely.
+ */
+async function deferOutboxWithoutSpendingAnAttempt(
   client: Pick<Prisma.TransactionClient, 'integrationOutbox'>,
   job: IntegrationOutboxRow,
   error: string,
@@ -2386,6 +2516,801 @@ async function deferOutboxForRateLimit(
     },
   })
   if (released.count === 0) throw new Error(`Xero outbox job ${job.id} is not claimed by ${XERO_ACCOUNTING_WORKER_ID}`)
+}
+
+/**
+ * THE REFUSAL EVIDENCE, BUILT ONCE FOR BOTH RUNNERS AND BOTH WAYS OF WRITING IT (o3d-jit6 r5).
+ *
+ * This is the activity row a later refusal tells an operator to look for: on the `transport-refused`
+ * reason it is THE ONLY DURABLE TRACE that a create was recorded by the marker and then not sent, and
+ * `CREATE_DISPATCH_UNSETTLED_MEANING` names its `action` verbatim. So the wording and the metadata are
+ * produced here rather than spelt out at each call site — a transactional write and a best-effort one
+ * that described the same refusal differently would send that operator looking for the wrong row.
+ */
+function unsentPostEvidence(
+  entry: { id: string; type: string },
+  notPosted: NonNullable<EntryResult['notPosted']>,
+  outboxJobId?: string,
+  /**
+   * o3d-jit6 r8: THE DETERMINISTIC IDENTITY OF THE HAND-BACK THAT WROTE THIS ROW, on the one path
+   * that has one. It is what lets a retry whose COMMIT landed but whose acknowledgement was lost
+   * recognise its own committed work instead of reporting the row permanently stranded — see
+   * {@link unsentHandBackOperationId} and {@link findRecordedUnsentHandBack}.
+   */
+  handBackId?: string,
+) {
+  return {
+    entityType: 'SYSTEM' as const,
+    // o3d-jit6 r8: NAMED ON THE ROW, not only inside the metadata. This is the row an operator is
+    // sent to find, and it is the row the ambiguous-commit probe must look up cheaply — `entityType`
+    // + `entityId` is an index, a JSON scan of every activity row is not.
+    entityId: entry.id,
+    action: notPosted.reason === 'lease-expired'
+      ? 'xero_sync_lease_expired_before_post'
+      : notPosted.reason === 'dispatch-unrecorded'
+        ? 'xero_sync_dispatch_unrecorded_before_post'
+        // o3d-jit6 r3: THE ONLY DURABLE TRACE that a create was recorded and then not sent. The
+        // refusal a later attempt makes names this action and tells an operator to look for it
+        // before they go hunting in the ledger.
+        : notPosted.reason === 'transport-refused'
+          ? 'xero_sync_transport_refused_before_post'
+          : 'xero_sync_claim_lost_before_post',
+    tag: 'sync',
+    level: 'WARNING' as const,
+    description: notPosted.message,
+    metadata: {
+      syncLogId: entry.id,
+      type: entry.type,
+      ...(outboxJobId ? { outboxJobId } : {}),
+      operation: notPosted.operation,
+      reason: notPosted.reason,
+      ...(handBackId ? { handBackId } : {}),
+    },
+  }
+}
+
+/** The three tables one unsent-refusal hand-back touches, and nothing else. */
+type UnsentRefusalTransactionClient = Pick<Prisma.TransactionClient, 'activityLog' | 'accountingSyncLog' | 'integrationOutbox'>
+
+/**
+ * THE DETERMINISTIC NAME OF ONE HAND-BACK (o3d-jit6 r8, Codex MEDIUM).
+ *
+ * A retried transaction can COMMIT and still fail: the connection drops between the commit and its
+ * acknowledgement, and the caller sees only a rejection. Round 7 named that residual honestly and
+ * then paid its full price — the next attempt met an already-released row, aborted on the outbox
+ * fence, and the sequence reported the work PERMANENTLY STRANDED at an operator when it had in fact
+ * been handed back. A false alarm pointed at a human is not a cheaper failure than the one it
+ * replaces.
+ *
+ * So the hand-back carries an identifier it can recognise afterwards, and the identifier is derived
+ * rather than generated: the ROW, the exact CLAIM INSTANT the release is fenced on, and the ATTEMPT
+ * the operator-fence is taken against. Those three are precisely what make this hand-back the one it
+ * is, they are fixed for the whole retry sequence — no fence runs during it, so `heldFrom()` cannot
+ * move — and any OTHER sequence, on this row or another, necessarily differs in one of them. A
+ * random id would have to be threaded through and could not be re-derived by a later reader; a
+ * derived one is the same on every attempt by construction.
+ */
+export function unsentHandBackOperationId(entryId: string, lease: HeldClaim, attempt: AttemptRef): string {
+  return `${entryId}:${lease.heldFrom().toISOString()}:${attempt.attemptRevision}`
+}
+
+/**
+ * THE RECORD THAT THE FENCED RELEASE ACTUALLY RAN, AND WHAT IT MATCHED (o3d-jit6 r9, Codex MEDIUM).
+ *
+ * r8's probe looked for the EVIDENCE row and read it as proof that the whole hand-back landed. It is
+ * not. The evidence row is written FIRST — before the release — and the transaction deliberately
+ * commits even when the fenced release matches ZERO rows, because a refusal that really happened must
+ * not be rolled back on the grounds that somebody else now owns the row. That asymmetry stays. What
+ * it means is that "the named evidence row exists" and "the release ran" are different facts, and the
+ * probe was certifying the second from the first.
+ *
+ * So the release's own result is persisted, in the same transaction, on a row that carries the
+ * hand-back's deterministic name — written AFTER the release, so it cannot exist unless the release
+ * returned. The probe requires THAT row, and requires it to state a boolean: a hand-back is
+ * acknowledged as landed only by a record that says what the release matched.
+ *
+ * `false` is a perfectly good answer here and still means the hand-back committed. What is no longer
+ * possible is a hand-back certified by a record that never saw the release at all.
+ */
+export const UNSENT_HANDBACK_COMMIT_ACTION = 'xero_sync_transport_refusal_handback_committed'
+
+/** True only for a commit record that actually states what the fenced release matched. */
+export function unsentHandBackCommitProvesRelease(metadata: unknown): boolean {
+  return typeof (metadata as { released?: unknown } | null | undefined)?.released === 'boolean'
+}
+
+/**
+ * THE WHOLE HAND-BACK, AS ONE TRANSACTION BODY — SHARED BY BOTH RUNNERS (o3d-jit6 r5, Codex HIGH).
+ *
+ * WHAT ROUND 4 GOT RIGHT AND WHERE IT STOPPED, AGAIN. r4 established the ORDER: write the evidence
+ * first, release second, so no worker can meet the standing dispatch marker with the trace of why it
+ * stands already missing. That ordering is correct and it could not enforce itself, because the write
+ * it ordered was `logActivity` — which SWALLOWS ITS OWN FAILURES so that logging can never break its
+ * caller — and it sat OUTSIDE the transaction that released the row and requeued the job. So the
+ * release could commit while the ONLY DURABLE EVIDENCE OF THE REFUSAL was silently lost, and the
+ * invariant the ordering existed to buy did not hold at all:
+ *
+ *   • the row goes back to PENDING and another worker takes it;
+ *   • it meets `createDispatchedAt`/`createDispatchIdempotencyKey` still standing;
+ *   • past the window, `decideCreateDispatch` refuses and its message tells an operator to look for
+ *     `xero_sync_transport_refused_before_post` before they go hunting in the ledger;
+ *   • and that activity row is not there, because the write that would have made it failed into a
+ *     `console.error` nobody durably keeps.
+ *
+ * SO ALL THREE WRITES COMMIT TOGETHER. `logActivityInTransaction` applies the identical redaction and
+ * sanitisation as `logActivity` but writes through the caller's transaction and does NOT catch, so an
+ * unwritable record ABORTS the hand-back rather than letting it proceed silently. That is the same
+ * consequence o3d-batch-settle settled on for an operator's settlement assertion, and for the same
+ * reason: an audit record written best-effort BEFORE the thing it describes can vanish while the
+ * thing proceeds.
+ *
+ * ONE BODY, TWO CALLERS. The direct runner holds no outbox job, so it passes none and the requeue is
+ * simply absent; the queued runner passes the job and the requeue joins the same commit. Both halves
+ * of the queued pair were already required to be atomic (r4): a released row whose job stayed
+ * PROCESSING waits for the queue's own fifteen-minute stale-lock sweep — the very fifteen minutes the
+ * release exists to escape — and a requeued job whose row stayed PROCESSING is claimed by the next
+ * tick only to find the row unclaimable and skip it. The evidence is now the third member of that
+ * set, on the same reasoning.
+ *
+ * A ZERO-ROW RELEASE DOES NOT ABORT, and the asymmetry with the log failure is deliberate. `false`
+ * from the fenced release means a displaced owner, or an attempt an operator has since moved — the
+ * fence doing its job. The refusal it records still happened, it is still the row the marker's
+ * refusal points at, and rolling it back would delete the record of a real refusal on the grounds
+ * that somebody else now owns the row. The caller gets the flag so it can say so.
+ */
+/**
+ * RELEASE THE DISPATCH MARKER ON PROOF THAT NOTHING LEFT THE PROCESS (o3d-gvzu).
+ *
+ * The marker itself is untouched — it is write-once by database trigger, and it must stay that way,
+ * because it is a PROHIBITION and one that tampering clears hands the tamperer what they wanted. What
+ * this writes is the separate column beside it, which says the request the marker records never left.
+ *
+ * WHAT LICENSED IT IS DECIDED ELSEWHERE, and deliberately: the two facts that make a release provable
+ * — the transport's NAMED pre-egress refusal and the basis this attempt's dispatch was planned on —
+ * are only both in scope in the branch that made the post. By the time the hand-back runs, all that
+ * survives is the verdict it reached. This function does not re-derive it and could not: an error
+ * string is not evidence, and re-deciding from one here is the shape-matching this whole change exists
+ * to replace.
+ *
+ * FENCED LIKE EVERY OTHER NON-TERMINAL WRITE, and it must run BEFORE the claim is released: the fence
+ * requires the row to still be PROCESSING at this worker's claim instant, and the release flips it to
+ * PENDING in the same transaction.
+ *
+ *  • the held claim + the attempt revision — a displaced owner, or an attempt an operator has since
+ *    decided about, releases nothing;
+ *  • `createDispatchedAt: { not: null }` — a release with no marker to be about is meaningless, and
+ *    the database refuses one anyway;
+ *  • `createDispatchReleasedAt: null` — write-once per proof. A release already standing is not
+ *    re-stamped, so the instant on the row is the one belonging to the proof that first established
+ *    it.
+ *
+ * ZERO ROWS IS NOT AN ERROR: it is the fence doing its job, and the caller reports it. FAILING is —
+ * see the caller, where this shares the hand-back's all-or-nothing transaction.
+ *
+ * THE INSTANT IS THIS HOST'S CLOCK, AND THAT IS SAFE HERE ONLY BECAUSE OF WHAT READS IT. Unlike
+ * `createDispatchedAt`, which is aged against `clock_timestamp()` and therefore has to come from the
+ * database (o3d-clxw), this column is read by exactly one predicate — `releasedAt !== null` — and is
+ * never compared to another instant, never subtracted from one, and never ordered against anything. A
+ * future reader that wants to age it must take it from the database instead; there is no correct way
+ * to age this value.
+ */
+async function releaseCreateDispatchMarker(
+  client: Pick<Prisma.TransactionClient, 'accountingSyncLog'>,
+  entryId: string,
+  held: HeldClaim,
+  attempt: AttemptRef,
+  now: Date = new Date(),
+): Promise<boolean> {
+  const released = await client.accountingSyncLog.updateMany({
+    where: {
+      ...heldClaimWhere(entryId, held),
+      connector: XERO_CONNECTOR,
+      attemptRevision: attempt.attemptRevision,
+      createDispatchedAt: { not: null },
+      createDispatchReleasedAt: null,
+    },
+    data: { createDispatchReleasedAt: now },
+  })
+  return released.count > 0
+}
+
+export async function recordAndReleaseUnsentTransportRefusal(
+  tx: UnsentRefusalTransactionClient,
+  args: {
+    entry: { id: string; type: string }
+    notPosted: NonNullable<EntryResult['notPosted']>
+    /**
+     * THE LEASE, NOT the sweep's captured claim instant (o3d-xl63 r6's rule, load-bearing here of all
+     * places). `openRemoteWriteLease` renews `processingStartedAt` when it opens and again in the
+     * fence that mints the dispatch marker, so `claimHeldFrom(claimedAt)` from the top of the runner
+     * loop names an instant the row no longer carries. `releaseClaimForRetry` fences on the instant
+     * and fails CLOSED, so a release fenced on the stale one matches nothing, reports nothing, and
+     * leaves the row in PROCESSING exactly as round 3 did — an invisible no-op that looks like a fix.
+     */
+    lease: HeldClaim
+    attempt: AttemptRef
+    /** The queued runner's job. Absent on the direct runner, which owns no outbox row. */
+    job?: IntegrationOutboxRow | null
+  },
+): Promise<{ released: boolean }> {
+  const handBackId = unsentHandBackOperationId(args.entry.id, args.lease, args.attempt)
+  // EVIDENCE FIRST — inside the transaction, so the order is now belt as well as braces.
+  await logActivityInTransaction(tx, {
+    // o3d-jit6 r8: AND IT CARRIES THE HAND-BACK'S OWN NAME. The evidence row is the only member of
+    // this commit a later reader can identify unambiguously, so it is what makes the whole commit
+    // detectable to a retry whose acknowledgement went missing.
+    ...unsentPostEvidence(args.entry, args.notPosted, args.job?.id, handBackId),
+    // No session exists on either runner; both are cron-driven. `resolveUser: false` is the
+    // best-effort helper's way of saying this, and this one takes the answer directly.
+    userId: null,
+  })
+  // o3d-gvzu — AND THE MARKER'S RELEASE, WHEN THE POST PROVED NOTHING LEFT, BEFORE the claim goes
+  // back: the fence below flips the row to PENDING, and this one requires it to still be PROCESSING.
+  //
+  // IT SHARES THIS TRANSACTION, WHICH IS WHAT MAKES IT FAIL CLOSED. A release that cannot be written
+  // takes the whole hand-back with it: no evidence row, no claim release, no requeue, and
+  // `retryUnsentHandBack` retries and then reports the abort. The row is left exactly as the marker
+  // alone leaves it — refusing past the window, with a remedy — which is the state this change exists
+  // to escape but is emphatically the safe end to fail towards. The alternative, handing the row back
+  // while quietly failing to release it, would be a row that looks recovered and is not.
+  const markerReleased = args.notPosted.releaseCreateDispatch
+    ? await releaseCreateDispatchMarker(tx, args.entry.id, args.lease, args.attempt)
+    : null
+  const released = await releaseUnsentTransportRefusal(
+    tx, args.entry.id, args.lease, args.attempt, args.notPosted.message,
+  )
+  // AND NOT `markXeroOutboxRetry`: that one counts the attempt against MAX_RETRIES and its first
+  // backoff floor is five minutes, which would burn the replay window this is racing.
+  if (args.job) await deferOutboxWithoutSpendingAnAttempt(tx, args.job, args.notPosted.message, 0)
+  // AND LAST, WHAT THE FENCED RELEASE MATCHED — see UNSENT_HANDBACK_COMMIT_ACTION. Written after the
+  // release, so this row cannot exist unless the release returned; committed with everything else, so
+  // it cannot exist unless the whole hand-back landed. This, not the evidence row, is what the
+  // ambiguous-commit probe is allowed to read as proof.
+  await logActivityInTransaction(tx, {
+    entityType: 'SYSTEM',
+    entityId: args.entry.id,
+    action: UNSENT_HANDBACK_COMMIT_ACTION,
+    tag: 'sync',
+    level: 'INFO',
+    description: `[xero-sync] sync log ${args.entry.id}: the unsent-refusal hand-back committed — `
+      + `evidence written, fenced release matched ${released ? 'the row' : 'NOTHING (displaced owner '
+        + 'or a moved attempt; the refusal is still recorded)'}`
+      + `${markerReleased === null
+        ? ', no dispatch-marker release (the refusal did not prove the request failed to leave, or the '
+          + 'marker was not this attempt\'s)'
+        : markerReleased
+          ? ', DISPATCH MARKER RELEASED — a later attempt may send'
+          : ', dispatch-marker release matched nothing'}`
+      + `${args.job ? ', job requeued' : ''}.`,
+    metadata: {
+      syncLogId: args.entry.id,
+      type: args.entry.type,
+      ...(args.job?.id ? { outboxJobId: args.job.id } : {}),
+      operation: args.notPosted.operation,
+      reason: args.notPosted.reason,
+      handBackId,
+      released,
+      // o3d-gvzu: null when this refusal licensed no release at all (the ordinary case — a timeout, a
+      // reset, a 5xx, or a replay of somebody else's marker), true/false when it did and the fence
+      // did or did not match. Three distinguishable answers, because "no release was attempted" and
+      // "a release was attempted and matched nothing" are different things to read afterwards.
+      createDispatchReleased: markerReleased,
+      ...(args.notPosted.releaseCreateDispatch ?? {}),
+    },
+    userId: null,
+  })
+  return { released }
+}
+
+/**
+ * SAY THAT THE HAND-BACK ABORTED — because the alternative is the silence this round exists to end
+ * (o3d-jit6 r5, Codex HIGH).
+ *
+ * The refusal evidence and the hand-back now commit together, which means a database that cannot take
+ * the evidence takes neither: nothing is released, nothing is requeued, and the row waits for the
+ * stale-claim cutoff exactly as round 3 left it. That is the CORRECT outcome — an unwritable record
+ * must abort rather than let the release proceed without it — but an abort nobody hears is how the
+ * best-effort write failed in the first place.
+ *
+ * So it is reported twice, and the pair is deliberate. `console.error` survives the case where the
+ * database itself is refusing writes, which is precisely when the transaction is most likely to have
+ * rolled back. The best-effort activity row covers every other cause — a serialisation failure, a
+ * fence that matched no outbox job, a constraint — and is where an operator actually looks; it carries
+ * the original refusal wording, so in those cases the trace is not lost after all, only relabelled.
+ * Best-effort is right HERE and wrong inside the transaction: this write guards no state change, and a
+ * throw would spend a retry and FAIL a row that sent nothing.
+ */
+async function reportUnsentHandBackAborted(
+  entry: { id: string; type: string },
+  notPosted: NonNullable<EntryResult['notPosted']>,
+  error: unknown,
+  outboxJobId?: string,
+  exhaustion?: {
+    attempts: number
+    abandoned: UnsentHandBackAbandonment
+    /** r8: whether the wall-time bound was the marker's real one, or the fallback from entry. */
+    deadlineAnchor?: UnsentHandBackDeadline['anchor']
+  },
+): Promise<void> {
+  // o3d-jit6 r7: HOW HARD IT TRIED, AND WHAT THE ROW IS NOW. An operator meeting the marker's
+  // permanent refusal later needs both: that this was not one unlucky statement, and that the row
+  // itself is sitting in PROCESSING rather than waiting its turn in PENDING.
+  const tried = exhaustion
+    ? ` The complete hand-back was attempted ${exhaustion.attempts} time${exhaustion.attempts === 1 ? '' : 's'} `
+      + `and abandoned (${exhaustion.abandoned}).`
+    : ''
+  const stranded = ` THE ROW IS LEFT PROCESSING: no selector re-takes it for ${Math.round(CLAIM_STALE_MS / 60_000)} `
+    + 'minutes, which is past the replay window the standing dispatch marker allows, so the next attempt '
+    + 'will meet a permanent refusal for a create that was never sent and only an operator can resolve it. '
+    + 'That is the least-bad end: throwing here would spend a retry and mark FAILED a row that provably '
+    + 'sent nothing, and releasing without the evidence would let a worker meet the marker with no trace '
+    + 'of why it stands.'
+  // Only the transport-refusal path binds the evidence to the hand-back, so only it can have lost
+  // the evidence with it. Saying otherwise on the other three reasons would send an operator looking
+  // for a row that IS there.
+  const detail = notPosted.reason === 'transport-refused'
+    ? `[xero-sync] sync log ${entry.id} could not be handed back after a transport refusal, and the `
+      + `refusal evidence was NOT recorded either — they roll back together: ${String(error)}.${tried}${stranded}`
+    : `[xero-sync] sync log ${entry.id} could not be handed back after ${notPosted.reason}: ${String(error)}`
+  console.error(detail)
+  await logActivity({
+    entityType: 'SYSTEM',
+    action: 'xero_sync_transport_refusal_handback_aborted',
+    tag: 'sync',
+    // ERROR, not WARNING: the row is stranded in PROCESSING until the stale cutoff, by which time
+    // the dispatch marker's replay window has closed and only a human can resolve it.
+    level: 'ERROR',
+    description: `${detail} The refusal was: ${notPosted.message}`,
+    metadata: {
+      syncLogId: entry.id,
+      type: entry.type,
+      ...(outboxJobId ? { outboxJobId } : {}),
+      operation: notPosted.operation,
+      reason: notPosted.reason,
+      abortedBy: String(error),
+      ...(exhaustion
+        ? {
+          handBackAttempts: exhaustion.attempts,
+          abandoned: exhaustion.abandoned,
+          ...(exhaustion.deadlineAnchor ? { deadlineAnchor: exhaustion.deadlineAnchor } : {}),
+        }
+        : {}),
+    },
+    resolveUser: false,
+  })
+}
+
+/**
+ * BOUNDEDLY RETRY THE COMPLETE ATOMIC HAND-BACK, WHILE THE REPLAY WINDOW IS STILL OPEN
+ * (o3d-jit6 r7, Codex HIGH).
+ *
+ * WHAT ROUND 6 GOT RIGHT AND WHERE IT STOPPED. r6 made the evidence, the release and the requeue ONE
+ * transaction, and it chose deliberately NOT to throw the abort into the per-entry catch: that would
+ * spend a retry and mark FAILED a row that provably sent nothing, which is the very outcome
+ * `notPosted` exists to prevent. Both of those still hold and neither is traded away here.
+ *
+ * WHAT IT DID INSTEAD WAS GIVE UP AFTER ONE ATTEMPT. The catch reported best-effort and continued, so
+ * a transaction that aborted for a transient reason — a serialisation failure, a deadlock, a dropped
+ * connection — left the row PROCESSING at a freshly renewed `processingStartedAt`, unclaimable until
+ * the FIFTEEN-MINUTE stale cutoff, which is past the SIX-minute window in which a replay is provably
+ * not a second create. That is precisely the defect round 5 fixed, reached again through the abort
+ * path, and a transient abort is exactly the case that succeeds on a second attempt.
+ *
+ * SO THE WHOLE TRANSACTION IS RE-RUN, NOT PART OF IT. Retrying anything smaller would reintroduce the
+ * separation r5 closed. The body is atomic, so a failed attempt left nothing behind: re-running it
+ * writes the evidence, releases under the same lease fence and defers the same job, or rolls all
+ * three back again.
+ *
+ * AND THE SEQUENCE IS BOUNDED BY A DEADLINE, NOT BY A BUDGET IT GRANTS ITSELF AT ENTRY (r8, Codex
+ * HIGH). `UNSENT_HANDBACK_MAX_ATTEMPTS` still caps the attempts. The wall-time bound is now an
+ * ABSOLUTE INSTANT derived from `createDispatchedAt` — the marker's own DATABASE-clock stamp, which is
+ * when the replay window actually opened — so the time already spent between the mint and this
+ * hand-back is time the sequence does not get to spend a second time. r7 computed its budget at entry
+ * and then checked only the REQUESTED delay before sleeping, which bounded nothing it did not itself
+ * choose: a slow attempt, or a sleep that took longer than it asked for, carried the sequence past the
+ * very window it exists to protect while every check it made still passed. So the ELAPSED time is
+ * measured before EVERY attempt — which is also after every sleep — and what remains is passed DOWN
+ * into the attempt as its own transaction timeout, so an attempt cannot outlive the deadline either.
+ *
+ * THE FIRST ATTEMPT IS NEVER SKIPPED, however late the marker already is. Declining to try leaves the
+ * row PROCESSING for the full stale cutoff with no evidence written at all, which is strictly worse
+ * than a hand-back that lands late: the late one still records why the marker stands and still returns
+ * the row to PENDING, where the next tick can at least meet an honest refusal.
+ *
+ * AND AN AMBIGUOUS COMMIT IS NO LONGER REPORTED AS PERMANENT STRANDING (r8, Codex MEDIUM). r7 named
+ * this residual and then paid its full price: an attempt whose COMMIT succeeded and whose
+ * ACKNOWLEDGEMENT was lost had already written the evidence, released the row and requeued the job —
+ * and the sequence then re-ran, met the already-released row, threw on the outbox fence that no longer
+ * matched, and told an operator the work was permanently stranded. It was not stranded; it was done.
+ * A false alarm pointed at a human is not a cheaper failure than the one it replaces. So the hand-back
+ * carries a deterministic name ({@link unsentHandBackOperationId}) written into the evidence row, and
+ * a failed attempt ASKS THE DATABASE whether that name is already recorded. If it is, the hand-back
+ * happened: the sequence returns success, no second attempt duplicates the evidence, and nobody is
+ * sent looking for a row that is already back in the queue.
+ */
+export type UnsentHandBackAbandonment = 'attempts-exhausted' | 'budget-exhausted'
+
+export type UnsentHandBackOutcome =
+  /** The hand-back committed on this run, and `released` is what its fenced release matched. */
+  | { handedBack: true; released: boolean; attempts: number; alreadyRecorded: false }
+  /**
+   * The hand-back was found ALREADY RECORDED after an attempt failed ambiguously: an earlier attempt
+   * committed and its acknowledgement was lost. `released` is null because this run did not perform
+   * the release and must not claim to know what it matched — the commit that did is the authority.
+   */
+  | { handedBack: true; released: null; attempts: number; alreadyRecorded: true }
+  | { handedBack: false; attempts: number; error: unknown; abandoned: UnsentHandBackAbandonment }
+
+/** Attempts of the COMPLETE hand-back transaction, including the first. */
+export const UNSENT_HANDBACK_MAX_ATTEMPTS = 3
+/** The first pause between attempts; each subsequent one doubles. */
+export const UNSENT_HANDBACK_RETRY_BASE_DELAY_MS = 250
+/**
+ * The whole sequence's share of the window it is racing — a tenth of
+ * `XERO_IDEMPOTENCY_KEY_RETENTION_MS - CREATE_DISPATCH_REPLAY_MARGIN_MS`, derived rather than retyped
+ * so that shortening the window shortens this with it. The refusal happens within seconds of the
+ * mint, so spending at most a tenth of what remains cannot be what closes it.
+ *
+ * r8: this is a LENGTH, and the deadline it produces is measured FROM THE MARKER (see
+ * {@link unsentHandBackDeadline}), not from whenever the hand-back happened to start.
+ */
+export const UNSENT_HANDBACK_RETRY_BUDGET_MS =
+  Math.floor((XERO_IDEMPOTENCY_KEY_RETENTION_MS - CREATE_DISPATCH_REPLAY_MARGIN_MS) / 10)
+/**
+ * ACQUISITION AND EXECUTION HAVE SEPARATE MINIMA, BECAUSE THEY BUY DIFFERENT THINGS (o3d-jit6 r10,
+ * Codex HIGH).
+ *
+ * r8 wrote down ONE floor and meant it as a floor under EXECUTION: a transaction handed a timeout of
+ * a millisecond cannot write three rows, so an already-overrun deadline would turn the last
+ * permitted attempt into a guaranteed abort — a bound that manufactures the failure it is measuring.
+ * r9 then took the connection wait OUT of that same clamped value, so the floor case was left
+ * running the transaction in HALF the time the floor exists to guarantee it. Each change is right on
+ * its own; together they cancel.
+ *
+ * So the two are named separately and the attempt's floor is their SUM. That is what makes the split
+ * safe: whatever {@link unsentHandBackAttemptBounds} reserves for the wait, execution still ends up
+ * with at least `UNSENT_HANDBACK_MIN_EXECUTION_MS`.
+ */
+export const UNSENT_HANDBACK_MIN_EXECUTION_MS = 1_000
+/**
+ * The floor under the connection wait. A `maxWait` of a millisecond fails an attempt against a pool
+ * that would have handed it a connection immediately, so the reservation is never squeezed below
+ * this — a self-inflicted abort is not cheaper than a short wait.
+ */
+export const UNSENT_HANDBACK_MIN_ACQUISITION_MS = 250
+/**
+ * The floor under a single attempt's own bound: the two minima TOGETHER, so that an attempt clamped
+ * to the floor can still wait for a connection AND run its transaction for as long as each of those
+ * actually needs. Clamping to the execution minimum alone — r8's figure — is what r9's split then
+ * halved.
+ */
+export const UNSENT_HANDBACK_MIN_ATTEMPT_MS =
+  UNSENT_HANDBACK_MIN_EXECUTION_MS + UNSENT_HANDBACK_MIN_ACQUISITION_MS
+/** How long an attempt may wait for a connection before it counts as failed; never past its own bound. */
+export const UNSENT_HANDBACK_MAX_WAIT_MS = 2_000
+
+/**
+ * The instant past which no FURTHER attempt may begin, and what it is anchored to.
+ *
+ * `anchor` is reported rather than inferred: an operator reading an exhausted sequence needs to know
+ * whether the deadline was the real one (the marker's) or the fallback the code had to invent because
+ * the marker could not be read.
+ */
+export type UnsentHandBackDeadline = { atMs: number; anchor: 'dispatch-marker' | 'hand-back-entry' }
+
+/**
+ * ANCHOR THE DEADLINE ON THE MARKER'S OWN TIMESTAMP (r8, Codex HIGH).
+ *
+ * `age` is a DURATION measured entirely on the database's clock (see `readCreateDispatchAge`), so
+ * subtracting it from the budget converts "a tenth of the usable window" from a promise the sequence
+ * makes to itself into the deadline the row is actually under. `atMs` may already be in the past when
+ * the marker is old; the loop still makes its first attempt, because not handing the row back at all
+ * is the worse end.
+ */
+export function unsentHandBackDeadline(nowMs: number, age: CreateDispatchAge): UnsentHandBackDeadline {
+  if (!age.known) return { atMs: nowMs + UNSENT_HANDBACK_RETRY_BUDGET_MS, anchor: 'hand-back-entry' }
+  return { atMs: nowMs + (UNSENT_HANDBACK_RETRY_BUDGET_MS - age.elapsedMs), anchor: 'dispatch-marker' }
+}
+
+/**
+ * What one attempt may spend: the measured remainder, floored so it can work and capped by the budget.
+ *
+ * r10: the floor is `UNSENT_HANDBACK_MIN_ATTEMPT_MS`, which is acquisition's minimum PLUS execution's
+ * — clamped high enough that what {@link unsentHandBackAttemptBounds} reserves for the connection
+ * wait still leaves the transaction its own `UNSENT_HANDBACK_MIN_EXECUTION_MS` to run in.
+ */
+export function unsentHandBackAttemptBudgetMs(remainingMs: number): number {
+  return Math.min(Math.max(remainingMs, UNSENT_HANDBACK_MIN_ATTEMPT_MS), UNSENT_HANDBACK_RETRY_BUDGET_MS)
+}
+
+/**
+ * ONE REMAINDER, SPLIT — NEVER TWO BUDGETS THAT ADD UP (o3d-jit6 r9, Codex HIGH).
+ *
+ * r8 handed the attempt's whole budget down as the transaction's `timeout` and then let `maxWait`
+ * allow ANOTHER two seconds, independently, for getting a connection out of the pool. Those are
+ * consecutive, not concurrent: an attempt could wait its full acquisition and then execute for its
+ * full budget, and the sequence would leave the deadline the previous round installed behind it by up
+ * to `UNSENT_HANDBACK_MAX_WAIT_MS` per attempt — under pool exhaustion, which is exactly the
+ * condition that produces the long wait in the first place.
+ *
+ * So the acquisition is RESERVED OUT OF the attempt's budget rather than added to it: `maxWait +
+ * timeout` is the budget, exactly, whatever the budget is. The reservation is capped at
+ * `UNSENT_HANDBACK_MAX_WAIT_MS` so a large budget still gives execution nearly all of it.
+ *
+ * AND THE RESERVATION NEVER EATS THE EXECUTION MINIMUM (r10, Codex HIGH). r9's second cap was HALF
+ * the budget, which reads as generous and is the opposite: the budget is clamped UP to a floor
+ * precisely because the transaction needs that much time to RUN, so taking half of that floor for
+ * the connection wait handed the floor case half the execution the clamp was there to guarantee. The
+ * reservation is therefore capped at whatever sits ABOVE `UNSENT_HANDBACK_MIN_EXECUTION_MS`, never
+ * dropping below `UNSENT_HANDBACK_MIN_ACQUISITION_MS` — and because
+ * {@link unsentHandBackAttemptBudgetMs} clamps the total to the SUM of the two minima, the floor
+ * case now splits into exactly `MIN_ACQUISITION` for the wait and `MIN_EXECUTION` for the
+ * transaction, with the two still summing to the budget.
+ */
+export function unsentHandBackAttemptBounds(attemptBudgetMs: number): { maxWait: number; timeout: number } {
+  // What the wait may take without pushing execution under its own minimum — but never below the
+  // acquisition minimum, so a budget too small to satisfy both still leaves a usable wait.
+  const reservable = Math.max(
+    UNSENT_HANDBACK_MIN_ACQUISITION_MS,
+    attemptBudgetMs - UNSENT_HANDBACK_MIN_EXECUTION_MS,
+  )
+  // Also held under the budget itself, so the two halves still SUM to it exactly.
+  const maxWait = Math.max(1, Math.min(UNSENT_HANDBACK_MAX_WAIT_MS, reservable, attemptBudgetMs - 1))
+  return { maxWait, timeout: Math.max(1, attemptBudgetMs - maxWait) }
+}
+
+export async function retryUnsentHandBack(
+  /** Runs the COMPLETE hand-back transaction, bounded by the time it is given. */
+  run: (attemptBudgetMs: number) => Promise<{ released: boolean }>,
+  deps: {
+    sleep?: (ms: number) => Promise<void>
+    monotonicMs?: () => number
+    /** Defaults to a budget from entry — the r7 behaviour — only when no marker could be read. */
+    deadline?: UnsentHandBackDeadline
+    /** "Did an earlier attempt's hand-back already commit?" Defaults to "no idea", i.e. no. */
+    recordedHandBack?: () => Promise<boolean>
+  } = {},
+): Promise<UnsentHandBackOutcome> {
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
+  const monotonicMs = deps.monotonicMs ?? (() => Date.now())
+  const deadlineAtMs = deps.deadline?.atMs ?? monotonicMs() + UNSENT_HANDBACK_RETRY_BUDGET_MS
+  const recordedHandBack = deps.recordedHandBack ?? (async () => false)
+  let attempts = 0
+  let lastError: unknown = undefined
+  for (;;) {
+    // MEASURED, NOT REQUESTED, AND CHECKED HERE — which is before every attempt AND after every
+    // sleep. r7 checked only the delay it was about to ask for, so an attempt that overran its share
+    // of the budget, or a pause that slept longer than it requested, was never noticed at all.
+    const remainingMs = deadlineAtMs - monotonicMs()
+    if (attempts > 0 && remainingMs <= 0) {
+      return { handedBack: false, attempts, error: lastError, abandoned: 'budget-exhausted' }
+    }
+    attempts++
+    try {
+      // AND THE ATTEMPT CANNOT OUTLIVE THE DEADLINE EITHER: what is left is handed down as the
+      // transaction's own bound, so a hung statement ends the attempt instead of the window.
+      const { released } = await run(unsentHandBackAttemptBudgetMs(remainingMs))
+      return { handedBack: true, released, attempts, alreadyRecorded: false }
+    } catch (error) {
+      lastError = error
+      // AN AMBIGUOUS COMMIT IS NOT AN EXHAUSTED ONE. Asked BEFORE the bounds are consulted and before
+      // a retry is made, so a hand-back that committed is neither duplicated nor reported stranded.
+      // A probe that cannot answer says "no", which is exactly the r7 behaviour it replaces.
+      if (await recordedHandBack()) {
+        return { handedBack: true, released: null, attempts, alreadyRecorded: true }
+      }
+      if (attempts >= UNSENT_HANDBACK_MAX_ATTEMPTS) {
+        return { handedBack: false, attempts, error, abandoned: 'attempts-exhausted' }
+      }
+      // CHECKED BEFORE THE PAUSE IS TAKEN as well as after it: a pause that would land past the
+      // deadline is not worth taking, and the check above catches one that overran anyway.
+      const delayMs = UNSENT_HANDBACK_RETRY_BASE_DELAY_MS * 2 ** (attempts - 1)
+      if (monotonicMs() + delayMs >= deadlineAtMs) {
+        return { handedBack: false, attempts, error, abandoned: 'budget-exhausted' }
+      }
+      await sleep(delayMs)
+    }
+  }
+}
+
+/**
+ * DID THE HAND-BACK ALREADY COMMIT? (o3d-jit6 r8, Codex MEDIUM.)
+ *
+ * The hand-back's own deterministic name is the one thing a later reader can identify unambiguously —
+ * the released row and the requeued job look the same whoever released them.
+ *
+ * BUT THE NAMED EVIDENCE ROW IS NOT THE PROOF (r9, Codex MEDIUM). It is written BEFORE the release,
+ * and the transaction commits even when the fenced release matches zero rows, so its existence says
+ * a refusal was recorded and says nothing about whether the release ran. The proof is the COMMIT
+ * RECORD — written after the release, stating what it matched — and this asks for that row and for
+ * the boolean on it. See {@link UNSENT_HANDBACK_COMMIT_ACTION}.
+ *
+ * BEST-EFFORT ON PURPOSE. A probe that throws answers "not recorded", which is precisely the r7
+ * outcome — an over-stated abort report — rather than a new failure mode. It must never be the thing
+ * that turns a hand-back into an exception.
+ */
+async function findRecordedUnsentHandBack(args: {
+  entry: { id: string; type: string }
+  notPosted: NonNullable<EntryResult['notPosted']>
+  handBackId: string
+}): Promise<boolean> {
+  try {
+    const found = await db.activityLog.findFirst({
+      where: {
+        entityType: 'SYSTEM',
+        entityId: args.entry.id,
+        action: UNSENT_HANDBACK_COMMIT_ACTION,
+        metadata: { path: ['handBackId'], equals: args.handBackId },
+      },
+      select: { metadata: true },
+    })
+    // A row is not enough: it must SAY what the fenced release matched. Anything else — a row from a
+    // writer this build does not contain, a truncated metadata — is "not recorded", which is the r7
+    // behaviour and never a false certification.
+    return unsentHandBackCommitProvesRelease(found?.metadata)
+  } catch {
+    return false
+  }
+}
+
+/**
+ * SAY THAT AN ACKNOWLEDGEMENT WAS LOST — and that the work was NOT (o3d-jit6 r8, Codex MEDIUM).
+ *
+ * Silence here would be defensible: the row is back in the queue and nothing needs doing. But the
+ * sequence took a rejection from the database and then decided it did not mean what it said, and that
+ * is worth a line an operator can find later — not least because the same conditions that lose an
+ * acknowledgement lose other things too. WARNING, not ERROR: nothing is stranded.
+ */
+async function reportUnsentHandBackAcknowledgementLost(
+  entry: { id: string; type: string },
+  notPosted: NonNullable<EntryResult['notPosted']>,
+  attempts: number,
+  handBackId: string,
+  outboxJobId?: string,
+): Promise<void> {
+  await logActivity({
+    entityType: 'SYSTEM',
+    entityId: entry.id,
+    action: 'xero_sync_transport_refusal_handback_ack_lost',
+    tag: 'sync',
+    level: 'WARNING',
+    description: `[xero-sync] sync log ${entry.id}: attempt ${attempts} of the unsent-refusal hand-back `
+      + 'reported a failure, but the hand-back it describes is already recorded in the database — the '
+      + 'commit landed and only its acknowledgement was lost. The row was handed back: the refusal '
+      + 'evidence is written, the claim is released and (on the queued runner) the job is requeued. '
+      + 'NOTHING IS STRANDED and no operator action is needed; this is recorded because a rejection '
+      + 'that did not mean what it said is worth knowing about.',
+    metadata: {
+      syncLogId: entry.id,
+      type: entry.type,
+      ...(outboxJobId ? { outboxJobId } : {}),
+      operation: notPosted.operation,
+      reason: notPosted.reason,
+      handBackAttempts: attempts,
+      handBackId,
+    },
+    resolveUser: false,
+  })
+}
+
+/**
+ * THE ONE PLACE EITHER RUNNER HANDS BACK AN UNSENT TRANSPORT REFUSAL (o3d-jit6 r7).
+ *
+ * r5 shared the transaction BODY between the runners; r6 left the transaction, its catch and its
+ * report spelt out at each call site, which is where a bounded retry would have had to be written
+ * twice and could drift once. All of it lives here now, so the direct and queued runners differ in
+ * exactly one thing — whether an outbox job joins the commit — and in nothing else.
+ *
+ * It does not throw. The caller counts the row as `skipped` either way: it sent nothing, so it must
+ * not be failed and must not spend a retry, whether or not the hand-back landed.
+ */
+async function handBackUnsentTransportRefusal(args: {
+  entry: { id: string; type: string }
+  notPosted: NonNullable<EntryResult['notPosted']>
+  lease: HeldClaim
+  attempt: AttemptRef
+  job?: IntegrationOutboxRow | null
+}): Promise<UnsentHandBackOutcome> {
+  const { entry, notPosted, lease, attempt, job } = args
+  // THE DEADLINE IS ANCHORED WHERE THE WINDOW ACTUALLY OPENED (r8): the marker's own database-clock
+  // stamp, read as an ELAPSED DURATION so no instant crosses between clocks. Unreadable — or no marker
+  // at all — falls back to a budget from here, which is the r7 bound and never a longer one.
+  const deadline = unsentHandBackDeadline(Date.now(), await readCreateDispatchAge(db, entry.id))
+  // Derived from the row, the claim instant the release fences on and the attempt: the same on every
+  // pass of the sequence, and different for any other sequence.
+  const handBackId = unsentHandBackOperationId(entry.id, lease, attempt)
+  // r9: ACQUISITION AND EXECUTION SHARE THE ONE REMAINDER — see unsentHandBackAttemptBounds. Passing
+  // the budget as `timeout` while `maxWait` independently allowed more was two budgets, not one.
+  const outcome = await retryUnsentHandBack((attemptBudgetMs) => db.$transaction(async (tx) => {
+    return recordAndReleaseUnsentTransportRefusal(tx, { entry, notPosted, lease, attempt, job })
+  }, unsentHandBackAttemptBounds(attemptBudgetMs)), {
+    deadline,
+    recordedHandBack: () => findRecordedUnsentHandBack({ entry, notPosted, handBackId }),
+  })
+  if (outcome.handedBack) {
+    // A LOST ACKNOWLEDGEMENT IS NOT AN EXHAUSTION (r8): the work is done, and the line that says so
+    // is a WARNING about the database, not an ERROR about this row.
+    if (outcome.alreadyRecorded) {
+      await reportUnsentHandBackAcknowledgementLost(entry, notPosted, outcome.attempts, handBackId, job?.id)
+    }
+  } else {
+    // ABORTED, AND SAID SO — see reportUnsentHandBackAborted, which now also names how many complete
+    // attempts were made, what the deadline was anchored to, and what state the row is left in.
+    await reportUnsentHandBackAborted(entry, notPosted, outcome.error, job?.id, {
+      attempts: outcome.attempts,
+      abandoned: outcome.abandoned,
+      deadlineAnchor: deadline.anchor,
+    })
+  }
+  return outcome
+}
+
+/**
+ * HAND BACK A ROW THAT PROVABLY SENT NOTHING — AND HAND IT BACK IN TIME TO REPLAY IT
+ * (o3d-jit6 r4, Codex HIGH).
+ *
+ * WHAT ROUND 3 GOT RIGHT AND WHERE IT STOPPED. r3 classified a pre-egress transport refusal as
+ * `notPosted`, so the row was not failed and spent no retry — the right instinct. But the branch then
+ * logged the named activity row and moved on, leaving the row PROCESSING at the `processingStartedAt`
+ * the fence had just RENEWED. Neither runner's selector can take a PROCESSING row until it is older
+ * than `CLAIM_STALE_MS` (fifteen minutes), so the earliest possible next attempt was fifteen
+ * minutes after the refusal — and the dispatch marker minted moments earlier is only replayable for
+ * SIX. "No retry spent" had become "no retry possible in time": the marker stands, the window closes
+ * under it, and the next attempt meets a permanent refusal that needs an operator, for a create that
+ * was never sent.
+ *
+ * SO THE CLAIM IS RELEASED, THROUGH THE ONE FENCED RELEASE, AT AN INSTANT ALREADY PAST. `nextAttemptAt`
+ * is `now` rather than `now + backoff`: `releaseClaimForRetry` writes it as the PENDING row's
+ * earliest-next-claim gate, so the row is claimable from the refusal onwards — at EVERY instant of
+ * the window that is left, rather than at none of them.
+ *
+ * AND BE PRECISE ABOUT WHAT THAT DOES AND DOES NOT GUARANTEE. The usable part of the window is
+ * `XERO_IDEMPOTENCY_KEY_RETENTION_MS - CREATE_DISPATCH_REPLAY_MARGIN_MS` = five minutes from the
+ * dispatch, and `accounting-sync` ticks every five: whether a tick actually falls inside is a
+ * question about the cron's phase, which this layer does not choose and must not pretend to. What is
+ * ours is the INTERVAL. A zero delay leaves the whole remainder of the window open; a backoff carves
+ * ticks off the front of it, and the five-minute one `markXeroOutboxRetry` would apply leaves none at
+ * all. Nothing is spent to buy that — the release does not touch `retryCount` — so a refusal that
+ * persists costs one attempt per tick and never drives the row to FAILED, which is the correct
+ * treatment for a connection, a posting-intent refusal, an egress authorisation or an exhausted rate
+ * budget: none of them is a fact about this row.
+ *
+ * AND IT DOES NOT LICENSE A SECOND POST. THIS IS THE PART THAT HAD TO STAY TRUE.
+ *
+ * The marker is untouched — `createDispatchedAt` and `createDispatchIdempotencyKey` are write-once by
+ * database trigger, and this release writes neither. So the retry this makes possible arrives back at
+ * `planCreateDispatch`/`decideCreateDispatch` carrying the same deterministic key, and the marker
+ * answers exactly as it would have answered fifteen minutes later:
+ *
+ *   • INSIDE the window — `basis: 'replay-within-idempotency-window'`. Xero answers a repeat of a key
+ *     it still holds with the ORIGINAL document, so this is provably not a second create. And in the
+ *     case this path actually produces, there is no original: the transport refused, so the replay is
+ *     the first request Xero ever sees. One document either way, which is the point.
+ *   • PAST the window — REFUSED, unchanged, with the same message naming both producers of the state
+ *     and pointing at `xero_sync_transport_refused_before_post`. Releasing the claim buys a chance to
+ *     get back before the deadline; it does not move the deadline, and it cannot talk the marker into
+ *     letting a late attempt through.
+ *
+ * The order at the call sites is therefore LOG FIRST, RELEASE SECOND. The activity row is the evidence
+ * a later refusal tells an operator to look for, and it is the only durable trace that a create was
+ * recorded and then not sent; writing it before the row becomes claimable means no other worker can
+ * pick the row up in a state where that trace is missing.
+ *
+ * Fenced on the claim AND on the attempt, like every other non-terminal release: a displaced owner
+ * releases nothing, and an operator decision taken while this claim was held is not reopened.
+ */
+export async function releaseUnsentTransportRefusal(
+  client: Pick<Prisma.TransactionClient, 'accountingSyncLog'>,
+  entryId: string,
+  held: HeldClaim,
+  attempt: AttemptRef,
+  message: string,
+  now: Date = new Date(),
+): Promise<boolean> {
+  return releaseClaimForRetry(client, entryId, held, {
+    errorMessage: message,
+    nextAttemptAt: now,
+  }, attempt)
 }
 
 async function markXeroOutboxRetry(job: IntegrationOutboxRow, error: string, client?: Pick<Prisma.TransactionClient, 'integrationOutbox'>): Promise<void> {
@@ -2796,9 +3721,26 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
     // The pre-claim snapshot survives only as the seed value: if the re-read itself throws, the
     // catch below records a FAILURE with it. Nothing is posted on that path.
     let payload = (entry.payload ?? {}) as SyncPayload
+    // o3d-dzip: and the durable half of the row's origin record — the column, PLUS retention's own
+    // record of having emptied the payload, which is what tells a compacted row from a rewritten one
+    // (Codex r1 finding 1). Seeded from the row the sweep read — `entry` already carries both — so
+    // that if the authoritative re-read below throws, the failure path describes the row with the
+    // record it was selected with rather than with a null that would read as "this row records
+    // nothing".
+    let origin = {
+      connectionProvenance: entry.connectionProvenance ?? null,
+      backReferenceEvidenceCompactedAt: entry.backReferenceEvidenceCompactedAt ?? null,
+    }
 
     try {
-      payload = await readClaimedSyncLogPayload(db, entry.id) as SyncPayload
+      // ONE read for all of it (o3d-dzip): the payload, the column and the compaction instant are one
+      // record, and assembling them from two reads is how a disagreement gets manufactured.
+      const claimed = await readClaimedSyncLogOriginRecord(db, entry.id)
+      payload = claimed.payload as SyncPayload
+      origin = {
+        connectionProvenance: claimed.connectionProvenance,
+        backReferenceEvidenceCompactedAt: claimed.backReferenceEvidenceCompactedAt,
+      }
       // Kept as a cheap pre-filter over the run's snapshot. It is no longer what makes the ordering
       // safe — the locked claim above is — but it still spares a lock round-trip in the ordinary case
       // and its verdict, when it fires, is the same one.
@@ -2847,9 +3789,20 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
           // catch below returns the row to PENDING still carrying `backReferenceFollowUpsPendingAt`,
           // and the next pass announces. Re-running the enqueue on that pass is a no-op — it is
           // idempotent through `hasExistingSyncLog` and the partial unique index (audit-42co).
-          await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, { externalId: entry.externalTransactionId })
+          const followUps = await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, { externalId: entry.externalTransactionId },
+            // o3d-bqw7 r2: the row's COMPLETE origin record. This is the tombstone path — `payload` here
+            // is `{}` — so the durable column is the only half that still names an organisation, and
+            // without it the invoice PDF this enqueue raises could never post.
+            { payload, ...origin },
+            // o3d-0bfh r15: the generation this pass claimed, so the deferred-receipt re-drive can
+            // release it inside the same transaction as its final re-read under the order lock.
+            record.followUpObligation)
           await announceCompactedFollowUpLoss(entry)
-          await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: XERO_CONNECTOR })
+          // o3d-ekn8 r5: and the release is gated on what the enqueue LEFT OWED as well as on the
+          // announcement, for the same reason — the marker must never be discharged on the strength
+          // of work that silently did nothing. o3d-0bfh r4: and on the generation THIS pass claimed,
+          // so a sweep that has taken the obligation since keeps it.
+          await settleFollowUpObligation(entry, followUps, record.followUpObligation)
         } catch (followUpError) {
           // NOT released: the follow-ups did not run. The row goes back to PENDING (or FAILED at
           // MAX_RETRIES) still carrying the obligation, so whichever gets there first — this
@@ -2881,27 +3834,55 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
         continue
       }
 
-      const syncResult = await processEntry(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, lease, attempt)
+      const syncResult = await processEntry(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, origin, lease, attempt)
 
       // BEFORE `skipped` and before `success` (r5 #1): this row stopped without sending anything, so
       // it must not be failed, must not spend a retry, and must not be persisted.
       if (syncResult.notPosted) {
-        await logActivity({
-          entityType: 'SYSTEM',
-          action: syncResult.notPosted.reason === 'lease-expired'
-            ? 'xero_sync_lease_expired_before_post'
-            : 'xero_sync_claim_lost_before_post',
-          tag: 'sync',
-          level: 'WARNING',
-          description: syncResult.notPosted.message,
-          metadata: {
-            syncLogId: entry.id,
-            type: entry.type,
-            operation: syncResult.notPosted.operation,
-            reason: syncResult.notPosted.reason,
-          },
-          resolveUser: false,
-        })
+        const notPosted = syncResult.notPosted
+        // The evidence is worded and shaped in ONE place (unsentPostEvidence) and written through
+        // one of TWO mechanisms. Which one it takes is the whole of round 5, and it turns on whether
+        // this reason also changes the row's state here.
+        //
+        // o3d-jit6 r4 (Codex HIGH): AND THE ROW IS ACTUALLY GIVEN BACK. r3 left it PROCESSING at the
+        // instant the fence had just renewed, so nothing could re-take it for fifteen minutes — past
+        // the six-minute window in which the standing dispatch marker still permits a replay. See
+        // releaseUnsentTransportRefusal for why `nextAttemptAt` is now, and for why this cannot
+        // license a second post: the marker is untouched and still refuses a late attempt.
+        //
+        // ONLY `transport-refused`. The other three reasons are deliberately unchanged. `claim-lost`
+        // has no claim to give back — the release would match nothing, which is correct but pointless
+        // — and `lease-expired` and `dispatch-unrecorded` are the outcomes o3d-xl63 and r1 settled on
+        // their own terms, with no replay window running against them.
+        if (notPosted.reason === 'transport-refused') {
+          // o3d-jit6 r5 (Codex HIGH): THE EVIDENCE AND THE RELEASE ARE ONE COMMIT.
+          //
+          // r4 established the right ORDER — log first, release second, so no worker can meet the
+          // marker with the trace missing — and then defeated it with the mechanism. `logActivity`
+          // SWALLOWS ITS OWN FAILURES by design, and it sat OUTSIDE the release. So the ordering
+          // guaranteed nothing at all: the write could fail silently, the release would commit
+          // regardless, and the row would become claimable with the only durable trace of the
+          // refusal gone. `logActivityInTransaction` writes THROUGH the transaction and does NOT
+          // catch, so evidence and release commit or roll back together.
+          //
+          // o3d-jit6 r7 (Codex HIGH): AND AN ABORT IS NOW RETRIED, BOUNDEDLY, RATHER THAN CONCEDED.
+          // r6 caught the abort, reported best-effort and continued — so a transient serialisation
+          // failure or deadlock left the row PROCESSING until the fifteen-minute stale cutoff, past
+          // the replay window, which is the defect r5 fixed reached through the abort path. It still
+          // does not throw into the per-entry catch (that would spend a retry and FAIL a row that
+          // provably sent nothing); it re-runs the COMPLETE atomic hand-back inside a wall-time
+          // budget, and says what state the row is left in if the bounds are reached.
+          //
+          // THE SAME hand-back as the queued runner, not a copy of it. It fences on the LEASE
+          // (never on `held`, which the minting fence has since moved), and a zero-row release does
+          // not abort it — see recordAndReleaseUnsentTransportRefusal.
+          await handBackUnsentTransportRefusal({ entry, notPosted, lease, attempt })
+        } else {
+          // The other three reasons change nothing about this row here, so no invariant binds the
+          // evidence to a state change and the best-effort write is the right default: a failed log
+          // must not turn a settled outcome into an unsettled one.
+          await logActivity({ ...unsentPostEvidence(entry, notPosted), resolveUser: false })
+        }
         result.skipped++
         continue
       }
@@ -2944,8 +3925,17 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
 
         try {
           await updateBackReference(entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber)
-          await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, syncResult)
-          await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: XERO_CONNECTOR })
+          const followUps = await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, syncResult,
+            // The record this post was made under, read in the same statement as the payload.
+            { payload, ...origin },
+            // o3d-0bfh r15: the generation this pass claimed, so the deferred-receipt re-drive can
+            // release it inside the same transaction as its final re-read under the order lock.
+            persisted.followUpObligation)
+          // o3d-ekn8 r5: released only if the receipts recorded before this invoice reached the
+          // ledger. The re-drive never throws, so that failure was arriving here as success. This
+          // supersedes the bare releaseFollowUpObligation: an unsettled receipt now retains the marker.
+          // o3d-0bfh r4: and only the generation this pass claimed in the SYNCED transaction.
+          await settleFollowUpObligation(entry, followUps, persisted.followUpObligation)
         } catch (followUpError) {
           await markSyncLogForFollowUpRetry(attempt, entry, followUpError)
           await logFollowUpRetry(entry.id, followUpError)
@@ -3281,9 +4271,26 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
     // The pre-claim snapshot survives only as the seed value: if the re-read itself throws, the
     // catch below records a FAILURE with it. Nothing is posted on that path.
     let payload = (entry.payload ?? {}) as SyncPayload
+    // o3d-dzip: and the durable half of the row's origin record — the column, PLUS retention's own
+    // record of having emptied the payload, which is what tells a compacted row from a rewritten one
+    // (Codex r1 finding 1). Seeded from the row the sweep read — `entry` already carries both — so
+    // that if the authoritative re-read below throws, the failure path describes the row with the
+    // record it was selected with rather than with a null that would read as "this row records
+    // nothing".
+    let origin = {
+      connectionProvenance: entry.connectionProvenance ?? null,
+      backReferenceEvidenceCompactedAt: entry.backReferenceEvidenceCompactedAt ?? null,
+    }
 
     try {
-      payload = await readClaimedSyncLogPayload(db, entry.id) as SyncPayload
+      // ONE read for all of it (o3d-dzip): the payload, the column and the compaction instant are one
+      // record, and assembling them from two reads is how a disagreement gets manufactured.
+      const claimed = await readClaimedSyncLogOriginRecord(db, entry.id)
+      payload = claimed.payload as SyncPayload
+      origin = {
+        connectionProvenance: claimed.connectionProvenance,
+        backReferenceEvidenceCompactedAt: claimed.backReferenceEvidenceCompactedAt,
+      }
       // Cheap pre-filter over the run's snapshot; the locked claim above is what makes the ordering
       // safe. The claim IS held here, so the deferral gives it back under its own fence.
       if (blockedPaymentEntryIds.has(entry.id)) {
@@ -3346,9 +4353,20 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
           // catch below returns the row to PENDING still carrying `backReferenceFollowUpsPendingAt`,
           // and the next pass announces. Re-running the enqueue on that pass is a no-op — it is
           // idempotent through `hasExistingSyncLog` and the partial unique index (audit-42co).
-          await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, { externalId: entry.externalTransactionId })
+          const followUps = await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, { externalId: entry.externalTransactionId },
+            // o3d-bqw7 r2: the row's COMPLETE origin record. This is the tombstone path — `payload` here
+            // is `{}` — so the durable column is the only half that still names an organisation, and
+            // without it the invoice PDF this enqueue raises could never post.
+            { payload, ...origin },
+            // o3d-0bfh r15: the generation this pass claimed, so the deferred-receipt re-drive can
+            // release it inside the same transaction as its final re-read under the order lock.
+            record.followUpObligation)
           await announceCompactedFollowUpLoss(entry)
-          await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: XERO_CONNECTOR })
+          // o3d-ekn8 r5: and the release is gated on what the enqueue LEFT OWED as well as on the
+          // announcement, for the same reason — the marker must never be discharged on the strength
+          // of work that silently did nothing. o3d-0bfh r4: and on the generation THIS pass claimed,
+          // so a sweep that has taken the obligation since keeps it.
+          await settleFollowUpObligation(entry, followUps, record.followUpObligation)
         } catch (followUpError) {
           const retry = await db.$transaction(async (tx) => {
             const nextRetry = await markSyncLogForFollowUpRetry(attempt, entry, followUpError, tx)
@@ -3390,37 +4408,64 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
         continue
       }
 
-      const syncResult = await processEntry(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, lease, attempt)
+      const syncResult = await processEntry(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, origin, lease, attempt)
 
       if (syncResult.notPosted) {
+        const notPosted = syncResult.notPosted
+        // LOG FIRST (o3d-jit6 r4) is now LOG IN THE SAME TRANSACTION (r5): this activity row is what
+        // the later refusal tells an operator to look for, and the release below makes the row
+        // claimable again, so the gap in which another worker can meet the marker with no trace of
+        // why it stands must not merely be narrow — it must not exist. r3 handed the JOB back before
+        // logging; the row could not move, so the order did not matter. It does now, and ordering
+        // alone was never enough to secure it.
+        //
         // The lock may itself be what was lost, in which case handing the job back cannot work — say
         // so rather than letting the fence's own throw escape into the generic failure handler and
         // spend a retry on a row that was never posted.
         try {
-          await markXeroOutboxRetry(job, syncResult.notPosted.message)
+          if (notPosted.reason === 'transport-refused') {
+            // o3d-jit6 r4 (Codex HIGH): ONE TRANSACTION, because on this path the row and the job are
+            // two halves of one retry. A released row whose job stayed PROCESSING waits for the
+            // queue's own fifteen-minute stale-lock sweep — the same fifteen minutes the release
+            // exists to escape — and a requeued job whose row stayed PROCESSING is claimed by the
+            // next tick only to find the row unclaimable and skip it. Either half alone re-creates
+            // the defect, so neither may commit without the other.
+            //
+            // And the job is handed back through the deferral that spends NO attempt, at
+            // `nextAttemptAt` now, NOT through markXeroOutboxRetry: that one counts the attempt
+            // against MAX_RETRIES and its first backoff floor is five minutes, which would burn the
+            // replay window it is supposed to be racing.
+            // o3d-jit6 r5 (Codex HIGH): AND THE EVIDENCE IS THE THIRD MEMBER OF THAT TRANSACTION.
+            //
+            // r4 wrote it with `logActivity` — which SWALLOWS ITS OWN FAILURES — from outside this
+            // block, so the release and the requeue could commit while the only durable trace of the
+            // refusal was silently lost. The ordering r4 chose was the right one and could not
+            // enforce itself. THE SAME hand-back as the direct runner now writes all three, and it
+            // does not catch: an unwritable record aborts the lot rather than letting two of them
+            // proceed without it.
+            //
+            // o3d-jit6 r7 (Codex HIGH): AND THAT ABORT IS BOUNDEDLY RETRIED. Conceding after one
+            // attempt left BOTH halves stranded until their own fifteen-minute stale sweeps — past
+            // the replay window — for what is typically a transient serialisation failure. The
+            // complete transaction is re-run within a wall-time budget that cannot itself close the
+            // window; only when the bounds are reached is the abort reported, naming the state the
+            // row is left in. It still never throws into the per-entry catch.
+            await handBackUnsentTransportRefusal({ entry, notPosted, lease, attempt, job })
+          } else {
+            // The other three reasons take the ordinary failure hand-back, which is not the
+            // marker-and-replay-window state the invariant is about, so the evidence stays
+            // best-effort: a failed log must not stop a job being handed back.
+            await logActivity({ ...unsentPostEvidence(entry, notPosted, job.id), resolveUser: false })
+            await markXeroOutboxRetry(job, notPosted.message)
+          }
         } catch (releaseError) {
-          console.error(
-            `[xero-sync] outbox job ${job.id} could not be handed back after a lost claim `
-              + `(${syncResult.notPosted.reason}): ${String(releaseError)}`,
-          )
+          // REACHABLE FROM THE `else` ARM ONLY (r7): the refusal arm handles, retries and reports its
+          // own abort and does not throw. What can still land here is the ordinary hand-back for the
+          // other three reasons — `markXeroOutboxRetry`'s own fence, say — and it is reported the
+          // same way rather than escaping into the generic failure handler and spending a retry on a
+          // row that was never posted.
+          await reportUnsentHandBackAborted(entry, notPosted, releaseError, job.id)
         }
-        await logActivity({
-          entityType: 'SYSTEM',
-          action: syncResult.notPosted.reason === 'lease-expired'
-            ? 'xero_sync_lease_expired_before_post'
-            : 'xero_sync_claim_lost_before_post',
-          tag: 'sync',
-          level: 'WARNING',
-          description: syncResult.notPosted.message,
-          metadata: {
-            syncLogId: entry.id,
-            type: entry.type,
-            outboxJobId: job.id,
-            operation: syncResult.notPosted.operation,
-            reason: syncResult.notPosted.reason,
-          },
-          resolveUser: false,
-        })
         result.skipped++
         continue
       }
@@ -3467,8 +4512,17 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
 
         try {
           await updateBackReference(entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber)
-          await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, syncResult)
-          await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: XERO_CONNECTOR })
+          const followUps = await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, syncResult,
+            // The record this post was made under, read in the same statement as the payload.
+            { payload, ...origin },
+            // o3d-0bfh r15: the generation this pass claimed, so the deferred-receipt re-drive can
+            // release it inside the same transaction as its final re-read under the order lock.
+            persisted.followUpObligation)
+          // o3d-ekn8 r5: released only if the receipts recorded before this invoice reached the
+          // ledger. The re-drive never throws, so that failure was arriving here as success. This
+          // supersedes the bare releaseFollowUpObligation: an unsettled receipt now retains the marker.
+          // o3d-0bfh r4: and only the generation this pass claimed in the SYNCED transaction.
+          await settleFollowUpObligation(entry, followUps, persisted.followUpObligation)
         } catch (followUpError) {
           const retry = await db.$transaction(async (tx) => {
             const nextRetry = await markSyncLogForFollowUpRetry(attempt, entry, followUpError, tx)
@@ -3497,7 +4551,7 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
               errorMessage,
               nextAttemptAt: new Date(Date.now() + retryDelayMs),
             }, attempt)
-            await deferOutboxForRateLimit(tx, job, errorMessage, retryDelayMs)
+            await deferOutboxWithoutSpendingAnAttempt(tx, job, errorMessage, retryDelayMs)
           })
         } else {
           await db.$transaction(async (tx) => {
@@ -3536,7 +4590,7 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
             errorMessage,
             nextAttemptAt: new Date(Date.now() + retryDelayMs),
           }, attempt)
-          await deferOutboxForRateLimit(tx, job, errorMessage, retryDelayMs)
+          await deferOutboxWithoutSpendingAnAttempt(tx, job, errorMessage, retryDelayMs)
         })
       } else {
         await db.$transaction(async (tx) => {
@@ -3594,7 +4648,26 @@ type EntryResult = {
    * a failure may have reached Xero, this provably did not, so the row is handed back rather than
    * having its retry count spent. Callers must test this before `skipped` and before `success`.
    */
-  notPosted?: { reason: 'claim-lost' | 'lease-expired'; operation: string; message: string }
+  notPosted?: {
+    /**
+     * o3d-jit6 r3: `transport-refused` is the one of these that happens AFTER the dispatch record was
+     * minted — the fence sent nothing because the transport would not. The row is handed back exactly
+     * like the other three, and the marker it left behind is a known, named residual (o3d-gvzu).
+     */
+    reason: 'claim-lost' | 'lease-expired' | 'dispatch-unrecorded' | 'transport-refused'
+    operation: string
+    message: string
+    /**
+     * o3d-gvzu — PRESENT ONLY WHEN THE HAND-BACK MUST ALSO RELEASE THE DISPATCH MARKER, and carrying
+     * the two facts that licensed it so the evidence row can name them.
+     *
+     * Set by the branch that made the post, because that is the only place both facts are in scope:
+     * the transport's NAMED pre-egress refusal, and the basis this attempt's dispatch was planned on.
+     * Absent is the normal case and the safe one — a timeout, a reset mid-write, a 5xx, or a replay of
+     * somebody else's marker all leave it absent, and the marker then stands exactly as before.
+     */
+    releaseCreateDispatch?: { notSent: string; basis: string }
+  }
 }
 
 /**
@@ -4382,6 +5455,14 @@ async function processEntry(
   referenceType: string,
   referenceId: string,
   payload: SyncPayload,
+  /**
+   * o3d-dzip: the row's DURABLE origin record — the `connectionProvenance` column and retention's
+   * `backReferenceEvidenceCompactedAt` — read in the same statement as `payload`. It travels to the
+   * intent, and from there to the verdict taken at the socket, so a retention-compacted row is still
+   * checked against the organisation it was raised for instead of refusing as unrecorded, while a row
+   * whose payload was merely REWRITTEN is not silently authorised by the column (Codex r1 finding 1).
+   */
+  origin: { connectionProvenance: string | null; backReferenceEvidenceCompactedAt: Date | null },
   // The LEASE, not a claim timestamp (o3d-xl63 r5 #1). Every remote mutation below fences on it, and
   // the caller reads `lease.heldFrom()` afterwards to anchor the persist to the claim actually held.
   lease: RemoteWriteLease,
@@ -4389,7 +5470,7 @@ async function processEntry(
   attempt: AttemptRef,
 ): Promise<EntryResult> {
   return withAccountingPostingIntent(
-    { connector: XERO_CONNECTOR, payload, type, referenceType, referenceId },
+    { connector: XERO_CONNECTOR, payload, ...origin, type, referenceType, referenceId },
     () => processClaimedEntry(entryId, type, referenceType, referenceId, payload, lease, attempt),
   )
 }
@@ -4980,14 +6061,141 @@ async function processClaimedEntry(
         : type.startsWith('DAILY_BATCH_')
         ? `${type}:${referenceId}`
         : entryId
-      const fence = await lease.fenceBeforeRemoteWrite('manual-journal')
-      if (!fence.ok) return fence.result
-      return pushManualJournal({
+      const journalIdempotencyKey = buildXeroIdempotencyKey(idempotencySource, 'manual-journal')
+      // EVERY GATE THAT CAN REFUSE THIS JOURNAL, ABOVE EVERYTHING THAT RECORDS ANYTHING (o3d-jit6 r2,
+      // Codex finding 1).
+      //
+      // `pushManualJournal` used to build and CHECK the request body itself — a journal with no
+      // non-zero lines, or one whose debits and credits do not agree, returns from it without calling
+      // Xero. Those returns happened BELOW the fence, so the marker was minted and nothing left the
+      // process: the exact shape r1 finding 2 closed for the fence's own refusals, arriving through
+      // the payload instead of through the claim. The next legitimate attempt then met a dispatch that
+      // never happened.
+      //
+      // `prepareManualJournal` is that check, extracted whole. It is PURE and SYNCHRONOUS — no clock,
+      // no database, no network — so hoisting it costs the adjacency rule nothing: it adds no await
+      // anywhere, least of all between proving the claim and using it. What is left below the fence
+      // (`postPreparedManualJournal`) has no refusal of its own; it hands an already-checked body to
+      // the transport.
+      //
+      // WHAT IS STILL BELOW THE MINT, SAID PLAINLY: the TRANSPORT's own pre-egress stops — an
+      // unresolvable connection, `accountingPostingIntentRefusal`, the egress authorisations, the
+      // rate-limit budget. They are not hoistable and must not be pre-evaluated here. Each is
+      // evaluated once, immediately before the socket, against the very `auth` the request is built
+      // from (see accounting-egress-authorization.ts): an authorisation may read AND WRITE the
+      // database and one of them takes an exclusive slot, so asking twice is not free, and o3d-batch-
+      // realm deleted precisely such a pre-check on the ground that a refusal produced from a stale
+      // read is as wrong as a permission produced from one.
+      //
+      // r3 (Codex HIGH, round 3 of this finding) — AND MINTING INSIDE THE TRANSPORT IS NOT THE ANSWER
+      // EITHER, WHICH IS WHY THE MARKER IS STILL MINTED HERE. Moving the mint to the statement before
+      // `connectorFetch` was the obvious repair and it fails on three counts. (1) THE CLAIM PROOF
+      // COULD NO LONGER BE ADJACENT: between this fence and that statement lie `waitForBudget`, which
+      // SLEEPS up to a minute, and an awaited egress authorisation — so the claim would be proven up
+      // to a minute before it was used, which is exactly the o3d-xl63 r5 #1 defect a structural test
+      // already forbids. Carrying the lease into the transport instead would put sync-row claim
+      // fencing inside the shared HTTP client that every Xero GET, PDF download, attachment upload
+      // and tax-rate read goes through. (2) THE RETRY LOOP has no single "the" attempt to mint on.
+      // (3) IT WOULD NOT EVEN BE TRUE: `noteRequest` runs before `connectorFetch`, and a connection
+      // that is refused, times out or fails TLS sent nothing either — so the mint would still
+      // sometimes stand over a create nobody made. There is no point at which "minted" implies "sent";
+      // minting before the wire is a deliberate over-claim, and narrowing it is not closing it.
+      //
+      // SO THE MARKER STANDS AFTER A TRANSPORT REFUSAL, AND WHAT CHANGES IS THAT THE ATTEMPT SAYS SO.
+      // `postPreparedManualJournal` reports `reachedTheWire`, measured from the transport's own
+      // monotonic attempt counter rather than from a status code or an error string, and an attempt
+      // that provably sent nothing is returned as `notPosted` — handed back intact, no retry spent,
+      // no FAILED status, and a named WARNING activity row carrying this sync log's id. The refusal a
+      // later attempt makes then names BOTH producers of the state instead of asserting the
+      // commit-failure story, and points at that activity row (see
+      // CREATE_DISPATCH_UNSETTLED_MEANING). CLEARING the marker on that evidence would need a durable
+      // column of its own — the trigger deliberately forbids clearing the pair, and rightly so, since
+      // this marker is a PROHIBITION and one that tampering clears hands the tamperer what they
+      // wanted. That column is o3d-gvzu and is a separate change, not a comment.
+      const prepared = prepareManualJournal({
         date: payload.date as string,
         reference: payload.reference as string,
         narration: payload.narration as string,
         lines: payload.lines as Array<{ accountCode: string; description: string; debit?: number; credit?: number; taxType?: string }>,
-      }, resolveJournalStatus(postingMode), { idempotencyKey: buildXeroIdempotencyKey(idempotencySource, 'manual-journal') }).then(r => ({ success: r.success, externalId: r.journalId, error: r.error }))
+      }, resolveJournalStatus(postingMode))
+      if (!prepared.ok) return { success: false, error: prepared.error }
+      // o3d-jit6: THE DURABLE RECORD THAT A CREATE IS ABOUT TO LEAVE, committed before it does.
+      //
+      // A manual journal is the one create with nothing else standing behind it: `POST /ManualJournals`
+      // deduplicates on no key we own, so if the transaction that settles this row with the returned
+      // id fails at COMMIT, the document is real, its id is gone, and the ordinary retry posts a
+      // SECOND journal into the accounts. So the dispatch is recorded first — so the retry can tell —
+      // and REFUSED rather than guessed at once Xero's six-minute idempotency window has closed.
+      //
+      // THREE STEPS, AND THE ORDER IS THE WHOLE OF Codex r1 FINDING 2 AND r2 FINDING 1. The journal is
+      // VALIDATED above, before anything is read or written. `planCreateDispatch` only READS:
+      // it answers "may this create go out at all", refuses here if not, and writes nothing whichever
+      // way it answers. It is awaited BEFORE the fence for the same reason
+      // `isFirstPurchaseCreditNoteAttempt` is (o3d-xl63 r5 #1) — nothing awaitable may sit between
+      // proving the claim and using it.
+      //
+      // The RECORD is then minted by the fence itself, inside the very statement that re-proves the
+      // claim. That is what stops the marker being written on a path that sends nothing: an expired
+      // lease or a lost claim returns from `fenceBeforeRemoteWrite` having written neither the claim
+      // renewal nor the dispatch, so a later legitimate attempt does not meet a dispatch that never
+      // happened. The key is passed exactly as it will be sent, so the replay arm compares what was
+      // sent against what is about to be sent rather than two derivations of it.
+      const dispatch = await planCreateDispatch(db, {
+        entryId,
+        type,
+        idempotencyKey: journalIdempotencyKey,
+        label: `${type} for ${referenceType} ${referenceId}`,
+      })
+      if (!dispatch.dispatch) return { success: false, error: dispatch.error }
+      const fence = await lease.fenceBeforeRemoteWrite('manual-journal', dispatch.write ?? undefined)
+      if (!fence.ok) return fence.result
+      const posted = await postPreparedManualJournal(prepared.prepared, { idempotencyKey: journalIdempotencyKey })
+      if (!posted.success && !posted.reachedTheWire) {
+        // The transport refused after the fence. Nothing left the process, so this is not a failure
+        // of the row: failing it spends a retry and drives it to FAILED for a reason that is about
+        // the connection, the tenant's posting intent, an egress authorisation or an exhausted rate
+        // budget — none of which the row can do anything about. `notPosted` is the channel that
+        // already exists for "provably nothing was sent", and it is what writes the durable,
+        // named activity row the later refusal tells an operator to look for.
+        //
+        // o3d-gvzu — AND WHETHER THE MARKER IS RELEASED IS DECIDED HERE, FROM TWO INDEPENDENT FACTS,
+        // BOTH OF WHICH MUST HOLD.
+        //
+        //  1. `posted.notSent` is present. That is a NAMED member of an enumeration written by the one
+        //     statement that performed the refusal, each provable from where that statement sits (see
+        //     XeroNotSentReason). It is not a status code, not an error shape and not a string match.
+        //     It is absent for a timeout, a socket reset mid-write, a 5xx and a client that threw —
+        //     every case where the request MAY HAVE ARRIVED — and those therefore keep the marker.
+        //  2. `mayReleaseCreateDispatch(dispatch.basis)`. The proof covers THIS attempt's request. It
+        //     may only be turned into a release when the marker on the row is one this attempt can
+        //     speak for: it minted it, or it spent a release that already said nothing had been sent.
+        //     A replay of an earlier dispatch's key may not, because that earlier request might have
+        //     reached Xero.
+        //
+        // The conjunction is the conservative direction: each half can only WITHHOLD a release the
+        // other would have granted, and a withheld release costs a refusal an operator resolves while
+        // a wrong one costs a duplicate journal in a live ledger.
+        const verdict = decideCreateDispatchRelease({ basis: dispatch.basis, outcome: posted })
+        const message = describeCreateDispatchNotSent({
+          label: `${type} for ${referenceType} ${referenceId}`,
+          error: posted.error ?? 'the transport gave no reason',
+          notSent: posted.notSent,
+          releasing: verdict.release,
+        })
+        return {
+          success: false,
+          error: message,
+          notPosted: {
+            reason: 'transport-refused',
+            operation: 'manual-journal',
+            message,
+            ...(verdict.release
+              ? { releaseCreateDispatch: { notSent: verdict.notSent, basis: dispatch.basis } }
+              : {}),
+          },
+        }
+      }
+      return { success: posted.success, externalId: posted.journalId, error: posted.error }
     }
 
     case 'TAX_RATE_SYNC': {
@@ -5131,8 +6339,38 @@ export async function repairXeroBackReferences(limit = DEFAULT_BACK_REFERENCE_SW
     // What the connector supplies is only the part the connector-agnostic module cannot hold: the
     // locked read and the retirement, in one transaction on the Xero database handle.
     decideSaleRelease,
-    enqueueFollowUps: (entryId, type, referenceType, referenceId, payload, syncResult) =>
-      enqueueFollowUps(entryId, type, referenceType, referenceId, payload as SyncPayload, syncResult),
+    // o3d-bqw7 r2: the sweep hands over the row's COMPLETE durable origin record, not just its
+    // payload — a tombstone's payload is `{}` and its `connectionProvenance` column is the only half
+    // left speaking, so without it every follow-up the sweep rebuilds is born unable to post.
+    //
+    // THE SETTLEMENT OUTCOME IS RETURNED, NOT DISCARDED (o3d-0bfh, closing the residual r5 named).
+    //
+    // This adapter used to `await` the enqueue and drop its `FollowUpOutcome` to satisfy a
+    // `Promise<void>` dep. That made the sweep an ALTERNATE OBLIGATION-RELEASE PATH around the four
+    // gates r5 had just installed on this connector's own post sites: the re-drive never throws for
+    // a receipt it could not register — capacity refusals and connector-switch rollbacks return
+    // `settled: false` deliberately — so every one of them reached the sweep as success, and it
+    // stamped the row checked and cleared `backReferenceFollowUpsPendingAt` over unqueued money.
+    // Permanently: a stamped row is never a candidate again.
+    //
+    // IT IS NOW PASSED BY REFERENCE, WITH NO ADAPTER AT ALL — that is the point, not a tidy-up.
+    // Widening the type does not close this on its own: an `async` wrapper that awaits the call and
+    // returns a hardcoded `{ deferredReceiptsSettled: true }` satisfies the new signature exactly as
+    // happily as the old `void` one did, and it is the SAME line of code that was wrong before.
+    // (Verified: that mutation type-checks clean.) Handing over the function itself leaves nothing in
+    // between that could drop, fabricate or narrow the answer, and lets the binding seam assert it by
+    // IDENTITY — see tests/connectors/backreference-sweep-bindings.test.ts.
+    //
+    // It also removes the last place the ORIGIN record (o3d-bqw7 r2) could be dropped on its way to
+    // the enqueue: there is no longer a parameter list here to forget to forward it through.
+    //
+    // The wrapper only ever existed for a `payload as SyncPayload` cast, and `SyncPayload` IS
+    // `Record<string, unknown>` — the sweep's own parameter type — so the cast was doing nothing.
+    // `FollowUpOutcome` and `BackReferenceFollowUpOutcome` are likewise structurally identical, as are
+    // `AccountingOriginRecord` and the sweep's own origin parameter; they are separate declarations on
+    // purpose, because the sweep is connector-agnostic and must state its own contract, and if they
+    // ever diverge this line is where the compiler says so.
+    enqueueFollowUps,
   }, { limit })
 }
 
@@ -5442,8 +6680,15 @@ export async function reenqueueMissingCreditNoteAllocations(limit = 200): Promis
         amount: item.amount,
         sourceEntryId: 'reenqueue-sweep',
       }, origin.outcome === 'inherited'
-        ? { from: 'postedRow', payload: origin.payload }
-        : { from: 'unobserved' })
+        // PAYLOAD ONLY HERE, DELIBERATELY, and unchanged by o3d-bqw7 r2. `selectIssuingPostOriginRecord`
+        // chooses AMONG several candidate rows by what each payload records, and returns the payload
+        // rather than a row, so there is no single row whose durable column this could honestly be
+        // paired with. A compacted issuing row therefore still hands on nothing and the allocation
+        // refuses at post time — which is what it did yesterday, and is the safe direction. Nothing
+        // classifies a PURCHASE_CREDIT_NOTE allocation as REBUILT after compaction, so no claim
+        // anywhere depends on it being raisable from a tombstone.
+        ? { from: 'postedRow' as const, record: { payload: origin.payload, connectionProvenance: null } }
+        : { from: 'unobserved' as const })
       result.enqueued++
       await logActivity({
         entityType: 'SYSTEM',
@@ -5477,14 +6722,161 @@ export async function reenqueueMissingCreditNoteAllocations(limit = 200): Promis
   return result
 }
 
+/**
+ * WHAT THE FOLLOW-UP WORK LEFT OUTSTANDING (o3d-ekn8 r5, Codex HIGH — CROSS-PORTED FROM THE
+ * QUICKBOOKS PATH, where the finding was raised).
+ *
+ * `enqueueFollowUps` returned `void`, so "it did not throw" was the only signal the four release
+ * sites below had — and the deferred-receipt re-drive is built NEVER to throw, because a receipt
+ * that cannot be registered must not fail a sync entry whose invoice HAS posted. Every way it can
+ * leave money unregistered therefore arrived at `releaseFollowUpObligation` as success, and the
+ * marker that says this row still owes work was cleared over a receipt still sitting unsettled.
+ *
+ * The back-reference half of the QuickBooks finding does NOT apply here and is deliberately not
+ * ported: this connector's `updateBackReference` propagates its failure (audit-H3), so a link that
+ * did not land reaches the catch, the row goes back to PENDING and the obligation is never released
+ * in the first place. Only the receipt half was open on this side.
+ */
+type FollowUpOutcome = {
+  /** False when a receipt recorded before this invoice is still waiting to reach the ledger. */
+  deferredReceiptsSettled: boolean
+  /**
+   * TRUE WHEN THE DEFERRED PASS ALREADY TOOK THE MARKER DECISION ITSELF (o3d-0bfh r15, Codex HIGH).
+   *
+   * The re-drive now re-reads the order's receipts UNDER THE SALES-ORDER LOCK and clears the exact
+   * obligation generation in that same transaction, because a receipt that commits after its
+   * snapshot would otherwise read a live marker and then have it cleared over it. So when this is
+   * true the release has already happened (or was deliberately withheld) and `settleFollowUpObligation`
+   * must clear NOTHING — a second, unfenced clear here would re-open the very window the fence closes.
+   */
+  obligationFenced: boolean
+}
+
+/**
+ * Discharge the obligation only when the follow-ups left nothing owed (o3d-ekn8 r5).
+ *
+ * The asymmetry is the one followUpObligationClaim was designed around: a marker left set costs one
+ * idempotent re-enqueue on a later sweep, a marker cleared early costs the payment.
+ */
+async function settleFollowUpObligation(
+  entry: { id: string; type: AccountingSyncType; referenceType: string; referenceId: string },
+  followUps: FollowUpOutcome,
+  /**
+   * THE GENERATION THIS PASS TOOK IN THE SYNCED TRANSACTION (o3d-0bfh r4, Codex HIGH) — not a value
+   * re-read here, which is the race one layer down. `null` means the claim did not land, and then
+   * the release clears nothing: a pass that owns no generation has no standing to say the work is
+   * done, and the marker it would have cleared belongs to whoever does.
+   */
+  obligation: Date | null,
+): Promise<void> {
+  if (followUps.deferredReceiptsSettled) {
+    // ALREADY DISCHARGED, UNDER THE ORDER LOCK (o3d-0bfh r15, Codex HIGH). The deferred-receipt pass
+    // clears the generation inside the same transaction as its final re-read, which is the only
+    // ordering in which a receipt arriving mid-pass cannot be settled over. Clearing it a second
+    // time here would be the unfenced write the fence exists to remove.
+    if (followUps.obligationFenced) return
+    // The release is fenced on `obligation`; a `superseded` answer means a sweep (or a later post)
+    // has claimed a NEWER generation since, so its obligation stands and this pass writes nothing.
+    // Not an error for this entry — its own follow-ups did run — and the helper says so on the log.
+    await releaseFollowUpObligation(db, {
+      syncLogId: entry.id,
+      connector: XERO_CONNECTOR,
+      generation: obligation,
+      // o3d-0bfh r5: Xero is the connector where the "a later sweep will discharge it" reasoning is
+      // actually TRUE — `repairXeroBackReferences` is bound below and the accounting-sync cron
+      // invokes it, so a retained marker is re-read and its follow-ups re-enqueued idempotently.
+      // Stated rather than defaulted, because the sibling connector's answer is the opposite one and
+      // a default would have silently given QuickBooks this one.
+      //
+      // AND IT IS READ FROM THE REGISTRY, NOT WRITTEN AS A LITERAL HERE (o3d-0bfh r6, Codex MEDIUM).
+      // `{ consumer: 'sweep' }` written inline is an ordinary copyable object with no relationship
+      // to the binding two functions below or to the cron that calls it; a new connector could paste
+      // it, have neither, and compile. The registry entry it now reads is the one
+      // tests/accounting/follow-up-recovery-registry.test.ts holds to having BOTH an exported
+      // binding and a scheduled or manual invocation.
+      recovery: followUpObligationRecoveryFor(XERO_CONNECTOR),
+    })
+    return
+  }
+  await logActivity({
+    entityType: 'SYSTEM',
+    action: 'xero_followup_obligation_retained',
+    tag: 'sync',
+    level: 'ERROR',
+    description: xeroRetainedFollowUpObligationDescription(entry.id),
+    metadata: {
+      syncLogId: entry.id,
+      type: entry.type,
+      referenceType: entry.referenceType,
+      referenceId: entry.referenceId,
+    },
+    // Retaining the marker is ALREADY the safe state, so failing to describe it must not turn a
+    // posted invoice into a failed sync entry.
+  }).catch(() => { /* the state is on the row; the log is the notification */ })
+}
+
+/**
+ * THE STRING AN OPERATOR ACTUALLY RECEIVES WHEN A XERO OBLIGATION IS RETAINED — exported so the
+ * shared banned-instruction contract can be run over the PRODUCER rather than over the constants it
+ * happens to be built from today (o3d-0bfh r11, Codex HIGH).
+ *
+ * WHAT WAS HERE TOLD THE OPERATOR TO RE-DRIVE A PATH THE SYSTEM RETRIES BY ITSELF: "Re-run the
+ * invoice sync for this reference, or register the receipt in Xero by hand." Both halves are unsafe
+ * on THIS connector precisely BECAUSE the marker is deliberately retained and
+ * `repairXeroBackReferences` re-reads it on the accounting-sync cron. The operator's hand-made
+ * receipt races the queued re-enqueue, and the connector's request id cannot deduplicate a payment a
+ * human entered in the Xero UI. It is the r7/r8 QuickBooks finding, on the connector where the
+ * automatic retry actually exists — which is what makes it worse here, not better.
+ *
+ * AND IT SHIPPED THROUGH A ROUND THAT EXPANDED THE BANNED-INSTRUCTION LIST FROM THREE STRINGS TO
+ * ELEVEN, because that list was pointed at the registry strings and the two files somebody had
+ * already looked at. A contract covers the strings it is pointed at, not every string an operator
+ * can receive. So this is a named, exported producer, and
+ * tests/accounting/follow-up-recovery-registry.test.ts runs THE ONE LIST over what it returns.
+ *
+ * The guidance itself is escalation-only and comes from the registry: what re-drives a retained
+ * obligation on this connector is a declared fact about the connector, not a sentence written here.
+ */
+export function xeroRetainedFollowUpObligationDescription(entryId: string): string {
+  const recovery = followUpObligationRecoveryNote(followUpObligationRecoveryFor(XERO_CONNECTOR))
+  return `Xero sync entry ${entryId} posted to the ledger, but a receipt recorded before this invoice `
+    + 'is still not registered against it. The row is deliberately left marked as owing follow-ups, because '
+    + 'nothing else about it records that: it is SYNCED and carries its external id exactly like a row that '
+    + `completed. There is no manual step here and a hand-made settlement is the one action that costs money: ${recovery}, `
+    + 'so a receipt entered by hand would be a SECOND one, racing work that is already queued — and no request id '
+    + 'can deduplicate a payment a human entered in the Xero UI. If the row is still marked after the next '
+    + 'accounting-sync run, READ the invoice in Xero, record what is actually present, and ESCALATE that reading.'
+}
+
 async function enqueueSalesInvoiceFollowUps(
   entryId: string,
   referenceType: string,
   referenceId: string,
   payload: SyncPayload,
   syncResult: { externalId?: string; invoiceNumber?: string },
-): Promise<void> {
-  if (referenceType !== 'SalesOrder' || !syncResult.externalId) return
+  origin: AccountingOriginRecord,
+  /**
+   * THE OBLIGATION GENERATION THIS PASS CLAIMED (o3d-0bfh r15, Codex HIGH), threaded down to the
+   * deferred-receipt re-drive so its final re-read and its release commit in ONE transaction under
+   * the sales-order lock. `null` means this pass never took one and may therefore clear nothing.
+   *
+   * It travels IN rather than being re-read at the bottom, for the reason r4 gives: a generation
+   * read after the work is whichever one is live NOW, and clearing that clears somebody else's
+   * obligation.
+   */
+  followUpObligation: Date | null,
+  /**
+   * WHAT ELSE THE CALLER MUST HAVE MADE DURABLE BEFORE THE GENERATION MAY BE CLEARED (o3d-0bfh r16,
+   * Codex HIGH). Absent on the post path — this processor has no settlement write of its own after
+   * the enqueue — and supplied by the back-reference sweep, whose terminal warnings gate its
+   * settlement and were being written AFTER the fenced clear. See `DeferredReceiptObligation`.
+   */
+  settlementPrerequisite?: () => Promise<boolean>,
+): Promise<FollowUpOutcome> {
+  if (referenceType !== 'SalesOrder' || !syncResult.externalId) return { deferredReceiptsSettled: true, obligationFenced: false }
+  // Captured once, so the id handed to the deferred re-drive below is provably the one THIS post
+  // returned rather than a re-read of a narrowed property.
+  const postedInvoiceId: string = syncResult.externalId
 
   if (payload._registerPayment) {
     const paymentMap = await getPaymentAccountMap()
@@ -5529,7 +6921,7 @@ async function enqueueSalesInvoiceFollowUps(
             currency,
             method,
             sourceEntryId: entryId,
-          }, { from: 'postedRow', payload })
+          }, { from: 'postedRow', record: origin })
         }
       }
     }
@@ -5540,7 +6932,7 @@ async function enqueueSalesInvoiceFollowUps(
     referenceId,
     invoiceNumber: syncResult.invoiceNumber,
     sourceEntryId: entryId,
-  }, { from: 'postedRow', payload })
+  }, { from: 'postedRow', record: origin })
 
   // o3d-ekn8: receipts recorded BEFORE this invoice existed were refused with DOCUMENT_NOT_POSTED and
   // nothing ever came back for them. This is the moment that refusal stops applying — the CREATE has
@@ -5552,7 +6944,40 @@ async function enqueueSalesInvoiceFollowUps(
   // awaited but never allowed to throw: the invoice HAS posted, and a receipt that could not be
   // re-registered must not turn that into a failed sync entry.
   const { registerDeferredOrderReceipts } = await import('@/lib/domain/accounting/invoice-payment-enqueue')
-  await registerDeferredOrderReceipts(referenceId)
+  // PINNED TO THIS POST (o3d-ekn8 r2, Codex HIGH). Handing over only the order id made the callee
+  // re-derive both of the facts this hand-off is about — it asked which connector is active NOW and
+  // which document the order points at NOW — while the authoritative answers were sitting right here:
+  // this processor made the call, and `syncResult.externalId` is the id the call returned. A connector
+  // swap or a delete-and-re-post between the post and the re-drive silently redirected it. Re-resolving
+  // after a pin is the race being closed, not a check of it, so the evidence goes IN.
+  //
+  // AND THE ANSWER IS CARRIED BACK (o3d-ekn8 r5, Codex HIGH). It is awaited but never allowed to
+  // throw, which meant "it returned" was indistinguishable from "the receipts reached the ledger" —
+  // and the caller discharges a durable obligation on that answer.
+  //
+  // AND THE OBLIGATION GOES IN WITH IT (o3d-0bfh r15, Codex HIGH). The re-drive's final re-read of
+  // the order's receipts and the clearing of this generation now happen in ONE transaction holding
+  // the sales-order lock, because a receipt committing after the re-drive's snapshot would otherwise
+  // read a live marker — and be told its recovery is retained — and then have that marker cleared
+  // by this caller over it.
+  const redrive = await registerDeferredOrderReceipts(referenceId, {
+    connector: 'xero',
+    accountingInvoiceId: postedInvoiceId,
+  }, {
+    syncLogId: entryId,
+    connector: XERO_CONNECTOR,
+    generation: followUpObligation,
+    // The same registry answer `settleFollowUpObligation` reads, for the same reason: what re-drives
+    // a retained obligation is a declared fact about the connector, never a sentence written here.
+    recovery: followUpObligationRecoveryFor(XERO_CONNECTOR),
+    // o3d-0bfh r16: SPREAD, not written as `settlementPrerequisite: undefined` — the field's absence
+    // is what keeps the post path on the single-pass fence, and an explicitly-undefined key would be
+    // a second thing to get wrong at every call site that reads this object.
+    ...(settlementPrerequisite ? { settlementPrerequisite } : {}),
+  })
+  // `unfenced` is the one answer that leaves the marker to this caller: the re-drive returned on a
+  // fact no later receipt can change (payments do not post at all; the order is gone).
+  return { deferredReceiptsSettled: redrive.settled, obligationFenced: redrive.release !== 'unfenced' }
 }
 
 async function enqueuePurchaseInvoiceFollowUps(
@@ -5561,13 +6986,14 @@ async function enqueuePurchaseInvoiceFollowUps(
   referenceId: string,
   payload: SyncPayload,
   syncResult: { externalId?: string },
+  origin: AccountingOriginRecord,
 ): Promise<void> {
   if ((referenceType !== 'PurchaseInvoice' && referenceType !== 'PurchaseOrder') || !syncResult.externalId || !payload.supplierInvoicePath) return
   await enqueueFollowUpSyncLog('BILL_ATTACHMENT', referenceType, referenceId, {
     accountingInvoiceId: syncResult.externalId,
     supplierInvoicePath: payload.supplierInvoicePath,
     sourceEntryId: entryId,
-  }, { from: 'postedRow', payload })
+  }, { from: 'postedRow', record: origin })
 }
 
 async function enqueuePurchaseCreditNoteFollowUps(
@@ -5576,6 +7002,7 @@ async function enqueuePurchaseCreditNoteFollowUps(
   referenceId: string,
   payload: SyncPayload,
   syncResult: { externalId?: string },
+  origin: AccountingOriginRecord,
 ): Promise<void> {
   // audit-v08m: after the ACCPAYCREDIT posts, allocate it to the bill it offsets.
   // Needs both the credit's new external id and the bill's external id. The bill
@@ -5595,18 +7022,25 @@ async function enqueuePurchaseCreditNoteFollowUps(
     // retry of a pinned request was no longer the same request (Codex review, r2 #3).
     date: (payload.date as string | undefined)?.slice(0, 10) || new Date().toISOString().slice(0, 10),
     sourceEntryId: entryId,
-  }, { from: 'postedRow', payload })
+  }, { from: 'postedRow', record: origin })
 }
 
 /**
  * Fan a posted row out into the follow-up work it owes.
  *
- * `payload` IS THE ORIGIN EVIDENCE, not just the source of fields (Codex r3 finding 1). It is the stored
- * payload of the row that posted — whether this call comes from the processor moments after the post, or
- * from the back-reference sweep days later for a row whose process died before its follow-ups ran — and
- * the record it carries is the only thing that knows which organisation the external ids being handed on
- * belong to. Every `enqueueFollowUpSyncLog` below therefore passes `{ from: 'postedRow', payload }`, and
- * none of them reads the live connection.
+ * THE POSTING ROW'S ORIGIN RECORD IS THE EVIDENCE, not just the source of fields (Codex r3 finding 1).
+ * It belongs to the row that posted — whether this call comes from the processor moments after the post,
+ * or from the back-reference sweep days later for a row whose process died before its follow-ups ran —
+ * and it is the only thing that knows which organisation the external ids being handed on belong to.
+ * Every `enqueueFollowUpSyncLog` below therefore passes `{ from: 'postedRow', record: origin }`, and none
+ * of them reads the live connection.
+ *
+ * THE RECORD IS BOTH HALVES (o3d-bqw7 r2, Codex HIGH). `payload` alone was the evidence until a
+ * retention tombstone showed what that costs: compaction empties the payload and KEEPS
+ * `connectionProvenance`, so the rows whose follow-ups this pipeline still claims to rebuild handed on
+ * nothing at all, and the rows they created could never post. `origin` carries the payload, the column
+ * and retention's compaction instant together, which is the only combination
+ * `readAccountingOriginRecord` will decide from.
  *
  * A row whose payload recorded nothing hands nothing on, and the follow-up refuses at post time instead
  * of being addressed to whoever is connected. That is the same answer the parent row itself would now
@@ -5620,20 +7054,46 @@ async function enqueueFollowUps(
   referenceId: string,
   payload: SyncPayload,
   syncResult: { externalId?: string; invoiceNumber?: string },
-): Promise<void> {
+  /**
+   * o3d-bqw7 r2 (Codex HIGH) — THE COMPLETE DURABLE ORIGIN RECORD OF THE POSTING ROW, not just its
+   * payload. On a retention tombstone the payload is `{}` and the organisation is recorded only in
+   * the `connectionProvenance` column; handing on the payload alone created follow-ups that could
+   * never post, which made "the invoice PDF survives compaction" a claim this pipeline did not
+   * honour.
+   */
+  origin: AccountingOriginRecord,
+  /**
+   * THE OBLIGATION GENERATION THIS PASS CLAIMED (o3d-0bfh r15, Codex HIGH), threaded down to the
+   * deferred-receipt re-drive so its final re-read and its release commit in ONE transaction under
+   * the sales-order lock. `null` means this pass never took one and may therefore clear nothing.
+   *
+   * It travels IN rather than being re-read at the bottom, for the reason r4 gives: a generation
+   * read after the work is whichever one is live NOW, and clearing that clears somebody else's
+   * obligation.
+   */
+  followUpObligation: Date | null,
+  /**
+   * o3d-0bfh r16 (Codex HIGH) — THE CALLER'S OWN SETTLEMENT PREREQUISITE, carried down to the fence
+   * so the generation cannot be cleared before the caller's terminal warnings are durable. Optional
+   * because this processor's own post sites have nothing left to settle after the enqueue; the
+   * back-reference sweep does, and passing it is what stops the fenced release outrunning it.
+   */
+  settlementPrerequisite?: () => Promise<boolean>,
+): Promise<FollowUpOutcome> {
   if (type === 'SALES_INVOICE') {
-    await enqueueSalesInvoiceFollowUps(entryId, referenceType, referenceId, payload, syncResult)
-    return
+    return enqueueSalesInvoiceFollowUps(
+      entryId, referenceType, referenceId, payload, syncResult, origin, followUpObligation, settlementPrerequisite,
+    )
   }
 
   if (type === 'PURCHASE_INVOICE') {
-    await enqueuePurchaseInvoiceFollowUps(entryId, referenceType, referenceId, payload, syncResult)
-    return
+    await enqueuePurchaseInvoiceFollowUps(entryId, referenceType, referenceId, payload, syncResult, origin)
+    return { deferredReceiptsSettled: true, obligationFenced: false }
   }
 
   if (type === 'PURCHASE_CREDIT_NOTE') {
-    await enqueuePurchaseCreditNoteFollowUps(entryId, referenceType, referenceId, payload, syncResult)
-    return
+    await enqueuePurchaseCreditNoteFollowUps(entryId, referenceType, referenceId, payload, syncResult, origin)
+    return { deferredReceiptsSettled: true, obligationFenced: false }
   }
 
   if (type === 'INVOICE_PDF' && referenceType === 'SalesOrder') {
@@ -5647,14 +7107,17 @@ async function enqueueFollowUps(
     if (order?.customerEmail) {
       await enqueueFollowUpSyncLog(
         'INVOICE_EMAIL', referenceType, referenceId, { referenceId, sourceEntryId: entryId },
-        { from: 'postedRow', payload },
+        { from: 'postedRow', record: origin },
       )
     }
     if (order?.shoppingLinks.length) {
       await enqueueFollowUpSyncLog(
         'WC_INVOICE_NOTE', referenceType, referenceId, { referenceId, sourceEntryId: entryId },
-        { from: 'postedRow', payload },
+        { from: 'postedRow', record: origin },
       )
     }
   }
+  // Every remaining type enqueues rows that carry their own document id in the payload; none of them
+  // has a deferred receipt waiting on it.
+  return { deferredReceiptsSettled: true, obligationFenced: false }
 }

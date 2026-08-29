@@ -10,9 +10,28 @@ import 'dotenv/config'
 import { PrismaClient } from '../app/generated/prisma/client'
 import { PrismaPg } from '@prisma/adapter-pg'
 import bcrypt from 'bcryptjs'
+import { pgConnectionConfig, prismaAdapterSchemaOptions } from '../lib/db/database-url-schema.mjs'
 import { validateUserPassword } from '../lib/security/password-policy'
 
-const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL! })
+/**
+ * BOTH HALVES OF THE SCHEMA, exactly as the runtime builds them (o3d-2k5r r12).
+ *
+ * `npm run db:seed` is an INSTALL-PATH writer — scripts/install.sh runs it between
+ * `prisma migrate deploy` and the bootstrap in scripts/provision-instance.mjs — so it must land in
+ * the schema the application will read from. `new PrismaPg({ connectionString })` alone gave it
+ * neither half: the adapter reported no `schemaName`, so generated queries were qualified with the
+ * hardcoded `public`, and the pool got no `search_path` because `pg` discards the Prisma-only
+ * `?schema=` parameter. On a `?schema=TenantA` installation the organisation, warehouse, currency
+ * and tax rows were seeded into `public` while the application read `TenantA` — a fresh install
+ * that comes up with none of its own reference data.
+ *
+ * See lib/db/database-url-schema.mjs: `pgConnectionConfig` for the pool, `prismaAdapterSchemaOptions`
+ * for the query compiler. Neither is sufficient alone.
+ */
+const adapter = new PrismaPg(
+  pgConnectionConfig(process.env.DATABASE_URL!),
+  prismaAdapterSchemaOptions(process.env.DATABASE_URL!),
+)
 const db = new PrismaClient({ adapter })
 
 async function main() {

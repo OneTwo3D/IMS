@@ -1,5 +1,6 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 import { WMS_LOOKUP_CONFIRMED_ABSENT } from '@/lib/domain/wms/order-status-sweep'
+import { provesNoRemoteWmsCall } from '@/lib/domain/wms/order-push-sweep'
 import { isOperatorAssertedSettlement } from '@/lib/domain/accounting/sync-row-settlement'
 
 /**
@@ -239,17 +240,54 @@ export async function findSalesOrderDeleteBlocker(
   // 1b. WMS push link. The link row is the push sweep's claim: it exists from immediately before
   // the remote create until the order is withdrawn, so ANY link means the WMS may hold
   // (or be about to be handed) this order.
+  //
+  // ONE EXCEPTION (o3d-92fu): a VALIDATION_FAILED disposition the push sweep CREATED — no link
+  // existed, so nothing had been claimed and buildPushInput threw on local data (a line with no
+  // SKU) before pushOrder could be invoked. Without it, a purely local data error made an order
+  // permanently undeletable: the failure aged into DEAD_LETTER, which this guard blocks on and
+  // which the create pass will never retry.
+  //
+  // THE RULE IS NOT "attempts === 0" (o3d-2k5r). Read that way, this guard hard-deleted orders the
+  // warehouse was fulfilling: claimForCreate writes its PENDING_CREATE claim at the schema default
+  // of attempts 0 BEFORE the remote call, the increment that would record the call lives in a catch
+  // whose write is `.catch(() => {})`-swallowed and does not run at all on a process kill, and the
+  // disposition write then converted that claim while preserving attempts 0. Absence of a marker
+  // was being read as a positive answer about a remote system.
+  //
+  // ONLY AN ABSENT LINK PROVES NOTHING WAS CALLED. Any pre-existing link — including a bare
+  // PENDING_CREATE claim — is AMBIGUOUS, and the rule that says so lives in one place, next to the
+  // writer that has to uphold it, so this reader cannot re-derive a weaker one.
   const pushLink = await tx.wmsOrderPushLink.findUnique({
     where: { orderId },
-    select: { state: true, externalOrderNumber: true, externalOrderId: true },
+    select: { state: true, externalOrderNumber: true, externalOrderId: true, attempts: true, pushedAt: true },
   })
-  if (pushLink) {
+  if (pushLink && !provesNoRemoteWmsCall(pushLink)) {
     const ref = pushLink.externalOrderNumber ?? pushLink.externalOrderId
+    // Name what actually blocks. Citing `attempts` alone printed "0 push attempts were made" for a
+    // link carrying a real WMS order id — a refusal whose own reason argued for the delete.
+    const evidence = ref
+      ? `WMS order ${ref}`
+      : pushLink.pushedAt
+        ? 'a push to the warehouse is recorded against it'
+        : `${pushLink.attempts} push attempt(s) may already have been dispatched`
     blockers.push({
       code: 'wms_order_push_link',
-      message:
-        `Cannot delete an order that has been claimed for or sent to the warehouse management system ` +
-        `(push state ${pushLink.state}${ref ? `, WMS order ${ref}` : ''}). Cancel the order instead so the WMS order is withdrawn.`,
+      message: pushLink.state === 'AMBIGUOUS_CREATE'
+        // o3d-2k5r r4: its own message, because the generic one prescribes a remedy that cannot be
+        // performed here. "Cancel the order so the WMS order is withdrawn" needs an external id to
+        // withdraw, and the defining feature of this state is that IMS never learned one — a cancel
+        // would report success having withdrawn nothing.
+        ? 'Cannot delete an order whose WMS create was dispatched with no recorded outcome '
+          + `(push state ${pushLink.state}). The warehouse may be holding an order for it under a `
+          + 'reference IMS never learned, so a cancel here would withdraw nothing. Resolve it in the '
+          + 'WMS first — the push chip carries the reference to search for and what to do with what '
+          + 'you find.'
+        : pushLink.state === 'VALIDATION_FAILED'
+        ? `Cannot delete an order that may already have reached the warehouse management system `
+          + `(${evidence}, and its payload only became invalid afterwards). A failed or unfinished push `
+          + 'does not prove nothing was created — cancel the order instead so the WMS order is withdrawn.'
+        : `Cannot delete an order that has been claimed for or sent to the warehouse management system `
+          + `(push state ${pushLink.state}${ref ? `, WMS order ${ref}` : ''}). Cancel the order instead so the WMS order is withdrawn.`,
     })
   }
 
@@ -316,8 +354,9 @@ export async function findSalesOrderDeleteBlocker(
           // shipments in the same transaction as the allocation release.
           : 'A picked or packed shipment is stock the warehouse is already holding against this '
             + 'order. Cancel the order instead — cancelling deletes its picked and packed shipments '
-            + 'and releases the reservations in one step. A single shipment cannot be cancelled on '
-            + 'its own (o3d-q8r6), so the whole order is the unit of undo here.'),
+            + 'and releases the reservations in one step. To keep the order and clear this blocker '
+            + 'instead, use "Reopen for repack" on each picked/packed shipment (o3d-2k5): that reverts '
+            + 'it to a PENDING draft, and a PENDING draft is deliberately not a blocker here.'),
     })
   }
   const orderKeyed: Prisma.AccountingSyncLogWhereInput[] = [

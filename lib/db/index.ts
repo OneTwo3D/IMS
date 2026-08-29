@@ -1,6 +1,8 @@
 import { PrismaClient } from '@/app/generated/prisma/client'
 import { PrismaPg } from '@prisma/adapter-pg'
 
+import { pgConnectionConfig, prismaAdapterSchemaOptions } from './database-url-schema.mjs'
+
 const globalForPrisma = globalThis as unknown as { prisma?: PrismaClient }
 
 /** How many connections the pool may hold open at once. */
@@ -56,32 +58,73 @@ export const POST_REMOTE_PERSIST_TX_OPTIONS = {
   timeout: 15_000,
 } as const
 
+/**
+ * THE ADAPTER PRODUCTION RUNS ON — exported so a test can build the real thing rather than
+ * re-describe it (o3d-1izw / o3d-2k5r r8).
+ *
+ * Config form, NOT `new PrismaPg(pool)` (o3d-4ajo) — the same trap the
+ * concurrency tests already guard against, which this runtime path never
+ * got. The adapter decides between "this is my pool" and "this is my
+ * config" with `instanceof pg.Pool`, so a Pool built from a second copy of
+ * `pg` fails that check and the adapter treats the Pool OBJECT as its
+ * config. It then hands the Pool's own `options` object to postgres as the
+ * startup `options` parameter, pg-protocol calls Buffer.byteLength() on it,
+ * and it throws ERR_INVALID_ARG_TYPE from the socket connect callback —
+ * uncaught, so the request promise never settles. Letting the adapter build
+ * its own pool removes the instanceof branch entirely.
+ *
+ * This is not hypothetical here: the checkout carries a duplicated
+ * node_modules/node_modules tree, which is exactly the second `pg` identity
+ * that triggers it.
+ *
+ * THE SECOND ARGUMENT IS THE HALF THAT WAS MISSING. Without `{ schema }` the adapter reports no
+ * `schemaName`, so Prisma's generated queries are unqualified; combined with a pool whose
+ * connections carried no `search_path`, a `?schema=` URL left the application resolving tables in
+ * the server-default schema while the deploy check and the production preflight — which DO honour
+ * that parameter — inspected and passed the named one. See lib/db/database-url-schema.mjs.
+ */
+export function createDbAdapter(): PrismaPg {
+  return new PrismaPg(dbPoolConfig(), prismaAdapterSchemaOptions(process.env.DATABASE_URL))
+}
+
 function createPrismaClient() {
-  // Config form, NOT `new PrismaPg(pool)` (o3d-4ajo) — the same trap the
-  // concurrency tests already guard against, which this runtime path never
-  // got. The adapter decides between "this is my pool" and "this is my
-  // config" with `instanceof pg.Pool`, so a Pool built from a second copy of
-  // `pg` fails that check and the adapter treats the Pool OBJECT as its
-  // config. It then hands the Pool's own `options` object to postgres as the
-  // startup `options` parameter, pg-protocol calls Buffer.byteLength() on it,
-  // and it throws ERR_INVALID_ARG_TYPE from the socket connect callback —
-  // uncaught, so the request promise never settles. Letting the adapter build
-  // its own pool removes the instanceof branch entirely.
-  //
-  // This is not hypothetical here: the checkout carries a duplicated
-  // node_modules/node_modules tree, which is exactly the second `pg` identity
-  // that triggers it.
-  const adapter = new PrismaPg(dbPoolConfig())
-  return new PrismaClient({ adapter })
+  return new PrismaClient({ adapter: createDbAdapter() })
 }
 
 /**
  * The pool configuration handed to the adapter, exported so it can be asserted against rather than
  * re-described by a test — a duplicated literal is a bound nothing checks is still there.
+ *
+ * `options` is the startup `search_path`. It is ALWAYS set on a parseable URL — the URL's own
+ * `?schema=` when it has one, and Prisma's own default when it has not, because an adapter with no
+ * `schemaName` compiles generated queries against a hardcoded `"public"` rather than against the
+ * connection's search path, so "no schema named" is a divergence and not an agreement. It is what
+ * makes the RAW statements this application runs — the o3d-1izw push-state gate among them — resolve the
+ * same objects the two out-of-process release gates resolve. `PrismaPg`'s `{ schema }` option does
+ * not cover them: it qualifies generated queries only.
+ *
+ * `onConnect` COMES FROM THE SAME PLACE AND IS PART OF THE SAME PIN (o3d-2k5r r22). It is present
+ * only when the composed `options` carries a non-ASCII byte — i.e. only when a deployment probe's
+ * verdict is being spent — and `pg-pool` awaits it on every NEW PHYSICAL CONNECTION before that
+ * connection is handed to anyone, refusing one served by a backend other than the one the verdict
+ * was measured on. It is deliberately NOT re-described here: it is composed by
+ * `pgConnectionConfig()`, arrives through the spread below, and reaches the pool because
+ * `PrismaPg`'s config form passes its config verbatim to `new pg.Pool(...)`.
  */
-export function dbPoolConfig() {
+export function dbPoolConfig(): {
+  connectionString: string
+  max: number
+  connectionTimeoutMillis: number
+  options?: string
+  onConnect?: (client: { query(text: string): Promise<{ rows: Array<Record<string, unknown>> }> }) => Promise<void>
+} {
+  // THE SPREAD COMES FIRST, AND IT CARRIES THE CONNECTION STRING (o3d-2k5r r10). `pg` parses
+  // `connectionString` AFTER the surrounding config and assigns the result over it, so a
+  // `connectionString` set here and an `options` set beside it is not a pinned search path at all:
+  // an `options=` inside the URL wins. pgConnectionConfig() strips it from the URL and folds it
+  // into one effective value, so the two can no longer be different things.
   return {
-    connectionString: process.env.DATABASE_URL!,
+    ...pgConnectionConfig(process.env.DATABASE_URL),
     max: DB_POOL_MAX,
     connectionTimeoutMillis: DB_POOL_ACQUISITION_TIMEOUT_MS,
   }

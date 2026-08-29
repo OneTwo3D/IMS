@@ -1,6 +1,17 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
+// DRIVEN BY THE REGISTRY (o3d-0bfh r8, Codex MEDIUM). The declarations below are not restated here:
+// a connector's entry in ACCOUNTING_FOLLOW_UP_RECOVERY is the claim, and the tests at the bottom of
+// this file are what CHECKS it, by invoking the real cron route and asserting whether that
+// connector's sweep binding was actually reached. Adding a connector to the registry adds a contract
+// assertion for it automatically — and it fails until somebody wires the mock for it here, which is
+// the right way round.
+//
+// It is imported before every mock.module below on purpose: this module reads no database and mocks
+// nothing, so loading it early cannot be affected by, or affect, the doubles.
+import { ACCOUNTING_FOLLOW_UP_RECOVERY } from '@/lib/domain/accounting/follow-up-obligation-registry'
+
 // ---------------------------------------------------------------------------
 // o3d-9kek — which cron branch runs the back-reference repair sweep, and which deliberately does
 // not.
@@ -19,7 +30,14 @@ import test, { mock } from 'node:test'
 //
 // Failing to repair is acceptable; repairing onto the wrong document is not. So this file asserts
 // the ABSENCE as firmly as the presence — re-adding the binding is one line, and no other test in
-// the suite would go red. Precondition for re-adding it: o3d-s36z (connector-tenant isolation).
+// the suite would go red.
+//
+// THE PRECONDITION THIS COMMENT USED TO NAME IS THE WRONG ONE (o3d-0bfh r6, Codex MEDIUM). It said
+// o3d-s36z (connector-tenant isolation); that CLOSED on 2026-08-21 and a row's realm is recorded
+// now, so a maintainer checking it would find it satisfied and add back the one line this file
+// exists to forbid. The real prerequisites are POST-TIME AUTHORIZATION (o3d-8prh) and ORIGIN
+// PROPAGATION on the follow-up rows a sweep would create — see the block at the end of
+// lib/connectors/quickbooks/sync-processor.ts.
 // ---------------------------------------------------------------------------
 
 type Call = { connector: string; what: 'process' | 'repair' }
@@ -106,4 +124,54 @@ test('[o3d-9kek] the Xero cron branch DOES run it — Xero is the connector with
   // Reported, not swallowed: an operator reading the cron result must be able to see what the
   // repair pass did.
   assert.deepEqual(body.backReferenceRepair, REPAIR_RESULT)
+})
+
+// ---------------------------------------------------------------------------
+// THE CONTRACT, DRIVEN BY THE REGISTRY (o3d-0bfh r8, Codex MEDIUM).
+//
+// The two tests above assert the behaviour this file has always been about, connector by connector.
+// What they did NOT do is tie that behaviour to the DECLARATION an operator is shown. The registry
+// says of each connector either "a sweep re-reads the retained marker" or "nothing does, here is
+// what a human must do instead"; nothing executed anything to find out whether that was true, and
+// the registry test could only check that a file with the right name mentioned the right strings.
+//
+// So the loop below asks the real entry point. For every connector in the registry it drives the
+// actual cron GET under that connector's branch and asserts that the connector's own sweep double —
+// the exact function, not a name in a text scan — was called if and only if the connector declares
+// `consumer: 'sweep'`. A connector added to the registry gets an assertion here whether or not
+// anybody remembers to write one.
+// ---------------------------------------------------------------------------
+
+/** Which connectors this file has doubles for. Asserted to cover the registry, never to define it. */
+const CONTRACTED_CONNECTORS = ['xero', 'quickbooks'] as const
+
+test('[o3d-0bfh r8] CONTRACT: every registry entry is checked against what the real cron route does', async () => {
+  const declared = Object.keys(ACCOUNTING_FOLLOW_UP_RECOVERY)
+  assert.ok(declared.length > 0, 'the registry must declare something, or this loop asserts nothing')
+  for (const connector of declared) {
+    assert.ok(
+      (CONTRACTED_CONNECTORS as readonly string[]).includes(connector),
+      `${connector} is declared in ACCOUNTING_FOLLOW_UP_RECOVERY but this file has no double for it, so its `
+        + 'declaration is checked by nothing. Add the double and list it in CONTRACTED_CONNECTORS.',
+    )
+  }
+
+  for (const [connector, recovery] of Object.entries(ACCOUNTING_FOLLOW_UP_RECOVERY)) {
+    await runCron(connector)
+    const swept = calls.some((call) => call.connector === connector && call.what === 'repair')
+    // The precondition: this run really did reach the connector's branch. Without it a route that
+    // returned `skipped` early would satisfy every `consumer: 'none'` entry for the wrong reason.
+    assert.ok(
+      calls.some((call) => call.connector === connector && call.what === 'process'),
+      `the cron route never reached the ${connector} branch, so this run establishes nothing about it`,
+    )
+    assert.equal(
+      swept, recovery.consumer === 'sweep',
+      recovery.consumer === 'sweep'
+        ? `${connector} declares consumer: 'sweep', but driving the real cron route did not call its sweep. The `
+          + 'operator is being told a payment will be re-enqueued by something that never runs.'
+        : `${connector} declares consumer: 'none' — and its remedy tells a human to act by hand — but driving the `
+          + 'real cron route DID call a sweep for it. The declaration and the code have drifted.',
+    )
+  }
 })
