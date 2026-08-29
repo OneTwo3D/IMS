@@ -648,8 +648,16 @@ test('install.sh lifts the fences immediately before the start, and restores cro
 
   // The crontab block is spliced from the LIVE crontab, so restoring it after the splice
   // would leave every fenced line commented out and the queue workers silently off.
-  const splice = realCodeLine(INSTALL_LINES, /crontab -u "\$\{APP_USER\}" -l .* \| awk/)
+  //
+  // The read that feeds it is the shared, fail-closed one now (o3d-p9dq, Codex r28) rather than a
+  // second `crontab -l 2>/dev/null || true`, so the splice is located by its awk and the feed is
+  // asserted on its own line.
+  const splice = realCodeLine(INSTALL_LINES, /\| awk -v port="\$\{APP_PORT\}" -v blockfile=/)
   assert.notEqual(splice, -1, 'the managed cron block is spliced into whatever the crontab currently holds')
+  assert.match(INSTALL_LINES[splice - 1], /printf '%s\\n' "\$\{existing\}"/,
+    'and it is fed from the crontab this run READ, not from a second unguarded read')
+  assert.notEqual(realCodeLine(INSTALL_LINES, /^\s*existing="\$\{CRONTAB_READ_TEXT\}"$/), -1,
+    'which is what the shared reader returned')
   assert.ok(unfence < splice, 'cron must be unfenced BEFORE the managed block is spliced into it')
 })
 
@@ -2694,6 +2702,17 @@ crontab(){
   # so the log line named the file and that was the whole assertion. Since the restore decides
   # WHAT to install rather than which path to copy, the content is what has to be observed — so
   # a write (last argument '-') has its stdin recorded and the assertions read that.
+  #
+  # AND A -l READ ANSWERS WITH THE CRONTAB THE SCENARIO ACTUALLY HAS (o3d-p9dq, Codex r28). This shim
+  # used to answer every read with nothing, which is not a neutral stub: it describes a crontab
+  # somebody has emptied, and the restore now refuses to install a snapshot over that rather than
+  # resurrecting entries a deletion removed. Each harness seeds \${FAKE_LIVE_CRONTAB} with the
+  # state its own scenario leaves — the unfenced original for a fence whose write failed, the
+  # fenced projection for a run interrupted after it fenced.
+  if [[ " $* " == *" -l "* ]]; then
+    if [[ -n "\${FAKE_LIVE_CRONTAB:-}" && -f "\${FAKE_LIVE_CRONTAB}" ]]; then cat "\${FAKE_LIVE_CRONTAB}"; fi
+    return 0
+  fi
   if [[ "\${*: -1}" == "-" ]]; then sed 's/^/crontab-stdin: /' >> "\${LOG}"; fi
   return 0
 }
@@ -2719,11 +2738,15 @@ function runTrapHarness(
     writeFileSync(join(dir, 'FENCED'), 'migration_attempted=false\nschema_touched=false\n')
     writeFileSync(join(dropinDir, 'zz-deploy-fence.conf'), '[Unit]\n')
     writeFileSync(join(dir, 'crontab.bak'), '*/5 * * * * /usr/bin/true\n')
+    // …and the crontab itself. This scenario is "fence_cron took the backup and its `crontab -`
+    // then failed", so the live crontab is the ORIGINAL, unchanged and unfenced.
+    writeFileSync(join(dir, 'live-crontab'), '*/5 * * * * /usr/bin/true\n')
 
     const program = [
       'set -euo pipefail',
       entry.preamble(dir),
       TRAP_STUBS,
+      `FAKE_LIVE_CRONTAB='${join(dir, 'live-crontab')}'`,
       shellFunction(entry.source, 'restore_cron_from_backup_locked'),
       shellFunction(entry.source, 'restore_cron_from_backup'),
       shellFunction(entry.source, 'rollback_reboot_fence_install'),
@@ -3154,6 +3177,7 @@ function adoptionProgram(entry: (typeof R8_CASES)[number], dir: string, state: s
     'set -euo pipefail',
     entry.preamble(dir),
     TRAP_STUBS,
+    `FAKE_LIVE_CRONTAB='${join(dir, 'live-crontab')}'`,
     entry.extra,
     R8_STUBS,
     // Stubbed because they reach the network, a database or /etc — never because they are
@@ -3195,6 +3219,11 @@ function runAdoption(
     writeFileSync(join(dir, 'FENCED'), marker)
     writeFileSync(join(dropinDir, 'zz-deploy-fence.conf'), '[Unit]\n')
     writeFileSync(join(dir, 'crontab.bak'), '*/5 * * * * /usr/bin/true\n')
+    // …and the crontab as that run left it: FENCED. An interrupted ARMING is by definition a run
+    // that got as far as commenting the crontab out, so the live crontab is the fence's own
+    // projection of the backup beside it — which is what makes "nothing has written it since"
+    // true, and what the resume now proves before installing the snapshot (o3d-p9dq, Codex r28).
+    writeFileSync(join(dir, 'live-crontab'), '#DEPLOY-FENCE# */5 * * * * /usr/bin/true\n')
     // AND THE CONNECTION-FENCE RECORD (o3d-2sm1.5, Codex r12). A fence that is STANDING has a
     // record; the fixture used to omit it, so install.sh's inline adoption skipped its whole
     // held-fence branch on a missing file and the "must NOT release" assertions below were
