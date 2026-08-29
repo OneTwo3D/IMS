@@ -89,15 +89,44 @@ function txDelegates() {
   },
   // The refusal queue and the pending-FX queue share this table and are told apart by the
   // payload discriminator; the double keeps them together for the same reason production does.
+  // r14: THE DOUBLE HAS TO READ BACK WHAT IT WROTE. `findFirst: () => null` was harmless while the
+  // recorder swallowed its own failures; now that the refusal is only acknowledged once the by-id
+  // row is confirmed readable, a write-only double models a database that never persists anything —
+  // and every refusal below would be reported as an unrecorded one.
   shoppingSyncLog: {
-    create: async ({ data }: { data: Row }) => { state.refusalQueue.push(data); return { id: 'log-1' } },
-    update: async ({ data }: { data: Row }) => { state.refusalQueue.push(data); return { id: 'log-1' } },
-    findFirst: async () => null,
-    findMany: async () => [],
+    create: async ({ data }: { data: Row }) => {
+      const row = { ...data, id: `log-${state.refusalQueue.length + 1}` }
+      state.refusalQueue.push(row)
+      return row
+    },
+    update: async ({ where, data }: { where: { id: string }; data: Row }) => {
+      const row = state.refusalQueue.find((entry) => entry.id === where.id)
+      if (row) Object.assign(row, data)
+      return row ?? {}
+    },
+    findFirst: async ({ where }: { where: Row }) => matchRefusalRows(where)[0] ?? null,
+    findMany: async ({ where }: { where: Row }) => matchRefusalRows(where),
     count: async () => 0,
   },
   user: { findMany: async () => [] },
   }
+}
+
+/** The subset of the refusal queue's `where` the recorder and the drain actually use. */
+function matchRefusalRows(where: Row) {
+  const path = where.payload as { path?: string[]; equals?: unknown } | undefined
+  return state.refusalQueue.filter((row) => {
+    if (where.status && row.status !== where.status) return false
+    if (where.externalId && row.externalId !== where.externalId) return false
+    if (where.entityType && row.entityType !== where.entityType) return false
+    if (where.connector && row.connector !== where.connector) return false
+    if (where.direction && row.direction !== where.direction) return false
+    if (path?.path) {
+      const payload = row.payload as Record<string, unknown> | undefined
+      if (!payload || payload[path.path[0]] !== path.equals) return false
+    }
+    return true
+  })
 }
 
 function txClient() {

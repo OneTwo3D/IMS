@@ -77,7 +77,12 @@ function assertProcessableEvent(
   }
 }
 
-function isRetryableHttpStatus(status: number): boolean {
+/**
+ * Exported so a test can ask THIS rule whether a delivery will be sent again, rather than restate
+ * it (o3d-batch-ret r14). "The order is redelivered" is the whole claim behind refusing to ACK a
+ * refusal that was not written down, and a test that hard-codes `=== 500` proves nothing about it.
+ */
+export function isRetryableHttpStatus(status: number): boolean {
   return status === 408 || status === 429 || status >= 500
 }
 
