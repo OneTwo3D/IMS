@@ -253,6 +253,20 @@ test('saveCronJobSettings mirrors the legacy enablement row, driven from the reg
     assert.equal(state.transactions, 1, 'in the SAME transaction — a mirror that can half-apply is not one')
   }
 
+  // THE REGISTRY MUST BE READ THROUGH THE BARREL, and no behavioural assertion here can show it:
+  // registration is a module-load side effect on a process-global array, and this test file has
+  // already imported the barrel, so `@/lib/cron-registry` would answer identically. It is asserted
+  // as source instead, honestly labelled. Today app/actions/cron.ts also reaches the barrel
+  // transitively (via @/lib/crontab-reconcile), so the bare spelling happens to work; the import
+  // below is what keeps it working if that transitive path ever changes, and a mutation to the bare
+  // module fails HERE rather than silently mirroring nothing.
+  const cronSource = readFileSync(join(REPO, 'app/actions/cron.ts'), 'utf8')
+  assert.match(
+    cronSource,
+    /import \{[^}]*getAllCronJobs[^}]*\} from '@\/lib\/cron-jobs'/,
+    'the registry is read through the barrel that registers the jobs, not the bare registry module',
+  )
+
   // A job WITHOUT a legacy key gets exactly its two canonical rows and nothing invented.
   const plain = getAllCronJobs().find((job) => !job.legacyEnabledKey)
   assert.ok(plain, 'every job has a legacy key — the negative case cannot be exercised')
