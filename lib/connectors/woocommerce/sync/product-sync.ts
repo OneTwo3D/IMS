@@ -1445,7 +1445,9 @@ export const MAX_WC_VARIATION_PAGES =
  * option — bound the work BELOW the reclaim window — and makes the relationship an asserted
  * invariant rather than a hope: see `tests/wc-variation-fetch-budget.test.ts`. A real heartbeat is
  * still the right answer if this budget ever has to rise; the pattern to copy is
- * `lib/connectors/mintsoft/sync/stock-sync.ts`.
+ * `lib/connectors/mintsoft/sync/stock-sync.ts`. wms-connector-boundary-ok: o3d-xnwu: prose pointer to
+ * the heartbeat pattern worth copying if this budget rises; no WMS connector behaviour is reached
+ * from the WooCommerce product sync.
  *
  * Checked BETWEEN pages, so one in-flight request may overshoot it — that is the
  * "+ WC_REQUEST_TIMEOUT_MS" term in the invariant.
