@@ -2424,7 +2424,15 @@ upgrade_in_place() {
     return 0
   fi
   if command -v crontab >/dev/null 2>&1; then
-    if crontab -u "${APP_USER}" -l 2>/dev/null | grep -qE '^[[:space:]]*[^#[:space:]]'; then
+    # FAIL CLOSED, AND NOT TOWARDS EITHER ANSWER (o3d-p9dq, Codex r28 sweep). The pipeline this
+    # replaces sent a failed read to `grep -q`, which found no active line and returned "there is
+    # nothing here to break" — so a host whose crontab could not be read was treated as a FRESH BOX
+    # and its database was migrated with the existing installation still serving. Guessing the
+    # other way is just as destructive: a first install would be stopped and fenced. So this
+    # refuses instead, before the run has changed anything at all.
+    read_crontab_for "${APP_USER}" || die \
+      "the ${APP_USER} crontab could not be read, so this run cannot tell an in-place upgrade from a first install: ${CRONTAB_READ_REASON}. Both answers act destructively on the wrong host — one migrates a live installation, the other stops and fences a box that has nothing on it — so NOTHING HAS BEEN CHANGED. Settle the read (crontab -u ${APP_USER} -l) and run this again."
+    if grep -qE '^[[:space:]]*[^#[:space:]]' <<< "${CRONTAB_READ_TEXT}"; then
       return 0
     fi
   fi
@@ -4629,8 +4637,16 @@ fence_cron() {
 
 fence_cron_locked() {
   local current active
-  current="$(crontab -u "${APP_USER}" -l 2>/dev/null || true)"
-  [[ -n "${current}" ]] || { info "No crontab for ${APP_USER}; nothing to fence."; return 0; }
+  # FAIL CLOSED, BEFORE THE DATABASE FENCE AND THE MIGRATION (o3d-p9dq, Codex r28 HIGH #2).
+  # This is the read the whole-crontab fence rests on. `2>/dev/null || true` used to turn a
+  # permission, spool or I/O failure into an empty string, which the line below read as "no
+  # crontab" — and the run then walked on into the connection fence and the migration believing
+  # it had disarmed cron, with every existing entry still scheduled. read_crontab_for() resolves
+  # an absence only from the diagnostic that states one; everything else stops the run here.
+  read_crontab_for "${APP_USER}" || die \
+    "The ${APP_USER} crontab could not be READ, so the cron writers cannot be fenced: ${CRONTAB_READ_REASON}. A crontab this run cannot read is not a crontab with nothing in it — taking the database fence and running the migration on that reading would leave every existing cron entry scheduled over a moving schema, which is the writer class this fence exists to stop. NOTHING HAS BEEN MIGRATED."
+  current="${CRONTAB_READ_TEXT}"
+  if ! ${CRONTAB_READ_PRESENT} || [[ -z "${current}" ]]; then info "No crontab for ${APP_USER}; nothing to fence."; return 0; fi
   active="$(printf '%s\n' "${current}" | grep -cE '^[[:space:]]*[^#[:space:]]' || true)"
   if [[ "${active}" -eq 0 ]]; then
     CRON_FENCED=true
@@ -4684,7 +4700,14 @@ unfence_cron() {
 # rows, the durable record the crontab is only a projection of.
 unfence_cron_locked() {
   local current backup
-  current="$(crontab -u "${APP_USER}" -l 2>/dev/null || true)"
+  # AND THE READ ITSELF FAILS CLOSED (o3d-p9dq, Codex r28 HIGH #1). An unreadable crontab used to
+  # arrive here as the empty string, which holds nothing the backup does not — so the plan restored
+  # the pre-cutover snapshot over whatever was really there.
+  read_crontab_for "${APP_USER}" || {
+    CRON_UNFENCE_REASON="the live crontab could not be read, so nothing can establish what is in it and a snapshot installed on that reading would discard whatever is: ${CRONTAB_READ_REASON}"
+    return "${CRONTAB_UNFENCE_DIVERGED}"
+  }
+  current="${CRONTAB_READ_TEXT}"
   if ! backup="$(cat "${CRON_BACKUP}" 2>/dev/null)"; then
     CRON_UNFENCE_REASON="the backup at ${CRON_BACKUP} could not be read"
     return "${CRONTAB_UNFENCE_DIVERGED}"
@@ -4787,10 +4810,14 @@ predecessor_is_active() {
 resume_restore_cron_locked() {
   local current backup
   RESUME_CRON_DIVERGED=""
-  current="$(crontab -u "${APP_USER}" -l 2>/dev/null || true)"
+  read_crontab_for "${APP_USER}" || {
+    RESUME_CRON_DIVERGED="the live crontab could not be read, so nothing can establish that the interrupted run's snapshot is still current: ${CRONTAB_READ_REASON}"
+    return 1
+  }
+  current="${CRONTAB_READ_TEXT}"
   backup="$(cat "${CRON_BACKUP}" 2>/dev/null)" || return 1
-  if crontab_gained_lines_over_backup "${backup}" "${current}"; then
-    RESUME_CRON_DIVERGED="the live crontab holds lines the fenced projection of ${CRON_BACKUP} does not, so something has written it since the interrupted run took that snapshot and installing the snapshot would discard that write"
+  if ! crontab_is_unmoved_since_backup "${backup}" "${current}"; then
+    RESUME_CRON_DIVERGED="the live crontab is not the fence's own projection of ${CRON_BACKUP}, so something has written it since the interrupted run took that snapshot — installing the snapshot would discard that write, or put back an entry somebody deliberately deleted"
     return 1
   fi
   printf '%s\n' "${backup}" | crontab -u "${APP_USER}" - || return 1
@@ -5255,7 +5282,11 @@ restore_cron_from_backup() {
 # caller prints the by-hand command, which is what it already did for a lock it could not take.
 restore_cron_from_backup_locked() {
   local current backup
-  current="$(crontab -u "${APP_USER}" -l 2>/dev/null || true)"
+  read_crontab_for "${APP_USER}" || {
+    warn "The ${APP_USER} crontab could not be read, so it will not be restored from ${CRON_BACKUP}: ${CRONTAB_READ_REASON}"
+    return 1
+  }
+  current="${CRONTAB_READ_TEXT}"
   backup="$(cat "${CRON_BACKUP}" 2>/dev/null)" || return 1
   plan_crontab_unfence "${backup}" "${current}" || return 1
   printf '%s\n' "${CRON_UNFENCE_TEXT}" | crontab -u "${APP_USER}" - || return 1
@@ -7636,14 +7667,27 @@ bootstrap_managed_crontab_block_locked() {
   # committed rows and nothing notices" state this whole protocol exists to prevent, just reached
   # from the outside. If a managed block is already there, the app owns it. This test and the write
   # are both inside the lock, so a save cannot land between them.
-  if grep -qE '^# --- OTI CRON START ---[ \t\r]*$' <<< "$(crontab -u "${APP_USER}" -l 2>/dev/null || true)"; then
+  #
+  # ONE READ, AND IT FAILS CLOSED (o3d-p9dq, Codex r28 sweep). This function used to read the
+  # crontab TWICE with `2>/dev/null || true`, and both readings were load-bearing in the dangerous
+  # direction: a failed read holds no START marker, so the test below said "no managed block, the
+  # app does not own this" and the awk pipeline below THAT rebuilt the crontab from an empty
+  # reading — installing the installer's DEFAULT schedules over the operator's committed ones and
+  # dropping every unmanaged line the crontab was the only record of. Now it is read once, and a
+  # read that did not resolve writes nothing.
+  local existing
+  read_crontab_for "${APP_USER}" || return 1
+  existing="${CRONTAB_READ_TEXT}"
+  if grep -qE '^# --- OTI CRON START ---[ \t\r]*$' <<< "${existing}"; then
     info "A managed crontab block already exists for ${APP_USER} — leaving the app's schedules alone."
     info "Newly registered jobs are scheduled by Settings -> System -> Scheduler -> Save & Apply."
   else
     CRON_BOOTSTRAP_WRITTEN=yes
-# `|| true` so a fresh box with NO existing crontab (crontab -l exits nonzero)
-# doesn't trip `set -euo pipefail` and abort the install (Codex r9).
-{ crontab -u "${APP_USER}" -l 2>/dev/null || true; } | awk -v port="${APP_PORT}" -v blockfile="${CRON_BLOCK_FILE}" '
+# The crontab as read ABOVE, under this same lock — never a second read, which could disagree with
+# the one the marker test was decided on. A box with no crontab at all feeds the awk nothing, which
+# is how it appends the block to an empty file.
+if [[ -n "${existing}" ]]; then printf '%s\n' "${existing}"; fi \
+  | awk -v port="${APP_PORT}" -v blockfile="${CRON_BLOCK_FILE}" '
   function isStart(x) { return x ~ /^# --- OTI CRON START ---[ \t\r]*$/ }
   function isEnd(x)   { return x ~ /^# --- OTI CRON END ---[ \t\r]*$/ }
   function isRemnant(x) {
@@ -7693,7 +7737,11 @@ if [[ "${CRON_BOOTSTRAP_RC}" -ne 0 ]]; then
   # This is the ONE crontab site in these three scripts that does not die on a conflict, because
   # the only thing it would have written is a set of DEFAULT schedules the application replaces on
   # its first save. Nothing this run needs to put back is left behind.
-  warn "Another process is reconciling ${APP_USER}'s crontab; leaving it untouched."
+  if [[ "${CRON_BOOTSTRAP_RC}" -eq "${CRONTAB_LOCK_CONFLICT}" ]]; then
+    warn "Another process is reconciling ${APP_USER}'s crontab; leaving it untouched."
+  else
+    warn "The ${APP_USER} crontab could not be read, so no default schedule was written: ${CRONTAB_READ_REASON:-reason not recorded}"
+  fi
   warn "If scheduled jobs are missing, open Settings -> System -> Scheduler and press Save & Apply."
 fi
 rm -f "${CRON_BLOCK_FILE}"

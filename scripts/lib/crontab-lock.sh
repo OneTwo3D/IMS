@@ -335,6 +335,113 @@ with_crontab_lock() {
 # only safe to install blindly if the world still matches what it was taken from; when it does
 # not, "refuse loudly" beats both "restore the old one" and "guess".
 
+# =============================================================================
+# A CRONTAB READ IS A QUESTION, AND A QUESTION THAT COULD NOT BE ANSWERED IS NOT THE
+# ANSWER "NOTHING IS SCHEDULED"
+# (o3d-p9dq, Codex r28 HIGH x2 — the `ss` finding of r27, reached again through `crontab -l`)
+# =============================================================================
+# Round 27 closed exactly this shape at the socket census: `ss` missing, `ss` non-zero and `ss`
+# silent were all being read as "nobody is listening". Every `crontab -l` in these three
+# entrypoints was written the other way and kept it open:
+#
+#     current="$(crontab -u "$APP_USER" -l 2>/dev/null || true)"
+#
+# `2>/dev/null` throws away the only thing that says WHY, and `|| true` turns every failure into
+# the empty string. Two callers then read that empty string as a fact about the world:
+#
+#   fence_cron_locked        "No crontab for ${APP_USER}; nothing to fence."  — and the cutover
+#                            walks on into the database fence and the migration with every
+#                            existing cron entry still scheduled, which is the writer class the
+#                            whole-crontab fence exists to stop.
+#   unfence_cron_locked      an empty live crontab holds nothing the backup does not, so the
+#                            pre-cutover snapshot goes back — over a schedule the application
+#                            committed and reported as saved while the fence was up.
+#
+# THE SEPARATION, ESTABLISHED ON THE PLATFORMS THIS SHIPS TO RATHER THAN ASSUMED. Debian 11/12 and
+# Ubuntu 22.04/24.04 all carry Vixie cron (Debian `cron`, /usr/bin/crontab, setgid crontab).
+# `crontab -u <user> -l` was run on one of them in each state:
+#
+#   the user has a crontab            rc=0  stdout=the crontab      stderr=(empty)
+#   the user has an EMPTY crontab     rc=0  stdout=(empty)          stderr=(empty)
+#   the user has NO crontab           rc=1  stdout=(empty)          stderr=`no crontab for <user>`
+#   no such user                      rc=1  stdout=(empty)          stderr=``crontab:  user `x' unknown``
+#   not privileged to use -u          rc=1  stdout=(empty)          stderr=`must be privileged to use -u`
+#
+# So the exit status alone CANNOT separate the benign answer from the failures — every one of them
+# is 1 with empty output, which is precisely why `|| true` looked harmless. What separates them is
+# the diagnostic: the absent-crontab case, and only it, says `no crontab for <that user>` and says
+# nothing else. This reader therefore resolves an absence ONLY from that message, matched whole
+# against the user it asked about, with empty output alongside it. Anything else — a different
+# message, an extra line, no message at all — is an UNRESOLVED READ, and every caller refuses.
+#
+# Deliberately strict: a message this reader does not recognise is treated as a failure rather than
+# guessed at, because the cost of the two mistakes is not symmetric. An unresolved read costs a
+# re-run; an unresolved read mistaken for an empty crontab costs a migration under live cron
+# writers, or a committed schedule silently discarded.
+#
+#   read_crontab_for <user>
+#
+#   0  the read RESOLVED. CRONTAB_READ_TEXT holds the crontab (empty when there is none), and
+#      CRONTAB_READ_PRESENT says which of "empty crontab" and "no crontab" it was.
+#   1  the read did NOT resolve. CRONTAB_READ_REASON says what happened; the caller must refuse.
+CRONTAB_READ_TEXT=""
+CRONTAB_READ_PRESENT=false
+CRONTAB_READ_REASON=""
+
+# Is <stderr> the one benign diagnostic, and nothing else? Normalised for a leading `crontab: `
+# prefix and surrounding whitespace, then compared WHOLE: a second line, or any trailing text,
+# leaves the read unresolved rather than being skimmed for a substring.
+crontab_read_says_no_crontab() {
+  local user="$1" err="$2" normalised
+  normalised="$(printf '%s' "${err}" | tr -d '\r' \
+    | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^crontab:[[:space:]]*//')"
+  [[ "${normalised}" == "no crontab for ${user}" ]]
+}
+
+read_crontab_for() {
+  local user="${1:-}" err_file out err rc=0
+  CRONTAB_READ_TEXT=""
+  CRONTAB_READ_PRESENT=false
+  CRONTAB_READ_REASON=""
+
+  if [[ -z "${user}" ]]; then
+    CRONTAB_READ_REASON="the crontab owner could not be resolved, so there is no user to ask about and nothing can establish what is scheduled"
+    return 1
+  fi
+  # NOT the same shape as a missing `ss`, and the difference is the reason this one is an answer.
+  # `ss` absent leaves the port question unanswered — something can still be bound. A host with no
+  # `crontab` binary has no per-user crontabs for anything to have written, so "there is nothing to
+  # fence" is established rather than assumed. The callers that reach this treat it as an
+  # unresolved read anyway; the ones that can act on it check `command -v crontab` themselves and
+  # say so.
+  if ! command -v crontab >/dev/null 2>&1; then
+    CRONTAB_READ_REASON="\`crontab\` is not installed on this host, so it cannot be asked what ${user} has scheduled"
+    return 1
+  fi
+
+  # THE DIAGNOSTIC IS CAPTURED, NOT DISCARDED — it is the whole basis of the separation above — and
+  # the exit status is taken on its own line rather than inside a pipeline that would hide it.
+  err_file="$(mktemp "${TMPDIR:-/tmp}/ims-crontab-read.XXXXXX" 2>/dev/null)" || {
+    CRONTAB_READ_REASON="a temporary file for \`crontab -u ${user} -l\`'s diagnostics could not be created, so a failed read could not be told from an absent crontab"
+    return 1
+  }
+  out="$(crontab -u "${user}" -l 2>"${err_file}")" || rc=$?
+  err="$(cat "${err_file}" 2>/dev/null)" || err=""
+  rm -f "${err_file}"
+
+  if [[ "${rc}" -eq 0 ]]; then
+    CRONTAB_READ_TEXT="${out}"
+    CRONTAB_READ_PRESENT=true
+    return 0
+  fi
+  if [[ -z "${out}" ]] && crontab_read_says_no_crontab "${user}" "${err}"; then
+    CRONTAB_READ_PRESENT=false
+    return 0
+  fi
+  CRONTAB_READ_REASON="\`crontab -u ${user} -l\` exited ${rc} and did not answer that ${user} has no crontab — it said: ${err:-nothing at all}. An unreadable crontab is not an empty one"
+  return 1
+}
+
 # The mark the fence puts in front of every active line, stated ONCE so that the projection, its
 # inverse and every message quote the same string. Three copies of a sentinel is three sentinels.
 CRON_FENCE_PREFIX='#DEPLOY-FENCE# '
@@ -357,54 +464,78 @@ crontab_unfence_projection() {
   printf '%s\n' "$1" | awk '{ sub(/^#DEPLOY-FENCE# /, ""); print }'
 }
 
-# WHICH LINES ONLY THE CRONTAB REMEMBERS — and are they still there?
+# WHICH LINES ONLY THE CRONTAB REMEMBERS — and are they all still there, as many times as there
+# were, in the order they were in?
 #
 #   crontab_unmanaged_lines_missing_from <backup-text> <candidate-text>
 #
-# Prints every line of <backup> that lives OUTSIDE an OTI managed block and does not appear in
-# <candidate>. Returns 0 when nothing is missing.
+# Prints every line of <backup> that lives OUTSIDE an OTI managed block and cannot be matched, in
+# order, against a distinct line of <candidate> outside ITS managed block. Prints nothing — and
+# returns 0 — when the backup's unmanaged content is an ordered subsequence of the candidate's.
 #
-# The managed block is deliberately EXCLUDED from the comparison: replacing it is the entire
-# point of a merge, and its truth is the settings rows rather than these bytes. Blank lines are
-# ignored because neither writer preserves how many there were. Everything else is compared as a
-# whole line, exactly, because an operator's cron entry is not a thing to approximate.
-# Every non-blank line of <a> that does not appear in <b>. Whole-line, exact: an operator's cron
-# entry is not a thing to approximate. Blank lines are ignored because no writer here preserves how
-# many there were.
-crontab_lines_missing_from() {
-  local a="$1" b="$2"
-  awk '
-    NR == FNR { have[$0] = 1; next }
-    /^[[:space:]]*$/ { next }
-    !($0 in have) { print }
-  ' <(printf '%s\n' "${b}") <(printf '%s\n' "${a}")
-}
-
-# HAS ANYTHING BEEN WRITTEN THAT THE SNAPSHOT DOES NOT ALREADY ACCOUNT FOR?
+# A SUBSEQUENCE WITH MULTIPLICITY, NOT A SET (o3d-p9dq, Codex r28 MEDIUM). This used to build one
+# `have[$0]` table out of the candidate and ask whether each backup line appeared in it at all,
+# which throws away two things a crontab actually means:
 #
-#   crontab_gained_lines_over_backup <backup-text> <live-crontab-text>
+#   HOW MANY TIMES. Two identical entries run the job TWICE. A backup holding an operator's job on
+#   two lines was satisfied by a candidate holding it on one, the merge was declared lossless, the
+#   backup was deleted, and the schedule quietly halved.
+#   IN WHAT ORDER. `PATH=`, `SHELL=`, `MAILTO=` and `CRON_TZ=` apply to the entries BELOW them and
+#   not to the ones above. Every line still existing after a reordering is not the same crontab: a
+#   job that moved above the `CRON_TZ=` that dated it now runs in a different timezone. A set test
+#   cannot see that at all.
 #
-# True when the live crontab holds a line the fence's own projection of <backup> does not — which
-# is exactly the shape of a reconciliation's managed block, an operator's new entry, or anything
-# else committed after the snapshot was taken. False when the live crontab holds nothing new,
-# whether it is identical to the projection or has LOST lines (a fence that died half-written, a
-# `crontab -l` that came back empty). That asymmetry is the point: gaining a line means a snapshot
-# would discard a write, and losing one means the snapshot is the only record left.
-crontab_gained_lines_over_backup() {
-  local backup="$1" live="$2"
-  [[ -n "$(crontab_lines_missing_from "${live}" "$(crontab_fence_projection "${backup}")")" ]]
-}
-
+# So each backup line consumes a DISTINCT candidate line and the cursor only moves forwards.
+# Gaining lines is still allowed — a managed block the application projected while the fence was
+# up, an operator entry added since — because inserting into a sequence leaves it a subsequence.
+#
+# The managed block is excluded on BOTH sides: replacing it is the entire point of a merge, its
+# truth is the settings rows rather than these bytes, and an unmanaged backup line must not be
+# counted as preserved because it happens to appear inside the block a reconciliation generated.
+# Blank lines are ignored because neither writer preserves how many there were. Everything else is
+# compared as a whole line, exactly, because an operator's cron entry is not a thing to approximate.
 crontab_unmanaged_lines_missing_from() {
   local backup="$1" candidate="$2"
   awk '
-    NR == FNR { have[$0] = 1; next }
-    /^# --- OTI CRON START ---[ \t\r]*$/ { in_block = 1; next }
-    /^# --- OTI CRON END ---[ \t\r]*$/   { in_block = 0; next }
-    in_block { next }
-    /^[[:space:]]*$/ { next }
-    !($0 in have) { print }
+    function is_start(x) { return x ~ /^# --- OTI CRON START ---[ \t\r]*$/ }
+    function is_end(x)   { return x ~ /^# --- OTI CRON END ---[ \t\r]*$/ }
+    function is_blank(x) { return x ~ /^[[:space:]]*$/ }
+    NR == FNR {
+      if (is_start($0)) { c_block = 1; next }
+      if (is_end($0))   { c_block = 0; next }
+      if (c_block || is_blank($0)) next
+      cand[++m] = $0
+      next
+    }
+    {
+      if (is_start($0)) { b_block = 1; next }
+      if (is_end($0))   { b_block = 0; next }
+      if (b_block || is_blank($0)) next
+      back[++n] = $0
+    }
+    END {
+      cursor = 1
+      for (i = 1; i <= n; i++) {
+        j = cursor
+        while (j <= m && cand[j] != back[i]) j++
+        if (j <= m) { cursor = j + 1 } else { print back[i] }
+      }
+    }
   ' <(printf '%s\n' "${candidate}") <(printf '%s\n' "${backup}")
+}
+
+# IS THE WORLD STILL THE ONE THE SNAPSHOT WAS TAKEN FROM?
+#
+#   crontab_is_unmoved_since_backup <backup-text> <live-crontab-text>
+#
+# True only when the live crontab is EXACTLY the fence's own projection of <backup>, byte for byte
+# — which is what "the only write since the snapshot was the fence itself" looks like, and the one
+# condition under which installing the snapshot cannot discard anything. `crontab -` on the Vixie
+# cron these scripts ship to writes its input verbatim and `crontab -l` reads it back verbatim, so
+# this equality is a real test and not a formatting lottery.
+crontab_is_unmoved_since_backup() {
+  local backup="$1" live="$2"
+  [[ "${live}" == "$(crontab_fence_projection "${backup}")" ]]
 }
 
 # HOW A FENCED CRONTAB IS PUT BACK.
@@ -437,27 +568,24 @@ plan_crontab_unfence() {
   # the backup, byte for byte. Equal means the only write since the snapshot was the fence itself,
   # so the snapshot is provably current and goes back verbatim — the pre-existing behaviour, now
   # with a proof under it instead of an assumption.
-  if [[ "${live}" == "$(crontab_fence_projection "${backup}")" ]]; then
+  if crontab_is_unmoved_since_backup "${backup}" "${live}"; then
     CRON_UNFENCE_PLAN="snapshot"
     CRON_UNFENCE_TEXT="${backup}"
     return 0
   fi
 
-  # (2) DID ANYTHING NEW APPEAR? A live crontab whose every line is already in the projection has
-  # not GAINED anything — it has LOST lines, which is what a fence that died half-written, or a
-  # `crontab -l` this shell could not read, both look like. Restoring the backup there cannot
-  # discard a committed save, because there is no write to discard; refusing would leave a crontab
-  # that is missing lines nothing else records. So the snapshot goes back, and the finding stays
-  # closed: a reconciliation's managed block is by construction NOT in the projection of a backup
-  # taken before it, so this branch cannot swallow one.
-  if ! crontab_gained_lines_over_backup "${backup}" "${live}"; then
-    CRON_UNFENCE_PLAN="snapshot"
-    CRON_UNFENCE_TEXT="${backup}"
-    CRON_UNFENCE_REASON="the live crontab held nothing the backup does not, so it had lost lines rather than gained any"
-    return 0
-  fi
+  # A DELETION IS A WRITE (o3d-p9dq, Codex r28 HIGH #1, second half). Round 27 had a branch here
+  # for a live crontab that had only LOST lines: it restored the snapshot, on the reasoning that
+  # there was no write to discard. Two of the three things that produce that reading were an
+  # unreadable `crontab -l` — now impossible, because read_crontab_for() refuses instead of
+  # returning an empty string — and the third is somebody having deleted a cron entry on purpose.
+  # Restoring the snapshot over that RESURRECTS the entry: an operator who ran `crontab -e` to stop
+  # a job, and was given no error, finds it scheduled again. So there is no lost-lines branch any
+  # more. A deletion falls through to the merge below exactly like every other write, and the
+  # subsequence check is what decides: the deleted line is a backup line the candidate does not
+  # hold, so the merge refuses and NAMES it, leaving the backup on disk to settle by hand.
 
-  # (3) SOMETHING WROTE. Undo the fence where it was applied: the live crontab minus the marks.
+  # (2) SOMETHING WROTE. Undo the fence where it was applied: the live crontab minus the marks.
   # That keeps the managed block whoever wrote it last projected from the settings rows, and it
   # keeps any unmanaged line added while the fence was up.
   merged="$(crontab_unfence_projection "${live}")"
@@ -469,7 +597,7 @@ plan_crontab_unfence() {
     return 0
   fi
 
-  # (4) THE MERGE WOULD DROP A LINE NOTHING ELSE HOLDS. Neither candidate is safe to install —
+  # (3) THE MERGE WOULD DROP A LINE NOTHING ELSE HOLDS. Neither candidate is safe to install —
   # the backup would discard whatever wrote, the merge would discard these — so nothing is
   # installed and the divergence is named.
   CRON_UNFENCE_PLAN="refuse"

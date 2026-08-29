@@ -2339,8 +2339,16 @@ fence_cron() {
 
 fence_cron_locked() {
   local current
-  current="$(crontab -u "$APP_USER" -l 2>/dev/null || true)"
-  if [[ -z "$current" ]]; then
+  # FAIL CLOSED, BEFORE THE DATABASE FENCE AND THE MIGRATION (o3d-p9dq, Codex r28 HIGH #2).
+  # This is the read the whole-crontab fence rests on. `2>/dev/null || true` used to turn a
+  # permission, spool or I/O failure into an empty string, which the line below read as "no
+  # crontab" — and the run then walked on into the connection fence and the migration believing
+  # it had disarmed cron, with every existing entry still scheduled. read_crontab_for() resolves
+  # an absence only from the diagnostic that states one; everything else stops the run here.
+  read_crontab_for "$APP_USER" || die \
+    "The ${APP_USER} crontab could not be READ, so the cron writers cannot be fenced: ${CRONTAB_READ_REASON}. A crontab this run cannot read is not a crontab with nothing in it — taking the database fence and running the migration on that reading would leave every existing cron entry scheduled over a moving schema, which is the writer class this fence exists to stop. NOTHING HAS BEEN MIGRATED."
+  current="$CRONTAB_READ_TEXT"
+  if ! $CRONTAB_READ_PRESENT || [[ -z "$current" ]]; then
     info "No crontab for ${APP_USER}; nothing to fence."
     return 0
   fi
@@ -2416,7 +2424,14 @@ unfence_cron_locked() {
   fi
   [[ -f "$CRON_BACKUP" ]] || { warn "No crontab backup at ${CRON_BACKUP}; leaving the crontab as it is."; return 0; }
   local current backup
-  current="$(crontab -u "$APP_USER" -l 2>/dev/null || true)"
+  # AND THE READ ITSELF FAILS CLOSED (o3d-p9dq, Codex r28 HIGH #1). An unreadable crontab used to
+  # arrive here as the empty string, which holds nothing the backup does not — so the plan restored
+  # the pre-cutover snapshot over whatever was really there.
+  read_crontab_for "$APP_USER" || {
+    CRON_UNFENCE_REASON="the live crontab could not be read, so nothing can establish what is in it and a snapshot installed on that reading would discard whatever is: ${CRONTAB_READ_REASON}"
+    return "$CRONTAB_UNFENCE_DIVERGED"
+  }
+  current="$CRONTAB_READ_TEXT"
   if ! backup="$(cat "$CRON_BACKUP" 2>/dev/null)"; then
     CRON_UNFENCE_REASON="the backup at ${CRON_BACKUP} could not be read"
     return "$CRONTAB_UNFENCE_DIVERGED"
@@ -2524,10 +2539,14 @@ RESUME_CRON_DIVERGED=""
 resume_restore_cron_locked() {
   local current backup
   RESUME_CRON_DIVERGED=""
-  current="$(crontab -u "$APP_USER" -l 2>/dev/null || true)"
+  read_crontab_for "$APP_USER" || {
+    RESUME_CRON_DIVERGED="the live crontab could not be read, so nothing can establish that the interrupted run's snapshot is still current: ${CRONTAB_READ_REASON}"
+    return 1
+  }
+  current="$CRONTAB_READ_TEXT"
   backup="$(cat "$CRON_BACKUP" 2>/dev/null)" || return 1
-  if crontab_gained_lines_over_backup "$backup" "$current"; then
-    RESUME_CRON_DIVERGED="the live crontab holds lines the fenced projection of ${CRON_BACKUP} does not, so something has written it since the interrupted run took that snapshot and installing the snapshot would discard that write"
+  if ! crontab_is_unmoved_since_backup "$backup" "$current"; then
+    RESUME_CRON_DIVERGED="the live crontab is not the fence's own projection of ${CRON_BACKUP}, so something has written it since the interrupted run took that snapshot — installing the snapshot would discard that write, or put back an entry somebody deliberately deleted"
     return 1
   fi
   printf '%s\n' "$backup" | crontab -u "$APP_USER" - || return 1
@@ -2603,7 +2622,11 @@ restore_cron_from_backup() {
 # prints the by-hand command, which is what it already did for a lock it could not take.
 restore_cron_from_backup_locked() {
   local current backup
-  current="$(crontab -u "$APP_USER" -l 2>/dev/null || true)"
+  read_crontab_for "$APP_USER" || {
+    warn "The ${APP_USER} crontab could not be read, so it will not be restored from ${CRON_BACKUP}: ${CRONTAB_READ_REASON}"
+    return 1
+  }
+  current="$CRONTAB_READ_TEXT"
   backup="$(cat "$CRON_BACKUP" 2>/dev/null)" || return 1
   plan_crontab_unfence "$backup" "$current" || return 1
   printf '%s\n' "$CRON_UNFENCE_TEXT" | crontab -u "$APP_USER" - || return 1
@@ -2915,7 +2938,13 @@ adopt_cron_fence() {
 
 adopt_cron_fence_locked() {
   local current active
-  current="$(crontab -u "$APP_USER" -l 2>/dev/null || true)"
+  # An unreadable crontab counts NO active lines, which reads as "still fenced" — and the run then
+  # migrates over cron entries the previous run may have left live (o3d-p9dq, Codex r28).
+  read_crontab_for "$APP_USER" || {
+    warn "The ${APP_USER} crontab could not be read while adopting the previous run's fence: ${CRONTAB_READ_REASON}"
+    return 1
+  }
+  current="$CRONTAB_READ_TEXT"
   active="$(printf '%s\n' "$current" | grep -cE '^[[:space:]]*[^#[:space:]]' || true)"
   if [[ "$active" -gt 0 ]]; then
     warn "${active} cron line(s) are active again; re-fencing them."
