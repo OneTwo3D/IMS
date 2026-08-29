@@ -49,7 +49,14 @@ const MAINTENANCE_FENCE_SETTING_KEYS = [
   'wms_booked_in_recheck_due_since',
 ] as const
 
-/** The Mintsoft token-refresh lease (`lib/connectors/mintsoft/api/auth-lock.ts`). */
+/**
+ * Token-refresh leases. Named as the literal rows they are, which is what the refusal has to match.
+ *
+ * The connector name is unavoidable here and is not a WMS flow: this list is an authorization rule
+ * about `settings` keys, and a generic WMS facade has no key to offer it. Checked against the owning
+ * module's exported constant by `tests/settings/reserved-setting-keys.test.ts`.
+ */
+// wms-connector-boundary-ok: o3d-j7y4: a settings-key authorization list must name the concrete row, not a connector facade
 const LEASE_SETTING_KEYS = ['mintsoft_auth_lock'] as const
 
 /**
