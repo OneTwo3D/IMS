@@ -84,15 +84,26 @@ export async function resolveWcOrderCreateAdmission(
 export const WC_ADMISSION_REFUSAL_QUEUE = 'wc_order_admission_refusal'
 
 /**
- * WHY a create was withheld. Both are ACKNOWLEDGED decisions rather than failures, and both are
- * resolved by the operator changing a setting that fires no WooCommerce webhook — which is exactly
- * why neither may depend on another delivery arriving.
+ * WHY a create was withheld. All three are ACKNOWLEDGED decisions rather than failures.
+ *
+ * The two STATUS reasons are resolved by the operator changing a setting that fires no WooCommerce
+ * webhook — which is exactly why neither may depend on another delivery arriving. The CURRENCY
+ * reason is resolved at the source instead, and depends on the same by-id re-read for the same
+ * reason: the delivery that carried the unreadable payload was acknowledged, so a corrected order
+ * is only ever seen again because this queue goes and looks.
  */
 export type WcAdmissionRefusalReason =
   /** The order's status is outside the "Import order statuses" selection. */
   | 'status_not_admitted'
   /** Neither a mapping row nor a built-in default says what this WooCommerce status means. */
   | 'status_not_mapped'
+  /**
+   * WooCommerce stated no usable currency for the order — the field was absent, blank, or not a
+   * three-letter code. IMS will not supply one (o3d-batch-ret r13, Codex HIGH): the currency
+   * decides the FX rate, the ledger the invoice posts in and the bank account a payment settles
+   * into, and a guess there is wrong in a way nothing downstream can detect.
+   */
+  | 'currency_missing'
 
 export type WcAdmissionRefusalPayload = {
   queue: typeof WC_ADMISSION_REFUSAL_QUEUE
@@ -102,6 +113,12 @@ export type WcAdmissionRefusalPayload = {
   externalOrderNumber: string
   status: string
   configured: string[]
+  /**
+   * The currency EXACTLY as WooCommerce stated it, including the blank or absent value that caused
+   * a `currency_missing` refusal — an operator cannot fix a field without being told what IMS read
+   * in it. Optional only because rows written before r13 do not carry it.
+   */
+  currency?: string
   /** When the boundary FIRST turned this order away. Preserved across re-refusals. */
   refusedAt: string
   attempts: number
@@ -130,7 +147,22 @@ export function isWcAdmissionRefusalPayload(payload: unknown): payload is WcAdmi
     && (payload as { externalOrderId?: string }).externalOrderId !== ''
 }
 
-function refusalDescription(reason: WcAdmissionRefusalReason, status: string, configured: string[]): string {
+function refusalDescription(
+  reason: WcAdmissionRefusalReason,
+  status: string,
+  configured: string[],
+  currency: string,
+): string {
+  if (reason === 'currency_missing') {
+    // Quotes the raw value rather than describing it, because "blank" and "absent" are different
+    // faults at the source and the operator is the one who has to tell them apart.
+    return `WooCommerce stated no usable currency for this order (IMS read ${currency === '' ? 'an empty value' : `"${currency}"`}), `
+      + 'so it was not imported. IMS will not assume one: the currency decides the FX rate, the '
+      + 'ledger the invoice posts in and the bank account a payment settles into. Check the order '
+      + 'in WooCommerce — a currency missing from the API response usually means a degraded or '
+      + 'filtered REST response rather than an order without a price. This row is re-checked by '
+      + 'order id every 15 minutes and imports itself as soon as the order states its currency.'
+  }
   return reason === 'status_not_admitted'
     ? `Status "${status}" is not in the "Import order statuses" selection `
       + `(${configured.length > 0 ? configured.join(', ') : 'none selected'}), so the order was not imported. `
@@ -154,7 +186,7 @@ function refusalDescription(reason: WcAdmissionRefusalReason, status: string, co
  * repeatedly.
  */
 export async function recordWcOrderAdmissionRefusal(
-  wcOrder: Pick<WcFullOrder, 'id' | 'number' | 'status'>,
+  wcOrder: Pick<WcFullOrder, 'id' | 'number' | 'status'> & Partial<Pick<WcFullOrder, 'currency'>>,
   reason: WcAdmissionRefusalReason,
   configured: string[],
 ): Promise<void> {
@@ -166,6 +198,9 @@ export async function recordWcOrderAdmissionRefusal(
       select: { id: true, payload: true },
     })
     const previous = isWcAdmissionRefusalPayload(existing?.payload) ? existing.payload : null
+    // Not `|| ''`: an absent field and a blank one are the SAME refusal but not the same message,
+    // and this is the one record that can still tell them apart.
+    const statedCurrency = typeof wcOrder.currency === 'string' ? wcOrder.currency : ''
     const payload: WcAdmissionRefusalPayload = {
       queue: WC_ADMISSION_REFUSAL_QUEUE,
       reason,
@@ -174,6 +209,7 @@ export async function recordWcOrderAdmissionRefusal(
       externalOrderNumber: String(wcOrder.number ?? ''),
       status: String(wcOrder.status ?? ''),
       configured,
+      currency: statedCurrency,
       refusedAt: previous?.refusedAt ?? new Date().toISOString(),
       attempts: previous?.attempts ?? 0,
     }
@@ -184,7 +220,7 @@ export async function recordWcOrderAdmissionRefusal(
       entityType: 'SalesOrder',
       externalId: externalOrderId,
       payload: JSON.parse(JSON.stringify(payload)) as Prisma.InputJsonValue,
-      errorMessage: refusalDescription(reason, payload.status, configured),
+      errorMessage: refusalDescription(reason, payload.status, configured, statedCurrency),
       syncedAt: null,
     }
     if (existing) await db.shoppingSyncLog.update({ where: { id: existing.id }, data })

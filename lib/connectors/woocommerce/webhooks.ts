@@ -24,6 +24,7 @@ import {
   type ShoppingWebhookEventRepository,
 } from '@/lib/connectors/woocommerce/webhook-inbox'
 import type { WcFullOrder, WcFullProduct, WcRefund } from '@/lib/connectors/woocommerce/sync/types'
+import type { WcAdmissionRefusalReason } from '@/lib/connectors/woocommerce/sync/order-admission'
 import type { ShoppingWebhookResource } from '@/lib/shopping'
 import { getSettingValue } from '@/lib/settings-store'
 
@@ -193,6 +194,13 @@ async function logInitialImportPendingSkip(): Promise<void> {
 // WooCommerce status IMS has no mapping for, which is a different problem with a different fix.
 const STATUS_NOT_ADMITTED_LOG_KEY = 'wc_order_webhook_status_not_admitted_last_logged_at'
 const STATUS_NOT_MAPPED_LOG_KEY = 'wc_order_webhook_status_not_mapped_last_logged_at'
+/**
+ * Its OWN throttle window (r13). The two status keys throttle a decision the operator made on
+ * purpose and will see a hundred times; a missing currency is a fault in what WooCommerce sent, and
+ * sharing a window with the status skips would let an hour of routine excluded-status deliveries
+ * swallow the one line that reports it.
+ */
+const CURRENCY_MISSING_LOG_KEY = 'wc_order_webhook_currency_missing_last_logged_at'
 
 /**
  * Make the admission refusal visible. The delivery is ACKed, so without this the boundary would be
@@ -204,11 +212,14 @@ const STATUS_NOT_MAPPED_LOG_KEY = 'wc_order_webhook_status_not_mapped_last_logge
 async function logWcOrderWebhookNotAdmitted(
   wcOrder: WcFullOrder,
   topic: string | null,
-  reason: 'status_not_admitted' | 'status_not_mapped',
+  reason: WcAdmissionRefusalReason,
   configured: string[],
 ): Promise<void> {
   const notAdmitted = reason === 'status_not_admitted'
-  const key = notAdmitted ? STATUS_NOT_ADMITTED_LOG_KEY : STATUS_NOT_MAPPED_LOG_KEY
+  const currencyMissing = reason === 'currency_missing'
+  const key = currencyMissing
+    ? CURRENCY_MISSING_LOG_KEY
+    : (notAdmitted ? STATUS_NOT_ADMITTED_LOG_KEY : STATUS_NOT_MAPPED_LOG_KEY)
   try {
     const last = await db.setting.findUnique({ where: { key } })
     if (!shouldLogThrottledWebhookSkip(last?.value, Date.now())) return
@@ -219,10 +230,22 @@ async function logWcOrderWebhookNotAdmitted(
     })
     await logActivity({
       entityType: 'SYNC',
-      action: notAdmitted ? 'wc_order_webhook_status_not_admitted' : 'wc_order_webhook_status_not_mapped',
+      action: currencyMissing
+        ? 'wc_order_webhook_currency_missing'
+        : (notAdmitted ? 'wc_order_webhook_status_not_admitted' : 'wc_order_webhook_status_not_mapped'),
       tag: 'sync',
-      level: 'INFO',
-      description: notAdmitted
+      // WARNING, where the two status skips are INFO: those record a decision the operator made,
+      // this one records that WooCommerce sent a payload IMS could not read a currency out of.
+      level: currencyMissing ? 'WARNING' : 'INFO',
+      description: currencyMissing
+        ? `WooCommerce pushed order #${wcOrder.number} without a usable currency `
+          + `(IMS read ${typeof wcOrder.currency === 'string' && wcOrder.currency.trim() !== '' ? `"${wcOrder.currency}"` : 'an empty value'}), `
+          + 'so it was NOT imported. IMS will not assume one — the currency decides the FX rate, the '
+          + 'ledger the invoice posts in and the bank account a payment settles into, and an order '
+          + 'created on a guessed currency agrees with itself everywhere it is wrong. The order is '
+          + 'queued for retry BY ORDER ID and the fifteen-minute sweep re-reads the LIVE order, so it '
+          + 'imports itself as soon as the store states a currency. Further skips are logged at most hourly.'
+        : notAdmitted
         ? `WooCommerce pushed order #${wcOrder.number} with status "${wcOrder.status}", which is not `
           + 'in the "Import order statuses" selection under Sync -> WooCommerce -> Order Sync '
           + `(currently ${configured.length > 0 ? configured.join(', ') : 'none selected'}), so it was not imported. `
@@ -233,7 +256,15 @@ async function logWcOrderWebhookNotAdmitted(
           + 'NOT imported, because creating it would mean inventing a lifecycle status for it — the same answer '
           + 'the status sync gives for an order IMS already holds. Add a mapping under Sync -> WooCommerce -> '
           + 'Status Mappings; the order is queued for retry by order id. Further skips are logged at most hourly.',
-      metadata: { externalOrderId: wcOrder.id, topic, status: wcOrder.status, reason, configured },
+      metadata: {
+        externalOrderId: wcOrder.id,
+        topic,
+        status: wcOrder.status,
+        reason,
+        configured,
+        // The raw field, so the record distinguishes "absent" from "blank" from "not a code".
+        currency: wcOrder.currency ?? null,
+      },
       resolveUser: false,
     })
   } catch (e) {
@@ -384,9 +415,13 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
       // cheap bulk case.
       return NextResponse.json({
         ok: true,
-        skipped: guarded.result.skipped === 'status_not_admitted'
-          ? 'status_not_selected_for_import'
-          : 'status_not_mapped',
+        // A lookup, not a ternary chain: r13's third reason would otherwise have been ACKed under
+        // the sentence "status_not_mapped", which is a different fault at a different layer.
+        skipped: {
+          status_not_admitted: 'status_not_selected_for_import',
+          status_not_mapped: 'status_not_mapped',
+          currency_missing: 'currency_not_stated_by_woocommerce',
+        }[guarded.result.skipped],
       })
     }
     if (!guarded.result.success) {

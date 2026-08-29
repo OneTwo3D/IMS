@@ -1406,6 +1406,41 @@ async function resolveDirectCreateShortfall(orderId: string): Promise<void> {
   }
 }
 
+/**
+ * THE ORDER'S CURRENCY, AS WOOCOMMERCE STATED IT — or nothing at all (o3d-batch-ret r13, Codex HIGH).
+ *
+ * This replaced `const currency = wcOrder.currency || 'GBP'`, which was the LAST place in the chain
+ * where a currency nobody stated became one IMS asserted. Round 12 built a refusal at the far end of
+ * that chain — the accounting fold will not settle a payment whose payload names no currency — and
+ * measuring its blast radius found it could never fire, because THIS line had already substituted a
+ * guess for the missing fact one layer upstream. A guard nothing can reach is not a small problem
+ * with the guard; it is the whole error, sitting where the guard cannot see it.
+ *
+ * What the guess cost, when the fact was genuinely absent: the FX lookup returns 1:1 for `GBP` and
+ * every foreign figure on the order is then recorded as sterling at par; `salesOrder.currency` says
+ * GBP; the accounting payload says GBP, so the invoice posts to a GBP ledger; and the payment leg
+ * selects the GBP bank account. Nothing downstream can detect any of it, because every one of those
+ * records agrees — they agree because they all came from the same invention.
+ *
+ * `WcFullOrder.currency` is typed `string`, but neither ingress path validates the shape it casts:
+ * the pull and the webhook both `as WcFullOrder` over parsed JSON. A degraded, filtered or
+ * partially-serialised REST response therefore reaches here with the field absent or empty, and the
+ * type says nothing about it.
+ *
+ * WHAT COUNTS AS USABLE: a non-blank three-letter code. IMS holds no allowlist of currencies — the
+ * FX-rate table is the registry, and `getFxRateToGbp` already refuses a well-formed code it has no
+ * rate for by retaining the order in the pending-FX queue. So the two checks compose and neither
+ * duplicates the other: this one answers "did WooCommerce state a currency at all?", and the FX
+ * lookup answers "does IMS support the one it stated?". Deliberately NOT normalised away as
+ * `getFxRateToGbp` would have done anyway — the trimmed, upper-cased code is what gets PERSISTED
+ * from here on, so `salesOrder.currency` and the accounting payload can no longer disagree with the
+ * FX rate that was fetched for them.
+ */
+export function readWcOrderCurrency(wcOrder: Pick<WcFullOrder, 'currency'>): string | null {
+  const stated = typeof wcOrder.currency === 'string' ? wcOrder.currency.trim().toUpperCase() : ''
+  return /^[A-Z]{3}$/.test(stated) ? stated : null
+}
+
 export type ImportWcOrderResult = {
   success: boolean
   orderId?: string
@@ -1414,11 +1449,17 @@ export type ImportWcOrderResult = {
    * Set when nothing was imported because the order is NEW and IMS declined to take it on:
    * `status_not_admitted` — outside the "Import order statuses" selection; `status_not_mapped` —
    * no mapping row and no built-in reading of the WooCommerce status, so creating it would mean
-   * inventing a lifecycle status. `success` is true for both: these are resolved decisions, not
-   * failures to retry. Both leave a durable by-id row in the admission-refusal queue.
+   * inventing a lifecycle status; `currency_missing` — WooCommerce stated no usable currency, so
+   * creating it would mean inventing the ledger, the FX rate and the bank account (r13).
+   * `success` is true for all three: these are resolved decisions, not failures to retry. All
+   * three leave a durable by-id row in the admission-refusal queue.
    */
   skipped?: WcAdmissionRefusalReason
-  /** The operator's selection at the moment of the refusal, so the caller can say so. */
+  /**
+   * The operator's selection at the moment of the refusal, so the caller can say so. Meaningful
+   * for the two STATUS reasons only — a `currency_missing` refusal is not about the selection, and
+   * reports the empty list rather than a selection that had nothing to do with it.
+   */
   configured?: string[]
 }
 
@@ -1451,11 +1492,20 @@ async function refuseWcOrderCreate(
   if (options.pendingFxRetryLogId) {
     await markPendingFxRetryLogFailed(
       options.pendingFxRetryLogId,
-      reason === 'status_not_admitted'
-        ? 'An FX rate arrived, but the order\'s status is outside the "Import order statuses" selection. '
-          + 'It is queued for retry by order id instead.'
-        : 'An FX rate arrived, but IMS has no reading of this order\'s WooCommerce status. '
+      // Written as a lookup rather than a nested ternary so a fourth reason cannot silently inherit
+      // a third one's sentence — which is how the r13 currency reason would have arrived.
+      {
+        status_not_admitted:
+          'An FX rate arrived, but the order\'s status is outside the "Import order statuses" selection. '
           + 'It is queued for retry by order id instead.',
+        status_not_mapped:
+          'An FX rate arrived, but IMS has no reading of this order\'s WooCommerce status. '
+          + 'It is queued for retry by order id instead.',
+        currency_missing:
+          'An FX rate arrived, but WooCommerce states no usable currency for this order, so the '
+          + 'stored snapshot cannot be imported at all. It is queued for retry by order id instead, '
+          + 'which re-reads the LIVE order.',
+      }[reason],
     ).catch(() => {})
   }
   return { success: true, skipped: reason, configured }
@@ -1551,14 +1601,24 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     const importRefundDisposition = refundDispositionForStatus(imsStatus)
     const lifecycleStatus = importRefundDisposition === 'NONE' ? imsStatus : 'PROCESSING'
 
+    // THE CURRENCY IS A FACT WOOCOMMERCE STATES, NOT ONE IMS SUPPLIES (r13). Placed HERE, above
+    // `upsertCustomer`, for the same reason the two status refusals sit above it: a refusal that
+    // has already written a customer row is a refusal that changed the database on its way out.
+    const currency = readWcOrderCurrency(wcOrder)
+    if (!currency) {
+      // The selection is NOT re-read for this reason. It is the control for the status refusals and
+      // has no bearing on a missing currency, so reporting whatever happens to be ticked would point
+      // an operator at the wrong setting; `refusalDescription` names the currency instead.
+      return refuseWcOrderCreate(wcOrder, 'currency_missing', [], options)
+    }
+
     // Customer
     const customerId = await upsertCustomer(wcOrder)
     const customerName = [wcOrder.billing.first_name, wcOrder.billing.last_name].filter(Boolean).join(' ')
       || [wcOrder.shipping.first_name, wcOrder.shipping.last_name].filter(Boolean).join(' ')
       || 'WooCommerce Customer'
 
-    // Currency & FX
-    const currency = wcOrder.currency || 'GBP'
+    // FX, against the currency read above.
     const orderedAt = wcOrder.date_created_gmt
       ? new Date(`${wcOrder.date_created_gmt.replace(/Z$/, '')}Z`)
       : (wcOrder.date_created ? new Date(wcOrder.date_created) : undefined)
@@ -1775,13 +1835,19 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     // o3d-cyn r2: shipping need not carry the goods' rate, and a document that will not produce
     // Woo's own tax must not be claimed as settled by a payment for the order total.
     // The ORDER's currency, not the base one: every figure compared below is in it (o3d-cyn r4).
-    const orderMoneyDigits = currencyMinorUnits(wcOrder.currency)
+    // `currency`, not `wcOrder.currency` (r13). These three read the ORDER's currency to set the
+    // minor unit that every money comparison below is measured in, and they were reading the RAW
+    // field while the rest of the import used the resolved one — so an untrimmed or lower-case code
+    // measured its tolerances against the 2-digit default while the order posted under the real
+    // one, and an absent field threw a bare TypeError out of `currencyMinorUnits` here rather than
+    // refusing anywhere an operator could see it.
+    const orderMoneyDigits = currencyMinorUnits(currency)
     const shippingTax = resolveWcShippingTaxRate({
       shippingLines: wcOrder.shipping_lines,
       shippingNetForeign: shippingForeign,
       rateById: wcResolvedById,
       orderDefault: { accountingTaxType, taxRateValue },
-      currency: wcOrder.currency,
+      currency,
     })
     const documentTaxReconciliation = reconcileWcDocumentTax([
       ...mappedLines.map((l, idx) => ({
@@ -1802,7 +1868,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           toDecimal(0),
         ),
       },
-    ], wcOrder.currency)
+    ], currency)
     const documentTotalsToTheOrder = shippingTax.resolved && documentTaxReconciliation.reconciles
 
     // GBP conversions

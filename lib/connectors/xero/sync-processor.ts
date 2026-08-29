@@ -7162,6 +7162,16 @@ async function decideInvoicePaymentFollowUp(
    * which is the only one known to be the one the document posted in. o3d-emus persists the remote
    * base currency the guard verified and restores the default against THAT.
    *
+   * o3d-batch-ret r13 (Codex HIGH): AND THE REFUSAL IS NOW REACHABLE, which it was not when it was
+   * written. Measuring its blast radius found that no producer could emit an absent currency beside
+   * a payment request — and the reason was not that the producers are careful. The WooCommerce
+   * importer opened with `wcOrder.currency || 'GBP'`, so a payload that reached this fold ALWAYS
+   * named a currency, and where WooCommerce had stated none the name was sterling by invention. The
+   * guard could only ever have fired on a producer nobody had written yet. That default is gone
+   * (`readWcOrderCurrency` in the WooCommerce order importer refuses the import instead), so the
+   * absent-`currency` arm below now guards a case that can actually arrive: a producer that stops
+   * stating the currency reaches a refusal here rather than a sterling bank account.
+   *
    * The two configuration arms below differ only in WHICH sentence an operator reads. The remedy is
    * a SETTING — safe to repeat, and it cannot double anything — and what happens afterwards comes
    * from the connector's registry entry rather than from a promise written here.
