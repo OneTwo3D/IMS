@@ -2,8 +2,8 @@
  * THE SENTINEL IS INSTALLED, IT FAILS A LEAK, AND IT DOES NOT FAIL A CLEAN RUN (o3d-tmpleak).
  *
  * This replaces a static rule that banned `mkdtemp` outside one helper. That rule was measured
- * against the tree it was meant to police and would have failed the build on 151 call sites that
- * already clean up in order to reach the 1 that did not — see `tests/temp-dir-sentinel.ts` for
+ * against the tree it was meant to police and would have rewritten all 140 raw `mkdtemp` call
+ * sites in that directory's harnesses, 139 of which already clean up, to reach the 1 that did not — see `tests/temp-dir-sentinel.ts` for
  * why a static reader cannot do better, and why the shape of the check moved from the CALL to the
  * SURVIVING DIRECTORY.
  *

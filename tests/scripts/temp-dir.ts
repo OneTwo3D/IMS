@@ -10,8 +10,9 @@
  * leaked, and it is the shape this exists for.
  *
  * IT IS NOT THE GUARD. An earlier attempt made it one, by banning `mkdtemp` everywhere in this
- * directory but here. Measured against the tree, that rule would have failed the build on 151
- * call sites that already clean up correctly in order to reach the 1 that did not. The guard is
+ * directory but here. Measured against the tree, that rule would have rewritten all 140 raw
+ * `mkdtemp` call sites in this directory's harnesses, 139 of which already clean up correctly, to
+ * reach the 1 that did not. The guard is
  * now `tests/temp-dir-sentinel.ts`, which measures what actually survives a test process instead
  * of reading source, and this file is a convenience that makes the awkward case easy to get right
  * — so use it where a scope exists too, but a plain `mkdtemp` with a `finally` is not a defect.
@@ -27,7 +28,8 @@
  *     exits normally, with status 1) and on an explicit `process.exit`. It is the whole mechanism
  *     for callers with no TestContext to give. The sentinel deliberately looks AFTER every exit
  *     listener has run, so directories drained here are not reported as leaks — an ordinary
- *     `process.on('exit')` in the sentinel saw all 18 of them mid-removal and reported them.
+ *     `process.on('exit')` in the sentinel saw 16 of them mid-removal here, and 2 more in
+ *     deploy-order.test.ts, and reported all 18 as leaks.
  *
  * Neither survives SIGKILL. Nothing in a test process does, and that is not the leak that happened.
  *

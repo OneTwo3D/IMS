@@ -7,14 +7,14 @@
  *
  * WHAT THIS IS NOT. The first attempt at this was a static rule: `mkdtemp` may appear in one
  * helper and nowhere else in `tests/scripts/`. Measured against the tree as it now stands, that
- * rule fails the build on 151 call sites that already clean up correctly in order to reach the
- * one that does not. A rule whose output is 99% false alarm is a rule somebody deletes the first
+ * rule would rewrite all 140 raw `mkdtemp` call sites in this directory's harnesses — 139 of
+ * which already clean up correctly — in order to reach the 1 that does not. A rule whose output is 99% false alarm is a rule somebody deletes the first
  * week, and it is also the wrong shape: `mkdtemp` is not the defect. A SURVIVING DIRECTORY is the
  * defect, and a static reader cannot see one — the cleanup may be in a `finally` twelve lines
  * down, on an `after` hook, on a parent directory, or (the real leak) absent because the value
  * escapes the function that made it. Any static approximation of "is this one paired with a
- * removal?" is a proximity rule, and a proximity rule in a file with 82 `rmSync` calls passes
- * vacuously for all 69 of its creations.
+ * removal?" is a proximity rule, and a proximity rule in a file with 81 `rmSync` calls passes
+ * vacuously for all 68 of its creations.
  *
  * SO THIS MEASURES INSTEAD OF READING. Loaded with `--import` from `npm run test:unit`, it runs
  * once in every test process — Node's test runner passes `--import` down to the child it spawns
@@ -110,8 +110,9 @@ const settle = (): void => {
  * Listeners run in registration order and this module is loaded by `--import`, i.e. before any
  * test file — so an ordinary listener here runs FIRST and sees the directories that exit-time
  * cleanup is about to remove. That is not a hypothetical: `tests/scripts/temp-dir.ts` drains its
- * own set from an `exit` hook, and the first version of this file reported all 18 of the
- * directories it was in the middle of removing as leaks.
+ * own set from an `exit` hook, and the first version of this file reported the directories it was
+ * in the middle of removing as leaks — 16 in install-rerun-preserves-credentials, 2 in
+ * deploy-order.
  *
  * Wrapping `emit` is what makes "still there at exit" mean it, rather than meaning "still there
  * at the moment the earliest-registered listener happened to look". It also holds for cleanup
