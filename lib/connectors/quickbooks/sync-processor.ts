@@ -2138,13 +2138,16 @@ async function decideInvoicePaymentFollowUp(
    * raw payload expression left here for a default to be attached to, and a field added later has
    * nowhere in this file to acquire one.
    *
-   * o3d-batch-ret r11 (Codex HIGH): AND THE CURRENCY IT IS HANDED IS THE ONE THE DOCUMENT POSTED IN.
-   * The absent-`currency` arm used to be a `GBP` literal. It is now the organisation base currency,
-   * resolved once inside the fold — and that is the same currency this connector's document post
-   * ends up in, because an absent `currency` reaches the builder as `undefined`, the builder omits
-   * the key, the ledger denominates the document in its own base currency, and `connectQuickBooks` refuses to
-   * bind a ledger whose base currency is not `getBaseCurrencyCode()`. Document and payment
-   * therefore name one currency on a EUR-base installation exactly as they did on a GBP one.
+   * o3d-batch-ret r11/r12 (Codex HIGH): AND IT IS NEVER HANDED A CURRENCY NOBODY VERIFIED.
+   * The absent-`currency` arm used to be a `GBP` literal; round 11 made it the IMS base currency, on
+   * the warrant that `connectQuickBooks` refuses to bind a ledger whose base currency is not
+   * `getBaseCurrencyCode()`. It refuses only when it could READ that base currency —
+   * `fetchCompanyInfo` answers `null` for a failed or malformed CompanyInfo read, the guard's
+   * truthy-only comparison then does not fire, and the binding is stored with the equality never
+   * established. So an absent `currency` no longer takes a default here at all: the fold refuses it
+   * under the `base-currency` fact. What this connector receives is a currency the PAYLOAD stated,
+   * which is the only one known to be the one the document posted in. o3d-emus persists the remote
+   * base currency the guard verified and restores the default against THAT.
    *
    * The two configuration arms below differ only in WHICH sentence an operator reads. The remedy is
    * a SETTING — safe to repeat, and it cannot double anything — and what follows the correction is

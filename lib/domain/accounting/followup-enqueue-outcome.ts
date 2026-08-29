@@ -445,12 +445,14 @@ function unreadableField(field: string, value: unknown, expectation: string): { 
  *     on the CURRENCY half (`method:*`), so an empty method matches no mapping written for a real
  *     one. It fails closed into the ordinary mapping refusal, which names the empty method out loud.
  *
- *   `currency` absent → the ORGANISATION BASE CURRENCY. ESTABLISHED as of this round, and it is the
- *     one that was not. `'GBP'` was inherited from `payload.currency as string || 'GBP'`; the
- *     warrant it now has is that the DOCUMENT is denominated in exactly that currency — the builders
- *     omit `CurrencyCode`/`CurrencyRef` for an absent value, the ledger uses its own base currency,
- *     and the connect-time guards refuse to bind a ledger whose base currency is not
- *     `getBaseCurrencyCode()`. See {@link resolveBasePaymentCurrency}.
+ *   `currency` absent → NO DEFAULT AT ALL; it REFUSES (r12). Round 11 replaced the `'GBP'` literal
+ *     with the IMS base currency and called that ESTABLISHED, on the warrant that the connect-time
+ *     guards refuse a ledger whose base currency is not `getBaseCurrencyCode()`. That warrant is
+ *     true only of the path where the remote base was READ. When it cannot be read the guard has
+ *     nothing to compare, does not fire, and the binding is stored anyway — so a USD ledger can be
+ *     bound to a EUR installation and the equality the default rests on was never established for
+ *     it. The default is therefore withdrawn rather than re-argued: see
+ *     {@link payloadPaymentCurrency}. o3d-emus restores it by persisting the verified remote base.
  *
  *   `_paymentDate` absent → TODAY.              INHERITED. Nothing derives it; its whole warrant is
  *     that both connectors have always done it, and unlike `''` it is a guess at a value that really
@@ -520,18 +522,33 @@ function payloadPaymentMethod(payload: Record<string, unknown>): PayloadField<st
 }
 
 /**
- * THE ORGANISATION BASE CURRENCY, AS THE CLASSIFIER RECEIVES IT (o3d-batch-ret r11, Codex HIGH).
+ * WHY AN ABSENT `currency` HAS NO DEFAULT LEFT TO TAKE (o3d-batch-ret r12, Codex HIGH).
  *
- * It is a {@link PayloadField} for exactly the reason every payload field is one: "the base
- * currency is EUR" and "the base currency could not be read" are different answers, and only the
- * first may settle anything. And it ARRIVES as an argument — {@link resolveBasePaymentCurrency}
- * is called once, in the fold — so the classifier below stays a pure function that cannot acquire
- * a database read, and every arm of it is reachable from a table.
+ * Every other absent-key answer in this file is a fact about IMS — what its own writers emit, what
+ * its own mapping table does with `''`. This one was a fact about A REMOTE LEDGER, and that is the
+ * difference round 11 did not price in.
+ *
+ * The clause it read is `if (organisation.baseCurrency && organisation.baseCurrency !== imsBase)`,
+ * in both `connectXero` and `connectQuickBooks`. It is a TRUTHY-only comparison, and both readers
+ * answer `null` for a base currency they could not obtain — a non-OK response, a body with no
+ * organisation in it, a `BaseCurrency`/`HomeCurrency` that is not a currency string. On that path
+ * the guard has nothing to compare, so it does not fire, and the binding is stored regardless. A
+ * transient failure at the moment an operator clicks Connect is enough to bind a USD ledger to a
+ * EUR installation.
+ *
+ * So `getBaseCurrencyCode()` is NOT a stand-in for what the ledger denominates in. It is the same
+ * value on every binding whose guard actually ran, and nothing on this side of the wire can tell
+ * those bindings apart from the ones whose guard was handed a null — the verified remote base is
+ * not persisted anywhere (o3d-emus).
  */
-type BasePaymentCurrency = PayloadField<string>
+const LEDGER_BASE_UNVERIFIED =
+  'the payload names no currency, so the document was denominated by the ledger in ITS OWN base '
+  + 'currency — and what that is was never verified for this connection: both connect-time guards '
+  + 'compare the remote base currency only when they could READ it, and neither records the value '
+  + 'they compared, so nothing here establishes that the ledger posts in the IMS base currency'
 
 /**
- * `currency` — THE FIELD WHERE THE OLD DEFAULT MOVED MONEY TO THE WRONG PLACE, TWICE.
+ * `currency` — THE FIELD WHERE THE OLD DEFAULT MOVED MONEY TO THE WRONG PLACE, THREE TIMES.
  *
  * `payload.currency as string || 'GBP'` answered `GBP` for an absent key, for a present `null`, and
  * for a present `''` alike. The last two are a currency something wrote nothing into, and
@@ -539,24 +556,31 @@ type BasePaymentCurrency = PayloadField<string>
  * whose currency did not survive persistence was settled into the sterling account, and the amount
  * was written onto the INVOICE_PAYMENT row as sterling too. Round 10 closed those two.
  *
- * ROUND 11 (Codex HIGH) IS THE THIRD ONE, AND IT IS THE DEFAULT NOBODY HAD QUESTIONED. The ABSENT
- * arm kept a `GBP` LITERAL, and `Organisation.baseCurrency` is configurable. On a EUR-base
- * installation the document itself posts in the base currency — an absent `currency` reaches the
- * builders as `undefined`, and both of them omit the key (Xero's `CurrencyCode`, QuickBooks'
- * `CurrencyRef`), so the ledger denominates the invoice in ITS OWN base currency, which
- * `connectXero`/`connectQuickBooks` refuse to bind unless it equals `getBaseCurrencyCode()`. This
- * classifier then called the same absence sterling, so the DOCUMENT was in EUR and its PAYMENT was
- * looked up and stamped as GBP: either a `method:EUR` mapping was missed, or a `method:GBP` one was
- * found and the money settled into the sterling account. The literal is gone; the absent arm is the
- * resolved base currency, which is the same value the document was posted in.
+ * ROUND 11 TOOK THE THIRD — the ABSENT arm's `GBP` LITERAL, which on a EUR-base installation
+ * stamped a payment in a currency the document was not in — and replaced it with the IMS base
+ * currency, on the warrant that the connect-time guards refuse a ledger whose base currency is not
+ * `getBaseCurrencyCode()`. ROUND 12 IS THE BILL FOR THAT WARRANT: it is true of the path where the
+ * remote base was read and silent on the path where it could not be (see
+ * {@link LEDGER_BASE_UNVERIFIED}), so the equality was asserted, not established.
  *
- * A PRESENT value must still NAME a currency; only absence may take the base.
+ * THE ANSWER IS TO STOP DEFAULTING, NOT TO PICK A BETTER DEFAULT. There is no value available here
+ * that is known to be the one the document posted in, and a payment stamped in a currency nobody
+ * verified selects the bank account by that currency — the identical failure the previous two
+ * rounds closed, arriving through the binding instead of through the payload. So an absent
+ * `currency` on a payload that asks for a payment REFUSES, under the `base-currency` fact, exactly
+ * as an unresolvable base currency already did.
+ *
+ * IT COSTS NOTHING TODAY, WHICH IS WHY IT CAN BE DONE HERE. The only writer of `_registerPayment`
+ * is the WooCommerce order importer, and it writes `currency` unconditionally
+ * (`wcOrder.currency || 'GBP'`, always a non-empty string) on the same payload literal — so no
+ * current producer can emit the combination this refuses. o3d-emus restores the default properly,
+ * by persisting the remote base currency the guard verified and comparing against THAT.
+ *
+ * A PRESENT value must still NAME a currency, and it settles: the refusal is on the absent arm
+ * only, so every payload that states its own currency is untouched by this round.
  */
-function payloadPaymentCurrency(
-  payload: Record<string, unknown>,
-  base: BasePaymentCurrency,
-): PayloadField<string> {
-  if (!declaresField(payload, 'currency')) return base
+function payloadPaymentCurrency(payload: Record<string, unknown>): PayloadField<string> {
+  if (!declaresField(payload, 'currency')) return { detail: LEDGER_BASE_UNVERIFIED }
   const value = payload.currency
   return typeof value === 'string' && value.trim() !== ''
     ? { value }
@@ -639,9 +663,10 @@ export type UnreadablePaymentFact =
   /** A payment of a known amount was asked for and a field the registration is built from cannot be read. */
   | 'field'
   /**
-   * The payload names NO currency — which is legitimate and the ordinary case — and the
-   * organisation base currency it would therefore be settled in could not be resolved
-   * (o3d-batch-ret r11). Nothing about the payload is wrong here, which is why it is not `field`.
+   * The payload names NO currency — which is legitimate and the ordinary case — and the currency it
+   * would therefore be settled in, the LEDGER's own base currency, is not established for this
+   * connection (o3d-batch-ret r11, widened in r12). Nothing about the payload is wrong here, which
+   * is why it is not `field`: no rebuild of it can help, and the operator must not be sent to look.
    */
   | 'base-currency'
 
@@ -679,12 +704,9 @@ type InvoicePaymentRequest =
  * is what the refusal's activity-log metadata is built from and a refusal about the AMOUNT should
  * still say which method and currency the row named.
  */
-function invoicePaymentRequest(
-  payload: Record<string, unknown>,
-  base: BasePaymentCurrency,
-): InvoicePaymentRequest {
+function invoicePaymentRequest(payload: Record<string, unknown>): InvoicePaymentRequest {
   const method = payloadPaymentMethod(payload)
-  const currency = payloadPaymentCurrency(payload, base)
+  const currency = payloadPaymentCurrency(payload)
   const known: PaymentRefusalContext = {
     method: 'value' in method ? method.value : null,
     currency: 'value' in currency ? currency.value : null,
@@ -704,9 +726,9 @@ function invoicePaymentRequest(
   if ('detail' in method) return unreadable('field', method.detail)
   // WHICH refusal this is depends on WHOSE value could not be read, and `declaresField` is the same
   // discriminator `payloadPaymentCurrency` used to pick the arm (o3d-batch-ret r11). A present
-  // unreadable `currency` is a corrupt PAYLOAD FIELD; an absent one whose base currency would not
-  // resolve is not a payload fault at all, and telling an operator to look at a field the payload
-  // legitimately omits is the r7/r8 defect — a clause true of one call site read at one where it is
+  // unreadable `currency` is a corrupt PAYLOAD FIELD; an absent one is not a payload fault at all —
+  // it is the unverified ledger base of r12 — and telling an operator to look at a field the payload
+  // legitimately omits is the r7/r8 defect: a clause true of one call site read at one where it is
   // false.
   if ('detail' in currency) {
     return unreadable(declaresField(payload, 'currency') ? 'field' : 'base-currency', currency.detail)
@@ -721,50 +743,20 @@ function invoicePaymentRequest(
 }
 
 /**
- * THE ONE PLACE THE ORGANISATION BASE CURRENCY IS RESOLVED FOR THIS DECISION (o3d-batch-ret r11,
- * Codex HIGH).
+ * WHY NOTHING IS RESOLVED HERE ANY MORE (o3d-batch-ret r12, Codex HIGH).
  *
- * IT IS HERE, IN THE FOLD, AND NOT IN EITHER CONNECTOR. Codex asked that the document-post and
- * follow-up paths agree about the currency, and "both connectors remember to resolve it the same
- * way" is a convention, which is the thing this whole batch has been replacing with shape. The fold
- * is already the only door onto the payment decision, so resolving it here makes divergence between
- * the two connectors unwritable rather than merely unlikely, and a third connector inherits the
- * agreement instead of having to be told about it.
+ * Round 11 put a `resolveBasePaymentCurrency()` in this position — one `getBaseCurrencyCode()` read
+ * per fold, injected into the classifier — so that the two connectors could not disagree about the
+ * currency an absent `currency` settles in. The shape was right and the VALUE was wrong: the IMS
+ * base currency is not what the ledger denominated the document in, it is only equal to it on the
+ * bindings whose connect-time guard could read the remote base (see {@link LEDGER_BASE_UNVERIFIED}).
  *
- * IT IS INJECTED INTO THE CLASSIFIER RATHER THAN REACHED FOR BY IT. `invoicePaymentRequest` and
- * every field classifier under it stay pure functions of their arguments: a database read inside
- * one of them would make the boundary untestable as a table and would put an I/O failure on a path
- * that is meant to answer from bytes alone.
- *
- * IT IS RESOLVED UNCONDITIONALLY AND CONSULTED ONLY WHERE IT IS USED. A payload that NAMES its
- * currency is unaffected by a base currency that will not resolve — `payloadPaymentCurrency`
- * returns this value only on the ABSENT arm — so an installation whose organisation row is
- * unreadable still settles every payment whose payload states its own currency.
- *
- * AND AN UNRESOLVABLE ONE REFUSES; IT DOES NOT FALL BACK. That is the same answer this axis has
- * given for six rounds: an unknown is not a default. Note what is NOT unknown —
- * `resolveBaseCurrencyCode` answers `org?.baseCurrency ?? DEFAULT_BASE_CURRENCY`, and that
- * fallback is ESTABLISHED rather than assumed, because the connect-time guards compare the
- * ledger's base currency against the very same expression: an installation with no organisation
- * row cannot have a non-GBP ledger bound to it at all, so document and payment still agree. What
- * IS unknown is a read that THREW (the row could not be consulted) or a `baseCurrency` holding no
- * currency code, and neither of those may be spent as sterling.
- *
- * The import is dynamic for the reason `getPaymentAccountMap`'s is: this module is the payload
- * boundary and is pulled in by callers that have no database at all.
+ * With the absent arm refusing, there is no value left for this decision to resolve, and the read is
+ * gone rather than kept for a message. That is deliberate: a base currency resolved and then never
+ * spent is exactly the sort of vestige a later round mistakes for an established fact. When o3d-emus
+ * persists the remote base the guard verified, the resolution comes back HERE, in the fold, reading
+ * THAT — and the round-11 argument for the position survives its value.
  */
-async function resolveBasePaymentCurrency(): Promise<BasePaymentCurrency> {
-  let code: unknown
-  try {
-    const { getBaseCurrencyCode } = await import('@/lib/base-currency')
-    code = await getBaseCurrencyCode()
-  } catch (error) {
-    return { detail: 'reading the organisation base currency failed: ' + (error instanceof Error ? error.message : String(error)) }
-  }
-  return typeof code === 'string' && code.trim() !== ''
-    ? { value: code }
-    : { detail: `\`Organisation.baseCurrency\` is ${describePresent(code)}, which is not a currency code` }
-}
 
 /**
  * o3d-batch-ret ROUND 10 (Codex HIGH) — THE FIELD THAT GATES THE WHOLE DECISION WAS STILL READ BY
@@ -817,7 +809,7 @@ export async function decideRequestedInvoicePayment(
     onInvalid: (unreadable: UnreadablePaymentPayload) => Promise<RefusedFollowUpEnqueue>
   },
 ): Promise<FollowUpEnqueueOutcome> {
-  const requested = invoicePaymentRequest(payload, await resolveBasePaymentCurrency())
+  const requested = invoicePaymentRequest(payload)
   switch (requested.kind) {
     case 'none':
       return FOLLOW_UPS_ENQUEUED
@@ -878,20 +870,30 @@ const UNREADABLE_PAYMENT_CLAUSES: Record<UnreadablePaymentFact, { asked: string;
       + 'receipt wrongly in the ledger',
   },
   /**
-   * THE ONE WHERE THE PAYLOAD IS FINE AND THE INSTALLATION IS NOT (o3d-batch-ret r11, Codex HIGH).
+   * THE ONE WHERE THE PAYLOAD IS FINE AND THE CONNECTION IS NOT (o3d-batch-ret r11, rewritten r12).
    *
-   * Omitting `currency` is the ordinary case, not a corruption: the document itself is then posted
-   * in the ledger's own base currency, which is pinned equal to `Organisation.baseCurrency` at
-   * connect time. So the sentence must NOT send an operator to look at the payload — there is
-   * nothing wrong with it — and it must not promise a payload rebuild will help, which is why this
-   * is a fact of its own rather than the `field` clause reused.
+   * Omitting `currency` is the ordinary case, not a corruption: the document is then denominated by
+   * the LEDGER, in the ledger's own base currency. So the sentence must NOT send an operator to look
+   * at the payload — there is nothing wrong with it — and it must not promise a payload rebuild will
+   * help, which is why this is a fact of its own rather than the `field` clause reused.
+   *
+   * ROUND 11 WROTE IT AS "could not be resolved", because the only way to reach it then was an IMS
+   * organisation row that would not read. Round 12 found the larger one: the value can resolve
+   * perfectly and still not be the ledger's, because the connect-time guards compare the remote base
+   * currency only when they could read it and record nothing about what they compared. The sentence
+   * therefore says UNVERIFIED rather than unresolvable, and names the remedy that fits it — an
+   * operator who reconnects the ledger makes the guard run again with a readable answer, where
+   * re-running the sync would only reach the same silence.
    */
   'base-currency': {
     asked: 'the invoice asked for a payment to be registered, its payload names no currency of its own — which is '
-      + 'ordinary — and the organisation base currency the payment would therefore be settled in could not be resolved',
-    claim: 'AN UNRESOLVED BASE CURRENCY IS NOT STERLING: this row does not say the payment is in GBP, it says the '
-      + 'currency it would be settled in cannot be determined — and the bank account is keyed on that currency, so '
-      + 'assuming one selects an account by a currency nobody stated and stamps it onto the payment',
+      + 'ordinary — and the currency the ledger therefore denominated that document in is not established for this '
+      + 'connection',
+    claim: 'AN UNVERIFIED LEDGER BASE CURRENCY IS NOT THE IMS ONE: this row does not say the payment is in the IMS '
+      + 'base currency, it says the currency it would be settled in was never read back from the ledger — the '
+      + 'connect-time check compares that currency only when it can be read, and stores the connection either way — '
+      + 'and the bank account is keyed on that currency, so assuming one selects an account by a currency nobody '
+      + 'verified and stamps it onto the payment. Reconnect the ledger to establish it',
   },
 }
 
