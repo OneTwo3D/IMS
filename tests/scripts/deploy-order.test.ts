@@ -8725,9 +8725,18 @@ test('r33: every printed recovery instruction carries the privilege the account 
     const noSudoDir = join(dir, 'nosudo')
     mkdirSync(noSudoDir)
     for (const entry of (process.env.PATH ?? '').split(':')) {
-      if (!entry || !existsSync(entry)) continue
-      for (const name of readdirSync(entry)) {
+      if (!entry) continue
+      // A PATH may name a directory that does not exist, is not a directory, or cannot be read.
+      // None of those is this test's subject, and none of them should abort it.
+      let names: string[]
+      try {
+        names = readdirSync(entry)
+      } catch {
+        continue
+      }
+      for (const name of names) {
         if (name === 'sudo') continue
+        // First entry wins, exactly as a PATH search would resolve it.
         if (existsSync(join(noSudoDir, name))) continue
         symlinkSync(join(entry, name), join(noSudoDir, name))
       }
