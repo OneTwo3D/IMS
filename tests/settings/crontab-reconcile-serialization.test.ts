@@ -882,6 +882,11 @@ test('[o3d-batch-ret] the lock path is writable under every sandboxing directive
   //
   // So the direction is inverted: the unit is PARSED, and a directive nobody has classified fails,
   // whatever it is called.
+  //
+  // WHAT THIS CENSUS DOES NOT CATCH, said plainly: it is over directive NAMES. A directive that is
+  // already classified but whose VALUE changes is caught only where a test reads that value — which
+  // the four that decide the lock path do, above: ProtectSystem=, ReadWritePaths=, StateDirectory=
+  // and WorkingDirectory= are each read out of the unit and asserted, not merely counted here.
   // ------------------------------------------------------------------------
 
   /** Every directive NAME active in the [Service] section, in order, duplicates included. */
