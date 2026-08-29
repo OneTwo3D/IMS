@@ -1576,7 +1576,14 @@ db_application_route_env_refusal() {
       return 1
     fi
   done < <(db_route_env_variables)
-  [[ "${mode}" == "service" ]] || return 0
+  # THE MODE IS ENUMERATED, NOT DEFAULTED PAST. `|| return 0` on a `== "service"` test would make
+  # every misspelling of the stricter mode silently take the weaker one — a start gate that
+  # checked nothing, and looked exactly like one that passed.
+  case "${mode}" in
+    installer) return 0 ;;
+    service) ;;
+    *) printf 'db_application_route_env_refusal was asked for a %s check, and the only questions it answers are the installer one (this process) and the service one (this process, plus the properties of the composed unit). That is a programming error in this script, not a condition of this host' "$(printf '%q' "${mode}")"; return 1 ;;
+  esac
   if ! unit_route_env_guaranteed "${APP_NAME}.service"; then
     printf '%s' "${ENV_ROUTE_GUARANTEE_REASON}"
     return 1

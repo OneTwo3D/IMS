@@ -2001,7 +2001,7 @@ interface RouteEnvOptions {
   readonly unsetEnvironment?: string
   readonly execStart?: string
   readonly loadState?: string
-  readonly mode?: 'installer' | 'service'
+  readonly mode?: string
 }
 
 const HOST_EXECSTART = 'a(sasbttttuii) 1 "/opt/app/node_modules/.bin/next" 4 "/opt/app/node_modules/.bin/next" "start" "-p" "3000" false 0 0 0 0 0 0 0'
@@ -2050,9 +2050,9 @@ function runRouteEnv(options: RouteEnvOptions): { status: number; output: string
     lift('db_route_env_effect'),
     lift('db_application_route_env_refusal'),
     lift('db_application_route_sslmode'),
-    options.mode === 'service'
-      ? 'if reason="$(db_application_route_env_refusal service)"; then echo "GUARANTEED"; else echo "REFUSED=${reason}"; fi'
-      : 'if route="$(db_application_route_sslmode)"; then echo "ROUTE=${route}"; else echo "REFUSED=${route}"; fi',
+    options.mode === undefined
+      ? 'if route="$(db_application_route_sslmode)"; then echo "ROUTE=${route}"; else echo "REFUSED=${route}"; fi'
+      : `if reason="$(db_application_route_env_refusal ${options.mode})"; then echo "GUARANTEED"; else echo "REFUSED=\${reason}"; fi`,
   ].join('\n')
   try {
     return {
@@ -2175,6 +2175,16 @@ test('r45: the installer’s own environment still refuses, and now names the su
 
   // THE CONTROL: a clean environment resolves, and it resolves to the route DB_SSLMODE names.
   assert.match(runRouteEnv({}).output, /^ROUTE=disable$/m, 'nothing set, and the derivation answers')
+
+  // AND THE MODE IS ENUMERATED. A `[[ $mode == service ]] || return 0` would make every
+  // misspelling of the stricter question take the weaker one silently — a start gate that checked
+  // nothing and looked exactly like one that passed.
+  //
+  // MUTATION ROUTE: replace the `case` in db_application_route_env_refusal() with
+  // `[[ "${mode}" == "service" ]] || return 0` and this resolves instead of refusing.
+  const typo = runRouteEnv({ mode: 'servce' })
+  assert.match(typo.output, /^REFUSED=/m, `an unrecognised mode is a refusal, not the weaker check:\n${typo.output}`)
+  assert.match(typo.output, /programming error in this script/, 'and it says whose mistake it is')
 })
 
 // ---------------------------------------------------------------------------
