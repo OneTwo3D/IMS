@@ -87,6 +87,19 @@ function envWriteBlock(source: string): string {
   return sliceRange(source, 'cat > "${APP_DIR}/.env" <<EOF', 'chown "${APP_USER}:${APP_USER}" "${APP_DIR}/.env"')
 }
 
+/**
+ * THE SENTINEL AND THE CAPTURE PRIMITIVE, OPTIONALLY (o3d-2sm1.5 r40, Codex HIGH).
+ *
+ * The Redis recovery this file exercises now reads its userinfo through the shipped `capture`,
+ * because command substitution deletes a trailing newline out of a credential. Both are lifted
+ * OPTIONALLY, like every other slice here: reverting r40 removes them from install.sh and this rig
+ * then runs the old code and fails on what the second run PRODUCED, which is the property the
+ * slicing is built on.
+ */
+function captureTerminatorAssignment(source: string): string {
+  return /^CAPTURE_TERMINATOR=.*$/m.exec(source)?.[0] ?? ''
+}
+
 async function readScript(): Promise<string> {
   return readFile(path.join(SCRIPT), 'utf8')
 }
@@ -142,6 +155,8 @@ async function runInstallerCapturing(
     DATABASE_URL=postgresql://imsuser:pw@localhost:5432/one_two_inventory
     ${UNRELATED_VARS.map((name) => `${name}=''`).join('\n    ')}
     ${hasEnvTable ? 'declare -A EXISTING_ENV=()' : ''}
+    ${captureTerminatorAssignment(source)}
+    ${sliceOptionalBlock(source, 'capture() {') ?? ''}
     ${sliceOptionalBlock(source, 'urlencode() {') ?? ''}
     ${sliceOptionalBlock(source, 'urldecode() {') ?? ''}
     ${sliceOptionalBlock(source, 'mask_secret() {') ?? ''}
@@ -348,6 +363,8 @@ test('a preserved credential is never echoed as a prompt default', async () => {
       die() { echo "DIE: $*" >&2; exit 9; }
       APP_DIR=${JSON.stringify(appDir)}
       ${source.includes('declare -A EXISTING_ENV=()') ? 'declare -A EXISTING_ENV=()' : ''}
+      ${captureTerminatorAssignment(source)}
+      ${sliceOptionalBlock(source, 'capture() {') ?? ''}
       ${sliceOptionalBlock(source, 'urlencode() {') ?? ''}
       ${sliceOptionalBlock(source, 'urldecode() {') ?? ''}
       ${sliceOptionalBlock(source, 'mask_secret() {') ?? ''}

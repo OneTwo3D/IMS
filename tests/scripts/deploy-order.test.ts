@@ -5221,11 +5221,15 @@ const MENTION_SHAPES: ReadonlyArray<{ why: string; match: RegExp }> = (
         '"\\$\\{APP_USER\\}:\\$\\{APP_USER\\}" 600 \\|\\| return 1',
     },
     // The rotation journal write, which mentions the environment file only in the sentence it
-    // refuses with. Its two arguments are PASSWORDS BY VALUE — no path is handed to it — and it is
-    // named in full so that a call passing something else is not covered.
+    // refuses with. Its arguments are TWO PASSWORDS AND A DATABASE NAME, all BY VALUE — no path is
+    // handed to it — and it is named in full so that a call passing something else is not covered.
+    // The third argument arrived in r40: the endpoint the rotation proved could tell one password
+    // from another, recorded so the run that reconciles asks the same place.
     {
-      why: 'the rotation journal write, guarded by a refusal, handed two passwords by value',
-      match: 'write_role_rotation_journal "\\$\\{DB_PASSWORD_EFFECTIVE\\}" "\\$\\{DB_PASSWORD\\}" \\|\\| die "[^"]*"',
+      why: 'the rotation journal write, guarded by a refusal, handed two passwords and a database name by value',
+      match:
+        'write_role_rotation_journal "\\$\\{DB_PASSWORD_EFFECTIVE\\}" "\\$\\{DB_PASSWORD\\}"'
+        + ' "\\$\\{DB_ROTATION_PROBE_DATABASE\\}" \\|\\| die "[^"]*"',
     },
     {
       why: 'install.sh locking down or removing the file it owns',

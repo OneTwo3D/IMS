@@ -13,6 +13,8 @@ import { execFileSync, spawn } from 'node:child_process'
 import { chmodSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
+import pg from 'pg'
+
 import { type Cluster, cleanLibpqEnv, currentUser, shippedFunction } from './real-postgres-cluster.ts'
 
 export const REPO = process.cwd()
@@ -303,4 +305,103 @@ export const REINSTALL_BODY = `
 export function seedLiveInstallation(cluster: Cluster): void {
   cluster.psql(['-c', "CREATE ROLE imsuser LOGIN PASSWORD 'live-password'"])
   cluster.psql(['-c', 'CREATE DATABASE one_two_inventory OWNER imsuser'])
+}
+
+// ---------------------------------------------------------------------------
+// WHAT THE CREDENTIAL REGRESSIONS SHARE (moved here in r40)
+//
+// These were defined in install-credential-representation.test.ts while it was the only file
+// that needed them. The probe regressions need the same journal readers, the same base64 door
+// and the same 'the run that comes after the interrupted one' body — and two copies of a body
+// that models the shipped sequence is how two files come to disagree about what install.sh
+// does, which is the reason this rig exists at all.
+// ---------------------------------------------------------------------------
+
+/**
+ * The base64 door into the rig, as a shell function.
+ *
+ * runShipped() JSON-stringifies its variables into a DOUBLE-quoted shell assignment, so a value
+ * containing `$` or a backtick would be evaluated before any shipped function saw it — and a value
+ * containing a NEWLINE would not survive the assignment at all. base64 has no meaning in any layer
+ * it crosses, and `capture` is what brings the decoded bytes back out of the pipeline intact.
+ */
+export const DECODE_HELPER = `decode_b64() { printf '%s' "$1" | base64 -d; }`
+
+/** The four values that identify one credential, as the rig's tests supply them. */
+export function installVars(cluster: Cluster, root: string): Record<string, string> {
+  return {
+    APP_DIR: root,
+    APP_USER: currentUser(),
+    DB_HOST: '127.0.0.1',
+    DB_PORT: String(cluster.port),
+    DB_NAME: 'one_two_inventory',
+    DB_USER: 'imsuser',
+    IMS_PG_SOCKET_DIR: cluster.socket,
+  }
+}
+
+export const JOURNAL = 'cutover-private/db-role-rotation.journal'
+
+/** Does the shipped script's journal exist at the path the rig gives it? */
+export function journalPath(root: string): string {
+  return join(root, JOURNAL)
+}
+
+export function journalValue(root: string, key: string): string | null {
+  const match = new RegExp(`^${key}=(.*)$`, 'm').exec(readFileSync(journalPath(root), 'utf8'))
+  return match === null ? null : match[1]
+}
+
+/** THE APPLICATION'S OWN CONNECTION: the installed driver, the composed URL, the real server. */
+export async function connectWithDriver(url: string): Promise<string> {
+  const client = new pg.Client({ connectionString: url })
+  await client.connect()
+  try {
+    const result = await client.query('SELECT current_user AS who')
+    return String(result.rows[0].who)
+  } finally {
+    await client.end()
+  }
+}
+
+/**
+ * THE RUN THAT COMES AFTER THE INTERRUPTED ONE, with no password supplied — which under
+ * `--non-interactive`, and under an operator pressing Enter, is the same thing. It is the shipped
+ * pre-stop sequence: recover, classify, provision, publish, resolve.
+ *
+ * WHAT IT PRINTS IS WHAT THE RECONCILIATION DECIDED. DB_PASSWORD_INSTALLED is the credential this
+ * run believes the server has; DB_PASSWORD_EFFECTIVE is what it composed the URL from; and
+ * JOURNAL_LEFT says whether the record was cleared, which is the difference between "reconciled"
+ * and "still in flight".
+ */
+export const NEXT_RUN_BODY = `
+  load_existing_env "\${APP_DIR}/.env"
+  prompt_db_password
+  ensure_database_role_exists
+  classify_database_credential_rotation
+  provision_database_role_and_privileges
+  write_app_env_file
+  resolve_role_rotation_journal_after_env_publication
+  echo "INSTALLED_B64=$(printf '%s' "\${DB_PASSWORD_INSTALLED}" | base64 | tr -d '\\n')"
+  echo "EFFECTIVE_B64=$(printf '%s' "\${DB_PASSWORD_EFFECTIVE}" | base64 | tr -d '\\n')"
+  echo "PENDING=\${DB_PASSWORD_ROTATION_PENDING}"
+  echo "RECONCILED=\${DB_ROTATION_JOURNAL_FOUND}"
+  echo "JOURNAL_LEFT=$([[ -e "\${DB_ROLE_ROTATION_JOURNAL}" ]] && echo yes || echo no)"
+`
+
+/** The shipped rotation, TRUNCATED at one interruption point. Nothing here re-implements it. */
+export const SHIPPED_ROTATION_UP_TO_THE_CLEAR = `
+  write_role_rotation_journal "\${DB_PASSWORD_EFFECTIVE}" "\${DB_PASSWORD}" || exit 7
+  quoted="$(sql_quote_literal "\${DB_PASSWORD}")"
+  pg_local_psql -q >/dev/null <<EOSQL || exit 8
+    SET standard_conforming_strings = on;
+    ALTER USER "\${DB_USER}" WITH PASSWORD \${quoted};
+EOSQL
+  DB_PASSWORD_EFFECTIVE="\${DB_PASSWORD}"
+  DATABASE_URL="$(compose_database_url "\${DB_USER}" "\${DB_PASSWORD_EFFECTIVE}" "\${DB_HOST}" "\${DB_PORT}" "\${DB_NAME}")"
+  write_app_env_file || exit 9
+`
+
+export function decodeVar(output: string, name: string): string {
+  return Buffer.from(readVar(output, name), 'base64').toString('utf8')
 }
