@@ -1252,37 +1252,6 @@ EOSQL
   success "Database '${DB_NAME}' and user '${DB_USER}' ready."
 }
 
-# ONE LINE OF ${APP_DIR}/.env, REWRITTEN IN PLACE (o3d-2sm1.5 r38, Codex HIGH).
-#
-# The heredoc that writes .env runs long before the stop, and it has to write a credential that
-# WORKS, because a run that dies at the build leaves the predecessor up and its .env is what the
-# next `systemctl start` — or the next reboot — reads. So .env carries DB_PASSWORD_EFFECTIVE, and
-# the ONE line that has to change when a rotation finally happens is changed here, on its own,
-# after the ALTER has succeeded.
-#
-# `^DATABASE_URL=` is anchored because DEPLOY_ADMIN_DATABASE_URL is in the same file and ends in
-# the same fourteen characters; and the count is asserted rather than assumed, because a
-# substitution that matched nothing would leave .env naming a credential the server no longer has
-# while this function reported success. The value travels through the ENVIRONMENT into awk, so no
-# byte of a password can be read as a regex, a backslash escape or a field separator.
-write_env_database_url() {
-  local url="$1" env_file="${APP_DIR}/.env" tmp matches
-  [[ -f "${env_file}" ]] || die "The credential of '${DB_USER}' has been rotated but ${env_file} does not exist, so nothing names the new one. The database has the NEW password and no environment file states it. Write DATABASE_URL by hand before starting ${APP_NAME}.service."
-  matches="$(grep -c '^DATABASE_URL=' "${env_file}" || true)"
-  [[ "${matches}" == "1" ]] || die "The credential of '${DB_USER}' has been rotated but ${env_file} holds ${matches} lines beginning DATABASE_URL= rather than exactly one, so this run will not guess which to rewrite. The database has the NEW password; set DATABASE_URL by hand before starting ${APP_NAME}.service."
-  tmp="$(mktemp "${env_file}.XXXXXX")" || die "The credential of '${DB_USER}' has been rotated but no temporary file could be created beside ${env_file} to rewrite it. The database has the NEW password; set DATABASE_URL by hand before starting ${APP_NAME}.service."
-  if ! IMS_NEW_DATABASE_URL="${url}" awk '
-      /^DATABASE_URL=/ { print "DATABASE_URL=" ENVIRON["IMS_NEW_DATABASE_URL"]; next }
-      { print }
-    ' "${env_file}" > "${tmp}"; then
-    rm -f "${tmp}"
-    die "The credential of '${DB_USER}' has been rotated but rewriting ${env_file} failed. The database has the NEW password; set DATABASE_URL by hand before starting ${APP_NAME}.service."
-  fi
-  chown "${APP_USER}:${APP_USER}" "${tmp}" || { rm -f "${tmp}"; die "The credential of '${DB_USER}' has been rotated but the replacement ${env_file} could not be given to ${APP_USER}, so it was not installed. The database has the NEW password; set DATABASE_URL by hand before starting ${APP_NAME}.service."; }
-  chmod 600 "${tmp}" || { rm -f "${tmp}"; die "The credential of '${DB_USER}' has been rotated but the replacement ${env_file} could not be made mode 600, so it was not installed. The database has the NEW password; set DATABASE_URL by hand before starting ${APP_NAME}.service."; }
-  mv -f "${tmp}" "${env_file}" || { rm -f "${tmp}"; die "The credential of '${DB_USER}' has been rotated but the rewritten ${env_file} could not be moved into place. The database has the NEW password; set DATABASE_URL by hand before starting ${APP_NAME}.service."; }
-}
-
 # @install-phase: credential-rotation
 #
 # THE ONE STATEMENT THAT TAKES A WORKING CREDENTIAL AWAY, AND THE ONLY WINDOW IN WHICH NOBODY IS
@@ -1310,18 +1279,18 @@ rotate_database_password_in_fenced_window() {
   warn "connection onwards. Nothing this installer can do makes that untrue; it is why the rotation"
   warn "happens only because a password different from the installed one was supplied."
 
-  pg_local_psql -q >/dev/null <<EOSQL || die "Rotating the password of the existing role '${DB_USER}' failed. The service is STOPPED and the connection fence is UP; ${APP_DIR}/.env still names the credential the server already had, so the two agree and starting the old service by hand would work. NOTHING HAS BEEN MIGRATED. Fix the role or re-run without a password change."
+  pg_local_psql -q >/dev/null <<EOSQL || die "Rotating the password of the existing role '${DB_USER}' failed. The service is STOPPED and the connection fence is UP; the application environment file this run wrote still names the credential the server already had, so the two agree and starting the old service by hand would work. NOTHING HAS BEEN MIGRATED. Fix the role or re-run without a password change."
     ALTER USER "${DB_USER}" WITH PASSWORD '${DB_PASSWORD}';
 EOSQL
 
   DB_ROLE_CREDENTIALS_ROTATED=true
   DB_PASSWORD_ROTATION_PENDING=false
   DB_PASSWORD_EFFECTIVE="${DB_PASSWORD}"
-  # The application connection is recomposed BEFORE .env is rewritten, so that a failure inside
-  # write_env_database_url() dies with this run's own DATABASE_URL already pointing at the
-  # credential the server now has, and its message can say exactly which file disagrees.
+  # The application connection is recomposed BEFORE the environment file is rewritten, so that
+  # write_app_env_file() emits the credential the server now has. The two are set together, in
+  # that order, and nothing between them can fail into a state where only one of them moved.
   DATABASE_URL="postgresql://${DB_USER}:${DB_PASSWORD_EFFECTIVE}@${DB_HOST}:${DB_PORT}/${DB_NAME}"
-  write_env_database_url "${DATABASE_URL}"
+  write_app_env_file
   success "The password of '${DB_USER}' has been rotated and ${APP_DIR}/.env now names it. The build ran before this, on the previous credential."
 }
 
@@ -4072,8 +4041,26 @@ DEPLOY_ADMIN_DATABASE_URL="$(unquote_env_value "${DEPLOY_ADMIN_DATABASE_URL:-$(e
 # `existing_env` cannot tell those apart: it answers "not present" identically for both.
 require_preserved_secrets
 
+# THE FILE THIS INSTALLER OWNS, WRITTEN FROM THE VARIABLES IT HOLDS — AND WRITABLE TWICE
+# (o3d-2sm1.5 r38, Codex HIGH).
+#
+# It is a function because a credential rotation happens LATER, after the predecessor has been
+# stopped and the database fenced, and the file then has to name the new credential. The obvious
+# alternative — reach into ${APP_DIR}/.env and substitute the one line — makes install.sh a
+# SECOND READER of an application-owned file, which is the thing tests/scripts/deploy-order.test.ts
+# forbids outright and for good reason: the account that owns that file is the account this script
+# is protecting the database from. Re-running the write is not a read at all. Every value in it is
+# a variable this process is already holding, so the second write differs from the first in
+# exactly the bytes the rotation changed.
+#
+# WHICH IS WHY THE STAMP IS HOISTED. `$(date ...)` inline made the two writes differ in a line
+# that has nothing to do with the change, and "exactly one line moved" is an assertion the
+# regressions make.
+ENV_FILE_GENERATED_AT="$(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+
+write_app_env_file() {
 cat > "${APP_DIR}/.env" <<EOF
-# One Two Inventory — generated by install.sh on $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+# One Two Inventory — generated by install.sh on ${ENV_FILE_GENERATED_AT}
 
 NODE_ENV=production
 # What this deployment IS, as opposed to what it was built as. NODE_ENV is set
@@ -4146,6 +4133,9 @@ EOF
 
 chown "${APP_USER}:${APP_USER}" "${APP_DIR}/.env"
 chmod 600 "${APP_DIR}/.env"
+}
+
+write_app_env_file
 success ".env written to ${APP_DIR}/.env"
 
 # ---------------------------------------------------------------------------

@@ -43,6 +43,37 @@ function renderOnPty(command: string): Promise<string> {
 
 const SCRIPT = 'scripts/install.sh'
 
+/**
+ * WHERE THE `.env` WRITE BEGINS, IN EITHER SHAPE OF THE SCRIPT (o3d-2sm1.5 r38).
+ *
+ * The heredoc used to be four straight-line statements; r38 wrapped it in write_app_env_file() so
+ * that a credential rotation performed after the stop can re-write the file install.sh owns
+ * instead of reading a file the application account owns. These two helpers keep this rig bounded
+ * by lines that exist in BOTH shapes — which is the property the slicing here is built on, so that
+ * reverting the change under test runs the OLD code and this file fails on what the second run
+ * PRODUCED rather than on a marker that moved.
+ */
+function envWriteStartMarker(source: string): string {
+  return source.includes('write_app_env_file() {') ? 'write_app_env_file() {' : 'cat > "${APP_DIR}/.env"'
+}
+
+/**
+ * The write itself: the shipped function plus its call, or the bare statements that preceded it.
+ *
+ * The chown/chmod pair is dropped, which is exactly where the old slice ENDED. This rig runs as an
+ * ordinary user and has no APP_USER to give the file to; what it is about is the CONTENT the
+ * heredoc produces, and both ownership and mode are asserted elsewhere
+ * (tests/scripts/install-credential-preservation.test.ts checks the mode after a rotation).
+ */
+function envWriteBlock(source: string): string {
+  const wrapped = sliceOptionalBlock(source, 'write_app_env_file() {')
+  if (wrapped !== null) {
+    const body = wrapped.split('\n').filter((line) => !/^\s*(chown|chmod) /.test(line))
+    return `${body.join('\n')}\nwrite_app_env_file`
+  }
+  return sliceRange(source, 'cat > "${APP_DIR}/.env" <<EOF', 'chown "${APP_USER}:${APP_USER}" "${APP_DIR}/.env"')
+}
+
 async function readScript(): Promise<string> {
   return readFile(path.join(SCRIPT), 'utf8')
 }
@@ -112,8 +143,8 @@ async function runInstallerCapturing(
     ${source.includes('\nload_existing_env "${APP_DIR}/.env"') ? 'load_existing_env "${APP_DIR}/.env"' : ''}
     ${env}
     ${sliceRange(source, 'prompt_yn INSTALL_REDIS', 'info "--- WooCommerce')}
-    ${sliceRange(source, 'AUTH_SECRET=', 'cat > "${APP_DIR}/.env"')}
-    ${sliceRange(source, 'cat > "${APP_DIR}/.env" <<EOF', 'chown "${APP_USER}:${APP_USER}" "${APP_DIR}/.env"')}
+    ${sliceRange(source, 'AUTH_SECRET=', envWriteStartMarker(source))}
+    ${envWriteBlock(source)}
   `
   const { stderr } = await execFileAsync('bash', ['-c', script])
   return { values: parseEnvFile(await readFile(path.join(appDir, '.env'), 'utf8')), stderr }

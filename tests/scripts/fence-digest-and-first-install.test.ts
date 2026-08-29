@@ -526,9 +526,12 @@ function runInstallBranch(vars: string): { status: number; output: string } {
     DB_HOST=localhost
     DB_PORT=5432
     DB_NAME=one_two_inventory
+    DB_USER=imsuser
     DB_CREATED_BY_THIS_RUN=false
     DB_CREATED_IDENTITY=""
     DB_NEWNESS_FINDING="the fixture states that nothing established it"
+    # r38: the first-install arm refuses a credential rotation it has no window for.
+    DB_PASSWORD_ROTATION_PENDING=false
     ${vars}
     upgrade_in_place()            { return 1; }
     on_cutover_exit()             { :; }
@@ -651,6 +654,31 @@ test('r36: a genuine first install still takes the exemption, and still needs no
   } finally {
     rmSync(root, { recursive: true, force: true })
   }
+})
+
+test('r38: the first-install arm refuses a rotation it has no window to perform', () => {
+  // THE ONE PLACE A PENDING ROTATION CAN REACH THAT HAS NO STOP AND NO FENCE. The exemption says
+  // THIS run created THIS database, so nothing is serving it — but DB_PASSWORD_ROTATION_PENDING is
+  // only ever set over a role this run did NOT create, and a role is cluster-wide. It is therefore
+  // somebody else's role, on some other database, with nothing held closed. The refusal lands
+  // before the build and before the role work.
+  //
+  // MUTATION ROUTE (measured): delete the `if ${DB_PASSWORD_ROTATION_PENDING}` block from the else
+  // arm of install.sh. This run then reaches EXEMPTION_TAKEN and ROLE_WORK, and this test fails on
+  // both — alone in this file, since every other case here leaves the flag false.
+  const rotating = runInstallBranch(`
+    DB_HOST=localhost
+    DB_PORT=5432
+    DB_NAME=one_two_inventory
+    DB_CREATED_BY_THIS_RUN=true
+    DB_CREATED_IDENTITY="localhost:5432/one_two_inventory"
+    DB_PASSWORD_ROTATION_PENDING=true
+  `)
+  assert.equal(rotating.status, 9, `a rotation with no window must stop the run:\n${rotating.output}`)
+  assert.doesNotMatch(rotating.output, /EXEMPTION_TAKEN/, 'and it must land before the exemption is armed')
+  assert.doesNotMatch(rotating.output, /ROLE_WORK/, 'and before anything is written to the database')
+  assert.match(rotating.output, /first-install exemption/, 'saying which path it is on')
+  assert.match(rotating.output, /password is UNCHANGED/, 'and what state the role is in')
 })
 
 test('r36: the policy refuses to arm an exemption it has not earned, even if something calls it', () => {
