@@ -1,4 +1,4 @@
-import { execFile } from 'child_process'
+import { execFile, spawn } from 'child_process'
 import { existsSync, readFileSync } from 'fs'
 import os from 'os'
 import path from 'path'
@@ -18,6 +18,9 @@ import {
 import { getIntegrationPluginState, isIntegrationModuleVisible } from '@/lib/integration-plugins'
 import { getPublicAppUrl } from '@/lib/public-app-url'
 import { withCrontabReconcileLock, type HeldCrontabReconcileLock } from '@/lib/crontab-reconcile-lock'
+
+/** How long `crontab -` gets to accept the new file before it is killed and reported as failed. */
+const CRONTAB_WRITE_TIMEOUT_MS = 5000
 
 /**
  * THE CRONTAB RECONCILIATION, SEPARATED FROM ITS PERMISSION GATE (o3d-osl8 round 9, finding 4).
@@ -65,14 +68,14 @@ export type CrontabReconcileResult = {
 }
 
 /**
- * SERIALIZED, AND THE SERIALIZATION COVERS THE SNAPSHOT (Codex r21 HIGH).
+ * SERIALIZED, AND THE SERIALIZATION COVERS THE SNAPSHOT (Codex r21 HIGH, r22 HIGH).
  *
- * Everything from reading the settings to writing the crontab happens under ONE cross-process lock,
- * so two saves committing opposite enablement cannot end with the earlier snapshot writing last —
- * the state the previous round removed by a different route: an enablement row on, no cron line,
- * and every caller reporting success. The whole argument, including why a lock taken after the
- * snapshot would not have helped and why a session advisory lock is the right risk class for a
- * derived, re-derivable artefact, is in lib/crontab-reconcile-lock.ts.
+ * Everything from reading the settings to writing the crontab happens under ONE host-local file
+ * lock, so two saves committing opposite enablement cannot end with the earlier snapshot writing
+ * last — the state an earlier round removed by a different route: an enablement row on, no cron
+ * line, and every caller reporting success. The whole argument — why a lock taken after the
+ * snapshot would not have helped, why the exclusion is an `flock` on a file rather than a
+ * PostgreSQL advisory lock, and what that trade gives up — is in lib/crontab-reconcile-lock.ts.
  *
  * THE LOCK IS TAKEN HERE, NOT AT THE CALL SITES, and that is deliberate. Six server actions
  * reconcile the crontab — `savePublicAppUrl`, `saveBackupScheduleSettings`,
@@ -80,6 +83,12 @@ export type CrontabReconcileResult = {
  * `syncCrontab` — and a seventh will be added by someone who has not read this file. A rule that
  * every caller must remember to wrap is a rule that will be broken; taking it inside the only
  * function that touches the crontab makes coverage a property of the code rather than of a habit.
+ *
+ * COVERAGE IS A PROPERTY OF THE CODE, AND THE CODE IS NOT ONLY THIS LANGUAGE (r22). The other
+ * writer of this file is `scripts/install.sh`, which is shell, runs as root, and has no database
+ * connection when it gets there. It joins the same protocol by taking the same `flock` on the same
+ * path — see the "Cron jobs" section there and the writer census in
+ * tests/settings/crontab-reconcile-serialization.test.ts.
  *
  * The audit row and the cache revalidation stay OUTSIDE the lock: they observe a write that has
  * already happened and cannot change it, so holding the exclusion across them would only make every
@@ -167,28 +176,54 @@ async function applyCrontabFromSettings(
   const existingCrontab = await readOwnCrontab()
   const newCrontab = spliceOtiBlock(existingCrontab, block.lines)
 
-  // THE EXCLUSION MUST STILL EXIST AT THE MOMENT OF THE WRITE. PostgreSQL frees a session advisory
-  // lock the instant its connection dies, so from that instant another reconciliation can be
-  // running — and this one is holding a snapshot it took believing it was alone. Reporting a
-  // failure sends the operator to Save & Apply, which re-derives the crontab from the committed
-  // rows; writing anyway would silently reinstate the interleaving this lock exists to prevent.
-  if (lock.lost) {
-    return {
-      success: false,
-      error: 'The crontab reconciliation lock was lost before the write, so the crontab was not '
-        + 'changed. Re-apply from Settings -> System -> Scheduler.',
-    }
-  }
+  return writeCrontab(newCrontab, lock.fd)
+}
 
-  return new Promise<{ success: boolean; error?: string }>((resolve) => {
-    const proc = execFile('crontab', ['-'], { timeout: 5000 }, (err) => {
-      if (err) {
-        resolve({ success: false, error: `crontab write failed: ${err.message}` })
-      } else {
-        resolve({ success: true })
-      }
+/**
+ * Write the crontab, WITH THE LOCK DESCRIPTOR INHERITED BY THE CHILD (Codex r22 HIGH).
+ *
+ * The write is not done by this process — `crontab -` does it. Round 21's exclusion was a
+ * PostgreSQL session lock, which could only be CHECKED before the spawn: a connection that died
+ * after that check left this child writing with no exclusion, so a second reconciliation could
+ * acquire, read newer settings, write, and then be overtaken by this child finishing LAST with a
+ * stale snapshot. Nothing to re-verify would have helped, because the write was already gone.
+ *
+ * Passing the lock fd as the child's fd 3 removes the window instead of narrowing it. An `flock`
+ * belongs to an open file description, and `spawn` gives the child a DUPLICATE of ours; the kernel
+ * releases the lock only when every duplicate is closed. So the exclusion covers this write for as
+ * long as the child lives — including the case where this process is killed the instant after the
+ * spawn, which is the one that produced the stale last write.
+ *
+ * `spawn`, not `execFile`, and that is load-bearing: `execFile` builds its own options for `spawn`
+ * and DROPS `stdio`, so the descriptor would silently not reach the child and the lock would end at
+ * this process again.
+ */
+function writeCrontab(contents: string, lockFd: number): Promise<{ success: boolean; error?: string }> {
+  return new Promise((resolve) => {
+    const proc = spawn('crontab', ['-'], { stdio: ['pipe', 'ignore', 'pipe', lockFd] })
+    let stderr = ''
+    let settled = false
+    const settle = (outcome: { success: boolean; error?: string }) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve(outcome)
+    }
+    // The same 5s bound the previous `execFile` carried, kept because the lock wait is sized from it.
+    const timer = setTimeout(() => {
+      proc.kill('SIGKILL')
+      settle({ success: false, error: 'crontab write failed: timed out after 5000ms' })
+    }, CRONTAB_WRITE_TIMEOUT_MS)
+    proc.stderr?.on('data', (chunk) => { stderr += String(chunk) })
+    proc.on('error', (err) => settle({ success: false, error: `crontab write failed: ${err.message}` }))
+    proc.on('close', (code) => {
+      if (code === 0) return settle({ success: true })
+      settle({ success: false, error: `crontab write failed: ${stderr.trim() || `crontab exited ${code}`}` })
     })
-    proc.stdin?.write(newCrontab)
+    proc.stdin?.on('error', () => {
+      // A crontab that exited before reading stdin surfaces as the non-zero close above.
+    })
+    proc.stdin?.write(contents)
     proc.stdin?.end()
   })
 }

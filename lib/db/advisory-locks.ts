@@ -109,27 +109,20 @@ export const COMPONENT_GRAPH_WRITE_LOCK_KEY = 918_274_101
 export const ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY = 918_274_233
 
 /**
- * CRONTAB RECONCILIATION domain (Codex r21 HIGH).
+ * THERE IS NO CRONTAB LOCK IN THIS REGISTRY, AND THAT IS THE POINT (Codex r22 HIGH).
  *
- * ONE reconciliation of the OS crontab at a time, across processes.
+ * A round of review put one here — `CRONTAB_RECONCILE_LOCK_KEY = 918_274_234`, a session advisory
+ * lock serializing the reconciliation of the OS crontab. It was the wrong mechanism for the
+ * resource, twice over: the lock died with its PostgreSQL connection while the spawned `crontab -`
+ * was still writing, and `scripts/install.sh` — the other writer of the same file — has no database
+ * connection to take it with. The exclusion now lives where the resource does, as an `flock` on a
+ * file beside the app, taken identically by the Node reconciliation and by the installer's shell.
+ * See lib/crontab-reconcile-lock.ts.
  *
- * `reconcileCrontab` snapshots the `cron_*` settings and then, separately, reads and rewrites the
- * OS crontab. Six server actions call it, every one of them AFTER its own commit — so two saves
- * that overlap used to interleave as: A commits backups OFF and snapshots; B commits backups ON,
- * snapshots, and installs the line; A writes last, from its stale snapshot, and REMOVES the line.
- * Both actions return `saved`, the database and every screen say backups are enabled, and no
- * scheduled invocation exists. Nothing ever notices, because a crontab has no version to compare.
- *
- * The exclusion is only worth anything if it covers the SNAPSHOT as well as the write: a lock taken
- * after the read serializes the two writers and still lets the stale reading win. Held across
- * snapshot -> read crontab -> write crontab, whoever writes last has necessarily read the latest
- * committed state, so the two orders converge on the same crontab. See lib/crontab-reconcile-lock.ts.
- *
- * ITS OWN DOMAIN. A crontab rewrite has no overlap with accounting posting or connector selection,
- * and folding it into either would make an operator saving a schedule wait behind a batch for no
- * correctness gain. Nothing else writes the crontab, so this domain has exactly one holder.
+ * 918_274_234 is deliberately NOT reused for anything else: an operator looking at an old
+ * `pg_locks` capture, or an old build still running, must not find that number meaning something
+ * new.
  */
-export const CRONTAB_RECONCILE_LOCK_KEY = 918_274_234
 
 /**
  * Every single-bigint domain above, for the uniqueness test. A new lock MUST be
@@ -142,7 +135,6 @@ export const SINGLE_KEY_ADVISORY_LOCKS = {
   SWEEP_CURSOR_LOCK_KEY,
   COMPONENT_GRAPH_WRITE_LOCK_KEY,
   ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY,
-  CRONTAB_RECONCILE_LOCK_KEY,
 } as const
 
 /**

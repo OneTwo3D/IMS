@@ -749,7 +749,8 @@ apt-get install -y -qq \
   fail2ban \
   unattended-upgrades apt-listchanges \
   openssl \
-  logrotate
+  logrotate \
+  util-linux
 
 success "Base packages installed."
 
@@ -1464,6 +1465,52 @@ trap 'rm -f "${CRON_BLOCK_FILE}"' EXIT
 #     preserved; legacy pre-marker localhost:APP_PORT/api/cron/ lines are cleared,
 #   - the fresh block is re-inserted where the first managed marker was (NOT at
 #     EOF), so it never jumps past an operator PATH/SHELL/CRON_TZ assignment.
+# ---------------------------------------------------------------------------
+# ONE EXCLUSION PROTOCOL FOR THIS CRONTAB, AND THIS SCRIPT JOINS IT (Codex r22 HIGH).
+#
+# The running application rewrites the SAME managed block from six server actions
+# (lib/crontab-reconcile.ts). This script is a second read-modify-write of it, it runs as root,
+# and by this point the service has already been started above — so an upgrade or a re-run can
+# overlap a save an operator is making in the browser, and whichever pipeline writes last silently
+# discards the other's block.
+#
+# The app's exclusion used to be a PostgreSQL session advisory lock, which this script could not
+# possibly take: it is shell, and it gets here long before there is an app session to take a lock
+# on. So the exclusion moved to where the resource is — an `flock` on a file next to the app — and
+# what follows is the same two lines the app performs, on the same path.
+#
+#   ${APP_DIR}/.crontab-reconcile.lock  ==  path.join(process.cwd(), '.crontab-reconcile.lock')
+#
+# and the systemd unit written above sets WorkingDirectory=${APP_DIR}, which is what makes those
+# two the same file. tests/settings/crontab-reconcile-serialization.test.ts asserts all three.
+#
+# `touch`, never rm-and-recreate: the lock lives on the INODE, so replacing the file would hand two
+# writers two different locks and look like it worked.
+# ---------------------------------------------------------------------------
+CRONTAB_LOCK_FILE="${APP_DIR}/.crontab-reconcile.lock"
+touch "${CRONTAB_LOCK_FILE}"
+chown "${APP_USER}:${APP_USER}" "${CRONTAB_LOCK_FILE}"
+chmod 0664 "${CRONTAB_LOCK_FILE}"
+
+CRON_BOOTSTRAP_WRITTEN=no
+exec 9>>"${CRONTAB_LOCK_FILE}"
+if ! flock --exclusive --timeout 30 9; then
+  # FAIL SAFE, DO NOT ABORT. Writing without the lock is the defect itself, and a held lock means
+  # the app is reconciling right now — which also means the block below would have been skipped.
+  warn "Another process is reconciling ${APP_USER}'s crontab; leaving it untouched."
+  warn "If scheduled jobs are missing, open Settings -> System -> Scheduler and press Save & Apply."
+else
+  # BOOTSTRAP, NOT RECONCILE (Codex r22 HIGH). The block below carries the INSTALLER's default
+  # schedules, not the operator's committed settings, so writing it over an existing managed block
+  # would revert every schedule choice made in the app — the same "the crontab disagrees with the
+  # committed rows and nothing notices" state this whole protocol exists to prevent, just reached
+  # from the outside. If a managed block is already there, the app owns it. This test and the write
+  # are both inside the lock, so a save cannot land between them.
+  if grep -qE '^# --- OTI CRON START ---[ \t\r]*$' <<< "$(crontab -u "${APP_USER}" -l 2>/dev/null || true)"; then
+    info "A managed crontab block already exists for ${APP_USER} — leaving the app's schedules alone."
+    info "Newly registered jobs are scheduled by Settings -> System -> Scheduler -> Save & Apply."
+  else
+    CRON_BOOTSTRAP_WRITTEN=yes
 # `|| true` so a fresh box with NO existing crontab (crontab -l exits nonzero)
 # doesn't trip `set -euo pipefail` and abort the install (Codex r9).
 { crontab -u "${APP_USER}" -l 2>/dev/null || true; } | awk -v port="${APP_PORT}" -v blockfile="${CRON_BLOCK_FILE}" '
@@ -1505,15 +1552,22 @@ trap 'rm -f "${CRON_BLOCK_FILE}"' EXIT
     if (!emitted) emitBlock()   # no prior block → append at end
   }
 ' | crontab -u "${APP_USER}" -
+  fi
+fi
+exec 9>&-   # release the crontab lock: the fd IS the lock
 rm -f "${CRON_BLOCK_FILE}"
 trap - EXIT   # risky window over; drop the cleanup trap
 
-success "Cron jobs configured:"
-echo "  - 02:00 Daily scheduled backup (if enabled in settings)"
-echo "  - 03:00 Activity log cleanup"
-echo "  - 04:00 WooCommerce backup reconciliation and stock retry drain"
-echo "  - Every 15 min Delivery status polling"
-echo "  - 06:00 FX rate update"
+if [[ "${CRON_BOOTSTRAP_WRITTEN}" == "yes" ]]; then
+  success "Cron jobs configured:"
+  echo "  - 02:00 Daily scheduled backup (if enabled in settings)"
+  echo "  - 03:00 Activity log cleanup"
+  echo "  - 04:00 WooCommerce backup reconciliation and stock retry drain"
+  echo "  - Every 15 min Delivery status polling"
+  echo "  - 06:00 FX rate update"
+else
+  success "Cron jobs left to the application's own scheduler settings."
+fi
 
 # ---------------------------------------------------------------------------
 # 17. Firewall hints (ufw)
