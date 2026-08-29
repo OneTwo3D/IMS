@@ -83,15 +83,51 @@ import path from 'path'
  *     other) while still under-protecting (the installer). A host-local lock has exactly the scope
  *     of the thing it protects.
  *   • A LOCAL FILESYSTEM ASSUMPTION. `flock` is not reliable over NFS on older kernels; the lock
- *     file lives in the app directory, which is local on every supported install (`scripts/install.sh`
- *     puts it under /opt), and this is written down here rather than discovered later.
+ *     file lives under the service's systemd `StateDirectory`, which is `/var/lib/...` and local on
+ *     every supported install, and this is written down here rather than discovered later.
+ *
+ * ============================================================================================
+ * WHERE THE LOCK FILE LIVES, AND WHY IT IS NOT THE APP DIRECTORY (r23 HIGH).
+ *
+ * Round 22 put the lock at `path.join(process.cwd(), …)` — the app directory — and proved that
+ * choice against a scratch directory in `/tmp`, which is writable. The SHIPPED unit is not:
+ * `deploy/systemd/ims-stage.service` sets `ProtectSystem=strict`, which remounts the entire
+ * filesystem read-only for the service except for what it names, and it names only
+ * `.next`, `uploads` and `public/uploads` under the app tree. `openSync(<appdir>/.lock, 'a')`
+ * therefore fails with EROFS on a real hardened install — at the FIRST reconciliation, not at
+ * deploy time. And the documented `OTI_CRONTAB_LOCK_PATH` escape hatch made it worse rather than
+ * better: `scripts/install.sh` did not read it, so an operator who set it gave the two writers two
+ * different locks — the exact "looks locked, excludes nothing" state this protocol exists to remove.
+ *
+ * The lock now lives under the service's systemd **StateDirectory**, and both writers derive it
+ * from that ONE source:
+ *
+ *   • the application reads `$STATE_DIRECTORY`, which systemd itself sets in the service's
+ *     environment from the unit's `StateDirectory=`. Nothing has to be configured for the app and
+ *     the unit to agree — systemd is the one telling it.
+ *   • `scripts/install.sh` writes `StateDirectory=${APP_NAME}` into the unit it generates and locks
+ *     `${DATA_DIR}/.crontab-reconcile.lock`, where `DATA_DIR=/var/lib/${APP_NAME}` is exactly the
+ *     path systemd will hand the app in `$STATE_DIRECTORY`.
+ *   • `deploy/systemd/ims-stage.service` already declared `StateDirectory=onetwoinventory` for its
+ *     backups, so the hardened unit needs no new directory and no new `ReadWritePaths=` entry:
+ *     systemd creates a StateDirectory, owns it to the service user at `StateDirectoryMode=`, and
+ *     implicitly adds it to `ReadWritePaths=`, so it survives `ProtectSystem=strict` by construction.
+ *     `ProtectHome=` does not reach `/var/lib`, and `PrivateTmp=` does not either.
+ *
+ * The resolved-path agreement between the two writers is asserted — by RESOLVING both, not by
+ * comparing basenames — in tests/settings/crontab-reconcile-serialization.test.ts.
+ *
+ * IF THE PATH IS UNWRITABLE ANYWAY, THE RECONCILIATION REFUSES. `acquireCrontabFileLock` returns a
+ * failure, `reconcileCrontab` returns `{ success: false, error }` WITHOUT running the
+ * read-modify-write, and the caller renders "the scheduler may be behind". A reconciliation that
+ * proceeded unserialised would be the defect itself; one that refuses is safe, and the message
+ * names the path and the unit directive so the operator is not left guessing.
  */
 
 /**
- * The lock file's name. The installer writes the SAME basename under `${APP_DIR}` and the systemd
- * unit sets `WorkingDirectory=${APP_DIR}`, so both writers land on one file. That agreement is
- * asserted by tests/settings/crontab-reconcile-serialization.test.ts, because an exclusion whose
- * two participants silently pick different paths is not an exclusion.
+ * The lock file's name, inside the state directory both writers resolve. That agreement is asserted
+ * by tests/settings/crontab-reconcile-serialization.test.ts, because an exclusion whose two
+ * participants silently pick different paths is not an exclusion.
  */
 export const CRONTAB_RECONCILE_LOCK_FILENAME = '.crontab-reconcile.lock'
 
@@ -128,13 +164,50 @@ const FLOCK_CONFLICT_EXIT_CODE = 75
 const LOCK_FD_IN_CHILD = 3
 
 /**
- * Where the lock file is. `process.cwd()` is the app directory on a real install (the unit sets
- * `WorkingDirectory`), which is the same assumption `resolveSecretRef` already makes about `.env`.
- * The env override exists for tests and for an operator who has moved the app.
+ * The service's state directory, as systemd itself reports it.
+ *
+ * `$STATE_DIRECTORY` is set by systemd from the unit's `StateDirectory=`; it is absolute, and it is
+ * COLON-SEPARATED when a unit declares more than one, so the first entry is taken (that is the one
+ * the unit names first, and it is the one the installer writes). A value that is not absolute is
+ * not systemd's — it is something in the environment wearing the name — and is ignored.
+ */
+function systemdStateDirectory(): string | null {
+  const first = process.env.STATE_DIRECTORY?.split(':')[0]?.trim()
+  return first && path.isAbsolute(first) ? first : null
+}
+
+/**
+ * Where the lock file is.
+ *
+ * ONE source, in this order:
+ *
+ *   1. `$STATE_DIRECTORY` — systemd's own answer, and the only one a supported deployment uses. It
+ *      is the same directory `scripts/install.sh` locks, because the installer writes the
+ *      `StateDirectory=` that produces it. Nothing can be configured to make those two disagree.
+ *   2. `OTI_CRONTAB_LOCK_PATH` — TESTS ONLY, and scoped so it cannot become a second protocol on a
+ *      real install: systemd's answer above always wins over it, and it is REFUSED outright when
+ *      `NODE_ENV=production`. An override that can split the exclusion is worse than no override,
+ *      which is the same argument this module already makes about the lock file's inode. A
+ *      production process that sets it is told, on stderr, that it was ignored — rather than
+ *      quietly locking a file no other writer will ever open.
+ *   3. the working directory — a developer running `next dev` outside systemd, where there is no
+ *      installer and no second writer to agree with. On a hardened unit this is unwritable, and the
+ *      reconciliation then REFUSES rather than proceeding unserialised (see `openLockFile`).
  */
 export function crontabReconcileLockPath(): string {
+  const stateDir = systemdStateDirectory()
+  if (stateDir) return path.join(stateDir, CRONTAB_RECONCILE_LOCK_FILENAME)
+
   const override = process.env.OTI_CRONTAB_LOCK_PATH?.trim()
-  return override || path.join(process.cwd(), CRONTAB_RECONCILE_LOCK_FILENAME)
+  if (override) {
+    if (process.env.NODE_ENV !== 'production') return override
+    console.warn(
+      `OTI_CRONTAB_LOCK_PATH=${override} was IGNORED: it is a test-only override, and honouring it in `
+      + 'production would give the application and scripts/install.sh two different crontab locks. '
+      + 'Set StateDirectory= in the systemd unit instead.',
+    )
+  }
+  return path.join(process.cwd(), CRONTAB_RECONCILE_LOCK_FILENAME)
 }
 
 /**
@@ -156,16 +229,25 @@ export type CrontabReconcileLockOutcome<T> =
 /**
  * Open the lock file, creating it if it is not there.
  *
- * Falls back to a READ-ONLY descriptor when the file exists but is not writable by this user:
+ * Falls back to a READ-ONLY descriptor when the file exists but cannot be opened for writing:
  * `flock(2)` takes an exclusive lock on any descriptor regardless of its access mode, and the
- * installer creates this file as root before `chown`ing it. A read-only fallback means a
- * mis-owned lock file degrades to "still serialized" rather than "silently unserialized".
+ * installer creates this file as root before `chown`ing it. A read-only fallback means a mis-owned
+ * lock file (EACCES) or one on a read-only bind mount (EROFS — what `ProtectSystem=strict` produces
+ * for every path the unit does not open up) degrades to "still serialized" rather than "silently
+ * unserialized".
+ *
+ * When even that fails — the usual case being a directory the service cannot write, so the file was
+ * never created and the read-only open is ENOENT — the error PROPAGATES. It is turned into a
+ * returned refusal by `acquireCrontabFileLock`, and the crontab is left alone. Proceeding without
+ * the lock is the defect this module exists to prevent, so there is deliberately no path here that
+ * ends in "carry on without one".
  */
 function openLockFile(lockPath: string): number {
   try {
     return openSync(lockPath, 'a')
   } catch (error) {
-    if ((error as NodeJS.ErrnoException)?.code !== 'EACCES') throw error
+    const code = (error as NodeJS.ErrnoException)?.code
+    if (code !== 'EACCES' && code !== 'EROFS') throw error
     return openSync(lockPath, 'r')
   }
 }
@@ -236,7 +318,11 @@ async function acquireCrontabFileLock(timeoutMs: number): Promise<AcquireOutcome
       return {
         ok: false,
         error: `Could not open the crontab reconciliation lock file ${lockPath}: `
-          + `${error instanceof Error ? error.message : String(error)}`,
+          + `${error instanceof Error ? error.message : String(error)}. `
+          + 'The crontab was NOT changed, because a reconciliation that cannot be serialized can '
+          + 'silently discard another writer\'s block. This path comes from the service\'s systemd '
+          + 'StateDirectory: check the unit declares StateDirectory= and that the directory is '
+          + 'writable by the service user.',
       }
     }
     const remaining = Math.max(1, deadline - Date.now())

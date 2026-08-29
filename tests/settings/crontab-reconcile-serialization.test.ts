@@ -63,7 +63,15 @@ import test, { mock } from 'node:test'
 //      OUTCOME rather than a throw                                    (lib/crontab-reconcile-lock.ts)
 //   8. EVERY writer of this crontab in the whole repository — TypeScript and shell — participates
 //                                                                             (repository walk)
-//   9. the app and the installer resolve the same lock FILE                    (repository scan)
+//   9. LOAD-BEARING. the app and the installer RESOLVE one file — bash evaluates the installer's own
+//      definitions, and the shipped function is asked with the $STATE_DIRECTORY the installer's unit
+//      produces                                          (scripts/install.sh + the generated unit)
+//  10. LOAD-BEARING. that path survives every write-constraining directive in the SHIPPED hardened
+//      unit, which is what round 22 was never checked against  (deploy/systemd/ims-stage.service)
+//  11. LOAD-BEARING. an unwritable lock path REFUSES: no crontab read, no crontab write, and a
+//      message naming the path and the directive        (backup-schedule.tsx -> saveBackupSchedule…)
+//  12. the test-only path override cannot be used by a production process to diverge from the
+//      installer                                                       (lib/crontab-reconcile-lock.ts)
 //
 // DETERMINISM. There is no sleep and no timer used to sequence anything. The interleaving comes
 // from two injected barriers — one inside the settings snapshot, one inside a real `crontab`
@@ -86,6 +94,13 @@ const READY_FIFO = join(HARNESS, 'ready.fifo')
 const GO_FIFO = join(HARNESS, 'go.fifo')
 const LOCK_FILE = join(HARNESS, 'crontab-reconcile.lock')
 
+// `$STATE_DIRECTORY` is systemd's answer and outranks the test-only override, so it must be absent
+// here — otherwise every test below would silently lock a file in a real state directory.
+delete process.env.STATE_DIRECTORY
+// …and the override is refused outright in production, so a runner that set NODE_ENV=production
+// would send every lock below to the repository root instead of the harness.
+assert.notEqual(process.env.NODE_ENV, 'production',
+  'these tests drive the lock through OTI_CRONTAB_LOCK_PATH, which production refuses')
 process.env.OTI_CRONTAB_LOCK_PATH = LOCK_FILE
 process.env.CRON_SECRET = 'a1b2c3d4e5f6'
 
@@ -675,30 +690,289 @@ test('[o3d-batch-ret] every crontab writer in the repository is inside the one e
 })
 
 // ---------------------------------------------------------------------------
-// 9 — the two writers resolve the SAME file
+// 9 — the two writers RESOLVE the same file, from the systemd StateDirectory
 // ---------------------------------------------------------------------------
 
-test('[o3d-batch-ret] the application and the installer lock the same path', async () => {
+/**
+ * Evaluate the installer's OWN variable definitions in a real bash, and print what they resolve to.
+ *
+ * Not a re-typed copy of the paths: the four `NAME="…"` lines are lifted out of scripts/install.sh
+ * by name, so renaming APP_NAME or repointing DATA_DIR moves what these tests compare against and a
+ * divergence shows up here instead of on an operator's box.
+ */
+async function installerResolves(names: string[]): Promise<Record<string, string>> {
+  const defs = names.map((name) => {
+    const line = INSTALL_SH.match(new RegExp(`^${name}="[^"]*"$`, 'm'))
+    assert.ok(line, `scripts/install.sh must define ${name} on one line`)
+    return line![0]
+  })
+  const prints = names.map((name) => `printf '%s=%s\\n' '${name}' "\${${name}}"`)
+  const { code, stdout, stderr } = await sh(`set -eu\n${defs.join('\n')}\n${prints.join('\n')}`)
+  assert.equal(code, 0, `the installer's own definitions must evaluate: ${stderr}`)
+  const resolved: Record<string, string> = {}
+  for (const line of stdout.split('\n').filter(Boolean)) {
+    const eq = line.indexOf('=')
+    resolved[line.slice(0, eq)] = line.slice(eq + 1)
+  }
+  assert.deepEqual(Object.keys(resolved).sort(), [...names].sort())
+  return resolved
+}
+
+test('[o3d-batch-ret] the application and the installer RESOLVE the same lock path, from the unit StateDirectory', async () => {
   const { CRONTAB_RECONCILE_LOCK_FILENAME, crontabReconcileLockPath } =
     await import('@/lib/crontab-reconcile-lock')
 
-  // An exclusion whose participants silently choose different files is not an exclusion, and
-  // nothing at runtime would ever say so.
-  assert.match(
-    INSTALL_SH,
-    new RegExp(`^CRONTAB_LOCK_FILE="\\$\\{APP_DIR\\}/${CRONTAB_RECONCILE_LOCK_FILENAME.replace('.', '\\.')}"$`, 'm'),
-    'the installer must lock ${APP_DIR}/<the same basename the app uses>',
-  )
-  assert.match(INSTALL_SH, /^WorkingDirectory=\$\{APP_DIR\}$/m,
-    "the unit must put the app's cwd at APP_DIR, which is what makes those two paths one file")
+  // --- what the INSTALLER locks, resolved by bash from the installer's own definitions ---
+  const resolved = await installerResolves(['APP_NAME', 'APP_DIR', 'DATA_DIR', 'CRONTAB_LOCK_FILE'])
+  const installerLock = resolved.CRONTAB_LOCK_FILE
+  assert.ok(installerLock.startsWith('/'), `the installer's lock must be absolute: ${installerLock}`)
 
-  const saved = process.env.OTI_CRONTAB_LOCK_PATH
+  // --- what SYSTEMD will hand the application, from the unit the installer writes ---
+  // StateDirectory= is a NAME relative to /var/lib; systemd exports the absolute path as
+  // $STATE_DIRECTORY. Both halves are read out of the generated unit rather than assumed.
+  const stateDirName = INSTALL_SH.match(/^StateDirectory=(\S+)$/m)
+  assert.ok(stateDirName, 'the unit written by scripts/install.sh must declare StateDirectory=')
+  const { stdout: expandedName } = await sh(
+    `set -eu\nAPP_NAME='${resolved.APP_NAME}'\nprintf '%s' "${stateDirName![1]}"`,
+  )
+  const stateDirectory = `/var/lib/${expandedName}`
+  assert.equal(stateDirectory, resolved.DATA_DIR,
+    'StateDirectory= must name the same directory the installer already creates as DATA_DIR, '
+    + 'or systemd hands the app a directory the installer never locks')
+
+  // --- and the APPLICATION, resolved by the shipped function with that exact value ---
+  const savedState = process.env.STATE_DIRECTORY
+  const savedOverride = process.env.OTI_CRONTAB_LOCK_PATH
   try {
-    delete process.env.OTI_CRONTAB_LOCK_PATH
-    assert.equal(crontabReconcileLockPath(), join(process.cwd(), CRONTAB_RECONCILE_LOCK_FILENAME))
-    process.env.OTI_CRONTAB_LOCK_PATH = '  /var/lib/oti/crontab.lock  '
-    assert.equal(crontabReconcileLockPath(), '/var/lib/oti/crontab.lock')
+    process.env.STATE_DIRECTORY = stateDirectory
+    assert.equal(crontabReconcileLockPath(), installerLock,
+      'THE assertion: the two writers must resolve one FILE, not share a basename under two roots')
+
+    // systemd's answer outranks the test-only override — that is what stops a configured path from
+    // splitting the exclusion the way OTI_CRONTAB_LOCK_PATH did before the installer could see it.
+    process.env.OTI_CRONTAB_LOCK_PATH = join(HARNESS, 'somewhere-else.lock')
+    assert.equal(crontabReconcileLockPath(), installerLock,
+      'STATE_DIRECTORY must win over the override, or the two writers can be configured apart again')
+
+    // A colon-separated list (a unit with several StateDirectory= entries) takes the first.
+    process.env.STATE_DIRECTORY = `${stateDirectory}:/var/lib/something-else`
+    assert.equal(crontabReconcileLockPath(), installerLock)
+
+    // A value that is not an absolute path is not systemd's, and is ignored rather than joined.
+    process.env.STATE_DIRECTORY = 'onetwoinventory'
+    assert.equal(crontabReconcileLockPath(), join(HARNESS, 'somewhere-else.lock'))
   } finally {
-    process.env.OTI_CRONTAB_LOCK_PATH = saved
+    if (savedState === undefined) delete process.env.STATE_DIRECTORY
+    else process.env.STATE_DIRECTORY = savedState
+    process.env.OTI_CRONTAB_LOCK_PATH = savedOverride
+  }
+
+  // The lock file is no longer in the app tree, and the installer must not put it back there.
+  assert.equal(installerLock, join(resolved.DATA_DIR, CRONTAB_RECONCILE_LOCK_FILENAME))
+  assert.ok(!installerLock.startsWith(`${resolved.APP_DIR}/`),
+    'a lock under APP_DIR cannot be opened under ProtectSystem=strict (Codex r23)')
+})
+
+// ---------------------------------------------------------------------------
+// 10 — the chosen path survives the SHIPPED hardened unit's sandboxing
+// ---------------------------------------------------------------------------
+
+test('[o3d-batch-ret] the lock path is writable under every sandboxing directive in the shipped hardened unit', async () => {
+  const { CRONTAB_RECONCILE_LOCK_FILENAME, crontabReconcileLockPath } =
+    await import('@/lib/crontab-reconcile-lock')
+
+  // The unit that the previous round was NOT checked against. Read it, do not describe it.
+  const UNIT = readFileSync(join(REPO_ROOT, 'deploy/systemd/ims-stage.service'), 'utf8')
+  const directive = (name: string) =>
+    UNIT.split('\n').filter((l) => l.startsWith(`${name}=`)).map((l) => l.slice(name.length + 1).trim())
+
+  // The constraint that broke the old path: everything is read-only except what is named.
+  assert.deepEqual(directive('ProtectSystem'), ['strict'],
+    'if this unit stops being strict the reasoning below changes — re-derive it, do not relax it')
+  const readWrite = directive('ReadWritePaths')
+  assert.ok(readWrite.length > 0)
+
+  const workingDirectory = directive('WorkingDirectory')[0]
+  assert.ok(workingDirectory, 'the unit must set WorkingDirectory')
+  assert.ok(!readWrite.includes(workingDirectory),
+    'the app directory itself is NOT read-write here — which is exactly why cwd was the wrong home '
+    + `for the lock (ReadWritePaths: ${readWrite.join(', ')})`)
+
+  // The path that IS writable: systemd creates a StateDirectory, owns it to User=, and implicitly
+  // adds it to ReadWritePaths, so it needs no entry of its own.
+  const stateNames = directive('StateDirectory')
+  assert.deepEqual(stateNames.length, 1, 'exactly one StateDirectory, or $STATE_DIRECTORY is ambiguous')
+  const stateDirectory = `/var/lib/${stateNames[0]}`
+
+  const savedState = process.env.STATE_DIRECTORY
+  try {
+    process.env.STATE_DIRECTORY = stateDirectory
+    assert.equal(crontabReconcileLockPath(), join(stateDirectory, CRONTAB_RECONCILE_LOCK_FILENAME),
+      'under this unit the lock resolves inside the StateDirectory systemd guarantees is writable')
+  } finally {
+    if (savedState === undefined) delete process.env.STATE_DIRECTORY
+    else process.env.STATE_DIRECTORY = savedState
+  }
+
+  // Every OTHER write-constraining directive this unit sets, and why /var/lib/<state> survives it.
+  // Listed as a SET so a directive added to the unit later fails here until it has been reasoned
+  // about, rather than being assumed harmless.
+  const WRITE_CONSTRAINING = new Map<string, string>([
+    ['ProtectSystem', 'strict — StateDirectory= is implicitly read-write, unlike WorkingDirectory'],
+    ['ProtectHome', 'true — makes /home,/root,/run/user inaccessible; /var/lib is none of those'],
+    ['PrivateTmp', 'true — private /tmp,/var/tmp only; /var/lib is untouched'],
+    ['ProtectKernelTunables', 'true — /proc/sys and /sys only'],
+    ['ProtectKernelModules', 'true — module (un)loading only'],
+    ['ProtectKernelLogs', 'true — kmsg/dmesg only'],
+    ['ProtectControlGroups', 'true — /sys/fs/cgroup only'],
+    ['ProtectClock', 'true — system clock only'],
+    ['ProtectHostname', 'true — hostname only'],
+    ['NoNewPrivileges', 'true — no privilege gain; the state dir is owned by User=ims, no setuid needed'],
+    ['RestrictSUIDSGID', 'true — forbids CREATING suid/sgid files; the lock file is 0664'],
+    ['RestrictRealtime', 'true — scheduling only'],
+    ['RestrictNamespaces', 'true — namespace creation only'],
+    ['RestrictAddressFamilies', 'AF_INET AF_INET6 AF_UNIX — sockets only; flock(1) opens no socket'],
+    ['LockPersonality', 'true — personality(2) only'],
+    ['StateDirectory', 'onetwoinventory — the directory itself'],
+    ['StateDirectoryMode', '0750 — owned by User=ims, so the service user can create the lock file'],
+  ])
+  const sandboxDirectives = UNIT.split('\n')
+    .map((l) => l.trim())
+    .filter((l) => !l.startsWith('#') && l.includes('='))
+    .map((l) => l.slice(0, l.indexOf('=')))
+    .filter((name) => /^(Protect|Restrict|Private|Lock|NoNewPrivileges|ReadWrite|ReadOnly|Inaccessible|State|Runtime|Cache|Logs|Configuration)/.test(name))
+  const unreasoned = [...new Set(sandboxDirectives)].filter(
+    (name) => name !== 'ReadWritePaths' && !WRITE_CONSTRAINING.has(name),
+  )
+  assert.deepEqual(unreasoned, [],
+    'a sandboxing directive was added to the shipped unit that nothing here has reasoned about '
+    + 'against the lock path — do that, then list it')
+  for (const name of WRITE_CONSTRAINING.keys()) {
+    assert.ok(directive(name).length > 0, `the unit no longer sets ${name} — re-check the reasoning`)
+  }
+
+  // Exercised, not only read: the lock file can be created and locked inside a directory with the
+  // ownership and mode systemd gives a StateDirectory (0750, owned by the service user).
+  const stateLike = join(HARNESS, 'state-like')
+  await sh(`mkdir -p '${stateLike}' && chmod 0750 '${stateLike}'`)
+  const { code } = await sh(
+    `set -eu\ntouch '${stateLike}/${CRONTAB_RECONCILE_LOCK_FILENAME}'\n`
+    + `chmod 0664 '${stateLike}/${CRONTAB_RECONCILE_LOCK_FILENAME}'\n`
+    + `exec 9>>'${stateLike}/${CRONTAB_RECONCILE_LOCK_FILENAME}'\nflock --exclusive --timeout 0 9\nexec 9>&-`,
+  )
+  assert.equal(code, 0, 'a 0750 state-directory-shaped directory must accept the lock file and the flock')
+})
+
+// ---------------------------------------------------------------------------
+// 11 — an UNWRITABLE lock path refuses; it never reconciles unserialised
+// ---------------------------------------------------------------------------
+
+test('[o3d-batch-ret] a lock path the service cannot write REFUSES the reconciliation and leaves the crontab alone', async () => {
+  // The failure mode the previous round would actually have shipped: a state directory that is not
+  // writable (no StateDirectory= in the unit, a mis-owned directory, a read-only bind mount). The
+  // only two possible behaviours are "reconcile without the lock" — the defect — and "refuse".
+  const readOnlyDir = join(HARNESS, 'unwritable-state')
+  await sh(`mkdir -p '${readOnlyDir}' && chmod 0555 '${readOnlyDir}'`)
+
+  const before = crontabText()
+  writeFileSync(JOURNAL, '')
+
+  const savedState = process.env.STATE_DIRECTORY
+  try {
+    process.env.STATE_DIRECTORY = readOnlyDir
+    const result = await saveBackup(true)
+
+    // The crontab was NOT touched: the shim journals a line the moment it is invoked at all.
+    assert.deepEqual(journal(), [],
+      'the crontab must not be read or written when the reconciliation could not be serialized')
+    assert.equal(crontabText(), before, 'and the crontab file itself is byte-for-byte unchanged')
+
+    // And the refusal SAYS WHY, naming the path and the directive that produces it.
+    const reported = JSON.stringify(result)
+    assert.match(reported, /Could not open the crontab reconciliation lock file/)
+    assert.ok(reported.includes(readOnlyDir), `the refusal must name the path it tried: ${reported}`)
+    assert.match(reported, /StateDirectory/,
+      'and must name the unit directive an operator has to fix, not just fail')
+  } finally {
+    if (savedState === undefined) delete process.env.STATE_DIRECTORY
+    else process.env.STATE_DIRECTORY = savedState
+    await sh(`chmod 0755 '${readOnlyDir}'`)
+  }
+})
+
+test('[o3d-batch-ret] a lock file that exists but cannot be opened for writing still serializes', async () => {
+  // The degradation that must NOT become "carry on unlocked": the installer creates this file as
+  // root and chowns it, and a mis-owned or read-only-mounted file must fall back to a READ-ONLY
+  // descriptor — flock(2) does not care about the access mode — rather than to no lock at all.
+  const dir = join(HARNESS, 'readonly-lockfile')
+  const lock = join(dir, '.crontab-reconcile.lock')
+  await sh(`mkdir -p '${dir}' && touch '${lock}' && chmod 0444 '${lock}' && chmod 0555 '${dir}'`)
+
+  const { withCrontabReconcileLock } = await import('@/lib/crontab-reconcile-lock')
+  const savedState = process.env.STATE_DIRECTORY
+  try {
+    process.env.STATE_DIRECTORY = dir
+    let heldDuringRun: boolean | null = null
+    const outcome = await withCrontabReconcileLock(async () => {
+      const { code } = await sh(`flock --exclusive --timeout 0 '${lock}' true`)
+      heldDuringRun = code !== 0
+      return 'ran'
+    })
+    assert.equal(outcome.locked, true, 'an unwritable-but-present lock file must still lock')
+    assert.equal(heldDuringRun, true,
+      'and the exclusion must be real: an independent taker is refused while the section runs')
+  } finally {
+    if (savedState === undefined) delete process.env.STATE_DIRECTORY
+    else process.env.STATE_DIRECTORY = savedState
+    await sh(`chmod 0755 '${dir}' && chmod 0644 '${lock}'`)
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 12 — the override cannot split the exclusion on a production install
+// ---------------------------------------------------------------------------
+
+test('[o3d-batch-ret] OTI_CRONTAB_LOCK_PATH is refused in production, so it cannot diverge from the installer', async () => {
+  const { CRONTAB_RECONCILE_LOCK_FILENAME, crontabReconcileLockPath } =
+    await import('@/lib/crontab-reconcile-lock')
+
+  const env = process.env as Record<string, string | undefined>
+  const savedNodeEnv = env.NODE_ENV
+  const savedState = env.STATE_DIRECTORY
+  const savedOverride = env.OTI_CRONTAB_LOCK_PATH
+  const warnings: string[] = []
+  const realWarn = console.warn
+  console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')) }
+
+  try {
+    delete env.STATE_DIRECTORY
+
+    // Outside production it is honoured — this whole test file depends on that.
+    env.NODE_ENV = 'test'
+    env.OTI_CRONTAB_LOCK_PATH = '  /var/lib/oti/crontab.lock  '
+    assert.equal(crontabReconcileLockPath(), '/var/lib/oti/crontab.lock')
+    assert.deepEqual(warnings, [], 'and it warns about nothing when it is being used as intended')
+
+    // In production it is IGNORED, and said so out loud. Silently honouring it is what gave the
+    // installer and the app two different locks; silently dropping it would be no better.
+    env.NODE_ENV = 'production'
+    assert.equal(crontabReconcileLockPath(), join(process.cwd(), CRONTAB_RECONCILE_LOCK_FILENAME),
+      'production must fall through to the working directory, never to the operator override')
+    assert.equal(warnings.length, 1, 'the ignored override must be reported, not dropped in silence')
+    assert.match(warnings[0], /OTI_CRONTAB_LOCK_PATH/)
+    assert.match(warnings[0], /IGNORED/)
+    assert.match(warnings[0], /StateDirectory/, 'and must point at what to set instead')
+
+    // And with systemd present, production resolves to the state directory regardless.
+    env.STATE_DIRECTORY = '/var/lib/one-two-inventory'
+    assert.equal(crontabReconcileLockPath(), `/var/lib/one-two-inventory/${CRONTAB_RECONCILE_LOCK_FILENAME}`)
+    assert.equal(warnings.length, 1, 'no warning is needed when systemd has already answered')
+  } finally {
+    console.warn = realWarn
+    if (savedNodeEnv === undefined) delete env.NODE_ENV
+    else env.NODE_ENV = savedNodeEnv
+    if (savedState === undefined) delete env.STATE_DIRECTORY
+    else env.STATE_DIRECTORY = savedState
+    env.OTI_CRONTAB_LOCK_PATH = savedOverride
   }
 })

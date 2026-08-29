@@ -64,7 +64,17 @@ LockPersonality=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 # NOTE: do NOT set MemoryDenyWriteExecute — it breaks the V8 JIT.
 
-# systemd creates/owns /var/lib/onetwoinventory (0750) for the service user.
+# systemd creates/owns /var/lib/onetwoinventory (0750) for the service user, and exports its
+# absolute path to the service as $STATE_DIRECTORY.
+#
+# LOAD-BEARING beyond the backups above: the crontab reconciliation lock
+# (lib/crontab-reconcile-lock.ts, and the matching `flock` in scripts/install.sh) lives at
+# $STATE_DIRECTORY/.crontab-reconcile.lock. It has to — ProtectSystem=strict below leaves the app
+# tree read-only apart from the three ReadWritePaths=, so a lock file next to the app cannot even be
+# created, and the app and the installer would otherwise have no writable path they both derive.
+# systemd implicitly adds a StateDirectory to ReadWritePaths=, so this needs no entry of its own.
+# Removing this directive does not fail at deploy time: it fails at the first scheduler save, which
+# then refuses and reports that the scheduler may be behind.
 StateDirectory=onetwoinventory
 StateDirectoryMode=0750
 

@@ -1228,6 +1228,15 @@ ExecStart=${APP_DIR}/node_modules/.bin/next start -p ${APP_PORT}
 Restart=always
 RestartSec=5
 
+# systemd creates/owns /var/lib/${APP_NAME} for ${APP_USER} and exports its absolute path to the
+# service as \$STATE_DIRECTORY. That export is the ONLY thing that makes the application and this
+# installer lock the same crontab file (see the crontab section below): the app reads
+# \$STATE_DIRECTORY, this script writes \${DATA_DIR}, and StateDirectory=${APP_NAME} is what makes
+# those the same directory. It is also what survives ProtectSystem=strict in the hardened unit at
+# deploy/systemd/ims-stage.service, which a lock file in \${APP_DIR} does not.
+StateDirectory=${APP_NAME}
+StateDirectoryMode=0750
+
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -1476,18 +1485,27 @@ trap 'rm -f "${CRON_BLOCK_FILE}"' EXIT
 #
 # The app's exclusion used to be a PostgreSQL session advisory lock, which this script could not
 # possibly take: it is shell, and it gets here long before there is an app session to take a lock
-# on. So the exclusion moved to where the resource is — an `flock` on a file next to the app — and
-# what follows is the same two lines the app performs, on the same path.
+# on. So the exclusion moved to where the resource is — an `flock` on a host-local file — and what
+# follows is the same two lines the app performs, on the same path.
 #
-#   ${APP_DIR}/.crontab-reconcile.lock  ==  path.join(process.cwd(), '.crontab-reconcile.lock')
+# THAT PATH IS THE SERVICE'S systemd StateDirectory, NOT ${APP_DIR} (Codex r23 HIGH). A lock file
+# beside the app cannot be opened at all under the hardened unit shipped in
+# deploy/systemd/ims-stage.service: ProtectSystem=strict remounts everything read-only except the
+# few paths that unit names, so the app's very first reconciliation would fail with EROFS on a real
+# install. A StateDirectory is created by systemd, owned by the service user, and implicitly
+# read-write under ProtectSystem=strict — and systemd hands its absolute path to the service as
+# $STATE_DIRECTORY, which is what the app reads. So:
 #
-# and the systemd unit written above sets WorkingDirectory=${APP_DIR}, which is what makes those
-# two the same file. tests/settings/crontab-reconcile-serialization.test.ts asserts all three.
+#   ${DATA_DIR}/.crontab-reconcile.lock  ==  path.join($STATE_DIRECTORY, '.crontab-reconcile.lock')
+#
+# because DATA_DIR=/var/lib/${APP_NAME} and the unit written above sets StateDirectory=${APP_NAME}.
+# Both sides derive from that one declaration; neither has a path of its own to get wrong.
+# tests/settings/crontab-reconcile-serialization.test.ts RESOLVES both and asserts they are equal.
 #
 # `touch`, never rm-and-recreate: the lock lives on the INODE, so replacing the file would hand two
 # writers two different locks and look like it worked.
 # ---------------------------------------------------------------------------
-CRONTAB_LOCK_FILE="${APP_DIR}/.crontab-reconcile.lock"
+CRONTAB_LOCK_FILE="${DATA_DIR}/.crontab-reconcile.lock"
 touch "${CRONTAB_LOCK_FILE}"
 chown "${APP_USER}:${APP_USER}" "${CRONTAB_LOCK_FILE}"
 chmod 0664 "${CRONTAB_LOCK_FILE}"
