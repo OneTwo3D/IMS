@@ -995,7 +995,12 @@ pg_endpoint_psql() {
   # negotiates. Pinning only the first would leave the divergence open on any host with a Kerberos
   # credential cache. They come AFTER the `-u` options: env unsets during option parsing and
   # assigns afterwards, so these win over anything the caller's environment carried.
-  if [[ -n "${DB_ENDPOINT_ROUTE_SSLMODE}" ]]; then
+  # `:-` AND NOT A BARE EXPANSION. The default is "libpq's own", so the absence of the variable and
+  # its emptiness must mean the same thing — and this function is lifted whole by three separate
+  # regression rigs, only one of which has any reason to know the knob exists. Under `set -u` a bare
+  # expansion turns the other two into dead shells that report an unbound variable from inside a
+  # refusal message, which is how this landed the first time.
+  if [[ -n "${DB_ENDPOINT_ROUTE_SSLMODE:-}" ]]; then
     route=("PGSSLMODE=${DB_ENDPOINT_ROUTE_SSLMODE}" "PGGSSENCMODE=disable")
   fi
   # THE ONE VARIABLE THIS CONNECTION SUPPLIES ITSELF IS KEPT OUT OF THE UNSET LIST, and then
