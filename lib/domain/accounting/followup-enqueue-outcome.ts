@@ -93,7 +93,25 @@ export type FollowUpPreEnqueueRefusalReason =
    * registry entry declares no consumer at all, the money was lost permanently. Repairing the
    * mapping afterwards could not re-drive a marker that no longer existed.
    */
-  'payment_account_unmapped'
+  | 'payment_account_unmapped'
+  /**
+   * o3d-batch-ret ROUND 8 (Codex HIGH): `_registerPayment` was requested and the persisted payload
+   * CANNOT SAY HOW MUCH — a `_paymentAmount` that is not a finite amount, an absent or non-array
+   * `lines` to derive one from, a line whose quantity or unit amount cannot be read, or a derived
+   * total that is not finite.
+   *
+   * IT IS A SECOND, DIFFERENT PRE-ENQUEUE REFUSAL AND NOT A CASE OF THE FIRST. The one above is a
+   * SETTING an operator can correct, and correcting it makes the next pass queue the payment. This
+   * one is a corrupt payload at rest: there is nothing to configure, retrying reads the same bytes,
+   * and the remedy is to have the payload rebuilt. Folding it into `payment_account_unmapped` would
+   * send an operator to a bank-account screen that has nothing to do with it.
+   *
+   * BEFORE THIS EXISTED IT WAS REPORTED AS SUCCESS, one level below where round 6 found the same
+   * class: `requestedInvoicePaymentAmount` answered `number | undefined`, and both connectors read
+   * the undefined and the derived zero the same way — FOLLOW_UPS_ENQUEUED. See
+   * {@link RequestedInvoicePayment}.
+   */
+  | 'payment_amount_unreadable'
 
 /** Every reason a follow-up can be reported as still owed — the enqueue's own, and the caller's. */
 export type FollowUpEnqueueRefusalReason = FollowUpEnqueueDeclineReason | FollowUpPreEnqueueRefusalReason
@@ -129,7 +147,7 @@ export const FOLLOW_UPS_ENQUEUED: FollowUpEnqueueOutcome = { enqueued: true }
  * with nothing in it — an unexplained refusal is the same silence this type exists to remove, and a
  * caller cannot report what it was not told.
  */
-export function refusedFollowUpEnqueue(...refusals: FollowUpEnqueueRefusal[]): FollowUpEnqueueOutcome {
+export function refusedFollowUpEnqueue(...refusals: FollowUpEnqueueRefusal[]): RefusedFollowUpEnqueue {
   if (refusals.length === 0) throw new Error('refusedFollowUpEnqueue requires at least one refusal')
   return { enqueued: false, refusals }
 }
@@ -171,49 +189,234 @@ export function paymentAccountRefusalMessage(input: {
 }
 
 /**
- * THE AMOUNT A POSTED INVOICE'S PAYLOAD IS ACTUALLY ASKING TO SETTLE (o3d-batch-ret r7, Codex
- * MEDIUM) — RESOLVED BEFORE ANY CONFIGURATION IS CONSULTED, AND ON BOTH CONNECTORS.
+ * WHAT A POSTED INVOICE'S PAYLOAD IS ASKING TO SETTLE — AND "UNKNOWN" IS NOT ONE OF THE ANSWERS
+ * "NOTHING" IS (o3d-batch-ret r8, Codex HIGH). RESOLVED BEFORE ANY CONFIGURATION IS CONSULTED, AND
+ * ON BOTH CONNECTORS.
  *
- * ROUND 6 TURNED A SILENT SUCCESS INTO A FALSE REFUSAL. `decideInvoicePaymentFollowUp` validated the
- * payment-account map FIRST and only then computed the amount, so the explicit `!(amount > 0)`
- * verdict — "nobody is owed anything, and that is a success" — sat downstream of a check the
- * no-payment case never needed. The WooCommerce importer sets
- * `_registerPayment: !!wcOrder.date_paid_gmt && documentTotalsToTheOrder` while
- * `resolveWcInvoicePaymentAmount` returns `undefined` for a PAID ZERO-TOTAL order (its guard is
- * `gross > 0`), so a £0 order marked paid asks for a payment worth nothing. With no mapping
- * configured that order was refused for a bank account it would never have used, kept its obligation
- * marker for ever, and — on QuickBooks — could carry the posted parent all the way to FAILED.
+ * ROUND 7 MOVED THE DEFECT ONE LEVEL DOWN INSTEAD OF REMOVING IT. Round 6's defect was a `let`
+ * seeded with a value that MEANS SUCCESS, inherited by every branch that failed to overwrite it.
+ * Round 7 replaced it with a resolver — and the resolver returned `number | undefined`, where
+ * `undefined` meant "this declaration cannot be read" and a derived `0` meant "nothing is owed".
+ * Both connectors then wrote `if (amount === undefined || !(amount > 0)) return FOLLOW_UPS_ENQUEUED`,
+ * so the two collapsed back into the one value that discharges money work. A `_paymentAmount` of
+ * `"abc"`, a `lines` key that is absent, a `lines` that is an object, a line with no `quantity` —
+ * every one of them settled a row whose payment was requested and never queued, on a connector
+ * (QuickBooks) where the marker is the ONLY record that the money is owed.
  *
- * THE ORDER OF QUESTIONS IS THE FIX, NOT A NEW BRANCH. A consumer may only ask about a mapping once
- * it knows a payment is genuinely owed; asking earlier makes a configuration answer stand in for a
- * money one. Both connectors had the identical ordering and both are reordered, and the resolution
- * itself is HERE rather than twice, because a rule copied into two files is a rule two files can
- * disagree about — which is how this pair acquired the same defect in the first place.
+ * FOUR DIFFERENT FACTS, AND EXACTLY ONE OF THEM MEANS NO PAYMENT IS OWED. A missing `lines`, a
+ * non-array `lines`, a malformed amount and an explicit zero are not the same state, and the
+ * fail-safe direction is not the same for them either: the explicit zero must SETTLE (round 7's
+ * fix — a paid £0 WooCommerce order asks for a payment worth nothing and must not be refused for a
+ * bank account it will never use), and the other three must REFUSE.
  *
- * IT RETURNS `undefined` RATHER THAN 0 FOR AN UNUSABLE DECLARATION, and the caller's `!(amount > 0)`
- * reads both the same way: nothing to move. Note the string arm — the shipped code declared
- * `amount` as `number | undefined` and then tested `amount == null` before converting, so a numeric
- * STRING was never converted and was handed to the enqueue as a string. Doing the conversion where
- * the value's type is actually examined is what makes that arm reachable.
+ * SO THE ANSWER IS A UNION AND THE NUMBER LIVES ON ONE ARM OF IT. `none` is reserved for a finite
+ * non-positive DECLARED amount, or for a derivation that actually succeeded over a validated
+ * `lines` array; `invalid` carries the operator-facing reason it could not be read; and `amount`
+ * is the only arm that carries a number, so there is no value a caller can read without
+ * discriminating first. The `undefined`-means-two-things read is not a mistake a caller can still
+ * make — it is a type error.
+ *
+ * A NUMERIC STRING IS READABLE, EVERYWHERE AN AMOUNT IS READ. `_paymentAmount` already accepted
+ * one, and line quantities are typed `DecimalInput` upstream (`Prisma.Decimal | string | number`),
+ * whose JSON form is a STRING. Rejecting those would turn ordinary persisted payloads into
+ * refusals, which is the opposite failure and a louder one.
  */
-export function requestedInvoicePaymentAmount(payload: Record<string, unknown>): number | undefined {
-  const declared = payload._paymentAmount
-  if (typeof declared === 'number') return Number.isFinite(declared) ? declared : undefined
-  if (typeof declared === 'string') {
-    const parsed = Number(declared)
-    return Number.isFinite(parsed) ? parsed : undefined
-  }
-  // Anything else DECLARED is unusable and must not silently fall back to a derived figure: the
-  // payload said what to settle and it cannot be read, which is not the same as it saying nothing.
-  if (declared !== null && declared !== undefined) return undefined
+export type RequestedInvoicePayment =
+  /** The payload says, readably, that no payment is owed. This is the ONLY arm that may settle. */
+  | { readonly kind: 'none' }
+  /** A finite, positive amount to register. */
+  | { readonly kind: 'amount'; readonly amount: number }
+  /** The payload asked for a payment and cannot say how much. NOT a zero, and not a mapping problem. */
+  | { readonly kind: 'invalid'; readonly detail: string }
 
-  // Nothing declared: derive the document total the same way both connectors always have. The
-  // `Array.isArray` guard replaces an unguarded cast — a payload with no lines used to throw a
-  // TypeError from inside the follow-up pass, which fails an entry whose invoice has already posted.
-  const lines = Array.isArray(payload.lines) ? payload.lines as Array<{ quantity: number; unitAmount: number }> : []
-  const shipping = typeof payload.shippingAmount === 'number' ? payload.shippingAmount : 0
-  const discount = typeof payload.discountAmount === 'number' ? payload.discountAmount : 0
-  return lines.reduce((sum, line) => sum + line.quantity * line.unitAmount, 0) + shipping - discount
+/** The refused arm alone — see {@link decideRequestedInvoicePayment} for why it is named. */
+export type RefusedFollowUpEnqueue = Extract<FollowUpEnqueueOutcome, { enqueued: false }>
+
+/**
+ * A finite amount read from a number or a numeric string; `null` when the value is not one.
+ *
+ * `''` is `null` rather than `0`: `Number('')` is 0, so an empty string would otherwise DECLARE a
+ * zero — the single value that settles — out of a field that says nothing.
+ */
+function finiteAmount(value: unknown): number | null {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    if (trimmed === '') return null
+    const parsed = Number(trimmed)
+    return Number.isFinite(parsed) ? parsed : null
+  }
+  return null
+}
+
+/** What an unreadable value IS, for the operator sentence — bounded, so a payload cannot flood a log. */
+function describeUnreadable(value: unknown): string {
+  if (value === undefined) return 'absent'
+  if (value === null) return 'null'
+  if (Array.isArray(value)) return 'an array'
+  if (typeof value === 'object') return 'an object'
+  if (typeof value === 'string') return `the string ${JSON.stringify(value.slice(0, 40))}`
+  if (typeof value === 'number') return String(value)
+  return `a ${typeof value}`
+}
+
+const NOTHING_OWED: RequestedInvoicePayment = { kind: 'none' }
+
+/** A positive amount is owed; a finite non-positive one is the readable "nothing is owed". */
+function readableAmount(amount: number): RequestedInvoicePayment {
+  return amount > 0 ? { kind: 'amount', amount } : NOTHING_OWED
+}
+
+function unreadableAmount(detail: string): RequestedInvoicePayment {
+  return { kind: 'invalid', detail }
+}
+
+/**
+ * THE RESOLUTION ITSELF, SHARED SO THE TWO CONNECTORS CANNOT DISAGREE ABOUT IT — they acquired the
+ * round-6 defect independently, in duplicated code, which is the whole argument for it living here.
+ *
+ * A DECLARED `_paymentAmount` IS FINAL. It is what the payload SAID to settle: if it cannot be read
+ * the answer is `invalid`, never a quiet fall-through to a figure derived from something else. The
+ * derivation is the fallback for a payload that declares nothing, and it is the round-7 note that
+ * matters here — the shipped code declared `amount` as `number | undefined` and tested `== null`
+ * before converting, so a numeric STRING was never converted and reached the enqueue as a string.
+ *
+ * `lines` MUST BE AN ARRAY OF READABLE LINES. Round 7 replaced an unguarded cast with
+ * `Array.isArray(payload.lines) ? ... : []`, which stopped a TypeError from failing an already-posted
+ * invoice — and put "there are no lines" and "the lines cannot be read" both at zero, i.e. at
+ * settled. The guard stays; its answer changes.
+ */
+export function requestedInvoicePayment(payload: Record<string, unknown>): RequestedInvoicePayment {
+  const declared = payload._paymentAmount
+  if (declared !== null && declared !== undefined) {
+    const amount = finiteAmount(declared)
+    return amount === null
+      ? unreadableAmount(`\`_paymentAmount\` is ${describeUnreadable(declared)}, which is not a finite amount`)
+      : readableAmount(amount)
+  }
+
+  const lines = payload.lines
+  if (!Array.isArray(lines)) {
+    return unreadableAmount(
+      `the payload declares no \`_paymentAmount\` and its \`lines\` is ${describeUnreadable(lines)} rather than an `
+      + 'array, so there is nothing to derive the amount from',
+    )
+  }
+  let derived = 0
+  for (const [index, line] of lines.entries()) {
+    if (typeof line !== 'object' || line === null || Array.isArray(line)) {
+      return unreadableAmount(`\`lines[${index}]\` is ${describeUnreadable(line)} rather than a line`)
+    }
+    const { quantity, unitAmount } = line as { quantity?: unknown; unitAmount?: unknown }
+    const readableQuantity = finiteAmount(quantity)
+    if (readableQuantity === null) {
+      return unreadableAmount(`\`lines[${index}].quantity\` is ${describeUnreadable(quantity)}, which is not a finite number`)
+    }
+    const readableUnitAmount = finiteAmount(unitAmount)
+    if (readableUnitAmount === null) {
+      return unreadableAmount(`\`lines[${index}].unitAmount\` is ${describeUnreadable(unitAmount)}, which is not a finite number`)
+    }
+    derived += readableQuantity * readableUnitAmount
+  }
+
+  // Absent is a real zero for these two — an invoice with no shipping leg carries no
+  // `shippingAmount` at all — but a PRESENT value that cannot be read is not.
+  const shipping = payload.shippingAmount === null || payload.shippingAmount === undefined
+    ? 0 : finiteAmount(payload.shippingAmount)
+  if (shipping === null) {
+    return unreadableAmount(`\`shippingAmount\` is ${describeUnreadable(payload.shippingAmount)}, which is not a finite number`)
+  }
+  const discount = payload.discountAmount === null || payload.discountAmount === undefined
+    ? 0 : finiteAmount(payload.discountAmount)
+  if (discount === null) {
+    return unreadableAmount(`\`discountAmount\` is ${describeUnreadable(payload.discountAmount)}, which is not a finite number`)
+  }
+
+  const total = derived + shipping - discount
+  // Every part is finite and the sum still need not be. A total that overflowed is not a figure to
+  // settle a customer's invoice against, and it is certainly not a zero.
+  return Number.isFinite(total)
+    ? readableAmount(total)
+    : unreadableAmount('the amount derived from the payload lines is not a finite number')
+}
+
+/**
+ * THE ONLY WAY EITHER CONNECTOR ASKS THE QUESTION — AND THE REASON IT IS A FOLD RATHER THAN A
+ * `switch` EACH OF THEM WRITES (o3d-batch-ret r8, Codex HIGH).
+ *
+ * A union alone leaves the conflation available to a caller who wants it: `if (r.kind !== 'amount')
+ * return FOLLOW_UPS_ENQUEUED` type-checks perfectly and is exactly the round-7 defect written out
+ * longhand. So the branch is taken HERE, once, and what the callers supply is what to DO with the
+ * two arms that are theirs:
+ *
+ *   • `none` never reaches a caller at all. Settling is this function's answer, not a decision two
+ *     connectors are trusted to repeat.
+ *   • `onInvalid` must return {@link RefusedFollowUpEnqueue} — the `enqueued: false` arm — so a
+ *     caller CANNOT return `FOLLOW_UPS_ENQUEUED` from it. An unreadable payload cannot reach the
+ *     settle path, and that is a compile error rather than a convention, which is the same move
+ *     that made a missing verdict a ts2366 two rounds ago.
+ *   • `onAmount` gets the number, and only ever a finite positive one, so a mapping may finally be
+ *     asked about — the round-7 ordering, preserved by construction rather than by comment.
+ *
+ * The `switch` is exhaustive against a declared return type, so a fourth arm added to
+ * `RequestedInvoicePayment` fails to build here (ts2366) instead of falling out as `undefined`.
+ */
+export async function decideRequestedInvoicePayment(
+  payload: Record<string, unknown>,
+  handle: {
+    onAmount: (amount: number) => Promise<FollowUpEnqueueOutcome>
+    onInvalid: (detail: string) => Promise<RefusedFollowUpEnqueue>
+  },
+): Promise<FollowUpEnqueueOutcome> {
+  const requested = requestedInvoicePayment(payload)
+  switch (requested.kind) {
+    case 'none':
+      return FOLLOW_UPS_ENQUEUED
+    case 'amount':
+      return await handle.onAmount(requested.amount)
+    case 'invalid':
+      return await handle.onInvalid(requested.detail)
+  }
+}
+
+/**
+ * WHAT AN OPERATOR IS TOLD WHEN THE PAYLOAD CANNOT SAY WHAT IS OWED (o3d-batch-ret r8, Codex HIGH).
+ *
+ * A payload the code cannot read is a REAL STATE an operator needs to see. It is not a mapping
+ * problem — there is no setting to correct — and it is not "nothing was owed", so neither of the
+ * two sentences this module already writes is true of it.
+ *
+ * IT PROMISES NO RECOVERY OF ITS OWN, for the reason `paymentAccountRefusalMessage` gives: what
+ * re-reads a retained marker is a declared fact about the connector, so `recovery` comes in from
+ * `followUpObligationRecoveryNote(...)`. What is said here and not there is that the re-read cannot
+ * FIX this one: the payload is at rest, so every further pass reads the same bytes and refuses
+ * again until the payload itself is rebuilt.
+ *
+ * AND IT AUTHORISES NO HAND-MADE PAYMENT. The invoice has posted; the operator can be asked to READ
+ * it and ESCALATE what they read, and nothing more — a receipt entered by hand would be a second
+ * one that no request id can deduplicate (the o3d-0bfh r11 rule).
+ */
+export function unreadablePaymentAmountRefusalMessage(input: {
+  /** Display name of the accounting package, for the operator: `Xero`, `QuickBooks`. */
+  connector: string
+  referenceType: string
+  referenceId: string
+  /** Which field could not be read, and what it holds, as a clause. */
+  detail: string
+  /** The connector's declared recovery note — what re-reads the retained marker, if anything. */
+  recovery: string
+}): string {
+  return `Refused to enqueue the ${input.connector} INVOICE_PAYMENT for ${input.referenceType} ${input.referenceId}: `
+    + `the invoice asked for a payment to be registered and the persisted payload cannot say how much — ${input.detail}. `
+    + 'NOTHING WAS QUEUED, and the row is deliberately left marked as owing follow-ups so the money is not reported as '
+    + 'settled. AN UNREADABLE AMOUNT IS NOT A ZERO: this row does not say no payment was owed, it says how much is owed '
+    + 'cannot be read from it, and settling those two the same way is how a receipt that was really taken disappears. '
+    + 'There is no setting to correct and no further attempt at this row can repair it — the payload is at rest, so every '
+    + `pass reads the same bytes and refuses again. What re-reads the marker on this connector is a fact about the `
+    + `connector rather than a promise made here: ${input.recovery}; that re-read changes nothing until the payload `
+    + `itself is rebuilt. READ the invoice in ${input.connector}, record what is actually present against it, and `
+    + 'ESCALATE that reading with this reference. A payment entered by hand in the meantime would be a SECOND one, '
+    + 'racing whatever the corrected payload queues, and no request id can deduplicate it.'
 }
 
 /**

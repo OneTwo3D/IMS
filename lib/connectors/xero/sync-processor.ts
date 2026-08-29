@@ -62,8 +62,10 @@ import {
   describeFollowUpEnqueueRefusals,
   paymentAccountRefusalMessage,
   refusedFollowUpEnqueue,
-  requestedInvoicePaymentAmount,
+  decideRequestedInvoicePayment,
+  unreadablePaymentAmountRefusalMessage,
   type FollowUpEnqueueOutcome,
+  type RefusedFollowUpEnqueue,
 } from '@/lib/domain/accounting/followup-enqueue-outcome'
 import {
   describeUnburiedOutboxJobForUnwrittenEvidence,
@@ -7139,26 +7141,6 @@ async function decideInvoicePaymentFollowUp(
   // Nobody asked for a payment, so none is owed. STATED, not inherited from an initialiser.
   if (!payload._registerPayment) return FOLLOW_UPS_ENQUEUED
 
-  /**
-   * THE AMOUNT IS RESOLVED BEFORE ANY CONFIGURATION IS CONSULTED (o3d-batch-ret r7, Codex MEDIUM).
-   *
-   * NOTHING TO MOVE IS NOT A REFUSAL, and it is stated rather than fallen into. A non-positive
-   * amount owes no payment: Xero would reject it, and there is no configuration for an operator to
-   * repair. The distinction this whole function exists for is between "no follow-up is owed" and
-   * "one is owed and was not queued" — this arm is the first, and it says so out loud.
-   *
-   * IT USED TO SIT BELOW THE MAPPING CHECKS, WHICH TURNED ROUND 6'S FIX INTO A FALSE REFUSAL. The
-   * WooCommerce importer sets `_registerPayment` from `date_paid_gmt` alone while
-   * `resolveWcInvoicePaymentAmount` returns `undefined` for a paid ZERO-TOTAL order, so such an
-   * order reached the two configuration arms and was refused for a bank account it would never have
-   * used — keeping its obligation marker indefinitely over a payment nobody was owed. A consumer
-   * may only ask about a mapping once it knows money actually moves. The resolution itself is the
-   * shared `requestedInvoicePaymentAmount`, so the sibling connector cannot drift out of this order.
-   */
-  const amount = requestedInvoicePaymentAmount(payload)
-  if (amount === undefined || !(amount > 0)) return FOLLOW_UPS_ENQUEUED
-
-  const paymentMap = await getPaymentAccountMap()
   const method = payload._paymentMethod as string || ''
   const currency = payload.currency as string || 'GBP'
 
@@ -7167,7 +7149,7 @@ async function decideInvoicePaymentFollowUp(
    * a SETTING — safe to repeat, and it cannot double anything — and what happens afterwards comes
    * from the connector's registry entry rather than from a promise written here.
    */
-  const refuse = async (missing: string, configure: string): Promise<FollowUpEnqueueOutcome> => {
+  const refuse = async (missing: string, configure: string): Promise<RefusedFollowUpEnqueue> => {
     const message = paymentAccountRefusalMessage({
       connector: 'Xero',
       referenceType,
@@ -7206,29 +7188,91 @@ async function decideInvoicePaymentFollowUp(
     })
   }
 
-  if (!paymentMap || Object.keys(paymentMap).length === 0) {
-    return await refuse(
-      'no payment account map is configured',
-      'Set up a bank account for each payment method under Settings → Accounting → Payment Account Mapping.',
-    )
-  }
-  const stored = lookupPaymentAccount(paymentMap, method, currency)
-  if (!stored) {
-    return await refuse(
-      `no bank account is mapped for method "${method}" / currency "${currency}"`,
-      'Add that mapping under Settings → Accounting → Payment Account Mapping.',
-    )
+  /**
+   * o3d-batch-ret r8 (Codex HIGH) — THE OTHER PRE-ENQUEUE REFUSAL, AND IT IS NOT THE ONE ABOVE.
+   *
+   * The payload asked for a payment and cannot say how much. There is no mapping to correct, so the
+   * two arms above would send an operator to a bank-account screen over a corrupt payload. The
+   * recovery clause stays the registry's driver-agnostic note for the reason the arms above give —
+   * this function is reached from the processor's post path AND from `repairXeroBackReferences` —
+   * and the producer says the part that is true of this refusal on both drivers: a re-read cannot
+   * make the amount readable, so every pass refuses again until the payload itself is rebuilt.
+   */
+  const refuseUnreadable = async (detail: string): Promise<RefusedFollowUpEnqueue> => {
+    const message = unreadablePaymentAmountRefusalMessage({
+      connector: 'Xero',
+      referenceType,
+      referenceId,
+      detail,
+      recovery: followUpObligationRecoveryNote(followUpObligationRecoveryFor(XERO_CONNECTOR)),
+    })
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'xero_payment_skipped',
+      tag: 'sync',
+      level: 'ERROR',
+      description: message,
+      metadata: {
+        type: 'INVOICE_PAYMENT',
+        referenceType,
+        referenceId,
+        reason: 'payment_amount_unreadable',
+        method,
+        currency,
+        sourceEntryId: entryId,
+      },
+    })
+    return refusedFollowUpEnqueue({
+      type: 'INVOICE_PAYMENT', referenceType, referenceId, reason: 'payment_amount_unreadable', message,
+    })
   }
 
-  return await enqueueFollowUpSyncLog('INVOICE_PAYMENT', referenceType, referenceId, {
-    accountingInvoiceId: postedInvoiceId,
-    bankAccountId: stored,
-    amount,
-    paymentDate: (payload._paymentDate as string)?.slice(0, 10) || new Date().toISOString().slice(0, 10),
-    currency,
-    method,
-    sourceEntryId: entryId,
-  }, { from: 'postedRow', record: origin })
+  /**
+   * THE AMOUNT IS RESOLVED BEFORE ANY CONFIGURATION IS CONSULTED (o3d-batch-ret r7, Codex MEDIUM),
+   * AND "UNKNOWN" NO LONGER ANSWERS "NOTHING" (r8, Codex HIGH).
+   *
+   * NOTHING TO MOVE IS NOT A REFUSAL. A readable non-positive amount owes no payment: Xero would
+   * reject it, and there is no configuration for an operator to repair. The WooCommerce importer
+   * sets `_registerPayment` from `date_paid_gmt` alone while `resolveWcInvoicePaymentAmount`
+   * returns `undefined` for a paid ZERO-TOTAL order, so such an order used to reach the two
+   * configuration arms and be refused for a bank account it would never have used. A consumer may
+   * only ask about a mapping once it knows money actually moves.
+   *
+   * AN UNREADABLE AMOUNT IS A REFUSAL, and the SHAPE is what holds both connectors to that rather
+   * than a rule each is trusted to remember: `decideRequestedInvoicePayment` settles the `none` arm
+   * itself, and the `onInvalid` handler is typed to return a REFUSED outcome, so no expression here
+   * can settle a payload whose amount could not be read. The resolution itself is shared, so the
+   * sibling connector cannot drift out of this ordering or out of this distinction.
+   */
+  return await decideRequestedInvoicePayment(payload, {
+    onInvalid: refuseUnreadable,
+    onAmount: async (amount) => {
+      const paymentMap = await getPaymentAccountMap()
+      if (!paymentMap || Object.keys(paymentMap).length === 0) {
+        return await refuse(
+          'no payment account map is configured',
+          'Set up a bank account for each payment method under Settings → Accounting → Payment Account Mapping.',
+        )
+      }
+      const stored = lookupPaymentAccount(paymentMap, method, currency)
+      if (!stored) {
+        return await refuse(
+          `no bank account is mapped for method "${method}" / currency "${currency}"`,
+          'Add that mapping under Settings → Accounting → Payment Account Mapping.',
+        )
+      }
+
+      return await enqueueFollowUpSyncLog('INVOICE_PAYMENT', referenceType, referenceId, {
+        accountingInvoiceId: postedInvoiceId,
+        bankAccountId: stored,
+        amount,
+        paymentDate: (payload._paymentDate as string)?.slice(0, 10) || new Date().toISOString().slice(0, 10),
+        currency,
+        method,
+        sourceEntryId: entryId,
+      }, { from: 'postedRow', record: origin })
+    },
+  })
 }
 
 async function enqueueSalesInvoiceFollowUps(

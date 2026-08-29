@@ -44,8 +44,10 @@ import {
   paymentAccountRefusalMessage,
   postedRowFollowUpRetryNote,
   refusedFollowUpEnqueue,
-  requestedInvoicePaymentAmount,
+  decideRequestedInvoicePayment,
+  unreadablePaymentAmountRefusalMessage,
   type FollowUpEnqueueOutcome,
+  type RefusedFollowUpEnqueue,
 } from '@/lib/domain/accounting/followup-enqueue-outcome'
 import { isUniqueConstraintViolation } from '@/lib/db/prisma-unique-violation'
 import {
@@ -2126,24 +2128,6 @@ async function decideInvoicePaymentFollowUp(
   // Nobody asked for a payment, so none is owed. STATED, not inherited from an initialiser.
   if (!payload._registerPayment) return FOLLOW_UPS_ENQUEUED
 
-  /**
-   * THE AMOUNT IS RESOLVED BEFORE ANY CONFIGURATION IS CONSULTED (o3d-batch-ret r7, Codex MEDIUM) —
-   * THE TWIN OF THE XERO REORDERING, AND THE CONSEQUENCE IS WORSE HERE.
-   *
-   * NOTHING TO MOVE IS NOT A REFUSAL. A non-positive amount owes no payment: QuickBooks would reject
-   * it, and there is no configuration for an operator to correct. The distinction this function
-   * exists for is between "no follow-up is owed" and "one is owed and was not queued".
-   *
-   * BELOW THE MAPPING CHECKS, THAT VERDICT WAS UNREACHABLE FOR THE ROWS THAT NEEDED IT. A paid
-   * ZERO-TOTAL WooCommerce order carries `_registerPayment` with no `_paymentAmount`
-   * (`resolveWcInvoicePaymentAmount` guards on `gross > 0`), so it was refused for a bank account it
-   * would never have used — and on this connector a refusal FAILS the entry, so the posted parent
-   * retried five times over a payment nobody was owed and came to rest FAILED with its marker held.
-   */
-  const amount = requestedInvoicePaymentAmount(payload)
-  if (amount === undefined || !(amount > 0)) return FOLLOW_UPS_ENQUEUED
-
-  const paymentMap = await getPaymentAccountMap()
   const method = payload._paymentMethod as string || ''
   const currency = payload.currency as string || 'GBP'
 
@@ -2152,7 +2136,7 @@ async function decideInvoicePaymentFollowUp(
    * a SETTING — safe to repeat, and it cannot double anything — and what follows the correction is
    * read off this connector's registry entry, which says nothing re-drives the row.
    */
-  const refuse = async (missing: string, configure: string): Promise<FollowUpEnqueueOutcome> => {
+  const refuse = async (missing: string, configure: string): Promise<RefusedFollowUpEnqueue> => {
     const message = paymentAccountRefusalMessage({
       connector: 'QuickBooks',
       referenceType,
@@ -2203,40 +2187,99 @@ async function decideInvoicePaymentFollowUp(
     })
   }
 
-  if (!paymentMap || Object.keys(paymentMap).length === 0) {
-    return await refuse(
-      'no payment account map is configured',
-      'Set up a bank account for each payment method under Settings → Accounting → Payment Account Mapping.',
-    )
-  }
-  const stored = lookupPaymentAccount(paymentMap, method, currency)
-  if (!stored) {
-    return await refuse(
-      `no bank account is mapped for method "${method}" / currency "${currency}"`,
-      'Add that mapping under Settings → Accounting → Payment Account Mapping.',
-    )
-  }
-
-  // Resolve QBO customer ID for the payment request
-  let customerRef: string | undefined
-  if (referenceType === 'SalesOrder') {
-    const order = await db.salesOrder.findUnique({
-      where: { id: referenceId },
-      select: { customer: { select: { accountingContactId: true, accountingContactProvenance: true } } },
+  /**
+   * o3d-batch-ret r8 (Codex HIGH) — THE OTHER PRE-ENQUEUE REFUSAL, AND IT IS NOT THE ONE ABOVE.
+   *
+   * The payload asked for a payment and cannot say how much. There is no setting to correct, so the
+   * remedy above would send an operator to a bank-account screen for a corrupt payload — and the
+   * recovery clause is NOT `postedRowFollowUpRetryNote`, whose whole sentence is that the retry
+   * queues the payment as soon as the mapping names an account. Nothing about this row changes on a
+   * retry, so the honest clause is the registry's at-rest fact and the message says the rest itself.
+   */
+  const refuseUnreadable = async (detail: string): Promise<RefusedFollowUpEnqueue> => {
+    const message = unreadablePaymentAmountRefusalMessage({
+      connector: 'QuickBooks',
+      referenceType,
+      referenceId,
+      detail,
+      recovery: followUpObligationRecoveryNote(QBO_FOLLOW_UP_RECOVERY),
     })
-    // Provenance-guarded (o3d-6nd): only enqueue an id that belongs to the active company, so a
-    // follow-up queued now cannot carry a former realm's id.
-    customerRef = (await customerContactIdIfCurrent(order?.customer)) ?? undefined
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'quickbooks_payment_skipped',
+      tag: 'sync',
+      level: 'ERROR',
+      description: message,
+      metadata: {
+        type: 'INVOICE_PAYMENT',
+        referenceType,
+        referenceId,
+        reason: 'payment_amount_unreadable',
+        method,
+        currency,
+      },
+    })
+    return refusedFollowUpEnqueue({
+      type: 'INVOICE_PAYMENT', referenceType, referenceId, reason: 'payment_amount_unreadable', message,
+    })
   }
 
-  return await enqueueFollowUpSyncLog('INVOICE_PAYMENT', referenceType, referenceId, {
-    accountingInvoiceId: postedInvoiceId,
-    bankAccountId: stored,
-    amount,
-    paymentDate: (payload._paymentDate as string)?.slice(0, 10) || new Date().toISOString().slice(0, 10),
-    currency,
-    method,
-    customerRef,
+  /**
+   * THE AMOUNT IS RESOLVED BEFORE ANY CONFIGURATION IS CONSULTED (o3d-batch-ret r7, Codex MEDIUM) —
+   * THE TWIN OF THE XERO ORDERING — AND "UNKNOWN" NO LONGER ANSWERS "NOTHING" (r8, Codex HIGH).
+   *
+   * NOTHING TO MOVE IS NOT A REFUSAL. A readable non-positive amount owes no payment: QuickBooks
+   * would reject it, and there is no configuration for an operator to correct. A paid ZERO-TOTAL
+   * WooCommerce order carries `_registerPayment` with no `_paymentAmount`
+   * (`resolveWcInvoicePaymentAmount` guards on `gross > 0`), and below the mapping checks it was
+   * refused for a bank account it would never have used — on this connector a refusal FAILS the
+   * entry, so the posted parent retried five times over a payment nobody was owed.
+   *
+   * AN UNREADABLE ONE IS A REFUSAL, and the shape is what makes that unforgettable rather than the
+   * comment: `decideRequestedInvoicePayment` settles the `none` arm itself and hands this caller
+   * only the two arms that are its own, with `onInvalid` typed to return a REFUSED outcome. There
+   * is no expression here that can settle a payload whose amount could not be read.
+   */
+  return await decideRequestedInvoicePayment(payload, {
+    onInvalid: refuseUnreadable,
+    onAmount: async (amount) => {
+      const paymentMap = await getPaymentAccountMap()
+      if (!paymentMap || Object.keys(paymentMap).length === 0) {
+        return await refuse(
+          'no payment account map is configured',
+          'Set up a bank account for each payment method under Settings → Accounting → Payment Account Mapping.',
+        )
+      }
+      const stored = lookupPaymentAccount(paymentMap, method, currency)
+      if (!stored) {
+        return await refuse(
+          `no bank account is mapped for method "${method}" / currency "${currency}"`,
+          'Add that mapping under Settings → Accounting → Payment Account Mapping.',
+        )
+      }
+
+      // Resolve QBO customer ID for the payment request
+      let customerRef: string | undefined
+      if (referenceType === 'SalesOrder') {
+        const order = await db.salesOrder.findUnique({
+          where: { id: referenceId },
+          select: { customer: { select: { accountingContactId: true, accountingContactProvenance: true } } },
+        })
+        // Provenance-guarded (o3d-6nd): only enqueue an id that belongs to the active company, so a
+        // follow-up queued now cannot carry a former realm's id.
+        customerRef = (await customerContactIdIfCurrent(order?.customer)) ?? undefined
+      }
+
+      return await enqueueFollowUpSyncLog('INVOICE_PAYMENT', referenceType, referenceId, {
+        accountingInvoiceId: postedInvoiceId,
+        bankAccountId: stored,
+        amount,
+        paymentDate: (payload._paymentDate as string)?.slice(0, 10) || new Date().toISOString().slice(0, 10),
+        currency,
+        method,
+        customerRef,
+      })
+    },
   })
 }
 
