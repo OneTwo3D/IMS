@@ -27,7 +27,14 @@ import { DEFAULT_CONNECTOR_FETCH_TIMEOUT_MS } from '@/lib/security/connector-fet
  * a crashed holder's lease simply expires.
  */
 
-const LOCK_KEY = 'mintsoft_auth_lock'
+/**
+ * Exported so `lib/domain/settings/reserved-setting-keys.ts` — which cannot import this module
+ * without dragging `@/lib/db` into every settings render — can be CHECKED against it rather than
+ * trusted to have copied it correctly (`tests/settings/reserved-setting-keys.test.ts`).
+ */
+export const MINTSOFT_AUTH_LOCK_SETTING_KEY = 'mintsoft_auth_lock'
+
+const LOCK_KEY = MINTSOFT_AUTH_LOCK_SETTING_KEY
 
 /**
  * How long a lease survives WITHOUT renewal.

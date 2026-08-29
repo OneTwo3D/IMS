@@ -16,6 +16,7 @@ import { completePluginSelectionSave, type PluginSelectionSaveResult } from '@/l
 import { runPostCommit } from '@/lib/domain/post-commit'
 import { uniqueViolationTargetsField } from '@/lib/db/prisma-unique-violation'
 import type { SettingSaveResult } from '@/lib/domain/settings/setting-save-outcome'
+import { assertWritableSettingKeys } from '@/lib/domain/settings/reserved-setting-keys'
 import { reconcileCrontab } from '@/lib/crontab-reconcile'
 import { normalizePublicAppUrl } from '@/lib/domain/settings/public-app-url-input'
 import { toIsoCountryCode } from '@/lib/countries'
@@ -904,6 +905,13 @@ export async function getUsers(): Promise<UserOption[]> {
  * action has an outer `catch` that renders a rejection as a failed save. See `setSettings`.
  */
 export async function setSetting(key: string, value: string): Promise<SettingSaveResult> {
+  // The reserved-key refusal is asserted HERE TOO, not left to the delegation (Codex r19 HIGH).
+  // `setSettings` runs the same check and this call would reach it — today. Both are exported
+  // server actions, i.e. two separately addressable endpoints, and an endpoint whose authorization
+  // depends on where it happens to forward to is one refactor away from having none. The cost is
+  // one duplicated line; `tests/settings/reserved-setting-keys.test.ts` proves each route refuses
+  // on its own.
+  assertWritableSettingKeys([key])
   return setSettings({ [key]: value })
 }
 
@@ -947,20 +955,24 @@ export async function setSettings(values: Record<string, string>): Promise<Setti
   const entries = Object.entries(values)
   if (entries.length === 0) return { status: 'saved' }
 
-  // o3d-osl8 round 5, finding 2. The integration plugin flags decide WHICH connector is active,
-  // and other writers make destructive decisions from that answer (cancelOrphanedAccountingSyncRows
-  // discards a non-active connector's queue). Changing them one generic key at a time is neither
-  // atomic — the plugins UI fired five of these in parallel, so "Xero off, QuickBooks on" passed
-  // through both-off and both-on states — nor serialized against those readers. Routed through
-  // saveIntegrationPluginState instead, which does both. Refused rather than silently allowed so
-  // the guarantee cannot be bypassed by a new call site. THROWN, not returned: this is a
-  // programming error at a call site, not an outcome an operator can act on, and it happens before
-  // the transaction so nothing is committed.
-  for (const [key] of entries) {
-    if ((Object.values(INTEGRATION_PLUGIN_SETTING_KEYS) as string[]).includes(key)) {
-      throw new Error(`Use saveIntegrationPluginState to change ${key} — it must be written atomically and under the connector-selection lock.`)
-    }
-  }
+  // RESERVED KEYS ARE REFUSED BEFORE ANYTHING IS COMMITTED (Codex r19 HIGH).
+  //
+  // This was, until r19, a hand-written loop over the integration plugin flags alone — round 5's
+  // finding, fixed at the family that was being looked at that round. The flags are refused for a
+  // reason that generalises exactly: they are SYSTEM-MANAGED, other writers make destructive
+  // decisions from their value, and changing one through a generic key/value writer is neither
+  // atomic nor serialized against those readers. Every system-managed key added since (the
+  // accounting binding pins, the maintenance fence, the lock leases) had the same property and none
+  // of them was listed, because the list was inline here rather than somewhere a new key could join
+  // it. `setSetting` and `setSettings` are both exported server actions taking an arbitrary key, so
+  // a principal with 'settings.company' could name any of them.
+  //
+  // The set, and the reason each family is in it, now live in
+  // lib/domain/settings/reserved-setting-keys.ts. THROWN, not returned, for the reason the plugin
+  // check was: no screen offers these keys, so reaching here is a call-site bug or a hand-invoked
+  // action, not an outcome an operator can act on — and it happens before the transaction, so
+  // nothing is committed.
+  assertWritableSettingKeys(entries.map(([key]) => key))
 
   await db.$transaction(async (tx) => {
     for (const [key, value] of entries) {
