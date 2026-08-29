@@ -2089,10 +2089,15 @@ function hostUnitProperty(unit: string, property: string): string | null {
 
 test('r45: the ExecStart and UnsetEnvironment renderings the parsers are given are the ones systemd prints', () => {
   // MUTATION ROUTE: change the signature `unit_execstart_is_exactly()` asks bus_array_count() for
-  // (say to `as`, the signature of the environment lists) and the first assertion fails, because
-  // systemd's own rendering does not begin with it. That is the r21 finding held in place: the
-  // element count is read from the data structure, and a rendering of another shape is not an
-  // answer.
+  // -- say to `as`, the signature of the environment lists -- and this fails, because the
+  // signature is READ OUT OF THE SHIPPED SOURCE and checked against what systemd really prints.
+  // That is the r21 finding held in place: the element count is read from the data structure, and
+  // a rendering of another shape is not an answer.
+  const source = readFileSync(join(REPO, 'scripts/install.sh'), 'utf8')
+  const execStartSignature = /bus_array_count "\$rendering" '([^']+)'\)" \|\| ! bus_read_strings "\$rendering"; then/.exec(source)
+  assert.ok(execStartSignature, 'precondition: unit_execstart_is_exactly() must name the signature it asks bus_array_count() for')
+  const unsetSignature = /unit_route_env_guaranteed\(\)[\s\S]*?bus_array_count "\$rendering" '([^']+)'/.exec(source)
+  assert.ok(unsetSignature, 'precondition: unit_route_env_guaranteed() must name the signature it asks for')
   //
   // IT IS SKIPPED, NOT FAILED, WHERE THERE IS NO SYSTEM BUS — CI containers without systemd are a
   // real place this suite runs, and a precondition that cannot be taken is not a defect. The
@@ -2105,10 +2110,10 @@ test('r45: the ExecStart and UnsetEnvironment renderings the parsers are given a
     const unsetEnvironment = hostUnitProperty(unit, 'UnsetEnvironment')
     if (execStart === null || unsetEnvironment === null) continue
     probed += 1
-    assert.match(execStart, /^a\(sasbttttuii\) \d+ /,
-      `${unit}: systemd renders ExecStart with the signature the shipped reader asks bus_array_count() for`)
-    assert.match(unsetEnvironment, /^as \d+/,
-      `${unit}: and UnsetEnvironment as a plain string array, which is what unit_route_env_guaranteed() parses`)
+    assert.ok(execStart.startsWith(`${execStartSignature[1]} `),
+      `${unit}: systemd renders ExecStart as ${execStart.slice(0, 24)}…, and the shipped reader asks bus_array_count() for ${execStartSignature[1]}`)
+    assert.ok(unsetEnvironment.startsWith(`${unsetSignature[1]} `),
+      `${unit}: systemd renders UnsetEnvironment as ${unsetEnvironment.slice(0, 12)}…, and the shipped reader asks for ${unsetSignature[1]}`)
   }
   if (probed === 0) {
     console.log('# skipped: no systemd bus on this host, so the renderings could not be taken from it')
@@ -2119,8 +2124,12 @@ test('r45: the ExecStart and UnsetEnvironment renderings the parsers are given a
   // AND THE STUB SHAPE MATCHES ONE OF THEM, field for field. `ims-stage-dev.service` on this host
   // renders `a(sasbttttuii) 1 "/usr/bin/npm" 8 "/usr/bin/npm" "run" "dev" ... false 0 0 0 0 0 0 0`;
   // HOST_EXECSTART is that shape with this installer's own command in it.
-  assert.match(HOST_EXECSTART, /^a\(sasbttttuii\) 1 "\S+" \d+ (?:"[^"]*" )+false(?: 0){7}$/,
-    'the stubbed ExecStart rendering is the shape systemd prints, not an approximation of it')
+  assert.ok(HOST_EXECSTART.startsWith(`${execStartSignature[1]} 1 `),
+    'the stubbed ExecStart rendering carries the signature the shipped reader asks for')
+  assert.match(HOST_EXECSTART, /^\S+ 1 "\S+" \d+ (?:"[^"]*" )+false(?: 0){7}$/,
+    'and the field order systemd prints, not an approximation of it')
+  assert.ok(HOST_UNSET.startsWith(`${unsetSignature[1]} `),
+    'and the stubbed UnsetEnvironment rendering carries the signature unit_route_env_guaranteed() asks for')
 })
 
 // ---------------------------------------------------------------------------
@@ -2635,6 +2644,76 @@ test('r45: a TLS-only external database is installable, and the gate validates t
       withoutCa = String((error as { stdout?: string }).stdout ?? '')
     }
     assert.match(withoutCa, /--sslrootcert= is required/, 'and it refuses to verify against a trust store nobody named')
+
+    // READER_VERIFIES: handed a CA the cluster's certificate does NOT chain to, the reader must
+    // fail the handshake. Without this the two assertions above pass just as well for a reader
+    // that sets `rejectUnauthorized: false` and reports `verify-full` anyway -- which is a probe
+    // claiming a route it did not take, and the r43 defect wearing a new label.
+    const strangerCa = join(root, 'stranger-ca.pem')
+    execFileSync('openssl', [
+      'req', '-new', '-x509', '-days', '2', '-nodes', '-subj', '/CN=stranger',
+      '-addext', 'subjectAltName=IP:127.0.0.1,DNS:localhost',
+      '-keyout', join(root, 'stranger.key'), '-out', strangerCa,
+    ], { stdio: 'pipe' })
+    let wrongCa = ''
+    try {
+      execFileSync('node', [
+        join(REPO, 'scripts/lib/pg-auth-request.mjs'),
+        '--host=127.0.0.1', `--port=${cluster.port}`, '--user=imsuser', '--database=postgres',
+        '--sslmode=verify-full', `--sslrootcert=${strangerCa}`,
+      ], { encoding: 'utf8', env: cleanLibpqEnv(), stdio: ['ignore', 'pipe', 'pipe'] })
+    } catch (error) {
+      wrongCa = String((error as { stdout?: string }).stdout ?? '')
+    }
+    assert.match(wrongCa, /^method=unknown$/m,
+      `READER_VERIFIES: a CA the server's certificate does not chain to must stop the handshake:\n${wrongCa}`)
+    assert.match(wrongCa, /SELF_SIGNED_CERT_IN_CHAIN|unable to verify|self-signed certificate/i,
+      'and the reason must be the certificate, not something else')
+
+    // AND SO MUST THE APPLICATION'S OWN DRIVER, on the same wrong CA — which is what makes
+    // "the reader and the driver are the same TLS client" a measured claim.
+    assert.match(await driverRoute(`${plain}?sslmode=verify-full&uselibpqcompat=true&sslrootcert=${strangerCa}`), /^refused:/,
+      'the installed driver refuses the same certificate against the same wrong CA')
+
+    // VERIFY_CA, the third supported mode, and the one whose whole content is "the chain but not
+    // the hostname". Both halves are measured: the wrong CA stops it (so the CA is checked) and
+    // the right one lets it through even though the certificate's CN is `localhost` while the
+    // connection is to 127.0.0.1 (so the hostname is not).
+    //
+    // MUTATION ROUTE: give verify-ca the `{ rejectUnauthorized: false }` options `require` gets,
+    // in tlsOptionsFor() and in db_url_route_query()'s consumers alike -- CA_WRONG_UNDER_VERIFY_CA
+    // then succeeds and this fails.
+    let caWrong = ''
+    try {
+      execFileSync('node', [
+        join(REPO, 'scripts/lib/pg-auth-request.mjs'),
+        '--host=127.0.0.1', `--port=${cluster.port}`, '--user=imsuser', '--database=postgres',
+        '--sslmode=verify-ca', `--sslrootcert=${strangerCa}`,
+      ], { encoding: 'utf8', env: cleanLibpqEnv(), stdio: ['ignore', 'pipe', 'pipe'] })
+    } catch (error) {
+      caWrong = String((error as { stdout?: string }).stdout ?? '')
+    }
+    assert.match(caWrong, /^method=unknown$/m,
+      `CA_WRONG_UNDER_VERIFY_CA: verify-ca must still verify the chain:\n${caWrong}`)
+    const caRight = readerOn(cluster.port, 'verify-ca').length > 0 ? execFileSync('node', [
+      join(REPO, 'scripts/lib/pg-auth-request.mjs'),
+      '--host=127.0.0.1', `--port=${cluster.port}`, '--user=imsuser', '--database=postgres',
+      '--sslmode=verify-ca', `--sslrootcert=${ca}`,
+    ], { encoding: 'utf8', env: cleanLibpqEnv(), stdio: ['ignore', 'pipe', 'pipe'] }) : ''
+    assert.match(caRight, /^sslmode=verify-ca$/m, 'and it reports the mode it took')
+    assert.match(caRight, /^method=scram-sha-256$/m,
+      'and reaches the record even though the certificate names `localhost` and the connection is to 127.0.0.1 — which is what verify-ca means')
+    const verifyCaRun = runShipped({ ...installVars(cluster, root), DB_SSLMODE: 'verify-ca', DB_SSLROOTCERT: ca }, `
+      DB_PROBE_REPORT=""
+      echo "ROUTE=$(db_application_route_sslmode)"
+      if db_endpoint_checks_role_verifier postgres; then echo "GATE=admitted"; else echo "GATE=refused"; fi
+      echo "PIN=\${DB_PROBE_SSLMODE}"
+      echo "REPORT_B64=$(printf '%s' "\${DB_PROBE_REPORT}" | base64 -w0)"
+    `)
+    assert.match(verifyCaRun.output, /^ROUTE=verify-ca$/m, 'the derivation answers verify-ca')
+    assert.match(verifyCaRun.output, /^GATE=admitted$/m,
+      `and the gate reads the method on it:\n${Buffer.from(readVar(verifyCaRun.output, 'REPORT_B64'), 'base64').toString('utf8')}`)
+    assert.match(verifyCaRun.output, /^PIN=verify-ca$/m, 'and pins psql to it')
 
     // THE REFUSAL THAT REMAINS, AND ITS WAY OUT. An unsupported spelling is still refused — and the
     // message names the four that are supported rather than telling the operator to remove their
