@@ -356,22 +356,21 @@ candidate.
 node-postgres does with the URL it is about to write, **tells** the reader to take exactly that
 route, checks that the reader reports having taken it, and pins every credential-bearing psql to
 it — with `gssencmode=disable` beside it so GSSAPI encryption cannot select a `hostgssenc` record
-either. Today that route is always `sslmode=disable`; if the emitted URL ever stops being of the
-shape the driver was measured against, the gate refuses rather than assuming. `prefer` appears in
-no connection the installer opens. A method read on **any other route**, including a perfectly
-pinnable `require`, is refused exactly as an unestablished method is.
+either. That route is whatever `DB_SSLMODE` states — `disable` unless the deployment says
+otherwise, and `disable` for every installation that existed before it — and if the emitted URL
+ever stops being of the shape the driver was measured against, the gate refuses rather than
+assuming. `prefer` appears in no connection the installer opens. A method read on **any other
+route** is refused exactly as an unestablished method is.
 
 Two things follow, and they are the point rather than a side effect:
 
-* **a cluster whose only password-checking rule is a `hostssl` one is refused**, because the
-  application cannot reach it either. Better a refusal before the `ALTER` than a rotation whose
-  result the application can never present.
+* **a cluster whose only password-checking rule is a `hostssl` one is refused while
+  `DB_SSLMODE=disable`**, because the application cannot reach it either. Better a refusal before
+  the `ALTER` than a rotation whose result the application can never present. Set `DB_SSLMODE` to
+  the transport that cluster requires and the same rule is read, probed and rotated against — on
+  the record the application will be matched by.
 * **a cluster whose `hostssl` rule is useless but whose `hostnossl` rule is sound is accepted**,
-  which the previous round refused. `DATABASE_URL` was not given explicit SSL parameters to make
-  this work: on the installed `pg-connection-string`, `sslmode=require` is an alias for
-  *verify-full*, there is no spelling of libpq's `prefer` at all, the meaning is scheduled to
-  change in the driver's next major version, and adding one would change what every existing
-  installation's application connection does at its next upgrade.
+  which an earlier round refused.
 
 ### The URL is only half of what decides that route
 
@@ -395,27 +394,92 @@ change which `pg_hba.conf` record answers:
 | `PGREPLICATION` | turns the backend into a WAL sender, which `pg_hba.conf` matches on the `replication` keyword rather than on the database name |
 | `NODE_PG_FORCE_NATIVE` | replaces node-postgres with libpq, which fills `sslmode`, `gssencmode`, `service` and `host` from the environment all over again |
 
-**Any of those three, from any source that can reach the application, is a refusal** — before the
-reconciliation and again before the service is started. Deriving a route from them instead was
-rejected for the reason the previous section gives: node-postgres's TLS semantics are not libpq's,
-so there is no `sslmode=` a probe could be pinned to that reproduces `require`'s
-verify-full-against-the-system-store, and a value missed in such a mapping is this defect again.
+**An ambient value of any of those three is still a refusal, and it is refused in the installer's
+own process.** The migration, the build and `scripts/fence-db-connections.mjs` are Node processes
+the installer starts; they run the application's own driver and inherit that environment verbatim,
+and no systemd directive reaches them. If one is set, unset it and re-run — and if the deployment
+needs an encrypted transport, **state it as `DB_SSLMODE=` instead**, which is the next section.
 
-Three places are read, all read-only:
+### What the service is handed is a property, not a survey
 
-* **this installer's own environment**, because the migration, the build and the connection fence
-  are Node processes started from it and inherit it verbatim;
-* **the service manager's environment block** (`systemctl show-environment`), which systemd passes
-  to every service it starts and which appears in no unit property at all;
-* **the unit**, through the same scan that answers "is this `.env` the only thing defining
-  `DATABASE_URL`" — its `Environment=`, `PassEnvironment=`, `UnsetEnvironment=`, `PAMName=` and
-  every `EnvironmentFile=` it loads. For this question there is no permitted source, so unlike the
-  `DATABASE_URL` scan the environment files are opened and checked for the name.
+Everything the *service* could be given is closed rather than looked at. The installer writes a
+permanent drop-in — `/etc/systemd/system/<unit>.service.d/zz-deploy-db-route.conf` —
 
-If a refusal names one of these, remove the setting rather than working around it: with
-`PGSSLMODE` in play the installer cannot say which record the application will be matched by, and
-a credential rotated against the wrong record is an outage that only shows up after the restart.
+```ini
+[Service]
+UnsetEnvironment=PGSSLMODE PGREPLICATION NODE_PG_FORCE_NATIVE
+```
 
+and `systemd.exec(5)` is explicit about when that is applied: *"as the final step all variables
+listed in `UnsetEnvironment=` are removed from the compiled environment variable list, immediately
+before it is passed to the executed process"* — after `DefaultEnvironment=`, `systemctl
+set-environment`, the manager's own block, `Environment=`, `EnvironmentFile=` and PAM alike.
+
+That replaces a reader which used to open the unit's environment files and grep them, and which was
+wrong in two ways at once. `EnvironmentFile=` may be a **wildcard**, and a glob is not a file, so a
+matching file that set `PGSSLMODE` was read as absent. And even a literal path was read by the
+installer *here* while systemd opens it *there*, at exec, past a git clone, an `npm ci`, a Next
+build and a migration — so a line added in that window moved the route after the gate had passed.
+A directive removes the variable whatever set it and whenever it was set. The names are written
+**bare**: `UnsetEnvironment=PGSSLMODE=require` would remove only that exact assignment.
+
+The drop-in is not trusted because it was written. Immediately before `systemctl start` — after the
+last `daemon-reload`, which is the point at which "composed" means anything — the installer reads
+the loaded unit back off systemd's bus and refuses unless all three names are there. An empty
+`UnsetEnvironment=` in a later drop-in *resets* the list, which is why this one sorts last and why
+it is verified rather than assumed. It is left in place after the run, so the starts `deploy.sh`
+and `update.sh` perform later are covered by the same directive.
+
+**`ExecStart=` is the one layer the directive cannot reach**, and it gets its own check. A drop-in
+saying
+
+```ini
+ExecStart=/usr/bin/env PGSSLMODE=no-verify /opt/ims/node_modules/.bin/next start -p 3000
+```
+
+sets the variable *inside* the launched program, one exec after systemd has finished composing the
+environment. It appears in no `Environment=`, no `PassEnvironment=`, no `UnsetEnvironment=` and no
+`EnvironmentFile=`, and it survives a rewrite of the base unit. So the composed `ExecStart` is read
+off the bus too and compared, string for string, with the command the installer's own unit
+here-doc emits — one command, that binary, that argv. A wrapper, an override, a second command or
+a path systemd had to escape is a refusal that prints both what systemd would run and what was
+expected.
+
+### TLS: `DB_SSLMODE`, and why it is a supported input rather than a derivation
+
+An external PostgreSQL that accepts **only** encrypted connections — which is every managed one — is
+a supported deployment, and the way to say so is `DB_SSLMODE`. The installer prompts for it on the
+external-database path (`INSTALL_POSTGRES=n`); the local path sets `disable` explicitly, because
+that cluster is one this script installs on this host and reaches over `localhost`.
+
+| `DB_SSLMODE` | what the application does | needs |
+| --- | --- | --- |
+| `disable` (default) | no `SSLRequest` at all; matched by `hostnossl`/`host` records only | — |
+| `require` | encrypted; the certificate is **not** verified | — |
+| `verify-ca` | encrypted; the certificate chain is verified, the hostname is not | `DB_SSLROOTCERT` |
+| `verify-full` | encrypted; chain **and** hostname verified | `DB_SSLROOTCERT` |
+
+`prefer` is deliberately absent: it picks its transport at run time, so an authentication *failure*
+can fall onto a second `pg_hba.conf` record, which is precisely what pinning exists to prevent.
+
+The mode goes into the emitted `DATABASE_URL` as
+`?sslmode=<mode>&uselibpqcompat=true` (plus `&sslrootcert=<path>` where one is needed). **That
+second parameter is the whole answer to the objection the previous section raises.** node-postgres's
+`sslmode=` is not libpq's — without it, `require` means *verify-full against Node's own CA bundle*,
+which no `psql` pin reproduces and which a Debian cluster's self-signed certificate fails. With it,
+pg-connection-string switches to its libpq-compatible branch and the four words above mean exactly
+what libpq and `psql` mean by them. Nothing is re-implemented here; the driver's own compatibility
+switch is *selected*, and the gate and the application are then describing one transport with one
+word.
+
+Everything then runs on it. The authentication-request reader is told the mode (and the CA) and
+reports the mode it took; the credential probes are `psql` under `PGSSLMODE=` and `PGSSLROOTCERT=`
+with `PGGSSENCMODE=disable` beside them. `DB_SSLROOTCERT` must be an absolute path made only of
+`A-Za-z0-9._-/`: it is placed verbatim into a URL query, an environment variable and a command-line
+argument, and escaping it correctly for all three would be three more sets of somebody else's rules.
+
+On an upgrade the mode and the CA are recovered from the `DATABASE_URL` the previous run wrote, so
+pressing Enter through the prompts keeps a TLS-only installation on TLS.
 
 The postmaster-identity read performed just after `CREATE DATABASE` is the one credential-bearing
 connection deliberately **left unpinned**. What it concludes — that the server answering
@@ -564,6 +628,12 @@ After installation, sign in and set the organisation base currency in **Settings
 - **Install PostgreSQL** — install on this server, or connect to an external database
 - **Database name** (default: `one_two_inventory`)
 - **Database user** (default: `imsuser`)
+- **Database TLS mode** (`DB_SSLMODE`, default: `disable`) — asked only for an **external** database.
+  `disable`, `require`, `verify-ca` or `verify-full`; the last two also ask for
+  **`DB_SSLROOTCERT`**, the CA the server's certificate is verified against. It is recovered from
+  the previous run's `DATABASE_URL` on an upgrade, so an existing TLS-only installation stays on
+  TLS when the prompts are accepted. See *TLS: `DB_SSLMODE`* above for what each mode means and why
+  an ambient `PGSSLMODE` is refused instead.
 - **Database password** — on a first install, auto-generated if not provided. On a re-install it
   defaults to the credential already in `${APP_DIR}/.env`, so accepting the default changes nothing
   about the role. Entering a different one requests a rotation, performed only after the existing
