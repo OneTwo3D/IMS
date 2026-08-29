@@ -807,12 +807,13 @@ test('r40: a password whose decoded form ends in a newline installs, authenticat
   //   1. revert the password decode in installed_database_password() to
   //      `password="$(url_decode_userinfo "${password}")"`. The recovered value loses its newline,
   //      so it differs from the installed one and the re-run reports ROTATION_PENDING=true over a
-  //      live role — this test fails on RECOVERED_B64 and on ROTATION_PENDING. Test 7 below fails
-  //      with it; nothing else in the file notices.
+  //      live role — this test fails on RECOVERED_B64 and on ROTATION_PENDING, ALONE across both
+  //      installer credential files. Nothing else in the repo notices a missing trailing byte.
   //   2. revert the OUTER capture to
-  //      `DB_PASSWORD_INSTALLED="$(installed_database_password ... || true)"`. Identical
-  //      symptoms — which is the point of measuring it separately: fixing only one of the two
-  //      leaves the defect exactly where it was.
+  //      `DB_PASSWORD_INSTALLED="$(installed_database_password ... || true)"`. Identical symptoms,
+  //      also alone — which is the point of measuring it separately: fixing only one of the two
+  //      leaves the defect exactly where it was, and one test failing for two different reasons is
+  //      the only thing that says so.
   //   3. drop the sentinel from url_decode_userinfo()'s internal sed pipeline: nothing here fails,
   //      because no value reaching it through a URL carries a LITERAL trailing newline. Recorded so
   //      the next reader does not go looking for it; that half is asserted directly in test 13.
@@ -957,16 +958,19 @@ test('r40: capture() returns every byte its command wrote, including trailing ne
   //   - a value that ENDS WITH THE SENTINEL'S OWN TEXT loses only the one the capture appended,
   //     which is what makes `${var%"..."}` (shortest suffix) the right expansion and `${var%%...}`
   //     the wrong one;
-  //   - a command that FAILS still yields its exit status, so `|| true` at the call sites is a
-  //     decision and not an accident. Under `set -e` without the subshell's `set +e` the sentinel
-  //     is never written and the fix silently reverts to stripping.
+  //   - a command that FAILS still yields its exit status, so the `|| DB_PASSWORD_INSTALLED=""`
+  //     at the call site is a decision and not an accident, and its output still reaches the
+  //     caller.
   //
   // MUTATION ROUTES (each measured by making the change and re-running):
   //   1. change `${__capture_raw%"${CAPTURE_TERMINATOR}"}` to `%%`: the sentinel-suffixed row
   //      loses BOTH copies and this test fails on it, alone in the repo.
-  //   2. remove `set +e` from the subshell: the failing-command row loses its output and this test
-  //      fails on it. Nothing else fails, because every production caller is a pure function that
-  //      succeeds — which is why it is measured here.
+  //   2. add `set +e` back to the subshell as a guard against errexit killing it before the
+  //      terminator is written: NOTHING changes, in this test or anywhere else. It was measured
+  //      under `set -euo pipefail` with `shopt -s inherit_errexit` both set and unset, and the
+  //      value and the status are identical either way — because capture()'s own
+  //      `|| __capture_status=$?` puts the substitution in a tested context, where errexit does
+  //      not apply. The line was removed rather than shipped as decoration.
   //   3. remove the `exit "${__capture_inner}"`: the status row reports 0 and this test fails on
   //      it. That one is load-bearing at the call site in prompt_db_password(), where a failed
   //      recovery has to fall through to `DB_PASSWORD_INSTALLED=""`.

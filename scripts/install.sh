@@ -163,9 +163,13 @@ redis_conf_set_requirepass() {
 # return value is the command's own. A command that writes nothing leaves VAR empty. The command
 # runs in a SUBSHELL, as it did under `$( )`, so it must be pure — every caller here is.
 #
-# `set +e` inside the subshell is what makes the terminator unconditional: under the script's
-# `set -e` a non-zero return from the command would leave the subshell before the terminator was
-# written, and the recovery would silently be back to stripping.
+# THERE IS NO `set +e` IN HERE, AND THAT WAS MEASURED RATHER THAN ASSUMED. The obvious worry is
+# that under this script's `set -e` a non-zero return from the command would leave the subshell
+# before the terminator was written — silently back to stripping. It cannot: the assignment below
+# is ALWAYS in a `|| __capture_status=$?` context, and errexit is suppressed for a command whose
+# failure is tested, all the way into the substitution. That holds with `shopt -s inherit_errexit`
+# set as well as unset (bash 5.2, both measured). A `set +e` here would be a line that cannot
+# change what this function does, and a guard that cannot fail is not a guard.
 CAPTURE_TERMINATOR='--ims-end-of-captured-value--'
 
 capture() {
@@ -173,7 +177,6 @@ capture() {
   shift
   local __capture_raw __capture_status=0
   __capture_raw="$(
-    set +e
     "$@"
     __capture_inner=$?
     printf '%s' "${CAPTURE_TERMINATOR}"
@@ -1464,11 +1467,20 @@ rotate_database_password_in_fenced_window() {
   # must not perform. Refusing costs nothing — no ALTER has been issued.
   DB_PROBE_REPORT=""
   DB_ROTATION_PROBE_DATABASE=""
-  if db_endpoint_is_password_sensitive postgres "${DB_PASSWORD_EFFECTIVE}"; then
-    DB_ROTATION_PROBE_DATABASE=postgres
-    info "Rotation endpoint proven: 'postgres' refused a random 32-byte password and accepted the"
-    info "credential '${DB_USER}' is holding right now, so it can tell one password from another."
-    info "That endpoint is recorded in the journal and is what a next run reconciles against."
+  local -a rotation_probe_candidates=()
+  local rotation_probe_candidate
+  db_unfenced_probe_candidates rotation_probe_candidates
+  for rotation_probe_candidate in "${rotation_probe_candidates[@]}"; do
+    if db_endpoint_is_password_sensitive "${rotation_probe_candidate}" "${DB_PASSWORD_EFFECTIVE}"; then
+      DB_ROTATION_PROBE_DATABASE="${rotation_probe_candidate}"
+      break
+    fi
+  done
+  if [[ -n "${DB_ROTATION_PROBE_DATABASE}" ]]; then
+    info "Rotation endpoint proven: '${DB_ROTATION_PROBE_DATABASE}' refused a random 32-byte password"
+    info "and accepted the credential '${DB_USER}' is holding right now, so it can tell one password"
+    info "from another. That endpoint is recorded in the journal and is what a next run reconciles"
+    info "against — the application database is never it, because the fence stands over that one."
   else
     # ONE PHYSICAL LINE, AND THE REPORT LAST. deploy-order.test.ts classifies every source line that
     # names an application-owned path, and a literal newline inside this string makes its second half
@@ -2059,15 +2071,58 @@ db_endpoint_is_password_sensitive() {
   return 0
 }
 
-# THE ENDPOINTS A RECONCILIATION MAY ASK, most-likely-unfenced first, with the one the rotating
-# run RECORDED ahead of both — that is the "reuse that exact endpoint" half. A journal written by
-# an installer older than r40 carries no probe_database line; the list then starts at `postgres`,
-# which is where that older run would have asked first anyway.
+# THE DATABASES ON THIS SERVER THAT COULD SERVE AS AN UNFENCED PROBE, most-likely-first.
+#
+# `postgres` LEADS because PUBLIC holds CONNECT on it by default and no fence in this script
+# touches it. THE REST ARE READ FROM THE SERVER RATHER THAN ASSUMED, and that is not decoration: a
+# site that has revoked PUBLIC CONNECT on the maintenance database — which is ordinary hardening —
+# has nowhere on the fixed list left to ask, and refusing every rotation on such a site would be
+# this round trading a wrong answer for a wrong refusal. So the question is put to the server.
+#
+# ${DB_NAME} IS EXCLUDED BY CONSTRUCTION. The connection fence revokes CONNECT on it and a
+# reconciliation runs with that fence still standing, so an endpoint chosen here must not be it.
+# Templates are excluded because they are not ordinary connection targets, and `datallowconn`
+# because a database that refuses every connection cannot discriminate anything. The list is
+# capped: each candidate costs up to two connection attempts, and a cluster with two hundred
+# databases must not turn one rotation into four hundred.
+db_connectable_databases_except_app() {
+  pg_local_psql -tA -v dbname="${DB_NAME}" <<'EOSQL' 2>/dev/null
+SELECT datname
+  FROM pg_database
+ WHERE datallowconn
+   AND NOT datistemplate
+   AND datname <> :'dbname'
+ ORDER BY (datname = 'postgres') DESC, datname
+ LIMIT 8;
+EOSQL
+}
+
+db_unfenced_probe_candidates() {
+  local -n _unfenced="$1"
+  local line
+  _unfenced=(postgres)
+  while IFS= read -r line; do
+    [[ -n "${line}" && "${line}" != "postgres" ]] || continue
+    _unfenced+=("${line}")
+  done < <(db_connectable_databases_except_app || true)
+}
+
+# THE ENDPOINTS A RECONCILIATION MAY ASK, with the one the rotating run RECORDED ahead of every
+# other — that is the "reuse that exact endpoint" half, and on a site whose only password-checked
+# endpoint is a database this list would not otherwise reach, it is the only thing that answers.
+# A journal written by an installer older than r40 carries no probe_database line; the list then
+# starts at `postgres`, which is where that older run would have asked first anyway.
+#
+# ${DB_NAME} COMES LAST, and it is here at all only as a last resort: it is normally behind the
+# fence, but a fence that has been released by hand, or a rotation interrupted before the fence
+# went up, leaves it the one endpoint that can still answer.
 db_probe_endpoint_candidates() {
   local -n _endpoints="$1"
   local recorded="${2:-}" database
+  local -a unfenced=()
+  db_unfenced_probe_candidates unfenced
   _endpoints=()
-  for database in "${recorded}" postgres "${DB_NAME}"; do
+  for database in "${recorded}" "${unfenced[@]}" "${DB_NAME}"; do
     [[ -n "${database}" ]] || continue
     [[ " ${_endpoints[*]-} " == *" ${database} "* ]] || _endpoints+=("${database}")
   done

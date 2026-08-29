@@ -62,6 +62,8 @@ export const SHIPPED = [
   // r40 (Codex HIGH): the probe that has to prove it can say NO before anything believes its YES.
   'db_endpoint_accepts_password',
   'db_endpoint_is_password_sensitive',
+  'db_connectable_databases_except_app',
+  'db_unfenced_probe_candidates',
   'db_probe_endpoint_candidates',
   'resolve_live_role_password',
   'reconcile_interrupted_role_rotation',

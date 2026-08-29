@@ -83,17 +83,20 @@ test('r40: a trust rule on the probe endpoint makes the rotation REFUSE, not pro
   // be the configuration the finding is about and every assertion below would be meaningless.
   //
   // MUTATION ROUTES (each measured by making the change and re-running):
-  //   1. delete the db_endpoint_is_password_sensitive gate from
-  //      rotate_database_password_in_fenced_window(): the rotation proceeds, this test fails on its
-  //      status assertion, on ROTATED_ANYWAY and on the live-credential assertion. Test 2 fails
-  //      with it; no other file in the repo notices.
+  //   1. disable the gate in rotate_database_password_in_fenced_window() (`if true; then` over
+  //      the endpoint search): the rotation proceeds, and this test fails on its status assertion,
+  //      on ROTATED_ANYWAY and on the live-credential assertion. Tests 5 and 8 fail with it.
   //   2. keep the gate but drop the NEGATIVE CONTROL from db_endpoint_is_password_sensitive() —
   //      i.e. return 0 as soon as the positive password connects. Under `trust` the positive
-  //      always connects, so the gate passes and the rotation proceeds: same three failures. This
-  //      is the route that matters, because it is the one a fix that "looks right" takes.
+  //      always connects, so the gate passes and the rotation proceeds: same three failures here,
+  //      and tests 2 and 3 fail with it. THIS IS THE ROUTE THAT MATTERS, because it is the one a
+  //      fix that "looks right" takes.
   //   3. keep the control but drop the POSITIVE half: the gate then passes on any endpoint that
   //      refuses a random password, including one behind a revoked CONNECT. Nothing here fails;
-  //      test 5 is what catches it.
+  //      tests 5 and 8 are what catch it.
+  //   4. drop the `datname <> :'dbname'` exclusion from db_connectable_databases_except_app(): the
+  //      application database — which still checks passwords — becomes a candidate, the gate is
+  //      satisfied by it, and the rotation proceeds. Same three failures here, and test 5 with it.
   const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
   let cluster: Cluster | undefined
   try {
@@ -169,16 +172,23 @@ test('r40: under trust the reconciliation REFUSES rather than adopting the candi
   // the only remaining record of the two candidates.
   //
   // MUTATION ROUTES (each measured by making the change and re-running):
-  //   1. restore r39's `if db_password_authenticates "${new_password}"` first-success-wins body in
-  //      reconcile_interrupted_role_rotation(): the run succeeds, adopts `rotated-secret`, and
-  //      publishes it. This test fails on its status assertion, on ADOPTED and on JOURNAL_LEFT —
-  //      alone in the repo, because every other reconciliation test runs on a scram cluster where
-  //      first-success-wins happens to give the right answer.
+  //   1. restore r39's first-success-wins body in reconcile_interrupted_role_rotation() — probe
+  //      `new` on postgres then the application database, take the first success, then `old`. The
+  //      run succeeds, adopts `rotated-secret`, and publishes it. This test fails on its status
+  //      assertion, on ADOPTED and on JOURNAL_LEFT. It is the widest-blast-radius mutation
+  //      measured on this branch — SEVEN tests fail, including r39's own boundary (4) and every
+  //      probe test that depends on WHICH endpoint answered — which is the right shape for
+  //      reverting the finding itself.
   //   2. drop the negative control from db_endpoint_is_password_sensitive(): both candidates
   //      connect, the endpoint is admitted, and resolve_live_role_password() returns the AMBIGUOUS
   //      verdict instead. The run still refuses, but with the wrong message — this test fails on
-  //      its "cannot tell one password from another" assertion and not on its status. Recorded
-  //      because the distinction is the finding: refusing by luck is not refusing by rule.
+  //      its "cannot tell one password from another" assertion and not on its status, together
+  //      with tests 1 and 3. Recorded because the distinction is the finding: refusing by luck is
+  //      not refusing by rule.
+  //   3. turn the `|| continue` in resolve_live_role_password() into `|| return 1`: the loop stops
+  //      at the first endpoint it cannot use, which here is `postgres`, so the run refuses for the
+  //      right reason and the wrong endpoints are never reported. This test fails on its
+  //      "one_two_inventory ACCEPTED" assertion, with test 3.
   const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
   let cluster: Cluster | undefined
   try {
@@ -239,11 +249,16 @@ test('r40: a recorded probe endpoint that has gone trust is discarded, and a dis
   // MUTATION ROUTES (each measured by making the change and re-running):
   //   1. make resolve_live_role_password() `return 1` instead of `continue` when an endpoint fails
   //      the sensitivity pair: the recorded endpoint is trust, the loop stops there, and the run
-  //      refuses. This test fails on its status assertion, alone.
-  //   2. drop the recorded endpoint from db_probe_endpoint_candidates() (start the list at
-  //      `postgres` unconditionally): NOTHING here fails, because the recorded endpoint IS
-  //      `postgres`. Test 6 is what asserts the recording; recorded here so the next reader does
-  //      not look for it in this test.
+  //      refuses. This test fails on its status assertion, with test 2.
+  //   2. drop the recorded endpoint from db_probe_endpoint_candidates(): NOTHING here fails,
+  //      because the recorded endpoint is `postgres`, which the derived list reaches first anyway.
+  //      Test 9 is the one that discriminates the record from the derivation; recorded here so the
+  //      next reader does not look for it in this test.
+  //   3. drop the negative control: `postgres` is admitted on its trust acceptance, and under
+  //      trust it accepts BOTH candidates — so resolve_live_role_password() returns the AMBIGUOUS
+  //      verdict and the run REFUSES. This test fails on its status assertion (expected 0, got 9),
+  //      with tests 1 and 2. Refusing for the wrong reason is still the wrong behaviour: the
+  //      endpoint should have been discarded, not consulted and then found confusing.
   const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
   let cluster: Cluster | undefined
   try {
@@ -285,12 +300,20 @@ test('r40: a revoked CONNECT on the maintenance database does not strand a recov
   // "cannot be shown password-sensitive" starts refusing sites that were fine. It must not.
   //
   // MUTATION ROUTES (each measured by making the change and re-running):
-  //   1. reduce db_probe_endpoint_candidates() to `postgres` alone: no endpoint can be shown
-  //      password-sensitive and the run refuses. This test fails on its status assertion, alone —
-  //      and that failure is the whole reason the fallback exists.
-  //   2. treat "refused everything" as password-sensitivity (drop the positive half of the pair):
-  //      `postgres` is admitted, reports that neither candidate is live, and the run either adopts
-  //      nothing or refuses. This test fails on PROBE_DB and on INSTALLED_B64.
+  //   1. drop `"${DB_NAME}"` from the end of db_probe_endpoint_candidates(): the application
+  //      database is never asked, no endpoint can be shown password-sensitive, and the run refuses.
+  //      This test fails on its status assertion — and that failure is the whole reason the
+  //      application database is on the list at all, as a LAST RESORT rather than a first choice.
+  //      Three other tests fail with it, all for the same reason.
+  //   2. restore r39's first-success-wins reconciliation: `postgres` refuses both candidates, the
+  //      fallback probes the application database with no control at all, and the run answers
+  //      `old` — the right password, from an endpoint it never showed could discriminate, and
+  //      recorded as having come from `postgres`. This test fails on PROBE_DB, which is the only
+  //      assertion here that can see the difference. Six other tests fail with it.
+  //   3. drop the POSITIVE half of the sensitivity pair: nothing here fails. `postgres` refuses
+  //      the control AND both candidates, so `resolve_live_role_password` skips it before the pair
+  //      is consulted at all. Tests 5 and 8 are what catch that route; recorded so the next reader
+  //      does not look for it here.
   const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
   let cluster: Cluster | undefined
   try {
@@ -339,11 +362,14 @@ test('r40: a rotation refuses when the role cannot reach any UNFENCED endpoint a
   // MUTATION ROUTES (each measured by making the change and re-running):
   //   1. drop the POSITIVE half of db_endpoint_is_password_sensitive(): `postgres` is admitted on
   //      the strength of refusing a random password, the rotation proceeds, and this test fails on
-  //      its status assertion, on ROTATED_ANYWAY and on the live-credential assertion. Alone.
-  //   2. let the rotation gate fall back to ${DB_NAME}: it is behind the fence when a
-  //      reconciliation runs, so the rotation would succeed here and strand the next run. This test
-  //      fails on its status assertion; nothing else does, which is why the gate names `postgres`
-  //      explicitly rather than reusing the reconciliation's candidate list.
+  //      its status assertion, on ROTATED_ANYWAY and on the live-credential assertion. Test 8 fails
+  //      with it.
+  //   2. let the rotation gate reach ${DB_NAME}, by dropping the `datname <> :'dbname'` exclusion
+  //      from db_connectable_databases_except_app(): the application database still checks
+  //      passwords, so the gate is satisfied by an endpoint that will be BEHIND THE FENCE when a
+  //      reconciliation runs, and the rotation succeeds here and strands the next run. This test
+  //      fails on its status assertion, with test 1.
+  //   3. disable the gate entirely: same three failures here, with tests 1 and 8.
   const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
   let cluster: Cluster | undefined
   try {
@@ -395,8 +421,10 @@ test('r40: a rotation records the endpoint it proved, and the reconciliation rea
   //
   // MUTATION ROUTES (each measured by making the change and re-running):
   //   1. drop the probe_database line from write_role_rotation_journal(): this test fails on the
-  //      journal assertion, alone — the reconciliation still works, because the candidate list
-  //      starts at `postgres` anyway, which is exactly why the recording needs its own assertion.
+  //      journal assertion. The reconciliation on THIS cluster still works, because the derived
+  //      list starts at `postgres` anyway — which is exactly why the recording needs an assertion
+  //      of its own — but tests 8 and 9 fail with it, and those are the two where the recorded
+  //      endpoint is the only thing that reaches the right place.
   //   2. write it BEFORE marker_complete is not a thing — the marker is written last by
   //      construction; a reader that stops at the first missing key would be a different defect.
   //      Recorded as not-applicable so the next reader does not go looking.
@@ -456,10 +484,11 @@ test('r40: a discriminating endpoint that accepts BOTH candidates is refused, no
   //   1. delete the `return 2` branch and let the `new_ok` arm win: the run succeeds and adopts a
   //      candidate on an ambiguous reading. This test fails on its status assertion and on
   //      JOURNAL_LEFT, alone in the repo.
-  //   2. move the negative control BEFORE the candidate probes: no behaviour here changes (the
-  //      control is refused either way) but the run costs one extra connection on every endpoint
-  //      that refuses both candidates. Recorded as a no-op so the ordering is not mistaken for
-  //      load-bearing.
+  //   2. resolve the ambiguity to `old` instead of refusing (set `new_ok=false` where the
+  //      `return 2` was): the run succeeds and adopts `live-password` — which on this cluster is
+  //      the RIGHT password, reached by a rule that has no way of knowing that. This test fails on
+  //      its status assertion, alone, which is the point: the refusal is the property, not which
+  //      candidate a guess would have landed on.
   const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
   let cluster: Cluster | undefined
   try {
@@ -480,6 +509,148 @@ test('r40: a discriminating endpoint that accepts BOTH candidates is refused, no
     assert.match(next.output, /LEFT IN PLACE/, 'and the record is kept')
     assert.doesNotMatch(next.output, /INSTALLED_B64/, 'nothing past the refusal ran')
     assert.equal(readFileSync(join(root, '.env'), 'utf8').includes('live-password'), true, 'and .env was not republished')
+  } finally {
+    cluster?.stop()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 8. The hardened site: the only password-checked endpoint is neither of the two obvious ones
+// ---------------------------------------------------------------------------
+
+test('r40: a site with no CONNECT on postgres rotates against a database the server named, and reconciles there', async () => {
+  // THE OVER-REFUSAL THIS ROUND HAD TO AVOID. Revoking PUBLIC CONNECT on the maintenance database
+  // is ordinary hardening, and a rotation gate that only ever asks `postgres` would refuse every
+  // such site — trading r39's wrong answer for a wrong refusal. So the candidates are READ FROM THE
+  // SERVER, and what this test proves is that the whole chain then works end to end on a cluster
+  // where neither `postgres` nor the application database can answer:
+  //
+  //   the shipped gate picks a database the server named, RECORDS it, the rotation commits, the run
+  //   is interrupted before the journal is cleared, THE FENCE GOES UP over the application database
+  //   — which is the real state a reconciliation runs in — and the next run still resolves.
+  //
+  // MUTATION ROUTES (each measured by making the change and re-running):
+  //   1. reduce db_unfenced_probe_candidates() to `_unfenced=(postgres)`: the gate finds nothing,
+  //      the rotation refuses, and this test fails on the interrupted run's status. Alone.
+  //   2. drop the probe_database line from write_role_rotation_journal(): the reconciliation
+  //      derives its own list, and neither `postgres` nor the fenced application database can
+  //      answer, so the run refuses. This test fails on its status assertion, with tests 6 and 9.
+  //   3. drop the POSITIVE half of the sensitivity pair, or disable the rotation gate: the gate
+  //      settles on `postgres` — which refuses everything here — and records it, so the
+  //      reconciliation would have nothing usable. This test fails on GATE_PROBE_DB, the first
+  //      assertion that can see it, with test 5.
+  //   4. drop the `datname <> :'dbname'` exclusion from db_connectable_databases_except_app():
+  //      NOTHING here fails, because `ims_spare_probe` sorts before `one_two_inventory` and is
+  //      chosen either way. Tests 1 and 5 are what catch that route.
+  const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
+  let cluster: Cluster | undefined
+  try {
+    cluster = startCluster(root, 'live', await freePort(), '127.0.0.1')
+    seedLiveInstallation(cluster)
+    writeInstalledEnv(root, cluster.port, 'live-password')
+    // The hardened site, and the one other database this cluster holds.
+    cluster.psql(['-c', 'CREATE DATABASE ims_spare_probe'])
+    cluster.psql(['-c', 'REVOKE CONNECT ON DATABASE postgres FROM PUBLIC'])
+
+    const interrupted = runShipped({ ...installVars(cluster, root), DB_PASSWORD: 'rotated-secret' }, `
+      ${REINSTALL_BODY}
+      FENCE_ARMED=true
+      DB_FENCE_UP=true
+      rotate_database_password_in_fenced_window
+      echo "GATE_PROBE_DB=\${DB_ROTATION_PROBE_DATABASE}"
+      echo "ROTATED=\${DB_ROLE_CREDENTIALS_ROTATED}"
+    `)
+    assert.equal(interrupted.status, 0, `the rotation must find an endpoint the server named:\n${interrupted.output}`)
+    assert.match(interrupted.output, /GATE_PROBE_DB=ims_spare_probe/, 'and it must be the spare database, not the maintenance one and not the application one')
+    assert.match(interrupted.output, /Rotation endpoint proven: 'ims_spare_probe'/, 'and the run must say so')
+
+    // The rotation completed here, so re-create the state a crash before the clear leaves: the
+    // journal standing over a server that already has the new password.
+    const rejournalled = runShipped({ ...installVars(cluster, root), DB_PASSWORD: 'rotated-secret' }, `
+      ${REINSTALL_BODY}
+      write_role_rotation_journal "live-password" "rotated-secret" ims_spare_probe || exit 7
+    `)
+    assert.equal(rejournalled.status, 0, rejournalled.output)
+    assert.equal(journalValue(root, 'probe_database'), 'ims_spare_probe')
+
+    // AND NOW THE FENCE, which is what a reconciliation actually runs under.
+    cluster.psql(['-c', 'REVOKE CONNECT ON DATABASE one_two_inventory FROM PUBLIC'])
+    cluster.psql(['-c', 'REVOKE CONNECT ON DATABASE one_two_inventory FROM imsuser'])
+
+    const next = runShipped(installVars(cluster, root), `
+      if db_endpoint_accepts_password postgres "rotated-secret"; then echo "POSTGRES_ANSWERS=yes"; else echo "POSTGRES_ANSWERS=no"; fi
+      if db_endpoint_accepts_password one_two_inventory "rotated-secret"; then echo "APPDB_ANSWERS=yes"; else echo "APPDB_ANSWERS=no"; fi
+      ${NEXT_RUN_BODY}
+      echo "PROBE_DB=\${DB_ROTATION_PROBE_DATABASE}"
+    `)
+    assert.match(next.output, /POSTGRES_ANSWERS=no/, 'precondition: the maintenance database must be closed to this role')
+    assert.match(next.output, /APPDB_ANSWERS=no/, 'precondition: and the fence must be standing over the application database')
+
+    assert.equal(next.status, 0, `the recorded endpoint must still answer:\n${next.output}`)
+    assert.match(next.output, /PROBE_DB=ims_spare_probe/, 'on the endpoint the rotating run proved')
+    assert.match(next.output, /server has the NEW password/)
+    assert.equal(decodeVar(next.output, 'INSTALLED_B64'), 'rotated-secret')
+    assert.match(next.output, /JOURNAL_LEFT=no/, 'and the record is cleared')
+  } finally {
+    cluster?.stop()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 9. "Reuse that exact endpoint" is a behaviour, not a comment
+// ---------------------------------------------------------------------------
+
+test('r40: the reconciliation asks the RECORDED endpoint, not the one it would have derived', async () => {
+  // THE DISCRIMINATING CASE, and it exists because test 8 cannot be it: there, the recorded
+  // endpoint is also the only one that works, so honouring the record and re-deriving a list give
+  // the same answer and the record proves nothing.
+  //
+  // Here BOTH endpoints can discriminate. `postgres` is reachable and checks passwords, so a
+  // reconciliation that derives its own list answers on `postgres`; the journal names
+  // `ims_spare_probe`, so one that honours the record answers there. The credential resolved is
+  // identical either way — WHICH ENDPOINT ANSWERED is the whole observable, and it is exactly the
+  // property Codex asked for: the run that reconciles asks the place the run that rotated proved,
+  // rather than one it derived for itself under whatever pg_hba.conf now says.
+  //
+  // MUTATION ROUTES (each measured by making the change and re-running):
+  //   1. drop the recorded endpoint from db_probe_endpoint_candidates() (iterate
+  //      `"${unfenced[@]}" "${DB_NAME}"`): the list starts at `postgres`, which discriminates, so
+  //      the run succeeds with the right password on the WRONG endpoint. This test fails on
+  //      PROBE_DB and on the success message, alone in the repo.
+  //   2. put the recorded endpoint LAST instead of first: same two failures, same test. Recorded
+  //      because "the record is in the list somewhere" is not the property — being asked FIRST is.
+  const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
+  let cluster: Cluster | undefined
+  try {
+    cluster = startCluster(root, 'live', await freePort(), '127.0.0.1')
+    seedLiveInstallation(cluster)
+    writeInstalledEnv(root, cluster.port, 'live-password')
+    cluster.psql(['-c', 'CREATE DATABASE ims_spare_probe'])
+
+    const interrupted = writeInterruptedJournal(cluster, root, 'rotated-secret', 'ims_spare_probe')
+    assert.equal(interrupted.status, 0, interrupted.output)
+    assert.equal(journalValue(root, 'probe_database'), 'ims_spare_probe', 'precondition: the journal names the spare database')
+
+    const next = runShipped(installVars(cluster, root), `
+      # PRECONDITION: the endpoint a re-derived list would reach FIRST is fully able to answer, so
+      # the assertion below is about which one was asked and not about which one could be.
+      if db_endpoint_is_password_sensitive postgres "live-password"; then
+        echo "POSTGRES_WOULD_ANSWER=yes"
+      else
+        echo "POSTGRES_WOULD_ANSWER=no"
+      fi
+      ${NEXT_RUN_BODY}
+      echo "PROBE_DB=\${DB_ROTATION_PROBE_DATABASE}"
+    `)
+    assert.match(next.output, /POSTGRES_WOULD_ANSWER=yes/, 'precondition: postgres must be able to discriminate, or the record is not what steered this')
+
+    assert.equal(next.status, 0, next.output)
+    assert.match(next.output, /PROBE_DB=ims_spare_probe/, 'the reconciliation must ask the endpoint the journal recorded')
+    assert.match(next.output, /Established on 'ims_spare_probe'/, 'and say so')
+    assert.match(next.output, /still has the OLD password/, 'and reach the right answer on it')
+    assert.equal(decodeVar(next.output, 'INSTALLED_B64'), 'live-password')
   } finally {
     cluster?.stop()
     rmSync(root, { recursive: true, force: true })
