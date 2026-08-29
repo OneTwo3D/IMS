@@ -3,6 +3,7 @@
 import { config as loadDotenv } from 'dotenv'
 import { Pool } from 'pg'
 
+import { pgConnectionConfig } from '@/lib/db/database-url-schema.mjs'
 import { runInvariantCheckPreflight } from '@/lib/cron/invariant-check-preflight'
 import type { InvariantCheckPreflightResult } from '@/lib/cron/invariant-check-preflight'
 import { runInvariantCheckPreflightCli } from './invariant-check-preflight.ts'
@@ -16,7 +17,10 @@ if (!DATABASE_URL) {
   throw new Error('DATABASE_URL is required for the invariant preflight fixture')
 }
 
-const pool = new Pool({ connectionString: DATABASE_URL })
+// Guarded config, not a bare connection string: this fixture writes stock_levels/warehouses/
+// products with UNQUALIFIED names, so without the search_path pin it seeds whatever schema the
+// server default resolves to while the preflight under test reads the application's (o3d-2k5r r23).
+const pool = new Pool(pgConnectionConfig(DATABASE_URL))
 const fixtureId = `invariant-preflight-fixture-${Date.now()}`
 const productId = `${fixtureId}-product`
 const warehouseId = `${fixtureId}-warehouse`

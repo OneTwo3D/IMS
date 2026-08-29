@@ -758,11 +758,17 @@ test('the WMS create path checks the fence before claiming, and again under the 
   // And under the lock: the window the read vouched for is re-checked there.
   const claim = wms.slice(wms.indexOf('async claimForCreate('))
   const body = claim.slice(0, claim.indexOf('\n    },'))
-  assert.ok(body.includes('!suppressed.retiredAt) return false'))
+  // o3d-2k5r r4: the claim answers with an OUTCOME rather than a boolean now (an expired claim is
+  // PARKED, not granted), so these refusals read 'SKIPPED'. The fence itself is unchanged: a live
+  // suppression still refuses outright, and a retired one still has to spend its single-use proof.
+  assert.ok(body.includes("!suppressed.retiredAt) return 'SKIPPED'"))
   // The proof is CONSUMED under the lock, so a second attempt cannot ride on
   // the read another worker took.
   assert.ok(body.includes('pushProofToken: null'))
-  assert.ok(body.includes('consumed.count === 0) return false'))
+  assert.ok(body.includes("consumed.count === 0) return 'SKIPPED'"))
+  // And the fence is checked BEFORE the claim decision, so a withdrawn order can never reach the
+  // park either — a parked claim is a claim that was granted at some point.
+  assert.ok(body.indexOf('wcWithdrawalSuppression') < body.indexOf('decideCreateClaim'))
 })
 
 test('a retired row does not block the import it was retired to allow', async () => {

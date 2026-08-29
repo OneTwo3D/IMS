@@ -83,13 +83,21 @@ function makePort(seed: Seed) {
     activeBindings: async () => BINDINGS,
     releasableHeldOrders: async () => [],
     createCandidates: async () => seed.createCandidates ?? [],
-    claimForCreate: async (orderId) => { claims.push(orderId); return true },
+    claimForCreate: async (orderId) => { claims.push(orderId); return 'CLAIMED' as const },
+    // o3d-92fu: this suite's orders all build a valid payload, so this is never reached;
+    // it throws rather than returning a value so a future seed that DOES fail to build
+    // cannot silently pass through it unnoticed.
+    recordValidationFailure: async () => { throw new Error('recordValidationFailure not expected in the withdrawal-fence suite') },
     verifiableLinks: async () => seed.verifiable ?? [],
     updatableLinks: async () => [],
     holdableLinks: async () => [],
     cancellableLinks: async () => [],
     upsertByOrder: async (orderId, create, update) => { upserts.push({ orderId, create, update }) },
     updateLink: async (id, data) => { updates.push({ id, data }) },
+    // o3d-2k5r r2: this suite seeds no releasable or revalidatable links, so the only two
+    // callers of the guarded write are unreachable here; it throws rather than recording, so a
+    // future seed that DOES reach it cannot pass unnoticed with an unasserted write.
+    updateLinkIfState: async () => { throw new Error('updateLinkIfState not expected in the withdrawal-fence suite') },
     updateLinkByOrder: async (orderId, data) => { updatesByOrder.push({ orderId, data }) },
     readWithdrawalState: seed.readWithdrawalState
       ?? (async () => ({ withdrawalHoldAt: null, withdrawalApprovedAt: null })),

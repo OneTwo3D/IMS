@@ -12,6 +12,16 @@ import {
 } from '@/lib/ops/instance-identity'
 import { checkFileScanHealth, type FileScanResult } from '@/lib/security/file-scan'
 import { RETIRED_ENV_VARS } from '@/lib/ops/retired-env-vars'
+import {
+  missingWmsPushStates,
+  pgConnectionConfig,
+  pinClientToMeasuredBackend,
+  WMS_PUSH_STATE_COLUMN,
+  WMS_PUSH_STATE_ENUM,
+  WMS_PUSH_STATE_ENUM_LABELS_SQL,
+  WMS_PUSH_STATE_TABLE,
+  wmsPushStateSchemaRefusal,
+} from '@/lib/domain/wms/push-state-schema-gate'
 
 export type PreflightStatus = 'pass' | 'fail' | 'warn'
 
@@ -33,6 +43,12 @@ type PreflightOptions = {
   env?: Env
   scanHealth?: (env: Env) => Promise<FileScanResult>
   dbConnect?: (databaseUrl: string) => Promise<void>
+  /**
+   * o3d-1izw: the database's OWN labels for the type `wms_order_push_links.state` is declared as.
+   * Injected so the check is testable without a server; the default asks the SHARED, column-
+   * anchored statement over the same connection string the connectivity check uses.
+   */
+  readWmsPushStates?: (databaseUrl: string) => Promise<readonly string[]>
 }
 
 const PLACEHOLDER_SUBSTRING_PATTERN = /(change[-_ ]?(me|this|it|in[-_ ]?production)|please[-_ ]?change|(^|[-_ ])(dev|test|sample|placeholder|dummy|changeme)[-_ ]?secret|replace[-_ ]?me|example|yourdomain\.com|your[-_ ]?(secret|password|token)|<[^>]+>|\[[^\]]+\]|__[^_]+__)/i
@@ -191,6 +207,12 @@ async function checkDatabaseConnectivity(
     if (dbConnect) {
       await dbConnect(databaseUrl)
     } else {
+      // DELIBERATELY UNGUARDED, and it is the ONE runtime client that is (o3d-2k5r r23, Codex HIGH).
+      // This asks one question — can a TCP connection to this URL be opened and answered — and its
+      // only statement is `SELECT 1`, which resolves no object and so has no schema to be wrong
+      // about. Routing it through `pgConnectionConfig()` would make an unsupported schema name
+      // report itself as "database connectivity failed", which is the wrong check failing: the
+      // schema is `checkWmsPushStateSchema()` below, and that one IS guarded.
       const { Client } = await import('pg')
       const client = new Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5_000 })
       try {
@@ -204,6 +226,92 @@ async function checkDatabaseConnectivity(
   } catch {
     add(checks, 'fail', 'database-connectivity', 'PREFLIGHT_DB_CONNECT', 'Database connectivity check failed.')
   }
+}
+
+/**
+ * o3d-1izw — CAN THIS BUILD WRITE WHAT IT IS ABOUT TO WRITE?
+ *
+ * Asked of the COLUMN the value would be written to, via the one statement the runtime gate and the
+ * deploy check also use. Identifying the enum by name would let a same-named type in an unrelated
+ * schema pass all three at once — the gates are only independent if the question is right.
+ *
+ * A deploy that applied its migrations cannot fail this. A deploy that skipped them can, and so can
+ * an environment served straight from a working tree — the two ways this branch reaches a database
+ * that has never heard of `AMBIGUOUS_CREATE`. Without it the discovery is made by Postgres, inside
+ * the create claim that writes the value, once per sweep for ever.
+ *
+ * Rides on PREFLIGHT_DB_CONNECT because it needs the same live connection, and fails rather than
+ * warns: the WMS order-push sweep refuses to run at all in this state, which is an outage of
+ * fulfilment, not a nit.
+ */
+async function checkWmsPushStateSchema(
+  checks: PreflightCheck[],
+  env: Env,
+  databaseUrl: string | null,
+  readWmsPushStates?: (databaseUrl: string) => Promise<readonly string[]>,
+): Promise<void> {
+  if (!isTruthy(env.PREFLIGHT_DB_CONNECT)) return
+  if (!databaseUrl) return
+
+  let labels: readonly string[]
+  try {
+    if (readWmsPushStates) {
+      labels = await readWmsPushStates(databaseUrl)
+    } else {
+      // o3d-2k5r r19 — settle the non-ASCII startup-byte question against THIS server before the
+      // connection config is composed from the URL. A URL with no such bytes opens nothing; where
+      // there are some, the verdict this leaves behind is what pgConnectionConfig() consults, so a
+      // schema this deployment cannot carry is reported here with the rename procedure attached
+      // rather than as an opaque "could not read the catalogue".
+      const { establishStartupOptionByteSafety, nonAsciiStartupOptionCharacters } = await import(
+        '../db/database-url-schema.mjs'
+      )
+      if (nonAsciiStartupOptionCharacters(databaseUrl) !== '') {
+        await establishStartupOptionByteSafety(databaseUrl)
+      }
+
+      const { Client } = await import('pg')
+      // The search path is aligned with Prisma's deliberately: this check opens its OWN connection,
+      // and the shared statement resolves the table through whatever search path the asking
+      // connection has. A preflight that resolved `wms_order_push_links` to a different table from
+      // the application it is vouching for would be answering about the wrong object.
+      // The spread comes FIRST and carries the connection string with it: `pg` parses
+      // `connectionString` after the surrounding config, so an `options=` left inside the URL
+      // would overwrite the search path composed beside it (o3d-2k5r r10).
+      // `pinClientToMeasuredBackend` wraps `connect()` so this preflight cannot vouch for a backend
+      // the deployment probe above is not about (o3d-2k5r r22). It is a no-op for an ASCII pin.
+      const clientConfig = {
+        ...pgConnectionConfig(databaseUrl),
+        connectionTimeoutMillis: 5_000,
+      }
+      const client = pinClientToMeasuredBackend(new Client(clientConfig), clientConfig)
+      try {
+        await client.connect()
+        const result = await client.query<{ enumlabel: string }>(
+          WMS_PUSH_STATE_ENUM_LABELS_SQL,
+          [WMS_PUSH_STATE_TABLE, WMS_PUSH_STATE_COLUMN],
+        )
+        labels = result.rows.map((row) => row.enumlabel)
+      } finally {
+        await client.end().catch(() => undefined)
+      }
+    }
+  } catch (error) {
+    // An unreadable catalogue is not a clean one — and neither is a DATABASE_URL that names two
+    // schemas, which throws from the config composition above rather than picking one. The reason
+    // is carried through, because "could not read the catalogue" would send an operator looking at
+    // the database for a fault that is in the URL.
+    const because = error instanceof Error && error.message ? ` (${error.message})` : ''
+    add(checks, 'fail', 'wms-push-state-schema', WMS_PUSH_STATE_ENUM, `Could not read the enum ${WMS_PUSH_STATE_TABLE}.${WMS_PUSH_STATE_COLUMN} is declared as, so ${WMS_PUSH_STATE_ENUM} cannot be confirmed to carry what this build writes${because}. Release gate: o3d-1izw.`)
+    return
+  }
+
+  const missing = missingWmsPushStates(labels)
+  if (missing.length > 0) {
+    add(checks, 'fail', 'wms-push-state-schema', WMS_PUSH_STATE_ENUM, wmsPushStateSchemaRefusal(missing))
+    return
+  }
+  add(checks, 'pass', 'wms-push-state-schema', WMS_PUSH_STATE_ENUM, `The enum ${WMS_PUSH_STATE_TABLE}.${WMS_PUSH_STATE_COLUMN} is declared as carries every value this build writes.`)
 }
 
 async function checkWritableDirectory(checks: PreflightCheck[], label: string, directory: string): Promise<void> {
@@ -423,6 +531,7 @@ export async function runProductionPreflight(options: PreflightOptions = {}): Pr
   checkSettingsEncryptionKey(checks, env)
   const databaseUrl = checkDatabaseUrl(checks, env)
   await checkDatabaseConnectivity(checks, env, databaseUrl, options.dbConnect)
+  await checkWmsPushStateSchema(checks, env, databaseUrl, options.readWmsPushStates)
 
   const appUrl = parseRequiredUrl(checks, env, 'NEXT_PUBLIC_APP_URL')
   const authUrl = parseRequiredUrl(checks, env, 'AUTH_URL')
