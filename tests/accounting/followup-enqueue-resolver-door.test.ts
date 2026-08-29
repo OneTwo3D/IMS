@@ -75,6 +75,86 @@ test('[o3d-batch-ret r9] the raw resolver does not leave the module, and the fol
     'and nor must its result type: a caller that can name the union can switch on it, and the arm it '
       + 'will forget is `invalid`',
   )
+
+  // o3d-batch-ret ROUND 10: THE SAME RULE FOR THE CLASSIFIER THAT NOW OWNS THE WHOLE BOUNDARY.
+  //
+  // Round 9 shut the door on the AMOUNT resolver. Round 10 put the request flag, the method, the
+  // currency and the date behind the same fold, and every one of them is a value a caller could
+  // read and default for itself if it could name the classifier — which is the round-6-to-round-9
+  // defect with a different field in it. So the field classifiers and the combined one are
+  // module-private on exactly the argument the resolver is.
+  for (const declaration of [
+    'function invoicePaymentRequest(',
+    'function payloadPaymentRequested(',
+    'function payloadPaymentMethod(',
+    'function payloadPaymentCurrency(',
+    'function payloadPaymentDate(',
+  ]) {
+    const spelling = declaration.replace('(', '\\(')
+    assert.match(
+      source, new RegExp(`^${spelling}`, 'm'),
+      `${declaration}) must still be declared, or the "not exported" assertion below asserts nothing`,
+    )
+    assert.doesNotMatch(
+      source, new RegExp(`^export (async )?${spelling}`, 'm'),
+      `${declaration}) must not be exported: a caller that can classify a field for itself can choose `
+        + 'what an unreadable one means, and choosing "nothing was owed" is the defect of every round '
+        + 'from 6 to 10',
+    )
+  }
+  assert.match(source, /^type InvoicePaymentRequest =/m, 'the combined union must still be declared')
+  assert.doesNotMatch(
+    source, /^export type InvoicePaymentRequest =/m,
+    'and it must not be exported, for the reason its amount-only predecessor is not',
+  )
+})
+
+/**
+ * o3d-batch-ret ROUND 10 (Codex HIGH) — THE BOUNDARY IS CLOSED ONLY WHILE THE CONNECTORS READ
+ * NOTHING OUT OF THE PAYLOAD THEMSELVES.
+ *
+ * Five consecutive rounds each found one more field being read inline with a default, and each fix
+ * was a new expression written next to the last one. The shape that ends that is not another fix: it
+ * is that neither connector's payment path contains a payload read AT ALL, so a field added later
+ * has nowhere to acquire an ad-hoc truthiness test and must go through the classifier.
+ *
+ * ASSERTED AGAINST THE SOURCE because the defect is the PRESENCE of a read that no behaviour
+ * distinguishes until somebody adds the sixth field. Comments are stripped first: both files discuss
+ * `payload._registerPayment` at length in prose, and a guard that matched the discussion would fail
+ * on the explanation of its own finding.
+ *
+ * REVERT EVIDENCE: restoring `const currency = payload.currency as string || 'GBP'` to either
+ * connector fails naming that file and that field.
+ */
+test('[o3d-batch-ret r10] neither connector reads the payment payload itself — the fold is the only reader', async () => {
+  const stripComments = (text: string): string => text
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^[ \t]*\/\/.*$/gm, '')
+
+  for (const rel of ['lib/connectors/xero/sync-processor.ts', 'lib/connectors/quickbooks/sync-processor.ts']) {
+    const source = await readFile(path.join(ROOT, rel), 'utf8')
+    // SCOPED TO THE PAYMENT DECISION, which is the boundary this is about. Both files legitimately
+    // read `payload.currency` on the DOCUMENT-BUILD paths (the invoice and credit-note posts), and a
+    // guard that swept the whole file would be asserting something it has not reasoned about.
+    const from = source.indexOf('async function decideInvoicePaymentFollowUp(')
+    const to = source.indexOf('async function enqueueSalesInvoiceFollowUps(')
+    assert.ok(from >= 0 && to > from, `${rel}: the payment decision must still be found, and end where it does`)
+    const code = stripComments(source.slice(from, to))
+    // Non-vacuity: the strip must leave the body, and leave the call that replaced those reads.
+    assert.ok(code.length > 500, `${rel}: the comment strip must not have eaten the function body`)
+    assert.match(
+      code, /decideRequestedInvoicePayment\(payload, \{/,
+      `${rel} must still hand the whole payload to the fold, or there is no reader to be the only one`,
+    )
+    for (const field of ['_registerPayment', '_paymentMethod', '_paymentDate', 'currency']) {
+      assert.doesNotMatch(
+        code, new RegExp(`payload\\.${field}\\b`),
+        `${rel} reads \`payload.${field}\` inline in decideInvoicePaymentFollowUp. Every such read has had to answer what an ABSENT key `
+          + 'means and what a PRESENT UNREADABLE value means, and five rounds running the inline answer '
+          + 'was the same one — settle. Classify it in followup-enqueue-outcome.ts instead',
+      )
+    }
+  }
 })
 
 test('[o3d-batch-ret r9] nothing imports the raw resolver, and the walk really reached the importers', async () => {
@@ -93,7 +173,12 @@ test('[o3d-batch-ret r9] nothing imports the raw resolver, and the walk really r
       importers.push(rel)
       const names = match[1].split(',').map((name) => name.trim().replace(/^type\s+/, '').split(/\s+as\s+/)[0])
       if (names.includes('decideRequestedInvoicePayment')) foldImporters.push(rel)
-      for (const forbidden of ['requestedInvoicePayment', 'RequestedInvoicePayment']) {
+      for (const forbidden of [
+        'requestedInvoicePayment', 'RequestedInvoicePayment',
+        // o3d-batch-ret r10: and the classifier that now owns the flag, the method, the currency
+        // and the date as well.
+        'invoicePaymentRequest', 'InvoicePaymentRequest', 'payloadPaymentRequested',
+      ]) {
         assert.ok(
           !names.includes(forbidden),
           `${rel} imports ${forbidden} from the outcome module. The fold is only mandatory while it is `

@@ -759,3 +759,314 @@ test('[o3d-batch-ret r9] CONTROL: ABSENT and READABLE-ZERO fields still take the
     assert.equal(marker(), null, `and the obligation IS discharged (${what})`)
   }
 })
+
+/**
+ * o3d-batch-ret ROUND 10 (Codex HIGH) — THE FLAG THAT GATES THE WHOLE DECISION WAS READ BY
+ * TRUTHINESS, AND IT IS THE FIFTH ROUND ON ONE AXIS. THE XERO HALF.
+ *
+ * Rounds 6–9 each fixed the field Codex had just named: a default meaning success, a resolver
+ * merging "unknown" with "nothing owed", a present `null` read as an absent key. The field that
+ * decides whether ANY of that runs was never one of them. This connector opened with
+ * `if (!payload._registerPayment) return FOLLOW_UPS_ENQUEUED`, so an absent key, a literal `false`,
+ * a present `null`, a `0`, an `''` and an explicit `undefined` were ONE answer — nobody asked for a
+ * payment, settle — and a truthy malformed value such as the string `'false'` went the other way and
+ * ENTERED payment registration.
+ *
+ * THE TRUTHY DIRECTION IS THE ONE THAT IS WORSE HERE. Xero declares `consumer: 'sweep'`, so a
+ * cleared marker costs a lap of a sweep that does come back; but a payment REGISTERED because a
+ * corrupt byte was truthy puts real money against a real invoice in the ledger, and no request id
+ * deduplicates it afterwards.
+ */
+test('[o3d-batch-ret r10] a `_registerPayment` that cannot be READ is refused durably, in BOTH directions', async () => {
+  // ROUTE: the real `repairXeroBackReferences` over a SYNCED SALES_INVOICE, with the mapping
+  // CORRECTLY CONFIGURED (`card: BANK-1`) and a readable amount — so nothing below can be the
+  // mapping refusal or the round-8 amount refusal, and the ONLY thing standing between this row and
+  // a settlement is the request flag. The real receipt fence runs and the real
+  // `releaseFollowUpObligation` is the only thing that can clear the marker column read below.
+  //
+  // MUTATION THAT KILLS IT: in lib/domain/accounting/followup-enqueue-outcome.ts, replace the body
+  // of `payloadPaymentRequested` with `return { value: Boolean(payload._registerPayment) }` — the
+  // shipped truthiness test. The four FALSY arms then settle (the marker is cleared and the refusal
+  // count drops to 0) and the two TRUTHY-MALFORMED arms create an INVOICE_PAYMENT row, so
+  // `followUpTypes` fails naming the shape.
+  //
+  // BOTH DIRECTIONS ARE WALKED because truthiness fails both ways and a guard written only against
+  // `null` would pass a test that only drove falsy values.
+  for (const { what, flag, detail } of [
+    { what: 'a present null — something wrote nothing into it', flag: { _registerPayment: null }, detail: /`_registerPayment` is null, which is neither `true` nor `false`/ },
+    { what: 'a present 0', flag: { _registerPayment: 0 }, detail: /`_registerPayment` is 0, which is neither `true` nor `false`/ },
+    { what: 'a present empty string', flag: { _registerPayment: '' }, detail: /`_registerPayment` is the string "", which is neither `true` nor `false`/ },
+    { what: 'a key present holding an explicit `undefined` — present, and not absent', flag: { _registerPayment: undefined }, detail: /`_registerPayment` is present and holds `undefined`, which is neither `true` nor `false`/ },
+    { what: 'the MALFORMED TRUTHY string "false", which truthiness let INTO payment registration', flag: { _registerPayment: 'false' }, detail: /`_registerPayment` is the string "false", which is neither `true` nor `false`/ },
+    { what: 'a present 1 — the other truthy malformed value', flag: { _registerPayment: 1 }, detail: /`_registerPayment` is 1, which is neither `true` nor `false`/ },
+  ]) {
+    reset({ card: 'BANK-1' })
+    store = createSyncLogStore([syncLogRow({
+      ...SALES_CANDIDATE,
+      payload: {
+        invoiceNumber: 'INV-1',
+        currency: 'GBP',
+        _paymentMethod: 'card',
+        _paymentAmount: 120,
+        _paymentDate: '2026-08-20',
+        ...flag,
+      },
+    })])
+
+    await (await loadSweep())()
+
+    assert.equal(
+      salesOrders.get('order-1')?.accountingInvoiceId, 'XERO-INV-1',
+      `PRECONDITION (${what}): the repair really ran — otherwise nothing below is about the enqueue`,
+    )
+    assert.deepEqual(
+      followUpTypes(), ['INVOICE_PDF'],
+      `no INVOICE_PAYMENT row is created (${what}) — an unreadable request is not a YES either, and a `
+        + 'receipt registered on the strength of a corrupt byte is real money against a real invoice',
+    )
+
+    const refusal = paymentRefusals()
+    assert.equal(refusal.length, 1, `the operator is told once, and told why (${what})`)
+    assert.equal(
+      refusal[0].metadata?.reason, 'payment_payload_unreadable',
+      `and it is the CORRUPT-PAYLOAD refusal (${what}), not the mapping one — the mapping is correct here`,
+    )
+    assert.match(refusal[0].description, detail, `the sentence names the field and what it holds (${what})`)
+    assert.match(
+      refusal[0].description, /AN UNREADABLE REQUEST IS NOT A "NO"/,
+      `and says which of the three facts this is (${what})`,
+    )
+    assert.doesNotMatch(
+      refusal[0].description, /the invoice asked for a payment to be registered/,
+      `and does NOT assert the thing it is refusing over (${what}): whether the invoice asked is the `
+        + 'very fact that could not be read, so round 8\'s opening clause would be a lie here',
+    )
+    assert.match(refusal[0].description, /ESCALATE/, `the remedy is escalation, not a setting (${what})`)
+
+    assert.notEqual(
+      marker(), null,
+      `THE FINDING (${what}): the row must still say it owes follow-ups, or the sweep that is this `
+        + "connector's whole recovery story stops selecting it",
+    )
+    assert.equal(
+      store.get('log-1')?.backReferenceCheckedAt, null,
+      `and it is left in the sweep candidate set (${what})`,
+    )
+  }
+})
+
+test('[o3d-batch-ret r10] CONTROL: ABSENT and literal `false` still settle, and literal `true` still resolves the amount', async () => {
+  // Without this the test above passes on a build that refuses EVERY payload — which would refuse
+  // every invoice IMS raises itself (the ordinary sales path composes payloads with no
+  // `_registerPayment` key at all) and is a worse failure than the one being fixed.
+  //
+  // THREE ARMS, WHICH ARE THE THREE READABLE ANSWERS: absent means the payload does not use the
+  // mechanism; a literal `false` is that same statement made explicitly (the WooCommerce importer
+  // persists `!!date_paid_gmt && documentTotalsToTheOrder`, so an unpaid order really does write
+  // one); and a literal `true` must still reach the amount resolution and queue the payment.
+  //
+  // ROUTE: one real sweep run per arm, mapping configured so an enqueue is possible.
+  // MUTATIONS THAT KILL IT: make `payloadPaymentRequested` refuse on an ABSENT key — arm 1 refuses;
+  // drop the `value === false` arm so only `true` is readable — arm 2 refuses; make it answer
+  // `{ value: false }` for a literal `true` — arm 3 queues no INVOICE_PAYMENT.
+  for (const { what, flag, expected, amount } of [
+    { what: 'no `_registerPayment` key at all', flag: {}, expected: ['INVOICE_PDF'], amount: null },
+    { what: 'a literal `false`', flag: { _registerPayment: false }, expected: ['INVOICE_PDF'], amount: null },
+    { what: 'a literal `true`', flag: { _registerPayment: true }, expected: ['INVOICE_PAYMENT', 'INVOICE_PDF'], amount: 120 },
+  ]) {
+    reset({ card: 'BANK-1' })
+    store = createSyncLogStore([syncLogRow({
+      ...SALES_CANDIDATE,
+      payload: {
+        invoiceNumber: 'INV-1',
+        currency: 'GBP',
+        _paymentMethod: 'card',
+        _paymentAmount: 120,
+        _paymentDate: '2026-08-20',
+        ...flag,
+      },
+    })])
+
+    await (await loadSweep())()
+
+    assert.equal(
+      salesOrders.get('order-1')?.accountingInvoiceId, 'XERO-INV-1',
+      `PRECONDITION (${what}): the repair really ran`,
+    )
+    assert.deepEqual(paymentRefusals(), [], `a flag that CAN be read is not refused (${what})`)
+    assert.deepEqual(followUpTypes(), expected, `and the follow-ups are the ones the flag calls for (${what})`)
+    if (amount !== null) {
+      const payment = store.rows.find((row) => row.type === 'INVOICE_PAYMENT')
+      assert.equal(
+        (payment?.payload as { amount?: unknown } | undefined)?.amount, amount,
+        `a literal true still resolves the amount exactly as before (${what}) — the classifier gates `
+          + 'the decision, it does not change what a readable request does with it',
+      )
+    }
+    assert.equal(marker(), null, `and the obligation IS discharged (${what})`)
+  }
+})
+
+/**
+ * o3d-batch-ret ROUND 10 — AND THE THREE FIELDS BESIDE THE FLAG, WHICH NOBODY HAD LOOKED AT.
+ *
+ * Codex asked for the BOUNDARY rather than the field, and the enumeration found three more reads
+ * with the same shape: `payload._paymentMethod as string || ''`, `payload.currency as string ||
+ * 'GBP'` and `(payload._paymentDate as string)?.slice(0, 10) || <today>`. Each conflated an absent
+ * key with a present value nothing could read, and two of them are worse than a lost obligation:
+ *
+ *   • a present unreadable `currency` became `GBP`, and `lookupPaymentAccount` keys the BANK ACCOUNT
+ *     on it — so the money is registered into the sterling account and written onto the row as
+ *     sterling, which is a wrong settlement rather than a missing one;
+ *   • a present non-string `_paymentDate` did not default at all, it raised
+ *     `TypeError: .slice is not a function` — and on THIS driver that throw is inside the sweep,
+ *     which is meant to be the recovery path for rows nothing else re-drives.
+ */
+test('[o3d-batch-ret r10] every OTHER field this path reads is refused when present and unreadable', async () => {
+  // ROUTE: the real `repairXeroBackReferences`, mapping CORRECTLY CONFIGURED and `_paymentAmount:
+  // 120` readable — so the amount and the mapping are both fine and the only thing refusing is the
+  // field under test.
+  //
+  // MUTATION THAT KILLS IT: in lib/connectors/xero/sync-processor.ts, restore the inline reads —
+  // `const method = payload._paymentMethod as string || ''`, `const currency = payload.currency as
+  // string || 'GBP'`, `paymentDate: (payload._paymentDate as string)?.slice(0, 10) || new
+  // Date().toISOString().slice(0, 10)` — and read them instead of the classifier's values. The two
+  // null arms and the `''` currency then queue an INVOICE_PAYMENT against the GBP account and clear
+  // the marker, the `'20/08/2026'` arm queues one dated "20/08/2026", and the numeric-date arm
+  // throws instead of refusing. Every arm fails on `followUpTypes` or on the refusal count.
+  for (const { what, field, detail } of [
+    { what: 'a present `_paymentMethod` holding null', field: { _paymentMethod: null }, detail: /`_paymentMethod` is null, which is not a payment-method string/ },
+    { what: 'a `_paymentMethod` that is not a string at all', field: { _paymentMethod: 7 }, detail: /`_paymentMethod` is 7, which is not a payment-method string/ },
+    { what: 'a present `currency` holding null — the arm that used to settle into the STERLING account', field: { currency: null }, detail: /`currency` is null, which is not a currency code/ },
+    { what: 'a present `currency` holding an empty string', field: { currency: '' }, detail: /`currency` is the string "", which is not a currency code/ },
+    { what: 'a present `_paymentDate` holding null', field: { _paymentDate: null }, detail: /`_paymentDate` is null, which is not a date string/ },
+    { what: 'a `_paymentDate` that is a NUMBER — the arm that used to throw a TypeError inside the sweep', field: { _paymentDate: 20260820 }, detail: /`_paymentDate` is 20260820, which is not a date string/ },
+    { what: 'a `_paymentDate` string that is not a ledger date', field: { _paymentDate: '20/08/2026' }, detail: /`_paymentDate` is the string "20\/08\/2026", whose first ten characters are not a YYYY-MM-DD date/ },
+  ]) {
+    reset({ card: 'BANK-1' })
+    store = createSyncLogStore([syncLogRow({
+      ...SALES_CANDIDATE,
+      payload: {
+        invoiceNumber: 'INV-1',
+        currency: 'GBP',
+        _registerPayment: true,
+        _paymentMethod: 'card',
+        _paymentAmount: 120,
+        _paymentDate: '2026-08-20',
+        ...field,
+      },
+    })])
+
+    await (await loadSweep())()
+
+    assert.equal(
+      salesOrders.get('order-1')?.accountingInvoiceId, 'XERO-INV-1',
+      `PRECONDITION (${what}): the repair really ran — otherwise nothing below is about the enqueue`,
+    )
+    assert.deepEqual(
+      followUpTypes(), ['INVOICE_PDF'],
+      `no INVOICE_PAYMENT row is created (${what}) — a payment registered against a value the payload `
+        + 'does not state is a WRONG settlement, which is worse than a withheld one',
+    )
+
+    const refusal = paymentRefusals()
+    assert.equal(refusal.length, 1, `the operator is told once, and told why (${what})`)
+    assert.equal(
+      refusal[0].metadata?.reason, 'payment_payload_unreadable',
+      `and it is the CORRUPT-PAYLOAD refusal (${what}), not the mapping one`,
+    )
+    assert.match(refusal[0].description, detail, `the sentence names the field and what it holds (${what})`)
+    assert.match(
+      refusal[0].description, /AN UNREADABLE FIELD IS NOT ITS DEFAULT/,
+      `and says which of the three facts this is (${what}) — the amount read perfectly well here`,
+    )
+
+    assert.notEqual(marker(), null, `THE FINDING (${what}): the obligation marker SURVIVES`)
+    assert.equal(
+      store.get('log-1')?.backReferenceCheckedAt, null,
+      `and it is left in the sweep candidate set (${what})`,
+    )
+  }
+})
+
+test('[o3d-batch-ret r10] CONTROL: an ABSENT method, currency or date still takes its documented default', async () => {
+  // Without this, the test above passes on a build that refuses every payload that omits an optional
+  // field — and the WooCommerce importer writes `wcOrder.payment_method || undefined` and
+  // `wcOrder.date_paid_gmt || undefined`, which JSON DROPS, so absence is the ordinary case and
+  // refusing it would refuse real orders.
+  //
+  // EACH ARM PROVES THE DEFAULT WAS TAKEN, not merely that nothing refused:
+  //   • an absent `_paymentMethod` resolves to `''`, so the row reaches the MAPPING refusal naming an
+  //     empty method — readable, and a different refusal from the payload one;
+  //   • an absent `currency` is registered as GBP, read off the queued row;
+  //   • an absent `_paymentDate` is registered as today, read off the queued row.
+  //
+  // MUTATION THAT KILLS IT: make `payloadPaymentMethod`, `payloadPaymentCurrency` or
+  // `payloadPaymentDate` answer `unreadableField(...)` for an ABSENT key — each arm then produces a
+  // `payment_payload_unreadable` refusal instead of the outcome asserted here.
+  const today = new Date().toISOString().slice(0, 10)
+  for (const { what, drop, expected, assertRow } of [
+    {
+      what: 'no `_paymentMethod` key at all',
+      drop: '_paymentMethod',
+      expected: ['INVOICE_PDF'],
+      assertRow: null,
+    },
+    {
+      what: 'no `currency` key at all',
+      drop: 'currency',
+      expected: ['INVOICE_PAYMENT', 'INVOICE_PDF'],
+      assertRow: { currency: 'GBP' },
+    },
+    {
+      what: 'no `_paymentDate` key at all',
+      drop: '_paymentDate',
+      expected: ['INVOICE_PAYMENT', 'INVOICE_PDF'],
+      assertRow: { paymentDate: today },
+    },
+  ]) {
+    reset({ card: 'BANK-1' })
+    const payload: Record<string, unknown> = {
+      invoiceNumber: 'INV-1',
+      currency: 'GBP',
+      _registerPayment: true,
+      _paymentMethod: 'card',
+      _paymentAmount: 120,
+      _paymentDate: '2026-08-20',
+    }
+    delete payload[drop]
+    assert.ok(!Object.hasOwn(payload, drop), `PRECONDITION (${what}): the key really is absent, not merely undefined`)
+    store = createSyncLogStore([syncLogRow({ ...SALES_CANDIDATE, payload })])
+
+    await (await loadSweep())()
+
+    assert.equal(
+      salesOrders.get('order-1')?.accountingInvoiceId, 'XERO-INV-1',
+      `PRECONDITION (${what}): the repair really ran`,
+    )
+    assert.deepEqual(followUpTypes(), expected, `the follow-ups are the ones the default calls for (${what})`)
+    const refusal = paymentRefusals()
+    for (const entry of refusal) {
+      assert.notEqual(
+        entry.metadata?.reason, 'payment_payload_unreadable',
+        `an ABSENT key is never the corrupt-payload refusal (${what}) — absence is a legitimate `
+          + 'instruction to take the default, which is the whole distinction rounds 9 and 10 rest on',
+      )
+    }
+    if (assertRow === null) {
+      assert.equal(refusal.length, 1, `the absent method reaches the MAPPING refusal instead (${what})`)
+      assert.equal(refusal[0].metadata?.reason, 'payment_account_unmapped', `and it is that one (${what})`)
+      assert.match(
+        refusal[0].description, /no bank account is mapped for method "" \/ currency "GBP"/,
+        `naming the empty method it really resolved to (${what})`,
+      )
+    } else {
+      assert.deepEqual(refusal, [], `nothing is refused (${what})`)
+      const row = (store.rows.find((r) => r.type === 'INVOICE_PAYMENT')?.payload ?? {}) as Record<string, unknown>
+      for (const [key, value] of Object.entries(assertRow)) {
+        assert.equal(row[key], value, `the default really was written onto the queued row (${what})`)
+      }
+      assert.equal(marker(), null, `and the obligation IS discharged (${what})`)
+    }
+  }
+})
