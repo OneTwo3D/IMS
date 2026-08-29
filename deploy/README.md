@@ -67,6 +67,14 @@ sudo -u ims bash -lc 'cd /opt/ims/onetwo3d-ims && git pull && npm ci && npm run 
 sudo systemctl restart ims-stage
 ```
 
+The `restart` is not optional and `start` will not do: a running process is not
+replaced by a `start`, so a rebuilt tree with the old process still up leaves
+that process on whatever crontab lock path the *old* build derived — while
+anything that reconciles the crontab afterwards (a scheduler save, or
+`scripts/install.sh`) locks the new one. Two locks that do not exclude each
+other silently lose one side's managed block. The installer does this for you
+and aborts if the restart fails; a hand-deploy must not skip it.
+
 ## Tuning notes
 
 - **Writable paths**: `ProtectSystem=strict` makes everything read-only except the
