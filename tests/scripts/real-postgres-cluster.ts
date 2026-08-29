@@ -19,7 +19,7 @@
  */
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:net'
 import { join } from 'node:path'
 
@@ -102,7 +102,28 @@ export function cleanLibpqEnv(): NodeJS.ProcessEnv {
  * generated pg_hba.conf, so they win over the `--auth-host` default below — which is how a
  * `trust` rule on one database and scram on the rest is expressed.
  */
-export function startCluster(root: string, name: string, port: number, listen: string, hbaHostLines: string[] = []): Cluster {
+export interface ClusterOptions {
+  /**
+   * Generate a self-signed certificate and start with `ssl = on` (r41).
+   *
+   * Debian's packaged cluster ships `ssl = on`, and libpq's default `sslmode=prefer` therefore
+   * negotiates TLS on every ordinary install this script performs -- while an `initdb` cluster
+   * ships `ssl = off` and never does. A regression suite that only ever runs the second one leaves
+   * the transport the real installations use completely unmeasured, and the pg_hba record matched
+   * over TLS is a DIFFERENT record from the one matched in the clear wherever `hostssl` and
+   * `hostnossl` are both present.
+   */
+  readonly ssl?: boolean
+}
+
+export function startCluster(
+  root: string,
+  name: string,
+  port: number,
+  listen: string,
+  hbaHostLines: string[] = [],
+  options: ClusterOptions = {},
+): Cluster {
   const bin = pgBinDir()
   const data = join(root, name, 'data')
   const socket = join(root, name, 'sock')
@@ -120,6 +141,18 @@ export function startCluster(root: string, name: string, port: number, listen: s
     // FIRST, because PostgreSQL takes the FIRST matching record and stops. Appending would be a
     // test that silently measures the default.
     writeFileSync(hba, `${hbaHostLines.join('\n')}\n${readFileSync(hba, 'utf8')}`)
+  }
+  if (options.ssl === true) {
+    // The default ssl_cert_file/ssl_key_file are `server.crt`/`server.key` in the data directory,
+    // so naming them is enough; the key must be 0600 or the postmaster refuses to start.
+    execFileSync('openssl', [
+      'req', '-new', '-x509', '-days', '2', '-nodes',
+      '-subj', '/CN=localhost',
+      '-keyout', join(data, 'server.key'),
+      '-out', join(data, 'server.crt'),
+    ], { stdio: 'pipe' })
+    chmodSync(join(data, 'server.key'), 0o600)
+    writeFileSync(join(data, 'postgresql.conf'), `${readFileSync(join(data, 'postgresql.conf'), 'utf8')}\nssl = on\n`)
   }
   execFileSync(join(bin, 'pg_ctl'), [
     '-D', data,

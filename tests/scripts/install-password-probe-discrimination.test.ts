@@ -28,6 +28,7 @@
  * `initdb` cluster created in a temporary directory and destroyed in a `finally`.
  */
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -42,11 +43,13 @@ import {
   envDatabaseUrl,
   installVars,
   journalValue,
+  readVar,
   runShipped,
   seedLiveInstallation,
   writeInstalledEnv,
 } from './install-shell-rig.ts'
-import { type Cluster, freePort, startCluster } from './real-postgres-cluster.ts'
+import { type Cluster, cleanLibpqEnv, freePort, startCluster } from './real-postgres-cluster.ts'
+import { type RadiusVerifier, radiusHbaLine, startRadiusVerifier } from './radius-verifier.ts'
 
 /** A `trust` rule covering ONLY the maintenance database — the endpoint the rotation relies on. */
 const TRUST_POSTGRES_ONLY = ['host postgres all 127.0.0.1/32 trust']
@@ -661,6 +664,541 @@ test('r40: the reconciliation asks the RECORDED endpoint, not the one it would h
     assert.match(next.output, /Established on 'ims_spare_probe'/, 'and say so')
     assert.match(next.output, /still has the OLD password/, 'and reach the right answer on it')
     assert.equal(decodeVar(next.output, 'INSTALLED_B64'), 'live-password')
+  } finally {
+    cluster?.stop()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// r41 (Codex HIGH): WHOSE PASSWORD THE ENDPOINT IS CHECKING
+//
+// Everything above proves an endpoint can tell one password from another. None of it proves the
+// password it tells apart is POSTGRESQL'S ROLE CREDENTIAL — the only thing `ALTER ROLE` changes.
+// `ldap`, `pam`, `radius` and `bsd` are password-DEPENDENT and role-credential-INDEPENDENT: under
+// every one of them the negative control refuses the random password, the positive half accepts the
+// asserted one, and the endpoint is admitted while answering about somebody else's store.
+//
+// The five tests below are built on a REAL external verifier (tests/scripts/radius-verifier.ts) for
+// the reason every cluster in this file is real: a stub that refuses everything would make the OLD
+// probe fail on its positive half, so a regression written against it would pass on r40's code and
+// prove nothing. The verifier here says YES to one password and NO to another, and the role's own
+// password is a third thing — which is exactly the gap the outage falls into.
+//
+// A NOTE ON THE VERSIONS. What the tests measure is not this suite's PostgreSQL. It is the
+// Authentication request message of protocol 3.0, which every version this installer meets — 14 on
+// Ubuntu 22.04 through 17 on Debian 13 — sends in the same bytes. That is why the mechanism is the
+// startup exchange and not `pg_hba_file_rules` (a rule listing is not a match), not a catalogue
+// (none names the matched method of a live backend; verified on 17), and not libpq's
+// `require_auth` (absent before libpq 16, which is half the estate).
+// ---------------------------------------------------------------------------
+
+/** The RADIUS secret and the two databases every test below is arranged around. */
+const RADIUS_SECRET = 'a-radius-shared-secret'
+
+/** A connection that states its sslmode, which pg_endpoint_psql cannot: `hostnossl` needs one. */
+function psqlWithSslMode(port: number, password: string, database: string, sslmode: string): boolean {
+  try {
+    execFileSync('psql', [
+      '-X', '-w', '-q', '-tAc', 'SELECT 1',
+      `postgresql://imsuser:${encodeURIComponent(password)}@127.0.0.1:${port}/${database}?sslmode=${sslmode}`,
+    ], { encoding: 'utf8', env: cleanLibpqEnv(), stdio: ['ignore', 'pipe', 'pipe'] })
+    return true
+  } catch {
+    return false
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 10. THE LOAD-BEARING ONE: an external verifier is not admitted as evidence
+// ---------------------------------------------------------------------------
+
+test('r41: an endpoint whose rule is an EXTERNAL verifier is not admitted, and the right password is published', async () => {
+  // CODEX'S SCENARIO, BUILT. `postgres` authenticates through RADIUS; the application database uses
+  // scram. The RADIUS directory knows `live-password` and nothing else. The rotation to
+  // `rotated-secret` COMMITTED and the run then died before `.env` was published — boundary (2),
+  // where the only safe answer is to finish the transition.
+  //
+  // UNDER r40 THAT ENDPOINT IS EVIDENCE AND THE EVIDENCE IS WRONG. RADIUS refuses the random
+  // control and accepts `live-password`, so `postgres` is admitted; it then refuses
+  // `rotated-secret`, because a directory has never heard of an `ALTER ROLE`; so the reconciliation
+  // concludes the ALTER did not commit, publishes the OLD password and CLEARS THE JOURNAL. The
+  // application database now wants the new one. The service cannot start and the record that would
+  // have recovered it has been deleted.
+  //
+  // BOTH HALVES OF THAT ARE MEASURED BELOW rather than asserted in a comment: that r40's pair passes
+  // on the RADIUS endpoint, and that the role's real credential is refused there.
+  //
+  // MUTATION ROUTES (each measured by making the change and re-running):
+  //   1. delete the `db_endpoint_checks_role_verifier "${database}" || continue` line from
+  //      resolve_live_role_password(): `postgres` is admitted on r40's pair, answers `old`, and the
+  //      run publishes `live-password` and clears the journal. This test fails on PROBE_DB, on
+  //      INSTALLED_B64, and on the driver connection at the end — which is the outage itself.
+  //      Test 11 fails with it.
+  //   2. admit AuthenticationCleartextPassword in scripts/lib/pg-auth-request.mjs (return
+  //      verifier 'role' for code 3): identical failures. This is the route a fix that "looks
+  //      right" takes, because cleartext-against-postgres really is role-credential-checked — and
+  //      the wire cannot tell it from this. Tests 11 and 13 fail with it.
+  //   3. make db_endpoint_checks_role_verifier() return 0 whenever the reader cannot be run: the
+  //      gate becomes advisory and route 1's failures reappear on any host without node. Test 15
+  //      is what catches that directly.
+  const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
+  let cluster: Cluster | undefined
+  let radius: RadiusVerifier | undefined
+  try {
+    radius = await startRadiusVerifier(root, RADIUS_SECRET, 'imsuser', 'live-password')
+    cluster = startCluster(root, 'live', await freePort(), '127.0.0.1', [radiusHbaLine('postgres', radius.port, RADIUS_SECRET)])
+    seedLiveInstallation(cluster)
+    writeInstalledEnv(root, cluster.port, 'live-password')
+
+    const interrupted = writeInterruptedJournal(cluster, root, 'rotated-secret', 'postgres')
+    assert.equal(interrupted.status, 0, interrupted.output)
+    // The ALTER committed; the run died before `.env` was replaced.
+    cluster.psql(['-c', "ALTER USER imsuser WITH PASSWORD 'rotated-secret'"])
+
+    const next = runShipped(installVars(cluster, root), `
+      # PRECONDITION 1, MEASURED: r40's pair PASSES on the RADIUS endpoint. If it did not, this
+      # cluster would not be the configuration the finding is about.
+      if db_endpoint_discriminates_passwords postgres "live-password"; then
+        echo "R40_PAIR_PASSES_ON_RADIUS=yes"
+      else
+        echo "R40_PAIR_PASSES_ON_RADIUS=no"
+      fi
+      # PRECONDITION 2, MEASURED: and it is wrong. The role's ACTUAL credential — the one the ALTER
+      # committed — is refused there, because the directory never heard of the ALTER.
+      if db_endpoint_accepts_password postgres "rotated-secret"; then
+        echo "RADIUS_KNOWS_THE_ROLES_PASSWORD=yes"
+      else
+        echo "RADIUS_KNOWS_THE_ROLES_PASSWORD=no"
+      fi
+      ${NEXT_RUN_BODY}
+      echo "PROBE_DB=\${DB_ROTATION_PROBE_DATABASE}"
+      echo "REPORT_B64=$(printf '%s' "\${DB_PROBE_REPORT}" | base64 | tr -d '\\n')"
+    `)
+    assert.match(next.output, /R40_PAIR_PASSES_ON_RADIUS=yes/, 'precondition: the external verifier must look exactly like a healthy endpoint to r40')
+    assert.match(next.output, /RADIUS_KNOWS_THE_ROLES_PASSWORD=no/, 'precondition: and it must be answering about a different credential entirely')
+
+    assert.equal(next.status, 0, `the run must resolve on the endpoint that checks the ROLE:\n${next.output}`)
+    assert.match(next.output, /PROBE_DB=one_two_inventory/, 'the RADIUS endpoint must not be the one that answered')
+    assert.match(next.output, /server has the NEW password/, 'and the answer must be the true one: the ALTER committed')
+    assert.equal(decodeVar(next.output, 'INSTALLED_B64'), 'rotated-secret')
+    assert.match(next.output, /JOURNAL_LEFT=no/, 'the transition is finished, so the record goes')
+
+    // AND THE REFUSAL IS EXPLAINED WHERE AN OPERATOR WOULD LOOK.
+    const report = Buffer.from(decodeVar(next.output, 'REPORT_B64'), 'utf8').toString('utf8')
+    assert.match(report, /'postgres' does not authenticate 'imsuser' against PostgreSQL's own role credential/, 'the report must name the endpoint that was dropped')
+    assert.match(report, /the matched pg_hba method reads as 'password-or-external'/, 'and the method the server itself announced')
+    assert.match(report, /`password`, `ldap`, `pam`, `radius` and `bsd` all ask for/, 'and why that message cannot be resolved further')
+
+    // THE VERIFIER WAS ACTUALLY CONSULTED, so the endpoint really was external and this test is not
+    // quietly measuring a cluster where the rule failed to load.
+    const asked = radius.asked()
+    assert.ok(asked.some((line) => line.startsWith('imsuser ')), `the RADIUS directory must have been asked about the role: ${JSON.stringify(asked)}`)
+    assert.ok(asked.includes('imsuser accept'), 'and it must have ACCEPTED one of the passwords, which is what made r40 believe it')
+    assert.ok(asked.includes('imsuser reject'), 'and refused another, which is what made r40 believe it was discriminating')
+
+    // AND THE FILE THE SERVICE RESTARTS FROM OPENS A CONNECTION, which under r40 it would not.
+    assert.equal(await connectWithDriver(envDatabaseUrl(root)), 'imsuser')
+  } finally {
+    cluster?.stop()
+    await radius?.stop()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 11. And when the external verifier is the ONLY reachable endpoint: refuse, and keep the record
+// ---------------------------------------------------------------------------
+
+test('r41: with only an external verifier reachable the reconciliation REFUSES and keeps both candidates', async () => {
+  // THE SAME CLUSTER WITH THE FENCE STANDING, which is the state a reconciliation actually runs in:
+  // the interrupted run revoked CONNECT on the application database and never got to release it. So
+  // the only endpoint `imsuser` can reach is the RADIUS one, and r40 would have taken its answer.
+  //
+  // THE ALTER DID NOT COMMIT here, and RADIUS says `live-password` — so r40's answer would have been
+  // RIGHT BY LUCK and the journal would have been cleared on evidence that proves nothing. This
+  // round refuses instead, because "the directory happens to agree today" is not a property any
+  // future run can rely on, and clearing the journal is the irreversible half.
+  //
+  // MUTATION ROUTES (each measured by making the change and re-running):
+  //   1. delete the method gate from resolve_live_role_password(): the RADIUS endpoint is admitted,
+  //      the run resolves `old`, publishes it and CLEARS THE JOURNAL. This test fails on its status
+  //      assertion, on JOURNAL_LEFT and on RECONCILED. Test 10 fails with it.
+  //   2. admit AuthenticationCleartextPassword in the reader: identical failures.
+  //   3. drop the negative control from db_endpoint_discriminates_passwords(): nothing here fails —
+  //      the method gate has already refused the only endpoint that could answer. Tests 1, 2 and 3
+  //      are what catch that route; recorded so the next reader does not look for it here.
+  const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
+  let cluster: Cluster | undefined
+  let radius: RadiusVerifier | undefined
+  try {
+    radius = await startRadiusVerifier(root, RADIUS_SECRET, 'imsuser', 'live-password')
+    cluster = startCluster(root, 'live', await freePort(), '127.0.0.1', [radiusHbaLine('postgres', radius.port, RADIUS_SECRET)])
+    seedLiveInstallation(cluster)
+    writeInstalledEnv(root, cluster.port, 'live-password')
+
+    const interrupted = writeInterruptedJournal(cluster, root, 'rotated-secret', 'postgres')
+    assert.equal(interrupted.status, 0, interrupted.output)
+    // THE FENCE, as the interrupted run left it: the application database is closed to the role.
+    cluster.psql(['-c', 'REVOKE CONNECT ON DATABASE one_two_inventory FROM PUBLIC'])
+    cluster.psql(['-c', 'REVOKE CONNECT ON DATABASE one_two_inventory FROM imsuser'])
+
+    const next = runShipped(installVars(cluster, root), `
+      if db_endpoint_discriminates_passwords postgres "live-password"; then
+        echo "R40_WOULD_HAVE_ANSWERED=yes"
+      else
+        echo "R40_WOULD_HAVE_ANSWERED=no"
+      fi
+      if db_endpoint_accepts_password one_two_inventory "live-password"; then
+        echo "APP_DB_REACHABLE=yes"
+      else
+        echo "APP_DB_REACHABLE=no"
+      fi
+      ${NEXT_RUN_BODY}
+    `)
+    assert.match(next.output, /R40_WOULD_HAVE_ANSWERED=yes/, 'precondition: r40 would have adopted this endpoint, or this test is about nothing')
+    assert.match(next.output, /APP_DB_REACHABLE=no/, 'precondition: and the fence must leave nothing else to ask')
+
+    assert.equal(next.status, 9, `an answer from a directory is not an answer about the role:\n${next.output}`)
+    assert.match(next.output, /could not find a single endpoint that both checks POSTGRESQL'S OWN role credential/, 'for the reason the finding names')
+    assert.match(next.output, /an ldap, pam, radius or bsd rule answers confidently about a password held somewhere ALTER ROLE cannot reach/, 'and it says which shape of rule it refused')
+    assert.match(next.output, /the matched pg_hba method reads as 'password-or-external'/, 'naming what the server itself announced')
+    assert.match(next.output, /LEFT IN PLACE/, 'and the record is kept')
+    assert.doesNotMatch(next.output, /RECONCILED=true/, 'nothing past the refusal ran')
+
+    // BOTH CANDIDATES SURVIVE, which is the whole reason the refusal is preferable to the lucky
+    // right answer: the next operator still has them.
+    assert.equal(Buffer.from(journalValue(root, 'old_password_b64')!, 'base64').toString('utf8'), 'live-password')
+    assert.equal(Buffer.from(journalValue(root, 'new_password_b64')!, 'base64').toString('utf8'), 'rotated-secret')
+    assert.equal(envDatabaseUrl(root), `postgresql://imsuser:live-password@127.0.0.1:${cluster.port}/one_two_inventory`, 'and .env was not republished')
+  } finally {
+    cluster?.stop()
+    await radius?.stop()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 12. THE OTHER SIDE OF IT: an ordinary scram-sha-256 endpoint still qualifies
+// ---------------------------------------------------------------------------
+
+test('r41: an ordinary scram-sha-256 endpoint still qualifies and the rotation proceeds', async () => {
+  // THE COST OF THE RULE, MEASURED. A gate that refuses more than it should is this branch's other
+  // failure mode — "a refusal whose precondition nobody can satisfy" — and every ordinary
+  // installation this script performs runs on exactly the cluster below: initdb's default, which is
+  // `scram-sha-256` for host connections. So this test is the one that would go red if the new gate
+  // were too strict, and it drives the WHOLE rotation rather than the gate alone: the ALTER
+  // commits, `.env` is republished, the journal is cleared, and the installed driver opens a
+  // connection with the credential the file names.
+  //
+  // MUTATION ROUTES (each measured by making the change and re-running):
+  //   1. make db_endpoint_checks_role_verifier() `return 1` unconditionally: no endpoint qualifies,
+  //      the rotation refuses before the ALTER, and this test fails on the run's status, on ROTATED
+  //      and on the driver connection. Ten other tests fail with it, which is the correct blast
+  //      radius for disabling the gate.
+  //   2. require `verifier=external` instead of `verifier=role` in the reader's exit status: same
+  //      failures here.
+  //   3. point db_auth_request_probe_path() at ${APP_DIR} instead of the release's own lib
+  //      directory: the reader is not there, the gate refuses, same failures. Test 15 is the one
+  //      that states that refusal's message.
+  const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
+  let cluster: Cluster | undefined
+  try {
+    cluster = startCluster(root, 'live', await freePort(), '127.0.0.1')
+    seedLiveInstallation(cluster)
+    writeInstalledEnv(root, cluster.port, 'live-password')
+
+    const run = runShipped({ ...installVars(cluster, root), DB_PASSWORD: 'rotated-secret' }, `
+      # WHAT THE SERVER SAID, printed rather than inferred: this is the fact the whole gate rests on.
+      node "$(db_auth_request_probe_path)" --host="\${DB_HOST}" --port="\${DB_PORT}" --user="\${DB_USER}" --database=postgres > "\${APP_DIR}/reader.out" 2>&1 || true
+      echo "READER_B64=$(base64 -w0 < "\${APP_DIR}/reader.out")"
+      ${REINSTALL_BODY}
+      FENCE_ARMED=true
+      DB_FENCE_UP=true
+      rotate_database_password_in_fenced_window
+      echo "GATE_PROBE_DB=\${DB_ROTATION_PROBE_DATABASE}"
+      echo "ROTATED=\${DB_ROLE_CREDENTIALS_ROTATED}"
+    `)
+    const reader = Buffer.from(readVar(run.output, 'READER_B64'), 'base64').toString('utf8')
+    assert.match(reader, /^method=scram-sha-256$/m, 'precondition: the default cluster must present the method this gate admits')
+    assert.match(reader, /^verifier=role$/m, 'and the reader must classify it as the role\'s own credential')
+    assert.match(reader, /pg_authid\.rolpassword/, 'and say which secret that is')
+
+    assert.equal(run.status, 0, `an ordinary cluster must still rotate:\n${run.output}`)
+    assert.match(run.output, /GATE_PROBE_DB=postgres/, 'on the maintenance database, which is where the gate looks first')
+    assert.match(run.output, /ROTATED=true/, 'and the ALTER must have run')
+    assert.match(run.output, /Rotation endpoint proven: on 'postgres' the server itself named a/, 'and the run must say what it established')
+    assert.equal(await connectWithDriver(envDatabaseUrl(root)), 'imsuser', 'and the published file must open a connection')
+    assert.match(envDatabaseUrl(root), /rotated-secret/, 'with the credential the ALTER installed')
+  } finally {
+    cluster?.stop()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 13. THE NARROWING, STATED: `password` checks the role's own secret and is refused anyway
+// ---------------------------------------------------------------------------
+
+test('r41: a cleartext `password` rule is refused too, because the wire cannot tell it from ldap', async () => {
+  // THIS IS THE PRICE OF THE MECHANISM AND IT IS PAID DELIBERATELY. `password` in pg_hba.conf
+  // compares the supplied plaintext against pg_authid.rolpassword — it IS role-credential-checked,
+  // and an answer from it would have been sound. But it asks for the plaintext with
+  // AuthenticationCleartextPassword, which is the same message `ldap`, `pam`, `radius` and `bsd`
+  // send, and must be: an external verifier can only be consulted with the plaintext. Nothing in
+  // the protocol separates the safe one from the four unsafe ones, so all five are refused.
+  //
+  // The test exists so that the narrowing is a measured property and not a paragraph. It measures
+  // that this endpoint genuinely DOES discriminate — r40's pair passes on it — and that the run
+  // refuses regardless, naming the ambiguity as the reason.
+  //
+  // MUTATION ROUTES (each measured by making the change and re-running):
+  //   1. return verifier 'role' for authentication request 3 in scripts/lib/pg-auth-request.mjs:
+  //      the endpoint is admitted, the rotation proceeds, and this test fails on its status
+  //      assertion and on ROTATED_ANYWAY. Test 10 fails with it — which is the point: the two
+  //      failures together are why the narrowing is not negotiable.
+  //   2. drop the `password-or-external` branch entirely so the reader falls through to its
+  //      unrecognised-code answer: this test still passes on status but fails on the two
+  //      assertions that quote the explanation, which is what an operator has to act on.
+  const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
+  let cluster: Cluster | undefined
+  try {
+    cluster = startCluster(root, 'live', await freePort(), '127.0.0.1', ['host postgres all 127.0.0.1/32 password'])
+    seedLiveInstallation(cluster)
+    writeInstalledEnv(root, cluster.port, 'live-password')
+
+    const run = runShipped({ ...installVars(cluster, root), DB_PASSWORD: 'rotated-secret' }, `
+      # PRECONDITION, MEASURED: r40's pair passes here. A cleartext rule really does check the
+      # role's password, so this is a sound endpoint being refused for what it cannot prove.
+      if db_endpoint_discriminates_passwords postgres "live-password"; then
+        echo "R40_PAIR_PASSES=yes"
+      else
+        echo "R40_PAIR_PASSES=no"
+      fi
+      ${REINSTALL_BODY}
+      FENCE_ARMED=true
+      DB_FENCE_UP=true
+      rotate_database_password_in_fenced_window
+      echo "ROTATED_ANYWAY"
+    `)
+    assert.match(run.output, /R40_PAIR_PASSES=yes/, 'precondition: a `password` rule must discriminate, or this test is not about the narrowing')
+
+    assert.equal(run.status, 9, `an ambiguous authentication request is not evidence:\n${run.output}`)
+    assert.doesNotMatch(run.output, /ROTATED_ANYWAY/, 'and nothing past the refusal ran')
+    assert.match(run.output, /the matched pg_hba method reads as 'password-or-external'/, 'the refusal names what the server announced')
+    assert.match(run.output, /an external verifier has to be handed the plaintext, so it must ask for the plaintext/, 'and why the five cannot be separated')
+    assert.match(run.output, /THE ALTER HAS NOT BEEN ISSUED/, 'and says the role still holds the credential .env names')
+
+    // AND THE ROLE IS UNTOUCHED, which is what makes refusing cheap.
+    assert.equal(await connectWithDriver(envDatabaseUrl(root)), 'imsuser')
+    assert.match(envDatabaseUrl(root), /live-password/, 'the file still names the credential the server has')
+  } finally {
+    cluster?.stop()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 14. THE TRANSPORT: a hostssl rule is what a real install matches, and what the reader must read
+// ---------------------------------------------------------------------------
+
+test('r41: the reader negotiates TLS the way libpq prefers, so it reads the hostssl record psql matched', async () => {
+  // THE GAP A GREEN SUITE WOULD HAVE HIDDEN. An `initdb` cluster ships `ssl = off`, so every test
+  // above negotiates in the clear. DEBIAN'S PACKAGED CLUSTER SHIPS `ssl = on`, and libpq's default
+  // `sslmode=prefer` -- which is what every psql this installer runs uses -- therefore negotiates
+  // TLS on every real installation. `hostssl` and `hostnossl` are DIFFERENT RECORDS, so a reader
+  // that skipped the SSLRequest would read one rule while the psql beside it authenticated under
+  // another.
+  //
+  // The cluster below admits SSL connections under `scram-sha-256` and REJECTS everything else, so
+  // the reader has to negotiate TLS to learn anything at all: in the clear the server would answer
+  // its startup message with an ErrorResponse and no method would be readable.
+  //
+  // MUTATION ROUTES (each measured by making the change and re-running):
+  //   1. skip the SSLRequest in scripts/lib/pg-auth-request.mjs and send the startup message
+  //      straight down the socket: the server refuses the connection outright, the reader answers
+  //      method=none, the gate refuses and the rotation refuses. This test fails on the reader
+  //      assertions, on the run's status and on ROTATED. Nothing else fails, because nothing else
+  //      in this suite runs a TLS-capable cluster -- which is exactly why this test exists.
+  //   2. answer `N` unconditionally instead of reading the server's byte: identical failures.
+  const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
+  let cluster: Cluster | undefined
+  try {
+    cluster = startCluster(root, 'live', await freePort(), '127.0.0.1', [
+      'hostssl all all 127.0.0.1/32 scram-sha-256',
+      'hostnossl all all 127.0.0.1/32 reject',
+    ], { ssl: true })
+    seedLiveInstallation(cluster)
+    writeInstalledEnv(root, cluster.port, 'live-password')
+
+    // PRECONDITIONS, MEASURED FROM OUTSIDE THE SHELL because pg_endpoint_psql cannot state an
+    // sslmode: only the TLS transport reaches a rule at all here, and that rule checks the password.
+    assert.equal(psqlWithSslMode(cluster.port, 'live-password', 'postgres', 'disable'), false,
+      'precondition: a cleartext connection must reach no usable record')
+    assert.equal(psqlWithSslMode(cluster.port, 'live-password', 'postgres', 'require'), true,
+      'precondition: and the TLS record must accept the live credential')
+
+    const run = runShipped({ ...installVars(cluster, root), DB_PASSWORD: 'rotated-secret' }, `
+      node "$(db_auth_request_probe_path)" --host="\${DB_HOST}" --port="\${DB_PORT}" --user="\${DB_USER}" --database=postgres > "\${APP_DIR}/reader.out" 2>&1 || true
+      echo "READER_B64=$(base64 -w0 < "\${APP_DIR}/reader.out")"
+      ${REINSTALL_BODY}
+      FENCE_ARMED=true
+      DB_FENCE_UP=true
+      rotate_database_password_in_fenced_window
+      echo "GATE_PROBE_DB=\${DB_ROTATION_PROBE_DATABASE}"
+      echo "ROTATED=\${DB_ROLE_CREDENTIALS_ROTATED}"
+    `)
+    const reader = Buffer.from(readVar(run.output, 'READER_B64'), 'base64').toString('utf8')
+    assert.match(reader, /^ssl=yes$/m, 'the reader must have negotiated TLS, as sslmode=prefer does')
+    assert.match(reader, /^method=scram-sha-256$/m, 'and therefore read the hostssl record rather than being refused in the clear')
+
+    assert.equal(run.status, 0, `the endpoint psql actually uses is the one that must be measured:\n${run.output}`)
+    assert.match(run.output, /GATE_PROBE_DB=postgres/)
+    assert.match(run.output, /ROTATED=true/)
+    // THE ALTER LANDED, CHECKED OVER THE TRANSPORT THIS CLUSTER ADMITS. connectWithDriver() is not
+    // used here and that is deliberate: node-postgres does NOT negotiate TLS unless told to, so on a
+    // cluster built to reject cleartext it would fail for a reason that has nothing to do with the
+    // credential. The application driver is exercised on ordinary clusters by tests 10 and 12.
+    assert.equal(psqlWithSslMode(cluster.port, 'rotated-secret', 'one_two_inventory', 'require'), true,
+      'the rotated credential must open the application database')
+    assert.equal(psqlWithSslMode(cluster.port, 'live-password', 'one_two_inventory', 'require'), false,
+      'and the previous one must not')
+    assert.match(envDatabaseUrl(root), /rotated-secret/, 'and the published file must name what the ALTER installed')
+  } finally {
+    cluster?.stop()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 14b. AND WHERE THE TWO CONNECTIONS REALLY DO MATCH DIFFERENT RECORDS, THE CONTROL CATCHES IT
+// ---------------------------------------------------------------------------
+
+test('r41: a hostssl/hostnossl split where libpq falls back is caught by the negative control', async () => {
+  // THE ONE THING THE READER CANNOT ESTABLISH, BUILT AND MEASURED. It observes the matched method on
+  // a connection of its own. The header of scripts/lib/pg-auth-request.mjs says the same record must
+  // therefore match, because the same user, database, host, port and SSL preference are stated —
+  // and this cluster is the case where that reasoning fails, discovered by running it rather than by
+  // thinking about it:
+  //
+  //   `sslmode=prefer` does not mean "use TLS". It means try TLS, AND IF THAT CONNECTION FAILS,
+  //   RETRY WITHOUT IT. So on a cluster whose hostssl record is `scram-sha-256` and whose hostnossl
+  //   record is `trust`, a psql handed a WRONG password authenticates anyway: the TLS attempt is
+  //   refused by scram, libpq drops to the clear, and `trust` lets it in. The reader, which stops at
+  //   the authentication request and never fails an authentication, sees only the hostssl record and
+  //   would report a perfectly admissible `scram-sha-256`.
+  //
+  // THE NEGATIVE CONTROL IS WHAT SAVES IT, and this is the test that proves that half is still load
+  // bearing rather than redundant now that the method is established: the control opens exactly the
+  // connection the reconciliation would later open, watches a password nothing can know be ACCEPTED,
+  // and refuses the endpoint. Two mechanisms, each covering the other's gap.
+  //
+  // MUTATION ROUTES (each measured by making the change and re-running):
+  //   1. drop the negative control from db_endpoint_discriminates_passwords() — return 0 as soon as
+  //      the positive password connects: the endpoint is admitted on the reader's word alone, the
+  //      rotation proceeds against an endpoint that in practice accepts anything, and this test
+  //      fails on its status assertion and on ROTATED_ANYWAY. Tests 1, 2 and 3 fail with it.
+  //   2. delete the method gate instead: nothing here changes — the control already refuses this
+  //      endpoint. Recorded so the next reader does not look for it here.
+  const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
+  let cluster: Cluster | undefined
+  try {
+    cluster = startCluster(root, 'live', await freePort(), '127.0.0.1', [
+      'hostssl all all 127.0.0.1/32 scram-sha-256',
+      'hostnossl all all 127.0.0.1/32 trust',
+    ], { ssl: true })
+    seedLiveInstallation(cluster)
+    writeInstalledEnv(root, cluster.port, 'live-password')
+
+    // PRECONDITION, MEASURED: the two transports really are two different records.
+    assert.equal(psqlWithSslMode(cluster.port, 'a-password-nothing-has-ever-set', 'postgres', 'disable'), true,
+      'precondition: the hostnossl record must be trust')
+    assert.equal(psqlWithSslMode(cluster.port, 'a-password-nothing-has-ever-set', 'postgres', 'require'), false,
+      'precondition: and the hostssl record must check the password')
+
+    const run = runShipped({ ...installVars(cluster, root), DB_PASSWORD: 'rotated-secret' }, `
+      node "$(db_auth_request_probe_path)" --host="\${DB_HOST}" --port="\${DB_PORT}" --user="\${DB_USER}" --database=postgres > "\${APP_DIR}/reader.out" 2>&1 || true
+      echo "READER_B64=$(base64 -w0 < "\${APP_DIR}/reader.out")"
+      # AND WHAT libpq ACTUALLY DOES WITH THE SAME FOUR VALUES, which is the divergence itself.
+      if db_endpoint_accepts_password postgres "a-password-nothing-has-ever-set"; then
+        echo "LIBPQ_FELL_BACK_TO_TRUST=yes"
+      else
+        echo "LIBPQ_FELL_BACK_TO_TRUST=no"
+      fi
+      ${REINSTALL_BODY}
+      FENCE_ARMED=true
+      DB_FENCE_UP=true
+      rotate_database_password_in_fenced_window
+      echo "ROTATED_ANYWAY"
+    `)
+    const reader = Buffer.from(readVar(run.output, 'READER_B64'), 'base64').toString('utf8')
+    assert.match(reader, /^method=scram-sha-256$/m, 'the reader reads the hostssl record, which is admissible')
+    assert.match(run.output, /LIBPQ_FELL_BACK_TO_TRUST=yes/, 'while libpq, on a failed TLS authentication, lands on the hostnossl one')
+
+    assert.equal(run.status, 9, `the control must refuse the endpoint the reader would have admitted:\n${run.output}`)
+    assert.doesNotMatch(run.output, /ROTATED_ANYWAY/, 'and nothing past the refusal ran')
+    assert.match(run.output, /'postgres' ACCEPTED a random 32-byte password/, 'naming the half of the gate that caught it')
+    assert.match(run.output, /THE ALTER HAS NOT BEEN ISSUED/, 'and the role is untouched')
+    assert.equal(await connectWithDriver(envDatabaseUrl(root)), 'imsuser')
+  } finally {
+    cluster?.stop()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 15. AN UNKNOWN REFUSES: no reader, no answer, no rotation
+// ---------------------------------------------------------------------------
+
+test('r41: a rotation refuses when the matched method cannot be established at all', async () => {
+  // THIS BRANCH'S STANDING RULE, APPLIED TO THE NEW QUESTION. If the matched method cannot be
+  // established, that is an unknown, and an unknown refuses — before the ALTER, so the role still
+  // holds the credential its clients have and `.env` still names it. The alternative is a gate that
+  // silently becomes advisory on any host where the reader is missing, which is the same defect as
+  // a pin nobody checks.
+  //
+  // The cluster here is the ORDINARY one — the same default scram cluster that rotates happily in
+  // test 12 — so the only difference between green and red is whether the question could be asked.
+  //
+  // MUTATION ROUTES (each measured by making the change and re-running):
+  //   1. make db_endpoint_checks_role_verifier() `return 0` when the reader is absent: the rotation
+  //      proceeds, and this test fails on its status assertion and on ROTATED_ANYWAY. Nothing else
+  //      fails, because every other test has a working reader — which is why this one exists.
+  //   2. drop the `[[ -f "${probe}" ]]` check and let node fail instead: the run still refuses, but
+  //      the report says whatever node's module loader said, so this test fails on the two
+  //      assertions that quote the actionable sentence.
+  const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
+  let cluster: Cluster | undefined
+  try {
+    cluster = startCluster(root, 'live', await freePort(), '127.0.0.1')
+    seedLiveInstallation(cluster)
+    writeInstalledEnv(root, cluster.port, 'live-password')
+
+    const run = runShipped({
+      ...installVars(cluster, root),
+      DB_PASSWORD: 'rotated-secret',
+      IMS_AUTH_REQUEST_PROBE: join(root, 'no-such-reader.mjs'),
+    }, `
+      # PRECONDITION, MEASURED: this cluster is otherwise perfectly rotatable — r40's pair passes.
+      if db_endpoint_discriminates_passwords postgres "live-password"; then
+        echo "R40_PAIR_PASSES=yes"
+      else
+        echo "R40_PAIR_PASSES=no"
+      fi
+      ${REINSTALL_BODY}
+      FENCE_ARMED=true
+      DB_FENCE_UP=true
+      rotate_database_password_in_fenced_window
+      echo "ROTATED_ANYWAY"
+    `)
+    assert.match(run.output, /R40_PAIR_PASSES=yes/, 'precondition: only the missing reader may be what stops this run')
+
+    assert.equal(run.status, 9, `an unestablished method is an unknown, and an unknown refuses:\n${run.output}`)
+    assert.doesNotMatch(run.output, /ROTATED_ANYWAY/, 'and nothing past the refusal ran')
+    assert.match(run.output, /was not asked which pg_hba rule matches it, because the reader that asks/, 'the report says what could not be done')
+    assert.match(run.output, /Re-run the installer from a complete release checkout/, 'and what to do about it')
+    assert.match(run.output, /THE ALTER HAS NOT BEEN ISSUED/, 'and that nothing was taken away')
+    assert.equal(await connectWithDriver(envDatabaseUrl(root)), 'imsuser')
   } finally {
     cluster?.stop()
     rmSync(root, { recursive: true, force: true })

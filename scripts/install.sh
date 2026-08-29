@@ -2040,10 +2040,18 @@ clear_role_rotation_journal() {
 # WHAT IT DOES NOT: it cannot admit the `password` method — cleartext compared against the role's
 # own secret — because on the wire that is the same message `ldap` sends, and it must be: an
 # external verifier can only be consulted with the plaintext. Refusing it is a deliberate
-# narrowing, and the refusal below says so and says what to change. Nor is the method observed on
-# the SAME connection psql then opens; it is observed on one stating the same user, database,
-# host, port and SSL preference, so only a pg_hba reload between the two could separate them —
-# which is the remaining reason the negative control is kept rather than retired as redundant.
+# narrowing, and the refusal below says so and says what to change.
+#
+# NOR IS THE METHOD OBSERVED ON THE SAME CONNECTION psql then opens. It is observed on one stating
+# the same user, database, host, port and SSL preference — and there are two measured ways those
+# can still land on different pg_hba records. A reload between them is the obvious one. The other
+# was found by running it: `sslmode=prefer` means try TLS AND RETRY WITHOUT IT IF THAT CONNECTION
+# FAILS, so against `hostssl ... scram-sha-256` over `hostnossl ... trust` a psql given a wrong
+# password is refused by scram, drops to the clear, and is let in by trust — while the reader,
+# which never fails an authentication, stops at the hostssl record and reports an admissible
+# `scram-sha-256`. THE NEGATIVE CONTROL CATCHES BOTH, because it opens the connection the
+# reconciliation will actually open. That is why it is kept rather than retired as redundant, and
+# there is a regression on exactly that cluster.
 #
 # THE ORDER IS METHOD FIRST, AND THAT IS NOT AN OPTIMISATION. The positive half of the control
 # sends the application role's real password to the endpoint. Running it before the method is

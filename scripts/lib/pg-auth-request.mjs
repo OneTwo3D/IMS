@@ -48,10 +48,18 @@
  *   * It cannot admit `password` (cleartext compared against the role's own secret), because the
  *     wire cannot tell it from `ldap`. That is a deliberate narrowing, and it costs a site running
  *     cleartext-against-PostgreSQL a refusal it did not strictly have to have.
- *   * It is a SEPARATE CONNECTION from the one the caller then opens with psql. It states the
- *     same user, database, host, port and SSL preference, so the same record matches -- unless
- *     pg_hba.conf is reloaded between the two. The caller's negative control is what would catch
- *     that, and is the reason that control is kept.
+ *   * IT IS A SEPARATE CONNECTION from the one the caller then opens with psql, and there are two
+ *     measured ways the two can land on different pg_hba records. The obvious one is a reload
+ *     between them. The other was found by running it rather than by reasoning about it:
+ *     `sslmode=prefer` does not mean "use TLS", it means try TLS AND RETRY WITHOUT IT IF THAT
+ *     CONNECTION FAILS -- so against `hostssl ... scram-sha-256` over `hostnossl ... trust`, a psql
+ *     given a wrong password is refused by scram, drops to the clear, and is let in by trust. This
+ *     program never fails an authentication, so it stops at the hostssl record and reports an
+ *     entirely admissible `scram-sha-256`.
+ *     THE CALLER'S NEGATIVE CONTROL IS WHAT CATCHES BOTH, because it opens the connection the
+ *     reconciliation will actually open and watches a password nothing can know be accepted. That
+ *     is why the control is kept rather than retired as redundant, and there is a regression on
+ *     exactly that cluster.
  *
  * WHY IT SPEAKS THE PROTOCOL RATHER THAN READING A CATALOGUE. `pg_hba_file_rules` (PostgreSQL 10
  * and later) lists the PARSED RULES. A rule listing is not a match: deciding which record applies
@@ -84,7 +92,13 @@
  * SSLRequest first, upgrade if the server answers `S`, continue in the clear if it answers `N`,
  * and verify nothing -- `prefer` verifies nothing. Getting this wrong would not produce a wrong
  * answer, it would produce a `hostssl` record matched in one connection and a `hostnossl` record
- * in the other, which is the one thing this must not do.
+ * in the other. It is measured on a TLS-only cluster rather than asserted: an `initdb` cluster
+ * ships `ssl = off`, so a regression suite that only ever runs one of those leaves the transport
+ * every real installation uses entirely untested.
+ *
+ * WHAT `prefer` DOES NOT DO IS GUARANTEE TLS, and the bullet above is the consequence: it retries
+ * in the clear when the TLS connection FAILS, which an authentication this program never performs
+ * cannot provoke.
  *
  * Unix-domain sockets take no SSLRequest, for the same reason libpq sends none.
  */

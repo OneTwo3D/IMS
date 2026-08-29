@@ -252,15 +252,16 @@ Two things close that:
   *A probe that cannot say no is not evidence* below.
 
 On the next run, `prompt_db_password` reconciles it before anything has been touched, by **asking
-the server** which of the two passwords is live — on an endpoint that has first been shown able to
-**refuse** a password nothing can know:
+the server** which of the two passwords is live — on an endpoint whose matched `pg_hba` rule the
+server itself named as one that checks `pg_authid.rolpassword`, and which has then been shown able
+to **refuse** a password nothing can know:
 
 | what the interrupted run got as far as | what the next run does |
 | --- | --- |
 | the journal, not the `ALTER` | the OLD password answers. Nothing was taken away and `.env` already agrees; the run adopts it as the installed credential and clears the journal. Supply the new password again to ask for the rotation a second time. |
 | the `ALTER`, not the environment file | the NEW password answers. The run **finishes the transition**: it treats that credential as the installed one in place of what `.env` says, so the environment file it writes names what the server actually has, and the journal is cleared only once that file is published. |
 | both, but not the clear | indistinguishable from the row above, and it does not need to be distinguished. The rewrite is byte-identical and the journal is cleared. |
-| neither password answers anywhere that could discriminate | the run **refuses**, before anything is stopped, and **leaves the journal** — it is the only remaining record of the two candidates. Restore one with `ALTER USER`, or set a password of your own and delete the file, then re-run. |
+| no endpoint both checks the role's own credential and can discriminate | the run **refuses**, before anything is stopped, and **leaves the journal** — it is the only remaining record of the two candidates. Restore one with `ALTER USER`, or set a password of your own and delete the file, then re-run. |
 | an endpoint that can discriminate accepts **both** | also a refusal. Two passwords cannot both be the role's, so the server is not answering the way a password check answers, and preferring one of them would be a guess. |
 
 A journal naming a **different** role, host, port or database is also a refusal: this run cannot
@@ -284,15 +285,67 @@ So an endpoint is admitted as evidence only after it has been shown, on that end
 to **refuse** a freshly minted random 32-byte password **and accept** one asserted live. Both
 halves: an endpoint that refuses everything has not been shown able to say yes.
 
+##### ...and a probe that can say no still has to say whose password it checked
+
+Those two halves prove an endpoint tells one password from another. They do **not** prove the
+password it tells apart is PostgreSQL's own role credential, which is the only thing `ALTER ROLE`
+changes. `pg_hba.conf` has password-dependent methods that consult somebody else's store —
+**`ldap`**, **`pam`**, **`radius`**, **`bsd`** — and under every one of them both halves behave
+exactly as they do on a healthy `scram-sha-256` endpoint:
+
+> `postgres` authenticates through LDAP while the application database uses `scram-sha-256`. Before
+> the rotation the LDAP endpoint refuses the random control and accepts the credential `.env` names,
+> so it is admitted and recorded. The run dies after the `ALTER`. The next run re-proves that same
+> endpoint; LDAP still accepts only the *old* password, because a directory never heard of an
+> `ALTER ROLE`; so the reconciliation concludes the `ALTER` did not commit, publishes the old
+> password and **clears the journal**. The application database wants the new one. The service
+> cannot connect and the record that would have recovered it has been deleted.
+
+So the matched method is **established rather than inferred**, and it is the server that states it.
+`scripts/lib/pg-auth-request.mjs` performs the ordinary startup exchange and reads the
+authentication request the server sends *after performing its own `pg_hba` match*:
+
+| what the server asks for | matched method | admitted? |
+| --- | --- | --- |
+| SASL offering `SCRAM-SHA-256` | `scram-sha-256`, or `md5` over a SCRAM-format verifier | **yes** — it compares `pg_authid.rolpassword` |
+| `AuthenticationMD5Password` | `md5` | **yes** — same secret |
+| a cleartext password | `password`, `ldap`, `pam`, `radius` or `bsd` — *the wire cannot separate them* | no |
+| nothing at all | `trust`, or a `peer`/`ident`/`cert` rule already satisfied | no |
+| GSSAPI, SSPI, anything else | an external identity system | no |
+
+It sends **no password** — the connection is dropped as soon as the request has been read — and it
+is asked **first**, before any candidate credential leaves the host, so a rotation never hands the
+role's password to a directory it has not yet established is uninvolved.
+
+Two consequences worth knowing before you meet them:
+
+* **`password` is refused even though it is sound.** Cleartext-against-PostgreSQL does compare the
+  role's own secret, but it asks for the plaintext with the same protocol message `ldap` uses — and
+  must, since an external verifier can only be consulted with the plaintext. All five are refused
+  together. Use `scram-sha-256` or `md5` for the installer's host.
+* **If the method cannot be established at all** — no `node`, or the installer was run from an
+  incomplete checkout so `scripts/lib/pg-auth-request.mjs` is missing — that is an unknown, and an
+  unknown **refuses**, before the `ALTER`.
+
+The negative control is *kept* alongside this, and is not redundant: the method is read on a
+connection of the reader's own, and two things can still make `psql` land on a different record.
+`pg_hba.conf` can be reloaded between them; and `sslmode=prefer` — libpq's default — does not mean
+"use TLS", it means *try TLS and retry without it if that connection fails*, so against
+`hostssl … scram-sha-256` over `hostnossl … trust` a wrong password is refused by scram, drops to
+the clear, and is let in by trust. The control opens the connection the reconciliation will
+actually open, so it catches both.
+
 **Before the `ALTER`**, the rotation searches for such an endpoint and records it in the journal.
 The candidates are read from the server — every connectable, non-template database except the
 application one, capped at eight, with `postgres` first — because the application database will be
 behind the fence when a reconciliation runs, and a rotation whose journal could not be reconciled
-must not happen. **If no endpoint can be shown password-sensitive, the rotation refuses**: nothing
-has been `ALTER`ed, the role still holds the credential `.env` names, and the two agree.
+must not happen. **If no endpoint can be shown to check the role's own credential *and* be able to
+tell one password from another, the rotation refuses**: nothing has been `ALTER`ed, the role still
+holds the credential `.env` names, and the two agree.
 
-The usual cause of that refusal is a `trust` rule for this host, or `PUBLIC` `CONNECT` revoked on
-every database this role could reach. Either is fixed before re-running:
+The usual cause of that refusal is a `trust` rule for this host, an authentication method that is
+not `scram-sha-256` or `md5`, or `PUBLIC` `CONNECT` revoked on every database this role could
+reach. Each is fixed before re-running:
 
 ```sql
 GRANT CONNECT ON DATABASE postgres TO "imsuser";   -- or any database that is not the application one
