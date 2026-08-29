@@ -29,6 +29,7 @@ import {
 // Everything here is line-based and skips comment lines, so a phrase quoted in a
 // header comment cannot satisfy an assertion about what the script actually does.
 
+const LOCK_LIB = join(process.cwd(), 'scripts/lib/crontab-lock.sh')
 const DEPLOY_LINES = readFileSync(join(process.cwd(), 'scripts/deploy.sh'), 'utf8').split(/\r?\n/)
 const UPDATE_LINES = readFileSync(join(process.cwd(), 'scripts/update.sh'), 'utf8').split(/\r?\n/)
 
@@ -133,14 +134,41 @@ test('deploy.sh proves quiescence with the database, not only with the process l
   assert.ok(check < migrate, 'quiescence must be proven before the schema moves')
 })
 
-test('deploy.sh fences the cron writers and restores them only after the health check', () => {
+test('deploy.sh fences the cron writers once NOTHING IS SERVING, and restores them after the health check', () => {
+  // THIS USED TO ASSERT `fenceCall < drain`, AND THAT ORDER WAS THE DEFECT (o3d-p9dq, Codex r26
+  // HIGH). Fencing the crontab while the predecessor is still up makes the snapshot-and-replace a
+  // read-modify-write racing the six server actions that reconcile the same crontab from a
+  // browser: a schedule saved between the two halves went into a crontab this run then overwrote,
+  // and the verbatim backup restored later did not contain it. Taking the flock there would not
+  // have closed it either — on the rollout that introduces the flock the predecessor was built
+  // before it existed and cannot join it. Only the stop reaches that process.
+  //
+  // So the fence now sits AFTER the stop, the stray sweep and the port-free proof, and still
+  // BEFORE the database probe (a cron tick that opens a connection is what that probe refuses).
   const fenceWriters = phaseLine(DEPLOY_LINES, 'fence-writers')
   const drain = phaseLine(DEPLOY_LINES, 'drain-verify')
+  const migrate = phaseLine(DEPLOY_LINES, 'migrate')
   const health = phaseLine(DEPLOY_LINES, 'health')
+
+  const stop = codeLine(DEPLOY_LINES, /^\s*run systemctl stop "\$unit"$/, fenceWriters)
+  assert.notEqual(stop, -1, 'the stop phase must actually stop the units')
+  const portFree = codeLine(DEPLOY_LINES, /^\s*ok "Port \$\{PORT\} is free\."$/, drain)
+  assert.notEqual(portFree, -1, 'the drain must prove the port is free before anything rests on it')
 
   const fenceCall = codeLine(DEPLOY_LINES, /^fence_cron$/, fenceWriters)
   assert.notEqual(fenceCall, -1, 'cron entries are writers and must be fenced')
-  assert.ok(fenceCall < drain, 'cron is fenced before quiescence is asserted')
+  assert.ok(stop < fenceCall,
+    'cron must be fenced AFTER the service is stopped: a fence taken while a browser can still '
+    + 'reach the app is the lost-update this protocol exists to prevent')
+  assert.ok(portFree < fenceCall,
+    'and after the port is proved free, which is what makes "nothing is serving" a fact rather '
+    + 'than an assumption')
+  assert.ok(fenceCall < migrate, 'and before the schema moves')
+
+  const probe = codeLine(DEPLOY_LINES, /check-db-writers\.mjs/, fenceCall)
+  assert.notEqual(probe, -1, 'the database probe must still follow the cron fence')
+  assert.ok(fenceCall < probe,
+    'the writers are commented out first, and the probe then asks whether the room is empty')
 
   const unfenceCall = codeLine(DEPLOY_LINES, /^unfence_cron$/, health)
   assert.notEqual(unfenceCall, -1, 'cron must be restored once the new build has answered')
@@ -661,6 +689,15 @@ const MARKER_CASES = [
     markerFn: 'write_fence_marker',
     markerCall: 'write_fence_marker "cutover started"',
     preamble: (dir: string) => `
+# THE REAL CRONTAB EXCLUSION, SOURCED RATHER THAN STUBBED (o3d-p9dq). Every fence, unfence,
+# adoption and unwind lifted into these harnesses performs its read-modify-write through
+# with_crontab_lock, so a harness that stubbed it out would be measuring an ordering the shipped
+# code no longer has. The lock file is created directly because prepare_crontab_lock needs root;
+# its preparation is exercised in tests/settings/crontab-reconcile-serialization.test.ts.
+source '${LOCK_LIB}'
+crontab_lock_paths '${dir}'
+mkdir -p "\${CRONTAB_LOCK_DIR}"
+: > "\${CRONTAB_LOCK_FILE}"
 DRY_RUN=false
 BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
 STATE_DIR='${dir}'
@@ -708,6 +745,15 @@ die() { echo "die: $*" >&2; exit 1; }
     markerFn: 'write_fence_marker',
     markerCall: 'write_fence_marker "cutover started"',
     preamble: (dir: string) => `
+# THE REAL CRONTAB EXCLUSION, SOURCED RATHER THAN STUBBED (o3d-p9dq). Every fence, unfence,
+# adoption and unwind lifted into these harnesses performs its read-modify-write through
+# with_crontab_lock, so a harness that stubbed it out would be measuring an ordering the shipped
+# code no longer has. The lock file is created directly because prepare_crontab_lock needs root;
+# its preparation is exercised in tests/settings/crontab-reconcile-serialization.test.ts.
+source '${LOCK_LIB}'
+crontab_lock_paths '${dir}'
+mkdir -p "\${CRONTAB_LOCK_DIR}"
+: > "\${CRONTAB_LOCK_FILE}"
 DRY_RUN=false
 BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
 DATA_DIR='${dir}'
@@ -753,6 +799,15 @@ die() { echo "die: $*" >&2; exit 1; }
     markerFn: 'write_cutover_marker',
     markerCall: 'write_cutover_marker "cutover started"',
     preamble: (dir: string) => `
+# THE REAL CRONTAB EXCLUSION, SOURCED RATHER THAN STUBBED (o3d-p9dq). Every fence, unfence,
+# adoption and unwind lifted into these harnesses performs its read-modify-write through
+# with_crontab_lock, so a harness that stubbed it out would be measuring an ordering the shipped
+# code no longer has. The lock file is created directly because prepare_crontab_lock needs root;
+# its preparation is exercised in tests/settings/crontab-reconcile-serialization.test.ts.
+source '${LOCK_LIB}'
+crontab_lock_paths '${dir}'
+mkdir -p "\${CRONTAB_LOCK_DIR}"
+: > "\${CRONTAB_LOCK_FILE}"
 DATA_DIR='${dir}'
 CUTOVER_STATE_DIR='${dir}'
 FENCE_FILE="\${CUTOVER_STATE_DIR}/DEPLOY-FENCED"
@@ -1084,6 +1139,15 @@ const FENCE_HARNESS = [
     name: 'deploy.sh',
     source: DEPLOY_LINES.join('\n'),
     preamble: (dir: string) => `
+# THE REAL CRONTAB EXCLUSION, SOURCED RATHER THAN STUBBED (o3d-p9dq). Every fence, unfence,
+# adoption and unwind lifted into these harnesses performs its read-modify-write through
+# with_crontab_lock, so a harness that stubbed it out would be measuring an ordering the shipped
+# code no longer has. The lock file is created directly because prepare_crontab_lock needs root;
+# its preparation is exercised in tests/settings/crontab-reconcile-serialization.test.ts.
+source '${LOCK_LIB}'
+crontab_lock_paths '${dir}'
+mkdir -p "\${CRONTAB_LOCK_DIR}"
+: > "\${CRONTAB_LOCK_FILE}"
 DRY_RUN=false
 BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
 APP_USER="$(id -un)"
@@ -1136,6 +1200,15 @@ chown() { :; }
     name: 'update.sh',
     source: UPDATE_LINES.join('\n'),
     preamble: (dir: string) => `
+# THE REAL CRONTAB EXCLUSION, SOURCED RATHER THAN STUBBED (o3d-p9dq). Every fence, unfence,
+# adoption and unwind lifted into these harnesses performs its read-modify-write through
+# with_crontab_lock, so a harness that stubbed it out would be measuring an ordering the shipped
+# code no longer has. The lock file is created directly because prepare_crontab_lock needs root;
+# its preparation is exercised in tests/settings/crontab-reconcile-serialization.test.ts.
+source '${LOCK_LIB}'
+crontab_lock_paths '${dir}'
+mkdir -p "\${CRONTAB_LOCK_DIR}"
+: > "\${CRONTAB_LOCK_FILE}"
 DRY_RUN=false
 BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
 APP_USER="$(id -un)"
@@ -1208,6 +1281,15 @@ chown() { :; }
     name: 'install.sh',
     source: INSTALL_SOURCE,
     preamble: (dir: string) => `
+# THE REAL CRONTAB EXCLUSION, SOURCED RATHER THAN STUBBED (o3d-p9dq). Every fence, unfence,
+# adoption and unwind lifted into these harnesses performs its read-modify-write through
+# with_crontab_lock, so a harness that stubbed it out would be measuring an ordering the shipped
+# code no longer has. The lock file is created directly because prepare_crontab_lock needs root;
+# its preparation is exercised in tests/settings/crontab-reconcile-serialization.test.ts.
+source '${LOCK_LIB}'
+crontab_lock_paths '${dir}'
+mkdir -p "\${CRONTAB_LOCK_DIR}"
+: > "\${CRONTAB_LOCK_FILE}"
 BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
 APP_USER="$(id -un)"
 APP_DIR='${dir}'
@@ -1702,6 +1784,15 @@ const FENCE_INSTALL_CASES = [
     source: DEPLOY_LINES.join('\n'),
     markerFn: 'write_fence_marker',
     preamble: (dir: string) => `
+# THE REAL CRONTAB EXCLUSION, SOURCED RATHER THAN STUBBED (o3d-p9dq). Every fence, unfence,
+# adoption and unwind lifted into these harnesses performs its read-modify-write through
+# with_crontab_lock, so a harness that stubbed it out would be measuring an ordering the shipped
+# code no longer has. The lock file is created directly because prepare_crontab_lock needs root;
+# its preparation is exercised in tests/settings/crontab-reconcile-serialization.test.ts.
+source '${LOCK_LIB}'
+crontab_lock_paths '${dir}'
+mkdir -p "\${CRONTAB_LOCK_DIR}"
+: > "\${CRONTAB_LOCK_FILE}"
 DRY_RUN=false
 BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
 STATE_DIR='${dir}'
@@ -1756,6 +1847,15 @@ systemctl() { [ "$1" = daemon-reload ] && return 1; return 0; }
     source: UPDATE_LINES.join('\n'),
     markerFn: 'write_fence_marker',
     preamble: (dir: string) => `
+# THE REAL CRONTAB EXCLUSION, SOURCED RATHER THAN STUBBED (o3d-p9dq). Every fence, unfence,
+# adoption and unwind lifted into these harnesses performs its read-modify-write through
+# with_crontab_lock, so a harness that stubbed it out would be measuring an ordering the shipped
+# code no longer has. The lock file is created directly because prepare_crontab_lock needs root;
+# its preparation is exercised in tests/settings/crontab-reconcile-serialization.test.ts.
+source '${LOCK_LIB}'
+crontab_lock_paths '${dir}'
+mkdir -p "\${CRONTAB_LOCK_DIR}"
+: > "\${CRONTAB_LOCK_FILE}"
 DRY_RUN=false
 BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
 DATA_DIR='${dir}'
@@ -1810,6 +1910,15 @@ systemctl() { [ "$1" = daemon-reload ] && return 1; return 0; }
     source: INSTALL_SOURCE,
     markerFn: 'write_cutover_marker',
     preamble: (dir: string) => `
+# THE REAL CRONTAB EXCLUSION, SOURCED RATHER THAN STUBBED (o3d-p9dq). Every fence, unfence,
+# adoption and unwind lifted into these harnesses performs its read-modify-write through
+# with_crontab_lock, so a harness that stubbed it out would be measuring an ordering the shipped
+# code no longer has. The lock file is created directly because prepare_crontab_lock needs root;
+# its preparation is exercised in tests/settings/crontab-reconcile-serialization.test.ts.
+source '${LOCK_LIB}'
+crontab_lock_paths '${dir}'
+mkdir -p "\${CRONTAB_LOCK_DIR}"
+: > "\${CRONTAB_LOCK_FILE}"
 DATA_DIR='${dir}'
 CUTOVER_STATE_DIR='${dir}'
 FENCE_FILE="\${CUTOVER_STATE_DIR}/DEPLOY-FENCED"
@@ -2290,7 +2399,7 @@ const ARMING_ORDER = [
 ] as const
 
 for (const entry of ARMING_ORDER) {
-  test(`${entry.name} arms the fence at the stop, so a cron-fencing failure is not a post-stop failure`, () => {
+  test(`${entry.name} keeps only the REBOOT fence in the reversible phase, and fences cron after the stop`, () => {
     const { lines } = entry
     // The anchor is the reboot-fence install, so start looking a little before it: the
     // arming flag has to be raised BEFORE the first thing that creates cutover state.
@@ -2299,16 +2408,34 @@ for (const entry of ARMING_ORDER) {
 
     const arming = requireCodeLine(lines, /^\s*CUTOVER_ARMING=true\s*$/, from, 'the reversible phase must be entered explicitly')
     const install = requireCodeLine(lines, /install_reboot_fence "/, arming, 'the reboot fence is installed inside the arming phase')
-    const cron = requireCodeLine(lines, /^\s*fence_cron\s*$/, arming, 'the cron writers are fenced inside the arming phase')
     const armed = requireCodeLine(lines, /^\s*FENCE_ARMED=true\s*$/, arming, 'and the fence is armed after it')
     const stop = requireCodeLine(lines, /systemctl stop/, armed, 'the stop must follow the arming')
+    const cron = requireCodeLine(lines, /^\s*fence_cron\s*$/, stop, 'the cron writers are fenced after the stop')
 
     assert.ok(arming < install, 'the arming phase must be entered before the reboot fence is written')
-    assert.ok(
-      cron < armed,
-      'fence_cron must run INSIDE the reversible phase: every way it can fail used to be reported as a post-stop failure, and answered by stopping a healthy service',
-    )
     assert.ok(armed < stop, 'and FENCE_ARMED must be raised before anything is actually stopped')
+
+    // THIS ASSERTION USED TO READ `cron < armed`, AND ITS RATIONALE WAS TRUE OF THE WRONG THING
+    // (o3d-p9dq, Codex r26 HIGH). Keeping fence_cron inside the reversible phase did make a
+    // failed backup a pre-stop failure — but it also made the fence itself a read-modify-write of
+    // a crontab a browser could still be reconciling, and the flock cannot close that on the
+    // rollout that introduces it, because the predecessor was built before the flock existed.
+    // Only the stop reaches that process. So the fence moved below the stop, a failed backup is
+    // now an honest post-stop failure (fence_cron's own message says the service is stopped), and
+    // what stays in the reversible phase is the reboot fence, which must be installed before
+    // anything is stopped because a fence installed on the way out does not exist for a run that
+    // is killed.
+    assert.ok(
+      stop < cron,
+      'fence_cron must run AFTER the stop: fencing the crontab while the predecessor can still '
+      + 'reconcile it from a browser is the lost-update this protocol exists to prevent',
+    )
+    // And there is no SECOND, earlier cutover fence left behind above the stop.
+    const strayFence = lines.findIndex((line, index) =>
+      index > arming && index < stop && isCode(line) && /^\s*fence_cron\s*$/.test(line))
+    assert.equal(strayFence, -1,
+      `${entry.name}:${strayFence + 1} fences the crontab between the arming and the stop, which is `
+      + 'exactly the window the fence was moved out of')
 
     // And the phase is CLOSED where the cutover ends. A CUTOVER_ARMING left raised past that
     // point sends a cleanup failure into the pre-stop branch, which would report a
@@ -2363,6 +2490,15 @@ const ARMING_TRAP_CASES = [
     trap: 'on_exit',
     marker: 'FENCED',
     preamble: (dir: string) => `
+# THE REAL CRONTAB EXCLUSION, SOURCED RATHER THAN STUBBED (o3d-p9dq). Every fence, unfence,
+# adoption and unwind lifted into these harnesses performs its read-modify-write through
+# with_crontab_lock, so a harness that stubbed it out would be measuring an ordering the shipped
+# code no longer has. The lock file is created directly because prepare_crontab_lock needs root;
+# its preparation is exercised in tests/settings/crontab-reconcile-serialization.test.ts.
+source '${LOCK_LIB}'
+crontab_lock_paths '${dir}'
+mkdir -p "\${CRONTAB_LOCK_DIR}"
+: > "\${CRONTAB_LOCK_FILE}"
 DRY_RUN=false
 BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
 STATE_DIR='${dir}'
@@ -2420,6 +2556,15 @@ DB_IDENTITY_DRIFT_REASON=''
     trap: 'on_exit',
     marker: 'FENCED',
     preamble: (dir: string) => `
+# THE REAL CRONTAB EXCLUSION, SOURCED RATHER THAN STUBBED (o3d-p9dq). Every fence, unfence,
+# adoption and unwind lifted into these harnesses performs its read-modify-write through
+# with_crontab_lock, so a harness that stubbed it out would be measuring an ordering the shipped
+# code no longer has. The lock file is created directly because prepare_crontab_lock needs root;
+# its preparation is exercised in tests/settings/crontab-reconcile-serialization.test.ts.
+source '${LOCK_LIB}'
+crontab_lock_paths '${dir}'
+mkdir -p "\${CRONTAB_LOCK_DIR}"
+: > "\${CRONTAB_LOCK_FILE}"
 DRY_RUN=false
 BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
 DATA_DIR='${dir}'
@@ -2475,6 +2620,15 @@ DB_IDENTITY_DRIFT_REASON=''
     trap: 'on_cutover_exit',
     marker: 'FENCED',
     preamble: (dir: string) => `
+# THE REAL CRONTAB EXCLUSION, SOURCED RATHER THAN STUBBED (o3d-p9dq). Every fence, unfence,
+# adoption and unwind lifted into these harnesses performs its read-modify-write through
+# with_crontab_lock, so a harness that stubbed it out would be measuring an ordering the shipped
+# code no longer has. The lock file is created directly because prepare_crontab_lock needs root;
+# its preparation is exercised in tests/settings/crontab-reconcile-serialization.test.ts.
+source '${LOCK_LIB}'
+crontab_lock_paths '${dir}'
+mkdir -p "\${CRONTAB_LOCK_DIR}"
+: > "\${CRONTAB_LOCK_FILE}"
 DATA_DIR='${dir}'
 CUTOVER_STATE_DIR='${dir}'
 APP_USER=appuser
@@ -2559,6 +2713,7 @@ function runTrapHarness(
       'set -euo pipefail',
       entry.preamble(dir),
       TRAP_STUBS,
+      shellFunction(entry.source, 'restore_cron_from_backup_locked'),
       shellFunction(entry.source, 'restore_cron_from_backup'),
       shellFunction(entry.source, 'rollback_reboot_fence_install'),
       shellFunction(entry.source, 'unwind_arming'),
@@ -3004,6 +3159,7 @@ function adoptionProgram(entry: (typeof R8_CASES)[number], dir: string, state: s
     shellFunction(entry.source, 'marker_phase'),
     shellFunction(entry.source, 'predecessor_is_active'),
     shellFunction(entry.source, 'remove_reboot_fence'),
+    shellFunction(entry.source, 'resume_restore_cron_locked'),
     shellFunction(entry.source, 'resume_from_interrupted_arming'),
   )
   if (isInstall) parts.push(shellFunction(entry.source, 'adopt_existing_fence'))
@@ -3303,6 +3459,7 @@ for (const entry of R8_CASES) {
         'crontab(){ if [[ "${3:-}" == "-l" ]]; then echo "*/5 * * * * /usr/bin/true"; else echo "crontab $*" >> "${LOG}"; fi; return 0; }',
         durabilityFunctions(entry.source),
         shellFunction(entry.source, 'publish_cron_backup'),
+        shellFunction(entry.source, 'fence_cron_locked'),
         shellFunction(entry.source, 'fence_cron'),
         'CRON_FENCED=false',
         'CRON_BACKUP_CREATED=false',
@@ -3377,6 +3534,7 @@ function runPointOfNoReturn(state: string, unfenceRc: number): { log: string; st
       entry.extra,
       R8_STUBS,
       `unfence_cron(){ echo "unfence_cron" >> "\${LOG}"; return ${unfenceRc}; }`,
+      shellFunction(entry.source, 'restore_cron_from_backup_locked'),
       shellFunction(entry.source, 'restore_cron_from_backup'),
       shellFunction(entry.source, 'rollback_reboot_fence_install'),
       shellFunction(entry.source, 'unwind_arming'),
@@ -3548,6 +3706,15 @@ test('no harness in this file makes a trap the left operand of an AND-OR list', 
 const R9_MARKER_PREAMBLE = (dir: string) => `
 DRY_RUN=false
 BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
+# THE REAL CRONTAB EXCLUSION, sourced rather than stubbed (o3d-p9dq): fence_cron and its siblings
+# perform their read-modify-write through with_crontab_lock, so a harness without it would be
+# measuring an ordering the shipped code no longer has. The lock file is created directly because
+# prepare_crontab_lock needs root; its preparation is exercised in
+# tests/settings/crontab-reconcile-serialization.test.ts.
+source '${LOCK_LIB}'
+crontab_lock_paths '${dir}'
+mkdir -p "\${CRONTAB_LOCK_DIR}"
+: > "\${CRONTAB_LOCK_FILE}"
 CUTOVER_STATE_DIR='${dir}'
 STATE_DIR='${dir}'
 DATA_DIR='${dir}'
@@ -3726,7 +3893,7 @@ for (const entry of R9_SCRIPTS) {
     // empty crontab or leaves cron commented out for ever.
     const result = runR9(
       entry,
-      ['fsync_path', 'publish_cron_backup', 'fence_cron'],
+      ['fsync_path', 'publish_cron_backup', 'fence_cron_locked', 'fence_cron'],
       'fence_cron',
       [R9_BARRIER_SHIMS, 'DRY_RUN=false', 'step(){ :; }', 'header(){ :; }'].join('\n'),
     )
@@ -7112,7 +7279,13 @@ test('update.sh never reads a shell variable that only the deleted `source` coul
   // it expands is a name this run expands. It is scanned as one file with update.sh, and the
   // per-entrypoint half of the same question — does EVERY entrypoint define what the shared
   // library reads — is the test immediately below.
-  const LIBRARY_LINES = readFileSync(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'), 'utf8').split(/\r?\n/)
+  const LIBRARY_LINES = [
+    ...readFileSync(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'), 'utf8').split(/\r?\n/),
+    // …and the crontab exclusion, sourced by all three entrypoints since o3d-p9dq. It assigns
+    // CRONTAB_LOCK_FILE, CRONTAB_LOCK_CONFLICT and CRONTAB_LOCK_WAIT_SECONDS, which update.sh
+    // expands with no default — so leaving it out of this scan reports three names as unsupplied.
+    ...readFileSync(join(process.cwd(), 'scripts/lib/crontab-lock.sh'), 'utf8').split(/\r?\n/),
+  ]
   const label = 'update.sh'
   const code = [...UPDATE_LINES, ...LIBRARY_LINES].filter((line) => !/^\s*#/.test(line))
 
@@ -7176,8 +7349,12 @@ test('every entrypoint defines what the shared fence library reads', () => {
   // MUTATION ROUTE: delete the `DB_FENCE_SCRIPT=` line from install.sh and this fails naming
   // install.sh and DB_FENCE_SCRIPT; add `echo "${DB_FENCE_NOWHERE}"` to the library and it fails
   // for all three.
-  const LIBRARY = readFileSync(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'), 'utf8')
-  const libCode = LIBRARY.split(/\r?\n/).filter((line) => !/^\s*#/.test(line))
+  // BOTH shared libraries, for the same reason (o3d-p9dq added the second): each is sourced by
+  // all three entrypoints and each expands names the entrypoint must supply — DB_FENCE_SCRIPT for
+  // the fence, APP_USER for the crontab lock's refusal messages.
+  const libCode = ['scripts/lib/db-fence-protected.sh', 'scripts/lib/crontab-lock.sh']
+    .flatMap((rel) => readFileSync(join(process.cwd(), rel), 'utf8').split(/\r?\n/))
+    .filter((line) => !/^\s*#/.test(line))
 
   const libAssigned = new Set<string>()
   for (const line of libCode) {
@@ -7199,6 +7376,8 @@ test('every entrypoint defines what the shared fence library reads', () => {
   // PRECONDITION, so this is not a test of an empty set: the library really does depend on the
   // entrypoint for the one thing it must not decide for itself — where the checkout's helper is.
   assert.ok(needed.has('DB_FENCE_SCRIPT'), `the library must read DB_FENCE_SCRIPT from its caller (${[...needed]})`)
+  assert.ok(needed.has('APP_USER'),
+    `the crontab lock library must read APP_USER from its caller (${[...needed]})`)
 
   for (const [label, lines] of [['update.sh', UPDATE_LINES], ['deploy.sh', DEPLOY_LINES], ['install.sh', INSTALL_LINES]] as const) {
     const source = lines.filter((line) => !/^\s*#/.test(line)).join('\n')
@@ -7211,6 +7390,8 @@ test('every entrypoint defines what the shared fence library reads', () => {
       `${label} must resolve the library beside itself, not under an application-writable directory`,
     )
     assert.match(source, /source "\$\{IMS_SCRIPT_LIB_DIR\}\/db-fence-protected\.sh"/, `${label} must source it`)
+    assert.match(source, /source "\$\{IMS_SCRIPT_LIB_DIR\}\/crontab-lock\.sh"/,
+      `${label} must source the crontab exclusion from the same place`)
   }
 })
 

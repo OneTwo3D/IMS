@@ -14,7 +14,7 @@ import {
 import { writeFile } from 'node:fs/promises'
 import { createReadStream } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import test, { mock } from 'node:test'
 
 // ---------------------------------------------------------------------------
@@ -430,57 +430,69 @@ test('[o3d-batch-ret] the crontab child inherits the lock descriptor, so the exc
 // ---------------------------------------------------------------------------
 
 const INSTALL_SH = readFileSync(join(REPO_ROOT, 'scripts/install.sh'), 'utf8')
+const DEPLOY_SH = readFileSync(join(REPO_ROOT, 'scripts/deploy.sh'), 'utf8')
+const UPDATE_SH = readFileSync(join(REPO_ROOT, 'scripts/update.sh'), 'utf8')
+const CRONTAB_LOCK_LIB = join(REPO_ROOT, 'scripts/lib/crontab-lock.sh')
+const CRONTAB_LOCK_LIB_SRC = readFileSync(CRONTAB_LOCK_LIB, 'utf8')
+const SHELL_ENTRYPOINTS: Array<[string, string]> = [
+  ['scripts/install.sh', INSTALL_SH],
+  ['scripts/deploy.sh', DEPLOY_SH],
+  ['scripts/update.sh', UPDATE_SH],
+]
 
 /**
- * The installer's OWN lock lines, lifted out of the script rather than retyped here. If someone
- * removes or renames them, these tests stop finding them and fail — which is the point: this is
- * the only coverage that the shell writer is inside the exclusion.
+ * A probe that takes the crontab lock EXACTLY the way the shipped entrypoints take it: by sourcing
+ * scripts/lib/crontab-lock.sh and calling `with_crontab_lock`. Nothing about the acquisition is
+ * retyped here, so removing or weakening the helper breaks these tests rather than passing quietly.
+ *
+ * It replaces a probe that lifted `exec 9<…` / `flock … 9` out of scripts/install.sh by regexp.
+ * Those two lines are gone — o3d-p9dq moved the acquisition into the library, partly because fd 9
+ * is where all three entrypoints hold the SHARED CUTOVER lock and `exec 9<` was silently releasing
+ * it.
  */
-function installerLockLines() {
-  const openFd = INSTALL_SH.match(/^exec 9<"\$\{CRONTAB_LOCK_FILE\}"$/m)
-  const acquire = INSTALL_SH.match(/^if ! (flock --exclusive --timeout \d+ 9); then$/m)
-  const closeFd = INSTALL_SH.match(/^exec 9>&-/m)
-  assert.ok(openFd, 'scripts/install.sh must open the crontab lock file READ-ONLY on fd 9 '
-    + '(flock(2) ignores the access mode, and the file is root-owned — r24)')
-  assert.ok(acquire, 'scripts/install.sh must take an exclusive flock on fd 9 before writing the crontab')
-  assert.ok(closeFd, 'scripts/install.sh must close fd 9 to release the crontab lock')
-  return { openFd: openFd![0], acquire: acquire![1] }
+function shellLockProbe(body: string, waitSeconds: number): string {
+  return `set -u
+die() { echo "DIE: $*" >&2; exit 1; }
+IMS_CRONTAB_LOCK_WAIT_SECONDS=${waitSeconds}
+source '${CRONTAB_LOCK_LIB}'
+CRONTAB_LOCK_DIR='${dirname(LOCK_FILE)}'
+CRONTAB_LOCK_FILE='${LOCK_FILE}'
+probe_body() {
+${body}
+}
+rc=0
+with_crontab_lock probe_body || rc=$?
+exit "$rc"`
 }
 
-test('[o3d-batch-ret] the INSTALLER cannot take the crontab lock while the application holds it', async () => {
-  const { openFd, acquire } = installerLockLines()
+/** `flock --conflict-exit-code` is not used by the shell helper; it reports conflicts as 75. */
+const SHELL_LOCK_CONFLICT = 75
+
+test('[o3d-batch-ret] a SHELL ENTRYPOINT cannot take the crontab lock while the application holds it', async () => {
   // `--timeout 0`: an immediate, deterministic answer about a lock that is definitely held.
-  const probe = `set -u
-CRONTAB_LOCK_FILE='${LOCK_FILE}'
-${openFd}
-if ! ${acquire.replace(/--timeout \d+/, '--timeout 0')}; then echo CONFLICT; exit 9; fi
-echo ACQUIRED
-exec 9>&-`
+  const probe = shellLockProbe('  echo ACQUIRED', 0)
 
   const { withCrontabReconcileLock } = await import('@/lib/crontab-reconcile-lock')
   const outcome = await withCrontabReconcileLock(async () => sh(probe))
   assert.equal(outcome.locked, true)
   const result = outcome.locked === true ? outcome.result : null
-  assert.equal(result!.stdout.trim(), 'CONFLICT',
-    "the installer's own lock lines must be refused while a reconciliation holds the lock")
-  assert.equal(result!.code, 9)
+  assert.equal(result!.code, SHELL_LOCK_CONFLICT,
+    'with_crontab_lock must report a conflict, not run the body, while a reconciliation holds the lock')
+  assert.doesNotMatch(result!.stdout, /ACQUIRED/,
+    'and the body must not have run: a shell writer that proceeds without the lock IS the defect')
 
   // …and granted the moment it is free, so this is exclusion and not a broken command.
   const after = await sh(probe)
-  assert.equal(after.stdout.trim(), 'ACQUIRED')
+  assert.equal(after.code, 0)
+  assert.match(after.stdout, /ACQUIRED/)
 })
 
-test('[o3d-batch-ret] an APPLICATION reconciliation is refused while the installer holds the crontab lock', async () => {
-  const { openFd, acquire } = installerLockLines()
-  const holder = spawn('bash', ['-c', `set -u
-CRONTAB_LOCK_FILE='${LOCK_FILE}'
-${openFd}
-${acquire} || exit 9
-echo held > '${READY_FIFO}'
-head -n 1 '${GO_FIFO}' > /dev/null
-exec 9>&-`], { stdio: ['ignore', 'ignore', 'pipe'] })
+test('[o3d-batch-ret] an APPLICATION reconciliation is refused while a SHELL ENTRYPOINT holds the crontab lock', async () => {
+  const holder = spawn('bash', ['-c', shellLockProbe(
+    `  echo held > '${READY_FIFO}'\n  head -n 1 '${GO_FIFO}' > /dev/null`, 30)],
+  { stdio: ['ignore', 'ignore', 'pipe'] })
   await awaitFifo(READY_FIFO)
-  assert.equal(await lockIsFree(), false, 'the installer holds the lock')
+  assert.equal(await lockIsFree(), false, 'the shell entrypoint holds the lock')
 
   // The wait is bounded, and here it is deliberately short: the assertion is that it EXPIRES.
   process.env.OTI_CRONTAB_LOCK_WAIT_MS = '50'
@@ -488,7 +500,7 @@ exec 9>&-`], { stdio: ['ignore', 'ignore', 'pipe'] })
   const result = await saveBackup(true)
 
   assert.equal(crontabText(), before,
-    'no application reconciliation may rewrite the crontab while the installer is inside its own read-modify-write')
+    'no application reconciliation may rewrite the crontab while a shell entrypoint is inside its own read-modify-write')
   assert.equal(snapshots.length, 0, 'and it must not even snapshot the settings')
   assert.equal(result.status, 'post-commit-failed')
   assert.equal(result.status === 'post-commit-failed' && result.step, 'scheduler')
@@ -497,8 +509,8 @@ exec 9>&-`], { stdio: ['ignore', 'ignore', 'pipe'] })
   await writeFile(GO_FIFO, 'go\n')
   await new Promise((resolve) => holder.on('exit', resolve))
 
-  // Once the installer is out, the application reconciles normally — the refusal was the exclusion,
-  // not a broken path.
+  // Once the entrypoint is out, the application reconciles normally — the refusal was the
+  // exclusion, not a broken path.
   delete process.env.OTI_CRONTAB_LOCK_WAIT_MS
   assert.deepEqual(await saveBackup(true), { status: 'saved' })
   assert.ok(backupLineInstalled())
@@ -576,14 +588,9 @@ test('[o3d-batch-ret] a lock file REPLACED mid-wait does not leave the reconcili
   // — and believing it is alone. Nothing in this repository removes the file (the installer
   // `touch`es it precisely so the inode survives a re-run), but "nothing does" is what every one of
   // these findings has been about.
-  const { openFd, acquire } = installerLockLines()
-  const holder = spawn('bash', ['-c', `set -u
-CRONTAB_LOCK_FILE='${LOCK_FILE}'
-${openFd}
-${acquire} || exit 9
-echo held > '${READY_FIFO}'
-head -n 1 '${GO_FIFO}' > /dev/null
-exec 9>&-`], { stdio: ['ignore', 'ignore', 'pipe'] })
+  const holder = spawn('bash', ['-c', shellLockProbe(
+    `  echo held > '${READY_FIFO}'\n  head -n 1 '${GO_FIFO}' > /dev/null`, 30)],
+  { stdio: ['ignore', 'ignore', 'pipe'] })
   await awaitFifo(READY_FIFO)
 
   const { withCrontabReconcileLock } = await import('@/lib/crontab-reconcile-lock')
@@ -612,6 +619,89 @@ exec 9>&-`], { stdio: ['ignore', 'ignore', 'pipe'] })
 // ---------------------------------------------------------------------------
 // 8 — EVERY writer of this crontab, in every language, participates
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// THE SHELL-SIDE CLASSIFIER, shared by the census and by the mutation control below.
+//
+// It exists as a function rather than as code inside one test precisely so that the negative
+// control can run the SAME logic over a mutated source. A guard that is only ever asked about
+// sources that satisfy it has not been shown to reject anything (o3d-p9dq).
+// ---------------------------------------------------------------------------
+type ShellCrontabSite = { file: string; line: number; text: string }
+
+/**
+ * Every `crontab` INVOCATION in one shell source.
+ *
+ * `\s*` AFTER `^`, not before `crontab`: the original spelling required `crontab` to be the FIRST
+ * CHARACTER of the line, so every indented bare invocation — which is what a call inside a shell
+ * function looks like — was skipped by a test that calls itself a walk.
+ *
+ * A line beginning with a double quote is skipped, and that is not a loophole: those are the
+ * continuation lines of `die`/`warn` messages, several of which QUOTE `crontab -u <user> <backup>`
+ * as the by-hand recovery command an operator should run. Counting operator prose as a writer is
+ * how round 25's allowlist came to carry entries for functions whose only `crontab` was in a
+ * sentence. Every real invocation in these scripts is a command, and no command line in them
+ * begins with a quote.
+ */
+function shellCrontabSitesIn(file: string, src: string): ShellCrontabSite[] {
+  const sites: ShellCrontabSite[] = []
+  src.split('\n').forEach((line, index) => {
+    const trimmed = line.trimStart()
+    if (trimmed.startsWith('#') || trimmed.startsWith('"')) return
+    if (!/(^\s*|[|;&({]\s*)crontab\b/.test(line)) return
+    sites.push({ file, line: index + 1, text: line })
+  })
+  return sites
+}
+
+/**
+ * Which shell function a line is inside. Classified by ENCLOSING FUNCTION rather than by file,
+ * because that is the unit that either takes the lock or does not.
+ */
+function enclosingFunctionInSource(src: string[], line: number): string {
+  for (let i = line - 1; i >= 0; i -= 1) {
+    const opened = src[i].match(/^([a-zA-Z_][a-zA-Z0-9_]*)\(\) \{/)
+    if (opened) return opened[1]
+    if (i < line - 1 && /^\}/.test(src[i])) break   // left the previous function's body
+  }
+  return '(top level)'
+}
+
+function enclosingFunctionIn(file: string, line: number): string {
+  return enclosingFunctionInSource(readFileSync(join(REPO_ROOT, file), 'utf8').split('\n'), line)
+}
+
+/**
+ * THE RULE, applied. A scope is reported when either half fails:
+ *
+ *   • the crontab invocation is not inside a `*_locked` body at all — it is at top level, or in an
+ *     ordinary function, which is where every one of round 25's fourteen exceptions sat; or
+ *   • it IS in such a body, but that body has a caller which is not `with_crontab_lock`. A second
+ *     entry point into a locked body is an unlocked writer wearing the name of a locked one, and
+ *     it is the placement a file-keyed or count-keyed allowlist cannot see.
+ */
+function unlockedCrontabScopesIn(
+  files: Array<[string, string]>,
+  sites: ShellCrontabSite[],
+): string[] {
+  const sources = new Map(files)
+  const bad = new Set<string>()
+  for (const site of sites) {
+    const raw = sources.get(site.file) ?? readFileSync(join(REPO_ROOT, site.file), 'utf8')
+    const src = raw.split('\n')
+    const fn = enclosingFunctionInSource(src, site.line)
+    const scope = `${site.file}:${fn}`
+    if (!fn.endsWith('_locked')) { bad.add(scope); continue }
+    const references = src.filter((l) => !l.trimStart().startsWith('#')
+      && new RegExp(`(^|[^A-Za-z0-9_])${fn}([^A-Za-z0-9_]|$)`).test(l))
+    const callers = references.filter((l) => !new RegExp(`^${fn}\\(\\) \\{`).test(l))
+    if (callers.length === 0) { bad.add(scope); continue }
+    if (!callers.every((l) => new RegExp(`^\\s*with_crontab_lock ${fn}([^A-Za-z0-9_]|$)`).test(l))) {
+      bad.add(scope)
+    }
+  }
+  return [...bad].sort()
+}
 
 test('[o3d-batch-ret] every crontab writer in the repository is inside the one exclusion protocol', () => {
   // A repository WALK, not a list: a seventh writer added anywhere under these roots shows up here
@@ -643,14 +733,11 @@ test('[o3d-batch-ret] every crontab writer in the repository is inside the one e
           if (!call) return
           if (/'-l'/.test(line)) codeReads.push(rel)
           else codeWrites.push(rel)
-          // `\s*` AFTER `^`, not before `crontab`. The original spelling required `crontab` to be
-          // the FIRST CHARACTER of the line, so every indented bare invocation — which is what a
-          // call inside a shell function looks like — was skipped by a test that calls itself a
-          // walk. The merge with o3d-2sm1.5 brought in nine of them.
-        } else if (/(^\s*|[|;&({]\s*)crontab\b/.test(line) && !line.trimStart().startsWith('#')) {
-          shellCrontab.push({ file: rel, line: index + 1, text: line })
         }
       })
+      // The shell side goes through the SHARED classifier, so the census and the mutation control
+      // below are asking one question rather than two that happen to agree today.
+      if (isShell) shellCrontab.push(...shellCrontabSitesIn(rel, src))
     }
   }
   roots.forEach(walk)
@@ -690,112 +777,92 @@ test('[o3d-batch-ret] every crontab writer in the repository is inside the one e
   }
   assert.equal(callSites, 6, 'six call sites — if this changed, the new caller must be listed above')
 
-  // --- writer 2 and beyond: the shell scripts ---
+  // --- writer 2 and beyond: the three shell entrypoints ---
   //
-  // THIS USED TO SAY `['scripts/install.sh']`, AND IT WAS TRUE WHEN IT WAS WRITTEN. The merge with
-  // o3d-2sm1.5 brought in a fenced cutover — deploy.sh, update.sh and install.sh itself now comment
-  // the whole crontab out before a migration, back it up verbatim, and put it back afterwards —
-  // and NONE of those read-modify-writes takes the flock. So the honest statement is no longer
-  // "one shell writer"; it is "one shell writer is inside the protocol, and these named ones are
-  // not, and here is exactly which".
+  // ROUND 25 LISTED FOURTEEN EXCEPTIONS HERE AND CALLED IT A CENSUS. install.sh had the flock;
+  // deploy.sh and update.sh fenced, unfenced, adopted and unwound the SAME crontab with no
+  // exclusion at all, and this test recorded that as an allowlist keyed by enclosing function —
+  // `{'scripts/deploy.sh:fence_cron': 2, …}`, fourteen entries. An exclusion protocol with
+  // fourteen declared exceptions is not an exclusion protocol, so o3d-p9dq closed them, and what
+  // stands here is a RULE rather than a list:
   //
-  // Classified by ENCLOSING SHELL FUNCTION rather than by file, because that is the unit that
-  // either takes the lock or does not, and because a file-level list would go on passing while a
-  // seventh function was added to a file already on it.
-  const enclosingFunction = (file: string, line: number): string => {
-    const src = readFileSync(join(REPO_ROOT, file), 'utf8').split('\n')
-    for (let i = line - 1; i >= 0; i--) {
-      const opened = src[i].match(/^([a-zA-Z_][a-zA-Z0-9_]*)\(\) \{/)
-      if (opened) return opened[1]
-      if (i < line - 1 && /^\}/.test(src[i])) break   // left the previous function's body
+  //   every shell crontab invocation sits in a body whose name ends `_locked`,
+  //   and every one of those bodies is reachable ONLY through `with_crontab_lock`.
+  //
+  // A list would go on passing while a fifteenth writer was added to a file already on it. The
+  // rule fails on the fifteenth, wherever it is put — and that is proved by mutation in
+  // '[o3d-batch-ret] the census fails on a FIFTEENTH writer', below, which feeds it a source with
+  // one added.
+  const unlocked = unlockedCrontabScopesIn(SHELL_ENTRYPOINTS, shellCrontab)
+  assert.deepEqual(unlocked, [],
+    'every shell crontab read-modify-write must sit in a `*_locked` body whose only caller is '
+    + 'with_crontab_lock. These are not: ' + JSON.stringify(unlocked))
+
+  // NOT VACUOUS: the walk found the bodies, in all three entrypoints, and each is where the
+  // cutover fence and its unwind actually live.
+  const scopes = new Set(shellCrontab.map((c) => `${c.file}:${enclosingFunctionIn(c.file, c.line)}`))
+  for (const file of ['scripts/install.sh', 'scripts/deploy.sh', 'scripts/update.sh']) {
+    for (const body of ['fence_cron_locked', 'unfence_cron_locked',
+      'restore_cron_from_backup_locked', 'resume_restore_cron_locked']) {
+      assert.ok(scopes.has(`${file}:${body}`),
+        `${file} must still perform its crontab read-modify-write in ${body}() — if it was renamed `
+        + 'or removed, this census no longer covers it')
     }
-    return '(top level)'
   }
-  const byScope = new Map<string, number>()
-  for (const c of shellCrontab) {
-    const key = `${c.file}:${enclosingFunction(c.file, c.line)}`
-    byScope.set(key, (byScope.get(key) ?? 0) + 1)
-  }
-
-  // (a) THE ONE THAT IS INSIDE THE PROTOCOL. install.sh's bootstrap block, at top level, between
-  //     the descriptor it opens on the lock and the one it closes.
-  const installLinesForScope = INSTALL_SH.split('\n')
-  const lockOpen = installLinesForScope.findIndex((l) => l === 'exec 9<"${CRONTAB_LOCK_FILE}"')
-  const lockClose = installLinesForScope.findIndex((l, i) => i > lockOpen && /^exec 9>&-/.test(l))
-  assert.ok(lockOpen !== -1 && lockClose > lockOpen,
-    'scripts/install.sh must still open and close the crontab lock descriptor')
-  // Asserted just below, against the same region computed from the same two lines.
-  const topLevelInstall = shellCrontab.filter(
-    (c) => c.file === 'scripts/install.sh' && enclosingFunction(c.file, c.line) === '(top level)')
-
-  // (b) THE ONES THAT ARE NOT, NAMED AND COUNTED. Every entry here is a crontab read-modify-write
-  //     that can race the application's `reconcileCrontab`, which six server actions can start from
-  //     a browser at any moment. They are the cutover fence and its unwind: the crontab is
-  //     commented out while the OLD build is still serving, and restored after the NEW one is,
-  //     so the application is live at both ends of the window.
-  //
-  //     Tracked as o3d-p9dq — extend the crontab flock to the fenced cutover.
-  //     Listed rather than tolerated: a writer that is NOT one of these fails this test, and so
-  //     does closing the gap, which is the point — either change has to come back through here.
-  const OUTSIDE_THE_PROTOCOL: Record<string, number> = {
-    'scripts/install.sh:fence_cron': 2,
-    'scripts/install.sh:unfence_cron': 1,
-    'scripts/install.sh:resume_from_interrupted_arming': 2,
-    'scripts/install.sh:restore_cron_from_backup': 1,
-    'scripts/deploy.sh:fence_cron': 2,
-    'scripts/deploy.sh:unfence_cron': 1,
-    'scripts/deploy.sh:resume_from_interrupted_arming': 2,
-    'scripts/deploy.sh:restore_cron_from_backup': 1,
-    'scripts/deploy.sh:adopt_cron_fence': 1,
-    'scripts/update.sh:fence_cron': 2,
-    'scripts/update.sh:unfence_cron': 1,
-    'scripts/update.sh:resume_from_interrupted_arming': 2,
-    'scripts/update.sh:restore_cron_from_backup': 1,
-    'scripts/update.sh:adopt_cron_fence': 1,
-  }
-  const found: Record<string, number> = {}
-  for (const [key, count] of byScope) {
-    if (key === 'scripts/install.sh:(top level)') continue
-    found[key] = count
-  }
-  assert.deepEqual(found, OUTSIDE_THE_PROTOCOL,
-    'every shell function that touches this crontab must be either inside the flock or on this '
-    + 'list. A new one is a second exclusion protocol; a removed one means the gap closed and the '
-    + 'list must shrink with it.')
-
-  // And none of those may be an unlocked write in the file that DOES own the lock without saying
-  // so — install.sh's fenced-cutover functions are on the list above precisely because they run
-  // BEFORE the section-16 lock is ever opened.
-  for (const key of Object.keys(OUTSIDE_THE_PROTOCOL)) {
-    if (!key.startsWith('scripts/install.sh:')) continue
-    const fn = key.slice('scripts/install.sh:'.length)
-    const declared = installLinesForScope.findIndex((l) => l.startsWith(`${fn}() {`))
-    assert.notEqual(declared, -1, `scripts/install.sh no longer declares ${fn}()`)
-    assert.ok(declared < lockOpen,
-      `${fn}() must be declared before the lock section, or it should be taking the lock`)
+  assert.ok(scopes.has('scripts/install.sh:bootstrap_managed_crontab_block_locked'),
+    'the installer must still write its bootstrap block, and inside the lock')
+  for (const file of ['scripts/deploy.sh', 'scripts/update.sh']) {
+    assert.ok(scopes.has(`${file}:adopt_cron_fence_locked`),
+      `${file} re-fences an adopted crontab and that read-modify-write is one critical section too`)
   }
 
+  // AND EVERY ENTRYPOINT JOINS THE PROTOCOL FROM THE SAME FILE. Three copies of an exclusion are
+  // three exclusions; db-fence-protected.sh made the same argument about the fence script and this
+  // is the same shape (o3d-p9dq).
+  for (const [name, src] of SHELL_ENTRYPOINTS) {
+    assert.match(src, /^source "\$\{IMS_SCRIPT_LIB_DIR\}\/crontab-lock\.sh" \|\| \{$/m,
+      `${name} must source the shared crontab lock library, not restate the protocol`)
+    assert.match(src, /^crontab_lock_paths "\$\{(?:DATA_DIR|CUTOVER_STATE_DIR)\}"$/m,
+      `${name} must compose its lock path through crontab_lock_paths(), so the two components live `
+      + 'in one place')
+    assert.match(src, /^\s*prepare_crontab_lock$/m,
+      `${name} must PREPARE the root-owned lock before it touches the crontab: on a host installed `
+      + 'by a release older than this protocol the lock file does not exist yet')
+    assert.doesNotMatch(src, /^\s*exec 9<"\$\{CRONTAB_LOCK_FILE\}"/m,
+      `${name} must not open the crontab lock on fd 9: that is the descriptor acquire_cutover_lock `
+      + 'holds the SHARED CUTOVER lock on, and re-opening it releases that lock')
+  }
+
+  // THE ONE PLACE A BODY MAY RUN WITHOUT THE LOCK, and it is in the library rather than at any
+  // call site: --dry-run, which is documented to work unprivileged and whose crontab bodies all
+  // return before any write.
+  const dryRunBypasses = CRONTAB_LOCK_LIB_SRC.split('\n')
+    .filter((l) => /CRONTAB_LOCK_DRY_RUN/.test(l) && !l.trim().startsWith('#'))
+  assert.deepEqual(dryRunBypasses.map((l) => l.trim()),
+    ['CRONTAB_LOCK_DRY_RUN=false', 'if ${CRONTAB_LOCK_DRY_RUN}; then'],
+    'the dry-run bypass must be exactly one declaration and one branch, in the library')
+  for (const [name, src] of SHELL_ENTRYPOINTS) {
+    const sets = src.split('\n').filter((l) => /^CRONTAB_LOCK_DRY_RUN=/.test(l))
+    if (name === 'scripts/install.sh') {
+      assert.deepEqual(sets, [],
+        'scripts/install.sh has no --dry-run, so it must never raise the bypass')
+    } else {
+      assert.deepEqual(sets, ['CRONTAB_LOCK_DRY_RUN="${DRY_RUN}"'],
+        `${name} must raise the bypass from its own DRY_RUN and from nothing else`)
+    }
+  }
+
+  // THE INSTALLER'S BOOTSTRAP IS STILL GATED ON THE BUILD/LISTENER PROOF, and the gate is still
+  // BEFORE the lock is taken rather than beside it.
   const installLines = INSTALL_SH.split('\n')
   const lineOf = (re: RegExp) => {
     const index = installLines.findIndex((l) => re.test(l))
     assert.notEqual(index, -1, `scripts/install.sh is missing: ${re}`)
     return index + 1
   }
-  const opened = lineOf(/^exec 9<"\$\{CRONTAB_LOCK_FILE\}"$/)
-  const acquired = lineOf(/^if ! flock --exclusive --timeout \d+ 9; then$/)
-  const released = lineOf(/^exec 9>&-/)
-  assert.ok(opened < acquired && acquired < released, 'open, lock, release, in that order')
-
-  // SCOPED TO install.sh's OWN TOP-LEVEL WRITES. It used to run over every shell crontab site in
-  // the repository, which was the same set while install.sh was the only shell writer. deploy.sh
-  // and update.sh are now writers too and are NOT inside this file's flock — that is recorded, and
-  // bounded, by OUTSIDE_THE_PROTOCOL above; asserting it here instead would only mean asserting
-  // that install.sh's line numbers apply to another file.
-  assert.ok(topLevelInstall.length > 0, 'the installer must still write the crontab at top level')
-  for (const { line, text } of topLevelInstall) {
-    assert.ok(line > acquired && line < released,
-      `scripts/install.sh:${line} touches the crontab outside the flock region (lines ${acquired}-${released}): ${text.trim()}`)
-  }
+  const guard = lineOf(/^\[\[ "\$\{APP_SERVICE_ON_NEW_BUILD:-false\}" == "true" \]\]/)
+  const taken = lineOf(/^with_crontab_lock bootstrap_managed_crontab_block_locked/)
+  assert.ok(guard < taken, 'the proof gate must precede the acquisition, not follow it')
 
   // The installer is a BOOTSTRAP: it must not overwrite a managed block the application owns,
   // because its schedules are defaults rather than the committed settings.
@@ -805,11 +872,14 @@ test('[o3d-batch-ret] every crontab writer in the repository is inside the one e
   // And it must never replace the lock file, because the lock lives on the inode.
   assert.doesNotMatch(INSTALL_SH, /rm -f "\$\{CRONTAB_LOCK_FILE\}"/)
 
-  // The lock file is prepared ONCE, in section 8, and the crontab region only opens it (r24). No
-  // `touch`/`chown`/`chmod` may sit on either lock path anywhere in the script: those three follow
-  // symlinks, and both paths live under a directory the service user owns.
-  const lockPathOperations = installLines
-    .map((l, index) => ({ line: index + 1, text: l.trim() }))
+  // The lock file is prepared ONCE, by the library, and nothing else ever operates on either lock
+  // path (r24). No `touch`/`chown`/`chmod` may sit on them ANYWHERE — in the library or in any of
+  // the three entrypoints — because those three follow symlinks and both paths live under a
+  // directory the service user owns. Scanned across all four files, since the preparation moved.
+  const lockPathOperations = [['scripts/lib/crontab-lock.sh', CRONTAB_LOCK_LIB_SRC] as [string, string],
+    ...SHELL_ENTRYPOINTS]
+    .flatMap(([name, src]) => src.split('\n')
+      .map((l, index) => ({ file: name, line: index + 1, text: l.trim() })))
     .filter(({ text }) => !text.startsWith('#')
       && /\$\{CRONTAB_LOCK_(?:DIR|FILE)\}/.test(text)
       && /^(touch|chmod|chown|install|ln|cp|mv|rm)\b/.test(text))
@@ -819,18 +889,56 @@ test('[o3d-batch-ret] every crontab writer in the repository is inside the one e
     'every root-side operation on the crontab lock paths must be symlink-proof: only `chown -h` '
     + '(which never dereferences) is allowed, and touch/chmod are not',
   )
-  assert.equal(lockPathOperations.length, 2,
-    'the two `chown -h root:root` calls in prepare_crontab_lock — the directory and the file')
-  assert.doesNotMatch(INSTALL_SH, /chown[^\n]*\$\{APP_USER\}[^\n]*\$\{CRONTAB_LOCK_/,
-    'the lock must never be handed to the service user: that is what made an installer re-run a '
-    + 'privilege-escalation primitive (r24 CRITICAL)')
-  assert.match(INSTALL_SH, /^prepare_crontab_lock$/m,
-    'prepare_crontab_lock must actually be CALLED, not merely defined')
+  assert.deepEqual(lockPathOperations.map(({ file }) => file),
+    ['scripts/lib/crontab-lock.sh', 'scripts/lib/crontab-lock.sh'],
+    'the two `chown -h root:root` calls in prepare_crontab_lock — the directory and the file — and '
+    + 'no entrypoint may have grown one of its own')
+  for (const [name, src] of [['scripts/lib/crontab-lock.sh', CRONTAB_LOCK_LIB_SRC] as [string, string],
+    ...SHELL_ENTRYPOINTS]) {
+    assert.doesNotMatch(src, /chown[^\n]*\$\{APP_USER\}[^\n]*\$\{CRONTAB_LOCK_/,
+      `${name}: the lock must never be handed to the service user — that is what made an installer `
+      + 're-run a privilege-escalation primitive (r24 CRITICAL)')
+  }
   assert.ok(
-    installLines.findIndex((l) => l === 'prepare_crontab_lock') < opened,
-    'the lock must be prepared before the crontab region opens it — the installer no longer '
-    + 'creates it there, and by then the service is already running',
+    installLines.findIndex((l) => l === 'prepare_crontab_lock') < taken,
+    'the lock must be prepared before the installer takes it — the installer no longer creates it '
+    + 'there, and by then the service is already running',
   )
+})
+
+// ---------------------------------------------------------------------------
+// 8b — the census is a RULE, not a list: it fails on the fifteenth writer
+// ---------------------------------------------------------------------------
+
+test('[o3d-batch-ret] the census fails on a FIFTEENTH writer, wherever it is put', () => {
+  // MUTATION, against the SAME classifier the census above runs. Round 25's version of this test
+  // held a fourteen-entry allowlist keyed by file:function, which a new crontab call inside an
+  // already-listed function satisfied silently. Three placements are tried, and each is the
+  // natural one for a future edit to reach for.
+  const placements: Array<[string, string]> = [
+    // (a) a brand-new helper that does its own read-modify-write
+    ['a new unlocked function',
+      'sweep_cron() {\n  crontab -u "${APP_USER}" -l | grep -v foo | crontab -u "${APP_USER}" -\n}\n'],
+    // (b) a line added at top level, outside every function
+    ['a top-level write', '\ncrontab -u "${APP_USER}" /tmp/whatever\n'],
+    // (c) a line added INSIDE a body that is already inside the protocol, but reached from a new
+    //     wrapper of its own — the placement a file-keyed or count-keyed allowlist cannot see
+    ['a second, unlocked caller of a locked body',
+      'refence_cron() {\n  crontab -u "${APP_USER}" -l > /dev/null\n  fence_cron_locked\n}\n'],
+  ]
+  for (const [what, snippet] of placements) {
+    const mutated = INSTALL_SH + '\n' + snippet
+    const sites = shellCrontabSitesIn('scripts/install.sh', mutated)
+    const unlocked = unlockedCrontabScopesIn([['scripts/install.sh', mutated]], sites)
+    assert.notDeepEqual(unlocked, [],
+      `the census must reject ${what}; it reported nothing unlocked`)
+  }
+
+  // CONTROL — the unmutated sources come back clean through the very same two functions, so the
+  // three rejections above are the rule working and not a classifier that rejects everything.
+  const clean = SHELL_ENTRYPOINTS.flatMap(([name, src]) => shellCrontabSitesIn(name, src))
+  assert.ok(clean.length >= 15, `the control must reach the real sites (found ${clean.length})`)
+  assert.deepEqual(unlockedCrontabScopesIn(SHELL_ENTRYPOINTS, clean), [])
 })
 
 // ---------------------------------------------------------------------------
@@ -838,20 +946,31 @@ test('[o3d-batch-ret] every crontab writer in the repository is inside the one e
 // ---------------------------------------------------------------------------
 
 /**
- * Evaluate the installer's OWN variable definitions in a real bash, and print what they resolve to.
+ * Evaluate the installer's OWN definitions in a real bash, and print what they resolve to.
  *
- * Not a re-typed copy of the paths: the four `NAME="…"` lines are lifted out of scripts/install.sh
- * by name, so renaming APP_NAME or repointing DATA_DIR moves what these tests compare against and a
- * divergence shows up here instead of on an operator's box.
+ * Not a re-typed copy of the paths. The plain `NAME="…"` lines are lifted out of scripts/install.sh
+ * by name; the two lock paths are no longer literals there at all — o3d-p9dq moved the two
+ * components into scripts/lib/crontab-lock.sh so that three entrypoints could not each get them
+ * slightly wrong — so this SOURCES that library and runs the installer's own lifted
+ * `crontab_lock_paths` call. Renaming APP_NAME, repointing DATA_DIR or changing either component
+ * therefore moves what these tests compare against, and a divergence shows up here instead of on an
+ * operator's box.
  */
+const COMPOSED_LOCK_NAMES = ['CRONTAB_LOCK_DIR', 'CRONTAB_LOCK_FILE']
 async function installerResolves(names: string[]): Promise<Record<string, string>> {
-  const defs = names.map((name) => {
+  const defs = names.filter((name) => !COMPOSED_LOCK_NAMES.includes(name)).map((name) => {
     const line = INSTALL_SH.match(new RegExp(`^${name}="[^"]*"$`, 'm'))
     assert.ok(line, `scripts/install.sh must define ${name} on one line`)
     return line![0]
   })
+  const compose = INSTALL_SH.match(/^crontab_lock_paths "\$\{DATA_DIR\}"$/m)
+  assert.ok(compose, 'scripts/install.sh must compose its crontab lock path from ${DATA_DIR} '
+    + 'through the shared library, on one line')
+  assert.ok(names.includes('DATA_DIR'),
+    'DATA_DIR is what the composition reads, so it has to be resolved alongside it')
   const prints = names.map((name) => `printf '%s=%s\\n' '${name}' "\${${name}}"`)
-  const { code, stdout, stderr } = await sh(`set -eu\n${defs.join('\n')}\n${prints.join('\n')}`)
+  const { code, stdout, stderr } = await sh(
+    `set -eu\n${defs.join('\n')}\nsource '${CRONTAB_LOCK_LIB}'\n${compose![0]}\n${prints.join('\n')}`)
   assert.equal(code, 0, `the installer's own definitions must evaluate: ${stderr}`)
   const resolved: Record<string, string> = {}
   for (const line of stdout.split('\n').filter(Boolean)) {
@@ -1333,20 +1452,22 @@ test('[o3d-batch-ret] OTI_CRONTAB_LOCK_PATH is refused in production, so it cann
 // unprivileged service user owns. All three follow symlinks, so that user could replace the lock
 // file with a link to any path on the system and have the next install or upgrade hand it over.
 //
-// These four tests drive the SHIPPED `prepare_crontab_lock`, lifted out of scripts/install.sh and
-// executed by a real bash against real files. `chown` is the only step this harness cannot perform
+// These four tests drive the SHIPPED `prepare_crontab_lock`, lifted out of
+// scripts/lib/crontab-lock.sh and executed by a real bash against real files. `chown` is the only step this harness cannot perform
 // (it is not root); it is recorded and asserted instead, which is how these tests observe that
 // every root-side ownership change is `--no-dereference`.
 // ---------------------------------------------------------------------------
 
 /**
- * The installer's OWN preparation function, lifted out of the script rather than retyped here — so
- * a change to it changes what these tests execute, instead of quietly leaving them testing a copy.
+ * The SHIPPED preparation function, lifted out of scripts/lib/crontab-lock.sh rather than retyped
+ * here — so a change to it changes what these tests execute, instead of quietly leaving them
+ * testing a copy. It lived in scripts/install.sh until o3d-p9dq; deploy.sh and update.sh now
+ * prepare the same root-owned lock, from this same function, so the tests follow it.
  */
 function installerPreparer(): string {
-  const lines = INSTALL_SH.split('\n')
+  const lines = CRONTAB_LOCK_LIB_SRC.split('\n')
   const start = lines.indexOf('prepare_crontab_lock() {')
-  assert.notEqual(start, -1, 'scripts/install.sh must define prepare_crontab_lock()')
+  assert.notEqual(start, -1, 'scripts/lib/crontab-lock.sh must define prepare_crontab_lock()')
   const end = lines.indexOf('}', start)
   assert.ok(end > start, 'prepare_crontab_lock() must be closed by a `}` on its own line')
   return lines.slice(start, end + 1).join('\n')
@@ -1389,7 +1510,7 @@ function assertChownsNeverDereference(run: PreparerRun): void {
     + 'is also how the service user came to own the lock file in the first place')
 }
 
-test('[o3d-batch-ret] the installer prepares the lock with symlink-proof primitives only', () => {
+test('[o3d-batch-ret] the shared library prepares the lock with symlink-proof primitives only', () => {
   // The three behavioural tests that follow prove the OUTCOME. This one names the mechanism, so
   // that a future edit which reaches the same outcome by a dereferencing route — the natural,
   // obvious route, and the one round 23 took — is refused here rather than only when someone
@@ -1587,9 +1708,10 @@ test('[o3d-batch-ret] the prepared lock cannot be replaced from a directory the 
  */
 function buildProofArmingBlock(): { block: string; from: number; to: number } {
   const lines = INSTALL_SH.split('\n')
-  const from = lines.findIndex((l) => l === 'if $NEW_BUILD_SERVING; then')
+  const from = lines.findIndex((l) => l === 'if $NEW_BUILD_SERVING && $APP_SERVICE_LISTENER_PROVED; then')
   assert.notEqual(from, -1,
-    'scripts/install.sh must gate the point of no return on $NEW_BUILD_SERVING')
+    'scripts/install.sh must gate the point of no return on BOTH proofs: the build identity of the '
+    + 'tree on the port, and the listener being this unit\'s own process (o3d-p9dq)')
   const to = lines.findIndex((l, i) => i > from && l === 'fi')
   assert.notEqual(to, -1, 'that block must be closed')
   return { block: lines.slice(from, to + 1).join('\n'), from, to }
@@ -1614,18 +1736,29 @@ test('[o3d-batch-ret] the crontab guard flag is armed ONLY by the proof that THI
   assert.match(block, /APP_SERVICE_ON_NEW_BUILD=true/,
     'the lifted block must be the one under test')
 
-  // (b) AND IT REALLY IS THE GATE — the shipped lines, run. Without the proof the flag stays down.
+  // (b) AND IT REALLY IS THE GATE — the shipped lines, run. Each proof is withheld in turn, and
+  //     BOTH cases must leave the flag down. The second one is round 26's finding: a listener that
+  //     serves the newly built tree without being the unit's process passes the asset fetch and
+  //     has no $STATE_DIRECTORY, so it would resolve a different lock file entirely.
   const prelude = 'set -euo pipefail\nPAST_POINT_OF_NO_RETURN=false\nAPP_SERVICE_ON_NEW_BUILD=false\n'
   const report = '\necho "flag=${APP_SERVICE_ON_NEW_BUILD}"'
-  const unproved = await sh(`${prelude}NEW_BUILD_SERVING=false\n${block}${report}`)
-  assert.equal(unproved.code, 0, unproved.stderr)
-  assert.match(unproved.stdout, /flag=false/,
-    'a run that could not prove which build is on the port must NOT arm the crontab guard — '
-    + 'moving the assignment out of the if would make this read true')
+  const withheld: Array<[string, string]> = [
+    ['neither proof', 'NEW_BUILD_SERVING=false\nAPP_SERVICE_LISTENER_PROVED=false'],
+    ['no build proof', 'NEW_BUILD_SERVING=false\nAPP_SERVICE_LISTENER_PROVED=true'],
+    ['no listener proof', 'NEW_BUILD_SERVING=true\nAPP_SERVICE_LISTENER_PROVED=false'],
+  ]
+  for (const [what, vars] of withheld) {
+    const unproved = await sh(`${prelude}${vars}\n${block}${report}`)
+    assert.equal(unproved.code, 0, unproved.stderr)
+    assert.match(unproved.stdout, /flag=false/,
+      `with ${what}, the crontab guard must NOT be armed — moving the assignment out of the if, or `
+      + 'dropping either conjunct, would make this read true')
+  }
 
-  // (c) CONTROL. With the proof, the same shipped lines raise it — so (b) is a gate and not a
+  // (c) CONTROL. With both proofs, the same shipped lines raise it — so (b) is a gate and not a
   //     block that never assigns anything.
-  const proved = await sh(`${prelude}NEW_BUILD_SERVING=true\n${block}${report}`)
+  const proved = await sh(
+    `${prelude}NEW_BUILD_SERVING=true\nAPP_SERVICE_LISTENER_PROVED=true\n${block}${report}`)
   assert.equal(proved.code, 0, proved.stderr)
   assert.match(proved.stdout, /flag=true/)
 })
@@ -1647,18 +1780,36 @@ test('[o3d-batch-ret] the predecessor is stopped, the new build is started, and 
   const unit = at(/^cat > "\/etc\/systemd\/system\/\$\{APP_NAME\}\.service"/, 'unit heredoc')
   const start = at(/^systemctl start "\$\{APP_NAME\}\.service"$/, 'service start')
   const proof = at(/^\s*NEW_BUILD_SERVING=true$/, 'build proof')
+  const listener = at(/^\s*APP_SERVICE_LISTENER_PROVED=true$/, 'listener proof')
   const arm = at(/^\s*APP_SERVICE_ON_NEW_BUILD=true$/, 'guard arming')
   const guard = at(/^\[\[ "\$\{APP_SERVICE_ON_NEW_BUILD:-false\}" == "true" \]\]/, 'crontab guard')
-  const open = at(/^exec 9<"\$\{CRONTAB_LOCK_FILE\}"$/, 'lock open')
+  const open = at(/^with_crontab_lock bootstrap_managed_crontab_block_locked/, 'lock acquisition')
+
+  // AND THE CRON FENCE IS BELOW THE STOP, which is round 26's other half: fencing it above the
+  // stop is a read-modify-write racing a browser-triggered reconciliation that the flock cannot
+  // exclude on its first rollout, because the predecessor was built before the flock existed.
+  const drained = at(/^\s*success "Nothing is serving \$\{APP_NAME\} any more\."$/, 'drain proof')
+  // The CUTOVER fence, not the adoption path's — that one is declared far above and calls the same
+  // function for a predecessor this run has just re-stopped.
+  const cutoverFences = lines
+    .map((l, i) => [l, i] as [string, number])
+    .filter(([l, i]) => /^\s*fence_cron$/.test(l) && i > stop)
+  assert.equal(cutoverFences.length, 1,
+    'exactly one cutover fence_cron call, and it must be the one below the drain; found at '
+    + JSON.stringify(cutoverFences.map(([, i]) => i + 1)))
+  const fence = cutoverFences[0][1]
 
   // THE ORDER THE WHOLE PROTOCOL RESTS ON. The build is produced while the predecessor still
-  // serves; the predecessor is then stopped; the unit is rewritten; the new process is started
-  // and PROVED to be this build; only then may the crontab lock be opened.
-  const order = { build, stop, unit, start, proof, arm, guard, open }
-  assert.ok(build < stop && stop < unit && unit < start && start < proof
-    && proof < arm && arm < guard && guard < open,
-    'the order must be build -> stop -> unit -> start -> proof -> arm -> guard -> lock, and is '
-    + JSON.stringify(order))
+  // serves; the predecessor is then stopped and the port proved free; only then is the crontab
+  // fenced; the unit is rewritten; the new process is started, PROVED to be this build and PROVED
+  // to be this unit's; only then may the crontab lock be taken.
+  const order = { build, stop, drained, fence, unit, start, proof, listener, arm, guard, open }
+  assert.ok(build < stop && stop < drained && drained < fence && fence < unit
+    && unit < start && start < proof && proof < listener && listener < arm
+    && arm < guard && guard < open,
+    'the order must be build -> stop -> drain -> fence-cron -> unit -> start -> build-proof -> '
+    + 'listener-proof -> arm -> guard -> lock, and is ' + JSON.stringify(order))
+
 
   // AND `enable --now` IS STILL NOT HOW THE SERVICE COMES UP. Its `--now` is a `start`, which does
   // nothing to a running process — the original finding, and the reason enable and start are two
@@ -1673,7 +1824,7 @@ test('[o3d-batch-ret] the predecessor is stopped, the new build is started, and 
 
   // A RUN THAT CANNOT SAY WHICH BUILD ANSWERED DOES NOT REACH ANY OF THIS. The else branch of the
   // build proof dies, so there is no path from "something answered the port" to the crontab lock.
-  const proofElse = lines.slice(proof, guard).find((l) => /^\s*die "Something answered /.test(l))
+  const proofElse = lines.slice(build, guard).find((l) => /^\s*die "Something answered /.test(l))
   assert.ok(proofElse,
     'an unproved build must die between the health check and the crontab section, not warn')
   assert.match(proofElse!, /predecessor still holding port/,
