@@ -2056,8 +2056,14 @@ fi
 exit 0
 `)
 writeFileSync(join(PROOF_BIN, 'ss'), `#!/bin/sh
-[ -n "\${FAKE_LISTENER_PID}" ] || exit 0
-printf 'LISTEN 0 511 *:%s *:* users:(("node",pid=%s,fd=21))\\n' "\${FAKE_PORT}" "\${FAKE_LISTENER_PID}"
+if [ -n "\${FAKE_LISTENER_PID}" ]; then
+  printf 'LISTEN 0 511 *:%s *:* users:(("node",pid=%s,fd=21))\\n' "\${FAKE_PORT}" "\${FAKE_LISTENER_PID}"
+fi
+# A second row on the same port that \`ss\` could not attribute to any pid — what a socket held by
+# a process this reader cannot see looks like, and what SO_REUSEPORT makes dangerous.
+if [ -n "\${FAKE_UNATTRIBUTED_ROW}" ]; then
+  printf 'LISTEN 0 511 *:%s *:*\\n' "\${FAKE_PORT}"
+fi
 `)
 chmodSync(join(PROOF_BIN, 'systemctl'), 0o755)
 chmodSync(join(PROOF_BIN, 'ss'), 0o755)
@@ -2147,13 +2153,27 @@ test('[o3d-batch-ret] a listener serving the new build that is NOT the unit\'s p
     })
     assert.match(inactive.stdout, /does not report app\.service active/, inactive.stdout)
 
-    // (e) NOTHING HOLDS THE PORT — `systemctl start` returned but nothing bound.
+    // (e) ONE ATTRIBUTED ROW BESIDE ONE `ss` COULD NOT ATTRIBUTE. Taking the pids that were named
+    //     and ignoring the rest answers a different question from "which process did the fetch
+    //     reach" — with SO_REUSEPORT the kernel may hand the connection to the socket this run
+    //     cannot name. update.sh's prove_service_owns_port already refuses on exactly this.
+    const mixed = await runListenerProof({
+      ...base, FAKE_MAIN_PID: String(insider.pid), FAKE_CGROUP: ownCgroup,
+      FAKE_LISTENER_PID: String(insider.pid), FAKE_UNATTRIBUTED_ROW: '1',
+    })
+    assert.match(mixed.stdout, /^UNPROVEN=/m,
+      `one attributed listener beside one unattributable one is not a proof:\n${mixed.stdout}`)
+    assert.match(mixed.stdout, /shows 2 listening socket\(s\) on :3000 and attributes 1 of them to no pid at all/,
+      'and it must count the ROWS, not the pids it happened to read')
+
+    // (f) NOTHING HOLDS THE PORT — `systemctl start` returned but nothing bound.
     const nobody = await runListenerProof({
       ...base, FAKE_MAIN_PID: String(insider.pid), FAKE_CGROUP: ownCgroup, FAKE_LISTENER_PID: '',
     })
-    assert.match(nobody.stdout, /named no process holding a listening socket/, nobody.stdout)
+    assert.match(nobody.stdout, /reports no listening socket on :3000 at all/,
+      `nothing listening is its own answer, distinct from a row nobody owns:\n${nobody.stdout}`)
 
-    // (f) CONTROL. The unit's own process, in its control group, with this run's state directory
+    // (g) CONTROL. The unit's own process, in its control group, with this run's state directory
     //     first in a colon-separated $STATE_DIRECTORY — which is what systemd hands a unit with
     //     several StateDirectory= entries, and what lib/crontab-reconcile-lock.ts takes the first
     //     of. Without this the five refusals above could be a proof that refuses everything.

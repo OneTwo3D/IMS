@@ -7125,7 +7125,7 @@ effective_state_directory() {
 LISTENER_PROOF_REASON=""
 LISTENER_PIDS=""
 prove_listener_belongs_to_unit() {
-  local unit="${APP_NAME}.service" main_pid cgroup pids pid state_dir first
+  local unit="${APP_NAME}.service" main_pid cgroup rows row_count unattributed pids pid state_dir first
   LISTENER_PROOF_REASON=""
   LISTENER_PIDS=""
 
@@ -7156,11 +7156,26 @@ prove_listener_belongs_to_unit() {
     LISTENER_PROOF_REASON="\`ss\` is not available, so this run cannot find out which process holds the listening socket on :${APP_PORT}"
     return 1
   }
-  pids="$(ss -ltnp 2>/dev/null | awk -v p=":${APP_PORT}\$" '$4 ~ p' \
-    | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u | tr '\n' ' ')"
+  # EVERY ROW, AND A ROW WITHOUT A PID IS AN UNKNOWN HOLDER RATHER THAN AN ABSENT ONE. Taking the
+  # pids `ss` did attribute and ignoring the rows it could not is how "one of them is ours" passes
+  # for a question that is which process the fetch above actually reached — and with SO_REUSEPORT
+  # the kernel may hand a connection to the socket this run cannot name. update.sh's
+  # prove_service_owns_port already refuses on exactly this; the rule is the same one.
+  rows="$(ss -ltnp 2>/dev/null | awk -v p=":${APP_PORT}\$" '$4 ~ p')"
+  [[ -n "${rows}" ]] || {
+    LISTENER_PROOF_REASON="\`ss -ltnp\` reports no listening socket on :${APP_PORT} at all, so the process behind the response cannot be identified"
+    return 1
+  }
+  row_count="$(printf '%s\n' "${rows}" | wc -l)"
+  unattributed="$(printf '%s\n' "${rows}" | grep -cv 'pid=[0-9]' || true)"
+  [[ "${unattributed}" -eq 0 ]] || {
+    LISTENER_PROOF_REASON="\`ss -ltnp\` shows ${row_count} listening socket(s) on :${APP_PORT} and attributes ${unattributed} of them to no pid at all — an unattributable holder is an unknown and not an absent one, so the process behind the response cannot be identified"
+    return 1
+  }
+  pids="$(printf '%s\n' "${rows}" | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u | tr '\n' ' ')"
   pids="${pids% }"
   [[ -n "${pids}" ]] || {
-    LISTENER_PROOF_REASON="\`ss -ltnp\` named no process holding a listening socket on :${APP_PORT}"
+    LISTENER_PROOF_REASON="\`ss -ltnp\` shows ${row_count} listening socket(s) on :${APP_PORT} and no pid could be read out of any of them"
     return 1
   }
 
