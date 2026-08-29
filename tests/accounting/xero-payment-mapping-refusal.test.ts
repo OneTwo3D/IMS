@@ -929,13 +929,22 @@ test('[o3d-batch-ret r10] every OTHER field this path reads is refused when pres
   // 120` readable — so the amount and the mapping are both fine and the only thing refusing is the
   // field under test.
   //
-  // MUTATION THAT KILLS IT: in lib/connectors/xero/sync-processor.ts, restore the inline reads —
-  // `const method = payload._paymentMethod as string || ''`, `const currency = payload.currency as
-  // string || 'GBP'`, `paymentDate: (payload._paymentDate as string)?.slice(0, 10) || new
-  // Date().toISOString().slice(0, 10)` — and read them instead of the classifier's values. The two
-  // null arms and the `''` currency then queue an INVOICE_PAYMENT against the GBP account and clear
-  // the marker, the `'20/08/2026'` arm queues one dated "20/08/2026", and the numeric-date arm
-  // throws instead of refusing. Every arm fails on `followUpTypes` or on the refusal count.
+  //
+  // MUTATION THAT KILLS IT: in lib/domain/accounting/followup-enqueue-outcome.ts, give the three
+  // field classifiers the semantics the connectors used to have inline — `payloadPaymentMethod`
+  // returning `{ value: payload._paymentMethod as string || '' }`, `payloadPaymentCurrency`
+  // returning `{ value: payload.currency as string || BASE_PAYMENT_CURRENCY }` and
+  // `payloadPaymentDate` returning `{ value: (payload._paymentDate as string)?.slice(0, 10) || new
+  // Date().toISOString().slice(0, 10) }`. The null-currency, empty-currency and null-date arms then
+  // queue an INVOICE_PAYMENT against the sterling account, the `'20/08/2026'` arm queues one dated
+  // "20/08/2026", the null-method arms fall through to the MAPPING refusal instead of the payload
+  // one, and the numeric-date arm throws. Every arm fails on `followUpTypes`, on the refusal count
+  // or on the reason code.
+  //
+  // NOT "restore the reads in the connector" — verified, and it kills nothing. The classifier
+  // refuses before `onAmount` is ever entered, so a connector-side read of an unreadable field is
+  // unreachable code. That the reads must not come back is a SOURCE fact, and
+  // followup-enqueue-resolver-door.test.ts is what asserts it.
   const fields: Array<{ what: string; field: Record<string, unknown>; detail: RegExp }> = [
     { what: 'a present `_paymentMethod` holding null', field: { _paymentMethod: null }, detail: /`_paymentMethod` is null, which is not a payment-method string/ },
     { what: 'a `_paymentMethod` that is not a string at all', field: { _paymentMethod: 7 }, detail: /`_paymentMethod` is 7, which is not a payment-method string/ },
