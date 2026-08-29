@@ -326,7 +326,7 @@ test('the allowlist names exactly the screens that call a generic settings write
   // The walk must have gone somewhere. Without this, a mistyped root would make every assertion
   // below compare two empty sets and pass.
   assert.ok(scanned > 200, `the walk reached only ${scanned} files`)
-  assert.ok(importers.length >= 10, `found only ${importers.length} generic-writer callers`)
+  assert.ok(importers.length >= 8, `found only ${importers.length} generic-writer callers`)
 
   assert.deepEqual(
     [...new Set(importers)].sort(),
@@ -353,15 +353,34 @@ test('every allowlisted key really appears in the screen it is filed under', () 
     }
   }
   assert.equal(checked, WRITABLE_SETTING_KEYS.length, 'no key is filed under two screens or none')
-  assert.ok(checked >= 38, `the walk reached ${checked} keys`)
+  assert.ok(checked >= 32, `the walk reached ${checked} keys`)
 })
 
 // ---------------------------------------------------------------------------
 // 8. Nothing system-managed has leaked onto the allowlist.
 // ---------------------------------------------------------------------------
 
-test('no system-managed key has leaked onto the allowlist', () => {
+test('no system-managed key has leaked onto the allowlist', async () => {
+  // THE CRON REGISTRY IS AN OWNER TOO (Codex r20 HIGH, second finding). The backup and FX schedule
+  // switches were allowlisted for one round on the strength of "a screen offers them", and both were
+  // duplicating enablement the registry owns — `backup_schedule_enabled` badly (a crontab line the
+  // generic save never reconciled) and the FX pair not at all (no reader anywhere). Deriving the
+  // scheduler's keys FROM THE REGISTRY is what stops that being re-reasoned into existence.
+  const { getAllCronJobs } = await import('@/lib/cron-jobs')
+  const cronJobs = getAllCronJobs()
+  assert.ok(cronJobs.length >= 10, `the registry produced only ${cronJobs.length} jobs — the barrel did not register`)
+  const schedulerKeys = cronJobs.flatMap((job) => [
+    `cron_${job.settingKey}_enabled`,
+    `cron_${job.settingKey}_schedule`,
+    ...(job.legacyEnabledKey ? [job.legacyEnabledKey] : []),
+  ])
+  assert.ok(
+    schedulerKeys.includes('backup_schedule_enabled'),
+    'the backup job still declares its legacy enablement row — this cross-check names a live key',
+  )
+
   const owned = new Set<string>([
+    ...schedulerKeys,
     ...RESERVED_SETTING_KEYS,
     ...keysInSourceConst('app/actions/wc-sync.ts', 'SYNC_SETTING_KEYS'),
     'wc_url',
@@ -375,7 +394,7 @@ test('no system-managed key has leaked onto the allowlist', () => {
     'onboarding_complete',
     'onboarding_dismissed',
   ])
-  assert.ok(owned.size >= 30, `the cross-check assembled only ${owned.size} owned keys`)
+  assert.ok(owned.size >= 50, `the cross-check assembled only ${owned.size} owned keys`)
 
   for (const key of WRITABLE_SETTING_KEYS) {
     assert.ok(!owned.has(key), `${key} has an owning writer and must not be generically writable`)

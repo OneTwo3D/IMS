@@ -1,44 +1,34 @@
 'use client'
 
-import { useState, useTransition } from 'react'
-import { Loader2, Check, RefreshCw } from 'lucide-react'
+import { useState } from 'react'
+import { Loader2, RefreshCw } from 'lucide-react'
 import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
-import { Switch } from '@/components/ui/switch'
-import { setSettings } from '@/app/actions/settings'
 import { fetchAllFxRates } from '@/app/actions/currencies'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
 
+/**
+ * THE SCHEDULE CONTROLS THIS PANEL USED TO OFFER DID NOTHING (Codex r20 HIGH).
+ *
+ * It saved `fx_schedule_enabled` and `fx_schedule_interval_hours` through the generic settings
+ * writer, and NOTHING READ EITHER ROW. The FX refresh is a registered cron job (`fx_rates`), so its
+ * enablement and its schedule are `cron_fx_rates_enabled` / `cron_fx_rates_schedule`, written by the
+ * Scheduled Jobs editor and rendered into the crontab; `/api/cron/fx-rates` then runs
+ * unconditionally whenever it is invoked. So an operator could switch automatic updates off here,
+ * see "Saved", and have rates keep refreshing on the old schedule indefinitely.
+ *
+ * The controls are gone rather than rewired. Rewiring would mean inventing a mapping from "every N
+ * hours" (this panel offered 1-168) to a cron expression, and no such mapping is faithful past 23.
+ * The real control already exists and is one screen away; this panel now says where, and keeps the
+ * two things it genuinely does — showing when rates were last fetched, and fetching them now.
+ */
 type Props = {
-  enabled: boolean
-  intervalHours: string
   lastFetched: string | null
 }
 
-export function FxScheduleSettings({ enabled, intervalHours, lastFetched }: Props) {
+export function FxScheduleSettings({ lastFetched }: Props) {
   const formatDateTime = useFormatDateTime()
-  const [isPending, startTransition] = useTransition()
-  const [saved, setSaved] = useState(false)
-  const [isEnabled, setIsEnabled] = useState(enabled)
-  const [hours, setHours] = useState(intervalHours)
   const [refreshing, setRefreshing] = useState(false)
   const [refreshMsg, setRefreshMsg] = useState<string | null>(null)
-
-  function handleSave() {
-    setSaved(false)
-    startTransition(async () => {
-      // ONE transaction, not a Promise.all of independent writes (o3d-osl8 round 9, finding 1):
-      // the first rejection there left the rest still committing, so a "failed" save could store
-      // an arbitrary subset of one edit.
-      await setSettings({
-        fx_schedule_enabled: isEnabled ? 'true' : 'false',
-        fx_schedule_interval_hours: hours,
-      })
-      setSaved(true)
-      setTimeout(() => setSaved(false), 2000)
-    })
-  }
 
   async function handleRefreshNow() {
     setRefreshing(true)
@@ -64,27 +54,16 @@ export function FxScheduleSettings({ enabled, intervalHours, lastFetched }: Prop
         )}
       </p>
 
-      <label className="flex items-center gap-2 text-sm">
-        <Switch checked={isEnabled} onCheckedChange={setIsEnabled} />
-        Enable automatic FX rate updates
-      </label>
-
-      <div className="flex items-center gap-3 max-w-xs">
-        <div className="space-y-1.5 flex-1">
-          <Label className="text-xs">Update interval (hours)</Label>
-          <Input type="number" min={1} max={168} value={hours} onChange={(e) => setHours(e.target.value)} className="h-9" />
-        </div>
-      </div>
+      <p className="text-xs text-muted-foreground">
+        Automatic updates are switched on or off, and scheduled, on the <strong>FX Rate Update</strong> job in
+        Settings &rarr; System &rarr; Scheduled Jobs — that is the setting the crontab is built from.
+      </p>
 
       <div className="flex items-center gap-2">
-        <Button size="sm" onClick={handleSave} disabled={isPending}>
-          {isPending && <Loader2 className="h-4 w-4 mr-1 animate-spin" />}Save
-        </Button>
         <Button variant="outline" size="sm" onClick={handleRefreshNow} disabled={refreshing}>
           {refreshing ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <RefreshCw className="h-4 w-4 mr-1" />}
           Update Now
         </Button>
-        {saved && <span className="text-sm text-green-600 flex items-center gap-1"><Check className="h-3 w-3" />Saved</span>}
         {refreshMsg && <span className="text-sm text-green-600">{refreshMsg}</span>}
       </div>
     </div>

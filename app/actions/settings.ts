@@ -19,6 +19,7 @@ import type { SettingSaveResult } from '@/lib/domain/settings/setting-save-outco
 import { assertWritableSettingKeys } from '@/lib/domain/settings/writable-setting-keys'
 import { reconcileCrontab } from '@/lib/crontab-reconcile'
 import { normalizePublicAppUrl } from '@/lib/domain/settings/public-app-url-input'
+import { validateBackupScheduleInput, type BackupScheduleInput } from '@/lib/domain/settings/backup-schedule-input'
 import { toIsoCountryCode } from '@/lib/countries'
 import { getSettingValue, serializeSettingValue, SENSITIVE_SETTING_KEYS } from '@/lib/settings-store'
 import { refreshMutableDocumentTaxSnapshotsForRate } from '@/lib/tax/document-tax-snapshot-refresh'
@@ -1036,6 +1037,84 @@ export async function savePublicAppUrl(value: string): Promise<SettingSaveResult
   // this runs — and it is the step with a named operator recovery, which is why it reports
   // separately from the local steps above.
   const scheduler = await runPostCommit(reconcileCrontab, 'Failed to apply Public App URL changes.')
+  if (scheduler.status === 'failed') return { status: 'post-commit-failed', step: 'scheduler', error: scheduler.error }
+  return { status: 'saved' }
+}
+
+/**
+ * SAVE THE BACKUP SCHEDULE, INCLUDING THE ROW THE SCHEDULER ACTUALLY READS (Codex r20 HIGH).
+ *
+ * This panel used to save through the generic `setSettings`, and that made its enable switch a
+ * control that could do nothing. Two things read "are scheduled backups on?", and they are not the
+ * same row:
+ *
+ *   • THE CRONTAB decides whether the job is invoked at all. `buildOtiCrontabBlock` reads
+ *     `cron_backup_enabled` and falls back to the registry's `legacyEnabledKey`
+ *     (`backup_schedule_enabled`) ONLY while the canonical row is absent. So the moment anyone
+ *     touches the Scheduled Jobs editor, this screen's switch stops reaching the crontab entirely.
+ *   • THE ROUTE decides whether an invocation does anything. `/api/cron/backup` skips unless
+ *     `backup_schedule_enabled` is 'true'.
+ *
+ * And a generic settings save never reconciles the crontab, so even on an instance where the legacy
+ * fallback was still live, switching backups on stored 'true' and installed no cron line — the
+ * screen said Saved and no backup was ever taken.
+ *
+ * So this action writes BOTH rows, in one transaction, and reconciles the crontab as a post-commit
+ * step it classifies rather than rejects — the shape `savePublicAppUrl` already uses for the same
+ * reason. Writing both is deliberate and not belt-and-braces: they gate different things, and the
+ * defect is precisely that they could disagree. The `legacyEnabledKey` fallback survives for
+ * instances that have never written the canonical row; `saveCronJobSettings` mirrors in the other
+ * direction so the editor cannot leave this row stale either.
+ *
+ * NOTE THE VALIDATION. The generic writer stored whatever the inputs contained; a blank or negative
+ * retention silently became `parseInt('') || 30` at purge time. These are refused BEFORE the write,
+ * so a refusal means the stored schedule still stands.
+ */
+export async function saveBackupScheduleSettings(input: BackupScheduleInput): Promise<SettingSaveResult> {
+  await requirePermission('settings.company')
+
+  // The SAME function the screen validates with, so a value that slips past the client is refused
+  // here rather than stored.
+  const validated = validateBackupScheduleInput(input)
+  if (!validated.ok) return { status: 'refused', error: validated.error }
+  const { retentionDays, maxCount, autoUpload } = validated
+
+  const enabled = input.enabled ? 'true' : 'false'
+  const entries: Array<[string, string]> = [
+    // The row the CRONTAB reads. Canonical: once it exists the legacy fallback is never consulted.
+    ['cron_backup_enabled', enabled],
+    // The row the ROUTE reads. Kept equal to the canonical one, because a disagreement is either a
+    // cron line that runs a no-op or a backup nothing invokes.
+    ['backup_schedule_enabled', enabled],
+    ['backup_retention_days', String(retentionDays)],
+    ['backup_max_count', String(maxCount)],
+    ['backup_auto_upload', autoUpload],
+  ]
+
+  await db.$transaction(async (tx) => {
+    for (const [key, value] of entries) {
+      await tx.setting.upsert({
+        where: { key },
+        create: { key, value: serializeSettingValue(key, value) },
+        update: { value: serializeSettingValue(key, value) },
+      })
+    }
+  })
+
+  // EVERYTHING BELOW IS POST-COMMIT — see setSettings.
+  const local = await runPostCommit(async () => {
+    await logActivity({
+      entityType: 'SETTING',
+      tag: 'settings',
+      action: 'updated',
+      description: `Updated settings: ${entries.map(([key]) => key).join(', ')}`,
+    })
+    revalidatePath('/settings', 'layout')
+  }, 'Failed to record the settings change')
+  if (local.status === 'failed') return { status: 'post-commit-failed', step: 'local', error: local.error }
+
+  // The crontab is genuinely stale until this runs: the enable switch IS a crontab line.
+  const scheduler = await runPostCommit(reconcileCrontab, 'Failed to apply the backup schedule change.')
   if (scheduler.status === 'failed') return { status: 'post-commit-failed', step: 'scheduler', error: scheduler.error }
   return { status: 'saved' }
 }

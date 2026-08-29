@@ -137,13 +137,9 @@ export default async function AccountingSettingsPage({
               <h2 className="text-base font-semibold">FX Rate Schedule</h2>
             </div>
             <p className="text-sm text-muted-foreground mb-4">
-              Configure automatic FX rate updates. Rates are fetched from the European Central Bank (ECB).
+              Rates are fetched from the European Central Bank (ECB).
             </p>
-            <FxScheduleSettings
-              enabled={currencyData.fxEnabled === 'true'}
-              intervalHours={currencyData.fxInterval ?? '24'}
-              lastFetched={currencyData.fxLastFetched}
-            />
+            <FxScheduleSettings lastFetched={currencyData.fxLastFetched} />
           </Card>
         </div>
       )}
@@ -170,13 +166,14 @@ async function loadTaxRates() {
 }
 
 async function loadCurrencies() {
-  const [currencies, fxEnabled, fxInterval, fxLastFetched] = await Promise.all([
+  // `fx_schedule_enabled` / `fx_schedule_interval_hours` are NOT read here any more (Codex r20
+  // HIGH): nothing in the application ever read them, so the panel's switch and interval were
+  // controls that stored a value and changed nothing. The FX schedule is the `fx_rates` cron job.
+  const [currencies, fxLastFetched] = await Promise.all([
     getCurrencies(false),
-    getSetting('fx_schedule_enabled'),
-    getSetting('fx_schedule_interval_hours'),
     getSetting('fx_last_fetched'),
   ])
-  return { currencies, fxEnabled, fxInterval, fxLastFetched }
+  return { currencies, fxLastFetched }
 }
 
 async function loadFxRates() {

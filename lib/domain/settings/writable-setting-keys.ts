@@ -45,6 +45,22 @@ import { reservedSettingKeyRefusal } from '@/lib/domain/settings/reserved-settin
  *     each has an owning writer; see `reserved-setting-keys.ts`, which is now only where the
  *     refusal MESSAGE names that writer.
  *   • onboarding progress rows — `app/actions/onboarding.ts`, key-specific writers of their own.
+ *   • the backup schedule — `saveBackupScheduleSettings`. These looked like ordinary preferences and
+ *     were on this list for one round (Codex r20 HIGH). They are not: `backup_schedule_enabled` is
+ *     the registry's `legacyEnabledKey` for the `backup` cron job AND the row `/api/cron/backup`
+ *     gates itself on, so the switch is a crontab line, and a generic save never reconciled the
+ *     crontab. `cron_backup_enabled` and the crontab rewrite belong to the same save.
+ *   • the FX schedule — `cron_fx_rates_enabled` / `cron_fx_rates_schedule`, via `saveCronJobSettings`.
+ *     `fx_schedule_enabled` and `fx_schedule_interval_hours` had NO reader anywhere in the
+ *     application; the panel that offered them is gone rather than rewired, so those two keys are
+ *     not written by anything and belong on no list.
+ *
+ * "OFFERED BY A SCREEN" IS NOT THE WHOLE TEST, and round 20's second finding is why. A key can be
+ * offered by a screen and still not be an ordinary preference: the backup and FX schedule switches
+ * were, and both were duplicating — one badly, one not at all — state the cron registry owns. So the
+ * list is derived from the UI and then checked AGAINST THE OWNERS: the repository test cross-checks
+ * every allowlisted key against the cron registry's canonical and legacy enablement keys, so a
+ * scheduler control cannot be re-listed here by someone reasoning only from "a screen offers it".
  *
  * SECRETS ARE ON THIS LIST, DELIBERATELY. The backup S3/SFTP credentials and the TrackShip API key
  * are secrets, and they are allowlisted because THIS SCREEN IS THEIR WRITER — there is no other path
@@ -81,12 +97,6 @@ const PREFERENCE_KEYS_BY_SCREEN: Readonly<Record<string, readonly string[]>> = {
     'backup_sftp_host_fingerprint',
     'backup_sftp_path',
   ],
-  'components/settings/backup-schedule.tsx': [
-    'backup_schedule_enabled',
-    'backup_retention_days',
-    'backup_max_count',
-    'backup_auto_upload',
-  ],
   'components/settings/data-retention.tsx': [
     'retention_sales_orders_months',
     'retention_purchase_orders_months',
@@ -105,7 +115,6 @@ const PREFERENCE_KEYS_BY_SCREEN: Readonly<Record<string, readonly string[]>> = {
   ],
   'components/settings/dispatch-email.tsx': ['dispatch_email_enabled'],
   'components/settings/financial-year-start.tsx': ['financial_year_start'],
-  'components/settings/fx-schedule.tsx': ['fx_schedule_enabled', 'fx_schedule_interval_hours'],
   'components/settings/invoice-trigger.tsx': ['invoice_trigger'],
   'components/settings/landed-cost-method.tsx': ['default_landed_cost_method'],
 }

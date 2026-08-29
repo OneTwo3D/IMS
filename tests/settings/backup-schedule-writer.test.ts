@@ -1,0 +1,309 @@
+import assert from 'node:assert/strict'
+import { readFileSync, readdirSync } from 'node:fs'
+import { join, relative } from 'node:path'
+import test, { mock } from 'node:test'
+
+// ---------------------------------------------------------------------------
+// Codex r20 HIGH (second finding) — SCHEDULER STATE IS NOT AN ORDINARY PREFERENCE.
+//
+// The Backup and FX schedule panels saved through the generic key/value writer, and the r20
+// allowlist listed their keys as ordinary preferences on the strength of "a screen offers them".
+// Both were duplicating enablement the cron registry owns, and both controls were broken:
+//
+//   • BACKUP. Two rows answer "are scheduled backups on?" and they are not the same row. The crontab
+//     is built from `cron_backup_enabled`, falling back to the registry's legacyEnabledKey
+//     (`backup_schedule_enabled`) only while the canonical row is absent; `/api/cron/backup` gates
+//     its own execution on `backup_schedule_enabled`. The generic save wrote only the legacy row and
+//     never reconciled the crontab — so switching backups on stored 'true' and installed no cron
+//     line, and once anyone had touched the Scheduled Jobs editor the switch reached the crontab not
+//     at all.
+//   • FX. `fx_schedule_enabled` / `fx_schedule_interval_hours` had NO reader anywhere. The panel
+//     reported "Saved" over a switch that changed nothing; /api/cron/fx-rates runs whenever invoked.
+//
+// WHAT THESE TESTS PIN, and the route each takes:
+//   1. saveBackupScheduleSettings writes BOTH enablement rows plus the preferences in ONE
+//      transaction, and reconciles the crontab AFTER the commit
+//                                            (backup-schedule.tsx → saveBackupScheduleSettings)
+//   2. a crontab failure is reported as committed-but-scheduler-behind, never as a failed save
+//                                            (same route, post-commit guard)
+//   3. an invalid retention/count/target is refused BEFORE the write   (same route, validation gate)
+//   4. every key that screen used to send is now refused by BOTH generic writers
+//                                            (setSetting / setSettings → assertWritableSettingKeys)
+//   5. saveCronJobSettings mirrors the legacy enablement row, driven from the registry
+//                                            (cron-jobs-settings.tsx → saveCronJobSettings)
+//   6. the dead FX schedule keys are gone from the application entirely   (repository scan)
+// ---------------------------------------------------------------------------
+
+const REPO = process.cwd()
+
+const state = {
+  /** Settings rows written, in commit order. */
+  writes: [] as string[],
+  transactions: 0,
+  openTransactions: 0,
+  /** How many rows had been written when the crontab reconciliation ran. */
+  cronCalledAfterWrites: null as number | null,
+  /** Whether a transaction was still open when it ran — it must not be. */
+  openTransactionsWhenCronRan: null as number | null,
+  cronResult: { success: true } as { success: boolean; error?: string },
+  cronThrows: null as Error | null,
+  logActivityThrows: null as Error | null,
+  revalidated: [] as string[],
+  permissions: [] as string[],
+}
+
+function reset() {
+  state.writes = []
+  state.transactions = 0
+  state.openTransactions = 0
+  state.cronCalledAfterWrites = null
+  state.openTransactionsWhenCronRan = null
+  state.cronResult = { success: true }
+  state.cronThrows = null
+  state.logActivityThrows = null
+  state.revalidated = []
+  state.permissions = []
+}
+
+const txClient = {
+  setting: {
+    upsert: async ({ where, create }: { where: { key: string }; create: { key: string; value: string } }) => {
+      state.writes.push(`${where.key}=${create.value}`)
+      return { key: where.key, value: create.value }
+    },
+  },
+}
+
+mock.module('@/lib/db', {
+  namedExports: {
+    db: {
+      setting: txClient.setting,
+      $transaction: async (arg: unknown) => {
+        if (typeof arg !== 'function') return Promise.all(arg as unknown[])
+        state.transactions += 1
+        state.openTransactions += 1
+        try {
+          return await (arg as (tx: typeof txClient) => Promise<unknown>)(txClient)
+        } finally {
+          state.openTransactions -= 1
+        }
+      },
+    },
+  },
+})
+
+mock.module('@/lib/auth/server', {
+  namedExports: {
+    requireAuth: async () => ({ user: { id: 'u1', role: 'ADMIN' } }),
+    requirePermission: async (permission: string) => {
+      state.permissions.push(permission)
+      return { user: { id: 'u1', role: 'ADMIN' } }
+    },
+    requireInternalUser: async () => ({ user: { id: 'u1', role: 'ADMIN' } }),
+    requireAdmin: async () => ({ user: { id: 'u1', role: 'ADMIN' } }),
+    requireFreshAdmin: async () => ({ user: { id: 'u1', role: 'ADMIN' } }),
+    freshAuthFailureResult: () => null,
+  },
+})
+
+mock.module('@/lib/activity-log', {
+  namedExports: { logActivity: async () => { if (state.logActivityThrows) throw state.logActivityThrows } },
+})
+mock.module('next/cache', { namedExports: { revalidatePath: (path: string) => { state.revalidated.push(path) } } })
+
+/**
+ * INJECTABLE, and doubling `@/lib/crontab-reconcile` rather than `@/app/actions/cron` — the same
+ * reasoning as tests/accounting/plugin-selection-lock.test.ts. The assertions below observe calls
+ * through this double, so a stale mock target fails loudly rather than letting the real crontab work
+ * run inside the test.
+ */
+mock.module('@/lib/crontab-reconcile', {
+  namedExports: {
+    reconcileCrontab: async () => {
+      state.cronCalledAfterWrites = state.writes.length
+      state.openTransactionsWhenCronRan = state.openTransactions
+      if (state.cronThrows) throw state.cronThrows
+      return state.cronResult
+    },
+    readOwnCrontab: async () => '',
+  },
+})
+
+const VALID = { enabled: true, retentionDays: '30', maxCount: '10', autoUpload: 's3' }
+
+async function saveBackup(input: typeof VALID) {
+  const { saveBackupScheduleSettings } = await import('@/app/actions/settings')
+  return saveBackupScheduleSettings(input)
+}
+
+test.beforeEach(reset)
+
+test('the backup schedule save writes BOTH enablement rows in one transaction, then reconciles', async () => {
+  const result = await saveBackup(VALID)
+
+  assert.deepEqual(result, { status: 'saved' })
+  assert.deepEqual(state.permissions, ['settings.company'])
+  assert.deepEqual(state.writes, [
+    // The row the CRONTAB reads. Its absence was the whole defect: without it the switch reached the
+    // crontab only on instances where the legacy fallback was still live.
+    'cron_backup_enabled=true',
+    // The row /api/cron/backup reads. Equal to the canonical one, so the two gates cannot disagree.
+    'backup_schedule_enabled=true',
+    'backup_retention_days=30',
+    'backup_max_count=10',
+    'backup_auto_upload=s3',
+  ])
+  assert.equal(state.transactions, 1, 'one transaction — a partial commit is a half-configured schedule')
+  assert.equal(state.cronCalledAfterWrites, 5, 'the crontab is reconciled AFTER every row is written')
+  assert.equal(state.openTransactionsWhenCronRan, 0, 'and outside the transaction, not holding it open')
+  assert.deepEqual(state.revalidated, ['/settings'])
+})
+
+test('switching backups OFF writes false to both rows', async () => {
+  // The asymmetric half of the defect: with only the legacy row written, a disable could leave the
+  // cron line installed and the route silently skipping — a backup job that runs and does nothing.
+  await saveBackup({ ...VALID, enabled: false })
+  assert.ok(state.writes.includes('cron_backup_enabled=false'))
+  assert.ok(state.writes.includes('backup_schedule_enabled=false'))
+})
+
+test('a crontab failure is committed-but-scheduler-behind, never a failed save', async () => {
+  state.cronResult = { success: false, error: 'crontab write failed: no crontab for ims' }
+
+  const result = await saveBackup(VALID)
+
+  assert.equal(result.status, 'post-commit-failed')
+  assert.equal(result.status === 'post-commit-failed' ? result.step : null, 'scheduler')
+  assert.match(result.status === 'post-commit-failed' ? result.error : '', /crontab write failed/)
+  assert.ok(state.writes.length > 0, 'and the values really are stored — the screen must not say otherwise')
+})
+
+test('an invalid schedule is refused BEFORE anything is written', async () => {
+  // Refused, not stored-then-corrected: the purge reads these as `parseInt(x) || default`, so a
+  // blank or a zero silently became 30 days / 10 files — a schedule the operator never chose.
+  const invalid: Array<[string, typeof VALID]> = [
+    ['retention 0', { ...VALID, retentionDays: '0' }],
+    ['retention blank', { ...VALID, retentionDays: '' }],
+    ['retention fractional', { ...VALID, retentionDays: '1.5' }],
+    ['max count blank', { ...VALID, maxCount: '' }],
+    ['unknown upload target', { ...VALID, autoUpload: 'ftp' }],
+  ]
+
+  for (const [why, input] of invalid) {
+    reset()
+    const result = await saveBackup(input)
+    assert.equal(result.status, 'refused', `${why} must be refused`)
+    assert.deepEqual(state.writes, [], `${why}: nothing may be written`)
+    assert.equal(state.transactions, 0, `${why}: no transaction may open`)
+    assert.equal(state.cronCalledAfterWrites, null, `${why}: the crontab is untouched`)
+  }
+
+  // Non-vacuity: '' IS a legitimate upload target (it means "do not upload"), so the check is not
+  // "refuse every empty string".
+  reset()
+  assert.deepEqual(await saveBackup({ ...VALID, autoUpload: '' }), { status: 'saved' })
+})
+
+test('every key this screen used to send is now refused by BOTH generic writers', async () => {
+  // The panel is the only writer of these rows, and it no longer goes through setSetting/setSettings.
+  // The FX pair is here too: nothing writes it any more, so a generic write would resurrect a row
+  // with no reader.
+  const { setSetting, setSettings } = await import('@/app/actions/settings')
+  const retired = [
+    'backup_schedule_enabled',
+    'backup_retention_days',
+    'backup_max_count',
+    'backup_auto_upload',
+    'fx_schedule_enabled',
+    'fx_schedule_interval_hours',
+    'cron_backup_enabled',
+  ]
+
+  for (const key of retired) {
+    reset()
+    await assert.rejects(() => setSettings({ [key]: '1' }), `setSettings must refuse ${key}`)
+    assert.deepEqual(state.writes, [], `${key}: setSettings committed nothing`)
+    reset()
+    await assert.rejects(() => setSetting(key, '1'), `setSetting must refuse ${key}`)
+    assert.deepEqual(state.permissions, [], `${key}: setSetting refused on its OWN line`)
+  }
+})
+
+test('saveCronJobSettings mirrors the legacy enablement row, driven from the registry', async () => {
+  // The other direction of the same disagreement: the Scheduled Jobs editor writing only
+  // `cron_backup_enabled` left `backup_schedule_enabled` stale, so the cron line ran a route that
+  // skipped. The mirror is registry-driven, so a job that gains a legacyEnabledKey is covered
+  // without this test changing — via the BARREL, because registration is an import side effect and
+  // the bare registry module is empty.
+  const { getAllCronJobs } = await import('@/lib/cron-jobs')
+  const legacyJobs = getAllCronJobs().filter((job) => job.legacyEnabledKey)
+  assert.ok(legacyJobs.length > 0, 'no job declares a legacy enablement row — this test asserts nothing')
+
+  const { saveCronJobSettings } = await import('@/app/actions/cron')
+
+  for (const job of legacyJobs) {
+    reset()
+    const result = await saveCronJobSettings([{ settingKey: job.settingKey, enabled: true, schedule: '0 1 * * *' }])
+    assert.deepEqual(result, { status: 'saved' })
+    assert.ok(
+      state.writes.includes(`${job.legacyEnabledKey}=true`),
+      `${job.settingKey}: the legacy row ${job.legacyEnabledKey} must be written too`,
+    )
+    assert.ok(state.writes.includes(`cron_${job.settingKey}_enabled=true`), 'and the canonical row')
+    assert.equal(state.transactions, 1, 'in the SAME transaction — a mirror that can half-apply is not one')
+  }
+
+  // A job WITHOUT a legacy key gets exactly its two canonical rows and nothing invented.
+  const plain = getAllCronJobs().find((job) => !job.legacyEnabledKey)
+  assert.ok(plain, 'every job has a legacy key — the negative case cannot be exercised')
+  reset()
+  await saveCronJobSettings([{ settingKey: plain!.settingKey, enabled: false, schedule: '0 2 * * *' }])
+  assert.deepEqual(state.writes, [`cron_${plain!.settingKey}_enabled=false`, `cron_${plain!.settingKey}_schedule=0 2 * * *`])
+})
+
+/** Source with `//` and block comments removed, so a key NAMED in a comment is not read as a use. */
+function codeOf(file: string): string {
+  return readFileSync(file, 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/(^|[^:'"`])\/\/[^\n]*/g, '$1 ')
+}
+
+test('the dead FX schedule keys are gone from the application', () => {
+  // They were stored and never read. Leaving a LIVE reference anywhere invites the panel being
+  // "restored" by someone who finds one and assumes it means something. The three surviving mentions
+  // are prose explaining why the keys are dead, which is the opposite problem, so comments are
+  // stripped before the scan.
+  const dead = ['fx_schedule_enabled', 'fx_schedule_interval_hours']
+  const roots = ['app', 'components', 'lib', 'scripts']
+  let scanned = 0
+  const hits: string[] = []
+
+  function walk(dir: string) {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name)
+      if (entry.isDirectory()) {
+        if (entry.name === 'node_modules' || entry.name.startsWith('.')) continue
+        walk(full)
+        continue
+      }
+      if (!entry.name.endsWith('.ts') && !entry.name.endsWith('.tsx')) continue
+      scanned += 1
+      const source = codeOf(full)
+      for (const key of dead) if (source.includes(key)) hits.push(`${relative(REPO, full)}: ${key}`)
+    }
+  }
+  for (const root of roots) walk(join(REPO, root))
+
+  assert.ok(scanned > 200, `the walk reached only ${scanned} files`)
+  assert.deepEqual(hits, [], 'a key with no reader must have no writer and no screen either')
+
+  // The stripper is not a way of passing: it must still see a key that IS used in code. Fed the
+  // exact shape the panel had before this round.
+  const probe = "// fx_schedule_enabled is dead\nconst x = { fx_schedule_enabled: 'true' }\n"
+  assert.ok(probe.includes('fx_schedule_enabled'))
+  assert.equal(
+    (probe.replace(/(^|[^:'\"`])\/\/[^\n]*/g, '$1 ').match(/fx_schedule_enabled/g) ?? []).length,
+    1,
+    'the comment is stripped and the code use survives',
+  )
+})

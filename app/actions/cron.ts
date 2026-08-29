@@ -12,6 +12,10 @@ import {
   type OtiCrontabStatus,
 } from '@/lib/crontab-sync'
 import { reconcileCrontab, readOwnCrontab } from '@/lib/crontab-reconcile'
+// The BARREL, not @/lib/cron-registry: registration is an import side effect of the job modules,
+// so the registry is EMPTY unless something has imported them. Reading it bare would have mirrored
+// no legacy key and reported nothing.
+import { getAllCronJobs } from '@/lib/cron-jobs'
 import { serializeSettingValue } from '@/lib/settings-store'
 import { runPostCommit } from '@/lib/domain/post-commit'
 import type { SettingSaveResult } from '@/lib/domain/settings/setting-save-outcome'
@@ -60,10 +64,31 @@ export type CronJobSettingInput = {
 export async function saveCronJobSettings(jobs: CronJobSettingInput[]): Promise<SettingSaveResult> {
   await requirePermission('settings.company')
 
-  const entries: Array<[string, string]> = jobs.flatMap((job) => [
-    [`cron_${job.settingKey}_enabled`, String(job.enabled)] as [string, string],
-    [`cron_${job.settingKey}_schedule`, job.schedule] as [string, string],
-  ])
+  // THE LEGACY ENABLEMENT ROW IS MIRRORED, NOT LEFT BEHIND (Codex r20 HIGH).
+  //
+  // A registry job may declare a `legacyEnabledKey` — the row the crontab consulted before the
+  // canonical `cron_<job>_enabled` existed, and which `buildOtiCrontabBlock` still falls back to
+  // while the canonical row is absent. For `backup` that legacy row is `backup_schedule_enabled`,
+  // and it is ALSO the row `/api/cron/backup` gates its own execution on. Writing only the
+  // canonical row therefore produced the exact disagreement the fallback was meant to prevent: the
+  // cron line installed, the route skipping every invocation, and neither screen showing anything
+  // wrong. Mirroring here is the other half of `saveBackupScheduleSettings`, which writes both rows
+  // from the Backup screen.
+  const legacyKeyBySettingKey = new Map(
+    getAllCronJobs()
+      .filter((job) => job.legacyEnabledKey)
+      .map((job) => [job.settingKey, job.legacyEnabledKey!]),
+  )
+
+  const entries: Array<[string, string]> = jobs.flatMap((job) => {
+    const rows: Array<[string, string]> = [
+      [`cron_${job.settingKey}_enabled`, String(job.enabled)],
+      [`cron_${job.settingKey}_schedule`, job.schedule],
+    ]
+    const legacy = legacyKeyBySettingKey.get(job.settingKey)
+    if (legacy) rows.push([legacy, String(job.enabled)])
+    return rows
+  })
   if (entries.length === 0) return { status: 'saved' }
 
   await db.$transaction(async (tx) => {
