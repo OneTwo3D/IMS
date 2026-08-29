@@ -603,7 +603,18 @@ the WMS dispatch sweep all run on cron), so the first refusal may well be a cron
 watching rather than an operator's money post. What the check detects is **interposition**,
 not the pooling **mode**: a `pool_mode` cannot be read from an ordinary SQL connection, so a
 *session*-mode pooler is refused on the same evidence, and a plain TCP NAT or port-forward is refused
-too. Setting `DATABASE_SESSION_LOCK_URL` to a direct URL takes the lock connections past the pooler and
+too. **A worked example of that last case, because this repository's own CI ran into it:** GitHub
+Actions publishes a PostgreSQL *service container's* port on the runner, and `docker-proxy` carries
+the connection — it terminates the client socket and opens its own, so the backend names
+`172.18.0.1:<proxy port>` as its client while the process's own socket is `127.0.0.1:<our port>`, and
+every session lock is refused. The way out is the one below rather than a weaker check: the
+container's **own bridge address** is a direct route, because host-to-container traffic leaves via
+the bridge interface and Docker's `MASQUERADE` rule excludes it, so the backend sees this process's
+socket byte for byte. `DATABASE_SESSION_LOCK_URL` pointed there — same server, same database, same
+schema — passes both the peer comparison and the shared-lock-space measurement; see the
+`fresh-db-drift` job in `.github/workflows/schema-guardrails.yml` for the shape. The same applies to
+any published container port, Docker Desktop's VM port forward included.
+Setting `DATABASE_SESSION_LOCK_URL` to a direct URL takes the lock connections past the pooler and
 with them the refusal — the data path stays pooled, stays unsupported, and nothing reports it. Over a
 **Unix-domain socket** the backend names no peer at all (`client_addr` NULL, `client_port` -1), which
 was measured indistinguishable from Odyssey pooling over the same transport, so directness cannot be
