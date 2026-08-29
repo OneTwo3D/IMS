@@ -981,6 +981,13 @@ chown -R "${APP_USER}:${APP_USER}" "${UPLOAD_STORAGE_DIR}" "${PUBLIC_UPLOAD_STOR
 #     chmod is the same escalation with a different verb. Modes come from `umask` at creation, and a
 #     mode that is already wrong is REFUSED rather than corrected.
 #
+# AND IT IS RE-ASSERTED ON EVERY RUN, not established once. systemd re-owns a StateDirectory
+# RECURSIVELY when the TOP-LEVEL directory's owner does not match `User=` — so a box where
+# ${DATA_DIR} ends up root-owned for any reason will hand this subdirectory to ${APP_USER} at the
+# next service start. Nothing below trusts what a previous run left: it re-takes ownership and
+# re-derives every fact with lstat, so that case ends in a corrected directory or a refused install
+# rather than in a root-side write into a directory the service user can rewrite.
+#
 # WHAT IS STILL POSSIBLE, stated rather than glossed over: ${DATA_DIR} itself belongs to
 # ${APP_USER}, so that user can rename(2) the lock DIRECTORY aside within it — a same-directory
 # rename of a directory does not need write permission on the directory being renamed — and drop a
