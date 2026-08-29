@@ -25,9 +25,11 @@
  *     this process computes — `mkdtemp`, `mkdtempSync`, a bare `mkdirSync(join(tmpdir(), …))`, a
  *     library's own scratch file, a child process that inherits the environment — lands inside it.
  *     That is strictly more than the static rule covered, which only ever saw `mkdtemp`.
- *   • On exit: whatever is still in there did not get cleaned up. Report it, remove it, and fail
- *     the process. Node's test runner reports a file whose child exits non-zero as a failure and
- *     names the file, so the report arrives attached to the harness that produced it.
+ *   • On exit, strictly after every other 'exit' listener has run: whatever is still in there did
+ *     not get cleaned up. Report it, remove it, and fail the process. Node's test runner reports a
+ *     file whose child exits non-zero as a failure and names the file, so the report arrives
+ *     attached to the harness that produced it. "After every other listener" is load-bearing and
+ *     is why `process.emit` is wrapped rather than a listener added — see `settle` below.
  *
  * IT REMOVES WHAT IT FINDS, which matters more than the exit code: even a run whose failure is
  * ignored cannot leave a second directory behind, so the accumulation that started this is not
@@ -40,7 +42,7 @@
  * in package.json, and proves against a real child process that a leak fails and a clean run does
  * not.
  */
-import { mkdtempSync, readdirSync, rmSync } from 'node:fs'
+import { chmodSync, mkdtempSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -53,9 +55,22 @@ import { join } from 'node:path'
 const TOOLCHAIN = /^(?:tsx-\d+|node-compile-cache)$/
 
 const own = mkdtempSync(join(tmpdir(), 'ims-unit-'))
+
+/**
+ * `/tmp` IS 1777, AND HARNESSES DEPEND ON THAT. `mkdtemp` creates 0700, which silently changes
+ * what the tests can observe: install-password-probe-discrimination asserts that a published CA
+ * is "readable by every uid on this host", and under a 0700 ancestor that is false for a reason
+ * that has nothing to do with the code under test. Five of its assertions failed the first time
+ * this ran. Mirroring /tmp's mode exactly is what keeps the sentinel an observer.
+ */
+chmodSync(own, 0o1777)
+
 process.env.TMPDIR = own
 
-process.on('exit', () => {
+/**
+ * Whatever is left when the process is genuinely finished.
+ */
+const settle = (): void => {
   let leftovers: string[]
   try {
     leftovers = readdirSync(own).filter((entry) => !TOOLCHAIN.test(entry))
@@ -87,4 +102,24 @@ process.on('exit', () => {
       'prefix. Remove it where it is made — or, where the directory outlives the scope that made ' +
       'it, obtain it from tests/scripts/temp-dir.ts, whose creation and removal are one call.\n',
   )
-})
+}
+
+/**
+ * STRICTLY AFTER EVERY OTHER 'exit' LISTENER, which a plain `process.on('exit')` cannot be.
+ *
+ * Listeners run in registration order and this module is loaded by `--import`, i.e. before any
+ * test file — so an ordinary listener here runs FIRST and sees the directories that exit-time
+ * cleanup is about to remove. That is not a hypothetical: `tests/scripts/temp-dir.ts` drains its
+ * own set from an `exit` hook, and the first version of this file reported all 18 of the
+ * directories it was in the middle of removing as leaks.
+ *
+ * Wrapping `emit` is what makes "still there at exit" mean it, rather than meaning "still there
+ * at the moment the earliest-registered listener happened to look". It also holds for cleanup
+ * this file knows nothing about — a library's own exit handler, a future harness's.
+ */
+const emit = process.emit.bind(process)
+process.emit = function sentinelEmit(this: unknown, name: string | symbol, ...args: unknown[]) {
+  const delivered = emit(name as never, ...(args as never[]))
+  if (name === 'exit') settle()
+  return delivered
+} as typeof process.emit
