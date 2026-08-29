@@ -1371,9 +1371,53 @@ if command -v pm2 >/dev/null 2>&1; then
   env PM2_HOME="${APP_DIR}/.pm2" pm2 delete "${APP_NAME}" 2>/dev/null || true
   env PM2_HOME="${APP_DIR}/.pm2" pm2 kill 2>/dev/null || true
 fi
-systemctl enable --now "${APP_NAME}.service"
+# ---------------------------------------------------------------------------
+# RESTART THE APPLICATION — DO NOT MERELY `enable --now` (Codex r25 HIGH).
+#
+# `enable --now` is `enable` + `start`, and `start` on a unit that is ALREADY RUNNING is a no-op.
+# `daemon-reload` above only changes what the NEXT start reads. So on an upgrade — the only time
+# any of this matters — both of them together leave the pre-upgrade process alive, serving the
+# PREVIOUS bundle, with the PREVIOUS environment, and therefore on the PREVIOUS crontab exclusion
+# protocol: a lock file somewhere else, or no lock at all.
+#
+# Measured on this systemd (257), against a scratch unit:
+#   systemctl start   on an active unit -> MainPID UNCHANGED   (the defect)
+#   systemctl restart on an active unit -> MainPID CHANGED     (the fix)
+#   systemctl restart on an INACTIVE unit -> starts it, exit 0 (so no `--now` is needed)
+#
+# WHY IT MUST HAPPEN HERE, BEFORE SECTION 16. The crontab section below takes an exclusive flock on
+# ${CRONTAB_LOCK_FILE} and rewrites the managed block. That flock excludes exactly one thing: an
+# application process that locks the SAME inode. A process still running the old build locks a
+# different file, or none, so the installer and the application would hold two locks that do not
+# exclude each other and whichever wrote last would silently discard the other's block — the exact
+# race this whole protocol exists to remove, reintroduced by the upgrade itself. The restart is
+# therefore ordered AFTER the build (section 11) and the unit write (just above), and BEFORE any
+# crontab access. ${APP_SERVICE_RESTARTED} carries that ordering to the crontab section, which
+# refuses to open the lock unless it says yes.
+#
+# A FAILED RESTART ABORTS THE INSTALL. If the restart does not produce a live process on the new
+# unit we do not know what is serving this installation, so we must not go on to take a lock that
+# claims we do. Everything before this point is idempotent — the code deploy, the migrations, the
+# build, the unit file — so the operator fixes the service and re-runs the installer. What is left
+# undone by aborting here is named in the message.
+#
+# WHAT THIS DOES NOT CATCH: with Type=simple, systemd calls the service started as soon as the fork
+# succeeds, so an application that starts and then crashes seconds later still passes both checks
+# below (Restart=always would leave it flapping). That is a health check's job, not the installer's;
+# the checks here answer the narrower question this section owns — is the process that will contend
+# for the crontab lock the one this run just built.
+# ---------------------------------------------------------------------------
+APP_SERVICE_RESTARTED=no
+systemctl enable "${APP_NAME}.service"
+if ! systemctl restart "${APP_NAME}.service"; then
+  die "systemctl restart ${APP_NAME}.service failed, so the process serving this installation is not the one this run just built. Aborting BEFORE the crontab section: from here the installer takes an exclusive lock on ${CRONTAB_LOCK_FILE} to serialise against the running application, and a process on the previous build holds a different lock or none — the two would not exclude each other and one would silently discard the other's crontab block. Nothing past this point has run: no nginx site, no security hardening, no log rotation, no cron block. Diagnose with 'systemctl status ${APP_NAME}.service' and 'journalctl -u ${APP_NAME}.service -n 50', then run this installer again — every step before this one is idempotent."
+fi
+if ! systemctl is-active --quiet "${APP_NAME}.service"; then
+  die "${APP_NAME}.service is '$(systemctl is-active "${APP_NAME}.service" 2>/dev/null || true)' after a restart that reported success, so nothing is serving this installation on the build this run produced. Aborting before the crontab section for the reason above; nothing past this point has run. Diagnose with 'journalctl -u ${APP_NAME}.service -n 50', then run this installer again."
+fi
+APP_SERVICE_RESTARTED=yes
 
-success "Application service started and registered with systemd."
+success "Application service restarted onto this build and registered with systemd."
 
 # ---------------------------------------------------------------------------
 # 13. nginx configuration
@@ -1637,6 +1681,15 @@ trap 'rm -f "${CRON_BLOCK_FILE}"' EXIT
 # Never rm-and-recreate: the lock lives on the INODE, so replacing the file would hand two writers
 # two different locks and look like it worked.
 # ---------------------------------------------------------------------------
+# THE RESTART IN SECTION 12 IS WHAT MAKES THIS LOCK MEAN ANYTHING (Codex r25 HIGH). The flock
+# below excludes exactly one thing: an application process locking the SAME inode. That is only
+# true of a process running the build this run produced, under the unit this run wrote — which is
+# what the restart above guarantees and what an `enable --now` on an already-running service did
+# not. Carried here as state rather than as a comment, so reordering the two sections fails loudly
+# instead of quietly reopening the race.
+[[ "${APP_SERVICE_RESTARTED:-no}" == "yes" ]] || die \
+  "the application service was not restarted onto this build before the crontab section (APP_SERVICE_RESTARTED='${APP_SERVICE_RESTARTED:-unset}'). Taking the crontab lock now would serialise this script against nothing: a process still running the previous build locks a different file, or none, and the two writers would silently overwrite each other's managed block. This is an ordering bug in the installer itself, not an operator error — the restart is in section 12 and must precede this section."
+
 [[ -f "${CRONTAB_LOCK_FILE}" ]] || die \
   "${CRONTAB_LOCK_FILE} is missing or is not a regular file, so this crontab write cannot be serialized against the application's. It is created earlier in this script; re-run the installer."
 
