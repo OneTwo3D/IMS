@@ -105,6 +105,22 @@ export const CRONTAB_RECONCILE_LOCK_FILENAME = '.crontab-reconcile.lock'
  */
 export const CRONTAB_RECONCILE_LOCK_WAIT_MS = 20_000
 
+/**
+ * The wait, with an operator override.
+ *
+ * `OTI_CRONTAB_LOCK_WAIT_MS` exists because the bound above is a claim about how long a `crontab`
+ * rewrite takes on this host, and that is an operational property — a box where `crontab` is slow
+ * needs a longer one, and the tests that prove an installer holding the lock REFUSES an application
+ * reconciliation need a shorter one than a passing test should ever spend. Anything unparseable or
+ * non-positive falls back to the constant rather than to no bound at all.
+ */
+export function crontabReconcileLockWaitMs(): number {
+  const raw = process.env.OTI_CRONTAB_LOCK_WAIT_MS?.trim()
+  if (!raw) return CRONTAB_RECONCILE_LOCK_WAIT_MS
+  const parsed = Number(raw)
+  return Number.isFinite(parsed) && parsed > 0 ? Math.trunc(parsed) : CRONTAB_RECONCILE_LOCK_WAIT_MS
+}
+
 /** `flock --conflict-exit-code`: this exact status means "could not take it", nothing else. */
 const FLOCK_CONFLICT_EXIT_CODE = 75
 
@@ -261,7 +277,7 @@ async function acquireCrontabFileLock(timeoutMs: number): Promise<AcquireOutcome
 export async function withCrontabReconcileLock<T>(
   run: (lock: HeldCrontabReconcileLock) => Promise<T>,
 ): Promise<CrontabReconcileLockOutcome<T>> {
-  const acquired = await acquireCrontabFileLock(CRONTAB_RECONCILE_LOCK_WAIT_MS)
+  const acquired = await acquireCrontabFileLock(crontabReconcileLockWaitMs())
   if (!acquired.ok) return { locked: false, error: acquired.error }
   try {
     return { locked: true, result: await run({ fd: acquired.fd }) }

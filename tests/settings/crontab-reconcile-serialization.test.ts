@@ -1,11 +1,24 @@
 import assert from 'node:assert/strict'
-import { chmodSync, mkdtempSync, readFileSync, writeFileSync, existsSync } from 'node:fs'
+import { spawn } from 'node:child_process'
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs'
+import { writeFile } from 'node:fs/promises'
+import { createReadStream } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test, { mock } from 'node:test'
 
 // ---------------------------------------------------------------------------
-// Codex r21 HIGH — CONCURRENT RECONCILIATIONS COULD WRITE A STALE CRONTAB.
+// Codex r21 HIGH + r22 HIGH x2 — THE CRONTAB HAS EXACTLY ONE EXCLUSION PROTOCOL,
+// AND EVERY WRITER JOINS IT.
 //
 // `reconcileCrontab` snapshots the cron_* settings and then, separately, reads and rewrites the OS
 // crontab. Six server actions call it, every one of them AFTER its own commit, and nothing
@@ -19,49 +32,118 @@ import test, { mock } from 'node:test'
 //                                  write crontab: line INSTALLED
 //   write crontab: line REMOVED        <- from a snapshot taken before B committed
 //
-// The end state is the one the previous round removed by a different route: an enablement row
-// committed ON, no cron line, and every caller reporting `saved`.
+// The end state is an enablement row committed ON, no cron line, and every caller reporting
+// `saved`.
+//
+// Round 21 closed that with a PostgreSQL SESSION ADVISORY LOCK, and round 22 found two ways the
+// mechanism did not fit the resource:
+//
+//   • the lock could be released while the spawned `crontab -` was STILL WRITING (the session dies
+//     after the pre-write check), so a second reconciliation could acquire, read newer settings,
+//     write — and be overtaken by the first child finishing LAST with its stale snapshot;
+//   • `scripts/install.sh` writes the same crontab and cannot take a PostgreSQL lock at all.
+//
+// The exclusion is now a host-local `flock` on ONE file, whose descriptor is inherited by the
+// `crontab -` child and which the installer's shell takes with the same two lines.
 //
 // WHAT THESE TESTS PIN, and the route each takes:
-//   1. two concurrent saves — Backup OFF and Scheduled Jobs ON — leave the crontab agreeing with the
-//      LAST COMMIT, not the last snapshot
+//   1. LOAD-BEARING. A crontab write still in flight while a second reconciliation is queued: the
+//      final crontab is the LATER COMMIT's, and the queued reconciliation re-read the settings
+//      only after the in-flight write finished
 //                       (backup-schedule.tsx -> saveBackupScheduleSettings, and
 //                        cron-jobs-settings.tsx -> saveCronJobSettings, both -> reconcileCrontab)
-//   2. the SNAPSHOT is inside the lock, not just the write   (same route, observed at the db read)
-//   3. an ordinary single save still reconciles, and takes/releases the lock exactly once with no
-//      wait                                    (backup-schedule.tsx -> saveBackupScheduleSettings)
-//   4. the lock WAITS on the registered key rather than skipping     (lib/crontab-reconcile-lock.ts)
-//   5. a wait that times out does not write the crontab and is reported as a failure   (same)
-//   6. a lock lost mid-run refuses the write rather than writing under an exclusion it lost (same)
-//   7. the lock is released when the reconciliation throws                              (same)
-//   8. every reconcileCrontab caller is covered, because the lock is INSIDE the reconciliation
-//                                                                             (repository scan)
+//   2. LOAD-BEARING. The lock outlives the holding PROCESS's release, because the `crontab -` child
+//      holds a duplicate of the descriptor  (lib/crontab-reconcile-lock.ts + lib/crontab-reconcile.ts)
+//   3. LOAD-BEARING. An installer reconciliation and an application one cannot interleave, in both
+//      directions, using the installer's OWN lock lines lifted out of scripts/install.sh
+//   4. the SNAPSHOT is inside the lock, not just the write   (same route as 1, observed at the read)
+//   5. an ordinary single save still reconciles                (backup-schedule.tsx -> saveBackup…)
+//   6. a wait that expires does not write the crontab and is reported as a failure
+//   7. the lock is released when the reconciliation throws, and an acquisition failure is an
+//      OUTCOME rather than a throw                                    (lib/crontab-reconcile-lock.ts)
+//   8. EVERY writer of this crontab in the whole repository — TypeScript and shell — participates
+//                                                                             (repository walk)
+//   9. the app and the installer resolve the same lock FILE                    (repository scan)
 //
-// DETERMINISM. There is no sleep and no timer anywhere below. The interleaving is produced by an
-// injected BARRIER inside the settings snapshot — the reconciliation parks there until the test
-// releases it — and the test never waits on wall-clock time: it waits on `Promise.race` between
-// "the second save finished" and "the second save had to queue for the lock", exactly one of which
-// can happen in each of the two worlds being distinguished.
+// DETERMINISM. There is no sleep and no timer used to sequence anything. The interleaving comes
+// from two injected barriers — one inside the settings snapshot, one inside a real `crontab`
+// executable that parks mid-write — and every wait below is on a FIFO or a process exit, never on
+// wall-clock time. The two flock waits that DO carry a timeout are asked for `--timeout 0` (an
+// immediate, deterministic answer about a lock that is definitely held) or are asserted to expire.
 //
-// WHAT SUBSTITUTES FOR POSTGRES. `@/lib/db/pinned-advisory-lock` is doubled by a FAITHFUL in-process
-// FIFO mutex — mutual exclusion is `pg_advisory_lock`'s job and not ours to re-test. Everything
-// above it is real: the real `withCrontabReconcileLock`, the real `reconcileCrontab`, the real
-// crontab block builder and splicer, and a real `crontab` executable on PATH writing a real file.
-// The double REFUSES the try-lock form, so a reconciliation that skipped on contention instead of
-// queueing would fail here rather than pass quietly.
+// WHAT IS REAL HERE. The lock is a real `flock(2)` on a real file. The crontab is a real executable
+// on PATH writing a real file. The installer's lock lines are EXTRACTED FROM scripts/install.sh and
+// executed by a real `bash`, so a change there breaks these tests rather than passing quietly.
+// Only the database and the auth gate are doubled.
 // ---------------------------------------------------------------------------
 
-// A real `crontab` on PATH: `execFile('crontab', ...)` resolves it at call time, so the whole
-// read-splice-write path runs for real against a file this test can read back.
-const BIN = mkdtempSync(join(tmpdir(), 'crontab-lock-'))
-const CRONTAB_FILE = join(BIN, 'crontab.txt')
-writeFileSync(join(BIN, 'crontab'), `#!/bin/sh
-if [ "$1" = "-l" ]; then exec cat '${CRONTAB_FILE}'; fi
-exec cat > '${CRONTAB_FILE}'
-`)
-chmodSync(join(BIN, 'crontab'), 0o755)
-process.env.PATH = `${BIN}:${process.env.PATH ?? ''}`
+const REPO_ROOT = process.cwd()
+const HARNESS = mkdtempSync(join(tmpdir(), 'crontab-lock-'))
+const CRONTAB_FILE = join(HARNESS, 'crontab.txt')
+const JOURNAL = join(HARNESS, 'journal.txt')
+const WRITE_GATE = join(HARNESS, 'gate-armed')
+const READY_FIFO = join(HARNESS, 'ready.fifo')
+const GO_FIFO = join(HARNESS, 'go.fifo')
+const LOCK_FILE = join(HARNESS, 'crontab-reconcile.lock')
+
+process.env.OTI_CRONTAB_LOCK_PATH = LOCK_FILE
 process.env.CRON_SECRET = 'a1b2c3d4e5f6'
+
+// A real `crontab` on PATH. `spawn('crontab', ...)` resolves it at call time, so the whole
+// read-splice-write path runs for real — and this shim is where the write is OBSERVED from the
+// inside: while it is running it records whether the exclusion is still held by anybody, and
+// whether it was itself handed the lock descriptor as fd 3.
+writeFileSync(join(HARNESS, 'crontab'), `#!/bin/sh
+if [ "$1" = "-l" ]; then
+  if [ -f '${CRONTAB_FILE}' ]; then cat '${CRONTAB_FILE}'; fi
+  exit 0
+fi
+echo "write-start" >> '${JOURNAL}'
+if flock --exclusive --timeout 0 '${LOCK_FILE}' true 2>/dev/null; then
+  echo "exclusion-absent" >> '${JOURNAL}'
+else
+  echo "exclusion-held" >> '${JOURNAL}'
+fi
+if [ -e /proc/self/fd/3 ]; then
+  echo "lock-fd=$(readlink /proc/self/fd/3)" >> '${JOURNAL}'
+else
+  echo "lock-fd=absent" >> '${JOURNAL}'
+fi
+if [ -f '${WRITE_GATE}' ]; then
+  rm -f '${WRITE_GATE}'
+  echo parked > '${READY_FIFO}'
+  head -n 1 '${GO_FIFO}' > /dev/null
+fi
+cat > '${CRONTAB_FILE}'
+echo "write-end" >> '${JOURNAL}'
+`)
+chmodSync(join(HARNESS, 'crontab'), 0o755)
+process.env.PATH = `${HARNESS}:${process.env.PATH ?? ''}`
+
+function sh(script: string): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    const proc = spawn('bash', ['-c', script], { stdio: ['ignore', 'pipe', 'pipe'] })
+    let stdout = ''
+    let stderr = ''
+    proc.stdout.on('data', (c) => { stdout += String(c) })
+    proc.stderr.on('data', (c) => { stderr += String(c) })
+    proc.on('close', (code) => resolve({ code, stdout, stderr }))
+  })
+}
+
+/** Block until the parked child announces itself. A FIFO read, never a poll. */
+function awaitFifo(path: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const stream = createReadStream(path)
+    let data = ''
+    stream.on('data', (chunk) => {
+      data += String(chunk)
+      stream.close()
+      resolve(data)
+    })
+    stream.on('error', reject)
+  })
+}
 
 function crontabText(): string {
   return existsSync(CRONTAB_FILE) ? readFileSync(CRONTAB_FILE, 'utf8') : ''
@@ -69,6 +151,18 @@ function crontabText(): string {
 /** Is the backup job actually scheduled? The only question the defect got wrong. */
 function backupLineInstalled(): boolean {
   return /\$BASE_URL\/backup"/.test(crontabText())
+}
+function journal(): string[] {
+  return existsSync(JOURNAL) ? readFileSync(JOURNAL, 'utf8').split('\n').filter(Boolean) : []
+}
+
+/**
+ * Can an INDEPENDENT process take the crontab lock right now? Asked with `--timeout 0`, so the
+ * answer is immediate and carries no timing assumption at all.
+ */
+async function lockIsFree(): Promise<boolean> {
+  const { code } = await sh(`flock --exclusive --timeout 0 '${LOCK_FILE}' true`)
+  return code === 0
 }
 
 // --- the committed settings, shared by both saves --------------------------
@@ -83,7 +177,10 @@ let releaseBarrier: () => void
 let barrier: Promise<void>
 let barrierArmed = false
 /** Every findMany that asked for the cron rows, in order — i.e. every SNAPSHOT. */
-let snapshots: Array<{ lockHeldDuringRead: boolean }> = []
+let snapshots: Array<{ lockHeldDuringRead: boolean; journalAtRead: string[] }> = []
+/** Resolved when the Scheduled Jobs save has COMMITTED backups ON. */
+let committedOn: Promise<void>
+let announceCommittedOn: () => void
 
 function isCronSnapshot(keys: string[]): boolean {
   return keys.includes('cron_backup_enabled')
@@ -94,7 +191,7 @@ const settingDelegate = {
     const keys = where.key.in
     const rows = keys.filter((k) => store.has(k)).map((k) => ({ key: k, value: store.get(k)! }))
     if (!isCronSnapshot(keys)) return rows
-    snapshots.push({ lockHeldDuringRead: lockState.held })
+    snapshots.push({ lockHeldDuringRead: !(await lockIsFree()), journalAtRead: journal() })
     if (barrierArmed) {
       barrierArmed = false
       announceSnapshot()
@@ -106,6 +203,7 @@ const settingDelegate = {
     (store.has(where.key) ? { key: where.key, value: store.get(where.key)! } : null),
   upsert: async ({ where, create }: { where: { key: string }; create: { key: string; value: string } }) => {
     store.set(where.key, create.value)
+    if (where.key === 'cron_backup_enabled' && create.value === 'true') announceCommittedOn?.()
     return { key: where.key, value: create.value }
   },
 }
@@ -154,59 +252,6 @@ mock.module('@/lib/cron-jobs', {
   },
 })
 
-// --- the advisory lock double ----------------------------------------------
-
-class FakeWaitTimeout extends Error {}
-
-const lockState = {
-  mode: 'mutex' as 'mutex' | 'timeout' | 'error' | 'lost',
-  held: false,
-  queue: [] as Array<() => void>,
-  keys: [] as Array<number | undefined>,
-  timeouts: [] as Array<number | undefined>,
-  acquires: 0,
-  waits: 0,
-  releases: 0,
-  onWait: null as (() => void) | null,
-}
-
-mock.module('@/lib/db/pinned-advisory-lock', {
-  namedExports: {
-    AdvisoryLockWaitTimeoutError: FakeWaitTimeout,
-    AdvisoryLockLostError: class extends Error {},
-    // A reconciliation that SKIPS on contention is the defect, not the fix. If the module under
-    // test ever reaches for the try form, this fails loudly instead of quietly passing.
-    acquirePinnedAdvisoryLockOrNull: async () => {
-      throw new Error('the crontab reconciliation must WAIT for the lock, not skip its run')
-    },
-    acquirePinnedAdvisoryLockWaiting: async (key: number, options?: { timeoutMs?: number }) => {
-      lockState.keys.push(key)
-      lockState.timeouts.push(options?.timeoutMs)
-      lockState.acquires += 1
-      if (lockState.mode === 'timeout') throw new FakeWaitTimeout('timed out waiting')
-      if (lockState.mode === 'error') throw new Error('connection refused')
-      if (lockState.held) {
-        lockState.waits += 1
-        await new Promise<void>((resolve) => {
-          lockState.queue.push(resolve)
-          lockState.onWait?.()
-        })
-      }
-      lockState.held = true
-      return {
-        get lost() { return lockState.mode === 'lost' },
-        assertHeld() {},
-        release: async () => {
-          lockState.releases += 1
-          const next = lockState.queue.shift()
-          if (next) next()
-          else lockState.held = false
-        },
-      }
-    },
-  },
-})
-
 // --- fixture ---------------------------------------------------------------
 
 const BACKUP_INPUT = { retentionDays: '30', maxCount: '10', autoUpload: 's3' }
@@ -221,50 +266,62 @@ async function saveScheduledJobs(enabled: boolean) {
   return saveCronJobSettings([{ settingKey: 'backup', enabled, schedule: '0 1 * * *' }])
 }
 
-function armBarrier() {
+function armSnapshotBarrier() {
   barrier = new Promise<void>((resolve) => { releaseBarrier = resolve })
   snapshotTaken = new Promise<void>((resolve) => { announceSnapshot = resolve })
   barrierArmed = true
 }
 
+test.before(async () => {
+  await sh(`mkfifo '${READY_FIFO}' '${GO_FIFO}'`)
+})
+
 test.beforeEach(() => {
   store.clear()
   store.set('public_app_url', 'https://ims.test')
   writeFileSync(CRONTAB_FILE, '# an operator line the app must preserve\n')
+  writeFileSync(JOURNAL, '')
+  rmSync(WRITE_GATE, { force: true })
   snapshots = []
   barrierArmed = false
-  lockState.mode = 'mutex'
-  lockState.held = false
-  lockState.queue = []
-  lockState.keys = []
-  lockState.timeouts = []
-  lockState.acquires = 0
-  lockState.waits = 0
-  lockState.releases = 0
-  lockState.onWait = null
+  committedOn = new Promise<void>((resolve) => { announceCommittedOn = resolve })
+  delete process.env.OTI_CRONTAB_LOCK_WAIT_MS
+})
+
+test.after(() => {
+  rmSync(HARNESS, { recursive: true, force: true })
 })
 
 // ---------------------------------------------------------------------------
-// 1 + 2 — the load-bearing case
+// 1 + 4 — LOAD-BEARING: a write still in flight, and a second reconciliation queued behind it
 // ---------------------------------------------------------------------------
 
-test('[o3d-batch-ret] two concurrent saves: the crontab agrees with the LAST COMMIT, not the last snapshot', async () => {
-  // A is the Backup screen switching backups OFF. It reaches the snapshot first and parks there.
-  armBarrier()
+test('[o3d-batch-ret] a crontab write STILL IN FLIGHT keeps the exclusion, and the final crontab is the LATER COMMIT', async () => {
+  // A is the Backup screen switching backups OFF. It reaches the settings snapshot first and parks.
+  armSnapshotBarrier()
   const a = saveBackup(false)
   await snapshotTaken
-  assert.equal(snapshots.length, 1, 'A has taken its snapshot and is parked before the crontab write')
+  assert.equal(snapshots.length, 1, 'A has taken its snapshot and has not written yet')
 
   // B is the Scheduled Jobs screen switching backups ON. Its commit lands AFTER A's snapshot —
   // which is the whole hazard: A is now holding a reading that is out of date.
-  const bQueued = new Promise<void>((resolve) => { lockState.onWait = resolve })
   const b = saveScheduledJobs(true)
-  const bFinished = b.then(() => 'finished' as const)
-  // Deterministic, and it distinguishes the two worlds without a timer: WITH the lock B cannot
-  // finish (it is queued behind A), and WITHOUT it B never queues (it runs straight through).
-  await Promise.race([bFinished, bQueued.then(() => 'queued' as const)])
+  await committedOn
+  assert.equal(store.get('cron_backup_enabled'), 'true', 'B has COMMITTED backups ON')
+  assert.equal(snapshots.length, 1, 'and B cannot have re-read the settings: A holds the lock')
 
+  // A's `crontab -` will now park MID-WRITE, which is the state round 21 could not survive: the
+  // holder had finished its own checks and the write was in another process.
+  writeFileSync(WRITE_GATE, '')
   releaseBarrier()
+  await awaitFifo(READY_FIFO)
+
+  // THE ASSERTION ROUND 21 COULD NOT MAKE. The write is in flight right now, and the exclusion is
+  // still there — an independent taker is refused, immediately.
+  assert.equal(await lockIsFree(), false, 'the crontab lock must still be held while the child writes')
+  assert.equal(snapshots.length, 1, 'so B still has not re-read the settings')
+
+  await writeFile(GO_FIFO, 'go\n')
   const [aResult, bResult] = await Promise.all([a, b])
 
   // THE ASSERTION THE DEFECT FAILS. The last committed state says backups are ON, so a scheduled
@@ -276,81 +333,174 @@ test('[o3d-batch-ret] two concurrent saves: the crontab agrees with the LAST COM
 
   assert.deepEqual(aResult, { status: 'saved' })
   assert.deepEqual(bResult, { status: 'saved' })
-  assert.equal(lockState.waits, 1, 'B queued behind A rather than reconciling alongside it')
-  assert.equal(lockState.acquires, 2)
-  assert.equal(lockState.releases, 2, 'and neither reconciliation leaked the lock')
-})
 
-test('[o3d-batch-ret] the SNAPSHOT is taken inside the lock, not just the crontab write', async () => {
-  // A lock that covers only the write serializes the two writers and still lets the stale reading
-  // win: the later writer must re-read, and it can only do that if the read is inside the lock.
-  await saveBackup(true)
-  assert.ok(snapshots.length > 0, 'the reconciliation was actually reached')
+  // The two writes did not overlap, and the shim saw the exclusion from inside both of them.
+  const lines = journal()
   assert.deepEqual(
-    snapshots.map((s) => s.lockHeldDuringRead), [true],
-    'every settings snapshot must be read while the reconciliation lock is held',
+    lines.filter((l) => l === 'write-start' || l === 'write-end'),
+    ['write-start', 'write-end', 'write-start', 'write-end'],
+    'the two crontab writes must not interleave',
   )
+  assert.equal(lines.filter((l) => l === 'exclusion-held').length, 2)
+  assert.equal(lines.filter((l) => l === 'exclusion-absent').length, 0)
+
+  // 4 — and B's SNAPSHOT is what makes the outcome right: it was taken inside the lock, AFTER A's
+  // write had completed, so it read the committed ON rather than anything staler.
+  assert.equal(snapshots.length, 2)
+  assert.deepEqual(snapshots.map((s) => s.lockHeldDuringRead), [true, true],
+    'every settings snapshot must be read while the reconciliation lock is held')
+  assert.ok(snapshots[1].journalAtRead.includes('write-end'),
+    "B re-read the settings only after A's crontab write had finished — a lock covering only the "
+    + 'write would have let B read before A wrote and still lose to it')
 })
 
 // ---------------------------------------------------------------------------
-// 3 — the ordinary case still works, and pays nothing meaningful
+// 2 — LOAD-BEARING: the lock outlives the holding process's release
 // ---------------------------------------------------------------------------
 
-test('[o3d-batch-ret] an ordinary single save still reconciles, taking the lock once and never waiting', async () => {
+test('[o3d-batch-ret] the crontab child inherits the lock descriptor, so the exclusion survives the holder releasing it', async () => {
+  // The write records what it can see of the lock from inside itself. This is the property that
+  // replaces round 21's "re-verify after the write": there is nothing to re-verify, because the
+  // kernel will not release an flock while a duplicate of its descriptor is open in the child.
+  await saveBackup(true)
+
+  const lines = journal()
+  assert.ok(lines.includes('exclusion-held'), 'the write ran while the exclusion was held')
+  assert.ok(
+    lines.some((l) => l === `lock-fd=${LOCK_FILE}`),
+    `the crontab child must be handed the lock file as fd 3 (saw: ${lines.filter((l) => l.startsWith('lock-fd=')).join(', ')})`,
+  )
+
+  // And the same thing proved directly: hold the lock, hand the descriptor to a child, let the
+  // HOLDER release — the lock is still not takeable until the child exits.
+  const { withCrontabReconcileLock } = await import('@/lib/crontab-reconcile-lock')
+  let child: ReturnType<typeof spawn> | null = null
+  const outcome = await withCrontabReconcileLock(async (lock) => {
+    child = spawn('bash', ['-c', `head -n 1 '${GO_FIFO}' > /dev/null`], {
+      stdio: ['ignore', 'ignore', 'ignore', lock.fd],
+    })
+    return 'spawned'
+  })
+  assert.deepEqual(outcome, { locked: true, result: 'spawned' })
+  // withCrontabReconcileLock has returned, so this process has closed its descriptor.
+  assert.equal(await lockIsFree(), false,
+    'the lock must still be held by the child that inherited the descriptor')
+
+  await writeFile(GO_FIFO, 'go\n')
+  await new Promise((resolve) => child!.on('exit', resolve))
+  assert.equal(await lockIsFree(), true, 'and it is released once that child exits')
+})
+
+// ---------------------------------------------------------------------------
+// 3 — LOAD-BEARING: the installer is in the same protocol, in both directions
+// ---------------------------------------------------------------------------
+
+const INSTALL_SH = readFileSync(join(REPO_ROOT, 'scripts/install.sh'), 'utf8')
+
+/**
+ * The installer's OWN lock lines, lifted out of the script rather than retyped here. If someone
+ * removes or renames them, these tests stop finding them and fail — which is the point: this is
+ * the only coverage that the shell writer is inside the exclusion.
+ */
+function installerLockLines() {
+  const openFd = INSTALL_SH.match(/^exec 9>>"\$\{CRONTAB_LOCK_FILE\}"$/m)
+  const acquire = INSTALL_SH.match(/^if ! (flock --exclusive --timeout \d+ 9); then$/m)
+  const closeFd = INSTALL_SH.match(/^exec 9>&-/m)
+  assert.ok(openFd, 'scripts/install.sh must open the crontab lock file on fd 9')
+  assert.ok(acquire, 'scripts/install.sh must take an exclusive flock on fd 9 before writing the crontab')
+  assert.ok(closeFd, 'scripts/install.sh must close fd 9 to release the crontab lock')
+  return { openFd: openFd![0], acquire: acquire![1] }
+}
+
+test('[o3d-batch-ret] the INSTALLER cannot take the crontab lock while the application holds it', async () => {
+  const { openFd, acquire } = installerLockLines()
+  // `--timeout 0`: an immediate, deterministic answer about a lock that is definitely held.
+  const probe = `set -u
+CRONTAB_LOCK_FILE='${LOCK_FILE}'
+${openFd}
+if ! ${acquire.replace(/--timeout \d+/, '--timeout 0')}; then echo CONFLICT; exit 9; fi
+echo ACQUIRED
+exec 9>&-`
+
+  const { withCrontabReconcileLock } = await import('@/lib/crontab-reconcile-lock')
+  const outcome = await withCrontabReconcileLock(async () => sh(probe))
+  assert.equal(outcome.locked, true)
+  const result = outcome.locked === true ? outcome.result : null
+  assert.equal(result!.stdout.trim(), 'CONFLICT',
+    "the installer's own lock lines must be refused while a reconciliation holds the lock")
+  assert.equal(result!.code, 9)
+
+  // …and granted the moment it is free, so this is exclusion and not a broken command.
+  const after = await sh(probe)
+  assert.equal(after.stdout.trim(), 'ACQUIRED')
+})
+
+test('[o3d-batch-ret] an APPLICATION reconciliation is refused while the installer holds the crontab lock', async () => {
+  const { openFd, acquire } = installerLockLines()
+  const holder = spawn('bash', ['-c', `set -u
+CRONTAB_LOCK_FILE='${LOCK_FILE}'
+${openFd}
+${acquire} || exit 9
+echo held > '${READY_FIFO}'
+head -n 1 '${GO_FIFO}' > /dev/null
+exec 9>&-`], { stdio: ['ignore', 'ignore', 'pipe'] })
+  await awaitFifo(READY_FIFO)
+  assert.equal(await lockIsFree(), false, 'the installer holds the lock')
+
+  // The wait is bounded, and here it is deliberately short: the assertion is that it EXPIRES.
+  process.env.OTI_CRONTAB_LOCK_WAIT_MS = '50'
+  const before = crontabText()
+  const result = await saveBackup(true)
+
+  assert.equal(crontabText(), before,
+    'no application reconciliation may rewrite the crontab while the installer is inside its own read-modify-write')
+  assert.equal(snapshots.length, 0, 'and it must not even snapshot the settings')
+  assert.equal(result.status, 'post-commit-failed')
+  assert.equal(result.status === 'post-commit-failed' && result.step, 'scheduler')
+  assert.match(result.status === 'post-commit-failed' ? result.error : '', /Another crontab reconciliation is still running/)
+
+  await writeFile(GO_FIFO, 'go\n')
+  await new Promise((resolve) => holder.on('exit', resolve))
+
+  // Once the installer is out, the application reconciles normally — the refusal was the exclusion,
+  // not a broken path.
+  delete process.env.OTI_CRONTAB_LOCK_WAIT_MS
+  assert.deepEqual(await saveBackup(true), { status: 'saved' })
+  assert.ok(backupLineInstalled())
+})
+
+// ---------------------------------------------------------------------------
+// 5 - 7 — the ordinary case, and the lock module's own contract
+// ---------------------------------------------------------------------------
+
+test('[o3d-batch-ret] an ordinary single save still reconciles, and the lock does not leak', async () => {
   const result = await saveBackup(true)
 
   assert.deepEqual(result, { status: 'saved' })
   assert.ok(backupLineInstalled(), 'the switch still reaches the crontab')
-  assert.equal(lockState.acquires, 1, 'one acquisition')
-  assert.equal(lockState.releases, 1, 'released, so the next save is not queued behind a leak')
-  assert.equal(lockState.waits, 0, 'and an uncontended save waits for nobody')
+  assert.equal(await lockIsFree(), true, 'released, so the next save is not queued behind a leak')
 
   // Switching back off removes the line again — the exclusion did not freeze the artefact.
   await saveBackup(false)
   assert.equal(backupLineInstalled(), false)
+  assert.equal(await lockIsFree(), true)
 })
 
-// ---------------------------------------------------------------------------
-// 4-7 — the lock module's own contract
-// ---------------------------------------------------------------------------
+test('[o3d-batch-ret] the reconciliation wait is bounded and outlasts the crontab execs it queues behind', async () => {
+  const { CRONTAB_RECONCILE_LOCK_WAIT_MS, crontabReconcileLockWaitMs } =
+    await import('@/lib/crontab-reconcile-lock')
 
-test('[o3d-batch-ret] the reconciliation waits on the REGISTERED key, and never on a try-lock', async () => {
-  const { CRONTAB_RECONCILE_LOCK_KEY } = await import('@/lib/db/advisory-locks')
-  const { CRONTAB_RECONCILE_LOCK_WAIT_MS } = await import('@/lib/crontab-reconcile-lock')
-
-  await saveBackup(true)
-
-  assert.deepEqual(lockState.keys, [CRONTAB_RECONCILE_LOCK_KEY],
-    'the key must come from the registry, so a future collision cannot be introduced silently')
-  assert.deepEqual(lockState.timeouts, [CRONTAB_RECONCILE_LOCK_WAIT_MS])
   assert.ok(CRONTAB_RECONCILE_LOCK_WAIT_MS > 10_000,
     'the wait must outlast the two 5s crontab execs it queues behind, or a legitimate queue expires')
-  // The try-lock double throws if it is ever reached; reaching this line is the assertion.
-})
-
-test('[o3d-batch-ret] a lock wait that times out writes NOTHING and is reported as a failure', async () => {
-  lockState.mode = 'timeout'
-  const before = crontabText()
-
-  const result = await saveBackup(true)
-
-  assert.equal(crontabText(), before, 'the crontab must not be rewritten by a reconciliation that never held the lock')
-  assert.equal(snapshots.length, 0, 'and it must not even snapshot')
-  assert.equal(result.status, 'post-commit-failed')
-  assert.equal(result.status === 'post-commit-failed' && result.step, 'scheduler')
-  assert.match(result.status === 'post-commit-failed' ? result.error : '', /Another crontab reconciliation is still running/)
-})
-
-test('[o3d-batch-ret] a lock LOST mid-run refuses the write instead of writing under an exclusion it no longer has', async () => {
-  lockState.mode = 'lost'
-  const before = crontabText()
-
-  const result = await saveBackup(true)
-
-  assert.equal(crontabText(), before, 'a reconciliation whose connection died must not write')
-  assert.ok(snapshots.length > 0, 'it did reach the snapshot — the refusal is at the write, not before it')
-  assert.equal(result.status, 'post-commit-failed')
-  assert.match(result.status === 'post-commit-failed' ? result.error : '', /lock was lost/)
+  assert.equal(crontabReconcileLockWaitMs(), CRONTAB_RECONCILE_LOCK_WAIT_MS)
+  for (const bad of ['', '  ', 'soon', '0', '-5', 'NaN']) {
+    process.env.OTI_CRONTAB_LOCK_WAIT_MS = bad
+    assert.equal(crontabReconcileLockWaitMs(), CRONTAB_RECONCILE_LOCK_WAIT_MS,
+      `an unusable override (${JSON.stringify(bad)}) must fall back to the bound, never to no bound`)
+  }
+  process.env.OTI_CRONTAB_LOCK_WAIT_MS = '250'
+  assert.equal(crontabReconcileLockWaitMs(), 250)
+  delete process.env.OTI_CRONTAB_LOCK_WAIT_MS
 })
 
 test('[o3d-batch-ret] the lock is released when the reconciliation throws', async () => {
@@ -362,30 +512,122 @@ test('[o3d-batch-ret] the lock is released when the reconciliation throws', asyn
     (error: unknown) => error === boom,
     'a throw from the critical section propagates — it is not classified as "could not lock"',
   )
-  assert.equal(lockState.releases, 1, 'and the lock is released, or every later reconciliation wedges')
-  assert.equal(lockState.held, false)
+  assert.equal(await lockIsFree(), true, 'and the lock is released, or every later reconciliation wedges')
 })
 
 test('[o3d-batch-ret] an acquisition FAILURE is returned as an outcome, not thrown at a post-commit caller', async () => {
-  lockState.mode = 'error'
   const { withCrontabReconcileLock } = await import('@/lib/crontab-reconcile-lock')
+  const unopenable = join(HARNESS, 'no-such-directory', 'lock')
+  process.env.OTI_CRONTAB_LOCK_PATH = unopenable
+  try {
+    const outcome = await withCrontabReconcileLock(async () => 'ran')
+    assert.equal(outcome.locked, false)
+    assert.match(outcome.locked === false ? outcome.error : '', /Could not open the crontab reconciliation lock file/)
+  } finally {
+    process.env.OTI_CRONTAB_LOCK_PATH = LOCK_FILE
+  }
+})
 
-  const outcome = await withCrontabReconcileLock(async () => 'ran')
+test('[o3d-batch-ret] a lock file REPLACED mid-wait does not leave the reconciliation holding an orphaned inode', async () => {
+  // The one genuine hazard of a file lock: the exclusion lives on the INODE, so a lock file
+  // replaced while a waiter is queued leaves that waiter holding a lock nobody else will ever open
+  // — and believing it is alone. Nothing in this repository removes the file (the installer
+  // `touch`es it precisely so the inode survives a re-run), but "nothing does" is what every one of
+  // these findings has been about.
+  const { openFd, acquire } = installerLockLines()
+  const holder = spawn('bash', ['-c', `set -u
+CRONTAB_LOCK_FILE='${LOCK_FILE}'
+${openFd}
+${acquire} || exit 9
+echo held > '${READY_FIFO}'
+head -n 1 '${GO_FIFO}' > /dev/null
+exec 9>&-`], { stdio: ['ignore', 'ignore', 'pipe'] })
+  await awaitFifo(READY_FIFO)
 
-  assert.equal(outcome.locked, false)
-  assert.match(outcome.locked === false ? outcome.error : '', /Could not serialize the crontab reconciliation/)
-  assert.equal(lockState.releases, 0)
+  const { withCrontabReconcileLock } = await import('@/lib/crontab-reconcile-lock')
+  // NOT awaited: the acquisition opens the lock file and spawns its `flock` waiter synchronously,
+  // before its first suspension point, so by the time this statement returns the waiter is queued
+  // on the ORIGINAL inode. That is what makes the replacement below deterministic rather than a race.
+  let insideProbe: boolean | null = null
+  const pending = withCrontabReconcileLock(async () => {
+    // THE ASSERTION. While this callback runs, an independent taker of the lock FILE must be
+    // refused. If the acquisition kept the descriptor it opened before the replacement, it is
+    // holding an inode with no name and this probe succeeds — two writers, one crontab.
+    insideProbe = await lockIsFree()
+    return 'held'
+  })
+
+  await sh(`mv '${LOCK_FILE}' '${LOCK_FILE}.replaced' && touch '${LOCK_FILE}'`)
+  await writeFile(GO_FIFO, 'go\n')
+  await new Promise((resolve) => holder.on('exit', resolve))
+  await pending
+
+  assert.equal(insideProbe, false,
+    'the reconciliation must hold the lock on the file at the configured path, not on a replaced inode')
+  rmSync(`${LOCK_FILE}.replaced`, { force: true })
 })
 
 // ---------------------------------------------------------------------------
-// 8 — coverage of every caller, by construction
+// 8 — EVERY writer of this crontab, in every language, participates
 // ---------------------------------------------------------------------------
 
-test('[o3d-batch-ret] every reconcileCrontab caller is covered, because the lock is inside the reconciliation', () => {
-  const { readFileSync: read } = require('node:fs') as typeof import('node:fs')
+test('[o3d-batch-ret] every crontab writer in the repository is inside the one exclusion protocol', () => {
+  // A repository WALK, not a list: a seventh writer added anywhere under these roots shows up here
+  // as a failure rather than as a quiet second protocol. Round 21's version of this test scanned
+  // only TypeScript, which is exactly how the shell installer stayed outside the exclusion.
+  const roots = ['lib', 'app', 'scripts', 'e2e']
+  const codeWrites: string[] = []
+  const codeReads: string[] = []
+  const shellCrontab: Array<{ file: string; line: number; text: string }> = []
+  let filesWalked = 0
 
-  // The five action modules that reconcile, plus the module that does it. Listed rather than
-  // globbed so that a caller ADDED elsewhere shows up as a miss in the scan below.
+  const walk = (dir: string) => {
+    for (const entry of readdirSync(join(REPO_ROOT, dir))) {
+      const rel = join(dir, entry)
+      if (statSync(join(REPO_ROOT, rel)).isDirectory()) {
+        if (entry === 'node_modules' || entry === 'generated' || entry.startsWith('.')) continue
+        walk(rel)
+        continue
+      }
+      const isCode = /\.(ts|tsx|mjs|js)$/.test(entry)
+      const isShell = /\.(sh|bash)$/.test(entry)
+      if (!isCode && !isShell) continue
+      filesWalked += 1
+      const src = readFileSync(join(REPO_ROOT, rel), 'utf8')
+      src.split('\n').forEach((line, index) => {
+        if (isCode) {
+          // Any child-process invocation of `crontab`, whatever the spawning function.
+          const call = line.match(/\b(?:spawn|spawnSync|execFile|execFileSync|exec|execSync)\(\s*'crontab'/)
+          if (!call) return
+          if (/'-l'/.test(line)) codeReads.push(rel)
+          else codeWrites.push(rel)
+        } else if (/(^|[|;&({]\s*)crontab\b/.test(line) && !line.trimStart().startsWith('#')) {
+          shellCrontab.push({ file: rel, line: index + 1, text: line })
+        }
+      })
+    }
+  }
+  roots.forEach(walk)
+
+  // The walk must actually have reached the files, or every assertion below is vacuous.
+  assert.ok(filesWalked > 200, `the walk must reach the source tree (walked ${filesWalked} files)`)
+  assert.ok(shellCrontab.length > 0, 'the walk must reach the shell writer')
+
+  // --- writer 1: the application, in TypeScript ---
+  assert.deepEqual([...new Set(codeWrites)], ['lib/crontab-reconcile.ts'],
+    'the only code that WRITES the crontab is the reconciliation; a new one must join the lock and be listed here')
+  assert.deepEqual([...new Set(codeReads)], ['lib/crontab-reconcile.ts'])
+
+  const reconcile = readFileSync(join(REPO_ROOT, 'lib/crontab-reconcile.ts'), 'utf8')
+  assert.match(reconcile, /withCrontabReconcileLock\(applyCrontabFromSettings\)/,
+    'reconcileCrontab must run the snapshot-and-write under the lock')
+  assert.match(reconcile, /spawn\('crontab', \['-'\], \{ stdio: \['pipe', 'ignore', 'pipe', lockFd\] \}\)/,
+    'the crontab child must inherit the lock descriptor — execFile drops stdio and would end the exclusion at this process')
+  assert.doesNotMatch(reconcile, /export (async )?function applyCrontabFromSettings/,
+    'the unlocked read-modify-write must not be reachable from outside this module')
+
+  // The six server actions need no wrapper each precisely because the lock is inside the
+  // reconciliation. Listed so that a caller added elsewhere shows up as a miss.
   const CALLERS: Array<[string, string[]]> = [
     ['app/actions/settings.ts', ['savePublicAppUrl', 'saveBackupScheduleSettings', 'saveIntegrationPluginState']],
     ['app/actions/cron.ts', ['syncCrontab', 'saveCronJobSettings']],
@@ -393,22 +635,70 @@ test('[o3d-batch-ret] every reconcileCrontab caller is covered, because the lock
   ]
   let callSites = 0
   for (const [file, actions] of CALLERS) {
-    const src = read(file, 'utf8')
+    const src = readFileSync(join(REPO_ROOT, file), 'utf8')
     for (const action of actions) {
       assert.match(src, new RegExp(`function ${action}\\b`), `${file}: ${action} has moved or been renamed`)
     }
+    assert.doesNotMatch(src, /applyCrontabFromSettings/, `${file} must go through reconcileCrontab`)
     callSites += (src.match(/reconcileCrontab\(\)/g) ?? []).length
   }
   assert.equal(callSites, 6, 'six call sites — if this changed, the new caller must be listed above')
 
-  // Nothing outside the reconciliation module may reach the unlocked read-modify-write, and the
-  // reconciliation must take the lock. Together these are why the six above need no wrapper each.
-  const reconcile = read('lib/crontab-reconcile.ts', 'utf8')
-  assert.match(reconcile, /withCrontabReconcileLock\(applyCrontabFromSettings\)/,
-    'reconcileCrontab must run the snapshot-and-write under the lock')
-  assert.doesNotMatch(reconcile, /export (async )?function applyCrontabFromSettings/,
-    'the unlocked read-modify-write must not be reachable from outside this module')
-  for (const [file] of CALLERS) {
-    assert.doesNotMatch(read(file, 'utf8'), /applyCrontabFromSettings/, `${file} must go through reconcileCrontab`)
+  // --- writer 2: the installer, in shell ---
+  assert.deepEqual([...new Set(shellCrontab.map((c) => c.file))], ['scripts/install.sh'],
+    'only the installer touches the crontab from shell; a new script must take the same lock and be listed here')
+
+  const installLines = INSTALL_SH.split('\n')
+  const lineOf = (re: RegExp) => {
+    const index = installLines.findIndex((l) => re.test(l))
+    assert.notEqual(index, -1, `scripts/install.sh is missing: ${re}`)
+    return index + 1
+  }
+  const opened = lineOf(/^exec 9>>"\$\{CRONTAB_LOCK_FILE\}"$/)
+  const acquired = lineOf(/^if ! flock --exclusive --timeout \d+ 9; then$/)
+  const released = lineOf(/^exec 9>&-/)
+  assert.ok(opened < acquired && acquired < released, 'open, lock, release, in that order')
+
+  for (const { line, text } of shellCrontab) {
+    assert.ok(line > acquired && line < released,
+      `scripts/install.sh:${line} touches the crontab outside the flock region (lines ${acquired}-${released}): ${text.trim()}`)
+  }
+
+  // The installer is a BOOTSTRAP: it must not overwrite a managed block the application owns,
+  // because its schedules are defaults rather than the committed settings.
+  assert.match(INSTALL_SH, /grep -qE '\^# --- OTI CRON START ---\[ \\t\\r\]\*\$'/,
+    'the installer must skip its bootstrap block when the application already manages one')
+
+  // And it must never replace the lock file, because the lock lives on the inode.
+  assert.doesNotMatch(INSTALL_SH, /rm -f "\$\{CRONTAB_LOCK_FILE\}"/)
+  assert.match(INSTALL_SH, /^touch "\$\{CRONTAB_LOCK_FILE\}"$/m)
+})
+
+// ---------------------------------------------------------------------------
+// 9 — the two writers resolve the SAME file
+// ---------------------------------------------------------------------------
+
+test('[o3d-batch-ret] the application and the installer lock the same path', async () => {
+  const { CRONTAB_RECONCILE_LOCK_FILENAME, crontabReconcileLockPath } =
+    await import('@/lib/crontab-reconcile-lock')
+
+  // An exclusion whose participants silently choose different files is not an exclusion, and
+  // nothing at runtime would ever say so.
+  assert.match(
+    INSTALL_SH,
+    new RegExp(`^CRONTAB_LOCK_FILE="\\$\\{APP_DIR\\}/${CRONTAB_RECONCILE_LOCK_FILENAME.replace('.', '\\.')}"$`, 'm'),
+    'the installer must lock ${APP_DIR}/<the same basename the app uses>',
+  )
+  assert.match(INSTALL_SH, /^WorkingDirectory=\$\{APP_DIR\}$/m,
+    "the unit must put the app's cwd at APP_DIR, which is what makes those two paths one file")
+
+  const saved = process.env.OTI_CRONTAB_LOCK_PATH
+  try {
+    delete process.env.OTI_CRONTAB_LOCK_PATH
+    assert.equal(crontabReconcileLockPath(), join(process.cwd(), CRONTAB_RECONCILE_LOCK_FILENAME))
+    process.env.OTI_CRONTAB_LOCK_PATH = '  /var/lib/oti/crontab.lock  '
+    assert.equal(crontabReconcileLockPath(), '/var/lib/oti/crontab.lock')
+  } finally {
+    process.env.OTI_CRONTAB_LOCK_PATH = saved
   }
 })
