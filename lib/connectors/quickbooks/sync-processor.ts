@@ -2254,6 +2254,12 @@ async function enqueueSalesInvoiceFollowUps(
   // the generation is already gone. It matters MORE here than on Xero: this connector's recovery
   // registry entry says nothing re-drives a retained marker, so the sweep that Xero relies on to
   // pick the refused work back up does not exist — a marker cleared early is the end of the trail.
+  //
+  // GUARDED BEHAVIOURALLY, NOT STRUCTURALLY (r6, Codex MEDIUM): the round-5 source parse that
+  // asserted this ordering could be satisfied by a shape whose RUNTIME called the fence first, and
+  // it was deleted rather than deepened. tests/connectors/quickbooks-payment-mapping-refusal.test.ts
+  // drives this processor with an enqueue that refuses and reads whether the obligation was
+  // discharged — the observable a hoisted fence would have got wrong.
   const enqueueOutcome = combineFollowUpEnqueueOutcomes(paymentOutcome, pdfOutcome)
   // This connector states no settlement prerequisite of its own (no sweep hands one down), so this
   // is `undefined` whenever the enqueue succeeded and the fence stays on its single pass.

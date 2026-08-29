@@ -298,3 +298,51 @@ test('[o3d-batch-ret r6] CONTROL: a mapped payment clears in ONE run, so the ret
   assert.deepEqual(paymentRefusals(), [])
   assert.equal(marker(), null, 'a pass that queued everything it owed DOES clear the generation')
 })
+
+/**
+ * AND THE OTHER AXIS OF THE SAME FOLD (o3d-batch-ret r6).
+ *
+ * `combineFollowUpEnqueueOutcomes` exists because a refusal on EITHER half means the row still owes
+ * work. The round-5 structural judge asserted that by reading the connector's source for a
+ * prerequisite composed over the aggregate NAME; this asserts it by making the OTHER half refuse and
+ * reading the marker. A FAILED INVOICE_PDF row left at attempt revision 0 is the enqueue's
+ * `unprobed_unfenced_reuse`: nothing can establish whether that row's effect already happened, and
+ * the PDF creates no ledger document to probe. The payment, fully mapped here, enqueues normally.
+ */
+test('[o3d-batch-ret r6] a refused PDF beside an ENQUEUED payment also keeps the marker', async () => {
+  // MUTATION THAT KILLS IT: compose `obligationReleasePrerequisite` over `paymentOutcome` alone
+  // instead of the aggregate `enqueueOutcome` — the payment succeeded, so the fence would release
+  // while the PDF is still owed.
+  // ROUTE: the real sweep, with the payment mapping present and an unfenced FAILED PDF row in scope.
+  reset({ card: 'BANK-1' })
+  store = createSyncLogStore([
+    syncLogRow(SALES_CANDIDATE),
+    syncLogRow({
+      id: 'pdf-failed',
+      connector: 'xero',
+      type: 'INVOICE_PDF',
+      status: 'FAILED',
+      referenceType: 'SalesOrder',
+      referenceId: 'order-1',
+      // Revision 0 is the legacy population the attempt fence cannot reason about: the row reached
+      // FAILED by RUNNING, so reviving it could repeat an effect nothing can take back.
+      attemptRevision: 0,
+      payload: { accountingInvoiceId: 'XERO-INV-1', referenceId: 'order-1' },
+    }),
+  ])
+
+  await (await loadSweep())()
+
+  assert.equal(salesOrders.get('order-1')?.accountingInvoiceId, 'XERO-INV-1', 'PRECONDITION: the repair ran')
+  const refused = activity.filter((entry) => entry.action === 'xero_followup_enqueue_refused')
+  assert.equal(refused.length, 1, 'PRECONDITION: the PDF enqueue really did refuse')
+  assert.equal(refused[0].metadata?.reason, 'unprobed_unfenced_reuse')
+  assert.equal(refused[0].metadata?.type, 'INVOICE_PDF', 'and it is the PDF half that refused, not the payment')
+  assert.deepEqual(paymentRefusals(), [], 'PRECONDITION: the payment half was mapped and did NOT refuse')
+  assert.ok(
+    store.rows.some((row) => row.type === 'INVOICE_PAYMENT'),
+    'PRECONDITION: the payment really was enqueued, so this is a mixed verdict rather than two refusals',
+  )
+
+  assert.notEqual(marker(), null, 'a refusal on EITHER half keeps the obligation open')
+})

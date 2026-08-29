@@ -7268,6 +7268,15 @@ async function enqueueSalesInvoiceFollowUps(
   // should have gated: `requireFollowUpsEnqueued` (post path) and `followUpSettlement` (sweep) both
   // read it correctly and both read it too late to matter, since neither can restore a generation
   // the fence has already cleared. See `obligationReleasePrerequisite`.
+  //
+  // GUARDED BEHAVIOURALLY, NOT STRUCTURALLY (r6, Codex MEDIUM). Round 5 asserted this ordering by
+  // PARSING both connectors for a verdict declared above the fence call. Codex's r6 finding is that
+  // such a judge has to model scope and hoisting to be sound — a nested hoisted fence invoked before
+  // the declarations execute satisfies the text and receives `undefined` at runtime — and that was
+  // its second escape. The parse was deleted rather than deepened: re-implementing the compiler to
+  // check an ordering is worse than observing the ordering. tests/accounting/xero-payment-mapping-refusal.test.ts
+  // and tests/connectors/quickbooks-payment-mapping-refusal.test.ts drive the real connectors with a
+  // refusable enqueue and read the obligation MARKER, which a fence that ran first would have cleared.
   const enqueueOutcome = combineFollowUpEnqueueOutcomes(paymentOutcome, pdfOutcome)
   // Both axes the caller of this function may release on, in ONE closure the fence consults between
   // its fenced re-read and its fenced release: this enqueue's refusals, and whatever the caller
