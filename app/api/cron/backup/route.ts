@@ -11,6 +11,11 @@ import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { BackupArtifactUploadError, uploadBackupArtifactsToTarget } from '@/lib/backup-remote'
 import { appendCronRunId, cronRunResponseInit, runCronWithLogging } from '@/lib/ops/cron-run'
 import { backupManifestPath, writeBackupManifestForFile } from '@/lib/backup-manifest'
+import {
+  BACKUP_MAX_COUNT_FALLBACK,
+  BACKUP_RETENTION_FALLBACK_DAYS,
+  resolveBackupPurgeLimit,
+} from '@/lib/domain/settings/backup-schedule-input'
 
 const BACKUP_DIR = getBackupDir()
 
@@ -46,8 +51,20 @@ export async function GET(request: Request) {
         return { skipped: true, reason: 'Scheduled backups disabled' }
       }
 
-      const retentionDays = parseInt(await getSetting('backup_retention_days') || '30')
-      const maxBackups = parseInt(await getSetting('backup_max_count') || '10')
+      // NOT `parseInt(x || 'default')` (Codex r20 HIGH #2). That fallback only caught an EMPTY row,
+      // and the two values it did not catch are the destructive ones: a stored '0' put the purge
+      // cutoff at `now` and made `i >= maxBackups` true for every file, so the run deleted the whole
+      // backup set moments after taking one; a non-numeric row read as NaN, both comparisons went
+      // false, and nothing was ever purged. The panel now refuses both, but a row written before
+      // that gate existed is still in the database, so the READER has to be safe too.
+      const retentionDays = resolveBackupPurgeLimit(
+        await getSetting('backup_retention_days'),
+        BACKUP_RETENTION_FALLBACK_DAYS,
+      )
+      const maxBackups = resolveBackupPurgeLimit(
+        await getSetting('backup_max_count'),
+        BACKUP_MAX_COUNT_FALLBACK,
+      )
 
       const dbConf = getDbConfig()
       const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)

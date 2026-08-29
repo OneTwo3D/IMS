@@ -282,6 +282,33 @@ function codeOf(file: string): string {
     .replace(/(^|[^:'"`])\/\/[^\n]*/g, '$1 ')
 }
 
+test('the purge READER is safe over rows written before the gate existed', async () => {
+  // Validating the writer does not fix a row already in the database, and the destructive values are
+  // exactly the ones the old ungated writer could store. `parseInt(x || 'default')` caught only an
+  // EMPTY row: '0' put the purge cutoff at `now` and made `i >= maxBackups` true for every file — the
+  // whole backup set deleted moments after one was taken — and a non-numeric row read as NaN, so both
+  // comparisons went false and nothing was ever purged.
+  const { resolveBackupPurgeLimit, BACKUP_RETENTION_FALLBACK_DAYS, BACKUP_MAX_COUNT_FALLBACK } =
+    await import('@/lib/domain/settings/backup-schedule-input')
+
+  for (const destructive of ['0', '-1', '0.5']) {
+    assert.equal(resolveBackupPurgeLimit(destructive, 30), 30, `${destructive} must not reach the purge`)
+  }
+  for (const never of ['abc', '', null, undefined]) {
+    assert.equal(resolveBackupPurgeLimit(never, 10), 10, `${String(never)} must not disable the purge`)
+  }
+  // Non-vacuity: a real stored value is used, not replaced by the fallback.
+  assert.equal(resolveBackupPurgeLimit('7', 30), 7)
+  assert.equal(BACKUP_RETENTION_FALLBACK_DAYS, 30)
+  assert.equal(BACKUP_MAX_COUNT_FALLBACK, 10)
+
+  // And the route reads through it, rather than re-deriving the numbers with the old expression.
+  const route = readFileSync(join(REPO, 'app/api/cron/backup/route.ts'), 'utf8')
+  assert.match(route, /resolveBackupPurgeLimit\(\s*await getSetting\('backup_retention_days'\)/)
+  assert.match(route, /resolveBackupPurgeLimit\(\s*await getSetting\('backup_max_count'\)/)
+  assert.doesNotMatch(route, /parseInt\(await getSetting\('backup_(retention_days|max_count)'\)/)
+})
+
 test('the dead FX schedule keys are gone from the application', () => {
   // They were stored and never read. Leaving a LIVE reference anywhere invites the panel being
   // "restored" by someone who finds one and assumes it means something. The three surviving mentions

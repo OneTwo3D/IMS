@@ -235,6 +235,11 @@ Automate your backup routine by enabling scheduled backups:
 - **Enable/disable** the schedule
 - **Retention days** — automatically delete backups older than this many days (whole number, minimum 1)
 - **Max backup count** — limit the total number of backups kept on the server (whole number, minimum 1)
+
+Both counts are refused below 1, and a stored value that is not a positive whole number is read as
+the default (30 days / 10 backups) rather than acted on. A `0` used to be taken literally: the purge
+cutoff became "now" and the count limit matched every file, so a scheduled run deleted the entire
+backup set moments after taking one.
 - **Auto-upload** — optionally upload each scheduled backup to S3 or SFTP automatically
 
 Saving this panel rewrites the managed crontab. The enable switch is the same enablement the

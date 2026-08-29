@@ -19,10 +19,34 @@ export type BackupScheduleInput = {
 /**
  * Validate a backup schedule edit, or say why not.
  *
- * A whole-number floor of 1 on both counts because the purge reads them as `parseInt(x) || default`:
- * a blank or a `0` silently became 30 days / 10 files at purge time, which is a schedule the
- * operator never chose and the screen never showed back to them.
+ * A WHOLE-NUMBER FLOOR OF 1 ON BOTH COUNTS, and the reason is not tidiness. `/api/cron/backup` reads
+ * them as `parseInt(await getSetting(k) || 'default')`, and the fallback only catches an EMPTY row:
+ *
+ *   • `''`  → 30 days / 10 files. Harmless, and the only case the `||` was written for.
+ *   • `'0'` → retentionDays 0 makes the purge cutoff `now`, so EVERY backup is older than it; and
+ *     maxBackups 0 makes `i >= maxBackups` true for every file. Each of those deletes the whole
+ *     backup set on the next scheduled run, moments after taking one.
+ *   • `'abc'` → NaN, and both comparisons are false, so nothing is ever purged and the disk fills.
+ *
+ * The number input on the screen has `min={1}`, which is advice to a browser and was never a gate;
+ * the generic writer this panel used stored whatever arrived.
  */
+export const BACKUP_RETENTION_FALLBACK_DAYS = 30
+export const BACKUP_MAX_COUNT_FALLBACK = 10
+
+/**
+ * What the purge should use for a stored value, given rows written before the gate above existed.
+ *
+ * Validating the WRITER does not fix a row already in the database, and the two values whose reading
+ * is destructive are exactly the ones a writer with no gate could store. Anything not a positive
+ * whole number reads as the documented default — never as "delete everything" and never as "never
+ * purge".
+ */
+export function resolveBackupPurgeLimit(stored: string | null | undefined, fallback: number): number {
+  const parsed = Number(stored)
+  if (!Number.isInteger(parsed) || parsed < 1) return fallback
+  return parsed
+}
 export function validateBackupScheduleInput(
   input: BackupScheduleInput,
 ): { ok: true; retentionDays: number; maxCount: number; autoUpload: string } | { ok: false; error: string } {
