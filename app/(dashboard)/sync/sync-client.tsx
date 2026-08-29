@@ -117,14 +117,19 @@ type WcProductSyncProgress = {
   currentPage: number
   totalPages: number
   errors: string[]
+  /** o3d-xbt: failures a re-run can never clear. Optional — a progress row written before the split has none. */
+  permanentErrors?: string[]
 }
 
 function formatWcProductSyncProgress(progress: WcProductSyncProgress): { detail: string; isError: boolean } {
+  const blocked = progress.permanentErrors?.length ?? 0
   if (progress.totalProducts > 0) {
     const parts = [`Imported ${progress.productsImported} of ${progress.totalProducts} products`]
     if (progress.productsSkipped > 0) parts.push(`${progress.productsSkipped} skipped`)
     if (progress.errors.length > 0) parts.push(`${progress.errors.length} errors`)
-    return { detail: parts.join(' · '), isError: progress.errors.length > 0 }
+    // Worded so it does not read as "try again": a re-run is the one thing that cannot help.
+    if (blocked > 0) parts.push(`${blocked} blocked (needs an operator)`)
+    return { detail: parts.join(' · '), isError: progress.errors.length > 0 || blocked > 0 }
   }
 
   return {

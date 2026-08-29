@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 import type { WcFullProduct } from '../lib/connectors/woocommerce/sync/types.ts'
+import { describeWcPageWalkCeilingStall } from '@/lib/connectors/woocommerce/api'
 
 // o3d-y89x: the WooCommerce product sync is the THIRD writer of Product.type (after the
 // editor and the CSV import) and was the only unguarded one. It computed
@@ -29,6 +30,20 @@ const state = {
   componentDeletes: 0,
   /** Every `Setting` key written by an upsert — the bulk sync's cursor is one of these. */
   settingUpserts: [] as string[],
+  /** Every logActivity call, so the bulk sync's operator-facing lines can be asserted (o3d-xbt). */
+  activity: [] as Row[],
+  /** When set, every activity-log INSERT fails — see the bulk-cursor tests (o3d-xbt r2). */
+  failActivityLogWrite: false,
+  /**
+   * SKU -> the value `product.findFirst` throws when the sync looks it up (o3d-xbt).
+   *
+   * The one hook the permanent/transient split needs: it decides on what `syncWcProductToIms`
+   * THREW, so a test has to be able to make one product in a page fail in a chosen way while its
+   * neighbours succeed. Empty by default, so no existing test can be affected by it, and it throws
+   * the caller's own value rather than a canned error — a double that invented the error shape
+   * could not tell a classifier that reads `meta.target` from one that returns a constant.
+   */
+  throwForSku: new Map<string, unknown>(),
 
   // --- what makes a product LIVE (o3d-y89x r2) ---------------------------------
   // The editor refuses a type OR parent change on a product carrying any of these, and the
@@ -127,6 +142,11 @@ function snapshot() {
     components: state.components.map((row) => ({ ...row })),
     options: state.options.map((row) => ({ ...row })),
     syncLogs: state.syncLogs.map((row) => ({ ...row })),
+    // A ROLLBACK TAKES THESE BACK TOO (o3d-xbt r2). The cursor advance and the permanent-conflict
+    // line are now written in one transaction, and a double whose rollback left either behind would
+    // report exactly the outcome the change exists to prevent.
+    activity: state.activity.map((row) => ({ ...row })),
+    settingUpserts: [...state.settingUpserts],
   }
 }
 
@@ -135,6 +155,8 @@ function restore(snap: ReturnType<typeof snapshot>) {
   state.components.splice(0, state.components.length, ...snap.components)
   state.options.splice(0, state.options.length, ...snap.options)
   state.syncLogs.splice(0, state.syncLogs.length, ...snap.syncLogs)
+  state.activity.splice(0, state.activity.length, ...snap.activity)
+  state.settingUpserts.splice(0, state.settingUpserts.length, ...snap.settingUpserts)
 }
 
 let nextId = 1
@@ -172,10 +194,30 @@ mock.module('@/lib/connectors/woocommerce/api', {
       return { data: [], totalPages: 1, totalItems: 0, error: null }
     },
     wcPut: async () => ({ data: null, error: null }),
+    // o3d-xnwu: the walks now end on an EMPTY PAGE and bound themselves with the shared ceiling, so
+    // a module double that omits these leaves `page <= undefined` and the loop never runs at all.
+    MAX_WC_PAGE_WALK_PAGES: 1000,
+    // round 3: the REAL describer, so the operator-facing sentence the stall tests read is the one
+    // that ships rather than a stand-in this file wrote for itself.
+    describeWcPageWalkCeilingStall,
   },
 })
 
-mock.module('@/lib/activity-log', { namedExports: { logActivity: async () => {} } })
+mock.module('@/lib/activity-log', {
+  namedExports: {
+    logActivity: async (entry: Row) => { state.activity.push(entry) },
+    /**
+     * MODELS THE REAL ONE, and the two differences from `logActivity` are the whole point (o3d-xbt
+     * r2): it writes through the CALLER'S transaction client, and it does not catch. A double that
+     * pushed straight onto `state.activity` and swallowed would make the bulk cursor's new
+     * guarantee — the loud line and the advance commit together — untestable.
+     */
+    logActivityInTransaction: async (
+      tx: { activityLog: { create: (args: { data: Row }) => Promise<unknown> } },
+      entry: Row,
+    ) => { await tx.activityLog.create({ data: entry }) },
+  },
+})
 mock.module('@/lib/trade/hs-classification-trigger', {
   namedExports: { invalidateStaleHsProposal: async () => {} },
 })
@@ -386,6 +428,8 @@ const productDelegate = {
   findFirst: async ({ where, include }: { where?: { sku?: unknown }; include?: Row } = {}) => {
     if (where === undefined) return state.products[0] ?? null
     state.productReads.push('findFirst:sku')
+    const failure = state.throwForSku.get(String(where?.sku))
+    if (failure !== undefined) throw failure
     const row = findProductBySku(where?.sku)
     return row === null ? null : withChildCount(row, include)
   },
@@ -713,6 +757,18 @@ const txClient = {
       return { count: removed }
     },
   },
+  /**
+   * The activity-log table, reachable from inside a transaction (o3d-xbt r2). `failActivityLogWrite`
+   * is how a test makes the record of a burial fail — the case the old best-effort logger turned
+   * into a silent success.
+   */
+  activityLog: {
+    create: async ({ data }: { data: Row }) => {
+      if (state.failActivityLogWrite) throw new Error('activity_log insert failed')
+      state.activity.push(data)
+      return data
+    },
+  },
   setting: {
     upsert: async ({ where }: { where: { key: string } }) => {
       state.settingUpserts.push(where.key)
@@ -821,6 +877,9 @@ function resetState() {
   state.updateData.length = 0
   state.componentDeletes = 0
   state.settingUpserts.length = 0
+  state.activity.length = 0
+  state.failActivityLogWrite = false
+  state.throwForSku.clear()
   state.stockLevels.length = 0
   state.salesOrderLines.length = 0
   state.purchaseOrderLines.length = 0
@@ -2359,33 +2418,189 @@ test('a KIT already under THIS parent is still adopted, type intact (o3d-h2cz)',
 
 // --- the bulk cursor --------------------------------------------------------
 
-test('the bulk sync does not advance its cursor past a conflicted product (o3d-y89x)', async () => {
+// o3d-xbt: the bulk path had NO permanent/transient split. Every failure went into
+// `result.errors`, and the cursor advanced only when that list was empty — so one product that
+// could never succeed pinned `last_wc_product_sync_at` / `last_wc_product_reconcile_at` for ever,
+// and every later cycle re-fetched the WHOLE catalogue from that watermark and re-failed on the
+// same product. The tests below pin the two halves being treated OPPOSITELY.
+
+/** A Prisma P2002 on `Product.barcode` — the shape `isPermanentProductSyncConflict` calls permanent. */
+function duplicateBarcodeConflict(): unknown {
+  return Object.assign(new Error('Unique constraint failed'), {
+    code: 'P2002',
+    meta: { modelName: 'Product', target: ['barcode'] },
+  })
+}
+
+test('a PERMANENT conflict no longer pins the bulk cursor, and is named out loud (o3d-xbt)', async () => {
   const { syncAllWcProducts } = await import('@/lib/connectors/woocommerce/sync/product-sync')
   resetState()
+  // A GTIN already held by a different IMS product: a retry looks the target up by SKU again,
+  // misses again, creates again, and re-hits the identical constraint. Forever.
+  state.throwForSku.set('PARENT-SKU', duplicateBarcodeConflict())
+  productPages = { '1': [variableProduct() as unknown as Row] }
+
+  const result = await capturingWarnings(() => syncAllWcProducts({ mode: 'reconcile' }))
+
+  assert.equal(result.synced, 0)
+  assert.deepEqual(result.errors, [], 'a permanent conflict is NOT a transient error')
+  assert.equal(result.permanentErrors.length, 1, 'it is reported in its own bucket')
+  assert.match(result.permanentErrors[0], /^SKU PARENT-SKU: /)
+  assert.ok(
+    state.settingUpserts.includes('last_wc_product_reconcile_at'),
+    'the cursor MUST advance — holding it re-reads the whole catalogue every cycle, for ever, '
+    + 'and still never imports this product',
+  )
+  // Advancing is only defensible because the operator is told. One line, at ERROR, naming the SKU.
+  const loud = state.activity.filter((entry) => entry.action === 'wc_product_sync_permanent_conflicts')
+  assert.equal(loud.length, 1, 'exactly one line, not one per product')
+  assert.equal(loud[0].level, 'ERROR')
+  assert.match(String(loud[0].description), /PARENT-SKU/)
+})
+
+test('a TRANSIENT failure still holds the bulk cursor (o3d-xbt)', async () => {
+  const { syncAllWcProducts } = await import('@/lib/connectors/woocommerce/sync/product-sync')
+  resetState()
+  // A dropped connection, a lock timeout, a WooCommerce 5xx: the next run can succeed, so
+  // advancing past it would permanently skip remote changes older than now.
+  state.throwForSku.set('PARENT-SKU', new Error('connection terminated unexpectedly'))
+  productPages = { '1': [variableProduct() as unknown as Row] }
+
+  const result = await capturingWarnings(() => syncAllWcProducts({ mode: 'reconcile' }))
+
+  assert.equal(result.errors.length, 1)
+  assert.deepEqual(result.permanentErrors, [])
+  assert.deepEqual(
+    state.settingUpserts.filter((key) => key.includes('reconcile')),
+    [],
+    'the reconcile cursor must NOT move — the next run has to re-attempt this product',
+  )
+  assert.deepEqual(
+    state.activity.filter((entry) => entry.action === 'wc_product_sync_permanent_conflicts'),
+    [],
+    'nothing here needs an operator; saying so would train them to ignore the line',
+  )
+})
+
+test('a permanent conflict alongside a transient one still holds the cursor (o3d-xbt)', async () => {
+  const { syncAllWcProducts } = await import('@/lib/connectors/woocommerce/sync/product-sync')
+  resetState()
+  // The mixed case is the one a single list cannot express. The transient product is the reason
+  // the cursor is held; the permanent one is still reported, and would have advanced it alone.
+  state.throwForSku.set('PARENT-SKU', duplicateBarcodeConflict())
+  state.throwForSku.set('KIT-SKU', new Error('lock timeout'))
+  productPages = { '1': [variableProduct() as unknown as Row, simpleProduct() as unknown as Row] }
+
+  const result = await capturingWarnings(() => syncAllWcProducts({ mode: 'reconcile' }))
+
+  assert.equal(result.permanentErrors.length, 1)
+  assert.equal(result.errors.length, 1)
+  assert.deepEqual(
+    state.settingUpserts.filter((key) => key.includes('reconcile')),
+    [],
+    'one retryable failure is enough to hold the cursor, whatever else failed',
+  )
+  assert.equal(
+    state.activity.filter((entry) => entry.action === 'wc_product_sync_permanent_conflicts').length,
+    1,
+    'the permanent conflict is still named even though the run was not clean',
+  )
+})
+
+test('the loud line and the cursor advance are ONE COMMIT (o3d-xbt r2)', async () => {
+  const { syncAllWcProducts } = await import('@/lib/connectors/woocommerce/sync/product-sync')
+  resetState()
+  // Codex r2 (MEDIUM). The rule was "the line is emitted BEFORE the cursor moves, because advancing
+  // means nothing looks at these SKUs again" — and it was carried by an `await logActivity(...)`
+  // standing above the upsert. `logActivity` catches its own persistence failure and returns void,
+  // so a failed INSERT reached the advance looking exactly like a successful one: the products were
+  // buried and NOTHING named them. A rule that has to hold needs a logger whose failure is visible.
+  state.throwForSku.set('PARENT-SKU', duplicateBarcodeConflict())
+  state.failActivityLogWrite = true
+  productPages = { '1': [variableProduct() as unknown as Row] }
+
+  await assert.rejects(
+    () => capturingWarnings(() => syncAllWcProducts({ mode: 'reconcile' })),
+    /activity_log insert failed/,
+    'the failure is the caller\'s problem now, not stderr\'s',
+  )
+
+  assert.deepEqual(
+    state.settingUpserts.filter((key) => key.includes('reconcile')),
+    [],
+    'the cursor MUST NOT move past products whose only record failed to be written',
+  )
+  assert.deepEqual(
+    state.activity.filter((entry) => entry.action === 'wc_product_sync_permanent_conflicts'),
+    [],
+    'and the line really did not land — this is not a test of a double that recorded it anyway',
+  )
+})
+
+test('a cursor HELD by a transient failure still gets the line, best-effort (o3d-xbt r2)', async () => {
+  const { syncAllWcProducts } = await import('@/lib/connectors/woocommerce/sync/product-sync')
+  resetState()
+  // The other half of the split. Nothing is being buried here — the cursor is held, so the next run
+  // re-reads and re-reports these SKUs — so the line is worth writing but not worth failing the run
+  // for. It goes through the swallowing logger, and the run still returns its result.
+  state.throwForSku.set('PARENT-SKU', duplicateBarcodeConflict())
+  state.throwForSku.set('KIT-SKU', new Error('lock timeout'))
+  state.failActivityLogWrite = true
+  productPages = { '1': [variableProduct() as unknown as Row, simpleProduct() as unknown as Row] }
+
+  const result = await capturingWarnings(() => syncAllWcProducts({ mode: 'reconcile' }))
+
+  assert.equal(result.permanentErrors.length, 1)
+  assert.equal(result.errors.length, 1)
+  assert.deepEqual(
+    state.settingUpserts.filter((key) => key.includes('reconcile')),
+    [],
+    'held by the transient failure, exactly as before',
+  )
+})
+
+test('a run with no failures at all advances the cursor and says nothing (o3d-xbt)', async () => {
+  const { syncAllWcProducts } = await import('@/lib/connectors/woocommerce/sync/product-sync')
+  resetState()
+  // The control. Without it, a change that simply never populated `permanentErrors` — or one that
+  // upserted the cursor unconditionally — would pass the three tests above.
+  productPages = { '1': [variableProduct() as unknown as Row] }
+
+  const result = await capturingWarnings(() => syncAllWcProducts({ mode: 'reconcile' }))
+
+  assert.equal(result.synced, 1)
+  assert.deepEqual(result.errors, [])
+  assert.deepEqual(result.permanentErrors, [])
+  assert.ok(state.settingUpserts.includes('last_wc_product_reconcile_at'))
+  assert.deepEqual(state.activity.filter((entry) => entry.action === 'wc_product_sync_permanent_conflicts'), [])
+})
+
+test('a STRUCTURE conflict is permanent too, so it no longer pins the cursor either (o3d-xbt / o3d-y89x)', async () => {
+  const { syncAllWcProducts } = await import('@/lib/connectors/woocommerce/sync/product-sync')
+  resetState()
+  // This is the case the o3d-y89x test used to pin the other way round: a KIT paired with a
+  // WooCommerce variable product leaves WooCommerce objects unimported, and syncWcProductToIms
+  // already returns `permanent: true` for it. Holding the cursor was a livelock, not caution — the
+  // resolution is an operator's, not a retry's.
   state.products.push(imsRow({ id: 'ims-kit', sku: 'PARENT-SKU', name: 'A kit', type: 'KIT' }))
   productPages = { '1': [variableProduct() as unknown as Row] }
 
   const result = await capturingWarnings(() => syncAllWcProducts({ mode: 'reconcile' }))
 
   assert.equal(result.synced, 0, 'a conflicted product is not counted as synced')
-  assert.equal(result.errors.length, 1, 'it is reported as an error')
-  assert.deepEqual(
-    state.settingUpserts.filter((key) => key.includes('reconcile')),
-    [],
-    'the reconcile cursor must NOT move — the next run has to re-attempt this product',
-  )
+  assert.deepEqual(result.errors, [])
+  assert.equal(result.permanentErrors.length, 1)
+  assert.ok(state.settingUpserts.includes('last_wc_product_reconcile_at'))
 
-  // And once it is resolved the cursor does move again, so a conflict pins the cursor only
-  // for as long as it is unresolved.
+  // And once it is resolved the product syncs normally again — the conflict was never the
+  // cursor's business.
   state.products.find((row) => row.id === 'ims-kit')!.type = 'VARIABLE'
   state.settingUpserts.length = 0
   const after = await capturingWarnings(() => syncAllWcProducts({ mode: 'reconcile' }))
 
-  assert.equal(after.errors.length, 0)
-  assert.ok(
-    state.settingUpserts.includes('last_wc_product_reconcile_at'),
-    'a clean run advances the cursor as before',
-  )
+  assert.deepEqual(after.errors, [])
+  assert.deepEqual(after.permanentErrors, [])
+  assert.ok(state.settingUpserts.includes('last_wc_product_reconcile_at'))
 })
 
 // ---------------------------------------------------------------------------
@@ -2921,4 +3136,77 @@ test('o3d-y89x r5: a blocker the DECISION saw and the itemisation missed still r
   assert.match(String(result.error), /rolled back/)
   assert.notEqual(result.permanent, true, 'a blocker that clears itself must stay retryable')
   assert.equal(findProductBySku('PARENT-SKU')?.type, 'SIMPLE', 'the transform is not committed')
+})
+
+// --- the page walk itself ---------------------------------------------------
+//
+// o3d-batch-wcsync ROUND 3 (Codex HIGH + MEDIUM) — "THE CURSOR IS HELD" HAD NO BEHAVIOURAL COVER.
+//
+// The round that made this walk end on an empty page pinned its central claim — a read that did not
+// cover the collection must not advance `last_wc_product_*` — with WHITESPACE-NORMALISED SOURCE
+// GREPS. Wrapping the very push those greps asserted in `if (false && …)` left the source text
+// intact and the whole suite green, and so did flipping the truncation flag to a constant `false`.
+// The pure functions were tested; the wiring that makes them matter was not.
+//
+// These drive the real `syncAllWcProducts` against a store that never ends, and assert on the
+// SETTING KEYS IT UPSERTED. The cursor is the only thing that decides whether the products past the
+// truncation are ever read again, so it is what the assertion is about.
+
+/** A product the walk counts and moves past cheaply: no SKU means "skipped", with no writes. */
+function skulessProduct(id: number): Row {
+  return { id, sku: '', name: `No SKU ${id}`, type: 'simple' } as unknown as Row
+}
+
+/** A store that answers every page with one product — it never returns an empty page. */
+function neverEndingStore(): Record<string, Row[]> {
+  let id = 1
+  return new Proxy({}, { get: () => [skulessProduct(id++)] }) as Record<string, Row[]>
+}
+
+test('[round 3] a walk that never reaches an empty page does NOT advance the cursor', async () => {
+  const { syncAllWcProducts } = await import('@/lib/connectors/woocommerce/sync/product-sync')
+  resetState()
+  productPages = neverEndingStore()
+
+  const result = await capturingWarnings(() => syncAllWcProducts({ mode: 'reconcile' }))
+
+  assert.equal(
+    state.settingUpserts.includes('last_wc_product_reconcile_at'),
+    false,
+    'advancing here skips every product past the truncation for ever — nothing re-reads behind a cursor',
+  )
+  assert.equal(result.errors.length, 1, 'and the incomplete read is RECORDED rather than merely implied')
+  assert.deepEqual(result.permanentErrors, [], 'nothing about the catalogue was established, so nothing is buried')
+})
+
+test('[round 3] running out of ceiling is escalated as a STALL, not left as one sync error line', async () => {
+  // The MEDIUM. This walk reads `modified_after = <cursor>`, and the error above HOLDS that cursor —
+  // so the next run rebuilds the identical window, reads the identical 1000 pages and stops in the
+  // identical place, for ever, never reaching what is past it. The round-2 wording said "it will be
+  // retried" and blamed an unreadable page-count header; both are the wrong diagnosis here.
+  const { syncAllWcProducts } = await import('@/lib/connectors/woocommerce/sync/product-sync')
+  resetState()
+  productPages = neverEndingStore()
+
+  const result = await capturingWarnings(() => syncAllWcProducts({ mode: 'reconcile' }))
+
+  const stall = state.activity.filter((entry) => entry.action === 'wc_product_sync_ceiling_stall')
+  assert.equal(stall.length, 1, 'an operator has to be told this run makes no progress at all')
+  assert.equal(stall[0].level, 'ERROR')
+  assert.match(String(stall[0].description), /RETRYING CANNOT CLEAR IT/)
+  assert.match(String(stall[0].description), /last_wc_product_reconcile_at/, 'and it names the cursor that is stuck')
+  assert.equal(result.errors[0], stall[0].description, 'the sync error and the escalation are one sentence, not two')
+})
+
+test('[round 3] a walk that DOES reach an empty page advances the cursor and escalates nothing', async () => {
+  // The control that makes the two above mean something: without it, a change that simply never
+  // upserted the cursor, or one that escalated on every run, would pass them both.
+  const { syncAllWcProducts } = await import('@/lib/connectors/woocommerce/sync/product-sync')
+  resetState()
+  productPages = { '1': [skulessProduct(1)] }
+
+  await capturingWarnings(() => syncAllWcProducts({ mode: 'reconcile' }))
+
+  assert.ok(state.settingUpserts.includes('last_wc_product_reconcile_at'))
+  assert.deepEqual(state.activity.filter((entry) => entry.action === 'wc_product_sync_ceiling_stall'), [])
 })

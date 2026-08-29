@@ -29,6 +29,8 @@ const state = {
   /** RETURN_INBOUND movements: WHICH goods a restocking refund actually received back. */
   returnMovements: [] as Row[],
   allocationCount: 1,
+  /** What the allocator answers. Stateful so the BACKORDER refusal can be reached (o3d-xnwu). */
+  autoAllocate: { success: true, allocationCount: 1, unallocatedQty: 0 } as Row,
   /** ('shipmentId', 'targetStatus') for every transition actually attempted. */
   transitions: [] as Array<[string, string]>,
   activity: [] as Row[],
@@ -133,7 +135,7 @@ mock.module('@/lib/db', {
 
 mock.module('@/app/actions/allocation', {
   namedExports: {
-    autoAllocateOrder: async () => ({ success: true, allocationCount: 1, unallocatedQty: 0 }),
+    autoAllocateOrder: async () => ({ ...state.autoAllocate }),
     confirmAllocations: async () => ({ success: true }),
     updateShipmentStatus: async (shipmentId: string, target: string) => {
       state.transitions.push([shipmentId, target])
@@ -192,6 +194,7 @@ function reset() {
   state.returnMovements = []
   state.shipments = [{ id: 'shp-1', status: 'PACKED' }]
   state.allocationCount = 1
+  state.autoAllocate = { success: true, allocationCount: 1, unallocatedQty: 0 }
   state.transitions = []
   state.activity = []
   state.kits = new Map()
@@ -387,8 +390,8 @@ test('a RESTOCKING partial refund does not excuse an uncovered dispatch', async 
 
   // The specific reason, not a bare failure: the restocked/kept units must still show as
   // uncovered demand, in the quantity the shipment lines fall short by.
-  assert.match(result.error ?? '', /WIDGET \(4 of 10 uncovered\)/)
   assert.equal(result.success, false)
+  assert.match(result.error ?? '', /WIDGET \(4 of 10 uncovered\)/)
   assert.equal(state.transitions.length, 0)
 })
 
@@ -406,8 +409,8 @@ test('a CHARGEBACK refund does not excuse an uncovered dispatch either', async (
 
   // The specific reason, not a bare failure: the restocked/kept units must still show as
   // uncovered demand, in the quantity the shipment lines fall short by.
-  assert.match(result.error ?? '', /WIDGET \(7 of 10 uncovered\)/)
   assert.equal(result.success, false)
+  assert.match(result.error ?? '', /WIDGET \(7 of 10 uncovered\)/)
   assert.equal(state.transitions.length, 0)
 })
 
@@ -560,4 +563,62 @@ test('a KIT restock is measured in LEAF units, per component', async () => {
   const result = await apply()
 
   assert.deepEqual(result, { success: true })
+})
+
+// ---------------------------------------------------------------------------
+// o3d-xnwu — the refusals have a SHAPE, so a caller can tell "no" from "it broke".
+// ---------------------------------------------------------------------------
+
+test('o3d-xnwu: the physical-stock refusal is classified, RETRYABLE, and leaves a record', async () => {
+  reset()
+  // This refusal has existed since long before o3d-okbd and produced NOTHING: the WooCommerce
+  // caller discarded the result and nothing was logged here either, so an order the store had
+  // marked completed simply never became an IMS shipment and no surface said so.
+  state.allocationCount = 0
+  state.autoAllocate = { success: true, allocationCount: 0, unallocatedQty: 3 }
+  state.orderLines = [{ id: 'line-1', productId: 'p-1', qty: 3, sku: 'WIDGET', description: 'Widget', product: { type: 'SIMPLE' } }]
+
+  const result = await apply()
+
+  assert.equal(result.success, false)
+  assert.equal(result.success === false && result.refusal, 'insufficient_physical_stock')
+  // NOT permanent: it is a statement about IMS stock at this instant, not about the request, and it
+  // clears the moment a receipt lands — the same reasoning that keeps a P2002 on `sku` transient.
+  assert.equal(result.success === false && result.permanent, false)
+  assert.equal(state.transitions.length, 0, 'nothing may be driven to SHIPPED')
+  const logged = state.activity.filter((entry) => entry.action === 'external_fulfillment_backordered')
+  assert.equal(logged.length, 1)
+  assert.equal(logged[0].level, 'WARNING')
+  assert.match(String(logged[0].description), /3 unit\(s\)/)
+})
+
+test('o3d-xnwu: the coverage shortfall is classified PERMANENT — a redelivery reaches the same answer', async () => {
+  reset()
+  // The complement of the test above, and the reason the two must not share a classification: this
+  // one is computed entirely from committed IMS state, so retrying it 24 times into the dead-letter
+  // queue tells an operator nothing the first attempt did not.
+  state.orderLines = [{ id: 'line-1', productId: 'p-1', qty: 10, sku: 'WIDGET', description: 'Widget', product: { type: 'SIMPLE' } }]
+  state.shipmentLines = [{ shipmentId: 'shp-1', lineId: 'line-1', productId: 'p-1', qty: 4 }]
+
+  const result = await apply()
+
+  assert.equal(result.success, false)
+  assert.equal(result.success === false && result.refusal, 'coverage_shortfall')
+  assert.equal(result.success === false && result.permanent, true)
+})
+
+test('o3d-xnwu: a failure that is not a business refusal stays retryable', async () => {
+  reset()
+  // The safe direction, and the reason `permanent` is an allow-list rather than "everything that
+  // is not a success": an allocator that errored may work on the next attempt, and acknowledging
+  // it would discard a fulfilment that was always going to land.
+  state.allocationCount = 0
+  state.autoAllocate = { success: false, error: 'deadlock detected' }
+  state.orderLines = [{ id: 'line-1', productId: 'p-1', qty: 3, sku: 'WIDGET', description: 'Widget', product: { type: 'SIMPLE' } }]
+
+  const result = await apply()
+
+  assert.equal(result.success, false)
+  assert.equal(result.success === false && result.refusal, 'auto_allocation_failed')
+  assert.equal(result.success === false && result.permanent, false)
 })

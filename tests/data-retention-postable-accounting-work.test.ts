@@ -109,6 +109,11 @@ mock.module('@/lib/db', {
     db: {
       setting: { findMany: async () => store.settingRows },
       shoppingSyncLog: noopDelegate(),
+      // o3d-xnwu r15: the WooCommerce sync-log delete is a raw statement now — the recovery-witness
+      // exemption is a fact in another table and Prisma cannot express it. Nothing here asserts
+      // about it (tests/wc-refund-park-recovery-witness-retention.test.ts does), but it must
+      // EXIST or purgeExpiredData dies before reaching anything this file measures.
+      $queryRaw: async () => [{ count: 0 }],
       accountingSyncLog: {
         ...noopDelegate(),
         deleteMany: async ({ where }: { where: Where }) => {

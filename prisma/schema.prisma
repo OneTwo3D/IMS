@@ -1970,6 +1970,19 @@ model SalesOrderRefund {
   // accountingRetrySyncs are NULL on every pre-existing row, so none of the three can tell a genuine
   // lost reversal from a row that predates them. See lib/domain/sales/refund-reversal-record.ts.
   reversalStagingState String? @map("reversal_staging_state")
+  // o3d-2sm1.4: DID THIS ROW EXIST BEFORE reversalStagingState DID? Written once, by the migration
+  // that added the column above, under the ACCESS EXCLUSIVE lock of its own ALTER TABLE — so it
+  // marks exactly the rows present at that instant and nothing can be inserted in the middle of it.
+  // The default is then flipped to false, so every row inserted afterwards carries false.
+  //
+  // It exists because the post-migration check has to tell a LEGACY NULL (legitimate: the column is
+  // deliberately not backfilled) from a NULL minted AFTER the column existed by a binary that never
+  // heard of it — the predecessor writing across the cutover. The first revision of that check
+  // compared createdAt against _prisma_migrations.started_at, and CURRENT_TIMESTAMP is fixed at
+  // TRANSACTION START in Postgres: a predecessor transaction that began before the migration and
+  // committed after it produced a row that looked legacy and was not. No writer sets this column;
+  // it is decided by construction, not by a clock. See the migration and its verify.sql.
+  reversalStagingStatePredatesColumn Boolean @default(false) @map("reversal_staging_state_predates_column")
   refundedAt      DateTime   @default(now())
   createdAt       DateTime   @default(now())
 
@@ -2830,6 +2843,29 @@ model ShoppingSyncLog {
   errorMessage String?
   syncedAt     DateTime?
   createdAt    DateTime              @default(now())
+
+  // o3d-xnwu r8 (Codex HIGH) — WHICH FAMILY OF ROW THIS IS, said in a column IMS owns.
+  //
+  // `entityType` says what the row is ABOUT; this says what the row IS. They are different
+  // questions, and until r8 the second one had no column to live in. This table keeps several
+  // distinct row families that share connector/direction/entityType/status, and each one grew its
+  // own way of being told apart: the pending-FX queue and the admission-refusal queue by having NO
+  // entityId, the refund park by HAVING one. That last discriminator stopped working the moment a
+  // second family with an entityId appeared — the held sales invoice — and the refund-park
+  // predicate, which is the one the recovery inbox offers refund actions from, admitted it.
+  //
+  // WHY NOT payload. A refund park PERSISTS THE RAW WOOCOMMERCE REFUND, whose fields are the
+  // store's and whose `reason` is free text a human types. Selecting or excluding rows on it is
+  // the exact defect r7 fixed (an operator's refund reason hid their own park), and it is
+  // bidirectional: a park whose reason happened to read `missing_wc_invoice_number` was selected
+  // by the held-invoice queue, which UPDATES the rows it finds. A discriminator has to be a
+  // column, and it has to be one only IMS ever writes.
+  //
+  // Nullable, and a value here is a POSITIVE assertion by the writer. It is never decided by
+  // absence: NULL means "an ordinary sync log, or a row written before this column existed", not
+  // "a park". Every predicate that reads it asks for its own value by name, so a new family that
+  // forgets to stamp is invisible to the others rather than silently inheriting one of them.
+  recordKind   String?
 
   // Polymorphic reference: use entityType + entityId for application-level lookups.
   // No FK constraints — entityId may point to Product or SalesOrder based on entityType.

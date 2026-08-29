@@ -43,6 +43,63 @@ function renderOnPty(command: string): Promise<string> {
 
 const SCRIPT = 'scripts/install.sh'
 
+/**
+ * WHERE THE `.env` WRITE BEGINS, IN EITHER SHAPE OF THE SCRIPT (o3d-2sm1.5 r38).
+ *
+ * The heredoc used to be four straight-line statements; r38 wrapped it in write_app_env_file() so
+ * that a credential rotation performed after the stop can re-write the file install.sh owns
+ * instead of reading a file the application account owns. These two helpers keep this rig bounded
+ * by lines that exist in BOTH shapes — which is the property the slicing here is built on, so that
+ * reverting the change under test runs the OLD code and this file fails on what the second run
+ * PRODUCED rather than on a marker that moved.
+ */
+function envWriteStartMarker(source: string): string {
+  // r39 split the writer in two: render_app_env_file() holds the heredoc and write_app_env_file()
+  // publishes its output durably. The RENDER is what this file is about, and it is the earlier of
+  // the two, so it is the boundary the preceding slice must stop at.
+  if (source.includes('render_app_env_file() {')) return 'render_app_env_file() {'
+  return source.includes('write_app_env_file() {') ? 'write_app_env_file() {' : 'cat > "${APP_DIR}/.env"'
+}
+
+/**
+ * The write itself: the shipped renderer plus a redirect, the shipped function plus its call, or
+ * the bare statements that preceded either.
+ *
+ * WHAT THIS RIG IS ABOUT IS THE CONTENT, and it says so in three shapes of the script. r38 wrapped
+ * the heredoc in write_app_env_file(); r39 (Codex HIGH) split THAT into render_app_env_file(),
+ * which produces the bytes from held variables, and write_app_env_file(), which publishes them by
+ * rename with ownership and mode applied before the rename. Ownership is exactly what this rig
+ * cannot exercise — it runs as an ordinary user with no APP_USER to give a file to — so it takes
+ * the renderer and redirects it, the same way the pre-r38 slice dropped the chown/chmod pair.
+ *
+ * The publication half is asserted where it can be: install-credential-representation.test.ts
+ * proves the rename by hard link and asserts the mode, and install-credential-preservation.test.ts
+ * checks the mode after a rotation.
+ */
+function envWriteBlock(source: string): string {
+  const rendered = sliceOptionalBlock(source, 'render_app_env_file() {')
+  if (rendered !== null) return `${rendered}\nrender_app_env_file > "\${APP_DIR}/.env"`
+  const wrapped = sliceOptionalBlock(source, 'write_app_env_file() {')
+  if (wrapped !== null) {
+    const body = wrapped.split('\n').filter((line) => !/^\s*(chown|chmod) /.test(line))
+    return `${body.join('\n')}\nwrite_app_env_file`
+  }
+  return sliceRange(source, 'cat > "${APP_DIR}/.env" <<EOF', 'chown "${APP_USER}:${APP_USER}" "${APP_DIR}/.env"')
+}
+
+/**
+ * THE SENTINEL AND THE CAPTURE PRIMITIVE, OPTIONALLY (o3d-2sm1.5 r40, Codex HIGH).
+ *
+ * The Redis recovery this file exercises now reads its userinfo through the shipped `capture`,
+ * because command substitution deletes a trailing newline out of a credential. Both are lifted
+ * OPTIONALLY, like every other slice here: reverting r40 removes them from install.sh and this rig
+ * then runs the old code and fails on what the second run PRODUCED, which is the property the
+ * slicing is built on.
+ */
+function captureTerminatorAssignment(source: string): string {
+  return /^CAPTURE_TERMINATOR=.*$/m.exec(source)?.[0] ?? ''
+}
+
 async function readScript(): Promise<string> {
   return readFile(path.join(SCRIPT), 'utf8')
 }
@@ -98,12 +155,15 @@ async function runInstallerCapturing(
     DATABASE_URL=postgresql://imsuser:pw@localhost:5432/one_two_inventory
     ${UNRELATED_VARS.map((name) => `${name}=''`).join('\n    ')}
     ${hasEnvTable ? 'declare -A EXISTING_ENV=()' : ''}
+    ${captureTerminatorAssignment(source)}
+    ${sliceOptionalBlock(source, 'capture() {') ?? ''}
     ${sliceOptionalBlock(source, 'urlencode() {') ?? ''}
     ${sliceOptionalBlock(source, 'urldecode() {') ?? ''}
     ${sliceOptionalBlock(source, 'mask_secret() {') ?? ''}
     ${sliceOptionalBlock(source, 'redact_url_credentials() {') ?? ''}
     ${sliceOptionalBlock(source, 'redis_url_credential_state() {') ?? ''}
     ${sliceOptionalBlock(source, 'load_existing_env() {') ?? ''}
+    ${sliceOptionalBlock(source, 'unquote_env_value() {') ?? ''}
     ${sliceOptionalBlock(source, 'existing_env() {') ?? ''}
     ${sliceOptionalBlock(source, 'require_preserved_secrets() {') ?? ''}
     ${sliceOptionalBlock(source, 'prompt() {') ?? ''}
@@ -111,8 +171,8 @@ async function runInstallerCapturing(
     ${source.includes('\nload_existing_env "${APP_DIR}/.env"') ? 'load_existing_env "${APP_DIR}/.env"' : ''}
     ${env}
     ${sliceRange(source, 'prompt_yn INSTALL_REDIS', 'info "--- WooCommerce')}
-    ${sliceRange(source, 'AUTH_SECRET=', 'cat > "${APP_DIR}/.env"')}
-    ${sliceRange(source, 'cat > "${APP_DIR}/.env" <<EOF', 'chown "${APP_USER}:${APP_USER}" "${APP_DIR}/.env"')}
+    ${sliceRange(source, 'AUTH_SECRET=', envWriteStartMarker(source))}
+    ${envWriteBlock(source)}
   `
   const { stderr } = await execFileAsync('bash', ['-c', script])
   return { values: parseEnvFile(await readFile(path.join(appDir, '.env'), 'utf8')), stderr }
@@ -303,13 +363,16 @@ test('a preserved credential is never echoed as a prompt default', async () => {
       die() { echo "DIE: $*" >&2; exit 9; }
       APP_DIR=${JSON.stringify(appDir)}
       ${source.includes('declare -A EXISTING_ENV=()') ? 'declare -A EXISTING_ENV=()' : ''}
+      ${captureTerminatorAssignment(source)}
+      ${sliceOptionalBlock(source, 'capture() {') ?? ''}
       ${sliceOptionalBlock(source, 'urlencode() {') ?? ''}
       ${sliceOptionalBlock(source, 'urldecode() {') ?? ''}
       ${sliceOptionalBlock(source, 'mask_secret() {') ?? ''}
       ${sliceOptionalBlock(source, 'redact_url_credentials() {') ?? ''}
       ${sliceOptionalBlock(source, 'redis_url_credential_state() {') ?? ''}
       ${sliceOptionalBlock(source, 'load_existing_env() {') ?? ''}
-      ${sliceOptionalBlock(source, 'existing_env() {') ?? ''}
+      ${sliceOptionalBlock(source, 'unquote_env_value() {') ?? ''}
+    ${sliceOptionalBlock(source, 'existing_env() {') ?? ''}
       ${sliceOptionalBlock(source, 'prompt() {') ?? ''}
       ${sliceOptionalBlock(source, 'prompt_yn() {') ?? ''}
       load_existing_env "\${APP_DIR}/.env"
@@ -353,6 +416,7 @@ async function loadEnvState(
     APP_DIR=${JSON.stringify(appDir)}
     declare -A EXISTING_ENV=()
     ${sliceOptionalBlock(source, 'load_existing_env() {') ?? 'load_existing_env() { :; }'}
+    ${sliceOptionalBlock(source, 'unquote_env_value() {') ?? ''}
     ${sliceOptionalBlock(source, 'existing_env() {') ?? ''}
     load_existing_env "\${APP_DIR}/.env"
     printf 'STATE<<<%s>>>\\n' "\${ENV_FILE_STATE:-__ABSENT__}"
@@ -503,4 +567,33 @@ test('o3d-l89a r4: a genuinely absent .env still mints — the refusal must not 
 
   assert.match(stdout, /STATE<<<absent>>>/)
   assert.match(stdout, /KEY<<<__WOULD_MINT__>>>/, 'a first install has nothing to preserve, and minting there is correct')
+})
+
+test('a re-run keeps the privileged cutover connection it never minted', async () => {
+  // o3d-2sm1.3 — the installer now performs a fenced cutover when it finds an existing
+  // installation, and a real connection fence needs DEPLOY_ADMIN_DATABASE_URL. Nothing
+  // prompts for it and nothing mints it: an operator sets it deliberately as a role
+  // separate from the application's. The heredoc rewrites .env whole, so a value this
+  // script does not carry forward is one a re-run silently deletes — and the cost of that
+  // is not visible, because the NEXT upgrade simply falls back to the snapshot probe.
+  const source = await readScript()
+  const appDir = await appDirectory()
+  const admin = 'postgresql://deployadmin:pw@localhost:5432/one_two_inventory'
+
+  const first = await runInstaller(
+    source,
+    appDir,
+    `INSTALL_REDIS=y; REDIS_PORT=6379; DEPLOY_ADMIN_DATABASE_URL=${JSON.stringify(admin)}`,
+  )
+  assert.equal(first.DEPLOY_ADMIN_DATABASE_URL, admin, 'precondition: the first run wrote it')
+
+  const second = await runInstaller(source, appDir, 'INSTALL_REDIS=y; REDIS_PORT=6379')
+  assert.equal(second.DEPLOY_ADMIN_DATABASE_URL, admin, 'the re-run dropped the cutover admin connection')
+
+  const third = await runInstaller(
+    source,
+    appDir,
+    'INSTALL_REDIS=y; REDIS_PORT=6379; DEPLOY_ADMIN_DATABASE_URL=postgresql://other@localhost/x',
+  )
+  assert.equal(third.DEPLOY_ADMIN_DATABASE_URL, 'postgresql://other@localhost/x', 'an explicit value must still win')
 })

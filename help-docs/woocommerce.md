@@ -263,6 +263,31 @@ a live document onto the storefront's number.
 
 This uses the same shared external-fulfillment path that future WMS plugins will use. WooCommerce does not bypass the IMS shipment model or dispatch stock directly at order level.
 
+**A completion that cannot become a shipment is now reported, not swallowed.** There are two reasons
+IMS will refuse one, and they are handled differently because only one of them clears by itself:
+
+- **The order is on backorder** — there is no physical stock for IMS to consume, so nothing can be
+  marked shipped. The webhook delivery is **retried**, because the refusal describes IMS stock at
+  that instant and a receipt landing later is the fix. A warning is recorded against the order.
+- **The shipment lines do not cover what was ordered**, net of refunds. The goods have already left
+  the warehouse, so recording the smaller quantity would under-book stock movement and COGS
+  permanently. Re-delivering the same order reaches the same conclusion, so the delivery is
+  **acknowledged rather than retried**, and a warning naming the uncovered quantities is recorded
+  against the order for someone to act on.
+
+  This one is only decided **after the order's refunds have been read**. A delivery that carries both
+  the completion and a refund — eight of ten shipped, two refunded, which is a complete dispatch —
+  would otherwise be judged against demand that still counted the refunded units and be refused
+  seconds before the refund was applied. The completion is therefore re-checked once the refund sweep
+  for that order has finished, and only the second answer is recorded. If the refunds could not be
+  read to the end, **or any refund that was read failed to apply**, nothing is recorded at all and the
+  delivery is retried — a refund sitting in the store but not in IMS leaves exactly the same hole in
+  the coverage check as one that was never read, and the failure is named in the delivery's own
+  failure list.
+
+Previously both took the same route and neither reached the caller at all: the store showed the order
+as completed, IMS never created the shipment, the webhook was acknowledged, and nothing retried.
+
 ### Webhooks (Recommended)
 
 Webhooks deliver order changes to One Two Inventory in real-time, rather than waiting for the next poll. To set up:
@@ -324,9 +349,61 @@ The **Products** tab controls bidirectional product synchronisation.
 - Weight and dimensions (length, width, height)
 - GTIN/barcode from WooCommerce's `global_unique_id` field (only written if the IMS barcode field is empty)
 - HS code and country of origin from WC product attributes (only written if the IMS fields are empty)
-- **Categories** — the WC product-category tree is mirrored into IMS. Each WC category becomes an IMS reporting category with its WC parent chain preserved (so `Apparel > T-Shirts > V-Neck` arrives as a 3-level path). The product is linked to its **deepest** WC category. The mirror is cached for 5 minutes so per-product webhooks do not re-fetch the whole tree. If the WC categories endpoint is unreachable, the product's existing category link is left alone rather than wiped.
+- **Categories** — the WC product-category tree is mirrored into IMS. Each WC category becomes an IMS reporting category with its WC parent chain preserved (so `Apparel > T-Shirts > V-Neck` arrives as a 3-level path). The product is linked to its **deepest** WC category. The mirror is cached for 5 minutes so per-product webhooks do not re-fetch the whole tree. If the WC categories endpoint is unreachable — or the category list cannot be read to its end — the product's existing category link is left alone rather than wiped or linked to a partial tree.
 - Variable products: all variations are synced as child VARIANT products linked to the parent
 - Variation attributes are synced for the options panel
+
+**There is a supported size for a variable product: 1,000 variations.** A product's variations are
+read in full *before* anything is written, and then applied in a single transaction, so a failure
+anywhere leaves the catalogue exactly as it was. That transaction has a budget, and 1,000 variations
+is what fits inside it. A larger product is **refused before the first write**, naming the count —
+importing part of a product and reporting success would leave the catalogue silently incomplete. The
+remedy is to split the product in WooCommerce; raising the limit means raising the write
+transaction's budget with it.
+
+Two related refusals come from the same place, and both are retried rather than needing a person. If
+reading a product's variations takes longer than **five minutes**, the import gives up and comes back
+later, so a slow store cannot leave a webhook in flight long enough for a second worker to pick the
+same one up. And if the store serves **fewer variations than it says the product has**, the import is
+refused rather than applied — a truncated variation list applied as if whole is the silent
+incompleteness this connector exists to avoid.
+
+**How the connector decides it has read a whole list.** Every paged read here ends on an **empty
+page**, never on what the response headers say — variations, categories, tax rates and refunds, and
+now the four bulk walks as well: the **product sync**, the **order import sweep**, the **historical
+order import** and the **initial import**. A store that does not send a page count is
+indistinguishable from one reporting a single page, and `per_page` is a request rather than a grant,
+so a store that answers with its own smaller page size does so with no error at all. Ending on
+either would silently import the first page of a list and report it as the lot. Each walk also has a
+page ceiling so that a store ignoring the `page` parameter is not asked for ever; reaching that
+ceiling is reported as an incomplete read, not treated as the end of the collection.
+
+**A page that could not be read is the other kind of incomplete.** Ending on an empty page answers a
+question about the *tail*. A page whose fetch fails after its retries is a hole in the *middle*, and
+reaching an empty page later says nothing about it — so the two order backfills stop on the first
+unread page rather than skipping past it, and record which page it was. Stopping is also what keeps a
+store outage cheap: a walk that skipped would work its way through the whole page ceiling, three
+attempts and a two-minute timeout at a time, to reach a conclusion the first unread page had already
+settled.
+
+The four bulk walks are the ones with something to lose from getting this wrong, because three of
+them **move a cursor**. A read that did not cover the collection but looked clean would advance the
+product or order sync cursor past everything it never asked for, and nothing re-reads behind a cursor
+— so an incomplete walk is recorded as an **error**, which is exactly the condition those cursors
+already refuse to advance on. The initial import goes further: an incomplete read **fails the pass
+outright**, because that pass is what unlocks ongoing live order sync, and a backfill cut short at its
+first page has still "imported at least one order".
+
+**When a cursor walk runs out of ceiling, retrying cannot clear it.** The product sync and the order
+sweep read a window defined by their own cursor, and the incomplete read holds that cursor — so the
+next run rebuilds the same window, reads the same pages and stops in the same place, and the rows past
+the ceiling are never reached. That is not a transient failure waiting to clear, so it is raised as an
+ERROR in the activity log naming the stuck cursor, and the remedy is a human one: narrow the window so
+the cursor can advance, or raise the ceiling for that store.
+
+**A historical import that did not read its whole window says so.** That job has no cursor to hold, so
+the notification is the whole remedy — it reports as *incomplete* rather than complete, and tells you
+to re-run the same dates.
 
 ### What the connector will NOT change
 
@@ -351,7 +428,7 @@ When a refusal applies, the row is left **structurally and commercially** untouc
 
 A variation is also only matched to an existing IMS row when that row is genuinely the one the WooCommerce variation owns: not mapped to a different WooCommerce object, not already a child of a *different* IMS parent, not itself a parent, of a type that can sit under a variable parent, and not carrying stock or open documents. A bare SKU match is not enough.
 
-When a refusal means WooCommerce data goes **unimported**, the import is reported as failed, the product is not marked synced, the reconcile cursor does not advance past it, and a row appears in the [Sync Exception Inbox](sync-exceptions.md). Resolve it in IMS or in WooCommerce; the next successful sync clears the row by itself. There are four ways to reach that state, and they are one rule — *the two systems disagree about whether the row is a variable parent*, asked of the row's **type and its actual child rows**, not of its type alone:
+When a refusal means WooCommerce data goes **unimported**, the import is reported as failed, the product is not marked synced, and a row appears in the [Sync Exception Inbox](sync-exceptions.md). Resolve it in IMS or in WooCommerce; the next successful sync clears the row by itself. There are four ways to reach that state, and they are one rule — *the two systems disagree about whether the row is a variable parent*, asked of the row's **type and its actual child rows**, not of its type alone:
 
 - a **variable** WooCommerce product paired with an IMS row that cannot be a parent (a kit, a row that is already somebody's variation, a row that already has child rows its type does not allow, or a row carrying stock or open documents) — none of its variations are imported;
 - a **simple** WooCommerce product paired with an IMS **VARIABLE** row — its type and its price are not applied, and the IMS variants stay where they are. The connector will not delete IMS children that WooCommerce never asked it to remove;
@@ -580,6 +657,24 @@ What it does:
 3. Runs the daily stock catch-up by draining queued retry jobs and force-pushing current stock
 
 Order reconcile also backfills orders that were intentionally skipped while `wc_initial_import_completed` was not yet `true`. The reconcile path uses its own `last_wc_order_reconcile_at` cursor, so the first reconcile after initial import completion can import those missed live orders.
+
+**A product that can never import does not stall the rest of the catalogue.** Each product sync
+carries a cursor — the point in WooCommerce's own modification history the next run reads from — and
+it only moves forward on a run with no failures a retry could fix. A failure that *no* retry can fix
+is treated as the opposite: a duplicate GTIN, a WooCommerce id already mapped to a different IMS
+product, or a product-structure conflict is **counted and named at ERROR level, and the cursor moves
+past it**. Holding the cursor for those was a stall, not caution — every later run re-read the whole
+catalogue from the same watermark, re-imported all of it, and re-failed on the same product, for
+ever.
+
+The log line names each blocked SKU, and the manual product sync shows them as **blocked (needs an
+operator)** separately from the error count, because re-running is the one thing that cannot help.
+That line and the cursor move are written together: if the line cannot be recorded, the cursor does
+not move either, so products are never skipped past with nothing naming them.
+One thing to know when you fix one: if the remedy is on the IMS side — clearing a product's external
+mapping, or resolving a structure conflict on [Sync Exceptions](sync-exceptions.md) — WooCommerce's
+own record of the product has not changed, so the cursor has nothing to find. **Re-save the product
+in WooCommerce** after fixing it and the next sync picks it up.
 
 The cron endpoints require a `CRON_SECRET` header for security. Cron setup is usually handled by your administrator during deployment.
 

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { Prisma } from '@/app/generated/prisma/client'
-import { resolveMonetaryRefundVatRate, syncWcRefund, type WcRefundSyncDependencies } from '@/lib/connectors/woocommerce/sync/refund-sync'
+import { refundIsInIms, refundMayStillReachIms, refundOutcomeFailed, resolveMonetaryRefundVatRate, syncWcRefund, type WcRefundSyncDependencies } from '@/lib/connectors/woocommerce/sync/refund-sync'
 import type { WcRefund } from '@/lib/connectors/woocommerce/sync/types'
 import { refundWouldExceedOrderTotal } from '@/lib/domain/sales/o2c-guards'
 import { isFullRefundAmount } from '@/lib/domain/sales/refund-thresholds'
@@ -334,8 +334,10 @@ test('syncWcRefund treats repeated WooCommerce refund delivery as already proces
   const first = await syncWcRefund(1001, makeRefund(), state.dependencies)
   const second = await syncWcRefund(1001, makeRefund(), state.dependencies)
 
-  assert.deepEqual(first, { success: true })
-  assert.deepEqual(second, { success: true })
+  // o3d-xnwu r4: the two deliveries are NOT the same ending, and the type now says which is which —
+  // the first APPLIES the refund, the second finds it already there.
+  assert.deepEqual(first, { outcome: 'applied' })
+  assert.deepEqual(second, { outcome: 'already-applied' })
   assert.equal(state.refunds.length, 1)
   assert.equal(state.syncLogs.length, 1)
   assert.equal(state.activityLogs.length, 1)
@@ -371,7 +373,7 @@ test('syncWcRefund reconciles a VAT line refund on the gross basis (amount inclu
 
   const result = await syncWcRefund(1001, refund, state.dependencies)
 
-  assert.deepEqual(result, { success: true })
+  assert.deepEqual(result, { outcome: 'applied' })
   assert.equal(state.createRefundCalls, 1)
   // No PENDING amount-mismatch log should have been written
   assert.equal(
@@ -415,7 +417,7 @@ test('a monetary-only refund converts gross to net at the FRACTIONAL tax rate, n
 
   const result = await syncWcRefund(1001, refund, state.dependencies)
 
-  assert.equal(result.success, true)
+  assert.equal(refundIsInIms(result.outcome), true)
   assert.equal(state.createRefundLines.length, 1)
   // 120.00 gross / 1.20 = 100.00 net. Reading taxRatePercent as a percentage gave 120/1.002 = 119.7605.
   assert.equal(state.createRefundLines[0].totalBase, 100, 'the stored NET total is the order net, not the gross')
@@ -484,7 +486,7 @@ test('a monetary-only refund whose gross->net basis CANNOT be determined is refu
 
   const result = await syncWcRefund(1001, refund, state.dependencies)
 
-  assert.equal(result.success, false, 'refused rather than recorded on an undetermined basis')
+  assert.equal(refundOutcomeFailed(result.outcome), true, 'refused rather than recorded on an undetermined basis')
   assert.match(result.error ?? '', /cannot be converted from gross to net/)
   assert.equal(state.createRefundCalls, 0, 'no refund is created')
   const park = state.syncLogs.at(-1) as { data?: { status?: string; externalId?: string } }
@@ -506,7 +508,7 @@ test('a monetary-only refund is refused when the order total cannot be reproduce
 
   const result = await syncWcRefund(1001, refund, state.dependencies)
 
-  assert.equal(result.success, false)
+  assert.equal(refundOutcomeFailed(result.outcome), true)
   assert.match(result.error ?? '', /does not reconcile with its VAT/)
   assert.equal(state.createRefundCalls, 0)
 })
@@ -522,7 +524,7 @@ test('a monetary-only refund on a NON-taxable order still stores the gross amoun
 
   const result = await syncWcRefund(1001, refund, state.dependencies)
 
-  assert.equal(result.success, true, 'an untaxed order needs no rate and must not be quarantined')
+  assert.equal(refundIsInIms(result.outcome), true, 'an untaxed order needs no rate and must not be quarantined')
   assert.equal(state.createRefundLines[0].totalBase, 100)
 })
 
@@ -796,7 +798,7 @@ test('a shipping-taxed order is QUARANTINED instead of being credited short (o3d
 
   const result = await syncWcRefund(1001, refund, state.dependencies)
 
-  assert.equal(result.success, false)
+  assert.equal(refundOutcomeFailed(result.outcome), true)
   assert.equal(state.createRefundCalls, 0, 'no credit note is raised on a rate the order did not charge')
   const park = state.syncLogs.at(-1) as { data?: { status?: string; payload?: unknown } }
   assert.equal(park?.data?.status, 'QUARANTINED')
@@ -1018,7 +1020,7 @@ test('an undeterminable-basis quarantine names the completion path that exists (
   })
   const result = await syncWcRefund(1001, makeRefund({ id: 7104, amount: '120.00', line_items: [], shipping_lines: [] }), state.dependencies)
 
-  assert.equal(result.success, false)
+  assert.equal(refundOutcomeFailed(result.outcome), true)
   const message = result.error ?? ''
   // The remedy is the Record-manually action on the exception inbox — recordRefundParkManually — and it
   // takes a NET allocation across the order's lines. Naming anything else would be naming a screen that
@@ -1068,7 +1070,7 @@ test('syncWcRefund still rejects a genuine amount mismatch', async () => {
 
   const result = await syncWcRefund(1001, refund, state.dependencies)
 
-  assert.equal(result.success, false)
+  assert.equal(refundOutcomeFailed(result.outcome), true)
   assert.match(result.error ?? '', /amount mismatch/)
   assert.equal(state.createRefundCalls, 0)
 })
@@ -1101,7 +1103,7 @@ test('a park is NOT written for an order deleted during processing — no orphan
   state.simulateOrderDeleted()
   const result = await syncWcRefund(1001, refund, state.dependencies)
 
-  assert.equal(result.success, false, 'the mismatch still surfaces')
+  assert.equal(refundOutcomeFailed(result.outcome), true, 'the mismatch still surfaces')
   const parks = state.syncLogs.filter((log) => (log as { data?: { externalId?: string } }).data?.externalId === '7011')
   assert.equal(parks.length, 0, 'no orphaned park was written for the deleted order')
 })
@@ -1114,7 +1116,9 @@ test('syncWcRefund treats external refund unique conflicts as idempotent races',
 
   const result = await syncWcRefund(1001, makeRefund(), state.dependencies)
 
-  assert.deepEqual(result, { success: true })
+  // The race's WINNER is this same order's row, verified under the lock — so the refund IS in IMS,
+  // it just was not this call that put it there.
+  assert.deepEqual(result, { outcome: 'already-applied' })
   assert.equal(state.syncLogs.length, 1)
   assert.deepEqual((state.syncLogs[0] as { data: unknown }).data, {
     direction: 'FROM_CONNECTOR',
@@ -1174,7 +1178,7 @@ test('syncWcRefund links a refund line to its IMS order line via _refunded_item_
 
   const result = await syncWcRefund(1001, refund, harness.dependencies)
 
-  assert.equal(result.success, true, result.error)
+  assert.equal(refundIsInIms(result.outcome), true, result.error)
   assert.equal(harness.createRefundLines.length, 1)
   assert.equal(
     harness.createRefundLines[0].lineId,
@@ -1190,7 +1194,7 @@ test('syncWcRefund falls back to the refund line id when _refunded_item_id is ab
   const harness = makeDependencies()
   const result = await syncWcRefund(1001, makeRefund(), harness.dependencies)
 
-  assert.equal(result.success, true, result.error)
+  assert.equal(refundIsInIms(result.outcome), true, result.error)
   assert.equal(harness.createRefundLines[0].lineId, 'line-1')
 })
 
@@ -1198,7 +1202,7 @@ test('a refused monetary-only refund is QUARANTINED and not re-attempted on the 
   const state = makeDependencies({ alwaysMissExistingRefund: true, refuseWithQuarantine: true })
 
   const first = await syncWcRefund(1001, makeRefund(), state.dependencies)
-  assert.equal(first.success, false, 'the refusal surfaces as a failed sync')
+  assert.equal(refundOutcomeFailed(first.outcome), true, 'the refusal surfaces as a failed sync')
 
   // It is parked as QUARANTINED (distinct from FAILED), keyed by the WC refund id.
   const parked = state.syncLogs.find((log) => {
@@ -1220,7 +1224,15 @@ test('a refused monetary-only refund is QUARANTINED and not re-attempted on the 
   const callsAfterFirst = state.createRefundCalls
   // A duplicate delivery must be skipped by the parked-log dedup — no re-refusal loop.
   const second = await syncWcRefund(1001, makeRefund(), state.dependencies)
-  assert.equal(second.success, true, 'the parked refund is treated as handled, not retried')
+  // o3d-xnwu r4: HANDLED, AND NOT APPLIED — and those are now two different things. This ending used
+  // to return the same `success: true` the applied endings did, so the sweep counted a refund sitting
+  // in the exception inbox as one that is in IMS.
+  // o3d-xnwu r5: and RESOLVABLE — the half of "handled" that says an operator can still make this a
+  // SalesOrderRefund, which is what makes holding a delivery for it worth something. The other half
+  // (a chargeback-suppressed refund) can never be applied and must not hold anything.
+  assert.equal(second.outcome, 'handled-unapplied-resolvable', 'the parked refund is treated as handled, not retried')
+  assert.equal(refundIsInIms(second.outcome), false, 'and nothing about it is in IMS')
+  assert.equal(refundMayStillReachIms(second.outcome), true, 'but an operator resolving the park still lands it')
   assert.equal(state.createRefundCalls, callsAfterFirst, 'createRefund was NOT called again for a parked refund')
 })
 
@@ -1236,7 +1248,7 @@ test('a refund id already parked for a DIFFERENT order fails closed, not silentl
   })
   const result = await syncWcRefund(1001, refund, state.dependencies)
 
-  assert.equal(result.success, false)
+  assert.equal(refundOutcomeFailed(result.outcome), true)
   assert.match(result.error ?? '', /already parked for a different order/i, 'failed closed on the cross-order collision')
   // Order A's park is untouched — still entityId so-other.
   const seed = state.syncLogs.find((log) => (log as { id?: string }).id === 'log-seed') as { data: { entityId: string } }
@@ -1255,7 +1267,7 @@ test('a QUARANTINED park for a DIFFERENT order does not mark this order handled 
   })
   const result = await syncWcRefund(1001, refund, state.dependencies)
 
-  assert.equal(result.success, false, 'B is NOT silently treated as handled by A\'s quarantined park')
+  assert.equal(refundOutcomeFailed(result.outcome), true, 'B is NOT silently treated as handled by A\'s quarantined park')
   assert.match(result.error ?? '', /different order/i, 'the cross-order quarantine is surfaced, not swallowed')
 })
 
@@ -1266,7 +1278,7 @@ test('an existing refund for a DIFFERENT order fails closed, not reported as alr
 
   const result = await syncWcRefund(1001, makeRefund({ id: 7014 }), state.dependencies)
 
-  assert.equal(result.success, false, 'not silently treated as already-synced for this order')
+  assert.equal(refundOutcomeFailed(result.outcome), true, 'not silently treated as already-synced for this order')
   assert.match(result.error ?? '', /different order/i, 'the cross-order existing refund is surfaced')
   assert.equal(state.createRefundCalls, 0, 'no refund was created on this order')
 })
@@ -1277,9 +1289,79 @@ test('a PENDING park for a DIFFERENT order blocks applying the same refund here 
 
   const result = await syncWcRefund(1001, makeRefund({ id: 7015 }), state.dependencies)
 
-  assert.equal(result.success, false, 'a PENDING park owned by another order fails closed too')
+  assert.equal(refundOutcomeFailed(result.outcome), true, 'a PENDING park owned by another order fails closed too')
   assert.match(result.error ?? '', /different order/i)
   assert.equal(state.createRefundCalls, 0, 'no refund created on this order while another order holds the park')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-xnwu ROUND 6 (Codex HIGH) — THE TWO CROSS-ORDER REFUSALS ARE NOT THE SAME KIND.
+//
+// Both used to return `permanent-failure`, and a caller deciding whether to WAIT read that as "no
+// operator act inside IMS can ever change this". True of one of them, false of the other:
+//
+//   a PARK on another order is exactly what o3d-54p's "Wrong order" recovery moves (merged, PR
+//   #640). It asks WooCommerce whether the refund is on the named order right now and, if it is,
+//   reassigns the park as PENDING — the one actionable status this sync does not treat as handled —
+//   after which the refund is retryable there.
+//
+//   a SalesOrderRefund that ALREADY EXISTS on another order is a created record. There is no park
+//   to move, a WooCommerce refund id maps to one order, and nothing in IMS makes it this order's.
+//
+// The refusals themselves are unchanged — failing closed automatically is right in both cases, and
+// `refundOutcomeFailed` is still true of both. What changed is only which of them
+// `refundMayStillReachIms` answers TRUE for.
+// ---------------------------------------------------------------------------
+
+test('o3d-xnwu r6: a park owned by another order is RESOLVABLE, not terminal', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true })
+  state.syncLogs.push({ id: 'log-r6', data: { connector: 'woocommerce', direction: 'FROM_CONNECTOR', entityType: 'SalesOrder', entityId: 'so-other', externalId: '7061', status: 'FAILED' } })
+
+  const result = await syncWcRefund(1001, makeRefund({ id: 7061 }), state.dependencies)
+
+  assert.equal(result.outcome, 'cross-order-park-resolvable')
+  assert.equal(refundOutcomeFailed(result.outcome), true, 'still a failure the caller reports — that half is unchanged')
+  assert.equal(refundIsInIms(result.outcome), false, 'and nothing is in IMS: the coverage predicate is NOT widened')
+  assert.equal(
+    refundMayStillReachIms(result.outcome),
+    true,
+    'THE POINT: the "Wrong order" recovery moves this park, so waiting for it buys something',
+  )
+  assert.match(result.error ?? '', /Wrong order/, 'and the refusal names the recovery an operator can use')
+  assert.equal(state.createRefundCalls, 0, 'the refusal itself is unchanged — nothing is created here')
+})
+
+test('o3d-xnwu r6: a QUARANTINED park owned by another order is resolvable too', async () => {
+  // Every actionable status is recoverable — RECOVERABLE_REFUND_PARK_STATUSES is exactly the set this
+  // guard queries — so the classification must not depend on which one the foreign park happens to be.
+  const state = makeDependencies({ alwaysMissExistingRefund: true })
+  state.syncLogs.push({ id: 'log-r6q', data: { connector: 'woocommerce', direction: 'FROM_CONNECTOR', entityType: 'SalesOrder', entityId: 'so-other', externalId: '7062', status: 'QUARANTINED' } })
+
+  const result = await syncWcRefund(1001, makeRefund({ id: 7062 }), state.dependencies)
+
+  assert.equal(result.outcome, 'cross-order-park-resolvable')
+  assert.equal(refundMayStillReachIms(result.outcome), true)
+})
+
+test('o3d-xnwu r6: an existing refund on another order stays TERMINAL', async () => {
+  // THE FENCE. Without it the change reads as "nothing is ever terminal", which reinstates the
+  // endless retry o3d-bx9 removed.
+  //
+  // (Targeted mutation that fails this: make the `existing.orderId !== so.id` branch return
+  // 'cross-order-park-resolvable'.)
+  const state = makeDependencies()
+  state.refunds.push({ id: 'refund-r6', externalRefundId: 7063, orderId: 'so-other' })
+
+  const result = await syncWcRefund(1001, makeRefund({ id: 7063 }), state.dependencies)
+
+  assert.equal(result.outcome, 'permanent-failure')
+  assert.equal(refundOutcomeFailed(result.outcome), true)
+  assert.equal(refundIsInIms(result.outcome), false)
+  assert.equal(
+    refundMayStillReachIms(result.outcome),
+    false,
+    'there is no park to move and no act inside IMS that makes this refund this order\'s',
+  )
 })
 
 test('a successful retry RESOLVES this order\'s lingering actionable park (o3d-7yf)', async () => {
@@ -1290,7 +1372,7 @@ test('a successful retry RESOLVES this order\'s lingering actionable park (o3d-7
   // The refund now lands (createRefund succeeds — makeDependencies default doesn't refuse).
   const result = await syncWcRefund(1001, makeRefund({ id: 7016 }), state.dependencies)
 
-  assert.equal(result.success, true, 'the refund landed')
+  assert.equal(refundIsInIms(result.outcome), true, 'the refund landed')
   const park = state.syncLogs.find((log) => (log as { id?: string }).id === 'log-f') as { data: { status: string } }
   assert.equal(park.data.status, 'SYNCED', 'the lingering FAILED park was resolved, not left actionable')
 })
@@ -1307,7 +1389,7 @@ test('an already-synced same-order refund resolves its lingering park but leaves
 
   const result = await syncWcRefund(1001, makeRefund({ id: 7017 }), state.dependencies)
 
-  assert.equal(result.success, true, 'already-synced same-order refund reports success')
+  assert.equal(refundIsInIms(result.outcome), true, 'already-synced same-order refund reports success')
   assert.equal(state.createRefundCalls, 0, 'no new refund created for the already-synced id')
   const byId = (id: string) => (state.syncLogs.find((l) => (l as { id?: string }).id === id) as { data: { status: string } }).data.status
   assert.equal(byId('p-mine'), 'SYNCED', 'this order\'s lingering FAILED park was resolved')
@@ -1324,7 +1406,7 @@ test('a refund that LANDS concurrently (seen under the per-refund lock) is not a
 
   const result = await syncWcRefund(1001, makeRefund({ id: 7018 }), state.dependencies)
 
-  assert.equal(result.success, false, 'the refusal still surfaces')
+  assert.equal(refundOutcomeFailed(result.outcome), true, 'the refusal still surfaces')
   const parks = state.syncLogs.filter((log) => (log as { data?: { externalId?: string } }).data?.externalId === '7018')
   assert.equal(parks.length, 0, 'no park was written because the refund had already landed under the lock')
 })
@@ -1438,7 +1520,7 @@ test('an itemised refund states the VAT WooCommerce returned on EVERY line (o3d-
 
   const result = await syncWcRefund(1001, refund, state.dependencies)
 
-  assert.deepEqual(result, { success: true })
+  assert.deepEqual(result, { outcome: 'applied' })
   assert.deepEqual(
     state.createRefundLines.map((line) => ({
       lineKind: line.lineKind,
@@ -1470,7 +1552,7 @@ test('an itemised shipping refund at the rate its credit will post at is recorde
 
   const result = await syncWcRefund(1001, refund, state.dependencies)
 
-  assert.deepEqual(result, { success: true })
+  assert.deepEqual(result, { outcome: 'applied' })
   assert.equal(state.createRefundCalls, 1)
   // Stored NET, as an unlinked shipping line — the shape the credit note re-grosses.
   assert.deepEqual(
@@ -1503,7 +1585,7 @@ test("the writer's posted-VAT refusal is QUARANTINED, and says the units are not
 
   const result = await syncWcRefund(1001, refund, state.dependencies)
 
-  assert.equal(result.success, false)
+  assert.equal(refundOutcomeFailed(result.outcome), true)
   const park = state.syncLogs.map((log) => (log as { data: Record<string, unknown> }).data).at(-1)
   assert.equal(park?.status, 'QUARANTINED')
   assert.equal(park?.externalId, '7403')
@@ -1529,4 +1611,45 @@ test('a monetary-only quarantine claims no units (o3d-w00 Codex r7 #3)', async (
   const park = state.syncLogs.map((log) => (log as { data: Record<string, unknown> }).data).at(-1)
   assert.equal(park?.status, 'QUARANTINED')
   assert.doesNotMatch(String(park?.errorMessage), /unit\(s\)/)
+})
+
+test('the park the sweep writes carries the stamp the recovery inbox selects on (o3d-xnwu r8)', async () => {
+  // THE WRITER AND THE READER, IN ONE TEST. r8 made `activeRefundParkWhere` ask for
+  // `recordKind = 'WC_REFUND_PARK'`, because a held sales invoice matched every other clause. That
+  // predicate is only as good as the write: a park the sweep did not stamp is a park the recovery
+  // inbox cannot see, and an unseen park HOLDS the refund delivery for ever (the cross-order guard
+  // refuses and waits for a recovery nobody can perform). So the two are pinned together here
+  // rather than separately.
+  //
+  // (Revert evidence: drop `recordKind` from upsertRefundPark's `data` and the last assertion fails
+  // — the row the sweep just wrote is not one `activeRefundParkWhere` would return.)
+  const { activeRefundParkWhere } = await import('@/lib/domain/sales/refund-park-recovery')
+
+  const state = makeDependencies({
+    alwaysMissExistingRefund: true,
+    order: { ...makeOrder({ grossTotal: 120, taxBase: 20, rate: 0.2 }), taxRatePercent: null },
+  })
+  const refund = makeRefund({ id: 7301, amount: '120.00', line_items: [], shipping_lines: [] })
+
+  await syncWcRefund(1001, refund, state.dependencies)
+
+  const park = state.syncLogs.at(-1) as { data?: Record<string, unknown> }
+  assert.ok(park?.data, 'a park was written')
+  assert.equal(park.data.recordKind, 'WC_REFUND_PARK', 'the row says which family it belongs to')
+
+  // And it satisfies the predicate the inbox, the cross-order guard and the park upsert all read —
+  // asserted against the predicate itself, so a change to either side that breaks the pairing fails
+  // here rather than in production.
+  const where = activeRefundParkWhere() as unknown as Record<string, unknown>
+  const row = park.data
+  assert.equal(row.connector, where.connector)
+  assert.equal(row.direction, where.direction)
+  assert.equal(row.entityType, where.entityType)
+  assert.equal(row.recordKind, where.recordKind)
+  assert.notEqual(row.entityId, null)
+  assert.equal(
+    (where.status as { in: string[] }).in.includes(row.status as string),
+    true,
+    'and in an actionable status, or the inbox never shows it',
+  )
 })

@@ -1,0 +1,406 @@
+-- o3d-xnwu r8 (Codex HIGH): give shopping_sync_logs a discriminator, because "it has an entityId"
+-- stopped meaning "it is a refund park".
+--
+-- WHAT WENT WRONG. r7 replaced an exclusion-based refund-park query with a positive one:
+-- connector='woocommerce', direction='FROM_CONNECTOR', entityType='SalesOrder', an actionable
+-- status, and entityId IS NOT NULL. Every clause is written by IMS and nothing is decided by
+-- absence, which was the point. What it is NOT is refund-specific. The held sales invoice
+-- (o3d-k26m.6, holdWcSalesInvoiceForMissingNumber) writes exactly those five values, so it is
+-- admitted as an actionable refund park: the recovery inbox lists an invoice hold and offers
+-- "Wrong order" / "Dismiss" refund actions on it.
+--
+-- It runs the other way too, and that direction WRITES. heldSalesInvoiceQueueWhere selects on
+-- payload->>'reason' = 'missing_wc_invoice_number'. A refund park persists the RAW WOOCOMMERCE
+-- REFUND, whose `reason` is free text a human types when issuing the refund — so a park with that
+-- reason is selected by the hold's own findFirst-and-update and by its release sweep, both of which
+-- overwrite the row.
+--
+-- WHY A COLUMN AND NOT A PAYLOAD FIELD. The payload of a refund park is the store's, and a field in
+-- it can be typed by an operator. r7 exists because that was already a live defect. This table had
+-- no scalar left to tell the families apart: it has exactly connector, direction, status,
+-- entityType, entityId, externalId, payload, errorMessage, syncedAt, createdAt — no action, no
+-- reason, no kind. So one is added.
+--
+-- (syncedAt was considered and rejected. A park happens to be written with syncedAt set and a hold
+-- with it NULL, so it would work today — but syncedAt means "when this synced", an unsettled PENDING
+-- park carrying one is an oddity rather than a design, and a predicate built on it would empty the
+-- recovery inbox the day somebody corrects that oddity.)
+--
+-- SAFE BY THE CONVENTIONS: a nullable ADD COLUMN with no default, so it is metadata-only on
+-- Postgres 11+, asserts nothing about historical rows, and needs no marker.
+ALTER TABLE "shopping_sync_logs" ADD COLUMN "recordKind" TEXT;
+
+-- THE BACKFILL, AND IT IS NOT OPTIONAL. Both new predicates ask for their own value BY NAME — a
+-- park is a row that SAYS it is a park — so an existing row left NULL is invisible to them. For a
+-- refund park that means invisible to the recovery inbox, which is the precise defect r7 closed;
+-- for a hold it means an invoice that is never released.
+--
+-- BOTH STATEMENTS ONLY EVER WRITE A NULL CELL, so they are idempotent and safe to re-run at any
+-- time. That matters — see the deploy order below.
+--
+-- ORDER MATTERS: holds first, then "everything else actionable is a park".
+
+-- 1. THE HELD SALES INVOICES, identified POSITIVELY and by a shape the store cannot forge. The
+--    payload is built by buildHeldSalesInvoicePayload, so it carries a top-level accountingPayload
+--    OBJECT, a salesOrderId equal to the row's own entityId, and a metaKey. A raw WooCommerce refund
+--    body carries no such SET: an operator can type the `reason` string, and a decorating extension
+--    can add a stray top-level member of its own — but neither introduces a nested accountingPayload
+--    object AND an IMS order id equal to this row's entityId. ALL FIVE CLAUSES TOGETHER, never the
+--    reason alone and never one member alone; a single field is not a shape, and every member here
+--    arrives inside JSON some other system wrote.
+--
+--    AND IT READS NO STATUS (Codex HIGH). This statement used to require PENDING, because that is
+--    the status a hold is WRITTEN in. It is not the status a hold is always FOUND in: the
+--    predecessor's own release sweep legitimately settles a hold to FAILED when its order cannot be
+--    found or its payload will not read, and its recovery inbox can settle one to SYNCED. Step 1
+--    skipped every one of those, and step 2 — which does read FAILED — then stamped them
+--    'WC_REFUND_PARK'.
+--
+--    BOTH OUTCOMES ARE BAD AND ONE OF THEM IS SILENT. An intact failed hold ends up stamped as a
+--    park over a held-invoice payload, which is exactly what check 3 in verify.sql exists to catch —
+--    so the cutover fails, AFTER the service has been stopped and the schema has moved, for damage
+--    this file did itself. A hold whose payload the same sweep had already degraded evades check 3
+--    and simply appears in the refund-recovery inbox, offering "Wrong order" and "Dismiss" on an
+--    invoice.
+--
+--    THE DEFECT IS THE SHAPE, NOT THE VALUE: a classifier gated on a status the damage itself can
+--    change. It is the same defect the previous round removed from check 3, found here in the
+--    backfill, and it is the reason check 1 in verify.sql no longer reads status either — that check
+--    is this statement's exact mirror, and the two must stay identical or the repair stops matching
+--    what the check reports.
+--
+--    What identifies a hold is the PAYLOAD SHAPE, which no status transition rewrites. So this
+--    statement classifies on the shape alone, in every status there is, and runs first.
+UPDATE "shopping_sync_logs"
+   SET "recordKind" = 'WC_HELD_SALES_INVOICE'
+ WHERE "recordKind" IS NULL
+   AND connector = 'woocommerce'
+   AND direction = 'FROM_CONNECTOR'
+   AND "entityType" = 'SalesOrder'
+   AND "entityId" IS NOT NULL
+   AND jsonb_typeof(payload) = 'object'
+   AND payload->>'reason' = 'missing_wc_invoice_number'
+   AND jsonb_typeof(payload->'accountingPayload') = 'object'
+   AND payload->>'salesOrderId' = "entityId"
+   AND payload->>'metaKey' IS NOT NULL;
+
+-- 2. THE REFUND PARKS. Deliberately the WHOLE of what activeRefundParkWhere returns today, minus the
+--    holds stamped above — externalId is not required here even though every park written by
+--    upsertRefundPark has one, because the invariant that must hold across this deploy is "every row
+--    the inbox lists today is still listed tomorrow", not "every row the unique index covers".
+--
+--    AND IT EXCLUDES THE HELD SHAPE OUTRIGHT, not merely by relying on step 1 having run (Codex
+--    HIGH). `recordKind IS NULL` already skips whatever step 1 stamped, so today the clause below
+--    matches nothing extra — which is the point. This statement is a CATCH-ALL: everything it does
+--    not recognise it declares a refund park, and a catch-all whose only protection is that some
+--    earlier statement was broad enough is one narrowing away from mis-stamping an invoice hold as a
+--    refund.
+--
+--    IT EXCLUDES THE SHAPE, NOT ONE FIELD OF IT (Codex HIGH, round 10). This clause used to read
+--    `payload->>'metaKey' IS NULL`, on the argument that buildHeldSalesInvoicePayload writes a
+--    metaKey on every hold and a WooCommerce refund body carries none. The first half is true; the
+--    second half is a claim about somebody else's JSON. A refund payload is cast from the store's
+--    response and persisted UNCHANGED, so a WooCommerce extension, a plugin that decorates the
+--    refund object, or a malformed response can put a top-level `metaKey` on a genuine refund body —
+--    and this statement then REFUSED TO STAMP A REAL PARK. Unstamped, it leaves the recovery inbox
+--    (activeRefundParkWhere requires the stamp) with a real unrefunded amount on it.
+--
+--    A SINGLE FIELD IS NOT A SHAPE, AND ANY FIELD THAT ARRIVES FROM AN EXTERNAL SYSTEM IS FORGEABLE.
+--    So the exclusion below is the NEGATION OF THE COMPLETE HELD-INVOICE PREDICATE STATEMENT 1 USES —
+--    payload object, the queue reason, an accountingPayload OBJECT, salesOrderId equal to the row's
+--    own entityId, and the key. Four of those five an operator cannot type into WooCommerce's refund
+--    dialog, and a decorating extension has no reason to synthesise the set. THE SAME TEXT APPEARS IN
+--    EXACTLY THREE PLACES — statement 1 above (positive), verify.sql check 1 (positive, its mirror)
+--    and verify.sql check 6 (negated, as here) — and a test asserts all four readers are the same
+--    predicate character for character, because three hand-written copies could not stay in step.
+--
+--    `IS NOT TRUE`, NOT `NOT (...)`. Every conjunct above is a comparison against a json member that
+--    may be ABSENT, and absent means SQL NULL: `NOT (UNKNOWN)` is UNKNOWN, which selects nothing, so
+--    a plain NOT would drop a payload with no `reason` at all from BOTH sides — neither stamped a
+--    hold by statement 1 nor stamped a park here. `IS NOT TRUE` folds UNKNOWN in with FALSE, which is
+--    the answer wanted: whatever is not provably a hold is a park. It is the `<>` versus
+--    `IS DISTINCT FROM` trap of verify.sql check 5, one level up.
+--
+--    WHAT THE IDENTITY CLAUSE COSTS, AND WHY IT IS STILL IN. Negating the WHOLE predicate means a
+--    degraded hold — one whose payload no longer names the row's own order, i.e. a legacy REASSIGN —
+--    now falls to this catch-all and is stamped a park. That row does not go quiet: verify.sql
+--    check 5 reads neither the stamp nor the status and selects exactly it, so the cutover stops and
+--    a human is shown it. The alternative, leaving it unstamped, only ever reached check 2 — the
+--    superset whose own comment says its answer is not diagnostic.
+UPDATE "shopping_sync_logs"
+   SET "recordKind" = 'WC_REFUND_PARK'
+ WHERE "recordKind" IS NULL
+   AND connector = 'woocommerce'
+   AND direction = 'FROM_CONNECTOR'
+   AND "entityType" = 'SalesOrder'
+   AND status IN ('PENDING', 'FAILED', 'QUARANTINED')
+   AND "entityId" IS NOT NULL
+   AND (
+             jsonb_typeof(payload) = 'object'
+         AND payload->>'reason' = 'missing_wc_invoice_number'
+         AND jsonb_typeof(payload->'accountingPayload') = 'object'
+         AND payload->>'salesOrderId' = "entityId"
+         AND payload->>'metaKey' IS NOT NULL
+       ) IS NOT TRUE;
+
+-- ---------------------------------------------------------------------------------------------
+-- CUTOVER — QUIESCENCE IS REQUIRED, NOT ADVISORY. READ THIS BEFORE SHIPPING.
+--
+-- The steady-state discriminator is sound. This block is entirely about the WINDOW in which two
+-- binaries could both be writing this table, because the OLD one still selects held sales invoices
+-- by payload->>'reason' = 'missing_wc_invoice_number' — an OPERATOR-CONTROLLED string typed into
+-- WooCommerce's refund dialog — and still selects refund parks with a predicate that has no
+-- recordKind clause at all. That is the exact collision "recordKind" exists to remove, and the old
+-- binary can recreate it AFTER the backfill has run.
+--
+-- THE REQUIRED ORDER. Every step is mandatory, and every step is now EXECUTED rather than described
+-- (see "THE ORDER IS AN ANCESTOR" below). There is no supported variant of this that runs the old
+-- binary against the migrated schema.
+--
+--   1. STOP AND DRAIN THE OLD BINARY FIRST. Nothing may be writing shopping_sync_logs: the
+--      WooCommerce refund sweep, the order import/poll, the webhook handler, the refund-park
+--      recovery action and the held-invoice release sweep all write it. "Quiesce" here means the
+--      process is stopped, not merely idle — an idle sweep is one webhook away from writing.
+--   2. APPLY THIS MIGRATION. Additive and nullable, so it is metadata-only.
+--   3. RUN THE TWO UPDATE STATEMENTS ABOVE (they are part of this file and run with it). They only
+--      ever write a NULL cell, so they are idempotent and safe to re-run at any time.
+--   4. RUN THE VERIFICATION CHECKS. They are declared beside this file as `verify.sql`: seven
+--      statements, each returning one row of (check_name, violations), every count required to be
+--      zero. `scripts/run-migration-verifications.mjs` runs them after the schema has moved and
+--      before anything is started, and a non-zero count stops the cutover.
+--
+--      A non-zero answer means something wrote this table after step 1, i.e. the predecessor was
+--      still live. The response is to stop it, establish what the rows are (see check 2's caveat in
+--      verify.sql — the repair is NOT unconditional), and re-verify.
+--   5. START THE NEW BUILD. From this moment every park and every hold is stamped as it is written,
+--      and both predicates require the stamp.
+--
+-- WHAT HAPPENS IF STEP 1 IS SKIPPED — three failures, and only one of them is repairable:
+--
+--   (a) THE OLD BINARY CREATES UNSTAMPED ROWS. A hold or a park written between the backfill and
+--       the new build carries a NULL recordKind and is invisible to BOTH new predicates: the hold
+--       is never released, so the order is never invoiced, and the park is never listed in the
+--       recovery inbox. This one IS repairable — re-running step 3 stamps it, ONCE THE ROWS HAVE
+--       BEEN LOOKED AT (check 2 is a superset; see its caveat in verify.sql) — which is why the
+--       verification queries below exist and why a non-zero answer is a hard stop.
+--
+--   (b) THE OLD BINARY OVERWRITES AN ALREADY-STAMPED PARK, AND THIS IS NOT REPAIRABLE.
+--       holdWcSalesInvoiceForMissingNumber does a findFirst-and-UPDATE, and the old binary's
+--       predicate for it has no recordKind clause — so a refund park whose operator typed
+--       'missing_wc_invoice_number' as the WooCommerce refund reason is selected and overwritten
+--       with an invoice-hold payload. The old binary does not know the column, so it leaves
+--       recordKind = 'WC_REFUND_PARK' on a row that is now a hold: THE STAMP LIES. Re-running
+--       step 3 cannot fix it (the cell is not NULL and the statements only ever write NULL cells),
+--       the refund evidence is gone, and the recovery inbox offers "Wrong order" / "Dismiss" on an
+--       invoice payload. THE COLLISION IS BACK, SILENTLY. That is the whole reason step 1 is a
+--       requirement rather than a preference.
+--
+--       AND IT IS DETECTABLE — AN EARLIER REVISION OF THIS BLOCK SAID IT WAS NOT, AND THAT WAS
+--       WRONG (Codex MEDIUM). The claim was that an overwritten row "has a non-NULL recordKind and
+--       every column of a park", so nothing distinguishes it. It does not have every column of a
+--       park: it KEEPS THE PARK STAMP while ACQUIRING THE HELD-INVOICE PAYLOAD SHAPE, and that
+--       combination is a contradiction no legitimate writer can produce. The payload shape is the
+--       one the backfill above already trusts to tell the families apart — a top-level
+--       accountingPayload OBJECT, a salesOrderId equal to the row's own entityId, and a metaKey —
+--       none of which an operator can introduce through WooCommerce's refund dialog, where the only
+--       thing they control is the free-text `reason`. So "stamped WC_REFUND_PARK *and* matching the
+--       full held-invoice shape" selects exactly the rows (b) creates, and nothing else: a genuine
+--       hold carries the hold stamp, and a genuine park carries a refund body.
+--
+--       That is check 3 in verify.sql, and it is mandatory like the others: the cutover fails and
+--       the new build is not started if it returns anything but zero. Saying this failure mode was
+--       invisible was worse than leaving it unchecked; saying a script enforces it when no such
+--       script exists is the same mistake in the other direction, and both are now behind us.
+--
+--       AND CHECK 3 NO LONGER READS `status` (Codex MEDIUM). It used to require PENDING, which is
+--       the status the overwrite lands on — so the predecessor's OWN release sweep, flipping the
+--       same row to SYNCED or FAILED, switched the check off while the corruption stood untouched.
+--       The contradiction is between the stamp and the payload. The status is not part of it.
+--
+--   (c) THE OLD BINARY RETIRES A HELD SALES INVOICE THROUGH THE REFUND-PARK RECOVERY ACTION, AND
+--       THIS IS NOT REPAIRABLE EITHER. This is (b) in the opposite direction and it was missing
+--       from every earlier revision of this block, including the "what is still not covered"
+--       paragraph that claimed to bound what was left (Codex MEDIUM). The recovery action
+--       (lib/domain/sales/refund-park-recovery.ts, o3d-54p) selects actionable parks — and the OLD
+--       version of activeRefundParkWhere has no recordKind clause, which is the r8 defect itself.
+--       So the recovery inbox lists a HELD SALES INVOICE and offers an operator two acts on it:
+--
+--         * DISMISS  — writes status = 'SYNCED', syncedAt = now, errorMessage = a note beginning
+--                      'Recovered by operator:'. The hold leaves heldSalesInvoiceQueueWhere's
+--                      PENDING selector permanently: the invoice is never posted, and nothing
+--                      anywhere says the order is still waiting for one. The payload is untouched
+--                      and the stamp, if any, is untouched, so checks 1, 2 AND 3 all return zero.
+--         * REASSIGN — writes a new entityId and leaves the payload deliberately alone, so the
+--                      hold now sits on one order while naming another. It also breaks check 3's
+--                      identity clause (payload->>'salesOrderId' = "entityId") on any row check 3
+--                      was catching, which is a second way for (b) to go quiet after the fact.
+--
+--       CHECKS 4 AND 5 ARE THOSE TWO SIGNATURES. The recovery note prefix is written by exactly one
+--       code path, and the CURRENT version of that path requires recordKind = 'WC_REFUND_PARK', so
+--       it can never land on a held invoice; and buildHeldSalesInvoicePayload always writes
+--       salesOrderId equal to the row's own entityId, so a hold-shaped payload naming a different
+--       order has no legitimate producer. Neither check reads recordKind, on purpose: the same act
+--       against an UNSTAMPED hold from case (a) has no stamp to test.
+--
+--   (d) THE OLD RELEASE SWEEP SETTLES A MIS-SELECTED PARK, AND THIS IS CHECK 6 (Codex MEDIUM,
+--       round 5). Earlier revisions of this block described exactly this act under the heading
+--       "WHAT IS STILL NOT COVERED" and then left it at that: the old sweep flips a mis-selected
+--       PARK to SYNCED or FAILED and replaces its errorMessage, WITHOUT touching the payload or the
+--       stamp, so — the argument ran — it has no contradictory shape to query for.
+--
+--       IT HAS ONE, AND IT IS THE MESSAGE. The sweep's three outcomes write three fixed sentences,
+--       and both code paths that write them act only on a row the CURRENT
+--       heldSalesInvoiceQueueWhere selected — which requires recordKind = 'WC_HELD_SALES_INVOICE'.
+--       A row that is not a hold carrying one of those sentences therefore has no legitimate
+--       producer, and WHAT SAYS "NOT A HOLD" IS THE NEGATED HELD-INVOICE SHAPE — the same five
+--       clauses statement 1 uses, spelled `(...) IS NOT TRUE` so a missing json member lands on the
+--       "not a hold" side instead of vanishing from both. It used to say `payload->>'metaKey' IS
+--       NULL`, and a refund body that arrived carrying a top-level metaKey of its own therefore
+--       switched check 6 OFF over exactly the row it exists to catch (Codex HIGH, round 10).
+--
+--       IT WAS ALSO NOT THE LESSER CORRUPTION IT WAS CALLED. The 'Superseded' outcome writes
+--       status = 'SYNCED', and activeRefundParkWhere lists only PENDING, FAILED and QUARANTINED —
+--       so a genuine refund park with a real unrefunded amount leaves the recovery inbox for ever,
+--       and all five earlier checks return zero over it. The refund evidence survives in the
+--       payload; what is lost is anybody ever being shown it again.
+--
+--       Stopping the writer first remains the defence, and step 1 is still a step rather than a
+--       note. What has changed is that admitting a blind spot is no longer treated as covering it.
+--
+-- ---------------------------------------------------------------------------------------------
+-- THE ORDER IS AN ANCESTOR, NOT A REQUEST. READ THIS BEFORE TRUSTING ANY SENTENCE ABOVE.
+--
+-- An earlier revision of this file said, correctly at the time, that neither step 1 nor step 4 was
+-- automated here and that both were MANUAL. It also asked a reader to honour a MERGE DEPENDENCY on
+-- a sibling branch. A comment is not a merge dependency: nothing stopped this migration shipping
+-- first, and shipping first is exactly failure modes (b) and (c).
+--
+-- SO THE DEPENDENCY IS NOW A COMMIT ORDER. This branch is REBASED ONTO o3d-batch-deployseq
+-- (o3d-2sm1.x). Every commit that reorders the deploy is an ancestor of the commit that adds this
+-- migration, so there is no history in which this migration is applied by a tree that does not
+-- already contain the stop, the fence and the runner. Git enforces it; no reviewer has to.
+--
+-- WHAT THOSE ANCESTORS GIVE THIS MIGRATION:
+--
+--   * `scripts/deploy.sh`, `scripts/update.sh` AND `scripts/install.sh` all run
+--     build -> validate -> stop and drain every writer -> fence the database -> migrate -> verify
+--     -> start. install.sh matters as much as the other two: it explicitly supports being re-run
+--     over an existing installation, and in that case it detects the existing install, installs a
+--     reboot fence, stops the service, fences the crontab, stops legacy PM2 and app-directory
+--     processes, proves with the database that nothing else is connected, and only then migrates.
+--     A rerun no longer migrates underneath a live predecessor, which is the one entrypoint most
+--     likely to be used by somebody who does not know the deploy order.
+--   * `scripts/run-migration-verifications.mjs` EXECUTES verify.sql on all three paths, after the
+--     schema has moved and before anything is started, and a non-zero count stops the cutover.
+--   * `prisma/migrations/verification-required.txt` NAMES this migration, so a future edit that
+--     deletes verify.sql is a coverage gap CI fails on rather than a silent loss of the checks.
+--
+-- WHAT THIS BRANCH STILL DOES NOT DO: it does not edit deploy.sh, update.sh or install.sh. It does
+-- not need to — it inherits them. This migration owns the CHECKS; the ancestors own the ORDER.
+-- ---------------------------------------------------------------------------------------------
+--
+-- A LEGACY PARK THAT ESCAPES ANYWAY STILL FAILS LOUDLY: an unstamped park is not found by
+-- upsertRefundPark's own park lookup, so the next delivery of that refund tries to INSERT a second
+-- actionable park and hits shopping_sync_logs_active_refund_park_uq. That index is deliberately NOT
+-- changed by this migration — it stays keyed on (connector, "externalId") over the wider predicate,
+-- so the failure mode is a unique violation somebody sees rather than two live parks for one refund.
+--
+-- VERIFICATION QUERIES — ALL SEVEN MUST RETURN 0. They live in `verify.sql` beside this file, NOT
+-- in this comment: a second copy is a check that can drift from the one that is actually run.
+--
+--   1. shopping_sync_logs unstamped held sales invoice   — an old binary CREATED a hold after the
+--                                                          backfill; it would never be released. In
+--                                                          ANY status: the mirror of backfill
+--                                                          statement 1, which no longer reads one
+--                                                          either.
+--   2. shopping_sync_logs unstamped refund park          — an unstamped row of PARK SHAPE. Usually
+--                                                          an old binary that CREATED a park after
+--                                                          the backfill — but it is a SUPERSET, and
+--                                                          the repair is not unconditional. Read
+--                                                          check 2's own comment before acting.
+--   3. shopping_sync_logs park stamp over a held-invoice payload
+--                                                        — an old binary OVERWROTE a stamped park
+--                                                          with an invoice hold; case (b) above. In
+--                                                          ANY status, so settling the row does not
+--                                                          hide it.
+--   4. shopping_sync_logs operator recovery note on a held-invoice payload
+--                                                        — the DISMISS half of case (c): an old
+--                                                          binary's recovery inbox let an operator
+--                                                          dismiss a held sales invoice, which is
+--                                                          never invoiced afterwards. A DISMISS
+--                                                          moves neither entityId nor the payload,
+--                                                          so this one requires
+--                                                          salesOrderId = entityId.
+--   5. shopping_sync_logs held-invoice payload naming another order
+--                                                        — the REASSIGN half of case (c), the state
+--                                                          check 3 loses when a row it was catching
+--                                                          is moved, and where reassign-then-dismiss
+--                                                          lands (it reads neither status nor
+--                                                          message). It requires a STRING
+--                                                          salesOrderId that differs from entityId.
+--   6. shopping_sync_logs held-release outcome on a row that is not a hold
+--                                                        — case (d): the old release sweep settled a
+--                                                          mis-selected refund park. On the
+--                                                          'Superseded' outcome the park is SYNCED
+--                                                          and gone from the recovery inbox with an
+--                                                          unrefunded amount on it.
+--   7. shopping_sync_logs recovered refund park now shaped or stamped as a held sales invoice
+--                                                        — case (c) FOLLOWED BY A HOLD REWRITE, and
+--                                                          the only check whose evidence is not in
+--                                                          the row it accuses. The predecessor
+--                                                          re-holding the reassigned (or dismissed)
+--                                                          row for its new order restores the
+--                                                          identity equality and replaces the
+--                                                          operator's note, so checks 1-6 all go
+--                                                          quiet over a destroyed accounting
+--                                                          payload. This one joins the
+--                                                          `wc_refund_park_recovered` activity
+--                                                          entries, which that rewrite cannot reach.
+--                                                          The entry's metadata.parkedOrderId names
+--                                                          the order the lost payload has to be
+--                                                          reconstructed for.
+--
+-- ---------------------------------------------------------------------------------------------
+-- A HOLD-SHAPED PAYLOAD WITH NO ORDER ID — MANUAL, AND DELIBERATELY NOT A VERIFY CHECK (Codex r12).
+--
+-- Checks 4 and 5 used to spell their identity clause `IS DISTINCT FROM`, so that a hold payload
+-- which had LOST its salesOrderId counted as the same contradiction. That is not free: an ABSENT
+-- member SATISFIES `IS DISTINCT FROM`, and every raw WooCommerce refund body is a payload with no
+-- salesOrderId — so a genuine refund park decorated with the other members was selected as damage,
+-- on a healthy database, by a hook that runs with the application and the database fenced.
+--
+-- The missing member cannot be told apart from external decoration by any clause available here, so
+-- it is diagnosed by HAND rather than by a check that stops a cutover over it. Run this when
+-- something else has already given you reason to look — it returns rows, it does not fail anything:
+--
+--   SELECT id, "recordKind", status, "entityId", "externalId", "errorMessage"
+--     FROM "shopping_sync_logs"
+--    WHERE connector = 'woocommerce'
+--      AND direction = 'FROM_CONNECTOR'
+--      AND "entityType" = 'SalesOrder'
+--      AND jsonb_typeof(payload) = 'object'
+--      AND payload->'id' IS NULL
+--      AND payload->>'reason' = 'missing_wc_invoice_number'
+--      AND payload->>'connector' = 'woocommerce'
+--      AND jsonb_typeof(payload->'externalOrderId') = 'string'
+--      AND jsonb_typeof(payload->'externalOrderNumber') = 'string'
+--      AND jsonb_typeof(payload->'orderNumber') = 'string'
+--      AND jsonb_typeof(payload->'metaKey') = 'string'
+--      AND jsonb_typeof(payload->'accountingPayload') = 'object'
+--      AND "externalId" = payload->>'externalOrderId'
+--      AND payload->'salesOrderId' IS NULL;
+--
+-- A row it returns is a hold whose payload no longer names any order. `payload->'id' IS NULL` and
+-- the externalId equality are what keep a decorated refund body out of the ANSWER as well as out of
+-- the checks — a diagnostic nobody trusts is not a diagnostic.
+-- ---------------------------------------------------------------------------------------------
+--
+-- 1 is repairable by re-running the two UPDATE statements above. 2 is repairable ONLY once the rows
+-- have been confirmed to be refund parks: statement 2 stamps whatever it matches as
+-- 'WC_REFUND_PARK', which puts the row in the recovery inbox with "Wrong order" / "Dismiss" refund
+-- actions on it — the r8 defect, recreated by the remedy. 3, 4, 5 and 6 are not repairable, and are
+-- an incident: on 3 the refund evidence on those rows has been replaced; on 4 and 5 a held invoice
+-- has been retired or moved by an operator who was shown the wrong row; on 6 a refund park has been
+-- settled by a sweep that had no business selecting it, and its own error text is gone. In every
+-- case the orders behind them have to be re-derived by hand.
+-- ---------------------------------------------------------------------------------------------

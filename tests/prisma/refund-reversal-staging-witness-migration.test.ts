@@ -34,6 +34,7 @@ import {
  */
 
 const MIGRATION = 'prisma/migrations/20260822090000_refund_reversal_staging_state/migration.sql'
+const VERIFY = 'prisma/migrations/20260822090000_refund_reversal_staging_state/verify.sql'
 const SCHEMA = 'prisma/schema.prisma'
 const RESTORE_ROUTE = 'app/api/backup/restore/route.ts'
 
@@ -53,22 +54,32 @@ function statementList(file: string): string[] {
     .filter(Boolean)
 }
 
-test('o3d-2sm1: the migration adds ONE nullable column and nothing else', () => {
-  // The whole file, as executable SQL. A single statement is the assertion — a second one is either
-  // a trigger, a backfill, or a rule, and all three are what this branch deliberately gave up.
+test('o3d-2sm1: the migration adds the state column and its boundary marker, and nothing else', () => {
+  // The whole file, as executable SQL. Three ALTERs and no fourth statement: anything else is a
+  // trigger, a backfill or a rule, and all three are what this branch deliberately gave up.
+  //
+  // o3d-2sm1.4 (Codex r3 HIGH) added statements two and three. They are NOT the mechanism rounds 2-4
+  // kept re-adding: they mint nothing about STAGING. They record only which rows existed when the
+  // state column was added, which the database observes directly under the ALTER's own ACCESS
+  // EXCLUSIVE lock — the boundary verify.sql used to draw with a clock, and could not.
   const list = statementList(MIGRATION)
   assert.deepEqual(
     list,
-    ['ALTER TABLE "sales_order_refunds" ADD COLUMN "reversal_staging_state" TEXT'],
-    'the migration is a plain nullable ADD COLUMN; anything else is mechanism this branch removed on purpose',
+    [
+      'ALTER TABLE "sales_order_refunds" ADD COLUMN "reversal_staging_state" TEXT',
+      'ALTER TABLE "sales_order_refunds" ADD COLUMN "reversal_staging_state_predates_column" BOOLEAN NOT NULL DEFAULT true',
+      'ALTER TABLE "sales_order_refunds" ALTER COLUMN "reversal_staging_state_predates_column" SET DEFAULT false',
+    ],
+    'the migration adds the nullable state column plus the boundary marker; anything else is mechanism this branch removed on purpose',
   )
 })
 
-test('o3d-2sm1: the column stays nullable, undefaulted and un-backfilled', () => {
+test('o3d-2sm1: the STATE column stays nullable, undefaulted and un-backfilled', () => {
   const sql = statements(MIGRATION)
   // A DEFAULT would be the database vouching for stagings it never witnessed, on every row already
   // there — which is exactly how `reversal_staged BOOLEAN NOT NULL DEFAULT false` became useless for
-  // this question.
+  // this question. The boundary marker below is a different claim and is exempt by name, not by
+  // pattern: it says a row EXISTED, not that anything was or was not staged.
   assert.ok(
     !/ADD COLUMN "reversal_staging_state"[^;]*(NOT NULL|DEFAULT)/.test(sql),
     'nullable with no default: NULL has to be able to mean "nobody spoke for this row"',
@@ -76,6 +87,82 @@ test('o3d-2sm1: the column stays nullable, undefaulted and un-backfilled', () =>
   // The pre-fix set cannot be reconstructed, only named. The invariant names it.
   assert.ok(!/^\s*UPDATE\s/mi.test(sql), 'no backfill statement may be added to this migration')
   assert.ok(!/^\s*INSERT\s/mi.test(sql), 'and nothing may be inserted either')
+})
+
+test('o3d-2sm1.4: the boundary marker is drawn under the ALTER lock, then closed to later inserts', () => {
+  // THE PAIR IS THE MECHANISM, AND THE ORDER IS THE WHOLE POINT.
+  //
+  // `ADD COLUMN ... NOT NULL DEFAULT true` marks exactly the rows that exist while the ALTER holds
+  // ACCESS EXCLUSIVE on the table — every earlier writer has committed and released its
+  // RowExclusiveLock, and nothing can insert in the middle of it. `SET DEFAULT false` afterwards
+  // changes only what FUTURE inserts carry, so the two populations are separated by what is
+  // physically stored in each row.
+  //
+  // Flip the order, or default it false and backfill true with an UPDATE, and the boundary stops
+  // being drawn by the lock: it starts depending on when a statement happened to run, which is the
+  // clock this replaced.
+  const list = statementList(MIGRATION)
+  const added = list.findIndex((statement) => /ADD COLUMN "reversal_staging_state_predates_column"/.test(statement))
+  const closed = list.findIndex((statement) => /ALTER COLUMN "reversal_staging_state_predates_column" SET DEFAULT false/.test(statement))
+  assert.notEqual(added, -1, 'the marker column must be added')
+  assert.notEqual(closed, -1, 'and its default flipped for later inserts')
+  assert.ok(added < closed, 'legacy rows are marked by the ADD; the flip must come after it')
+  assert.match(
+    list[added],
+    /BOOLEAN NOT NULL DEFAULT true/,
+    'NOT NULL with DEFAULT true is what marks the pre-existing rows without a rewrite and without a clock',
+  )
+
+  // And no writer sets it: it is decided by construction. A backfill or an application write would
+  // reintroduce the question of WHEN the value was decided.
+  const sql = statements(MIGRATION)
+  assert.ok(
+    !/UPDATE[^;]*reversal_staging_state_predates_column/i.test(sql),
+    'the marker is never backfilled — the ADD is what draws the boundary',
+  )
+  assert.match(
+    readFileSync(SCHEMA, 'utf8'),
+    /reversalStagingStatePredatesColumn\s+Boolean\s+@default\(false\)\s+@map\("reversal_staging_state_predates_column"\)/,
+    'the schema carries the marker with the post-migration default, or the drift check fails the deploy',
+  )
+})
+
+test('o3d-2sm1.4: verify.sql bounds the cutover by the marker, not by a timestamp', () => {
+  // WHY THE CLOCK WAS WRONG. The first revision compared `createdAt` against
+  // `_prisma_migrations.started_at`. `createdAt` defaults to CURRENT_TIMESTAMP, which Postgres fixes
+  // at TRANSACTION START — `now()`, not `clock_timestamp()`. A predecessor transaction that began
+  // before the migration and committed after it stamps a pre-migration time on a post-migration row,
+  // so the one row these checks exist to find reads as legacy. No clause over a timestamp can fix
+  // that, because the timestamp is not the insert time.
+  const verify = readFileSync(VERIFY, 'utf8')
+  const executable = verify
+    .split('\n')
+    .filter((line) => !line.trimStart().startsWith('--'))
+    .join('\n')
+
+  assert.ok(
+    !/createdAt/.test(executable),
+    'no check may bound the cutover window with a row timestamp',
+  )
+  assert.ok(
+    !/_prisma_migrations/.test(executable),
+    'nor with the migration ledger, whose started_at was being compared against that timestamp',
+  )
+
+  // Both NULL-state checks must be bounded by the marker, or they are non-zero for ever on legacy
+  // rows and stop meaning anything.
+  const nullChecks = executable
+    .split(';')
+    .map((chunk) => chunk.replace(/\s+/g, ' ').trim())
+    .filter((chunk) => /reversal_staging_state" IS NULL/.test(chunk))
+  assert.equal(nullChecks.length, 2, 'checks 1 and 2 are the two that count undecidable rows')
+  for (const chunk of nullChecks) {
+    assert.match(
+      chunk,
+      /"reversal_staging_state_predates_column" = false/,
+      'a NULL-state check must exclude the rows the migration marked as pre-existing',
+    )
+  }
 })
 
 test('o3d-2sm1: no trigger, no function and no session setting — the mechanism is gone, deliberately', () => {

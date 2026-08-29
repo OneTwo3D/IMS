@@ -64,6 +64,128 @@ export function isRecoverableRefundParkStatus(status: string): status is Recover
 }
 
 /**
+ * WHAT THIS ROW IS — the value a refund park stamps into `recordKind` (o3d-xnwu r8, Codex HIGH).
+ *
+ * `entityType` says what the row is ABOUT (a sales order). This says what the row IS. They are
+ * different questions and r7's predicate could only ask the first one, which is why it admitted a
+ * held sales invoice — see {@link activeRefundParkWhere}.
+ *
+ * Written by `upsertRefundPark` and by nothing else, and read by every predicate that means "an
+ * actionable refund park". It is an assertion the writer makes about its own row, never an
+ * inference from what a row lacks.
+ */
+export const WC_REFUND_PARK_RECORD_KIND = 'WC_REFUND_PARK'
+
+/**
+ * THE WITNESS — the activity-log action `recoverParkedWcRefund` writes when it recovers a park, and
+ * the only evidence check 7 of the 20260822120000 migration's verify.sql has to join to (o3d-xnwu
+ * r14, Codex HIGH).
+ *
+ * Check 7 exists because the ACCUSED ROW CAN BE MADE INNOCENT. The predecessor's held-invoice
+ * writer overwrites a recovered park wholesale — payload, externalId, errorMessage, status — and
+ * every check that reads the row alone then returns zero over a destroyed accounting payload. So
+ * the evidence has to come from somewhere the second write cannot reach, and this entry is it: a
+ * fact about the PAST, naming the row in `metadata.shoppingSyncLogId`.
+ *
+ * WHICH MAKES IT EVIDENCE, NOT HISTORY, AND EVIDENCE HAS TO BE AS DURABLE AS THE THING IT
+ * WITNESSES. It was neither. It was written with `logActivity` AFTER the recovery transaction
+ * committed — and `logActivity` swallows its own failures, so an ordinary transient write error
+ * (not merely a crash) left the recovery committed with nothing to join to. And it is a WARNING,
+ * which `purgeExpiredActivityLogs` deletes after 60 days by default, so a cutover run a quarter
+ * after the recovery would find no witness for a row that really was recovered and the check would
+ * go quiet — silently, and exactly for the oldest incidents.
+ *
+ * Both are closed, and it takes both:
+ *
+ *   1. THE WITNESS IS WRITTEN IN THE RECOVERY'S OWN TRANSACTION, with `logActivityInTransaction`,
+ *      which does not catch. No recovery can commit without it; a witness write that fails takes
+ *      the recovery down with it, and the operator sees a failure and retries. That is the right
+ *      way round for a mutation whose only later audit is this row.
+ *   2. IT IS EXEMPT FROM ACTIVITY-LOG RETENTION (lib/activity-log-cleanup.ts). Ageing it out does
+ *      not expire a log line; it deletes the only proof that a recovered row was ever recovered,
+ *      and switches off the one check a later overwrite cannot switch off.
+ *
+ * Named here, in the pure module the recovery vocabulary lives in, so that the writer, the
+ * retention exemption and the tests all spell it the same way. verify.sql carries the same literal
+ * and tests/prisma/shopping-sync-log-record-kind-verify.test.ts holds the two together.
+ */
+export const WC_REFUND_PARK_RECOVERED_ACTION = 'wc_refund_park_recovered'
+
+/**
+ * THE ONE PREDICATE THAT SAYS "THIS ROW IS AN ACTIVE REFUND PARK" — AND IT SAYS SO POSITIVELY
+ * (o3d-xnwu r7, Codex HIGH).
+ *
+ * Every column here is written by IMS. `connector`, `direction` and `entityType` are literals the
+ * refund sync supplies; `entityId` is the IMS sales-order id a park is BY DEFINITION attached to;
+ * `status` is the actionable set; `recordKind` is the row's own statement of which family it
+ * belongs to. Nothing an operator can type into WooCommerce appears in it, and nothing is decided
+ * by ABSENCE. That is the whole point of the shape.
+ *
+ * AND IT IS REFUND-SPECIFIC, WHICH r7 WAS NOT (o3d-xnwu r8, Codex HIGH). r7 was right that the
+ * definition had to be positive, and right that `entityId` was the column separating a park from
+ * the pending-FX queue and the admission-refusal queue — both of which have none. It was wrong that
+ * this made the predicate a REFUND predicate. A held sales invoice (o3d-k26m.6,
+ * `holdWcSalesInvoiceForMissingNumber`) writes the same connector, the same direction, the same
+ * `SalesOrder` entity type, PENDING, and the IMS order id in `entityId`, so it satisfied all five
+ * clauses. The recovery inbox listed an invoice hold as a refund park and offered "Wrong order" and
+ * "Dismiss" on it — a REASSIGN would have moved an invoice payload onto another order as a PENDING
+ * park, and a DISMISS would have closed a hold on an invoice nothing then posts.
+ *
+ * WHY A NEW COLUMN AND NOT AN EXISTING ONE. There was no existing one. `shopping_sync_logs` carries
+ * connector, direction, status, entityType, entityId, externalId, payload, errorMessage, syncedAt
+ * and createdAt — no action, no reason code, no kind — and the hold matches this park on every one
+ * of the five that are not free text. `syncedAt` happens to differ (a park is written with one, a
+ * hold with NULL), and was rejected: it means "when this synced", so an unsettled PENDING park
+ * carrying one is an accident of the writer rather than a distinction, and a recovery inbox built
+ * on it would empty itself the day somebody tidied it up.
+ *
+ * AND NOT THE PAYLOAD, WHICH IS THE DEFECT r7 FIXED. The park's payload is the STORE'S. The hold's
+ * marker lives at `payload.reason`, and `reason` on a WooCommerce refund is free text a human types
+ * — so excluding holds by it would let an operator who wrote `missing_wc_invoice_number` hide their
+ * own park, exactly as `missing_fx_rate` did. The collision runs both ways and the other way
+ * WRITES, which is why `heldSalesInvoiceQueueWhere` now carries its own `recordKind` too.
+ *
+ * WHAT IT REPLACED, and why the replacement is not a tidy-up. The exception inbox used to select
+ * parks by excluding rows whose payload's top-level `reason` was the pending-FX queue marker. A
+ * refund park PERSISTS THE RAW WOOCOMMERCE REFUND, and `reason` is a free-text field a human types
+ * when they issue a refund in WooCommerce. So an operator who typed that exact string hid their own
+ * park from the only page that can recover it — and since a foreign park now HOLDS the refund
+ * delivery, that was a permanent hold with no visible way out. An inbox that decides what to show by
+ * exclusion is one bad guess away from hiding the thing an operator needs.
+ *
+ * The pending-FX queue rows the exclusion was aimed at are told apart by a column instead, and by
+ * the one that cannot collide: they carry NO `entityId` (there is no IMS order yet — that is why
+ * they are queued), and `pendingFxQueueWhere` now says so explicitly. The two sets are disjoint by
+ * construction rather than by a guess about payload contents.
+ *
+ * ONE DEFINITION, three readers: the exception inbox, the refund sync's cross-order guard, and the
+ * park upsert. They must agree with each other and with the partial unique index
+ * `shopping_sync_logs_active_refund_park_uq`, and three hand-written copies could not.
+ */
+export function activeRefundParkWhere(): {
+  connector: string
+  direction: 'FROM_CONNECTOR'
+  entityType: string
+  entityId: { not: null }
+  recordKind: typeof WC_REFUND_PARK_RECORD_KIND
+  status: { in: RecoverableRefundParkStatus[] }
+} {
+  return {
+    connector: 'woocommerce',
+    direction: 'FROM_CONNECTOR',
+    entityType: 'SalesOrder',
+    // A park is evidence ABOUT AN IMS ORDER, so it always names one. This is also what the partial
+    // unique index requires, and what separates a park from the row families that have NO entityId
+    // (a failed import, a pending-FX queue row, an admission refusal).
+    entityId: { not: null },
+    // …and this is what separates it from the one family that DOES have one: the held sales
+    // invoice. The row says which family it belongs to; nothing here infers it (r8).
+    recordKind: WC_REFUND_PARK_RECORD_KIND,
+    status: { in: [...RECOVERABLE_REFUND_PARK_STATUSES] },
+  }
+}
+
+/**
  * The status a resolved park carries.
  *
  * SYNCED is not a claim that this refund posted — it is this table's established "an operator

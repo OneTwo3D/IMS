@@ -4,11 +4,11 @@
 
 import { after } from 'next/server'
 import { db } from '@/lib/db'
-import { logActivity } from '@/lib/activity-log'
+import { logActivity, logActivityInTransaction } from '@/lib/activity-log'
 import { getSettingValue } from '@/lib/settings-store'
-import { wcFetch, wcPut } from '../api'
+import { wcFetch, wcPut, WC_PAGINATION_UNKNOWN, MAX_WC_PAGE_WALK_PAGES, describeWcPageWalkCeilingStall } from '../api'
 import { ensureWcCategoryTreeMirrored, resolveImsCategoryId } from './category-mirror'
-import { isPermanentProductSyncConflict } from './product-sync-errors'
+import { isPermanentProductSyncConflict, WcVariationLimitExceededError } from './product-sync-errors'
 import {
   WC_PRODUCT_WRITE_LOCK_NAMESPACE,
   WC_SETTINGS_VERSION_KEY,
@@ -65,8 +65,8 @@ const MANUAL_PRODUCT_SYNC_STALE_MS = 30 * 60 * 1000
  * too tight for a product with several hundred variations, but the ceiling stays
  * low enough that a wedged transaction cannot hold its row locks indefinitely.
  */
-const PRODUCT_WRITE_TX_TIMEOUT_MS = 60_000
-const PRODUCT_WRITE_TX_MAX_WAIT_MS = 15_000
+export const PRODUCT_WRITE_TX_TIMEOUT_MS = 60_000
+export const PRODUCT_WRITE_TX_MAX_WAIT_MS = 15_000
 
 /**
  * A connector may never silently destroy IMS-owned structure (o3d-y89x, o3d-8s89, o3d-h2cz).
@@ -396,6 +396,13 @@ export type ManualProductSyncProgress = {
   currentPage: number
   totalPages: number
   errors: string[]
+  /**
+   * Failures that will NEVER clear on their own (o3d-xbt). Kept apart from `errors` because the
+   * two want opposite treatment — a transient error is retried by the next run, a permanent
+   * conflict is not and needs a person — and because a run whose only failures are permanent is
+   * a run that DID finish, and its cursor advances.
+   */
+  permanentErrors: string[]
   startedAt?: string
   updatedAt?: string
 }
@@ -409,6 +416,7 @@ type ProductSyncProgressSnapshot = {
   currentPage: number
   totalPages: number
   errors: string[]
+  permanentErrors: string[]
 }
 
 const INITIAL_MANUAL_PRODUCT_SYNC_PROGRESS: ManualProductSyncProgress = {
@@ -421,6 +429,7 @@ const INITIAL_MANUAL_PRODUCT_SYNC_PROGRESS: ManualProductSyncProgress = {
   currentPage: 0,
   totalPages: 0,
   errors: [],
+  permanentErrors: [],
 }
 
 async function saveManualProductSyncProgress(progress: ManualProductSyncProgress) {
@@ -435,7 +444,15 @@ export async function getManualWcProductSyncProgress(): Promise<ManualProductSyn
   const row = await db.setting.findUnique({ where: { key: MANUAL_PRODUCT_SYNC_JOB_KEY } })
   if (!row?.value) return INITIAL_MANUAL_PRODUCT_SYNC_PROGRESS
   try {
-    return JSON.parse(row.value) as ManualProductSyncProgress
+    const stored = JSON.parse(row.value) as Partial<ManualProductSyncProgress>
+    // A row written before o3d-xbt has no `permanentErrors`, and the type says it always does.
+    // Defaulted here rather than at every reader, so nothing downstream reads `undefined.length`.
+    return {
+      ...INITIAL_MANUAL_PRODUCT_SYNC_PROGRESS,
+      ...stored,
+      errors: Array.isArray(stored.errors) ? stored.errors : [],
+      permanentErrors: Array.isArray(stored.permanentErrors) ? stored.permanentErrors : [],
+    }
   } catch {
     return INITIAL_MANUAL_PRODUCT_SYNC_PROGRESS
   }
@@ -478,6 +495,7 @@ async function runManualWcProductSync(progress: ManualProductSyncProgress) {
       progress.currentPage = snapshot.currentPage
       progress.totalPages = snapshot.totalPages
       progress.errors = snapshot.errors
+      progress.permanentErrors = snapshot.permanentErrors
       progress.updatedAt = new Date().toISOString()
       await saveManualProductSyncProgress(progress)
     },
@@ -488,6 +506,7 @@ async function runManualWcProductSync(progress: ManualProductSyncProgress) {
   progress.productsImported = result.synced
   progress.productsSkipped = result.skipped
   progress.errors = result.errors
+  progress.permanentErrors = result.permanentErrors
   progress.updatedAt = new Date().toISOString()
 
   const totalProducts = progress.totalProducts || (result.synced + result.skipped)
@@ -495,9 +514,16 @@ async function runManualWcProductSync(progress: ManualProductSyncProgress) {
     const parts = [`Imported ${result.synced} of ${totalProducts} product(s)`]
     if (result.skipped > 0) parts.push(`${result.skipped} skipped`)
     if (result.errors.length > 0) parts.push(`${result.errors.length} errors`)
+    // Named differently from `errors` on purpose: "1 error" invites "run it again", which is the
+    // one thing that will never help here (o3d-xbt).
+    if (result.permanentErrors.length > 0) {
+      parts.push(`${result.permanentErrors.length} blocked (needs an operator)`)
+    }
     progress.message = parts.join(' · ')
   } else if (result.errors.length > 0) {
     progress.message = `WooCommerce product import failed: ${result.errors[0]}`
+  } else if (result.permanentErrors.length > 0) {
+    progress.message = `WooCommerce product import blocked: ${result.permanentErrors[0]}`
   } else {
     progress.message = 'No WooCommerce products found'
   }
@@ -1364,41 +1390,277 @@ export async function syncWcProductToIms(
 // ---------------------------------------------------------------------------
 
 /**
- * Fetch EVERY variations page for a WC parent, or throw.
+ * The page size this walk ASKS FOR. 100 is the most the WooCommerce REST API will serve.
+ *
+ * A REQUEST, NOT A GRANT — the same rule `fetchAllWcRefundsForOrder` is built on. A store is free
+ * to answer with fewer (a `rest_post_per_page` filter, a security plugin shedding load, a proxy
+ * trimming a response) and does so with its own page size and no error, so nothing below may be
+ * inferred from this number.
+ */
+export const WC_VARIATION_PAGE_SIZE = 100
+
+/**
+ * The smallest page size a WooCommerce install is realistically going to grant: the core default
+ * for a collection asked with no `per_page` at all. Used only to size the page ceiling, so that
+ * the largest SUPPORTED product can still be walked against the stingiest plausible store.
+ */
+const WC_MIN_GRANTED_PAGE_SIZE = 10
+
+/**
+ * The largest variable product this sync SUPPORTS (o3d-jcx).
+ *
+ * Derived from PRODUCT_WRITE_TX_TIMEOUT_MS, not from what the fetch could hold. Inside that one
+ * transaction each variation costs an advisory-lock acquisition plus one to four sequential
+ * statements, so THE COUNT THAT FITS THE WRITE BUDGET IS THE COUNT THAT MAY BE FETCHED.
+ * Prefetching more would only guarantee a rollback after the parent row lock and every earlier
+ * variation row lock had been held for most of a minute — which is worse than the page-by-page
+ * behaviour o3d-uh2 replaced, and is why this issue exists.
+ *
+ * Raising it means raising the transaction budget with it, and measuring;
+ * `tests/wc-variation-fetch-budget.test.ts` pins the relationship so it cannot be raised alone.
+ */
+export const MAX_WC_VARIATIONS_PER_PRODUCT = 1_000
+
+/**
+ * A hard ceiling on one product's walk, because the walk does not end on `totalPages` (below) and
+ * a store that ignores `page` would otherwise be asked forever.
+ *
+ * Sized so it can never refuse a product that is inside the ITEM limit: enough requests to collect
+ * MAX_WC_VARIATIONS_PER_PRODUCT even against a store granting only WC_MIN_GRANTED_PAGE_SIZE rows a
+ * page, plus the empty page that ends the walk. Reaching it therefore says something about the
+ * STORE, not about the product, which is why it is transient.
+ */
+export const MAX_WC_VARIATION_PAGES =
+  Math.ceil(MAX_WC_VARIATIONS_PER_PRODUCT / WC_MIN_GRANTED_PAGE_SIZE) + 1
+
+/**
+ * Wall-clock ceiling on the whole variations prefetch (o3d-jcx).
+ *
+ * The count limit alone does not bound TIME: the page ceiling at the per-request timeout is hours,
+ * far longer than the webhook inbox's stale-processing window — so a slow store could have its item
+ * reclaimed by a second worker while the first was still fetching, and both would then contend on
+ * the same SKU advisory locks while each reclaim burned an attempt toward the dead-letter cap.
+ *
+ * The issue offered "add a heartbeat or extend the claim while fetching". This takes the third
+ * option — bound the work BELOW the reclaim window — and makes the relationship an asserted
+ * invariant rather than a hope: see `tests/wc-variation-fetch-budget.test.ts`. A real heartbeat is
+ * still the right answer if this budget ever has to rise; the pattern to copy is
+ * `lib/connectors/mintsoft/sync/stock-sync.ts`. wms-connector-boundary-ok: o3d-xnwu: prose pointer to
+ * the heartbeat pattern worth copying if this budget rises; no WMS connector behaviour is reached
+ * from the WooCommerce product sync.
+ *
+ * Checked BETWEEN pages, so one in-flight request may overshoot it — that is the
+ * "+ WC_REQUEST_TIMEOUT_MS" term in the invariant.
+ *
+ * AND IT HAS TO COVER THE PAGE CEILING, WHICH IS THE RELATIONSHIP NOTHING USED TO STATE (o3d-xnwu,
+ * Codex LOW). The two variation ceilings are sized against DIFFERENT worst cases —
+ * MAX_WC_VARIATIONS_PER_PRODUCT against the write transaction, MAX_WC_VARIATION_PAGES against the
+ * stingiest page size a store grants — and neither was ever compared to this one. Put together they
+ * describe a real product: the largest SUPPORTED product against the stingiest SUPPORTED store
+ * needs MAX_WC_VARIATION_PAGES (101) round trips, and every one of them has to fit inside this
+ * budget or the walk throws the transient above. Transient means retried; retried means the same
+ * 101 requests against the same slow store; so a product on the wrong side of that line RETRIES FOR
+ * EVER, makes no progress, and produces no operator-facing signal at all — the throw is a webhook
+ * item failure, not a "this product cannot be imported" line.
+ *
+ * WC_VARIATION_PAGE_LATENCY_ALLOWANCE_MS below names the per-request allowance this budget implies,
+ * and tests/wc-variation-fetch-budget.test.ts asserts it is a plausible one. Raising either ceiling
+ * without raising this budget fails there rather than in production.
+ */
+export const WC_VARIATION_FETCH_BUDGET_MS = 5 * 60_000
+
+/**
+ * The per-round-trip time this budget leaves when the walk actually needs its whole page ceiling.
+ *
+ * Derived, not chosen — it exists so the relationship between the three constants is a value
+ * something can assert about rather than a division somebody has to notice. If it drops below what
+ * a WooCommerce variations page plausibly takes, the largest supported product on the stingiest
+ * supported store can never be imported and will retry silently for ever.
+ */
+export const WC_VARIATION_PAGE_LATENCY_ALLOWANCE_MS =
+  WC_VARIATION_FETCH_BUDGET_MS / MAX_WC_VARIATION_PAGES
+
+/**
+ * How many SKUs go into one `WHERE sku IN (...)` (o3d-jcx).
+ *
+ * The lookup ran unchunked over every variation SKU, inside a transaction already holding the
+ * parent row lock and every per-SKU advisory lock. Chunking bounds the statement's parameter count
+ * and its planning cost; it weakens nothing, because the locks are held for the whole transaction
+ * either way and the reads are therefore repeatable across the chunks.
+ */
+export const WC_VARIATION_SKU_LOOKUP_CHUNK = 200
+
+/**
+ * Fetch EVERY variation of a WC parent, or throw.
  *
  * Nothing is written here, so a failure on any page (first or last) leaves the
  * catalog exactly as it was. Propagating instead of swallowing is o3d-q1w: the
  * parent sync then records FAILED, writes no SYNCED log, and neither the webhook
  * nor the bulk cursor advances, so the reconcile re-attempts.
+ *
+ * BOUNDED, AND IT NEVER INFERS AN ENDING FROM WHAT THE HEADERS SAY (o3d-jcx). The previous version
+ * looped `while (page <= totalPages)` and retained every page in one array with no page, item or
+ * time limit:
+ *
+ *   - an absurd or growing `x-wp-totalpages` kept the loop running and the array growing until the
+ *     worker ran out of memory, or until the write transaction it fed could not finish inside
+ *     PRODUCT_WRITE_TX_TIMEOUT_MS and rolled back — repeatedly, each time after holding the parent
+ *     lock for most of a minute;
+ *   - an UNREADABLE `x-wp-totalpages` ended the walk after page one and returned that as the
+ *     complete variation set. `wcFetch` parsed the header with `parseInt(header ?? '1')`, and
+ *     `parseInt('')` is NaN, and `page <= NaN` is false. A store sending an empty header therefore
+ *     had every variable product imported down to its first hundred variations, silently;
+ *   - nothing bounded elapsed time, so a slow store could outlive the inbox claim on the very item
+ *     it was processing and have a second worker reclaim and duplicate the whole fetch.
+ *
+ * WHAT ENDS THE WALK is the rule `fetchAllWcRefundsForOrder` established (o3d-okbd), not
+ * re-derived here:
+ *
+ *   - `x-wp-totalpages` CANNOT end it. A store that never sends the header is indistinguishable
+ *     from one reporting a single page: both arrive as 1. Ending on that number takes "the store
+ *     said nothing" for "the store said there is no more".
+ *   - A SHORT PAGE CANNOT end it either. `per_page` is a request, not a grant, so against a store
+ *     that caps below it EVERY page is short and the walk would stop after the first one.
+ *   - AN EMPTY PAGE ENDS IT. A page with nothing on it lies past the end of the collection, so
+ *     everything the collection holds is already banked. It is the only unconditional proof of an
+ *     ending available to a client, and it costs exactly one extra request.
+ *
+ * WHAT IT REFUSES, AND WITH WHICH CLASSIFICATION. Every incomplete outcome throws — this function
+ * is all-or-nothing by construction, and applying half a product's variations while reporting
+ * success is the silent incompleteness the rest of this connector exists to refuse.
+ *
+ *   - MORE THAN MAX_WC_VARIATIONS_PER_PRODUCT: `WcVariationLimitExceededError`, PERMANENT. It is a
+ *     property of the product, so re-reading it reaches the same count and 24 retries into the
+ *     dead-letter queue tell the operator nothing the first attempt did not.
+ *   - The page ceiling, the time budget, a page that is entirely rows already read, a page the
+ *     store served short of what it says it holds: TRANSIENT. Each is a property of the STORE or
+ *     of the moment, and a later run can legitimately succeed.
+ *
+ * WHAT IT TOLERATES, AND SAYS OUT LOUD. WooCommerce paginates a LIVE list by POSITION, so a
+ * variation created mid-walk pushes a row already read onto the next page. Rows are therefore keyed
+ * by variation id rather than appended: a re-served row costs one dedupe instead of a duplicate
+ * write inside the transaction. That direction of motion can only over-read, never under-read, so
+ * it is logged rather than refused. The opposite motion — a variation DELETED behind the cursor —
+ * shifts every later row up one and hands the row that was going to open the next page to nobody;
+ * no arithmetic over a single walk can see it, because the stated total drops by exactly as much
+ * as the walk collects. The cost is bounded: `applyVariations` only upserts, so a row missed this
+ * way is "not updated this run" and the reconcile picks it up.
  */
 async function fetchAllWcVariations(
   wcParentId: number,
   creds: ConnectorCredentials | null,
+  now: () => number = Date.now,
 ): Promise<WcVariation[]> {
-  const all: WcVariation[] = []
-  let page = 1
-  let totalPages = 1
+  const deadline = now() + WC_VARIATION_FETCH_BUDGET_MS
+  // Keyed by variation id, not appended: WooCommerce serves a live list by position, so the same
+  // row can arrive on two pages.
+  const byId = new Map<number, WcVariation>()
+  let duplicates = 0
+  // The SMALLEST count the store stated anywhere in this walk, or null if it never stated one — a
+  // store that omits `x-wp-total` arrives here as 0, and an unreadable one as WC_PAGINATION_UNKNOWN;
+  // neither is a claim about anything. The minimum is used so a variation CREATED mid-walk raises
+  // the claim on a later page without turning a complete read into a refusal.
+  let statedTotal: number | null = null
 
-  while (page <= totalPages) {
+  for (let page = 1; page <= MAX_WC_VARIATION_PAGES; page += 1) {
+    if (page > 1 && now() >= deadline) {
+      // TRANSIENT on purpose: a slow store recovers, and the alternative — running past the inbox's
+      // stale-processing window — hands the same item to a second worker.
+      throw new Error(
+        `Fetching variations for WC product ${wcParentId} exceeded its ${WC_VARIATION_FETCH_BUDGET_MS}ms `
+        + `budget after ${page - 1} page(s) and ${byId.size} variation(s); refusing to keep a claimed `
+        + 'webhook item in flight past the inbox reclaim window. Nothing was written and it will be retried. '
+        // The signal the retry loop otherwise never gives (o3d-xnwu, Codex LOW). Transient means the
+        // same walk runs again against the same store, so if the store is simply slower than
+        // WC_VARIATION_PAGE_LATENCY_ALLOWANCE_MS per page this never succeeds and nothing else says so.
+        + `The budget allows about ${Math.round(WC_VARIATION_PAGE_LATENCY_ALLOWANCE_MS)}ms per request across `
+        + `the ${MAX_WC_VARIATION_PAGES}-page ceiling; if this product keeps failing here the store is `
+        + 'serving variation pages more slowly than that, and the budget (or the store) has to change — '
+        + 'retrying alone will not clear it.',
+      )
+    }
+
     // PINNED credentials, not ambient (o3d-mlc7): resolving them per page let a rebind
     // mid-import pair store-A parent data with store-B variations in one transaction.
-    const { data, totalPages: tp, error } = await wcFetch(
+    const { data, totalItems, error } = await wcFetch(
       `/products/${wcParentId}/variations`,
-      { per_page: '100', page: String(page) },
+      { per_page: String(WC_VARIATION_PAGE_SIZE), page: String(page) },
       creds,
     )
     if (error) {
       throw new Error(
-        `Failed to fetch variations for WC product ${wcParentId} (page ${page}/${totalPages}): ${error}`,
+        `Failed to fetch variations for WC product ${wcParentId} (page ${page}): ${error}`,
       )
     }
+    if (!Array.isArray(data)) {
+      throw new Error(
+        `WooCommerce returned a non-list variations page for product ${wcParentId} (page ${page}); `
+        + 'refusing to import it.',
+      )
+    }
+    if (totalItems > 0 && totalItems !== WC_PAGINATION_UNKNOWN) {
+      statedTotal = statedTotal === null ? totalItems : Math.min(statedTotal, totalItems)
+    }
 
-    totalPages = tp
-    all.push(...(data as WcVariation[]))
-    page++
+    const batch = data as WcVariation[]
+    const sizeBefore = byId.size
+    for (const variation of batch) {
+      if (byId.has(variation.id)) duplicates += 1
+      byId.set(variation.id, variation)
+    }
+    if (byId.size > MAX_WC_VARIATIONS_PER_PRODUCT) {
+      throw new WcVariationLimitExceededError({
+        wcParentId, limit: MAX_WC_VARIATIONS_PER_PRODUCT, observed: byId.size,
+      })
+    }
+
+    // THE ONLY PROOF OF AN ENDING. Checked after banking, so the empty page itself contributes
+    // nothing, and before advancing, so a product with no variations costs exactly one request.
+    if (batch.length === 0) {
+      if (statedTotal !== null && byId.size < statedTotal) {
+        // Pages cut out of the middle of the collection: the walk terminated cleanly and every page
+        // looked normal, but the store served fewer rows than it says the product has. Deletions
+        // mid-walk do NOT reach here — they lower the stated total by exactly what they cost the
+        // walk — so this is evidence of a trimmed response, not of a moving list.
+        throw new Error(
+          `WooCommerce says WC product ${wcParentId} has ${statedTotal} variation(s) but the walk `
+          + `collected only ${byId.size} across ${page} page(s). Refusing to import a partial variation `
+          + 'list as if it were whole; nothing was written and it will be retried.',
+        )
+      }
+      if (duplicates > 0) {
+        // Not fatal — deduping by id is the right resolution, and this direction of motion can only
+        // over-read — but it is evidence the list moved between requests, so it is said out loud
+        // rather than absorbed silently.
+        console.warn(
+          `[woocommerce-product-sync] WC product ${wcParentId}: ${duplicates} variation(s) were served on `
+          + 'more than one page; the list changed while it was being read. Deduplicated by variation id.',
+        )
+      }
+      return [...byId.values()]
+    }
+
+    if (byId.size === sizeBefore) {
+      // A full page of rows already banked. Either the store is ignoring `page` and re-serving the
+      // same rows, or the list shifted back a whole page; neither will end on an empty page, and
+      // continuing would spend the remaining page budget learning that. TRANSIENT — it describes
+      // the store, not the product.
+      throw new Error(
+        `WooCommerce served WC product ${wcParentId} a page ${page} of ${batch.length} variation(s) that `
+        + 'were all already read, so the walk is not advancing — the store may be ignoring the `page` '
+        + `parameter. Stopped with ${byId.size} variation(s) collected; nothing was written.`,
+      )
+    }
   }
 
-  return all
+  // The walk never reached an empty page. Reported as an incomplete READ rather than passed off as
+  // the end of the collection, and transient: the ceiling is sized so no product inside the item
+  // limit can reach it against any plausible page size.
+  throw new Error(
+    `The variation list for WC product ${wcParentId} did not end within ${MAX_WC_VARIATION_PAGES} pages `
+    + `(${byId.size} variation(s) collected). Refusing to treat a truncated list as the whole product; `
+    + 'nothing was written and it will be retried.',
+  )
 }
 
 /**
@@ -1541,10 +1803,20 @@ async function applyVariations(
   // candidate set: `WHERE parentId IN (candidates) GROUP BY parentId` returns at most one row per
   // candidate, off the `parentId` index. r4 asked it per row and returned one row per child —
   // hundreds of rows for a high-variation catalogue, read only to compute a boolean per candidate.
-  const existingRows = await withConnectorChildFlags(
-    tx,
-    await tx.product.findMany({ where: { sku: { in: entries.map((entry) => entry.sku) } } }),
-  )
+  //
+  // CHUNKED (o3d-jcx). It ran unchunked over every variation SKU, so a large product built one
+  // enormous parameter list inside a transaction that already holds the parent row lock and every
+  // per-SKU advisory lock. Chunking bounds the statement without weakening anything: the locks are
+  // held for the whole transaction either way, so the reads are repeatable across the chunks.
+  // Deduped first — WooCommerce permits one SKU on several variations of a parent, and asking for
+  // the same SKU twice only makes the list longer.
+  const lookupSkus = [...new Set(entries.map((entry) => entry.sku))]
+  const loadSkuChunk = (skus: string[]) =>
+    tx.product.findMany({ where: { sku: { in: skus } } }).then((rows) => withConnectorChildFlags(tx, rows))
+  const existingRows: Awaited<ReturnType<typeof loadSkuChunk>> = []
+  for (let start = 0; start < lookupSkus.length; start += WC_VARIATION_SKU_LOOKUP_CHUNK) {
+    existingRows.push(...await loadSkuChunk(lookupSkus.slice(start, start + WC_VARIATION_SKU_LOOKUP_CHUNK)))
+  }
   const existingBySku = new Map(existingRows.map((row) => [row.sku, row]))
 
   // Every WC variation id this payload maps to each SKU (o3d-fsi). WC permits one SKU on
@@ -1929,13 +2201,37 @@ export async function pushImsProductToWc(productId: string): Promise<{ success: 
 // Bulk product sync (WC → IMS)
 // ---------------------------------------------------------------------------
 
+/**
+ * What a bulk product run did, WITH ITS FAILURES SPLIT BY WHETHER A RETRY COULD EVER HELP
+ * (o3d-xbt).
+ *
+ * `errors` is the transient set: a dropped connection, a lock timeout, a WooCommerce 5xx, a
+ * settings rebind that overtook the run. The next run can succeed, so the cursor is HELD and the
+ * same window is re-read.
+ *
+ * `permanentErrors` is the set that re-runs to the identical outcome for ever — the same
+ * classification `syncWcProductToIms` already returns to the webhook path (o3d-gtk, o3d-fsi,
+ * o3d-y89x, o3d-jcx). Holding the cursor for these is not caution, it is a livelock: one product
+ * whose GTIN or WooCommerce id belongs to a different IMS row pinned
+ * `last_wc_product_sync_at` / `last_wc_product_reconcile_at` at its old value, so EVERY later
+ * cycle re-fetched the whole catalogue from that watermark, re-imported all of it, and re-failed
+ * on the same product. Unbounded work per cycle, permanently, and no operator-visible signal that
+ * it would never clear.
+ *
+ * Kept as two fields rather than one list with a flag so a caller cannot conflate them by
+ * accident: `errors.length === 0` is exactly the question the cursor asks.
+ */
+export type WcProductBulkSyncResult = SyncResult & { permanentErrors: string[] }
+
 export async function syncAllWcProducts(
   opts: {
     mode?: 'poll' | 'reconcile' | 'manual_reconcile'
     onProgress?: (progress: ProductSyncProgressSnapshot) => Promise<void> | void
   } = {},
-): Promise<SyncResult> {
-  const result: SyncResult = { synced: 0, skipped: 0, errors: [] }
+): Promise<WcProductBulkSyncResult> {
+  const result: WcProductBulkSyncResult = { synced: 0, skipped: 0, errors: [], permanentErrors: [] }
+  /** The SKUs behind `permanentErrors`, for the one loud line the operator has to act on. */
+  const permanentConflictSkus: string[] = []
   const mode = opts.mode ?? 'poll'
   const onProgress = opts.onProgress
   const cursorKey = mode === 'poll' ? 'last_wc_product_sync_at' : 'last_wc_product_reconcile_at'
@@ -1953,6 +2249,11 @@ export async function syncAllWcProducts(
 
   let page = 1
   let totalPages = 1
+  /**
+   * o3d-xnwu: the walk ends on an EMPTY PAGE, not on `totalPages`. Until this is true the run is an
+   * incomplete read and the cursor below must not move — see describeWcPageWalkCeilingStall.
+   */
+  let endedOnEmptyPage = false
 
   async function reportProgress(message: string, currentPage = page) {
     if (!onProgress) return
@@ -1965,12 +2266,16 @@ export async function syncAllWcProducts(
       currentPage,
       totalPages,
       errors: [...result.errors],
+      permanentErrors: [...result.permanentErrors],
     })
   }
 
   await reportProgress('Preparing WooCommerce product import...', 0)
 
-  while (page <= totalPages) {
+  // THE CEILING, NOT THE HEADER. `totalPages` is progress text from here on: a store that sends an
+  // empty or absent `x-wp-totalpages` used to end this walk after page one with NO error, and the
+  // cursor below advanced past every product it never asked for (o3d-xnwu).
+  while (page <= MAX_WC_PAGE_WALK_PAGES) {
     await reportProgress(
       `Fetching WooCommerce products... page ${page}${totalPages > 1 ? ` / ${totalPages}` : ''}`,
     )
@@ -1996,6 +2301,15 @@ export async function syncAllWcProducts(
     totalPages = tp
     if (totalItems > 0) totalProducts = totalItems
     const products = data as WcFullProduct[]
+
+    // THE ONLY PROOF OF AN ENDING (o3d-xnwu). Checked before any work, so the empty page costs one
+    // request and contributes nothing; and checked instead of `page > totalPages`, so a store that
+    // says nothing readable about how many pages it has cannot truncate this walk silently.
+    if (products.length === 0) {
+      endedOnEmptyPage = true
+      break
+    }
+
     if (totalProducts === 0) totalProducts = products.length
 
     await reportProgress('Importing WooCommerce products...')
@@ -2013,8 +2327,18 @@ export async function syncAllWcProducts(
       }
       const r = await syncWcProductToIms(product, pageVersion)
       processedProducts++
-      if (r.success) result.synced++
-      else result.errors.push(`SKU ${product.sku}: ${r.error}`)
+      if (r.success) {
+        result.synced++
+      } else if (r.permanent) {
+        // The SAME classification the webhook path acts on (o3d-gtk). Re-importing this payload
+        // reaches the identical conflict, so it must not hold the cursor — but it is not swallowed
+        // either: it is counted, named in the loud line below, and already has a
+        // `PERMANENT_CONFLICT:`-prefixed FAILED row in the sync log written by syncWcProductToIms.
+        result.permanentErrors.push(`SKU ${product.sku}: ${r.error}`)
+        permanentConflictSkus.push(product.sku)
+      } else {
+        result.errors.push(`SKU ${product.sku}: ${r.error}`)
+      }
 
       await reportProgress(
         totalProducts > 0
@@ -2026,14 +2350,97 @@ export async function syncAllWcProducts(
     page++
   }
 
-  // Only advance the cursor after a fully clean run. Advancing after a fetch
-  // or import error can permanently skip remote changes older than now.
-  if (result.errors.length === 0) {
-    await db.setting.upsert({
-      where: { key: cursorKey },
-      create: { key: cursorKey, value: new Date().toISOString() },
-      update: { value: new Date().toISOString() },
+  // ONE LOUD LINE, and it is emitted BEFORE the cursor moves past these products (o3d-xbt) — in
+  // the SAME TRANSACTION as the advance (o3d-xbt r2, Codex MEDIUM).
+  //
+  // Advancing the cursor is the right call — see WcProductBulkSyncResult — but it means the next
+  // run will not even look at these SKUs, so this is the only place the operator is told. ERROR,
+  // not WARNING: nothing will import these products until someone resolves the duplicate GTIN /
+  // WooCommerce id / structure conflict, and the run itself has stopped complaining about them.
+  //
+  // "Before" was being carried by `await logActivity(...)` standing above the upsert, and that is
+  // not a guarantee: `logActivity` catches its own persistence failure, logs to stderr and returns
+  // void, so a failed INSERT reaches the next statement looking exactly like a successful one. The
+  // cursor would then advance past products whose only record names nobody — the rule this line
+  // exists to satisfy ("the loud line is emitted before the cursor moves, BECAUSE advancing means
+  // nothing looks at them again") inverted into its own failure mode, silently. A rule that has to
+  // hold needs a logger whose failure is visible, which is `logActivityInTransaction`: it does not
+  // catch, so the record and the advance commit together or neither does. Same shape as the
+  // operator assertion in app/actions/accounting-settlement.ts.
+  const permanentConflictLine = {
+    entityType: 'SYNC' as const,
+    action: 'wc_product_sync_permanent_conflicts',
+    tag: 'sync' as const,
+    level: 'ERROR' as const,
+    description: `WC product ${mode === 'poll' ? 'poll' : 'reconciliation'} could not import `
+      + `${result.permanentErrors.length} product(s) and never will without an operator: `
+      + `${permanentConflictSkus.join(', ')}. The sync cursor was advanced past them so the rest of `
+      + 'the catalogue keeps syncing. Resolve the duplicate SKU / barcode / WooCommerce id, or the '
+      + 'product-structure conflict on /sync/exceptions — then re-save the product in WooCommerce so '
+      + 'it restamps date_modified and the next poll picks it up, because a fix made only in IMS '
+      + 'leaves nothing for the cursor to find.',
+    metadata: { mode, skus: permanentConflictSkus, permanentErrors: result.permanentErrors },
+  }
+
+  // Advance the cursor when nothing TRANSIENT failed. Advancing after a fetch or import error that
+  // a retry could fix would permanently skip remote changes older than now — but refusing to
+  // advance for a failure no retry can fix pins the cursor for ever, which is o3d-xbt: the whole
+  // catalogue re-read and re-imported every cycle, for one product that can never succeed.
+  //
+  // THE RESIDUAL, STATED RATHER THAN GLOSSED. Advancing means the next run does not look at these
+  // SKUs at all, and half of the remedies are IMS-side (clear the IMS product's external mapping,
+  // resolve the structure conflict on /sync/exceptions) — those do not move WooCommerce's
+  // `date_modified`, so the fixed product is not re-imported until WooCommerce next touches it.
+  // The ERROR line above therefore names that step explicitly. This is the same property the
+  // webhook path has had since o3d-gtk, and the automatic re-drive is filed as a follow-up; it is
+  // not a reason to keep the cursor pinned, because a pinned cursor re-reads the WHOLE catalogue
+  // every cycle for ever and still never imports the conflicted product.
+  // A WALK THAT NEVER ENDED IS AN ERROR, AND IT LANDS IN `errors` SO THE CURSOR IS HELD (o3d-xnwu).
+  // Not in `permanentErrors`: nothing about the catalogue is established by a truncated read, so
+  // nothing may be buried. `break` on a fetch error above already pushed its own error, so this
+  // only fires on a clean walk that RAN OUT OF CEILING.
+  //
+  // AND THAT IS A STALL, NOT A TRUNCATION TO RETRY (round 3, Codex MEDIUM). Round 2 wrote here that
+  // "a retry against a store that starts sending the header again succeeds". That reasoning covers
+  // the OTHER cause of an unended walk. This one is the catalogue in the window being wider than
+  // 1000 pages: the header is fine, the store is fine, and because this error holds `cursorKey` the
+  // next run rebuilds the identical `modified_after` window, re-reads the identical 100,000
+  // products and stops in the identical place — for ever, never reaching what is past it. So it
+  // says so, and it escalates, rather than logging one line that reads as "wait and it will clear".
+  const ranOutOfCeiling = !endedOnEmptyPage && result.errors.length === 0
+  if (ranOutOfCeiling) {
+    result.errors.push(describeWcPageWalkCeilingStall('product', cursorKey))
+    await logActivity({
+      entityType: 'SYNC',
+      action: 'wc_product_sync_ceiling_stall',
+      tag: 'sync',
+      level: 'ERROR',
+      description: result.errors[result.errors.length - 1],
+      metadata: { mode, cursorKey, modifiedAfter, pagesRead: page - 1, ceiling: MAX_WC_PAGE_WALK_PAGES },
+      resolveUser: false,
     })
+  }
+
+  if (result.errors.length === 0) {
+    const cursorAt = new Date().toISOString()
+    await db.$transaction(async (tx) => {
+      // Inside, and FIRST, so a failure to record the burial aborts the burial. `userId` is passed
+      // explicitly because the session lookup logActivity falls back on is a cache() read with no
+      // place in a transaction; this is a background run and there is no user to name.
+      if (result.permanentErrors.length > 0) {
+        await logActivityInTransaction(tx, { ...permanentConflictLine, userId: null })
+      }
+      await tx.setting.upsert({
+        where: { key: cursorKey },
+        create: { key: cursorKey, value: cursorAt },
+        update: { value: cursorAt },
+      })
+    })
+  } else if (result.permanentErrors.length > 0) {
+    // The cursor is HELD by a transient failure, so these SKUs are re-read and re-reported by the
+    // next run: nothing is being buried, and best-effort is the right cost for a line that will be
+    // emitted again. It is still emitted now, because a run can be transiently failing for weeks.
+    await logActivity({ ...permanentConflictLine, resolveUser: false })
   }
 
   if (result.synced > 0) {

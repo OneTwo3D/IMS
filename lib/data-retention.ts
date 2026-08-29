@@ -9,6 +9,10 @@ import {
 } from '@/lib/domain/accounting/back-reference-sweep'
 import { followUpObligationsOwedBy } from '@/lib/domain/accounting/compacted-followup-loss'
 import { POSTABLE_ACCOUNTING_SYNC_STATUSES } from '@/lib/domain/accounting/postable-sync-statuses'
+import {
+  RECOVERABLE_REFUND_PARK_STATUSES,
+  WC_REFUND_PARK_RECOVERED_ACTION,
+} from '@/lib/domain/sales/refund-park-recovery'
 import { REMOTE_MONEY_EVIDENCE_TYPES } from '@/lib/domain/accounting/remote-money-evidence'
 import {
   compactableInboundEventWhere,
@@ -132,26 +136,74 @@ export async function purgeExpiredData(): Promise<{
   if (syncMonths > 0) {
     const cutoff = monthsAgo(syncMonths)
     const [wc, acct] = await Promise.all([
-      db.shoppingSyncLog.deleteMany({
-        where: {
-          createdAt: { lt: cutoff },
-          // o3d-w00 / o3d-iup / o3d-7yf: never retention-delete an UNRESOLVED WooCommerce refund park
-          // (PENDING/FAILED amount-mismatch or QUARANTINED monetary-only). Each is a refund whose money
-          // already left the business but has no SalesOrderRefund / credit note yet; deleting it erases the
-          // only record of an unaccounted refund and defeats the deletion/rebind guards that rely on it.
-          // It must persist until an operator resolves it (which flips it to SYNCED, after which it expires
-          // normally). Now that upsertRefundPark dedups parks to one row per refund, excluding PENDING/
-          // FAILED no longer risks the unbounded growth that scoped this to QUARANTINED before. entityId:
-          // not null also skips the entity-less missing-FX queue rows.
-          NOT: {
-            connector: 'woocommerce',
-            direction: 'FROM_CONNECTOR',
-            entityType: 'SalesOrder',
-            status: { in: ['PENDING', 'FAILED', 'QUARANTINED'] },
-            entityId: { not: null },
-          },
-        },
-      }),
+      // RAW, AND NOT A `deleteMany`, FOR ONE REASON (o3d-xnwu r15, Codex HIGH): the second exemption
+      // below is a fact held in ANOTHER TABLE, and Prisma cannot express it. Reading the witness ids
+      // first and passing `id: { notIn: [...] }` would work almost always and lose exactly the case
+      // this exists for: a park recovered between the read and the DELETE has an OLD `createdAt`, so
+      // it is in scope of the very sweep that just decided it was not protected. A check whose
+      // evidence a cron can delete in a race is not a check either. `NOT EXISTS` is evaluated by the
+      // same statement that deletes, so there is no window.
+      //
+      // o3d-w00 / o3d-iup / o3d-7yf: never retention-delete an UNRESOLVED WooCommerce refund park
+      // (PENDING/FAILED amount-mismatch or QUARANTINED monetary-only). Each is a refund whose money
+      // already left the business but has no SalesOrderRefund / credit note yet; deleting it erases the
+      // only record of an unaccounted refund and defeats the deletion/rebind guards that rely on it.
+      // It must persist until an operator resolves it (which flips it to SYNCED, after which it expires
+      // normally). Now that upsertRefundPark dedups parks to one row per refund, excluding PENDING/
+      // FAILED no longer risks the unbounded growth that scoped this to QUARANTINED before. entityId
+      // IS NOT NULL also skips the entity-less missing-FX queue rows.
+      //
+      // AND o3d-xnwu r15 — NEVER DELETE A ROW THE RECOVERY WITNESS ACCUSES. Round 14 made the
+      // `wc_refund_park_recovered` activity entry durable: written in the recovery's own transaction
+      // and exempt from activity-log retention, so check 7 of the 20260822120000 verification can
+      // still see that a park recovery once acted on a row. IT IS A JOIN, AND A JOIN NEEDS BOTH
+      // SIDES. The row itself was left unprotected the moment it stopped being an active park —
+      // which is precisely the documented damage sequence: the predecessor rewrites the recovered
+      // row as a held invoice, the ordinary release path settles it to SYNCED, and from then on
+      // its ORIGINAL `createdAt` (six months by default, and the park may already have been old
+      // when it was recovered) expires it here. verify.sql's check 7 drives FROM this table and
+      // uses the witness only in an EXISTS subquery, so a deleted row is not an accusation with
+      // half its evidence missing — it is ZERO VIOLATIONS. The cutover proceeds, the accounting
+      // payload is gone, and the one row that proved it was destroyed by this statement.
+      //
+      // THE ROW IS EXEMPTED RATHER THAN THE EVIDENCE BEING MOVED INTO THE WITNESS, and that choice
+      // has a price, stated here rather than discovered later. The accusation check 7 makes is
+      // about the row's CURRENT state — "a row a recovery once acted on is NOW shaped or stamped as
+      // a held sales invoice" — and no entry written at recovery time can carry a fact about a
+      // write that had not happened yet. The alternative Codex offers, treating an ABSENT
+      // witness-referenced row as an incident, is a false-positive engine: a legitimately recovered
+      // park settles to SYNCED and expires by age like anything else, so on any installation older
+      // than the retention period it would fail the cutover over healthy history — the one outcome
+      // this file's own comments call a cutover outage. So the row is kept.
+      //
+      // WHAT THAT COSTS. These rows now outlive the retention period the settings UI promises,
+      // indefinitely, and unlike the PENDING/FAILED/QUARANTINED exemption above there is no state
+      // they later move into that releases them — the witness is permanent by design. The set is
+      // bounded by MANUAL OPERATOR RECOVERIES, which are rare and each of which is a refund whose
+      // money left the business, so it is small and every member of it is worth keeping; but it is
+      // retention coupled to a migration that may run much later, and it does not lift itself when
+      // that migration finally does run. components/settings/data-retention.tsx says so.
+      db.$queryRaw<Array<{ count: number }>>`
+        WITH deleted AS (
+          DELETE FROM "shopping_sync_logs"
+           WHERE "createdAt" < ${cutoff}
+             AND NOT (
+                   connector = 'woocommerce'
+               AND direction = 'FROM_CONNECTOR'::"ShoppingSyncDirection"
+               AND "entityType" = 'SalesOrder'
+               AND status = ANY(${[...RECOVERABLE_REFUND_PARK_STATUSES]}::"ShoppingSyncStatus"[])
+               AND "entityId" IS NOT NULL
+             )
+             AND NOT EXISTS (
+                   SELECT 1
+                     FROM "activity_logs"
+                    WHERE "activity_logs".action = ${WC_REFUND_PARK_RECOVERED_ACTION}
+                      AND "activity_logs".metadata->>'shoppingSyncLogId' = "shopping_sync_logs".id
+                 )
+          RETURNING 1
+        )
+        SELECT COUNT(*)::int AS count FROM deleted
+      `,
       // o3d-nepa / o3d-y14: age alone NEVER expires accounting work that can still be posted.
       //
       // A PENDING, PROCESSING or FAILED row is not a log of something that happened — it is an
@@ -253,7 +305,7 @@ export async function purgeExpiredData(): Promise<{
         },
       }),
     ])
-    syncLogsDeleted = wc.count + acct.count
+    syncLogsDeleted = (wc[0]?.count ?? 0) + acct.count
 
     // The other half: expired-but-unresolved rows lose their CONTENT and keep their ATTRIBUTION.
     // Ordered after the delete deliberately — the two predicates are MUTUALLY EXCLUSIVE (the delete
