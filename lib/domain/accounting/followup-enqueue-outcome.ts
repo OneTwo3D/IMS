@@ -221,7 +221,7 @@ export function paymentAccountRefusalMessage(input: {
  * whose JSON form is a STRING. Rejecting those would turn ordinary persisted payloads into
  * refusals, which is the opposite failure and a louder one.
  */
-export type RequestedInvoicePayment =
+type RequestedInvoicePayment =
   /** The payload says, readably, that no payment is owed. This is the ONLY arm that may settle. */
   | { readonly kind: 'none' }
   /** A finite, positive amount to register. */
@@ -260,6 +260,39 @@ function describeUnreadable(value: unknown): string {
   return `a ${typeof value}`
 }
 
+/**
+ * o3d-batch-ret ROUND 9 (Codex HIGH) — ABSENCE AND A PRESENT VALUE ARE DIFFERENT FACTS, AND ONLY
+ * ABSENCE MAY CHOOSE A DEFAULT.
+ *
+ * `payload.field === undefined` cannot tell "this payload does not use this mechanism" from "the key
+ * is there and something wrote nothing into it". The first is a legitimate instruction to take the
+ * other path — derive the amount, or treat the adjustment as a real zero. The second is a value at
+ * rest that CANNOT BE READ, which is the exact state `invalid` was built for one round earlier, and
+ * reading it as the first is how a persisted null becomes "nothing owed".
+ *
+ * `Object.hasOwn` is the only thing that separates them, so every optional monetary field asks it
+ * before it looks at what it holds. A key that is present holds SOMETHING — including `null`, and
+ * including an explicit `undefined` — and that something must pass {@link finiteAmount} or the
+ * payload is refused.
+ *
+ * `lines` needs no presence test of its own: absent and present-but-unreadable already take the SAME
+ * arm there (`!Array.isArray(...)` refuses both), so there is no default for absence to select, and
+ * neither can a line's `quantity` or `unitAmount` — an absent one is already `invalid`. The three
+ * fields below are the only ones that had a default for absence to select.
+ */
+function declaresField(payload: Record<string, unknown>, field: string): boolean {
+  return Object.hasOwn(payload, field)
+}
+
+/**
+ * The description of a value the payload DOES state. It differs from {@link describeUnreadable} in
+ * exactly one place, and that place is the finding: a present key holding `undefined` must not be
+ * reported to an operator as "absent", because absent is the one thing it is not.
+ */
+function describePresent(value: unknown): string {
+  return value === undefined ? 'present and holds `undefined`' : describeUnreadable(value)
+}
+
 const NOTHING_OWED: RequestedInvoicePayment = { kind: 'none' }
 
 /** A positive amount is owed; a finite non-positive one is the readable "nothing is owed". */
@@ -269,6 +302,27 @@ function readableAmount(amount: number): RequestedInvoicePayment {
 
 function unreadableAmount(detail: string): RequestedInvoicePayment {
   return { kind: 'invalid', detail }
+}
+
+/** A readable adjustment, or the operator clause saying why it could not be read. */
+type OptionalAdjustment = { readonly amount: number } | { readonly detail: string }
+
+/**
+ * `shippingAmount` and `discountAmount`: ABSENT IS A REAL ZERO, PRESENT-AND-UNREADABLE IS NOT.
+ *
+ * An invoice with no shipping leg carries no `shippingAmount` at all, so absence has to mean zero or
+ * ordinary payloads would be refused. A key that is THERE holding a null, an object, or `"abc"` is a
+ * different fact — something wrote into it and what it wrote cannot be read — and folding that into
+ * the zero silently changes the amount the customer is recorded as having paid, in whichever
+ * direction the missing figure would have moved it.
+ */
+function optionalAdjustment(payload: Record<string, unknown>, field: string): OptionalAdjustment {
+  if (!declaresField(payload, field)) return { amount: 0 }
+  const value = payload[field]
+  const amount = finiteAmount(value)
+  return amount === null
+    ? { detail: `\`${field}\` is ${describePresent(value)}, which is not a finite number` }
+    : { amount }
 }
 
 /**
@@ -285,13 +339,24 @@ function unreadableAmount(detail: string): RequestedInvoicePayment {
  * `Array.isArray(payload.lines) ? ... : []`, which stopped a TypeError from failing an already-posted
  * invoice — and put "there are no lines" and "the lines cannot be read" both at zero, i.e. at
  * settled. The guard stays; its answer changes.
+ *
+ * IT IS MODULE-PRIVATE, AND THAT IS WHAT MAKES THE FOLD MANDATORY (round 9, Codex MEDIUM). The
+ * argument for {@link decideRequestedInvoicePayment} is that a union alone leaves the conflation
+ * available to a caller who wants it, and the fold takes the branch once so nobody can write
+ * `if (r.kind !== 'amount') return FOLLOW_UPS_ENQUEUED` again. That argument only holds while the
+ * fold is the ONLY DOOR: while this function and its result type were exported, a new connector
+ * could import them and write that exact line, and the module API would not have stopped it. So
+ * neither this nor {@link RequestedInvoicePayment} leaves the module — the export list IS the
+ * invariant, not the comment above it. Tests reach the resolver the way production does, by driving
+ * a connector through the fold, and `followup-enqueue-resolver-door.test.ts` fails if the export
+ * comes back.
  */
-export function requestedInvoicePayment(payload: Record<string, unknown>): RequestedInvoicePayment {
-  const declared = payload._paymentAmount
-  if (declared !== null && declared !== undefined) {
+function requestedInvoicePayment(payload: Record<string, unknown>): RequestedInvoicePayment {
+  if (declaresField(payload, '_paymentAmount')) {
+    const declared = payload._paymentAmount
     const amount = finiteAmount(declared)
     return amount === null
-      ? unreadableAmount(`\`_paymentAmount\` is ${describeUnreadable(declared)}, which is not a finite amount`)
+      ? unreadableAmount(`\`_paymentAmount\` is ${describePresent(declared)}, which is not a finite amount`)
       : readableAmount(amount)
   }
 
@@ -319,20 +384,15 @@ export function requestedInvoicePayment(payload: Record<string, unknown>): Reque
     derived += readableQuantity * readableUnitAmount
   }
 
-  // Absent is a real zero for these two — an invoice with no shipping leg carries no
-  // `shippingAmount` at all — but a PRESENT value that cannot be read is not.
-  const shipping = payload.shippingAmount === null || payload.shippingAmount === undefined
-    ? 0 : finiteAmount(payload.shippingAmount)
-  if (shipping === null) {
-    return unreadableAmount(`\`shippingAmount\` is ${describeUnreadable(payload.shippingAmount)}, which is not a finite number`)
-  }
-  const discount = payload.discountAmount === null || payload.discountAmount === undefined
-    ? 0 : finiteAmount(payload.discountAmount)
-  if (discount === null) {
-    return unreadableAmount(`\`discountAmount\` is ${describeUnreadable(payload.discountAmount)}, which is not a finite number`)
-  }
+  // See `optionalAdjustment`: only an ABSENT key selects the zero. Until round 9 both of these read
+  // `=== null || === undefined ? 0`, so a persisted null was spent as a zero and the amount the
+  // customer is recorded as having paid quietly changed by whatever the null was hiding.
+  const shipping = optionalAdjustment(payload, 'shippingAmount')
+  if ('detail' in shipping) return unreadableAmount(shipping.detail)
+  const discount = optionalAdjustment(payload, 'discountAmount')
+  if ('detail' in discount) return unreadableAmount(discount.detail)
 
-  const total = derived + shipping - discount
+  const total = derived + shipping.amount - discount.amount
   // Every part is finite and the sum still need not be. A total that overflowed is not a figure to
   // settle a customer's invoice against, and it is certainly not a zero.
   return Number.isFinite(total)
