@@ -528,8 +528,10 @@ function payloadPaymentMethod(payload: Record<string, unknown>): PayloadField<st
  * its own mapping table does with `''`. This one was a fact about A REMOTE LEDGER, and that is the
  * difference round 11 did not price in.
  *
- * The clause it read is `if (organisation.baseCurrency && organisation.baseCurrency !== imsBase)`,
- * in both `connectXero` and `connectQuickBooks`. It is a TRUTHY-only comparison, and both readers
+ * The clause it read has the same shape in both connectors — `connectXero`'s
+ * `if (organisation.baseCurrency && organisation.baseCurrency !== imsBaseCurrency)` and
+ * `connectQuickBooks`' `if (qboCurrency && qboCurrency !== imsBaseCurrency)`. Each is a TRUTHY-only
+ * comparison, and `fetchOrganisationFacts`/`fetchCompanyInfo` both
  * answer `null` for a base currency they could not obtain — a non-OK response, a body with no
  * organisation in it, a `BaseCurrency`/`HomeCurrency` that is not a currency string. On that path
  * the guard has nothing to compare, so it does not fire, and the binding is stored regardless. A
