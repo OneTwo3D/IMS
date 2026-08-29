@@ -125,7 +125,7 @@ mock.module('@/lib/crontab-reconcile', {
       if (state.cronThrows) throw state.cronThrows
       return state.cronResult
     },
-    readOwnCrontab: async () => '',
+    readOwnCrontabResult: async () => ({ resolved: true, text: '', present: false }),
   },
 })
 

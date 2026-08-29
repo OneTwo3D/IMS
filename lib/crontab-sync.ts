@@ -384,3 +384,57 @@ export function parseOtiCrontabStatus(crontabText: string, currentSecret: string
 
   return { blockPresent, secretMode, embeddedSecretMatches, runtimeEnvPath, managedJobCount, unmanagedCronApiLines }
 }
+
+/**
+ * ONE QUESTION, ONE RULE — STATED TWICE BECAUSE NOTHING CAN SOURCE THE OTHER COPY
+ * (o3d-p9dq, Codex r29 HIGH #1).
+ *
+ * `crontab -l` answers "this user has no crontab" the same way it announces a permission failure,
+ * a wedged spool, an I/O error and an unknown user: exit status 1, empty stdout. The status alone
+ * therefore cannot separate the benign answer from the failures, which is precisely why every
+ * `|| true` and every `err ? '' : stdout` in this repository looked harmless. What separates them
+ * is the DIAGNOSTIC, and the separation was established by running `crontab -l` in each state on
+ * the platforms this ships to (Debian 11/12, Ubuntu 22.04/24.04, Vixie cron); the table and its
+ * provenance are in scripts/lib/crontab-lock.sh above `read_crontab_for`.
+ *
+ * The rule, whole:
+ *
+ *   an absent crontab, and ONLY an absent crontab, exits non-zero with EMPTY stdout and a stderr
+ *   that — with CRs removed, each line trimmed, and one leading `crontab: ` prefix stripped —
+ *   equals `no crontab for <the user asked about>` and equals nothing else.
+ *
+ * Matched WHOLE, never as a substring: a second line, or any trailing text, leaves the read
+ * unresolved rather than being skimmed. Deliberately strict, because the two mistakes do not cost
+ * the same. An unresolved read costs a re-run; an unresolved read mistaken for an empty crontab
+ * costs every unmanaged operator line in the file, spliced away by a write that then reports
+ * success.
+ *
+ * WHY THERE ARE TWO COPIES, AND HOW THEY ARE HELD TOGETHER. The shell rule lives in
+ * `crontab_read_says_no_crontab()` in scripts/lib/crontab-lock.sh, which the application cannot
+ * reach: this module is bundled into a Next.js server build that has no shell, no repository
+ * checkout underneath it, and no way to source a bash function. Extracting the rule to a data file
+ * both could read would not help either — the normalisation IS the rule, and a shared regex string
+ * interpreted once by `sed` and once by RegExp is two rules wearing one coat.
+ *
+ * So the rule is written twice and kept in agreement by EXECUTION, not by comment:
+ * tests/settings/crontab-read-discrimination.test.ts owns ONE table of stderr cases and runs BOTH
+ * implementations over it — this function in-process, and the bash function via `bash -c 'source
+ * scripts/lib/crontab-lock.sh; crontab_read_says_no_crontab …'` — asserting an identical verdict on
+ * every row. Either copy drifting fails that test, and a case added to the table is answered by
+ * both or by neither.
+ */
+export function isNoCrontabDiagnostic(user: string, stderr: string): boolean {
+  if (!user) return false
+  const normalised = stderr
+    .replace(/\r/g, '')
+    .split('\n')
+    // Per line, exactly as `sed` sees it: trim, then strip ONE leading `crontab:` label.
+    .map((line) => line
+      .replace(/^[ \t\v\f]+/, '')
+      .replace(/[ \t\v\f]+$/, '')
+      .replace(/^crontab:[ \t\v\f]*/, ''))
+    .join('\n')
+    // `$(…)` in the shell drops trailing newlines; nothing else about the text is touched.
+    .replace(/\n+$/, '')
+  return normalised === `no crontab for ${user}`
+}

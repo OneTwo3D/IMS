@@ -70,7 +70,10 @@ export default async function SystemSettingsPage({
   // secret (every managed job silently 401s), or unmanaged /api/cron/ lines
   // that will drift outside the app's control.
   const crontabWarnings: string[] = []
-  if (crontabStatus) {
+  if (crontabStatus?.readError) {
+    // An unreadable crontab answers NONE of the drift questions below, so none of them are asked.
+    crontabWarnings.push(`The crontab for the app user (${crontabStatus.osUser}) could not be read, so whether the managed block is present and current is UNKNOWN — this is not a report that it is missing. ${crontabStatus.readError}.`)
+  } else if (crontabStatus) {
     if (!crontabStatus.blockPresent) {
       crontabWarnings.push(`No managed crontab block exists for the app user (${crontabStatus.osUser}) — scheduled jobs are NOT running from these settings. Save the scheduler settings to write it.`)
     } else if (crontabStatus.secretMode === 'embedded' && crontabStatus.embeddedSecretMatches === false) {

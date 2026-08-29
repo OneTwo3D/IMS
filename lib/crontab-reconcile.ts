@@ -12,6 +12,7 @@ import {
   buildOtiCrontabBlock,
   emulateRuntimeSecretExtraction,
   isCronSafePath,
+  isNoCrontabDiagnostic,
   spliceOtiBlock,
   type CrontabSecretRef,
 } from '@/lib/crontab-sync'
@@ -173,8 +174,20 @@ async function applyCrontabFromSettings(
   const block = buildOtiCrontabBlock({ jobs, settings, secretRef: resolveSecretRef(secret), baseUrl, logPath })
   if (!block.ok) return { success: false, error: block.error }
 
-  const existingCrontab = await readOwnCrontab()
-  const newCrontab = spliceOtiBlock(existingCrontab, block.lines)
+  // REFUSE, DO NOT SPLICE INTO A GUESS (o3d-p9dq, Codex r29 HIGH #1). The only reading that lets
+  // this proceed is one that RESOLVED: a crontab that was read, or a crontab that provably is not
+  // there. Anything else stops here, with the crontab untouched — the write is what would have
+  // done the damage, and it is the write that does not happen.
+  const read = await readOwnCrontabResult()
+  if (!read.resolved) {
+    return {
+      success: false,
+      error: `The crontab could not be read, so it was NOT changed: ${read.reason}. `
+        + 'Splicing the managed block into a crontab this process could not read would have '
+        + 'written back only the block, deleting every line the crontab is the sole record of.',
+    }
+  }
+  const newCrontab = spliceOtiBlock(read.text, block.lines)
 
   return writeCrontab(newCrontab, lock.fd)
 }
@@ -228,10 +241,56 @@ function writeCrontab(contents: string, lockFd: number): Promise<{ success: bool
   })
 }
 
-export function readOwnCrontab(): Promise<string> {
-  return new Promise<string>((resolve) => {
-    execFile('crontab', ['-l'], { timeout: 5000 }, (err, stdout) => {
-      resolve(err ? '' : stdout)
+/**
+ * What a `crontab -l` actually established — an ANSWER, or the fact that there was none.
+ *
+ * `present: false` is the genuinely absent crontab, and it is a resolved read: there is nothing
+ * scheduled, and a reconciliation may splice its block into an empty file. `resolved: false` is
+ * every other outcome, and it carries the reason instead of a value, because there is no value it
+ * could carry that would not be a fabrication.
+ */
+export type CrontabReadResult =
+  | { resolved: true; text: string; present: boolean }
+  | { resolved: false; reason: string }
+
+/**
+ * THE APPLICATION'S OWN READ, FAILING CLOSED (o3d-p9dq, Codex r29 HIGH #1).
+ *
+ * This resolved `err ? empty-string : stdout` — every timeout, permission denial, spool I/O error and
+ * failed fork became the empty string. `applyCrontabFromSettings` then spliced the managed block
+ * into that fabricated empty crontab and handed it to `crontab -`, so a read that failed while the
+ * WRITE would have succeeded deleted every unmanaged operator line in the file and reported a
+ * successful reconciliation. That is the identical shape this branch closed in the three shell
+ * entrypoints and in the thirteen `crontab -l` call sites behind them; it had no business
+ * surviving in the TypeScript reader the branch is named after.
+ *
+ * The discrimination is `isNoCrontabDiagnostic` — the SAME rule the shell reader applies, held to
+ * it by an executed cross-check rather than by a comment. Its derivation, why the exit status
+ * alone cannot decide, and why there are two copies at all are documented on that function in
+ * lib/crontab-sync.ts.
+ *
+ * There is no timeout branch to special-case: `execFile` `timeout` kills the child and reports
+ * it as an error like any other, and an error is unresolved.
+ */
+export function readOwnCrontabResult(): Promise<CrontabReadResult> {
+  const user = (() => {
+    try { return os.userInfo().username } catch { return '' }
+  })()
+  return new Promise<CrontabReadResult>((resolve) => {
+    execFile('crontab', ['-l'], { timeout: 5000, encoding: 'utf8' }, (err, stdout, stderr) => {
+      const out = typeof stdout === 'string' ? stdout : String(stdout ?? '')
+      const errText = typeof stderr === 'string' ? stderr : String(stderr ?? '')
+      if (!err) return resolve({ resolved: true, text: out, present: true })
+      // Non-zero AND empty stdout AND the one benign diagnostic, whole — all three, or nothing.
+      if (out === '' && user && isNoCrontabDiagnostic(user, errText)) {
+        return resolve({ resolved: true, text: '', present: false })
+      }
+      const said = errText.trim() || 'nothing at all'
+      resolve({
+        resolved: false,
+        reason: `\`crontab -l\` failed and did not answer that ${user || 'this user'} has no crontab`
+          + ` — it said: ${said}. An unreadable crontab is not an empty one`,
+      })
     })
   })
 }

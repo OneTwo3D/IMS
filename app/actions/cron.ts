@@ -11,7 +11,7 @@ import {
   parseOtiCrontabStatus,
   type OtiCrontabStatus,
 } from '@/lib/crontab-sync'
-import { reconcileCrontab, readOwnCrontab } from '@/lib/crontab-reconcile'
+import { reconcileCrontab, readOwnCrontabResult } from '@/lib/crontab-reconcile'
 // The BARREL, not @/lib/cron-registry: registration is an import side effect of the job modules,
 // so the registry is EMPTY unless something has imported them. Reading it bare would have mirrored
 // no legacy key and reported nothing.
@@ -133,6 +133,14 @@ export type CrontabDriftStatus = OtiCrontabStatus & {
   osUser: string
   /** Runtime-env mode only: does the .env pipeline still yield the ACTIVE secret? null otherwise. */
   runtimeSecretMatches: boolean | null
+  /**
+   * THE READ ITSELF DID NOT RESOLVE (o3d-p9dq, Codex r29 HIGH #1). Non-null means every other
+   * field below it describes an EMPTY STRING this process invented, not the crontab: `blockPresent`
+   * is false because nothing was read, not because nothing is there. The caller must render this
+   * instead of the drift warnings, or it tells the operator their managed block is missing — and
+   * sends them to press the one button that used to overwrite the crontab it could not read.
+   */
+  readError: string | null
 }
 
 /**
@@ -143,8 +151,18 @@ export type CrontabDriftStatus = OtiCrontabStatus & {
  */
 export async function getCrontabStatus(): Promise<CrontabDriftStatus> {
   await requirePermission('settings.company')
-  const [crontabText, secret] = await Promise.all([readOwnCrontab(), getCronSecret()])
-  const status = parseOtiCrontabStatus(crontabText, secret)
+  const [read, secret] = await Promise.all([readOwnCrontabResult(), getCronSecret()])
+  if (!read.resolved) {
+    // Report the unanswered question as unanswered. Everything a drift panel would say about a
+    // crontab nobody read is a guess, and the guess this used to make was the alarming one.
+    return {
+      ...parseOtiCrontabStatus('', secret),
+      osUser: os.userInfo().username,
+      runtimeSecretMatches: null,
+      readError: read.reason,
+    }
+  }
+  const status = parseOtiCrontabStatus(read.text, secret)
 
   // Runtime-env blocks can drift too (Codex): an edited-but-not-restarted .env
   // or a service-manager override makes the pipeline yield a value the app no
@@ -167,5 +185,6 @@ export async function getCrontabStatus(): Promise<CrontabDriftStatus> {
     ...status,
     osUser: os.userInfo().username,
     runtimeSecretMatches,
+    readError: null,
   }
 }
