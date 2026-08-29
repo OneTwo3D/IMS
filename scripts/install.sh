@@ -732,6 +732,38 @@ DB_ENV_SNAPSHOT_DIR="/etc/ims-cutover"
 DB_ENV_SNAPSHOT_FILE="${DB_ENV_SNAPSHOT_DIR}/db-identity-snapshot.env"
 DB_ENV_SNAPSHOT_DROPIN_NAME="zz-deploy-db-identity.conf"
 DB_ENV_SNAPSHOT_DROPIN_FILE="${FENCE_DROPIN_DIR}/${DB_ENV_SNAPSHOT_DROPIN_NAME}"
+# THE ROUTE GUARANTEE'S DROP-IN (o3d-2sm1.5 r45, Codex HIGH).
+#
+# The identity snapshot above binds WHICH DATABASE the service connects to. This one binds HOW it
+# gets there, and it is a different KIND of instrument: the snapshot is a value this run publishes
+# and the service reads, whereas this states a PROPERTY systemd itself enforces —
+#
+#     UnsetEnvironment=PGSSLMODE PGREPLICATION NODE_PG_FORCE_NATIVE
+#
+# — which systemd.exec(5) applies "as the final step ... immediately before it is passed to the
+# executed process", after every one of the six sources it lists (DefaultEnvironment=,
+# systemctl set-environment, the manager's own block, Environment=, EnvironmentFile= and PAM).
+#
+# THAT IS WHY IT REPLACES THE SURVEY r44 SHIPPED. r44 answered "is any of these three set?" by
+# reading the unit's properties and OPENING its environment files. Two things were wrong with
+# that and both are the same mistake. An EnvironmentFile= may be a WILDCARD — systemd.exec
+# documents the path as one — and `[[ -e "/etc/ims/*.env" ]]` is false for a glob that matches
+# files; so a file that sets PGSSLMODE read as absent. And even a literal path was a POINT-IN-TIME
+# read: systemd opens it at exec, minutes later, at the far end of a build and a migration, and
+# a line added in that window changes the route after the gate has passed. A directive removes
+# the variable whatever set it and whenever it was set, so neither question needs asking.
+#
+# `zz-` SO IT SORTS LAST. systemd applies drop-ins in lexicographic order and an EMPTY
+# `UnsetEnvironment=` RESETS the list; a later drop-in could therefore undo this one. The name
+# puts it after anything a person is likely to write — and the point is not the name anyway: the
+# directive is VERIFIED on the bus, on the COMPOSED unit, after the last daemon-reload, so a
+# drop-in that did reset the list is a refusal rather than a silent hole.
+#
+# IT IS PERMANENT, unlike the identity snapshot. The snapshot pins ONE run's database and is
+# removed again before this script exits; there is no run in which the application is supposed to
+# take its transport from an ambient variable, so this stays on the host.
+DB_ROUTE_DROPIN_NAME="zz-deploy-db-route.conf"
+DB_ROUTE_DROPIN_FILE="${FENCE_DROPIN_DIR}/${DB_ROUTE_DROPIN_NAME}"
 # ONE lock for all three entrypoints. deploy.sh and update.sh each held their own and this
 # script took none at all, so an install could run straight through another cutover.
 LOCK_FILE="${CUTOVER_STATE_DIR}/cutover.lock"
@@ -981,6 +1013,12 @@ pg_local_psql() {
 # neither strips it nor mistakes it for a libpq setting. The functions that pin it set it inside a
 # SUBSHELL, which is what keeps a `VAR=x function` prefix's well-known persistence out of this.
 DB_ENDPOINT_ROUTE_SSLMODE=""
+# AND THE TRUST ROOT THE STRICTER MODES VERIFY AGAINST (r45). `verify-ca` and `verify-full` are
+# not a route on their own: libpq reads the CA from ~/.postgresql/root.crt when nothing names one,
+# and the probes run as the `postgres` OS user, whose home is not the operator's. So the CA travels
+# with the mode, from the same DB_SSLROOTCERT that went into the URL — which is what makes the
+# psql and the application verify against the same file rather than against two default stores.
+DB_ENDPOINT_ROUTE_SSLROOTCERT=""
 
 # A connection opened the way the APPLICATION opens its own: TCP, to the four values
 # DATABASE_URL is composed from. Used only to read a server identity back — and, with the route
@@ -1004,6 +1042,7 @@ pg_endpoint_psql() {
   # refusal message, which is how this landed the first time.
   if [[ -n "${DB_ENDPOINT_ROUTE_SSLMODE:-}" ]]; then
     route=("PGSSLMODE=${DB_ENDPOINT_ROUTE_SSLMODE}" "PGGSSENCMODE=disable")
+    [[ -z "${DB_ENDPOINT_ROUTE_SSLROOTCERT:-}" ]] || route+=("PGSSLROOTCERT=${DB_ENDPOINT_ROUTE_SSLROOTCERT}")
   fi
   # THE ONE VARIABLE THIS CONNECTION SUPPLIES ITSELF IS KEPT OUT OF THE UNSET LIST, and then
   # EXPORTED rather than passed to `env` as an argument. `env PGPASSWORD=... psql` would put the
@@ -1124,15 +1163,78 @@ url_decode_userinfo() {
   printf '%b' "${escaped}"
 }
 
+# THE TRANSPORT, AS A DEPLOYMENT INPUT (o3d-2sm1.5 r45, Codex MEDIUM).
+#
+# THE FINDING. r44 refused every PGSSLMODE from every source and emitted a URL with no TLS
+# configuration in it. The installer documents external PostgreSQL as supported, and a great many
+# external clusters — every managed one — accept nothing but TLS. So the refusal made a documented
+# deployment impossible and its remediation ("remove PGSSLMODE") either left the application
+# unable to connect or asked an operator to give up a required trust boundary.
+#
+# THE REFUSAL WAS RIGHT ABOUT THE MECHANISM AND WRONG ABOUT THE WAY OUT. An AMBIENT PGSSLMODE is
+# still refused, for exactly the reason r44 gave: it moves the application onto a `hostssl` record
+# while the gate reads, probes and rotates against `hostnossl`, and it is invisible in the URL
+# this run publishes. What r44 was missing is a SUPPORTED spelling — a place to state the
+# transport where the gate can see it, and where the probes can be put on it. That place is the
+# URL, and it is stated here.
+#
+# AND THE SEMANTICS ARE THE DRIVER'S OWN, NOT A MAPPING THIS SCRIPT INVENTS. That was the whole
+# objection to deriving a route: node-postgres's `sslmode=` is NOT libpq's, so no psql pin
+# reproduces it. Measured against the installed pg-connection-string (2.12.0,
+# `node_modules/pg-connection-string/index.js:99-151`), the driver has TWO switch statements over
+# `sslmode` and picks between them on ONE query parameter:
+#
+#   without `uselibpqcompat`   `require` falls through to the default branch, leaving `ssl = {}` —
+#                              Node's `rejectUnauthorized: true` against Node's own CA bundle,
+#                              i.e. verify-full. That is the spelling r43 measured and refused.
+#   with `uselibpqcompat=true` `disable` -> ssl false; `prefer`/`require` -> rejectUnauthorized
+#                              false; `require` WITH an sslrootcert -> CA checked, hostname not;
+#                              `verify-ca` -> CA checked, hostname not; `verify-full` -> both.
+#                              Those are libpq's five, and the driver says so in its own comments.
+#
+# So the emitted URL carries `uselibpqcompat=true` beside `sslmode=`, and from that point on the
+# application's driver, the `psql` probes and the authentication-request reader are all describing
+# the same thing with the same word. The mapping is not reproduced here; it is SELECTED, by the
+# switch the driver ships for exactly this purpose.
+#
+# WHAT IS SUPPORTED, AND WHY NOT MORE. `disable` (the default, and what every installation before
+# this round emitted), `require`, `verify-ca` and `verify-full`. `prefer` is deliberately absent:
+# it picks its transport at RUN TIME, so an authentication FAILURE can fall onto a second pg_hba
+# record — the divergence this whole section exists to close.
+DB_SSLMODE="disable"
+DB_SSLROOTCERT=""
+
+db_sslmode_is_supported() {
+  case "${1:-}" in
+    disable|require|verify-ca|verify-full) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# The query string the modes above put on the URL, or nothing at all for `disable`.
+#
+# NOTHING IS PERCENT-ENCODED HERE AND NOTHING NEEDS TO BE. The mode is one of four literal words
+# and the CA path is validated (below) down to a character set that is unreserved in a URL query,
+# so there is no value in this string that could carry a `&`, a `?` or a space into it. That is a
+# validation rather than an escape on purpose: an escape that is right for `new URL()` and wrong
+# for libpq's own parser would be one more reimplementation of somebody else's rules, and the
+# emitted URL is read by three of them.
+db_url_route_query() {
+  [[ "${DB_SSLMODE}" != "disable" ]] || return 0
+  printf '?sslmode=%s&uselibpqcompat=true' "${DB_SSLMODE}"
+  [[ -z "${DB_SSLROOTCERT}" ]] || printf '&sslrootcert=%s' "${DB_SSLROOTCERT}"
+}
+
 # THE ONE PLACE A DATABASE_URL IS COMPOSED. Both writers — the pre-stop classification and the
 # rotation inside the fenced window — go through here, so the encoding cannot be right in one and
 # missing in the other, which is the shape the r38 defect took.
 compose_database_url() {
   local user="$1" password="$2" host="$3" port="$4" database="$5"
-  printf 'postgresql://%s:%s@%s:%s/%s' \
+  printf 'postgresql://%s:%s@%s:%s/%s%s' \
     "$(url_encode_userinfo "${user}")" \
     "$(url_encode_userinfo "${password}")" \
-    "${host}" "${port}" "${database}"
+    "${host}" "${port}" "${database}" \
+    "$(db_url_route_query)"
 }
 
 # THE ROUTE THE APPLICATION TAKES, AS THE libpq SETTING THAT REPRODUCES IT (o3d-2sm1.5 r43,
@@ -1202,15 +1304,30 @@ compose_database_url() {
 # The rest are read AFTER the record has been matched and move nothing: PGOPTIONS, PGAPPNAME,
 # PGBINARY, PGCLIENT_ENCODING, PGCONNECT_TIMEOUT. They are named here and deliberately not refused.
 #
-# AND THE ANSWER IS REFUSE RATHER THAN DERIVE. Deriving would mean reproducing node-postgres's TLS
-# semantics for every value of every variable above — and they are not libpq's, so there is no
-# psql `sslmode=` that reproduces `require`'s verify-full-against-the-system-store, which is the
-# same wall r43 hit when it refused to emit `?sslmode=require`. A value missed in that mapping is
-# this finding again. Refusing costs an operator one line to delete on a host that has configured
-# a transport this installer's URL does not state; it is this branch's standing answer for an
-# unknown, and it is what the two call sites below take.
+# AND THE ANSWER IS STILL REFUSE RATHER THAN DERIVE — BUT THE REFUSAL NOW HAS A WAY OUT (r45,
+# Codex MEDIUM). Deriving would mean reproducing node-postgres's TLS semantics for every value of
+# every variable above, and r43 and r44 were right that this script cannot: the driver's `require`
+# is not libpq's. What r44 got wrong was concluding that an operator who NEEDS a transport
+# therefore has nothing to do but delete a line. There is something to do, and it is one line in
+# the other direction: DB_SSLMODE=. Stating the transport there puts it in the URL, where the
+# derivation reads it and every probe is pinned to it, under `uselibpqcompat=true` so the word
+# means the same thing to all three clients — see compose_database_url() above. So an AMBIENT
+# value is refused (it is invisible to the URL and therefore to the probes) and a STATED one is
+# supported, and the refusal below says which is which.
 db_route_env_variables() {
   printf '%s\n' PGSSLMODE PGREPLICATION NODE_PG_FORCE_NATIVE
+}
+
+# THE SUPPORTED SPELLING OF THE SAME INTENT, where there is one (r45). PGSSLMODE has one —
+# DB_SSLMODE puts the transport in the URL, where the derivation reads it and every probe is
+# pinned to it. The other two have none, and saying so is the point: a WAL-sender backend and a
+# libpq-instead-of-node-postgres swap are not deployment options this installer offers, so a
+# refusal that offered a way out would be inventing one.
+db_route_env_alternative() {
+  case "${1}" in
+    PGSSLMODE) printf ' — and if this deployment NEEDS an encrypted transport, state it as DB_SSLMODE=require (or verify-ca / verify-full with DB_SSLROOTCERT=) instead of exporting a variable: that puts it in the DATABASE_URL this run publishes, where the authentication-request reader and every credential probe are pinned to it' ;;
+    *) printf '' ;;
+  esac
 }
 
 # What each one does to the record, in the words the refusal prints.
@@ -1223,65 +1340,248 @@ db_route_env_effect() {
   esac
 }
 
-# THE THREE PLACES THE APPLICATION'S DRIVER CAN ACQUIRE ONE, ALL READ.
+# WHERE ONE CAN COME FROM, AND WHICH OF THOSE PLACES CAN BE CLOSED RATHER THAN SURVEYED
+# (o3d-2sm1.5 r45, Codex HIGH).
 #
-# THE REASON COMES OUT ON STDOUT and not in a global, because every consumer of the route reads it
-# through `$( )` and a global set inside a command substitution does not survive the subshell.
-# That is how a refusal comes to be silently generic, and this branch has shipped that once.
+# r44 read THREE sources and called an absence in all three a proof: this process's environment,
+# the service manager's own block, and the unit — the unit's Environment=, PassEnvironment=,
+# UnsetEnvironment=, PAMName= and every EnvironmentFile=, which it OPENED and grepped. Two of the
+# three were surveys of MUTABLE state, and a survey answers about the moment it ran:
 #
-# NOTHING HERE WRITES ANYTHING: three environment reads, one `systemctl show-environment`, and the
-# unit scan, which is `busctl get-property` and a `grep` of files the unit already names.
-db_application_route_env_refusal() {
-  local name manager_env=""
-  if command -v systemctl >/dev/null 2>&1; then
-    manager_env="$(systemctl show-environment 2>/dev/null || true)"
+#   * an `EnvironmentFile=` may be a WILDCARD. systemd.exec(5) documents the path as one, and
+#     `[[ -e "/etc/ims/*.env" ]]` is false for a glob no matter how many files it matches. A file
+#     that set PGSSLMODE was read as absent.
+#   * and a LITERAL path was read HERE while systemd opens it THERE — at exec, past a git clone,
+#     an npm install, a Next build and a migration. A line added in that window moved the route
+#     after the gate had passed.
+#
+# SO THE TWO SOURCES SYSTEMD OWNS ARE NO LONGER SURVEYED. They are CLOSED, by a directive systemd
+# applies to every one of them (see DB_ROUTE_DROPIN_FILE and publish_db_route_guarantee):
+#
+#     UnsetEnvironment=PGSSLMODE PGREPLICATION NODE_PG_FORCE_NATIVE
+#
+# systemd.exec(5) is explicit about when that runs — "as the final step all variables listed in
+# UnsetEnvironment= are removed from the compiled environment variable list, immediately before it
+# is passed to the executed process" — and the list it is final over is the same six-item list
+# that names DefaultEnvironment=, `systemctl set-environment`, the manager's block, Environment=,
+# EnvironmentFile= and PAM. Wildcards, files written after this line ran, a PAM stack, a drop-in
+# from another tool: none of them survive it, and none of them has to be looked at.
+#
+# WHAT IS LEFT IS A PROPERTY, AND IT IS VERIFIED ON THE COMPOSED UNIT — on the bus, after the last
+# daemon-reload, immediately before the start. An empty `UnsetEnvironment=` in a later drop-in
+# RESETS the list, so the directive is not trusted because it was written; it is trusted because
+# systemd states it back.
+#
+# THE ONE SOURCE THAT CANNOT BE CLOSED THIS WAY IS THIS PROCESS. The migration, the build and
+# scripts/fence-db-connections.mjs are node processes THIS script starts, running the
+# application's own driver and inheriting this environment verbatim. No unit directive reaches
+# them, so an exported PGSSLMODE here is still a refusal — and now one with somewhere to go:
+# DB_SSLMODE= states the same intent where the whole gate can act on it.
+ENV_ROUTE_GUARANTEE_REASON=""
+
+# THE UNIT OBJECT ON THE BUS, or a sentence saying why there isn't one. Lifted out of
+# unit_env_var_sole_source() at r45 because two more callers needed the same six lines, and a
+# second copy of "how do I address a unit" is a second place for it to be got wrong.
+BUS_UNIT_OBJECT=""
+bus_unit_object() {
+  local unit="${1:-}" rendering load_state
+  BUS_UNIT_OBJECT=""
+  ENV_ROUTE_GUARANTEE_REASON=""
+  if ! command -v busctl >/dev/null 2>&1; then
+    ENV_ROUTE_GUARANTEE_REASON="busctl — systemd's own bus client, shipped beside systemctl — is not available, so ${unit}'s composed configuration cannot be read"
+    return 1
   fi
+  rendering="$(busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager LoadUnit s "$unit" 2>/dev/null)" || rendering=''
+  if ! bus_read_strings "$rendering" || [[ "${#BUS_STRINGS[@]}" -ne 1 || -z "${BUS_STRINGS[0]}" ]]; then
+    ENV_ROUTE_GUARANTEE_REASON="systemd would not say where ${unit} lives on its bus, so its composed configuration cannot be read"
+    return 1
+  fi
+  BUS_UNIT_OBJECT="${BUS_STRINGS[0]}"
+  rendering="$(bus_unit_property "$BUS_UNIT_OBJECT" Unit LoadState)" || rendering=''
+  if ! bus_read_strings "$rendering" || [[ "${#BUS_STRINGS[@]}" -ne 1 ]]; then
+    ENV_ROUTE_GUARANTEE_REASON="systemd would not answer for ${unit}'s LoadState, so its composed configuration cannot be read"
+    return 1
+  fi
+  load_state="${BUS_STRINGS[0]}"
+  if [[ "$load_state" != "loaded" ]]; then
+    ENV_ROUTE_GUARANTEE_REASON="systemd reports ${unit} as '${load_state:-unknown}' rather than loaded, so its composed configuration cannot be read"
+    return 1
+  fi
+  return 0
+}
+
+# IS THE ROUTE GUARANTEE IN THE UNIT SYSTEMD HAS LOADED?
+#
+# Every route variable must appear in the composed UnsetEnvironment= as a BARE NAME. The
+# assignment form is NOT accepted and the difference is the whole of the r21 finding read the
+# other way round: systemd.exec takes "a space-separated list of variable names or variable
+# assignments", and an assignment removes ONLY that exact pair — `UnsetEnvironment=PGSSLMODE=require`
+# leaves `PGSSLMODE=no-verify` standing. A bare name removes the variable whatever its value.
+unit_route_env_guaranteed() {
+  local unit="${1:-}" rendering count name element found
+  bus_unit_object "$unit" || return 1
+  rendering="$(bus_unit_property "$BUS_UNIT_OBJECT" Service UnsetEnvironment)" || rendering=''
+  if ! count="$(bus_array_count "$rendering" 'as')" || ! bus_read_strings "$rendering" \
+    || [[ "${#BUS_STRINGS[@]}" -ne "$count" ]]; then
+    ENV_ROUTE_GUARANTEE_REASON="systemd would not answer readably for ${unit}'s UnsetEnvironment=, so whether the transport variables are removed from the service's environment at exec is unknown"
+    return 1
+  fi
+  local -a unset_names=()
+  unset_names=(${BUS_STRINGS[@]+"${BUS_STRINGS[@]}"})
   while IFS= read -r name; do
-    # 1. THIS PROCESS. Not a proxy for the service's environment — a source in its own right. The
-    #    MIGRATION, the BUILD and scripts/fence-db-connections.mjs are node processes this script
-    #    starts, they run the application's own driver, and they inherit this environment verbatim.
-    if [[ -n "${!name+is-set}" ]]; then
-      printf 'this installer is running with %s=%s in its own environment, and %s. The migration, the build and the connection fence are started from here and inherit it, so the connection this gate vouches for is not the one it observed. Unset %s and re-run' \
-        "${name}" "${!name}" "$(db_route_env_effect "${name}")" "${name}"
-      return 1
-    fi
-    # 2. THE SERVICE MANAGER'S OWN ENVIRONMENT BLOCK, which systemd passes to EVERY service it
-    #    starts and which appears in NO unit property — DefaultEnvironment= in system.conf plus
-    #    whatever `systemctl set-environment` has been told. The unit scan below cannot see it, and
-    #    this branch's own doctrine is that a source you cannot see is the one that gets you: the
-    #    same sentence r28 wrote about EnvironmentFile= being read at fork and never published.
-    if printf '%s\n' "${manager_env}" | grep -q "^${name}="; then
-      printf 'the systemd manager passes %s to every service it starts — systemctl show-environment names it — and %s. The application would take that route while this gate observed another. Clear it with systemctl unset-environment %s, or remove it from DefaultEnvironment= in the manager configuration, and re-run' \
-        "${name}" "$(db_route_env_effect "${name}")" "${name}"
-      return 1
-    fi
-    # 3. THE UNIT, THROUGH THE READER THIS BRANCH ALREADY BUILT. unit_env_var_sole_source() is the
-    #    one place that knows what a systemd environment is composed of — Environment=,
-    #    PassEnvironment=, UnsetEnvironment=, every EnvironmentFile= and PAMName= — and writing a
-    #    second reader for PGSSLMODE beside it is precisely the shape of the finding this answers.
-    #    The `none` layer is what this question needs: for DATABASE_URL an environment file is the
-    #    PERMITTED source, and here there is no permitted source at all.
-    if ! unit_env_var_sole_source "${name}" none "" "${APP_NAME}.service"; then
-      printf '%s, and %s' "${ENV_VAR_SOURCE_REASON}" "$(db_route_env_effect "${name}")"
+    found=false
+    for element in ${unset_names[@]+"${unset_names[@]}"}; do
+      [[ "$element" == "$name" ]] || continue
+      found=true
+      break
+    done
+    if ! $found; then
+      ENV_ROUTE_GUARANTEE_REASON="${unit}'s loaded configuration does not list ${name} as a bare name in UnsetEnvironment= (systemd composes it as: ${unset_names[*]:-nothing at all}), so systemd does not remove it from the service's environment at exec — and ${name} reaching the application means %s. The ${DB_ROUTE_DROPIN_NAME} drop-in this installer writes states exactly that directive; a later drop-in whose own UnsetEnvironment= is EMPTY resets the list and is the usual cause"
+      printf -v ENV_ROUTE_GUARANTEE_REASON "$ENV_ROUTE_GUARANTEE_REASON" "$(db_route_env_effect "${name}")"
       return 1
     fi
   done < <(db_route_env_variables)
   return 0
 }
 
+# THE COMPOSED ExecStart, WHICH IS THE ONE LAYER UnsetEnvironment= CANNOT REACH (r45, Codex HIGH).
+#
+# UnsetEnvironment= is final over the environment systemd COMPOSES. It is not final over what the
+# launched program does to its own environment afterwards, and
+#
+#     ExecStart=/usr/bin/env PGSSLMODE=no-verify /opt/app/node_modules/.bin/next start -p 3000
+#
+# is a drop-in that sets the variable AFTER systemd has finished — inside the process, one exec
+# later. It appears in no Environment=, no PassEnvironment=, no UnsetEnvironment= and no
+# EnvironmentFile=, it survives a rewrite of the base unit, and it puts the application on the
+# `hostssl` record this run never authenticated against. The file already admitted this blind spot
+# for DATABASE_URL and left it open; here it is closed, and it is closed the only way an
+# unbounded question ever gets closed on this branch — by asking a BOUNDED one instead.
+#
+# THE BOUNDED QUESTION IS NOT "does this ExecStart set a variable?" (that means reading programs)
+# BUT "is this the ExecStart this installer wrote?". The unit is written by this script a few
+# lines above the start, so the expected command is not inferred from anything: it is the same
+# five strings the here-doc emitted. Anything else — a wrapper, an override, a second command, a
+# path systemd had to escape to state — is a refusal that prints both.
+#
+# systemd renders ExecStart as `a(sasbttttuii)`: for each command a path, an argv ARRAY, an
+# ignore-failure boolean and seven counters. bus_read_strings() returns the path followed by the
+# argv, in order, and bus_array_count() gives systemd's own count of COMMANDS — so "exactly one,
+# and it is this one" is answered from the data structure and not from where a space falls.
+UNIT_EXECSTART_REASON=""
+unit_execstart_is_exactly() {
+  local unit="${1:-}"; shift
+  local -a expected=("$@")
+  local rendering count index
+  UNIT_EXECSTART_REASON=""
+  if ! bus_unit_object "$unit"; then
+    UNIT_EXECSTART_REASON="$ENV_ROUTE_GUARANTEE_REASON"
+    return 1
+  fi
+  rendering="$(bus_unit_property "$BUS_UNIT_OBJECT" Service ExecStart)" || rendering=''
+  if ! count="$(bus_array_count "$rendering" 'a(sasbttttuii)')" || ! bus_read_strings "$rendering"; then
+    UNIT_EXECSTART_REASON="systemd would not answer readably for ${unit}'s ExecStart=, so what the service is about to run — and therefore whether anything wraps it — is unknown"
+    return 1
+  fi
+  if [[ "$count" -ne 1 ]]; then
+    UNIT_EXECSTART_REASON="${unit} is composed with ${count} ExecStart= commands and this installer writes exactly one. A second command is a program this run has not read, and a program can set any environment variable it likes after systemd has finished composing one — including the transport variables. Remove the drop-in that adds it"
+    return 1
+  fi
+  if [[ "${#BUS_STRINGS[@]}" -ne "${#expected[@]}" ]]; then
+    UNIT_EXECSTART_REASON="${unit} is composed with ExecStart=${BUS_STRINGS[*]:-nothing at all}, and this installer wrote ExecStart=${expected[*]}. A different command line is a program this run has not read — the shape that matters is a wrapper such as \`/usr/bin/env PGSSLMODE=no-verify …\`, which sets the transport INSIDE the launched process, where no systemd property and no UnsetEnvironment= can reach it. Remove the drop-in that overrides ExecStart=, or re-run the installer"
+    return 1
+  fi
+  for (( index = 0; index < ${#expected[@]}; index++ )); do
+    [[ "${BUS_STRINGS[index]}" == "${expected[index]}" ]] && continue
+    UNIT_EXECSTART_REASON="${unit} is composed with ExecStart=${BUS_STRINGS[*]}, and this installer wrote ExecStart=${expected[*]} (they differ at element $((index + 1))). A different command line is a program this run has not read — the shape that matters is a wrapper such as \`/usr/bin/env PGSSLMODE=no-verify …\`, which sets the transport INSIDE the launched process, where no systemd property and no UnsetEnvironment= can reach it. Remove the drop-in that overrides ExecStart=, or re-run the installer"
+    return 1
+  done
+  return 0
+}
+
+# The five strings the unit's own here-doc emits, in the order systemd states them back: the
+# binary, then argv. Written once and read by both the writer and the check, so a change to one
+# is a change to the other.
+db_service_execstart_expected() {
+  printf '%s\n' "${APP_DIR}/node_modules/.bin/next" "${APP_DIR}/node_modules/.bin/next" start -p "${APP_PORT}"
+}
+
+# THE REASON COMES OUT ON STDOUT and not in a global, because every consumer of the route reads it
+# through `$( )` and a global set inside a command substitution does not survive the subshell.
+# That is how a refusal comes to be silently generic, and this branch has shipped that once.
+#
+# TWO MOMENTS, AND THEY ASK DIFFERENT QUESTIONS (r45).
+#
+#   installer  the reconciliation and the rotation. What matters here is the connection THIS
+#              SCRIPT's own node processes make, because they are the ones the gate observes on.
+#              The service's future environment is not surveyed at all any more: it is closed by
+#              the directive, which is installed and verified before anything starts.
+#   service    the start. The installer's own environment still matters — it is the same refusal —
+#              and on top of it systemd must STATE that it removes the three at exec, and the
+#              composed ExecStart must be the one this run wrote.
+#
+# NOTHING HERE WRITES ANYTHING: three environment reads and, in `service` mode, two `busctl`
+# get-property calls.
+db_application_route_env_refusal() {
+  local mode="${1:-installer}" name
+  while IFS= read -r name; do
+    # THIS PROCESS. Not a proxy for the service's environment — a source in its own right, and the
+    # one source no unit directive can close. The MIGRATION, the BUILD and
+    # scripts/fence-db-connections.mjs are node processes this script starts, they run the
+    # application's own driver, and they inherit this environment verbatim.
+    if [[ -n "${!name+is-set}" ]]; then
+      printf 'this installer is running with %s=%s in its own environment, and %s. The migration, the build and the connection fence are started from here and inherit it, so the connection this gate vouches for is not the one it observed. Unset %s and re-run%s' \
+        "${name}" "${!name}" "$(db_route_env_effect "${name}")" "${name}" "$(db_route_env_alternative "${name}")"
+      return 1
+    fi
+  done < <(db_route_env_variables)
+  [[ "${mode}" == "service" ]] || return 0
+  if ! unit_route_env_guaranteed "${APP_NAME}.service"; then
+    printf '%s' "${ENV_ROUTE_GUARANTEE_REASON}"
+    return 1
+  fi
+  local -a expected_execstart=()
+  mapfile -t expected_execstart < <(db_service_execstart_expected)
+  if ! unit_execstart_is_exactly "${APP_NAME}.service" ${expected_execstart[@]+"${expected_execstart[@]}"}; then
+    printf '%s' "${UNIT_EXECSTART_REASON}"
+    return 1
+  fi
+  return 0
+}
+
+# THE ROUTE, AS THE libpq `sslmode=` EVERY PROBE IS PINNED TO.
+#
+# It is DB_SSLMODE, checked back against the URL this run would actually publish rather than
+# asserted from the variable: if a later round ever changes what compose_database_url() puts on
+# the end, this stops answering instead of answering the old answer. The three words it can return
+# are libpq's own AND — because the emitted URL carries `uselibpqcompat=true` — node-postgres's
+# own, which is what makes a psql pinned to them the same transport decision the application makes.
 db_application_route_sslmode() {
-  local url reason
-  # THE ENVIRONMENT FIRST, because it is the half r43 did not look at and the half that decides.
-  if ! reason="$(db_application_route_env_refusal)"; then
+  local url reason expected_query
+  # THE ENVIRONMENT FIRST, because an ambient value is invisible in the URL and beats it.
+  if ! reason="$(db_application_route_env_refusal installer)"; then
     printf '%s' "${reason}"
+    return 1
+  fi
+  if ! db_sslmode_is_supported "${DB_SSLMODE}"; then
+    printf 'DB_SSLMODE is %s, and the transports this installer can put every probe on are disable, require, verify-ca and verify-full' "$(printf '%q' "${DB_SSLMODE}")"
     return 1
   fi
   url="$(compose_database_url "${DB_USER}" "irrelevant" "${DB_HOST}" "${DB_PORT}" "${DB_NAME}")"
   case "${url}" in
-    *\?*) printf 'the DATABASE_URL this run would publish carries a query string, and a query string is what gives node-postgres an ssl setting of its own — so the URL is not of the shape the driver was measured against and the route it would take is unknown'; return 1 ;;
-    postgresql://*) printf 'disable' ;;
+    postgresql://*) ;;
     *) printf 'the DATABASE_URL this run would publish is not a postgresql:// URL, so what node-postgres does with it has not been measured'; return 1 ;;
   esac
+  expected_query="$(db_url_route_query)"
+  if [[ -z "${expected_query}" ]]; then
+    case "${url}" in
+      *\?*) printf 'the DATABASE_URL this run would publish carries a query string this run did not compose, and a query string is what gives node-postgres an ssl setting of its own — so the URL is not of the shape the driver was measured against and the route it would take is unknown'; return 1 ;;
+    esac
+  elif [[ "${url}" != *"${expected_query}" ]]; then
+    printf 'the DATABASE_URL this run would publish does not end in the transport query string DB_SSLMODE=%s composes (%s), so what node-postgres does with it has not been measured' "${DB_SSLMODE}" "${expected_query}"
+    return 1
+  fi
+  printf '%s' "${DB_SSLMODE}"
 }
 
 # WHAT "THE SAME SERVER" MEANS HERE, IN ONE PLACE, READ BY BOTH CONNECTIONS.
@@ -2370,6 +2670,7 @@ db_endpoint_accepts_password() {
   [[ -n "${DB_PROBE_SSLMODE}" && "${DB_PROBE_ROUTE_DATABASE}" == "${database}" ]] || return 1
   (
     DB_ENDPOINT_ROUTE_SSLMODE="${DB_PROBE_SSLMODE}"
+    DB_ENDPOINT_ROUTE_SSLROOTCERT="${DB_SSLROOTCERT}"
     pg_endpoint_psql "${DB_USER}" "${password}" "${database}" -tAc 'SELECT 1'
   ) >/dev/null 2>&1
 }
@@ -2442,9 +2743,16 @@ db_endpoint_checks_role_verifier() {
   fi
   # The reader's own answer, whatever it is, on stdout. Its EXIT STATUS is the verdict; the
   # `method=` and `detail=` lines are what the refusal quotes back to the operator.
-  capture verdict node "${probe}" \
-    --host="${DB_HOST}" --port="${DB_PORT}" --user="${DB_USER}" --database="${database}" \
-    --sslmode="${route}" || status=$?
+  local -a probe_args=(
+    "--host=${DB_HOST}" "--port=${DB_PORT}" "--user=${DB_USER}" "--database=${database}"
+    "--sslmode=${route}"
+  )
+  # THE SAME FILE THE APPLICATION VERIFIES AGAINST, not this reader's own idea of a trust store
+  # (r45). Under `verify-ca`/`verify-full` the driver is handed `ssl.ca` read from DB_SSLROOTCERT
+  # by pg-connection-string; the reader is handed the same path, and psql is handed it as
+  # PGSSLROOTCERT. Three clients, one CA.
+  [[ -z "${DB_SSLROOTCERT}" ]] || probe_args+=("--sslrootcert=${DB_SSLROOTCERT}")
+  capture verdict node "${probe}" "${probe_args[@]}" || status=$?
   method="$(printf '%s\n' "${verdict}" | sed -n 's/^method=//p' | head -1)"
   detail="$(printf '%s\n' "${verdict}" | sed -n 's/^detail=//p' | head -1)"
   sslmode="$(printf '%s\n' "${verdict}" | sed -n 's/^sslmode=//p' | head -1)"
@@ -3207,23 +3515,30 @@ bus_read_env_ignore_flags() {
 # about to hand the units to systemd (o3d-2sm1.5 r23).
 DB_IDENTITY_REQUIRE_SNAPSHOT=false
 
-# THE SCAN, TOLD WHICH VARIABLE TO ASK ABOUT AND WHICH LAYER MAY ANSWER (o3d-2sm1.5 r44).
+# THE SCAN, TOLD WHICH VARIABLE TO ASK ABOUT (o3d-2sm1.5 r44, narrowed again at r45).
 #
 # It was `env_file_is_sole_database_url_source` and nothing else until r44, which is exactly the
-# shape update.sh was in when r28 found a second reader beside it. The generalisation is lifted
-# from there so the two files hold ONE rule rather than two that drift:
+# shape update.sh was in when r28 found a second reader beside it. The variable stays an argument
+# so the two files hold ONE rule rather than two that drift.
 #
-#   file   the DATABASE_URL question. ${env_file} is the PERMITTED source; an `Environment=`
-#          directive is a competing definition and a refusal; and this run's own snapshot may be
-#          the second environment file and nothing else may.
-#   none   the transport question (r44). There is NO permitted source: the route this gate
-#          publishes is DERIVED from the URL, so any environment source that could move it is a
-#          route this run did not choose. This is the one layer that OPENS the environment files,
-#          and the difference is the question rather than the doctrine — see the block below.
+# THE SECOND `layer` PARAMETER IS GONE AGAIN (r45, Codex HIGH). r44 gave this function a `none`
+# layer for the TRANSPORT question, and that layer OPENED the unit's environment files and
+# grepped them. Both halves of that were the finding: a wildcard `EnvironmentFile=` path is not a
+# file, so `[[ -e ]]` said absent; and a file read here is read again by systemd at exec, minutes
+# later, so an absence established here is not an absence there. The transport question is now
+# answered by a systemd DIRECTIVE that removes the variables outright — unit_route_env_guaranteed()
+# — and with the only caller of `none` gone the layer goes with it rather than sitting here as a
+# second, broken way to ask.
+#
+# WHAT IS LEFT IS THE DATABASE_URL QUESTION AND ONLY IT: ${env_file} is the PERMITTED source, an
+# `Environment=` directive is a competing definition and a refusal, and this run's own snapshot may
+# be the second environment file and nothing else may. No environment file is opened on this path,
+# for the reason r19 and r28 gave: WHICH of several definitions systemd would keep is composition
+# this script does not reproduce.
 ENV_VAR_SOURCE_REASON="the service environment has not been asked about yet"
 
 unit_env_var_sole_source() {
-  local variable="${1:-}" layer="${2:-}" env_file="${3:-}"; shift 3 2>/dev/null || true
+  local variable="${1:-}" env_file="${2:-}"; shift 2 2>/dev/null || true
   local -a units=("$@")
   local unit object rendering count element expected resolved load_state pam_name snapshot_expected
 
@@ -3259,15 +3574,9 @@ unit_env_var_sole_source() {
       return 1
     fi
     load_state="${BUS_STRINGS[0]}"
-    # A UNIT SYSTEMD DOES NOT HAVE DEFINES NOTHING — and only the `none` layer may say so
-    # (o3d-2sm1.5 r44). LoadUnit loads from disk, so `not-found` means there is no unit file at
-    # all; a unit that does not exist cannot carry a PGSSLMODE, and on a first install this script
-    # is about to write the unit itself. For the `file` layer the same state is still a refusal,
-    # because there the question is "does THIS file give the service its DATABASE_URL", and a
-    # service that does not exist has not been shown to be given it by anything.
-    if [[ "$layer" == "none" && "$load_state" == "not-found" ]]; then
-      continue
-    fi
+    # ANY STATE BUT `loaded` IS A REFUSAL HERE, INCLUDING `not-found`: the question this function
+    # asks is "does THIS file give the service its DATABASE_URL", and a service systemd does not
+    # have has not been shown to be given it by anything.
     if [[ "$load_state" != "loaded" ]]; then
       ENV_VAR_SOURCE_REASON="systemd reports ${unit} as '${load_state:-unknown}' rather than loaded, so what defines ${variable} for it cannot be read"
       return 1
@@ -3320,36 +3629,6 @@ unit_env_var_sole_source() {
       || [[ "${#BUS_STRINGS[@]}" -ne "$count" ]]; then
       ENV_VAR_SOURCE_REASON="systemd would not answer readably for ${unit}'s EnvironmentFiles=, so what defines ${variable} for that service is unknown"
       return 1
-    fi
-    # THE `none` LAYER OPENS THEM, WHICH THE `file` LAYER REFUSES TO DO (o3d-2sm1.5 r44, Codex
-    # HIGH) — AND THE DIFFERENCE IS THE QUESTION, NOT THE DOCTRINE. r19 and r28 refuse to open an
-    # environment file because WHICH of several definitions systemd would keep is composition this
-    # script does not reproduce. Here there is no precedence to work out: any definition, in any
-    # file, in any position, is the refusal, so the test is PRESENCE and nothing about ordering is
-    # assumed. It is deliberately over-broad — a line whose name half matches, anywhere in the
-    # file, refuses — because over-matching costs an operator one message naming the file, and
-    # under-matching costs the finding this round exists to answer. A file that is not there
-    # defines nothing; one that is there and cannot be read is an unknown, and unknowns refuse.
-    if [[ "$layer" == "none" ]]; then
-      local scanned
-      for (( scanned = 0; scanned < count; scanned++ )); do
-        element="${BUS_STRINGS[scanned]}"
-        case "$element" in
-          *'\'*)
-            ENV_VAR_SOURCE_REASON="systemd reports one of ${unit}'s environment files as ${element}, a path it had to escape to state. Comparing that here would be a reimplementation of somebody else's escaping, so whether it defines ${variable} is refused rather than guessed at"
-            return 1 ;;
-        esac
-        [[ -e "$element" ]] || continue
-        if [[ ! -r "$element" ]]; then
-          ENV_VAR_SOURCE_REASON="${unit} loads ${element} as an environment file and this run cannot read it, so whether it defines ${variable} for the service is unknown"
-          return 1
-        fi
-        if grep -Eq "^[[:space:]]*(export[[:space:]]+)?${variable}[[:space:]]*=" "$element"; then
-          ENV_VAR_SOURCE_REASON="${unit} loads the environment file ${element}, and that file has a line naming ${variable}. systemd reads it at exec and puts it in the service's environment, so the application runs with ${variable} set"
-          return 1
-        fi
-      done
-      continue
     fi
     if [[ "$count" -eq 0 ]]; then
       ENV_VAR_SOURCE_REASON="${unit} does not load ${env_file} with EnvironmentFile=, so ${variable} reaches the application through its own dotenv loader instead — whose .env.local and per-mode overlays are exactly the composition this deploy stopped reproducing. Add EnvironmentFile=${env_file} to the unit, or state the connection identity explicitly"
@@ -3419,11 +3698,11 @@ unit_env_var_sole_source() {
 }
 
 # THE DATABASE IDENTITY'S NAME FOR THE QUESTION, and all that is left of the function that used to
-# BE it: the same scan, told which variable to ask about and which layer is allowed to answer. Its
+# BE it: the same scan, told which variable to ask about. Its
 # four call sites read `require_env_file_is_sole_definition` exactly as they always did.
 env_file_is_sole_database_url_source() {
   local rc=0
-  unit_env_var_sole_source DATABASE_URL file "$@" || rc=$?
+  unit_env_var_sole_source DATABASE_URL "$@" || rc=$?
   DB_IDENTITY_SOURCE_REASON="$ENV_VAR_SOURCE_REASON"
   return "$rc"
 }
@@ -3446,15 +3725,26 @@ require_env_file_is_sole_definition() {
 # disk would be correct-but-astonishing.
 require_start_identity_bound() {
   local rc=0 route_reason
-  # AND NOTHING THE SERVICE IS ABOUT TO BE HANDED MAY MOVE THE DRIVER'S ROUTE (r44, Codex HIGH:
-  # "reject any PGSSLMODE source before reconciliation AND STARTUP"). The reconciliation half is in
-  # db_application_route_sslmode(); this is the startup half, and it is a different moment: the
-  # gate rotated, probed and vouched for a CLEARTEXT connection, and a PGSSLMODE the service
-  # acquires between then and its exec puts the application on a hostssl record nothing here has
-  # checked — which is the same post-upgrade outage the whole round exists to prevent, arriving
-  # after every check has passed.
-  if ! route_reason="$(db_application_route_env_refusal)"; then
-    DB_IDENTITY_SOURCE_REASON="${route_reason}. This run established which pg_hba record the application would be matched by over a cleartext connection and rotated its credential against that record, so starting it onto another transport is starting it onto a rule nothing here has checked"
+  # AND THE ROUTE THE SERVICE IS ABOUT TO TAKE IS THE ONE THIS RUN VOUCHED FOR (r44, r45).
+  #
+  # This is the startup half of the transport question and it is a DIFFERENT MOMENT from the
+  # reconciliation: the gate probed and rotated against one pg_hba record, and a transport the
+  # service acquires between then and its exec puts the application on another one that nothing
+  # here has checked — the same post-upgrade outage, arriving after every check has passed.
+  #
+  # IT IS ALSO A DIFFERENT QUESTION SINCE r45, and the difference is the finding. Until now this
+  # SURVEYED the unit for a definition. Now it asks systemd for two PROPERTIES of the composed
+  # unit — the UnsetEnvironment= directive that removes all three variables as the final step of
+  # composing the environment, and an ExecStart= that is exactly the command this run wrote, with
+  # no wrapper in front of it to set them again one exec later. The first covers every source
+  # systemd owns, whatever it is and whenever it appeared; the second covers the one source
+  # systemd does not own. Neither is an inference from mutable state.
+  #
+  # IT IS ASKED HERE AND NOWHERE EARLIER because "composed" means after the last daemon-reload,
+  # which remove_reboot_fence() has just issued, and because `systemctl start` — the only command
+  # between this line and the exec — acts on the loaded configuration and re-reads no unit file.
+  if ! route_reason="$(db_application_route_env_refusal service)"; then
+    DB_IDENTITY_SOURCE_REASON="${route_reason}. This run established which pg_hba record the application would be matched by over the transport DB_SSLMODE=${DB_SSLMODE} names and rotated its credential against that record, so starting it onto another transport is starting it onto a rule nothing here has checked"
     return 1
   fi
   DB_IDENTITY_REQUIRE_SNAPSHOT=true
@@ -3473,6 +3763,60 @@ require_start_identity_bound() {
     DB_IDENTITY_SOURCE_REASON="${APP_DIR}/.env no longer states the DATABASE_URL this run fenced and migrated with. The service would still start on the right database — the environment snapshot is loaded last and wins — but the file on disk and this run have parted company, and starting into that disagreement silently is how the next operator is misled"
     return 1
   fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# THE ROUTE GUARANTEE: install the directive that makes the transport a property (r45, Codex HIGH)
+# ---------------------------------------------------------------------------
+# Called from the same place as the identity snapshot — unit written, fences still up, nothing
+# started — so a failure here costs a re-run and no outage. Unlike the snapshot it is PERMANENT:
+# there is no run in which the application is meant to take its transport from an ambient
+# variable, so it stays on the host and every later start is covered by it too.
+#
+# THE VERIFICATION IS NOT HERE. Publishing is a write; the proof is a read of the COMPOSED unit
+# after the last daemon-reload, and that happens in require_start_identity_bound() a few steps
+# further on. Splitting them is deliberate: a check that runs before the reloads that follow it
+# proves nothing about what systemd will act on, which is the r24 finding.
+publish_db_route_guarantee() {
+  if $DRY_RUN; then
+    echo -e "${YELLOW}[DRY]${RESET}   would publish the ${DB_ROUTE_DROPIN_NAME} drop-in (UnsetEnvironment= for the transport variables) and verify it on the bus before the start"
+    return 0
+  fi
+  command -v systemctl >/dev/null 2>&1 || {
+    error "systemctl is unavailable, so the started service cannot be made to drop the transport variables at exec."
+    return 1
+  }
+  if [[ -z "${APP_NAME}" ]]; then
+    error "No systemd unit is named for the application, so there is nothing to install the route guarantee on."
+    return 1
+  fi
+  local names
+  names="$(db_route_env_variables | tr '\n' ' ')"
+  names="${names% }"
+  if ! publish_durable_dropin "${DB_ROUTE_DROPIN_FILE}" <<EOF
+[Service]
+# Installed by scripts/install.sh (o3d-2sm1.5 r45). systemd.exec(5): "as the final step all
+# variables listed in UnsetEnvironment= are removed from the compiled environment variable list,
+# immediately before it is passed to the executed process" — after DefaultEnvironment=,
+# \`systemctl set-environment\`, the manager's own block, Environment=, EnvironmentFile= (wildcards
+# included) and PAM alike.
+#
+# These three move which pg_hba.conf record answers the application's connection. The installer
+# probes and rotates the database credential against ONE record; a value acquired from anywhere
+# else would put the application on another. The transport is a deployment input instead — state
+# it as DB_SSLMODE= when running the installer and it goes into DATABASE_URL, where the installer
+# can see it and pin its probes to it.
+#
+# BARE NAMES, NOT ASSIGNMENTS: an assignment removes only that exact pair.
+# \`zz-\` so this sorts after any other drop-in, because an EMPTY UnsetEnvironment= resets the list.
+UnsetEnvironment=${names}
+EOF
+  then
+    error "${DB_ROUTE_DROPIN_FILE} could not be published durably, so ${APP_NAME}.service is NOT guaranteed to drop ${names} at exec."
+    return 1
+  fi
+  systemctl daemon-reload 2>/dev/null || true
   return 0
 }
 
@@ -5734,6 +6078,16 @@ EOF
 # drop-in that loads it LAST. systemd keeps the last definition of a variable across environment
 # files, so it beats whatever ${APP_DIR}/.env has come to say; and it is loaded with NO leading
 # `-`, so if it is gone the start fails instead of falling back.
+# AND BIND ITS TRANSPORT THE SAME WAY (o3d-2sm1.5 r45, Codex HIGH). The snapshot below says
+# WHICH database; this says HOW the application gets to it — by removing from the service's
+# environment the three variables that would otherwise choose a different pg_hba record from the
+# one this run probed and rotated against. It is written before the snapshot because both are
+# unit-file operations and every one of those must be upstream of remove_reboot_fence()'s
+# daemon-reload; the proof that systemd LOADED it is taken after that reload, in
+# require_start_identity_bound().
+publish_db_route_guarantee || die \
+  "The application service could not be made to drop the database transport variables at exec (the reason is printed above). The connection fence is still up and nothing has been started. Without that directive an ambient PGSSLMODE, PGREPLICATION or NODE_PG_FORCE_NATIVE — from the systemd manager's environment block, from a drop-in, or from any environment file the unit loads, including a wildcard one — puts the application on a pg_hba.conf record this run never authenticated against. Fix the cause and re-run; the re-run adopts the standing fence."
+
 publish_db_identity_snapshot || die \
   "The application service could not be bound to the database this run fenced and migrated (the reason is printed above). The connection fence is still up and nothing has been started. Without the binding, the DATABASE_URL systemd reads at exec is whatever ${APP_DIR}/.env says at that instant, which is not something this script can hold still. Fix the cause and re-run; the re-run adopts the standing fence."
 
