@@ -413,6 +413,12 @@ LOG_DIR="/var/log/${APP_NAME}"
 BACKUP_DIR="${DATA_DIR}/backups"
 UPLOAD_STORAGE_DIR="${DATA_DIR}/uploads"
 PUBLIC_UPLOAD_STORAGE_DIR="${DATA_DIR}/public-uploads"
+# The crontab reconciliation lock: a ROOT-OWNED file in a ROOT-OWNED subdirectory of the state
+# directory. Both halves are load-bearing and both are explained where the directory is prepared,
+# in section 8 (`prepare_crontab_lock`). The application derives the same two components from
+# $STATE_DIRECTORY (lib/crontab-reconcile-lock.ts).
+CRONTAB_LOCK_DIR="${DATA_DIR}/locks"
+CRONTAB_LOCK_FILE="${CRONTAB_LOCK_DIR}/.crontab-reconcile.lock"
 NGINX_CONF="/etc/nginx/sites-available/${APP_NAME}"
 NODE_VERSION="22"
 DEPLOY_SSH_DIR="${DATA_DIR}/git-ssh"
@@ -925,8 +931,118 @@ migrate_uploads "${APP_DIR}/uploads/quarantine/invoices" "${UPLOAD_STORAGE_DIR}/
 migrate_uploads "${APP_DIR}/public/uploads/branding" "${PUBLIC_UPLOAD_STORAGE_DIR}/branding"
 migrate_uploads "${APP_DIR}/public/uploads/avatars" "${PUBLIC_UPLOAD_STORAGE_DIR}/avatars"
 
-chown -R "${APP_USER}:${APP_USER}" "${DATA_DIR}" "${LOG_DIR}"
+# The crontab lock directory below is deliberately NOT handed to the service user, so it is pruned
+# out of this recursive chown rather than being taken back and re-taken on every re-run (which would
+# open a window in which the service user could plant a symlink inside it). `-exec chown -h` also
+# means a symlink anywhere under ${DATA_DIR} has its own ownership changed rather than its target's.
+find "${DATA_DIR}" -path "${CRONTAB_LOCK_DIR}" -prune -o -exec chown -h "${APP_USER}:${APP_USER}" {} +
+chown -R "${APP_USER}:${APP_USER}" "${LOG_DIR}"
 chown -R "${APP_USER}:${APP_USER}" "${UPLOAD_STORAGE_DIR}" "${PUBLIC_UPLOAD_STORAGE_DIR}"
+
+# ---------------------------------------------------------------------------
+# THE CRONTAB RECONCILIATION LOCK IS ROOT-OWNED, AND NO ROOT-SIDE STEP FOLLOWS A SYMLINK
+# (Codex r24 CRITICAL).
+#
+# ${DATA_DIR} is the service's systemd StateDirectory. systemd creates it OWNED BY ${APP_USER}, and
+# it MUST be writable by that user — that is what makes the lock reachable under the hardened unit
+# at all (r23). Round 23 then put the lock file directly in it and, as root, ran `touch`, `chown`
+# and `chmod` on that path on every install and every upgrade. All three follow symlinks. So the
+# unprivileged service account — the one account an attacker who reaches this application gets —
+# could replace the lock with a symlink to /etc/shadow and wait: the next installer run would give
+# the target away as ${APP_USER}:${APP_USER}, mode 0664. A root-side write into a directory the
+# service user controls is not a convenience, it is a privilege-escalation primitive.
+#
+# THE SERVICE USER NEVER NEEDS TO WRITE THIS FILE. `flock(2)` locks the open file DESCRIPTION
+# whatever its access mode, and the application already falls back to a READ-ONLY descriptor when
+# the lock file cannot be opened for writing (lib/crontab-reconcile-lock.ts, `openLockFile`). So the
+# lock can be root's alone and the exclusion still works in both directions:
+#
+#   ${CRONTAB_LOCK_DIR}
+#       root:root, 0755. The service user cannot create, replace or remove ANY entry in it, so the
+#       lock file underneath it cannot be swapped — this directory, not the file's mode, is what
+#       closes the finding.
+#   ${CRONTAB_LOCK_FILE}
+#       root:root, 0644. World-readable so the service can open it read-only and flock it; never
+#       `chown`ed to ${APP_USER}, and never written by anyone — its CONTENTS are meaningless, only
+#       its inode is the lock.
+#
+# NOTHING HERE FOLLOWS A SYMLINK, and each primitive is chosen for that:
+#
+#   • `mkdir` WITHOUT -p — plain mkdir fails with EEXIST on an existing symlink, where `mkdir -p`
+#     succeeds silently and leaves every later step operating inside the link's target.
+#   • `set -C` (noclobber) redirection — open(O_CREAT|O_EXCL), which by POSIX fails with EEXIST when
+#     the final component is a symlink, and so cannot create or truncate the target. `touch`, and a
+#     plain `: >` redirection, both follow.
+#   • `stat` and `[[ -L ]]` — both lstat. `stat -c %F` reports "symbolic link" rather than the
+#     target's type (`stat -L`, which would dereference, is deliberately not used).
+#   • `chown -h` — never dereferences: on a symlink it changes the LINK, so even a path swapped
+#     between the check and the call cannot hand a target away.
+#   • NO `chmod`, anywhere on these two paths. chmod has no --no-dereference on Linux, so a raced
+#     chmod is the same escalation with a different verb. Modes come from `umask` at creation, and a
+#     mode that is already wrong is REFUSED rather than corrected.
+#
+# WHAT IS STILL POSSIBLE, stated rather than glossed over: ${DATA_DIR} itself belongs to
+# ${APP_USER}, so that user can rename(2) the lock DIRECTORY aside within it — a same-directory
+# rename of a directory does not need write permission on the directory being renamed — and drop a
+# symlink in its place. Which is why every step below re-derives what it is looking at with lstat
+# and DIES: the outcome is a refused install naming the path, never a followed link. Whoever holds
+# the service account can already deny an install a hundred ways; what they must not be able to do
+# is aim a root-side write, and they cannot.
+# ---------------------------------------------------------------------------
+prepare_crontab_lock() {
+  local self dir_meta file_meta dir_kind dir_owner dir_mode file_kind file_owner
+  # 0 — the EUID guard at the top of this script has already refused to run as anything else. It is
+  # asked rather than hardcoded so the check below reads as "owned by the privileged user that owns
+  # this install", which is the property that matters, and so this function can be exercised in a
+  # test harness that is not root.
+  self="$(id -u)"
+
+  # (1) THE DIRECTORY. Plain `mkdir`: a symlink already at this path makes it fail with EEXIST
+  # instead of being followed, and we then refuse below rather than working inside it.
+  if ! (umask 022; mkdir "${CRONTAB_LOCK_DIR}") 2>/dev/null; then
+    [[ "$(stat -c '%F' "${CRONTAB_LOCK_DIR}" 2>/dev/null || true)" == "directory" ]] || die \
+      "${CRONTAB_LOCK_DIR} exists and is not a directory (a symlink there is how a compromised '${APP_USER}' would aim a root-side write). Remove or fix that path, then run the installer again."
+  fi
+  # Take/keep root ownership. `-h` so this is safe even if the path became a symlink just now.
+  chown -h root:root "${CRONTAB_LOCK_DIR}"
+
+  # (2) THE FILE. Created, if missing, with O_CREAT|O_EXCL so a planted symlink is refused rather
+  # than written through; never `touch`ed, and never chowned to the service user.
+  #
+  # The `-e` test is a CONVENIENCE, not the safety: it dereferences, so a symlink to an existing
+  # file reads as "already there", and a DANGLING one reads as "missing" and falls into the
+  # redirection below. `set -C` is what makes both of those safe — O_CREAT|O_EXCL fails with EEXIST
+  # on a symlink and creates nothing, dangling or not — and the lstat that follows is what refuses.
+  if [[ ! -e "${CRONTAB_LOCK_FILE}" ]]; then
+    ( umask 022; set -C; : > "${CRONTAB_LOCK_FILE}" ) 2>/dev/null || true
+  fi
+  # `stat -c %F` says "regular empty file" for a zero-length one, and this file is ALWAYS empty —
+  # nothing ever writes to it. Both spellings are the same st_mode, and neither is a symlink.
+  file_kind="$(stat -c '%F' "${CRONTAB_LOCK_FILE}" 2>/dev/null || true)"
+  [[ "${file_kind}" == "regular file" || "${file_kind}" == "regular empty file" ]] || die \
+    "${CRONTAB_LOCK_FILE} is not a regular file (it is a ${file_kind:-missing path}). The crontab reconciliation lock must be a plain file that only root can replace; refusing to write to that path."
+  chown -h root:root "${CRONTAB_LOCK_FILE}"
+
+  # (3) THE POST-CONDITIONS, re-read with lstat rather than assumed from the steps above.
+  dir_meta="$(stat -c '%F|%u|%a' "${CRONTAB_LOCK_DIR}" 2>/dev/null || true)"
+  IFS='|' read -r dir_kind dir_owner dir_mode <<< "${dir_meta}"
+  [[ "${dir_kind}" == "directory" && "${dir_owner}" == "${self}" ]] || die \
+    "${CRONTAB_LOCK_DIR} must be a directory owned by uid ${self} after preparation, and is '${dir_meta}'."
+  # The whole protection is that the service user cannot write this DIRECTORY. A group- or
+  # other-writable mode would give the lock file back to them, so it is refused, not chmod'ed away.
+  (( (8#${dir_mode:-777} & 0022) == 0 )) || die \
+    "${CRONTAB_LOCK_DIR} is mode ${dir_mode}: group- or other-writable, so '${APP_USER}' could still replace the lock file inside it. Set it to 0755 and run the installer again."
+  file_meta="$(stat -c '%F|%u' "${CRONTAB_LOCK_FILE}" 2>/dev/null || true)"
+  IFS='|' read -r file_kind file_owner <<< "${file_meta}"
+  # No mode assertion on the FILE, deliberately: nothing ever reads or writes its contents, and it
+  # cannot be replaced from inside a directory the service user cannot write. Only "root owns it and
+  # it is a plain file" is load-bearing.
+  [[ ( "${file_kind}" == "regular file" || "${file_kind}" == "regular empty file" ) \
+     && "${file_owner}" == "${self}" ]] || die \
+    "${CRONTAB_LOCK_FILE} must be a regular file owned by uid ${self} after preparation, and is '${file_meta}'."
+}
+
+prepare_crontab_lock
 
 success "Directories created."
 
@@ -1496,22 +1612,29 @@ trap 'rm -f "${CRON_BLOCK_FILE}"' EXIT
 # read-write under ProtectSystem=strict — and systemd hands its absolute path to the service as
 # $STATE_DIRECTORY, which is what the app reads. So:
 #
-#   ${DATA_DIR}/.crontab-reconcile.lock  ==  path.join($STATE_DIRECTORY, '.crontab-reconcile.lock')
+#   ${DATA_DIR}/locks/.crontab-reconcile.lock
+#     ==  path.join($STATE_DIRECTORY, 'locks', '.crontab-reconcile.lock')
 #
 # because DATA_DIR=/var/lib/${APP_NAME} and the unit written above sets StateDirectory=${APP_NAME}.
 # Both sides derive from that one declaration; neither has a path of its own to get wrong.
 # tests/settings/crontab-reconcile-serialization.test.ts RESOLVES both and asserts they are equal.
 #
-# `touch`, never rm-and-recreate: the lock lives on the INODE, so replacing the file would hand two
-# writers two different locks and look like it worked.
+# THE FILE IS NOT CREATED HERE, AND NOT WRITTEN HERE (Codex r24 CRITICAL). `prepare_crontab_lock`
+# in section 8 made it — root-owned, inside a root-owned directory — before the service was ever
+# started, precisely so that no root-side `touch`/`chown`/`chmod` ever lands on a path the service
+# user can turn into a symlink. All that is left to do here is OPEN it, and it is opened READ-ONLY:
+# `flock(2)` ignores the access mode, so a read-only descriptor takes the same exclusive lock, and
+# an fd that cannot write cannot be steered into writing something else either. That is the same
+# fallback the application relies on (lib/crontab-reconcile-lock.ts, `openLockFile`).
+#
+# Never rm-and-recreate: the lock lives on the INODE, so replacing the file would hand two writers
+# two different locks and look like it worked.
 # ---------------------------------------------------------------------------
-CRONTAB_LOCK_FILE="${DATA_DIR}/.crontab-reconcile.lock"
-touch "${CRONTAB_LOCK_FILE}"
-chown "${APP_USER}:${APP_USER}" "${CRONTAB_LOCK_FILE}"
-chmod 0664 "${CRONTAB_LOCK_FILE}"
+[[ -f "${CRONTAB_LOCK_FILE}" ]] || die \
+  "${CRONTAB_LOCK_FILE} is missing or is not a regular file, so this crontab write cannot be serialized against the application's. It is created earlier in this script; re-run the installer."
 
 CRON_BOOTSTRAP_WRITTEN=no
-exec 9>>"${CRONTAB_LOCK_FILE}"
+exec 9<"${CRONTAB_LOCK_FILE}"
 if ! flock --exclusive --timeout 30 9; then
   # FAIL SAFE, DO NOT ABORT. Writing without the lock is the defect itself, and a held lock means
   # the app is reconciling right now — which also means the block below would have been skipped.

@@ -1,5 +1,5 @@
 import { spawn } from 'child_process'
-import { closeSync, fstatSync, openSync, statSync } from 'fs'
+import { closeSync, fstatSync, mkdirSync, openSync, statSync } from 'fs'
 import path from 'path'
 
 /**
@@ -106,8 +106,9 @@ import path from 'path'
  *     environment from the unit's `StateDirectory=`. Nothing has to be configured for the app and
  *     the unit to agree — systemd is the one telling it.
  *   • `scripts/install.sh` writes `StateDirectory=${APP_NAME}` into the unit it generates and locks
- *     `${DATA_DIR}/.crontab-reconcile.lock`, where `DATA_DIR=/var/lib/${APP_NAME}` is exactly the
- *     path systemd will hand the app in `$STATE_DIRECTORY`.
+ *     `${DATA_DIR}/locks/.crontab-reconcile.lock`, where `DATA_DIR=/var/lib/${APP_NAME}` is exactly
+ *     the path systemd will hand the app in `$STATE_DIRECTORY` (the `locks` component is r24's, and
+ *     is explained below).
  *   • `deploy/systemd/ims-stage.service` already declared `StateDirectory=onetwoinventory` for its
  *     backups, so the hardened unit needs no new directory and no new `ReadWritePaths=` entry:
  *     systemd creates a StateDirectory, owns it to the service user at `StateDirectoryMode=`, and
@@ -116,6 +117,34 @@ import path from 'path'
  *
  * The resolved-path agreement between the two writers is asserted — by RESOLVING both, not by
  * comparing basenames — in tests/settings/crontab-reconcile-serialization.test.ts.
+ *
+ * ============================================================================================
+ * AND WHY IT IS IN A SUBDIRECTORY OF IT THAT ROOT OWNS (r24 CRITICAL).
+ *
+ * Round 23 put the lock file directly in the state directory and had `scripts/install.sh` `touch`,
+ * `chown` and `chmod` it as root on every install and upgrade. The state directory is writable by
+ * the service user — it has to be, that is the whole reason the lock moved there — so those three
+ * root-side operations, all of which follow symlinks, were a privilege-escalation primitive: the
+ * unprivileged application account could replace the lock with a symlink to any path on the system
+ * and have the next installer run hand it over as `imsapp:imsapp` 0664.
+ *
+ * The fix rests on a property this module already had. `flock(2)` locks the open file DESCRIPTION
+ * regardless of its access mode, which is why `openLockFile` below falls back to a READ-ONLY
+ * descriptor. So the service user never needs to write the lock file, and the installer now:
+ *
+ *   • creates `$STATE_DIRECTORY/locks` as a ROOT-OWNED 0755 directory. The service user cannot
+ *     create, replace or remove any entry inside it, so the lock file cannot be swapped for a
+ *     symlink at all — the directory, not the file's mode, is what closes the finding;
+ *   • creates `$STATE_DIRECTORY/locks/.crontab-reconcile.lock` as a ROOT-OWNED 0644 file, and never
+ *     chowns it to the service user;
+ *   • performs no root-side operation on either path that follows a symlink (`mkdir` without -p,
+ *     an O_CREAT|O_EXCL redirection, lstat checks, `chown -h`, and no `chmod` at all).
+ *
+ * So on an installed host the application opens the lock file READ-ONLY, via the fallback below,
+ * and locks it exactly as before. Outside an install — `next dev`, or a unit deployed by hand —
+ * there is no root writer to be protected from and nothing has created the directory, so
+ * `openLockFile` creates it and the lock file itself as the service user. Both cases resolve the
+ * SAME path, which is the property that makes this one exclusion rather than two.
  *
  * IF THE PATH IS UNWRITABLE ANYWAY, THE RECONCILIATION REFUSES. `acquireCrontabFileLock` returns a
  * failure, `reconcileCrontab` returns `{ success: false, error }` WITHOUT running the
@@ -130,6 +159,16 @@ import path from 'path'
  * participants silently pick different paths is not an exclusion.
  */
 export const CRONTAB_RECONCILE_LOCK_FILENAME = '.crontab-reconcile.lock'
+
+/**
+ * The directory the lock file sits in, inside the state directory.
+ *
+ * It exists so that it can be ROOT-OWNED while the state directory around it stays writable by the
+ * service user (r24 CRITICAL): an entry in a directory the service user cannot write cannot be
+ * replaced by that user, which is what stops the installer's root-side operations from being
+ * aimable at another path. `scripts/install.sh` creates both, and asserts both, in section 8.
+ */
+export const CRONTAB_RECONCILE_LOCK_DIRNAME = 'locks'
 
 /**
  * How long a queued reconciliation waits before giving up.
@@ -196,7 +235,9 @@ function systemdStateDirectory(): string | null {
  */
 export function crontabReconcileLockPath(): string {
   const stateDir = systemdStateDirectory()
-  if (stateDir) return path.join(stateDir, CRONTAB_RECONCILE_LOCK_FILENAME)
+  if (stateDir) {
+    return path.join(stateDir, CRONTAB_RECONCILE_LOCK_DIRNAME, CRONTAB_RECONCILE_LOCK_FILENAME)
+  }
 
   const override = process.env.OTI_CRONTAB_LOCK_PATH?.trim()
   if (override) {
@@ -207,7 +248,7 @@ export function crontabReconcileLockPath(): string {
       + 'Set StateDirectory= in the systemd unit instead.',
     )
   }
-  return path.join(process.cwd(), CRONTAB_RECONCILE_LOCK_FILENAME)
+  return path.join(process.cwd(), CRONTAB_RECONCILE_LOCK_DIRNAME, CRONTAB_RECONCILE_LOCK_FILENAME)
 }
 
 /**
@@ -227,22 +268,35 @@ export type CrontabReconcileLockOutcome<T> =
   | { locked: false; error: string }
 
 /**
- * Open the lock file, creating it if it is not there.
+ * Open the lock file, creating it — and its directory — if they are not there.
  *
- * Falls back to a READ-ONLY descriptor when the file exists but cannot be opened for writing:
- * `flock(2)` takes an exclusive lock on any descriptor regardless of its access mode, and the
- * installer creates this file as root before `chown`ing it. A read-only fallback means a mis-owned
- * lock file (EACCES) or one on a read-only bind mount (EROFS — what `ProtectSystem=strict` produces
- * for every path the unit does not open up) degrades to "still serialized" rather than "silently
- * unserialized".
+ * THE READ-ONLY FALLBACK IS THE NORMAL PATH ON AN INSTALLED HOST, not a degraded one. `flock(2)`
+ * takes an exclusive lock on any descriptor regardless of its access mode, and `scripts/install.sh`
+ * relies on exactly that: it creates the lock file root-owned 0644 inside a root-owned directory,
+ * so that no root-side operation of its own ever lands on a path this service user could replace
+ * with a symlink (r24 CRITICAL). The write open therefore fails with EACCES here, every time, and
+ * the read-only open that follows takes the same lock. The fallback also covers a lock file on a
+ * read-only bind mount (EROFS — what `ProtectSystem=strict` produces for every path the unit does
+ * not open up), which degrades to "still serialized" rather than "silently unserialized".
  *
- * When even that fails — the usual case being a directory the service cannot write, so the file was
- * never created and the read-only open is ENOENT — the error PROPAGATES. It is turned into a
- * returned refusal by `acquireCrontabFileLock`, and the crontab is left alone. Proceeding without
- * the lock is the defect this module exists to prevent, so there is deliberately no path here that
- * ends in "carry on without one".
+ * The `mkdir` is best-effort and its failure is deliberately ignored: on an installed host the
+ * directory is already there and root-owned, and the open below is the only real answer about
+ * whether this process can lock anything. It matters where there was never an installer — `next
+ * dev`, or a unit deployed by hand — because there the service user IS the only writer and has to
+ * be able to bootstrap the same path the installer would have made.
+ *
+ * When even the read-only open fails — the usual case being a directory that could not be created
+ * and does not exist, so the open is ENOENT — the error PROPAGATES. It is turned into a returned
+ * refusal by `acquireCrontabFileLock`, and the crontab is left alone. Proceeding without the lock is
+ * the defect this module exists to prevent, so there is deliberately no path here that ends in
+ * "carry on without one".
  */
 function openLockFile(lockPath: string): number {
+  try {
+    mkdirSync(path.dirname(lockPath), { recursive: true })
+  } catch {
+    // Already there (the installed case), or unwritable. The open below is the real answer.
+  }
   try {
     return openSync(lockPath, 'a')
   } catch (error) {
@@ -320,9 +374,11 @@ async function acquireCrontabFileLock(timeoutMs: number): Promise<AcquireOutcome
         error: `Could not open the crontab reconciliation lock file ${lockPath}: `
           + `${error instanceof Error ? error.message : String(error)}. `
           + 'The crontab was NOT changed, because a reconciliation that cannot be serialized can '
-          + 'silently discard another writer\'s block. This path comes from the service\'s systemd '
-          + 'StateDirectory: check the unit declares StateDirectory= and that the directory is '
-          + 'writable by the service user.',
+          + 'silently discard another writer\'s block. This path is the service\'s systemd '
+          + 'StateDirectory plus the lock directory scripts/install.sh creates inside it: check the '
+          + `unit declares StateDirectory=, and that ${path.dirname(lockPath)} exists and is `
+          + 'readable by the service user (the installer makes it root-owned on purpose, so the '
+          + 'file is opened read-only — flock does not need write access).',
       }
     }
     const remaining = Math.max(1, deadline - Date.now())
