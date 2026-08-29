@@ -684,6 +684,7 @@ function enclosingFunctionIn(file: string, line: number): string {
 function unlockedCrontabScopesIn(
   files: Array<[string, string]>,
   sites: ShellCrontabSite[],
+  exempt: string[] = [],
 ): string[] {
   const sources = new Map(files)
   const bad = new Set<string>()
@@ -692,6 +693,7 @@ function unlockedCrontabScopesIn(
     const src = raw.split('\n')
     const fn = enclosingFunctionInSource(src, site.line)
     const scope = `${site.file}:${fn}`
+    if (exempt.includes(scope)) continue
     if (!fn.endsWith('_locked')) { bad.add(scope); continue }
     const references = src.filter((l) => !l.trimStart().startsWith('#')
       && new RegExp(`(^|[^A-Za-z0-9_])${fn}([^A-Za-z0-9_]|$)`).test(l))
@@ -794,10 +796,42 @@ test('[o3d-batch-ret] every crontab writer in the repository is inside the one e
   // rule fails on the fifteenth, wherever it is put — and that is proved by mutation in
   // '[o3d-batch-ret] the census fails on a FIFTEENTH writer', below, which feeds it a source with
   // one added.
-  const unlocked = unlockedCrontabScopesIn(SHELL_ENTRYPOINTS, shellCrontab)
+  // ONE EXEMPTION, NAMED HERE AND PAID FOR IMMEDIATELY BELOW (o3d-p9dq, Codex r28).
+  // scripts/lib/crontab-lock.sh:read_crontab_for is the shared READER all three entrypoints now go
+  // through instead of `crontab -u … -l 2>/dev/null || true`. It is not a read-modify-write — it
+  // never writes — and the bodies that do the modify-and-write half call it from inside their own
+  // hold. An exemption is a hole unless both of those are asserted, so both are.
+  const SHARED_READER = 'scripts/lib/crontab-lock.sh:read_crontab_for'
+  const unlocked = unlockedCrontabScopesIn(SHELL_ENTRYPOINTS, shellCrontab, [SHARED_READER])
   assert.deepEqual(unlocked, [],
     'every shell crontab read-modify-write must sit in a `*_locked` body whose only caller is '
     + 'with_crontab_lock. These are not: ' + JSON.stringify(unlocked))
+
+  // (i) the exempted body READS and does nothing else — one `crontab` invocation, and it is `-l`.
+  const readerBody = shellFunctionFrom(CRONTAB_LOCK_LIB_SRC, 'read_crontab_for', 'scripts/lib/crontab-lock.sh')
+  const readerCalls = readerBody.split('\n').filter((l) => /(^\s*|[|;&({]\s*)crontab\b/.test(l))
+  assert.equal(readerCalls.length, 1,
+    `the shared reader must invoke crontab exactly once: ${JSON.stringify(readerCalls)}`)
+  assert.match(readerCalls[0], /crontab -u "\$\{user\}" -l /,
+    'and that invocation must be a READ — a write here would be an unlocked write in a shared library')
+  assert.ok(shellCrontab.some((site) => site.file === 'scripts/lib/crontab-lock.sh'),
+    'not vacuous: the walk really did reach the shared reader, which is why it needs the exemption')
+
+  // (ii) and every entrypoint that calls it, except the one pure QUERY, does so under the lock.
+  const readerScopes = new Set<string>()
+  for (const [name, src] of SHELL_ENTRYPOINTS) {
+    const lines = src.split('\n')
+    lines.forEach((line, index) => {
+      if (!/^\s*read_crontab_for /.test(line)) return
+      readerScopes.add(`${name}:${enclosingFunctionInSource(lines, index + 1)}`)
+    })
+  }
+  assert.ok(readerScopes.size >= 5,
+    `the entrypoints must actually call the shared reader (found ${readerScopes.size} scopes)`)
+  assert.deepEqual([...readerScopes].filter((scope) => !scope.endsWith('_locked')).sort(),
+    ['scripts/install.sh:upgrade_in_place'],
+    'the only crontab read outside a `*_locked` body is the installer asking whether there is an '
+    + 'installation here at all — it modifies nothing, and it now refuses rather than guessing')
 
   // NOT VACUOUS: the walk found the bodies, in all three entrypoints, and each is where the
   // cutover fence and its unwind actually live.
@@ -812,9 +846,23 @@ test('[o3d-batch-ret] every crontab writer in the repository is inside the one e
   }
   assert.ok(scopes.has('scripts/install.sh:bootstrap_managed_crontab_block_locked'),
     'the installer must still write its bootstrap block, and inside the lock')
+  // `adopt_cron_fence_locked` no longer invokes `crontab` itself: it READS through the shared
+  // reader and delegates the re-fence to fence_cron (o3d-p9dq, Codex r28). So the census asks what
+  // is still true of it — it is a `*_locked` body, with_crontab_lock is its only caller, and the
+  // read it makes is the shared one rather than a private `2>/dev/null || true`.
   for (const file of ['scripts/deploy.sh', 'scripts/update.sh']) {
-    assert.ok(scopes.has(`${file}:adopt_cron_fence_locked`),
-      `${file} re-fences an adopted crontab and that read-modify-write is one critical section too`)
+    const src = new Map(SHELL_ENTRYPOINTS).get(file)!
+    const body = shellFunctionFrom(src, 'adopt_cron_fence_locked', file)
+    assert.match(body, /^\s*read_crontab_for /m,
+      `${file}: the adopted fence must establish what is in the crontab through the shared reader`)
+    assert.doesNotMatch(body, /2>\/dev\/null \|\| true/,
+      `${file}: and not by suppressing the read's own failure`)
+    const references = src.split('\n').filter((l) => !l.trimStart().startsWith('#')
+      && /(^|[^A-Za-z0-9_])adopt_cron_fence_locked([^A-Za-z0-9_]|$)/.test(l)
+      && !/^adopt_cron_fence_locked\(\) \{/.test(l))
+    assert.ok(references.length > 0, `${file}: adopt_cron_fence_locked must be called`)
+    assert.ok(references.every((l) => /^\s*with_crontab_lock adopt_cron_fence_locked/.test(l)),
+      `${file}: with_crontab_lock must be its only caller — ${JSON.stringify(references)}`)
   }
 
   // AND EVERY ENTRYPOINT JOINS THE PROTOCOL FROM THE SAME FILE. Three copies of an exclusion are
@@ -938,7 +986,9 @@ test('[o3d-batch-ret] the census fails on a FIFTEENTH writer, wherever it is put
   // CONTROL — the unmutated sources come back clean through the very same two functions, so the
   // three rejections above are the rule working and not a classifier that rejects everything.
   const clean = SHELL_ENTRYPOINTS.flatMap(([name, src]) => shellCrontabSitesIn(name, src))
-  assert.ok(clean.length >= 15, `the control must reach the real sites (found ${clean.length})`)
+  // Thirteen, not the fifteen of round 27: the installer's bootstrap used to read the crontab
+  // TWICE with the failure suppressed, and both readings are now one call to the shared reader.
+  assert.ok(clean.length >= 12, `the control must reach the real sites (found ${clean.length})`)
   assert.deepEqual(unlockedCrontabScopesIn(SHELL_ENTRYPOINTS, clean), [])
 })
 
@@ -2419,7 +2469,7 @@ const PREDECESSOR_BLOCK = '# --- OTI CRON START ---\n'
   + '# --- OTI CRON END ---'
 
 const blindResumeMutation = (src: string): string => {
-  const before = '  if crontab_gained_lines_over_backup "${backup}" "${current}"; then'
+  const before = '  if ! crontab_is_unmoved_since_backup "${backup}" "${current}"; then'
   assert.ok(src.includes(before),
     'scripts/install.sh must compare the live crontab with the backup projection on one line')
   return src.replace(before, '  if false; then')
@@ -2458,7 +2508,7 @@ test('[o3d-batch-ret] a transition recovery REFUSES a backup whose world has mov
   assert.equal(moved.run.code, 9,
     'a recovery that cannot prove the snapshot is current must FAIL, so its caller dies')
   assert.doesNotMatch(moved.run.stdout, /RESTORED/)
-  assert.match(moved.run.stderr, /THE REASON IS NOT THE LOCK: the live crontab holds lines the fenced projection/,
+  assert.match(moved.run.stderr, /THE REASON IS NOT THE LOCK: the live crontab is not the fence's own projection/,
     'and the operator is told it was the crontab that moved, not a lock that was busy')
   assert.equal(moved.final, `${projection}${PREDECESSOR_BLOCK}\n`,
     'and it must leave the crontab EXACTLY as it found it — refusing means writing nothing')
@@ -2689,4 +2739,562 @@ test('[o3d-batch-ret] MUTATION: the sweep rejects each way of putting the fail-o
 
   // CONTROL — the unmutated source comes back clean through the very same function.
   assert.deepEqual(drainProofFaultsIn('scripts/update.sh', base), [])
+})
+
+// ---------------------------------------------------------------------------
+// 23 — LOAD-BEARING: a crontab that could not be READ is not a crontab with nothing in it
+//
+// Codex r28's two HIGHs, and they are round 27's third HIGH reached through a different command.
+// There the socket census read a missing `ss`, a non-zero `ss` and a silent `ss` as "nobody is
+// listening". Here every `crontab -l` in all three entrypoints was written
+//
+//     current="$(crontab -u "$APP_USER" -l 2>/dev/null || true)"
+//
+// which throws away the diagnostic and converts every failure into the empty string. Two callers
+// then read that empty string as a fact:
+//
+//   fence_cron_locked      "No crontab; nothing to fence" — and the cutover proceeds into the
+//                          database fence and the migration with cron still armed.
+//   unfence_cron_locked    an empty live crontab holds nothing the backup does not — so the
+//                          pre-cutover snapshot goes back over a committed save.
+//
+// The fix is ONE reader, read_crontab_for(), and the interesting half of it is that exit status
+// CANNOT do the separation: on the Vixie cron every supported platform ships, "no crontab for this
+// user", "no such user" and "must be privileged" are all exit 1 with empty output. What separates
+// them is the diagnostic, and only the benign one says `no crontab for <user>` and says nothing
+// else. The shim below reproduces each of those states verbatim.
+//
+// WHAT THESE PIN, and the route each takes:
+//   1. every failing read is UNRESOLVED, and a genuinely absent crontab is still RESOLVED
+//                                          (scripts/lib/crontab-lock.sh -> read_crontab_for)
+//   2. the fence ABORTS, before the database fence and the migration, in all three entrypoints
+//                                          (fence_cron -> fence_cron_locked)
+//   3. the unfence REFUSES rather than installing the snapshot
+//                                          (unfence_cron -> unfence_cron_locked)
+//   4. a deletion made while the fence was up is a WRITE, and is not undone
+//                                          (plan_crontab_unfence)
+//   5. a backup line appearing twice is not satisfied by one live occurrence, and moving an
+//      environment assignment past a job is not "every line still exists"
+//                                          (crontab_unmanaged_lines_missing_from)
+// ---------------------------------------------------------------------------
+
+const FAULT_DIR = join(HARNESS, 'crontab-faults')
+const FAULT_BIN = join(FAULT_DIR, 'bin')
+const FAULT_CRONTAB = join(FAULT_DIR, 'crontab.txt')
+const FAULT_BACKUP = join(FAULT_DIR, 'crontab-appuser.bak')
+mkdirSync(FAULT_BIN, { recursive: true })
+
+/**
+ * A `crontab` whose `-l` can be put into each state a real one reaches, selected by
+ * $FAKE_CRONTAB_READ. The exit statuses and the diagnostics are not invented: they were taken off
+ * `/usr/bin/crontab` from the Debian `cron` package (Vixie cron, setgid crontab) by running it in
+ * each state — an existing user with no crontab, a user that does not exist, and `-u` as an
+ * unprivileged caller. All three are exit 1 with empty stdout, which is exactly why `|| true` on
+ * the exit status alone could never have told them apart.
+ */
+writeFileSync(join(FAULT_BIN, 'crontab'), `#!/bin/sh
+user=self
+if [ "$1" = "-u" ]; then user="$2"; shift 2; fi
+if [ "$1" = "-l" ]; then
+  case "\${FAKE_CRONTAB_READ:-ok}" in
+    ok)       if [ -f '${FAULT_CRONTAB}' ]; then cat '${FAULT_CRONTAB}'; fi; exit 0 ;;
+    absent)   echo "no crontab for $user" >&2; exit 1 ;;
+    denied)   echo "must be privileged to use -u" >&2; exit 1 ;;
+    nouser)   echo "crontab:  user '$user' unknown" >&2; exit 1 ;;
+    silent)   exit 1 ;;
+    partial)  if [ -f '${FAULT_CRONTAB}' ]; then cat '${FAULT_CRONTAB}'; fi
+              echo "no crontab for $user" >&2; exit 1 ;;
+    *)        echo "unmodelled mode" >&2; exit 1 ;;
+  esac
+fi
+src="$1"
+if [ "$src" = "-" ]; then cat > '${FAULT_CRONTAB}'; else cat "$src" > '${FAULT_CRONTAB}'; fi
+`)
+chmodSync(join(FAULT_BIN, 'crontab'), 0o755)
+
+function faultCrontabText(): string {
+  return existsSync(FAULT_CRONTAB) ? readFileSync(FAULT_CRONTAB, 'utf8') : ''
+}
+
+/** A copy of the SHIPPED library with named edits applied, so a mutation runs real code. */
+let mutatedLibSeq = 0
+function libraryWith(edits: Array<[string, string]>): string {
+  let src = CRONTAB_LOCK_LIB_SRC
+  for (const [from, to] of edits) {
+    assert.equal(src.split(from).length - 1, 1,
+      `scripts/lib/crontab-lock.sh must contain exactly one:\n${from}`)
+    src = src.replace(from, to)
+  }
+  assert.notEqual(src, CRONTAB_LOCK_LIB_SRC, 'a library mutation that changes nothing tests nothing')
+  const path = join(FAULT_DIR, `crontab-lock-mutated-${++mutatedLibSeq}.sh`)
+  writeFileSync(path, src)
+  return path
+}
+
+/**
+ * A bash program built out of one SHIPPED entrypoint's own functions, running against the fault
+ * shim. `lib` swaps in a mutated library; `mutate` edits the assembled prelude, which is how the
+ * pre-fix body is RUN rather than described.
+ */
+function faultProgram(
+  where: string,
+  src: string,
+  body: string,
+  opts: { functions: string[]; mutate?: (s: string) => string; lib?: string } = { functions: [] },
+): string {
+  const program = [
+    'set -uo pipefail',
+    `PATH='${FAULT_BIN}':"$PATH"`,
+    'IMS_CRONTAB_LOCK_WAIT_SECONDS=30',
+    `source '${opts.lib ?? CRONTAB_LOCK_LIB}'`,
+    `CRONTAB_LOCK_DIR='${dirname(LOCK_FILE)}'`,
+    `CRONTAB_LOCK_FILE='${LOCK_FILE}'`,
+    'APP_USER=appuser',
+    `DATA_DIR='${FAULT_DIR}'`,
+    `CRON_BACKUP='${FAULT_BACKUP}'`,
+    'CRON_FENCED=false',
+    'CRON_BACKUP_CREATED=false',
+    'DRY_RUN=false',
+    "YELLOW=''; RESET=''",
+    'info(){ :; }; ok(){ :; }; success(){ :; }; warn(){ echo "WARN: $*" >&2; }',
+    'die(){ echo "DIE: $*" >&2; exit 9; }',
+    ...opts.functions.map((name) => shellFunctionFrom(src, name, where)),
+  ].join('\n')
+  const prelude = opts.mutate ? opts.mutate(program) : program
+  if (opts.mutate) assert.notEqual(prelude, program, 'a mutation that changes nothing tests nothing')
+  return `${prelude}\n${body}`
+}
+
+/** The three entrypoints, with the spelling each uses for the user, since the bodies are lifted verbatim. */
+const FAULT_ENTRYPOINTS: Array<[string, string, string]> = [
+  ['scripts/install.sh', INSTALL_SH, '"${APP_USER}"'],
+  ['scripts/deploy.sh', DEPLOY_SH, '"$APP_USER"'],
+  ['scripts/update.sh', UPDATE_SH, '"${APP_USER}"'],
+]
+
+const FAULT_ORIGINAL = '# an operator line the cutover must put back\n*/5 * * * * /usr/bin/true\n'
+
+/**
+ * THE PRE-FIX BODY OF THE READ, put back at whichever site the marker names. `read_crontab_for … ||
+ * die \` becomes the suppressed read it replaced, with the continuation swallowed by `:` so the
+ * long message below it stays a well-formed argument. Everything downstream then sees exactly what
+ * it saw before this round: an empty string, and no way to know why.
+ */
+function failOpenReadMutation(user: string) {
+  return (src: string): string => {
+    const marker = `  read_crontab_for ${user} || die \\`
+    assert.equal(src.split(marker).length - 1, 1, `the fence must read the crontab on one line:\n${marker}`)
+    return src.replace(marker,
+      `  current="$(crontab -u ${user} -l 2>/dev/null || true)"\n`
+      + '  CRONTAB_READ_TEXT="$current"\n'
+      + '  CRONTAB_READ_PRESENT=true\n'
+      + '  : \\')
+  }
+}
+
+test('[o3d-batch-ret] a crontab read that did not RESOLVE is refused, and a crontab that is genuinely ABSENT is not', async () => {
+  const probe = async (mode: string, lib = CRONTAB_LOCK_LIB) => sh([
+    'set -uo pipefail',
+    `PATH='${FAULT_BIN}':"$PATH"`,
+    'die(){ echo "DIE: $*" >&2; exit 9; }',
+    `source '${lib}'`,
+    `export FAKE_CRONTAB_READ='${mode}'`,
+    'if read_crontab_for appuser; then',
+    '  echo "RESOLVED present=${CRONTAB_READ_PRESENT} text=[${CRONTAB_READ_TEXT}]"',
+    'else',
+    '  echo "UNRESOLVED ${CRONTAB_READ_REASON}"',
+    'fi',
+  ].join('\n'))
+
+  writeFileSync(FAULT_CRONTAB, FAULT_ORIGINAL)
+
+  // CONTROL, FIRST. A crontab that reads normally resolves and carries its content, so the
+  // refusals below are a decision and not a function that refuses everything.
+  const ok = await probe('ok')
+  assert.match(ok.stdout, /^RESOLVED present=true text=\[# an operator line/m,
+    `a readable crontab must resolve, with its content:\n${ok.stdout}${ok.stderr}`)
+
+  // LOAD-BEARING HALF ONE. A genuinely absent crontab is a real answer and must stay one: making
+  // every non-zero exit a refusal would trade one failure for another, and every fresh box has no
+  // crontab at all.
+  const absent = await probe('absent')
+  assert.match(absent.stdout, /^RESOLVED present=false text=\[\]$/m,
+    `"no crontab for appuser" is an ANSWER, not a failure:\n${absent.stdout}${absent.stderr}`)
+
+  // LOAD-BEARING HALF TWO. Every other way of exiting non-zero is unresolved — and each of these
+  // exits 1 with empty output exactly as the benign case does, which is why the exit status alone
+  // could never have done this.
+  for (const [mode, expected] of [
+    ['denied', /must be privileged to use -u/],
+    ['nouser', /unknown/],
+    ['silent', /nothing at all/],
+  ] as Array<[string, RegExp]>) {
+    const run = await probe(mode)
+    assert.match(run.stdout, /^UNRESOLVED /m,
+      `\`${mode}\` must not be read as an absent crontab:\n${run.stdout}${run.stderr}`)
+    assert.match(run.stdout, expected, `and it must quote what crontab actually said:\n${run.stdout}`)
+  }
+
+  // …and the benign message is matched WHOLE. Output alongside it means something was read and
+  // then something failed, which is not "there is no crontab".
+  const partial = await probe('partial')
+  assert.match(partial.stdout, /^UNRESOLVED /m,
+    `output plus the absence message is not an absence:\n${partial.stdout}${partial.stderr}`)
+})
+
+test('[o3d-batch-ret] MUTATION: with the failure suppressed, every one of those refusals becomes "there is no crontab"', async () => {
+  // THE ROUTE, RUN. The resolution rule replaced by "any non-zero exit means there is no crontab",
+  // which is precisely what `2>/dev/null || true` amounted to at all thirteen call sites.
+  const lib = libraryWith([[
+    '  if [[ -z "${out}" ]] && crontab_read_says_no_crontab "${user}" "${err}"; then',
+    '  if true; then',
+  ]])
+  const probe = async (mode: string) => sh([
+    'set -uo pipefail',
+    `PATH='${FAULT_BIN}':"$PATH"`,
+    'die(){ echo "DIE: $*" >&2; exit 9; }',
+    `source '${lib}'`,
+    `export FAKE_CRONTAB_READ='${mode}'`,
+    'if read_crontab_for appuser; then echo "RESOLVED present=${CRONTAB_READ_PRESENT}"; else echo UNRESOLVED; fi',
+  ].join('\n'))
+
+  for (const mode of ['denied', 'nouser', 'silent']) {
+    const run = await probe(mode)
+    assert.match(run.stdout, /^RESOLVED present=false$/m,
+      `without the diagnostic rule, \`${mode}\` reports an absent crontab:\n${run.stdout}${run.stderr}`)
+  }
+})
+
+for (const [where, src, user] of FAULT_ENTRYPOINTS) {
+  test(`[o3d-batch-ret] ${where}: the cron fence ABORTS on an unresolved read, before the database fence and the migration`, async () => {
+    // The static half: this is a fence whose whole job is to be finished before those two steps.
+    const lines = src.split('\n')
+    const at = (re: RegExp, from = 0): number => {
+      const i = lines.findIndex((line, n) => n >= from && re.test(line))
+      assert.notEqual(i, -1, `${where} must contain ${re}`)
+      return i
+    }
+    const fenceCall = at(/^\s*fence_cron$/)
+    assert.ok(fenceCall < at(/prisma migrate deploy --schema prisma\/schema\.prisma/, fenceCall),
+      `${where} fences cron before the schema moves, so a fence that returns 0 without fencing is a migration under live cron writers`)
+    assert.ok(fenceCall < at(/fence_db_connections|check-db-writers\.mjs/, fenceCall),
+      `${where} fences cron before the database fence, which is the step the cron entries would defeat`)
+
+    // The dynamic half: the shipped fence, against a crontab whose read cannot be resolved.
+    const functions = ['fsync_path', 'publish_cron_backup', 'fence_cron_locked', 'fence_cron']
+    const body = 'fence_cron\necho "REACHED-THE-DATABASE-FENCE"'
+
+    writeFileSync(FAULT_CRONTAB, FAULT_ORIGINAL)
+    rmSync(FAULT_BACKUP, { force: true })
+    const refused = await sh(`export FAKE_CRONTAB_READ=denied\n${faultProgram(where, src, body, { functions })}`)
+
+    assert.equal(refused.code, 9, `an unresolved read must stop the run:\n${refused.stdout}${refused.stderr}`)
+    assert.doesNotMatch(refused.stdout, /REACHED-THE-DATABASE-FENCE/,
+      'and stop it HERE — nothing after the fence may run')
+    assert.match(refused.stderr, /NOTHING HAS BEEN MIGRATED/,
+      `and say so in the terms the operator needs:\n${refused.stderr}`)
+    assert.match(refused.stderr, /must be privileged to use -u/,
+      'and quote what the read actually said')
+    assert.equal(faultCrontabText(), FAULT_ORIGINAL, 'refusing means writing nothing')
+    assert.equal(existsSync(FAULT_BACKUP), false, 'and taking no backup it would later restore from')
+
+    // CONTROL. The same program on a crontab that reads fine fences it and carries on, so the
+    // refusal above is about the read and not about the program being broken.
+    writeFileSync(FAULT_CRONTAB, FAULT_ORIGINAL)
+    rmSync(FAULT_BACKUP, { force: true })
+    const fenced = await sh(`export FAKE_CRONTAB_READ=ok\n${faultProgram(where, src, body, { functions })}`)
+    assert.equal(fenced.code, 0, `a readable crontab must still be fenced:\n${fenced.stderr}`)
+    assert.match(fenced.stdout, /REACHED-THE-DATABASE-FENCE/)
+    assert.match(faultCrontabText(), /^#DEPLOY-FENCE# \*\/5 \* \* \* \* \/usr\/bin\/true$/m,
+      'and the active line really must be commented out')
+
+    // …and a crontab that is genuinely ABSENT is neither refused nor fenced. Without this the
+    // refusal could be a fence that stops on every box that has no crontab, which is every box
+    // the installer has not run on yet.
+    rmSync(FAULT_CRONTAB, { force: true })
+    rmSync(FAULT_BACKUP, { force: true })
+    const none = await sh(`export FAKE_CRONTAB_READ=absent\n${faultProgram(where, src, body, { functions })}`)
+    assert.equal(none.code, 0, `an absent crontab must not stop the run:\n${none.stdout}${none.stderr}`)
+    assert.match(none.stdout, /REACHED-THE-DATABASE-FENCE/, 'the cutover carries on')
+    assert.equal(faultCrontabText(), '', 'and nothing was written to a crontab that does not exist')
+    assert.equal(existsSync(FAULT_BACKUP), false, 'and no backup was taken of nothing')
+  })
+
+  test(`[o3d-batch-ret] MUTATION: ${where}'s fence with the read suppressed calls that "no crontab" and migrates over it`, async () => {
+    // THE ROUTE, RUN. The read put back the way it stood before this round, at the shipped site.
+    const functions = ['fsync_path', 'publish_cron_backup', 'fence_cron_locked', 'fence_cron']
+    const body = 'fence_cron\necho "REACHED-THE-DATABASE-FENCE"'
+    writeFileSync(FAULT_CRONTAB, FAULT_ORIGINAL)
+    rmSync(FAULT_BACKUP, { force: true })
+
+    const run = await sh(`export FAKE_CRONTAB_READ=denied\n${faultProgram(where, src, body,
+      { functions, mutate: failOpenReadMutation(user) })}`)
+
+    assert.equal(run.code, 0, `the suppressed read completes without complaint:\n${run.stderr}`)
+    assert.match(run.stdout, /REACHED-THE-DATABASE-FENCE/,
+      'THE FINDING: the cutover walks on into the database fence and the migration')
+    assert.equal(faultCrontabText(), FAULT_ORIGINAL,
+      'and the cron entries it believes it disarmed are still active, still scheduled')
+  })
+}
+
+test('[o3d-batch-ret] an unreadable crontab at the UNFENCE refuses, rather than restoring the snapshot over it', async () => {
+  const functions = ['fsync_path', 'publish_cron_backup', 'fence_cron_locked', 'fence_cron',
+    'unfence_cron_locked', 'unfence_cron']
+  const where = 'scripts/install.sh'
+
+  /** Fence for real, then unfence with the read in <mode>. */
+  async function fenceThenUnfence(mode: string, opts: { mutate?: (s: string) => string; lib?: string } = {}) {
+    writeFileSync(FAULT_CRONTAB, FAULT_ORIGINAL)
+    rmSync(FAULT_BACKUP, { force: true })
+    const fenced = await sh(`export FAKE_CRONTAB_READ=ok\n${faultProgram(where, INSTALL_SH, 'fence_cron',
+      { functions, ...opts })}`)
+    assert.equal(fenced.code, 0, `the fence must complete before the unfence is asked anything:\n${fenced.stderr}`)
+    assert.equal(existsSync(FAULT_BACKUP), true, 'precondition: the fence took a backup')
+    const whileFenced = faultCrontabText()
+    const restore = await sh(`export FAKE_CRONTAB_READ=${mode}\n${faultProgram(where, INSTALL_SH,
+      'CRON_FENCED=true\nunfence_cron\necho "PLAN=${CRON_UNFENCE_PLAN}"', { functions, ...opts })}`)
+    return { whileFenced, restore, final: faultCrontabText() }
+  }
+
+  // CONTROL. A readable crontab unfences, so the refusal below is not a function that refuses
+  // everything.
+  const good = await fenceThenUnfence('ok')
+  assert.equal(good.restore.code, 0, `a readable crontab must be put back:\n${good.restore.stderr}`)
+  assert.equal(good.final, FAULT_ORIGINAL, 'verbatim, because nothing wrote while it was fenced')
+  assert.equal(existsSync(FAULT_BACKUP), false, 'and the backup it consumed is gone')
+
+  // THE PROPERTY. The read cannot be resolved, so this run does not get to decide what belongs in
+  // the crontab — and above all does not install a snapshot on the strength of a reading it does
+  // not have.
+  const blind = await fenceThenUnfence('denied')
+  assert.equal(blind.restore.code, 9,
+    `an unresolved read must refuse:\n${blind.restore.stdout}${blind.restore.stderr}`)
+  assert.match(blind.restore.stderr, /still FENCED/,
+    'and say the crontab is still fenced, which is the state it is leaving behind')
+  assert.match(blind.restore.stderr, /the live crontab could not be read/, blind.restore.stderr)
+  assert.match(blind.restore.stderr, /must be privileged to use -u/, 'quoting what crontab said')
+  assert.equal(blind.final, blind.whileFenced,
+    'REFUSING MEANS WRITING NOTHING: the fenced crontab is exactly as the unfence found it')
+  assert.equal(existsSync(FAULT_BACKUP), true,
+    'and the backup stays on disk, because the operator is told to settle it by hand')
+})
+
+test('[o3d-batch-ret] MUTATION: the pre-round body reads that failure as an empty crontab and restores the stale snapshot', async () => {
+  // THE ROUTE, RUN, IN BOTH ITS PARTS — because the fix has two halves and each alone is enough to
+  // refuse. Part one is the suppressed read at the unfence site. Part two is round 27's lost-lines
+  // branch, which sent a live crontab holding nothing the projection does not straight to the
+  // snapshot. Together they are the shipped code as it stood, and it discards whatever was really
+  // in the crontab.
+  const lib = libraryWith([[
+    '  if crontab_is_unmoved_since_backup "${backup}" "${live}"; then',
+    '  if [[ -z "$(awk \'NR == FNR { have[$0] = 1; next } /^[[:space:]]*$/ { next } !($0 in have) { print }\''
+    + ' <(crontab_fence_projection "${backup}") <(printf \'%s\\n\' "${live}"))" ]]; then',
+  ]])
+  const suppressUnfenceRead = (s: string): string => {
+    const marker = '  read_crontab_for "${APP_USER}" || {\n'
+      + '    CRON_UNFENCE_REASON="the live crontab could not be read, so nothing can establish what is in it'
+      + ' and a snapshot installed on that reading would discard whatever is: ${CRONTAB_READ_REASON}"\n'
+      + '    return "${CRONTAB_UNFENCE_DIVERGED}"\n'
+      + '  }'
+    assert.equal(s.split(marker).length - 1, 1, `scripts/install.sh must guard the unfence read:\n${marker}`)
+    return s.replace(marker, '  :')
+  }
+  const mutate = (s: string): string =>
+    suppressUnfenceRead(s).replace('  current="${CRONTAB_READ_TEXT}"\n  if ! backup=',
+      '  current="$(crontab -u "${APP_USER}" -l 2>/dev/null || true)"\n  if ! backup=')
+
+  const functions = ['fsync_path', 'publish_cron_backup', 'fence_cron_locked', 'fence_cron',
+    'unfence_cron_locked', 'unfence_cron']
+  writeFileSync(FAULT_CRONTAB, FAULT_ORIGINAL)
+  rmSync(FAULT_BACKUP, { force: true })
+  const fenced = await sh(`export FAKE_CRONTAB_READ=ok\n${faultProgram('scripts/install.sh', INSTALL_SH,
+    'fence_cron', { functions, mutate, lib })}`)
+  assert.equal(fenced.code, 0, fenced.stderr)
+
+  const restore = await sh(`export FAKE_CRONTAB_READ=denied\n${faultProgram('scripts/install.sh', INSTALL_SH,
+    'CRON_FENCED=true\nunfence_cron\necho "PLAN=${CRON_UNFENCE_PLAN}"', { functions, mutate, lib })}`)
+
+  assert.equal(restore.code, 0, `the pre-round body completes with no complaint:\n${restore.stderr}`)
+  assert.match(restore.stdout, /PLAN=snapshot/,
+    'THE FINDING: a read that failed is classified as a crontab that had lost lines')
+  assert.equal(faultCrontabText(), FAULT_ORIGINAL,
+    'and the pre-cutover snapshot is installed on the strength of a reading nobody has')
+})
+
+test('[o3d-batch-ret] a line DELETED while the fence was up is a write, and the unfence does not put it back', async () => {
+  // Codex r28 HIGH #1, second half. Round 27 read "the live crontab holds nothing the backup does
+  // not" as "nothing wrote", and restored. One of the things that produces that reading is an
+  // operator who ran `crontab -e` to stop a job — and was given no error, and found it scheduled
+  // again after the next deploy.
+  const backup = '# an operator line\nPATH=/usr/local/bin\n*/5 * * * * /usr/bin/keep\n17 3 * * * /usr/bin/retired'
+  // The fenced crontab is the SHIPPED transform of that backup, not a re-typed copy of it — and
+  // the deletion is one line taken out of it, which is what `crontab -e` leaves behind.
+  const projection = (await fenceProjectionOf(backup)).replace(/\n$/, '')
+  const deletedOne = projection.split('\n').filter((l) => !l.includes('/usr/bin/retired')).join('\n')
+  assert.equal(projection.split('\n').length - deletedOne.split('\n').length, 1,
+    'precondition: exactly one line was deleted while the fence was up')
+
+  const plan = async (live: string, lib = CRONTAB_LOCK_LIB) => sh([
+    'set -uo pipefail',
+    'die(){ exit 1; }',
+    `source '${lib}'`,
+    `backup=$(cat <<'B_EOF'\n${backup}\nB_EOF\n)`,
+    `live=$(cat <<'L_EOF'\n${live}\nL_EOF\n)`,
+    'if plan_crontab_unfence "$backup" "$live"; then echo "PLAN=${CRON_UNFENCE_PLAN}"; else echo "REFUSED"; fi',
+    'echo "REASON=${CRON_UNFENCE_REASON}"',
+  ].join('\n'))
+
+  // CONTROL. Nothing was deleted: the live crontab IS the fence's projection of the backup, and the
+  // snapshot goes back. Without this the refusal below could be a plan that refuses everything.
+  const untouched = await plan(projection)
+  assert.match(untouched.stdout, /PLAN=snapshot/,
+    `an unmoved world still restores verbatim:\n${untouched.stdout}${untouched.stderr}`)
+
+  // THE PROPERTY. `17 3 * * * /usr/bin/retired` was removed while the fence was up. Restoring the
+  // snapshot would schedule it again.
+  const deleted = await plan(deletedOne)
+  assert.match(deleted.stdout, /^REFUSED$/m,
+    `a deletion is a write and cannot be undone by a snapshot:\n${deleted.stdout}${deleted.stderr}`)
+  assert.match(deleted.stdout, /17 3 \* \* \* \/usr\/bin\/retired/,
+    'and the refusal must NAME the line, because settling this is a human job')
+})
+
+test('[o3d-batch-ret] MUTATION: round 27\'s lost-lines branch schedules the deleted job again', async () => {
+  // THE ROUTE, RUN. The branch as it shipped last round: live gained nothing over the projection,
+  // therefore nothing wrote, therefore install the snapshot.
+  const lib = libraryWith([[
+    '  if crontab_is_unmoved_since_backup "${backup}" "${live}"; then',
+    '  if [[ -z "$(awk \'NR == FNR { have[$0] = 1; next } /^[[:space:]]*$/ { next } !($0 in have) { print }\''
+    + ' <(crontab_fence_projection "${backup}") <(printf \'%s\\n\' "${live}"))" ]]; then',
+  ]])
+  const backup = '# an operator line\nPATH=/usr/local/bin\n*/5 * * * * /usr/bin/keep\n17 3 * * * /usr/bin/retired'
+  const live = (await fenceProjectionOf(backup)).replace(/\n$/, '')
+    .split('\n').filter((l) => !l.includes('/usr/bin/retired')).join('\n')
+  const run = await sh([
+    'set -uo pipefail',
+    'die(){ exit 1; }',
+    `source '${lib}'`,
+    `backup=$(cat <<'B_EOF'\n${backup}\nB_EOF\n)`,
+    `live=$(cat <<'L_EOF'\n${live}\nL_EOF\n)`,
+    'if plan_crontab_unfence "$backup" "$live"; then echo "PLAN=${CRON_UNFENCE_PLAN}"; else echo REFUSED; fi',
+    'echo "TEXT<<"; printf "%s\\n" "${CRON_UNFENCE_TEXT}"',
+  ].join('\n'))
+  assert.match(run.stdout, /PLAN=snapshot/, `the lost-lines branch takes it:\n${run.stdout}${run.stderr}`)
+  assert.match(run.stdout, /17 3 \* \* \* \/usr\/bin\/retired/,
+    'THE RESURRECTION: the entry the operator deleted is in the text about to be installed')
+})
+
+test('[o3d-batch-ret] the preservation check counts OCCURRENCES and respects ORDER, because cron does', async () => {
+  // Codex r28 MEDIUM. Two identical entries run the job TWICE, and `PATH=`/`CRON_TZ=` apply to the
+  // entries BELOW them — so "every line still exists somewhere" is not the same crontab.
+  const missing = async (backup: string, candidate: string, lib = CRONTAB_LOCK_LIB) => sh([
+    'set -uo pipefail',
+    'die(){ exit 1; }',
+    `source '${lib}'`,
+    `backup=$(cat <<'B_EOF'\n${backup}B_EOF\n)`,
+    `candidate=$(cat <<'C_EOF'\n${candidate}C_EOF\n)`,
+    'echo "MISSING<<"',
+    'crontab_unmanaged_lines_missing_from "$backup" "$candidate"',
+    'echo ">>END"',
+  ].join('\n'))
+
+  const twice = '0 1 * * * /usr/bin/sweep\n0 1 * * * /usr/bin/sweep\n'
+  const once = '0 1 * * * /usr/bin/sweep\n'
+  const block = '# --- OTI CRON START ---\n*/7 * * * * curl "$BASE_URL/backup"\n# --- OTI CRON END ---\n'
+
+  // CONTROL. Both occurrences present: nothing is missing. Without this the check below could be
+  // one that reports everything.
+  const kept = await missing(twice, `${twice}${block}`)
+  assert.match(kept.stdout, /MISSING<<\n>>END/, `two kept as two must pass:\n${kept.stdout}${kept.stderr}`)
+
+  // THE PROPERTY, ONE. Two occurrences in the backup, one in the candidate: the job would run half
+  // as often, and the merge must not call that lossless.
+  const halved = await missing(twice, `${once}${block}`)
+  assert.match(halved.stdout, /MISSING<<\n0 1 \* \* \* \/usr\/bin\/sweep\n>>END/,
+    `a duplicate reduced to one occurrence is a LOSS:\n${halved.stdout}${halved.stderr}`)
+
+  // THE PROPERTY, TWO. Every line still exists, and the crontab means something different: the job
+  // has moved above the assignment that dated it.
+  const reordered = await missing('CRON_TZ=Europe/London\n0 1 * * * /usr/bin/sweep\n',
+    '0 1 * * * /usr/bin/sweep\nCRON_TZ=Europe/London\n')
+  assert.match(reordered.stdout, /MISSING<</, reordered.stdout)
+  assert.notEqual(reordered.stdout.replace(/MISSING<<\n|>>END\n?/g, '').trim(), '',
+    `moving an environment assignment past a job must not pass:\n${reordered.stdout}${reordered.stderr}`)
+
+  // …and the same two facts reach the operator through the shipped plan, which is where they
+  // decide whether the backup may be deleted.
+  const planned = await sh([
+    'set -uo pipefail',
+    'die(){ exit 1; }',
+    `source '${CRONTAB_LOCK_LIB}'`,
+    `backup=$(cat <<'B_EOF'\n${twice}B_EOF\n)`,
+    `live=$(cat <<'L_EOF'\n#DEPLOY-FENCE# 0 1 * * * /usr/bin/sweep\n${block}L_EOF\n)`,
+    'if plan_crontab_unfence "$backup" "$live"; then echo "PLAN=${CRON_UNFENCE_PLAN}"; else echo REFUSED; fi',
+  ].join('\n'))
+  assert.match(planned.stdout, /^REFUSED$/m,
+    `the merge must refuse rather than halve the schedule and delete the backup:\n${planned.stdout}${planned.stderr}`)
+})
+
+test('[o3d-batch-ret] MUTATION: the set-based comparison passes both of those', async () => {
+  // THE ROUTE, RUN. `have[$0]` — the body as it stood before this round, appended so it overrides
+  // the shipped definition and everything else runs unchanged.
+  const src = `${CRONTAB_LOCK_LIB_SRC}
+crontab_unmanaged_lines_missing_from() {
+  local backup="$1" candidate="$2"
+  awk '
+    NR == FNR { have[$0] = 1; next }
+    /^# --- OTI CRON START ---[ \\t\\r]*$/ { in_block = 1; next }
+    /^# --- OTI CRON END ---[ \\t\\r]*$/   { in_block = 0; next }
+    in_block { next }
+    /^[[:space:]]*$/ { next }
+    !($0 in have) { print }
+  ' <(printf '%s\\n' "\${candidate}") <(printf '%s\\n' "\${backup}")
+}
+`
+  const lib = join(FAULT_DIR, 'crontab-lock-setwise.sh')
+  writeFileSync(lib, src)
+
+  const run = async (backup: string, candidate: string) => sh([
+    'set -uo pipefail',
+    'die(){ exit 1; }',
+    `source '${lib}'`,
+    `backup=$(cat <<'B_EOF'\n${backup}B_EOF\n)`,
+    `candidate=$(cat <<'C_EOF'\n${candidate}C_EOF\n)`,
+    'echo "MISSING<<"; crontab_unmanaged_lines_missing_from "$backup" "$candidate"; echo ">>END"',
+  ].join('\n'))
+
+  const halved = await run('0 1 * * * /usr/bin/sweep\n0 1 * * * /usr/bin/sweep\n', '0 1 * * * /usr/bin/sweep\n')
+  assert.match(halved.stdout, /MISSING<<\n>>END/,
+    `THE FINDING: a set says nothing is missing while the job now runs once:\n${halved.stdout}${halved.stderr}`)
+
+  const reordered = await run('CRON_TZ=Europe/London\n0 1 * * * /usr/bin/sweep\n',
+    '0 1 * * * /usr/bin/sweep\nCRON_TZ=Europe/London\n')
+  assert.match(reordered.stdout, /MISSING<<\n>>END/,
+    `and says nothing is missing while the job now runs in a different timezone:\n${reordered.stdout}`)
+})
+
+test('[o3d-batch-ret] no entrypoint reads the crontab without going through the one reader', () => {
+  const faults: string[] = []
+  let reads = 0
+  for (const [name, src] of SHELL_ENTRYPOINTS) {
+    const calls = src.split('\n').filter((line) => /^\s*read_crontab_for /.test(line))
+    reads += calls.length
+    assert.ok(calls.length >= 5,
+      `${name} must route its crontab reads through read_crontab_for (found ${calls.length})`)
+    src.split('\n').forEach((line, i) => {
+      if (/^\s*#/.test(line)) return
+      if (/crontab\b[^"']*-l\b[^"']*2>\/dev\/null/.test(line)) {
+        faults.push(`${name}:${i + 1} reads the crontab with its diagnostic discarded: ${line.trim()}`)
+      }
+    })
+  }
+  assert.deepEqual(faults, [], faults.join('\n'))
+  // NOT VACUOUS: the walk really did reach the reads it is a rule about.
+  assert.ok(reads >= 15, `the sweep must have found the shipped reads, and found ${reads}`)
+  assert.match(CRONTAB_LOCK_LIB_SRC, /^read_crontab_for\(\) \{$/m,
+    'and the reader must live in the shared library, not be copied into each entrypoint')
+  for (const [name, src] of SHELL_ENTRYPOINTS) {
+    assert.doesNotMatch(src, /^read_crontab_for\(\) \{$/m, `${name} must not define its own copy`)
+  }
 })
