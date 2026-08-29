@@ -1241,6 +1241,12 @@ export async function saveIntegrationPluginState(
       // `requirePermission`, which answers an invalidated or 2FA-unverified session by throwing
       // NEXT_REDIRECT — and round 8's post-commit guard swallowed that into a scheduler warning
       // instead of letting Next redirect. This caller has already run the identical gate above.
+      // ITS `followUpError` IS DELIBERATELY NOT SURFACED HERE (Codex r20 MEDIUM). This step reports ONE
+      // outcome, so the only channel available says "the scheduler is behind" — and after a
+      // post-write follow-up failure the scheduler is NOT behind: the crontab is applied and what
+      // failed is the audit row recording it. Saying so would be the same false sentence the split
+      // was made to remove, and the row cannot be recorded by a second attempt at the log that just
+      // failed. The crontab result is the answer; the missing record is accepted.
       return reconcileCrontab()
     },
   })
