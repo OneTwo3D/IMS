@@ -51,6 +51,20 @@ export const SHIPPED = [
   'compose_database_url',
   // r43 (Codex HIGH): the route the APPLICATION takes, derived from the composer rather than
   // asserted, and the reference every probe is now aligned to.
+  //
+  // r44 (Codex HIGH): and the half of the driver's configuration the URL does not carry. The bus
+  // reader is lifted with it because db_application_route_env_refusal() goes through the SHIPPED
+  // unit scan rather than through a second reader of its own -- which is the finding r44 answers,
+  // so a rig that stubbed the scan would be measuring the defect rather than the fix.
+  'bus_read_strings',
+  'bus_array_count',
+  'bus_unit_property',
+  'bus_element_names_variable',
+  'bus_read_env_ignore_flags',
+  'unit_env_var_sole_source',
+  'db_route_env_variables',
+  'db_route_env_effect',
+  'db_application_route_env_refusal',
   'db_application_route_sslmode',
   'installed_database_password',
   // r39 (Codex HIGH): the durable mechanism, and the journal that makes the ALTER recoverable.
@@ -165,6 +179,20 @@ DB_PROBE_REPORT=""
 DB_PROBE_ROUTE_DATABASE=""
 DB_PROBE_SSLMODE=""
 DB_ENDPOINT_ROUTE_SSLMODE=""
+# r44 (Codex HIGH): what the SHIPPED unit scan needs to exist, for the same reason as everything
+# else in this block -- the functions are lifted, the assignments beside them are not.
+#
+# The unit name the scan is given is \`\${APP_NAME}.service\`, which on this host is
+# \`one-two-inventory.service\` and is NOT a unit systemd has. That is not a hole in the rig, it is
+# the case the \`none\` layer names: a unit systemd does not have defines nothing. The refusal paths
+# are measured against a STUBBED busctl in the r44 tests, where the renderings are systemd's own.
+BUS_STRINGS=()
+BUS_ENV_IGNORE_FLAGS=()
+ENV_VAR_SOURCE_REASON=""
+DB_ENV_SNAPSHOT_FILE=/var/lib/one-two-inventory/deploy/db-identity.env
+DB_ENV_SNAPSHOT_DROPIN_NAME=zz-deploy-db-identity.conf
+DB_ENV_SNAPSHOT_PUBLISHED=false
+DB_IDENTITY_REQUIRE_SNAPSHOT=false
 # r41 (Codex HIGH): THE SHIPPED READER, at its real path.
 #
 # In install.sh this resolves from \${IMS_SCRIPT_LIB_DIR}, which is derived from BASH_SOURCE — and

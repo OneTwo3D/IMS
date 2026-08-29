@@ -1839,7 +1839,12 @@ test('r43: a DATABASE_URL the driver was not measured against stops the gate rat
     # A PASSWORD CANNOT REACH THE QUERY STRING: the composer encodes the userinfo.
     echo "ENCODED_URL=$(compose_database_url "\${DB_USER}" 'a?b' "\${DB_HOST}" "\${DB_PORT}" "\${DB_NAME}")"
     ( DB_NAME='one_two_inventory?sslmode=require'
-      echo "UNKNOWN_ROUTE=$(db_application_route_sslmode || echo REFUSED)"
+      # r44: the derivation PRINTS ITS REASON and returns 1, so the status is read separately
+      # rather than through \`|| echo REFUSED\` -- the reason is now what the caller quotes.
+      if unknown="$(db_application_route_sslmode)"
+      then echo "UNKNOWN_ROUTE=admitted:\${unknown}"
+      else echo "UNKNOWN_ROUTE=REFUSED:\${unknown}"
+      fi
       DB_PROBE_REPORT=""
       if db_endpoint_checks_role_verifier postgres; then echo "UNKNOWN_ADMITTED=yes"; else echo "UNKNOWN_ADMITTED=no"; fi
       echo "REPORT_B64=$(printf '%s' "\${DB_PROBE_REPORT}" | base64 -w0)" )
@@ -1847,9 +1852,424 @@ test('r43: a DATABASE_URL the driver was not measured against stops the gate rat
   assert.equal(run.status, 0, run.output)
   assert.match(run.output, /ORDINARY_ROUTE=disable/, 'precondition: the ordinary URL has a known route')
   assert.match(run.output, /ENCODED_URL=postgresql:\/\/imsuser:a%3Fb@/, 'and a `?` in the password cannot create a query string')
-  assert.match(run.output, /UNKNOWN_ROUTE=REFUSED/, 'a URL with a query string has no route this run has measured')
+  assert.match(run.output, /UNKNOWN_ROUTE=REFUSED:/, 'a URL with a query string has no route this run has measured')
+  assert.match(run.output, /UNKNOWN_ROUTE=REFUSED:.*carries a query string/,
+    'and since r44 the derivation says WHICH of the several ways the route is unknowable this is')
   assert.match(run.output, /UNKNOWN_ADMITTED=no/, 'so no endpoint is asked which rule it matches')
   const report = Buffer.from(readVar(run.output, 'REPORT_B64'), 'base64').toString('utf8')
   assert.match(report, /cannot say which TRANSPORT the application's own connection takes/,
     'and the report names the question that could not be answered')
+})
+
+// ---------------------------------------------------------------------------
+// 22. THE LOAD-BEARING ONE FOR r44: PGSSLMODE puts the application on the OTHER record
+//
+// THE FINDING (Codex HIGH). r43 answered `disable` because the composed URL has no query string.
+// That is not why node-postgres connects in the clear: the URL leaves `ssl` undefined and the
+// driver then reads `process.env.PGSSLMODE`. So a host that sets it — in the installer's own
+// environment, in the manager's, or in the unit — has an application on `hostssl` while this gate
+// reads, probes and rotates against `hostnossl`, which is the exact post-upgrade outage r43 exists
+// to prevent, arriving through the door r43 did not look at.
+//
+// THE CLUSTER IS THE ONE CODEX NAMED, ROUND THE WAY THAT MAKES THE GATE WRONG RATHER THAN MERELY
+// DIFFERENT:
+//
+//   hostssl   all all 127.0.0.1/32 trust            <- what the application meets. Checks nothing.
+//   hostnossl all all 127.0.0.1/32 scram-sha-256    <- what the gate reads. Impeccable.
+//
+// EVERY PRECONDITION HERE IS MEASURED WITH THE INSTALLED DRIVER against that cluster, because the
+// claim under test is about what pg does and not about what this file believes pg does.
+// ---------------------------------------------------------------------------
+
+/** What the INSTALLED driver does with one URL under one environment: does it get TLS, or in at all? */
+async function driverTransport(url: string, overrides: Record<string, string | undefined>): Promise<string> {
+  const saved: Record<string, string | undefined> = {}
+  for (const [key, value] of Object.entries(overrides)) {
+    saved[key] = process.env[key]
+    if (value === undefined) delete process.env[key]
+    else process.env[key] = value
+  }
+  const { default: pg } = await import('pg')
+  const client = new pg.Client({ connectionString: url })
+  try {
+    await client.connect()
+    const result = await client.query('SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()')
+    await client.end()
+    return result.rows[0].ssl === true ? 'tls' : 'cleartext'
+  } catch (error) {
+    return `refused:${(error as { code?: string }).code ?? ''}`
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  }
+}
+
+test('r44: a PGSSLMODE in the environment puts the application on a record the gate never read', async () => {
+  // MUTATIONS (each made locally and re-run; the route each one takes is stated):
+  //   M1 -- delete the `db_application_route_env_refusal` call from db_application_route_sslmode().
+  //         GATE_WITH_REQUIRE and GATE_WITH_NOVERIFY both become `admitted`: the gate reads the
+  //         hostnossl scram-sha-256 record and vouches for it while the application is on the
+  //         hostssl trust record (no-verify) or cannot authenticate at all (require). That is r43
+  //         exactly, and it is the defect. This test is the only one in the suite that fails.
+  //   M2 -- keep the call but drop PGSSLMODE from db_route_env_variables(): identical failure,
+  //         which is what makes the LIST a checked claim rather than a comment.
+  //   M3 -- have db_application_route_env_refusal() look only at the unit and not at this process:
+  //         both gate cases become `admitted` again, because the environment that reaches the
+  //         migration and the build is this one.
+  const root = mkdtempSync(join(tmpdir(), 'ims-r44-'))
+  let cluster: Cluster | undefined
+  try {
+    cluster = startCluster(root, 'split', await freePort(), '127.0.0.1', [
+      'hostssl all all 127.0.0.1/32 trust',
+      'hostnossl all all 127.0.0.1/32 scram-sha-256',
+    ], { ssl: true })
+    seedLiveInstallation(cluster)
+    const url = `postgresql://imsuser:live-password@127.0.0.1:${cluster.port}/postgres`
+
+    // PRECONDITION 1: the split is real and BOTH records are reachable from this host.
+    assert.equal(
+      cluster.psql(['-tAc', "SELECT count(*) FROM pg_hba_file_rules WHERE type='hostssl' AND auth_method='trust'"]),
+      '1', 'precondition: the hostssl record must be trust')
+    assert.equal(
+      cluster.psql(['-tAc', "SELECT count(*) FROM pg_hba_file_rules WHERE type='hostnossl' AND auth_method='scram-sha-256'"]),
+      '1', 'precondition: and the hostnossl record must check the password')
+
+    // PRECONDITION 2, MEASURED WITH THE INSTALLED DRIVER: what r43 asserts is true only while
+    // nothing sets PGSSLMODE, and the driver takes the OTHER record the moment something does.
+    assert.equal(await driverTransport(url, { PGSSLMODE: undefined }),
+      'cleartext', 'precondition: with no PGSSLMODE the driver is matched by the hostnossl record — r43 measured this and it still holds')
+    assert.equal(await driverTransport(url, { PGSSLMODE: 'no-verify' }),
+      'tls', 'and with PGSSLMODE=no-verify the SAME URL is matched by the hostssl TRUST record instead')
+    assert.equal(await driverTransport(url, { PGSSLMODE: 'require' }),
+      'refused:DEPTH_ZERO_SELF_SIGNED_CERT',
+      'and with PGSSLMODE=require it demands a CA-verified certificate — pg’s `require` is verify-full — so against a self-signed cluster it never authenticates at all')
+
+    const vars = { ...installVars(cluster, root), DB_PASSWORD: 'rotated-secret' }
+    const gate = `
+      DB_PROBE_REPORT=""
+      if db_endpoint_checks_role_verifier postgres; then echo "$1=admitted"; else echo "$1=refused"; fi
+      echo "$1_ROUTE=\${DB_PROBE_SSLMODE}"
+      echo "$1_REPORT_B64=$(printf '%s' "\${DB_PROBE_REPORT}" | base64 -w0)"
+    `
+    const run = runShipped(vars, `
+      gate() { ${gate} }
+      # THE CONTROL FIRST, so a refusal below cannot be the cluster refusing.
+      gate GATE_CLEAN
+      ( export PGSSLMODE=require;   gate GATE_WITH_REQUIRE )
+      ( export PGSSLMODE=no-verify; gate GATE_WITH_NOVERIFY )
+      ( export PGREPLICATION=true;  gate GATE_WITH_REPLICATION )
+      ( export NODE_PG_FORCE_NATIVE=1; gate GATE_WITH_NATIVE )
+    `)
+    assert.equal(run.status, 0, run.output)
+
+    assert.match(run.output, /GATE_CLEAN=admitted/,
+      'control: with nothing set, the hostnossl scram-sha-256 record IS the application’s and the gate admits it')
+    assert.match(run.output, /GATE_CLEAN_ROUTE=disable/, 'and publishes the route it read it on')
+
+    for (const label of ['GATE_WITH_REQUIRE', 'GATE_WITH_NOVERIFY', 'GATE_WITH_REPLICATION', 'GATE_WITH_NATIVE']) {
+      assert.match(run.output, new RegExp(`^${label}=refused$`, 'm'),
+        `${label}: the driver’s route is not the one this gate derived, so nothing may be read on it:\n${run.output}`)
+      assert.match(run.output, new RegExp(`^${label}_ROUTE=$`, 'm'),
+        `${label}: and no route is published, so no credential-bearing probe can run either`)
+    }
+    const withRequire = Buffer.from(readVar(run.output, 'GATE_WITH_REQUIRE_REPORT_B64'), 'base64').toString('utf8')
+    assert.match(withRequire, /PGSSLMODE=require in its own environment/, 'the report names the variable and its value')
+    assert.match(withRequire, /hostssl record is a different pg_hba record from a hostnossl one/, 'and why that decides the question')
+    assert.match(withRequire, /Unset PGSSLMODE and re-run/, 'and what to do about it')
+    const withNative = Buffer.from(readVar(run.output, 'GATE_WITH_NATIVE_REPORT_B64'), 'base64').toString('utf8')
+    assert.match(withNative, /NODE_PG_FORCE_NATIVE=1/, 'and the same for the one that swaps the whole driver out')
+  } finally {
+    cluster?.stop()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 23. WHERE THE SERVICE WOULD GET ONE — all three places, and the reader is the shipped one
+//
+// `busctl` and `systemctl` are stubbed for the same reason the port resolution tests stub them
+// (deploy-order.test.ts): the point is not whether busctl works, it is that everything which
+// DECIDES is the shipped code. The renderings below are the shape systemd actually prints, taken
+// read-only off THIS HOST: `as 7 "NODE_ENV=development" … "PORT=3000" …` for Environment= and
+// `a(sb) 1 "/opt/ims/onetwo3d-ims/.env" true` for EnvironmentFiles= on ims-stage-dev.service.
+// ---------------------------------------------------------------------------
+
+interface RouteEnvOptions {
+  readonly processEnv?: Record<string, string>
+  readonly managerEnv?: string
+  readonly environment?: string
+  readonly passEnvironment?: string
+  readonly unsetEnvironment?: string
+  readonly environmentFiles?: string
+  readonly pamName?: string
+  readonly loadState?: string
+  readonly envFile?: { path: string; contents: string }
+}
+
+function runRouteEnv(options: RouteEnvOptions): { status: number; output: string } {
+  const source = readFileSync(join(REPO, 'scripts/install.sh'), 'utf8')
+  const lift = (name: string): string => {
+    const start = source.indexOf(`\n${name}() {\n`)
+    assert.notEqual(start, -1, `precondition: scripts/install.sh must define ${name}()`)
+    const end = source.indexOf('\n}\n', start)
+    return source.slice(start + 1, end + 3)
+  }
+  if (options.envFile !== undefined) writeFileSync(options.envFile.path, options.envFile.contents)
+  const program = [
+    'set -uo pipefail',
+    'APP_NAME="one-two-inventory"',
+    'DB_USER=imsuser; DB_HOST=127.0.0.1; DB_PORT=5432; DB_NAME=one_two_inventory',
+    'BUS_STRINGS=(); BUS_ENV_IGNORE_FLAGS=(); ENV_VAR_SOURCE_REASON=""',
+    'DB_ENV_SNAPSHOT_FILE=/var/lib/one-two-inventory/deploy/db-identity.env',
+    'DB_ENV_SNAPSHOT_DROPIN_NAME=zz-deploy-db-identity.conf',
+    'DB_ENV_SNAPSHOT_PUBLISHED=false; DB_IDENTITY_REQUIRE_SNAPSHOT=false',
+    ...Object.entries(options.processEnv ?? {}).map(([key, value]) => `export ${key}=${JSON.stringify(value)}`),
+    // systemd’s own answer for the block it passes to every service.
+    // `%b`, so the \n in the JSON-quoted string becomes the line break systemd prints.
+    `systemctl(){ case "$*" in show-environment) printf '%b\\n' ${JSON.stringify(options.managerEnv ?? 'LANG=C\nPATH=/usr/bin')} ;; *) return 1 ;; esac; }`,
+    'busctl(){',
+    '  case "$*" in',
+    `    *LoadUnit*) printf '%s\\n' 'o "/org/freedesktop/systemd1/unit/one_2dtwo_2dinventory_2eservice"' ;;`,
+    `    *Unit\\ LoadState*) printf '%s\\n' '${options.loadState ?? 's "loaded"'}' ;;`,
+    // EnvironmentFiles FIRST: `*Service\ Environment*` is a prefix of it.
+    `    *Service\\ EnvironmentFiles*) printf '%s\\n' '${options.environmentFiles ?? 'a(sb) 0'}' ;;`,
+    `    *Service\\ Environment*) printf '%s\\n' '${options.environment ?? 'as 0'}' ;;`,
+    `    *Service\\ PassEnvironment*) printf '%s\\n' '${options.passEnvironment ?? 'as 0'}' ;;`,
+    `    *Service\\ UnsetEnvironment*) printf '%s\\n' '${options.unsetEnvironment ?? 'as 0'}' ;;`,
+    `    *Service\\ PAMName*) printf '%s\\n' '${options.pamName ?? 's ""'}' ;;`,
+    '    *) return 1 ;;',
+    '  esac',
+    '}',
+    lift('bus_read_strings'),
+    lift('bus_array_count'),
+    lift('bus_unit_property'),
+    lift('bus_element_names_variable'),
+    lift('bus_read_env_ignore_flags'),
+    lift('unit_env_var_sole_source'),
+    lift('url_encode_userinfo'),
+    lift('compose_database_url'),
+    lift('db_route_env_variables'),
+    lift('db_route_env_effect'),
+    lift('db_application_route_env_refusal'),
+    lift('db_application_route_sslmode'),
+    'if route="$(db_application_route_sslmode)"; then echo "ROUTE=${route}"; else echo "REFUSED=${route}"; fi',
+  ].join('\n')
+  try {
+    return {
+      status: 0,
+      output: execFileSync('bash', ['-c', program], { encoding: 'utf8', env: cleanLibpqEnv(), stdio: ['ignore', 'pipe', 'pipe'] }),
+    }
+  } catch (error) {
+    const failure = error as { status?: number; stdout?: string; stderr?: string }
+    return { status: failure.status ?? -1, output: `${failure.stdout ?? ''}${failure.stderr ?? ''}` }
+  }
+}
+
+test('r44: every environment source that can reach the service is refused, not just this process’s', () => {
+  // MUTATION ROUTES, one per source (each made locally and re-run):
+  //   - delete the `${!name+is-set}` branch: the four `this process` cases resolve to disable.
+  //   - delete the `systemctl show-environment` branch: the manager case resolves.
+  //   - delete the `unit_env_var_sole_source` call: all five unit cases resolve.
+  //   - give the `none` layer the `file` layer’s EnvironmentFile= handling (do not open them):
+  //     the environment-file case resolves, which is the case a reader that only looked at
+  //     directives would have missed.
+  // THE CONTROLS at the end are what stop any of those mutations being answered by "just refuse
+  // everything": a clean unit, a unit systemd does not have, and a file that names something else
+  // must all still resolve to `disable`.
+  const root = mkdtempSync(join(tmpdir(), 'ims-r44-src-'))
+  try {
+    const envPath = join(root, '.env')
+    const cases: ReadonlyArray<{ label: string; options: RouteEnvOptions; says: RegExp }> = [
+      { label: 'this process, PGSSLMODE', options: { processEnv: { PGSSLMODE: 'require' } }, says: /running with PGSSLMODE=require in its own environment/ },
+      { label: 'this process, PGREPLICATION', options: { processEnv: { PGREPLICATION: 'true' } }, says: /WAL sender, which pg_hba matches on the replication keyword/ },
+      { label: 'this process, NODE_PG_FORCE_NATIVE', options: { processEnv: { NODE_PG_FORCE_NATIVE: '1' } }, says: /replaces node-postgres with libpq/ },
+      { label: 'the manager environment block', options: { managerEnv: 'LANG=C\nPGSSLMODE=require\nPATH=/usr/bin' }, says: /systemd manager passes PGSSLMODE to every service/ },
+      { label: 'the unit’s Environment=', options: { environment: 'as 2 "NODE_ENV=production" "PGSSLMODE=require"' }, says: /sets PGSSLMODE in its own Environment=/ },
+      { label: 'the unit’s PassEnvironment=', options: { passEnvironment: 'as 1 "PGSSLMODE"' }, says: /lists PGSSLMODE in PassEnvironment=/ },
+      { label: 'the unit’s UnsetEnvironment=', options: { unsetEnvironment: 'as 1 "PGSSLMODE"' }, says: /lists PGSSLMODE in UnsetEnvironment=/ },
+      { label: 'the unit’s PAMName=', options: { pamName: 's "login"' }, says: /sets PAMName=login/ },
+      {
+        label: 'an environment file the unit loads',
+        options: {
+          environmentFiles: `a(sb) 1 "${envPath}" true`,
+          envFile: { path: envPath, contents: 'NODE_ENV=production\nPGSSLMODE=no-verify\n' },
+        },
+        says: new RegExp(`loads the environment file ${envPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}, and that file has a line naming PGSSLMODE`),
+      },
+      {
+        label: 'an environment file that exports it',
+        options: {
+          environmentFiles: `a(sb) 1 "${envPath}" true`,
+          envFile: { path: envPath, contents: '  export PGSSLMODE = require\n' },
+        },
+        says: /has a line naming PGSSLMODE/,
+      },
+      {
+        label: 'an environment file systemd had to escape',
+        options: { environmentFiles: 'a(sb) 1 "/opt/app/a\\"b.env" false' },
+        says: /a path it had to escape to state/,
+      },
+    ]
+    for (const scenario of cases) {
+      const result = runRouteEnv(scenario.options)
+      assert.match(result.output, /^REFUSED=/m, `${scenario.label}: this must refuse, not resolve:\n${result.output}`)
+      assert.match(result.output, scenario.says, `${scenario.label}: the refusal must name the source:\n${result.output}`)
+      assert.match(result.output, /pg_hba record|WAL sender|libpq/, `${scenario.label}: and say what it does to the route:\n${result.output}`)
+    }
+
+    // THE CONTROLS.
+    assert.match(runRouteEnv({}).output, /^ROUTE=disable$/m, 'a unit that carries none of them resolves')
+    assert.match(
+      runRouteEnv({ loadState: 's "not-found"' }).output, /^ROUTE=disable$/m,
+      'and a unit systemd does not have defines nothing — which is a first install, and every one of this file’s other tests')
+    assert.match(
+      runRouteEnv({
+        environment: 'as 7 "NODE_ENV=development" "NEXT_PUBLIC_APP_URL=https://x" "AUTH_URL=https://x" "PORT=3000" "HOSTNAME=0.0.0.0" "HOME=/opt/ims/onetwo3d-ims" "NPM_CONFIG_CACHE=/opt/ims/onetwo3d-ims/.npm-cache"',
+        environmentFiles: `a(sb) 1 "${envPath}" true`,
+        envFile: { path: envPath, contents: 'NODE_ENV=production\nDATABASE_URL=postgresql://a:b@127.0.0.1:5432/c\nNEXT_PUBLIC_PGSSLMODE=require\n' },
+      }).output,
+      /^ROUTE=disable$/m,
+      'and THIS HOST’s real unit shape — read off ims-stage-dev.service — resolves, including a file whose only near miss is a differently-named variable')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 24. THE SET IS THE DRIVER’S, AND IT IS MEASURED HERE RATHER THAN QUOTED
+//
+// The whole finding is a variable nobody enumerated. So the enumeration is a test: the installed
+// `pg` is asked, through a recording Proxy over `process.env`, which variables it consults when
+// handed exactly the URL compose_database_url() emits — and this fails the day it consults one
+// this gate has not classified.
+// ---------------------------------------------------------------------------
+
+test('r44: the variables the installed driver consults are exactly the ones this gate classifies', () => {
+  // MUTATION ROUTE: add a name to db_route_env_variables() that the driver does not read, or
+  // remove one it does, and the last two assertions fail. Change the URL compose_database_url()
+  // emits so that it stops stating (say) the port, and PGPORT appears in the measured set and the
+  // first assertion fails — which is the r37 measurement, re-measured here instead of remembered.
+  const probe = `
+    const seen = new Set()
+    const base = { ...process.env }
+    const proxy = new Proxy(base, {
+      get(target, key) { if (typeof key === 'string') seen.add(key); return target[key] },
+      has(target, key) { if (typeof key === 'string') seen.add(key); return key in target },
+    })
+    Object.defineProperty(process, 'env', { value: proxy, configurable: true, writable: true })
+    // The recorder is in place BEFORE the first require, because NODE_PG_FORCE_NATIVE is read at
+    // module load (pg/lib/index.js) and the module cache means there is no second chance at it.
+    require('pg')
+    const ConnectionParameters = require('pg/lib/connection-parameters.js')
+    new ConnectionParameters('postgresql://imsuser:pw@127.0.0.1:5432/one_two_inventory')
+    console.log(JSON.stringify([...seen].filter((name) => /^(PG|NODE_PG)/.test(name)).sort()))
+  `
+  const consulted: string[] = JSON.parse(
+    execFileSync('node', ['-e', probe], { encoding: 'utf8', cwd: REPO, env: cleanLibpqEnv() }).trim(),
+  )
+  // The URL states all five identity values, so the driver never falls back to their variables.
+  for (const absent of ['PGHOST', 'PGPORT', 'PGUSER', 'PGDATABASE', 'PGPASSWORD']) {
+    assert.ok(!consulted.includes(absent),
+      `r37 measured that a complete URL leaves ${absent} unconsulted; it must still be true:\n${consulted.join(' ')}`)
+  }
+  // NODE_PG_FORCE_NATIVE is read at module load, not by ConnectionParameters, so the probe
+  // re-requires `pg` with a cleared recorder to catch it in the same measurement.
+  assert.deepEqual(consulted.sort(), [
+    'NODE_PG_FORCE_NATIVE',
+    'PGAPPNAME',
+    'PGBINARY',
+    'PGCLIENT_ENCODING',
+    'PGCONNECT_TIMEOUT',
+    'PGOPTIONS',
+    'PGREPLICATION',
+    'PGSSLMODE',
+  ], 'the installed driver consults exactly these, and a new one is this finding again')
+
+  const source = readFileSync(join(REPO, 'scripts/install.sh'), 'utf8')
+  const listed = execFileSync('bash', ['-c', `${source.slice(source.indexOf('\ndb_route_env_variables() {\n'), source.indexOf('\n}\n', source.indexOf('\ndb_route_env_variables() {\n')) + 3)}\ndb_route_env_variables`], { encoding: 'utf8' })
+    .trim().split('\n')
+  assert.deepEqual(listed, ['PGSSLMODE', 'PGREPLICATION', 'NODE_PG_FORCE_NATIVE'],
+    'and the gate refuses exactly the ones that move which pg_hba record answers')
+  for (const name of consulted) {
+    assert.ok(source.includes(name), `${name} must at least be NAMED in the derivation’s argument, refused or not`)
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 25. THE OTHER HALF OF "BEFORE RECONCILIATION AND STARTUP"
+// ---------------------------------------------------------------------------
+
+test('r44: a PGSSLMODE the service would be started with stops the start too', () => {
+  // The reconciliation half is test 22. This is the START: by then the gate has already rotated
+  // the credential against the record a CLEARTEXT connection is matched by, so a PGSSLMODE the
+  // service acquires between then and its exec is the same outage arriving after every check has
+  // passed.
+  //
+  // MUTATION ROUTE: delete the db_application_route_env_refusal() call from
+  // require_start_identity_bound() and the first case reports BOUND instead of REFUSED. The
+  // control below is what stops that mutation being answered by refusing everything.
+  const source = readFileSync(join(REPO, 'scripts/install.sh'), 'utf8')
+  const lift = (name: string): string => {
+    const start = source.indexOf(`\n${name}() {\n`)
+    assert.notEqual(start, -1, `precondition: scripts/install.sh must define ${name}()`)
+    return source.slice(start + 1, source.indexOf('\n}\n', start) + 3)
+  }
+  const root = mkdtempSync(join(tmpdir(), 'ims-r44-start-'))
+  try {
+    const envPath = join(root, '.env')
+    const snapshot = join(root, 'db-identity.env')
+    const url = 'postgresql://imsuser:pw@127.0.0.1:5432/one_two_inventory'
+    writeFileSync(envPath, `NODE_ENV=production\nDATABASE_URL=${url}\n`)
+    writeFileSync(snapshot, `DATABASE_URL=${url}\n`)
+    const run = (extra: string): string => {
+      const program = [
+        'set -uo pipefail',
+        `APP_NAME="one-two-inventory"; APP_DIR=${JSON.stringify(root)}`,
+        'DB_USER=imsuser; DB_HOST=127.0.0.1; DB_PORT=5432; DB_NAME=one_two_inventory',
+        `DATABASE_URL=${JSON.stringify(url)}`,
+        'BUS_STRINGS=(); BUS_ENV_IGNORE_FLAGS=(); ENV_VAR_SOURCE_REASON=""; DB_IDENTITY_SOURCE_REASON=""',
+        `DB_ENV_SNAPSHOT_FILE=${JSON.stringify(snapshot)}`,
+        'DB_ENV_SNAPSHOT_DROPIN_NAME=zz-deploy-db-identity.conf',
+        'DB_ENV_SNAPSHOT_PUBLISHED=true; DB_IDENTITY_REQUIRE_SNAPSHOT=false',
+        extra,
+        `systemctl(){ case "$*" in show-environment) printf 'LANG=C\\n' ;; *) return 1 ;; esac; }`,
+        'busctl(){',
+        '  case "$*" in',
+        `    *LoadUnit*) printf '%s\\n' 'o "/x"' ;;`,
+        `    *Unit\\ LoadState*) printf '%s\\n' 's "loaded"' ;;`,
+        `    *Service\\ EnvironmentFiles*) printf '%s\\n' 'a(sb) 2 "${envPath}" false "${snapshot}" false' ;;`,
+        `    *Service\\ Environment*) printf '%s\\n' 'as 0' ;;`,
+        `    *Service\\ PassEnvironment*) printf '%s\\n' 'as 0' ;;`,
+        `    *Service\\ UnsetEnvironment*) printf '%s\\n' 'as 0' ;;`,
+        `    *Service\\ PAMName*) printf '%s\\n' 's ""' ;;`,
+        '    *) return 1 ;;',
+        '  esac',
+        '}',
+        lift('bus_read_strings'), lift('bus_array_count'), lift('bus_unit_property'),
+        lift('bus_element_names_variable'), lift('bus_read_env_ignore_flags'),
+        lift('unit_env_var_sole_source'), lift('env_file_is_sole_database_url_source'),
+        lift('require_env_file_is_sole_definition'), lift('env_file_value'),
+        lift('url_encode_userinfo'), lift('compose_database_url'),
+        lift('db_route_env_variables'), lift('db_route_env_effect'),
+        lift('db_application_route_env_refusal'), lift('require_start_identity_bound'),
+        'if require_start_identity_bound; then echo "BOUND"; else echo "REFUSED=${DB_IDENTITY_SOURCE_REASON}"; fi',
+      ].join('\n')
+      try {
+        return execFileSync('bash', ['-c', program], { encoding: 'utf8', env: cleanLibpqEnv(), stdio: ['ignore', 'pipe', 'pipe'] })
+      } catch (error) {
+        const failure = error as { stdout?: string; stderr?: string }
+        return `${failure.stdout ?? ''}${failure.stderr ?? ''}`
+      }
+    }
+    const withMode = run('export PGSSLMODE=require')
+    assert.match(withMode, /^REFUSED=/m, `the start must refuse:\n${withMode}`)
+    assert.match(withMode, /PGSSLMODE=require/, 'and name the variable')
+    assert.match(withMode, /rotated its credential against that record/, 'and say why the start is the wrong moment to discover it')
+    const clean = run('true')
+    assert.match(clean, /^BOUND$/m, `control: the same unit with nothing set still binds:\n${clean}`)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
 })
