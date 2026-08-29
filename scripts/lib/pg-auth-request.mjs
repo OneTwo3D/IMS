@@ -48,23 +48,26 @@
  *   * It cannot admit `password` (cleartext compared against the role's own secret), because the
  *     wire cannot tell it from `ldap`. That is a deliberate narrowing, and it costs a site running
  *     cleartext-against-PostgreSQL a refusal it did not strictly have to have.
- *   * IT IS A SEPARATE CONNECTION from the one the caller then opens with psql. That is why this
- *     program REPORTS THE ROUTE IT TOOK and not only the method it read -- see `sslmode=` below.
- *     A method observed on one transport is not a statement about another, and libpq's default
- *     `sslmode=prefer` picks its transport at RUN TIME: it means try TLS AND RETRY WITHOUT IT IF
- *     THAT CONNECTION FAILS, so against `hostssl ... scram-sha-256` over `hostnossl ... <anything>`
- *     a psql given a wrong password is refused by scram, drops to the clear, and is answered by
- *     the other record. This program never fails an authentication, so it stops at the hostssl
- *     record and reports an entirely admissible `scram-sha-256` -- and where the record underneath
- *     is `trust` the caller's negative control catches the divergence, while where it is `radius`
- *     over a directory holding the CURRENT password, the control is satisfied by it too and BOTH
- *     INSTRUMENTS PASS WHILE THE ANSWER IS FALSE, because they are answering about different
- *     transports (o3d-2sm1.5 r42, Codex HIGH).
- *     SO THE DIVERGENCE IS REMOVED RATHER THAN CROSS-CHECKED. `sslmode=` names the libpq setting
- *     that reproduces the transport this connection actually used, and install.sh pins every
- *     credential-bearing connection to that endpoint to it -- `require` or `disable`, never
- *     `prefer` -- so an authentication failure has no second record to select. What remains is a
- *     pg_hba RELOAD between the two connections, which no pinning can close and which the negative
+ *   * IT IS A SEPARATE CONNECTION from the one the caller then opens with psql, and from the one
+ *     the APPLICATION opens with node-postgres. That is why this program is TOLD which route to
+ *     take (`--sslmode=`) and REPORTS THE ROUTE IT TOOK (`sslmode=`), rather than only the method
+ *     it read. A method observed on one transport is not a statement about another: `hostssl` and
+ *     `hostnossl` are different records, and against `hostssl ... scram-sha-256` over
+ *     `hostnossl ... <anything>` the two answer differently about the same role.
+ *
+ *     WHICH ROUTE IS THE RIGHT ONE TO OBSERVE ON: THE APPLICATION'S (o3d-2sm1.5 r43, Codex HIGH).
+ *     Through r42 this program observed on libpq's default `sslmode=prefer` and the caller pinned
+ *     its psql probes to whatever came back. That aligned the instruments WITH EACH OTHER and left
+ *     them aligned with a connection nobody makes: node-postgres, handed the `DATABASE_URL` this
+ *     installer emits, sends no SSLRequest at all -- measured against the installed `pg`, not read
+ *     out of its documentation -- so the application is matched by the `hostnossl`/`host` record
+ *     while every probe was reading the `hostssl` one. On the split above that publishes a SCRAM
+ *     password the application's own route has never heard of.
+ *
+ *     So the caller passes the route the APPLICATION takes, this program takes exactly that one,
+ *     and the caller then pins its psql probes to it as well -- `require` or `disable`, never
+ *     `prefer`, so an authentication failure has no second record to fall onto. What remains is a
+ *     pg_hba RELOAD between the connections, which no pinning can close and which the negative
  *     control does still catch.
  *   * IT NEGOTIATES NO GSSAPI ENCRYPTION, and neither may the caller. libpq's `gssencmode=prefer`
  *     sends a GSSENCRequest BEFORE the SSLRequest wherever a Kerberos credential cache is present,
@@ -98,18 +101,23 @@
  * The startup message is the one answer every supported version gives, in the same bytes, and has
  * given since protocol 3.0.
  *
- * SSL. This connection negotiates exactly what libpq's default `sslmode=prefer` negotiates:
- * SSLRequest first, upgrade if the server answers `S`, continue in the clear if it answers `N`,
- * and verify nothing -- `prefer` verifies nothing. Debian's packaged cluster ships `ssl = on`, so
- * on an ordinary installation that is a TLS connection and a `hostssl` record; an `initdb` cluster
- * ships `ssl = off` and it is a `hostnossl` one. Both are measured, on real clusters, because a
- * suite that only ever runs the second leaves the transport every real installation uses untested.
+ * SSL, AND THE THREE ROUTES `--sslmode=` SELECTS BETWEEN. The value is REQUIRED: there is no
+ * default, because a default is the one thing that can put this connection on a transport nobody
+ * chose, and that is the whole of the r43 finding.
  *
- * `prefer` IS THE RIGHT THING TO OBSERVE WITH AND THE WRONG THING TO ACT ON. Observing with it is
- * what makes this connection land where an unpinned psql would have landed, which is the whole
- * value of reading the route rather than assuming one. Acting on it is what let an authentication
- * FAILURE select a second pg_hba record -- so the caller acts on `sslmode=` below instead, and the
- * word `prefer` appears in no connection install.sh opens with a credential.
+ *   `disable`  no SSLRequest is sent at all. This is what node-postgres does with the URL
+ *              install.sh emits, so it is what install.sh asks for, and it is matched by
+ *              `hostnossl`/`host` records only.
+ *   `require`  SSLRequest, and an `N` is a FAILURE rather than a fallback. Verifies nothing, as
+ *              libpq's `require` verifies nothing -- anything stricter would refuse the
+ *              self-signed certificate a Debian cluster ships and that the psql beside it accepts.
+ *   `prefer`   SSLRequest, upgrade on `S`, continue in the clear on `N`. libpq's default, and no
+ *              connection install.sh opens uses it: it picks its transport at RUN TIME, which is
+ *              what let an authentication FAILURE select a second pg_hba record.
+ *
+ * Debian's packaged cluster ships `ssl = on` and an `initdb` cluster ships `ssl = off`. Both are
+ * measured, on real clusters, because a suite that only ever runs the second leaves the transport
+ * every real installation offers untested.
  *
  * Unix-domain sockets take no SSLRequest, for the same reason libpq sends none.
  */
@@ -125,7 +133,7 @@ const DEFAULT_TIMEOUT_MS = 10_000
 const NUL = '\u0000'
 
 function die(message, status) {
-  process.stdout.write(`sslmode=unknown\nmethod=unknown\nverifier=unknown\ndetail=${message}\n`)
+  process.stdout.write(`requested=unknown\nsslmode=unknown\nmethod=unknown\nverifier=unknown\ndetail=${message}\n`)
   process.exit(status)
 }
 
@@ -378,23 +386,35 @@ function classify(type, payload) {
 function pinFor(transport, ssl) {
   if (transport === 'unix') return 'disable'
   if (ssl === 'yes') return 'require'
-  if (ssl === 'no') return 'disable'
+  if (ssl === 'no' || ssl === 'not-offered') return 'disable'
   return 'unknown'
 }
 
-function report(transport, ssl, verdict) {
-  process.stdout.write(`transport=${transport}\nssl=${ssl}\nsslmode=${pinFor(transport, ssl)}\nmethod=${verdict.method}\nverifier=${verdict.verifier}\ndetail=${verdict.detail}\n`)
+/**
+ * `requested=` is what the caller asked for; `sslmode=` is what HAPPENED, derived by pinFor().
+ * The caller compares them and refuses if they differ, which is what makes "the route the
+ * application takes" a checked claim rather than an argument passed and forgotten.
+ */
+function report(requested, transport, ssl, verdict) {
+  process.stdout.write(`requested=${requested}\ntransport=${transport}\nssl=${ssl}\nsslmode=${pinFor(transport, ssl)}\nmethod=${verdict.method}\nverifier=${verdict.verifier}\ndetail=${verdict.detail}\n`)
 }
 
 async function main() {
   const options = new Map()
   for (const argument of process.argv.slice(2)) {
     const match = /^--([a-z][a-z0-9-]*)=([\s\S]*)$/.exec(argument)
-    if (match === null) die(`unrecognised argument ${JSON.stringify(argument)}; expected --host= --port= --user= --database= [--timeout-ms=]`, 2)
+    if (match === null) die(`unrecognised argument ${JSON.stringify(argument)}; expected --host= --port= --user= --database= --sslmode= [--timeout-ms=]`, 2)
     options.set(match[1], match[2])
   }
-  for (const required of ['host', 'port', 'user', 'database']) {
+  for (const required of ['host', 'port', 'user', 'database', 'sslmode']) {
     if (!options.has(required) || options.get(required).length === 0) die(`--${required}= is required`, 2)
+  }
+  // NO DEFAULT (r43). An omitted route is a usage error and not `prefer`: the caller's whole job
+  // is to name the transport the APPLICATION takes, and a default is exactly how this program
+  // came to be observing one nobody uses.
+  const requested = options.get('sslmode')
+  if (requested !== 'disable' && requested !== 'require' && requested !== 'prefer') {
+    die(`--sslmode= must be disable, require or prefer, not ${JSON.stringify(requested)}`, 2)
   }
   const host = options.get('host')
   const port = Number(options.get('port'))
@@ -412,7 +432,10 @@ async function main() {
     socket = await connect(host, port, deadline)
     stream = socket
     reader.attach(socket)
-    if (transport === 'tcp') {
+    if (transport === 'tcp' && requested === 'disable') {
+      // WHAT node-postgres DOES WITH THE EMITTED URL: nothing at all before the startup message.
+      ssl = 'not-offered'
+    } else if (transport === 'tcp') {
       socket.write(sslRequest())
       const reply = String.fromCharCode((await reader.read(1, deadline))[0])
       if (reply === 'S') {
@@ -425,13 +448,16 @@ async function main() {
         reader.attach(stream)
         ssl = 'yes'
       } else if (reply === 'N') {
+        // `require` DOES NOT FALL BACK, which is the difference between it and `prefer` and the
+        // only reason the caller may act on it.
+        if (requested === 'require') throw new Error('the server refused TLS (it answered N to the SSLRequest) and this route does not fall back to the clear')
         ssl = 'no'
       } else if (reply === 'E') {
         // A pre-negotiation ErrorResponse -- the rest of it is still on the wire, minus the type
         // byte already consumed.
         const length = (await reader.read(4, deadline)).readInt32BE(0)
         const payload = await reader.read(Math.max(0, length - 4), deadline)
-        report(transport, 'refused', classify('E', payload))
+        report(requested, transport, 'refused', classify('E', payload))
         process.exit(1)
       } else {
         throw new Error(`the server answered the SSL request with ${JSON.stringify(reply)}, which is neither S nor N`)
@@ -443,10 +469,10 @@ async function main() {
     // A NoticeResponse may precede anything, and means nothing here.
     while (message.type === 'N') message = await reader.message(deadline)
     const verdict = classify(message.type, message.payload)
-    report(transport, ssl, verdict)
+    report(requested, transport, ssl, verdict)
     process.exit(verdict.verifier === 'role' ? 0 : 1)
   } catch (error) {
-    report(transport, ssl, {
+    report(requested, transport, ssl, {
       method: 'unknown',
       verifier: 'unknown',
       detail: String(error && error.message ? error.message : error).replace(/\s+/g, ' '),

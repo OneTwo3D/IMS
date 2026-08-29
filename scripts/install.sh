@@ -968,12 +968,14 @@ pg_local_psql() {
     -h "$(db_local_socket_dir)" -p "${DB_PORT}" -d postgres "$@"
 }
 
-# THE ROUTE A CREDENTIAL-BEARING CONNECTION IS PINNED TO (o3d-2sm1.5 r42, Codex HIGH).
+# THE ROUTE A CREDENTIAL-BEARING CONNECTION IS PINNED TO (o3d-2sm1.5 r42, r43).
 #
 # Empty is libpq's own default, `sslmode=prefer` — which is what the server-identity read below
-# wants, because that connection is opened to be LIKE the application's and not to be evidence
-# about a password. Set to `require` or `disable` it removes libpq's run-time transport choice
-# entirely, and with it the second pg_hba record an authentication FAILURE could otherwise select.
+# wants, for the reasons argued at length there. Set to `require` or `disable` it removes libpq's
+# run-time transport choice entirely, and with it the second pg_hba record an authentication
+# FAILURE could otherwise select. Since r43 the value it is set to is the APPLICATION'S route and
+# not a probe's, so a psql running under this pin is matched by the record that will match the
+# application.
 #
 # IT IS NEVER EXPORTED and its name begins with neither PG nor PSQL, so libpq_env_unset_args()
 # neither strips it nor mistakes it for a libpq setting. The functions that pin it set it inside a
@@ -1133,6 +1135,44 @@ compose_database_url() {
     "${host}" "${port}" "${database}"
 }
 
+# THE ROUTE THE APPLICATION TAKES, AS THE libpq SETTING THAT REPRODUCES IT (o3d-2sm1.5 r43,
+# Codex HIGH).
+#
+# THE FINDING. Every alignment through r42 used a PROBE as the reference point: the reader observed
+# on libpq's `sslmode=prefer` and published what it got, and the psql probes were pinned to that.
+# The probes then agreed with each other and with nothing else — because the connection this whole
+# gate exists to vouch for is the APPLICATION'S, and the application does not use libpq at all.
+#
+# WHAT node-postgres DOES WITH THE URL compose_database_url() PRODUCES, MEASURED. Against the
+# installed `pg` (8.20.0) and `pg-connection-string` (2.12.0), a URL with no query string parses to
+# `ssl: undefined` and the driver's first bytes on the wire are the StartupMessage itself: NO
+# SSLRequest, no GSSENCRequest. That is libpq's `sslmode=disable`, and it is matched by
+# `hostnossl`/`host` records and never by a `hostssl` one.
+#
+# SO THE REFERENCE IS THE APPLICATION'S CONNECTION, AND EVERY OBSERVATION AND EVERY PROBE IS PUT ON
+# IT. The alternative — emitting `?sslmode=require` in DATABASE_URL — was measured too and refused:
+# on the installed pg-connection-string `require` is an ALIAS FOR verify-full (the driver says so
+# itself, on stderr), so it would demand a CA-verified certificate where the reader deliberately
+# verifies nothing and where a Debian cluster ships a self-signed one; there is no spelling of
+# libpq's `prefer` at all; the meaning is scheduled to change under the driver's feet at pg v9; and
+# it would change what EVERY EXISTING INSTALLATION's application connection does at the next
+# upgrade, from a branch already deep in review.
+#
+# IT ASKS THE COMPOSER RATHER THAN ASSERTING A CONSTANT, so the two cannot drift: if a later round
+# ever gives the emitted URL a query string, this stops answering rather than answering the old
+# answer. The password is a placeholder because url_encode_userinfo() percent-encodes everything
+# outside the RFC 3986 unreserved set — a `?` in a password reaches the URL as `%3F` — so no
+# credential can put a query string there, and none is needed to ask this question.
+db_application_route_sslmode() {
+  local url
+  url="$(compose_database_url "${DB_USER}" "irrelevant" "${DB_HOST}" "${DB_PORT}" "${DB_NAME}")"
+  case "${url}" in
+    *\?*) return 1 ;;
+    postgresql://*) printf 'disable' ;;
+    *) return 1 ;;
+  esac
+}
+
 # WHAT "THE SAME SERVER" MEANS HERE, IN ONE PLACE, READ BY BOTH CONNECTIONS.
 #
 #   pg_postmaster_start_time()  the same microsecond stamp on every backend of one postmaster and
@@ -1173,8 +1213,8 @@ pg_extract_server_identity() {
 # THE PROOF IS ABOUT THE SERVER THE MIGRATION WILL USE, OR IT IS NOT PROOF (o3d-2sm1.5 r37,
 # Codex CRITICAL). Called with the identity read on the connection that performed the CREATE.
 #
-# It opens a SECOND connection — TCP, to ${DB_HOST}:${DB_PORT}, to the database just created,
-# exactly as the application will — and asks it the same question. Equal answers mean one
+# It opens a SECOND connection — TCP, to the four values DATABASE_URL is composed from, which is
+# the endpoint the application will use — and asks it the same question. Equal answers mean one
 # postmaster, on the port this run will dial, holding the database object this run created.
 # Anything else stops the run: a CREATE that landed somewhere else means the endpoint the
 # migration is about to use holds a database this run did NOT create, which is the live database
@@ -1187,23 +1227,31 @@ pg_extract_server_identity() {
 # by construction nothing else uses, with a random password, reads one row as it, and drops it.
 # It cannot collide with an existing role and it cannot alter one.
 #
-# AND IT IS DELIBERATELY NOT PINNED TO THE READER'S ROUTE (o3d-2sm1.5 r42, Codex HIGH). r42 binds
-# every credential-bearing probe on the ROTATION path to the transport the authentication-request
-# reader observed, and this connection carries a credential and can run after that reader has
-# spoken — so it was asked the same question, and the answer is that it must not be pinned:
+# AND IT IS DELIBERATELY NOT PINNED — RE-ARGUED AGAINST THE NEW REFERENCE POINT (r42, and r43,
+# Codex HIGH). r42 bound every credential-bearing probe on the ROTATION path to the transport the
+# authentication-request reader observed; r43 moved the reference from that reader to the
+# APPLICATION'S own connection, which is `sslmode=disable`. This connection carries a credential
+# and runs at a point where that route is perfectly well known, so the question was put a second
+# time. The first half of the r42 answer survives the change; the second half did not, and is
+# replaced:
 #
-#   * ITS CONCLUSION CANNOT BE FALSIFIED BY A TRANSPORT DIVERGENCE. What it asserts is that the
-#     postmaster answering ${DB_HOST}:${DB_PORT} is the one the CREATE landed on, and it asserts
-#     it by comparing a start time, a port and a database oid. Which pg_hba record admitted the
-#     connection does not change which postmaster answered it, so falling back from TLS to the
-#     clear — or being let in by `trust` — changes nothing about the identity that comes back.
-#     The rotation probes are pinned because their conclusion is ABOUT the authentication; this
-#     one's is about the server behind it.
-#   * AND PINNING IT WOULD MAKE IT LESS LIKE THE APPLICATION, WHICH IS ITS WHOLE POINT. It exists
-#     to reach the endpoint the way DATABASE_URL will be used, and node-postgres opens that
-#     connection with no TLS unless told to. Forcing `sslmode=require` here would refuse installs
-#     on ordinary non-TLS clusters, and forcing `disable` would refuse them on TLS-only ones —
-#     each of them a run stopped by the probe rather than by the endpoint.
+#   * ITS CONCLUSION CANNOT BE FALSIFIED BY A TRANSPORT DIVERGENCE — UNCHANGED, AND IT IS THE
+#     WHOLE ARGUMENT. What it asserts is that the postmaster answering ${DB_HOST}:${DB_PORT} is
+#     the one the CREATE landed on, and it asserts it by comparing a start time, a port and a
+#     database oid. Which pg_hba record admitted the connection does not change which postmaster
+#     answered it, so falling back from TLS to the clear — or being let in by `trust` — changes
+#     nothing about the identity that comes back. The rotation probes are pinned because their
+#     conclusion is ABOUT the authentication; this one's is about the server behind it, and a pin
+#     could therefore only change whether it CONNECTS, never what it concludes.
+#   * WHAT r42 SAID SECOND WAS THAT PINNING WOULD MAKE IT LESS LIKE THE APPLICATION. That reason
+#     is now the wrong way round and is withdrawn: since r43 "like the application" has a definite
+#     value, `disable`, and pinning would make this connection MORE like it. It is still not
+#     pinned, for the reason the first bullet gives plus one this function's failure mode makes
+#     decisive: EVERY REFUSAL HERE IS A die(). It authenticates as a THROWAWAY ROLE, not as
+#     ${DB_USER}, and pg_hba records may name a role — `hostnossl <db> imsuser ... scram` beside
+#     `hostssl <db> all ... scram` is a legal and ordinary file. Under a pin that role-specific
+#     layout turns a run that would have completed into a stopped install, and it would buy
+#     nothing, because the identity that comes back is the same on either transport.
 #
 # The route the ROTATION uses is therefore left alone by this function: it neither reads
 # DB_PROBE_SSLMODE nor sets it, and DB_ENDPOINT_ROUTE_SSLMODE is empty on every path into here.
@@ -2184,19 +2232,26 @@ clear_role_rotation_journal() {
 # the ALTER, so the role still has the credential its clients hold, and the reconciliation refuses
 # before anything is stopped, with the journal left in place carrying both candidates.
 
-# THE ROUTE THE READER OBSERVED, AND THE ENDPOINT IT OBSERVED IT ON (o3d-2sm1.5 r42, Codex HIGH).
+# THE ROUTE THE READER OBSERVED, AND THE ENDPOINT IT OBSERVED IT ON (o3d-2sm1.5 r42, r43).
 #
 # Set together by db_endpoint_checks_role_verifier() and cleared together by it, so that a route
 # proven for one database can never be spent on another. Empty means no reader has spoken, and
 # every credential-bearing probe below REFUSES on that rather than opening a connection libpq gets
 # to route for itself.
+#
+# SINCE r43 THIS IS THE APPLICATION'S ROUTE. The reader is told to take it (see
+# db_application_route_sslmode()) and its answer is checked back against it, so what is published
+# here is not "what libpq happened to negotiate" but "what node-postgres does with the URL this run
+# will write". Every probe below therefore runs on the transport the application runs on, which is
+# the connection all of this exists to vouch for.
 DB_PROBE_ROUTE_DATABASE=""
 DB_PROBE_SSLMODE=""
 
 # Does this endpoint let ${DB_USER} in with these bytes? The verdict is the EXIT STATUS of a
 # `SELECT 1` and never a match on the server's message, which is localised by lc_messages.
 #
-# IT GOES OUT ON THE READER'S ROUTE OR IT DOES NOT GO OUT (r42). The pin is set in a SUBSHELL: a
+# IT GOES OUT ON THE APPLICATION'S ROUTE OR IT DOES NOT GO OUT (r42, r43) — which is the route the
+# reader was told to take and reported back. The pin is set in a SUBSHELL: a
 # `VAR=x function` prefix would survive the call — bash keeps such an assignment after a FUNCTION
 # invocation — and a route left set is a route the next endpoint would inherit.
 db_endpoint_accepts_password() {
@@ -2234,14 +2289,31 @@ db_auth_request_probe_path() {
 # ${DB_HOST}, over the transport this reader negotiated, checks the secret `ALTER ROLE` writes.
 # Appends to DB_PROBE_REPORT on every refusal. Sends no password.
 #
-# ON SUCCESS IT PUBLISHES THE ROUTE (r42): DB_PROBE_SSLMODE is the libpq setting that reproduces
-# the transport the reader used, read out of the reader's own `sslmode=` line rather than inferred
-# here, and DB_PROBE_ROUTE_DATABASE is the endpoint it belongs to. ON EVERY OTHER PATH IT CLEARS
-# THEM, which is what makes an unproven endpoint unprobeable rather than probeable-by-default.
+# ON SUCCESS IT PUBLISHES THE ROUTE (r42, r43): DB_PROBE_SSLMODE is the libpq setting that
+# reproduces the transport the reader used, read out of the reader's own `sslmode=` line rather
+# than inferred here, and DB_PROBE_ROUTE_DATABASE is the endpoint it belongs to. ON EVERY OTHER
+# PATH IT CLEARS THEM, which is what makes an unproven endpoint unprobeable rather than
+# probeable-by-default.
+#
+# AND THE ROUTE IS THE APPLICATION'S, DECIDED HERE AND CHECKED BACK (r43). This function asks
+# db_application_route_sslmode() what node-postgres does with the URL this run will publish, hands
+# that to the reader as `--sslmode=`, and admits the answer only if the reader's own `sslmode=`
+# line names the same route. So the method is read on the transport the application uses, and the
+# probes below are pinned to it — instead of every instrument agreeing with each other about a
+# connection nobody makes, which is what r42 left behind.
 db_endpoint_checks_role_verifier() {
-  local database="$1" probe verdict method detail sslmode status=0
+  local database="$1" probe verdict method detail sslmode route status=0
   DB_PROBE_ROUTE_DATABASE=""
   DB_PROBE_SSLMODE=""
+  # THE ROUTE IS DECIDED BEFORE THE READER IS RUN, AND BY THE APPLICATION (r43). Not by libpq, not
+  # by whatever the reader would have negotiated on its own: the question this gate answers is
+  # about the connection ${APP_DIR}/.env will name, so the observation is made on that connection's
+  # transport or it is not made at all.
+  if ! route="$(db_application_route_sslmode)"; then
+    DB_PROBE_REPORT+="
+  - '${database}' was not asked which pg_hba rule matches it, because this run cannot say which TRANSPORT the application's own connection takes. The DATABASE_URL it would publish is not of the shape node-postgres was measured against — a query string on it changes the driver's transport — so the route to observe on is unknown, and a method read over an unknown route is not evidence about the connection the application makes. Re-run the installer from a complete release checkout."
+    return 1
+  fi
   probe="$(db_auth_request_probe_path)"
   if [[ ! -f "${probe}" ]]; then
     DB_PROBE_REPORT+="
@@ -2256,7 +2328,8 @@ db_endpoint_checks_role_verifier() {
   # The reader's own answer, whatever it is, on stdout. Its EXIT STATUS is the verdict; the
   # `method=` and `detail=` lines are what the refusal quotes back to the operator.
   capture verdict node "${probe}" \
-    --host="${DB_HOST}" --port="${DB_PORT}" --user="${DB_USER}" --database="${database}" || status=$?
+    --host="${DB_HOST}" --port="${DB_PORT}" --user="${DB_USER}" --database="${database}" \
+    --sslmode="${route}" || status=$?
   method="$(printf '%s\n' "${verdict}" | sed -n 's/^method=//p' | head -1)"
   detail="$(printf '%s\n' "${verdict}" | sed -n 's/^detail=//p' | head -1)"
   sslmode="$(printf '%s\n' "${verdict}" | sed -n 's/^sslmode=//p' | head -1)"
@@ -2265,15 +2338,17 @@ db_endpoint_checks_role_verifier() {
   if [[ "${status}" -eq 0 ]]; then
     # A METHOD WITHOUT A ROUTE IS NOT USABLE (r42). The two are published together or not at all:
     # a probe pinned to nothing is a probe libpq routes for itself, which is the divergence.
-    case "${sslmode}" in
-      require|disable)
-        DB_PROBE_ROUTE_DATABASE="${database}"
-        DB_PROBE_SSLMODE="${sslmode}"
-        return 0
-        ;;
-    esac
+    # THE ROUTE IS CHECKED BACK, NOT ASSUMED (r43). The reader is TOLD which transport to take and
+    # REPORTS which one it took; those are two different lines and this compares them, so an
+    # argument passed and quietly ignored cannot look like a route observed. Anything but the
+    # application's own route — including a reader too old to have been given one — refuses here.
+    if [[ "${sslmode}" == "${route}" ]]; then
+      DB_PROBE_ROUTE_DATABASE="${database}"
+      DB_PROBE_SSLMODE="${sslmode}"
+      return 0
+    fi
     DB_PROBE_REPORT+="
-  - '${database}' named an admissible matched method ('${method}') but did not name the TRANSPORT it read it on: its sslmode line says '${sslmode:-nothing at all}'. A pg_hba rule is matched per transport — hostssl and hostnossl are different records — so a method read over an unstated route cannot be pinned to, and this run will not send a credential over one libpq gets to choose for itself. Re-run the installer from a complete release checkout."
+  - '${database}' named an admissible matched method ('${method}') but not on the transport the APPLICATION uses: it was asked to read the rule on '${route}' — which is what node-postgres does with the DATABASE_URL this installer emits — and its sslmode line says '${sslmode:-nothing at all}'. A pg_hba rule is matched per transport, hostssl and hostnossl being different records, so a method read on any other route is not evidence about the connection the application will make. Re-run the installer from a complete release checkout."
     return 1
   fi
   DB_PROBE_REPORT+="

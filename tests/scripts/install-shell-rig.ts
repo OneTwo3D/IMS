@@ -49,6 +49,9 @@ export const SHIPPED = [
   'url_encode_userinfo',
   'url_decode_userinfo',
   'compose_database_url',
+  // r43 (Codex HIGH): the route the APPLICATION takes, derived from the composer rather than
+  // asserted, and the reference every probe is now aligned to.
+  'db_application_route_sslmode',
   'installed_database_password',
   // r39 (Codex HIGH): the durable mechanism, and the journal that makes the ALTER recoverable.
   'fsync_path',
