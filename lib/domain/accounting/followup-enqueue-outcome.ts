@@ -423,6 +423,48 @@ function unreadableField(field: string, value: unknown, expectation: string): { 
 }
 
 /**
+ * WHAT AN ABSENT KEY MEANS, PER FIELD — AND WHETHER THAT ANSWER WAS DERIVED OR INHERITED
+ * (o3d-batch-ret r11, Codex HIGH).
+ *
+ * Round 10 centralised four reads and, with them, four absent-key defaults. Three of those defaults
+ * were CARRIED OVER from the inline expressions rather than argued for, and round 11 is the bill for
+ * one of them. So the table is written down, with the distinction that matters stated per field: a
+ * default is ESTABLISHED when something outside this module makes it true, and INHERITED when its
+ * only warrant is that the code used to do it.
+ *
+ *   `_registerPayment` absent → `false`.        ESTABLISHED. The ordinary sales path composes
+ *     payloads without the key at all, so absence must mean "no payment requested" or every invoice
+ *     IMS raises itself would be refused. The alternative is not merely unwarranted, it is
+ *     contradicted by the writers.
+ *
+ *   `_paymentMethod` absent → `''`.             ESTABLISHED, and re-argued rather than assumed. The
+ *     WooCommerce importer writes `wcOrder.payment_method || undefined`, which JSON drops, while
+ *     `_registerPayment` can still be true — an order marked paid with no gateway string — so
+ *     absence is a REAL state meaning "no method was recorded". And `''` cannot mis-settle the way
+ *     `'GBP'` could: it is a sentinel no real method has, `lookupPaymentAccount`'s only wildcard is
+ *     on the CURRENCY half (`method:*`), so an empty method matches no mapping written for a real
+ *     one. It fails closed into the ordinary mapping refusal, which names the empty method out loud.
+ *
+ *   `currency` absent → the ORGANISATION BASE CURRENCY. ESTABLISHED as of this round, and it is the
+ *     one that was not. `'GBP'` was inherited from `payload.currency as string || 'GBP'`; the
+ *     warrant it now has is that the DOCUMENT is denominated in exactly that currency — the builders
+ *     omit `CurrencyCode`/`CurrencyRef` for an absent value, the ledger uses its own base currency,
+ *     and the connect-time guards refuse to bind a ledger whose base currency is not
+ *     `getBaseCurrencyCode()`. See {@link resolveBasePaymentCurrency}.
+ *
+ *   `_paymentDate` absent → TODAY.              INHERITED. Nothing derives it; its whole warrant is
+ *     that both connectors have always done it, and unlike `''` it is a guess at a value that really
+ *     exists (the day the money moved) — the `field` refusal clause says so itself, "a date read as
+ *     today dates the receipt wrongly in the ledger". What keeps it from being a live defect is that
+ *     the only writer of these keys cannot produce it: `_registerPayment` is
+ *     `!!wcOrder.date_paid_gmt && …` while `_paymentDate` is `wcOrder.date_paid_gmt || undefined`,
+ *     so a payload that ASKS for a payment always carries the date. It is reachable only from a
+ *     payload written by some future producer, and it is filed rather than changed here — refusing
+ *     it would refuse historical rows for a state no current writer emits, which is a larger change
+ *     than this finding, and it must not be made on the way past. o3d-pi9n.
+ */
+
+/**
  * `_registerPayment` — THE FLAG CODEX NAMED, AND THE ONLY THREE ANSWERS IT HAS.
  *
  * ABSENT means this payload does not use the mechanism: the ordinary sales path composes payloads

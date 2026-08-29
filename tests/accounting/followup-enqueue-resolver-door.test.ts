@@ -157,6 +157,74 @@ test('[o3d-batch-ret r10] neither connector reads the payment payload itself —
   }
 })
 
+/**
+ * o3d-batch-ret ROUND 11 (Codex HIGH) — AND THE BOUNDARY MAY NOT NAME A CURRENCY OF ITS OWN.
+ *
+ * Round 10 moved every payload read into this module and left ONE literal behind: the absent-
+ * `currency` arm answered `'GBP'`. `Organisation.baseCurrency` is configurable, so on a EUR-base
+ * installation that made the payment disagree with the document it settles — the document takes the
+ * ledger's base currency (both builders omit the key when the value is absent) and the payment took
+ * sterling. The behavioural proof is in the two connector suites; this is the SOURCE half, because
+ * the defect is a hard-coded literal and the next one would be added the same way.
+ *
+ * THE RULE IS ABOUT THE MODULE, NOT ABOUT A LINE. Any currency literal in the classification code is
+ * a currency this boundary decided for itself, and there is exactly one thing it is allowed to
+ * decide it from: `getBaseCurrencyCode()`, which is the same expression the connect-time guards
+ * compare the ledger's own base currency against.
+ *
+ * REVERT EVIDENCE: restoring `const BASE_PAYMENT_CURRENCY = 'GBP'` fails "the payload boundary names
+ * no currency of its own"; replacing the resolver's `await import('@/lib/base-currency')` with a
+ * literal fails "and it resolves the one it may take from the organisation".
+ */
+test('[o3d-batch-ret r11] the payload boundary names no currency of its own, and resolves the one it may take from the organisation', async () => {
+  const source = await readFile(path.join(ROOT, MODULE_REL), 'utf8')
+  // Comments FIRST: this module explains the finding at length and quotes the shipped
+  // `payload.currency as string || 'GBP'` while doing so. A guard that matched the explanation of
+  // its own defect would be unfixable.
+  const code = source
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^[ \t]*\/\/.*$/gm, '')
+  assert.ok(code.length > 2000, 'the comment strip must not have eaten the module, or this asserts nothing')
+
+  // NON-VACUITY: the strip must have left the classifier that used to hold the literal.
+  assert.match(code, /^function payloadPaymentCurrency\(/m, 'the currency classifier must still be in the stripped source')
+
+  const literals = [...code.matchAll(/'([A-Z]{3})'/g)].map((m) => m[1])
+  assert.deepEqual(
+    literals, [],
+    'a three-letter currency literal in the payload boundary is a currency this module decided for '
+      + `itself (found ${literals.join(', ')}). The absent-\`currency\` arm must take the ORGANISATION `
+      + 'base currency — the same value the ledger denominated the document in — not a constant',
+  )
+
+  assert.match(
+    code, /await import\('@\/lib\/base-currency'\)/,
+    'and it must resolve that currency through `getBaseCurrencyCode`, which is the expression '
+      + '`connectXero`/`connectQuickBooks` pin the ledger\'s own base currency against — a second '
+      + 'definition of "the base currency" is a second answer to what the payment settles in',
+  )
+  assert.match(code, /getBaseCurrencyCode/, 'by name, so the resolution is greppable from here')
+
+  // AND IT IS RESOLVED IN THE FOLD, ONCE, not in each connector. Two call sites that each resolve it
+  // is a convention that they agree; one is a shape that they cannot disagree.
+  for (const rel of ['lib/connectors/xero/sync-processor.ts', 'lib/connectors/quickbooks/sync-processor.ts']) {
+    const connector = await readFile(path.join(ROOT, rel), 'utf8')
+    const from = connector.indexOf('async function decideInvoicePaymentFollowUp(')
+    const to = connector.indexOf('async function enqueueSalesInvoiceFollowUps(')
+    assert.ok(from >= 0 && to > from, `${rel}: the payment decision must still be found`)
+    const body = connector.slice(from, to)
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^[ \t]*\/\/.*$/gm, '')
+    assert.ok(body.length > 500, `${rel}: the comment strip must not have eaten the function body`)
+    assert.doesNotMatch(
+      body, /getBaseCurrencyCode/,
+      `${rel} resolves the base currency itself inside the payment decision. The fold resolves it `
+        + 'once for both connectors precisely so the two cannot drift apart — which is what Codex '
+        + 'asked for when it asked that the document-post and follow-up paths agree',
+    )
+  }
+})
+
 test('[o3d-batch-ret r9] nothing imports the raw resolver, and the walk really reached the importers', async () => {
   const files = [...await sourceFiles('lib'), ...await sourceFiles('tests')]
     .filter((rel) => rel !== MODULE_REL)

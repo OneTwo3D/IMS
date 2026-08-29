@@ -43,6 +43,18 @@ const claimed: Array<{ syncLogId: string; generation: Date }> = []
 let paymentMap: Record<string, string> | null = null
 
 /**
+ * THE ORGANISATION BASE CURRENCY (o3d-batch-ret r11, Codex HIGH) — A FIXTURE, BECAUSE IT IS
+ * CONFIGURABLE IN PRODUCTION.
+ *
+ * `Organisation.baseCurrency` is what `getBaseCurrencyCode()` answers, and the absent-`currency`
+ * arm of the payload boundary now takes it. Held as the ROW the resolver actually reads rather than
+ * as a canned currency string, so the real `resolveBaseCurrencyCode` runs — including its
+ * `?? DEFAULT_BASE_CURRENCY` fallback — and so "the read threw" is a state this fixture can express
+ * at all. `'throw'` is a database that will not answer, which is the unknown the refusal arm is for.
+ */
+let organisationRow: { baseCurrency: string } | null | 'throw' = { baseCurrency: 'GBP' }
+
+/**
  * The order under test: GBP 120, paid by card, and NO receipt of its own.
  *
  * No receipt is deliberate and load-bearing. The deferred-receipt re-drive then takes its
@@ -68,6 +80,15 @@ const accountingSyncLog = new Proxy({}, {
 
 const dbStub = {
   accountingSyncLog,
+  // o3d-batch-ret r11: the row `getBaseCurrencyCode()` reads. NOT stubbed at the
+  // `getBaseCurrencyCode` level — the resolver's own fallback and its failure mode are part of what
+  // the refusal arm is about.
+  organisation: {
+    findFirst: async () => {
+      if (organisationRow === 'throw') throw new Error('organisation table unavailable')
+      return organisationRow
+    },
+  },
   salesOrder: { findUnique: async () => ({ ...order, payments: [] }) },
   payment: { findUnique: async () => null, findMany: async () => [] },
   // The advisory locks the enqueue and the fence take. They must ANSWER, or the enqueue dies before
@@ -108,7 +129,11 @@ mock.module('@/lib/accounting', {
     getActiveAccountingConnectorInfo: async () => ({ id: 'quickbooks' }),
     // THE VARIABLE UNDER TEST, asked as a real question of a real map.
     getPaymentAccountMap: async () => paymentMap,
-    lookupPaymentAccount: (map: Record<string, string> | null, method: string) => map?.[method] ?? null,
+    // KEYED THE WAY THE REAL ONE IS (o3d-batch-ret r11): `method:currency`, then the `method:*`
+    // wildcard. A currency-blind stub would have made every assertion about WHICH account the money
+    // reached vacuous — which is the whole of this round's finding.
+    lookupPaymentAccount: (map: Record<string, string> | null, method: string, currency: string) =>
+      map?.[`${method}:${currency}`] ?? map?.[`${method}:*`] ?? null,
     queueAccountingSyncTxWithOutcome: async () => ({ queued: true, connector: 'quickbooks' }),
   },
 })
@@ -192,6 +217,7 @@ function pendingSalesInvoice() {
 }
 
 function reset(map: Record<string, string> | null) {
+  organisationRow = { baseCurrency: 'GBP' }
   store = createSyncLogStore([pendingSalesInvoice()])
   activity.length = 0
   released.length = 0
@@ -265,7 +291,7 @@ test('[o3d-batch-ret r6] a map that does not name THIS method is refused too', a
   // The second configuration arm. Both inherited the same success default.
   // MUTATION THAT KILLS IT: revert the `if (!stored)` arm to a bare warning.
   // ROUTE: as above, with `paymentMap` naming an unrelated method.
-  reset({ bank_transfer: 'QBO-BANK-9' })
+  reset({ 'bank_transfer:GBP': 'QBO-BANK-9' })
 
   await runQuickBooks()
 
@@ -289,7 +315,7 @@ test('[o3d-batch-ret r6] with the mapping in place the payment IS enqueued and t
   // is that later; this one stays a single pass because its job is the CONTROL — that a mapped
   // payment enqueues and discharges in one go, so the retention above is a real difference.
   // ROUTE: one real processor run with the mapping configured.
-  reset({ card: 'QBO-BANK-1' })
+  reset({ 'card:GBP': 'QBO-BANK-1' })
 
   await runQuickBooks()
 
@@ -452,7 +478,7 @@ test('[o3d-batch-ret r7] the refusal describes what the SECOND processor pass ac
   assert.deepEqual(released, [], 'and discharged nothing — the marker is still the row\'s record of the debt')
 
   // THE OPERATOR DOES THE ONE THING THE MESSAGE ASKS FOR: a setting.
-  paymentMap = { card: 'QBO-BANK-1' }
+  paymentMap = { 'card:GBP': 'QBO-BANK-1' }
   activity.length = 0
 
   await runQuickBooks()
@@ -528,7 +554,7 @@ test('[o3d-batch-ret r8] a payment amount that cannot be READ is refused on ever
       detail: /the amount derived from the payload lines is not a finite number/,
     },
   ]) {
-    reset({ card: 'QBO-BANK-1' })
+    reset({ 'card:GBP': 'QBO-BANK-1' })
     store = createSyncLogStore([syncLogRow({
       id: 'entry-invoice',
       connector: 'quickbooks',
@@ -682,7 +708,7 @@ test('[o3d-batch-ret r9] a PRESENT null is refused on every field that had a def
       detail: /`discountAmount` is null, which is not a finite number/,
     },
   ]) {
-    reset({ card: 'QBO-BANK-1' })
+    reset({ 'card:GBP': 'QBO-BANK-1' })
     store = createSyncLogStore([syncLogRow({
       id: 'entry-invoice',
       connector: 'quickbooks',
@@ -774,7 +800,7 @@ test('[o3d-batch-ret r9] CONTROL: ABSENT and READABLE-ZERO fields still take the
       amount: null,
     },
   ]) {
-    reset({ card: 'QBO-BANK-1' })
+    reset({ 'card:GBP': 'QBO-BANK-1' })
     store = createSyncLogStore([syncLogRow({
       id: 'entry-invoice',
       connector: 'quickbooks',
@@ -850,7 +876,7 @@ test('[o3d-batch-ret r10] a `_registerPayment` that cannot be READ is refused du
     { what: 'a present 1 — the other truthy malformed value', flag: { _registerPayment: 1 }, detail: /`_registerPayment` is 1, which is neither `true` nor `false`/ },
   ]
   for (const { what, flag, detail } of flags) {
-    reset({ card: 'QBO-BANK-1' })
+    reset({ 'card:GBP': 'QBO-BANK-1' })
     store = createSyncLogStore([syncLogRow({
       id: 'entry-invoice',
       connector: 'quickbooks',
@@ -936,7 +962,7 @@ test('[o3d-batch-ret r10] CONTROL: ABSENT and literal `false` still settle, and 
     { what: 'a literal `true`', flag: { _registerPayment: true }, expected: ['INVOICE_PAYMENT', 'INVOICE_PDF'], amount: 120 },
   ]
   for (const { what, flag, expected, amount } of readable) {
-    reset({ card: 'QBO-BANK-1' })
+    reset({ 'card:GBP': 'QBO-BANK-1' })
     store = createSyncLogStore([syncLogRow({
       id: 'entry-invoice',
       connector: 'quickbooks',
@@ -1017,7 +1043,7 @@ test('[o3d-batch-ret r10] every OTHER field this path reads is refused when pres
     { what: 'a `_paymentDate` string that is not a ledger date', field: { _paymentDate: '20/08/2026' }, detail: /`_paymentDate` is the string "20\/08\/2026", whose first ten characters are not a YYYY-MM-DD date/ },
   ]
   for (const { what, field, detail } of fields) {
-    reset({ card: 'QBO-BANK-1' })
+    reset({ 'card:GBP': 'QBO-BANK-1' })
     store = createSyncLogStore([syncLogRow({
       id: 'entry-invoice',
       connector: 'quickbooks',
@@ -1078,7 +1104,9 @@ test('[o3d-batch-ret r10] CONTROL: an ABSENT method, currency or date still take
   // EACH ARM PROVES THE DEFAULT WAS TAKEN, not merely that nothing refused:
   //   • an absent `_paymentMethod` resolves to `''`, so the row reaches the MAPPING refusal naming an
   //     empty method — readable, and a different refusal from the payload one;
-  //   • an absent `currency` is registered as GBP, read off the queued row;
+  //   • an absent `currency` is registered as the ORGANISATION base currency, read off the queued
+  //     row — GBP here because that is what the `organisationRow` fixture holds, and o3d-batch-ret
+  //     r11 is the round that made that provenance real rather than a literal;
   //   • an absent `_paymentDate` is registered as today, read off the queued row.
   //
   // MUTATION THAT KILLS IT: make `payloadPaymentMethod`, `payloadPaymentCurrency` or
@@ -1106,7 +1134,7 @@ test('[o3d-batch-ret r10] CONTROL: an ABSENT method, currency or date still take
     },
   ]
   for (const { what, drop, expected, assertRow } of absences) {
-    reset({ card: 'QBO-BANK-1' })
+    reset({ 'card:GBP': 'QBO-BANK-1' })
     const payload: Record<string, unknown> = {
       currency: 'GBP',
       _registerPayment: true,
@@ -1154,5 +1182,259 @@ test('[o3d-batch-ret r10] CONTROL: an ABSENT method, currency or date still take
       }
       assert.deepEqual(released, ['entry-invoice'], `and the obligation IS discharged (${what})`)
     }
+  }
+})
+
+/**
+ * o3d-batch-ret ROUND 11 (Codex HIGH) — THE DEFAULT NOBODY HAD QUESTIONED, ON THE INSTALLATION IT
+ * IS WRONG FOR.
+ *
+ * Round 10 closed the two PRESENT holes in `currency` — a persisted `null` and a persisted `''` had
+ * both become `GBP` — and kept the ABSENT arm's `GBP` literal, because absence really is the
+ * ordinary case. But `Organisation.baseCurrency` is CONFIGURABLE, and on a EUR-base installation
+ * the two halves of one settlement then disagreed:
+ *
+ *   • THE DOCUMENT posts in the base currency. An absent `currency` reaches `pushSalesInvoice` as
+ *     `undefined`, the builder writes `CurrencyRef` only `if (data.currency)`, and QuickBooks
+ *     denominates the invoice in the company's own home currency — which `connectQuickBooks`
+ *     refuses to bind unless it equals `getBaseCurrencyCode()`.
+ *   • THE PAYMENT called the same absence sterling. `lookupPaymentAccount` keys the BANK ACCOUNT on
+ *     that currency, so either a real `card:EUR` mapping was missed and the payment refused, or a
+ *     `card:GBP` mapping was found and the money settled into the STERLING account with `GBP`
+ *     stamped on the INVOICE_PAYMENT row — against a EUR invoice.
+ *
+ * BOTH BASES ARE WALKED, and that is the point of the table rather than a second test: the fix has
+ * to move the EUR installation without moving the GBP one, and a build that simply refused every
+ * absent currency would pass a EUR-only test.
+ */
+test('[o3d-batch-ret r11] an ABSENT currency settles in the ORGANISATION base currency — EUR on a EUR-base install, GBP on a GBP-base one', async () => {
+  // ROUTE: the real `processPendingQuickBooksSync` over a PENDING SALES_INVOICE whose payload has
+  // NO `currency` key, with the real `resolveBaseCurrencyCode` reading the `organisationRow`
+  // fixture and the real `lookupPaymentAccount` keyed on `method:currency`. The observable is the
+  // queued INVOICE_PAYMENT row's own `currency` and `bankAccountId`, which is the account the money
+  // actually lands in.
+  //
+  // MUTATION THAT KILLS IT: in lib/domain/accounting/followup-enqueue-outcome.ts, restore the
+  // shipped literal — `const BASE_PAYMENT_CURRENCY = 'GBP'` and, in `payloadPaymentCurrency`,
+  // `if (!declaresField(payload, 'currency')) return { value: BASE_PAYMENT_CURRENCY }`. Arm 1 then
+  // queues the payment as GBP into QBO-BANK-GBP (both assertions fail), and arm 3 queues one into
+  // the sterling account instead of refusing. Arm 2 — the GBP install — is unmoved by that
+  // mutation, which is exactly why it is here.
+  const cases: Array<{
+    what: string
+    base: string
+    map: Record<string, string>
+    queued: { currency: string; bankAccountId: string } | null
+    refusal: RegExp | null
+  }> = [
+    {
+      what: 'a EUR-base organisation with BOTH currencies mapped — the wrong-settlement half of the finding',
+      base: 'EUR',
+      map: { 'card:EUR': 'QBO-BANK-EUR', 'card:GBP': 'QBO-BANK-GBP' },
+      queued: { currency: 'EUR', bankAccountId: 'QBO-BANK-EUR' },
+      refusal: null,
+    },
+    {
+      what: 'THE ORDINARY CASE: a GBP-base organisation, unchanged',
+      base: 'GBP',
+      map: { 'card:EUR': 'QBO-BANK-EUR', 'card:GBP': 'QBO-BANK-GBP' },
+      queued: { currency: 'GBP', bankAccountId: 'QBO-BANK-GBP' },
+      refusal: null,
+    },
+    {
+      what: 'a EUR-base organisation with ONLY the sterling account mapped — the missed-mapping half',
+      base: 'EUR',
+      map: { 'card:GBP': 'QBO-BANK-GBP' },
+      queued: null,
+      refusal: /no bank account is mapped for method "card" \/ currency "EUR"/,
+    },
+  ]
+  for (const { what, base, map, queued, refusal } of cases) {
+    reset(map)
+    organisationRow = { baseCurrency: base }
+    const payload: Record<string, unknown> = {
+      _registerPayment: true,
+      _paymentMethod: 'card',
+      _paymentAmount: 120,
+      _paymentDate: '2026-08-20',
+    }
+    assert.ok(
+      !Object.hasOwn(payload, 'currency'),
+      `PRECONDITION (${what}): the payload really states NO currency — the arm under test is absence, `
+        + 'not a present unreadable value, which round 10 already refuses',
+    )
+    store = createSyncLogStore([syncLogRow({
+      id: 'entry-invoice',
+      connector: 'quickbooks',
+      type: 'SALES_INVOICE',
+      status: 'PENDING',
+      referenceType: 'SalesOrder',
+      referenceId: 'order-1',
+      payload,
+      attemptStampingCustodyAt: new Date('2026-08-20T09:00:00.000Z'),
+    })])
+
+    await runQuickBooks()
+
+    assert.equal(
+      order.accountingInvoiceId, 'QBINV-9',
+      `PRECONDITION (${what}): the invoice really did post — the document is the half that took the `
+        + 'base currency implicitly, and nothing below is about the payment unless it exists',
+    )
+
+    if (queued === null) {
+      assert.deepEqual(followUpTypes(), ['INVOICE_PDF'], `no payment row was created (${what})`)
+      const refusals = paymentRefusals()
+      assert.equal(refusals.length, 1, `the operator is told once (${what})`)
+      assert.equal(
+        refusals[0].metadata?.reason, 'payment_account_unmapped',
+        `and it is the MAPPING refusal (${what}) — the payload is not at fault`,
+      )
+      assert.match(
+        String(refusals[0].description), refusal!,
+        `THE FINDING (${what}): the refusal names the currency the DOCUMENT is in. Under the shipped `
+          + 'literal this row found the sterling account instead and settled a EUR invoice into it',
+      )
+      assert.equal(
+        refusals[0].metadata?.currency, base,
+        `and the activity metadata records that currency too (${what})`,
+      )
+      assert.deepEqual(released, [], `the obligation survives (${what})`)
+      continue
+    }
+
+    assert.deepEqual(
+      paymentRefusals(), [],
+      `nothing is refused (${what}) — the account for the base currency is mapped`,
+    )
+    assert.deepEqual(
+      followUpTypes(), ['INVOICE_PAYMENT', 'INVOICE_PDF'],
+      `the payment IS queued (${what})`,
+    )
+    const row = (store.rows.find((r) => r.type === 'INVOICE_PAYMENT')?.payload ?? {}) as Record<string, unknown>
+    assert.equal(
+      row.currency, queued.currency,
+      `THE FINDING (${what}): the currency stamped on the INVOICE_PAYMENT row is the organisation's, `
+        + 'not a literal',
+    )
+    assert.equal(
+      row.bankAccountId, queued.bankAccountId,
+      `and the money lands in THAT currency's bank account (${what}) — this is the assertion the `
+        + 'sterling literal fails, and it can only fail while both accounts are mapped',
+    )
+    assert.deepEqual(released, ['entry-invoice'], `and the obligation is discharged (${what})`)
+  }
+})
+
+/**
+ * o3d-batch-ret ROUND 11 — AND AN UNRESOLVABLE BASE CURRENCY IS AN UNKNOWN, WHICH IS THE ONE THING
+ * SIX ROUNDS HAVE AGREED MUST NOT BE SPENT AS A DEFAULT.
+ *
+ * `resolveBaseCurrencyCode` answers `org?.baseCurrency ?? DEFAULT_BASE_CURRENCY`, and THAT fallback
+ * is established rather than assumed: the connect-time guards compare the ledger's base currency
+ * against the same expression, so an installation with no organisation row cannot have a non-GBP
+ * ledger bound to it and the two halves still agree. What is genuinely unknown is a read that THREW
+ * — the row could not be consulted at all — or a `baseCurrency` holding no currency code. Guessing
+ * sterling there is the round-10 defect one layer down: it picks a bank account by a currency
+ * nobody stated.
+ *
+ * THE THIRD ARM IS WHAT KEEPS THE FIRST TWO HONEST. The base currency is consulted ONLY where it is
+ * used, so a payload that names its own currency must settle normally even while the organisation
+ * read is broken. Without it, "refuse when the read fails" could have been implemented as "refuse
+ * every payment when the read fails", which would take an entire installation's payments down over
+ * a transient database error.
+ */
+test('[o3d-batch-ret r11] an UNRESOLVABLE base currency refuses the absent-currency payment, and only that one', async () => {
+  // ROUTE: the real `processPendingQuickBooksSync` with the `organisation.findFirst` fixture set to
+  // throw, or to a row holding a blank `baseCurrency`. The real `resolveBasePaymentCurrency` in
+  // lib/domain/accounting/followup-enqueue-outcome.ts is what turns that into the refusal.
+  //
+  // MUTATION THAT KILLS IT: make `resolveBasePaymentCurrency` fall back instead of refusing —
+  // `catch { return { value: 'GBP' } }` and drop the blank-string check. Arms 1 and 2 then queue an
+  // INVOICE_PAYMENT into the sterling account rather than refusing, failing on `followUpTypes` and
+  // on the refusal count. Arm 3 is unaffected by that mutation and is the control.
+  const cases: Array<{ what: string; row: { baseCurrency: string } | null | 'throw'; currency?: string; detail: RegExp | null }> = [
+    {
+      what: 'the organisation row cannot be read at all',
+      row: 'throw',
+      detail: /reading the organisation base currency failed: organisation table unavailable/,
+    },
+    {
+      what: 'the organisation row holds a blank base currency',
+      row: { baseCurrency: '   ' },
+      detail: /`Organisation.baseCurrency` is the string "   ", which is not a currency code/,
+    },
+    {
+      what: 'CONTROL: the same broken read, but the payload NAMES its own currency',
+      row: 'throw',
+      currency: 'GBP',
+      detail: null,
+    },
+  ]
+  for (const { what, row, currency, detail } of cases) {
+    reset({ 'card:GBP': 'QBO-BANK-GBP' })
+    organisationRow = row
+    const payload: Record<string, unknown> = {
+      _registerPayment: true,
+      _paymentMethod: 'card',
+      _paymentAmount: 120,
+      _paymentDate: '2026-08-20',
+      ...(currency === undefined ? {} : { currency }),
+    }
+    store = createSyncLogStore([syncLogRow({
+      id: 'entry-invoice',
+      connector: 'quickbooks',
+      type: 'SALES_INVOICE',
+      status: 'PENDING',
+      referenceType: 'SalesOrder',
+      referenceId: 'order-1',
+      payload,
+      attemptStampingCustodyAt: new Date('2026-08-20T09:00:00.000Z'),
+    })])
+
+    await runQuickBooks()
+
+    assert.equal(order.accountingInvoiceId, 'QBINV-9', `PRECONDITION (${what}): the invoice really did post`)
+
+    if (detail === null) {
+      assert.deepEqual(
+        paymentRefusals(), [],
+        `THE CONTROL (${what}): a payload that states its currency does not consult the base one at `
+          + 'all, so a broken organisation read must not touch it',
+      )
+      assert.deepEqual(followUpTypes(), ['INVOICE_PAYMENT', 'INVOICE_PDF'], `and the payment IS queued (${what})`)
+      const queued = (store.rows.find((r) => r.type === 'INVOICE_PAYMENT')?.payload ?? {}) as Record<string, unknown>
+      assert.equal(queued.currency, 'GBP', `in the currency the payload named (${what})`)
+      assert.deepEqual(released, ['entry-invoice'], `and the obligation is discharged (${what})`)
+      continue
+    }
+
+    assert.deepEqual(
+      followUpTypes(), ['INVOICE_PDF'],
+      `no INVOICE_PAYMENT row is created (${what}) — a bank account chosen by a currency nobody `
+        + 'stated is a wrong settlement, not a missing one',
+    )
+    const refusals = paymentRefusals()
+    assert.equal(refusals.length, 1, `the operator is told once (${what})`)
+    assert.equal(
+      refusals[0].metadata?.reason, 'payment_payload_unreadable',
+      `and it is the unreadable refusal (${what})`,
+    )
+    assert.match(String(refusals[0].description), detail, `naming what could not be resolved (${what})`)
+    assert.match(
+      String(refusals[0].description), /AN UNRESOLVED BASE CURRENCY IS NOT STERLING/,
+      `and it is the BASE-CURRENCY clause (${what}), not the corrupt-field one — the payload is `
+        + 'entirely well-formed here, and telling an operator to look at it would be false',
+    )
+    assert.doesNotMatch(
+      String(refusals[0].description), /AN UNREADABLE FIELD IS NOT ITS DEFAULT/,
+      `the field clause must NOT be borrowed for it (${what}) — omitting \`currency\` is the ordinary `
+        + 'case, and that clause blames the payload',
+    )
+    assert.deepEqual(released, [], `THE FINDING (${what}): the obligation survives`)
+    assert.equal(
+      claimed.length, 1,
+      `PRECONDITION (${what}): a generation WAS claimed, so an empty \`released\` is a WITHHELD release`,
+    )
   }
 })
