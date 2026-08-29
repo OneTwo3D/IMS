@@ -377,6 +377,11 @@ test('dotenv is a runtime dependency, because `npm ci --omit=dev` has to be able
 })
 
 function runScript(args: string[], env: Record<string, string | undefined>, identity?: string[]) {
+  // THE DIRECTORY IS REMOVED IN A `finally` (o3d-2sm1.5). This harness created one per call and
+  // removed none, so every run of this file left a pile under /tmp. The `try` below already
+  // existed to turn a non-zero exit into a value rather than a throw; the removal goes in a
+  // `finally` around BOTH of its arms, because a run that threw for some third reason — node
+  // missing, ENOENT on the script — is exactly the one an unwound `catch` would leak.
   const cwd = mkdtempSync(join(tmpdir(), 'ims-noenv-'))
   // THE APPLICATION'S IDENTITY IS ON THE COMMAND LINE (o3d-2sm1.5 r19). scripts/fence-db-connections.mjs
   // no longer works out where the application connects — from this process's environment, from a
@@ -397,6 +402,8 @@ function runScript(args: string[], env: Record<string, string | undefined>, iden
   } catch (error) {
     const failure = error as { status?: number; stdout?: string; stderr?: string }
     return { status: failure.status ?? -1, output: `${failure.stdout ?? ''}${failure.stderr ?? ''}` }
+  } finally {
+    try { rmSync(cwd, { recursive: true, force: true }) } catch { /* already gone */ }
   }
 }
 

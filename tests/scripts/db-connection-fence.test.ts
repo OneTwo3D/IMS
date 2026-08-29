@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process'
 import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { test } from 'node:test'
+import { type TestContext, test } from 'node:test'
 
 /**
  * BOTH HALVES OF THE DRIVER, asked DIRECTLY rather than re-exported from the script under test.
@@ -137,23 +137,31 @@ function runFenceScript(
   env: Record<string, string | undefined>,
   identity: string[] | null = identityArgs({ appDatabase: 'ims' }),
 ) {
+  // THE DIRECTORY IS REMOVED IN A `finally` (o3d-2sm1.5). This harness runs on every call in a
+  // file of several dozen tests and used to remove nothing, so a single run left a directory per
+  // call under /tmp. `finally` and not the happy path: the runs that fail are the ones a leaking
+  // harness leaks, and this one is called far more often for its refusals than for its successes.
   const cwd = mkdtempSync(join(tmpdir(), 'ims-fence-'))
-  // spawnSync, not execFileSync: the script's diagnostics go to STDERR so that stdout stays the
-  // machine-readable channel `--print-migration-url` is captured through, and a test that could
-  // only see stdout on success could not tell the two apart.
-  const run = spawnSync(
-    'node',
-    [join(process.cwd(), 'scripts/fence-db-connections.mjs'), ...args, ...(identity ?? [])],
-    {
-      encoding: 'utf8',
-      env: { ...process.env, ...env },
-      cwd,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    },
-  )
-  const stdout = run.stdout ?? ''
-  const stderr = run.stderr ?? ''
-  return { status: run.status ?? -1, stdout, stderr, output: `${stdout}${stderr}` }
+  try {
+    // spawnSync, not execFileSync: the script's diagnostics go to STDERR so that stdout stays the
+    // machine-readable channel `--print-migration-url` is captured through, and a test that could
+    // only see stdout on success could not tell the two apart.
+    const run = spawnSync(
+      'node',
+      [join(process.cwd(), 'scripts/fence-db-connections.mjs'), ...args, ...(identity ?? [])],
+      {
+        encoding: 'utf8',
+        env: { ...process.env, ...env },
+        cwd,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
+    )
+    const stdout = run.stdout ?? ''
+    const stderr = run.stderr ?? ''
+    return { status: run.status ?? -1, stdout, stderr, output: `${stdout}${stderr}` }
+  } finally {
+    try { rmSync(cwd, { recursive: true, force: true }) } catch { /* already gone */ }
+  }
 }
 
 // o3d-2sm1.2 — check-db-writers.mjs SNAPSHOTS pg_stat_activity and closes; the dump
@@ -600,8 +608,21 @@ const NO_WRITE = 0o500
  */
 const NO_READ = 0o300
 
-function stateDir() {
-  return mkdtempSync(join(tmpdir(), 'ims-fence-state-'))
+/**
+ * A throwaway state directory THAT IS REMOVED AGAIN (o3d-2sm1.5).
+ *
+ * It used to be a bare `mkdtempSync` with no removal anywhere, and twenty-four tests call it —
+ * so one `npm run test:unit` left twenty-four directories under /tmp and the count only ever went
+ * up. `t.after` runs whether the test passed or threw, and it runs at the END OF THAT TEST, so
+ * this file holds one directory at a time rather than twenty-four. Taking the TestContext is what
+ * makes that possible, which is why every caller now threads it.
+ */
+function stateDir(t: TestContext) {
+  const dir = mkdtempSync(join(tmpdir(), 'ims-fence-state-'))
+  // Never fail a test on its own tidy-up: a test that threw has already said something more
+  // useful than an EBUSY from the removal.
+  t.after(() => { try { rmSync(dir, { recursive: true, force: true }) } catch { /* already gone */ } })
+  return dir
 }
 
 const SAMPLE_STATE = {
@@ -735,8 +756,8 @@ async function withAdminUrl<T>(run: () => Promise<T>): Promise<T> {
   }
 }
 
-test('the fence record is published atomically and ends with the completeness sentinel', () => {
-  const dir = stateDir()
+test('the fence record is published atomically and ends with the completeness sentinel', (t) => {
+  const dir = stateDir(t)
   try {
     const stateFile = join(dir, 'db-connect-fence.json')
     publishState(stateFile, SAMPLE_STATE)
@@ -758,8 +779,8 @@ test('the fence record is published atomically and ends with the completeness se
   }
 })
 
-test('readState tells a missing record apart from one that exists and cannot be used', () => {
-  const dir = stateDir()
+test('readState tells a missing record apart from one that exists and cannot be used', (t) => {
+  const dir = stateDir(t)
   try {
     const missing = join(dir, 'absent.json')
     assert.equal(readState(missing).status, STATE_ABSENT, 'nothing at the path is ABSENT, which proves nothing on its own')
@@ -791,11 +812,11 @@ test('readState tells a missing record apart from one that exists and cannot be 
   }
 })
 
-test('a publish that fails BEFORE the rename leaves the previous record byte for byte', () => {
+test('a publish that fails BEFORE the rename leaves the previous record byte for byte', (t) => {
   // FAILURE INJECTED ON THE PRE-RENAME SIDE: the directory refuses new entries, so the
   // temporary is never created and nothing is renamed. The last durable record must survive
   // exactly — the old writeFileSync would have truncated it in place at this instant.
-  const dir = stateDir()
+  const dir = stateDir(t)
   try {
     const stateFile = join(dir, 'db-connect-fence.json')
     publishState(stateFile, SAMPLE_STATE)
@@ -817,11 +838,11 @@ test('a publish that fails BEFORE the rename leaves the previous record byte for
   }
 })
 
-test('a publish whose POST-RENAME barrier fails throws, though the record is already visible', () => {
+test('a publish whose POST-RENAME barrier fails throws, though the record is already visible', (t) => {
   // FAILURE INJECTED ON THE POST-RENAME SIDE: create, write, fsync and rename all succeed;
   // only the flush of the directory entry the rename created is refused. Any caller that read
   // the file back here would be satisfied. Only the throw tells the truth.
-  const dir = stateDir()
+  const dir = stateDir(t)
   try {
     const stateFile = join(dir, 'db-connect-fence.json')
     chmodSync(dir, NO_READ)
@@ -839,10 +860,10 @@ test('a publish whose POST-RENAME barrier fails throws, though the record is alr
   }
 })
 
-test('the fence refuses to revoke when its record cannot be created at all', async () => {
+test('the fence refuses to revoke when its record cannot be created at all', async (t) => {
   // PRE-RENAME side. Nothing is on disk and nothing may be revoked: a REVOKE is committed and
   // survives, so it must never outrun the record that undoes it.
-  const dir = stateDir()
+  const dir = stateDir(t)
   try {
     const stateFile = join(dir, 'db-connect-fence.json')
     chmodSync(dir, NO_WRITE)
@@ -860,11 +881,11 @@ test('the fence refuses to revoke when its record cannot be created at all', asy
   }
 })
 
-test('the fence refuses to revoke when its record is visible but its name is not durable', async () => {
+test('the fence refuses to revoke when its record is visible but its name is not durable', async (t) => {
   // POST-RENAME side — the instant the finding names. The record is complete and readable at
   // the authoritative path; a read-back would pass; a power loss can still restore the
   // previous directory entry. Only publishState()'s throw can refuse here.
-  const dir = stateDir()
+  const dir = stateDir(t)
   try {
     const stateFile = join(dir, 'db-connect-fence.json')
     chmodSync(dir, NO_READ)
@@ -885,10 +906,10 @@ test('the fence refuses to revoke when its record is visible but its name is not
   }
 })
 
-test('the complete record is on the medium before the revoking transaction is opened', async () => {
+test('the complete record is on the medium before the revoking transaction is opened', async (t) => {
   // The positive half, observed at the wire: the fake snapshots the state file the instant it
   // is asked for BEGIN. A publication ordered AFTER the transaction would leave it empty.
-  const dir = stateDir()
+  const dir = stateDir(t)
   try {
     const stateFile = join(dir, 'db-connect-fence.json')
     const client = new FakeAdminClient({ stateFile })
@@ -917,10 +938,10 @@ test('the complete record is on the medium before the revoking transaction is op
   }
 })
 
-test('a grantee that appeared since the fence was recorded is recorded durably before it is revoked', async () => {
+test('a grantee that appeared since the fence was recorded is recorded durably before it is revoked', async (t) => {
   // The append path, on the POST-RENAME side. The fence recorded earlier stays standing; the
   // NEW grantee is not revoked, because the record that would restore it could not be proven.
-  const dir = stateDir()
+  const dir = stateDir(t)
   try {
     const stateFile = join(dir, 'db-connect-fence.json')
     publishState(stateFile, { ...SAMPLE_STATE, revoked: ['PUBLIC'] })
@@ -943,7 +964,7 @@ test('a grantee that appeared since the fence was recorded is recorded durably b
   }
 })
 
-test('the fence refuses to re-apply a record written for another database', async () => {
+test('the fence refuses to re-apply a record written for another database', async (t) => {
   // o3d-2sm1.5 r30, Codex CRITICAL (the second half of it). `--release` has asked this since it
   // was written; `--fence` never did, and the re-apply path is where it matters most: an existing
   // record is reused for its GRANTEE LIST, and that list is the set of roles a fence on THAT
@@ -955,7 +976,7 @@ test('the fence refuses to re-apply a record written for another database', asyn
   // MUTATION ROUTE (verified by making the change locally and re-running): delete the
   // `existing.database !== facts.database` guard from doFence() and this test fails at the exit
   // code and at `revokes` — the fence re-applies "otherdb"'s grantee list against imsdb.
-  const dir = stateDir()
+  const dir = stateDir(t)
   try {
     const stateFile = join(dir, 'db-connect-fence.json')
     publishState(stateFile, { ...SAMPLE_STATE, database: 'otherdb', revoked: ['PUBLIC', 'otherapp'] })
@@ -977,11 +998,11 @@ test('the fence refuses to re-apply a record written for another database', asyn
   }
 })
 
-test('the fence refuses to start a fresh record over one it cannot read', async () => {
+test('the fence refuses to start a fresh record over one it cannot read', async (t) => {
   // The same absence-read-as-negative defect on the WRITE side: the old readState() collapsed
   // "unusable" into null, and doFence would then publish a fresh record over the only account
   // of what an earlier fence revoked.
-  const dir = stateDir()
+  const dir = stateDir(t)
   try {
     const stateFile = join(dir, 'db-connect-fence.json')
     writeFileSync(stateFile, '{ "database": "imsdb", "revoked": ["monitoring"')
@@ -1082,11 +1103,11 @@ test('a release with no role to ask about refuses rather than reporting success'
   assert.match(verdict.lines.join('\n'), /--app-role/, 'and it must say how to make the question answerable')
 })
 
-test('--release over a lost record grants nothing and fails, rather than reporting nothing to release', async () => {
+test('--release over a lost record grants nothing and fails, rather than reporting nothing to release', async (t) => {
   // The behavioural half: the record is gone, the database says the application cannot
   // connect. The old code printed "No connection fence is recorded; nothing to release." and
   // exited 0 here.
-  const dir = stateDir()
+  const dir = stateDir(t)
   try {
     const stateFile = join(dir, 'db-connect-fence.json')
     const client = new FakeAdminClient({ stateFile, stillConnectsBefore: false })
@@ -1103,14 +1124,14 @@ test('--release over a lost record grants nothing and fails, rather than reporti
   }
 })
 
-test('--release over a lost record refuses even when the application connects, because another revoked grantee may still be out', async () => {
+test('--release over a lost record refuses even when the application connects, because another revoked grantee may still be out', async (t) => {
   // THE SHAPE doFence() ITSELF LEAVES BEHIND (o3d-2sm1.5, Codex r12 HIGH). The fence revoked
   // CONNECT from PUBLIC and from `monitoring`; the application kept it through role membership,
   // so doFence() rejected the fence as ineffective and DELIBERATELY left the revokes standing.
   // The datacl below is that state: imsapp connects, PUBLIC and monitoring do not. Then the
   // record is lost. Reading has_database_privilege('imsapp') as "no fence is standing" reports
   // success over two revocations nobody will ever undo.
-  const dir = stateDir()
+  const dir = stateDir(t)
   try {
     const stateFile = join(dir, 'db-connect-fence.json')
     const client = new FakeAdminClient({
@@ -1144,8 +1165,8 @@ test('--release over a lost record refuses even when the application connects, b
   }
 })
 
-test('--release restores exactly the recorded grantees when the record survived', async () => {
-  const dir = stateDir()
+test('--release restores exactly the recorded grantees when the record survived', async (t) => {
+  const dir = stateDir(t)
   try {
     const stateFile = join(dir, 'db-connect-fence.json')
     publishState(stateFile, SAMPLE_STATE)
@@ -1319,14 +1340,14 @@ async function withMismatchedUrls<T>(run: () => Promise<T>): Promise<T> {
   }
 }
 
-test('the fence revokes nothing when the admin connection is not the application\'s database', () => {
+test('the fence revokes nothing when the admin connection is not the application\'s database', (t) => {
   // TWO DATABASES, and the role connects only to the admin URL's target. Fencing here would lock
   // other people's clients out of somewhere else while the application went on writing across
   // the migration, and every verification would be a truthful report about the wrong database.
   //
   // MUTATION ROUTE: remove the requireBoundDatabaseIdentity() call from doFence() and this
   // fences 'imsdb' and returns EXIT_OK with three REVOKEs on the wire.
-  const dir = stateDir()
+  const dir = stateDir(t)
   return (async () => {
     try {
       const stateFile = join(dir, 'db-connect-fence.json')
@@ -1343,7 +1364,7 @@ test('the fence revokes nothing when the admin connection is not the application
   })()
 })
 
-test('a release over an unbound connection restores nothing, however good its record looks', async () => {
+test('a release over an unbound connection restores nothing, however good its record looks', async (t) => {
   // The record is PRESENT and valid, so nothing downstream would ever question this release: it
   // would GRANT CONNECT on 'imsdb' — the admin URL's target, where imsapp already connects —
   // report "released", and let the caller start an application whose own database, onetwo3d_ims,
@@ -1351,7 +1372,7 @@ test('a release over an unbound connection restores nothing, however good its re
   //
   // MUTATION ROUTE: remove the requireBoundDatabaseIdentity() call from doRelease() and this
   // returns EXIT_OK with two GRANTs on the wire.
-  const dir = stateDir()
+  const dir = stateDir(t)
   try {
     const stateFile = join(dir, 'db-connect-fence.json')
     publishState(stateFile, SAMPLE_STATE)
@@ -1367,14 +1388,14 @@ test('a release over an unbound connection restores nothing, however good its re
   }
 })
 
-test('a release refuses when the record it holds was written for another database', async () => {
+test('a release refuses when the record it holds was written for another database', async (t) => {
   // The other half of the same question: the URLs agree, and the RECORD is from somewhere else —
   // a state file left by a run against a different database. Releasing from here would restore
   // grants recorded elsewhere, named by a database this connection is not attached to.
   //
   // MUTATION ROUTE: delete the `state.database !== connectedDatabase` arm from doRelease() and
   // this returns EXIT_OK, having granted on "elsewhere".
-  const dir = stateDir()
+  const dir = stateDir(t)
   try {
     const stateFile = join(dir, 'db-connect-fence.json')
     publishState(stateFile, { ...SAMPLE_STATE, database: 'elsewhere' })
@@ -1473,10 +1494,10 @@ test('an unrecorded release still refuses to call a fence released when the appl
 // EXIT_FENCE_STANDING means one thing: the revokes are committed and in force.
 // ---------------------------------------------------------------------------
 
-test('a fence that committed its revokes and could not shut the application out says the fence is STANDING', async () => {
+test('a fence that committed its revokes and could not shut the application out says the fence is STANDING', async (t) => {
   // MUTATION ROUTE: return EXIT_ERROR from the ineffective-fence branch of completeFence() and
   // this fails — which is the state the entrypoints could not distinguish.
-  const dir = stateDir()
+  const dir = stateDir(t)
   try {
     const stateFile = join(dir, 'db-connect-fence.json')
     const client = new FakeAdminClient({ stateFile, stillConnectsAfter: true })
@@ -1492,9 +1513,9 @@ test('a fence that committed its revokes and could not shut the application out 
   }
 })
 
-test('a fence whose room will not go quiet says the fence is STANDING', async () => {
+test('a fence whose room will not go quiet says the fence is STANDING', async (t) => {
   // MUTATION ROUTE: return EXIT_ERROR from the drain refusal and this fails.
-  const dir = stateDir()
+  const dir = stateDir(t)
   try {
     const stateFile = join(dir, 'db-connect-fence.json')
     const client = new FakeAdminClient({
@@ -1510,14 +1531,14 @@ test('a fence whose room will not go quiet says the fence is STANDING', async ()
   }
 })
 
-test('an error thrown AFTER the commit is a standing fence, not an exception the caller must classify', async () => {
+test('an error thrown AFTER the commit is a standing fence, not an exception the caller must classify', async (t) => {
   // A throw from any post-commit read used to escape doFence() entirely and reach main()'s
   // catch, which exits 1 — indistinguishable from a fence that revoked nothing, over a database
   // whose CONNECT had just been taken away.
   //
   // MUTATION ROUTE: remove the try/catch around completeFence() and this rejects instead of
   // returning, failing the test.
-  const dir = stateDir()
+  const dir = stateDir(t)
   try {
     const stateFile = join(dir, 'db-connect-fence.json')
     const client = new FakeAdminClient({ stateFile, throwAfterCommit: 'server closed the connection unexpectedly' })
@@ -1670,7 +1691,7 @@ test('the role half is asked of the connection: what it logged in as, and what i
   assert.equal(assessDatabaseIdentity({ ...base, ...ATTACHED_AS_ADMIN }).bound, true)
 })
 
-test('the fence revokes nothing when the SUPPLIED identity is not the cluster this connection is on', async () => {
+test('the fence revokes nothing when the SUPPLIED identity is not the cluster this connection is on', async (t) => {
   // THE WHOLE FINDING, AT THE WIRE, ON THE NEW SHAPE. The admin URL reaches localhost:5432/imsdb;
   // the caller says the application is on remote.example:6432. Fencing here would lock other
   // people's clients out of THIS cluster while the application keeps writing to remote.example
@@ -1682,7 +1703,7 @@ test('the fence revokes nothing when the SUPPLIED identity is not the cluster th
   // MUTATION ROUTE: delete that arm (or the requireBoundDatabaseIdentity() call from doFence())
   // and this fence proceeds — client.revokes stops being empty, COMMIT appears in the log and the
   // record is published.
-  const dir = stateDir()
+  const dir = stateDir(t)
   try {
     const stateFile = join(dir, 'db-connect-fence.json')
     const client = new FakeAdminClient({ stateFile })
@@ -1704,11 +1725,11 @@ test('the fence revokes nothing when the SUPPLIED identity is not the cluster th
   }
 })
 
-test('the fence revokes nothing when the connection logged in as a role the admin URL does not name', async () => {
+test('the fence revokes nothing when the connection logged in as a role the admin URL does not name', async (t) => {
   // MUTATION ROUTE: delete the admin.user vs connectedLoginRole arm and this fence proceeds,
   // excluding 'deployadmin' from the revoke while the connection it must keep is 'postgres' —
   // which is how a fence locks out the very connection that would release it.
-  const dir = stateDir()
+  const dir = stateDir(t)
   try {
     const stateFile = join(dir, 'db-connect-fence.json')
     const client = new FakeAdminClient({ stateFile, loginRole: 'postgres', effectiveRole: 'postgres' })
@@ -1733,10 +1754,10 @@ test('the fence revokes nothing when the connection logged in as a role the admi
 //         application. The boundary is now the moment COMMIT is ISSUED.
 // ---------------------------------------------------------------------------
 
-test('a COMMIT whose acknowledgement never arrives is a fence that MAY BE STANDING, not one that did not happen', async () => {
+test('a COMMIT whose acknowledgement never arrives is a fence that MAY BE STANDING, not one that did not happen', async (t) => {
   // MUTATION ROUTE: move `commitIssued = true` to after the COMMIT await — the old boundary — and
   // this test rejects instead of returning, because the catch rethrows.
-  const dir = stateDir()
+  const dir = stateDir(t)
   try {
     const stateFile = join(dir, 'db-connect-fence.json')
     const client = new FakeAdminClient({ stateFile, failCommitAck: 'Connection terminated unexpectedly' })
@@ -1759,13 +1780,13 @@ test('a COMMIT whose acknowledgement never arrives is a fence that MAY BE STANDI
   }
 })
 
-test('a failure BEFORE the COMMIT is issued still rolls back and still reports a fence that never happened', async () => {
+test('a failure BEFORE the COMMIT is issued still rolls back and still reports a fence that never happened', async (t) => {
   // The control on the control (o3d-2sm1.5): if every failure became EXIT_FENCE_STANDING, the
   // code would stop meaning anything and every aborted run would send an operator hunting for a
   // fence that is not there.
   //
   // MUTATION ROUTE: drop the `if (!commitIssued)` guard and this stops throwing.
-  const dir = stateDir()
+  const dir = stateDir(t)
   try {
     const stateFile = join(dir, 'db-connect-fence.json')
     class RefusingClient extends FakeAdminClient {
@@ -1929,7 +1950,7 @@ async function withAdminUrlOf<T>(adminUrl: string, run: () => Promise<T>): Promi
   }
 }
 
-test('the fence revokes nothing, and commits nothing, when the ADMIN URL names two hosts, two ports and two roles', async () => {
+test('the fence revokes nothing, and commits nothing, when the ADMIN URL names two hosts, two ports and two roles', async (t) => {
   // THE WHOLE FINDING, AT THE WIRE, IN THE DIRECTION THAT ACTUALLY FENCES. The duplicates here
   // resolve — through the driver — to precisely the address and role the caller supplies, so with
   // the repetition accepted the identity binds and the fence goes ahead: it would revoke CONNECT
@@ -1945,7 +1966,7 @@ test('the fence revokes nothing, and commits nothing, when the ADMIN URL names t
   assert.equal(effective.port, '5432', 'precondition: and the supplied port')
   assert.equal(effective.user, 'deployadmin', 'precondition: and the role the connection logs in as, so nothing else would refuse this')
 
-  const dir = stateDir()
+  const dir = stateDir(t)
   try {
     const stateFile = join(dir, 'db-connect-fence.json')
     const client = new FakeAdminClient({ stateFile })
