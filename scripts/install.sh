@@ -1163,13 +1163,124 @@ compose_database_url() {
 # answer. The password is a placeholder because url_encode_userinfo() percent-encodes everything
 # outside the RFC 3986 unreserved set — a `?` in a password reaches the URL as `%3F` — so no
 # credential can put a query string there, and none is needed to ask this question.
+# AND THE URL IS ONLY HALF OF THE DRIVER'S CONFIGURATION (o3d-2sm1.5 r44, Codex HIGH).
+#
+# THE FINDING. r43 answered `disable` BECAUSE THE COMPOSED URL HAS NO QUERY STRING. That is not
+# why node-postgres connects in the clear. The URL leaves `ssl` UNDEFINED, and the driver then
+# reads `process.env.PGSSLMODE` (`node_modules/pg/lib/connection-parameters.js:25-37,85`): a
+# service carrying `Environment=PGSSLMODE=…` takes a `hostssl` record while this gate reads,
+# probes and rotates against `hostnossl`. It is the defect this branch ALREADY FIXED one layer
+# down — libpq_env_unset_args() exists because libpq fills every absent connection value from the
+# environment — reaching a second driver the rule was never applied to.
+#
+# THE SET, MEASURED AND NOT LOOKED UP. `process.env` was replaced with a recording Proxy and a
+# ConnectionParameters built from exactly the URL compose_database_url() emits, against the
+# installed pg 8.20.0 and pg-connection-string 2.12.0. The driver consults these and no others:
+#
+#   PGSSLMODE                                       the SSL layer
+#   PGREPLICATION  PGOPTIONS                        the startup packet
+#   PGAPPNAME  PGBINARY  PGCLIENT_ENCODING  PGCONNECT_TIMEOUT
+#   NODE_PG_FORCE_NATIVE                            read at module load, `pg/lib/index.js:41`
+#
+# PGHOST, PGPORT, PGUSER, PGDATABASE and PGPASSWORD are NOT among them, and that is not luck: the
+# driver's `val()` takes the config value whenever it is truthy, and this URL states all five. The
+# r37 measurement therefore still holds — it just never covered the layer that has no URL field.
+#
+# OF THOSE, THE ONES THAT MOVE WHICH pg_hba RECORD ANSWERS, each measured against a real cluster
+# carrying `hostssl … trust` over `hostnossl … scram-sha-256`:
+#
+#   PGSSLMODE=no-verify   the driver completes TLS; pg_stat_ssl says ssl=true; the hostssl record
+#                         answers. That is the OPPOSITE record from the one r43 validates.
+#   PGSSLMODE=require     the driver demands a CA-verified certificate — its `require` is
+#                         verify-full, which r43 recorded from the other direction — and against a
+#                         self-signed cluster certificate it never authenticates at all.
+#   PGREPLICATION=…       the backend becomes a WAL sender, and pg_hba matches a WAL sender on the
+#                         `replication` keyword rather than on the database name.
+#   NODE_PG_FORCE_NATIVE  swaps the whole driver for libpq, which reopens PGSSLMODE, PGGSSENCMODE,
+#                         PGSERVICE, PGSYSCONFDIR and everything else this gate has bounded.
+#
+# The rest are read AFTER the record has been matched and move nothing: PGOPTIONS, PGAPPNAME,
+# PGBINARY, PGCLIENT_ENCODING, PGCONNECT_TIMEOUT. They are named here and deliberately not refused.
+#
+# AND THE ANSWER IS REFUSE RATHER THAN DERIVE. Deriving would mean reproducing node-postgres's TLS
+# semantics for every value of every variable above — and they are not libpq's, so there is no
+# psql `sslmode=` that reproduces `require`'s verify-full-against-the-system-store, which is the
+# same wall r43 hit when it refused to emit `?sslmode=require`. A value missed in that mapping is
+# this finding again. Refusing costs an operator one line to delete on a host that has configured
+# a transport this installer's URL does not state; it is this branch's standing answer for an
+# unknown, and it is what the two call sites below take.
+db_route_env_variables() {
+  printf '%s\n' PGSSLMODE PGREPLICATION NODE_PG_FORCE_NATIVE
+}
+
+# What each one does to the record, in the words the refusal prints.
+db_route_env_effect() {
+  case "${1}" in
+    PGSSLMODE) printf 'it decides whether node-postgres sends an SSLRequest, and a hostssl record is a different pg_hba record from a hostnossl one' ;;
+    PGREPLICATION) printf 'it turns the backend into a WAL sender, which pg_hba matches on the replication keyword rather than on the database name' ;;
+    NODE_PG_FORCE_NATIVE) printf 'it replaces node-postgres with libpq, which fills sslmode, gssencmode, service and host from the environment all over again' ;;
+    *) printf 'it is consulted by the driver when the URL leaves that field undefined' ;;
+  esac
+}
+
+# THE THREE PLACES THE APPLICATION'S DRIVER CAN ACQUIRE ONE, ALL READ.
+#
+# THE REASON COMES OUT ON STDOUT and not in a global, because every consumer of the route reads it
+# through `$( )` and a global set inside a command substitution does not survive the subshell.
+# That is how a refusal comes to be silently generic, and this branch has shipped that once.
+#
+# NOTHING HERE WRITES ANYTHING: three environment reads, one `systemctl show-environment`, and the
+# unit scan, which is `busctl get-property` and a `grep` of files the unit already names.
+db_application_route_env_refusal() {
+  local name manager_env=""
+  if command -v systemctl >/dev/null 2>&1; then
+    manager_env="$(systemctl show-environment 2>/dev/null || true)"
+  fi
+  while IFS= read -r name; do
+    # 1. THIS PROCESS. Not a proxy for the service's environment — a source in its own right. The
+    #    MIGRATION, the BUILD and scripts/fence-db-connections.mjs are node processes this script
+    #    starts, they run the application's own driver, and they inherit this environment verbatim.
+    if [[ -n "${!name+is-set}" ]]; then
+      printf 'this installer is running with %s=%s in its own environment, and %s. The migration, the build and the connection fence are started from here and inherit it, so the connection this gate vouches for is not the one it observed. Unset %s and re-run' \
+        "${name}" "${!name}" "$(db_route_env_effect "${name}")" "${name}"
+      return 1
+    fi
+    # 2. THE SERVICE MANAGER'S OWN ENVIRONMENT BLOCK, which systemd passes to EVERY service it
+    #    starts and which appears in NO unit property — DefaultEnvironment= in system.conf plus
+    #    whatever `systemctl set-environment` has been told. The unit scan below cannot see it, and
+    #    this branch's own doctrine is that a source you cannot see is the one that gets you: the
+    #    same sentence r28 wrote about EnvironmentFile= being read at fork and never published.
+    if printf '%s\n' "${manager_env}" | grep -q "^${name}="; then
+      printf 'the systemd manager passes %s to every service it starts — systemctl show-environment names it — and %s. The application would take that route while this gate observed another. Clear it with systemctl unset-environment %s, or remove it from DefaultEnvironment= in the manager configuration, and re-run' \
+        "${name}" "$(db_route_env_effect "${name}")" "${name}"
+      return 1
+    fi
+    # 3. THE UNIT, THROUGH THE READER THIS BRANCH ALREADY BUILT. unit_env_var_sole_source() is the
+    #    one place that knows what a systemd environment is composed of — Environment=,
+    #    PassEnvironment=, UnsetEnvironment=, every EnvironmentFile= and PAMName= — and writing a
+    #    second reader for PGSSLMODE beside it is precisely the shape of the finding this answers.
+    #    The `none` layer is what this question needs: for DATABASE_URL an environment file is the
+    #    PERMITTED source, and here there is no permitted source at all.
+    if ! unit_env_var_sole_source "${name}" none "" "${APP_NAME}.service"; then
+      printf '%s, and %s' "${ENV_VAR_SOURCE_REASON}" "$(db_route_env_effect "${name}")"
+      return 1
+    fi
+  done < <(db_route_env_variables)
+  return 0
+}
+
 db_application_route_sslmode() {
-  local url
+  local url reason
+  # THE ENVIRONMENT FIRST, because it is the half r43 did not look at and the half that decides.
+  if ! reason="$(db_application_route_env_refusal)"; then
+    printf '%s' "${reason}"
+    return 1
+  fi
   url="$(compose_database_url "${DB_USER}" "irrelevant" "${DB_HOST}" "${DB_PORT}" "${DB_NAME}")"
   case "${url}" in
-    *\?*) return 1 ;;
+    *\?*) printf 'the DATABASE_URL this run would publish carries a query string, and a query string is what gives node-postgres an ssl setting of its own — so the URL is not of the shape the driver was measured against and the route it would take is unknown'; return 1 ;;
     postgresql://*) printf 'disable' ;;
-    *) return 1 ;;
+    *) printf 'the DATABASE_URL this run would publish is not a postgresql:// URL, so what node-postgres does with it has not been measured'; return 1 ;;
   esac
 }
 
@@ -2310,8 +2421,12 @@ db_endpoint_checks_role_verifier() {
   # about the connection ${APP_DIR}/.env will name, so the observation is made on that connection's
   # transport or it is not made at all.
   if ! route="$(db_application_route_sslmode)"; then
+    # THE DERIVATION'S OWN SENTENCE, NOT A SUMMARY OF IT (r44). It is the only thing that knows
+    # WHICH of the several ways the route can be unknowable this host is in, and the summary that
+    # used to stand here named exactly one of them — the query string — while r44's finding was
+    # that the commonest is a PGSSLMODE this reader had never looked for.
     DB_PROBE_REPORT+="
-  - '${database}' was not asked which pg_hba rule matches it, because this run cannot say which TRANSPORT the application's own connection takes. The DATABASE_URL it would publish is not of the shape node-postgres was measured against — a query string on it changes the driver's transport — so the route to observe on is unknown, and a method read over an unknown route is not evidence about the connection the application makes. Re-run the installer from a complete release checkout."
+  - '${database}' was not asked which pg_hba rule matches it, because this run cannot say which TRANSPORT the application's own connection takes: ${route}. A pg_hba rule is matched per transport — hostssl and hostnossl are different records — so a method read over an unknown route is not evidence about the connection the application makes."
     return 1
   fi
   probe="$(db_auth_request_probe_path)"
@@ -3049,11 +3164,14 @@ bus_unit_property() {
   busctl get-property org.freedesktop.systemd1 "${1:-}" "org.freedesktop.systemd1.${2:-}" "${3:-}" 2>/dev/null
 }
 
-# Does this element of an environment property NAME DATABASE_URL? Everything before the first `=`
-# is the name, so `DATABASE_URL`, `DATABASE_URL=postgresql://...` and an assignment carrying any
-# value at all are one answer, and `NEXT_PUBLIC_DATABASE_URL=...` is not.
-bus_element_names_database_url() {
-  [[ "${1%%=*}" == "DATABASE_URL" ]]
+# Does this element of an environment property NAME the variable being asked about? Everything
+# before the first `=` is the name, so `DATABASE_URL`, `DATABASE_URL=postgresql://...` and an
+# assignment carrying any value at all are one answer, and `NEXT_PUBLIC_DATABASE_URL=...` is not.
+# The variable is an ARGUMENT since r44, for the same reason it became one in update.sh at r28:
+# the transport question below asks it of PGSSLMODE, and a second matcher written for that is a
+# second place for the rule to be got wrong.
+bus_element_names_variable() {
+  [[ "${1%%=*}" == "${2}" ]]
 }
 
 # THE `ignore_errors` HALF OF EnvironmentFiles=, which is an `a(sb)` and not an `as`
@@ -3089,21 +3207,36 @@ bus_read_env_ignore_flags() {
 # about to hand the units to systemd (o3d-2sm1.5 r23).
 DB_IDENTITY_REQUIRE_SNAPSHOT=false
 
-env_file_is_sole_database_url_source() {
-  local env_file="${1:-}"; shift || true
+# THE SCAN, TOLD WHICH VARIABLE TO ASK ABOUT AND WHICH LAYER MAY ANSWER (o3d-2sm1.5 r44).
+#
+# It was `env_file_is_sole_database_url_source` and nothing else until r44, which is exactly the
+# shape update.sh was in when r28 found a second reader beside it. The generalisation is lifted
+# from there so the two files hold ONE rule rather than two that drift:
+#
+#   file   the DATABASE_URL question. ${env_file} is the PERMITTED source; an `Environment=`
+#          directive is a competing definition and a refusal; and this run's own snapshot may be
+#          the second environment file and nothing else may.
+#   none   the transport question (r44). There is NO permitted source: the route this gate
+#          publishes is DERIVED from the URL, so any environment source that could move it is a
+#          route this run did not choose. This is the one layer that OPENS the environment files,
+#          and the difference is the question rather than the doctrine — see the block below.
+ENV_VAR_SOURCE_REASON="the service environment has not been asked about yet"
+
+unit_env_var_sole_source() {
+  local variable="${1:-}" layer="${2:-}" env_file="${3:-}"; shift 3 2>/dev/null || true
   local -a units=("$@")
   local unit object rendering count element expected resolved load_state pam_name snapshot_expected
 
-  DB_IDENTITY_SOURCE_REASON=""
+  ENV_VAR_SOURCE_REASON=""
   expected="$(readlink -f "$env_file" 2>/dev/null || printf '%s' "$env_file")"
   snapshot_expected="$(readlink -f "$DB_ENV_SNAPSHOT_FILE" 2>/dev/null || printf '%s' "$DB_ENV_SNAPSHOT_FILE")"
 
   if [[ "${#units[@]}" -eq 0 || -z "${units[0]}" ]]; then
-    DB_IDENTITY_SOURCE_REASON="no systemd unit was identified for the application, so there is nothing that can say whether ${env_file} is what gives it DATABASE_URL"
+    ENV_VAR_SOURCE_REASON="no systemd unit was identified for the application, so there is nothing that can say whether ${env_file} is what gives it ${variable}"
     return 1
   fi
   if ! command -v busctl >/dev/null 2>&1; then
-    DB_IDENTITY_SOURCE_REASON="busctl — systemd's own bus client, shipped beside systemctl — is not available, so whether anything other than ${env_file} defines DATABASE_URL for the service cannot be established"
+    ENV_VAR_SOURCE_REASON="busctl — systemd's own bus client, shipped beside systemctl — is not available, so whether anything other than ${env_file} defines ${variable} for the service cannot be established"
     return 1
   fi
 
@@ -3115,36 +3248,45 @@ env_file_is_sole_database_url_source() {
     # load `systemctl show` performs — it starts nothing and queues no job.
     rendering="$(busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager LoadUnit s "$unit" 2>/dev/null)" || rendering=''
     if ! bus_read_strings "$rendering" || [[ "${#BUS_STRINGS[@]}" -ne 1 || -z "${BUS_STRINGS[0]}" ]]; then
-      DB_IDENTITY_SOURCE_REASON="systemd would not say where ${unit} lives on its bus, so what defines DATABASE_URL for that service is unknown"
+      ENV_VAR_SOURCE_REASON="systemd would not say where ${unit} lives on its bus, so what defines ${variable} for that service is unknown"
       return 1
     fi
     object="${BUS_STRINGS[0]}"
 
     rendering="$(bus_unit_property "$object" Unit LoadState)" || rendering=''
     if ! bus_read_strings "$rendering" || [[ "${#BUS_STRINGS[@]}" -ne 1 ]]; then
-      DB_IDENTITY_SOURCE_REASON="systemd would not answer for ${unit}'s LoadState, so what defines DATABASE_URL for that service is unknown"
+      ENV_VAR_SOURCE_REASON="systemd would not answer for ${unit}'s LoadState, so what defines ${variable} for that service is unknown"
       return 1
     fi
     load_state="${BUS_STRINGS[0]}"
+    # A UNIT SYSTEMD DOES NOT HAVE DEFINES NOTHING — and only the `none` layer may say so
+    # (o3d-2sm1.5 r44). LoadUnit loads from disk, so `not-found` means there is no unit file at
+    # all; a unit that does not exist cannot carry a PGSSLMODE, and on a first install this script
+    # is about to write the unit itself. For the `file` layer the same state is still a refusal,
+    # because there the question is "does THIS file give the service its DATABASE_URL", and a
+    # service that does not exist has not been shown to be given it by anything.
+    if [[ "$layer" == "none" && "$load_state" == "not-found" ]]; then
+      continue
+    fi
     if [[ "$load_state" != "loaded" ]]; then
-      DB_IDENTITY_SOURCE_REASON="systemd reports ${unit} as '${load_state:-unknown}' rather than loaded, so what defines DATABASE_URL for it cannot be read"
+      ENV_VAR_SOURCE_REASON="systemd reports ${unit} as '${load_state:-unknown}' rather than loaded, so what defines ${variable} for it cannot be read"
       return 1
     fi
 
     # PAMName=, which the five-property question did not ask (r21, Codex CRITICAL). systemd.exec
     # lists "variables set by any PAM modules in case PAMName= is in effect" AFTER the
     # EnvironmentFile= layer and says the later source wins, so a unit naming a PAM profile whose
-    # stack runs pam_env can be handed a DATABASE_URL that beats the file this deploy read — while
+    # stack runs pam_env can be handed a ${variable} that beats the file this deploy read — while
     # every other property here still says "only that file". What a PAM stack supplies is not
     # knowable without reading PAM configuration, so ANY non-empty value is refused.
     rendering="$(bus_unit_property "$object" Service PAMName)" || rendering=''
     if ! bus_read_strings "$rendering" || [[ "${#BUS_STRINGS[@]}" -ne 1 ]]; then
-      DB_IDENTITY_SOURCE_REASON="systemd would not answer for ${unit}'s PAMName=, so whether a PAM stack also defines DATABASE_URL for it is unknown"
+      ENV_VAR_SOURCE_REASON="systemd would not answer for ${unit}'s PAMName=, so whether a PAM stack also defines ${variable} for it is unknown"
       return 1
     fi
     pam_name="${BUS_STRINGS[0]}"
     if [[ -n "$pam_name" ]]; then
-      DB_IDENTITY_SOURCE_REASON="${unit} sets PAMName=${pam_name}, and systemd applies the variables its PAM modules set AFTER the environment file — the later source wins. Whether that stack exports DATABASE_URL is a question about PAM configuration this will not read, so it is refused rather than guessed at. Remove PAMName=, or state the connection identity explicitly"
+      ENV_VAR_SOURCE_REASON="${unit} sets PAMName=${pam_name}, and systemd applies the variables its PAM modules set AFTER the environment file — the later source wins. Whether that stack exports ${variable} is a question about PAM configuration this will not read, so it is refused rather than guessed at. Remove PAMName=, or state the connection identity explicitly"
       return 1
     fi
 
@@ -3156,17 +3298,17 @@ env_file_is_sole_database_url_source() {
       rendering="$(bus_unit_property "$object" Service "$property")" || rendering=''
       if ! count="$(bus_array_count "$rendering" 'as')" || ! bus_read_strings "$rendering" \
         || [[ "${#BUS_STRINGS[@]}" -ne "$count" ]]; then
-        DB_IDENTITY_SOURCE_REASON="systemd would not answer readably for ${unit}'s ${property}=, so what defines DATABASE_URL for that service is unknown"
+        ENV_VAR_SOURCE_REASON="systemd would not answer readably for ${unit}'s ${property}=, so what defines ${variable} for that service is unknown"
         return 1
       fi
       for element in ${BUS_STRINGS[@]+"${BUS_STRINGS[@]}"}; do
-        bus_element_names_database_url "$element" || continue
+        bus_element_names_variable "$element" "$variable" || continue
         case "$property" in
-          Environment) description="sets DATABASE_URL in its own Environment= (${element%%=*}=…). systemd puts that in the service's environment and dotenv will not overwrite an already-set variable, so the application connects where THAT says and not where ${env_file} says" ;;
-          PassEnvironment) description="lists DATABASE_URL in PassEnvironment=, so the service inherits whatever the service manager's own environment holds and ${env_file} does not decide where the application connects" ;;
-          *) description="lists DATABASE_URL in UnsetEnvironment= (as '${element}'), so systemd removes the value ${env_file} supplies — as the final step of composing the environment, whether it is written as a name or as an exact assignment — and the application's own loader decides what replaces it" ;;
+          Environment) description="sets ${variable} in its own Environment= (${element%%=*}=…). systemd puts that in the service's environment and dotenv will not overwrite an already-set variable, so the application connects where THAT says and not where ${env_file} says" ;;
+          PassEnvironment) description="lists ${variable} in PassEnvironment=, so the service inherits whatever the service manager's own environment holds and ${env_file} does not decide where the application connects" ;;
+          *) description="lists ${variable} in UnsetEnvironment= (as '${element}'), so systemd removes the value ${env_file} supplies — as the final step of composing the environment, whether it is written as a name or as an exact assignment — and the application's own loader decides what replaces it" ;;
         esac
-        DB_IDENTITY_SOURCE_REASON="${unit} ${description}. Remove it, or state the connection identity explicitly"
+        ENV_VAR_SOURCE_REASON="${unit} ${description}. Remove it, or state the connection identity explicitly"
         return 1
       done
     done
@@ -3176,11 +3318,41 @@ env_file_is_sole_database_url_source() {
     rendering="$(bus_unit_property "$object" Service EnvironmentFiles)" || rendering=''
     if ! count="$(bus_array_count "$rendering" 'a(sb)')" || ! bus_read_strings "$rendering" \
       || [[ "${#BUS_STRINGS[@]}" -ne "$count" ]]; then
-      DB_IDENTITY_SOURCE_REASON="systemd would not answer readably for ${unit}'s EnvironmentFiles=, so what defines DATABASE_URL for that service is unknown"
+      ENV_VAR_SOURCE_REASON="systemd would not answer readably for ${unit}'s EnvironmentFiles=, so what defines ${variable} for that service is unknown"
       return 1
     fi
+    # THE `none` LAYER OPENS THEM, WHICH THE `file` LAYER REFUSES TO DO (o3d-2sm1.5 r44, Codex
+    # HIGH) — AND THE DIFFERENCE IS THE QUESTION, NOT THE DOCTRINE. r19 and r28 refuse to open an
+    # environment file because WHICH of several definitions systemd would keep is composition this
+    # script does not reproduce. Here there is no precedence to work out: any definition, in any
+    # file, in any position, is the refusal, so the test is PRESENCE and nothing about ordering is
+    # assumed. It is deliberately over-broad — a line whose name half matches, anywhere in the
+    # file, refuses — because over-matching costs an operator one message naming the file, and
+    # under-matching costs the finding this round exists to answer. A file that is not there
+    # defines nothing; one that is there and cannot be read is an unknown, and unknowns refuse.
+    if [[ "$layer" == "none" ]]; then
+      local scanned
+      for (( scanned = 0; scanned < count; scanned++ )); do
+        element="${BUS_STRINGS[scanned]}"
+        case "$element" in
+          *'\'*)
+            ENV_VAR_SOURCE_REASON="systemd reports one of ${unit}'s environment files as ${element}, a path it had to escape to state. Comparing that here would be a reimplementation of somebody else's escaping, so whether it defines ${variable} is refused rather than guessed at"
+            return 1 ;;
+        esac
+        [[ -e "$element" ]] || continue
+        if [[ ! -r "$element" ]]; then
+          ENV_VAR_SOURCE_REASON="${unit} loads ${element} as an environment file and this run cannot read it, so whether it defines ${variable} for the service is unknown"
+          return 1
+        fi
+        if grep -Eq "^[[:space:]]*(export[[:space:]]+)?${variable}[[:space:]]*=" "$element"; then
+          ENV_VAR_SOURCE_REASON="${unit} loads the environment file ${element}, and that file has a line naming ${variable}. systemd reads it at exec and puts it in the service's environment, so the application runs with ${variable} set"
+          return 1
+        fi
+      done
+      continue
+    fi
     if [[ "$count" -eq 0 ]]; then
-      DB_IDENTITY_SOURCE_REASON="${unit} does not load ${env_file} with EnvironmentFile=, so DATABASE_URL reaches the application through its own dotenv loader instead — whose .env.local and per-mode overlays are exactly the composition this deploy stopped reproducing. Add EnvironmentFile=${env_file} to the unit, or state the connection identity explicitly"
+      ENV_VAR_SOURCE_REASON="${unit} does not load ${env_file} with EnvironmentFile=, so ${variable} reaches the application through its own dotenv loader instead — whose .env.local and per-mode overlays are exactly the composition this deploy stopped reproducing. Add EnvironmentFile=${env_file} to the unit, or state the connection identity explicitly"
       return 1
     fi
     # ONE ENVIRONMENT FILE, OR TWO OF WHICH THE SECOND IS THIS RUN'S OWN SNAPSHOT
@@ -3190,14 +3362,14 @@ env_file_is_sole_database_url_source() {
     # drop-in that loads ${DB_ENV_SNAPSHOT_FILE} after it. So the shape is stated exactly: the
     # application's file first, and at most one more, which may only be the snapshot THIS RUN
     # published. A snapshot left behind by some earlier run is NOT tolerated — DB_ENV_SNAPSHOT_PUBLISHED
-    # is false until this run writes one — because an unexplained pin is a DATABASE_URL nobody
+    # is false until this run writes one — because an unexplained pin is a ${variable} nobody
     # here chose, which is precisely the condition this function exists to refuse.
     if [[ "$count" -gt 2 ]]; then
-      DB_IDENTITY_SOURCE_REASON="${unit} loads ${count} environment files (${BUS_STRINGS[*]}). Whether any of them but ${env_file} defines DATABASE_URL, and which definition systemd would keep, is composition this will not reproduce — so it is refused rather than guessed at, and without reading them. Load only ${env_file}, or state the connection identity explicitly"
+      ENV_VAR_SOURCE_REASON="${unit} loads ${count} environment files (${BUS_STRINGS[*]}). Whether any of them but ${env_file} defines ${variable}, and which definition systemd would keep, is composition this will not reproduce — so it is refused rather than guessed at, and without reading them. Load only ${env_file}, or state the connection identity explicitly"
       return 1
     fi
     if ! bus_read_env_ignore_flags "$rendering" || [[ "${#BUS_ENV_IGNORE_FLAGS[@]}" -ne "$count" ]]; then
-      DB_IDENTITY_SOURCE_REASON="systemd would not say readably whether ${unit} loads its environment files with a leading '-'. Whether a missing file is skipped or fatal decides what the service gets when one disappears, so it is refused rather than assumed"
+      ENV_VAR_SOURCE_REASON="systemd would not say readably whether ${unit} loads its environment files with a leading '-'. Whether a missing file is skipped or fatal decides what the service gets when one disappears, so it is refused rather than assumed"
       return 1
     fi
     local index
@@ -3206,32 +3378,32 @@ env_file_is_sole_database_url_source() {
       element="${BUS_STRINGS[index]}"
       case "$element" in
         *'\'*)
-          DB_IDENTITY_SOURCE_REASON="systemd reports one of ${unit}'s environment files as ${element}, a path it had to escape to state. Decoding that here to compare it with ${env_file} is a reimplementation of somebody else's escaping, so it is refused: give the unit an EnvironmentFile= path with no character needing an escape, or state the connection identity explicitly"
+          ENV_VAR_SOURCE_REASON="systemd reports one of ${unit}'s environment files as ${element}, a path it had to escape to state. Decoding that here to compare it with ${env_file} is a reimplementation of somebody else's escaping, so it is refused: give the unit an EnvironmentFile= path with no character needing an escape, or state the connection identity explicitly"
           return 1 ;;
       esac
       resolved="$(readlink -f "$element" 2>/dev/null || printf '%s' "$element")"
       if [[ "$index" -eq 0 ]]; then
         if [[ "$resolved" != "$expected" ]]; then
-          DB_IDENTITY_SOURCE_REASON="${unit} loads ${element} as its first environment file and not ${env_file}, so the file this deploy read is not the one that gives the service DATABASE_URL. Load ${env_file}, or state the connection identity explicitly"
+          ENV_VAR_SOURCE_REASON="${unit} loads ${element} as its first environment file and not ${env_file}, so the file this deploy read is not the one that gives the service ${variable}. Load ${env_file}, or state the connection identity explicitly"
           return 1
         fi
         continue
       fi
       # THE SECOND ENTRY, WHICH MAY ONLY BE THE BINDING. Three things are required of it and each
-      # is load-bearing: it is the snapshot's path (anything else is a source of DATABASE_URL this
+      # is load-bearing: it is the snapshot's path (anything else is a source of ${variable} this
       # deploy did not write), THIS run published it (an old one pins a value nobody re-validated),
       # and it is loaded WITHOUT a leading '-' (with one, deleting it between here and the exec
       # takes the binding away silently and hands the service back to ${env_file}).
       if ! $DB_ENV_SNAPSHOT_PUBLISHED; then
-        DB_IDENTITY_SOURCE_REASON="${unit} loads a second environment file, ${element}, that this run did not publish. A second file can define DATABASE_URL and systemd keeps the LAST definition, so what the service would connect to is not ${env_file}'s answer. Remove it (if it is a ${DB_ENV_SNAPSHOT_DROPIN_NAME} drop-in, an earlier cutover left it behind and it is safe to delete), or state the connection identity explicitly"
+        ENV_VAR_SOURCE_REASON="${unit} loads a second environment file, ${element}, that this run did not publish. A second file can define ${variable} and systemd keeps the LAST definition, so what the service would connect to is not ${env_file}'s answer. Remove it (if it is a ${DB_ENV_SNAPSHOT_DROPIN_NAME} drop-in, an earlier cutover left it behind and it is safe to delete), or state the connection identity explicitly"
         return 1
       fi
       if [[ "$resolved" != "$snapshot_expected" ]]; then
-        DB_IDENTITY_SOURCE_REASON="${unit} loads ${element} as a second environment file, and this run's environment snapshot is ${DB_ENV_SNAPSHOT_FILE}. A second file can define DATABASE_URL and systemd keeps the LAST definition, so the service would connect where that file says. Remove it, or state the connection identity explicitly"
+        ENV_VAR_SOURCE_REASON="${unit} loads ${element} as a second environment file, and this run's environment snapshot is ${DB_ENV_SNAPSHOT_FILE}. A second file can define ${variable} and systemd keeps the LAST definition, so the service would connect where that file says. Remove it, or state the connection identity explicitly"
         return 1
       fi
       if [[ "${BUS_ENV_IGNORE_FLAGS[index]}" != "false" ]]; then
-        DB_IDENTITY_SOURCE_REASON="${unit} loads ${element} with a leading '-', so systemd SKIPS it if it is missing instead of failing the start. The whole point of the snapshot is that its absence stops the service rather than handing it back to ${env_file}; drop the '-' from the ${DB_ENV_SNAPSHOT_DROPIN_NAME} drop-in"
+        ENV_VAR_SOURCE_REASON="${unit} loads ${element} with a leading '-', so systemd SKIPS it if it is missing instead of failing the start. The whole point of the snapshot is that its absence stops the service rather than handing it back to ${env_file}; drop the '-' from the ${DB_ENV_SNAPSHOT_DROPIN_NAME} drop-in"
         return 1
       fi
     done
@@ -3239,11 +3411,21 @@ env_file_is_sole_database_url_source() {
     # else this function is a refusal of extra sources; at the start it is also the proof that the
     # one source that cannot be replaced under us is loaded.
     if $DB_IDENTITY_REQUIRE_SNAPSHOT && [[ "$count" -ne 2 ]]; then
-      DB_IDENTITY_SOURCE_REASON="${unit} does not load this run's environment snapshot ${DB_ENV_SNAPSHOT_FILE}, so the DATABASE_URL it gets at exec is whatever ${env_file} says at that moment and not the one this run fenced and migrated"
+      ENV_VAR_SOURCE_REASON="${unit} does not load this run's environment snapshot ${DB_ENV_SNAPSHOT_FILE}, so the ${variable} it gets at exec is whatever ${env_file} says at that moment and not the one this run fenced and migrated"
       return 1
     fi
   done
   return 0
+}
+
+# THE DATABASE IDENTITY'S NAME FOR THE QUESTION, and all that is left of the function that used to
+# BE it: the same scan, told which variable to ask about and which layer is allowed to answer. Its
+# four call sites read `require_env_file_is_sole_definition` exactly as they always did.
+env_file_is_sole_database_url_source() {
+  local rc=0
+  unit_env_var_sole_source DATABASE_URL file "$@" || rc=$?
+  DB_IDENTITY_SOURCE_REASON="$ENV_VAR_SOURCE_REASON"
+  return "$rc"
 }
 
 # The refusal the start goes through: a service whose DATABASE_URL nothing but that file (and
@@ -3263,7 +3445,18 @@ require_env_file_is_sole_definition() {
 # and this run have parted company, and starting into a snapshot that contradicts the file on
 # disk would be correct-but-astonishing.
 require_start_identity_bound() {
-  local rc=0
+  local rc=0 route_reason
+  # AND NOTHING THE SERVICE IS ABOUT TO BE HANDED MAY MOVE THE DRIVER'S ROUTE (r44, Codex HIGH:
+  # "reject any PGSSLMODE source before reconciliation AND STARTUP"). The reconciliation half is in
+  # db_application_route_sslmode(); this is the startup half, and it is a different moment: the
+  # gate rotated, probed and vouched for a CLEARTEXT connection, and a PGSSLMODE the service
+  # acquires between then and its exec puts the application on a hostssl record nothing here has
+  # checked — which is the same post-upgrade outage the whole round exists to prevent, arriving
+  # after every check has passed.
+  if ! route_reason="$(db_application_route_env_refusal)"; then
+    DB_IDENTITY_SOURCE_REASON="${route_reason}. This run established which pg_hba record the application would be matched by over a cleartext connection and rotated its credential against that record, so starting it onto another transport is starting it onto a rule nothing here has checked"
+    return 1
+  fi
   DB_IDENTITY_REQUIRE_SNAPSHOT=true
   require_env_file_is_sole_definition || rc=$?
   DB_IDENTITY_REQUIRE_SNAPSHOT=false
