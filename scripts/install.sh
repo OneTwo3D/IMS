@@ -2423,7 +2423,18 @@ upgrade_in_place() {
   if [[ -f "/etc/systemd/system/${APP_NAME}.service" ]]; then
     return 0
   fi
-  if command -v crontab >/dev/null 2>&1; then
+  # AND THE BINARY'S ABSENCE IS NOT AN ANSWER EITHER (o3d-p9dq, Codex r29 HIGH #2). This test used
+  # to be a plain `if command -v crontab`, so a host that had the schedule but not the client fell
+  # through to the launcher probes below and could be classified a FRESH BOX — the same wrong
+  # answer the read below refuses to give, reached by skipping the read entirely. A proved absence
+  # (no spool entry, no daemon) legitimately contributes nothing and falls through; anything else
+  # stops the run.
+  local crc=0
+  require_crontab_command "${APP_USER}" || crc=$?
+  if [[ "${crc}" -eq 1 ]]; then
+    die "this run cannot tell an in-place upgrade from a first install: ${CRONTAB_COMMAND_REASON}. Both answers act destructively on the wrong host — one migrates a live installation, the other stops and fences a box that has nothing on it — so NOTHING HAS BEEN CHANGED."
+  fi
+  if [[ "${crc}" -eq 0 ]]; then
     # FAIL CLOSED, AND NOT TOWARDS EITHER ANSWER (o3d-p9dq, Codex r28 sweep). The pipeline this
     # replaces sent a failed read to `grep -q`, which found no active line and returned "there is
     # nothing here to break" — so a host whose crontab could not be read was treated as a FRESH BOX
@@ -4628,7 +4639,22 @@ publish_cron_backup() {
 # interleaving the finding was about: a reconciliation that commits between `crontab -l` and
 # `crontab -` is discarded by a backup taken before it, and restored over later.
 fence_cron() {
-  command -v crontab >/dev/null 2>&1 || return 0
+  # A MISSING `crontab` IS NOT "NO CRON WRITERS TO FENCE" (o3d-p9dq, Codex r29 HIGH #2). This line
+  # used to return success on `command -v crontab` failing, and the run then took the database
+  # fence and ran the migration with whatever the spool holds still scheduled. The client binary is
+  # an editor; the daemon reads the spool directly and keeps the loaded schedule in memory, so
+  # removing `crontab(1)` unschedules nothing. require_crontab_command() either finds the binary,
+  # PROVES there is no per-user schedule and no daemon that could be holding one, or refuses — and
+  # what its proof rests on, and how it can be wrong, is stated where it is defined.
+  local crc=0
+  require_crontab_command "${APP_USER}" || crc=$?
+  if [[ "${crc}" -eq 1 ]]; then
+    die "The cron writers could not be fenced: ${CRONTAB_COMMAND_REASON}. A schedule this run cannot rule out is a schedule that can fire into a moving schema, which is the writer class this fence exists to stop. NOTHING HAS BEEN MIGRATED."
+  fi
+  if [[ "${crc}" -eq 2 ]]; then
+    info "\`crontab\` is not installed, and ${APP_USER} has no spooled schedule and no cron daemon that could run one; nothing to fence."
+    return 0
+  fi
   local rc=0
   with_crontab_lock fence_cron_locked || rc=$?
   [[ "${rc}" -eq 0 ]] || die \
@@ -4837,7 +4863,14 @@ resume_from_interrupted_arming() {
   # bounded by that one transition, and it is smaller than what it replaces: since o3d-p9dq the
   # cutover fence happens AFTER the stop, so an interrupted ARMING no longer leaves a fenced crontab
   # at all and this branch only fires for a marker written by an older script.
-  if command -v crontab >/dev/null 2>&1 && [[ -f "${CRON_BACKUP}" ]]; then
+  # AN UNRESTORABLE FENCE IS NOT AN ABSENT ONE (o3d-p9dq, Codex r29 HIGH #2). The `command -v
+  # crontab &&` that used to open this test made a missing client silently skip the restore, and
+  # the run then continued with the interrupted run's fence still standing over the cron writers.
+  # The backup file is the evidence; the missing tool is the reason it cannot be acted on.
+  if [[ -f "${CRON_BACKUP}" ]] && ! command -v crontab >/dev/null 2>&1; then
+    die "The interrupted run had fenced the ${APP_USER} crontab and its backup is at ${CRON_BACKUP}, but \`crontab\` is not installed on this host, so it cannot be put back. Refusing to continue with the cron writers commented out: restore it by hand once the client is available and re-run. Nothing has been stopped."
+  fi
+  if [[ -f "${CRON_BACKUP}" ]]; then
     with_crontab_lock resume_restore_cron_locked || die \
       "The interrupted run had fenced the ${APP_USER} crontab and its backup at ${CRON_BACKUP} could not be restored under ${CRONTAB_LOCK_FILE}.${RESUME_CRON_DIVERGED:+ THE REASON IS NOT THE LOCK: }${RESUME_CRON_DIVERGED} Refusing to continue with the cron writers commented out: settle it by hand (compare ${CRON_BACKUP} against crontab -u ${APP_USER} -l) and re-run. Nothing has been stopped."
   fi
@@ -5264,8 +5297,15 @@ adopt_existing_fence() {
 # halfway through rewriting it — would otherwise restore nothing. An ADOPTED backup is left
 # alone: it belongs to a previous run's fence, which is still standing.
 restore_cron_from_backup() {
-  command -v crontab >/dev/null 2>&1 || return 0
   ${CRON_BACKUP_CREATED} || return 0
+  # THE BINARY CHECK MOVED BELOW THE BACKUP CHECK, AND STOPPED REPORTING SUCCESS (o3d-p9dq, Codex
+  # r29 HIGH #2). `command -v crontab || return 0` was the FIRST line here, so a run that had
+  # fenced the crontab and then lost the client mid-run reported the unwind as complete with the
+  # cron writers still commented out. Nothing this function could return would make that true; the
+  # only honest answer is the failure that makes the caller print the by-hand command.
+  if ! command -v crontab >/dev/null 2>&1; then
+    return 1
+  fi
   [[ -f "${CRON_BACKUP}" ]] || return 1
   # UNDER THE LOCK, because this one can run while something is serving: the pre-stop branch of the
   # trap calls it through unwind_arming() with the predecessor untouched. A conflict is a FAILURE
@@ -7686,35 +7726,22 @@ bootstrap_managed_crontab_block_locked() {
 # The crontab as read ABOVE, under this same lock — never a second read, which could disagree with
 # the one the marker test was decided on. A box with no crontab at all feeds the awk nothing, which
 # is how it appends the block to an empty file.
+# The crontab as read ABOVE, under this same lock — never a second read, which could disagree with
+# the one the marker test was decided on. A box with no crontab at all feeds the awk nothing, which
+# is how it appends the block to an empty file.
+#
+# THE MARKER RULE COMES FROM ${CRONTAB_MANAGED_BLOCK_AWK} (o3d-p9dq, Codex r29 HIGH #3) — the same
+# string scripts/lib/crontab-lock.sh gives its loss check, rather than a second hand-kept copy of
+# it. What remains inline is only what is specific to bootstrapping: where the new block goes, and
+# the pre-marker legacy line to drop.
 if [[ -n "${existing}" ]]; then printf '%s\n' "${existing}"; fi \
-  | awk -v port="${APP_PORT}" -v blockfile="${CRON_BLOCK_FILE}" '
-  function isStart(x) { return x ~ /^# --- OTI CRON START ---[ \t\r]*$/ }
-  function isEnd(x)   { return x ~ /^# --- OTI CRON END ---[ \t\r]*$/ }
-  function isRemnant(x) {
-    managed = "-H \"Authorization: Bearer $CRON_SECRET\" \"$BASE_URL/"   # exact generated job signature (== TS)
-    return (index(x, managed) > 0 \
-      || x ~ /^# CRON_SECRET is read from .* at runtime/ \
-      || x ~ /^# Managed by One Two Inventory/ \
-      || x ~ /^BASE_URL="/)
-  }
+  | awk -v port="${APP_PORT}" -v blockfile="${CRON_BLOCK_FILE}" "${CRONTAB_MANAGED_BLOCK_AWK}"'
   function emitBlock(  bl) { while ((getline bl < blockfile) > 0) print bl; close(blockfile) }
   { line[NR] = $0 }
   END {
-    i = 1; firstMarker = 0
-    while (i <= NR) {
-      if (isStart(line[i])) {
-        if (firstMarker == 0) firstMarker = i
-        j = i + 1
-        while (j <= NR && !isEnd(line[j]) && !isStart(line[j])) j++
-        if (j <= NR && isEnd(line[j])) { for (k = i; k <= j; k++) drop[k] = 1; i = j + 1; continue }
-        drop[i] = 1   # unclosed START: marker + our tail remnants, keep operator lines
-        for (k = i + 1; k < j; k++) if (isEnd(line[k]) || isRemnant(line[k])) drop[k] = 1
-        i = j
-        continue
-      }
-      if (isEnd(line[i])) { if (firstMarker == 0) firstMarker = i; drop[i] = 1 }   # stray END
-      i++
-    }
+    markManagedDrops(line, NR, drop)
+    firstMarker = 0
+    for (i = 1; i <= NR; i++) if (isStart(line[i]) || isEnd(line[i])) { firstMarker = i; break }
     legacy = "localhost:" port "/api/cron/"   # pre-r4 bootstrap lines predate the markers
     emitted = 0
     for (i = 1; i <= NR; i++) {

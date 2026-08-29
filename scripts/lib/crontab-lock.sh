@@ -408,14 +408,21 @@ read_crontab_for() {
     CRONTAB_READ_REASON="the crontab owner could not be resolved, so there is no user to ask about and nothing can establish what is scheduled"
     return 1
   fi
-  # NOT the same shape as a missing `ss`, and the difference is the reason this one is an answer.
-  # `ss` absent leaves the port question unanswered — something can still be bound. A host with no
-  # `crontab` binary has no per-user crontabs for anything to have written, so "there is nothing to
-  # fence" is established rather than assumed. The callers that reach this treat it as an
-  # unresolved read anyway; the ones that can act on it check `command -v crontab` themselves and
-  # say so.
+  # EXACTLY the same shape as a missing `ss`, and round 28 said the opposite (o3d-p9dq, Codex r29
+  # HIGH #2). The claim was that "a host with no `crontab` binary has no per-user crontabs for
+  # anything to have written". That is false, and the mistake is worth naming rather than deleting:
+  # `crontab(1)` is an EDITOR. It is setgid so an unprivileged user can install a file into the
+  # spool; it is not what runs anything. The DAEMON reads the spool directly, and on every
+  # implementation these scripts meet it also holds the loaded schedule in memory. So removing,
+  # renaming or un-executable-ing /usr/bin/crontab unschedules NOTHING — the spool file survives it,
+  # a running `cron` keeps firing what it already parsed, and a `cron` restarted afterwards re-reads
+  # the spool without ever consulting the binary that is missing. Absence of the client is absence
+  # of evidence, precisely like an `ss` that is not installed.
+  #
+  # So this stays an unresolved read, and the callers that used to skip on it now either die or
+  # prove the absence — see require_crontab_command() below.
   if ! command -v crontab >/dev/null 2>&1; then
-    CRONTAB_READ_REASON="\`crontab\` is not installed on this host, so it cannot be asked what ${user} has scheduled"
+    CRONTAB_READ_REASON="\`crontab\` is not installed on this host, so it cannot be asked what ${user} has scheduled — and its absence does not mean ${user} has nothing scheduled, because the spool file and the running daemon both outlive the client binary"
     return 1
   fi
 
@@ -440,6 +447,107 @@ read_crontab_for() {
   fi
   CRONTAB_READ_REASON="\`crontab -u ${user} -l\` exited ${rc} and did not answer that ${user} has no crontab — it said: ${err:-nothing at all}. An unreadable crontab is not an empty one"
   return 1
+}
+
+# =============================================================================
+# A MISSING `crontab` IS NOT A PROOF THAT NOTHING IS SCHEDULED
+# (o3d-p9dq, Codex r29 HIGH #2)
+# =============================================================================
+# Every cutover fence in the three entrypoints opened with
+#
+#     command -v crontab >/dev/null 2>&1 || return 0     # "no cron writers to fence"
+#
+# which reads a missing TOOL as an absent SCHEDULE, and then walks on into the database fence and
+# the migration. It is the same fail-open shape as the `ss` census, arrived at through a specific
+# wrong belief: that the client binary is what makes a crontab exist. It is not. `crontab(1)` puts
+# a file into the spool and takes it out again; `cron(8)` reads that spool, and keeps what it read
+# in memory. A host can therefore have no `crontab` command and a fully live schedule — a package
+# removed after install, a hardened image that ships only the daemon, a PATH that no longer reaches
+# it, a binary whose execute bit was cleared.
+#
+#   require_crontab_command <user>
+#
+#   0  `crontab` is available. Nothing was proved and nothing needed to be.
+#   1  `crontab` is NOT available, and the absence of a schedule could not be proved either.
+#      CRONTAB_COMMAND_REASON says what could not be established; the caller must die.
+#   2  `crontab` is NOT available, and the absence of a schedule WAS proved: there is no spool
+#      entry for <user> in any spool root this function knows, and no scheduler daemon is running
+#      that could be holding one it already read. The caller may continue without fencing.
+#
+# THE PRICE OF KEEPING A NO-BINARY PATH AT ALL, stated plainly: this proof is a positive search of
+# a KNOWN list, so it is exactly as good as that list. It can be wrong in these ways —
+#
+#   * a cron implementation whose per-user spool is not one of ${CRON_SPOOL_ROOTS[@]};
+#   * a daemon whose process name is not one of ${CRON_DAEMON_NAMES[@]};
+#   * a daemon started between this check and the migration (nothing here can hold that shut —
+#     it is the same residual the port drain carries);
+#   * a systemd timer or another scheduler entirely, which is outside cron and outside every other
+#     site in this protocol too, all of which are per-user-crontab shaped.
+#
+# It is NOT allowed to be wrong in the ways that matter most, and that is what the unresolved
+# return is for. Not being root, a spool root that exists but cannot be listed, or a missing
+# `ps`/`pgrep` all return 1 rather than 2: a search that could not run is not a search that found
+# nothing. `anacron` is deliberately not in the daemon list — it runs /etc/anacrontab, never a
+# per-user spool, so it cannot execute what this fence is about.
+CRON_SPOOL_ROOTS=(/var/spool/cron/crontabs /var/spool/cron /var/spool/fcron)
+CRON_DAEMON_NAMES=(cron crond fcron)
+CRONTAB_COMMAND_REASON=""
+
+require_crontab_command() {
+  local user="${1:-}" root name listing
+  CRONTAB_COMMAND_REASON=""
+
+  if command -v crontab >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if [[ -z "${user}" ]]; then
+    CRONTAB_COMMAND_REASON="\`crontab\` is not installed and no crontab owner was resolved, so there is not even a user whose spool could be searched"
+    return 1
+  fi
+
+  # THE SPOOL IS ROOT-ONLY ON EVERY IMPLEMENTATION HERE (mode 1730, group crontab/cron). A
+  # non-root run cannot list it, and an unlistable directory reads as empty to every test below.
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    CRONTAB_COMMAND_REASON="\`crontab\` is not installed, and this is not running as root, so the cron spool cannot be listed to establish whether ${user} has a schedule the missing client would have written"
+    return 1
+  fi
+
+  if ! command -v pgrep >/dev/null 2>&1; then
+    CRONTAB_COMMAND_REASON="\`crontab\` is not installed and \`pgrep\` is not available either, so this host cannot be asked whether a cron daemon is running with ${user}'s schedule already loaded"
+    return 1
+  fi
+
+  # (1) IS ANYTHING RUNNING THAT COULD FIRE IT? Asked FIRST, because a daemon that has already
+  # parsed the spool keeps firing after the spool file itself is gone — so a running daemon leaves
+  # the question open no matter what the directory search finds.
+  for name in "${CRON_DAEMON_NAMES[@]}"; do
+    if pgrep -x "${name}" >/dev/null 2>&1; then
+      CRONTAB_COMMAND_REASON="\`crontab\` is not installed, but a \`${name}\` daemon IS running — it holds whatever it last read from the spool in memory and keeps firing it, so nothing here can establish that ${user} has no cron writers"
+      return 1
+    fi
+  done
+
+  # (2) IS THERE A SPOOL ENTRY? Every root that EXISTS must be listable, and none of them may hold
+  # a file named for this user. A root that is absent contributes nothing and is not a failure.
+  for root in "${CRON_SPOOL_ROOTS[@]}"; do
+    [[ -e "${root}" ]] || continue
+    if [[ ! -d "${root}" ]]; then
+      CRONTAB_COMMAND_REASON="\`crontab\` is not installed and ${root} exists but is not a directory, so the cron spool cannot be read as one and ${user}'s schedule cannot be ruled out"
+      return 1
+    fi
+    if ! listing="$(ls -A "${root}" 2>/dev/null)"; then
+      CRONTAB_COMMAND_REASON="\`crontab\` is not installed and the cron spool ${root} could not be listed, so an entry for ${user} cannot be ruled out — an unreadable directory is not an empty one"
+      return 1
+    fi
+    unset listing
+    if [[ -e "${root}/${user}" ]]; then
+      CRONTAB_COMMAND_REASON="\`crontab\` is not installed, but ${root}/${user} EXISTS — ${user} has a spooled schedule that a cron daemon will read whether or not the client binary is there. It cannot be read, fenced or put back without \`crontab\`"
+      return 1
+    fi
+  done
+
+  return 2
 }
 
 # The mark the fence puts in front of every active line, stated ONCE so that the projection, its
@@ -494,26 +602,84 @@ crontab_unfence_projection() {
 # counted as preserved because it happens to appear inside the block a reconciliation generated.
 # Blank lines are ignored because neither writer preserves how many there were. Everything else is
 # compared as a whole line, exactly, because an operator's cron entry is not a thing to approximate.
+# THE MANAGED-BLOCK RULE, AS ONE AWK SOURCE THE WHOLE REPOSITORY SHARES (o3d-p9dq, Codex r29
+# HIGH #3). What counts as "generated by us" is decided in exactly three places — this shell
+# library, the installer's bootstrap awk, and computeOtiDrops() in lib/crontab-sync.ts — and until
+# now the shell loss check had its OWN, cruder answer. Now the two awk copies are literally the
+# same string, and the TypeScript one is held to it by tests/settings/crontab-managed-block-parity.
+#
+# WHAT AN UNCLOSED START MEANS, DECIDED AND WRITTEN DOWN. The old parser said "everything after a
+# START is managed until an END", which for a marker with no END makes the rest of the file managed
+# — so an operator's `17 3 * * * /usr/local/bin/operator-only` sitting below a half-written marker
+# was excluded from the loss check, the merge that dropped it was declared lossless, and the backup
+# holding the only copy was deleted. That failure mode aligns exactly with the state these recovery
+# paths exist for: a half-written fence is how an unclosed marker gets there in the first place.
+#
+# It is not "everything after this is managed". An unclosed START means THE EXTENT OF THE BLOCK IS
+# UNKNOWN, and unknown extent is not a licence to claim territory. So within the malformed region
+# [START .. next START or EOF) only the marker itself, a stray END, and lines POSITIVELY identified
+# as our own generated output are managed:
+#
+#   * a job line — it contains the exact curl signature this repository's builder emits, which
+#     references our own shell variable names and cannot be typed by accident;
+#   * the header comment, the `# Managed by One Two Inventory` line, or a `BASE_URL="` assignment.
+#
+# Everything else in that region stays an OPERATOR line: preserved by the application's stripper,
+# and counted by the loss check below. The two directions now agree — a line the app would keep is
+# a line whose disappearance this refuses to call lossless.
+#
+# It sees UNFENCED text on both sides by construction: plan_crontab_unfence compares the raw backup
+# against `crontab_unfence_projection` of the live crontab, so no `#DEPLOY-FENCE# ` prefix reaches
+# these patterns. That matters for the anchored ones (`^BASE_URL="`), which the fence's prefix would
+# otherwise hide; the job signature is matched with index() and would survive it either way.
+CRONTAB_MANAGED_BLOCK_AWK='
+  function isStart(x) { return x ~ /^# --- OTI CRON START ---[ \t\r]*$/ }
+  function isEnd(x)   { return x ~ /^# --- OTI CRON END ---[ \t\r]*$/ }
+  function isBlank(x) { return x ~ /^[[:space:]]*$/ }
+  function isRemnant(x,   managed) {
+    managed = "-H \"Authorization: Bearer $CRON_SECRET\" \"$BASE_URL/"   # exact generated job signature (== TS)
+    return (index(x, managed) > 0 \
+      || x ~ /^# CRON_SECRET is read from .* at runtime/ \
+      || x ~ /^# Managed by One Two Inventory/ \
+      || x ~ /^BASE_URL="/)
+  }
+  # Fill drop[1..n] for the lines in line[1..n]: 1 = generated by us, 0 = the operator every
+  # caller must preserve. Complete blocks go whole; an unclosed START claims only itself and the
+  # remnants it can positively identify.
+  function markManagedDrops(line, n, drop,   i, j, k) {
+    i = 1
+    while (i <= n) {
+      if (isStart(line[i])) {
+        j = i + 1
+        while (j <= n && !isEnd(line[j]) && !isStart(line[j])) j++
+        if (j <= n && isEnd(line[j])) {
+          for (k = i; k <= j; k++) drop[k] = 1
+          i = j + 1
+          continue
+        }
+        drop[i] = 1
+        for (k = i + 1; k < j; k++) if (isEnd(line[k]) || isRemnant(line[k])) drop[k] = 1
+        i = j
+        continue
+      }
+      if (isEnd(line[i])) drop[i] = 1   # stray END outside a block
+      i++
+    }
+  }
+'
+
 crontab_unmanaged_lines_missing_from() {
   local backup="$1" candidate="$2"
-  awk '
-    function is_start(x) { return x ~ /^# --- OTI CRON START ---[ \t\r]*$/ }
-    function is_end(x)   { return x ~ /^# --- OTI CRON END ---[ \t\r]*$/ }
-    function is_blank(x) { return x ~ /^[[:space:]]*$/ }
-    NR == FNR {
-      if (is_start($0)) { c_block = 1; next }
-      if (is_end($0))   { c_block = 0; next }
-      if (c_block || is_blank($0)) next
-      cand[++m] = $0
-      next
-    }
-    {
-      if (is_start($0)) { b_block = 1; next }
-      if (is_end($0))   { b_block = 0; next }
-      if (b_block || is_blank($0)) next
-      back[++n] = $0
-    }
+  awk "${CRONTAB_MANAGED_BLOCK_AWK}"'
+    NR == FNR { craw[++cn] = $0; next }
+    { braw[++bn] = $0 }
     END {
+      markManagedDrops(craw, cn, cdrop)
+      markManagedDrops(braw, bn, bdrop)
+      m = 0
+      for (i = 1; i <= cn; i++) if (!cdrop[i] && !isBlank(craw[i])) cand[++m] = craw[i]
+      n = 0
+      for (i = 1; i <= bn; i++) if (!bdrop[i] && !isBlank(braw[i])) back[++n] = braw[i]
       cursor = 1
       for (i = 1; i <= n; i++) {
         j = cursor
