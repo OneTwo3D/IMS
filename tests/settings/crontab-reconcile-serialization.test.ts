@@ -2419,7 +2419,7 @@ const PREDECESSOR_BLOCK = '# --- OTI CRON START ---\n'
   + '# --- OTI CRON END ---'
 
 const blindResumeMutation = (src: string): string => {
-  const before = '  if [[ "${current}" != "$(crontab_fence_projection "${backup}")" ]]; then'
+  const before = '  if crontab_gained_lines_over_backup "${backup}" "${current}"; then'
   assert.ok(src.includes(before),
     'scripts/install.sh must compare the live crontab with the backup projection on one line')
   return src.replace(before, '  if false; then')
@@ -2458,7 +2458,7 @@ test('[o3d-batch-ret] a transition recovery REFUSES a backup whose world has mov
   assert.equal(moved.run.code, 9,
     'a recovery that cannot prove the snapshot is current must FAIL, so its caller dies')
   assert.doesNotMatch(moved.run.stdout, /RESTORED/)
-  assert.match(moved.run.stderr, /THE REASON IS NOT THE LOCK: the live crontab is not the fenced projection/,
+  assert.match(moved.run.stderr, /THE REASON IS NOT THE LOCK: the live crontab holds lines the fenced projection/,
     'and the operator is told it was the crontab that moved, not a lock that was busy')
   assert.equal(moved.final, `${projection}${PREDECESSOR_BLOCK}\n`,
     'and it must leave the crontab EXACTLY as it found it — refusing means writing nothing')

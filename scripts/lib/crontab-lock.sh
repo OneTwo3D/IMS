@@ -368,6 +368,33 @@ crontab_unfence_projection() {
 # point of a merge, and its truth is the settings rows rather than these bytes. Blank lines are
 # ignored because neither writer preserves how many there were. Everything else is compared as a
 # whole line, exactly, because an operator's cron entry is not a thing to approximate.
+# Every non-blank line of <a> that does not appear in <b>. Whole-line, exact: an operator's cron
+# entry is not a thing to approximate. Blank lines are ignored because no writer here preserves how
+# many there were.
+crontab_lines_missing_from() {
+  local a="$1" b="$2"
+  awk '
+    NR == FNR { have[$0] = 1; next }
+    /^[[:space:]]*$/ { next }
+    !($0 in have) { print }
+  ' <(printf '%s\n' "${b}") <(printf '%s\n' "${a}")
+}
+
+# HAS ANYTHING BEEN WRITTEN THAT THE SNAPSHOT DOES NOT ALREADY ACCOUNT FOR?
+#
+#   crontab_gained_lines_over_backup <backup-text> <live-crontab-text>
+#
+# True when the live crontab holds a line the fence's own projection of <backup> does not — which
+# is exactly the shape of a reconciliation's managed block, an operator's new entry, or anything
+# else committed after the snapshot was taken. False when the live crontab holds nothing new,
+# whether it is identical to the projection or has LOST lines (a fence that died half-written, a
+# `crontab -l` that came back empty). That asymmetry is the point: gaining a line means a snapshot
+# would discard a write, and losing one means the snapshot is the only record left.
+crontab_gained_lines_over_backup() {
+  local backup="$1" live="$2"
+  [[ -n "$(crontab_lines_missing_from "${live}" "$(crontab_fence_projection "${backup}")")" ]]
+}
+
 crontab_unmanaged_lines_missing_from() {
   local backup="$1" candidate="$2"
   awk '
@@ -416,7 +443,21 @@ plan_crontab_unfence() {
     return 0
   fi
 
-  # (2) SOMETHING WROTE. Undo the fence where it was applied: the live crontab minus the marks.
+  # (2) DID ANYTHING NEW APPEAR? A live crontab whose every line is already in the projection has
+  # not GAINED anything — it has LOST lines, which is what a fence that died half-written, or a
+  # `crontab -l` this shell could not read, both look like. Restoring the backup there cannot
+  # discard a committed save, because there is no write to discard; refusing would leave a crontab
+  # that is missing lines nothing else records. So the snapshot goes back, and the finding stays
+  # closed: a reconciliation's managed block is by construction NOT in the projection of a backup
+  # taken before it, so this branch cannot swallow one.
+  if ! crontab_gained_lines_over_backup "${backup}" "${live}"; then
+    CRON_UNFENCE_PLAN="snapshot"
+    CRON_UNFENCE_TEXT="${backup}"
+    CRON_UNFENCE_REASON="the live crontab held nothing the backup does not, so it had lost lines rather than gained any"
+    return 0
+  fi
+
+  # (3) SOMETHING WROTE. Undo the fence where it was applied: the live crontab minus the marks.
   # That keeps the managed block whoever wrote it last projected from the settings rows, and it
   # keeps any unmanaged line added while the fence was up.
   merged="$(crontab_unfence_projection "${live}")"
@@ -428,7 +469,7 @@ plan_crontab_unfence() {
     return 0
   fi
 
-  # (3) THE MERGE WOULD DROP A LINE NOTHING ELSE HOLDS. Neither candidate is safe to install —
+  # (4) THE MERGE WOULD DROP A LINE NOTHING ELSE HOLDS. Neither candidate is safe to install —
   # the backup would discard whatever wrote, the merge would discard these — so nothing is
   # installed and the divergence is named.
   CRON_UNFENCE_PLAN="refuse"

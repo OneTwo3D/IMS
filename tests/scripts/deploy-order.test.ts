@@ -152,7 +152,10 @@ test('deploy.sh fences the cron writers once NOTHING IS SERVING, and restores th
 
   const stop = codeLine(DEPLOY_LINES, /^\s*run systemctl stop "\$unit"$/, fenceWriters)
   assert.notEqual(stop, -1, 'the stop phase must actually stop the units')
-  const portFree = codeLine(DEPLOY_LINES, /^\s*ok "Port \$\{PORT\} is free\."$/, drain)
+  // …and the drain is a PROOF, not an attempt (o3d-p9dq, Codex r27 HIGH #3): the success line is
+  // only reached when require_port_drained returned 0, which it does only from a socket census
+  // that actually ran.
+  const portFree = codeLine(DEPLOY_LINES, /^\s*ok "Port \$\{PORT\} is free, and the census that says so ran\."$/, drain)
   assert.notEqual(portFree, -1, 'the drain must prove the port is free before anything rests on it')
 
   const fenceCall = codeLine(DEPLOY_LINES, /^fence_cron$/, fenceWriters)
@@ -2685,7 +2688,15 @@ error(){ echo "$*"; }
 ok(){ echo "$*"; }
 success(){ echo "$*"; }
 systemctl(){ echo "systemctl $*" >> "\${LOG}"; return 0; }
-crontab(){ echo "crontab $*" >> "\${LOG}"; return 0; }
+crontab(){
+  echo "crontab $*" >> "\${LOG}"
+  # THE RESTORE IS A PIPE NOW (o3d-p9dq, Codex r27). It used to be 'crontab -u <user> <backup>',
+  # so the log line named the file and that was the whole assertion. Since the restore decides
+  # WHAT to install rather than which path to copy, the content is what has to be observed — so
+  # a write (last argument '-') has its stdin recorded and the assertions read that.
+  if [[ "\${*: -1}" == "-" ]]; then sed 's/^/crontab-stdin: /' >> "\${LOG}"; fi
+  return 0
+}
 install_reboot_fence(){ echo "install_reboot_fence $*" >> "\${LOG}"; return 0; }
 release_db_connections(){ echo "release_db_connections" >> "\${LOG}"; return 0; }
 refence_db_connections(){ echo "refence_db_connections" >> "\${LOG}"; return 0; }
@@ -2767,7 +2778,7 @@ for (const entry of ARMING_TRAP_CASES) {
     assert.ok(!/refence_db_connections/.test(result.log), 'nor revoke CONNECT on a database that was never fenced')
     assert.match(
       result.log,
-      /crontab -u appuser \S*crontab\.bak/,
+      /crontab-stdin: \*\/5 \* \* \* \* \/usr\/bin\/true/,
       'the crontab must be restored from the backup this run took, whatever fence_cron managed to do with it',
     )
     assert.equal(result.markerExists, false, 'the reboot-fence marker this run wrote must be removed, or the next boot is refused')
@@ -2786,7 +2797,7 @@ for (const entry of ARMING_TRAP_CASES) {
     assert.match(result.log, /systemctl stop/, 'a failure after the stop must re-stop what may have come back')
     assert.match(result.log, /install_reboot_fence/, 'and re-establish the reboot fence')
     assert.ok(
-      !/crontab -u appuser \S*crontab\.bak/.test(result.log),
+      !/crontab-stdin: /.test(result.log),
       'and it must NOT hand the cron writers back to a host with nothing serving',
     )
     assert.equal(result.markerExists, true, 'the marker stays: the next run adopts it')
@@ -3247,7 +3258,7 @@ for (const entry of R8_CASES) {
     assert.match(result.log, /release_db_connections/, 'the connection fence, if any, is released')
     assert.match(
       result.log,
-      /crontab -u appuser \S*crontab\.bak/,
+      /crontab-stdin: \*\/5 \* \* \* \* \/usr\/bin\/true/,
       'the crontab the interrupted run fenced must be restored from its own backup',
     )
     assert.equal(result.backupExists, false, 'and the backup consumed')

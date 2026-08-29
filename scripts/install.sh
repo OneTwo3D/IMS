@@ -4732,6 +4732,12 @@ RESUME_EVIDENCE=""
 # Why an interrupted arming's crontab could NOT be put back, when the reason is a diverged crontab
 # rather than a lock. Empty means the lock, which is what the message defaults to saying.
 RESUME_CRON_DIVERGED=""
+# NOT THE SAME SHAPE AS THE DRAIN, THOUGH IT LOOKS LIKE IT (o3d-p9dq, Codex r27 HIGH #3). A
+# missing `ss` here makes this answer "no", and "no" sends the run down the ORDINARY adoption
+# path, which stops the service and re-fences. That is the conservative direction: the failure
+# mode of not knowing is that something gets stopped, not that a migration proceeds over a live
+# writer. The drain proof below is the opposite way round, which is why it is fatal there and
+# fail-safe here.
 # IS THE EXISTING INSTALLATION STILL UP? Asked only to decide whether an interrupted ARMING
 # can be resumed, and answered conservatively: a unit systemd reports active, or anything
 # listening on the app's port, counts as "still serving". A `false` sends the run down the
@@ -4783,8 +4789,8 @@ resume_restore_cron_locked() {
   RESUME_CRON_DIVERGED=""
   current="$(crontab -u "${APP_USER}" -l 2>/dev/null || true)"
   backup="$(cat "${CRON_BACKUP}" 2>/dev/null)" || return 1
-  if [[ "${current}" != "$(crontab_fence_projection "${backup}")" ]]; then
-    RESUME_CRON_DIVERGED="the live crontab is not the fenced projection of ${CRON_BACKUP}, so something has written it since the interrupted run took that snapshot and installing the snapshot would discard that write"
+  if crontab_gained_lines_over_backup "${backup}" "${current}"; then
+    RESUME_CRON_DIVERGED="the live crontab holds lines the fenced projection of ${CRON_BACKUP} does not, so something has written it since the interrupted run took that snapshot and installing the snapshot would discard that write"
     return 1
   fi
   printf '%s\n' "${backup}" | crontab -u "${APP_USER}" - || return 1
