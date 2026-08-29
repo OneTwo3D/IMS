@@ -18,12 +18,12 @@
  *
  * WHAT THIS FILE PROVES, against real PostgreSQL clusters and the real `pg` in node_modules:
  *
- *   1. the shipped encoder and the INSTALLED driver agree, byte for byte, on 23 reserved-character
+ *   1. the shipped encoder and the INSTALLED driver agree, byte for byte, on 28 reserved-character
  *      passwords — the URL install.sh composes parses back to the literal the ALTER set, and opens
  *      a connection the server accepts;
  *   2. an explicit rotation to a password full of reserved characters ends with the server holding
  *      that password, `.env` naming it, and node-postgres connecting with it;
- *   3. the shipped decoder reaches the same answer node-postgres does for 21 legacy raw URLs,
+ *   3. the shipped decoder reaches the same answer node-postgres does for 25 legacy raw URLs,
  *      including every malformed-escape spelling;
  *   4. `.env` is PUBLISHED BY RENAME and never truncated in place;
  *   5. each of the four interruption outcomes between the ALTER and the environment file is
@@ -353,8 +353,8 @@ test('r39: the shipped decoder reaches node-postgres\'s answer for a legacy raw 
     }
     // PRECONDITION: the comparison is not vacuous. If decoding were the identity function these
     // rows would all agree with a decoder that does nothing, and this test would pass on r38's
-    // code. Eight of the twenty-one differ from their input.
-    assert.ok(differed >= 8, `precondition: the corpus must contain rows a non-decoding recovery gets wrong, found ${differed}`)
+    // code. Twelve of the twenty-five differ from their input.
+    assert.ok(differed >= 12, `precondition: the corpus must contain rows a non-decoding recovery gets wrong, found ${differed}`)
   } finally {
     rmSync(root, { recursive: true, force: true })
   }

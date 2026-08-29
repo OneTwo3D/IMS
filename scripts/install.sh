@@ -1032,7 +1032,7 @@ pg_endpoint_psql() {
 # VERIFIED AGAINST THE INSTALLED DRIVER, NOT AGAINST THE SPECIFICATION — the discipline this
 # branch used for the pooler and the clone. tests/scripts/install-credential-representation.test.ts
 # runs these two shell functions and hands their output to the `pg` in node_modules, on a real
-# cluster: 23 reserved-character passwords encode, parse back to the literal, and open a
+# cluster: 28 reserved-character passwords encode, parse back to the literal, and open a
 # connection the server accepts.
 # ---------------------------------------------------------------------------
 
@@ -1070,8 +1070,9 @@ url_encode_userinfo() {
 # not followed by two hex digits, stays literal. That is not a simplification of the driver, it
 # is what the driver does: pg-connection-string pre-encodes a malformed escape to `%25` before
 # `new URL()` sees it, and decodeURIComponent then turns it back into a literal `%`.
-# tests/scripts/install-credential-representation.test.ts asserts the two agree on 21 legacy
-# spellings including `a%b`, `a%`, `a%2`, `a%zz`, `%%%`, `100%25pure` and `\back\slash`.
+# tests/scripts/install-credential-representation.test.ts asserts the two agree on 25 legacy
+# spellings including `a%b`, `a%`, `a%2`, `a%zz`, `%%%`, `100%25pure`, `\back\slash` and — since
+# r40 — `a%0A`, whose decoded form ends in the byte a command substitution deletes.
 #
 # THE ONE DIVERGENCE, STATED. decodeURIComponent THROWS on a `%XX` sequence that is not valid
 # UTF-8 (`%FF`), where this returns the byte. A URL in that state cannot start the application at
