@@ -247,13 +247,26 @@ CRONTAB_LOCK_CONFLICT=75
 CRONTAB_LOCK_HELD=false
 
 # THE ONE EXEMPTION, STATED HERE RATHER THAN SPELLED OUT AT EACH CALL SITE. deploy.sh and update.sh
-# have a --dry-run that is documented to work unprivileged: it takes no root action, and every
-# crontab body it reaches returns after PRINTING what it would do and before any `crontab -` write.
-# There is nothing for an exclusion to protect, and taking one would mean requiring root and a
-# prepared lock file for a mode whose whole point is that it needs neither. The entrypoints set this
-# from their own DRY_RUN and it is false everywhere else; tests/settings/crontab-reconcile-
-# serialization.test.ts asserts that this is the ONLY path through with_crontab_lock that does not
-# hold the lock, and that no crontab WRITE is reachable under it.
+# have a --dry-run that is documented to work unprivileged: it takes no root action, and no crontab
+# WRITE is reachable under it. There is nothing for an exclusion to protect, and taking one would
+# mean requiring root and a prepared lock file for a mode whose whole point is that it needs
+# neither.
+#
+# "NO WRITE IS REACHABLE" HOLDS BY THREE DIFFERENT MECHANISMS, so it is worth saying which rather
+# than asserting the conclusion:
+#
+#   • fence_cron_locked and unfence_cron_locked return after PRINTING what they would do, before any
+#     `crontab -`. Exercised in tests/settings/crontab-reconcile-serialization.test.ts, run with NO
+#     lock file present at all — which is also the proof that a dry run needs neither root nor a
+#     prepared lock.
+#   • resume_restore_cron_locked and adopt_cron_fence_locked are never reached: their callers sit in
+#     the `else` of an `if $DRY_RUN` that prints instead.
+#   • restore_cron_from_backup_locked is guarded by ${CRON_BACKUP_CREATED}, which only
+#     publish_cron_backup raises — and fence_cron_locked's dry-run branch returns before it.
+#
+# The entrypoints set this from their own DRY_RUN and it is false everywhere else; the census in
+# that same test asserts this is the ONLY path through with_crontab_lock that does not hold the
+# lock.
 CRONTAB_LOCK_DRY_RUN=false
 
 with_crontab_lock() {

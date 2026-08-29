@@ -2204,3 +2204,71 @@ test('[o3d-batch-ret] an UNREADABLE /proc/<pid>/environ is proof not established
   assert.match(result.stdout, /\/proc\/1\/environ could not be read/, result.stdout)
   assert.match(result.stdout, /hidepid/, 'and it must say what the two realistic causes are')
 })
+
+// ---------------------------------------------------------------------------
+// 17 — the one documented path through with_crontab_lock that does not hold the lock
+//
+// `--dry-run` is the exemption, and it is in the library rather than at any call site. Two claims
+// are made for it and both are run here: a dry run needs neither root nor a prepared lock file, and
+// no crontab WRITE is reachable under it. The control is the same program with the bypass down —
+// which refuses, naming the missing lock, and is what makes the first half a bypass and not a
+// program that would have worked anyway.
+// ---------------------------------------------------------------------------
+
+test('[o3d-batch-ret] --dry-run needs no lock file and writes no crontab', async () => {
+  const dryDir = join(HARNESS, 'dry-run')
+  const dryBin = join(dryDir, 'bin')
+  const dryLog = join(dryDir, 'calls.log')
+  mkdirSync(dryBin, { recursive: true })
+  rmSync(dryLog, { force: true })
+  writeFileSync(join(dryBin, 'crontab'), `#!/bin/sh
+echo "crontab $*" >> '${dryLog}'
+for a in "$@"; do last="$a"; done
+if [ "$last" = "-l" ]; then echo '*/5 * * * * /usr/bin/true'; fi
+exit 0
+`)
+  chmodSync(join(dryBin, 'crontab'), 0o755)
+
+  // NO crontab_lock_paths call and NO lock file anywhere: that is the point.
+  const program = [
+    'set -uo pipefail',
+    `PATH='${dryBin}':"$PATH"`,
+    `source '${CRONTAB_LOCK_LIB}'`,
+    'DRY_RUN=true',
+    'CRONTAB_LOCK_DRY_RUN=true',
+    'APP_USER=appuser',
+    `CRON_BACKUP='${join(dryDir, 'no-such-backup')}'`,
+    'CRON_FENCED=false',
+    'CRON_BACKUP_CREATED=false',
+    "YELLOW=''; RESET=''",
+    'info(){ :; }; ok(){ :; }; warn(){ :; }',
+    'die(){ echo "DIE: $*" >&2; exit 9; }',
+    shellFunctionFrom(DEPLOY_SH, 'fence_cron_locked', 'scripts/deploy.sh'),
+    shellFunctionFrom(DEPLOY_SH, 'fence_cron', 'scripts/deploy.sh'),
+    shellFunctionFrom(DEPLOY_SH, 'unfence_cron_locked', 'scripts/deploy.sh'),
+    shellFunctionFrom(DEPLOY_SH, 'unfence_cron', 'scripts/deploy.sh'),
+    'fence_cron',
+    'unfence_cron',
+    'echo "CRON_FENCED=${CRON_FENCED}"',
+  ].join('\n')
+
+  const dry = await sh(program)
+  assert.equal(dry.code, 0, `a dry run must complete with no lock file at all:\n${dry.stderr}`)
+  assert.match(dry.stdout, /CRON_FENCED=true/, 'and it must still report what it would have fenced')
+
+  const calls = existsSync(dryLog) ? readFileSync(dryLog, 'utf8') : ''
+  assert.match(calls, /^crontab -u appuser -l$/m,
+    'precondition: the dry run really did READ the crontab, so this is not a program that ran nothing')
+  assert.deepEqual(
+    calls.split('\n').filter(Boolean).filter((line) => !/^crontab -u appuser -l$/.test(line)),
+    [],
+    'a dry run must never write the crontab — every recorded invocation must be the read',
+  )
+
+  // CONTROL. The same program with the bypass down refuses, and names what is missing. Without
+  // this the run above could be a program that never needed the lock in the first place.
+  const strict = await sh(program.replace('CRONTAB_LOCK_DRY_RUN=true', 'CRONTAB_LOCK_DRY_RUN=false'))
+  assert.equal(strict.code, 9, `with the bypass down the same program must refuse:\n${strict.stdout}`)
+  assert.match(strict.stderr, /before CRONTAB_LOCK_FILE was composed/,
+    'and say that the entrypoint never composed a lock path, which is an ordering bug and not an operator error')
+})
