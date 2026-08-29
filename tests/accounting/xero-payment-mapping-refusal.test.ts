@@ -1036,13 +1036,17 @@ test('[o3d-batch-ret r10] CONTROL: an ABSENT method, currency or date still take
   // EACH ARM PROVES THE DEFAULT WAS TAKEN, not merely that nothing refused:
   //   • an absent `_paymentMethod` resolves to `''`, so the row reaches the MAPPING refusal naming an
   //     empty method — readable, and a different refusal from the payload one;
-  //   • an absent `currency` is registered as the ORGANISATION base currency, read off the queued
-  //     row — GBP here because that is what the `organisationRow` fixture holds, and o3d-batch-ret
-  //     r11 is the round that made that provenance real rather than a literal;
   //   • an absent `_paymentDate` is registered as today, read off the queued row.
   //
-  // MUTATION THAT KILLS IT: make `payloadPaymentMethod`, `payloadPaymentCurrency` or
-  // `payloadPaymentDate` answer `unreadableField(...)` for an ABSENT key — each arm then produces a
+  // `currency` USED TO BE THE THIRD ARM HERE and is not any more (o3d-batch-ret r12): it no longer
+  // HAS a default to take, because the value it would have taken — the IMS base currency — is only
+  // equal to the currency the ledger denominated the document in on bindings whose connect-time
+  // guard could read the remote base, and nothing records which those are. Its absence arm is now a
+  // refusal, walked by the two r12 tests at the foot of this file. It is called out rather than
+  // silently dropped so that a reader of this table does not conclude the field was forgotten.
+  //
+  // MUTATION THAT KILLS IT: make `payloadPaymentMethod` or `payloadPaymentDate` answer
+  // `unreadableField(...)` for an ABSENT key — each arm then produces a
   // `payment_payload_unreadable` refusal instead of the outcome asserted here.
   const today = new Date().toISOString().slice(0, 10)
   const absences: Array<{ what: string; drop: string; expected: string[]; assertRow: Record<string, string> | null }> = [
@@ -1051,12 +1055,6 @@ test('[o3d-batch-ret r10] CONTROL: an ABSENT method, currency or date still take
       drop: '_paymentMethod',
       expected: ['INVOICE_PDF'],
       assertRow: null,
-    },
-    {
-      what: 'no `currency` key at all',
-      drop: 'currency',
-      expected: ['INVOICE_PAYMENT', 'INVOICE_PDF'],
-      assertRow: { currency: 'GBP' },
     },
     {
       what: 'no `_paymentDate` key at all',
@@ -1113,69 +1111,65 @@ test('[o3d-batch-ret r10] CONTROL: an ABSENT method, currency or date still take
 })
 
 /**
- * o3d-batch-ret ROUND 11 (Codex HIGH), THE XERO HALF — THE DEFAULT NOBODY HAD QUESTIONED, ON THE
- * INSTALLATION IT IS WRONG FOR.
+ * o3d-batch-ret ROUND 12 (Codex HIGH), THE XERO HALF — THE EQUALITY ROUND 11 SPENT WAS
+ * ASSERTED, NOT ESTABLISHED.
  *
- * Round 10 closed the two PRESENT holes in `currency` — a persisted `null` and a persisted `''` had
- * both become `GBP` — and kept the ABSENT arm's `GBP` literal, because absence really is the
- * ordinary case. But `Organisation.baseCurrency` is CONFIGURABLE, and on a EUR-base installation
- * the two halves of one settlement then disagreed:
+ * Round 11 replaced the absent-`currency` `GBP` literal with the IMS base currency and called the
+ * default ESTABLISHED, on this warrant: the document is denominated by the ledger in the ledger's
+ * own base currency, and `connectXero` refuses to bind a ledger whose base currency is not
+ * `getBaseCurrencyCode()`, so the two are the same value.
  *
- *   • THE DOCUMENT posts in the base currency. An absent `currency` reaches `pushSalesInvoice` as
- *     `undefined`, `CurrencyCode: data.currency` is dropped from the body by JSON, and Xero
- *     denominates the invoice in the organisation's own base currency — which `connectXero`
- *     refuses to bind unless it equals `getBaseCurrencyCode()`.
- *   • THE PAYMENT called the same absence sterling. `lookupPaymentAccount` keys the BANK ACCOUNT on
- *     that currency, so either a real `card:EUR` mapping was missed and the payment refused, or a
- *     `card:GBP` mapping was found and the money settled into the STERLING account with `GBP`
- *     stamped on the INVOICE_PAYMENT row — against a EUR invoice.
+ * THE GUARD REFUSES ONLY WHAT IT CAN READ. Its clause is a truthy-only comparison, and the reader
+ * beside it answers `null` for a base currency it could not obtain — a non-OK response, a body with
+ * no organisation in it, a base-currency field that is not a currency string. On that path there is
+ * nothing to compare, the guard does not fire, and the binding is stored anyway. A transient failure
+ * at the moment an operator clicks Connect is enough to bind a USD ledger to a EUR installation, and
+ * NOTHING RECORDS which bindings were verified and which were not.
  *
- * BOTH BASES ARE WALKED, and that is the point of the table rather than a second test: the fix has
- * to move the EUR installation without moving the GBP one, and a build that simply refused every
- * absent currency would pass a EUR-only test.
+ * SO THE DEFAULT IS WITHDRAWN. An absent `currency` on a payload that asks for a payment refuses,
+ * under the `base-currency` fact — the same arm an unresolvable base currency already took. It costs
+ * nothing today: the only writer of `_registerPayment` is the WooCommerce order importer, and it
+ * writes `currency` unconditionally on the same payload literal.
+ *
+ * ALL THREE BASES ARE WALKED, AND THE GBP ONE IS THE POINT. A fix written as "refuse when the base
+ * currency is not sterling" would pass a EUR-only table and leave the actual defect — an unverified
+ * binding — untouched on the installation where it is hardest to see.
  */
-test('[o3d-batch-ret r11] an ABSENT currency settles in the ORGANISATION base currency — EUR on a EUR-base install, GBP on a GBP-base one', async () => {
-  // ROUTE: the real `repairXeroBackReferences` over a SYNCED SALES_INVOICE whose payload has NO
-  // `currency` key, with the real `resolveBaseCurrencyCode` reading the `organisationRow` fixture
-  // and the real `lookupPaymentAccount` keyed on `method:currency`. The observable is the queued
-  // INVOICE_PAYMENT row's own `currency` and `bankAccountId` — the account the money lands in.
+test('[o3d-batch-ret r12] an ABSENT currency REFUSES whatever the IMS base currency is, because neither says what the LEDGER posted in', async () => {
+  // ROUTE: the real `repairXeroBackReferences` over a SYNCED SALES_INVOICE whose payload has NO `currency` key, with the
+  // real `resolveBaseCurrencyCode` reading the `organisationRow` fixture and the real
+  // `lookupPaymentAccount` keyed on `method:currency`. The observable is that no INVOICE_PAYMENT row
+  // is queued at all and the operator gets the base-currency clause.
   //
-  // MUTATION THAT KILLS IT: in lib/domain/accounting/followup-enqueue-outcome.ts, restore the
-  // shipped literal — `const BASE_PAYMENT_CURRENCY = 'GBP'` and, in `payloadPaymentCurrency`,
-  // `if (!declaresField(payload, 'currency')) return { value: BASE_PAYMENT_CURRENCY }`. Arm 1 then
-  // queues the payment as GBP into BANK-GBP (both assertions fail), and arm 3 queues one into the
-  // sterling account instead of refusing. Arm 2 — the GBP install — is unmoved by that mutation,
-  // which is exactly why it is here.
-  const cases: Array<{
-    what: string
-    base: string
-    map: Record<string, string>
-    queued: { currency: string; bankAccountId: string } | null
-    refusal: RegExp | null
-  }> = [
+  // MUTATION THAT KILLS IT (1): in `payloadPaymentCurrency`, restore round 10's literal —
+  // `if (!declaresField(payload, 'currency')) return { value: 'GBP' }`. Every arm then queues a
+  // payment into the sterling account instead of refusing, and all three `followUpTypes` assertions
+  // fail.
+  //
+  // MUTATION THAT KILLS IT (2), the one the GBP arm exists for: restore round 11 exactly — resolve
+  // `getBaseCurrencyCode()` in the fold and return it from the absent arm. Arms 1 and 2 then queue a
+  // payment (EUR into BANK-EUR, GBP into BANK-GBP) and arm 3 raises the MAPPING refusal
+  // rather than this one. Arm 2 is the one a "only a non-GBP base is dangerous" fix leaves alive.
+  const cases: Array<{ what: string; base: string; map: Record<string, string> }> = [
     {
-      what: 'a EUR-base organisation with BOTH currencies mapped — the wrong-settlement half of the finding',
+      what: 'a EUR-base installation with BOTH currencies mapped — where round 11 settled in EUR',
       base: 'EUR',
       map: { 'card:EUR': 'BANK-EUR', 'card:GBP': 'BANK-GBP' },
-      queued: { currency: 'EUR', bankAccountId: 'BANK-EUR' },
-      refusal: null,
     },
     {
-      what: 'THE ORDINARY CASE: a GBP-base organisation, unchanged',
+      what: 'a GBP-base installation with both mapped — where round 11 settled in GBP, and where a '
+        + 'fix conditioned on a non-sterling base would still settle',
       base: 'GBP',
       map: { 'card:EUR': 'BANK-EUR', 'card:GBP': 'BANK-GBP' },
-      queued: { currency: 'GBP', bankAccountId: 'BANK-GBP' },
-      refusal: null,
     },
     {
-      what: 'a EUR-base organisation with ONLY the sterling account mapped — the missed-mapping half',
+      what: 'a EUR-base installation with ONLY the sterling account mapped — where round 11 refused, '
+        + 'but under the MAPPING reason, which tells an operator to add a mapping that would not help',
       base: 'EUR',
       map: { 'card:GBP': 'BANK-GBP' },
-      queued: null,
-      refusal: /no bank account is mapped for method "card" \/ currency "EUR"/,
     },
   ]
-  for (const { what, base, map, queued, refusal } of cases) {
+  for (const { what, base, map } of cases) {
     reset(map)
     organisationRow = { baseCurrency: base }
     const payload: Record<string, unknown> = {
@@ -1196,101 +1190,84 @@ test('[o3d-batch-ret r11] an ABSENT currency settles in the ORGANISATION base cu
 
     assert.equal(
       salesOrders.get('order-1')?.accountingInvoiceId, 'XERO-INV-1',
-      `PRECONDITION (${what}): the repair really ran — the document is the half that took the base `
-        + 'currency implicitly, and nothing below is about the payment unless it exists',
+      `PRECONDITION (${what}): the repair really ran — the DOCUMENT posted, and nothing below is `
+        + 'about the payment unless the invoice it settles exists',
     )
 
-    if (queued === null) {
-      assert.deepEqual(followUpTypes(), ['INVOICE_PDF'], `no payment row was created (${what})`)
-      const refusals = paymentRefusals()
-      assert.equal(refusals.length, 1, `the operator is told once (${what})`)
-      assert.equal(
-        refusals[0].metadata?.reason, 'payment_account_unmapped',
-        `and it is the MAPPING refusal (${what}) — the payload is not at fault`,
-      )
-      assert.match(
-        refusals[0].description, refusal!,
-        `THE FINDING (${what}): the refusal names the currency the DOCUMENT is in. Under the shipped `
-          + 'literal this row found the sterling account instead and settled a EUR invoice into it',
-      )
-      assert.equal(
-        refusals[0].metadata?.currency, base,
-        `and the activity metadata records that currency too (${what})`,
-      )
-      assert.notEqual(marker(), null, `the obligation marker survives (${what})`)
-      continue
-    }
-
     assert.deepEqual(
-      paymentRefusals(), [],
-      `nothing is refused (${what}) — the account for the base currency is mapped`,
+      followUpTypes(), ['INVOICE_PDF'],
+      `no INVOICE_PAYMENT row is created (${what}) — a bank account chosen by a currency nobody `
+        + 'verified is a wrong settlement, not a missing one',
     )
-    assert.deepEqual(
-      followUpTypes(), ['INVOICE_PAYMENT', 'INVOICE_PDF'],
-      `the payment IS queued (${what})`,
-    )
-    const row = (store.rows.find((r) => r.type === 'INVOICE_PAYMENT')?.payload ?? {}) as Record<string, unknown>
+    const refusals = paymentRefusals()
+    assert.equal(refusals.length, 1, `the operator is told once (${what})`)
     assert.equal(
-      row.currency, queued.currency,
-      `THE FINDING (${what}): the currency stamped on the INVOICE_PAYMENT row is the organisation's, `
-        + 'not a literal',
+      refusals[0].metadata?.reason, 'payment_payload_unreadable',
+      `and it is the unreadable refusal (${what}) — NOT the mapping one, which would send an `
+        + 'operator to add a bank account mapping that cannot fix an unverified binding',
+    )
+    assert.match(
+      refusals[0].description, /AN UNVERIFIED LEDGER BASE CURRENCY IS NOT THE IMS ONE/,
+      `and it is the BASE-CURRENCY clause (${what})`,
+    )
+    assert.match(
+      refusals[0].description, /never read back from the ledger/,
+      `naming what was not established (${what}) — the LEDGER's base currency, not the IMS one`,
+    )
+    assert.doesNotMatch(
+      refusals[0].description, /AN UNREADABLE FIELD IS NOT ITS DEFAULT/,
+      `the field clause must NOT be borrowed for it (${what}) — omitting \`currency\` is the ordinary `
+        + 'case, and that clause blames the payload',
     )
     assert.equal(
-      row.bankAccountId, queued.bankAccountId,
-      `and the money lands in THAT currency's bank account (${what}) — this is the assertion the `
-        + 'sterling literal fails, and it can only fail while both accounts are mapped',
+      refusals[0].metadata?.currency, null,
+      `and the log names NO currency (${what}): there is no currency to name, and printing the IMS `
+        + 'base here would put the unverified value back into the record it was removed from',
     )
-    assert.equal(marker(), null, `and the obligation IS discharged (${what})`)
+    assert.notEqual(marker(), null, `THE FINDING (${what}): the obligation marker SURVIVES`)
+    assert.equal(
+      store.get('log-1')?.backReferenceCheckedAt, null,
+      `and it is left in the sweep candidate set (${what})`,
+    )
   }
 })
 
 /**
- * o3d-batch-ret ROUND 11 — AND AN UNRESOLVABLE BASE CURRENCY IS AN UNKNOWN, WHICH IS THE ONE THING
- * SIX ROUNDS HAVE AGREED MUST NOT BE SPENT AS A DEFAULT.
+ * o3d-batch-ret ROUND 12 — AND THE REFUSAL IS INDEPENDENT OF THE IMS BASE CURRENCY, WHICH IS THE
+ * WHOLE CLAIM.
  *
- * `resolveBaseCurrencyCode` answers `org?.baseCurrency ?? DEFAULT_BASE_CURRENCY`, and THAT fallback
- * is established rather than assumed: the connect-time guards compare the ledger's base currency
- * against the same expression, so an installation with no organisation row cannot have a non-GBP
- * ledger bound to it and the two halves still agree. What is genuinely unknown is a read that THREW
- * — the row could not be consulted at all — or a `baseCurrency` holding no currency code. Guessing
- * sterling there is the round-10 defect one layer down: it picks a bank account by a currency
- * nobody stated.
+ * Round 11's refusal arm fired when `getBaseCurrencyCode()` would not RESOLVE — a read that threw, a
+ * blank `baseCurrency`. Round 12 removed the read entirely, so the interesting property is no longer
+ * "an unresolvable base refuses" but "the answer does not depend on that value at all". The three
+ * refusing arms below put the organisation row into three states that round 11 distinguished
+ * sharply — unreadable, EUR, blank — and require the operator to receive THE SAME SENTENCE from all
+ * three. Byte-for-byte equality is the assertion: a build that leaked the IMS base into the message,
+ * or that branched on it, cannot produce three identical strings.
  *
- * THE THIRD ARM IS WHAT KEEPS THE FIRST TWO HONEST. The base currency is consulted ONLY where it is
- * used, so a payload that names its own currency must settle normally even while the organisation
- * read is broken. Without it, "refuse when the read fails" could have been implemented as "refuse
- * every payment when the read fails", which on this driver would stall the sweep for every row in
- * the candidate set over a transient database error.
+ * THE FOURTH ARM IS WHAT KEEPS THE OTHER THREE HONEST. A payload that names its own currency must
+ * settle normally even while the organisation read is broken. Without it, "refuse the absent arm"
+ * could have been implemented as "refuse every payment", which on this driver would stall the whole
+ * candidate set over a transient database error.
  */
-test('[o3d-batch-ret r11] an UNRESOLVABLE base currency refuses the absent-currency payment, and only that one', async () => {
-  // ROUTE: the real `repairXeroBackReferences` with the `organisation.findFirst` fixture set to
-  // throw, or to a row holding a blank `baseCurrency`. The real `resolveBasePaymentCurrency` in
-  // lib/domain/accounting/followup-enqueue-outcome.ts is what turns that into the refusal.
+test('[o3d-batch-ret r12] the absent-currency refusal does not consult the IMS base currency — same sentence from three organisation rows, and a stated currency still settles', async () => {
+  // ROUTE: as above, with the `organisation.findFirst` fixture set to throw, to a EUR row, and to a
+  // row holding a blank `baseCurrency`. BOTH bank accounts are mapped throughout, so a build that
+  // took a base currency would SETTLE rather than refuse and be caught by the refusal count.
   //
-  // MUTATION THAT KILLS IT: make `resolveBasePaymentCurrency` fall back instead of refusing —
-  // `catch { return { value: 'GBP' } }` and drop the blank-string check. Arms 1 and 2 then queue an
-  // INVOICE_PAYMENT into the sterling account rather than refusing, failing on `followUpTypes` and
-  // on the refusal count. Arm 3 is unaffected by that mutation and is the control.
-  const cases: Array<{ what: string; row: { baseCurrency: string } | null | 'throw'; currency?: string; detail: RegExp | null }> = [
-    {
-      what: 'the organisation row cannot be read at all',
-      row: 'throw',
-      detail: /reading the organisation base currency failed: organisation table unavailable/,
-    },
-    {
-      what: 'the organisation row holds a blank base currency',
-      row: { baseCurrency: '   ' },
-      detail: /`Organisation.baseCurrency` is the string "   ", which is not a currency code/,
-    },
-    {
-      what: 'CONTROL: the same broken read, but the payload NAMES its own currency',
-      row: 'throw',
-      currency: 'GBP',
-      detail: null,
-    },
+  // MUTATION THAT KILLS IT: restore round 11's `resolveBasePaymentCurrency` and inject it into
+  // `payloadPaymentCurrency`'s absent arm. Arm 2 (a readable EUR row) then queues a payment into
+  // BANK-EUR — its refusal-count assertion fails — and arms 1 and 3 refuse with the
+  // organisation-read detail, so the three descriptions are no longer equal either. Arm 4 is
+  // untouched by that mutation, which is what makes it the control rather than a fourth case.
+  const cases: Array<{ what: string; row: { baseCurrency: string } | null | 'throw'; currency?: string }> = [
+    { what: 'the organisation row cannot be read at all', row: 'throw' },
+    { what: 'the organisation row reads perfectly and says EUR', row: { baseCurrency: 'EUR' } },
+    { what: 'the organisation row holds a blank base currency', row: { baseCurrency: '   ' } },
+    { what: 'CONTROL: the same broken read, but the payload NAMES its own currency', row: 'throw', currency: 'GBP' },
   ]
-  for (const { what, row, currency, detail } of cases) {
-    reset({ 'card:GBP': 'BANK-GBP' })
+  const sentences: string[] = []
+  for (const { what, row, currency } of cases) {
+    reset({ 'card:EUR': 'BANK-EUR', 'card:GBP': 'BANK-GBP' })
     organisationRow = row
     const payload: Record<string, unknown> = {
       invoiceNumber: 'INV-1',
@@ -1306,48 +1283,41 @@ test('[o3d-batch-ret r11] an UNRESOLVABLE base currency refuses the absent-curre
 
     assert.equal(
       salesOrders.get('order-1')?.accountingInvoiceId, 'XERO-INV-1',
-      `PRECONDITION (${what}): the repair really ran`,
+      `PRECONDITION (${what}): the repair really ran — the DOCUMENT posted, and nothing below is `
+        + 'about the payment unless the invoice it settles exists',
     )
 
-    if (detail === null) {
+    if (currency !== undefined) {
       assert.deepEqual(
         paymentRefusals(), [],
-        `THE CONTROL (${what}): a payload that states its currency does not consult the base one at `
-          + 'all, so a broken organisation read must not touch it',
+        `THE CONTROL (${what}): a payload that states its currency asks nothing about the ledger's `
+          + 'base, so a broken organisation read must not touch it',
       )
       assert.deepEqual(followUpTypes(), ['INVOICE_PAYMENT', 'INVOICE_PDF'], `and the payment IS queued (${what})`)
       const queued = (store.rows.find((r) => r.type === 'INVOICE_PAYMENT')?.payload ?? {}) as Record<string, unknown>
       assert.equal(queued.currency, 'GBP', `in the currency the payload named (${what})`)
-      assert.equal(marker(), null, `and the obligation IS discharged (${what})`)
+      assert.equal(queued.bankAccountId, 'BANK-GBP', `and in that currency's account (${what})`)
+    assert.equal(marker(), null, `and the obligation IS discharged (${what})`)
       continue
     }
 
-    assert.deepEqual(
-      followUpTypes(), ['INVOICE_PDF'],
-      `no INVOICE_PAYMENT row is created (${what}) — a bank account chosen by a currency nobody `
-        + 'stated is a wrong settlement, not a missing one',
-    )
+    assert.deepEqual(followUpTypes(), ['INVOICE_PDF'], `no INVOICE_PAYMENT row is created (${what})`)
     const refusals = paymentRefusals()
-    assert.equal(refusals.length, 1, `the operator is told once (${what})`)
     assert.equal(
-      refusals[0].metadata?.reason, 'payment_payload_unreadable',
-      `and it is the unreadable refusal (${what})`,
+      refusals.length, 1,
+      `the operator is told once (${what}) — and a build that took a base currency here would have `
+        + 'SETTLED instead, because both accounts are mapped',
     )
-    assert.match(refusals[0].description, detail, `naming what could not be resolved (${what})`)
-    assert.match(
-      refusals[0].description, /AN UNRESOLVED BASE CURRENCY IS NOT STERLING/,
-      `and it is the BASE-CURRENCY clause (${what}), not the corrupt-field one — the payload is `
-        + 'entirely well-formed here, and telling an operator to look at it would be false',
-    )
-    assert.doesNotMatch(
-      refusals[0].description, /AN UNREADABLE FIELD IS NOT ITS DEFAULT/,
-      `the field clause must NOT be borrowed for it (${what}) — omitting \`currency\` is the ordinary `
-        + 'case, and that clause blames the payload',
-    )
+    assert.equal(refusals[0].metadata?.reason, 'payment_payload_unreadable', `under the unreadable reason (${what})`)
+    sentences.push(refusals[0].description)
     assert.notEqual(marker(), null, `THE FINDING (${what}): the obligation marker SURVIVES`)
-    assert.equal(
-      store.get('log-1')?.backReferenceCheckedAt, null,
-      `and it is left in the sweep candidate set (${what})`,
-    )
   }
+
+  assert.equal(sentences.length, 3, 'PRECONDITION: all three refusing arms really produced a sentence')
+  assert.equal(
+    new Set(sentences).size, 1,
+    'THE CLAIM: the operator receives the SAME sentence whether the IMS base currency reads as EUR, '
+      + 'reads as blank, or will not read at all. Three different sentences would mean the decision '
+      + `still depends on a value that says nothing about the ledger — got ${JSON.stringify([...new Set(sentences)])}`,
+  )
 })

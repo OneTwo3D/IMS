@@ -158,25 +158,32 @@ test('[o3d-batch-ret r10] neither connector reads the payment payload itself —
 })
 
 /**
- * o3d-batch-ret ROUND 11 (Codex HIGH) — AND THE BOUNDARY MAY NOT NAME A CURRENCY OF ITS OWN.
+ * o3d-batch-ret ROUND 11, TIGHTENED IN ROUND 12 (Codex HIGH) — THE BOUNDARY MAY NOT NAME A CURRENCY
+ * OF ITS OWN, AND MAY NOT SUBSTITUTE THE IMS ONE FOR THE LEDGER'S EITHER.
  *
  * Round 10 moved every payload read into this module and left ONE literal behind: the absent-
- * `currency` arm answered `'GBP'`. `Organisation.baseCurrency` is configurable, so on a EUR-base
- * installation that made the payment disagree with the document it settles — the document takes the
- * ledger's base currency (both builders omit the key when the value is absent) and the payment took
- * sterling. The behavioural proof is in the two connector suites; this is the SOURCE half, because
- * the defect is a hard-coded literal and the next one would be added the same way.
+ * `currency` arm answered `'GBP'`. Round 11 replaced that literal with `getBaseCurrencyCode()` — the
+ * IMS base currency — on the warrant that the connect-time guards refuse a ledger whose base
+ * currency differs. Round 12 found that warrant covers only the path where the remote base could be
+ * READ: both guards are truthy-only comparisons over a reader that answers `null` on failure, so a
+ * binding whose equality was never established is stored just the same.
  *
- * THE RULE IS ABOUT THE MODULE, NOT ABOUT A LINE. Any currency literal in the classification code is
- * a currency this boundary decided for itself, and there is exactly one thing it is allowed to
- * decide it from: `getBaseCurrencyCode()`, which is the same expression the connect-time guards
- * compare the ledger's own base currency against.
+ * SO THERE ARE NOW TWO PROHIBITED SOURCES, NOT ONE. A three-letter literal is a currency this module
+ * invented. `getBaseCurrencyCode()` is a currency this module BORROWED from the wrong side of the
+ * wire — it describes IMS, and what an absent `currency` settles in is whatever the LEDGER
+ * denominated the document in. Neither may appear in the classification code; the absent arm refuses
+ * instead (o3d-emus restores a default once the verified remote base is persisted, and when it does
+ * the value will come from the BINDING, not from `@/lib/base-currency`).
+ *
+ * The behavioural proof is in the two connector suites; this is the SOURCE half, because both
+ * defects are a value written into this module and the next one would be added the same way.
  *
  * REVERT EVIDENCE: restoring `const BASE_PAYMENT_CURRENCY = 'GBP'` fails "the payload boundary names
- * no currency of its own"; replacing the resolver's `await import('@/lib/base-currency')` with a
- * literal fails "and it resolves the one it may take from the organisation".
+ * no currency of its own"; restoring round 11's `resolveBasePaymentCurrency` with its
+ * `await import('@/lib/base-currency')` fails "and it does not borrow the IMS base currency for the
+ * ledger's".
  */
-test('[o3d-batch-ret r11] the payload boundary names no currency of its own, and resolves the one it may take from the organisation', async () => {
+test('[o3d-batch-ret r12] the payload boundary names no currency of its own and borrows none from IMS either', async () => {
   const source = await readFile(path.join(ROOT, MODULE_REL), 'utf8')
   // Comments FIRST: this module explains the finding at length and quotes the shipped
   // `payload.currency as string || 'GBP'` while doing so. A guard that matched the explanation of
@@ -186,27 +193,43 @@ test('[o3d-batch-ret r11] the payload boundary names no currency of its own, and
     .replace(/^[ \t]*\/\/.*$/gm, '')
   assert.ok(code.length > 2000, 'the comment strip must not have eaten the module, or this asserts nothing')
 
-  // NON-VACUITY: the strip must have left the classifier that used to hold the literal.
+  // NON-VACUITY: the strip must have left the classifier that used to hold the literal, AND the
+  // refusal the absent arm now takes instead. Both `assert.doesNotMatch`es below pass trivially over
+  // an empty string, so the thing they are about has to be shown to still be here.
   assert.match(code, /^function payloadPaymentCurrency\(/m, 'the currency classifier must still be in the stripped source')
+  assert.match(
+    code, /const LEDGER_BASE_UNVERIFIED\b/,
+    'and the absent arm\'s refusal must still be in it — if this constant went away the module took a '
+      + 'default again, and the two prohibitions below would be guarding nothing',
+  )
+  assert.match(
+    code, /if \(!declaresField\(payload, 'currency'\)\) return \{ detail: LEDGER_BASE_UNVERIFIED \}/,
+    'and the absent arm must be the one that takes it',
+  )
 
   const literals = [...code.matchAll(/'([A-Z]{3})'/g)].map((m) => m[1])
   assert.deepEqual(
     literals, [],
     'a three-letter currency literal in the payload boundary is a currency this module decided for '
-      + `itself (found ${literals.join(', ')}). The absent-\`currency\` arm must take the ORGANISATION `
-      + 'base currency — the same value the ledger denominated the document in — not a constant',
+      + `itself (found ${literals.join(', ')}). An absent \`currency\` is settled in whatever the LEDGER `
+      + 'denominated the document in, which no constant here can know',
   )
 
-  assert.match(
+  assert.doesNotMatch(
     code, /await import\('@\/lib\/base-currency'\)/,
-    'and it must resolve that currency through `getBaseCurrencyCode`, which is the expression '
-      + '`connectXero`/`connectQuickBooks` pin the ledger\'s own base currency against — a second '
-      + 'definition of "the base currency" is a second answer to what the payment settles in',
+    'the payload boundary must not read the IMS base currency. It is not the ledger\'s: the '
+      + 'connect-time guards compare the two only when the remote one can be READ, and store the '
+      + 'binding either way, so substituting one for the other asserts an equality nothing '
+      + 'established (o3d-emus)',
   )
-  assert.match(code, /getBaseCurrencyCode/, 'by name, so the resolution is greppable from here')
+  assert.doesNotMatch(
+    code, /getBaseCurrencyCode/,
+    'and not by name either — a second route to the same value is the same substitution',
+  )
 
-  // AND IT IS RESOLVED IN THE FOLD, ONCE, not in each connector. Two call sites that each resolve it
-  // is a convention that they agree; one is a shape that they cannot disagree.
+  // AND NEITHER CONNECTOR MAY REACH FOR IT ON THIS PATH. Round 11 wanted this so the two could not
+  // disagree about a resolved value; round 12 wants it because there is no value to resolve, and a
+  // connector that resolved one would be re-introducing the substitution one frame out.
   for (const rel of ['lib/connectors/xero/sync-processor.ts', 'lib/connectors/quickbooks/sync-processor.ts']) {
     const connector = await readFile(path.join(ROOT, rel), 'utf8')
     const from = connector.indexOf('async function decideInvoicePaymentFollowUp(')
@@ -218,9 +241,10 @@ test('[o3d-batch-ret r11] the payload boundary names no currency of its own, and
     assert.ok(body.length > 500, `${rel}: the comment strip must not have eaten the function body`)
     assert.doesNotMatch(
       body, /getBaseCurrencyCode/,
-      `${rel} resolves the base currency itself inside the payment decision. The fold resolves it `
-        + 'once for both connectors precisely so the two cannot drift apart — which is what Codex '
-        + 'asked for when it asked that the document-post and follow-up paths agree',
+      `${rel} reads the IMS base currency inside the payment decision. Nothing on this path may: it `
+        + 'is not the currency the ledger denominated the document in, and the fold is the one place '
+        + 'that answer is decided — which is what Codex asked for when it asked that the '
+        + 'document-post and follow-up paths agree',
     )
   }
 })

@@ -2499,11 +2499,12 @@ function activityProducers(): Array<{ what: string; text: string; mustEscalate: 
       { fact: 'request' as const, detail: '`_registerPayment` is null, which is neither `true` nor `false`' },
       { fact: 'amount' as const, detail: '`_paymentAmount` is the string "not-a-number", which is not a finite amount' },
       { fact: 'field' as const, detail: '`currency` is null, which is not a currency code' },
-      // o3d-batch-ret r11: the fourth form. The payload is WELL-FORMED here — omitting `currency` is
-      // the ordinary case — and what could not be read is the organisation base currency the payment
-      // would have been settled in. It gets its own clause precisely so the sentence does not send an
-      // operator to inspect a payload that is not at fault, which is the r7/r8 lesson again.
-      { fact: 'base-currency' as const, detail: 'reading the organisation base currency failed: organisation table unavailable' },
+      // o3d-batch-ret r11, rewritten r12: the fourth form. The payload is WELL-FORMED here —
+      // omitting `currency` is the ordinary case — and what is not established is the LEDGER's own
+      // base currency, which is what the document was denominated in. It gets its own clause
+      // precisely so the sentence does not send an operator to inspect a payload that is not at
+      // fault, which is the r7/r8 lesson again.
+      { fact: 'base-currency' as const, detail: 'the payload names no currency, so the document was denominated by the ledger in ITS OWN base currency — and what that is was never verified for this connection' },
     ]) {
       produced.push({
         what: `unreadablePaymentPayloadRefusalMessage for ${connector}, ${fact} clause `
