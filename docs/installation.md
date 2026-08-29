@@ -329,8 +329,8 @@ Two consequences worth knowing before you meet them:
 
 ### The route, and why the method alone was not enough
 
-The method is read on a connection of the reader's own, and until this round every probe that
-followed was opened on libpq's default `sslmode=prefer` — which does not mean "use TLS". It means
+The method is read on a connection of the reader's own, and through r42 every probe that followed
+was opened on libpq's default `sslmode=prefer` — which does not mean "use TLS". It means
 *try TLS, and if that connection fails, retry without it*. `hostssl` and `hostnossl` are **different
 records**, so an authentication failure could select a second one, and the two instruments then
 answer about two different transports:
@@ -343,12 +343,42 @@ answer about two different transports:
 > scram and the old one by the directory, both candidates read as live, and the reconciliation
 > refuses — leaving a stopped, fenced installation that needs a person.
 
-So the reader now **reports the route it took**, as the libpq setting that reproduces it —
-`sslmode=require` where TLS was negotiated, `sslmode=disable` where it was not — and every
-credential-bearing connection the installer then opens to that endpoint is pinned to that value,
-with `gssencmode=disable` beside it so GSSAPI encryption cannot select a `hostgssenc` record
-either. `prefer` appears in no probe. A method read over a route that cannot be pinned to is
-refused, exactly as an unestablished method is.
+Removing that divergence by aligning the reader and the probes **with each other** left them
+aligned with a connection nobody makes. The connection this gate exists to vouch for is the
+**application's**, and the application does not use libpq at all: node-postgres, handed the
+`DATABASE_URL` this installer emits, sends no `SSLRequest` — measured against the driver the
+release installs, not read out of its documentation. It is matched by the `hostnossl`/`host` record
+while every probe was reading the `hostssl` one. On the split above that publishes a SCRAM password
+the application's own route has never heard of, and clears the journal that recorded the other
+candidate.
+
+**So the reference point is the application's connection.** The installer works out what
+node-postgres does with the URL it is about to write, **tells** the reader to take exactly that
+route, checks that the reader reports having taken it, and pins every credential-bearing psql to
+it — with `gssencmode=disable` beside it so GSSAPI encryption cannot select a `hostgssenc` record
+either. Today that route is always `sslmode=disable`; if the emitted URL ever stops being of the
+shape the driver was measured against, the gate refuses rather than assuming. `prefer` appears in
+no connection the installer opens. A method read on **any other route**, including a perfectly
+pinnable `require`, is refused exactly as an unestablished method is.
+
+Two things follow, and they are the point rather than a side effect:
+
+* **a cluster whose only password-checking rule is a `hostssl` one is refused**, because the
+  application cannot reach it either. Better a refusal before the `ALTER` than a rotation whose
+  result the application can never present.
+* **a cluster whose `hostssl` rule is useless but whose `hostnossl` rule is sound is accepted**,
+  which the previous round refused. `DATABASE_URL` was not given explicit SSL parameters to make
+  this work: on the installed `pg-connection-string`, `sslmode=require` is an alias for
+  *verify-full*, there is no spelling of libpq's `prefer` at all, the meaning is scheduled to
+  change in the driver's next major version, and adding one would change what every existing
+  installation's application connection does at its next upgrade.
+
+The postmaster-identity read performed just after `CREATE DATABASE` is the one credential-bearing
+connection deliberately **left unpinned**. What it concludes — that the server answering
+`DB_HOST:DB_PORT` is the one the `CREATE` landed on — is established from a start time, a port and
+a database oid, none of which any transport can change; and it authenticates as a throwaway role
+rather than as the application's, so under a pin a role-specific `pg_hba.conf` layout would turn a
+run that would have completed into a stopped install, and buy nothing.
 
 The negative control is *kept* alongside all of this, and is not redundant — but for two reasons
 rather than the transport one:
