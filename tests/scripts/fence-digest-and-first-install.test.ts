@@ -214,6 +214,36 @@ function shippedFunction(source: string, name: string): string {
   return source.slice(start + 1, end + 3)
 }
 
+/** One shipped shell assignment, whole line, so a test can run the real string and not a copy. */
+function shippedAssignment(source: string, name: string): string {
+  const line = new RegExp(`^${name}="[^"]*"$`, 'm').exec(source)
+  assert.ok(line, `precondition: scripts/install.sh must define ${name} as a double-quoted literal`)
+  return line[0]
+}
+
+/** The value of that assignment, which is what the runbook has to quote verbatim. */
+function shippedAssignmentValue(source: string, name: string): string {
+  const value = new RegExp(`^${name}="([^"]*)"$`, 'm').exec(source)
+  assert.ok(value, `precondition: scripts/install.sh must define ${name} as a double-quoted literal`)
+  return value[1]
+}
+
+/**
+ * THE BRANCH THAT DECIDES WHETHER THIS RUN IS FENCED, lifted whole and RUN rather than read.
+ *
+ * r35 tested this wiring by regex over the source — which is the same "assert a sentence exists"
+ * shape as the documentation test that round replaced, one level down. Both arms are stubbed with
+ * markers here, so the assertion is on which arm executed.
+ */
+function shippedBranch(source: string): string {
+  const start = source.indexOf('\nif upgrade_in_place; then\n')
+  assert.notEqual(start, -1, 'precondition: the installer must branch on upgrade_in_place')
+  const endMarker = '\nelse\n  first_install_fence_policy\nfi\n'
+  const end = source.indexOf(endMarker, start)
+  assert.notEqual(end, -1, 'precondition: the branch must end with the first-install arm')
+  return source.slice(start + 1, end + endMarker.length)
+}
+
 /**
  * Run the SHIPPED first-install functions against a fake checkout and a scratch recovery
  * directory. Nothing here re-implements the policy: `first_install_fence_policy` and
@@ -224,6 +254,13 @@ function runFirstInstall(
   root: string,
   pin: Record<string, string>,
   after: string,
+  /**
+   * Shell run after the defaults below and before the shipped functions. The defaults GRANT the
+   * exemption — this run created localhost:5432/one_two_inventory — because that is the state
+   * every pre-r36 test in this file was implicitly assuming; a test about an unearned exemption
+   * overrides them here and says so.
+   */
+  overrides = '',
 ): { status: number; output: string } {
   const checkout = join(root, 'app')
   const recovery = join(root, 'recovery')
@@ -244,6 +281,16 @@ function runFirstInstall(
     source ${JSON.stringify(join(REPO, 'scripts/lib/db-fence-protected.sh'))}
     ${protectedLibraryLinesAt(recovery).join('\n    ')}
     DB_FENCE_SCRIPT=${JSON.stringify(join(checkout, 'scripts', 'fence-db-connections.mjs'))}
+    DB_HOST=localhost
+    DB_PORT=5432
+    DB_NAME=one_two_inventory
+    DB_CREATED_BY_THIS_RUN=true
+    DB_CREATED_IDENTITY="localhost:5432/one_two_inventory"
+    DB_NEWNESS_FINDING="the fixture states that this run created it"
+    FIRST_INSTALL_EXEMPTION_REFUSAL=""
+    ${shippedAssignment(INSTALL_SOURCE, 'FIRST_INSTALL_PIN_CONTRACT')}
+    ${overrides}
+    ${shippedFunction(INSTALL_SOURCE, 'first_install_exemption_available')}
     ${shippedFunction(INSTALL_SOURCE, 'resolve_fence_script')}
     ${shippedFunction(INSTALL_SOURCE, 'first_install_fence_policy')}
     ${INSTALL_SOURCE.includes('\nFIRST_INSTALL_NO_CREDENTIALED_FENCE=false\n') ? 'FIRST_INSTALL_NO_CREDENTIALED_FENCE=false' : ''}
@@ -440,32 +487,294 @@ test('r35: a first install with a pin that does not authenticate the checkout is
   }
 })
 
-test('r35: the shipped installer runs that policy on the branch where there is no existing installation', () => {
-  // The three tests above call first_install_fence_policy() directly, which proves what it does
-  // and not that anything calls it. This is the wiring, and it is the one assertion here that
-  // reads source rather than running it — so it is written about the CONTROL FLOW and not about a
-  // sentence: the `else` arm of `if upgrade_in_place; then`, which is the branch that runs when
-  // there is no service, no crontab, no PM2 instance and no process in the application directory.
+// ---------------------------------------------------------------------------
+// r36 — THE EXEMPTION IS EARNED, NOT INFERRED FROM WHAT IS ABSENT ON THIS HOST
+// ---------------------------------------------------------------------------
+
+/**
+ * Run the SHIPPED branch that decides whether this run is fenced. Both arms are markers, so what
+ * is measured is which one executed and what UPGRADE_EXISTING was left at.
+ *
+ * `upgrade_in_place` returns 1 throughout: this host has no service unit, no crontab, no PM2
+ * instance and no process in the application directory. That is the ONLY condition r35 looked at,
+ * so holding it fixed at "nothing here to break" is what isolates the question r36 added.
+ */
+function runInstallBranch(vars: string): { status: number; output: string } {
+  const script = `
+    exec 2>&1
+    set -uo pipefail
+    info()    { echo "INFO: $*"; }
+    success() { echo "OK: $*"; }
+    warn()    { echo "WARN: $*"; }
+    error()   { echo "ERROR: $*" >&2; }
+    die()     { error "$*"; exit 9; }
+    header()  { echo "== $* =="; }
+    APP_DIR=/opt/one-two-inventory
+    UPGRADE_EXISTING=false
+    FENCED_CUTOVER=false
+    CUTOVER_REASON=""
+    CUTOVER_STEP=""
+    FIRST_INSTALL_EXEMPTION_REFUSAL=""
+    DB_HOST=localhost
+    DB_PORT=5432
+    DB_NAME=one_two_inventory
+    DB_CREATED_BY_THIS_RUN=false
+    DB_CREATED_IDENTITY=""
+    DB_NEWNESS_FINDING="the fixture states that nothing established it"
+    ${vars}
+    upgrade_in_place()            { return 1; }
+    on_cutover_exit()             { :; }
+    require_fenceable_database()  { echo "FENCED_PATH"; }
+    acquire_cutover_lock()        { :; }
+    import_legacy_cutover_state() { :; }
+    adopt_existing_fence()        { :; }
+    first_install_fence_policy()  { echo "EXEMPTION_TAKEN"; }
+    ${shippedFunction(INSTALL_SOURCE, 'first_install_exemption_available')}
+    ${shippedBranch(INSTALL_SOURCE)}
+    echo "UPGRADE_EXISTING=\${UPGRADE_EXISTING}"
+  `
+  try {
+    return { status: 0, output: execFileSync('bash', ['-c', script], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) }
+  } catch (error) {
+    const failure = error as { status?: number; stdout?: string; stderr?: string }
+    return { status: failure.status ?? -1, output: `${failure.stdout ?? ''}${failure.stderr ?? ''}` }
+  }
+}
+
+test('r36: a "first install" against a database this run did not create is fenced, not exempted', () => {
+  // THE FINDING, RUN. Every signal upgrade_in_place() reads says "first install": no unit, no
+  // crontab, no PM2, no process in the app directory. The database is somebody else's, live, and
+  // remote. r35 took the no-fence exemption here and migrated it.
   //
-  // MUTATION ROUTE: delete the `else first_install_fence_policy` arm — this test fails on the
-  // missing call; and every behavioural assertion above keeps passing, which is exactly why this
-  // assertion has to exist separately.
-  const branch = /\nif upgrade_in_place; then\n([\s\S]*?)\nfi\n/.exec(INSTALL_SOURCE)
-  assert.ok(branch, 'precondition: the installer must branch on upgrade_in_place')
-  const body = branch[1]
-  const elseIndex = body.indexOf('\nelse\n')
-  assert.notEqual(elseIndex, -1, 'the branch must have a first-install arm at all')
-  const firstInstallArm = body.slice(elseIndex)
-  assert.match(
-    firstInstallArm,
-    /^\s*first_install_fence_policy\s*$/m,
-    'the first-install arm must run the policy',
+  // MUTATION ROUTES (each verified by making the change and re-running):
+  //   1. delete the `elif ! first_install_exemption_available` arm from the branch: the run prints
+  //      EXEMPTION_TAKEN and UPGRADE_EXISTING=false — this test goes red on both assertions. That
+  //      is the shipped r35 behaviour, restored exactly.
+  //   2. make first_install_exemption_available() `return 0` unconditionally: identical failure,
+  //      from the other end.
+  //   3. drop the DB_CREATED_IDENTITY comparison: the third case below (proof about a DIFFERENT
+  //      database) prints EXEMPTION_TAKEN and fails; the first two stay green, which is why the
+  //      identity case is asserted separately.
+  const remote = runInstallBranch(`
+    DB_HOST=db.internal
+    DB_PORT=5432
+    DB_NAME=one_two_inventory
+    DB_CREATED_BY_THIS_RUN=false
+  `)
+  assert.equal(remote.status, 0, remote.output)
+  assert.match(remote.output, /FENCED_PATH/, 'an unproven database must reach require_fenceable_database')
+  assert.doesNotMatch(remote.output, /EXEMPTION_TAKEN/, 'and must never reach the no-fence policy')
+  assert.match(remote.output, /UPGRADE_EXISTING=true/, 'so that the stop, drain, fence and release blocks below all run')
+  assert.match(remote.output, /db\.internal/, 'and the reason names the database, not this host')
+
+  // THE SAME, VIA THE PATH THAT PRODUCES IT: INSTALL_POSTGRES=n creates nothing, so the finding
+  // string is the one the installer starts with and never replaces.
+  const external = runInstallBranch(`
+    DB_HOST=10.0.3.99
+    DB_CREATED_BY_THIS_RUN=false
+    DB_NEWNESS_FINDING="this run created no database, so nothing here established that the database it is about to migrate is new"
+  `)
+  assert.match(external.output, /FENCED_PATH/)
+  assert.doesNotMatch(external.output, /EXEMPTION_TAKEN/)
+
+  // AND PROOF ABOUT ONE DATABASE IS NOT PROOF ABOUT ANOTHER. This run really did create a
+  // database; it is not the one it is about to migrate.
+  const wrongDatabase = runInstallBranch(`
+    DB_HOST=localhost
+    DB_NAME=one_two_inventory
+    DB_CREATED_BY_THIS_RUN=true
+    DB_CREATED_IDENTITY="localhost:5432/some_other_database"
+  `)
+  assert.match(wrongDatabase.output, /FENCED_PATH/, 'a proof spent on the wrong database is not a proof')
+  assert.doesNotMatch(wrongDatabase.output, /EXEMPTION_TAKEN/)
+  assert.match(wrongDatabase.output, /some_other_database/, 'and the reason says which two databases it is about')
+})
+
+test('r36: a genuine first install still takes the exemption, and still needs no pin', () => {
+  // THE OTHER LOAD-BEARING CASE. The point of the fix is not to fence everything; a run that
+  // created its own database on a host with nothing on it must still install with no
+  // DEPLOY_ADMIN_DATABASE_URL, no artefact and no digest. If this goes red the fix has made every
+  // fresh install impossible, which is the failure mode this branch is under instructions to avoid.
+  //
+  // MUTATION ROUTE: change `elif ! first_install_exemption_available` to `elif true` — i.e. fence
+  // unconditionally: this test fails on FENCED_PATH and on UPGRADE_EXISTING=false, while the test
+  // above stays green. That is exactly why both exist.
+  const fresh = runInstallBranch(`
+    DB_HOST=localhost
+    DB_PORT=5432
+    DB_NAME=one_two_inventory
+    DB_CREATED_BY_THIS_RUN=true
+    DB_CREATED_IDENTITY="localhost:5432/one_two_inventory"
+  `)
+  assert.equal(fresh.status, 0, fresh.output)
+  assert.match(fresh.output, /EXEMPTION_TAKEN/, 'a database this run created has no other writer to fence out')
+  assert.doesNotMatch(fresh.output, /FENCED_PATH/, 'and must not demand an administrative credential to install')
+  assert.match(fresh.output, /UPGRADE_EXISTING=false/, 'so nothing below stops, drains or re-fences anything')
+
+  // AND THE POLICY IT REACHES STILL WORKS WITH NOTHING SUPPLIED — the no-pin path, which the
+  // r35 test above measures in full. Here it is only the join: the arm the branch chose is the
+  // arm that accepts an empty environment.
+  const { root } = firstInstallFixture()
+  try {
+    const policy = runFirstInstall(root, { IMS_FENCE_ARTEFACT_SHA256: '', IMS_FENCE_SCRIPT_SHA256: '' }, `
+      first_install_fence_policy
+      echo "POLICY_RC=$?"
+    `)
+    assert.equal(policy.status, 0, policy.output)
+    assert.match(policy.output, /POLICY_RC=0/, 'a genuine first install with no pin is not a refusal')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('r36: the policy refuses to arm an exemption it has not earned, even if something calls it', () => {
+  // DEFENCE IN DEPTH, AND THE REASON IT IS NOT A COMMENT. The branch routes correctly today. This
+  // is the same question asked at the one function that ARMS the exemption, so a later edit that
+  // reaches it on an unproven database stops the install instead of quietly exempting live data.
+  //
+  // MUTATION ROUTE: delete the `first_install_exemption_available || die` guard from
+  // first_install_fence_policy(): the call returns 0, POLICY_RC=0 is printed, and both the status
+  // and the doesNotMatch assertion below fail.
+  const { root } = firstInstallFixture()
+  try {
+    const run = runFirstInstall(root, { IMS_FENCE_ARTEFACT_SHA256: '', IMS_FENCE_SCRIPT_SHA256: '' }, `
+      first_install_fence_policy
+      echo "POLICY_RC=$?"
+    `, `
+      DB_CREATED_BY_THIS_RUN=false
+      DB_CREATED_IDENTITY=""
+      DB_NEWNESS_FINDING="this run created no database, so nothing here established that the database it is about to migrate is new"
+    `)
+    assert.equal(run.status, 9, `the die stub exits 9; got ${run.status}:\n${run.output}`)
+    assert.doesNotMatch(run.output, /POLICY_RC=/, 'the run must not continue past the refusal')
+    assert.match(run.output, /has not earned it/, 'and must say that the exemption was refused, not that a file was missing')
+    assert.ok(!existsSync(join(root, 'recovery')), 'and nothing may have been published on the way out')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('r36: CREATE DATABASE succeeding is the only thing that records the database as new', () => {
+  // WHAT COUNTS AS PROOF, MEASURED AT THE ONE STATEMENT THAT PRODUCES IT. The old
+  // `SELECT ... WHERE NOT EXISTS ... \gexec` succeeded identically in the first two cases below,
+  // which is why the exemption downstream could not tell them apart.
+  //
+  // MUTATION ROUTES (each verified by making the change and re-running):
+  //   1. set DB_CREATED_BY_THIS_RUN=true in the duplicate branch — i.e. restore the \gexec
+  //      semantics, where "already there" and "I made it" are the same outcome: the second case
+  //      fails on CREATED=false.
+  //   2. change the final `die` to `warn`: the third case exits 0 and its status assertion fails,
+  //      which is the run continuing over a database it could not describe.
+  //   3. drop the DB_CREATED_IDENTITY assignment: the first case fails on IDENTITY=.
+  function runCreate(stub: string): { status: number; output: string } {
+    const script = `
+      exec 2>&1
+      set -uo pipefail
+      success() { echo "OK: $*"; }
+      warn()    { echo "WARN: $*"; }
+      error()   { echo "ERROR: $*" >&2; }
+      die()     { error "$*"; exit 9; }
+      DB_NAME=one_two_inventory
+      DB_HOST=localhost
+      DB_PORT=5432
+      DB_CREATED_BY_THIS_RUN=false
+      DB_CREATED_IDENTITY=""
+      DB_NEWNESS_FINDING="unset"
+      ${stub}
+      ${shippedFunction(INSTALL_SOURCE, 'create_database_and_record_newness')}
+      create_database_and_record_newness
+      echo "CREATED=\${DB_CREATED_BY_THIS_RUN}"
+      echo "IDENTITY=\${DB_CREATED_IDENTITY}"
+    `
+    try {
+      return { status: 0, output: execFileSync('bash', ['-c', script], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) }
+    } catch (error) {
+      const failure = error as { status?: number; stdout?: string; stderr?: string }
+      return { status: failure.status ?? -1, output: `${failure.stdout ?? ''}${failure.stderr ?? ''}` }
+    }
+  }
+
+  // THE SERVER ACCEPTED THE STATEMENT. That is the proof, and the only one.
+  const created = runCreate('run_as_user() { return 0; }')
+  assert.equal(created.status, 0, created.output)
+  assert.match(created.output, /CREATED=true/, 'a CREATE DATABASE that succeeded is the database not having existed')
+  assert.match(created.output, /IDENTITY=localhost:5432\/one_two_inventory/, 'bound to the identity it succeeded against')
+
+  // THE SERVER REFUSED IT AS A DUPLICATE. Supported, not an error — and NOT proof.
+  const duplicate = runCreate(
+    'run_as_user() { echo \'ERROR:  database "one_two_inventory" already exists\' >&2; return 1; }',
   )
-  const upgradeArm = body.slice(0, elseIndex)
-  assert.match(upgradeArm, /require_fenceable_database/, 'precondition: the upgrade arm is the one that fences')
-  assert.doesNotMatch(
-    upgradeArm,
-    /first_install_fence_policy/,
-    'and it must not arm the no-execution flag, or an upgrade could never fence',
+  assert.equal(duplicate.status, 0, `a pre-existing database is a supported outcome:\n${duplicate.output}`)
+  assert.match(duplicate.output, /CREATED=false/, 'a database that was already there was not created by this run')
+  assert.match(duplicate.output, /IDENTITY=$/m, 'and nothing may be bound to it')
+  assert.match(duplicate.output, /WARN:/, 'and the operator is told, because it changes what this run does next')
+
+  // ANYTHING ELSE IS INDETERMINATE, AND INDETERMINATE STOPS THE RUN.
+  const unreachable = runCreate(
+    'run_as_user() { echo "psql: error: connection to server failed" >&2; return 2; }',
+  )
+  assert.equal(unreachable.status, 9, `an indeterminate result must stop the run:\n${unreachable.output}`)
+  assert.doesNotMatch(unreachable.output, /CREATED=/, 'the run must not continue past it')
+  assert.match(unreachable.output, /NOTHING HAS BEEN MIGRATED/, 'and must say what state the box is in')
+})
+
+// ---------------------------------------------------------------------------
+// r36 — ONE PIN CONTRACT, IN CODE, RUNBOOK AND TESTS
+// ---------------------------------------------------------------------------
+
+test('r36: the entry-file pin alone is refused at the entrypoint, before anything is staged', () => {
+  // THE FINDING. The runbook advertised EITHER pin as a first-install publication input, and the
+  // policy treated either as a publication request — but install.sh chowns the checkout to the
+  // application user, so _fence_stage_and_publish() refuses an entry-file pin from it. The
+  // advertised invocation could not publish on any ordinary first install; it aborted one.
+  //
+  // MUTATION ROUTE: delete the `-n SCRIPT && -z ARTEFACT` refusal from
+  // first_install_fence_policy(). The run still exits 9 — the LIBRARY refuses the same publication
+  // one layer down — so the status assertion alone stays green; the recovery-directory assertion
+  // is what fails, because _fence_stage_and_publish() creates that directory before it reaches its
+  // own refusal. Measured, not predicted: that is why this test asserts on the directory and on
+  // the contract text rather than on the exit code.
+  const { root } = firstInstallFixture()
+  try {
+    const scriptDigest = execFileSync('sha256sum', [join(root, 'app', 'scripts', 'fence-db-connections.mjs')], {
+      encoding: 'utf8',
+    }).slice(0, 64)
+    const run = runFirstInstall(root, { IMS_FENCE_SCRIPT_SHA256: scriptDigest, IMS_FENCE_ARTEFACT_SHA256: '' }, `
+      first_install_fence_policy
+      echo "POLICY_RC=$?"
+    `)
+    assert.equal(run.status, 9, `the die stub exits 9; got ${run.status}:\n${run.output}`)
+    assert.doesNotMatch(run.output, /POLICY_RC=/, 'the run must not continue past the refusal')
+    assert.match(
+      run.output,
+      /IMS_FENCE_ARTEFACT_SHA256 is the ONLY input that publishes/,
+      'and the refusal must be the contract itself, not a paraphrase of it',
+    )
+    assert.ok(
+      !existsSync(join(root, 'recovery')),
+      'the refusal must land at the entrypoint: the recovery directory would exist if staging had begun',
+    )
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('r36: the runbook quotes the installer\'s pin contract, byte for byte', () => {
+  // THIS IS NOT "A SENTENCE EXISTS IN THE DOCS". The installer defines the contract ONCE, as
+  // FIRST_INSTALL_PIN_CONTRACT, and prints those bytes when it refuses — the test above asserts
+  // the refusal carries them. This asserts the runbook carries the SAME bytes, so the code is the
+  // source and the documentation is derived from it. Three readers, one string.
+  //
+  // MUTATION ROUTES (each verified by making the change and re-running):
+  //   1. change one word of FIRST_INSTALL_PIN_CONTRACT in scripts/install.sh: this fails, because
+  //      the runbook now says something the code does not.
+  //   2. change one word of the quoted block in docs/installation.md: identical failure, from the
+  //      other end. That is the drift this branch has shipped three times.
+  const contract = shippedAssignmentValue(INSTALL_SOURCE, 'FIRST_INSTALL_PIN_CONTRACT')
+  assert.match(contract, /IMS_FENCE_ARTEFACT_SHA256/, 'precondition: the contract must name the input it requires')
+  const runbook = readFileSync(join(REPO, 'docs/installation.md'), 'utf8')
+  assert.ok(
+    runbook.includes(contract),
+    `docs/installation.md must quote FIRST_INSTALL_PIN_CONTRACT verbatim. The installer says:\n${contract}`,
   )
 })

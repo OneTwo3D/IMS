@@ -25,19 +25,61 @@ IMS_FENCE_ARTEFACT_SHA256=<digest published with this release> \
 ```
 
 **A first install performs no credentialed fence execution, so `IMS_FENCE_ARTEFACT_SHA256` is not
-required there.** `upgrade_in_place()` returning false means there is no service, no crontab, no
-PM2 instance and no process in the application directory, and the database was created by this
-run: there is no writer to stop, so there is no migration window to hold closed, so the fence
-helper — whose whole risk is that it is executed with an administrative database credential
-beside it — is never executed. `resolve_fence_script()` **refuses** on that path rather than
-merely never being called, so the policy is a property of the code and not a description of it.
+required there — but the run has to *earn* that exemption, and most runs cannot.** There is no
+writer to stop only when this invocation created the database itself; then there is no migration
+window to hold closed, and the fence helper — whose whole risk is that it is executed with an
+administrative database credential beside it — is never executed. `resolve_fence_script()`
+**refuses** on that path rather than merely never being called, so the policy is a property of the
+code and not a description of it.
 
-**Supply the digest anyway if you have it, and it is enforced.** With `IMS_FENCE_ARTEFACT_SHA256`
-(or `IMS_FENCE_SCRIPT_SHA256`) on the invocation, a first install *publishes* the protected
-artefact before it migrates — root reads and copies the tree, executing nothing — so the first
-upgrade cutover finds a standing, authenticated artefact instead of discovering the bootstrap is
-still outstanding at the worst possible moment. A pin that does **not** authenticate this checkout
-is a **refusal**, never a warning: nothing has been migrated and nothing has been started.
+**Two questions, and either answer fences the run.** `upgrade_in_place()` returning false means
+there is no service, no crontab, no PM2 instance and no process in the application directory. That
+is a statement about *this host*, not about the database, and treating it as one was the r35
+defect: a fresh application host pointed at an existing, live, remote database answers "nothing
+here to break" while other writers are connected to the schema it is about to migrate. So
+`first_install_exemption_available()` asks the second question separately, and the exemption needs
+**both**.
+
+**What counts as proof that this run created the database.** `CREATE DATABASE` succeeding, issued
+by this invocation against the local PostgreSQL server it just installed. PostgreSQL rejects that
+statement with `42P04 duplicate_database` when the name is taken, so a zero exit is the *server*
+saying the object did not exist an instant earlier and that this statement brought it into being.
+An already-existing database cannot produce that exit status — it makes the statement fail, and it
+fails identically whether the database is empty, full, idle or busy. **An empty schema is not the
+same thing and is not accepted**: "no tables in `public`" is true of a brand-new database and
+equally true of one another operator created five minutes ago and is about to migrate, and it is a
+race besides, since content can arrive between the question and the migration. Connection counts
+and `datconnlimit` are the same kind of instant and are not used either.
+
+**Everything unproven is fenced**, which is every case below. Each requires
+`DEPLOY_ADMIN_DATABASE_URL` and a protected fence artefact, exactly as an upgrade does:
+
+| case | why |
+| --- | --- |
+| `INSTALL_POSTGRES=n` — an external or remote database | the installer creates no database on this path, so there is nothing for it to have proven. **Every remote database is here.** |
+| `INSTALL_POSTGRES=y` over a database that already existed | `CREATE DATABASE` was refused as a duplicate. The run continues; it simply does not get the exemption. |
+| any indeterminate creation result | `psql` unreachable, or a failure that is not duplication. The run **stops** rather than continuing over a database it cannot describe. |
+| a proof about a different host, port or database name | proof about one database is not proof about another. |
+
+**Supply the digest if you have it, and it is enforced — but only the whole-tree one.** With
+`IMS_FENCE_ARTEFACT_SHA256` on the invocation, a first install *publishes* the protected artefact
+before it migrates — root reads and copies the tree, executing nothing — so the first upgrade
+cutover finds a standing, authenticated artefact instead of discovering the bootstrap is still
+outstanding at the worst possible moment. A pin that does **not** authenticate this checkout is a
+**refusal**, never a warning: nothing has been migrated and nothing has been started.
+
+<a id="first-install-pin-contract"></a>
+**The first-install pin contract.** These are the exact bytes `scripts/install.sh` defines as
+`FIRST_INSTALL_PIN_CONTRACT` and prints when it refuses;
+`tests/scripts/fence-digest-and-first-install.test.ts` asserts that this block and that constant
+are the same string, so the code is the source and this paragraph is derived from it:
+
+> On a first install, IMS_FENCE_ARTEFACT_SHA256 is the ONLY input that publishes the protected fence artefact. IMS_FENCE_SCRIPT_SHA256 alone is REFUSED here: it authenticates the entry file, while the artefact also vendors that helper's dependency closure out of the application-owned checkout. Supply IMS_FENCE_ARTEFACT_SHA256 -- IMS_FENCE_SCRIPT_SHA256 may accompany it and is then also enforced -- or supply neither, in which case this install fences nothing, publishes nothing, and the first upgrade asks for the digest instead.
+
+`install.sh` chowns the checkout to the application user before it reaches this point, so the
+source the closure is vendored from is application-writable on **every** install this script
+performs — which is why the rule is stated flatly rather than conditioned on a property that is
+always true here.
 
 **An upgrade is where the pin becomes mandatory.** Running this installer over an existing
 installation, or running `scripts/update.sh` or `scripts/deploy.sh`, fences a real window and
@@ -1101,12 +1143,16 @@ and nothing else:
 
 **And a fourth case that is not a state of the artefact at all: a FIRST INSTALL.** `install.sh` on
 a box with no service, no crontab, no PM2 instance and no process in the application directory
-fences nothing — there is no writer to stop — so it never reaches the table above by needing to
-*execute* the helper. `resolve_fence_script()` refuses outright on that path. It reaches the first
-row only when the operator supplies a pin, in which case it **publishes** the artefact before the
-migration (a read and a copy by root; nothing is executed) so the first upgrade has one standing.
-With no pin it publishes nothing and says so, and the pin is required at the first upgrade
-instead. See [The Install Script](#the-install-script).
+**and a database this run created itself** fences nothing — there is no writer to stop — so it
+never reaches the table above by needing to *execute* the helper. `resolve_fence_script()` refuses
+outright on that path. A run that cannot prove it created the database is **not** in this case: it
+takes the ordinary cutover path and everything in the table applies to it. It reaches the first row
+only when the operator supplies `IMS_FENCE_ARTEFACT_SHA256`, in which case it **publishes** the
+artefact before the migration (a read and a copy by root; nothing is executed) so the first upgrade
+has one standing. `IMS_FENCE_SCRIPT_SHA256` alone is refused at the entrypoint, before anything is
+staged — see [the first-install pin contract](#first-install-pin-contract). With no pin it
+publishes nothing and says so, and the pin is required at the first upgrade instead. See
+[The Install Script](#the-install-script).
 
 Divergence **warns rather than refuses** deliberately. Refusing would hand the application account
 a denial of service on every future cutover — write one byte into a file it owns and no deploy runs
