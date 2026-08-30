@@ -262,9 +262,33 @@ Remote upload and delete actions apply to both the SQL backup and the `.manifest
 Automate your backup routine by enabling scheduled backups:
 
 - **Enable/disable** the schedule
-- **Retention days** — automatically delete backups older than this many days
-- **Max backup count** — limit the total number of backups kept on the server
+- **Retention days** — automatically delete backups older than this many days (whole number, minimum 1)
+- **Max backup count** — limit the total number of backups kept on the server (whole number, minimum 1)
+
+Both counts are refused below 1, and a stored value that is not a positive whole number is read as
+the default (30 days / 10 backups) rather than acted on. A `0` used to be taken literally: the purge
+cutoff became "now" and the count limit matched every file, so a scheduled run deleted the entire
+backup set moments after taking one.
 - **Auto-upload** — optionally upload each scheduled backup to S3 or SFTP automatically
+
+The switch shows, and sets, what the scheduler will actually do. Two rows have historically answered
+"are scheduled backups on?" — `cron_backup_enabled` (what the crontab is built from) and
+`backup_schedule_enabled` (what the backup route checks before doing any work) — and on an
+installation where they disagree the result was silent in both directions: a cron line that fired and
+returned "disabled", or a screen showing ON over a job with no cron line. Every reader now resolves
+them the same way (canonical row first, legacy row as a fallback, registry default last), and every
+save writes both, so the first save from either screen collapses the pair for good. No migration is
+needed.
+
+Saving this panel rewrites the managed crontab. The enable switch is the same enablement the
+**Database Backup** job uses in Settings → System → Scheduled Jobs, so the two screens cannot
+disagree: whichever one you save writes both the scheduler's row (`cron_backup_enabled`) and the row
+the backup route checks before it does any work (`backup_schedule_enabled`). Choose the *time* the
+backup runs on the Scheduled Jobs page — this panel does not set it.
+
+If the crontab cannot be written, the panel reports the values as saved and warns that the scheduler
+is behind, rather than reporting a failed save over values that are stored. Recover with **Save &
+Apply** on the Scheduled Jobs page.
 
 ## Cron Endpoint
 

@@ -49,6 +49,20 @@ const JOB_KEY = 'initial_order_import_job'
  * active orders to import, is complete (per-order errors are surfaced but don't
  * block, since live sync of new orders can still proceed).
  *
+ * EXCEPT FOR AN UNRECORDED REFUSAL, WHICH BLOCKS COMPLETION ON ITS OWN (o3d-batch-ret r15,
+ * Codex HIGH). "Per-order errors don't block" is true of every error this loop can otherwise
+ * produce, because every one of them leaves the order where the NEXT pass will find it: it is
+ * still in the `?status=` page, still absent from `shopping_order_links`, still re-fetched. An
+ * unrecorded admission refusal is the one error that is not like that. The order was refused, the
+ * refusal was not written down, and marking the pass complete does two irreversible things at
+ * once — it stamps `wc_initial_import_completed`, so this backfill never runs again, and it
+ * writes `last_wc_order_sync_at` to now, so the ongoing `?modified_after=` sweep starts AFTER the
+ * order it just skipped. A historical order is not redelivered by anything: no webhook is coming,
+ * there is no refusal row for the by-id drain, and the cursor is past it. It is gone.
+ *
+ * So the count is a separate input rather than part of `errorCount`. A mixed-success pass — nine
+ * orders imported, one refusal that could not be recorded — is FAILED, and the operator retries a
+ * backfill that is idempotent by construction (`importedOrderIds` skips what already landed).
  * AN INCOMPLETE READ IS THE ONE PER-PASS FAILURE THAT PROGRESS CANNOT OUTVOTE (o3d-xnwu). The
  * per-ORDER inputs are outvoted deliberately: some orders failed, the rest are in, and live sync can
  * carry the rest. A read that did not cover the collection is a different kind of statement — IMS
@@ -70,11 +84,22 @@ const JOB_KEY = 'initial_order_import_job'
  * `unreadPages` is that second cause, and it is deliberately NOT folded into `truncatedRead`: they
  * need different sentences in front of an operator (one says "we never saw the end", the other says
  * "page 7 is missing"), and collapsing them is how the first came to stand for both.
+ *
+ * THE THREE BLOCKING INPUTS ARE INDEPENDENT, AND NONE OF THEM IS THE OTHERS' SPECIAL CASE
+ * (merge of o3d-batch-ret into o3d-xnwu). `truncatedRead` and `unreadPages` are statements
+ * about the COLLECTION — which pages of the store were read at all. `unrecordedRefusals` is a
+ * statement about an order that WAS read, was refused, and whose refusal could not be written
+ * down. A pass can be any combination of the three, and folding the refusal count into
+ * `errorCount` would resurrect exactly the defect the two branches independently found: an
+ * input that progress is allowed to outvote. So all three are checked before `madeProgress` is
+ * ever computed, and each keeps its own sentence for the operator.
  */
 export function decideInitialImportOutcome(input: {
   imported: number
   skipped: number
   errorCount: number
+  /** Orders refused whose durable by-id retry row could not be confirmed. See above. */
+  unrecordedRefusals: number
   /** The order walk never reached an empty page, so how much of the store was read is unknown. */
   truncatedRead?: boolean
   /**
@@ -83,6 +108,11 @@ export function decideInitialImportOutcome(input: {
    */
   unreadPages?: number
 }): 'complete' | 'failed' {
+  // All three before `madeProgress`, because being outvoted by progress is the one thing each of
+  // them exists to be immune to. `unrecordedRefusals` is REQUIRED and the other two are optional
+  // by deliberate asymmetry: a caller that forgets the refusal count silently re-opens o3d-batch-ret
+  // r15, whereas a caller with no page walk to describe genuinely has nothing to say about pages.
+  if (input.unrecordedRefusals > 0) return 'failed'
   if (input.truncatedRead || (input.unreadPages ?? 0) > 0) return 'failed'
   const madeProgress = input.imported > 0 || input.skipped > 0
   return input.errorCount > 0 && !madeProgress ? 'failed' : 'complete'
@@ -190,6 +220,10 @@ async function runInitialImport(progress: InitialImportProgress) {
 
     let page = 1
     let totalPages = 1
+    // Orders the admission boundary refused whose durable by-id retry row could not be confirmed.
+    // Counted separately from `progress.errors` because it decides a different question: not "how
+    // did this pass go" but "may this pass advance the cursor at all" (r15).
+    let unrecordedRefusals = 0
     // o3d-xnwu: the walk ends on an EMPTY PAGE, not on `x-wp-totalpages`. This is the run that
     // GATES live order sync — an initial import truncated to 100 orders by a store that sends no
     // readable page count would unlock live sync over a store IMS has mostly never seen.
@@ -288,6 +322,9 @@ async function runInitialImport(progress: InitialImportProgress) {
           progress.activeOrdersSkipped++
         } else {
           progress.errors.push(`Order #${order.number}: ${importResult.error}`)
+          // The one error that must stop this pass completing, however well the rest went. The
+          // order is refused, unrecorded, and behind the cursor this pass would write.
+          if (importResult.unrecordedRefusal) unrecordedRefusals++
         }
 
         importedOrderIds.add(order.id)
@@ -314,6 +351,7 @@ async function runInitialImport(progress: InitialImportProgress) {
       imported: progress.activeOrdersImported,
       skipped: progress.activeOrdersSkipped,
       errorCount: progress.errors.length,
+      unrecordedRefusals,
       truncatedRead: !endedOnEmptyPage && unreadPages === 0,
       unreadPages,
     })
@@ -324,16 +362,27 @@ async function runInitialImport(progress: InitialImportProgress) {
       // would falsely unlock live sync and leave a dead-end "done" state with no
       // retry. Surface it as an error so the UI shows Retry and live order sync
       // stays gated off until a real import succeeds.
+      //
+      // OR an order was refused and the refusal could not be written down (r15). OR the read did
+      // not cover the collection, by either of its two causes (o3d-xnwu). Each of those says
+      // something different from "everything failed" and is worded as itself below \u2014 the pass
+      // may have imported most of the store, and the reason it must not complete is what it did
+      // NOT get, not what it did.
       progress.status = 'error'
-      // THREE REASONS REACH HERE NOW AND THEY NEED THREE SENTENCES (round 3, Codex CRITICAL).
-      // "0 of N imported" is false for either incomplete read, which imported everything it managed
-      // to see \u2014 the problem is that nobody knows what it did not see. And an unread page is not
-      // "we never saw the end": it is "page N is missing", a different thing to go and look at.
+      // FOUR REASONS REACH HERE NOW AND THEY NEED FOUR SENTENCES (merge of o3d-batch-ret r15
+      // into o3d-xnwu round 3). "0 of N imported" is false for any of the first three, each of
+      // which imported everything it managed to. They are ordered by HOW MUCH IS UNKNOWN, widest
+      // first, because that is what decides where the operator looks: a missing page hides up to
+      // 100 orders, an unended walk hides an unbounded tail, and a refusal names the exact orders
+      // it is about. Only ONE of them can be the message, but every one of them is also in
+      // `progress.errors`, so ordering chooses the headline and hides nothing.
       progress.message = unreadPages > 0
         ? `Import incomplete \u2014 ${progress.activeOrdersImported} order${progress.activeOrdersImported === 1 ? '' : 's'} imported, but page ${progress.currentPage} could not be read, so up to 100 orders in the MIDDLE of the store were never seen. Retry; live order sync stays off until a complete read succeeds.`
         : !endedOnEmptyPage
           ? `Import incomplete \u2014 ${progress.activeOrdersImported} order${progress.activeOrdersImported === 1 ? '' : 's'} imported, but WooCommerce never returned an empty page, so how much of the store was read is unknown. Retry; live order sync stays off until a complete read succeeds.`
-          : `Import failed \u2014 0 of ${progress.totalOrders} order${progress.totalOrders === 1 ? '' : 's'} imported (${progress.errors.length} error${progress.errors.length === 1 ? '' : 's'}). Resolve the cause and retry; live order sync stays off until the initial import succeeds.`
+          : unrecordedRefusals > 0
+            ? `Import held \u2014 ${unrecordedRefusals} order${unrecordedRefusals === 1 ? ' was' : 's were'} not imported and the durable retry row could not be written, so ${unrecordedRefusals === 1 ? 'it' : 'they'} would be stranded behind the sync cursor. Nothing was marked complete and the cursor was NOT advanced; ${progress.activeOrdersImported} order${progress.activeOrdersImported === 1 ? '' : 's'} did import and will be skipped on the retry. Resolve the cause and retry.`
+            : `Import failed \u2014 0 of ${progress.totalOrders} order${progress.totalOrders === 1 ? '' : 's'} imported (${progress.errors.length} error${progress.errors.length === 1 ? '' : 's'}). Resolve the cause and retry; live order sync stays off until the initial import succeeds.`
       await saveProgress(progress)
 
       await logActivity({

@@ -40,6 +40,11 @@ import {
   type SettlementUniqueConflictKind,
 } from '@/lib/domain/accounting/sync-row-settlement'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
+import {
+  accountingSyncEnabledSettingKey,
+  describeStillClaimableStrandedRow,
+  isStrandedRowUnclaimable,
+} from '@/lib/domain/accounting/sync-row-claimability'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import type { FreshAuthFailureResult } from '@/lib/auth/session-gates'
 
@@ -108,6 +113,14 @@ export type SettlementFailureCode =
   | SettlementUniqueConflictKind
   | SettlementRefusalCode
   | 'unrecognised_outcome'
+  /**
+   * The row is off the active connector but its connector's sync toggle is still on, so the
+   * abandoned attempt is NOT the only attempt it can have — the manual Sync button would reclaim it
+   * (round 5, Codex HIGH #1). Distinct from UNFENCED_ATTEMPT because the remedy is different and
+   * performable: turn the toggle off. UNFENCED_ATTEMPT's own message says "this row cannot be
+   * settled per-attempt", which would be a second wrong absolute in an operator's hands.
+   */
+  | 'CONNECTOR_STILL_CLAIMABLE'
 
 export type SettleAccountingSyncRowResult =
   | {
@@ -210,6 +223,24 @@ async function resolveActiveAccountingConnector(): Promise<string | null> {
   if (await isIntegrationPluginEnabled('xero')) return 'xero'
   if (await isIntegrationPluginEnabled('quickbooks')) return 'quickbooks'
   return null
+}
+
+/**
+ * The connector's sync toggle, read exactly as its own gates read it (round 5, Codex HIGH #1).
+ *
+ * This is the OTHER half of the adoption precondition, and it is the half neither round 3 nor round
+ * 4 asked for. `triggerXeroSync` and `triggerQuickBooksSync` do `enabled?.value !== 'true'` on this
+ * key and then run the processor — no plugin flag, no active-connector resolution — so a row whose
+ * toggle is on is claimable however retired its connector looks.
+ *
+ * Returns null for a connector this codebase knows no claim path for, which
+ * `isAccountingConnectorQuiesced` treats as "cannot be shown to be quiesced" rather than as off.
+ */
+async function readAccountingSyncEnabledValue(connector: string): Promise<string | null> {
+  const key = accountingSyncEnabledSettingKey(connector)
+  if (key === null) return null
+  const setting = await db.setting.findUnique({ where: { key }, select: { value: true } })
+  return setting?.value ?? null
 }
 
 /**
@@ -404,9 +435,35 @@ export async function settleAccountingSyncRow(
     // route already (retry it, the fence-aware processor claims it and stamps attempt 1), and
     // offering a second way to do what the system does correctly by itself is the same objection
     // that keeps PENDING unsettleable.
-    const adoptAttempt = !isFencedAttemptRevision(row.attemptRevision)
-      && input.observedAttemptRevision === 0
-      && (await resolveActiveAccountingConnector()) !== row.connector
+    //
+    // AND "NOT THE ACTIVE CONNECTOR" IS NOT THAT PRECONDITION (round 5, Codex HIGH #1). The active
+    // connector is resolved from the PLUGIN flags, Xero-first; `triggerQuickBooksSync` and
+    // `triggerXeroSync` — the manual Sync buttons, reachable by any holder of `sync` — gate on
+    // `<connector>_sync_enabled` and never resolve the active connector at all. With Xero enabled
+    // beside a still-enabled QuickBooks, this test alone would adopt a QuickBooks row that the very
+    // next press of the QuickBooks Sync button reclaims: the operation replays and the worker's
+    // write lands on top of the settlement. `isStrandedRowUnclaimable` is the whole rule, shared
+    // verbatim with the read model that decides whether to OFFER the control.
+    const activeConnector = await resolveActiveAccountingConnector()
+    const wantsAdoption = !isFencedAttemptRevision(row.attemptRevision) && input.observedAttemptRevision === 0
+    const adoptAttempt = wantsAdoption && isStrandedRowUnclaimable({
+      connector: row.connector,
+      activeConnector,
+      syncEnabledValue: await readAccountingSyncEnabledValue(row.connector),
+    })
+
+    // REFUSED WITH THE LEVER, not with the fence's generic sentence. A row that is off the active
+    // connector and STILL claimable would otherwise fall through to UNFENCED_ATTEMPT, whose message
+    // ends "this row cannot be settled per-attempt" — the same absolute round 4 was raised to
+    // remove, restated where the reader can act on it. Named here so the operator is told the one
+    // thing that changes the answer.
+    if (wantsAdoption && !adoptAttempt && activeConnector !== row.connector) {
+      return {
+        success: false,
+        code: 'CONNECTOR_STILL_CLAIMABLE',
+        error: describeStillClaimableStrandedRow(row.connector),
+      }
+    }
 
     const now = new Date()
     const priorStatus = row.status

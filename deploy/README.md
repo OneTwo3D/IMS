@@ -67,12 +67,41 @@ sudo -u ims bash -lc 'cd /opt/ims/onetwo3d-ims && git pull && npm ci && npm run 
 sudo systemctl restart ims-stage
 ```
 
+The `restart` is not optional and `start` will not do: a running process is not
+replaced by a `start`, so a rebuilt tree with the old process still up leaves
+that process on whatever crontab lock path the *old* build derived — while
+anything that reconciles the crontab afterwards (a scheduler save, or
+`scripts/install.sh`) locks the new one. Two locks that do not exclude each
+other silently lose one side's managed block. A hand-deploy must not skip it.
+
+`scripts/install.sh` reaches the same end by a different route and needs no
+`restart` of its own: it **stops** the service before the migration and refuses
+to continue while the port is still bound, so its later `start` acts on a
+stopped unit. It then *proves* the result rather than assuming it — it fetches
+`/_next/static/<BUILD_ID>/`, a route only the process whose own build id is that
+one serves, and aborts before the crontab section if anything else answers.
+Nothing here does that for you, which is why the `restart` above is the whole
+guarantee.
+
 ## Tuning notes
 
 - **Writable paths**: `ProtectSystem=strict` makes everything read-only except the
   `.next` cache and the uploads dirs listed in the unit. If you relocate uploads
   via `UPLOAD_STORAGE_DIR` / `PUBLIC_UPLOAD_STORAGE_DIR`, update `ReadWritePaths`
   (or add another `StateDirectory`) to match.
+- **`StateDirectory` is load-bearing beyond backups**: the crontab reconciliation
+  lock lives at `$STATE_DIRECTORY/locks/.crontab-reconcile.lock`
+  (`lib/crontab-reconcile-lock.ts`, and the matching `flock` in
+  `scripts/install.sh`). The `locks/` directory and the file in it are
+  `root:root` on an installed host — the service opens the lock read-only,
+  because `flock(2)` ignores the access mode, and so nothing root writes there
+  sits on a path the service user could replace with a symlink. systemd creates the directory, owns it to `User=`, and
+  adds it to `ReadWritePaths` implicitly, so it is the only path both the
+  application and the installer can derive *and* write under
+  `ProtectSystem=strict` — a lock beside the app cannot be created at all.
+  Dropping `StateDirectory=` from the unit does not fail at deploy time; it fails
+  at the first scheduler save, which then refuses and reports that the scheduler
+  may be behind.
 - **Sandbox validation**: `systemd-analyze security ims-stage` scores the unit;
   aim to keep it in the "OK"/"exposed" range or better.
 - Do **not** add `MemoryDenyWriteExecute=true` — it breaks the V8 JIT and the

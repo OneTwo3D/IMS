@@ -490,6 +490,10 @@ LOG_DIR="/var/log/${APP_NAME}"
 BACKUP_DIR="${DATA_DIR}/backups"
 UPLOAD_STORAGE_DIR="${DATA_DIR}/uploads"
 PUBLIC_UPLOAD_STORAGE_DIR="${DATA_DIR}/public-uploads"
+# The crontab reconciliation lock is composed from ${DATA_DIR} by crontab_lock_paths(), just
+# below the library that defines it — the two components live in scripts/lib/crontab-lock.sh and
+# nowhere else, because deploy.sh and update.sh compose the same path from their own state
+# directory and the application derives it from $STATE_DIRECTORY (lib/crontab-reconcile-lock.ts).
 NGINX_CONF="/etc/nginx/sites-available/${APP_NAME}"
 NODE_VERSION="22"
 DEPLOY_SSH_DIR="${DATA_DIR}/git-ssh"
@@ -884,6 +888,19 @@ source "${IMS_SCRIPT_LIB_DIR}/db-fence-protected.sh" || {
   echo "FATAL: ${IMS_SCRIPT_LIB_DIR}/db-fence-protected.sh could not be sourced. It decides which bytes the connection fence may be executed with, and without it this run cannot fence a migration window. Nothing has been changed." >&2
   exit 1
 }
+# AND THE CRONTAB EXCLUSION, for the same reason and out of the same tree (o3d-p9dq, Codex r26
+# HIGH). Round 25 had the flock in this file and nowhere else, so deploy.sh and update.sh — which
+# fence and unfence the SAME crontab around their own cutovers — wrote it unserialized. One
+# protocol cannot be restated in three scripts and stay one protocol, so it is stated once here:
+# prepare_crontab_lock() creates the root-owned lock, with_crontab_lock() is how every shell
+# read-modify-write of the crontab is performed, and crontab_lock_paths() composes the path all
+# four writers must agree on.
+# shellcheck source=lib/crontab-lock.sh
+source "${IMS_SCRIPT_LIB_DIR}/crontab-lock.sh" || {
+  echo "FATAL: ${IMS_SCRIPT_LIB_DIR}/crontab-lock.sh could not be sourced. It is the only exclusion between this script's crontab writes and the running application's, and without it a cutover can silently discard a schedule an operator has just saved. Nothing has been changed." >&2
+  exit 1
+}
+crontab_lock_paths "${DATA_DIR}"
 DB_OBJECT_ACCESS_SCRIPT="${APP_DIR}/scripts/check-app-db-object-access.mjs"
 # THE APPLICATION'S CONNECTION IDENTITY, WHICH THIS INSTALLER OWNS OUTRIGHT (o3d-2sm1.5 r19).
 #
@@ -1042,15 +1059,28 @@ FIRST_INSTALL_EXEMPTION_REFUSAL=""
 # `compgen -e`, so nothing here has to trust a caller-supplied string.
 #
 # Fills the caller's named array; `env -u X -u Y ... psql` then starts psql with them gone.
+#
+# AND THE ENUMERATION IS TAKEN WHOLE OR NOT AT ALL (o3d-p9dq, Codex r33). `compgen -e` behind a
+# process substitution had no status anybody could take, and a PARTIAL enumeration is not a shorter
+# list of `-u` options: it is a PG*/PSQL* variable left STANDING in the environment of the very
+# psql this function exists to sanitise — PGOPTIONS, PSQLRC, PGSERVICE, PGSYSCONFDIR, none of which
+# db_application_route_env_refusal covers. That is the wrong-cluster write argued at length above,
+# reached through a check that appeared to run. So the names are captured with their status taken,
+# an empty enumeration is a refusal, and the loop reads text this shell already holds.
+#
+# THE CALLERS TAKE THIS STATUS (`|| return 1`), and a psql that does not run is the correct answer
+# to "which PG* variables must be removed" going unanswered.
 libpq_env_unset_args() {
   local -n _out="$1"
-  local var
+  local var names
   _out=()
+  names="$(compgen -e)" || return 1
+  [[ -n "${names}" ]] || return 1
   while IFS= read -r var; do
     case "${var}" in
       PG*|PSQL*) _out+=(-u "${var}") ;;
     esac
-  done < <(compgen -e)
+  done <<<"${names}"
 }
 
 # WHERE THE LOCAL SUPERUSER CONNECTION GOES, STATED RATHER THAN INHERITED.
@@ -1079,7 +1109,7 @@ db_local_socket_dir() {
 # through pg_endpoint_psql below.
 pg_local_psql() {
   local -a unset_args=()
-  libpq_env_unset_args unset_args
+  libpq_env_unset_args unset_args || return 1
   run_as_user postgres env "${unset_args[@]}" psql \
     -X -w -v ON_ERROR_STOP=1 -v VERBOSITY=verbose \
     -h "$(db_local_socket_dir)" -p "${DB_PORT}" -d postgres "$@"
@@ -1113,7 +1143,7 @@ pg_endpoint_psql() {
   shift 3
   local -a unset_args=() keep=() route=()
   local i=0
-  libpq_env_unset_args unset_args
+  libpq_env_unset_args unset_args || return 1
   # THE PIN, AS TWO libpq SETTINGS AND NOT ONE. `sslmode` decides TLS; `gssencmode` decides GSSAPI
   # encryption, defaults to `prefer` wherever libpq was built with GSSAPI, and a connection that
   # takes it is matched by `hostgssenc` records — a third transport, and one the reader never
@@ -1550,12 +1580,25 @@ bus_unit_object() {
 # assignments", and an assignment removes ONLY that exact pair — `UnsetEnvironment=PGSSLMODE=require`
 # leaves `PGSSLMODE=no-verify` standing. A bare name removes the variable whatever its value.
 unit_route_env_guaranteed() {
-  local unit="${1:-}" rendering count name element found
+  local unit="${1:-}" rendering count name element found route_names
   bus_unit_object "$unit" || return 1
   rendering="$(bus_unit_property "$BUS_UNIT_OBJECT" Service UnsetEnvironment)" || rendering=''
   if ! count="$(bus_array_count "$rendering" 'as')" || ! bus_read_strings "$rendering" \
     || [[ "${#BUS_STRINGS[@]}" -ne "$count" ]]; then
     ENV_ROUTE_GUARANTEE_REASON="systemd would not answer readably for ${unit}'s UnsetEnvironment=, so whether the transport variables are removed from the service's environment at exec is unknown"
+    return 1
+  fi
+  # CAPTURED AND CHECKED, NOT PROCESS-SUBSTITUTED (o3d-p9dq, Codex r32 CRITICAL, the sweep).
+  # `done < <(db_route_env_variables)` reads its producer's status NOWHERE — not this shell's, not
+  # the loop's — so a producer that emitted nothing made this loop run NOUGHT times and the
+  # function return 0, which is the word "guaranteed" for a guarantee nobody checked. A capture
+  # has a status, and this takes it; the here-string then feeds the same bytes to the same loop.
+  route_names="$(db_route_env_variables)" || {
+    ENV_ROUTE_GUARANTEE_REASON="the list of transport variables that must be removed from ${unit}'s environment could not be produced, so nothing has established that systemd removes any of them — and an empty list is not a guarantee, it is the absence of one"
+    return 1
+  }
+  if [[ -z "${route_names}" ]]; then
+    ENV_ROUTE_GUARANTEE_REASON="the list of transport variables that must be removed from ${unit}'s environment came back EMPTY, so this check would have examined nothing and returned success. That is not a guarantee"
     return 1
   fi
   local -a unset_names=()
@@ -1575,7 +1618,7 @@ unit_route_env_guaranteed() {
       ENV_ROUTE_GUARANTEE_REASON="${unit}'s loaded configuration does not list ${name} as a bare name in UnsetEnvironment= (systemd composes it as: ${unset_names[*]:-nothing at all}), so systemd does not remove it from the service's environment at exec — and ${name} reaching the application means $(db_route_env_effect "${name}"). The ${DB_ROUTE_DROPIN_NAME} drop-in this installer writes states exactly that directive; a later drop-in whose own UnsetEnvironment= is EMPTY resets the list and is the usual cause"
       return 1
     fi
-  done < <(db_route_env_variables)
+  done <<< "${route_names}"
   return 0
 }
 
@@ -1658,7 +1701,17 @@ db_service_execstart_expected() {
 # NOTHING HERE WRITES ANYTHING: three environment reads and, in `service` mode, two `busctl`
 # get-property calls.
 db_application_route_env_refusal() {
-  local mode="${1:-installer}" name
+  local mode="${1:-installer}" name route_names
+  # THE SAME CAPTURE, FOR THE SAME REASON (o3d-p9dq, Codex r32 CRITICAL, the sweep). An empty list
+  # here read as "none of the three is set in this process" — a refusal that examined nothing.
+  route_names="$(db_route_env_variables)" || {
+    printf 'the list of transport environment variables this gate must refuse could not be produced, so nothing has been examined. An empty list is not a clean environment'
+    return 1
+  }
+  if [[ -z "${route_names}" ]]; then
+    printf 'the list of transport environment variables this gate must refuse came back EMPTY, so this check would have examined nothing and passed. An empty list is not a clean environment'
+    return 1
+  fi
   while IFS= read -r name; do
     # THIS PROCESS. Not a proxy for the service's environment — a source in its own right, and the
     # one source no unit directive can close. The MIGRATION, the BUILD and
@@ -1669,7 +1722,7 @@ db_application_route_env_refusal() {
         "${name}" "${!name}" "$(db_route_env_effect "${name}")" "${name}" "$(db_route_env_alternative "${name}")"
       return 1
     fi
-  done < <(db_route_env_variables)
+  done <<< "${route_names}"
   # THE MODE IS ENUMERATED, NOT DEFAULTED PAST. `|| return 0` on a `== "service"` test would make
   # every misspelling of the stricter mode silently take the weaker one — a start gate that
   # checked nothing, and looked exactly like one that passed.
@@ -1682,8 +1735,16 @@ db_application_route_env_refusal() {
     printf '%s' "${ENV_ROUTE_GUARANTEE_REASON}"
     return 1
   fi
+  # AND THE SAME AGAIN (o3d-p9dq, Codex r32 CRITICAL, the sweep). A truncated producer here would
+  # have failed CLOSED — a short expectation cannot equal the composed ExecStart — but it would
+  # have blamed the unit for a list this script failed to produce, and the status is free to take.
   local -a expected_execstart=()
-  mapfile -t expected_execstart < <(db_service_execstart_expected)
+  local execstart_expected
+  execstart_expected="$(db_service_execstart_expected)" || {
+    printf 'the ExecStart this installer writes could not be composed, so there is nothing to compare %s.service against. That is a failure of this script, not a property of the unit' "${APP_NAME}"
+    return 1
+  }
+  mapfile -t expected_execstart <<< "${execstart_expected}"
   if ! unit_execstart_is_exactly "${APP_NAME}.service" ${expected_execstart[@]+"${expected_execstart[@]}"}; then
     printf '%s' "${UNIT_EXECSTART_REASON}"
     return 1
@@ -2347,6 +2408,12 @@ DB_IDENTITY_SOURCE_REASON=""
 # the process that answered. Nothing after this may stop it, re-fence it or revoke CONNECT
 # again (o3d-2sm1.5, Codex r4 HIGH).
 PAST_POINT_OF_NO_RETURN=false
+# THE CRONTAB SECTION'S ORDERING GUARD (o3d-batch-ret r25, re-attached at the merge). False until
+# section 12b has PROVED that the process on ${APP_PORT} is serving the build this run produced.
+# Section 16 refuses to open the crontab lock while it is false, because a lock taken against a
+# predecessor's process excludes nothing. Declared here rather than at the point of use so that
+# reordering the two sections leaves it false and fails loudly, instead of leaving it undefined.
+APP_SERVICE_ON_NEW_BUILD=false
 # Did anything PROVE that the build on disk is the process answering the port? An open port
 # is not that proof (o3d-2sm1.5, Codex r5 HIGH).
 NEW_BUILD_SERVING=false
@@ -2400,8 +2467,27 @@ upgrade_in_place() {
   if [[ -f "/etc/systemd/system/${APP_NAME}.service" ]]; then
     return 0
   fi
-  if command -v crontab >/dev/null 2>&1; then
-    if crontab -u "${APP_USER}" -l 2>/dev/null | grep -qE '^[[:space:]]*[^#[:space:]]'; then
+  # AND THE BINARY'S ABSENCE IS NOT AN ANSWER EITHER (o3d-p9dq, Codex r29 HIGH #2). This test used
+  # to be a plain `if command -v crontab`, so a host that had the schedule but not the client fell
+  # through to the launcher probes below and could be classified a FRESH BOX — the same wrong
+  # answer the read below refuses to give, reached by skipping the read entirely. A proved absence
+  # (no spool entry, no daemon) legitimately contributes nothing and falls through; anything else
+  # stops the run.
+  local crc=0
+  require_crontab_command "${APP_USER}" || crc=$?
+  if [[ "${crc}" -eq 1 ]]; then
+    die "this run cannot tell an in-place upgrade from a first install: ${CRONTAB_COMMAND_REASON}. Both answers act destructively on the wrong host — one migrates a live installation, the other stops and fences a box that has nothing on it — so NOTHING HAS BEEN CHANGED."
+  fi
+  if [[ "${crc}" -eq 0 ]]; then
+    # FAIL CLOSED, AND NOT TOWARDS EITHER ANSWER (o3d-p9dq, Codex r28 sweep). The pipeline this
+    # replaces sent a failed read to `grep -q`, which found no active line and returned "there is
+    # nothing here to break" — so a host whose crontab could not be read was treated as a FRESH BOX
+    # and its database was migrated with the existing installation still serving. Guessing the
+    # other way is just as destructive: a first install would be stopped and fenced. So this
+    # refuses instead, before the run has changed anything at all.
+    read_crontab_for "${APP_USER}" || die \
+      "the ${APP_USER} crontab could not be read, so this run cannot tell an in-place upgrade from a first install: ${CRONTAB_READ_REASON}. Both answers act destructively on the wrong host — one migrates a live installation, the other stops and fences a box that has nothing on it — so NOTHING HAS BEEN CHANGED. Settle the read (crontab -u ${APP_USER} -l) and run this again."
+    if grep -qE '^[[:space:]]*[^#[:space:]]' <<< "${CRONTAB_READ_TEXT}"; then
       return 0
     fi
   fi
@@ -4554,15 +4640,24 @@ remove_reboot_fence() {
 # immediately. Every failure path removes the temporary file, or the file it had just
 # published, and returns non-zero: a failed publish leaves nothing at ${CRON_BACKUP}.
 publish_cron_backup() {
-  local content="$1" tmp
+  local content="$1" tmp readback mode
   mkdir -p "$(dirname "${CRON_BACKUP}")" || return 1
   tmp="$(mktemp "${CRON_BACKUP}.XXXXXX" 2>/dev/null)" || return 1
   if ! printf '%s\n' "${content}" > "${tmp}" 2>/dev/null; then rm -f "${tmp}"; return 1; fi
   if ! chmod 600 "${tmp}" 2>/dev/null; then rm -f "${tmp}"; return 1; fi
   # The whole content, read back off the filesystem. `$(cat ...)` and the value written both
   # lose their trailing newlines, so this compares every byte that matters.
-  if [[ "$(cat "${tmp}" 2>/dev/null)" != "${content}" ]]; then rm -f "${tmp}"; return 1; fi
-  if [[ "$(stat -c '%a' "${tmp}" 2>/dev/null)" != "600" ]]; then rm -f "${tmp}"; return 1; fi
+  # THE READ-BACK TAKES ITS OWN STATUS (o3d-p9dq, Codex r31 sweep). This was
+  # `if [[ "$(cat …)" != "${content}" ]]`, and a `cat` that could not run yields the empty string
+  # — which is INDISTINGUISHABLE from the read-back of a backup whose content is legitimately
+  # empty, because a crontab may genuinely have nothing in it. In that one case the verification
+  # passed without having verified anything, and the run went on to fence the crontab trusting a
+  # backup it had not read. Same shape as the planner's, and the same answer: the status first,
+  # the comparison second.
+  readback="$(cat "${tmp}" 2>/dev/null)" || { rm -f "${tmp}"; return 1; }
+  if [[ "${readback}" != "${content}" ]]; then rm -f "${tmp}"; return 1; fi
+  mode="$(stat -c '%a' "${tmp}" 2>/dev/null)" || { rm -f "${tmp}"; return 1; }
+  if [[ "${mode}" != "600" ]]; then rm -f "${tmp}"; return 1; fi
   # DURABLE, NOT MERELY VISIBLE (o3d-2sm1.5, Codex r9 HIGH). The read-back above proves the
   # bytes can be SEEN, and the page cache will happily satisfy it from memory. A power loss
   # after the crontab has been fenced would then reboot with this backup missing or
@@ -4577,7 +4672,12 @@ publish_cron_backup() {
   # IMMEDIATELY: from here the file is authoritative and must be owned by this run in the
   # same breath, or the unwind disowns a backup it is the only one able to restore.
   CRON_BACKUP_CREATED=true
-  if [[ "$(cat "${CRON_BACKUP}" 2>/dev/null)" != "${content}" ]]; then
+  readback="$(cat "${CRON_BACKUP}" 2>/dev/null)" || {
+    rm -f "${CRON_BACKUP}"
+    CRON_BACKUP_CREATED=false
+    return 1
+  }
+  if [[ "${readback}" != "${content}" ]]; then
     rm -f "${CRON_BACKUP}"
     CRON_BACKUP_CREATED=false
     return 1
@@ -4585,11 +4685,52 @@ publish_cron_backup() {
   return 0
 }
 
+# FENCE THE CRON WRITERS. Called ONLY where nothing is serving — after `systemctl stop`, after
+# `stop_legacy_launchers`, and after the port has been proved free — and it still takes the lock.
+#
+# BOTH, BECAUSE THEY COVER DIFFERENT SETS (o3d-p9dq, Codex r26 HIGH). The DRAIN is what excludes a
+# PREDECESSOR build: on the first rollout of this protocol the process that was serving this box
+# was built before the flock existed, so no lock this script takes can reach its reconciliation.
+# Only its being stopped can. The LOCK is what excludes every writer that comes later — a
+# reconciliation from a process running THIS build, and the other two entrypoints — and it is what
+# makes the snapshot and the replacement below one critical section rather than two, which is the
+# interleaving the finding was about: a reconciliation that commits between `crontab -l` and
+# `crontab -` is discarded by a backup taken before it, and restored over later.
 fence_cron() {
-  command -v crontab >/dev/null 2>&1 || return 0
+  # A MISSING `crontab` IS NOT "NO CRON WRITERS TO FENCE" (o3d-p9dq, Codex r29 HIGH #2). This line
+  # used to return success on `command -v crontab` failing, and the run then took the database
+  # fence and ran the migration with whatever the spool holds still scheduled. The client binary is
+  # an editor; the daemon reads the spool directly and keeps the loaded schedule in memory, so
+  # removing `crontab(1)` unschedules nothing. require_crontab_command() either finds the binary,
+  # PROVES there is no per-user schedule and no daemon that could be holding one, or refuses — and
+  # what its proof rests on, and how it can be wrong, is stated where it is defined.
+  local crc=0
+  require_crontab_command "${APP_USER}" || crc=$?
+  if [[ "${crc}" -eq 1 ]]; then
+    die "The cron writers could not be fenced: ${CRONTAB_COMMAND_REASON}. A schedule this run cannot rule out is a schedule that can fire into a moving schema, which is the writer class this fence exists to stop. NOTHING HAS BEEN MIGRATED."
+  fi
+  if [[ "${crc}" -eq 2 ]]; then
+    info "\`crontab\` is not installed, and ${APP_USER} has no spooled schedule and no cron daemon that could run one; nothing to fence."
+    return 0
+  fi
+  local rc=0
+  with_crontab_lock fence_cron_locked || rc=$?
+  [[ "${rc}" -eq 0 ]] || die \
+    "The ${APP_USER} crontab could not be fenced$(if [[ "${rc}" -eq "${CRONTAB_LOCK_CONFLICT}" ]]; then printf ' because another process held %s for %ss — the application is reconciling the crontab, or a process is wedged holding that lock' "${CRONTAB_LOCK_FILE}" "${CRONTAB_LOCK_WAIT_SECONDS}"; fi)${CRON_FENCE_REASON:+: ${CRON_FENCE_REASON}}. The crontab was NOT replaced and the original schedule is still whatever it was. Fencing it without that lock is the defect this protocol exists to prevent: a reconciliation committing between the snapshot and the replacement would be silently discarded. NOTHING HAS BEEN MIGRATED."
+}
+
+fence_cron_locked() {
   local current active
-  current="$(crontab -u "${APP_USER}" -l 2>/dev/null || true)"
-  [[ -n "${current}" ]] || { info "No crontab for ${APP_USER}; nothing to fence."; return 0; }
+  # FAIL CLOSED, BEFORE THE DATABASE FENCE AND THE MIGRATION (o3d-p9dq, Codex r28 HIGH #2).
+  # This is the read the whole-crontab fence rests on. `2>/dev/null || true` used to turn a
+  # permission, spool or I/O failure into an empty string, which the line below read as "no
+  # crontab" — and the run then walked on into the connection fence and the migration believing
+  # it had disarmed cron, with every existing entry still scheduled. read_crontab_for() resolves
+  # an absence only from the diagnostic that states one; everything else stops the run here.
+  read_crontab_for "${APP_USER}" || die \
+    "The ${APP_USER} crontab could not be READ, so the cron writers cannot be fenced: ${CRONTAB_READ_REASON}. A crontab this run cannot read is not a crontab with nothing in it — taking the database fence and running the migration on that reading would leave every existing cron entry scheduled over a moving schema, which is the writer class this fence exists to stop. NOTHING HAS BEEN MIGRATED."
+  current="${CRONTAB_READ_TEXT}"
+  if ! ${CRONTAB_READ_PRESENT} || [[ -z "${current}" ]]; then info "No crontab for ${APP_USER}; nothing to fence."; return 0; fi
   active="$(printf '%s\n' "${current}" | grep -cE '^[[:space:]]*[^#[:space:]]' || true)"
   if [[ "${active}" -eq 0 ]]; then
     CRON_FENCED=true
@@ -4601,22 +4742,107 @@ fence_cron() {
     # THIS run's backup, so the arming unwind may restore from it and delete it — and it is
     # only ever at that path once it is complete, verified and owned.
     publish_cron_backup "${current}" || die \
-      "The ${APP_USER} crontab could not be backed up to ${CRON_BACKUP}, so this run will not fence the cron writers: a fence whose backup cannot be verified is a crontab nobody can put back. Nothing was left behind at ${CRON_BACKUP}. Nothing has been stopped and nothing has been migrated."
+      "The ${APP_USER} crontab could not be backed up to ${CRON_BACKUP}, so this run will not fence the cron writers: a fence whose backup cannot be verified is a crontab nobody can put back. Nothing was left behind at ${CRON_BACKUP}. The service IS STOPPED at this point — the fence is taken after the drain, so that no predecessor can write the crontab between the snapshot and the replacement — and NOTHING HAS BEEN MIGRATED. The trap below re-fences and says how to recover."
   fi
-  printf '%s\n' "${current}" \
-    | awk '{ if ($0 ~ /^[[:space:]]*[^#[:space:]]/) print "#DEPLOY-FENCE# " $0; else print $0 }' \
-    | crontab -u "${APP_USER}" -
+  # THROUGH THE SHARED PROJECTION, not a fourth copy of the awk. plan_crontab_unfence() decides
+  # whether the snapshot is still current by re-running THIS transform over the backup and
+  # comparing; a re-typed copy here would let the two drift and make that comparison meaningless.
+  local fenced
+  fenced="$(crontab_fence_projection "${current}")" || {
+    CRON_FENCE_REASON="the fence projection of the ${APP_USER} crontab could not be computed, so there is nothing this run is willing to install in its place"
+    return 1
+  }
+  # THE WRITE IS CHECKED, AND CRON_FENCED IS RAISED ONLY AFTER IT IS CONFIRMED
+  # (o3d-p9dq, Codex r30 CRITICAL). This was a bare `printf | crontab -` followed by
+  # `CRON_FENCED=true`, on the belief that `set -e` covered it. It did not: `with_crontab_lock`
+  # calls this body as `"$@" || rc=$?`, and a command on the LEFT of `||` runs with errexit
+  # suspended for its WHOLE DYNAMIC EXTENT — every line in here included. A rejected write
+  # therefore recorded the crontab as fenced, printed success, returned 0, and the run took the
+  # database fence and migrated with the original schedule still live. Both halves matter: the
+  # status is taken, and it is taken BEFORE the flag and BEFORE the success line.
+  write_crontab_for "${APP_USER}" "${fenced}" || {
+    CRON_FENCE_REASON="${CRONTAB_WRITE_REASON}"
+    return 1
+  }
   CRON_FENCED=true
   success "Cron writers fenced."
 }
 
+# UNFENCE. Unlike the fence, this runs while the application IS SERVING — section 12 started it and
+# section 12b proved it is this build — so DRAINING covers nothing here and the lock is the only
+# exclusion there is. It is sufficient, and for a reason the fence cannot rely on: the process that
+# can race this one was built by THIS run, so it participates in this protocol by construction
+# (lib/crontab-reconcile-lock.ts resolves the same inode from $STATE_DIRECTORY).
 unfence_cron() {
   ${CRON_FENCED} || return 0
   [[ -f "${CRON_BACKUP}" ]] || return 0
-  crontab -u "${APP_USER}" "${CRON_BACKUP}"
+  local rc=0
+  with_crontab_lock unfence_cron_locked || rc=$?
+  [[ "${rc}" -ne "${CRONTAB_WRITE_FAILED}" ]] || die \
+    "The ${APP_USER} crontab is still FENCED (every line commented out) because the restoring write was REJECTED: ${CRON_UNFENCE_REASON}. Nothing was installed, the backup at ${CRON_BACKUP} was NOT deleted, and this run has changed nothing else. The application is up and the migration is complete; settle the cause and put the schedule back by hand:  crontab -u ${APP_USER} ${CRON_BACKUP}"
+  [[ "${rc}" -ne "${CRONTAB_COMPUTE_FAILED}" ]] || die \
+    "The ${APP_USER} crontab is still FENCED (every line commented out) because this run could not COMPUTE what to put back: ${CRON_UNFENCE_REASON}. Nothing was installed and the backup at ${CRON_BACKUP} was NOT deleted. This is NOT a divergence — there are no two candidates to compare, and no schedule has been rewritten; a tool this protocol depends on did not run. Settle that, then put the schedule back by hand:  crontab -u ${APP_USER} ${CRON_BACKUP}"
+  [[ "${rc}" -ne "${CRONTAB_UNFENCE_DIVERGED}" ]] || die \
+    "The ${APP_USER} crontab is still FENCED (every line commented out) and this run will not decide what belongs in it: ${CRON_UNFENCE_REASON}. Neither candidate is safe to install without a human — the backup at ${CRON_BACKUP} would discard whatever rewrote the crontab, and undoing the fence in place would discard the lines listed above. Compare the two (crontab -u ${APP_USER} -l, against ${CRON_BACKUP}) and install the union by hand."
+  [[ "${rc}" -eq 0 ]] || die \
+    "The ${APP_USER} crontab is still FENCED (every line commented out) because this run could not take ${CRONTAB_LOCK_FILE}$(if [[ "${rc}" -eq "${CRONTAB_LOCK_CONFLICT}" ]]; then printf ' within %ss' "${CRONTAB_LOCK_WAIT_SECONDS}"; fi). The application is up and the migration is complete; put the schedule back by hand once nothing is reconciling:  crontab -u ${APP_USER} ${CRON_BACKUP}"
+}
+
+# NOT A BLIND RESTORE, AND THIS IS THE SITE THE FINDING NAMED (o3d-p9dq, Codex r27 HIGH #1).
+#
+# The new service accepted traffic several sections ago. Between that moment and this one an
+# operator can save a schedule: the application takes the SAME lock, writes its managed block into
+# the fenced crontab, releases, and reports success — correctly, because the settings row is
+# committed. This function then takes the lock in its turn and, until now, installed a snapshot
+# taken before the cutover over the top of it. Perfectly ordered. Completely wrong. The database
+# and the UI went on saying the job was enabled and nothing was scheduled to run it.
+#
+# The lock cannot fix that, because nothing here is out of order. What fixes it is not restoring a
+# snapshot whose world has moved: plan_crontab_unfence() proves the live crontab is still the
+# fence's own projection of the backup before it uses the backup at all, and otherwise undoes the
+# fence WHERE IT WAS APPLIED — which keeps the block the reconciliation projected from the settings
+# rows, the durable record the crontab is only a projection of.
+unfence_cron_locked() {
+  local current backup
+  # AND THE READ ITSELF FAILS CLOSED (o3d-p9dq, Codex r28 HIGH #1). An unreadable crontab used to
+  # arrive here as the empty string, which holds nothing the backup does not — so the plan restored
+  # the pre-cutover snapshot over whatever was really there.
+  read_crontab_for "${APP_USER}" || {
+    CRON_UNFENCE_REASON="the live crontab could not be read, so nothing can establish what is in it and a snapshot installed on that reading would discard whatever is: ${CRONTAB_READ_REASON}"
+    return "${CRONTAB_UNFENCE_DIVERGED}"
+  }
+  current="${CRONTAB_READ_TEXT}"
+  if ! backup="$(cat "${CRON_BACKUP}" 2>/dev/null)"; then
+    CRON_UNFENCE_REASON="the backup at ${CRON_BACKUP} could not be read"
+    return "${CRONTAB_UNFENCE_DIVERGED}"
+  fi
+  # A COMPUTATION THAT COULD NOT BE MADE IS NOT A DIVERGENCE (o3d-p9dq, Codex r31 CRITICAL).
+  # Both refuse, both keep the backup and both leave the crontab fenced — but they send the
+  # operator to different places, and one of them is the wrong place. A divergence says "compare
+  # these two crontabs and install the union"; a failed computation says "a tool this protocol
+  # depends on did not run", and there is no union to compare. The status is forwarded rather
+  # than folded into the one the caller already knew about.
+  local plan_rc=0
+  plan_crontab_unfence "${backup}" "${current}" || plan_rc=$?
+  [[ "${plan_rc}" -ne "${CRONTAB_COMPUTE_FAILED}" ]] || return "${CRONTAB_COMPUTE_FAILED}"
+  [[ "${plan_rc}" -eq 0 ]] || return "${CRONTAB_UNFENCE_DIVERGED}"
+  # THE ORDER IS THE FIX, NOT THE CHECK ALONE (o3d-p9dq, Codex r30 CRITICAL). The mirror of the
+  # fence, and the worse half: a rejected write here used to be followed by `rm -f "${CRON_BACKUP}"`
+  # — deleting the ONLY copy of the operator's schedule — and by `CRON_FENCED=false`, which tells
+  # the unwind there is nothing to put back. The crontab stayed fenced and the run reported it
+  # restored. So the write is checked first and returns ${CRONTAB_WRITE_FAILED}; the backup is not
+  # touched, the flag is not cleared, and the caller prints the by-hand command.
+  write_crontab_for "${APP_USER}" "${CRON_UNFENCE_TEXT}" || {
+    CRON_UNFENCE_REASON="${CRONTAB_WRITE_REASON}"
+    return "${CRONTAB_WRITE_FAILED}"
+  }
   rm -f "${CRON_BACKUP}"
   CRON_FENCED=false
-  success "Cron writers restored verbatim."
+  if [[ "${CRON_UNFENCE_PLAN}" == "merge" ]]; then
+    warn "Cron writers restored, and ${CRON_UNFENCE_REASON}."
+  else
+    success "Cron writers restored verbatim."
+  fi
 }
 
 # --- adopting somebody else's marker ---------------------------------------
@@ -4648,6 +4874,15 @@ marker_phase() {
 }
 
 RESUME_EVIDENCE=""
+# Why an interrupted arming's crontab could NOT be put back, when the reason is a diverged crontab
+# rather than a lock. Empty means the lock, which is what the message defaults to saying.
+RESUME_CRON_DIVERGED=""
+# NOT THE SAME SHAPE AS THE DRAIN, THOUGH IT LOOKS LIKE IT (o3d-p9dq, Codex r27 HIGH #3). A
+# missing `ss` here makes this answer "no", and "no" sends the run down the ORDINARY adoption
+# path, which stops the service and re-fences. That is the conservative direction: the failure
+# mode of not knowing is that something gets stopped, not that a migration proceeds over a live
+# writer. The drain proof below is the opposite way round, which is why it is fatal there and
+# fail-safe here.
 # IS THE EXISTING INSTALLATION STILL UP? Asked only to decide whether an interrupted ARMING
 # can be resumed, and answered conservatively: a unit systemd reports active, or anything
 # listening on the app's port, counts as "still serving". A `false` sends the run down the
@@ -4677,13 +4912,75 @@ predecessor_is_active() {
 # Order matters: the crontab is restored FIRST and a failure there is fatal BEFORE the fence
 # comes down, so a run that cannot finish the unwind leaves the marker exactly as it found it
 # and the next run adopts the same phase again.
+# A BACKUP IS ONLY SAFE TO INSTALL BLINDLY IF THE WORLD STILL MATCHES WHAT IT WAS TAKEN FROM
+# (o3d-p9dq, Codex r27 HIGH #2).
+#
+# This is the ONE path where the predecessor was never stopped and never held this lock — it is
+# reached only for a marker written by a script older than this protocol — so the divergence here
+# is not bounded by a deploy window at all: the interrupted run's backup may be minutes or hours
+# old, and every schedule saved since then went into the LIVE crontab and into no backup. The lock
+# cannot protect history made by a process that never joined it.
+#
+# So the same comparison as unfence_cron_locked, through the same helper — but the policy on a
+# mismatch is REFUSE rather than merge, and the difference is deliberate. At unfence the window is
+# ours, everything that could have written it holds this lock and writes the projection of the
+# settings rows, so the merge is provably what the database says. Here it is not: an unattributable
+# write over an unbounded interval could be the application's reconciliation or an operator's
+# `crontab -e`, and nothing on this box can tell them apart. Nothing has been stopped at this point
+# and nothing has been migrated, so a refusal costs a re-run and loses nothing — which is the
+# cheapest thing in the room.
+resume_restore_cron_locked() {
+  local current backup
+  RESUME_CRON_DIVERGED=""
+  read_crontab_for "${APP_USER}" || {
+    RESUME_CRON_DIVERGED="the live crontab could not be read, so nothing can establish that the interrupted run's snapshot is still current: ${CRONTAB_READ_REASON}"
+    return 1
+  }
+  current="${CRONTAB_READ_TEXT}"
+  backup="$(cat "${CRON_BACKUP}" 2>/dev/null)" || return 1
+  # THE COMPARISON HAS THREE ANSWERS NOW (o3d-p9dq, Codex r31 CRITICAL), and reading the third
+  # one as the second would blame an operator write that never happened. Both refuse and both keep
+  # the backup; only the message differs, and the message is the entire product of this branch.
+  local unmoved=0
+  crontab_is_unmoved_since_backup "${backup}" "${current}" || unmoved=$?
+  if [[ "${unmoved}" -eq "${CRONTAB_COMPUTE_FAILED}" ]]; then
+    RESUME_CRON_DIVERGED="the comparison that decides whether ${CRON_BACKUP} is still current could not be MADE, so nothing has established that installing it would discard nothing — this is not a write somebody made, it is a check that did not run: ${CRON_UNMOVED_REASON}"
+    return 1
+  fi
+  if [[ "${unmoved}" -ne 0 ]]; then
+    RESUME_CRON_DIVERGED="the live crontab is not the fence's own projection of ${CRON_BACKUP}, so something has written it since the interrupted run took that snapshot — installing the snapshot would discard that write, or put back an entry somebody deliberately deleted"
+    return 1
+  fi
+  write_crontab_for "${APP_USER}" "${backup}" || {
+    RESUME_CRON_DIVERGED="the interrupted run's snapshot could not be installed: ${CRONTAB_WRITE_REASON}"
+    return 1
+  }
+  rm -f "${CRON_BACKUP}"
+  CRON_FENCED=false
+  success "The ${APP_USER} crontab is back exactly as the interrupted run found it."
+  return 0
+}
+
 resume_from_interrupted_arming() {
-  if command -v crontab >/dev/null 2>&1 && [[ -f "${CRON_BACKUP}" ]]; then
-    crontab -u "${APP_USER}" "${CRON_BACKUP}" || die \
-      "The interrupted run had fenced the ${APP_USER} crontab and its backup at ${CRON_BACKUP} could not be restored. Refusing to continue with the cron writers commented out: restore it by hand (crontab -u ${APP_USER} ${CRON_BACKUP}) and re-run. Nothing has been stopped."
-    rm -f "${CRON_BACKUP}"
-    CRON_FENCED=false
-    success "The ${APP_USER} crontab is back exactly as the interrupted run found it."
+  # THE ONE SITE WHERE THE LOCK IS THE ONLY THING AVAILABLE AND IS NOT SUFFICIENT ON ITS OWN, said
+  # plainly (o3d-p9dq). This path exists precisely because the predecessor is STILL SERVING and must
+  # not be stopped, so draining is not on the table; and a crontab backup can only be here if a
+  # PREVIOUS run fenced it, which — on the rollout that introduces this protocol — was a run of a
+  # script whose fence happened before the stop and whose predecessor did not take this lock. From
+  # the next rollout on, the serving process participates and the lock is complete. The residual is
+  # bounded by that one transition, and it is smaller than what it replaces: since o3d-p9dq the
+  # cutover fence happens AFTER the stop, so an interrupted ARMING no longer leaves a fenced crontab
+  # at all and this branch only fires for a marker written by an older script.
+  # AN UNRESTORABLE FENCE IS NOT AN ABSENT ONE (o3d-p9dq, Codex r29 HIGH #2). The `command -v
+  # crontab &&` that used to open this test made a missing client silently skip the restore, and
+  # the run then continued with the interrupted run's fence still standing over the cron writers.
+  # The backup file is the evidence; the missing tool is the reason it cannot be acted on.
+  if [[ -f "${CRON_BACKUP}" ]] && ! command -v crontab >/dev/null 2>&1; then
+    die "The interrupted run had fenced the ${APP_USER} crontab and its backup is at ${CRON_BACKUP}, but \`crontab\` is not installed on this host, so it cannot be put back. Refusing to continue with the cron writers commented out: restore it by hand once the client is available and re-run. Nothing has been stopped."
+  fi
+  if [[ -f "${CRON_BACKUP}" ]]; then
+    with_crontab_lock resume_restore_cron_locked || die \
+      "The interrupted run had fenced the ${APP_USER} crontab and its backup at ${CRON_BACKUP} could not be restored under ${CRONTAB_LOCK_FILE}.${RESUME_CRON_DIVERGED:+ THE REASON IS NOT THE LOCK: }${RESUME_CRON_DIVERGED} Refusing to continue with the cron writers commented out: settle it by hand (compare ${CRON_BACKUP} against crontab -u ${APP_USER} -l) and re-run. Nothing has been stopped."
   fi
   release_db_connections || die \
     "A connection fence was standing over an UNTOUCHED schema and could not be released. Fix that before re-running; nothing has been stopped."
@@ -5108,10 +5405,45 @@ adopt_existing_fence() {
 # halfway through rewriting it — would otherwise restore nothing. An ADOPTED backup is left
 # alone: it belongs to a previous run's fence, which is still standing.
 restore_cron_from_backup() {
-  command -v crontab >/dev/null 2>&1 || return 0
   ${CRON_BACKUP_CREATED} || return 0
+  # THE BINARY CHECK MOVED BELOW THE BACKUP CHECK, AND STOPPED REPORTING SUCCESS (o3d-p9dq, Codex
+  # r29 HIGH #2). `command -v crontab || return 0` was the FIRST line here, so a run that had
+  # fenced the crontab and then lost the client mid-run reported the unwind as complete with the
+  # cron writers still commented out. Nothing this function could return would make that true; the
+  # only honest answer is the failure that makes the caller print the by-hand command.
+  if ! command -v crontab >/dev/null 2>&1; then
+    return 1
+  fi
   [[ -f "${CRON_BACKUP}" ]] || return 1
-  crontab -u "${APP_USER}" "${CRON_BACKUP}" || return 1
+  # UNDER THE LOCK, because this one can run while something is serving: the pre-stop branch of the
+  # trap calls it through unwind_arming() with the predecessor untouched. A conflict is a FAILURE
+  # here rather than a skip — the caller prints the by-hand command — because a silent skip leaves
+  # a fenced crontab behind while reporting that everything was undone.
+  with_crontab_lock restore_cron_from_backup_locked || return 1
+  return 0
+}
+
+# THE SAME BLIND RESTORE, ON THE UNWIND PATH (o3d-p9dq, Codex r27 HIGH #1, "deploy and update
+# contain the same blind restore"). This one runs from the exit trap, where something may well be
+# serving — so it is routed through the identical plan rather than being the one restore that
+# still overwrites a committed save. A divergence it cannot merge is reported as a failure and the
+# caller prints the by-hand command, which is what it already did for a lock it could not take.
+restore_cron_from_backup_locked() {
+  local current backup
+  read_crontab_for "${APP_USER}" || {
+    warn "The ${APP_USER} crontab could not be read, so it will not be restored from ${CRON_BACKUP}: ${CRONTAB_READ_REASON}"
+    return 1
+  }
+  current="${CRONTAB_READ_TEXT}"
+  backup="$(cat "${CRON_BACKUP}" 2>/dev/null)" || return 1
+  plan_crontab_unfence "${backup}" "${current}" || {
+    warn "The ${APP_USER} crontab will not be restored from ${CRON_BACKUP}: ${CRON_UNFENCE_REASON}"
+    return 1
+  }
+  write_crontab_for "${APP_USER}" "${CRON_UNFENCE_TEXT}" || {
+    warn "The ${APP_USER} crontab could not be restored from ${CRON_BACKUP}: ${CRONTAB_WRITE_REASON}"
+    return 1
+  }
   rm -f "${CRON_BACKUP}"
   CRON_FENCED=false
   CRON_BACKUP_CREATED=false
@@ -5886,7 +6218,8 @@ apt-get install -y -qq \
   fail2ban \
   unattended-upgrades apt-listchanges \
   openssl \
-  logrotate
+  logrotate \
+  util-linux
 
 success "Base packages installed."
 
@@ -6135,8 +6468,26 @@ migrate_uploads "${APP_DIR}/uploads/quarantine/invoices" "${UPLOAD_STORAGE_DIR}/
 migrate_uploads "${APP_DIR}/public/uploads/branding" "${PUBLIC_UPLOAD_STORAGE_DIR}/branding"
 migrate_uploads "${APP_DIR}/public/uploads/avatars" "${PUBLIC_UPLOAD_STORAGE_DIR}/avatars"
 
-chown -R "${APP_USER}:${APP_USER}" "${DATA_DIR}" "${LOG_DIR}"
+# The crontab lock directory below is deliberately NOT handed to the service user, so it is pruned
+# out of this recursive chown rather than being taken back and re-taken on every re-run (which would
+# open a window in which the service user could plant a symlink inside it). `-exec chown -h` also
+# means a symlink anywhere under ${DATA_DIR} has its own ownership changed rather than its target's.
+find "${DATA_DIR}" -path "${CRONTAB_LOCK_DIR}" -prune -o -exec chown -h "${APP_USER}:${APP_USER}" {} +
+chown -R "${APP_USER}:${APP_USER}" "${LOG_DIR}"
 chown -R "${APP_USER}:${APP_USER}" "${UPLOAD_STORAGE_DIR}" "${PUBLIC_UPLOAD_STORAGE_DIR}"
+
+# THE CRONTAB RECONCILIATION LOCK, prepared here and defined in scripts/lib/crontab-lock.sh.
+#
+# Root-owned file inside a root-owned directory inside the service's StateDirectory, created with
+# primitives that cannot follow a symlink (Codex r24 CRITICAL). It moved into the library in
+# o3d-p9dq: deploy.sh and update.sh need the identical preparation, because they now take the
+# identical lock, and a rule about a root-side write into a directory the service user owns cannot
+# be restated in three scripts and stay one rule.
+#
+# BEFORE THE SERVICE IS EVER STARTED, and before anything in this run touches the crontab: the
+# adoption path in section 10a fences and unfences the crontab, and it must find the lock already
+# there.
+prepare_crontab_lock
 
 success "Directories created."
 
@@ -6569,7 +6920,24 @@ if ${UPGRADE_EXISTING}; then
   install_reboot_fence "install.sh cutover started $(date -Iseconds)" \
     || die "Refusing to stop the existing service without a verified reboot fence: a reboot mid-migration would start it again against a migrated schema."
 
-  fence_cron
+  # THE CRON FENCE USED TO BE HERE, AND THAT WAS THE RACE (o3d-p9dq, Codex r26 HIGH).
+  #
+  # `fence_cron` snapshots the crontab, backs the snapshot up verbatim and replaces the crontab
+  # with a commented-out copy. Run at this point, the predecessor is still serving and six server
+  # actions can start a reconciliation from a browser at any moment — so a schedule an operator
+  # saved between the snapshot and the replacement was written into a crontab this run was about
+  # to overwrite, and the verbatim backup restored later did not contain it. The database and the
+  # UI went on reporting the job enabled and nothing was scheduled to run it.
+  #
+  # AND ADDING THE FLOCK HERE WOULD NOT HAVE CLOSED IT. On the rollout that introduces the lock the
+  # predecessor was built before the lock existed: it excludes itself with a PostgreSQL advisory
+  # lock, or with nothing, and an flock taken here would have serialized this script against no
+  # one. The exclusion that reaches a process built before this protocol is that it is not running.
+  #
+  # So the fence has moved below the stop, the legacy-launcher sweep and the port drain — see
+  # "Fencing the cron writers" further down. What stays here is the REBOOT fence, which must be
+  # installed before anything is stopped because a fence installed on the way out does not exist
+  # for a run that is killed.
 
   # PHASE `stopping`: from the next statement on, something has been asked to stop and
   # nothing may start it again. Every failure before this point takes the reversible branch
@@ -6587,16 +6955,31 @@ if ${UPGRADE_EXISTING}; then
   # window (o3d-2sm1.4, Codex r3 HIGH).
   stop_legacy_launchers
 
-  if command -v ss >/dev/null 2>&1; then
-    for _ in $(seq 1 15); do
-      ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${APP_PORT}\$" || break
-      sleep 1
-    done
-    if ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${APP_PORT}\$"; then
-      die "Port ${APP_PORT} is still bound. Something is still serving — refusing to migrate."
-    fi
-  fi
+  # AND THE DRAIN IS PROVED, NOT ATTEMPTED (o3d-p9dq, Codex r27 HIGH #3). This block used to run
+  # only `if command -v ss` and fall straight through to the fence when it did not — a missing tool
+  # read as a proof of absence, at the one proof the fence below now rests on. require_port_drained
+  # answers only from a census that actually ran; everything else is fatal here, BEFORE the crontab
+  # is fenced and long before anything is migrated.
+  require_port_drained "${APP_PORT:-}" || die \
+    "The drain could not be PROVED before fencing the cron writers and migrating: ${PORT_DRAIN_REASON}. Since the cron fence moved below the stop, \"nothing is serving\" is the premise it rests on — the exclusion that reaches a predecessor built before the shared lock is that it is not running, and no lock this script takes can substitute for it. Install iproute2, or stop whatever still holds the port, and re-run. NOTHING HAS BEEN MIGRATED."
   success "Nothing is serving ${APP_NAME} any more."
+
+  # ---------------------------------------------------------------------------
+  # AND ONLY NOW ARE THE CRON WRITERS FENCED (o3d-p9dq, Codex r26 HIGH).
+  #
+  # Nothing is serving: the unit is stopped, the legacy launchers are stopped and the port has just
+  # been proved free. That is what makes the snapshot below safe against a PREDECESSOR build, which
+  # no lock of ours can reach. `fence_cron` additionally holds the shared crontab flock across its
+  # own `crontab -l` and `crontab -`, which is what makes it safe against everything that comes
+  # after — a reconciliation from a process running this build, and the other two entrypoints.
+  #
+  # STILL BEFORE THE DRAIN-VERIFY BELOW: a cron tick that opens a database connection is exactly
+  # what `check-db-writers.mjs` is about to refuse, so the writers are commented out first and the
+  # probe then asks whether the room is empty.
+  # ---------------------------------------------------------------------------
+  CUTOVER_STEP="fence-cron"
+  header "Fencing the cron writers"
+  fence_cron
 
   CUTOVER_STEP="drain-verify"
   # The FENCE shuts the door for the rest of the window; only then does the PROBE
@@ -6743,10 +7126,48 @@ ExecStart=${APP_DIR}/node_modules/.bin/next start -p ${APP_PORT}
 Restart=always
 RestartSec=5
 
+# systemd creates/owns /var/lib/${APP_NAME} for ${APP_USER} and exports its absolute path to the
+# service as \$STATE_DIRECTORY. That export is the ONLY thing that makes the application and this
+# installer lock the same crontab file (see the crontab section below): the app reads
+# \$STATE_DIRECTORY, this script writes \${DATA_DIR}, and StateDirectory=${APP_NAME} is what makes
+# those the same directory. It is also what survives ProtectSystem=strict in the hardened unit at
+# deploy/systemd/ims-stage.service, which a lock file in \${APP_DIR} does not.
+StateDirectory=${APP_NAME}
+StateDirectoryMode=0750
+
 [Install]
 WantedBy=multi-user.target
 EOF
 
+# ---------------------------------------------------------------------------
+# THE `systemctl restart` THIS BRANCH ADDED IS GONE, AND ITS INVARIANT IS NOT (merge of
+# o3d-batch-ret r25 into o3d-2sm1.5).
+#
+# r25 replaced `systemctl enable --now` with `enable` + `restart` because `--now`'s `start` is a
+# no-op on an already-running unit, so an upgrade left the PREVIOUS process serving — and
+# therefore locking a different crontab file, or none, which makes the flock in section 16
+# serialise this script against nothing.
+#
+# THAT DEFECT DOES NOT EXIST IN THE STRUCTURE BELOW, and re-adding the restart would be a
+# regression rather than a fix. On every path where anything is running, `upgrade_in_place`
+# returns true (it returns true merely on the unit FILE existing), so `UPGRADE_EXISTING` is true,
+# so section 10c has already `systemctl stop`ped the unit, stopped the legacy launchers and
+# refused to continue while ${APP_PORT} was still bound. `start` below therefore acts on a stopped
+# unit, exactly as `restart` would, and a `restart` here would additionally bounce a process that
+# section 12b is about to health-check.
+#
+# WHAT IS KEPT IS THE INVARIANT, WHICH WAS NEVER "we called restart": it is that the process which
+# will contend for the crontab lock is the one this run just built. This structure proves that
+# STRICTLY BETTER than r25's `systemctl is-active` did — section 12b fetches
+# /_next/static/<BUILD_ID>/ and dies unless the process on the port identifies itself as this
+# build, which is the one thing `is-active` could not tell you and the exact case (a predecessor
+# still holding the port) that made the check worth having. So the flag is set from THAT proof,
+# below, and section 16 still refuses to open the lock without it.
+#
+# It is also renamed, from APP_SERVICE_RESTARTED to APP_SERVICE_ON_NEW_BUILD, because nothing here
+# restarts anything any more and a flag whose name describes a command that is not in the file is
+# how the next reader reintroduces the command.
+# ---------------------------------------------------------------------------
 # BIND THE SERVICE TO THE DATABASE THIS RUN MIGRATED, BEFORE THE RELOAD THAT LOADS THE UNIT
 # (o3d-2sm1.5 r23, Codex HIGH). The unit above loads ${APP_DIR}/.env with a leading `-`, and
 # systemd does not read it until it EXECS — at the far end of a window that has held a git
@@ -6890,15 +7311,181 @@ else
   die "Something answered ${INSTALL_HEALTH_URL}, but nothing proved it was BUILD_ID ${NEW_BUILD_ID}. A predecessor still holding port ${APP_PORT} answers that route too, and the schema has already moved. Refusing to declare the installation irreversible on the strength of an open port."
 fi
 
+# ---------------------------------------------------------------------------
+# ...AND IS THAT PROCESS THE UNIT'S? (o3d-p9dq, Codex r26 HIGH)
+#
+# THE ASSET FETCH ABOVE PROVES A PROPERTY NEXT TO THE ONE THIS RUN NEEDS. A 200 on
+# /_next/static/<BUILD_ID>/ proves that whatever holds the port serves the tree this run just
+# built. It does not prove that process is systemd's. A same-build process started by hand out of
+# ${APP_DIR} — by an operator, by a stale PM2 entry, by a test harness — after the port was drained
+# can win the bind while `systemctl start` returns 0 for a unit that then fails to bind at all.
+# That process satisfies the fetch and satisfies nothing else, and the difference is not academic:
+# NOT BEING THE UNIT'S CHILD, IT HAS NO $STATE_DIRECTORY. lib/crontab-reconcile-lock.ts then falls
+# through to `path.join(process.cwd(), 'locks', '.crontab-reconcile.lock')` — a DIFFERENT INODE from
+# the ${CRONTAB_LOCK_FILE} section 16 locks — so the installer and the application would each hold
+# an exclusion against nobody and overwrite each other's managed block.
+#
+# So four facts are established, and the last one is the one that closes the loop because it asks
+# the PROCESS where its lock is rather than asking the installer:
+#
+#   1. systemd reports the unit ACTIVE, and gives a MainPID and a ControlGroup for it.
+#   2. Something is listening on :${APP_PORT}, and `ss` can name the pids that hold those sockets.
+#   3. Every one of those pids — and MainPID itself — is inside the unit's control group. A
+#      cgroup rather than a pid equality because a Next.js unit's listener is routinely a CHILD of
+#      the ExecStart process (`npm start` -> `next start` -> the server), and every one of those is
+#      in the unit's cgroup while only one of them is MainPID.
+#   4. The LISTENER's own effective STATE_DIRECTORY — read out of /proc/<pid>/environ, which is the
+#      only place a process's live environment can be read from — has ${DATA_DIR} as its first
+#      colon-separated element, which is exactly what crontabReconcileLockPath() joins onto.
+#
+# WHEN /proc/<pid>/environ CANNOT BE READ. It is mode 0400 owned by the process's real uid, and
+# this script has already refused to run as anything but root, so the only realistic failures are
+# the process having exited between the `ss` above and the read (ENOENT) and a /proc mounted with
+# hidepid= for a reader that is not root. Both are read as PROOF NOT ESTABLISHED and die: an
+# unreadable environment is precisely the case where the installer cannot tell the unit's process
+# from an impostor, so it must not arm anything. An environ that is readable but has no
+# STATE_DIRECTORY at all is the impostor case itself, and is named separately in the message.
+# ---------------------------------------------------------------------------
+
+# Exact match or a descendant: a unit with Delegate= puts its processes in sub-cgroups of its own.
+process_is_in_cgroup() {
+  local pid="$1" want="$2" line path
+  [[ -r "/proc/${pid}/cgroup" ]] || return 1
+  while IFS= read -r line; do
+    # cgroup v2: "0::/system.slice/x.service"   cgroup v1: "N:controller:/system.slice/x.service"
+    path="${line#*:}"
+    path="${path#*:}"
+    [[ "${path}" == "${want}" || "${path}" == "${want}/"* ]] && return 0
+  done < "/proc/${pid}/cgroup"
+  return 1
+}
+
+# The process's OWN view of its environment. Prints the raw STATE_DIRECTORY value (empty when the
+# process has none); returns non-zero only when the environment could not be read at all, so the
+# caller can tell "no such variable" from "no such answer".
+#
+# `awk` WITH A FLAG RATHER THAN `sed | head -1`. This script runs under `set -o pipefail`, and a
+# `head` that closes the pipe after the first line SIGPIPEs the writer behind it — which makes the
+# pipeline's status 141 on a large environment and 0 on a small one, i.e. an unreadable-environ
+# refusal that depends on how many variables the service happens to have. awk consumes the whole
+# stream and prints at most one line, so the status is the same either way.
+effective_state_directory() {
+  local pid="$1"
+  [[ -r "/proc/${pid}/environ" ]] || return 1
+  tr '\0' '\n' < "/proc/${pid}/environ" 2>/dev/null \
+    | awk 'found { next } /^STATE_DIRECTORY=/ { sub(/^STATE_DIRECTORY=/, ""); print; found = 1 }'
+}
+
+LISTENER_PROOF_REASON=""
+LISTENER_PIDS=""
+prove_listener_belongs_to_unit() {
+  local unit="${APP_NAME}.service" main_pid cgroup rows row_count unattributed pids pid state_dir first
+  LISTENER_PROOF_REASON=""
+  LISTENER_PIDS=""
+
+  command -v systemctl >/dev/null 2>&1 || {
+    LISTENER_PROOF_REASON="systemctl is not available on this host, so nothing can say which process systemd owns"
+    return 1
+  }
+  systemctl is-active --quiet "${unit}" 2>/dev/null || {
+    LISTENER_PROOF_REASON="systemd does not report ${unit} active, so the process on the port is not systemd's"
+    return 1
+  }
+  main_pid="$(systemctl show -p MainPID --value "${unit}" 2>/dev/null || true)"
+  [[ "${main_pid}" =~ ^[0-9]+$ ]] && [[ "${main_pid}" -gt 0 ]] || {
+    LISTENER_PROOF_REASON="systemd reports no MainPID for ${unit} (got '${main_pid}')"
+    return 1
+  }
+  cgroup="$(systemctl show -p ControlGroup --value "${unit}" 2>/dev/null || true)"
+  [[ -n "${cgroup}" && "${cgroup}" != "/" ]] || {
+    LISTENER_PROOF_REASON="systemd reports no control group for ${unit} (got '${cgroup}'), so this run cannot tell the unit's processes from anything else on the box"
+    return 1
+  }
+  process_is_in_cgroup "${main_pid}" "${cgroup}" || {
+    LISTENER_PROOF_REASON="${unit}'s own MainPID ${main_pid} is not in its control group ${cgroup} — systemd's answers do not agree with /proc, so neither can be used to identify the listener"
+    return 1
+  }
+
+  command -v ss >/dev/null 2>&1 || {
+    LISTENER_PROOF_REASON="\`ss\` is not available, so this run cannot find out which process holds the listening socket on :${APP_PORT}"
+    return 1
+  }
+  # EVERY ROW, AND A ROW WITHOUT A PID IS AN UNKNOWN HOLDER RATHER THAN AN ABSENT ONE. Taking the
+  # pids `ss` did attribute and ignoring the rows it could not is how "one of them is ours" passes
+  # for a question that is which process the fetch above actually reached — and with SO_REUSEPORT
+  # the kernel may hand a connection to the socket this run cannot name. update.sh's
+  # prove_service_owns_port already refuses on exactly this; the rule is the same one.
+  rows="$(ss -ltnp 2>/dev/null | awk -v p=":${APP_PORT}\$" '$4 ~ p')"
+  [[ -n "${rows}" ]] || {
+    LISTENER_PROOF_REASON="\`ss -ltnp\` reports no listening socket on :${APP_PORT} at all, so the process behind the response cannot be identified"
+    return 1
+  }
+  row_count="$(printf '%s\n' "${rows}" | wc -l)"
+  unattributed="$(printf '%s\n' "${rows}" | grep -cv 'pid=[0-9]' || true)"
+  [[ "${unattributed}" -eq 0 ]] || {
+    LISTENER_PROOF_REASON="\`ss -ltnp\` shows ${row_count} listening socket(s) on :${APP_PORT} and attributes ${unattributed} of them to no pid at all — an unattributable holder is an unknown and not an absent one, so the process behind the response cannot be identified"
+    return 1
+  }
+  pids="$(printf '%s\n' "${rows}" | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u | tr '\n' ' ')"
+  pids="${pids% }"
+  [[ -n "${pids}" ]] || {
+    LISTENER_PROOF_REASON="\`ss -ltnp\` shows ${row_count} listening socket(s) on :${APP_PORT} and no pid could be read out of any of them"
+    return 1
+  }
+
+  for pid in ${pids}; do
+    process_is_in_cgroup "${pid}" "${cgroup}" || {
+      LISTENER_PROOF_REASON="pid ${pid} holds a listening socket on :${APP_PORT} but is NOT in ${unit}'s control group ${cgroup} — it serves this build's tree without being this unit's process"
+      return 1
+    }
+    state_dir="$(effective_state_directory "${pid}")" || {
+      LISTENER_PROOF_REASON="/proc/${pid}/environ could not be read, so this run cannot establish where the process on :${APP_PORT} resolves its crontab lock. Either it exited while this check ran, or /proc is mounted with hidepid= for this reader"
+      return 1
+    }
+    [[ -n "${state_dir}" ]] || {
+      LISTENER_PROOF_REASON="pid ${pid} holds :${APP_PORT} with NO STATE_DIRECTORY in its environment, so it resolves its crontab lock under its own working directory instead of ${CRONTAB_LOCK_FILE}"
+      return 1
+    }
+    # The application takes the FIRST colon-separated entry (lib/crontab-reconcile-lock.ts,
+    # systemdStateDirectory), so that is the one compared — not "contains".
+    first="${state_dir%%:*}"
+    [[ "${first}" == "${DATA_DIR}" ]] || {
+      LISTENER_PROOF_REASON="pid ${pid} holds :${APP_PORT} with STATE_DIRECTORY='${state_dir}', whose first entry '${first}' is not ${DATA_DIR}, so it locks a different file from ${CRONTAB_LOCK_FILE}"
+      return 1
+    }
+  done
+
+  LISTENER_PIDS="${pids}"
+  return 0
+}
+
+APP_SERVICE_LISTENER_PROVED=false
+if prove_listener_belongs_to_unit; then
+  APP_SERVICE_LISTENER_PROVED=true
+  success "The listener(s) on :${APP_PORT} (${LISTENER_PIDS}) belong to ${APP_NAME}.service and resolve ${CRONTAB_LOCK_FILE}."
+else
+  die "The new build is answering on port ${APP_PORT}, but this run could NOT establish that the process serving it is ${APP_NAME}.service's own: ${LISTENER_PROOF_REASON}. That matters for one specific reason: the crontab lock this installer is about to take is only an exclusion against a process whose \$STATE_DIRECTORY is ${DATA_DIR}, and a listener that is not this unit's child has none. The migration applied and the service was started; fix the listener (stop whatever else holds :${APP_PORT}, check \`systemctl status ${APP_NAME}.service\`) and re-run, which adopts the state this run left."
+fi
+
 # THE POINT OF NO RETURN (o3d-2sm1.5, Codex r4 HIGH). The new build is serving and everything
 # that could reject this release has passed. Nothing below may stop it, re-fence it or revoke
 # CONNECT again: a failure in the cron restore, the nginx config or the log rotation is
 # something to fix by hand, not a reason to tear down a working installation.
 #
-# ARMED ONLY BY THE PROOF ABOVE: `$NEW_BUILD_SERVING` is false until the build on disk was
-# shown to be the process on the port (o3d-2sm1.5, Codex r5 HIGH).
-if $NEW_BUILD_SERVING; then
+# ARMED ONLY BY THE TWO PROOFS ABOVE, AND BY BOTH (o3d-2sm1.5 Codex r5 HIGH; o3d-p9dq Codex r26
+# HIGH). `$NEW_BUILD_SERVING` is false until the build on disk was shown to be the tree the process
+# on the port serves; `$APP_SERVICE_LISTENER_PROVED` is false until that process was shown to be
+# ${APP_NAME}.service's own, in its control group, with an effective STATE_DIRECTORY that resolves
+# ${CRONTAB_LOCK_FILE}. Neither implies the other: a stray same-build listener passes the first and
+# fails the second, and a correctly-owned process serving a stale tree does the reverse.
+if $NEW_BUILD_SERVING && $APP_SERVICE_LISTENER_PROVED; then
   PAST_POINT_OF_NO_RETURN=true
+  # AND THE CRONTAB LOCK MAY NOW BE TAKEN, for the same reason and on the same evidence. The
+  # question section 16 asks is "is the process that will contend for this lock the one this run
+  # built, holding the lock file this run prepared" — and the conjunction above is the only thing
+  # in this script that answers it. Set INSIDE the block rather than beside it, so there is exactly
+  # one place where that proof becomes permission.
+  APP_SERVICE_ON_NEW_BUILD=true
 fi
 
 # The ARMING phase is over on every path that reaches here: the reboot fence came down before
@@ -7163,36 +7750,123 @@ trap 'rm -f "${CRON_BLOCK_FILE}"' EXIT
 #     preserved; legacy pre-marker localhost:APP_PORT/api/cron/ lines are cleared,
 #   - the fresh block is re-inserted where the first managed marker was (NOT at
 #     EOF), so it never jumps past an operator PATH/SHELL/CRON_TZ assignment.
-# `|| true` so a fresh box with NO existing crontab (crontab -l exits nonzero)
-# doesn't trip `set -euo pipefail` and abort the install (Codex r9).
-{ crontab -u "${APP_USER}" -l 2>/dev/null || true; } | awk -v port="${APP_PORT}" -v blockfile="${CRON_BLOCK_FILE}" '
-  function isStart(x) { return x ~ /^# --- OTI CRON START ---[ \t\r]*$/ }
-  function isEnd(x)   { return x ~ /^# --- OTI CRON END ---[ \t\r]*$/ }
-  function isRemnant(x) {
-    managed = "-H \"Authorization: Bearer $CRON_SECRET\" \"$BASE_URL/"   # exact generated job signature (== TS)
-    return (index(x, managed) > 0 \
-      || x ~ /^# CRON_SECRET is read from .* at runtime/ \
-      || x ~ /^# Managed by One Two Inventory/ \
-      || x ~ /^BASE_URL="/)
-  }
+# ---------------------------------------------------------------------------
+# ONE EXCLUSION PROTOCOL FOR THIS CRONTAB, AND THIS SCRIPT JOINS IT (Codex r22 HIGH).
+#
+# The running application rewrites the SAME managed block from six server actions
+# (lib/crontab-reconcile.ts). This script is a second read-modify-write of it, it runs as root,
+# and by this point the service has already been started above — so an upgrade or a re-run can
+# overlap a save an operator is making in the browser, and whichever pipeline writes last silently
+# discards the other's block.
+#
+# The app's exclusion used to be a PostgreSQL session advisory lock, which this script could not
+# possibly take: it is shell, and it gets here long before there is an app session to take a lock
+# on. So the exclusion moved to where the resource is — an `flock` on a host-local file — and the
+# write below performs it through with_crontab_lock(), on the same path, exactly as this script's
+# cutover fence and unwind now do and as deploy.sh and update.sh do (o3d-p9dq).
+#
+# THAT PATH IS THE SERVICE'S systemd StateDirectory, NOT ${APP_DIR} (Codex r23 HIGH). A lock file
+# beside the app cannot be opened at all under the hardened unit shipped in
+# deploy/systemd/ims-stage.service: ProtectSystem=strict remounts everything read-only except the
+# few paths that unit names, so the app's very first reconciliation would fail with EROFS on a real
+# install. A StateDirectory is created by systemd, owned by the service user, and implicitly
+# read-write under ProtectSystem=strict — and systemd hands its absolute path to the service as
+# $STATE_DIRECTORY, which is what the app reads. So:
+#
+#   ${DATA_DIR}/locks/.crontab-reconcile.lock
+#     ==  path.join($STATE_DIRECTORY, 'locks', '.crontab-reconcile.lock')
+#
+# because DATA_DIR=/var/lib/${APP_NAME} and the unit written above sets StateDirectory=${APP_NAME}.
+# Both sides derive from that one declaration; neither has a path of its own to get wrong.
+# tests/settings/crontab-reconcile-serialization.test.ts RESOLVES both and asserts they are equal.
+#
+# THE FILE IS NOT CREATED HERE, AND NOT WRITTEN HERE (Codex r24 CRITICAL). `prepare_crontab_lock`
+# in section 8 made it — root-owned, inside a root-owned directory — before the service was ever
+# started, precisely so that no root-side `touch`/`chown`/`chmod` ever lands on a path the service
+# user can turn into a symlink. All that is left to do here is OPEN it, which with_crontab_lock()
+# does READ-ONLY: `flock(2)` ignores the access mode, so a read-only descriptor takes the same
+# exclusive lock, and an fd that cannot write cannot be steered into writing something else either.
+# That is the same fallback the application relies on (lib/crontab-reconcile-lock.ts,
+# `openLockFile`).
+#
+# Never rm-and-recreate: the lock lives on the INODE, so replacing the file would hand two writers
+# two different locks and look like it worked.
+# ---------------------------------------------------------------------------
+# SECTION 12b's LISTENER PROOF IS WHAT MAKES THIS LOCK MEAN ANYTHING (Codex r25/r26 HIGH). The
+# flock below excludes exactly one thing: an application process locking the SAME inode. That is
+# true only of a process that (a) runs the build this run produced and (b) resolves its lock path
+# from the $STATE_DIRECTORY of the unit this run wrote. Section 10c stopped the predecessor,
+# section 12 started the new unit, and section 12b then proved BOTH halves: it fetched
+# /_next/static/<BUILD_ID>/ from the port for the build identity, and it resolved the unit's
+# MainPID and control group, established that the process holding the listening socket belongs to
+# that unit, and read that process's own effective STATE_DIRECTORY out of /proc/<pid>/environ to
+# confirm it resolves THIS lock file. ${APP_SERVICE_ON_NEW_BUILD} records the conjunction. Carried
+# here as state rather than as a comment, so reordering the sections fails loudly instead of
+# quietly reopening the race.
+[[ "${APP_SERVICE_ON_NEW_BUILD:-false}" == "true" ]] || die \
+  "the application service was not proved to be running this run's build, under this run's unit, before the crontab section (APP_SERVICE_ON_NEW_BUILD='${APP_SERVICE_ON_NEW_BUILD:-unset}'). Taking the crontab lock now would serialise this script against nothing: a process still running the previous build locks a different file, and a process that is not the unit's own has no STATE_DIRECTORY at all and locks a file under its working directory instead — either way the two writers would silently overwrite each other's managed block. This is an ordering bug in the installer itself, not an operator error — the build and listener proofs are in section 12b and must precede this section."
+
+CRON_BOOTSTRAP_WRITTEN=no
+
+# THE BOOTSTRAP WRITE, AS A FUNCTION, SO IT GOES THROUGH THE ONE HELPER EVERY OTHER SHELL CRONTAB
+# WRITE GOES THROUGH (o3d-p9dq). It used to be an inline `exec 9<lock; flock 9; …; exec 9>&-`, which
+# had a second defect nobody had asked about: `acquire_cutover_lock` holds the SHARED CUTOVER LOCK
+# on fd 9 for the whole run, so `exec 9<` replaced that descriptor — releasing the cutover lock —
+# and `exec 9>&-` then left the run holding no cutover lock at all. with_crontab_lock() scopes its
+# descriptor to a command group and uses fd 7.
+bootstrap_managed_crontab_block_locked() {
+  # BOOTSTRAP, NOT RECONCILE (Codex r22 HIGH). The block below carries the INSTALLER's default
+  # schedules, not the operator's committed settings, so writing it over an existing managed block
+  # would revert every schedule choice made in the app — the same "the crontab disagrees with the
+  # committed rows and nothing notices" state this whole protocol exists to prevent, just reached
+  # from the outside. If a managed block is already there, the app owns it. This test and the write
+  # are both inside the lock, so a save cannot land between them.
+  #
+  # ONE READ, AND IT FAILS CLOSED (o3d-p9dq, Codex r28 sweep). This function used to read the
+  # crontab TWICE with `2>/dev/null || true`, and both readings were load-bearing in the dangerous
+  # direction: a failed read holds no START marker, so the test below said "no managed block, the
+  # app does not own this" and the awk pipeline below THAT rebuilt the crontab from an empty
+  # reading — installing the installer's DEFAULT schedules over the operator's committed ones and
+  # dropping every unmanaged line the crontab was the only record of. Now it is read once, and a
+  # read that did not resolve writes nothing.
+  local existing
+  read_crontab_for "${APP_USER}" || return 1
+  existing="${CRONTAB_READ_TEXT}"
+  if grep -qE '^# --- OTI CRON START ---[ \t\r]*$' <<< "${existing}"; then
+    info "A managed crontab block already exists for ${APP_USER} — leaving the app's schedules alone."
+    info "Newly registered jobs are scheduled by Settings -> System -> Scheduler -> Save & Apply."
+  else
+    # THE FIFTEENTH `*_locked` BODY, AND IT INHERITED THE SAME SUSPENDED ERREXIT AS THE OTHER
+    # FOURTEEN (o3d-p9dq, Codex r30 CRITICAL). The projection below used to run straight into
+    # the crontab client with nothing taking its status, so a REJECTED write still set
+    # CRON_BOOTSTRAP_WRITTEN=yes, returned 0, and the installer's closing summary told the
+    # operator a default schedule had been installed that was never installed.
+    #
+    # CAPTURED RATHER THAN PIPED, for the reason write_crontab_for documents: every element of a
+    # pipeline runs in a SUBSHELL, so a `| write_crontab_for` would set ${CRONTAB_WRITE_REASON} in
+    # a child and this function would read an empty string. Capturing also makes the projection's
+    # OWN failure visible, which the old pipeline swallowed whenever the write happened to succeed.
+    local block
+# The crontab as read ABOVE, under this same lock — never a second read, which could disagree with
+# the one the marker test was decided on. A box with no crontab at all feeds the awk nothing, which
+# is how it appends the block to an empty file.
+# The crontab as read ABOVE, under this same lock — never a second read, which could disagree with
+# the one the marker test was decided on. A box with no crontab at all feeds the awk nothing, which
+# is how it appends the block to an empty file.
+#
+# THE MARKER RULE COMES FROM ${CRONTAB_MANAGED_BLOCK_AWK} (o3d-p9dq, Codex r29 HIGH #3) — the same
+# string scripts/lib/crontab-lock.sh gives its loss check, rather than a second hand-kept copy of
+# it. What remains inline is only what is specific to bootstrapping: where the new block goes, and
+# the pre-marker legacy line to drop.
+block="$(
+if [[ -n "${existing}" ]]; then printf '%s\n' "${existing}"; fi \
+  | awk -v port="${APP_PORT}" -v blockfile="${CRON_BLOCK_FILE}" "${CRONTAB_MANAGED_BLOCK_AWK}"'
   function emitBlock(  bl) { while ((getline bl < blockfile) > 0) print bl; close(blockfile) }
   { line[NR] = $0 }
   END {
-    i = 1; firstMarker = 0
-    while (i <= NR) {
-      if (isStart(line[i])) {
-        if (firstMarker == 0) firstMarker = i
-        j = i + 1
-        while (j <= NR && !isEnd(line[j]) && !isStart(line[j])) j++
-        if (j <= NR && isEnd(line[j])) { for (k = i; k <= j; k++) drop[k] = 1; i = j + 1; continue }
-        drop[i] = 1   # unclosed START: marker + our tail remnants, keep operator lines
-        for (k = i + 1; k < j; k++) if (isEnd(line[k]) || isRemnant(line[k])) drop[k] = 1
-        i = j
-        continue
-      }
-      if (isEnd(line[i])) { if (firstMarker == 0) firstMarker = i; drop[i] = 1 }   # stray END
-      i++
-    }
+    markManagedDrops(line, NR, drop)
+    firstMarker = 0
+    for (i = 1; i <= NR; i++) if (isStart(line[i]) || isEnd(line[i])) { firstMarker = i; break }
     legacy = "localhost:" port "/api/cron/"   # pre-r4 bootstrap lines predate the markers
     emitted = 0
     for (i = 1; i <= NR; i++) {
@@ -7203,16 +7877,47 @@ trap 'rm -f "${CRON_BLOCK_FILE}"' EXIT
     }
     if (!emitted) emitBlock()   # no prior block → append at end
   }
-' | crontab -u "${APP_USER}" -
+'
+)" || {
+      CRONTAB_WRITE_REASON="the default crontab block could not be composed from the crontab as read - the awk projection failed - so nothing was installed"
+      return 1
+    }
+    write_crontab_for "${APP_USER}" "${block}" || return 1
+    CRON_BOOTSTRAP_WRITTEN=yes
+  fi
+}
+
+CRON_BOOTSTRAP_RC=0
+with_crontab_lock bootstrap_managed_crontab_block_locked || CRON_BOOTSTRAP_RC=$?
+if [[ "${CRON_BOOTSTRAP_RC}" -ne 0 ]]; then
+  # FAIL SAFE, DO NOT ABORT. Writing without the lock is the defect itself, and a held lock means
+  # the app is reconciling right now — which also means the block above would have been skipped.
+  # This is the ONE crontab site in these three scripts that does not die on a conflict, because
+  # the only thing it would have written is a set of DEFAULT schedules the application replaces on
+  # its first save. Nothing this run needs to put back is left behind.
+  if [[ "${CRON_BOOTSTRAP_RC}" -eq "${CRONTAB_LOCK_CONFLICT}" ]]; then
+    warn "Another process is reconciling ${APP_USER}'s crontab; leaving it untouched."
+  else
+    # EITHER HALF CAN BE THE REASON NOW (o3d-p9dq, Codex r30 CRITICAL). Until this round the only
+    # way to reach here other than a lock conflict was a failed READ, because a failed WRITE
+    # returned 0. It no longer does, so the message asks the write first.
+    warn "No default schedule was written to the ${APP_USER} crontab: ${CRONTAB_WRITE_REASON:-${CRONTAB_READ_REASON:-reason not recorded}}"
+  fi
+  warn "If scheduled jobs are missing, open Settings -> System -> Scheduler and press Save & Apply."
+fi
 rm -f "${CRON_BLOCK_FILE}"
 trap - EXIT   # risky window over; drop the cleanup trap
 
-success "Cron jobs configured:"
-echo "  - 02:00 Daily scheduled backup (if enabled in settings)"
-echo "  - 03:00 Activity log cleanup"
-echo "  - 04:00 WooCommerce backup reconciliation and stock retry drain"
-echo "  - Every 15 min Delivery status polling"
-echo "  - 06:00 FX rate update"
+if [[ "${CRON_BOOTSTRAP_WRITTEN}" == "yes" ]]; then
+  success "Cron jobs configured:"
+  echo "  - 02:00 Daily scheduled backup (if enabled in settings)"
+  echo "  - 03:00 Activity log cleanup"
+  echo "  - 04:00 WooCommerce backup reconciliation and stock retry drain"
+  echo "  - Every 15 min Delivery status polling"
+  echo "  - 06:00 FX rate update"
+else
+  success "Cron jobs left to the application's own scheduler settings."
+fi
 
 # ---------------------------------------------------------------------------
 # 17. Firewall hints (ufw)

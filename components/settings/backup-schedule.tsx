@@ -6,7 +6,9 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
-import { setSettings } from '@/app/actions/settings'
+import { saveBackupScheduleSettings } from '@/app/actions/settings'
+import { validateBackupScheduleInput } from '@/lib/domain/settings/backup-schedule-input'
+import { resolveSettingSaveView } from '@/lib/domain/settings/setting-save-outcome'
 
 type Props = {
   enabled: boolean
@@ -18,6 +20,9 @@ type Props = {
 export function BackupScheduleSettings({ enabled, retentionDays, maxCount, autoUpload }: Props) {
   const [isPending, startTransition] = useTransition()
   const [saved, setSaved] = useState(false)
+  const [error, setError] = useState('')
+  /** Saved, but the crontab is behind. Not an error — see handleSave. */
+  const [schedulerWarning, setSchedulerWarning] = useState('')
   const [isEnabled, setIsEnabled] = useState(enabled)
   const [days, setDays] = useState(retentionDays)
   const [max, setMax] = useState(maxCount)
@@ -25,24 +30,49 @@ export function BackupScheduleSettings({ enabled, retentionDays, maxCount, autoU
 
   function handleSave() {
     setSaved(false)
+    setError('')
+    setSchedulerWarning('')
+
+    const input = { enabled: isEnabled, retentionDays: days, maxCount: max, autoUpload: upload }
+    // Immediate feedback only. The SAME function is the server action's gate, so a value that slips
+    // past here is still refused there rather than stored.
+    const validated = validateBackupScheduleInput(input)
+    if (!validated.ok) {
+      setError(validated.error)
+      return
+    }
+
     startTransition(async () => {
-      // ONE transaction (o3d-osl8 round 9, finding 1) — see setSettings.
-      await setSettings({
-        backup_schedule_enabled: isEnabled ? 'true' : 'false',
-        backup_retention_days: days,
-        backup_max_count: max,
-        backup_auto_upload: upload,
-      })
-      setSaved(true)
-      setTimeout(() => setSaved(false), 2000)
+      try {
+        // ONE round trip, and the crontab reconciliation is INSIDE it (Codex r20 HIGH). This screen
+        // used to save through the generic key/value writer, which never reconciled the crontab and
+        // never wrote `cron_backup_enabled` — so the switch below could store 'true' and install no
+        // cron line at all. The action writes both enablement rows and reconciles; the screen only
+        // renders the outcome.
+        const view = resolveSettingSaveView({
+          result: await saveBackupScheduleSettings(input),
+          what: 'The backup schedule',
+        })
+        if (!view.committed) {
+          setError(view.error)
+          return
+        }
+        setSchedulerWarning(view.warning)
+        setSaved(true)
+        setTimeout(() => setSaved(false), 2000)
+      } catch (e) {
+        setError(e instanceof Error ? e.message : 'Failed to save the backup schedule')
+      }
     })
   }
 
   return (
     <div className="space-y-3">
       <p className="text-xs text-muted-foreground">
-        Runs daily via <code className="text-xs bg-muted px-1 rounded">/api/cron/backup</code>. Old backups are
-        automatically purged based on the retention settings below.
+        Runs via <code className="text-xs bg-muted px-1 rounded">/api/cron/backup</code> on the schedule set for
+        the <strong>Database Backup</strong> job in Settings &rarr; System &rarr; Scheduled Jobs. The switch below
+        is the same enablement the scheduler reads — saving it rewrites the crontab. Old backups are automatically
+        purged based on the retention settings.
       </p>
 
       <label className="flex items-center gap-2 text-sm">
@@ -83,6 +113,8 @@ export function BackupScheduleSettings({ enabled, retentionDays, maxCount, autoU
         </Button>
         {saved && <span className="text-sm text-green-600 flex items-center gap-1"><Check className="h-3 w-3" />Saved</span>}
       </div>
+      {error && <p className="text-sm text-red-600">{error}</p>}
+      {schedulerWarning && <p className="text-sm text-amber-700">{schedulerWarning}</p>}
     </div>
   )
 }

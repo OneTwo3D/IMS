@@ -1,6 +1,12 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
+import {
+  FOLLOW_UPS_ENQUEUED,
+  obligationReleasePrerequisite,
+  refusedFollowUpEnqueue,
+} from '@/lib/domain/accounting/followup-enqueue-outcome'
+
 /**
  * o3d-ekn8 — DB WIRING for the deferred-receipt re-drive.
  *
@@ -816,4 +822,129 @@ test('[o3d-0bfh r16] a receipt already awaiting is answered BEFORE the caller is
   assert.equal(result.settled, false)
   assert.equal(result.awaiting, 1)
   assert.equal(result.release, 'retained')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-batch-ret (Codex HIGH) — THE ENQUEUE'S OWN REFUSAL IS THE THIRD THING THE RELEASE IS OWED.
+//
+// r16 gave the fence a caller-side prerequisite and both connectors declined to state one on their
+// post path, because "this processor has no settlement write of its own after the enqueue". True of
+// its WRITES, false of its VERDICT: the payment and PDF enqueues run immediately above the fence and
+// either of them can REFUSE — return normally, having queued nothing. Those two outcomes were folded
+// into a `FollowUpEnqueueOutcome` in the `return` statement four lines BELOW the fence, and every
+// consumer of that outcome — `requireFollowUpsEnqueued` on the post path, `followUpSettlement` in the
+// sweep — therefore read a correct answer about a marker that was already gone. The row is left
+// SYNCED, linked and marker-null, which the next sweep reads as reconciled and stamps; the refused
+// payment is never re-enqueued, and the refusal notice promises the exact opposite ("the row is
+// deliberately left marked as owing follow-ups").
+//
+// A CORRECT CHECK PLACED AFTER THE IRREVERSIBLE STEP IS NOT A CHECK. So the verdict is computed
+// before the fence and composed into the prerequisite by `obligationReleasePrerequisite`, and these
+// drive the real helper into the real fence.
+// ---------------------------------------------------------------------------
+
+const REFUSED_PAYMENT_ENQUEUE = () => refusedFollowUpEnqueue({
+  type: 'INVOICE_PAYMENT',
+  referenceType: 'SalesOrder',
+  referenceId: 'order-1',
+  reason: 'ledger_not_clear',
+  message: 'The ledger would not confirm this payment attempt is absent, so it was not re-posted.',
+})
+
+test('[o3d-batch-ret] a REFUSED enqueue keeps the marker even though every receipt IS settled', async () => {
+  // THE LOAD-BEARING CASE, and every one of its three axes is deliberate: the receipts are settled
+  // (so the fence's own re-read finds nothing and would release), the caller states no prerequisite
+  // of its own (the post path's shape, which is what made `undefined` look safe), and the enqueue
+  // REFUSED. Before the fix those three met at a `released`.
+  //
+  // MUTATION THAT KILLS THIS: make `obligationReleasePrerequisite` return `callerPrerequisite`
+  // unconditionally — i.e. ignore the refusal, which is the shipped behaviour this replaced. The
+  // release becomes `released`, `state.markerClears` gains its one write, and the assertion below
+  // that the SECOND pass can still clear the generation becomes vacuous because the first already
+  // did. ROUTE: `registerDeferredOrderReceipts` → `dischargeDeferredReceiptObligation`, whose
+  // prerequisite branch is only entered because the helper produced a closure.
+  ONE_SETTLED_RECEIPT()
+  const refusalPrerequisite = obligationReleasePrerequisite(REFUSED_PAYMENT_ENQUEUE())
+  assert.ok(
+    refusalPrerequisite,
+    'a refusal must STATE a prerequisite. `undefined` here is the single-pass fence, which clears the '
+    + 'marker unconditionally — so this precondition is the one the whole finding turns on',
+  )
+
+  const result = await redrive('INV-1', OBLIGATION, refusalPrerequisite)
+
+  assert.deepEqual(
+    // Mapped rather than compared whole: `assert.deepEqual(state.markerClears, [])` narrows the
+    // property to `never[]` for the rest of this function, and the second half below has to index it.
+    state.markerClears.map((write) => write.where), [],
+    'THE LOAD-BEARING ASSERTION: nothing cleared the obligation. The payment was REFUSED and nothing '
+    + 'was queued, so the marker is the only record left that the work is owed',
+  )
+  assert.equal(result.release, 'prerequisite-unmet',
+    'named rather than folded into `retained`: the receipts settled, and what failed is the caller\'s own half')
+  assert.equal(result.settled, true,
+    'and the receipt half is genuinely finished — this is exactly the state in which the old ordering released')
+
+  // AND IT IS DEFERRED, NOT RETIRED. The generation is still on the row, so the next sweep's pass —
+  // once the refusal has cleared — finds it and clears THAT generation. If the first pass had
+  // released it, this second one would answer `superseded` and write nothing.
+  const later = await redrive('INV-1', OBLIGATION, obligationReleasePrerequisite(FOLLOW_UPS_ENQUEUED))
+  assert.equal(later.release, 'released', 'the later sweep completes the work the refusal deferred')
+  assert.equal(state.markerClears.length, 1, 'and only NOW is there a clearing write')
+  assert.deepEqual(state.markerClears[0].where, { id: 'sync-1', backReferenceFollowUpsPendingAt: OBLIGATION },
+    'fenced on the same generation the refused pass left standing — which is what proves it survived')
+})
+
+test('[o3d-batch-ret] an ENQUEUED outcome states no prerequisite of its own, so the post path keeps its single pass', async () => {
+  // The control, and it is about COST as much as correctness: the composition must not turn every
+  // healthy post into the two-pass split, and "nothing was cleared" above must not be reachable by a
+  // helper that simply always refuses.
+  ONE_SETTLED_RECEIPT()
+  assert.equal(
+    obligationReleasePrerequisite(FOLLOW_UPS_ENQUEUED), undefined,
+    'no refusal and no caller condition is the one shape that goes back to the single-pass fence',
+  )
+
+  const result = await redrive('INV-1', OBLIGATION, obligationReleasePrerequisite(FOLLOW_UPS_ENQUEUED))
+
+  assert.equal(result.release, 'released')
+  assert.equal(state.markerClears.length, 1, 'the healthy path still clears, exactly once')
+})
+
+test('[o3d-batch-ret] a refusal overrides the caller\'s own prerequisite without ever spending it', async () => {
+  // The sweep DOES state a prerequisite, and its closure ANNOUNCES a terminal loss. Announcing one
+  // on a pass that queued nothing is the same mistake the fence avoids when its re-read answers
+  // `retained`: the announcement is what licenses the settlement, so it must not be spent by a pass
+  // that is not going to settle.
+  //
+  // MUTATION THAT KILLS THIS: compose as `enqueued && await callerPrerequisite()` in the other order
+  // (`await callerPrerequisite() && enqueued`). `announced` flips to true, the terminal notice is
+  // written for a row that stays marked, and the next sweep re-announces it.
+  ONE_SETTLED_RECEIPT()
+  let announced = false
+  const prerequisite = obligationReleasePrerequisite(
+    REFUSED_PAYMENT_ENQUEUE(),
+    async () => { announced = true; return true },
+  )
+
+  const result = await redrive('INV-1', OBLIGATION, prerequisite)
+
+  assert.equal(announced, false, 'the caller\'s terminal notice is not spent on a pass that queued nothing')
+  assert.equal(result.release, 'prerequisite-unmet')
+  assert.deepEqual(state.markerClears, [])
+})
+
+test('[o3d-batch-ret] an enqueued outcome hands the caller\'s own prerequisite straight through', async () => {
+  // The other control: the composition must not swallow the condition r16 added. Without this, a
+  // helper that returned `undefined` whenever the enqueue succeeded would pass every test above and
+  // silently undo r16 for the sweep.
+  ONE_SETTLED_RECEIPT()
+  let asked = false
+  const prerequisite = obligationReleasePrerequisite(FOLLOW_UPS_ENQUEUED, async () => { asked = true; return false })
+
+  const result = await redrive('INV-1', OBLIGATION, prerequisite)
+
+  assert.equal(asked, true, 'the caller\'s condition still runs')
+  assert.equal(result.release, 'prerequisite-unmet', 'and it still withholds the release')
+  assert.deepEqual(state.markerClears, [])
 })

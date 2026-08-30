@@ -9,6 +9,16 @@ import {
   pageStrandedSyncRows,
 } from '@/lib/domain/accounting/stranded-sync-rows'
 
+/**
+ * The loader's answer to "can anything still claim a row on this connector?".
+ *
+ * QUIESCED is the default the older tests were written against — it is what the read model used to
+ * pass unconditionally. `stillClaimable` is the state round 5 found: a row off the active connector
+ * whose connector's sync toggle is still on, so the manual Sync button can reclaim it.
+ */
+const QUIESCED = () => true
+const STILL_CLAIMABLE = () => false
+
 // o3d-osl8 item 1. The stranded-row read model, tested without a database — the same way
 // connector-orphans.ts and followup-idempotency.ts are, and for the same reason: the rule that
 // makes these rows visible at all (NOT scoping the query to the active connector) is the part
@@ -71,33 +81,36 @@ test('a `take + 1` read is paged down to `take`, and reports that rows are hidde
   // FAILED they never move, and every newer stranded row is invisible FOREVER. Returning a bare
   // array of the oldest `take` said nothing about that.
   const rows = Array.from({ length: 4 }, (_, i) => sourceRow({ id: `log-${i}` }))
-  const page = pageStrandedSyncRows(rows, 3, NOW)
+  const page = pageStrandedSyncRows(rows, 3, NOW, QUIESCED)
   assert.equal(page.hasMore, true, 'the extra row proves more exist')
   assert.equal(page.rows.length, 3, 'the extra row is dropped, not shown')
   assert.deepEqual(page.rows.map((row) => row.id), ['log-0', 'log-1', 'log-2'])
 })
 
 test('a complete page reports no more — and the probe row is not counted as one', () => {
-  const exact = pageStrandedSyncRows(Array.from({ length: 3 }, (_, i) => sourceRow({ id: `log-${i}` })), 3, NOW)
+  const exact = pageStrandedSyncRows(Array.from({ length: 3 }, (_, i) => sourceRow({ id: `log-${i}` })), 3, NOW, QUIESCED)
   assert.equal(exact.hasMore, false, 'exactly `take` rows means the list is complete')
   assert.equal(exact.rows.length, 3)
 
-  const short = pageStrandedSyncRows([sourceRow()], 3, NOW)
+  const short = pageStrandedSyncRows([sourceRow()], 3, NOW, QUIESCED)
   assert.equal(short.hasMore, false)
   assert.equal(short.rows.length, 1)
 
-  const none = pageStrandedSyncRows([], 3, NOW)
+  const none = pageStrandedSyncRows([], 3, NOW, QUIESCED)
   assert.equal(none.hasMore, false)
   assert.deepEqual(none.rows, [])
 })
 
 test('paged rows are described, not returned raw', () => {
-  const page = pageStrandedSyncRows([sourceRow()], 3, NOW)
+  const page = pageStrandedSyncRows([sourceRow()], 3, NOW, QUIESCED)
   assert.equal(page.rows[0].ageDays, 10)
   assert.equal(page.rows[0].createdAt, '2026-08-04T10:00:00.000Z')
 })
 
-function stranded(over: Partial<Parameters<typeof describeStrandedSyncRow>[0]> = {}) {
+function stranded(
+  over: Partial<Parameters<typeof describeStrandedSyncRow>[0]> = {},
+  unclaimable: (connector: string) => boolean = QUIESCED,
+) {
   return describeStrandedSyncRow(
     {
       id: 'log-1',
@@ -113,6 +126,7 @@ function stranded(over: Partial<Parameters<typeof describeStrandedSyncRow>[0]> =
       ...over,
     },
     NOW,
+    unclaimable,
   )
 }
 
@@ -220,4 +234,64 @@ test('a STRANDED row at revision 0 reaches the remedy by adoption — this list 
   // The minting is said out loud rather than done quietly.
   assert.match(adoptable.settlementCaveat ?? '', /MINTS one/)
   assert.match(adoptable.settlementCaveat ?? '', /NOT proof that nothing posted/)
+})
+
+// ---------------------------------------------------------------------------
+// ROUND 5 (Codex HIGH #1) — BEING ON THIS PAGE IS NOT PROOF THAT NOTHING CAN CLAIM THE ROW.
+//
+// The test directly above encodes the round-3/round-4 argument: `buildStrandedSyncRowWhere` selects
+// rows off the active connector, therefore nothing in the attempt fence can claim them, therefore
+// every row here is adoptable. The second step is false, and QuickBooks rows are the counter-example
+// the whole feature was built for — `triggerQuickBooksSync` gates on `quickbooks_sync_enabled` and
+// never resolves the active connector, so with Xero enabled beside it every QuickBooks row is listed
+// here while any holder of `sync` can press the button and have the stale-claim sweep reclaim one.
+//
+// These are about what the read model DOES with that answer, not about how it is computed; the rule
+// itself is pinned in tests/domain/accounting/sync-row-claimability.test.ts.
+// ---------------------------------------------------------------------------
+
+test('[round 5] a revision-0 row whose connector can STILL claim it is refused, not adopted', () => {
+  const row = stranded({ status: 'PROCESSING', attemptRevision: 0 }, STILL_CLAIMABLE)
+  assert.equal(row.settleable, false, 'adopting here is overwritten by the next press of the Sync button')
+  assert.equal(row.requiresAttemptAdoption, false)
+  assert.equal(row.settlementCaveat, null, 'a caveat is for a decision that can be made')
+})
+
+test('[round 5] and it says WHY, naming the toggle — not the generic active-connector sentence', () => {
+  const row = stranded({ status: 'PROCESSING', attemptRevision: 0 }, STILL_CLAIMABLE)
+  const reason = row.notSettleableReason ?? ''
+  // The lever, by its settings key: an operator cannot act on "it is claimable".
+  assert.match(reason, /quickbooks_sync_enabled/)
+  assert.match(reason, /manual\s+Sync button/)
+  // And NOT the wording for a row on the ACTIVE connector, whose remedy (retry it, the processor
+  // stamps an attempt) is a different action against a different cause.
+  assert.doesNotMatch(reason, /It is on the ACTIVE connector/)
+})
+
+test('[round 5] the question is asked PER CONNECTOR, so one quiesced connector does not adopt the other', () => {
+  // With no accounting plugin enabled at all, buildStrandedSyncRowWhere selects EVERY unresolved
+  // row, so one page carries both connectors. A single boolean for the page would adopt rows on a
+  // connector nobody asked about.
+  const onlyXeroQuiesced = (connector: string) => connector === 'xero'
+  const page = pageStrandedSyncRows(
+    [
+      { ...sourceRow({ id: 'log-x', connector: 'xero', attemptRevision: 0 }) },
+      { ...sourceRow({ id: 'log-q', connector: 'quickbooks', attemptRevision: 0 }) },
+    ],
+    10,
+    NOW,
+    onlyXeroQuiesced,
+  )
+  const byId = new Map(page.rows.map((row) => [row.id, row]))
+  assert.equal(byId.get('log-x')?.settleable, true, 'the quiesced connector keeps the adoption remedy')
+  assert.equal(byId.get('log-q')?.settleable, false, 'the one that can still sweep does not')
+  assert.match(byId.get('log-q')?.notSettleableReason ?? '', /quickbooks_sync_enabled/)
+})
+
+test('[round 5] a FENCED row is unaffected — the fence, not the toggle, is what protects it', () => {
+  // The claimability question is only ever asked of revision 0. A row carrying a real attempt is
+  // settled against that attempt, and a concurrent claim is refused by the CAS rather than by this.
+  const row = stranded({ status: 'FAILED', attemptRevision: 3 }, STILL_CLAIMABLE)
+  assert.equal(row.settleable, true)
+  assert.equal(row.notSettleableReason, null)
 })

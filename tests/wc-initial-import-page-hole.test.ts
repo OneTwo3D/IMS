@@ -297,11 +297,11 @@ test('the truncation flag is what fails the pass — a full walk with per-order 
   assert.equal(settings.get('wc_initial_import_completed'), 'true')
 
   // And the rule those settings came from, stated directly on the pure function.
-  assert.equal(decideInitialImportOutcome({ imported: 5, skipped: 0, errorCount: 3 }), 'complete')
-  assert.equal(decideInitialImportOutcome({ imported: 5, skipped: 0, errorCount: 3, truncatedRead: true }), 'failed')
-  assert.equal(decideInitialImportOutcome({ imported: 5, skipped: 0, errorCount: 3, unreadPages: 1 }), 'failed')
+  assert.equal(decideInitialImportOutcome({ imported: 5, skipped: 0, errorCount: 3, unrecordedRefusals: 0 }), 'complete')
+  assert.equal(decideInitialImportOutcome({ imported: 5, skipped: 0, errorCount: 3, truncatedRead: true, unrecordedRefusals: 0 }), 'failed')
+  assert.equal(decideInitialImportOutcome({ imported: 5, skipped: 0, errorCount: 3, unreadPages: 1, unrecordedRefusals: 0 }), 'failed')
   assert.equal(
-    decideInitialImportOutcome({ imported: 500, skipped: 500, errorCount: 0, unreadPages: 1 }),
+    decideInitialImportOutcome({ imported: 500, skipped: 500, errorCount: 0, unreadPages: 1, unrecordedRefusals: 0 }),
     'failed',
     'no amount of progress outvotes a page that was never read',
   )

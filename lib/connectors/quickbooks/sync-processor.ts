@@ -36,12 +36,36 @@ import {
   retireOverSettlingInvoicePayment,
 } from '@/lib/domain/accounting/invoice-payment-capacity'
 import { logFollowUpRevival, resolveLostFollowUpRevival } from '@/lib/domain/accounting/followup-revival'
+import {
+  FOLLOW_UPS_ENQUEUED,
+  combineFollowUpEnqueueOutcomes,
+  obligationReleasePrerequisite,
+  describeFollowUpEnqueueRefusals,
+  paymentAccountRefusalMessage,
+  postedRowFollowUpRetryNote,
+  refusedFollowUpEnqueue,
+  decideRequestedInvoicePayment,
+  unreadablePaymentPayloadRefusalMessage,
+  type FollowUpEnqueueOutcome,
+  type UnreadablePaymentPayload,
+  type RefusedFollowUpEnqueue,
+} from '@/lib/domain/accounting/followup-enqueue-outcome'
 import { isUniqueConstraintViolation } from '@/lib/db/prisma-unique-violation'
+import {
+  QBO_UNRECORDED_POSTED_DOCUMENT_ACTION,
+  describeUnpersistedQboPost,
+  ledgerTargetIdFromPayload,
+  type PostedOperationOutcome,
+  type RemoteEffectOutcome,
+  type UnpersistedQboPost,
+} from '@/lib/domain/accounting/unrecorded-posted-document'
+import { redactActivityLogText, sanitizeActivityLogMetadata } from '@/lib/activity-log'
 import {
   applyBackReference,
   backReferenceHolder,
   findExternalDocumentIdClaim,
   claimFollowUpObligation,
+  followUpObligationRecoveryNote,
   isExternalDocumentIdConflict,
   releaseFollowUpObligation,
 } from '@/lib/domain/accounting/back-reference'
@@ -164,6 +188,344 @@ async function updateMirroredEventForSyncLog(client: Pick<Prisma.TransactionClie
 }
 
 /**
+ * o3d-peh1 — the follow-ups this entry owes were REFUSED, so the obligation is not released.
+ *
+ * The Xero twin of this carries the full argument; the shape here is the same. Thrown rather than
+ * branched because both post paths already handle a throw correctly: the obligation marker stays
+ * claimed and the entry is retried, which is the right state for work that has not run.
+ *
+ * A DISTINCT CLASS, not a bare Error (Codex, this branch). "Both post paths handle a throw
+ * correctly" was false of the FRESH-POST path, whose local catch treats every follow-up exception as
+ * best-effort, logs it and counts the entry SUCCEEDED. That is the o3d-peh1 defect itself: the
+ * parent reported settled while the money-moving child was never enqueued. The two cases THAT catch
+ * has to tell apart are genuinely different, which is why the type exists rather than a string match
+ * on the message:
+ *
+ * The SHORT-CIRCUIT path needs no such distinction and does not make one (Codex round 2, HIGH). It
+ * used to have no catch at all, which sent every follow-up exception — refused or merely failed —
+ * into the main-post failure handler, where a final failure stamps the mirrored AccountingEvent
+ * FAILED on a document that is demonstrably in the ledger. It now catches both and routes both to
+ * `markSyncLogForFollowUpRetry`, which is the transition that keeps the mirror truthful. See the
+ * comment on that catch for why catching the plain failure there is not a widening.
+ *
+ *
+ *   • a follow-up enqueue that FAILED — a transient database error. The work is still owed and the
+ *     obligation marker records that; QuickBooks deliberately does not fail the entry for it, and
+ *     that behaviour is unchanged here.
+ *   • a follow-up enqueue that was REFUSED — the planner or the ledger fence declined, deliberately,
+ *     and NOTHING WAS QUEUED. Nothing will re-drive it either: the QuickBooks repair sweep is still
+ *     unwired (o3d-s36z), so on this connector the marker alone is a note to nobody. The parent must
+ *     go back to being unsettled so this processor's own retry returns to it.
+ */
+class FollowUpEnqueueRefused extends Error {}
+
+function requireFollowUpsEnqueued(entryId: string, outcome: FollowUpEnqueueOutcome): void {
+  if (outcome.enqueued) return
+  throw new FollowUpEnqueueRefused(
+    `QuickBooks sync entry ${entryId} posted, but its follow-ups were REFUSED and nothing was queued: `
+    + `${describeFollowUpEnqueueRefusals(outcome)}`,
+  )
+}
+
+/**
+ * RETURN A POSTED PARENT TO ITS UNSETTLED STATE, KEEPING THE TWO FACTS THAT MAKE IT RECOVERABLE.
+ *
+ * The Xero twin is `markSyncLogForFollowUpRetry`, and this is deliberately the same three-column
+ * write rather than a re-use of the QuickBooks main-failure path a few lines below. BOTH posted
+ * arms use it (Codex round 2, HIGH): the fresh-post arm for a refusal, the short-circuit arm for
+ * every follow-up failure, because on that arm the row is only there at all by virtue of an external
+ * id — a document in the ledger — and the main-failure path's terminal write would deny it:
+ *
+ *   • `externalTransactionId` IS NOT TOUCHED. It is post evidence — the only local record that the
+ *     document is in QuickBooks — and it is also what makes the retry safe: the loop's idempotency
+ *     guard reads it and short-circuits straight to the follow-ups instead of posting a second
+ *     document. Dropping it would turn a retry into a duplicate.
+ *   • `backReferenceFollowUpsPendingAt` IS NOT TOUCHED either. The obligation is still owed; the
+ *     release runs only on the arm where the enqueue actually happened.
+ *   • NO MIRRORED EVENT is written. The main-failure path stamps the mirrored AccountingEvent FAILED
+ *     on a final failure, which is right when nothing posted and wrong here: this document POSTED,
+ *     the mirror already says so, and overwriting it would make the ledger's own copy of the record
+ *     contradict the ledger.
+ *
+ * Status goes back to PENDING, or FAILED once the retries are exhausted — the same bound every other
+ * failure on this loop observes, so a permanently refusable row cannot spin for ever.
+ */
+function postedRowRetryColumns(entry: { retryCount: number }, errorMessage: string) {
+  const retryCount = entry.retryCount + 1
+  return {
+    status: retryCount >= MAX_RETRIES ? ('FAILED' as const) : ('PENDING' as const),
+    retryCount,
+    errorMessage,
+    processingStartedAt: null,
+  }
+}
+
+async function markSyncLogForFollowUpRetry(
+  entry: { id: string; retryCount: number },
+  error: unknown,
+): Promise<void> {
+  await db.accountingSyncLog.update({
+    where: { id: entry.id },
+    data: postedRowRetryColumns(
+      entry,
+      // Covers both callers: the fresh-post arm sends only REFUSALS here, the short-circuit arm
+      // sends every follow-up failure. The refusal's own text says "REFUSED and nothing was queued",
+      // so the prefix does not need to claim which happened — and claiming it would be wrong for
+      // half the rows that now reach this line.
+      `QuickBooks follow-up work did not complete after connector post: ${String(error)}`,
+    ),
+  })
+}
+
+/**
+ * THE SAME TRANSITION, FOR A CALLER THAT DOES NOT KNOW WHETHER THE ROW IS POSTED (Codex r4, HIGH).
+ *
+ * THE EXTERNAL ID IS POST EVIDENCE, AND A FAILED MIRROR CONTRADICTS A DOCUMENT THAT EXISTS. That is
+ * already the established principle on this branch — {@link markSyncLogForFollowUpRetry} was written
+ * for it, and round 2 moved the short-circuit arm's follow-up failures onto it for exactly this
+ * reason. What round 2 did not do was make the GENERIC OUTER CATCH obey it. That handler still asked
+ * only "have the retries run out?", and on the last one it stamped the mirrored AccountingEvent
+ * FAILED — over a row whose `externalTransactionId` says the document is in QuickBooks.
+ *
+ * AND IT IS UNTRUE FOR A TRANSIENT ERROR EXACTLY AS IT IS FOR A REFUSAL. The reasons are properties
+ * of the LEDGER, not of the exception: the document exists, the mirror already says POSTED, and the
+ * id is what makes the retry resume at the follow-ups instead of posting a second document. A
+ * database blip on a posted row is not evidence the post came undone.
+ *
+ * THE ROUTES THAT REACH IT. Round 2's inner catch covers the short-circuit arm's follow-up work
+ * only. Everything else on that arm still lands here: the payload re-read
+ * (`readClaimedSyncLogPayload`), the SYNCED/POSTED transaction itself, `logActivity`, a throw from
+ * `markSyncLogForFollowUpRetry`. And on the FRESH-POST arm the row acquires an id mid-iteration —
+ * `entry.externalTransactionId` is the PRE-CLAIM snapshot and is still null in memory — so a failure
+ * after that transaction commits is a failure on a posted row that no in-memory test can recognise.
+ * That is why this asks the DATABASE, in the statement that writes.
+ *
+ * FENCED, NOT READ-THEN-WRITE. `where: { externalTransactionId: { not: null } }` makes the question
+ * and the answer one statement, so a post that lands between them cannot be written over — and its
+ * sibling below is fenced the opposite way, so the two are mutually exclusive by construction rather
+ * than by the order they are called in. `count === 0` means the row names no document (or is gone),
+ * and the caller falls through to the ordinary failure.
+ *
+ * Writes NO mirrored event. That is the whole point, and it is why this is a separate statement from
+ * the main-failure transaction rather than a flag on it.
+ */
+async function markPostedSyncLogRetryPreservingEvidence(
+  client: Pick<Prisma.TransactionClient, 'accountingSyncLog'>,
+  entry: { id: string; retryCount: number },
+  errorMessage: string,
+): Promise<boolean> {
+  const updated = await client.accountingSyncLog.updateMany({
+    where: { id: entry.id, externalTransactionId: { not: null } },
+    data: postedRowRetryColumns(entry, errorMessage),
+  })
+  return updated.count > 0
+}
+
+/**
+ * HOW MANY TIMES THE FRESH POST'S EVIDENCE TRANSACTION IS RE-DRIVEN BEFORE THE ID IS DECLARED
+ * UNRECORDABLE.
+ *
+ * The same number and the same reasoning as the Xero side's EVIDENCE_TRANSACTION_ATTEMPTS: each
+ * attempt is a WHOLE fresh transaction writing the same two rows from the same in-memory result, so
+ * re-driving weakens nothing, and the common failure here is a serialization conflict or a deadlock
+ * victim that would commit perfectly well a moment later. No sleep between attempts, deliberately —
+ * a cron worker holding a claim is the wrong place to add latency.
+ */
+const POST_EVIDENCE_TRANSACTION_ATTEMPTS = 3
+
+/**
+ * THE ONE WRITE THAT TURNS A RETURNED ID INTO A FACT THE DATABASE KNOWS.
+ *
+ * Extracted so it can be RE-DRIVEN (below) rather than attempted once. Its contents are unchanged:
+ * SYNCED + the external id + the follow-up obligation claim, and the mirrored event stamped POSTED,
+ * in ONE transaction — everything after it can die without the row ever being re-posted.
+ */
+async function persistFreshQboPost(
+  entry: { id: string; type: AccountingSyncType; referenceType: string; referenceId: string },
+  payload: SyncPayload,
+  externalId: string | null,
+  /**
+   * Returns THE OBLIGATION GENERATION THIS PASS MINTED (o3d-0bfh r4), or `null` when the claim did
+   * not land. A pass that owns no generation has no standing to say the follow-ups are done, so the
+   * value has to travel out of the transaction that took it rather than be re-read afterwards —
+   * re-reading gives whichever generation is live NOW, which may be somebody else's.
+   */
+): Promise<Date | null> {
+  return await db.$transaction(async (tx) => {
+    await tx.accountingSyncLog.update({
+      where: { id: entry.id },
+      data: {
+        status: 'SYNCED',
+        externalTransactionId: externalId,
+        syncedAt: new Date(),
+        errorMessage: null,
+        processingStartedAt: null,
+      },
+    })
+    // The external id and the record that follow-ups are owed become durable in ONE
+    // TRANSACTION (r10 finding 1) — the comment above is exactly why they have to: everything
+    // after it can die without the row ever being re-posted. o3d-0bfh r4 moved the claim out of
+    // the statement above and into this one so it can read the generation it replaces and report
+    // the one it minted; both statements commit together, so the window is still zero.
+    const claim = await claimFollowUpObligation(tx, { syncLogId: entry.id, connector: QBO_CONNECTOR })
+    await updateMirroredEventForSyncLog(tx, {
+      syncLogId: entry.id,
+      type: entry.type,
+      referenceType: entry.referenceType,
+      referenceId: entry.referenceId,
+      payload,
+      status: 'POSTED',
+      externalId,
+    })
+    return claim.claimed ? claim.generation : null
+  })
+}
+
+/** The one shape of the durable record, so the two places that write it cannot drift apart. */
+function unpersistedQboPostRecord(incident: UnpersistedQboPost, description: string) {
+  const { entry } = incident
+  return {
+    userId: null,
+    entityType: 'SYSTEM' as const,
+    entityId: entry.id,
+    action: QBO_UNRECORDED_POSTED_DOCUMENT_ACTION,
+    tag: 'sync',
+    level: 'ERROR' as const,
+    description: redactActivityLogText(description),
+    metadata: JSON.parse(JSON.stringify(sanitizeActivityLogMetadata({
+      syncLogId: entry.id,
+      type: entry.type,
+      referenceType: entry.referenceType,
+      referenceId: entry.referenceId,
+      postedExternalId: incident.postedExternalId,
+      // o3d-batch-ret r10: what the ATTEMPT did, which the operation type cannot say. See the Xero
+      // builder for why an absent key must read as "not recorded" and never as a live posting.
+      postingMode: incident.outcome?.postingMode ?? null,
+      externalEffect: incident.outcome?.externalEffect ?? null,
+      // o3d-batch-ret r12 (Codex MEDIUM): the ledger document this operation acted ON. See the Xero
+      // builder — a remedy that says "open that bill" has to be able to say WHICH bill.
+      ledgerTargetId: incident.outcome?.ledgerTargetId ?? null,
+    }))),
+  }
+}
+
+/**
+ * PERSIST THE ID THIS WORKER IS HOLDING, OR ESCALATE THE DOCUMENT IT CANNOT WRITE DOWN — AND NEVER
+ * FALL THROUGH TO A HANDLER THAT WOULD CALL IT A FAILED POST (Codex r5, HIGH).
+ *
+ * THE DEFECT. Rounds 2 and 4 fixed the cases where the row ALREADY CARRIED an external id: the
+ * database could be asked, so the failure handler could establish there was a document not to
+ * contradict. This is the case where it does not carry one yet. The connector returned success —
+ * QUICKBOOKS ALREADY HOLDS THE DOCUMENT — and the id is recorded only by the transaction above. If
+ * that transaction fails, the database never learns the id, `markPostedSyncLogRetryPreservingEvidence`
+ * correctly answers "this row names no document", and the ordinary failure path writes a FAILED
+ * MIRROR FOR A DOCUMENT THAT EXISTS. The evidence fence cannot help: there is no evidence, and that
+ * is precisely the problem.
+ *
+ * WHAT THIS IS, NAMED. It is o3d-jit6 on this connector — "a commit failure after a successful post
+ * discards the new document id, and the retry posts again". The full answer is a PRE-POST DISPATCH
+ * RECORD, so the id has somewhere to live before the call is made; the Xero mechanism for it is in
+ * flight on o3d-batch-prov and is not merged, and building a second copy of it here would be a much
+ * larger change made in a hurry. The QuickBooks equivalent is filed as o3d-tr2q.
+ *
+ * SO THIS DOES THE SMALLER, CORRECT THING. At this point the process HOLDS the returned id and KNOWS
+ * the post succeeded, so:
+ *
+ *   • the durable persistence is RE-DRIVEN, because the common failure is a blip, not a verdict;
+ *   • if it still cannot be written, the identifier is RECORDED AND ESCALATED — an ERROR ActivityLog
+ *     row under the retention exemption (evidence that expires is the same defect one layer out),
+ *     plus a console line that cannot fail and cannot be swept;
+ *   • and NO MIRRORED EVENT IS WRITTEN AT ALL, on any exit. A FAILED mirror contradicts a document
+ *     that exists — the principle this branch has now established twice — and it is untrue here for
+ *     exactly the same reason it was there: the fact is about the LEDGER, not about the exception.
+ *
+ * THE ROW IS LEFT ALONE on the escalation path, deliberately. Writing PENDING/FAILED over it would
+ * record a post that failed, which is the falsehood being avoided; and the row still holds this
+ * worker's claim, so `CLAIM_STALE_MS` later it is re-claimed and re-attempted. FOR A DOCUMENT POST
+ * that re-attempt goes out under the SAME derived Intuit Request-Id, which is what makes it a
+ * deduplicated replay rather than a second document. (Not a guarantee, which is why o3d-tr2q exists;
+ * the record above is what makes the residual risk visible to a person rather than silent.)
+ *
+ * FOR THE FOUR NO-IDENTIFIER OPERATIONS IT IS NOT A DEDUPLICATED REPLAY, AND THE RECORD NOW SAYS SO.
+ * `BILL_ATTACHMENT`, `INVOICE_PDF`, `INVOICE_EMAIL` and `WC_INVOICE_NOTE` reach this function on
+ * exactly the same path — they succeed, they carry no external id, and nothing sent them under a
+ * Request-Id — so the stale-claim reclaim REPEATS THE EFFECT: another upload, another PDF write,
+ * another email to the customer, another WooCommerce note, once per sweep, unbounded. That is a real
+ * open defect, filed as o3d-qn21, and it is NOT fenced here: rounds 6 and 7 built the fence out of a
+ * claim-time marker and it was unsound twice over (a claim is not proof of dispatch, and a failure is
+ * not proof of no effect), so the machinery was reverted and the hole was filed instead. What
+ * `describeUnpersistedQboPost` does is refuse to describe a protection these four do not have — it
+ * tells the operator the effect will repeat, what the effect is, and WHAT CAN AND CANNOT BE PRESSED.
+ *
+ * IT DOES NOT PRESCRIBE SETTLING THE ROW AT ALL (round 7), AND THAT IS A REVERSAL. Rounds 4 to 6
+ * built a per-row remedy — retire QuickBooks in favour of Xero, turn `quickbooks_sync_enabled` off,
+ * count, settle by adoption, turn it back on — on the premise that the toggle quiesces the
+ * connector. It does not: both claim paths READ that setting and then call this processor, so a run
+ * admitted before the flip still claims; its claim leaves the row at attempt revision 0, which is
+ * what adoption's compare-and-swap matches; and `persistFreshQboPost` above updates the row BY ID
+ * with no claim or attempt fence, so its write lands on top of a settlement. The record now says
+ * turn the toggle off, LEAVE it off, and escalate the row. Do not re-add a settle instruction here
+ * or there until o3d-4b5p gives this connector a real quiescence fence. The single authority on the
+ * wording is `describeUnpersistedQboPost`.
+ *
+ * Returns whether the id is now durable, AND — o3d-0bfh r4 — the obligation generation the durable
+ * write claimed. `persisted: false` means the caller must NOT continue into the follow-ups and must
+ * NOT let the outer handler see this iteration; there is then no generation, which is correct, since
+ * a pass whose post was never recorded has claimed nothing it could later discharge.
+ */
+type FreshQboPostPersistence =
+  | { persisted: true; obligation: Date | null }
+  | { persisted: false }
+
+async function persistFreshQboPostOrEscalate(
+  entry: { id: string; type: AccountingSyncType; referenceType: string; referenceId: string },
+  payload: SyncPayload,
+  externalId: string | null,
+  /** o3d-batch-ret r10: the handler's own answer to "did anything leave this process". */
+  externalEffect?: RemoteEffectOutcome,
+): Promise<FreshQboPostPersistence> {
+  let lastError: unknown
+  for (let attempt = 0; attempt < POST_EVIDENCE_TRANSACTION_ATTEMPTS; attempt += 1) {
+    try {
+      return { persisted: true, obligation: await persistFreshQboPost(entry, payload, externalId) }
+    } catch (error) {
+      lastError = error
+    }
+  }
+
+  // o3d-batch-ret r10 (Codex HIGH): THIS CONNECTOR HAS NO DRAFT FORM OF ANY DOCUMENT. Its invoice
+  // module says so in as many words — "No DRAFT/AUTHORISED status distinction on creation" — and no
+  // QuickBooks handler reads `_postingMode` or sends a status of any kind. So the mode is LIVE as a
+  // FACT about this connector, not as a default, and a test holds the connector to it: the day a
+  // draft path appears here, resolving LIVE unconditionally would be the same falsehood the Xero
+  // side was corrected for.
+  const outcome: PostedOperationOutcome = {
+    postingMode: 'LIVE',
+    externalEffect,
+    // r12: the ledger document this operation acted on, read off the row's own payload.
+    ledgerTargetId: ledgerTargetIdFromPayload(payload),
+  }
+  const incident: UnpersistedQboPost = { entry, postedExternalId: externalId, outcome }
+  const description = describeUnpersistedQboPost(incident, lastError)
+  // The console line FIRST, because it cannot fail and cannot be swept: at this instant it is the
+  // only place the identifier is written down, and a crash inside the durable write below must still
+  // leave the incident said out loud.
+  console.error(`[quickbooks-sync] ${description}`)
+  try {
+    await db.activityLog.create({ data: unpersistedQboPostRecord(incident, description) })
+  } catch (cause) {
+    // Swallowed on purpose: there is nothing further to try, and throwing from here would replace an
+    // escalation with a stack trace — landing in the very handler that would then write the FAILED
+    // mirror this whole function exists to prevent.
+    console.error(
+      `[quickbooks-sync] the unrecorded-document record for sync log ${entry.id} could not be `
+      + `written either: ${String(cause)}`,
+    )
+  }
+  return { persisted: false }
+}
+
+/**
  * o3d-anu8, CROSS-PORTED FROM THE XERO PATH (Codex, this branch) — A LIVE ROW SUPPRESSES THIS WORK,
  * AND ONLY THE CONNECTOR IS ENTITLED TO.
  *
@@ -258,7 +620,7 @@ export async function enqueueFollowUpSyncLog(
   payload: SyncPayload,
   /** Bounds the re-plan below, so a pathological race cannot recurse forever. */
   attempt = 0,
-): Promise<void> {
+): Promise<FollowUpEnqueueOutcome> {
   const live = await hasExistingSyncLog(type, referenceType, referenceId, payload)
   const liveRowExists = live.exists
   // o3d-h2wx: a FAILED row is REUSED rather than replaced. The QuickBooks Request-Id is
@@ -300,17 +662,28 @@ export async function enqueueFollowUpSyncLog(
     liveRowAsserted: live.asserted,
     failedRows,
   })
-  if (plan.action === 'skip') return
+  // A live row already owns this scope, so the follow-up IS queued — by that row.
+  if (plan.action === 'skip') return FOLLOW_UPS_ENQUEUED
   if (plan.action === 'refuse') {
+    // o3d-peh1, cross-ported from the Xero side: the refusal is REPORTED TO THE CALLER, not only to
+    // the activity log. QuickBooks has no back-reference sweep to be misled (see the note at the end
+    // of this file), but its own post path releases the follow-up obligation on the strength of this
+    // call returning, and a refusal that returns normally discharges a marker for work never done.
+    const message = `Refused to re-enqueue QuickBooks ${type} for ${referenceType} ${referenceId}: ${plan.reason} `
+      + 'Nothing was queued and the FAILED rows are unchanged. '
+      + 'A RETRY CANNOT CLEAR THIS: the manual retry applies the same rule and refuses for the same reason. Open the '
+      + 'document in QuickBooks, establish which attempt actually landed, and record that on each row with Settle on the '
+      + 'accounting sync log (\'it posted, here is the id\' / \'it did not post\'). The follow-up is enqueued by the '
+      + 'next sweep once the scope is no longer ambiguous.'
     await logActivity({
       entityType: 'SYSTEM',
       action: 'quickbooks_followup_enqueue_refused',
       tag: 'sync',
       level: 'WARNING',
-      description: `Refused to re-enqueue QuickBooks ${type} for ${referenceType} ${referenceId}: ${plan.reason}`,
-      metadata: { type, referenceType, referenceId, failedRowIds: failedRows.map((row) => row.id) },
+      description: message,
+      metadata: { type, referenceType, referenceId, reason: 'plan_refused', failedRowIds: failedRows.map((row) => row.id) },
     })
-    return
+    return refusedFollowUpEnqueue({ type, referenceType, referenceId, reason: 'plan_refused', message })
   }
 
   // o3d-0m56: the AUTOMATIC path carries the identical hazard the manual retry does. Reviving a
@@ -326,17 +699,27 @@ export async function enqueueFollowUpSyncLog(
     syncLogId: plan.action === 'reuse' ? plan.syncLogId : undefined,
   })
   if (!evidence.clear) {
+    const message = `Refused to re-enqueue QuickBooks ${type} for ${referenceType} ${referenceId}: `
+      + `${evidence.reason}. Re-posting it could duplicate a payment, so nothing was queued and the row is `
+      + 'unchanged. Open the document in QuickBooks: if that settlement IS this attempt, record it with Settle on the '
+      + 'accounting sync log so the row stops being retried; if it is not, the follow-up is enqueued by the next '
+      + 'sweep once the ledger no longer matches.'
     await logActivity({
       entityType: 'SYSTEM',
       action: 'quickbooks_followup_enqueue_refused',
       tag: 'sync',
       level: 'WARNING',
-      description: `Refused to re-enqueue QuickBooks ${type} for ${referenceType} ${referenceId}: `
-        + `${evidence.reason}. Re-posting it could duplicate a payment; check the ledger and resolve `
-        + 'the row by hand.',
-      metadata: { type, referenceType, referenceId, failedRowIds: failedRows.map((row) => row.id) },
+      description: message,
+      metadata: { type, referenceType, referenceId, reason: 'ledger_not_clear', failedRowIds: failedRows.map((row) => row.id) },
     })
-    return
+    return refusedFollowUpEnqueue({
+      type,
+      referenceType,
+      referenceId,
+      reason: 'ledger_not_clear',
+      message,
+      syncLogId: plan.action === 'reuse' ? plan.syncLogId : undefined,
+    })
   }
 
   try {
@@ -361,7 +744,8 @@ export async function enqueueFollowUpSyncLog(
         })
       })
       if (revived.count === 0) {
-        await resolveLostFollowUpRevival({
+        // o3d-peh1: the resolver's verdict IS this call's verdict — see the Xero twin.
+        return await resolveLostFollowUpRevival({
           connector: QBO_CONNECTOR,
           type,
           referenceType,
@@ -374,10 +758,9 @@ export async function enqueueFollowUpSyncLog(
           // key as the row that vanished. That is what makes losing the row survivable.
           retry: () => enqueueFollowUpSyncLog(type, referenceType, referenceId, plan.payload, attempt + 1),
         })
-        return
       }
       await logFollowUpRevival(QBO_CONNECTOR, type, referenceType, referenceId, plan)
-      return
+      return FOLLOW_UPS_ENQUEUED
     }
     await db.$transaction(async (tx) => {
       await lockFollowUpScope(tx, { connector: QBO_CONNECTOR, type, referenceType, referenceId })
@@ -404,7 +787,7 @@ export async function enqueueFollowUpSyncLog(
     // same resolver as a lost compare-and-set, which only accepts a live row carrying our
     // token.
     if (isUniqueConstraintViolation(error)) {
-      await resolveLostFollowUpRevival({
+      return await resolveLostFollowUpRevival({
         connector: QBO_CONNECTOR,
         type,
         referenceType,
@@ -414,10 +797,10 @@ export async function enqueueFollowUpSyncLog(
         attempt,
         retry: () => enqueueFollowUpSyncLog(type, referenceType, referenceId, plan.payload, attempt + 1),
       })
-      return
     }
     throw error
   }
+  return FOLLOW_UPS_ENQUEUED
 }
 
 /**
@@ -507,6 +890,8 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
       processingStartedAt: claimedAt,
       data: {
         status: 'PROCESSING',
+        // Attempt-stamping custody moves with the claim through `stampingCustodyOnClaim` above
+        // (o3d-0m56 r10 / o3d-anu8 r3), which wraps this whole argument.
       },
     }))
     if (claim.count === 0) continue
@@ -557,21 +942,79 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
           })
           return claim.claimed ? claim.generation : null
         })
-        const link = await updateBackReference(entry.id, entry.type, entry.referenceType, entry.referenceId, entry.externalTransactionId, undefined)
-        // o3d-0bfh r15: the generation this pass claimed goes DOWN to the deferred-receipt re-drive,
-        // so its final re-read and this release commit together under the sales-order lock. It is
-        // withheld when the LINK did not land: the marker is then the record of that debt too, and
-        // the receipt fence knows nothing about it (`settleFollowUpObligation` keeps it below).
-        const followUps = await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, { externalId: entry.externalTransactionId },
-          backReferenceLeavesNothingOwed(link) ? obligation : null)
-        // Only reached when the enqueue did NOT throw. This branch has no catch of its own — an
-        // exception propagates to the outer handler, which retries the row — so the obligation
-        // simply stays claimed, which is the correct state for work that has not run.
+        // EVERY FOLLOW-UP FAILURE ON THIS ARM IS CAUGHT HERE, AND NONE OF THEM MAY REACH THE
+        // MAIN-POST FAILURE HANDLER (Codex round 2, HIGH).
         //
-        // AND NOT THROWING IS NOT THE SAME AS NOTHING BEING OWED (o3d-ekn8 r5): the back-reference
-        // write swallows its failure and the deferred-receipt re-drive is built never to throw, so
-        // the discharge asks both of them instead of inferring it from the absence of an exception.
-        await settleFollowUpObligation(entry, link, followUps, obligation)
+        // Round 1 gave the refusal its own transition on the FRESH-POST arm and left this one
+        // relying on the outer handler, reasoning that it "retries the row with the obligation still
+        // claimed". It does retry it — and on the LAST retry it also stamps the mirrored
+        // AccountingEvent FAILED, a few lines after this very branch wrote that same event POSTED.
+        // A row is only in this branch because `externalTransactionId` is set, i.e. because the
+        // document IS in QuickBooks, so the outer handler's terminal write records a live ledger
+        // document as a failed post — worse than the defect round 1 closed.
+        //
+        // Round 1 had already written down why: `markSyncLogForFollowUpRetry` writes NO mirrored
+        // event precisely because "this document POSTED, the mirror already says so, and overwriting
+        // it would make the ledger's own copy of the record contradict the ledger". That reasoning
+        // applies to this arm most of all, and it was the one arm not using the transition.
+        //
+        // So the follow-up work takes a catch of its own — the same shape as the Xero twin, which
+        // has had one since o3d-nepa — routed to the follow-up-only retry transition. Nothing else
+        // moves: the entry is still counted FAILED, still bounded by MAX_RETRIES, still keeps its
+        // external id and its obligation marker, and still re-enters this short-circuit on the next
+        // pass rather than posting a second document.
+        //
+        // CATCH-ALL, NOT `instanceof FollowUpEnqueueRefused`. The narrow catch belongs to the
+        // FRESH-POST arm, where a plain follow-up failure is deliberately best-effort and falls
+        // through to `succeeded` (o3d-peh1, and the test that pins it). Nothing on THIS arm was ever
+        // best-effort: every exception here already counted FAILED, through the outer handler. So
+        // for a plain failure the only thing that changes is WHICH transition records it, and it is
+        // the transition that does not contradict the ledger.
+        try {
+          const link = await updateBackReference(entry.id, entry.type, entry.referenceType, entry.referenceId, entry.externalTransactionId, undefined)
+          // o3d-0bfh r15: the generation this pass claimed goes DOWN to the deferred-receipt re-drive,
+          // so its final re-read and this release commit together under the sales-order lock. It is
+          // withheld when the LINK did not land: the marker is then the record of that debt too, and
+          // the receipt fence knows nothing about it (`settleFollowUpObligation` keeps it below).
+          const followUps = await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, { externalId: entry.externalTransactionId },
+            backReferenceLeavesNothingOwed(link) ? obligation : null)
+          // o3d-peh1: a REFUSED enqueue throws here for the same reason a failed one does — the
+          // release below must not discharge a marker for work that was never queued. It throws into
+          // THIS arm's own catch, not the outer handler, which is the whole point of the block above.
+          requireFollowUpsEnqueued(entry.id, followUps)
+          // Only reached when the enqueue did NOT throw — and on this arm a throw is caught directly
+          // above, so the obligation simply stays claimed, which is the correct state for work that
+          // has not run.
+          //
+          // AND NOT THROWING IS NOT THE SAME AS NOTHING BEING OWED (o3d-ekn8 r5): the back-reference
+          // write swallows its failure and the deferred-receipt re-drive is built never to throw, so
+          // the discharge asks both of them instead of inferring it from the absence of an exception.
+          // That is a THIRD silent answer beside the refusal above, and each is invisible to the
+          // others: nothing queued, money queued but not landed, and a link that never wrote.
+          await settleFollowUpObligation(entry, link, followUps, obligation)
+        } catch (followUpError) {
+          await logActivity({
+            entityType: 'SYSTEM',
+            action: 'quickbooks_followup_error',
+            tag: 'sync',
+            level: 'ERROR',
+            description: `QuickBooks sync entry ${entry.id} is already posted (${entry.externalTransactionId}) but its `
+              + `follow-up work could not be completed: ${String(followUpError)}. The document is in QuickBooks and the `
+              + 'entry keeps its external id, so a retry resumes at the follow-ups rather than posting again.',
+            metadata: {
+              syncLogId: entry.id,
+              type: entry.type,
+              referenceType: entry.referenceType,
+              referenceId: entry.referenceId,
+              externalTransactionId: entry.externalTransactionId,
+            },
+            // A log write that fails must not throw out of the catch and land in the main-post
+            // failure handler — which is the entire hazard this block exists to remove.
+          }).catch(() => { /* the announcement is best-effort; the transition below is not */ })
+          await markSyncLogForFollowUpRetry(entry, followUpError)
+          result.failed++
+          continue
+        }
         result.succeeded++
         continue
       }
@@ -588,34 +1031,26 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
         // Persist external ID and SYNCED status BEFORE any follow-up work.
         // If follow-ups fail, the next retry will see externalTransactionId
         // and skip the QBO write (idempotency guard above).
-        const obligation = await db.$transaction(async (tx) => {
-          await tx.accountingSyncLog.update({
-            where: { id: entry.id },
-            data: {
-              status: 'SYNCED',
-              externalTransactionId: syncResult.externalId ?? null,
-              syncedAt: new Date(),
-              errorMessage: null,
-              processingStartedAt: null,
-            },
-          })
-          // The external id and the record that follow-ups are owed become durable in ONE
-          // TRANSACTION (r10 finding 1) — the comment above is exactly why they have to: everything
-          // after it can die without the row ever being re-posted. o3d-0bfh r4 moved the claim out
-          // of the statement above and into this one so it can read the generation it replaces and
-          // report the one it minted; both statements commit together, so the window is still zero.
-          const claim = await claimFollowUpObligation(tx, { syncLogId: entry.id, connector: QBO_CONNECTOR })
-          await updateMirroredEventForSyncLog(tx, {
-            syncLogId: entry.id,
-            type: entry.type,
-            referenceType: entry.referenceType,
-            referenceId: entry.referenceId,
-            payload,
-            status: 'POSTED',
-            externalId: syncResult.externalId ?? null,
-          })
-          return claim.claimed ? claim.generation : null
-        })
+        //
+        // AND IF THAT PERSISTENCE ITSELF FAILS, THIS ITERATION ENDS HERE (Codex r5, HIGH). The
+        // document is in QuickBooks and the id is in this process's memory; letting the throw reach
+        // the outer handler would produce a FAILED mirror for a document that exists, and the
+        // evidence fence there cannot stop it because the database has no evidence yet. See
+        // persistFreshQboPostOrEscalate: the write is re-driven, and an id that still cannot be
+        // recorded is escalated rather than denied.
+        // o3d-0bfh r4: AND IT HANDS BACK THE GENERATION IT CLAIMED, rather than the claim being a
+        // fragment of the SYNCED update. The claim reads the generation it replaces and reports the
+        // one it minted, inside the same transaction, so the release below is fenced on a value no
+        // overlapping pass can also be holding. Extracting the transaction into the escalating
+        // helper is what made it a return value instead of a write nobody could name.
+        const persistence = await persistFreshQboPostOrEscalate(
+          entry, payload, syncResult.externalId ?? null, syncResult.externalEffect,
+        )
+        if (!persistence.persisted) {
+          result.failed++
+          continue
+        }
+        const obligation = persistence.obligation
 
         // Follow-up work (back-references, enqueue PDF/email/payment).
         // These are best-effort: if they fail, the external post is already
@@ -626,6 +1061,10 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
           // fenced by the order lock, and is withheld when the link itself is still owed.
           const followUps = await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, syncResult,
             backReferenceLeavesNothingOwed(link) ? obligation : null)
+          // o3d-peh1: and a REFUSED enqueue throws, exactly as a failed one does. Distinct from
+          // both answers the settle helper reads below — a link that did not land and a receipt
+          // that did not reach the ledger — because this one queued nothing at all.
+          requireFollowUpsEnqueued(entry.id, followUps)
           // o3d-ekn8 r5, Codex HIGH: released only if the link landed AND the receipts recorded
           // before this invoice reached the ledger. Neither of those failures throws, so both had
           // been arriving here as success and clearing the row's last record of the work.
@@ -667,6 +1106,29 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
             metadata: { syncLogId: entry.id, type: entry.type, referenceType: entry.referenceType, referenceId: entry.referenceId },
             syncLogId: entry.id,
           })
+          // o3d-peh1, cross-ported from the Xero side (Codex, this branch) — A REFUSAL IS NOT A
+          // BEST-EFFORT FAILURE, AND THIS CATCH WAS ABSORBING BOTH.
+          //
+          // `requireFollowUpsEnqueued` was added above so that a refused enqueue could not be read as
+          // success. On this branch it could: the throw landed here, was logged, and execution fell
+          // through to `result.succeeded++` one line down — the parent stamped SYNCED and counted
+          // settled while the money-moving child was never queued. That is the exact defect
+          // o3d-peh1 exists to fix, surviving on the other connector because only the Xero caller was
+          // changed to act on the refusal.
+          //
+          // So the parent goes back to UNSETTLED, keeping its external id and its obligation marker
+          // (see markSyncLogForFollowUpRetry for why each of those is load-bearing), and the entry is
+          // counted FAILED. Nothing is re-posted: the retry finds the external id and takes the
+          // idempotency short-circuit straight to the follow-ups.
+          //
+          // A plain follow-up FAILURE still falls through to `succeeded` exactly as before. It is a
+          // transient error whose work the obligation marker records, and turning that into a retry
+          // here would be a second change wearing this one's clothes.
+          if (followUpError instanceof FollowUpEnqueueRefused) {
+            await markSyncLogForFollowUpRetry(entry, followUpError)
+            result.failed++
+            continue
+          }
         }
 
         result.succeeded++
@@ -712,6 +1174,9 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
     } catch (e) {
       const errorMessage = String(e)
       if (isRateLimitError(errorMessage)) {
+        // Not evidence-aware, and does not need to be: a backoff writes no mirrored event at all, so
+        // there is nothing here that could contradict a document in the ledger. It still re-asserts
+        // custody on the claim (o3d-anu8), which is a separate rule and not one this may drop.
         await db.accountingSyncLog.updateMany(stampingCustodyOnClaim({
           where: { id: entry.id },
           processingStartedAt: new Date(Date.now() + getRateLimitBackoffMs(entry.retryCount, errorMessage)),
@@ -724,8 +1189,27 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
         const retryCount = entry.retryCount + 1
         const finalFailure = retryCount >= MAX_RETRIES
         await db.$transaction(async (tx) => {
-          await tx.accountingSyncLog.update({
-            where: { id: entry.id },
+          // EVIDENCE FIRST (Codex r4, HIGH). THE EXTERNAL ID IS POST EVIDENCE, AND A FAILED MIRROR
+          // CONTRADICTS A DOCUMENT THAT EXISTS — so before this handler may record a failed post it
+          // has to establish that there is no post to contradict, and it has to do that against the
+          // DATABASE. `entry` is the PRE-CLAIM snapshot: on the fresh-post arm the row acquires its
+          // id mid-iteration and `entry.externalTransactionId` is still null in memory, so an
+          // in-memory test would answer "not posted" about a document that is in QuickBooks.
+          //
+          // Round 3 closed the follow-up ROUTE on the short-circuit arm. Everything else on that arm
+          // still arrives here — the payload re-read, the SYNCED/POSTED transaction, the activity
+          // write, a throw from the follow-up transition itself — and arrived at a handler that, on
+          // the last retry, stamped the mirrored event FAILED over the POSTED one written moments
+          // earlier. It is untrue for a transient error exactly as it is for a refusal: the reasons
+          // are facts about the ledger, not about the exception.
+          //
+          // TWO MUTUALLY EXCLUSIVE FENCED STATEMENTS, one transaction. Each carries the opposite
+          // predicate on `externalTransactionId`, so which one applies is decided by the row at the
+          // moment of the write rather than by a read taken before it — a post that commits between
+          // them cannot be written over, and neither can both land.
+          if (await markPostedSyncLogRetryPreservingEvidence(tx, entry, errorMessage)) return
+          const failed = await tx.accountingSyncLog.updateMany({
+            where: { id: entry.id, externalTransactionId: null },
             data: {
               status: finalFailure ? 'FAILED' : 'PENDING',
               retryCount,
@@ -733,7 +1217,11 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
               processingStartedAt: null,
             },
           })
-          if (finalFailure) {
+          // AND THE MIRROR FOLLOWS THE WRITE THAT LANDED, not the intention. `count === 0` here means
+          // the row named a document by the time this statement ran (or is gone) — either way this
+          // handler has recorded nothing, and a FAILED mirror written beside a write that matched
+          // nothing would be the same lie by another route.
+          if (failed.count > 0 && finalFailure) {
             await updateMirroredEventForSyncLog(tx, {
               syncLogId: entry.id,
               type: entry.type,
@@ -779,7 +1267,19 @@ async function processEntry(
   // o3d-550x: the instant this worker claimed the row. Still needed after o3d-e2mz — this connector
   // mints no attempt revision, so the claim is the ONLY fence its cancelled-order retirement has.
   claimedAt: Date,
-): Promise<{ success: boolean; externalId?: string; invoiceNumber?: string; error?: string; skipped?: boolean }> {
+): Promise<{
+  success: boolean
+  externalId?: string
+  invoiceNumber?: string
+  error?: string
+  skipped?: boolean
+  /**
+   * o3d-batch-ret r10 (Codex MEDIUM): DID THIS HANDLER TOUCH QUICKBOOKS AT ALL? Set only by the
+   * handlers that can succeed WITHOUT a remote call — `BILL_ATTACHMENT` returns success and uploads
+   * nothing when `quickbooks_sync_attach_pdf` is 'false'. Absent means "not recorded".
+   */
+  externalEffect?: RemoteEffectOutcome
+}> {
   const requestId = buildQboRequestId(getIdempotencySource(entryId, type, referenceId, payload))
 
   switch (type) {
@@ -1116,7 +1616,8 @@ async function processEntry(
       }
       const attachEnabled = await db.setting.findUnique({ where: { key: 'quickbooks_sync_attach_pdf' } })
       if (attachEnabled?.value === 'false') {
-        return { success: true }
+        // NOTHING LEAVES THIS PROCESS, and the record has to be able to say so (r10, Codex MEDIUM).
+        return { success: true, externalEffect: 'NONE' }
       }
       try {
         const relPath = supplierInvoicePath.replace(/^\/+/, '')
@@ -1130,7 +1631,8 @@ async function processEntry(
         if (!uploadRes.ok) {
           return { success: false, error: uploadRes.error ?? 'Failed to attach supplier invoice PDF' }
         }
-        return { success: true }
+        // An attachment now exists on that bill — no accounting document, but not nothing either.
+        return { success: true, externalEffect: 'MADE' }
       } catch (e) {
         return { success: false, error: String(e) }
       }
@@ -1577,7 +2079,7 @@ async function updateBackReference(
  * whose invoice HAS posted), so every way it can leave money unregistered arrived at the release as
  * success. This carries the fact back instead of leaving the loop to assume it.
  */
-type FollowUpOutcome = {
+type FollowUpOutcome = FollowUpEnqueueOutcome & {
   /** False when a receipt recorded before this invoice is still waiting to reach the ledger. */
   deferredReceiptsSettled: boolean
   /**
@@ -1590,6 +2092,231 @@ type FollowUpOutcome = {
    * second, unfenced clear re-opens the window the fence closes.
    */
   obligationFenced: boolean
+}
+
+/**
+ * WHAT THE PAYMENT HALF OF THIS POST OWES — AND EVERY PATH OUT OF IT SAYS SO (o3d-batch-ret r6,
+ * Codex HIGH). THE TWIN OF THE XERO FUNCTION OF THE SAME NAME, AND THE DEFECT WAS WHOLE HERE TOO.
+ *
+ * THE DEFECT WAS THE INITIAL VALUE, NOT THE BRANCH. This was inline in `enqueueSalesInvoiceFollowUps`
+ * as `let paymentOutcome: FollowUpEnqueueOutcome = FOLLOW_UPS_ENQUEUED`, narrowed only by the arm
+ * that actually reached `enqueueFollowUpSyncLog`. The two configuration arms — no payment account map
+ * at all, and no account mapped for this method/currency — wrote a WARNING and fell out without
+ * touching it, so a payload that asked for a payment and queued NOTHING still reported
+ * `enqueued: true`, the fence was handed no prerequisite, and it CLEARED the obligation generation.
+ *
+ * AND THE BLAST RADIUS IS LARGER HERE THAN ON XERO. This connector's registry entry declares
+ * `consumer: 'none'`: nothing re-reads a retained marker, so the marker is not a deferral, it is the
+ * only EVIDENCE that the money is owed. Clearing it early does not delay the payment, it ends the
+ * trail — which is why the operator sentence below is composed out of that registry entry rather
+ * than out of Xero's "the next sweep will pick it up", and why correcting the mapping afterwards
+ * cannot recover a row this already cleared.
+ *
+ * A DEFAULT THAT MEANS SUCCESS ACQUIRES EVERY BRANCH THAT FORGETS TO NARROW IT. That is a class, not
+ * an instance. The decision is therefore a FUNCTION with a declared `Promise<FollowUpEnqueueOutcome>`
+ * return type and no accumulator to inherit: under `strict`, a path that reaches the end without
+ * returning is a COMPILE ERROR (ts2366), not a silent claim of success.
+ *
+ * Behaviourally instrumented in tests/connectors/quickbooks-payment-mapping-refusal.test.ts, which
+ * drives the real `processPendingQuickBooksSync` and asserts the marker SURVIVES the pass.
+ */
+async function decideInvoicePaymentFollowUp(
+  referenceType: string,
+  referenceId: string,
+  payload: SyncPayload,
+  postedInvoiceId: string,
+): Promise<FollowUpEnqueueOutcome> {
+  /**
+   * o3d-batch-ret r10 (Codex HIGH) — THIS FUNCTION NO LONGER READS THE PAYLOAD AT ALL.
+   *
+   * It opened with `if (!payload._registerPayment) return FOLLOW_UPS_ENQUEUED` and then
+   * `payload._paymentMethod as string || ''` / `payload.currency as string || 'GBP'`. Those three
+   * lines were the last ad-hoc reads on this path, and each conflated an absent key with a present
+   * value nothing could read — the flag settling the obligation over a `null`, the currency settling
+   * a EUR payment into the sterling bank account. Every field is now classified by
+   * `decideRequestedInvoicePayment`, which hands this caller only values that WERE read; there is no
+   * raw payload expression left here for a default to be attached to, and a field added later has
+   * nowhere in this file to acquire one.
+   *
+   * o3d-batch-ret r11/r12 (Codex HIGH): AND IT IS NEVER HANDED A CURRENCY NOBODY VERIFIED.
+   * The absent-`currency` arm used to be a `GBP` literal; round 11 made it the IMS base currency, on
+   * the warrant that `connectQuickBooks` refuses to bind a ledger whose base currency is not
+   * `getBaseCurrencyCode()`. It refuses only when it could READ that base currency —
+   * `fetchCompanyInfo` answers `null` for a failed or malformed CompanyInfo read, the guard's
+   * truthy-only comparison then does not fire, and the binding is stored with the equality never
+   * established. So an absent `currency` no longer takes a default here at all: the fold refuses it
+   * under the `base-currency` fact. What this connector receives is a currency the PAYLOAD stated,
+   * which is the only one known to be the one the document posted in. o3d-emus persists the remote
+   * base currency the guard verified and restores the default against THAT.
+   *
+   * o3d-batch-ret r13 (Codex HIGH): AND THE REFUSAL IS NOW REACHABLE, which it was not when it was
+   * written. Measuring its blast radius found that no producer could emit an absent currency beside
+   * a payment request — and the reason was not that the producers are careful. The WooCommerce
+   * importer opened with `wcOrder.currency || 'GBP'`, so a payload that reached this fold ALWAYS
+   * named a currency, and where WooCommerce had stated none the name was sterling by invention. The
+   * guard could only ever have fired on a producer nobody had written yet. That default is gone
+   * (`readWcOrderCurrency` in the WooCommerce order importer refuses the import instead), so the
+   * absent-`currency` arm below now guards a case that can actually arrive: a producer that stops
+   * stating the currency reaches a refusal here rather than a sterling bank account.
+   *
+   * The two configuration arms below differ only in WHICH sentence an operator reads. The remedy is
+   * a SETTING — safe to repeat, and it cannot double anything — and what follows the correction is
+   * read off this connector's registry entry, which says nothing re-drives the row.
+   */
+  const refuse = async (
+    { method, currency }: { method: string; currency: string },
+    missing: string,
+    configure: string,
+  ): Promise<RefusedFollowUpEnqueue> => {
+    const message = paymentAccountRefusalMessage({
+      connector: 'QuickBooks',
+      referenceType,
+      referenceId,
+      missing,
+      configure,
+      /**
+       * THE RECOVERY CLAUSE IS THE ONE TRUE OF THIS CALL SITE, NOT THE ONE TRUE OF THE SWEEP
+       * (o3d-batch-ret r7, Codex MEDIUM).
+       *
+       * Round 6 passed the REGISTRY's note here, and on this connector that note says nothing
+       * re-enqueues the work and a human must READ AND ESCALATE. That is true of a RETAINED MARKER
+       * on a row at rest — which is what the registry describes, and what
+       * `settleFollowUpObligation` and the exception inbox are about — and FALSE of this refusal.
+       * A refusal from here is thrown by `requireFollowUpsEnqueued`, caught on both post arms, and
+       * turned by `markSyncLogForFollowUpRetry` into a PENDING posted parent that the very next
+       * processor pass selects and resumes at the follow-ups. So the operator was told to escalate
+       * a row that was actively retrying, and the asymmetry with Xero that sentence asserts is not
+       * the asymmetry of this path.
+       *
+       * The registry keeps the half it actually answers: `atRest` is what becomes of the row once
+       * the retries are spent, read from the same entry as before. Nothing about this connector's
+       * consumer is written here.
+       */
+      recovery: postedRowFollowUpRetryNote({
+        connector: 'QuickBooks',
+        maxRetries: MAX_RETRIES,
+        atRest: followUpObligationRecoveryNote(QBO_FOLLOW_UP_RECOVERY),
+      }),
+    })
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'quickbooks_payment_skipped',
+      tag: 'sync',
+      level: 'WARNING',
+      description: message,
+      metadata: {
+        type: 'INVOICE_PAYMENT',
+        referenceType,
+        referenceId,
+        reason: 'payment_account_unmapped',
+        method,
+        currency,
+      },
+    })
+    return refusedFollowUpEnqueue({
+      type: 'INVOICE_PAYMENT', referenceType, referenceId, reason: 'payment_account_unmapped', message,
+    })
+  }
+
+  /**
+   * o3d-batch-ret r8 (Codex HIGH) — THE OTHER PRE-ENQUEUE REFUSAL, AND IT IS NOT THE ONE ABOVE.
+   *
+   * The payload asked for a payment and cannot say how much. There is no setting to correct, so the
+   * remedy above would send an operator to a bank-account screen for a corrupt payload — and the
+   * recovery clause is NOT `postedRowFollowUpRetryNote`, whose whole sentence is that the retry
+   * queues the payment as soon as the mapping names an account. Nothing about this row changes on a
+   * retry, so the honest clause is the registry's at-rest fact and the message says the rest itself.
+   */
+  const refuseUnreadable = async (
+    { fact, detail, known: { method, currency } }: UnreadablePaymentPayload,
+  ): Promise<RefusedFollowUpEnqueue> => {
+    const message = unreadablePaymentPayloadRefusalMessage({
+      connector: 'QuickBooks',
+      referenceType,
+      referenceId,
+      fact,
+      detail,
+      recovery: followUpObligationRecoveryNote(QBO_FOLLOW_UP_RECOVERY),
+    })
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'quickbooks_payment_skipped',
+      tag: 'sync',
+      level: 'ERROR',
+      description: message,
+      metadata: {
+        type: 'INVOICE_PAYMENT',
+        referenceType,
+        referenceId,
+        reason: 'payment_payload_unreadable',
+        method,
+        currency,
+      },
+    })
+    return refusedFollowUpEnqueue({
+      type: 'INVOICE_PAYMENT', referenceType, referenceId, reason: 'payment_payload_unreadable', message,
+    })
+  }
+
+  /**
+   * THE AMOUNT IS RESOLVED BEFORE ANY CONFIGURATION IS CONSULTED (o3d-batch-ret r7, Codex MEDIUM) —
+   * THE TWIN OF THE XERO ORDERING — AND "UNKNOWN" NO LONGER ANSWERS "NOTHING" (r8, Codex HIGH).
+   *
+   * NOTHING TO MOVE IS NOT A REFUSAL. A readable non-positive amount owes no payment: QuickBooks
+   * would reject it, and there is no configuration for an operator to correct. A paid ZERO-TOTAL
+   * WooCommerce order carries `_registerPayment` with no `_paymentAmount`
+   * (`resolveWcInvoicePaymentAmount` guards on `gross > 0`), and below the mapping checks it was
+   * refused for a bank account it would never have used — on this connector a refusal FAILS the
+   * entry, so the posted parent retried five times over a payment nobody was owed.
+   *
+   * AN UNREADABLE ONE IS A REFUSAL, and the shape is what makes that unforgettable rather than the
+   * comment: `decideRequestedInvoicePayment` settles the `none` arm itself and hands this caller
+   * only the two arms that are its own, with `onInvalid` typed to return a REFUSED outcome. There
+   * is no expression here that can settle a payload whose amount could not be read.
+   */
+  return await decideRequestedInvoicePayment(payload, {
+    onInvalid: refuseUnreadable,
+    onAmount: async ({ amount, method, currency, paymentDate }) => {
+      const paymentMap = await getPaymentAccountMap()
+      if (!paymentMap || Object.keys(paymentMap).length === 0) {
+        return await refuse(
+          { method, currency },
+          'no payment account map is configured',
+          'Set up a bank account for each payment method under Settings → Accounting → Payment Account Mapping.',
+        )
+      }
+      const stored = lookupPaymentAccount(paymentMap, method, currency)
+      if (!stored) {
+        return await refuse(
+          { method, currency },
+          `no bank account is mapped for method "${method}" / currency "${currency}"`,
+          'Add that mapping under Settings → Accounting → Payment Account Mapping.',
+        )
+      }
+
+      // Resolve QBO customer ID for the payment request
+      let customerRef: string | undefined
+      if (referenceType === 'SalesOrder') {
+        const order = await db.salesOrder.findUnique({
+          where: { id: referenceId },
+          select: { customer: { select: { accountingContactId: true, accountingContactProvenance: true } } },
+        })
+        // Provenance-guarded (o3d-6nd): only enqueue an id that belongs to the active company, so a
+        // follow-up queued now cannot carry a former realm's id.
+        customerRef = (await customerContactIdIfCurrent(order?.customer)) ?? undefined
+      }
+
+      return await enqueueFollowUpSyncLog('INVOICE_PAYMENT', referenceType, referenceId, {
+        accountingInvoiceId: postedInvoiceId,
+        bankAccountId: stored,
+        amount,
+        paymentDate,
+        currency,
+        method,
+        customerRef,
+      })
+    },
+  })
 }
 
 async function enqueueSalesInvoiceFollowUps(
@@ -1608,77 +2335,39 @@ async function enqueueSalesInvoiceFollowUps(
    */
   followUpObligation: Date | null,
 ): Promise<FollowUpOutcome> {
-  if (referenceType !== 'SalesOrder' || !syncResult.externalId) return { deferredReceiptsSettled: true, obligationFenced: false }
+  if (referenceType !== 'SalesOrder' || !syncResult.externalId) return { enqueued: true, deferredReceiptsSettled: true, obligationFenced: false }
   // Captured once, so the id handed to the deferred re-drive below is provably the one THIS post
   // returned rather than a re-read of a narrowed property.
   const postedInvoiceId: string = syncResult.externalId
+  // o3d-peh1: the PAYMENT's outcome is kept and folded in with the PDF's at the end. Both are still
+  // attempted; a refused payment is no reason to withhold the PDF.
+  //
+  // o3d-batch-ret r6 (Codex HIGH), CROSS-PORTED WITH THE XERO PATH: a `const` from a function that
+  // must return, never a `let` seeded with success. See `decideInvoicePaymentFollowUp`.
+  const paymentOutcome = await decideInvoicePaymentFollowUp(referenceType, referenceId, payload, postedInvoiceId)
 
-  if (payload._registerPayment) {
-    const paymentMap = await getPaymentAccountMap()
-    const method = payload._paymentMethod as string || ''
-    const currency = payload.currency as string || 'GBP'
-
-    if (!paymentMap || Object.keys(paymentMap).length === 0) {
-      await logActivity({
-        entityType: 'SYSTEM',
-        action: 'quickbooks_payment_skipped',
-        tag: 'sync',
-        level: 'WARNING',
-        description: 'Skipped QuickBooks payment registration: no payment account map configured.',
-      })
-    } else {
-      const stored = lookupPaymentAccount(paymentMap, method, currency)
-      if (!stored) {
-        await logActivity({
-          entityType: 'SYSTEM',
-          action: 'quickbooks_payment_skipped',
-          tag: 'sync',
-          level: 'WARNING',
-          description: `Skipped QuickBooks payment registration: no bank account mapped for method "${method}" / currency "${currency}".`,
-        })
-      } else {
-        let amount = payload._paymentAmount as number | undefined
-        if (amount == null && typeof payload._paymentAmount === 'string') {
-          amount = Number(payload._paymentAmount)
-        }
-        if (amount == null) {
-          amount = (payload.lines as Array<{ quantity: number; unitAmount: number }>).reduce((s, l) => s + l.quantity * l.unitAmount, 0)
-            + ((payload.shippingAmount as number) || 0)
-            - ((payload.discountAmount as number) || 0)
-        }
-
-        if (amount > 0) {
-          // Resolve QBO customer ID for the payment request
-          let customerRef: string | undefined
-          if (referenceType === 'SalesOrder') {
-            const order = await db.salesOrder.findUnique({
-              where: { id: referenceId },
-              select: { customer: { select: { accountingContactId: true, accountingContactProvenance: true } } },
-            })
-            // Provenance-guarded (o3d-6nd): only enqueue an id that belongs to the active company, so a
-            // follow-up queued now cannot carry a former realm's id.
-            customerRef = (await customerContactIdIfCurrent(order?.customer)) ?? undefined
-          }
-
-          await enqueueFollowUpSyncLog('INVOICE_PAYMENT', referenceType, referenceId, {
-            accountingInvoiceId: syncResult.externalId,
-            bankAccountId: stored,
-            amount,
-            paymentDate: (payload._paymentDate as string)?.slice(0, 10) || new Date().toISOString().slice(0, 10),
-            currency,
-            method,
-            customerRef,
-          })
-        }
-      }
-    }
-  }
-
-  await enqueueFollowUpSyncLog('INVOICE_PDF', referenceType, referenceId, {
+  const pdfOutcome = await enqueueFollowUpSyncLog('INVOICE_PDF', referenceType, referenceId, {
     accountingInvoiceId: syncResult.externalId,
     referenceId,
     invoiceNumber: syncResult.invoiceNumber,
   })
+
+  // o3d-batch-ret (Codex HIGH), CROSS-PORTED WITH THE XERO PATH — THE SAME RELEASE-BEFORE-REQUIRE
+  // ORDERING WAS WHOLE HERE TOO. The verdict was built in the `return` below, past the fence that
+  // clears the marker, and `requireFollowUpsEnqueued` on this connector's post paths reads it after
+  // the generation is already gone. It matters MORE here than on Xero: this connector's recovery
+  // registry entry says nothing re-drives a retained marker, so the sweep that Xero relies on to
+  // pick the refused work back up does not exist — a marker cleared early is the end of the trail.
+  //
+  // GUARDED BEHAVIOURALLY, NOT STRUCTURALLY (r6, Codex MEDIUM): the round-5 source parse that
+  // asserted this ordering could be satisfied by a shape whose RUNTIME called the fence first, and
+  // it was deleted rather than deepened. tests/connectors/quickbooks-payment-mapping-refusal.test.ts
+  // drives this processor with an enqueue that refuses and reads whether the obligation was
+  // discharged — the observable a hoisted fence would have got wrong.
+  const enqueueOutcome = combineFollowUpEnqueueOutcomes(paymentOutcome, pdfOutcome)
+  // This connector states no settlement prerequisite of its own (no sweep hands one down), so this
+  // is `undefined` whenever the enqueue succeeded and the fence stays on its single pass.
+  const releasePrerequisite = obligationReleasePrerequisite(enqueueOutcome)
 
   // o3d-ekn8, CROSS-PORTED FROM THE XERO PATH (this branch) — REGISTER THE RECEIPTS THAT WERE
   // RECORDED BEFORE THIS INVOICE EXISTED.
@@ -1726,10 +2415,22 @@ async function enqueueSalesInvoiceFollowUps(
     // The same registry answer `settleFollowUpObligation` reads — on this connector it says NOTHING
     // re-drives a retained marker, and that has to reach the operator notice unchanged.
     recovery: QBO_FOLLOW_UP_RECOVERY,
+    // o3d-batch-ret: SPREAD for the reason the Xero twin gives — the field's ABSENCE is what keeps
+    // this on the single-pass fence, and an explicitly-undefined key would be a second thing to get
+    // wrong at every site that reads this object.
+    ...(releasePrerequisite ? { settlementPrerequisite: releasePrerequisite } : {}),
   })
   // `unfenced` is the one answer that leaves the marker to this caller: the re-drive returned on a
   // fact no later receipt can change (payments do not post at all; the order is gone).
-  return { deferredReceiptsSettled: redrive.settled, obligationFenced: redrive.release !== 'unfenced' }
+  // AND THE ENQUEUE'S OWN VERDICT TRAVELS WITH IT (o3d-peh1). Kept SEPARATE from the receipt
+  // answer rather than folded into it: a refusal means nothing was queued and an operator has to
+  // clear it, an unsettled receipt means money that WAS queued has not landed. One boolean would
+  // make each of them the other's blind spot.
+  return {
+    ...enqueueOutcome,
+    deferredReceiptsSettled: redrive.settled,
+    obligationFenced: redrive.release !== 'unfenced',
+  }
 }
 
 async function enqueuePurchaseInvoiceFollowUps(
@@ -1738,10 +2439,12 @@ async function enqueuePurchaseInvoiceFollowUps(
   referenceId: string,
   payload: SyncPayload,
   syncResult: { externalId?: string },
-): Promise<void> {
+): Promise<FollowUpEnqueueOutcome> {
   // Entries can arrive with referenceType 'PurchaseInvoice' or 'PurchaseOrder'
-  if ((referenceType !== 'PurchaseInvoice' && referenceType !== 'PurchaseOrder') || !syncResult.externalId || !payload.supplierInvoicePath) return
-  await enqueueFollowUpSyncLog('BILL_ATTACHMENT', referenceType, referenceId, {
+  if ((referenceType !== 'PurchaseInvoice' && referenceType !== 'PurchaseOrder') || !syncResult.externalId || !payload.supplierInvoicePath) {
+    return FOLLOW_UPS_ENQUEUED
+  }
+  return await enqueueFollowUpSyncLog('BILL_ATTACHMENT', referenceType, referenceId, {
     accountingInvoiceId: syncResult.externalId,
     supplierInvoicePath: payload.supplierInvoicePath,
   })
@@ -1768,8 +2471,14 @@ async function enqueueFollowUps(
   }
 
   if (type === 'PURCHASE_INVOICE') {
-    await enqueuePurchaseInvoiceFollowUps(entryId, referenceType, referenceId, payload, syncResult)
-    return { deferredReceiptsSettled: true, obligationFenced: false }
+    // o3d-peh1: the sibling enqueue ANSWERS, and its answer is the caller's settle verdict.
+    // Discarding the return here would put a refused bill attachment back in the silence
+    // this branch exists to end; it has no deferred receipt of its own.
+    return {
+      ...await enqueuePurchaseInvoiceFollowUps(entryId, referenceType, referenceId, payload, syncResult),
+      deferredReceiptsSettled: true,
+      obligationFenced: false,
+    }
   }
 
   if (type === 'INVOICE_PDF' && referenceType === 'SalesOrder') {
@@ -1780,8 +2489,9 @@ async function enqueueFollowUps(
         shoppingLinks: { where: { connector: 'woocommerce' }, select: { id: true }, take: 1 },
       },
     })
+    const outcomes: FollowUpEnqueueOutcome[] = []
     if (order?.customerEmail) {
-      await enqueueFollowUpSyncLog('INVOICE_EMAIL', referenceType, referenceId, { referenceId })
+      outcomes.push(await enqueueFollowUpSyncLog('INVOICE_EMAIL', referenceType, referenceId, { referenceId }))
     }
     // b8i6.6: the post-invoice note follow-up is WooCommerce-only BY DESIGN.
     // It is already connector-aware — only enqueued when the order has a
@@ -1791,12 +2501,13 @@ async function enqueueFollowUps(
     // implementation + live validation before a SHOPPING_INVOICE_NOTE could be
     // generalised here.
     if (order?.shoppingLinks.length) {
-      await enqueueFollowUpSyncLog('WC_INVOICE_NOTE', referenceType, referenceId, { referenceId })
+      outcomes.push(await enqueueFollowUpSyncLog('WC_INVOICE_NOTE', referenceType, referenceId, { referenceId }))
     }
+    return { ...combineFollowUpEnqueueOutcomes(...outcomes), deferredReceiptsSettled: true, obligationFenced: false }
   }
   // Every remaining type enqueues rows that carry their own document id in the payload; none of them
-  // has a deferred receipt waiting on it.
-  return { deferredReceiptsSettled: true, obligationFenced: false }
+  // has a deferred receipt waiting on it, and none of them refused anything.
+  return { enqueued: true, deferredReceiptsSettled: true, obligationFenced: false }
 }
 
 // ---------------------------------------------------------------------------

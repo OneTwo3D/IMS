@@ -12,7 +12,11 @@ import {
 } from '@/lib/connectors/accounting-binding-lock-order'
 import { freshAuthFailureResult, requireFreshAdmin } from '@/lib/auth/server'
 import { issueDestructiveActionCode, consumeDestructiveActionCode } from '@/lib/destructive-action-confirm'
-import { UNRECORDED_POSTED_DOCUMENT_ACTION } from '@/lib/domain/accounting/unrecorded-posted-document'
+import {
+  countUnrecordedIncidents,
+  describePreservedUnrecordedIncidents,
+  UNRECORDED_POSTED_DOCUMENT_ACTIONS,
+} from '@/lib/domain/accounting/unrecorded-posted-document'
 
 export type ResetLevel = 'transactions' | 'products' | 'full'
 
@@ -105,14 +109,42 @@ async function clearTransactionScope() {
   await db.shoppingSyncLog.deleteMany({})
   await db.accountingSyncLog.deleteMany({})
 
-  // A RESET CLEARS IMS. IT CANNOT CLEAR XERO (o3d-550x; Codex r3, medium).
+  // A RESET CLEARS IMS. IT CANNOT CLEAR XERO — OR QUICKBOOKS (o3d-550x; Codex r3 medium, Codex HIGH).
   //
   // Everything else on this list describes something that lives in this database, so deleting it is the
-  // whole point of a reset. `xero_posted_document_unrecorded` does not: it says a document was ACCEPTED
-  // BY XERO and its sync row can never name it — real money in somebody else's ledger, which no reset of
-  // ours voids, and which nothing in IMS can re-derive. That is the same sentence that earned it the
-  // retention exemption, and a factory reset is not a weaker eraser than a 90-day sweep; it is a
-  // stronger one.
+  // whole point of a reset. The unrecorded-posted-document records do not: each one says AN EFFECT
+  // LANDED OUTSIDE IMS and its sync row can never name it, and nothing in IMS can re-derive it. That is
+  // the same sentence that earned them the retention exemption, and a factory reset is not a weaker
+  // eraser than a 90-day sweep; it is a stronger one.
+  //
+  // "AN EFFECT", NOT "A DOCUMENT" — round 3, Codex MEDIUM. Folding the pair into one exemption made
+  // the breadcrumb speak for both action names at once, and it kept the Xero sentence: every preserved
+  // row was described as a document still standing in a ledger. The QuickBooks action does not mean
+  // only that. The same name covers the four no-identifier operations in
+  // lib/domain/accounting/unrecorded-posted-document.ts — a bill attachment, a stored invoice PDF, an
+  // invoice email QUEUED to a customer, a WooCommerce note — none of which is a ledger document and
+  // one of which is not even finished.
+  //
+  // AND ROUND 3'S ANSWER TO THAT WAS A HEDGE, NOT A FIX (round 6, Codex MEDIUM). It replaced the one
+  // false sentence with "THEY ARE NOT ALL LEDGER DOCUMENTS. Some name a document … The rest name an
+  // effect …" over a SINGLE count. That is true of the set and useless about any member of it: an
+  // install whose only preserved incident is a queued INVOICE_EMAIL still got a paragraph asserting
+  // that some of them are documents standing in a ledger, when none of them is — and this breadcrumb
+  // is exempt from retention and from the reset, so it is permanent evidence for a document that
+  // never existed. The record's own `metadata.type` is what settles it, and BOTH connectors write
+  // that field, so the counts below are classified rather than aggregated: a kind with nothing in it
+  // now emits no sentence at all. A row whose type cannot be read is counted as UNCLASSIFIED and
+  // never guessed into either bucket.
+  //
+  // BOTH ACTIONS, FROM THE ONE PLACE THE PAIR IS NAMED. This exemption originally spelled out a single
+  // constant — the Xero one — and read as complete: it compiled, its test passed, and the sentence
+  // above was true of it. It was simply blind to the QuickBooks twin, whose incidents carry their own
+  // action name, so every `quickbooks_posted_document_unrecorded` row was deleted by the `not` on the
+  // other string. That record is the ONLY thing naming a document QuickBooks accepted and IMS could
+  // not write down, so the reset was destroying evidence of live remote money while reporting that it
+  // had preserved it. The fix is not "add the other string here" — it is to import the pair, so the
+  // next connector to grow one of these is protected by an edit in a single module rather than by
+  // somebody remembering this line exists.
   //
   // An earlier answer was that the reset "deletes the sync rows too", so the record has nothing left to
   // point at. Read the other way round, that is the argument FOR keeping it: after the reset there is no
@@ -126,20 +158,39 @@ async function clearTransactionScope() {
   // and nothing is lost by discharging it.
   //
   // WHERE AN OPERATOR SEES IT AFTERWARDS: /activity — filter level ERROR or tag `sync`, or search for
-  // the action name or either Xero id; the description is the full incident and its remedy. The
-  // breadcrumb below puts the count in the same list so nobody has to know to look.
-  await db.activityLog.deleteMany({ where: { action: { not: UNRECORDED_POSTED_DOCUMENT_ACTION } } })
-  const preserved = await db.activityLog.count({ where: { action: UNRECORDED_POSTED_DOCUMENT_ACTION } })
-  if (preserved > 0) {
+  // either action name or any of the ledger ids; the description is the full incident and its remedy.
+  // The breadcrumb below puts the count in the same list so nobody has to know to look, and it names
+  // BOTH actions because a breadcrumb that names one is the same defect as an exemption that does.
+  await db.activityLog.deleteMany({ where: { action: { notIn: [...UNRECORDED_POSTED_DOCUMENT_ACTIONS] } } })
+  // findMany, not count: the breadcrumb can no longer be written from an integer, because which
+  // sentence each row earns is decided by its own metadata. The population is bounded by what
+  // survived the delete above — incidents this rare are units, not pages.
+  const preservedRows = await db.activityLog.findMany({
+    where: { action: { in: [...UNRECORDED_POSTED_DOCUMENT_ACTIONS] } },
+    select: { metadata: true },
+  })
+  if (preservedRows.length > 0) {
+    const counts = countUnrecordedIncidents(preservedRows)
     await logActivity({
       entityType: 'SYSTEM',
       tag: 'sync',
       action: 'database_reset_preserved_unrecorded_documents',
       level: 'WARNING',
-      description: `Database reset kept ${preserved} record(s) of Xero document(s) that IMS posted and `
-        + 'could never record. Those documents still exist in Xero and nothing else in IMS references '
-        + `them any more. Search this log for "${UNRECORDED_POSTED_DOCUMENT_ACTION}".`,
-      metadata: { preserved, action: UNRECORDED_POSTED_DOCUMENT_ACTION },
+      description: describePreservedUnrecordedIncidents(counts),
+      metadata: {
+        preserved: preservedRows.length,
+        ledgerDocuments: counts.LEDGER_DOCUMENT,
+        ledgerDocumentsWithoutIdentifier: counts.LEDGER_DOCUMENT_NO_IDENTIFIER,
+        // o3d-batch-ret r10: a DRAFT moved no balances and an unrecorded posting mode cannot say
+        // whether one did. Folding either into `ledgerDocuments` is the falsehood this round removed
+        // from the sentence, so it must not survive in the number beside it.
+        ledgerDrafts: counts.LEDGER_DRAFT,
+        ledgerOutcomeUnrecorded: counts.LEDGER_OUTCOME_UNRECORDED,
+        ledgerNonDocuments: counts.LEDGER_NON_DOCUMENT,
+        noIdentifierSideEffects: counts.NO_IDENTIFIER_SIDE_EFFECT,
+        unclassified: counts.UNCLASSIFIED,
+        actions: [...UNRECORDED_POSTED_DOCUMENT_ACTIONS],
+      },
     })
   }
 

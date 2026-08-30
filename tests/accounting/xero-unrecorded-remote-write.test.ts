@@ -258,9 +258,14 @@ test('r5 #2 (retargeted): a write the row refuses records the evidence rather th
   assert.equal(outcome.reason, 'not-recorded',
     'and it is told WHICH failure, because the outbox runner buries this one permanently and must '
       + 'not bury the pool-exhaustion one')
-  assert.match(String(outcome.evidence), /BOTH documents exist in Xero/,
+  // ROUND 10 (Codex HIGH): this row is an INVOICE_PAYMENT, and the wording says so. It used to say
+  // "BOTH documents exist in Xero … void or credit the duplicate", which for a payment names the
+  // wrong object entirely — the invoice it was applied to was not created here.
+  assert.match(String(outcome.evidence), /BOTH payments are in Xero/,
     'the wording the runner puts on the buried job comes back with the outcome, so the operator '
       + 'reads it on the job rather than having to find the activity row')
+  assert.match(String(outcome.evidence), /remove or reverse the duplicate PAYMENT/)
+  assert.doesNotMatch(String(outcome.evidence), /void or credit the duplicate/)
 
   // The write was ATTEMPTED and it carried a real precondition — without both, this proves nothing.
   const fenceLine = stderr.split('\n').find((line) => line.startsWith('FENCE-WRITE'))
@@ -289,5 +294,5 @@ test('r5 #2 (retargeted): a write the row refuses records the evidence rather th
   assert.equal(activity.level, 'ERROR', 'a document in Xero that no row names is not a warning')
   assert.match(String(activity.description), /PAY-88/, 'the id this worker posted')
   assert.match(String(activity.description), /PAY-OTHER/, 'and the id the row already names')
-  assert.match(String(activity.description), /BOTH documents exist in Xero/)
+  assert.match(String(activity.description), /BOTH payments are in Xero/)
 })

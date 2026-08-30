@@ -7,6 +7,7 @@ import { ActivitySquare, Archive, Plug, RotateCcw, ScrollText, Timer } from 'luc
 import { cn } from '@/lib/utils'
 import { Card } from '@/components/ui/card'
 import { getSetting } from '@/app/actions/settings'
+import { describeLegacyWcOrderEvidenceHold } from '@/lib/connectors/shopping-webhook-evidence-hold'
 import { getCrontabStatus } from '@/app/actions/cron'
 import { ActivityLogRetentionSetting } from '@/components/settings/activity-log-retention'
 import { DataRetentionSetting } from '@/components/settings/data-retention'
@@ -69,7 +70,10 @@ export default async function SystemSettingsPage({
   // secret (every managed job silently 401s), or unmanaged /api/cron/ lines
   // that will drift outside the app's control.
   const crontabWarnings: string[] = []
-  if (crontabStatus) {
+  if (crontabStatus?.readError) {
+    // An unreadable crontab answers NONE of the drift questions below, so none of them are asked.
+    crontabWarnings.push(`The crontab for the app user (${crontabStatus.osUser}) could not be read, so whether the managed block is present and current is UNKNOWN — this is not a report that it is missing. ${crontabStatus.readError}.`)
+  } else if (crontabStatus) {
     if (!crontabStatus.blockPresent) {
       crontabWarnings.push(`No managed crontab block exists for the app user (${crontabStatus.osUser}) — scheduled jobs are NOT running from these settings. Save the scheduler settings to write it.`)
     } else if (crontabStatus.secretMode === 'embedded' && crontabStatus.embeddedSecretMatches === false) {
@@ -255,6 +259,7 @@ export default async function SystemSettingsPage({
               webhookEventsValue={retentionData.drWebhookEvents ?? '3'}
               wmsEventsValue={retentionData.drWmsEvents ?? '3'}
               wmsSyncJobsValue={retentionData.drWmsSyncJobs ?? '12'}
+              evidenceHold={retentionData.evidenceHold}
             />
           </Card>
         </div>
@@ -328,7 +333,12 @@ async function loadCronJobs(): Promise<CronJobState[]> {
   })
 }
 
+/**
+ * o3d-j7y4 (Codex r18 MEDIUM, count corrected in r19): the shopping-inbox retention window is being
+ * OVERRIDDEN for one set of rows, and an override an operator cannot see is not a bounded one.
+ */
 async function loadRetentionData() {
+  const evidenceHold = await describeLegacyWcOrderEvidenceHold()
   const [retInfo, retWarn, retError, drSales, drPurchase, drCustomers, drMovements, drSyncLogs, drWebhookEvents, drWmsEvents, drWmsSyncJobs] = await Promise.all([
     getSetting('activity_log_retention_info'),
     getSetting('activity_log_retention_warning'),
@@ -342,5 +352,15 @@ async function loadRetentionData() {
     getSetting('retention_wms_events_months'),
     getSetting('retention_wms_sync_jobs_months'),
   ])
-  return { retInfo, retWarn, retError, drSales, drPurchase, drCustomers, drMovements, drSyncLogs, drWebhookEvents, drWmsEvents, drWmsSyncJobs }
+  return {
+    retInfo, retWarn, retError, drSales, drPurchase, drCustomers, drMovements, drSyncLogs, drWebhookEvents, drWmsEvents, drWmsSyncJobs,
+    evidenceHold: evidenceHold
+      ? {
+          issue: evidenceHold.issue,
+          retentionMonths: evidenceHold.retentionMonths,
+          retainedByOverride: evidenceHold.retainedByOverride,
+          evidenceRowsWithPayload: evidenceHold.evidenceRowsWithPayload,
+        }
+      : null,
+  }
 }

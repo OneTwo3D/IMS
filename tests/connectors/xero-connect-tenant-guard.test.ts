@@ -437,6 +437,10 @@ const inertModel = {
   // The transaction scope counts what its activity-log delete deliberately kept — the records of Xero
   // documents IMS could never record (Codex r3, medium). This file models none, so: nothing kept.
   count: async () => 0,
+  // Round 6 (Codex MEDIUM): the breadcrumb is no longer written from a count. Which sentence each
+  // preserved incident earns is decided by its own `metadata.type`, so the reset READS the rows.
+  // Still none here, so still nothing kept — the empty array is the same answer `count: 0` was.
+  findMany: async () => [],
 }
 
 const dbDouble: Record<string, unknown> = {

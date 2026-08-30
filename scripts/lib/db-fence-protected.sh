@@ -1388,12 +1388,15 @@ db_fence_probe_cleanup() {
 # throwaway directory this call creates and removes. The throwaway is removed before it
 # returns, so a caller that goes on to do anything else is unaffected by having asked.
 db_fence_report_candidate_digest() {
-  local rc=0 line
+  local rc=0
   db_fence_probe_candidate_digest || rc=1
   # db_fence_probe_report() prints the standing artefact's digest only when
   # DB_FENCE_PROBE_STANDING_SHA256 is set, and nothing above sets it: the candidate is the whole
   # answer here, and the box's own artefact is not this command's business.
-  while IFS= read -r line; do printf '%s\n' "${line}"; done < <(db_fence_probe_report)
+  # CALLED, NOT PROCESS-SUBSTITUTED (o3d-p9dq, Codex r33). The loop this replaces re-emitted the
+  # report line by line through a producer whose exit reached nobody; calling it writes the same
+  # bytes to the same stdout with no second process to fail, and its status is this shell's.
+  db_fence_probe_report || rc=1
   db_fence_probe_cleanup
   return "${rc}"
 }

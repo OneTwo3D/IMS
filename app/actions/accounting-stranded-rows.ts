@@ -4,6 +4,11 @@ import { db } from '@/lib/db'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { requirePermission } from '@/lib/auth/server'
 import {
+  accountingSyncEnabledSettingKey,
+  accountingSyncEnabledSettingKeysFor,
+  isStrandedRowUnclaimable,
+} from '@/lib/domain/accounting/sync-row-claimability'
+import {
   buildStrandedSyncRowOrderBy,
   buildStrandedSyncRowWhere,
   pageStrandedSyncRows,
@@ -89,7 +94,26 @@ export async function getStrandedAccountingSyncRows(limit = 50): Promise<Strande
       attemptRevision: true,
     },
   })
-  const page = pageStrandedSyncRows(sourceRows, take, new Date())
+  // WHETHER ANYTHING CAN STILL CLAIM THESE ROWS, asked of the installation rather than assumed from
+  // the list (round 5, Codex HIGH #1). Read AFTER the rows so only the toggles the page actually
+  // needs are fetched, and in one query rather than one per connector. A connector with no row on
+  // the page is not consulted at all.
+  const syncEnabled = new Map<string, string>()
+  const settingKeys = accountingSyncEnabledSettingKeysFor(sourceRows.map((row) => row.connector))
+  if (settingKeys.length > 0) {
+    for (const setting of await db.setting.findMany({ where: { key: { in: settingKeys } }, select: { key: true, value: true } })) {
+      syncEnabled.set(setting.key, setting.value)
+    }
+  }
+  const unclaimable = (connector: string) => isStrandedRowUnclaimable({
+    connector,
+    activeConnector,
+    // A toggle with no row is OFF, which is exactly how triggerXeroSync / triggerQuickBooksSync read
+    // it — `enabled?.value !== 'true'`. `null` and "absent" are the same answer to both.
+    syncEnabledValue: syncEnabled.get(accountingSyncEnabledSettingKey(connector) ?? '') ?? null,
+  })
+
+  const page = pageStrandedSyncRows(sourceRows, take, new Date(), unclaimable)
   return {
     ...page,
     total: page.hasMore ? await db.accountingSyncLog.count({ where }) : page.rows.length,

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
-import { UNRECORDED_POSTED_DOCUMENT_ACTION } from '@/lib/domain/accounting/unrecorded-posted-document'
+import { QBO_UNRECORDED_POSTED_DOCUMENT_ACTION, UNRECORDED_POSTED_DOCUMENT_ACTION } from '@/lib/domain/accounting/unrecorded-posted-document'
 import { DIRECT_CREATE_PENDING_ACTION } from '@/lib/fulfillment/pre-fulfilment-reallocation'
 
 // ---------------------------------------------------------------------------
@@ -62,6 +62,24 @@ test('Codex r2 medium 1: the retention sweep is told to keep the unrecorded-docu
   // The pre-existing exemption is still there: this is an addition, not a replacement.
   assert.ok(exempt.includes(DIRECT_CREATE_PENDING_ACTION))
   assert.match(errorDelete.sql, /action <> ALL\(/, 'and <> ALL is what makes a two-entry list hold')
+})
+
+test('o3d-peh1 r5: the QuickBooks unrecorded-document record is exempt too, for the same reason', async () => {
+  // The other way a real document ends up unreferenced: QuickBooks accepted the post and returned an
+  // id, and the transaction that would have made it durable failed. The row names no document, so
+  // nothing re-derives the identifier and no later sync attempt can — it exists only in this record,
+  // written at ERROR, on the same 90-day sweep.
+  await purge()
+
+  const errorDelete = captured.find((query) => query.values[0] === 'ERROR')
+  const exempt = errorDelete!.values.find((value): value is string[] => Array.isArray(value))
+  assert.ok(
+    exempt!.includes(QBO_UNRECORDED_POSTED_DOCUMENT_ACTION),
+    'the only local record of a document that exists in QuickBooks must not be deleted by age',
+  )
+  // A DISTINCT string, not a reuse: the operator reading it has to know which ledger to look in, and
+  // an exemption only protects the spelling it was given.
+  assert.notEqual(QBO_UNRECORDED_POSTED_DOCUMENT_ACTION, UNRECORDED_POSTED_DOCUMENT_ACTION)
 })
 
 test('Codex r2 medium 1: the exemption is inside the DELETE, not applied afterwards', async () => {

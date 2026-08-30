@@ -111,6 +111,22 @@ export const COMPONENT_GRAPH_WRITE_LOCK_KEY = 918_274_101
 export const ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY = 918_274_233
 
 /**
+ * THERE IS NO CRONTAB LOCK IN THIS REGISTRY, AND THAT IS THE POINT (Codex r22 HIGH).
+ *
+ * A round of review put one here — `CRONTAB_RECONCILE_LOCK_KEY = 918_274_234`, a session advisory
+ * lock serializing the reconciliation of the OS crontab. It was the wrong mechanism for the
+ * resource, twice over: the lock died with its PostgreSQL connection while the spawned `crontab -`
+ * was still writing, and `scripts/install.sh` — the other writer of the same file — has no database
+ * connection to take it with. The exclusion now lives where the resource does, as an `flock` on a
+ * file beside the app, taken identically by the Node reconciliation and by the installer's shell.
+ * See lib/crontab-reconcile-lock.ts.
+ *
+ * 918_274_234 is deliberately NOT reused for anything else: an operator looking at an old
+ * `pg_locks` capture, or an old build still running, must not find that number meaning something
+ * new.
+ */
+
+/**
  * Every single-bigint domain above, for the uniqueness test. A new lock MUST be
  * declared here — the test fails on any module that writes its own key literal.
  */

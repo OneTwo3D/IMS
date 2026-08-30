@@ -11,12 +11,33 @@ import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { BackupArtifactUploadError, uploadBackupArtifactsToTarget } from '@/lib/backup-remote'
 import { appendCronRunId, cronRunResponseInit, runCronWithLogging } from '@/lib/ops/cron-run'
 import { backupManifestPath, writeBackupManifestForFile } from '@/lib/backup-manifest'
+import {
+  BACKUP_MAX_COUNT_FALLBACK,
+  BACKUP_RETENTION_FALLBACK_DAYS,
+  resolveBackupPurgeLimit,
+} from '@/lib/domain/settings/backup-schedule-input'
+import { isBackupScheduleEnabled } from '@/lib/domain/settings/backup-schedule-enabled'
 
 const BACKUP_DIR = getBackupDir()
 
 async function getSetting(key: string): Promise<string> {
   const row = await db.setting.findUnique({ where: { key } })
   return row?.value ?? ''
+}
+
+/**
+ * ABSENCE PRESERVED, not flattened to `''` (Codex r20 HIGH).
+ *
+ * `getSetting` above answers `''` for a row that does not exist, and enablement resolution CANNOT
+ * use that: `''` is a value, so it would be read as an authoritative "off" and the legacy fallback
+ * would never be consulted. On an installation that has only `backup_schedule_enabled=true` — every
+ * installation that has not yet saved either schedule screen — the crontab and the Backup page
+ * resolved ENABLED while this route skipped every invocation as disabled. Silent, and exactly the
+ * class of disagreement the shared resolver exists to end.
+ */
+async function getSettingOrNull(key: string): Promise<string | null> {
+  const row = await db.setting.findUnique({ where: { key } })
+  return row?.value ?? null
 }
 
 function getDbConfig() {
@@ -41,13 +62,30 @@ export async function GET(request: Request) {
   const { runId, result, responseStatus } = await runCronWithLogging({
     jobName: 'backup',
     run: async () => {
-      const enabled = await getSetting('backup_schedule_enabled')
-      if (enabled !== 'true') {
+      // BOTH ENABLEMENT ROWS, resolved the way the crontab resolves them (Codex r20 HIGH). This read
+      // `backup_schedule_enabled` alone, while the crontab prefers `cron_backup_enabled`. On an
+      // installation where the two disagree — the Scheduled Jobs editor wrote one, the Backup panel
+      // the other — the cron line fired on schedule and every invocation returned "disabled". Saves
+      // now write both rows; this is what makes an ALREADY diverged installation behave, with no
+      // migration.
+      if (!(await isBackupScheduleEnabled(getSettingOrNull))) {
         return { skipped: true, reason: 'Scheduled backups disabled' }
       }
 
-      const retentionDays = parseInt(await getSetting('backup_retention_days') || '30')
-      const maxBackups = parseInt(await getSetting('backup_max_count') || '10')
+      // NOT `parseInt(x || 'default')` (Codex r20 HIGH #2). That fallback only caught an EMPTY row,
+      // and the two values it did not catch are the destructive ones: a stored '0' put the purge
+      // cutoff at `now` and made `i >= maxBackups` true for every file, so the run deleted the whole
+      // backup set moments after taking one; a non-numeric row read as NaN, both comparisons went
+      // false, and nothing was ever purged. The panel now refuses both, but a row written before
+      // that gate existed is still in the database, so the READER has to be safe too.
+      const retentionDays = resolveBackupPurgeLimit(
+        await getSetting('backup_retention_days'),
+        BACKUP_RETENTION_FALLBACK_DAYS,
+      )
+      const maxBackups = resolveBackupPurgeLimit(
+        await getSetting('backup_max_count'),
+        BACKUP_MAX_COUNT_FALLBACK,
+      )
 
       const dbConf = getDbConfig()
       const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)

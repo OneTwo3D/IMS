@@ -11,10 +11,14 @@ import {
   parseOtiCrontabStatus,
   type OtiCrontabStatus,
 } from '@/lib/crontab-sync'
-import { reconcileCrontab, readOwnCrontab } from '@/lib/crontab-reconcile'
+import { reconcileCrontab, readOwnCrontabResult } from '@/lib/crontab-reconcile'
+// The BARREL, not @/lib/cron-registry: registration is an import side effect of the job modules,
+// so the registry is EMPTY unless something has imported them. Reading it bare would have mirrored
+// no legacy key and reported nothing.
+import { getAllCronJobs } from '@/lib/cron-jobs'
 import { serializeSettingValue } from '@/lib/settings-store'
 import { runPostCommit } from '@/lib/domain/post-commit'
-import type { SettingSaveResult } from '@/lib/domain/settings/setting-save-outcome'
+import { combinePostCommitOutcomes, type SettingSaveResult } from '@/lib/domain/settings/setting-save-outcome'
 
 /**
  * Reconcile the OS crontab from the stored cron_* settings, behind the permission gate.
@@ -60,10 +64,31 @@ export type CronJobSettingInput = {
 export async function saveCronJobSettings(jobs: CronJobSettingInput[]): Promise<SettingSaveResult> {
   await requirePermission('settings.company')
 
-  const entries: Array<[string, string]> = jobs.flatMap((job) => [
-    [`cron_${job.settingKey}_enabled`, String(job.enabled)] as [string, string],
-    [`cron_${job.settingKey}_schedule`, job.schedule] as [string, string],
-  ])
+  // THE LEGACY ENABLEMENT ROW IS MIRRORED, NOT LEFT BEHIND (Codex r20 HIGH).
+  //
+  // A registry job may declare a `legacyEnabledKey` — the row the crontab consulted before the
+  // canonical `cron_<job>_enabled` existed, and which `buildOtiCrontabBlock` still falls back to
+  // while the canonical row is absent. For `backup` that legacy row is `backup_schedule_enabled`,
+  // and it is ALSO the row `/api/cron/backup` gates its own execution on. Writing only the
+  // canonical row therefore produced the exact disagreement the fallback was meant to prevent: the
+  // cron line installed, the route skipping every invocation, and neither screen showing anything
+  // wrong. Mirroring here is the other half of `saveBackupScheduleSettings`, which writes both rows
+  // from the Backup screen.
+  const legacyKeyBySettingKey = new Map(
+    getAllCronJobs()
+      .filter((job) => job.legacyEnabledKey)
+      .map((job) => [job.settingKey, job.legacyEnabledKey!]),
+  )
+
+  const entries: Array<[string, string]> = jobs.flatMap((job) => {
+    const rows: Array<[string, string]> = [
+      [`cron_${job.settingKey}_enabled`, String(job.enabled)],
+      [`cron_${job.settingKey}_schedule`, job.schedule],
+    ]
+    const legacy = legacyKeyBySettingKey.get(job.settingKey)
+    if (legacy) rows.push([legacy, String(job.enabled)])
+    return rows
+  })
   if (entries.length === 0) return { status: 'saved' }
 
   await db.$transaction(async (tx) => {
@@ -77,6 +102,9 @@ export async function saveCronJobSettings(jobs: CronJobSettingInput[]): Promise<
   })
 
   // POST-COMMIT. Split in two so the warning sentence stays true about WHICH artefact lags.
+  // BOTH STEPS ALWAYS RUN (Codex r20 HIGH). Returning early on the local step meant a transient
+  // activity-log failure left the crontab un-reconciled — on the very screen whose whole purpose is
+  // to change it — under a warning that talked about the audit row instead.
   const local = await runPostCommit(async () => {
     await logActivity({
       entityType: 'SETTING',
@@ -85,11 +113,19 @@ export async function saveCronJobSettings(jobs: CronJobSettingInput[]): Promise<
       description: `Updated scheduled job settings (${jobs.length} jobs)`,
     })
   }, 'Failed to record the scheduled-job change')
-  if (local.status === 'failed') return { status: 'post-commit-failed', step: 'local', error: local.error }
 
-  const scheduler = await runPostCommit(reconcileCrontab, 'Failed to sync crontab')
-  if (scheduler.status === 'failed') return { status: 'post-commit-failed', step: 'scheduler', error: scheduler.error }
-  return { status: 'saved' }
+  // The crontab write and the audit row it owes afterwards are DIFFERENT facts, and the
+  // reconciliation reports them separately (Codex r20 MEDIUM). Folding the follow-up into the
+  // local outcome is what stops a screen sending an operator to re-apply a crontab that is
+  // already correct.
+  let schedulerFollowUpError: string | null = null
+  const scheduler = await runPostCommit(async () => {
+    const result = await reconcileCrontab()
+    schedulerFollowUpError = result.followUpError ?? null
+    return result
+  }, 'Failed to sync crontab')
+
+  return combinePostCommitOutcomes({ local, scheduler, schedulerFollowUpError })
 }
 
 export type CrontabDriftStatus = OtiCrontabStatus & {
@@ -97,6 +133,14 @@ export type CrontabDriftStatus = OtiCrontabStatus & {
   osUser: string
   /** Runtime-env mode only: does the .env pipeline still yield the ACTIVE secret? null otherwise. */
   runtimeSecretMatches: boolean | null
+  /**
+   * THE READ ITSELF DID NOT RESOLVE (o3d-p9dq, Codex r29 HIGH #1). Non-null means every other
+   * field below it describes an EMPTY STRING this process invented, not the crontab: `blockPresent`
+   * is false because nothing was read, not because nothing is there. The caller must render this
+   * instead of the drift warnings, or it tells the operator their managed block is missing — and
+   * sends them to press the one button that used to overwrite the crontab it could not read.
+   */
+  readError: string | null
 }
 
 /**
@@ -107,8 +151,18 @@ export type CrontabDriftStatus = OtiCrontabStatus & {
  */
 export async function getCrontabStatus(): Promise<CrontabDriftStatus> {
   await requirePermission('settings.company')
-  const [crontabText, secret] = await Promise.all([readOwnCrontab(), getCronSecret()])
-  const status = parseOtiCrontabStatus(crontabText, secret)
+  const [read, secret] = await Promise.all([readOwnCrontabResult(), getCronSecret()])
+  if (!read.resolved) {
+    // Report the unanswered question as unanswered. Everything a drift panel would say about a
+    // crontab nobody read is a guess, and the guess this used to make was the alarming one.
+    return {
+      ...parseOtiCrontabStatus('', secret),
+      osUser: os.userInfo().username,
+      runtimeSecretMatches: null,
+      readError: read.reason,
+    }
+  }
+  const status = parseOtiCrontabStatus(read.text, secret)
 
   // Runtime-env blocks can drift too (Codex): an edited-but-not-restarted .env
   // or a service-manager override makes the pipeline yield a value the app no
@@ -131,5 +185,6 @@ export async function getCrontabStatus(): Promise<CrontabDriftStatus> {
     ...status,
     osUser: os.userInfo().username,
     runtimeSecretMatches,
+    readError: null,
   }
 }

@@ -63,9 +63,24 @@ import type { MirroredEventWriteGuard } from '@/lib/domain/accounting/accounting
  *
  * WHAT IS STILL REFUSED, and none of it is arbitrary: see SETTLEABLE_ACCOUNTING_SYNC_STATUSES
  * (PENDING, SYNCED, CANCELLED), settleableSettlementOutcomes (DAILY_BATCH_*), and the fence's own
- * UNFENCED_ATTEMPT — which is what refuses every QuickBooks row, because that processor stamps no
- * attempt revision and its rows therefore stay at 0 forever. That is not a regression: a QuickBooks
- * row cannot be settled today either, and settling one under a one-sided fence would prove nothing.
+ * UNFENCED_ATTEMPT — which is what refuses a QuickBooks row WHILE QUICKBOOKS IS THE ACTIVE
+ * CONNECTOR, because that processor stamps no attempt revision and its rows therefore stay at 0.
+ *
+ * THAT IS A QUALIFIED STATEMENT AND IT MUST STAY ONE (round 4, Codex HIGH). It is NOT true that a
+ * QuickBooks row can never be settled: `unclaimable` (below) is a fact about the INSTALLATION, and
+ * a QuickBooks row that is neither on the active connector nor reachable by any claim path becomes
+ * settleable BY ADOPTION, with the stranded-rows banner rendering the control for it. Writing the
+ * refusal as an absolute anywhere it is read by an operator (see
+ * lib/domain/accounting/unrecorded-posted-document.ts) hides the only per-row remedy that exists.
+ *
+ * AND THE QUALIFICATION IS NOT "NOT THE ACTIVE CONNECTOR" (round 5, Codex HIGH #1). Round 4 wrote
+ * that `describeStrandedSyncRow` passes `unclaimable` unconditionally for every row on a non-active
+ * connector, and it did — which made adoption available while the QuickBooks manual Sync button
+ * could still reclaim the row, because that action gates on `quickbooks_sync_enabled` alone and
+ * never resolves the active connector. The precondition now lives in one place,
+ * `isStrandedRowUnclaimable` (sync-row-claimability.ts): NOT the active connector AND that
+ * connector's sync toggle off. Loosening it back to half of that re-opens a settled row to the very
+ * next press of a button any `sync` holder can reach.
  *
  * Pure functions only, so the decision — which statuses are settleable, the data patch per outcome,
  * the mirror guard, and the refusal vocabulary — is unit-testable without a database, exactly as
@@ -272,6 +287,17 @@ export type SettlementAssertion =
 export type SettlementRefusalCode =
   | 'pending_not_settleable'
   | 'already_terminal'
+  /**
+   * A status that is neither settleable, nor PENDING, nor terminal.
+   *
+   * UNREACHABLE FROM `refuseSettlement` (round 4, Codex LOW), and that is stated rather than left to
+   * be discovered: that function is only ever handed a row READ FROM THE DATABASE, and
+   * `AccountingSyncStatus` has exactly five members — PENDING, PROCESSING, SYNCED, FAILED,
+   * CANCELLED — all five of which are answered by the three branches above it. It exists for the
+   * ACTION's pre-read check, where `observedStatus` arrives from the client as a bare `string` and
+   * can be anything at all, and as the arm that keeps the code total if the enum ever grows. Do not
+   * write an operator-facing message that promises this code from a database row.
+   */
   | 'status_not_settleable'
   | 'daily_batch_not_settleable'
   | 'missing_external_id'
@@ -415,14 +441,22 @@ export type SyncRowSettleability = {
  * itself a CAS on (id, revision 0, status), so two operators racing produce one winner and one
  * ATTEMPT_MOVED, and a sweep that retires the row first moves its status and refuses the adoption.
  *
- * The caller decides `unclaimable` — it is a fact about the INSTALLATION (which connector is active),
- * not about the row — and it must never be passed for the active connector.
+ * The caller decides `unclaimable` — it is a fact about the INSTALLATION, not about the row — and
+ * it must never be passed for the active connector.
+ *
+ * BEING OFF THE ACTIVE CONNECTOR IS NOT THAT FACT ON ITS OWN (round 5, Codex HIGH #1). The active
+ * connector is resolved from the PLUGIN flags; the manual Sync action for each connector gates on
+ * `<connector>_sync_enabled` and never resolves the active connector at all, so a "stranded" row
+ * whose sync toggle is still on can be reclaimed by anyone with the `sync` permission pressing that
+ * button. `isStrandedRowUnclaimable` in sync-row-claimability.ts is the whole precondition, and
+ * both the read model and the settlement action take it from there rather than each deciding.
  */
 export function describeAttemptAdoptionCaveat(connector: string): string {
-  return `This row carries no attempt revision, so settling it MINTS one: no processor participating in the `
-    + `attempt fence will ever claim a ${connector} row while ${connector} is not the active connector, so the `
-    + 'attempt in front of you is the only one this row can ever have had. Your assertion is fenced on that — if '
-    + 'anything moves the row before you record this, it is refused rather than applied.'
+  return `This row carries no attempt revision, so settling it MINTS one: ${connector} is neither the active `
+    + `connector nor sync-enabled, so nothing — not the cron, not the manual Sync button — can claim a `
+    + `${connector} row, and the attempt in front of you is the only one this row can ever have had. Your `
+    + 'assertion is fenced on that — if anything moves the row before you record this, it is refused rather '
+    + 'than applied.'
 }
 
 export function describeSyncRowSettleability(
@@ -436,6 +470,15 @@ export function describeSyncRowSettleability(
      * refused. See describeAttemptAdoptionCaveat for why this is the whole precondition.
      */
     unclaimable?: boolean
+    /**
+     * Why adoption was WITHHELD, when the caller evaluated the precondition and it did not hold —
+     * used verbatim as `notSettleableReason` instead of the generic active-connector wording
+     * (round 5, Codex HIGH #1). A stranded row whose connector can still be swept by the manual
+     * Sync button is refused for a reason the active-connector sentence does not describe and whose
+     * remedy it does not name, and "there is nothing to do here" is the opposite of the truth for
+     * a row the operator can see and cannot clear.
+     */
+    unclaimableRefusalReason?: string | null
     /** Only used to word the adoption caveat. */
     connector?: string
   },
@@ -474,11 +517,11 @@ export function describeSyncRowSettleability(
       settlementCaveat: null,
       settleableOutcomes: outcomes,
       requiresAttemptAdoption: false,
-      notSettleableReason:
-        'This row carries no attempt revision, so a decision cannot be tied to the attempt it would be made '
+      notSettleableReason: row.unclaimableRefusalReason
+        ?? 'This row carries no attempt revision, so a decision cannot be tied to the attempt it would be made '
         + 'about and would be refused. It is on the ACTIVE connector, so the fence-aware processor will stamp '
         + 'one the next time it claims the row: retry the row, and settle it once it shows an attempt. Rows on a '
-        + 'RETIRED connector never get one and are settled by adoption instead.',
+        + 'connector that is retired AND whose sync toggle is off never get one and are settled by adoption instead.',
     }
   }
   return {

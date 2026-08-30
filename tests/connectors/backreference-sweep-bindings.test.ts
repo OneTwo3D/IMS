@@ -197,7 +197,7 @@ test('[o3d-0bfh r2] an UNSETTLED deferred receipt reaches the sweep unchanged th
     syncResult: { externalId?: string; invoiceNumber?: string },
     origin: { payload: unknown; connectionProvenance: string | null; backReferenceEvidenceCompactedAt: Date | null },
     followUpObligation: Date | null,
-  ) => Promise<{ deferredReceiptsSettled: boolean; obligationFenced: boolean }>
+  ) => Promise<{ enqueued: boolean; deferredReceiptsSettled: boolean; obligationFenced: boolean }>
   assert.equal(typeof enqueueFollowUps, 'function')
 
   deferredReceipts.obligation = null
@@ -215,7 +215,12 @@ test('[o3d-0bfh r2] an UNSETTLED deferred receipt reaches the sweep unchanged th
 
   assert.deepEqual(
     outcome,
-    { deferredReceiptsSettled: false, obligationFenced: true },
+    // o3d-peh1 joins o3d-0bfh here: the outcome that crosses this seam now carries THREE facts, and
+    // the whole object is compared so the binding cannot quietly drop one of them. `enqueued` is the
+    // enqueue's own verdict — nothing was refused on this call — and it is asserted for the same
+    // reason `deferredReceiptsSettled` is: an adapter that fabricated it would strand or lose work
+    // with nothing else in the suite able to see it.
+    { enqueued: true, deferredReceiptsSettled: false, obligationFenced: true },
     'the sweep discharges a durable money obligation on this answer: an adapter that hardcoded true '
       + 'here is the exact regression o3d-0bfh fixed, and it would be invisible to every other test',
   )
@@ -242,11 +247,11 @@ test('[o3d-0bfh r2] and a SETTLED one is not turned into a refusal either', asyn
 
   const enqueueFollowUps = captured[0].deps.enqueueFollowUps as (
     ...args: unknown[]
-  ) => Promise<{ deferredReceiptsSettled: boolean; obligationFenced: boolean }>
+  ) => Promise<{ enqueued: boolean; deferredReceiptsSettled: boolean; obligationFenced: boolean }>
   const outcome = await enqueueFollowUps('log-1', 'SALES_INVOICE', 'SalesOrder', 'so-1', {}, { externalId: 'XINV-1' },
     { payload: {}, connectionProvenance: null, backReferenceEvidenceCompactedAt: null }, SWEEP_GENERATION)
 
-  assert.deepEqual(outcome, { deferredReceiptsSettled: true, obligationFenced: true })
+  assert.deepEqual(outcome, { enqueued: true, deferredReceiptsSettled: true, obligationFenced: true })
 })
 
 test('[o3d-9kek r6] QuickBooks exports NO back-reference sweep binding, and never runs the sweep', async () => {

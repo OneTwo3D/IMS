@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
+import { QBO_UNRECORDED_POSTED_DOCUMENT_ACTION } from '@/lib/domain/accounting/unrecorded-posted-document'
 import { nextFollowUpObligationGeneration } from '@/lib/domain/accounting/back-reference'
 import { buildFollowUpObligationBacklogWhere } from '@/lib/domain/accounting/follow-up-obligation-registry'
 
@@ -192,6 +193,31 @@ const state = {
   /** Sync-log ids whose obligation RELEASE must fail. */
   failReleaseFor: new Set<string>(),
   /**
+   * Sync-log ids whose SYNCED/POSTED transaction must fail (Codex r4).
+   *
+   * A NON-FOLLOW-UP failure on a row that already carries an external id — the case round 3's inner
+   * catch does not cover and the generic outer handler did. It is a real route: the short-circuit arm
+   * writes SYNCED and the mirrored POSTED event in one transaction, and a database error there throws
+   * straight past every local catch.
+   */
+  failSyncedWriteFor: new Set<string>(),
+  /**
+   * The SAME injection, but COUNTED (Codex r5). The fresh post's evidence transaction is now
+   * RE-DRIVEN, and a set-membership switch cannot tell "it failed and was retried into success" from
+   * "it never failed at all" — which is the difference between a re-drive and a no-op.
+   */
+  syncedWriteFailuresLeft: new Map<string, number>(),
+  /**
+   * Activity actions whose write must THROW (Codex r4), as distinct from
+   * `unpersistableActivityActions`, which only makes the persisted variant return false.
+   *
+   * The fresh-post arm awaits `logActivity` inside its follow-up catch WITHOUT a `.catch()` — the
+   * short-circuit arm has one, that arm does not — so a failed announcement there lands in the outer
+   * handler at the one moment `entry.externalTransactionId` is stale: the row was committed with its
+   * id moments earlier, and the in-memory snapshot still says null.
+   */
+  throwingActivityActions: new Set<string>(),
+  /**
    * o3d-0bfh r4: fired ONCE, immediately before the release statement is evaluated — the exact
    * interleaving the finding is about. Production has by then minted its generation, run the
    * follow-ups and built a release fenced on that generation; this is where another writer's commit
@@ -205,6 +231,15 @@ const state = {
    * of the "settle only if the announcement is on record" property.
    */
   unpersistableActivityActions: new Set<string>(),
+  /** Every write to the mirrored AccountingEvent, in order. See the mirror mock below. */
+  mirror: [] as Array<{ syncLogId: string; status: string; externalId: string | null }>,
+  /**
+   * Rows written STRAIGHT to ActivityLog, bypassing the `logActivity` helper (Codex r5). The
+   * unrecorded-posted-document record is written this way on both connectors — it carries its own
+   * retention-exempt action and its own redaction — so a double that only watched `logActivity`
+   * could not see it at all, and "the identifier was escalated" would be an assertion about nothing.
+   */
+  activityRows: [] as Array<Record<string, unknown>>,
   /**
    * o3d-0bfh r6: the back-reference WRITE fails (not a unique-id conflict — an ordinary transient
    * error). QuickBooks swallows that, so the entry still succeeds while the link never landed, which
@@ -257,6 +292,18 @@ const syncLogClient = {
   async update(args: { where: { id: string }; data: Record<string, unknown> }) {
     const row = state.syncRows.find((candidate) => candidate.id === args.where.id)
     if (!row) throw new Error(`fake db: no sync row ${args.where.id}`)
+    if (args.data.backReferenceFollowUpsPendingAt === null && state.failReleaseFor.has(row.id)) {
+      record('release.attempted-and-failed')
+      throw new Error('transient: could not clear the obligation')
+    }
+    if (args.data.status === 'SYNCED') {
+      const countedLeft = state.syncedWriteFailuresLeft.get(row.id) ?? 0
+      if (state.failSyncedWriteFor.has(row.id) || countedLeft > 0) {
+        if (countedLeft > 0) state.syncedWriteFailuresLeft.set(row.id, countedLeft - 1)
+        record('synced.attempted-and-failed')
+        throw new Error('transient: the SYNCED transaction could not be written')
+      }
+    }
     stampFollowUpClaimClock(row.backReferenceFollowUpsPendingAt, args.data, new Date())
     Object.assign(row, args.data)
     record('syncLog.update', args.data)
@@ -368,7 +415,13 @@ const db = {
   // The outbox runner reads the filed unrecorded-posted-document incidents once per batch, before it
   // decides anything about a settled row (Codex r3, HIGH). Nothing in this file files one, so the
   // honest answer is "none" — not a missing model.
-  activityLog: { async findMany() { return [] }, async create(args: { data: unknown }) { return args.data } },
+  activityLog: {
+    async findMany() { return [] },
+    async create(args: { data: Record<string, unknown> }) {
+      state.activityRows.push(args.data)
+      return args.data
+    },
+  },
   purchaseInvoice: billClient,
   salesOrder: {
     async findUnique() { return salesOrderRow },
@@ -406,15 +459,33 @@ const db = {
 mock.module('@/lib/db', { namedExports: { db } })
 mock.module('@/lib/activity-log', {
   namedExports: {
-    logActivity: async (entry: { action: string }) => { state.activities.push(entry) },
+    logActivity: async (entry: { action: string }) => {
+      state.activities.push(entry)
+      if (state.throwingActivityActions.has(entry.action)) {
+        throw new Error(`transient: could not write the ${entry.action} activity row`)
+      }
+    },
     logActivityPersisted: async (entry: { action: string }) => {
       state.activities.push(entry)
       return !state.unpersistableActivityActions.has(entry.action)
     },
+    // The unrecorded-posted-document record does NOT go through the helper, so it applies these
+    // itself. `mock.module` replaces the whole module, so they have to be here or the escalation
+    // calls `undefined` (Codex r5).
+    redactActivityLogText: (value: string) => value,
+    sanitizeActivityLogMetadata: (value: unknown) => value,
   },
 })
+// RECORDED, not swallowed (Codex round 2, HIGH). The mirrored AccountingEvent is the ledger's own
+// copy of what IMS believes it posted, and the whole finding is that a follow-up failure on the
+// already-posted arm could stamp it FAILED for a document that is in QuickBooks. A no-op double
+// cannot see that, which is how the port shipped with it.
 mock.module('@/lib/domain/accounting/accounting-event-mirror', {
-  namedExports: { updateMirroredAccountingEventStatus: async () => {} },
+  namedExports: {
+    updateMirroredAccountingEventStatus: async (_client: unknown, params: { syncLogId: string; status: string; externalId?: string | null }) => {
+      state.mirror.push({ syncLogId: params.syncLogId, status: params.status, externalId: params.externalId ?? null })
+    },
+  },
 })
 // The FRESH-POST branch — the one the finding named by line — needs a connector call to succeed.
 // Only these two are stubbed, so everything between "the ledger accepted it" and "the follow-ups are
@@ -465,9 +536,69 @@ mock.module('@/lib/connectors/xero/bills', {
     updatePurchaseBill: async () => ({ success: true, invoiceId: 'XBILL-1' }),
   },
 })
+/**
+ * THE QUICKBOOKS POST'S OWN VERDICT, SWITCHABLE (Codex r5).
+ *
+ * It has to be, because "the connector refused" and "the connector accepted and the database then
+ * refused" are now DIFFERENT OUTCOMES and the control test distinguishes them. Before r5 the mock
+ * always succeeded, so the test that called itself "a main-post failure on a row with no document"
+ * was in fact driving a post that HAD succeeded — pinning the defect r5 removes as if it were the
+ * desired behaviour.
+ *
+ * Succeeds by default, so every other test in this file is untouched.
+ */
+let qboPostVerdict: { success: true; invoiceId: string } | { success: false; error: string } = { success: true, invoiceId: 'XBILL-1' }
+
 mock.module('@/lib/connectors/quickbooks/bills', {
   namedExports: {
-    pushPurchaseBill: async () => ({ success: true, invoiceId: 'XBILL-1' }),
+    pushPurchaseBill: async () => qboPostVerdict,
+  },
+})
+
+/**
+ * THE EXTERNAL SIDE EFFECT OF A NO-IDENTIFIER OPERATION, COUNTED (o3d-qn21).
+ *
+ * INVOICE_EMAIL is the plainest of the four: it sends a real email to a real customer and returns
+ * nothing that could ever name it again. It has to be stubbed at all because the production path
+ * would otherwise mail somebody from a unit test — and it is stubbed with a COUNTER because the
+ * property the escalation's new wording claims is not a property of the database. "The row settled"
+ * is observable in `state`; "the customer was mailed three times" is only observable here.
+ *
+ * Counted on ENTRY, not on success: a send that throws may still have reached the customer, and the
+ * subject is how many times the operation was DISPATCHED.
+ */
+let emailsSent = 0
+
+mock.module('@/lib/accounting-email', {
+  namedExports: {
+    sendAccountingInvoiceEmailInternal: async () => {
+      emailsSent += 1
+      return { success: true }
+    },
+  },
+})
+
+/**
+ * o3d-peh1 — THE LEDGER FENCE'S VERDICT, SWITCHABLE, SO A REFUSAL CAN BE DRIVEN THROUGH THE REAL LOOP.
+ *
+ * `enqueueFollowUpSyncLog` asks the ledger whether the attempt it is about to queue is already in it,
+ * on BOTH connectors and for every follow-up, and a "no" is returned to the caller as a REFUSAL —
+ * `{ enqueued: false }` — rather than thrown. That return value is the thing under test: a refusal
+ * and a success differ only in what the caller does with them, which is why nothing simulated can
+ * stand in for the caller here.
+ *
+ * CLEAR by default, so every other test in this file is untouched. `postMoneyUnderLedgerFence` and
+ * the two probe helpers are re-exported as pass-throughs because `mock.module` replaces the whole
+ * module and both processors import them at load time.
+ */
+let ledgerVerdict: { clear: true } | { clear: false; reason: string } = { clear: true }
+
+mock.module('@/lib/connectors/accounting-settlement-probe', {
+  namedExports: {
+    ledgerClearsFollowUpRevival: async () => ledgerVerdict,
+    postMoneyUnderLedgerFence: async (_params: unknown, run: () => Promise<unknown>) => run(),
+    probeLedgerSettlement: async () => ({ ok: true, records: [] }),
+    settlementProbeKey: () => 'probe-key',
   },
 })
 
@@ -510,6 +641,15 @@ function reset(connector = 'xero') {
   state.outbox = []
   state.failFollowUpsFor.clear()
   state.failReleaseFor.clear()
+  state.failSyncedWriteFor.clear()
+  state.syncedWriteFailuresLeft.clear()
+  state.throwingActivityActions.clear()
+  state.unpersistableActivityActions.clear()
+  state.mirror.length = 0
+  state.activityRows.length = 0
+  ledgerVerdict = { clear: true }
+  qboPostVerdict = { success: true, invoiceId: 'XBILL-1' }
+  emailsSent = 0
   state.raceBeforeRelease = null
   state.unpersistableActivityActions.clear()
   state.failBackReferenceWrite = false
@@ -1198,11 +1338,14 @@ test('[o3d-9kek r10 f1] a QuickBooks fresh post whose follow-ups fail keeps the 
 })
 
 test('[o3d-9kek r10 f1] a failed QuickBooks follow-up enqueue leaves the obligation CLAIMED', async () => {
-  // This branch has no catch of its own: the throw reaches the loop's outer handler, which counts a
-  // failure and schedules a retry. Either way the marker must survive — it is the only thing left
-  // that distinguishes this row from one whose follow-ups ran, and with the QuickBooks sweep
-  // unwired it is also the state that makes the work recoverable the day a consumer is bound — which
-  // waits on post-time authorization (o3d-8prh) and origin propagation, not on the closed o3d-s36z.
+  // The branch catches this itself now (Codex round 2, HIGH) and routes it to the follow-up-only
+  // retry transition instead of the main-post failure handler. The counted failure and the retry are
+  // unchanged, which is why this test reads exactly as it did; what changed is only that the
+  // transition no longer contradicts the ledger — pinned by the two tests at the end of this file.
+  // Either way the marker must survive: it is the only thing left that distinguishes this row from
+  // one whose follow-ups ran, and with the QuickBooks sweep unwired it is also the state that makes
+  // the work recoverable the day a consumer is bound — which waits on post-time authorization
+  // (o3d-8prh) and origin propagation, not on the closed o3d-s36z.
   reset('quickbooks')
   state.failFollowUpsFor.add('log-1')
 
@@ -1216,6 +1359,656 @@ test('[o3d-9kek r10 f1] a failed QuickBooks follow-up enqueue leaves the obligat
 })
 
 // ---------------------------------------------------------------------------
+// o3d-peh1, CROSS-PORTED — A REFUSED FOLLOW-UP ENQUEUE MUST NOT REPORT THE PARENT AS SETTLED.
+//
+// `requireFollowUpsEnqueued` exists on both connectors: the enqueue can decline (the planner cannot
+// tell which of several attempts committed, or the ledger fence says the settlement is already in
+// it) and it says so by RETURNING `{ enqueued: false }`. The guard turns that into a throw so the
+// obligation release below it cannot run.
+//
+// On QuickBooks the throw landed in a catch that treats every follow-up exception as best-effort:
+// it logged an ERROR and fell through to `result.succeeded++`. So the parent was SYNCED, counted
+// synced, and the money-moving child had never been queued — the o3d-peh1 defect exactly, surviving
+// on the connector whose caller was not changed. The QuickBooks repair sweep is still unwired
+// (o3d-s36z), so nothing else was going to come back for it either.
+//
+// These run the REAL processPendingQuickBooksSync down the fresh-post branch — the branch the
+// finding names — so what is asserted is the caller's behaviour, not a re-description of the guard.
+// A passing Xero test proves nothing here: the two callers are separate code.
+// ---------------------------------------------------------------------------
+
+test('[o3d-peh1] a REFUSED QuickBooks follow-up enqueue does not count the entry as succeeded', async () => {
+  reset('quickbooks')
+  state.syncRows = [{ ...blankRow(), externalTransactionId: null }]
+  ledgerVerdict = { clear: false, reason: 'a settlement matching this attempt is already in QuickBooks' }
+
+  const result = await runQuickBooks()
+
+  assert.equal(result.succeeded, 0, 'nothing was queued, so nothing about this entry is finished')
+  assert.equal(result.failed, 1)
+  assert.equal(
+    state.syncRows.filter((row) => row.type === 'BILL_ATTACHMENT').length,
+    0,
+    'the refusal is real: no follow-up row exists',
+  )
+  assert.ok(
+    state.activities.some((entry) => entry.action === 'quickbooks_followup_enqueue_refused'),
+    'and it is on record as a refusal, not as a generic failure',
+  )
+})
+
+test('[o3d-peh1] the refused parent goes back to UNSETTLED, keeping its external id and its obligation', async () => {
+  reset('quickbooks')
+  state.syncRows = [{ ...blankRow(), externalTransactionId: null }]
+  ledgerVerdict = { clear: false, reason: 'a settlement matching this attempt is already in QuickBooks' }
+
+  await runQuickBooks()
+
+  assert.equal(subject().status, 'PENDING', 'the row is owed work again, so it must be claimable again')
+  assert.equal(subject().retryCount, 1, 'and bounded by the same retry budget as every other failure')
+  assert.equal(subject().processingStartedAt, null, 'the claim is given up — nothing is in flight')
+  // THE TWO FACTS THE REVERSAL MUST NOT DESTROY.
+  assert.equal(
+    subject().externalTransactionId,
+    'XBILL-1',
+    'the external id is POST EVIDENCE — it is the only local record the bill is in QuickBooks, and it is '
+    + 'what makes the retry take the idempotency short-circuit instead of posting a second document',
+  )
+  assert.ok(
+    subject().backReferenceFollowUpsPendingAt instanceof Date,
+    'the obligation is still owed; the release runs only on the arm where the enqueue actually happened',
+  )
+  assert.equal(state.bills[0].accountingInvoiceId, 'XBILL-1', 'the back-reference half succeeded and stands')
+})
+
+test('[o3d-peh1] a refused entry re-runs into the short-circuit and never posts a second document', async () => {
+  reset('quickbooks')
+  state.syncRows = [{ ...blankRow(), externalTransactionId: null }]
+  ledgerVerdict = { clear: false, reason: 'a settlement matching this attempt is already in QuickBooks' }
+
+  await runQuickBooks()
+  // The ambiguity clears — an operator reconciled the ledger — and the next cron pass picks the row
+  // up again. THIS is what "unsettled" has to mean: recoverable without a second post.
+  ledgerVerdict = { clear: true }
+  const second = await runQuickBooks()
+
+  assert.equal(second.succeeded, 1, 'the retry settles it')
+  assert.equal(subject().status, 'SYNCED')
+  assert.equal(
+    state.syncRows.filter((row) => row.type === 'BILL_ATTACHMENT').length,
+    1,
+    'the follow-up the refusal withheld is queued exactly once',
+  )
+  assert.equal(subject().backReferenceFollowUpsPendingAt, null, 'and only now is the obligation released')
+})
+
+test('[o3d-peh1] a plain follow-up FAILURE is still best-effort — the port did not widen', async () => {
+  // The catch has to tell a refusal from a transient error, and this is the case it must leave alone.
+  // A failed enqueue is retryable work the obligation marker records; QuickBooks deliberately does
+  // not fail the entry for it (the test above this block pins that), and changing it here would be a
+  // second change wearing this one's clothes.
+  reset('quickbooks')
+  state.syncRows = [{ ...blankRow(), externalTransactionId: null }]
+  state.failFollowUpsFor.add('log-1')
+
+  const result = await runQuickBooks()
+
+  assert.equal(result.succeeded, 1)
+  assert.equal(result.failed, 0)
+  assert.equal(subject().status, 'SYNCED')
+  assert.equal(subject().retryCount, 0)
+  assert.ok(subject().backReferenceFollowUpsPendingAt instanceof Date)
+})
+
+// ---------------------------------------------------------------------------
+// CODEX ROUND 2, HIGH — THE FINAL REFUSAL MUST NOT RECORD A LIVE DOCUMENT AS A FAILED POST.
+//
+// Round 1 closed o3d-peh1 by preserving `externalTransactionId` across a refusal. That is what puts
+// the row into the ALREADY-POSTED short-circuit on its next pass, and the short-circuit does two
+// things before it touches the follow-ups: it writes the row SYNCED and it writes the mirrored
+// AccountingEvent POSTED. Then the follow-up refusal threw — into the loop's MAIN-POST failure
+// handler, whose terminal arm stamps that same mirrored event FAILED.
+//
+// So the row round 1 saved from being reported settled ended up reported as a FAILED POST of a
+// document that is in QuickBooks. Round 1's own note on `markSyncLogForFollowUpRetry` says why that
+// is the wrong write — "this document POSTED, the mirror already says so, and overwriting it would
+// make the ledger's own copy of the record contradict the ledger" — and that transition is now the
+// one both posted arms use.
+//
+// THESE DRIVE THE QUICKBOOKS LOOP, from a row that ALREADY CARRIES AN EXTERNAL ID, all the way to
+// the final retry. The Xero twin has had its own catch since o3d-nepa and passes either way, so only
+// the QuickBooks path can show this.
+// ---------------------------------------------------------------------------
+
+/** MAX_RETRIES on the QuickBooks processor. The fifth pass is the one that terminalises the row. */
+const QBO_MAX_RETRIES = 5
+
+function mirrorFailures() {
+  return state.mirror.filter((entry) => entry.status === 'FAILED')
+}
+
+test('[o3d-peh1 r2] a REFUSED follow-up on an already-posted QuickBooks row never records it as a failed post', async () => {
+  reset('quickbooks')
+  // blankRow() already carries XBILL-1, which is what sends this row down the short-circuit — the
+  // starting condition the finding names.
+  ledgerVerdict = { clear: false, reason: 'a settlement matching this attempt is already in QuickBooks' }
+
+  for (let pass = 0; pass < QBO_MAX_RETRIES; pass += 1) await runQuickBooks()
+
+  assert.equal(subject().retryCount, QBO_MAX_RETRIES, 'the row really was driven to its last retry')
+  assert.equal(subject().status, 'FAILED', 'and the retry budget is still bounded — that part is unchanged')
+  assert.deepEqual(
+    mirrorFailures(),
+    [],
+    'but the DOCUMENT is in QuickBooks, and nothing may write the mirrored event FAILED for it',
+  )
+  assert.ok(state.mirror.length > 0, 'the mirror was written — POSTED — so the assertion above is about real writes')
+  assert.deepEqual(
+    [...new Set(state.mirror.map((entry) => entry.status))],
+    ['POSTED'],
+    'every mirrored write for this row says POSTED, which is what the ledger holds',
+  )
+  assert.equal(subject().externalTransactionId, 'XBILL-1', 'post evidence survives the terminal transition')
+  assert.ok(
+    subject().backReferenceFollowUpsPendingAt instanceof Date,
+    'and so does the obligation: the follow-ups were never enqueued',
+  )
+  assert.equal(
+    state.syncRows.filter((row) => row.type === 'BILL_ATTACHMENT').length,
+    0,
+    'the refusal was real throughout — nothing was ever queued',
+  )
+})
+
+test('[o3d-peh1 r2] a PLAIN follow-up failure on the already-posted arm is recorded the same way', async () => {
+  // The catch on this arm is deliberately catch-all. A plain failure here was never best-effort —
+  // it already counted FAILED through the outer handler — so the only thing that changes is which
+  // transition writes it, and a mirror stamped FAILED is just as untrue for a transient error as
+  // for a refusal. (The FRESH-POST arm's narrow `instanceof` catch is a different rule and is
+  // pinned separately, above.)
+  reset('quickbooks')
+  state.failFollowUpsFor.add('log-1')
+
+  for (let pass = 0; pass < QBO_MAX_RETRIES; pass += 1) await runQuickBooks()
+
+  assert.equal(subject().status, 'FAILED')
+  assert.deepEqual(mirrorFailures(), [], 'the bill is in QuickBooks; a FAILED mirror would deny it')
+  assert.equal(subject().externalTransactionId, 'XBILL-1')
+  assert.ok(subject().backReferenceFollowUpsPendingAt instanceof Date)
+  assert.ok(
+    state.activities.some((entry) => entry.action === 'quickbooks_followup_error'),
+    'and it is reported, so the outstanding work is visible rather than merely recorded',
+  )
+})
+
+test('[o3d-peh1 r2] the already-posted arm still settles normally once the refusal clears', async () => {
+  // The control: the catch must not turn a recoverable row into a permanently failed one. Same row,
+  // same short-circuit, refusal lifted before the budget runs out.
+  reset('quickbooks')
+  ledgerVerdict = { clear: false, reason: 'a settlement matching this attempt is already in QuickBooks' }
+
+  await runQuickBooks()
+  ledgerVerdict = { clear: true }
+  const second = await runQuickBooks()
+
+  assert.equal(second.succeeded, 1)
+  assert.equal(subject().status, 'SYNCED')
+  assert.equal(subject().backReferenceFollowUpsPendingAt, null, 'the obligation is discharged only now')
+  assert.equal(state.syncRows.filter((row) => row.type === 'BILL_ATTACHMENT').length, 1)
+  assert.deepEqual(mirrorFailures(), [])
+})
+
+// ---------------------------------------------------------------------------
+// ROUND 4 (Codex HIGH) — THE OUTER HANDLER COULD STILL MARK AN ALREADY-POSTED DOCUMENT FAILED.
+//
+// Round 3 gave the short-circuit arm's FOLLOW-UP WORK a catch of its own and routed it to the
+// transition that writes no mirrored event. That closed one route. The generic outer handler was
+// not touched, and it still asked only "have the retries run out?" — so a failure ANYWHERE ELSE on
+// that arm reached it and, on the last retry, stamped the mirrored AccountingEvent FAILED for a
+// document that is in the ledger. The routes are real and none of them is follow-up work:
+//
+//   • the SYNCED/POSTED transaction itself, and the payload re-read before it (short-circuit arm);
+//   • the announcement inside the FRESH-POST arm's follow-up catch, which is awaited with no
+//     `.catch()` of its own — and which fires at the one moment `entry.externalTransactionId` is
+//     STALE, because the row acquired its id in this same iteration and the snapshot still says null.
+//
+// THE PRINCIPLE, RESTATED BECAUSE IT IS THE WHOLE FIX: THE EXTERNAL ID IS POST EVIDENCE, AND A
+// FAILED MIRROR CONTRADICTS A DOCUMENT THAT EXISTS. It is untrue for a transient error exactly as it
+// is for a refusal — the reasons are facts about the ledger, not about the exception. So the outer
+// handler now asks the DATABASE, in the statement that writes.
+// ---------------------------------------------------------------------------
+
+test('[o3d-peh1 r4] a NON-follow-up failure on an already-posted row never records it as a failed post', async () => {
+  reset('quickbooks')
+  // blankRow() carries XBILL-1, so this row takes the short-circuit — and the thing that fails is
+  // the SYNCED/POSTED transaction, which round 3's inner catch does not cover at all.
+  state.syncRows = [{ ...blankRow(), retryCount: QBO_MAX_RETRIES - 1 }]
+  state.failSyncedWriteFor.add('log-1')
+
+  const result = await runQuickBooks()
+
+  assert.equal(result.failed, 1, 'the failure is real and counted')
+  assert.ok(
+    state.journal.some((entry) => entry.op === 'synced.attempted-and-failed'),
+    'and it happened where this test says it did — not in follow-up work',
+  )
+  assert.equal(subject().status, 'FAILED', 'the retry budget is still bounded — that part is unchanged')
+  assert.equal(subject().retryCount, QBO_MAX_RETRIES)
+  assert.deepEqual(
+    mirrorFailures(),
+    [],
+    'THE POINT: the document is in QuickBooks, so nothing may write the mirrored event FAILED for it',
+  )
+  assert.equal(subject().externalTransactionId, 'XBILL-1', 'post evidence survives the terminal transition')
+  assert.ok(
+    subject().backReferenceFollowUpsPendingAt instanceof Date || subject().backReferenceFollowUpsPendingAt === null,
+    'the obligation column is not disturbed by the failure transition',
+  )
+  assert.match(String(subject().errorMessage), /SYNCED transaction could not be written/)
+})
+
+test('[o3d-peh1 r4 + o3d-0bfh r6] the FRESH-POST arm no longer reaches the failure handler at all', async () => {
+  // THE CASE NO IN-MEMORY TEST COULD GET RIGHT, and what the merge did to it. `entry` is the
+  // PRE-CLAIM snapshot: this row starts with no external id, acquires one when the SYNCED
+  // transaction commits, and `entry.externalTransactionId` is still null in memory while the row in
+  // the database names a document. Every route out of this arm after that commit therefore had to
+  // ask the DATABASE, not the snapshot, before it could record anything terminal.
+  //
+  // WHAT THIS TEST USED TO DRIVE, and why it cannot any more. It made the follow-up catch's own
+  // announcement throw, so the throw escaped into the loop's main-post failure handler — which,
+  // with retries exhausted, wrote the terminal transition. o3d-peh1 r4 fenced that handler on
+  // database evidence so it could not stamp a FAILED mirror over the live document.
+  //
+  // o3d-0bfh r6 then closed that escape at its source: the announcement goes through
+  // `reportRetainedObligation`, which CATCHES its own write failure and reports the lost notice to
+  // stderr, on the stated ground that a failed activity-log write is not a reason to fail a posted
+  // invoice. The debt is carried by the ROW and the exception inbox, not by that log line.
+  //
+  // Between that and o3d-peh1 r5 — which took the SYNCED write itself out of the outer handler's
+  // reach, into `persistFreshQboPostOrEscalate` — this arm has NO route left to the main-post
+  // failure handler once the post has committed. So the property is now STRUCTURAL rather than
+  // fenced, and this test pins it that way: both surviving post-commit failures are driven, and
+  // neither may produce a FAILED mirror, lose the external id, or discharge the obligation.
+  //
+  // NOT VACUOUS: the two routes are asserted to reach DIFFERENT counted outcomes. A plain follow-up
+  // failure is best-effort and still counts SUCCEEDED (unchanged on this arm, by both sides); a
+  // REFUSAL counts FAILED and returns the row to UNSETTLED. If either route silently became a no-op
+  // — or if they collapsed into one answer — the counts below stop matching.
+
+  // (1) a plain follow-up failure, with the announcement ALSO failing: the route that used to
+  //     escalate, now swallowed at source.
+  //
+  //     INJECTED AT THE WRITER THE NOTICE ACTUALLY USES. o3d-0bfh r6 moved this announcement from
+  //     `logActivity` to `logActivityPersisted` (inside `reportRetainedObligation`), and those are
+  //     two different doubles: `throwingActivityActions` reaches the first, `unpersistable-
+  //     ActivityActions` the second. Keeping the old injection would have left this half asserting
+  //     the ordinary best-effort fall-through with its precondition never reached — proved by
+  //     mutation: making reportRetainedObligation rethrow changed nothing.
+  reset('quickbooks')
+  state.syncRows = [{ ...blankRow(), externalTransactionId: null, retryCount: QBO_MAX_RETRIES - 1 }]
+  state.failFollowUpsFor.add('log-1')
+  state.unpersistableActivityActions.add('quickbooks_followup_error')
+
+  const plain = await runQuickBooks()
+
+  assert.ok(
+    state.activities.some((entry) => entry.action === 'quickbooks_followup_error'),
+    'the precondition was reached: the notice was attempted',
+  )
+  assert.equal(plain.succeeded, 1, 'a transient follow-up failure is best-effort on this arm, and a lost NOTICE does not change that')
+  assert.equal(plain.failed, 0, 'the announcement no longer decides the entry\'s outcome — o3d-0bfh r6')
+  assert.equal(
+    subject().externalTransactionId,
+    'XBILL-1',
+    'the post committed in this very iteration — the document IS in QuickBooks',
+  )
+  assert.ok(
+    state.mirror.some((entry) => entry.status === 'POSTED'),
+    'and the mirror says so, which is what a FAILED write would then contradict',
+  )
+  assert.notEqual(subject().status, 'FAILED', 'retries were exhausted, but nothing terminal was ever reached')
+  assert.deepEqual(mirrorFailures(), [], 'THE POINT: no FAILED mirror over a live document')
+  assert.ok(
+    subject().backReferenceFollowUpsPendingAt instanceof Date,
+    'the obligation survives: the follow-ups were never enqueued, and the row is the record of that',
+  )
+
+  // (2) a REFUSAL on the same arm, with the same stale snapshot and the same exhausted retries.
+  //     This one IS counted a failure and DOES take a terminal transition — through
+  //     `markSyncLogForFollowUpRetry`, which writes no mirrored event precisely because the
+  //     document posted.
+  reset('quickbooks')
+  state.syncRows = [{ ...blankRow(), externalTransactionId: null, retryCount: QBO_MAX_RETRIES - 1 }]
+  state.unpersistableActivityActions.add('quickbooks_followup_error')
+  ledgerVerdict = { clear: false, reason: 'a settlement matching this attempt is already in QuickBooks' }
+
+  const refused = await runQuickBooks()
+
+  assert.equal(refused.failed, 1, 'a refusal queued nothing, so the entry is not finished')
+  assert.equal(refused.succeeded, 0, 'and the two routes do NOT reach the same answer')
+  assert.equal(subject().externalTransactionId, 'XBILL-1', 'the document is still in QuickBooks')
+  assert.equal(subject().status, 'FAILED', 'the retries are exhausted, so this is the terminal write')
+  assert.deepEqual(mirrorFailures(), [], 'and it still writes no FAILED mirror over a live document')
+  assert.ok(
+    subject().backReferenceFollowUpsPendingAt instanceof Date,
+    'the obligation survives here too',
+  )
+})
+
+test('[o3d-peh1 r4] a main-post failure on a row with NO document is recorded exactly as before', async () => {
+  // THE CONTROL, and the one that stops the fix being "never mirror a failure". A row that never
+  // posted has no evidence to protect: the terminal write must still stamp the mirrored event FAILED,
+  // because that is the truth about it. Without this the change would be indistinguishable from
+  // deleting the FAILED mirror altogether.
+  //
+  // THE POST IS WHAT FAILS HERE, and until r5 it was not (Codex r5). This test used to make the
+  // SYNCED WRITE fail while `pushPurchaseBill` succeeded — which is a document that IS in
+  // QuickBooks with an id this process is holding, i.e. the r5 defect itself, pinned as if it were
+  // the intended behaviour. A control has to be the case it claims to be, so the connector now
+  // refuses and nothing is ever posted.
+  reset('quickbooks')
+  state.syncRows = [{ ...blankRow(), externalTransactionId: null, retryCount: QBO_MAX_RETRIES - 1 }]
+  qboPostVerdict = { success: false, error: 'QuickBooks rejected the bill: invalid account reference' }
+
+  const result = await runQuickBooks()
+
+  assert.equal(result.failed, 1)
+  assert.equal(subject().externalTransactionId, null, 'nothing was ever posted for this row')
+  assert.equal(subject().status, 'FAILED')
+  assert.deepEqual(
+    mirrorFailures().map((entry) => entry.syncLogId),
+    ['log-1'],
+    'so the mirrored event IS stamped FAILED — the evidence check is a fence, not a blanket refusal',
+  )
+  assert.deepEqual(
+    state.activityRows.filter((row) => row.action === QBO_UNRECORDED_POSTED_DOCUMENT_ACTION),
+    [],
+    'and nothing is escalated as an unrecorded document, because there is no document',
+  )
+})
+
+// ---------------------------------------------------------------------------
+// ROUND 5 (Codex HIGH) — A POST-SUCCESS PERSISTENCE FAILURE STILL WROTE A FAILED MIRROR.
+//
+// Rounds 2 and 4 fixed the cases where the row ALREADY CARRIED an external id. The database could
+// be asked, so the outer handler could establish there was a document not to contradict, and
+// `markPostedSyncLogRetryPreservingEvidence` is that question asked in the statement that writes.
+//
+// THIS IS THE CASE WHERE THE ROW DOES NOT CARRY ONE YET. `processEntry` returns success —
+// QUICKBOOKS ALREADY HOLDS THE DOCUMENT — and the id becomes durable only in the transaction that
+// follows. When that transaction fails, the database never learns the id; the evidence fence
+// correctly answers "this row names no document" (it does not); and the ordinary failure path
+// stamps the mirrored AccountingEvent FAILED FOR A DOCUMENT THAT EXISTS. No fence built on the
+// database can close it, because at that instant the database is the thing that is wrong.
+//
+// It is o3d-jit6 on this connector. The full answer — a pre-post dispatch record — is in flight for
+// Xero on o3d-batch-prov and is filed here as o3d-tr2q. What this branch does instead is the
+// smaller thing that is unambiguously correct: the process HOLDS the returned id and KNOWS the post
+// succeeded, so it re-drives the durable write, and if that is exhausted it RECORDS AND ESCALATES
+// the unrecorded posted document rather than recording a falsehood.
+//
+// The mirror-failure assertions below are the same shape as r2's and r4's for a reason: this is the
+// third route to one untrue write, and the property is stated identically each time.
+// ---------------------------------------------------------------------------
+
+test('[o3d-peh1 r5] a persistence failure AFTER a successful post never records a failed post', async () => {
+  // The connector accepts the bill and returns XBILL-1; every attempt at the SYNCED/POSTED
+  // transaction then fails. The retries are already at their last one, so the pre-r5 handler took
+  // its terminal arm — the arm that writes the FAILED mirror.
+  reset('quickbooks')
+  state.syncRows = [{ ...blankRow(), externalTransactionId: null, retryCount: QBO_MAX_RETRIES - 1 }]
+  state.failSyncedWriteFor.add('log-1')
+
+  const result = await runQuickBooks()
+
+  assert.equal(result.failed, 1, 'the failure is real and counted')
+  assert.equal(
+    state.journal.filter((entry) => entry.op === 'synced.attempted-and-failed').length,
+    3,
+    'and the durable write was RE-DRIVEN before anything was given up on — a blip is not a verdict',
+  )
+  assert.deepEqual(
+    mirrorFailures(),
+    [],
+    'THE POINT: QuickBooks holds this document, so nothing may write the mirrored event FAILED for it',
+  )
+  assert.deepEqual(
+    state.mirror,
+    [],
+    'and no mirrored write landed at all — the POSTED one was inside the transaction that failed',
+  )
+
+  // RECORDED AND ESCALATED, which is what makes this different from swallowing the incident.
+  const escalation = state.activityRows.find((row) => row.action === QBO_UNRECORDED_POSTED_DOCUMENT_ACTION)
+  assert.ok(escalation, 'the posted document IMS cannot name must leave a durable record')
+  assert.equal(escalation.level, 'ERROR')
+  assert.match(String(escalation.description), /POSTED as XBILL-1/, 'the identifier is IN the record')
+  assert.equal(
+    (escalation.metadata as { postedExternalId?: string }).postedExternalId,
+    'XBILL-1',
+    'and in its metadata, so it is searchable rather than only readable',
+  )
+
+  // THE ROW IS LEFT ALONE, deliberately: a PENDING/FAILED write here would record a post that failed.
+  assert.equal(subject().externalTransactionId, null, 'the id could not be written — that is the incident')
+  assert.equal(subject().status, 'PROCESSING', 'the claim is still held, so the stale-claim reclaim retries it')
+  assert.equal(subject().retryCount, QBO_MAX_RETRIES - 1, 'and no retry was consumed for a post that succeeded')
+})
+
+test('[o3d-peh1 r5] the durable write is re-driven, and an id that lands on a later attempt settles normally', async () => {
+  // THE OTHER HALF OF "re-driven": the common failure here is a serialization conflict or a deadlock
+  // victim, and a transaction that lost commits perfectly well a moment later. Without this the fix
+  // could be a single attempt plus an escalation, which would escalate every blip.
+  reset('quickbooks')
+  state.syncRows = [{ ...blankRow(), externalTransactionId: null }]
+  state.syncedWriteFailuresLeft.set('log-1', 2)
+
+  const result = await runQuickBooks()
+
+  assert.equal(
+    state.journal.filter((entry) => entry.op === 'synced.attempted-and-failed').length,
+    2,
+    'it really did fail twice — otherwise this asserts nothing about re-driving',
+  )
+  assert.equal(result.succeeded, 1, 'and the third attempt settled it, exactly as an unbroken run would')
+  assert.equal(subject().status, 'SYNCED')
+  assert.equal(subject().externalTransactionId, 'XBILL-1', 'the id is durable')
+  assert.deepEqual(
+    [...new Set(state.mirror.map((entry) => entry.status))],
+    ['POSTED'],
+    'the mirror says POSTED, once the write that carries it lands',
+  )
+  assert.deepEqual(
+    state.activityRows.filter((row) => row.action === QBO_UNRECORDED_POSTED_DOCUMENT_ACTION),
+    [],
+    'and nothing is escalated: a recovered write is not an unrecorded document',
+  )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-qn21 (Codex MEDIUM) — THE ESCALATION PROMISED A DEDUPLICATION FOUR OPERATIONS DO NOT HAVE.
+//
+// Round 5's escalation is given EVERY successful QuickBooks result, and its wording told one story:
+// the row keeps its claim, the stale-claim reclaim re-posts UNDER THE SAME DERIVED INTUIT
+// REQUEST-ID, so the replay is deduplicated rather than duplicated.
+//
+// FOUR TYPES BREAK THAT SENTENCE. BILL_ATTACHMENT, INVOICE_PDF, INVOICE_EMAIL and WC_INVOICE_NOTE
+// are not document posts: they upload a file, save a PDF, SEND AN EMAIL, write a note onto a
+// WooCommerce order. None reaches the idempotent poster, none carries a Request-Id, and every one
+// returns success with no external id. For them the reclaim is not a deduplicated replay — it is the
+// side effect again, on every sweep.
+//
+// ROUNDS 6 AND 7 STAY REVERTED. This is a MESSAGE fix, not the fence: both attempts at the fence
+// were unsound (a claim is not proof of dispatch; a failure is not proof of no effect) and the hole
+// is filed as o3d-qn21. What these tests pin is that the record an operator reads no longer
+// describes a protection that is not there — and, in the second test, that the replay it now warns
+// about is real, so the wording is true rather than merely different.
+// ---------------------------------------------------------------------------
+
+/** A no-identifier operation row: the email follow-up, which is the one with a customer on the end. */
+function emailRow(): SyncRow {
+  return {
+    ...blankRow(),
+    type: 'INVOICE_EMAIL',
+    referenceType: 'SalesOrder',
+    referenceId: 'order-1',
+    externalTransactionId: null,
+    payload: { referenceId: 'order-1' },
+  }
+}
+
+/** The stale-claim reclaim, driven by hand: age this row's claim past CLAIM_STALE_MS (15 minutes). */
+function ageTheClaim() {
+  const row = subject()
+  if (row.processingStartedAt) row.processingStartedAt = new Date(Date.now() - 20 * 60 * 1000)
+}
+
+function qboEscalation() {
+  return state.activityRows.find((row) => row.action === QBO_UNRECORDED_POSTED_DOCUMENT_ACTION)
+}
+
+test('[o3d-qn21] a no-identifier operation is escalated as a REPLAY, never as a deduplicated re-post', async () => {
+  // The email goes out; every attempt at the transaction that would record it fails. That is exactly
+  // the round-5 escalation path — the assertion is about WHAT IT SAYS to the operator who finds it.
+  reset('quickbooks')
+  state.syncRows = [emailRow()]
+  state.failSyncedWriteFor.add('log-1')
+
+  const result = await runQuickBooks()
+
+  assert.equal(result.failed, 1, 'the failure is real and counted')
+  assert.equal(emailsSent, 1, 'and the effect really did happen — otherwise there is nothing to warn about')
+
+  const escalation = qboEscalation()
+  assert.ok(escalation, 'the unrecorded operation must still leave a durable record')
+  const description = String(escalation.description)
+
+  // THE FALSEHOOD THAT WAS THERE, both halves of the sentence that used to be printed here. Either
+  // one alone sends the operator to reconcile a duplicate document rather than stop a send from
+  // repeating. (The negations are matched, not the WORD "Request-Id" — the new wording has to be
+  // free to say that no Request-Id was ever sent, which is the correction itself.)
+  assert.doesNotMatch(
+    description,
+    /re-posts under the SAME Intuit Request-Id/,
+    'no Request-Id may be claimed for an operation that was never sent under one',
+  )
+  assert.doesNotMatch(
+    description,
+    /should be deduplicated rather than duplicated/,
+    'and nothing deduplicates it, so the record must not promise a deduplicated replay',
+  )
+  assert.match(
+    description,
+    /nothing for QuickBooks or WooCommerce or a mail server to deduplicate it against/,
+    'the only mention of deduplication left is its ABSENCE, said out loud',
+  )
+
+  // WHAT IT MUST SAY INSTEAD: no protection, the effect will be replayed, and what to check.
+  assert.match(description, /NO REQUEST ID PROTECTS IT/, 'it states plainly that nothing protects the effect')
+  assert.match(
+    description,
+    /RUN THE OPERATION AGAIN OUTRIGHT/,
+    'and that stale-claim recovery replays it, rather than replaying an identifier',
+  )
+  assert.match(
+    description,
+    /ANOTHER COPY OF THE INVOICE EMAIL IS QUEUED TO THE CUSTOMER/,
+    'named as the effect this particular operation has, not as a generic "side effect"',
+  )
+
+  // Codex MEDIUM — QUEUED, NOT SENT. `INVOICE_EMAIL` succeeds by writing a PENDING email-outbox row;
+  // the outbox cron delivers it afterwards. So the sweep leaves a queued copy behind on every pass.
+  assert.doesNotMatch(
+    description,
+    /IS SENT TO THE CUSTOMER, once per sweep/,
+    'the old wording described a send that has already finished, so nothing was left to say',
+  )
+  assert.match(description, /PENDING/, 'the record says the copies are pending, not delivered')
+
+  // ROUND 3, Codex HIGH — AND NEITHER STEP OF THE REMEDY THAT REPLACED IT WAS PERFORMABLE. The
+  // outbox has no cancelled state and no control that removes an unsent row, and the settlement
+  // action refuses every QuickBooks row (UNFENCED_ATTEMPT, permanently). Both instructions are gone;
+  // the message names the impossibilities and the one lever that does work. Each step is walked
+  // against the shipped code in tests/accounting/qbo-remedy-is-performable.test.ts.
+  assert.doesNotMatch(description, /cancel the rest/, 'there is no operation that cancels a queued copy')
+  assert.doesNotMatch(description, /then settle sync row log-1 by hand/, 'and none that settles this row')
+  assert.match(description, /IMS CANNOT CANCEL A QUEUED COPY/)
+
+  // ROUND 7, Codex HIGH — AND THE PER-ROW REMEDY ROUNDS 4-6 BUILT WAS RACEABLE ALL ALONG. Its
+  // precondition was the sync toggle, which both claim paths merely READ before calling the
+  // processor, so a run admitted a moment earlier can claim the row afterwards and — because
+  // persistFreshQboPost updates by id with no fence — overwrite the settlement. The whole
+  // count/settle/re-enable procedure is deleted rather than qualified; the race is driven end to
+  // end in tests/accounting/qbo-disable-is-not-quiescence.ts.
+  assert.doesNotMatch(description, /settle sync row log-1/)
+  assert.doesNotMatch(description, /refuses EVERY QuickBooks row/)
+  assert.doesNotMatch(description, /STRANDED SYNC ROWS/)
+  assert.match(description, /THEN LEAVE IT OFF, BECAUSE TURNING IT OFF IS NOT A FENCE/)
+  assert.match(description, /ESCALATE sync row log-1/)
+  assert.match(
+    description,
+    /kind ACCOUNTING_INVOICE, referenceType SalesOrder, referenceId = the order id/,
+    'the half that IS runnable — inspecting them — is still named precisely enough to run',
+  )
+  assert.match(description, /quickbooks_sync_enabled/, 'and the one lever that stops new runs is named')
+  assert.match(description, /o3d-qn21/, 'and the durable fix is named, so the reader can see it is tracked')
+  assert.match(description, /o3d-3lhp/, 'as are the two missing operations')
+  assert.match(description, /o3d-4b5p/, 'as is the quiescence fence a per-row remedy would need')
+
+  // The console line and the durable record are the SAME wording — one incident, one story.
+  assert.equal(escalation.level, 'ERROR')
+  assert.equal(
+    (escalation.metadata as { postedExternalId?: string | null }).postedExternalId,
+    null,
+    'there is no identifier, which is the whole reason this arm exists',
+  )
+})
+
+test('[o3d-qn21] the replay that message warns about is real — three sweeps, three emails', async () => {
+  // THE CONTROL THAT MAKES THE WORDING TRUE RATHER THAN MERELY DIFFERENT. If the row were somehow
+  // settled or fenced, "the sweep WILL run the operation again outright" would be a new falsehood
+  // replacing the old one. It is not fenced — rounds 6 and 7 are reverted — so the customer is
+  // mailed once per sweep, and this is the defect o3d-qn21 records as still open.
+  reset('quickbooks')
+  state.syncRows = [emailRow()]
+  state.failSyncedWriteFor.add('log-1')
+
+  await runQuickBooks()
+  ageTheClaim()
+  await runQuickBooks()
+  ageTheClaim()
+  await runQuickBooks()
+
+  assert.equal(emailsSent, 3, 'one queued copy per sweep — the replay the record now warns about, unbounded')
+  assert.equal(subject().status, 'PROCESSING', 'the row never leaves PROCESSING, which is why it recurs')
+  assert.equal(subject().retryCount, 0, 'and no retry is consumed, so nothing bounds it')
+})
+
+test('[o3d-qn21] a DOCUMENT post keeps its Request-Id wording — the split is per operation, not a rewrite', async () => {
+  // THE OTHER SIDE OF THE SPLIT. A bill IS sent under a derived Request-Id, so for it the
+  // re-attempt really is a deduplicated replay and the remedy really is "check, then reconcile".
+  // Without this the change would be indistinguishable from deleting the deduplication claim
+  // everywhere — which would send THIS operator looking for a replayed effect that cannot happen.
+  reset('quickbooks')
+  state.syncRows = [{ ...blankRow(), externalTransactionId: null }]
+  state.failSyncedWriteFor.add('log-1')
+
+  await runQuickBooks()
+
+  const description = String(qboEscalation()?.description)
+  assert.match(description, /POSTED as XBILL-1/, 'the identifier is in the record')
+  assert.match(
+    description,
+    /re-posts under the SAME Intuit Request-Id, so it should be deduplicated/,
+    'and the deduplication claim survives exactly where it is TRUE',
+  )
+  assert.doesNotMatch(
+    description,
+    /NO REQUEST ID PROTECTS IT/,
+    'the no-protection warning must not leak onto an operation that has the protection',
+  )
+})
+
 // o3d-0bfh r4 (Codex HIGH) — THE CONNECTOR-VERSUS-SWEEP INTERLEAVING.
 //
 // r3 made the SWEEP's claim a strictly-later compare-and-set and proved it exclusive BETWEEN SWEEPS.

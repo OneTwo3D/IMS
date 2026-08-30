@@ -15,9 +15,11 @@ import { lockIntegrationPluginSelection } from '@/lib/integration-plugin-selecti
 import { completePluginSelectionSave, type PluginSelectionSaveResult } from '@/lib/domain/integrations/plugin-save-outcome'
 import { runPostCommit } from '@/lib/domain/post-commit'
 import { uniqueViolationTargetsField } from '@/lib/db/prisma-unique-violation'
-import type { SettingSaveResult } from '@/lib/domain/settings/setting-save-outcome'
+import { combinePostCommitOutcomes, type SettingSaveResult } from '@/lib/domain/settings/setting-save-outcome'
+import { assertWritableSettingKeys } from '@/lib/domain/settings/writable-setting-keys'
 import { reconcileCrontab } from '@/lib/crontab-reconcile'
 import { normalizePublicAppUrl } from '@/lib/domain/settings/public-app-url-input'
+import { validateBackupScheduleInput, type BackupScheduleInput } from '@/lib/domain/settings/backup-schedule-input'
 import { toIsoCountryCode } from '@/lib/countries'
 import { getSettingValue, serializeSettingValue, SENSITIVE_SETTING_KEYS } from '@/lib/settings-store'
 import { refreshMutableDocumentTaxSnapshotsForRate } from '@/lib/tax/document-tax-snapshot-refresh'
@@ -904,6 +906,13 @@ export async function getUsers(): Promise<UserOption[]> {
  * action has an outer `catch` that renders a rejection as a failed save. See `setSettings`.
  */
 export async function setSetting(key: string, value: string): Promise<SettingSaveResult> {
+  // The allowlist is asserted HERE TOO, not left to the delegation (Codex r19 HIGH, r20 HIGH).
+  // `setSettings` runs the same check and this call would reach it — today. Both are exported
+  // server actions, i.e. two separately addressable endpoints, and an endpoint whose authorization
+  // depends on where it happens to forward to is one refactor away from having none. The cost is
+  // one duplicated line; `tests/settings/writable-setting-keys.test.ts` proves each route refuses
+  // on its own, for every family.
+  assertWritableSettingKeys([key])
   return setSettings({ [key]: value })
 }
 
@@ -947,20 +956,25 @@ export async function setSettings(values: Record<string, string>): Promise<Setti
   const entries = Object.entries(values)
   if (entries.length === 0) return { status: 'saved' }
 
-  // o3d-osl8 round 5, finding 2. The integration plugin flags decide WHICH connector is active,
-  // and other writers make destructive decisions from that answer (cancelOrphanedAccountingSyncRows
-  // discards a non-active connector's queue). Changing them one generic key at a time is neither
-  // atomic — the plugins UI fired five of these in parallel, so "Xero off, QuickBooks on" passed
-  // through both-off and both-on states — nor serialized against those readers. Routed through
-  // saveIntegrationPluginState instead, which does both. Refused rather than silently allowed so
-  // the guarantee cannot be bypassed by a new call site. THROWN, not returned: this is a
-  // programming error at a call site, not an outcome an operator can act on, and it happens before
-  // the transaction so nothing is committed.
-  for (const [key] of entries) {
-    if ((Object.values(INTEGRATION_PLUGIN_SETTING_KEYS) as string[]).includes(key)) {
-      throw new Error(`Use saveIntegrationPluginState to change ${key} — it must be written atomically and under the connector-selection lock.`)
-    }
-  }
+  // ONLY ALLOWLISTED PREFERENCE KEYS ARE WRITTEN, AND THE CHECK IS BEFORE THE COMMIT
+  // (Codex r19 HIGH; the shape corrected r20 HIGH).
+  //
+  // This was, until r19, a hand-written loop over the integration plugin flags alone. r19 replaced
+  // it with a DENYLIST of the system-managed families — and that was still the wrong shape, because
+  // a denylist over a growing key space is only as complete as the last search for keys. It was
+  // already incomplete when it was written: `MACHINE_MANAGED_SYNC_KEYS` in `app/actions/wc-sync.ts`
+  // was not in it, so `wc_initial_import_completed` — the completion flag THIS BRANCH had just made
+  // refusal-blocking — and the WooCommerce sync cursors were writable by any principal holding
+  // `settings.company`, as were the `wc_url`/`wc_consumer_*` credential rows that `saveWcCredentials`
+  // guards with validation, a fresh-auth gate, a lock and a version bump.
+  //
+  // So the rule is inverted. `lib/domain/settings/writable-setting-keys.ts` enumerates the ordinary
+  // operator preferences the settings screens offer, and EVERYTHING ELSE IS REFUSED — including a
+  // key nobody has thought about yet, which is the case the denylist could never cover. THROWN, not
+  // returned: no screen offers an unlisted key, so reaching here is a call-site bug or a
+  // hand-invoked action, not an outcome an operator can act on — and it happens before the
+  // transaction, so nothing is committed.
+  assertWritableSettingKeys(entries.map(([key]) => key))
 
   await db.$transaction(async (tx) => {
     for (const [key, value] of entries) {
@@ -1017,14 +1031,116 @@ export async function savePublicAppUrl(value: string): Promise<SettingSaveResult
     await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: `Updated setting: ${key}` })
     revalidatePath('/settings', 'layout')
   }, 'Failed to record the settings change')
-  if (local.status === 'failed') return { status: 'post-commit-failed', step: 'local', error: local.error }
 
   // The crontab embeds the public app URL in every managed job line, so it is genuinely stale until
   // this runs — and it is the step with a named operator recovery, which is why it reports
-  // separately from the local steps above.
-  const scheduler = await runPostCommit(reconcileCrontab, 'Failed to apply Public App URL changes.')
-  if (scheduler.status === 'failed') return { status: 'post-commit-failed', step: 'scheduler', error: scheduler.error }
-  return { status: 'saved' }
+  // separately from the local steps above. IT RUNS EVEN IF THE LOCAL STEP FAILED (Codex r20 HIGH):
+  // returning early here left every managed job line pointing at the previous URL while the warning
+  // talked about an audit row. Cross-ported from saveBackupScheduleSettings, which had the same
+  // shape and the worse consequence.
+  // The crontab write and the audit row it owes afterwards are DIFFERENT facts, and the
+  // reconciliation reports them separately (Codex r20 MEDIUM). Folding the follow-up into the
+  // local outcome is what stops a screen sending an operator to re-apply a crontab that is
+  // already correct.
+  let schedulerFollowUpError: string | null = null
+  const scheduler = await runPostCommit(async () => {
+    const result = await reconcileCrontab()
+    schedulerFollowUpError = result.followUpError ?? null
+    return result
+  }, 'Failed to apply Public App URL changes.')
+
+  return combinePostCommitOutcomes({ local, scheduler, schedulerFollowUpError })
+}
+
+/**
+ * SAVE THE BACKUP SCHEDULE, INCLUDING THE ROW THE SCHEDULER ACTUALLY READS (Codex r20 HIGH).
+ *
+ * This panel used to save through the generic `setSettings`, and that made its enable switch a
+ * control that could do nothing. Two things read "are scheduled backups on?", and they are not the
+ * same row:
+ *
+ *   • THE CRONTAB decides whether the job is invoked at all. `buildOtiCrontabBlock` reads
+ *     `cron_backup_enabled` and falls back to the registry's `legacyEnabledKey`
+ *     (`backup_schedule_enabled`) ONLY while the canonical row is absent. So the moment anyone
+ *     touches the Scheduled Jobs editor, this screen's switch stops reaching the crontab entirely.
+ *   • THE ROUTE decides whether an invocation does anything. `/api/cron/backup` skips unless
+ *     `backup_schedule_enabled` is 'true'.
+ *
+ * And a generic settings save never reconciles the crontab, so even on an instance where the legacy
+ * fallback was still live, switching backups on stored 'true' and installed no cron line — the
+ * screen said Saved and no backup was ever taken.
+ *
+ * So this action writes BOTH rows, in one transaction, and reconciles the crontab as a post-commit
+ * step it classifies rather than rejects — the shape `savePublicAppUrl` already uses for the same
+ * reason. Writing both is deliberate and not belt-and-braces: they gate different things, and the
+ * defect is precisely that they could disagree. The `legacyEnabledKey` fallback survives for
+ * instances that have never written the canonical row; `saveCronJobSettings` mirrors in the other
+ * direction so the editor cannot leave this row stale either.
+ *
+ * NOTE THE VALIDATION. The generic writer stored whatever the inputs contained; a blank or negative
+ * retention silently became `parseInt('') || 30` at purge time. These are refused BEFORE the write,
+ * so a refusal means the stored schedule still stands.
+ */
+export async function saveBackupScheduleSettings(input: BackupScheduleInput): Promise<SettingSaveResult> {
+  await requirePermission('settings.company')
+
+  // The SAME function the screen validates with, so a value that slips past the client is refused
+  // here rather than stored.
+  const validated = validateBackupScheduleInput(input)
+  if (!validated.ok) return { status: 'refused', error: validated.error }
+  const { retentionDays, maxCount, autoUpload } = validated
+
+  const enabled = input.enabled ? 'true' : 'false'
+  const entries: Array<[string, string]> = [
+    // The row the CRONTAB reads. Canonical: once it exists the legacy fallback is never consulted.
+    ['cron_backup_enabled', enabled],
+    // The row the ROUTE reads. Kept equal to the canonical one, because a disagreement is either a
+    // cron line that runs a no-op or a backup nothing invokes.
+    ['backup_schedule_enabled', enabled],
+    ['backup_retention_days', String(retentionDays)],
+    ['backup_max_count', String(maxCount)],
+    ['backup_auto_upload', autoUpload],
+  ]
+
+  await db.$transaction(async (tx) => {
+    for (const [key, value] of entries) {
+      await tx.setting.upsert({
+        where: { key },
+        create: { key, value: serializeSettingValue(key, value) },
+        update: { value: serializeSettingValue(key, value) },
+      })
+    }
+  })
+
+  // EVERYTHING BELOW IS POST-COMMIT — see setSettings — AND BOTH STEPS ALWAYS RUN (Codex r20 HIGH).
+  //
+  // This used to `return` on a failed local step, which skipped the reconciliation. Here that is the
+  // worst possible skip: the enable switch IS a crontab line, so a transient activity-log failure
+  // meant the operator switched backups on, the row committed, and NO scheduled invocation was ever
+  // installed — reported as "the audit entry or a cache may lag", which was simply untrue.
+  const local = await runPostCommit(async () => {
+    await logActivity({
+      entityType: 'SETTING',
+      tag: 'settings',
+      action: 'updated',
+      description: `Updated settings: ${entries.map(([key]) => key).join(', ')}`,
+    })
+    revalidatePath('/settings', 'layout')
+  }, 'Failed to record the settings change')
+
+  // The crontab is genuinely stale until this runs, whatever happened above.
+  // The crontab write and the audit row it owes afterwards are DIFFERENT facts, and the
+  // reconciliation reports them separately (Codex r20 MEDIUM). Folding the follow-up into the
+  // local outcome is what stops a screen sending an operator to re-apply a crontab that is
+  // already correct.
+  let schedulerFollowUpError: string | null = null
+  const scheduler = await runPostCommit(async () => {
+    const result = await reconcileCrontab()
+    schedulerFollowUpError = result.followUpError ?? null
+    return result
+  }, 'Failed to apply the backup schedule change.')
+
+  return combinePostCommitOutcomes({ local, scheduler, schedulerFollowUpError })
 }
 
 /** Not exported: nothing outside needs the name, and a 'use server' module's export surface is an RPC manifest. */
@@ -1125,6 +1241,12 @@ export async function saveIntegrationPluginState(
       // `requirePermission`, which answers an invalidated or 2FA-unverified session by throwing
       // NEXT_REDIRECT — and round 8's post-commit guard swallowed that into a scheduler warning
       // instead of letting Next redirect. This caller has already run the identical gate above.
+      // ITS `followUpError` IS DELIBERATELY NOT SURFACED HERE (Codex r20 MEDIUM). This step reports ONE
+      // outcome, so the only channel available says "the scheduler is behind" — and after a
+      // post-write follow-up failure the scheduler is NOT behind: the crontab is applied and what
+      // failed is the audit row recording it. Saying so would be the same false sentence the split
+      // was made to remove, and the row cannot be recorded by a second attempt at the log that just
+      // failed. The crontab result is the answer; the missing record is accepted.
       return reconcileCrontab()
     },
   })

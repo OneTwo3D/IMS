@@ -34,6 +34,13 @@
  *    and puts it back through the ordinary gated importer, so one code path answers all three
  *    cases — still excluded (row stays), now admitted (imported), already held because a
  *    concurrent create won (updated, row resolved).
+ *
+ *    AND THE ACKNOWLEDGEMENT IS CONDITIONAL ON THAT ROW (r14). Every sentence above is an argument
+ *    for ACKing a refusal *because* the queue row exists. Writing the row and ACKing regardless of
+ *    whether it landed keeps the ACK and throws away its justification — so the recorder returns
+ *    whether the row is readable, and a refusal that could not be recorded is reported as a
+ *    retryable failure instead. All three reasons share the recorder and the one exit in
+ *    `refuseWcOrderCreate`, so all three are covered by that.
  */
 
 import type { Prisma } from '@/app/generated/prisma/client'
@@ -84,15 +91,26 @@ export async function resolveWcOrderCreateAdmission(
 export const WC_ADMISSION_REFUSAL_QUEUE = 'wc_order_admission_refusal'
 
 /**
- * WHY a create was withheld. Both are ACKNOWLEDGED decisions rather than failures, and both are
- * resolved by the operator changing a setting that fires no WooCommerce webhook — which is exactly
- * why neither may depend on another delivery arriving.
+ * WHY a create was withheld. All three are ACKNOWLEDGED decisions rather than failures.
+ *
+ * The two STATUS reasons are resolved by the operator changing a setting that fires no WooCommerce
+ * webhook — which is exactly why neither may depend on another delivery arriving. The CURRENCY
+ * reason is resolved at the source instead, and depends on the same by-id re-read for the same
+ * reason: the delivery that carried the unreadable payload was acknowledged, so a corrected order
+ * is only ever seen again because this queue goes and looks.
  */
 export type WcAdmissionRefusalReason =
   /** The order's status is outside the "Import order statuses" selection. */
   | 'status_not_admitted'
   /** Neither a mapping row nor a built-in default says what this WooCommerce status means. */
   | 'status_not_mapped'
+  /**
+   * WooCommerce stated no usable currency for the order — the field was absent, blank, or not a
+   * three-letter code. IMS will not supply one (o3d-batch-ret r13, Codex HIGH): the currency
+   * decides the FX rate, the ledger the invoice posts in and the bank account a payment settles
+   * into, and a guess there is wrong in a way nothing downstream can detect.
+   */
+  | 'currency_missing'
 
 export type WcAdmissionRefusalPayload = {
   queue: typeof WC_ADMISSION_REFUSAL_QUEUE
@@ -102,6 +120,12 @@ export type WcAdmissionRefusalPayload = {
   externalOrderNumber: string
   status: string
   configured: string[]
+  /**
+   * The currency EXACTLY as WooCommerce stated it, including the blank or absent value that caused
+   * a `currency_missing` refusal — an operator cannot fix a field without being told what IMS read
+   * in it. Optional only because rows written before r13 do not carry it.
+   */
+  currency?: string
   /** When the boundary FIRST turned this order away. Preserved across re-refusals. */
   refusedAt: string
   attempts: number
@@ -130,7 +154,22 @@ export function isWcAdmissionRefusalPayload(payload: unknown): payload is WcAdmi
     && (payload as { externalOrderId?: string }).externalOrderId !== ''
 }
 
-function refusalDescription(reason: WcAdmissionRefusalReason, status: string, configured: string[]): string {
+function refusalDescription(
+  reason: WcAdmissionRefusalReason,
+  status: string,
+  configured: string[],
+  currency: string,
+): string {
+  if (reason === 'currency_missing') {
+    // Quotes the raw value rather than describing it, because "blank" and "absent" are different
+    // faults at the source and the operator is the one who has to tell them apart.
+    return `WooCommerce stated no usable currency for this order (IMS read ${currency === '' ? 'an empty value' : `"${currency}"`}), `
+      + 'so it was not imported. IMS will not assume one: the currency decides the FX rate, the '
+      + 'ledger the invoice posts in and the bank account a payment settles into. Check the order '
+      + 'in WooCommerce — a currency missing from the API response usually means a degraded or '
+      + 'filtered REST response rather than an order without a price. This row is re-checked by '
+      + 'order id every 15 minutes and imports itself as soon as the order states its currency.'
+  }
   return reason === 'status_not_admitted'
     ? `Status "${status}" is not in the "Import order statuses" selection `
       + `(${configured.length > 0 ? configured.join(', ') : 'none selected'}), so the order was not imported. `
@@ -142,22 +181,51 @@ function refusalDescription(reason: WcAdmissionRefusalReason, status: string, co
 }
 
 /**
+ * Whether the refusal is DURABLY RECORDED — the caller's licence to acknowledge the delivery.
+ *
+ * `persisted: false` is not advisory. It means the by-id queue row the whole recovery design rests
+ * on is not there, so the refusal must be reported as a retryable FAILURE and WooCommerce must be
+ * allowed to send the order again. See `recordWcOrderAdmissionRefusal`.
+ */
+export type WcAdmissionRefusalRecord =
+  | { persisted: true; id: string }
+  | { persisted: false; reason: string }
+
+/**
  * Record — durably, by order id — that the admission boundary turned an order away.
  *
- * NEVER THROWS, and that is a deliberate trade the other way round from the watermark it sits
- * beside. Turning an acknowledged skip into a retried failure would burn WooCommerce's finite
- * retries down to a dead letter for an order the operator excluded on purpose. A queue row that
- * failed to write leaves the cursor rewind as the remaining recovery, which is what round 4 had.
+ * IT RETURNS WHETHER THE ROW IS ACTUALLY THERE, and the caller acknowledges only if it is
+ * (o3d-batch-ret r14, Codex HIGH). This used to catch every failure, return `void`, and let the
+ * caller ACK regardless, on the argument that turning an acknowledged skip into a retried failure
+ * would burn WooCommerce's finite retries down to a dead letter for an order the operator excluded
+ * on purpose.
+ *
+ * THAT ARGUMENT IS TRUE ONLY WHILE THE ROW EXISTS. With the row written, a redelivery re-hits the
+ * identical rule and the by-id drain owns the order, so re-ACKing is exactly right. With the write
+ * failed it inverts into the worst outcome the module has: WooCommerce stops redelivering, the
+ * drain has nothing to read, and the only recovery left is the cursor rewind — which the header
+ * above already establishes is not a guarantee (the next admitted delivery advances the cursor past
+ * the order, and a refusal recorded before any sweep wrote a selection fingerprint is never
+ * reached). A transient statement failure would therefore lose the order silently and permanently.
+ *
+ * So it still NEVER THROWS — the caller decides what a failure means — but it no longer HIDES: a
+ * failure comes back as `persisted: false`, and `refuseWcOrderCreate` turns that into
+ * `success: false`, which the webhook reports as a 5xx the shared inbox classifies as retryable.
+ *
+ * CONFIRMED WITH THE DRAIN'S OWN PREDICATE, not by the write returning. A write that commits a row
+ * `drainWcOrderAdmissionRefusals` cannot select — wrong status, a payload the queue filter does not
+ * match — is worth exactly as much as no write at all, so the confirmation re-reads through
+ * `wcAdmissionRefusalQueueWhere`, which is the query the drain itself runs.
  *
  * Idempotent per order: a re-refusal updates the existing row and keeps its original `refusedAt`,
  * so the queue cannot grow one row per delivery for a store that pushes the same excluded order
  * repeatedly.
  */
 export async function recordWcOrderAdmissionRefusal(
-  wcOrder: Pick<WcFullOrder, 'id' | 'number' | 'status'>,
+  wcOrder: Pick<WcFullOrder, 'id' | 'number' | 'status'> & Partial<Pick<WcFullOrder, 'currency'>>,
   reason: WcAdmissionRefusalReason,
   configured: string[],
-): Promise<void> {
+): Promise<WcAdmissionRefusalRecord> {
   try {
     const externalOrderId = String(wcOrder.id)
     const existing = await db.shoppingSyncLog.findFirst({
@@ -166,6 +234,9 @@ export async function recordWcOrderAdmissionRefusal(
       select: { id: true, payload: true },
     })
     const previous = isWcAdmissionRefusalPayload(existing?.payload) ? existing.payload : null
+    // Not `|| ''`: an absent field and a blank one are the SAME refusal but not the same message,
+    // and this is the one record that can still tell them apart.
+    const statedCurrency = typeof wcOrder.currency === 'string' ? wcOrder.currency : ''
     const payload: WcAdmissionRefusalPayload = {
       queue: WC_ADMISSION_REFUSAL_QUEUE,
       reason,
@@ -174,6 +245,7 @@ export async function recordWcOrderAdmissionRefusal(
       externalOrderNumber: String(wcOrder.number ?? ''),
       status: String(wcOrder.status ?? ''),
       configured,
+      currency: statedCurrency,
       refusedAt: previous?.refusedAt ?? new Date().toISOString(),
       attempts: previous?.attempts ?? 0,
     }
@@ -184,13 +256,29 @@ export async function recordWcOrderAdmissionRefusal(
       entityType: 'SalesOrder',
       externalId: externalOrderId,
       payload: JSON.parse(JSON.stringify(payload)) as Prisma.InputJsonValue,
-      errorMessage: refusalDescription(reason, payload.status, configured),
+      errorMessage: refusalDescription(reason, payload.status, configured, statedCurrency),
       syncedAt: null,
     }
     if (existing) await db.shoppingSyncLog.update({ where: { id: existing.id }, data })
     else await db.shoppingSyncLog.create({ data })
+
+    // READ IT BACK THROUGH THE DRAIN'S OWN `where`. Not paranoia about Prisma: the write above
+    // takes two different shapes (update an existing row, or create one), and only this query
+    // decides whether the fifteen-minute sweep will ever see the result of either.
+    const confirmed = await db.shoppingSyncLog.findFirst({
+      where: wcAdmissionRefusalQueueWhere(externalOrderId),
+      select: { id: true },
+    })
+    if (!confirmed) {
+      console.error(
+        `o3d-batch-ret r14: an admission refusal for WooCommerce order ${externalOrderId} wrote no row the by-id drain can read`,
+      )
+      return { persisted: false, reason: 'the refusal queue row could not be read back after writing' }
+    }
+    return { persisted: true, id: confirmed.id }
   } catch (e) {
     console.error('o3d-tj6v r5: failed to record an admission refusal for later retry', e)
+    return { persisted: false, reason: e instanceof Error ? e.message : String(e) }
   }
 }
 

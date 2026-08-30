@@ -47,6 +47,9 @@ function releaseCheckout(): string {
   const checkout = join(root, 'checkout')
   cpSync(join(REPO, 'scripts/update.sh'), join(checkout, 'scripts/update.sh'))
   cpSync(join(REPO, 'scripts/lib/db-fence-protected.sh'), join(checkout, 'scripts/lib/db-fence-protected.sh'))
+  // …and the crontab exclusion, sourced from the same directory since o3d-p9dq. A release checkout
+  // without it is not a release checkout: update.sh refuses to start.
+  cpSync(join(REPO, 'scripts/lib/crontab-lock.sh'), join(checkout, 'scripts/lib/crontab-lock.sh'))
   cpSync(join(REPO, 'scripts/fence-db-connections.mjs'), join(checkout, 'scripts/fence-db-connections.mjs'))
   writeCheckoutPg(checkout)
   mkdirSync(join(root, 'tmp'), { recursive: true })
@@ -342,6 +345,7 @@ function firstInstallFixture(): { root: string; digest: string } {
   const release = join(root, 'release')
   cpSync(join(REPO, 'scripts/update.sh'), join(release, 'scripts/update.sh'))
   cpSync(join(REPO, 'scripts/lib/db-fence-protected.sh'), join(release, 'scripts/lib/db-fence-protected.sh'))
+  cpSync(join(REPO, 'scripts/lib/crontab-lock.sh'), join(release, 'scripts/lib/crontab-lock.sh'))
   cpSync(join(app, 'scripts/fence-db-connections.mjs'), join(release, 'scripts/fence-db-connections.mjs'))
   writeCheckoutPg(release)
   const printed = execFileSync('bash', ['scripts/update.sh', '--print-fence-digest'], {

@@ -1,5 +1,7 @@
 import type { AccountingSyncType } from '@/app/generated/prisma/client'
 
+import { payloadMayOweInvoicePayment } from '@/lib/domain/accounting/followup-enqueue-outcome'
+
 /**
  * THE ONE WORDING FOR "this row's follow-ups cannot be rebuilt, because retention compacted it"
  * (o3d-nepa r3).
@@ -309,7 +311,14 @@ export function followUpObligationsOwedBy(row: {
     owed.add('invoice-pdf')
     // THE GATE THE TYPE TABLE COULD NOT SEE. Without this flag the connector takes no payment
     // branch at all, so nothing was ever owed and nothing was lost.
-    if (payload._registerPayment) owed.add('payment-registration')
+    //
+    // o3d-batch-ret r10 (Codex HIGH): asked through the SAME classifier the connectors ask, rather
+    // than by a second truthiness test written out beside theirs. `payload._registerPayment` here
+    // read a present `null` — a flag something wrote nothing into — as "no payment was ever owed",
+    // which is precisely the conflation the connectors were refusing for, and it would have recorded
+    // a compacted row as having lost nothing. The classifier answers TRUE for an unreadable flag on
+    // THIS side, because the rule for this record is broader-but-never-narrower.
+    if (payloadMayOweInvoicePayment(payload)) owed.add('payment-registration')
   }
 
   if (row.type === 'PURCHASE_INVOICE'

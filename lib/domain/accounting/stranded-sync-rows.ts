@@ -1,4 +1,5 @@
 import type { Prisma } from '@/app/generated/prisma/client'
+import { describeStillClaimableStrandedRow } from '@/lib/domain/accounting/sync-row-claimability'
 import {
   describeSyncRowSettleability,
   type SettlementOutcome,
@@ -27,9 +28,13 @@ import {
  *
  * `settleable` is a UI affordance, NOT a permission and NOT a guarantee: it says the row's status
  * and type admit an operator assertion and that it carries an attempt the assertion can be fenced
- * to — or, for a row that carries none, that its attempt can be ADOPTED because nothing on a
- * retired connector will ever claim it. Whether the assertion actually lands is decided by
- * applyFencedAttemptDecision at write time, against the state then — never by this flag.
+ * to — or, for a row that carries none, that its attempt can be ADOPTED because no claim path for
+ * its connector is left open. That second case is NOT "the connector is not the active one" (round
+ * 5, Codex HIGH #1): the manual Sync action for each connector gates on its own sync toggle and
+ * never resolves the active connector, so listing a row here proves only that it is invisible
+ * elsewhere, not that it is finished with. `isStrandedRowUnclaimable` decides it; this module asks.
+ * Whether the assertion actually lands is decided by applyFencedAttemptDecision at write time,
+ * against the state then — never by this flag.
  *
  * Pure functions only, so the scoping rule — the part that must not drift back to being
  * active-connector-scoped — is unit-testable without a database, exactly as connector-orphans.ts
@@ -126,7 +131,21 @@ export type StrandedSyncRow = {
   settleableOutcomes: readonly SettlementOutcome[]
 }
 
-export function describeStrandedSyncRow(row: StrandedSyncRowSource, now: Date): StrandedSyncRow {
+/**
+ * Whether a row on this connector can still be claimed by anything — the loader's answer, computed
+ * from the installation's sync toggles by `isStrandedRowUnclaimable`.
+ *
+ * A FUNCTION rather than a boolean because a single page can carry rows from more than one
+ * connector (with no accounting plugin enabled at all, every unresolved row is stranded), and one
+ * connector being quiesced says nothing about the other.
+ */
+export type StrandedRowUnclaimable = (connector: string) => boolean
+
+export function describeStrandedSyncRow(
+  row: StrandedSyncRowSource,
+  now: Date,
+  unclaimable: StrandedRowUnclaimable,
+): StrandedSyncRow {
   const ageMs = Math.max(0, now.getTime() - row.createdAt.getTime())
   return {
     id: row.id,
@@ -142,14 +161,27 @@ export function describeStrandedSyncRow(row: StrandedSyncRowSource, now: Date): 
     attemptRevision: row.attemptRevision,
     // ONE implementation of "which rows get a control", shared with the active connector's sync log.
     //
-    // `unclaimable: true` UNCONDITIONALLY, and it is a property of this LIST rather than of the row:
-    // buildStrandedSyncRowWhere selects only rows whose connector is NOT the active one (or every
-    // unresolved row when no connector is active at all), so by construction nothing that
-    // participates in the attempt fence will ever claim anything on this page. That is exactly the
-    // precondition adoption needs — see describeAttemptAdoptionCaveat. Without it every row here is
-    // refused for ever as UNFENCED_ATTEMPT, and the per-row remedy this list points at does not
-    // exist for the population it was built for (o3d-nf9i r3, Codex finding 3).
-    ...describeSyncRowSettleability({ ...row, unclaimable: true }),
+    // `unclaimable` IS ASKED PER CONNECTOR, and rounds 3 and 4 got this wrong (round 5, Codex
+    // HIGH #1). It used to be passed `true` unconditionally, argued as a property of this LIST:
+    // buildStrandedSyncRowWhere selects only rows whose connector is NOT the active one, so —
+    // the argument went — nothing that participates in the attempt fence can claim anything here.
+    //
+    // The rows this list exists for are precisely the counter-example. The active connector comes
+    // from the PLUGIN flags, Xero-first; `triggerQuickBooksSync` gates on `quickbooks_sync_enabled`
+    // and NOTHING ELSE, so with Xero enabled beside a still-enabled QuickBooks — the exact state the
+    // QuickBooks unrecorded-post record tells an operator to create — every QuickBooks row is listed
+    // here as unclaimable while any `sync` holder can press the QuickBooks Sync button and have the
+    // stale-claim sweep reclaim it, replaying the operation over the settlement.
+    //
+    // So the real precondition is asked instead, and when it does not hold the row is refused WITH
+    // THE REASON AND THE LEVER (describeStillClaimableStrandedRow) rather than silently losing the
+    // control — an omitted control with no reason reads as "there is nothing to do here", which is
+    // the opposite of the truth for a row the operator can see and cannot clear.
+    ...describeSyncRowSettleability(
+      unclaimable(row.connector)
+        ? { ...row, unclaimable: true }
+        : { ...row, unclaimable: false, unclaimableRefusalReason: describeStillClaimableStrandedRow(row.connector) },
+    ),
   }
 }
 
@@ -174,10 +206,11 @@ export function pageStrandedSyncRows(
   sourceRows: StrandedSyncRowSource[],
   take: number,
   now: Date,
+  unclaimable: StrandedRowUnclaimable,
 ): StrandedSyncRowPage {
   const hasMore = sourceRows.length > take
   return {
-    rows: (hasMore ? sourceRows.slice(0, take) : sourceRows).map((row) => describeStrandedSyncRow(row, now)),
+    rows: (hasMore ? sourceRows.slice(0, take) : sourceRows).map((row) => describeStrandedSyncRow(row, now, unclaimable)),
     hasMore,
   }
 }

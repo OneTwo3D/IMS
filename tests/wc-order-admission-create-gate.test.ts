@@ -89,15 +89,44 @@ function txDelegates() {
   },
   // The refusal queue and the pending-FX queue share this table and are told apart by the
   // payload discriminator; the double keeps them together for the same reason production does.
+  // r14: THE DOUBLE HAS TO READ BACK WHAT IT WROTE. `findFirst: () => null` was harmless while the
+  // recorder swallowed its own failures; now that the refusal is only acknowledged once the by-id
+  // row is confirmed readable, a write-only double models a database that never persists anything —
+  // and every refusal below would be reported as an unrecorded one.
   shoppingSyncLog: {
-    create: async ({ data }: { data: Row }) => { state.refusalQueue.push(data); return { id: 'log-1' } },
-    update: async ({ data }: { data: Row }) => { state.refusalQueue.push(data); return { id: 'log-1' } },
-    findFirst: async () => null,
-    findMany: async () => [],
+    create: async ({ data }: { data: Row }) => {
+      const row = { ...data, id: `log-${state.refusalQueue.length + 1}` }
+      state.refusalQueue.push(row)
+      return row
+    },
+    update: async ({ where, data }: { where: { id: string }; data: Row }) => {
+      const row = state.refusalQueue.find((entry) => entry.id === where.id)
+      if (row) Object.assign(row, data)
+      return row ?? {}
+    },
+    findFirst: async ({ where }: { where: Row }) => matchRefusalRows(where)[0] ?? null,
+    findMany: async ({ where }: { where: Row }) => matchRefusalRows(where),
     count: async () => 0,
   },
   user: { findMany: async () => [] },
   }
+}
+
+/** The subset of the refusal queue's `where` the recorder and the drain actually use. */
+function matchRefusalRows(where: Row) {
+  const path = where.payload as { path?: string[]; equals?: unknown } | undefined
+  return state.refusalQueue.filter((row) => {
+    if (where.status && row.status !== where.status) return false
+    if (where.externalId && row.externalId !== where.externalId) return false
+    if (where.entityType && row.entityType !== where.entityType) return false
+    if (where.connector && row.connector !== where.connector) return false
+    if (where.direction && row.direction !== where.direction) return false
+    if (path?.path) {
+      const payload = row.payload as Record<string, unknown> | undefined
+      if (!payload || payload[path.path[0]] !== path.equals) return false
+    }
+    return true
+  })
 }
 
 function txClient() {
@@ -185,13 +214,27 @@ function reset() {
   ])
 }
 
-function wcOrder(id: number, status: string) {
+/**
+ * `currency` is a PARAMETER, and it is stated by default (o3d-batch-ret r13).
+ *
+ * Until r13 this fixture named no currency at all and every test in this file that asserts an order
+ * REACHES the create path still passed — because `importWcOrder` opened with
+ * `wcOrder.currency || 'GBP'` and invented one. Three of them broke the moment the default was
+ * removed, which is the clearest statement of what the default was doing: the tests that proved the
+ * status gate lets an order through were only getting through on a currency nobody had stated.
+ *
+ * Pass `null` for the order whose currency WooCommerce genuinely omitted, and `''` for the one that
+ * sent the key with nothing in it — two different faults at the source, and the refusal is required
+ * to tell them apart in what it writes.
+ */
+function wcOrder(id: number, status: string, currency: string | null = 'GBP') {
   return {
     id,
     number: String(id),
     status,
     order_key: `wc_order_${id}`,
     date_modified_gmt: '2026-08-01T10:00:00',
+    ...(currency === null ? {} : { currency }),
     billing: {},
     shipping: {},
     line_items: [],
@@ -436,4 +479,196 @@ test('an excluded order IMS has never seen is still refused, acknowledged, and q
   const skip = state.activity.find((entry) => entry.action === 'wc_order_webhook_status_not_admitted')
   assert.ok(skip, 'the refusal must stay visible')
   assert.equal(refusalRows().length, 1, 'and recoverable by order id')
+})
+
+// --- finding r13: the currency is a fact WooCommerce states -----------------------------------
+//
+// Round 12 built a refusal at the FAR END of this chain: the accounting fold will not settle a
+// payment whose payload names no currency. Measuring its blast radius found no producer that could
+// reach it — and the reason was this importer, which opened with `wcOrder.currency || 'GBP'` and so
+// handed the fold a currency on every single order, sterling by invention where WooCommerce had
+// stated none. A guard nothing can reach is not a guard.
+//
+// `WcFullOrder.currency` is typed `string`, and neither ingress path validates it: the pull and the
+// webhook both `as WcFullOrder` over parsed JSON. So both routes are driven below.
+
+test('r13 — the PULL route refuses an order whose currency WooCommerce omitted', async () => {
+  // The pull's opt-out (`preauthorised-by-status-query`) is deliberate: it is the route that skips
+  // the status gate entirely, so it is the one where a currency check placed in the status gate
+  // would have been bypassed. MUTATION: restore `const currency = wcOrder.currency || 'GBP'` and
+  // delete the gate above `upsertCustomer` — `skipped` becomes undefined and this fails.
+  reset()
+
+  const result = await importOrder(
+    wcOrder(220, 'processing', null),
+    { createAdmission: 'preauthorised-by-status-query' },
+  )
+
+  assert.equal(result.skipped, 'currency_missing', 'a preauthorised row is still not exempt from this')
+  assert.equal(result.success, true, 'a refusal is a resolved decision, not a failure to retry')
+  assert.equal(state.createdOrders, 0, 'no order may be created on a currency nobody stated')
+  assert.deepEqual(
+    result.configured,
+    [],
+    'the selection is the control for the STATUS refusals and would point the operator at the wrong setting',
+  )
+})
+
+test('r13 — a currency key present but EMPTY is the same refusal, told apart in the record', async () => {
+  // A blank string is the value the `|| 'GBP'` default was most likely to swallow, since it is
+  // falsy and typed `string`.
+  //
+  // MUTATIONS, both verified to kill this: restoring `wcOrder.currency || 'GBP'` and dropping the
+  // gate (the pre-r13 shape); and dropping `currency: statedCurrency` from the recorded queue
+  // payload, which leaves the refusal correct but makes it unfixable — an operator cannot repair a
+  // field without being told what IMS read in it. Note that widening the READER to
+  // `stated !== undefined` does NOT kill it: an empty string is still falsy at the gate, so that
+  // mutation is caught by the malformed-code case below rather than here.
+  reset()
+
+  const result = await importOrder(wcOrder(221, 'processing', ''))
+
+  assert.equal(result.skipped, 'currency_missing')
+  assert.equal(state.createdOrders, 0)
+
+  const rows = refusalRows()
+  assert.equal(rows.length, 1, 'durable, by order id, like the two status refusals')
+  const payload = rows[0].payload as Record<string, unknown>
+  assert.equal(payload.reason, 'currency_missing')
+  assert.equal(payload.externalOrderId, '221')
+  assert.equal(payload.currency, '', 'the RAW value, so a blank field and an absent one stay distinguishable')
+  assert.equal(
+    String(rows[0].errorMessage).includes('GBP'),
+    false,
+    'the refusal must not name a currency either — that is the invention it exists to prevent',
+  )
+  assert.match(String(rows[0].errorMessage), /empty value/, 'and it must say WHAT was read')
+})
+
+test('r13 — a MALFORMED code is refused too, not passed to the FX lookup', async () => {
+  // "£" and "Pound Sterling" are what a broken serialiser and a mis-mapped field actually produce.
+  // Neither is a currency, and `getFxRateToGbp` would turn both into a pending-FX row that tells
+  // the operator to add an FX rate for a code that does not exist.
+  // MUTATION: drop the /^[A-Z]{3}$/ test and keep only the non-blank check — this fails.
+  reset()
+
+  for (const [id, bad] of [[222, '£'], [223, 'Pound Sterling'], [224, 'GB']] as Array<[number, string]>) {
+    const result = await importOrder(wcOrder(id, 'processing', bad))
+    assert.equal(result.skipped, 'currency_missing', `"${bad}" is not a currency code`)
+  }
+  assert.equal(state.createdOrders, 0)
+})
+
+test('r13 — a stated code is NORMALISED, not refused, and not left to disagree with the FX rate', async () => {
+  // `getFxRateToGbp` upper-cases and trims for ITS lookup, so an untrimmed lower-case code already
+  // fetched the right rate — and was then PERSISTED raw, where `currencyMinorUnits` read it as an
+  // unknown code and measured every money tolerance on the order against the 2-digit default.
+  // MUTATION: drop `.trim().toUpperCase()` from the reader — ' gbp ' refuses and this fails.
+  reset()
+  const { readWcOrderCurrency } = await import('@/lib/connectors/woocommerce/sync/order-import')
+
+  assert.equal(readWcOrderCurrency({ currency: ' gbp ' } as never), 'GBP')
+  assert.equal(readWcOrderCurrency({ currency: 'eur' } as never), 'EUR')
+  assert.equal(readWcOrderCurrency({ currency: 'JPY' } as never), 'JPY')
+  assert.equal(readWcOrderCurrency({ currency: '' } as never), null)
+  assert.equal(readWcOrderCurrency({ currency: '   ' } as never), null)
+  assert.equal(readWcOrderCurrency({} as never), null, 'the field the type says is always there')
+  assert.equal(readWcOrderCurrency({ currency: 123 } as never), null, 'and a number, which JSON permits')
+})
+
+test('r13 — the WEBHOOK route refuses, ACKs, and reports it as a currency fault', async () => {
+  // ACK for the same reason the status refusals ACK: a redelivery carries the identical payload and
+  // re-hits the identical rule, so a non-2xx only burns WooCommerce's finite retries down to a dead
+  // letter. The recovery is the by-id row, which the sweep re-reads against the LIVE order.
+  // MUTATION: collapse the `skipped` lookup back to the two-arm ternary — the response says
+  // `status_not_mapped` and this fails.
+  reset()
+
+  const response = await pushOrder(wcOrder(225, 'processing', null), 'order.created')
+
+  assert.equal(response.status, 200, 'acknowledged — redelivery cannot help')
+  assert.deepEqual(await response.json(), { ok: true, skipped: 'currency_not_stated_by_woocommerce' })
+  assert.equal(state.createdOrders, 0)
+  assert.deepEqual(state.updatedOrderIds, [])
+
+  const skip = state.activity.find((entry) => entry.action === 'wc_order_webhook_currency_missing')
+  assert.ok(skip, 'reported under its OWN action, not folded into a status skip')
+  assert.equal(skip.level, 'WARNING', 'a status skip is the operator’s choice; this is a bad payload')
+  assert.equal(
+    (skip.metadata as Record<string, unknown>).currency,
+    null,
+    'the metadata records that the field was ABSENT',
+  )
+  assert.equal(refusalRows().length, 1, 'and it is recoverable by order id')
+})
+
+test('r13 — the currency gate DISCRIMINATES: an ordinary order is untouched by it', async () => {
+  // Paired deliberately with the four refusals above, which all also pass if the importer refuses
+  // everything. This is the control for "nothing changed for an ordinary order".
+  // MUTATION: make `readWcOrderCurrency` return null unconditionally — this fails while every
+  // refusal test above still passes.
+  reset()
+
+  const result = await importOrder(wcOrder(226, 'processing'))
+
+  assert.equal(result.skipped, undefined, 'a stated currency must reach the create path')
+  assert.equal(refusalRows().length, 0, 'and must not be queued as a refusal')
+  assert.equal(state.findFirstCalls, 1, 'through the same single pivot read as before')
+
+  // And the same order over the webhook. NOT asserted on the status code: this double carries no
+  // tax-rate delegate, so an order that gets PAST the gate goes on to fail in the mapping work and
+  // the handler reports that as a delivery failure. What the gate owns is whether the delivery was
+  // ACKNOWLEDGED AS A SKIP, and it must not be.
+  reset()
+  const viaWebhook = await pushOrder(wcOrder(227, 'processing'), 'order.created')
+  assert.equal(
+    (await viaWebhook.json() as { skipped?: string }).skipped,
+    undefined,
+    'an ordinary order must not be acknowledged away as any kind of skip',
+  )
+  assert.equal(refusalRows().length, 0, 'and must leave no refusal row')
+  // The three SKIP actions by name. A `startsWith('wc_order_webhook_')` sweep also catches the
+  // delivery-failure record this double provokes, which would make the assertion about the missing
+  // tax delegate rather than about the gate.
+  assert.equal(
+    state.activity.some((entry) => [
+      'wc_order_webhook_currency_missing',
+      'wc_order_webhook_status_not_admitted',
+      'wc_order_webhook_status_not_mapped',
+    ].includes(String(entry.action))),
+    false,
+    'and nothing is reported as a skip',
+  )
+})
+
+test('r13 — THE DEFAULT IS GONE FROM THE SOURCE, not merely guarded around', async () => {
+  // The refusal above is satisfiable by a build that still holds `|| 'GBP'` on a branch the tests
+  // do not reach — which is exactly the shape round 12 shipped at the other end of this chain.
+  // MUTATION: re-add `const currency = wcOrder.currency || 'GBP'` anywhere in the importer.
+  const { readFile } = await import('node:fs/promises')
+  const source = await readFile(
+    new URL('../lib/connectors/woocommerce/sync/order-import.ts', import.meta.url),
+    'utf8',
+  )
+  // Comments in this file DISCUSS the removed default by name, so a naive scan of the whole text
+  // matches the prose that explains the fix. Strip them first.
+  const code = source
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '')
+
+  // Non-vacuity: two `doesNotMatch`es pass trivially over an empty string or a bad path.
+  assert.ok(code.length > 20_000, 'the stripped source must still be the module')
+  assert.match(code, /currency_missing/, 'and must still contain the refusal being asserted')
+  assert.match(code, /readWcOrderCurrency/, 'and the reader that replaced the default')
+
+  assert.doesNotMatch(
+    code,
+    /currency\s*(\|\||\?\?)\s*['"`]/,
+    'no currency expression may fall back to a literal',
+  )
+  assert.doesNotMatch(
+    code,
+    /['"`]GBP['"`]/,
+    'and the importer must name no currency at all — every one it uses came off the wire',
+  )
 })

@@ -73,11 +73,20 @@ A burst of refusals after a store change is normal for a few minutes (the old st
 Before ongoing sync begins, you must import your existing active orders:
 
 1. Go to the **Orders** tab on the WooCommerce connector page
-2. Click **Import Active Orders** — this fetches all orders with `processing`, `pending`, or `on-hold` status from WooCommerce
+2. Click **Import Active Orders** — this fetches the statuses ticked under **Import order statuses**, which the Sync page prints before you press the button
 3. A progress bar shows pages processed, orders imported, and orders skipped (already in the system)
 4. Once complete, a green checkmark appears and the "Sync Orders Now" button becomes available
 
 This is a one-time operation. Ongoing sync is blocked until the initial import finishes.
+
+Per-order errors do not stop the import completing — the orders that did import are kept, and the
+errors are listed on the card. There is **one exception**. If IMS declines to import an order and
+then cannot write down that it declined it, the import is held: the message reads *"Import held —
+… would be stranded behind the sync cursor"*, nothing is marked complete, and the sync cursor is
+not advanced. That is deliberate. Completing would set the ongoing sync's starting point past an
+order that has no record anywhere — no webhook will resend a historical order, and there is no
+retry row for the fifteen-minute recheck to find. Press **Import Active Orders** again once the
+cause is resolved; orders that already imported are skipped, so a retry costs nothing.
 
 ### Ongoing Order Sync
 

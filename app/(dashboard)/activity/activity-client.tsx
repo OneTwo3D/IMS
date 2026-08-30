@@ -19,6 +19,7 @@ import { Badge } from '@/components/ui/badge'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { getActivityLogs, type ActivityLogRow } from '@/app/actions/activity-log'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
+import { supersedingRemedyForStoredIncident } from '@/lib/domain/accounting/unrecorded-posted-document'
 
 const LEVEL_TABS = [
   { key: null, label: 'All' },
@@ -260,7 +261,23 @@ export function ActivityClient({ initialRows, initialTotal, availableTags }: Pro
                       {row.tag}
                     </Badge>
                   </TableCell>
-                  <TableCell>{row.description}</TableCell>
+                  <TableCell>
+                    {row.description}
+                    {/*
+                      THE REMEDY THIS VERSION WOULD WRITE, WHEN THE STORED ONE IS NOT IT (o3d-batch-ret
+                      r13). An unrecorded-posted-document record is rendered once and stored, and is
+                      exempt from retention and from the factory reset — so a record written by an older
+                      binary keeps that binary's remedy for ever, including the one that told an operator
+                      to open a bill this record never named. This prints the current one beside it, and
+                      prints nothing at all when the stored text already contains it.
+                    */}
+                    {supersedingRemedyForStoredIncident(row) && (
+                      <p className="mt-1.5 text-xs font-medium">
+                        THIS RECORD WAS WRITTEN BY AN EARLIER VERSION OF IMS. WHERE THE TWO DISAGREE, THIS
+                        IS THE REMEDY THIS VERSION WRITES: {supersedingRemedyForStoredIncident(row)}
+                      </p>
+                    )}
+                  </TableCell>
                   <TableCell className="text-muted-foreground">{row.userName ?? 'System'}</TableCell>
                 </TableRow>
                 {expandedId === row.id && row.metadata != null && (
