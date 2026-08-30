@@ -108,6 +108,7 @@ export const SHIPPED = [
   // o3d-rn10: the publisher resolves its destination from a trusted ancestor instead of stat-ing
   // its own pathname, so the table and the walk come with it.
   'publish_trust_root_candidates',
+  'publish_root_anchored',
   'publish_trust_root',
   'pin_dir_beneath_root',
   'publish_durable_file',

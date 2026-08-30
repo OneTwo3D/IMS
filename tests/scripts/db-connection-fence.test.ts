@@ -3188,6 +3188,7 @@ test('o3d-2sm1.5 r23: the snapshot is written verbatim, root-only, and loaded wi
         // o3d-czpy: publish_durable_file() stages through a root-owned directory named here.
         source.split('\n').find((l) => l.startsWith('PUBLISH_STAGE_DIRNAME=')) ?? '',
         readShellFunction(source, 'publish_trust_root_candidates'),
+        readShellFunction(source, 'publish_root_anchored'),
         readShellFunction(source, 'publish_trust_root'),
         readShellFunction(source, 'pin_dir_beneath_root'),
         readShellFunction(source, 'publish_durable_file'),

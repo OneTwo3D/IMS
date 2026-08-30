@@ -78,7 +78,7 @@ function rig(functions: string[], body: string, extra = ''): string {
  * the roots are the way the installer does, by defining ${APP_DIR} and ${DATA_DIR}, and never by
  * re-typing the table itself.
  */
-const PUBLISHER = ['fsync_path', 'publish_trust_root_candidates', 'publish_trust_root', 'pin_dir_beneath_root', 'publish_durable_file']
+const PUBLISHER = ['fsync_path', 'publish_trust_root_candidates', 'publish_root_anchored', 'publish_trust_root', 'pin_dir_beneath_root', 'publish_durable_file']
 
 /** The five variables publish_trust_root_candidates() reads. Anything unnamed stays EMPTY, which
  *  the table skips — so a destination outside the roots a test declares is refused, as it is in
@@ -742,6 +742,208 @@ test('[o3d-rn10] publish_durable_file still creates a destination directory that
   assert.equal(statSync(join(dataDir, 'git-ssh/known_hosts')).mode & 0o777, 0o600)
 })
 
+// ---------------------------------------------------------------------------
+// THE ANCHOR (o3d-rn10 r2). Round 1 admitted a candidate by its SPELLING and preferred the
+// deepest match, and wrote the reason each shipped root is trustworthy — "its own parent is
+// root-owned and not writable by ${APP_USER}" — in a comment beside the table. Three of the six
+// are operator-settable, so that sentence is a claim about a particular VALUE and the table holds
+// only NAMES. publish_root_anchored() now proves it, per candidate, at the moment of publication.
+//
+// WHAT AN UNPRIVILEGED HARNESS CAN AND CANNOT PLANT, STATED RATHER THAN GLOSSED. In production the
+// unanchored parent is unanchored because ${APP_USER} OWNS it — and a harness running as an
+// ordinary user cannot make a directory owned by somebody else. So the tests below plant the OTHER
+// half of the same predicate, the one a mode can express: a parent that is group- or
+// other-writable, which is a parent the service account can rename inside just as surely. The
+// ownership half is measured on its own, directly, by stubbing `id -u` — see the two
+// publish_root_anchored tests at the end of this block.
+// ---------------------------------------------------------------------------
+
+test('[o3d-rn10] publish_durable_file refuses a nested CUTOVER_STATE_DIR replaced by a symlink, and demotes the walk to the anchored root above it', (t) => {
+  const root = createTempDirSync('ims-rn10-nested-', t)
+  const dataDir = join(root, 'data')
+  // ${IMS_CUTOVER_STATE_DIR}=${DATA_DIR}/cutover — the layout docs/installation.md tells operators
+  // they may set, and the case the finding is written about.
+  const cutover = join(dataDir, 'cutover')
+  // Another instance's state namespace, or /root/.ssh. A DEPLOY-FENCED published in here is a
+  // root-side write into a directory the service account chose.
+  const victim = join(root, 'victim')
+  mkdirSync(dataDir)
+  mkdirSync(victim)
+  writeFileSync(join(victim, 'DEPLOY-FENCED'), 'UNTOUCHED\n')
+
+  // THE PLANT COSTS ONE RENAME AND ONE SYMLINK, with no race to win: ${DATA_DIR} belongs to
+  // ${APP_USER} after every upgrade's recursive chown, so `cutover` is theirs to replace between
+  // runs. Here the same thing is expressed with a mode: 0777 is a directory anybody can rename
+  // inside, which is exactly the standing ${APP_USER} has on the real ${DATA_DIR}.
+  chmodSync(dataDir, 0o777)
+  symlinkSync(victim, cutover)
+
+  // 0700 and owned by the publishing uid, deliberately — every check made AFTER the walk would
+  // pass on this directory, so only the anchor can refuse it.
+  chmodSync(victim, 0o700)
+
+  const script = rig(PUBLISHER, [
+    `printf 'PWNED\\n' | publish_durable_file "${join(cutover, 'DEPLOY-FENCED')}" "" 600`,
+    'echo "rc=$?"',
+  ].join('\n'), roots({ data: dataDir, cutover }))
+  const run = runBash(script)
+
+  // NOT VACUOUS: the destination really does still MATCH the candidate text — the string table
+  // would have admitted it — and the name really is a symlink at the moment of the publication.
+  assert.equal(lstatSync(cutover).isSymbolicLink(), true, 'the nested root must be a planted symlink, or this test states nothing')
+  assert.equal(statSync(cutover).ino, statSync(victim).ino, 'and it must resolve to the victim')
+
+  assert.match(run.stdout, /^rc=1$/m, 'a nested root the service account can replace must not be a starting point')
+  assert.equal(readFileSync(join(victim, 'DEPLOY-FENCED'), 'utf8'), 'UNTOUCHED\n',
+    'the publication must not land in the directory the planted link chose')
+  assert.deepEqual(readdirSync(victim).sort(), ['DEPLOY-FENCED'],
+    'and nothing may be created inside it — no staging directory, no temporary')
+})
+
+test('[o3d-rn10] publish_durable_file still publishes into a nested unanchored root that is a real directory, by walking to it from the anchored one', (t) => {
+  const root = createTempDirSync('ims-rn10-nested-ok-', t)
+  const dataDir = join(root, 'data')
+  const cutover = join(dataDir, 'cutover')
+  mkdirSync(cutover, { recursive: true })
+  // Unanchored for the same reason as above, and this time NOT under attack. Demotion has to be a
+  // demotion: a walk from ${DATA_DIR} through `cutover`, not a refusal. A publisher that refused
+  // every unanchored candidate outright would pass the test above and fail this one.
+  chmodSync(dataDir, 0o777)
+
+  const script = rig(PUBLISHER, [
+    `printf 'phase=stopping\\n' | publish_durable_file "${join(cutover, 'DEPLOY-FENCED')}" "" 600`,
+    'echo "rc=$?"',
+  ].join('\n'), roots({ data: dataDir, cutover }))
+  const run = runBash(script)
+
+  assert.match(run.stdout, /^rc=0$/m, run.stderr)
+  assert.equal(readFileSync(join(cutover, 'DEPLOY-FENCED'), 'utf8'), 'phase=stopping\n',
+    'the supported nested layout must keep working')
+  assert.equal(statSync(join(cutover, 'DEPLOY-FENCED')).mode & 0o777, 0o600)
+})
+
+test('[o3d-rn10] publish_durable_file walks a nested root from the OUTER anchor even when the nested one is anchored too, so a symlink at it is refused', (t) => {
+  const root = createTempDirSync('ims-rn10-nested-anchored-', t)
+  const dataDir = join(root, 'data')
+  // An intermediate directory the service account CANNOT rename inside: 0755, owned by the
+  // publishing uid. So `${state}/inner` has an anchor of its own, and round 1's deepest-match rule
+  // would start the walk AT it — following the symlink with `cd -P`, which is what a root gets.
+  const state = join(dataDir, 'state')
+  const inner = join(state, 'inner')
+  const victim = join(root, 'victim')
+  mkdirSync(state, { recursive: true })
+  mkdirSync(victim)
+  writeFileSync(join(victim, 'DEPLOY-FENCED'), 'UNTOUCHED\n')
+  chmodSync(victim, 0o700)
+  chmodSync(state, 0o755)
+  symlinkSync(victim, inner)
+
+  const script = rig(PUBLISHER, [
+    `printf 'PWNED\\n' | publish_durable_file "${join(inner, 'DEPLOY-FENCED')}" "" 600`,
+    'echo "rc=$?"',
+  ].join('\n'), roots({ data: dataDir, cutover: inner }))
+  const run = runBash(script)
+
+  // NOT VACUOUS: the nested candidate really would have passed the anchor check on its own, so
+  // what refuses this publication is the SELECTION and not the anchor.
+  const anchored = runBash(rig(['publish_root_anchored'], `publish_root_anchored "${inner}"; echo "rc=$?"`))
+  assert.match(anchored.stdout, /^rc=0$/m, 'the nested candidate must itself be anchored, or this test is the previous one again')
+
+  assert.match(run.stdout, /^rc=1$/m, 'the walk must start at the outer anchor, which resolves the nested name as an ordinary component')
+  assert.equal(readFileSync(join(victim, 'DEPLOY-FENCED'), 'utf8'), 'UNTOUCHED\n')
+  assert.deepEqual(readdirSync(victim).sort(), ['DEPLOY-FENCED'], 'and nothing may be created inside the directory the link chose')
+})
+
+test('[o3d-rn10] an unanchored operator override with no anchored root above it is refused outright, and nothing is created at it', (t) => {
+  const root = createTempDirSync('ims-rn10-override-', t)
+  // `IMS_CUTOVER_STATE_DIR=/home/svc/state`: an override pointing at a directory whose parent the
+  // service account controls, and which lies under no other root. There is nothing to demote it
+  // to, so the answer is a refusal at the write rather than a publication into it.
+  const home = join(root, 'svc-home')
+  const state = join(home, 'state')
+  mkdirSync(state, { recursive: true })
+  chmodSync(home, 0o777)
+
+  const script = rig(PUBLISHER, [
+    `printf 'PWNED\\n' | publish_durable_file "${join(state, 'DEPLOY-FENCED')}" "" 600`,
+    'echo "rc=$?"',
+  ].join('\n'), roots({ cutover: state }))
+  const run = runBash(script)
+
+  assert.match(run.stdout, /^rc=1$/m, 'an unanchored override must not become a trusted root by being spelled in the table')
+  assert.deepEqual(readdirSync(state), [], 'and nothing may be written into it — not the file, not a staging directory')
+})
+
+test('[o3d-rn10] publish_root_anchored decides on the PARENT mode, and does not credit the sticky bit', (t) => {
+  const root = createTempDirSync('ims-rn10-anchor-mode-', t)
+  const parent = join(root, 'parent')
+  const candidate = join(parent, 'candidate')
+  mkdirSync(candidate, { recursive: true })
+
+  // The candidate's own mode is deliberately wide open throughout: what is being measured is who
+  // can replace the NAME, which is a property of the directory the name lives in.
+  chmodSync(candidate, 0o777)
+
+  const cases: ReadonlyArray<readonly [number, boolean]> = [
+    [0o700, true],
+    [0o755, true],
+    [0o750, true],
+    [0o775, false],
+    [0o757, false],
+    [0o707, false],
+    // /tmp's mode. The sticky bit stops a non-owner REPLACING an entry that already exists and
+    // says nothing about the first install, where the root does not exist yet.
+    [0o1777, false],
+  ]
+  for (const [mode, expected] of cases) {
+    chmodSync(parent, mode)
+    const run = runBash(rig(['publish_root_anchored'], `publish_root_anchored "${candidate}"; echo "rc=$?"`))
+    assert.match(run.stdout, new RegExp(`^rc=${expected ? 0 : 1}$`, 'm'),
+      `a parent at mode 0${mode.toString(8)} must be ${expected ? 'anchored' : 'refused'}: ${run.stdout}${run.stderr}`)
+  }
+
+  // And the shipped roots' real parents, on this machine, answer the way the table's paragraph
+  // always claimed they would — through the uid-0 branch, which is why an unprivileged harness can
+  // ask at all.
+  for (const [dir, expected] of [['/opt/one-two-inventory', true], ['/var/lib/one-two-inventory', true],
+    ['/etc/ims-cutover', true], ['/tmp/ims-state', false]] as const) {
+    const run = runBash(rig(['publish_root_anchored'], `publish_root_anchored "${dir}"; echo "rc=$?"`))
+    assert.match(run.stdout, new RegExp(`^rc=${expected ? 0 : 1}$`, 'm'),
+      `${dir} must be ${expected ? 'anchored' : 'refused'}: ${run.stdout}${run.stderr}`)
+  }
+})
+
+test('[o3d-rn10] publish_root_anchored refuses a parent that belongs to neither root nor the account running the publication', (t) => {
+  const root = createTempDirSync('ims-rn10-anchor-owner-', t)
+  const parent = join(root, 'parent')
+  const candidate = join(parent, 'candidate')
+  mkdirSync(candidate, { recursive: true })
+  chmodSync(parent, 0o755)
+
+  // THE OWNERSHIP HALF, WHICH IS THE ONE PRODUCTION ACTUALLY TRIPS ON and which no unprivileged
+  // harness can plant: the finding's ${DATA_DIR} is unanchored because ${APP_USER} OWNS it, not
+  // because of its mode. It is measured from the other side instead — the shipped function asks
+  // `id -u` for the account it must belong to, so a run that answers a DIFFERENT uid is a run
+  // whose privileged account does not own this parent. `stat` stays real throughout.
+  const foreign = runBash(rig(['publish_root_anchored'],
+    `publish_root_anchored "${candidate}"; echo "rc=$?"`,
+    'id() { printf "%s\\n" 424242; }'))
+  assert.match(foreign.stdout, /^rc=1$/m,
+    `a parent owned by neither uid 0 nor the running account must be refused: ${foreign.stdout}${foreign.stderr}`)
+
+  // NOT VACUOUS: the same directory, at the same mode, with the real `id`, is anchored — so what
+  // the line above measured is the ownership comparison and not some other refusal.
+  const own = runBash(rig(['publish_root_anchored'], `publish_root_anchored "${candidate}"; echo "rc=$?"`))
+  assert.match(own.stdout, /^rc=0$/m, `and it must be anchored for the account that owns it: ${own.stdout}${own.stderr}`)
+
+  // And the uid-0 branch is reachable with that same foreign `id`: /etc belongs to root, and root
+  // is the privileged account by definition however this process was started.
+  const rootOwned = runBash(rig(['publish_root_anchored'],
+    `publish_root_anchored "/etc/ims-cutover"; echo "rc=$?"`,
+    'id() { printf "%s\\n" 424242; }'))
+  assert.match(rootOwned.stdout, /^rc=0$/m, `a root-owned parent must be anchored regardless of who runs this: ${rootOwned.stdout}${rootOwned.stderr}`)
+})
+
 /**
  * EVERY SHIPPED PUBLICATION, AND THE DIRECTORY IT LANDS IN (o3d-rn10).
  *
@@ -815,20 +1017,31 @@ for (const script of ENTRYPOINTS) {
       .map((name) => [source, FENCE_LIB].map((text) => text.split('\n').find((l) => l.startsWith(`${name}=`))).find(Boolean))
       .filter((line): line is string => Boolean(line))
 
-    const rigLines = [
-      'set -uo pipefail',
-      // deploy.sh derives APP_USER by stat-ing the checkout, which a rig has no business running;
-      // ${CRON_BACKUP} only needs the value to exist, and its DIRECTORY is what is measured.
-      'APP_USER=appuser',
-      ...constants,
-      shellFunction(source, 'publish_trust_root_candidates'),
-      shellFunction(source, 'publish_trust_root'),
-    ]
-    if (source.includes('\ndb_ca_generation_file() {\n')) rigLines.push(shellFunction(source, 'db_ca_generation_file'))
-    rigLines.push(...spec.targets.map((target) =>
-      `t="${target}"; if r="$(publish_trust_root "$(dirname "$t")")"; then printf 'OK\\t%s\\t%s\\n' "$t" "$r"; else printf 'NOROOT\\t%s\\n' "$t"; fi`))
+    // THE ANCHOR IS STUBBED HERE, AND ONLY HERE (o3d-rn10 r2). The question this test asks is
+    // LEXICAL — does every shipped destination lie under some directory the table names — and the
+    // shipped roots are /opt, /var/lib, /etc and /root paths whose REAL anchoring is a fact about
+    // the machine the suite happens to run on (a checkout on a laptop has no /opt/one-two-inventory
+    // and no /root/ims). Stubbing publish_root_anchored keeps the lexical question answerable
+    // anywhere; the anchor itself is measured against real directories, by real modes and a real
+    // `id`, in the block above.
+    const rigFor = (anchored: boolean): string => {
+      const lines = [
+        'set -uo pipefail',
+        // deploy.sh derives APP_USER by stat-ing the checkout, which a rig has no business running;
+        // ${CRON_BACKUP} only needs the value to exist, and its DIRECTORY is what is measured.
+        'APP_USER=appuser',
+        ...constants,
+        shellFunction(source, 'publish_trust_root_candidates'),
+        `publish_root_anchored() { return ${anchored ? 0 : 1}; }`,
+        shellFunction(source, 'publish_trust_root'),
+      ]
+      if (source.includes('\ndb_ca_generation_file() {\n')) lines.push(shellFunction(source, 'db_ca_generation_file'))
+      lines.push(...spec.targets.map((target) =>
+        `t="${target}"; if r="$(publish_trust_root "$(dirname "$t")")"; then printf 'OK\\t%s\\t%s\\n' "$t" "$r"; else printf 'NOROOT\\t%s\\n' "$t"; fi`))
+      return lines.join('\n')
+    }
 
-    const run = runBash(rigLines.join('\n'))
+    const run = runBash(rigFor(true))
     assert.equal(run.status, 0, run.stderr)
     const lines = run.stdout.trim().split('\n')
     assert.equal(lines.length, spec.targets.length, run.stdout)
@@ -840,6 +1053,16 @@ for (const script of ENTRYPOINTS) {
       const [, target, root] = line.split('\t')
       assert.ok(SHIPPED_ROOTS.has(root), `${script}: ${target} resolved to ${root}, which is not one of the shipped roots`)
     }
+
+    // AND THE STUB CANNOT HIDE A SELECTOR THAT STOPPED ASKING. The same rig with the gate SHUT must
+    // return NOROOT for every destination: a publish_trust_root() that admitted a candidate without
+    // consulting publish_root_anchored() would go on resolving them all, and pass the half above.
+    const closed = runBash(rigFor(false))
+    assert.equal(closed.status, 0, closed.stderr)
+    const closedLines = closed.stdout.trim().split('\n')
+    assert.equal(closedLines.length, spec.targets.length, closed.stdout)
+    assert.deepEqual(closedLines.filter((l) => !l.startsWith('NOROOT')), [],
+      `${script}: publish_trust_root must admit a candidate only through publish_root_anchored:\n${closed.stdout}`)
   })
 }
 
