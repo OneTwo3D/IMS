@@ -169,6 +169,20 @@ export const CAPTURE_TERMINATOR_ASSIGNMENT = (() => {
  * A rig that declared its own copies would agree with itself and with nothing else: the accept-list
  * is the whole of the disclosure fix, and the generation name is the whole of the overwrite fix.
  */
+/**
+ * THE STAGING DIRECTORY publish_durable_file() PUBLISHES THROUGH (o3d-czpy).
+ *
+ * Lifted for the same reason CAPTURE_TERMINATOR is: scripts/install.sh names it once, because the
+ * recursive chown over ${DATA_DIR} has to prune the same name, and a rig that spelled it itself
+ * would agree with itself and with nothing else. Unset, `${dir}/` resolves to the target's own
+ * directory and every one of these tests measures a publication that is not the shipped one.
+ */
+export const PUBLISH_STAGE_ASSIGNMENT = (() => {
+  const match = /^PUBLISH_STAGE_DIRNAME=.*$/m.exec(INSTALL_SOURCE)
+  assert.ok(match, 'precondition: scripts/install.sh must define PUBLISH_STAGE_DIRNAME')
+  return match[0]
+})()
+
 export const DB_CA_ASSIGNMENTS = [
   'DB_CA_ACCEPTED_PEM_LABELS',
   'DB_CA_GENERATION_PREFIX',
@@ -351,6 +365,7 @@ DB_CA_PUBLISHED_FILE="\${DB_CA_PUBLISHED_FILE-}"
 # retyped: a rig that spelled the prefix itself would pass while install.sh used another one, and
 # the two would disagree only in production.
 ${DB_CA_ASSIGNMENTS}
+${PUBLISH_STAGE_ASSIGNMENT}
 ${ENV_HEREDOC_DEFAULTS}
 ${SHIPPED}
 ${body}

@@ -573,7 +573,10 @@ test('r39: boundary (2) — the ALTER commits and .env cannot be written: the ne
       # production it is /etc/ims-cutover and is not under \${APP_DIR} at all.
       mkdir -p "\${DB_ENV_SNAPSHOT_DIR}"
       # THE WRITE FAILURE, deterministic: neither the file nor its directory can be written, so
-      # both \`cat >\` and publish_durable_file()'s mktemp fail.
+      # \`cat >\` fails on the file and publish_durable_file() cannot rename onto it — o3d-czpy
+      # moved the temporary into a 0700 staging directory whose x-bit survives a 0500 parent, so
+      # what refuses now is the rename into \${APP_DIR}, not the mktemp. Either way the file the
+      # server has parted company with is left whole, which is what the assertions below measure.
       chmod 400 "\${APP_DIR}/.env"
       chmod 500 "\${APP_DIR}"
       FENCE_ARMED=true
