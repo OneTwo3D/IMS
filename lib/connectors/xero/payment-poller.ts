@@ -35,6 +35,8 @@ import { notify, notifyPersisted } from '@/lib/notifications'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import {
   detectPaymentReversals,
+  readDatabaseLedgerFence,
+  readPaidProvenanceVerdicts,
   retireBillPaymentRegistrationsReversedInLedger,
   type LedgerClassifierProof,
 } from '@/lib/domain/accounting/payment-reversal'
@@ -43,61 +45,27 @@ import { withPaymentWriteLockOrSkip, isLockSkipped } from './payment-write-lock'
 
 import {
   advanceCheckpoint,
-  classifyRegisteredPayment,
   CURSOR_OVERLAP_MS,
-  databaseLedgerFence,
   drainInvoicesModifiedSince,
   idsWhere,
+  listedLedgerPaymentIds,
   parseLedgerAmount,
   partitionPaymentReversals,
   zeroPaidIsProvenReversal,
   type LedgerReadFence,
   type PaymentReversalReading,
-  unregisteredLocalReceipts,
-  type RegisteredPaymentRow,
   type RegisteredPaymentVerdict,
   type XeroInvoice,
   type XeroInvoicesResponse,
 } from './invoice-delta'
-import { payloadPaymentId } from '@/lib/domain/accounting/invoice-payment-enqueue'
 import type { ActivityEntityType } from '@/app/generated/prisma/client'
 
 /** A Xero reversal can only ever speak about rows Xero itself issued. */
 const XERO_CONNECTOR = 'xero'
 
-/**
- * THE INSTANT THE LEDGER WAS ASKED, READ FROM THE DATABASE (o3d-clxw round 4).
- *
- * This is one half of the fence that decides whether a registration's absence from a Xero snapshot
- * proves the payment was removed; the other half is `accounting_sync_logs."syncedAt"`, stamped by
- * `stampSyncedAtFromDatabaseClock` with the SAME expression on the SAME server. Round 3 had this end
- * as `new Date()` on the poll host and the other end as `new Date()` on the sync-processor host, and
- * an ordering that rests on two machines agreeing is not an ordering: with the poller's clock ahead,
- * a payment posted AFTER the snapshot reads as posted before it, its absence reads as proof, `paidAt`
- * is cleared, Mark Paid re-arms and the supplier is paid twice.
- *
- * MUST be read BEFORE the ledger request goes out. That ordering is this function returning before
- * `xeroGet` is called — program order inside one process — not a comparison of any two clock values.
- *
- * NULL ON FAILURE, and null means NOTHING IS DECIDED (see classifyRegisteredPayment): with no fence
- * every registration might have landed after the snapshot, so every document with one withholds.
- * Fail-closed also keeps the o3d-batch-payidx algebra: the decided set only ever shrinks.
- */
-async function readDatabaseLedgerFence(): Promise<LedgerReadFence | null> {
-  try {
-    const rows = await db.$queryRaw<Array<{ fence: Date | string | null }>>`SELECT clock_timestamp() AT TIME ZONE 'UTC' AS fence`
-    const fence = rows?.[0]?.fence
-    // Normalised rather than `instanceof`-checked: a raw query can hand back a driver Date, a Date
-    // from another realm, or a string, and none of those is a reason to lose the ordering. An
-    // unreadable value still is.
-    if (fence == null) return null
-    const at = new Date(fence as string | Date).getTime()
-    if (!Number.isFinite(at)) return null
-    return databaseLedgerFence(new Date(at))
-  } catch {
-    return null
-  }
-}
+// o3d-psrx r3: `readDatabaseLedgerFence` moved to lib/domain/accounting/payment-reversal.ts beside the
+// classifier it fences, so the QuickBooks poller mints the SAME database-clock fence rather than a
+// `new Date()` that only looks like one. Its reasoning travelled with it.
 
 // A detected payment reversal / chargeback needs a human to reconcile (dispute the
 // chargeback, revert fulfilment, chase re-payment). Broadcast a warning to active
@@ -401,83 +369,39 @@ async function readResidualVerdicts<T extends {
   const out = emptyResidual<T>()
   if (docs.length === 0) return out
 
-  const rows = await db.accountingSyncLog.findMany({
-    where: {
-      connector: XERO_CONNECTOR,
-      type: registrationType,
-      referenceType,
-      referenceId: { in: docs.map((d) => d.id) },
-    },
-    // `syncedAtDatabaseClock` is selected WITH `syncedAt` and never instead of it: the fence is the
-    // two agreeing, which is what makes a stamp written by an old build's host clock visible as one
-    // (o3d-clxw round 5, finding 1 — see databaseStampedCompletion).
-    select: {
-      id: true, referenceId: true, status: true, externalTransactionId: true,
-      syncedAt: true, syncedAtDatabaseClock: true,
-      // o3d-psrx: the receipt this registration NAMES, so a local receipt no registration names can
-      // be told from one that is already spoken for. Read through the same `payloadPaymentId` the
-      // enqueue writes it with, never re-spelt here.
-      payload: true,
+  // o3d-psrx r3 (Codex HIGH) — THE EVIDENCE READ IS NOT WRITTEN HERE ANY MORE.
+  //
+  // Registrations, local receipts and the recorded provenance are read by
+  // `readPaidProvenanceVerdicts`, which the QuickBooks poller now calls with the same arguments and
+  // the same fence. It used to be sixty lines of this file, and being sixty lines of THIS file is how
+  // the sibling connector came to have no version of it at all. What stays here is the part that is
+  // genuinely Xero's: which invoices the delta put in which bucket, and what to say about a withheld
+  // one.
+  const verdicts = await readPaidProvenanceVerdicts(docs, {
+    connector: XERO_CONNECTOR,
+    registrationType,
+    referenceType,
+    ledgerObservedBefore,
+    // Xero DOES enumerate the payments on an invoice, so absence in that list is evidence. Passing
+    // the payload's own listing (null when it withheld `Payments[]`) is the whole of the difference
+    // between this caller and QuickBooks'.
+    ledgerListedPaymentIds: (doc) => {
+      const invoice = doc.accountingInvoiceId ? candidateInvoices.get(doc.accountingInvoiceId) : undefined
+      return invoice ? listedLedgerPaymentIds(invoice) : null
     },
   })
-  const byDocument = new Map<string, RegisteredPaymentRow[]>()
-  const receiptsNamedByDocument = new Map<string, { status: string; paymentId: string | null }[]>()
-  for (const row of rows) {
-    const list = byDocument.get(row.referenceId) ?? []
-    list.push({
-      id: row.id,
-      status: row.status,
-      externalTransactionId: row.externalTransactionId,
-      syncedAt: row.syncedAt,
-      syncedAtDatabaseClock: row.syncedAtDatabaseClock,
-    })
-    byDocument.set(row.referenceId, list)
-    const named = receiptsNamedByDocument.get(row.referenceId) ?? []
-    named.push({ status: row.status, paymentId: payloadPaymentId(row.payload) })
-    receiptsNamedByDocument.set(row.referenceId, named)
-  }
-
-  // o3d-psrx — THE RECEIPTS THEMSELVES, read AFTER the registrations.
-  //
-  // Order is deliberate and it is the safe one. `addPayment` commits the receipt and `paidAt`
-  // together and queues the registration afterwards, so reading receipts LAST can only ever find
-  // MORE of them than the registration read accounted for — which withholds. Reading them first
-  // could miss a receipt whose registration then appeared, and the answer that produces is a
-  // reversal admitted over a receipt this poll never saw.
-  //
-  // Sales only: a bill has no local receipt rows, and its half of this defect was closed at source
-  // by markBillPaid queueing the registration inside the paid transaction (o3d-a3wx).
-  const receiptsByDocument = new Map<string, string[]>()
-  if (referenceType === 'SalesOrder') {
-    const payments = await db.payment.findMany({
-      // `refundId: null` — a refund receipt settles a credit note, not the invoice this poll is
-      // reading, so it neither owes an INVOICE_PAYMENT nor bears on the invoice's residual.
-      where: { orderId: { in: docs.map((d) => d.id) }, refundId: null },
-      select: { id: true, orderId: true },
-    })
-    for (const payment of payments) {
-      const list = receiptsByDocument.get(payment.orderId) ?? []
-      list.push(payment.id)
-      receiptsByDocument.set(payment.orderId, list)
-    }
-  }
 
   for (const doc of docs) {
     const invoice = doc.accountingInvoiceId ? candidateInvoices.get(doc.accountingInvoiceId) : undefined
     if (!invoice) continue
-    const verdict = classifyRegisteredPayment(
-      invoice,
-      byDocument.get(doc.id) ?? [],
-      ledgerObservedBefore,
-      unregisteredLocalReceipts(
-        receiptsByDocument.get(doc.id) ?? [],
-        receiptsNamedByDocument.get(doc.id) ?? [],
-      ),
-      // o3d-psrx r2 — READ FROM THE ROW, not inferred from the absence of a receipt. "No Payment row"
-      // is true of a WooCommerce-paid order AND of an order the Xero forward pass marked paid, and
-      // those need OPPOSITE answers here; only the recorded provenance separates them.
-      doc.unregisteredPaidAt != null,
-    )
+    // No verdict = nothing was decided, and the fail-closed reading of that is to withhold. Not
+    // reachable while `readPaidProvenanceVerdicts` answers for every document carrying an invoice id,
+    // which is exactly why it is asserted here rather than assumed.
+    const verdict = verdicts.get(doc.id)
+    if (verdict == null) {
+      out.withheld.push({ doc, invoice, verdict: { verdict: 'REGISTRATION_UNDECIDED', entryIds: [] }, reason: 'zero-paid-unproven' })
+      continue
+    }
 
     if (zeroPaidInvoiceIds.has(invoice.InvoiceID)) {
       if (zeroPaidIsProvenReversal(verdict)) {

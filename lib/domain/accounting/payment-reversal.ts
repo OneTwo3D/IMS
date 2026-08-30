@@ -1,7 +1,17 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 
-import { databaseStampedCompletion, type LedgerReadFence } from '@/lib/connectors/xero/invoice-delta'
+import { db } from '@/lib/db'
+import {
+  classifyRegisteredPaymentAgainstListing,
+  databaseLedgerFence,
+  databaseStampedCompletion,
+  unregisteredLocalReceipts,
+  type LedgerReadFence,
+  type RegisteredPaymentRow,
+  type RegisteredPaymentVerdict,
+} from '@/lib/connectors/xero/invoice-delta'
 import { storedBodyMayHaveReachedTheLedger } from '@/lib/domain/accounting/followup-idempotency'
+import { payloadPaymentId } from '@/lib/domain/accounting/invoice-payment-enqueue'
 
 // ---------------------------------------------------------------------------
 // Payment-reversal detection (audit-M-acct #3)
@@ -14,6 +24,182 @@ import { storedBodyMayHaveReachedTheLedger } from '@/lib/domain/accounting/follo
 // are paid, which now have a non-paid (AUTHORISED) Xero invoice in the polled
 // window? Those get paidAt rolled back. Pure set intersection, unit-tested.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// THE EVIDENCE EVERY CONNECTOR'S REVERSAL READER MUST CONSULT (o3d-psrx r3, Codex HIGH)
+//
+// r2 gave `SalesOrder.paidAt` a provenance column and taught the XERO poller to read it. Codex found
+// the SAME rule wide open one connector over: the QuickBooks reversal candidate query selected
+// neither `unregisteredPaidAt` nor any registration/receipt evidence, so every recently modified
+// balance-due invoice walked straight into reversal handling — and a sale an operator marked paid by
+// hand, which by design has no ledger receipt at all, satisfied that query exactly. The branch that
+// exists to close "one rule, several writers, one fixed" would have shipped "one rule, two readers,
+// one fixed".
+//
+// So the reader is written ONCE, here, and both pollers call it. What differs between Xero and
+// QuickBooks is only how each ledger states its payments, and that difference is a single argument
+// (`ledgerListedPaymentIds`) rather than a second implementation of the decision.
+// ---------------------------------------------------------------------------
+
+/**
+ * The one instant a reversal verdict may be ordered against, measured by the DATABASE.
+ *
+ * MUST be read BEFORE the ledger request goes out. That ordering is this function returning before
+ * the connector's HTTP call is made — program order inside one process — not a comparison of any two
+ * clock values. The other end is `accounting_sync_logs."syncedAt"`, stamped by
+ * `stampSyncedAtFromDatabaseClock` with the SAME expression on the SAME server; an ordering that
+ * rests on two machines agreeing is not an ordering at all (o3d-clxw round 4, #634).
+ *
+ * NULL ON FAILURE, and null means NOTHING IS DECIDED (see classifyRegisteredPaymentAgainstListing):
+ * with no fence every registration might have landed after the snapshot, so every document with one
+ * withholds. Fail-closed also keeps the o3d-batch-payidx algebra: the decided set only ever shrinks.
+ *
+ * Shared rather than re-declared per connector for the same reason the classifier is: a fence a
+ * second poller mints from `new Date()` is the defect this type is branded to prevent, and the only
+ * reliable way to stop a caller reaching for `new Date()` is for there to be a correct one to import.
+ */
+export async function readDatabaseLedgerFence(): Promise<LedgerReadFence | null> {
+  try {
+    const rows = await db.$queryRaw<Array<{ fence: Date | string | null }>>`SELECT clock_timestamp() AT TIME ZONE 'UTC' AS fence`
+    const fence = rows?.[0]?.fence
+    // Normalised rather than `instanceof`-checked: a raw query can hand back a driver Date, a Date
+    // from another realm, or a string, and none of those is a reason to lose the ordering. An
+    // unreadable value still is.
+    if (fence == null) return null
+    const at = new Date(fence as string | Date).getTime()
+    if (!Number.isFinite(at)) return null
+    return databaseLedgerFence(new Date(at))
+  } catch {
+    return null
+  }
+}
+
+/** A document whose paid flag is up for reversal, reduced to what the evidence read needs. */
+export type PaidProvenanceDoc = {
+  id: string
+  accountingInvoiceId: string | null
+  /**
+   * o3d-psrx — present on SALES documents only. A bill has no such column, so this is `undefined` for
+   * every `PurchaseInvoice` and the arm it feeds is unreachable from the bill pass, which is correct:
+   * markBillPaid queues its BILL_PAYMENT registration INSIDE the paid transaction (o3d-a3wx), so a
+   * bill IMS holds as paid always has a registration to be judged by.
+   *
+   * OPTIONAL IN THE TYPE, NEVER OPTIONAL IN THE QUERY. `undefined` here reads as "not a sales
+   * document", not as "sales document we forgot to select" — those are the same value and opposite
+   * facts, which is why the select itself is policed by a census
+   * (tests/accounting/paid-provenance-readers.test.ts) rather than by this type.
+   */
+  unregisteredPaidAt?: Date | null
+}
+
+/**
+ * WHAT IMS'S OWN RECORDS SAY ABOUT EACH DOCUMENT'S PAID FLAG, as a verdict per document.
+ *
+ * Three sources, read in an order that is deliberate and is the safe one:
+ *
+ *   1. the INVOICE_PAYMENT / BILL_PAYMENT registrations — what IMS has told the ledger, and whether
+ *      this read can speak for the outcome (the fence).
+ *   2. the local `Payment` receipts (sales only) — what IMS has RECORDED. Read AFTER the
+ *      registrations, because `addPayment` commits the receipt with `paidAt` and queues the
+ *      registration afterwards: reading receipts last can only ever find MORE than the registration
+ *      read accounted for, which withholds. Reading them first could miss a receipt whose
+ *      registration then appeared, and that answer is a reversal admitted over a receipt this poll
+ *      never saw.
+ *   3. `unregisteredPaidAt` on the row itself — whether the paid flag was ever going to have a ledger
+ *      receipt at all. "No Payment row" is true of a WooCommerce-paid order AND of an order the
+ *      ledger's own forward pass marked paid, and those need OPPOSITE answers; only the recorded
+ *      provenance separates them.
+ *
+ * Documents with no `accountingInvoiceId` get no verdict — there is no ledger document to disagree
+ * with. A caller that finds no entry for a document must WITHHOLD, never admit: this map's absences
+ * are "nothing was decided", which is the same fail-closed reading a null fence gets.
+ */
+export async function readPaidProvenanceVerdicts<T extends PaidProvenanceDoc>(
+  docs: readonly T[],
+  params: {
+    /** Whose registrations these are. A reversal seen by one connector says nothing about another's rows. */
+    connector: string
+    registrationType: 'BILL_PAYMENT' | 'INVOICE_PAYMENT'
+    referenceType: 'PurchaseInvoice' | 'SalesOrder'
+    /** Database-measured instant the ledger was asked; null = nothing this read can decide. */
+    ledgerObservedBefore: LedgerReadFence | null
+    /**
+     * The payment ids this ledger states on the document, lowercased, or NULL when the read did not
+     * enumerate them. See classifyRegisteredPaymentAgainstListing — null is not emptiness.
+     */
+    ledgerListedPaymentIds: (doc: T) => ReadonlySet<string> | null
+  },
+): Promise<Map<string, RegisteredPaymentVerdict>> {
+  const out = new Map<string, RegisteredPaymentVerdict>()
+  const scoped = docs.filter((doc) => doc.accountingInvoiceId != null)
+  if (scoped.length === 0) return out
+
+  const rows = await db.accountingSyncLog.findMany({
+    where: {
+      connector: params.connector,
+      type: params.registrationType,
+      referenceType: params.referenceType,
+      referenceId: { in: scoped.map((d) => d.id) },
+    },
+    // `syncedAtDatabaseClock` is selected WITH `syncedAt` and never instead of it: the fence is the
+    // two agreeing, which is what makes a stamp written by an old build's host clock visible as one
+    // (o3d-clxw round 5, finding 1 — see databaseStampedCompletion).
+    select: {
+      id: true, referenceId: true, status: true, externalTransactionId: true,
+      syncedAt: true, syncedAtDatabaseClock: true,
+      // o3d-psrx: the receipt this registration NAMES, so a local receipt no registration names can
+      // be told from one that is already spoken for. Read through the same `payloadPaymentId` the
+      // enqueue writes it with, never re-spelt here.
+      payload: true,
+    },
+  })
+  const byDocument = new Map<string, RegisteredPaymentRow[]>()
+  const receiptsNamedByDocument = new Map<string, { status: string; paymentId: string | null }[]>()
+  for (const row of rows) {
+    const list = byDocument.get(row.referenceId) ?? []
+    list.push({
+      id: row.id,
+      status: row.status,
+      externalTransactionId: row.externalTransactionId,
+      syncedAt: row.syncedAt,
+      syncedAtDatabaseClock: row.syncedAtDatabaseClock,
+    })
+    byDocument.set(row.referenceId, list)
+    const named = receiptsNamedByDocument.get(row.referenceId) ?? []
+    named.push({ status: row.status, paymentId: payloadPaymentId(row.payload) })
+    receiptsNamedByDocument.set(row.referenceId, named)
+  }
+
+  const receiptsByDocument = new Map<string, string[]>()
+  if (params.referenceType === 'SalesOrder') {
+    const payments = await db.payment.findMany({
+      // `refundId: null` — a refund receipt settles a credit note, not the invoice this poll is
+      // reading, so it neither owes an INVOICE_PAYMENT nor bears on the invoice's residual.
+      where: { orderId: { in: scoped.map((d) => d.id) }, refundId: null },
+      select: { id: true, orderId: true },
+    })
+    for (const payment of payments) {
+      const list = receiptsByDocument.get(payment.orderId) ?? []
+      list.push(payment.id)
+      receiptsByDocument.set(payment.orderId, list)
+    }
+  }
+
+  for (const doc of scoped) {
+    out.set(doc.id, classifyRegisteredPaymentAgainstListing(
+      params.ledgerListedPaymentIds(doc),
+      byDocument.get(doc.id) ?? [],
+      params.ledgerObservedBefore,
+      unregisteredLocalReceipts(
+        receiptsByDocument.get(doc.id) ?? [],
+        receiptsNamedByDocument.get(doc.id) ?? [],
+      ),
+      // READ FROM THE ROW, not inferred from the absence of a receipt.
+      doc.unregisteredPaidAt != null,
+    ))
+  }
+  return out
+}
 
 export type ReversalCandidate = { accountingInvoiceId: string | null }
 

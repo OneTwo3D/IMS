@@ -1246,6 +1246,38 @@ export function classifyRegisteredPayment(
   invoice: XeroInvoice,
   registrations: RegisteredPaymentRow[],
   ledgerObservedBefore: LedgerReadFence | null,
+  unregisteredReceiptIds: readonly string[] = [],
+  paidWithoutLedgerReceipt: boolean = false,
+): RegisteredPaymentVerdict {
+  return classifyRegisteredPaymentAgainstListing(
+    listedLedgerPaymentIds(invoice),
+    registrations,
+    ledgerObservedBefore,
+    unregisteredReceiptIds,
+    paidWithoutLedgerReceipt,
+  )
+}
+
+/**
+ * THE DECISION ITSELF, WITH NO LEDGER'S DIALECT IN IT (o3d-psrx r3, Codex HIGH).
+ *
+ * `classifyRegisteredPayment` above is this function plus ONE line: how a XERO invoice states which
+ * payments it carries. Everything the verdict actually turns on -- the registrations, the fence, the
+ * unregistered receipts, the recorded provenance -- is connector-neutral, and splitting it here is
+ * what lets the QuickBooks poller reach the SAME decision instead of a second one worded like it.
+ * Two independently-worded implementations of one money rule is precisely the defect Codex found:
+ * the rule enforced for Xero and silently absent for QuickBooks.
+ *
+ * `ledgerListedPaymentIds` is the set of payment ids the ledger states on this document, LOWERCASED,
+ * or NULL when this read did not enumerate them. Null is not "no payments": it is "absence cannot be
+ * established from this payload", which is what `LEDGER_DID_NOT_LIST_PAYMENTS` says. The QuickBooks
+ * reversal read asks only which invoice ids regressed, so it always passes null, and GONE/STILL_HELD
+ * are unreachable from that connector -- see the QuickBooks poller's own note.
+ */
+export function classifyRegisteredPaymentAgainstListing(
+  ledgerListedPaymentIds: ReadonlySet<string> | null,
+  registrations: RegisteredPaymentRow[],
+  ledgerObservedBefore: LedgerReadFence | null,
   /**
    * o3d-psrx — the local receipts on this document that NO registration names, from
    * {@link unregisteredLocalReceipts}. Defaulted to none so every existing caller and test keeps its
@@ -1332,7 +1364,7 @@ export function classifyRegisteredPayment(
     return { verdict: 'NOTHING_REGISTERED' }
   }
 
-  const listed = listedLedgerPaymentIds(invoice)
+  const listed = ledgerListedPaymentIds
   if (listed === null) return { verdict: 'LEDGER_DID_NOT_LIST_PAYMENTS' }
 
   const stillHeld = posted.filter((id) => listed.has(id.toLowerCase()))
