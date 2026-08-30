@@ -5561,6 +5561,16 @@ test('[o3d-batch-ret] the unchecked-substitution rule can FAIL, on every shape t
 //   TIER 2  everywhere else in the shipped shell files, each one is on the roster with the reason
 //           its producer failing is not a decision made on nothing. A new one fails this test
 //           until somebody has written that reason down.
+//
+// AND THE QUESTION EACH REASON MUST ANSWER IS ABOUT A **PARTIAL** RESULT (o3d-p9dq, Codex r33
+// HIGH). Round 32 wrote these reasons against EMPTINESS — "a truncated list can only drop units,
+// and an empty one refuses". That is a different claim, and the gap between them cost the deploy
+// its unit census: with two units serving this tree, a producer emitting the first and dying
+// leaves a NON-EMPTY list that passes the empty-list refusal, and the cutover proceeds having
+// stopped one of the two while the other keeps writing across the migration. Every entry below
+// was re-read against that question — what does a partial NON-EMPTY result do — and the ones that
+// could not answer it are no longer on this roster: they are captured with their status taken.
+// A reason that argues only from emptiness is not a reason.
 // ---------------------------------------------------------------------------
 
 const DB_FENCE_LIB = 'scripts/lib/db-fence-protected.sh'
@@ -5570,15 +5580,53 @@ const DB_FENCE_LIB_SRC = readFileSync(join(REPO_ROOT, DB_FENCE_LIB), 'utf8')
 const ALL_SHELL_SOURCES: Array<[string, string]> = [...SHELL_FILES, [DB_FENCE_LIB, DB_FENCE_LIB_SRC]]
 
 /**
+ * The physical lines rejoined into the LOGICAL ones bash actually tokenizes (o3d-p9dq, Codex r33
+ * MEDIUM).
+ *
+ * A detector that scans PHYSICAL lines and requires `[<>](` on one of them cannot see a process
+ * substitution split across a backslash-newline. Bash removes backslash-newline BEFORE
+ * tokenization, so
+ *
+ *     mapfile -t out < <\
+ *     (producer)
+ *
+ * is one `< <(producer)` and neither physical line matches. Verified under a real shell by the
+ * mutation test below, which runs that exact text and counts what the array received. Such a
+ * substitution could enter the supposedly substitution-free closure, or evade the roster, while
+ * both tests stayed green.
+ *
+ * AN ODD NUMBER of trailing backslashes escapes the newline; an even number is escaped
+ * BACKSLASHES and the line genuinely ends there. A comment is never continued — bash's `#` runs
+ * to the newline and a trailing backslash inside one continues nothing (also verified under a
+ * real shell) — so a comment must not be allowed to swallow the line after it.
+ */
+function logicalShellLines(lines: string[]): string[] {
+  const out: string[] = []
+  let pending: string | null = null
+  for (const line of lines) {
+    if (pending === null && /^\s*#/.test(line)) { out.push(line); continue }
+    const joined = pending === null ? line : pending + line
+    if ((/\\*$/.exec(joined)![0].length % 2) === 1) { pending = joined.slice(0, -1); continue }
+    out.push(joined)
+    pending = null
+  }
+  // A file whose last line ends in a backslash continues into nothing; scan what there is.
+  if (pending !== null) out.push(pending)
+  return out
+}
+
+/**
  * Every process substitution in <lines>. Comments are skipped, and `$(` is not one of these — it
- * is a command substitution, which section 10 owns.
+ * is a command substitution, which section 10 owns. Runs of whitespace in a reported entry are
+ * collapsed to one space, because a logical line rejoined from three physical ones carries the
+ * indentation of each.
  */
 function processSubstitutionsIn(label: string, lines: string[]): string[] {
   const found: string[] = []
-  for (const line of lines) {
+  for (const line of logicalShellLines(lines)) {
     if (/^\s*#/.test(line)) continue
     if (!/(^|[^$])[<>]\(/.test(line)) continue
-    found.push(`${label}» ${line.trim()}`)
+    found.push(`${label}» ${line.trim().replace(/\s+/g, ' ')}`)
   }
   return found
 }
@@ -5589,51 +5637,41 @@ function processSubstitutionsIn(label: string, lines: string[]): string[] {
  * incomplete answer get something INSTALLED or DELETED, and does emptiness read as a PASS?
  */
 const PROCESS_SUBSTITUTIONS_JUSTIFIED: Record<string, string> = {
-  // DIAGNOSTIC TEXT, and nothing else. The decision on this path is `db_fence_probe_script ||
-  // probe_rc=1`, taken on its own line above with its own status. A report that stopped part-way
-  // costs the operator warning lines; it cannot change what this run does.
-  'scripts/deploy.sh» while IFS= read -r probe_line; do warn "$probe_line"; done < <(db_fence_probe_report)':
-    'warning text; the decision on this path is taken from db_fence_probe_script\'s own status',
-  'scripts/update.sh» while IFS= read -r probe_line; do warn "${probe_line}"; done < <(db_fence_probe_report)':
-    'warning text; the decision on this path is taken from db_fence_probe_script\'s own status',
-  'scripts/lib/db-fence-protected.sh» while IFS= read -r line; do printf \'%s\\n\' "${line}"; done < <(db_fence_probe_report)':
-    'the report re-emitted for a caller to print; it decides nothing',
+  // A PREFILTER FOR A DELETE LOOP, and the loop re-decides every candidate before removing it.
+  //
+  // PARTIAL, NON-EMPTY: the loop is offered FEWER files. `kept` counts only files that pass the
+  // name grammar AND re-hash to the digest their own name claims, and a file is deleted only once
+  // `kept` exceeds the retention window — so a short list makes `kept` smaller and deletes FEWER
+  // files, never more, and never a file it did not first prove it wrote. A truncation landing
+  // mid-path is safer still: `db_ca_generation_digest` rejects anything that is not the prefix
+  // plus 64 lowercase hex, so a half-written path is skipped rather than deleted. Nothing
+  // downstream reads this directory as a census; the function documents that it never fails the
+  // install, and its subject is public certificates.
+  'scripts/install.sh» done < <(find "${DB_CA_PUBLISH_DIR}" -maxdepth 1 -type f -name "${DB_CA_GENERATION_PREFIX}*${DB_CA_GENERATION_SUFFIX}" -printf \'%T@ %p\\n\' 2>/dev/null | sort -rn | cut -d\' \' -f2-)':
+    'a prefilter for a deletion whose selector is a re-hash: a partial list deletes FEWER files, and a partial path is rejected by the digest grammar before it can name one',
 
-  // THE UNIT LIST, and the one case that matters fails CLOSED. A `systemctl list-units` that
-  // stopped part-way can only DROP units, and dropping the one that serves ${APP_DIR_REAL} leaves
-  // SERVICE_UNITS empty — which every migrating path refuses outright, before anything is stopped
-  // ("No systemd unit serves …, so the predecessor cannot be fenced against a reboot"). A run that
-  // still finds its own unit has the answer it needed.
-  'scripts/deploy.sh» done < <(systemctl list-units --type=service --all --plain --no-legend --no-pager 2>/dev/null | awk \'{print $1}\')':
-    'a truncated list can only drop units, and an empty one refuses the migrating deploy before anything is stopped',
-  'scripts/deploy.sh» mapfile -t SERVICE_UNITS < <(detect_service_units)':
-    'same producer, same refusal: an empty SERVICE_UNITS is a die, not a default',
-
-  // THIS PROCESS\'S OWN ENVIRONMENT, enumerated by a shell BUILTIN in a subshell that opens no
-  // file and executes nothing. It has no partial-output failure mode that leaves the parent
-  // running, and the transport variables it exists to strip are separately REFUSED outright by
-  // db_application_route_env_refusal, which reads them from this process directly.
-  'scripts/install.sh» done < <(compgen -e)':
-    'a builtin over this process\'s own environment; the transport variables are separately refused',
-
-  // A PREFILTER FOR A DELETE LOOP, and the loop re-hashes every candidate before removing it. A
-  // `find` that stopped part-way offers FEWER files, so the failure direction is keeping a
-  // superseded CA generation — never deleting one this run cannot account for.
-  'scripts/install.sh» done < <(find "${DB_CA_PUBLISH_DIR}" -maxdepth 1 -type f \\':
-    'a prefilter for a deletion; a short list deletes fewer files, never more',
-
-  // EXTRA PROBE CANDIDATES, seeded with `postgres` before the loop runs and already written with
-  // `|| true`. A short list costs connection attempts the rotation would have made; it cannot make
-  // one it should not have.
+  // EXTRA PROBE CANDIDATES, and INCOMPLETENESS IS ALREADY THIS LIST'S DESIGN. The query carries
+  // `LIMIT 8` precisely so a cluster with two hundred databases cannot turn one rotation into four
+  // hundred connection attempts — so the list is a best-effort set of endpoints to try and has
+  // never been a census of the cluster.
+  //
+  // PARTIAL, NON-EMPTY: fewer candidates are probed, which is the same answer the LIMIT produces
+  // by design on any cluster large enough. The array is SEEDED with `postgres` before the loop
+  // runs, so the endpoint the rotation actually needs is present whatever the producer did, and
+  // nothing here installs, deletes or records a "checked everything" verdict.
   'scripts/install.sh» done < <(db_connectable_databases_except_app || true)':
-    'an additive candidate list seeded with postgres; a short list probes fewer endpoints',
+    'a best-effort candidate list the query itself caps at 8 and the caller seeds with postgres; a partial list probes fewer endpoints, which is what the cap already does by design',
 
-  // THE POST-MIGRATION VERIFICATION SET. This one is a genuine selection, and the honest statement
-  // is what it can and cannot do: it installs nothing and deletes nothing, the count it found is
-  // PRINTED, and a set that came back empty prints the warning that says a pass from the hook
-  // would mean nothing was checked. A `find` that stopped part-way is visible in that count.
+  // THE POST-MIGRATION VERIFICATION SET — and this is a PREFLIGHT LISTING, not the selection.
+  // scripts/run-migration-verifications.mjs rediscovers the files itself after the migration, runs
+  // them, and prints its own coverage report; VERIFY_FILES never reaches it. Read the code either
+  // side of this line: the array is used for the `info` above and for nothing else.
+  //
+  // PARTIAL, NON-EMPTY: the operator is shown a shorter list before anything is stopped. What
+  // actually runs after the schema moves is unchanged, because a different process enumerates it,
+  // and the `|| die` on that process is what makes a verification failure fatal.
   'scripts/deploy.sh» done < <(find "${APP_DIR_REAL}/prisma/migrations" -mindepth 2 -maxdepth 2 -name \'verify.sql\' -type f 2>/dev/null | sort)':
-    'selects which verifications run; installs and deletes nothing, and the count it found is printed',
+    'a preflight listing printed for the operator; run-migration-verifications.mjs rediscovers and runs the files itself, so a partial list shortens the notice and changes nothing that executes',
 }
 
 test('[o3d-batch-ret] the crontab/fence subsystem carries NO process substitution, because nobody can take a producer\'s status', () => {
@@ -5664,9 +5702,16 @@ test('[o3d-batch-ret] the crontab/fence subsystem carries NO process substitutio
 test('[o3d-batch-ret] every other process substitution in the shipped shell files is on the roster with a reason', () => {
   const found = ALL_SHELL_SOURCES.flatMap(([file, src]) => processSubstitutionsIn(file, src.split('\n')))
 
-  // NOT VACUOUS: the detector is matching real text in the shipped files. An empty `surprises`
-  // below is then a property of the roster and not of a walk that found nothing.
-  assert.ok(found.length >= 8,
+  // NOT VACUOUS, AND NOT BY A COUNT ALONE. Round 33 converted four of the nine entries into
+  // checked captures, so a threshold big enough to be meaningful no longer exists — assert
+  // instead that the walk actually READ each shipped file, and that it is still finding real
+  // sites in them. A walk over four empty strings would satisfy any `found.length >= n`.
+  assert.equal(ALL_SHELL_SOURCES.length, 5,
+    'the walk must cover the three entrypoints, the crontab library and the fence library')
+  for (const [file, src] of ALL_SHELL_SOURCES) {
+    assert.ok(src.split('\n').length > 200, `${file} was read as too few lines to be the shipped file`)
+  }
+  assert.ok(found.length >= 3,
     `the walk found only ${found.length} process substitutions across ${ALL_SHELL_SOURCES.length} files`)
 
   assert.deepEqual(found.filter((entry) => !(entry in PROCESS_SUBSTITUTIONS_JUSTIFIED)), [],
@@ -5681,7 +5726,7 @@ test('[o3d-batch-ret] every other process substitution in the shipped shell file
     'a roster entry that matches no line in the shipped scripts must be deleted')
 })
 
-test('[o3d-batch-ret] the process-substitution rule can FAIL, on every shape these files could use', () => {
+test('[o3d-batch-ret] the process-substitution rule can FAIL, on every shape these files could use', async () => {
   // The two empty lists above mean nothing unless the rule that produced them can produce a
   // non-empty one. Run against lines written to break it, one at a time.
   const planted = [
@@ -5694,19 +5739,227 @@ test('[o3d-batch-ret] the process-substitution rule can FAIL, on every shape the
     '  n=$(( n + 1 ))',                                                                  // 7  arithmetic
     '  while read -r x; do :; done <<< "$captured"',                                      // 8  the fix
     '  awk \'{ print }\' "$a" "$b"',                                                        // 9  the other fix
+    // 10-11 SPLIT ACROSS A BACKSLASH-NEWLINE, and FLAGGED as the one logical line bash reads.
+    // Neither physical line carries `<(`, which is exactly round 33's MEDIUM.
+    '  mapfile -t out < <\\',
+    '(split_producer)',
+    // 12-13 the same thing continued twice, so the rejoin is not a one-step special case.
+    '  diff <\\',
+    '(first) <\\',
+    '(second) >/dev/null',
+    // 15-16 an EVEN number of trailing backslashes is escaped backslashes, NOT a continuation:
+    // the line ends, and the `(` below must not be pulled up into it.
+    '  printf \'%s\' "a\\\\"',
+    '(subshell_not_a_substitution)',
+    // 17-18 a COMMENT ending in a backslash continues nothing in bash, so it must not swallow the
+    // process substitution on the line after it — that line must be flagged in its own right.
+    '  # a trailing backslash inside a comment continues nothing \\',
+    '  mapfile -t after_comment < <(producer)',
   ]
   assert.deepEqual(processSubstitutionsIn('synthetic', planted), [
     'synthetic» while read -r x; do :; done < <(producer)',
     'synthetic» mapfile -t out < <(producer)',
     'synthetic» diff <(one) <(two) >/dev/null',
     'synthetic» tee >(consumer) < "$f"',
-  ], 'the rule must flag the read loop, the mapfile, both halves of a two-input compare and the '
-   + 'output substitution — and must flag none of the comment, the command substitution section 10 '
-   + 'owns, the arithmetic, or either of the two shapes that replace one')
+    'synthetic» mapfile -t out < <(split_producer)',
+    'synthetic» diff <(first) <(second) >/dev/null',
+    'synthetic» mapfile -t after_comment < <(producer)',
+  ], 'the rule must flag the read loop, the mapfile, both halves of a two-input compare, the '
+   + 'output substitution, and the two SPLIT across backslash-newlines — and must flag none of the '
+   + 'comment, the command substitution section 10 owns, the arithmetic, either of the two shapes '
+   + 'that replace one, or the subshell below a line ending in ESCAPED backslashes')
+
+  // AND THE SPLIT FORM IS A PROCESS SUBSTITUTION IN A REAL SHELL, not a shape this test asserts
+  // into existence. Bash removes backslash-newline before tokenization; run the exact text the
+  // detector was just asked about and count what the array received.
+  const split = await sh([
+    'set -uo pipefail',
+    'mapfile -t out < <\\',
+    '(printf \'%s\\n\' one two three)',
+    'echo "N=${#out[@]} LAST=${out[2]:-}"',
+  ].join('\n'))
+  assert.match(split.stdout, /^N=3 LAST=three$/m,
+    `the split form must really be a process substitution, or the detector is guarding a shape `
+    + `bash does not have:\n${split.stdout}${split.stderr}`)
+
+  // …and the COMMENT half, likewise measured rather than assumed: a trailing backslash in a
+  // comment continues nothing, so the line after it is code and the detector must scan it.
+  const comment = await sh([
+    'set -uo pipefail',
+    '# a comment ending in a backslash \\',
+    'echo COMMENT_DID_NOT_SWALLOW',
+  ].join('\n'))
+  assert.match(comment.stdout, /^COMMENT_DID_NOT_SWALLOW$/m,
+    `a comment must not continue, or logicalShellLines() would be joining lines bash keeps `
+    + `apart:\n${comment.stdout}${comment.stderr}`)
 
   // AND IT MUST SEE THEM IN THE REAL FILES, not only in a planted array — the same detector, over
   // the shipped text, with a known site in it.
   const real = processSubstitutionsIn('scripts/install.sh', INSTALL_SH.split('\n'))
-  assert.ok(real.some((e) => e.includes('compgen -e')),
+  assert.ok(real.some((e) => e.includes('db_connectable_databases_except_app')),
     'the detector must find the known site in the shipped installer')
+
+  // AND THE KNOWN SPLIT SITE, which is the whole of round 33's MEDIUM: the CA prune's `find` runs
+  // across three physical lines, and no one of them carries both halves of `< <(`. A detector
+  // reading physical lines reports it as absent.
+  assert.ok(real.some((e) => e.includes('DB_CA_PUBLISH_DIR') && e.includes('cut -d')),
+    'the detector must rejoin the CA prune\'s multi-line `find` into the one logical line bash sees')
+})
+
+// ---------------------------------------------------------------------------
+// 12 — A PARTIAL UNIT CENSUS IS AN OLD WRITER LEFT RUNNING   (o3d-p9dq, Codex r33 HIGH)
+//
+// Section 11's roster excused the deploy's two `SERVICE_UNITS` process substitutions on the
+// grounds that "a truncated list can only DROP units, and an empty one refuses the migrating
+// deploy before anything is stopped". Both halves are true and together they are not a safety
+// argument: they cover EMPTINESS, and a partial list is not empty.
+//
+// WHERE TWO UNITS SERVE THIS TREE — a stage box running `next dev` alongside the packaged unit is
+// exactly that host — a producer that emits the first and dies before the second leaves
+// SERVICE_UNITS holding ONE element. That passes the "no unit serves ${APP_DIR_REAL}" refusal.
+// The deploy then fences, stops, environment-binds and restarts the unit it found, and the one it
+// never saw is still up, still holding connections, and still executing the PREVIOUS release when
+// the schema moves under it. The enumeration exists to close that window; a partial census opens
+// it while every check the run makes is satisfied.
+//
+// WHAT THESE PIN, and the route each takes:
+//   1. NOT VACUOUS. Two units really are discovered when the census completes
+//        (detect_service_units -> the caller's mapfile -> SERVICE_UNITS)
+//   2. LOAD-BEARING. A census that emits one of the two and FAILS is refused, and the refusal
+//      happens before anything is stopped   (`systemctl list-units` status -> `|| return 1`
+//        -> `DETECTED_SERVICE_UNITS="$(…)" || die`)
+//   3. LOAD-BEARING. The per-unit `systemctl show` failing is the same hazard one unit at a time,
+//      and is refused too   (the inner capture's status)
+//   4. MUTATION. Round 32's wiring — the process substitution and the `|| true` — run against the
+//      SAME faults: a roster of ONE unit, and a run that proceeds
+// ---------------------------------------------------------------------------
+
+const CENSUS_DIR = join(HARNESS, 'census-app')
+mkdirSync(CENSUS_DIR, { recursive: true })
+
+/** Round 32's enumeration, verbatim, so the finding is RUN and not described. */
+const PRE_FIX_CENSUS = `detect_service_units() {
+  command -v systemctl >/dev/null 2>&1 || return 0
+  local unit wd
+  while read -r unit; do
+    [[ -n "$unit" ]] || continue
+    wd="$(systemctl show -p WorkingDirectory --value "$unit" 2>/dev/null || true)"
+    [[ -n "$wd" && -d "$wd" ]] || continue
+    if [[ "$(readlink -f "$wd")" == "$APP_DIR_REAL" ]]; then
+      echo "$unit"
+    fi
+  done < <(systemctl list-units --type=service --all --plain --no-legend --no-pager 2>/dev/null | awk '{print $1}')
+}
+
+if [[ -n "\${IMS_SERVICE_UNIT:-}" ]]; then
+  mapfile -t SERVICE_UNITS <<<"\${IMS_SERVICE_UNIT}"
+else
+  mapfile -t SERVICE_UNITS < <(detect_service_units)
+fi`
+
+/**
+ * The SHIPPED enumeration and the SHIPPED wiring, both lifted out of scripts/deploy.sh by their
+ * own text — so this runs what deploys rather than a transcription of it.
+ */
+function shippedCensus(): string {
+  const fn = shellFunctionFrom(DEPLOY_SH, 'detect_service_units', 'scripts/deploy.sh')
+  const start = DEPLOY_SH.indexOf('if [[ -n "${IMS_SERVICE_UNIT:-}" ]]; then')
+  assert.notEqual(start, -1, 'scripts/deploy.sh must still branch on IMS_SERVICE_UNIT')
+  const end = DEPLOY_SH.indexOf('\n# mapfile leaves a single empty element when the input is empty.', start)
+  assert.ok(end > start, 'the IMS_SERVICE_UNIT branch must still be followed by the empty-element cleanup')
+  const caller = DEPLOY_SH.slice(start, end)
+  assert.match(caller, /DETECTED_SERVICE_UNITS="\$\(detect_service_units\)" \|\| die/,
+    'the shipped caller must take the census status')
+  return `${fn}\n\n${caller}`
+}
+
+/**
+ * A `systemctl` that reports TWO units serving ${CENSUS_DIR}, with a fault injected into one of
+ * the two producers the enumeration depends on.
+ *
+ *   none            both units listed, both interrogated
+ *   census-partial  `list-units` prints the FIRST unit and exits non-zero — a producer that died
+ *                   after part of its output, which is the whole finding
+ *   show-fails      the census completes; the per-unit `systemctl show` fails for the SECOND unit
+ */
+type CensusFault = 'none' | 'census-partial' | 'show-fails'
+function systemctlShim(fault: CensusFault): string {
+  return [
+    'systemctl() {',
+    '  case "${1:-}" in',
+    '    list-units)',
+    "      printf '%s\\n' 'ims-one.service loaded active running One'",
+    fault === 'census-partial' ? '      return 1' : '      :',
+    "      printf '%s\\n' 'ims-two.service loaded active running Two'",
+    "      printf '%s\\n' 'unrelated.service loaded active running Other'",
+    '      return 0 ;;',
+    '    show)',
+    '      case "${!#}" in',
+    fault === 'show-fails' ? '        ims-two.service) return 1 ;;' : '        __never__) : ;;',
+    `        ims-one.service|ims-two.service) printf '%s\\n' '${CENSUS_DIR}'; return 0 ;;`,
+    "        *) printf '%s\\n' '/nowhere'; return 0 ;;",
+    '      esac ;;',
+    '  esac',
+    '  return 0',
+    '}',
+  ].join('\n')
+}
+
+async function runCensus(fault: CensusFault, census: string) {
+  return sh([
+    'set -uo pipefail',
+    `APP_DIR_REAL='${CENSUS_DIR}'`,
+    'SERVICE_UNITS=()',
+    'die(){ echo "DIED: $*" >&2; exit 9; }',
+    'IMS_SERVICE_UNIT=""',
+    systemctlShim(fault),
+    census,
+    // The shipped cleanup that follows the branch, so an empty census reads the way it does live.
+    'if [[ "${#SERVICE_UNITS[@]}" -eq 1 && -z "${SERVICE_UNITS[0]}" ]]; then SERVICE_UNITS=(); fi',
+    'echo "COUNT=${#SERVICE_UNITS[@]}"',
+    'echo "UNITS=${SERVICE_UNITS[*]:-none}"',
+  ].join('\n'))
+}
+
+test('[o3d-batch-ret] a unit census that stopped part-way is REFUSED, rather than deploying against fewer units than the host runs', async () => {
+  const shipped = shippedCensus()
+
+  // (1) NOT VACUOUS. The mechanism finds BOTH units when its producers complete — so "one unit"
+  // below is a census that lost one, not a shim that only ever offered one.
+  const whole = await runCensus('none', shipped)
+  assert.match(whole.stdout, /^COUNT=2$/m,
+    `both units serving this tree must be discovered:\n${whole.stdout}${whole.stderr}`)
+  assert.match(whole.stdout, /^UNITS=ims-one\.service ims-two\.service$/m, whole.stdout)
+
+  // (2) THE PROPERTY. `list-units` emits the first unit and dies. The status is the shell's, the
+  // caller takes it, and the run stops — before anything is fenced, stopped or migrated.
+  const partial = await runCensus('census-partial', shipped)
+  assert.equal(partial.code, 9,
+    `a census that stopped part-way must refuse:\n${partial.stdout}${partial.stderr}`)
+  assert.match(partial.stderr, /did not complete/, partial.stderr)
+  assert.match(partial.stderr, /IMS_SERVICE_UNIT/,
+    `and it must name the way past it:\n${partial.stderr}`)
+  assert.doesNotMatch(partial.stdout, /^COUNT=/m,
+    'nothing after the census may run on a roster this run could not vouch for')
+
+  // (3) THE SAME HAZARD ONE UNIT AT A TIME: a `systemctl show` that fails for the second unit used
+  // to drop it silently through `|| true`.
+  const showFails = await runCensus('show-fails', shipped)
+  assert.equal(showFails.code, 9,
+    `a unit whose WorkingDirectory could not be read must refuse, not be dropped:\n${showFails.stdout}${showFails.stderr}`)
+
+  // (4) MUTATION, AND ITS ROUTE. Round 32's process-substituted enumeration and its `|| true`,
+  // against the SAME two faults. The producer's exit reaches neither the reader nor `$?`, so the
+  // roster comes back NON-EMPTY with one of the two units and every later check is satisfied.
+  for (const [fault, why] of [
+    ['census-partial', 'the census producer dying after its first unit'],
+    ['show-fails', 'the per-unit WorkingDirectory read failing'],
+  ] as Array<[CensusFault, string]>) {
+    const preFix = await runCensus(fault, PRE_FIX_CENSUS)
+    assert.notEqual(preFix.code, 9, `${why}: the pre-fix wiring must NOT refuse:\n${preFix.stderr}`)
+    assert.match(preFix.stdout, /^COUNT=1$/m,
+      `THE FINDING (${why}): a NON-EMPTY roster of one unit passes the empty-list refusal:\n${preFix.stdout}${preFix.stderr}`)
+    assert.match(preFix.stdout, /^UNITS=ims-one\.service$/m,
+      `THE LOSS (${why}): ims-two.service is never fenced, stopped or restarted, and writes across the migration`)
+  }
 })

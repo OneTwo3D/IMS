@@ -1962,9 +1962,17 @@ require_fenceable_database() {
     # or when IMS_FENCE_ARTEFACT_SHA256 authenticates the candidate. Otherwise
     # ${DB_FENCE_PROBE_SCRIPT} is empty, and this run preflights nothing rather than handing an
     # administrative credential to bytes the application account chose.
-    local probe_rc=0 probe_line
+    # THE REPORT IS CAPTURED, NOT PROCESS-SUBSTITUTED (o3d-p9dq, Codex r33). db_fence_probe_report
+    # only ever prints, but a producer nobody can take a status from is a shape this subsystem no
+    # longer carries anywhere: `$( … )` gives this shell the status, and the `warn` loop then reads
+    # from text it already holds rather than from a writer that could stop mid-report.
+    local probe_rc=0 probe_line probe_report=""
     db_fence_probe_script || probe_rc=1
-    while IFS= read -r probe_line; do warn "$probe_line"; done < <(db_fence_probe_report)
+    probe_report="$(db_fence_probe_report)" || probe_report=""
+    while IFS= read -r probe_line; do
+      [[ -n "$probe_line" ]] || continue
+      warn "$probe_line"
+    done <<<"$probe_report"
 
     if [[ -z "$DEPLOY_ADMIN_DATABASE_URL" ]] || { [[ ! -f "$DB_FENCE_SCRIPT" ]] && [[ ! -f "$DB_FENCE_SCRIPT_COPY" ]]; } || [[ ! -f "$DB_OBJECT_ACCESS_SCRIPT" ]]; then
       db_fence_probe_cleanup
@@ -2951,23 +2959,66 @@ fi
 # app under systemd with Restart=always, and a plain `kill` there is undone in
 # seconds. Match on WorkingDirectory so a second instance serving a DIFFERENT tree
 # and a DIFFERENT database (the full-chain e2e rig) is never caught by this.
+# A PARTIAL CENSUS IS NOT A SHORT LIST, IT IS AN OLD WRITER LEFT RUNNING (o3d-p9dq, Codex r33 HIGH).
+#
+# Every version of this enumeration until now was a process substitution — `< <(systemctl
+# list-units … | awk …)`, and the whole function behind another one — whose producers report their
+# exit to nobody. The roster in the serialization suite excused them on the grounds that a
+# truncated list "can only drop units, and an empty one refuses the migrating deploy".
+#
+# THAT COVERS THE EMPTY CASE AND ONLY THE EMPTY CASE. Where this host runs TWO units against
+# ${APP_DIR_REAL} — a stage box running `next dev` alongside the packaged unit is exactly that
+# shape — a producer that emits the first and dies before the second leaves SERVICE_UNITS
+# NON-EMPTY. It passes the "no unit serves this tree" refusal, and the deploy proceeds having
+# fenced, stopped, environment-bound and restarted ONE of the two. The other is still up, still
+# holding connections, and still executing the PREVIOUS release against a schema this run is about
+# to move: precisely the version-skew write window the enumeration exists to close, reached
+# through a check that was satisfied.
+#
+# SO EVERY PRODUCER HERE HAS A STATUS AND EVERY STATUS IS TAKEN. The census is captured whole and
+# checked before a single line of it is parsed; the parsing is a here-string over that captured
+# text, so no second process can die between the reader and the data. `awk` is gone — `read`'s own
+# field splitting is what took its first column anyway, and it was one more unwatched producer.
+# A failure anywhere is `return 1`, which the caller turns into a refusal: a census this run
+# cannot vouch for must not become a list of the units it believes it stopped.
 detect_service_units() {
   command -v systemctl >/dev/null 2>&1 || return 0
-  local unit wd
-  while read -r unit; do
-    [[ -n "$unit" ]] || continue
-    wd="$(systemctl show -p WorkingDirectory --value "$unit" 2>/dev/null || true)"
-    [[ -n "$wd" && -d "$wd" ]] || continue
-    if [[ "$(readlink -f "$wd")" == "$APP_DIR_REAL" ]]; then
-      echo "$unit"
+  local unit rest wd resolved census
+  local -a listed=()
+  # THE WHOLE CENSUS FIRST, WITH ITS STATUS. `systemctl list-units` that died part-way through its
+  # output exits non-zero, and unlike a process substitution's producer that status is this
+  # shell's to take.
+  census="$(systemctl list-units --type=service --all --plain --no-legend --no-pager 2>/dev/null)" || return 1
+  # THEN PARSED, from text this shell already holds. `read` splits on IFS, so ${unit} is the first
+  # column — what the `awk '{print $1}'` did, minus the process that could fail unnoticed.
+  while read -r unit rest; do
+    [[ -n "${unit}" ]] || continue
+    listed+=("${unit}")
+  done <<<"${census}"
+  for unit in "${listed[@]:-}"; do
+    [[ -n "${unit}" ]] || continue
+    # AND THIS ONE IS THE SAME HAZARD ONE UNIT AT A TIME: `|| true` here meant a unit whose
+    # WorkingDirectory could not be read was silently dropped from the roster, which for the unit
+    # serving this tree is the partial census again with a smaller blast radius.
+    wd="$(systemctl show -p WorkingDirectory --value "${unit}" 2>/dev/null)" || return 1
+    [[ -n "${wd}" && -d "${wd}" ]] || continue
+    resolved="$(readlink -f "${wd}")" || return 1
+    if [[ "${resolved}" == "${APP_DIR_REAL}" ]]; then
+      printf '%s\n' "${unit}"
     fi
-  done < <(systemctl list-units --type=service --all --plain --no-legend --no-pager 2>/dev/null | awk '{print $1}')
+  done
 }
 
 if [[ -n "${IMS_SERVICE_UNIT:-}" ]]; then
   mapfile -t SERVICE_UNITS <<<"${IMS_SERVICE_UNIT}"
 else
-  mapfile -t SERVICE_UNITS < <(detect_service_units)
+  # THE STATUS, AND THEN THE LIST. An enumeration that failed is not an empty roster: an empty
+  # roster is a claim that nothing serves this tree, and this run has no basis for making it.
+  # Refusing here costs a re-run; proceeding costs a writer of the previous release surviving the
+  # cutover, which is the one failure the units are enumerated to prevent.
+  DETECTED_SERVICE_UNITS="$(detect_service_units)" || die \
+    "The systemd unit census for ${APP_DIR_REAL} did not complete, so this run cannot say which units serve this tree — and a census that stopped part-way looks exactly like a host with fewer units, which would let a writer of the previous release survive the cutover. Nothing has been stopped and nothing has been migrated. Re-run, or name the units explicitly with IMS_SERVICE_UNIT=<unit> (newline-separated for more than one)."
+  mapfile -t SERVICE_UNITS <<<"${DETECTED_SERVICE_UNITS}"
 fi
 # mapfile leaves a single empty element when the input is empty.
 if [[ "${#SERVICE_UNITS[@]}" -eq 1 && -z "${SERVICE_UNITS[0]}" ]]; then

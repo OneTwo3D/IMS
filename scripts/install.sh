@@ -1059,15 +1059,28 @@ FIRST_INSTALL_EXEMPTION_REFUSAL=""
 # `compgen -e`, so nothing here has to trust a caller-supplied string.
 #
 # Fills the caller's named array; `env -u X -u Y ... psql` then starts psql with them gone.
+#
+# AND THE ENUMERATION IS TAKEN WHOLE OR NOT AT ALL (o3d-p9dq, Codex r33). `compgen -e` behind a
+# process substitution had no status anybody could take, and a PARTIAL enumeration is not a shorter
+# list of `-u` options: it is a PG*/PSQL* variable left STANDING in the environment of the very
+# psql this function exists to sanitise — PGOPTIONS, PSQLRC, PGSERVICE, PGSYSCONFDIR, none of which
+# db_application_route_env_refusal covers. That is the wrong-cluster write argued at length above,
+# reached through a check that appeared to run. So the names are captured with their status taken,
+# an empty enumeration is a refusal, and the loop reads text this shell already holds.
+#
+# THE CALLERS TAKE THIS STATUS (`|| return 1`), and a psql that does not run is the correct answer
+# to "which PG* variables must be removed" going unanswered.
 libpq_env_unset_args() {
   local -n _out="$1"
-  local var
+  local var names
   _out=()
+  names="$(compgen -e)" || return 1
+  [[ -n "${names}" ]] || return 1
   while IFS= read -r var; do
     case "${var}" in
       PG*|PSQL*) _out+=(-u "${var}") ;;
     esac
-  done < <(compgen -e)
+  done <<<"${names}"
 }
 
 # WHERE THE LOCAL SUPERUSER CONNECTION GOES, STATED RATHER THAN INHERITED.
@@ -1096,7 +1109,7 @@ db_local_socket_dir() {
 # through pg_endpoint_psql below.
 pg_local_psql() {
   local -a unset_args=()
-  libpq_env_unset_args unset_args
+  libpq_env_unset_args unset_args || return 1
   run_as_user postgres env "${unset_args[@]}" psql \
     -X -w -v ON_ERROR_STOP=1 -v VERBOSITY=verbose \
     -h "$(db_local_socket_dir)" -p "${DB_PORT}" -d postgres "$@"
@@ -1130,7 +1143,7 @@ pg_endpoint_psql() {
   shift 3
   local -a unset_args=() keep=() route=()
   local i=0
-  libpq_env_unset_args unset_args
+  libpq_env_unset_args unset_args || return 1
   # THE PIN, AS TWO libpq SETTINGS AND NOT ONE. `sslmode` decides TLS; `gssencmode` decides GSSAPI
   # encryption, defaults to `prefer` wherever libpq was built with GSSAPI, and a connection that
   # takes it is matched by `hostgssenc` records — a third transport, and one the reader never

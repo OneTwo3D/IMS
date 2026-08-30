@@ -2740,9 +2740,17 @@ require_fenceable_database() {
     # or when IMS_FENCE_ARTEFACT_SHA256 authenticates the candidate. Otherwise
     # ${DB_FENCE_PROBE_SCRIPT} is empty, and this run preflights nothing rather than handing an
     # administrative credential to bytes the application account chose.
-    local probe_rc=0 probe_line
+    # THE REPORT IS CAPTURED, NOT PROCESS-SUBSTITUTED (o3d-p9dq, Codex r33). db_fence_probe_report
+    # only ever prints, but a producer nobody can take a status from is a shape this subsystem no
+    # longer carries anywhere: `$( … )` gives this shell the status, and the `warn` loop then reads
+    # from text it already holds rather than from a writer that could stop mid-report.
+    local probe_rc=0 probe_line probe_report=""
     db_fence_probe_script || probe_rc=1
-    while IFS= read -r probe_line; do warn "${probe_line}"; done < <(db_fence_probe_report)
+    probe_report="$(db_fence_probe_report)" || probe_report=""
+    while IFS= read -r probe_line; do
+      [[ -n "${probe_line}" ]] || continue
+      warn "${probe_line}"
+    done <<<"${probe_report}"
 
     if [[ -z "${DEPLOY_ADMIN_DATABASE_URL}" ]] || { [[ ! -f "${DB_FENCE_SCRIPT}" ]] && [[ ! -f "${DB_FENCE_SCRIPT_COPY}" ]]; } || [[ ! -f "${DB_OBJECT_ACCESS_SCRIPT}" ]]; then
       db_fence_probe_cleanup
