@@ -864,3 +864,47 @@ test('the Gross Margin CSV carries the credit that reached no product row, with 
   // And the basis notice still travels with it: three amounts mean nothing without the sentence.
   assert.match(body, /# refundTreatment,/)
 })
+
+test('every total all six sales-analytics reports emit has an empty-state fallback and reaches its CSV metadata (o3d-kyey)', async () => {
+  /**
+   * The same gap as the one above, found in the other consumer of a producer's totals: the page's
+   * `salesAnalyticsEmptyTotals` is a hand-kept map used when a source scan is refused, and it had
+   * drifted from the producer within this branch. Both consumers are now checked from the
+   * producer's own key set, and over EVERY export the route can produce rather than the three this
+   * change happened to touch — a subset is how a hand-kept list rots in the first place.
+   *
+   * Empty fixtures on purpose: `totals` is constructed unconditionally, so an empty report still
+   * states the full shape, and no fixture can quietly narrow what is compared.
+   */
+  const { salesAnalyticsEmptyTotals } = await import('@/app/(dashboard)/analytics/_components/sales-analytics-page-utils')
+  const {
+    getFulfillmentAnalyticsReport, getReturnsAnalyticsReport, getThroughputAnalyticsReport,
+  } = await import('@/lib/domain/sales/sales-fulfillment-analytics')
+  const deps = { client: baseClient(), now: NOW }
+
+  const reports: Array<[string, keyof typeof salesAnalyticsEmptyTotals, { rows: Record<string, unknown>[]; totals: Record<string, string> }]> = [
+    ['sales', 'sales', await getSalesAnalyticsReport(WINDOW, deps)],
+    ['customers', 'customers', await getCustomerAnalyticsReport(WINDOW, deps)],
+    ['margin', 'margin', await getMarginAnalyticsReport(WINDOW, deps)],
+    ['returns', 'returns', await getReturnsAnalyticsReport(WINDOW, deps)],
+    ['fulfillment', 'fulfillment', await getFulfillmentAnalyticsReport(WINDOW, deps)],
+    ['throughput', 'throughput', await getThroughputAnalyticsReport(WINDOW, deps)],
+  ]
+  // The route can produce exactly these six, so the sweep is total rather than a chosen subset.
+  const { SALES_ANALYTICS_EXPORTS } = await import('@/app/api/export/sales-analytics/route')
+  assert.deepEqual(reports.map(([type]) => type).sort(), Object.keys(SALES_ANALYTICS_EXPORTS).sort())
+
+  const missing: string[] = []
+  for (const [reportType, emptyKey, report] of reports) {
+    const keys = Object.keys(report.totals)
+    // Not a vacuous sweep: every one of these reports really does publish totals.
+    assert.ok(keys.length >= 2, `${reportType}: the producer returned near-empty totals`)
+    const fallback = salesAnalyticsEmptyTotals[emptyKey] as Record<string, string>
+    const body = await exportedCsv(reportType, report)
+    for (const key of keys) {
+      if (!(key in fallback)) missing.push(`${reportType}: total ${key} has no empty-state fallback`)
+      if (!body.includes(`\r\n# totals.${key},`)) missing.push(`${reportType}: total ${key} is nowhere in the exported file`)
+    }
+  }
+  assert.deepEqual(missing, [], 'A producer total is missing from a consumer that keeps its own list of them.')
+})
