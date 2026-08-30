@@ -1567,12 +1567,25 @@ bus_unit_object() {
 # assignments", and an assignment removes ONLY that exact pair — `UnsetEnvironment=PGSSLMODE=require`
 # leaves `PGSSLMODE=no-verify` standing. A bare name removes the variable whatever its value.
 unit_route_env_guaranteed() {
-  local unit="${1:-}" rendering count name element found
+  local unit="${1:-}" rendering count name element found route_names
   bus_unit_object "$unit" || return 1
   rendering="$(bus_unit_property "$BUS_UNIT_OBJECT" Service UnsetEnvironment)" || rendering=''
   if ! count="$(bus_array_count "$rendering" 'as')" || ! bus_read_strings "$rendering" \
     || [[ "${#BUS_STRINGS[@]}" -ne "$count" ]]; then
     ENV_ROUTE_GUARANTEE_REASON="systemd would not answer readably for ${unit}'s UnsetEnvironment=, so whether the transport variables are removed from the service's environment at exec is unknown"
+    return 1
+  fi
+  # CAPTURED AND CHECKED, NOT PROCESS-SUBSTITUTED (o3d-p9dq, Codex r32 CRITICAL, the sweep).
+  # `done < <(db_route_env_variables)` reads its producer's status NOWHERE — not this shell's, not
+  # the loop's — so a producer that emitted nothing made this loop run NOUGHT times and the
+  # function return 0, which is the word "guaranteed" for a guarantee nobody checked. A capture
+  # has a status, and this takes it; the here-string then feeds the same bytes to the same loop.
+  route_names="$(db_route_env_variables)" || {
+    ENV_ROUTE_GUARANTEE_REASON="the list of transport variables that must be removed from ${unit}'s environment could not be produced, so nothing has established that systemd removes any of them — and an empty list is not a guarantee, it is the absence of one"
+    return 1
+  }
+  if [[ -z "${route_names}" ]]; then
+    ENV_ROUTE_GUARANTEE_REASON="the list of transport variables that must be removed from ${unit}'s environment came back EMPTY, so this check would have examined nothing and returned success. That is not a guarantee"
     return 1
   fi
   local -a unset_names=()
@@ -1592,7 +1605,7 @@ unit_route_env_guaranteed() {
       ENV_ROUTE_GUARANTEE_REASON="${unit}'s loaded configuration does not list ${name} as a bare name in UnsetEnvironment= (systemd composes it as: ${unset_names[*]:-nothing at all}), so systemd does not remove it from the service's environment at exec — and ${name} reaching the application means $(db_route_env_effect "${name}"). The ${DB_ROUTE_DROPIN_NAME} drop-in this installer writes states exactly that directive; a later drop-in whose own UnsetEnvironment= is EMPTY resets the list and is the usual cause"
       return 1
     fi
-  done < <(db_route_env_variables)
+  done <<< "${route_names}"
   return 0
 }
 
@@ -1675,7 +1688,17 @@ db_service_execstart_expected() {
 # NOTHING HERE WRITES ANYTHING: three environment reads and, in `service` mode, two `busctl`
 # get-property calls.
 db_application_route_env_refusal() {
-  local mode="${1:-installer}" name
+  local mode="${1:-installer}" name route_names
+  # THE SAME CAPTURE, FOR THE SAME REASON (o3d-p9dq, Codex r32 CRITICAL, the sweep). An empty list
+  # here read as "none of the three is set in this process" — a refusal that examined nothing.
+  route_names="$(db_route_env_variables)" || {
+    printf 'the list of transport environment variables this gate must refuse could not be produced, so nothing has been examined. An empty list is not a clean environment'
+    return 1
+  }
+  if [[ -z "${route_names}" ]]; then
+    printf 'the list of transport environment variables this gate must refuse came back EMPTY, so this check would have examined nothing and passed. An empty list is not a clean environment'
+    return 1
+  fi
   while IFS= read -r name; do
     # THIS PROCESS. Not a proxy for the service's environment — a source in its own right, and the
     # one source no unit directive can close. The MIGRATION, the BUILD and
@@ -1686,7 +1709,7 @@ db_application_route_env_refusal() {
         "${name}" "${!name}" "$(db_route_env_effect "${name}")" "${name}" "$(db_route_env_alternative "${name}")"
       return 1
     fi
-  done < <(db_route_env_variables)
+  done <<< "${route_names}"
   # THE MODE IS ENUMERATED, NOT DEFAULTED PAST. `|| return 0` on a `== "service"` test would make
   # every misspelling of the stricter mode silently take the weaker one — a start gate that
   # checked nothing, and looked exactly like one that passed.
@@ -1699,8 +1722,16 @@ db_application_route_env_refusal() {
     printf '%s' "${ENV_ROUTE_GUARANTEE_REASON}"
     return 1
   fi
+  # AND THE SAME AGAIN (o3d-p9dq, Codex r32 CRITICAL, the sweep). A truncated producer here would
+  # have failed CLOSED — a short expectation cannot equal the composed ExecStart — but it would
+  # have blamed the unit for a list this script failed to produce, and the status is free to take.
   local -a expected_execstart=()
-  mapfile -t expected_execstart < <(db_service_execstart_expected)
+  local execstart_expected
+  execstart_expected="$(db_service_execstart_expected)" || {
+    printf 'the ExecStart this installer writes could not be composed, so there is nothing to compare %s.service against. That is a failure of this script, not a property of the unit' "${APP_NAME}"
+    return 1
+  }
+  mapfile -t expected_execstart <<< "${execstart_expected}"
   if ! unit_execstart_is_exactly "${APP_NAME}.service" ${expected_execstart[@]+"${expected_execstart[@]}"}; then
     printf '%s' "${UNIT_EXECSTART_REASON}"
     return 1

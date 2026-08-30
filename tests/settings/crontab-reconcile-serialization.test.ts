@@ -4799,6 +4799,354 @@ test('[o3d-batch-ret] the drain proof refuses an UNCOUNTABLE census, because bas
 })
 
 // ---------------------------------------------------------------------------
+// Codex r32 CRITICAL — THE SENTINEL PROVES `awk` FINISHED, NOT THAT `awk` SAW EVERYTHING
+//
+// Round 31 gave the subsequence check a COMPLETION SENTINEL, and it was the right idea aimed at
+// the wrong endpoint. The sentinel establishes that the computation reached its END block. It
+// cannot establish that the computation's INPUT was complete — and both inputs arrived through
+// process substitutions, whose producers report to nobody: not to `awk`, which sees a file that
+// ended rather than a writer that failed, and not to the shell, which never waits for them.
+//
+// So a backup-side `printf` that died after part of its output handed `awk` a TRUNCATED backup.
+// `awk` compared what it was given, found nothing of it missing, printed the sentinel and exited
+// 0 — and every check in this file passed. The merge was approved as lossless, installed, and
+// ${CRON_BACKUP} — the only copy of the line it had just dropped — was deleted.
+//
+// The fix writes both inputs to separately created temporary files, takes each write's status AND
+// reads each file back to count it, and only then invokes `awk`. The sentinel stays: it proves a
+// different thing, and now both ends are covered.
+//
+// WHAT THESE PIN, and the route each takes:
+//   1. LOAD-BEARING. A producer that DIES AFTER PARTIAL OUTPUT makes the comparison refuse, leaves
+//      the crontab exactly as it is, and keeps the backup — in all three entrypoints
+//        (unfence_cron -> with_crontab_lock -> unfence_cron_locked -> plan_crontab_unfence
+//         -> run_crontab_missing_comparison -> crontab_unmanaged_lines_missing_from
+//         -> crontab_publish_comparison_input, the WRITE STATUS)
+//   2. LOAD-BEARING. A producer that truncates and reports SUCCESS is refused too
+//        (… -> crontab_publish_comparison_input, the READ-BACK LINE COUNT)
+//   3. LOAD-BEARING. A producer that fails having written everything is refused as well, so the
+//      status check is not merely the line count in disguise    (the WRITE STATUS, on its own)
+//   4. MUTATION. The process-substituted comparison approves the merge over a backup it never read
+//      in full, installs it, and deletes the backup
+//   5. MUTATION. Each of the two checks removed on its own still loses the line
+//   6. LOAD-BEARING, THE OTHER DIRECTION. A genuinely complete comparison still merges
+//   7. LOAD-BEARING. Both temporary files are removed on EVERY path, refusals included, and the
+//      ledger proves they were created in the first place
+// ---------------------------------------------------------------------------
+
+/**
+ * A crontab whose second line the merge would drop: the operator's job was deleted while the fence
+ * was up, so the candidate cannot match it and the comparison must refuse and NAME it. Truncate
+ * the backup before `awk` sees it and that line stops existing as far as the check is concerned.
+ */
+const TRUNC_BACKUP = '# an operator comment the cutover must put back\n*/5 * * * * /usr/bin/operator-only\n'
+const TRUNC_BACKUP_TEXT = TRUNC_BACKUP.replace(/\n$/, '')
+const TRUNC_LIVE = '# an operator comment the cutover must put back'
+
+/**
+ * A REAL PRODUCER THAT DIES, not an argument that one might. It replaces `printf` — the shipped
+ * producer — for the ONE call that writes the backup, matched on the text itself so every other
+ * `printf` in the library and the entrypoint is untouched. Three shapes, because the two checks
+ * catch different failures:
+ *
+ *   partial-then-fail   what a killed or ENOSPC producer looks like: some output, non-zero status
+ *   partial-then-ok     the short write reported as success — a close(2) error, a producer killed
+ *                       between its last write and its exit — which no status can catch
+ *   whole-then-fail     everything written, non-zero status, which no line count can catch
+ */
+type ProducerFault = 'partial-then-fail' | 'partial-then-ok' | 'whole-then-fail'
+function truncatingProducer(fault: ProducerFault, target = TRUNC_BACKUP_TEXT): string {
+  const partial = fault !== 'whole-then-fail'
+  const rc = fault === 'partial-then-ok' ? 0 : 1
+  return [
+    `__TRUNC_TARGET=$(cat <<'TRUNC_EOF'`,
+    target,
+    'TRUNC_EOF',
+    ')',
+    'printf(){',
+    `  if [ "$1" = '%s\\n' ] && [ "$#" -eq 2 ] && [ "$2" = "$__TRUNC_TARGET" ]; then`,
+    partial
+      ? '    builtin printf \'%s\\n\' "${__TRUNC_TARGET%%$\'\\n\'*}"'
+      : '    builtin printf \'%s\\n\' "$__TRUNC_TARGET"',
+    `    return ${rc}`,
+    '  fi',
+    '  builtin printf "$@"',
+    '}',
+  ].join('\n')
+}
+
+/** The library with round 31's PROCESS SUBSTITUTIONS put back — the route, run rather than described. */
+const preFixComparisonLib = () => libraryWith([
+  [`  local backup="$1" candidate="$2" cand_file back_file out rc=0
+
+  # SEPARATELY CREATED, and each creation checked: \`mktemp\` picks a name nothing else holds, so two
+  # runs racing each other cannot read one another's inputs. The second failing cleans up the first
+  # — there is no path out of this function that leaves either file behind.
+  cand_file="$(mktemp "\${TMPDIR:-/tmp}/ims-crontab-cand.XXXXXX" 2>/dev/null)" || return 1
+  back_file="$(mktemp "\${TMPDIR:-/tmp}/ims-crontab-back.XXXXXX" 2>/dev/null)" || {
+    rm -f "\${cand_file}"
+    return 1
+  }
+
+  # BEFORE \`awk\` RUNS AT ALL. A failed write is a refusal here and not a discovery afterwards:
+  # there is no answer from an incomplete input that this function is willing to hand back, and an
+  # answer it does hand back gets a crontab installed and a backup deleted.
+  if ! crontab_publish_comparison_input "\${candidate}" "\${cand_file}" \\
+     || ! crontab_publish_comparison_input "\${backup}" "\${back_file}"; then
+    rm -f "\${cand_file}" "\${back_file}"
+    return 1
+  fi
+
+  out="$(awk`,
+   `  local backup="$1" candidate="$2" out rc=0
+  out="$(awk`],
+  [`  ' "\${cand_file}" "\${back_file}")" || rc=$?
+  # REMOVED ON EVERY PATH FROM HERE ON, including both refusals below, and before any of them can
+  # return. A \`trap\` would be the other way to say this, but this file is SOURCED by three
+  # entrypoints and an EXIT trap set here would displace theirs.
+  rm -f "\${cand_file}" "\${back_file}"`,
+   `  ' <(printf '%s\\n' "\${candidate}") <(printf '%s\\n' "\${backup}"))" || rc=$?`],
+])
+
+/** Only the write STATUS check removed. */
+const noWriteStatusLib = () => libraryWith([[
+  `  printf '%s\\n' "\${text}" > "\${path}" || return 1`,
+  `  printf '%s\\n' "\${text}" > "\${path}" || :`]])
+
+/** Only the READ-BACK LINE COUNT removed. */
+const noReadBackLib = () => libraryWith([[
+  `  if [[ "\${got}" -ne "\${want}" ]]; then return 1; fi`,
+  '  :']])
+
+/** Put the fixture on disk: a fenced crontab that LOST the operator job, and the backup holding it. */
+function seedTruncationFixture(): void {
+  writeFileSync(FAULT_CRONTAB, TRUNC_LIVE)
+  writeFileSync(FAULT_BACKUP, TRUNC_BACKUP)
+}
+
+for (const [where, src] of FAULT_ENTRYPOINTS) {
+  test(`[o3d-batch-ret] ${where}: a comparison input that arrived TRUNCATED refuses, leaves the crontab as it is, and keeps the backup`, async () => {
+    seedTruncationFixture()
+
+    const run = await sh(faultProgram(where, src,
+      `${truncatingProducer('partial-then-fail')}\nCRON_FENCED=true\nunfence_cron\necho UNFENCE_RETURNED`,
+      { functions: ['unfence_cron_locked', 'unfence_cron'], mutate: withErrexit }))
+
+    assert.equal(run.code, 9,
+      `a comparison made over an input that never arrived in full must stop the run:\n${run.stdout}${run.stderr}`)
+    assert.doesNotMatch(run.stdout, /UNFENCE_RETURNED/, run.stdout)
+    assert.match(run.stderr, /could not COMPUTE what to put back/,
+      `and it must say the computation failed rather than blame an operator write:\n${run.stderr}`)
+
+    // THE LOAD-BEARING HALF. The crontab is exactly as the fence left it — not merged, not emptied.
+    assert.equal(faultCrontabText(), TRUNC_LIVE,
+      'a comparison that did not see the whole backup must install NOTHING')
+
+    // AND THE BACKUP SURVIVES. It is the only copy of the line the merge would have dropped.
+    assert.ok(existsSync(FAULT_BACKUP),
+      'the backup must survive a comparison whose input was never whole')
+    assert.equal(readFileSync(FAULT_BACKUP, 'utf8'), TRUNC_BACKUP)
+
+    // …and the body returns the COMPUTATION status, distinct from a divergence (76) and a rejected
+    // write (77), so the entrypoint prints the recovery that fits.
+    const observed = await sh(faultProgram(where, src,
+      [truncatingProducer('partial-then-fail'), 'CRON_FENCED=true', 'rc=0',
+        'with_crontab_lock unfence_cron_locked || rc=$?',
+        'echo "RC=$rc"', 'echo "PLAN=$CRON_UNFENCE_PLAN"', 'echo "FENCED=$CRON_FENCED"'].join('\n'),
+      { functions: ['unfence_cron_locked'], mutate: withErrexit }))
+    assert.match(observed.stdout, /^RC=78$/m,
+      `${observed.stdout}${observed.stderr}`)
+    assert.match(observed.stdout, /^PLAN=refuse$/m, observed.stdout)
+    assert.match(observed.stdout, /^FENCED=true$/m,
+      `the fence flag must not be cleared while the crontab is still fenced:\n${observed.stdout}`)
+  })
+}
+
+test('[o3d-batch-ret] a producer that TRUNCATES and reports SUCCESS is refused, because a status is not a proof the input was whole', async () => {
+  seedTruncationFixture()
+
+  // CONTROL, and the reason this test is not about a function that refuses everything: with the
+  // producer intact the comparison RUNS, finds the operator job missing from the candidate, and
+  // refuses by NAMING it — a divergence (76), not a failed computation (78).
+  const control = await sh(faultProgram('scripts/deploy.sh', DEPLOY_SH,
+    ['CRON_FENCED=true', 'rc=0', 'with_crontab_lock unfence_cron_locked || rc=$?',
+      'echo "RC=$rc"', 'echo "PLAN=$CRON_UNFENCE_PLAN"', 'echo "WHY=$CRON_UNFENCE_REASON"'].join('\n'),
+    { functions: ['unfence_cron_locked'], mutate: withErrexit }))
+  assert.match(control.stdout, /^RC=76$/m,
+    `the comparison must run and find the loss when its input is whole:\n${control.stdout}${control.stderr}`)
+  assert.match(control.stdout, /operator-only/,
+    `and name the line the merge would drop:\n${control.stdout}`)
+
+  // THE PROPERTY. The producer wrote part of its output and exited 0 — the short write reported as
+  // success, which the status cannot catch. The read-back count can, and does.
+  for (const fault of ['partial-then-ok', 'whole-then-fail'] as ProducerFault[]) {
+    seedTruncationFixture()
+    const run = await sh(faultProgram('scripts/deploy.sh', DEPLOY_SH,
+      [truncatingProducer(fault), 'CRON_FENCED=true', 'rc=0',
+        'with_crontab_lock unfence_cron_locked || rc=$?',
+        'echo "RC=$rc"', 'echo "PLAN=$CRON_UNFENCE_PLAN"'].join('\n'),
+      { functions: ['unfence_cron_locked'], mutate: withErrexit }))
+    assert.match(run.stdout, /^RC=78$/m,
+      `a ${fault} producer must not be read as a comparison that ran:\n${run.stdout}${run.stderr}`)
+    assert.match(run.stdout, /^PLAN=refuse$/m, run.stdout)
+    assert.ok(existsSync(FAULT_BACKUP), `the backup must survive a ${fault} producer`)
+    assert.equal(faultCrontabText(), TRUNC_LIVE, `and nothing may be installed after a ${fault} producer`)
+  }
+})
+
+test('[o3d-batch-ret] MUTATION: the process-substituted comparison merges over a backup it never read, and deletes it', async () => {
+  // THE ROUTE, RUN. Round 31's two `<(printf …)` inputs put back, under a REAL `set -euo pipefail`,
+  // called the way the shipped code calls them — through `with_crontab_lock`, whose `|| rc=$?` is
+  // what suspends errexit. The producer dies after one of the backup's two lines.
+  seedTruncationFixture()
+  const run = await sh(faultProgram('scripts/deploy.sh', DEPLOY_SH,
+    [truncatingProducer('partial-then-fail'), 'CRON_FENCED=true', 'rc=0',
+      'with_crontab_lock unfence_cron_locked || rc=$?',
+      'echo "RC=$rc"', 'echo "PLAN=$CRON_UNFENCE_PLAN"', 'echo "FENCED=$CRON_FENCED"'].join('\n'),
+    { functions: ['unfence_cron_locked'], mutate: withErrexit, lib: preFixComparisonLib() }))
+
+  assert.match(run.stdout, /^RC=0$/m,
+    `THE FINDING: a comparison that never saw the whole backup returns SUCCESS:\n${run.stdout}${run.stderr}`)
+  assert.match(run.stdout, /^PLAN=merge$/m,
+    'THE FINDING: and the merge is approved as lossless')
+  assert.doesNotMatch(faultCrontabText(), /operator-only/,
+    'THE LOSS: the operator job is gone from the crontab this installed')
+  assert.ok(!existsSync(FAULT_BACKUP),
+    'AND THE ONLY OTHER COPY IS GONE: the backup holding that line was deleted on the strength of it')
+  assert.match(run.stdout, /^FENCED=false$/m, run.stdout)
+
+  // THE READ-BACK COUNT, ON ITS OWN. A producer that truncated and reported SUCCESS is the shape
+  // no status can catch, and removing the count alone puts the loss straight back.
+  seedTruncationFixture()
+  const noCount = await sh(faultProgram('scripts/deploy.sh', DEPLOY_SH,
+    [truncatingProducer('partial-then-ok'), 'CRON_FENCED=true', 'rc=0',
+      'with_crontab_lock unfence_cron_locked || rc=$?',
+      'echo "RC=$rc"', 'echo "PLAN=$CRON_UNFENCE_PLAN"'].join('\n'),
+    { functions: ['unfence_cron_locked'], mutate: withErrexit, lib: noReadBackLib() }))
+  assert.match(noCount.stdout, /^PLAN=merge$/m,
+    `without the read-back line count the silently truncated input is merged:\n${noCount.stdout}${noCount.stderr}`)
+  assert.doesNotMatch(faultCrontabText(), /operator-only/,
+    'and the operator job is lost without the read-back line count')
+  assert.ok(!existsSync(FAULT_BACKUP), 'and its only other copy is deleted')
+
+  // THE WRITE STATUS, ON ITS OWN, AND WHAT IT IS ACTUALLY FOR. It is NOT a second line count —
+  // pair it with a producer whose output was complete and it changes no answer. What it buys is
+  // requirement one: a failed write ABORTS THE COMPARISON rather than being discovered after it.
+  // Shipped, a `whole-then-fail` producer refuses with 78, having compared nothing. With the check
+  // removed, the same producer's failure is invisible and awk runs on its output — a different
+  // answer (76) from a comparison that should never have been attempted. Stated this way because
+  // "both checks stop the loss" would have been the easy claim and it is not true.
+  seedTruncationFixture()
+  const noStatus = await sh(faultProgram('scripts/deploy.sh', DEPLOY_SH,
+    [truncatingProducer('whole-then-fail'), 'CRON_FENCED=true', 'rc=0',
+      'with_crontab_lock unfence_cron_locked || rc=$?',
+      'echo "RC=$rc"', 'echo "PLAN=$CRON_UNFENCE_PLAN"'].join('\n'),
+    { functions: ['unfence_cron_locked'], mutate: withErrexit, lib: noWriteStatusLib() }))
+  assert.match(noStatus.stdout, /^RC=76$/m,
+    `THE FINDING: without the write status a producer that FAILED is compared anyway:\n${noStatus.stdout}${noStatus.stderr}`)
+})
+
+test('[o3d-batch-ret] a COMPLETE comparison still merges, and both temporary files are removed on every path', async () => {
+  const TMP = mkdtempSync(join(HARNESS, 'cmp-tmp-'))
+  const LEDGER = join(TMP, 'ledger')
+
+  // EVERY `mktemp` THIS FUNCTION TAKES IS RECORDED, so "the directory is empty afterwards" is a
+  // statement about files that existed rather than about a mechanism that never ran. `fail_at`
+  // makes the Nth creation fail, which is the one refusal path no producer fault can reach.
+  const ledgeredMktemp = (failAt = 0) => [
+    `__LEDGER='${LEDGER}'`,
+    `__MKTEMP_FAIL_AT=${failAt}`,
+    'mktemp(){',
+    // SCOPED TO THE COMPARISON'S OWN TWO FILES. read_crontab_for and write_crontab_for each take a
+    // temporary file for their diagnostics; ledgering those would make the count below mean
+    // something else, and failing one would test a different function's refusal.
+    '  case "${1:-}" in',
+    '    *ims-crontab-cand.*|*ims-crontab-back.*) ;;',
+    '    *) command mktemp "$@"; return $? ;;',
+    '  esac',
+    // COUNTED FROM THE LEDGER, NOT A VARIABLE. Every one of these calls is inside a command
+    // substitution, so it runs in a SUBSHELL and an incremented variable dies with it — the
+    // append to the ledger is the only part of it the parent ever sees.
+    '  local __p __n',
+    '  __n=$(( $(wc -l < "$__LEDGER") + 1 ))',
+    '  if [ "$__n" -eq "$__MKTEMP_FAIL_AT" ]; then return 1; fi',
+    '  __p="$(command mktemp "$@")" || return 1',
+    '  builtin printf \'%s\\n\' "$__p" >> "$__LEDGER"',
+    '  builtin printf \'%s\\n\' "$__p"',
+    '}',
+  ].join('\n')
+
+  // A LIVE CRONTAB THAT MOVED: the backup's own two lines, still fenced, plus one added while the
+  // fence was up. Nothing of the backup is missing from it, so a comparison that RUNS plans the
+  // merge — which is what makes "and it still merges" a statement about the fix.
+  const MERGEABLE_LIVE = '# an operator comment the cutover must put back\n'
+    + '#DEPLOY-FENCE# */5 * * * * /usr/bin/operator-only\n'
+    + '#DEPLOY-FENCE# 7 * * * * /usr/bin/added-while-fenced'
+
+  const probe = async (label: string, inject: string, opts: { lib?: string; failAt?: number } = {}) => {
+    // RESEEDED EVERY TIME: the merge below installs its result and deletes the backup, so a second
+    // probe against what it left would be asking a different question.
+    writeFileSync(FAULT_CRONTAB, MERGEABLE_LIVE)
+    writeFileSync(FAULT_BACKUP, TRUNC_BACKUP)
+    writeFileSync(LEDGER, '')
+    const run = await sh(faultProgram('scripts/deploy.sh', DEPLOY_SH,
+      [`export TMPDIR='${TMP}'`, ledgeredMktemp(opts.failAt ?? 0), inject,
+        'CRON_FENCED=true', 'rc=0', 'with_crontab_lock unfence_cron_locked || rc=$?',
+        'echo "RC=$rc"', 'echo "PLAN=$CRON_UNFENCE_PLAN"'].join('\n'),
+      { functions: ['unfence_cron_locked'], mutate: withErrexit, lib: opts.lib }))
+    const handedOut = readFileSync(LEDGER, 'utf8').split('\n').filter(Boolean)
+    const survivors = handedOut.filter((p) => existsSync(p))
+    return { label, run, handedOut, survivors }
+  }
+
+  // (1) THE OTHER DIRECTION: a comparison whose inputs both arrive is merged, exactly as before
+  // this round. The fix trades no working case for the failing one.
+  const merged = await probe('a complete comparison', '')
+  assert.match(merged.run.stdout, /^RC=0$/m,
+    `${merged.run.stdout}${merged.run.stderr}`)
+  assert.match(merged.run.stdout, /^PLAN=merge$/m, merged.run.stdout)
+  assert.match(faultCrontabText(), /operator-only/,
+    'and the line the backup holds is in what it installed')
+
+  // NOT VACUOUS: the mechanism really did create two files, and both are gone.
+  assert.equal(merged.handedOut.length, 2,
+    `the comparison must create two temporary files, not ${merged.handedOut.length}`)
+  assert.deepEqual(merged.survivors, [], 'both must be removed on the success path')
+
+  // (2) EVERY REFUSAL PATH, each leaving nothing behind. The two `awk` faults are scoped to the
+  // COMPARISON's invocation — a blanket one breaks the projections first, and the run then refuses
+  // before this function is ever called, which would test nothing about its cleanup.
+  const comparisonAwk = (rc: number) => [
+    'real_awk="$(command -v awk)"',
+    `awk(){ for a in "$@"; do case "$a" in sentinel=*) return ${rc} ;; esac; done; "$real_awk" "$@"; }`,
+  ].join('\n')
+  const refusals = [
+    await probe('the comparison awk failing', comparisonAwk(127)),
+    await probe('the comparison awk silent (no sentinel)', comparisonAwk(0)),
+    await probe('a producer that died part-way', truncatingProducer('partial-then-fail')),
+    await probe('a producer that truncated silently', truncatingProducer('partial-then-ok')),
+  ]
+  for (const { label, run, handedOut, survivors } of refusals) {
+    assert.match(run.stdout, /^RC=78$/m, `${label} must refuse:\n${run.stdout}${run.stderr}`)
+    assert.equal(handedOut.length, 2, `${label}: both files must have been created (${handedOut.length})`)
+    assert.deepEqual(survivors, [], `${label}: a refusal must leave no temporary file behind`)
+  }
+
+  // (3) THE SECOND CREATION FAILING, which is the one path the first file can outlive.
+  const halfCreated = await probe('the second mktemp failing', '', { failAt: 2 })
+  assert.match(halfCreated.run.stdout, /^RC=78$/m,
+    `${halfCreated.run.stdout}${halfCreated.run.stderr}`)
+  assert.equal(halfCreated.handedOut.length, 1,
+    'exactly one file must have been handed out before the failure')
+  assert.deepEqual(halfCreated.survivors, [],
+    'and the one that was created must be removed by the path that could not create the second')
+
+  // (4) THE DIRECTORY ITSELF, which catches anything created by a name this ledger never saw.
+  assert.deepEqual(readdirSync(TMP).filter((n) => n !== 'ledger'), [],
+    `no temporary file may outlive the comparison: ${readdirSync(TMP).join(', ')}`)
+})
+
+// ---------------------------------------------------------------------------
 // 10 — THE REPOSITORY WALK, AND WHAT STOPS THE NEXT UNCHECKED SUBSTITUTION
 //
 // This is the third round in which the same hazard has been found somewhere new: in the wrapper's
@@ -5045,4 +5393,176 @@ test('[o3d-batch-ret] the unchecked-substitution rule can FAIL, on every shape t
     'the closure must not sweep in every function in these files, or its scoping means nothing')
   assert.ok(suspended.size < ALL_SHELL_BODIES.length,
     `the closure (${suspended.size}) must be a subset of all ${ALL_SHELL_BODIES.length} bodies`)
+})
+// ---------------------------------------------------------------------------
+// 11 — THE THIRD PRODUCER SHAPE: PROCESS SUBSTITUTION      (o3d-p9dq, Codex r32)
+//
+// Section 10 pins every COMMAND substitution in an errexit-suspended body. A command substitution
+// has a status; errexit suspension merely throws it away, so "take the status" is a real fix and
+// the roster there is for the few where the failure is already a refusal.
+//
+// A PROCESS SUBSTITUTION HAS NO STATUS TO TAKE. `<(cmd)` forks a producer whose exit is reported
+// to nobody: not to the reader, which sees a file that ended rather than a writer that failed; not
+// to `$?`, which never carries it; and not to errexit, suspended or otherwise. There is therefore
+// no "checked" form of one, and the rule below has no such category. That is why round 31's
+// completion sentinel — a check on the CONSUMER — could not see round 32's finding at all.
+//
+// TWO TIERS, because the consequence differs:
+//
+//   TIER 1  the crontab/fence subsystem's errexit-suspended closure carries NONE. Not one, not on
+//           a roster. These are the functions that decide what crontab to install and whether to
+//           delete the only backup of the one they are replacing, and an input nobody can vouch
+//           for has no place in that decision. Every one of them can be written as a checked
+//           capture into a here-string or a temporary file, and now is.
+//   TIER 2  everywhere else in the shipped shell files, each one is on the roster with the reason
+//           its producer failing is not a decision made on nothing. A new one fails this test
+//           until somebody has written that reason down.
+// ---------------------------------------------------------------------------
+
+const DB_FENCE_LIB = 'scripts/lib/db-fence-protected.sh'
+const DB_FENCE_LIB_SRC = readFileSync(join(REPO_ROOT, DB_FENCE_LIB), 'utf8')
+
+/** The shipped shell files, including the fence library the three entrypoints source. */
+const ALL_SHELL_SOURCES: Array<[string, string]> = [...SHELL_FILES, [DB_FENCE_LIB, DB_FENCE_LIB_SRC]]
+
+/**
+ * Every process substitution in <lines>. Comments are skipped, and `$(` is not one of these — it
+ * is a command substitution, which section 10 owns.
+ */
+function processSubstitutionsIn(label: string, lines: string[]): string[] {
+  const found: string[] = []
+  for (const line of lines) {
+    if (/^\s*#/.test(line)) continue
+    if (!/(^|[^$])[<>]\(/.test(line)) continue
+    found.push(`${label}» ${line.trim()}`)
+  }
+  return found
+}
+
+/**
+ * THE ROSTER, and what each entry is claiming. Every one of these producers can fail, and the
+ * reason says what happens when it does — in the same terms the finding was written in: does an
+ * incomplete answer get something INSTALLED or DELETED, and does emptiness read as a PASS?
+ */
+const PROCESS_SUBSTITUTIONS_JUSTIFIED: Record<string, string> = {
+  // DIAGNOSTIC TEXT, and nothing else. The decision on this path is `db_fence_probe_script ||
+  // probe_rc=1`, taken on its own line above with its own status. A report that stopped part-way
+  // costs the operator warning lines; it cannot change what this run does.
+  'scripts/deploy.sh» while IFS= read -r probe_line; do warn "$probe_line"; done < <(db_fence_probe_report)':
+    'warning text; the decision on this path is taken from db_fence_probe_script\'s own status',
+  'scripts/update.sh» while IFS= read -r probe_line; do warn "${probe_line}"; done < <(db_fence_probe_report)':
+    'warning text; the decision on this path is taken from db_fence_probe_script\'s own status',
+  'scripts/lib/db-fence-protected.sh» while IFS= read -r line; do printf \'%s\\n\' "${line}"; done < <(db_fence_probe_report)':
+    'the report re-emitted for a caller to print; it decides nothing',
+
+  // THE UNIT LIST, and the one case that matters fails CLOSED. A `systemctl list-units` that
+  // stopped part-way can only DROP units, and dropping the one that serves ${APP_DIR_REAL} leaves
+  // SERVICE_UNITS empty — which every migrating path refuses outright, before anything is stopped
+  // ("No systemd unit serves …, so the predecessor cannot be fenced against a reboot"). A run that
+  // still finds its own unit has the answer it needed.
+  'scripts/deploy.sh» done < <(systemctl list-units --type=service --all --plain --no-legend --no-pager 2>/dev/null | awk \'{print $1}\')':
+    'a truncated list can only drop units, and an empty one refuses the migrating deploy before anything is stopped',
+  'scripts/deploy.sh» mapfile -t SERVICE_UNITS < <(detect_service_units)':
+    'same producer, same refusal: an empty SERVICE_UNITS is a die, not a default',
+
+  // THIS PROCESS\'S OWN ENVIRONMENT, enumerated by a shell BUILTIN in a subshell that opens no
+  // file and executes nothing. It has no partial-output failure mode that leaves the parent
+  // running, and the transport variables it exists to strip are separately REFUSED outright by
+  // db_application_route_env_refusal, which reads them from this process directly.
+  'scripts/install.sh» done < <(compgen -e)':
+    'a builtin over this process\'s own environment; the transport variables are separately refused',
+
+  // A PREFILTER FOR A DELETE LOOP, and the loop re-hashes every candidate before removing it. A
+  // `find` that stopped part-way offers FEWER files, so the failure direction is keeping a
+  // superseded CA generation — never deleting one this run cannot account for.
+  'scripts/install.sh» done < <(find "${DB_CA_PUBLISH_DIR}" -maxdepth 1 -type f \\':
+    'a prefilter for a deletion; a short list deletes fewer files, never more',
+
+  // EXTRA PROBE CANDIDATES, seeded with `postgres` before the loop runs and already written with
+  // `|| true`. A short list costs connection attempts the rotation would have made; it cannot make
+  // one it should not have.
+  'scripts/install.sh» done < <(db_connectable_databases_except_app || true)':
+    'an additive candidate list seeded with postgres; a short list probes fewer endpoints',
+
+  // THE POST-MIGRATION VERIFICATION SET. This one is a genuine selection, and the honest statement
+  // is what it can and cannot do: it installs nothing and deletes nothing, the count it found is
+  // PRINTED, and a set that came back empty prints the warning that says a pass from the hook
+  // would mean nothing was checked. A `find` that stopped part-way is visible in that count.
+  'scripts/deploy.sh» done < <(find "${APP_DIR_REAL}/prisma/migrations" -mindepth 2 -maxdepth 2 -name \'verify.sql\' -type f 2>/dev/null | sort)':
+    'selects which verifications run; installs and deletes nothing, and the count it found is printed',
+}
+
+test('[o3d-batch-ret] the crontab/fence subsystem carries NO process substitution, because nobody can take a producer\'s status', () => {
+  const suspended = errexitSuspendedFunctions()
+
+  // NOT VACUOUS, PART ONE: the same closure section 10 uses, reaching the same functions — so a
+  // walk that has stopped looking fails here rather than reporting a clean set.
+  assert.ok(suspended.size >= 30, `the closure found only ${suspended.size} functions`)
+  for (const required of ['crontab_unmanaged_lines_missing_from', 'crontab_publish_comparison_input',
+    'plan_crontab_unfence', 'run_crontab_missing_comparison', 'unfence_cron_locked']) {
+    assert.ok(suspended.has(required), `${required}() must be inside the walk`)
+  }
+
+  const inside = [...suspended].sort()
+    .flatMap((name) => processSubstitutionsIn(`${BY_NAME.get(name)!.file}:${name}`, BY_NAME.get(name)!.lines))
+  assert.deepEqual(inside, [],
+    'A process substitution has NO status anybody can take. Its producer\'s exit reaches neither '
+    + 'the reader — which sees a file that ended, not a writer that failed — nor `$?`, nor '
+    + 'errexit. So a producer that died after part of its output is indistinguishable here from '
+    + 'one that wrote everything, and that is round 32\'s CRITICAL: a TRUNCATED backup compared '
+    + 'clean, the merge was approved as lossless, and the only copy of the line it dropped was '
+    + 'deleted. These functions decide what crontab to install and whether to delete the backup; '
+    + 'they carry none. Write the producer\'s output into a checked capture and feed it with a '
+    + 'here-string, or into a temporary file whose write status you take, as '
+    + 'crontab_publish_comparison_input does.')
+})
+
+test('[o3d-batch-ret] every other process substitution in the shipped shell files is on the roster with a reason', () => {
+  const found = ALL_SHELL_SOURCES.flatMap(([file, src]) => processSubstitutionsIn(file, src.split('\n')))
+
+  // NOT VACUOUS: the detector is matching real text in the shipped files. An empty `surprises`
+  // below is then a property of the roster and not of a walk that found nothing.
+  assert.ok(found.length >= 8,
+    `the walk found only ${found.length} process substitutions across ${ALL_SHELL_SOURCES.length} files`)
+
+  assert.deepEqual(found.filter((entry) => !(entry in PROCESS_SUBSTITUTIONS_JUSTIFIED)), [],
+    'A process substitution\'s producer reports its failure to nobody, so there is no way to check '
+    + 'one — only to state why an incomplete answer from it is not a decision made on nothing. Say '
+    + 'that here, or capture the producer into a variable whose status you take and feed the '
+    + 'reader with a here-string.')
+
+  // …and the roster may not outlive what it describes: a reason nobody can check against a line
+  // that no longer exists hides the next real finding behind stale text.
+  assert.deepEqual(Object.keys(PROCESS_SUBSTITUTIONS_JUSTIFIED).filter((k) => !found.includes(k)), [],
+    'a roster entry that matches no line in the shipped scripts must be deleted')
+})
+
+test('[o3d-batch-ret] the process-substitution rule can FAIL, on every shape these files could use', () => {
+  // The two empty lists above mean nothing unless the rule that produced them can produce a
+  // non-empty one. Run against lines written to break it, one at a time.
+  const planted = [
+    '  # done < <(producer)          <- a comment must NOT be flagged',                  // 1
+    '  while read -r x; do :; done < <(producer)',                                       // 2  FLAGGED
+    '  mapfile -t out < <(producer)',                                                    // 3  FLAGGED
+    '  diff <(one) <(two) >/dev/null',                                                   // 4  FLAGGED
+    '  tee >(consumer) < "$f"',                                                          // 5  FLAGGED
+    '  x="$(producer)" || return 1',                                                     // 6  a command substitution, section 10\'s
+    '  n=$(( n + 1 ))',                                                                  // 7  arithmetic
+    '  while read -r x; do :; done <<< "$captured"',                                      // 8  the fix
+    '  awk \'{ print }\' "$a" "$b"',                                                        // 9  the other fix
+  ]
+  assert.deepEqual(processSubstitutionsIn('synthetic', planted), [
+    'synthetic» while read -r x; do :; done < <(producer)',
+    'synthetic» mapfile -t out < <(producer)',
+    'synthetic» diff <(one) <(two) >/dev/null',
+    'synthetic» tee >(consumer) < "$f"',
+  ], 'the rule must flag the read loop, the mapfile, both halves of a two-input compare and the '
+   + 'output substitution — and must flag none of the comment, the command substitution section 10 '
+   + 'owns, the arithmetic, or either of the two shapes that replace one')
+
+  // AND IT MUST SEE THEM IN THE REAL FILES, not only in a planted array — the same detector, over
+  // the shipped text, with a known site in it.
+  const real = processSubstitutionsIn('scripts/install.sh', INSTALL_SH.split('\n'))
+  assert.ok(real.some((e) => e.includes('compgen -e')),
+    'the detector must find the known site in the shipped installer')
 })
