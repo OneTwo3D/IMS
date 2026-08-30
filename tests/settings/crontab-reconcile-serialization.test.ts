@@ -3861,3 +3861,43 @@ crontab_unmanaged_lines_missing_from() {
   assert.doesNotMatch(planned.stdout.replace(/^[\s\S]*TEXT<</, ''), /operator-only/,
     'THE LOSS: the text about to be installed no longer holds the operator entry, and the backup is then deleted')
 })
+
+test('[o3d-batch-ret] the shell and TypeScript managed-job signatures are the same bytes', async () => {
+  // The shared awk rule assembles the signature out of pieces so the dollars never look like shell
+  // expansions to the entrypoint scan in tests/scripts/deploy-order.test.ts. That assembly is the
+  // kind of thing that drifts silently — a stray space would make `isRemnant` match nothing, and
+  // every generated line inside a malformed block would then count as an operator entry, so every
+  // reconciliation over such a block would start refusing. It is therefore EVALUATED by a real awk
+  // against the constant the block builder actually emits.
+  //
+  // The subject goes in through the environment and comes back through ENVIRON[], so no quoting
+  // layer between TypeScript, bash and awk can alter the bytes being compared.
+  const { MANAGED_JOB_LINE_SIGNATURE } = await crontabSync()
+  const isRemnant = (subject: string) => sh([
+    'set -uo pipefail',
+    `source '${CRONTAB_LOCK_LIB}'`,
+    "SUBJECT=$(cat <<'S_EOF'",
+    subject,
+    'S_EOF',
+    ')',
+    'export SUBJECT',
+    `awk "\${CRONTAB_MANAGED_BLOCK_AWK}"'BEGIN { if (isRemnant(ENVIRON["SUBJECT"])) print "MATCHES"; else print "DIFFERS" }' </dev/null`,
+  ].join('\n'))
+
+  const generated = await isRemnant(`0 2 * * * curl -s ${MANAGED_JOB_LINE_SIGNATURE}api/cron/backup"`)
+  assert.match(generated.stdout, /MATCHES/,
+    `the shell rule must recognise the exact line the TypeScript builder emits:\n${generated.stdout}${generated.stderr}`)
+
+  // AND NOT VACUOUSLY: a line that does not carry the signature must NOT be recognised, or
+  // `isRemnant` would sweep operator entries out of a malformed block — which is the very loss
+  // this round is closing, reintroduced from the other side.
+  const operator = await isRemnant('17 3 * * * /usr/local/bin/operator-only')
+  assert.match(operator.stdout, /DIFFERS/,
+    `an operator line must not be taken for a generated remnant:\n${operator.stdout}${operator.stderr}`)
+
+  // …and a single altered byte in the signature is enough to stop matching, which is what makes
+  // the equality above a real comparison rather than a substring that happens to be short.
+  const drifted = await isRemnant(`0 2 * * * curl -s ${MANAGED_JOB_LINE_SIGNATURE.replace('Bearer', 'Bearer ')}api/cron/backup"`)
+  assert.match(drifted.stdout, /DIFFERS/,
+    `a drifted signature must stop matching:\n${drifted.stdout}${drifted.stderr}`)
+})

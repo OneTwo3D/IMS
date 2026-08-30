@@ -637,7 +637,13 @@ CRONTAB_MANAGED_BLOCK_AWK='
   function isEnd(x)   { return x ~ /^# --- OTI CRON END ---[ \t\r]*$/ }
   function isBlank(x) { return x ~ /^[[:space:]]*$/ }
   function isRemnant(x,   managed) {
-    managed = "-H \"Authorization: Bearer $CRON_SECRET\" \"$BASE_URL/"   # exact generated job signature (== TS)
+    # The exact generated job signature (== MANAGED_JOB_LINE_SIGNATURE in lib/crontab-sync.ts),
+    # assembled from pieces so that the dollars never form a `$NAME` token. They are awk string
+    # constants inside a single-quoted shell assignment and bash never expands them — but the
+    # entrypoint scan in tests/scripts/deploy-order.test.ts reads this library line by line, and a
+    # bare `$CRON_SECRET` here is indistinguishable to it from a variable the caller must supply.
+    # awk concatenates adjacent constants, so the value is byte-identical to the TypeScript one.
+    managed = "-H \"Authorization: Bearer " "$" "CRON_SECRET\" \"" "$" "BASE_URL/"
     return (index(x, managed) > 0 \
       || x ~ /^# CRON_SECRET is read from .* at runtime/ \
       || x ~ /^# Managed by One Two Inventory/ \
