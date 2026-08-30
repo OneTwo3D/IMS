@@ -8,6 +8,12 @@ import { resolveAccountingEnqueueOrderScope } from '@/lib/domain/accounting/enqu
 import { hasLockedSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 import { stampingCustodyOnCreate } from '@/lib/domain/accounting/money-attempt-provenance'
+import {
+  classifyPriorAttempts,
+  describeUnresolvedPriorAttempt,
+  PRIOR_ATTEMPT_SELECT,
+  priorAttemptsWhere,
+} from '@/lib/domain/accounting/prior-posting-evidence'
 
 export type AccountingSettings = {
   syncEnabled: boolean
@@ -443,20 +449,45 @@ export async function queueAccountingSyncTx(
   })
 
   if (params.idempotencyKey) {
-    const existing = await tx.accountingSyncLog.findFirst({
-      where: {
+    // o3d-d0pd: EVERY prior attempt for this key, in ANY status. Read through `tx`, so this runs
+    // behind the follow-up scope lock taken immediately above and a concurrent enqueue for the same
+    // key cannot slip its row in between this read and the create below. The three-status predicate
+    // this replaced was blind to a FAILED attempt, and so is the partial unique index that would
+    // otherwise have been the backstop. See prior-posting-evidence.ts.
+    const priorAttempts = await tx.accountingSyncLog.findMany({
+      where: priorAttemptsWhere({
+        ...params,
         connector: context.connector,
-        type: params.type,
-        referenceType: params.referenceType,
-        referenceId: params.referenceId,
-        status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
-        payload: { path: ['_idempotencyKey'], equals: params.idempotencyKey },
-      },
-      select: { id: true },
+        idempotencyKey: params.idempotencyKey,
+      }),
+      select: PRIOR_ATTEMPT_SELECT,
     })
+    const verdict = classifyPriorAttempts(priorAttempts)
     // NOTHING IS WRITTEN HERE. `queued: true` means "the work is on the queue", not "this call put
     // it there" — see ConnectorEnqueueOutcome.reason (o3d-ekn8 r4).
-    if (existing) return answer({ queued: true, reason: 'already-queued' }, context.connector)
+    if (verdict.kind === 'live' || verdict.kind === 'posted') {
+      return answer({ queued: true, reason: 'already-queued' }, context.connector)
+    }
+    if (verdict.kind === 'unresolved') {
+      // REFUSED, not decided — the posting is still owed. Written through `tx` so it shares the
+      // caller's fate: a refusal recorded against a transaction that then rolls back would be a
+      // warning about something that did not happen.
+      //
+      // NOT swallowed, unlike the two connector queues' own logs. Those open their own transaction
+      // and a failed log there costs nothing; here a failed statement has already aborted the
+      // CALLER's transaction, and continuing on an aborted transaction turns a refusal the caller
+      // could act on into a commit failure it cannot explain. Let it throw.
+      await tx.activityLog.create({
+        data: {
+          entityType: 'SYSTEM',
+          action: 'accounting_enqueue_refused_unresolved_attempt',
+          tag: 'accounting',
+          level: 'WARNING',
+          description: describeUnresolvedPriorAttempt({ ...params, syncLogId: verdict.syncLogId }),
+        },
+      })
+      return answer({ queued: false, reason: 'refused' }, context.connector)
+    }
   }
 
   try {
