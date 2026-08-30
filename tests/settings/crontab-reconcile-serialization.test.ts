@@ -811,8 +811,18 @@ test('[o3d-batch-ret] every crontab writer in the repository is inside the one e
   // through instead of `crontab -u … -l 2>/dev/null || true`. It is not a read-modify-write — it
   // never writes — and the bodies that do the modify-and-write half call it from inside their own
   // hold. An exemption is a hole unless both of those are asserted, so both are.
+  //
+  // A SECOND EXEMPTION, ON THE SAME TERMS (o3d-p9dq, Codex r30 CRITICAL).
+  // scripts/lib/crontab-lock.sh:write_crontab_for is the shared WRITER all three entrypoints now go
+  // through instead of a bare `printf … | crontab -`. It exists because `with_crontab_lock` runs
+  // its body as `"$@" || rc=$?`, which suspends errexit for every line inside the body — so a
+  // rejected write aborted nothing and the two sites that had no explicit check recorded a fence
+  // that never happened. It never reads, it returns non-zero with a reason instead of relying on an
+  // errexit that is not armed, and every caller of it sits inside a `*_locked` body. All three are
+  // asserted below.
   const SHARED_READER = 'scripts/lib/crontab-lock.sh:read_crontab_for'
-  const unlocked = unlockedCrontabScopesIn(SHELL_ENTRYPOINTS, shellCrontab, [SHARED_READER])
+  const SHARED_WRITER = 'scripts/lib/crontab-lock.sh:write_crontab_for'
+  const unlocked = unlockedCrontabScopesIn(SHELL_ENTRYPOINTS, shellCrontab, [SHARED_READER, SHARED_WRITER])
   assert.deepEqual(unlocked, [],
     'every shell crontab read-modify-write must sit in a `*_locked` body whose only caller is '
     + 'with_crontab_lock. These are not: ' + JSON.stringify(unlocked))
@@ -826,6 +836,35 @@ test('[o3d-batch-ret] every crontab writer in the repository is inside the one e
     'and that invocation must be a READ — a write here would be an unlocked write in a shared library')
   assert.ok(shellCrontab.some((site) => site.file === 'scripts/lib/crontab-lock.sh'),
     'not vacuous: the walk really did reach the shared reader, which is why it needs the exemption')
+
+  // (iii) the second exempted body WRITES and does nothing else — one `crontab` invocation, and it
+  // is the `-` that installs a schedule.
+  const writerBody = shellFunctionFrom(CRONTAB_LOCK_LIB_SRC, 'write_crontab_for', 'scripts/lib/crontab-lock.sh')
+  const writerCalls = writerBody.split('\n').filter((l) => /(^\s*|[|;&({]\s*)crontab\b/.test(l))
+  assert.equal(writerCalls.length, 1,
+    `the shared writer must invoke crontab exactly once: ${JSON.stringify(writerCalls)}`)
+  assert.match(writerCalls[0], /\| crontab -u "\$\{user\}" - /,
+    'and that invocation must be the WRITE — a read here would be a second reader outside the one '
+    + 'that discriminates a failed read from an absent crontab')
+  assert.match(writerBody, /\|\| rc=\$\?/,
+    'and it must take the status itself, because the caller runs with errexit suspended')
+
+  // (iv) …and every caller of it is inside a `*_locked` body, so the modify half and the write half
+  // are still one critical section. This is the half a file-keyed exemption cannot see: moving the
+  // write into a shared helper would otherwise let a NEW caller write from outside the lock while
+  // this census went on reporting nothing unlocked.
+  for (const [entrypoint, entrypointSrc] of SHELL_ENTRYPOINTS) {
+    const lines = entrypointSrc.split('\n')
+    const callers = lines
+      .map((l, i) => [i + 1, l] as [number, string])
+      .filter(([, l]) => !l.trimStart().startsWith('#') && /^\s*write_crontab_for\b/.test(l))
+    assert.ok(callers.length > 0,
+      `${entrypoint} must reach the crontab through the shared writer, or it has grown a second way in`)
+    for (const [at] of callers) {
+      assert.match(enclosingFunctionInSource(lines, at), /_locked$/,
+        `${entrypoint}:${at} writes the crontab from outside a \`*_locked\` body`)
+    }
+  }
 
   // (ii) and every entrypoint that calls it, except the one pure QUERY, does so under the lock.
   const readerScopes = new Set<string>()
@@ -845,17 +884,32 @@ test('[o3d-batch-ret] every crontab writer in the repository is inside the one e
 
   // NOT VACUOUS: the walk found the bodies, in all three entrypoints, and each is where the
   // cutover fence and its unwind actually live.
-  const scopes = new Set(shellCrontab.map((c) => `${c.file}:${enclosingFunctionIn(c.file, c.line)}`))
+  //
+  // ASKED OF THE WRITER CALLS RATHER THAN OF `crontab` ITSELF (o3d-p9dq, Codex r30 CRITICAL). Until
+  // this round each of these bodies invoked the client directly, so the invocation census reached
+  // them. They now go through write_crontab_for, and a check that kept looking for `crontab` in
+  // them would have started passing over an empty set — the walk would still run and still find
+  // nothing to complain about, which is the shape of a guard that has quietly stopped guarding.
+  const writerScopes = new Set<string>()
+  for (const [name, src] of SHELL_ENTRYPOINTS) {
+    const lines = src.split('\n')
+    lines.forEach((line, index) => {
+      if (line.trimStart().startsWith('#') || !/^\s*write_crontab_for\b/.test(line)) return
+      writerScopes.add(`${name}:${enclosingFunctionInSource(lines, index + 1)}`)
+    })
+  }
   for (const file of ['scripts/install.sh', 'scripts/deploy.sh', 'scripts/update.sh']) {
     for (const body of ['fence_cron_locked', 'unfence_cron_locked',
       'restore_cron_from_backup_locked', 'resume_restore_cron_locked']) {
-      assert.ok(scopes.has(`${file}:${body}`),
+      assert.ok(writerScopes.has(`${file}:${body}`),
         `${file} must still perform its crontab read-modify-write in ${body}() — if it was renamed `
         + 'or removed, this census no longer covers it')
     }
   }
-  assert.ok(scopes.has('scripts/install.sh:bootstrap_managed_crontab_block_locked'),
+  assert.ok(writerScopes.has('scripts/install.sh:bootstrap_managed_crontab_block_locked'),
     'the installer must still write its bootstrap block, and inside the lock')
+  assert.deepEqual([...writerScopes].filter((scope) => !scope.endsWith('_locked')), [],
+    'and nothing writes the crontab from outside a `*_locked` body')
   // `adopt_cron_fence_locked` no longer invokes `crontab` itself: it READS through the shared
   // reader and delegates the re-fence to fence_cron (o3d-p9dq, Codex r28). So the census asks what
   // is still true of it — it is a `*_locked` body, with_crontab_lock is its only caller, and the
@@ -995,11 +1049,25 @@ test('[o3d-batch-ret] the census fails on a FIFTEENTH writer, wherever it is put
 
   // CONTROL — the unmutated sources come back clean through the very same two functions, so the
   // three rejections above are the rule working and not a classifier that rejects everything.
-  const clean = SHELL_ENTRYPOINTS.flatMap(([name, src]) => shellCrontabSitesIn(name, src))
-  // Thirteen, not the fifteen of round 27: the installer's bootstrap used to read the crontab
-  // TWICE with the failure suppressed, and both readings are now one call to the shared reader.
-  assert.ok(clean.length >= 12, `the control must reach the real sites (found ${clean.length})`)
-  assert.deepEqual(unlockedCrontabScopesIn(SHELL_ENTRYPOINTS, clean), [])
+  //
+  // AND THE CONTROL MOVED, because the sites did (o3d-p9dq, Codex r30 CRITICAL). Round 29 counted
+  // twelve-plus invocations in the entrypoints; there are now NONE. Every read goes through
+  // read_crontab_for and every write through write_crontab_for, both in the shared library, so the
+  // control has to walk the library too or it would assert over an empty set and pass on anything.
+  const entrypointSites = SHELL_ENTRYPOINTS.flatMap(([name, src]) => shellCrontabSitesIn(name, src))
+  assert.deepEqual(entrypointSites, [],
+    'no entrypoint may invoke the crontab client directly: the reader discriminates a failed read '
+    + 'from an absent crontab, and the writer takes a status the suspended errexit will not take '
+    + `for it. These do: ${JSON.stringify(entrypointSites.map((x) => `${x.file}:${x.line}`))}`)
+
+  const SHELL_SOURCES: Array<[string, string]> = [...SHELL_ENTRYPOINTS,
+    ['scripts/lib/crontab-lock.sh', CRONTAB_LOCK_LIB_SRC]]
+  const clean = SHELL_SOURCES.flatMap(([name, src]) => shellCrontabSitesIn(name, src))
+  assert.equal(clean.length, 2,
+    `the control must reach the real sites — the one reader and the one writer (found ${clean.length}: `
+    + `${JSON.stringify(clean.map((x) => x.text.trim()))})`)
+  assert.deepEqual(unlockedCrontabScopesIn(SHELL_SOURCES, clean,
+    ['scripts/lib/crontab-lock.sh:read_crontab_for', 'scripts/lib/crontab-lock.sh:write_crontab_for']), [])
 })
 
 // ---------------------------------------------------------------------------
@@ -2818,6 +2886,17 @@ if [ "$1" = "-l" ]; then
   esac
 fi
 src="$1"
+# A REJECTED WRITE, in the shape a real client rejects one (o3d-p9dq, Codex r30 CRITICAL): the
+# input is CONSUMED, the diagnostic goes to stderr, NOTHING is installed, and the status is
+# non-zero. Taken off Debian's Vixie crontab client by feeding it a malformed schedule.
+case "\${FAKE_CRONTAB_WRITE:-ok}" in
+  reject)
+    if [ "$src" = "-" ]; then cat > /dev/null; fi
+    echo "crontab: installing new crontab" >&2
+    echo "/tmp/crontab.7Yh2Kf:2: bad minute" >&2
+    echo "errors in crontab file, can't install." >&2
+    exit 1 ;;
+esac
 if [ "$src" = "-" ]; then cat > '${FAULT_CRONTAB}'; else cat "$src" > '${FAULT_CRONTAB}'; fi
 `)
 chmodSync(join(FAULT_BIN, 'crontab'), 0o755)
@@ -3900,4 +3979,460 @@ test('[o3d-batch-ret] the shell and TypeScript managed-job signatures are the sa
   const drifted = await isRemnant(`0 2 * * * curl -s ${MANAGED_JOB_LINE_SIGNATURE.replace('Bearer', 'Bearer ')}api/cron/backup"`)
   assert.match(drifted.stdout, /DIFFERS/,
     `a drifted signature must stop matching:\n${drifted.stdout}${drifted.stderr}`)
+})
+
+// ---------------------------------------------------------------------------
+// Codex r30 CRITICAL — A CRONTAB WRITE THAT WAS REJECTED IS NOT A CRONTAB THAT WAS WRITTEN
+//
+// `with_crontab_lock` invokes its body as `"$@" || rc=$?`, because it needs the body's status to
+// tell a lock conflict from a write failure. A command on the LEFT of `||` runs with errexit
+// SUSPENDED, and bash suspends it for the ENTIRE DYNAMIC EXTENT of that command — every line
+// inside the called function, not merely the call. Round 26's lock wrapper therefore disarmed
+// error propagation inside all fifteen `*_locked` bodies at once, silently, and the two crontab
+// writes that carried no explicit check went from "covered by set -e" to "not covered by
+// anything" with nothing at either site to say so:
+//
+//     printf '%s\n' "$fenced" | crontab -u "$APP_USER" -     <- rejected
+//     CRON_FENCED=true                                       <- recorded as fenced anyway
+//     ok "Cron writers fenced."                              <- and reported
+//
+// and the run then took the database fence and ran the migration against a LIVE schedule. The
+// unfence is the mirror image and is worse: a rejected write was followed by `rm -f "$CRON_BACKUP"`
+// — deleting the only copy of the operator's schedule — and by `CRON_FENCED=false`, which tells the
+// unwind there is nothing left to put back.
+//
+// WHAT THESE PIN, and the route each takes:
+//   1. LOAD-BEARING. A rejected FENCE write aborts BEFORE the database fence and the migration,
+//      with CRON_FENCED still false and the backup still on disk, in all three entrypoints
+//                                     (fence_cron -> with_crontab_lock -> fence_cron_locked)
+//   2. MUTATION. The pre-fix body, run under a REAL `set -euo pipefail`, migrates over the live
+//      schedule — with a CONTROL proving errexit is armed and the WRAPPER is what suspends it
+//   3. LOAD-BEARING. A rejected UNFENCE write keeps the backup and keeps the flag, and the caller
+//      prints the by-hand restore                (unfence_cron -> unfence_cron_locked)
+//   4. MUTATION. The pre-fix body DELETES the backup and reports the crontab restored
+//   5. the repository walk: no `*_locked` body writes the crontab except through the one helper,
+//      every such call takes its status, and the roster of bodies is fixed so a SIXTEENTH cannot
+//      inherit the hazard silently                                    (repository walk)
+// ---------------------------------------------------------------------------
+
+/** The fault program with a REAL `set -euo pipefail`, because the claim is about errexit. */
+const withErrexit = (program: string): string => {
+  assert.equal(program.split('set -uo pipefail').length - 1, 1,
+    'the fault prelude must set its shell options exactly once')
+  return program.replace('set -uo pipefail', 'set -euo pipefail')
+}
+
+/**
+ * Put the pre-fix, UNCHECKED write back at whichever site the assembled prelude holds. Found by
+ * grammar rather than by a per-entrypoint copy of the line, so it works across all three
+ * spellings of ${APP_USER} and cannot silently match nothing.
+ */
+function unchecked(call: string) {
+  return (src: string): string => {
+    const start = src.indexOf('  write_crontab_for ')
+    assert.notEqual(start, -1, 'the prelude must contain a checked write to un-check')
+    assert.equal(src.split('  write_crontab_for ').length - 1, 1,
+      'exactly one checked write must be lifted, or this mutation is ambiguous')
+    const end = src.indexOf('\n  }\n', start)
+    assert.ok(end > start, 'the checked write must be closed by a `  }` on its own line')
+    return src.slice(0, start) + call + src.slice(end + '\n  }'.length)
+  }
+}
+
+const REJECT_WRITE = 'export FAKE_CRONTAB_READ=ok\nexport FAKE_CRONTAB_WRITE=reject'
+const STUB_FSYNC = 'fsync_path(){ return 0; }'
+
+for (const [where, src, user] of FAULT_ENTRYPOINTS) {
+  test(`[o3d-batch-ret] ${where}: a REJECTED fence write aborts before the database fence and the migration`, async () => {
+    writeFileSync(FAULT_CRONTAB, FAULT_ORIGINAL)
+    rmSync(FAULT_BACKUP, { force: true })
+
+    // THE CUTOVER SEQUENCE, in the order deploy.sh runs it. The two echoes stand for the database
+    // fence and `prisma migrate deploy`: if either is printed, the schema moved while the
+    // operator's cron entries were still scheduled, which is the finding.
+    const run = await sh(`${REJECT_WRITE}\n` + faultProgram(where, src,
+      `${STUB_FSYNC}\nfence_cron\necho DB_FENCE_TAKEN\necho MIGRATION_RAN`,
+      { functions: ['publish_cron_backup', 'fence_cron_locked', 'fence_cron'], mutate: withErrexit }))
+
+    assert.equal(run.code, 9,
+      `the fence must die on a rejected write:\n${run.stdout}${run.stderr}`)
+    assert.doesNotMatch(run.stdout, /DB_FENCE_TAKEN/,
+      `the connection fence must not be taken over a crontab that was never fenced:\n${run.stdout}`)
+    assert.doesNotMatch(run.stdout, /MIGRATION_RAN/,
+      `THE FINDING: the migration must not run against a live schedule:\n${run.stdout}`)
+    assert.match(run.stderr, /NOTHING HAS BEEN MIGRATED/, run.stderr)
+    assert.match(run.stderr, /did NOT install the schedule it was given/,
+      `and it must say the write was rejected, not blame the lock it held:\n${run.stderr}`)
+    assert.match(run.stderr, /errors in crontab file/,
+      `carrying the client's own diagnostic, which is the only thing that says WHY:\n${run.stderr}`)
+
+    // THE CRONTAB IS STILL WHAT IT WAS. A rejected write installs nothing, and the run must not
+    // have left a half-fenced schedule behind either.
+    assert.equal(faultCrontabText(), FAULT_ORIGINAL,
+      'a rejected write must leave the crontab exactly as it was')
+
+    // THE BACKUP SURVIVES, because it is the only copy of the pre-fence schedule and the run is
+    // about to hand the box back to a human.
+    assert.ok(existsSync(FAULT_BACKUP), 'the backup must not be removed by a fence that failed')
+    assert.equal(readFileSync(FAULT_BACKUP, 'utf8'), FAULT_ORIGINAL)
+
+    // …AND THE FLAG IS NOT SET. Observed on the body itself, since the caller `die`s before
+    // anything could print it, and it is the flag the unwind reads to decide whether to restore.
+    const observed = await sh(`${REJECT_WRITE}\n` + faultProgram(where, src,
+      [STUB_FSYNC, 'rc=0', 'with_crontab_lock fence_cron_locked || rc=$?',
+        'echo "RC=$rc"', 'echo "FENCED=$CRON_FENCED"', 'echo "WHY=$CRON_FENCE_REASON"'].join('\n'),
+      { functions: ['publish_cron_backup', 'fence_cron_locked'], mutate: withErrexit }))
+    assert.match(observed.stdout, /^RC=1$/m,
+      `the body must report the failure to its caller:\n${observed.stdout}${observed.stderr}`)
+    assert.match(observed.stdout, /^FENCED=false$/m,
+      `CRON_FENCED must not be raised by a write that was rejected:\n${observed.stdout}`)
+    assert.match(observed.stdout, /^WHY=.*exited 1/m, observed.stdout)
+  })
+}
+
+test('[o3d-batch-ret] MUTATION: the unchecked write records the crontab as fenced and the migration runs', async () => {
+  writeFileSync(FAULT_CRONTAB, FAULT_ORIGINAL)
+  rmSync(FAULT_BACKUP, { force: true })
+
+  // THE ROUTE, RUN — the exact two lines the fence used to end with, under a REAL `set -euo
+  // pipefail`, called the way the shipped code calls it: through `with_crontab_lock`.
+  const preFix = (s: string) => unchecked(
+    `  printf '%s\\n' "$fenced" | crontab -u "$APP_USER" -`)(withErrexit(s))
+  const run = await sh(`${REJECT_WRITE}\n` + faultProgram('scripts/deploy.sh', DEPLOY_SH,
+    `${STUB_FSYNC}\nfence_cron\necho DB_FENCE_TAKEN\necho MIGRATION_RAN`,
+    { functions: ['publish_cron_backup', 'fence_cron_locked', 'fence_cron'], mutate: preFix }))
+
+  assert.equal(run.code, 0,
+    `THE FINDING: the rejected write is reported as a success:\n${run.stdout}${run.stderr}`)
+  assert.match(run.stdout, /DB_FENCE_TAKEN/, run.stdout)
+  assert.match(run.stdout, /MIGRATION_RAN/,
+    `THE FINDING: the schema moves while the operator's cron entries are still scheduled:\n${run.stdout}`)
+  assert.equal(faultCrontabText(), FAULT_ORIGINAL,
+    'and nothing was fenced — the schedule the migration ran under is the live one')
+
+  // THE CONTROL THAT NAMES THE CAUSE. The SAME pre-fix body, the SAME `set -euo pipefail`, called
+  // DIRECTLY instead of through the wrapper: errexit is armed, the failing pipeline aborts, and the
+  // line after it never runs. So the suspension is the wrapper's, not a `set -e` that was missing —
+  // which is exactly why fourteen other bodies inherited it without a word being written.
+  const direct = await sh(`${REJECT_WRITE}\n` + faultProgram('scripts/deploy.sh', DEPLOY_SH,
+    `${STUB_FSYNC}\nfence_cron_locked\necho REACHED_AFTER_THE_BODY`,
+    { functions: ['publish_cron_backup', 'fence_cron_locked'], mutate: preFix }))
+  assert.notEqual(direct.code, 0,
+    `errexit must be armed in this harness, or the mutation above proves nothing:\n${direct.stdout}${direct.stderr}`)
+  assert.doesNotMatch(direct.stdout, /REACHED_AFTER_THE_BODY/,
+    `and it must abort at the rejected write when the wrapper is not in the way:\n${direct.stdout}`)
+})
+
+test('[o3d-batch-ret] the write-failure status is its own answer, distinct from a lock conflict and a divergence', async () => {
+  const run = await sh(`source '${CRONTAB_LOCK_LIB}'\n`
+    + 'echo "CONFLICT=$CRONTAB_LOCK_CONFLICT DIVERGED=$CRONTAB_UNFENCE_DIVERGED WRITE=$CRONTAB_WRITE_FAILED"')
+  assert.match(run.stdout, /CONFLICT=75 DIVERGED=76 WRITE=77/,
+    `a caller that cannot tell "the lock was held" from "the write was rejected" tells the operator `
+    + `to look in the wrong place:\n${run.stdout}${run.stderr}`)
+})
+
+for (const [where, src, user] of FAULT_ENTRYPOINTS) {
+  test(`[o3d-batch-ret] ${where}: a REJECTED unfence write keeps the backup and keeps the fence`, async () => {
+    const fenced = await fenceProjectionOf(FAULT_ORIGINAL.replace(/\n$/, ''))
+    writeFileSync(FAULT_CRONTAB, fenced)
+    writeFileSync(FAULT_BACKUP, FAULT_ORIGINAL)
+
+    const run = await sh(`${REJECT_WRITE}\n` + faultProgram(where, src,
+      'CRON_FENCED=true\nunfence_cron\necho UNFENCE_RETURNED',
+      { functions: ['unfence_cron_locked', 'unfence_cron'], mutate: withErrexit }))
+
+    assert.equal(run.code, 9,
+      `a rejected restore must stop the run rather than report success:\n${run.stdout}${run.stderr}`)
+    assert.doesNotMatch(run.stdout, /UNFENCE_RETURNED/, run.stdout)
+    assert.match(run.stderr, /restoring write was REJECTED/,
+      `and it must say the write was rejected rather than blaming the lock:\n${run.stderr}`)
+    assert.match(run.stderr, new RegExp(`crontab -u appuser ${FAULT_BACKUP}`),
+      `naming the by-hand restore, which is only possible because the backup is still there:\n${run.stderr}`)
+
+    // THE BACKUP IS THE ONLY COPY OF THE OPERATOR'S SCHEDULE. Deleting it after a rejected write is
+    // the irreversible half of this finding.
+    assert.ok(existsSync(FAULT_BACKUP), 'the backup must survive a rejected restore')
+    assert.equal(readFileSync(FAULT_BACKUP, 'utf8'), FAULT_ORIGINAL)
+    assert.equal(faultCrontabText(), fenced, 'and the crontab is still fenced, which is what the message says')
+
+    // …and the flag stays TRUE, so the unwind still knows there is a fence to undo.
+    const observed = await sh(`${REJECT_WRITE}\n` + faultProgram(where, src,
+      ['CRON_FENCED=true', 'rc=0', 'with_crontab_lock unfence_cron_locked || rc=$?',
+        'echo "RC=$rc"', 'echo "FENCED=$CRON_FENCED"'].join('\n'),
+      { functions: ['unfence_cron_locked'], mutate: withErrexit }))
+    assert.match(observed.stdout, /^RC=77$/m,
+      `the body must return the write-failure status, not the divergence one:\n${observed.stdout}${observed.stderr}`)
+    assert.match(observed.stdout, /^FENCED=true$/m,
+      `CRON_FENCED must not be cleared while the crontab is still fenced:\n${observed.stdout}`)
+  })
+}
+
+test('[o3d-batch-ret] MUTATION: the unchecked unfence deletes the backup and reports the crontab restored', async () => {
+  const fenced = await fenceProjectionOf(FAULT_ORIGINAL.replace(/\n$/, ''))
+  writeFileSync(FAULT_CRONTAB, fenced)
+  writeFileSync(FAULT_BACKUP, FAULT_ORIGINAL)
+
+  const preFix = (s: string) => unchecked(
+    `  printf '%s\\n' "$CRON_UNFENCE_TEXT" | crontab -u "$APP_USER" -`)(withErrexit(s))
+  const run = await sh(`${REJECT_WRITE}\n` + faultProgram('scripts/deploy.sh', DEPLOY_SH,
+    ['CRON_FENCED=true', 'rc=0', 'with_crontab_lock unfence_cron_locked || rc=$?',
+      'echo "RC=$rc"', 'echo "FENCED=$CRON_FENCED"'].join('\n'),
+    { functions: ['unfence_cron_locked'], mutate: preFix }))
+
+  assert.match(run.stdout, /^RC=0$/m,
+    `THE FINDING: the rejected restore returns success:\n${run.stdout}${run.stderr}`)
+  assert.match(run.stdout, /^FENCED=false$/m,
+    'THE FINDING: and the unwind is told there is no fence left to undo')
+  assert.equal(existsSync(FAULT_BACKUP), false,
+    'THE FINDING: the only copy of the operator schedule is deleted after a write that installed nothing')
+  assert.equal(faultCrontabText(), fenced,
+    'while the crontab is still fenced — every line commented out, and nothing left to restore it from')
+})
+
+// ---------------------------------------------------------------------------
+// 5 — THE REPOSITORY WALK, AND WHAT STOPS A SIXTEENTH BODY INHERITING THE HAZARD
+//
+// The wrapper cannot stop suspending errexit. It must run the body in THIS shell — `CRON_FENCED`,
+// `CRON_BACKUP_CREATED` and `CRON_UNFENCE_TEXT` are set inside it and read by the unwind, and a
+// subshell would lose every one of them — and it must return the body's status, because callers
+// distinguish 75 (lock held), 76 (divergence) and 77 (rejected write). Bash has no idiom that does
+// both while leaving errexit armed inside the callee: `cmd || rc=$?`, `if ! cmd`, `cmd; rc=$?`
+// under `set +e`, and an ERR trap all suspend it for the same dynamic extent, and the only shape
+// that does not — letting errexit kill the shell — discards the status the callers need.
+//
+// So the suspension stays, and it is made SAFE BY ENUMERATION instead: every crontab write in a
+// `*_locked` body goes through one helper, every such call takes its status, and the roster of
+// bodies is fixed here. A sixteenth body cannot inherit the hazard silently, because adding one
+// fails this test until whoever adds it has read what the failure says.
+// ---------------------------------------------------------------------------
+
+type LockedBody = { file: string; name: string; first: number; lines: string[] }
+
+/** Every `*_locked` body in the four shell files, by grammar. */
+function lockedBodiesIn(file: string, src: string): LockedBody[] {
+  const lines = src.split('\n')
+  const found: LockedBody[] = []
+  for (let i = 0; i < lines.length; i++) {
+    const match = /^([a-z_][a-z0-9_]*_locked)\(\) \{$/.exec(lines[i])
+    if (!match) continue
+    const end = lines.indexOf('}', i + 1)
+    assert.ok(end > i, `${file}: ${match[1]}() must be closed by a \`}\` on its own line`)
+    found.push({ file, name: match[1], first: i + 2, lines: lines.slice(i + 1, end) })
+  }
+  return found
+}
+
+/** A line with its comment removed, so the rules below are about code and not about prose. */
+const isComment = (line: string) => /^\s*#/.test(line)
+
+/** Lines that reach the crontab client directly instead of going through the one helper. */
+const bareCrontabWrites = (body: LockedBody) => body.lines
+  .map((line, i) => [body.first + i, line] as [number, string])
+  .filter(([, line]) => !isComment(line) && /\bcrontab -u\b/.test(line))
+
+/** Lines that call the helper without taking its status. */
+const uncheckedWrites = (body: LockedBody) => body.lines
+  .map((line, i) => [body.first + i, line] as [number, string])
+  .filter(([, line]) => !isComment(line) && /\bwrite_crontab_for\b/.test(line))
+  .filter(([, line]) => !/\|\|\s*(\{|return\b)/.test(line))
+
+const ALL_LOCKED_BODIES = [
+  ['scripts/install.sh', INSTALL_SH],
+  ['scripts/deploy.sh', DEPLOY_SH],
+  ['scripts/update.sh', UPDATE_SH],
+  ['scripts/lib/crontab-lock.sh', CRONTAB_LOCK_LIB_SRC],
+].flatMap(([file, src]) => lockedBodiesIn(file as string, src as string))
+
+test('[o3d-batch-ret] the roster of bodies the lock wrapper disarms errexit for is FIXED', () => {
+  // The wrapper's shape, asserted rather than assumed: if this stops matching, the suspension may
+  // be gone and the enumeration below may no longer be the thing keeping these bodies safe.
+  // Re-derive it before deleting anything here.
+  assert.match(CRONTAB_LOCK_LIB_SRC, /^ +"\$@" \|\| rc=\$\?$/m,
+    'with_crontab_lock still runs its body on the LEFT of `||`, so errexit is still suspended '
+    + 'for the whole dynamic extent of every body below')
+
+  assert.deepEqual(ALL_LOCKED_BODIES.map((b) => `${b.file}:${b.name}`).sort(), [
+    'scripts/deploy.sh:adopt_cron_fence_locked',
+    'scripts/deploy.sh:fence_cron_locked',
+    'scripts/deploy.sh:restore_cron_from_backup_locked',
+    'scripts/deploy.sh:resume_restore_cron_locked',
+    'scripts/deploy.sh:unfence_cron_locked',
+    'scripts/install.sh:bootstrap_managed_crontab_block_locked',
+    'scripts/install.sh:fence_cron_locked',
+    'scripts/install.sh:restore_cron_from_backup_locked',
+    'scripts/install.sh:resume_restore_cron_locked',
+    'scripts/install.sh:unfence_cron_locked',
+    'scripts/update.sh:adopt_cron_fence_locked',
+    'scripts/update.sh:fence_cron_locked',
+    'scripts/update.sh:restore_cron_from_backup_locked',
+    'scripts/update.sh:resume_restore_cron_locked',
+    'scripts/update.sh:unfence_cron_locked',
+  ], 'a new `*_locked` body runs with errexit suspended for every line in it. Read '
+   + '`write_crontab_for` in scripts/lib/crontab-lock.sh before adding it to this list: every '
+   + 'command in it whose failure matters must take its own status, and no flag may be set and no '
+   + 'backup deleted before the write it depends on is confirmed.')
+})
+
+test('[o3d-batch-ret] no `*_locked` body writes the crontab except through the one checked helper', () => {
+  const bare = ALL_LOCKED_BODIES.flatMap((b) =>
+    bareCrontabWrites(b).map(([n, l]) => `${b.file}:${n} (${b.name}): ${l.trim()}`))
+  assert.deepEqual(bare, [],
+    'a bare `crontab -u … -` inside a body the wrapper disarms errexit for is a write whose '
+    + 'rejection nothing notices')
+
+  const loose = ALL_LOCKED_BODIES.flatMap((b) =>
+    uncheckedWrites(b).map(([n, l]) => `${b.file}:${n} (${b.name}): ${l.trim()}`))
+  assert.deepEqual(loose, [],
+    'write_crontab_for returns non-zero rather than aborting, because errexit is suspended here — '
+    + 'so every call must take its status')
+
+  // NOT VACUOUS. The walk reached the files, found the bodies, and found writes in them.
+  assert.equal(ALL_LOCKED_BODIES.length, 15)
+  const writes = ALL_LOCKED_BODIES.flatMap((b) => b.lines.filter(
+    (l) => !isComment(l) && /\bwrite_crontab_for\b/.test(l)))
+  assert.equal(writes.length, 13,
+    'every crontab write in the three entrypoints must be one of these; a count that drifted '
+    + 'means a site was added or removed without this test being read')
+
+  // …AND THE RULES CAN FAIL, which is the only thing that makes the two empty lists above mean
+  // anything. Both are run against a body that breaks them.
+  const planted: LockedBody = {
+    file: 'synthetic', name: 'planted_locked', first: 1,
+    lines: [
+      '  # crontab -u "$APP_USER" -   <- a comment must NOT be flagged',
+      '  printf \'%s\\n\' "$x" | crontab -u "$APP_USER" -',
+      '  write_crontab_for "$APP_USER" "$x"',
+      '  write_crontab_for "$APP_USER" "$y" || return 1',
+    ],
+  }
+  assert.deepEqual(bareCrontabWrites(planted).map(([n]) => n), [2],
+    'the bare-write rule must flag the pipeline and must not flag the comment')
+  assert.deepEqual(uncheckedWrites(planted).map(([n]) => n), [3],
+    'the status rule must flag the unchecked call and must not flag the checked one')
+})
+
+// ---------------------------------------------------------------------------
+// Codex r30 HIGH — A FAILING `pgrep` IS NOT A PROOF THAT NO DAEMON EXISTS
+//
+// `require_crontab_command` is the absence proof written last round precisely because a missing
+// TOOL is not an absent SCHEDULE. Its own first step — the daemon census — then read every non-zero
+// `pgrep` status as "no daemon": `if pgrep -x "${name}"; then …`. With empty spool roots the
+// function returned 2 (absence PROVED) on a census that never ran, and all three fence paths
+// continued into the database fence and the migration with a cron daemon possibly still firing the
+// schedule it had already loaded.
+//
+// WHAT THESE PIN:
+//   1. the status semantics the classification rests on are THIS HOST'S, measured, not the manual's
+//   2. LOAD-BEARING. `pgrep` exiting 2 or 3 leaves the absence UNRESOLVED, with a CONTROL that a
+//      working `pgrep` still proves it                                (require_crontab_command)
+//   3. MUTATION. With the one-bit test restored, a broken `pgrep` proves absence and the fence
+//      returns success over a host it never examined
+// ---------------------------------------------------------------------------
+
+test('[o3d-batch-ret] the `pgrep` status semantics the census classifies on are the ones this host has', async () => {
+  const measured = await sh([
+    'sleep 30 &',
+    'subject=$!',
+    'sleep 0.3',
+    'pgrep -x sleep >/dev/null 2>&1; echo "MATCH=$?"',
+    'kill "$subject" 2>/dev/null || true',
+    'pgrep -x no-such-process-name-xyz >/dev/null 2>&1; echo "NOMATCH=$?"',
+    'pgrep --no-such-flag-xyz >/dev/null 2>&1; echo "BADFLAG=$?"',
+    "pgrep -x '[' >/dev/null 2>&1; echo \"BADREGEX=$?\"",
+    'pgrep -x a b >/dev/null 2>&1; echo "TWOPATTERNS=$?"',
+  ].join('\n'))
+
+  assert.match(measured.stdout, /^MATCH=0$/m, measured.stdout)
+  assert.match(measured.stdout, /^NOMATCH=1$/m,
+    `only status 1 is evidence of absence:\n${measured.stdout}`)
+  for (const usage of ['BADFLAG', 'BADREGEX', 'TWOPATTERNS']) {
+    assert.match(measured.stdout, new RegExp(`^${usage}=2$`, 'm'),
+      `a command line \`pgrep\` could not parse must NOT look like "no match":\n${measured.stdout}`)
+  }
+  // The whole classification rests on this inequality. If a host ever collapsed them, the census
+  // could not be built out of the exit status at all.
+  assert.doesNotMatch(measured.stdout, /^(BADFLAG|BADREGEX|TWOPATTERNS)=1$/m,
+    'a usage error must be distinguishable from an absence, or this proof cannot be made')
+})
+
+/** The no-crontab host, with `pgrep` replaced by one that exits with a chosen status. */
+function noCrontabBinWithBrokenPgrep(status: number): string {
+  const dir = mkdtempSync(join(FAULT_DIR, `pgrep-${status}-`))
+  for (const entry of readdirSync(NO_CRONTAB_BIN)) {
+    if (entry !== 'pgrep') symlinkSync(join(NO_CRONTAB_BIN, entry), join(dir, entry))
+  }
+  writeFileSync(join(dir, 'pgrep'), `#!/bin/sh\necho 'pgrep: broken on this host' >&2\nexit ${status}\n`)
+  chmodSync(join(dir, 'pgrep'), 0o755)
+  return dir
+}
+
+for (const status of [2, 3, 126]) {
+  test(`[o3d-batch-ret] a \`pgrep\` exiting ${status} leaves the absence UNRESOLVED, not proved`, async () => {
+    const emptySpool = mkdtempSync(join(FAULT_DIR, `spool-pgrep-${status}-`))
+    const brokenBin = noCrontabBinWithBrokenPgrep(status)
+    const onBrokenPath = (program: string): string => {
+      const line = `PATH='${FAULT_BIN}':"$PATH"`
+      assert.equal(program.split(line).length - 1, 1, 'the harness must set PATH exactly once')
+      return program.replace(line, `PATH='${brokenBin}'`)
+    }
+    const body = `CRON_SPOOL_ROOTS=('${emptySpool}')\nCRON_DAEMON_NAMES=(cron)\n`
+      + `require_crontab_command appuser; echo "RC=$?"\necho "WHY=${'$'}{CRONTAB_COMMAND_REASON}"`
+
+    // PRECONDITION: the shim really is what `pgrep` resolves to, and it really exits as asked.
+    const shim = await sh(`PATH='${brokenBin}' pgrep -x cron >/dev/null 2>&1; echo "RC=$?"`)
+    assert.match(shim.stdout, new RegExp(`^RC=${status}$`, 'm'), shim.stdout)
+
+    const run = await sh(faultProgram('scripts/deploy.sh', DEPLOY_SH, body,
+      { functions: [], mutate: onBrokenPath, lib: asRootLib() }))
+    assert.match(run.stdout, /^RC=1$/m,
+      `a census that did not run must withhold the proof, not grant it:\n${run.stdout}${run.stderr}`)
+    assert.match(run.stdout, new RegExp(`WHY=.*exited ${status}`),
+      `and it must name the status it could not classify:\n${run.stdout}`)
+    assert.match(run.stdout, /WHY=.*census/, run.stdout)
+
+    // CONTROL. The SAME empty spool and the SAME daemon name, with the host's REAL `pgrep`: the
+    // proof is given. So the refusal above is a decision about the census, not a helper that
+    // refuses everything.
+    const working = await sh(faultProgram('scripts/deploy.sh', DEPLOY_SH,
+      `CRON_SPOOL_ROOTS=('${emptySpool}')\nCRON_DAEMON_NAMES=(no-such-daemon-xyz)\n`
+      + `require_crontab_command appuser; echo "RC=$?"`,
+      { functions: [], mutate: withoutCrontabOnPath, lib: asRootLib() }))
+    assert.match(working.stdout, /^RC=2$/m,
+      `a working census over a cron-less host must still PROVE absence:\n${working.stdout}${working.stderr}`)
+  })
+}
+
+test('[o3d-batch-ret] MUTATION: the one-bit census reads a broken `pgrep` as an empty host, and the fence walks on', async () => {
+  const emptySpool = mkdtempSync(join(FAULT_DIR, 'spool-pgrep-mutation-'))
+  const brokenBin = noCrontabBinWithBrokenPgrep(2)
+  const onBrokenPath = (program: string): string =>
+    program.replace(`PATH='${FAULT_BIN}':"$PATH"`, `PATH='${brokenBin}'`)
+
+  // THE ROUTE, RUN. Only the classification is put back to one bit; everything else is shipped.
+  const oneBitLib = libraryWith([[ROOT_GATE, '  if false; then'],
+    ['    if [[ "${prc}" -ne 1 ]]; then', '    if false; then']])
+
+  const proved = await sh(faultProgram('scripts/deploy.sh', DEPLOY_SH,
+    `CRON_SPOOL_ROOTS=('${emptySpool}')\nCRON_DAEMON_NAMES=(cron)\n`
+    + `require_crontab_command appuser; echo "RC=$?"`,
+    { functions: [], mutate: onBrokenPath, lib: oneBitLib }))
+  assert.match(proved.stdout, /^RC=2$/m,
+    `THE FINDING: absence is reported as PROVED off a census that never ran:\n${proved.stdout}${proved.stderr}`)
+
+  // …and that answer is load-bearing all the way to the migration: `fence_cron` treats a 2 as
+  // "nothing to fence" and returns success without touching the crontab.
+  const fence = await sh(faultProgram('scripts/deploy.sh', DEPLOY_SH,
+    `CRON_SPOOL_ROOTS=('${emptySpool}')\nCRON_DAEMON_NAMES=(cron)\nfence_cron\necho MIGRATION_RAN`,
+    { functions: ['fence_cron'], mutate: onBrokenPath, lib: oneBitLib }))
+  assert.match(fence.stdout, /MIGRATION_RAN/,
+    `THE FINDING: the cutover proceeds past a fence that examined nothing:\n${fence.stdout}${fence.stderr}`)
+
+  // AND THE SHIPPED LIBRARY, asked about the same host, refuses.
+  const shipped = await sh(faultProgram('scripts/deploy.sh', DEPLOY_SH,
+    `CRON_SPOOL_ROOTS=('${emptySpool}')\nCRON_DAEMON_NAMES=(cron)\nfence_cron\necho MIGRATION_RAN`,
+    { functions: ['fence_cron'], mutate: onBrokenPath, lib: asRootLib() }))
+  assert.equal(shipped.code, 9, `${shipped.stdout}${shipped.stderr}`)
+  assert.doesNotMatch(shipped.stdout, /MIGRATION_RAN/,
+    `the shipped fence must stop instead:\n${shipped.stdout}${shipped.stderr}`)
+  assert.match(shipped.stderr, /NOTHING HAS BEEN MIGRATED/, shipped.stderr)
 })
