@@ -109,6 +109,13 @@ test('[o3d-czpy] publish_durable_file refuses a symlink planted at its staging d
   mkdirSync(appDir)
   mkdirSync(victim)
   writeFileSync(join(victim, 'keep'), 'UNTOUCHED\n')
+  // 0700 DELIBERATELY, AND IT IS WHAT MAKES THIS TEST DISCRIMINATE. The `cd`-then-lstat pin asks
+  // for uid ${self} and mode 0700; an attacker directory left at 0755 would be refused by the MODE
+  // even if the mkdir had followed the link, and the test would then pass while proving nothing
+  // about the mkdir. At 0700 — and, in this same-uid harness, at the harness's own uid — the pin
+  // is satisfied, so the ONLY thing standing between this publication and the victim directory is
+  // that `mkdir` is plain and not `mkdir -p`.
+  chmodSync(victim, 0o700)
 
   // The plant: the service account owns ${APP_DIR}, so it can create this name before the
   // installer does. `mkdir -p` would work happily inside it; a plain `mkdir` fails with EEXIST.
@@ -146,6 +153,27 @@ test('[o3d-czpy] publish_durable_file replaces a symlink planted at its target i
   assert.equal(lstatSync(join(appDir, '.env')).isSymbolicLink(), false, 'and the published name must be a regular file afterwards')
   assert.equal(readFileSync(join(appDir, '.env'), 'utf8'), 'SECRET=abc\n')
   assert.equal(statSync(join(appDir, '.env')).mode & 0o777, 0o600)
+})
+
+test('[o3d-czpy] publish_durable_file refuses a DIRECTORY planted at its target instead of filling it', (t) => {
+  const root = createTempDirSync('ims-czpy-dirtarget-', t)
+  const appDir = join(root, 'app')
+  mkdirSync(appDir)
+  // The other thing the service account can leave at a name this installer is about to publish.
+  // A plain `mv` moves the temporary INTO a destination that is a directory, which would leave
+  // ${APP_DIR}/.env a directory holding one stray `publish.XXXXXX` while the run reported success
+  // and the service failed to start. `mv -T` refuses, and the caller dies with the reason.
+  mkdirSync(join(appDir, '.env'))
+
+  const script = rig(['fsync_path', 'publish_durable_file'], [
+    `printf 'SECRET=abc\\n' | publish_durable_file "${appDir}/.env" "" 600`,
+    'echo "rc=$?"',
+  ].join('\n'))
+  const run = runBash(script)
+
+  assert.match(run.stdout, /^rc=1$/m, 'the publication must refuse a directory at the target name')
+  assert.deepEqual(readdirSync(join(appDir, '.env')), [],
+    'and must not leave a stray temporary inside it')
 })
 
 test('[o3d-czpy] publish_durable_file creates its temporary INSIDE the staging directory, not beside the target', (t) => {
