@@ -867,7 +867,13 @@ async function processDeltaChunk(
         accountingInvoiceId: { in: [...reversedSalesIds] },
         paidAt: { not: null },
       },
-      select: { id: true, accountingInvoiceId: true, orderNumber: true, externalOrderNumber: true, status: true, revenueDeferredDate: true },
+      // `unregisteredPaidAt` is selected here as well as on the residual read above. It is not consumed
+      // on this line — the verdict was already reached — and that is exactly why it is selected: the
+      // rule policed by tests/accounting/paid-provenance-readers.test.ts is "a read that requires
+      // `paidAt: { not: null }` inside a file that decides reversals carries the provenance", with no
+      // exceptions for reads that happen not to need it today. An exception is a hole the next reader
+      // walks through, which is the shape of the defect this round exists to close.
+      select: { id: true, accountingInvoiceId: true, orderNumber: true, externalOrderNumber: true, status: true, revenueDeferredDate: true, unregisteredPaidAt: true },
     })
     if (paidOrders.length > 0) {
       for (const order of detectPaymentReversals(paidOrders, reversedSalesIds)) {
@@ -1517,7 +1523,9 @@ async function recheckWithheldReversals(
   })
   const orders = soIds.length === 0 ? [] : await db.salesOrder.findMany({
     where: { id: { in: soIds }, paidAt: { not: null }, accountingInvoiceId: { not: null } },
-    select: { id: true, accountingInvoiceId: true },
+    // See the note on the reversal pass's own select: no exceptions to the provenance rule inside a
+    // file that decides reversals, including for a read that only needs the invoice ids today.
+    select: { id: true, accountingInvoiceId: true, unregisteredPaidAt: true },
   })
 
   const invoiceIdsByEntity = new Map<string, string[]>()

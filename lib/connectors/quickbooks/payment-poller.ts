@@ -194,6 +194,48 @@ export function qboWithheldReversalReason(verdict: RegisteredPaymentVerdict): st
 }
 
 /**
+ * THE SALES REVERSAL CANDIDATES, AS ONE CALLABLE STEP (o3d-psrx r3, Codex HIGH).
+ *
+ * Lifted out of `pollQuickBooksPayments` for the same reason `readSalesResidualVerdicts` was lifted
+ * out of the Xero poller: the defect Codex found was a break in the wiring from the DATABASE ROW to
+ * the VERDICT — the poller asked a question the row could answer and never selected the column that
+ * answers it — and a test that rebuilt the query by hand would have sailed straight over it. This is
+ * the poller's OWN query, and tests/concurrency/qbo-paid-provenance-reversal.concurrent.test.ts calls
+ * THIS and feeds it to the SAME gate production feeds it to, against a real PostgreSQL and with no
+ * QuickBooks call anywhere.
+ */
+export async function readQboSalesReversalCandidates() {
+  return await db.salesOrder.findMany({
+    where: {
+      accountingInvoiceId: { not: null },
+      paidAt: { not: null },
+      shoppingLinks: { none: {} },
+    },
+    select: {
+      id: true,
+      accountingInvoiceId: true,
+      orderNumber: true,
+      externalOrderNumber: true,
+      status: true,
+      revenueDeferredDate: true,
+      // o3d-psrx r3 (Codex HIGH): WHERE this order's paid flag came from. Selected with `paidAt`'s own
+      // candidates because the reversal verdict turns on it — see gateQboReversalsOnProvenance.
+      // Leaving it out is the defect itself: every verdict then reads as NOTHING_REGISTERED and a sale
+      // an operator marked paid by hand is reversed with a chargeback credit note against it.
+      unregisteredPaidAt: true,
+    },
+  })
+}
+
+/** The bill reversal candidates, same reasoning. A bill carries no provenance column (o3d-a3wx). */
+export async function readQboBillReversalCandidates() {
+  return await db.purchaseInvoice.findMany({
+    where: { accountingInvoiceId: { not: null }, paidAt: { not: null } },
+    select: { id: true, accountingInvoiceId: true, poId: true, po: { select: { reference: true, status: true } } },
+  })
+}
+
+/**
  * Poll QuickBooks for paid invoices and bills.
  * Updates paidAt on matching IMS records and advances order status.
  */
@@ -285,26 +327,7 @@ export async function pollQuickBooksPayments(): Promise<{ salesPaid: number; bil
   // Status is NOT auto-reverted (the order may already be picking/shipped); a
   // WARNING carrying the current status flags it. Must run AFTER the forward pass
   // so a pay-then-reverse within one window nets to the correct (unpaid) state.
-  const paidOrders = await db.salesOrder.findMany({
-    where: {
-      accountingInvoiceId: { not: null },
-      paidAt: { not: null },
-      shoppingLinks: { none: {} },
-    },
-    select: {
-      id: true,
-      accountingInvoiceId: true,
-      orderNumber: true,
-      externalOrderNumber: true,
-      status: true,
-      revenueDeferredDate: true,
-      // o3d-psrx r3 (Codex HIGH): WHERE this order's paid flag came from. Selected with `paidAt`'s own
-      // candidates because the reversal verdict turns on it — see gateQboReversalsOnProvenance.
-      // Leaving it out is the defect itself: every verdict then reads as NOTHING_REGISTERED and a sale
-      // an operator marked paid by hand is reversed with a chargeback credit note against it.
-      unregisteredPaidAt: true,
-    },
-  })
+  const paidOrders = await readQboSalesReversalCandidates()
 
   if (paidOrders.length > 0) {
     const reversedIds = await fetchReversedEntityIds('Invoice', since)
@@ -447,10 +470,7 @@ export async function pollQuickBooksPayments(): Promise<{ salesPaid: number; bil
   // A bill IMS thinks paid whose QBO transaction regressed (Balance > 0, payment
   // un-applied; or TotalAmt = 0, voided) gets paidAt cleared with a WARNING. No
   // chargeback equivalent on the purchase side.
-  const paidBills = await db.purchaseInvoice.findMany({
-    where: { accountingInvoiceId: { not: null }, paidAt: { not: null } },
-    select: { id: true, accountingInvoiceId: true, poId: true, po: { select: { reference: true, status: true } } },
-  })
+  const paidBills = await readQboBillReversalCandidates()
 
   if (paidBills.length > 0) {
     const reversedIds = await fetchReversedEntityIds('Bill', since)
