@@ -883,9 +883,38 @@ die() { echo "die: $*" >&2; exit 1; }
   },
 ] as const
 
+/**
+ * A STATE DIRECTORY WITH AN ANCHOR ABOVE IT (o3d-rn10 r2).
+ *
+ * publish_durable_file() refuses a trust root whose OWN PARENT the service account could rename
+ * inside, and /tmp is 1777 — so a mkdtemp directory used directly as ${CUTOVER_STATE_DIR} or
+ * ${DATA_DIR} is a root with no anchor, and every publication in a rig that did so would fail for
+ * a reason unrelated to what the rig measures. One nesting level gives the state directory a 0700
+ * parent of this run's own, which is the standing /var/lib gives it in production. The returned
+ * `dir` is the state directory; `outer` is what the caller removes.
+ */
+function anchoredStateDir(prefix: string): { outer: string; dir: string } {
+  const outer = mkdtempSync(join(tmpdir(), prefix))
+  const dir = join(outer, 'state')
+  mkdirSync(dir)
+  return { outer, dir }
+}
+
+/**
+ * ${APP_DIR}, ${CUTOVER_STATE_DIR} and ${DB_FENCE_RECOVERY_DIR} under ONE anchor, for the reason
+ * anchoredStateDir() gives: each of the three is a publication root, and a root directly beneath a
+ * 1777 directory has no anchor and is refused.
+ */
+function anchoredRoots(prefix: string): { outer: string; app: string; state: string; recovery: string } {
+  const outer = mkdtempSync(join(tmpdir(), prefix))
+  const dirs = { outer, app: join(outer, 'app'), state: join(outer, 'state'), recovery: join(outer, 'recovery') }
+  for (const dir of [dirs.app, dirs.state, dirs.recovery]) mkdirSync(dir)
+  return dirs
+}
+
 /** Run the script's OWN marker functions, then walk away — exactly what a SIGKILL leaves. */
 function runMarkerHarness(entry: (typeof MARKER_CASES)[number], call: string): string {
-  const dir = mkdtempSync(join(tmpdir(), 'ims-marker-'))
+  const { outer, dir } = anchoredStateDir('ims-marker-')
   try {
     const program = [
       'set -euo pipefail',
@@ -898,7 +927,7 @@ function runMarkerHarness(entry: (typeof MARKER_CASES)[number], call: string): s
     execFileSync('bash', ['-c', program], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
     return readFileSync(join(dir, MARKER_NAME), 'utf8')
   } finally {
-    rmSync(dir, { recursive: true, force: true })
+    rmSync(outer, { recursive: true, force: true })
   }
 }
 
@@ -2008,7 +2037,7 @@ systemctl() { [ "$1" = daemon-reload ] && return 1; return 0; }
 ] as const
 
 function runFenceInstallHarness(entry: (typeof FENCE_INSTALL_CASES)[number], prelude: string) {
-  const dir = mkdtempSync(join(tmpdir(), 'ims-fenceinstall-'))
+  const { outer, dir } = anchoredStateDir('ims-fenceinstall-')
   try {
     const program = [
       'set -uo pipefail',
@@ -2030,7 +2059,7 @@ function runFenceInstallHarness(entry: (typeof FENCE_INSTALL_CASES)[number], pre
       dir,
     }
   } finally {
-    rmSync(dir, { recursive: true, force: true })
+    rmSync(outer, { recursive: true, force: true })
   }
 }
 
@@ -2068,7 +2097,7 @@ for (const entry of FENCE_INSTALL_CASES) {
     // leave a marker rather than a fence nobody can undo. So it initially says `absent`, and the
     // install has to correct it — otherwise the file the next run and the operator read describes
     // a fence that was in fact installed as one that was not.
-    const dir = mkdtempSync(join(tmpdir(), 'ims-fenceok-'))
+    const { outer, dir } = anchoredStateDir('ims-fenceok-')
     try {
       const preamble = entry
         .preamble(dir)
@@ -2100,7 +2129,7 @@ for (const entry of FENCE_INSTALL_CASES) {
         'the marker must record the fence that is actually loaded, not the one that was intended',
       )
     } finally {
-      rmSync(dir, { recursive: true, force: true })
+      rmSync(outer, { recursive: true, force: true })
     }
   })
 }
@@ -3132,7 +3161,7 @@ const R8_CASES = ARMING_TRAP_CASES.map((entry) => ({
 // FINDING 1a — the marker records the phase, and records it separately from the intent.
 // ---------------------------------------------------------------------------
 function runMarkerWriter(entry: (typeof R8_CASES)[number], state: string): string {
-  const dir = mkdtempSync(join(tmpdir(), 'ims-r8-marker-'))
+  const { outer, dir } = anchoredStateDir('ims-r8-marker-')
   try {
     const program = [
       'set -euo pipefail',
@@ -3148,7 +3177,7 @@ function runMarkerWriter(entry: (typeof R8_CASES)[number], state: string): strin
     ].join('\n')
     return execFileSync('bash', ['-c', program], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
   } finally {
-    rmSync(dir, { recursive: true, force: true })
+    rmSync(outer, { recursive: true, force: true })
   }
 }
 
@@ -3239,7 +3268,7 @@ function runAdoption(
   marker: string,
   state: string,
 ): { log: string; stdout: string; status: number; markerExists: boolean; dropinExists: boolean; backupExists: boolean } {
-  const dir = mkdtempSync(join(tmpdir(), 'ims-r8-adopt-'))
+  const { outer, dir } = anchoredStateDir('ims-r8-adopt-')
   try {
     const dropinDir = join(dir, 'dropin')
     execFileSync('mkdir', ['-p', dropinDir])
@@ -3281,7 +3310,7 @@ function runAdoption(
       backupExists: existsSync(join(dir, 'crontab.bak')),
     }
   } finally {
-    rmSync(dir, { recursive: true, force: true })
+    rmSync(outer, { recursive: true, force: true })
   }
 }
 
@@ -3864,7 +3893,7 @@ function runR9(
   body: string,
   extra = '',
 ): { stdout: string; status: number; dir: string; files: string[]; marker: string | null; barriers: string[] } {
-  const dir = mkdtempSync(join(tmpdir(), 'ims-r9-'))
+  const { outer, dir } = anchoredStateDir('ims-r9-')
   try {
     const program = [
       'set -euo pipefail',
@@ -3904,7 +3933,7 @@ function runR9(
       barriers: existsSync(barrierPath) ? readFileSync(barrierPath, 'utf8').split('\n').filter(Boolean) : [],
     }
   } finally {
-    rmSync(dir, { recursive: true, force: true })
+    rmSync(outer, { recursive: true, force: true })
   }
 }
 
@@ -6145,9 +6174,7 @@ test('a deleted .env does not stop the connection fence being adopted', () => {
   //   3. make publish_fence_recovery_record() a no-op and phase 2 fails on the missing record,
   //      naming it — the record has to be written when the fence is RAISED or there is nothing
   //      to recover from.
-  const app = mkdtempSync(join(tmpdir(), 'ims-recover-app-'))
-  const state = mkdtempSync(join(tmpdir(), 'ims-recover-state-'))
-  const recovery = mkdtempSync(join(tmpdir(), 'ims-recover-etc-'))
+  const { outer, app, state, recovery } = anchoredRoots('ims-recover-')
   try {
     // PHASE 1 — an ordinary run raises a fence, with .env in place and the script in the
     // checkout. Nothing here is about recovery; it is what produces the record.
@@ -6230,9 +6257,7 @@ test('a deleted .env does not stop the connection fence being adopted', () => {
       `nor the sole-source question about it:\n${log}`,
     )
   } finally {
-    rmSync(app, { recursive: true, force: true })
-    rmSync(state, { recursive: true, force: true })
-    rmSync(recovery, { recursive: true, force: true })
+    rmSync(outer, { recursive: true, force: true })
   }
 })
 
@@ -6245,9 +6270,7 @@ test('a recovery with no privileged credential refuses, naming the argument that
   // adopt_db_connections() and this test fails at the status assertion — the run proceeds to
   // invoke the fence with an empty admin URL, which is the shape that revokes CONNECT and then
   // cannot get back in.
-  const app = mkdtempSync(join(tmpdir(), 'ims-recover-app-'))
-  const state = mkdtempSync(join(tmpdir(), 'ims-recover-state-'))
-  const recovery = mkdtempSync(join(tmpdir(), 'ims-recover-etc-'))
+  const { outer, app, state, recovery } = anchoredRoots('ims-recover-')
   try {
     mkdirSync(join(state, 'deploy'), { recursive: true })
     writeFileSync(join(state, 'deploy', 'db-connect-fence.json'), '{}\n')
@@ -6277,9 +6300,7 @@ test('a recovery with no privileged credential refuses, naming the argument that
     assert.match(result.output, /imsapp@127\.0\.0\.1:5432\/imsdb/, 'and the record gave the identity')
     assert.ok(!/--fence/.test(readCalls(state)), 'and no fence was attempted without a connection that survives it')
   } finally {
-    rmSync(app, { recursive: true, force: true })
-    rmSync(state, { recursive: true, force: true })
-    rmSync(recovery, { recursive: true, force: true })
+    rmSync(outer, { recursive: true, force: true })
   }
 })
 
@@ -6313,9 +6334,7 @@ for (const scenario of RECOVERY_RECORD_REFUSALS) {
     // adopt_identity_from_recovery_record() and the truncated case stops refusing — it adopts
     // host, port and role from the record and NO database, which is three of four values about a
     // database nothing named.
-    const app = mkdtempSync(join(tmpdir(), 'ims-recover-app-'))
-    const state = mkdtempSync(join(tmpdir(), 'ims-recover-state-'))
-    const recovery = mkdtempSync(join(tmpdir(), 'ims-recover-etc-'))
+    const { outer, app, state, recovery } = anchoredRoots('ims-recover-')
     try {
       mkdirSync(join(state, 'deploy'), { recursive: true })
       writeFileSync(join(state, 'deploy', 'db-connect-fence.json'), '{}\n')
@@ -6334,9 +6353,7 @@ for (const scenario of RECOVERY_RECORD_REFUSALS) {
       assert.match(result.output, scenario.says, `and it must say what is wrong with the record:\n${result.output}`)
       assert.ok(!/--fence/.test(readCalls(state)), `and nothing may be re-fenced on a guess:\n${readCalls(state)}`)
     } finally {
-      rmSync(app, { recursive: true, force: true })
-      rmSync(state, { recursive: true, force: true })
-      rmSync(recovery, { recursive: true, force: true })
+      rmSync(outer, { recursive: true, force: true })
     }
   })
 }
@@ -6368,16 +6385,12 @@ function raiseFenceFor(dirs: { app: string; state: string; recovery: string }, s
   assert.match(raised.output, /^RAISED=true$/m, `precondition: and the fence must go up:\n${raised.output}`)
 }
 
-function recoveryDirs(): { app: string; state: string; recovery: string } {
-  return {
-    app: mkdtempSync(join(tmpdir(), 'ims-r30-app-')),
-    state: mkdtempSync(join(tmpdir(), 'ims-r30-state-')),
-    recovery: mkdtempSync(join(tmpdir(), 'ims-r30-etc-')),
-  }
+function recoveryDirs(): { outer: string; app: string; state: string; recovery: string } {
+  return anchoredRoots('ims-r30-')
 }
 
-function cleanUp(dirs: { app: string; state: string; recovery: string }): void {
-  for (const dir of [dirs.app, dirs.state, dirs.recovery]) rmSync(dir, { recursive: true, force: true })
+function cleanUp(dirs: { outer: string }): void {
+  rmSync(dirs.outer, { recursive: true, force: true })
 }
 
 test('an .env retargeted to another database cannot redirect a standing fence', () => {
