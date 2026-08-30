@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, rm } from 'node:fs/promises'
-import os from 'node:os'
+import { mkdir } from 'node:fs/promises'
 import path from 'node:path'
 import test from 'node:test'
 
@@ -9,10 +8,10 @@ import {
   runProductionPreflight,
   type PreflightResult,
 } from '../../scripts/preflight-production.ts'
+import { createTempDir, withTempDir } from './temp-dir.ts'
 
 async function withStorageDirs<T>(fn: (env: Record<string, string>) => Promise<T>): Promise<T> {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'ims-preflight-test-'))
-  try {
+  return withTempDir('ims-preflight-test-', async (root) => {
     const uploadRoot = path.join(root, 'uploads')
     const publicUploadRoot = path.join(root, 'public-uploads')
     const invoicePdfRoot = path.join(root, 'invoice-pdfs')
@@ -31,9 +30,7 @@ async function withStorageDirs<T>(fn: (env: Record<string, string>) => Promise<T
       INVOICE_PDF_STORAGE_DIR: invoicePdfRoot,
       BACKUP_DIR: backupRoot,
     })
-  } finally {
-    await rm(root, { recursive: true, force: true })
-  }
+  })
 }
 
 function baseEnv(storage: Record<string, string>): Record<string, string> {
@@ -375,9 +372,9 @@ test('production preflight passes when scanner command health is clean', async (
   })
 })
 
-test('production preflight reports missing storage subdirectories with expected paths', async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'ims-preflight-missing-storage-'))
-  try {
+test('production preflight reports missing storage subdirectories with expected paths', async (t) => {
+  const root = await createTempDir('ims-preflight-missing-storage-', t)
+  {
     // Deliberately use a fresh root rather than withStorageDirs so every
     // storage path, including invoicePdfStorage, exercises the missing path.
     const result = await runProductionPreflight({
@@ -399,8 +396,6 @@ test('production preflight reports missing storage subdirectories with expected 
     assert.match(output, /public-uploads\/branding/)
     assert.match(output, /invoice-pdfs/)
     assert.match(output, /backups/)
-  } finally {
-    await rm(root, { recursive: true, force: true })
   }
 })
 

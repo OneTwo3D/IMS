@@ -1,15 +1,15 @@
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { mkdirSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import test, { type TestContext } from 'node:test'
+
+import { createTempDirSync } from './temp-dir.ts'
 
 const SCRIPT = join(process.cwd(), 'scripts/check-prisma-schema-scope.mjs')
 
 function createRepo(t: TestContext) {
-  const root = mkdtempSync(join(tmpdir(), 'prisma-schema-scope-'))
-  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const root = createTempDirSync('prisma-schema-scope-', t)
   git(root, ['init'])
   git(root, ['config', 'user.name', 'Schema Scope Test'])
   git(root, ['config', 'user.email', 'schema-scope@example.test'])
