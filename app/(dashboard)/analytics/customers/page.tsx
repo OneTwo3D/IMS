@@ -26,7 +26,7 @@ export default async function CustomerAnalyticsPage({ searchParams }: { searchPa
     // A WITHHELD FIGURE MUST NOT LOOK LIKE A MEASURED ZERO (o3d-8u4h): the word, not a dash, and
     // the reason is in the notices above the table rather than under a hover.
     { key: 'profit', label: 'Gross profit', align: 'right', render: (row) => row.grossProfitBase == null ? WITHHELD_CELL_TEXT : `${row.grossProfitBase}${boundSuffix(row.grossProfitBaseBound)}`, footer: `${report.totals.grossProfitBase}${bound(report.totals.grossProfitBaseBound)}` },
-    { key: 'ar', label: 'AR exposure', align: 'right', render: (row) => row.arExposureBase, footer: report.totals.arExposureBase },
+    { key: 'ar', label: 'AR exposure', align: 'right', render: (row) => `${row.arExposureBase}${boundSuffix(row.arExposureBaseBound)}`, footer: `${report.totals.arExposureBase}${bound(report.totals.arExposureBaseBound)}` },
     { key: 'share', label: 'Share', align: 'right', render: (row) => `${row.shareOfRevenuePct}%${boundSuffix(row.shareOfRevenuePctBound)}` },
     { key: 'creditNet', label: 'Credit (net basis)', align: 'right', render: (row) => row.refundsNetBasis, footer: report.totals.refundsNetBasis },
     { key: 'creditGross', label: 'Credit (gross basis)', align: 'right', render: (row) => row.refundsGrossBasis, footer: report.totals.refundsGrossBasis },
@@ -48,7 +48,7 @@ export default async function CustomerAnalyticsPage({ searchParams }: { searchPa
         { label: 'Net revenue', value: `${report.totals.netRevenueBase}${bound(report.totals.netRevenueBaseBound)}` },
         { label: 'Gross profit', value: `${report.totals.grossProfitBase}${bound(report.totals.grossProfitBaseBound)}` },
         { label: 'Costed customers', value: `${report.totals.costCapturedRows ?? '0'}/${report.pageInfo.totalRows.toLocaleString()}` },
-        { label: 'AR exposure', value: report.totals.arExposureBase, tone: 'warning' },
+        { label: 'AR exposure', value: `${report.totals.arExposureBase}${bound(report.totals.arExposureBaseBound)}`, tone: 'warning' },
         { label: 'Customers', value: report.pageInfo.totalRows.toLocaleString() },
       ]}
       notices={report.notices}

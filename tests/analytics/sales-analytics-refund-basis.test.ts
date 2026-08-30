@@ -273,6 +273,8 @@ test('customer mix: AR exposure nets only the credit on UNPAID orders (o3d-kyey)
 
   // Exposure is the unpaid order-1 only: 100 - 30 = 70. Order-2's 50 credit must not touch it.
   assert.equal(report.rows[0]?.arExposureBase, '70')
+  // Both credits are on the comparable basis, so nothing was left unapplied to the unpaid side.
+  assert.equal(report.rows[0]?.arExposureBaseBound, 'exact')
   // Net revenue still sees both: (100 + 50) - (30 + 50) = 70 as well, from a different sum.
   assert.equal(report.rows[0]?.netRevenueBase, '70')
 })
@@ -497,4 +499,69 @@ test('sales analytics: product grouping allocates the credit by line value and t
   // Whatever the split, the whole credit reaches some row: 120 - 40 = 80.
   assert.equal(report.totals.revenue, '120')
   assert.equal(report.totals.netRevenue, '80')
+})
+
+test('customer mix: AR exposure is bounded by the credit it could not apply (o3d-kyey)', async () => {
+  const client: SalesFulfillmentAnalyticsClient = {
+    ...baseClient(),
+    salesOrder: { findMany: async () => [order({ id: 'order-1', customerId: 'cust-1', customerName: 'Acme', totalBase: '120', taxBase: '20', paidAt: null, lines: [{ id: 'line-1', productId: 'product-1', totalBase: '100' }] })] },
+    cogsEntry: { findMany: async () => [cogsByOrderRow('order-1', '0')] },
+    salesOrderRefund: { findMany: async () => [orderRefund('order-1', '100', 'NET')] },
+  }
+
+  const report = await getCustomerAnalyticsReport(WINDOW, { client, now: NOW })
+
+  // A NET credit is real relief on a VAT-inclusive exposure, but not the same unit as it, so the
+  // 120 stands and says it is at most what is owed. Publishing 120 unmarked would be a claim.
+  assert.equal(report.rows[0]?.arExposureBase, '120')
+  assert.equal(report.rows[0]?.arExposureBaseBound, 'upper')
+  assert.equal(report.totals.arExposureBaseBound, 'upper')
+})
+
+// ---------------------------------------------------------------------------------------------
+// The CSV half. A file reader has no tooltip, and no page either.
+// ---------------------------------------------------------------------------------------------
+
+test('every figure the three reports publish reaches their CSV, bound markers included (o3d-kyey)', async () => {
+  /**
+   * The producer and the export route are edited in different files, and the pinned inventory only
+   * asks whether the route SAYS something about the figure names it contains — not whether the
+   * column is actually written. A figure added to a row type and forgotten in `toCsv` would ship a
+   * page that nets off credit and a file that silently does not, which is the worse half to be wrong.
+   *
+   * So this reads the route's real column arrays out of its source and compares them against the
+   * keys of a row the producer really returned. Nothing is hand-listed on either side.
+   */
+  const { readFileSync } = await import('node:fs')
+  const source = readFileSync(new URL('../../app/api/export/sales-analytics/route.ts', import.meta.url), 'utf8')
+  const columnsFor = (filename: string): string[] => {
+    const line = source.split('\n').find((l) => l.includes(`\`${filename}-\${date}.csv\``))
+    assert.ok(line, `no csvResponse line for ${filename}`)
+    const list = /toCsv\(report\.rows, \[([^\]]*)\]\)/.exec(line!)
+    assert.ok(list, `could not read the column list for ${filename}`)
+    const columns = list![1]!.split(',').map((entry) => entry.trim().replace(/^'|'$/g, '')).filter(Boolean)
+    // Proof the extraction reached something real, so a regex slip cannot make this pass vacuously.
+    assert.ok(columns.length >= 8, `${filename} column list looks empty: ${columns.join('|')}`)
+    return columns
+  }
+
+  const salesClient: SalesFulfillmentAnalyticsClient = {
+    ...baseClient(),
+    salesOrder: { findMany: async () => [order({ id: 'order-1', customerId: 'cust-1', customerName: 'Acme', totalBase: '100', taxBase: '0', lines: [{ id: 'line-1', productId: 'product-1', totalBase: '100' }] })] },
+    cogsEntry: { findMany: async () => [cogsByOrderRow('order-1', '10')] },
+    salesOrderRefund: { findMany: async () => [orderRefund('order-1', '10', 'GROSS')] },
+  }
+
+  const cases: Array<[string, string[]]> = [
+    ['sales-analytics', Object.keys((await getSalesAnalyticsReport(WINDOW, { client: salesClient, now: NOW })).rows[0]!)],
+    ['customer-mix', Object.keys((await getCustomerAnalyticsReport(WINDOW, { client: salesClient, now: NOW })).rows[0]!)],
+    ['gross-margin', Object.keys((await getMarginAnalyticsReport(WINDOW, { client: marginClient({ lineTotalBase: '100', cogs: '40' }), now: NOW })).rows[0]!)],
+  ]
+
+  const missing: string[] = []
+  for (const [filename, keys] of cases) {
+    const columns = columnsFor(filename)
+    for (const key of keys) if (!columns.includes(key)) missing.push(`${filename}.csv: ${key}`)
+  }
+  assert.deepEqual(missing, [], 'These row fields are published on the page but dropped from the CSV.')
 })

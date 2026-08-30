@@ -94,7 +94,7 @@ export async function GET(req: NextRequest) {
       const report = await getCustomerAnalyticsReport({ ...filters, pageSize: SALES_ANALYTICS_CSV_ROW_LIMIT }, { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
-      return csvResponse(toCsv(report.rows, ['customerId', 'customerName', 'customerEmail', 'orderCount', 'revenueBase', 'netRevenueBase', 'netRevenueBaseBound', 'netRevenueExVatBase', 'netRevenueExVatBaseBound', 'grossProfitBase', 'grossProfitBaseBound', 'costCaptured', 'arExposureBase', 'shareOfRevenuePct', 'shareOfRevenuePctBound', 'refundsNetBasis', 'refundsGrossBasis', 'refundsUnknownBasis']), `customer-mix-${date}.csv`, exportMetadata(REFUND_BASIS_NOTICE_CUSTOMER_MIX))
+      return csvResponse(toCsv(report.rows, ['customerId', 'customerName', 'customerEmail', 'orderCount', 'revenueBase', 'netRevenueBase', 'netRevenueBaseBound', 'netRevenueExVatBase', 'netRevenueExVatBaseBound', 'grossProfitBase', 'grossProfitBaseBound', 'costCaptured', 'arExposureBase', 'arExposureBaseBound', 'shareOfRevenuePct', 'shareOfRevenuePctBound', 'refundsNetBasis', 'refundsGrossBasis', 'refundsUnknownBasis']), `customer-mix-${date}.csv`, exportMetadata(REFUND_BASIS_NOTICE_CUSTOMER_MIX))
     }
     case 'margin': {
       const report = await getMarginAnalyticsReport({ ...filters, pageSize: SALES_ANALYTICS_CSV_ROW_LIMIT }, { paginate: false })

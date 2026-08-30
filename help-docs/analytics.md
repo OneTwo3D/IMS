@@ -97,16 +97,26 @@ Products without a preferred supplier are listed under "Unassigned" and require 
 
 | Report | What it shows |
 |---|---|
-| **Sales Analytics** | Sales totals by product, category, customer, or channel. Cancelled orders are excluded. |
-| **Customer Mix** | Revenue, gross profit, AR exposure, and concentration by customer. |
-| **Gross Margin** | Product margin using posted COGS entries rather than recalculating FIFO. |
+| **Sales Analytics** | Invoiced sales totals by product, category, customer or channel, with net revenue after credit beside them. Cancelled orders are excluded. |
+| **Customer Mix** | Invoiced and net revenue, gross profit, AR exposure, and concentration by customer. |
+| **Gross Margin** | Product margin using posted COGS entries rather than recalculating FIFO, with revenue net of the period's credit. |
 | **Returns** | Refund and return activity by SKU, customer, and reason, with same-period shipment context. |
 | **Fulfillment KPIs** | Shipment-based fulfillment timing, fill rate, partial shipment rate, and late shipment evidence. |
 | **Throughput** | Shipment status activity by user and queue depth for picking, packing, and shipping work. |
 
 Revenue figures honour each order's `taxInclusive` flag: tax-exclusive orders use the line subtotal before VAT; tax-inclusive orders back-calculate revenue by removing VAT from the gross. Mixed-mode batches (some WC orders inclusive, some exclusive) sum correctly without double-counting.
 
-**Refunds are not deducted from Sales Analytics, Customer Mix or Gross Margin.** Those three report what was invoiced and dispatched, so a credited or returned order still contributes its full revenue, profit and margin. This is stated in each report's own notices and repeated in the CSV export's metadata rows. For a refund-aware net revenue, with the credits it could not place named beside it, use **Sales Statistics**.
+### Refunds in Sales Analytics, Customer Mix and Gross Margin
+
+These three reports **do** deduct credits, but only the credit that is the *same unit* as the figure it is deducted from. A refund's stored total is either NET (ex-VAT), GROSS (VAT-inclusive) or of unproven basis, and the two bases differ by VAT; nothing is converted between them, because on a mixed-rate order the rate that produced a gross figure is not recoverable. Whatever could not be deducted is listed in the credit columns beside the figure, and the figure itself carries a marker: **≤** means it is at most the true figure, and **?** means a bound exists but its direction is not established.
+
+- **Sales Analytics** — Revenue, tax, shipping and discount stay **as invoiced**, so the grand totals still reconcile to sales-order totals. **Net revenue** beside them deducts the gross-basis credit. Rows rank on net revenue.
+- **Customer Mix** — Revenue is as invoiced; **net revenue** deducts the gross-basis credit and **share of revenue** is measured on it, so a customer who returned everything no longer ranks on what they originally bought. **Gross profit** is measured on the ex-VAT revenue less the net-basis credit, because COGS is ex-tax — it is *not* revenue minus gross profit. Rows rank on net revenue.
+- **Gross Margin** — Revenue is dispatched ex-VAT line revenue less the net-basis credit raised in the period, so a fully credited sale no longer shows its original revenue and margin. Margin and contribution are ratios whose numerator and denominator both move when a credit cannot be placed, so they are marked **?** rather than **≤**. The totals also state any credit that reached no product row, either because the credit line named no product or because that product posted no COGS in the period.
+
+**Customer Mix withholds gross profit where cost is not known.** A customer with an in-period order that has no COGS posted in the period shows `Withheld` instead of a profit figure, and the summary says how many customers the period total covers. A missing cost is not a zero cost: counting it as zero published an undispatched order's entire revenue as profit.
+
+All of this is stated in each report's own notices and repeated in the CSV export's metadata rows; every bound marker also has its own column in the CSV. The **COGS Report** and **Inventory Turnover** are unchanged and remain refund-blind (see above).
 
 The **Returns** report shows each credit on its own recorded basis. Where a row -- or the period -- mixes ex-VAT and VAT-inclusive credits, no single total is shown, because adding the two gives an amount on neither basis; the net-basis, gross-basis and unproven-basis columns carry the whole credit instead, and rows with no single stated value sort last rather than among the zeroes.
 

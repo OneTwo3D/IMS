@@ -163,6 +163,12 @@ export type CustomerReportRow = {
   costCaptured: boolean
   /** Unpaid order value, less the GROSS-basis credit raised against those unpaid orders. */
   arExposureBase: string
+  /**
+   * AR exposure nets credit too, so it is bounded on the same terms as every other figure here. A
+   * NET-basis credit against an unpaid order is real relief this figure could not apply, which
+   * leaves the published exposure at most the true one.
+   */
+  arExposureBaseBound: DerivedFigureBound
   /** Share of the period's REFUND-AWARE revenue, so a customer who returned everything ranks on it. */
   shareOfRevenuePct: string
   /** A ratio moves both its parts; it is never an upper bound. See `shareFigureBound`. */
@@ -963,6 +969,7 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
       grossProfitBaseBound: 'exact',
       costCaptured: true,
       arExposureBase: '0',
+      arExposureBaseBound: 'exact',
       shareOfRevenuePct: '0',
       shareOfRevenuePctBound: 'exact',
       refundsGrossBasis: '0',
@@ -1012,6 +1019,7 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
     grossProfit: new Prisma.Decimal(0),
     arExposure: new Prisma.Decimal(0),
     credits: emptyCredits(),
+    unpaidCredits: emptyCredits(),
     costCapturedRows: 0,
   }
   const netRevenueByGroup = new Map<string, Prisma.Decimal>()
@@ -1023,6 +1031,7 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
     period_.revenueExVat = period_.revenueExVat.add(group.revenueExVat)
     period_.arExposure = period_.arExposure.add(group.arExposure.sub(comparableCredit(group.unpaidCredits, 'GROSS')))
     mergeCredits(period_.credits, group.credits)
+    mergeCredits(period_.unpaidCredits, group.unpaidCredits)
     if (group.costCaptured) {
       period_.costCapturedRows += 1
       const netRevenueExVat = group.revenueExVat.sub(comparableCredit(group.credits, 'NET'))
@@ -1067,6 +1076,10 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
           : 'indeterminate',
         costCaptured: row.costCaptured,
         arExposureBase: moneyString(row.arExposure.sub(comparableCredit(row.unpaidCredits, 'GROSS')), baseCurrency),
+        arExposureBaseBound: netLinearFigureBoundDecimal({
+          basisComplete: creditBasisComplete(row.unpaidCredits, 'GROSS'),
+          unplacedCredit: unplacedCredit(row.unpaidCredits, 'GROSS'),
+        }),
         shareOfRevenuePct: pctString(netRevenue, period_.netRevenue),
         shareOfRevenuePctBound: shareBound,
         refundsGrossBasis: moneyString(row.credits.gross, baseCurrency),
@@ -1102,6 +1115,10 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
       }),
       costCapturedRows: String(period_.costCapturedRows),
       arExposureBase: moneyString(period_.arExposure, baseCurrency),
+      arExposureBaseBound: netLinearFigureBoundDecimal({
+        basisComplete: creditBasisComplete(period_.unpaidCredits, 'GROSS'),
+        unplacedCredit: unplacedCredit(period_.unpaidCredits, 'GROSS'),
+      }),
       refundsGrossBasis: moneyString(period_.credits.gross, baseCurrency),
       refundsNetBasis: moneyString(period_.credits.net, baseCurrency),
       refundsUnknownBasis: moneyString(period_.credits.unknown, baseCurrency),
