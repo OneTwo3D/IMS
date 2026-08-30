@@ -4797,3 +4797,252 @@ test('[o3d-batch-ret] the drain proof refuses an UNCOUNTABLE census, because bas
   assert.match(drained.stdout, /^RC=0$/m,
     `THE FINDING: the port is reported DRAINED over a census that was never read, with a listener on it:\n${drained.stdout}${drained.stderr}`)
 })
+
+// ---------------------------------------------------------------------------
+// 10 — THE REPOSITORY WALK, AND WHAT STOPS THE NEXT UNCHECKED SUBSTITUTION
+//
+// This is the third round in which the same hazard has been found somewhere new: in the wrapper's
+// `*_locked` bodies (r30), in the crontab writes inside them (r30), and now in a COMPUTATION that
+// feeds one (r31). The roster of bodies in section 5 stopped a sixteenth body inheriting it
+// silently. Nothing stopped a sixteenth SUBSTITUTION, which is what this walk is for.
+//
+// THE RULE, and why it is stated about grammar rather than about intent: a command substitution
+// inside a function that some caller invokes as `f … || return` runs with errexit suspended, so
+// its failure is silent unless the statement takes the status itself. Every such substitution in
+// the crontab/fence subsystem is therefore either CHECKED, or on the roster below with a reason
+// that says why its failure is already a refusal. There is no third category, and adding one
+// fails this test until whoever adds it has read what the failure says.
+// ---------------------------------------------------------------------------
+
+type ShellBody = { file: string; name: string; first: number; lines: string[] }
+
+/** Every top-level function in the four shell files, by grammar. */
+function shellBodiesIn(file: string, src: string): ShellBody[] {
+  const lines = src.split('\n')
+  const found: ShellBody[] = []
+  for (let i = 0; i < lines.length; i++) {
+    const match = /^([a-z_][a-z0-9_]*)\(\) \{$/.exec(lines[i])
+    if (!match) continue
+    const end = lines.indexOf('}', i + 1)
+    if (end < 0) continue
+    found.push({ file, name: match[1], first: i + 2, lines: lines.slice(i + 1, end) })
+  }
+  return found
+}
+
+const SHELL_FILES: Array<[string, string]> = [
+  ['scripts/lib/crontab-lock.sh', CRONTAB_LOCK_LIB_SRC],
+  ['scripts/deploy.sh', DEPLOY_SH],
+  ['scripts/update.sh', UPDATE_SH],
+  ['scripts/install.sh', INSTALL_SH],
+]
+const ALL_SHELL_BODIES = SHELL_FILES.flatMap(([f, src]) => shellBodiesIn(f, src))
+const BY_NAME = new Map(ALL_SHELL_BODIES.map((b) => [b.name, b]))
+
+/**
+ * The functions that run with errexit SUSPENDED, and everything they reach.
+ *
+ * The seed is every `*_locked` body — `with_crontab_lock` runs those as `"$@" || rc=$?` — plus
+ * every function these files call on the LEFT of `||` or as an `if` condition. It is then closed
+ * transitively, because the suspension is dynamic: `plan_crontab_unfence` is not called with `||`
+ * by anything except `unfence_cron_locked`, and that is exactly how the CRITICAL got in. Scoped to
+ * the crontab/fence subsystem, which is what this file is about.
+ */
+function errexitSuspendedFunctions(): Set<string> {
+  const seed = new Set(ALL_SHELL_BODIES.filter((b) => b.name.endsWith('_locked')).map((b) => b.name))
+  for (const [, src] of SHELL_FILES) {
+    for (const line of src.split('\n')) {
+      if (/^\s*#/.test(line)) continue
+      const piped = /^\s*([a-z_][a-z0-9_]*)\b[^|&]*\|\|/.exec(line)
+      if (piped && BY_NAME.has(piped[1])) seed.add(piped[1])
+      const cond = /^\s*if !?\s*([a-z_][a-z0-9_]*)\b/.exec(line)
+      if (cond && BY_NAME.has(cond[1])) seed.add(cond[1])
+    }
+  }
+  const subsystem = /cron|fence|crontab|drain|port_listener|lock/i
+  const reached = new Set([...seed].filter((n) => subsystem.test(n)))
+  const queue = [...reached]
+  while (queue.length) {
+    const body = BY_NAME.get(queue.pop()!)!
+    for (const line of body.lines) {
+      if (/^\s*#/.test(line)) continue
+      for (const [, word] of line.matchAll(/\b([a-z_][a-z0-9_]*)\b/g)) {
+        if (!BY_NAME.has(word) || reached.has(word)) continue
+        reached.add(word)
+        queue.push(word)
+      }
+    }
+  }
+  return reached
+}
+
+/** A statement that opens `"$(` without closing it runs on to the next line. */
+const opensSubstitution = (line: string): boolean => {
+  const at = line.indexOf('"$(')
+  return at >= 0 && !line.slice(at + 3).includes(')"')
+}
+
+/** Does this whole statement take the status of what it substituted? */
+const takesItsStatus = (statement: string): boolean =>
+  /\|\|\s*(return\b|rc=\$\?|\{|die\b|true\b|continue\b|[a-z_][a-z0-9_]*=)/.test(statement)
+  || /^\s*if\s+!/.test(statement)
+
+/** Every command substitution in <body> whose statement does NOT take its status. */
+function uncheckedSubstitutionsIn(body: ShellBody): string[] {
+  const found: string[] = []
+  for (let i = 0; i < body.lines.length; i++) {
+    if (/^\s*#/.test(body.lines[i])) continue
+    let statement = body.lines[i]
+    let j = i
+    while (j + 1 < body.lines.length && (opensSubstitution(statement) || /\\$/.test(statement))) {
+      j += 1
+      statement += `\n${body.lines[j]}`
+    }
+    const flat = statement.replace(/\n\s*/g, ' ')
+    // `$((` is arithmetic, not a subprocess, and cannot fail the way a command can.
+    if (/\$\(/.test(flat.replace(/\$\(\(/g, 'ARITH')) && !takesItsStatus(flat)) {
+      found.push(`${body.file}:${body.name}» ${body.lines[i].trim()}`)
+    }
+    i = j
+  }
+  return found
+}
+
+/**
+ * THE ROSTER. Every command substitution inside an errexit-suspended body that does NOT take its
+ * own status, and the reason its failure is already a refusal. A new entry here is a claim that
+ * needs proving; the alternative is to check the status, which is nearly always cheaper.
+ */
+const UNCHECKED_BUT_FAIL_CLOSED: Record<string, string> = {
+  // Message text on a path that has ALREADY refused. `missing` is established non-empty above, the
+  // plan is `refuse`, nothing will be installed and no backup deleted. A `sed` that failed here
+  // costs the operator the indented list, not the crontab.
+  'scripts/lib/crontab-lock.sh:plan_crontab_unfence» $(printf \'%s\\n\' "${missing}" | sed \'s/^/    /\')"': 'refusal message; the refusal is already decided',
+
+  // `EUID` is set by bash on every startup, so the `:-` fallback never fires. If it somehow did,
+  // an empty value fails the `-ne 0` test as zero and the function proceeds as root — which is the
+  // branch this guard exists to allow, and the very next thing it does is a privileged operation
+  // that fails on its own if it is not.
+  'scripts/lib/crontab-lock.sh:require_crontab_command» if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then': 'EUID is always set by bash; the fallback is unreachable',
+
+  // `dirname` on a path this script composed itself. A failure yields the empty string, and the
+  // `mkdir -p ""` that follows fails, and THAT status is taken.
+  'scripts/install.sh:publish_durable_file» dir="$(dirname "$target")"': 'an empty result fails the mkdir below, which is checked',
+  'scripts/install.sh:publish_durable_dropin» dir="$(dirname "$target")"': 'an empty result fails the mkdir below, which is checked',
+  'scripts/install.sh:publish_durable_dropin» parent="$(dirname "$dir")"': 'an empty result fails the mkdir below, which is checked',
+
+  // `printf %q` is a shell builtin operating on this script's own argv. It has no failure mode
+  // that leaves the shell running.
+  'scripts/install.sh:run_as_user» su -s /bin/bash -c "$(printf \'%q \' "$@")" "$user"': 'printf is a builtin over our own argv',
+
+  // MARKER CONTENT, not marker publication. These compose the text of the cutover marker; the
+  // marker is then published through publish_durable_file, which fsyncs and reads it back and
+  // whose status IS taken. A `date` that failed leaves a field empty in a file that is diagnostic,
+  // and every decision the resume makes is read with env_file_value, which fails closed on a
+  // missing field.
+  'scripts/install.sh:write_cutover_marker» echo "fenced_at=$(date -Iseconds)"': 'marker text; publication is checked, and readers fail closed on a missing field',
+  'scripts/install.sh:write_cutover_marker» echo "phase=$(if ${FENCE_ARMED}; then echo stopping; elif ${CUTOVER_ARMING}; then echo arming; else echo none; fi)"': 'marker text; a shell `if` with no external command',
+  'scripts/install.sh:write_cutover_marker» echo "reboot_fence=$(${REBOOT_FENCE_INSTALLED} && echo installed || echo absent)"': 'marker text; a shell boolean with no external command',
+  'scripts/install.sh:write_cutover_marker» echo "db_connect_fence=$(${DB_FENCE_UP} && echo held || echo released)"': 'marker text; a shell boolean with no external command',
+  'scripts/update.sh:write_fence_marker» echo "fenced_at=$(date -Iseconds)"': 'marker text; publication is checked, and readers fail closed on a missing field',
+  'scripts/update.sh:write_fence_marker» echo "phase=$(if $FENCE_ARMED; then echo stopping; elif $CUTOVER_ARMING; then echo arming; else echo none; fi)"': 'marker text; a shell `if` with no external command',
+  'scripts/update.sh:write_fence_marker» echo "reboot_fence=$($REBOOT_FENCE_INSTALLED && echo installed || echo absent)"': 'marker text; a shell boolean with no external command',
+  'scripts/update.sh:write_fence_marker» echo "db_connect_fence=$($DB_FENCE_UP && echo held || echo released)"': 'marker text; a shell boolean with no external command',
+  'scripts/update.sh:publish_fence_recovery_record» printf \'recorded_at=%s\\n\' "$(date -Iseconds)"': 'record text; publication is checked, and readers fail closed on a missing field',
+}
+
+test('[o3d-batch-ret] every command substitution in an errexit-suspended body is checked, or on the roster with a reason', () => {
+  const suspended = errexitSuspendedFunctions()
+
+  // NOT VACUOUS, PART ONE: the walk reached the files, found the bodies, and reached the function
+  // the CRITICAL was in — which no caller invokes with `||` directly, and which is therefore only
+  // in this set because the closure followed `unfence_cron_locked` into it. If that stops being
+  // true the walk has stopped looking where the finding was.
+  assert.ok(suspended.size >= 30, `the closure found only ${suspended.size} functions`)
+  for (const required of ['plan_crontab_unfence', 'crontab_is_unmoved_since_backup',
+    'crontab_unfence_projection', 'crontab_unmanaged_lines_missing_from', 'port_listener_census',
+    'crontab_read_says_no_crontab', 'unfence_cron_locked', 'write_crontab_for']) {
+    assert.ok(suspended.has(required),
+      `${required}() runs with errexit suspended and the walk must reach it`)
+  }
+
+  const unchecked = [...suspended].sort()
+    .flatMap((name) => uncheckedSubstitutionsIn(BY_NAME.get(name)!))
+
+  // NOT VACUOUS, PART TWO: these bodies do contain substitutions, and most of them ARE checked —
+  // so an empty unchecked list below is a property of the code and not of a walk that found nothing.
+  const total = [...suspended].reduce((n, name) => n + BY_NAME.get(name)!.lines
+    .filter((l) => !/^\s*#/.test(l) && /\$\(/.test(l.replace(/\$\(\(/g, 'A'))).length, 0)
+  assert.ok(total >= 50, `the walk found only ${total} substitutions in ${suspended.size} bodies`)
+  assert.ok(total - unchecked.length >= 30,
+    `only ${total - unchecked.length} of ${total} substitutions came back CHECKED — a rule that `
+    + `matches nothing would report every one of them as unchecked, and a rule that matches `
+    + `everything would report none, so both directions are pinned here`)
+
+  const surprises = unchecked.filter((entry) => !(entry in UNCHECKED_BUT_FAIL_CLOSED))
+  assert.deepEqual(surprises, [],
+    'A command substitution inside a function some caller invokes as `f … || return` runs with '
+    + 'errexit SUSPENDED — its failure is silent, and an empty result is handed on as if it were '
+    + 'an answer. That is the r30 write hazard and the r31 planner CRITICAL, twice over. Take the '
+    + 'status (`x="$(…)" || { … return 1; }`), and where an empty result is itself a legitimate '
+    + 'answer, establish success positively as run_crontab_projection and the subsequence sentinel '
+    + 'do. Only add it to UNCHECKED_BUT_FAIL_CLOSED with a reason that says why its failure is '
+    + 'already a refusal.')
+
+  // …and the roster does not outlive what it describes: an entry that no longer matches anything
+  // is a reason nobody can check, and it hides the next real one behind stale text.
+  assert.deepEqual(Object.keys(UNCHECKED_BUT_FAIL_CLOSED).filter((k) => !unchecked.includes(k)), [],
+    'a roster entry that matches no line in the shipped scripts must be deleted')
+
+  // THE SITES THE CRITICAL NAMED CARRY NOTHING AT ALL. Stated separately from the roster, because
+  // "the roster is unchanged" would still pass if one of these were quietly added to it.
+  for (const name of ['crontab_is_unmoved_since_backup', 'crontab_unfence_projection',
+    'crontab_unmanaged_lines_missing_from', 'run_crontab_projection', 'run_crontab_missing_comparison',
+    'port_listener_census', 'crontab_read_says_no_crontab', 'prepare_crontab_lock',
+    'publish_cron_backup', 'unfence_cron_locked', 'resume_restore_cron_locked',
+    'restore_cron_from_backup_locked']) {
+    const body = BY_NAME.get(name)
+    if (!body) continue
+    assert.deepEqual(uncheckedSubstitutionsIn(body), [],
+      `${name}() decides what to install or what to delete; no substitution in it may go unchecked`)
+  }
+})
+
+test('[o3d-batch-ret] the unchecked-substitution rule can FAIL, on every shape this file actually uses', () => {
+  // The two empty lists above mean nothing unless the rule that produced them can produce a
+  // non-empty one. Run against a body written to break it, one line at a time.
+  const planted: ShellBody = {
+    file: 'synthetic', name: 'planted', first: 1,
+    lines: [
+      '  # x="$(awk …)"   <- a comment must NOT be flagged',                    // 1
+      '  x="$(awk \'{print}\' <<< "$in")"',                                     // 2  UNCHECKED
+      '  y="$(awk \'{print}\' <<< "$in")" || return 1',                         // 3  checked
+      '  if ! z="$(ls -A "$d")"; then return 1; fi',                            // 4  checked
+      '  n=$(( n + 1 ))',                                                       // 5  arithmetic
+      '  [[ "$a" == "$(projection "$b")" ]]',                                   // 6  UNCHECKED (the CRITICAL\'s own shape)
+      '  w="$(cat "$f" 2>/dev/null)" || w=""',                                  // 7  checked
+      '  multi="$(',                                                            // 8  UNCHECKED, runs on
+      '    some_command',
+      '  )"',
+      '  ok="$(',                                                               // 11 checked, runs on
+      '    some_command',
+      '  )" || return 1',
+      '  plain="no substitution here"',                                         // 14
+    ],
+  }
+  assert.deepEqual(uncheckedSubstitutionsIn(planted), [
+    'synthetic:planted» x="$(awk \'{print}\' <<< "$in")"',
+    'synthetic:planted» [[ "$a" == "$(projection "$b")" ]]',
+    'synthetic:planted» multi="$(',
+  ], 'the rule must flag the bare capture, the substitution inside `[[ ]]` — which is exactly how '
+   + 'crontab_is_unmoved_since_backup threw its projection\'s status away — and the unchecked '
+   + 'multi-line capture, and must flag none of the comment, the checked forms, or the arithmetic')
+
+  // AND THE CLOSURE CAN FAIL TOO: a function reached by nothing is not in it, so the walk above is
+  // selecting rather than returning everything it parsed.
+  const suspended = errexitSuspendedFunctions()
+  assert.ok(!suspended.has('urlencode'),
+    'the closure must not sweep in every function in these files, or its scoping means nothing')
+  assert.ok(suspended.size < ALL_SHELL_BODIES.length,
+    `the closure (${suspended.size}) must be a subset of all ${ALL_SHELL_BODIES.length} bodies`)
+})
