@@ -22,8 +22,8 @@
  * prepare_crontab_lock's own regressions rest on. Everything else below is measured.
  */
 import assert from 'node:assert/strict'
-import { execFileSync } from 'node:child_process'
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import test, { type TestContext } from 'node:test'
 
@@ -68,21 +68,87 @@ function rig(functions: string[], body: string, extra = ''): string {
   ].join('\n')
 }
 
+/**
+ * THE PUBLISHER AND EVERYTHING IT RESOLVES ITS DESTINATION WITH (o3d-rn10).
+ *
+ * publish_durable_file() no longer pins `$dir` by stat-ing that pathname; it asks
+ * publish_trust_root() which trusted ancestor the destination lies under and walks down from
+ * there with pin_dir_beneath_root(). All four are SHIPPED TEXT, lifted rather than re-typed —
+ * including the trust-root TABLE, which names installer variables. A test therefore states where
+ * the roots are the way the installer does, by defining ${APP_DIR} and ${DATA_DIR}, and never by
+ * re-typing the table itself.
+ */
+const PUBLISHER = ['fsync_path', 'publish_trust_root_candidates', 'publish_trust_root', 'pin_dir_beneath_root', 'publish_durable_file']
+
+/** The five variables publish_trust_root_candidates() reads. Anything unnamed stays EMPTY, which
+ *  the table skips — so a destination outside the roots a test declares is refused, as it is in
+ *  the installer. */
+function roots(where: { app?: string, data?: string, cutover?: string, snapshot?: string, ca?: string }): string {
+  return [
+    `APP_DIR=${q(where.app ?? '')}`,
+    `DATA_DIR=${q(where.data ?? '')}`,
+    `CUTOVER_STATE_DIR=${q(where.cutover ?? '')}`,
+    `DB_ENV_SNAPSHOT_DIR=${q(where.snapshot ?? '')}`,
+    `DB_CA_PUBLISH_DIR=${q(where.ca ?? '')}`,
+  ].join('\n')
+}
+
 type Run = { status: number, stdout: string, stderr: string }
 
-function runBash(script: string, opts: { cwd?: string, env?: Record<string, string> } = {}): Run {
-  try {
-    const stdout = execFileSync('bash', ['-c', script], {
-      cwd: opts.cwd ?? REPO,
-      encoding: 'utf8',
-      env: { ...process.env, ...(opts.env ?? {}) },
-      stdio: ['pipe', 'pipe', 'pipe'],
-    })
-    return { status: 0, stdout, stderr: '' }
-  } catch (error) {
-    const e = error as { status?: number, stdout?: string, stderr?: string }
-    return { status: e.status ?? 1, stdout: e.stdout ?? '', stderr: e.stderr ?? '' }
+/**
+ * THE WALL CLOCK, WHICH IS THE ONLY BRAKE THAT DOES NOT NEED THE SHIM'S COOPERATION (o3d-rn10).
+ *
+ * The two guards inside every shim stop a shim that RE-ENTERS ITSELF and a shim that RECORDS
+ * without bound. Neither of them is consulted by a shim that simply blocks — one that spins, waits
+ * on a lock, or reads a pipe nobody writes — and that is the same failure class: the eleven-hour
+ * runaway this file already carries a note about occupied a worker until a human noticed it.
+ *
+ * So every execution here is bounded from OUTSIDE the script, by `timeout`, and NOT by
+ * `execFileSync`'s own `timeout` option: Node kills the process it spawned, and a shell leaves
+ * children. GNU `timeout` without `--foreground` runs the managed command in its OWN PROCESS GROUP
+ * and signals the GROUP, so a background descendant a shim left behind dies with it. `-k` follows
+ * the TERM with a KILL for anything that ignores the first.
+ *
+ * A DEADLINE THAT PASSES IS A THROWN ERROR AND NEVER A `Run`. A harness that returned
+ * `{ status: 124 }` would let a test that expects a refusal (`status === 1`) fail with a confusing
+ * diff, or — worse — let one that only greps stderr pass. The failure has to name itself.
+ */
+const RUN_BASH_DEADLINE_MS = 60_000
+/** `timeout`'s own exit codes: 124 when the TERM did it, 137 when the follow-up KILL did. */
+const TIMEOUT_EXPIRED = 124
+const TIMEOUT_KILLED = 137
+/** Output past this is a runaway too, and is not read into this process's memory. */
+const RUN_BASH_MAX_OUTPUT_BYTES = 4 * 1024 * 1024
+
+class HarnessRunaway extends Error {}
+
+function runBash(script: string, opts: { cwd?: string, env?: Record<string, string>, deadlineMs?: number } = {}): Run {
+  const deadlineMs = opts.deadlineMs ?? RUN_BASH_DEADLINE_MS
+  const seconds = Math.max(1, Math.ceil(deadlineMs / 1000))
+  const result = spawnSync(REAL.timeout, ['-k', '2', String(seconds), 'bash', '-c', script], {
+    cwd: opts.cwd ?? REPO,
+    encoding: 'utf8',
+    env: { ...process.env, ...(opts.env ?? {}) },
+    // An EMPTY stdin rather than this process's: a shim that reads stdin then gets EOF instead of
+    // blocking on a terminal that will never answer.
+    input: '',
+    maxBuffer: RUN_BASH_MAX_OUTPUT_BYTES,
+  })
+  if (result.error) {
+    throw new HarnessRunaway(`the harness could not bound this execution: ${result.error.message}`)
   }
+  if (result.status === TIMEOUT_EXPIRED || result.status === TIMEOUT_KILLED || result.signal) {
+    throw new HarnessRunaway(
+      `harness deadline of ${seconds}s exceeded — the script under test did not finish and its process GROUP was terminated. `
+      + `stderr: ${(result.stderr ?? '').slice(0, 2000)}`,
+    )
+  }
+  return { status: result.status ?? 1, stdout: result.stdout ?? '', stderr: result.stderr ?? '' }
+}
+
+/** A synchronous pause, for the one assertion that has to watch a killed descendant stay dead. */
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
 }
 
 /**
@@ -114,6 +180,8 @@ const REAL = {
   ln: realBin('ln'),
   id: realBin('id'),
   wc: realBin('wc'),
+  timeout: realBin('timeout'),
+  sleep: realBin('sleep'),
 } as const
 
 /** A shell literal. Every path a shim names goes through this. */
@@ -197,6 +265,51 @@ test('[o3d-czpy] a shim that delegates to the command it shadows by bare name fa
     'and nothing may be appended to it')
 })
 
+test('[o3d-rn10] a shim that blocks without delegating or recording is failed by the harness deadline, and its descendants die with it', (t) => {
+  const root = createTempDirSync('ims-rn10-deadline-', t)
+  const tick = join(root, 'tick')
+  writeFileSync(tick, '')
+
+  // NEITHER OF THE TWO EXISTING BRAKES CAN SEE THIS ONE, which is the finding. It never delegates,
+  // so the re-entry marker is never reached a second time; it never calls ims_shim_append, so the
+  // line cap is never consulted. It just blocks — the shape of a shim that waits on a lock, or
+  // reads a pipe nobody writes, or spins.
+  //
+  // The background descendant ticks a file so that "the process GROUP was terminated" is something
+  // this test can OBSERVE rather than assume. It records with a raw `>>` and deliberately, outside
+  // the bounded append: this recording is the proof that the bound worked, and it is bounded by
+  // the deadline itself. Its output goes to /dev/null so that it cannot hold the harness's own
+  // pipes open — a survivor must show up as a still-growing file, never as a second hang.
+  const bin = shimDir(t, {
+    mktemp: [
+      `( while :; do printf 'x' >> ${q(tick)}; ${REAL.sleep} 0.05; done ) >/dev/null 2>&1 &`,
+      'while :; do :; done',
+    ].join('\n'),
+  })
+
+  const started = Date.now()
+  assert.throws(
+    () => runBash('mktemp -d', { cwd: root, env: { PATH: `${bin}:${process.env.PATH ?? ''}` }, deadlineMs: 3000 }),
+    /harness deadline of 3s exceeded/,
+    'a shim that simply blocks must FAIL the harness rather than occupy it',
+  )
+  const elapsed = Date.now() - started
+  assert.ok(elapsed >= 2_500, `the deadline must be what ended it, not an earlier error (${elapsed}ms)`)
+  assert.ok(elapsed < 30_000, `and it must end AT the deadline rather than run on (${elapsed}ms)`)
+
+  // NOT VACUOUS: the blocking shim really was reached, and it really did leave a descendant running.
+  const atDeadline = statSync(tick).size
+  assert.ok(atDeadline > 5, `the blocking shim must have been reached and left a descendant ticking: ${atDeadline} ticks`)
+
+  // AND THE DESCENDANT DIED WITH THE SHELL. This is why the bound is `timeout` and not
+  // execFileSync's own `timeout` option: Node kills the process it spawned, and a shell leaves
+  // children behind. `timeout` without --foreground puts the command in its own process group and
+  // signals the GROUP.
+  sleepSync(700)
+  assert.equal(statSync(tick).size, atDeadline,
+    'a descendant of the killed shell must not still be running after the deadline')
+})
+
 // ---------------------------------------------------------------------------
 // SITE 1 and 2 — publish_durable_file(), the publisher ${APP_DIR}/.env,
 // ${APP_DIR}/.deploy-meta, the cutover marker and the cron backup all go through.
@@ -221,10 +334,10 @@ test('[o3d-czpy] publish_durable_file refuses a symlink planted at its staging d
   // installer does. `mkdir -p` would work happily inside it; a plain `mkdir` fails with EEXIST.
   symlinkSync(victim, join(appDir, '.ims-publish'))
 
-  const script = rig(['fsync_path', 'publish_durable_file'], [
+  const script = rig(PUBLISHER, [
     `printf 'SECRET=abc\\n' | publish_durable_file "${appDir}/.env" "" 600`,
     'echo "rc=$?"',
-  ].join('\n'))
+  ].join('\n'), roots({ app: appDir }))
   const run = runBash(script)
 
   assert.match(run.stdout, /^rc=1$/m, 'the publication must REFUSE rather than stage inside a directory it did not create')
@@ -242,10 +355,10 @@ test('[o3d-czpy] publish_durable_file replaces a symlink planted at its target i
   chmodSync(victim, 0o600)
   symlinkSync(victim, join(appDir, '.env'))
 
-  const script = rig(['fsync_path', 'publish_durable_file'], [
+  const script = rig(PUBLISHER, [
     `printf 'SECRET=abc\\n' | publish_durable_file "${appDir}/.env" "" 600`,
     'echo "rc=$?"',
-  ].join('\n'))
+  ].join('\n'), roots({ app: appDir }))
   const run = runBash(script)
 
   assert.match(run.stdout, /^rc=0$/m, run.stderr)
@@ -265,10 +378,10 @@ test('[o3d-czpy] publish_durable_file refuses a DIRECTORY planted at its target 
   // and the service failed to start. `mv -T` refuses, and the caller dies with the reason.
   mkdirSync(join(appDir, '.env'))
 
-  const script = rig(['fsync_path', 'publish_durable_file'], [
+  const script = rig(PUBLISHER, [
     `printf 'SECRET=abc\\n' | publish_durable_file "${appDir}/.env" "" 600`,
     'echo "rc=$?"',
-  ].join('\n'))
+  ].join('\n'), roots({ app: appDir }))
   const run = runBash(script)
 
   assert.match(run.stdout, /^rc=1$/m, 'the publication must refuse a directory at the target name')
@@ -291,10 +404,10 @@ test('[o3d-czpy] publish_durable_file creates its temporary INSIDE the staging d
     mktemp: `ims_shim_append ${q(log)} "$(printf '%s\\t%s' "$PWD" "$*")"\nexec ${REAL.mktemp} "$@"`,
   })
 
-  const script = rig(['fsync_path', 'publish_durable_file'], [
+  const script = rig(PUBLISHER, [
     `printf 'SECRET=abc\\n' | publish_durable_file "${appDir}/.env" "" 600`,
     'echo "rc=$?"',
-  ].join('\n'))
+  ].join('\n'), roots({ app: appDir }))
   const run = runBash(script, { env: { PATH: `${bin}:${process.env.PATH ?? ''}` } })
 
   assert.match(run.stdout, /^rc=0$/m, run.stderr)
@@ -318,10 +431,10 @@ test('[o3d-czpy] publish_durable_file applies the mode before the content, so a 
     chmod: `last="\${@: -1}"\nsz=$(${REAL.stat} -c '%s' "$last" 2>/dev/null || echo -1)\nims_shim_append ${q(log)} "$(printf '%s\\t%s' "$sz" "$*")"\nexec ${REAL.chmod} "$@"`,
   })
 
-  const script = rig(['fsync_path', 'publish_durable_file'], [
+  const script = rig(PUBLISHER, [
     `printf 'SECRET=abcdefghij\\n' | publish_durable_file "${appDir}/.env" "" 600`,
     'echo "rc=$?"',
-  ].join('\n'))
+  ].join('\n'), roots({ app: appDir }))
   const run = runBash(script, { env: { PATH: `${bin}:${process.env.PATH ?? ''}` } })
 
   assert.match(run.stdout, /^rc=0$/m, run.stderr)
@@ -357,10 +470,10 @@ test('[o3d-czpy] publish_durable_file publishes into the directory it staged in,
     ].join('\n'),
   })
 
-  const script = rig(['fsync_path', 'publish_durable_file'], [
+  const script = rig(PUBLISHER, [
     `printf 'github.com ssh-ed25519 AAAA\\n' | publish_durable_file "${join(gitSsh, 'known_hosts')}" "" 600`,
     'echo "rc=$?"',
-  ].join('\n'))
+  ].join('\n'), roots({ data: dataDir }))
   const run = runBash(script, { env: { PATH: `${bin}:${process.env.PATH ?? ''}` } })
 
   // NOT VACUOUS: the swap really happened, and it happened while the publication was in flight.
@@ -373,6 +486,195 @@ test('[o3d-czpy] publish_durable_file publishes into the directory it staged in,
   assert.deepEqual(readdirSync(victim), ['known_hosts'], 'and must leave nothing else in it')
   assert.equal(readFileSync(join(moved, 'known_hosts'), 'utf8'), 'github.com ssh-ed25519 AAAA\n',
     'it lands in the directory the staging directory is IN, which is the one whose device was checked')
+})
+
+// ---------------------------------------------------------------------------
+// THE INITIAL PIN (o3d-rn10). Round 2 proved the destination did not MOVE after it was pinned;
+// it proved nothing about WHICH directory got pinned, because the pin was a stat of ${dir}. The
+// destination is now walked down from a trusted ancestor, and these are the walk's own cases.
+// ---------------------------------------------------------------------------
+
+test('[o3d-rn10] publish_durable_file refuses a destination directory replaced by a symlink BEFORE the pin, and leaves the victim untouched', (t) => {
+  const root = createTempDirSync('ims-rn10-prepin-', t)
+  const dataDir = join(root, 'data')
+  const gitSsh = join(dataDir, 'git-ssh')
+  // /root/.ssh, in the shipped case. A service-owned known_hosts published into it is a root login.
+  const victim = join(root, 'root-dot-ssh')
+  mkdirSync(gitSsh, { recursive: true })
+  mkdirSync(victim)
+  writeFileSync(join(victim, 'known_hosts'), 'UNTOUCHED\n')
+
+  // THE PLANT, AND IT HAPPENS BEFORE THE INSTALLER RUNS AT ALL — which is what makes this case
+  // different from the parent-swap regression above. ${DATA_DIR} belongs to ${APP_USER} on every
+  // upgrade, so replacing the `git-ssh` the previous run created costs them one rename and one
+  // symlink, with no race to win.
+  renameSync(gitSsh, join(dataDir, 'git-ssh.real'))
+  symlinkSync(victim, gitSsh)
+
+  // 0700 AND OWNED BY THIS UID, DELIBERATELY: those are exactly the properties the post-pin checks
+  // ask of the staging directory, so if the walk followed this link every later check would PASS.
+  // The only thing that can refuse this publication is the walk itself.
+  chmodSync(victim, 0o700)
+  assert.equal(statSync(victim).uid, process.getuid?.(), 'the victim must be owned by the uid the publisher runs as, or this test states nothing')
+
+  const script = rig(PUBLISHER, [
+    `printf 'PWNED\\n' | publish_durable_file "${join(gitSsh, 'known_hosts')}" "" 600`,
+    'echo "rc=$?"',
+  ].join('\n'), roots({ data: dataDir }))
+  const run = runBash(script)
+
+  assert.match(run.stdout, /^rc=1$/m, 'a destination that is a symlink when the walk reaches it must be REFUSED, not pinned')
+  assert.equal(readFileSync(join(victim, 'known_hosts'), 'utf8'), 'UNTOUCHED\n',
+    'the publication must not land in the directory the planted link chose')
+  assert.deepEqual(readdirSync(victim).sort(), ['known_hosts'],
+    'and nothing may be created inside it — no staging directory, no temporary')
+  assert.equal(lstatSync(gitSsh).isSymbolicLink(), true, 'the plant must still be there: nothing followed it and nothing replaced it')
+})
+
+test('[o3d-rn10] publish_durable_file refuses a destination component swapped between the check that accepted it and the step into it', (t) => {
+  const root = createTempDirSync('ims-rn10-walkswap-', t)
+  const dataDir = join(root, 'data')
+  const gitSsh = join(dataDir, 'git-ssh')
+  const victim = join(root, 'root-dot-ssh')
+  mkdirSync(gitSsh, { recursive: true })
+  mkdirSync(victim)
+  writeFileSync(join(victim, 'known_hosts'), 'UNTOUCHED\n')
+  chmodSync(victim, 0o700)
+  const fired = join(root, 'swapped')
+
+  // The walk's check on an EXISTING component is `stat -c '%F' git-ssh`, made from inside
+  // ${DATA_DIR}. The shim answers TRUTHFULLY — it IS a directory at the instant it is asked — and
+  // only then swaps it, which is the window the finding describes made deterministic.
+  const bin = shimDir(t, {
+    stat: [
+      `${REAL.stat} "$@"`,
+      'status=$?',
+      `if [[ "$*" == *git-ssh* && ! -e ${q(fired)} ]]; then`,
+      `  : > ${q(fired)}`,
+      `  ${REAL.mv} -T ${q(gitSsh)} ${q(join(dataDir, 'git-ssh.moved'))}`,
+      `  ${REAL.ln} -s ${q(victim)} ${q(gitSsh)}`,
+      'fi',
+      'exit $status',
+    ].join('\n'),
+  })
+
+  const script = rig(PUBLISHER, [
+    `printf 'PWNED\\n' | publish_durable_file "${join(gitSsh, 'known_hosts')}" "" 600`,
+    'echo "rc=$?"',
+  ].join('\n'), roots({ data: dataDir }))
+  const run = runBash(script, { env: { PATH: `${bin}:${process.env.PATH ?? ''}` } })
+
+  // NOT VACUOUS: the check really was made, and the swap really happened after it.
+  assert.ok(existsSync(fired), 'the walk must actually have lstat-ed the existing component')
+  assert.equal(lstatSync(gitSsh).isSymbolicLink(), true, 'and the component must have been swapped for a link')
+
+  assert.match(run.stdout, /^rc=1$/m, 'a component swapped after its check must refuse the publication')
+  assert.equal(readFileSync(join(victim, 'known_hosts'), 'utf8'), 'UNTOUCHED\n')
+  assert.deepEqual(readdirSync(victim).sort(), ['known_hosts'], 'and nothing may be created inside the directory the link chose')
+})
+
+test('[o3d-rn10] publish_durable_file refuses a destination that lies under no trusted ancestor', (t) => {
+  const root = createTempDirSync('ims-rn10-noroot-', t)
+  const appDir = join(root, 'app')
+  const elsewhere = join(root, 'elsewhere')
+  mkdirSync(appDir)
+  mkdirSync(elsewhere)
+
+  // The roots declared are ${APP_DIR} and nothing else, so ${elsewhere} is outside every one of
+  // them. A publisher that resolved its own destination would happily write here.
+  const script = rig(PUBLISHER, [
+    `printf 'x\\n' | publish_durable_file "${join(elsewhere, 'f')}" "" 600`,
+    'echo "rc=$?"',
+  ].join('\n'), roots({ app: appDir }))
+  const run = runBash(script)
+
+  assert.match(run.stdout, /^rc=1$/m, 'a destination under no trusted ancestor must be refused, not resolved')
+  assert.deepEqual(readdirSync(elsewhere), [], 'and nothing may be written there')
+})
+
+test('[o3d-rn10] publish_durable_file still creates a destination directory that does not exist yet, beneath the trusted root', (t) => {
+  const root = createTempDirSync('ims-rn10-create-', t)
+  const dataDir = join(root, 'data')
+  mkdirSync(dataDir)
+
+  // NOT VACUOUS in the other direction: a walk that refused everything would pass all three tests
+  // above and fail this one. `mkdir -p "$dir"` is what this replaces, and a first install reaches
+  // publish_durable_file with ${DATA_DIR}/git-ssh not yet created.
+  const script = rig(PUBLISHER, [
+    `printf 'github.com ssh-ed25519 AAAA\\n' | publish_durable_file "${join(dataDir, 'git-ssh/known_hosts')}" "" 600`,
+    'echo "rc=$?"',
+  ].join('\n'), roots({ data: dataDir }))
+  const run = runBash(script)
+
+  assert.match(run.stdout, /^rc=0$/m, run.stderr)
+  assert.equal(readFileSync(join(dataDir, 'git-ssh/known_hosts'), 'utf8'), 'github.com ssh-ed25519 AAAA\n')
+  assert.equal(statSync(join(dataDir, 'git-ssh/known_hosts')).mode & 0o777, 0o600)
+})
+
+/**
+ * EVERY SHIPPED PUBLICATION, AND THE DIRECTORY IT LANDS IN. publish_durable_file() now REFUSES a
+ * destination it cannot relate to a trusted ancestor, so the table and the call sites have to
+ * agree or an install fails at the write. `$canonical` is broken out into the three values
+ * import_legacy_cutover_state() passes it, because a shell expression is not a path.
+ */
+const SHIPPED_PUBLICATIONS: ReadonlyArray<{ readonly call: string, readonly target: string }> = [
+  { call: 'publish_durable_file "$(db_ca_generation_file "${digest}")"', target: '$(db_ca_generation_file abc123)' },
+  { call: 'publish_durable_file "${DB_ROLE_ROTATION_JOURNAL}"', target: '${DB_ROLE_ROTATION_JOURNAL}' },
+  { call: 'publish_durable_file "${FENCE_FILE}"', target: '${FENCE_FILE}' },
+  { call: 'publish_durable_file "$DB_ENV_SNAPSHOT_FILE"', target: '${DB_ENV_SNAPSHOT_FILE}' },
+  // The three `$canonical` values, named at the import_legacy_file() call sites.
+  { call: 'import_legacy_file "$LEGACY_DB_FENCE_STATE" "$DB_FENCE_STATE"', target: '${DB_FENCE_STATE}' },
+  { call: 'import_legacy_file "$LEGACY_CRON_BACKUP" "$CRON_BACKUP"', target: '${CRON_BACKUP}' },
+  { call: 'import_legacy_file "$LEGACY_FENCE_FILE" "$FENCE_FILE"', target: '${FENCE_FILE}' },
+  { call: 'publish_durable_file "${DEPLOY_SSH_KNOWN_HOSTS}"', target: '${DEPLOY_SSH_KNOWN_HOSTS}' },
+  { call: 'publish_durable_file "${DEPLOY_META_FILE}"', target: '${DEPLOY_META_FILE}' },
+  { call: 'publish_durable_file "${APP_DIR}/.env"', target: '${APP_DIR}/.env' },
+]
+
+/** The installer constants those targets are composed from, lifted rather than re-typed. */
+const PUBLICATION_CONSTANTS = [
+  'APP_NAME', 'APP_USER', 'APP_DIR', 'DATA_DIR', 'DEPLOY_SSH_DIR', 'DEPLOY_SSH_KNOWN_HOSTS',
+  'CUTOVER_STATE_DIR', 'FENCE_FILE', 'CRON_BACKUP', 'DB_FENCE_DIR', 'DB_FENCE_STATE',
+  'DB_ENV_SNAPSHOT_DIR', 'DB_ENV_SNAPSHOT_FILE', 'DB_CA_PUBLISH_DIR',
+  'DB_CA_GENERATION_PREFIX', 'DB_CA_GENERATION_SUFFIX', 'DB_ROLE_ROTATION_JOURNAL',
+  'DEPLOY_META_FILE',
+]
+
+test('[o3d-rn10] every destination scripts/install.sh publishes to lies under a trusted ancestor', () => {
+  // The enumeration is COMPLETE, or this test is measuring a subset of the installer. Comment
+  // lines are dropped first: this file's own prose names the function dozens of times.
+  const callSites = INSTALL_SH.split('\n')
+    .filter((line) => !line.trimStart().startsWith('#'))
+    .filter((line) => line.includes('publish_durable_file "'))
+  assert.equal(callSites.length, 8,
+    `scripts/install.sh has ${callSites.length} publication call sites; SHIPPED_PUBLICATIONS accounts for 8 (one of them \`$canonical\`, broken out into three). Add the new one here and prove its destination has a root:\n${callSites.join('\n')}`)
+  for (const { call } of SHIPPED_PUBLICATIONS) {
+    assert.ok(INSTALL_SH.includes(call), `scripts/install.sh must still contain: ${call}`)
+  }
+
+  const script = [
+    'set -uo pipefail',
+    ...PUBLICATION_CONSTANTS.map((name) => shellConstant(INSTALL_SH, name)),
+    shellFunction(INSTALL_SH, 'db_ca_generation_file'),
+    shellFunction(INSTALL_SH, 'publish_trust_root_candidates'),
+    shellFunction(INSTALL_SH, 'publish_trust_root'),
+    ...SHIPPED_PUBLICATIONS.map(({ target }) =>
+      `t="${target}"; if r="$(publish_trust_root "$(dirname "$t")")"; then printf 'OK\\t%s\\t%s\\n' "$t" "$r"; else printf 'NOROOT\\t%s\\n' "$t"; fi`),
+  ].join('\n')
+  const run = runBash(script)
+  assert.equal(run.status, 0, run.stderr)
+
+  const lines = run.stdout.trim().split('\n')
+  assert.equal(lines.length, SHIPPED_PUBLICATIONS.length, run.stdout)
+  const orphans = lines.filter((l) => l.startsWith('NOROOT'))
+  assert.deepEqual(orphans, [], `every publication must resolve to a trusted ancestor:\n${run.stdout}`)
+  // NOT VACUOUS: a publish_trust_root() that answered "/" to everything would satisfy the line
+  // above, so the roots it actually named are checked against the five the table can return.
+  const allowed = new Set(['/opt/one-two-inventory', '/var/lib/one-two-inventory', '/etc/ims-cutover', '/etc/ims-db-ca'])
+  for (const line of lines) {
+    const [, target, root] = line.split('\t')
+    assert.ok(allowed.has(root), `${target} resolved to ${root}, which is not one of the shipped roots`)
+  }
 })
 
 // ---------------------------------------------------------------------------
