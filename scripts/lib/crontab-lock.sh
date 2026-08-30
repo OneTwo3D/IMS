@@ -932,8 +932,92 @@ CRONTAB_MANAGED_BLOCK_AWK='
 # reported as MISSING rather than swallowed as the sentinel, which errs towards refusing.
 CRONTAB_SUBSEQUENCE_SENTINEL=$'\001CRONTAB-SUBSEQUENCE-COMPLETE\001'
 
+# EACH INPUT ARRIVES ON DISK, IN FULL, BEFORE `awk` IS ASKED ANYTHING
+# (o3d-p9dq, Codex r32 CRITICAL)
+#
+# This comparison needs TWO inputs at once — `NR == FNR` is how one awk tells them apart — and a
+# here-string supplies only one, so the fix the two projections got could not be copied here.
+# Round 31 handed both in through process substitutions instead:
+#
+#     ' <(printf '%s\n' "${candidate}") <(printf '%s\n' "${backup}")
+#
+# A PROCESS SUBSTITUTION'S PRODUCER REPORTS TO NOBODY. Its status is not awk's — awk sees a file
+# that ended, not a writer that failed — and it is not this shell's either, because the shell never
+# waits for it and `$?` never carries it. So a backup-side `printf` that was killed, or that died
+# after part of its output, handed awk a TRUNCATED backup; awk compared what it was given, found
+# nothing of it missing, printed the sentinel and exited 0.
+#
+# THE COMPLETION SENTINEL IS NOT THE ANSWER TO THIS, and that is worth saying plainly because the
+# previous round believed it was. The sentinel proves the computation reached its END block, which
+# in this failure it genuinely did — over an input that was never whole. It establishes that the
+# computation FINISHED; it cannot establish that the computation SAW EVERYTHING. Both ends need
+# covering, and the sentinel below still covers its own.
+#
+# What the uncovered end cost: the merge is approved as lossless, installed, and ${CRON_BACKUP} —
+# the only copy of the lines it has just dropped — is then deleted. Reproduced against the shipped
+# function by failing only the backup-side producer: rc=0, plan=merge, the operator's line gone.
+#
+# So both inputs are written to temporary files FIRST, each write's status taken and each file read
+# back and counted, and only then is awk invoked. A write that failed aborts the comparison BEFORE
+# it runs rather than being discovered after its answer has been acted on.
+
+# WRITE ONE COMPARISON INPUT TO A FILE, AND ESTABLISH THAT ALL OF IT ARRIVED.
+#
+#   crontab_publish_comparison_input <text> <path>
+#
+#   0  <path> holds exactly the bytes `<(printf '%s\n' "<text>")` used to supply, so the awk below
+#      reads what it has always read.
+#   1  it does not, and no comparison may be attempted on it.
+#
+# TWO CHECKS, CATCHING DIFFERENT FAILURES:
+#
+#   the STATUS      a `printf` that could not write — a full filesystem, a closed descriptor, a
+#                   read-only ${TMPDIR} — returns non-zero, and unlike a process substitution's
+#                   producer that status is THIS shell's to take.
+#   the LINE COUNT  read back with `mapfile`, a builtin, so the check cannot be taken down by the
+#                   very failure it exists to detect. A short write reported as successful — the
+#                   classic one is an error surfaced only at close(2), and a producer killed
+#                   part-way through is the same shape — yields fewer lines than went in. This is
+#                   the projections' line-for-line proof, said about an input instead of an output.
+crontab_publish_comparison_input() {
+  local text="$1" path="$2" want got
+  local -a readback=()
+  # `printf '%s\n' "${text}"` writes the text plus ONE newline, so the file always holds at least
+  # one line: the empty string becomes a single BLANK line, which is exactly what the process
+  # substitution produced and what the awk's isBlank() has always discarded. Byte-identical input
+  # in, byte-identical answer out.
+  printf '%s\n' "${text}" > "${path}" || return 1
+  crontab_count_lines "${text}"
+  want="${CRON_LINE_COUNT}"
+  # crontab_count_lines calls the empty string nought lines; printf still wrote one.
+  if [[ -z "${text}" ]]; then want=1; fi
+  mapfile -t readback < "${path}" || return 1
+  got="${#readback[@]}"
+  if [[ "${got}" -ne "${want}" ]]; then return 1; fi
+  return 0
+}
+
 crontab_unmanaged_lines_missing_from() {
-  local backup="$1" candidate="$2" out rc=0
+  local backup="$1" candidate="$2" cand_file back_file out rc=0
+
+  # SEPARATELY CREATED, and each creation checked: `mktemp` picks a name nothing else holds, so two
+  # runs racing each other cannot read one another's inputs. The second failing cleans up the first
+  # — there is no path out of this function that leaves either file behind.
+  cand_file="$(mktemp "${TMPDIR:-/tmp}/ims-crontab-cand.XXXXXX" 2>/dev/null)" || return 1
+  back_file="$(mktemp "${TMPDIR:-/tmp}/ims-crontab-back.XXXXXX" 2>/dev/null)" || {
+    rm -f "${cand_file}"
+    return 1
+  }
+
+  # BEFORE `awk` RUNS AT ALL. A failed write is a refusal here and not a discovery afterwards:
+  # there is no answer from an incomplete input that this function is willing to hand back, and an
+  # answer it does hand back gets a crontab installed and a backup deleted.
+  if ! crontab_publish_comparison_input "${candidate}" "${cand_file}" \
+     || ! crontab_publish_comparison_input "${backup}" "${back_file}"; then
+    rm -f "${cand_file}" "${back_file}"
+    return 1
+  fi
+
   out="$(awk -v sentinel="${CRONTAB_SUBSEQUENCE_SENTINEL}" "${CRONTAB_MANAGED_BLOCK_AWK}"'
     NR == FNR { craw[++cn] = $0; next }
     { braw[++bn] = $0 }
@@ -952,7 +1036,11 @@ crontab_unmanaged_lines_missing_from() {
       }
       print sentinel   # LAST: it proves the loop above ran to the end, not merely that awk started
     }
-  ' <(printf '%s\n' "${candidate}") <(printf '%s\n' "${backup}"))" || rc=$?
+  ' "${cand_file}" "${back_file}")" || rc=$?
+  # REMOVED ON EVERY PATH FROM HERE ON, including both refusals below, and before any of them can
+  # return. A `trap` would be the other way to say this, but this file is SOURCED by three
+  # entrypoints and an EXIT trap set here would displace theirs.
+  rm -f "${cand_file}" "${back_file}"
   if [[ "${rc}" -ne 0 ]]; then return 1; fi
   # NO SENTINEL, NO ANSWER. An awk that exited 0 without reaching the end of its END block — a
   # shim, a truncated pipe, a seccomp denial — produces output that does not end here, and this
