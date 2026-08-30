@@ -28,10 +28,17 @@
  *   5. add a leaking `mkdtempSync` to any harness under tests/ -> that harness's own file fails
  *      under `npm run test:unit`, which is the case this whole mechanism exists for; the fixture
  *      above is that change, made permanently and in a file the glob does not collect.
+ *   6. delete the `node:child_process` redirect from the sentinel -> 'a child given a replacement
+ *      environment cannot escape' fails: the grandchild's directory is created in the SYSTEM /tmp,
+ *      is never reported, and is still there afterwards.
+ *   7. delete `loosen(own)` from the sentinel's removal retry -> 'an unremovable leftover is
+ *      repaired' fails: the 0-mode descendant defeats `rmSync` and the whole private root survives.
+ *   8. restore the sentinel's blanket `catch { return }` around `readdirSync(own)` -> 'an
+ *      unreadable root fails the run' fails: the run exits 0 having reported nothing.
  */
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { readFileSync, readdirSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -40,6 +47,19 @@ const SENTINEL = './tests/temp-dir-sentinel.ts'
 const FIXTURES = 'tests/scripts/fixtures'
 const LEAKY = 'leaks-a-temp-dir.fixture.ts'
 const CLEAN = 'cleans-up-its-temp-dir.fixture.ts'
+const ENV_LEAKY = 'leaks-from-a-replacement-environment.fixture.ts'
+const LOCKED = 'leaves-an-unreadable-directory.fixture.ts'
+const HIDDEN_ROOT = 'hides-its-temp-root.fixture.ts'
+
+/**
+ * ROOT READS AND REMOVES REGARDLESS OF MODE, so the two mode-based fixtures below cannot be built
+ * as uid 0 — a directory chmodded to 0 is still fully traversable. Skipped there, with the reason
+ * said out loud, rather than passed vacuously.
+ */
+const AS_ROOT = process.getuid?.() === 0
+const MODES_ARE_INERT =
+  'running as uid 0: a 0-mode directory is still readable and removable, so the failure this ' +
+  'measures cannot be produced on this host'
 
 /**
  * Duplicated from the fixture rather than imported, deliberately: importing it would REGISTER the
@@ -150,4 +170,155 @@ test('a clean run is not failed', () => {
       `guard, it is an outage:\n${run.output}`,
   )
   assert.ok(!/temp-dir leak/.test(run.output), `and nothing to report:\n${run.output}`)
+})
+
+/**
+ * THE HOLE THE REDIRECT CLOSES, measured rather than argued (Codex MEDIUM).
+ *
+ * Pointing `process.env.TMPDIR` at the private root covers every child that INHERITS the
+ * environment. A child launched with a REPLACEMENT one — `{ PATH: … }`, which is how these
+ * harnesses run shell wrappers — inherits nothing, so its `os.tmpdir()` was the system /tmp and
+ * anything it abandoned there was invisible to the sentinel: not reported, and, far worse, not
+ * removed. `tests/` has 53 spawn-family call sites passing an explicit `env`; 7 reach no TMPDIR at
+ * all today, and the other 46 reach it only because they happen to spread `process.env`.
+ *
+ * This is not a re-reading of the sentinel's source. A real grandchild, under a real replacement
+ * environment, really does abandon a directory — and the assertions are that the sentinel SAW it
+ * and that the directory is GONE.
+ */
+test('a child given a replacement environment cannot escape the private /tmp', () => {
+  // The fixture must still hand its child an environment that carries no TMPDIR — otherwise this
+  // whole test would be measuring the inheriting path the sibling fixture already covers.
+  const fixture = readFileSync(join(FIXTURES, ENV_LEAKY), 'utf8')
+  assert.match(fixture, /env:\s*\{\s*PATH:/, `${ENV_LEAKY} must launch its child with a replacement environment`)
+  assert.ok(
+    !/env:\s*\{[^}]*process\.env/.test(fixture),
+    `${ENV_LEAKY} must not spread process.env into the child — that is the covered case, not this one`,
+  )
+  assert.ok(!/TMPDIR/.test(fixture), `${ENV_LEAKY} must not hand the child a TMPDIR of its own`)
+  assert.ok(!/\brmSync\b|\brm\(/.test(fixture), `${ENV_LEAKY} must not clean up — that is the defect it reproduces`)
+
+  const before = new Set(readdirSync(tmpdir()))
+  const run = runFixture(ENV_LEAKY)
+
+  // ATTRIBUTION, as above: the fixture's own assertions pass, so the failure is the sentinel's.
+  assert.match(
+    run.output,
+    /^ok \d+ - the assertion itself passes; only the grandchild's directory is wrong$/m,
+    `the fixture's own assertion must pass:\n${run.output}`,
+  )
+  assert.ok(!/ERR_ASSERTION/.test(run.output), `nothing in the fixture may throw:\n${run.output}`)
+
+  assert.notEqual(run.status, 0, `a directory abandoned by the grandchild must fail the run:\n${run.output}`)
+  assert.match(run.output, /temp-dir leak: 1 entry survived/, `and say so:\n${run.output}`)
+  assert.match(run.output, /\bims-fixture-envleak-/, `and name it:\n${run.output}`)
+
+  // WHERE IT LANDED, which is the redirect itself and cannot be faked by an exit code: the
+  // grandchild computed this path from ITS OWN environment, and it is inside the test process's
+  // private root. Without the redirect it reads `/tmp/ims-fixture-envleak-…` and this fails.
+  const announced = /ENVLEAK_AT=(\S+)/.exec(run.output)?.[1]
+  assert.ok(announced !== undefined, `the grandchild must announce what it made:\n${run.output}`)
+  assert.match(
+    announced,
+    /\/ims-unit-[^/]+\//,
+    'the grandchild\'s temporary directory must sit inside a sentinel root, not the system /tmp',
+  )
+
+  // AND IT IS GONE. The half that stops the accumulation.
+  assert.ok(!existsSync(announced), `the sentinel must have removed it, but ${announced} is still there`)
+
+  const toolchain = /^(?:tsx-\d+|node-compile-cache)$/
+  const survivors = readdirSync(tmpdir())
+    .filter((entry) => !before.has(entry) && !toolchain.test(entry))
+    .sort()
+  assert.deepEqual(survivors, [], `and nothing outlived the run — ${survivors.join(', ')} did`)
+})
+
+/**
+ * REMOVAL THAT FAILS MUST NOT FAIL SILENTLY (Codex MEDIUM).
+ *
+ * `rmSync` cannot recurse into a directory it may not traverse, and the first version of the
+ * sentinel swallowed that error. The private root then survived — one per run, which is the
+ * accumulation this file exists to make unreachable, arriving through the guard's own error
+ * handling. The fixture abandons a two-level 0-mode tree; the sentinel must repair the modes it
+ * owns, retry, and leave nothing.
+ */
+test('an unremovable leftover is repaired and removed, not swallowed', { skip: AS_ROOT ? MODES_ARE_INERT : false }, () => {
+  const fixture = readFileSync(join(FIXTURES, LOCKED), 'utf8')
+  assert.match(fixture, /chmodSync\([^)]*0o000\)/, `${LOCKED} must leave something untraversable`)
+  assert.ok(!/\brmSync\b|\brm\(/.test(fixture), `${LOCKED} must not clean up — that is the defect it reproduces`)
+
+  const before = new Set(readdirSync(tmpdir()))
+  const run = runFixture(LOCKED)
+
+  assert.match(
+    run.output,
+    /^ok \d+ - the assertion itself passes; only the abandoned directory is unreadable$/m,
+    `the fixture's own assertion must pass:\n${run.output}`,
+  )
+  assert.ok(!/ERR_ASSERTION/.test(run.output), `nothing in the fixture may throw:\n${run.output}`)
+
+  assert.notEqual(run.status, 0, `an abandoned directory must fail the run whatever its mode:\n${run.output}`)
+  assert.match(run.output, /temp-dir leak: 1 entry survived/, `and say so:\n${run.output}`)
+  assert.match(run.output, /\bims-fixture-locked-/, `and name it:\n${run.output}`)
+
+  // THE POINT. Either the repair worked and nothing survived, or the sentinel said out loud that
+  // it could not remove the root — never a clean report over a directory that is still there.
+  const toolchain = /^(?:tsx-\d+|node-compile-cache)$/
+  const survivors = readdirSync(tmpdir())
+    .filter((entry) => !before.has(entry) && !toolchain.test(entry))
+    .sort()
+  assert.deepEqual(
+    survivors,
+    [],
+    `the sentinel could not remove what it reported — ${survivors.join(', ')} outlived the run:\n${run.output}`,
+  )
+  assert.ok(
+    !/temp-dir sentinel: could not remove/.test(run.output),
+    `and it should not have needed to give up:\n${run.output}`,
+  )
+})
+
+/**
+ * THE FAIL-OPEN INSIDE THE GUARD (Codex MEDIUM).
+ *
+ * `readdirSync` throwing was treated as "the root is already gone", so a permission or ownership
+ * error produced a CLEAN REPORT over a directory the sentinel could not read — the exact failure
+ * it exists to catch, in its own implementation, and with the root left behind on top. Only ENOENT
+ * may mean "already removed"; anything else is named and fails the run, after the modes this uid
+ * owns have been repaired so the removal can still happen.
+ */
+test('an unreadable root fails the run rather than reporting it clean', { skip: AS_ROOT ? MODES_ARE_INERT : false }, () => {
+  const fixture = readFileSync(join(FIXTURES, HIDDEN_ROOT), 'utf8')
+  assert.match(fixture, /chmodSync\(root, 0o000\)/, `${HIDDEN_ROOT} must make the sentinel's own root unreadable`)
+  assert.match(fixture, /process\.on\('exit'/, 'and must do it at exit, or it breaks the run instead of the guard')
+
+  const before = new Set(readdirSync(tmpdir()))
+  const run = runFixture(HIDDEN_ROOT)
+
+  assert.match(
+    run.output,
+    /^ok \d+ - the assertion itself passes; only the temp root is left unreadable$/m,
+    `the fixture's own assertion must pass:\n${run.output}`,
+  )
+  assert.ok(!/ERR_ASSERTION/.test(run.output), `nothing in the fixture may throw:\n${run.output}`)
+
+  assert.notEqual(run.status, 0, `a root the sentinel cannot read must fail the run:\n${run.output}`)
+  assert.match(
+    run.output,
+    /temp-dir sentinel: could not enumerate \S*ims-unit-\S*: EACCES/,
+    `and name the root and the error, so it can be acted on:\n${run.output}`,
+  )
+  assert.ok(
+    !/temp-dir leak: /.test(run.output),
+    `and not silently claim a count it could not take:\n${run.output}`,
+  )
+
+  // AND THE ROOT IS STILL GONE: failing is the signal, repairing the mode is what stops the
+  // accumulation, and the finding is that the first version did neither.
+  const toolchain = /^(?:tsx-\d+|node-compile-cache)$/
+  const survivors = readdirSync(tmpdir())
+    .filter((entry) => !before.has(entry) && !toolchain.test(entry))
+    .sort()
+  assert.deepEqual(survivors, [], `the unreadable root outlived the run — ${survivors.join(', ')}`)
 })
