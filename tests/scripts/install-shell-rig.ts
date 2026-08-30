@@ -105,6 +105,11 @@ export const SHIPPED = [
   'prompt_db_sslmode',
   // r39 (Codex HIGH): the durable mechanism, and the journal that makes the ALTER recoverable.
   'fsync_path',
+  // o3d-rn10: the publisher resolves its destination from a trusted ancestor instead of stat-ing
+  // its own pathname, so the table and the walk come with it.
+  'publish_trust_root_candidates',
+  'publish_trust_root',
+  'pin_dir_beneath_root',
   'publish_durable_file',
   'rotation_journal_encode',
   'rotation_journal_decode',

@@ -617,6 +617,93 @@ test('[o3d-rn10] publish_durable_file stages inside the directory it PINNED, eve
     'it lands in the directory the walk pinned, which is the one the rename was proved against')
 })
 
+test('[o3d-rn10] publish_durable_file refuses a component swapped for a symlink to a SIBLING under the same parent', (t) => {
+  const root = createTempDirSync('ims-rn10-sibling-', t)
+  const dataDir = join(root, 'data')
+  const gitSsh = join(dataDir, 'git-ssh')
+  // A DIRECTORY UNDER THE SAME PARENT — in the shipped tree, ${DATA_DIR}/locks, which is root-owned
+  // and holds the crontab reconciliation lock. `..` alone CANNOT tell it apart from the real
+  // destination, because its parent IS ${DATA_DIR}: that is the residual o3d-rn10 was filed with,
+  // and the one case that looked as though it needed openat2. The lstat'ed inode tells them apart.
+  const sibling = join(dataDir, 'locks')
+  mkdirSync(gitSsh, { recursive: true })
+  mkdirSync(sibling)
+  writeFileSync(join(sibling, '.crontab-reconcile.lock'), '')
+  const fired = join(root, 'swapped')
+
+  const bin = shimDir(t, {
+    stat: [
+      `${REAL.stat} "$@"`,
+      'status=$?',
+      `if [[ "$*" == *git-ssh* && ! -e ${q(fired)} ]]; then`,
+      `  : > ${q(fired)}`,
+      `  ${REAL.mv} -T ${q(gitSsh)} ${q(join(dataDir, 'git-ssh.moved'))}`,
+      `  ${REAL.ln} -s ${q(sibling)} ${q(gitSsh)}`,
+      'fi',
+      'exit $status',
+    ].join('\n'),
+  })
+
+  const script = rig(PUBLISHER, [
+    `printf 'PWNED\\n' | publish_durable_file "${join(gitSsh, 'known_hosts')}" "" 600`,
+    'echo "rc=$?"',
+  ].join('\n'), roots({ data: dataDir }))
+  const run = runBash(script, { env: { PATH: `${bin}:${process.env.PATH ?? ''}` } })
+
+  // NOT VACUOUS: the swap fired, and the link really does point at a sibling whose parent is the
+  // same directory the walk came from — so the `..` check alone would have accepted it.
+  assert.ok(existsSync(fired), 'the walk must actually have lstat-ed the component')
+  assert.equal(lstatSync(gitSsh).isSymbolicLink(), true)
+  assert.equal(statSync(join(sibling, '..')).ino, statSync(dataDir).ino,
+    'the sibling must share the destination\'s parent, or this test is the same case as the one above')
+
+  assert.match(run.stdout, /^rc=1$/m, 'the walk must land in the inode it lstat-ed, not merely under the parent it expected')
+  assert.deepEqual(readdirSync(sibling).sort(), ['.crontab-reconcile.lock'],
+    'and nothing may be created inside the sibling the link chose')
+})
+
+test('[o3d-rn10] publish_durable_file refuses a destination MOVED WHOLESALE into another parent, though its inode never changed', (t) => {
+  const root = createTempDirSync('ims-rn10-reparent-', t)
+  const dataDir = join(root, 'data')
+  const gitSsh = join(dataDir, 'git-ssh')
+  // A parent the service account controls entirely. Moving the destination there and leaving a
+  // symlink behind keeps the INODE the walk lstat-ed, so the identity check alone accepts it —
+  // this is the case `..` is for, and the reason both checks are kept.
+  const elsewhere = join(root, 'attacker')
+  mkdirSync(gitSsh, { recursive: true })
+  mkdirSync(elsewhere)
+  const before = statSync(gitSsh).ino
+  const fired = join(root, 'moved')
+
+  const bin = shimDir(t, {
+    stat: [
+      `${REAL.stat} "$@"`,
+      'status=$?',
+      `if [[ "$*" == *git-ssh* && ! -e ${q(fired)} ]]; then`,
+      `  : > ${q(fired)}`,
+      `  ${REAL.mv} -T ${q(gitSsh)} ${q(join(elsewhere, 'git-ssh'))}`,
+      `  ${REAL.ln} -s ${q(join(elsewhere, 'git-ssh'))} ${q(gitSsh)}`,
+      'fi',
+      'exit $status',
+    ].join('\n'),
+  })
+
+  const script = rig(PUBLISHER, [
+    `printf 'PWNED\\n' | publish_durable_file "${join(gitSsh, 'known_hosts')}" "" 600`,
+    'echo "rc=$?"',
+  ].join('\n'), roots({ data: dataDir }))
+  const run = runBash(script, { env: { PATH: `${bin}:${process.env.PATH ?? ''}` } })
+
+  // NOT VACUOUS: the move happened, and it is the SAME directory — same inode — under a new parent.
+  assert.ok(existsSync(fired), 'the walk must actually have lstat-ed the component')
+  assert.equal(statSync(join(elsewhere, 'git-ssh')).ino, before,
+    'the destination must have kept its inode, or this test is the sibling case again')
+
+  assert.match(run.stdout, /^rc=1$/m, 'a destination whose PARENT changed must be refused, inode or no inode')
+  assert.deepEqual(readdirSync(join(elsewhere, 'git-ssh')), [],
+    'and nothing may be published into it under the parent the attacker chose')
+})
+
 test('[o3d-rn10] publish_durable_file refuses a destination that lies under no trusted ancestor', (t) => {
   const root = createTempDirSync('ims-rn10-noroot-', t)
   const appDir = join(root, 'app')
@@ -656,70 +743,105 @@ test('[o3d-rn10] publish_durable_file still creates a destination directory that
 })
 
 /**
- * EVERY SHIPPED PUBLICATION, AND THE DIRECTORY IT LANDS IN. publish_durable_file() now REFUSES a
- * destination it cannot relate to a trusted ancestor, so the table and the call sites have to
- * agree or an install fails at the write. `$canonical` is broken out into the three values
- * import_legacy_cutover_state() passes it, because a shell expression is not a path.
+ * EVERY SHIPPED PUBLICATION, AND THE DIRECTORY IT LANDS IN (o3d-rn10).
+ *
+ * publish_durable_file() now REFUSES a destination it cannot relate to a trusted ancestor, so the
+ * table and the call sites have to agree or an install fails at the write. All three entrypoints
+ * carry the publisher byte for byte, so all three are measured. `$canonical` is broken out into the
+ * three values import_legacy_cutover_state() passes it, because a shell expression is not a path.
  */
-const SHIPPED_PUBLICATIONS: ReadonlyArray<{ readonly call: string, readonly target: string }> = [
-  { call: 'publish_durable_file "$(db_ca_generation_file "${digest}")"', target: '$(db_ca_generation_file abc123)' },
-  { call: 'publish_durable_file "${DB_ROLE_ROTATION_JOURNAL}"', target: '${DB_ROLE_ROTATION_JOURNAL}' },
-  { call: 'publish_durable_file "${FENCE_FILE}"', target: '${FENCE_FILE}' },
-  { call: 'publish_durable_file "$DB_ENV_SNAPSHOT_FILE"', target: '${DB_ENV_SNAPSHOT_FILE}' },
-  // The three `$canonical` values, named at the import_legacy_file() call sites.
-  { call: 'import_legacy_file "$LEGACY_DB_FENCE_STATE" "$DB_FENCE_STATE"', target: '${DB_FENCE_STATE}' },
-  { call: 'import_legacy_file "$LEGACY_CRON_BACKUP" "$CRON_BACKUP"', target: '${CRON_BACKUP}' },
-  { call: 'import_legacy_file "$LEGACY_FENCE_FILE" "$FENCE_FILE"', target: '${FENCE_FILE}' },
-  { call: 'publish_durable_file "${DEPLOY_SSH_KNOWN_HOSTS}"', target: '${DEPLOY_SSH_KNOWN_HOSTS}' },
-  { call: 'publish_durable_file "${DEPLOY_META_FILE}"', target: '${DEPLOY_META_FILE}' },
-  { call: 'publish_durable_file "${APP_DIR}/.env"', target: '${APP_DIR}/.env' },
-]
+const ENTRYPOINTS = ['scripts/install.sh', 'scripts/deploy.sh', 'scripts/update.sh'] as const
 
-/** The installer constants those targets are composed from, lifted rather than re-typed. */
+/** Destination expressions per entrypoint, and how many `publish_durable_file "` call sites each
+ *  has — so a NEW publication fails this test until its destination is stated and shown to have a
+ *  root. */
+const SHIPPED_PUBLICATIONS: Readonly<Record<string, { readonly callSites: number, readonly targets: readonly string[] }>> = {
+  'scripts/install.sh': {
+    callSites: 8,
+    targets: [
+      '$(db_ca_generation_file abc123)',
+      '${DB_ROLE_ROTATION_JOURNAL}',
+      '${FENCE_FILE}',
+      '${DB_ENV_SNAPSHOT_FILE}',
+      '${DEPLOY_SSH_KNOWN_HOSTS}',
+      '${DEPLOY_META_FILE}',
+      '${APP_DIR}/.env',
+      // `$canonical`
+      '${DB_FENCE_STATE}', '${CRON_BACKUP}', '${FENCE_FILE}',
+    ],
+  },
+  'scripts/deploy.sh': {
+    callSites: 3,
+    targets: ['${FENCE_FILE}', '${DB_ENV_SNAPSHOT_FILE}', '${DB_FENCE_STATE}', '${CRON_BACKUP}'],
+  },
+  'scripts/update.sh': {
+    callSites: 4,
+    targets: ['${FENCE_FILE}', '${DB_ENV_SNAPSHOT_FILE}', '${DB_FENCE_IDENTITY_FILE}', '${DB_FENCE_STATE}', '${CRON_BACKUP}'],
+  },
+}
+
+/** Every constant those targets are composed from, across the three scripts and the shared fence
+ *  library. A script that does not define one simply does not contribute it. */
 const PUBLICATION_CONSTANTS = [
-  'APP_NAME', 'APP_USER', 'APP_DIR', 'DATA_DIR', 'DEPLOY_SSH_DIR', 'DEPLOY_SSH_KNOWN_HOSTS',
+  'APP_NAME', 'APP_DIR', 'DATA_DIR', 'DEPLOY_SSH_DIR', 'DEPLOY_SSH_KNOWN_HOSTS',
   'CUTOVER_STATE_DIR', 'FENCE_FILE', 'CRON_BACKUP', 'DB_FENCE_DIR', 'DB_FENCE_STATE',
   'DB_ENV_SNAPSHOT_DIR', 'DB_ENV_SNAPSHOT_FILE', 'DB_CA_PUBLISH_DIR',
   'DB_CA_GENERATION_PREFIX', 'DB_CA_GENERATION_SUFFIX', 'DB_ROLE_ROTATION_JOURNAL',
-  'DEPLOY_META_FILE',
+  'DEPLOY_META_FILE', 'DB_FENCE_RECOVERY_DIR', 'DB_FENCE_IDENTITY_FILE',
 ]
 
-test('[o3d-rn10] every destination scripts/install.sh publishes to lies under a trusted ancestor', () => {
-  // The enumeration is COMPLETE, or this test is measuring a subset of the installer. Comment
-  // lines are dropped first: this file's own prose names the function dozens of times.
-  const callSites = INSTALL_SH.split('\n')
-    .filter((line) => !line.trimStart().startsWith('#'))
-    .filter((line) => line.includes('publish_durable_file "'))
-  assert.equal(callSites.length, 8,
-    `scripts/install.sh has ${callSites.length} publication call sites; SHIPPED_PUBLICATIONS accounts for 8 (one of them \`$canonical\`, broken out into three). Add the new one here and prove its destination has a root:\n${callSites.join('\n')}`)
-  for (const { call } of SHIPPED_PUBLICATIONS) {
-    assert.ok(INSTALL_SH.includes(call), `scripts/install.sh must still contain: ${call}`)
-  }
+/** The five roots publish_trust_root_candidates() can name, at their shipped values. A resolution
+ *  to anything else means the table has grown a directory nobody argued for. */
+const SHIPPED_ROOTS = new Set([
+  '/opt/one-two-inventory', '/var/lib/one-two-inventory', '/root/ims/onetwo3d-ims',
+  '/etc/ims-cutover', '/etc/ims-db-ca', '/etc/ims-cutover-recovery',
+])
 
-  const script = [
-    'set -uo pipefail',
-    ...PUBLICATION_CONSTANTS.map((name) => shellConstant(INSTALL_SH, name)),
-    shellFunction(INSTALL_SH, 'db_ca_generation_file'),
-    shellFunction(INSTALL_SH, 'publish_trust_root_candidates'),
-    shellFunction(INSTALL_SH, 'publish_trust_root'),
-    ...SHIPPED_PUBLICATIONS.map(({ target }) =>
-      `t="${target}"; if r="$(publish_trust_root "$(dirname "$t")")"; then printf 'OK\\t%s\\t%s\\n' "$t" "$r"; else printf 'NOROOT\\t%s\\n' "$t"; fi`),
-  ].join('\n')
-  const run = runBash(script)
-  assert.equal(run.status, 0, run.stderr)
+const FENCE_LIB = readFileSync(join(REPO, 'scripts/lib/db-fence-protected.sh'), 'utf8')
 
-  const lines = run.stdout.trim().split('\n')
-  assert.equal(lines.length, SHIPPED_PUBLICATIONS.length, run.stdout)
-  const orphans = lines.filter((l) => l.startsWith('NOROOT'))
-  assert.deepEqual(orphans, [], `every publication must resolve to a trusted ancestor:\n${run.stdout}`)
-  // NOT VACUOUS: a publish_trust_root() that answered "/" to everything would satisfy the line
-  // above, so the roots it actually named are checked against the five the table can return.
-  const allowed = new Set(['/opt/one-two-inventory', '/var/lib/one-two-inventory', '/etc/ims-cutover', '/etc/ims-db-ca'])
-  for (const line of lines) {
-    const [, target, root] = line.split('\t')
-    assert.ok(allowed.has(root), `${target} resolved to ${root}, which is not one of the shipped roots`)
-  }
-})
+for (const script of ENTRYPOINTS) {
+  test(`[o3d-rn10] every destination ${script} publishes to lies under a trusted ancestor`, () => {
+    const source = readFileSync(join(REPO, script), 'utf8')
+    const spec = SHIPPED_PUBLICATIONS[script]
+    // The enumeration is COMPLETE, or this test measures a subset of the entrypoint. Comment lines
+    // are dropped first: the prose names the function dozens of times.
+    const callSites = source.split('\n')
+      .filter((line) => !line.trimStart().startsWith('#'))
+      .filter((line) => line.includes('publish_durable_file "'))
+    assert.equal(callSites.length, spec.callSites,
+      `${script} has ${callSites.length} publication call sites; this test accounts for ${spec.callSites}. Add the new one and prove its destination has a root:\n${callSites.join('\n')}`)
+
+    const constants = PUBLICATION_CONSTANTS
+      .map((name) => [source, FENCE_LIB].map((text) => text.split('\n').find((l) => l.startsWith(`${name}=`))).find(Boolean))
+      .filter((line): line is string => Boolean(line))
+
+    const rigLines = [
+      'set -uo pipefail',
+      // deploy.sh derives APP_USER by stat-ing the checkout, which a rig has no business running;
+      // ${CRON_BACKUP} only needs the value to exist, and its DIRECTORY is what is measured.
+      'APP_USER=appuser',
+      ...constants,
+      shellFunction(source, 'publish_trust_root_candidates'),
+      shellFunction(source, 'publish_trust_root'),
+    ]
+    if (source.includes('\ndb_ca_generation_file() {\n')) rigLines.push(shellFunction(source, 'db_ca_generation_file'))
+    rigLines.push(...spec.targets.map((target) =>
+      `t="${target}"; if r="$(publish_trust_root "$(dirname "$t")")"; then printf 'OK\\t%s\\t%s\\n' "$t" "$r"; else printf 'NOROOT\\t%s\\n' "$t"; fi`))
+
+    const run = runBash(rigLines.join('\n'))
+    assert.equal(run.status, 0, run.stderr)
+    const lines = run.stdout.trim().split('\n')
+    assert.equal(lines.length, spec.targets.length, run.stdout)
+    assert.deepEqual(lines.filter((l) => l.startsWith('NOROOT')), [],
+      `every publication must resolve to a trusted ancestor:\n${run.stdout}`)
+    // NOT VACUOUS: a publish_trust_root() that answered `/` to everything would satisfy the line
+    // above, so what it actually named is checked against the shipped roots.
+    for (const line of lines) {
+      const [, target, root] = line.split('\t')
+      assert.ok(SHIPPED_ROOTS.has(root), `${script}: ${target} resolved to ${root}, which is not one of the shipped roots`)
+    }
+  })
+}
 
 // ---------------------------------------------------------------------------
 // SITES 4, 5 and 7 — every directory created below a root the service account owns.

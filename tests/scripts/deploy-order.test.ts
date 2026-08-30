@@ -293,6 +293,13 @@ function durabilityFunctions(source: string): string {
     // o3d-czpy: the staging directory publish_durable_file() writes through, named once.
     shellConstant(source, 'PUBLISH_STAGE_DIRNAME'),
     shellFunction(source, 'fsync_path'),
+    // o3d-rn10: publish_durable_file() no longer stats its own destination pathname. It asks which
+    // trusted ancestor the destination lies under and walks down from there, so all three come
+    // with it — a rig missing them fails every publication with "command not found", and every
+    // "the publish must fail" test then passes for the wrong reason.
+    shellFunction(source, 'publish_trust_root_candidates'),
+    shellFunction(source, 'publish_trust_root'),
+    shellFunction(source, 'pin_dir_beneath_root'),
     shellFunction(source, 'publish_durable_file'),
     // The drop-in publisher is one of these too (o3d-2sm1.5, Codex r11): install_reboot_fence()
     // routes the systemd fragment through it, so a harness without it fails the install with
@@ -3865,7 +3872,15 @@ function runR9(
       // o3d-czpy: publish_durable_file() stages through this directory, and it is lifted rather
       // than re-typed for the same reason its functions are.
       shellConstant(entry.source, 'PUBLISH_STAGE_DIRNAME'),
-      ...functions.map((name) => shellFunction(entry.source, name)),
+      // o3d-rn10: publish_durable_file() resolves its destination from a trusted ancestor now, so
+      // wherever it is asked for, the table and the walk come with it. Named here rather than at
+      // each call site: a rig missing them fails every publication with "command not found", and
+      // every "the publish must fail" test then passes for the wrong reason.
+      ...functions
+        .flatMap((name) => (name === 'publish_durable_file'
+          ? ['publish_trust_root_candidates', 'publish_trust_root', 'pin_dir_beneath_root', name]
+          : [name]))
+        .map((name) => shellFunction(entry.source, name)),
       body,
     ].join('\n')
     let stdout = ''
@@ -4221,6 +4236,9 @@ test('all three entrypoints carry the same durability and namespace primitives, 
   // this namespace split survived a round. Shared text cannot drift silently.
   for (const name of [
     'fsync_path',
+    'publish_trust_root_candidates',
+    'publish_trust_root',
+    'pin_dir_beneath_root',
     'publish_durable_file',
     'publish_durable_dropin',
     'ensure_cutover_state_dirs',

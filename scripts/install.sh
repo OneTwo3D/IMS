@@ -2590,10 +2590,11 @@ PUBLISH_STAGE_DIRNAME=".ims-publish"
 # absolute pathname afterwards, which is where the round-2 code reopened the hole it had just
 # closed.
 #
-# WHY THESE FIVE ARE TRUSTWORTHY, AND WHY THE WALK DOES NOT START AT `/`. Each of them is a
+# WHY THESE SIX ARE TRUSTWORTHY, AND WHY THE WALK DOES NOT START AT `/`. Each of them is a
 # top-level directory whose OWN PARENT is root-owned and not writable by ${APP_USER}: /opt for
-# ${APP_DIR}, /var/lib for ${DATA_DIR} and the default ${CUTOVER_STATE_DIR}, /etc for the two
-# literals. The service account can rewrite anything INSIDE them and nothing ABOUT them: it cannot
+# ${APP_DIR}, /var/lib for ${DATA_DIR} and the default ${CUTOVER_STATE_DIR}, /etc for the three
+# literals (${DB_ENV_SNAPSHOT_DIR}, ${DB_CA_PUBLISH_DIR} and the shared library's
+# ${DB_FENCE_RECOVERY_DIR}). The service account can rewrite anything INSIDE them and nothing ABOUT them: it cannot
 # rename ${APP_DIR} aside, and it cannot leave a symlink at that name. That is the same argument
 # copy_tree_into_new_dir() rests on for ${APP_DIR}/.git, made once and used for all of them.
 #
@@ -2608,7 +2609,7 @@ PUBLISH_STAGE_DIRNAME=".ims-publish"
 # destination that matches no root is REFUSED — a new publication site outside these five fails
 # loudly at install time instead of silently resolving its own path.
 publish_trust_root_candidates() {
-  printf '%s\n' "${APP_DIR:-}" "${DATA_DIR:-}" "${CUTOVER_STATE_DIR:-}" "${DB_ENV_SNAPSHOT_DIR:-}" "${DB_CA_PUBLISH_DIR:-}"
+  printf '%s\n' "${APP_DIR:-}" "${DATA_DIR:-}" "${CUTOVER_STATE_DIR:-}" "${DB_ENV_SNAPSHOT_DIR:-}" "${DB_CA_PUBLISH_DIR:-}" "${DB_FENCE_RECOVERY_DIR:-}"
 }
 
 # The deepest candidate that "$1" lies at or under, printed; non-zero when there is none.
@@ -2617,14 +2618,19 @@ publish_trust_root_candidates() {
 # inside another; starting the walk from the closest trusted ancestor means the fewest components
 # are resolved by name, which is the whole point of the walk.
 publish_trust_root() {
-  local dir="$1" root best=""
+  local dir="$1" root best="" list
+  # A CHECKED CAPTURE AND A HERE-STRING, NEVER `< <(...)`. A process substitution has no status
+  # anybody can take, so a producer that died half-way through is indistinguishable from one that
+  # listed every root — and here that difference is the difference between refusing a publication
+  # and refusing all of them. This is the same rule the crontab/fence subsystem is held to.
+  list="$(publish_trust_root_candidates)" || return 1
   while IFS= read -r root; do
     [[ -n "$root" ]] || continue
     root="${root%/}"
     [[ -n "$root" ]] || continue
     [[ "$dir" == "$root" || "$dir" == "${root}/"* ]] || continue
     if (( ${#root} > ${#best} )); then best="$root"; fi
-  done < <(publish_trust_root_candidates)
+  done <<< "$list"
   [[ -n "$best" ]] || return 1
   printf '%s\n' "$best"
 }
@@ -2648,7 +2654,7 @@ publish_trust_root() {
 # deliberately by mkdir_service_subdir() or ensure_cutover_state_dirs(); creating one here is the
 # first-install fallback, not the path that decides the permissions.
 pin_dir_beneath_root() {
-  local root="$1" path="$2" rel comp here
+  local root="$1" path="$2" rel comp here entry
   [[ "$root" == /* && "$path" == /* ]] || return 1
   [[ "$path" == "$root" || "$path" == "${root}/"* ]] || return 1
   # The root itself, whose parent is root-owned. `-p` is correct here and only here.
@@ -2664,13 +2670,22 @@ pin_dir_beneath_root() {
     [[ -n "$comp" ]] || continue
     # `.` and `..` would step outside the walk while it believed it was stepping down it.
     [[ "$comp" != "." && "$comp" != ".." ]] || return 1
-    if ! mkdir "$comp" 2>/dev/null; then
-      [[ "$(stat -c '%F' "$comp" 2>/dev/null || true)" == "directory" ]] || return 1
-    fi
+    mkdir "$comp" 2>/dev/null || true
+    # ONE lstat, TAKING THE TYPE AND THE IDENTITY TOGETHER — whether this run created the component
+    # a moment ago or found it already there. `stat` without `-L` does not dereference, so a link
+    # reads as "symbolic link" and is refused before anything steps into it.
+    entry="$(stat -c '%F|%d:%i' "$comp" 2>/dev/null || true)"
+    [[ "${entry%%|*}" == "directory" ]] || return 1
     cd -P "$comp" 2>/dev/null || return 1
+    # AND THE DIRECTORY WE LANDED IN IS THE ONE THAT ENTRY NAMED. `..` alone accepts a component
+    # swapped for a symlink to a SIBLING under the same parent — the residual o3d-rn10 was filed
+    # with, and the one case that looked like it needed openat2. It does not: an lstat gives the
+    # inode of the entry, `stat .` gives the inode we are standing in, and a rename between them
+    # can only make the two differ. Both are kept: `..` also refuses a directory moved WHOLESALE
+    # into another parent, which preserves its inode.
+    [[ "$(stat -c '%d:%i' . 2>/dev/null || true)" == "${entry#*|}" ]] || return 1
     [[ "$(stat -c '%d:%i' .. 2>/dev/null || true)" == "$here" ]] || return 1
-    here="$(stat -c '%d:%i' . 2>/dev/null || true)"
-    [[ -n "$here" ]] || return 1
+    here="${entry#*|}"
   done
   return 0
 }
@@ -2861,7 +2876,7 @@ publish_durable_file() {
 # EXIT trap this script installs (${CRON_BLOCK_FILE}) names an absolute path.
 enter_service_subdir() {
   local root="$1" mask="$2" path="$3"
-  local rel comp built kind here
+  local rel comp built kind here entry
   # The root itself, whose parent is root-owned. `-p` is correct here and only here.
   mkdir -p "${root}" || die "${root} could not be created, so this installation has nowhere to put its state. Nothing has been changed."
   [[ "${path}" == "${root}/"* ]] || die \
@@ -2882,12 +2897,20 @@ enter_service_subdir() {
       [[ "${kind}" == "directory" ]] || die \
         "${built} exists and is a ${kind:-missing path}, not a directory. A symlink there is how a compromised '${APP_USER}' would aim this installer's root-side writes at a path of their choosing, so this run refuses rather than following it. Remove or fix that path and run the installer again; nothing has been changed."
     fi
+    # THE TYPE AND THE IDENTITY, TAKEN TOGETHER, whether this run created the component or accepted
+    # one that was already there. `stat` without `-L` does not dereference.
+    entry="$(stat -c '%F|%d:%i' "${comp}" 2>/dev/null || true)"
+    [[ "${entry%%|*}" == "directory" ]] || die \
+      "${built} is not the directory this run had just checked: it was replaced between the check and the step into it, which is how a compromised '${APP_USER}' would aim this installer's root-side writes at a path of their choosing. This run refuses rather than following it; nothing has been changed."
     cd -P "${comp}" 2>/dev/null || die \
       "${built} could not be entered after this run created or accepted it. Nothing has been changed."
+    # AND THE DIRECTORY WE LANDED IN IS THE ONE THAT ENTRY NAMED (o3d-rn10). `..` alone accepts a
+    # component swapped for a symlink to a SIBLING under the same parent; the inode does not.
+    [[ "$(stat -c '%d:%i' . 2>/dev/null || true)" == "${entry#*|}" ]] || die \
+      "${built} is not the directory this run had just checked: it was replaced between the check and the step into it, which is how a compromised '${APP_USER}' would aim this installer's root-side writes at a path of their choosing. This run refuses rather than following it; nothing has been changed."
     [[ "$(stat -c '%d:%i' .. 2>/dev/null || true)" == "${here}" ]] || die \
       "${built} is not in the directory this run had just checked: it was replaced between the check and the step into it, which is how a compromised '${APP_USER}' would aim this installer's root-side writes at a path of their choosing. This run refuses rather than following it; nothing has been changed."
-    here="$(stat -c '%d:%i' . 2>/dev/null || true)"
-    [[ -n "${here}" ]] || die "${built} could not be identified after this run entered it. Nothing has been changed."
+    here="${entry#*|}"
   done
 }
 
