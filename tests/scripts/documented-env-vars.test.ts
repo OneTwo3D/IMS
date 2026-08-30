@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
-import os from 'node:os'
+import { mkdir, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import test from 'node:test'
 
@@ -17,6 +16,7 @@ import {
   isOperatorFacingFile,
   loadAllowlist,
 } from '../../scripts/check-documented-env-vars.mjs'
+import { createTempDir } from './temp-dir.ts'
 
 import { RETIRED_ENV_VARS } from '@/lib/ops/retired-env-vars'
 
@@ -380,9 +380,9 @@ test('an allowlist entry that is no longer documented, or is now read, fails as 
   assert.deepEqual(staleAllowlistEntries.map((entry) => entry.name), ['GONE_FROM_DOCS', 'NOW_WIRED_UP'])
 })
 
-test('an allowlist entry without a substantive reason is rejected', async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'ims-env-allowlist-'))
-  try {
+test('an allowlist entry without a substantive reason is rejected', async (t) => {
+  const root = await createTempDir('ims-env-allowlist-', t)
+  {
     await mkdir(path.join(root, 'scripts'), { recursive: true })
     const file = path.join(root, 'scripts/documented-env-var-allowlist.json')
 
@@ -393,8 +393,6 @@ test('an allowlist entry without a substantive reason is rejected', async () => 
       documentedButUnread: { APP_PORT: 'Consumed by scripts/update.sh and the installer, not by application code.' },
     }))
     assert.deepEqual(Object.keys(loadAllowlist(root).documentedButUnread), ['APP_PORT'])
-  } finally {
-    await rm(root, { recursive: true, force: true })
   }
 })
 
