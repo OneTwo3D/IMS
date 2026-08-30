@@ -5617,7 +5617,11 @@ function logicalShellLines(lines: string[]): string[] {
 
 /**
  * Every process substitution in <lines>. Comments are skipped, and `$(` is not one of these — it
- * is a command substitution, which section 10 owns. Runs of whitespace in a reported entry are
+ * is a command substitution, which section 10 owns -- and that needs no exclusion here, because
+ * `$(` carries neither redirection character. Excluding a preceding `$` protected nothing and
+ * opened a bypass: bash performs `$<(producer)` (the producer forks; only the consuming word is
+ * broken), so the shape evaded a detector whose whole claim is that none exists. Runs of
+ * whitespace in a reported entry are
  * collapsed to one space, because a logical line rejoined from three physical ones carries the
  * indentation of each.
  */
@@ -5625,7 +5629,7 @@ function processSubstitutionsIn(label: string, lines: string[]): string[] {
   const found: string[] = []
   for (const line of logicalShellLines(lines)) {
     if (/^\s*#/.test(line)) continue
-    if (!/(^|[^$])[<>]\(/.test(line)) continue
+    if (!/[<>]\(/.test(line)) continue
     found.push(`${label}» ${line.trim().replace(/\s+/g, ' ')}`)
   }
   return found
@@ -5726,7 +5730,7 @@ test('[o3d-batch-ret] every other process substitution in the shipped shell file
     'a roster entry that matches no line in the shipped scripts must be deleted')
 })
 
-test('[o3d-batch-ret] the process-substitution rule can FAIL, on every shape these files could use', async () => {
+test('[o3d-batch-ret] the process-substitution rule can FAIL, on every shape these files could use', async (t) => {
   // The two empty lists above mean nothing unless the rule that produced them can produce a
   // non-empty one. Run against lines written to break it, one at a time.
   const planted = [
@@ -5755,6 +5759,12 @@ test('[o3d-batch-ret] the process-substitution rule can FAIL, on every shape the
     // process substitution on the line after it — that line must be flagged in its own right.
     '  # a trailing backslash inside a comment continues nothing \\',
     '  mapfile -t after_comment < <(producer)',
+    // 19-20 PREFIXED WITH `$`. Round 34's MEDIUM: the rule used to exclude a `$` before the
+    // redirection character, to keep command substitutions out. That excluded nothing real --
+    // `$(` carries neither `<` nor `>` -- while hiding a shape bash genuinely performs. Measured
+    // under a real shell below: the producer forks and only the consuming word is broken.
+    '  cat $<(producer)',
+    '  tee $>(consumer) < "$f"',
   ]
   assert.deepEqual(processSubstitutionsIn('synthetic', planted), [
     'synthetic» while read -r x; do :; done < <(producer)',
@@ -5764,10 +5774,27 @@ test('[o3d-batch-ret] the process-substitution rule can FAIL, on every shape the
     'synthetic» mapfile -t out < <(split_producer)',
     'synthetic» diff <(first) <(second) >/dev/null',
     'synthetic» mapfile -t after_comment < <(producer)',
+    'synthetic» cat $<(producer)',
+    'synthetic» tee $>(consumer) < "$f"',
   ], 'the rule must flag the read loop, the mapfile, both halves of a two-input compare, the '
    + 'output substitution, and the two SPLIT across backslash-newlines — and must flag none of the '
    + 'comment, the command substitution section 10 owns, the arithmetic, either of the two shapes '
    + 'that replace one, or the subshell below a line ending in ESCAPED backslashes')
+
+  // The `$`-prefixed shape is a real process substitution, not a curiosity: bash performs it and
+  // the producer runs. Proved here rather than asserted, so the two entries above are earned.
+  const { execFileSync } = await import('node:child_process')
+  const { mkdtempSync, existsSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const probeRoot = mkdtempSync(join(tmpdir(), 'psprobe-'))
+  t.after(() => rmSync(probeRoot, { recursive: true, force: true }))
+  const marker = join(probeRoot, 'producer-ran')
+  // A side effect, not the producer's output: the consuming word is broken, so nothing it WROTE
+  // can be observed through the reader. The fork is what matters, and the file proves it.
+  execFileSync('bash', ['-c', `cat $<(printf x > ${JSON.stringify(marker)}) 2>/dev/null || true`])
+  assert.equal(existsSync(marker), true,
+    'bash must actually run the producer of a `$`-prefixed process substitution — if it did not, '
+  + 'the detector would have nothing to catch and these two cases would be decoration')
 
   // AND THE SPLIT FORM IS A PROCESS SUBSTITUTION IN A REAL SHELL, not a shape this test asserts
   // into existence. Bash removes backslash-newline before tokenization; run the exact text the
