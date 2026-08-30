@@ -150,6 +150,26 @@ export function priorAttemptsWhere(scope: {
 export const PRIOR_ATTEMPT_SELECT = { id: true, status: true, externalTransactionId: true } as const
 
 /**
+ * "A COUNTERPART FOR THIS POSTING EXISTS OR WILL", as a Prisma predicate — the `live` and `posted`
+ * arms of {@link classifyPriorAttempts}, and nothing else.
+ *
+ * For readers that only need the yes/no and cannot act on the third answer. The WooCommerce held-
+ * invoice release is the one: it enqueues, then looks for the row to confirm the enqueue really
+ * wrote something, and a predicate NARROWER than the enqueue's own short-circuit would report
+ * "nothing was queued" about a row the enqueue had just deduped against — stranding a held invoice
+ * for ever. The two are pinned together by a test rather than by this comment.
+ *
+ * POSITIVE ARMS ONLY, deliberately: `NOT (status = $1 AND ...)` is NULL for a NULL column and would
+ * silently drop rows. Both arms here are `IS NOT NULL` / `IN`, which have no three-valued surprise.
+ */
+export const PRIOR_ATTEMPT_COUNTERPART_EXISTS_OR: NonNullable<Prisma.AccountingSyncLogWhereInput['OR']> = [
+  { status: { in: [...PRIOR_ATTEMPT_LIVE_STATUSES] } },
+  // The empty-string arm matches `classifyPriorAttempts`, which trims before believing an id. The
+  // `not: null` conjunct comes first so the second is only ever evaluated on a non-null column.
+  { AND: [{ externalTransactionId: { not: null } }, { externalTransactionId: { not: '' } }] },
+]
+
+/**
  * What an operator is told when an enqueue refuses because a prior attempt cannot be ruled out.
  *
  * It names the ROW, because the remedy acts on that row and not on the document the caller was

@@ -11,6 +11,7 @@ import {
   MISSING_INVOICE_NUMBER_QUEUE_REASON,
   releasedSalesInvoiceQueueWhere,
 } from '@/lib/connectors/woocommerce/sync/held-sales-invoice'
+import { PRIOR_ATTEMPT_COUNTERPART_EXISTS_OR } from '@/lib/domain/accounting/prior-posting-evidence'
 
 // ---------------------------------------------------------------------------
 // o3d-k26m.6 — the invoice held back for a number has to come BACK.
@@ -137,21 +138,45 @@ test('the release looks for the sync row under the very key it enqueued', () => 
 })
 
 test('the confirmation asks the SAME question the enqueue dedupes on, so the two cannot disagree', () => {
-  // Widen this set and a FAILED row reads as work in flight, closing the hold on an invoice
-  // nothing will retry. Narrow it and every poll enqueues a duplicate. It is not a free choice:
-  // it is queueXeroSync's own predicate, and this pins them together.
+  // Widen this and a row nothing will retry reads as work in flight, closing the hold on an invoice
+  // that will never post. Narrow it and every poll enqueues a duplicate — or, since o3d-d0pd, the
+  // confirmation reports "nothing was queued" about a row the enqueue had just deduped against and
+  // the hold never releases at all. It is not a free choice: it is the enqueue's own predicate.
+  //
+  // PINNED BY IDENTITY, NOT BY A STRING. The previous version of this test asserted that a status
+  // literal appeared in two source files, and o3d-d0pd's whole point is that a status is the wrong
+  // question — a literal-matching pin would have had to be deleted to let the fix land, which is a
+  // pin that guards nothing. Both readers now share ONE exported value, so they cannot drift without
+  // this failing.
   const where = releasedSalesInvoiceQueueWhere({ salesOrderId: 'so-1', idempotencyKey: 'k' })
-  assert.deepEqual(where.status, { in: ['PENDING', 'PROCESSING', 'SYNCED'] })
-  const queueSource = readFileSync('lib/connectors/xero/queue.ts', 'utf8')
-  assert.ok(
-    queueSource.includes("status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },"),
-    'queueXeroSync must still dedupe on exactly these statuses',
-  )
-  const accountingSource = readFileSync('lib/accounting.ts', 'utf8')
-  assert.ok(
-    accountingSource.includes("status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },"),
-    'and so must the transactional enqueue',
-  )
+  assert.equal(where.OR, PRIOR_ATTEMPT_COUNTERPART_EXISTS_OR,
+    'the confirmation must read the enqueue\'s own definition, not a copy of it')
+  assert.equal(where.status, undefined, 'and must not carry a second, narrower status filter beside it')
+
+  // The shared definition still admits the live statuses AND a document id in any status: a FAILED
+  // row that names a real document is one the enqueue reports as already queued (o3d-ju8t).
+  assert.deepEqual(PRIOR_ATTEMPT_COUNTERPART_EXISTS_OR[0], { status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] } })
+  assert.deepEqual(PRIOR_ATTEMPT_COUNTERPART_EXISTS_OR[1], {
+    AND: [{ externalTransactionId: { not: null } }, { externalTransactionId: { not: '' } }],
+  })
+
+  // And the three enqueues really do decide from that module rather than from a status list of their
+  // own. Asserted on the files themselves, because a drift here is a silent duplicate posting.
+  for (const file of [
+    'lib/connectors/xero/queue.ts',
+    'lib/connectors/quickbooks/queue.ts',
+    'lib/accounting.ts',
+  ]) {
+    const source = readFileSync(file, 'utf8')
+    assert.ok(
+      source.includes('classifyPriorAttempts(') && source.includes('priorAttemptsWhere('),
+      `${file} must reach its already-present verdict through prior-posting-evidence.ts`,
+    )
+    assert.ok(
+      !source.includes("status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },"),
+      `${file} must not have grown a status-shaped dedupe back`,
+    )
+  }
 })
 
 // ---------------------------------------------------------------------------

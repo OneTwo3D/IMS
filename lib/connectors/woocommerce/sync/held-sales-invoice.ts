@@ -32,6 +32,7 @@
  */
 
 import type { Prisma } from '@/app/generated/prisma/client'
+import { PRIOR_ATTEMPT_COUNTERPART_EXISTS_OR } from '@/lib/domain/accounting/prior-posting-evidence'
 
 /** Marks a ShoppingSyncLog row as a held sales invoice. Lives at `payload.reason`. */
 export const MISSING_INVOICE_NUMBER_QUEUE_REASON = 'missing_wc_invoice_number'
@@ -130,10 +131,20 @@ export function heldSalesInvoiceQueueWhere(params?: { salesOrderId?: string; ext
  * order was deleted under it. Treating "it did not throw" as "it queued" marked the hold SYNCED for
  * an invoice that will never post, which is the very defect the hold exists to prevent.
  *
- * THE STATUS SET IS NOT A CHOICE. It is exactly the set `queueAccountingSync`/`queueXeroSync`
- * dedupe their idempotency key against, so "no row matches this" means "the next release would
- * create one". Widen it and a FAILED row would be read as work in flight, closing the hold on an
- * invoice nothing will retry; narrow it and every poll would enqueue a duplicate.
+ * THE PREDICATE IS NOT A CHOICE. It is exactly what `queueAccountingSync`/`queueXeroSync` short-
+ * circuit their idempotency key against, so "no row matches this" means "the next release would
+ * create one". Widen it and a row nothing will retry reads as work in flight, closing the hold on an
+ * invoice that will never post; narrow it and every poll would enqueue a duplicate.
+ *
+ * o3d-d0pd MOVED THAT PREDICATE, so this moved with it. The enqueue used to dedupe on three statuses
+ * and now decides from the row's own posting EVIDENCE — a row in any status carrying an
+ * `externalTransactionId` is a document that exists, and the enqueue reports it as already queued. A
+ * confirmation still asking only about the three statuses would answer "nothing was queued" about
+ * exactly that row and strand the hold for ever, so both read the one shared definition
+ * (`PRIOR_ATTEMPT_COUNTERPART_EXISTS_OR`).
+ *
+ * The enqueue's THIRD answer — a failed attempt that may have landed, which it refuses — needs no arm
+ * here: it writes no row, so nothing matches, and 'not-queued' is the truth.
  */
 export function releasedSalesInvoiceQueueWhere(params: {
   salesOrderId: string
@@ -143,7 +154,7 @@ export function releasedSalesInvoiceQueueWhere(params: {
     type: 'SALES_INVOICE',
     referenceType: 'SalesOrder',
     referenceId: params.salesOrderId,
-    status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
+    OR: PRIOR_ATTEMPT_COUNTERPART_EXISTS_OR,
     payload: { path: ['_idempotencyKey'], equals: params.idempotencyKey },
   }
 }

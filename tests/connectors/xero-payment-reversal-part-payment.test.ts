@@ -37,6 +37,12 @@ const state = {
   purchaseInvoices: [] as Row[],
   /** AccountingSyncLog rows: the BILL_PAYMENT / INVOICE_PAYMENT registrations IMS holds. */
   syncLogs: [] as Row[],
+  /**
+   * o3d-psrx: the LOCAL receipts IMS has recorded — the `Payment` rows `addPayment` writes in the
+   * same transaction as the order's `paidAt`. A receipt here that no registration in `syncLogs`
+   * names is the window between that commit and the registration being queued.
+   */
+  payments: [] as Row[],
   attempts: 0,
   activity: [] as LoggedActivity[],
   notifications: [] as { title?: string; message?: string; userId?: string | null }[],
@@ -119,6 +125,7 @@ function reset(): void {
   state.salesOrders = []
   state.purchaseInvoices = []
   state.syncLogs = []
+  state.payments = []
   state.rawStatements = []
   state.attempts = 0
   state.activity = []
@@ -391,6 +398,11 @@ const dbDouble: Record<string, unknown> = {
       }
       return { count }
     },
+  },
+  // o3d-psrx: the receipts the sales residual reading now consults. A bill has none, which is why
+  // this is only ever asked about sales orders.
+  payment: {
+    findMany: async ({ where }: { where: Row }) => state.payments.filter((r) => rowMatches(r, where)),
   },
   purchaseInvoice: {
     findMany: async ({ where }: { where: Row }) => state.purchaseInvoices.filter((r) => rowMatches(r, where)),
@@ -1519,4 +1531,98 @@ test('the scan classifies open against closed BEFORE it cuts the page, in the st
     'least recently reconsidered first — the round robin round 4 built')
   assert.doesNotMatch(sql, /bill_payment_reversal/,
     'the action lists are bound as parameters, never interpolated into the statement')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-psrx — THE WINDOW BETWEEN A RECEIPT COMMITTING AND ITS REGISTRATION BEING QUEUED
+//
+// `addPayment` writes the local Payment row and the order's `paidAt` in ONE transaction and queues
+// the INVOICE_PAYMENT registration afterwards, outside it — with a `revalidatePath` and an awaited
+// `logActivity` in between. Every fixture below is the durable state at an instant inside that gap:
+// an order IMS holds as paid, a receipt recorded against it, and no registration at all.
+//
+// Before this, the poll read that as NOTHING_REGISTERED, cleared `paidAt` and raised a chargeback
+// credit note against a sale nobody reversed.
+// ---------------------------------------------------------------------------
+
+const localReceipt = (overrides: Row = {}): Row => ({ id: 'pay_1', orderId: 'so_1', refundId: null, ...overrides })
+
+test('[o3d-psrx] a zero-paid sales invoice with an UNREGISTERED receipt raises NO chargeback and keeps paidAt', async () => {
+  reset()
+  state.invoices = [{ InvoiceID: 'XS1', Type: 'ACCREC', Status: 'AUTHORISED', AmountPaid: 0, AmountDue: 100, Payments: [] }]
+  state.salesOrders = [paidOrderRow()]
+  // The whole fixture: a receipt, and NOTHING in syncLogs. This is the gap.
+  state.payments = [localReceipt()]
+
+  const result = await poll()
+
+  // MUTATION ROUTE: delete the `db.payment.findMany` read from readResidualVerdicts (or pass `[]`
+  // for `unregisteredReceiptIds`) and the verdict falls back to NOTHING_REGISTERED — chargebacks
+  // becomes ['so_1'], paidAt is cleared, and salesReversalsWithheld drops to 0.
+  assert.deepEqual(state.chargebacks, [],
+    'a credit note here reverses revenue against a receipt IMS simply had not told Xero about yet')
+  assert.deepEqual(clearedPaidAt(state.salesOrderUpdates), [], 'and paidAt must stay set')
+  assert.equal(result.salesReversed, 0)
+  assert.equal(result.salesReversalsWithheld, 1, 'withheld and REPORTED, never silently skipped')
+
+  const withheld = state.activity.find((a) => a.action === 'payment_reversal_withheld')
+  assert.match(withheld?.description ?? '', /never registered with Xero/,
+    'the warning must name IMS\'s own silence — an operator sent to /sync finds no row to look at')
+  assert.match(withheld?.description ?? '', /pay_1/, 'and name the receipt')
+  assert.equal(state.notifications.some((n) => n.title === 'Payment reversal detected'), false)
+})
+
+test('[o3d-psrx] once the registration names the receipt, the poll decides normally again', async () => {
+  reset()
+  state.invoices = [{ InvoiceID: 'XS1', Type: 'ACCREC', Status: 'AUTHORISED', AmountPaid: 0, AmountDue: 100, Payments: [] }]
+  state.salesOrders = [paidOrderRow()]
+  state.payments = [localReceipt()]
+  // The same instant one step later: the registration exists, SYNCED before the ledger read, and the
+  // ledger does not list it. That is a real removal and it must STILL be reversed.
+  state.syncLogs = [salesRegistration({ payload: { paymentId: 'pay_1' } })]
+
+  const result = await poll()
+
+  // MUTATION ROUTE: make `unregisteredLocalReceipts` ignore `paymentId` in the other direction —
+  // report every receipt as unregistered — and this fails, because the fix would then have disabled
+  // sales reversal detection outright.
+  assert.deepEqual(state.chargebacks, ['so_1'], 'a genuine reversal is still detected')
+  assert.deepEqual(clearedPaidAt(state.salesOrderUpdates).map((u) => u.id), ['so_1'])
+  assert.equal(result.salesReversalsWithheld, 0)
+})
+
+test('[o3d-psrx] a SECOND receipt on an already-registered order reopens the window for itself alone', async () => {
+  reset()
+  state.invoices = [{ InvoiceID: 'XS1', Type: 'ACCREC', Status: 'AUTHORISED', AmountPaid: 0, AmountDue: 100, Payments: [] }]
+  state.salesOrders = [paidOrderRow()]
+  state.payments = [localReceipt(), localReceipt({ id: 'pay_2' })]
+  state.syncLogs = [salesRegistration({ payload: { paymentId: 'pay_1' } })]
+
+  const result = await poll()
+
+  // The order DOES have a registration, so a check that asked only "is there a row for this order?"
+  // would answer yes and admit the reversal. The question has to be per RECEIPT.
+  //
+  // MUTATION ROUTE: pair on the order instead of on `paymentId` and chargebacks becomes ['so_1'].
+  assert.deepEqual(state.chargebacks, [])
+  assert.deepEqual(clearedPaidAt(state.salesOrderUpdates), [])
+  assert.equal(result.salesReversalsWithheld, 1)
+  assert.match(state.activity.find((a) => a.action === 'payment_reversal_withheld')?.description ?? '', /pay_2/)
+})
+
+test('[o3d-psrx] a REFUND receipt is not an invoice receipt and does not withhold', async () => {
+  reset()
+  state.invoices = [{ InvoiceID: 'XS1', Type: 'ACCREC', Status: 'AUTHORISED', AmountPaid: 0, AmountDue: 100, Payments: [] }]
+  state.salesOrders = [paidOrderRow()]
+  // A refund receipt settles a credit note, not this invoice: it owes no INVOICE_PAYMENT and bears
+  // on nothing this poll is reading.
+  //
+  // MUTATION ROUTE: drop `refundId: null` from the receipt read and this fails — every refunded
+  // order would withhold its reversal for ever.
+  state.payments = [localReceipt({ id: 'pay_refund', refundId: 'ref_1' })]
+
+  const result = await poll()
+
+  assert.deepEqual(state.chargebacks, ['so_1'])
+  assert.equal(result.salesReversalsWithheld, 0)
 })

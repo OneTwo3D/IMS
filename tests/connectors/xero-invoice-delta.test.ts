@@ -11,6 +11,7 @@ import {
   parseLedgerAmount,
   partitionPaymentReversals,
   listedLedgerPaymentIds,
+  unregisteredLocalReceipts,
   PAYMENT_PRESENT_EPSILON,
   MAX_CHUNKS_PER_POLL,
   MAX_PAGES,
@@ -758,4 +759,98 @@ test('a registration that synced at the very instant of the read is undecided, m
   assert.deepEqual(
     classifyRegisteredPayment(invoice, [postedRegistration({ syncedAt: new Date(READ_AT.databaseClock.getTime() - 1) })], READ_AT),
     { verdict: 'GONE', paymentIds: ['PAY-1'] })
+})
+
+// ---------------------------------------------------------------------------
+// o3d-psrx — A RECEIPT IMS HAS NOT REGISTERED IS NOT A REVERSAL
+//
+// `addPayment` commits the local Payment row and the order's `paidAt` in ONE transaction, then
+// queues the INVOICE_PAYMENT registration AFTERWARDS, outside it. A poll landing in that window
+// found no registration and read it as NOTHING_REGISTERED — "IMS never told the ledger about a
+// payment here, so the zero is the whole story". It is not the whole story: the registration has not
+// been raised yet. `paidAt` was cleared and a chargeback credit note was raised against revenue
+// nobody reversed.
+//
+// The witness is the receipt itself, already written in the right transaction. These are the reader.
+// ---------------------------------------------------------------------------
+
+test('[o3d-psrx] a receipt no registration names is unregistered', () => {
+  // MUTATION ROUTE: return `[]` unconditionally and every test below passes vacuously — so each one
+  // also asserts the paired case, where the receipt IS named and must NOT be reported.
+  assert.deepEqual(unregisteredLocalReceipts(['pay_1'], []), ['pay_1'],
+    'no registration at all: the window this issue is about')
+  assert.deepEqual(unregisteredLocalReceipts(['pay_1'], [{ status: 'PENDING', paymentId: 'pay_1' }]), [],
+    'a PENDING registration DOES name it — the ordinary path a moment later')
+})
+
+test('[o3d-psrx] a registration for a DIFFERENT receipt leaves this one unregistered', () => {
+  // MUTATION ROUTE: ignore `paymentId` and treat any registration on the order as covering every
+  // receipt. A second receipt added to an already-registered order then reads as covered, and the
+  // window reopens for it alone — the hardest case to notice, because the order does have a row.
+  assert.deepEqual(
+    unregisteredLocalReceipts(['pay_1', 'pay_2'], [{ status: 'SYNCED', paymentId: 'pay_1' }]),
+    ['pay_2'],
+  )
+})
+
+test('[o3d-psrx] a CANCELLED registration has told the ledger nothing', () => {
+  // CANCELLED asserts that nothing was sent (see classifyRegisteredPayment), so it leaves the
+  // receipt exactly as unregistered as it was before the row existed.
+  //
+  // MUTATION ROUTE: drop the CANCELLED filter and this fails.
+  assert.deepEqual(unregisteredLocalReceipts(['pay_1'], [{ status: 'CANCELLED', paymentId: 'pay_1' }]), ['pay_1'])
+})
+
+test('[o3d-psrx] a registration that names no receipt clears none', () => {
+  // A row from before the payload carried `paymentId`, or one raised by the SALES_INVOICE follow-up
+  // for an imported order. Naming nothing, it clears nothing — the conservative direction.
+  //
+  // MUTATION ROUTE: treat a null paymentId as a wildcard and this fails.
+  assert.deepEqual(unregisteredLocalReceipts(['pay_1'], [{ status: 'SYNCED', paymentId: null }]), ['pay_1'])
+})
+
+test('[o3d-psrx] an order with an unregistered receipt is RECEIPT_NOT_REGISTERED, not NOTHING_REGISTERED', () => {
+  const invoice = ledgerInv('i1', 'ACCREC', 'AUTHORISED', { AmountPaid: 0, AmountDue: 500, Payments: [] })
+  // MUTATION ROUTE: drop the `unregisteredReceiptIds` arm from classifyRegisteredPayment and this
+  // returns NOTHING_REGISTERED — which zeroPaidIsProvenReversal reads as a proven reversal.
+  assert.deepEqual(
+    classifyRegisteredPayment(invoice, [], READ_AT, ['pay_1']),
+    { verdict: 'RECEIPT_NOT_REGISTERED', paymentIds: ['pay_1'] },
+  )
+  // And with nothing unregistered it is the old answer, unchanged.
+  assert.deepEqual(classifyRegisteredPayment(invoice, [], READ_AT, []), { verdict: 'NOTHING_REGISTERED' })
+})
+
+test('[o3d-psrx] an unregistered receipt withholds even when our registered payment is provably GONE', () => {
+  const invoice = ledgerInv('i1', 'ACCREC', 'AUTHORISED', {
+    AmountPaid: 20, AmountDue: 480, Payments: [{ PaymentID: 'PAY-SOMEONE-ELSE' }],
+  })
+  // The ledger's account of this document is not an account of what IMS believes was paid, so the
+  // shortfall cannot be attributed to a removal.
+  //
+  // MUTATION ROUTE: move the unregistered-receipt arm BELOW the `posted.length === 0` split and this
+  // returns GONE — which clears paidAt and raises a chargeback on the part-payment path.
+  assert.deepEqual(
+    classifyRegisteredPayment(invoice, [postedRegistration()], READ_AT, ['pay_2']),
+    { verdict: 'RECEIPT_NOT_REGISTERED', paymentIds: ['pay_2'] },
+  )
+})
+
+test('[o3d-psrx] an UNDECIDED registration still beats everything', () => {
+  const invoice = ledgerInv('i1', 'ACCREC', 'AUTHORISED', { AmountPaid: 0, AmountDue: 500, Payments: [] })
+  // MUTATION ROUTE: put the unregistered-receipt arm above the undecided one and this fails. Both
+  // withhold, so the harm is only the message — but a message that says "IMS never registered this"
+  // about an order with a PENDING registration sends an operator to register it by hand, on top of
+  // the one about to post.
+  assert.deepEqual(
+    classifyRegisteredPayment(invoice, [postedRegistration({ status: 'PENDING' })], READ_AT, ['pay_2']),
+    { verdict: 'REGISTRATION_UNDECIDED', entryIds: ['log_1'] },
+  )
+})
+
+test('[o3d-psrx] RECEIPT_NOT_REGISTERED is never a proven reversal', () => {
+  // MUTATION ROUTE: return true for this verdict and the whole fix is undone while every test above
+  // still passes — the classification would be right and nothing would act on it.
+  assert.equal(zeroPaidIsProvenReversal({ verdict: 'RECEIPT_NOT_REGISTERED', paymentIds: ['pay_1'] }), false,
+    'the ledger is short by a payment IMS never sent, not by one that was taken away')
 })
