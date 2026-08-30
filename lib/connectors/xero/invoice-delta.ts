@@ -1198,6 +1198,22 @@ export type RegisteredPaymentVerdict =
    * verdict exists for. See `unregisteredLocalReceipts`.
    */
   | { verdict: 'RECEIPT_NOT_REGISTERED'; paymentIds: string[] }
+  /**
+   * o3d-psrx r2 — THE PAID FLAG WAS SET FROM EVIDENCE THE LEDGER WAS NEVER GIVEN, AND THERE IS NO
+   * LOCAL RECEIPT TO SAY SO.
+   *
+   * `RECEIPT_NOT_REGISTERED` above catches the case where IMS holds a `Payment` row it has not
+   * registered. It cannot catch the case where IMS holds the order as paid and there is no `Payment`
+   * row at all — which is the ordinary shape of a WooCommerce order (`date_paid_gmt`) and of
+   * `markSalesOrderPaid`. Nothing was recorded and nothing was registered, so the receipt witness
+   * sees nothing to withhold on and the ledger's zero reads as `NOTHING_REGISTERED`: "IMS never told
+   * the ledger about a payment here, so the zero is the whole story".
+   *
+   * It is not the whole story. Nobody ever intended to tell the ledger. See
+   * `SalesOrder.unregisteredPaidAt`, which is what separates this from the ledger-sourced paid flag
+   * that `NOTHING_REGISTERED` is genuinely about.
+   */
+  | { verdict: 'PAID_WITHOUT_LEDGER_RECEIPT' }
   /** The payload did not enumerate the payments, so absence cannot be established from it. */
   | { verdict: 'LEDGER_DID_NOT_LIST_PAYMENTS' }
   /** A registration exists whose effect on the ledger this read cannot speak for. */
@@ -1236,6 +1252,20 @@ export function classifyRegisteredPayment(
    * exact previous meaning; the sales pass is the one that supplies it. See the verdict's own note.
    */
   unregisteredReceiptIds: readonly string[] = [],
+  /**
+   * o3d-psrx r2 — WAS THIS DOCUMENT'S PAID FLAG SET FROM SOMETHING THE LEDGER WAS NEVER TOLD?
+   *
+   * `SalesOrder.unregisteredPaidAt != null`, read straight from the row. Defaulted to false so every
+   * existing caller and test keeps its exact previous meaning, and so a BILL — which has no such
+   * column and whose half of this defect was closed at source by markBillPaid queueing inside the
+   * paid transaction (o3d-a3wx) — never reaches this arm.
+   *
+   * Consulted ONLY when no registration is shown to have posted, which is what makes it
+   * self-discharging: the moment an INVOICE_PAYMENT is proved to have reached the ledger before the
+   * read, the ledger's own list decides, and a genuine WooCommerce chargeback reverses exactly as
+   * 6oyu.6 intends.
+   */
+  paidWithoutLedgerReceipt: boolean = false,
 ): RegisteredPaymentVerdict {
   const undecided: string[] = []
   const posted: string[] = []
@@ -1286,7 +1316,21 @@ export function classifyRegisteredPayment(
     return { verdict: 'RECEIPT_NOT_REGISTERED', paymentIds: [...unregisteredReceiptIds] }
   }
 
-  if (posted.length === 0) return { verdict: 'NOTHING_REGISTERED' }
+  // o3d-psrx r2 — NOTHING POSTED. WHICH OF THE TWO VERY DIFFERENT REASONS IS IT?
+  //
+  // `NOTHING_REGISTERED` is a REVERSAL under zeroPaidIsProvenReversal, and it is right to be one for
+  // the population it was written for: `paidAt` came from the ledger's own forward pass or from the
+  // backlog reconcile, so a ledger that now reads zero has genuinely had the payment taken away.
+  //
+  // It is catastrophically wrong for the OTHER population that reaches this line with no posted
+  // registration — an order whose paid flag came from a channel or from an operator. Nothing was
+  // ever going to be registered for it, so the ledger's zero says nothing whatever about a removal,
+  // and admitting it clears `paidAt` and raises a chargeback credit note against a sale the customer
+  // paid for. The row itself is what separates them; see SalesOrder.unregisteredPaidAt.
+  if (posted.length === 0) {
+    if (paidWithoutLedgerReceipt) return { verdict: 'PAID_WITHOUT_LEDGER_RECEIPT' }
+    return { verdict: 'NOTHING_REGISTERED' }
+  }
 
   const listed = listedLedgerPaymentIds(invoice)
   if (listed === null) return { verdict: 'LEDGER_DID_NOT_LIST_PAYMENTS' }
@@ -1353,6 +1397,11 @@ export function zeroPaidIsProvenReversal(verdict: RegisteredPaymentVerdict): boo
     // here: a wrongly withheld reversal is a warning a human clears in a minute, a wrongly admitted
     // one raises a chargeback credit note against revenue nobody took back.
     case 'RECEIPT_NOT_REGISTERED':
+    // o3d-psrx r2: the paid flag was set by a channel or an operator and no registration ever
+    // posted, so the ledger has never been told there was a payment at all. Its zero is IMS's own
+    // silence — the same asymmetry as every other arm: a wrongly withheld reversal is a warning a
+    // human clears, a wrongly admitted one raises a chargeback credit note against a paid sale.
+    case 'PAID_WITHOUT_LEDGER_RECEIPT':
       return false
   }
 }

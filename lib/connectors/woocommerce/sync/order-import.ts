@@ -782,6 +782,20 @@ async function updateExistingWcOrderFromPayload(
         shippingAddress: mapWcAddress(wcOrder.shipping),
         notes: wcOrder.customer_note || null,
         paidAt: wcOrder.date_paid_gmt ? new Date(wcOrder.date_paid_gmt) : undefined,
+        // o3d-psrx r2 — THE PAID FLAG'S PROVENANCE, WRITTEN BY THE SAME STATEMENT THAT SETS IT.
+        //
+        // This is the writer Codex found: an order imported UNPAID and paid in WooCommerce later.
+        // Its SALES_INVOICE has already posted with `_registerPayment: false`, and NOTHING on this
+        // path raises an INVOICE_PAYMENT afterwards — so the order ends up held as paid with no
+        // local receipt and no registration, PERMANENTLY. The poller's reversal pass then read the
+        // ledger's zero as `NOTHING_REGISTERED` ("IMS never told the ledger, so the zero is the
+        // whole story"), cleared `paidAt`, and raised a chargeback credit note against a sale the
+        // customer had genuinely paid for.
+        //
+        // `undefined` on the same condition as `paidAt`, not `null`: an unpaid payload must leave
+        // BOTH columns exactly as they are, or a redelivery of the pre-payment webhook would wipe
+        // the provenance off an order that is already paid and re-open the defect.
+        unregisteredPaidAt: wcOrder.date_paid_gmt ? new Date(wcOrder.date_paid_gmt) : undefined,
       },
     })
   })
@@ -2095,6 +2109,16 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           discountModel: 'LINE_ALLOCATED',
           notes: wcOrder.customer_note || null,
           paidAt: wcOrder.date_paid_gmt ? new Date(wcOrder.date_paid_gmt) : null,
+          // o3d-psrx r2 — the initial import's half of the same fact, in the same CREATE.
+          //
+          // This order's receipt IS destined for the ledger: the SALES_INVOICE is queued with
+          // `_registerPayment` set, and the Xero processor raises the INVOICE_PAYMENT follow-up once
+          // that invoice posts. But those are separate steps, and between the back-reference landing
+          // (which is what makes the order a reversal candidate at all) and the follow-up row being
+          // created, the order is held as paid with no receipt and no registration — the same window,
+          // reached by a different route. Stamped here, it withholds for exactly that window and stops
+          // mattering the moment the registration posts.
+          unregisteredPaidAt: wcOrder.date_paid_gmt ? new Date(wcOrder.date_paid_gmt) : null,
           shoppingLinks: {
             create: {
               connector: 'woocommerce',

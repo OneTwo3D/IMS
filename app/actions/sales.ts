@@ -3183,9 +3183,21 @@ export async function markSalesOrderPaid(id: string): Promise<{ success: boolean
       const row = await tx.salesOrder.findUnique({ where: { id }, select: { orderNumber: true, externalOrderNumber: true, paidAt: true, invoiceNumber: true } })
       if (!row) return null
       const markingAsPaid = !row.paidAt // transitioning from unpaid to paid
+      const paidAt = markingAsPaid ? new Date() : null
       await tx.salesOrder.update({
         where: { id },
-        data: { paidAt: markingAsPaid ? new Date() : null },
+        data: {
+          paidAt,
+          // o3d-psrx r2 — A HUMAN SAYING SO IS NOT A REGISTRATION EITHER.
+          //
+          // This control records no `Payment` row and queues no INVOICE_PAYMENT: it sets the flag and
+          // (at most) generates an invoice number. So an order marked paid here is held as paid with
+          // nothing whatever in the ledger about a payment, and the poller's reversal pass would read
+          // the ledger's zero as a removal and raise a chargeback against it. The SAME statement that
+          // sets the flag records where it came from; toggling OFF clears both together, which is what
+          // stops a later ledger-sourced paid transition inheriting a stale marker.
+          unregisteredPaidAt: paidAt,
+        },
       })
       return { so: row, markingAsPaid }
     }, STOCK_TX_OPTIONS)
@@ -3462,7 +3474,15 @@ export async function addPayment(input: {
       // these two writes across transactions — in either order — reopens the defect.
       const becamePaid = !refundId && !so.paidAt && totalPaid + input.amount >= Number(so.totalForeign) - 0.0001
       if (becamePaid) {
-        await tx.salesOrder.update({ where: { id: input.orderId }, data: { paidAt: new Date() } })
+        await tx.salesOrder.update({
+          where: { id: input.orderId },
+          // o3d-psrx r2: NULL — this order is paid on a `Payment` row, which is a receipt the witness
+          // above already reads. `unregisteredPaidAt` marks the paid flags that have NO receipt to be
+          // read (WooCommerce's `date_paid_gmt`, `markSalesOrderPaid`), and stamping it here would
+          // withhold reversals for the one population that is already witnessed. Written explicitly,
+          // not omitted: an order marked paid by hand and THEN given a receipt must lose the marker.
+          data: { paidAt: new Date(), unregisteredPaidAt: null },
+        })
       }
       const settlementRateToBase = await resolveSettlementFxRateToBase(tx, {
         currency: so.currency,
@@ -3684,7 +3704,13 @@ async function removePaymentAndSettlePaidAt(
   const becameUnpaid = input.paidAt !== null && !stillFullyPaid
   await tx.salesOrder.update({
     where: { id: input.orderId },
-    data: { paidAt: stillFullyPaid ? undefined : null },
+    data: {
+      paidAt: stillFullyPaid ? undefined : null,
+      // o3d-psrx r2: the provenance follows `paidAt` exactly — cleared when the flag is cleared, left
+      // alone when the remaining receipts still settle the order. A marker outliving the flag it
+      // describes would withhold the next reversal on evidence that no longer exists.
+      unregisteredPaidAt: stillFullyPaid ? undefined : null,
+    },
   })
   return becameUnpaid
 }

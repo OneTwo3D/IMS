@@ -120,7 +120,12 @@ export async function pollQuickBooksPayments(): Promise<{ salesPaid: number; bil
         if (!order.accountingInvoiceId || !paidInvoiceIds.has(order.accountingInvoiceId)) continue
 
         try {
-          const updateData: Record<string, unknown> = { paidAt: new Date() }
+          // o3d-psrx r2: `unregisteredPaidAt: null` — a LEDGER-sourced paid flag (QuickBooks reported
+          // the invoice paid). See SalesOrder.unregisteredPaidAt. Written here rather than left off
+          // the object so this writer cannot inherit a marker an earlier non-ledger write left behind,
+          // and so the paid-provenance guard can see it: an untyped `Record<string, unknown>` is
+          // exactly the shape in which a missing column is not a type error.
+          const updateData: Record<string, unknown> = { paidAt: new Date(), unregisteredPaidAt: null }
           // Advance status from PENDING_PAYMENT to PROCESSING
           if (order.status === 'PENDING_PAYMENT') {
             updateData.status = 'PROCESSING'
@@ -224,7 +229,11 @@ export async function pollQuickBooksPayments(): Promise<{ salesPaid: number; bil
           allQueriesSucceeded = false
           continue
         }
-        await db.salesOrder.update({ where: { id: order.id }, data: { paidAt: null } })
+        // o3d-psrx r2: the provenance is cleared with the flag it describes.
+        await db.salesOrder.update({
+          where: { id: order.id },
+          data: { paidAt: null, unregisteredPaidAt: null },
+        })
         salesReversed++
         await logActivity({
           entityType: 'SALES_ORDER',

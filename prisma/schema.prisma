@@ -1749,6 +1749,42 @@ model SalesOrder {
   // not equal in Postgres, so any number of orders may be unlinked.
   accountingInvoiceId     String?    @unique @map("accounting_invoice_id") // Accounting invoice ID after sync
   paidAt            DateTime?
+  /// o3d-psrx r2 — THE PAID FLAG BESIDE IT WAS SET FROM EVIDENCE THE LEDGER WAS NEVER GIVEN.
+  ///
+  /// `paidAt` records THAT this order is held as paid. It does not record WHERE that belief came
+  /// from, and the payment poller's reversal pass turns on exactly that distinction:
+  ///
+  ///   the LEDGER said so       the Xero/QuickBooks forward pass and the backlog reconcile stamp
+  ///                            `paidAt` from an invoice the ledger itself reported PAID. If the
+  ///                            ledger later reports zero, the payment really has been taken away
+  ///                            and clearing `paidAt` is the whole point of the pass.
+  ///   A CHANNEL OR AN OPERATOR said so
+  ///                            the WooCommerce importer stamps `paidAt` from `date_paid_gmt`, and
+  ///                            `markSalesOrderPaid` stamps it because a human said so. NEITHER puts
+  ///                            anything into the ledger. A ledger reading zero against such an
+  ///                            order is IMS's OWN SILENCE, not a removal — and reading it as a
+  ///                            removal clears `paidAt` and raises a chargeback credit note against
+  ///                            a sale the customer genuinely paid for.
+  ///
+  /// The two are INDISTINGUISHABLE from the row alone: neither has a local `Payment`, so the receipt
+  /// witness (o3d-psrx r1) cannot separate them, and "has a shopping link" cannot either — every
+  /// ledger-sourced writer already excludes shopping-linked orders, but `markSalesOrderPaid` does not.
+  /// So the provenance is RECORDED rather than inferred, by the same UPDATE statement that writes
+  /// `paidAt`. There is no instant at which a reader can see one without the other.
+  ///
+  /// SET to the paid instant by the non-ledger writers; NULL by every ledger-sourced writer and by
+  /// every writer that clears `paidAt`. `tests/accounting/paid-provenance-writers.test.ts` requires
+  /// every `paidAt` write in app/ and lib/ to name this field in the same `data` object, which is
+  /// what stops the next writer inheriting a stale value by omission.
+  ///
+  /// DISCHARGED BY THE LEDGER, NOT BY A SWEEP. Once an INVOICE_PAYMENT registration is shown to have
+  /// posted before the ledger read, `classifyRegisteredPayment` stops consulting this at all — a
+  /// genuine WooCommerce chargeback still reverses. Nothing has to clear it, which is why no writer
+  /// does; it is a fact about how the flag was set, and that fact does not expire.
+  ///
+  /// NULL on rows written before this column existed. The migration backfills the population it can
+  /// prove — shopping-linked, paid, no local receipt — and leaves the rest honest.
+  unregisteredPaidAt DateTime? @map("unregistered_paid_at")
   orderNumber       String?    // IMS order number (prefix + WC number, or manual)
   paymentMethod     String?    // e.g. "stripe", "paypal", "bacs" — populated by any shopping channel
   paymentMethodTitle String?   // e.g. "Credit card", "PayPal"

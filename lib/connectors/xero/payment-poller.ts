@@ -231,6 +231,17 @@ function registrationText(verdict: RegisteredPaymentVerdict, reason: WithheldAmo
         + `the ledger shows is IMS's own silence rather than evidence of a removal. If the registration is `
         + `still on its way IMS will decide this by itself on a later poll; if it was refused, the warning `
         + `that refused it says why and the receipt has to be registered by hand.`
+    // o3d-psrx r2: the same silence, reached without any local receipt to name. A WooCommerce order
+    // paid in the channel, or one an operator marked paid by hand, has NO Payment row and NO
+    // registration — and never will have one unless something raises it. Named as provenance,
+    // because the operator's action is to look at the ORDER's payment, not at a sync row.
+    case 'PAID_WITHOUT_LEDGER_RECEIPT':
+      return ` This order is held as paid on evidence the ledger was never given — a shopping channel `
+        + `reported the payment, or an operator marked it paid — and no payment registration for it has `
+        + `reached the ledger. The ledger therefore has nothing of IMS's to have removed, so its figure `
+        + `is IMS's own silence and not proof of a reversal. Check the payment in the sales channel: if `
+        + `it is genuinely gone, reverse the order by hand; if it stands, register the receipt so the `
+        + `two agree.`
     case 'GONE':
       return ''
   }
@@ -369,7 +380,17 @@ function emptyResidual<T>(): ResidualReading<T> {
  * classifyRegisteredPayment for why a registration that finished after it cannot be decided by this
  * read, and why a null fence decides nothing at all.
  */
-async function readResidualVerdicts<T extends { id: string; accountingInvoiceId: string | null }>(
+async function readResidualVerdicts<T extends {
+  id: string
+  accountingInvoiceId: string | null
+  /**
+   * o3d-psrx r2 — present on SALES documents only. A bill has no such column, so this is `undefined`
+   * for every `PurchaseInvoice` and the arm it feeds is unreachable from the bill pass, which is
+   * correct: markBillPaid queues its BILL_PAYMENT registration INSIDE the paid transaction (o3d-a3wx),
+   * so a bill IMS holds as paid always has a registration to be judged by.
+   */
+  unregisteredPaidAt?: Date | null
+}>(
   docs: T[],
   candidateInvoices: Map<string, XeroInvoice>,
   zeroPaidInvoiceIds: ReadonlySet<string>,
@@ -452,6 +473,10 @@ async function readResidualVerdicts<T extends { id: string; accountingInvoiceId:
         receiptsByDocument.get(doc.id) ?? [],
         receiptsNamedByDocument.get(doc.id) ?? [],
       ),
+      // o3d-psrx r2 — READ FROM THE ROW, not inferred from the absence of a receipt. "No Payment row"
+      // is true of a WooCommerce-paid order AND of an order the Xero forward pass marked paid, and
+      // those need OPPOSITE answers here; only the recorded provenance separates them.
+      doc.unregisteredPaidAt != null,
     )
 
     if (zeroPaidInvoiceIds.has(invoice.InvoiceID)) {
@@ -497,6 +522,8 @@ type WithheldOrderDoc = {
   orderNumber: string | null
   externalOrderNumber: string | null
   status: string
+  /** o3d-psrx r2 — see SalesOrder.unregisteredPaidAt and readResidualVerdicts. */
+  unregisteredPaidAt: Date | null
 }
 
 function billWithheldDescription(bill: WithheldBillDoc, invoice: XeroInvoice, reason: WithheldAmountReason): string {
@@ -774,7 +801,12 @@ async function processDeltaChunk(
   try {
     const candidateOrders = salesCandidateInvoices.size === 0 ? [] : await db.salesOrder.findMany({
       where: { accountingInvoiceId: { in: [...salesCandidateInvoices.keys()] }, paidAt: { not: null } },
-      select: { id: true, accountingInvoiceId: true, orderNumber: true, externalOrderNumber: true, status: true },
+      select: {
+        id: true, accountingInvoiceId: true, orderNumber: true, externalOrderNumber: true, status: true,
+        // o3d-psrx r2: WHERE this order's paid flag came from. Selected with `paidAt`'s own candidates
+        // because the reversal verdict turns on it — see readResidualVerdicts.
+        unregisteredPaidAt: true,
+      },
     })
     salesResidual = await readResidualVerdicts(
       candidateOrders, salesCandidateInvoices, salesZeroPaidIds, 'INVOICE_PAYMENT', 'SalesOrder', ledgerObservedBefore,
@@ -825,7 +857,12 @@ async function processDeltaChunk(
       //    concurrent PENDING_PAYMENT→ON_HOLD/PROCESSING cannot make us silently lose a real payment.
       const paid = await db.salesOrder.updateMany({
         where: { id: order.id, paidAt: null, refundStatus: { not: 'FULL' } },
-        data: { paidAt: paidDate },
+        // o3d-psrx r2: NULL — THIS is the ledger-sourced paid flag, and it is the one population
+        // `NOTHING_REGISTERED` is genuinely a reversal for. Xero reported the invoice PAID; if Xero
+        // later reports zero, the payment really has been taken away and clearing `paidAt` is the
+        // whole purpose of the reversal pass. Written explicitly so the provenance can never be
+        // inherited from an earlier non-ledger write.
+        data: { paidAt: paidDate, unregisteredPaidAt: null },
       })
       if (paid.count === 0) continue // already paid, or fully refunded since selection — nothing to do
 
@@ -937,7 +974,13 @@ async function processDeltaChunk(
           // every future poll — the alert and the audit entry are landed first, while re-detection is
           // still possible.
           clearPaidAt: async (orderId) => {
-            await db.salesOrder.update({ where: { id: orderId }, data: { paidAt: null } })
+            // o3d-psrx r2: the provenance goes with the flag. Leaving it set on an order that is no
+            // longer paid would withhold the NEXT reversal on a marker describing a flag that has
+            // already been cleared once.
+            await db.salesOrder.update({
+              where: { id: orderId },
+              data: { paidAt: null, unregisteredPaidAt: null },
+            })
           },
           notifyNeedsAttention: (o, { wcHandled, chargebackManualReason }) =>
             notifyReversalAdmins(o, wcHandled, registeredPaymentGone, chargebackManualReason),
