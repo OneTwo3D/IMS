@@ -11,7 +11,7 @@ import {
   type RegisteredPaymentVerdict,
 } from '@/lib/connectors/xero/invoice-delta'
 import { storedBodyMayHaveReachedTheLedger } from '@/lib/domain/accounting/followup-idempotency'
-import { payloadPaymentId } from '@/lib/domain/accounting/invoice-payment-enqueue'
+import { payloadAccountingInvoiceId, payloadPaymentId } from '@/lib/domain/accounting/invoice-payment-enqueue'
 
 // ---------------------------------------------------------------------------
 // Payment-reversal detection (audit-M-acct #3)
@@ -110,6 +110,14 @@ export type PaidProvenanceDoc = {
  *      ledger's own forward pass marked paid, and those need OPPOSITE answers; only the recorded
  *      provenance separates them.
  *
+ * AND EVERY REGISTRATION IS WEIGHED AGAINST THE PAID STATE IT IS SUPPOSED TO BE ABOUT (r4, Codex
+ * HIGH). `referenceId` groups every registration this document has ever had. Two of them are not
+ * about the flag being decided: one raised against an `accountingInvoiceId` the document no longer
+ * has (deleted and re-posted — o3d-hbgo's rule, on the reversal side), and one that completed before
+ * the current paid episode began (paid, registered, reversed, paid again — the stale row then made
+ * `posted` non-empty, which is precisely what stops `unregisteredPaidAt` being consulted). Both facts
+ * are already recorded, on the registration's payload and on the row; see `PaidStateBinding`.
+ *
  * Documents with no `accountingInvoiceId` get no verdict — there is no ledger document to disagree
  * with. A caller that finds no entry for a document must WITHHOLD, never admit: this map's absences
  * are "nothing was decided", which is the same fail-closed reading a null fence gets.
@@ -163,6 +171,11 @@ export async function readPaidProvenanceVerdicts<T extends PaidProvenanceDoc>(
       externalTransactionId: row.externalTransactionId,
       syncedAt: row.syncedAt,
       syncedAtDatabaseClock: row.syncedAtDatabaseClock,
+      // o3d-psrx r4 (Codex HIGH): WHICH LEDGER DOCUMENT this registration was raised against, read
+      // through the same helper the enqueue writes it with and never re-spelt here. Selected because
+      // `referenceId` alone groups every registration this order has EVER had — including one against
+      // an invoice that was deleted and re-posted, which then answered for its replacement.
+      registeredAgainstInvoiceId: payloadAccountingInvoiceId(row.payload),
     })
     byDocument.set(row.referenceId, list)
     const named = receiptsNamedByDocument.get(row.referenceId) ?? []
@@ -196,6 +209,14 @@ export async function readPaidProvenanceVerdicts<T extends PaidProvenanceDoc>(
       ),
       // READ FROM THE ROW, not inferred from the absence of a receipt.
       doc.unregisteredPaidAt != null,
+      // o3d-psrx r4 (Codex HIGH): and WHICH paid state the evidence has to be about. Both fields come
+      // off the document itself — the invoice it points at now, and (for a sales order) the instant
+      // this paid episode was entered with nothing to register. A registration that predates the
+      // marker, or names a document this one replaced, is no longer allowed to discharge it.
+      {
+        accountingInvoiceId: doc.accountingInvoiceId,
+        unregisteredPaidAt: doc.unregisteredPaidAt ?? null,
+      },
     ))
   }
   return out

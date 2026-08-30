@@ -102,7 +102,7 @@ export async function loadInvoicePaymentSyncRows(
       paymentId: payloadPaymentId(r.payload),
       // o3d-hbgo: WHICH ledger invoice this settled. A row against a document the order no longer has
       // (deleted and re-posted) must not be read as bearing on the replacement's settlement.
-      accountingInvoiceId: typeof payload.accountingInvoiceId === 'string' ? payload.accountingInvoiceId : null,
+      accountingInvoiceId: payloadAccountingInvoiceId(r.payload),
       // o3d-0m56. The three facts the unresolved-attempt fence weighs, all derived through the SAME
       // helpers the retry guard and the processors use rather than re-spelt here — copies of these
       // rules are what let a probe go looking for a settlement on a day no post would ever create.
@@ -124,6 +124,30 @@ export async function loadInvoicePaymentSyncRows(
 export function payloadPaymentId(payload: unknown): string | null {
   const p = (payload && typeof payload === 'object' ? payload : {}) as Record<string, unknown>
   return typeof p.paymentId === 'string' ? p.paymentId : null
+}
+
+/**
+ * WHICH LEDGER DOCUMENT A REGISTRATION WAS RAISED AGAINST (o3d-hbgo; o3d-psrx r4, Codex HIGH).
+ *
+ * Both INVOICE_PAYMENT and BILL_PAYMENT put `accountingInvoiceId` in the payload at enqueue time, and
+ * it is the ONLY durable record of which document the money call was about: `salesOrder`/
+ * `purchaseInvoice`.`accountingInvoiceId` answers "which document does this row point at NOW", which
+ * a delete-and-re-post silently changes underneath every registration already raised.
+ *
+ * Spelt once, here, next to `payloadPaymentId`, because the settlement reader (`findRegisteredPayments`)
+ * and the reversal evidence reader (`readPaidProvenanceVerdicts`) must agree about what "this
+ * registration is about that document" means — two readings of one payload field is the same class of
+ * defect as two readings of one money rule.
+ *
+ * A payload that records no id — a row from before the field existed, or one retention-compacted to
+ * `{}` (o3d-m5qk) — answers NULL, which every caller must read as "cannot be tied to any document",
+ * never as "tied to this one".
+ */
+export function payloadAccountingInvoiceId(payload: unknown): string | null {
+  const p = (payload && typeof payload === 'object' ? payload : {}) as Record<string, unknown>
+  if (typeof p.accountingInvoiceId !== 'string') return null
+  const trimmed = p.accountingInvoiceId.trim()
+  return trimmed === '' ? null : trimmed
 }
 
 /**

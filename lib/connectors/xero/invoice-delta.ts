@@ -1042,6 +1042,89 @@ export type RegisteredPaymentRow = {
    * two millisecond values, and any writer can produce it.
    */
   syncedAtDatabaseClock: Date | null
+  /**
+   * o3d-psrx r4 (Codex HIGH) — WHICH LEDGER DOCUMENT THIS REGISTRATION WAS RAISED AGAINST.
+   *
+   * `payloadAccountingInvoiceId(row.payload)`, i.e. the id the enqueue recorded, NOT the id the
+   * document points at now. Null when the payload records none (a legacy row, or one retention-
+   * compacted to `{}`), and null must be read as "cannot be tied to any document".
+   *
+   * OPTIONAL so every existing caller and test keeps its exact previous meaning: a row that does not
+   * carry this field is never weighed against a {@link PaidStateBinding}, because only a caller that
+   * supplies a binding is asking the question.
+   */
+  registeredAgainstInvoiceId?: string | null
+}
+
+/**
+ * WHAT THE DOCUMENT'S PAID FLAG IS ABOUT RIGHT NOW (o3d-psrx r4, Codex HIGH).
+ *
+ * THE DEFECT. The evidence read grouped registrations by `referenceId` ALONE — one sales order, every
+ * INVOICE_PAYMENT ever raised for it — and the classifier then took any one of them that had posted
+ * before the fence as evidence about the CURRENT paid flag. Neither half of "current" was checked:
+ *
+ *   NOT THIS DOCUMENT.  An invoice deleted in the ledger and re-posted gives the order a new
+ *                       `accountingInvoiceId`. The registration that settled the OLD document is
+ *                       still a SYNCED row against the same order, and it answered for the
+ *                       replacement — the cross-document contamination `o3d-hbgo` already states must
+ *                       not happen on the settlement side.
+ *   NOT THIS PAYMENT.   An order can be paid, registered, reversed and paid AGAIN. Clearing `paidAt`
+ *                       does not retire the first episode's registration, so on the second episode
+ *                       the evidence read said "a registration posted" — true, and about a payment
+ *                       that was taken away. Concretely: the stale row made `posted` non-empty, which
+ *                       is what stops `unregisteredPaidAt` producing PAID_WITHOUT_LEDGER_RECEIPT, so
+ *                       an off-ledger re-payment was admitted as a reversal and charged back.
+ *
+ * NO NEW COLUMN CARRIES THIS. Both facts are already recorded:
+ *
+ *   `accountingInvoiceId`   the document the flag is about now, weighed against the id the
+ *                           registration's own payload names.
+ *   `unregisteredPaidAt`    the instant THIS paid episode was entered with no ledger receipt behind
+ *                           it. It is written by the same statement that sets `paidAt` and cleared by
+ *                           the same statement that clears it (the writer census in
+ *                           tests/accounting/paid-provenance-writers.test.ts is what keeps that true),
+ *                           so while it stands it IS this episode's own timestamp — nothing older
+ *                           than it belongs to this paid state.
+ *
+ * Null = the caller is not asking. Every existing caller stays exactly as it was.
+ */
+export type PaidStateBinding = {
+  /** `SalesOrder`/`PurchaseInvoice`.`accountingInvoiceId` — the document the paid flag is about NOW. */
+  accountingInvoiceId: string | null
+  /** `SalesOrder.unregisteredPaidAt` — this episode's own instant, or null for a ledger-sourced flag. */
+  unregisteredPaidAt: Date | null
+}
+
+/**
+ * MAY THIS REGISTRATION SPEAK FOR THE DOCUMENT'S CURRENT PAID STATE?
+ *
+ * Both tests are conservative in the same direction: `false` never admits a reversal on its own — it
+ * only moves a row out of the evidence that DISCHARGES a withholding marker, and the classifier then
+ * withholds rather than concludes (see the `unbound` arm there). So an unbindable row costs a warning
+ * a human clears; the answer this replaces cost a chargeback credit note against a paid sale.
+ *
+ * ON THE TWO CLOCKS. `completedAt` is minted by the database (`databaseStampedCompletion`) and
+ * `unregisteredPaidAt` by whichever writer set the flag. That is deliberately NOT the fence: the fence
+ * (`LedgerReadFence`) orders a ledger READ against a registration, its two ends are milliseconds apart
+ * by design, and it is why `syncedAtDatabaseClock` exists. This orders two of IMS's OWN records of its
+ * own actions, and its two ends are separated by a human deciding to mark an order paid again — a
+ * reversal, then a re-payment. Skew cannot reach across that, and the direction it would have to fail
+ * in is "an OLDER registration reads as newer than the marker", which additionally requires the same
+ * row to name the document's current invoice id.
+ */
+export function registrationBindsToPaidState(
+  row: Pick<RegisteredPaymentRow, 'registeredAgainstInvoiceId'>,
+  completedAt: Date,
+  paidState: PaidStateBinding,
+): boolean {
+  // THE DOCUMENT. A row that names no document names no document — it is not a wildcard.
+  const against = typeof row.registeredAgainstInvoiceId === 'string' ? row.registeredAgainstInvoiceId.trim() : ''
+  if (against === '') return false
+  if (paidState.accountingInvoiceId == null || against !== paidState.accountingInvoiceId) return false
+  // THE EPISODE. Only asked of a paid flag that RECORDS its own start; a ledger-sourced flag has no
+  // marker to discharge and this arm is not what decides it.
+  if (paidState.unregisteredPaidAt == null) return true
+  return completedAt.getTime() > paidState.unregisteredPaidAt.getTime()
 }
 
 /**
@@ -1298,9 +1381,22 @@ export function classifyRegisteredPaymentAgainstListing(
    * 6oyu.6 intends.
    */
   paidWithoutLedgerReceipt: boolean = false,
+  /**
+   * o3d-psrx r4 — WHAT THE DOCUMENT'S PAID FLAG IS ABOUT RIGHT NOW, so a registration raised against a
+   * document the order no longer has, or during a paid state that has since been cleared, cannot
+   * answer for this one. See {@link PaidStateBinding}. Null = the caller is not asking, and then every
+   * registration weighs exactly as it did before.
+   */
+  paidState: PaidStateBinding | null = null,
 ): RegisteredPaymentVerdict {
   const undecided: string[] = []
   const posted: string[] = []
+  // o3d-psrx r4 — POSTED, BUT NOT ABOUT THIS PAID STATE. Kept apart from both other buckets on
+  // purpose: counting these as `posted` is the defect Codex found, and DROPPING them would be worse —
+  // a document whose only registration is unbound would read as NOTHING_REGISTERED, which is an
+  // ADMITTED reversal. They are evidence of a registration and evidence of nothing about this flag,
+  // and the only honest verdict over them alone is "undecided".
+  const unbound: string[] = []
 
   for (const row of registrations) {
     // CANCELLED is the one status this tree only ever asserts where "nothing was sent" is true, so it
@@ -1324,6 +1420,12 @@ export function classifyRegisteredPaymentAgainstListing(
       // comparison is meaningless, and was actively dangerous, between two hosts.
       && completedAt.getTime() < ledgerObservedBefore.databaseClock.getTime()
     ) {
+      // o3d-psrx r4: it posted and the ledger's answer covers it — but does it cover THIS document's
+      // CURRENT paid flag? A caller that supplies no binding is not asking, and nothing changes.
+      if (paidState != null && !registrationBindsToPaidState(row, completedAt, paidState)) {
+        unbound.push(row.id)
+        continue
+      }
       posted.push(row.externalTransactionId.trim())
       continue
     }
@@ -1360,7 +1462,17 @@ export function classifyRegisteredPaymentAgainstListing(
   // and admitting it clears `paidAt` and raises a chargeback credit note against a sale the customer
   // paid for. The row itself is what separates them; see SalesOrder.unregisteredPaidAt.
   if (posted.length === 0) {
+    // o3d-psrx r4 — THE MARKER IS ASKED BEFORE THE UNBOUND ROWS, and that order is the whole finding.
+    //
+    // The marker says this paid flag was entered with no ledger receipt behind it and none coming. An
+    // unbound row cannot contradict that: by construction it is about a document this one replaced, or
+    // about a paid state that was cleared before this one began. Asking the rows first is exactly the
+    // reading that let a registration from the FIRST paid episode discharge the SECOND.
     if (paidWithoutLedgerReceipt) return { verdict: 'PAID_WITHOUT_LEDGER_RECEIPT' }
+    // No marker, and every registration this document has is unbound. `NOTHING_REGISTERED` would be a
+    // lie in the admitting direction — IMS DID register a payment, just not for this document or this
+    // paid state, and the ledger may still be holding it. Undecided, named, and withheld.
+    if (unbound.length > 0) return { verdict: 'REGISTRATION_UNDECIDED', entryIds: unbound }
     return { verdict: 'NOTHING_REGISTERED' }
   }
 
