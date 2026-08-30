@@ -8,6 +8,7 @@ import { resolveAccountingEnqueueOrderScope } from '@/lib/domain/accounting/enqu
 import { hasLockedSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 import { stampingCustodyOnCreate } from '@/lib/domain/accounting/money-attempt-provenance'
+import { withSavepoint } from '@/lib/db/savepoint'
 import {
   classifyPriorAttempts,
   describeUnresolvedPriorAttempt,
@@ -497,7 +498,26 @@ export async function queueAccountingSyncTx(
       import('@/lib/domain/accounting/accounting-event-mirror'),
     ])
     const baseCurrency = await getBaseCurrencyCode()
-    const log = await tx.accountingSyncLog.create({
+    // o3d-d0pd r2 (Codex MEDIUM) — THE ONLY STATEMENT HERE THAT MAY RAISE A HANDLED ERROR, AND SO
+    // THE ONLY ONE THAT NEEDS ISOLATING.
+    //
+    // The catch below detects `accounting_sync_logs_idempotency_key_uq` and answers `queued: true`.
+    // That detection was dead code until this round fixed it (o3d-5od: `String(error)` never
+    // contains the index name under `@prisma/adapter-pg`), which means the path it guards is NEWLY
+    // REACHABLE — and reaching it was worse than throwing. `tx` is the CALLER's interactive
+    // transaction; PostgreSQL aborts the whole transaction on the 23505, Prisma wraps no savepoint
+    // around individual statements, and so every statement the caller issues after this function
+    // returns — and the COMMIT itself — fails with 25P02. Callers that immediately write COGS or
+    // transit subledger rows are exactly the ones that would have hit it. "Detected, reported, and
+    // then the caller's transaction cannot commit" is not a handled collision.
+    //
+    // The savepoint is what makes the catch genuinely recoverable: rolling back to it clears the
+    // aborted state and leaves the rest of the transaction intact and committable.
+    //
+    // WRAPPED AROUND THE CREATE ALONE, not the whole block. The outbox schedule and the event mirror
+    // that follow are ordinary work whose failure is NOT handled here — isolating them would only
+    // hide it. The collision can come from nothing but this INSERT.
+    const log = await withSavepoint(tx, () => tx.accountingSyncLog.create({
       data: {
         connector: context.connector,
         type: params.type,
@@ -516,7 +536,7 @@ export async function queueAccountingSyncTx(
         // money-attempt-provenance.ts. A row created without it is never recycled again.
         ...stampingCustodyOnCreate(),
       },
-    })
+    }))
     if (context.connector === 'xero') {
       const { scheduleXeroAccountingOutbox } = await import('@/lib/connectors/xero/outbox')
       await scheduleXeroAccountingOutbox(tx, {
@@ -547,10 +567,13 @@ export async function queueAccountingSyncTx(
     // so the GL counterpart exists — treat as queued.
     //
     // o3d-d0pd: detected through the shared reader rather than a substring of the error text, which
-    // the driver adapter never contains (o3d-5od). NOTE, unchanged by this: catching a P2002 inside
-    // the CALLER's interactive transaction leaves that transaction aborted (Postgres 25P02) because
-    // Prisma wraps no savepoint around the statement, so the caller's commit fails anyway. Making the
-    // guard fire is necessary but not sufficient here; the savepoint half is o3d-5od's own follow-up.
+    // the driver adapter never contains (o3d-5od).
+    //
+    // o3d-d0pd r2: AND THE TRANSACTION IS USABLE WHEN THIS RETURNS. The create above runs inside a
+    // savepoint, so the 23505 that brought us here has already been rolled back to it and the
+    // caller's interactive transaction is committable — which is the whole difference between
+    // reporting a handled collision and reporting one the caller then cannot act on. See the note on
+    // the create.
     if (params.idempotencyKey && isIdempotencyKeyIndexCollision(error)) {
       return answer({ queued: true, reason: 'already-queued' }, context.connector)
     }
