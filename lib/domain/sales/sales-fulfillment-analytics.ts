@@ -415,24 +415,35 @@ type OffRowCreditSummary = {
    */
   present: boolean
   /**
-   * An upper bound, IN NET TERMS, on the credit no row subtracted — or null when the direction is
-   * not established. Every bucket's true NET value is at most its stated amount (a GROSS amount is
-   * VAT-inclusive, so its ex-VAT value is smaller; an unproven one is bounded the same way), so
-   * while every bucket is non-negative their total is a legitimate ceiling on the NET credit
-   * missing from the figure — a MAGNITUDE for `netLinearFigureBoundDecimal`, never a published
-   * amount, and never the test for whether any credit exists. One negative bucket breaks the
-   * inequality, so the answer is null and the figures degrade to indeterminate.
+   * A CEILING, IN NET TERMS, on the credit no row subtracted — or null when the published figures
+   * cannot be claimed to be ceilings at all. Never a published amount and never the existence test;
+   * only a magnitude for `netLinearFigureBoundDecimal` / `marginFigureBoundDecimal`.
+   *
+   * A NET bucket is already in NET terms, so it contributes exactly its amount. A GROSS or unproven
+   * bucket `b` is worth somewhere in `[0, b]` net of VAT when `b >= 0`, and in `[b, 0]` when it is
+   * negative, so the total NET credit missing from the figure lies in
+   *   `[ Σnet + Σ min(b, 0) , Σnet + Σ max(b, 0) ]`.
+   * The upper end is this ceiling. The LOWER end is what decides whether there is a ceiling at all:
+   * a `≤` marker says "the truth is at or below the published figure", which holds only while the
+   * unsubtracted credit cannot be negative. So a lower end below zero returns null and the figures
+   * are marked indeterminate — including the case a plain signed sum gets wrong, a negative NET
+   * bucket outweighed by a positive GROSS one, where the sum looks safely positive and the true
+   * credit can still be negative.
    */
   netUpperBound: Prisma.Decimal | null
 }
 
 function offRowCreditSummary(...sets: CreditBuckets[]): OffRowCreditSummary {
-  const buckets = sets.flatMap((set) => [set.net, set.gross, set.unknown])
+  const zero = new Prisma.Decimal(0)
+  const sum = (values: Prisma.Decimal[]) => values.reduce((total, value) => total.add(value), zero)
+  const exact = sets.map((set) => set.net)
+  const convertible = sets.flatMap((set) => [set.gross, set.unknown])
+  const lowerEnd = sum(exact).add(sum(convertible.map((value) => value.lt(0) ? value : zero)))
   return {
-    present: buckets.some((bucket) => !bucket.isZero()),
-    netUpperBound: buckets.some((bucket) => bucket.lt(0))
+    present: [...exact, ...convertible].some((bucket) => !bucket.isZero()),
+    netUpperBound: lowerEnd.lt(0)
       ? null
-      : buckets.reduce((sum, bucket) => sum.add(bucket), new Prisma.Decimal(0)),
+      : sum(exact).add(sum(convertible.map((value) => value.gt(0) ? value : zero))),
   }
 }
 
@@ -1575,9 +1586,9 @@ export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = 
   const paged = paginate(rows, filters, deps?.paginate !== false)
   const totalRevenue = [...netRevenueByKey.values()].reduce((sum, revenue) => sum.add(revenue), new Prisma.Decimal(0))
   const totalCogs = [...groups.values()].reduce((sum, row) => sum.add(row.cogs), new Prisma.Decimal(0))
-  // Null `netUpperBound` = a negative off-row bucket, so there is no established direction for the
-  // totals to be bounded in: they are marked indeterminate rather than given a ceiling that is not
-  // one. `rowUnplaced` is already a NET-terms magnitude, so the two add.
+  // Null `netUpperBound` = the off-row credit could itself be negative, so there is no direction to
+  // bound the totals in: they are marked indeterminate rather than given a ceiling that is not one.
+  // `rowUnplaced` is already a NET-terms magnitude, so the two add.
   const totalUnplaced = offRow.netUpperBound === null ? null : rowUnplaced.add(offRow.netUpperBound)
   const totalBasisComplete = rowBasisComplete && !offRow.present
   const totalLinearBound: DerivedFigureBound = totalUnplaced === null

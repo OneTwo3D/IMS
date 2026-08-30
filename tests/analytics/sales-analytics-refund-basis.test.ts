@@ -94,14 +94,51 @@ function cogsByOrderRow(orderId: string, totalCostBase: string) {
   return { totalCostBase: D(totalCostBase), movement: { referenceId: orderId } }
 }
 
+/** One in-window dispatch movement, linked to the sales line it shipped. */
+function dispatch(orderId: string, lineId: string, productId: string, qty: string) {
+  return { qty: D(qty), referenceId: orderId, productId, shipmentLine: { lineId } }
+}
+
+/**
+ * Every line of every order shipped IN FULL, inside the window.
+ *
+ * Customer Mix measures gross profit against the whole order's revenue, so a fixture that posts a
+ * cost and ships nothing is not "an order with a cost" — it is a partially (here, zero-) dispatched
+ * order, and the report withholds its profit. Fixtures that mean "this order is fully costed" have
+ * to say so with dispatch movements; the ones that mean the opposite are written out by hand.
+ */
+function dispatchedInFull(orders: Array<ReturnType<typeof order>>) {
+  return {
+    findMany: async () => orders.flatMap((row) => row.lines.map((line) => dispatch(row.id, line.id, line.productId, line.qty.toString()))),
+  }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Customer Mix
 // ---------------------------------------------------------------------------------------------
 
+/** One Acme order: 120 gross, 20 VAT, one line of one unit at an ex-VAT 100. */
+const ACME_120 = [order({ id: 'order-1', customerId: 'cust-1', customerName: 'Acme', totalBase: '120', taxBase: '20', lines: [{ id: 'line-1', productId: 'product-1', totalBase: '100' }] })]
+const ACME_120_UNPAID = [order({ id: 'order-1', customerId: 'cust-1', customerName: 'Acme', totalBase: '120', taxBase: '20', paidAt: null, lines: [{ id: 'line-1', productId: 'product-1', totalBase: '100' }] })]
+const ACME_100 = [order({ id: 'order-1', customerId: 'cust-1', customerName: 'Acme', totalBase: '100', taxBase: '0', lines: [{ id: 'line-1', productId: 'product-1', totalBase: '100' }] })]
+const RETURNER_AND_KEEPER = [
+  order({ id: 'order-1', customerId: 'cust-1', customerName: 'Returner', totalBase: '100', taxBase: '0', lines: [{ id: 'line-1', productId: 'product-1', totalBase: '100' }] }),
+  order({ id: 'order-2', customerId: 'cust-2', customerName: 'Keeper', totalBase: '60', taxBase: '0', lines: [{ id: 'line-2', productId: 'product-1', totalBase: '60' }] }),
+]
+const ACME_AND_BETA = [
+  order({ id: 'order-1', customerId: 'cust-1', customerName: 'Acme', totalBase: '100', taxBase: '0', lines: [{ id: 'line-1', productId: 'product-1', totalBase: '100' }] }),
+  order({ id: 'order-2', customerId: 'cust-2', customerName: 'Beta', totalBase: '60', taxBase: '0', lines: [{ id: 'line-2', productId: 'product-1', totalBase: '60' }] }),
+]
+const ACME_UNPAID_AND_PAID = [
+  order({ id: 'order-1', customerId: 'cust-1', customerName: 'Acme', totalBase: '100', taxBase: '0', paidAt: null, lines: [{ id: 'line-1', productId: 'product-1', totalBase: '100' }] }),
+  order({ id: 'order-2', customerId: 'cust-1', customerName: 'Acme', totalBase: '50', taxBase: '0', lines: [{ id: 'line-2', productId: 'product-1', totalBase: '50' }] }),
+]
+
 test('customer mix: a full NET credit takes the sale out of net revenue and drives gross profit negative (o3d-kyey)', async () => {
   const client: SalesFulfillmentAnalyticsClient = {
     ...baseClient(),
-    salesOrder: { findMany: async () => [order({ id: 'order-1', customerId: 'cust-1', customerName: 'Acme', totalBase: '120', taxBase: '20', lines: [{ id: 'line-1', productId: 'product-1', totalBase: '100' }] })] },
+    salesOrder: { findMany: async () => ACME_120 },
+    stockMovement: dispatchedInFull(ACME_120),
     cogsEntry: { findMany: async () => [cogsByOrderRow('order-1', '40')] },
     salesOrderRefund: { findMany: async () => [orderRefund('order-1', '100', 'NET')] },
   }
@@ -130,7 +167,8 @@ test('customer mix: a full NET credit takes the sale out of net revenue and driv
 test('customer mix: a full GROSS credit clears net revenue, and does NOT get converted into the ex-VAT figure (o3d-kyey)', async () => {
   const client: SalesFulfillmentAnalyticsClient = {
     ...baseClient(),
-    salesOrder: { findMany: async () => [order({ id: 'order-1', customerId: 'cust-1', customerName: 'Acme', totalBase: '120', taxBase: '20', lines: [{ id: 'line-1', productId: 'product-1', totalBase: '100' }] })] },
+    salesOrder: { findMany: async () => ACME_120 },
+    stockMovement: dispatchedInFull(ACME_120),
     cogsEntry: { findMany: async () => [cogsByOrderRow('order-1', '40')] },
     salesOrderRefund: { findMany: async () => [orderRefund('order-1', '120', 'GROSS')] },
   }
@@ -162,6 +200,14 @@ test('customer mix: an order with no posted cost WITHHOLDS gross profit instead 
         order({ id: 'order-3', customerId: 'cust-2', customerName: 'Beta', totalBase: '24', taxBase: '4', lines: [{ id: 'line-3', productId: 'product-1', totalBase: '20' }] }),
       ],
     },
+    // order-1 and order-3 shipped what they sold; order-2 shipped nothing, which is why it has no
+    // COGS entry either. Written out rather than derived, so the fixture states the difference.
+    stockMovement: {
+      findMany: async () => [
+        dispatch('order-1', 'line-1', 'product-1', '1'),
+        dispatch('order-3', 'line-3', 'product-1', '1'),
+      ],
+    },
     cogsEntry: { findMany: async () => [cogsByOrderRow('order-1', '40'), cogsByOrderRow('order-3', '5')] },
   }
 
@@ -185,12 +231,8 @@ test('customer mix: an order with no posted cost WITHHOLDS gross profit instead 
 test('customer mix: rows rank on net revenue, and share of revenue is measured on it (o3d-kyey)', async () => {
   const client: SalesFulfillmentAnalyticsClient = {
     ...baseClient(),
-    salesOrder: {
-      findMany: async () => [
-        order({ id: 'order-1', customerId: 'cust-1', customerName: 'Returner', totalBase: '100', taxBase: '0', lines: [{ id: 'line-1', productId: 'product-1', totalBase: '100' }] }),
-        order({ id: 'order-2', customerId: 'cust-2', customerName: 'Keeper', totalBase: '60', taxBase: '0', lines: [{ id: 'line-2', productId: 'product-1', totalBase: '60' }] }),
-      ],
-    },
+    salesOrder: { findMany: async () => RETURNER_AND_KEEPER },
+    stockMovement: dispatchedInFull(RETURNER_AND_KEEPER),
     cogsEntry: { findMany: async () => [cogsByOrderRow('order-1', '0'), cogsByOrderRow('order-2', '0')] },
     salesOrderRefund: { findMany: async () => [orderRefund('order-1', '100', 'GROSS')] },
   }
@@ -211,12 +253,8 @@ test('customer mix: rows rank on net revenue, and share of revenue is measured o
 test('customer mix: a ratio is bounded by the WHOLE report, not by the row (o3d-kyey)', async () => {
   const client: SalesFulfillmentAnalyticsClient = {
     ...baseClient(),
-    salesOrder: {
-      findMany: async () => [
-        order({ id: 'order-1', customerId: 'cust-1', customerName: 'Acme', totalBase: '100', taxBase: '0', lines: [{ id: 'line-1', productId: 'product-1', totalBase: '100' }] }),
-        order({ id: 'order-2', customerId: 'cust-2', customerName: 'Beta', totalBase: '60', taxBase: '0', lines: [{ id: 'line-2', productId: 'product-1', totalBase: '60' }] }),
-      ],
-    },
+    salesOrder: { findMany: async () => ACME_AND_BETA },
+    stockMovement: dispatchedInFull(ACME_AND_BETA),
     cogsEntry: { findMany: async () => [cogsByOrderRow('order-1', '0'), cogsByOrderRow('order-2', '0')] },
     // Only Acme carries credit, and it is on the basis the gross figure cannot use.
     salesOrderRefund: { findMany: async () => [orderRefund('order-1', '40', 'NET')] },
@@ -238,7 +276,8 @@ test('customer mix: a ratio is bounded by the WHOLE report, not by the row (o3d-
 test('customer mix: an exactly-zero credit on the other basis does not degrade the flag (o3d-kyey)', async () => {
   const client: SalesFulfillmentAnalyticsClient = {
     ...baseClient(),
-    salesOrder: { findMany: async () => [order({ id: 'order-1', customerId: 'cust-1', customerName: 'Acme', totalBase: '100', taxBase: '0', lines: [{ id: 'line-1', productId: 'product-1', totalBase: '100' }] })] },
+    salesOrder: { findMany: async () => ACME_100 },
+    stockMovement: dispatchedInFull(ACME_100),
     cogsEntry: { findMany: async () => [cogsByOrderRow('order-1', '0')] },
     // Zero is the one amount identical on both bases, so it carries no basis information at all.
     salesOrderRefund: { findMany: async () => [orderRefund('order-1', '0', 'NET'), orderRefund('order-1', '25', 'GROSS')] },
@@ -254,12 +293,8 @@ test('customer mix: an exactly-zero credit on the other basis does not degrade t
 test('customer mix: AR exposure nets only the credit on UNPAID orders (o3d-kyey)', async () => {
   const client: SalesFulfillmentAnalyticsClient = {
     ...baseClient(),
-    salesOrder: {
-      findMany: async () => [
-        order({ id: 'order-1', customerId: 'cust-1', customerName: 'Acme', totalBase: '100', taxBase: '0', paidAt: null, lines: [{ id: 'line-1', productId: 'product-1', totalBase: '100' }] }),
-        order({ id: 'order-2', customerId: 'cust-1', customerName: 'Acme', totalBase: '50', taxBase: '0', lines: [{ id: 'line-2', productId: 'product-1', totalBase: '50' }] }),
-      ],
-    },
+    salesOrder: { findMany: async () => ACME_UNPAID_AND_PAID },
+    stockMovement: dispatchedInFull(ACME_UNPAID_AND_PAID),
     cogsEntry: { findMany: async () => [cogsByOrderRow('order-1', '0'), cogsByOrderRow('order-2', '0')] },
     salesOrderRefund: {
       findMany: async () => [
@@ -392,9 +427,15 @@ test('gross margin: credit that reaches no product row is stated, never dropped 
   assert.equal(row.revenueBase, '100')
   assert.equal(row.grossProfitBase, '60')
   assert.equal(row.refundsNetBasis, '0')
-  // The 40 that reached no row is published, split by why it could not.
-  assert.equal(report.totals.refundsUnattributedBase, '15')
-  assert.equal(report.totals.refundsOutsideReportBase, '25')
+  // The 40 that reached no row is published, split by why it could not — and ON ITS BASIS. Both
+  // credits are stamped NET, so the net buckets carry them and the other four stay empty. A single
+  // combined amount per case would be a number in no unit as soon as the two bases were both used.
+  assert.equal(report.totals.refundsUnattributedNetBasis, '15')
+  assert.equal(report.totals.refundsUnattributedGrossBasis, '0')
+  assert.equal(report.totals.refundsUnattributedUnknownBasis, '0')
+  assert.equal(report.totals.refundsOutsideReportNetBasis, '25')
+  assert.equal(report.totals.refundsOutsideReportGrossBasis, '0')
+  assert.equal(report.totals.refundsOutsideReportUnknownBasis, '0')
   // AND it bounds the period figures even though it is on the comparable basis. A NET credit is the
   // same UNIT as this revenue, so the basis test alone would call the total EXACT while 40 of credit
   // sat unsubtracted. Existence of the bound comes from the amount here, not from the basis.
@@ -420,7 +461,9 @@ test('gross margin: a KIT credit is attributed through the SALES LINE product, n
   // 100 - 30 = 70 of revenue, 70 - 40 = 30 of profit, and nothing left off-report.
   assert.equal(row.revenueBase, '70')
   assert.equal(row.grossProfitBase, '30')
-  assert.equal(report.totals.refundsOutsideReportBase, '0')
+  assert.equal(report.totals.refundsOutsideReportNetBasis, '0')
+  assert.equal(report.totals.refundsOutsideReportGrossBasis, '0')
+  assert.equal(report.totals.refundsOutsideReportUnknownBasis, '0')
   assert.equal(row.revenueBaseBound, 'exact')
 })
 
@@ -504,7 +547,8 @@ test('sales analytics: product grouping allocates the credit by line value and t
 test('customer mix: AR exposure is bounded by the credit it could not apply (o3d-kyey)', async () => {
   const client: SalesFulfillmentAnalyticsClient = {
     ...baseClient(),
-    salesOrder: { findMany: async () => [order({ id: 'order-1', customerId: 'cust-1', customerName: 'Acme', totalBase: '120', taxBase: '20', paidAt: null, lines: [{ id: 'line-1', productId: 'product-1', totalBase: '100' }] })] },
+    salesOrder: { findMany: async () => ACME_120_UNPAID },
+    stockMovement: dispatchedInFull(ACME_120_UNPAID),
     cogsEntry: { findMany: async () => [cogsByOrderRow('order-1', '0')] },
     salesOrderRefund: { findMany: async () => [orderRefund('order-1', '100', 'NET')] },
   }
@@ -518,50 +562,305 @@ test('customer mix: AR exposure is bounded by the credit it could not apply (o3d
   assert.equal(report.totals.arExposureBaseBound, 'upper')
 })
 
+
+// ---------------------------------------------------------------------------------------------
+// Customer Mix: is the cost COMPLETE for the revenue it is measured against?
+// ---------------------------------------------------------------------------------------------
+
+test('customer mix: a PARTIALLY dispatched order withholds gross profit — a partial cost is not a complete one (o3d-kyey)', async () => {
+  // Ten units ordered at an ex-VAT 10 each; ONE of them shipped in the window, so one unit's cost
+  // is posted. The order is in ACTIVE_ORDER_STATUSES and carries a COGS entry, so "does any cost
+  // exist?" answers yes — and answering that question is the defect: the published profit would set
+  // one unit's cost against ten units' revenue.
+  const orders = [order({
+    id: 'order-1', customerId: 'cust-1', customerName: 'Acme', totalBase: '120', taxBase: '20',
+    lines: [{ id: 'line-1', productId: 'product-1', totalBase: '100', qty: '10' }],
+  })]
+  const client: SalesFulfillmentAnalyticsClient = {
+    ...baseClient(),
+    salesOrder: { findMany: async () => orders },
+    stockMovement: { findMany: async () => [dispatch('order-1', 'line-1', 'product-1', '1')] },
+    cogsEntry: { findMany: async () => [cogsByOrderRow('order-1', '4')] },
+  }
+
+  const report = await getCustomerAnalyticsReport(WINDOW, { client, now: NOW })
+  const row = report.rows[0]!
+
+  // Ex-VAT revenue is the whole order: 120 - 20 = 100.
+  assert.equal(row.netRevenueExVatBase, '100')
+  // The old rule published 100 - 4 = 96 of "gross profit" at a 96% margin, from one shipped unit of
+  // ten. Nine units' cost is not zero, it is unposted, so there is no complete figure to publish.
+  assert.equal(row.grossProfitBase, null)
+  assert.equal(row.costCaptured, false)
+  // And it is excluded from the period total, which says how many customers it does cover: 0 of 1.
+  assert.equal(report.totals.grossProfitBase, '0')
+  assert.equal(report.totals.costCapturedRows, '0')
+})
+
+test('customer mix: a FULLY dispatched order still publishes, and an explicit zero cost is still evidence (o3d-kyey)', async () => {
+  // The other direction, so the withholding cannot be satisfied by withholding everything. Ten of
+  // ten units shipped in the window, and the posted cost is exactly zero — which is a real answer,
+  // not a missing one, and the distinction `.has` was introduced to keep.
+  const orders = [order({
+    id: 'order-1', customerId: 'cust-1', customerName: 'Acme', totalBase: '120', taxBase: '20',
+    lines: [{ id: 'line-1', productId: 'product-1', totalBase: '100', qty: '10' }],
+  })]
+  const client: SalesFulfillmentAnalyticsClient = {
+    ...baseClient(),
+    salesOrder: { findMany: async () => orders },
+    stockMovement: { findMany: async () => [dispatch('order-1', 'line-1', 'product-1', '10')] },
+    cogsEntry: { findMany: async () => [cogsByOrderRow('order-1', '0')] },
+  }
+
+  const report = await getCustomerAnalyticsReport(WINDOW, { client, now: NOW })
+
+  // 100 of ex-VAT revenue less a posted cost of 0 = 100.
+  assert.equal(report.rows[0]?.grossProfitBase, '100')
+  assert.equal(report.rows[0]?.costCaptured, true)
+  assert.equal(report.totals.costCapturedRows, '1')
+})
+
+test('customer mix: a unit dispatched AFTER the window does not complete the in-window cost (o3d-kyey)', async () => {
+  // Orders are selected by createdAt, so a dispatch can never fall before the window — but it can
+  // fall after it, which puts the cost in the NEXT period's COGS and the revenue in this one. The
+  // dispatch query is windowed, so a movement outside it simply is not there: two of three units
+  // shipped in the window is a partial cost, exactly as an unshipped unit is.
+  const orders = [order({
+    id: 'order-1', customerId: 'cust-1', customerName: 'Acme', totalBase: '90', taxBase: '0',
+    lines: [{ id: 'line-1', productId: 'product-1', totalBase: '90', qty: '3' }],
+  })]
+  const client: SalesFulfillmentAnalyticsClient = {
+    ...baseClient(),
+    salesOrder: { findMany: async () => orders },
+    stockMovement: { findMany: async () => [dispatch('order-1', 'line-1', 'product-1', '2')] },
+    cogsEntry: { findMany: async () => [cogsByOrderRow('order-1', '20')] },
+  }
+
+  const report = await getCustomerAnalyticsReport(WINDOW, { client, now: NOW })
+
+  // 90 - 20 = 70 would have been published against three units' revenue for two units' cost.
+  assert.equal(report.rows[0]?.grossProfitBase, null)
+  assert.equal(report.rows[0]?.costCaptured, false)
+  // The revenue figures are untouched: this rule withholds a PROFIT, it does not restate revenue.
+  assert.equal(report.rows[0]?.revenueBase, '90')
+  assert.equal(report.rows[0]?.netRevenueExVatBase, '90')
+})
+
+test('customer mix: a line whose product is gone cannot prove coverage, and fails closed (o3d-kyey)', async () => {
+  // SalesOrderLine.productId is nullable — "product deleted / not found". A dispatch movement is
+  // attributed through the product, so how much that line shipped is not knowable from stored data.
+  // Not knowable is the case this report withholds for, not one it waves through.
+  const orders = [order({
+    id: 'order-1', customerId: 'cust-1', customerName: 'Acme', totalBase: '100', taxBase: '0',
+    lines: [{ id: 'line-1', productId: 'product-1', totalBase: '60' }, { id: 'line-2', productId: 'product-2', totalBase: '40' }],
+  })]
+  orders[0]!.lines[1]!.productId = null as unknown as string
+  const client: SalesFulfillmentAnalyticsClient = {
+    ...baseClient(),
+    salesOrder: { findMany: async () => orders },
+    // The line that DOES have a product shipped in full, so nothing but the orphaned line is at issue.
+    stockMovement: { findMany: async () => [dispatch('order-1', 'line-1', 'product-1', '1')] },
+    cogsEntry: { findMany: async () => [cogsByOrderRow('order-1', '25')] },
+  }
+
+  const report = await getCustomerAnalyticsReport(WINDOW, { client, now: NOW })
+
+  assert.equal(report.rows[0]?.grossProfitBase, null)
+  assert.equal(report.rows[0]?.costCaptured, false)
+})
+
+// ---------------------------------------------------------------------------------------------
+// Gross Margin: off-row credit is never recombined across bases
+// ---------------------------------------------------------------------------------------------
+
+test('gross margin: off-row credit on different bases does not cancel into an exactness claim (o3d-kyey)', async () => {
+  // 100 of NET credit and -100 of GROSS credit, both on refund lines naming no product, so both
+  // reach no row. They are not the same unit and they are not each other's opposite — but they add
+  // to zero, and a report that decided "is there off-row credit?" from that sum would answer no.
+  const report = await getMarginAnalyticsReport(WINDOW, {
+    client: marginClient({
+      lineTotalBase: '100',
+      cogs: '40',
+      refundLines: [
+        { productId: null, salesOrderLineProductId: null, totalBase: '100', totalsBasis: 'NET' },
+        { productId: null, salesOrderLineProductId: null, totalBase: '-100', totalsBasis: 'GROSS' },
+      ],
+    }),
+    now: NOW,
+  })
+
+  // Each amount is published on its own basis, and neither is folded into the other.
+  assert.equal(report.totals.refundsUnattributedNetBasis, '100')
+  assert.equal(report.totals.refundsUnattributedGrossBasis, '-100')
+  // The row itself never saw either credit: 100 of revenue, 100 - 40 = 60 of profit.
+  assert.equal(report.totals.revenueBase, '100')
+  assert.equal(report.totals.grossProfitBase, '60')
+  // And NONE of those figures may be called exact. Before this fix the two amounts summed to 0,
+  // `isZero()` was true, and revenue / profit / margin / contribution were all published as EXACT
+  // with 200 of credit unaccounted for.
+  //
+  // What is true instead, worked from the amounts: the credit missing from the net revenue is the
+  // 100 NET in full plus the ex-VAT value of a -100 gross, which lies in [-100, 0]. So the missing
+  // credit is somewhere in [0, 100] — never negative, so the published figures really are ceilings,
+  // and the ceiling is 100. Revenue and profit are `≤`.
+  assert.equal(report.totals.revenueBaseBound, 'upper')
+  assert.equal(report.totals.grossProfitBaseBound, 'upper')
+  // Margin: revenue 100, cogs 40, ceiling 100. 100 - 100 = 0 is not > 0, so it is not the monotone
+  // case; revenue 100 >= cogs 40 puts it in marginFigureBound case 4's `upper` half.
+  assert.equal(report.totals.marginPctBound, 'upper')
+  // The ratio over a report-wide denominator stays `?`, which is where the exactness claim was
+  // loudest before: a contribution column of exact percentages over a moved total.
+  assert.equal(report.rows[0]?.contributionPctBound, 'indeterminate')
+})
+
+test('gross margin: a negative NET off-row credit outweighed by a positive GROSS one is still indeterminate (o3d-kyey)', async () => {
+  // -10 NET and +50 GROSS. A signed sum is +40 and looks like a safe ceiling, so a bound built on
+  // it would print `≤`. It is not one: the +50 is VAT-inclusive, so its ex-VAT value is anywhere in
+  // [0, 50], and the credit actually missing from the net figure is anywhere in [-10, 40]. A
+  // NEGATIVE missing credit means the published revenue is too LOW, and `≤` claims the opposite.
+  const report = await getMarginAnalyticsReport(WINDOW, {
+    client: marginClient({
+      lineTotalBase: '100',
+      cogs: '40',
+      refundLines: [
+        { productId: null, salesOrderLineProductId: null, totalBase: '-10', totalsBasis: 'NET' },
+        { productId: null, salesOrderLineProductId: null, totalBase: '50', totalsBasis: 'GROSS' },
+      ],
+    }),
+    now: NOW,
+  })
+
+  assert.equal(report.totals.refundsUnattributedNetBasis, '-10')
+  assert.equal(report.totals.refundsUnattributedGrossBasis, '50')
+  assert.equal(report.totals.revenueBaseBound, 'indeterminate')
+  assert.equal(report.totals.marginPctBound, 'indeterminate')
+})
+
+test('gross margin: off-row credit that CAN only lower the figure keeps its ≤, so the rule is not "always indeterminate" (o3d-kyey)', async () => {
+  // The counterweight to the two above. +10 NET and +50 GROSS off-row: the missing NET credit is in
+  // [10, 60], never negative, so the published revenue really is at or above the truth and `≤` is
+  // the honest marker. A fix that answered `indeterminate` to every off-row credit would pass both
+  // tests above and destroy the information this one asserts.
+  const report = await getMarginAnalyticsReport(WINDOW, {
+    client: marginClient({
+      lineTotalBase: '100',
+      cogs: '40',
+      refundLines: [
+        { productId: null, salesOrderLineProductId: null, totalBase: '10', totalsBasis: 'NET' },
+        { productId: null, salesOrderLineProductId: null, totalBase: '50', totalsBasis: 'GROSS' },
+      ],
+    }),
+    now: NOW,
+  })
+
+  assert.equal(report.totals.revenueBase, '100')
+  assert.equal(report.totals.revenueBaseBound, 'upper')
+  // Margin: revenue 100, cogs 40, ceiling on the missing credit 60. 100 - 60 = 40 > 0, so the whole
+  // interval sits where the margin function is monotone — marginFigureBound case 3, `upper`.
+  assert.equal(report.totals.marginPctBound, 'upper')
+  // A ratio over a moved denominator is still never `≤`, whatever the amounts do.
+  assert.equal(report.rows[0]?.contributionPctBound, 'indeterminate')
+})
+
 // ---------------------------------------------------------------------------------------------
 // The CSV half. A file reader has no tooltip, and no page either.
 // ---------------------------------------------------------------------------------------------
 
-test('every figure the three reports publish reaches their CSV, bound markers included (o3d-kyey)', async () => {
-  /**
-   * The producer and the export route are edited in different files, and the pinned inventory only
-   * asks whether the route SAYS something about the figure names it contains — not whether the
-   * column is actually written. A figure added to a row type and forgotten in `toCsv` would ship a
-   * page that nets off credit and a file that silently does not, which is the worse half to be wrong.
-   *
-   * So this reads the route's real column arrays out of its source and compares them against the
-   * keys of a row the producer really returned. Nothing is hand-listed on either side.
-   */
-  const { readFileSync } = await import('node:fs')
-  const source = readFileSync(new URL('../../app/api/export/sales-analytics/route.ts', import.meta.url), 'utf8')
-  const columnsFor = (filename: string): string[] => {
-    const line = source.split('\n').find((l) => l.includes(`\`${filename}-\${date}.csv\``))
-    assert.ok(line, `no csvResponse line for ${filename}`)
-    const list = /toCsv\(report\.rows, \[([^\]]*)\]\)/.exec(line!)
-    assert.ok(list, `could not read the column list for ${filename}`)
-    const columns = list![1]!.split(',').map((entry) => entry.trim().replace(/^'|'$/g, '')).filter(Boolean)
-    // Proof the extraction reached something real, so a regex slip cannot make this pass vacuously.
-    assert.ok(columns.length >= 8, `${filename} column list looks empty: ${columns.join('|')}`)
-    return columns
-  }
+/**
+ * Every disclosure the producer emits has to reach the file, and the CHECK has to be structural.
+ *
+ * The previous version of this test compared the route's column arrays against the keys of a ROW.
+ * That is why it was green while the Gross Margin CSV dropped `refundsUnattributed*` and
+ * `refundsOutsideReport*` entirely: those live in `totals`, and a test that only ever looked at
+ * `rows[0]` could not see a totals-level figure go missing. The gap was not "one export was
+ * uncovered" — all three were — it was that a whole HALF of every producer's output was outside
+ * what the test compared.
+ *
+ * So this goes through the route's real serialiser and asks the file itself, for every export the
+ * route can produce: does each row key appear as a CSV column, and does each `totals` key appear in
+ * the export metadata? Neither side is hand-listed, so a figure added tomorrow is covered tomorrow.
+ */
+async function exportedCsv(reportType: string, report: { rows: Record<string, unknown>[]; totals: Record<string, string> }) {
+  const { salesAnalyticsCsvResponse } = await import('@/app/api/export/sales-analytics/route')
+  const response = salesAnalyticsCsvResponse(reportType as never, report, WINDOW, '2026-06-30')
+  return response.text()
+}
 
+test('every disclosure a sales-analytics producer emits reaches its CSV — rows as columns, totals as metadata (o3d-kyey)', async () => {
+  const { parseCsv } = await import('@/lib/csv')
   const salesClient: SalesFulfillmentAnalyticsClient = {
     ...baseClient(),
-    salesOrder: { findMany: async () => [order({ id: 'order-1', customerId: 'cust-1', customerName: 'Acme', totalBase: '100', taxBase: '0', lines: [{ id: 'line-1', productId: 'product-1', totalBase: '100' }] })] },
+    salesOrder: { findMany: async () => ACME_100 },
+    stockMovement: dispatchedInFull(ACME_100),
     cogsEntry: { findMany: async () => [cogsByOrderRow('order-1', '10')] },
     salesOrderRefund: { findMany: async () => [orderRefund('order-1', '10', 'GROSS')] },
   }
+  // A margin fixture with credit on BOTH halves: some that reached the product row, and some that
+  // reached no row at all. The off-row half is the one that only exists in `totals`.
+  const marginReport = await getMarginAnalyticsReport(WINDOW, {
+    client: marginClient({
+      lineTotalBase: '100',
+      cogs: '40',
+      refundLines: [
+        { productId: 'product-1', salesOrderLineProductId: 'product-1', totalBase: '5', totalsBasis: 'NET' },
+        { productId: null, salesOrderLineProductId: null, totalBase: '15', totalsBasis: 'NET' },
+        { productId: 'product-9', salesOrderLineProductId: 'product-9', totalBase: '25', totalsBasis: 'GROSS' },
+      ],
+    }),
+    now: NOW,
+  })
 
-  const cases: Array<[string, string[]]> = [
-    ['sales-analytics', Object.keys((await getSalesAnalyticsReport(WINDOW, { client: salesClient, now: NOW })).rows[0]!)],
-    ['customer-mix', Object.keys((await getCustomerAnalyticsReport(WINDOW, { client: salesClient, now: NOW })).rows[0]!)],
-    ['gross-margin', Object.keys((await getMarginAnalyticsReport(WINDOW, { client: marginClient({ lineTotalBase: '100', cogs: '40' }), now: NOW })).rows[0]!)],
+  const cases: Array<[string, { rows: Record<string, unknown>[]; totals: Record<string, string> }]> = [
+    ['sales', await getSalesAnalyticsReport(WINDOW, { client: salesClient, now: NOW })],
+    ['customers', await getCustomerAnalyticsReport(WINDOW, { client: salesClient, now: NOW })],
+    ['margin', marginReport],
   ]
 
   const missing: string[] = []
-  for (const [filename, keys] of cases) {
-    const columns = columnsFor(filename)
-    for (const key of keys) if (!columns.includes(key)) missing.push(`${filename}.csv: ${key}`)
+  for (const [reportType, report] of cases) {
+    const body = await exportedCsv(reportType, report)
+    const parsed = parseCsv(body)
+    // Proof the fixture and the serialiser both reached something real, so nothing below can pass
+    // vacuously on an empty report or an empty file.
+    assert.ok(parsed.length > 0, `${reportType}: the export produced no data rows`)
+    assert.ok(Object.keys(report.rows[0]!).length >= 8, `${reportType}: the producer returned a near-empty row`)
+    assert.ok(Object.keys(report.totals).length >= 4, `${reportType}: the producer returned near-empty totals`)
+
+    const columns = Object.keys(parsed[0]!)
+    for (const key of Object.keys(report.rows[0]!)) {
+      if (!columns.includes(key)) missing.push(`${reportType}: row field ${key} is not a CSV column`)
+    }
+    for (const key of Object.keys(report.totals)) {
+      if (!body.includes(`\r\n# totals.${key},`)) missing.push(`${reportType}: total ${key} is nowhere in the exported file`)
+    }
   }
-  assert.deepEqual(missing, [], 'These row fields are published on the page but dropped from the CSV.')
+  assert.deepEqual(missing, [], 'These figures are published by the producer and dropped from the file an operator downloads.')
+})
+
+test('the Gross Margin CSV carries the credit that reached no product row, with its amount (o3d-kyey)', async () => {
+  // The structural test above proves the KEY is present. This one proves the NUMBER is, because a
+  // disclosure whose value never reaches the file is the same silence wearing a label.
+  const report = await getMarginAnalyticsReport(WINDOW, {
+    client: marginClient({
+      lineTotalBase: '100',
+      cogs: '40',
+      refundLines: [
+        { productId: null, salesOrderLineProductId: null, totalBase: '15', totalsBasis: 'NET' },
+        { productId: 'product-9', salesOrderLineProductId: 'product-9', totalBase: '25', totalsBasis: 'GROSS' },
+      ],
+    }),
+    now: NOW,
+  })
+  const body = await exportedCsv('margin', report)
+
+  // Every exported product row shows exact revenue and no credit of its own — which is true, and is
+  // exactly why the file needs the rest. 15 of credit named no product; 25 named a product this
+  // report has no row for; and the period revenue is bounded, not exact.
+  assert.equal(report.rows[0]?.revenueBase, '100')
+  assert.equal(report.rows[0]?.refundsNetBasis, '0')
+  assert.ok(body.includes('\r\n# totals.refundsUnattributedNetBasis,15'), body.slice(-800))
+  assert.ok(body.includes('\r\n# totals.refundsOutsideReportGrossBasis,25'), body.slice(-800))
+  assert.ok(body.includes('\r\n# totals.revenueBaseBound,upper'), body.slice(-800))
+  // And the basis notice still travels with it: three amounts mean nothing without the sentence.
+  assert.match(body, /# refundTreatment,/)
 })
