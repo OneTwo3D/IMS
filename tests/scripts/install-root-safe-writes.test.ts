@@ -85,16 +85,117 @@ function runBash(script: string, opts: { cwd?: string, env?: Record<string, stri
   }
 }
 
-/** A PATH shim directory whose entries delegate to the real tool after recording what they saw. */
+/**
+ * THE ABSOLUTE PATH OF A COMMAND A SHIM SHADOWS, resolved ONCE and here, where the shimmed PATH
+ * does not exist yet.
+ *
+ * A SHIM THAT DELEGATES BY BARE NAME IS AN INFINITE LOOP, and it is not a theoretical one: an
+ * earlier run of this file left a `mktemp` shim spinning for eleven hours, writing 37 million
+ * identical lines and 2.69 GB into /tmp — which is a tmpfs, so 2.69 GB of RAM — and the builds it
+ * starved were blamed on a different worktree. The shim directory is FIRST on PATH precisely so
+ * that the shipped code reaches the shim; the shim is therefore the one caller that must never
+ * resolve the name through PATH.
+ */
+const REAL_BIN_DIRS = ['/usr/bin', '/bin', '/usr/local/bin']
+function realBin(name: string): string {
+  for (const dir of REAL_BIN_DIRS) {
+    const path = join(dir, name)
+    if (existsSync(path)) return path
+  }
+  throw new Error(`${name} is not in any of ${REAL_BIN_DIRS.join(', ')}, so no shim can delegate to it`)
+}
+const REAL = {
+  mktemp: realBin('mktemp'),
+  chmod: realBin('chmod'),
+  stat: realBin('stat'),
+  rm: realBin('rm'),
+  mkdir: realBin('mkdir'),
+  mv: realBin('mv'),
+  ln: realBin('ln'),
+  id: realBin('id'),
+  wc: realBin('wc'),
+} as const
+
+/** A shell literal. Every path a shim names goes through this. */
+function q(value: string): string {
+  return JSON.stringify(value)
+}
+
+/**
+ * How many lines any one shim may record. A recording that can grow without bound is a runaway and
+ * not a test artefact; every assertion in this file counts single-figure numbers of lines.
+ */
+const SHIM_LOG_MAX_LINES = 256
+/** The shim exit codes for the two failures that must be LOUD rather than silent. */
+const SHIM_REENTERED = 97
+const SHIM_LOG_FULL = 98
+
+/**
+ * A PATH shim directory whose entries delegate to the real tool after recording what they saw.
+ *
+ * Every shim carries two guards ahead of its body, so that the failure modes above end the test
+ * instead of running until somebody notices:
+ *
+ *   - A RE-ENTRY MARKER, exported, so it survives the `exec` a delegating shim ends with. A shim
+ *     that reaches itself a second time — which is what delegating by bare name does — exits 97
+ *     saying so, on the FIRST recursion rather than the millionth.
+ *   - A BOUNDED APPEND. `ims_shim_append` refuses a log that has already reached
+ *     SHIM_LOG_MAX_LINES lines and exits 98. Shims record through it and never with a raw `>>`.
+ */
 function shimDir(t: TestContext, shims: Record<string, string>): string {
   const dir = createTempDirSync('ims-czpy-shim-', t)
   for (const [name, body] of Object.entries(shims)) {
+    const marker = `IMS_SHIM_ENTERED_${name.replace(/[^A-Za-z0-9]/g, '_').toUpperCase()}`
     const path = join(dir, name)
-    writeFileSync(path, `#!/usr/bin/env bash\n${body}\n`)
+    writeFileSync(path, [
+      '#!/usr/bin/env bash',
+      `if [[ -n "\${${marker}:-}" ]]; then`,
+      `  printf 'ims-shim: %s re-entered itself — it is delegating to the command it shadows by BARE NAME, and PATH resolves that back to this shim. Failing fast.\\n' ${q(name)} >&2`,
+      `  exit ${SHIM_REENTERED}`,
+      'fi',
+      `export ${marker}=1`,
+      'ims_shim_append() {',
+      '  local file="$1"; shift',
+      '  local lines',
+      `  lines="$(${REAL.wc} -l < "\${file}" 2>/dev/null || printf '0')"`,
+      `  if (( lines >= ${SHIM_LOG_MAX_LINES} )); then`,
+      `    printf 'ims-shim: %s already holds %s lines — a recording that can reach gigabytes is a runaway, not a test artefact. Failing fast.\\n' "\${file}" "\${lines}" >&2`,
+      `    exit ${SHIM_LOG_FULL}`,
+      '  fi',
+      '  printf \'%s\\n\' "$*" >> "${file}"',
+      '}',
+      body,
+      '',
+    ].join('\n'))
     chmodSync(path, 0o755)
   }
   return dir
 }
+
+test('[o3d-czpy] a shim that delegates to the command it shadows by bare name fails fast instead of looping', (t) => {
+  const root = createTempDirSync('ims-czpy-shimguard-', t)
+  const log = join(root, 'entered.log')
+  writeFileSync(log, '')
+  // DELIBERATELY BARE. This is the exact shape that ran for eleven hours; the guard is what makes
+  // it a failed test in milliseconds instead.
+  const bin = shimDir(t, { mktemp: `ims_shim_append ${q(log)} "entered"\nexec mktemp "$@"` })
+
+  const run = runBash('mktemp -d', { cwd: root, env: { PATH: `${bin}:${process.env.PATH ?? ''}` } })
+
+  assert.equal(run.status, SHIM_REENTERED, `the second entry must exit ${SHIM_REENTERED}: ${run.stderr}`)
+  assert.match(run.stderr, /re-entered itself/)
+  assert.equal(readFileSync(log, 'utf8').trim().split('\n').length, 1,
+    'and it must have recorded exactly once — the guard fires BEFORE the second recording')
+
+  // And the other half: a recording that has already run away is refused rather than extended.
+  const full = join(root, 'full.log')
+  writeFileSync(full, `x\n`.repeat(SHIM_LOG_MAX_LINES))
+  const capped = shimDir(t, { mktemp: `ims_shim_append ${q(full)} "one more"\nexec ${REAL.mktemp} "$@"` })
+  const run2 = runBash('mktemp -d', { cwd: root, env: { PATH: `${capped}:${process.env.PATH ?? ''}` } })
+  assert.equal(run2.status, SHIM_LOG_FULL, `a full log must exit ${SHIM_LOG_FULL}: ${run2.stderr}`)
+  assert.equal(readFileSync(full, 'utf8').trim().split('\n').length, SHIM_LOG_MAX_LINES,
+    'and nothing may be appended to it')
+})
 
 // ---------------------------------------------------------------------------
 // SITE 1 and 2 — publish_durable_file(), the publisher ${APP_DIR}/.env,
@@ -186,8 +287,8 @@ test('[o3d-czpy] publish_durable_file creates its temporary INSIDE the staging d
   // owns; a temporary made beside the target is the state that has that exposure.
   const bin = shimDir(t, {
     // Absolute paths inside every shim: the shim directory is FIRST on PATH, so a bare `mktemp`
-    // here would re-enter this file forever.
-    mktemp: `printf '%s\\t%s\\n' "$PWD" "$*" >> ${JSON.stringify(log)}\nexec /usr/bin/mktemp "$@"`,
+    // here would re-enter this file forever — see the guard in shimDir(), and the test above it.
+    mktemp: `ims_shim_append ${q(log)} "$(printf '%s\\t%s' "$PWD" "$*")"\nexec ${REAL.mktemp} "$@"`,
   })
 
   const script = rig(['fsync_path', 'publish_durable_file'], [
@@ -214,7 +315,7 @@ test('[o3d-czpy] publish_durable_file applies the mode before the content, so a 
   // The measurement is the SIZE OF THE FILE at the instant chmod runs. Mode applied first means an
   // empty file; mode applied after `cat` means the secrets are already in it.
   const bin = shimDir(t, {
-    chmod: `last="\${@: -1}"\nsz=$(/usr/bin/stat -c '%s' "$last" 2>/dev/null || echo -1)\nprintf '%s\\t%s\\n' "$sz" "$*" >> ${JSON.stringify(log)}\nexec /usr/bin/chmod "$@"`,
+    chmod: `last="\${@: -1}"\nsz=$(${REAL.stat} -c '%s' "$last" 2>/dev/null || echo -1)\nims_shim_append ${q(log)} "$(printf '%s\\t%s' "$sz" "$*")"\nexec ${REAL.chmod} "$@"`,
   })
 
   const script = rig(['fsync_path', 'publish_durable_file'], [
@@ -230,6 +331,50 @@ test('[o3d-czpy] publish_durable_file applies the mode before the content, so a 
   assert.equal(onTheTemp[0][0], '0', 'the temporary must still be EMPTY when its mode is set — mode before content, never a chmod after it')
 })
 
+test('[o3d-czpy] publish_durable_file publishes into the directory it staged in, even after that directory\'s NAME is swapped for a symlink', (t) => {
+  const root = createTempDirSync('ims-czpy-parentswap-', t)
+  const dataDir = join(root, 'data')
+  const gitSsh = join(dataDir, 'git-ssh')
+  const moved = join(dataDir, 'git-ssh.moved')
+  // The privileged directory the swap aims at. In the shipped case this is /root/.ssh and the file
+  // that lands in it is a known_hosts owned by the service account — which is a root login.
+  const victim = join(root, 'root-dot-ssh')
+  mkdirSync(gitSsh, { recursive: true })
+  mkdirSync(victim)
+  writeFileSync(join(victim, 'known_hosts'), 'UNTOUCHED\n')
+
+  // THE SWAP, FIRED FROM INSIDE THE PUBLICATION. `mktemp` runs after the staging directory has been
+  // created, chowned and ENTERED and before the rename: every pin this function takes is already
+  // taken, and the destination is still nothing but a pathname. ${DATA_DIR} belongs to ${APP_USER}
+  // on an upgrade, so renaming `git-ssh` aside and leaving a link at the name is theirs to do.
+  const log = join(root, 'mktemp.log')
+  const bin = shimDir(t, {
+    mktemp: [
+      `ims_shim_append ${q(log)} "$PWD"`,
+      `${REAL.mv} -T ${q(gitSsh)} ${q(moved)}`,
+      `${REAL.ln} -s ${q(victim)} ${q(gitSsh)}`,
+      `exec ${REAL.mktemp} "$@"`,
+    ].join('\n'),
+  })
+
+  const script = rig(['fsync_path', 'publish_durable_file'], [
+    `printf 'github.com ssh-ed25519 AAAA\\n' | publish_durable_file "${join(gitSsh, 'known_hosts')}" "" 600`,
+    'echo "rc=$?"',
+  ].join('\n'))
+  const run = runBash(script, { env: { PATH: `${bin}:${process.env.PATH ?? ''}` } })
+
+  // NOT VACUOUS: the swap really happened, and it happened while the publication was in flight.
+  assert.equal(readFileSync(log, 'utf8').trim().split('\n').length, 1, 'the staging directory must have been entered once')
+  assert.equal(lstatSync(gitSsh).isSymbolicLink(), true, 'and the destination NAME must now be the planted link')
+
+  assert.match(run.stdout, /^rc=0$/m, run.stderr)
+  assert.equal(readFileSync(join(victim, 'known_hosts'), 'utf8'), 'UNTOUCHED\n',
+    'the publication must not follow the link the destination NAME acquired after the pin')
+  assert.deepEqual(readdirSync(victim), ['known_hosts'], 'and must leave nothing else in it')
+  assert.equal(readFileSync(join(moved, 'known_hosts'), 'utf8'), 'github.com ssh-ed25519 AAAA\n',
+    'it lands in the directory the staging directory is IN, which is the one whose device was checked')
+})
+
 // ---------------------------------------------------------------------------
 // SITES 4, 5 and 7 — every directory created below a root the service account owns.
 // ---------------------------------------------------------------------------
@@ -242,7 +387,7 @@ test('[o3d-czpy] mkdir_service_subdir refuses a planted symlink and creates noth
   mkdirSync(victim)
   symlinkSync(victim, join(dataDir, 'uploads'))
 
-  const script = rig(['mkdir_service_subdir'],
+  const script = rig(['enter_service_subdir', 'mkdir_service_subdir'],
     `mkdir_service_subdir "${dataDir}" 022 "${dataDir}/uploads/invoices"\necho "reached=yes"`)
   const run = runBash(script)
 
@@ -256,7 +401,7 @@ test('[o3d-czpy] mkdir_service_subdir still creates the directories it is meant 
   const root = createTempDirSync('ims-czpy-mkdir-ok-', t)
   const dataDir = join(root, 'data')
 
-  const script = rig(['mkdir_service_subdir'],
+  const script = rig(['enter_service_subdir', 'mkdir_service_subdir'],
     `mkdir_service_subdir "${dataDir}" 022 "${dataDir}/uploads/quarantine/invoices" "${dataDir}/xero"\necho "reached=yes"`)
   const run = runBash(script)
 
@@ -264,7 +409,7 @@ test('[o3d-czpy] mkdir_service_subdir still creates the directories it is meant 
   assert.ok(statSync(join(dataDir, 'uploads/quarantine/invoices')).isDirectory())
   assert.ok(statSync(join(dataDir, 'xero')).isDirectory())
   // NOT VACUOUS: a helper that refused everything would pass the test above and fail this one.
-  const run2 = runBash(rig(['mkdir_service_subdir'],
+  const run2 = runBash(rig(['enter_service_subdir', 'mkdir_service_subdir'],
     `mkdir_service_subdir "${dataDir}" 022 "${dataDir}/uploads/quarantine/invoices"\necho "reached=yes"`))
   assert.match(run2.stdout, /reached=yes/, 'and it must be idempotent across installer runs')
 })
@@ -273,7 +418,7 @@ test('[o3d-czpy] mkdir_service_subdir creates the deploy-key directory at 0700 w
   const root = createTempDirSync('ims-czpy-sshdir-', t)
   const dataDir = join(root, 'data')
 
-  const script = rig(['mkdir_service_subdir'], `mkdir_service_subdir "${dataDir}" 077 "${dataDir}/git-ssh"`)
+  const script = rig(['enter_service_subdir', 'mkdir_service_subdir'], `mkdir_service_subdir "${dataDir}" 077 "${dataDir}/git-ssh"`)
   const run = runBash(script)
 
   assert.equal(run.status, 0, run.stderr)
@@ -293,7 +438,7 @@ test('[o3d-czpy] migrate_uploads refuses a planted destination and moves nothing
   mkdirSync(join(dataDir, 'uploads'))
   symlinkSync(victim, join(dataDir, 'uploads/invoices'))
 
-  const script = rig(['mkdir_service_subdir', 'migrate_uploads'],
+  const script = rig(['enter_service_subdir', 'mkdir_service_subdir', 'migrate_uploads'],
     `migrate_uploads "${src}" "${dataDir}/uploads/invoices"\necho "reached=yes"`,
     `DATA_DIR="${dataDir}"`)
   const run = runBash(script)
@@ -304,6 +449,42 @@ test('[o3d-czpy] migrate_uploads refuses a planted destination and moves nothing
   assert.deepEqual(readdirSync(src), ['invoice-1.pdf'], 'and the source must be left where it was')
 })
 
+test('[o3d-czpy] migrate_uploads migrates a rerun whose destination is already owned by the SERVICE account', (t) => {
+  const root = createTempDirSync('ims-czpy-migrate-rerun-', t)
+  const dataDir = join(root, 'data')
+  const src = join(root, 'legacy')
+  const dest = join(dataDir, 'uploads/invoices')
+  // THE ORDINARY UPGRADE. The previous install created these destinations and then chowned them,
+  // with everything else under ${DATA_DIR}, to ${APP_USER}; legacy uploads then reappear (a
+  // restored backup, a rolled-back deploy) and this run has to finish moving them.
+  mkdirSync(dest, { recursive: true })
+  writeFileSync(join(dest, 'invoice-0.pdf'), 'ALREADY THERE\n')
+  mkdirSync(src)
+  writeFileSync(join(src, 'invoice-1.pdf'), 'PDF\n')
+
+  // THE MULTI-ACCOUNT CONDITION, BUILT AND NOT ARGUED. An unprivileged harness cannot chown the
+  // destination to a second uid, so the mismatch is made at the other end: `id -u` answers a uid
+  // that is NOT the destination's owner, which is the state every rerun reaches. The pin the
+  // installer now uses is an inode identity and asks nothing about ownership, so it never consults
+  // this shim; the check it REPLACED did, and refused the migration on exactly this state.
+  const bin = shimDir(t, {
+    id: `if [[ "$*" == "-u" ]]; then printf '%s\\n' 4242; exit 0; fi\nexec ${REAL.id} "$@"`,
+  })
+  assert.notEqual(statSync(dest).uid, 4242,
+    'the destination must NOT be owned by the uid the installer reports, or this test states nothing')
+
+  const script = rig(['enter_service_subdir', 'mkdir_service_subdir', 'migrate_uploads'],
+    `migrate_uploads "${src}" "${dest}"\necho "reached=yes"`,
+    `DATA_DIR="${dataDir}"`)
+  const run = runBash(script, { env: { PATH: `${bin}:${process.env.PATH ?? ''}` } })
+
+  assert.match(run.stdout, /reached=yes/, `a normal upgrade must not be refused: ${run.stderr}`)
+  assert.equal(readFileSync(join(dest, 'invoice-1.pdf'), 'utf8'), 'PDF\n', 'the legacy upload must be migrated')
+  assert.equal(readFileSync(join(dest, 'invoice-0.pdf'), 'utf8'), 'ALREADY THERE\n',
+    'and what the previous run migrated must be left alone')
+  assert.ok(!existsSync(src), 'and the emptied legacy directory is removed')
+})
+
 test('[o3d-czpy] migrate_uploads still migrates a real legacy directory', (t) => {
   const root = createTempDirSync('ims-czpy-migrate-ok-', t)
   const dataDir = join(root, 'data')
@@ -312,7 +493,7 @@ test('[o3d-czpy] migrate_uploads still migrates a real legacy directory', (t) =>
   mkdirSync(src)
   writeFileSync(join(src, 'invoice-1.pdf'), 'PDF\n')
 
-  const script = rig(['mkdir_service_subdir', 'migrate_uploads'],
+  const script = rig(['enter_service_subdir', 'mkdir_service_subdir', 'migrate_uploads'],
     `migrate_uploads "${src}" "${dataDir}/uploads/invoices"\necho "reached=yes"`,
     `DATA_DIR="${dataDir}"`)
   const run = runBash(script)
@@ -320,6 +501,48 @@ test('[o3d-czpy] migrate_uploads still migrates a real legacy directory', (t) =>
   assert.match(run.stdout, /reached=yes/, run.stderr)
   assert.equal(readFileSync(join(dataDir, 'uploads/invoices/invoice-1.pdf'), 'utf8'), 'PDF\n')
   assert.ok(!existsSync(src), 'and the emptied legacy directory is removed')
+})
+
+test('[o3d-czpy] mkdir_service_subdir refuses an existing component swapped for a symlink between its check and the step into it', (t) => {
+  const root = createTempDirSync('ims-czpy-walkswap-', t)
+  const dataDir = join(root, 'data')
+  const uploads = join(dataDir, 'uploads')
+  const victim = join(root, 'victim')
+  // THE UPGRADE, WHICH IS THE RUN THAT MATTERS: `uploads` is already there, and by this point in a
+  // real install it belongs to ${APP_USER}, who can rename it.
+  mkdirSync(uploads, { recursive: true })
+  mkdirSync(victim)
+  const fired = join(root, 'swapped')
+
+  // `stat` is the walk's check on an existing component, and the shim answers TRUTHFULLY — the
+  // component IS a directory at the instant it is asked — before swapping it. That is exactly the
+  // sequence the finding describes, made deterministic; a real attacker just has to win the race.
+  const bin = shimDir(t, {
+    stat: [
+      `${REAL.stat} "$@"`,
+      'status=$?',
+      `if [[ "$*" == *uploads* && ! -e ${q(fired)} ]]; then`,
+      `  : > ${q(fired)}`,
+      `  ${REAL.mv} -T ${q(uploads)} ${q(join(dataDir, 'uploads.moved'))}`,
+      `  ${REAL.ln} -s ${q(victim)} ${q(uploads)}`,
+      'fi',
+      'exit $status',
+    ].join('\n'),
+  })
+
+  const script = rig(['enter_service_subdir', 'mkdir_service_subdir'],
+    `mkdir_service_subdir "${dataDir}" 022 "${join(dataDir, 'uploads/invoices')}"\necho "reached=yes"`)
+  const run = runBash(script, { env: { PATH: `${bin}:${process.env.PATH ?? ''}` } })
+
+  // NOT VACUOUS: the shim was reached and the swap was made.
+  assert.ok(existsSync(fired), 'the walk must actually have stat()ed the existing component')
+  assert.equal(lstatSync(uploads).isSymbolicLink(), true, 'and the component must have been swapped for a link')
+
+  assert.equal(run.status, 1, 'a component swapped after its check must END the run')
+  assert.ok(!run.stdout.includes('reached=yes'), 'and nothing after it may execute')
+  assert.match(run.stderr, /was replaced between the check and the step into it/, run.stderr)
+  assert.deepEqual(readdirSync(victim), [],
+    'and no directory may be created inside the directory the link chose')
 })
 
 // ---------------------------------------------------------------------------
@@ -341,7 +564,7 @@ test('[o3d-czpy] copy_tree_into_new_dir refuses a destination re-planted between
   // is exactly the window the service account has, and is the only way to exhibit it from outside
   // the process.
   const bin = shimDir(t, {
-    rm: `/usr/bin/rm "$@"\nfor a in "$@"; do case "$a" in */.git) /usr/bin/ln -s ${JSON.stringify(victim)} "$a" ;; esac; done\nexit 0`,
+    rm: `${REAL.rm} "$@"\nfor a in "$@"; do case "$a" in */.git) ${REAL.ln} -s ${q(victim)} "$a" ;; esac; done\nexit 0`,
   })
 
   const script = rig(['copy_tree_into_new_dir'],
@@ -372,6 +595,58 @@ test('[o3d-czpy] copy_tree_into_new_dir still installs the git metadata, dotfile
   assert.ok(statSync(join(appDir, '.git/refs/heads')).isDirectory())
 })
 
+test('[o3d-czpy] copy_tree_into_new_dir refuses a name replaced, AFTER it was created, by a symlink to another directory owned by the privileged uid', (t) => {
+  const root = createTempDirSync('ims-czpy-gitswap-', t)
+  const appDir = join(root, 'app')
+  const clone = join(root, 'clone')
+  const dest = join(appDir, '.git')
+  // ANOTHER DIRECTORY OWNED BY THE PRIVILEGED ACCOUNT, which is the whole point: root ownership is
+  // a property a great many directories have. In the shipped case this is /root or another
+  // install's .git, and `cp -a` overwrites the entries whose names match — `config` among them.
+  const victim = join(root, 'other-root-owned')
+  mkdirSync(appDir)
+  mkdirSync(victim)
+  writeFileSync(join(victim, 'config'), 'UNTOUCHED\n')
+  mkdirSync(join(clone, '.git'), { recursive: true })
+  writeFileSync(join(clone, '.git/HEAD'), 'ref: refs/heads/main\n')
+  writeFileSync(join(clone, '.git/config'), '[remote "origin"]\n')
+
+  // THE PRECONDITION THE OLD CHECK ACCEPTED, ASSERTED RATHER THAN ASSUMED. `stat -c '%F|%u' .`
+  // after the chdir asked for "a directory owned by ${self}", and this victim is one — so the old
+  // code passed that check and copied into it. If this assertion ever stopped holding, the test
+  // below would be proving something else.
+  assert.equal(statSync(victim).uid, process.getuid?.(), 'the victim must be owned by the uid the installer runs as')
+  assert.ok(statSync(victim).isDirectory())
+
+  // The window: between the `mkdir` that creates ${dest} and the `cd` that pins it. The existing
+  // replant regression covers only the window BEFORE the mkdir, which a plain mkdir already closes.
+  const bin = shimDir(t, {
+    mkdir: [
+      `${REAL.mkdir} "$@"`,
+      'status=$?',
+      `if [[ $status -eq 0 && "$*" == *.git* ]]; then`,
+      `  ${REAL.mv} -T ${q(dest)} ${q(join(root, 'git.moved'))}`,
+      `  ${REAL.ln} -s ${q(victim)} ${q(dest)}`,
+      'fi',
+      'exit $status',
+    ].join('\n'),
+  })
+
+  const script = rig(['copy_tree_into_new_dir'],
+    `copy_tree_into_new_dir "${join(clone, '.git')}" "${dest}"\necho "reached=yes"`)
+  const run = runBash(script, { env: { PATH: `${bin}:${process.env.PATH ?? ''}` } })
+
+  // NOT VACUOUS: the directory really was created and really was replaced by the link.
+  assert.equal(lstatSync(dest).isSymbolicLink(), true, 'the created directory must have been swapped for the link')
+  assert.ok(statSync(join(root, 'git.moved')).isDirectory(), 'and the one this run created must still exist, renamed aside')
+
+  assert.equal(run.status, 1, 'ownership is not identity: a link to ANOTHER directory owned by the same uid must end the run')
+  assert.ok(!run.stdout.includes('reached=yes'))
+  assert.equal(readFileSync(join(victim, 'config'), 'utf8'), 'UNTOUCHED\n',
+    'and the git metadata must not be copied over the entries of the directory the link chose')
+  assert.deepEqual(readdirSync(victim), ['config'], 'nor anything else be left in it')
+})
+
 // ---------------------------------------------------------------------------
 // The recursive chown, which must not hand a staging directory back to the service account.
 // ---------------------------------------------------------------------------
@@ -396,7 +671,7 @@ test('[o3d-czpy] the recursive chown over DATA_DIR skips the lock directory AND 
   assert.match(shipped, /chown -h/, 'and it must still be the chown line')
 
   const log = join(root, 'chown.log')
-  const bin = shimDir(t, { chown: `printf '%s\\n' "$@" >> ${JSON.stringify(log)}\nexit 0` })
+  const bin = shimDir(t, { chown: `for a in "$@"; do ims_shim_append ${q(log)} "$a"; done\nexit 0` })
   const run = runBash([
     'set -uo pipefail',
     `DATA_DIR="${dataDir}"`,

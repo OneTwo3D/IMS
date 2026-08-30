@@ -1011,8 +1011,11 @@ for (const entry of MARKER_CASES) {
     const fileBarrier = publish.indexOf('fsync_path "$tmp"')
     // o3d-czpy: `-T`, so a DIRECTORY planted at the target name is refused rather than filled
     // with a stray temporary while the run reports success.
-    const rename = publish.indexOf('mv -f -T "$tmp" "$target"')
-    const dirBarrier = publish.indexOf('fsync_path "$dir"')
+    // o3d-czpy r2: `../${base}` from inside the pinned staging directory, never the absolute
+    // target, which re-resolved the destination parent at the instant of the rename.
+    const rename = publish.indexOf('mv -f -T "$tmp" "../${base}"')
+    // And the directory barrier flushes the SAME pinned parent the rename landed in.
+    const dirBarrier = publish.indexOf('fsync_path ..')
     assert.ok(fileBarrier !== -1, 'the data must be fsynced')
     assert.ok(rename !== -1, 'and published by rename')
     assert.ok(dirBarrier !== -1, 'and the parent directory fsynced')
