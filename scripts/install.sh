@@ -2572,6 +2572,109 @@ fsync_path() {
 # directory, and a staging directory handed to the service account is not a staging directory.
 PUBLISH_STAGE_DIRNAME=".ims-publish"
 
+# THE TRUSTED ANCESTORS EVERY publish_durable_file() DESTINATION IS REACHED FROM (o3d-rn10).
+#
+# THE FINDING THIS CLOSES, WHICH THE PREVIOUS ROUND LEFT OPEN. Round 2 pinned the destination as a
+# device and an inode and published `../${base}` from inside the staging directory, so nothing
+# AFTER the pin could redirect the write. But the pin itself was `stat -c '%d:%i' "$dir"` — a
+# pathname resolution, made with no relationship to any directory this run trusts. For
+# ${DEPLOY_SSH_KNOWN_HOSTS} that pathname is ${DATA_DIR}/git-ssh, and ${DATA_DIR} belongs to
+# ${APP_USER} on every upgrade: they replace `git-ssh` with a symlink to /root/.ssh BEFORE this
+# function runs, the `stat` records /root/.ssh itself, `.ims-publish` is created and entered THERE,
+# `..` is /root/.ssh — which is exactly what was pinned — and every check passes while the rename
+# publishes a service-owned known_hosts over /root/.ssh/known_hosts. A pin proves that the
+# directory did not MOVE; it says nothing about which directory was pinned.
+#
+# SO THE DESTINATION IS RESOLVED FROM A DIRECTORY THE SERVICE ACCOUNT CANNOT REPLACE, one component
+# at a time, by the same chdir walk enter_service_subdir() uses — and never converted back into an
+# absolute pathname afterwards, which is where the round-2 code reopened the hole it had just
+# closed.
+#
+# WHY THESE FIVE ARE TRUSTWORTHY, AND WHY THE WALK DOES NOT START AT `/`. Each of them is a
+# top-level directory whose OWN PARENT is root-owned and not writable by ${APP_USER}: /opt for
+# ${APP_DIR}, /var/lib for ${DATA_DIR} and the default ${CUTOVER_STATE_DIR}, /etc for the two
+# literals. The service account can rewrite anything INSIDE them and nothing ABOUT them: it cannot
+# rename ${APP_DIR} aside, and it cannot leave a symlink at that name. That is the same argument
+# copy_tree_into_new_dir() rests on for ${APP_DIR}/.git, made once and used for all of them.
+#
+# It stops there rather than walking from `/` for the reason enter_service_subdir() gives at
+# length: a symlinked ${DATA_DIR} — /var/lib/${APP_NAME} pointing at a second disk — is a supported
+# operator layout, and /var/lib is root-owned so it cannot be forged. So the ROOT may be a symlink
+# and is followed (`cd -P`); every component BELOW it may not be, and is refused.
+#
+# A FUNCTION AND NOT AN ARRAY, so the list is read at the moment of the publication rather than at
+# the moment this file was parsed: a root reassigned by a prompt would otherwise leave the table
+# naming a directory nothing publishes into. `${VAR:-}` because an empty entry is skipped and a
+# destination that matches no root is REFUSED — a new publication site outside these five fails
+# loudly at install time instead of silently resolving its own path.
+publish_trust_root_candidates() {
+  printf '%s\n' "${APP_DIR:-}" "${DATA_DIR:-}" "${CUTOVER_STATE_DIR:-}" "${DB_ENV_SNAPSHOT_DIR:-}" "${DB_CA_PUBLISH_DIR:-}"
+}
+
+# The deepest candidate that "$1" lies at or under, printed; non-zero when there is none.
+#
+# DEEPEST, because ${CUTOVER_STATE_DIR} defaults to ${DATA_DIR} and an operator may nest one root
+# inside another; starting the walk from the closest trusted ancestor means the fewest components
+# are resolved by name, which is the whole point of the walk.
+publish_trust_root() {
+  local dir="$1" root best=""
+  while IFS= read -r root; do
+    [[ -n "$root" ]] || continue
+    root="${root%/}"
+    [[ -n "$root" ]] || continue
+    [[ "$dir" == "$root" || "$dir" == "${root}/"* ]] || continue
+    if (( ${#root} > ${#best} )); then best="$root"; fi
+  done < <(publish_trust_root_candidates)
+  [[ -n "$best" ]] || return 1
+  printf '%s\n' "$best"
+}
+
+# Walk from "$1" down to "$2" one component at a time, LEAVING THE CALLING SHELL INSIDE "$2".
+#
+# The non-fatal twin of enter_service_subdir(): same mechanism, same refusals, but it returns
+# rather than calling `die`, because publish_durable_file()'s whole contract with its callers is a
+# return code — every one of them decides for itself whether a failed publication ends the run.
+# It is called from inside publish_durable_file()'s subshell, so the moved cwd dies with it.
+#
+# Each component is created with a PLAIN `mkdir` (EEXIST on a planted symlink, where `mkdir -p`
+# would silently work inside its target) and lstat-ed with `stat -c '%F'` when that fails, so a
+# link reads as "symbolic link" and is refused. Then `cd -P` pins the inode and `..` — the kernel's
+# own answer for the directory this process is inside — is compared against the component we came
+# from, which closes the window between the lstat and the chdir. An ancestor is never named again
+# after it has been entered.
+#
+# THE MODE OF A COMPONENT THIS CREATES comes from the ambient umask, which is what the `mkdir -p`
+# it replaces used. Every destination this function is asked for is created earlier and
+# deliberately by mkdir_service_subdir() or ensure_cutover_state_dirs(); creating one here is the
+# first-install fallback, not the path that decides the permissions.
+pin_dir_beneath_root() {
+  local root="$1" path="$2" rel comp here
+  [[ "$root" == /* && "$path" == /* ]] || return 1
+  [[ "$path" == "$root" || "$path" == "${root}/"* ]] || return 1
+  # The root itself, whose parent is root-owned. `-p` is correct here and only here.
+  mkdir -p "$root" 2>/dev/null || return 1
+  cd -P "$root" 2>/dev/null || return 1
+  here="$(stat -c '%d:%i' . 2>/dev/null || true)"
+  [[ -n "$here" ]] || return 1
+  rel="${path#"$root"}"
+  rel="${rel#/}"
+  while [[ -n "$rel" ]]; do
+    comp="${rel%%/*}"
+    if [[ "$comp" == "$rel" ]]; then rel=""; else rel="${rel#*/}"; fi
+    [[ -n "$comp" ]] || continue
+    # `.` and `..` would step outside the walk while it believed it was stepping down it.
+    [[ "$comp" != "." && "$comp" != ".." ]] || return 1
+    if ! mkdir "$comp" 2>/dev/null; then
+      [[ "$(stat -c '%F' "$comp" 2>/dev/null || true)" == "directory" ]] || return 1
+    fi
+    cd -P "$comp" 2>/dev/null || return 1
+    [[ "$(stat -c '%d:%i' .. 2>/dev/null || true)" == "$here" ]] || return 1
+    here="$(stat -c '%d:%i' . 2>/dev/null || true)"
+    [[ -n "$here" ]] || return 1
+  done
+  return 0
+}
+
 # Publish stdin at "$1" so that a SIGKILL or a power loss at any instant leaves either the
 # PREVIOUS durable content or the complete new content, and never a truncated file.
 #
@@ -2625,37 +2728,45 @@ PUBLISH_STAGE_DIRNAME=".ims-publish"
 # the create left. Inside a 0700 root-owned directory nothing can open it either way — which is
 # the belt — but the ordering is the braces, and it costs nothing.
 publish_durable_file() {
-  local target="$1" owner="${2:-}" mode="${3:-600}" dir base stage self tmp meta parent
+  local target="$1" owner="${2:-}" mode="${3:-600}" dir base root self tmp meta parent
   # Absolute, so `dirname` and `basename` below split a whole path rather than a fragment of one.
   [[ "$target" == /* ]] || target="${PWD}/${target}"
   dir="$(dirname "$target")"
   base="$(basename "$target")" || return 1
-  mkdir -p "$dir" || return 1
+  # ONE REAL COMPONENT. Everything below publishes `../${base}` from inside the staging directory,
+  # so an empty `base`, or `.` or `..`, would aim the rename at the destination directory itself.
+  [[ -n "$base" && "$base" != "." && "$base" != ".." && "$base" != */* ]] || return 1
+  # THE DESTINATION IS NO LONGER PINNED FROM ITS OWN PATHNAME (o3d-rn10, Codex HIGH). It used to be
+  # `stat -c '%d:%i' "$dir"`, which follows whatever ${dir} resolves to at that instant and relates
+  # it to nothing: a `git-ssh` replaced by a symlink to /root/.ssh BEFORE this function ran was
+  # pinned as /root/.ssh, and every check afterwards agreed with the attacker's choice. So the
+  # destination is reached from a directory ${APP_USER} cannot replace — see
+  # publish_trust_root_candidates() above for which ancestors those are and why. A destination
+  # under none of them is REFUSED rather than resolved.
+  root="$(publish_trust_root "$dir")" || return 1
   # Asked rather than hardcoded, exactly as prepare_crontab_lock asks it: the property is "owned by
   # the privileged user that owns this install", and it lets the harnesses run this unprivileged.
   self="$(id -u)" || return 1
-  # THE DESTINATION DIRECTORY, RECORDED AS A DEVICE AND AN INODE AND NOT AS A NAME (o3d-czpy r2,
-  # Codex HIGH). The staging inode was pinned and the rename then used the ABSOLUTE target, which
-  # re-resolves ${dir} at the instant of the `mv`. For ${DEPLOY_SSH_KNOWN_HOSTS} that directory is
-  # ${DATA_DIR}/git-ssh, whose PARENT belongs to ${APP_USER}, so they can rename `git-ssh` aside
-  # after this function has pinned everything it pinned and leave a symlink at the name — and the
-  # `mv` then publishes a root-written, service-owned file into a directory of their choosing, such
-  # as /root/.ssh/known_hosts. A pinned inode does not pin the path used afterwards.
-  #
-  # The first field is the device, which is what proves the publication below is a rename and not a
-  # dereferencing cross-device copy; the second is the inode, which is what makes it the SAME
-  # directory rather than the same name.
-  parent="$(stat -c '%d:%i' "$dir" 2>/dev/null || true)"
-  [[ -n "$parent" ]] || return 1
-  stage="${dir}/${PUBLISH_STAGE_DIRNAME}"
-  if ! (umask 077; mkdir "$stage") 2>/dev/null; then
-    [[ "$(stat -c '%F' "$stage" 2>/dev/null || true)" == "directory" ]] || return 1
-  fi
-  # `-h`, so a path that became a symlink between the mkdir and here has the LINK re-owned and not
-  # its target. The verification that follows the chdir is what decides whether we proceed.
-  chown -h "$self" "$stage" 2>/dev/null || return 1
   (
-    cd "$stage" 2>/dev/null || exit 1
+    # THE WALK, WHICH ENDS WITH THIS SUBSHELL INSIDE ${dir}. From here on the destination exists
+    # only as this process's cwd — a descriptor no rename can move — AND IS NEVER SPELLED AGAIN.
+    # That is the half round 2 got wrong: it rebuilt `${dir}/${PUBLISH_STAGE_DIRNAME}` and handed
+    # the whole pathname to `mkdir`, `stat` and `chown`, so all three re-resolved every component
+    # the pin had already accepted.
+    pin_dir_beneath_root "$root" "$dir" || exit 1
+    # The destination, recorded as a device and an inode. The first field is what proves the
+    # publication below is a rename and not a dereferencing cross-device copy; the second is what
+    # makes it the SAME directory rather than the same name.
+    parent="$(stat -c '%d:%i' . 2>/dev/null || true)"
+    [[ -n "$parent" ]] || exit 1
+    # A SINGLE RELATIVE COMPONENT, resolved by the kernel from the directory this process holds.
+    if ! (umask 077; mkdir "${PUBLISH_STAGE_DIRNAME}") 2>/dev/null; then
+      [[ "$(stat -c '%F' "${PUBLISH_STAGE_DIRNAME}" 2>/dev/null || true)" == "directory" ]] || exit 1
+    fi
+    # `-h`, so a name that became a symlink between the mkdir and here has the LINK re-owned and
+    # not its target. The verification that follows the chdir is what decides whether we proceed.
+    chown -h "$self" "${PUBLISH_STAGE_DIRNAME}" 2>/dev/null || exit 1
+    cd "${PUBLISH_STAGE_DIRNAME}" 2>/dev/null || exit 1
     meta="$(stat -c '%u|%a|%d' . 2>/dev/null || true)"
     [[ "$meta" == "${self}|700|${parent%%:*}" ]] || exit 1
     # AND `..` IS THE DESTINATION, ASKED OF THE KERNEL RATHER THAN OF A PATHNAME. The shell holds a
