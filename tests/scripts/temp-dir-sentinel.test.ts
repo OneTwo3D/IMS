@@ -45,7 +45,8 @@
  *      contained child resolving the private root rather than the directory it was handed.
  *  11. restore the pathname repair — `if (entry.isDirectory()) chmodSync(join(path, entry.name),
  *      0o700)` -> 'the repair does not follow a symlink swapped in after the type check' fails:
- *      the victim directory outside the private root comes back 0700 (10 of 10 runs measured).
+ *      the victim directory outside the private root comes back 0700 (10 of 10 runs measured;
+ *      the descriptor repair leaves it 0755 in 20 of 20).
  */
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
@@ -501,14 +502,19 @@ test('a child given a TMPDIR outside the private root cannot escape, and a conta
  * reported directory with a symlink and have the repair chmod an arbitrary same-uid target to
  * 0700, as whatever uid runs the tests, which in CI is root.
  *
- * WHAT THIS TEST IS HONEST ABOUT. The race is built, not argued: a detached process rewrites 64
- * names for the whole of the sweep, and the victim directory outside the private root is created
- * 0755 and must still be 0755 afterwards. It is a window, so a single run of the OLD code is not
- * guaranteed to hit it — measured while writing this, restoring the pathname chmod turned the
- * victim to 0700 in 10 of 10 runs. Under the descriptor repair it cannot hit at all rather than
- * usually not hitting: the walk opens every directory with `O_DIRECTORY | O_NOFOLLOW`, which IS
- * the type check, and changes the mode of the inode that descriptor holds rather than of a name
- * looked up again afterwards.
+ * THE RACE IS BUILT, NOT ARGUED, and two things had to be true before it could be observed at all.
+ * The swapper must already be in its loop when the sweep starts — a detached process boots for
+ * longer than a whole sweep lasts, and the first version of this measured a swapper that was still
+ * starting up and passed against the very repair it was written to catch, ten runs in a row. And
+ * the walk must be the slower of the two, or it finishes an entire pass inside one
+ * all-directories phase and never sees a link; the abandoned names therefore hold subtrees, which
+ * is what took the hit rate from 6 runs in 10 to 10 in 10.
+ *
+ * MEASURED BOTH WAYS. With the pathname chmod restored the victim directory outside the private
+ * root came back 0700 in 10 runs out of 10. With the descriptor repair it stayed 0755 in 20 runs
+ * out of 20 — and not by winning the race but by not being in one: the walk opens every directory
+ * with `O_DIRECTORY | O_NOFOLLOW`, which IS the type check, and changes the mode of the inode that
+ * descriptor holds rather than of a name looked up again afterwards.
  *
  * Removal completeness is deliberately not asserted here — a process actively recreating entries
  * can defeat any removal, and that half is measured by the unremovable-leftover test above. This
@@ -524,13 +530,14 @@ test('the repair does not follow a symlink swapped in after the type check', { s
   // its own `ims-unit-…` root under this process's tmpdir, and this arena is that root's sibling.
   const arena = mkdtempSync(join(tmpdir(), 'ims-swaprace-'))
   const victim = join(arena, 'victim')
+  const ready = join(arena, 'ready')
   const done = join(arena, 'done')
   mkdirSync(victim)
   chmodSync(victim, 0o755)
 
   const before = new Set(readdirSync(tmpdir()))
   try {
-    const run = runFixture(SWAP, { IMS_SWAP_VICTIM: victim, IMS_SWAP_DONE: done })
+    const run = runFixture(SWAP, { IMS_SWAP_VICTIM: victim, IMS_SWAP_READY: ready, IMS_SWAP_DONE: done })
 
     assert.match(
       run.output,
@@ -545,8 +552,14 @@ test('the repair does not follow a symlink swapped in after the type check', { s
     assert.match(run.output, /temp-dir leak: 1 entry survived/, `and be reported:\n${run.output}`)
     assert.match(run.output, /\bims-fixture-swap-/, `and named:\n${run.output}`)
 
-    // Let the swapper finish before measuring, so the mode read below is a settled one and the
-    // cleanup underneath cannot race a process still putting directories back.
+    // THE RACE REALLY WAS ONE. The fixture blocks until the swapper is in its loop, so this
+    // marker existing before the run ended is the evidence that the sweep and the swapping
+    // overlapped — without it the first version of this fixture measured a swapper that had not
+    // finished booting, and passed against the very repair it was written to catch.
+    assert.ok(existsSync(ready), 'the swapper must have reached its loop before the sweep ran')
+
+    // Let it finish before measuring, so the mode read below is a settled one and the cleanup
+    // underneath cannot race a process still putting directories back.
     for (let waited = 0; waited < 300 && !existsSync(done); waited += 1) pause(50)
     assert.ok(existsSync(done), 'the swapper must have finished, or nothing here was concurrent')
 
