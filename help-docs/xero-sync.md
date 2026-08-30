@@ -898,6 +898,29 @@ is genuinely gone, or register the receipt so the two agree. The moment a paymen
 posted, the recorded origin stops mattering and Xero's own list decides again — so a genuine
 **WooCommerce chargeback is still detected and still unwinds revenue**, exactly as before.
 
+**QuickBooks reverses on the same evidence, decided by the same code.** The rule above is not Xero's;
+it is IMS's, and the QuickBooks payment poller reaches its verdict through the same functions. It
+selects each order's recorded origin, takes the same database-clock reading *before* asking Intuit,
+and puts every reversal candidate through the same decision. A sale marked paid by hand or by a
+channel, one whose receipt has not been registered yet, and one whose registration this read cannot
+speak for are all **withheld** — `paidAt` is left set, no chargeback credit note is raised, and a
+WARNING against the order says which of the three it is and what to do. A genuine chargeback still
+reverses the moment a payment registration has demonstrably reached QuickBooks. The bill side is
+covered too: a bill whose payment IMS has queued but not yet posted no longer has `paidAt` cleared on
+the strength of a balance QuickBooks reports while that payment is still on its way.
+
+Two differences from Xero are worth knowing, because they are visible to whoever reads the warnings:
+
+- **QuickBooks is not asked which payments a document carries.** The reversal read asks only which
+  documents regressed, so IMS can never prove that one *particular* payment of its own has been
+  removed. Where Xero would name the vanished payment id, QuickBooks acts on the balance alone. For
+  the same reason a QuickBooks balance due does not distinguish a **part** payment from a removed one,
+  which Xero's amount reading does — reconcile a partly-paid QuickBooks document by hand.
+- **There is no hourly re-ask.** A withheld Xero verdict is put back to Xero on a timer; a withheld
+  QuickBooks reversal is reported once and the poll watermark still advances. Holding the cursor for
+  it would freeze every later QuickBooks payment and reversal behind a paid flag that, by design, is
+  never going to be registered. The warning is the durable record — act on it from there.
+
 **A withheld verdict is asked again on a timer.** It cannot be left to resolve itself: the delta
 returns an invoice only when it *changes*, and what usually settles a withheld verdict is not a change
 in Xero at all — it is the IMS's own registration finishing, or somebody cancelling a failed one.
