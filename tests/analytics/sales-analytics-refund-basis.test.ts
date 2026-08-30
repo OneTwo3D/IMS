@@ -826,6 +826,11 @@ test('every disclosure a sales-analytics producer emits reaches its CSV — rows
     assert.ok(Object.keys(report.rows[0]!).length >= 8, `${reportType}: the producer returned a near-empty row`)
     assert.ok(Object.keys(report.totals).length >= 4, `${reportType}: the producer returned near-empty totals`)
 
+    // csvResponse caps its metadata payload and, past the cap, keeps only a handful of essential
+    // keys — in the FILE as well as the header. That is the same silent drop this test exists to
+    // catch, arriving by size instead of by omission, so the file must say it was not truncated.
+    assert.ok(!body.includes('\r\n# metadataTruncated,'), `${reportType}: the export metadata was truncated, so totals were dropped from the file`)
+
     const columns = Object.keys(parsed[0]!)
     for (const key of Object.keys(report.rows[0]!)) {
       if (!columns.includes(key)) missing.push(`${reportType}: row field ${key} is not a CSV column`)
