@@ -5605,7 +5605,7 @@ function logicalShellLines(lines: string[]): string[] {
   let pending: string | null = null
   for (const line of lines) {
     if (pending === null && /^\s*#/.test(line)) { out.push(line); continue }
-    const joined = pending === null ? line : pending + line
+    const joined: string = pending === null ? line : pending + line
     if ((/\\*$/.exec(joined)![0].length % 2) === 1) { pending = joined.slice(0, -1); continue }
     out.push(joined)
     pending = null
