@@ -1281,6 +1281,13 @@ fsync_path() {
   return 1
 }
 
+# THE NAME OF THE ROOT-OWNED STAGING DIRECTORY publish_durable_file() writes through (o3d-czpy).
+#
+# ONE NAME, STATED ONCE, because scripts/install.sh also has to PRUNE it out of the recursive
+# `chown -h ${APP_USER}` it runs over ${DATA_DIR}: half this function's targets live under that
+# directory, and a staging directory handed to the service account is not a staging directory.
+PUBLISH_STAGE_DIRNAME=".ims-publish"
+
 # Publish stdin at "$1" so that a SIGKILL or a power loss at any instant leaves either the
 # PREVIOUS durable content or the complete new content, and never a truncated file.
 #
@@ -1299,18 +1306,71 @@ fsync_path() {
 # before the rename, so the name is published once and everything about it is already true.
 # `$2` and `$3` are optional and default to what every earlier caller already got: root's own
 # ownership, since this script runs as root, and mode 0600.
+#
+# AND THE TEMPORARY FILE IS NOT MADE BESIDE ITS TARGET ANY MORE (o3d-czpy). Round 24's CRITICAL
+# was about a root-side write into a directory ${APP_USER} owns, and every one of this function's
+# targets is in such a directory: ${APP_DIR}/.env, ${APP_DIR}/.deploy-meta,
+# ${CUTOVER_STATE_DIR}/DEPLOY-FENCED, the cron backup. `mktemp "${target}.XXXXXX"` is not itself
+# plantable — the name is unpredictable and the create is O_CREAT|O_EXCL — but everything done to
+# it AFTERWARDS is by PATH, and the service user can watch the directory, rename the new entry
+# aside and leave a symlink at the same name. Then the `chmod` chmods their choice, the `chown`
+# hands their choice to them, and the `cat >` writes the application's secrets into it. Three
+# root-side operations aimed by a rename, and no amount of re-checking the path closes it, because
+# the check and the operation are two syscalls.
+#
+# So the temporary lives in a ROOT-OWNED 0700 DIRECTORY the service user cannot write, cannot
+# rename inside, and cannot list. It is created with the same primitives prepare_crontab_lock uses
+# and for the same reasons — plain `mkdir` (which fails with EEXIST on a planted symlink where
+# `mkdir -p` would silently work inside its target), `stat -c %F` (lstat, so a symlink reads as
+# "symbolic link" and is refused), `chown -h` (which cannot dereference) — and it is a SIBLING of
+# the target, so the publication is still a same-filesystem rename.
+#
+# AND THE ONE HOLE THAT LEAVES IS CLOSED BY `cd`, NOT BY ANOTHER CHECK. ${APP_USER} owns the
+# CONTAINING directory, so they can rename ${dir}/.ims-publish aside AFTER it has been verified and
+# put a symlink there; a fourth lstat would race exactly like the first three. `cd` does not: it
+# resolves the path once and the shell then holds a descriptor on that INODE, which no rename can
+# move. Everything below runs relative to that cwd. The verification is therefore made of `.`
+# AFTER the chdir — it asks what this process is actually inside — and it asks for uid ${self} and
+# mode 0700, which is a directory the service user cannot manufacture: they cannot chown anything
+# to root. `%d` is in the same stat so the same answer also proves the rename below is a rename
+# and not a dereferencing cross-device copy.
+#
+# MODE AND OWNER ARE APPLIED BEFORE THE CONTENT, not after it. `.env` is the reason: it carries
+# AUTH_SECRET, SETTINGS_ENCRYPTION_KEY, CRON_SECRET and the database password, and a file that is
+# filled first and restricted second exists, for an instant, with secrets in it at whatever mode
+# the create left. Inside a 0700 root-owned directory nothing can open it either way — which is
+# the belt — but the ordering is the braces, and it costs nothing.
 publish_durable_file() {
-  local target="$1" owner="${2:-}" mode="${3:-600}" dir tmp
+  local target="$1" owner="${2:-}" mode="${3:-600}" dir stage self tmp meta dev
+  # `mv -T` below is given an absolute target so it cannot be re-resolved against the staging cwd.
+  [[ "$target" == /* ]] || target="${PWD}/${target}"
   dir="$(dirname "$target")"
   mkdir -p "$dir" || return 1
-  tmp="$(mktemp "${target}.XXXXXX" 2>/dev/null)" || return 1
-  if ! cat > "$tmp" 2>/dev/null; then rm -f "$tmp"; return 1; fi
-  if ! chmod "$mode" "$tmp" 2>/dev/null; then rm -f "$tmp"; return 1; fi
-  if [[ -n "$owner" ]] && ! chown "$owner" "$tmp" 2>/dev/null; then rm -f "$tmp"; return 1; fi
+  # Asked rather than hardcoded, exactly as prepare_crontab_lock asks it: the property is "owned by
+  # the privileged user that owns this install", and it lets the harnesses run this unprivileged.
+  self="$(id -u)" || return 1
+  dev="$(stat -c '%d' "$dir" 2>/dev/null || true)"
+  [[ -n "$dev" ]] || return 1
+  stage="${dir}/${PUBLISH_STAGE_DIRNAME}"
+  if ! (umask 077; mkdir "$stage") 2>/dev/null; then
+    [[ "$(stat -c '%F' "$stage" 2>/dev/null || true)" == "directory" ]] || return 1
+  fi
+  # `-h`, so a path that became a symlink between the mkdir and here has the LINK re-owned and not
+  # its target. The verification that follows the chdir is what decides whether we proceed.
+  chown -h "$self" "$stage" 2>/dev/null || return 1
+  (
+    cd "$stage" 2>/dev/null || exit 1
+    meta="$(stat -c '%u|%a|%d' . 2>/dev/null || true)"
+    [[ "$meta" == "${self}|700|${dev}" ]] || exit 1
+    if ! tmp="$(mktemp ./publish.XXXXXX 2>/dev/null)"; then exit 1; fi
+    if ! chmod "$mode" "$tmp" 2>/dev/null; then rm -f "$tmp"; exit 1; fi
+    if [[ -n "$owner" ]] && ! chown "$owner" "$tmp" 2>/dev/null; then rm -f "$tmp"; exit 1; fi
+    if ! cat > "$tmp" 2>/dev/null; then rm -f "$tmp"; exit 1; fi
   # BARRIER 1: the data, before the name exists. After this the rename can only publish
   # bytes that are already on the medium.
-  if ! fsync_path "$tmp"; then rm -f "$tmp"; return 1; fi
-  if ! mv -f "$tmp" "$target" 2>/dev/null; then rm -f "$tmp"; return 1; fi
+    if ! fsync_path "$tmp"; then rm -f "$tmp"; exit 1; fi
+    if ! mv -f -T "$tmp" "$target" 2>/dev/null; then rm -f "$tmp"; exit 1; fi
+  ) || return 1
   # BARRIER 2: the directory entry the rename created. Without it the reboot can find the
   # old name, or neither name, however well the data was flushed.
   #

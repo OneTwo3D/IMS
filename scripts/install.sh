@@ -2565,6 +2565,13 @@ fsync_path() {
   return 1
 }
 
+# THE NAME OF THE ROOT-OWNED STAGING DIRECTORY publish_durable_file() writes through (o3d-czpy).
+#
+# ONE NAME, STATED ONCE, because scripts/install.sh also has to PRUNE it out of the recursive
+# `chown -h ${APP_USER}` it runs over ${DATA_DIR}: half this function's targets live under that
+# directory, and a staging directory handed to the service account is not a staging directory.
+PUBLISH_STAGE_DIRNAME=".ims-publish"
+
 # Publish stdin at "$1" so that a SIGKILL or a power loss at any instant leaves either the
 # PREVIOUS durable content or the complete new content, and never a truncated file.
 #
@@ -2583,18 +2590,71 @@ fsync_path() {
 # before the rename, so the name is published once and everything about it is already true.
 # `$2` and `$3` are optional and default to what every earlier caller already got: root's own
 # ownership, since this script runs as root, and mode 0600.
+#
+# AND THE TEMPORARY FILE IS NOT MADE BESIDE ITS TARGET ANY MORE (o3d-czpy). Round 24's CRITICAL
+# was about a root-side write into a directory ${APP_USER} owns, and every one of this function's
+# targets is in such a directory: ${APP_DIR}/.env, ${APP_DIR}/.deploy-meta,
+# ${CUTOVER_STATE_DIR}/DEPLOY-FENCED, the cron backup. `mktemp "${target}.XXXXXX"` is not itself
+# plantable — the name is unpredictable and the create is O_CREAT|O_EXCL — but everything done to
+# it AFTERWARDS is by PATH, and the service user can watch the directory, rename the new entry
+# aside and leave a symlink at the same name. Then the `chmod` chmods their choice, the `chown`
+# hands their choice to them, and the `cat >` writes the application's secrets into it. Three
+# root-side operations aimed by a rename, and no amount of re-checking the path closes it, because
+# the check and the operation are two syscalls.
+#
+# So the temporary lives in a ROOT-OWNED 0700 DIRECTORY the service user cannot write, cannot
+# rename inside, and cannot list. It is created with the same primitives prepare_crontab_lock uses
+# and for the same reasons — plain `mkdir` (which fails with EEXIST on a planted symlink where
+# `mkdir -p` would silently work inside its target), `stat -c %F` (lstat, so a symlink reads as
+# "symbolic link" and is refused), `chown -h` (which cannot dereference) — and it is a SIBLING of
+# the target, so the publication is still a same-filesystem rename.
+#
+# AND THE ONE HOLE THAT LEAVES IS CLOSED BY `cd`, NOT BY ANOTHER CHECK. ${APP_USER} owns the
+# CONTAINING directory, so they can rename ${dir}/.ims-publish aside AFTER it has been verified and
+# put a symlink there; a fourth lstat would race exactly like the first three. `cd` does not: it
+# resolves the path once and the shell then holds a descriptor on that INODE, which no rename can
+# move. Everything below runs relative to that cwd. The verification is therefore made of `.`
+# AFTER the chdir — it asks what this process is actually inside — and it asks for uid ${self} and
+# mode 0700, which is a directory the service user cannot manufacture: they cannot chown anything
+# to root. `%d` is in the same stat so the same answer also proves the rename below is a rename
+# and not a dereferencing cross-device copy.
+#
+# MODE AND OWNER ARE APPLIED BEFORE THE CONTENT, not after it. `.env` is the reason: it carries
+# AUTH_SECRET, SETTINGS_ENCRYPTION_KEY, CRON_SECRET and the database password, and a file that is
+# filled first and restricted second exists, for an instant, with secrets in it at whatever mode
+# the create left. Inside a 0700 root-owned directory nothing can open it either way — which is
+# the belt — but the ordering is the braces, and it costs nothing.
 publish_durable_file() {
-  local target="$1" owner="${2:-}" mode="${3:-600}" dir tmp
+  local target="$1" owner="${2:-}" mode="${3:-600}" dir stage self tmp meta dev
+  # `mv -T` below is given an absolute target so it cannot be re-resolved against the staging cwd.
+  [[ "$target" == /* ]] || target="${PWD}/${target}"
   dir="$(dirname "$target")"
   mkdir -p "$dir" || return 1
-  tmp="$(mktemp "${target}.XXXXXX" 2>/dev/null)" || return 1
-  if ! cat > "$tmp" 2>/dev/null; then rm -f "$tmp"; return 1; fi
-  if ! chmod "$mode" "$tmp" 2>/dev/null; then rm -f "$tmp"; return 1; fi
-  if [[ -n "$owner" ]] && ! chown "$owner" "$tmp" 2>/dev/null; then rm -f "$tmp"; return 1; fi
+  # Asked rather than hardcoded, exactly as prepare_crontab_lock asks it: the property is "owned by
+  # the privileged user that owns this install", and it lets the harnesses run this unprivileged.
+  self="$(id -u)" || return 1
+  dev="$(stat -c '%d' "$dir" 2>/dev/null || true)"
+  [[ -n "$dev" ]] || return 1
+  stage="${dir}/${PUBLISH_STAGE_DIRNAME}"
+  if ! (umask 077; mkdir "$stage") 2>/dev/null; then
+    [[ "$(stat -c '%F' "$stage" 2>/dev/null || true)" == "directory" ]] || return 1
+  fi
+  # `-h`, so a path that became a symlink between the mkdir and here has the LINK re-owned and not
+  # its target. The verification that follows the chdir is what decides whether we proceed.
+  chown -h "$self" "$stage" 2>/dev/null || return 1
+  (
+    cd "$stage" 2>/dev/null || exit 1
+    meta="$(stat -c '%u|%a|%d' . 2>/dev/null || true)"
+    [[ "$meta" == "${self}|700|${dev}" ]] || exit 1
+    if ! tmp="$(mktemp ./publish.XXXXXX 2>/dev/null)"; then exit 1; fi
+    if ! chmod "$mode" "$tmp" 2>/dev/null; then rm -f "$tmp"; exit 1; fi
+    if [[ -n "$owner" ]] && ! chown "$owner" "$tmp" 2>/dev/null; then rm -f "$tmp"; exit 1; fi
+    if ! cat > "$tmp" 2>/dev/null; then rm -f "$tmp"; exit 1; fi
   # BARRIER 1: the data, before the name exists. After this the rename can only publish
   # bytes that are already on the medium.
-  if ! fsync_path "$tmp"; then rm -f "$tmp"; return 1; fi
-  if ! mv -f "$tmp" "$target" 2>/dev/null; then rm -f "$tmp"; return 1; fi
+    if ! fsync_path "$tmp"; then rm -f "$tmp"; exit 1; fi
+    if ! mv -f -T "$tmp" "$target" 2>/dev/null; then rm -f "$tmp"; exit 1; fi
+  ) || return 1
   # BARRIER 2: the directory entry the rename created. Without it the reboot can find the
   # old name, or neither name, however well the data was flushed.
   #
@@ -2605,6 +2665,87 @@ publish_durable_file() {
   # instead reads the new content and concludes a durability it was never given.
   fsync_path "$dir" || return 1
   return 0
+}
+
+# ---------------------------------------------------------------------------
+# CREATING A DIRECTORY INSIDE ONE THE SERVICE ACCOUNT OWNS (o3d-czpy)
+#
+# THE FINDING, RESTATED FOR DIRECTORIES. `mkdir -p a/b` SUCCEEDS SILENTLY when `a` is a symlink to
+# a directory, and every step after it then operates inside the link's target. Every directory this
+# installer creates under ${DATA_DIR} or ${APP_DIR} is created on an UPGRADE too, by which time
+# `chown -R ${APP_USER}` has already handed the containing directory to the service account — so
+# whoever holds that account chooses where the next run's `mkdir -p`, and anything written into
+# what it "created", actually lands.
+#
+# WHERE THE LINE IS DRAWN, AND WHY IT IS NOT AT `/`. A strict walk from the root would also refuse
+# a symlinked ${DATA_DIR} or ${LOG_DIR} — and THAT is a supported operator layout: putting
+# /var/lib/${APP_NAME} on a second disk by symlinking it is a normal thing to do, and /var/lib is
+# root-owned so the service account cannot forge it. The boundary is therefore the TOP-LEVEL
+# directory this installer hands to the service account. At and above it the path belongs to the
+# operator and a symlink is a configuration; below it a symlink is the finding, because below it is
+# exactly the region the service account can write.
+#
+# SO: `mkdir -p` the trusted root (its parent is root-owned), then create each component beneath it
+# with a PLAIN `mkdir`, which fails with EEXIST on a planted symlink rather than working inside it,
+# and lstat what is there when it does — `stat -c %F` reports "symbolic link" for a link, where
+# `-L`, deliberately not used, would report the target's type. The outcome of a planted link is a
+# REFUSED RUN naming the path, never a followed one.
+#
+# NO `chmod`, HERE EITHER. The mode comes from the umask the caller states, at creation. A
+# directory that is already there with the wrong mode is the caller's problem to assert on; chmod
+# has no --no-dereference on Linux, so correcting it would be the same escalation with another verb.
+mkdir_service_subdir() {
+  local root="$1" mask="$2"
+  shift 2
+  local path rel comp built kind
+  # The root itself, whose parent is root-owned. `-p` is correct here and only here.
+  mkdir -p "${root}" || die "${root} could not be created, so this installation has nowhere to put its state. Nothing has been changed."
+  for path in "$@"; do
+    [[ "${path}" == "${root}/"* ]] || die \
+      "mkdir_service_subdir was asked to create ${path}, which is not underneath ${root}. This is a bug in this script, not an operator error: the symlink-proof walk only means anything for components below the directory the service account owns."
+    rel="${path#"${root}/"}"
+    built="${root}"
+    while [[ -n "${rel}" ]]; do
+      comp="${rel%%/*}"
+      if [[ "${comp}" == "${rel}" ]]; then rel=""; else rel="${rel#*/}"; fi
+      [[ -n "${comp}" ]] || continue
+      built="${built}/${comp}"
+      if ! (umask "${mask}"; mkdir "${built}") 2>/dev/null; then
+        kind="$(stat -c '%F' "${built}" 2>/dev/null || true)"
+        [[ "${kind}" == "directory" ]] || die \
+          "${built} exists and is a ${kind:-missing path}, not a directory. A symlink there is how a compromised '${APP_USER}' would aim this installer's root-side writes at a path of their choosing, so this run refuses rather than following it. Remove or fix that path and run the installer again; nothing has been changed."
+      fi
+    done
+  done
+}
+
+# ---------------------------------------------------------------------------
+# COPYING A TREE INTO A DIRECTORY THE SERVICE ACCOUNT OWNS (o3d-czpy)
+#
+# `rm -rf "${APP_DIR}/.git"` followed by `cp -a "${clone}/.git" "${APP_DIR}/.git"` is the same
+# finding one more time, and the `rm` is what opens it: it removes a symlink without following it
+# (correct), and leaves the NAME free for the service account to re-create as a symlink to
+# somewhere else before the `cp` runs. `cp -a src dest` with `dest` a symlink-to-directory copies
+# INTO the target, as root, with the copy's ownership.
+#
+# Two steps, and the second is the one that matters. A plain `mkdir` refuses a name that is already
+# taken, so a link planted between the `rm` and here ends the run instead of being followed. Then
+# `cd` PINS the result: the shell holds a descriptor on the inode it just created, and a rename of
+# the name cannot move it. What is verified is `.` after the chdir — uid ${self} and a directory —
+# which the service account cannot manufacture, because they cannot chown anything to root. The
+# copy is then made relative to that cwd and can land nowhere else.
+copy_tree_into_new_dir() {
+  local src="$1" dest="$2" self meta
+  self="$(id -u)" || die "\`id -u\` failed, so this run cannot establish which uid it is and cannot prove that ${dest} is the directory it just created."
+  rm -rf "${dest}"
+  (umask 022; mkdir "${dest}") 2>/dev/null || die \
+    "${dest} could not be created: something is already at that path after it was removed, which is how a compromised '${APP_USER}' would aim this copy at a directory of their choosing. Nothing has been copied."
+  (
+    cd "${dest}" 2>/dev/null || exit 1
+    meta="$(stat -c '%F|%u' . 2>/dev/null || true)"
+    [[ "${meta}" == "directory|${self}" ]] || exit 1
+    cp -a "${src}/." . 2>/dev/null || exit 1
+  ) || die "${src} could not be copied into ${dest}. Nothing that a later step depends on has been written."
 }
 
 # ---------------------------------------------------------------------------
@@ -6437,15 +6578,36 @@ if [[ -n "${DB_SSLROOTCERT}" ]]; then
     "The database CA at ${DB_CA_PUBLISHED_FILE} is not usable by the account the service runs as; the reason is above. DB_SSLMODE=${DB_SSLMODE} verifies every connection against that file, so an application that cannot open it cannot start. NOTHING HAS BEEN MIGRATED and nothing has been stopped. ${DB_CA_REFRESH_FAILURE_ADVICE}"
 fi
 
-mkdir -p "${DATA_DIR}" "${LOG_DIR}" "${BACKUP_DIR}" \
+# THE STATE ROOTS THEMSELVES: /var/lib and /var/log are root-owned, so a symlink at either of
+# these two names is an operator's storage layout and not an attack, and `-p` is right for them.
+mkdir -p "${DATA_DIR}" "${LOG_DIR}"
+
+# EVERYTHING BENEATH THEM GOES THROUGH THE SYMLINK-PROOF WALK (o3d-czpy). On an upgrade the
+# containing directory already belongs to ${APP_USER} — the recursive chown below did that on the
+# previous run — so `mkdir -p` here was creating whatever a planted symlink pointed at, and the
+# application's uploads are then written into it.
+mkdir_service_subdir "${DATA_DIR}" 022 \
+  "${BACKUP_DIR}" \
   "${DATA_DIR}/xero" \
   "${UPLOAD_STORAGE_DIR}/invoices" \
   "${UPLOAD_STORAGE_DIR}/quarantine/invoices" \
   "${PUBLIC_UPLOAD_STORAGE_DIR}/branding" \
-  "${PUBLIC_UPLOAD_STORAGE_DIR}/avatars" \
-  "${APP_DIR}/backups" \
-  /tmp/${APP_NAME}/pdf \
-  /tmp/${APP_NAME}/uploads
+  "${PUBLIC_UPLOAD_STORAGE_DIR}/avatars"
+mkdir_service_subdir "${APP_DIR}" 022 "${APP_DIR}/backups"
+
+# AND /tmp/${APP_NAME}/pdf AND /tmp/${APP_NAME}/uploads ARE NOT CREATED AT ALL ANY MORE (o3d-czpy).
+#
+# /tmp is 1777, so `mkdir -p /tmp/${APP_NAME}/pdf` as root was the one site in this script reachable
+# by ANY local user and not merely by ${APP_USER}: pre-create /tmp/${APP_NAME} as a symlink and the
+# next install run makes root create directories wherever it points.
+#
+# THE FIX IS DELETION, BECAUSE NOTHING READS THEM. ${APP_NAME} is "one-two-inventory"; the
+# application's own temporary uploads path is `path.join(os.tmpdir(), 'onetwoinventory', 'uploads')`
+# (lib/ops/health.ts) and its dev backup root is /tmp/onetwoinventory/backups
+# (lib/backup-storage.ts) — different names, neither of them these. Nothing in the repository, in
+# either spelling of the app name, opens /tmp/one-two-inventory. Making a dead directory safe is
+# not the fix for creating it in a world-writable place; not creating it is. The app creates its own
+# temp directories at runtime, under its own uid, and the health check reports on them.
 
 # Migrate uploads from any previous in-tree location to the new storage roots.
 # Existing DB rows reference filenames only, so files left behind under
@@ -6455,10 +6617,23 @@ mkdir -p "${DATA_DIR}" "${LOG_DIR}" "${BACKUP_DIR}" \
 migrate_uploads() {
   local src="$1"
   local dest="$2"
+  local self meta
   if [[ -d "${src}" ]] && [[ -n "$(find "${src}" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
     info "Migrating legacy uploads: ${src} -> ${dest}"
-    mkdir -p "${dest}"
-    find "${src}" -mindepth 1 -maxdepth 1 -exec mv -n -t "${dest}" {} +
+    # THE DESTINATION IS CREATED SYMLINK-PROOF AND THEN PINNED (o3d-czpy). `mkdir -p "${dest}"`
+    # followed by `mv -t "${dest}"` is two resolutions of a path inside a directory ${APP_USER}
+    # owns, and the run that matters is the UPGRADE — where the previous run has already handed
+    # ${DATA_DIR} to them. `cd` resolves it once; the shell then holds the inode, and the uid check
+    # on `.` is a fact about what this process is inside rather than about a name that can move.
+    # ${self} still owns these directories at this point: the recursive chown below has not run yet.
+    mkdir_service_subdir "${DATA_DIR}" 022 "${dest}"
+    self="$(id -u)" || die "\`id -u\` failed, so this run cannot prove where it is moving ${src} to."
+    (
+      cd "${dest}" 2>/dev/null || exit 1
+      meta="$(stat -c '%F|%u' . 2>/dev/null || true)"
+      [[ "${meta}" == "directory|${self}" ]] || exit 1
+      find "${src}" -mindepth 1 -maxdepth 1 -exec mv -n -t . {} +
+    ) || die "Legacy uploads at ${src} could not be moved into ${dest}. Nothing has been started and nothing has been migrated."
     rmdir "${src}" 2>/dev/null || true
   fi
 }
@@ -6472,7 +6647,12 @@ migrate_uploads "${APP_DIR}/public/uploads/avatars" "${PUBLIC_UPLOAD_STORAGE_DIR
 # out of this recursive chown rather than being taken back and re-taken on every re-run (which would
 # open a window in which the service user could plant a symlink inside it). `-exec chown -h` also
 # means a symlink anywhere under ${DATA_DIR} has its own ownership changed rather than its target's.
-find "${DATA_DIR}" -path "${CRONTAB_LOCK_DIR}" -prune -o -exec chown -h "${APP_USER}:${APP_USER}" {} +
+# ${PUBLISH_STAGE_DIRNAME} is pruned for the SAME reason and by name, at any depth (o3d-czpy):
+# publish_durable_file() stages ${CUTOVER_STATE_DIR}/DEPLOY-FENCED and the cron backup through
+# root-owned 0700 directories inside ${DATA_DIR}, and a staging directory this line handed to
+# ${APP_USER} would be a staging directory they can rename — which is the whole finding.
+find "${DATA_DIR}" \( -path "${CRONTAB_LOCK_DIR}" -o -name "${PUBLISH_STAGE_DIRNAME}" \) -prune \
+  -o -exec chown -h "${APP_USER}:${APP_USER}" {} +
 chown -R "${APP_USER}:${APP_USER}" "${LOG_DIR}"
 chown -R "${APP_USER}:${APP_USER}" "${UPLOAD_STORAGE_DIR}" "${PUBLIC_UPLOAD_STORAGE_DIR}"
 
@@ -6500,9 +6680,29 @@ if [[ "${GIT_DEPLOY_KEY_ENABLED:-n}" == "y" ]]; then
   [[ -n "${GITHUB_REPO_NAME:-}" ]] || die "GITHUB_REPO_NAME is required when GIT_DEPLOY_KEY_ENABLED=y."
   git_repo_uses_ssh "${GIT_REPO_URL}" || die "GIT_REPO_URL must use the GitHub SSH form when GIT_DEPLOY_KEY_ENABLED=y."
 
-  mkdir -p "${DEPLOY_SSH_DIR}"
-  chown -R "${APP_USER}:${APP_USER}" "${DEPLOY_SSH_DIR}"
-  chmod 700 "${DEPLOY_SSH_DIR}"
+  # THE DIRECTORY THAT HOLDS THE DEPLOY PRIVATE KEY (o3d-czpy).
+  #
+  # It was `mkdir -p` + `chown -R` + `chmod 700`, all three of which resolve a path inside
+  # ${DATA_DIR} — which the previous run gave to ${APP_USER}. `mkdir -p` accepts a symlink to a
+  # directory silently, and the `chmod 700` that followed it therefore made an arbitrary directory
+  # of the service account's choosing root-only: a root-side mode change aimed by a symlink.
+  #
+  # NOW: the walk creates it with a PLAIN mkdir under `umask 077`, so the mode is 0700 from the
+  # create and there is nothing to correct afterwards. A mode that is already wrong is REFUSED, not
+  # chmod'ed — the same rule prepare_crontab_lock states, for the same reason: chmod has no
+  # --no-dereference on Linux. (Every installation that has run any previous version of this script
+  # already has 0700 here, because the line above set it on every run, so this refuses only a
+  # directory somebody changed by hand.)
+  #
+  # `chown -h` and NOT `chown -R`: -R's OPERAND is dereferenced, so a symlink that arrived between
+  # the mkdir and here would have had its target's ownership changed. There is nothing recursive to
+  # do in any case — ssh-keygen creates the key as ${APP_USER} below, and known_hosts is published
+  # with its owner applied before the rename.
+  mkdir_service_subdir "${DATA_DIR}" 077 "${DEPLOY_SSH_DIR}"
+  DEPLOY_SSH_DIR_MODE="$(stat -c '%a' "${DEPLOY_SSH_DIR}" 2>/dev/null || true)"
+  [[ "${DEPLOY_SSH_DIR_MODE}" == "700" ]] || die \
+    "${DEPLOY_SSH_DIR} is mode ${DEPLOY_SSH_DIR_MODE:-unreadable}, not 700. It holds the deploy private key, and ssh itself refuses a key in a group- or world-accessible directory. This run will not chmod it: chmod has no --no-dereference on Linux, so correcting a path inside a directory '${APP_USER}' owns is the same escalation with a different verb. Set it to 700 by hand and run the installer again."
+  chown -h "${APP_USER}:${APP_USER}" "${DEPLOY_SSH_DIR}"
 
   if [[ ! -f "${DEPLOY_SSH_KEY_PATH}" ]]; then
     run_as_user "${APP_USER}" ssh-keygen -q -t ed25519 -N "" -C "${GITHUB_DEPLOY_KEY_TITLE}" -f "${DEPLOY_SSH_KEY_PATH}"
@@ -6511,10 +6711,22 @@ if [[ "${GIT_DEPLOY_KEY_ENABLED:-n}" == "y" ]]; then
     info "Reusing existing deploy key at ${DEPLOY_SSH_KEY_PATH}."
   fi
 
-  ssh-keyscan -H github.com > "${DEPLOY_SSH_KNOWN_HOSTS}.tmp" 2>/dev/null
-  mv "${DEPLOY_SSH_KNOWN_HOSTS}.tmp" "${DEPLOY_SSH_KNOWN_HOSTS}"
-  chmod 600 "${DEPLOY_SSH_KNOWN_HOSTS}"
-  chown "${APP_USER}:${APP_USER}" "${DEPLOY_SSH_KNOWN_HOSTS}"
+  # THE HOST KEYS, CAPTURED AND THEN PUBLISHED (o3d-czpy). The redirection wrote into
+  # ${DEPLOY_SSH_DIR}, which belongs to ${APP_USER}: `>` follows a symlink at the final component,
+  # so a planted `known_hosts.tmp` sent ssh-keyscan's output — and, on the older layout, the mode
+  # and owner changes after it — wherever they chose. The rename that followed was the only safe
+  # step of the four, and it happened after the write.
+  #
+  # CAPTURED FIRST, so an ssh-keyscan that fails or that returns nothing cannot publish an EMPTY
+  # known_hosts: that file is the only thing standing between this deploy key and a man in the
+  # middle, and an empty one makes every later `git` either refuse or prompt.
+  KEYSCAN_OUTPUT="$(ssh-keyscan -H github.com 2>/dev/null)" || die \
+    "ssh-keyscan could not reach github.com, so this run cannot pin its host keys. ${DEPLOY_SSH_KNOWN_HOSTS} is unchanged and nothing has been started."
+  [[ -n "${KEYSCAN_OUTPUT}" ]] || die \
+    "ssh-keyscan returned no host keys for github.com. Publishing an empty ${DEPLOY_SSH_KNOWN_HOSTS} would leave every later git fetch unauthenticated, so this run refuses; the existing file is unchanged and nothing has been started."
+  printf '%s\n' "${KEYSCAN_OUTPUT}" \
+    | publish_durable_file "${DEPLOY_SSH_KNOWN_HOSTS}" "${APP_USER}:${APP_USER}" 600 || die \
+    "${DEPLOY_SSH_KNOWN_HOSTS} could not be published. The file at that path is whatever the previous run left there, complete and unchanged — it is published by rename — and nothing has been started."
 
   DEPLOY_PUBLIC_KEY="$(<"${DEPLOY_SSH_KEY_PATH}.pub")"
   EXISTING_KEYS_JSON="$(github_api GET "/repos/${GITHUB_REPO_OWNER}/${GITHUB_REPO_NAME}/keys")"
@@ -6567,8 +6779,7 @@ if [[ "$INSTALL_FROM_GIT" == "y" ]]; then
       --exclude='uploads' \
       --exclude='public/uploads' \
       "${TMP_CLONE_WORKTREE%/}/" "${APP_DIR}/"
-    rm -rf "${APP_DIR}/.git"
-    cp -a "${TMP_CLONE_WORKTREE}/.git" "${APP_DIR}/.git"
+    copy_tree_into_new_dir "${TMP_CLONE_WORKTREE}/.git" "${APP_DIR}/.git"
     chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"
     rm -rf "${TMP_CLONE_DIR}"
     success "Repository synced into existing directory."
@@ -6601,8 +6812,7 @@ else
     chown "${APP_USER}:${APP_USER}" "${TMP_CLONE_DIR}"
     run_git_as_user "${APP_USER}" git clone --branch "${GIT_BRANCH}" --depth 1 \
       "${GIT_REPO_URL}" "${TMP_CLONE_WORKTREE}"
-    rm -rf "${APP_DIR}/.git"
-    cp -a "${TMP_CLONE_WORKTREE}/.git" "${APP_DIR}/.git"
+    copy_tree_into_new_dir "${TMP_CLONE_WORKTREE}/.git" "${APP_DIR}/.git"
     chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}/.git"
     rm -rf "${TMP_CLONE_DIR}"
     success "Git metadata attached."
@@ -6610,14 +6820,19 @@ else
 fi
 
 DEPLOY_META_FILE="${APP_DIR}/.deploy-meta"
-cat > "${DEPLOY_META_FILE}" <<EOF
-INSTALL_FROM_GIT=${INSTALL_FROM_GIT}
-GIT_REPO_URL=${GIT_REPO_URL:-}
-GIT_BRANCH=${GIT_BRANCH:-}
-GIT_DEPLOY_KEY_ENABLED=${GIT_DEPLOY_KEY_ENABLED:-n}
-EOF
-chown "${APP_USER}:${APP_USER}" "${DEPLOY_META_FILE}"
-chmod 600 "${DEPLOY_META_FILE}"
+# PUBLISHED, NOT TRUNCATED-THEN-FILLED (o3d-czpy). ${APP_DIR} belongs to ${APP_USER} by the time an
+# upgrade reaches this line, so `cat >` followed by a `chown` and a `chmod 600` was three root-side
+# operations on a name they can turn into a symlink — the same shape as the `.env` write, over the
+# file update.sh reads GIT_REPO_URL out of. publish_durable_file() stages it in a root-owned 0700
+# directory, applies the owner and the mode there, and renames; rename replaces a symlink entry
+# instead of following it.
+{
+  echo "INSTALL_FROM_GIT=${INSTALL_FROM_GIT}"
+  echo "GIT_REPO_URL=${GIT_REPO_URL:-}"
+  echo "GIT_BRANCH=${GIT_BRANCH:-}"
+  echo "GIT_DEPLOY_KEY_ENABLED=${GIT_DEPLOY_KEY_ENABLED:-n}"
+} | publish_durable_file "${DEPLOY_META_FILE}" "${APP_USER}:${APP_USER}" 600 || die \
+  "${DEPLOY_META_FILE} could not be written. Nothing has been stopped and nothing has been migrated; the file at that path is whatever the previous run left there, complete and unchanged — it is published by rename."
 
 # ---------------------------------------------------------------------------
 # 10. Write .env file
