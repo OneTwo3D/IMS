@@ -53,11 +53,13 @@ import {
   zeroPaidIsProvenReversal,
   type LedgerReadFence,
   type PaymentReversalReading,
+  unregisteredLocalReceipts,
   type RegisteredPaymentRow,
   type RegisteredPaymentVerdict,
   type XeroInvoice,
   type XeroInvoicesResponse,
 } from './invoice-delta'
+import { payloadPaymentId } from '@/lib/domain/accounting/invoice-payment-enqueue'
 import type { ActivityEntityType } from '@/app/generated/prisma/client'
 
 /** A Xero reversal can only ever speak about rows Xero itself issued. */
@@ -221,6 +223,14 @@ function registrationText(verdict: RegisteredPaymentVerdict, reason: WithheldAmo
       return ` ${verdict.entryIds.length} payment registration(s) (${verdict.entryIds.join(', ')}) had not `
         + `finished when this Xero read was taken, so the read cannot say whether the payment they created `
         + `is still there.`
+    // o3d-psrx: the state that produced the defect. Named as what it is — IMS's own silence — because
+    // "no registration" and "a registration not raised yet" were the same sentence before this.
+    case 'RECEIPT_NOT_REGISTERED':
+      return ` IMS has recorded ${verdict.paymentIds.length} receipt(s) (${verdict.paymentIds.join(', ')}) `
+        + `against this document that it has NOT registered with the accounting connector, so the shortfall `
+        + `the ledger shows is IMS's own silence rather than evidence of a removal. If the registration is `
+        + `still on its way IMS will decide this by itself on a later poll; if it was refused, the warning `
+        + `that refused it says why and the receipt has to be registered by hand.`
     case 'GONE':
       return ''
   }
@@ -383,9 +393,14 @@ async function readResidualVerdicts<T extends { id: string; accountingInvoiceId:
     select: {
       id: true, referenceId: true, status: true, externalTransactionId: true,
       syncedAt: true, syncedAtDatabaseClock: true,
+      // o3d-psrx: the receipt this registration NAMES, so a local receipt no registration names can
+      // be told from one that is already spoken for. Read through the same `payloadPaymentId` the
+      // enqueue writes it with, never re-spelt here.
+      payload: true,
     },
   })
   const byDocument = new Map<string, RegisteredPaymentRow[]>()
+  const receiptsNamedByDocument = new Map<string, { status: string; paymentId: string | null }[]>()
   for (const row of rows) {
     const list = byDocument.get(row.referenceId) ?? []
     list.push({
@@ -396,12 +411,48 @@ async function readResidualVerdicts<T extends { id: string; accountingInvoiceId:
       syncedAtDatabaseClock: row.syncedAtDatabaseClock,
     })
     byDocument.set(row.referenceId, list)
+    const named = receiptsNamedByDocument.get(row.referenceId) ?? []
+    named.push({ status: row.status, paymentId: payloadPaymentId(row.payload) })
+    receiptsNamedByDocument.set(row.referenceId, named)
+  }
+
+  // o3d-psrx — THE RECEIPTS THEMSELVES, read AFTER the registrations.
+  //
+  // Order is deliberate and it is the safe one. `addPayment` commits the receipt and `paidAt`
+  // together and queues the registration afterwards, so reading receipts LAST can only ever find
+  // MORE of them than the registration read accounted for — which withholds. Reading them first
+  // could miss a receipt whose registration then appeared, and the answer that produces is a
+  // reversal admitted over a receipt this poll never saw.
+  //
+  // Sales only: a bill has no local receipt rows, and its half of this defect was closed at source
+  // by markBillPaid queueing the registration inside the paid transaction (o3d-a3wx).
+  const receiptsByDocument = new Map<string, string[]>()
+  if (referenceType === 'SalesOrder') {
+    const payments = await db.payment.findMany({
+      // `refundId: null` — a refund receipt settles a credit note, not the invoice this poll is
+      // reading, so it neither owes an INVOICE_PAYMENT nor bears on the invoice's residual.
+      where: { orderId: { in: docs.map((d) => d.id) }, refundId: null },
+      select: { id: true, orderId: true },
+    })
+    for (const payment of payments) {
+      const list = receiptsByDocument.get(payment.orderId) ?? []
+      list.push(payment.id)
+      receiptsByDocument.set(payment.orderId, list)
+    }
   }
 
   for (const doc of docs) {
     const invoice = doc.accountingInvoiceId ? candidateInvoices.get(doc.accountingInvoiceId) : undefined
     if (!invoice) continue
-    const verdict = classifyRegisteredPayment(invoice, byDocument.get(doc.id) ?? [], ledgerObservedBefore)
+    const verdict = classifyRegisteredPayment(
+      invoice,
+      byDocument.get(doc.id) ?? [],
+      ledgerObservedBefore,
+      unregisteredLocalReceipts(
+        receiptsByDocument.get(doc.id) ?? [],
+        receiptsNamedByDocument.get(doc.id) ?? [],
+      ),
+    )
 
     if (zeroPaidInvoiceIds.has(invoice.InvoiceID)) {
       if (zeroPaidIsProvenReversal(verdict)) {
@@ -512,7 +563,25 @@ async function signalWithheldBillReversals(
   }
 }
 
-function salesWithheldDescription(ref: string, invoice: XeroInvoice, reason: WithheldAmountReason): string {
+function salesWithheldDescription(
+  ref: string,
+  invoice: XeroInvoice,
+  reason: WithheldAmountReason,
+  verdict: RegisteredPaymentVerdict,
+): string {
+  // o3d-psrx: the zero-paid sentence below asserts that IMS HOLDS A REGISTRATION this read cannot
+  // speak for. On this verdict it holds no registration at all, and stating one sends an operator
+  // looking on /sync for a row that was never raised. Said separately rather than patched with a
+  // clause, because the remedy is different too: nothing will arrive on its own if the registration
+  // was refused.
+  if (verdict.verdict === 'RECEIPT_NOT_REGISTERED') {
+    return `Invoice for order ${ref} is ${invoice.Status} in Xero showing `
+      + `${ledgerAmountText(invoice.AmountPaid)} paid, which normally means a payment was removed. `
+      + `paidAt was LEFT SET and NO chargeback credit note was raised: IMS has recorded a receipt `
+      + `against this order that it has never registered with Xero, so the ledger is short by a `
+      + `payment IMS never sent rather than by one that was taken away. Unwinding revenue here would `
+      + `raise a credit note against a sale nobody charged back.`
+  }
   switch (reason) {
     case 'part-payment':
       return `Invoice for order ${ref} is ${invoice.Status} in Xero (not fully paid), but the ledger still `
@@ -547,7 +616,7 @@ async function signalWithheldSalesReversals(
     const ref = order.orderNumber ?? order.externalOrderNumber ?? order.id
     result.salesReversalsWithheld++
     mode.observe?.(withheldEntityKey('SALES_ORDER', order.id))
-    const description = salesWithheldDescription(ref, invoice, reason) + registrationText(verdict, reason)
+    const description = salesWithheldDescription(ref, invoice, reason, verdict) + registrationText(verdict, reason)
 
     await signalWithheldReversal({
       label: `order ${ref}`,

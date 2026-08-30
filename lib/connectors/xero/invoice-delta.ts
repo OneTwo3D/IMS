@@ -1189,6 +1189,15 @@ export type RegisteredPaymentVerdict =
   | { verdict: 'STILL_HELD'; paymentIds: string[] }
   /** IMS never told the ledger about a payment, so it holds no opinion about the residual one. */
   | { verdict: 'NOTHING_REGISTERED' }
+  /**
+   * o3d-psrx — IMS HOLDS A RECEIPT IT HAS NOT TOLD THE LEDGER ABOUT.
+   *
+   * The local `Payment` rows named here have no INVOICE_PAYMENT registration of any status. That is
+   * not "nothing was registered": it is "the registration has not been raised YET", and the two are
+   * the same state to a reader that only looks at sync rows — which is exactly the window this
+   * verdict exists for. See `unregisteredLocalReceipts`.
+   */
+  | { verdict: 'RECEIPT_NOT_REGISTERED'; paymentIds: string[] }
   /** The payload did not enumerate the payments, so absence cannot be established from it. */
   | { verdict: 'LEDGER_DID_NOT_LIST_PAYMENTS' }
   /** A registration exists whose effect on the ledger this read cannot speak for. */
@@ -1221,6 +1230,12 @@ export function classifyRegisteredPayment(
   invoice: XeroInvoice,
   registrations: RegisteredPaymentRow[],
   ledgerObservedBefore: LedgerReadFence | null,
+  /**
+   * o3d-psrx — the local receipts on this document that NO registration names, from
+   * {@link unregisteredLocalReceipts}. Defaulted to none so every existing caller and test keeps its
+   * exact previous meaning; the sales pass is the one that supplies it. See the verdict's own note.
+   */
+  unregisteredReceiptIds: readonly string[] = [],
 ): RegisteredPaymentVerdict {
   const undecided: string[] = []
   const posted: string[] = []
@@ -1259,6 +1274,18 @@ export function classifyRegisteredPayment(
   }
 
   if (undecided.length > 0) return { verdict: 'REGISTRATION_UNDECIDED', entryIds: undecided }
+
+  // o3d-psrx — ASKED BEFORE ANYTHING IS CONCLUDED FROM THE LEDGER'S LIST, and it dominates every
+  // answer below including GONE.
+  //
+  // A receipt IMS has recorded and not registered means the ledger's account of this document is not
+  // an account of what IMS believes was paid — the shortfall is IMS's own doing, not a removal. That
+  // is true whether the ledger shows zero, a part payment, or no figure at all, so the check sits
+  // above the split rather than inside the zero-paid arm.
+  if (unregisteredReceiptIds.length > 0) {
+    return { verdict: 'RECEIPT_NOT_REGISTERED', paymentIds: [...unregisteredReceiptIds] }
+  }
+
   if (posted.length === 0) return { verdict: 'NOTHING_REGISTERED' }
 
   const listed = listedLedgerPaymentIds(invoice)
@@ -1321,6 +1348,55 @@ export function zeroPaidIsProvenReversal(verdict: RegisteredPaymentVerdict): boo
       return true
     case 'REGISTRATION_UNDECIDED':
     case 'STILL_HELD':
+    // o3d-psrx: IMS recorded a receipt and has not told the ledger about it, so the ledger's zero is
+    // IMS's own silence rather than a removal. WITHHELD, on the same asymmetry as every other arm
+    // here: a wrongly withheld reversal is a warning a human clears in a minute, a wrongly admitted
+    // one raises a chargeback credit note against revenue nobody took back.
+    case 'RECEIPT_NOT_REGISTERED':
       return false
   }
+}
+
+/**
+ * o3d-psrx — WHICH OF THIS DOCUMENT'S LOCAL RECEIPTS THE LEDGER HAS NEVER BEEN TOLD ABOUT.
+ *
+ * THE DEFECT. `addPayment` writes the `Payment` row and the order's `paidAt` in ONE transaction and
+ * queues the INVOICE_PAYMENT registration AFTERWARDS, outside it — with a `revalidatePath` and an
+ * awaited `logActivity` in between. A poll landing in that window sees an order IMS holds as paid,
+ * finds no registration for it, and reads that as NOTHING_REGISTERED: "IMS never told the ledger
+ * about a payment here, so the zero is the whole story". It is not the whole story. The registration
+ * has not been raised yet. `paidAt` is cleared, the reversal pass raises a chargeback credit note
+ * against revenue nobody reversed, and Mark Paid re-arms. That is the same double-payment class
+ * o3d-clxw closed for bills, reached by a different route.
+ *
+ * markBillPaid's answer — queue the registration inside the transaction — does not transfer. Marking
+ * a bill paid is an INSTRUCTION, so rolling it back when the queue declines is honest; recording a
+ * customer receipt is a FACT, and `registerInvoicePaymentWithLedger` says in its own header that it
+ * must never fail the receipt the operator just recorded.
+ *
+ * SO THE WITNESS IS THE RECEIPT ITSELF, AND IT IS ALREADY WRITTEN IN THE RIGHT TRANSACTION. The
+ * `Payment` row and `paidAt` commit together, so there is NO instant at which a reader can see the
+ * paid flag and not the receipt that produced it. Nothing new has to be made durable — the defect
+ * was that nobody read it. What this adds is the reader.
+ *
+ * PAIRED BY `paymentId`, which is the id `registerInvoicePaymentWithLedger` puts in the registration
+ * payload (`payloadPaymentId`) and the same field `findRegisteredPaymentsForReceipt` matches on. A
+ * registration whose payload records no `paymentId` — a row from before the field existed, or one
+ * raised by the SALES_INVOICE follow-up for an imported order — names no receipt and so clears none;
+ * that is the conservative direction and it is deliberate.
+ *
+ * CANCELLED REGISTRATIONS DO NOT COUNT AS TELLING THE LEDGER. A retired row asserts nothing was
+ * sent, which leaves the receipt exactly as unregistered as it was before the row existed.
+ */
+export function unregisteredLocalReceipts(
+  receiptIds: readonly string[],
+  registrations: readonly { status: string; paymentId: string | null }[],
+): string[] {
+  const named = new Set(
+    registrations
+      .filter((row) => row.status !== 'CANCELLED')
+      .map((row) => row.paymentId)
+      .filter((id): id is string => typeof id === 'string' && id.length > 0),
+  )
+  return receiptIds.filter((id) => !named.has(id))
 }

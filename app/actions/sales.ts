@@ -3445,6 +3445,21 @@ export async function addPayment(input: {
         select: { id: true, paidAt: true },
       })
 
+      // o3d-psrx — THE RECEIPT AND `paidAt` COMMIT TOGETHER, AND SOMETHING NOW DEPENDS ON THAT.
+      //
+      // The ledger registration is queued AFTER this transaction commits
+      // (`registerInvoicePaymentWithLedger` below), because a receipt is a FACT an operator recorded
+      // and must never be rolled back by a queue that declines — the opposite of `markBillPaid`,
+      // where the paid transition is an INSTRUCTION and rolling it back is the honest answer
+      // (o3d-a3wx). So there IS a window in which IMS holds this order as paid with no registration
+      // raised, and the payment poller used to read that as "IMS never told the ledger about a
+      // payment here", clear `paidAt`, and raise a chargeback credit note against a sale nobody
+      // reversed.
+      //
+      // The witness that closes it is the `Payment` row this transaction has already written: there
+      // is no instant at which a reader can see `paidAt` set and not see the receipt that set it.
+      // `unregisteredLocalReceipts` in lib/connectors/xero/invoice-delta.ts is that reader. SPLITTING
+      // these two writes across transactions — in either order — reopens the defect.
       const becamePaid = !refundId && !so.paidAt && totalPaid + input.amount >= Number(so.totalForeign) - 0.0001
       if (becamePaid) {
         await tx.salesOrder.update({ where: { id: input.orderId }, data: { paidAt: new Date() } })
