@@ -35,10 +35,21 @@
  *      repaired' fails: the 0-mode descendant defeats `rmSync` and the whole private root survives.
  *   8. restore the sentinel's blanket `catch { return }` around `readdirSync(own)` -> 'an
  *      unreadable root fails the run' fails: the run exits 0 having reported nothing.
+ *   9. put the sentinel's `settle()` back after the emit call instead of in a `finally` -> 'a leak
+ *      is still swept when an exit listener throws' fails: the throw carries past the sweep, so
+ *      nothing is reported and the private root is still there afterwards.
+ *  10. restore `if (environment.TMPDIR !== undefined && environment.TMPDIR !== '') return argument`
+ *      -> 'a child given a TMPDIR outside the private root cannot escape' fails: the child's
+ *      directory is made in the system /tmp, is never reported and is never removed. Make the
+ *      redirect unconditional instead and the same test fails from the other side, on the
+ *      contained child resolving the private root rather than the directory it was handed.
+ *  11. restore the pathname repair — `if (entry.isDirectory()) chmodSync(join(path, entry.name),
+ *      0o700)` -> 'the repair does not follow a symlink swapped in after the type check' fails:
+ *      the victim directory outside the private root comes back 0700 (10 of 10 runs measured).
  */
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { existsSync, readFileSync, readdirSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -50,6 +61,9 @@ const CLEAN = 'cleans-up-its-temp-dir.fixture.ts'
 const ENV_LEAKY = 'leaks-from-a-replacement-environment.fixture.ts'
 const LOCKED = 'leaves-an-unreadable-directory.fixture.ts'
 const HIDDEN_ROOT = 'hides-its-temp-root.fixture.ts'
+const EXIT_THROW = 'throws-from-an-exit-listener.fixture.ts'
+const EXTERNAL = 'escapes-an-external-tmpdir.fixture.ts'
+const SWAP = 'swaps-a-symlink-under-the-repair.fixture.ts'
 
 /**
  * ROOT READS AND REMOVES REGARDLESS OF MODE, so the two mode-based fixtures below cannot be built
@@ -60,6 +74,21 @@ const AS_ROOT = process.getuid?.() === 0
 const MODES_ARE_INERT =
   'running as uid 0: a 0-mode directory is still readable and removable, so the failure this ' +
   'measures cannot be produced on this host'
+
+/**
+ * The repair re-permissions through PINNED DESCRIPTORS, which is `O_PATH` plus `/proc/self/fd` and
+ * therefore Linux's. Elsewhere the sentinel repairs nothing and reports the removal failure, which
+ * is the fail-closed direction but not what these two measure — so they say so instead of failing.
+ */
+const PINS = process.platform === 'linux'
+const NO_PINNING =
+  'the descriptor-pinned repair needs O_PATH and /proc/self/fd, which this platform does not have'
+const NEEDS_REPAIR = AS_ROOT ? MODES_ARE_INERT : PINS ? false : NO_PINNING
+
+/** A synchronous pause, in a file whose measurements are all of synchronous child processes. */
+const pause = (ms: number): void => {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+}
 
 /**
  * Duplicated from the fixture rather than imported, deliberately: importing it would REGISTER the
@@ -76,12 +105,12 @@ interface Run {
 }
 
 /** The real runner, the real sentinel, one fixture, from the repository root. */
-function runFixture(fixture: string): Run {
+function runFixture(fixture: string, extra: Record<string, string> = {}): Run {
   // NODE_TEST_CONTEXT is set in every process the test runner spawns, and a runner that sees it
   // refuses to run files ("run() is being called recursively") — which would leave the child
   // silent and every assertion below measuring an empty string. Dropping it is what makes the
   // child a real, independent run.
-  const env = { ...process.env }
+  const env = { ...process.env, ...extra }
   delete env.NODE_TEST_CONTEXT
 
   const result = spawnSync(
@@ -253,7 +282,7 @@ test('a child given a replacement environment cannot escape the private /tmp', (
  * handling. The fixture abandons a two-level 0-mode tree; the sentinel must repair the modes it
  * owns, retry, and leave nothing.
  */
-test('an unremovable leftover is repaired and removed, not swallowed', { skip: AS_ROOT ? MODES_ARE_INERT : false }, () => {
+test('an unremovable leftover is repaired and removed, not swallowed', { skip: NEEDS_REPAIR }, () => {
   const fixture = withoutComments(readFileSync(join(FIXTURES, LOCKED), 'utf8'))
   assert.match(fixture, /chmodSync\([^)]*0o000\)/, `${LOCKED} must leave something untraversable`)
   assert.ok(!/\brmSync\b|\brm\(/.test(fixture), `${LOCKED} must not clean up — that is the defect it reproduces`)
@@ -298,7 +327,7 @@ test('an unremovable leftover is repaired and removed, not swallowed', { skip: A
  * may mean "already removed"; anything else is named and fails the run, after the modes this uid
  * owns have been repaired so the removal can still happen.
  */
-test('an unreadable root fails the run rather than reporting it clean', { skip: AS_ROOT ? MODES_ARE_INERT : false }, () => {
+test('an unreadable root fails the run rather than reporting it clean', { skip: NEEDS_REPAIR }, () => {
   const fixture = withoutComments(readFileSync(join(FIXTURES, HIDDEN_ROOT), 'utf8'))
   assert.match(fixture, /chmodSync\(root, 0o000\)/, `${HIDDEN_ROOT} must make the sentinel's own root unreadable`)
   assert.match(fixture, /process\.on\('exit'/, 'and must do it at exit, or it breaks the run instead of the guard')
@@ -331,4 +360,213 @@ test('an unreadable root fails the run rather than reporting it clean', { skip: 
     .filter((entry) => !before.has(entry) && !toolchain.test(entry))
     .sort()
   assert.deepEqual(survivors, [], `the unreadable root outlived the run — ${survivors.join(', ')}`)
+})
+
+/**
+ * A THROWING EXIT LISTENER MUST NOT SKIP THE SWEEP (Codex MEDIUM).
+ *
+ * The sweep runs from a wrapper around `process.emit('exit')` so that it is strictly last. Written
+ * as a sequence — emit, then sweep — that only held when every listener RETURNED: EventEmitter
+ * stops delivering the moment one throws, and the throw carried out of the wrapper past the sweep.
+ * A process dying badly is exactly when residue is likeliest, so the guard did nothing in the case
+ * that needed it most, and the accumulation came back one private root per failing run. The sweep
+ * is now in a `finally`, which is what this measures: a real process, a real leak, a real throw.
+ */
+test('a leak is still swept when an exit listener throws', () => {
+  const fixture = withoutComments(readFileSync(join(FIXTURES, EXIT_THROW), 'utf8'))
+  assert.match(
+    fixture,
+    /process\.on\('exit',\s*\(\)\s*=>\s*\{\s*throw/,
+    `${EXIT_THROW} must throw from an exit listener — that is the whole mechanism under test`,
+  )
+  assert.ok(!/\brmSync\b|\brm\(/.test(fixture), `${EXIT_THROW} must not clean up — that is the defect it reproduces`)
+
+  const before = new Set(readdirSync(tmpdir()))
+  const run = runFixture(EXIT_THROW)
+
+  // THE THROW REALLY HAPPENED. Without this the test would pass just as well against a fixture
+  // whose listener had quietly stopped throwing, which is the vacuous version of it.
+  assert.match(
+    run.output,
+    /ims-fixture-exit-listener-exploded/,
+    `the exit listener must actually throw:\n${run.output}`,
+  )
+  assert.match(
+    run.output,
+    /^ok \d+ - the assertion itself passes; only the directory is wrong, and the exit is loud$/m,
+    `and the fixture's own assertion must pass, so the leak is the only defect:\n${run.output}`,
+  )
+
+  // AND THE SWEEP STILL RAN, both halves of it. Reported…
+  assert.notEqual(run.status, 0, `an abandoned directory must fail the run:\n${run.output}`)
+  assert.match(run.output, /temp-dir leak: 1 entry survived/, `and said so:\n${run.output}`)
+  assert.match(run.output, /\bims-fixture-exitthrow-/, `and named it:\n${run.output}`)
+
+  // …and REMOVED, which is the half the accumulation actually depends on.
+  const announced = /EXITTHROW_AT=(\S+)/.exec(run.output)?.[1]
+  assert.ok(announced !== undefined, `the fixture must announce what it abandoned:\n${run.output}`)
+  assert.ok(!existsSync(announced), `the sentinel must have removed it, but ${announced} is still there`)
+
+  const toolchain = /^(?:tsx-\d+|node-compile-cache)$/
+  const survivors = readdirSync(tmpdir())
+    .filter((entry) => !before.has(entry) && !toolchain.test(entry))
+    .sort()
+  assert.deepEqual(
+    survivors,
+    [],
+    `a run that died on the way out left its private root behind — ${survivors.join(', ')}`,
+  )
+})
+
+/**
+ * AN EXPLICIT TMPDIR IS NOT A LICENCE TO LEAVE THE PRIVATE ROOT (Codex MEDIUM).
+ *
+ * The redirect exempted any child whose environment already named a TMPDIR, on the reasoning that
+ * setting one is a deliberate act. The reasoning was about ONE harness, which points children at a
+ * directory inside its own scratch root; the implementation exempted EVERY value, `/tmp` included —
+ * so the escape the redirect exists to close was available to anything that wrote it down. What
+ * earns the exemption is containment, not presence, and both directions are measured here in one
+ * process: an external value must be replaced, and a contained value must survive untouched.
+ */
+test('a child given a TMPDIR outside the private root cannot escape, and a contained one is left alone', () => {
+  const fixture = withoutComments(readFileSync(join(FIXTURES, EXTERNAL), 'utf8'))
+  assert.match(fixture, /TMPDIR:\s*'\/tmp'/, `${EXTERNAL} must hand a child an EXTERNAL TMPDIR`)
+  assert.match(fixture, /TMPDIR:\s*scratch/, `${EXTERNAL} must also hand one a CONTAINED TMPDIR`)
+
+  const before = new Set(readdirSync(tmpdir()))
+  const systemBefore = new Set(readdirSync('/tmp'))
+  const run = runFixture(EXTERNAL)
+
+  assert.match(
+    run.output,
+    /^ok \d+ - the assertion itself passes; only the child's directory is wrong$/m,
+    `the fixture's own assertions must pass:\n${run.output}`,
+  )
+  assert.ok(!/ERR_ASSERTION/.test(run.output), `nothing in the fixture may throw:\n${run.output}`)
+
+  // THE CONTAINED CASE IS UNTOUCHED. A redirect applied to everything would pass every assertion
+  // below and break the one harness this exemption exists for, so it is measured first: the child
+  // resolved exactly the directory it was given, not the private root.
+  const asked = /CONTAINED_ASKED=(\S+)/.exec(run.output)?.[1]
+  const resolved = /CONTAINED_RESOLVED=(\S+)/.exec(run.output)?.[1]
+  assert.ok(asked !== undefined && resolved !== undefined, `both children must announce:\n${run.output}`)
+  assert.equal(
+    resolved,
+    asked,
+    'a TMPDIR already inside the private root is a deliberate choice with assertions resting on ' +
+      'it, and must be passed through exactly as given',
+  )
+
+  // THE EXTERNAL CASE IS CONTAINED. Without the containment test this reads /tmp/ims-fixture-outside-…
+  const escaped = /OUTSIDE_AT=(\S+)/.exec(run.output)?.[1]
+  assert.ok(escaped !== undefined, `the escaping child must announce what it made:\n${run.output}`)
+  assert.match(
+    escaped,
+    /\/ims-unit-[^/]+\//,
+    `a child pointed at an external TMPDIR must still land inside a sentinel root, not ${escaped}`,
+  )
+
+  // SEEN, SAID, AND GONE.
+  assert.notEqual(run.status, 0, `and the leak must fail the run:\n${run.output}`)
+  assert.match(run.output, /temp-dir leak: 1 entry survived/, `and be reported:\n${run.output}`)
+  assert.match(run.output, /\bims-fixture-outside-/, `and named:\n${run.output}`)
+  assert.ok(!existsSync(escaped), `the sentinel must have removed it, but ${escaped} is still there`)
+
+  const toolchain = /^(?:tsx-\d+|node-compile-cache)$/
+  const survivors = readdirSync(tmpdir())
+    .filter((entry) => !before.has(entry) && !toolchain.test(entry))
+    .sort()
+  assert.deepEqual(survivors, [], `and nothing outlived the run — ${survivors.join(', ')} did`)
+
+  // AND NOTHING REACHED THE REAL /tmp, which is where the un-contained value pointed. Named by
+  // prefix rather than by "no new entry", because /tmp is shared with the rest of the machine.
+  const escapedToSystem = readdirSync('/tmp')
+    .filter((entry) => !systemBefore.has(entry) && entry.startsWith('ims-fixture-outside-'))
+    .sort()
+  assert.deepEqual(
+    escapedToSystem,
+    [],
+    `the child's directory reached the system /tmp — ${escapedToSystem.join(', ')}`,
+  )
+})
+
+/**
+ * THE REPAIR MUST NOT FOLLOW A LINK PUT THERE AFTER THE TYPE CHECK (Codex MEDIUM).
+ *
+ * The repair walk read `if (entry.isDirectory()) chmodSync(join(path, entry.name), 0o700)`, and
+ * `readdirSync` snapshots every name and type in a single call while the chmods that follow are
+ * separate lookups made one at a time afterwards. The header's claim that the walk never follows a
+ * link was therefore true of the check and false of the operation: anything able to write in the
+ * directory in between — and the sentinel deliberately makes its root 1777 — could replace a
+ * reported directory with a symlink and have the repair chmod an arbitrary same-uid target to
+ * 0700, as whatever uid runs the tests, which in CI is root.
+ *
+ * WHAT THIS TEST IS HONEST ABOUT. The race is built, not argued: a detached process rewrites 64
+ * names for the whole of the sweep, and the victim directory outside the private root is created
+ * 0755 and must still be 0755 afterwards. It is a window, so a single run of the OLD code is not
+ * guaranteed to hit it — measured while writing this, restoring the pathname chmod turned the
+ * victim to 0700 in 10 of 10 runs. Under the descriptor repair it cannot hit at all rather than
+ * usually not hitting: the walk opens every directory with `O_DIRECTORY | O_NOFOLLOW`, which IS
+ * the type check, and changes the mode of the inode that descriptor holds rather than of a name
+ * looked up again afterwards.
+ *
+ * Removal completeness is deliberately not asserted here — a process actively recreating entries
+ * can defeat any removal, and that half is measured by the unremovable-leftover test above. This
+ * one measures where the writes landed.
+ */
+test('the repair does not follow a symlink swapped in after the type check', { skip: NEEDS_REPAIR }, () => {
+  const fixture = withoutComments(readFileSync(join(FIXTURES, SWAP), 'utf8'))
+  assert.match(fixture, /symlinkSync\(victim, name\)/, `${SWAP} must swap symlinks in during the sweep`)
+  assert.match(fixture, /chmodSync\(join\(abandoned, 'blocked'\), 0o000\)/, `${SWAP} must force the repair to run`)
+  assert.ok(!/\brmSync\b/.test(fixture), `${SWAP} must not clean up — that is the defect it reproduces`)
+
+  // OUTSIDE THE CHILD'S PRIVATE ROOT, which is what makes a chmod on it an escape: the child makes
+  // its own `ims-unit-…` root under this process's tmpdir, and this arena is that root's sibling.
+  const arena = mkdtempSync(join(tmpdir(), 'ims-swaprace-'))
+  const victim = join(arena, 'victim')
+  const done = join(arena, 'done')
+  mkdirSync(victim)
+  chmodSync(victim, 0o755)
+
+  const before = new Set(readdirSync(tmpdir()))
+  try {
+    const run = runFixture(SWAP, { IMS_SWAP_VICTIM: victim, IMS_SWAP_DONE: done })
+
+    assert.match(
+      run.output,
+      /^ok \d+ - the assertion itself passes; only the abandoned tree is being rewritten$/m,
+      `the fixture's own assertion must pass:\n${run.output}`,
+    )
+    assert.ok(!/ERR_ASSERTION/.test(run.output), `nothing in the fixture may throw:\n${run.output}`)
+
+    // THE PRECONDITION, asserted rather than assumed: the repair only runs when a removal fails,
+    // so a run that reported no leftovers never walked anything and would pass vacuously.
+    assert.notEqual(run.status, 0, `the abandoned tree must fail the run:\n${run.output}`)
+    assert.match(run.output, /temp-dir leak: 1 entry survived/, `and be reported:\n${run.output}`)
+    assert.match(run.output, /\bims-fixture-swap-/, `and named:\n${run.output}`)
+
+    // Let the swapper finish before measuring, so the mode read below is a settled one and the
+    // cleanup underneath cannot race a process still putting directories back.
+    for (let waited = 0; waited < 300 && !existsSync(done); waited += 1) pause(50)
+    assert.ok(existsSync(done), 'the swapper must have finished, or nothing here was concurrent')
+
+    // THE MEASUREMENT. Nothing in the sweep may write outside the root it owns.
+    assert.equal(
+      (statSync(victim).mode & 0o777).toString(8),
+      '755',
+      `the repair followed a symlink out of the private root and re-permissioned ${victim}`,
+    )
+  } finally {
+    // Whatever the sweep could not remove while it was being rewritten is this test's to clear —
+    // otherwise the sentinel watching THIS process would report it, correctly, as a leak.
+    const toolchain = /^(?:tsx-\d+|node-compile-cache)$/
+    for (const entry of readdirSync(tmpdir())) {
+      if (before.has(entry) || toolchain.test(entry)) continue
+      const path = join(tmpdir(), entry)
+      spawnSync('chmod', ['-R', 'u+rwX', path])
+      rmSync(path, { recursive: true, force: true })
+    }
+    spawnSync('chmod', ['-R', 'u+rwX', arena])
+    rmSync(arena, { recursive: true, force: true })
+  }
 })
