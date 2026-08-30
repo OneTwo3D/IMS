@@ -3682,3 +3682,182 @@ test('[o3d-batch-ret] no cutover fence, adoption or restore path still skips on 
   assert.match(CRONTAB_LOCK_LIB_SRC, /if ! command -v crontab >\/dev\/null 2>&1; then/,
     'require_crontab_command / read_crontab_for must still be the place the question is asked')
 })
+
+// ---------------------------------------------------------------------------
+// Codex r29 HIGH #3 — AN UNCLOSED MARKER MUST NOT HIDE OPERATOR LINES FROM THE LOSS CHECK
+//
+// The backup parser set `b_block` at a START and cleared it only at an END, so for a marker with no
+// END every later line was excluded as managed. Codex reproduced it: a backup with an unclosed OTI
+// marker followed by `17 3 * * * /usr/local/bin/operator-only`, that entry removed from the live
+// projection, `plan_crontab_unfence` returning PLAN=merge with the entry gone — and the caller then
+// installs the merge and DELETES the backup that held the only copy.
+//
+// That failure mode aligns exactly with the case these recovery paths exist for: a half-written
+// fence is how an unclosed marker gets into a crontab in the first place.
+//
+// THE SEMANTICS CHOSEN. An unclosed START does not mean "everything after this is managed". It
+// means THE EXTENT OF THE BLOCK IS UNKNOWN, and unknown extent is not a licence to claim territory.
+// Within [START .. next START / EOF) only the marker, a stray END and lines POSITIVELY identified
+// as our own generated output are managed; everything else stays an operator line. That is the rule
+// lib/crontab-sync.ts already applies when it STRIPS blocks, which is what makes the two directions
+// agree: a line the application would preserve is a line whose disappearance this refuses to call
+// lossless.
+//
+// WHAT THESE PIN, and the route each takes:
+//   1. LOAD-BEARING. An operator line after an unclosed START is visible to the loss check, and the
+//      unfence REFUSES rather than merging it away
+//                                (plan_crontab_unfence -> crontab_unmanaged_lines_missing_from)
+//   2. the rule is bounded, not inverted: our OWN remnants after an unclosed START are still
+//      managed, so an ordinary reconciliation still merges
+//   3. the shell rule and the application's stripper agree on the same crontab
+//                                (crontab_unmanaged_lines_missing_from vs stripOtiBlocks)
+//   4. MUTATION. The pre-fix parser merges, omits the entry, and reports the merge as lossless
+// ---------------------------------------------------------------------------
+
+const UNCLOSED_OPERATOR_LINE = '17 3 * * * /usr/local/bin/operator-only'
+/** The generated job line, with the exact signature the builder emits — our own remnant. */
+const GENERATED_JOB = '0 2 * * * curl -s -H "Authorization: Bearer $CRON_SECRET" "$BASE_URL/api/cron/backup"'
+/** A backup whose managed block was never closed, with the operator's own entry below it. */
+const UNCLOSED_BACKUP = ['# --- OTI CRON START ---', GENERATED_JOB, UNCLOSED_OPERATOR_LINE].join('\n')
+
+function missingFrom(backup: string, candidate: string, lib = CRONTAB_LOCK_LIB) {
+  return sh([
+    'set -uo pipefail',
+    'die(){ exit 1; }',
+    `source '${lib}'`,
+    `backup=$(cat <<'B_EOF'\n${backup}\nB_EOF\n)`,
+    `candidate=$(cat <<'C_EOF'\n${candidate}\nC_EOF\n)`,
+    'echo "MISSING<<"',
+    'crontab_unmanaged_lines_missing_from "$backup" "$candidate"',
+    'echo ">>END"',
+  ].join('\n'))
+}
+
+test('[o3d-batch-ret] an operator line below an UNCLOSED managed block is still visible to the loss check', async () => {
+  // A candidate that replaced the managed block properly and, in doing so, lost the operator entry
+  // that was sitting inside the region the old parser called managed.
+  const candidate = ['# --- OTI CRON START ---', GENERATED_JOB, '# --- OTI CRON END ---'].join('\n')
+
+  // CONTROL, FIRST. The same operator line kept: nothing is missing. Without this the refusal below
+  // could be a check that reports every line of every backup.
+  const kept = await missingFrom(UNCLOSED_BACKUP, `${candidate}\n${UNCLOSED_OPERATOR_LINE}`)
+  assert.match(kept.stdout, /MISSING<<\n>>END/,
+    `an operator line still present must not be reported lost:\n${kept.stdout}${kept.stderr}`)
+
+  // THE PROPERTY. It is gone, and the check must see it.
+  const lost = await missingFrom(UNCLOSED_BACKUP, candidate)
+  assert.match(lost.stdout, new RegExp(`MISSING<<\\n${UNCLOSED_OPERATOR_LINE.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\n>>END`),
+    `THE FINDING: an unclosed START must not conceal the operator's entry:\n${lost.stdout}${lost.stderr}`)
+
+  // …and it reaches the operator through the SHIPPED plan, which is where the decision to install
+  // the merge and delete the backup is actually taken.
+  const projection = (await fenceProjectionOf(UNCLOSED_BACKUP)).replace(/\n$/, '')
+  assert.ok(projection.includes(`#DEPLOY-FENCE# ${UNCLOSED_OPERATOR_LINE}`),
+    `precondition: the fence marks the operator line:\n${projection}`)
+  const live = projection.split('\n').filter((l) => !l.includes('operator-only')).join('\n')
+    .concat('\n# --- OTI CRON END ---')
+  const planned = await sh([
+    'set -uo pipefail',
+    'die(){ exit 1; }',
+    `source '${CRONTAB_LOCK_LIB}'`,
+    `backup=$(cat <<'B_EOF'\n${UNCLOSED_BACKUP}\nB_EOF\n)`,
+    `live=$(cat <<'L_EOF'\n${live}\nL_EOF\n)`,
+    'if plan_crontab_unfence "$backup" "$live"; then echo "PLAN=${CRON_UNFENCE_PLAN}"; else echo REFUSED; fi',
+    'echo "REASON=${CRON_UNFENCE_REASON}"',
+  ].join('\n'))
+  assert.match(planned.stdout, /^REFUSED$/m,
+    `the plan must refuse rather than install a merge that drops it:\n${planned.stdout}${planned.stderr}`)
+  assert.match(planned.stdout, /operator-only/,
+    `and NAME the line, because settling this is a human job:\n${planned.stdout}`)
+})
+
+test('[o3d-batch-ret] the unclosed-block rule is BOUNDED, not inverted: our own remnants are still managed', async () => {
+  // The opposite error would be just as bad: treat nothing after an unclosed START as managed, and
+  // every ordinary reconciliation — which legitimately replaces the generated job line — starts
+  // refusing, leaving operators to settle a divergence that is not one.
+  const replaced = ['# --- OTI CRON START ---',
+    GENERATED_JOB.replace('0 2 * * *', '0 5 * * *'),
+    '# --- OTI CRON END ---',
+    UNCLOSED_OPERATOR_LINE].join('\n')
+  const run = await missingFrom(UNCLOSED_BACKUP, replaced)
+  assert.match(run.stdout, /MISSING<<\n>>END/,
+    `a rescheduled managed job is not a lost operator line:\n${run.stdout}${run.stderr}`)
+})
+
+test('[o3d-batch-ret] the shell loss check and the application stripper agree on an unclosed block', async () => {
+  // The two directions of one rule. Whatever `stripOtiBlocks` PRESERVES is what the loss check must
+  // be prepared to report as lost; a line the app throws away must not be demanded back.
+  const { stripOtiBlocks } = await crontabSync()
+  const preserved = stripOtiBlocks(UNCLOSED_BACKUP).split('\n').filter((l) => l.trim() !== '')
+  assert.deepEqual(preserved, [UNCLOSED_OPERATOR_LINE],
+    `the application keeps exactly the operator line from an unclosed block:\n${preserved.join('\n')}`)
+
+  // Ask the shell the same question by handing it an EMPTY candidate: everything it considers
+  // unmanaged in the backup comes back.
+  const everything = await missingFrom(UNCLOSED_BACKUP, '')
+  const reported = everything.stdout.replace(/^[\s\S]*MISSING<<\n/, '').replace(/>>END\n?$/, '')
+    .split('\n').filter((l) => l.trim() !== '')
+  assert.deepEqual(reported, preserved,
+    `the shell must call exactly the same lines unmanaged as the application preserves:\n`
+    + `shell: ${JSON.stringify(reported)}\napp:   ${JSON.stringify(preserved)}`)
+})
+
+test('[o3d-batch-ret] MUTATION: the pre-fix parser merges the operator line away and calls it lossless', async () => {
+  // THE ROUTE, RUN. The body as it shipped last round: one streaming pass in which `b_block` is set
+  // at a START and cleared only at an END, so an unclosed marker excludes the rest of the file.
+  const lib = join(FAULT_DIR, `crontab-lock-preround-${Date.now()}.sh`)
+  writeFileSync(lib, `${CRONTAB_LOCK_LIB_SRC}
+crontab_unmanaged_lines_missing_from() {
+  local backup="$1" candidate="$2"
+  awk '
+    function is_start(x) { return x ~ /^# --- OTI CRON START ---[ \\t\\r]*$/ }
+    function is_end(x)   { return x ~ /^# --- OTI CRON END ---[ \\t\\r]*$/ }
+    function is_blank(x) { return x ~ /^[[:space:]]*$/ }
+    NR == FNR {
+      if (is_start($0)) { c_block = 1; next }
+      if (is_end($0))   { c_block = 0; next }
+      if (c_block || is_blank($0)) next
+      cand[++m] = $0
+      next
+    }
+    {
+      if (is_start($0)) { b_block = 1; next }
+      if (is_end($0))   { b_block = 0; next }
+      if (b_block || is_blank($0)) next
+      back[++n] = $0
+    }
+    END {
+      cursor = 1
+      for (i = 1; i <= n; i++) {
+        j = cursor
+        while (j <= m && cand[j] != back[i]) j++
+        if (j <= m) { cursor = j + 1 } else { print back[i] }
+      }
+    }
+  ' <(printf '%s\\n' "\${candidate}") <(printf '%s\\n' "\${backup}")
+}
+`)
+
+  const candidate = ['# --- OTI CRON START ---', GENERATED_JOB, '# --- OTI CRON END ---'].join('\n')
+  const blind = await missingFrom(UNCLOSED_BACKUP, candidate, lib)
+  assert.match(blind.stdout, /MISSING<<\n>>END/,
+    `THE FINDING: the pre-fix parser reports nothing lost:\n${blind.stdout}${blind.stderr}`)
+
+  // …and the shipped plan built on it MERGES, installing a crontab the operator's entry is not in.
+  const projection = (await fenceProjectionOf(UNCLOSED_BACKUP)).replace(/\n$/, '')
+  const live = projection.split('\n').filter((l) => !l.includes('operator-only')).join('\n')
+    .concat('\n# --- OTI CRON END ---')
+  const planned = await sh([
+    'set -uo pipefail',
+    'die(){ exit 1; }',
+    `source '${lib}'`,
+    `backup=$(cat <<'B_EOF'\n${UNCLOSED_BACKUP}\nB_EOF\n)`,
+    `live=$(cat <<'L_EOF'\n${live}\nL_EOF\n)`,
+    'if plan_crontab_unfence "$backup" "$live"; then echo "PLAN=${CRON_UNFENCE_PLAN}"; else echo REFUSED; fi',
+    'echo "TEXT<<"; printf "%s\\n" "${CRON_UNFENCE_TEXT}"',
+  ].join('\n'))
+  assert.match(planned.stdout, /PLAN=merge/,
+    `the merge is taken:\n${planned.stdout}${planned.stderr}`)
+  assert.doesNotMatch(planned.stdout.replace(/^[\s\S]*TEXT<</, ''), /operator-only/,
+    'THE LOSS: the text about to be installed no longer holds the operator entry, and the backup is then deleted')
+})
