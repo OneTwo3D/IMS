@@ -44,8 +44,12 @@ export default async function MarginAnalyticsPage({ searchParams }: { searchPara
         { label: 'COGS', value: report.totals.cogsBase },
         { label: 'Gross profit', value: `${report.totals.grossProfitBase}${bound(report.totals.grossProfitBaseBound)}` },
         { label: 'Margin', value: `${report.totals.marginPct}%${bound(report.totals.marginPctBound)}` },
-        // Credit that reached no product row. A zero here is the claim that all of it did.
-        { label: 'Credit off-report', value: `${report.totals.refundsUnattributedBase ?? '0'} / ${report.totals.refundsOutsideReportBase ?? '0'}`, tone: 'warning' },
+        // Credit that reached no product row, ON ITS BASIS. Three amounts and not one sum: a NET
+        // and a GROSS credit differ by VAT, so a combined figure would be in no unit at all — and
+        // a negative on one basis would hide a real credit on another. A zero across all three is
+        // the claim that every credit reached a row.
+        { label: 'Credit off-report — no product (net / gross / unproven)', value: `${report.totals.refundsUnattributedNetBasis ?? '0'} / ${report.totals.refundsUnattributedGrossBasis ?? '0'} / ${report.totals.refundsUnattributedUnknownBasis ?? '0'}`, tone: 'warning' },
+        { label: 'Credit off-report — product outside report (net / gross / unproven)', value: `${report.totals.refundsOutsideReportNetBasis ?? '0'} / ${report.totals.refundsOutsideReportGrossBasis ?? '0'} / ${report.totals.refundsOutsideReportUnknownBasis ?? '0'}`, tone: 'warning' },
       ]}
       notices={report.notices}
     />

@@ -404,6 +404,38 @@ function creditBasisComplete(buckets: CreditBuckets, basis: 'NET' | 'GROSS'): bo
   return basis === 'NET' ? buckets.netBasisComplete : buckets.grossBasisComplete
 }
 
+/** What off-row credit does to a report's figures, decided WITHOUT ever adding its bases together. */
+type OffRowCreditSummary = {
+  /**
+   * True when ANY basis holds a nonzero off-row amount. Decided per bucket and never from a sum:
+   * a +100 GROSS credit and a -100 NET credit add to zero while both still sit off every row, and a
+   * report that read existence off that sum would publish EXACT with 200 of credit unaccounted for.
+   * This is `CreditBuckets`' own reason for tracking the two completeness flags separately, applied
+   * to the amounts.
+   */
+  present: boolean
+  /**
+   * An upper bound, IN NET TERMS, on the credit no row subtracted — or null when the direction is
+   * not established. Every bucket's true NET value is at most its stated amount (a GROSS amount is
+   * VAT-inclusive, so its ex-VAT value is smaller; an unproven one is bounded the same way), so
+   * while every bucket is non-negative their total is a legitimate ceiling on the NET credit
+   * missing from the figure — a MAGNITUDE for `netLinearFigureBoundDecimal`, never a published
+   * amount, and never the test for whether any credit exists. One negative bucket breaks the
+   * inequality, so the answer is null and the figures degrade to indeterminate.
+   */
+  netUpperBound: Prisma.Decimal | null
+}
+
+function offRowCreditSummary(...sets: CreditBuckets[]): OffRowCreditSummary {
+  const buckets = sets.flatMap((set) => [set.net, set.gross, set.unknown])
+  return {
+    present: buckets.some((bucket) => !bucket.isZero()),
+    netUpperBound: buckets.some((bucket) => bucket.lt(0))
+      ? null
+      : buckets.reduce((sum, bucket) => sum.add(bucket), new Prisma.Decimal(0)),
+  }
+}
+
 /** An order's whole credit, as Sales Analytics and Customer Mix attribute it: by order id. */
 type OrderRefundRow = {
   orderId: string
@@ -933,6 +965,9 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
     loadCogsByOrder(client, window),
   ])
   assertSourceLimit(orders.length, SOURCE_ROW_LIMIT, 'Customer analytics source orders')
+  // What each line actually shipped inside the window — the evidence that the cost posted for an
+  // order covers the revenue this report measures it against. See `orderCostCoverageComplete`.
+  const dispatchedQtyByLine = await loadInWindowDispatchedQtyByLine(client, window, orders, 'Customer analytics')
   // As in Sales Analytics: an order cohort, so ALL of these orders' credit counts, whenever raised.
   const refunds = await loadOrderRefunds(client, orders.map((order) => order.id))
   const refundsByOrder = new Map<string, OrderRefundRow[]>()
@@ -990,12 +1025,22 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
     // and `CogsEntry.totalCostBase` is ex-tax, so the old `totalBase - cogs` was a subtraction
     // between two different units and overstated profit by the whole VAT on every taxable order.
     current.revenueExVat = current.revenueExVat.add(toDecimal(order.totalBase).sub(toDecimal(order.taxBase)))
-    // A MISSING COST IS NOT A ZERO COST. `cogsByOrder` is keyed on orders with a SALE_DISPATCH COGS
-    // entry inside the window; an order created near the end of the period and dispatched after it
-    // has none, and the old `?? 0` published its entire revenue as profit. `.has` is the question —
-    // `.get() ?? 0` cannot tell "no cost posted" from "cost posted, and it was zero".
-    if (cogsByOrder.has(order.id)) current.cogs = current.cogs.add(cogsByOrder.get(order.id)!)
-    else current.costCaptured = false
+    // A MISSING COST IS NOT A ZERO COST, AND A PARTIAL COST IS NOT A COMPLETE ONE.
+    //
+    // `cogsByOrder` is keyed on orders with a SALE_DISPATCH COGS entry inside the window; an order
+    // created near the end of the period and dispatched after it has none, and the old `?? 0`
+    // published its entire revenue as profit. `.has` is the right question for THAT — `.get() ?? 0`
+    // cannot tell "no cost posted" from "cost posted, and it was zero".
+    //
+    // But `.has` only asks whether ANY cost exists. A partially dispatched order has some, so it
+    // passed, and one dispatched unit's cost was then set against the whole order's revenue. The
+    // question the figure needs is whether the cost is COMPLETE for the revenue being measured, and
+    // that is `orderCostCoverageComplete`: every ordered unit dispatched inside the window.
+    if (cogsByOrder.has(order.id) && orderCostCoverageComplete(order, dispatchedQtyByLine)) {
+      current.cogs = current.cogs.add(cogsByOrder.get(order.id)!)
+    } else {
+      current.costCaptured = false
+    }
     const orderRefunds = refundsByOrder.get(order.id) ?? []
     for (const refund of orderRefunds) addCredit(current.credits, refund.totalsBasis, refund.totalBase)
     if (!order.paidAt) {
@@ -1125,7 +1170,7 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
     },
     notices: [
       'AR exposure is unpaid sales-order totalBase for the selected period, less the gross-basis credit raised against those unpaid orders. COGS comes from CogsEntry rows linked to SALE_DISPATCH movements.',
-      `Gross profit is withheld for a customer with an in-period order that has no COGS posted in the period, and the period total covers ${period_.costCapturedRows} of ${groups.size} customers. A missing cost is not a zero cost.`,
+      `Gross profit is withheld for a customer with an in-period order whose posted cost does not cover the revenue it is measured against — no COGS posted in the period, or not every ordered unit dispatched within it — and the period total covers ${period_.costCapturedRows} of ${groups.size} customers. A missing cost is not a zero cost, and a partially dispatched order's cost is not the whole order's cost.`,
       REFUND_BASIS_NOTICE_CUSTOMER_MIX,
     ],
   }
@@ -1241,6 +1286,102 @@ export function computeInWindowDispatchedQtyByLine(
   return effective
 }
 
+/**
+ * The in-window dispatched quantity of every line of `orders`, keyed `${lineId}|${productId}`.
+ *
+ * ONE loader for the two questions that both need it, so they cannot drift on what "dispatched in
+ * this window" means: Gross Margin PRORATES a line's revenue to it, and Customer Mix asks whether
+ * the cost posted for an order covers the revenue that order is publishing (see
+ * `orderCostCoverageComplete`). Both are the same measurement — how much of what was ordered was
+ * actually shipped, and therefore costed, inside the period being reported.
+ */
+async function loadInWindowDispatchedQtyByLine(
+  client: SalesFulfillmentAnalyticsClient,
+  window: { dateFrom: Date; dateTo: Date; dateToExclusive: Date },
+  orders: SalesOrderRow[],
+  sourceLabel: string,
+): Promise<Map<string, Prisma.Decimal>> {
+  // In-window dispatch movements carry the line-granularity link (scjz.51/4pz6).
+  const dispatchRows = await client.stockMovement.findMany({
+    where: {
+      type: StockMovementType.SALE_DISPATCH,
+      referenceType: 'SalesOrder',
+      createdAt: { gte: window.dateFrom, lt: window.dateToExclusive },
+    },
+    select: { qty: true, referenceId: true, productId: true, shipmentLine: { select: { lineId: true } } },
+    take: SOURCE_ROW_LIMIT + 1,
+  }) as Array<{ qty: DecimalInput; referenceId: string | null; productId: string; shipmentLine: { lineId: string } | null }>
+  assertSourceLimit(dispatchRows.length, SOURCE_ROW_LIMIT, `${sourceLabel} dispatch source rows`)
+  // o3d-7r6x: a KIT line's dispatch movements are denominated in leaf components, the line in
+  // parent units. Resolve each line's component requirements so the linked dispatch can be
+  // converted to whole ordered units before it is matched back to the line.
+  const graph = await loadFulfillmentProductGraph(
+    client as unknown as Parameters<typeof loadFulfillmentProductGraph>[0],
+    [...new Set(orders.flatMap((order) => order.lines.map((line) => line.productId)).filter((id): id is string => Boolean(id)))],
+  )
+  const requirementsByLine = new Map<string, DecimalFulfillmentRequirement[]>()
+  for (const order of orders) {
+    for (const line of order.lines) {
+      if (!line.productId || requirementsByLine.has(line.id)) continue
+      requirementsByLine.set(
+        line.id,
+        requirementsMapToDecimalRows(expandFulfillmentRequirementsDecimal(line.productId, 1, graph)),
+      )
+    }
+  }
+  return computeInWindowDispatchedQtyByLine(
+    dispatchRows.map((row) => ({
+      orderId: row.referenceId,
+      productId: row.productId,
+      qty: row.qty,
+      shipmentLineLineId: row.shipmentLine?.lineId ?? null,
+    })),
+    orders.flatMap((order) => order.lines.map((line) => ({
+      id: line.id,
+      orderId: order.id,
+      productId: line.productId,
+      qty: line.qty,
+    }))),
+    requirementsByLine,
+  )
+}
+
+/**
+ * IS THE POSTED COST COMPLETE FOR THE REVENUE BEING MEASURED?
+ *
+ * Customer Mix measures gross profit against the WHOLE order's ex-VAT revenue — `SalesOrder.
+ * totalBase` less tax, every ordered unit of it. The question "was a cost posted for this order?"
+ * is therefore the wrong question, and answering it with `cogsByOrder.has(order.id)` is the
+ * missing-cost defect one step along: an order that dispatched one of ten units has a COGS entry,
+ * passes that test, and gets ONE unit's cost set against TEN units' revenue. The profit that comes
+ * out is plausible, confident and far too high — the same shape as the `?? 0` it replaced.
+ *
+ * COMPLETE therefore means: every ordered unit of every line was dispatched INSIDE THE WINDOW. The
+ * in-window part is not a detail. Orders are selected by `createdAt`, so a dispatch can never fall
+ * before the window, but it can fall after it: an order created on the 30th and shipped on the 2nd
+ * has cost in NEXT period's `cogsByOrder` and revenue in THIS one. Measuring coverage with the same
+ * in-window dispatched quantity Gross Margin prorates by makes both leaks one rule.
+ *
+ * A line with no `productId` (the schema's "product deleted / not found") fails closed. There is no
+ * product for a dispatch movement to be attributed through, so the quantity that line shipped is
+ * not knowable from stored data — and "not knowable" is exactly the case this branch withholds for,
+ * not one it waves through. A line ordered at zero quantity has no units to cover and is skipped.
+ *
+ * Note this is about COVERAGE, not amount: an order whose posted cost is genuinely zero is complete
+ * as long as its units shipped, which is the "cost posted, and it was zero" evidence `.has` was
+ * introduced to preserve.
+ */
+function orderCostCoverageComplete(order: SalesOrderRow, dispatchedQtyByLine: Map<string, Prisma.Decimal>): boolean {
+  for (const line of order.lines) {
+    const ordered = toDecimal(line.qty)
+    if (ordered.lte(0)) continue
+    if (!line.productId) return false
+    const dispatched = dispatchedQtyByLine.get(`${line.id}|${line.productId}`) ?? new Prisma.Decimal(0)
+    if (dispatched.lt(ordered)) return false
+  }
+  return true
+}
+
 export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = {}, deps?: SalesFulfillmentAnalyticsDeps): Promise<SalesAnalyticsReport<MarginReportRow>> {
   const client = clientFromDeps(deps)
   const generatedAt = nowFromDeps(deps)
@@ -1282,19 +1423,6 @@ export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = 
     .filter((id): id is string => typeof id === 'string' && id.length > 0)
   const cogsProductIds = new Set(cogsRows.map((row) => marginCogsBucket(row).productId))
   const orders = await loadSalesOrdersByIds(client, cogsOrderIds)
-  // In-window dispatch movements carry the line-granularity link (scjz.51/4pz6):
-  // we prorate each line's revenue to the units it actually dispatched in the
-  // window instead of booking its full total against in-window COGS.
-  const dispatchRows = await client.stockMovement.findMany({
-    where: {
-      type: StockMovementType.SALE_DISPATCH,
-      referenceType: 'SalesOrder',
-      createdAt: { gte: window.dateFrom, lt: window.dateToExclusive },
-    },
-    select: { qty: true, referenceId: true, productId: true, shipmentLine: { select: { lineId: true } } },
-    take: SOURCE_ROW_LIMIT + 1,
-  }) as Array<{ qty: DecimalInput; referenceId: string | null; productId: string; shipmentLine: { lineId: string } | null }>
-  assertSourceLimit(dispatchRows.length, SOURCE_ROW_LIMIT, 'Margin analytics dispatch source rows')
   // o3d-kyey: the credit RAISED IN THE WINDOW, which is the period this report already measures —
   // it is anchored to CogsEntry.createdAt and prorates revenue to the quantity dispatched inside the
   // window, so it is a DISPATCH-PERIOD report, not an order cohort. A credit note therefore belongs
@@ -1314,38 +1442,7 @@ export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = 
     take: SOURCE_ROW_LIMIT + 1,
   }) as MarginRefundLineRow[]
   assertSourceLimit(marginRefundLines.length, SOURCE_ROW_LIMIT, 'Margin analytics refund source rows')
-  // o3d-7r6x: a KIT line's dispatch movements are denominated in leaf components, the line in
-  // parent units. Resolve each line's component requirements so the linked dispatch can be
-  // converted to whole ordered units before it is matched back to the line.
-  const marginGraph = await loadFulfillmentProductGraph(
-    client as unknown as Parameters<typeof loadFulfillmentProductGraph>[0],
-    [...new Set(orders.flatMap((order) => order.lines.map((line) => line.productId)).filter((id): id is string => Boolean(id)))],
-  )
-  const marginRequirementsByLine = new Map<string, DecimalFulfillmentRequirement[]>()
-  for (const order of orders) {
-    for (const line of order.lines) {
-      if (!line.productId || marginRequirementsByLine.has(line.id)) continue
-      marginRequirementsByLine.set(
-        line.id,
-        requirementsMapToDecimalRows(expandFulfillmentRequirementsDecimal(line.productId, 1, marginGraph)),
-      )
-    }
-  }
-  const dispatchedQtyByLine = computeInWindowDispatchedQtyByLine(
-    dispatchRows.map((row) => ({
-      orderId: row.referenceId,
-      productId: row.productId,
-      qty: row.qty,
-      shipmentLineLineId: row.shipmentLine?.lineId ?? null,
-    })),
-    orders.flatMap((order) => order.lines.map((line) => ({
-      id: line.id,
-      orderId: order.id,
-      productId: line.productId,
-      qty: line.qty,
-    }))),
-    marginRequirementsByLine,
-  )
+  const dispatchedQtyByLine = await loadInWindowDispatchedQtyByLine(client, window, orders, 'Margin analytics')
   type MarginGroup = MarginReportRow & { revenue: Prisma.Decimal; cogs: Prisma.Decimal; credits: CreditBuckets; lineIds: Set<string> }
   const emptyMarginGroup = (productId: string, sku: string, productName: string, categoryName: string | null): MarginGroup => ({
     productId,
@@ -1440,13 +1537,13 @@ export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = 
    * basis test is not enough on its own. A NET-basis credit that reached no row is `placeable` by
    * `creditPlacement` — it is the same unit as the figure — so the basis flag stays true while the
    * credit sits unsubtracted. Reading completeness off the basis alone would publish the period
-   * revenue as EXACT with a credit note missing from it. Existence is decided by the amount here
-   * because that is what "reached no row" means; direction still comes from the sign, so a negative
-   * off-row amount degrades to indeterminate rather than being marked `≤`.
+   * revenue as EXACT with a credit note missing from it. Existence is decided by the AMOUNTS here
+   * because that is what "reached no row" means — but per basis, never from a cross-basis sum, or a
+   * negative discount credit on one basis silently cancels a real credit on another and restores
+   * the exactness claim this whole mechanism exists to withhold. See `offRowCreditSummary`.
    */
-  const offRowCredit = refundsUnattributed.net.add(refundsUnattributed.gross).add(refundsUnattributed.unknown)
-    .add(refundsOutsideReport.net).add(refundsOutsideReport.gross).add(refundsOutsideReport.unknown)
-  const contributionBound = shareFigureBound({ reportBasisComplete: rowBasisComplete && offRowCredit.isZero() })
+  const offRow = offRowCreditSummary(refundsUnattributed, refundsOutsideReport)
+  const contributionBound = shareFigureBound({ reportBasisComplete: rowBasisComplete && !offRow.present })
   const rows: MarginReportRow[] = [...groups.entries()]
     .map(([key, row]) => {
       const netRevenue = netRevenueByKey.get(key)!
@@ -1478,9 +1575,14 @@ export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = 
   const paged = paginate(rows, filters, deps?.paginate !== false)
   const totalRevenue = [...netRevenueByKey.values()].reduce((sum, revenue) => sum.add(revenue), new Prisma.Decimal(0))
   const totalCogs = [...groups.values()].reduce((sum, row) => sum.add(row.cogs), new Prisma.Decimal(0))
-  const totalUnplaced = rowUnplaced.add(offRowCredit)
-  const totalBasisComplete = rowBasisComplete && offRowCredit.isZero()
-  const totalLinearBound = netLinearFigureBoundDecimal({ basisComplete: totalBasisComplete, unplacedCredit: totalUnplaced })
+  // Null `netUpperBound` = a negative off-row bucket, so there is no established direction for the
+  // totals to be bounded in: they are marked indeterminate rather than given a ceiling that is not
+  // one. `rowUnplaced` is already a NET-terms magnitude, so the two add.
+  const totalUnplaced = offRow.netUpperBound === null ? null : rowUnplaced.add(offRow.netUpperBound)
+  const totalBasisComplete = rowBasisComplete && !offRow.present
+  const totalLinearBound: DerivedFigureBound = totalUnplaced === null
+    ? 'indeterminate'
+    : netLinearFigureBoundDecimal({ basisComplete: totalBasisComplete, unplacedCredit: totalUnplaced })
   return {
     generatedAt: generatedAt.toISOString(),
     dateFrom: dateOnly(window.dateFrom),
@@ -1494,19 +1596,28 @@ export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = 
       grossProfitBase: moneyString(totalGrossProfit, baseCurrency),
       grossProfitBaseBound: totalLinearBound,
       marginPct: pctString(totalGrossProfit, totalRevenue),
-      marginPctBound: marginFigureBoundDecimal({
-        netRevenue: totalRevenue,
-        cogs: totalCogs,
-        unplacedCredit: totalUnplaced,
-        basisComplete: totalBasisComplete,
-      }),
+      marginPctBound: totalUnplaced === null
+        ? 'indeterminate'
+        : marginFigureBoundDecimal({
+          netRevenue: totalRevenue,
+          cogs: totalCogs,
+          unplacedCredit: totalUnplaced,
+          basisComplete: totalBasisComplete,
+        }),
       refundsNetBasis: moneyString(reportCredits.net, baseCurrency),
       refundsGrossBasis: moneyString(reportCredits.gross, baseCurrency),
       refundsUnknownBasis: moneyString(reportCredits.unknown, baseCurrency),
-      // Credit that reached no row, stated separately from credit that did. Both are inside
-      // refunds*Basis above; these say how much of it no product row could account for.
-      refundsUnattributedBase: moneyString(refundsUnattributed.net.add(refundsUnattributed.gross).add(refundsUnattributed.unknown), baseCurrency),
-      refundsOutsideReportBase: moneyString(refundsOutsideReport.net.add(refundsOutsideReport.gross).add(refundsOutsideReport.unknown), baseCurrency),
+      // Credit that reached no row, stated separately from credit that did, and ON ITS BASIS. Both
+      // are inside refunds*Basis above; these say how much of it no product row could account for.
+      // A single combined figure would be the one thing this report refuses to publish — a number
+      // adding NET, GROSS and unproven amounts is in no unit at all, and the operator reading it
+      // beside a NET revenue column would take it for one.
+      refundsUnattributedNetBasis: moneyString(refundsUnattributed.net, baseCurrency),
+      refundsUnattributedGrossBasis: moneyString(refundsUnattributed.gross, baseCurrency),
+      refundsUnattributedUnknownBasis: moneyString(refundsUnattributed.unknown, baseCurrency),
+      refundsOutsideReportNetBasis: moneyString(refundsOutsideReport.net, baseCurrency),
+      refundsOutsideReportGrossBasis: moneyString(refundsOutsideReport.gross, baseCurrency),
+      refundsOutsideReportUnknownBasis: moneyString(refundsOutsideReport.unknown, baseCurrency),
     },
     notices: [
       'Gross margin is anchored to CogsEntry.createdAt, matches the inventory COGS report period semantics, and uses source SalesOrderLine revenue without recalculating FIFO.',
