@@ -214,3 +214,105 @@ test('[o3d-psrx r3] every withheld verdict can tell an operator what to do about
   assert.match(reasons[1], /pay_1/)
   assert.match(reasons[2], /log_1/)
 })
+
+// ---------------------------------------------------------------------------
+// o3d-psrx r4 (Codex HIGH) — THE BINDING, THROUGH THE DOOR THE DEFECT CAME IN BY.
+//
+// Codex's route is QuickBooks: it enumerates no payments, so a stale registration that reaches
+// `posted` lands on LEDGER_DID_NOT_LIST_PAYMENTS, which `zeroPaidIsProvenReversal` ADMITS. The
+// pure-function cases below are that route with nothing else in the way; the wiring — that the
+// evidence read actually supplies the binding off real rows — is proved against a real database in
+// tests/concurrency/paid-provenance-reversal.concurrent.test.ts.
+// ---------------------------------------------------------------------------
+
+/** The paid state a document is in NOW: which ledger document, and (sales) when this episode began. */
+const paidState = (accountingInvoiceId: string | null, unregisteredPaidAt: Date | null = null) =>
+  ({ accountingInvoiceId, unregisteredPaidAt })
+
+const EPISODE_2_BEGAN = new Date('2026-08-20T11:30:00.000Z')
+
+test('[o3d-psrx r4] a registration from an EARLIER paid episode leaves the marker standing', () => {
+  // Posted at 11:00, this paid state entered at 11:30, ledger read at 12:00. Everything about the row
+  // is impeccable — SYNCED, database-stamped, a real ledger payment id, before the fence, and against
+  // THIS document. It is simply about a payment that was taken away before this flag was set.
+  const stale = registration({ registeredAgainstInvoiceId: 'inv_1', syncedAt: BEFORE_READ })
+  assert.deepEqual(
+    classifyRegisteredPaymentAgainstListing(null, [stale], READ_AT, [], true, paidState('inv_1', EPISODE_2_BEGAN)),
+    { verdict: 'PAID_WITHOUT_LEDGER_RECEIPT' },
+    'the marker says this paid state was never going to have a ledger receipt; a row from the '
+    + 'PREVIOUS one cannot contradict it',
+  )
+  // WITHOUT the binding this is the exact defect: admitted, and a chargeback credit note raised.
+  const unbound = classifyRegisteredPaymentAgainstListing(null, [stale], READ_AT, [], true)
+  assert.equal(unbound.verdict, 'LEDGER_DID_NOT_LIST_PAYMENTS')
+  assert.equal(zeroPaidIsProvenReversal(unbound), true,
+    'stated so the danger is visible: with no binding the stale row makes this an ADMITTED reversal')
+})
+
+test('[o3d-psrx r4] a registration raised DURING this paid state still discharges the marker', () => {
+  // The control for the case above, and the reason the marker is self-discharging at all (6oyu.6): a
+  // WooCommerce chargeback on an order IMS did register must still reverse.
+  const current = registration({ registeredAgainstInvoiceId: 'inv_1', syncedAt: new Date('2026-08-20T11:45:00.000Z') })
+  assert.deepEqual(
+    classifyRegisteredPaymentAgainstListing(
+      new Set<string>(), [current], READ_AT, [], true, paidState('inv_1', EPISODE_2_BEGAN),
+    ),
+    { verdict: 'GONE', paymentIds: ['PAY-1'] },
+  )
+})
+
+test('[o3d-psrx r4] a registration against a document this one replaced is UNDECIDED, not absent', () => {
+  const stranded = registration({ id: 'log_old', registeredAgainstInvoiceId: 'inv_deleted' })
+  const verdict = classifyRegisteredPaymentAgainstListing(null, [stranded], READ_AT, [], false, paidState('inv_1'))
+  assert.deepEqual(verdict, { verdict: 'REGISTRATION_UNDECIDED', entryIds: ['log_old'] })
+  assert.equal(zeroPaidIsProvenReversal(verdict), false)
+  // NOT `NOTHING_REGISTERED`. Dropping the row would be the opposite mistake and a worse one: the
+  // ledger may still be holding that payment, and NOTHING_REGISTERED is an ADMITTED reversal.
+  assert.notEqual(verdict.verdict, 'NOTHING_REGISTERED')
+})
+
+test('[o3d-psrx r4] a registration that names NO document binds to nothing (legacy and compacted rows)', () => {
+  // A row from before the payload carried `accountingInvoiceId`, or one retention-compacted to `{}`
+  // (o3d-m5qk). "We cannot tell which document this was about" is not "it was about this one".
+  for (const registeredAgainstInvoiceId of [null, undefined, '', '   ']) {
+    const legacy = registration({ id: 'log_legacy', registeredAgainstInvoiceId })
+    assert.deepEqual(
+      classifyRegisteredPaymentAgainstListing(null, [legacy], READ_AT, [], false, paidState('inv_1')),
+      { verdict: 'REGISTRATION_UNDECIDED', entryIds: ['log_legacy'] },
+      `registeredAgainstInvoiceId=${JSON.stringify(registeredAgainstInvoiceId)}`,
+    )
+  }
+})
+
+test('[o3d-psrx r4] a caller that supplies no binding decides exactly what it decided before', () => {
+  // Every existing caller — `classifyRegisteredPayment` and its tests above — passes no binding, and
+  // this is what makes that safe to say rather than to assume.
+  const rows = [registration({ registeredAgainstInvoiceId: 'inv_whatever' })]
+  for (const listing of [null, new Set<string>(), new Set(['pay-1'])]) {
+    assert.deepEqual(
+      classifyRegisteredPaymentAgainstListing(listing, rows, READ_AT, [], true),
+      classifyRegisteredPaymentAgainstListing(listing, rows, READ_AT, [], true, null),
+    )
+  }
+})
+
+test('[o3d-psrx r4] the binding narrows the evidence; it never admits a reversal on its own', () => {
+  // The whole safety argument, over the case table above: a binding that REJECTS every registration
+  // can only move a verdict from ADMITTED to WITHHELD, never the reverse. That is what makes r4 safe
+  // to ship without re-arguing each of the earlier rounds' verdicts.
+  assert.ok(CASES.length >= 5, `the table must actually have cases in it, found ${CASES.length}`)
+  let changed = 0
+  for (const c of CASES) {
+    const withBinding = classifyRegisteredPaymentAgainstListing(
+      null, c.registrations.map((r) => ({ ...r, registeredAgainstInvoiceId: 'inv_someone_else' })),
+      READ_AT, c.unregisteredReceiptIds, c.paidWithoutLedgerReceipt, paidState('inv_1'),
+    )
+    if (withBinding.verdict !== c.quickbooks) changed++
+    assert.ok(!zeroPaidIsProvenReversal(withBinding) || c.quickbooksReverses,
+      `${c.name}: rejecting every registration turned a WITHHELD verdict into an ADMITTED one`)
+  }
+  // Non-vacuity: if rejecting every registration changed nothing anywhere, the loop above proved
+  // nothing about the binding and would keep passing with the binding deleted.
+  assert.ok(changed > 0,
+    'rejecting every registration must actually change some verdict, or this test is examining nothing')
+})

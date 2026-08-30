@@ -188,7 +188,10 @@ test(
         referenceType: 'SalesOrder',
         referenceId: orderId,
         externalTransactionId: 'PAY-LANDED',
-        payload: {},
+        // o3d-psrx r4: WHICH ledger document this registration settled, exactly as
+        // `registerInvoicePaymentWithLedger` writes it. Without it the row names no document, and a row
+        // that names no document can discharge nothing — which is the LEGACY arm, not this case.
+        payload: { accountingInvoiceId: invoiceId },
       },
       select: { id: true },
     })
@@ -217,5 +220,200 @@ test(
       'once IMS\'s own payment has demonstrably reached the ledger, the ledger\'s list decides — and a '
       + 'WooCommerce chargeback must still be detected',
     )
+  },
+)
+
+// ---------------------------------------------------------------------------
+// o3d-psrx r4 (Codex HIGH) — A REGISTRATION ANSWERS ONLY FOR THE DOCUMENT AND THE PAID EPISODE IT
+// WAS RAISED IN.
+//
+// r2/r3 read the registrations for a document by `referenceId` alone, and any one of them that had
+// posted before the fence made `posted` non-empty. `posted` being non-empty is precisely what stops
+// `unregisteredPaidAt` being consulted — so a registration about a payment that no longer exists, or
+// about a ledger document this order no longer has, discharged a marker it knows nothing about.
+//
+// Both cases below are real database rows, read through the poller's OWN query, and both are paired
+// with a control that must still reverse. "Withhold everything" passes the headline and destroys the
+// pass, which is the mistake these controls exist to catch.
+// ---------------------------------------------------------------------------
+
+/** A SYNCED INVOICE_PAYMENT with a ledger payment id, stamped by the database like the processor's. */
+async function postedRegistration(
+  db: Awaited<ReturnType<typeof loadDb>>,
+  orderId: string,
+  registeredAgainstInvoiceId: string,
+  externalTransactionId: string,
+): Promise<string> {
+  const { stampSyncedAtFromDatabaseClock } = await import('@/lib/connectors/xero/synced-at-clock')
+  const row = await db.accountingSyncLog.create({
+    data: {
+      connector: 'xero',
+      type: 'INVOICE_PAYMENT',
+      status: 'SYNCED',
+      referenceType: 'SalesOrder',
+      referenceId: orderId,
+      externalTransactionId,
+      // The payload every production enqueue writes. It is the ONLY durable record of which ledger
+      // document the call was about — the order's own column answers "which document NOW".
+      payload: { accountingInvoiceId: registeredAgainstInvoiceId },
+    },
+    select: { id: true },
+  })
+  // The trigger in 20260821090000 REFUSES a `syncedAtDatabaseClock` supplied by an INSERT, so the
+  // stamp has to go through the same helper the processor uses or the row comes back undecidable.
+  await stampSyncedAtFromDatabaseClock(db, row.id)
+  const stamped = await db.accountingSyncLog.findUniqueOrThrow({
+    where: { id: row.id }, select: { syncedAt: true, syncedAtDatabaseClock: true },
+  })
+  assert.ok(
+    stamped.syncedAt != null && stamped.syncedAtDatabaseClock != null
+    && stamped.syncedAt.getTime() === stamped.syncedAtDatabaseClock.getTime(),
+    'the registration must be database-stamped, or the classifier calls it UNDECIDED and every '
+    + 'assertion below passes for a reason that has nothing to do with the binding',
+  )
+  return row.id
+}
+
+test(
+  '[o3d-psrx r4] a registration from an EARLIER paid episode does not discharge the current marker',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    // THE CASE THAT MOTIVATES THE WHOLE FINDING: paid, registered, REFUNDED, PAID AGAIN off-ledger.
+    //
+    //   1. the order was paid and IMS registered the payment with Xero (SYNCED, PAY-EPISODE-1).
+    //   2. the payment was reversed in Xero. `paidAt` was cleared; the SYNCED row stayed — nothing
+    //      retires a sales registration, and a reversal Xero performed that IMS never polled would
+    //      leave it in place regardless.
+    //   3. an operator marked the order paid again by hand. `markSalesOrderPaid` stamps
+    //      `unregisteredPaidAt`, records no receipt and queues nothing: this paid state was never
+    //      going to have a ledger receipt.
+    //
+    // Before r4 the stale row made `posted` non-empty, the marker was never consulted, the zero-paid
+    // invoice read as a removal, and IMS raised a chargeback credit note against the SECOND payment.
+    const db = await loadDb()
+    const { readSalesResidualVerdicts } = await import('@/lib/connectors/xero/payment-poller')
+    const { databaseLedgerFence } = await import('@/lib/connectors/xero/invoice-delta')
+
+    const staleId = probeId()
+    const currentId = probeId()
+    const staleInvoice = `INV-${staleId}`
+    const currentInvoice = `INV-${currentId}`
+    t.after(async () => {
+      await db.accountingSyncLog.deleteMany({ where: { referenceType: 'SalesOrder', referenceId: { in: [staleId, currentId] } } })
+      await db.salesOrder.deleteMany({ where: { id: { in: [staleId, currentId] } } })
+    })
+
+    await createPaidOrder(db, staleId, staleInvoice, { unregisteredPaidAt: null })
+    // THE CONTROL. Its marker is stamped BEFORE its registration posts, so that registration belongs
+    // to the paid state the marker describes and is allowed to discharge it — this is the 6oyu.6
+    // WooCommerce chargeback, and withholding it would trade one money defect for another.
+    await createPaidOrder(db, currentId, currentInvoice, { unregisteredPaidAt: null })
+    const [{ before }] = await db.$queryRaw<Array<{ before: Date }>>`SELECT clock_timestamp() AS before`
+    await db.salesOrder.update({ where: { id: currentId }, data: { paidAt: before, unregisteredPaidAt: before } })
+
+    await postedRegistration(db, staleId, staleInvoice, 'PAY-EPISODE-1')
+    await postedRegistration(db, currentId, currentInvoice, 'PAY-THIS-EPISODE')
+
+    // ...and only NOW is the stale order's second paid state entered, AFTER its episode-1 registration
+    // completed. That ordering is the whole fact this test is about, so it is asserted rather than
+    // assumed: a fixture that got it backwards would pass for the control's reason.
+    const [{ after }] = await db.$queryRaw<Array<{ after: Date }>>`SELECT clock_timestamp() AS after`
+    await db.salesOrder.update({ where: { id: staleId }, data: { paidAt: after, unregisteredPaidAt: after } })
+    const staleRow = await db.accountingSyncLog.findFirstOrThrow({
+      where: { referenceId: staleId }, select: { syncedAtDatabaseClock: true },
+    })
+    assert.ok(staleRow.syncedAtDatabaseClock != null && staleRow.syncedAtDatabaseClock.getTime() < after.getTime(),
+      'the stale registration must have completed BEFORE the current paid state was entered')
+
+    const [{ now }] = await db.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`
+    const invoices = new Map([
+      [staleInvoice, zeroPaidInvoice(staleInvoice)],
+      [currentInvoice, zeroPaidInvoice(currentInvoice)],
+    ])
+    const residual = await readSalesResidualVerdicts(
+      invoices as never, new Set([staleInvoice, currentInvoice]), databaseLedgerFence(now),
+    )
+
+    // THE HEADLINE.
+    assert.ok(!residual.zeroPaidReversed.has(staleInvoice),
+      'a registration about a payment that was taken away BEFORE this paid state began must not be '
+      + 'read as "IMS told the ledger about this one" — acting on it charges back a customer who paid')
+    assert.ok(!residual.provenGone.has(staleInvoice), 'and it is not promoted by the identity route either')
+    const withheld = residual.withheld.find((w) => w.doc.id === staleId)
+    assert.ok(withheld, 'it must be WITHHELD and reported, not silently dropped')
+    assert.equal(withheld.verdict.verdict, 'PAID_WITHOUT_LEDGER_RECEIPT',
+      'and for the RIGHT reason: this paid flag came from an operator and no registration belongs to '
+      + 'it. REGISTRATION_UNDECIDED would also withhold, and would send the operator hunting for a '
+      + 'sync row that has nothing to do with the flag they set.')
+
+    // THE CONTROL. Identical in every respect except which side of the marker its registration posted.
+    assert.ok(residual.zeroPaidReversed.has(currentInvoice),
+      'a registration raised DURING this paid state still discharges the marker — the marker is '
+      + 'self-discharging by design, and a WooCommerce chargeback must still be detected (6oyu.6)')
+  },
+)
+
+test(
+  '[o3d-psrx r4] a registration against a DIFFERENT ledger document does not discharge this one',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    // The delete-and-re-post shape. The invoice IMS settled was deleted in the ledger and re-posted,
+    // so the order now points at a NEW `accountingInvoiceId` while the SYNCED registration still names
+    // the old one. o3d-hbgo already states this rule for settlement — "a row against a document the
+    // order no longer has must not be read as bearing on the replacement" — and the reversal reader
+    // was the sibling that did not.
+    //
+    // Both orders here are LEDGER-sourced (`unregisteredPaidAt: null`), so nothing in this test can
+    // pass by way of the marker: the only difference between the two is which document the payload
+    // names.
+    const db = await loadDb()
+    const { readSalesResidualVerdicts } = await import('@/lib/connectors/xero/payment-poller')
+    const { databaseLedgerFence } = await import('@/lib/connectors/xero/invoice-delta')
+
+    const movedId = probeId()
+    const sameId = probeId()
+    const replacementInvoice = `INV-NEW-${movedId}`
+    const deletedInvoice = `INV-OLD-${movedId}`
+    const sameInvoice = `INV-${sameId}`
+    t.after(async () => {
+      await db.accountingSyncLog.deleteMany({ where: { referenceType: 'SalesOrder', referenceId: { in: [movedId, sameId] } } })
+      await db.salesOrder.deleteMany({ where: { id: { in: [movedId, sameId] } } })
+    })
+
+    await createPaidOrder(db, movedId, replacementInvoice, { unregisteredPaidAt: null })
+    await createPaidOrder(db, sameId, sameInvoice, { unregisteredPaidAt: null })
+    const strandedEntryId = await postedRegistration(db, movedId, deletedInvoice, 'PAY-AGAINST-DELETED')
+    await postedRegistration(db, sameId, sameInvoice, 'PAY-AGAINST-THIS')
+
+    const [{ now }] = await db.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`
+    const invoices = new Map([
+      [replacementInvoice, zeroPaidInvoice(replacementInvoice)],
+      [sameInvoice, zeroPaidInvoice(sameInvoice)],
+    ])
+    const residual = await readSalesResidualVerdicts(
+      invoices as never, new Set([replacementInvoice, sameInvoice]), databaseLedgerFence(now),
+    )
+
+    // THE HEADLINE. Note which direction the danger runs in: the stranded row must not be counted as
+    // `posted` (it would answer for a document it never touched) and must not be DROPPED either — a
+    // document whose only registration vanished reads as NOTHING_REGISTERED, which is an ADMITTED
+    // reversal. Undecided is the only honest answer, and it withholds.
+    assert.ok(!residual.zeroPaidReversed.has(replacementInvoice),
+      'a payment IMS registered against a document that no longer exists says nothing about the '
+      + 'replacement, in either direction — the ledger may still be holding that money')
+    assert.ok(!residual.provenGone.has(replacementInvoice))
+    const withheld = residual.withheld.find((w) => w.doc.id === movedId)
+    assert.ok(withheld, 'it must be WITHHELD and reported')
+    assert.equal(withheld.verdict.verdict, 'REGISTRATION_UNDECIDED')
+    assert.deepEqual(
+      withheld.verdict.verdict === 'REGISTRATION_UNDECIDED' ? withheld.verdict.entryIds : null,
+      [strandedEntryId],
+      'and it NAMES the stranded entry, because that row is what a human has to look at')
+
+    // THE CONTROL. Same shape, same fence, same zero — the payload names the document the order
+    // actually points at, so the ledger's list decides and the reversal is admitted.
+    assert.ok(residual.zeroPaidReversed.has(sameInvoice),
+      'a registration against THIS document is still evidence about it — the binding narrows the '
+      + 'evidence, it does not switch the pass off')
   },
 )
