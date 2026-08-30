@@ -268,14 +268,24 @@ const dbDouble: Record<string, unknown> = {
     // explicit UTC strings, because the column is TIMESTAMP WITHOUT TIME ZONE; the double
     // answers in the same shapes, so the production side's parsing is exercised rather than
     // bypassed.
-    const [openActions, closedActions, allActions, horizonIso, limit] =
-      values as [string[], string[], string[], string, number]
+    // o3d-psrx r4: the scan is CONNECTOR-SCOPED now — both pollers write the same action names, so
+    // the statement asks for its own markers plus (for the legacy owner) the ones written before the
+    // key existed. Applied here for real: a double that ignored the predicate would make the
+    // cross-connector test vacuous.
+    const [openActions, closedActions, allActions, horizonIso, connector, legacyOwner, limit] =
+      values as [string[], string[], string[], string, string, boolean, number]
     const horizon = new Date(horizonIso)
+    const claims = (row: Row): boolean => {
+      const meta = row.metadata as { connector?: unknown } | null | undefined
+      const owner = typeof meta?.connector === 'string' ? meta.connector : null
+      return owner === connector || (legacyOwner && owner === null)
+    }
     const groups = new Map<string, { entityType: unknown; entityId: string; openMax: Date | null; closedMax: Date | null }>()
     for (const row of state.activityRows) {
       if (row.tag !== 'sync') continue
       if (!allActions.includes(row.action as string)) continue
       if (row.entityId == null) continue
+      if (!claims(row)) continue
       const at = row.createdAt as Date
       if (at.getTime() < horizon.getTime()) continue
       const key = `${String(row.entityType)}:${String(row.entityId)}`
@@ -1268,8 +1278,10 @@ test('a document Xero did not return is deferred rather than closed', async () =
 })
 
 test('the due set is oldest-reconsidered-first, latest marker wins, and it is bounded', async () => {
+  // o3d-psrx r4: the lifecycle moved out of the Xero poller — it was never Xero-shaped, and
+  // QuickBooks now drives the same one. See lib/domain/accounting/withheld-reversal-markers.ts.
   const { dueWithheldMarkers, WITHHELD_RECHECK_INTERVAL_MS } =
-    await import('@/lib/connectors/xero/payment-poller')
+    await import('@/lib/domain/accounting/withheld-reversal-markers')
   const old = (minutes: number) => new Date(Date.now() - WITHHELD_RECHECK_INTERVAL_MS - minutes * 60_000)
   // One entry per document per side, which is what the grouped scan hands it (round 5, finding 3):
   // the action that classified a marker is the query's business, and history is not in here at all.
@@ -1473,7 +1485,7 @@ test('the due order is each document\'s LAST reconsideration, not its first (r5)
 // ---------------------------------------------------------------------------
 
 test('documents whose withheld verdict is already CLOSED cannot spend the scan (r6)', async () => {
-  const { WITHHELD_MARKER_SCAN } = await import('@/lib/connectors/xero/payment-poller')
+  const { WITHHELD_MARKER_SCAN } = await import('@/lib/domain/accounting/withheld-reversal-markers')
   reset()
   state.invoices = []
   const day = 24 * 60 * 60_000
