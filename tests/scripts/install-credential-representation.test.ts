@@ -36,28 +36,28 @@
  */
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { chmodSync, linkSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { chmodSync, linkSync, readFileSync, rmSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import test from 'node:test'
 
 import { parse } from 'pg-connection-string'
 
 import {
-  DECODE_HELPER,
-  NEXT_RUN_BODY,
-  REINSTALL_BODY,
-  SHIPPED_ROTATION_UP_TO_THE_CLEAR,
   base64,
   connectWithDriver,
+  DECODE_HELPER,
   decodeVar,
   envDatabaseUrl,
+  installRoot,
   installVars,
   journalPath,
   journalValue,
+  NEXT_RUN_BODY,
   readVar,
+  REINSTALL_BODY,
   runShipped,
   seedLiveInstallation,
+  SHIPPED_ROTATION_UP_TO_THE_CLEAR,
   writeInstalledEnv,
 } from './install-shell-rig.ts'
 import { type Cluster, currentUser, freePort, startCluster } from './real-postgres-cluster.ts'
@@ -134,7 +134,7 @@ test('r39: a password of reserved characters survives SQL, the URL and the insta
   //   3. drop the decode from installed_database_password(): the recovered value is the URL's
   //      BYTES, so the second run below reads a different password than the one installed and
   //      reports a rotation nobody asked for — this test fails on ROTATION_PENDING, alone.
-  const root = mkdtempSync(join(tmpdir(), 'ims-repr-'))
+  const root = installRoot('ims-repr-')
   let cluster: Cluster | undefined
   try {
     cluster = startCluster(root, 'live', await freePort(), '127.0.0.1')
@@ -221,7 +221,7 @@ test('r39: the shipped encoder and the installed node-postgres agree on every re
   //   3. make url_decode_userinfo() decode `%` sequences that are not two hex digits (drop the
   //      `{2}` from the sed pattern): `a%2` and `a%` stop round-tripping and this test fails on
   //      those rows, and test 3 fails on four legacy rows. Alone in this file otherwise.
-  const root = mkdtempSync(join(tmpdir(), 'ims-repr-'))
+  const root = installRoot('ims-repr-')
   let cluster: Cluster | undefined
   try {
     cluster = startCluster(root, 'live', await freePort(), '127.0.0.1')
@@ -325,7 +325,7 @@ test('r39: the shipped decoder reaches node-postgres\'s answer for a legacy raw 
   //      becomes a backspace and a `\s`, and this test fails on that row alone.
   //   3. drop the `{2}` from the hex pattern so a single hex digit decodes: `a%2` disagrees and
   //      this test fails on it; test 2 fails on `a%` and `a%2` as well.
-  const root = mkdtempSync(join(tmpdir(), 'ims-repr-'))
+  const root = installRoot('ims-repr-')
   try {
     const run = runShipped(
       { APP_DIR: root, APP_USER: currentUser(), CASES_B64: base64(`${LEGACY_RAW_USERINFO.join('\n')}\n`) },
@@ -382,7 +382,7 @@ test('r39: .env is published by rename, so the previous file is never truncated'
   //      only as a statement about the end state, and the ATOMICITY of it is what route 1 covers.
   //   3. drop the `[[ -n "${rendered}" ]]` guard: nothing here fails. It is asserted below by
   //      rendering into a variable and checking the published bytes equal it exactly.
-  const root = mkdtempSync(join(tmpdir(), 'ims-repr-'))
+  const root = installRoot('ims-repr-')
   let cluster: Cluster | undefined
   try {
     cluster = startCluster(root, 'live', await freePort(), '127.0.0.1')
@@ -436,7 +436,7 @@ test('r39: a rotation that cannot be journalled does not ALTER anything', async 
   //      assertion. It fails ALONE — the reconciliation tests below still pass, because on their
   //      paths the journal does get written.
   //   2. drop the `|| die` from it: same two failures, same test, alone.
-  const root = mkdtempSync(join(tmpdir(), 'ims-repr-'))
+  const root = installRoot('ims-repr-')
   let cluster: Cluster | undefined
   try {
     cluster = startCluster(root, 'live', await freePort(), '127.0.0.1')
@@ -498,7 +498,7 @@ test('r39: boundary (1) — journalled, ALTER not run: the next run finds the OL
   //      resolve_role_rotation_journal_after_env_publication(): JOURNAL_LEFT is `yes` and this test
   //      fails on it — as do the two boundary tests below, which is right: they are three
   //      statements about the same clear.
-  const root = mkdtempSync(join(tmpdir(), 'ims-repr-'))
+  const root = installRoot('ims-repr-')
   let cluster: Cluster | undefined
   try {
     cluster = startCluster(root, 'live', await freePort(), '127.0.0.1')
@@ -559,7 +559,7 @@ test('r39: boundary (2) — the ALTER commits and .env cannot be written: the ne
   //      INSTALLED_B64 and on connectWithDriver. That is the finding, and it fails here alone.
   //   3. make reconcile_interrupted_role_rotation() prefer the OLD password (swap the two probes):
   //      the same three assertions fail, and boundary (3) fails with them.
-  const root = mkdtempSync(join(tmpdir(), 'ims-repr-'))
+  const root = installRoot('ims-repr-')
   let cluster: Cluster | undefined
   try {
     cluster = startCluster(root, 'live', await freePort(), '127.0.0.1')
@@ -645,7 +645,7 @@ test('r39: boundary (3) — both done, the record not cleared: the next run conf
   //      branch in prompt_db_password): the recovered value here happens to be the same either way,
   //      so this test stays GREEN and boundary (2) fails. Recorded because it is the one route this
   //      test cannot see.
-  const root = mkdtempSync(join(tmpdir(), 'ims-repr-'))
+  const root = installRoot('ims-repr-')
   let cluster: Cluster | undefined
   try {
     cluster = startCluster(root, 'live', await freePort(), '127.0.0.1')
@@ -694,7 +694,7 @@ test('r39: boundary (4) — neither password authenticates: the run refuses and 
   //   2. delete the journal from the failure path (add clear_role_rotation_journal before the die):
   //      this test fails on its journal assertion, alone — the two candidate passwords would be
   //      gone and no re-run could ever reconcile.
-  const root = mkdtempSync(join(tmpdir(), 'ims-repr-'))
+  const root = installRoot('ims-repr-')
   let cluster: Cluster | undefined
   try {
     cluster = startCluster(root, 'live', await freePort(), '127.0.0.1')
@@ -743,7 +743,7 @@ test('r39: an interrupted rotation for a DIFFERENT connection is refused, not ad
   //      a role on a database it is not installing, both probes fail, and it dies with "NEITHER of
   //      the two passwords" — this test fails on its message assertion, alone.
   //   2. replace the die with a `clear_role_rotation_journal`: the journal assertion fails, alone.
-  const root = mkdtempSync(join(tmpdir(), 'ims-repr-'))
+  const root = installRoot('ims-repr-')
   let cluster: Cluster | undefined
   try {
     cluster = startCluster(root, 'live', await freePort(), '127.0.0.1')
@@ -808,7 +808,7 @@ test('r40: a password whose decoded form ends in a newline installs, authenticat
   //   3. drop the sentinel from url_decode_userinfo()'s internal sed pipeline: nothing here fails,
   //      because no value reaching it through a URL carries a LITERAL trailing newline. Recorded so
   //      the next reader does not go looking for it; that half is asserted directly in test 13.
-  const root = mkdtempSync(join(tmpdir(), 'ims-repr-'))
+  const root = installRoot('ims-repr-')
   let cluster: Cluster | undefined
   try {
     cluster = startCluster(root, 'live', await freePort(), '127.0.0.1')
@@ -886,7 +886,7 @@ test('r40: an interrupted rotation to a newline-terminated password reconciles t
   //   2. revert the outer capture in prompt_db_password(): DB_ROTATION_RECONCILED_PASSWORD is
   //      assigned to DB_PASSWORD_INSTALLED directly and does not cross a capture, so this test
   //      stays GREEN and test 6 fails. Recorded because it is the one route this test cannot see.
-  const root = mkdtempSync(join(tmpdir(), 'ims-repr-'))
+  const root = installRoot('ims-repr-')
   let cluster: Cluster | undefined
   try {
     cluster = startCluster(root, 'live', await freePort(), '127.0.0.1')
@@ -965,7 +965,7 @@ test('r40: capture() returns every byte its command wrote, including trailing ne
   //   3. remove the `exit "${__capture_inner}"`: the status row reports 0 and this test fails on
   //      it. That one is load-bearing at the call site in prompt_db_password(), where a failed
   //      recovery has to fall through to `DB_PASSWORD_INSTALLED=""`.
-  const root = mkdtempSync(join(tmpdir(), 'ims-repr-'))
+  const root = installRoot('ims-repr-')
   try {
     const run = runShipped({ APP_DIR: root, APP_USER: currentUser() }, `
       ${DECODE_HELPER}

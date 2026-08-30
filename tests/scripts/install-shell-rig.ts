@@ -11,13 +11,14 @@
 import assert from 'node:assert/strict'
 import { execFileSync, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { chmodSync, readFileSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import tls from 'node:tls'
 
 import pg from 'pg'
 
 import { type Cluster, cleanLibpqEnv, currentUser, shippedFunction } from './real-postgres-cluster.ts'
+import { createTempDirSync } from './temp-dir.ts'
 
 export const REPO = process.cwd()
 export const INSTALL_SOURCE = readFileSync(join(REPO, 'scripts/install.sh'), 'utf8')
@@ -550,6 +551,32 @@ export function base64(value: string): string {
  * it crosses, and `capture` is what brings the decoded bytes back out of the pipeline intact.
  */
 export const DECODE_HELPER = `decode_b64() { printf '%s' "$1" | base64 -d; }`
+
+/**
+ * AN INSTALL ROOT WITH AN ANCHOR ABOVE IT (o3d-rn10 r2).
+ *
+ * The rig hands the caller's directory to the shipped script as ${APP_DIR}, and derives
+ * ${DB_ENV_SNAPSHOT_DIR} and ${DB_CA_PUBLISH_DIR} from it — three of the six directories
+ * publish_durable_file() will publish into. It now refuses a root whose OWN PARENT could be
+ * renamed inside by anyone but root, and the unit suite's TMPDIR deliberately mirrors /tmp at
+ * 1777, so a bare `mkdtemp` root has no anchor and every publication in the rig fails for a reason
+ * that has nothing to do with what it measures. One nesting level supplies it.
+ *
+ * THE ANCHOR IS 0755 AND NOT 0700, because an anchor is about WRITE. Several tests here assert
+ * that a published CA is readable by every uid on the box, which a 0700 ancestor would make false;
+ * the roots that need it chmod THEMSELVES to 0755 already, and this keeps that reachable.
+ * The root itself is created 0700, which is what `mkdtemp` gave them.
+ *
+ * The outer directory is registered for removal at exit, so a caller that `rmSync`s the root it
+ * was given still leaves nothing behind.
+ */
+export function installRoot(prefix: string): string {
+  const outer = createTempDirSync(prefix)
+  chmodSync(outer, 0o755)
+  const root = join(outer, 'app')
+  mkdirSync(root, { mode: 0o700 })
+  return root
+}
 
 /** The four values that identify one credential, as the rig's tests supply them. */
 export function installVars(cluster: Cluster, root: string): Record<string, string> {

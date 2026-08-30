@@ -36,30 +36,30 @@
  */
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { chmodSync, existsSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import test from 'node:test'
 
 import {
-  INSTALL_SOURCE,
-  NEXT_RUN_BODY,
-  OPENSSL_PEM_LABELS,
-  REINSTALL_BODY,
-  REPO,
-  SHIPPED_ROTATION_UP_TO_THE_CLEAR,
   caGenerationPath,
   connectWithDriver,
   decodeVar,
   envDatabaseUrl,
+  INSTALL_SOURCE,
+  installRoot,
   installVars,
   journalValue,
+  NEXT_RUN_BODY,
   nodeTlsVerdict,
+  OPENSSL_PEM_LABELS,
   opensslVerifies,
   readVar,
+  REINSTALL_BODY,
   relabelPem,
+  REPO,
   runShipped,
   seedLiveInstallation,
+  SHIPPED_ROTATION_UP_TO_THE_CLEAR,
   writeCertificate,
   writeInstalledEnv,
 } from './install-shell-rig.ts'
@@ -145,7 +145,7 @@ test('r40: a trust rule on the probe endpoint makes the rotation REFUSE, not pro
   //   4. drop the `datname <> :'dbname'` exclusion from db_connectable_databases_except_app(): the
   //      application database — which still checks passwords — becomes a candidate, the gate is
   //      satisfied by it, and the rotation proceeds. Same three failures here, and test 5 with it.
-  const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
+  const root = installRoot('ims-probe-')
   let cluster: Cluster | undefined
   try {
     cluster = startCluster(root, 'live', await freePort(), '127.0.0.1', TRUST_POSTGRES_ONLY)
@@ -242,7 +242,7 @@ test('r40: under trust the reconciliation REFUSES rather than adopting the candi
   //      stops at the first endpoint it cannot use, which here is `postgres`, so the run refuses
   //      for the right reason and the wrong endpoints are never reported. This test fails on its
   //      second endpoint assertion, with tests 3 and 10.
-  const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
+  const root = installRoot('ims-probe-')
   let cluster: Cluster | undefined
   try {
     cluster = startCluster(root, 'live', await freePort(), '127.0.0.1', TRUST_EVERYTHING)
@@ -315,7 +315,7 @@ test('r40: a recorded probe endpoint that has gone trust is discarded, and a dis
   //      its trust acceptance and the run refused with the AMBIGUOUS verdict; in r41 the method
   //      gate drops it first, so the control never sees it. Test 15 is the only test left that
   //      catches the control's removal — measured, and recorded so it is not looked for here.
-  const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
+  const root = installRoot('ims-probe-')
   let cluster: Cluster | undefined
   try {
     cluster = startCluster(root, 'live', await freePort(), '127.0.0.1', TRUST_POSTGRES_ONLY)
@@ -370,7 +370,7 @@ test('r40: a revoked CONNECT on the maintenance database does not strand a recov
   //      the control AND both candidates, so `resolve_live_role_password` skips it before the pair
   //      is consulted at all. Tests 5, 8 and 10 are what catch that route; recorded so the next
   //      reader does not look for it here.
-  const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
+  const root = installRoot('ims-probe-')
   let cluster: Cluster | undefined
   try {
     cluster = startCluster(root, 'live', await freePort(), '127.0.0.1')
@@ -426,7 +426,7 @@ test('r40: a rotation refuses when the role cannot reach any UNFENCED endpoint a
   //      reconciliation runs, and the rotation succeeds here and strands the next run. This test
   //      fails on its status assertion, with test 1.
   //   3. disable the gate entirely: same three failures here, with tests 1 and 8.
-  const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
+  const root = installRoot('ims-probe-')
   let cluster: Cluster | undefined
   try {
     cluster = startCluster(root, 'live', await freePort(), '127.0.0.1')
@@ -484,7 +484,7 @@ test('r40: a rotation records the endpoint it proved, and the reconciliation rea
   //   2. write it BEFORE marker_complete is not a thing — the marker is written last by
   //      construction; a reader that stops at the first missing key would be a different defect.
   //      Recorded as not-applicable so the next reader does not go looking.
-  const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
+  const root = installRoot('ims-probe-')
   let cluster: Cluster | undefined
   try {
     cluster = startCluster(root, 'live', await freePort(), '127.0.0.1')
@@ -545,7 +545,7 @@ test('r40: a discriminating endpoint that accepts BOTH candidates is refused, no
   //      the RIGHT password, reached by a rule that has no way of knowing that. This test fails on
   //      its status assertion, alone, which is the point: the refusal is the property, not which
   //      candidate a guess would have landed on.
-  const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
+  const root = installRoot('ims-probe-')
   let cluster: Cluster | undefined
   try {
     cluster = startCluster(root, 'live', await freePort(), '127.0.0.1')
@@ -599,7 +599,7 @@ test('r40: a site with no CONNECT on postgres rotates against a database the ser
   //   4. drop the `datname <> :'dbname'` exclusion from db_connectable_databases_except_app():
   //      NOTHING here fails, because `ims_spare_probe` sorts before `one_two_inventory` and is
   //      chosen either way. Tests 1 and 5 are what catch that route.
-  const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
+  const root = installRoot('ims-probe-')
   let cluster: Cluster | undefined
   try {
     cluster = startCluster(root, 'live', await freePort(), '127.0.0.1')
@@ -677,7 +677,7 @@ test('r40: the reconciliation asks the RECORDED endpoint, not the one it would h
   //      PROBE_DB and on the success message, alone in the repo.
   //   2. put the recorded endpoint LAST instead of first: same two failures, same test. Recorded
   //      because "the record is in the list somewhere" is not the property — being asked FIRST is.
-  const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
+  const root = installRoot('ims-probe-')
   let cluster: Cluster | undefined
   try {
     cluster = startCluster(root, 'live', await freePort(), '127.0.0.1')
@@ -837,7 +837,7 @@ test('r41: an endpoint whose rule is an EXTERNAL verifier is not admitted, and t
   //   3. make db_endpoint_checks_role_verifier() return 0 whenever the reader cannot be run: the
   //      gate becomes advisory and route 1's failures reappear on any host without node. Test 15
   //      is what catches that directly.
-  const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
+  const root = installRoot('ims-probe-')
   let cluster: Cluster | undefined
   let radius: RadiusVerifier | undefined
   try {
@@ -923,7 +923,7 @@ test('r41: with only an external verifier reachable the reconciliation REFUSES a
   //   3. drop the negative control from db_endpoint_discriminates_passwords(): nothing here fails —
   //      the method gate has already refused the only endpoint that could answer. Tests 1, 2 and 3
   //      are what catch that route; recorded so the next reader does not look for it here.
-  const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
+  const root = installRoot('ims-probe-')
   let cluster: Cluster | undefined
   let radius: RadiusVerifier | undefined
   try {
@@ -997,7 +997,7 @@ test('r41: an ordinary scram-sha-256 endpoint still qualifies and the rotation p
   //   3. point db_auth_request_probe_path() at ${APP_DIR} instead of the release's own lib
   //      directory: the reader is not there, the gate refuses, same failures. Test 15 is the one
   //      that states that refusal's message.
-  const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
+  const root = installRoot('ims-probe-')
   let cluster: Cluster | undefined
   try {
     cluster = startCluster(root, 'live', await freePort(), '127.0.0.1')
@@ -1056,7 +1056,7 @@ test('r41: a cleartext `password` rule is refused too, because the wire cannot t
   //   2. drop the `password-or-external` branch entirely so the reader falls through to its
   //      unrecognised-code answer: this test still passes on status but fails on the two
   //      assertions that quote the explanation, which is what an operator has to act on.
-  const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
+  const root = installRoot('ims-probe-')
   let cluster: Cluster | undefined
   try {
     cluster = startCluster(root, 'live', await freePort(), '127.0.0.1', ['host postgres all 127.0.0.1/32 password'])
@@ -1150,7 +1150,7 @@ test('r43: a cluster only TLS can authenticate on is REFUSED, because the applic
   //      the server-quote assertion.
   //   M4 -- the psql pin removed: NO CHANGE here. The gate refuses one step earlier, on the
   //      method, so no probe is ever opened. 14b and 17 are what measure that line.
-  const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
+  const root = installRoot('ims-probe-')
   let cluster: Cluster | undefined
   try {
     cluster = startCluster(root, 'live', await freePort(), '127.0.0.1', [
@@ -1241,7 +1241,7 @@ test('r43: a hostssl rule the probes could satisfy does not vouch for the hostno
   //   M4 -- the psql pin removed: R42_PAIR_ON_TLS becomes `refuses` -- unpinned, the control's
   //      random password fails scram, falls back to the clear and is let in by trust -- and this
   //      test fails on that precondition, which is r42's own claim being re-measured here.
-  const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
+  const root = installRoot('ims-probe-')
   let cluster: Cluster | undefined
   try {
     cluster = startCluster(root, 'live', await freePort(), '127.0.0.1', [
@@ -1327,7 +1327,7 @@ test('r43: the gate VALIDATES the application\'s route, on a cluster where only 
   //      `requested=disable`, so the comparison refuses; same failures, one line further on.
   //   M4 -- the psql pin removed: the probes run on `prefer`, land on the hostssl trust record and
   //      accept the negative control, so the discrimination half refuses. Same failures.
-  const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
+  const root = installRoot('ims-probe-')
   let cluster: Cluster | undefined
   try {
     cluster = startCluster(root, 'live', await freePort(), '127.0.0.1', [
@@ -1393,7 +1393,7 @@ test('r41: a rotation refuses when the matched method cannot be established at a
   //   2. drop the `[[ -f "${probe}" ]]` check and let node fail instead: the run still refuses, but
   //      the report says whatever node's module loader said, so this test fails on the two
   //      assertions that quote the actionable sentence.
-  const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
+  const root = installRoot('ims-probe-')
   let cluster: Cluster | undefined
   try {
     cluster = startCluster(root, 'live', await freePort(), '127.0.0.1')
@@ -1476,7 +1476,7 @@ test('r43: aligned to the probes, reconciliation publishes a credential the appl
   //   Also measured, outside the four: make db_endpoint_checks_role_verifier() admit
   //   `password-or-external` as verifier=role and run 3 adopts whichever candidate RADIUS accepts;
   //   this test fails on run 3's status and on LEFT IN PLACE, and tests 10, 11 and 13 fail with it.
-  const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
+  const root = installRoot('ims-probe-')
   let cluster: Cluster | undefined
   let radius: RadiusVerifier | undefined
   try {
@@ -1611,7 +1611,7 @@ test('r42: a pg_hba reload between the reader and the probe is caught by the neg
   //      this endpoint. Tests 5, 8 and 10 are what catch that.
   //   3. delete the method gate: nothing here fails either, for the same reason. Recorded so the
   //      next reader does not look for it here.
-  const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
+  const root = installRoot('ims-probe-')
   let cluster: Cluster | undefined
   try {
     cluster = startCluster(root, 'live', await freePort(), '127.0.0.1')
@@ -1710,7 +1710,7 @@ test('r42: a credential probe with no route established refuses, on an endpoint 
   //      assertion. Nothing else in the suite fails.
   //   3. delete both: UNROUTED_ACCEPTS becomes `yes`, the pair is then satisfied by a `trust`
   //      endpoint, and this test fails on three assertions at once.
-  const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
+  const root = installRoot('ims-probe-')
   let cluster: Cluster | undefined
   try {
     cluster = startCluster(root, 'live', await freePort(), '127.0.0.1', TRUST_EVERYTHING)
@@ -1786,7 +1786,7 @@ test('r43: a method read on any route but the application\'s is refused, includi
   //   M3 -- the reader sends the SSLRequest anyway: NO CHANGE. This test drives stub readers, not
   //      the shipped one. 14, 14b, 14c and 17 are what cover that line.
   //   M4 -- the psql pin removed: no change either; nothing here opens a psql.
-  const root = mkdtempSync(join(tmpdir(), 'ims-probe-'))
+  const root = installRoot('ims-probe-')
   try {
     const reader = (sslmode: string) =>
       `process.stdout.write('requested=asked\\ntransport=tcp\\nssl=yes\\nsslmode=${sslmode}\\nmethod=scram-sha-256\\nverifier=role\\ndetail=a stub reader\\n')\n`
@@ -1954,7 +1954,7 @@ test('r44: a PGSSLMODE in the environment puts the application on a record the g
   //   M3 -- have db_application_route_env_refusal() look only at the unit and not at this process:
   //         both gate cases become `admitted` again, because the environment that reaches the
   //         migration and the build is this one.
-  const root = mkdtempSync(join(tmpdir(), 'ims-r44-'))
+  const root = installRoot('ims-r44-')
   let cluster: Cluster | undefined
   try {
     cluster = startCluster(root, 'split', await freePort(), '127.0.0.1', [
@@ -2248,7 +2248,7 @@ test('r45: a wildcard EnvironmentFile that sets PGSSLMODE cannot reach the appli
   //         while `PGSSLMODE=no-verify` from the wildcard file survived.
   //   M3 -- drop NODE_PG_FORCE_NATIVE from the directive the installer writes: TWO_OF_THREE
   //         reports GUARANTEED.
-  const root = mkdtempSync(join(tmpdir(), 'ims-r45-wild-'))
+  const root = installRoot('ims-r45-wild-')
   try {
     // PRECONDITION, MEASURED: this is exactly why the r44 reader said "absent". The glob is not a
     // path; the file it matches is, and it sets the variable.
@@ -2442,7 +2442,7 @@ test('r45: the start gate refuses a transport the run never authenticated agains
     assert.notEqual(start, -1, `precondition: scripts/install.sh must define ${name}()`)
     return source.slice(start + 1, source.indexOf('\n}\n', start) + 3)
   }
-  const root = mkdtempSync(join(tmpdir(), 'ims-r45-start-'))
+  const root = installRoot('ims-r45-start-')
   try {
     const envPath = join(root, '.env')
     const snapshot = join(root, 'db-identity.env')
@@ -2588,7 +2588,7 @@ test('r45: a TLS-only external database is installable, and the gate validates t
   //   M4 -- accept `no-verify` in db_sslmode_is_supported() and pass it through: the URL parses,
   //         but the reader dies on `--sslmode=no-verify` (it is not a libpq word) and the gate
   //         refuses. The supported set is the intersection of three clients on purpose.
-  const root = mkdtempSync(join(tmpdir(), 'ims-r45-tls-'))
+  const root = installRoot('ims-r45-tls-')
   let cluster: Cluster | undefined
   try {
     cluster = startCluster(root, 'live', await freePort(), '127.0.0.1', [
@@ -2800,7 +2800,7 @@ test('r45: an upgrade recovers the transport and the CA from the URL the previou
   //         this installer composes: HAND_WRITTEN (a URL with a bare `?sslmode=require`, which is
   //         NOT what the composer emits and NOT libpq semantics under this driver) is recovered
   //         instead of ignored.
-  const root = mkdtempSync(join(tmpdir(), 'ims-r45-upgrade-'))
+  const root = installRoot('ims-r45-upgrade-')
   // mkdtemp gives 0700, and the published CA has to be reachable by every uid — which on a
   // production host it is, because /etc is 0755. Without this the ancestry walk is measuring the
   // temporary directory rather than the publication.
@@ -2939,7 +2939,7 @@ test('r46: a full --non-interactive install carries verify-full and its CA from 
   // reversing the precedence so the RECOVERED value beats the supplied one passes here — a first
   // install has nothing to recover — and fails 27, where an explicit DB_SSLMODE must beat the URL
   // the previous run wrote. Neither test covers the precedence alone; both of them do.
-  const root = mkdtempSync(join(tmpdir(), 'ims-r46-noninteractive-'))
+  const root = installRoot('ims-r46-noninteractive-')
   // mkdtemp gives 0700, and the published CA has to be reachable by every uid — which on a
   // production host it is, because /etc is 0755. Without this the ancestry walk is measuring the
   // temporary directory rather than the publication.
@@ -3055,7 +3055,7 @@ test('r46: a CA readable only by its owner is published as a copy every uid can 
   //   M4 -- make verify_db_ca_published() iterate over nothing instead of over "$@": CALLED= comes
   //         back empty and UNREADABLE= comes back 0, so a principal that cannot open the CA is
   //         reported as one that can.
-  const root = mkdtempSync(join(tmpdir(), 'ims-r46-ca-principal-'))
+  const root = installRoot('ims-r46-ca-principal-')
   // mkdtemp gives 0700, and the published CA has to be reachable by every uid — which on a
   // production host it is, because /etc is 0755. Without this the ancestry walk is measuring the
   // temporary directory rather than the publication.
@@ -3192,7 +3192,7 @@ test('r47: a source that is not a bundle of certificates is refused, and nothing
   //         content-addressing itself — test 27e cannot, because the CA it uses is a cluster
   //         certificate openssl already wrote in canonical form, so there the two digests coincide
   //         and the mutation comes back vacuous.
-  const root = mkdtempSync(join(tmpdir(), 'ims-r47-disclosure-'))
+  const root = installRoot('ims-r47-disclosure-')
   chmodSync(root, 0o755)
   try {
     const publishDir = join(root, 'published')
@@ -3357,7 +3357,7 @@ test('r47: an upgrade whose candidate CA cannot verify the server leaves the ins
   // re-issues a number some installed URL is still using — the same overwrite, reached by a
   // different route. A name derived from the bytes cannot collide with a different trust root at
   // all, which is why this is a removal of the irreversible act and not a re-ordering of it.
-  const root = mkdtempSync(join(tmpdir(), 'ims-r47-refresh-'))
+  const root = installRoot('ims-r47-refresh-')
   chmodSync(root, 0o755)
   let cluster: Cluster | undefined
   try {
@@ -3488,7 +3488,7 @@ test('r47: a prune keeps this run’s generation, the previous installation’s,
   //         something else — a restored backup, a hand-edited bundle, a copy made under a
   //         generation's name — is deleted. The name is a claim; content-addressing exists so that
   //         the claim can be checked, and this is the one place on the CA path that deletes.
-  const root = mkdtempSync(join(tmpdir(), 'ims-r47-prune-'))
+  const root = installRoot('ims-r47-prune-')
   chmodSync(root, 0o755)
   try {
     const publishDir = join(root, 'published')
@@ -3632,7 +3632,7 @@ test('r48: the accept-list is exactly the set of PEM labels the shared readers c
   //         a check on install.sh. It is asserted anyway, because the whole accept-list rests on
   //         the two readers wanting the same thing, and if that ever stops being true this test is
   //         where it surfaces rather than in an installation.
-  const root = mkdtempSync(join(tmpdir(), 'ims-r48-labels-'))
+  const root = installRoot('ims-r48-labels-')
   chmodSync(root, 0o755)
   try {
     const ca = join(root, 'ca.pem')
@@ -3713,7 +3713,7 @@ test('r48: a bundle in any accepted label publishes, and all three readers accep
   //         the bytes are the stripped ones. All three readers still ACCEPT it, which is the whole
   //         danger: the anchor is wider and nothing about the outcome says so. 27i is where that
   //         becomes a failure rather than a surprise.
-  const root = mkdtempSync(join(tmpdir(), 'ims-r48-publish-'))
+  const root = installRoot('ims-r48-publish-')
   chmodSync(root, 0o755)
   pgBinDir()
   let cluster: Cluster | undefined
@@ -3807,7 +3807,7 @@ test('r48: an X509_AUX-restricted anchor is still restricted after publication, 
   //         serverAuth` instead of `-addreject serverAuth`: the precondition assert fires — a
   //         source that never refused this leaf cannot show a publisher losing the refusal, so the
   //         test cannot pass by measuring a bundle with nothing to preserve.
-  const root = mkdtempSync(join(tmpdir(), 'ims-r48-trust-'))
+  const root = installRoot('ims-r48-trust-')
   chmodSync(root, 0o755)
   pgBinDir()
   let cluster: Cluster | undefined
