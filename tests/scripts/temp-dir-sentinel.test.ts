@@ -570,6 +570,12 @@ test('the repair does not follow a symlink swapped in after the type check', { s
       `the repair followed a symlink out of the private root and re-permissioned ${victim}`,
     )
   } finally {
+    // WAIT FOR THE SWAPPER HERE TOO, not only on the happy path: an assertion failing earlier
+    // would otherwise clean up underneath a process still putting directories back, and leave the
+    // very residue this file exists to make impossible — observed doing exactly that while the
+    // mutation routes above were being measured.
+    for (let waited = 0; waited < 300 && !existsSync(done); waited += 1) pause(50)
+
     // Whatever the sweep could not remove while it was being rewritten is this test's to clear —
     // otherwise the sentinel watching THIS process would report it, correctly, as a leak.
     const toolchain = /^(?:tsx-\d+|node-compile-cache)$/
