@@ -708,6 +708,38 @@ type PollResult = {
 }
 
 /**
+ * o3d-psrx r2 — THE SALES REVERSAL CANDIDATES AND THEIR VERDICTS, AS ONE CALLABLE STEP.
+ *
+ * Lifted out of `processDeltaChunk` so the wiring from the DATABASE ROW to the VERDICT can be proved
+ * against a real PostgreSQL, which is the one thing a double cannot establish. The defect Codex found
+ * was precisely a break in that wiring — the poller asked a question the row could answer and never
+ * selected the column that answers it — so a test that reconstructs the query by hand would have
+ * passed over it. tests/concurrency/paid-provenance-reversal.concurrent.test.ts calls THIS.
+ *
+ * Behaviour is unchanged: same query, same select, same arguments, same order.
+ */
+export async function readSalesResidualVerdicts(
+  candidateInvoices: Map<string, XeroInvoice>,
+  zeroPaidInvoiceIds: ReadonlySet<string>,
+  ledgerObservedBefore: LedgerReadFence | null,
+): Promise<ResidualReading<WithheldOrderDoc>> {
+  const candidateOrders = candidateInvoices.size === 0 ? [] : await db.salesOrder.findMany({
+    where: { accountingInvoiceId: { in: [...candidateInvoices.keys()] }, paidAt: { not: null } },
+    select: {
+      id: true, accountingInvoiceId: true, orderNumber: true, externalOrderNumber: true, status: true,
+      // o3d-psrx r2: WHERE this order's paid flag came from. Selected with `paidAt`'s own candidates
+      // because the reversal verdict turns on it — see readResidualVerdicts. Leaving it out is the
+      // defect itself: the classifier then answers NOTHING_REGISTERED for a channel-paid sale and the
+      // reversal proceeds against a customer who really did pay.
+      unregisteredPaidAt: true,
+    },
+  })
+  return await readResidualVerdicts(
+    candidateOrders, candidateInvoices, zeroPaidInvoiceIds, 'INVOICE_PAYMENT', 'SalesOrder', ledgerObservedBefore,
+  )
+}
+
+/**
  * The four passes, run over ONE slice of the delta.
  *
  * Lifted out of the poll body because an oversized window is no longer read whole: it is drained in
@@ -799,17 +831,8 @@ async function processDeltaChunk(
   )
   let salesResidual = emptyResidual<WithheldOrderDoc>()
   try {
-    const candidateOrders = salesCandidateInvoices.size === 0 ? [] : await db.salesOrder.findMany({
-      where: { accountingInvoiceId: { in: [...salesCandidateInvoices.keys()] }, paidAt: { not: null } },
-      select: {
-        id: true, accountingInvoiceId: true, orderNumber: true, externalOrderNumber: true, status: true,
-        // o3d-psrx r2: WHERE this order's paid flag came from. Selected with `paidAt`'s own candidates
-        // because the reversal verdict turns on it — see readResidualVerdicts.
-        unregisteredPaidAt: true,
-      },
-    })
-    salesResidual = await readResidualVerdicts(
-      candidateOrders, salesCandidateInvoices, salesZeroPaidIds, 'INVOICE_PAYMENT', 'SalesOrder', ledgerObservedBefore,
+    salesResidual = await readSalesResidualVerdicts(
+      salesCandidateInvoices, salesZeroPaidIds, ledgerObservedBefore,
     )
   } catch (e) {
     result.errors.push(`Sales registered-payment reading error: ${String(e)}`)
