@@ -99,7 +99,7 @@ test('[o3d-batch-ret] the application and the shell answer the SAME rule on ever
   assert.ok(CASES.some(([, , e]) => !e), 'the table must contain refused cases')
 })
 
-test('[o3d-batch-ret] MUTATION: a substring match — the plausible wrong rule — disagrees on the near-misses', async () => {
+test('[o3d-batch-ret] MUTATION: a substring match — the plausible wrong rule — disagrees on the near-misses', async (t) => {
   // THE ROUTE, RUN, on both sides. `includes` instead of a whole-string comparison is what
   // "matching the diagnostic" means if nobody says WHOLE, and it accepts a failure that merely
   // mentions the benign message.
@@ -117,9 +117,13 @@ test('[o3d-batch-ret] MUTATION: a substring match — the plausible wrong rule �
   assert.equal(src.split(whole).length - 1, 1,
     'the shell rule must compare the normalised diagnostic WHOLE, exactly once')
   const sloppySrc = src.replace(whole, '  [[ "${normalised}" == *"no crontab for ${user}"* ]]')
-  const { mkdtempSync, writeFileSync } = await import('node:fs')
+  const { mkdtempSync, writeFileSync, rmSync } = await import('node:fs')
   const { tmpdir } = await import('node:os')
-  const sloppyLib = join(mkdtempSync(join(tmpdir(), 'crontab-rule-')), 'crontab-lock.sh')
+  const sloppyRoot = mkdtempSync(join(tmpdir(), 'crontab-rule-'))
+  // This directory outlives no scope but the test's, so it is removed by t.after rather than at
+  // the end of the body: the two assertions below can fail, and the failure path must not leak.
+  t.after(() => rmSync(sloppyRoot, { recursive: true, force: true }))
+  const sloppyLib = join(sloppyRoot, 'crontab-lock.sh')
   writeFileSync(sloppyLib, sloppySrc)
 
   assert.equal(await shellProbe(USER, trap, sloppyLib), true,
