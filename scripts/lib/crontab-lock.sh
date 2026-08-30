@@ -172,7 +172,8 @@ prepare_crontab_lock() {
   # else. It is asked rather than hardcoded so the check below reads as "owned by the privileged
   # user that owns this install", which is the property that matters, and so this function can be
   # exercised in a test harness that is not root.
-  self="$(id -u)"
+  self="$(id -u)" || die \
+    "\`id -u\` failed, so this run cannot establish which uid it is and cannot check that the crontab lock at ${CRONTAB_LOCK_DIR} belongs to it. An unanswerable ownership question is not an ownership proof."
 
   # (1) THE DIRECTORY. Plain `mkdir`: a symlink already at this path makes it fail with EEXIST
   # instead of being followed, and we then refuse below rather than working inside it.
@@ -202,6 +203,15 @@ prepare_crontab_lock() {
   chown -h root:root "${CRONTAB_LOCK_FILE}"
 
   # (3) THE POST-CONDITIONS, re-read with lstat rather than assumed from the steps above.
+  #
+  # THE `|| true` ON EVERY `stat` HERE IS DELIBERATE, AND IT IS SAFE FOR A STATED REASON
+  # (o3d-p9dq, Codex r31 sweep). Each capture is compared against a POSITIVE LITERAL — "directory",
+  # "regular file", the uid this process is running as — so a `stat` that could not run yields the
+  # empty string, matches none of them, and DIES. The failure direction is the refusing one, which
+  # is why these are not rewritten to take a status: there is nothing a status could add that the
+  # comparison does not already do. What matters is that this is written down; every OTHER capture
+  # in this file whose failure is not already a refusal takes its status explicitly, and the
+  # repository walk in tests/settings/crontab-reconcile-serialization.test.ts holds that line.
   dir_meta="$(stat -c '%F|%u|%a' "${CRONTAB_LOCK_DIR}" 2>/dev/null || true)"
   IFS='|' read -r dir_kind dir_owner dir_mode <<< "${dir_meta}"
   [[ "${dir_kind}" == "directory" && "${dir_owner}" == "${self}" ]] || die \
@@ -392,9 +402,20 @@ CRONTAB_READ_REASON=""
 # prefix and surrounding whitespace, then compared WHOLE: a second line, or any trailing text,
 # leaves the read unresolved rather than being skimmed for a substring.
 crontab_read_says_no_crontab() {
-  local user="$1" err="$2" normalised
-  normalised="$(printf '%s' "${err}" | tr -d '\r' \
-    | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^crontab:[[:space:]]*//')"
+  local user="$1" err="$2" stripped normalised
+  # TWO CAPTURES, EACH WITH ITS STATUS TAKEN, rather than one three-stage pipeline whose middle
+  # command could fail unseen (o3d-p9dq, Codex r31 sweep). This one was already fail-closed BY
+  # ACCIDENT — the comparison below is against a non-empty literal, so a failed `tr` or `sed` gave
+  # an empty string, failed to match, and left the read unresolved, which is the safe direction.
+  # "Safe because the answer happens to come out no" is the shape this file keeps having to remove,
+  # and it stops being safe the moment somebody inverts the comparison. So it is stated.
+  #
+  # `printf` is a builtin and each capture ends in the external command, so no pipefail is needed
+  # for either status to be the one that matters. The normalisation itself is unchanged: a second
+  # line, or any trailing text, still leaves the read unresolved rather than being skimmed.
+  stripped="$(printf '%s' "${err}" | tr -d '\r')" || return 1
+  normalised="$(printf '%s' "${stripped}" \
+    | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^crontab:[[:space:]]*//')" || return 1
   [[ "${normalised}" == "no crontab for ${user}" ]]
 }
 
@@ -666,6 +687,115 @@ require_crontab_command() {
 # inverse and every message quote the same string. Three copies of a sentinel is three sentinels.
 CRON_FENCE_PREFIX='#DEPLOY-FENCE# '
 
+# =============================================================================
+# A COMPUTATION THAT COULD NOT BE RUN IS NOT AN ANSWER OF "NOTHING"
+# (o3d-p9dq, Codex r31 CRITICAL)
+# =============================================================================
+# This file already refuses to read an absence as a proof twice. `read_crontab_for` will not let a
+# failed `crontab -l` become an empty crontab, and `port_listener_census` will not let a failed
+# `ss` become an absent listener. The PLANNER then did exactly that a third time, in the one place
+# where the consequence cannot be undone:
+#
+#     merged="$(crontab_unfence_projection "${live}")"                          <- status discarded
+#     missing="$(crontab_unmanaged_lines_missing_from "${backup}" "${merged}")" <- status discarded
+#     if [[ -z "${missing}" ]]; then … CRON_UNFENCE_PLAN="merge" …
+#
+# Every caller reaches this function as `plan_crontab_unfence … || return`, and a command on the
+# LEFT of `||` runs with errexit suspended for its whole dynamic extent — so neither assignment
+# aborted anything. An `awk` that is missing, killed by the OOM reaper, or denied by seccomp makes
+# BOTH substitutions empty; the empty `missing` is then read as "the merge loses nothing",
+# `CRON_UNFENCE_TEXT` is set to the empty `merged`, and the caller installs an EMPTY CRONTAB and
+# then deletes ${CRON_BACKUP} — the only copy of the schedule it has just erased. Reproduced
+# against the shipped function with a failing `awk`: rc=0, plan=merge, empty text.
+#
+# WHY AN EXIT STATUS IS NOT ENOUGH HERE, and this is the whole difficulty: "produced no output" is
+# a LEGITIMATE ANSWER at both sites. A crontab may genuinely be empty, and a subsequence check may
+# genuinely find nothing missing. Failure therefore cannot be represented as emptiness, because
+# emptiness is already taken. Each computation below establishes its success POSITIVELY instead:
+#
+#   the projections   are line-for-line transforms — the fence prefixes each active line, the
+#                     unfence removes that prefix, and neither adds or drops one — so the answer is
+#                     accepted only when the output holds exactly as many lines as the input did.
+#                     An awk that exits 0 having printed nothing fails that; the projection of a
+#                     genuinely empty crontab (nought lines in, nought lines out) passes it.
+#   the subsequence   check prints a COMPLETION SENTINEL as the last thing its END block does, so
+#                     "nothing is missing" arrives as the sentinel alone and a check that died
+#                     part-way through arrives without it. Same shape as the `ss -ltn` header row
+#                     one section below, built deliberately rather than relied upon.
+#
+# A status of its own, so a caller can tell "the computation could not be made" from "the world
+# moved" (76) and from "the write was rejected" (77). An operator sent to compare two crontabs by
+# hand, when what actually happened is that `awk` is missing, is sent to the wrong place.
+CRONTAB_COMPUTE_FAILED=78
+CRON_COMPUTE_TEXT=""
+CRON_COMPUTE_REASON=""
+
+# HOW MANY LINES IS THIS TEXT? In the shell's own arithmetic, with no subprocess — a checker that
+# calls out to `wc` can be taken down by the very failure it exists to detect. Command substitution
+# has already stripped the trailing newline from both the input and the output, so both are counted
+# by the same rule: the empty string is nought lines, and anything else has one more line than it
+# has newlines.
+CRON_LINE_COUNT=0
+crontab_count_lines() {
+  local text="$1" newlines
+  CRON_LINE_COUNT=0
+  if [[ -z "${text}" ]]; then return 0; fi
+  newlines="${text//[!$'\n']/}"
+  CRON_LINE_COUNT=$(( ${#newlines} + 1 ))
+  return 0
+}
+
+# RUN A LINE-FOR-LINE PROJECTION, AND ESTABLISH THAT IT RAN.
+#
+#   run_crontab_projection <what-it-is> <projection-fn> <input-text>
+#
+#   0  the projection RAN. CRON_COMPUTE_TEXT holds it — legitimately empty when the input was.
+#   1  the projection did NOT run. CRON_COMPUTE_REASON says why, and CRON_COMPUTE_TEXT is not an
+#      answer: the caller must refuse, install nothing, and delete no backup.
+run_crontab_projection() {
+  local what="$1" fn="$2" input="$3" out rc=0 want got
+  CRON_COMPUTE_TEXT=""
+  CRON_COMPUTE_REASON=""
+
+  out="$("${fn}" "${input}")" || rc=$?
+  if [[ "${rc}" -ne 0 ]]; then
+    CRON_COMPUTE_REASON="${what} exited ${rc}, so it did not run to completion. Its empty output is a FAILED COMPUTATION and not an empty crontab, and nothing may be installed — and no backup deleted — on the strength of it"
+    return 1
+  fi
+
+  # THE POSITIVE PROOF, and the thing an exit status cannot give. An `awk` replaced by a shim, cut
+  # off by a truncated pipe, or denied its input by seccomp can exit 0 having emitted nothing at
+  # all; a line count that no longer matches says so whatever it exited with.
+  crontab_count_lines "${input}"; want="${CRON_LINE_COUNT}"
+  crontab_count_lines "${out}";   got="${CRON_LINE_COUNT}"
+  if [[ "${got}" -ne "${want}" ]]; then
+    CRON_COMPUTE_REASON="${what} exited 0 but returned ${got} line(s) for an input of ${want}. A line-for-line projection that changes the line count did not run to completion, whatever it exited with, and its output is not a crontab this run is willing to install"
+    return 1
+  fi
+
+  CRON_COMPUTE_TEXT="${out}"
+  return 0
+}
+
+# RUN THE UNMANAGED-LINE COMPARISON, AND ESTABLISH THAT IT RAN.
+#
+#   0  the comparison RAN. CRON_COMPUTE_TEXT holds the lines the merge would drop, and an empty
+#      value here MEANS "it would drop none" — because the sentinel proved the check finished.
+#   1  the comparison did NOT run. An empty answer from a check that never ran is not a clean
+#      bill of health, and it is the difference between merging and erasing a crontab.
+run_crontab_missing_comparison() {
+  local backup="$1" candidate="$2" out rc=0
+  CRON_COMPUTE_TEXT=""
+  CRON_COMPUTE_REASON=""
+  out="$(crontab_unmanaged_lines_missing_from "${backup}" "${candidate}")" || rc=$?
+  if [[ "${rc}" -ne 0 ]]; then
+    CRON_COMPUTE_REASON="the comparison that asks which of the backup's unmanaged lines a merge would drop did not run to completion (exit ${rc}), so nothing has established that the merge loses nothing. An empty answer from a check that never ran is not a clean bill of health"
+    return 1
+  fi
+  CRON_COMPUTE_TEXT="${out}"
+  return 0
+}
+
 # THE FENCE, AS A PURE FUNCTION. `fence_cron_locked` in all three entrypoints runs its crontab
 # through THIS, so the comparison in plan_crontab_unfence() below is asking about the transform
 # that was actually applied rather than about a re-typed copy of it that can drift.
@@ -673,15 +803,20 @@ CRON_FENCE_PREFIX='#DEPLOY-FENCE# '
 # Comment lines and blank lines pass through untouched: they are already inert, and prefixing
 # them would make the inverse ambiguous.
 crontab_fence_projection() {
-  printf '%s\n' "$1" \
-    | awk '{ if ($0 ~ /^[[:space:]]*[^#[:space:]]/) print "#DEPLOY-FENCE# " $0; else print $0 }'
+  # A HERE-STRING, NOT A PIPE (o3d-p9dq, Codex r31 CRITICAL). A pipeline reports only its LAST
+  # command's status unless whoever sourced this file happens to have pipefail set, so a `printf`
+  # that failed — a full /tmp, a closed descriptor — could hand `awk` a truncated crontab and the
+  # projection would still exit 0. `<<<` appends exactly the one trailing newline `printf '%s\n'`
+  # did, so the output is byte-identical, and the status is one command's and unambiguous.
+  awk '{ if ($0 ~ /^[[:space:]]*[^#[:space:]]/) print "#DEPLOY-FENCE# " $0; else print $0 }' <<< "$1"
 }
 
 # ITS EXACT INVERSE: remove the mark this protocol added, and nothing else. Anchored, and it
 # strips ONE occurrence from the front of the line, so a line an operator wrote that happens to
 # contain the sentinel further along is untouched.
 crontab_unfence_projection() {
-  printf '%s\n' "$1" | awk '{ sub(/^#DEPLOY-FENCE# /, ""); print }'
+  # A here-string for the same reason its inverse uses one: one command, one status.
+  awk '{ sub(/^#DEPLOY-FENCE# /, ""); print }' <<< "$1"
 }
 
 # WHICH LINES ONLY THE CRONTAB REMEMBERS — and are they all still there, as many times as there
@@ -786,9 +921,20 @@ CRONTAB_MANAGED_BLOCK_AWK='
   }
 '
 
+# THE COMPLETION SENTINEL (o3d-p9dq, Codex r31 CRITICAL). Printed as the LAST thing the END block
+# below does, and stripped again by the shell, so the function's stdout is exactly what it always
+# was. What it buys is the one distinction this check could not otherwise make: "nothing is
+# missing" now arrives as the sentinel ALONE, and an awk that was never run, or was killed part-way
+# through the comparison loop, arrives without it — where before both arrived as an empty string
+# and the empty one was read as a clean bill of health for the merge.
+#
+# The leading SOH is deliberate. A crontab line that were somehow exactly this string would be
+# reported as MISSING rather than swallowed as the sentinel, which errs towards refusing.
+CRONTAB_SUBSEQUENCE_SENTINEL=$'\001CRONTAB-SUBSEQUENCE-COMPLETE\001'
+
 crontab_unmanaged_lines_missing_from() {
-  local backup="$1" candidate="$2"
-  awk "${CRONTAB_MANAGED_BLOCK_AWK}"'
+  local backup="$1" candidate="$2" out rc=0
+  out="$(awk -v sentinel="${CRONTAB_SUBSEQUENCE_SENTINEL}" "${CRONTAB_MANAGED_BLOCK_AWK}"'
     NR == FNR { craw[++cn] = $0; next }
     { braw[++bn] = $0 }
     END {
@@ -804,8 +950,22 @@ crontab_unmanaged_lines_missing_from() {
         while (j <= m && cand[j] != back[i]) j++
         if (j <= m) { cursor = j + 1 } else { print back[i] }
       }
+      print sentinel   # LAST: it proves the loop above ran to the end, not merely that awk started
     }
-  ' <(printf '%s\n' "${candidate}") <(printf '%s\n' "${backup}")
+  ' <(printf '%s\n' "${candidate}") <(printf '%s\n' "${backup}"))" || rc=$?
+  if [[ "${rc}" -ne 0 ]]; then return 1; fi
+  # NO SENTINEL, NO ANSWER. An awk that exited 0 without reaching the end of its END block — a
+  # shim, a truncated pipe, a seccomp denial — produces output that does not end here, and this
+  # function refuses rather than reporting the empty set of missing lines it appears to have found.
+  if [[ "${out}" != "${CRONTAB_SUBSEQUENCE_SENTINEL}" \
+     && "${out}" != *$'\n'"${CRONTAB_SUBSEQUENCE_SENTINEL}" ]]; then return 1; fi
+  out="${out%"${CRONTAB_SUBSEQUENCE_SENTINEL}"}"
+  out="${out%$'\n'}"
+  # Byte-for-byte the stdout this function has always produced: the missing lines each followed by
+  # a newline, and nothing at all when there are none. The awk never emits a blank line, so
+  # stripping and restoring the trailing newline here is lossless.
+  if [[ -n "${out}" ]]; then printf '%s\n' "${out}"; fi
+  return 0
 }
 
 # IS THE WORLD STILL THE ONE THE SNAPSHOT WAS TAKEN FROM?
@@ -817,9 +977,26 @@ crontab_unmanaged_lines_missing_from() {
 # condition under which installing the snapshot cannot discard anything. `crontab -` on the Vixie
 # cron these scripts ship to writes its input verbatim and `crontab -l` reads it back verbatim, so
 # this equality is a real test and not a formatting lottery.
+#   0                          the comparison RAN, and the live crontab IS that projection
+#   1                          the comparison RAN, and they differ — something wrote
+#   ${CRONTAB_COMPUTE_FAILED}  the comparison could NOT be made; CRON_UNMOVED_REASON says why
+#
+# THE THIRD ANSWER IS NEW (o3d-p9dq, Codex r31 CRITICAL). This was one line — `[[ "${live}" ==
+# "$(crontab_fence_projection "${backup}")" ]]` — and a command substitution inside `[[ ]]` throws
+# its status away. A failed projection therefore compared the live crontab against the EMPTY
+# STRING, which is not a comparison anybody asked for: against a non-empty crontab it silently
+# became "something wrote" and fell through to the merge, and against a genuinely empty one it
+# became "nothing wrote" and returned the snapshot — restoring entries an operator had deleted,
+# which is the exact resurrection round 27 removed the lost-lines branch to prevent.
+CRON_UNMOVED_REASON=""
 crontab_is_unmoved_since_backup() {
   local backup="$1" live="$2"
-  [[ "${live}" == "$(crontab_fence_projection "${backup}")" ]]
+  CRON_UNMOVED_REASON=""
+  if ! run_crontab_projection "the fence projection of the backup" crontab_fence_projection "${backup}"; then
+    CRON_UNMOVED_REASON="${CRON_COMPUTE_REASON}"
+    return "${CRONTAB_COMPUTE_FAILED}"
+  fi
+  [[ "${live}" == "${CRON_COMPUTE_TEXT}" ]]
 }
 
 # HOW A FENCED CRONTAB IS PUT BACK.
@@ -843,16 +1020,29 @@ CRON_UNFENCE_PLAN=""
 CRON_UNFENCE_TEXT=""
 CRON_UNFENCE_REASON=""
 plan_crontab_unfence() {
-  local backup="$1" live="$2" merged missing
+  local backup="$1" live="$2" merged missing unmoved=0
   CRON_UNFENCE_PLAN=""
   CRON_UNFENCE_TEXT=""
   CRON_UNFENCE_REASON=""
+
+  # (0) EVERY COMPUTATION BELOW IS CHECKED, AND A FAILED ONE REFUSES BEFORE ANY PLAN IS SET
+  # (o3d-p9dq, Codex r31 CRITICAL). See the section above `crontab_fence_projection` for the route
+  # this used to take: three unchecked substitutions, an empty `missing` read as "the merge loses
+  # nothing", and a caller that installed an empty crontab and deleted the only copy of what had
+  # been there. The refusal is set BEFORE anything else so that no path out of this function can
+  # leave a merge plan behind a computation that did not run.
 
   # (1) DID ANYTHING WRITE? Asked by comparing the live crontab with the fence's OWN projection of
   # the backup, byte for byte. Equal means the only write since the snapshot was the fence itself,
   # so the snapshot is provably current and goes back verbatim — the pre-existing behaviour, now
   # with a proof under it instead of an assumption.
-  if crontab_is_unmoved_since_backup "${backup}" "${live}"; then
+  crontab_is_unmoved_since_backup "${backup}" "${live}" || unmoved=$?
+  if [[ "${unmoved}" -eq "${CRONTAB_COMPUTE_FAILED}" ]]; then
+    CRON_UNFENCE_PLAN="refuse"
+    CRON_UNFENCE_REASON="${CRON_UNMOVED_REASON}"
+    return "${CRONTAB_COMPUTE_FAILED}"
+  fi
+  if [[ "${unmoved}" -eq 0 ]]; then
     CRON_UNFENCE_PLAN="snapshot"
     CRON_UNFENCE_TEXT="${backup}"
     return 0
@@ -872,8 +1062,22 @@ plan_crontab_unfence() {
   # (2) SOMETHING WROTE. Undo the fence where it was applied: the live crontab minus the marks.
   # That keeps the managed block whoever wrote it last projected from the settings rows, and it
   # keeps any unmanaged line added while the fence was up.
-  merged="$(crontab_unfence_projection "${live}")"
-  missing="$(crontab_unmanaged_lines_missing_from "${backup}" "${merged}")"
+  run_crontab_projection "the unfence projection of the live crontab" crontab_unfence_projection "${live}" || {
+    CRON_UNFENCE_PLAN="refuse"
+    CRON_UNFENCE_REASON="${CRON_COMPUTE_REASON}"
+    return "${CRONTAB_COMPUTE_FAILED}"
+  }
+  merged="${CRON_COMPUTE_TEXT}"
+
+  run_crontab_missing_comparison "${backup}" "${merged}" || {
+    CRON_UNFENCE_PLAN="refuse"
+    CRON_UNFENCE_REASON="${CRON_COMPUTE_REASON}"
+    return "${CRONTAB_COMPUTE_FAILED}"
+  }
+  missing="${CRON_COMPUTE_TEXT}"
+
+  # AND ONLY NOW MAY AN EMPTY ANSWER MEAN "NOTHING IS MISSING". Both computations have positively
+  # established that they ran; before this round, reaching this line proved nothing at all.
   if [[ -z "${missing}" ]]; then
     CRON_UNFENCE_PLAN="merge"
     CRON_UNFENCE_TEXT="${merged}"
@@ -945,8 +1149,28 @@ port_listener_census() {
     PORT_DRAIN_REASON="\`ss -ltn\` exited 0 but produced no output at all, not even its header row, so its silence cannot be read as an absent listener"
     return 1
   fi
-  PORT_DRAIN_LISTENERS="$(printf '%s\n' "${out}" \
-    | awk -v p=":${port}\$" '$4 ~ p { n += 1 } END { print n + 0 }')"
+  # THE COUNT IS A COMPUTATION TOO, AND IT WAS THE ONE THING HERE NOBODY CHECKED
+  # (o3d-p9dq, Codex r31, the same shape as the CRITICAL). Everything above exists so that a failed
+  # `ss` cannot be read as an absent listener — and then the count was taken with an unchecked
+  # `printf | awk` whose empty result went straight into `[[ "${PORT_DRAIN_LISTENERS}" -eq 0 ]]`.
+  # Bash evaluates the EMPTY STRING as 0 in an arithmetic comparison, so a broken `awk` reported
+  # the port as drained over a census it never read, and the cron fence was then taken with the
+  # predecessor still serving. Measured, not reasoned about: `[[ "" -eq 0 ]]` is TRUE here.
+  #
+  # A here-string rather than a pipe, so the status is awk's alone; then the status; then the
+  # POSITIVE establishment that what came back is a number, because that is the only thing that
+  # separates "nought listeners" from "no answer".
+  local count rc_count=0
+  count="$(awk -v p=":${port}\$" '$4 ~ p { n += 1 } END { print n + 0 }' <<< "${out}")" || rc_count=$?
+  if [[ "${rc_count}" -ne 0 ]]; then
+    PORT_DRAIN_REASON="the listener count could not be computed from a census that DID run (\`awk\` exited ${rc_count}), so nothing has established how many sockets are listening on :${port}"
+    return 1
+  fi
+  if [[ ! "${count}" =~ ^[0-9]+$ ]]; then
+    PORT_DRAIN_REASON="the listener count for :${port} came back as '${count}', which is not a number. An unparseable count must not be read as nought — the shell would do exactly that, because it evaluates an empty string as 0 in an arithmetic comparison"
+    return 1
+  fi
+  PORT_DRAIN_LISTENERS="${count}"
   return 0
 }
 
