@@ -25,7 +25,7 @@ import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import test from 'node:test'
+import test, { type TestContext } from 'node:test'
 
 import { createTempDirSync } from './temp-dir.ts'
 
@@ -86,9 +86,8 @@ function runBash(script: string, opts: { cwd?: string, env?: Record<string, stri
 }
 
 /** A PATH shim directory whose entries delegate to the real tool after recording what they saw. */
-function shimDir(t: Parameters<typeof test>[1] extends never ? never : Parameters<Parameters<typeof test>[1]>[0],
-  shims: Record<string, string>): string {
-  const dir = createTempDirSync('ims-czpy-shim-', t as never)
+function shimDir(t: TestContext, shims: Record<string, string>): string {
+  const dir = createTempDirSync('ims-czpy-shim-', t)
   for (const [name, body] of Object.entries(shims)) {
     const path = join(dir, name)
     writeFileSync(path, `#!/usr/bin/env bash\n${body}\n`)
