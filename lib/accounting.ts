@@ -11,6 +11,7 @@ import { stampingCustodyOnCreate } from '@/lib/domain/accounting/money-attempt-p
 import {
   classifyPriorAttempts,
   describeUnresolvedPriorAttempt,
+  isIdempotencyKeyIndexCollision,
   PRIOR_ATTEMPT_SELECT,
   priorAttemptsWhere,
 } from '@/lib/domain/accounting/prior-posting-evidence'
@@ -544,8 +545,14 @@ export async function queueAccountingSyncTx(
   } catch (error) {
     // A unique-key collision means a concurrent insert already queued this posting,
     // so the GL counterpart exists — treat as queued.
-    if (params.idempotencyKey && String(error).includes('accounting_sync_logs_idempotency_key_uq')) {
-      return answer({ queued: true }, context.connector)
+    //
+    // o3d-d0pd: detected through the shared reader rather than a substring of the error text, which
+    // the driver adapter never contains (o3d-5od). NOTE, unchanged by this: catching a P2002 inside
+    // the CALLER's interactive transaction leaves that transaction aborted (Postgres 25P02) because
+    // Prisma wraps no savepoint around the statement, so the caller's commit fails anyway. Making the
+    // guard fire is necessary but not sufficient here; the savepoint half is o3d-5od's own follow-up.
+    if (params.idempotencyKey && isIdempotencyKeyIndexCollision(error)) {
+      return answer({ queued: true, reason: 'already-queued' }, context.connector)
     }
     throw error
   }

@@ -1,4 +1,5 @@
 import type { Prisma } from '@/app/generated/prisma/client'
+import { uniqueConstraintFields } from '@/lib/db/prisma-unique-violation'
 
 /**
  * o3d-d0pd — WHAT AN ALREADY-PRESENT CHECK HAS TO PROVE BEFORE IT RAISES A SECOND ROW.
@@ -188,4 +189,36 @@ export function describeUnresolvedPriorAttempt(params: {
     + 'would create a SECOND document if the first one landed. REMEDY: resolve that row on /sync — '
     + 'retry it, or record its document id with the per-row settlement action if the document is '
     + 'already in the ledger. This posting is still outstanding until you do.'
+}
+
+/**
+ * IS THIS P2002 THE IDEMPOTENCY INDEX SAYING A CONCURRENT ENQUEUE GOT THERE FIRST?
+ *
+ * A SEPARATE DEFECT, FOUND BY THE o3d-d0pd CONCURRENCY PROBE, ON THE SAME THREE LINES. All three
+ * enqueues end with
+ *
+ *     if (String(error).includes('accounting_sync_logs_idempotency_key_uq')) return { queued: true }
+ *
+ * and that condition has never once been true under the driver adapter this build uses. o3d-5od
+ * established it and lib/db/prisma-unique-violation.ts documents it from a live probe: `@prisma/
+ * adapter-pg` reports a P2002 as a COLUMN LIST (`meta.driverAdapterError.cause.constraint.fields`)
+ * and populates neither `meta.target` nor the index name anywhere `String(error)` can see it. The
+ * message the caller gets is "Unique constraint failed on the fields: (`connector`, `type`, …)".
+ *
+ * So the handler for "another writer queued this posting a millisecond ago" was dead code, and two
+ * concurrent enqueues for one key threw a raw P2002 out of the enqueue instead of reporting the
+ * counterpart that demonstrably exists. Safe — nothing duplicates — but it turns an ordinary race
+ * into a failed refund retry, and it made the enqueue's own comment ("already present") untrue.
+ *
+ * THE DISCRIMINATOR IS `_idempotencyKey`. `accounting_sync_logs` carries two partial unique indexes
+ * and only this one mentions that path: `accounting_sync_logs_followup_live_unique` is expressed
+ * over `accountingInvoiceId` / `creditNoteId` / `paymentId`. The index NAME is still matched as a
+ * fallback, so this keeps working if the adapter is swapped back for the query engine — which is
+ * exactly the case the dead condition was written for.
+ */
+export function isIdempotencyKeyIndexCollision(error: unknown): boolean {
+  const names = uniqueConstraintFields(error)
+  if (!names) return false
+  return names.some((name) =>
+    name.includes('_idempotencyKey') || name === 'accounting_sync_logs_idempotency_key_uq')
 }

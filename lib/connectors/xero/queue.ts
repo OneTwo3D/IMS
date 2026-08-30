@@ -24,6 +24,7 @@ import { stampingCustodyOnCreate } from '@/lib/domain/accounting/money-attempt-p
 import {
   classifyPriorAttempts,
   describeUnresolvedPriorAttempt,
+  isIdempotencyKeyIndexCollision,
   PRIOR_ATTEMPT_SELECT,
   priorAttemptsWhere,
 } from '@/lib/domain/accounting/prior-posting-evidence'
@@ -211,8 +212,13 @@ export async function queueXeroSync(params: {
     return { queued: true }
   } catch (error) {
     // A concurrent insert already queued this posting, so the counterpart exists — already present.
-    if (params.idempotencyKey && String(error).includes('accounting_sync_logs_idempotency_key_uq')) {
-      return { queued: true }
+    //
+    // o3d-d0pd: read through `isIdempotencyKeyIndexCollision`, not `String(error).includes(...)`. The
+    // driver adapter this build uses reports a P2002 as a COLUMN LIST and puts the index name nowhere
+    // the string form can see it (o3d-5od), so the old condition was never once true and an ordinary
+    // race threw a raw P2002 out of the enqueue instead.
+    if (params.idempotencyKey && isIdempotencyKeyIndexCollision(error)) {
+      return { queued: true, reason: 'already-queued' }
     }
     throw error
   }

@@ -18,6 +18,7 @@ import { stampingCustodyOnCreate } from '@/lib/domain/accounting/money-attempt-p
 import {
   classifyPriorAttempts,
   describeUnresolvedPriorAttempt,
+  isIdempotencyKeyIndexCollision,
   PRIOR_ATTEMPT_SELECT,
   priorAttemptsWhere,
 } from '@/lib/domain/accounting/prior-posting-evidence'
@@ -185,8 +186,10 @@ export async function queueQuickBooksSync(params: {
     return { queued: true }
   } catch (error) {
     // A concurrent insert already queued this posting, so the counterpart exists — already present.
-    if (params.idempotencyKey && String(error).includes('accounting_sync_logs_idempotency_key_uq')) {
-      return { queued: true }
+    // o3d-d0pd: the twin of the Xero queue's correction — see isIdempotencyKeyIndexCollision for why
+    // the string match it replaces could never fire.
+    if (params.idempotencyKey && isIdempotencyKeyIndexCollision(error)) {
+      return { queued: true, reason: 'already-queued' }
     }
     throw error
   }
