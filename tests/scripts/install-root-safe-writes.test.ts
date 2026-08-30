@@ -573,6 +573,50 @@ test('[o3d-rn10] publish_durable_file refuses a destination component swapped be
   assert.deepEqual(readdirSync(victim).sort(), ['known_hosts'], 'and nothing may be created inside the directory the link chose')
 })
 
+test('[o3d-rn10] publish_durable_file stages inside the directory it PINNED, even when the destination NAME is swapped for a symlink after the walk', (t) => {
+  const root = createTempDirSync('ims-rn10-postwalk-', t)
+  const dataDir = join(root, 'data')
+  const gitSsh = join(dataDir, 'git-ssh')
+  const moved = join(dataDir, 'git-ssh.moved')
+  const victim = join(root, 'root-dot-ssh')
+  mkdirSync(gitSsh, { recursive: true })
+  mkdirSync(victim)
+  writeFileSync(join(victim, 'known_hosts'), 'UNTOUCHED\n')
+  chmodSync(victim, 0o700)
+
+  // THE HALF A WALK ALONE DOES NOT BUY. Walking down to the destination pins it as a descriptor —
+  // and then RE-DERIVING `${dir}/${PUBLISH_STAGE_DIRNAME}` from the pathname hands that pin
+  // straight back, because `mkdir`, `stat` and `chown` would each resolve ${dir} again. This shim
+  // fires in exactly that window: the walk has finished, the destination is pinned, and the NAME
+  // is swapped for a link the instant the staging directory is created.
+  const bin = shimDir(t, {
+    mkdir: [
+      'for a in "$@"; do',
+      '  case "$a" in',
+      `    *${'.ims-publish'}) ${REAL.mv} -T ${q(gitSsh)} ${q(moved)}; ${REAL.ln} -s ${q(victim)} ${q(gitSsh)} ;;`,
+      '  esac',
+      'done',
+      `exec ${REAL.mkdir} "$@"`,
+    ].join('\n'),
+  })
+
+  const script = rig(PUBLISHER, [
+    `printf 'github.com ssh-ed25519 AAAA\\n' | publish_durable_file "${join(gitSsh, 'known_hosts')}" "" 600`,
+    'echo "rc=$?"',
+  ].join('\n'), roots({ data: dataDir }))
+  const run = runBash(script, { env: { PATH: `${bin}:${process.env.PATH ?? ''}` } })
+
+  // NOT VACUOUS: the swap fired, and it fired while the publication was in flight.
+  assert.equal(lstatSync(gitSsh).isSymbolicLink(), true, 'the destination NAME must have been swapped for the planted link')
+
+  assert.match(run.stdout, /^rc=0$/m, `the publication must complete in the directory it pinned: ${run.stderr}`)
+  assert.deepEqual(readdirSync(victim).sort(), ['known_hosts'],
+    'and NOTHING may be created inside the directory the link chose — not even the staging directory')
+  assert.equal(readFileSync(join(victim, 'known_hosts'), 'utf8'), 'UNTOUCHED\n')
+  assert.equal(readFileSync(join(moved, 'known_hosts'), 'utf8'), 'github.com ssh-ed25519 AAAA\n',
+    'it lands in the directory the walk pinned, which is the one the rename was proved against')
+})
+
 test('[o3d-rn10] publish_durable_file refuses a destination that lies under no trusted ancestor', (t) => {
   const root = createTempDirSync('ims-rn10-noroot-', t)
   const appDir = join(root, 'app')
