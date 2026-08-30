@@ -1341,16 +1341,28 @@ PUBLISH_STAGE_DIRNAME=".ims-publish"
 # the create left. Inside a 0700 root-owned directory nothing can open it either way — which is
 # the belt — but the ordering is the braces, and it costs nothing.
 publish_durable_file() {
-  local target="$1" owner="${2:-}" mode="${3:-600}" dir stage self tmp meta dev
-  # `mv -T` below is given an absolute target so it cannot be re-resolved against the staging cwd.
+  local target="$1" owner="${2:-}" mode="${3:-600}" dir base stage self tmp meta parent
+  # Absolute, so `dirname` and `basename` below split a whole path rather than a fragment of one.
   [[ "$target" == /* ]] || target="${PWD}/${target}"
   dir="$(dirname "$target")"
+  base="$(basename "$target")"
   mkdir -p "$dir" || return 1
   # Asked rather than hardcoded, exactly as prepare_crontab_lock asks it: the property is "owned by
   # the privileged user that owns this install", and it lets the harnesses run this unprivileged.
   self="$(id -u)" || return 1
-  dev="$(stat -c '%d' "$dir" 2>/dev/null || true)"
-  [[ -n "$dev" ]] || return 1
+  # THE DESTINATION DIRECTORY, RECORDED AS A DEVICE AND AN INODE AND NOT AS A NAME (o3d-czpy r2,
+  # Codex HIGH). The staging inode was pinned and the rename then used the ABSOLUTE target, which
+  # re-resolves ${dir} at the instant of the `mv`. For ${DEPLOY_SSH_KNOWN_HOSTS} that directory is
+  # ${DATA_DIR}/git-ssh, whose PARENT belongs to ${APP_USER}, so they can rename `git-ssh` aside
+  # after this function has pinned everything it pinned and leave a symlink at the name — and the
+  # `mv` then publishes a root-written, service-owned file into a directory of their choosing, such
+  # as /root/.ssh/known_hosts. A pinned inode does not pin the path used afterwards.
+  #
+  # The first field is the device, which is what proves the publication below is a rename and not a
+  # dereferencing cross-device copy; the second is the inode, which is what makes it the SAME
+  # directory rather than the same name.
+  parent="$(stat -c '%d:%i' "$dir" 2>/dev/null || true)"
+  [[ -n "$parent" ]] || return 1
   stage="${dir}/${PUBLISH_STAGE_DIRNAME}"
   if ! (umask 077; mkdir "$stage") 2>/dev/null; then
     [[ "$(stat -c '%F' "$stage" 2>/dev/null || true)" == "directory" ]] || return 1
@@ -1361,7 +1373,12 @@ publish_durable_file() {
   (
     cd "$stage" 2>/dev/null || exit 1
     meta="$(stat -c '%u|%a|%d' . 2>/dev/null || true)"
-    [[ "$meta" == "${self}|700|${dev}" ]] || exit 1
+    [[ "$meta" == "${self}|700|${parent%%:*}" ]] || exit 1
+    # AND `..` IS THE DESTINATION, ASKED OF THE KERNEL RATHER THAN OF A PATHNAME. The shell holds a
+    # descriptor on the staging inode; `..` is that directory's own parent link, so it answers
+    # "the directory this staging directory is IN", which no rename of any name above it can move.
+    # A staging directory moved wholesale into some other directory changes it, and is refused.
+    [[ "$(stat -c '%d:%i' .. 2>/dev/null || true)" == "$parent" ]] || exit 1
     if ! tmp="$(mktemp ./publish.XXXXXX 2>/dev/null)"; then exit 1; fi
     if ! chmod "$mode" "$tmp" 2>/dev/null; then rm -f "$tmp"; exit 1; fi
     if [[ -n "$owner" ]] && ! chown "$owner" "$tmp" 2>/dev/null; then rm -f "$tmp"; exit 1; fi
@@ -1369,17 +1386,20 @@ publish_durable_file() {
   # BARRIER 1: the data, before the name exists. After this the rename can only publish
   # bytes that are already on the medium.
     if ! fsync_path "$tmp"; then rm -f "$tmp"; exit 1; fi
-    if ! mv -f -T "$tmp" "$target" 2>/dev/null; then rm -f "$tmp"; exit 1; fi
-  ) || return 1
+    # `../${base}`, and never the absolute target: one component, resolved from the pinned parent.
+    if ! mv -f -T "$tmp" "../${base}" 2>/dev/null; then rm -f "$tmp"; exit 1; fi
   # BARRIER 2: the directory entry the rename created. Without it the reboot can find the
-  # old name, or neither name, however well the data was flushed.
+  # old name, or neither name, however well the data was flushed. It flushes `..` — the same
+  # pinned parent the rename landed in — because `fsync_path "$dir"` re-resolved the pathname
+  # a third time and could report durability for a directory nothing was published into.
   #
   # A FAILURE HERE RETURNS NON-ZERO WITH THE NEW BYTES ALREADY AT $target (o3d-2sm1.5, Codex
   # r10 HIGH). That is not a leak, it is the honest answer: the content is VISIBLE and its
   # NAME is not proven, so a power loss can restore the previous directory entry and with it
   # the previous marker. Callers must act on THIS RETURN VALUE. Anything that greps $target
   # instead reads the new content and concludes a durability it was never given.
-  fsync_path "$dir" || return 1
+    fsync_path .. || exit 1
+  ) || return 1
   return 0
 }
 

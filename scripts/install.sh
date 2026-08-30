@@ -2625,16 +2625,28 @@ PUBLISH_STAGE_DIRNAME=".ims-publish"
 # the create left. Inside a 0700 root-owned directory nothing can open it either way — which is
 # the belt — but the ordering is the braces, and it costs nothing.
 publish_durable_file() {
-  local target="$1" owner="${2:-}" mode="${3:-600}" dir stage self tmp meta dev
-  # `mv -T` below is given an absolute target so it cannot be re-resolved against the staging cwd.
+  local target="$1" owner="${2:-}" mode="${3:-600}" dir base stage self tmp meta parent
+  # Absolute, so `dirname` and `basename` below split a whole path rather than a fragment of one.
   [[ "$target" == /* ]] || target="${PWD}/${target}"
   dir="$(dirname "$target")"
+  base="$(basename "$target")"
   mkdir -p "$dir" || return 1
   # Asked rather than hardcoded, exactly as prepare_crontab_lock asks it: the property is "owned by
   # the privileged user that owns this install", and it lets the harnesses run this unprivileged.
   self="$(id -u)" || return 1
-  dev="$(stat -c '%d' "$dir" 2>/dev/null || true)"
-  [[ -n "$dev" ]] || return 1
+  # THE DESTINATION DIRECTORY, RECORDED AS A DEVICE AND AN INODE AND NOT AS A NAME (o3d-czpy r2,
+  # Codex HIGH). The staging inode was pinned and the rename then used the ABSOLUTE target, which
+  # re-resolves ${dir} at the instant of the `mv`. For ${DEPLOY_SSH_KNOWN_HOSTS} that directory is
+  # ${DATA_DIR}/git-ssh, whose PARENT belongs to ${APP_USER}, so they can rename `git-ssh` aside
+  # after this function has pinned everything it pinned and leave a symlink at the name — and the
+  # `mv` then publishes a root-written, service-owned file into a directory of their choosing, such
+  # as /root/.ssh/known_hosts. A pinned inode does not pin the path used afterwards.
+  #
+  # The first field is the device, which is what proves the publication below is a rename and not a
+  # dereferencing cross-device copy; the second is the inode, which is what makes it the SAME
+  # directory rather than the same name.
+  parent="$(stat -c '%d:%i' "$dir" 2>/dev/null || true)"
+  [[ -n "$parent" ]] || return 1
   stage="${dir}/${PUBLISH_STAGE_DIRNAME}"
   if ! (umask 077; mkdir "$stage") 2>/dev/null; then
     [[ "$(stat -c '%F' "$stage" 2>/dev/null || true)" == "directory" ]] || return 1
@@ -2645,7 +2657,12 @@ publish_durable_file() {
   (
     cd "$stage" 2>/dev/null || exit 1
     meta="$(stat -c '%u|%a|%d' . 2>/dev/null || true)"
-    [[ "$meta" == "${self}|700|${dev}" ]] || exit 1
+    [[ "$meta" == "${self}|700|${parent%%:*}" ]] || exit 1
+    # AND `..` IS THE DESTINATION, ASKED OF THE KERNEL RATHER THAN OF A PATHNAME. The shell holds a
+    # descriptor on the staging inode; `..` is that directory's own parent link, so it answers
+    # "the directory this staging directory is IN", which no rename of any name above it can move.
+    # A staging directory moved wholesale into some other directory changes it, and is refused.
+    [[ "$(stat -c '%d:%i' .. 2>/dev/null || true)" == "$parent" ]] || exit 1
     if ! tmp="$(mktemp ./publish.XXXXXX 2>/dev/null)"; then exit 1; fi
     if ! chmod "$mode" "$tmp" 2>/dev/null; then rm -f "$tmp"; exit 1; fi
     if [[ -n "$owner" ]] && ! chown "$owner" "$tmp" 2>/dev/null; then rm -f "$tmp"; exit 1; fi
@@ -2653,17 +2670,20 @@ publish_durable_file() {
   # BARRIER 1: the data, before the name exists. After this the rename can only publish
   # bytes that are already on the medium.
     if ! fsync_path "$tmp"; then rm -f "$tmp"; exit 1; fi
-    if ! mv -f -T "$tmp" "$target" 2>/dev/null; then rm -f "$tmp"; exit 1; fi
-  ) || return 1
+    # `../${base}`, and never the absolute target: one component, resolved from the pinned parent.
+    if ! mv -f -T "$tmp" "../${base}" 2>/dev/null; then rm -f "$tmp"; exit 1; fi
   # BARRIER 2: the directory entry the rename created. Without it the reboot can find the
-  # old name, or neither name, however well the data was flushed.
+  # old name, or neither name, however well the data was flushed. It flushes `..` — the same
+  # pinned parent the rename landed in — because `fsync_path "$dir"` re-resolved the pathname
+  # a third time and could report durability for a directory nothing was published into.
   #
   # A FAILURE HERE RETURNS NON-ZERO WITH THE NEW BYTES ALREADY AT $target (o3d-2sm1.5, Codex
   # r10 HIGH). That is not a leak, it is the honest answer: the content is VISIBLE and its
   # NAME is not proven, so a power loss can restore the previous directory entry and with it
   # the previous marker. Callers must act on THIS RETURN VALUE. Anything that greps $target
   # instead reads the new content and concludes a durability it was never given.
-  fsync_path "$dir" || return 1
+    fsync_path .. || exit 1
+  ) || return 1
   return 0
 }
 
@@ -2694,28 +2714,80 @@ publish_durable_file() {
 # NO `chmod`, HERE EITHER. The mode comes from the umask the caller states, at creation. A
 # directory that is already there with the wrong mode is the caller's problem to assert on; chmod
 # has no --no-dereference on Linux, so correcting it would be the same escalation with another verb.
+#
+# AND THE WALK NO LONGER RE-RESOLVES WHAT IT HAS ALREADY CHECKED (o3d-czpy r2, Codex HIGH). The
+# version above rebuilt an absolute `${built}` and handed the WHOLE pathname to the next `mkdir`,
+# so every ancestor it had just accepted was resolved again, once per component. On an upgrade
+# `${DATA_DIR}/uploads` is service-owned: the account renames it aside the instant after its `stat`
+# says "directory" and leaves a symlink at the name, and the next root-side `mkdir` — which
+# re-resolves `${DATA_DIR}/uploads/invoices` from the top — creates directories inside whatever
+# they chose. A plain `mkdir` refuses a link AT the component it is creating and says nothing at
+# all about the ancestry that got it there.
+#
+# THE WALK IS THEREFORE A CHDIR AND NOT A PATH. Each step creates or accepts a SINGLE COMPONENT
+# relative to the directory this process is already inside, then steps into it. An ancestor is
+# never named again after it has been entered, so renaming it cannot redirect anything: the shell
+# holds a descriptor on the inode, and the descriptor is the pin.
+#
+# WHAT CLOSES THE LAST WINDOW — the one between "stat says directory" and "cd into it" — IS `..`,
+# WHICH IS NOT A PATHNAME. A directory's `..` is its own parent link, answered by the kernel from
+# the inode this process is in. Step into a component that was swapped for a symlink pointing
+# somewhere else and `..` is that somewhere else's parent, not the directory we came from, and the
+# run is refused. What this does NOT catch is a link aimed at another directory under the SAME
+# parent — and it does not need to: that is a directory the service account already owns, so
+# nothing crosses a privilege boundary.
+#
+# WHY NOT SIMPLY DROP TO ${APP_USER} FOR THE MKDIRs, which is the other remedy for the whole class:
+# see copy_tree_into_new_dir() below, where the same choice is made and the reasoning is written
+# out. In short, the pin holds for every principal, and the drop's guarantee cannot be exhibited by
+# a harness that has only one uid.
+
+# The walk. It ENDS WITH THE PROCESS INSIDE ${path} — that is not a side effect, it is the point:
+# migrate_uploads() then moves files into `.` rather than re-resolving the destination it just had
+# proved. Callers that do not want the cwd moved use mkdir_service_subdir(), which restores it.
+#
+# Every `die` below ENDS THE RUN, so the cwd it leaves behind never outlives the process; the one
+# EXIT trap this script installs (${CRON_BLOCK_FILE}) names an absolute path.
+enter_service_subdir() {
+  local root="$1" mask="$2" path="$3"
+  local rel comp built kind here
+  # The root itself, whose parent is root-owned. `-p` is correct here and only here.
+  mkdir -p "${root}" || die "${root} could not be created, so this installation has nowhere to put its state. Nothing has been changed."
+  [[ "${path}" == "${root}/"* ]] || die \
+    "enter_service_subdir was asked to create ${path}, which is not underneath ${root}. This is a bug in this script, not an operator error: the symlink-proof walk only means anything for components below the directory the service account owns."
+  cd -P "${root}" 2>/dev/null || die \
+    "${root} could not be entered, so this run cannot create anything beneath it. Nothing has been changed."
+  here="$(stat -c '%d:%i' . 2>/dev/null || true)"
+  [[ -n "${here}" ]] || die "${root} could not be identified, so this run cannot prove where it is creating ${path}. Nothing has been changed."
+  rel="${path#"${root}/"}"
+  built="${root}"
+  while [[ -n "${rel}" ]]; do
+    comp="${rel%%/*}"
+    if [[ "${comp}" == "${rel}" ]]; then rel=""; else rel="${rel#*/}"; fi
+    [[ -n "${comp}" ]] || continue
+    built="${built}/${comp}"
+    if ! (umask "${mask}"; mkdir "${comp}") 2>/dev/null; then
+      kind="$(stat -c '%F' "${comp}" 2>/dev/null || true)"
+      [[ "${kind}" == "directory" ]] || die \
+        "${built} exists and is a ${kind:-missing path}, not a directory. A symlink there is how a compromised '${APP_USER}' would aim this installer's root-side writes at a path of their choosing, so this run refuses rather than following it. Remove or fix that path and run the installer again; nothing has been changed."
+    fi
+    cd -P "${comp}" 2>/dev/null || die \
+      "${built} could not be entered after this run created or accepted it. Nothing has been changed."
+    [[ "$(stat -c '%d:%i' .. 2>/dev/null || true)" == "${here}" ]] || die \
+      "${built} is not in the directory this run had just checked: it was replaced between the check and the step into it, which is how a compromised '${APP_USER}' would aim this installer's root-side writes at a path of their choosing. This run refuses rather than following it; nothing has been changed."
+    here="$(stat -c '%d:%i' . 2>/dev/null || true)"
+    [[ -n "${here}" ]] || die "${built} could not be identified after this run entered it. Nothing has been changed."
+  done
+}
+
 mkdir_service_subdir() {
   local root="$1" mask="$2"
   shift 2
-  local path rel comp built kind
-  # The root itself, whose parent is root-owned. `-p` is correct here and only here.
-  mkdir -p "${root}" || die "${root} could not be created, so this installation has nowhere to put its state. Nothing has been changed."
+  local path saved
+  saved="$(pwd -P)" || die "this run cannot establish its own working directory, so it will not walk into ${root} and back. Nothing has been changed."
   for path in "$@"; do
-    [[ "${path}" == "${root}/"* ]] || die \
-      "mkdir_service_subdir was asked to create ${path}, which is not underneath ${root}. This is a bug in this script, not an operator error: the symlink-proof walk only means anything for components below the directory the service account owns."
-    rel="${path#"${root}/"}"
-    built="${root}"
-    while [[ -n "${rel}" ]]; do
-      comp="${rel%%/*}"
-      if [[ "${comp}" == "${rel}" ]]; then rel=""; else rel="${rel#*/}"; fi
-      [[ -n "${comp}" ]] || continue
-      built="${built}/${comp}"
-      if ! (umask "${mask}"; mkdir "${built}") 2>/dev/null; then
-        kind="$(stat -c '%F' "${built}" 2>/dev/null || true)"
-        [[ "${kind}" == "directory" ]] || die \
-          "${built} exists and is a ${kind:-missing path}, not a directory. A symlink there is how a compromised '${APP_USER}' would aim this installer's root-side writes at a path of their choosing, so this run refuses rather than following it. Remove or fix that path and run the installer again; nothing has been changed."
-      fi
-    done
+    enter_service_subdir "${root}" "${mask}" "${path}"
+    cd "${saved}" || die "this run could not return to ${saved} after creating ${path}. Nothing further has been changed."
   done
 }
 
@@ -2731,21 +2803,56 @@ mkdir_service_subdir() {
 # Two steps, and the second is the one that matters. A plain `mkdir` refuses a name that is already
 # taken, so a link planted between the `rm` and here ends the run instead of being followed. Then
 # `cd` PINS the result: the shell holds a descriptor on the inode it just created, and a rename of
-# the name cannot move it. What is verified is `.` after the chdir — uid ${self} and a directory —
-# which the service account cannot manufacture, because they cannot chown anything to root. The
-# copy is then made relative to that cwd and can land nowhere else.
+# the name cannot move it. The copy is then made relative to that cwd and can land nowhere else.
+#
+# BUT OWNERSHIP IS NOT IDENTITY, AND THAT IS WHAT THE uid CHECK WAS MISTAKEN FOR (o3d-czpy r2,
+# Codex HIGH). There is a window between the `mkdir` and the `cd`. The service account owns
+# ${APP_DIR}, so in that window they can rename the directory this run just created aside and leave
+# at its name a SYMLINK TO ANOTHER ROOT-OWNED DIRECTORY — /root, /etc/systemd/system, the git
+# metadata of some other install. `cd` follows it, and `stat -c '%F|%u' .` then answers
+# "directory|0" and the check PASSES, precisely because the target they chose is root-owned. The
+# root-side `cp -a` writes the whole of the clone's .git into that directory, overwriting any
+# entry with a matching name — `config` among them. Being owned by root is a property a great many
+# directories have; being THE directory this run created is a property exactly one has.
+#
+# SO THE CHECK IS `..` AND NOT THE OWNER. ${APP_DIR}'s own parent is root-owned, so ${APP_DIR}
+# cannot be renamed by the service account and its device and inode, taken before the `rm`, are a
+# fact this function can rely on. After the chdir, `..` — the kernel's answer for the parent of the
+# inode this process is inside, not a re-resolution of a pathname — must be that same directory.
+# A link to anywhere outside ${APP_DIR} fails it. A link to another directory INSIDE ${APP_DIR}
+# passes it and is harmless: that directory already belongs to the service account. The uid check
+# is kept for what it does prove — that the `mkdir` and not somebody else created what we are in.
+#
+# WHY THIS AND NOT `run_as_user "${APP_USER}"`, which is the other remedy and would delete the
+# class rather than guard it: the result IS service-owned (the callers chown -R it immediately
+# afterwards), so the drop is available here and would be sound. It is not taken because the
+# guarantee it gives cannot be EXHIBITED. A drop is worth exactly one sentence — "the account that
+# could plant the symlink is the account doing the write" — and to observe it a harness needs two
+# uids, which an unprivileged test run does not have; under a drop the planted symlink is FOLLOWED
+# rather than refused, so the operator also loses the refusal that names the path. The pin is
+# uid-independent, which matters because the same argument cannot be made for publish_durable_file()
+# at all: its markers are deliberately root-owned INSIDE service-owned directories, so that the
+# service account cannot forge a fence, and there is no version of them that root does not write.
+# One mechanism, stated once, holding for every principal. The descriptor-relative alternative
+# (openat2 with RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS, mkdirat, renameat) is stronger still — it
+# closes the link-inside-the-same-parent case too — but it is not shell: it would mean a compiled
+# or Python helper shipped and verified alongside this script, on a host where the installer is the
+# thing that establishes what is installed.
 copy_tree_into_new_dir() {
-  local src="$1" dest="$2" self meta
+  local src="$1" dest="$2" self meta parent
   self="$(id -u)" || die "\`id -u\` failed, so this run cannot establish which uid it is and cannot prove that ${dest} is the directory it just created."
+  parent="$(stat -c '%d:%i' "$(dirname "${dest}")" 2>/dev/null || true)"
+  [[ -n "${parent}" ]] || die "$(dirname "${dest}") could not be identified, so this run cannot prove where ${dest} is. Nothing has been copied."
   rm -rf "${dest}"
   (umask 022; mkdir "${dest}") 2>/dev/null || die \
     "${dest} could not be created: something is already at that path after it was removed, which is how a compromised '${APP_USER}' would aim this copy at a directory of their choosing. Nothing has been copied."
   (
-    cd "${dest}" 2>/dev/null || exit 1
+    cd -P "${dest}" 2>/dev/null || exit 1
     meta="$(stat -c '%F|%u' . 2>/dev/null || true)"
     [[ "${meta}" == "directory|${self}" ]] || exit 1
+    [[ "$(stat -c '%d:%i' .. 2>/dev/null || true)" == "${parent}" ]] || exit 1
     cp -a "${src}/." . 2>/dev/null || exit 1
-  ) || die "${src} could not be copied into ${dest}. Nothing that a later step depends on has been written."
+  ) || die "${src} could not be copied into ${dest}: either the copy failed, or the name this run created was replaced — after it was created — by a link to a directory somewhere else, which this run refuses to follow however that directory is owned. Nothing that a later step depends on has been written."
 }
 
 # ---------------------------------------------------------------------------
@@ -6617,23 +6724,30 @@ mkdir_service_subdir "${APP_DIR}" 022 "${APP_DIR}/backups"
 migrate_uploads() {
   local src="$1"
   local dest="$2"
-  local self meta
+  local saved
   if [[ -d "${src}" ]] && [[ -n "$(find "${src}" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
     info "Migrating legacy uploads: ${src} -> ${dest}"
-    # THE DESTINATION IS CREATED SYMLINK-PROOF AND THEN PINNED (o3d-czpy). `mkdir -p "${dest}"`
-    # followed by `mv -t "${dest}"` is two resolutions of a path inside a directory ${APP_USER}
-    # owns, and the run that matters is the UPGRADE — where the previous run has already handed
-    # ${DATA_DIR} to them. `cd` resolves it once; the shell then holds the inode, and the uid check
-    # on `.` is a fact about what this process is inside rather than about a name that can move.
-    # ${self} still owns these directories at this point: the recursive chown below has not run yet.
-    mkdir_service_subdir "${DATA_DIR}" 022 "${dest}"
-    self="$(id -u)" || die "\`id -u\` failed, so this run cannot prove where it is moving ${src} to."
-    (
-      cd "${dest}" 2>/dev/null || exit 1
-      meta="$(stat -c '%F|%u' . 2>/dev/null || true)"
-      [[ "${meta}" == "directory|${self}" ]] || exit 1
-      find "${src}" -mindepth 1 -maxdepth 1 -exec mv -n -t . {} +
-    ) || die "Legacy uploads at ${src} could not be moved into ${dest}. Nothing has been started and nothing has been migrated."
+    # THE DESTINATION IS CREATED SYMLINK-PROOF AND THEN USED WITHOUT BEING NAMED AGAIN (o3d-czpy).
+    # `mkdir -p "${dest}"` followed by `mv -t "${dest}"` was two resolutions of a path inside a
+    # directory ${APP_USER} owns, and the run that matters is the UPGRADE — where the previous run
+    # has already handed ${DATA_DIR} to them. enter_service_subdir() walks there by chdir and
+    # LEAVES THIS PROCESS INSIDE the destination, so the files are moved into `.`: the pin the walk
+    # established is the same pin the move uses, with no pathname in between to re-resolve.
+    #
+    # AND IT NO LONGER DEMANDS THAT THE DESTINATION BE OWNED BY THIS RUN (o3d-czpy r2, Codex
+    # MEDIUM). It did — `stat -c '%F|%u' .` against `id -u` — on the argument that the recursive
+    # chown had not happened YET. That is true of a first install and false of every rerun after
+    # one: the previous install chowned ${UPLOAD_STORAGE_DIR} and ${PUBLIC_UPLOAD_STORAGE_DIR} to
+    # ${APP_USER}, so on the ordinary upgrade path the destination comes back owned by the SERVICE
+    # account, `stat` returns its uid, and the installer aborted — a legitimate migration refused
+    # by a check that could only pass on the run that needed it least. A same-account harness
+    # cannot see it, because there the two uids are one. The identity of the destination is what
+    # mattered and ownership was standing in for it; the walk pins the identity directly.
+    saved="$(pwd -P)" || die "this run cannot establish its own working directory, so it will not migrate ${src}."
+    enter_service_subdir "${DATA_DIR}" 022 "${dest}"
+    find "${src}" -mindepth 1 -maxdepth 1 -exec mv -n -t . {} + \
+      || die "Legacy uploads at ${src} could not be moved into ${dest}. Nothing has been started and nothing has been migrated."
+    cd "${saved}" || die "this run could not return to ${saved} after migrating ${src}. Nothing further has been changed."
     rmdir "${src}" 2>/dev/null || true
   fi
 }
