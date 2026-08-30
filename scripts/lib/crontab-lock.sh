@@ -974,26 +974,46 @@ CRONTAB_SUBSEQUENCE_SENTINEL=$'\001CRONTAB-SUBSEQUENCE-COMPLETE\001'
 #   the STATUS      a `printf` that could not write — a full filesystem, a closed descriptor, a
 #                   read-only ${TMPDIR} — returns non-zero, and unlike a process substitution's
 #                   producer that status is THIS shell's to take.
-#   the LINE COUNT  read back with `mapfile`, a builtin, so the check cannot be taken down by the
-#                   very failure it exists to detect. A short write reported as successful — the
-#                   classic one is an error surfaced only at close(2), and a producer killed
-#                   part-way through is the same shape — yields fewer lines than went in. This is
-#                   the projections' line-for-line proof, said about an input instead of an output.
+#   the BYTES       the file is read back and compared with `${text}` plus its newline IN FULL.
+#                   Not counted: COUNTING WAS NOT ENOUGH, and that is round 33's finding. `mapfile
+#                   -t` discards the delimiters and still counts an unterminated final record, so
+#                   for intended bytes `a<NL>abcdef<NL>` a short write of `a<NL>abc` yields the
+#                   same two elements the whole text does, and passed. The awk below would then
+#                   find nothing of that truncated backup missing from a candidate containing
+#                   `a<NL>abc`, approve the merge as lossless, and the caller would delete the only
+#                   copy of `abcdef`. A count proves the number of records; only the bytes prove
+#                   the bytes.
+#
+# AND THE COMPARISON IS BUILTIN-ONLY, which is the property the count check had and must not lose:
+# `read` is a shell builtin, so it opens no pipe, forks nothing, and cannot be taken down by the
+# very failure it exists to detect. A `cmp`, a `wc -c` or a `$(cat ...)` would each be one more
+# producer, and a producer that died would read here as agreement.
+#
+# THE FINAL NEWLINE IS PART OF THE COMPARISON, because that is precisely where a truncation of the
+# LAST line hides: `a<NL>abc` and `a<NL>abc<NL>` differ in nothing else, and only one of them is
+# what `printf '%s\n'` was asked to write.
 crontab_publish_comparison_input() {
-  local text="$1" path="$2" want got
-  local -a readback=()
+  local text="$1" path="$2" want readback=""
   # `printf '%s\n' "${text}"` writes the text plus ONE newline, so the file always holds at least
   # one line: the empty string becomes a single BLANK line, which is exactly what the process
   # substitution produced and what the awk's isBlank() has always discarded. Byte-identical input
   # in, byte-identical answer out.
+  want="${text}"$'\n'
   printf '%s\n' "${text}" > "${path}" || return 1
-  crontab_count_lines "${text}"
-  want="${CRON_LINE_COUNT}"
-  # crontab_count_lines calls the empty string nought lines; printf still wrote one.
-  if [[ -z "${text}" ]]; then want=1; fi
-  mapfile -t readback < "${path}" || return 1
-  got="${#readback[@]}"
-  if [[ "${got}" -ne "${want}" ]]; then return 1; fi
+  # THE WHOLE FILE, IN ONE BUILTIN READ. `-d ''` makes the delimiter NUL; `IFS=` and `-r` stop the
+  # shell trimming or unescaping anything, so what lands in ${readback} is the file's bytes as
+  # they are. No subshell, no pipe, no second process.
+  #
+  # AND THE STATUS IS INVERTED ON PURPOSE. `read -d ''` returns 0 only when it FOUND its delimiter
+  # -- a NUL byte -- and non-zero when it stopped at end of file. ${want} can hold no NUL (no bash
+  # variable can), so the only acceptable outcome here is the non-zero one: the read consumed the
+  # file to EOF. A 0 means the file holds a NUL these bytes never had, and there may be more after
+  # it that this comparison never saw, so it is a refusal and not a pass.
+  if IFS= read -r -d '' readback < "${path}"; then return 1; fi
+  # EVERY BYTE, INCLUDING THE LAST NEWLINE. A short write that stopped mid-line -- the classic
+  # error surfaced only at close(2), or a writer killed part-way -- differs from ${want} here even
+  # when it kept the record count, which is the check this replaced.
+  if [[ "${readback}" != "${want}" ]]; then return 1; fi
   return 0
 }
 

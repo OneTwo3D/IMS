@@ -4823,7 +4823,14 @@ test('[o3d-batch-ret] the drain proof refuses an UNCOUNTABLE census, because bas
 //         -> run_crontab_missing_comparison -> crontab_unmanaged_lines_missing_from
 //         -> crontab_publish_comparison_input, the WRITE STATUS)
 //   2. LOAD-BEARING. A producer that truncates and reports SUCCESS is refused too
-//        (… -> crontab_publish_comparison_input, the READ-BACK LINE COUNT)
+//        (… -> crontab_publish_comparison_input, the BYTE-FOR-BYTE READ-BACK)
+//   2b. LOAD-BEARING, and the reason 2 is no longer a COUNT (round 33). A producer that stops
+//      INSIDE THE LAST LINE keeps the record count `mapfile -t` would have measured — it discards
+//      the delimiters and still counts an unterminated final record — so `a<NL>abcdef` and
+//      `a<NL>abc` are both two. The truncated tail then matches a line the candidate really has,
+//      awk finds nothing missing, and the merge is approved over a corrupted line whose only
+//      complete copy is the backup this then deletes.
+//        (… -> crontab_publish_comparison_input, the BYTE-FOR-BYTE READ-BACK, on the last line)
 //   3. LOAD-BEARING. A producer that fails having written everything is refused as well, so the
 //      status check is not merely the line count in disguise    (the WRITE STATUS, on its own)
 //   4. MUTATION. The process-substituted comparison approves the merge over a backup it never read
@@ -4855,9 +4862,21 @@ const TRUNC_LIVE = '# an operator comment the cutover must put back'
  *   whole-then-fail     everything written, non-zero status, which no line count can catch
  */
 type ProducerFault = 'partial-then-fail' | 'partial-then-ok' | 'whole-then-fail'
+  | 'mid-last-line-then-ok'
 function truncatingProducer(fault: ProducerFault, target = TRUNC_BACKUP_TEXT): string {
-  const partial = fault !== 'whole-then-fail'
-  const rc = fault === 'partial-then-ok' ? 0 : 1
+  const rc = fault === 'partial-then-ok' || fault === 'mid-last-line-then-ok' ? 0 : 1
+  // What the faulty `printf` emits in place of `'%s\\n' "$target"`.
+  const emit = {
+    // A WHOLE RECORD LOST: everything after the first newline never arrives.
+    'partial-then-fail': '    builtin printf \'%s\\n\' "${__TRUNC_TARGET%%$\'\\n\'*}"',
+    'partial-then-ok': '    builtin printf \'%s\\n\' "${__TRUNC_TARGET%%$\'\\n\'*}"',
+    // EVERYTHING, and then a failure — which no byte comparison can catch, and no count either.
+    'whole-then-fail': '    builtin printf \'%s\\n\' "$__TRUNC_TARGET"',
+    // ROUND 33'S SHAPE: the write stops one character INSIDE the last line and never emits its
+    // newline. `mapfile -t` counts an unterminated final record, so the record count is untouched
+    // and only the bytes differ.
+    'mid-last-line-then-ok': '    builtin printf \'%s\' "${__TRUNC_TARGET%?}"',
+  }[fault]
   return [
     `__TRUNC_TARGET=$(cat <<'TRUNC_EOF'`,
     target,
@@ -4865,9 +4884,7 @@ function truncatingProducer(fault: ProducerFault, target = TRUNC_BACKUP_TEXT): s
     ')',
     'printf(){',
     `  if [ "$1" = '%s\\n' ] && [ "$#" -eq 2 ] && [ "$2" = "$__TRUNC_TARGET" ]; then`,
-    partial
-      ? '    builtin printf \'%s\\n\' "${__TRUNC_TARGET%%$\'\\n\'*}"'
-      : '    builtin printf \'%s\\n\' "$__TRUNC_TARGET"',
+    emit,
     `    return ${rc}`,
     '  fi',
     '  builtin printf "$@"',
@@ -4913,10 +4930,33 @@ const noWriteStatusLib = () => libraryWith([[
   `  printf '%s\\n' "\${text}" > "\${path}" || return 1`,
   `  printf '%s\\n' "\${text}" > "\${path}" || :`]])
 
-/** Only the READ-BACK LINE COUNT removed. */
+/**
+ * Only the BYTE-FOR-BYTE READ-BACK comparison removed — the `read` that fills it is left in place,
+ * so what this mutates is the CHECK and not the mechanism.
+ */
 const noReadBackLib = () => libraryWith([[
-  `  if [[ "\${got}" -ne "\${want}" ]]; then return 1; fi`,
+  `  if [[ "\${readback}" != "\${want}" ]]; then return 1; fi`,
   '  :']])
+
+/**
+ * The read-back put back the way round 32 wrote it: `mapfile -t` and a RECORD COUNT. Not a check
+ * deleted — a check REPLACED by the weaker one that shipped, which is the only mutation that can
+ * show what round 33's finding actually bought.
+ */
+const countingReadBackLib = () => libraryWith([[
+  `  want="\${text}"$'\\n'`, '  :'], [
+  `  if IFS= read -r -d '' readback < "\${path}"; then return 1; fi
+  # EVERY BYTE, INCLUDING THE LAST NEWLINE. A short write that stopped mid-line -- the classic
+  # error surfaced only at close(2), or a writer killed part-way -- differs from \${want} here even
+  # when it kept the record count, which is the check this replaced.
+  if [[ "\${readback}" != "\${want}" ]]; then return 1; fi`,
+  `  local -a __rb=() ; local __want __got
+  crontab_count_lines "\${text}"
+  __want="\${CRON_LINE_COUNT}"
+  if [[ -z "\${text}" ]]; then __want=1; fi
+  mapfile -t __rb < "\${path}" || return 1
+  __got="\${#__rb[@]}"
+  if [[ "\${__got}" -ne "\${__want}" ]]; then return 1; fi`]])
 
 /** Put the fixture on disk: a fenced crontab that LOST the operator job, and the backup holding it. */
 function seedTruncationFixture(): void {
@@ -4992,6 +5032,110 @@ test('[o3d-batch-ret] a producer that TRUNCATES and reports SUCCESS is refused, 
     assert.ok(existsSync(FAULT_BACKUP), `the backup must survive a ${fault} producer`)
     assert.equal(faultCrontabText(), TRUNC_LIVE, `and nothing may be installed after a ${fault} producer`)
   }
+})
+
+// ---------------------------------------------------------------------------
+// Codex r33 HIGH — A RECORD COUNT ACCEPTS A WRITE THAT STOPPED INSIDE THE LAST LINE
+//
+// Round 32's read-back counted records with `mapfile -t`. `mapfile -t` discards the newline
+// delimiters and still counts an UNTERMINATED final record, so for intended bytes
+// `a<NL>abcdef<NL>` a short write of `a<NL>abc` produces the same two elements the whole text
+// does — and passed. Every other check in the chain then behaves exactly as designed over the
+// corrupted input: the write status is 0 because the producer exited 0, the sentinel prints
+// because awk reached its END block, and awk finds nothing of the truncated backup missing from a
+// candidate that happens to carry the truncated line. Merge approved as lossless, installed, and
+// the only complete copy of that line — the backup — deleted.
+//
+// THE FIXTURE IS BUILT AROUND THAT LAST STEP, because it is what makes the count check unsafe
+// rather than merely imprecise: the live crontab carries the operator job with its LAST CHARACTER
+// MISSING, which is exactly what the truncated backup would compare clean against.
+// ---------------------------------------------------------------------------
+
+/** The backup's second line with its final character gone — what a write that stopped one byte
+ *  short of the end leaves on disk, and what `truncatingProducer('mid-last-line-then-ok')` emits. */
+const MIDLINE_TRUNCATED_JOB = '*/5 * * * * /usr/bin/operator-onl'
+
+/** A live crontab whose unfenced projection carries the TRUNCATED job and nothing else new, so a
+ *  comparison made over the truncated backup finds nothing missing and plans the merge. */
+const MIDLINE_LIVE = '# an operator comment the cutover must put back\n'
+  + `#DEPLOY-FENCE# ${MIDLINE_TRUNCATED_JOB}`
+
+function seedMidlineFixture(): void {
+  writeFileSync(FAULT_CRONTAB, MIDLINE_LIVE)
+  writeFileSync(FAULT_BACKUP, TRUNC_BACKUP)
+}
+
+test('[o3d-batch-ret] a producer that stops INSIDE THE LAST LINE is refused, and the record count it preserves is why the read-back compares bytes', async () => {
+  const midline = truncatingProducer('mid-last-line-then-ok')
+
+  // (0) THE PRECONDITION THE FINDING RESTS ON, MEASURED RATHER THAN ASSERTED: the fault leaves a
+  // file `mapfile -t` counts exactly as it counts the whole text. If this stops being true the
+  // rest of this test is about nothing, so it is checked first and it is checked in a real shell.
+  const counts = await sh([
+    'set -uo pipefail', midline,
+    `f="$(mktemp)"`,
+    `printf '%s\\n' "$__TRUNC_TARGET" > "$f"`,
+    'mapfile -t got < "$f"',
+    'mapfile -t whole <<< "$__TRUNC_TARGET"',
+    'echo "GOT=${#got[@]} WHOLE=${#whole[@]}"',
+    // `builtin printf` DELIBERATELY: the shim above intercepts exactly this call, so asking it
+    // for the intended length would return the truncated one and the assertion would be vacuous.
+    `echo "BYTES=$(wc -c < "$f") WANT=$(builtin printf '%s\\n' "$__TRUNC_TARGET" | wc -c)"`,
+    'rm -f "$f"',
+  ].join('\n'))
+  assert.match(counts.stdout, /^GOT=2 WHOLE=2$/m,
+    `the fault must preserve the record count, or it is not round 33's shape:\n${counts.stdout}${counts.stderr}`)
+  assert.match(counts.stdout, /^BYTES=(\d+) WANT=(?!\1$)/m,
+    `…and it must nevertheless have written FEWER BYTES:\n${counts.stdout}`)
+
+  // (1) THE CONTROL. With the producer intact the comparison RUNS over this same fixture and
+  // refuses by NAMING the loss — a divergence (76), not a failed computation (78). So a 78 below
+  // is the read-back talking and not a function that refuses everything.
+  seedMidlineFixture()
+  const control = await sh(faultProgram('scripts/deploy.sh', DEPLOY_SH,
+    ['CRON_FENCED=true', 'rc=0', 'with_crontab_lock unfence_cron_locked || rc=$?',
+      'echo "RC=$rc"', 'echo "PLAN=$CRON_UNFENCE_PLAN"', 'echo "WHY=$CRON_UNFENCE_REASON"'].join('\n'),
+    { functions: ['unfence_cron_locked'], mutate: withErrexit }))
+  assert.match(control.stdout, /^RC=76$/m,
+    `the whole backup must be seen to diverge from this candidate:\n${control.stdout}${control.stderr}`)
+  assert.match(control.stdout, /operator-only/,
+    `and the complete job must be the line it names as missing:\n${control.stdout}`)
+
+  // (2) SHIPPED. The same fixture, the producer stopping one byte inside the last line: refused.
+  seedMidlineFixture()
+  const shipped = await sh(faultProgram('scripts/deploy.sh', DEPLOY_SH,
+    [midline, 'CRON_FENCED=true', 'rc=0', 'with_crontab_lock unfence_cron_locked || rc=$?',
+      'echo "RC=$rc"', 'echo "PLAN=$CRON_UNFENCE_PLAN"', 'echo "FENCED=$CRON_FENCED"'].join('\n'),
+    { functions: ['unfence_cron_locked'], mutate: withErrexit }))
+  assert.match(shipped.stdout, /^RC=78$/m,
+    `a write that stopped inside the last line must be a FAILED COMPUTATION:\n${shipped.stdout}${shipped.stderr}`)
+  assert.match(shipped.stdout, /^PLAN=refuse$/m, shipped.stdout)
+  assert.match(shipped.stdout, /^FENCED=true$/m,
+    `the fence flag must not be cleared while the crontab is still fenced:\n${shipped.stdout}`)
+  assert.equal(faultCrontabText(), MIDLINE_LIVE,
+    'a comparison whose input lost bytes must install NOTHING')
+  assert.equal(readFileSync(FAULT_BACKUP, 'utf8'), TRUNC_BACKUP,
+    'and the only complete copy of the operator job must survive')
+
+  // (3) MUTATION, AND THE ROUTE IT RUNS. Round 32's `mapfile -t` record count put back in place of
+  // the byte comparison — the check REPLACED by its weaker predecessor rather than deleted — under
+  // a real `set -euo pipefail`, through
+  //   with_crontab_lock -> unfence_cron_locked -> plan_crontab_unfence
+  //     -> run_crontab_missing_comparison -> crontab_unmanaged_lines_missing_from
+  //     -> crontab_publish_comparison_input.
+  seedMidlineFixture()
+  const counted = await sh(faultProgram('scripts/deploy.sh', DEPLOY_SH,
+    [midline, 'CRON_FENCED=true', 'rc=0', 'with_crontab_lock unfence_cron_locked || rc=$?',
+      'echo "RC=$rc"', 'echo "PLAN=$CRON_UNFENCE_PLAN"'].join('\n'),
+    { functions: ['unfence_cron_locked'], mutate: withErrexit, lib: countingReadBackLib() }))
+  assert.match(counted.stdout, /^RC=0$/m,
+    `THE FINDING: a record count accepts the truncated backup and the run succeeds:\n${counted.stdout}${counted.stderr}`)
+  assert.match(counted.stdout, /^PLAN=merge$/m,
+    'THE FINDING: and the merge is approved as lossless over bytes that never arrived')
+  assert.equal(faultCrontabText(), `# an operator comment the cutover must put back\n${MIDLINE_TRUNCATED_JOB}\n`,
+    'THE LOSS: what it installed carries the operator job with its last character missing')
+  assert.ok(!existsSync(FAULT_BACKUP),
+    'AND THE ONLY COMPLETE COPY IS GONE: the backup holding the whole job was deleted on the strength of it')
 })
 
 test('[o3d-batch-ret] MUTATION: the process-substituted comparison merges over a backup it never read, and deletes it', async () => {
