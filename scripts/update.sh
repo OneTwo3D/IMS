@@ -1861,33 +1861,122 @@ PUBLISH_STAGE_DIRNAME=".ims-publish"
 # absolute pathname afterwards, which is where the round-2 code reopened the hole it had just
 # closed.
 #
-# WHY THESE SIX ARE TRUSTWORTHY, AND WHY THE WALK DOES NOT START AT `/`. Each of them is a
-# top-level directory whose OWN PARENT is root-owned and not writable by ${APP_USER}: /opt for
-# ${APP_DIR}, /var/lib for ${DATA_DIR} and the default ${CUTOVER_STATE_DIR}, /etc for the three
-# literals (${DB_ENV_SNAPSHOT_DIR}, ${DB_CA_PUBLISH_DIR} and the shared library's
-# ${DB_FENCE_RECOVERY_DIR}). The service account can rewrite anything INSIDE them and nothing ABOUT them: it cannot
-# rename ${APP_DIR} aside, and it cannot leave a symlink at that name. That is the same argument
-# copy_tree_into_new_dir() rests on for ${APP_DIR}/.git, made once and used for all of them.
+# WHY A CANDIDATE IS TRUSTWORTHY — AND WHY THAT IS NOW A CHECK AND NOT A PARAGRAPH (o3d-rn10 r2).
 #
-# It stops there rather than walking from `/` for the reason enter_service_subdir() gives at
-# length: a symlinked ${DATA_DIR} — /var/lib/${APP_NAME} pointing at a second disk — is a supported
-# operator layout, and /var/lib is root-owned so it cannot be forged. So the ROOT may be a symlink
-# and is followed (`cd -P`); every component BELOW it may not be, and is refused.
+# The previous round argued the property here, in prose: each of the six is a directory whose OWN
+# PARENT is root-owned and not writable by ${APP_USER} — /opt for ${APP_DIR}, /var/lib for
+# ${DATA_DIR} and the default ${CUTOVER_STATE_DIR}, /etc for the three literals
+# (${DB_ENV_SNAPSHOT_DIR}, ${DB_CA_PUBLISH_DIR} and the shared library's ${DB_FENCE_RECOVERY_DIR}).
+# The service account can rewrite anything INSIDE such a directory and nothing ABOUT it: it cannot
+# rename ${APP_DIR} aside, and it cannot leave a symlink at that name. The argument is right, and
+# it was the only thing standing behind the table — a candidate was admitted by its SPELLING, and
+# the deepest spelling won.
+#
+# WHICH IS NOT A PROPERTY OF A STRING, BECAUSE THREE OF THE SIX ARE OPERATOR-SETTABLE.
+# ${IMS_APP_DIR}, ${IMS_DATA_DIR} and ${IMS_CUTOVER_STATE_DIR} can point a root anywhere, and the
+# runbook itself suggests the case that breaks the paragraph: `IMS_CUTOVER_STATE_DIR=${DATA_DIR}/cutover`,
+# where ${APP_USER} owns ${DATA_DIR} and can replace `cutover` with a symlink to a directory of
+# their choosing. The destination still MATCHES the candidate text, the deepest match wins, and
+# `cd -P "$root"` follows the link deliberately — publishing root-side into an attacker's pick.
+#
+# SO THE ANCHOR IS PROVEN AT RUNTIME, by publish_root_anchored(), and a candidate that cannot prove
+# it is not a root. What that costs: nothing at all when the override is anchored, and a walk
+# instead of a shortcut when it is not — see publish_trust_root() for what demotion means, and for
+# what happens to an override with nothing left to demote to.
+#
+# The line is still drawn AT these directories rather than at `/`, for the reason
+# enter_service_subdir() gives at length: a symlinked ${DATA_DIR} — /var/lib/${APP_NAME} pointing at
+# a second disk — is a supported operator layout, and /var/lib is root-owned so it cannot be forged.
+# So the ROOT may be a symlink and is followed (`cd -P`); every component BELOW it may not be, and
+# is refused.
 #
 # A FUNCTION AND NOT AN ARRAY, so the list is read at the moment of the publication rather than at
 # the moment this file was parsed: a root reassigned by a prompt would otherwise leave the table
 # naming a directory nothing publishes into. `${VAR:-}` because an empty entry is skipped and a
-# destination that matches no root is REFUSED — a new publication site outside these five fails
+# destination that matches no root is REFUSED — a new publication site outside these six fails
 # loudly at install time instead of silently resolving its own path.
 publish_trust_root_candidates() {
   printf '%s\n' "${APP_DIR:-}" "${DATA_DIR:-}" "${CUTOVER_STATE_DIR:-}" "${DB_ENV_SNAPSHOT_DIR:-}" "${DB_CA_PUBLISH_DIR:-}" "${DB_FENCE_RECOVERY_DIR:-}"
 }
 
-# The deepest candidate that "$1" lies at or under, printed; non-zero when there is none.
+# WHETHER "$1" MAY BE A STARTING POINT FOR THE WALK: can the service account replace the entry that
+# NAMES it? That is the one property the whole walk rests on, because the root — and only the root
+# — is entered with `cd -P`, which follows a symlink. Everything below it is created with a plain
+# `mkdir`, lstat-ed and inode-checked; the root is taken on trust, so the trust has to be earned.
 #
-# DEEPEST, because ${CUTOVER_STATE_DIR} defaults to ${DATA_DIR} and an operator may nest one root
-# inside another; starting the walk from the closest trusted ancestor means the fewest components
-# are resolved by name, which is the whole point of the walk.
+# THE PARENT, AND NOT THE ROOT ITSELF. The root may legitimately BE a symlink (a ${DATA_DIR} on a
+# second disk), may not exist yet on a first install, and is owned by ${APP_USER} by design in two
+# of the six cases. None of that is the question. The question is who can change the directory
+# ENTRY at that name, and that is decided by the containing directory alone.
+#
+# OWNED BY ROOT, OR BY WHOEVER IS RUNNING THIS. `id -u` for the same reason publish_durable_file()
+# asks it instead of hardcoding 0: the property is "the privileged account that owns this install",
+# and asking lets the regression rigs measure the mechanism unprivileged. uid 0 is accepted
+# unconditionally as well, because root IS that account by definition — which is also what lets an
+# unprivileged harness resolve the SHIPPED roots under /opt, /var/lib and /etc.
+#
+# AND NO GROUP OR OTHER WRITE BIT. Ownership alone is not the property: a root-owned parent that is
+# 0775 with the service group on it is a parent ${APP_USER} can rename inside. The sticky bit is
+# deliberately NOT credited — it would stop them replacing an entry that already exists and says
+# nothing about the first install, where the root does not exist yet and the `mkdir -p` below would
+# find whatever they left at that name. A root under /tmp is therefore REFUSED, which is intended.
+#
+# WHAT THIS DOES NOT CLAIM. It bounds what the SERVICE ACCOUNT can do to the root's own name; it
+# does not walk the parent's own ancestry, and it resolves the parent PATHNAME rather than pinning
+# it. /opt, /var/lib, /etc and /root are system directories this installer never hands to any
+# account — the same boundary enter_service_subdir() draws, stated here instead of left implicit.
+# POSIX ACLs are not read either: a parent given a write ACL is outside what a mode can express.
+publish_root_anchored() {
+  local root="$1" parent meta owner mode self
+  [[ "$root" == /* ]] || return 1
+  root="${root%/}"
+  # `/` has no parent that could anchor it, and is not a directory anything here publishes under.
+  [[ -n "$root" ]] || return 1
+  parent="${root%/*}"
+  [[ -n "$parent" ]] || parent="/"
+  self="$(id -u)" || return 1
+  # ONE stat, TAKING TYPE, OWNER AND MODE TOGETHER, so no two of the three can describe different
+  # directories — the same reason the walk below takes `%F|%d:%i` in one call.
+  meta="$(stat -c '%F|%u|%a' "$parent" 2>/dev/null || true)"
+  [[ "${meta%%|*}" == "directory" ]] || return 1
+  meta="${meta#*|}"
+  owner="${meta%%|*}"
+  mode="${meta##*|}"
+  [[ "$owner" == "0" || "$owner" == "$self" ]] || return 1
+  # Validated BEFORE `8#` sees it: `8#` on anything that is not octal is a fatal arithmetic error
+  # under `set -e`, which is a crash and not a refusal.
+  [[ "$mode" =~ ^[0-7]+$ ]] || return 1
+  (( (8#$mode & 8#22) == 0 )) || return 1
+  return 0
+}
+
+# The SHALLOWEST ANCHORED candidate that "$1" lies at or under, printed; non-zero when there is
+# none.
+#
+# ANCHORED FIRST, AND A CANDIDATE THAT FAILS IS DEMOTED RATHER THAN FATAL. Dropping it from the
+# table is not the same as refusing the publication, and the difference is the whole behaviour of
+# the two override shapes:
+#
+#   • `IMS_CUTOVER_STATE_DIR=${DATA_DIR}/cutover` is UNANCHORED — ${APP_USER} owns ${DATA_DIR} — but
+#     ${DATA_DIR} is anchored and covers it. The walk therefore starts at ${DATA_DIR}, and `cutover`
+#     is an ORDINARY COMPONENT: plain `mkdir`, lstat-ed, inode-checked, refused outright if it is a
+#     symlink. The supported nested layout keeps working, and the attack on it stops working.
+#   • `IMS_CUTOVER_STATE_DIR=/home/svc/state` is unanchored AND under no anchored candidate. There
+#     is nothing to demote it to, so this returns non-zero and publish_durable_file() REFUSES every
+#     publication into it. An unanchored override never becomes a trusted root by being spelled in
+#     the table; at worst it stops the run, loudly, at the write.
+#
+# Demotion rather than blanket refusal because refusing every unanchored candidate outright would
+# also refuse the nested layout, for no security gain: the walk from the outer anchor already
+# resolves every component the candidate names, one at a time and under lstat, which is strictly
+# more than trusting the candidate ever did.
+#
+# SHALLOWEST AND NOT DEEPEST — round 1's rule, inverted. Two candidates that both cover "$1" are
+# necessarily nested, one a prefix of the other, so the shallowest is an ancestor of every other:
+# the walk from it COVERS them, and they need no anchor of their own. Preferring the deepest was
+# defended as "the fewest components resolved by name", which had it backwards. A component the
+# walk resolves is not resolved by name — it is created, lstat-ed and inode-checked. Fewer starting
+# assumptions beats fewer steps.
 publish_trust_root() {
   local dir="$1" root best="" list
   # A CHECKED CAPTURE AND A HERE-STRING, NEVER `< <(...)`. A process substitution has no status
@@ -1900,7 +1989,8 @@ publish_trust_root() {
     root="${root%/}"
     [[ -n "$root" ]] || continue
     [[ "$dir" == "$root" || "$dir" == "${root}/"* ]] || continue
-    if (( ${#root} > ${#best} )); then best="$root"; fi
+    publish_root_anchored "$root" || continue
+    if [[ -z "$best" ]] || (( ${#root} < ${#best} )); then best="$root"; fi
   done <<< "$list"
   [[ -n "$best" ]] || return 1
   printf '%s\n' "$best"
@@ -1928,7 +2018,13 @@ pin_dir_beneath_root() {
   local root="$1" path="$2" rel comp here entry
   [[ "$root" == /* && "$path" == /* ]] || return 1
   [[ "$path" == "$root" || "$path" == "${root}/"* ]] || return 1
-  # The root itself, whose parent is root-owned. `-p` is correct here and only here.
+  # AND THE ROOT IS ANCHORED, ASKED AGAIN HERE (o3d-rn10 r2). publish_trust_root() only ever hands
+  # over anchored candidates, but this is the function that ACTS on the answer — the `mkdir -p` and
+  # the `cd -P` below are the two operations that take the root's own name on trust, and a caller
+  # arriving with a root from anywhere else must not get them for free.
+  publish_root_anchored "$root" || return 1
+  # The root itself, whose parent the line above proved the service account cannot write. `-p` is
+  # correct here and only here.
   mkdir -p "$root" 2>/dev/null || return 1
   cd -P "$root" 2>/dev/null || return 1
   here="$(stat -c '%d:%i' . 2>/dev/null || true)"
