@@ -37,7 +37,9 @@ test('the assertion itself passes; only the grandchild\'s directory is wrong', (
   // environment cannot make this fail for an unrelated reason.
   const child = spawnSync(process.execPath, ['-e', PROGRAM], {
     encoding: 'utf8',
-    env: { PATH: '/usr/bin:/bin' },
+    // The repo's ProcessEnv augmentation makes NODE_ENV required, which a REPLACEMENT environment
+    // by definition does not have; the cast is the same one the deploy-order harnesses use.
+    env: { PATH: '/usr/bin:/bin' } as unknown as NodeJS.ProcessEnv,
   })
 
   assert.equal(child.status, 0, `the grandchild must run: ${child.stderr}`)

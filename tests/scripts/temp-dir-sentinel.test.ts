@@ -173,6 +173,16 @@ test('a clean run is not failed', () => {
 })
 
 /**
+ * A fixture's CODE, with its comments removed.
+ *
+ * The shape assertions below are about what a fixture DOES. Each of these fixtures has to explain
+ * in prose the escape it reproduces — which means naming `rmSync`, or TMPDIR — and a guard that
+ * read the raw file would fail on the explanation rather than on the behaviour.
+ */
+const withoutComments = (source: string): string =>
+  source.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/(^|[^:])\/\/.*$/gm, '$1')
+
+/**
  * THE HOLE THE REDIRECT CLOSES, measured rather than argued (Codex MEDIUM).
  *
  * Pointing `process.env.TMPDIR` at the private root covers every child that INHERITS the
@@ -189,7 +199,7 @@ test('a clean run is not failed', () => {
 test('a child given a replacement environment cannot escape the private /tmp', () => {
   // The fixture must still hand its child an environment that carries no TMPDIR — otherwise this
   // whole test would be measuring the inheriting path the sibling fixture already covers.
-  const fixture = readFileSync(join(FIXTURES, ENV_LEAKY), 'utf8')
+  const fixture = withoutComments(readFileSync(join(FIXTURES, ENV_LEAKY), 'utf8'))
   assert.match(fixture, /env:\s*\{\s*PATH:/, `${ENV_LEAKY} must launch its child with a replacement environment`)
   assert.ok(
     !/env:\s*\{[^}]*process\.env/.test(fixture),
@@ -244,7 +254,7 @@ test('a child given a replacement environment cannot escape the private /tmp', (
  * owns, retry, and leave nothing.
  */
 test('an unremovable leftover is repaired and removed, not swallowed', { skip: AS_ROOT ? MODES_ARE_INERT : false }, () => {
-  const fixture = readFileSync(join(FIXTURES, LOCKED), 'utf8')
+  const fixture = withoutComments(readFileSync(join(FIXTURES, LOCKED), 'utf8'))
   assert.match(fixture, /chmodSync\([^)]*0o000\)/, `${LOCKED} must leave something untraversable`)
   assert.ok(!/\brmSync\b|\brm\(/.test(fixture), `${LOCKED} must not clean up — that is the defect it reproduces`)
 
@@ -289,7 +299,7 @@ test('an unremovable leftover is repaired and removed, not swallowed', { skip: A
  * owns have been repaired so the removal can still happen.
  */
 test('an unreadable root fails the run rather than reporting it clean', { skip: AS_ROOT ? MODES_ARE_INERT : false }, () => {
-  const fixture = readFileSync(join(FIXTURES, HIDDEN_ROOT), 'utf8')
+  const fixture = withoutComments(readFileSync(join(FIXTURES, HIDDEN_ROOT), 'utf8'))
   assert.match(fixture, /chmodSync\(root, 0o000\)/, `${HIDDEN_ROOT} must make the sentinel's own root unreadable`)
   assert.match(fixture, /process\.on\('exit'/, 'and must do it at exit, or it breaks the run instead of the guard')
 
