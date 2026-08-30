@@ -7,11 +7,23 @@
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
-import { detectPaymentReversals } from '@/lib/domain/accounting/payment-reversal'
+import {
+  detectPaymentReversals,
+  readDatabaseLedgerFence,
+  readPaidProvenanceVerdicts,
+} from '@/lib/domain/accounting/payment-reversal'
+import {
+  zeroPaidIsProvenReversal,
+  type LedgerReadFence,
+  type RegisteredPaymentVerdict,
+} from '@/lib/connectors/xero/invoice-delta'
 import { qboQuery } from './api'
 import { getSettingValue } from '@/lib/settings-store'
 
 const LAST_POLL_KEY = 'quickbooks_last_payment_poll'
+
+/** A QuickBooks reversal can only ever speak about rows QuickBooks itself issued. */
+const QUICKBOOKS_CONNECTOR = 'quickbooks'
 
 type QboInvoice = {
   Id: string
@@ -64,7 +76,15 @@ export function classifyQboReversals(
 async function fetchReversedEntityIds(
   entity: 'Invoice' | 'Bill',
   since: string,
-): Promise<{ all: Set<string>; voided: Set<string> } | null> {
+): Promise<{ all: Set<string>; voided: Set<string>; ledgerObservedBefore: LedgerReadFence | null } | null> {
+  // o3d-psrx r3 — THE FENCE IS MINTED HERE, AND HERE IS BEFORE THE LEDGER IS ASKED.
+  //
+  // It is read inside this function rather than by the caller for one reason: the ordering that makes
+  // the fence sound is PROGRAM ORDER — this statement running before `qboQuery` — and a fence passed
+  // in from elsewhere is a fence whose ordering nobody in this file can see. Null is a legitimate
+  // answer (the database clock could not be read) and it decides NOTHING, which withholds every
+  // reversal that has a registration to weigh.
+  const ledgerObservedBefore = await readDatabaseLedgerFence()
   const [balanceRes, voidedRes] = await Promise.all([
     qboQuery<QboQueryResponse<QboEntityId>>(entity, `Balance > '0' AND MetaData.LastUpdatedTime > '${since}'`),
     qboQuery<QboQueryResponse<QboEntityId>>(entity, `TotalAmt = '0' AND MetaData.LastUpdatedTime > '${since}'`),
@@ -72,19 +92,120 @@ async function fetchReversedEntityIds(
   if (!balanceRes.ok || !voidedRes.ok) return null
   const balanceDue = balanceRes.data?.QueryResponse?.[entity] ?? []
   const voided = voidedRes.data?.QueryResponse?.[entity] ?? []
-  return classifyQboReversals(balanceDue, voided)
+  return { ...classifyQboReversals(balanceDue, voided), ledgerObservedBefore }
+}
+
+/**
+ * o3d-psrx r3 (Codex HIGH) — THE PROVENANCE GATE, APPLIED TO WHATEVER QUICKBOOKS SAYS REGRESSED.
+ *
+ * THE DEFECT. r2 established that a paid sale IMS never told the ledger about must not be reversed,
+ * and wired it into the Xero poller. This poller's reversal candidate query selected neither
+ * `unregisteredPaidAt` nor any receipt/registration evidence, so every recently modified balance-due
+ * invoice walked straight into reversal handling. A native order marked paid through
+ * `markSalesOrderPaid` has no shopping link, sets the marker, and by design creates no ledger
+ * payment — it satisfied that query exactly, and IMS's deliberate non-registration read as a removed
+ * payment: chargeback credit note raised, `paidAt` cleared, against a customer who paid.
+ *
+ * ONE DECISION, NOT A SECOND ONE WORDED LIKE IT. `readPaidProvenanceVerdicts` and
+ * `zeroPaidIsProvenReversal` are the SAME functions the Xero poller reaches its verdict with. The
+ * only connector-shaped argument is `ledgerListedPaymentIds`, and QuickBooks' answer to that is
+ * always NULL: the reversal read asks which invoice ids regressed and nothing else, so this poller
+ * cannot enumerate the payments a document carries. Null means "absence cannot be established from
+ * this payload", NOT "no payments" — so GONE and STILL_HELD are unreachable here and a document with
+ * a posted registration lands on LEDGER_DID_NOT_LIST_PAYMENTS.
+ *
+ * WHICH DIRECTION THIS MOVES. Every verdict `zeroPaidIsProvenReversal` admits was already reversed
+ * before this gate existed, so no reversal this poller used to make is lost. What it adds is
+ * withholding for the three states that used to reverse wrongly: the paid flag with no ledger
+ * receipt behind it (PAID_WITHOUT_LEDGER_RECEIPT), a local receipt not yet registered
+ * (RECEIPT_NOT_REGISTERED), and a registration this read cannot speak for (REGISTRATION_UNDECIDED).
+ *
+ * A RESIDUAL THIS DOES NOT CLOSE, stated so nobody reads it as closed: `Balance > 0` covers a PART
+ * payment as well as a removed one, and this poller does not read the amounts to tell them apart.
+ * Xero's poller does (`partitionPaymentReversals`). That is a different defect from the one Codex
+ * found and it is filed separately; nothing here makes it worse.
+ */
+export type QboReversalGate<T> = {
+  /** Reversal may proceed: the evidence proves the payment is gone, or there was never one of ours. */
+  admitted: T[]
+  /** Reversal WITHHELD — `paidAt` is left set and reported, never cleared on unproven evidence. */
+  withheld: Array<{ doc: T; verdict: RegisteredPaymentVerdict }>
+}
+
+export async function gateQboReversalsOnProvenance<T extends { id: string; accountingInvoiceId: string | null; unregisteredPaidAt?: Date | null }>(
+  candidates: T[],
+  params: {
+    registrationType: 'BILL_PAYMENT' | 'INVOICE_PAYMENT'
+    referenceType: 'PurchaseInvoice' | 'SalesOrder'
+    ledgerObservedBefore: LedgerReadFence | null
+  },
+): Promise<QboReversalGate<T>> {
+  const gate: QboReversalGate<T> = { admitted: [], withheld: [] }
+  if (candidates.length === 0) return gate
+  const verdicts = await readPaidProvenanceVerdicts(candidates, {
+    connector: QUICKBOOKS_CONNECTOR,
+    registrationType: params.registrationType,
+    referenceType: params.referenceType,
+    ledgerObservedBefore: params.ledgerObservedBefore,
+    // QuickBooks' reversal read enumerates no payments. See the header — null is not emptiness.
+    ledgerListedPaymentIds: () => null,
+  })
+  for (const doc of candidates) {
+    const verdict = verdicts.get(doc.id)
+    // NO VERDICT IS NOT A PASS. An absence means nothing was decided about this document, and the
+    // fail-closed reading of "nothing was decided" is the same one a null fence gets: withhold.
+    if (verdict == null) {
+      gate.withheld.push({ doc, verdict: { verdict: 'REGISTRATION_UNDECIDED', entryIds: [] } })
+      continue
+    }
+    if (zeroPaidIsProvenReversal(verdict)) gate.admitted.push(doc)
+    else gate.withheld.push({ doc, verdict })
+  }
+  return gate
+}
+
+/** Why a withheld reversal was withheld, in words an operator can act on. */
+export function qboWithheldReversalReason(verdict: RegisteredPaymentVerdict): string {
+  switch (verdict.verdict) {
+    case 'PAID_WITHOUT_LEDGER_RECEIPT':
+      return 'IMS holds this as paid from a channel or an operator, and no payment was ever registered '
+        + 'with QuickBooks for it. QuickBooks showing a balance due is IMS\'s own silence, not a removed '
+        + 'payment, so paidAt was LEFT SET and no chargeback credit note was raised. If the payment '
+        + 'really was reversed, unwind it by hand.'
+    case 'RECEIPT_NOT_REGISTERED':
+      return `IMS has recorded a receipt (${verdict.paymentIds.join(', ')}) that has not been registered `
+        + 'with QuickBooks yet, so the balance due is a payment of OURS that has not landed rather than '
+        + 'one taken away. paidAt was LEFT SET; IMS will decide this itself once the registration posts.'
+    case 'REGISTRATION_UNDECIDED':
+      return `IMS holds a payment registration (${verdict.entryIds.join(', ') || 'clock unreadable'}) that `
+        + 'this QuickBooks read cannot speak for, so the balance due may be a payment of ours still in '
+        + 'flight. paidAt was LEFT SET rather than guessed.'
+    case 'STILL_HELD':
+      return `QuickBooks still lists the payment IMS registered (${verdict.paymentIds.join(', ')}) on a `
+        + 'document it reports as unpaid. That contradiction is not proof of a reversal, so paidAt was '
+        + 'LEFT SET. Reconcile the document in QuickBooks.'
+    case 'GONE':
+    case 'NOTHING_REGISTERED':
+    case 'LEDGER_DID_NOT_LIST_PAYMENTS':
+      // Not reachable — these are the admitted verdicts. Stated rather than defaulted so a new
+      // verdict added to the union is a type error here instead of a silent generic sentence.
+      return 'Reversal was admitted; no reason to report.'
+  }
 }
 
 /**
  * Poll QuickBooks for paid invoices and bills.
  * Updates paidAt on matching IMS records and advances order status.
  */
-export async function pollQuickBooksPayments(): Promise<{ salesPaid: number; billsPaid: number; salesReversed: number; billsReversed: number; errors: string[] }> {
+export async function pollQuickBooksPayments(): Promise<{ salesPaid: number; billsPaid: number; salesReversed: number; billsReversed: number; salesReversalsWithheld: number; billsReversalsWithheld: number; errors: string[] }> {
   const errors: string[] = []
   let salesPaid = 0
   let billsPaid = 0
   let salesReversed = 0
   let billsReversed = 0
+  // o3d-psrx r3: reversals the provenance gate refused. Reported, never silently dropped.
+  let salesReversalsWithheld = 0
+  let billsReversalsWithheld = 0
   let allQueriesSucceeded = true
 
   const lastPoll = await getSettingValue(LAST_POLL_KEY)
@@ -177,6 +298,11 @@ export async function pollQuickBooksPayments(): Promise<{ salesPaid: number; bil
       externalOrderNumber: true,
       status: true,
       revenueDeferredDate: true,
+      // o3d-psrx r3 (Codex HIGH): WHERE this order's paid flag came from. Selected with `paidAt`'s own
+      // candidates because the reversal verdict turns on it — see gateQboReversalsOnProvenance.
+      // Leaving it out is the defect itself: every verdict then reads as NOTHING_REGISTERED and a sale
+      // an operator marked paid by hand is reversed with a chargeback credit note against it.
+      unregisteredPaidAt: true,
     },
   })
 
@@ -186,7 +312,36 @@ export async function pollQuickBooksPayments(): Promise<{ salesPaid: number; bil
       allQueriesSucceeded = false
       errors.push('Failed to query QuickBooks invoices for payment reversals')
     } else {
-      for (const order of detectPaymentReversals(paidOrders, reversedIds.all)) {
+      // o3d-psrx r3 (Codex HIGH) — THE SAME EVIDENCE XERO NOW REQUIRES, REQUIRED HERE.
+      const gate = await gateQboReversalsOnProvenance(
+        detectPaymentReversals(paidOrders, reversedIds.all),
+        {
+          registrationType: 'INVOICE_PAYMENT',
+          referenceType: 'SalesOrder',
+          ledgerObservedBefore: reversedIds.ledgerObservedBefore,
+        },
+      )
+
+      // WITHHELD IS REPORTED, NEVER SILENT. The watermark is deliberately NOT held for it: a paid flag
+      // that was never going to be registered stays unregistered for ever, so holding the cursor on it
+      // would freeze every later QuickBooks payment and reversal behind it indefinitely — the same
+      // trap o3d-w00 (Codex r8 #3) records a few lines below for a refused chargeback. The audit
+      // entry is therefore the durable record, and it says what a human has to do.
+      for (const { doc: order, verdict } of gate.withheld) {
+        salesReversalsWithheld++
+        await logActivity({
+          entityType: 'SALES_ORDER',
+          entityId: order.id,
+          action: 'payment_reversal_withheld',
+          tag: 'sync',
+          level: 'WARNING',
+          description: `QuickBooks reports a balance due on order ${order.orderNumber ?? order.externalOrderNumber} `
+            + `(status: ${order.status}), but the payment reversal was WITHHELD. ${qboWithheldReversalReason(verdict)}`,
+          resolveUser: false,
+        })
+      }
+
+      for (const order of gate.admitted) {
         // scjz.71: a reversed payment on a revenue-POSTED order (revenue recognised +
         // invoiced) is a chargeback — raise a revenue-only credit note that reverses
         // recognised revenue against AR. Idempotent (one chargeback per order).
@@ -303,7 +458,33 @@ export async function pollQuickBooksPayments(): Promise<{ salesPaid: number; bil
       allQueriesSucceeded = false
       errors.push('Failed to query QuickBooks bills for payment reversals')
     } else {
-      for (const bill of detectPaymentReversals(paidBills, reversedIds.all)) {
+      // o3d-psrx r3: the SAME gate, at the sibling reader in this same file. A bill has no
+      // `unregisteredPaidAt` column (markBillPaid queues its BILL_PAYMENT registration inside the paid
+      // transaction — o3d-a3wx), so what this adds on the purchase side is the REGISTRATION fence: a
+      // bill whose payment IMS has queued but not yet posted no longer has `paidAt` cleared on the
+      // strength of a balance QuickBooks reports while that payment is still on its way. Clearing it
+      // re-arms Mark Paid over money already leaving the bank, and pressing it pays the supplier twice.
+      const gate = await gateQboReversalsOnProvenance(detectPaymentReversals(paidBills, reversedIds.all), {
+        registrationType: 'BILL_PAYMENT',
+        referenceType: 'PurchaseInvoice',
+        ledgerObservedBefore: reversedIds.ledgerObservedBefore,
+      })
+
+      for (const { doc: bill, verdict } of gate.withheld) {
+        billsReversalsWithheld++
+        await logActivity({
+          entityType: 'PURCHASE_ORDER',
+          entityId: bill.poId,
+          action: 'bill_payment_reversal_withheld',
+          tag: 'sync',
+          level: 'WARNING',
+          description: `QuickBooks reports a balance due on the bill for PO ${bill.po.reference} `
+            + `(PO status: ${bill.po.status}), but the payment reversal was WITHHELD. ${qboWithheldReversalReason(verdict)}`,
+          resolveUser: false,
+        })
+      }
+
+      for (const bill of gate.admitted) {
         await db.purchaseInvoice.update({ where: { id: bill.id }, data: { paidAt: null } })
         billsReversed++
         await logActivity({
@@ -330,15 +511,17 @@ export async function pollQuickBooksPayments(): Promise<{ salesPaid: number; bil
     })
   }
 
-  if (salesPaid > 0 || billsPaid > 0 || salesReversed > 0 || billsReversed > 0) {
+  if (salesPaid > 0 || billsPaid > 0 || salesReversed > 0 || billsReversed > 0
+    || salesReversalsWithheld > 0 || billsReversalsWithheld > 0) {
     await logActivity({
       entityType: 'SYSTEM',
       action: 'quickbooks_payment_poll',
       tag: 'sync',
-      description: `QuickBooks payment poll: ${salesPaid} sales paid, ${billsPaid} bills paid, ${salesReversed} sales reversed, ${billsReversed} bills reversed`,
-      metadata: { salesPaid, billsPaid, salesReversed, billsReversed },
+      description: `QuickBooks payment poll: ${salesPaid} sales paid, ${billsPaid} bills paid, ${salesReversed} sales reversed, ${billsReversed} bills reversed`
+        + `, ${salesReversalsWithheld} sales + ${billsReversalsWithheld} bill reversals withheld`,
+      metadata: { salesPaid, billsPaid, salesReversed, billsReversed, salesReversalsWithheld, billsReversalsWithheld },
     })
   }
 
-  return { salesPaid, billsPaid, salesReversed, billsReversed, errors }
+  return { salesPaid, billsPaid, salesReversed, billsReversed, salesReversalsWithheld, billsReversalsWithheld, errors }
 }
