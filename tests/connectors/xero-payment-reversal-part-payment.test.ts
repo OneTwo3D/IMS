@@ -599,6 +599,18 @@ function databaseStamped(row: Row): Row {
   return { syncedAtDatabaseClock: row.syncedAt, ...row }
 }
 
+/**
+ * o3d-psrx r4 — EVERY REGISTRATION NAMES THE LEDGER DOCUMENT IT WAS RAISED AGAINST, because every
+ * production enqueue writes it: `markBillPaid` puts `accountingInvoiceId` in the BILL_PAYMENT payload
+ * and `registerInvoicePaymentWithLedger` puts it in the INVOICE_PAYMENT one. A fixture that omitted it
+ * would be modelling a row production does not create, and would exercise the LEGACY arm of
+ * `registrationBindsToPaidState` (unbindable -> undecided) in every test in this file.
+ */
+function withRegisteredDocument(accountingInvoiceId: string, overrides: Row): Row {
+  const { payload, ...rest } = overrides
+  return { payload: { accountingInvoiceId, ...(payload as Row | undefined) }, ...rest }
+}
+
 /** A BILL_PAYMENT registration IMS holds against bill pi_1. */
 function billRegistration(overrides: Row = {}): Row {
   return databaseStamped({
@@ -611,7 +623,7 @@ function billRegistration(overrides: Row = {}): Row {
     externalTransactionId: 'PAY-OURS',
     // Stamped by `clock_timestamp()` in the sync processor's own transaction (round 4).
     syncedAt: databaseNow(-5 * 60_000),
-    ...overrides,
+    ...withRegisteredDocument('XB1', overrides),
   })
 }
 
@@ -626,7 +638,7 @@ function salesRegistration(overrides: Row = {}): Row {
     externalTransactionId: 'PAY-OURS-S',
     // Stamped by `clock_timestamp()` in the sync processor's own transaction (round 4).
     syncedAt: databaseNow(-5 * 60_000),
-    ...overrides,
+    ...withRegisteredDocument('XS1', overrides),
   })
 }
 
@@ -1311,7 +1323,7 @@ test('an OLD BUILD row and a database-stamped row in one poll: only the one with
     // which is "outside any plausible skew" — and that reasoning is the defect.
     billRegistration({ id: 'log_old', syncedAtDatabaseClock: null }),
     // Written by this build: one statement, one reading of `clock_timestamp()`, both columns.
-    billRegistration({ id: 'log_new', referenceId: 'pi_2', externalTransactionId: 'PAY-OURS-2' }),
+    billRegistration({ id: 'log_new', referenceId: 'pi_2', externalTransactionId: 'PAY-OURS-2', payload: { accountingInvoiceId: 'XB2' } }),
   ]
 
   const result = await poll()
