@@ -2442,9 +2442,15 @@ exit 0
  * line breaks the mutation rather than letting it drift into testing nothing.
  */
 const blindRestoreMutation = (src: string): string => {
-  const before = 'plan_crontab_unfence "${backup}" "${current}" || return "${CRONTAB_UNFENCE_DIVERGED}"'
-  assert.ok(src.includes(before), 'scripts/install.sh must plan the unfence on one line')
-  return src.replace(before, 'CRON_UNFENCE_PLAN=snapshot; CRON_UNFENCE_TEXT="${backup}"')
+  // THE WHOLE PLAN, INCLUDING ITS THREE-WAY DISPATCH (o3d-p9dq, Codex r31 CRITICAL). This used to
+  // be a single line; the planner now answers "could not compute" separately from "the world
+  // moved", so the mutation lifts all three lines. Anchored on the exact shipped text, so a change
+  // to the dispatch breaks this mutation rather than letting it drift into testing nothing.
+  const before = '  plan_crontab_unfence "${backup}" "${current}" || plan_rc=$?\n'
+    + '  [[ "${plan_rc}" -ne "${CRONTAB_COMPUTE_FAILED}" ]] || return "${CRONTAB_COMPUTE_FAILED}"\n'
+    + '  [[ "${plan_rc}" -eq 0 ]] || return "${CRONTAB_UNFENCE_DIVERGED}"'
+  assert.ok(src.includes(before), `scripts/install.sh must plan the unfence here:\n${before}`)
+  return src.replace(before, '  CRON_UNFENCE_PLAN=snapshot; CRON_UNFENCE_TEXT="${backup}"')
 }
 
 async function saveInsideTheUnfenceWindow(mutate?: (src: string) => string) {
@@ -2547,10 +2553,13 @@ const PREDECESSOR_BLOCK = '# --- OTI CRON START ---\n'
   + '# --- OTI CRON END ---'
 
 const blindResumeMutation = (src: string): string => {
-  const before = '  if ! crontab_is_unmoved_since_backup "${backup}" "${current}"; then'
+  // The comparison has three answers since Codex r31, so "skip it entirely" is expressed by
+  // asserting the unmoved answer rather than by falsifying one `if`. Both branches below it then
+  // fall through, which is exactly what the pre-comparison resume did.
+  const before = '  crontab_is_unmoved_since_backup "${backup}" "${current}" || unmoved=$?'
   assert.ok(src.includes(before),
-    'scripts/install.sh must compare the live crontab with the backup projection on one line')
-  return src.replace(before, '  if false; then')
+    `scripts/install.sh must compare the live crontab with the backup projection here:\n${before}`)
+  return src.replace(before, '  unmoved=0')
 }
 
 async function resumeAgainst(live: string, mutate?: (src: string) => string) {
@@ -3194,7 +3203,13 @@ test('[o3d-batch-ret] MUTATION: the pre-round body reads that failure as an empt
   // snapshot. Together they are the shipped code as it stood, and it discards whatever was really
   // in the crontab.
   const lib = libraryWith([[
-    '  if crontab_is_unmoved_since_backup "${backup}" "${live}"; then',
+    '  crontab_is_unmoved_since_backup "${backup}" "${live}" || unmoved=$?\n'
+    + '  if [[ "${unmoved}" -eq "${CRONTAB_COMPUTE_FAILED}" ]]; then\n'
+    + '    CRON_UNFENCE_PLAN="refuse"\n'
+    + '    CRON_UNFENCE_REASON="${CRON_UNMOVED_REASON}"\n'
+    + '    return "${CRONTAB_COMPUTE_FAILED}"\n'
+    + '  fi\n'
+    + '  if [[ "${unmoved}" -eq 0 ]]; then',
     '  if [[ -z "$(awk \'NR == FNR { have[$0] = 1; next } /^[[:space:]]*$/ { next } !($0 in have) { print }\''
     + ' <(crontab_fence_projection "${backup}") <(printf \'%s\\n\' "${live}"))" ]]; then',
   ]])
@@ -3271,7 +3286,13 @@ test('[o3d-batch-ret] MUTATION: round 27\'s lost-lines branch schedules the dele
   // THE ROUTE, RUN. The branch as it shipped last round: live gained nothing over the projection,
   // therefore nothing wrote, therefore install the snapshot.
   const lib = libraryWith([[
-    '  if crontab_is_unmoved_since_backup "${backup}" "${live}"; then',
+    '  crontab_is_unmoved_since_backup "${backup}" "${live}" || unmoved=$?\n'
+    + '  if [[ "${unmoved}" -eq "${CRONTAB_COMPUTE_FAILED}" ]]; then\n'
+    + '    CRON_UNFENCE_PLAN="refuse"\n'
+    + '    CRON_UNFENCE_REASON="${CRON_UNMOVED_REASON}"\n'
+    + '    return "${CRONTAB_COMPUTE_FAILED}"\n'
+    + '  fi\n'
+    + '  if [[ "${unmoved}" -eq 0 ]]; then',
     '  if [[ -z "$(awk \'NR == FNR { have[$0] = 1; next } /^[[:space:]]*$/ { next } !($0 in have) { print }\''
     + ' <(crontab_fence_projection "${backup}") <(printf \'%s\\n\' "${live}"))" ]]; then',
   ]])
@@ -4435,4 +4456,344 @@ test('[o3d-batch-ret] MUTATION: the one-bit census reads a broken `pgrep` as an 
   assert.doesNotMatch(shipped.stdout, /MIGRATION_RAN/,
     `the shipped fence must stop instead:\n${shipped.stdout}${shipped.stderr}`)
   assert.match(shipped.stderr, /NOTHING HAS BEEN MIGRATED/, shipped.stderr)
+})
+
+// ---------------------------------------------------------------------------
+// Codex r31 CRITICAL — A COMPUTATION THAT COULD NOT BE RUN IS NOT AN ANSWER OF "NOTHING"
+//
+// The suspended-errexit hazard reached the PLANNER. `plan_crontab_unfence` is invoked by every
+// caller as `… || return`, so errexit is suspended for its whole dynamic extent, and it held three
+// command substitutions whose statuses nothing took:
+//
+//     merged="$(crontab_unfence_projection "${live}")"
+//     missing="$(crontab_unmanaged_lines_missing_from "${backup}" "${merged}")"
+//     [[ "${live}" == "$(crontab_fence_projection "${backup}")" ]]      (inside is_unmoved)
+//
+// A failing `awk` made all three empty. The empty `missing` was read as "the merge loses nothing",
+// `CRON_UNFENCE_TEXT` was set to the empty `merged`, and the caller installed an EMPTY CRONTAB and
+// then deleted ${CRON_BACKUP} — the only copy of what it had just erased. It is the same defect as
+// round 30's fourteen write sites, in a computation that FEEDS one, and worse in outcome: a failed
+// write installs nothing, a failed computation installs an emptiness the writer accepts.
+//
+// The difficulty, and why an exit status alone is not the fix: "produced no output" is a LEGITIMATE
+// answer at both sites. A crontab may genuinely be empty; a subsequence check may genuinely find
+// nothing missing. So failure cannot be represented as emptiness — each computation establishes
+// success POSITIVELY (a preserved line count; a completion sentinel).
+//
+// WHAT THESE PIN, and the route each takes:
+//   1. LOAD-BEARING. A failed projection REFUSES, leaves the crontab exactly as it is, and keeps
+//      the backup — in all three entrypoints
+//                 (unfence_cron -> with_crontab_lock -> unfence_cron_locked -> plan_crontab_unfence)
+//   2. MUTATION. The pre-fix planner, run under a REAL `set -euo pipefail`, installs an EMPTY
+//      crontab and deletes the backup
+//   3. LOAD-BEARING, THE OTHER DIRECTION. A genuinely EMPTY crontab still plans correctly, so the
+//      fix has not traded one failure for the other               (plan_crontab_unfence)
+//   4. LOAD-BEARING. A failed projection over an empty LIVE crontab refuses instead of returning
+//      the snapshot, which is the resurrection round 27 removed the lost-lines branch to prevent
+//   5. LOAD-BEARING. The subsequence check's completion sentinel: an `awk` that exits 0 without
+//      finishing is refused, with a CONTROL that the real one is accepted
+//   6. MUTATION. Without the sentinel check, that same silent `awk` merges
+//   7. LOAD-BEARING. `require_port_drained` refuses on an uncountable census
+//   8. MUTATION. The unchecked count reports the port DRAINED with a listener on it, because bash
+//      evaluates the empty string as 0                                     (port_listener_census)
+//   9. the repository walk: every command substitution inside an errexit-suspended body is either
+//      checked or on a roster with a stated reason                          (repository walk)
+// ---------------------------------------------------------------------------
+
+/** A shell function definition that replaces a real tool, injected into the program body. */
+const BROKEN_AWK = 'awk(){ return 127; }'
+const SILENT_AWK = 'awk(){ return 0; }'
+
+/** The library with the pre-fix, UNCHECKED planner put back — the route, run rather than described. */
+const preFixPlannerLib = () => libraryWith([
+  [`  CRON_UNMOVED_REASON=""
+  if ! run_crontab_projection "the fence projection of the backup" crontab_fence_projection "\${backup}"; then
+    CRON_UNMOVED_REASON="\${CRON_COMPUTE_REASON}"
+    return "\${CRONTAB_COMPUTE_FAILED}"
+  fi
+  [[ "\${live}" == "\${CRON_COMPUTE_TEXT}" ]]`,
+   `  [[ "\${live}" == "$(crontab_fence_projection "\${backup}")" ]]`],
+  [`  crontab_is_unmoved_since_backup "\${backup}" "\${live}" || unmoved=$?
+  if [[ "\${unmoved}" -eq "\${CRONTAB_COMPUTE_FAILED}" ]]; then
+    CRON_UNFENCE_PLAN="refuse"
+    CRON_UNFENCE_REASON="\${CRON_UNMOVED_REASON}"
+    return "\${CRONTAB_COMPUTE_FAILED}"
+  fi
+  if [[ "\${unmoved}" -eq 0 ]]; then`,
+   `  if crontab_is_unmoved_since_backup "\${backup}" "\${live}"; then`],
+  [`  run_crontab_projection "the unfence projection of the live crontab" crontab_unfence_projection "\${live}" || {
+    CRON_UNFENCE_PLAN="refuse"
+    CRON_UNFENCE_REASON="\${CRON_COMPUTE_REASON}"
+    return "\${CRONTAB_COMPUTE_FAILED}"
+  }
+  merged="\${CRON_COMPUTE_TEXT}"
+
+  run_crontab_missing_comparison "\${backup}" "\${merged}" || {
+    CRON_UNFENCE_PLAN="refuse"
+    CRON_UNFENCE_REASON="\${CRON_COMPUTE_REASON}"
+    return "\${CRONTAB_COMPUTE_FAILED}"
+  }
+  missing="\${CRON_COMPUTE_TEXT}"`,
+   `  merged="$(crontab_unfence_projection "\${live}")"
+  missing="$(crontab_unmanaged_lines_missing_from "\${backup}" "\${merged}")"`],
+])
+
+for (const [where, src] of FAULT_ENTRYPOINTS) {
+  test(`[o3d-batch-ret] ${where}: a FAILED projection refuses, leaves the crontab as it is, and keeps the backup`, async () => {
+    const fenced = await fenceProjectionOf(FAULT_ORIGINAL.replace(/\n$/, ''))
+    writeFileSync(FAULT_CRONTAB, fenced)
+    writeFileSync(FAULT_BACKUP, FAULT_ORIGINAL)
+
+    const run = await sh(faultProgram(where, src,
+      `${BROKEN_AWK}\nCRON_FENCED=true\nunfence_cron\necho UNFENCE_RETURNED`,
+      { functions: ['unfence_cron_locked', 'unfence_cron'], mutate: withErrexit }))
+
+    assert.equal(run.code, 9,
+      `an uncomputable plan must stop the run rather than install one:\n${run.stdout}${run.stderr}`)
+    assert.doesNotMatch(run.stdout, /UNFENCE_RETURNED/, run.stdout)
+    assert.match(run.stderr, /could not COMPUTE what to put back/,
+      `and it must say the computation failed, not blame an operator write:\n${run.stderr}`)
+    assert.match(run.stderr, /This is NOT a divergence/,
+      `a divergence sends the operator to compare two crontabs; there is nothing to compare here:\n${run.stderr}`)
+    assert.match(run.stderr, /exited 127/,
+      `carrying the status of the thing that actually failed:\n${run.stderr}`)
+
+    // THE CRONTAB IS UNTOUCHED. Still fenced, byte for byte — not emptied, not half-restored.
+    assert.equal(faultCrontabText(), fenced,
+      'THE LOAD-BEARING HALF: a failed computation must install NOTHING')
+
+    // THE BACKUP IS THE LAST COPY, and it survives — which is the difference between a run an
+    // operator can recover from by hand and a schedule that no longer exists anywhere.
+    assert.ok(existsSync(FAULT_BACKUP), 'the backup must survive a computation that could not be made')
+    assert.equal(readFileSync(FAULT_BACKUP, 'utf8'), FAULT_ORIGINAL)
+
+    // …and the body returns the COMPUTATION status, distinct from a divergence and from a
+    // rejected write, so the caller can say which of the three happened.
+    const observed = await sh(faultProgram(where, src,
+      [BROKEN_AWK, 'CRON_FENCED=true', 'rc=0', 'with_crontab_lock unfence_cron_locked || rc=$?',
+        'echo "RC=$rc"', 'echo "FENCED=$CRON_FENCED"', 'echo "PLAN=$CRON_UNFENCE_PLAN"'].join('\n'),
+      { functions: ['unfence_cron_locked'], mutate: withErrexit }))
+    assert.match(observed.stdout, /^RC=78$/m,
+      `the body must return CRONTAB_COMPUTE_FAILED, not 76 (diverged) or 77 (write rejected):\n${observed.stdout}${observed.stderr}`)
+    assert.match(observed.stdout, /^FENCED=true$/m,
+      `CRON_FENCED must not be cleared while the crontab is still fenced:\n${observed.stdout}`)
+    assert.match(observed.stdout, /^PLAN=refuse$/m,
+      `and no merge plan may be left behind a computation that did not run:\n${observed.stdout}`)
+  })
+}
+
+test('[o3d-batch-ret] MUTATION: the unchecked planner installs an EMPTY crontab and deletes the backup', async () => {
+  const fenced = await fenceProjectionOf(FAULT_ORIGINAL.replace(/\n$/, ''))
+  writeFileSync(FAULT_CRONTAB, fenced)
+  writeFileSync(FAULT_BACKUP, FAULT_ORIGINAL)
+
+  // THE ROUTE, RUN: the three unchecked substitutions as they stood, under a REAL `set -euo
+  // pipefail`, called the way the shipped code calls them — through `with_crontab_lock`, which is
+  // what suspends errexit and is the whole reason the missing checks mattered.
+  const run = await sh(faultProgram('scripts/deploy.sh', DEPLOY_SH,
+    [BROKEN_AWK, 'CRON_FENCED=true', 'rc=0', 'with_crontab_lock unfence_cron_locked || rc=$?',
+      'echo "RC=$rc"', 'echo "PLAN=$CRON_UNFENCE_PLAN"', 'echo "FENCED=$CRON_FENCED"'].join('\n'),
+    { functions: ['unfence_cron_locked'], mutate: withErrexit, lib: preFixPlannerLib() }))
+
+  assert.match(run.stdout, /^RC=0$/m,
+    `THE FINDING: a plan nothing could compute returns SUCCESS:\n${run.stdout}${run.stderr}`)
+  assert.match(run.stdout, /^PLAN=merge$/m,
+    'THE FINDING: and it is classified as a merge, on a comparison that never ran')
+  assert.equal(faultCrontabText(), '\n',
+    `THE FINDING: the operator's schedule is replaced by an EMPTY crontab:\n${JSON.stringify(faultCrontabText())}`)
+  assert.equal(existsSync(FAULT_BACKUP), false,
+    'THE IRREVERSIBLE HALF: and the only copy of what was just erased is deleted')
+
+  // THE CONTROL THAT NAMES THE CAUSE, and it names a WIDER one than the write sites did. There,
+  // `with_crontab_lock` was the single thing suspending errexit. Here the suspension arrives twice
+  // over: the wrapper suspends it for `unfence_cron_locked`, and `unfence_cron_locked` suspends it
+  // AGAIN for the planner by calling it as `plan_crontab_unfence … || plan_rc=$?`. That second
+  // suspension is the ordinary way a bash caller takes a status, which is why this hazard reached a
+  // function nobody thought of as running unprotected. So the control asks the planner directly,
+  // with nothing on the left of a `||`, under the same REAL `set -euo pipefail`.
+  const preFixLib = preFixPlannerLib()
+  const askPlanner = (call: string) => [
+    'set -euo pipefail',
+    `PATH='${FAULT_BIN}':"$PATH"`,
+    'die(){ echo "DIE: $*" >&2; exit 9; }',
+    `source '${preFixLib}'`,
+    BROKEN_AWK,
+    `backup=$(cat <<'B_EOF'\n${FAULT_ORIGINAL.replace(/\n$/, '')}\nB_EOF\n)`,
+    `live=$(cat <<'L_EOF'\n${fenced.replace(/\n$/, '')}\nL_EOF\n)`,
+    call,
+    'echo REACHED_AFTER_THE_PLANNER',
+  ].join('\n')
+
+  const bare = await sh(askPlanner('plan_crontab_unfence "$backup" "$live"'))
+  assert.notEqual(bare.code, 0,
+    `errexit must be armed in this harness, or the mutation above proves nothing:\n${bare.stdout}${bare.stderr}`)
+  assert.doesNotMatch(bare.stdout, /REACHED_AFTER_THE_PLANNER/,
+    `and the unchecked substitution must abort when nothing is suspending errexit:\n${bare.stdout}`)
+
+  // …AND THE SAME CALL, WRITTEN THE WAY EVERY CALLER WRITES IT, does not abort. This is the
+  // finding in one line: taking a function's status is what disarms every check inside it.
+  const suspended = await sh(askPlanner('rc=0; plan_crontab_unfence "$backup" "$live" || rc=$?'))
+  assert.equal(suspended.code, 0,
+    `${suspended.stdout}${suspended.stderr}`)
+  assert.match(suspended.stdout, /REACHED_AFTER_THE_PLANNER/,
+    `THE FINDING: `
+    + `\`|| rc=$?\` at the call site suspends errexit for every line inside the planner:\n${suspended.stdout}`)
+})
+
+/** Ask the SHIPPED planner directly, so the two directions below are about the plan itself. */
+async function planOf(backup: string, live: string, opts: { inject?: string; lib?: string } = {}) {
+  const run = await sh([
+    'set -uo pipefail',
+    `PATH='${FAULT_BIN}':"$PATH"`,
+    'die(){ echo "DIE: $*" >&2; exit 9; }',
+    `source '${opts.lib ?? CRONTAB_LOCK_LIB}'`,
+    opts.inject ?? '',
+    `backup=$(cat <<'B_EOF'\n${backup}\nB_EOF\n)`,
+    `live=$(cat <<'L_EOF'\n${live}\nL_EOF\n)`,
+    'rc=0; plan_crontab_unfence "$backup" "$live" || rc=$?',
+    'echo "RC=$rc"; echo "PLAN=${CRON_UNFENCE_PLAN}"',
+    'echo "TEXT<<"; printf \'%s\' "${CRON_UNFENCE_TEXT}"; echo; echo ">>END"',
+    'echo "WHY=${CRON_UNFENCE_REASON}"',
+  ].join('\n'))
+  return run
+}
+
+test('[o3d-batch-ret] a GENUINELY EMPTY crontab still plans correctly — the fix trades no failure for the other', async () => {
+  // THE OTHER DIRECTION, and the reason a bare exit-status check would not have been enough. An
+  // empty answer is LEGITIMATE here: a box may have no crontab at all, and the round-trip through
+  // the fence must still be planned rather than refused as a suspected failure.
+  const emptyBoth = await planOf('', '')
+  assert.match(emptyBoth.stdout, /^RC=0$/m,
+    `an empty crontab that nothing wrote must PLAN, not refuse:\n${emptyBoth.stdout}${emptyBoth.stderr}`)
+  assert.match(emptyBoth.stdout, /^PLAN=snapshot$/m, emptyBoth.stdout)
+  assert.match(emptyBoth.stdout, /TEXT<<\n\n>>END/, `and the plan is to install nothing:\n${emptyBoth.stdout}`)
+
+  // …and an empty backup with a line added while the fence was up still MERGES that line, rather
+  // than the empty projection of the backup being mistaken for a failed one.
+  const added = await planOf('', '#DEPLOY-FENCE# 0 1 * * * /usr/bin/added')
+  assert.match(added.stdout, /^RC=0$/m, `${added.stdout}${added.stderr}`)
+  assert.match(added.stdout, /^PLAN=merge$/m, added.stdout)
+  assert.match(added.stdout, /TEXT<<\n0 1 \* \* \* \/usr\/bin\/added\n>>END/,
+    `the line written while the crontab was fenced must survive:\n${added.stdout}`)
+
+  // THE PROOF THAT THE POSITIVE CHECK IS NOT VACUOUS. The very same empty-crontab case, with the
+  // projection broken: it must now REFUSE. If this passed as well, the line-count check would be
+  // accepting everything and the two assertions above would prove nothing.
+  const broken = await planOf('', '', { inject: BROKEN_AWK })
+  assert.match(broken.stdout, /^RC=78$/m,
+    `an empty crontab and a BROKEN projection must not look the same:\n${broken.stdout}${broken.stderr}`)
+  assert.match(broken.stdout, /^PLAN=refuse$/m, broken.stdout)
+})
+
+test('[o3d-batch-ret] a failed projection over an EMPTY live crontab refuses instead of resurrecting the snapshot', async () => {
+  // THE WORST READING OF THE OLD CODE. With the status discarded, a failed projection compared the
+  // live crontab against the empty string — so a live crontab that was ALSO empty compared EQUAL,
+  // the planner said "nothing wrote", and the snapshot went back verbatim. That is the resurrection
+  // round 27 deleted the lost-lines branch to prevent: an operator who ran `crontab -e` to stop a
+  // job finds it scheduled again, and is told the restore succeeded.
+  const backup = '*/5 * * * * /usr/bin/retired-by-the-operator'
+
+  const shipped = await planOf(backup, '', { inject: BROKEN_AWK })
+  assert.match(shipped.stdout, /^RC=78$/m,
+    `${shipped.stdout}${shipped.stderr}`)
+  assert.match(shipped.stdout, /^PLAN=refuse$/m, shipped.stdout)
+  assert.doesNotMatch(shipped.stdout, /retired-by-the-operator/,
+    `the deleted entry must not appear in anything this run would install:\n${shipped.stdout}`)
+
+  // THE ROUTE, RUN. The same question, of the pre-fix comparison.
+  const preFix = await planOf(backup, '', { inject: BROKEN_AWK, lib: preFixPlannerLib() })
+  assert.match(preFix.stdout, /^RC=0$/m,
+    `THE FINDING: a failed comparison reads as "nothing wrote":\n${preFix.stdout}${preFix.stderr}`)
+  assert.match(preFix.stdout, /^PLAN=snapshot$/m, preFix.stdout)
+  assert.match(preFix.stdout, /retired-by-the-operator/,
+    'THE RESURRECTION: the entry the operator deleted is in the text about to be installed')
+})
+
+test('[o3d-batch-ret] the subsequence check proves it FINISHED, so "nothing missing" is not the same as "never ran"', async () => {
+  const backup = '*/5 * * * * /usr/bin/operator-job'
+  const live = '#DEPLOY-FENCE# */5 * * * * /usr/bin/operator-job\n#DEPLOY-FENCE# 7 * * * * /usr/bin/added'
+
+  // CONTROL. The real check runs, finds nothing missing, and the merge is planned — so the
+  // refusals below are about the sentinel and not about the merge being broken outright.
+  const control = await planOf(backup, live)
+  assert.match(control.stdout, /^PLAN=merge$/m, `${control.stdout}${control.stderr}`)
+
+  // THE PROPERTY. An `awk` that exits 0 having printed NOTHING — a shim, a truncated pipe, a
+  // seccomp denial — produces exactly the output that used to mean "the merge loses nothing".
+  // Without the sentinel there is no way to tell the two apart; with it, this refuses.
+  const silent = await planOf(backup, live, { inject: SILENT_AWK })
+  assert.match(silent.stdout, /^RC=78$/m,
+    `an awk that exited 0 having done nothing must not read as a clean merge:\n${silent.stdout}${silent.stderr}`)
+  assert.match(silent.stdout, /^PLAN=refuse$/m, silent.stdout)
+
+  // ONLY the subsequence check broken, with both projections intact — so this is the sentinel's
+  // own property and not the line-count check catching it first.
+  const onlyComparison = [
+    'real_awk="$(command -v awk)"',
+    'awk(){ for a in "$@"; do case "$a" in sentinel=*) return 0 ;; esac; done; "$real_awk" "$@"; }',
+  ].join('\n')
+  const scoped = await planOf(backup, live, { inject: onlyComparison })
+  assert.match(scoped.stdout, /^RC=78$/m,
+    `${scoped.stdout}${scoped.stderr}`)
+  assert.match(scoped.stdout, /never ran is not a clean bill of health/,
+    `and it must name what was not established:\n${scoped.stdout}`)
+
+  // THE ROUTE, RUN: the sentinel check removed, everything else shipped.
+  const noSentinelCheck = libraryWith([[
+    `  if [[ "\${out}" != "\${CRONTAB_SUBSEQUENCE_SENTINEL}" \\
+     && "\${out}" != *$'\\n'"\${CRONTAB_SUBSEQUENCE_SENTINEL}" ]]; then return 1; fi`,
+    '  :']])
+  const mutated = await planOf(backup, live, { inject: onlyComparison, lib: noSentinelCheck })
+  assert.match(mutated.stdout, /^RC=0$/m,
+    `THE FINDING: without the sentinel, a check that never ran is a clean bill of health:\n${mutated.stdout}${mutated.stderr}`)
+  assert.match(mutated.stdout, /^PLAN=merge$/m,
+    'THE FINDING: and the merge is planned on it')
+})
+
+test('[o3d-batch-ret] the drain proof refuses an UNCOUNTABLE census, because bash reads an empty count as nought', async () => {
+  const census = (mode: string, extra = '', lib = CRONTAB_LOCK_LIB) => sh([
+    'set -uo pipefail',
+    'die(){ echo "DIE: $*" >&2; exit 9; }',
+    'IMS_PORT_DRAIN_WAIT_SECONDS=0',
+    `source '${lib}'`,
+    'command -v ss >/dev/null 2>&1 || ss(){ :; }',
+    mode,
+    extra,
+    'rc=0; require_port_drained 3000 || rc=$?',
+    'echo "RC=$rc"; echo "WHY=${PORT_DRAIN_REASON}"',
+  ].join('\n'))
+
+  const LISTENING = `ss(){ printf 'State Recv-Q Send-Q Local:Port Peer\\nLISTEN 0 511 0.0.0.0:3000 0.0.0.0:*\\n'; }`
+  const QUIET = `ss(){ printf 'State Recv-Q Send-Q Local:Port Peer\\n'; }`
+
+  // CONTROLS, both directions, so the refusals below are not a function that refuses everything.
+  const busy = await census(LISTENING)
+  assert.match(busy.stdout, /^RC=1$/m, `a listener must be reported:\n${busy.stdout}${busy.stderr}`)
+  assert.match(busy.stdout, /1 socket\(s\) are still listening/, busy.stdout)
+  const quiet = await census(QUIET)
+  assert.match(quiet.stdout, /^RC=0$/m, `a quiet port must be reported drained:\n${quiet.stdout}${quiet.stderr}`)
+
+  // THE PROPERTY. `ss` ran and answered; the COUNT could not be taken. That must not be drained.
+  const uncountable = await census(LISTENING, BROKEN_AWK)
+  assert.match(uncountable.stdout, /^RC=1$/m,
+    `a census that cannot be counted is not an absent listener:\n${uncountable.stdout}${uncountable.stderr}`)
+  assert.match(uncountable.stdout, /could not be computed from a census that DID run/, uncountable.stdout)
+
+  // …and an `awk` that exits 0 with no output, which the exit status alone cannot catch.
+  const unparseable = await census(LISTENING, SILENT_AWK)
+  assert.match(unparseable.stdout, /^RC=1$/m, `${unparseable.stdout}${unparseable.stderr}`)
+  assert.match(unparseable.stdout, /is not a number/, unparseable.stdout)
+
+  // THE ROUTE, RUN: the unchecked count put back. `[[ "" -eq 0 ]]` is TRUE in bash, so the port is
+  // reported drained with a listener sitting on it, and the cron fence is taken over a live box.
+  const preFix = libraryWith([[
+    `  local count rc_count=0
+  count="$(awk -v p=":\${port}\\$" '$4 ~ p { n += 1 } END { print n + 0 }' <<< "\${out}")" || rc_count=$?`,
+    `  local count rc_count=0
+  count="$(printf '%s\\n' "\${out}" | awk -v p=":\${port}\\$" '$4 ~ p { n += 1 } END { print n + 0 }')"`],
+    [`  if [[ "\${rc_count}" -ne 0 ]]; then`, `  if false; then`],
+    [`  if [[ ! "\${count}" =~ ^[0-9]+$ ]]; then`, `  if false; then`]])
+  const drained = await census(LISTENING, BROKEN_AWK, preFix)
+  assert.match(drained.stdout, /^RC=0$/m,
+    `THE FINDING: the port is reported DRAINED over a census that was never read, with a listener on it:\n${drained.stdout}${drained.stderr}`)
 })

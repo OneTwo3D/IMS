@@ -2291,15 +2291,24 @@ adopt_db_connections() {
 # just published, and returns non-zero. What a failed publish leaves at $CRON_BACKUP is
 # nothing at all.
 publish_cron_backup() {
-  local content="$1" tmp
+  local content="$1" tmp readback mode
   mkdir -p "$(dirname "$CRON_BACKUP")" || return 1
   tmp="$(mktemp "${CRON_BACKUP}.XXXXXX" 2>/dev/null)" || return 1
   if ! printf '%s\n' "$content" > "$tmp" 2>/dev/null; then rm -f "$tmp"; return 1; fi
   if ! chmod 600 "$tmp" 2>/dev/null; then rm -f "$tmp"; return 1; fi
   # The whole content, read back off the filesystem. `$(cat ...)` and the value that was
   # written both lose their trailing newlines, so this compares every byte that matters.
-  if [[ "$(cat "$tmp" 2>/dev/null)" != "$content" ]]; then rm -f "$tmp"; return 1; fi
-  if [[ "$(stat -c '%a' "$tmp" 2>/dev/null)" != "600" ]]; then rm -f "$tmp"; return 1; fi
+  # THE READ-BACK TAKES ITS OWN STATUS (o3d-p9dq, Codex r31 sweep). This was
+  # `if [[ "$(cat …)" != "${content}" ]]`, and a `cat` that could not run yields the empty string
+  # — which is INDISTINGUISHABLE from the read-back of a backup whose content is legitimately
+  # empty, because a crontab may genuinely have nothing in it. In that one case the verification
+  # passed without having verified anything, and the run went on to fence the crontab trusting a
+  # backup it had not read. Same shape as the planner's, and the same answer: the status first,
+  # the comparison second.
+  readback="$(cat "$tmp" 2>/dev/null)" || { rm -f "$tmp"; return 1; }
+  if [[ "${readback}" != "$content" ]]; then rm -f "$tmp"; return 1; fi
+  mode="$(stat -c '%a' "$tmp" 2>/dev/null)" || { rm -f "$tmp"; return 1; }
+  if [[ "${mode}" != "600" ]]; then rm -f "$tmp"; return 1; fi
   # DURABLE, NOT MERELY VISIBLE (o3d-2sm1.5, Codex r9 HIGH). The read-back above proves the
   # bytes can be SEEN, and the page cache will happily satisfy it from memory. A power loss
   # after the crontab has been fenced would then reboot with this backup missing or
@@ -2314,7 +2323,12 @@ publish_cron_backup() {
   # IMMEDIATELY. From here the file is authoritative, and it must be owned by this run in the
   # same breath, or the unwind disowns a backup it is the only one able to restore.
   CRON_BACKUP_CREATED=true
-  if [[ "$(cat "$CRON_BACKUP" 2>/dev/null)" != "$content" ]]; then
+  readback="$(cat "$CRON_BACKUP" 2>/dev/null)" || {
+    rm -f "$CRON_BACKUP"
+    CRON_BACKUP_CREATED=false
+    return 1
+  }
+  if [[ "${readback}" != "$content" ]]; then
     rm -f "$CRON_BACKUP"
     CRON_BACKUP_CREATED=false
     return 1
@@ -2428,6 +2442,8 @@ unfence_cron() {
   with_crontab_lock unfence_cron_locked || rc=$?
   [[ "$rc" -ne "$CRONTAB_WRITE_FAILED" ]] || die \
     "The ${APP_USER} crontab is still FENCED (every line commented out) because the restoring write was REJECTED: ${CRON_UNFENCE_REASON}. Nothing was installed, the backup at ${CRON_BACKUP} was NOT deleted, and this run has changed nothing else. The application is up and the migration is complete; settle the cause and put the schedule back by hand:  crontab -u ${APP_USER} ${CRON_BACKUP}"
+  [[ "$rc" -ne "$CRONTAB_COMPUTE_FAILED" ]] || die \
+    "The ${APP_USER} crontab is still FENCED (every line commented out) because this run could not COMPUTE what to put back: $CRON_UNFENCE_REASON. Nothing was installed and the backup at ${CRON_BACKUP} was NOT deleted. This is NOT a divergence — there are no two candidates to compare, and no schedule has been rewritten; a tool this protocol depends on did not run. Settle that, then put the schedule back by hand:  crontab -u ${APP_USER} ${CRON_BACKUP}"
   [[ "$rc" -ne "$CRONTAB_UNFENCE_DIVERGED" ]] || die \
     "The ${APP_USER} crontab is still FENCED (every line commented out) and this run will not decide what belongs in it: ${CRON_UNFENCE_REASON}. Neither candidate is safe to install without a human — the backup at ${CRON_BACKUP} would discard whatever rewrote the crontab, and undoing the fence in place would discard the lines listed above. Compare the two (crontab -u ${APP_USER} -l, against ${CRON_BACKUP}) and install the union by hand."
   [[ "$rc" -eq 0 ]] || die \
@@ -2467,7 +2483,16 @@ unfence_cron_locked() {
     CRON_UNFENCE_REASON="the backup at ${CRON_BACKUP} could not be read"
     return "$CRONTAB_UNFENCE_DIVERGED"
   fi
-  plan_crontab_unfence "$backup" "$current" || return "$CRONTAB_UNFENCE_DIVERGED"
+  # A COMPUTATION THAT COULD NOT BE MADE IS NOT A DIVERGENCE (o3d-p9dq, Codex r31 CRITICAL).
+  # Both refuse, both keep the backup and both leave the crontab fenced — but they send the
+  # operator to different places, and one of them is the wrong place. A divergence says "compare
+  # these two crontabs and install the union"; a failed computation says "a tool this protocol
+  # depends on did not run", and there is no union to compare. The status is forwarded rather
+  # than folded into the one the caller already knew about.
+  local plan_rc=0
+  plan_crontab_unfence "$backup" "$current" || plan_rc=$?
+  [[ "${plan_rc}" -ne "$CRONTAB_COMPUTE_FAILED" ]] || return "$CRONTAB_COMPUTE_FAILED"
+  [[ "${plan_rc}" -eq 0 ]] || return "$CRONTAB_UNFENCE_DIVERGED"
   # THE ORDER IS THE FIX, NOT THE CHECK ALONE (o3d-p9dq, Codex r30 CRITICAL). The mirror of the
   # fence, and the worse half: a rejected write here used to be followed by `rm -f "${CRON_BACKUP}"`
   # — deleting the ONLY copy of the operator's schedule — and by `CRON_FENCED=false`, which tells
@@ -2585,7 +2610,16 @@ resume_restore_cron_locked() {
   }
   current="$CRONTAB_READ_TEXT"
   backup="$(cat "$CRON_BACKUP" 2>/dev/null)" || return 1
-  if ! crontab_is_unmoved_since_backup "$backup" "$current"; then
+  # THE COMPARISON HAS THREE ANSWERS NOW (o3d-p9dq, Codex r31 CRITICAL), and reading the third
+  # one as the second would blame an operator write that never happened. Both refuse and both keep
+  # the backup; only the message differs, and the message is the entire product of this branch.
+  local unmoved=0
+  crontab_is_unmoved_since_backup "$backup" "$current" || unmoved=$?
+  if [[ "${unmoved}" -eq "$CRONTAB_COMPUTE_FAILED" ]]; then
+    RESUME_CRON_DIVERGED="the comparison that decides whether ${CRON_BACKUP} is still current could not be MADE, so nothing has established that installing it would discard nothing — this is not a write somebody made, it is a check that did not run: $CRON_UNMOVED_REASON"
+    return 1
+  fi
+  if [[ "${unmoved}" -ne 0 ]]; then
     RESUME_CRON_DIVERGED="the live crontab is not the fence's own projection of ${CRON_BACKUP}, so something has written it since the interrupted run took that snapshot — installing the snapshot would discard that write, or put back an entry somebody deliberately deleted"
     return 1
   fi
@@ -2685,7 +2719,10 @@ restore_cron_from_backup_locked() {
   }
   current="$CRONTAB_READ_TEXT"
   backup="$(cat "$CRON_BACKUP" 2>/dev/null)" || return 1
-  plan_crontab_unfence "$backup" "$current" || return 1
+  plan_crontab_unfence "$backup" "$current" || {
+    warn "The ${APP_USER} crontab will not be restored from ${CRON_BACKUP}: $CRON_UNFENCE_REASON"
+    return 1
+  }
   write_crontab_for "$APP_USER" "$CRON_UNFENCE_TEXT" || {
     warn "The ${APP_USER} crontab could not be restored from ${CRON_BACKUP}: ${CRONTAB_WRITE_REASON}"
     return 1
