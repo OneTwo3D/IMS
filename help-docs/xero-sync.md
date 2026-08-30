@@ -880,6 +880,24 @@ still queued, on the wire, **failed**, or finished after this Xero read was take
 A *failed* attempt counts as unresolved deliberately: the connector posts before it records the
 outcome, so a lost response is written down identically to a rejection.
 
+**"No registration at all" now depends on where the paid flag came from.** That arm is right for the
+document it was written for — one the IMS marked paid *because Xero said so*, through the payment poll
+or the backlog reconcile. If Xero later holds nothing, the payment really has been taken away and
+clearing `paidAt` is the point of the pass.
+
+It is wrong for a sale the IMS holds as paid on evidence Xero was never given. A **WooCommerce** order
+is marked paid from the channel's own payment date, and an order marked paid **by hand** in the IMS is
+marked paid because somebody said so; neither of those puts anything into Xero by itself. An empty
+Xero invoice against one of them is not a removal — it is the IMS's own silence — and acting on it
+cleared `paidAt` and raised a **chargeback credit note against a customer who really had paid**.
+
+So each sale records *where* its paid flag came from, in the same write that sets it. A sale paid by a
+channel or by an operator, with no payment registration that has demonstrably reached Xero, is
+**withheld** and reported: check the payment in the sales channel, then reverse the order by hand if it
+is genuinely gone, or register the receipt so the two agree. The moment a payment registration *has*
+posted, the recorded origin stops mattering and Xero's own list decides again — so a genuine
+**WooCommerce chargeback is still detected and still unwinds revenue**, exactly as before.
+
 **A withheld verdict is asked again on a timer.** It cannot be left to resolve itself: the delta
 returns an invoice only when it *changes*, and what usually settles a withheld verdict is not a change
 in Xero at all — it is the IMS's own registration finishing, or somebody cancelling a failed one.
