@@ -874,6 +874,31 @@ test('[o3d-rn10] an unanchored operator override with no anchored root above it 
   assert.deepEqual(readdirSync(state), [], 'and nothing may be written into it — not the file, not a staging directory')
 })
 
+test('[o3d-rn10] pin_dir_beneath_root refuses an unanchored root of its own accord, whoever handed it one', (t) => {
+  const root = createTempDirSync('ims-rn10-pin-anchor-', t)
+  // The root the walk is TOLD to start from, with a parent anybody can rename inside. In the
+  // shipped path publish_trust_root() would never name it — this asks the function that acts on
+  // the answer, because it is the one that runs `mkdir -p` and `cd -P` on the root's own name.
+  const home = join(root, 'svc-home')
+  const state = join(home, 'state')
+  mkdirSync(state, { recursive: true })
+  chmodSync(home, 0o777)
+
+  const run = runBash(rig(['publish_root_anchored', 'pin_dir_beneath_root'],
+    `pin_dir_beneath_root "${state}" "${join(state, 'deploy')}"; echo "rc=$?"`))
+
+  assert.match(run.stdout, /^rc=1$/m, 'the walk must not start from a root it was handed without an anchor')
+  assert.deepEqual(readdirSync(state), [], 'and it must create nothing under it — not even the first component')
+
+  // NOT VACUOUS: the same call, with the same directories, succeeds once the parent is one only
+  // its owner can rename inside. So what refused it was the anchor and not the walk.
+  chmodSync(home, 0o755)
+  const ok = runBash(rig(['publish_root_anchored', 'pin_dir_beneath_root'],
+    `pin_dir_beneath_root "${state}" "${join(state, 'deploy')}"; echo "rc=$?"`))
+  assert.match(ok.stdout, /^rc=0$/m, `an anchored root must still be walked: ${ok.stderr}`)
+  assert.deepEqual(readdirSync(state), ['deploy'], 'and the component created')
+})
+
 test('[o3d-rn10] publish_root_anchored decides on the PARENT mode, and does not credit the sticky bit', (t) => {
   const root = createTempDirSync('ims-rn10-anchor-mode-', t)
   const parent = join(root, 'parent')
