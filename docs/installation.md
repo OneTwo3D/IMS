@@ -1237,7 +1237,23 @@ to do:
 | cutover lock | `/var/lib/one-two-inventory/cutover.lock` |
 
 Set `IMS_CUTOVER_STATE_DIR` **in the environment of the root invocation** to move all four
-together; `IMS_DEPLOY_STATE_DIR` and `IMS_DATA_DIR` are still honoured. Setting any of them in
+together; `IMS_DEPLOY_STATE_DIR` and `IMS_DATA_DIR` are still honoured.
+
+**An override has to be ANCHORED, and an unanchored one stops the run rather than being trusted.**
+Every path above is published by a walk that starts at a directory the scripts take on trust, so
+that directory's own name must be one the service user cannot replace: its **parent** must belong
+to root (or to whoever is running the script) and carry no group or other write bit. `/opt`,
+`/var/lib` and `/etc` all satisfy that, which is why the shipped defaults work; `/tmp` does not,
+and neither does anything under a directory the application account owns.
+
+* An override **nested inside another root** — `IMS_CUTOVER_STATE_DIR=/var/lib/one-two-inventory/cutover`
+  — is supported and needs no anchor of its own. The walk simply starts at the data directory and
+  resolves `cutover` like any other component: created with a plain `mkdir`, checked with `lstat`,
+  and **refused if it is a symlink**. So do not point a nested state directory at another disk with
+  a symlink; symlink the data directory itself instead, which is a root nothing else covers.
+* An override **outside every other root** whose parent is writable by anyone but root — say
+  `IMS_CUTOVER_STATE_DIR=/home/deploy/state` — is refused. The run fails, loudly, at the first
+  publication, rather than writing root-owned state into a directory somebody else can redirect. Setting any of them in
 `APP_DIR/.env` does nothing: the application user owns that file, and since o3d-2sm1.5 r25 none of
 the three entrypoints puts it into a shell's environment at all — each reads the handful of keys it
 needs out of it by name, so an `IMS_*` line in it never becomes a variable anywhere. Until o3d-2sm1.5 `deploy.sh` kept its own set under
