@@ -269,6 +269,19 @@ function shellFunction(source: string, name: string): string {
 }
 
 /**
+ * One `NAME="value"` assignment in column 0, lifted rather than re-typed (o3d-czpy).
+ *
+ * publish_durable_file() reads PUBLISH_STAGE_DIRNAME, which scripts/install.sh ALSO has to prune
+ * out of its recursive chown over ${DATA_DIR}. A harness that re-typed the name would keep passing
+ * while the two came apart, which is the whole reason the name is stated once in the script.
+ */
+function shellConstant(source: string, name: string): string {
+  const line = source.split('\n').find((l) => l.startsWith(`${name}=`))
+  assert.ok(line, `the script must define ${name} on one line`)
+  return line
+}
+
+/**
  * The durability primitives every marker and cron-backup writer now goes through, taken
  * from the script under test.
  *
@@ -277,6 +290,8 @@ function shellFunction(source: string, name: string): string {
  */
 function durabilityFunctions(source: string): string {
   return [
+    // o3d-czpy: the staging directory publish_durable_file() writes through, named once.
+    shellConstant(source, 'PUBLISH_STAGE_DIRNAME'),
     shellFunction(source, 'fsync_path'),
     shellFunction(source, 'publish_durable_file'),
     // The drop-in publisher is one of these too (o3d-2sm1.5, Codex r11): install_reboot_fence()
@@ -994,7 +1009,9 @@ for (const entry of MARKER_CASES) {
 
     const publish = shellFunction(entry.source, 'publish_durable_file')
     const fileBarrier = publish.indexOf('fsync_path "$tmp"')
-    const rename = publish.indexOf('mv -f "$tmp" "$target"')
+    // o3d-czpy: `-T`, so a DIRECTORY planted at the target name is refused rather than filled
+    // with a stray temporary while the run reports success.
+    const rename = publish.indexOf('mv -f -T "$tmp" "$target"')
     const dirBarrier = publish.indexOf('fsync_path "$dir"')
     assert.ok(fileBarrier !== -1, 'the data must be fsynced')
     assert.ok(rename !== -1, 'and published by rename')
@@ -3838,6 +3855,9 @@ function runR9(
       'set -euo pipefail',
       R9_MARKER_PREAMBLE(dir),
       extra,
+      // o3d-czpy: publish_durable_file() stages through this directory, and it is lifted rather
+      // than re-typed for the same reason its functions are.
+      shellConstant(entry.source, 'PUBLISH_STAGE_DIRNAME'),
       ...functions.map((name) => shellFunction(entry.source, name)),
       body,
     ].join('\n')
@@ -3873,8 +3893,11 @@ for (const entry of R9_SCRIPTS) {
     const result = runR9(entry, ['fsync_path', 'publish_durable_file', entry.writer], `${entry.writer} "under test"`, R9_BARRIER_SHIMS)
     assert.equal(result.status, 0, `the writer must succeed:\n${result.stdout}`)
 
-    const dataBarrier = result.barriers.findIndex((line) => /^sync .*DEPLOY-FENCED\.\w+$/.test(line))
-    const rename = result.barriers.findIndex((line) => /^mv -f .*DEPLOY-FENCED\.\w+ .*DEPLOY-FENCED$/.test(line))
+    // o3d-czpy: the temporary is made INSIDE the root-owned staging directory and named
+    // relative to it, so it is `./publish.XXXXXX` and no longer `DEPLOY-FENCED.XXXXXX` beside
+    // the marker. The ordering being measured is unchanged.
+    const dataBarrier = result.barriers.findIndex((line) => /^sync \.\/publish\.\w+$/.test(line))
+    const rename = result.barriers.findIndex((line) => /^mv -f -T \.\/publish\.\w+ .*DEPLOY-FENCED$/.test(line))
     const dirBarrier = result.barriers.findIndex((line) => new RegExp(`^sync ${result.dir}$`).test(line))
 
     assert.notEqual(dataBarrier, -1, `the temporary must be fsynced: ${result.barriers.join(' | ')}`)
@@ -3909,10 +3932,17 @@ for (const entry of R9_SCRIPTS) {
       result.marker !== null && /^marker_complete=1$/m.test(result.marker),
       'and it is still a complete marker, not a truncated one',
     )
+    // o3d-czpy: temporaries live in the root-owned staging directory now, so that is where a
+    // leaked one would be. Checking only for `DEPLOY-FENCED.*` beside the marker would pass
+    // whatever the publisher did.
+    const staged = existsSync(join(result.dir, '.ims-publish'))
+      ? readdirSync(join(result.dir, '.ims-publish'))
+      : []
+    assert.deepEqual(staged, [], `and no temporary may be left behind in the staging directory: ${staged.join(', ')}`)
     assert.deepEqual(
       result.files.filter((name) => name.startsWith('DEPLOY-FENCED.')),
       [],
-      `and no temporary may be left behind: ${result.files.join(', ')}`,
+      `nor beside the marker: ${result.files.join(', ')}`,
     )
   })
 
@@ -5438,6 +5468,20 @@ const MENTION_SHAPES: ReadonlyArray<{ why: string; match: RegExp }> = (
       match:
         'write_role_rotation_journal "\\$\\{DB_PASSWORD_EFFECTIVE\\}" "\\$\\{DB_PASSWORD\\}"'
         + ' "\\$\\{DB_ROTATION_PROBE_DATABASE\\}" \\|\\| die "[^"]*"',
+    },
+    // AND `.deploy-meta` JOINED IT (o3d-czpy). It was `cat > "${DEPLOY_META_FILE}" <<EOF`
+    // followed by a chown and a chmod 600 — three root-side operations on a name inside
+    // ${APP_DIR}, which belongs to ${APP_USER} by the time an upgrade reaches that line, so a
+    // symlink planted there aimed all three. It now goes through the same publisher `.env` does.
+    // Spelled out in full for the same reason that one is: the bytes come from the brace group
+    // immediately above, whose closing `}` opens this logical line, and the application-owned path
+    // appears here as a DESTINATION and never as an input. A call that piped something else in, or
+    // that dropped the ownership argument, is not covered by this.
+    {
+      why: 'install.sh publishing the deploy metadata it owns, by rename, from a group it composed itself',
+      match:
+        `\\} \\| publish_durable_file "(${APP_OWNED_PATH})" `
+        + '"\\$\\{APP_USER\\}:\\$\\{APP_USER\\}" 600 \\|\\| die "[^"]*"',
     },
     {
       why: 'install.sh locking down or removing the file it owns',

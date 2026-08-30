@@ -3185,6 +3185,8 @@ test('o3d-2sm1.5 r23: the snapshot is written verbatim, root-only, and loaded wi
         'error() { printf "ERROR %s\\n" "$*"; }',
         'warn() { printf "WARN %s\\n" "$*"; }',
         'fsync_path() { sync "$1" 2>/dev/null || true; return 0; }',
+        // o3d-czpy: publish_durable_file() stages through a root-owned directory named here.
+        source.split('\n').find((l) => l.startsWith('PUBLISH_STAGE_DIRNAME=')) ?? '',
         readShellFunction(source, 'publish_durable_file'),
         readShellFunction(source, 'publish_durable_dropin'),
         readShellFunction(source, 'env_file_value'),
