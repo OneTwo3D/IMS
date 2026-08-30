@@ -183,24 +183,39 @@ test('every entry carries a reason, and a refund-blind one that needs a disclosu
   assert.deepEqual(problems, [])
 })
 
-test('the refund-blind reports actually SAY SO where they are read (o3d-iigc r5)', async () => {
-  // Not "a constant is referenced" but "the sentence is in the payload the page renders". The three
-  // sales-analytics reports and the COGS/turnover report publish revenue/profit/margin that never
-  // sees a refund; blindness is a stated property of those reports, not an oversight in them.
+test('the three sales-analytics reports say WHICH credit was deducted, where they are read (o3d-kyey)', async () => {
+  // Not "a constant is referenced" but "the sentence is in the payload the page renders".
+  //
+  // o3d-iigc round 5 asserted the opposite of this: that all three carried "Refunds are NOT
+  // deducted". o3d-kyey made them basis-aware, so the assertion has to change with them — and the
+  // thing it now pins is the property that replaced blindness. "Net of refunds" with no basis named
+  // is precisely the ambiguity that produced the original defect, so each sentence must NAME the
+  // basis of the credit it took off, and must not still be claiming that none was taken off.
   const {
-    REFUND_BLIND_NOTICE_CUSTOMER_MIX, REFUND_BLIND_NOTICE_GROSS_MARGIN, REFUND_BLIND_NOTICE_SALES,
+    REFUND_BASIS_NOTICE_CUSTOMER_MIX, REFUND_BASIS_NOTICE_GROSS_MARGIN, REFUND_BASIS_NOTICE_SALES,
   } = await import('@/lib/analytics/refund-figure-surfaces')
   const analytics = readFileSync(path.join(process.cwd(), 'lib/domain/sales/sales-fulfillment-analytics.ts'), 'utf8')
 
   for (const [name, notice] of [
-    ['REFUND_BLIND_NOTICE_SALES', REFUND_BLIND_NOTICE_SALES],
-    ['REFUND_BLIND_NOTICE_CUSTOMER_MIX', REFUND_BLIND_NOTICE_CUSTOMER_MIX],
-    ['REFUND_BLIND_NOTICE_GROSS_MARGIN', REFUND_BLIND_NOTICE_GROSS_MARGIN],
+    ['REFUND_BASIS_NOTICE_SALES', REFUND_BASIS_NOTICE_SALES],
+    ['REFUND_BASIS_NOTICE_CUSTOMER_MIX', REFUND_BASIS_NOTICE_CUSTOMER_MIX],
+    ['REFUND_BASIS_NOTICE_GROSS_MARGIN', REFUND_BASIS_NOTICE_GROSS_MARGIN],
   ] as const) {
-    assert.match(notice, /Refunds are NOT deducted/, `${name} must lead with the fact, not bury it`)
+    assert.match(notice, /basis/, `${name} must name the basis of the credit it deducted`)
+    assert.doesNotMatch(notice, /Refunds are NOT deducted/, `${name} still claims the report is refund-blind`)
     // Twice — imported AND used. See the note on the same rule above: an import alone reaches nobody.
     assert.ok(analytics.split(name).length - 1 >= 2, `${name} must be in the notices of the report it describes`)
   }
+})
+
+test('the reports that ARE still refund-blind keep saying so (o3d-iigc r5)', async () => {
+  // The COGS/inventory-turnover report was not in o3d-kyey's scope and is still blind. Its notice
+  // must survive: making three siblings basis-aware must not quietly take the disclosure off the one
+  // that still needs it.
+  const { REFUND_BLIND_NOTICE_COGS_MARGIN } = await import('@/lib/analytics/refund-figure-surfaces')
+  assert.match(REFUND_BLIND_NOTICE_COGS_MARGIN, /Refunds are NOT deducted/)
+  const costing = readFileSync(path.join(process.cwd(), 'lib/domain/inventory/inventory-costing-reports.ts'), 'utf8')
+  assert.ok(costing.split('REFUND_BLIND_NOTICE_COGS_MARGIN').length - 1 >= 2)
 })
 
 test('and the pages that publish them actually RENDER the notices (o3d-iigc r5)', () => {

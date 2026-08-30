@@ -21,11 +21,18 @@ import {
   loadFulfillmentProductGraph,
 } from '@/lib/products/kit-fulfillment'
 import { lineFulfillmentRequirements } from '@/lib/products/fulfillment-requirement-snapshot'
-import { refundTotalsBasis } from '@/lib/domain/sales/refund-basis-analytics'
 import {
-  REFUND_BLIND_NOTICE_CUSTOMER_MIX,
-  REFUND_BLIND_NOTICE_GROSS_MARGIN,
-  REFUND_BLIND_NOTICE_SALES,
+  creditPlacement,
+  marginFigureBoundDecimal,
+  netLinearFigureBoundDecimal,
+  refundTotalsBasis,
+  shareFigureBound,
+  type DerivedFigureBound,
+} from '@/lib/domain/sales/refund-basis-analytics'
+import {
+  REFUND_BASIS_NOTICE_CUSTOMER_MIX,
+  REFUND_BASIS_NOTICE_GROSS_MARGIN,
+  REFUND_BASIS_NOTICE_SALES,
   RETURNS_MIXED_BASIS_MARKER,
   RETURNS_MIXED_BASIS_NOTICE,
 } from '@/lib/analytics/refund-figure-surfaces'
@@ -90,10 +97,33 @@ export type SalesReportRow = {
   currency: string
   orderCount: number
   lineCount: number
+  /**
+   * AS INVOICED, and deliberately still so after o3d-kyey. This report's contract — stated in its
+   * own notices, and the reason the product/category views allocate order totals across lines at all
+   * — is that its grand totals reconcile to `SalesOrder` totals. A figure that reconciles to the
+   * invoices cannot also be net of credit notes, so the refund-aware figure is `netRevenue` beside
+   * it rather than a redefinition of this one. `tax`, `shipping` and `discount` are as invoiced for
+   * the same reason.
+   */
   revenue: string
   tax: string
   shipping: string
   discount: string
+  /**
+   * `revenue` less the credit recorded on the SAME (gross, VAT-inclusive) basis. Not `revenue` minus
+   * every refund: a NET-basis credit is ex-VAT and subtracting it from a VAT-inclusive figure
+   * under-credits by its VAT, and an unproven one cannot be placed at all. Both sit in the buckets
+   * below and make this an upper bound — see `netRevenueBound`.
+   */
+  netRevenue: string
+  /** What `netRevenue` is: `exact`, `upper` (`≤`), or `indeterminate` (`?`). */
+  netRevenueBound: DerivedFigureBound
+  /** Credit stamped GROSS — the comparable one, already subtracted from `netRevenue`. */
+  refundsGrossBasis: string
+  /** Credit stamped NET — reported, NOT subtracted. */
+  refundsNetBasis: string
+  /** Credit with no proven basis — reported, NOT subtracted. */
+  refundsUnknownBasis: string
 }
 
 export type CustomerReportRow = {
@@ -101,10 +131,45 @@ export type CustomerReportRow = {
   customerName: string
   customerEmail: string | null
   orderCount: number
+  /** AS INVOICED, unchanged, so this column still agrees with Sales Analytics' customer grouping. */
   revenueBase: string
-  grossProfitBase: string
+  /** `revenueBase` less the GROSS-basis credit — the only credit on the same basis as it. */
+  netRevenueBase: string
+  netRevenueBaseBound: DerivedFigureBound
+  /**
+   * The EX-VAT revenue gross profit is actually computed from: `Σ(totalBase - taxBase)` less the
+   * NET-basis credit. Published because otherwise the profit below is a number with no visible
+   * arithmetic — `revenueBase - grossProfitBase` is not COGS and never was.
+   */
+  netRevenueExVatBase: string
+  netRevenueExVatBaseBound: DerivedFigureBound
+  /**
+   * `netRevenueExVatBase - cogs`, or NULL when this customer has an order in the period with no
+   * posted COGS at all.
+   *
+   * o3d-kyey. It used to be `Σ SalesOrder.totalBase - Σ CogsEntry.totalCostBase`, which was wrong
+   * twice over. It subtracted an EX-TAX cost from a VAT-INCLUSIVE revenue, so it overstated profit
+   * by the whole VAT on every taxable order; and `cogsByOrder.get(id) ?? 0` turned "this order has
+   * not dispatched yet, so its cost is not known" into "this order cost nothing", which published
+   * an order's entire revenue as profit. A missing cost is not a zero cost, so the figure is
+   * WITHHELD for that customer rather than published wrong — see `costCaptured`.
+   */
+  grossProfitBase: string | null
+  grossProfitBaseBound: DerivedFigureBound
+  /**
+   * False when at least one of this customer's in-period orders has no COGS posted in the period.
+   * `grossProfitBase` is null exactly when this is false.
+   */
+  costCaptured: boolean
+  /** Unpaid order value, less the GROSS-basis credit raised against those unpaid orders. */
   arExposureBase: string
+  /** Share of the period's REFUND-AWARE revenue, so a customer who returned everything ranks on it. */
   shareOfRevenuePct: string
+  /** A ratio moves both its parts; it is never an upper bound. See `shareFigureBound`. */
+  shareOfRevenuePctBound: DerivedFigureBound
+  refundsGrossBasis: string
+  refundsNetBasis: string
+  refundsUnknownBasis: string
 }
 
 export type MarginReportRow = {
@@ -113,11 +178,29 @@ export type MarginReportRow = {
   productName: string
   categoryName: string | null
   lineCount: number
+  /**
+   * Dispatched ex-VAT line revenue LESS the NET-basis credit raised in the period. Corrected in
+   * place rather than published beside an as-invoiced twin (the way Sales Analytics' is), because
+   * this figure reconciles to nothing: it is already prorated away from the order totals to the
+   * quantity each line dispatched inside the window, so there is no invoiced number for it to agree
+   * with. Its basis is NET, so the NET-basis credit is the comparable one.
+   */
   revenueBase: string
+  revenueBaseBound: DerivedFigureBound
   cogsBase: string
   grossProfitBase: string
+  grossProfitBaseBound: DerivedFigureBound
   marginPct: string
+  /** Margin is a RATIO: `refundBasisComplete === false` does not make it an upper bound. */
+  marginPctBound: DerivedFigureBound
   contributionPct: string
+  contributionPctBound: DerivedFigureBound
+  /** Credit stamped NET — the comparable one, already subtracted from `revenueBase`. */
+  refundsNetBasis: string
+  /** Credit stamped GROSS — reported, NOT subtracted. */
+  refundsGrossBasis: string
+  /** Credit with no proven basis — reported, NOT subtracted. */
+  refundsUnknownBasis: string
 }
 
 export type ReturnsReportRow = {
@@ -242,6 +325,110 @@ function marginCogsBucket(row: CogsEntryRow): { productId: string; product: Marg
   const line = row.movement.shipmentLine?.line
   if (line?.productId && line.product) return { productId: line.productId, product: line.product }
   return { productId: row.movement.productId, product: row.movement.product }
+}
+
+/**
+ * o3d-kyey: WHAT A PERIOD'S CREDIT IS, SPLIT BY THE BASIS IT WAS RECORDED ON.
+ *
+ * Every one of these three reports subtracts credit from a revenue figure, and each figure is on a
+ * basis of its own: Sales Analytics and Customer Mix build revenue from `SalesOrder.totalBase`,
+ * which is VAT-INCLUSIVE, while Gross Margin builds it from `SalesOrderLine.totalBase`, which is
+ * ex-VAT. Only the credit recorded on the SAME basis as the figure is the same unit as it, so only
+ * that one is subtracted; the other two are carried beside the figure and make it a stated bound.
+ * Nothing is converted between the bases — on a mixed-rate order the rate that produced a gross
+ * credit is not recoverable from stored data, which is the conclusion `refund-basis-analytics`
+ * reaches and `o3d-w00` made the refund CREATE path fail closed over.
+ *
+ * The two completeness flags are tracked SEPARATELY rather than derived from the sums, because a
+ * +5 and a -5 of unplaceable credit sum to zero while neither was placeable.
+ */
+type CreditBuckets = {
+  /** Credit stamped NET (ex-VAT). */
+  net: Prisma.Decimal
+  /** Credit stamped GROSS (VAT-inclusive). */
+  gross: Prisma.Decimal
+  /** Credit whose basis was never proved. Never guessed at, never converted. */
+  unknown: Prisma.Decimal
+  /** True while every credit seen could be placed on a NET-basis figure. */
+  netBasisComplete: boolean
+  /** True while every credit seen could be placed on a GROSS-basis figure. */
+  grossBasisComplete: boolean
+}
+
+function emptyCredits(): CreditBuckets {
+  return {
+    net: new Prisma.Decimal(0),
+    gross: new Prisma.Decimal(0),
+    unknown: new Prisma.Decimal(0),
+    netBasisComplete: true,
+    grossBasisComplete: true,
+  }
+}
+
+function addCredit(buckets: CreditBuckets, totalsBasis: string | null, amount: DecimalInput): void {
+  const onNet = creditPlacement('NET', totalsBasis, amount)
+  const onGross = creditPlacement('GROSS', totalsBasis, amount)
+  const value = toDecimal(amount)
+  if (onNet.bucket === 'net') buckets.net = buckets.net.add(value)
+  else if (onNet.bucket === 'gross') buckets.gross = buckets.gross.add(value)
+  else buckets.unknown = buckets.unknown.add(value)
+  if (!onNet.placeable) buckets.netBasisComplete = false
+  if (!onGross.placeable) buckets.grossBasisComplete = false
+}
+
+function mergeCredits(into: CreditBuckets, from: CreditBuckets): void {
+  into.net = into.net.add(from.net)
+  into.gross = into.gross.add(from.gross)
+  into.unknown = into.unknown.add(from.unknown)
+  if (!from.netBasisComplete) into.netBasisComplete = false
+  if (!from.grossBasisComplete) into.grossBasisComplete = false
+}
+
+/** The credit that is the same unit as a figure on `basis`, and is therefore SUBTRACTED from it. */
+function comparableCredit(buckets: CreditBuckets, basis: 'NET' | 'GROSS'): Prisma.Decimal {
+  return basis === 'NET' ? buckets.net : buckets.gross
+}
+
+/** The credit that is NOT — reported beside the figure, never folded into it. */
+function unplacedCredit(buckets: CreditBuckets, basis: 'NET' | 'GROSS'): Prisma.Decimal {
+  return basis === 'NET' ? buckets.gross.add(buckets.unknown) : buckets.net.add(buckets.unknown)
+}
+
+function creditBasisComplete(buckets: CreditBuckets, basis: 'NET' | 'GROSS'): boolean {
+  return basis === 'NET' ? buckets.netBasisComplete : buckets.grossBasisComplete
+}
+
+/** An order's whole credit, as Sales Analytics and Customer Mix attribute it: by order id. */
+type OrderRefundRow = {
+  orderId: string
+  totalBase: DecimalInput
+  totalForeign: DecimalInput
+  /** NET / GROSS / null. Governs what the two totals above MEAN. */
+  totalsBasis: string | null
+}
+
+/**
+ * A refund LINE as Gross Margin attributes it: to the sales line's product, which is the bucket the
+ * revenue it credits was booked into. `salesOrderLine.productId` is preferred over the refund line's
+ * own `productId` for the same reason `marginCogsBucket` prefers the shipment line's — the sales
+ * line is what the revenue is denominated in, and for a KIT the two differ.
+ */
+type MarginRefundLineRow = {
+  productId: string | null
+  totalBase: DecimalInput
+  salesOrderLine: { productId: string | null } | null
+  refund: { totalsBasis: string | null }
+}
+
+async function loadOrderRefunds(client: SalesFulfillmentAnalyticsClient, orderIds: string[]): Promise<OrderRefundRow[]> {
+  if (orderIds.length === 0) return []
+  const rows = await client.salesOrderRefund.findMany({
+    where: { orderId: { in: [...new Set(orderIds)] } },
+    select: { orderId: true, totalBase: true, totalForeign: true, totalsBasis: true },
+    take: SOURCE_ROW_LIMIT + 1,
+  }) as OrderRefundRow[]
+  assertSourceLimit(rows.length, SOURCE_ROW_LIMIT, 'Sales analytics refund source rows')
+  return rows
 }
 
 type RefundLineRow = {
@@ -504,11 +691,25 @@ export async function getSalesAnalyticsReport(filters: SalesAnalyticsFilters = {
   const generatedAt = nowFromDeps(deps)
   const baseCurrency = await baseCurrencyFromDeps(deps)
   const window = period(filters, generatedAt)
-  const rowsByKey = new Map<string, SalesReportRow & { revenueDecimal: Prisma.Decimal; taxDecimal: Prisma.Decimal; shippingDecimal: Prisma.Decimal; discountDecimal: Prisma.Decimal; orderIds: Set<string> }>()
+  const rowsByKey = new Map<string, SalesReportRow & { revenueDecimal: Prisma.Decimal; taxDecimal: Prisma.Decimal; shippingDecimal: Prisma.Decimal; discountDecimal: Prisma.Decimal; credits: CreditBuckets; orderIds: Set<string> }>()
   const orders = await loadSalesOrders(client, filters, window)
   assertSourceLimit(orders.length, SOURCE_ROW_LIMIT, 'Sales analytics source orders')
   const grouping = groupBy(filters)
   const mode = currencyMode(filters)
+  // o3d-kyey: the credit raised against these orders, WHENEVER it was raised. The report's rows are
+  // an ORDER COHORT (orders created in the window), so its refund-aware figure is "what these orders
+  // were finally worth" — the same reading `getProductSalesStats` takes, and the reason neither
+  // filters credits by `refundedAt`. Attributed by order id and then, in the product/category views,
+  // spread across that order's lines by line value: the report's OWN allocation rule, already used
+  // for tax, shipping and discount, which is what keeps the credit total reconciling to the refunds.
+  const refunds = await loadOrderRefunds(client, orders.map((order) => order.id))
+  const refundsByOrder = new Map<string, OrderRefundRow[]>()
+  for (const refund of refunds) {
+    const existing = refundsByOrder.get(refund.orderId)
+    if (existing) existing.push(refund)
+    else refundsByOrder.set(refund.orderId, [refund])
+  }
+  const creditAmount = (refund: OrderRefundRow) => mode === 'foreign' ? refund.totalForeign : refund.totalBase
 
   for (const order of orders) {
     if (grouping === 'customer' || grouping === 'channel') {
@@ -528,15 +729,22 @@ export async function getSalesAnalyticsReport(filters: SalesAnalyticsFilters = {
         tax: '0',
         shipping: '0',
         discount: '0',
+        netRevenue: '0',
+        netRevenueBound: 'exact',
+        refundsGrossBasis: '0',
+        refundsNetBasis: '0',
+        refundsUnknownBasis: '0',
         revenueDecimal: new Prisma.Decimal(0),
         taxDecimal: new Prisma.Decimal(0),
         shippingDecimal: new Prisma.Decimal(0),
         discountDecimal: new Prisma.Decimal(0),
+        credits: emptyCredits(),
         orderIds: new Set<string>(),
       }
       current.orderIds.add(order.id)
       current.orderCount = current.orderIds.size
       current.lineCount += order.lines.length
+      for (const refund of refundsByOrder.get(order.id) ?? []) addCredit(current.credits, refund.totalsBasis, creditAmount(refund))
       current.revenueDecimal = current.revenueDecimal.add(toDecimal(mode === 'foreign' ? order.totalForeign : order.totalBase))
       current.taxDecimal = current.taxDecimal.add(toDecimal(mode === 'foreign' ? order.taxForeign : order.taxBase))
       current.shippingDecimal = current.shippingDecimal.add(toDecimal(mode === 'foreign' ? order.shippingForeign : order.shippingBase))
@@ -570,15 +778,29 @@ export async function getSalesAnalyticsReport(filters: SalesAnalyticsFilters = {
         tax: '0',
         shipping: '0',
         discount: '0',
+        netRevenue: '0',
+        netRevenueBound: 'exact',
+        refundsGrossBasis: '0',
+        refundsNetBasis: '0',
+        refundsUnknownBasis: '0',
         revenueDecimal: new Prisma.Decimal(0),
         taxDecimal: new Prisma.Decimal(0),
         shippingDecimal: new Prisma.Decimal(0),
         discountDecimal: new Prisma.Decimal(0),
+        credits: emptyCredits(),
         orderIds: new Set<string>(),
       }
       current.orderIds.add(order.id)
       current.orderCount = current.orderIds.size
       current.lineCount += 1
+      // This line's share of the order's credit, allocated by line value exactly as revenue, tax,
+      // shipping and discount are above. Allocating a GROSS credit by EX-VAT line value is the same
+      // approximation the report already makes for the order-level tax and shipping it apportions;
+      // it is exact whenever the order carries one rate, and the whole credit reaches SOME row of
+      // the order either way, so the grand total is unaffected by how it splits.
+      for (const refund of refundsByOrder.get(order.id) ?? []) {
+        addCredit(current.credits, refund.totalsBasis, allocatedOrderAmount(creditAmount(refund), lineAmount, lineTotal, fallbackShare))
+      }
       current.revenueDecimal = current.revenueDecimal.add(allocatedOrderAmount(mode === 'foreign' ? order.totalForeign : order.totalBase, lineAmount, lineTotal, fallbackShare))
       current.taxDecimal = current.taxDecimal.add(allocatedOrderAmount(mode === 'foreign' ? order.taxForeign : order.taxBase, lineAmount, lineTotal, fallbackShare))
       current.shippingDecimal = current.shippingDecimal.add(allocatedOrderAmount(mode === 'foreign' ? order.shippingForeign : order.shippingBase, lineAmount, lineTotal, fallbackShare))
@@ -594,29 +816,51 @@ export async function getSalesAnalyticsReport(filters: SalesAnalyticsFilters = {
     }
   }
 
+  // Revenue here is `SalesOrder.totalBase` (or totalForeign), which is VAT-INCLUSIVE, so GROSS is
+  // the basis every net figure below is on and the GROSS-basis credit is the comparable one.
+  const FIGURE_BASIS = 'GROSS' as const
   const rows = [...rowsByKey.values()]
-    .map((row) => ({
-      key: row.key,
-      label: row.label,
-      groupBy: row.groupBy,
-      currency: row.currency,
-      orderCount: row.orderCount,
-      lineCount: row.lineCount,
-      revenue: moneyString(row.revenueDecimal, row.currency === 'Multiple' ? baseCurrency : row.currency),
-      tax: moneyString(row.taxDecimal, row.currency === 'Multiple' ? baseCurrency : row.currency),
-      shipping: moneyString(row.shippingDecimal, row.currency === 'Multiple' ? baseCurrency : row.currency),
-      discount: moneyString(row.discountDecimal, row.currency === 'Multiple' ? baseCurrency : row.currency),
-    }))
-    .sort((a, b) => toDecimal(b.revenue).cmp(a.revenue) || a.label.localeCompare(b.label))
+    .map((row) => {
+      const currency = row.currency === 'Multiple' ? baseCurrency : row.currency
+      return {
+        key: row.key,
+        label: row.label,
+        groupBy: row.groupBy,
+        currency: row.currency,
+        orderCount: row.orderCount,
+        lineCount: row.lineCount,
+        revenue: moneyString(row.revenueDecimal, currency),
+        tax: moneyString(row.taxDecimal, currency),
+        shipping: moneyString(row.shippingDecimal, currency),
+        discount: moneyString(row.discountDecimal, currency),
+        netRevenue: moneyString(row.revenueDecimal.sub(comparableCredit(row.credits, FIGURE_BASIS)), currency),
+        // Classified from the UNROUNDED figures, before the rounding above: the claim is about which
+        // side of the published number the truth lies on, not about its last penny.
+        netRevenueBound: netLinearFigureBoundDecimal({
+          basisComplete: creditBasisComplete(row.credits, FIGURE_BASIS),
+          unplacedCredit: unplacedCredit(row.credits, FIGURE_BASIS),
+        }),
+        refundsGrossBasis: moneyString(row.credits.gross, currency),
+        refundsNetBasis: moneyString(row.credits.net, currency),
+        refundsUnknownBasis: moneyString(row.credits.unknown, currency),
+      }
+    })
+    // Ranked on the refund-aware figure. Ranking on `revenue` put a group that credited everything
+    // back above one that kept a smaller sale, which is the ordering defect o3d-kyey names.
+    .sort((a, b) => toDecimal(b.netRevenue).cmp(a.netRevenue) || a.label.localeCompare(b.label))
 
   const totals = [...rowsByKey.values()].reduce(
-    (total, row) => ({
-      revenue: total.revenue.add(row.revenueDecimal),
-      tax: total.tax.add(row.taxDecimal),
-      shipping: total.shipping.add(row.shippingDecimal),
-      discount: total.discount.add(row.discountDecimal),
-    }),
-    { revenue: new Prisma.Decimal(0), tax: new Prisma.Decimal(0), shipping: new Prisma.Decimal(0), discount: new Prisma.Decimal(0) },
+    (total, row) => {
+      mergeCredits(total.credits, row.credits)
+      return {
+        revenue: total.revenue.add(row.revenueDecimal),
+        tax: total.tax.add(row.taxDecimal),
+        shipping: total.shipping.add(row.shippingDecimal),
+        discount: total.discount.add(row.discountDecimal),
+        credits: total.credits,
+      }
+    },
+    { revenue: new Prisma.Decimal(0), tax: new Prisma.Decimal(0), shipping: new Prisma.Decimal(0), discount: new Prisma.Decimal(0), credits: emptyCredits() },
   )
   const paged = paginate(rows, filters, deps?.paginate !== false)
 
@@ -631,10 +875,18 @@ export async function getSalesAnalyticsReport(filters: SalesAnalyticsFilters = {
       tax: moneyString(totals.tax, baseCurrency),
       shipping: moneyString(totals.shipping, baseCurrency),
       discount: moneyString(totals.discount, baseCurrency),
+      netRevenue: moneyString(totals.revenue.sub(comparableCredit(totals.credits, FIGURE_BASIS)), baseCurrency),
+      netRevenueBound: netLinearFigureBoundDecimal({
+        basisComplete: creditBasisComplete(totals.credits, FIGURE_BASIS),
+        unplacedCredit: unplacedCredit(totals.credits, FIGURE_BASIS),
+      }),
+      refundsGrossBasis: moneyString(totals.credits.gross, baseCurrency),
+      refundsNetBasis: moneyString(totals.credits.net, baseCurrency),
+      refundsUnknownBasis: moneyString(totals.credits.unknown, baseCurrency),
     },
     notices: [
       'Sales totals exclude cancelled orders. Product/category views allocate order-level totals across lines by line value so grand totals reconcile to SalesOrder totals.',
-      REFUND_BLIND_NOTICE_SALES,
+      REFUND_BASIS_NOTICE_SALES,
       mode === 'foreign' ? 'Foreign-currency product/category rows are split by original order currency; customer/channel rows show Multiple when a group contains more than one original currency.' : `Base-currency rows use ${baseCurrency} amounts recorded on the order.`,
     ],
   }
@@ -675,47 +927,157 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
     loadCogsByOrder(client, window),
   ])
   assertSourceLimit(orders.length, SOURCE_ROW_LIMIT, 'Customer analytics source orders')
-  const totalRevenue = orders.reduce((sum, order) => sum.add(toDecimal(order.totalBase)), new Prisma.Decimal(0))
-  const groups = new Map<string, CustomerReportRow & { revenue: Prisma.Decimal; grossProfit: Prisma.Decimal; arExposure: Prisma.Decimal; orderIds: Set<string> }>()
+  // As in Sales Analytics: an order cohort, so ALL of these orders' credit counts, whenever raised.
+  const refunds = await loadOrderRefunds(client, orders.map((order) => order.id))
+  const refundsByOrder = new Map<string, OrderRefundRow[]>()
+  for (const refund of refunds) {
+    const existing = refundsByOrder.get(refund.orderId)
+    if (existing) existing.push(refund)
+    else refundsByOrder.set(refund.orderId, [refund])
+  }
+
+  type CustomerGroup = CustomerReportRow & {
+    revenue: Prisma.Decimal
+    revenueExVat: Prisma.Decimal
+    cogs: Prisma.Decimal
+    arExposure: Prisma.Decimal
+    credits: CreditBuckets
+    /** Credit on the orders that are UNPAID, which is the only credit AR exposure may net off. */
+    unpaidCredits: CreditBuckets
+    orderIds: Set<string>
+  }
+  const groups = new Map<string, CustomerGroup>()
   for (const order of orders) {
     const key = order.customerId ?? (order.customerEmail ? `guest-email:${order.customerEmail.toLowerCase()}` : `guest-name:${customerName(order)}`)
-    const cogs = cogsByOrder.get(order.id) ?? new Prisma.Decimal(0)
-    const current = groups.get(key) ?? {
+    const current: CustomerGroup = groups.get(key) ?? {
       customerId: order.customerId,
       customerName: customerName(order),
       customerEmail: order.customerEmail,
       orderCount: 0,
       revenueBase: '0',
+      netRevenueBase: '0',
+      netRevenueBaseBound: 'exact',
+      netRevenueExVatBase: '0',
+      netRevenueExVatBaseBound: 'exact',
       grossProfitBase: '0',
+      grossProfitBaseBound: 'exact',
+      costCaptured: true,
       arExposureBase: '0',
       shareOfRevenuePct: '0',
+      shareOfRevenuePctBound: 'exact',
+      refundsGrossBasis: '0',
+      refundsNetBasis: '0',
+      refundsUnknownBasis: '0',
       revenue: new Prisma.Decimal(0),
-      grossProfit: new Prisma.Decimal(0),
+      revenueExVat: new Prisma.Decimal(0),
+      cogs: new Prisma.Decimal(0),
       arExposure: new Prisma.Decimal(0),
+      credits: emptyCredits(),
+      unpaidCredits: emptyCredits(),
       orderIds: new Set<string>(),
     }
     current.orderIds.add(order.id)
     current.orderCount = current.orderIds.size
     current.revenue = current.revenue.add(toDecimal(order.totalBase))
-    current.grossProfit = current.grossProfit.add(toDecimal(order.totalBase).sub(cogs))
-    if (!order.paidAt) current.arExposure = current.arExposure.add(toDecimal(order.totalBase))
+    // The EX-VAT revenue gross profit is measured against. `SalesOrder.totalBase` is VAT-INCLUSIVE
+    // and `CogsEntry.totalCostBase` is ex-tax, so the old `totalBase - cogs` was a subtraction
+    // between two different units and overstated profit by the whole VAT on every taxable order.
+    current.revenueExVat = current.revenueExVat.add(toDecimal(order.totalBase).sub(toDecimal(order.taxBase)))
+    // A MISSING COST IS NOT A ZERO COST. `cogsByOrder` is keyed on orders with a SALE_DISPATCH COGS
+    // entry inside the window; an order created near the end of the period and dispatched after it
+    // has none, and the old `?? 0` published its entire revenue as profit. `.has` is the question —
+    // `.get() ?? 0` cannot tell "no cost posted" from "cost posted, and it was zero".
+    if (cogsByOrder.has(order.id)) current.cogs = current.cogs.add(cogsByOrder.get(order.id)!)
+    else current.costCaptured = false
+    const orderRefunds = refundsByOrder.get(order.id) ?? []
+    for (const refund of orderRefunds) addCredit(current.credits, refund.totalsBasis, refund.totalBase)
+    if (!order.paidAt) {
+      current.arExposure = current.arExposure.add(toDecimal(order.totalBase))
+      // Only an UNPAID order's credit reduces exposure: a credit note against an order already paid
+      // is a debt to the customer, not less money owed by them.
+      for (const refund of orderRefunds) addCredit(current.unpaidCredits, refund.totalsBasis, refund.totalBase)
+    }
     groups.set(key, current)
   }
-  const rows = [...groups.values()]
-    .map((row) => ({
-      customerId: row.customerId,
-      customerName: row.customerName,
-      customerEmail: row.customerEmail,
-      orderCount: row.orderCount,
-      revenueBase: moneyString(row.revenue, baseCurrency),
-      grossProfitBase: moneyString(row.grossProfit, baseCurrency),
-      arExposureBase: moneyString(row.arExposure, baseCurrency),
-      shareOfRevenuePct: pctString(row.revenue, totalRevenue),
-    }))
-    .sort((a, b) => toDecimal(b.revenueBase).cmp(a.revenueBase) || a.customerName.localeCompare(b.customerName))
+
+  // Accumulated UNROUNDED and rounded exactly once, at the figure. Summing the rounded row strings
+  // would put the published totals and the counterfactual their bounds are classified against on
+  // different numbers — the o3d-iigc round-5 finding in the sales-stats summary.
+  const period_ = {
+    revenue: new Prisma.Decimal(0),
+    netRevenue: new Prisma.Decimal(0),
+    revenueExVat: new Prisma.Decimal(0),
+    netRevenueExVat: new Prisma.Decimal(0),
+    cogs: new Prisma.Decimal(0),
+    grossProfit: new Prisma.Decimal(0),
+    arExposure: new Prisma.Decimal(0),
+    credits: emptyCredits(),
+    costCapturedRows: 0,
+  }
+  const netRevenueByGroup = new Map<string, Prisma.Decimal>()
+  for (const [key, group] of groups) {
+    const netRevenue = group.revenue.sub(comparableCredit(group.credits, 'GROSS'))
+    netRevenueByGroup.set(key, netRevenue)
+    period_.revenue = period_.revenue.add(group.revenue)
+    period_.netRevenue = period_.netRevenue.add(netRevenue)
+    period_.revenueExVat = period_.revenueExVat.add(group.revenueExVat)
+    period_.arExposure = period_.arExposure.add(group.arExposure.sub(comparableCredit(group.unpaidCredits, 'GROSS')))
+    mergeCredits(period_.credits, group.credits)
+    if (group.costCaptured) {
+      period_.costCapturedRows += 1
+      const netRevenueExVat = group.revenueExVat.sub(comparableCredit(group.credits, 'NET'))
+      period_.netRevenueExVat = period_.netRevenueExVat.add(netRevenueExVat)
+      period_.cogs = period_.cogs.add(group.cogs)
+      period_.grossProfit = period_.grossProfit.add(netRevenueExVat.sub(group.cogs))
+    }
+  }
+  // A ratio is bounded by the WHOLE report's completeness, not the row's: a row with no unplaced
+  // credit of its own still had its denominator moved by another row's.
+  const shareBound = shareFigureBound({ reportBasisComplete: creditBasisComplete(period_.credits, 'GROSS') })
+
+  const rows: CustomerReportRow[] = [...groups.entries()]
+    .map(([key, row]) => {
+      const netRevenue = netRevenueByGroup.get(key)!
+      const netRevenueExVat = row.revenueExVat.sub(comparableCredit(row.credits, 'NET'))
+      const grossProfit = netRevenueExVat.sub(row.cogs)
+      return {
+        customerId: row.customerId,
+        customerName: row.customerName,
+        customerEmail: row.customerEmail,
+        orderCount: row.orderCount,
+        revenueBase: moneyString(row.revenue, baseCurrency),
+        netRevenueBase: moneyString(netRevenue, baseCurrency),
+        netRevenueBaseBound: netLinearFigureBoundDecimal({
+          basisComplete: creditBasisComplete(row.credits, 'GROSS'),
+          unplacedCredit: unplacedCredit(row.credits, 'GROSS'),
+        }),
+        netRevenueExVatBase: moneyString(netRevenueExVat, baseCurrency),
+        netRevenueExVatBaseBound: netLinearFigureBoundDecimal({
+          basisComplete: creditBasisComplete(row.credits, 'NET'),
+          unplacedCredit: unplacedCredit(row.credits, 'NET'),
+        }),
+        grossProfitBase: row.costCaptured ? moneyString(grossProfit, baseCurrency) : null,
+        // A withheld figure carries no bound: there is no published number for a relation to be
+        // about, and marking it would read as a claim about something that was not published.
+        grossProfitBaseBound: row.costCaptured
+          ? netLinearFigureBoundDecimal({
+            basisComplete: creditBasisComplete(row.credits, 'NET'),
+            unplacedCredit: unplacedCredit(row.credits, 'NET'),
+          })
+          : 'indeterminate',
+        costCaptured: row.costCaptured,
+        arExposureBase: moneyString(row.arExposure.sub(comparableCredit(row.unpaidCredits, 'GROSS')), baseCurrency),
+        shareOfRevenuePct: pctString(netRevenue, period_.netRevenue),
+        shareOfRevenuePctBound: shareBound,
+        refundsGrossBasis: moneyString(row.credits.gross, baseCurrency),
+        refundsNetBasis: moneyString(row.credits.net, baseCurrency),
+        refundsUnknownBasis: moneyString(row.credits.unknown, baseCurrency),
+      }
+    })
+    // Ranked on the refund-aware figure, so a customer who returned everything no longer outranks
+    // one who kept a smaller order.
+    .sort((a, b) => toDecimal(b.netRevenueBase).cmp(a.netRevenueBase) || a.customerName.localeCompare(b.customerName))
   const paged = paginate(rows, filters, deps?.paginate !== false)
-  const grossProfit = [...groups.values()].reduce((sum, row) => sum.add(row.grossProfit), new Prisma.Decimal(0))
-  const arExposure = [...groups.values()].reduce((sum, row) => sum.add(row.arExposure), new Prisma.Decimal(0))
   return {
     generatedAt: generatedAt.toISOString(),
     dateFrom: dateOnly(window.dateFrom),
@@ -723,13 +1085,31 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
     rows: paged.rows,
     pageInfo: paged.pageInfo,
     totals: {
-      revenueBase: moneyString(totalRevenue, baseCurrency),
-      grossProfitBase: moneyString(grossProfit, baseCurrency),
-      arExposureBase: moneyString(arExposure, baseCurrency),
+      revenueBase: moneyString(period_.revenue, baseCurrency),
+      netRevenueBase: moneyString(period_.netRevenue, baseCurrency),
+      netRevenueBaseBound: netLinearFigureBoundDecimal({
+        basisComplete: creditBasisComplete(period_.credits, 'GROSS'),
+        unplacedCredit: unplacedCredit(period_.credits, 'GROSS'),
+      }),
+      netRevenueExVatBase: moneyString(period_.netRevenueExVat, baseCurrency),
+      // The period profit sums the CAPTURED rows only, which is why the count travels with it: a
+      // total over a subset that does not say it is a subset is the withheld-figure defect again,
+      // one level up.
+      grossProfitBase: moneyString(period_.grossProfit, baseCurrency),
+      grossProfitBaseBound: netLinearFigureBoundDecimal({
+        basisComplete: creditBasisComplete(period_.credits, 'NET'),
+        unplacedCredit: unplacedCredit(period_.credits, 'NET'),
+      }),
+      costCapturedRows: String(period_.costCapturedRows),
+      arExposureBase: moneyString(period_.arExposure, baseCurrency),
+      refundsGrossBasis: moneyString(period_.credits.gross, baseCurrency),
+      refundsNetBasis: moneyString(period_.credits.net, baseCurrency),
+      refundsUnknownBasis: moneyString(period_.credits.unknown, baseCurrency),
     },
     notices: [
-      'AR exposure is unpaid sales-order totalBase for the selected period. COGS comes from CogsEntry rows linked to SALE_DISPATCH movements.',
-      REFUND_BLIND_NOTICE_CUSTOMER_MIX,
+      'AR exposure is unpaid sales-order totalBase for the selected period, less the gross-basis credit raised against those unpaid orders. COGS comes from CogsEntry rows linked to SALE_DISPATCH movements.',
+      `Gross profit is withheld for a customer with an in-period order that has no COGS posted in the period, and the period total covers ${period_.costCapturedRows} of ${groups.size} customers. A missing cost is not a zero cost.`,
+      REFUND_BASIS_NOTICE_CUSTOMER_MIX,
     ],
   }
 }
@@ -898,6 +1278,25 @@ export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = 
     take: SOURCE_ROW_LIMIT + 1,
   }) as Array<{ qty: DecimalInput; referenceId: string | null; productId: string; shipmentLine: { lineId: string } | null }>
   assertSourceLimit(dispatchRows.length, SOURCE_ROW_LIMIT, 'Margin analytics dispatch source rows')
+  // o3d-kyey: the credit RAISED IN THE WINDOW, which is the period this report already measures —
+  // it is anchored to CogsEntry.createdAt and prorates revenue to the quantity dispatched inside the
+  // window, so it is a DISPATCH-PERIOD report, not an order cohort. A credit note therefore belongs
+  // to the period it was raised in, exactly as the Returns report reads it. A credit raised here
+  // against a dispatch from an earlier period consequently reduces this period's revenue, which is
+  // the same thing a credit note does to a month's accounts.
+  const marginRefundLines = await client.salesOrderRefundLine.findMany({
+    where: { refund: { refundedAt: { gte: window.dateFrom, lt: window.dateToExclusive } } },
+    select: {
+      productId: true,
+      totalBase: true,
+      // The sales line the credit reverses. Its product is the bucket the revenue was booked into;
+      // for a KIT it differs from the refund line's own product, exactly as in marginCogsBucket.
+      salesOrderLine: { select: { productId: true } },
+      refund: { select: { totalsBasis: true } },
+    },
+    take: SOURCE_ROW_LIMIT + 1,
+  }) as MarginRefundLineRow[]
+  assertSourceLimit(marginRefundLines.length, SOURCE_ROW_LIMIT, 'Margin analytics refund source rows')
   // o3d-7r6x: a KIT line's dispatch movements are denominated in leaf components, the line in
   // parent units. Resolve each line's component requirements so the linked dispatch can be
   // converted to whole ordered units before it is matched back to the line.
@@ -930,26 +1329,41 @@ export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = 
     }))),
     marginRequirementsByLine,
   )
-  const groups = new Map<string, MarginReportRow & { revenue: Prisma.Decimal; cogs: Prisma.Decimal; lineIds: Set<string> }>()
+  type MarginGroup = MarginReportRow & { revenue: Prisma.Decimal; cogs: Prisma.Decimal; credits: CreditBuckets; lineIds: Set<string> }
+  const emptyMarginGroup = (productId: string, sku: string, productName: string, categoryName: string | null): MarginGroup => ({
+    productId,
+    sku,
+    productName,
+    categoryName,
+    lineCount: 0,
+    revenueBase: '0',
+    revenueBaseBound: 'exact',
+    cogsBase: '0',
+    grossProfitBase: '0',
+    grossProfitBaseBound: 'exact',
+    marginPct: '0',
+    marginPctBound: 'exact',
+    contributionPct: '0',
+    contributionPctBound: 'exact',
+    refundsNetBasis: '0',
+    refundsGrossBasis: '0',
+    refundsUnknownBasis: '0',
+    revenue: new Prisma.Decimal(0),
+    cogs: new Prisma.Decimal(0),
+    credits: emptyCredits(),
+    lineIds: new Set<string>(),
+  })
+  const groups = new Map<string, MarginGroup>()
   for (const order of orders) {
     for (const line of order.lines) {
       if (!line.productId || !cogsProductIds.has(line.productId)) continue
       const key = line.productId ?? `sku:${line.sku ?? line.description}`
-      const current = groups.get(key) ?? {
-        productId: line.productId,
-        sku: line.sku ?? line.product?.sku ?? 'No SKU',
-        productName: line.product?.name ?? line.description,
-        categoryName: line.product?.category?.name ?? null,
-        lineCount: 0,
-        revenueBase: '0',
-        cogsBase: '0',
-        grossProfitBase: '0',
-        marginPct: '0',
-        contributionPct: '0',
-        revenue: new Prisma.Decimal(0),
-        cogs: new Prisma.Decimal(0),
-        lineIds: new Set<string>(),
-      }
+      const current = groups.get(key) ?? emptyMarginGroup(
+        line.productId,
+        line.sku ?? line.product?.sku ?? 'No SKU',
+        line.product?.name ?? line.description,
+        line.product?.category?.name ?? null,
+      )
       current.lineIds.add(line.id)
       current.lineCount = current.lineIds.size
       const dispatchedQty = dispatchedQtyByLine.get(`${line.id}|${line.productId}`) ?? new Prisma.Decimal(0)
@@ -962,45 +1376,81 @@ export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = 
   for (const row of cogsRows) {
     const bucket = marginCogsBucket(row)
     const key = bucket.productId
-    const current = groups.get(key) ?? {
-      productId: key,
-      sku: bucket.product.sku,
-      productName: bucket.product.name,
-      categoryName: bucket.product.category?.name ?? null,
-      lineCount: 0,
-      revenueBase: '0',
-      cogsBase: '0',
-      grossProfitBase: '0',
-      marginPct: '0',
-      contributionPct: '0',
-      revenue: new Prisma.Decimal(0),
-      cogs: new Prisma.Decimal(0),
-      lineIds: new Set<string>(),
-    }
+    const current = groups.get(key) ?? emptyMarginGroup(
+      key,
+      bucket.product.sku,
+      bucket.product.name,
+      bucket.product.category?.name ?? null,
+    )
     current.cogs = current.cogs.add(toDecimal(row.totalCostBase))
     groups.set(key, current)
   }
-  const totalGrossProfit = [...groups.values()].reduce((sum, row) => sum.add(row.revenue.sub(row.cogs)), new Prisma.Decimal(0))
-  const rows = [...groups.values()]
-    .map((row) => {
-      const grossProfit = row.revenue.sub(row.cogs)
+
+  // THE CREDIT THAT COULD NOT REACH A ROW IS STATED, NEVER DROPPED. Two ways it can fail to:
+  //   - the refund line names no product at all (a shipping or monetary-only credit line), so there
+  //     is no revenue bucket it could belong to;
+  //   - it names a product this report has no row for, because that product posted no COGS inside
+  //     the window. A row is invented for it NOT: this report's rows are "what was dispatched in
+  //     the window", and a bucket with credit and no cost cannot support a margin — publishing one
+  //     would be the missing-cost defect wearing a minus sign.
+  // Both are published in the totals and both make the report's ratio bounds indeterminate.
+  const refundsUnattributed = emptyCredits()
+  const refundsOutsideReport = emptyCredits()
+  for (const refundLine of marginRefundLines) {
+    const productId = refundLine.salesOrderLine?.productId ?? refundLine.productId
+    const target = productId ? groups.get(productId) : undefined
+    const buckets = target ? target.credits : productId ? refundsOutsideReport : refundsUnattributed
+    addCredit(buckets, refundLine.refund.totalsBasis, refundLine.totalBase)
+  }
+  // Line revenue here is `SalesOrderLine.totalBase`, which is ex-VAT, so this report's basis is NET
+  // and the NET-basis credit is the comparable one. Every net figure is computed from the UNROUNDED
+  // Decimal and rounded once, at the string.
+  const MARGIN_FIGURE_BASIS = 'NET' as const
+  const netRevenueByKey = new Map<string, Prisma.Decimal>()
+  for (const [key, row] of groups) {
+    netRevenueByKey.set(key, row.revenue.sub(comparableCredit(row.credits, MARGIN_FIGURE_BASIS)))
+  }
+  const totalGrossProfit = [...groups.entries()].reduce((sum, [key, row]) => sum.add(netRevenueByKey.get(key)!.sub(row.cogs)), new Prisma.Decimal(0))
+  // The report-wide credit: every row's, plus the credit that reached no row at all.
+  const reportCredits = emptyCredits()
+  for (const row of groups.values()) mergeCredits(reportCredits, row.credits)
+  mergeCredits(reportCredits, refundsUnattributed)
+  mergeCredits(reportCredits, refundsOutsideReport)
+  const contributionBound = shareFigureBound({ reportBasisComplete: creditBasisComplete(reportCredits, MARGIN_FIGURE_BASIS) })
+  const rows: MarginReportRow[] = [...groups.entries()]
+    .map(([key, row]) => {
+      const netRevenue = netRevenueByKey.get(key)!
+      const grossProfit = netRevenue.sub(row.cogs)
+      const basisComplete = creditBasisComplete(row.credits, MARGIN_FIGURE_BASIS)
+      const unplaced = unplacedCredit(row.credits, MARGIN_FIGURE_BASIS)
+      const linearBound = netLinearFigureBoundDecimal({ basisComplete, unplacedCredit: unplaced })
       return {
         productId: row.productId,
         sku: row.sku,
         productName: row.productName,
         categoryName: row.categoryName,
         lineCount: row.lineCount,
-        revenueBase: moneyString(row.revenue, baseCurrency),
+        revenueBase: moneyString(netRevenue, baseCurrency),
+        revenueBaseBound: linearBound,
         cogsBase: moneyString(row.cogs, baseCurrency),
         grossProfitBase: moneyString(grossProfit, baseCurrency),
-        marginPct: pctString(grossProfit, row.revenue),
+        grossProfitBaseBound: linearBound,
+        marginPct: pctString(grossProfit, netRevenue),
+        marginPctBound: marginFigureBoundDecimal({ netRevenue, cogs: row.cogs, unplacedCredit: unplaced, basisComplete }),
         contributionPct: pctString(grossProfit, totalGrossProfit),
+        contributionPctBound: contributionBound,
+        refundsNetBasis: moneyString(row.credits.net, baseCurrency),
+        refundsGrossBasis: moneyString(row.credits.gross, baseCurrency),
+        refundsUnknownBasis: moneyString(row.credits.unknown, baseCurrency),
       }
     })
     .sort((a, b) => toDecimal(b.grossProfitBase).cmp(a.grossProfitBase) || a.sku.localeCompare(b.sku))
   const paged = paginate(rows, filters, deps?.paginate !== false)
-  const totalRevenue = [...groups.values()].reduce((sum, row) => sum.add(row.revenue), new Prisma.Decimal(0))
+  const totalRevenue = [...netRevenueByKey.values()].reduce((sum, revenue) => sum.add(revenue), new Prisma.Decimal(0))
   const totalCogs = [...groups.values()].reduce((sum, row) => sum.add(row.cogs), new Prisma.Decimal(0))
+  const totalUnplaced = unplacedCredit(reportCredits, MARGIN_FIGURE_BASIS)
+  const totalBasisComplete = creditBasisComplete(reportCredits, MARGIN_FIGURE_BASIS)
+  const totalLinearBound = netLinearFigureBoundDecimal({ basisComplete: totalBasisComplete, unplacedCredit: totalUnplaced })
   return {
     generatedAt: generatedAt.toISOString(),
     dateFrom: dateOnly(window.dateFrom),
@@ -1009,16 +1459,31 @@ export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = 
     pageInfo: paged.pageInfo,
     totals: {
       revenueBase: moneyString(totalRevenue, baseCurrency),
+      revenueBaseBound: totalLinearBound,
       cogsBase: moneyString(totalCogs, baseCurrency),
       grossProfitBase: moneyString(totalGrossProfit, baseCurrency),
+      grossProfitBaseBound: totalLinearBound,
       marginPct: pctString(totalGrossProfit, totalRevenue),
+      marginPctBound: marginFigureBoundDecimal({
+        netRevenue: totalRevenue,
+        cogs: totalCogs,
+        unplacedCredit: totalUnplaced,
+        basisComplete: totalBasisComplete,
+      }),
+      refundsNetBasis: moneyString(reportCredits.net, baseCurrency),
+      refundsGrossBasis: moneyString(reportCredits.gross, baseCurrency),
+      refundsUnknownBasis: moneyString(reportCredits.unknown, baseCurrency),
+      // Credit that reached no row, stated separately from credit that did. Both are inside
+      // refunds*Basis above; these say how much of it no product row could account for.
+      refundsUnattributedBase: moneyString(refundsUnattributed.net.add(refundsUnattributed.gross).add(refundsUnattributed.unknown), baseCurrency),
+      refundsOutsideReportBase: moneyString(refundsOutsideReport.net.add(refundsOutsideReport.gross).add(refundsOutsideReport.unknown), baseCurrency),
     },
     notices: [
       'Gross margin is anchored to CogsEntry.createdAt, matches the inventory COGS report period semantics, and uses source SalesOrderLine revenue without recalculating FIFO.',
       'Margin rows are product-level buckets: COGS is grouped by the sales line product behind the dispatch (the movement product for unlinked rows) and revenue is grouped from sales-order lines for COGS-linked orders. Duplicate SKU lines share the same product bucket; this report is not line-level COGS attribution.',
       'Line revenue is prorated to the quantity each line dispatched within the window (via the shipment-line link on dispatch movements), so a line shipped across periods books only its in-window revenue against in-window COGS.',
     'Kit lines are converted from component dispatch quantities to whole ordered units through the fulfillment-requirement graph, so a kit contributes revenue in the same units its line is priced in.',
-      REFUND_BLIND_NOTICE_GROSS_MARGIN,
+      REFUND_BASIS_NOTICE_GROSS_MARGIN,
     ],
   }
 }

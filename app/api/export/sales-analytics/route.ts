@@ -13,9 +13,9 @@ import {
   type SalesCurrencyMode,
 } from '@/lib/domain/sales/sales-fulfillment-analytics'
 import {
-  REFUND_BLIND_NOTICE_CUSTOMER_MIX,
-  REFUND_BLIND_NOTICE_GROSS_MARGIN,
-  REFUND_BLIND_NOTICE_SALES,
+  REFUND_BASIS_NOTICE_CUSTOMER_MIX,
+  REFUND_BASIS_NOTICE_GROSS_MARGIN,
+  REFUND_BASIS_NOTICE_SALES,
   RETURNS_MIXED_BASIS_NOTICE,
 } from '@/lib/analytics/refund-figure-surfaces'
 import { canAccessSalesAnalytics } from '@/lib/security/sales-analytics-access'
@@ -88,19 +88,19 @@ export async function GET(req: NextRequest) {
       const report = await getSalesAnalyticsReport({ ...filters, pageSize: SALES_ANALYTICS_CSV_ROW_LIMIT }, { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
-      return csvResponse(toCsv(report.rows, ['key', 'label', 'groupBy', 'currency', 'orderCount', 'lineCount', 'revenue', 'tax', 'shipping', 'discount']), `sales-analytics-${date}.csv`, exportMetadata(REFUND_BLIND_NOTICE_SALES))
+      return csvResponse(toCsv(report.rows, ['key', 'label', 'groupBy', 'currency', 'orderCount', 'lineCount', 'revenue', 'netRevenue', 'netRevenueBound', 'tax', 'shipping', 'discount', 'refundsGrossBasis', 'refundsNetBasis', 'refundsUnknownBasis']), `sales-analytics-${date}.csv`, exportMetadata(REFUND_BASIS_NOTICE_SALES))
     }
     case 'customers': {
       const report = await getCustomerAnalyticsReport({ ...filters, pageSize: SALES_ANALYTICS_CSV_ROW_LIMIT }, { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
-      return csvResponse(toCsv(report.rows, ['customerId', 'customerName', 'customerEmail', 'orderCount', 'revenueBase', 'grossProfitBase', 'arExposureBase', 'shareOfRevenuePct']), `customer-mix-${date}.csv`, exportMetadata(REFUND_BLIND_NOTICE_CUSTOMER_MIX))
+      return csvResponse(toCsv(report.rows, ['customerId', 'customerName', 'customerEmail', 'orderCount', 'revenueBase', 'netRevenueBase', 'netRevenueBaseBound', 'netRevenueExVatBase', 'netRevenueExVatBaseBound', 'grossProfitBase', 'grossProfitBaseBound', 'costCaptured', 'arExposureBase', 'shareOfRevenuePct', 'shareOfRevenuePctBound', 'refundsNetBasis', 'refundsGrossBasis', 'refundsUnknownBasis']), `customer-mix-${date}.csv`, exportMetadata(REFUND_BASIS_NOTICE_CUSTOMER_MIX))
     }
     case 'margin': {
       const report = await getMarginAnalyticsReport({ ...filters, pageSize: SALES_ANALYTICS_CSV_ROW_LIMIT }, { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
-      return csvResponse(toCsv(report.rows, ['productId', 'sku', 'productName', 'categoryName', 'lineCount', 'revenueBase', 'cogsBase', 'grossProfitBase', 'marginPct', 'contributionPct']), `gross-margin-${date}.csv`, exportMetadata(REFUND_BLIND_NOTICE_GROSS_MARGIN))
+      return csvResponse(toCsv(report.rows, ['productId', 'sku', 'productName', 'categoryName', 'lineCount', 'revenueBase', 'revenueBaseBound', 'cogsBase', 'grossProfitBase', 'grossProfitBaseBound', 'marginPct', 'marginPctBound', 'contributionPct', 'contributionPctBound', 'refundsNetBasis', 'refundsGrossBasis', 'refundsUnknownBasis']), `gross-margin-${date}.csv`, exportMetadata(REFUND_BASIS_NOTICE_GROSS_MARGIN))
     }
     case 'returns': {
       const report = await getReturnsAnalyticsReport({ ...filters, pageSize: SALES_ANALYTICS_CSV_ROW_LIMIT }, { paginate: false })

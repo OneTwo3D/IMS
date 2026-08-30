@@ -164,10 +164,33 @@ export function refundLineBucket(
   totalsBasis: string | null,
   amountBase: DecimalInput,
 ): { bucket: 'net' | 'gross' | 'unknown'; placeableOnNetBasis: boolean } {
+  const placement = creditPlacement('NET', totalsBasis, amountBase)
+  return { bucket: placement.bucket, placeableOnNetBasis: placement.placeable }
+}
+
+/**
+ * o3d-kyey: the same question `refundLineBucket` asks, but for a figure whose own basis is GROSS.
+ *
+ * Sales Analytics and Customer Mix build revenue from `SalesOrder.totalBase`, which is
+ * VAT-INCLUSIVE. For those figures it is the GROSS-basis credit that is the comparable one and the
+ * NET-basis credit that cannot be placed — the exact mirror of the product sales report, and the
+ * reason this had to stop being hard-coded to NET. Nothing is converted in either direction, for the
+ * reason stated at the top of this module.
+ *
+ * `comparable` is what the caller SUBTRACTS. `placeable` is what its completeness flag is built
+ * from, and differs only for an EXACTLY-zero amount: zero is the same number on both bases, so it
+ * can never bias a figure and must not degrade one. `isZero()` and not a tolerance — dust is still
+ * value, and a tolerance here would let sub-penny unstamped credit accumulate behind a clean flag.
+ */
+export function creditPlacement(
+  figureBasis: 'NET' | 'GROSS',
+  totalsBasis: string | null,
+  amountBase: DecimalInput,
+): { bucket: 'net' | 'gross' | 'unknown'; comparable: boolean; placeable: boolean } {
   const basis = refundTotalsBasis(totalsBasis)
-  if (basis === 'NET') return { bucket: 'net', placeableOnNetBasis: true }
-  const bucket = basis === 'GROSS' ? 'gross' : 'unknown'
-  return { bucket, placeableOnNetBasis: toDecimal(amountBase).isZero() }
+  const bucket = basis === 'NET' ? 'net' : basis === 'GROSS' ? 'gross' : 'unknown'
+  const comparable = basis === figureBasis
+  return { bucket, comparable, placeable: comparable || toDecimal(amountBase).isZero() }
 }
 
 function round2(value: ReturnType<typeof toDecimal>): number {
@@ -259,3 +282,79 @@ export function marginFigureBound(params: {
  * what `≤` versus `?` means. `?` is deliberately NOT `≤`: it says a bound exists but its direction is
  * not established.
  */
+
+// ---------------------------------------------------------------------------
+// o3d-kyey: the same two classifications, over Decimal.
+// ---------------------------------------------------------------------------
+
+/**
+ * `netLinearFigureBound` for a caller that is Decimal all the way down.
+ *
+ * `lib/domain` is inside the decimal-boundary check for a reason, and the sales-analytics producer
+ * is Decimal-pure: converting a period total to a float purely to ask which side of the true figure
+ * it sits on would put a rounding step between the number that is PUBLISHED and the number the
+ * classification was made about — the precise mistake round 5 found in the sales-stats summary,
+ * where rounding twice produced a `≤` that was a false claim.
+ *
+ * The reasoning is `netLinearFigureBound`'s, unchanged, and `derived-figure-bounds.test.ts` runs
+ * both over one shared case table so they cannot drift.
+ *
+ * ONE THING THE DOCSTRING THERE STATES MORE NARROWLY THAN IS NEEDED. It reasons about a NET figure
+ * and a credit whose net value lies in `[0, unplacedCredit]`, which makes the published figure a
+ * ceiling that is loose by at most that much. For a GROSS figure carrying an unplaced NET credit the
+ * TIGHTNESS does not hold — the credit's gross value is larger than its net amount, so the true
+ * figure can be further below than `unplacedCredit` suggests. The DIRECTION still holds, and the
+ * direction is all `≤` claims: an unsubtracted non-negative credit can only make the published
+ * figure too high. Callers on the gross basis therefore get a sound `≤` and no tightness promise.
+ */
+export function netLinearFigureBoundDecimal(params: {
+  basisComplete: boolean
+  unplacedCredit: DecimalInput
+}): DerivedFigureBound {
+  if (params.basisComplete) return 'exact'
+  return toDecimal(params.unplacedCredit).lt(0) ? 'indeterminate' : 'upper'
+}
+
+/** `marginFigureBound`'s case analysis, over Decimal. Same five branches, in the same order. */
+export function marginFigureBoundDecimal(params: {
+  netRevenue: DecimalInput
+  cogs: DecimalInput
+  unplacedCredit: DecimalInput
+  basisComplete: boolean
+}): DerivedFigureBound {
+  if (params.basisComplete) return 'exact'
+  const netRevenue = toDecimal(params.netRevenue)
+  const cogs = toDecimal(params.cogs)
+  const unplacedCredit = toDecimal(params.unplacedCredit)
+  if (unplacedCredit.lt(0)) return 'indeterminate'
+  if (cogs.lt(0)) return 'indeterminate' // case 1
+  if (netRevenue.lte(0)) return 'exact' // case 2
+  if (netRevenue.sub(unplacedCredit).gt(0)) return 'upper' // case 3
+  return netRevenue.gte(cogs) ? 'upper' : 'indeterminate' // case 4
+}
+
+/**
+ * A ROW'S SHARE OF A REPORT-WIDE TOTAL — Customer Mix's `shareOfRevenuePct` and Gross Margin's
+ * `contributionPct`. NEITHER IS AN UPPER BOUND, AND SAYING SO WOULD BE A FALSE CLAIM.
+ *
+ * Both have the form `100 * f_r / Σ f_i`, so an unplaced credit moves the numerator and the
+ * denominator TOGETHER — and, unlike margin, the two move by DIFFERENT and unrelated amounts,
+ * because the credit that could not be placed on this row is not the credit that could not be placed
+ * on the others. Worked, on gross profit, with the report's own `Σ ≤ 0 → 0` guard:
+ *
+ *   - row 50, report total 100 → published 50%. All the unplaced credit belongs to OTHER rows
+ *     (u_r = 0, U = 50): true share is 50/50 = 100%. The published figure is BELOW the truth.
+ *   - the same 50 of 100 → published 50%. All of it belongs to THIS row (u_r = 50, U = 50): true
+ *     share is 0/50 = 0%. The published figure is ABOVE the truth.
+ *
+ * Same published figure, same unplaced amount, opposite directions — so no relation can be attached
+ * to it from the report's own data, and `indeterminate` (`?`) is the whole of what is known. The
+ * figure itself still stands: it is the best reading of a real period, and withholding it would be
+ * the other direction's failure.
+ *
+ * IT IS REPORT-WIDE, NOT PER ROW. A row with no unplaced credit of its own is still bounded, because
+ * its DENOMINATOR moved; classifying from the row's own flag would publish that row as exact.
+ */
+export function shareFigureBound(params: { reportBasisComplete: boolean }): DerivedFigureBound {
+  return params.reportBasisComplete ? 'exact' : 'indeterminate'
+}
