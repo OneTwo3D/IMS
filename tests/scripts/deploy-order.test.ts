@@ -3834,7 +3834,11 @@ die(){ echo "DIE: $*" >&2; exit 1; }
 const R9_BARRIER_SHIMS = `
 BARRIERS="\${CUTOVER_STATE_DIR}/barriers.log"
 : > "\${BARRIERS}"
-sync(){ echo "sync \$*" >> "\${BARRIERS}"; command sync "\$@"; }
+# o3d-czpy r2: publish_durable_file() flushes its PINNED parent as \`..\` — the point of the fix
+# is that it never names the destination again — so an operand that is a directory is recorded by
+# the physical path it resolves to. A file operand (the temporary) is recorded verbatim, and the
+# no-operand fallback stays distinguishable.
+sync(){ local _p=""; if [[ -n "\${1:-}" ]]; then _p="\$(cd "\${1}" 2>/dev/null && pwd -P)" || _p=""; fi; echo "sync \${_p:-\$*}" >> "\${BARRIERS}"; command sync "\$@"; }
 mv(){ echo "mv \$*" >> "\${BARRIERS}"; command mv "\$@"; }
 crontab(){
   echo "crontab \$*" >> "\${BARRIERS}"
@@ -4439,7 +4443,12 @@ for (const entry of R9_SCRIPTS) {
  */
 const R10_POST_RENAME_BARRIER_SHIM = `
 sync(){
-  if [[ $# -eq 0 || "\${1}" == "\${CUTOVER_STATE_DIR}" ]]; then return 1; fi
+  # o3d-czpy r2: the POST-RENAME barrier is now \`sync ..\` from inside the staging directory, so
+  # the operand is matched by the directory it RESOLVES to and not by its spelling.
+  if [[ $# -eq 0 ]]; then return 1; fi
+  local _p
+  _p="\$(cd "\${1}" 2>/dev/null && pwd -P)" || _p=""
+  if [[ -n "\${_p}" && "\${_p}" == "\$(cd "\${CUTOVER_STATE_DIR}" && pwd -P)" ]]; then return 1; fi
   command sync "\$@"
 }
 `
@@ -4644,7 +4653,11 @@ fence_dropin_file(){ echo "\${SYSTEMD_ROOT}/\$1.d/\${FENCE_DROPIN_NAME}"; }
 write_fence_marker(){ printf 'reboot_fence=absent\\nmarker_complete=1\\n' > "\${FENCE_FILE}"; return 0; }
 write_cutover_marker(){ write_fence_marker "\$@"; }
 verify_reboot_fence(){ echo VERIFIED; return 0; }
-sync(){ echo "sync \$*" >> "\${BARRIERS}"; command sync "\$@"; }
+# o3d-czpy r2: publish_durable_file() flushes its PINNED parent as \`..\` — the point of the fix
+# is that it never names the destination again — so an operand that is a directory is recorded by
+# the physical path it resolves to. A file operand (the temporary) is recorded verbatim, and the
+# no-operand fallback stays distinguishable.
+sync(){ local _p=""; if [[ -n "\${1:-}" ]]; then _p="\$(cd "\${1}" 2>/dev/null && pwd -P)" || _p=""; fi; echo "sync \${_p:-\$*}" >> "\${BARRIERS}"; command sync "\$@"; }
 mv(){ echo "mv \$*" >> "\${BARRIERS}"; command mv "\$@"; }
 rm(){
   local __a

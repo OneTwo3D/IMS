@@ -1901,7 +1901,7 @@ publish_durable_file() {
   # Absolute, so `dirname` and `basename` below split a whole path rather than a fragment of one.
   [[ "$target" == /* ]] || target="${PWD}/${target}"
   dir="$(dirname "$target")"
-  base="$(basename "$target")"
+  base="$(basename "$target")" || return 1
   mkdir -p "$dir" || return 1
   # Asked rather than hardcoded, exactly as prepare_crontab_lock asks it: the property is "owned by
   # the privileged user that owns this install", and it lets the harnesses run this unprivileged.
