@@ -100,6 +100,13 @@ function payloadFor(key: string, writer: 'enqueue' | 'interloper') {
   }
 }
 
+/**
+ * How long the winner holds its transaction open after its INSERT. The loser is blocked on the
+ * unique index for the whole of it, which is what makes the collision DETERMINISTIC and, just as
+ * importantly, MEASURABLE — see the timing assertion.
+ */
+const HOLD_MS = 300
+
 test(
   '[o3d-d0pd r2] a colliding enqueue leaves the outer transaction committable, and the collision is reached',
   { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
@@ -107,92 +114,100 @@ test(
     const { db, queueAccountingSyncTx } = await loadDeps()
     await enableXeroCogsReversal(db)
 
-    const references: string[] = []
-    const markers: string[] = []
+    const referenceId = probeId('ref')
+    const key = `cogs-reversal:${referenceId}`
     t.after(async () => {
-      await db.accountingEvent.deleteMany({ where: { sourceEntityId: { in: references } } }).catch(() => undefined)
-      await db.accountingSyncLog.deleteMany({ where: { referenceId: { in: references } } })
-      await db.activityLog.deleteMany({ where: { entityId: { in: markers } } })
+      await db.accountingEvent.deleteMany({ where: { sourceEntityId: referenceId } }).catch(() => undefined)
+      await db.accountingSyncLog.deleteMany({ where: { referenceId } })
+      await db.activityLog.deleteMany({ where: { entityId: { startsWith: `${referenceId}:` } } })
     })
 
-    let collisions = 0
-    let enqueueWon = 0
+    /**
+     * WHY THE COLLISION IS GUARANTEED, AND NOT MERELY LIKELY.
+     *
+     * Both racers are REAL enqueues in their own interactive transactions — an earlier draft raced the
+     * enqueue against a bare INSERT, and the bare INSERT won every single time, so the enqueue always
+     * read the row and deduped without ever inserting. The test passed and proved nothing.
+     *
+     * With two transactions, PostgreSQL's isolation does the work: the winner's row is INVISIBLE to
+     * the loser's SELECT until the winner COMMITS, but the unique index conflicts on it immediately.
+     * So the loser reads nothing, INSERTS, and blocks on the index — and gets its 23505 the moment the
+     * winner commits. The read-and-dedupe outcome is not available to it.
+     *
+     * The winner then holds its transaction open for HOLD_MS after its own insert, so the loser is
+     * demonstrably parked on the index rather than racing past it.
+     */
+    const started: Array<() => void> = []
+    const bothOpen = new Promise<void>((resolve) => {
+      let count = 0
+      started.push(() => { if (++count === 2) resolve() })
+      started.push(() => { if (++count === 2) resolve() })
+    })
 
-    for (let round = 0; round < ROUNDS; round++) {
-      const referenceId = probeId(`ref${round}`)
-      const key = `cogs-reversal:${referenceId}`
-      const marker = probeId(`marker${round}`)
-      references.push(referenceId)
-      markers.push(marker)
-
-      // THE CALLER: an interactive transaction that enqueues, THEN writes, THEN commits. The write
-      // after the enqueue is the whole point — before the savepoint it failed with 25P02, and so did
-      // the commit, so this transaction's marker never existed.
-      const caller = db.$transaction(async (tx) => {
+    async function racer(writer: string): Promise<{ writer: string; enqueueMs: number }> {
+      return await db.$transaction(async (tx) => {
+        // Both transactions are open before either enqueue begins.
+        started.pop()!()
+        await bothOpen
+        const startedAt = Date.now()
         const queued = await queueAccountingSyncTx(tx, {
           type: 'COGS_REVERSAL',
           referenceType: REFERENCE_TYPE,
           referenceId,
-          payload: payloadFor(key, 'enqueue'),
+          payload: { ...payloadFor(key, 'enqueue'), _probeWriter: writer },
           idempotencyKey: key,
         })
-        // The subsequent statement. On an aborted transaction this alone raises 25P02.
+        const enqueueMs = Date.now() - startedAt
+        // Both racers must be told the counterpart is queued: one wrote it, the other collided with it.
+        assert.equal(queued, true, `${writer}: the enqueue must report the posting as queued`)
+        // THE SUBSEQUENT STATEMENT. On an aborted transaction this alone raises 25P02 — which is the
+        // whole defect, and why a test that stopped at the enqueue's return would prove nothing.
         await tx.activityLog.create({
           data: {
             entityType: 'SYSTEM',
-            entityId: marker,
+            entityId: `${referenceId}:${writer}`,
             action: 'd0pd_collision_probe',
             tag: 'sync',
             level: 'INFO',
             description: `enqueue reported queued=${queued}`,
           },
         })
-        return queued
+        // Held open so the loser is parked on the unique index for a measurable interval.
+        await new Promise((resolve) => setTimeout(resolve, HOLD_MS))
+        return { writer, enqueueMs }
       }, TX)
-
-      // THE INTERLOPER: the concurrent writer whose row lands between the enqueue's read and its
-      // INSERT. It races on its own connection, exactly as a second retry would.
-      const interloper = db.accountingSyncLog.create({
-        data: {
-          connector: 'xero',
-          type: 'COGS_REVERSAL',
-          status: 'PENDING',
-          referenceType: REFERENCE_TYPE,
-          referenceId,
-          payload: payloadFor(key, 'interloper'),
-        },
-        select: { id: true },
-      }).then(() => 'created' as const, () => 'lost' as const)
-
-      const [queued] = await Promise.all([caller, interloper])
-
-      // The caller must always report the counterpart as queued — the row exists either way.
-      assert.equal(queued, true, `round ${round}: the enqueue must report the posting as queued`)
-
-      // The transaction COMMITTED. Read on a fresh query, after the transaction is done.
-      const committed = await db.activityLog.count({ where: { entityId: marker } })
-      assert.equal(committed, 1,
-        `round ${round}: the caller's transaction did not commit — this is the defect: a P2002 caught `
-        + 'inside the caller\'s interactive transaction aborts it, so the write after the enqueue and '
-        + 'the COMMIT both fail with 25P02',
-      )
-
-      // The index held: one row for one key, whoever won.
-      const rows = await db.accountingSyncLog.findMany({
-        where: { referenceId },
-        select: { payload: true },
-      })
-      assert.equal(rows.length, 1, `round ${round}: exactly one row may exist for one idempotency key`)
-      const writer = (rows[0].payload as { _probeWriter?: string } | null)?._probeWriter
-      if (writer === 'interloper') collisions++
-      else enqueueWon++
     }
 
-    // THE PRECONDITION WAS REACHED. Without this the test passes just as happily against a race that
+    const results = await Promise.all([racer('alpha'), racer('beta')])
+
+    // BOTH TRANSACTIONS COMMITTED. Read back on a fresh query, after both are done. Before the
+    // savepoint the loser's write and its COMMIT both failed with 25P02, so its marker never existed.
+    for (const { writer } of results) {
+      const committed = await db.activityLog.count({ where: { entityId: `${referenceId}:${writer}` } })
+      assert.equal(committed, 1,
+        `${writer}'s transaction did not commit — this is the defect: a P2002 caught inside the `
+        + "caller's interactive transaction aborts it, so the write after the enqueue and the COMMIT "
+        + 'both fail with 25P02',
+      )
+    }
+
+    // The index held: one row for one key.
+    const rows = await db.accountingSyncLog.findMany({ where: { referenceId }, select: { payload: true } })
+    assert.equal(rows.length, 1, 'exactly one row may exist for one idempotency key')
+    const winner = (rows[0].payload as { _probeWriter?: string } | null)?._probeWriter
+    assert.ok(winner === 'alpha' || winner === 'beta', `the surviving row must name its writer, got ${winner}`)
+
+    // THE PRECONDITION WAS REACHED, MEASURED RATHER THAN ARGUED. The loser sat on the unique index
+    // for the whole of the winner's hold, so its enqueue cannot have returned before the winner
+    // committed — which is only possible if it INSERTED and collided. A read-and-dedupe would have
+    // returned in milliseconds. Without this the test would pass just as happily against a race that
     // never raced, which is the shape of a guard that cannot fail.
-    assert.ok(collisions > 0,
-      `the enqueue's INSERT never collided in ${ROUNDS} rounds (it won ${enqueueWon} of them), so the `
-      + 'recovery path was never exercised and this test proved nothing. Widen the race.')
+    const loser = results.find((r) => r.writer !== winner)
+    assert.ok(loser, 'both racers must be accounted for')
+    assert.ok(loser.enqueueMs >= HOLD_MS,
+      `the losing enqueue returned in ${loser.enqueueMs}ms without waiting out the winner's ${HOLD_MS}ms `
+      + 'hold, so it never blocked on the unique index and the recovery path was never exercised',
+    )
   },
 )
 
