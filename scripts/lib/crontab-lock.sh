@@ -450,6 +450,85 @@ read_crontab_for() {
 }
 
 # =============================================================================
+# A CRONTAB WRITE IS AN ASSERTION, AND AN ASSERTION THAT WAS REJECTED IS NOT THE
+# FACT "THE CRONTAB NOW SAYS THIS"          (o3d-p9dq, Codex r30 CRITICAL)
+# =============================================================================
+# Round 28 made every crontab READ fail closed. The WRITES were left as bare pipelines —
+#
+#     printf '%s\n' "${fenced}" | crontab -u "${APP_USER}" -
+#     CRON_FENCED=true
+#
+# — on the belief that `set -e` would stop the function if the write were rejected. It does not,
+# and the reason is the wrapper these bodies are called through. `with_crontab_lock` invokes its
+# body as `"$@" || rc=$?`, because it needs the body's status to tell a lock conflict from a write
+# failure. A command on the LEFT of `||` runs with errexit SUSPENDED, and bash suspends it for the
+# ENTIRE DYNAMIC EXTENT of that command — every command inside the called function, and inside
+# anything it calls, not merely the call itself. So the lock wrapper added in round 26 silently
+# disarmed error propagation inside all fifteen `*_locked` bodies at once, and the two writes that
+# had no explicit check went from "protected by errexit" to "unprotected", with nothing at either
+# site to say so.
+#
+# What that cost: a rejected fence write left the crontab UNFENCED, then set `CRON_FENCED=true`,
+# printed "Cron writers fenced." and returned 0 — and the run took the database fence and ran the
+# migration against a live schedule. The unfence write is the mirror image: a rejected write left
+# the crontab FENCED, then DELETED the backup that was the only copy of the operator's schedule and
+# reported it restored.
+#
+# THE FIX IS THE ORDER, NOT ONLY THE CHECK. A check that runs after the flag is raised or after the
+# backup is deleted still leaves the run believing a thing that did not happen. So: every write goes
+# through THIS function, which returns non-zero and says why; and at every call site the status is
+# taken BEFORE any flag is set, any backup is removed, and any success is printed.
+#
+# TAKES ITS CONTENT AS AN ARGUMENT, NOT ON STDIN, and that is load-bearing rather than a style
+# choice: bash runs every element of a pipeline in a SUBSHELL, so `... | write_crontab_for user`
+# would set ${CRONTAB_WRITE_REASON} in a child and the caller would read an empty string — the
+# diagnostic would be lost at exactly the moment it is needed. Callers that produce their text with
+# a pipeline capture it first, and check THAT too.
+CRONTAB_WRITE_FAILED=77          # 75 = lock conflict, 76 = unfence diverged, 77 = the write itself
+CRONTAB_WRITE_REASON=""
+
+write_crontab_for() {
+  local user="${1:-}" text="${2-}" err_file err rc=0
+  CRONTAB_WRITE_REASON=""
+
+  if [[ -z "${user}" ]]; then
+    CRONTAB_WRITE_REASON="the crontab owner could not be resolved, so there is no user whose crontab this could be installed for"
+    return 1
+  fi
+  # NOT THE SAME AS AN EMPTY CRONTAB. `write_crontab_for user ""` is a deliberate request to install
+  # an empty schedule and is honoured; a caller that forgot the argument is a bug, and installing
+  # "nothing" on its behalf would delete every line the crontab is the only record of.
+  if [[ "$#" -lt 2 ]]; then
+    CRONTAB_WRITE_REASON="write_crontab_for was called with no content for ${user}'s crontab. This is a programming error, not an operator one, and it is refused rather than installing an empty schedule nobody asked for"
+    return 1
+  fi
+  if ! command -v crontab >/dev/null 2>&1; then
+    CRONTAB_WRITE_REASON="\`crontab\` is not installed on this host, so nothing can install a schedule for ${user} — and its absence does not mean there is no schedule to displace, because the spool file and the running daemon both outlive the client binary"
+    return 1
+  fi
+  # THE DIAGNOSTIC IS CAPTURED, for the same reason read_crontab_for captures its own: a crontab
+  # client rejects a schedule on stderr and the exit status alone does not say whether it was a
+  # syntax error in the content, a permission problem, or a full filesystem.
+  err_file="$(mktemp "${TMPDIR:-/tmp}/ims-crontab-write.XXXXXX" 2>/dev/null)" || {
+    CRONTAB_WRITE_REASON="a temporary file for \`crontab -u ${user} -\`'s diagnostics could not be created, so a REJECTED write could not be told from an accepted one"
+    return 1
+  }
+  printf '%s\n' "${text}" | crontab -u "${user}" - 2>"${err_file}" || rc=$?
+  err="$(cat "${err_file}" 2>/dev/null)" || err=""
+  rm -f "${err_file}"
+
+  if [[ "${rc}" -ne 0 ]]; then
+    CRONTAB_WRITE_REASON="\`crontab -u ${user} -\` exited ${rc} and did NOT install the schedule it was given — it said: ${err:-nothing at all}. A rejected write leaves the crontab exactly as it was, which is not what the caller asked for and is not what the caller's next line assumes"
+    return 1
+  fi
+  return 0
+}
+
+# Set by whichever `*_locked` body could not complete a FENCE, so the caller's `die` can say what
+# stopped it rather than blaming the lock it did in fact hold.
+CRON_FENCE_REASON=""
+
+# =============================================================================
 # A MISSING `crontab` IS NOT A PROOF THAT NOTHING IS SCHEDULED
 # (o3d-p9dq, Codex r29 HIGH #2)
 # =============================================================================
@@ -494,7 +573,7 @@ CRON_DAEMON_NAMES=(cron crond fcron)
 CRONTAB_COMMAND_REASON=""
 
 require_crontab_command() {
-  local user="${1:-}" root name listing
+  local user="${1:-}" root name listing prc
   CRONTAB_COMMAND_REASON=""
 
   if command -v crontab >/dev/null 2>&1; then
@@ -521,9 +600,42 @@ require_crontab_command() {
   # (1) IS ANYTHING RUNNING THAT COULD FIRE IT? Asked FIRST, because a daemon that has already
   # parsed the spool keeps firing after the spool file itself is gone — so a running daemon leaves
   # the question open no matter what the directory search finds.
+  #
+  # AND THE CENSUS ITSELF CAN FAIL (o3d-p9dq, Codex r30 HIGH). This loop used to read
+  # `if pgrep -x "${name}"; then` — ONE BIT, "matched or did not" — which is the same fail-open
+  # shape as the `ss` census of r27 and the pre-r28 `crontab -l`, arrived at INSIDE the very proof
+  # that was written to end it. `pgrep`'s answer is not a bit. Only ONE of its non-zero statuses
+  # means "no such process"; the rest mean the question was never asked. MEASURED on this host
+  # (procps-ng 4.0.4) rather than taken from the manual, one probe per status:
+  #
+  #     0    a process matched                     (`pgrep -x sleep` with one running)
+  #     1    NO process matched — and this is the ONLY status that is evidence of absence
+  #          (also: an unknown namespace, an over-long pattern, an empty pattern)
+  #     2    syntax error in the command line      (unknown flag; missing operand; two patterns;
+  #                                                 an invalid regex such as `[`)
+  #     3    fatal error: out of memory etc.       (documented in pgrep(1); not inducible here)
+  #
+  # …and the SHELL adds statuses `pgrep` never chose and the manual never lists: 126 if the binary
+  # is found but not executable, 127 if it disappears between the `command -v` above and here, and
+  # 128+n if it is killed — an OOM kill arrives as 137, which is precisely the condition status 3
+  # is for. Every one of those used to fall through this loop as "no cron daemon is running", the
+  # spool search below then found nothing, `require_crontab_command` returned 2, and all three
+  # fence paths continued into the database fence and the migration with a daemon possibly still
+  # firing ${user}'s loaded schedule.
+  #
+  # So the test is on the STATUS, and the classification is exhaustive: 0 is running, 1 is absent,
+  # and ANYTHING ELSE is a census that did not happen. A search that could not run is not a search
+  # that found nothing — the same rule this whole function is built on, now applied to its own
+  # first step.
   for name in "${CRON_DAEMON_NAMES[@]}"; do
-    if pgrep -x "${name}" >/dev/null 2>&1; then
+    prc=0
+    pgrep -x "${name}" >/dev/null 2>&1 || prc=$?
+    if [[ "${prc}" -eq 0 ]]; then
       CRONTAB_COMMAND_REASON="\`crontab\` is not installed, but a \`${name}\` daemon IS running — it holds whatever it last read from the spool in memory and keeps firing it, so nothing here can establish that ${user} has no cron writers"
+      return 1
+    fi
+    if [[ "${prc}" -ne 1 ]]; then
+      CRONTAB_COMMAND_REASON="\`crontab\` is not installed, and \`pgrep -x ${name}\` exited ${prc} — neither 0 (a ${name} daemon is running) nor 1 (none is), so it is a syntax error, a fatal error, or a binary that could not be run. No process census was obtained, and a census that did not run is not a census that found nothing: a ${name} daemon may be holding ${user}'s schedule in memory right now"
       return 1
     fi
   done

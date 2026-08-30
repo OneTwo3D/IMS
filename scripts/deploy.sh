@@ -2349,7 +2349,7 @@ fence_cron() {
   local rc=0
   with_crontab_lock fence_cron_locked || rc=$?
   [[ "$rc" -eq 0 ]] || die \
-    "The ${APP_USER} crontab could not be fenced$(if [[ "$rc" -eq "$CRONTAB_LOCK_CONFLICT" ]]; then printf ' because another process held %s for %ss — the application is reconciling the crontab, or a process is wedged holding that lock' "$CRONTAB_LOCK_FILE" "$CRONTAB_LOCK_WAIT_SECONDS"; fi). Fencing it without that lock is the defect this protocol exists to prevent: a reconciliation committing between the snapshot and the replacement would be silently discarded. NOTHING HAS BEEN MIGRATED."
+    "The ${APP_USER} crontab could not be fenced$(if [[ "$rc" -eq "$CRONTAB_LOCK_CONFLICT" ]]; then printf ' because another process held %s for %ss — the application is reconciling the crontab, or a process is wedged holding that lock' "$CRONTAB_LOCK_FILE" "$CRONTAB_LOCK_WAIT_SECONDS"; fi)${CRON_FENCE_REASON:+: ${CRON_FENCE_REASON}}. The crontab was NOT replaced and the original schedule is still whatever it was. Fencing it without that lock is the defect this protocol exists to prevent: a reconciliation committing between the snapshot and the replacement would be silently discarded. NOTHING HAS BEEN MIGRATED."
 }
 
 fence_cron_locked() {
@@ -2398,8 +2398,22 @@ fence_cron_locked() {
   # whether the snapshot is still current by re-running THIS transform over the backup and
   # comparing; a re-typed copy here would let the two drift and make that comparison meaningless.
   local fenced
-  fenced="$(crontab_fence_projection "$current")"
-  printf '%s\n' "$fenced" | crontab -u "$APP_USER" -
+  fenced="$(crontab_fence_projection "$current")" || {
+    CRON_FENCE_REASON="the fence projection of the ${APP_USER} crontab could not be computed, so there is nothing this run is willing to install in its place"
+    return 1
+  }
+  # THE WRITE IS CHECKED, AND CRON_FENCED IS RAISED ONLY AFTER IT IS CONFIRMED
+  # (o3d-p9dq, Codex r30 CRITICAL). This was a bare `printf | crontab -` followed by
+  # `CRON_FENCED=true`, on the belief that `set -e` covered it. It did not: `with_crontab_lock`
+  # calls this body as `"$@" || rc=$?`, and a command on the LEFT of `||` runs with errexit
+  # suspended for its WHOLE DYNAMIC EXTENT — every line in here included. A rejected write
+  # therefore recorded the crontab as fenced, printed success, returned 0, and the run took the
+  # database fence and migrated with the original schedule still live. Both halves matter: the
+  # status is taken, and it is taken BEFORE the flag and BEFORE the success line.
+  write_crontab_for "$APP_USER" "$fenced" || {
+    CRON_FENCE_REASON="$CRONTAB_WRITE_REASON"
+    return 1
+  }
   CRON_FENCED=true
   ok "Cron writers fenced."
 }
@@ -2412,6 +2426,8 @@ unfence_cron() {
   $CRON_FENCED || return 0
   local rc=0
   with_crontab_lock unfence_cron_locked || rc=$?
+  [[ "$rc" -ne "$CRONTAB_WRITE_FAILED" ]] || die \
+    "The ${APP_USER} crontab is still FENCED (every line commented out) because the restoring write was REJECTED: ${CRON_UNFENCE_REASON}. Nothing was installed, the backup at ${CRON_BACKUP} was NOT deleted, and this run has changed nothing else. The application is up and the migration is complete; settle the cause and put the schedule back by hand:  crontab -u ${APP_USER} ${CRON_BACKUP}"
   [[ "$rc" -ne "$CRONTAB_UNFENCE_DIVERGED" ]] || die \
     "The ${APP_USER} crontab is still FENCED (every line commented out) and this run will not decide what belongs in it: ${CRON_UNFENCE_REASON}. Neither candidate is safe to install without a human — the backup at ${CRON_BACKUP} would discard whatever rewrote the crontab, and undoing the fence in place would discard the lines listed above. Compare the two (crontab -u ${APP_USER} -l, against ${CRON_BACKUP}) and install the union by hand."
   [[ "$rc" -eq 0 ]] || die \
@@ -2452,7 +2468,16 @@ unfence_cron_locked() {
     return "$CRONTAB_UNFENCE_DIVERGED"
   fi
   plan_crontab_unfence "$backup" "$current" || return "$CRONTAB_UNFENCE_DIVERGED"
-  printf '%s\n' "$CRON_UNFENCE_TEXT" | crontab -u "$APP_USER" -
+  # THE ORDER IS THE FIX, NOT THE CHECK ALONE (o3d-p9dq, Codex r30 CRITICAL). The mirror of the
+  # fence, and the worse half: a rejected write here used to be followed by `rm -f "${CRON_BACKUP}"`
+  # — deleting the ONLY copy of the operator's schedule — and by `CRON_FENCED=false`, which tells
+  # the unwind there is nothing to put back. The crontab stayed fenced and the run reported it
+  # restored. So the write is checked first and returns ${CRONTAB_WRITE_FAILED}; the backup is not
+  # touched, the flag is not cleared, and the caller prints the by-hand command.
+  write_crontab_for "$APP_USER" "$CRON_UNFENCE_TEXT" || {
+    CRON_UNFENCE_REASON="$CRONTAB_WRITE_REASON"
+    return "$CRONTAB_WRITE_FAILED"
+  }
   rm -f "$CRON_BACKUP"
   CRON_FENCED=false
   if [[ "$CRON_UNFENCE_PLAN" == "merge" ]]; then
@@ -2564,7 +2589,10 @@ resume_restore_cron_locked() {
     RESUME_CRON_DIVERGED="the live crontab is not the fence's own projection of ${CRON_BACKUP}, so something has written it since the interrupted run took that snapshot — installing the snapshot would discard that write, or put back an entry somebody deliberately deleted"
     return 1
   fi
-  printf '%s\n' "$backup" | crontab -u "$APP_USER" - || return 1
+  write_crontab_for "$APP_USER" "$backup" || {
+    RESUME_CRON_DIVERGED="the interrupted run's snapshot could not be installed: ${CRONTAB_WRITE_REASON}"
+    return 1
+  }
   rm -f "$CRON_BACKUP"
   CRON_FENCED=false
   ok "The ${APP_USER} crontab is back exactly as the interrupted run found it."
@@ -2658,7 +2686,10 @@ restore_cron_from_backup_locked() {
   current="$CRONTAB_READ_TEXT"
   backup="$(cat "$CRON_BACKUP" 2>/dev/null)" || return 1
   plan_crontab_unfence "$backup" "$current" || return 1
-  printf '%s\n' "$CRON_UNFENCE_TEXT" | crontab -u "$APP_USER" - || return 1
+  write_crontab_for "$APP_USER" "$CRON_UNFENCE_TEXT" || {
+    warn "The ${APP_USER} crontab could not be restored from ${CRON_BACKUP}: ${CRONTAB_WRITE_REASON}"
+    return 1
+  }
   rm -f "$CRON_BACKUP"
   CRON_FENCED=false
   CRON_BACKUP_CREATED=false

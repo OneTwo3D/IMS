@@ -4658,7 +4658,7 @@ fence_cron() {
   local rc=0
   with_crontab_lock fence_cron_locked || rc=$?
   [[ "${rc}" -eq 0 ]] || die \
-    "The ${APP_USER} crontab could not be fenced$(if [[ "${rc}" -eq "${CRONTAB_LOCK_CONFLICT}" ]]; then printf ' because another process held %s for %ss — the application is reconciling the crontab, or a process is wedged holding that lock' "${CRONTAB_LOCK_FILE}" "${CRONTAB_LOCK_WAIT_SECONDS}"; fi). Fencing it without that lock is the defect this protocol exists to prevent: a reconciliation committing between the snapshot and the replacement would be silently discarded. NOTHING HAS BEEN MIGRATED."
+    "The ${APP_USER} crontab could not be fenced$(if [[ "${rc}" -eq "${CRONTAB_LOCK_CONFLICT}" ]]; then printf ' because another process held %s for %ss — the application is reconciling the crontab, or a process is wedged holding that lock' "${CRONTAB_LOCK_FILE}" "${CRONTAB_LOCK_WAIT_SECONDS}"; fi)${CRON_FENCE_REASON:+: ${CRON_FENCE_REASON}}. The crontab was NOT replaced and the original schedule is still whatever it was. Fencing it without that lock is the defect this protocol exists to prevent: a reconciliation committing between the snapshot and the replacement would be silently discarded. NOTHING HAS BEEN MIGRATED."
 }
 
 fence_cron_locked() {
@@ -4689,7 +4689,23 @@ fence_cron_locked() {
   # THROUGH THE SHARED PROJECTION, not a fourth copy of the awk. plan_crontab_unfence() decides
   # whether the snapshot is still current by re-running THIS transform over the backup and
   # comparing; a re-typed copy here would let the two drift and make that comparison meaningless.
-  crontab_fence_projection "${current}" | crontab -u "${APP_USER}" -
+  local fenced
+  fenced="$(crontab_fence_projection "${current}")" || {
+    CRON_FENCE_REASON="the fence projection of the ${APP_USER} crontab could not be computed, so there is nothing this run is willing to install in its place"
+    return 1
+  }
+  # THE WRITE IS CHECKED, AND CRON_FENCED IS RAISED ONLY AFTER IT IS CONFIRMED
+  # (o3d-p9dq, Codex r30 CRITICAL). This was a bare `printf | crontab -` followed by
+  # `CRON_FENCED=true`, on the belief that `set -e` covered it. It did not: `with_crontab_lock`
+  # calls this body as `"$@" || rc=$?`, and a command on the LEFT of `||` runs with errexit
+  # suspended for its WHOLE DYNAMIC EXTENT — every line in here included. A rejected write
+  # therefore recorded the crontab as fenced, printed success, returned 0, and the run took the
+  # database fence and migrated with the original schedule still live. Both halves matter: the
+  # status is taken, and it is taken BEFORE the flag and BEFORE the success line.
+  write_crontab_for "${APP_USER}" "${fenced}" || {
+    CRON_FENCE_REASON="${CRONTAB_WRITE_REASON}"
+    return 1
+  }
   CRON_FENCED=true
   success "Cron writers fenced."
 }
@@ -4704,6 +4720,8 @@ unfence_cron() {
   [[ -f "${CRON_BACKUP}" ]] || return 0
   local rc=0
   with_crontab_lock unfence_cron_locked || rc=$?
+  [[ "${rc}" -ne "${CRONTAB_WRITE_FAILED}" ]] || die \
+    "The ${APP_USER} crontab is still FENCED (every line commented out) because the restoring write was REJECTED: ${CRON_UNFENCE_REASON}. Nothing was installed, the backup at ${CRON_BACKUP} was NOT deleted, and this run has changed nothing else. The application is up and the migration is complete; settle the cause and put the schedule back by hand:  crontab -u ${APP_USER} ${CRON_BACKUP}"
   [[ "${rc}" -ne "${CRONTAB_UNFENCE_DIVERGED}" ]] || die \
     "The ${APP_USER} crontab is still FENCED (every line commented out) and this run will not decide what belongs in it: ${CRON_UNFENCE_REASON}. Neither candidate is safe to install without a human — the backup at ${CRON_BACKUP} would discard whatever rewrote the crontab, and undoing the fence in place would discard the lines listed above. Compare the two (crontab -u ${APP_USER} -l, against ${CRON_BACKUP}) and install the union by hand."
   [[ "${rc}" -eq 0 ]] || die \
@@ -4739,7 +4757,16 @@ unfence_cron_locked() {
     return "${CRONTAB_UNFENCE_DIVERGED}"
   fi
   plan_crontab_unfence "${backup}" "${current}" || return "${CRONTAB_UNFENCE_DIVERGED}"
-  printf '%s\n' "${CRON_UNFENCE_TEXT}" | crontab -u "${APP_USER}" -
+  # THE ORDER IS THE FIX, NOT THE CHECK ALONE (o3d-p9dq, Codex r30 CRITICAL). The mirror of the
+  # fence, and the worse half: a rejected write here used to be followed by `rm -f "${CRON_BACKUP}"`
+  # — deleting the ONLY copy of the operator's schedule — and by `CRON_FENCED=false`, which tells
+  # the unwind there is nothing to put back. The crontab stayed fenced and the run reported it
+  # restored. So the write is checked first and returns ${CRONTAB_WRITE_FAILED}; the backup is not
+  # touched, the flag is not cleared, and the caller prints the by-hand command.
+  write_crontab_for "${APP_USER}" "${CRON_UNFENCE_TEXT}" || {
+    CRON_UNFENCE_REASON="${CRONTAB_WRITE_REASON}"
+    return "${CRONTAB_WRITE_FAILED}"
+  }
   rm -f "${CRON_BACKUP}"
   CRON_FENCED=false
   if [[ "${CRON_UNFENCE_PLAN}" == "merge" ]]; then
@@ -4846,7 +4873,10 @@ resume_restore_cron_locked() {
     RESUME_CRON_DIVERGED="the live crontab is not the fence's own projection of ${CRON_BACKUP}, so something has written it since the interrupted run took that snapshot — installing the snapshot would discard that write, or put back an entry somebody deliberately deleted"
     return 1
   fi
-  printf '%s\n' "${backup}" | crontab -u "${APP_USER}" - || return 1
+  write_crontab_for "${APP_USER}" "${backup}" || {
+    RESUME_CRON_DIVERGED="the interrupted run's snapshot could not be installed: ${CRONTAB_WRITE_REASON}"
+    return 1
+  }
   rm -f "${CRON_BACKUP}"
   CRON_FENCED=false
   success "The ${APP_USER} crontab is back exactly as the interrupted run found it."
@@ -5329,7 +5359,10 @@ restore_cron_from_backup_locked() {
   current="${CRONTAB_READ_TEXT}"
   backup="$(cat "${CRON_BACKUP}" 2>/dev/null)" || return 1
   plan_crontab_unfence "${backup}" "${current}" || return 1
-  printf '%s\n' "${CRON_UNFENCE_TEXT}" | crontab -u "${APP_USER}" - || return 1
+  write_crontab_for "${APP_USER}" "${CRON_UNFENCE_TEXT}" || {
+    warn "The ${APP_USER} crontab could not be restored from ${CRON_BACKUP}: ${CRONTAB_WRITE_REASON}"
+    return 1
+  }
   rm -f "${CRON_BACKUP}"
   CRON_FENCED=false
   CRON_BACKUP_CREATED=false
@@ -7722,7 +7755,17 @@ bootstrap_managed_crontab_block_locked() {
     info "A managed crontab block already exists for ${APP_USER} — leaving the app's schedules alone."
     info "Newly registered jobs are scheduled by Settings -> System -> Scheduler -> Save & Apply."
   else
-    CRON_BOOTSTRAP_WRITTEN=yes
+    # THE FIFTEENTH `*_locked` BODY, AND IT INHERITED THE SAME SUSPENDED ERREXIT AS THE OTHER
+    # FOURTEEN (o3d-p9dq, Codex r30 CRITICAL). The projection below used to run straight into
+    # the crontab client with nothing taking its status, so a REJECTED write still set
+    # CRON_BOOTSTRAP_WRITTEN=yes, returned 0, and the installer's closing summary told the
+    # operator a default schedule had been installed that was never installed.
+    #
+    # CAPTURED RATHER THAN PIPED, for the reason write_crontab_for documents: every element of a
+    # pipeline runs in a SUBSHELL, so a `| write_crontab_for` would set ${CRONTAB_WRITE_REASON} in
+    # a child and this function would read an empty string. Capturing also makes the projection's
+    # OWN failure visible, which the old pipeline swallowed whenever the write happened to succeed.
+    local block
 # The crontab as read ABOVE, under this same lock — never a second read, which could disagree with
 # the one the marker test was decided on. A box with no crontab at all feeds the awk nothing, which
 # is how it appends the block to an empty file.
@@ -7734,6 +7777,7 @@ bootstrap_managed_crontab_block_locked() {
 # string scripts/lib/crontab-lock.sh gives its loss check, rather than a second hand-kept copy of
 # it. What remains inline is only what is specific to bootstrapping: where the new block goes, and
 # the pre-marker legacy line to drop.
+block="$(
 if [[ -n "${existing}" ]]; then printf '%s\n' "${existing}"; fi \
   | awk -v port="${APP_PORT}" -v blockfile="${CRON_BLOCK_FILE}" "${CRONTAB_MANAGED_BLOCK_AWK}"'
   function emitBlock(  bl) { while ((getline bl < blockfile) > 0) print bl; close(blockfile) }
@@ -7752,7 +7796,13 @@ if [[ -n "${existing}" ]]; then printf '%s\n' "${existing}"; fi \
     }
     if (!emitted) emitBlock()   # no prior block → append at end
   }
-'  | crontab -u "${APP_USER}" -
+'
+)" || {
+      CRONTAB_WRITE_REASON="the default crontab block could not be composed from the crontab as read - the awk projection failed - so nothing was installed"
+      return 1
+    }
+    write_crontab_for "${APP_USER}" "${block}" || return 1
+    CRON_BOOTSTRAP_WRITTEN=yes
   fi
 }
 
@@ -7767,7 +7817,10 @@ if [[ "${CRON_BOOTSTRAP_RC}" -ne 0 ]]; then
   if [[ "${CRON_BOOTSTRAP_RC}" -eq "${CRONTAB_LOCK_CONFLICT}" ]]; then
     warn "Another process is reconciling ${APP_USER}'s crontab; leaving it untouched."
   else
-    warn "The ${APP_USER} crontab could not be read, so no default schedule was written: ${CRONTAB_READ_REASON:-reason not recorded}"
+    # EITHER HALF CAN BE THE REASON NOW (o3d-p9dq, Codex r30 CRITICAL). Until this round the only
+    # way to reach here other than a lock conflict was a failed READ, because a failed WRITE
+    # returned 0. It no longer does, so the message asks the write first.
+    warn "No default schedule was written to the ${APP_USER} crontab: ${CRONTAB_WRITE_REASON:-${CRONTAB_READ_REASON:-reason not recorded}}"
   fi
   warn "If scheduled jobs are missing, open Settings -> System -> Scheduler and press Save & Apply."
 fi
