@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { marginFigureBound, netLinearFigureBound, boundSuffix } from '@/lib/domain/sales/refund-basis-analytics'
+import { marginFigureBound, marginFigureBoundDecimal, netLinearFigureBound, netLinearFigureBoundDecimal, shareFigureBound, boundSuffix } from '@/lib/domain/sales/refund-basis-analytics'
 
 /**
  * o3d-iigc round 4, Codex finding 1: AVG MARGIN IS NOT NECESSARILY AN UPPER BOUND.
@@ -134,4 +134,59 @@ test('the suffix distinguishes the three claims, and ? is deliberately not ≤ (
   assert.equal(boundSuffix('upper'), ' ≤')
   assert.equal(boundSuffix('indeterminate'), ' ?')
   assert.notEqual(boundSuffix('indeterminate'), boundSuffix('upper'))
+})
+
+// ---------------------------------------------------------------------------
+// o3d-kyey: the Decimal-native twins, and the ratio-of-a-total classifier
+// ---------------------------------------------------------------------------
+
+/**
+ * THE ANTI-DIVERGENCE TEST. The sales-analytics producer is Decimal-pure and must not round a period
+ * total to a float purely to ask which side of the true figure it sits on, so the two classifiers
+ * above got Decimal twins. Two copies of a five-branch case analysis is exactly the thing that rots:
+ * this walks a case table that reaches EVERY branch of both and asserts they answer identically.
+ *
+ * The table is asserted to reach all three verdicts, so a mistake that made one classifier constant
+ * cannot pass by making the other constant in the same way.
+ */
+const BOUND_CASES: Array<{ netRevenue: number; cogs: number; unplacedCredit: number; basisComplete: boolean }> = [
+  { netRevenue: 100, cogs: 40, unplacedCredit: 0, basisComplete: true },     // exact by the flag
+  { netRevenue: 100, cogs: 40, unplacedCredit: 10, basisComplete: false },   // margin case 3
+  { netRevenue: 100, cogs: 40, unplacedCredit: 120, basisComplete: false },  // margin case 4a
+  { netRevenue: 100, cogs: 150, unplacedCredit: 120, basisComplete: false }, // margin case 4b
+  { netRevenue: 100, cogs: -5, unplacedCredit: 10, basisComplete: false },   // margin case 1
+  { netRevenue: 0, cogs: 40, unplacedCredit: 10, basisComplete: false },     // margin case 2
+  { netRevenue: -20, cogs: 40, unplacedCredit: 10, basisComplete: false },   // margin case 2, negative
+  { netRevenue: 100, cogs: 40, unplacedCredit: -1, basisComplete: false },   // negative credit
+  { netRevenue: 100, cogs: 40, unplacedCredit: 0, basisComplete: false },    // sub-penny: flag decides
+]
+
+test('the Decimal bound classifiers answer exactly what their number twins do (o3d-kyey)', () => {
+  const linear = new Set<string>()
+  const margin = new Set<string>()
+  for (const input of BOUND_CASES) {
+    const linearNumber = netLinearFigureBound({ basisComplete: input.basisComplete, unplacedCredit: input.unplacedCredit })
+    const linearDecimal = netLinearFigureBoundDecimal({ basisComplete: input.basisComplete, unplacedCredit: input.unplacedCredit })
+    assert.equal(linearDecimal, linearNumber, `linear disagreed on ${JSON.stringify(input)}`)
+    linear.add(linearNumber)
+    const marginNumber = marginFigureBound(input)
+    const marginDecimal = marginFigureBoundDecimal(input)
+    assert.equal(marginDecimal, marginNumber, `margin disagreed on ${JSON.stringify(input)}`)
+    margin.add(marginNumber)
+  }
+  // The table must actually exercise the branches, or "they agree" is a statement about nothing.
+  assert.deepEqual([...linear].sort(), ['exact', 'indeterminate', 'upper'])
+  assert.deepEqual([...margin].sort(), ['exact', 'indeterminate', 'upper'])
+})
+
+/**
+ * A RATIO OF A ROW TO A REPORT TOTAL IS NEVER AN UPPER BOUND — Customer Mix's share of revenue and
+ * Gross Margin's contribution. Worked in `shareFigureBound`'s docstring: the same published 50% of a
+ * 100 total with 50 of unplaced credit is 100% if none of that credit is this row's and 0% if all of
+ * it is. Same figure, same amount, opposite directions, so no relation can be attached to it.
+ */
+test('a share-of-total ratio is exact or it is indeterminate — never ≤ (o3d-kyey)', () => {
+  assert.equal(shareFigureBound({ reportBasisComplete: true }), 'exact')
+  assert.equal(shareFigureBound({ reportBasisComplete: false }), 'indeterminate')
+  assert.equal(boundSuffix(shareFigureBound({ reportBasisComplete: false })), ' ?')
 })

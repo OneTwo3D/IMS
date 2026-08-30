@@ -1414,9 +1414,22 @@ export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = 
   // The report-wide credit: every row's, plus the credit that reached no row at all.
   const reportCredits = emptyCredits()
   for (const row of groups.values()) mergeCredits(reportCredits, row.credits)
+  const rowBasisComplete = creditBasisComplete(reportCredits, MARGIN_FIGURE_BASIS)
+  const rowUnplaced = unplacedCredit(reportCredits, MARGIN_FIGURE_BASIS)
   mergeCredits(reportCredits, refundsUnattributed)
   mergeCredits(reportCredits, refundsOutsideReport)
-  const contributionBound = shareFigureBound({ reportBasisComplete: creditBasisComplete(reportCredits, MARGIN_FIGURE_BASIS) })
+  /**
+   * OFF-ROW CREDIT BOUNDS THE PERIOD FIGURES WHATEVER BASIS IT IS ON, and this is the one place the
+   * basis test is not enough on its own. A NET-basis credit that reached no row is `placeable` by
+   * `creditPlacement` — it is the same unit as the figure — so the basis flag stays true while the
+   * credit sits unsubtracted. Reading completeness off the basis alone would publish the period
+   * revenue as EXACT with a credit note missing from it. Existence is decided by the amount here
+   * because that is what "reached no row" means; direction still comes from the sign, so a negative
+   * off-row amount degrades to indeterminate rather than being marked `≤`.
+   */
+  const offRowCredit = refundsUnattributed.net.add(refundsUnattributed.gross).add(refundsUnattributed.unknown)
+    .add(refundsOutsideReport.net).add(refundsOutsideReport.gross).add(refundsOutsideReport.unknown)
+  const contributionBound = shareFigureBound({ reportBasisComplete: rowBasisComplete && offRowCredit.isZero() })
   const rows: MarginReportRow[] = [...groups.entries()]
     .map(([key, row]) => {
       const netRevenue = netRevenueByKey.get(key)!
@@ -1448,8 +1461,8 @@ export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = 
   const paged = paginate(rows, filters, deps?.paginate !== false)
   const totalRevenue = [...netRevenueByKey.values()].reduce((sum, revenue) => sum.add(revenue), new Prisma.Decimal(0))
   const totalCogs = [...groups.values()].reduce((sum, row) => sum.add(row.cogs), new Prisma.Decimal(0))
-  const totalUnplaced = unplacedCredit(reportCredits, MARGIN_FIGURE_BASIS)
-  const totalBasisComplete = creditBasisComplete(reportCredits, MARGIN_FIGURE_BASIS)
+  const totalUnplaced = rowUnplaced.add(offRowCredit)
+  const totalBasisComplete = rowBasisComplete && offRowCredit.isZero()
   const totalLinearBound = netLinearFigureBoundDecimal({ basisComplete: totalBasisComplete, unplacedCredit: totalUnplaced })
   return {
     generatedAt: generatedAt.toISOString(),
