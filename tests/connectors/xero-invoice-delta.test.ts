@@ -854,3 +854,89 @@ test('[o3d-psrx] RECEIPT_NOT_REGISTERED is never a proven reversal', () => {
   assert.equal(zeroPaidIsProvenReversal({ verdict: 'RECEIPT_NOT_REGISTERED', paymentIds: ['pay_1'] }), false,
     'the ledger is short by a payment IMS never sent, not by one that was taken away')
 })
+
+// ---------------------------------------------------------------------------
+// o3d-psrx r2 (Codex HIGH) — THE PAID SALE THAT NEVER HAD A RECEIPT TO WITNESS
+//
+// The receipt witness above enumerates `Payment` rows, and a WooCommerce-paid order has none: the
+// importer writes `paidAt` straight from `date_paid_gmt`. `markSalesOrderPaid` has none either. So
+// the witness saw nothing to withhold on, the verdict fell through to NOTHING_REGISTERED, and a
+// zero-paid Xero snapshot cleared `paidAt` and raised a chargeback credit note against a sale the
+// customer had genuinely paid for.
+//
+// "No Payment row" cannot be the test: it is equally true of an order the Xero forward pass marked
+// paid, and THAT one must still reverse — clearing its `paidAt` when the ledger empties is the whole
+// purpose of the pass. What separates them is recorded, not inferred: SalesOrder.unregisteredPaidAt.
+// ---------------------------------------------------------------------------
+
+test('[o3d-psrx r2] a channel/operator paid flag with nothing registered is NOT the ledger being emptied', () => {
+  const invoice = ledgerInv('i1', 'ACCREC', 'AUTHORISED', { AmountPaid: 0, AmountDue: 500, Payments: [] })
+  // MUTATION ROUTE: delete the `if (paidWithoutLedgerReceipt)` arm from classifyRegisteredPayment
+  // (or make it `return { verdict: 'NOTHING_REGISTERED' }`) and this fails — which is exactly the
+  // defect, because zeroPaidIsProvenReversal reads NOTHING_REGISTERED as a proven reversal.
+  assert.deepEqual(
+    classifyRegisteredPayment(invoice, [], READ_AT, [], true),
+    { verdict: 'PAID_WITHOUT_LEDGER_RECEIPT' },
+  )
+})
+
+test('[o3d-psrx r2] the SAME shape with a LEDGER-sourced paid flag is still NOTHING_REGISTERED', () => {
+  const invoice = ledgerInv('i1', 'ACCREC', 'AUTHORISED', { AmountPaid: 0, AmountDue: 500, Payments: [] })
+  // The paired case, and the one that stops the fix being "withhold everything". An order the Xero
+  // forward pass marked paid has no Payment row and no registration either — identical inputs but
+  // for the flag — and the ledger going empty really does mean the payment was taken away.
+  //
+  // MUTATION ROUTE: make the new arm unconditional (ignore the parameter) and this fails.
+  assert.deepEqual(classifyRegisteredPayment(invoice, [], READ_AT, [], false), { verdict: 'NOTHING_REGISTERED' })
+  // ...and the default keeps every existing caller, and the whole BILL pass, on the old meaning.
+  assert.deepEqual(classifyRegisteredPayment(invoice, [], READ_AT, []), { verdict: 'NOTHING_REGISTERED' })
+})
+
+test('[o3d-psrx r2] once a registration has POSTED, the marker stops speaking and a real chargeback reverses', () => {
+  // THE REGRESSION THIS GUARDS. An ordinary WooCommerce order IS registered: the SALES_INVOICE
+  // carries `_registerPayment`, and the Xero processor raises the INVOICE_PAYMENT follow-up once the
+  // invoice posts. If the marker withheld for ever, 6oyu.6 chargeback detection — the reason WC
+  // orders are in this pass at all — would be dead for every WooCommerce sale.
+  //
+  // MUTATION ROUTE: hoist the `paidWithoutLedgerReceipt` arm ABOVE the `posted.length === 0` guard
+  // and this fails. That is the tempting simplification, and it silently disables WC chargebacks.
+  const emptied = ledgerInv('i1', 'ACCREC', 'AUTHORISED', { AmountPaid: 0, AmountDue: 500, Payments: [] })
+  assert.deepEqual(
+    classifyRegisteredPayment(emptied, [postedRegistration()], READ_AT, [], true),
+    { verdict: 'GONE', paymentIds: ['PAY-1'] },
+  )
+})
+
+test('[o3d-psrx r2] an UNDECIDED registration still outranks the marker', () => {
+  const invoice = ledgerInv('i1', 'ACCREC', 'AUTHORISED', { AmountPaid: 0, AmountDue: 500, Payments: [] })
+  // Both withhold, so the harm is only the message — but "nobody ever registered this, go and look
+  // at the channel" is the wrong instruction for an order with a payment about to post.
+  //
+  // MUTATION ROUTE: put the marker arm above the undecided one and this fails.
+  assert.deepEqual(
+    classifyRegisteredPayment(invoice, [postedRegistration({ status: 'PENDING' })], READ_AT, [], true),
+    { verdict: 'REGISTRATION_UNDECIDED', entryIds: ['log_1'] },
+  )
+})
+
+test('[o3d-psrx r2] an unregistered local RECEIPT still outranks the marker', () => {
+  const invoice = ledgerInv('i1', 'ACCREC', 'AUTHORISED', { AmountPaid: 0, AmountDue: 500, Payments: [] })
+  // An order can be both: marked paid by hand, then given a receipt. The receipt is the more
+  // specific fact and names the ids an operator can act on, so it must win.
+  //
+  // MUTATION ROUTE: put the marker arm above the receipt arm and this fails.
+  assert.deepEqual(
+    classifyRegisteredPayment(invoice, [], READ_AT, ['pay_1'], true),
+    { verdict: 'RECEIPT_NOT_REGISTERED', paymentIds: ['pay_1'] },
+  )
+})
+
+test('[o3d-psrx r2] PAID_WITHOUT_LEDGER_RECEIPT is never a proven reversal', () => {
+  // MUTATION ROUTE: return true for this verdict and every test above still passes while the fix is
+  // completely undone — the classification would be right and nothing would act on it. This is the
+  // single line that decides whether `paidAt` is cleared and a credit note raised.
+  assert.equal(zeroPaidIsProvenReversal({ verdict: 'PAID_WITHOUT_LEDGER_RECEIPT' }), false,
+    'the ledger holds nothing of IMS\'s to have removed — its zero is IMS\'s own silence')
+  // The paired case, so this cannot pass by returning false for everything.
+  assert.equal(zeroPaidIsProvenReversal({ verdict: 'NOTHING_REGISTERED' }), true)
+})
