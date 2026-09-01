@@ -1686,9 +1686,11 @@ export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = 
    * `creditPlacement` — it is the same unit as the figure — so the basis flag stays true while the
    * credit sits unsubtracted. Reading completeness off the basis alone would publish the period
    * revenue as EXACT with a credit note missing from it. Existence is decided by the AMOUNTS here
-   * because that is what "reached no row" means — but per basis, never from a cross-basis sum, or a
-   * negative discount credit on one basis silently cancels a real credit on another and restores
-   * the exactness claim this whole mechanism exists to withhold. See `offRowCreditSummary`.
+   * because that is what "reached no row" means — but from the INTERVAL those amounts occupy, never
+   * from a sum. A cross-basis sum lets a negative credit on one basis cancel a real one on another;
+   * a per-bucket sum lets two opposite credits on the SAME basis cancel, though their ex-VAT values
+   * need not. Either restores the exactness claim this whole mechanism exists to withhold. See
+   * `offRowCreditSummary`.
    */
   const offRow = offRowCreditSummary(refundsUnattributed, refundsOutsideReport)
   const contributionBound = shareFigureBound({ reportBasisComplete: rowBasisComplete && !offRow.present })
