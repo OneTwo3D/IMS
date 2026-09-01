@@ -1161,14 +1161,15 @@ test('[o3d-rn10] a parent replaced AFTER the anchor accepted it does not redirec
     'the attacker directory must still hold a symlink at the name the publisher was entering')
   assert.equal(statSync(join(parent, 'state')).ino, statSync(victim).ino, 'and it must resolve to the victim')
 
-  assert.match(run.stdout, /^rc=0$/m, `the publication must go through, into the directory it pinned: ${run.stderr}`)
-  assert.equal(readFileSync(join(`${parent}.real`, 'state', 'DEPLOY-FENCED'), 'utf8'), 'phase=stopping\n',
-    'and it must land in the operator\'s own directory, which the rename moved but did not replace')
-
+  // THE SECURITY CLAIM FIRST, so a regression names itself: the swap must not have aimed anything.
   assert.equal(readFileSync(join(victim, 'DEPLOY-FENCED'), 'utf8'), 'UNTOUCHED\n',
     'the directory the planted link chose must not be written into')
   assert.deepEqual(readdirSync(victim).sort(), ['DEPLOY-FENCED'],
     'and nothing may be created inside it — no staging directory, no temporary')
+
+  assert.match(run.stdout, /^rc=0$/m, `the publication must go through, into the directory it pinned: ${run.stderr}`)
+  assert.equal(readFileSync(join(`${parent}.real`, 'state', 'DEPLOY-FENCED'), 'utf8'), 'phase=stopping\n',
+    'and it must land in the operator\'s own directory, which the rename moved but did not replace')
 })
 
 /**
