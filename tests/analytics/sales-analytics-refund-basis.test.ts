@@ -854,24 +854,31 @@ test('customer mix: the SAME order costed exactly once still publishes its profi
   assert.equal(inconsistentNotice(report), undefined)
 })
 
-test('customer mix: the costed-quantity tolerance admits the engine’s rounding in BOTH directions (o3d-7jfq)', async () => {
-  // The tolerance is 0.000001 because that is what `consumeFifoLayersStrict` absorbs, and float-to-
-  // Decimal noise has no preferred direction — so the band has to be the same width on each side.
-  // All four points are asserted: a band that only ever withheld would fail the two admitted ones,
-  // and one that never withheld would fail the two rejected ones.
+test('customer mix: the costed-quantity tolerance is a SHORTFALL band, and one storage unit of EXCESS contradicts (o3d-7jfq)', async () => {
+  // The band is 0.000001 because that is what `consumeFifoLayersStrict` absorbs on the way DOWN: it
+  // leaves a residue that small and still treats the movement as costed, so a match tighter than
+  // the engine's would withhold a profit the engine has already ruled complete. UPWARDS it absorbs
+  // nothing — the engine consumes at most the requested quantity, so it cannot produce excess at
+  // all — and 0.000001 is the smallest quantity `Decimal(14,6)` can hold, which is the scale both
+  // `StockMovement.qty` and `CogsEntry.qty` are stored at. An excess of exactly that is therefore a
+  // whole stored unit somebody posted, not noise. All four points are asserted, so neither a rule
+  // that withheld everything nor one that withheld nothing can pass.
   const at = (costedQty: string) => reportForCogsEntries([cogsForDispatch('order-1', 'line-1', costedQty, '30')])
 
-  // OVER by exactly the tolerance: still costed. 100 - 30 = 70.
-  const overAbsorbed = await at('10.000001')
-  assert.equal(overAbsorbed.rows[0]?.grossProfitBase, '70')
-  assert.equal(overAbsorbed.rows[0]?.costEvidence, 'complete')
-
-  // Over by twice it: contradictory, and the same 70 is withheld rather than published.
-  const over = await at('10.000002')
+  // OVER by ONE STORAGE UNIT: the smallest excess the schema can express, and contradictory. The
+  // 70 the entry would support is not published, because the evidence for it contradicts itself.
+  const over = await at('10.000001')
   assert.equal(over.rows[0]?.grossProfitBase, null)
   assert.equal(over.rows[0]?.costEvidence, 'inconsistent')
+  assert.equal(over.totals.costInconsistentRows, '1')
 
-  // SHORT by exactly the tolerance: still costed, unchanged by the new arm.
+  // EXACTLY costed: published. 100 of ex-VAT revenue less 30 of cost = 70.
+  const exact = await at('10')
+  assert.equal(exact.rows[0]?.grossProfitBase, '70')
+  assert.equal(exact.rows[0]?.costEvidence, 'complete')
+
+  // SHORT by exactly the tolerance: still costed, and the same 70 published. The band survives on
+  // the side it belongs to — this is the assertion a blanket `excess.abs().gt(0)` would fail.
   const shortAbsorbed = await at('9.999999')
   assert.equal(shortAbsorbed.rows[0]?.grossProfitBase, '70')
   assert.equal(shortAbsorbed.rows[0]?.costEvidence, 'complete')
@@ -881,6 +888,119 @@ test('customer mix: the costed-quantity tolerance admits the engine’s rounding
   assert.equal(short.rows[0]?.grossProfitBase, null)
   assert.equal(short.rows[0]?.costEvidence, 'incomplete')
   assert.equal(short.totals.costInconsistentRows, '0')
+})
+
+/**
+ * Fifty-one customers, ONE of them contradicted and ranked last.
+ *
+ * Fifty invoice 200 apiece and rank above the contradicted Gamma on 100, so with the smallest page
+ * this report allows (50) Gamma is on page 2 and nothing on page 1 carries the condition.
+ */
+function fiftyCleanCustomersAndOneContradicted(): SalesFulfillmentAnalyticsClient {
+  const clean = Array.from({ length: 50 }, (_, index) => {
+    const n = String(index + 1).padStart(2, '0')
+    return order({
+      id: `order-${n}`,
+      customerId: `cust-${n}`,
+      customerName: `Clean ${n}`,
+      totalBase: '200',
+      taxBase: '0',
+      lines: [{ id: `line-${n}`, productId: `product-${n}`, totalBase: '200', qty: '10' }],
+    })
+  })
+  const gamma = order({ id: 'order-gamma', customerId: 'cust-gamma', customerName: 'Gamma', totalBase: '100', taxBase: '0', lines: [{ id: 'line-gamma', productId: 'product-gamma', totalBase: '100', qty: '10' }] })
+  return {
+    ...baseClient(),
+    salesOrder: { findMany: async () => [...clean, gamma] },
+    stockMovement: {
+      findMany: async () => [
+        ...clean.map((row) => dispatch(row.id, row.lines[0]!.id, row.lines[0]!.productId!, '10')),
+        dispatch('order-gamma', 'line-gamma', 'product-gamma', '10'),
+      ],
+    },
+    cogsEntry: {
+      findMany: async () => [
+        ...clean.map((row) => cogsForDispatch(row.id, row.lines[0]!.id, '10', '30')),
+        // Gamma's ten-unit entry, posted twice: twenty costed units for a ten-unit movement.
+        cogsForDispatch('order-gamma', 'line-gamma', '10', '10'),
+        cogsForDispatch('order-gamma', 'line-gamma', '10', '10'),
+      ],
+    },
+  }
+}
+
+test('customer mix: a contradicted customer OUTSIDE the visible page is NAMED in the notice (o3d-7jfq)', async () => {
+  // The count and the notice are computed over every group; the rows are then paginated. Fifty
+  // clean customers invoice 200 each and Gamma invoices 100, so on the smallest page this report
+  // allows Gamma is alone on page 2 — and an operator reading page 1 is told a customer is
+  // double-posted with nothing in front of them that is. A count cannot answer "which one", which
+  // is the whole reason over-costing was made a status of its own rather than a line in a summary.
+  //
+  // No VAT anywhere, so ex-VAT revenue is the invoiced figure: each clean customer publishes
+  // 200 - 30 = 170, and the period total covers those fifty only, 50 x 170 = 8500. Gamma's row is
+  // withheld — neither the 100 - 10 = 90 one entry would support nor the 100 - 20 = 80 both would.
+  const report = await getCustomerAnalyticsReport({ ...WINDOW, page: 1, pageSize: 50 }, { client: fiftyCleanCustomersAndOneContradicted(), now: NOW })
+
+  assert.equal(report.pageInfo.totalRows, 51)
+  assert.equal(report.pageInfo.totalPages, 2)
+  assert.equal(report.rows.length, 50)
+  // Nothing on this page carries the condition the notice below is about.
+  assert.equal(report.rows.some((row) => row.customerName === 'Gamma'), false)
+  assert.equal(report.rows.some((row) => row.costEvidence === 'inconsistent'), false)
+  assert.equal(report.totals.grossProfitBase, '8500')
+  assert.equal(report.totals.costCapturedRows, '50')
+  assert.equal(report.totals.costInconsistentRows, '1')
+
+  const notice = inconsistentNotice(report)
+  assert.ok(notice, 'the report did not raise the inconsistent-evidence notice')
+  assert.match(notice!, /^1 of 51 customers/)
+  // THE ROUTE FROM THE NOTICE TO THE ROW: the name, which is what the Customer column renders.
+  assert.match(notice!, /highest-ranked first: Gamma\.$/)
+  // And ONLY the affected one. Naming every row would be no list at all at the size that matters.
+  assert.equal(notice!.includes('Clean '), false)
+})
+
+test('customer mix: past the tenth name the notice counts the rest and says where all of them are (o3d-7jfq)', async () => {
+  // Eleven contradicted customers, invoiced 1100 down to 100 so the ranking is Cust 01 first and
+  // Cust 11 last. Each ships ten units on one dispatch and posts its ten-unit entry TWICE, so every
+  // one of them contradicts itself. A notice is one line of prose and a data incident could
+  // contradict hundreds, so it names ten, counts the remainder out loud, and points at the CSV
+  // export — which is built with `paginate: false` and carries costEvidence on every row.
+  const orders = Array.from({ length: 11 }, (_, index) => {
+    const n = String(index + 1).padStart(2, '0')
+    const revenue = String(1200 - (index + 1) * 100)
+    return order({
+      id: `order-${n}`,
+      customerId: `cust-${n}`,
+      customerName: `Cust ${n}`,
+      totalBase: revenue,
+      taxBase: '0',
+      lines: [{ id: `line-${n}`, productId: `product-${n}`, totalBase: revenue, qty: '10' }],
+    })
+  })
+  const client: SalesFulfillmentAnalyticsClient = {
+    ...baseClient(),
+    salesOrder: { findMany: async () => orders },
+    stockMovement: { findMany: async () => orders.map((row) => dispatch(row.id, row.lines[0]!.id, row.lines[0]!.productId!, '10')) },
+    cogsEntry: {
+      findMany: async () => orders.flatMap((row) => [
+        cogsForDispatch(row.id, row.lines[0]!.id, '10', '10'),
+        cogsForDispatch(row.id, row.lines[0]!.id, '10', '10'),
+      ]),
+    },
+  }
+
+  const report = await getCustomerAnalyticsReport(WINDOW, { client, now: NOW })
+
+  assert.equal(report.totals.costInconsistentRows, '11')
+  assert.equal(report.totals.costCapturedRows, '0')
+  const notice = inconsistentNotice(report)
+  assert.ok(notice, 'the report did not raise the inconsistent-evidence notice')
+  assert.match(notice!, /^11 of 11 customers/)
+  assert.match(notice!, /highest-ranked first: Cust 01; Cust 02; Cust 03; Cust 04; Cust 05; Cust 06; Cust 07; Cust 08; Cust 09; Cust 10, and 1 more not named here/)
+  // The eleventh is not named, and the sentence that omits it says where it can be found.
+  assert.equal(notice!.includes('Cust 11'), false)
+  assert.match(notice!, /costEvidence=inconsistent\.$/)
 })
 
 test('customer mix: an incomplete customer and a contradicted one are told apart (o3d-7jfq)', async () => {
