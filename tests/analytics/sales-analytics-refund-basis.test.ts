@@ -92,13 +92,42 @@ function orderRefund(orderId: string, totalBase: string, totalsBasis: string | n
   return { orderId, totalBase: D(totalBase), totalForeign: D(totalBase), totalsBasis }
 }
 
-function cogsByOrderRow(orderId: string, totalCostBase: string) {
-  return { totalCostBase: D(totalCostBase), movement: { referenceId: orderId } }
+/**
+ * The id of the dispatch movement a line's shipment produced.
+ *
+ * Named, not implied. The report matches posted cost to dispatched units MOVEMENT BY MOVEMENT, so a
+ * fixture that can only say "this order carries 40 of cost" cannot express the case that rule
+ * exists for: an order whose every unit shipped and whose lines only PARTLY posted their cost.
+ */
+function dispatchMovementId(orderId: string, lineId: string) {
+  return `mv-${orderId}-${lineId}`
 }
 
 /** One in-window dispatch movement, linked to the sales line it shipped. */
 function dispatch(orderId: string, lineId: string, productId: string, qty: string) {
-  return { qty: D(qty), referenceId: orderId, productId, shipmentLine: { lineId } }
+  return { id: dispatchMovementId(orderId, lineId), qty: D(qty), referenceId: orderId, productId, shipmentLine: { lineId } }
+}
+
+/** A COGS entry costing `qty` units OF ONE NAMED DISPATCH MOVEMENT at `totalCostBase`. */
+function cogsForDispatch(orderId: string, lineId: string, qty: string, totalCostBase: string) {
+  return { totalCostBase: D(totalCostBase), qty: D(qty), movement: { id: dispatchMovementId(orderId, lineId), referenceId: orderId } }
+}
+
+/**
+ * Every dispatch of `orders` costed IN FULL, each order's whole cost carried on its first line.
+ *
+ * The companion to `dispatchedInFull`: a fixture that means "this order is completely costed" now
+ * has to say so at the movement, because that is where the report reads it.
+ */
+function costedInFull(orders: Array<ReturnType<typeof order>>, costByOrder: Record<string, string>) {
+  return {
+    findMany: async () => orders.flatMap((row) => row.lines.map((line, index) => cogsForDispatch(
+      row.id,
+      line.id,
+      line.qty.toString(),
+      index === 0 ? (costByOrder[row.id] ?? '0') : '0',
+    ))),
+  }
 }
 
 /**
@@ -141,7 +170,7 @@ test('customer mix: a full NET credit takes the sale out of net revenue and driv
     ...baseClient(),
     salesOrder: { findMany: async () => ACME_120 },
     stockMovement: dispatchedInFull(ACME_120),
-    cogsEntry: { findMany: async () => [cogsByOrderRow('order-1', '40')] },
+    cogsEntry: costedInFull(ACME_120, { 'order-1': '40' }),
     salesOrderRefund: { findMany: async () => [orderRefund('order-1', '100', 'NET')] },
   }
 
@@ -171,7 +200,7 @@ test('customer mix: a full GROSS credit clears net revenue, and does NOT get con
     ...baseClient(),
     salesOrder: { findMany: async () => ACME_120 },
     stockMovement: dispatchedInFull(ACME_120),
-    cogsEntry: { findMany: async () => [cogsByOrderRow('order-1', '40')] },
+    cogsEntry: costedInFull(ACME_120, { 'order-1': '40' }),
     salesOrderRefund: { findMany: async () => [orderRefund('order-1', '120', 'GROSS')] },
   }
 
@@ -210,7 +239,7 @@ test('customer mix: an order with no posted cost WITHHOLDS gross profit instead 
         dispatch('order-3', 'line-3', 'product-1', '1'),
       ],
     },
-    cogsEntry: { findMany: async () => [cogsByOrderRow('order-1', '40'), cogsByOrderRow('order-3', '5')] },
+    cogsEntry: { findMany: async () => [cogsForDispatch('order-1', 'line-1', '1', '40'), cogsForDispatch('order-3', 'line-3', '1', '5')] },
   }
 
   const report = await getCustomerAnalyticsReport(WINDOW, { client, now: NOW })
@@ -235,7 +264,7 @@ test('customer mix: rows rank on net revenue, and share of revenue is measured o
     ...baseClient(),
     salesOrder: { findMany: async () => RETURNER_AND_KEEPER },
     stockMovement: dispatchedInFull(RETURNER_AND_KEEPER),
-    cogsEntry: { findMany: async () => [cogsByOrderRow('order-1', '0'), cogsByOrderRow('order-2', '0')] },
+    cogsEntry: costedInFull(RETURNER_AND_KEEPER, { 'order-1': '0', 'order-2': '0' }),
     salesOrderRefund: { findMany: async () => [orderRefund('order-1', '100', 'GROSS')] },
   }
 
@@ -257,7 +286,7 @@ test('customer mix: a ratio is bounded by the WHOLE report, not by the row (o3d-
     ...baseClient(),
     salesOrder: { findMany: async () => ACME_AND_BETA },
     stockMovement: dispatchedInFull(ACME_AND_BETA),
-    cogsEntry: { findMany: async () => [cogsByOrderRow('order-1', '0'), cogsByOrderRow('order-2', '0')] },
+    cogsEntry: costedInFull(ACME_AND_BETA, { 'order-1': '0', 'order-2': '0' }),
     // Only Acme carries credit, and it is on the basis the gross figure cannot use.
     salesOrderRefund: { findMany: async () => [orderRefund('order-1', '40', 'NET')] },
   }
@@ -280,7 +309,7 @@ test('customer mix: an exactly-zero credit on the other basis does not degrade t
     ...baseClient(),
     salesOrder: { findMany: async () => ACME_100 },
     stockMovement: dispatchedInFull(ACME_100),
-    cogsEntry: { findMany: async () => [cogsByOrderRow('order-1', '0')] },
+    cogsEntry: costedInFull(ACME_100, { 'order-1': '0' }),
     // Zero is the one amount identical on both bases, so it carries no basis information at all.
     salesOrderRefund: { findMany: async () => [orderRefund('order-1', '0', 'NET'), orderRefund('order-1', '25', 'GROSS')] },
   }
@@ -297,7 +326,7 @@ test('customer mix: AR exposure nets only the credit on UNPAID orders (o3d-kyey)
     ...baseClient(),
     salesOrder: { findMany: async () => ACME_UNPAID_AND_PAID },
     stockMovement: dispatchedInFull(ACME_UNPAID_AND_PAID),
-    cogsEntry: { findMany: async () => [cogsByOrderRow('order-1', '0'), cogsByOrderRow('order-2', '0')] },
+    cogsEntry: costedInFull(ACME_UNPAID_AND_PAID, { 'order-1': '0', 'order-2': '0' }),
     salesOrderRefund: {
       findMany: async () => [
         orderRefund('order-1', '30', 'GROSS'), // unpaid: reduces what is owed
@@ -551,7 +580,7 @@ test('customer mix: AR exposure is bounded by the credit it could not apply (o3d
     ...baseClient(),
     salesOrder: { findMany: async () => ACME_120_UNPAID },
     stockMovement: dispatchedInFull(ACME_120_UNPAID),
-    cogsEntry: { findMany: async () => [cogsByOrderRow('order-1', '0')] },
+    cogsEntry: costedInFull(ACME_120_UNPAID, { 'order-1': '0' }),
     salesOrderRefund: { findMany: async () => [orderRefund('order-1', '100', 'NET')] },
   }
 
@@ -582,7 +611,7 @@ test('customer mix: a PARTIALLY dispatched order withholds gross profit — a pa
     ...baseClient(),
     salesOrder: { findMany: async () => orders },
     stockMovement: { findMany: async () => [dispatch('order-1', 'line-1', 'product-1', '1')] },
-    cogsEntry: { findMany: async () => [cogsByOrderRow('order-1', '4')] },
+    cogsEntry: { findMany: async () => [cogsForDispatch('order-1', 'line-1', '1', '4')] },
   }
 
   const report = await getCustomerAnalyticsReport(WINDOW, { client, now: NOW })
@@ -611,7 +640,7 @@ test('customer mix: a FULLY dispatched order still publishes, and an explicit ze
     ...baseClient(),
     salesOrder: { findMany: async () => orders },
     stockMovement: { findMany: async () => [dispatch('order-1', 'line-1', 'product-1', '10')] },
-    cogsEntry: { findMany: async () => [cogsByOrderRow('order-1', '0')] },
+    cogsEntry: { findMany: async () => [cogsForDispatch('order-1', 'line-1', '10', '0')] },
   }
 
   const report = await getCustomerAnalyticsReport(WINDOW, { client, now: NOW })
@@ -620,6 +649,129 @@ test('customer mix: a FULLY dispatched order still publishes, and an explicit ze
   assert.equal(report.rows[0]?.grossProfitBase, '100')
   assert.equal(report.rows[0]?.costCaptured, true)
   assert.equal(report.totals.costCapturedRows, '1')
+})
+
+// ---------------------------------------------------------------------------------------------
+// Customer Mix: COVERAGE IS NOT COSTEDNESS — the mirror of the partial-dispatch defect
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Two lines, BOTH shipped in full inside the window, and only one of them posts a cost.
+ *
+ * Ex-VAT revenue 240 - 40 = 200. line-1 is ten units at an ex-VAT 120 and line-2 is five units at
+ * an ex-VAT 80; the movements for both are in the window, so `orderCostCoverage` answers `covered`.
+ * The order carries a COGS entry, so "does any cost exist?" answers yes as well.
+ */
+const COVERED_BUT_HALF_COSTED = [order({
+  id: 'order-1', customerId: 'cust-1', customerName: 'Acme', totalBase: '240', taxBase: '40',
+  lines: [
+    { id: 'line-1', productId: 'product-1', totalBase: '120', qty: '10' },
+    { id: 'line-2', productId: 'product-2', totalBase: '80', qty: '5' },
+  ],
+})]
+
+test('customer mix: every unit shipped but only one line posted its cost — no profit from a PARTIAL cost (o3d-7jfq)', async () => {
+  const client: SalesFulfillmentAnalyticsClient = {
+    ...baseClient(),
+    salesOrder: { findMany: async () => COVERED_BUT_HALF_COSTED },
+    stockMovement: dispatchedInFull(COVERED_BUT_HALF_COSTED),
+    // line-1's ten units cost 60. line-2's five units — dispatched, in the window — cost NOTHING,
+    // because no entry names its movement. That is the whole fixture.
+    cogsEntry: { findMany: async () => [cogsForDispatch('order-1', 'line-1', '10', '60')] },
+  }
+
+  const report = await getCustomerAnalyticsReport(WINDOW, { client, now: NOW })
+  const row = report.rows[0]!
+
+  // Revenue is untouched — this rule withholds a PROFIT, it does not restate revenue.
+  assert.equal(row.revenueBase, '240')
+  assert.equal(row.netRevenueExVatBase, '200')
+  // `coverage === 'covered' && cogsByOrder.has(order.id)` published 200 - 60 = 140 here: five units'
+  // cost treated as zero because ONE other line happened to post one. 140 is not a profit, it is a
+  // cost that is 40 short wearing a profit's name.
+  assert.equal(row.grossProfitBase, null)
+  assert.equal(row.grossProfitBaseBound, 'indeterminate')
+  assert.equal(row.costCaptured, false)
+  assert.equal(report.totals.grossProfitBase, '0')
+  assert.equal(report.totals.costCapturedRows, '0')
+})
+
+test('customer mix: the SAME order with both lines costed publishes its profit (o3d-7jfq)', async () => {
+  // The counterweight, on the identical fixture: the rule above must not be satisfiable by
+  // withholding everything with two lines on it. line-1's ten units cost 60 and line-2's five cost
+  // 40, so every dispatched unit is a costed unit.
+  const client: SalesFulfillmentAnalyticsClient = {
+    ...baseClient(),
+    salesOrder: { findMany: async () => COVERED_BUT_HALF_COSTED },
+    stockMovement: dispatchedInFull(COVERED_BUT_HALF_COSTED),
+    cogsEntry: {
+      findMany: async () => [
+        cogsForDispatch('order-1', 'line-1', '10', '60'),
+        cogsForDispatch('order-1', 'line-2', '5', '40'),
+      ],
+    },
+  }
+
+  const report = await getCustomerAnalyticsReport(WINDOW, { client, now: NOW })
+
+  // 200 of ex-VAT revenue less 60 + 40 = 100 of cost.
+  assert.equal(report.rows[0]?.grossProfitBase, '100')
+  assert.equal(report.rows[0]?.costCaptured, true)
+  assert.equal(report.totals.grossProfitBase, '100')
+  assert.equal(report.totals.costCapturedRows, '1')
+})
+
+test('customer mix: a dispatch costed for PART of its quantity is not a costed dispatch (o3d-7jfq)', async () => {
+  // One line, one movement, so no other line can be blamed: ten units shipped in the window and the
+  // entry against that movement costs FOUR of them. Presence of an entry is what the DB's own
+  // COGS-evidence guard checks, and presence is exactly what this fixture has — so a rule written
+  // as "every dispatch has an entry" would wave it through and publish 100 - 24 = 76.
+  const orders = [order({
+    id: 'order-1', customerId: 'cust-1', customerName: 'Acme', totalBase: '120', taxBase: '20',
+    lines: [{ id: 'line-1', productId: 'product-1', totalBase: '100', qty: '10' }],
+  })]
+  const client: SalesFulfillmentAnalyticsClient = {
+    ...baseClient(),
+    salesOrder: { findMany: async () => orders },
+    stockMovement: { findMany: async () => [dispatch('order-1', 'line-1', 'product-1', '10')] },
+    cogsEntry: { findMany: async () => [cogsForDispatch('order-1', 'line-1', '4', '24')] },
+  }
+
+  const report = await getCustomerAnalyticsReport(WINDOW, { client, now: NOW })
+
+  assert.equal(report.rows[0]?.netRevenueExVatBase, '100')
+  assert.equal(report.rows[0]?.grossProfitBase, null)
+  assert.equal(report.rows[0]?.costCaptured, false)
+})
+
+test('customer mix: the costed-quantity tolerance is the FIFO engine\u2019s, to the micro-unit (o3d-7jfq)', async () => {
+  // `consumeFifoLayersStrict` absorbs a shortfall of at most 0.000001 and throws above it, so a
+  // dispatch costed to within that IS costed and one costed less is not. Both sides are asserted:
+  // a tolerance that only ever withholds would fail the first half, and one that never withholds
+  // would fail the second.
+  const orders = [order({
+    id: 'order-1', customerId: 'cust-1', customerName: 'Acme', totalBase: '120', taxBase: '20',
+    lines: [{ id: 'line-1', productId: 'product-1', totalBase: '100', qty: '10' }],
+  })]
+  const withCostedQty = async (costedQty: string) => {
+    const client: SalesFulfillmentAnalyticsClient = {
+      ...baseClient(),
+      salesOrder: { findMany: async () => orders },
+      stockMovement: { findMany: async () => [dispatch('order-1', 'line-1', 'product-1', '10')] },
+      cogsEntry: { findMany: async () => [cogsForDispatch('order-1', 'line-1', costedQty, '30')] },
+    }
+    return getCustomerAnalyticsReport(WINDOW, { client, now: NOW })
+  }
+
+  // Short by exactly the tolerance: costed. 100 of ex-VAT revenue less 30 of cost = 70.
+  const absorbed = await withCostedQty('9.999999')
+  assert.equal(absorbed.rows[0]?.grossProfitBase, '70')
+  assert.equal(absorbed.rows[0]?.costCaptured, true)
+
+  // Short by twice it: not costed, and the same 70 is withheld rather than published.
+  const short = await withCostedQty('9.999998')
+  assert.equal(short.rows[0]?.grossProfitBase, null)
+  assert.equal(short.rows[0]?.costCaptured, false)
 })
 
 test('customer mix: a unit dispatched AFTER the window does not complete the in-window cost (o3d-kyey)', async () => {
@@ -635,7 +787,7 @@ test('customer mix: a unit dispatched AFTER the window does not complete the in-
     ...baseClient(),
     salesOrder: { findMany: async () => orders },
     stockMovement: { findMany: async () => [dispatch('order-1', 'line-1', 'product-1', '2')] },
-    cogsEntry: { findMany: async () => [cogsByOrderRow('order-1', '20')] },
+    cogsEntry: { findMany: async () => [cogsForDispatch('order-1', 'line-1', '2', '20')] },
   }
 
   const report = await getCustomerAnalyticsReport(WINDOW, { client, now: NOW })
@@ -662,7 +814,7 @@ test('customer mix: a line whose product is gone cannot prove coverage, and fail
     salesOrder: { findMany: async () => orders },
     // The line that DOES have a product shipped in full, so nothing but the orphaned line is at issue.
     stockMovement: { findMany: async () => [dispatch('order-1', 'line-1', 'product-1', '1')] },
-    cogsEntry: { findMany: async () => [cogsByOrderRow('order-1', '25')] },
+    cogsEntry: { findMany: async () => [cogsForDispatch('order-1', 'line-1', '1', '25')] },
   }
 
   const report = await getCustomerAnalyticsReport(WINDOW, { client, now: NOW })
@@ -794,7 +946,7 @@ test('every disclosure a sales-analytics producer emits reaches its CSV — rows
     ...baseClient(),
     salesOrder: { findMany: async () => ACME_100 },
     stockMovement: dispatchedInFull(ACME_100),
-    cogsEntry: { findMany: async () => [cogsByOrderRow('order-1', '10')] },
+    cogsEntry: costedInFull(ACME_100, { 'order-1': '10' }),
     salesOrderRefund: { findMany: async () => [orderRefund('order-1', '10', 'GROSS')] },
   }
   // A margin fixture with credit on BOTH halves: some that reached the product row, and some that
@@ -940,7 +1092,7 @@ test('customer mix: a delivery charge beside a fully dispatched line does NOT wi
     ...baseClient(),
     salesOrder: { findMany: async () => orders },
     stockMovement: { findMany: async () => [dispatch('order-1', 'line-1', 'product-1', '10')] },
-    cogsEntry: { findMany: async () => [cogsByOrderRow('order-1', '40')] },
+    cogsEntry: { findMany: async () => [cogsForDispatch('order-1', 'line-1', '10', '40')] },
   }
 
   const report = await getCustomerAnalyticsReport(WINDOW, { client, now: NOW })
@@ -1002,7 +1154,7 @@ test('customer mix: a VARIABLE line is an UNKNOWN cost, not an absent one, and s
     ...baseClient(),
     salesOrder: { findMany: async () => orders },
     stockMovement: { findMany: async () => [dispatch('order-1', 'line-1', 'product-1', '1')] },
-    cogsEntry: { findMany: async () => [cogsByOrderRow('order-1', '25')] },
+    cogsEntry: { findMany: async () => [cogsForDispatch('order-1', 'line-1', '1', '25')] },
   }
 
   const report = await getCustomerAnalyticsReport(WINDOW, { client, now: NOW })
@@ -1033,7 +1185,7 @@ test('customer mix: a SHORT goods line beside a delivery charge still withholds 
     ...baseClient(),
     salesOrder: { findMany: async () => orders },
     stockMovement: { findMany: async () => [dispatch('order-1', 'line-1', 'product-1', '1')] },
-    cogsEntry: { findMany: async () => [cogsByOrderRow('order-1', '4')] },
+    cogsEntry: { findMany: async () => [cogsForDispatch('order-1', 'line-1', '1', '4')] },
   }
 
   const report = await getCustomerAnalyticsReport(WINDOW, { client, now: NOW })

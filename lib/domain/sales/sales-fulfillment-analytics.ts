@@ -1025,7 +1025,25 @@ export async function getSalesAnalyticsReport(filters: SalesAnalyticsFilters = {
   }
 }
 
-async function loadCogsByOrder(client: SalesFulfillmentAnalyticsClient, window: { dateFrom: Date; dateTo: Date; dateToExclusive: Date }): Promise<Map<string, Prisma.Decimal>> {
+/**
+ * The in-window SALE_DISPATCH cost, TOGETHER WITH WHICH DISPATCH MOVEMENT EACH PART OF IT COSTS.
+ *
+ * The amount alone cannot answer the caller's question. A cost total says a cost was posted; it
+ * cannot say WHICH of the order's dispatches it covers, and an order whose every unit shipped but
+ * whose lines only partly posted their cost produces a perfectly ordinary-looking total. So the
+ * costed QUANTITY is carried per movement beside it, and `ordersWithEveryDispatchCosted` joins the
+ * two populations — these entries and the dispatch movements they hang off — into the only
+ * statement that supports a profit figure: every unit this order dispatched is a unit whose cost
+ * was posted.
+ */
+type OrderDispatchCostEvidence = {
+  /** Cost posted per order, summed over the in-window dispatch entries. */
+  costByOrder: Map<string, Prisma.Decimal>
+  /** Quantity COSTED per dispatch movement — `Σ CogsEntry.qty`, keyed by `movementId`. */
+  costedQtyByMovement: Map<string, Prisma.Decimal>
+}
+
+async function loadCogsByOrder(client: SalesFulfillmentAnalyticsClient, window: { dateFrom: Date; dateTo: Date; dateToExclusive: Date }): Promise<OrderDispatchCostEvidence> {
   const rows = await client.cogsEntry.findMany({
     where: {
       movement: {
@@ -1037,17 +1055,64 @@ async function loadCogsByOrder(client: SalesFulfillmentAnalyticsClient, window: 
     },
     select: {
       totalCostBase: true,
-      movement: { select: { referenceId: true } },
+      qty: true,
+      movement: { select: { id: true, referenceId: true } },
     },
     take: SOURCE_ROW_LIMIT + 1,
-  }) as Array<{ totalCostBase: DecimalInput; movement: { referenceId: string | null } }>
+  }) as Array<{ totalCostBase: DecimalInput; qty: DecimalInput; movement: { id: string; referenceId: string | null } }>
   assertSourceLimit(rows.length, SOURCE_ROW_LIMIT, 'Sales COGS source rows')
-  const byOrder = new Map<string, Prisma.Decimal>()
+  const costByOrder = new Map<string, Prisma.Decimal>()
+  const costedQtyByMovement = new Map<string, Prisma.Decimal>()
   for (const row of rows) {
+    costedQtyByMovement.set(row.movement.id, (costedQtyByMovement.get(row.movement.id) ?? new Prisma.Decimal(0)).add(toDecimal(row.qty)))
     if (!row.movement.referenceId) continue
-    byOrder.set(row.movement.referenceId, (byOrder.get(row.movement.referenceId) ?? new Prisma.Decimal(0)).add(toDecimal(row.totalCostBase)))
+    costByOrder.set(row.movement.referenceId, (costByOrder.get(row.movement.referenceId) ?? new Prisma.Decimal(0)).add(toDecimal(row.totalCostBase)))
   }
-  return byOrder
+  return { costByOrder, costedQtyByMovement }
+}
+
+/**
+ * THE COSTED-QUANTITY SHORTFALL A DISPATCH MAY CARRY AND STILL COUNT AS COSTED.
+ *
+ * `consumeFifoLayersStrict` (lib/cost-layers) absorbs a FIFO shortfall of at most this, and throws
+ * above it. Using the SAME figure means a movement is treated as costed here exactly when the
+ * costing engine treated it as costed there — a looser tolerance would let a real uncosted
+ * fraction through, and a tighter one would withhold profit for float-to-Decimal noise the engine
+ * has already ruled acceptable.
+ */
+const COSTED_QTY_TOLERANCE = new Prisma.Decimal('0.000001')
+
+/**
+ * The orders whose EVERY in-window dispatch movement is costed for its whole quantity.
+ *
+ * `cogsByOrder.has(orderId)` — the test this replaced — asks whether ANY cost was posted, which is
+ * the missing-cost defect one step along and the exact mirror of what `orderCostCoverage` fixed on
+ * the dispatch side. Coverage proves every ordered unit SHIPPED; this proves every shipped unit was
+ * COSTED. A profit figure needs both, because either one alone lets a real cost be silently treated
+ * as zero: coverage alone accepts an order that shipped in full and posted one line's cost, and
+ * `.has` alone accepts an order that posted one line's cost and shipped nothing else at all.
+ *
+ * Matched at the MOVEMENT, not summed per order. The sum would let one over-costed movement cover
+ * another's shortfall — and while the FIFO engine never consumes more than a movement's quantity,
+ * relying on that is relying on the writer whose output this function exists to check.
+ *
+ * Kit-safe by construction: both quantities are the MOVEMENT's own, so the parent-vs-component unit
+ * mismatch that `loadInWindowDispatchedQtyByLine` has to convert around never arises here.
+ */
+function ordersWithEveryDispatchCosted(
+  dispatchMovements: InWindowDispatchMovement[],
+  costedQtyByMovement: Map<string, Prisma.Decimal>,
+): Set<string> {
+  const orders = new Set<string>()
+  const shortOrders = new Set<string>()
+  for (const movement of dispatchMovements) {
+    if (!movement.orderId) continue
+    orders.add(movement.orderId)
+    const costed = costedQtyByMovement.get(movement.id) ?? new Prisma.Decimal(0)
+    if (toDecimal(movement.qty).sub(costed).gt(COSTED_QTY_TOLERANCE)) shortOrders.add(movement.orderId)
+  }
+  for (const orderId of shortOrders) orders.delete(orderId)
+  return orders
 }
 
 export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters = {}, deps?: SalesFulfillmentAnalyticsDeps): Promise<SalesAnalyticsReport<CustomerReportRow>> {
@@ -1055,14 +1120,16 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
   const generatedAt = nowFromDeps(deps)
   const baseCurrency = await baseCurrencyFromDeps(deps)
   const window = period(filters, generatedAt)
-  const [orders, cogsByOrder] = await Promise.all([
+  const [orders, { costByOrder: cogsByOrder, costedQtyByMovement }] = await Promise.all([
     loadSalesOrders(client, filters, window),
     loadCogsByOrder(client, window),
   ])
   assertSourceLimit(orders.length, SOURCE_ROW_LIMIT, 'Customer analytics source orders')
   // What each line actually shipped inside the window — the evidence that the cost posted for an
   // order covers the revenue this report measures it against. See `orderCostCoverage`.
-  const dispatchedQtyByLine = await loadInWindowDispatchedQtyByLine(client, window, orders, 'Customer analytics')
+  const { byLine: dispatchedQtyByLine, dispatchMovements } = await loadInWindowDispatchedQtyByLine(client, window, orders, 'Customer analytics')
+  // ...and, from the SAME movements, which orders had every one of those dispatches costed.
+  const fullyCostedOrders = ordersWithEveryDispatchCosted(dispatchMovements, costedQtyByMovement)
   // As in Sales Analytics: an order cohort, so ALL of these orders' credit counts, whenever raised.
   const refunds = await loadOrderRefunds(client, orders.map((order) => order.id))
   const refundsByOrder = new Map<string, OrderRefundRow[]>()
@@ -1132,7 +1199,17 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
     // question the figure needs is whether the cost is COMPLETE for the revenue being measured, and
     // that is `orderCostCoverage`: every dispatchable ordered unit shipped inside the window.
     //
-    // AND `.has` IS NOT THE RIGHT SECOND HALF FOR EVERY ORDER EITHER. A service-only order — one
+    // COVERAGE IS ONLY HALF OF IT, AND `.has` WAS STILL THE OTHER HALF UNTIL NOW. Coverage proves
+    // every ordered unit was DISPATCHED; `.has` then proved only that the order carries at least
+    // one COGS row. An order whose every unit shipped but whose lines only PARTLY posted their cost
+    // satisfies both — and publishes a profit built from part of its cost, which is the same defect
+    // as the `?? 0` and the partial dispatch, arrived at from the third side. Nothing about a cost
+    // TOTAL can rule it out: the total is the thing that is short. So the second half now matches
+    // the posted cost to the DISPATCHED UNITS it is being set against, movement by movement —
+    // `ordersWithEveryDispatchCosted`. It subsumes `.has`: an order that is `covered` dispatched at
+    // least one unit, and a costed dispatch has a COGS entry by construction.
+    //
+    // AND NEITHER IS THE RIGHT SECOND HALF FOR EVERY ORDER. A service-only order — one
     // whose lines are all NON_INVENTORY — has no COGS entry BY DESIGN, so requiring one would
     // withhold that customer's profit permanently for an order whose cost is a known zero. That is
     // `nothing-to-dispatch`, and it is complete on its own evidence. The `?? 0` there is not the
@@ -1141,8 +1218,11 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
     const coverage = orderCostCoverage(order, dispatchedQtyByLine)
     if (coverage === 'nothing-to-dispatch') {
       current.cogs = current.cogs.add(cogsByOrder.get(order.id) ?? new Prisma.Decimal(0))
-    } else if (coverage === 'covered' && cogsByOrder.has(order.id)) {
-      current.cogs = current.cogs.add(cogsByOrder.get(order.id)!)
+    } else if (coverage === 'covered' && fullyCostedOrders.has(order.id)) {
+      // `?? 0` is sound HERE and nowhere else in this block: membership of `fullyCostedOrders`
+      // requires a costed dispatch movement, so an absent total would be an order whose entries
+      // cost a positive quantity at no cost at all — a genuine zero, not an unknown.
+      current.cogs = current.cogs.add(cogsByOrder.get(order.id) ?? new Prisma.Decimal(0))
     } else {
       current.costCaptured = false
     }
@@ -1395,18 +1475,24 @@ export function computeInWindowDispatchedQtyByLine(
 /**
  * The in-window dispatched quantity of every line of `orders`, keyed `${lineId}|${productId}`.
  *
- * ONE loader for the two questions that both need it, so they cannot drift on what "dispatched in
- * this window" means: Gross Margin PRORATES a line's revenue to it, and Customer Mix asks whether
- * the cost posted for an order covers the revenue that order is publishing (see
- * `orderCostCoverage`). Both are the same measurement — how much of what was ordered was
- * actually shipped, and therefore costed, inside the period being reported.
+ * ONE loader for the questions that all need it, so they cannot drift on what "dispatched in this
+ * window" means: Gross Margin PRORATES a line's revenue to it, and Customer Mix asks whether the
+ * cost posted for an order covers the revenue that order is publishing (see `orderCostCoverage`).
+ * Both are the same measurement — how much of what was ordered was actually shipped, and therefore
+ * costed, inside the period being reported.
+ *
+ * The unaggregated movements come back beside the map for the third question, which the aggregate
+ * cannot answer: whether each of those dispatches actually posted its cost
+ * (`ordersWithEveryDispatchCosted`).
  */
+type InWindowDispatchMovement = { id: string; orderId: string | null; qty: DecimalInput }
+
 async function loadInWindowDispatchedQtyByLine(
   client: SalesFulfillmentAnalyticsClient,
   window: { dateFrom: Date; dateTo: Date; dateToExclusive: Date },
   orders: SalesOrderRow[],
   sourceLabel: string,
-): Promise<Map<string, Prisma.Decimal>> {
+): Promise<{ byLine: Map<string, Prisma.Decimal>; dispatchMovements: InWindowDispatchMovement[] }> {
   // In-window dispatch movements carry the line-granularity link (scjz.51/4pz6).
   const dispatchRows = await client.stockMovement.findMany({
     where: {
@@ -1414,9 +1500,9 @@ async function loadInWindowDispatchedQtyByLine(
       referenceType: 'SalesOrder',
       createdAt: { gte: window.dateFrom, lt: window.dateToExclusive },
     },
-    select: { qty: true, referenceId: true, productId: true, shipmentLine: { select: { lineId: true } } },
+    select: { id: true, qty: true, referenceId: true, productId: true, shipmentLine: { select: { lineId: true } } },
     take: SOURCE_ROW_LIMIT + 1,
-  }) as Array<{ qty: DecimalInput; referenceId: string | null; productId: string; shipmentLine: { lineId: string } | null }>
+  }) as Array<{ id: string; qty: DecimalInput; referenceId: string | null; productId: string; shipmentLine: { lineId: string } | null }>
   assertSourceLimit(dispatchRows.length, SOURCE_ROW_LIMIT, `${sourceLabel} dispatch source rows`)
   // o3d-7r6x: a KIT line's dispatch movements are denominated in leaf components, the line in
   // parent units. Resolve each line's component requirements so the linked dispatch can be
@@ -1435,21 +1521,28 @@ async function loadInWindowDispatchedQtyByLine(
       )
     }
   }
-  return computeInWindowDispatchedQtyByLine(
-    dispatchRows.map((row) => ({
-      orderId: row.referenceId,
-      productId: row.productId,
-      qty: row.qty,
-      shipmentLineLineId: row.shipmentLine?.lineId ?? null,
-    })),
-    orders.flatMap((order) => order.lines.map((line) => ({
-      id: line.id,
-      orderId: order.id,
-      productId: line.productId,
-      qty: line.qty,
-    }))),
-    requirementsByLine,
-  )
+  return {
+    byLine: computeInWindowDispatchedQtyByLine(
+      dispatchRows.map((row) => ({
+        orderId: row.referenceId,
+        productId: row.productId,
+        qty: row.qty,
+        shipmentLineLineId: row.shipmentLine?.lineId ?? null,
+      })),
+      orders.flatMap((order) => order.lines.map((line) => ({
+        id: line.id,
+        orderId: order.id,
+        productId: line.productId,
+        qty: line.qty,
+      }))),
+      requirementsByLine,
+    ),
+    // The SAME rows, unaggregated. `ordersWithEveryDispatchCosted` has to ask about each movement
+    // individually, and the per-line map has already added them up — so the population that
+    // establishes coverage and the population that establishes costedness are one query, and can
+    // never drift on what "dispatched in this window" means.
+    dispatchMovements: dispatchRows.map((row) => ({ id: row.id, orderId: row.referenceId, qty: row.qty })),
+  }
 }
 
 /**
@@ -1503,7 +1596,7 @@ async function loadInWindowDispatchedQtyByLine(
  * introduced to preserve.
  */
 type OrderCostCoverage =
-  /** Every dispatchable unit shipped in the window. The caller still needs a posted cost. */
+  /** Every dispatchable unit shipped in the window. The caller must still prove they were COSTED. */
   | 'covered'
   /** Nothing on this order could ever dispatch or post a cost. Complete, at zero, on its own. */
   | 'nothing-to-dispatch'
@@ -1590,7 +1683,7 @@ export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = 
     take: SOURCE_ROW_LIMIT + 1,
   }) as MarginRefundLineRow[]
   assertSourceLimit(marginRefundLines.length, SOURCE_ROW_LIMIT, 'Margin analytics refund source rows')
-  const dispatchedQtyByLine = await loadInWindowDispatchedQtyByLine(client, window, orders, 'Margin analytics')
+  const { byLine: dispatchedQtyByLine } = await loadInWindowDispatchedQtyByLine(client, window, orders, 'Margin analytics')
   type MarginGroup = MarginReportRow & { revenue: Prisma.Decimal; cogs: Prisma.Decimal; credits: CreditBuckets; lineIds: Set<string> }
   const emptyMarginGroup = (productId: string, sku: string, productName: string, categoryName: string | null): MarginGroup => ({
     productId,
