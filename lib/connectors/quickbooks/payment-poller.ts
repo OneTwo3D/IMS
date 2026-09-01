@@ -13,7 +13,9 @@ import {
   readPaidProvenanceVerdicts,
 } from '@/lib/domain/accounting/payment-reversal'
 import {
+  parseLedgerAmount,
   zeroPaidIsProvenReversal,
+  PAYMENT_PRESENT_EPSILON,
   type LedgerReadFence,
   type RegisteredPaymentVerdict,
 } from '@/lib/connectors/xero/invoice-delta'
@@ -64,6 +66,50 @@ type QboQueryResponse<T> = {
 type QboEntityId = { Id: string }
 
 /**
+ * o3d-psrx r8 (Codex HIGH 2) — WHAT THE LEDGER SAYS IT STILL HOLDS ON A DOCUMENT, AND WHETHER IT SAID.
+ *
+ * `paid` is `TotalAmt - Balance`, in the document's own currency; NULL when either figure could not be
+ * read. NULL IS NOT ZERO — see the verdict this feeds.
+ *
+ * NO NEW QUICKBOOKS CALL EXISTS TO MAKE THIS. `qboQuery` issues `SELECT * FROM <entity> WHERE ...`, so
+ * `Balance` and `TotalAmt` are already in the very responses the reversal reads take; the only thing
+ * that was missing was reading them. That matters beyond tidiness: an evidence gate that needed an
+ * extra round trip per document would be one the poller could skip under rate limiting, and a gate
+ * that can be skipped is not a gate.
+ */
+export type QboLedgerAmount = { paid: number | null; total: number | null }
+
+type QboAmountRow = { Id: string; Balance?: unknown; TotalAmt?: unknown }
+
+/**
+ * The document's current paid amount as QuickBooks states it, from one row of a reversal read.
+ *
+ * `Balance` and `TotalAmt` are read through `parseLedgerAmount` — the SAME reader Xero's amount
+ * partition uses — so a string figure, a missing one and an unparseable one all get the answer the
+ * other connector already gives them, rather than a second dialect of "is this a number".
+ */
+export function qboLedgerAmount(row: QboAmountRow): QboLedgerAmount {
+  const total = parseLedgerAmount(row.TotalAmt)
+  const balance = parseLedgerAmount(row.Balance)
+  return { total, paid: total === null || balance === null ? null : total - balance }
+}
+
+/**
+ * A VOIDED document holds nothing, and that is a fact about the document rather than a subtraction.
+ *
+ * QuickBooks voids by ZEROING (`TotalAmt = 0`), which is how both reversal reads recognise it, so
+ * there is no value left on the document for a payment to be applied to. Stated as its own rule and
+ * not left to `TotalAmt - Balance` because the arithmetic depends on QuickBooks serialising both
+ * fields on a zeroed document — and a payload that omits one would make an unreadable amount out of
+ * the one case that needs no reading, withholding every voided reversal. The IMS treatment of a
+ * voided document (clear `paidAt`, raise NO chargeback — QBO has already reversed the AR) is
+ * unchanged by this round.
+ */
+function qboVoidedAmount(): QboLedgerAmount {
+  return { paid: 0, total: 0 }
+}
+
+/**
  * Split the QBO transactions that regressed out of the fully-paid state into the
  * full reversed set and the subset that was VOIDED. Mirrors the Xero poller's
  * {all, voided} contract (audit-M-acct #3 / scjz.71):
@@ -96,7 +142,7 @@ export function classifyQboReversals(
 async function fetchReversedEntityIds(
   entity: 'Invoice' | 'Bill',
   since: string,
-): Promise<{ all: Set<string>; voided: Set<string>; ledgerObservedBefore: LedgerReadFence | null } | null> {
+): Promise<{ all: Set<string>; voided: Set<string>; amounts: Map<string, QboLedgerAmount>; ledgerObservedBefore: LedgerReadFence | null } | null> {
   // o3d-psrx r3 — THE FENCE IS MINTED HERE, AND HERE IS BEFORE THE LEDGER IS ASKED.
   //
   // It is read inside this function rather than by the caller for one reason: the ordering that makes
@@ -106,13 +152,18 @@ async function fetchReversedEntityIds(
   // reversal that has a registration to weigh.
   const ledgerObservedBefore = await readDatabaseLedgerFence()
   const [balanceRes, voidedRes] = await Promise.all([
-    qboQuery<QboQueryResponse<QboEntityId>>(entity, `Balance > '0' AND MetaData.LastUpdatedTime > '${since}'`),
-    qboQuery<QboQueryResponse<QboEntityId>>(entity, `TotalAmt = '0' AND MetaData.LastUpdatedTime > '${since}'`),
+    qboQuery<QboQueryResponse<QboAmountRow>>(entity, `Balance > '0' AND MetaData.LastUpdatedTime > '${since}'`),
+    qboQuery<QboQueryResponse<QboAmountRow>>(entity, `TotalAmt = '0' AND MetaData.LastUpdatedTime > '${since}'`),
   ])
   if (!balanceRes.ok || !voidedRes.ok) return null
   const balanceDue = balanceRes.data?.QueryResponse?.[entity] ?? []
   const voided = voidedRes.data?.QueryResponse?.[entity] ?? []
-  return { ...classifyQboReversals(balanceDue, voided), ledgerObservedBefore }
+  // o3d-psrx r8 (Codex HIGH 2) — the amounts these same rows already carry, kept instead of thrown
+  // away. VOIDED is applied SECOND so a document in both sets is settled by the stronger rule.
+  const amounts = new Map<string, QboLedgerAmount>()
+  for (const row of balanceDue) amounts.set(row.Id, qboLedgerAmount(row))
+  for (const row of voided) amounts.set(row.Id, qboVoidedAmount())
+  return { ...classifyQboReversals(balanceDue, voided), amounts, ledgerObservedBefore }
 }
 
 /**
@@ -137,13 +188,14 @@ async function fetchReversedEntityIds(
 async function fetchReversedEntityIdsByIds(
   entity: 'Invoice' | 'Bill',
   ids: readonly string[],
-): Promise<{ all: Set<string>; voided: Set<string>; returned: Set<string>; ledgerObservedBefore: LedgerReadFence | null } | null> {
+): Promise<{ all: Set<string>; voided: Set<string>; returned: Set<string>; amounts: Map<string, QboLedgerAmount>; ledgerObservedBefore: LedgerReadFence | null } | null> {
   // Minted BEFORE the ledger is asked, for the reason `fetchReversedEntityIds` gives: the ordering is
   // PROGRAM ORDER, and one fence covering several batches only ever decides FEWER registrations.
   const ledgerObservedBefore = await readDatabaseLedgerFence()
   const balanceDue: QboEntityId[] = []
   const voided: QboEntityId[] = []
   const returned = new Set<string>()
+  const amounts = new Map<string, QboLedgerAmount>()
   for (let i = 0; i < ids.length; i += WITHHELD_RECHECK_BATCH) {
     const batch = ids.slice(i, i + WITHHELD_RECHECK_BATCH)
     // Single-quoted ids, and ids that could break out of the quoting are refused rather than escaped:
@@ -158,11 +210,15 @@ async function fetchReversedEntityIdsByIds(
     for (const row of res.data?.QueryResponse?.[entity] ?? []) {
       returned.add(row.Id)
       // The same two predicates the delta read expresses as `Balance > '0'` and `TotalAmt = '0'`.
+      const isVoided = typeof row.TotalAmt === 'number' && row.TotalAmt === 0
       if (typeof row.Balance === 'number' && row.Balance > 0) balanceDue.push({ Id: row.Id })
-      if (typeof row.TotalAmt === 'number' && row.TotalAmt === 0) voided.push({ Id: row.Id })
+      if (isVoided) voided.push({ Id: row.Id })
+      // o3d-psrx r8: and the amounts, from the row this loop is already holding. Voided by its own
+      // rule for the reason `qboVoidedAmount` gives.
+      amounts.set(row.Id, isVoided ? qboVoidedAmount() : qboLedgerAmount(row))
     }
   }
-  return { ...classifyQboReversals(balanceDue, voided), returned, ledgerObservedBefore }
+  return { ...classifyQboReversals(balanceDue, voided), returned, amounts, ledgerObservedBefore }
 }
 
 /**
@@ -190,10 +246,45 @@ async function fetchReversedEntityIdsByIds(
  * receipt behind it (PAID_WITHOUT_LEDGER_RECEIPT), a local receipt not yet registered
  * (RECEIPT_NOT_REGISTERED), and a registration this read cannot speak for (REGISTRATION_UNDECIDED).
  *
- * A RESIDUAL THIS DOES NOT CLOSE, stated so nobody reads it as closed: `Balance > 0` covers a PART
- * payment as well as a removed one, and this poller does not read the amounts to tell them apart.
- * Xero's poller does (`partitionPaymentReversals`). That is a different defect from the one Codex
- * found and it is filed separately; nothing here makes it worse.
+ * AND THE RESIDUAL r3 FILED SEPARATELY WAS NOT SEPARATE — IT WAS THE THING THAT MADE THE GATE ADMIT
+ * (r8, Codex HIGH 2).
+ *
+ * r3 wrote here: "`Balance > 0` covers a PART payment as well as a removed one, and this poller does
+ * not read the amounts to tell them apart. Xero's poller does (`partitionPaymentReversals`). That is
+ * a different defect from the one Codex found and it is filed separately; nothing here makes it
+ * worse." Every clause of that is true and the conclusion was wrong, because of what the paragraph
+ * above it says: this poller enumerates nothing, so a document with a posted registration lands on
+ * `LEDGER_DID_NOT_LIST_PAYMENTS` — an ADMITTED verdict. Put the two together and a bill or invoice
+ * with two registrations covering its total, ONE of whose payments was removed, shows a balance due,
+ * reaches the gate, is admitted, and has `paidAt` cleared and a chargeback credit note raised over
+ * it — while QuickBooks is still holding the other payment. The amount reading was not a nicety this
+ * connector lacked; it was the PRECONDITION `zeroPaidIsProvenReversal` is written about, and the
+ * whole reason `LEDGER_DID_NOT_LIST_PAYMENTS` may admit at all is that Xero establishes it upstream
+ * ("the payload withheld `Payments[]`, but it STATED a zero total").
+ *
+ * SO THIS GATE ESTABLISHES IT TOO, FROM EVIDENCE IT ALREADY HAD. `qboQuery` issues `SELECT *`, so
+ * `TotalAmt` and `Balance` are in the very responses the reversal reads already take — no QuickBooks
+ * call is added, and none can be skipped under rate limiting to get around this. A document is asked
+ * the registration question ONLY once QuickBooks has stated that it holds nothing on it; anything
+ * else — a positive paid amount, or an amount the payload would not state — is
+ * `LEDGER_NOT_PROVEN_ZERO_PAID` and withholds.
+ *
+ * WHAT THIS STILL CANNOT DO, said plainly so nobody reads it as more: it establishes that the ledger
+ * holds NOTHING, not WHOSE payment is gone. `GONE` and `STILL_HELD` remain unreachable here, because
+ * the reversal read enumerates no payment ids and this round adds no call to fetch them. A zero-paid
+ * QuickBooks document carrying a bound registration is therefore still `LEDGER_DID_NOT_LIST_PAYMENTS`
+ * and still reverses — which is right, and is the same reading Xero gives a payload with no list and
+ * a stated zero.
+ *
+ * WHAT IT COSTS. A genuine QuickBooks chargeback that removes only PART of the payments on a document
+ * no longer clears `paidAt` by itself. It is not lost: the withheld marker written below brings the
+ * document back on the recheck timer regardless of the delta cursor, so when the rest of the payment
+ * goes the paid amount reaches zero and the next pass reverses it; and until then an operator has a
+ * WARNING naming both figures. Set against the alternative, which is clearing `paidAt` and raising a
+ * FULL chargeback credit note against a document the ledger is still holding money on, this is the
+ * cheaper failure by a wide margin — and it is the reading the Xero poller has always given a
+ * part-paid document ("Not a reversal, and the IMS document must stay paid: clearing it re-arms the
+ * UI over money that has already moved").
  *
  * ONE CORNER OF IT IS NOW CLOSED, and only that corner (r7, Codex HIGH 1). Where the order still
  * carries its off-ledger provenance marker, the SHARED classifier compares what the bound
@@ -217,6 +308,14 @@ export async function gateQboReversalsOnProvenance<T extends { id: string; accou
     registrationType: 'BILL_PAYMENT' | 'INVOICE_PAYMENT'
     referenceType: 'PurchaseInvoice' | 'SalesOrder'
     ledgerObservedBefore: LedgerReadFence | null
+    /**
+     * o3d-psrx r8 (Codex HIGH 2) — WHAT QUICKBOOKS SAYS IT STILL HOLDS, KEYED BY `accountingInvoiceId`.
+     *
+     * Supplied by the reversal read that produced the candidates, from the same response. A document
+     * MISSING from this map is not a document with nothing on it: it is one this read said nothing
+     * about, and it withholds on the same fail-closed reading an absent verdict gets below.
+     */
+    ledgerAmounts: ReadonlyMap<string, QboLedgerAmount>
   },
 ): Promise<QboReversalGate<T>> {
   const gate: QboReversalGate<T> = { admitted: [], withheld: [] }
@@ -230,7 +329,28 @@ export async function gateQboReversalsOnProvenance<T extends { id: string; accou
     ledgerListedPaymentIds: () => null,
   })
   for (const doc of candidates) {
-    const verdict = verdicts.get(doc.id)
+    // o3d-psrx r8 (Codex HIGH 2) — THE PRECONDITION FIRST, AND IT DOMINATES EVERY REGISTRATION
+    // VERDICT. `zeroPaidIsProvenReversal` decides whether a ZERO-PAID document may clear `paidAt`;
+    // asking it about a document that merely shows a balance due is asking a question whose subject
+    // has not been established. Ordered above the registration verdict because it is the cheaper
+    // and the more useful of two withholdings: it names the money QuickBooks is still holding, which
+    // is what an operator has to go and look at, and no registration evidence can make a document
+    // the ledger is still paid on into a proven reversal.
+    const amount = doc.accountingInvoiceId == null ? undefined : params.ledgerAmounts.get(doc.accountingInvoiceId)
+    // `Math.abs`, not `> 0`: a paid amount this code cannot explain is not permission to declare the
+    // payment gone. Exactly the reading `partitionPaymentReversals` gives a negative `AmountPaid`,
+    // through the same epsilon, so "the ledger holds nothing" means one thing across both connectors.
+    const zeroPaidProven = amount != null && amount.paid != null && Math.abs(amount.paid) <= PAYMENT_PRESENT_EPSILON
+    // ONE ADMIT/WITHHOLD DECISION, NOT A SECOND ONE WORDED LIKE IT: the precondition is expressed as
+    // a VERDICT and put through the same `zeroPaidIsProvenReversal` every other answer goes through,
+    // so a connector added next month cannot reach an admitted reversal past a rule stated here.
+    const verdict = zeroPaidProven
+      ? verdicts.get(doc.id)
+      : {
+          verdict: 'LEDGER_NOT_PROVEN_ZERO_PAID' as const,
+          paidAmount: amount?.paid ?? null,
+          documentTotal: amount?.total ?? null,
+        }
     // NO VERDICT IS NOT A PASS. An absence means nothing was decided about this document, and the
     // fail-closed reading of "nothing was decided" is the same one a null fence gets: withhold.
     if (verdict == null) {
@@ -277,6 +397,23 @@ export function qboWithheldReversalReason(verdict: RegisteredPaymentVerdict): st
         + `A balance due is therefore an account of PART of this order; the rest of it was never in `
         + `QuickBooks to be removed. paidAt was LEFT SET and no chargeback credit note was raised. `
         + `Record the remaining receipt, or unwind the order by hand if the payment is genuinely gone.`
+    // o3d-psrx r8 (Codex HIGH 2). The evidence QuickBooks CAN give about a reversal, and it is about
+    // the document rather than about IMS's rows — so the operator's action is different from every
+    // other arm here: go and look at what the ledger is still holding, not at a sync row.
+    case 'LEDGER_NOT_PROVEN_ZERO_PAID':
+      return verdict.paidAmount == null
+        ? 'QuickBooks reported a balance due on this document without stating an amount IMS could '
+          + 'read, so it has not been shown to be holding NOTHING. A balance due on its own does not '
+          + 'establish that the payments IMS registered were removed — a payment that is PART of the '
+          + 'document produces the same balance. paidAt was LEFT SET and no chargeback credit note '
+          + 'was raised. Open the document in QuickBooks to see what is still applied to it.'
+        : `QuickBooks still shows ${verdict.paidAmount} of `
+          + `${verdict.documentTotal == null ? 'this document' : `this document's ${verdict.documentTotal}`} `
+          + 'as PAID, so the balance due is part of the money missing rather than all of it, and IMS '
+          + 'cannot tell from this read which payment survived. Reversing the whole document would '
+          + 'raise a chargeback credit note over money QuickBooks is still holding. paidAt was LEFT '
+          + 'SET. Reconcile the document in QuickBooks; if the rest of the payment goes too, IMS will '
+          + 'reverse it by itself on a later poll.'
     case 'GONE':
     case 'NOTHING_REGISTERED':
     case 'LEDGER_DID_NOT_LIST_PAYMENTS':
@@ -566,6 +703,8 @@ export async function recheckWithheldQboReversals(
       registrationType: 'INVOICE_PAYMENT',
       referenceType: 'SalesOrder',
       ledgerObservedBefore: salesRead.ledgerObservedBefore,
+      // o3d-psrx r8: the amounts from the SAME read that produced these candidates.
+      ledgerAmounts: salesRead.amounts,
     })
     for (const { doc: order, verdict } of gate.withheld) {
       // Rewriting the marker is what RESTARTS the timer, which is what keeps the page a round robin
@@ -595,6 +734,7 @@ export async function recheckWithheldQboReversals(
       registrationType: 'BILL_PAYMENT',
       referenceType: 'PurchaseInvoice',
       ledgerObservedBefore: billsRead.ledgerObservedBefore,
+      ledgerAmounts: billsRead.amounts,
     })
     for (const { doc: bill, verdict } of gate.withheld) {
       stillWithheld.add(withheldEntityKey('PURCHASE_ORDER', bill.poId))
@@ -773,6 +913,7 @@ export async function pollQuickBooksPayments(): Promise<{ salesPaid: number; bil
           registrationType: 'INVOICE_PAYMENT',
           referenceType: 'SalesOrder',
           ledgerObservedBefore: reversedIds.ledgerObservedBefore,
+          ledgerAmounts: reversedIds.amounts,
         },
       )
 
@@ -885,6 +1026,7 @@ export async function pollQuickBooksPayments(): Promise<{ salesPaid: number; bil
         registrationType: 'BILL_PAYMENT',
         referenceType: 'PurchaseInvoice',
         ledgerObservedBefore: reversedIds.ledgerObservedBefore,
+        ledgerAmounts: reversedIds.amounts,
       })
 
       for (const { doc: bill, verdict } of gate.withheld) {

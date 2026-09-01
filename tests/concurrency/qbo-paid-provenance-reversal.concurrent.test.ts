@@ -76,6 +76,22 @@ async function createPaidOrder(
   })
 }
 
+/**
+ * o3d-psrx r8 (Codex HIGH 2) — WHAT QUICKBOOKS SAID IT STILL HOLDS ON EACH DOCUMENT.
+ *
+ * The gate now requires this, and requiring it is the fix: `zeroPaidIsProvenReversal` decides whether
+ * a ZERO-PAID document may clear `paidAt`, and this poller used to hand it documents selected only by
+ * `Balance > 0` — under which a payment PART of which was removed is indistinguishable from one that
+ * is entirely gone.
+ *
+ * The r3/r4 probes below are all about the REGISTRATION half of the gate, so each is given the reading
+ * that actually reaches it: the payment was removed in full and QuickBooks holds nothing. Saying so is
+ * compulsory now, which is the point — before r8 these tests were asserting about a precondition they
+ * had never established, and so was production.
+ */
+const fullyRemoved = (invoiceIds: Iterable<string>, total = 100) =>
+  new Map([...invoiceIds].map((id) => [id, { paid: 0, total }] as const))
+
 test(
   '[o3d-psrx r3] a QuickBooks-polled sale marked paid with no ledger registration is NOT reversed',
   { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
@@ -127,6 +143,7 @@ test(
         registrationType: 'INVOICE_PAYMENT',
         referenceType: 'SalesOrder',
         ledgerObservedBefore: await readDatabaseLedgerFence(),
+        ledgerAmounts: fullyRemoved(regressed),
       },
     )
 
@@ -236,7 +253,12 @@ test(
     assert.equal(candidates.length, 1)
     const gate = await gateQboReversalsOnProvenance(
       detectPaymentReversals(candidates, new Set([invoiceId])),
-      { registrationType: 'INVOICE_PAYMENT', referenceType: 'SalesOrder', ledgerObservedBefore },
+      {
+        registrationType: 'INVOICE_PAYMENT',
+        referenceType: 'SalesOrder',
+        ledgerObservedBefore,
+        ledgerAmounts: fullyRemoved([invoiceId]),
+      },
     )
     assert.deepEqual(gate.withheld, [], 'nothing is withheld once IMS\'s own payment has demonstrably landed')
     assert.deepEqual(gate.admitted.map((d) => d.id), [orderId],
@@ -322,6 +344,7 @@ test(
         registrationType: 'BILL_PAYMENT',
         referenceType: 'PurchaseInvoice',
         ledgerObservedBefore: await readDatabaseLedgerFence(),
+        ledgerAmounts: fullyRemoved([inFlight, control]),
       },
     )
 
@@ -330,5 +353,248 @@ test(
       + 'Paid over a payment in flight, and QuickBooks refuses nothing downstream')
     // THE CONTROL: the same bill with no registration at all is still reversed.
     assert.deepEqual(gate.admitted.map((d) => d.id), [bills[1].id])
+  },
+)
+
+// ---------------------------------------------------------------------------
+// o3d-psrx r8 (Codex HIGH 2) — A BALANCE DUE IS NOT PROOF THE PAYMENTS ARE GONE.
+//
+// THE FINDING. `zeroPaidIsProvenReversal` decides whether a ZERO-PAID document may clear `paidAt`;
+// two of its three admitting arms say so in as many words ("the zero is the whole story", "it STATED
+// a zero total"). Xero establishes that precondition upstream — `partitionPaymentReversals` splits on
+// `AmountPaid` and only `zeroPaid` is asked the registration question. THIS POLLER NEVER DID. Its
+// candidates were documents with `Balance > 0`, it enumerates no payment ids, and so a document
+// carrying a posted registration landed on `LEDGER_DID_NOT_LIST_PAYMENTS`, which ADMITS.
+//
+// Put together: an order settled by TWO registrations, ONE of whose payments is removed, shows a
+// balance due. The classifier sums both historical registrations as full coverage, cannot identify
+// which payment survived, and the gate admitted a FULL chargeback — `paidAt` cleared and a credit
+// note raised over the whole sale — while QuickBooks was still holding the other payment. r3 named
+// this residual in the poller's own header and filed it as a different defect; it was not a different
+// defect, it was the precondition the gate was missing.
+//
+// NO QUICKBOOKS CALL IS MADE ANYWHERE IN THIS FILE, r8 included. The evidence the gate now requires
+// is `TotalAmt - Balance`, which `SELECT *` already returns in the very responses the reversal reads
+// take — so the fix adds no call, and the tests supply that reading directly, exactly as they have
+// always supplied the set of regressed ids.
+//
+// THE CONTROLS ARE THE POINT, as everywhere else in this file. "Withhold whenever there is a balance
+// due" would pass the headline and switch the QuickBooks reversal pass off entirely, so the subject
+// is paired with an order IDENTICAL IN EVERY RESPECT — same total, same two registrations, same
+// absent listing — differing only in what QuickBooks says it still holds.
+// ---------------------------------------------------------------------------
+
+/**
+ * TWO RECEIPTS OF 50 ON ONE 100 ORDER, BOTH REGISTERED AND BOTH POSTED — the shape Codex names.
+ *
+ * Together they cover the order, which is why `addPayment` left `unregisteredPaidAt` NULL on it, and
+ * singly they do not, which is what makes "one of them removed" a state at all.
+ *
+ * A LOCAL `Payment` ROW PER REGISTRATION, and each registration NAMES its own receipt. Both halves are
+ * load-bearing and neither is decoration:
+ *
+ *   the receipts     without them the order is paid with nothing recorded behind it, which is a
+ *                    different population (r2's marker) and not the one this test is about. With them
+ *                    and unnamed, every verdict would be RECEIPT_NOT_REGISTERED — IMS's own silence —
+ *                    and the test would withhold for a reason that has nothing to do with the amount.
+ *   `paymentId`      `accounting_sync_logs_followup_live_unique` keys live rows on the document AND
+ *                    the receipt, so two registrations against one invoice are only a legal state
+ *                    when they settle DIFFERENT receipts. Omitting it does not make a smaller
+ *                    fixture; it makes an impossible one, and the database says so.
+ */
+async function twoPostedHalves(
+  db: Awaited<ReturnType<typeof loadDb>>,
+  orderId: string,
+  invoiceId: string,
+): Promise<void> {
+  const { stampSyncedAtFromDatabaseClock } = await import('@/lib/connectors/xero/synced-at-clock')
+  for (const half of ['A', 'B']) {
+    const receipt = await db.payment.create({
+      data: { orderId, amount: 50, currency: 'GBP', method: 'Card', paidAt: new Date('2026-08-02T09:00:00.000Z') },
+      select: { id: true },
+    })
+    const row = await db.accountingSyncLog.create({
+      data: {
+        connector: 'quickbooks',
+        type: 'INVOICE_PAYMENT',
+        status: 'SYNCED',
+        referenceType: 'SalesOrder',
+        referenceId: orderId,
+        externalTransactionId: `QBO-PAY-${half}-${orderId}`,
+        // The production payload shape, for the reason the r3/r7 fixture above gives at length: a row
+        // that names no document is UNBINDABLE, a row that names no amount is the part-covered case,
+        // and a row that names no receipt leaves that receipt reading as unregistered — any of the
+        // three would move this test onto an arm it does not claim to be testing.
+        payload: { accountingInvoiceId: invoiceId, amount: 50, currency: 'GBP', paymentId: receipt.id },
+      },
+      select: { id: true },
+    })
+    // Never by supplying the columns — migration 20260821090000's trigger refuses a supplied
+    // `syncedAtDatabaseClock`, so a writer outside the scheme destroys provenance rather than forging it.
+    await stampSyncedAtFromDatabaseClock(db, row.id)
+  }
+}
+
+test(
+  '[o3d-psrx r8] a QuickBooks document with a payment still on it is NOT reversed by its balance due',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    const db = await loadDb()
+    const { readQboSalesReversalCandidates, gateQboReversalsOnProvenance } =
+      await import('@/lib/connectors/quickbooks/payment-poller')
+    const { detectPaymentReversals, readDatabaseLedgerFence } =
+      await import('@/lib/domain/accounting/payment-reversal')
+
+    const halfId = probeId()   // QuickBooks removed ONE of the two payments
+    const goneId = probeId()   // QuickBooks removed BOTH
+    const ids = [halfId, goneId]
+    const invoiceOf = new Map(ids.map((id) => [id, `QBO-INV-${id}`]))
+    t.after(async () => {
+      await db.accountingSyncLog.deleteMany({ where: { referenceType: 'SalesOrder', referenceId: { in: ids } } })
+      await db.payment.deleteMany({ where: { orderId: { in: ids } } })
+      await db.salesOrder.deleteMany({ where: { id: { in: ids } } })
+    })
+
+    // NO off-ledger marker on either: this is the population r3's header said the residual was "written
+    // about", and Codex's own note — "The same occurs without a marker". With no marker the r7 coverage
+    // guard cannot run, so the ONLY thing between a balance due and a full chargeback is the amount.
+    for (const id of ids) {
+      await createPaidOrder(db, id, invoiceOf.get(id)!, null)
+      await twoPostedHalves(db, id, invoiceOf.get(id)!)
+    }
+
+    // PRECONDITIONS. Both orders must be in the state the finding is about — two registrations that
+    // together cover the total, both database-stamped before the read, neither carrying a marker.
+    const stamped = await db.accountingSyncLog.findMany({
+      where: { referenceType: 'SalesOrder', referenceId: { in: ids } },
+      select: { referenceId: true, syncedAt: true, syncedAtDatabaseClock: true },
+    })
+    assert.equal(stamped.length, 4, 'each order must carry BOTH registrations, or "one removed" is not a state')
+    for (const row of stamped) {
+      assert.ok(
+        row.syncedAt != null && row.syncedAtDatabaseClock != null
+        && row.syncedAt.getTime() === row.syncedAtDatabaseClock.getTime(),
+        'every registration must be database-stamped, or the verdict is REGISTRATION_UNDECIDED and '
+        + 'both arms would withhold for a reason this test is not about',
+      )
+    }
+
+    const ledgerObservedBefore = await readDatabaseLedgerFence()
+    assert.ok(ledgerObservedBefore != null, 'a null fence decides nothing and this test would be vacuous')
+
+    // THE POLLER'S OWN QUERY, then the gate production feeds on the next line.
+    const candidates = (await readQboSalesReversalCandidates()).filter((c) => ids.includes(c.id))
+    assert.equal(candidates.length, 2, 'both probes must be selected, or the controls prove nothing')
+
+    // WHAT QUICKBOOKS SAID. Both documents show a balance due — the predicate that selected them — and
+    // they differ in NOTHING ELSE but the amount still applied to them.
+    const gate = await gateQboReversalsOnProvenance(
+      detectPaymentReversals(candidates, new Set(invoiceOf.values())),
+      {
+        registrationType: 'INVOICE_PAYMENT',
+        referenceType: 'SalesOrder',
+        ledgerObservedBefore,
+        ledgerAmounts: new Map([
+          // TotalAmt 100, Balance 50: one payment gone, one still applied.
+          [invoiceOf.get(halfId)!, { paid: 50, total: 100 }],
+          // TotalAmt 100, Balance 100: nothing is applied to it any more.
+          [invoiceOf.get(goneId)!, { paid: 0, total: 100 }],
+        ]),
+      },
+    )
+
+    // THE HEADLINE.
+    const withheld = gate.withheld.find((w) => w.doc.id === halfId)
+    assert.ok(withheld,
+      'THE FINDING: QuickBooks is still holding half of this order and the gate reversed the whole of '
+      + 'it — paidAt cleared and a chargeback credit note raised over money the ledger never gave back')
+    assert.deepEqual(withheld.verdict, {
+      verdict: 'LEDGER_NOT_PROVEN_ZERO_PAID', paidAmount: 50, documentTotal: 100,
+    }, 'and it must say WHICH fact was missing, with the figures an operator has to reconcile against')
+    assert.ok(!gate.admitted.some((d) => d.id === halfId))
+
+    // THE CONTROL. Same order, same two registrations, same absent listing, same balance due — and
+    // QuickBooks holds nothing on it. A genuine chargeback must still reverse, or this fix has
+    // disabled the QuickBooks reversal pass rather than narrowed it.
+    assert.ok(gate.admitted.some((d) => d.id === goneId),
+      'a document QuickBooks states it holds NOTHING on is still a proven reversal — the gate narrows '
+      + 'the evidence it demands, it does not switch the pass off')
+    assert.ok(!gate.withheld.some((w) => w.doc.id === goneId))
+
+    // AND NOTHING WAS WRITTEN BY THE GATE ITSELF: it decides, the caller acts.
+    const after = await db.salesOrder.findMany({ where: { id: { in: ids } }, select: { id: true, paidAt: true } })
+    for (const row of after) assert.ok(row.paidAt != null, `${row.id} must still be held as paid by the gate`)
+  },
+)
+
+test(
+  '[o3d-psrx r8] an amount QuickBooks would not state, and a document it did not answer about, both withhold',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    // The two ways the evidence can be ABSENT rather than positive, and the one case that needs no
+    // arithmetic at all. Absence is not zero — the same reading `LEDGER_DID_NOT_LIST_PAYMENTS` gives a
+    // missing `Payments[]` and `databaseStampedCompletion` gives an unvouched timestamp.
+    const db = await loadDb()
+    const { readQboSalesReversalCandidates, gateQboReversalsOnProvenance } =
+      await import('@/lib/connectors/quickbooks/payment-poller')
+    const { detectPaymentReversals, readDatabaseLedgerFence } =
+      await import('@/lib/domain/accounting/payment-reversal')
+
+    const unreadableId = probeId()  // QuickBooks answered, but not with a figure IMS can read
+    const unaskedId = probeId()     // QuickBooks did not answer about this document at all
+    const voidedId = probeId()      // QuickBooks ZEROED the document
+    const ids = [unreadableId, unaskedId, voidedId]
+    const invoiceOf = new Map(ids.map((id) => [id, `QBO-INV-${id}`]))
+    t.after(async () => {
+      await db.accountingSyncLog.deleteMany({ where: { referenceType: 'SalesOrder', referenceId: { in: ids } } })
+      await db.payment.deleteMany({ where: { orderId: { in: ids } } })
+      await db.salesOrder.deleteMany({ where: { id: { in: ids } } })
+    })
+    for (const id of ids) {
+      await createPaidOrder(db, id, invoiceOf.get(id)!, null)
+      await twoPostedHalves(db, id, invoiceOf.get(id)!)
+    }
+
+    const ledgerObservedBefore = await readDatabaseLedgerFence()
+    assert.ok(ledgerObservedBefore != null, 'a null fence decides nothing and this test would be vacuous')
+    const candidates = (await readQboSalesReversalCandidates()).filter((c) => ids.includes(c.id))
+    assert.equal(candidates.length, 3)
+
+    const gate = await gateQboReversalsOnProvenance(
+      detectPaymentReversals(candidates, new Set(invoiceOf.values())),
+      {
+        registrationType: 'INVOICE_PAYMENT',
+        referenceType: 'SalesOrder',
+        ledgerObservedBefore,
+        ledgerAmounts: new Map([
+          // A payload whose figures `parseLedgerAmount` cannot read — `qboLedgerAmount` answers null.
+          [invoiceOf.get(unreadableId)!, { paid: null, total: null }],
+          // `unaskedId` is deliberately ABSENT from this map.
+          // VOIDED: `qboVoidedAmount`, a fact about the document rather than a subtraction.
+          [invoiceOf.get(voidedId)!, { paid: 0, total: 0 }],
+        ]),
+      },
+    )
+
+    const withheld = new Map(gate.withheld.map((w) => [w.doc.id, w.verdict]))
+    assert.deepEqual(withheld.get(unreadableId),
+      { verdict: 'LEDGER_NOT_PROVEN_ZERO_PAID', paidAmount: null, documentTotal: null },
+      'a figure that could not be read is not a figure of zero, and coverage that cannot be '
+      + 'established cannot be established in either direction')
+    assert.deepEqual(withheld.get(unaskedId),
+      { verdict: 'LEDGER_NOT_PROVEN_ZERO_PAID', paidAmount: null, documentTotal: null },
+      'a document this read said NOTHING about is not a document with nothing on it — the same '
+      + 'fail-closed reading an absent verdict and a null fence already get')
+    for (const id of [unreadableId, unaskedId]) {
+      assert.ok(!gate.admitted.some((d) => d.id === id))
+    }
+
+    // THE CONTROL, and it is the one this rule could most easily have broken by accident: a VOIDED
+    // document is zeroed, so there is nothing left on it for a payment to be applied to, and IMS's
+    // handling of it (clear paidAt, raise NO chargeback — QBO already reversed the AR) must be
+    // untouched by an amount rule written about balance-due documents.
+    assert.ok(gate.admitted.some((d) => d.id === voidedId),
+      'a voided document must still reverse — it is the one reading that needs no arithmetic')
+    assert.ok(!gate.withheld.some((w) => w.doc.id === voidedId))
   },
 )

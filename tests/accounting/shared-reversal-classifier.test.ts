@@ -10,7 +10,7 @@ import {
   type RegisteredPaymentRow,
   type XeroInvoice,
 } from '@/lib/connectors/xero/invoice-delta'
-import { qboWithheldReversalReason } from '@/lib/connectors/quickbooks/payment-poller'
+import { qboLedgerAmount, qboWithheldReversalReason } from '@/lib/connectors/quickbooks/payment-poller'
 
 /**
  * o3d-psrx r3 (Codex HIGH) — ONE CASE TABLE, BOTH ENTRY POINTS.
@@ -28,8 +28,17 @@ import { qboWithheldReversalReason } from '@/lib/connectors/quickbooks/payment-p
  *
  * THE QUICKBOOKS COLUMN is the second half. QuickBooks' reversal read enumerates no payments at all, so
  * its listing is always NULL — and null is "absence cannot be established", never "no payments". Every
- * case therefore states what the SAME evidence decides for a connector that cannot enumerate, which is
- * exactly what `gateQboReversalsOnProvenance` acts on.
+ * case therefore states what the SAME evidence decides for a connector that cannot enumerate.
+ *
+ * r8 (Codex HIGH 2) — AND THAT IS NOW THE SECOND HALF OF WHAT THE GATE ACTS ON, NOT THE WHOLE OF IT.
+ * r3 wrote the sentence above as "which is exactly what `gateQboReversalsOnProvenance` acts on", and
+ * that was the defect in one line: this whole table presumes the ledger has already been shown to hold
+ * NOTHING on the document, which is what makes `LEDGER_DID_NOT_LIST_PAYMENTS` an ADMITTED verdict at
+ * all ("the payload withheld the list, but it STATED a zero total"). QuickBooks selected its
+ * candidates on `Balance > 0`, under which a PART-removed payment is indistinguishable from a fully
+ * removed one, and so reached this table without establishing its subject. The gate now proves the
+ * zero first — see `LEDGER_NOT_PROVEN_ZERO_PAID` and the tests for it at the foot of this file — and
+ * only then asks the question this table answers.
  */
 
 const READ_AT = databaseLedgerFence(new Date('2026-08-20T12:00:00.000Z'))
@@ -203,6 +212,11 @@ test('[o3d-psrx r3] every withheld verdict can tell an operator what to do about
     { verdict: 'RECEIPT_NOT_REGISTERED' as const, paymentIds: ['pay_1'] },
     { verdict: 'REGISTRATION_UNDECIDED' as const, entryIds: ['log_1'] },
     { verdict: 'STILL_HELD' as const, paymentIds: ['PAY-1'] },
+    // o3d-psrx r8: the two ways the ledger can fail to show a zero, and they ask the operator for
+    // DIFFERENT things — reconcile a payment that is visibly still applied, versus go and look at a
+    // document whose figures IMS could not read at all.
+    { verdict: 'LEDGER_NOT_PROVEN_ZERO_PAID' as const, paidAmount: 50, documentTotal: 100 },
+    { verdict: 'LEDGER_NOT_PROVEN_ZERO_PAID' as const, paidAmount: null, documentTotal: null },
   ]
   const reasons = withheld.map((v) => qboWithheldReversalReason(v))
   for (const reason of reasons) {
@@ -315,4 +329,84 @@ test('[o3d-psrx r4] the binding narrows the evidence; it never admits a reversal
   // nothing about the binding and would keep passing with the binding deleted.
   assert.ok(changed > 0,
     'rejecting every registration must actually change some verdict, or this test is examining nothing')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-psrx r8 (Codex HIGH 2) — THE PRECONDITION THE TABLE ABOVE PRESUMES.
+//
+// `zeroPaidIsProvenReversal` answers "may a ZERO-PAID document clear `paidAt`". Its subject is not
+// established by any of the evidence in this file: the classifier reads registrations, receipts and
+// provenance, and never an amount the ledger states. Xero established it upstream
+// (`partitionPaymentReversals`, `AmountPaid`); the QuickBooks poller did not, and its candidates were
+// documents showing merely a BALANCE DUE — which a part-removed payment produces exactly as a fully
+// removed one does. So a document with posted registrations landed on LEDGER_DID_NOT_LIST_PAYMENTS,
+// which ADMITS, and a full chargeback was raised while QuickBooks still held some of the money.
+//
+// The wiring — that the QuickBooks gate now proves the zero before asking the question, and that a
+// balance-due document with a surviving payment is withheld while a fully-removed one still reverses
+// — is proved against a real database and the poller's own query in
+// tests/concurrency/qbo-paid-provenance-reversal.concurrent.test.ts. What is pinned HERE is the
+// decision and the arithmetic it rests on.
+// ---------------------------------------------------------------------------
+
+test('[o3d-psrx r8] a ledger not shown to hold nothing is never a proven reversal', () => {
+  for (const paidAmount of [50, 0.01, -25, null]) {
+    assert.equal(
+      zeroPaidIsProvenReversal({ verdict: 'LEDGER_NOT_PROVEN_ZERO_PAID', paidAmount, documentTotal: 100 }),
+      false,
+      `paidAmount=${paidAmount}: a balance due is not proof the payments IMS registered were removed`,
+    )
+  }
+})
+
+test('[o3d-psrx r8] the QuickBooks paid amount is TotalAmt - Balance, and NULL when either will not say', () => {
+  // THE ARITHMETIC IS THE EVIDENCE, and it comes out of the response the reversal read ALREADY takes:
+  // `qboQuery` issues `SELECT *`, so both figures are on the row. No QuickBooks call is added by this
+  // round, which is what stops the gate being something a rate-limited poll can skip.
+  assert.deepEqual(qboLedgerAmount({ Id: '1', TotalAmt: 100, Balance: 50 }), { paid: 50, total: 100 },
+    'one of two payments removed: the ledger is still holding half of this document')
+  assert.deepEqual(qboLedgerAmount({ Id: '1', TotalAmt: 100, Balance: 100 }), { paid: 0, total: 100 },
+    'every payment removed: the zero the admitting arms are written about')
+  // QuickBooks serialises money as a number, but `parseLedgerAmount` is the reader Xero's own amount
+  // partition uses and it accepts the string form — one dialect of "is this a number" across both.
+  assert.deepEqual(qboLedgerAmount({ Id: '1', TotalAmt: '100.00', Balance: '0.00' }), { paid: 100, total: 100 })
+
+  // NULL IS NOT ZERO. Each of these is a payload that did not state a figure this code can use, and
+  // the withheld direction is the only honest one: a document might be holding anything.
+  for (const row of [
+    { Id: '1', TotalAmt: 100 },                     // no Balance
+    { Id: '1', Balance: 50 },                       // no TotalAmt — the by-id read marks it optional
+    { Id: '1', TotalAmt: 100, Balance: 'n/a' },
+    { Id: '1', TotalAmt: null, Balance: 0 },
+    { Id: '1', TotalAmt: 100, Balance: Number.NaN },
+  ]) {
+    assert.equal(qboLedgerAmount(row).paid, null, `must not produce a figure from ${JSON.stringify(row)}`)
+    assert.equal(
+      zeroPaidIsProvenReversal({ verdict: 'LEDGER_NOT_PROVEN_ZERO_PAID', paidAmount: null, documentTotal: null }),
+      false,
+      'and an unreadable figure withholds, rather than falling into an admitting arm by default',
+    )
+  }
+})
+
+test('[o3d-psrx r8] the two ways the zero is unproven do not borrow each other\'s sentence', () => {
+  // WHY THIS IS NOT COVERED BY THE CENSUS ABOVE. That test asserts every withheld verdict gets its
+  // OWN explanation, and it compares whole strings — so two readings of this verdict that share a
+  // sentence and differ only where a figure is interpolated still pass it, distinct and both wrong.
+  // Collapse the branch and the unreadable case reports "QuickBooks still shows null of this document
+  // as PAID", which is not a smaller answer: it is an assertion about money nobody established.
+  const measured = qboWithheldReversalReason({
+    verdict: 'LEDGER_NOT_PROVEN_ZERO_PAID', paidAmount: 50, documentTotal: 100,
+  })
+  assert.match(measured, /\b50\b/, 'a measured amount must name what QuickBooks is still holding')
+  assert.match(measured, /\b100\b/, 'and what it is a part OF, which is the operator\'s next question')
+
+  const unreadable = qboWithheldReversalReason({
+    verdict: 'LEDGER_NOT_PROVEN_ZERO_PAID', paidAmount: null, documentTotal: null,
+  })
+  assert.doesNotMatch(unreadable, /\d|null/i,
+    'an amount that could not be read must not be REPORTED as an amount — the operator is being sent '
+    + 'to look at the document precisely because IMS has no figure for it')
+  assert.match(unreadable, /could not read|not.*read|without stating/i,
+    'and it must say that is why, or the warning is indistinguishable from the measured one')
 })

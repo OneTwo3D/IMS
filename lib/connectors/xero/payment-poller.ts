@@ -232,6 +232,18 @@ function registrationText(verdict: RegisteredPaymentVerdict, reason: WithheldAmo
         + `from. Reversing the whole order here would raise a chargeback credit note over money nobody took `
         + `back. Record the remaining receipt against the order, or reverse it by hand if the payment really `
         + `is gone.`
+    // o3d-psrx r8 (Codex HIGH 2): NOT REACHABLE FROM XERO, and the reason is this poller's own
+    // structure rather than luck. This verdict says "the ledger has not been shown to hold nothing on
+    // this document" — a precondition every admitting arm of `zeroPaidIsProvenReversal` assumes — and
+    // Xero establishes it BEFORE any registration is weighed: `partitionPaymentReversals` reads
+    // `AmountPaid` and only the `zeroPaid` bucket is asked the registration question at all, while
+    // `partPaid` and `unverifiable` get their own withheld reasons above (`WithheldAmountReason`).
+    // The QuickBooks poller had no such split, which is where the verdict came from. Stated rather
+    // than defaulted so that a change making this reachable here is a sentence somebody has to write,
+    // not a generic one somebody gets.
+    case 'LEDGER_NOT_PROVEN_ZERO_PAID':
+      return ` The ledger has not been shown to hold nothing on this document, so the figure it reports `
+        + `is not evidence that a payment was removed.`
     case 'GONE':
       return ''
   }

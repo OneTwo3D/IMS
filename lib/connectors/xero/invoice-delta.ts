@@ -1380,6 +1380,30 @@ export type RegisteredPaymentVerdict =
       registeredTotal: number | null
       documentTotal: number
     }
+  /**
+   * o3d-psrx r8 (Codex HIGH 2) — THE LEDGER HAS NOT BEEN SHOWN TO HOLD NOTHING ON THIS DOCUMENT.
+   *
+   * Every admitting arm of `zeroPaidIsProvenReversal` below rests on ONE unstated precondition: the
+   * ledger's own account of this document is ZERO PAID. That is what makes "IMS registered nothing,
+   * so the zero is the whole story" and "the payload withheld the list, but it STATED a zero total"
+   * sound. It is a fact about the LEDGER's amounts, and it is not established by the classifier —
+   * which reads registrations, receipts and provenance, and never an amount the ledger states.
+   *
+   * Xero establishes it upstream: `partitionPaymentReversals` splits `zeroPaid` from `partPaid` and
+   * `unverifiable` on `AmountPaid`, and only the first is asked this question at all. THE QUICKBOOKS
+   * POLLER DID NOT. Its candidates were invoices with `Balance > 0` — a PART payment and a removed
+   * one look identical in that predicate — and with no listing to enumerate, a document carrying a
+   * posted registration landed on `LEDGER_DID_NOT_LIST_PAYMENTS`, which admits. Two registrations
+   * covering the total, one payment removed: a positive balance, the other payment still held by
+   * QuickBooks, and the whole sale reversed with a chargeback credit note over it.
+   *
+   * So the precondition is now a VERDICT rather than an assumption, and a connector that cannot show
+   * it says so here instead of falling into an admitting arm by default. `paidAmount` is what the
+   * ledger states it still holds, or NULL when the read could not produce a figure — NULL is not
+   * zero, exactly as in `PART_COVERED_OFF_LEDGER`: it is the reason this verdict was reached rather
+   * than a measurement.
+   */
+  | { verdict: 'LEDGER_NOT_PROVEN_ZERO_PAID'; paidAmount: number | null; documentTotal: number | null }
   /** A registration exists whose effect on the ledger this read cannot speak for. */
   | { verdict: 'REGISTRATION_UNDECIDED'; entryIds: string[] }
 
@@ -1680,6 +1704,12 @@ function sumRegisteredAmounts(rows: readonly RegisteredPaymentRow[]): number | n
  *   LEDGER_DID_NOT_LIST_PAYMENTS  the payload withheld `Payments[]`, but it STATED a zero total. An
  *                               aggregate of zero needs no list: if the ledger holds no money at all,
  *                               it is not holding ours either, whatever its id. REVERSAL.
+ *   LEDGER_NOT_PROVEN_ZERO_PAID (r8) — AND THE SENTENCE ABOVE IS WHERE THIS ONE COMES FROM. "It
+ *                               STATED a zero total" is a precondition of the whole admitting side of
+ *                               this table, not a property of the verdict; a caller that hands in a
+ *                               document merely showing a BALANCE DUE has not established it, and a
+ *                               part-removed payment is indistinguishable from a fully removed one in
+ *                               that predicate. WITHHELD.
  *   REGISTRATION_UNDECIDED      THE DEFECT THIS FUNCTION EXISTS FOR. A PENDING, PROCESSING or FAILED
  *                               registration, or one that synced after the read, may have created a
  *                               payment this snapshot never saw. WITHHELD.
@@ -1720,6 +1750,12 @@ export function zeroPaidIsProvenReversal(verdict: RegisteredPaymentVerdict): boo
     // part of the balance. Reversing the whole of it raises a chargeback credit note over the
     // remainder — which no ledger ever held, and so cannot have taken away.
     case 'PART_COVERED_OFF_LEDGER':
+    // o3d-psrx r8 (Codex HIGH 2): the caller has not shown that the ledger holds NOTHING on this
+    // document, which every admitting arm above assumes and only Xero's `partitionPaymentReversals`
+    // was establishing. A balance due is not that proof — it is equally the shape of a payment PART
+    // of which is still held — and reversing on it clears `paidAt` and raises a chargeback credit
+    // note over money the ledger is still holding for us.
+    case 'LEDGER_NOT_PROVEN_ZERO_PAID':
       return false
   }
 }
