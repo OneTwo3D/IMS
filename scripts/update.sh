@@ -1843,6 +1843,7 @@ fsync_path() {
 # `chown -h ${APP_USER}` it runs over ${DATA_DIR}: half this function's targets live under that
 # directory, and a staging directory handed to the service account is not a staging directory.
 PUBLISH_STAGE_DIRNAME=".ims-publish"
+
 # THE TRUSTED ANCESTORS EVERY publish_durable_file() DESTINATION IS REACHED FROM (o3d-rn10).
 #
 # THE FINDING THIS CLOSES, WHICH THE PREVIOUS ROUND LEFT OPEN. Round 2 pinned the destination as a
@@ -2056,60 +2057,6 @@ pin_dir_beneath_root() {
   done
   return 0
 }
-
-# Publish stdin at "$1" so that a SIGKILL or a power loss at any instant leaves either the
-# PREVIOUS durable content or the complete new content, and never a truncated file.
-#
-# `> "$FENCE_FILE"` did the opposite: it truncated the authoritative marker first and filled
-# it afterwards, so a kill in between left an empty or partial marker at the one path the
-# next run reads. Adoption reads an unrecognised phase conservatively as `stopping`, but it
-# read the MISSING schema flag as `false` and released the connection fence — over a schema
-# that may have been half migrated.
-#
-# Same directory, so the rename is a rename and not a copy. Every failure path removes the
-# temporary file and returns non-zero, leaving the last durable marker untouched.
-# OWNERSHIP AND MODE ARE PART OF THE PUBLICATION, NOT A STEP AFTER IT (o3d-2sm1.5 r39, Codex
-# HIGH). ${APP_DIR}/.env has to reach the application account readable, and a `chown` issued AFTER
-# the rename is a second observable state: a crash between the two leaves a complete, correct file
-# the application cannot open. Both are applied to the TEMPORARY file, before the barrier and
-# before the rename, so the name is published once and everything about it is already true.
-# `$2` and `$3` are optional and default to what every earlier caller already got: root's own
-# ownership, since this script runs as root, and mode 0600.
-#
-# AND THE TEMPORARY FILE IS NOT MADE BESIDE ITS TARGET ANY MORE (o3d-czpy). Round 24's CRITICAL
-# was about a root-side write into a directory ${APP_USER} owns, and every one of this function's
-# targets is in such a directory: ${APP_DIR}/.env, ${APP_DIR}/.deploy-meta,
-# ${CUTOVER_STATE_DIR}/DEPLOY-FENCED, the cron backup. `mktemp "${target}.XXXXXX"` is not itself
-# plantable — the name is unpredictable and the create is O_CREAT|O_EXCL — but everything done to
-# it AFTERWARDS is by PATH, and the service user can watch the directory, rename the new entry
-# aside and leave a symlink at the same name. Then the `chmod` chmods their choice, the `chown`
-# hands their choice to them, and the `cat >` writes the application's secrets into it. Three
-# root-side operations aimed by a rename, and no amount of re-checking the path closes it, because
-# the check and the operation are two syscalls.
-#
-# So the temporary lives in a ROOT-OWNED 0700 DIRECTORY the service user cannot write, cannot
-# rename inside, and cannot list. It is created with the same primitives prepare_crontab_lock uses
-# and for the same reasons — plain `mkdir` (which fails with EEXIST on a planted symlink where
-# `mkdir -p` would silently work inside its target), `stat -c %F` (lstat, so a symlink reads as
-# "symbolic link" and is refused), `chown -h` (which cannot dereference) — and it is a SIBLING of
-# the target, so the publication is still a same-filesystem rename.
-#
-# AND THE ONE HOLE THAT LEAVES IS CLOSED BY `cd`, NOT BY ANOTHER CHECK. ${APP_USER} owns the
-# CONTAINING directory, so they can rename ${dir}/.ims-publish aside AFTER it has been verified and
-# put a symlink there; a fourth lstat would race exactly like the first three. `cd` does not: it
-# resolves the path once and the shell then holds a descriptor on that INODE, which no rename can
-# move. Everything below runs relative to that cwd. The verification is therefore made of `.`
-# AFTER the chdir — it asks what this process is actually inside — and it asks for uid ${self} and
-# mode 0700, which is a directory the service user cannot manufacture: they cannot chown anything
-# to root. `%d` is in the same stat so the same answer also proves the rename below is a rename
-# and not a dereferencing cross-device copy.
-#
-# MODE AND OWNER ARE APPLIED BEFORE THE CONTENT, not after it. `.env` is the reason: it carries
-# AUTH_SECRET, SETTINGS_ENCRYPTION_KEY, CRON_SECRET and the database password, and a file that is
-# filled first and restricted second exists, for an instant, with secrets in it at whatever mode
-# the create left. Inside a 0700 root-owned directory nothing can open it either way — which is
-# the belt — but the ordering is the braces, and it costs nothing.
-
 
 # Publish stdin at "$1" so that a SIGKILL or a power loss at any instant leaves either the
 # PREVIOUS durable content or the complete new content, and never a truncated file.
