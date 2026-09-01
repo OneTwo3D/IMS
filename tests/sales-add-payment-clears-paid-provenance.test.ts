@@ -65,7 +65,7 @@ const tx = {
       return { id: 'pay-1', paidAt: args.data.paidAt }
     },
   },
-  salesOrderRefund: { findFirst: async () => null },
+  salesOrderRefund: { findFirst: async (): Promise<{ totalForeign: number } | null> => null },
   fxRate: { findFirst: async () => null },
   activityLog: { create: async () => ({}) },
 }

@@ -272,9 +272,11 @@ const dbDouble: Record<string, unknown> = {
     // the statement asks for its own markers plus (for the legacy owner) the ones written before the
     // key existed. Applied here for real: a double that ignored the predicate would make the
     // cross-connector test vacuous.
-    const [openActions, closedActions, allActions, horizonIso, connector, legacyOwner, limit] =
-      values as [string[], string[], string[], string, string, boolean, number]
-    const horizon = new Date(horizonIso)
+    // o3d-psrx r5 (Codex HIGH 2): NO HORIZON PARAMETER any more. The scan bounds itself by DOCUMENTS,
+    // never by age — an age bound is what let an unresolved reversal be abandoned by an outage longer
+    // than it. The list is positional, so a stale double here would silently mis-read every predicate.
+    const [openActions, closedActions, allActions, connector, legacyOwner, limit] =
+      values as [string[], string[], string[], string, boolean, number]
     const claims = (row: Row): boolean => {
       const meta = row.metadata as { connector?: unknown } | null | undefined
       const owner = typeof meta?.connector === 'string' ? meta.connector : null
@@ -287,7 +289,6 @@ const dbDouble: Record<string, unknown> = {
       if (row.entityId == null) continue
       if (!claims(row)) continue
       const at = row.createdAt as Date
-      if (at.getTime() < horizon.getTime()) continue
       const key = `${String(row.entityType)}:${String(row.entityId)}`
       const held = groups.get(key)
         ?? { entityType: row.entityType, entityId: row.entityId as string, openMax: null, closedMax: null }

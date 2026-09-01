@@ -145,9 +145,12 @@ const dbDouble: Record<string, unknown> = {
       return [{ fence: new Date() }]
     }
     if (!sql.includes('activity_logs')) throw new Error(`unexpected raw statement: ${sql}`)
-    const [openActions, closedActions, allActions, horizonIso, connector, legacyOwner, limit] =
-      values as [string[], string[], string[], string, string, boolean, number]
-    const horizon = new Date(horizonIso)
+    // NO HORIZON PARAMETER (o3d-psrx r5, Codex HIGH 2). The scan bounds itself by DOCUMENTS, never by
+    // age: an age bound is what let an unresolved reversal be abandoned by a poll outage longer than
+    // it. Reading a positional list is why this had to be updated — which is the point of running the
+    // real reduction here rather than stubbing a row set.
+    const [openActions, closedActions, allActions, connector, legacyOwner, limit] =
+      values as [string[], string[], string[], string, boolean, number]
     const groups = new Map<string, { entityType: unknown; entityId: string; openMax: Date | null; closedMax: Date | null }>()
     for (const row of state.activityRows) {
       if (row.tag !== 'sync') continue
@@ -157,7 +160,6 @@ const dbDouble: Record<string, unknown> = {
       const owner = typeof meta?.connector === 'string' ? meta.connector : null
       if (!(owner === connector || (legacyOwner && owner === null))) continue
       const at = row.createdAt as Date
-      if (at.getTime() < horizon.getTime()) continue
       const key = `${String(row.entityType)}:${String(row.entityId)}`
       const held = groups.get(key)
         ?? { entityType: row.entityType, entityId: row.entityId as string, openMax: null, closedMax: null }
