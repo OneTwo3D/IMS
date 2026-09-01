@@ -55,14 +55,24 @@
 -- exists to remove, re-created by its own fix. Round 5 named that hazard in this comment block and
 -- then built the comparison that causes it.
 --
--- WHAT ACTUALLY MARKS A NEW EPISODE IS A TRANSITION THE DATABASE CAN SEE FOR ITSELF: the column going
--- from ABSENT to PRESENT. Nothing a caller supplies is consulted at all.
+-- WHAT ACTUALLY MARKS A NEW EPISODE IS A TRANSITION THE DATABASE CAN SEE FOR ITSELF: the PAID FLAG
+-- going from ABSENT to PRESENT. Nothing a caller supplies is consulted at all.
 --
---   INSERT with a marker            the row arrives already inside an episode. Mint.
---   UPDATE, OLD NULL, NEW non-null  the paid flag has just been set with nothing to register. Mint.
---   UPDATE, OLD non-null            an episode is already under way. THE STORED VALUE STANDS,
---                                   whatever the caller supplied — this is the redelivery case.
---   NEW NULL                        the flag is being cleared. No episode, no fence, nothing to do.
+-- r6 said that transition about THIS COLUMN, and r8 corrects it to `paidAt` — see the arm's own note
+-- below. The two differ on exactly one row of this table, and it is the row a covering receipt
+-- produces:
+--
+--   NEW."paidAt" NULL                    the flag is being cleared. The episode is over: the marker is
+--                                        forced to NULL whether or not the writer named it.
+--   NEW."unregistered_paid_at" NULL      the caller is CLEARING the marker while the flag stands —
+--                                        `addPayment` on coverage. Allowed, and it is the ONLY value
+--                                        a caller may still put in this column.
+--   INSERT with a marker                 the row arrives already inside an episode. Mint.
+--   UPDATE, OLD."paidAt" non-null        an episode is already under way. THE STORED VALUE STANDS,
+--                                        INCLUDING ITS ABSENCE, whatever the caller supplied — this
+--                                        is the redelivery case, before AND after a coverage clear.
+--   UPDATE, OLD."paidAt" NULL            no episode was under way and the flag has just been set with
+--                                        nothing to register. Mint.
 --
 -- AND THE END OF AN EPISODE IS A FACT ABOUT `paidAt`, NOT A COURTESY FROM ITS WRITERS (r7, Codex
 -- HIGH 2).
@@ -99,6 +109,30 @@
 -- restore. Neither is redundant: enforcement without a stated invariant is a rule nobody can find,
 -- and a stated invariant without enforcement is a rule that fails at 3am on a repair script.
 --
+-- AND A MID-EPISODE CLEAR IS NOT THE END OF THE EPISODE (r8, Codex HIGH 1).
+--
+-- r6 and r7 between them made two writes legal that r6's preserve arm could not tell apart, because
+-- it tested the MARKER and the thing that separates them is the FLAG:
+--
+--   the marker cleared, `paidAt` cleared      the episode ENDED. A new fence may be minted.
+--   the marker cleared, `paidAt` standing     a covering receipt was recorded (`addPayment`, r6). The
+--                                             episode is still running and now has a ledger receipt.
+--
+-- r6's arm preserved only an already-non-null marker, so the second row fell through to the mint on
+-- the very next write that named the column — and `updateExistingWcOrderFromPayload` names it on
+-- every webhook redelivery and every `modified_after` poll. The order got a brand-new fence for an
+-- episode it never left, minted AFTER the registration that had just discharged it, and that
+-- registration was unbound permanently. r8's arm therefore preserves OLD whenever `OLD."paidAt"` is
+-- non-null, absence included, and keeps the clearing arm above it so the legitimate clear still runs.
+--
+-- WHAT THAT REFUSES, STATED. A writer that wants to put a marker ON an order whose paid flag already
+-- stands is now silently ignored. No writer in this tree does it — `markSalesOrderPaid` writes the
+-- pair on the unpaid→paid transition, the WooCommerce importer writes `undefined` for an unpaid
+-- payload, and every clear names `paidAt` — and one that did would be asserting that an episode which
+-- began earlier had no ledger receipt behind it, which is a claim about the past that this column,
+-- whose whole job is to be the episode's LOWER BOUND, cannot honestly carry. The way to say it is to
+-- end the episode and begin a new one, which is what a genuine re-payment already does.
+--
 -- A GENUINE RE-PAYMENT STILL MINTS. Ending an episode clears the column — now by the database's own
 -- doing and not only by every writer remembering to, which is the whole of this round's change here.
 -- Paid → unpaid → paid again therefore passes through NULL however the unpaid step was spelt, and the
@@ -126,27 +160,51 @@ BEGIN
     RETURN NEW;
   END IF;
 
-  -- The marker is being cleared while the flag stands — a ledger receipt has been recorded for a paid
+  -- THE MARKER IS BEING CLEARED WHILE THE FLAG STANDS — a ledger receipt has been recorded for a paid
   -- state that had none (`addPayment` on coverage). The episode's fence goes with it.
+  --
+  -- THE ONE VALUE A CALLER MAY STILL PUT IN THIS COLUMN, and it must stay above the preserve arm
+  -- below or it can never take effect: preserving OLD over a deliberate clear would write the marker
+  -- straight back and `addPayment`'s coverage clear would be a no-op. The asymmetry is deliberate and
+  -- it is the safe one — clearing SAYS "this paid flag now has a ledger receipt behind it", which
+  -- makes the reversal reader trust the ledger; nothing may SET a marker on a flag that already
+  -- stands, because that is minting a fence for an episode that began earlier.
   IF NEW."unregistered_paid_at" IS NULL THEN
     RETURN NEW;
   END IF;
 
-  -- AN EPISODE ALREADY UNDER WAY. The stored fence is this episode's own start and nothing later may
-  -- move it: not a WooCommerce redelivery re-sending `date_paid_gmt`, not a repair script, not a
-  -- previous release. The caller's value is discarded and OLD is written back unchanged, so the
-  -- statement is a no-op on this column however it was spelt.
+  -- AN EPISODE ALREADY UNDER WAY. The stored value stands — INCLUDING ITS ABSENCE (r8, Codex HIGH 1).
   --
-  -- `OLD."paidAt" IS NOT NULL` IS WHAT MAKES THIS TRIGGER CORRECT ON ITS OWN (r7). An episode is a
-  -- period during which the flag STANDS, so a marker sitting beside a NULL `paidAt` is not one and is
-  -- not a fence to preserve. Stated plainly: while the CHECK at the foot of this migration stands,
-  -- that state cannot be reached and this clause never fires — the constraint bolts the same door.
-  -- It is here because the two mechanisms must not depend on each other: drop the constraint and the
-  -- trigger still ends the episode; disable the trigger and the constraint still refuses the state.
-  -- A guard that is only correct because a DIFFERENT guard is also present is one deployment away
-  -- from being wrong, and this file's whole subject is guards that turned out to rest on something
-  -- else being true. The test that proves it is not vacuous drops the constraint to reach it.
-  IF TG_OP = 'UPDATE' AND OLD."unregistered_paid_at" IS NOT NULL AND OLD."paidAt" IS NOT NULL THEN
+  -- r7 wrote this arm as `OLD."unregistered_paid_at" IS NOT NULL AND OLD."paidAt" IS NOT NULL`, so it
+  -- preserved only an already-non-null marker and everything else fell through to the mint. THE ARM
+  -- ABOVE IS WHAT MADE THAT WRONG, and r6 is what put it there: `addPayment` legitimately clears this
+  -- column when a receipt comes to COVER an order that was already paid off-ledger, and `paidAt` is
+  -- deliberately left alone by that write because re-stamping it would move a settlement date an
+  -- operator can see. The order is then paid, mid-episode, with NO marker — and the next WooCommerce
+  -- redelivery re-sends `date_paid_gmt` in both columns, finds `OLD."unregistered_paid_at"` NULL,
+  -- skips this arm and MINTS. A fence for an episode that never restarted, minted after the very
+  -- registration that discharged it completed, which unbinds that registration for ever
+  -- (`registrationBindsToPaidState` compares two immutable values, so every recheck repeats the
+  -- answer) and parks the order on PAID_WITHOUT_LEDGER_RECEIPT. That is r4's finding again, reached
+  -- through the door r6's own fix opened.
+  --
+  -- SO THE RULE IS SAID ABOUT `paidAt` AND NOTHING ELSE: while the paid flag STANDS, this column's
+  -- value is settled, and its absence is a value. An episode ends by `paidAt` going NULL — the arm at
+  -- the top of this function, which no writer has to know about — and only then may a new fence be
+  -- minted. Nothing later in an episode moves it: not a WooCommerce redelivery, not a repair script,
+  -- not a previous release across a deploy.
+  --
+  -- `OLD."paidAt" IS NOT NULL` IS WHAT MAKES THIS TRIGGER CORRECT ON ITS OWN (r7, kept in r8). An
+  -- episode is a period during which the flag STANDS, so a marker sitting beside a NULL `paidAt` is
+  -- not one and is not a fence to preserve. While the CHECK at the foot of this migration stands that
+  -- state cannot be reached, so this clause's FALSE branch never fires — the constraint bolts the
+  -- same door. It is here because the two mechanisms must not depend on each other: drop the
+  -- constraint and the trigger still refuses to preserve a dead fence; disable the trigger and the
+  -- constraint still refuses the state. A guard that is only correct because a DIFFERENT guard is also
+  -- present is one deployment away from being wrong, and this file's whole subject is guards that
+  -- turned out to rest on something else being true. The test that proves it is not vacuous drops the
+  -- constraint to reach it.
+  IF TG_OP = 'UPDATE' AND OLD."paidAt" IS NOT NULL THEN
     NEW."unregistered_paid_at" := OLD."unregistered_paid_at";
     RETURN NEW;
   END IF;
