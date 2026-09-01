@@ -193,7 +193,17 @@ test(
         referenceType: 'SalesOrder',
         referenceId: orderId,
         externalTransactionId: 'QBO-PAY-LANDED',
-        payload: {},
+        // o3d-psrx r4 — THE PAYLOAD NAMES THE DOCUMENT, BECAUSE EVERY PRODUCTION ENQUEUE WRITES IT.
+        //
+        // `registerInvoicePaymentWithLedger` puts `accountingInvoiceId` in the INVOICE_PAYMENT payload
+        // at enqueue time (invoice-payment-enqueue.ts), and r4 made the reversal reader weigh it: a
+        // registration that names no document is UNBINDABLE, and an unbindable row is undecided rather
+        // than evidence. `payload: {}` therefore modelled a LEGACY row — one written before the field
+        // existed, or retention-compacted (o3d-m5qk) — and this test would have asserted the legacy
+        // arm while claiming to assert the self-discharge. Xero's fixtures were aligned in e0e71513;
+        // this one is the sibling that was missed, and it is the case that would have shipped a
+        // withheld verdict for every genuine QuickBooks chargeback.
+        payload: { accountingInvoiceId: invoiceId },
       },
       select: { id: true },
     })
@@ -288,7 +298,11 @@ test(
         status: 'PENDING',
         referenceType: 'PurchaseInvoice',
         referenceId: bills[0].id,
-        payload: {},
+        // Named for the same reason as the sales fixture above, though nothing here turns on it today:
+        // PENDING never reaches the SYNCED branch where the binding is weighed, so this row is
+        // undecided by status alone. Naming it keeps the fixture a production shape, so that a later
+        // edit to the status cannot silently move this test onto the legacy-row arm.
+        payload: { accountingInvoiceId: inFlight },
       },
     })
 
