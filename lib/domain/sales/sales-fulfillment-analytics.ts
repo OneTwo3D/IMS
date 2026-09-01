@@ -1275,7 +1275,8 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
     },
     notices: [
       'AR exposure is unpaid sales-order totalBase for the selected period, less the gross-basis credit raised against those unpaid orders. COGS comes from CogsEntry rows linked to SALE_DISPATCH movements.',
-      `Gross profit is withheld for a customer with an in-period order whose posted cost does not cover the revenue it is measured against — no COGS posted in the period, or not every ordered unit dispatched within it — and the period total covers ${period_.costCapturedRows} of ${groups.size} customers. A missing cost is not a zero cost, and a partially dispatched order's cost is not the whole order's cost.`,
+      `Gross profit is withheld for a customer with an in-period order whose posted cost does not cover the revenue it is measured against — no COGS posted in the period, or not every ordered stock unit dispatched within it — and the period total covers ${period_.costCapturedRows} of ${groups.size} customers. A missing cost is not a zero cost, and a partially dispatched order's cost is not the whole order's cost.`,
+      'Non-inventory lines — services, fees, delivery charges — book no stock movement and post no cost, so they are not asked to show a dispatch and an order made only of them is fully costed at zero. A variable-parent line is not exempt: goods do leave for it and cannot be traced to it, so its cost is unknown and the order is withheld.',
       REFUND_BASIS_NOTICE_CUSTOMER_MIX,
     ],
   }
