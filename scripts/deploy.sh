@@ -1329,11 +1329,22 @@ PUBLISH_STAGE_DIRNAME=".ims-publish"
 # instead of a shortcut when it is not — see publish_trust_root() for what demotion means, and for
 # what happens to an override with nothing left to demote to.
 #
-# The line is still drawn AT these directories rather than at `/`, for the reason
-# enter_service_subdir() gives at length: a symlinked ${DATA_DIR} — /var/lib/${APP_NAME} pointing at
-# a second disk — is a supported operator layout, and /var/lib is root-owned so it cannot be forged.
-# So the ROOT may be a symlink and is followed (`cd -P`); every component BELOW it may not be, and
-# is refused.
+# THE LINE IS DRAWN AT THESE DIRECTORIES RATHER THAN AT `/`, AND UNTIL r5 THE ROOT ITSELF WAS
+# FOLLOWED. A symlinked ${DATA_DIR} — /var/lib/${APP_NAME} pointing at a second disk — was a
+# supported operator layout, so the root, and only the root, was entered with `cd -P`; every
+# component below it was refused.
+#
+# THAT ONE HOP LEFT THE PROVED TREE, WHICH IS THE r5 FINDING (Codex HIGH). The link ENTRY is safe:
+# it sits in a parent this walk proves only the privileged account can write, so nobody else can
+# rebind the root's own name. Its TARGET is not. `/var/lib/${APP_NAME} -> /srv/disk2/ims` resolves
+# through `/srv/disk2`, which nothing here walks and which the service account may own: they rename
+# `ims` aside and leave a link to /root/.ssh at that name, the root entry never changes, every
+# anchor check passes, and the publication creates its staging directory and writes `.env` — as
+# root — in the directory they chose. The walk proved every component except the one that mattered.
+#
+# SO A SYMLINKED ROOT IS REFUSED, AND A SECOND DISK IS A BIND MOUNT. pin_dir_beneath_root() prints
+# what an operator has to do, and does it at the write, naming the root. Every root is then an
+# ORDINARY COMPONENT, proved exactly as the ones below it are, and the walk has no exception left.
 #
 # A FUNCTION AND NOT AN ARRAY, so the list is read at the moment of the publication rather than at
 # the moment this file was parsed: a root reassigned by a prompt would otherwise leave the table
@@ -1384,11 +1395,11 @@ publish_trust_root_candidates() {
 # directory that /tmp happens to hold is not — which is precisely the difference between the two.
 #
 # WHAT THIS STILL DOES NOT CLAIM. POSIX ACLs are not read: a directory carrying a write ACL is
-# outside anything a mode can express. And the ROOT ITSELF is deliberately not lstat-ed — it may
-# legitimately BE a symlink (a ${DATA_DIR} on a second disk is a supported operator layout) and on
-# a first install it may not exist at all. It is entered from the pinned parent as ONE relative
-# component, so whatever sits at that name was put there by an account that can write into a
-# directory this walk has just proved only the privileged account can write into.
+# outside anything a mode can express. And the ROOT ITSELF is not lstat-ed HERE — on a first
+# install it does not exist yet, so the question belongs to the walk that CREATES it. Since r5
+# pin_dir_beneath_root() asks it there and REFUSES a symlink rather than following it: this
+# function proves the root's name cannot be rebound, which says nothing about what a link at that
+# name would resolve through.
 #
 # IT LEAVES THE CALLING SHELL INSIDE THE PARENT, on success AND part-way down on failure, which is
 # the half the anchor never had. Its only caller that wants an answer rather than a position is
@@ -1551,14 +1562,41 @@ pin_dir_beneath_root() {
   # way and ending with this shell INSIDE the parent, so the two operations below are aimed at a
   # directory descriptor the kernel is holding rather than at a name anybody can rebind.
   pin_publish_root_parent "$root" || return 1
-  # The root itself, as a SINGLE RELATIVE COMPONENT resolved from the pinned parent. `mkdir` is
-  # plain and its failure is tolerated, because the root usually exists and may legitimately be a
-  # symlink — `cd -P` follows it deliberately, and the walk above is what earned that. An
-  # unmakeable, unenterable name fails at the `cd` a line later.
-  mkdir "$base" 2>/dev/null || true
-  cd -P "$base" 2>/dev/null || return 1
+  # THE PARENT, AS AN INODE. Taken of `.` after the walk and never of "${root%/*}", so the `..`
+  # check below compares against the directory this process is standing in.
   here="$(stat -c '%d:%i' . 2>/dev/null || true)"
   [[ -n "$here" ]] || return 1
+  # THE ROOT IS AN ORDINARY COMPONENT (o3d-rn10 r5, Codex HIGH), and that is the whole change. It
+  # used to be entered with a bare `cd -P` that followed a symlink DELIBERATELY, which made the
+  # root the one hop this walk did not prove — see publish_trust_root_candidates() for what that
+  # buys an attacker who owns any directory on a symlinked root's TARGET path.
+  #
+  # WHY REFUSING THE SYMLINK AND NOT PINNING ITS TARGET. Pinning would keep the configuration
+  # working: read the link, walk its target from `/` through this same machinery, bound the chain,
+  # decide what a relative target means. That is a SECOND path proved per publication, in three
+  # byte-identical copies, to keep an indirection that is re-resolved every time it is used. A bind
+  # mount is the same layout with the indirection resolved ONCE, at mount time, out of a mount
+  # table only root can write — and it leaves this walk with no exception in it at all. The cost is
+  # an operator-facing change, so the refusal below says exactly what to do instead.
+  mkdir "$base" 2>/dev/null || true
+  # ONE lstat, TYPE AND IDENTITY TOGETHER, exactly as the loop below takes them. No `-L`, so a link
+  # reads as "symbolic link" and is refused before anything steps into it.
+  entry="$(stat -c '%F|%d:%i' "$base" 2>/dev/null || true)"
+  if [[ "${entry%%|*}" != "directory" ]]; then
+    if [[ "${entry%%|*}" == "symbolic link" ]]; then
+      printf 'ERROR: %s is a symbolic link, and a publication root may not be one: this installer can prove the root name, but nothing proves the path its target resolves through.\n' "$root" >&2
+      printf 'ERROR: To keep %s on another disk, replace the link with a real directory and bind-mount the disk onto it — no data has to move:\n' "$root" >&2
+      printf 'ERROR:   rm %s && mkdir -p %s && mount --bind TARGET %s\n' "$root" "$root" "$root" >&2
+      printf 'ERROR: then add `TARGET %s none bind 0 0` to /etc/fstab so the bind survives a reboot.\n' "$root" >&2
+    fi
+    return 1
+  fi
+  cd -P "$base" 2>/dev/null || return 1
+  # AND THE SAME PAIR THE LOOP BELOW ASKS: the directory we landed in is the inode that entry
+  # named, and `..` is still the parent pin_publish_root_parent() left this shell inside.
+  [[ "$(stat -c '%d:%i' . 2>/dev/null || true)" == "${entry#*|}" ]] || return 1
+  [[ "$(stat -c '%d:%i' .. 2>/dev/null || true)" == "$here" ]] || return 1
+  here="${entry#*|}"
   rel="${path#"$root"}"
   rel="${rel#/}"
   while [[ -n "$rel" ]]; do
