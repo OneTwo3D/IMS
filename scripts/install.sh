@@ -2714,18 +2714,18 @@ pin_publish_root_parent() {
     [[ -n "$comp" ]] || continue
     # `.` and `..` would step outside the walk while it believed it was stepping down it.
     [[ "$comp" != "." && "$comp" != ".." ]] || return 1
-    # ONE lstat, TAKING THE TYPE, THE IDENTITY AND THE OWNER TOGETHER, so no two of the three can
-    # describe different directories. No `-L`, so a symlinked ancestor is refused, not followed.
-    entry="$(stat -c '%F|%d:%i|%u' "$comp" 2>/dev/null || true)"
+    # ONE lstat, TAKING THE TYPE AND THE IDENTITY TOGETHER, so the two cannot describe different
+    # directories. No `-L`, so a symlinked ancestor is refused rather than followed.
+    entry="$(stat -c '%F|%d:%i' "$comp" 2>/dev/null || true)"
     [[ "${entry%%|*}" == "directory" ]] || return 1
     entry="${entry#*|}"
     if (( (8#$mode & 8#22) != 0 )); then
-      # Writable by somebody else, so only the sticky bit can still make THIS entry unreplaceable
-      # — and only because the entry exists and belongs to the privileged account.
+      # Writable by somebody else, so only the sticky bit can still make THIS entry unreplaceable.
+      # It does so only for an entry the privileged account owns — and THAT is not re-asked here,
+      # because the next turn of this loop asks it of `.` after the chdir, of an inode this walk
+      # has already pinned to this entry. Asking twice would be the same question in a worse place.
       (( (8#$mode & 8#1000) != 0 )) || return 1
-      [[ "${entry##*|}" == "0" || "${entry##*|}" == "$self" ]] || return 1
     fi
-    entry="${entry%|*}"
     cd -P "$comp" 2>/dev/null || return 1
     # AND THE DIRECTORY WE LANDED IN IS THE ONE THAT ENTRY NAMED — the same pair of questions the
     # walk below asks, for the same reason. An lstat gives the inode of the entry, `stat .` gives

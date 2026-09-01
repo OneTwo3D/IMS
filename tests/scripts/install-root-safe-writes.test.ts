@@ -1076,14 +1076,16 @@ test('[o3d-rn10] the anchor credits the sticky bit on an ANCESTOR and never on t
   chmodSync(mid, 0o1777)
   assert.match(ask(candidate).stdout, /^rc=0$/m, 'sticky must be credited for an ancestor whose entry we own')
 
-  // AND THE OWNERSHIP HALF OF THAT CREDIT, which is the half that makes it sound rather than
-  // convenient. `/tmp` is root-owned and 1777 on this machine, and the mkdtemp directory inside it
-  // belongs to whoever runs this suite — so a run whose privileged account is somebody ELSE is a
-  // run for which that entry is a third party's and the sticky bit protects nothing of theirs.
+  // AND THE CREDIT IS A CREDIT AGAINST THE WRITE BITS ALONE — never against the OWNERSHIP
+  // requirement, which is what makes it sound rather than convenient. A sticky directory protects
+  // an entry for its owner; it says nothing on behalf of an account that owns neither. `/tmp` is
+  // root-owned and 1777 on this machine and the mkdtemp directory inside it belongs to whoever runs
+  // this suite, so a run whose privileged account is somebody ELSE walks through two directories
+  // that belong to neither uid it accepts, one of them sticky, and must still refuse.
   assert.equal(statSync('/tmp').mode & 0o7777, 0o1777, '/tmp must be sticky and world-writable, or this assertion states nothing')
   assert.equal(statSync(root).uid, process.getuid?.(), 'and the temp directory must belong to this account')
   assert.match(ask(candidate, 'id() { printf "%s\\n" 424242; }').stdout, /^rc=1$/m,
-    'sticky must NOT be credited for an entry that belongs to neither root nor the privileged account')
+    'the sticky bit must not exempt an ancestor from belonging to root or the privileged account')
 
   // AND NEVER FOR THE PARENT, because on a first install the root does not exist yet and sticky
   // says nothing about who gets to CREATE an entry. This is the /tmp/ims-state case, one level in.
