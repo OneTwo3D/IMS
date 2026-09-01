@@ -194,6 +194,15 @@ async function fetchReversedEntityIdsByIds(
  * payment as well as a removed one, and this poller does not read the amounts to tell them apart.
  * Xero's poller does (`partitionPaymentReversals`). That is a different defect from the one Codex
  * found and it is filed separately; nothing here makes it worse.
+ *
+ * ONE CORNER OF IT IS NOW CLOSED, and only that corner (r7, Codex HIGH 1). Where the order still
+ * carries its off-ledger provenance marker, the SHARED classifier compares what the bound
+ * registrations told the ledger against the order's total and withholds when they do not cover it —
+ * so a GBP 1 registration going missing can no longer reverse a GBP 100 hand-marked order through
+ * this connector either. That mattered here specifically: this poller's `ledgerListedPaymentIds` is
+ * always null, so a document with a posted registration lands on LEDGER_DID_NOT_LIST_PAYMENTS, which
+ * `zeroPaidIsProvenReversal` ADMITS. The residual above is untouched for every order WITHOUT a
+ * marker, which is the population it was written about.
  */
 export type QboReversalGate<T> = {
   /** Reversal may proceed: the evidence proves the payment is gone, or there was never one of ours. */

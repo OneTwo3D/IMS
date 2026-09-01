@@ -3526,12 +3526,18 @@ export async function addPayment(input: {
         // on orders with no marker at all, and this way those pay a predicate instead of a row write.
         //
         // WHAT A PERMANENTLY PART-COVERED ORDER READS AS, since a rule that withholds needs its
-        // steady state stated (r6). It keeps the marker, and the marker is consulted by
-        // `classifyRegisteredPaymentAgainstListing` ONLY when nothing posted is left to speak — so
-        // while the £1 receipt is unregistered the verdict is RECEIPT_NOT_REGISTERED, once its
-        // registration posts and binds the LEDGER decides, and the marker speaks only in the state
-        // its own sentence describes: no receipt, no registration, nothing but IMS's own silence.
-        // It is therefore neither a silent full registration nor a permanent withholding.
+        // steady state stated (r6, corrected in r7). It keeps the marker: while the £1 receipt is
+        // unregistered the verdict is RECEIPT_NOT_REGISTERED; while its registration is in flight,
+        // REGISTRATION_UNDECIDED; and once that registration posts and binds, the LEDGER decides
+        // ABOUT THE PART IT COVERS — its absence is PART_COVERED_OFF_LEDGER and its presence is
+        // STILL_HELD, both of which withhold.
+        //
+        // r6 wrote this paragraph as "the LEDGER decides" full stop, on the strength of the reader
+        // consulting the marker only when nothing had posted. That was the r7 finding: the penny's
+        // registration posting is exactly what silenced the marker, and a GBP 100 order was charged
+        // back when that registration went missing. The withholding is not permanent — the receipt
+        // that completes the cover clears the marker here, in this very branch, and the reader's
+        // guard stops running.
         await tx.salesOrder.updateMany({
           where: { id: input.orderId, unregisteredPaidAt: { not: null } },
           // `paidAt` is deliberately NOT written here — this order is already paid and re-stamping it

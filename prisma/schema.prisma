@@ -1777,6 +1777,14 @@ model SalesOrder {
   /// every `paidAt` write in app/ and lib/ to name this field in the same `data` object, which is
   /// what stops the next writer inheriting a stale value by omission.
   ///
+  /// AND THE SECOND HALF OF THAT IS THE DATABASE'S, NOT A CENSUS'S (o3d-psrx r7, Codex HIGH 2). The
+  /// census walks app/ and lib/; a repair script, a seed, `psql` or a previous release serving across
+  /// a deploy is not in either. The trigger in migration 20260901090000 therefore fires on `paidAt`
+  /// as well and forces this column to NULL whenever `paidAt` is NULL, and the CHECK constraint
+  /// `sales_orders_paid_episode_marker_needs_paid_at` states the same thing as a table invariant. A
+  /// marker outliving its paid flag is not a legal state: the next paid transition would find it
+  /// non-null, preserve the DEAD fence, and hand the previous episode's registrations to the new one.
+  ///
   /// THE VALUE IS THE DATABASE'S, NOT THE WRITER'S (o3d-psrx r5, Codex HIGH 1). Whatever instant a
   /// caller supplies, the trigger in migration 20260901090000 stores `clock_timestamp()` instead.
   /// This column is one END OF A FENCE — a registration may speak for the current paid flag only if
@@ -1786,15 +1794,21 @@ model SalesOrder {
   /// machines, and a host running ahead unbinds a real, posted receipt for ever. The instant an
   /// operator sees is `paidAt`; this one is a fence, and a fence has to be measured by one clock.
   ///
-  /// AND A RECEIPT REPLACES IT. `addPayment` clears this column whenever it records a non-refund
-  /// receipt, including on an order that was ALREADY marked paid by hand — which was the r4 hole:
-  /// such an order kept a marker saying "no ledger receipt is coming" while a real INVOICE_PAYMENT
-  /// was registered moments later.
+  /// AND A RECEIPT THAT COVERS THE ORDER REPLACES IT. `addPayment` clears this column when the
+  /// non-refund receipts on the order — the new one included — cover its total, including on an order
+  /// that was ALREADY marked paid by hand, which was the r4 hole: such an order kept a marker saying
+  /// "no ledger receipt is coming" while a real INVOICE_PAYMENT was registered moments later. COVER,
+  /// not merely EXIST (r6): this column asserts something about the WHOLE paid balance, and a GBP 1
+  /// receipt on a GBP 100 hand-marked order leaves GBP 99 of it settled by nothing any ledger was
+  /// told about.
   ///
-  /// DISCHARGED BY THE LEDGER, NOT BY A SWEEP. Once an INVOICE_PAYMENT registration is shown to have
-  /// posted before the ledger read, `classifyRegisteredPayment` stops consulting this at all — a
-  /// genuine WooCommerce chargeback still reverses. Nothing has to clear it, which is why no writer
-  /// does; it is a fact about how the flag was set, and that fact does not expire.
+  /// DISCHARGED BY THE LEDGER, NOT BY A SWEEP — TO THE EXTENT THE LEDGER WAS TOLD (r7, Codex HIGH 1).
+  /// Once an INVOICE_PAYMENT registration that COVERS the order is shown to have posted before the
+  /// ledger read, `classifyRegisteredPayment` stops consulting this at all and a genuine WooCommerce
+  /// chargeback still reverses. A registration covering only PART of it discharges nothing: the
+  /// ledger's account of that part is not an account of the rest, and reading it as one reverses the
+  /// whole order (`PART_COVERED_OFF_LEDGER`). Nothing has to CLEAR this column, which is why no
+  /// writer sweeps it; it is a fact about how the flag was set, and that fact does not expire.
   ///
   /// NULL on rows written before this column existed. The migration backfills the population it can
   /// prove — shopping-linked, paid, no local receipt — and leaves the rest honest.

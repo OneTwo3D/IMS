@@ -1456,10 +1456,19 @@ export function classifyRegisteredPaymentAgainstListing(
    * column and whose half of this defect was closed at source by markBillPaid queueing inside the
    * paid transaction (o3d-a3wx) — never reaches this arm.
    *
-   * Consulted ONLY when no registration is shown to have posted, which is what makes it
-   * self-discharging: the moment an INVOICE_PAYMENT is proved to have reached the ledger before the
-   * read, the ledger's own list decides, and a genuine WooCommerce chargeback reverses exactly as
-   * 6oyu.6 intends.
+   * CONSULTED IN TWO PLACES, AND KNOWING WHICH IS WHICH IS r7's WHOLE FINDING:
+   *
+   *   nothing posted        it decides outright — PAID_WITHOUT_LEDGER_RECEIPT, withheld.
+   *   something posted      it gates the COVERAGE GUARD below, which asks whether what posted
+   *                         settles `documentTotal`. If it does, the ledger's own list decides and a
+   *                         genuine WooCommerce chargeback reverses exactly as 6oyu.6 intends. If it
+   *                         does not, the ledger's silence is an account of a PART of the balance.
+   *
+   * Round 6 had only the first, and said so as "consulted ONLY when no registration is shown to have
+   * posted, which is what makes it self-discharging". Self-discharging on a PART payment is not a
+   * discharge, it is a full chargeback bought with a penny's worth of evidence. It is still
+   * self-discharging — by the receipt that completes the cover, which clears this flag at the write
+   * site — and that is a fact about the ORDER rather than about how much has posted.
    */
   paidWithoutLedgerReceipt: boolean = false,
   /**
@@ -1678,6 +1687,11 @@ function sumRegisteredAmounts(rows: readonly RegisteredPaymentRow[]): number | n
  *                               a contradiction IMS cannot settle from one read — Xero can list a
  *                               payment that has since been deleted — and an unsettled contradiction
  *                               is not proof. WITHHELD.
+ *   PART_COVERED_OFF_LEDGER     (r7) the document still says its paid flag was entered with no ledger
+ *                               receipt behind it, and what posted settles LESS than its total. The
+ *                               ledger's account of those registrations is an account of part of the
+ *                               balance; the remainder was never in any ledger to be removed from.
+ *                               WITHHELD.
  *
  * Note what the withheld answers cost, because it is the asymmetry the whole module turns on: a
  * document IMS keeps showing as paid, loudly warned about on every poll that sees it, which a human

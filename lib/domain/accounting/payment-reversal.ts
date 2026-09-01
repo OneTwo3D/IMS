@@ -115,8 +115,16 @@ export type PaidProvenanceDoc = {
  * about the flag being decided: one raised against an `accountingInvoiceId` the document no longer
  * has (deleted and re-posted — o3d-hbgo's rule, on the reversal side), and one that completed before
  * the current paid episode began (paid, registered, reversed, paid again — the stale row then made
- * `posted` non-empty, which is precisely what stops `unregisteredPaidAt` being consulted). Both facts
- * are already recorded, on the registration's payload and on the row; see `PaidStateBinding`.
+ * `posted` non-empty, which under r4's reader was precisely what stopped `unregisteredPaidAt` being
+ * consulted). Both facts are already recorded, on the registration's payload and on the row; see
+ * `PaidStateBinding`.
+ *
+ * AND WHAT POSTED IS WEIGHED AGAINST WHAT THE FLAG IS FOR (r7, Codex HIGH 1). A bound registration no
+ * longer silences the marker merely by existing: while the marker stands, the classifier asks whether
+ * the bound registrations COVER the document's total, which is why this reader fetches that total and
+ * each registration's own recorded amount. A part-covering registration's absence is an account of
+ * part of the balance, and reversing the whole of it is a chargeback credit note over money no ledger
+ * ever held.
  *
  * AND THE PAYLOAD IS NOT THE ONLY WITNESS TO THE FIRST OF THEM (r5, Codex HIGH 3). A row from before
  * that field existed, or one an older release compacted to `{}`, names no document — and r4 read that
