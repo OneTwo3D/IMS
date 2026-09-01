@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { Prisma, SalesOrderStatus } from '@/app/generated/prisma/client'
+import { Prisma, ProductType, SalesOrderStatus } from '@/app/generated/prisma/client'
 import {
   getCustomerAnalyticsReport,
   getMarginAnalyticsReport,
@@ -48,7 +48,7 @@ type OrderInput = {
   totalBase: string
   taxBase: string
   paidAt?: Date | null
-  lines: Array<{ id: string; productId: string; totalBase: string; qty?: string }>
+  lines: Array<{ id: string; productId: string; totalBase: string; qty?: string; productType?: ProductType }>
 }
 
 function order(input: OrderInput) {
@@ -81,7 +81,9 @@ function order(input: OrderInput) {
       taxForeign: D('0'),
       taxBase: D('0'),
       discountAmount: D('0'),
-      product: { id: line.productId, sku: line.productId.toUpperCase(), name: line.productId, category: { name: 'Cat' } },
+      // SIMPLE unless the line says otherwise: `orderCostCoverage` reads the type to tell a line
+      // with no cost to post (NON_INVENTORY) from a line whose cost it cannot establish.
+      product: { id: line.productId, sku: line.productId.toUpperCase(), type: line.productType ?? ProductType.SIMPLE, name: line.productId, category: { name: 'Cat' } },
     })),
   }
 }

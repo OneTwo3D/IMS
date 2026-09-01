@@ -1,6 +1,7 @@
 import {
   ActivityEntityType,
   Prisma,
+  ProductType,
   SalesOrderStatus,
   ShipmentStatus,
   StockMovementType,
@@ -21,6 +22,7 @@ import {
   loadFulfillmentProductGraph,
 } from '@/lib/products/kit-fulfillment'
 import { lineFulfillmentRequirements } from '@/lib/products/fulfillment-requirement-snapshot'
+import { isStockTrackedProductType } from '@/lib/domain/inventory/backorder-policy'
 import {
   creditPlacement,
   marginFigureBoundDecimal,
@@ -270,6 +272,12 @@ type SalesOrderLineRow = {
   product: {
     id: string
     sku: string
+    /**
+     * What the line SELLS, which is what says whether it has a cost to post at all. Loaded for
+     * `orderCostCoverage`; see the distinction it draws between a line with no cost and a line
+     * whose cost is unknown.
+     */
+    type: ProductType
     name: string
     category: { name: string } | null
   } | null
@@ -355,6 +363,24 @@ type CreditBuckets = {
   gross: Prisma.Decimal
   /** Credit whose basis was never proved. Never guessed at, never converted. */
   unknown: Prisma.Decimal
+  /**
+   * THE POSITIVE PART OF EACH BUCKET — `Σ max(entry, 0)` — carried beside the signed total because
+   * the signed total cannot bound anything on its own.
+   *
+   * A credit that is not the figure's unit contributes an INTERVAL, not an amount: an entry `b` on
+   * another basis is worth somewhere in `[min(b, 0), max(b, 0)]` once expressed in the figure's
+   * unit. Adding the entries up first destroys that interval — +120 and −120 of GROSS credit sum to
+   * a bucket of zero, and a bound read off that zero says the figure cannot move when the figure
+   * can move by 120 in either direction. Recording the positive part AT THE ENTRY keeps both
+   * endpoints recoverable from the two numbers: `Σ max(b, 0)` is this field and `Σ min(b, 0)` is
+   * `total − this field`.
+   *
+   * Same reasoning as the two completeness flags below being tracked rather than derived from the
+   * sums, applied to the AMOUNTS instead of the flags.
+   */
+  netPositive: Prisma.Decimal
+  grossPositive: Prisma.Decimal
+  unknownPositive: Prisma.Decimal
   /** True while every credit seen could be placed on a NET-basis figure. */
   netBasisComplete: boolean
   /** True while every credit seen could be placed on a GROSS-basis figure. */
@@ -366,6 +392,9 @@ function emptyCredits(): CreditBuckets {
     net: new Prisma.Decimal(0),
     gross: new Prisma.Decimal(0),
     unknown: new Prisma.Decimal(0),
+    netPositive: new Prisma.Decimal(0),
+    grossPositive: new Prisma.Decimal(0),
+    unknownPositive: new Prisma.Decimal(0),
     netBasisComplete: true,
     grossBasisComplete: true,
   }
@@ -375,9 +404,20 @@ function addCredit(buckets: CreditBuckets, totalsBasis: string | null, amount: D
   const onNet = creditPlacement('NET', totalsBasis, amount)
   const onGross = creditPlacement('GROSS', totalsBasis, amount)
   const value = toDecimal(amount)
-  if (onNet.bucket === 'net') buckets.net = buckets.net.add(value)
-  else if (onNet.bucket === 'gross') buckets.gross = buckets.gross.add(value)
-  else buckets.unknown = buckets.unknown.add(value)
+  // THIS IS THE LAST PLACE AN INDIVIDUAL CREDIT EXISTS. Every consumer above this line sees bucket
+  // sums only, so a separation that is not made here can never be made at all — which is exactly
+  // how two opposite same-basis credits used to reach the interval arithmetic as a single zero.
+  const positive = value.gt(0) ? value : new Prisma.Decimal(0)
+  if (onNet.bucket === 'net') {
+    buckets.net = buckets.net.add(value)
+    buckets.netPositive = buckets.netPositive.add(positive)
+  } else if (onNet.bucket === 'gross') {
+    buckets.gross = buckets.gross.add(value)
+    buckets.grossPositive = buckets.grossPositive.add(positive)
+  } else {
+    buckets.unknown = buckets.unknown.add(value)
+    buckets.unknownPositive = buckets.unknownPositive.add(positive)
+  }
   if (!onNet.placeable) buckets.netBasisComplete = false
   if (!onGross.placeable) buckets.grossBasisComplete = false
 }
@@ -386,6 +426,9 @@ function mergeCredits(into: CreditBuckets, from: CreditBuckets): void {
   into.net = into.net.add(from.net)
   into.gross = into.gross.add(from.gross)
   into.unknown = into.unknown.add(from.unknown)
+  into.netPositive = into.netPositive.add(from.netPositive)
+  into.grossPositive = into.grossPositive.add(from.grossPositive)
+  into.unknownPositive = into.unknownPositive.add(from.unknownPositive)
   if (!from.netBasisComplete) into.netBasisComplete = false
   if (!from.grossBasisComplete) into.grossBasisComplete = false
 }
@@ -395,9 +438,56 @@ function comparableCredit(buckets: CreditBuckets, basis: 'NET' | 'GROSS'): Prism
   return basis === 'NET' ? buckets.net : buckets.gross
 }
 
-/** The credit that is NOT — reported beside the figure, never folded into it. */
+/**
+ * THE CREDIT A FIGURE COULD NOT ABSORB, AS THE INTERVAL IT ACTUALLY OCCUPIES — never as one signed
+ * amount, because one signed amount is what loses the cancellation.
+ *
+ * `[lower, upper]` is stated in the FIGURE'S unit and bounds the credit that was left unsubtracted,
+ * so the true figure lies in `[published − upper, published − lower]`.
+ *
+ * On a NET figure the bound is TIGHT in both directions: a GROSS entry `g` is worth `g / (1 + rate)`
+ * ex-VAT, which lies in `[0, g]` for `g >= 0` and in `[g, 0]` for `g < 0`, and an entry of unproven
+ * basis is worth either itself or that, so the same interval covers it.
+ *
+ * On a GROSS figure only the DIRECTION is established, which is all `netLinearFigureBoundDecimal`
+ * reads from it (its own docstring says so): a NET entry `n` is worth `n * (1 + rate)` VAT-inclusive
+ * and has no finite ceiling, so `upper` is a sign carrier there and not a magnitude. `lower` is
+ * still sign-correct — it is below zero exactly when some unplaced entry was negative, which is
+ * exactly when the published figure may be too LOW and no `≤` may be claimed.
+ */
+type UnplacedCreditInterval = { lower: Prisma.Decimal; upper: Prisma.Decimal }
+
+function unplacedCreditInterval(buckets: CreditBuckets, basis: 'NET' | 'GROSS'): UnplacedCreditInterval {
+  const zero = new Prisma.Decimal(0)
+  const unplaced: Array<[Prisma.Decimal, Prisma.Decimal]> = basis === 'NET'
+    ? [[buckets.gross, buckets.grossPositive], [buckets.unknown, buckets.unknownPositive]]
+    : [[buckets.net, buckets.netPositive], [buckets.unknown, buckets.unknownPositive]]
+  return unplaced.reduce<UnplacedCreditInterval>((interval, [total, positive]) => ({
+    // Σ min(b, 0) = total − Σ max(b, 0). The two fields are all the endpoints need.
+    lower: interval.lower.add(total.sub(positive)),
+    upper: interval.upper.add(positive),
+  }), { lower: zero, upper: zero })
+}
+
+function addUnplacedIntervals(a: UnplacedCreditInterval, b: UnplacedCreditInterval): UnplacedCreditInterval {
+  return { lower: a.lower.add(b.lower), upper: a.upper.add(b.upper) }
+}
+
+/**
+ * The one number `netLinearFigureBoundDecimal` and `marginFigureBoundDecimal` take, derived from the
+ * interval rather than from a sum.
+ *
+ * Both classifiers read a NEGATIVE value as "no `≤` claim holds", so a below-zero lower end is
+ * handed straight to them and produces `indeterminate`; otherwise the credit provably cannot be
+ * negative and the ceiling is the interval's upper end.
+ */
+function unplacedCreditBound(interval: UnplacedCreditInterval): Prisma.Decimal {
+  return interval.lower.lt(0) ? interval.lower : interval.upper
+}
+
+/** The bound input for the credit a figure on `basis` could not absorb. */
 function unplacedCredit(buckets: CreditBuckets, basis: 'NET' | 'GROSS'): Prisma.Decimal {
-  return basis === 'NET' ? buckets.gross.add(buckets.unknown) : buckets.net.add(buckets.unknown)
+  return unplacedCreditBound(unplacedCreditInterval(buckets, basis))
 }
 
 function creditBasisComplete(buckets: CreditBuckets, basis: 'NET' | 'GROSS'): boolean {
@@ -407,44 +497,38 @@ function creditBasisComplete(buckets: CreditBuckets, basis: 'NET' | 'GROSS'): bo
 /** What off-row credit does to a report's figures, decided WITHOUT ever adding its bases together. */
 type OffRowCreditSummary = {
   /**
-   * True when ANY basis holds a nonzero off-row amount. Decided per bucket and never from a sum:
-   * a +100 GROSS credit and a -100 NET credit add to zero while both still sit off every row, and a
-   * report that read existence off that sum would publish EXACT with 200 of credit unaccounted for.
-   * This is `CreditBuckets`' own reason for tracking the two completeness flags separately, applied
-   * to the amounts.
+   * True when the off-row credit can move the figures at all. Decided from the INTERVAL, never from
+   * a signed sum and never from a bucket total:
+   *   - +100 GROSS and −100 NET add to zero while both still sit off every row (the cross-basis
+   *     cancellation), and
+   *   - +120 GROSS and −120 GROSS collapse to a zero GROSS BUCKET while their ex-VAT values need
+   *     not cancel at all, since the rates behind them may differ (the same-basis cancellation).
+   * Only when both endpoints are zero is nothing unaccounted for, and only then may a report call
+   * its revenue, profit and margin exact.
    */
   present: boolean
   /**
-   * A CEILING, IN NET TERMS, on the credit no row subtracted — or null when the published figures
-   * cannot be claimed to be ceilings at all. Never a published amount and never the existence test;
-   * only a magnitude for `netLinearFigureBoundDecimal` / `marginFigureBoundDecimal`.
+   * The interval, IN NET TERMS, on the off-row credit that no row subtracted.
    *
-   * A NET bucket is already in NET terms, so it contributes exactly its amount. A GROSS or unproven
-   * bucket `b` is worth somewhere in `[0, b]` net of VAT when `b >= 0`, and in `[b, 0]` when it is
-   * negative, so the total NET credit missing from the figure lies in
-   *   `[ Σnet + Σ min(b, 0) , Σnet + Σ max(b, 0) ]`.
-   * The upper end is this ceiling. The LOWER end is what decides whether there is a ceiling at all:
-   * a `≤` marker says "the truth is at or below the published figure", which holds only while the
-   * unsubtracted credit cannot be negative. So a lower end below zero returns null and the figures
-   * are marked indeterminate — including the case a plain signed sum gets wrong, a negative NET
-   * bucket outweighed by a positive GROSS one, where the sum looks safely positive and the true
-   * credit can still be negative.
+   * Off-row credit reached no row, so even the NET-basis part of it is missing from the figures —
+   * that part is added at BOTH endpoints, exactly, because it needs no conversion. The GROSS and
+   * unproven parts contribute `unplacedCreditInterval`'s per-entry interval. Sum:
+   *   `[ Σnet + Σ min(b, 0) , Σnet + Σ max(b, 0) ]`, over the ENTRIES, not the buckets.
+   * A lower end below zero means the unsubtracted credit may itself be negative, so the published
+   * figures are not ceilings and `unplacedCreditBound` turns that into `indeterminate`.
    */
-  netUpperBound: Prisma.Decimal | null
+  interval: UnplacedCreditInterval
 }
 
 function offRowCreditSummary(...sets: CreditBuckets[]): OffRowCreditSummary {
-  const zero = new Prisma.Decimal(0)
-  const sum = (values: Prisma.Decimal[]) => values.reduce((total, value) => total.add(value), zero)
-  const exact = sets.map((set) => set.net)
-  const convertible = sets.flatMap((set) => [set.gross, set.unknown])
-  const lowerEnd = sum(exact).add(sum(convertible.map((value) => value.lt(0) ? value : zero)))
-  return {
-    present: [...exact, ...convertible].some((bucket) => !bucket.isZero()),
-    netUpperBound: lowerEnd.lt(0)
-      ? null
-      : sum(exact).add(sum(convertible.map((value) => value.gt(0) ? value : zero))),
+  const merged = emptyCredits()
+  for (const set of sets) mergeCredits(merged, set)
+  const convertible = unplacedCreditInterval(merged, 'NET')
+  const interval = {
+    lower: merged.net.add(convertible.lower),
+    upper: merged.net.add(convertible.upper),
   }
+  return { present: !(interval.lower.isZero() && interval.upper.isZero()), interval }
 }
 
 /** An order's whole credit, as Sales Analytics and Customer Mix attribute it: by order id. */
@@ -669,7 +753,7 @@ async function loadSalesOrders(client: SalesFulfillmentAnalyticsClient, filters:
           taxForeign: true,
           taxBase: true,
           discountAmount: true,
-          product: { select: { id: true, sku: true, name: true, category: { select: { name: true } } } },
+          product: { select: { id: true, sku: true, type: true, name: true, category: { select: { name: true } } } },
         },
       },
       shoppingLinks: { select: { connector: true }, orderBy: { createdAt: 'asc' }, take: 1 },
@@ -716,7 +800,7 @@ async function loadSalesOrdersByIds(client: SalesFulfillmentAnalyticsClient, ord
           taxForeign: true,
           taxBase: true,
           discountAmount: true,
-          product: { select: { id: true, sku: true, name: true, category: { select: { name: true } } } },
+          product: { select: { id: true, sku: true, type: true, name: true, category: { select: { name: true } } } },
         },
       },
       shoppingLinks: { select: { connector: true }, orderBy: { createdAt: 'asc' }, take: 1 },
@@ -977,7 +1061,7 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
   ])
   assertSourceLimit(orders.length, SOURCE_ROW_LIMIT, 'Customer analytics source orders')
   // What each line actually shipped inside the window — the evidence that the cost posted for an
-  // order covers the revenue this report measures it against. See `orderCostCoverageComplete`.
+  // order covers the revenue this report measures it against. See `orderCostCoverage`.
   const dispatchedQtyByLine = await loadInWindowDispatchedQtyByLine(client, window, orders, 'Customer analytics')
   // As in Sales Analytics: an order cohort, so ALL of these orders' credit counts, whenever raised.
   const refunds = await loadOrderRefunds(client, orders.map((order) => order.id))
@@ -1046,8 +1130,18 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
     // But `.has` only asks whether ANY cost exists. A partially dispatched order has some, so it
     // passed, and one dispatched unit's cost was then set against the whole order's revenue. The
     // question the figure needs is whether the cost is COMPLETE for the revenue being measured, and
-    // that is `orderCostCoverageComplete`: every ordered unit dispatched inside the window.
-    if (cogsByOrder.has(order.id) && orderCostCoverageComplete(order, dispatchedQtyByLine)) {
+    // that is `orderCostCoverage`: every dispatchable ordered unit shipped inside the window.
+    //
+    // AND `.has` IS NOT THE RIGHT SECOND HALF FOR EVERY ORDER EITHER. A service-only order — one
+    // whose lines are all NON_INVENTORY — has no COGS entry BY DESIGN, so requiring one would
+    // withhold that customer's profit permanently for an order whose cost is a known zero. That is
+    // `nothing-to-dispatch`, and it is complete on its own evidence. The `?? 0` there is not the
+    // one this branch removed: that one could not tell an absent cost from a zero one, while this
+    // has just established there is nothing on the order that could post a cost at all.
+    const coverage = orderCostCoverage(order, dispatchedQtyByLine)
+    if (coverage === 'nothing-to-dispatch') {
+      current.cogs = current.cogs.add(cogsByOrder.get(order.id) ?? new Prisma.Decimal(0))
+    } else if (coverage === 'covered' && cogsByOrder.has(order.id)) {
       current.cogs = current.cogs.add(cogsByOrder.get(order.id)!)
     } else {
       current.costCaptured = false
@@ -1303,7 +1397,7 @@ export function computeInWindowDispatchedQtyByLine(
  * ONE loader for the two questions that both need it, so they cannot drift on what "dispatched in
  * this window" means: Gross Margin PRORATES a line's revenue to it, and Customer Mix asks whether
  * the cost posted for an order covers the revenue that order is publishing (see
- * `orderCostCoverageComplete`). Both are the same measurement — how much of what was ordered was
+ * `orderCostCoverage`). Both are the same measurement — how much of what was ordered was
  * actually shipped, and therefore costed, inside the period being reported.
  */
 async function loadInWindowDispatchedQtyByLine(
@@ -1367,30 +1461,72 @@ async function loadInWindowDispatchedQtyByLine(
  * passes that test, and gets ONE unit's cost set against TEN units' revenue. The profit that comes
  * out is plausible, confident and far too high — the same shape as the `?? 0` it replaced.
  *
- * COMPLETE therefore means: every ordered unit of every line was dispatched INSIDE THE WINDOW. The
- * in-window part is not a detail. Orders are selected by `createdAt`, so a dispatch can never fall
- * before the window, but it can fall after it: an order created on the 30th and shipped on the 2nd
- * has cost in NEXT period's `cogsByOrder` and revenue in THIS one. Measuring coverage with the same
- * in-window dispatched quantity Gross Margin prorates by makes both leaks one rule.
+ * COMPLETE therefore means: every ordered unit of every line THAT CAN BE DISPATCHED was dispatched
+ * INSIDE THE WINDOW. The in-window part is not a detail. Orders are selected by `createdAt`, so a
+ * dispatch can never fall before the window, but it can fall after it: an order created on the 30th
+ * and shipped on the 2nd has cost in NEXT period's `cogsByOrder` and revenue in THIS one. Measuring
+ * coverage with the same in-window dispatched quantity Gross Margin prorates by makes both leaks
+ * one rule.
  *
- * A line with no `productId` (the schema's "product deleted / not found") fails closed. There is no
- * product for a dispatch movement to be attributed through, so the quantity that line shipped is
- * not knowable from stored data — and "not knowable" is exactly the case this branch withholds for,
- * not one it waves through. A line ordered at zero quantity has no units to cover and is skipped.
+ * AND THE "THAT CAN BE DISPATCHED" IS THE WHOLE OF THE REST OF IT. Withholding is right when a
+ * figure cannot be supported and wrong when it can, so this has to separate two things a naive
+ * "every line must show dispatch" rule folds together:
+ *
+ *   NO COST TO POST. A NON_INVENTORY line — a service, a fee, a delivery charge — is by definition
+ *   not stock-tracked. It books no stock movement, so it can never carry a dispatch and never
+ *   produces a `CogsEntry`; its contribution to the order's cost is a KNOWN ZERO. Requiring a
+ *   dispatch for it would withhold that customer's gross profit for as long as the order exists,
+ *   and an order carrying a delivery charge is the ordinary case, not the exotic one. It is skipped
+ *   here, and an order whose only quantity-bearing lines are of this kind is `nothing-to-dispatch`:
+ *   completely costed, at zero, with no COGS entry needed to prove it.
+ *
+ *   COST UNKNOWN. Everything else that cannot show coverage fails closed, because "no dispatch
+ *   found" is then not evidence of no cost:
+ *     - a line with no `productId` (the schema's "product deleted / not found") has no product for
+ *       a dispatch movement to be attributed through, so what it shipped is not knowable;
+ *     - a line whose product row did not load, for the same reason — the type that would decide
+ *       this is the thing that is missing;
+ *     - a VARIABLE line. VARIABLE is a parent of stock-tracked variants: goods really will leave
+ *       for it, and `external-fulfillment` records that such a line can never receive shipment
+ *       coverage. So its cost is real and permanently untraceable — the opposite of NON_INVENTORY,
+ *       and the case where publishing profit would silently treat a cost as zero. Naming the two
+ *       types together (as `isStockTrackedProductType` does, for a question about STOCK) would put
+ *       a real unposted cost into the same bucket as a service line's absent one.
+ *
+ * A line ordered at zero quantity has no units to cover and is skipped. An order with no
+ * quantity-bearing line at all is `incomplete`, not `nothing-to-dispatch`: it sold nothing this
+ * report can see while carrying revenue that says otherwise, and that is an absence of evidence.
  *
  * Note this is about COVERAGE, not amount: an order whose posted cost is genuinely zero is complete
  * as long as its units shipped, which is the "cost posted, and it was zero" evidence `.has` was
  * introduced to preserve.
  */
-function orderCostCoverageComplete(order: SalesOrderRow, dispatchedQtyByLine: Map<string, Prisma.Decimal>): boolean {
+type OrderCostCoverage =
+  /** Every dispatchable unit shipped in the window. The caller still needs a posted cost. */
+  | 'covered'
+  /** Nothing on this order could ever dispatch or post a cost. Complete, at zero, on its own. */
+  | 'nothing-to-dispatch'
+  /** Some line's cost is short or unknowable. No profit may be published for this order. */
+  | 'incomplete'
+
+function orderCostCoverage(order: SalesOrderRow, dispatchedQtyByLine: Map<string, Prisma.Decimal>): OrderCostCoverage {
+  let sawDispatchable = false
+  let sawNonStock = false
   for (const line of order.lines) {
     const ordered = toDecimal(line.qty)
     if (ordered.lte(0)) continue
-    if (!line.productId) return false
+    if (!line.productId || !line.product) return 'incomplete'
+    if (line.product.type === ProductType.NON_INVENTORY) {
+      sawNonStock = true
+      continue
+    }
+    if (!isStockTrackedProductType(line.product.type)) return 'incomplete'
+    sawDispatchable = true
     const dispatched = dispatchedQtyByLine.get(`${line.id}|${line.productId}`) ?? new Prisma.Decimal(0)
-    if (dispatched.lt(ordered)) return false
+    if (dispatched.lt(ordered)) return 'incomplete'
   }
-  return true
+  if (sawDispatchable) return 'covered'
+  return sawNonStock ? 'nothing-to-dispatch' : 'incomplete'
 }
 
 export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = {}, deps?: SalesFulfillmentAnalyticsDeps): Promise<SalesAnalyticsReport<MarginReportRow>> {
@@ -1540,7 +1676,7 @@ export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = 
   const reportCredits = emptyCredits()
   for (const row of groups.values()) mergeCredits(reportCredits, row.credits)
   const rowBasisComplete = creditBasisComplete(reportCredits, MARGIN_FIGURE_BASIS)
-  const rowUnplaced = unplacedCredit(reportCredits, MARGIN_FIGURE_BASIS)
+  const rowUnplacedInterval = unplacedCreditInterval(reportCredits, MARGIN_FIGURE_BASIS)
   mergeCredits(reportCredits, refundsUnattributed)
   mergeCredits(reportCredits, refundsOutsideReport)
   /**
@@ -1586,14 +1722,17 @@ export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = 
   const paged = paginate(rows, filters, deps?.paginate !== false)
   const totalRevenue = [...netRevenueByKey.values()].reduce((sum, revenue) => sum.add(revenue), new Prisma.Decimal(0))
   const totalCogs = [...groups.values()].reduce((sum, row) => sum.add(row.cogs), new Prisma.Decimal(0))
-  // Null `netUpperBound` = the off-row credit could itself be negative, so there is no direction to
-  // bound the totals in: they are marked indeterminate rather than given a ceiling that is not one.
-  // `rowUnplaced` is already a NET-terms magnitude, so the two add.
-  const totalUnplaced = offRow.netUpperBound === null ? null : rowUnplaced.add(offRow.netUpperBound)
+  // The two intervals ADD, endpoint by endpoint — both are in NET terms, and the credit missing
+  // from the totals is the row credit no row could absorb plus the credit that reached no row at
+  // all. A below-zero lower end (the off-row credit could itself be negative) survives the addition
+  // and `unplacedCreditBound` hands it to the classifiers, which answer `indeterminate` rather than
+  // print a ceiling that is not one.
+  const totalUnplaced = unplacedCreditBound(addUnplacedIntervals(rowUnplacedInterval, offRow.interval))
   const totalBasisComplete = rowBasisComplete && !offRow.present
-  const totalLinearBound: DerivedFigureBound = totalUnplaced === null
-    ? 'indeterminate'
-    : netLinearFigureBoundDecimal({ basisComplete: totalBasisComplete, unplacedCredit: totalUnplaced })
+  const totalLinearBound: DerivedFigureBound = netLinearFigureBoundDecimal({
+    basisComplete: totalBasisComplete,
+    unplacedCredit: totalUnplaced,
+  })
   return {
     generatedAt: generatedAt.toISOString(),
     dateFrom: dateOnly(window.dateFrom),
@@ -1607,14 +1746,12 @@ export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = 
       grossProfitBase: moneyString(totalGrossProfit, baseCurrency),
       grossProfitBaseBound: totalLinearBound,
       marginPct: pctString(totalGrossProfit, totalRevenue),
-      marginPctBound: totalUnplaced === null
-        ? 'indeterminate'
-        : marginFigureBoundDecimal({
-          netRevenue: totalRevenue,
-          cogs: totalCogs,
-          unplacedCredit: totalUnplaced,
-          basisComplete: totalBasisComplete,
-        }),
+      marginPctBound: marginFigureBoundDecimal({
+        netRevenue: totalRevenue,
+        cogs: totalCogs,
+        unplacedCredit: totalUnplaced,
+        basisComplete: totalBasisComplete,
+      }),
       refundsNetBasis: moneyString(reportCredits.net, baseCurrency),
       refundsGrossBasis: moneyString(reportCredits.gross, baseCurrency),
       refundsUnknownBasis: moneyString(reportCredits.unknown, baseCurrency),
