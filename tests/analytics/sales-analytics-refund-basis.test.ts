@@ -42,9 +42,12 @@ const WINDOW = { dateFrom: '2026-06-01', dateTo: '2026-06-30' }
 const NOW = () => new Date('2026-06-30T00:00:00.000Z')
 
 type OrderInput = {
+  /** NULL for a guest order — the grouping key then falls back to the email, and failing that the name. */
+  customerId: string | null
   id: string
-  customerId: string
   customerName: string
+  /** Defaults to NULL, which is what every test written before o3d-7jfq round 4 assumed. */
+  customerEmail?: string | null
   totalBase: string
   taxBase: string
   paidAt?: Date | null
@@ -58,7 +61,7 @@ function order(input: OrderInput) {
     currency: 'GBP',
     customerId: input.customerId,
     customerName: input.customerName,
-    customerEmail: null,
+    customerEmail: input.customerEmail ?? null,
     createdAt: new Date('2026-06-10T00:00:00.000Z'),
     expectedDelivery: null,
     paidAt: input.paidAt === undefined ? new Date('2026-06-11T00:00:00.000Z') : input.paidAt,
@@ -954,8 +957,9 @@ test('customer mix: a contradicted customer OUTSIDE the visible page is NAMED in
   const notice = inconsistentNotice(report)
   assert.ok(notice, 'the report did not raise the inconsistent-evidence notice')
   assert.match(notice!, /^1 of 51 customers/)
-  // THE ROUTE FROM THE NOTICE TO THE ROW: the name, which is what the Customer column renders.
-  assert.match(notice!, /highest-ranked first: Gamma\.$/)
+  // THE ROUTE FROM THE NOTICE TO THE ROW: the Customer cell, the Email cell, and the id the CSV
+  // export carries — see `inconsistentCustomerLabel` for why the name alone is not enough.
+  assert.match(notice!, /highest-ranked first: "Gamma" \(no email\) \[cust-gamma\]\.$/)
   // And ONLY the affected one. Naming every row would be no list at all at the size that matters.
   assert.equal(notice!.includes('Clean '), false)
 })
@@ -997,10 +1001,166 @@ test('customer mix: past the tenth name the notice counts the rest and says wher
   const notice = inconsistentNotice(report)
   assert.ok(notice, 'the report did not raise the inconsistent-evidence notice')
   assert.match(notice!, /^11 of 11 customers/)
-  assert.match(notice!, /highest-ranked first: Cust 01; Cust 02; Cust 03; Cust 04; Cust 05; Cust 06; Cust 07; Cust 08; Cust 09; Cust 10, and 1 more not named here/)
+  const named = Array.from({ length: 10 }, (_, index) => {
+    const n = String(index + 1).padStart(2, '0')
+    return `"Cust ${n}" (no email) [cust-${n}]`
+  }).join('; ')
+  assert.ok(notice!.includes(`highest-ranked first: ${named}, and 1 more not named here`), notice)
   // The eleventh is not named, and the sentence that omits it says where it can be found.
   assert.equal(notice!.includes('Cust 11'), false)
   assert.match(notice!, /costEvidence=inconsistent\.$/)
+})
+
+// ---------------------------------------------------------------------------------------------
+// Customer Mix: WHAT THE NOTICE CLAIMS, AND WHO IT NAMES — o3d-7jfq round 4
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * A contradicted customer: ten units ordered, ten dispatched on one movement, and that movement's
+ * ten-unit COGS entry posted TWICE. Twenty costed units against ten moved.
+ *
+ * `costPerEntry` is what each of the two entries sums to, because the whole point of round 4 is
+ * that the quantity contradiction is independent of the money: at `'0'` the entries are doubled and
+ * the total cost is still exactly right.
+ */
+function contradicted(input: { id: string; customerId: string | null; customerName: string; customerEmail?: string | null; totalBase: string; costPerEntry?: string }) {
+  const lineId = `line-${input.id}`
+  return {
+    order: order({
+      id: input.id,
+      customerId: input.customerId,
+      customerName: input.customerName,
+      customerEmail: input.customerEmail,
+      totalBase: input.totalBase,
+      taxBase: '0',
+      lines: [{ id: lineId, productId: `product-${input.id}`, totalBase: input.totalBase, qty: '10' }],
+    }),
+    movement: dispatch(input.id, lineId, `product-${input.id}`, '10'),
+    entries: [
+      cogsForDispatch(input.id, lineId, '10', input.costPerEntry ?? '10'),
+      cogsForDispatch(input.id, lineId, '10', input.costPerEntry ?? '10'),
+    ],
+  }
+}
+
+function reportForContradicted(fixtures: Array<ReturnType<typeof contradicted>>) {
+  const client: SalesFulfillmentAnalyticsClient = {
+    ...baseClient(),
+    salesOrder: { findMany: async () => fixtures.map((fixture) => fixture.order) },
+    stockMovement: { findMany: async () => fixtures.map((fixture) => fixture.movement) },
+    cogsEntry: { findMany: async () => fixtures.flatMap((fixture) => fixture.entries) },
+  }
+  return getCustomerAnalyticsReport(WINDOW, { client, now: NOW })
+}
+
+test('customer mix: the contradiction notice claims the QUANTITY it proved, not duplicated money (o3d-7jfq)', async () => {
+  // ROUND 4, FINDING 1. `dispatchCostEvidenceByOrder` compares Σ CogsEntry.qty with StockMovement.qty
+  // and never reads totalCostBase, so "every report summing COGS is overstating cost by the
+  // duplicate" was a claim the check had not made. This fixture is the counter-example that proves
+  // it is not merely unproven but FALSE in general: the ten-unit entry is posted twice at a cost of
+  // ZERO each, so the costed quantity is 20 against a 10-unit movement — contradictory — while the
+  // money those entries sum to is 0 + 0 = 0, which is exactly right and overstates nothing.
+  const report = await reportForContradicted([
+    contradicted({ id: 'order-1', customerId: 'cust-1', customerName: 'Acme Ltd', totalBase: '200', costPerEntry: '0' }),
+  ])
+
+  // 200 invoiced with no VAT, so the ex-VAT revenue is 200 and a report willing to publish would
+  // have shown 200 - 0 = 200. It is withheld anyway: the quantity evidence contradicts itself.
+  assert.equal(report.rows[0]?.netRevenueExVatBase, '200')
+  assert.equal(report.rows[0]?.grossProfitBase, null)
+  assert.equal(report.rows[0]?.costEvidence, 'inconsistent')
+
+  const notice = inconsistentNotice(report)
+  assert.ok(notice, 'the report did not raise the inconsistent-evidence notice')
+  // WHAT IT STATES AS FACT: a quantity.
+  assert.ok(notice!.includes('COGS entries for more units than the movement moved'), notice)
+  assert.ok(notice!.includes('the costed quantity exceeds the quantity that moved'), notice)
+  // WHAT IT STATES AS A POSSIBILITY: the money. The overstatement survives only inside a clause
+  // conditioned on duplication being the cause, and the notice says the cause is not established.
+  assert.ok(notice!.includes('Whether money was duplicated with it is NOT proven here'), notice)
+  assert.ok(notice!.includes('where they are the cause every figure that sums CogsEntry.totalCostBase overstates cost by the duplicate'), notice)
+  assert.ok(notice!.includes('can be carried by entries posted at no cost at all'), notice)
+  // AND WHAT IT MUST NOT SAY — the round-3 sentence this fixture falsifies. An operator sent after
+  // a monetary error that does not exist will go looking for cost evidence to delete.
+  assert.equal(notice!.includes('every report that sums COGS entries is overstating cost by the duplicate'), false)
+})
+
+test('customer mix: two distinct customer groups sharing one name are two distinguishable entries (o3d-7jfq)', async () => {
+  // ROUND 4, FINDING 2. Rows are grouped on `customerId ?? guest-email:… ?? guest-name:…`, so two
+  // guests really called `John Smith` are two rows — and a notice projecting them to `customerName`
+  // said `John Smith; John Smith`, which names neither. Both contradict themselves; the first
+  // invoices 200 and the second 100, so the net-revenue ranking is one.example then two.example.
+  const report = await reportForContradicted([
+    contradicted({ id: 'order-1', customerId: null, customerName: 'John Smith', customerEmail: 'john@one.example', totalBase: '200' }),
+    contradicted({ id: 'order-2', customerId: null, customerName: 'John Smith', customerEmail: 'john@two.example', totalBase: '100' }),
+  ])
+
+  // Two rows, one name: the premise. A grouping that merged them would make this test vacuous.
+  assert.equal(report.rows.length, 2)
+  assert.deepEqual(report.rows.map((row) => row.customerName), ['John Smith', 'John Smith'])
+  assert.equal(report.totals.costInconsistentRows, '2')
+
+  const notice = inconsistentNotice(report)
+  assert.ok(notice, 'the report did not raise the inconsistent-evidence notice')
+  assert.match(notice!, /^2 of 2 customers/)
+  // The Email column is what separates these two on screen, so it is what separates them here.
+  assert.ok(notice!.endsWith('They are, highest-ranked first: "John Smith" john@one.example [guest]; "John Smith" john@two.example [guest].'), notice)
+})
+
+test('customer mix: a registered customer and a guest sharing BOTH name and email are still told apart (o3d-7jfq)', async () => {
+  // The case the email cannot settle. `cust-1` and a guest ordering under the same address are two
+  // groups — `cust-1` and `guest-email:ops@acme.example` — with the same Customer cell and the same
+  // Email cell, so only the identity segment separates the two labels. `customerId` is a column of
+  // the CSV export the notice already points at, and its absence is stated rather than left blank.
+  const report = await reportForContradicted([
+    contradicted({ id: 'order-1', customerId: 'cust-1', customerName: 'Acme Ltd', customerEmail: 'ops@acme.example', totalBase: '200' }),
+    contradicted({ id: 'order-2', customerId: null, customerName: 'Acme Ltd', customerEmail: 'ops@acme.example', totalBase: '100' }),
+  ])
+
+  assert.equal(report.rows.length, 2)
+  assert.deepEqual(report.rows.map((row) => row.customerName), ['Acme Ltd', 'Acme Ltd'])
+  assert.deepEqual(report.rows.map((row) => row.customerEmail), ['ops@acme.example', 'ops@acme.example'])
+
+  const notice = inconsistentNotice(report)
+  assert.ok(notice, 'the report did not raise the inconsistent-evidence notice')
+  assert.ok(notice!.endsWith('They are, highest-ranked first: "Acme Ltd" ops@acme.example [cust-1]; "Acme Ltd" ops@acme.example [guest].'), notice)
+})
+
+test('customer mix: a BLANK stored name is still one findable entry in the notice (o3d-7jfq)', async () => {
+  // `customerName(order)` falls back only when the stored name is NULL; an empty string is a value
+  // and passes straight through, so the Customer cell renders blank. Unquoted, that name is a hole
+  // in the list — two separators with nothing between them — and the reader cannot tell whether a
+  // customer was named at all. Quoted, it is `""`: visibly one entry, and an honest description of
+  // the cell to look for. `Zeta` is here so the blank one has a neighbour to be confused with.
+  const report = await reportForContradicted([
+    contradicted({ id: 'order-1', customerId: 'cust-1', customerName: '', customerEmail: 'jo@x.example', totalBase: '200' }),
+    contradicted({ id: 'order-2', customerId: 'cust-2', customerName: 'Zeta', totalBase: '100' }),
+  ])
+
+  // The premise: the row really does render an empty Customer cell.
+  assert.equal(report.rows[0]?.customerName, '')
+
+  const notice = inconsistentNotice(report)
+  assert.ok(notice, 'the report did not raise the inconsistent-evidence notice')
+  assert.ok(notice!.endsWith('They are, highest-ranked first: "" jo@x.example [cust-1]; "Zeta" (no email) [cust-2].'), notice)
+})
+
+test('customer mix: a name containing the list separator does not break the list (o3d-7jfq)', async () => {
+  // Entries are separated by `; `, and a company name may contain one. Every entry therefore opens
+  // with a quote and the name ends at its closing quote, so `; ` inside a name is not `; "` and
+  // cannot be read as the separator. An embedded quote is doubled, CSV-style, so the closing quote
+  // stays unambiguous. `Smith; Jones Ltd` invoices 200 and ranks above `Say "Hi" Ltd` on 100.
+  const report = await reportForContradicted([
+    contradicted({ id: 'order-1', customerId: 'cust-1', customerName: 'Smith; Jones Ltd', totalBase: '200' }),
+    contradicted({ id: 'order-2', customerId: 'cust-2', customerName: 'Say "Hi" Ltd', totalBase: '100' }),
+  ])
+
+  const notice = inconsistentNotice(report)
+  assert.ok(notice, 'the report did not raise the inconsistent-evidence notice')
+  assert.ok(notice!.endsWith('They are, highest-ranked first: "Smith; Jones Ltd" (no email) [cust-1]; "Say ""Hi"" Ltd" (no email) [cust-2].'), notice)
+  // AND THE LIST IS SPLITTABLE: exactly one entry boundary for two customers. Drop the quoting and
+  // the name's own semicolon becomes a third entry.
+  assert.equal(notice!.split('; "').length, 2)
 })
 
 test('customer mix: an incomplete customer and a contradicted one are told apart (o3d-7jfq)', async () => {
