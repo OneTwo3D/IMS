@@ -27,7 +27,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync,
 import { dirname, join } from 'node:path'
 import test, { type TestContext } from 'node:test'
 
-import { shellConstant, shellConstantOptional, shellFunction } from './shell-symbol.ts'
+import { maskShellSource, shellConstant, shellConstantOptional, shellFunction, shellFunctionDefinitions } from './shell-symbol.ts'
 import { createTempDirSync } from './temp-dir.ts'
 
 const REPO = process.cwd()
@@ -1689,6 +1689,210 @@ test('[o3d-rn10] a publisher symbol defined twice fails the parity extractor ins
   // of the extractor cannot trade one for the other.
   assert.throws(() => shellFunction(DEPLOY.replace('\npublish_root_anchored() {\n', '\nremoved_publisher() {\n'), 'publish_root_anchored'),
     /must define publish_root_anchored\(\)/)
+})
+
+/**
+ * AND THE COMMAND POSITIONS THE LIST DID NOT HAVE (o3d-rn10 r6, Codex MEDIUM — the THIRD round on
+ * this one guard).
+ *
+ * r5 replaced an end-of-line anchor with a list of things a definition may follow — `;`, `&`, `|`,
+ * `(`, `)`, `{`, `}`, `then`, `else`, `do` — and Codex came back with five it did not have:
+ *
+ *     if publish_root_anchored() { return 0; }; then :; fi
+ *
+ * counts as ONE definition under that list, and runs as TWO under bash. `while`, `until`, `!` and
+ * `time` are the same. Writing those five down would have been r6, and `elif` and `time -p` — both
+ * verified below to parse and to take effect, neither listed by any round or any reviewer — would
+ * have been r7. Worse, every one of those rounds read the file LINE BY LINE, and
+ *
+ *     publish_root_anchored\
+ *     () { return 0; }
+ *
+ * is an effective override that no line-based rule can see however long its list of keywords gets.
+ *
+ * SO THE SCANNER STOPPED HAVING A LIST. tests/scripts/shell-symbol.ts now lexes the whole file,
+ * looks for a WORD followed by `()` (or `function` followed by the word), consults nothing about
+ * what precedes it beyond bash's own closed metacharacter set, and cross-checks its count against
+ * `bash --pretty-print` — bash's own parser, which deparses every form to the same canonical shape
+ * without executing anything. The forms below are not the rule's inputs; they are its witnesses.
+ *
+ * ROUTE: shellFunction() — the extractor the parity test above calls — on scripts/deploy.sh with
+ * each form appended, which is where an operator or a compromised checkout would put one.
+ *
+ * EACH IS PROVED TO BE AN OVERRIDE BEFORE IT IS REQUIRED TO BE CAUGHT, under a real bash running
+ * the SHIPPED anchor: a form the extractor rejects but bash ignores would make this a spelling test.
+ */
+const COMMAND_POSITION_OVERRIDES = [
+  // The five Codex named.
+  'if publish_root_anchored() { return 0; }; then :; fi',
+  'while publish_root_anchored() { return 0; }; do break; done',
+  'until publish_root_anchored() { return 0; }; do break; done',
+  '! publish_root_anchored() { return 0; }',
+  'time publish_root_anchored() { return 0; }',
+  // And the ones nobody named. `elif` and `time -p` are command positions no round listed; the
+  // `case` arm is one more; and the last is not a command position at all but a header split by a
+  // backslash-newline, which is the form that ends the line-by-line approach rather than extending
+  // its list.
+  'if false; then :; elif publish_root_anchored() { return 0; }; then :; fi',
+  'time -p publish_root_anchored() { return 0; }',
+  'case anything in *) publish_root_anchored() { return 0; };; esac',
+  'publish_root_anchored\\\n() { return 0; }',
+] as const
+
+test('[o3d-rn10] every command position bash accepts is caught, including the ones nobody listed', () => {
+  const DEPLOY = readFileSync(join(REPO, 'scripts/deploy.sh'), 'utf8')
+
+  // NOT VACUOUS: the shipped file resolves to exactly one, so what fails below is the appended
+  // definition and not a scanner that refuses everything it is shown.
+  assert.equal(shellFunctionDefinitions(DEPLOY, 'publish_root_anchored', 'scripts/deploy.sh').length, 1,
+    'scripts/deploy.sh must carry exactly one publisher before anything is appended to it')
+
+  for (const bypass of COMMAND_POSITION_OVERRIDES) {
+    const proof = runBash([
+      'set -uo pipefail',
+      shellFunction(INSTALL_SH, 'pin_publish_root_parent'),
+      shellFunction(INSTALL_SH, 'publish_root_anchored'),
+      bypass,
+      'publish_root_anchored /ims-rn10-no-such-root/state; echo "rc=$?"',
+    ].join('\n'))
+    assert.match(proof.stdout, /^rc=0$/m,
+      `bash must actually take ${JSON.stringify(bypass)} as the effective definition: ${proof.stderr}`)
+
+    assert.throws(() => shellFunction(`${DEPLOY}\n${bypass}\n`, 'publish_root_anchored'), /2 times/,
+      `and the extractor must refuse it: ${JSON.stringify(bypass)}`)
+  }
+
+  // AND THE ANCHOR REFUSES THAT ROOT WITHOUT A BYPASS, so `rc=0` above is the override talking.
+  const unbypassed = runBash([
+    'set -uo pipefail',
+    shellFunction(INSTALL_SH, 'pin_publish_root_parent'),
+    shellFunction(INSTALL_SH, 'publish_root_anchored'),
+    'publish_root_anchored /ims-rn10-no-such-root/state; echo "rc=$?"',
+  ].join('\n'))
+  assert.match(unbypassed.stdout, /^rc=1$/m, 'the canonical anchor must refuse a root that does not exist')
+})
+
+/**
+ * AND WHAT THE SCANNER CANNOT READ IS REFUSED, NOT COUNTED (o3d-rn10 r6).
+ *
+ * This is the half that makes the rewrite worth more than a sixth list. The previous detectors
+ * answered every question: shown a construct they did not model, they returned a number, and the
+ * number was the one an override hides behind. This one refuses.
+ *
+ * THE FORM THAT PROVES IT is `eval`. `eval 'publish_root_anchored() { return 0; }'` installs the
+ * override — asserted below under a real bash — and is invisible to the lexer, which sees a quoted
+ * string; invisible to any command-position rule, however many keywords it lists; and invisible to
+ * BASH'S OWN PARSER, which deparses it straight back out as the string it is. Nobody listed it,
+ * Codex did not name it, and no reading of the file's text can catch it. So the scanner does not
+ * report a count for a file containing one.
+ *
+ * `$( ( … ) … )` is the second: bash reads `$((` as arithmetic, fails, and re-reads it as a
+ * substitution around a subshell. The lexer cannot backtrack like that, so it commits, finds no
+ * `))`, and says so with a line number instead of masking the rest of the file away in silence.
+ *
+ * ROUTE: shellFunctionDefinitions() on scripts/deploy.sh with each construct appended.
+ */
+test('[o3d-rn10] a construct the scanner cannot read makes it refuse, not return a count', (t) => {
+  const DEPLOY = readFileSync(join(REPO, 'scripts/deploy.sh'), 'utf8')
+  const scratch = createTempDirSync('ims-rn10-lex-', t)
+
+  // AN EVAL'D OVERRIDE IS A REAL OVERRIDE. Proved first, for the same reason as above.
+  const evald = "eval 'publish_root_anchored() { return 0; }'"
+  const proof = runBash([
+    'set -uo pipefail',
+    shellFunction(INSTALL_SH, 'pin_publish_root_parent'),
+    shellFunction(INSTALL_SH, 'publish_root_anchored'),
+    evald,
+    'publish_root_anchored /ims-rn10-no-such-root/state; echo "rc=$?"',
+  ].join('\n'))
+  assert.match(proof.stdout, /^rc=0$/m, `bash must take the eval'd definition as effective: ${proof.stderr}`)
+
+  // AND BASH'S OWN PARSER CANNOT SEE IT EITHER, which is what makes refusal the honest answer here
+  // rather than a lazy one: the deparse hands the definition back as the string it went in as, so
+  // the third reading has nothing to add. MEASURED, because "no parser can see it" is exactly the
+  // kind of claim that turns out to be false and takes a guard down with it.
+  const subject = join(scratch, 'evald.sh')
+  writeFileSync(subject, `${evald}\n`)
+  const deparse = spawnSync('bash', ['--pretty-print', subject], { encoding: 'utf8' })
+  assert.equal(deparse.status, 0, deparse.stderr)
+  assert.match(deparse.stdout, /eval 'publish_root_anchored\(\) \{ return 0; \}'/,
+    "bash's own parse must still carry the definition as a STRING — if it ever unpacks it, this "
+    + 'refusal can become a count')
+  assert.doesNotMatch(deparse.stdout.replace(/eval '[^']*'/g, ''), /publish_root_anchored \(\)/,
+    'and it must not render it as a definition anywhere else in the deparse')
+
+  assert.throws(() => shellFunctionDefinitions(`${DEPLOY}\n${evald}\n`, 'publish_root_anchored', 'scripts/deploy.sh'),
+    /runs `eval`/,
+    'a file that builds a definition at runtime must be refused, not reported as carrying one')
+
+  // THE $(( AMBIGUITY. bash parses this; the lexer does not, and says so.
+  const ambiguous = 'x="$(( echo a ) ; publish_root_anchored() { return 0; })"'
+  const accepted = runBash(`${ambiguous}\necho "parsed=yes"`)
+  assert.match(accepted.stdout, /^parsed=yes$/m,
+    `bash must accept the construct this scanner refuses — otherwise the refusal is about a typo: ${accepted.stderr}`)
+  assert.throws(() => shellFunctionDefinitions(`${DEPLOY}\n${ambiguous}\n`, 'publish_root_anchored', 'scripts/deploy.sh'),
+    /arithmetic expansion that does not close/,
+    'a construct the lexer cannot resolve must name its line, not mask the rest of the file away')
+
+  // AN UNTERMINATED QUOTE swallows every definition after it. It is refused for the same reason.
+  assert.throws(() => shellFunctionDefinitions(`${DEPLOY}\necho 'never closed\n`, 'publish_root_anchored', 'scripts/deploy.sh'),
+    /unterminated single quote/)
+  assert.throws(() => shellFunctionDefinitions(`${DEPLOY}\ncat <<NEVER\nbody\n`, 'publish_root_anchored', 'scripts/deploy.sh'),
+    /unterminated here-document/)
+
+  // AND A FILE BASH ITSELF WILL NOT PARSE gets no count either: the second reading is not optional.
+  assert.throws(() => shellFunctionDefinitions(`${DEPLOY}\nif publish_root_anchored() { return 0; }\n`, 'publish_root_anchored', 'scripts/deploy.sh'),
+    /bash refuses to parse/)
+
+  // NOT VACUOUS: the same call on the unmodified file returns one. The refusals above are the
+  // constructs talking, not a scanner that has stopped answering.
+  assert.equal(shellFunctionDefinitions(DEPLOY, 'publish_root_anchored', 'scripts/deploy.sh').length, 1)
+})
+
+/**
+ * AND FAILING CLOSED HAS NOT MADE THE SCANNER UNUSABLE (o3d-rn10 r6).
+ *
+ * This is the risk the rewrite carries, and it is the reason to measure rather than assert it. A
+ * scanner that refuses a file it cannot read is only worth having if it can read the files this
+ * repository actually ships; one that trips on ordinary code gets an exemption, then a bypass, then
+ * deleted. So every shell script under version control is walked, every function symbol each one
+ * defines is looked up, and each must resolve to EXACTLY ONE under all three readings — the lexer,
+ * the word rule, and bash's own parse — with no refusal anywhere.
+ *
+ * ROUTE: shellFunctionDefinitions() over `git ls-files '*.sh'`, which is the same extractor the
+ * parity test and every behavioural rig in this file go through.
+ */
+test('[o3d-rn10] every function the tracked shell scripts define still resolves to exactly one', () => {
+  const listed = spawnSync('git', ['ls-files', '*.sh'], { cwd: REPO, encoding: 'utf8' })
+  assert.equal(listed.status, 0, listed.stderr)
+  const files = listed.stdout.trim().split('\n').filter(Boolean)
+  assert.ok(files.length >= 13, `the census must reach the tracked scripts; git listed ${files.length}`)
+
+  let canonicalDefinitions = 0
+  let symbolsResolved = 0
+  for (const file of files) {
+    const source = readFileSync(join(REPO, file), 'utf8')
+    canonicalDefinitions += source.split('\n').filter((line) => /^[A-Za-z_][A-Za-z0-9_]*\(\) \{$/.test(line)).length
+    // Names taken from the MASK, so a definition quoted inside a comment or written in an embedded
+    // awk program is not looked up as if it were shell.
+    const names = new Set<string>()
+    for (const match of maskShellSource(source, file).matchAll(/(?:^|\n)([A-Za-z_][A-Za-z0-9_]*)[ \t]*\([ \t]*\)/g)) names.add(match[1])
+    for (const name of names) {
+      assert.equal(shellFunctionDefinitions(source, name, file).length, 1,
+        `${file}: ${name}() must resolve to exactly one definition. A scanner that fails closed is `
+        + 'only usable while it can read the code this repository ships; if this is a legitimate '
+        + 'second definition, the script is what needs changing, and if it is not, the scanner is.')
+      symbolsResolved += 1
+    }
+  }
+
+  // THE WALK REACHED THE FILES, stated as numbers so a census that silently stopped visiting them
+  // cannot pass as one that visited them and found nothing wrong. Floors rather than equalities,
+  // because a new function is not a regression.
+  assert.ok(canonicalDefinitions >= 351,
+    `the tracked scripts carried 351 canonical \`name() {\` definitions when this was written; the census saw ${canonicalDefinitions}`)
+  assert.ok(symbolsResolved >= 373,
+    `the census resolved 373 (file, symbol) pairs when this was written; it saw ${symbolsResolved}`)
 })
 
 // ---------------------------------------------------------------------------
