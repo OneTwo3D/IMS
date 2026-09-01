@@ -104,12 +104,80 @@
  * All 351 canonical `name() {` definitions across the 13 tracked shell files — 373 (file, symbol)
  * pairs once the non-canonical and nested ones are included — still resolve to exactly one under
  * all three readings; see the census test in install-root-safe-writes.test.ts.
- * ─────────────────────────────────────────────────────────────────────────────────────────────
  *
- * WHAT COUNTS AS AN ASSIGNMENT. A top-level `NAME=`, with or without an `export`, `readonly`,
- * `declare` or `typeset` in front of it. Indented assignments are NOT counted: `local NAME=` and a
- * branch inside a function are ordinary shell, and a rule that banned them would ban the language.
- * The bypass this closes is a second top-level assignment, which is what a pasted copy looks like.
+ * ─────────────────────────────────────────────────────────────────────────────────────────────
+ * AND THE SAME THING FOR THE CONSTANT, WHICH WAS STILL A LINE ANCHOR (o3d-1dk9).
+ *
+ * The rewrite above made the FUNCTION half airtight and left the CONSTANT half exactly as it was:
+ * a per-line regex, `^(?:export|readonly|declare|typeset\s+…)?NAME=`. So the whole of the argument
+ * against enumerating command positions applied unanswered to the other symbol kind. Appending
+ *
+ *     true; PUBLISH_STAGE_DIRNAME="../../attacker"
+ *
+ * to scripts/deploy.sh was not caught, because the line does not START with the name. Verified
+ * under a real bash: that is the value the script publishes through, while `shellConstant()` went
+ * on returning install.sh's value and the parity comparison went on passing — the same vacuity, on
+ * the constant that aims every publication's staging directory.
+ *
+ * WHAT COUNTS AS AN ASSIGNMENT NOW. `NAME=` or `NAME+=` where `NAME` STARTS A WORD in shell code,
+ * at any indentation and in any command position, and NOT inside a function body. Three things
+ * follow from writing it that way rather than as a line rule:
+ *
+ *   - Nothing in front is enumerated. `export NAME=`, `readonly NAME=`, `declare -r NAME=` and
+ *     every prefix nobody has listed are caught by the word rule alone, exactly as `if`, `elif` and
+ *     `time -p` are caught for a definition. What is excluded is excluded by the same rule:
+ *     `$NAME=`, `${NAME}` and `x_NAME=` all have a non-metacharacter in front, so the name is the
+ *     tail of something longer and is not ours.
+ *   - It reads the MASK, so a `NAME=` inside a comment, a quoted string, a here-document body or an
+ *     embedded awk program is not an assignment. It never was one; the line rule counted some of
+ *     them.
+ *   - "TOP LEVEL" MEANS SCOPE, NOT COLUMN 0. That is the distinction the old anchor was reaching
+ *     for and could not express: it excluded `local NAME=` because such a line is INDENTED, which
+ *     is a fact about layout, and it excluded `true; NAME=` for the same reason, which is a bypass.
+ *     A body's extent is found with the mask in hand — see {@link braceGroupExtent} — so an
+ *     indented `local NAME=` stays uncounted because it is inside a function, and a `true; NAME=`
+ *     at script scope is counted because it is at script scope. Both were run under a real bash to
+ *     establish which value bash takes BEFORE either was required of this scanner.
+ *
+ * A SCOPE THAT CANNOT BE DETERMINED IS REFUSED, NAMED — the same answer the definition scanner
+ * gives. A function body may be any compound command: `f() ( … )`, `f() if …; fi` and
+ * `f() for …; done` all parse, and the extent of a subshell body cannot be delimited by counting
+ * parentheses once a `case` pattern's `)` is inside it — that would end the body EARLY and move an
+ * assignment out of function scope without saying so. So only a `{ … }` group is measured and
+ * every other body form throws and names its line. None of the 13 tracked scripts uses one: all 373
+ * bodies are brace groups.
+ *
+ * BASH CROSS-CHECKS IT, AND HERE IS EXACTLY HOW FAR THAT GOES. `--pretty-print` does not label a
+ * command with its scope, so it cannot be asked "is this assignment top level?" directly. What it
+ * does do is render EVERY function body as a `{ … }` group at a fresh word boundary — `f() ( … )`,
+ * `f() if …; fi` and `function f { … }` all come back as `f () \n{ \n … \n}` (verified) — so the
+ * nesting in its output is bash's own rather than the author's layout. The same two rules are read
+ * over that output, and both the NUMBER OF BODIES and the number of script-scope assignments must
+ * match the raw reading or the guard goes red naming both. That catches a body this file failed to
+ * find or delimited differently from bash, which is the failure this guard has actually had. It is
+ * a second reading of the same question, not an oracle for it: a construct BOTH readings misread
+ * alike is not caught by it, and this file says so rather than implying the parser settled it.
+ *
+ * WHAT THIS STILL CANNOT ANSWER, STATED RATHER THAN HIDDEN:
+ *
+ *   - AN UNQUOTED BRACE USED AS AN ORDINARY WORD. `echo }` inside a body ends it early here (an
+ *     over-count, so the guard goes red) and `echo {` extends it to the end of the file (a refusal,
+ *     since it never closes). Only a MATCHED spurious pair would move an assignment out of sight,
+ *     and bash's deparse reproduces such a pair rather than resolving it. No brace is used that way
+ *     in the 13 scripts.
+ *   - AN ASSIGNMENT INSIDE A FUNCTION THAT REACHES THE GLOBAL — `declare -g NAME=` or a plain
+ *     `NAME=` in a function that is then CALLED. Whether it takes effect depends on whether the
+ *     function runs before the value is read, which is a dataflow question and not a lexical one.
+ *     Scope is where this stops; it counts what executes at script scope.
+ *   - A SOURCED FILE. `. lib.sh` may assign the name, and this reads one file. That is why the
+ *     callers look the constant up in the entrypoint AND in scripts/lib/db-fence-protected.sh.
+ *
+ * AND THE COST OF FAILING CLOSED IS MEASURED AGAIN, because it was measured for the definitions and
+ * the same guard gets deleted the first time it fires on ordinary code. Across the 13 tracked
+ * scripts: 373 function bodies, all brace groups, and bash's parse of the same files contains 373
+ * too; 45 (file, constant) pairs over the 20 publication constants, every one of them resolving to
+ * EXACTLY ONE script-scope assignment under both readings, with no refusal anywhere. See the
+ * constant census in install-root-safe-writes.test.ts.
  */
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
@@ -448,6 +516,124 @@ function evalOffsets(mask: string): number[] {
   return found
 }
 
+/** True where a word ENDS: at a metacharacter, or at the end of the input. */
+function endsWord(ch: string | undefined): boolean {
+  return ch === undefined || METACHARACTERS.includes(ch)
+}
+
+/**
+ * The `[start, end)` offsets of the brace group that begins at or after `from`.
+ *
+ * A `{` and a `}` are RESERVED WORDS, not metacharacters, so they delimit a group only where they
+ * stand as a word of their own — which is the same word rule {@link definitionOffsets} uses, and
+ * the reason `${VAR}`, `{a,b}` and `find … {} \;` are all passed over rather than counted: in each
+ * of them the brace is glued to another character on one side or the other.
+ *
+ * REFUSES, NAMED, rather than guessing. A function body may be ANY compound command — `f() ( … )`,
+ * `f() if …; fi`, `f() for …; done` are all legal and were all verified to parse — and a subshell
+ * body cannot be delimited by counting parentheses once a `case` pattern's `)` is inside it, which
+ * would end the body EARLY and silently. So only a brace group is measured; every other body form
+ * throws and names its line. None of the 13 tracked scripts uses one (measured: 0 of 373 bodies).
+ */
+function braceGroupExtent(mask: string, from: number, where: string): [number, number] {
+  let start = from
+  while (start < mask.length && `${JOINED} \t\n`.includes(mask[start])) start += 1
+  if (mask[start] !== '{' || !endsWord(mask[start + 1])) {
+    throw new ShellLexError(
+      `${where}: line ${lineOf(mask, Math.min(start, mask.length - 1))} — a function body this scanner cannot `
+      + `delimit (it begins ${JSON.stringify(mask.slice(start, start + 24))}, not with a \`{\` group). `
+      + 'A body may be any compound command, and the extent of a subshell or an `if`/`for` body is '
+      + 'not a question a word-level lexer answers; ending it in the wrong place would move an '
+      + 'assignment in or out of function scope without saying so. The extent is refused rather '
+      + 'than guessed. Write the body as `{ … }`, or give this file its own regressions.')
+  }
+  let depth = 0
+  for (let j = start; j < mask.length; j += 1) {
+    const c = mask[j]
+    if (c !== '{' && c !== '}') continue
+    const opensWord = j === start || METACHARACTERS.includes(mask[j - 1])
+    if (!opensWord || !endsWord(mask[j + 1])) continue
+    if (c === '{') depth += 1
+    else {
+      depth -= 1
+      if (depth === 0) return [start, j + 1]
+    }
+  }
+  throw new ShellLexError(
+    `${where}: line ${lineOf(mask, start)} — a function body opened by \`{\` that this scanner never `
+    + 'sees closed by a `}` standing as its own word. The extent is refused rather than assumed to '
+    + 'run to the end of the file.')
+}
+
+/**
+ * `[start, end)` of every function BODY in `mask` — the regions in which an assignment is NOT at
+ * script scope.
+ *
+ * The headers are found the way {@link definitionOffsets} finds them, with the name left open
+ * instead of fixed: a word then `(` `)`, or the word `function` then a name. The one character bash
+ * itself excludes from that word is `=` — `x=() { echo hi; }` is a SYNTAX ERROR, not a definition
+ * (verified) — and excluding it is what keeps an ordinary `arr=()` from being read as a function
+ * whose body cannot be found.
+ */
+function functionBodyRanges(mask: string, where: string): Array<[number, number]> {
+  const meta = escapeForRegExp(METACHARACTERS)
+  const gap = `[${JOINED} \\t]*`
+  const ranges: Array<[number, number]> = []
+  const seen = new Set<number>()
+  const take = (from: number): void => {
+    const extent = braceGroupExtent(mask, from, where)
+    // `function name ()` matches both sweeps below and is ONE body, not two.
+    if (seen.has(extent[0])) return
+    seen.add(extent[0])
+    ranges.push(extent)
+  }
+
+  for (const match of mask.matchAll(new RegExp(`[^${meta}${JOINED}=]+${gap}\\(${gap}\\)`, 'g'))) {
+    const start = match.index
+    if (start !== 0 && !METACHARACTERS.includes(mask[start - 1])) continue
+    take(start + match[0].length)
+  }
+
+  for (const match of mask.matchAll(new RegExp(`(?:^|[${meta}])function[${JOINED} \\t]+`, 'g'))) {
+    let at = match.index + match[0].length
+    while (at < mask.length && !METACHARACTERS.includes(mask[at])) at += 1
+    let after = at
+    while (after < mask.length && `${JOINED} \t`.includes(mask[after])) after += 1
+    if (mask[after] !== '(') { take(at); continue }
+    after += 1
+    while (after < mask.length && `${JOINED} \t`.includes(mask[after])) after += 1
+    if (mask[after] !== ')') {
+      throw new ShellLexError(
+        `${where}: line ${lineOf(mask, at)} — a \`function\` header whose \`(\` this scanner does not see closed by \`)\`.`)
+    }
+    take(after + 1)
+  }
+
+  return ranges
+}
+
+/**
+ * Offsets in `mask` at which `name` is ASSIGNED — `name=`, `name+=`, with or without an `export`,
+ * `readonly`, `declare`, `typeset` or `local` in front of it.
+ *
+ * Nothing in front is enumerated, for the reason {@link definitionOffsets} gives: what makes the
+ * match ours is only that `name` STARTS A WORD, and a word starts after a metacharacter and nowhere
+ * else. `export NAME=` and `readonly NAME=` are caught by that without being named; `$NAME=`,
+ * `${NAME}` and `x_NAME=` are excluded by it, because in each the character in front joins the name
+ * to something longer.
+ */
+function assignmentOffsets(mask: string, name: string): number[] {
+  const j = `[${JOINED}]*`
+  const spelt = name.split('').map((c) => escapeForRegExp(c)).join(j)
+  const found: number[] = []
+  for (const match of mask.matchAll(new RegExp(`${spelt}${j}\\+?${j}=`, 'g'))) {
+    const start = match.index
+    if (start !== 0 && !METACHARACTERS.includes(mask[start - 1])) continue
+    found.push(start)
+  }
+  return found
+}
+
 const MASK_CACHE = new Map<string, string>()
 
 /** {@link maskShellSource}, memoised: the census walks 13 scripts once per symbol, not per byte. */
@@ -536,15 +722,89 @@ export function shellFunctionDefinitions(source: string, name: string, where = '
   return offsets.map((offset) => lineOf(source, offset) - 1)
 }
 
-/** Every line index at which `source` assigns `name` at top level (column 0). */
-export function shellConstantAssignments(source: string, name: string): number[] {
-  const escaped = escapeForRegExp(name)
-  const shape = new RegExp(`^(?:(?:export|readonly|declare|typeset)\\s+(?:-\\w+\\s+)*)?${escaped}=`)
-  const found: number[] = []
-  source.split('\n').forEach((line, index) => {
-    if (shape.test(line)) found.push(index)
-  })
-  return found
+/**
+ * Every OFFSET at which `source` assigns `name` at script scope — outside every function body.
+ *
+ * Throws rather than under-reporting, for the same reasons {@link shellFunctionDefinitions} does:
+ * an unlexable file, an `eval`, a body whose extent cannot be determined, or a disagreement with
+ * bash's own parse all fail here.
+ */
+function constantAssignmentOffsets(source: string, name: string, where: string): number[] {
+  const mask = maskCached(source, where)
+
+  const evals = evalOffsets(mask)
+  if (evals.length > 0) {
+    throw new ShellLexError(
+      `${where}: line ${lineOf(source, evals[0])} runs \`eval\`, and no lexical reading of this file `
+      + `can say how many times it assigns ${name}. \`eval '${name}=/attacker'\` is a STRING to this `
+      + "scanner, to any line rule, and to bash's own parser, which deparses it straight back out as "
+      + 'the string it is. The count is refused rather than guessed.')
+  }
+
+  const bodies = functionBodyRanges(mask, where)
+  const offsets = assignmentOffsets(mask, name)
+    .filter((offset) => !bodies.some(([start, end]) => offset >= start && offset < end))
+
+  // BASH'S OWN READING OF THE SAME BYTES, as for the definitions. `--pretty-print` deparses from
+  // the AST, and it renders EVERY function body as a `{ … }` group at a fresh word boundary —
+  // `f() ( … )`, `f() if …; fi` and `function f { … }` all come back as `f () \n{ \n … \n}` —
+  // so the nesting in this output is bash's own, not the author's layout. Reading the SAME two
+  // rules over it must give the same number of bodies and the same number of script-scope
+  // assignments. A disagreement means this file's lexer has misread something; it is reported,
+  // never resolved in favour of the smaller number.
+  //
+  // WHAT THIS CROSS-CHECK CANNOT DO, stated rather than implied: `--pretty-print` does not label
+  // a command with its scope, and this reads its output with the same word-level rules, so it is
+  // a second reading of the same question and not an oracle for it. It catches a body this file's
+  // lexer failed to find or delimited differently from bash — which is the failure mode this
+  // guard has actually had — and it does not catch a construct both readings misread alike.
+  const deparsedMask = maskCached(bashDeparse(source, where), `${where} (as bash parses it)`)
+  const deparsedBodies = functionBodyRanges(deparsedMask, `${where} (as bash parses it)`)
+  if (deparsedBodies.length !== bodies.length) {
+    throw new ShellLexError(
+      `${where}: this scanner finds ${bodies.length} function body/bodies but bash's own parse of the `
+      + `same bytes contains ${deparsedBodies.length}. Scope is decided by those bodies, so the two `
+      + 'readings must agree on them before an assignment count is reported. Fix the lexer — do not '
+      + 'take either number on its own.')
+  }
+  const deparsed = assignmentOffsets(deparsedMask, name)
+    .filter((offset) => !deparsedBodies.some(([start, end]) => offset >= start && offset < end))
+  if (deparsed.length !== offsets.length) {
+    throw new ShellLexError(
+      `${where}: this scanner finds ${offsets.length} script-scope assignment(s) of ${name} `
+      + `${offsets.length > 0 ? `(lines ${offsets.map((o) => lineOf(source, o)).join(', ')}) ` : ''}`
+      + `but bash's own parse of the same bytes contains ${deparsed.length}. The two readings must `
+      + 'agree before a count is reported: they disagree exactly when this file has misread a form '
+      + 'bash accepts. Fix the lexer — do not take the lower number.')
+  }
+
+  return offsets
+}
+
+/**
+ * Every line index at which `source` assigns `name` AT SCRIPT SCOPE — that is, anywhere outside a
+ * function body, at any indentation and in any command position.
+ *
+ * THIS USED TO BE A LINE ANCHOR, AND THE ANCHOR WAS THE BYPASS (o3d-1dk9). The rule was
+ * `^(?:export|readonly|declare|typeset\s+…)?NAME=` tested line by line, so appending
+ *
+ *     true; PUBLISH_STAGE_DIRNAME="../../attacker"
+ *
+ * to scripts/deploy.sh was invisible: the line does not START with the name. Verified under bash —
+ * the appended value is the one the script then publishes through — while `shellConstant()` went on
+ * returning install.sh's value and the parity comparison went on passing. That is exactly the
+ * vacuity {@link shellFunctionDefinitions} was rewritten twice to remove, left standing on the
+ * other half of the same claim: the constant that aims every publication's staging directory.
+ *
+ * SO THE ANCHOR IS GONE AND SCOPE REPLACES IT. "Top level" is not "column 0" — it is "not inside a
+ * function body", which is what the old rule was reaching for and could not express. An indented
+ * `local NAME=` inside a function stays uncounted because it is in a body, not because it is
+ * indented; a `true; NAME=` at script scope is counted because it is at script scope, however it is
+ * laid out. Both were run under a real bash to show which value bash takes before either was
+ * required of this scanner.
+ */
+export function shellConstantAssignments(source: string, name: string, where = 'the script'): number[] {
+  return constantAssignmentOffsets(source, name, where).map((offset) => lineOf(source, offset) - 1)
 }
 
 /**
@@ -582,14 +842,31 @@ export function shellConstant(source: string, name: string, where = 'the script'
   return line
 }
 
+/**
+ * The one line-prefix a lifted assignment may carry. This is NOT how the assignment is DETECTED —
+ * detection asks only whether the name starts a word, so `export`, `readonly`, `local` and every
+ * other prefix are caught without being listed. It is what the returned LINE is allowed to contain
+ * besides the assignment itself, because the rigs in this directory EXECUTE that line: anything
+ * else in front of it would be executed too, and would not be the assignment the caller asked for.
+ */
+const LIFTABLE_PREFIX = /^(?:(?:export|readonly|declare|typeset|local)[ \t]+(?:-[A-Za-z]+[ \t]+)*)?$/
+
 /** As {@link shellConstant}, but `undefined` when the script does not assign it at all. Still
  *  refuses a second assignment: "some other file defines it" is not "this file defines it twice". */
 export function shellConstantOptional(source: string, name: string, where = 'the script'): string | undefined {
-  const assignments = shellConstantAssignments(source, name)
-  assert.ok(assignments.length <= 1,
-    `${where} assigns ${name} ${assignments.length} times, at lines ${assignments.map((l) => l + 1).join(', ')}. `
+  const offsets = constantAssignmentOffsets(source, name, where)
+  assert.ok(offsets.length <= 1,
+    `${where} assigns ${name} ${offsets.length} times at script scope, at lines ${offsets.map((o) => lineOf(source, o)).join(', ')}. `
     + 'Bash keeps the LAST assignment; a harness that lifts the first would run the script with a value '
     + 'the script itself no longer has.')
-  if (assignments.length === 0) return undefined
-  return source.split('\n')[assignments[0]]
+  if (offsets.length === 0) return undefined
+  const lineStart = source.lastIndexOf('\n', offsets[0] - 1) + 1
+  const lineEnd = source.indexOf('\n', offsets[0])
+  const before = source.slice(lineStart, offsets[0])
+  assert.match(before, LIFTABLE_PREFIX,
+    `${where}: line ${lineOf(source, offsets[0])} assigns ${name} after ${JSON.stringify(before)}, and this `
+    + 'function returns the WHOLE LINE for a rig to execute. Detection covers that assignment wherever '
+    + 'it stands — that is the point of dropping the column-0 anchor — but the line around it cannot be '
+    + 'lifted and run as if it were the assignment alone. Put the assignment on a line of its own.')
+  return source.slice(lineStart, lineEnd === -1 ? source.length : lineEnd)
 }
