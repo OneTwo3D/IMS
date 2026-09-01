@@ -137,11 +137,15 @@ BEGIN
   -- previous release. The caller's value is discarded and OLD is written back unchanged, so the
   -- statement is a no-op on this column however it was spelt.
   --
-  -- `OLD."paidAt" IS NOT NULL` is the second half of r7's fix and it is not belt-and-braces: an
-  -- episode is a period during which the flag STANDS, so a marker sitting beside a NULL `paidAt` is
-  -- not one. Without this clause a row that reached that state — a pre-migration row, a write on a
-  -- path where this trigger did not run — would have its dead fence PRESERVED across the next paid
-  -- transition, which is the stale-fence defect itself.
+  -- `OLD."paidAt" IS NOT NULL` IS WHAT MAKES THIS TRIGGER CORRECT ON ITS OWN (r7). An episode is a
+  -- period during which the flag STANDS, so a marker sitting beside a NULL `paidAt` is not one and is
+  -- not a fence to preserve. Stated plainly: while the CHECK at the foot of this migration stands,
+  -- that state cannot be reached and this clause never fires — the constraint bolts the same door.
+  -- It is here because the two mechanisms must not depend on each other: drop the constraint and the
+  -- trigger still ends the episode; disable the trigger and the constraint still refuses the state.
+  -- A guard that is only correct because a DIFFERENT guard is also present is one deployment away
+  -- from being wrong, and this file's whole subject is guards that turned out to rest on something
+  -- else being true. The test that proves it is not vacuous drops the constraint to reach it.
   IF TG_OP = 'UPDATE' AND OLD."unregistered_paid_at" IS NOT NULL AND OLD."paidAt" IS NOT NULL THEN
     NEW."unregistered_paid_at" := OLD."unregistered_paid_at";
     RETURN NEW;

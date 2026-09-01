@@ -203,7 +203,15 @@ test(
         // arm while claiming to assert the self-discharge. Xero's fixtures were aligned in e0e71513;
         // this one is the sibling that was missed, and it is the case that would have shipped a
         // withheld verdict for every genuine QuickBooks chargeback.
-        payload: { accountingInvoiceId: invoiceId },
+        //
+        // r7 (Codex HIGH 1) — AND IT NAMES THE AMOUNT, for the same reason and by the same argument.
+        // The enqueue writes `amount` and `currency` beside the document id, and the reversal reader
+        // now weighs them: while the off-ledger marker stands, a registration that settled only PART
+        // of the order cannot have its absence read as a reversal of the whole order. This order is
+        // GBP 100 and this registration settled all of it — which is what makes the chargeback below
+        // a genuine one — so a fixture that omits the amount is not a smaller fixture, it is the
+        // part-covered case, and this test would again have asserted a different arm than it claims.
+        payload: { accountingInvoiceId: invoiceId, amount: 100, currency: 'GBP' },
       },
       select: { id: true },
     })

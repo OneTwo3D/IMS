@@ -36,6 +36,15 @@ import { config } from 'dotenv'
  * under it. The rule is now the NULL-to-non-null transition, and the proof below is driven through
  * the real WooCommerce writer rather than through an UPDATE this file spells itself.
  *
+ * r7 (Codex HIGH 2) — AND THE OTHER END OF AN EPISODE IS A FACT ABOUT `paidAt`.
+ *
+ * r6 justified "a genuine re-payment still mints" with a census of today's writers, every one of
+ * which clears `paidAt` and the marker in one statement. That is the kind of evidence the trigger
+ * exists BECAUSE IT CANNOT RELY ON — the migration's own reason for choosing a trigger is that it
+ * "has to bind writers this repository does not contain". The r7 block at the foot of this file drives
+ * exactly those writers: raw SQL naming only `paidAt`, the same statement with the trigger disabled to
+ * prove the CHECK is doing work, and the trigger examined alone with the CHECK dropped.
+ *
  * Gated behind RUN_DB_CONCURRENCY_TESTS=1: `npm run test:concurrency`.
  */
 
@@ -452,5 +461,71 @@ test(
       `SELECT count(*) AS n FROM "sales_orders" WHERE "paidAt" IS NULL AND "unregistered_paid_at" IS NOT NULL`,
     )
     assert.equal(Number(rows[0].n), 0)
+  },
+)
+
+test(
+  '[o3d-psrx r7] the trigger ends the episode even with the constraint out of the way',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    // WHAT THIS IS FOR. The trigger and the CHECK bolt the same door, and the trigger's
+    // `OLD."paidAt" IS NOT NULL` clause therefore never fires while both stand — which makes it
+    // exactly the kind of guard this branch keeps finding to be vacuous. So the constraint is dropped
+    // for the length of this test, the illegal state is manufactured with the trigger off, and the
+    // trigger alone is asked to do the thing the pair normally does together: refuse to treat a dead
+    // marker as this episode's fence.
+    //
+    // A guard that is only correct because a DIFFERENT guard is also present is one deployment away
+    // from being wrong. This is that guard, examined on its own.
+    const db = await loadDb()
+    const id = `PSRX7-${process.pid}-${randomUUID()}`
+    const CONSTRAINT = 'sales_orders_paid_episode_marker_needs_paid_at'
+    const TRIGGER = 'sales_order_mint_paid_episode_clock_update'
+    t.after(async () => {
+      await db.salesOrder.deleteMany({ where: { id } })
+      await db.$executeRawUnsafe(`ALTER TABLE "sales_orders" ENABLE TRIGGER ${TRIGGER}`).catch(() => {})
+      // Re-added and re-VALIDATED, so a failure here would mean this test left a violating row behind.
+      await db.$executeRawUnsafe(
+        `ALTER TABLE "sales_orders" ADD CONSTRAINT "${CONSTRAINT}" CHECK ("paidAt" IS NOT NULL OR "unregistered_paid_at" IS NULL)`,
+      ).catch(() => {})
+    })
+
+    await createOrder(db, id, new Date('2026-08-01T09:00:00.000Z'))
+    const deadFence = await storedEpisode(db, id)
+    assert.ok(deadFence, 'PRECONDITION: an episode is under way')
+    const firstEpisodeCompletion = new Date(await databaseNow(db))
+
+    // MANUFACTURE THE STATE NEITHER MECHANISM ALLOWS: marker standing over an unpaid order.
+    await db.$executeRawUnsafe(`ALTER TABLE "sales_orders" DROP CONSTRAINT "${CONSTRAINT}"`)
+    await db.$executeRawUnsafe(`ALTER TABLE "sales_orders" DISABLE TRIGGER ${TRIGGER}`)
+    await db.$executeRawUnsafe(`UPDATE "sales_orders" SET "paidAt" = NULL WHERE id = $1`, id)
+    await db.$executeRawUnsafe(`ALTER TABLE "sales_orders" ENABLE TRIGGER ${TRIGGER}`)
+    assert.equal(await storedEpisode(db, id), deadFence,
+      'PRECONDITION: the stale marker must actually be there, or this test proves nothing')
+
+    // NOW THE TRIGGER, ALONE. The order is paid again and the caller names both columns, exactly as
+    // `markSalesOrderPaid` does. With `OLD."paidAt" IS NOT NULL` removed, the rule would see OLD's
+    // marker non-null, call it "an episode already under way", and write the DEAD fence back.
+    await db.$executeRawUnsafe(
+      `UPDATE "sales_orders" SET "paidAt" = clock_timestamp(), "unregistered_paid_at" = clock_timestamp() WHERE id = $1`,
+      id,
+    )
+    const newFence = await storedEpisode(db, id)
+    assert.ok(newFence, 'the new paid episode must carry a fence')
+    assert.ok(newFence > deadFence,
+      'and it must be a NEW one: a marker beside a NULL paidAt is not an episode under way, so there '
+      + 'was nothing to preserve')
+
+    const { registrationBindsToPaidState } = await import('@/lib/connectors/xero/invoice-delta')
+    assert.equal(
+      registrationBindsToPaidState(
+        { registeredAgainstInvoiceId: 'inv_1', externalTransactionId: 'PAY-1' },
+        firstEpisodeCompletion,
+        { accountingInvoiceId: 'inv_1', unregisteredPaidAt: new Date(newFence) },
+      ),
+      false,
+      'so the previous episode\'s registration cannot answer for this paid flag — which is the whole '
+      + 'cost of a preserved dead fence',
+    )
   },
 )
