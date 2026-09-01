@@ -756,7 +756,20 @@ export async function isWcOrderWebhookPrimaryActive(): Promise<boolean> {
   return (Date.now() - ts) <= WEBHOOK_PRIMARY_FRESH_MS
 }
 
-async function updateExistingWcOrderFromPayload(
+/**
+ * EXPORTED FOR THE FENCE REGRESSION, and for nothing else (o3d-psrx r6, Codex HIGH 1).
+ *
+ * This is the writer that re-sends WooCommerce's `date_paid_gmt` into `unregisteredPaidAt` on EVERY
+ * webhook redelivery and every `modified_after` poll that touches the order again. r5's trigger
+ * guarded re-minting with `OLD IS DISTINCT FROM NEW`, which this writer defeats by construction, and
+ * r5's own test missed it because it re-submitted the value the database had stored. So the
+ * regression in tests/concurrency/paid-episode-database-clock.concurrent.test.ts drives THIS
+ * function against a real PostgreSQL rather than a hand-written UPDATE — a test that re-spells the
+ * writer's `data` is a test of the test.
+ *
+ * `importWcOrder` remains the only production entry point; nothing but the regression calls this.
+ */
+export async function updateExistingWcOrderFromPayload(
   orderId: string,
   wcOrder: WcFullOrder,
 ): Promise<void> {

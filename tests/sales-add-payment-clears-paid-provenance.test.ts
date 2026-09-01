@@ -22,6 +22,16 @@ import test, { mock } from 'node:test'
  * test that rebuilt `addPayment`'s writes by hand would have sailed straight over it, exactly as the
  * r2 concurrency test did. So the real action runs, with the database recorded rather than mocked
  * away per-call, and the assertions are on the writes it actually issues.
+ *
+ * r6 (Codex HIGH 2) — AND THE REPLACEMENT IS BY COVERAGE, NOT BY EXISTENCE.
+ *
+ * r5 cleared the marker on ANY non-refund receipt. `addPayment` explicitly permits PARTIAL receipts —
+ * its only amount guard rejects an over-payment — so a GBP 1 receipt on a GBP 100 order marked paid by
+ * hand erased the evidence that the other GBP 99 was settled off-ledger, which is a statement about the
+ * whole balance and was still true. The rule is now the one `becamePaid` already applied: the
+ * non-refund receipts on the order, this one included, must COVER its total. The two arms below —
+ * partial leaves it standing, cumulative cover clears it — are the halves of that sentence, and
+ * tests/accounting/partial-receipt-paid-provenance.test.ts is what the surviving marker then buys.
  */
 
 type Row = Record<string, unknown>
@@ -126,7 +136,7 @@ const HAND_MARKED_PAID = {
   invoiceNumber: 'INV-1',
 }
 
-test('[o3d-psrx r5] a receipt on an ALREADY-paid order clears its off-ledger provenance', async () => {
+test('[o3d-psrx r5] a COVERING receipt on an ALREADY-paid order clears its off-ledger provenance', async () => {
   reset({ ...HAND_MARKED_PAID })
 
   const result = await addPayment({ orderId: 'so-1', amount: 100, currency: 'GBP' })
@@ -175,4 +185,57 @@ test('[o3d-psrx r5] CONTROL: a REFUND receipt does not touch the invoice-side pr
   assert.equal(state.registered.length, 0, 'and no INVOICE_PAYMENT is raised for a refund receipt')
 
   tx.salesOrderRefund.findFirst = withRefund.findFirst
+})
+
+test('[o3d-psrx r6] a PARTIAL receipt on an already-paid order leaves the provenance STANDING', async () => {
+  reset({ ...HAND_MARKED_PAID })
+
+  // A penny of a hundred pounds. The action accepts it — its only amount guard is against an
+  // OVER-payment — and that acceptance is the whole finding: r5 treated the receipt's EXISTENCE as
+  // the replacement, so this write erased the evidence that the other GBP 99 was settled off-ledger.
+  const result = await addPayment({ orderId: 'so-1', amount: 1, currency: 'GBP' })
+  assert.equal(result.success, true, JSON.stringify(result))
+
+  // THE PRECONDITIONS, so this cannot pass by refusing the receipt or by taking the paid branch.
+  assert.equal(state.created.length, 1, 'the partial receipt must actually have been recorded')
+  assert.equal(Number(state.created[0].amount), 1)
+  assert.equal(state.updates.length, 0, 'the order was already paid — the becamePaid path must not run')
+
+  assert.deepEqual(state.updateManys.filter((u) => 'unregisteredPaidAt' in u.data), [],
+    'GBP 1 does not settle GBP 100, so the marker — which speaks for the WHOLE paid balance — stands')
+
+  // And the receipt is still registered with the ledger. Withholding the provenance change is not
+  // withholding the registration; the two are different facts.
+  assert.equal(state.registered.length, 1)
+})
+
+test('[o3d-psrx r6] the receipt that COMPLETES the cover clears it — cumulatively, not on its own size', async () => {
+  reset({ ...HAND_MARKED_PAID })
+  // GBP 99 already recorded against this order. The receipt below is GBP 1 — identical in size to the
+  // one above, and this time it is the one that finishes the job.
+  state.payments = [{ amount: 99, currency: 'GBP' }]
+
+  const result = await addPayment({ orderId: 'so-1', amount: 1, currency: 'GBP' })
+  assert.equal(result.success, true, JSON.stringify(result))
+
+  assert.equal(state.created.length, 1, 'the receipt must actually have been recorded')
+  assert.equal(state.updates.length, 0, 'still the already-paid branch — paidAt must not be re-stamped')
+
+  const cleared = state.updateManys.filter((u) => 'unregisteredPaidAt' in u.data)
+  assert.equal(cleared.length, 1, 'the receipts now cover the total, so nothing is settled off-ledger')
+  assert.deepEqual(cleared[0].data, { unregisteredPaidAt: null })
+  assert.deepEqual(cleared[0].where, { id: 'so-1', unregisteredPaidAt: { not: null } })
+})
+
+test('[o3d-psrx r6] CONTROL: a partial receipt that MAKES the order paid is not a thing', async () => {
+  reset({ ...HAND_MARKED_PAID, paidAt: null })
+
+  const result = await addPayment({ orderId: 'so-1', amount: 1, currency: 'GBP' })
+  assert.equal(result.success, true, JSON.stringify(result))
+
+  // The unpaid arm was always coverage-tested; this states that r6 did not loosen it. GBP 1 neither
+  // sets `paidAt` nor touches the provenance of a flag that is not set.
+  assert.equal(state.created.length, 1)
+  assert.equal(state.updates.length, 0, 'GBP 1 of GBP 100 is not a paid transition')
+  assert.deepEqual(state.updateManys.filter((u) => 'unregisteredPaidAt' in u.data), [])
 })

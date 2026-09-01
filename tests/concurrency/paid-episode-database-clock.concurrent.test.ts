@@ -26,6 +26,16 @@ import { config } from 'dotenv'
  * local zone would make a passing test out of a broken fence. `to_char` moves the whole comparison
  * into the database, where the ordering the fence actually uses lives.
  *
+ * r6 (Codex HIGH 1) — AND WHEN A NEW FENCE IS MINTED IS A TRANSITION, NOT A DIFFERENCE.
+ *
+ * r5 guarded re-minting with `OLD IS DISTINCT FROM NEW` and proved it with the assertion "re-writing
+ * the stored value is not a new episode" — which submits the value the DATABASE minted. No production
+ * writer does that. `updateExistingWcOrderFromPayload` submits the SHOP's `date_paid_gmt`, and after
+ * the first write the shop's value and the database's necessarily differ, so the guard passed on
+ * every webhook redelivery and the fence walked forward past registrations that had already completed
+ * under it. The rule is now the NULL-to-non-null transition, and the proof below is driven through
+ * the real WooCommerce writer rather than through an UPDATE this file spells itself.
+ *
  * Gated behind RUN_DB_CONCURRENCY_TESTS=1: `npm run test:concurrency`.
  */
 
@@ -141,6 +151,17 @@ test(
     await db.salesOrder.update({ where: { id }, data: { unregisteredPaidAt: row!.unregisteredPaidAt } })
     assert.equal(await storedEpisode(db, id), first, 're-writing the stored value is not a new episode')
 
+    // r6 — AND NEITHER IS WRITING A DIFFERENT ONE, which is the case r5's `IS DISTINCT FROM` guard
+    // could not tell from a new episode and which is the ONLY case production actually produces: no
+    // writer re-submits the database's own value, and the WooCommerce importer re-submits the shop's
+    // `date_paid_gmt` on every redelivery. Two different wrong answers are tried here — a value in
+    // the past and a value in the future — because a comparison, unlike a transition, is direction-
+    // sensitive and either direction is a moved fence.
+    await db.salesOrder.update({ where: { id }, data: { unregisteredPaidAt: new Date('2019-06-01T00:00:00.000Z') } })
+    assert.equal(await storedEpisode(db, id), first, 'a caller supplying an EARLIER value is not a new episode')
+    await db.salesOrder.update({ where: { id }, data: { unregisteredPaidAt: new Date(Date.now() + 3_600_000) } })
+    assert.equal(await storedEpisode(db, id), first, 'a caller supplying a LATER value is not a new episode either')
+
     // A GENUINELY NEW EPISODE IS. Paid, reversed, paid again: the second marker must be the database's
     // reading at the second transition, not the caller's and not the first one.
     await db.salesOrder.update({ where: { id }, data: { paidAt: null, unregisteredPaidAt: null } })
@@ -151,5 +172,128 @@ test(
     })
     const second = await storedEpisode(db, id)
     assert.ok(second && second > first, 'the second paid episode must carry a later database-minted fence')
+  },
+)
+
+/**
+ * o3d-psrx r6 (Codex HIGH 1) — THE REAL WOOCOMMERCE WRITER, REPEATEDLY, AGAINST A REAL DATABASE.
+ *
+ * The two tests above are about the RULE. This one is about the writer that broke it, and it drives
+ * `updateExistingWcOrderFromPayload` — the function `importWcOrder` calls for every order IMS already
+ * holds — rather than an UPDATE spelt here. That distinction is the finding: r5's test re-submitted
+ * the value the database had minted, which no production writer does, and the writer that matters
+ * re-submits the SHOP's `date_paid_gmt` on every webhook redelivery and every `modified_after` poll
+ * that sees the order again.
+ *
+ * WHAT IS BEING PROVED IS NOT "THE COLUMN DID NOT CHANGE". It is that an INVOICE_PAYMENT registration
+ * which completed under this episode STILL BINDS to it after the redeliveries — measured through
+ * `registrationBindsToPaidState`, the function the reversal classifier actually asks. A fence that
+ * walks past a completed registration unbinds it permanently (the comparison is over two immutable
+ * values), the order parks on PAID_WITHOUT_LEDGER_RECEIPT, and a genuine chargeback against it is
+ * never recognised.
+ *
+ * No WooCommerce call is made: the payload is a literal, and a payload carrying no PDF-invoice meta
+ * returns out of the writer immediately after its transaction.
+ */
+function wcPaidPayload(externalId: number, datePaidGmt: string) {
+  const address = {
+    first_name: 'A', last_name: 'Customer', company: '', address_1: '1 Test Street', address_2: '',
+    city: 'Cambridge', state: '', postcode: 'CB1 1AA', country: 'GB', email: 'ops@example.com', phone: '',
+  }
+  return {
+    id: externalId,
+    parent_id: 0,
+    number: String(externalId),
+    order_key: `wc_order_${externalId}`,
+    created_via: 'checkout',
+    version: '9.0.0',
+    status: 'processing',
+    currency: 'GBP',
+    date_created: '2026-08-01T09:00:00',
+    date_created_gmt: '2026-08-01T09:00:00',
+    date_modified: '2026-08-01T09:00:00',
+    date_modified_gmt: '2026-08-01T09:00:00',
+    discount_total: '0.00', discount_tax: '0.00', shipping_total: '0.00', shipping_tax: '0.00',
+    cart_tax: '0.00', total: '100.00', total_tax: '0.00', prices_include_tax: true,
+    customer_id: 0, customer_ip_address: '', customer_note: '',
+    billing: address, shipping: address,
+    payment_method: 'stripe', payment_method_title: 'Card', transaction_id: 'ch_1',
+    date_paid: datePaidGmt, date_paid_gmt: datePaidGmt,
+    date_completed: null, date_completed_gmt: null,
+    cart_hash: '',
+    // NO PDF-invoice meta: the writer's post-transaction half returns immediately, so this test
+    // touches the paid columns and nothing else.
+    meta_data: [],
+    line_items: [], tax_lines: [], shipping_lines: [], fee_lines: [], coupon_lines: [], refunds: [],
+  }
+}
+
+test(
+  '[o3d-psrx r6] a WooCommerce REDELIVERY of an unchanged paid order does not move the fence',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    const db = await loadDb()
+    loadEnv()
+    const { updateExistingWcOrderFromPayload } = await import('@/lib/connectors/woocommerce/sync/order-import')
+    const { registrationBindsToPaidState } = await import('@/lib/connectors/xero/invoice-delta')
+
+    const id = `PSRX6-${process.pid}-${randomUUID()}`
+    const externalId = Math.floor(Math.random() * 2_000_000_000)
+    t.after(async () => { await db.salesOrder.deleteMany({ where: { id } }) })
+
+    // The order as IMS holds it before the payment: imported, linked, UNPAID. Nothing to fence yet.
+    await db.salesOrder.create({
+      data: {
+        id,
+        status: 'SHIPPED',
+        currency: 'GBP',
+        subtotalForeign: 100, totalForeign: 100, subtotalBase: 100, totalBase: 100,
+        accountingInvoiceId: 'inv_1',
+        shoppingLinks: {
+          create: { connector: 'woocommerce', externalOrderId: String(externalId), externalOrderNumber: String(externalId) },
+        },
+      },
+    })
+    assert.equal(await storedEpisode(db, id), null, 'an unpaid order has no episode')
+
+    // DELIVERY 1: the shop reports the order paid. NULL -> non-null, so a fence is minted.
+    const payload = wcPaidPayload(externalId, '2026-08-02T10:00:00')
+    await updateExistingWcOrderFromPayload(id, payload as never)
+    const fence = await storedEpisode(db, id)
+    assert.ok(fence, 'the paid delivery must have minted an episode')
+    assert.ok(fence > '2026-08-02T10:00:00.000000Z',
+      'and it must be the DATABASE\'s reading, not the shop\'s date_paid_gmt')
+
+    // A REGISTRATION COMPLETES UNDER THAT EPISODE. Its instant is a reading of the same clock, taken
+    // after the fence, exactly as `stampSyncedAtFromDatabaseClock` takes it.
+    const completedIso = await databaseNow(db)
+    const completedAt = new Date(completedIso)
+    const registration = { registeredAgainstInvoiceId: 'inv_1', externalTransactionId: 'PAY-1' }
+    const boundBefore = registrationBindsToPaidState(
+      registration, completedAt, { accountingInvoiceId: 'inv_1', unregisteredPaidAt: new Date(fence) },
+    )
+    assert.equal(boundBefore, true, 'PRECONDITION: the registration must bind before the redeliveries')
+
+    // DELIVERIES 2..4: the SAME payload, the way a retried webhook and the modified_after poll send
+    // it. Nothing about the order has changed; the shop's date_paid_gmt is simply re-sent.
+    for (let i = 0; i < 3; i += 1) await updateExistingWcOrderFromPayload(id, payload as never)
+
+    assert.equal(await storedEpisode(db, id), fence,
+      'THE FINDING: the redelivery re-minted the fence, so it now sits past registrations that '
+      + 'completed under the episode it is supposed to be the start of')
+    const fenceNow = await storedEpisode(db, id)
+    assert.ok(fenceNow)
+    assert.equal(
+      registrationBindsToPaidState(
+        registration, completedAt, { accountingInvoiceId: 'inv_1', unregisteredPaidAt: new Date(fenceNow) },
+      ),
+      true,
+      'and the registration that legitimately followed the paid transition is still bound to it',
+    )
+
+    // AND THE ORDER'S OWN PAID DATE IS UNTOUCHED BY THE RULE: `paidAt` still carries the shop's
+    // instant, which is what an operator reads. Only the fence is the database's.
+    const row = await db.salesOrder.findUnique({ where: { id }, select: { paidAt: true } })
+    assert.equal(row?.paidAt?.toISOString(), new Date('2026-08-02T10:00:00').toISOString())
   },
 )
