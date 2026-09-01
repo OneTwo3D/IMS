@@ -41,12 +41,37 @@
 -- imported a week after it was paid keeps `date_paid_gmt` in `paidAt` and gets an episode fence of
 -- "when IMS came to believe it", which is the only instant any registration of ours can follow.
 --
--- ON `TG_OP = 'INSERT'` AND `IS DISTINCT FROM`. A write that leaves the value alone must not re-mint
--- it: the episode began when the flag was set, and re-stamping it on an unrelated UPDATE would push
--- the fence forward past registrations that had already completed under it — unbinding them, which is
--- the failure this migration exists to remove, re-created by its own fix. So only a statement that
--- actually CHANGES the value mints a new one. Clearing to NULL is left alone entirely: no episode, no
--- fence.
+-- WHEN A NEW FENCE IS MINTED, AND WHY IT IS A TRANSITION AND NOT A DIFFERENCE (r6, Codex HIGH 1).
+--
+-- The rule above needs a companion: a write that does not BEGIN an episode must not re-mint. Round 5
+-- said so and then wrote the test as `OLD IS DISTINCT FROM NEW` — a comparison between the value the
+-- DATABASE minted and the value the CALLER supplied. After the first write those two necessarily
+-- differ, because the first write is precisely what replaced the caller's value with the database's.
+-- So the guard passed on every subsequent write, and there IS a subsequent write on the hot path:
+-- `updateExistingWcOrderFromPayload` re-sends the shop's `date_paid_gmt` on EVERY webhook redelivery
+-- and every `modified_after` poll that sees the order again. The fence therefore advanced on each
+-- delivery, past INVOICE_PAYMENT registrations that had already completed under it, unbinding them
+-- for ever and parking the order on PAID_WITHOUT_LEDGER_RECEIPT — the exact defect this migration
+-- exists to remove, re-created by its own fix. Round 5 named that hazard in this comment block and
+-- then built the comparison that causes it.
+--
+-- WHAT ACTUALLY MARKS A NEW EPISODE IS A TRANSITION THE DATABASE CAN SEE FOR ITSELF: the column going
+-- from ABSENT to PRESENT. Nothing a caller supplies is consulted at all.
+--
+--   INSERT with a marker            the row arrives already inside an episode. Mint.
+--   UPDATE, OLD NULL, NEW non-null  the paid flag has just been set with nothing to register. Mint.
+--   UPDATE, OLD non-null            an episode is already under way. THE STORED VALUE STANDS,
+--                                   whatever the caller supplied — this is the redelivery case.
+--   NEW NULL                        the flag is being cleared. No episode, no fence, nothing to do.
+--
+-- AND A GENUINE RE-PAYMENT STILL MINTS, because ending an episode is what clears the column, in the
+-- same statement that clears `paidAt`, by every writer the census in
+-- tests/accounting/paid-provenance-writers.test.ts enumerates: `markSalesOrderPaid` toggling off
+-- (`paidAt: null, unregisteredPaidAt: null`), `removePaymentAndSettlePaidAt` when the remaining
+-- receipts no longer settle the order, and both pollers' reversal writes. Paid → unpaid → paid again
+-- therefore passes through NULL, and the second `paid` is a NULL-to-non-null transition that mints a
+-- second, strictly later fence. What can no longer happen is a fence moving WITHOUT the flag having
+-- been cleared, and no legitimate episode begins that way.
 --
 -- IT ONLY EVER NARROWS. A minted marker is at or after the caller's, so the set of registrations that
 -- bind can only shrink relative to trusting the host — and shrinking withholds, which costs a warning
@@ -58,16 +83,28 @@ RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 BEGIN
-  IF NEW."unregistered_paid_at" IS NOT NULL
-     AND (TG_OP = 'INSERT' OR OLD."unregistered_paid_at" IS DISTINCT FROM NEW."unregistered_paid_at")
-  THEN
-    -- `clock_timestamp()` and NOT `now()`: `now()` is transaction-start time, and the paid transition
-    -- rides inside a transaction that also locks the order and reads it. `clock_timestamp()` is read
-    -- at the statement. AT TIME ZONE 'UTC' because the column is TIMESTAMP WITHOUT TIME ZONE holding
-    -- UTC — the identical expression `readDatabaseLedgerFence` and `stampSyncedAtFromDatabaseClock`
-    -- use, so the fence's two ends are directly comparable whatever the session TimeZone is.
-    NEW."unregistered_paid_at" := clock_timestamp() AT TIME ZONE 'UTC';
+  -- The flag is being cleared. The episode is ending, not beginning; leave the NULL alone.
+  IF NEW."unregistered_paid_at" IS NULL THEN
+    RETURN NEW;
   END IF;
+
+  -- AN EPISODE ALREADY UNDER WAY. The stored fence is this episode's own start and nothing later may
+  -- move it: not a WooCommerce redelivery re-sending `date_paid_gmt`, not a repair script, not a
+  -- previous release. The caller's value is discarded and OLD is written back unchanged, so the
+  -- statement is a no-op on this column however it was spelt.
+  IF TG_OP = 'UPDATE' AND OLD."unregistered_paid_at" IS NOT NULL THEN
+    NEW."unregistered_paid_at" := OLD."unregistered_paid_at";
+    RETURN NEW;
+  END IF;
+
+  -- A NEW EPISODE: an insert that arrives inside one, or NULL -> non-null.
+  --
+  -- `clock_timestamp()` and NOT `now()`: `now()` is transaction-start time, and the paid transition
+  -- rides inside a transaction that also locks the order and reads it. `clock_timestamp()` is read
+  -- at the statement. AT TIME ZONE 'UTC' because the column is TIMESTAMP WITHOUT TIME ZONE holding
+  -- UTC — the identical expression `readDatabaseLedgerFence` and `stampSyncedAtFromDatabaseClock`
+  -- use, so the fence's two ends are directly comparable whatever the session TimeZone is.
+  NEW."unregistered_paid_at" := clock_timestamp() AT TIME ZONE 'UTC';
   RETURN NEW;
 END;
 $$;
@@ -81,20 +118,18 @@ FOR EACH ROW
 WHEN (NEW."unregistered_paid_at" IS NOT NULL)
 EXECUTE FUNCTION sales_order_mint_paid_episode_clock();
 
+-- DROPPED BEFORE THE BACKFILL AND CREATED AFTER IT, and the order is load-bearing (r6). The rule
+-- above preserves OLD whenever an episode is already under way, which is exactly what every row the
+-- backfill below is about looks like — so with the UPDATE trigger in place the backfill would be a
+-- silent no-op and the host-clock values it exists to delete would survive it. Both statements run
+-- inside this migration's transaction, so there is no window in which the table is unguarded.
 DROP TRIGGER IF EXISTS sales_order_mint_paid_episode_clock_update ON "sales_orders";
-
--- `UPDATE OF` so every write that does not mention the column — status changes, allocation stamps,
--- the accounting sub-ledger columns — never reaches the function at all.
-CREATE TRIGGER sales_order_mint_paid_episode_clock_update
-BEFORE UPDATE OF "unregistered_paid_at" ON "sales_orders"
-FOR EACH ROW
-EXECUTE FUNCTION sales_order_mint_paid_episode_clock();
 
 -- AND NO HOST-CLOCK VALUE SURVIVES THE MIGRATION.
 --
 -- 20260830090000 added this column and backfilled it from `paidAt` — an application clock, by
--- definition, since that is what wrote `paidAt`. The trigger above governs every value written from
--- here on; these are the ones already stored, and leaving them would make the column half-minted with
+-- definition, since that is what wrote `paidAt`. The trigger governs every value written from here
+-- on; these are the ones already stored, and leaving them would make the column half-minted with
 -- nothing in the row to say which half a given value is in. That is precisely the "laundered pair"
 -- objection round 6 raised against `syncedAtDatabaseClock`, and the answer here is simpler than a
 -- second column because the direction is not symmetric: re-minting moves every historical marker
@@ -108,11 +143,13 @@ EXECUTE FUNCTION sales_order_mint_paid_episode_clock();
 -- PAID_WITHOUT_LEDGER_RECEIPT either way, which withholds. So the observable change is none, and the
 -- invariant it buys is total: AFTER THIS MIGRATION EVERY NON-NULL VALUE IN THIS COLUMN WAS MINTED BY
 -- THIS DATABASE.
---
--- The trigger fires on this statement and mints each row's own `clock_timestamp()`, so the value
--- written below is replaced per row by the same rule every later writer gets. It is spelt out anyway
--- rather than written as a no-op update: a migration that depends on a trigger to supply the value it
--- claims to write is a migration that reads as doing nothing.
 UPDATE "sales_orders"
 SET "unregistered_paid_at" = clock_timestamp() AT TIME ZONE 'UTC'
 WHERE "unregistered_paid_at" IS NOT NULL;
+
+-- `UPDATE OF` so every write that does not mention the column — status changes, allocation stamps,
+-- the accounting sub-ledger columns — never reaches the function at all.
+CREATE TRIGGER sales_order_mint_paid_episode_clock_update
+BEFORE UPDATE OF "unregistered_paid_at" ON "sales_orders"
+FOR EACH ROW
+EXECUTE FUNCTION sales_order_mint_paid_episode_clock();

@@ -3472,7 +3472,24 @@ export async function addPayment(input: {
       // is no instant at which a reader can see `paidAt` set and not see the receipt that set it.
       // `unregisteredLocalReceipts` in lib/connectors/xero/invoice-delta.ts is that reader. SPLITTING
       // these two writes across transactions — in either order — reopens the defect.
-      const becamePaid = !refundId && !so.paidAt && totalPaid + input.amount >= Number(so.totalForeign) - 0.0001
+      //
+      // AND THE MARKER IS CLEARED BY COVERAGE, NOT BY THE EXISTENCE OF A RECEIPT (r6, Codex HIGH 2).
+      //
+      // `unregisteredPaidAt` asserts something about the WHOLE paid balance: "no ledger receipt
+      // covers this flag". A £1 receipt on a £100 order hand-marked paid does not make that false —
+      // £99 of it is still settled by nothing IMS ever told the ledger about — and this action
+      // explicitly permits partial receipts (the guard above rejects only an OVER-payment). Round 5
+      // cleared the marker on ANY non-refund receipt, which erased the provenance of the whole
+      // balance on the strength of a penny of it, leaving the order with exactly one thing the
+      // classifier can see: a single registration for £1. Retire that registration and the order
+      // reads NOTHING_REGISTERED — an ADMITTED reversal — and a chargeback credit note is raised
+      // against £100 the customer paid.
+      //
+      // So the same test decides both writes: do the non-refund receipts on this order, THIS ONE
+      // INCLUDED, cover its total? That is already the test `becamePaid` applies; it is simply not
+      // the only branch that needs it.
+      const coversOrderTotal = !refundId && totalPaid + input.amount >= Number(so.totalForeign) - 0.0001
+      const becamePaid = !so.paidAt && coversOrderTotal
       if (becamePaid) {
         await tx.salesOrder.update({
           where: { id: input.orderId },
@@ -3483,7 +3500,7 @@ export async function addPayment(input: {
           // not omitted: an order marked paid by hand and THEN given a receipt must lose the marker.
           data: { paidAt: new Date(), unregisteredPaidAt: null },
         })
-      } else if (!refundId) {
+      } else if (coversOrderTotal) {
         // o3d-psrx r5 (Codex HIGH 1) — AND THE ORDER THAT WAS ALREADY PAID LOSES IT TOO.
         //
         // The comment above says "an order marked paid by hand and THEN given a receipt must lose the
@@ -3501,6 +3518,14 @@ export async function addPayment(input: {
         //
         // `updateMany` with the guard rather than `update`: the overwhelming majority of receipts land
         // on orders with no marker at all, and this way those pay a predicate instead of a row write.
+        //
+        // WHAT A PERMANENTLY PART-COVERED ORDER READS AS, since a rule that withholds needs its
+        // steady state stated (r6). It keeps the marker, and the marker is consulted by
+        // `classifyRegisteredPaymentAgainstListing` ONLY when nothing posted is left to speak — so
+        // while the £1 receipt is unregistered the verdict is RECEIPT_NOT_REGISTERED, once its
+        // registration posts and binds the LEDGER decides, and the marker speaks only in the state
+        // its own sentence describes: no receipt, no registration, nothing but IMS's own silence.
+        // It is therefore neither a silent full registration nor a permanent withholding.
         await tx.salesOrder.updateMany({
           where: { id: input.orderId, unregisteredPaidAt: { not: null } },
           // `paidAt` is deliberately NOT written here — this order is already paid and re-stamping it
