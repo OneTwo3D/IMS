@@ -109,6 +109,8 @@ export const SHIPPED = [
   // o3d-rn10: the publisher resolves its destination from a trusted ancestor instead of stat-ing
   // its own pathname, so the table and the walk come with it.
   'publish_trust_root_candidates',
+  // r4: publish_root_anchored() is a subshell around this walk, and is nothing without it.
+  'pin_publish_root_parent',
   'publish_root_anchored',
   'publish_trust_root',
   'pin_dir_beneath_root',

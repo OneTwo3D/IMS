@@ -78,7 +78,12 @@ function rig(functions: string[], body: string, extra = ''): string {
  * the roots are the way the installer does, by defining ${APP_DIR} and ${DATA_DIR}, and never by
  * re-typing the table itself.
  */
-const PUBLISHER = ['fsync_path', 'publish_trust_root_candidates', 'publish_root_anchored', 'publish_trust_root', 'pin_dir_beneath_root', 'publish_durable_file']
+const PUBLISHER = ['fsync_path', 'publish_trust_root_candidates', 'pin_publish_root_parent', 'publish_root_anchored', 'publish_trust_root', 'pin_dir_beneath_root', 'publish_durable_file']
+
+/** The anchor and the walk it is made of (o3d-rn10 r4): publish_root_anchored() is now a subshell
+ *  around pin_publish_root_parent(), so a rig that lifts one without the other fails with
+ *  "command not found" and every "the publication must refuse" test passes for the wrong reason. */
+const ANCHOR = ['pin_publish_root_parent', 'publish_root_anchored'] as const
 
 /** The five variables publish_trust_root_candidates() reads. Anything unnamed stays EMPTY, which
  *  the table skips — so a destination outside the roots a test declares is refused, as it is in
@@ -846,7 +851,7 @@ test('[o3d-rn10] publish_durable_file walks a nested root from the OUTER anchor 
 
   // NOT VACUOUS: the nested candidate really would have passed the anchor check on its own, so
   // what refuses this publication is the SELECTION and not the anchor.
-  const anchored = runBash(rig(['publish_root_anchored'], `publish_root_anchored "${inner}"; echo "rc=$?"`))
+  const anchored = runBash(rig([...ANCHOR], `publish_root_anchored "${inner}"; echo "rc=$?"`))
   assert.match(anchored.stdout, /^rc=0$/m, 'the nested candidate must itself be anchored, or this test is the previous one again')
 
   assert.match(run.stdout, /^rc=1$/m, 'the walk must start at the outer anchor, which resolves the nested name as an ordinary component')
@@ -884,7 +889,7 @@ test('[o3d-rn10] pin_dir_beneath_root refuses an unanchored root of its own acco
   mkdirSync(state, { recursive: true })
   chmodSync(home, 0o777)
 
-  const run = runBash(rig(['publish_root_anchored', 'pin_dir_beneath_root'],
+  const run = runBash(rig([...ANCHOR, 'pin_dir_beneath_root'],
     `pin_dir_beneath_root "${state}" "${join(state, 'deploy')}"; echo "rc=$?"`))
 
   assert.match(run.stdout, /^rc=1$/m, 'the walk must not start from a root it was handed without an anchor')
@@ -893,7 +898,7 @@ test('[o3d-rn10] pin_dir_beneath_root refuses an unanchored root of its own acco
   // NOT VACUOUS: the same call, with the same directories, succeeds once the parent is one only
   // its owner can rename inside. So what refused it was the anchor and not the walk.
   chmodSync(home, 0o755)
-  const ok = runBash(rig(['publish_root_anchored', 'pin_dir_beneath_root'],
+  const ok = runBash(rig([...ANCHOR, 'pin_dir_beneath_root'],
     `pin_dir_beneath_root "${state}" "${join(state, 'deploy')}"; echo "rc=$?"`))
   assert.match(ok.stdout, /^rc=0$/m, `an anchored root must still be walked: ${ok.stderr}`)
   assert.deepEqual(readdirSync(state), ['deploy'], 'and the component created')
@@ -922,7 +927,7 @@ test('[o3d-rn10] publish_root_anchored decides on the PARENT mode, and does not 
   ]
   for (const [mode, expected] of cases) {
     chmodSync(parent, mode)
-    const run = runBash(rig(['publish_root_anchored'], `publish_root_anchored "${candidate}"; echo "rc=$?"`))
+    const run = runBash(rig([...ANCHOR], `publish_root_anchored "${candidate}"; echo "rc=$?"`))
     assert.match(run.stdout, new RegExp(`^rc=${expected ? 0 : 1}$`, 'm'),
       `a parent at mode 0${mode.toString(8)} must be ${expected ? 'anchored' : 'refused'}: ${run.stdout}${run.stderr}`)
   }
@@ -932,7 +937,7 @@ test('[o3d-rn10] publish_root_anchored decides on the PARENT mode, and does not 
   // ask at all.
   for (const [dir, expected] of [['/opt/one-two-inventory', true], ['/var/lib/one-two-inventory', true],
     ['/etc/ims-cutover', true], ['/tmp/ims-state', false]] as const) {
-    const run = runBash(rig(['publish_root_anchored'], `publish_root_anchored "${dir}"; echo "rc=$?"`))
+    const run = runBash(rig([...ANCHOR], `publish_root_anchored "${dir}"; echo "rc=$?"`))
     assert.match(run.stdout, new RegExp(`^rc=${expected ? 0 : 1}$`, 'm'),
       `${dir} must be ${expected ? 'anchored' : 'refused'}: ${run.stdout}${run.stderr}`)
   }
@@ -950,7 +955,7 @@ test('[o3d-rn10] publish_root_anchored refuses a parent that belongs to neither 
   // because of its mode. It is measured from the other side instead — the shipped function asks
   // `id -u` for the account it must belong to, so a run that answers a DIFFERENT uid is a run
   // whose privileged account does not own this parent. `stat` stays real throughout.
-  const foreign = runBash(rig(['publish_root_anchored'],
+  const foreign = runBash(rig([...ANCHOR],
     `publish_root_anchored "${candidate}"; echo "rc=$?"`,
     'id() { printf "%s\\n" 424242; }'))
   assert.match(foreign.stdout, /^rc=1$/m,
@@ -958,12 +963,12 @@ test('[o3d-rn10] publish_root_anchored refuses a parent that belongs to neither 
 
   // NOT VACUOUS: the same directory, at the same mode, with the real `id`, is anchored — so what
   // the line above measured is the ownership comparison and not some other refusal.
-  const own = runBash(rig(['publish_root_anchored'], `publish_root_anchored "${candidate}"; echo "rc=$?"`))
+  const own = runBash(rig([...ANCHOR], `publish_root_anchored "${candidate}"; echo "rc=$?"`))
   assert.match(own.stdout, /^rc=0$/m, `and it must be anchored for the account that owns it: ${own.stdout}${own.stderr}`)
 
   // And the uid-0 branch is reachable with that same foreign `id`: /etc belongs to root, and root
   // is the privileged account by definition however this process was started.
-  const rootOwned = runBash(rig(['publish_root_anchored'],
+  const rootOwned = runBash(rig([...ANCHOR],
     `publish_root_anchored "/etc/ims-cutover"; echo "rc=$?"`,
     'id() { printf "%s\\n" 424242; }'))
   assert.match(rootOwned.stdout, /^rc=0$/m, `a root-owned parent must be anchored regardless of who runs this: ${rootOwned.stdout}${rootOwned.stderr}`)
@@ -1119,8 +1124,8 @@ test('[o3d-rn10] deploy.sh and update.sh carry the SAME publisher as install.sh,
   // directory through. Sourced from PUBLISHER so a seventh function added to the publisher is
   // compared here without anyone remembering to add it.
   const shared = [...PUBLISHER]
-  assert.deepEqual(shared, ['fsync_path', 'publish_trust_root_candidates', 'publish_root_anchored',
-    'publish_trust_root', 'pin_dir_beneath_root', 'publish_durable_file'],
+  assert.deepEqual(shared, ['fsync_path', 'publish_trust_root_candidates', 'pin_publish_root_parent',
+    'publish_root_anchored', 'publish_trust_root', 'pin_dir_beneath_root', 'publish_durable_file'],
   'PUBLISHER is what the behavioural tests above run; this test exists to carry them to the other two entrypoints')
 
   for (const script of ['scripts/deploy.sh', 'scripts/update.sh'] as const) {
