@@ -2854,9 +2854,12 @@ publish_trust_root() {
 # the refusal prints the two commands that replace the link.
 #
 # AND THIS PARAGRAPH IS OUT HERE RATHER THAN IN THE BODY. Every byte between `name() {` and the
-# closing brace is lifted verbatim by tests/scripts/install-shell-rig.ts and handed to `bash` as a
-# SINGLE argv element, which Linux caps at MAX_ARG_STRLEN. Prose above the definition is not
-# lifted, so it costs nothing to a regression run.
+# closing brace is lifted verbatim by tests/scripts/install-shell-rig.ts into the script the
+# installer regressions run; prose above the definition is not lifted, so it costs them nothing.
+# It used to matter more than tidiness: the rig handed that script to `bash -c` as a SINGLE argv
+# element, which Linux caps at MAX_ARG_STRLEN, and the first draft of this paragraph crossed the
+# cap — E2BIG, which arrives as a spawn error carrying no status and no output at all. The rig now
+# writes the script to a file, so the cliff is gone; the habit is still the right one.
 pin_dir_beneath_root() {
   local root="$1" path="$2" rel comp here entry base
   [[ "$root" == /* && "$path" == /* ]] || return 1

@@ -11,7 +11,7 @@
 import assert from 'node:assert/strict'
 import { execFileSync, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import tls from 'node:tls'
 
@@ -380,10 +380,27 @@ ${SHIPPED}
 ${body}
 `
   const env = { ...cleanLibpqEnv(), ...(options.env ?? {}) }
+  // THE SCRIPT IS RUN FROM A FILE AND NOT FROM `bash -c`'s ARGUMENT (o3d-rn10 r5).
+  //
+  // Linux caps a SINGLE argv element at MAX_ARG_STRLEN — 32 pages, 128 KiB — and ${SHIPPED} alone
+  // is already ~115 KiB of lifted installer text. Adding a few lines of comment to any function on
+  // that list crossed the limit, and what that looked like was: `execve` fails with E2BIG,
+  // execFileSync throws an error carrying NO `status`, NO `stdout` and NO `stderr`, and the catch
+  // below turns it into `status: -1` with an EMPTY output. Every test in three files then failed
+  // with `-1 !== 0` and a blank message, naming neither the limit nor the edit that hit it. A
+  // harness that cannot say why it failed is worse than one that fails.
+  //
+  // A FILE HAS NO SUCH LIMIT, and `bash FILE ARGS...` binds `$1..` exactly as `bash -c SCRIPT $0
+  // ARGS...` did — nothing lifted reads `$0`, which is the only thing that changes. The directory
+  // is removed in a `finally`, so the temp-dir sentinel sees nothing left behind whether the script
+  // returned, failed or threw.
+  const dir = createTempDirSync('ims-shell-rig-')
   try {
+    const scriptFile = join(dir, 'rig.sh')
+    writeFileSync(scriptFile, script)
     return {
       status: 0,
-      output: execFileSync('bash', ['-c', script, 'install.sh', ...(options.argv ?? [])], {
+      output: execFileSync('bash', [scriptFile, ...(options.argv ?? [])], {
         encoding: 'utf8',
         env,
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -392,6 +409,8 @@ ${body}
   } catch (error) {
     const failure = error as { status?: number; stdout?: string; stderr?: string }
     return { status: failure.status ?? -1, output: `${failure.stdout ?? ''}${failure.stderr ?? ''}` }
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
   }
 }
 
