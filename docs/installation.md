@@ -1241,10 +1241,20 @@ together; `IMS_DEPLOY_STATE_DIR` and `IMS_DATA_DIR` are still honoured.
 
 **An override has to be ANCHORED, and an unanchored one stops the run rather than being trusted.**
 Every path above is published by a walk that starts at a directory the scripts take on trust, so
-that directory's own name must be one the service user cannot replace: its **parent** must belong
-to root (or to whoever is running the script) and carry no group or other write bit. `/opt`,
-`/var/lib` and `/etc` all satisfy that, which is why the shipped defaults work; `/tmp` does not,
-and neither does anything under a directory the application account owns.
+that directory's own name must be one the service user cannot replace. That is decided by walking
+to it from `/`: **every directory from `/` down to the override's parent** must belong to root (or
+to whoever is running the script), must carry no group or other write bit, and must be a real
+directory rather than a symlink. `/opt`, `/var/lib` and `/etc` all satisfy that, which is why the
+shipped defaults work; `/tmp` does not, and neither does anything under a directory the application
+account owns.
+
+It is the **whole ancestry** and not just the parent, because a parent nobody can write into is
+worth nothing if somebody can rename the parent. `IMS_CUTOVER_STATE_DIR=/home/app/guard/state` with
+`guard` root-owned and `0755` is refused, because `/home/app` belongs to the application account and
+`guard` is theirs to move aside. A **sticky** ancestor — `/tmp`'s `1777` — is accepted as an
+ancestor, since sticky stops anyone but an entry's owner from renaming it; it is **not** accepted as
+the override's own parent, because on a first install the directory does not exist yet and sticky
+says nothing about who may create it. So a root directly under `/tmp` is refused either way.
 
 * An override **nested inside another root** — `IMS_CUTOVER_STATE_DIR=/var/lib/one-two-inventory/cutover`
   — is supported and needs no anchor of its own. The walk simply starts at the data directory and
