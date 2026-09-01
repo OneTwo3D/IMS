@@ -27,7 +27,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync,
 import { dirname, join } from 'node:path'
 import test, { type TestContext } from 'node:test'
 
-import { maskShellSource, shellConstant, shellConstantOptional, shellFunction, shellFunctionDefinitions } from './shell-symbol.ts'
+import { maskShellSource, shellConstant, shellConstantAssignments, shellConstantOptional, shellFunction, shellFunctionBodyCount, shellFunctionDefinitions } from './shell-symbol.ts'
 import { createTempDirSync } from './temp-dir.ts'
 
 const REPO = process.cwd()
@@ -1689,6 +1689,261 @@ test('[o3d-rn10] a publisher symbol defined twice fails the parity extractor ins
   // of the extractor cannot trade one for the other.
   assert.throws(() => shellFunction(DEPLOY.replace('\npublish_root_anchored() {\n', '\nremoved_publisher() {\n'), 'publish_root_anchored'),
     /must define publish_root_anchored\(\)/)
+})
+
+/**
+ * THE LATE-ASSIGNMENT SET (o3d-1dk9).
+ *
+ * Every one of these is a SECOND assignment of the publisher constant that bash makes effective,
+ * and NOT ONE OF THEM starts its line with the name — which is all the old extractor looked at.
+ * They are kept in one place so a future narrowing has to delete a case rather than quietly stop
+ * matching it, and each is executed under a real bash in the test below before it is required to be
+ * caught: a form the extractor rejects but bash ignores would make the loop a spelling test.
+ */
+const LATE_ASSIGNMENTS = [
+  'true; PUBLISH_STAGE_DIRNAME="../../attacker"',
+  '  PUBLISH_STAGE_DIRNAME="../../attacker"',
+  'if true; then PUBLISH_STAGE_DIRNAME="../../attacker"; fi',
+  'while :; do PUBLISH_STAGE_DIRNAME="../../attacker"; break; done',
+  'for _ in 1; do PUBLISH_STAGE_DIRNAME="../../attacker"; done',
+  '{ PUBLISH_STAGE_DIRNAME="../../attacker"; }',
+  'case x in x) PUBLISH_STAGE_DIRNAME="../../attacker";; esac',
+  'export PUBLISH_STAGE_DIRNAME="../../attacker"',
+  'readonly PUBLISH_STAGE_DIRNAME="../../attacker"',
+  'declare -r PUBLISH_STAGE_DIRNAME="../../attacker"',
+  'PUBLISH_STAGE_DIRNAME+="/../../attacker"',
+  'PUBLISH_STAGE_DIRNAME\\\n="../../attacker"',
+] as const
+
+/**
+ * And the other direction: assignments of the SAME NAME that bash does NOT take at script scope,
+ * every one of which the extractor must keep ignoring. Without these the fix would be a rule that
+ * says yes to everything, and `local NAME=` — ordinary shell in a repository with 373 function
+ * bodies — would be a permanent red.
+ */
+const SCOPED_ASSIGNMENTS = [
+  'shadow() {\n  local PUBLISH_STAGE_DIRNAME="../../attacker"\n  :\n}\nshadow',
+  'shadow() {\n        local PUBLISH_STAGE_DIRNAME="../../attacker"\n}\nshadow',
+  'function shadow {\n  local PUBLISH_STAGE_DIRNAME="../../attacker"\n}\nshadow',
+  'shadow() { local PUBLISH_STAGE_DIRNAME="../../attacker"; }; shadow',
+  '# PUBLISH_STAGE_DIRNAME="../../attacker"',
+  'echo \'PUBLISH_STAGE_DIRNAME="../../attacker"\' > /dev/null',
+  'cat > /dev/null <<\'NOTE\'\nPUBLISH_STAGE_DIRNAME="../../attacker"\nNOTE',
+] as const
+
+/** The rig both sets are proved in: install.sh's own assignment, then the form, then the value. */
+function publishStageAfter(form: string): string {
+  return runBash([
+    'set -u',
+    shellConstant(INSTALL_SH, 'PUBLISH_STAGE_DIRNAME'),
+    form,
+    'printf "%s\\n" "$PUBLISH_STAGE_DIRNAME"',
+  ].join('\n')).stdout.trim()
+}
+
+/**
+ * THE CONSTANT HALF OF THE PARITY CLAIM WAS STILL A LINE ANCHOR (o3d-1dk9).
+ *
+ * shellFunctionDefinitions() was rewritten three times until it stopped enumerating command
+ * positions and started reading a lexer plus bash's own parse. shellConstantAssignments() was left
+ * exactly as it had always been — `^(?:export|readonly|declare|typeset\s+…)?NAME=`, tested line by
+ * line — so the whole of the argument against line rules applied, unanswered, to the other half of
+ * the same claim, and to the constant that aims EVERY publication's staging directory.
+ *
+ * THE BYPASS: appending `true; PUBLISH_STAGE_DIRNAME="../../attacker"` to scripts/deploy.sh. The
+ * line does not start with the name, so the old rule saw one assignment, shellConstant() returned
+ * install.sh's value, and the parity comparison passed — while bash published through the
+ * attacker's directory. Both halves are proved rather than described: the value bash ends up with
+ * is READ OUT OF A REAL BASH first, and the old reading is reproduced as lineAnchored() and shown
+ * returning install.sh's line out of the mutated file.
+ *
+ * ROUTE: shellConstant() -> shellConstantOptional() -> constantAssignmentOffsets() in
+ * tests/scripts/shell-symbol.ts, which is the extractor the parity test above and the
+ * publication-target tests call, on the file they read.
+ *
+ * MUTATION: restore the anchor — make constantAssignmentOffsets() keep only the offsets that start
+ * their line, behind the old optional declaration prefix — and 9 of the 12 forms below stop
+ * throwing (all but the three written `export`/`readonly`/`declare -r` at column 0), so the loop
+ * fails 9 times. Verified by making that edit and running this test.
+ */
+test('[o3d-1dk9] a second script-scope assignment of a publisher constant is refused wherever it stands', () => {
+  const DEPLOY = readFileSync(join(REPO, 'scripts/deploy.sh'), 'utf8')
+
+  /** The pre-fix reading: the lines that START with the name, optionally behind a declaration. */
+  const lineAnchored = (source: string, name: string): string[] => {
+    const shape = new RegExp(`^(?:(?:export|readonly|declare|typeset)\\s+(?:-\\w+\\s+)*)?${name}=`)
+    return source.split('\n').filter((line) => shape.test(line))
+  }
+
+  // NOT VACUOUS: the shipped file extracts cleanly and agrees with install.sh, so what fails below
+  // is the appended assignment and not some strictness the extractor grew.
+  assert.equal(shellConstant(DEPLOY, 'PUBLISH_STAGE_DIRNAME'), shellConstant(INSTALL_SH, 'PUBLISH_STAGE_DIRNAME'))
+
+  // THE BASELINE the proofs are read against: the value with no second assignment at all.
+  const baseline = publishStageAfter(':')
+  assert.ok(baseline.length > 0, "the rig must produce install.sh's staging directory name to compare against")
+
+  // THE VACUITY, MEASURED. The old reading finds ONE assignment in a file carrying two, and hands
+  // back install.sh's line byte for byte — which is the agreement the parity test was reporting.
+  const bypassed = `${DEPLOY}\ntrue; PUBLISH_STAGE_DIRNAME="../../attacker"\n`
+  assert.deepEqual(lineAnchored(bypassed, 'PUBLISH_STAGE_DIRNAME'), [shellConstant(INSTALL_SH, 'PUBLISH_STAGE_DIRNAME')],
+    "the line-anchored reading must still see exactly one assignment, and it must still be install.sh's — that blindness IS the finding")
+  assert.equal(publishStageAfter('true; PUBLISH_STAGE_DIRNAME="../../attacker"'), '../../attacker',
+    'and bash must take the appended one, or the finding is about a line nobody executes')
+
+  for (const form of LATE_ASSIGNMENTS) {
+    assert.notEqual(publishStageAfter(form), baseline,
+      `bash must actually take ${JSON.stringify(form)} as the effective value of PUBLISH_STAGE_DIRNAME`)
+
+    assert.throws(() => shellConstant(`${DEPLOY}\n${form}\n`, 'PUBLISH_STAGE_DIRNAME', 'scripts/deploy.sh'),
+      /assigns PUBLISH_STAGE_DIRNAME 2 times at script scope/,
+      `and the extractor must refuse it: ${JSON.stringify(form)}`)
+  }
+
+  // A DELETED ASSIGNMENT IS THE OTHER FAILURE, and still fails: uniqueness means exactly one, and
+  // "none" is not one.
+  assert.throws(() => shellConstant(DEPLOY.replace('\nPUBLISH_STAGE_DIRNAME=', '\nREMOVED_STAGE_DIRNAME='), 'PUBLISH_STAGE_DIRNAME'),
+    /must define PUBLISH_STAGE_DIRNAME on one line/)
+})
+
+/**
+ * AND "TOP LEVEL" MEANS SCOPE, NOT INDENTATION (o3d-1dk9).
+ *
+ * The old rule excluded `local NAME=` because such a line is INDENTED. That is a fact about layout,
+ * and the test above is the bill for it: `true; NAME=` is at column 0's mercy in exactly the same
+ * way, and it is a bypass. The replacement excludes an assignment because it is inside a FUNCTION
+ * BODY — so an indented assignment at script scope is now caught, and an indented `local` inside a
+ * function is still not.
+ *
+ * Every form below is read out of a real bash before it is required of the extractor: each leaves
+ * the script's value UNCHANGED, so an extractor that counted them would be red on ordinary shell,
+ * and a guard that is red on ordinary shell gets an exemption, then a bypass, then deleted.
+ *
+ * ROUTE: shellConstant() on scripts/deploy.sh with each form appended.
+ *
+ * MUTATION: drop the scope filter in constantAssignmentOffsets() — count every assignment the mask
+ * carries — and the four function-scoped forms throw `assigns PUBLISH_STAGE_DIRNAME 2 times`, so
+ * the loop fails 4 times. Widen it the other way instead (scan the raw source rather than the mask)
+ * and the comment, the quoted echo and the here-document fail too. Verified by making both edits.
+ */
+test('[o3d-1dk9] an assignment inside a function body is not a script-scope assignment', () => {
+  const DEPLOY = readFileSync(join(REPO, 'scripts/deploy.sh'), 'utf8')
+  const canonical = shellConstant(INSTALL_SH, 'PUBLISH_STAGE_DIRNAME')
+  const baseline = publishStageAfter(':')
+
+  for (const form of SCOPED_ASSIGNMENTS) {
+    assert.equal(publishStageAfter(form), baseline,
+      `bash must NOT take ${JSON.stringify(form)} — a form the extractor is asked to ignore has to be one bash ignores`)
+
+    assert.equal(shellConstant(`${DEPLOY}\n${form}\n`, 'PUBLISH_STAGE_DIRNAME', 'scripts/deploy.sh'), canonical,
+      `and the extractor must still resolve the one script-scope assignment: ${JSON.stringify(form)}`)
+  }
+
+  // THE PAIR THAT MAKES THE RULE SCOPE RATHER THAN INDENTATION: the same assignment, at the same
+  // eight spaces of indentation, once inside a function body and once outside one.
+  assert.equal(shellConstant(`${DEPLOY}\nshadow() {\n        PUBLISH_STAGE_DIRNAME="../../attacker"\n}\n`, 'PUBLISH_STAGE_DIRNAME'),
+    canonical, 'an indented assignment INSIDE a body is not at script scope')
+  assert.throws(() => shellConstant(`${DEPLOY}\n        PUBLISH_STAGE_DIRNAME="../../attacker"\n`, 'PUBLISH_STAGE_DIRNAME'),
+    /2 times at script scope/, 'the identically indented assignment OUTSIDE one is')
+})
+
+/**
+ * A SCOPE THAT CANNOT BE DETERMINED REFUSES, NAMED (o3d-1dk9).
+ *
+ * A function body may be ANY compound command. `f() ( … )`, `f() if …; fi` and `f() for …; done`
+ * all parse — asserted below under a real `bash -n`, so the refusal is about a construct and not a
+ * typo — and none of them is delimited by the brace rule the scanner uses. A subshell body is not
+ * delimited by counting parentheses either: a `case` pattern's `)` inside one would close the count
+ * early and move an assignment OUT of function scope without saying so.
+ *
+ * So the extent is refused rather than guessed, which is the answer the definition scanner already
+ * gives to the same question. `eval` is refused for the reason it already was: `eval 'NAME=/x'`
+ * assigns — verified here — and is a string to the lexer, to any line rule, and to bash's own parse.
+ *
+ * ROUTE: shellConstantAssignments() on scripts/deploy.sh with each construct appended.
+ *
+ * MUTATION: make braceGroupExtent() return `[from, from]` for a body it does not recognise instead
+ * of throwing — the "assume it is empty" reading — and the three body forms stop refusing and start
+ * returning a count of 2, so the loop fails 3 times. Delete the `eval` check and the fourth case
+ * fails too. Verified by making both edits.
+ */
+test('[o3d-1dk9] a function body whose extent cannot be determined refuses instead of returning a count', () => {
+  const DEPLOY = readFileSync(join(REPO, 'scripts/deploy.sh'), 'utf8')
+
+  for (const form of [
+    'shadow() ( PUBLISH_STAGE_DIRNAME="../../attacker" )',
+    'shadow() if true; then PUBLISH_STAGE_DIRNAME="../../attacker"; fi',
+    'shadow() for _ in 1; do PUBLISH_STAGE_DIRNAME="../../attacker"; done',
+  ]) {
+    const parsed = spawnSync('bash', ['-n'], { encoding: 'utf8', input: `${form}\n` })
+    assert.equal(parsed.status, 0,
+      `bash must accept ${JSON.stringify(form)} — a refusal aimed at something bash rejects is about a typo: ${parsed.stderr}`)
+
+    assert.throws(() => shellConstantAssignments(`${DEPLOY}\n${form}\n`, 'PUBLISH_STAGE_DIRNAME', 'scripts/deploy.sh'),
+      /a function body this scanner cannot delimit/,
+      `a body whose extent is not a brace group must be refused, not measured: ${JSON.stringify(form)}`)
+  }
+
+  // AND `eval`, which no lexical reading answers: bash installs the assignment, and every reading
+  // in this file sees a string.
+  assert.equal(publishStageAfter("eval 'PUBLISH_STAGE_DIRNAME=\"../../attacker\"'"), '../../attacker',
+    'eval must actually install the assignment, or refusing it is theatre')
+  assert.throws(() => shellConstantAssignments(`${DEPLOY}\neval 'PUBLISH_STAGE_DIRNAME="../../attacker"'\n`, 'PUBLISH_STAGE_DIRNAME', 'scripts/deploy.sh'),
+    /runs `eval`/)
+
+  // AND A FILE THIS SCANNER CANNOT LEX AT ALL, for the reason the definitions refuse one.
+  assert.throws(() => shellConstantAssignments(`${DEPLOY}\necho 'never closed\n`, 'PUBLISH_STAGE_DIRNAME', 'scripts/deploy.sh'),
+    /unterminated single quote/)
+
+  // NOT VACUOUS: the unmodified file returns exactly one. The refusals above are the constructs
+  // talking, not a scanner that has stopped answering.
+  assert.equal(shellConstantAssignments(DEPLOY, 'PUBLISH_STAGE_DIRNAME', 'scripts/deploy.sh').length, 1)
+})
+
+/**
+ * AND THE SCOPE RULE HAS NOT MADE THE SCANNER UNUSABLE EITHER (o3d-1dk9).
+ *
+ * The function census below this one exists because a guard that trips on ordinary code gets
+ * deleted; the constant scanner now refuses far more than it used to — a body it cannot delimit, a
+ * disagreement with bash over how many bodies there are — so the same thing has to be measured for
+ * it, and it has already gone wrong once on this branch (a here-STRING swallowed the whole of
+ * deploy.sh into a here-document body). So every shell script under version control is walked,
+ * every publication constant is looked up in it, and each one that is assigned at all must resolve
+ * to EXACTLY ONE script-scope assignment, with no refusal anywhere.
+ *
+ * ROUTE: shellConstantOptional() and shellFunctionBodyCount() over `git ls-files '*.sh'` — the same
+ * extractor the parity test and the publication-target tests go through.
+ */
+test('[o3d-1dk9] every publication constant the tracked shell scripts assign still resolves to exactly one', () => {
+  const listed = spawnSync('git', ['ls-files', '*.sh'], { cwd: REPO, encoding: 'utf8' })
+  assert.equal(listed.status, 0, listed.stderr)
+  const files = listed.stdout.trim().split('\n').filter(Boolean)
+  assert.ok(files.length >= 13, `the census must reach the tracked scripts; git listed ${files.length}`)
+
+  const names = [...PUBLICATION_CONSTANTS, 'PUBLISH_STAGE_DIRNAME']
+  let bodies = 0
+  let resolved = 0
+  for (const file of files) {
+    const source = readFileSync(join(REPO, file), 'utf8')
+    // Scope is decided by these, so the number of them is part of what has to hold: this throws if
+    // any body is not a brace group, or if bash's own parse of the file disagrees about how many
+    // there are.
+    bodies += shellFunctionBodyCount(source, file)
+    for (const name of names) {
+      // shellConstantOptional() IS the "exactly one" assertion — it refuses a second script-scope
+      // assignment — so a name this file simply does not assign returns undefined and is not
+      // counted, and one it assigns twice fails here.
+      if (shellConstantOptional(source, name, file) !== undefined) resolved += 1
+    }
+  }
+
+  // THE WALK REACHED THE FILES, stated as numbers so a census that silently stopped visiting them
+  // cannot pass as one that visited them and found nothing wrong. Floors rather than equalities,
+  // because a new function or a new constant is not a regression.
+  assert.ok(bodies >= 373,
+    `the tracked scripts carried 373 function bodies when this was written, every one of them a brace group; the census saw ${bodies}`)
+  assert.ok(resolved >= 45,
+    `the tracked scripts resolved 45 (file, constant) pairs when this was written; the census saw ${resolved}`)
 })
 
 /**

@@ -172,6 +172,12 @@
  *   - A SOURCED FILE. `. lib.sh` may assign the name, and this reads one file. That is why the
  *     callers look the constant up in the entrypoint AND in scripts/lib/db-fence-protected.sh.
  *
+ * AND TWO THINGS IT COUNTS THAT BASH DOES NOT TAKE, which is the direction to err in. A COMMAND
+ * PREFIX — `NAME=x cmd` — assigns only in that command's environment, and a top-level SUBSHELL —
+ * `( NAME=x )` — dies with the subshell; both were verified to leave the script's value unchanged,
+ * and both are counted here. Each is a false positive that makes the guard RED and names the line,
+ * never one that hides a second assignment. Neither appears in the 13 tracked scripts.
+ *
  * AND THE COST OF FAILING CLOSED IS MEASURED AGAIN, because it was measured for the definitions and
  * the same guard gets deleted the first time it fires on ordinary code. Across the 13 tracked
  * scripts: 373 function bodies, all brace groups, and bash's parse of the same files contains 373
@@ -729,6 +735,48 @@ export function shellFunctionDefinitions(source: string, name: string, where = '
  * an unlexable file, an `eval`, a body whose extent cannot be determined, or a disagreement with
  * bash's own parse all fail here.
  */
+/**
+ * The function bodies of `source` under BOTH readings — this file's lexer over the raw bytes, and
+ * the same rules over `bash --pretty-print`'s deparse of them, which must agree on how many there
+ * are before either is used to decide scope.
+ *
+ * The deparse is the reading that is not a re-implementation of bash's grammar. It cannot be asked
+ * "is this assignment top level?" — `--pretty-print` labels nothing with a scope — but it renders
+ * EVERY body as a `{ … }` group at a fresh word boundary, whatever the source wrote (`f() ( … )`,
+ * `f() if …; fi` and `function f { … }` all come back as `f () \n{ \n … \n}`), so the nesting in
+ * its output is bash's own rather than the author's layout.
+ */
+function bodyRangesBothReadings(source: string, where: string): {
+  mask: string
+  mine: Array<[number, number]>
+  deparsedMask: string
+  deparsed: Array<[number, number]>
+} {
+  const mask = maskCached(source, where)
+  const mine = functionBodyRanges(mask, where)
+  const deparsedWhere = `${where} (as bash parses it)`
+  const deparsedMask = maskCached(bashDeparse(source, where), deparsedWhere)
+  const deparsed = functionBodyRanges(deparsedMask, deparsedWhere)
+  if (deparsed.length !== mine.length) {
+    throw new ShellLexError(
+      `${where}: this scanner finds ${mine.length} function body/bodies but bash's own parse of the `
+      + `same bytes contains ${deparsed.length}. Scope is decided by those bodies, so the two `
+      + 'readings must agree on them before anything is reported. Fix the lexer — do not take '
+      + 'either number on its own.')
+  }
+  return { mask, mine, deparsedMask, deparsed }
+}
+
+/**
+ * How many function BODIES `source` contains, under both readings.
+ *
+ * Exported for the census: a NUMBER is what separates a walk that visited the tracked scripts and
+ * found nothing wrong from one that silently stopped visiting them.
+ */
+export function shellFunctionBodyCount(source: string, where = 'the script'): number {
+  return bodyRangesBothReadings(source, where).mine.length
+}
+
 function constantAssignmentOffsets(source: string, name: string, where: string): number[] {
   const mask = maskCached(source, where)
 
@@ -741,7 +789,7 @@ function constantAssignmentOffsets(source: string, name: string, where: string):
       + 'the string it is. The count is refused rather than guessed.')
   }
 
-  const bodies = functionBodyRanges(mask, where)
+  const { mine: bodies, deparsedMask, deparsed: deparsedBodies } = bodyRangesBothReadings(source, where)
   const offsets = assignmentOffsets(mask, name)
     .filter((offset) => !bodies.some(([start, end]) => offset >= start && offset < end))
 
@@ -758,15 +806,6 @@ function constantAssignmentOffsets(source: string, name: string, where: string):
   // a second reading of the same question and not an oracle for it. It catches a body this file's
   // lexer failed to find or delimited differently from bash — which is the failure mode this
   // guard has actually had — and it does not catch a construct both readings misread alike.
-  const deparsedMask = maskCached(bashDeparse(source, where), `${where} (as bash parses it)`)
-  const deparsedBodies = functionBodyRanges(deparsedMask, `${where} (as bash parses it)`)
-  if (deparsedBodies.length !== bodies.length) {
-    throw new ShellLexError(
-      `${where}: this scanner finds ${bodies.length} function body/bodies but bash's own parse of the `
-      + `same bytes contains ${deparsedBodies.length}. Scope is decided by those bodies, so the two `
-      + 'readings must agree on them before an assignment count is reported. Fix the lexer — do not '
-      + 'take either number on its own.')
-  }
   const deparsed = assignmentOffsets(deparsedMask, name)
     .filter((offset) => !deparsedBodies.some(([start, end]) => offset >= start && offset < end))
   if (deparsed.length !== offsets.length) {
