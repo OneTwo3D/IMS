@@ -129,6 +129,24 @@ Activity log retention is configurable per level in **System Settings**. Entries
 
 Set the retention period to **0** for any level to keep those entries indefinitely.
 
+### Entries retention never deletes
+
+A few entries are not history — they are **state**, and something else has to clear them. Deleting one
+of those does not age out a record, it silently discharges an obligation, so the cleanup skips them
+whatever the configured period says:
+
+| Entry | Why it is kept | What clears it |
+|---|---|---|
+| Direct-create fulfilment markers | An order entered fulfilment and its allocation coverage has not been verified | The reallocation sweep, on every outcome |
+| `xero_posted_document_unrecorded` / `quickbooks_posted_document_unrecorded` | The only record that a document was accepted by the ledger and could not be linked back | A person reconciling the duplicate in the ledger |
+| `wc_refund_park_recovered` | The only surviving evidence that a parked WooCommerce refund was recovered | Nothing — it is a join target for a later correctness check |
+| **Withheld payment-reversal markers** | The marker **is** the work queue: it is what brings a reversal IMS could not decide back in front of the poller | The recheck closing it, after which the whole document's markers expire normally |
+
+The last one is kept **conditionally**, not for ever: only each still-open document's *current* marker
+survives, so a document reconsidered hourly does not accumulate. Once the disagreement is settled, the
+marker expires on the ordinary schedule and its closure follows on the next sweep. Nothing here is
+affected by the retention period you set.
+
 
 ## Automatic Cleanup
 
