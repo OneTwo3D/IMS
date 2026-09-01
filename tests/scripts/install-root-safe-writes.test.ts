@@ -23,8 +23,8 @@
  */
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import test, { type TestContext } from 'node:test'
 
 import { shellConstant, shellConstantOptional, shellFunction } from './shell-symbol.ts'
@@ -1175,6 +1175,206 @@ test('[o3d-rn10] a parent replaced AFTER the anchor accepted it does not redirec
   assert.match(run.stdout, /^rc=0$/m, `the publication must go through, into the directory it pinned: ${run.stderr}`)
   assert.equal(readFileSync(join(`${parent}.real`, 'state', 'DEPLOY-FENCED'), 'utf8'), 'phase=stopping\n',
     'and it must land in the operator\'s own directory, which the rename moved but did not replace')
+})
+
+/**
+ * THE ONE HOP THE WALK DID NOT PROVE (o3d-rn10 r5, Codex HIGH).
+ *
+ * Until r5 the ROOT, and only the root, was entered with a bare `cd -P` that followed a symlink
+ * DELIBERATELY: a ${DATA_DIR} pointing at a second disk was a supported operator layout, and the
+ * link's own name sits in a parent the anchor walk proves only the privileged account can write.
+ * That argument covers the ENTRY and nothing else. `/var/lib/ims -> /srv/disk2/ims` is resolved
+ * through `/srv/disk2`, which no walk here touches and which the service account may own — so they
+ * rename `ims` aside on the second disk and leave a link to a victim at that name. The root entry
+ * in /var/lib never changes, every anchor check passes on it, and the publication creates its
+ * staging directory and writes the fixed destination basename, as root, where they chose.
+ *
+ * WHAT WAS CHOSEN, AND WHAT IT COSTS. The root is now created, lstat-ed, entered and inode/`..`
+ * checked exactly like every component below it, and a SYMLINK AT IT IS REFUSED. The alternate
+ * disk becomes a bind mount: `mount --bind DISK /var/lib/ims` plus the matching fstab line, which
+ * is the same indirection resolved ONCE, at mount time, out of a table only root can write. The
+ * refusal prints those two commands, because an operator whose state root is a symlink today will
+ * meet it at their next deploy. Pinning the target instead would have kept the symlink working, at
+ * the cost of a second path proved from `/` on every publication, a link chain to bound, and a
+ * third copy of both to hold byte-identical across the three entrypoints.
+ */
+
+/** scripts/install.sh's pin_dir_beneath_root() with the root entry restored to what it was before
+ *  r5 — a plain `mkdir` and a bare `cd -P`, with no lstat between them. THE MUTATION for the test
+ *  below, lifted and edited rather than re-typed so it cannot drift into a different function. */
+function preR5RootEntry(): string {
+  const body = shellFunction(INSTALL_SH, 'pin_dir_beneath_root')
+  const from = '  mkdir "$base" 2>/dev/null || true\n'
+  const to = '  here="${entry#*|}"\n'
+  const start = body.indexOf(from)
+  const end = body.indexOf(to)
+  assert.notEqual(start, -1, 'the shipped root entry must still begin with a plain mkdir of $base')
+  assert.ok(end > start, 'and must end by carrying the root component inode into $here')
+  const mutated = body.slice(0, start)
+    + from
+    + '  cd -P "$base" 2>/dev/null || return 1\n'
+    + '  here="$(stat -c \'%d:%i\' . 2>/dev/null || true)"\n'
+    + '  [[ -n "$here" ]] || return 1\n'
+    + body.slice(end + to.length)
+  assert.notEqual(mutated, body, 'the mutation must change the shipped function')
+  // AND IT MUST REMOVE EXACTLY WHAT IS BEING MEASURED: the root's own lstat, and the refusal it
+  // feeds. The loop below keeps its own lstat and its own "symbolic link" comment, which is why
+  // this is asserted on the root's line and on the message rather than on the phrase.
+  assert.ok(!mutated.includes(`entry="$(stat -c '%F|%d:%i' "$base"`), 'the root lstat must be gone')
+  assert.ok(!mutated.includes('mount --bind'), 'and with it the refusal that names the bind mount')
+  return mutated
+}
+
+/** The layout the finding is about, planted on a real filesystem: an anchored parent (`/var/lib`)
+ *  holding a SYMLINKED state root, whose target lives on a second disk in a directory the service
+ *  account can write — and which they have already rebound to a victim. The root ENTRY is
+ *  untouched throughout, which is the point: nothing about it can be refused. */
+function plantSymlinkedRoot(t: TestContext, prefix: string) {
+  const base = createTempDirSync(prefix, t)
+  const varlib = join(base, 'var-lib')
+  const stateRoot = join(varlib, 'ims')
+  const disk = join(base, 'srv-disk2')
+  const target = join(disk, 'ims')
+  const victim = join(base, 'victim')
+  mkdirSync(target, { recursive: true })
+  mkdirSync(varlib)
+  mkdirSync(victim)
+  writeFileSync(join(victim, 'DEPLOY-FENCED'), 'UNTOUCHED\n')
+  // 0700 and owned by the publishing uid, so every check made AFTER the entry passes on it: only
+  // the entry itself can keep this publication out.
+  chmodSync(victim, 0o700)
+  // Root-owned-and-0755 in production; here, the property a harness can plant is the same one —
+  // nobody but the owner may rename inside it, so the link at `ims` is not forgeable.
+  chmodSync(varlib, 0o755)
+  symlinkSync(target, stateRoot)
+  // AND THE HALF THE ANCHOR NEVER SAW: the target's parent, which the service account owns. One
+  // rename and one symlink, with no race to win.
+  chmodSync(disk, 0o777)
+  renameSync(target, `${target}.real`)
+  symlinkSync(victim, target)
+  return { base, varlib, stateRoot, disk, target, victim }
+}
+
+test('[o3d-rn10] a symlinked root does not redirect the publication into the directory its target\'s parent lets the service account choose', (t) => {
+  const plant = plantSymlinkedRoot(t, 'ims-rn10-symlink-root-')
+
+  const run = runBash(rig(PUBLISHER, [
+    `printf 'PWNED\\n' | publish_durable_file "${join(plant.stateRoot, 'DEPLOY-FENCED')}" "" 600`,
+    'echo "rc=$?"',
+  ].join('\n'), roots({ data: plant.stateRoot })))
+
+  // NOT VACUOUS: the plant is standing at the moment the assertions look at it, and the root entry
+  // really is the operator's own symlink — nothing about IT is what gets refused.
+  assert.equal(lstatSync(plant.stateRoot).isSymbolicLink(), true, 'the root must be a symlink, or this test states nothing')
+  assert.equal(lstatSync(plant.target).isSymbolicLink(), true, 'and its target name must be rebound to the victim')
+  assert.equal(statSync(plant.stateRoot).ino, statSync(plant.victim).ino, 'so the root resolves to the victim')
+
+  // THE SECURITY CLAIM FIRST.
+  assert.equal(readFileSync(join(plant.victim, 'DEPLOY-FENCED'), 'utf8'), 'UNTOUCHED\n',
+    'the directory the rebound target chose must not be written into')
+  assert.deepEqual(readdirSync(plant.victim).sort(), ['DEPLOY-FENCED'],
+    'and nothing may be created inside it — no staging directory, no temporary')
+  assert.match(run.stdout, /^rc=1$/m, 'and the publication must refuse rather than land somewhere else')
+
+  // MEASURED BY MUTATION, ROUTE STATED: the same rig, the same plant, with the root entry restored
+  // to the pre-r5 `cd -P`. The publication then goes through INTO THE VICTIM — which is the finding
+  // itself, executed. Everything else in the rig is shipped text, so the redirect can only come
+  // from the four lines preR5RootEntry() puts back.
+  const attacked = plantSymlinkedRoot(t, 'ims-rn10-symlink-root-mutated-')
+  const mutated = runBash(rig(PUBLISHER.filter((n) => n !== 'pin_dir_beneath_root'), [
+    `printf 'PWNED\\n' | publish_durable_file "${join(attacked.stateRoot, 'DEPLOY-FENCED')}" "" 600`,
+    'echo "rc=$?"',
+  ].join('\n'), [roots({ data: attacked.stateRoot }), preR5RootEntry()].join('\n')))
+
+  assert.match(mutated.stdout, /^rc=0$/m, `the pre-r5 root entry must publish, or the mutation proves nothing: ${mutated.stderr}`)
+  assert.equal(readFileSync(join(attacked.victim, 'DEPLOY-FENCED'), 'utf8'), 'PWNED\n',
+    'and it must land in the victim — that redirect is the finding, and this test exists because the shipped code no longer allows it')
+})
+
+test('[o3d-rn10] the refusal of a symlinked root names the bind mount an operator must use instead', (t) => {
+  const base = createTempDirSync('ims-rn10-symlink-refusal-', t)
+  const varlib = join(base, 'var-lib')
+  const stateRoot = join(varlib, 'ims')
+  const disk = join(base, 'srv-disk2')
+  const target = join(disk, 'ims')
+  mkdirSync(target, { recursive: true })
+  mkdirSync(varlib)
+  chmodSync(varlib, 0o755)
+  // BENIGN: nobody has touched the target. This is the operator layout that used to be supported,
+  // with no attack on it at all — the refusal has to be legible to the person who built it.
+  symlinkSync(target, stateRoot)
+
+  const script = (dest: string) => rig(PUBLISHER, [
+    `printf 'phase=stopping\\n' | publish_durable_file "${dest}" "" 600`,
+    'echo "rc=$?"',
+  ].join('\n'), roots({ data: stateRoot }))
+
+  const refused = runBash(script(join(stateRoot, 'DEPLOY-FENCED')))
+  assert.match(refused.stdout, /^rc=1$/m, 'a symlinked root must be refused')
+  assert.deepEqual(readdirSync(target), [], 'and nothing may be written through the link')
+  assert.ok(refused.stderr.includes(`${stateRoot} is a symbolic link`),
+    `the refusal must name the root it refused: ${refused.stderr}`)
+  assert.match(refused.stderr, /mount --bind/,
+    'and say what to do instead, in a form that can be run')
+  assert.match(refused.stderr, /fstab/,
+    'including the half that survives a reboot')
+  assert.match(refused.stderr, /no data has to move/,
+    'and the fact that answers the question an operator asks first')
+
+  // NOT VACUOUS: the SAME layout with a real directory at the root name publishes. What is refused
+  // is the LINK, not the location — an alternate disk is still supported, as a mount rather than a
+  // symlink, and the test below enters a real mount point to show that walk works.
+  unlinkSync(stateRoot)
+  renameSync(target, stateRoot)
+  const ok = runBash(script(join(stateRoot, 'DEPLOY-FENCED')))
+  assert.match(ok.stdout, /^rc=0$/m, `a real directory at the same root name must still publish: ${ok.stderr}`)
+  assert.equal(readFileSync(join(stateRoot, 'DEPLOY-FENCED'), 'utf8'), 'phase=stopping\n')
+})
+
+/** A directory that is a MOUNT POINT, whose parent is one only its owner can rename inside — which
+ *  is structurally what `mount --bind DISK /var/lib/ims` produces. An unprivileged harness cannot
+ *  create one, so one already on the machine is used; the candidates are ordered by how universal
+ *  they are, and the predicate is checked rather than assumed. */
+function existingMountPoint(): string | undefined {
+  const self = process.getuid?.() ?? 0
+  return ['/dev/shm', '/run', '/proc', '/sys', '/dev'].find((path) => {
+    try {
+      if (!lstatSync(path).isDirectory()) return false
+      const parent = statSync(dirname(path))
+      if (parent.uid !== 0 && parent.uid !== self) return false
+      if ((parent.mode & 0o022) !== 0) return false
+      return statSync(path).dev !== parent.dev
+    } catch {
+      return false
+    }
+  })
+}
+
+test('[o3d-rn10] the walk enters a real MOUNT POINT at the root, which is what an alternate disk must now be', (t) => {
+  const mount = existingMountPoint()
+  // STATED RATHER THAN GLOSSED: `mount --bind` needs CAP_SYS_ADMIN, which this harness does not
+  // have, so the mechanism r5 mandates is measured against a mount that is already there. To path
+  // resolution a bind mount and a filesystem mount are the same object, and what is being measured
+  // is precisely a path-resolution property: that the new lstat, the inode comparison and the `..`
+  // comparison all agree across a mount boundary, where the entry in the parent and the directory
+  // the walk lands in belong to different filesystems.
+  assert.ok(mount, 'no mount point with a non-writable root-owned parent was found; this test cannot state anything without one')
+
+  const entered = runBash(rig([...ANCHOR, 'pin_dir_beneath_root'], `pin_dir_beneath_root "${mount}" "${mount}"; echo "rc=$?"`))
+  assert.match(entered.stdout, /^rc=0$/m, `a mounted root must be walked into: ${entered.stderr}`)
+
+  // AND A SYMLINK TO THE VERY SAME DIRECTORY IS NOT. Same target, same contents, same everything
+  // the walk could measure about where it lands — only the entry differs, which is the distinction
+  // this round draws and the reason the refusal is not simply "that directory is unusable".
+  const base = createTempDirSync('ims-rn10-mountpoint-', t)
+  const varlib = join(base, 'var-lib')
+  const link = join(varlib, 'mounted')
+  mkdirSync(varlib)
+  chmodSync(varlib, 0o755)
+  symlinkSync(mount, link)
+  const viaLink = runBash(rig([...ANCHOR, 'pin_dir_beneath_root'], `pin_dir_beneath_root "${link}" "${link}"; echo "rc=$?"`))
+  assert.match(viaLink.stdout, /^rc=1$/m, 'a symlink to the same mounted directory must be refused')
+  assert.ok(viaLink.stderr.includes(`${link} is a symbolic link`), viaLink.stderr)
 })
 
 /**
