@@ -301,3 +301,74 @@ test('refunds: an unprovable basis reports NO proportion, not 0% (o3d-iigc)', as
   assert.equal(r.pctOfSale, null)
   assert.equal(r.totalBase, 100, 'the amount itself is still reported')
 })
+
+// ---------------------------------------------------------------------------
+// o3d-7jfq: TWO OPPOSITE SAME-BASIS CREDITS MUST NOT PRODUCE A `≤`
+// ---------------------------------------------------------------------------
+
+/**
+ * One £100 ex-VAT sale with £40 of COGS, credited +£120 on the GROSS basis and −£120 on it again —
+ * a credit and its reversal, both stamped the same way and neither placeable on this ex-VAT figure.
+ *
+ * `refundsGrossBasis` is therefore 120 - 120 = 0, and the bound used to be classified from
+ * `refundsGrossBasis + refundsUnknownBasis`. Zero is not negative, so both classifiers answered
+ * `upper` and the report printed "at most £100" about a figure whose true value is £100 less the
+ * NET worth of that pair — anywhere in [-£20, £220], since a gross entry's ex-VAT value lies
+ * between it and zero and the two entries' VAT rates need not match.
+ */
+const OPPOSITE_GROSS_CREDITS = () => [productOrder({
+  id: 'A', lineTotalBase: 100, cogsBase: 40,
+  refunds: [
+    { totalsBasis: 'GROSS', lines: [{ productId: 'p1', qty: 1, totalBase: 120 }] },
+    { totalsBasis: 'GROSS', lines: [{ productId: 'p1', qty: -1, totalBase: -120 }] },
+  ],
+})]
+
+test('products: two opposite GROSS credits cancel to a zero bucket and STILL do not license a ≤ (o3d-7jfq)', async () => {
+  PRODUCT_ORDERS = OPPOSITE_GROSS_CREDITS()
+  const { row, summary } = await products()
+
+  // The published columns are unchanged — this is about the RELATION, not the figures.
+  assert.equal(row.refundsGrossBasis, 0, 'the signed bucket really is zero; that is the trap')
+  assert.equal(row.refundsUnknownBasis, 0)
+  assert.equal(row.refundBasisComplete, false, 'neither entry was placeable on the ex-VAT basis')
+  assert.equal(row.netRevenue, 100)
+  assert.equal(row.grossProfit, 60)
+  assert.equal(row.avgOrderValue, 100)
+
+  // The claim. `Σ min(entry, 0)` over the unplaced entries is -120, which is below zero, so no
+  // ceiling holds and none is claimed.
+  assert.equal(row.netRevenueBound, 'indeterminate')
+  assert.equal(row.marginPctBound, 'indeterminate')
+  assert.equal(summary.netRevenueBound, 'indeterminate')
+  assert.equal(summary.avgMarginPctBound, 'indeterminate')
+})
+
+test('products: the same pair with BOTH entries positive is a sound ≤ (o3d-7jfq control)', async () => {
+  // The counterweight, so `indeterminate` cannot be reached by marking everything indeterminate:
+  // +120 and +120 of gross-basis credit leave `Σ min(entry, 0)` at zero, the ceiling holds, and the
+  // width is the £240 both columns already report.
+  PRODUCT_ORDERS = [productOrder({
+    id: 'A', lineTotalBase: 100, cogsBase: 40,
+    refunds: [
+      { totalsBasis: 'GROSS', lines: [{ productId: 'p1', qty: 1, totalBase: 120 }] },
+      { totalsBasis: 'GROSS', lines: [{ productId: 'p1', qty: 1, totalBase: 120 }] },
+    ],
+  })]
+  const { row, summary } = await products()
+
+  assert.equal(row.refundsGrossBasis, 240)
+  assert.equal(row.netRevenueBound, 'upper')
+  assert.equal(summary.netRevenueBound, 'upper')
+})
+
+test('products: an all-NET period claims nothing at all (o3d-7jfq control)', async () => {
+  PRODUCT_ORDERS = [productOrder({
+    id: 'A', lineTotalBase: 100, cogsBase: 40,
+    refunds: [{ totalsBasis: 'NET', lines: [{ productId: 'p1', qty: 1, totalBase: 25 }] }],
+  })]
+  const { row, summary } = await products()
+
+  assert.equal(row.netRevenueBound, 'exact')
+  assert.equal(summary.netRevenueBound, 'exact')
+})

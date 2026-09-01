@@ -269,3 +269,40 @@ test('profitability CSV: Profit gets its own bound column instead of borrowing R
     if (!hadDocument) delete (globalThis as { document?: unknown }).document
   }
 })
+
+// ---------------------------------------------------------------------------
+// o3d-7jfq: THE CSV'S BOUND COLUMNS ARE THE PRODUCER'S VERDICT, NOT A RE-DERIVATION
+// ---------------------------------------------------------------------------
+
+test('products CSV: two opposite GROSS credits cancel to a zero bucket and the file claims no ≤ (o3d-7jfq)', async () => {
+  // p1 is credited +£120 and −£120, both on the GROSS basis, so `refundsGrossBasis` on the exported
+  // row is 0 and `refundsUnknownBasis` is 0. The route derived all three linear bound columns from
+  // `r.refundsGrossBasis + r.refundsUnknownBasis` — that sum, ROUNDED, one file downstream of the
+  // producer — and zero is not negative, so the file printed `upper` on a £100 net revenue whose
+  // true value lies anywhere in [-£20, £220]. It now reads the marker the producer published from
+  // the interval, so the cancellation cannot be re-created here.
+  //
+  // p2 keeps its ordinary single £120 gross credit, so the same file still prints a sound `upper`
+  // on the row beside it — the verdict is per row, not per file.
+  await withOrders([
+    order('A', 'p1', 40, [
+      { totalsBasis: 'GROSS', lines: [{ productId: 'p1', qty: 1, totalBase: 120 }] },
+      { totalsBasis: 'GROSS', lines: [{ productId: 'p1', qty: -1, totalBase: -120 }] },
+    ]),
+    order('B', 'p2', 40, grossCredit('p2')),
+  ], async () => {
+    const rows = await exportCsv('products')
+    const p1 = rows.find((r) => r.sku === 'SKU-p1')!
+    const p2 = rows.find((r) => r.sku === 'SKU-p2')!
+
+    assert.equal(p1.refundsGrossBasis, '0.00', 'the signed column really is zero; that is the trap')
+    assert.equal(p1.netRevenueBound, 'indeterminate')
+    assert.equal(p1.grossProfitBound, 'indeterminate')
+    assert.equal(p1.avgOrderValueBound, 'indeterminate')
+
+    assert.equal(p2.refundsGrossBasis, '120.00')
+    assert.equal(p2.netRevenueBound, 'upper')
+    assert.equal(p2.grossProfitBound, 'upper')
+    assert.equal(p2.avgOrderValueBound, 'upper')
+  })
+})

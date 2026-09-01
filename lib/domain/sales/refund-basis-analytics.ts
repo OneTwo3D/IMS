@@ -193,6 +193,36 @@ export function creditPlacement(
   return { bucket, comparable, placeable: comparable || toDecimal(amountBase).isZero() }
 }
 
+/**
+ * THE UNPLACED CREDIT A FIGURE COULD NOT ABSORB, AS AN INTERVAL — for the producers that are floats.
+ *
+ * `netLinearFigureBound` and `marginFigureBound` read their `unplacedCredit` for its SIGN: a
+ * negative one means the true figure may be ABOVE the published one, so no `≤` may be claimed.
+ * Passing them `refundsGrossBasis + refundsUnknownBasis` — a SIGNED SUM — destroys exactly that
+ * information. A +120 and a −120 of gross-basis credit add to a bucket of zero, zero is not
+ * negative, and the classifiers answer `upper` about a figure that can move 120 in either
+ * direction. This is `unplacedCreditBound(unplacedCreditInterval(...))` in
+ * sales-fulfillment-analytics, over `number` instead of `Decimal`, and the argument is the same
+ * one: the interval has to be formed from `Σ max(b, 0)` recorded AT THE ENTRY, because by the time
+ * a bucket is a total there is no entry left to record.
+ *
+ * `total` is the bucket's signed sum, `positive` is `Σ max(entry, 0)` over the entries that fed it,
+ * and `Σ min(entry, 0)` is the difference. Pass every bucket the figure could NOT place.
+ *
+ * A NON-NEGATIVE result therefore means more than "the credit summed positive": it means no
+ * unplaced entry was negative at all, which is why a caller may still describe the result as the
+ * width of the bound when the classification comes back `upper`.
+ */
+export function unplacedCreditBoundFromParts(parts: ReadonlyArray<{ total: number; positive: number }>): number {
+  let lower = 0
+  let upper = 0
+  for (const part of parts) {
+    lower += part.total - part.positive
+    upper += part.positive
+  }
+  return lower < 0 ? lower : upper
+}
+
 function round2(value: ReturnType<typeof toDecimal>): number {
   return Math.round(value.mul(100).toNumber()) / 100
 }

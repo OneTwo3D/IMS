@@ -298,13 +298,13 @@ test('dashboard: the Cash Bridge marks its two net-derived bars and NO others (o
   const { kpi } = await dashboard(40, DASH_GROSS_CREDIT)
   const { cashBridgeRows } = await import('@/app/(dashboard)/dashboard/dashboard-client')
 
-  const marked = cashBridgeRows(kpi).filter((b) => b.bounded).map((b) => b.name)
+  const marked = cashBridgeRows(kpi).filter((b) => b.bound !== 'exact').map((b) => b.name)
   // 'Margin' here is the MONEY profit bar (kpi.profitCurrent), which is a genuine ceiling — unlike
   // the Margin % ratio two charts away.
   assert.deepEqual(marked, ['Net Sales', 'Margin'])
 
   const clean = await dashboard(40, [{ totalsBasis: 'NET', totalBase: 25 }])
-  assert.deepEqual(cashBridgeRows(clean.kpi).filter((b) => b.bounded).map((b) => b.name), [],
+  assert.deepEqual(cashBridgeRows(clean.kpi).filter((b) => b.bound !== 'exact').map((b) => b.name), [],
     'and the marking is driven by the basis, not hardcoded to those two bars')
 })
 

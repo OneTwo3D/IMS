@@ -181,14 +181,14 @@ test('a chart bucket whose credits are unplaceable marks its bar an upper bound 
   assert.equal(chartData.length, 24)
   const noon = chartData[12]
   assert.equal(noon.netSales, 100, 'old arithmetic gave -20 in this bucket')
-  assert.equal(noon.netSalesUpperBound, true)
+  assert.equal(noon.netSalesBound, 'upper')
   assert.equal(noon.compNetSales, 180)
-  assert.equal(noon.compNetSalesUpperBound, false)
+  assert.equal(noon.compNetSalesBound, 'exact')
 
   // An empty hour has nothing unplaceable and must not be marked.
   assert.equal(chartData[3].netSales, 0)
-  assert.equal(chartData[3].netSalesUpperBound, false)
-  assert.equal(chartData[3].compNetSalesUpperBound, false)
+  assert.equal(chartData[3].netSalesBound, 'exact')
+  assert.equal(chartData[3].compNetSalesBound, 'exact')
 })
 
 test('an all-NET period is byte-for-byte what it always was (o3d-iigc)', async () => {
@@ -203,4 +203,95 @@ test('an all-NET period is byte-for-byte what it always was (o3d-iigc)', async (
   assert.equal(kpi.refundBasisCompleteCurrent, true)
   assert.equal(kpi.refundsGrossBasisCurrent, 0)
   assert.equal(kpi.refundsUnknownBasisCurrent, 0)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-7jfq: TWO OPPOSITE SAME-BASIS CREDITS MUST NOT PRODUCE A `≤`
+// ---------------------------------------------------------------------------
+
+test('KPI: opposite GROSS credits cancel to a zero bucket and net sales claims no ceiling (o3d-7jfq)', async () => {
+  // A £100 ex-VAT sale credited +£120 and −£120, both stamped GROSS — a credit and its reversal.
+  // Neither is placeable on this ex-VAT figure, so `refundsGrossBasisCurrent` is 120 - 120 = 0, and
+  // the bound was classified from `refundsGrossBasis + refundsUnknownBasis`. Zero is not negative,
+  // so the cards printed "£100 ≤" about a figure whose true value lies anywhere in [-£20, £220].
+  ORDERS = [
+    order({ id: 'A', createdAt: TODAY_NOON, lineTotalBase: 100, cogsBase: 40, refunds: [
+      { totalsBasis: 'GROSS', totalBase: 120 },
+      { totalsBasis: 'GROSS', totalBase: -120 },
+    ] }),
+  ]
+  const { kpi } = await todayVsYesterday()
+
+  assert.equal(kpi.refundsGrossBasisCurrent, 0, 'the signed bucket really is zero; that is the trap')
+  assert.equal(kpi.refundBasisCompleteCurrent, false, 'neither entry could be placed')
+  assert.equal(kpi.netSalesCurrent, 100, 'the figure is unchanged — this is about the RELATION')
+  assert.equal(kpi.profitCurrent, 60)
+  assert.equal(kpi.netSalesBoundCurrent, 'indeterminate')
+  assert.equal(kpi.marginBoundCurrent, 'indeterminate')
+})
+
+test('KPI: the same period with both entries POSITIVE keeps its sound ≤ (o3d-7jfq control)', async () => {
+  // So `indeterminate` cannot be reached by marking everything indeterminate: +£120 and +£120 leave
+  // the negative part at zero, the ceiling holds, and the width is the £240 the column reports.
+  ORDERS = [
+    order({ id: 'A', createdAt: TODAY_NOON, lineTotalBase: 100, cogsBase: 40, refunds: [
+      { totalsBasis: 'GROSS', totalBase: 120 },
+      { totalsBasis: 'GROSS', totalBase: 120 },
+    ] }),
+  ]
+  const { kpi } = await todayVsYesterday()
+
+  assert.equal(kpi.refundsGrossBasisCurrent, 240)
+  assert.equal(kpi.netSalesBoundCurrent, 'upper')
+})
+
+test('KPI: an all-NET period claims nothing at all (o3d-7jfq control)', async () => {
+  ORDERS = [order({ id: 'A', createdAt: TODAY_NOON, lineTotalBase: 100, cogsBase: 40, refunds: [{ totalsBasis: 'NET', totalBase: 25 }] })]
+  const { kpi } = await todayVsYesterday()
+
+  assert.equal(kpi.netSalesBoundCurrent, 'exact')
+  assert.equal(kpi.netSalesBoundComparison, 'exact')
+})
+
+test('chart bucket + comparison bucket: the cancellation is caught per bucket (o3d-7jfq)', async () => {
+  // The chart classifies each bucket from its OWN aggregate, so the defect is per bucket too. Today
+  // noon holds the cancelling pair; yesterday noon holds one ordinary £120 gross credit.
+  ORDERS = [
+    order({ id: 'A', createdAt: TODAY_NOON, lineTotalBase: 100, cogsBase: 40, refunds: [
+      { totalsBasis: 'GROSS', totalBase: 120 },
+      { totalsBasis: 'GROSS', totalBase: -120 },
+    ] }),
+    order({ id: 'C', createdAt: YESTERDAY_NOON, lineTotalBase: 200, cogsBase: 40, refunds: [{ totalsBasis: 'GROSS', totalBase: 120 }] }),
+  ]
+  const { chartData } = await todayVsYesterday()
+  const noon = chartData[12]
+
+  assert.equal(noon.netSales, 100)
+  assert.equal(noon.netSalesBound, 'indeterminate')
+  // The comparison bucket's unplaced credit is a single positive entry, so its ceiling holds.
+  assert.equal(noon.compNetSales, 200)
+  assert.equal(noon.compNetSalesBound, 'upper')
+  // An empty hour has nothing unplaced at all.
+  assert.equal(chartData[3].netSalesBound, 'exact')
+})
+
+test('the Cash Bridge marks its two net-derived bars with the RELATION, not a boolean (o3d-7jfq)', async () => {
+  ORDERS = [
+    order({ id: 'A', createdAt: TODAY_NOON, lineTotalBase: 100, cogsBase: 40, refunds: [
+      { totalsBasis: 'GROSS', totalBase: 120 },
+      { totalsBasis: 'GROSS', totalBase: -120 },
+    ] }),
+  ]
+  const { kpi } = await todayVsYesterday()
+  const { cashBridgeRows } = await import('@/app/(dashboard)/dashboard/dashboard-client')
+  const bars = new Map(cashBridgeRows(kpi).map((b) => [b.name, b.bound]))
+
+  // The two bars that ARE net-derived carry the period's verdict; the four basis-independent ones
+  // stay exact, which is what stops this becoming a page-wide smear.
+  assert.equal(bars.get('Net Sales'), 'indeterminate')
+  assert.equal(bars.get('Margin'), 'indeterminate')
+  assert.equal(bars.get('Gross Sales'), 'exact')
+  assert.equal(bars.get('COGS'), 'exact')
+  assert.equal(bars.get('Refunds'), 'exact')
+  assert.equal(bars.get('Discounts'), 'exact')
 })

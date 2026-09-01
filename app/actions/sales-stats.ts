@@ -7,7 +7,7 @@ import { logActivity } from '@/lib/activity-log'
 import type { ProductLifecycleStatus } from '@/app/generated/prisma/client'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { allocateOrderDiscountBase, normalizeLineDiscountBase } from '@/lib/sales-currency'
-import { marginFigureBound, netOfRefunds, refundLineBucket, refundPctOfSale, refundTotalsBasis, type DerivedFigureBound, type RefundSetBasis, type RefundTotalsBasis } from '@/lib/domain/sales/refund-basis-analytics'
+import { marginFigureBound, netLinearFigureBound, netOfRefunds, refundLineBucket, refundPctOfSale, refundTotalsBasis, unplacedCreditBoundFromParts, type DerivedFigureBound, type RefundSetBasis, type RefundTotalsBasis } from '@/lib/domain/sales/refund-basis-analytics'
 
 // ---------------------------------------------------------------------------
 // Products tab (line-level)
@@ -42,12 +42,27 @@ export type SalesStatRow = {
   /** Refund value with no proven basis — reported, NOT subtracted from `netRevenue`. */
   refundsUnknownBasis: number
   /**
-   * False when this product carried refund value that could not be placed on the net basis. When
-   * false, `netRevenue`, `grossProfit` and `avgOrderValue` are UPPER BOUNDS, loose by at most
-   * refundsGrossBasis + refundsUnknownBasis. `marginPct` is NOT covered by this flag — see
-   * `marginPctBound`.
+   * False when this product carried refund value that could not be placed on the net basis.
+   *
+   * o3d-7jfq: THIS FLAG IS NOT A BOUND, AND A CONSUMER MAY NOT TURN IT INTO ONE. It says credit was
+   * left unsubtracted; it does not say which SIDE of the published figure the truth is on. Where
+   * two opposite credits were left unsubtracted the figure can be too LOW, and `≤` is then a false
+   * claim. `netRevenueBound` is the verdict; this stays because the columns beside it are what the
+   * reader is being pointed at.
    */
   refundBasisComplete: boolean
+  /**
+   * WHICH RELATION `netRevenue`, `grossProfit` and `avgOrderValue` bear to the true figures — all
+   * three, because all three are `netRevenue - k` for a basis-independent non-negative k and move
+   * with it one for one.
+   *
+   * PUBLISHED BY THE PRODUCER, not derived downstream. Deriving it needs the unsubtracted credit's
+   * INTERVAL, and the interval only exists while the individual credit entries do — which is here,
+   * in the loop below, and nowhere after it. The two published bucket columns are signed sums; a
+   * consumer that adds them gets the cancellation this field exists to prevent, and gets it from
+   * ROUNDED numbers on top (the round-5 finding). Consumers read this.
+   */
+  netRevenueBound: DerivedFigureBound
   netRevenue: number
   cogs: number
   grossProfit: number
@@ -74,10 +89,12 @@ export type SalesStatSummary = {
   totalRefundsGrossBasis: number
   totalRefundsUnknownBasis: number
   /**
-   * False when ANY row's refunds could not all be placed on the net basis. Governs totalNetRevenue,
-   * totalGrossProfit and avgOrderValue. NOT avgMarginPct — see avgMarginPctBound.
+   * False when ANY row's refunds could not all be placed on the net basis. As on the row, this is
+   * the EXISTENCE of unplaced credit and not a relation: read `netRevenueBound` for that (o3d-7jfq).
    */
   refundBasisComplete: boolean
+  /** As SalesStatRow.netRevenueBound, for totalNetRevenue / totalGrossProfit / avgOrderValue. */
+  netRevenueBound: DerivedFigureBound
   totalNetRevenue: number
   totalCogs: number
   totalGrossProfit: number
@@ -119,6 +136,21 @@ export async function getProductSalesStats(dateFrom?: string, dateTo?: string): 
   })
   const productInfo = new Map(products.map((p) => [p.id, p]))
   const productMap = new Map<string, SalesStatRow>()
+  /**
+   * o3d-7jfq: `Σ max(entry, 0)` for the two buckets a NET figure cannot place, recorded HERE
+   * because the refund loop below is the last place the individual entries exist. The published
+   * bucket columns are signed sums, and two opposite gross credits sum to a zero that reads as
+   * "this figure cannot move". Kept beside the row rather than on it: the row is the PUBLISHED
+   * shape, and what a consumer needs from this is the verdict, not the parts.
+   */
+  const unplacedPositive = new Map<string, { gross: number; unknown: number }>()
+  const positiveParts = (productId: string) => {
+    const existing = unplacedPositive.get(productId)
+    if (existing) return existing
+    const created = { gross: 0, unknown: 0 }
+    unplacedPositive.set(productId, created)
+    return created
+  }
 
   for (const order of orders) {
     const orderDiscountAllocations = allocateOrderDiscountBase(order, order.lines)
@@ -138,7 +170,7 @@ export async function getProductSalesStats(dateFrom?: string, dateTo?: string): 
           salesPrice: info?.salesPriceBase ? Number(info.salesPriceBase) : null,
           weight: info?.weight ? Number(info.weight) : null,
           qtySold: 0, qtyRefunded: 0, netQty: 0, grossRevenue: 0, discounts: 0, refunds: 0,
-          refundsGrossBasis: 0, refundsUnknownBasis: 0, refundBasisComplete: true,
+          refundsGrossBasis: 0, refundsUnknownBasis: 0, refundBasisComplete: true, netRevenueBound: 'exact',
           netRevenue: 0, cogs: 0, grossProfit: 0, marginPct: 0, marginPctBound: 'exact', orderCount: 0, avgOrderValue: 0,
         })
       }
@@ -168,9 +200,10 @@ export async function getProductSalesStats(dateFrom?: string, dateTo?: string): 
         row.qtyRefunded += Number(rl.qty)
         const amount = Number(rl.totalBase)
         const placement = refundLineBucket(refund.totalsBasis, rl.totalBase)
+        const positive = Math.max(amount, 0)
         if (placement.bucket === 'net') row.refunds += amount
-        else if (placement.bucket === 'gross') row.refundsGrossBasis += amount
-        else row.refundsUnknownBasis += amount
+        else if (placement.bucket === 'gross') { row.refundsGrossBasis += amount; positiveParts(rl.productId).gross += positive }
+        else { row.refundsUnknownBasis += amount; positiveParts(rl.productId).unknown += positive }
         if (!placement.placeableOnNetBasis) row.refundBasisComplete = false
       }
     }
@@ -195,6 +228,9 @@ export async function getProductSalesStats(dateFrom?: string, dateTo?: string): 
    */
   const period = {
     grossRevenue: 0, discounts: 0, refunds: 0, refundsGrossBasis: 0, refundsUnknownBasis: 0,
+    // The interval's other endpoint for the whole period, summed over the same ENTRIES the rows
+    // summed — not over the rows' signed totals, which have already cancelled (o3d-7jfq).
+    refundsGrossBasisPositive: 0, refundsUnknownBasisPositive: 0,
     netRevenue: 0, cogs: 0, grossProfit: 0, netQty: 0, refundBasisComplete: true,
   }
   for (const row of productMap.values()) {
@@ -205,15 +241,30 @@ export async function getProductSalesStats(dateFrom?: string, dateTo?: string): 
     row.avgOrderValue = row.orderCount > 0 ? row.netRevenue / row.orderCount : 0
     // Classified from the UNROUNDED figures, before the roundings below, because the classification
     // is about which side of the published number the truth lies on, not about its last penny.
+    //
+    // o3d-7jfq: and from the INTERVAL, not from `refundsGrossBasis + refundsUnknownBasis`. That sum
+    // is zero for a product credited +120 on the gross basis and −120 on it again, and zero is not
+    // negative, so both classifiers answered `upper` — a printed "at most" about a figure that can
+    // sit 120 either side of the published one.
+    const rowParts = unplacedPositive.get(row.productId) ?? { gross: 0, unknown: 0 }
+    const rowUnplaced = unplacedCreditBoundFromParts([
+      { total: row.refundsGrossBasis, positive: rowParts.gross },
+      { total: row.refundsUnknownBasis, positive: rowParts.unknown },
+    ])
     row.marginPctBound = marginFigureBound({
       netRevenue: row.netRevenue,
       cogs: row.cogs,
-      unplacedCredit: row.refundsGrossBasis + row.refundsUnknownBasis,
+      unplacedCredit: rowUnplaced,
       basisComplete: row.refundBasisComplete,
     })
+    // One verdict for the three figures that move with net revenue one for one. Published so no
+    // consumer has to re-derive it — and so none of them can re-derive it wrongly.
+    row.netRevenueBound = netLinearFigureBound({ basisComplete: row.refundBasisComplete, unplacedCredit: rowUnplaced })
     period.grossRevenue += row.grossRevenue; period.discounts += row.discounts
     period.refunds += row.refunds; period.refundsGrossBasis += row.refundsGrossBasis
     period.refundsUnknownBasis += row.refundsUnknownBasis
+    period.refundsGrossBasisPositive += rowParts.gross
+    period.refundsUnknownBasisPositive += rowParts.unknown
     period.netRevenue += row.netRevenue; period.cogs += row.cogs; period.grossProfit += row.grossProfit
     period.netQty += row.netQty
     if (!row.refundBasisComplete) period.refundBasisComplete = false
@@ -234,6 +285,7 @@ export async function getProductSalesStats(dateFrom?: string, dateTo?: string): 
     totalRefundsGrossBasis: m2(period.refundsGrossBasis),
     totalRefundsUnknownBasis: m2(period.refundsUnknownBasis),
     refundBasisComplete: period.refundBasisComplete,
+    netRevenueBound: 'exact',
     totalNetRevenue: m2(period.netRevenue), totalCogs: m2(period.cogs),
     totalGrossProfit: m2(period.grossProfit), avgMarginPct: 0, avgMarginPctBound: 'exact', avgOrderValue: 0,
     // Quantity is left unrounded exactly as it was: it may carry fractional units, and rounding it
@@ -247,12 +299,19 @@ export async function getProductSalesStats(dateFrom?: string, dateTo?: string): 
   // same way — from the period's own COGS and its own unplaced credit, NOT by OR-ing the rows'
   // verdicts: a row whose margin is indeterminate can sit inside a period whose margin is a sound
   // upper bound, and the reverse.
+  const periodUnplaced = unplacedCreditBoundFromParts([
+    { total: period.refundsGrossBasis, positive: period.refundsGrossBasisPositive },
+    { total: period.refundsUnknownBasis, positive: period.refundsUnknownBasisPositive },
+  ])
   summary.avgMarginPctBound = marginFigureBound({
     netRevenue: period.netRevenue,
     cogs: period.cogs,
-    unplacedCredit: period.refundsGrossBasis + period.refundsUnknownBasis,
+    unplacedCredit: periodUnplaced,
     basisComplete: period.refundBasisComplete,
   })
+  // The period's three linear figures, from the period's OWN interval — not by OR-ing the rows'
+  // verdicts, for the reason stated just above about the ratio.
+  summary.netRevenueBound = netLinearFigureBound({ basisComplete: period.refundBasisComplete, unplacedCredit: periodUnplaced })
   summary.avgOrderValue = summary.totalOrders > 0 ? Math.round((period.netRevenue / summary.totalOrders) * 100) / 100 : 0
   return { rows, summary }
 }

@@ -192,6 +192,24 @@ function marginBoundTitle(bound: DerivedFigureBound, summary = false): string | 
 }
 
 /**
+ * o3d-7jfq: A LINEAR FIGURE CAN BE INDETERMINATE TOO, AND FOR A DIFFERENT REASON FROM MARGIN'S.
+ *
+ * Net Revenue, Profit and Avg Order were marked straight off `refundBasisComplete` — a boolean, so
+ * the only two things they could say were "exact" and `≤`. But `≤` needs the unsubtracted credit to
+ * be NON-NEGATIVE: a product credited +120 on the gross basis and −120 on it again has a signed
+ * bucket of zero and a true figure that may be 120 ABOVE the published one. `netRevenueBound` is the
+ * producer's verdict over the INTERVAL, and it distinguishes the third case these cells could not.
+ */
+const LINEAR_INDETERMINATE_TITLE = 'Direction not established: this product\u2019s unsubtracted credit includes a NEGATIVE entry, so the true figure may be either side of this one. The figure is shown; the relation is not claimed.'
+const LINEAR_INDETERMINATE_TITLE_SUMMARY = 'Direction not established: the credit this period could not subtract includes a NEGATIVE entry, so the true figure may be either side of this one. The figure is shown; the relation is not claimed.'
+
+function linearBoundTitle(bound: DerivedFigureBound, summary = false): string | undefined {
+  if (bound === 'exact') return undefined
+  if (bound === 'indeterminate') return summary ? LINEAR_INDETERMINATE_TITLE_SUMMARY : LINEAR_INDETERMINATE_TITLE
+  return summary ? BOUND_TITLE_SUMMARY : BOUND_TITLE
+}
+
+/**
  * o3d-iigc round 2 (Codex finding 1): A SUMMARY CARD IS THE FIGURE PEOPLE ACTUALLY READ, and on a
  * card an upper bound was indistinguishable from a measurement — the marks the table cells carry
  * were on the columns hardly anyone scrolls to, while the five cards above them printed the same
@@ -201,7 +219,7 @@ function marginBoundTitle(bound: DerivedFigureBound, summary = false): string | 
  * of any colouring that would read as a verdict — plus, because a card has no "Refunds (gross)"
  * column beside it to reveal how loose the bound is, the looseness in words underneath.
  */
-function SummaryCard({ label, value, bound = 'exact', boundedBy, valueClass }: {
+function SummaryCard({ label, value, bound = 'exact', boundedBy, widthKnown = true, kind = 'linear', valueClass }: {
   label: string
   /** Already formatted: money through fmtBase, a percentage with its sign. */
   value: string
@@ -213,11 +231,22 @@ function SummaryCard({ label, value, bound = 'exact', boundedBy, valueClass }: {
   bound?: DerivedFigureBound
   /** Formatted refund value the figure could not absorb — how loose the bound is. */
   boundedBy?: string
+  /**
+   * o3d-7jfq: WHETHER `boundedBy` IS ACTUALLY THE WIDTH. It is the two published bucket columns
+   * added together, and that sum is the width only while no unplaced entry was negative — which is
+   * exactly when the period's LINEAR verdict is not `indeterminate`. Where it is, +120 and −120 of
+   * gross-basis credit have cancelled into a zero, and printing "£0.00 of refunds not subtracted"
+   * beside a figure that may be £120 out would be the same defect wearing a number. The sentence is
+   * then dropped for the one that says what is actually known.
+   */
+  widthKnown?: boolean
+  /** Which case analysis produced `bound` — a ratio's and a linear figure's differ (o3d-7jfq). */
+  kind?: 'linear' | 'ratio'
   /** Colouring that reads as a verdict on the figure. Dropped whenever the figure is not exact. */
   valueClass?: string
 }) {
   const marked = bound !== 'exact'
-  const title = bound === 'indeterminate' ? MARGIN_INDETERMINATE_TITLE_SUMMARY : bound === 'upper' ? BOUND_TITLE_SUMMARY : undefined
+  const title = (kind === 'ratio' ? marginBoundTitle : linearBoundTitle)(bound, true)
   return (
     <div className="rounded-md border p-3">
       <p className="text-xs text-muted-foreground">{label}</p>
@@ -226,7 +255,11 @@ function SummaryCard({ label, value, bound = 'exact', boundedBy, valueClass }: {
       </p>
       {marked && (
         <p className="text-[10px] leading-tight text-orange-600" title={title}>
-          {bound === 'indeterminate' ? 'Direction not established' : 'Upper bound'} &mdash; {boundedBy} of refunds not subtracted
+          {bound === 'upper'
+            ? <>Upper bound &mdash; {boundedBy} of refunds not subtracted</>
+            : widthKnown
+              ? <>Direction not established &mdash; {boundedBy} of refunds not subtracted</>
+              : 'Direction not established \u2014 some credit this figure could not subtract is negative'}
         </p>
       )}
     </div>
@@ -514,10 +547,15 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
   // How loose the bounded summary figures are: every refund the ex-VAT revenue could not absorb,
   // which is exactly the two columns the products table reports beside the figure. Rounded once,
   // here, because both totals are themselves sums of rounded rows.
-  const summaryIsBounded = !summary.refundBasisComplete
   // The verdict for the figures that move ONE-FOR-ONE with net revenue. Avg Margin does NOT use it —
   // it carries its own, because a ratio's error can run the other way (o3d-iigc round 4).
-  const summaryLinearBound: DerivedFigureBound = summaryIsBounded ? 'upper' : 'exact'
+  //
+  // o3d-7jfq: READ, not derived. This was `!summary.refundBasisComplete ? 'upper' : 'exact'`, which
+  // could only ever say `≤` — a boolean has no third value — so a period whose unsubtracted credit
+  // contains a negative entry printed a ceiling it does not have. The producer forms the interval.
+  const summaryLinearBound: DerivedFigureBound = summary.netRevenueBound
+  // The WIDTH — sound only while the linear verdict is not `indeterminate`; see SummaryCard.widthKnown.
+  const summaryWidthKnown = summaryLinearBound !== 'indeterminate'
   const summaryBoundedBy = fmtBase(Math.round((summary.totalRefundsGrossBasis + summary.totalRefundsUnknownBasis) * 100) / 100)
 
   // Filtered data per tab
@@ -557,16 +595,18 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
     refundsUnknownBasis: { label: moneyLabel('Refunds (basis ?)'), align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono text-orange-600" title="Refund value whose basis was never proved — excluded from net revenue rather than guessed at">{r.refundsUnknownBasis > 0 ? fmtBase(r.refundsUnknownBasis) : '—'}</span>, footer: () => <span className="tabular-nums font-mono text-orange-600">{fmtBase(summary.totalRefundsUnknownBasis)}</span> },
     // o3d-iigc: when the row's refunds could not all be placed on the net basis, this figure and
     // everything derived from it are UPPER BOUNDS — marked, not presented as exact.
-    netRevenue: { label: moneyLabel('Net Revenue'), align: 'right', render: (r) => <span className={`tabular-nums text-xs font-mono font-medium ${r.refundBasisComplete ? '' : 'text-orange-600'}`} title={r.refundBasisComplete ? undefined : BOUND_TITLE}>{fmtBase(r.netRevenue)}{r.refundBasisComplete ? '' : ' \u2264'}</span>, footer: () => <span className={`tabular-nums font-mono ${summary.refundBasisComplete ? '' : 'text-orange-600'}`} title={summary.refundBasisComplete ? undefined : BOUND_TITLE}>{fmtBase(summary.totalNetRevenue)}{summary.refundBasisComplete ? '' : ' \u2264'}</span> },
+    netRevenue: { label: moneyLabel('Net Revenue'), align: 'right', render: (r) => <span className={`tabular-nums text-xs font-mono font-medium ${r.netRevenueBound === 'exact' ? '' : 'text-orange-600'}`} title={linearBoundTitle(r.netRevenueBound)}>{fmtBase(r.netRevenue)}{boundSuffix(r.netRevenueBound)}</span>, footer: () => <span className={`tabular-nums font-mono ${summary.netRevenueBound === 'exact' ? '' : 'text-orange-600'}`} title={linearBoundTitle(summary.netRevenueBound, true)}>{fmtBase(summary.totalNetRevenue)}{boundSuffix(summary.netRevenueBound)}</span> },
     cogs: { label: moneyLabel('COGS'), align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono text-muted-foreground">{r.cogs > 0 ? fmtBase(r.cogs) : '—'}</span>, footer: () => <span className="tabular-nums font-mono text-muted-foreground">{fmtBase(summary.totalCogs)}</span> },
     // A bounded profit/margin DROPS the green/red colouring: that colouring reads as a verdict, and
     // an upper bound does not support one.
-    grossProfit: { label: moneyLabel('Profit'), align: 'right', render: (r) => <span className={`tabular-nums text-xs font-mono ${!r.refundBasisComplete ? 'text-orange-600' : r.grossProfit >= 0 ? 'text-green-600' : 'text-destructive'}`} title={r.refundBasisComplete ? undefined : BOUND_TITLE}>{fmtBase(r.grossProfit)}{r.refundBasisComplete ? '' : ' \u2264'}</span>, footer: () => <span className={`tabular-nums font-mono ${summary.refundBasisComplete ? 'text-green-600' : 'text-orange-600'}`} title={summary.refundBasisComplete ? undefined : BOUND_TITLE}>{fmtBase(summary.totalGrossProfit)}{summary.refundBasisComplete ? '' : ' \u2264'}</span> },
-    // o3d-iigc round 4: Margin reads marginPctBound, NOT refundBasisComplete. The other three
-    // net-derived columns keep refundBasisComplete because they move one-for-one with net revenue.
+    grossProfit: { label: moneyLabel('Profit'), align: 'right', render: (r) => <span className={`tabular-nums text-xs font-mono ${r.netRevenueBound !== 'exact' ? 'text-orange-600' : r.grossProfit >= 0 ? 'text-green-600' : 'text-destructive'}`} title={linearBoundTitle(r.netRevenueBound)}>{fmtBase(r.grossProfit)}{boundSuffix(r.netRevenueBound)}</span>, footer: () => <span className={`tabular-nums font-mono ${summary.netRevenueBound === 'exact' ? 'text-green-600' : 'text-orange-600'}`} title={linearBoundTitle(summary.netRevenueBound, true)}>{fmtBase(summary.totalGrossProfit)}{boundSuffix(summary.netRevenueBound)}</span> },
+    // o3d-iigc round 4: Margin reads marginPctBound, NOT refundBasisComplete. o3d-7jfq: and the
+    // other three read netRevenueBound for the same reason one step on — moving one-for-one with
+    // net revenue makes them the SAME kind of figure, not an EXACT one, and the flag they used to
+    // read cannot say which side of them the truth is on.
     marginPct: { label: 'Margin', align: 'right', render: (r) => <span className={`tabular-nums text-xs ${r.marginPctBound !== 'exact' ? 'text-orange-600' : r.marginPct < 0 ? 'text-destructive' : ''}`} title={marginBoundTitle(r.marginPctBound)}>{r.marginPct}%{boundSuffix(r.marginPctBound)}</span>, footer: () => <span className={`tabular-nums ${summary.avgMarginPctBound !== 'exact' ? 'text-orange-600' : ''}`} title={marginBoundTitle(summary.avgMarginPctBound, true)}>{summary.avgMarginPct}%{boundSuffix(summary.avgMarginPctBound)}</span> },
     orderCount: { label: 'Orders', align: 'right', render: (r) => <span className="tabular-nums text-xs text-muted-foreground">{r.orderCount}</span>, footer: () => <span className="tabular-nums text-muted-foreground">{summary.totalOrders}</span> },
-    avgOrderValue: { label: moneyLabel('Avg Order'), align: 'right', render: (r) => <span className={`tabular-nums text-xs font-mono ${r.refundBasisComplete ? '' : 'text-orange-600'}`} title={r.refundBasisComplete ? undefined : BOUND_TITLE}>{fmtBase(r.avgOrderValue)}{r.refundBasisComplete ? '' : ' \u2264'}</span>, footer: () => <span className={`tabular-nums font-mono ${summary.refundBasisComplete ? '' : 'text-orange-600'}`} title={summary.refundBasisComplete ? undefined : BOUND_TITLE}>{fmtBase(summary.avgOrderValue)}{summary.refundBasisComplete ? '' : ' \u2264'}</span> },
+    avgOrderValue: { label: moneyLabel('Avg Order'), align: 'right', render: (r) => <span className={`tabular-nums text-xs font-mono ${r.netRevenueBound === 'exact' ? '' : 'text-orange-600'}`} title={linearBoundTitle(r.netRevenueBound)}>{fmtBase(r.avgOrderValue)}{boundSuffix(r.netRevenueBound)}</span>, footer: () => <span className={`tabular-nums font-mono ${summary.netRevenueBound === 'exact' ? '' : 'text-orange-600'}`} title={linearBoundTitle(summary.netRevenueBound, true)}>{fmtBase(summary.avgOrderValue)}{boundSuffix(summary.netRevenueBound)}</span> },
     salesPrice: { label: moneyLabel('List Price'), align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono">{r.salesPrice != null ? fmtBase(r.salesPrice) : '—'}</span> },
     weight: { label: 'Weight', align: 'right', render: (r) => <span className="tabular-nums text-xs">{r.weight != null ? `${r.weight}kg` : '—'}</span> },
     currentStock: { label: 'On Hand', align: 'right', render: (r) => <span className="tabular-nums text-xs">{r.currentStock}</span> },
@@ -702,11 +742,11 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
           Orders/Qty are basis-independent — quantity nets off every refund line whatever its
           basis — so they are never marked. */}
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
-        <SummaryCard label="Net Revenue" value={fmtBase(summary.totalNetRevenue)} bound={summaryLinearBound} boundedBy={summaryBoundedBy} />
+        <SummaryCard label="Net Revenue" value={fmtBase(summary.totalNetRevenue)} bound={summaryLinearBound} boundedBy={summaryBoundedBy} widthKnown={summaryWidthKnown} />
         <SummaryCard label="COGS" value={fmtBase(summary.totalCogs)} />
-        <SummaryCard label="Gross Profit" value={fmtBase(summary.totalGrossProfit)} bound={summaryLinearBound} boundedBy={summaryBoundedBy} valueClass="text-green-600" />
+        <SummaryCard label="Gross Profit" value={fmtBase(summary.totalGrossProfit)} bound={summaryLinearBound} boundedBy={summaryBoundedBy} widthKnown={summaryWidthKnown} valueClass="text-green-600" />
         {/* o3d-iigc round 4: Avg Margin takes its OWN verdict, not the period's linear one. */}
-        <SummaryCard label="Avg Margin" value={`${summary.avgMarginPct}%`} bound={summary.avgMarginPctBound} boundedBy={summaryBoundedBy} />
+        <SummaryCard label="Avg Margin" value={`${summary.avgMarginPct}%`} bound={summary.avgMarginPctBound} boundedBy={summaryBoundedBy} widthKnown={summaryWidthKnown} kind="ratio" />
         <SummaryCard label="Orders / Qty" value={`${summary.totalOrders} / ${summary.totalQtySold}`} />
       </div>
 

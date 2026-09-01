@@ -180,10 +180,10 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'app/(dashboard)/analytics/sales-stats/sales-stats-client.tsx',
-    figures: ['avgMarginPct', 'avgMarginPctBound', 'avgOrderValue', 'grossProfit', 'grossRevenue', 'marginBoundTitle', 'marginPct', 'marginPctBound', 'netRevenue', 'netTotal', 'netTotalBasis', 'totalGrossProfit', 'totalGrossRevenue', 'totalNetRevenue'],
+    figures: ['avgMarginPct', 'avgMarginPctBound', 'avgOrderValue', 'grossProfit', 'grossRevenue', 'marginBoundTitle', 'marginPct', 'marginPctBound', 'netRevenue', 'netRevenueBound', 'netTotal', 'netTotalBasis', 'totalGrossProfit', 'totalGrossRevenue', 'totalNetRevenue'],
     treatment: 'basis-aware',
     reason:
-      'Renders every bounded sales-statistics figure, cards included, with the ratio marked separately from the linear figures.',
+      'Renders every bounded sales-statistics figure, cards included, with the ratio marked separately from the linear figures. o3d-7jfq: the linear cells and cards READ the producer\u2019s netRevenueBound instead of deriving \u2264 from refundBasisComplete, which is a boolean and could not say indeterminate.',
   },
   {
     file: 'app/(dashboard)/analytics/sales/page.tsx',
@@ -194,10 +194,10 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'app/(dashboard)/dashboard/dashboard-client.tsx',
-    figures: ['avgOrderValue', 'bestSellerMarginTitle', 'bestSellerRevenueTitle', 'compMarginPct', 'compMarginPctBound', 'compNetSales', 'compNetSalesUpperBound', 'grossSalesComparison', 'grossSalesCurrent', 'marginBoundComparison', 'marginBoundCurrent', 'marginChartTooltip', 'marginComparison', 'marginCurrent', 'marginPct', 'marginPctBound', 'marginTooltipFormatter', 'netRevenue', 'netRevenueBound', 'netSales', 'netSalesComparison', 'netSalesCurrent', 'netSalesTooltipFormatter', 'netSalesUpperBound', 'profitCurrent'],
+    figures: ['avgOrderValue', 'bestSellerMarginTitle', 'bestSellerRevenueTitle', 'compMarginPct', 'compMarginPctBound', 'compNetSales', 'compNetSalesBound', 'grossSalesComparison', 'grossSalesCurrent', 'marginBoundComparison', 'marginBoundCurrent', 'marginChartTooltip', 'marginComparison', 'marginCurrent', 'marginPct', 'marginPctBound', 'marginTooltipFormatter', 'netRevenue', 'netRevenueBound', 'netSales', 'netSalesBound', 'netSalesBoundComparison', 'netSalesBoundCurrent', 'netSalesComparison', 'netSalesCurrent', 'netSalesTooltipFormatter', 'profitCurrent'],
     treatment: 'basis-aware',
     reason:
-      'Renders the KPI cards, both chart tooltips per bucket, the cash-bridge bars and (round 5) the Best Sellers rows with their bound markers.',
+      'Renders the KPI cards, both chart tooltips per bucket, the cash-bridge bars and (round 5) the Best Sellers rows with their bound markers. o3d-7jfq: every linear \u2264 now reads a three-valued marker from the producer \u2014 the booleans it derived them from could not express indeterminate.',
   },
   {
     file: 'app/(dashboard)/sales/[id]/so-detail-client.tsx',
@@ -257,10 +257,10 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'app/actions/dashboard.ts',
-    figures: ['avgOrderValue', 'compMarginPct', 'compMarginPctBound', 'compNetSales', 'compNetSalesUpperBound', 'grossSales', 'grossSalesComparison', 'grossSalesCurrent', 'marginBoundComparison', 'marginBoundCurrent', 'marginComparison', 'marginCurrent', 'marginPct', 'marginPctBound', 'netRevenue', 'netRevenueBound', 'netSales', 'netSalesComparison', 'netSalesCurrent', 'netSalesUpperBound', 'profitCurrent'],
+    figures: ['avgOrderValue', 'compMarginPct', 'compMarginPctBound', 'compNetSales', 'compNetSalesBound', 'grossSales', 'grossSalesComparison', 'grossSalesCurrent', 'marginBoundComparison', 'marginBoundCurrent', 'marginComparison', 'marginCurrent', 'marginPct', 'marginPctBound', 'netRevenue', 'netRevenueBound', 'netSales', 'netSalesBound', 'netSalesBoundComparison', 'netSalesBoundCurrent', 'netSalesComparison', 'netSalesCurrent', 'profitCurrent'],
     treatment: 'basis-aware',
     reason:
-      'KPIs, chart buckets and (round 5) Best Sellers all bucket refunds by stamped basis, subtract only NET, and publish a bound.',
+      'KPIs, chart buckets and (round 5) Best Sellers all bucket refunds by stamped basis, subtract only NET, and publish a bound. o3d-7jfq: every bound comes from the unplaced credit\u2019s INTERVAL, recorded as each entry\u2019s positive part, so two opposite same-basis credits can no longer cancel into a \u2264.',
   },
   {
     file: 'app/actions/forecasting.ts',
@@ -299,10 +299,10 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'app/actions/sales-stats.ts',
-    figures: ['avgMarginPct', 'avgMarginPctBound', 'avgOrderValue', 'grossProfit', 'grossRevenue', 'marginPct', 'marginPctBound', 'netRevenue', 'netTotal', 'netTotalBasis', 'totalGrossProfit', 'totalGrossRevenue', 'totalNetRevenue'],
+    figures: ['avgMarginPct', 'avgMarginPctBound', 'avgOrderValue', 'grossProfit', 'grossRevenue', 'marginPct', 'marginPctBound', 'netRevenue', 'netRevenueBound', 'netTotal', 'netTotalBasis', 'totalGrossProfit', 'totalGrossRevenue', 'totalNetRevenue'],
     treatment: 'basis-aware',
     reason:
-      'The original basis-aware producer; round 5 moved its period totals and margin bound onto unrounded aggregates.',
+      'The original basis-aware producer; round 5 moved its period totals and margin bound onto unrounded aggregates. o3d-7jfq: it now PUBLISHES netRevenueBound for the three linear figures instead of leaving each consumer to re-derive it from two signed bucket columns.',
   },
   {
     file: 'app/actions/sales.ts',

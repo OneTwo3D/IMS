@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { marginFigureBound, marginFigureBoundDecimal, netLinearFigureBound, netLinearFigureBoundDecimal, shareFigureBound, boundSuffix } from '@/lib/domain/sales/refund-basis-analytics'
+import { marginFigureBound, marginFigureBoundDecimal, netLinearFigureBound, netLinearFigureBoundDecimal, shareFigureBound, boundSuffix, unplacedCreditBoundFromParts } from '@/lib/domain/sales/refund-basis-analytics'
 
 /**
  * o3d-iigc round 4, Codex finding 1: AVG MARGIN IS NOT NECESSARILY AN UPPER BOUND.
@@ -189,4 +189,33 @@ test('a share-of-total ratio is exact or it is indeterminate — never ≤ (o3d-
   assert.equal(shareFigureBound({ reportBasisComplete: true }), 'exact')
   assert.equal(shareFigureBound({ reportBasisComplete: false }), 'indeterminate')
   assert.equal(boundSuffix(shareFigureBound({ reportBasisComplete: false })), ' ?')
+})
+
+/**
+ * o3d-7jfq: THE INTERVAL, OVER `number`, FOR THE PRODUCERS THAT ARE NOT DECIMAL.
+ *
+ * `unplacedCreditBoundFromParts` is what stops a signed bucket sum reaching the classifiers above.
+ * The endpoints are `Σ min(entry, 0) = total - positive` and `Σ max(entry, 0) = positive`, and the
+ * classifiers read the result for its SIGN — so what has to hold is that a bucket containing a
+ * negative entry comes back below zero even when its signed total does not.
+ */
+test('the number-world interval keeps a negative entry visible through a zero bucket (o3d-7jfq)', () => {
+  // +120 and -120 of the same basis: total 0, positive 120, so the lower end is 0 - 120 = -120.
+  assert.equal(unplacedCreditBoundFromParts([{ total: 0, positive: 120 }]), -120)
+  // The signed sum this replaced. Zero is not negative, so the classifier said `upper` about it.
+  assert.equal(netLinearFigureBound({ basisComplete: false, unplacedCredit: 0 }), 'upper')
+  assert.equal(netLinearFigureBound({ basisComplete: false, unplacedCredit: unplacedCreditBoundFromParts([{ total: 0, positive: 120 }]) }), 'indeterminate')
+
+  // All entries non-negative: lower is 0, so the upper end is returned and the ceiling stands.
+  assert.equal(unplacedCreditBoundFromParts([{ total: 240, positive: 240 }]), 240)
+  assert.equal(netLinearFigureBound({ basisComplete: false, unplacedCredit: 240 }), 'upper')
+
+  // Two buckets summed as one interval, which is what every call site passes: gross +120/-120 and
+  // unknown +5. Lower = -120 + 0 = -120, so it is negative and wins, even though the ARITHMETIC sum
+  // across both buckets (0 + 5 = 5) is positive.
+  assert.equal(unplacedCreditBoundFromParts([{ total: 0, positive: 120 }, { total: 5, positive: 5 }]), -120)
+
+  // Nothing unplaced at all: both endpoints zero, and the caller's basisComplete flag decides.
+  assert.equal(unplacedCreditBoundFromParts([{ total: 0, positive: 0 }]), 0)
+  assert.equal(unplacedCreditBoundFromParts([]), 0)
 })
