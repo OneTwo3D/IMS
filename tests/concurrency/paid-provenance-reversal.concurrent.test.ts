@@ -191,7 +191,14 @@ test(
         // o3d-psrx r4: WHICH ledger document this registration settled, exactly as
         // `registerInvoicePaymentWithLedger` writes it. Without it the row names no document, and a row
         // that names no document can discharge nothing — which is the LEGACY arm, not this case.
-        payload: { accountingInvoiceId: invoiceId },
+        //
+        // r7 (Codex HIGH 1): AND HOW MUCH, which the enqueue has always written and this fixture used
+        // to leave out. It is load-bearing now: the order carries an off-ledger marker, so the
+        // coverage guard asks whether the registration that went missing settled the WHOLE GBP 100.
+        // It did — that is what makes this a genuine chargeback and not a part payment — and stating
+        // the amount is what lets the reader say so. A fixture that omits it is not a smaller fixture,
+        // it is a different case (see the part-covered test below, which is that case).
+        payload: { accountingInvoiceId: invoiceId, amount: 100, currency: 'GBP', paymentId: 'pay_local_full' },
       },
       select: { id: true },
     })
@@ -243,6 +250,18 @@ async function postedRegistration(
   orderId: string,
   registeredAgainstInvoiceId: string,
   externalTransactionId: string,
+  /**
+   * o3d-psrx r7 (Codex HIGH 1) — WHAT THIS REGISTRATION TOLD THE LEDGER IT WAS SENDING.
+   *
+   * Defaulted to the whole order (every order in this file is GBP 100), because that is what every
+   * case here was implicitly about: a receipt that SETTLED the order, registered, and then removed.
+   * It is not a detail any more — the reversal reader now refuses to treat a PART-covering
+   * registration's absence as a reversal of the whole order while the off-ledger marker stands, so a
+   * fixture that omits the amount is no longer a smaller fixture, it is the part-covered case.
+   */
+  amount: number = 100,
+  /** The local receipt this registration names, when the case has one — see `unregisteredLocalReceipts`. */
+  paymentId: string | null = null,
 ): Promise<string> {
   const { stampSyncedAtFromDatabaseClock } = await import('@/lib/connectors/xero/synced-at-clock')
   const row = await db.accountingSyncLog.create({
@@ -254,8 +273,11 @@ async function postedRegistration(
       referenceId: orderId,
       externalTransactionId,
       // The payload every production enqueue writes. It is the ONLY durable record of which ledger
-      // document the call was about — the order's own column answers "which document NOW".
-      payload: { accountingInvoiceId: registeredAgainstInvoiceId },
+      // document the call was about — the order's own column answers "which document NOW" — and (r7)
+      // of how much of that document it settled.
+      payload: paymentId == null
+        ? { accountingInvoiceId: registeredAgainstInvoiceId, amount, currency: 'GBP' }
+        : { accountingInvoiceId: registeredAgainstInvoiceId, amount, currency: 'GBP', paymentId },
     },
     select: { id: true },
   })
@@ -415,5 +437,122 @@ test(
     assert.ok(residual.zeroPaidReversed.has(sameInvoice),
       'a registration against THIS document is still evidence about it — the binding narrows the '
       + 'evidence, it does not switch the pass off')
+  },
+)
+
+// ---------------------------------------------------------------------------
+// o3d-psrx r7 (Codex HIGH 1) — A GBP 1 RECEIPT DISAPPEARING DOES NOT REVERSE A GBP 100 ORDER.
+//
+// THE FINDING, END TO END. r6 made `addPayment` keep `SalesOrder.unregisteredPaidAt` through a
+// PARTIAL receipt: a GBP 1 receipt on a GBP 100 order marked paid off-ledger no longer erased the
+// provenance of the other GBP 99. The READER consulted that marker only when nothing had posted — so
+// the moment the GBP 1 receipt's registration posted and bound, the marker was silent. Retire that
+// registration, read a zero-paid invoice, and the classifier returned GONE:
+// `zeroPaidIsProvenReversal` admitted it, the poller cleared `paidAt`, and
+// `raiseChargebackForReversedOrder` unwound the WHOLE GBP 100 against a customer who paid.
+//
+// WHY THIS IS HERE AND NOT ONLY IN THE UNIT FILE. The unit tests pin the DECISION. This pins the
+// WIRING — the order's total and currency being read at all, the registration's payload amount being
+// read through the same helper the enqueue writes it with, and both arriving at the classifier — and
+// wiring is what every finding in this branch has actually been. It drives the poller's OWN query
+// (`readSalesResidualVerdicts`) against real rows and asserts on the set the reversal pass consumes.
+//
+// THE CONTROL IS PAIRED, as everywhere else in this file: the same order, the same missing
+// registration, differing only in the amount that registration told the ledger about. "Withhold
+// whenever a marker is present" would pass the headline and disable chargeback detection for every
+// hand-marked and channel-paid order in the system.
+// ---------------------------------------------------------------------------
+
+test(
+  '[o3d-psrx r7] a part-covering registration going missing does NOT reverse the whole off-ledger order',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    const db = await loadDb()
+    const { readSalesResidualVerdicts } = await import('@/lib/connectors/xero/payment-poller')
+    const { databaseLedgerFence } = await import('@/lib/connectors/xero/invoice-delta')
+
+    const partId = probeId()
+    const fullId = probeId()
+    const partInvoice = `INV-${partId}`
+    const fullInvoice = `INV-${fullId}`
+    t.after(async () => {
+      await db.payment.deleteMany({ where: { orderId: { in: [partId, fullId] } } })
+      await db.accountingSyncLog.deleteMany({ where: { referenceType: 'SalesOrder', referenceId: { in: [partId, fullId] } } })
+      await db.salesOrder.deleteMany({ where: { id: { in: [partId, fullId] } } })
+    })
+
+    // BOTH orders: GBP 100, held as paid on evidence the ledger was never given. Identical rows.
+    // The control carries the marker TOO: the two arms must differ in the amount and in nothing else,
+    // or this proves the marker matters rather than that the coverage does.
+    await createPaidOrder(db, partId, partInvoice, { unregisteredPaidAt: new Date('2026-08-01T09:00:00.000Z') })
+    await createPaidOrder(db, fullId, fullInvoice, { unregisteredPaidAt: new Date('2026-08-01T09:00:00.000Z') })
+
+    // The receipts IMS recorded. One covers a penny of the order; one covers all of it.
+    const partReceipt = await db.payment.create({
+      data: { orderId: partId, amount: 1, currency: 'GBP', method: 'Card', paidAt: new Date('2026-08-02T09:00:00.000Z') },
+      select: { id: true },
+    })
+    const fullReceipt = await db.payment.create({
+      data: { orderId: fullId, amount: 100, currency: 'GBP', method: 'Card', paidAt: new Date('2026-08-02T09:00:00.000Z') },
+      select: { id: true },
+    })
+
+    // Their registrations POSTED — SYNCED, with a ledger payment id, database-stamped before the read.
+    await postedRegistration(db, partId, partInvoice, 'PAY-PENNY', 1, partReceipt.id)
+    await postedRegistration(db, fullId, fullInvoice, 'PAY-WHOLE', 100, fullReceipt.id)
+
+    // PRECONDITIONS, because both assertions below are worthless if the rows are undecidable for some
+    // unrelated reason. The classifier must be reaching the coverage arm, not the fence arm.
+    const stamped = await db.accountingSyncLog.findMany({
+      where: { referenceType: 'SalesOrder', referenceId: { in: [partId, fullId] } },
+      select: { syncedAt: true, syncedAtDatabaseClock: true },
+    })
+    assert.equal(stamped.length, 2)
+    for (const row of stamped) {
+      assert.ok(
+        row.syncedAt != null && row.syncedAtDatabaseClock != null
+        && row.syncedAt.getTime() === row.syncedAtDatabaseClock.getTime(),
+        'each registration must be database-stamped, or the verdict is REGISTRATION_UNDECIDED and '
+        + 'both arms would pass for the wrong reason',
+      )
+    }
+    const markers = await db.salesOrder.findMany({
+      where: { id: { in: [partId, fullId] } },
+      select: { id: true, unregisteredPaidAt: true },
+    })
+    assert.ok(markers.every((m) => m.unregisteredPaidAt != null),
+      'PRECONDITION: both orders must still carry the off-ledger marker — the guard is gated on it')
+
+    const [{ now }] = await db.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`
+    const invoices = new Map([
+      [partInvoice, zeroPaidInvoice(partInvoice)],
+      [fullInvoice, zeroPaidInvoice(fullInvoice)],
+    ])
+    const residual = await readSalesResidualVerdicts(
+      invoices as never, new Set([partInvoice, fullInvoice]), databaseLedgerFence(now),
+    )
+
+    // THE HEADLINE.
+    assert.ok(!residual.zeroPaidReversed.has(partInvoice),
+      'THE FINDING: the GBP 1 payment IMS registered is gone from the ledger, and r6 read that as the '
+      + 'whole GBP 100 order being reversed — a chargeback credit note against a customer who paid')
+    assert.ok(!residual.provenGone.has(partInvoice), 'and it is not promoted by the identity route either')
+    const withheld = residual.withheld.find((w) => w.doc.id === partId)
+    assert.ok(withheld, 'it must be WITHHELD and reported, not silently dropped')
+    assert.equal(withheld.verdict.verdict, 'PART_COVERED_OFF_LEDGER')
+    assert.deepEqual(
+      withheld.verdict.verdict === 'PART_COVERED_OFF_LEDGER'
+        ? { registeredTotal: withheld.verdict.registeredTotal, documentTotal: withheld.verdict.documentTotal }
+        : null,
+      { registeredTotal: 1, documentTotal: 100 },
+      'and it carries BOTH numbers, read from the registration\'s own payload and from the order — '
+      + 'which is the wiring this test exists for',
+    )
+
+    // THE CONTROL. Same order shape, same standing marker, same emptied ledger. The registration that
+    // went missing settled the WHOLE order, so its absence really is a reversal of the whole order.
+    assert.ok(residual.zeroPaidReversed.has(fullInvoice),
+      'a registration that covered the order and is now absent from a list IMS could read in full is '
+      + 'still a proven reversal — the guard narrows the evidence, it does not switch the pass off')
   },
 )

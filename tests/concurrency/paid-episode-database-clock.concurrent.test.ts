@@ -297,3 +297,160 @@ test(
     assert.equal(row?.paidAt?.toISOString(), new Date('2026-08-02T10:00:00').toISOString())
   },
 )
+
+// ---------------------------------------------------------------------------
+// o3d-psrx r7 (Codex HIGH 2) — THE EPISODE ENDS WHERE `paidAt` DOES, NOT WHERE A WRITER REMEMBERS TO
+// SAY SO.
+//
+// THE FINDING. r6's trigger fired only for `UPDATE OF unregistered_paid_at`. The migration chose a
+// trigger over a rule in the writers precisely because it "has to bind writers this repository does
+// not contain — the previous release across a deploy, a repair script, a seed, psql" — and then made
+// the episode-END half depend on an enumeration of TODAY's writers all clearing both columns in one
+// statement. A repair script running `UPDATE sales_orders SET "paidAt" = NULL` never reached the
+// function at all: the marker outlived the episode, the next paid transition found OLD non-null and
+// PRESERVED the dead fence, and a registration from the previous episode bound to the new one. That
+// is r4's finding, through the door r6 left open.
+//
+// ROUTE. Every write below is RAW SQL naming only the columns the offending writer names, executed
+// with `$executeRawUnsafe` — not a Prisma `update`, because a Prisma update is one of the writers the
+// trigger is not allowed to depend on. The bindings are then measured through
+// `registrationBindsToPaidState`, the function the reversal classifier actually asks.
+// ---------------------------------------------------------------------------
+
+test(
+  '[o3d-psrx r7] a raw UPDATE clearing ONLY paidAt leaves no marker behind',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    const db = await loadDb()
+    const { registrationBindsToPaidState } = await import('@/lib/connectors/xero/invoice-delta')
+    const id = `PSRX7-${process.pid}-${randomUUID()}`
+    t.after(async () => { await db.salesOrder.deleteMany({ where: { id } }) })
+
+    await createOrder(db, id, new Date('2026-08-01T09:00:00.000Z'))
+    const firstFence = await storedEpisode(db, id)
+    assert.ok(firstFence, 'PRECONDITION: the paid order must carry a database-minted episode fence')
+
+    // A REGISTRATION COMPLETES UNDER THE FIRST EPISODE, and is what a stale fence would hand to the
+    // second one. Its instant is a reading of the same clock, taken after the fence.
+    const firstEpisodeCompletion = new Date(await databaseNow(db))
+
+    // THE WRITER THE TRIGGER EXISTS FOR: a repair script, a seed, a previous release. It names
+    // `paidAt` and nothing else, because it does not know this column exists.
+    await db.$executeRawUnsafe(`UPDATE "sales_orders" SET "paidAt" = NULL WHERE id = $1`, id)
+
+    assert.equal(await storedEpisode(db, id), null,
+      'THE FINDING: r6 fired only for `UPDATE OF unregistered_paid_at`, so this statement left the '
+      + 'marker standing over an order that is no longer paid')
+
+    // AND THE NEXT PAID EPISODE MINTS ITS OWN FENCE. This is the half the stale marker destroyed: with
+    // OLD non-null the r6 rule preserved it, so the second episode inherited the first one's start.
+    await db.$executeRawUnsafe(
+      `UPDATE "sales_orders" SET "paidAt" = clock_timestamp(), "unregistered_paid_at" = clock_timestamp() WHERE id = $1`,
+      id,
+    )
+    const secondFence = await storedEpisode(db, id)
+    assert.ok(secondFence, 'the second paid transition must mint a fence')
+    assert.ok(secondFence > firstFence, 'and it must be a LATER one, not the first episode\'s')
+
+    // WHAT THAT BUYS, MEASURED WHERE IT IS SPENT. The first episode's registration must not speak for
+    // the second episode's paid flag; under the stale fence it did.
+    const registration = { registeredAgainstInvoiceId: 'inv_1', externalTransactionId: 'PAY-1' }
+    assert.equal(
+      registrationBindsToPaidState(
+        registration, firstEpisodeCompletion,
+        { accountingInvoiceId: 'inv_1', unregisteredPaidAt: new Date(secondFence) },
+      ),
+      false,
+      'a registration that completed under the PREVIOUS episode cannot discharge this one\'s marker',
+    )
+    assert.equal(
+      registrationBindsToPaidState(
+        registration, firstEpisodeCompletion,
+        { accountingInvoiceId: 'inv_1', unregisteredPaidAt: new Date(firstFence) },
+      ),
+      true,
+      'CONTROL: it did bind to the episode it actually belongs to, so the assertion above is about '
+      + 'the fence having moved and not about the row being unbindable',
+    )
+  },
+)
+
+test(
+  '[o3d-psrx r7] an INSERT that arrives unpaid carrying a marker is corrected, not stored',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    // The same rule on the other statement. A seed or a restore-shaped insert can present the illegal
+    // pair directly, and the BEFORE INSERT trigger's WHEN clause already selects exactly these rows.
+    const db = await loadDb()
+    const id = `PSRX7-${process.pid}-${randomUUID()}`
+    t.after(async () => { await db.salesOrder.deleteMany({ where: { id } }) })
+
+    await db.salesOrder.create({
+      data: {
+        id,
+        status: 'SHIPPED',
+        currency: 'GBP',
+        subtotalForeign: 100, totalForeign: 100, subtotalBase: 100, totalBase: 100,
+        paidAt: null,
+        unregisteredPaidAt: new Date('2026-08-01T09:00:00.000Z'),
+      },
+    })
+    assert.equal(await storedEpisode(db, id), null,
+      'a marker on a row that is not paid is a fence for an episode that is not running')
+  },
+)
+
+test(
+  '[o3d-psrx r7] the invariant is stated to the database, and it is not vacuous',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    // WHY THIS TEST EXISTS AT ALL. The BEFORE trigger REPAIRS the illegal pair, so with the trigger
+    // running the CHECK can never fire — which means an assertion "the constraint rejects it" would
+    // pass whether the constraint existed or not. The trigger is therefore DISABLED for one
+    // statement, which is also the only state the constraint is there for in production
+    // (`session_replication_role = replica`, a disabled trigger, a restore).
+    const db = await loadDb()
+    const id = `PSRX7-${process.pid}-${randomUUID()}`
+    t.after(async () => {
+      await db.$executeRawUnsafe(`ALTER TABLE "sales_orders" ENABLE TRIGGER sales_order_mint_paid_episode_clock_update`)
+        .catch(() => {})
+      await db.salesOrder.deleteMany({ where: { id } })
+    })
+
+    await createOrder(db, id, new Date('2026-08-01T09:00:00.000Z'))
+    assert.ok(await storedEpisode(db, id), 'PRECONDITION: the row is inside an episode')
+
+    await db.$executeRawUnsafe(`ALTER TABLE "sales_orders" DISABLE TRIGGER sales_order_mint_paid_episode_clock_update`)
+    let rejected: string | null = null
+    try {
+      await db.$executeRawUnsafe(`UPDATE "sales_orders" SET "paidAt" = NULL WHERE id = $1`, id)
+    } catch (error) {
+      rejected = error instanceof Error ? error.message : String(error)
+    }
+    await db.$executeRawUnsafe(`ALTER TABLE "sales_orders" ENABLE TRIGGER sales_order_mint_paid_episode_clock_update`)
+
+    assert.ok(rejected, 'with the trigger off, the illegal pair must be refused by the table itself')
+    assert.match(rejected, /sales_orders_paid_episode_marker_needs_paid_at/,
+      'and refused BY THE NAMED CONSTRAINT, so this is not passing on some unrelated error')
+
+    // AND THE ROW IS UNCHANGED: a rejected write is a rejected write, not a half-applied one.
+    const row = await db.salesOrder.findUniqueOrThrow({ where: { id }, select: { paidAt: true } })
+    assert.ok(row.paidAt, 'the refused statement must not have cleared the flag')
+  },
+)
+
+test(
+  '[o3d-psrx r7] no row in this database violates the invariant the constraint states',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    // The migration VALIDATES the constraint, so this cannot be false on a database the migration has
+    // run against — which is the point: it is the assertion the migration's repair statement makes,
+    // re-asked of the table afterwards. It also stands as the check to run against a copy of any
+    // database before deploying this.
+    const db = await loadDb()
+    const rows = await db.$queryRawUnsafe<Array<{ n: bigint }>>(
+      `SELECT count(*) AS n FROM "sales_orders" WHERE "paidAt" IS NULL AND "unregistered_paid_at" IS NOT NULL`,
+    )
+    assert.equal(Number(rows[0].n), 0)
+  },
+)
