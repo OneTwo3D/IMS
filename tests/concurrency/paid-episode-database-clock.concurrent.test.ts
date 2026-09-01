@@ -529,3 +529,149 @@ test(
     )
   },
 )
+
+// ---------------------------------------------------------------------------
+// o3d-psrx r8 (Codex HIGH 1) — A MID-EPISODE CLEAR IS NOT THE END OF THE EPISODE.
+//
+// THE FINDING. r6 taught `addPayment` to CLEAR this marker when a receipt comes to cover an order
+// that was already paid off-ledger, and to leave `paidAt` alone while doing it — re-stamping the paid
+// flag would move a settlement date an operator can see. r7's preserve arm tested
+// `OLD."unregistered_paid_at" IS NOT NULL`, so the state that clear produces — PAID, mid-episode, NO
+// marker — was not "an episode already under way" to it. The next WooCommerce redelivery re-sent
+// `date_paid_gmt` in both columns, fell past the arm, and MINTED. A fence for an episode that never
+// restarted, minted AFTER the registration that had just discharged it, which unbinds that
+// registration for ever and parks the order on PAID_WITHOUT_LEDGER_RECEIPT: a genuine chargeback
+// against it is then never recognised. r4's finding, reached through the door r6's own fix opened.
+//
+// ROUTE. The redelivery is the REAL importer, `updateExistingWcOrderFromPayload`, for the reason r6
+// gives: the writer that broke this re-sends the SHOP's `date_paid_gmt` on every webhook retry and
+// every `modified_after` poll, and an UPDATE spelt here would not be that writer.
+//
+// The CLEAR is issued directly, and deliberately: the defect is not in `addPayment` — r6 fixed it and
+// tests/sales-add-payment-clears-paid-provenance.test.ts pins the exact statement it emits, `data:
+// { unregisteredPaidAt: null }` with `where: { id, unregisteredPaidAt: { not: null } }` and `paidAt`
+// untouched — the defect is in what the TRIGGER does to the STATE that statement leaves behind. So
+// that statement is reproduced verbatim from the assertion that pins it, and the state it reaches is
+// asserted rather than assumed before anything else runs.
+//
+// WHAT IS BEING PROVED IS NOT "THE COLUMN DID NOT CHANGE". It is that the registration which
+// discharged the marker still binds afterwards, and that the shared classifier consequently still
+// recognises a chargeback on the order — measured through the functions the reversal pass asks.
+// ---------------------------------------------------------------------------
+
+test(
+  '[o3d-psrx r8] a covering receipt clears the marker and a WooCommerce redelivery leaves it cleared',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    const db = await loadDb()
+    loadEnv()
+    const { updateExistingWcOrderFromPayload } = await import('@/lib/connectors/woocommerce/sync/order-import')
+    const { registrationBindsToPaidState, classifyRegisteredPaymentAgainstListing, databaseLedgerFence } =
+      await import('@/lib/connectors/xero/invoice-delta')
+
+    const id = `PSRX8-${process.pid}-${randomUUID()}`
+    const externalId = Math.floor(Math.random() * 2_000_000_000)
+    t.after(async () => {
+      await db.payment.deleteMany({ where: { orderId: id } })
+      await db.salesOrder.deleteMany({ where: { id } })
+    })
+
+    await db.salesOrder.create({
+      data: {
+        id,
+        status: 'SHIPPED',
+        currency: 'GBP',
+        subtotalForeign: 100, totalForeign: 100, subtotalBase: 100, totalBase: 100,
+        accountingInvoiceId: 'inv_1',
+        shoppingLinks: {
+          create: { connector: 'woocommerce', externalOrderId: String(externalId), externalOrderNumber: String(externalId) },
+        },
+      },
+    })
+
+    // DELIVERY 1: the shop reports the order paid off-ledger. NULL paidAt -> non-null, so a fence is
+    // minted and the order is inside an episode.
+    const payload = wcPaidPayload(externalId, '2026-08-02T10:00:00')
+    await updateExistingWcOrderFromPayload(id, payload as never)
+    const openingFence = await storedEpisode(db, id)
+    assert.ok(openingFence, 'PRECONDITION: the paid delivery must have minted an episode')
+
+    // THE COVERING RECEIPT. `addPayment` records it and clears the marker in one transaction, and
+    // does NOT touch `paidAt`. Reproduced from the assertion that pins that statement in
+    // tests/sales-add-payment-clears-paid-provenance.test.ts.
+    await db.payment.create({ data: { orderId: id, amount: 100, currency: 'GBP', method: 'Card' } })
+    await db.salesOrder.updateMany({
+      where: { id, unregisteredPaidAt: { not: null } },
+      data: { unregisteredPaidAt: null },
+    })
+
+    // THE STATE THE FINDING IS ABOUT, ASSERTED RATHER THAN ASSUMED: paid, mid-episode, no marker.
+    // If either half of this is wrong the redeliveries below prove nothing.
+    const cleared = await db.salesOrder.findUniqueOrThrow({ where: { id }, select: { paidAt: true } })
+    assert.ok(cleared.paidAt, 'the clear must leave the paid flag STANDING — the episode is still running')
+    assert.equal(await storedEpisode(db, id), null, 'and it must actually have cleared the marker')
+
+    // THE REGISTRATION THAT DISCHARGED IT completes after the clear, which is the production order:
+    // `addPayment` commits the receipt and queues the INVOICE_PAYMENT afterwards.
+    const completedAt = new Date(await databaseNow(db))
+    const registration = {
+      id: 'log_1',
+      status: 'SYNCED',
+      externalTransactionId: 'PAY-1',
+      syncedAt: completedAt,
+      syncedAtDatabaseClock: completedAt,
+      registeredAgainstInvoiceId: 'inv_1',
+      registeredAmount: 100,
+    }
+
+    // DELIVERIES 2..4: the SAME payload, the way a retried webhook and the modified_after poll send
+    // it — `date_paid_gmt` in BOTH columns, on an order whose marker is legitimately gone.
+    for (let i = 0; i < 3; i += 1) await updateExistingWcOrderFromPayload(id, payload as never)
+
+    const markerNow = await storedEpisode(db, id)
+    assert.equal(markerNow, null,
+      'THE FINDING: the redelivery re-minted a fence for an episode that never restarted, because the '
+      + 'preserve arm asked whether there WAS a marker instead of whether the paid flag still stood')
+
+    // WHAT THAT BUYS, MEASURED WHERE IT IS SPENT — and both of these are what r7 would have failed.
+    const paidState = { accountingInvoiceId: 'inv_1', unregisteredPaidAt: markerNow ? new Date(markerNow) : null }
+    assert.equal(registrationBindsToPaidState(registration, completedAt, paidState), true,
+      'the registration that discharged the marker must still speak for this paid flag; a resurrected '
+      + 'fence sits AFTER it, and the comparison is over two immutable values so it never recovers')
+    assert.deepEqual(
+      classifyRegisteredPaymentAgainstListing(
+        new Set<string>(), [registration], databaseLedgerFence(new Date(await databaseNow(db))),
+        [], paidState.unregisteredPaidAt != null, paidState, 100,
+      ),
+      { verdict: 'GONE', paymentIds: ['PAY-1'] },
+      'so a GENUINE chargeback on this order is still recognised. Under the resurrected fence the row '
+      + 'is unbound, nothing has posted, the marker stands, and the verdict is '
+      + 'PAID_WITHOUT_LEDGER_RECEIPT — withheld for ever, because nothing later can move either value',
+    )
+
+    // AND THE ORDER'S OWN PAID DATE IS UNTOUCHED throughout: only the fence is the database's.
+    const row = await db.salesOrder.findUniqueOrThrow({ where: { id }, select: { paidAt: true } })
+    assert.equal(row.paidAt?.toISOString(), new Date('2026-08-02T10:00:00').toISOString())
+
+    // THE CONTROL, AND IT IS THE POINT. "Never mint again while paidAt stands" would pass everything
+    // above and disable the provenance marker for every genuine re-payment. The episode is ENDED by
+    // the writer the trigger exists for — raw SQL naming only `paidAt`, which is a repair script, a
+    // seed, or a previous release — and the shop then reports the order paid AGAIN through the same
+    // real importer. That must mint a NEW fence, later than the opening one.
+    await db.$executeRawUnsafe(`UPDATE "sales_orders" SET "paidAt" = NULL WHERE id = $1`, id)
+    assert.equal(await storedEpisode(db, id), null, 'ending the episode leaves no fence behind')
+    await updateExistingWcOrderFromPayload(id, wcPaidPayload(externalId, '2026-08-09T10:00:00') as never)
+    const secondFence = await storedEpisode(db, id)
+    assert.ok(secondFence, 'a genuine new episode must mint its own fence')
+    assert.ok(secondFence > openingFence,
+      'and a LATER one, so the previous episode\'s registration cannot answer for this paid flag')
+    assert.equal(
+      registrationBindsToPaidState(
+        registration, completedAt, { accountingInvoiceId: 'inv_1', unregisteredPaidAt: new Date(secondFence) },
+      ),
+      false,
+      'which is the whole reason the mint has to survive: the receipt that covered the FIRST episode '
+      + 'must not discharge the second one\'s marker',
+    )
+  },
+)
