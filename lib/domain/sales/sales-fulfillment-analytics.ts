@@ -1674,6 +1674,24 @@ async function loadInWindowDispatchedQtyByLine(
  * Note this is about COVERAGE, not amount: an order whose posted cost is genuinely zero is complete
  * as long as its units shipped, which is the "cost posted, and it was zero" evidence `.has` was
  * introduced to preserve.
+ *
+ * AND `dispatched < ordered` IS ONE-SIDED ON PURPOSE — unlike the costed-quantity match beside it,
+ * which o3d-7jfq round 2 had to make symmetric. Asked and answered, so it is not re-litigated:
+ *
+ *   - The two sides here are not the same measurement. `costedQty` and `movement.qty` are one
+ *     movement's own two fields in one unit; `dispatched` is DERIVED — a kit conversion plus the
+ *     proration of unlinked legacy movements across a line's quantity share, which
+ *     `computeInWindowDispatchedQtyByLine` documents as its remaining gap. A line already covered
+ *     by a linked dispatch that also picks up a share of a legacy unlinked movement for the same
+ *     product exceeds its ordered quantity with nothing wrong anywhere. That is an imprecise
+ *     estimate, not evidence contradicting itself.
+ *   - The writers differ in what they can be trusted for. `StockMovement.idempotencyKey` is UNIQUE
+ *     and `validateActiveShipmentTotalsWithinOrder` caps a shipment at ordered − refunded − already-shipped, so
+ *     a duplicated or oversized dispatch is refused by a constraint. `CogsEntry` carries no unique
+ *     constraint at all — which is exactly why the costed side needs the two-sided check and this
+ *     side does not.
+ *   - The failure modes are opposite. Withholding for an over-estimate would withhold a profit that
+ *     IS supported, and this branch's other failure mode is refusing figures it can stand behind.
  */
 type OrderCostCoverage =
   /** Every dispatchable unit shipped in the window. The caller must still prove they were COSTED. */
