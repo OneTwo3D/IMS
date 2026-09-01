@@ -128,6 +128,20 @@ export type SalesReportRow = {
   refundsUnknownBasis: string
 }
 
+/**
+ * THE STATE OF A CUSTOMER'S COST EVIDENCE — and therefore why their gross profit is or is not there.
+ *
+ * `incomplete` and `inconsistent` both withhold, and an operator handles them differently. See
+ * `dispatchCostEvidenceByOrder` for why excess evidence is not a gap.
+ */
+export type CostEvidenceStatus =
+  /** Every in-period order's posted cost covers, exactly, the revenue the profit is measured against. */
+  | 'complete'
+  /** Some cost is missing or unknowable. It may arrive: the rest ships, the rest is costed. */
+  | 'incomplete'
+  /** Some dispatch is costed for MORE units than it moved. Cost evidence that contradicts itself. */
+  | 'inconsistent'
+
 export type CustomerReportRow = {
   customerId: string | null
   customerName: string
@@ -160,9 +174,16 @@ export type CustomerReportRow = {
   grossProfitBaseBound: DerivedFigureBound
   /**
    * False when at least one of this customer's in-period orders has no COGS posted in the period.
-   * `grossProfitBase` is null exactly when this is false.
+   * `grossProfitBase` is null exactly when this is false, and this is `costEvidence === 'complete'`.
    */
   costCaptured: boolean
+  /**
+   * WHY, when `costCaptured` is false. The decision and the reason are separate fields because they
+   * are read by different people: a reader who only wants to know whether a number is there reads
+   * the boolean, and one who has to DO something about a blank needs to know which thing to do.
+   * Derived from this in the projection, so the two cannot drift.
+   */
+  costEvidence: CostEvidenceStatus
   /** Unpaid order value, less the GROSS-basis credit raised against those unpaid orders. */
   arExposureBase: string
   /**
@@ -1096,23 +1117,58 @@ const COSTED_QTY_TOLERANCE = new Prisma.Decimal('0.000001')
  * another's shortfall — and while the FIFO engine never consumes more than a movement's quantity,
  * relying on that is relying on the writer whose output this function exists to check.
  *
+ * SO THE MATCH IS TWO-SIDED, AND THE TWO SIDES DO NOT MEAN THE SAME THING (o3d-7jfq round 2). A
+ * one-sided `movement.qty - costedQty > tolerance` rejects only a SHORTFALL; a movement costed
+ * BEYOND its own quantity gives a negative difference and reads as fully costed — which is the very
+ * thing the paragraph above refuses to take on trust, granted anyway by the shape of the
+ * comparison. `Σ CogsEntry.qty > StockMovement.qty` cannot be a real event: `consumeFifoLayersStrict`
+ * consumes at most the requested quantity, so the consumed layers it writes entries from can never
+ * exceed the movement. Nothing in the schema ties the two together, and the deferred COGS-evidence
+ * guard checks only that an entry EXISTS — so a double-posted entry set is exactly what excess
+ * looks like, and it lands in `costByOrder` twice while the gate calls the order complete.
+ *
+ * AND EXCESS IS NOT A GAP — it is CONTRADICTORY EVIDENCE, so it is reported apart from a shortfall.
+ * Both withhold, because neither supports a profit figure. But an incomplete order resolves itself:
+ * the rest ships, the rest is costed, and next month's report publishes. Contradictory evidence
+ * never resolves, means the COGS ledger itself is double-posted — which silently overstates cost in
+ * every OTHER report that sums `CogsEntry.totalCostBase` — and is acted on by deleting an entry, not
+ * by waiting. Folding the two into one boolean would send an operator looking for a missing entry
+ * that is not missing, and the report's own notice names its causes: an unnamed third cause makes
+ * that notice a false statement about the row in front of them.
+ *
+ * The tolerance is the same figure on both sides, and deliberately: it exists for float-to-Decimal
+ * noise in the engine's own arithmetic, which has no preferred direction.
+ *
  * Kit-safe by construction: both quantities are the MOVEMENT's own, so the parent-vs-component unit
  * mismatch that `loadInWindowDispatchedQtyByLine` has to convert around never arises here.
  */
-function ordersWithEveryDispatchCosted(
+type DispatchCostEvidence = {
+  /** Orders whose every in-window dispatch is costed for its whole quantity — and for no more. */
+  fullyCosted: Set<string>
+  /** Orders carrying a dispatch costed BEYOND its own quantity. Withheld, and separately named. */
+  inconsistent: Set<string>
+}
+
+function dispatchCostEvidenceByOrder(
   dispatchMovements: InWindowDispatchMovement[],
   costedQtyByMovement: Map<string, Prisma.Decimal>,
-): Set<string> {
-  const orders = new Set<string>()
+): DispatchCostEvidence {
+  const fullyCosted = new Set<string>()
   const shortOrders = new Set<string>()
+  const inconsistent = new Set<string>()
   for (const movement of dispatchMovements) {
     if (!movement.orderId) continue
-    orders.add(movement.orderId)
+    fullyCosted.add(movement.orderId)
     const costed = costedQtyByMovement.get(movement.id) ?? new Prisma.Decimal(0)
-    if (toDecimal(movement.qty).sub(costed).gt(COSTED_QTY_TOLERANCE)) shortOrders.add(movement.orderId)
+    // Excess POSITIVE, shortfall NEGATIVE. `excess.neg()` is the old `qty - costed`, so the
+    // shortfall arm is unchanged to the digit and only the excess arm is new.
+    const excess = costed.sub(toDecimal(movement.qty))
+    if (excess.gt(COSTED_QTY_TOLERANCE)) inconsistent.add(movement.orderId)
+    else if (excess.neg().gt(COSTED_QTY_TOLERANCE)) shortOrders.add(movement.orderId)
   }
-  for (const orderId of shortOrders) orders.delete(orderId)
-  return orders
+  for (const orderId of shortOrders) fullyCosted.delete(orderId)
+  for (const orderId of inconsistent) fullyCosted.delete(orderId)
+  return { fullyCosted, inconsistent }
 }
 
 export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters = {}, deps?: SalesFulfillmentAnalyticsDeps): Promise<SalesAnalyticsReport<CustomerReportRow>> {
@@ -1128,8 +1184,9 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
   // What each line actually shipped inside the window — the evidence that the cost posted for an
   // order covers the revenue this report measures it against. See `orderCostCoverage`.
   const { byLine: dispatchedQtyByLine, dispatchMovements } = await loadInWindowDispatchedQtyByLine(client, window, orders, 'Customer analytics')
-  // ...and, from the SAME movements, which orders had every one of those dispatches costed.
-  const fullyCostedOrders = ordersWithEveryDispatchCosted(dispatchMovements, costedQtyByMovement)
+  // ...and, from the SAME movements, which orders had every one of those dispatches costed — and
+  // which carry a dispatch costed for more units than it moved, which is a different answer.
+  const { fullyCosted: fullyCostedOrders, inconsistent: inconsistentOrders } = dispatchCostEvidenceByOrder(dispatchMovements, costedQtyByMovement)
   // As in Sales Analytics: an order cohort, so ALL of these orders' credit counts, whenever raised.
   const refunds = await loadOrderRefunds(client, orders.map((order) => order.id))
   const refundsByOrder = new Map<string, OrderRefundRow[]>()
@@ -1139,7 +1196,9 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
     else refundsByOrder.set(refund.orderId, [refund])
   }
 
-  type CustomerGroup = CustomerReportRow & {
+  // `costCaptured` is OMITTED, not carried and ignored: it is derived from `costEvidence` at the
+  // projection, and a group field of the same name would be a second place to get it wrong.
+  type CustomerGroup = Omit<CustomerReportRow, 'costCaptured'> & {
     revenue: Prisma.Decimal
     revenueExVat: Prisma.Decimal
     cogs: Prisma.Decimal
@@ -1164,7 +1223,7 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
       netRevenueExVatBaseBound: 'exact',
       grossProfitBase: '0',
       grossProfitBaseBound: 'exact',
-      costCaptured: true,
+      costEvidence: 'complete',
       arExposureBase: '0',
       arExposureBaseBound: 'exact',
       shareOfRevenuePct: '0',
@@ -1216,15 +1275,23 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
     // one this branch removed: that one could not tell an absent cost from a zero one, while this
     // has just established there is nothing on the order that could post a cost at all.
     const coverage = orderCostCoverage(order, dispatchedQtyByLine)
-    if (coverage === 'nothing-to-dispatch') {
+    if (inconsistentOrders.has(order.id)) {
+      // FIRST, ahead of coverage: a dispatch costed beyond its own quantity contradicts itself, and
+      // nothing coverage can say about the order repairs that. `nothing-to-dispatch` in particular
+      // must not publish here — an order with no dispatchable line that nonetheless carries an
+      // over-costed dispatch movement is contradictory twice over, not "costed at zero".
+      current.costEvidence = 'inconsistent'
+    } else if (coverage === 'nothing-to-dispatch') {
       current.cogs = current.cogs.add(cogsByOrder.get(order.id) ?? new Prisma.Decimal(0))
     } else if (coverage === 'covered' && fullyCostedOrders.has(order.id)) {
       // `?? 0` is sound HERE and nowhere else in this block: membership of `fullyCostedOrders`
       // requires a costed dispatch movement, so an absent total would be an order whose entries
       // cost a positive quantity at no cost at all — a genuine zero, not an unknown.
       current.cogs = current.cogs.add(cogsByOrder.get(order.id) ?? new Prisma.Decimal(0))
-    } else {
-      current.costCaptured = false
+    } else if (current.costEvidence !== 'inconsistent') {
+      // A customer's other order may already have contradicted itself. The graver answer stands:
+      // downgrading it to `incomplete` would send the operator after the wrong thing.
+      current.costEvidence = 'incomplete'
     }
     const orderRefunds = refundsByOrder.get(order.id) ?? []
     for (const refund of orderRefunds) addCredit(current.credits, refund.totalsBasis, refund.totalBase)
@@ -1251,6 +1318,7 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
     credits: emptyCredits(),
     unpaidCredits: emptyCredits(),
     costCapturedRows: 0,
+    costInconsistentRows: 0,
   }
   const netRevenueByGroup = new Map<string, Prisma.Decimal>()
   for (const [key, group] of groups) {
@@ -1262,7 +1330,8 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
     period_.arExposure = period_.arExposure.add(group.arExposure.sub(comparableCredit(group.unpaidCredits, 'GROSS')))
     mergeCredits(period_.credits, group.credits)
     mergeCredits(period_.unpaidCredits, group.unpaidCredits)
-    if (group.costCaptured) {
+    if (group.costEvidence === 'inconsistent') period_.costInconsistentRows += 1
+    if (group.costEvidence === 'complete') {
       period_.costCapturedRows += 1
       const netRevenueExVat = group.revenueExVat.sub(comparableCredit(group.credits, 'NET'))
       period_.netRevenueExVat = period_.netRevenueExVat.add(netRevenueExVat)
@@ -1279,6 +1348,8 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
       const netRevenue = netRevenueByGroup.get(key)!
       const netRevenueExVat = row.revenueExVat.sub(comparableCredit(row.credits, 'NET'))
       const grossProfit = netRevenueExVat.sub(row.cogs)
+      // The single derivation of the decision from the reason — see `CustomerReportRow.costEvidence`.
+      const costCaptured = row.costEvidence === 'complete'
       return {
         customerId: row.customerId,
         customerName: row.customerName,
@@ -1295,16 +1366,17 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
           basisComplete: creditBasisComplete(row.credits, 'NET'),
           unplacedCredit: unplacedCredit(row.credits, 'NET'),
         }),
-        grossProfitBase: row.costCaptured ? moneyString(grossProfit, baseCurrency) : null,
+        grossProfitBase: costCaptured ? moneyString(grossProfit, baseCurrency) : null,
         // A withheld figure carries no bound: there is no published number for a relation to be
         // about, and marking it would read as a claim about something that was not published.
-        grossProfitBaseBound: row.costCaptured
+        grossProfitBaseBound: costCaptured
           ? netLinearFigureBoundDecimal({
             basisComplete: creditBasisComplete(row.credits, 'NET'),
             unplacedCredit: unplacedCredit(row.credits, 'NET'),
           })
           : 'indeterminate',
-        costCaptured: row.costCaptured,
+        costCaptured,
+        costEvidence: row.costEvidence,
         arExposureBase: moneyString(row.arExposure.sub(comparableCredit(row.unpaidCredits, 'GROSS')), baseCurrency),
         arExposureBaseBound: netLinearFigureBoundDecimal({
           basisComplete: creditBasisComplete(row.unpaidCredits, 'GROSS'),
@@ -1344,6 +1416,9 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
         unplacedCredit: unplacedCredit(period_.credits, 'NET'),
       }),
       costCapturedRows: String(period_.costCapturedRows),
+      // Travels beside the count it is NOT part of: an inconsistent customer is withheld like an
+      // incomplete one, and unlike one it will still be withheld next month if nobody acts.
+      costInconsistentRows: String(period_.costInconsistentRows),
       arExposureBase: moneyString(period_.arExposure, baseCurrency),
       arExposureBaseBound: netLinearFigureBoundDecimal({
         basisComplete: creditBasisComplete(period_.unpaidCredits, 'GROSS'),
@@ -1355,7 +1430,12 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
     },
     notices: [
       'AR exposure is unpaid sales-order totalBase for the selected period, less the gross-basis credit raised against those unpaid orders. COGS comes from CogsEntry rows linked to SALE_DISPATCH movements.',
-      `Gross profit is withheld for a customer with an in-period order whose posted cost does not cover the revenue it is measured against — no COGS posted in the period, or not every ordered stock unit dispatched within it — and the period total covers ${period_.costCapturedRows} of ${groups.size} customers. A missing cost is not a zero cost, and a partially dispatched order's cost is not the whole order's cost.`,
+      `Gross profit is withheld for a customer with an in-period order whose posted cost does not cover the revenue it is measured against — no COGS posted in the period, not every ordered stock unit dispatched within it, or a dispatch costed for more units than it moved — and the period total covers ${period_.costCapturedRows} of ${groups.size} customers. A missing cost is not a zero cost, and a partially dispatched order's cost is not the whole order's cost.`,
+      // Named separately, and only when there is one: it is the cause an operator has to ACT on,
+      // and the only one of the three that will still be here next month if nobody does.
+      ...(period_.costInconsistentRows > 0
+        ? [`${period_.costInconsistentRows} of ${groups.size} customers are withheld as INCONSISTENT rather than incomplete: an in-period dispatch carries COGS entries for more units than the movement moved, which the FIFO engine cannot produce and most often means the entries were posted twice. Nothing further will ship to complete these — the posted cost has to be corrected. Until it is, every report that sums COGS entries is overstating cost by the duplicate.`]
+        : []),
       'Non-inventory lines — services, fees, delivery charges — book no stock movement and post no cost, so they are not asked to show a dispatch and an order made only of them is fully costed at zero. A variable-parent line is not exempt: goods do leave for it and cannot be traced to it, so its cost is unknown and the order is withheld.',
       REFUND_BASIS_NOTICE_CUSTOMER_MIX,
     ],

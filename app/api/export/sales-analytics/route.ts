@@ -47,7 +47,7 @@ export const SALES_ANALYTICS_EXPORTS: Record<SalesAnalyticsExportType, SalesAnal
   },
   customers: {
     filename: 'customer-mix',
-    columns: ['customerId', 'customerName', 'customerEmail', 'orderCount', 'revenueBase', 'netRevenueBase', 'netRevenueBaseBound', 'netRevenueExVatBase', 'netRevenueExVatBaseBound', 'grossProfitBase', 'grossProfitBaseBound', 'costCaptured', 'arExposureBase', 'arExposureBaseBound', 'shareOfRevenuePct', 'shareOfRevenuePctBound', 'refundsNetBasis', 'refundsGrossBasis', 'refundsUnknownBasis'],
+    columns: ['customerId', 'customerName', 'customerEmail', 'orderCount', 'revenueBase', 'netRevenueBase', 'netRevenueBaseBound', 'netRevenueExVatBase', 'netRevenueExVatBaseBound', 'grossProfitBase', 'grossProfitBaseBound', 'costCaptured', 'costEvidence', 'arExposureBase', 'arExposureBaseBound', 'shareOfRevenuePct', 'shareOfRevenuePctBound', 'refundsNetBasis', 'refundsGrossBasis', 'refundsUnknownBasis'],
     refundTreatment: REFUND_BASIS_NOTICE_CUSTOMER_MIX,
   },
   margin: {
