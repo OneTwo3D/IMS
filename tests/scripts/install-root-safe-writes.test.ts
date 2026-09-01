@@ -1091,6 +1091,53 @@ for (const script of ENTRYPOINTS) {
   })
 }
 
+/**
+ * AND THE OTHER TWO ENTRYPOINTS ARE THE SAME PUBLISHER, WHICH UNTIL NOW WAS ONLY ASSERTED IN PROSE
+ * (o3d-rn10 r3).
+ *
+ * Every behavioural test in this file — the anchor, the demotion, the nested symlink, the
+ * unanchored override — lifts its functions out of scripts/install.sh and out of nothing else. The
+ * loop above is the only thing that reads deploy.sh and update.sh at all, and it STUBS
+ * publish_root_anchored() out, because the question it asks is lexical. So the whole guarantee for
+ * two of the three entrypoints rested on the sentence "all three carry the publisher byte for
+ * byte" — a claim about the files, made in a comment, checked by nothing. A deploy.sh whose
+ * publish_root_anchored() had been reduced to `return 0` would have passed every test above: the
+ * stub replaces it in the only test that opens the file.
+ *
+ * It was not even true. Carrying the walk to the other two entrypoints (2a9adace) pasted
+ * publish_durable_file()'s comment header into each of them twice and dropped a blank line, and
+ * nothing noticed for four commits. Comments, that time. The next divergence need not be.
+ *
+ * SO THE PREMISE IS THE TEST. Each shipped publisher function is compared BYTE FOR BYTE against
+ * install.sh's, which is what makes the behavioural tests above load-bearing for deploy.sh and
+ * update.sh instead of merely suggestive of them. Function bodies and not whole file regions: a
+ * region diff would fail on unrelated prose that happens to sit between two functions, and prose
+ * is not what the service account attacks.
+ */
+test('[o3d-rn10] deploy.sh and update.sh carry the SAME publisher as install.sh, function by function', () => {
+  // The same six the behavioural tests lift, plus the constant they all resolve the staging
+  // directory through. Sourced from PUBLISHER so a seventh function added to the publisher is
+  // compared here without anyone remembering to add it.
+  const shared = [...PUBLISHER]
+  assert.deepEqual(shared, ['fsync_path', 'publish_trust_root_candidates', 'publish_root_anchored',
+    'publish_trust_root', 'pin_dir_beneath_root', 'publish_durable_file'],
+  'PUBLISHER is what the behavioural tests above run; this test exists to carry them to the other two entrypoints')
+
+  for (const script of ['scripts/deploy.sh', 'scripts/update.sh'] as const) {
+    const source = readFileSync(join(REPO, script), 'utf8')
+    // NOT VACUOUS IN THE DIRECTION THAT MATTERS: a copy that simply does not DEFINE the function
+    // would make an equality over "whatever we found" trivially true. shellFunction() asserts the
+    // definition exists before there is anything to compare, and the constant is asserted the same
+    // way, so a deleted publisher fails here rather than passing quietly.
+    assert.equal(shellConstant(source, 'PUBLISH_STAGE_DIRNAME'), shellConstant(INSTALL_SH, 'PUBLISH_STAGE_DIRNAME'),
+      `${script}: the staging directory name must be the one install.sh's publisher was measured with`)
+    for (const name of shared) {
+      assert.equal(shellFunction(source, name), shellFunction(INSTALL_SH, name),
+        `${script}: ${name}() has drifted from scripts/install.sh. Every regression for the anchor, the demotion and the nested override in this file runs install.sh's copy; a divergent one here is untested code on a root-side write. Re-sync it, or give this entrypoint its own regressions.`)
+    }
+  }
+})
+
 // ---------------------------------------------------------------------------
 // SITES 4, 5 and 7 — every directory created below a root the service account owns.
 // ---------------------------------------------------------------------------
