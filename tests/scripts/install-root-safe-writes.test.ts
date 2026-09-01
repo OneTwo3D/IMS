@@ -1576,6 +1576,26 @@ test('[o3d-rn10] deploy.sh and update.sh carry the SAME publisher as install.sh,
  * firstAssignment() so the vacuity is MEASURED rather than described — both are shown returning
  * install.sh's text, byte for byte, out of a file carrying a second definition.
  */
+/**
+ * THE ONE-LINE OVERRIDE SET (o3d-rn10 r5).
+ *
+ * Every one of these is a SECOND definition bash makes effective, written on a single line — the
+ * shape the r4 detector was blind to. They are kept in one place so a future narrowing of the
+ * extractor has to delete a case rather than quietly stop matching it, and each is executed under
+ * a real bash in the test below before it is required to be caught.
+ */
+const ONE_LINE_OVERRIDES = [
+  'publish_root_anchored() { return 0; }',
+  'function publish_root_anchored { return 0; }',
+  'function publish_root_anchored() { return 0; }',
+  '  publish_root_anchored() { return 0; }',
+  'true; publish_root_anchored() { return 0; }',
+  '{ publish_root_anchored() { return 0; }; }',
+  'if true; then publish_root_anchored() { return 0; }; fi',
+  'if false; then :; else publish_root_anchored() { return 0; }; fi',
+  'for _ in 1; do publish_root_anchored() { return 0; }; done',
+] as const
+
 test('[o3d-rn10] a publisher symbol defined twice fails the parity extractor instead of being compared on its first copy', () => {
   const DEPLOY = readFileSync(join(REPO, 'scripts/deploy.sh'), 'utf8')
 
@@ -1619,6 +1639,39 @@ test('[o3d-rn10] a publisher symbol defined twice fails the parity extractor ins
     assert.throws(() => shellFunction(`${DEPLOY}${bypass}`, 'publish_root_anchored'), /2 times/,
       `a second definition written as ${JSON.stringify(bypass.trim().split('\n')[0])} must be refused too`)
   }
+
+  // AND THE ONE-LINE FORMS, WHICH THE GUARD ABOVE COULD NOT SEE (o3d-rn10 r5, Codex MEDIUM). The
+  // first detector anchored the header to the END of the line right after the optional `{`, so
+  // `publish_root_anchored() { return 0; }` — the cheapest duplicate there is, and the exact shape
+  // an appended override takes — left the count at one. shellFunction() went on slicing the
+  // canonical body, the parity comparison it feeds went on passing, and bash went on running the
+  // stub. That is the third time on this branch a check has missed its own subject, so the forms
+  // are enumerated here and each one is PROVED to be an override before it is required to be
+  // caught: a form the extractor rejects but bash ignores would make this loop a spelling test.
+  for (const bypass of ONE_LINE_OVERRIDES) {
+    const proof = runBash([
+      'set -uo pipefail',
+      shellFunction(INSTALL_SH, 'pin_publish_root_parent'),
+      shellFunction(INSTALL_SH, 'publish_root_anchored'),
+      bypass,
+      'publish_root_anchored /ims-rn10-no-such-root/state; echo "rc=$?"',
+    ].join('\n'))
+    assert.match(proof.stdout, /^rc=0$/m,
+      `bash must actually take ${JSON.stringify(bypass)} as the effective definition: ${proof.stderr}`)
+
+    assert.throws(() => shellFunction(`${DEPLOY}\n${bypass}\n`, 'publish_root_anchored'), /2 times/,
+      `and the extractor must refuse it: ${JSON.stringify(bypass)}`)
+  }
+
+  // NOT VACUOUS: without a bypass the same rig REFUSES that root, so `rc=0` above is the override
+  // talking and not a walk that says yes to everything.
+  const unbypassed = runBash([
+    'set -uo pipefail',
+    shellFunction(INSTALL_SH, 'pin_publish_root_parent'),
+    shellFunction(INSTALL_SH, 'publish_root_anchored'),
+    'publish_root_anchored /ims-rn10-no-such-root/state; echo "rc=$?"',
+  ].join('\n'))
+  assert.match(unbypassed.stdout, /^rc=1$/m, 'the canonical anchor must refuse a root that does not exist')
 
   // AND THE CONSTANT, which aims the staging directory every publication passes through.
   const reassigned = `${DEPLOY}\nPUBLISH_STAGE_DIRNAME="../../attacker"\n`

@@ -2101,6 +2101,34 @@ publish_trust_root() {
 # it replaces used. Every destination this function is asked for is created earlier and
 # deliberately by mkdir_service_subdir() or ensure_cutover_state_dirs(); creating one here is the
 # first-install fallback, not the path that decides the permissions.
+# THE ANCHOR AND THE ENTRY ARE ONE WALK (o3d-rn10 r4), and that was r4's finding. Round 3 asked
+# publish_root_anchored() whether the root's parent looked right, by PATHNAME, and then ran
+# `mkdir -p "$root"` and `cd -P "$root"` — two further resolutions of the same pathname, after the
+# check and independent of it. Re-asking a pathname question only ever adds another window.
+# pin_publish_root_parent() instead walks from `/` to the parent, proving every component on the
+# way and ending with this shell INSIDE the parent, so the operations below are aimed at a
+# directory descriptor the kernel is holding rather than at a name anybody can rebind.
+#
+# AND THE ROOT ITSELF IS NO LONGER AN EXCEPTION (o3d-rn10 r5, Codex HIGH). It used to be entered
+# with a bare `cd -P` that followed a symlink DELIBERATELY — a ${DATA_DIR} on a second disk was a
+# supported layout, and the link's own NAME sits in a parent the anchor walk proves only the
+# privileged account can write. That argument covers the ENTRY and nothing else: the path the
+# link's TARGET resolves through is proved by nothing, so a target under a directory the service
+# account owns can be renamed aside and rebound to a directory of their choosing, and the unchanged
+# root entry passes every check while the publication lands there as root.
+#
+# WHY REFUSING THE SYMLINK AND NOT PINNING ITS TARGET. Pinning would keep the configuration
+# working: read the link, walk its target from `/` through this same machinery, bound the chain,
+# decide what a relative target means. That is a SECOND path proved per publication, in three
+# byte-identical copies, to keep an indirection re-resolved every time it is used. A bind mount is
+# the same layout with the resolution done ONCE, at mount time, out of a mount table only root can
+# write — and it leaves this walk with no exception in it at all. The cost is operator-facing, so
+# the refusal prints the two commands that replace the link.
+#
+# AND THIS PARAGRAPH IS OUT HERE RATHER THAN IN THE BODY. Every byte between `name() {` and the
+# closing brace is lifted verbatim by tests/scripts/install-shell-rig.ts and handed to `bash` as a
+# SINGLE argv element, which Linux caps at MAX_ARG_STRLEN. Prose above the definition is not
+# lifted, so it costs nothing to a regression run.
 pin_dir_beneath_root() {
   local root="$1" path="$2" rel comp here entry base
   [[ "$root" == /* && "$path" == /* ]] || return 1
@@ -2110,37 +2138,19 @@ pin_dir_beneath_root() {
   # ONE COMPONENT, which is what the pinned parent lets us enter the root as.
   base="${root##*/}"
   [[ -n "$base" && "$base" != "." && "$base" != ".." ]] || return 1
-  # THE ANCHOR AND THE ENTRY ARE ONE WALK (o3d-rn10 r4), and that is the finding. Round 3 asked
-  # publish_root_anchored() whether the root's parent looked right, by PATHNAME, and then ran
-  # `mkdir -p "$root"` and `cd -P "$root"` — two further resolutions of the same pathname, after
-  # the check and independent of it. Re-asking a pathname question only ever adds another window.
-  # pin_publish_root_parent() instead walks from `/` to the parent, proving every component on the
-  # way and ending with this shell INSIDE the parent, so the two operations below are aimed at a
-  # directory descriptor the kernel is holding rather than at a name anybody can rebind.
+  # THE ANCHOR AND THE ENTRY ARE ONE WALK (o3d-rn10 r4). See above.
   pin_publish_root_parent "$root" || return 1
-  # THE PARENT, AS AN INODE. Taken of `.` after the walk and never of "${root%/*}", so the `..`
-  # check below compares against the directory this process is standing in.
+  # THE PARENT, AS AN INODE, so the `..` check below has a pinned directory to compare against.
   here="$(stat -c '%d:%i' . 2>/dev/null || true)"
   [[ -n "$here" ]] || return 1
-  # THE ROOT IS AN ORDINARY COMPONENT (o3d-rn10 r5, Codex HIGH), and that is the whole change. It
-  # used to be entered with a bare `cd -P` that followed a symlink DELIBERATELY, which made the
-  # root the one hop this walk did not prove — see publish_trust_root_candidates() for what that
-  # buys an attacker who owns any directory on a symlinked root's TARGET path.
-  #
-  # WHY REFUSING THE SYMLINK AND NOT PINNING ITS TARGET. Pinning would keep the configuration
-  # working: read the link, walk its target from `/` through this same machinery, bound the chain,
-  # decide what a relative target means. That is a SECOND path proved per publication, in three
-  # byte-identical copies, to keep an indirection that is re-resolved every time it is used. A bind
-  # mount is the same layout with the indirection resolved ONCE, at mount time, out of a mount
-  # table only root can write — and it leaves this walk with no exception in it at all. The cost is
-  # an operator-facing change, so the refusal below says exactly what to do instead.
+  # AND THE ROOT IS AN ORDINARY COMPONENT (o3d-rn10 r5) — created, lstat-ed, entered and
+  # inode/`..` checked like every component below it, with a SYMLINK AT IT REFUSED. See the
+  # comment above for the finding and for why the second disk is a bind mount and not a link.
   mkdir "$base" 2>/dev/null || true
-  # ONE lstat, TYPE AND IDENTITY TOGETHER, exactly as the loop below takes them. No `-L`, so a link
-  # reads as "symbolic link" and is refused before anything steps into it.
   entry="$(stat -c '%F|%d:%i' "$base" 2>/dev/null || true)"
   if [[ "${entry%%|*}" != "directory" ]]; then
     if [[ "${entry%%|*}" == "symbolic link" ]]; then
-      printf 'ERROR: %s is a symbolic link, and a publication root may not be one: this installer can prove the root name, but nothing proves the path its target resolves through.\n' "$root" >&2
+      printf 'ERROR: %s is a symbolic link, and a publication root may not be one: nothing here proves the path its target resolves through.\n' "$root" >&2
       printf 'ERROR: To keep %s on another disk, replace the link with a real directory and bind-mount the disk onto it — no data has to move:\n' "$root" >&2
       printf 'ERROR:   rm %s && mkdir -p %s && mount --bind TARGET %s\n' "$root" "$root" "$root" >&2
       printf 'ERROR: then add `TARGET %s none bind 0 0` to /etc/fstab so the bind survives a reboot.\n' "$root" >&2
@@ -2148,8 +2158,6 @@ pin_dir_beneath_root() {
     return 1
   fi
   cd -P "$base" 2>/dev/null || return 1
-  # AND THE SAME PAIR THE LOOP BELOW ASKS: the directory we landed in is the inode that entry
-  # named, and `..` is still the parent pin_publish_root_parent() left this shell inside.
   [[ "$(stat -c '%d:%i' . 2>/dev/null || true)" == "${entry#*|}" ]] || return 1
   [[ "$(stat -c '%d:%i' .. 2>/dev/null || true)" == "$here" ]] || return 1
   here="${entry#*|}"

@@ -24,6 +24,26 @@
  * must be found, and it must be at column 0 in the canonical `name() {` shape, because that is the
  * only shape the `}`-in-column-0 slice below can cut correctly.
  *
+ * AND THE BODY MAY FOLLOW ON THE SAME LINE, WHICH THIS MISSED (o3d-rn10 r5, Codex MEDIUM). The
+ * first version of the detector anchored the header to the END of the line right after the
+ * optional `{`, so it saw `name() {` and `function name {` and nothing else. Bash also accepts
+ *
+ *     publish_root_anchored() { return 0; }
+ *     function publish_root_anchored { return 0; }
+ *     if true; then publish_root_anchored() { return 0; }; fi
+ *
+ * and a ONE-LINE override is exactly the shape an appended duplicate takes — which is to say the
+ * guard added to catch duplicates could not see the cheapest duplicate there is. Counting stayed
+ * at one, shellFunction() went on slicing the canonical body, and the parity comparison it feeds
+ * stayed as vacuous as it was before the guard existed.
+ *
+ * SO THE HEADER IS LOOKED FOR IN COMMAND POSITION ANYWHERE ON THE LINE, and what follows it may be
+ * a body rather than an end of line. Command position is the start of the line, or a `;`, `&`,
+ * `|`, `(`, `)`, `{` or `}`, or one of the control words a command can follow (`then`, `else`,
+ * `do`) — which is also what keeps the scan off the text a line MENTIONS: a trailing `# ...` puts
+ * a `#` immediately before the header, and `#` is not a command separator, so a comment that
+ * quotes a definition is not counted as one. Whole-line comments are skipped as before.
+ *
  * WHAT COUNTS AS AN ASSIGNMENT. A top-level `NAME=`, with or without an `export`, `readonly`,
  * `declare` or `typeset` in front of it. Indented assignments are NOT counted: `local NAME=` and a
  * branch inside a function are ordinary shell, and a rule that banned them would ban the language.
@@ -35,16 +55,21 @@ function escapeForRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
-/** Every line index at which `source` defines `name` as a function, in any form bash accepts. */
+/**
+ * Every line index at which `source` defines `name` as a function, in any form bash accepts — one
+ * entry PER DEFINITION, so two on a single line are two.
+ */
 export function shellFunctionDefinitions(source: string, name: string): number[] {
   const escaped = escapeForRegExp(name)
-  // `name() {`, `name ()  {`, `function name() {`, `function name {` — and the `{` may open on
-  // the next line, so the brace is optional here.
-  const shape = new RegExp(`^\\s*(?:function\\s+${escaped}\\s*(?:\\(\\s*\\))?|${escaped}\\s*\\(\\s*\\))\\s*(?:\\{\\s*)?$`)
+  // `name()`, `name ()`, `function name()`, `function name`.
+  const header = `(?:function\\s+${escaped}\\s*(?:\\(\\s*\\))?|${escaped}\\s*\\(\\s*\\))`
+  // COMMAND POSITION, then the header, then either the `{` — with or without a body behind it —
+  // or the end of the line, because the brace may open on the next one.
+  const shape = new RegExp(`(?:^|[;&|(){}]|\\b(?:then|else|do)\\b)[ \\t]*${header}[ \\t]*(?:\\{|$)`, 'g')
   const found: number[] = []
   source.split('\n').forEach((line, index) => {
     if (line.trimStart().startsWith('#')) return
-    if (shape.test(line)) found.push(index)
+    for (const _match of line.matchAll(shape)) found.push(index)
   })
   return found
 }
