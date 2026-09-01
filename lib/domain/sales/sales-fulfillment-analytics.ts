@@ -1092,8 +1092,42 @@ async function loadCogsByOrder(client: SalesFulfillmentAnalyticsClient, window: 
   return { costByOrder, costedQtyByMovement }
 }
 
+/** How many contradicted customers the Customer Mix notice names before it points at the export. */
+const INCONSISTENT_NOTICE_NAME_LIMIT = 10
+
+/**
+ * THE CONTRADICTED CUSTOMERS BY NAME, SO THE NOTICE CAN BE ACTED ON FROM ANY PAGE (o3d-7jfq r3).
+ *
+ * The count is computed over every group and the rows are then PAGINATED, so on a report longer
+ * than a page the customers the notice is about can all rank outside the slice on screen — the
+ * notice then announces a problem with nothing visible that carries it. That is the same complaint
+ * that made over-costing its own status rather than a line in a summary: a count cannot tell an
+ * operator WHICH customer to go and look at, and a count on page 1 about a row on page 4 is that
+ * failure with an extra step. Names, not ids: the Customer column renders `customerName`, so the
+ * identifier the notice hands over is the one the operator will be reading down the page for.
+ *
+ * Semicolons separate them because a company name may contain a comma, and a list a reader cannot
+ * split is not a list of identifiers.
+ *
+ * Capped, because a notice is one line of prose and a data incident could contradict hundreds. The
+ * overflow is not dropped: it is COUNTED, said out loud, and pointed at the CSV export, which is
+ * built with `paginate: false` and carries `costEvidence` on every row — so the complete answer
+ * always exists somewhere the notice names, however long the list gets.
+ */
+function namedInconsistentCustomers(names: string[]): string {
+  const shown = names.slice(0, INCONSISTENT_NOTICE_NAME_LIMIT)
+  const rest = names.length - shown.length
+  const overflow = rest > 0
+    ? `, and ${rest} more not named here — the CSV export is not paginated and stamps every one of them costEvidence=inconsistent`
+    : ''
+  return `They are, highest-ranked first: ${shown.join('; ')}${overflow}.`
+}
+
 /**
  * THE COSTED-QUANTITY SHORTFALL A DISPATCH MAY CARRY AND STILL COUNT AS COSTED.
+ *
+ * SHORTFALL ONLY. There is no excess counterpart and deliberately none — see the closing
+ * paragraph of `dispatchCostEvidenceByOrder`.
  *
  * `consumeFifoLayersStrict` (lib/cost-layers) absorbs a FIFO shortfall of at most this, and throws
  * above it. Using the SAME figure means a movement is treated as costed here exactly when the
@@ -1136,8 +1170,17 @@ const COSTED_QTY_TOLERANCE = new Prisma.Decimal('0.000001')
  * that is not missing, and the report's own notice names its causes: an unnamed third cause makes
  * that notice a false statement about the row in front of them.
  *
- * The tolerance is the same figure on both sides, and deliberately: it exists for float-to-Decimal
- * noise in the engine's own arithmetic, which has no preferred direction.
+ * AND THE TOLERANCE BELONGS TO ONE SIDE ONLY (o3d-7jfq round 3). Carrying the same band into both
+ * arms looked like symmetry and was not. The band exists to absorb the FIFO engine's own
+ * arithmetic, and on the SHORTFALL side there is arithmetic to absorb: `consumeFifoLayersStrict`
+ * really does leave a residue that small and treats the movement as costed, so a match tighter
+ * than the engine's would withhold profit the engine has already ruled complete. On the EXCESS
+ * side there is nothing to absorb, by the paragraph above — the engine consumes at most the
+ * requested quantity, so it cannot produce excess AT ALL, and any excess that exists was written
+ * by something else. Nor is 0.000001 sub-storage noise: `StockMovement.qty` and `CogsEntry.qty`
+ * are both `Decimal(14,6)`, so it is the smallest quantity the schema can represent — one whole
+ * unit of the stored scale, a real posted figure and not a rounding artefact. So the excess arm
+ * rejects at `> 0`, and the tolerance survives only on `excess.neg()`.
  *
  * Kit-safe by construction: both quantities are the MOVEMENT's own, so the parent-vs-component unit
  * mismatch that `loadInWindowDispatchedQtyByLine` has to convert around never arises here.
@@ -1161,9 +1204,10 @@ function dispatchCostEvidenceByOrder(
     fullyCosted.add(movement.orderId)
     const costed = costedQtyByMovement.get(movement.id) ?? new Prisma.Decimal(0)
     // Excess POSITIVE, shortfall NEGATIVE. `excess.neg()` is the old `qty - costed`, so the
-    // shortfall arm is unchanged to the digit and only the excess arm is new.
+    // shortfall arm is unchanged to the digit — tolerance and all — while the excess arm, which
+    // has no engine arithmetic to forgive, rejects the first storage unit of it.
     const excess = costed.sub(toDecimal(movement.qty))
-    if (excess.gt(COSTED_QTY_TOLERANCE)) inconsistent.add(movement.orderId)
+    if (excess.gt(0)) inconsistent.add(movement.orderId)
     else if (excess.neg().gt(COSTED_QTY_TOLERANCE)) shortOrders.add(movement.orderId)
   }
   for (const orderId of shortOrders) fullyCosted.delete(orderId)
@@ -1318,7 +1362,6 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
     credits: emptyCredits(),
     unpaidCredits: emptyCredits(),
     costCapturedRows: 0,
-    costInconsistentRows: 0,
   }
   const netRevenueByGroup = new Map<string, Prisma.Decimal>()
   for (const [key, group] of groups) {
@@ -1330,7 +1373,6 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
     period_.arExposure = period_.arExposure.add(group.arExposure.sub(comparableCredit(group.unpaidCredits, 'GROSS')))
     mergeCredits(period_.credits, group.credits)
     mergeCredits(period_.unpaidCredits, group.unpaidCredits)
-    if (group.costEvidence === 'inconsistent') period_.costInconsistentRows += 1
     if (group.costEvidence === 'complete') {
       period_.costCapturedRows += 1
       const netRevenueExVat = group.revenueExVat.sub(comparableCredit(group.credits, 'NET'))
@@ -1392,6 +1434,11 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
     // Ranked on the refund-aware figure, so a customer who returned everything no longer outranks
     // one who kept a smaller order.
     .sort((a, b) => toDecimal(b.netRevenueBase).cmp(a.netRevenueBase) || a.customerName.localeCompare(b.customerName))
+  // ONE derivation of both the count and the list, taken from the SORTED, UNPAGINATED rows: the
+  // only place where "which customers" and "in the order the operator will page through them" are
+  // both true. A second walk over `groups` for the count would be a second thing to get wrong, and
+  // a count that disagreed with the names beneath it would be worse than either alone.
+  const inconsistentCustomers = rows.filter((row) => row.costEvidence === 'inconsistent').map((row) => row.customerName)
   const paged = paginate(rows, filters, deps?.paginate !== false)
   return {
     generatedAt: generatedAt.toISOString(),
@@ -1418,7 +1465,7 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
       costCapturedRows: String(period_.costCapturedRows),
       // Travels beside the count it is NOT part of: an inconsistent customer is withheld like an
       // incomplete one, and unlike one it will still be withheld next month if nobody acts.
-      costInconsistentRows: String(period_.costInconsistentRows),
+      costInconsistentRows: String(inconsistentCustomers.length),
       arExposureBase: moneyString(period_.arExposure, baseCurrency),
       arExposureBaseBound: netLinearFigureBoundDecimal({
         basisComplete: creditBasisComplete(period_.unpaidCredits, 'GROSS'),
@@ -1433,8 +1480,8 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
       `Gross profit is withheld for a customer with an in-period order whose posted cost does not cover the revenue it is measured against — no COGS posted in the period, not every ordered stock unit dispatched within it, or a dispatch costed for more units than it moved — and the period total covers ${period_.costCapturedRows} of ${groups.size} customers. A missing cost is not a zero cost, and a partially dispatched order's cost is not the whole order's cost.`,
       // Named separately, and only when there is one: it is the cause an operator has to ACT on,
       // and the only one of the three that will still be here next month if nobody does.
-      ...(period_.costInconsistentRows > 0
-        ? [`${period_.costInconsistentRows} of ${groups.size} customers are withheld as INCONSISTENT rather than incomplete: an in-period dispatch carries COGS entries for more units than the movement moved, which the FIFO engine cannot produce and most often means the entries were posted twice. Nothing further will ship to complete these — the posted cost has to be corrected. Until it is, every report that sums COGS entries is overstating cost by the duplicate.`]
+      ...(inconsistentCustomers.length > 0
+        ? [`${inconsistentCustomers.length} of ${groups.size} customers are withheld as INCONSISTENT rather than incomplete: an in-period dispatch carries COGS entries for more units than the movement moved, which the FIFO engine cannot produce and most often means the entries were posted twice. Nothing further will ship to complete these — the posted cost has to be corrected. Until it is, every report that sums COGS entries is overstating cost by the duplicate. ${namedInconsistentCustomers(inconsistentCustomers)}`]
         : []),
       'Non-inventory lines — services, fees, delivery charges — book no stock movement and post no cost, so they are not asked to show a dispatch and an order made only of them is fully costed at zero. A variable-parent line is not exempt: goods do leave for it and cannot be traced to it, so its cost is unknown and the order is withheld.',
       REFUND_BASIS_NOTICE_CUSTOMER_MIX,
