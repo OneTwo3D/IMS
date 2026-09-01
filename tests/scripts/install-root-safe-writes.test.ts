@@ -1425,6 +1425,9 @@ const PUBLICATION_CONSTANTS = [
   'DEPLOY_META_FILE', 'DB_FENCE_RECOVERY_DIR', 'DB_FENCE_IDENTITY_FILE',
 ]
 
+/** The same set plus the staging directory every publication is written through. */
+const PROTECTED_CONSTANTS = [...PUBLICATION_CONSTANTS, 'PUBLISH_STAGE_DIRNAME']
+
 /** The five roots publish_trust_root_candidates() can name, at their shipped values. A resolution
  *  to anything else means the table has grown a directory nobody argued for. */
 const SHIPPED_ROOTS = new Set([
@@ -1674,8 +1677,17 @@ test('[o3d-rn10] a publisher symbol defined twice fails the parity extractor ins
   assert.match(unbypassed.stdout, /^rc=1$/m, 'the canonical anchor must refuse a root that does not exist')
 
   // AND THE CONSTANT, which aims the staging directory every publication passes through.
-  const reassigned = `${DEPLOY}\nPUBLISH_STAGE_DIRNAME="../../attacker"\n`
-  assert.equal(firstAssignment(reassigned, 'PUBLISH_STAGE_DIRNAME'), shellConstant(INSTALL_SH, 'PUBLISH_STAGE_DIRNAME'),
+  //
+  // SHOWN ON THE BARE DECLARATION (o3d-secops). The pre-fix reading looked for a line STARTING with
+  // the name, and the shipped declaration starts with `readonly` — so on the shipped text that
+  // reading is blind a SECOND, different way: it walks straight past the canonical line and returns
+  // the attacker's. The vacuity this test indicts is the first one, so it is measured on the line
+  // as it stood, which is also the line deleting `readonly` restores.
+  const bare = bareDeclaration(DEPLOY, 'PUBLISH_STAGE_DIRNAME', 'scripts/deploy.sh')
+  assert.equal(bare, bareDeclaration(INSTALL_SH, 'PUBLISH_STAGE_DIRNAME', 'scripts/install.sh'),
+    'the two entrypoints must agree on the staging directory to begin with')
+  const reassigned = `${DEPLOY.replace(shellConstant(DEPLOY, 'PUBLISH_STAGE_DIRNAME'), () => bare)}\nPUBLISH_STAGE_DIRNAME="../../attacker"\n`
+  assert.equal(firstAssignment(reassigned, 'PUBLISH_STAGE_DIRNAME'), bare,
     'the first-assignment reading must still agree with install.sh')
   assert.throws(() => shellConstant(reassigned, 'PUBLISH_STAGE_DIRNAME'), /assigns PUBLISH_STAGE_DIRNAME 2 times/,
     'a second top-level assignment must be refused, not skipped')
@@ -1731,11 +1743,38 @@ const SCOPED_ASSIGNMENTS = [
   'cat > /dev/null <<\'NOTE\'\nPUBLISH_STAGE_DIRNAME="../../attacker"\nNOTE',
 ] as const
 
+/**
+ * THE DECLARATION WITHOUT ITS `readonly` (o3d-secops) — the line these entrypoints carried before
+ * that word was added, and exactly the line deleting it restores.
+ *
+ * Three demonstrations in this file are about WHAT BASH DOES with a second assignment of the
+ * publisher constant: bash takes it, the old reading did not see it, and that gap is what makes the
+ * scanner's uniqueness rule load-bearing rather than decorative. `readonly` makes bash refuse the
+ * second assignment outright, so run against the shipped line those demonstrations would measure
+ * the REFUSAL — passing, while proving nothing about the reading they exist to indict. They are
+ * therefore run against the bare line; that bash refuses the same forms on the shipped one is the
+ * separate, opposite claim made by the o3d-secops test below.
+ *
+ * AND THIS IS WHERE THE WORD IS REQUIRED. Strip `readonly` from an entrypoint's declaration and
+ * every test that reaches this fails, naming the constant and the file.
+ */
+function bareDeclaration(source: string, name: string, where = 'the script'): string {
+  const line = shellConstant(source, name, where)
+  const bare = line.replace(/^readonly /, '')
+  assert.notEqual(bare, line,
+    `${where}: ${name} must be declared \`readonly\` at its canonical declaration. That word is what makes bash `
+    + 'itself refuse `printf -v`, `read`, a nameref and `(( ))` — none of which is an assignment word, all of '
+    + `which re-aim this constant, and none of which any scanner here can see. Found: ${JSON.stringify(line)}`)
+  return bare
+}
+
 /** The rig both sets are proved in: install.sh's own assignment, then the form, then the value. */
 function publishStageAfter(form: string): string {
   return runBash([
     'set -u',
-    shellConstant(INSTALL_SH, 'PUBLISH_STAGE_DIRNAME'),
+    // WITHOUT the `readonly` — see bareDeclaration(): with it, every form below is refused and
+    // this rig would report the shipped value for all of them, which is the opposite measurement.
+    bareDeclaration(INSTALL_SH, 'PUBLISH_STAGE_DIRNAME', 'scripts/install.sh'),
     form,
     'printf "%s\\n" "$PUBLISH_STAGE_DIRNAME"',
   ].join('\n')).stdout.trim()
@@ -1933,7 +1972,7 @@ test('[o3d-1dk9] every publication constant the tracked shell scripts assign sti
   const files = listed.stdout.trim().split('\n').filter(Boolean)
   assert.ok(files.length >= 13, `the census must reach the tracked scripts; git listed ${files.length}`)
 
-  const names = [...PUBLICATION_CONSTANTS, 'PUBLISH_STAGE_DIRNAME']
+  const names = PROTECTED_CONSTANTS
   let bodies = 0
   let resolved = 0
   for (const file of files) {
@@ -1957,6 +1996,188 @@ test('[o3d-1dk9] every publication constant the tracked shell scripts assign sti
     `the tracked scripts carried 373 function bodies when this was written, every one of them a brace group; the census saw ${bodies}`)
   assert.ok(resolved >= 45,
     `the tracked scripts resolved 45 (file, constant) pairs when this was written; the census saw ${resolved}`)
+})
+
+/**
+ * A SCANNER SEES ASSIGNMENT WORDS; BASH MUTATES VARIABLES FOUR OTHER WAYS (o3d-secops, Codex HIGH).
+ *
+ * The two tests above made the constant reader airtight about SYNTAX — every position a `NAME=`
+ * word can stand in, read with a lexer and cross-checked against bash's own parse. That is a claim
+ * about assignment words, and bash does not need one to change a variable. Appending any of
+ *
+ *     printf -v PUBLISH_STAGE_DIRNAME %s ../../attacker
+ *     read PUBLISH_STAGE_DIRNAME <<<'../../attacker'
+ *     declare -n ref=PUBLISH_STAGE_DIRNAME; ref='../../attacker'
+ *     (( PUBLISH_STAGE_DIRNAME = 4919 ))
+ *
+ * to an entrypoint re-aims the staging directory every publication passes through — or, for the
+ * other names here, the trust root a destination is checked against and the path it is published
+ * to — while the scanner, both readings and the census all stay green, because not one of those
+ * lines contains a `NAME=` word.
+ *
+ * THE ANSWER IS NOT A FIFTH ROUND OF ENUMERATION. It is the move the three rounds before it made:
+ * stop listing and let something authoritative decide. `readonly` at the canonical declaration
+ * makes BASH refuse every mutation path, including the ones nobody has written down; the scanner
+ * keeps the job it can do, which is proving there is exactly one declaration.
+ *
+ * WHAT THIS TEST MEASURES, per entrypoint and per constant, under a real bash:
+ *
+ *   ROUTE — the shipped declarations of that script are executed in source order, then the mutation
+ *   runs in a subshell that prints the value it left behind. With `readonly` STRIPPED — the line
+ *   this branch inherited, and the line deleting the word restores — every one of the four changes
+ *   the value. That is the precondition: a mutation bash ignores anyway would make the refusal
+ *   below theatre.
+ *
+ *   THE CLAIM — with the shipped declarations, every one of the four leaves the value untouched
+ *   and bash says `readonly variable` in doing so.
+ *
+ * MUTATION: delete `readonly` from any one declaration in any one entrypoint and this fails naming
+ * that script and that constant, on the four values that then change. (Verified by stripping the
+ * word from PUBLISH_STAGE_DIRNAME in scripts/deploy.sh and from FENCE_FILE in scripts/update.sh.)
+ *
+ * WHY THE SCANNER ITSELF DOES NOT REQUIRE THE WORD. shellConstant() is the generic reader for every
+ * lifted shell constant in this directory — CAPTURE_TERMINATOR, DB_CA_ACCEPTED_PEM_LABELS and the
+ * rest, none of which is a publication constant and none of which is readonly. The requirement is
+ * a property of THIS SET, so it is asserted where the set is written down: here, and in the
+ * structural test below.
+ */
+const NON_ASSIGNMENT_MUTATIONS = [
+  { label: 'printf-v', form: (name: string) => `printf -v ${name} %s ../../ims-secops-attacker` },
+  { label: 'read', form: (name: string) => `read ${name} <<<'../../ims-secops-attacker'` },
+  {
+    label: 'nameref',
+    form: (name: string) => `declare -n ims_secops_ref=${name}; ims_secops_ref='../../ims-secops-attacker'`,
+  },
+  { label: 'arithmetic', form: (name: string) => `(( ${name} = 4919 ))` },
+] as const
+
+/**
+ * The protected constants THIS script declares, in the order it declares them — which matters,
+ * because several are composed from the ones above them (${FENCE_FILE} from ${CUTOVER_STATE_DIR},
+ * ${DEPLOY_META_FILE} from ${APP_DIR}).
+ */
+function protectedDeclarations(source: string, where: string): Array<{ name: string, line: string }> {
+  const found = PROTECTED_CONSTANTS
+    .map((name) => ({ name, line: shellConstantOptional(source, name, where) }))
+    .filter((entry): entry is { name: string, line: string } => entry.line !== undefined)
+  return found.sort((a, b) => source.indexOf(a.line) - source.indexOf(b.line))
+}
+
+/** The script's own declarations, in its own order, with or without the word under test. */
+function declarationPreamble(declarations: Array<{ name: string, line: string }>, strip: boolean): string[] {
+  return [
+    'set -u',
+    // ${CRON_BACKUP} is composed from the service account; nothing else here reads outside the set.
+    'APP_USER=svcuser',
+    ...declarations.map(({ line }) => (strip ? line.replace(/^readonly /, '') : line)),
+  ]
+}
+
+/**
+ * ONE MUTATION PER SHELL, and the value printed after it.
+ *
+ * Not four subshells in one script, which is where this started: `declare -n ref=NAME` against a
+ * readonly NAME does not merely fail, it TERMINATES the shell it runs in, so the nameref subshell
+ * printed nothing at all and a rig that read its line got `undefined` instead of a refusal. A
+ * process each keeps every outcome legible — the value survived, or the shell died refusing.
+ */
+function mutationRig(declarations: Array<{ name: string, line: string }>, target: string, form: string, strip: boolean): string {
+  return [
+    ...declarationPreamble(declarations, strip),
+    form,
+    `printf 'AFTER\\t%s\\n' "\${${target}}"`,
+  ].join('\n')
+}
+
+/** The value the rig printed, or undefined when the shell never got that far. */
+function mutationValue(run: Run): string | undefined {
+  const line = `${run.stdout}\n${run.stderr}`.split('\n').find((candidate) => candidate.startsWith('AFTER\t'))
+  return line === undefined ? undefined : line.slice('AFTER\t'.length)
+}
+
+/** The sentinel every mutation writes, so "it did not arrive" can be asserted directly. */
+const MUTATION_SENTINEL = '../../ims-secops-attacker'
+
+for (const script of ENTRYPOINTS) {
+  test(`[o3d-secops] bash refuses every non-assignment mutation of ${script}'s publication constants`, () => {
+    const source = readFileSync(join(REPO, script), 'utf8')
+    const declarations = protectedDeclarations(source, script)
+    assert.ok(declarations.length >= 9,
+      `${script} declared at least 9 protected publication constants when this was written; this test found ${declarations.length}`)
+
+    for (const { name } of declarations) {
+      // The value the script actually gives it, from the script's own declarations and no mutation.
+      const baseline = runBash([...declarationPreamble(declarations, false), `printf '%s' "\${${name}}"`].join('\n'))
+      assert.equal(baseline.status, 0, `${script}: the shipped declarations must evaluate: ${baseline.stderr}`)
+      const value = baseline.stdout
+      assert.ok(value.length > 0, `${script}: ${name} must resolve to something to compare against`)
+
+      for (const { label, form } of NON_ASSIGNMENT_MUTATIONS) {
+        // ROUTE / PRECONDITION: without the word, bash takes this mutation. A mutation bash ignores
+        // anyway would make the refusal below theatre.
+        const unprotected = runBash(mutationRig(declarations, name, form(name), true))
+        assert.equal(unprotected.status, 0,
+          `${script}: with \`readonly\` stripped, ${label} must run cleanly against ${name}: ${unprotected.stderr}`)
+        assert.notEqual(mutationValue(unprotected), value,
+          `${script}: with \`readonly\` stripped, ${label} must actually change ${name}`)
+
+        // THE CLAIM: with it, bash refuses, says so, and the constant is untouched.
+        const run = runBash(mutationRig(declarations, name, form(name), false))
+        const output = `${run.stdout}\n${run.stderr}`
+        assert.ok(output.includes(`${name}: readonly variable`),
+          `${script}: bash must REFUSE ${label} on ${name} and say so, not silently ignore it:\n${output}`)
+        assert.ok(!output.includes(MUTATION_SENTINEL),
+          `${script}: ${label} reached ${name} — the sentinel came back out of the shell:\n${output}`)
+        const after = mutationValue(run)
+        // `declare -n` against a readonly name kills the shell outright, so there is legitimately
+        // nothing after it; anything that DID print must be the shipped value.
+        if (after !== undefined) {
+          assert.equal(after, value,
+            `${script}: ${label} changed ${name} — \`readonly\` is missing from its declaration, or bash no longer `
+            + `refuses that path:\n${output}`)
+        }
+      }
+    }
+  })
+}
+
+/**
+ * THE STRUCTURAL HALF: THE WORD IS THERE, ON EVERY ONE OF THEM (o3d-secops).
+ *
+ * The test above proves bash's behaviour on each declaration it finds. This one pins the SET: how
+ * many declarations there are across the three entrypoints, and that each carries the word. A
+ * declaration that is deleted outright — a constant the entrypoints stop having, which the
+ * behavioural test would simply stop iterating over — fails here on the count.
+ *
+ * MUTATION: drop `readonly` from any declaration and this names the script and the constant; delete
+ * a declaration and the count moves.
+ *
+ * NOT THE TWO IN scripts/lib/db-fence-protected.sh, DELIBERATELY. DB_FENCE_RECOVERY_DIR and
+ * DB_FENCE_IDENTITY_FILE are owned by the shared library, and every fence harness in
+ * tests/scripts SOURCES that library — for its shipped bytes, which is the whole reason it is a
+ * library — and then points its /etc literals at a scratch directory. `readonly` there would make
+ * the library untestable rather than safer, and the property it would carry is already asserted
+ * from the other side: tests/scripts/deploy-order.test.ts requires the literal, requires it to be
+ * underivable from anything the application can move, and requires that NO entrypoint reassigns it.
+ */
+test('[o3d-secops] every protected publication constant an entrypoint declares is declared `readonly`', () => {
+  const missing: string[] = []
+  let declared = 0
+  for (const script of ENTRYPOINTS) {
+    const source = readFileSync(join(REPO, script), 'utf8')
+    for (const name of PROTECTED_CONSTANTS) {
+      const line = shellConstantOptional(source, name, script)
+      if (line === undefined) continue
+      declared += 1
+      if (!line.startsWith('readonly ')) missing.push(`${script}: ${line}`)
+    }
+  }
+  assert.deepEqual(missing, [],
+    'these publication constants are mutable, and `printf -v`, `read`, a nameref and `(( ))` all change them '
+    + `without writing an assignment word any scanner here can see:\n${missing.join('\n')}`)
+  assert.equal(declared, 41,
+    `the three entrypoints declared 41 protected publication constants between them when this was written; this walk found ${declared}. `
+    + 'A declaration that disappears takes its regression above with it, so the count is asserted rather than the floor.')
 })
 
 /**
