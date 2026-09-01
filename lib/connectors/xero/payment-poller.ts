@@ -47,7 +47,6 @@ import {
   dueWithheldMarkers,
   openWithheldDocuments,
   withheldEntityKey,
-  WITHHELD_MARKER_HORIZON_MS,
   WITHHELD_RECHECK_BATCH,
 } from '@/lib/domain/accounting/withheld-reversal-markers'
 import { withPaymentWriteLockOrSkip, isLockSkipped } from './payment-write-lock'
@@ -1234,8 +1233,10 @@ async function recheckWithheldReversals(
   windowStart: Date,
   fetchInvoices: (path: string) => Promise<{ ok: boolean; data?: XeroInvoicesResponse; error?: string; status?: number }>,
 ): Promise<void> {
-  const horizon = new Date(Date.now() - WITHHELD_MARKER_HORIZON_MS)
-  const { open: openMarkers, closed: closureMarkers } = await openWithheldDocuments(horizon, XERO_MARKER_SCOPE)
+  // NO AGE BOUND (o3d-psrx r5, Codex HIGH 2). Every still-open marker is scanned, however old: an
+  // outage longer than any horizon is exactly when a withheld reversal must not be dropped, and the
+  // page is bounded by DOCUMENTS rather than by time. See the module note in withheld-reversal-markers.
+  const { open: openMarkers, closed: closureMarkers } = await openWithheldDocuments(XERO_MARKER_SCOPE)
 
   const due = dueWithheldMarkers(openMarkers, closureMarkers, Date.now())
   if (due.length === 0) return

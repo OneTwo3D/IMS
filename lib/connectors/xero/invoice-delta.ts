@@ -1084,7 +1084,11 @@ export type RegisteredPaymentRow = {
  *                           the same statement that clears it (the writer census in
  *                           tests/accounting/paid-provenance-writers.test.ts is what keeps that true),
  *                           so while it stands it IS this episode's own timestamp — nothing older
- *                           than it belongs to this paid state.
+ *                           than it belongs to this paid state. ITS VALUE COMES FROM THE DATABASE,
+ *                           not from the writer: the trigger in migration 20260901090000 substitutes
+ *                           `clock_timestamp()` for whatever a caller supplies, which is what makes
+ *                           it comparable to a database-minted completion instant at all (r5, Codex
+ *                           HIGH 1).
  *
  * Null = the caller is not asking. Every existing caller stays exactly as it was.
  */
@@ -1103,26 +1107,69 @@ export type PaidStateBinding = {
  * withholds rather than concludes (see the `unbound` arm there). So an unbindable row costs a warning
  * a human clears; the answer this replaces cost a chargeback credit note against a paid sale.
  *
- * ON THE TWO CLOCKS. `completedAt` is minted by the database (`databaseStampedCompletion`) and
- * `unregisteredPaidAt` by whichever writer set the flag. That is deliberately NOT the fence: the fence
- * (`LedgerReadFence`) orders a ledger READ against a registration, its two ends are milliseconds apart
- * by design, and it is why `syncedAtDatabaseClock` exists. This orders two of IMS's OWN records of its
- * own actions, and its two ends are separated by a human deciding to mark an order paid again — a
- * reversal, then a re-payment. Skew cannot reach across that, and the direction it would have to fail
- * in is "an OLDER registration reads as newer than the marker", which additionally requires the same
- * row to name the document's current invoice id.
+ * ON THE TWO CLOCKS (r5, Codex HIGH 1). Round 4 argued that this comparison did not need the fence's
+ * rigour, because its two ends are separated by a human deciding to mark an order paid again and skew
+ * cannot reach across that. THAT ARGUMENT WAS WRONG, and wrong about the case that matters most:
+ * `addPayment` can record a receipt on an order that is ALREADY paid off-ledger, its INVOICE_PAYMENT
+ * registration completes seconds later, and the marker and the completion are then MILLISECONDS
+ * apart, not months. With `unregisteredPaidAt` written by an application host and `completedAt`
+ * minted by the database, a host running ahead unbinds a real receipt permanently — the comparison is
+ * over two immutable values, so every recheck repeats it.
+ *
+ * BOTH ENDS ARE NOW DATABASE-MINTED, and neither by this function's doing:
+ *
+ *   `completedAt`           `databaseStampedCompletion`, i.e. `clock_timestamp()` written inside the
+ *                           SYNCED transaction and vouched for by `syncedAtDatabaseClock`.
+ *   `unregisteredPaidAt`    `clock_timestamp()` substituted for whatever the writer supplied, by the
+ *                           trigger in migration 20260901090000. No application host can put a value
+ *                           in that column, so there is no host clock left in this comparison.
+ *
+ * And the case above no longer arises at all: `addPayment` now CLEARS the marker when it records a
+ * receipt on an already-paid order, so a paid flag with a real receipt behind it stops claiming to
+ * have none. The fence is what makes that safe rather than merely likely.
+ *
+ * THE DOCUMENT HALF HAS TWO SOURCES OF EVIDENCE, NOT ONE (r5, Codex HIGH 3). The registration's own
+ * payload is the first and the better one. It is not the only one: when the payload names no document
+ * — a row from before the field existed, or one an older release compacted to `{}` — and THE LEDGER
+ * ITSELF LISTS THIS REGISTRATION'S PAYMENT ON THE DOCUMENT BEING EXAMINED, the ledger has answered
+ * "which document" directly, and it is the authority on the question. Rejecting such a row as unbound
+ * was not conservative in the useful direction: it dropped a payment the ledger is still holding out
+ * of the `posted` set, and `posted` is what the STILL_HELD test runs over — so a document whose OTHER
+ * registration had been removed reported GONE while the ledger still held IMS's money on it.
+ *
+ * WHAT IS STILL UNPROVABLE, said plainly: a payload-less registration whose payment the ledger does
+ * NOT list. Absence cannot identify a document — "removed from this invoice" and "belonged to an
+ * invoice this order no longer has" produce exactly the same silence — so those rows stay unbound and
+ * the classifier withholds over them. See o3d-g7jk for the enumeration of that population.
  */
 export function registrationBindsToPaidState(
-  row: Pick<RegisteredPaymentRow, 'registeredAgainstInvoiceId'>,
+  row: Pick<RegisteredPaymentRow, 'registeredAgainstInvoiceId' | 'externalTransactionId'>,
   completedAt: Date,
   paidState: PaidStateBinding,
+  /**
+   * The payment ids the ledger states on THIS document, lowercased, or null when the read did not
+   * enumerate them. Null is not emptiness — see `classifyRegisteredPaymentAgainstListing`. Defaulted
+   * so a caller that has no listing keeps exactly round 4's behaviour.
+   */
+  ledgerListedPaymentIds: ReadonlySet<string> | null = null,
 ): boolean {
   // THE DOCUMENT. A row that names no document names no document — it is not a wildcard.
   const against = typeof row.registeredAgainstInvoiceId === 'string' ? row.registeredAgainstInvoiceId.trim() : ''
-  if (against === '') return false
-  if (paidState.accountingInvoiceId == null || against !== paidState.accountingInvoiceId) return false
+  if (against === '') {
+    // ...unless the LEDGER names it. The payload is IMS's record of which document it asked about;
+    // the listing is the ledger's record of which document is holding the payment that ask created.
+    // The second is not weaker evidence, and it is the only kind a compacted row can still produce.
+    const paymentId = typeof row.externalTransactionId === 'string' ? row.externalTransactionId.trim() : ''
+    if (paymentId === '') return false
+    if (ledgerListedPaymentIds == null) return false
+    if (!ledgerListedPaymentIds.has(paymentId.toLowerCase())) return false
+  } else if (paidState.accountingInvoiceId == null || against !== paidState.accountingInvoiceId) {
+    return false
+  }
   // THE EPISODE. Only asked of a paid flag that RECORDS its own start; a ledger-sourced flag has no
-  // marker to discharge and this arm is not what decides it.
+  // marker to discharge and this arm is not what decides it. Asked of ledger-identified rows on the
+  // same terms as payload-identified ones: knowing WHICH document a payment sits on says nothing
+  // about WHICH paid episode of that document it belongs to.
   if (paidState.unregisteredPaidAt == null) return true
   return completedAt.getTime() > paidState.unregisteredPaidAt.getTime()
 }
@@ -1422,7 +1469,7 @@ export function classifyRegisteredPaymentAgainstListing(
     ) {
       // o3d-psrx r4: it posted and the ledger's answer covers it — but does it cover THIS document's
       // CURRENT paid flag? A caller that supplies no binding is not asking, and nothing changes.
-      if (paidState != null && !registrationBindsToPaidState(row, completedAt, paidState)) {
+      if (paidState != null && !registrationBindsToPaidState(row, completedAt, paidState, ledgerListedPaymentIds)) {
         unbound.push(row.id)
         continue
       }

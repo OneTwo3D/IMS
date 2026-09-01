@@ -3483,6 +3483,30 @@ export async function addPayment(input: {
           // not omitted: an order marked paid by hand and THEN given a receipt must lose the marker.
           data: { paidAt: new Date(), unregisteredPaidAt: null },
         })
+      } else if (!refundId) {
+        // o3d-psrx r5 (Codex HIGH 1) — AND THE ORDER THAT WAS ALREADY PAID LOSES IT TOO.
+        //
+        // The comment above says "an order marked paid by hand and THEN given a receipt must lose the
+        // marker", and the branch it sat in could not do that: `becamePaid` requires `!so.paidAt`, so
+        // the one order that is ALREADY paid off-ledger and is now being given a receipt took the
+        // other path and kept its marker for ever. That is not a cosmetic leftover. The receipt gets
+        // an INVOICE_PAYMENT registration moments later, and the marker it left behind is what the
+        // paid-episode fence weighs that registration against — so a paid flag with a real, posted,
+        // ledger-visible receipt behind it still answered PAID_WITHOUT_LEDGER_RECEIPT, and a genuine
+        // chargeback on it was never recognised. The provenance has to be REPLACED when a receipt is
+        // recorded, not only when the receipt is what made the order paid.
+        //
+        // IN THIS TRANSACTION, beside the `Payment` row, for the reason the note above gives: the
+        // receipt and the state that describes it must not be separable by a reader.
+        //
+        // `updateMany` with the guard rather than `update`: the overwhelming majority of receipts land
+        // on orders with no marker at all, and this way those pay a predicate instead of a row write.
+        await tx.salesOrder.updateMany({
+          where: { id: input.orderId, unregisteredPaidAt: { not: null } },
+          // `paidAt` is deliberately NOT written here — this order is already paid and re-stamping it
+          // would move a settlement date an operator can see. Only the provenance changes.
+          data: { unregisteredPaidAt: null },
+        })
       }
       const settlementRateToBase = await resolveSettlementFxRateToBase(tx, {
         currency: so.currency,

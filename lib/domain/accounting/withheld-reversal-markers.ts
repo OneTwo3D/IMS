@@ -105,22 +105,62 @@ export const WITHHELD_RECHECK_INTERVAL_MS = 60 * 60 * 1000
  *
  * The first distinction is round 5's finding 3: markers accumulate (reconsidering appends a row), so
  * a bound on rows is a bound one long-running document's own history can consume. The second is
- * round 6's finding 2: a settled document keeps its historical open marker for the rest of the
- * horizon, so a bound applied before the closures are known is a bound that documents needing
- * nothing can consume. Both are the same starvation, and both are answered by deciding what the
+ * round 6's finding 2: a settled document keeps its historical open marker until retention sweeps
+ * it, so a bound applied before the closures are known is a bound that documents needing nothing can
+ * consume. Both are the same starvation, and both are answered by deciding what the
  * bound is counting BEFORE spending it — see `openWithheldDocuments`.
  */
 export const WITHHELD_MARKER_SCAN = 400
 
 /**
- * How old a marker may be and still be believed.
+ * EVERY ACTION NAME THIS LIFECYCLE OWNS, open and closed alike.
  *
- * Bounds the scan against the `createdAt` index instead of walking an activity log that is mostly
- * something else. It cannot lose work: an OPEN marker is rewritten every time it is reconsidered, so
- * one can only be older than this if the poll has not run for a month — and the daily reconcile keeps
- * reporting those documents as suspect advances regardless.
+ * Exported because the ACTIVITY-LOG RETENTION SWEEP has to know them (o3d-psrx r5, Codex HIGH 2). It
+ * is the same reason `UNRECORDED_POSTED_DOCUMENT_ACTIONS` is a shared constant: an exemption written
+ * from memory in the sweep is an exemption that names the half of the pair its author was thinking
+ * about, and the other half is deleted silently.
  */
-export const WITHHELD_MARKER_HORIZON_MS = 30 * 24 * 60 * 60 * 1000
+export const WITHHELD_MARKER_ACTIONS = [...WITHHELD_OPEN_ACTIONS, ...WITHHELD_CLOSED_ACTIONS] as const
+
+// ---------------------------------------------------------------------------
+// THERE IS NO HORIZON, AND THERE MUST NOT BE (o3d-psrx r5, Codex HIGH 2)
+// ---------------------------------------------------------------------------
+//
+// Round 4 bounded this scan at thirty days and argued it "cannot lose work: an OPEN marker is
+// rewritten every time it is reconsidered, so one can only be older than this if the poll has not run
+// for a month". Every clause of that is true and the conclusion does not follow — a poll that has not
+// run for a month is not a hypothetical, it is a disabled connector, a credential that expired over a
+// holiday, a maintenance window, a poller that has been erroring on every cycle since before the
+// horizon. And a failed recheck DELIBERATELY leaves the old marker untouched, so the row does not
+// move; the horizon walks past it instead.
+//
+// What it costs when that happens is the exact stranding this whole lifecycle exists to prevent, on a
+// slower clock: the reversal watermark advanced when the marker was first written, an unchanged
+// ledger document never re-enters the delta, and once the marker ages out there is no route back into
+// reversal processing at all. `paidAt` stands for ever against a ledger that disagrees — a supplier
+// who was never paid reads as settled, a real chargeback is never recognised — and NOTHING SAYS SO,
+// because the queue entry that would have said it is the thing that was deleted.
+//
+// So the scan is over ALL still-open markers, whatever their age, and the two things that made a
+// horizon look necessary are answered where they actually live:
+//
+//   THE COST OF THE SCAN. The horizon was a bound against `createdAt` on an activity log that is
+//   mostly something else. The predicate is now served by its own index —
+//   `activity_logs_action_entity_created_idx`, migration 20260901090100 — so the aggregate reads the
+//   six action names and nothing else, and the whole-table shape of the log stops mattering.
+//
+//   THE COST OF THE PAGE. Unbounded AGE is not unbounded WORK: `WITHHELD_MARKER_SCAN` still bounds
+//   how many open DOCUMENTS one poll rebuilds the set from, and `WITHHELD_RECHECK_PAGE` still bounds
+//   how many it reconsiders. Round 5's and round 6's starvation arguments are untouched, and are
+//   what make an unbounded age safe: the ordering is least-recently-reconsidered first over
+//   documents that are still open, so an old marker joins the round robin rather than jamming it.
+//
+// AND THE MARKER HAS TO SURVIVE RETENTION, which is the other half of the same finding. These are
+// activity rows, `activity_logs` is swept by a CONFIGURABLE retention period, and the open markers
+// are WARNING rows — the stock 60-day sweep deletes them. `lib/activity-log-cleanup.ts` therefore
+// retains the CURRENT open marker of every still-open document, and lets everything else about the
+// lifecycle expire on schedule. Unbounded in age, bounded in count: one retained row per open
+// document, and the closure that settles it releases the whole document's history.
 
 /** How many documents one poll reconsiders. Bounds both the DB work and the extra Xero calls. */
 export const WITHHELD_RECHECK_PAGE = 40
@@ -236,7 +276,7 @@ export const RECHECKABLE_ENTITY_TYPES: ReadonlySet<string> = new Set(['PURCHASE_
  *
  * Round 4's round robin rests on "oldest first means least recently reconsidered", and that only
  * holds if a document occupies ONE place in the ordering. It does not: reconsidering a document
- * APPENDS a marker, the old ones stay in the activity log for the whole thirty-day horizon, and a
+ * APPENDS a marker, the old ones stay in the activity log until retention sweeps them, and a
  * bounded scan of ROWS ordered oldest-first therefore fills with the HISTORY of whichever documents
  * have been withheld longest. One document reconsidered hourly writes seven hundred rows a month on
  * its own — more than the whole scan — so a document that became withheld yesterday need never appear
@@ -248,12 +288,12 @@ export const RECHECKABLE_ENTITY_TYPES: ReadonlySet<string> = new Set(['PURCHASE_
  * Grouping per document made the bound a bound on DOCUMENTS. It did not make it a bound on documents
  * THAT NEED ANYTHING (round 6, Codex finding 2), and that is the same starvation one step along:
  *
- *   a settled document keeps its historical open marker for the rest of the horizon, and that marker
+ *   a settled document keeps its historical open marker until retention sweeps it, and that marker
  *   is FROZEN — nothing rewrites it, because the document is never reconsidered again. An open
  *   document's marker, by contrast, is rewritten every time it IS reconsidered. So in an
  *   oldest-first ordering over open markers alone, every settled document sorts AHEAD of every
  *   document that is actually being worked, and once there are as many settled documents in the
- *   horizon as the scan is wide, the page is entirely documents that need nothing and no open
+ *   log as the scan is wide, the page is entirely documents that need nothing and no open
  *   document is ever reconsidered again. Reading the closures afterwards cannot repair it: by then
  *   the bound has already been spent.
  *
@@ -270,14 +310,14 @@ export const RECHECKABLE_ENTITY_TYPES: ReadonlySet<string> = new Set(['PURCHASE_
  * the other kind is known. The closure is still returned rather than only used as a filter, so
  * `dueWithheldMarkers` keeps deciding openness from the pair it is given.
  *
- * (Cost: the aggregate sees the whole horizon rather than stopping at the first N rows — as round 5's
- * group already did. These six actions are a vanishingly small fraction of `activity_logs`, so
- * finding N of them meant scanning most of the window anyway. An index over
- * (action, entityType, entityId, createdAt) would make it cheap and is worth doing; it is a separate
- * concurrent-build migration, not part of this correctness fix.)
+ * (Cost: the aggregate sees every marker row rather than stopping at the first N — as round 5's
+ * group already did, and now with no age bound at all (r5, Codex HIGH 2). The index round 6 said was
+ * "worth doing" became load-bearing the moment the horizon came off, so it is built:
+ * `activity_logs_action_entity_created_idx` over (action, entityType, entityId, createdAt),
+ * migration 20260901090100. The six action names are a vanishingly small fraction of the table, and
+ * the index is what keeps that fraction the only thing this query reads.)
  */
 export async function openWithheldDocuments(
-  horizon: Date,
   /**
    * Whose markers these are. See the module header: both pollers write the same action names, so a
    * scan that did not say which connector it is asking for would hand one connector's documents to the
@@ -288,11 +328,14 @@ export async function openWithheldDocuments(
 ): Promise<{ open: WithheldMarker[]; closed: WithheldMarker[] }> {
   const openActions = [...WITHHELD_OPEN_ACTIONS]
   const closedActions = [...WITHHELD_CLOSED_ACTIONS]
-  // The horizon goes in as an explicit UTC instant and the two aggregates come back as explicit UTC
-  // strings: `activity_logs."createdAt"` is TIMESTAMP WITHOUT TIME ZONE holding UTC, so a bare
-  // parameter or a bare column would be read through whatever the session's TimeZone happens to be.
-  // These markers only schedule (see `dueWithheldMarkers`) — but a whole-timezone shift in the due
-  // timer is still a recheck that runs hours early or not at all.
+  // The two aggregates come back as explicit UTC strings: `activity_logs."createdAt"` is TIMESTAMP
+  // WITHOUT TIME ZONE holding UTC, so a bare column would be read through whatever the session's
+  // TimeZone happens to be. These markers only schedule (see `dueWithheldMarkers`) — but a
+  // whole-timezone shift in the due timer is still a recheck that runs hours early or not at all.
+  //
+  // NO `createdAt` PREDICATE (r5, Codex HIGH 2). See the module note above the scan constants: an age
+  // bound here is what let an unresolved reversal be abandoned by a poll outage. The scan is bounded
+  // by DOCUMENTS (`LIMIT`), never by age.
   const rows = await db.$queryRaw<Array<{
     entityType: string
     entityId: string
@@ -312,7 +355,6 @@ export async function openWithheldDocuments(
       WHERE "tag" = 'sync'
         AND "action" = ANY(${[...openActions, ...closedActions]}::text[])
         AND "entityId" IS NOT NULL
-        AND "createdAt" >= ${horizon.toISOString()}::timestamptz AT TIME ZONE 'UTC'
         AND ("metadata"->>'connector' = ${scope.connector}
              OR (${scope.legacyOwner} AND "metadata"->>'connector' IS NULL))
       GROUP BY "entityType", "entityId"

@@ -2,6 +2,11 @@ import { db } from '@/lib/db'
 import { DIRECT_CREATE_PENDING_ACTION } from '@/lib/fulfillment/pre-fulfilment-reallocation'
 import { UNRECORDED_POSTED_DOCUMENT_ACTIONS } from '@/lib/domain/accounting/unrecorded-posted-document'
 import { WC_REFUND_PARK_RECOVERED_ACTION } from '@/lib/domain/sales/refund-park-recovery'
+import {
+  WITHHELD_CLOSED_ACTIONS,
+  WITHHELD_MARKER_ACTIONS,
+  WITHHELD_OPEN_ACTIONS,
+} from '@/lib/domain/accounting/withheld-reversal-markers'
 
 const DEFAULTS: Record<string, number> = {
   INFO: 30,
@@ -95,6 +100,49 @@ const RETAINED_ACTIONS = [
   WC_REFUND_PARK_RECOVERED_ACTION,
 ]
 
+/**
+ * o3d-psrx r5 (Codex HIGH 2) — THE FOURTH KIND: A ROW WHOSE RETENTION DEPENDS ON ANOTHER ROW.
+ *
+ * The withheld-reversal markers (lib/domain/accounting/withheld-reversal-markers.ts) are kind (1) —
+ * AN OPEN OBLIGATION, which something else must clear — with one difference that stops them going in
+ * `RETAINED_ACTIONS` above: they are not exempt by ACTION. A document withheld and reconsidered
+ * hourly writes a new open marker every hour, and an unconditional exemption would retain all seven
+ * hundred of them a month, for ever. What has to survive is ONE row: the document's CURRENT open
+ * marker, and only while it is still open.
+ *
+ * WHAT BREAKS WITHOUT IT. The open markers are WARNING rows, so the stock sixty-day sweep deletes
+ * them, oldest first — which is precisely the documents nobody has resolved. The marker IS the queue
+ * entry (round 4's whole design), the reversal watermark advanced when it was written, and an
+ * unchanged ledger document never re-enters the delta: delete the marker and the withheld reversal is
+ * not deferred, it is abandoned, silently, with `paidAt` standing against a ledger that disagrees.
+ *
+ * THE RULE, and it is a rule about a PAIR of rows rather than about one row's action:
+ *
+ *   an OPEN row is retained    while it is the document's NEWEST open marker AND no closure for that
+ *                              document is at least as new. That is `dueWithheldMarkers`' own
+ *                              openness test, spelt in SQL — deliberately the same `>=` at the tie,
+ *                              so a row the scan calls closed is a row this sweep may delete.
+ *   a CLOSURE is retained      while any open row for that document still exists. Closures are INFO
+ *                              (30 days) and open rows are WARNING (60), so without this the proof
+ *                              that a document SETTLED would expire a month before the marker it
+ *                              settles — and the surviving open row would then read as open again,
+ *                              putting a finished document back into the round robin for ever.
+ *
+ * Together they converge and they terminate: while a document is open, one row survives; once it is
+ * closed, the open rows age out first, and the next sweep — with no open row left to protect it —
+ * lets the closure go too. Bounded by OPEN DOCUMENTS, not by incidents or by time.
+ *
+ * SCOPED BY CONNECTOR, matching `openWithheldDocuments`. Both pollers write the same action names and
+ * each scan claims only its own connector's rows (plus, for the legacy owner, the rows written before
+ * the metadata key existed). A newest-marker test that ignored the connector would let one
+ * connector's fresh marker license the deletion of another connector's still-open one. `IS NOT
+ * DISTINCT FROM` rather than `=`, so the pre-key NULL rows form their own group instead of matching
+ * nothing and being deleted on their own evidence.
+ */
+const WITHHELD_OPEN_ACTION_NAMES = [...WITHHELD_OPEN_ACTIONS]
+const WITHHELD_CLOSED_ACTION_NAMES = [...WITHHELD_CLOSED_ACTIONS]
+const WITHHELD_ALL_ACTION_NAMES = [...WITHHELD_MARKER_ACTIONS]
+
 const DELETE_BATCH_SIZE = 10_000
 const DEFAULT_CRON_RUN_RETENTION_DAYS = 90
 
@@ -139,12 +187,52 @@ export async function purgeExpiredActivityLogs() {
         WITH deleted AS (
           DELETE FROM "activity_logs"
           WHERE id IN (
-            SELECT id
-            FROM "activity_logs"
-            WHERE level = ${level}::"ActivityLogLevel"
-              AND "createdAt" < ${cutoff}
-              AND action <> ALL(${RETAINED_ACTIONS}::text[])
-            ORDER BY "createdAt" ASC
+            SELECT m.id
+            FROM "activity_logs" m
+            WHERE m.level = ${level}::"ActivityLogLevel"
+              AND m."createdAt" < ${cutoff}
+              AND m.action <> ALL(${RETAINED_ACTIONS}::text[])
+              -- o3d-psrx r5 (Codex HIGH 2) — THE WITHHELD-REVERSAL MARKERS, retained by their
+              -- RELATION to the document's other markers rather than by their action alone. See
+              -- WITHHELD_OPEN_ACTION_NAMES above for the full argument. The action test is written
+              -- FIRST so an ordinary row pays one array test and never reaches the two correlated
+              -- subqueries.
+              AND NOT (
+                m.action = ANY(${WITHHELD_ALL_ACTION_NAMES}::text[])
+                AND m."entityId" IS NOT NULL
+                AND (
+                  -- STILL THIS DOCUMENT'S OPEN MARKER: no newer open row, and no closure at least as
+                  -- new. The >= at the tie is dueWithheldMarkers own test, so a row that scan
+                  -- calls closed is exactly a row this sweep may delete.
+                  (
+                    m.action = ANY(${WITHHELD_OPEN_ACTION_NAMES}::text[])
+                    AND NOT EXISTS (
+                      SELECT 1 FROM "activity_logs" newer
+                      WHERE newer."entityType" = m."entityType"
+                        AND newer."entityId" = m."entityId"
+                        AND newer."metadata"->>'connector' IS NOT DISTINCT FROM m."metadata"->>'connector'
+                        AND (
+                          (newer.action = ANY(${WITHHELD_OPEN_ACTION_NAMES}::text[]) AND newer."createdAt" > m."createdAt")
+                          OR (newer.action = ANY(${WITHHELD_CLOSED_ACTION_NAMES}::text[]) AND newer."createdAt" >= m."createdAt")
+                        )
+                    )
+                  )
+                  -- OR THE PROOF THAT A DOCUMENT SETTLED, for as long as an open row it answers
+                  -- survives. Closures are INFO and open rows are WARNING, so without this the proof
+                  -- expires a month before the marker it settles and the survivor reads as open again.
+                  OR (
+                    m.action = ANY(${WITHHELD_CLOSED_ACTION_NAMES}::text[])
+                    AND EXISTS (
+                      SELECT 1 FROM "activity_logs" openrow
+                      WHERE openrow."entityType" = m."entityType"
+                        AND openrow."entityId" = m."entityId"
+                        AND openrow."metadata"->>'connector' IS NOT DISTINCT FROM m."metadata"->>'connector'
+                        AND openrow.action = ANY(${WITHHELD_OPEN_ACTION_NAMES}::text[])
+                    )
+                  )
+                )
+              )
+            ORDER BY m."createdAt" ASC
             LIMIT ${DELETE_BATCH_SIZE}
           )
           RETURNING 1

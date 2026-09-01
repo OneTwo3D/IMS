@@ -1772,10 +1772,24 @@ model SalesOrder {
   /// So the provenance is RECORDED rather than inferred, by the same UPDATE statement that writes
   /// `paidAt`. There is no instant at which a reader can see one without the other.
   ///
-  /// SET to the paid instant by the non-ledger writers; NULL by every ledger-sourced writer and by
+  /// SET to a non-null instant by the non-ledger writers; NULL by every ledger-sourced writer and by
   /// every writer that clears `paidAt`. `tests/accounting/paid-provenance-writers.test.ts` requires
   /// every `paidAt` write in app/ and lib/ to name this field in the same `data` object, which is
   /// what stops the next writer inheriting a stale value by omission.
+  ///
+  /// THE VALUE IS THE DATABASE'S, NOT THE WRITER'S (o3d-psrx r5, Codex HIGH 1). Whatever instant a
+  /// caller supplies, the trigger in migration 20260901090000 stores `clock_timestamp()` instead.
+  /// This column is one END OF A FENCE — a registration may speak for the current paid flag only if
+  /// it completed AFTER the episode began (`registrationBindsToPaidState`) — and the other end is
+  /// database-minted. An application host's `new Date()` (markSalesOrderPaid) or a shop's
+  /// `date_paid_gmt` (the WooCommerce importer) on this side made that an ordering across two
+  /// machines, and a host running ahead unbinds a real, posted receipt for ever. The instant an
+  /// operator sees is `paidAt`; this one is a fence, and a fence has to be measured by one clock.
+  ///
+  /// AND A RECEIPT REPLACES IT. `addPayment` clears this column whenever it records a non-refund
+  /// receipt, including on an order that was ALREADY marked paid by hand — which was the r4 hole:
+  /// such an order kept a marker saying "no ledger receipt is coming" while a real INVOICE_PAYMENT
+  /// was registered moments later.
   ///
   /// DISCHARGED BY THE LEDGER, NOT BY A SWEEP. Once an INVOICE_PAYMENT registration is shown to have
   /// posted before the ledger read, `classifyRegisteredPayment` stops consulting this at all — a
@@ -3823,6 +3837,13 @@ model ActivityLog {
   @@index([tag])
   @@index([level])
   @@index([level, createdAt])
+  /// o3d-psrx r5 (Codex HIGH 2): the withheld-reversal marker scan
+  /// (lib/domain/accounting/withheld-reversal-markers.ts) groups the six marker actions per document
+  /// and takes each document's newest of each kind, with NO age bound — an age bound is what let an
+  /// unresolved reversal be abandoned by a poll outage. The retention sweep asks the same question
+  /// per row. `action` leads because it is the selective predicate; (entityType, entityId) is the
+  /// grouping; `createdAt` supplies the MAX and the oldest-first order without a sort.
+  @@index([action, entityType, entityId, createdAt], map: "activity_logs_action_entity_created_idx")
   @@map("activity_logs")
 }
 
