@@ -774,6 +774,237 @@ test('customer mix: the costed-quantity tolerance is the FIFO engine\u2019s, to 
   assert.equal(short.rows[0]?.costCaptured, false)
 })
 
+// ---------------------------------------------------------------------------------------------
+// Customer Mix: EXCESS cost evidence — the direction the costed-quantity match did not test
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Ten units ordered at an ex-VAT 10 each, all ten shipped inside the window.
+ *
+ * 120 invoiced with 20 of VAT, so the ex-VAT revenue every profit below is measured against is
+ * 120 - 20 = 100. What changes between the tests is only the COGS evidence against the ONE dispatch
+ * movement, which is where a costed-quantity rule has to read it.
+ */
+const TEN_UNITS_ALL_SHIPPED = [order({
+  id: 'order-1', customerId: 'cust-1', customerName: 'Acme', totalBase: '120', taxBase: '20',
+  lines: [{ id: 'line-1', productId: 'product-1', totalBase: '100', qty: '10' }],
+})]
+
+function reportForCogsEntries(entries: Array<ReturnType<typeof cogsForDispatch>>) {
+  const client: SalesFulfillmentAnalyticsClient = {
+    ...baseClient(),
+    salesOrder: { findMany: async () => TEN_UNITS_ALL_SHIPPED },
+    stockMovement: { findMany: async () => [dispatch('order-1', 'line-1', 'product-1', '10')] },
+    cogsEntry: { findMany: async () => entries },
+  }
+  return getCustomerAnalyticsReport(WINDOW, { client, now: NOW })
+}
+
+/** The standing notice the report raises only when a customer's cost evidence contradicts itself. */
+const inconsistentNotice = (report: { notices: string[] }) =>
+  report.notices.find((notice) => notice.includes('withheld as INCONSISTENT rather than incomplete'))
+
+test('customer mix: a dispatch costed for MORE units than it moved is withheld, not published (o3d-7jfq)', async () => {
+  // The one-sided match. Ten units shipped, and the COGS entry set for that movement is posted
+  // TWICE: 20 costed units against a 10-unit movement. `movement.qty - costedQty` is -10, which is
+  // not greater than the tolerance, so the movement read as fully costed and BOTH entries reached
+  // costByOrder — 30 + 30 = 60 of cost against 100 of ex-VAT revenue, published as a complete
+  // gross profit of 40. The true cost is 30 and the true profit 70, so the figure was understated
+  // by the whole duplicate and said nothing about it.
+  const report = await reportForCogsEntries([
+    cogsForDispatch('order-1', 'line-1', '10', '30'),
+    cogsForDispatch('order-1', 'line-1', '10', '30'),
+  ])
+  const row = report.rows[0]!
+
+  // Revenue is untouched: this rule withholds a PROFIT, it does not restate revenue.
+  assert.equal(row.revenueBase, '120')
+  assert.equal(row.netRevenueExVatBase, '100')
+  // 40 is not published, and neither is 70: the evidence contradicts itself, so there is no figure
+  // this report is entitled to pick.
+  assert.equal(row.grossProfitBase, null)
+  assert.equal(row.grossProfitBaseBound, 'indeterminate')
+  assert.equal(row.costCaptured, false)
+  // AND IT IS NOT THE SAME ANSWER AS AN INCOMPLETE ORDER. Nothing will ship or post to complete
+  // this one; somebody has to delete an entry. A reader told only "withheld" goes looking for the
+  // missing cost that is not missing.
+  assert.equal(row.costEvidence, 'inconsistent')
+  assert.equal(report.totals.grossProfitBase, '0')
+  assert.equal(report.totals.costCapturedRows, '0')
+  assert.equal(report.totals.costInconsistentRows, '1')
+  // And the page says so in words, because a count in a CSV total is not a thing anybody reads.
+  assert.ok(inconsistentNotice(report), 'the report did not raise the inconsistent-evidence notice')
+  assert.match(inconsistentNotice(report)!, /^1 of 1 customers/)
+})
+
+test('customer mix: the SAME order costed exactly once still publishes its profit (o3d-7jfq)', async () => {
+  // The counterweight on the identical fixture, so the rule above cannot be satisfied by refusing
+  // everything: one entry, ten costed units for a ten-unit movement, 30 of cost. A match that
+  // rejected any non-shortfall — `excess >= 0` — would withhold here too and fail this.
+  const report = await reportForCogsEntries([cogsForDispatch('order-1', 'line-1', '10', '30')])
+
+  // 100 of ex-VAT revenue less 30 of cost = 70.
+  assert.equal(report.rows[0]?.grossProfitBase, '70')
+  assert.equal(report.rows[0]?.costCaptured, true)
+  assert.equal(report.rows[0]?.costEvidence, 'complete')
+  assert.equal(report.totals.grossProfitBase, '70')
+  assert.equal(report.totals.costCapturedRows, '1')
+  assert.equal(report.totals.costInconsistentRows, '0')
+  // No contradiction, so no standing warning about one.
+  assert.equal(inconsistentNotice(report), undefined)
+})
+
+test('customer mix: the costed-quantity tolerance admits the engine’s rounding in BOTH directions (o3d-7jfq)', async () => {
+  // The tolerance is 0.000001 because that is what `consumeFifoLayersStrict` absorbs, and float-to-
+  // Decimal noise has no preferred direction — so the band has to be the same width on each side.
+  // All four points are asserted: a band that only ever withheld would fail the two admitted ones,
+  // and one that never withheld would fail the two rejected ones.
+  const at = (costedQty: string) => reportForCogsEntries([cogsForDispatch('order-1', 'line-1', costedQty, '30')])
+
+  // OVER by exactly the tolerance: still costed. 100 - 30 = 70.
+  const overAbsorbed = await at('10.000001')
+  assert.equal(overAbsorbed.rows[0]?.grossProfitBase, '70')
+  assert.equal(overAbsorbed.rows[0]?.costEvidence, 'complete')
+
+  // Over by twice it: contradictory, and the same 70 is withheld rather than published.
+  const over = await at('10.000002')
+  assert.equal(over.rows[0]?.grossProfitBase, null)
+  assert.equal(over.rows[0]?.costEvidence, 'inconsistent')
+
+  // SHORT by exactly the tolerance: still costed, unchanged by the new arm.
+  const shortAbsorbed = await at('9.999999')
+  assert.equal(shortAbsorbed.rows[0]?.grossProfitBase, '70')
+  assert.equal(shortAbsorbed.rows[0]?.costEvidence, 'complete')
+
+  // Short by twice it: incomplete — a gap, and NOT reported as a contradiction.
+  const short = await at('9.999998')
+  assert.equal(short.rows[0]?.grossProfitBase, null)
+  assert.equal(short.rows[0]?.costEvidence, 'incomplete')
+  assert.equal(short.totals.costInconsistentRows, '0')
+})
+
+test('customer mix: an incomplete customer and a contradicted one are told apart (o3d-7jfq)', async () => {
+  // Both withhold, and an operator does different things about them, so the row has to say which.
+  // Acme's order-1 ships ten of ten and posts its entry set twice — 20 costed units for 10 moved.
+  // Beta's order-2 ships four of ten and costs exactly those four: a plain gap, which next month's
+  // shipping closes on its own.
+  const orders = [
+    ...TEN_UNITS_ALL_SHIPPED,
+    order({
+      id: 'order-2', customerId: 'cust-2', customerName: 'Beta', totalBase: '120', taxBase: '20',
+      lines: [{ id: 'line-2', productId: 'product-2', totalBase: '100', qty: '10' }],
+    }),
+  ]
+  const client: SalesFulfillmentAnalyticsClient = {
+    ...baseClient(),
+    salesOrder: { findMany: async () => orders },
+    stockMovement: {
+      findMany: async () => [
+        dispatch('order-1', 'line-1', 'product-1', '10'),
+        dispatch('order-2', 'line-2', 'product-2', '4'),
+      ],
+    },
+    cogsEntry: {
+      findMany: async () => [
+        cogsForDispatch('order-1', 'line-1', '10', '30'),
+        cogsForDispatch('order-1', 'line-1', '10', '30'),
+        cogsForDispatch('order-2', 'line-2', '4', '12'),
+      ],
+    },
+  }
+
+  const report = await getCustomerAnalyticsReport(WINDOW, { client, now: NOW })
+  // Both customers invoice 120, so the net-revenue ranking ties and the name breaks it: Acme, Beta.
+  const [acme, beta] = report.rows
+  assert.equal(acme?.customerName, 'Acme')
+  assert.equal(beta?.customerName, 'Beta')
+
+  assert.equal(acme?.grossProfitBase, null)
+  assert.equal(acme?.costEvidence, 'inconsistent')
+  assert.equal(beta?.grossProfitBase, null)
+  assert.equal(beta?.costEvidence, 'incomplete')
+  // One of the two withheld customers is actionable, and the count says so: 1 of 2, not 2 of 2.
+  assert.equal(report.totals.costCapturedRows, '0')
+  assert.equal(report.totals.costInconsistentRows, '1')
+  assert.match(inconsistentNotice(report)!, /^1 of 2 customers/)
+})
+
+test('customer mix: a customer with both keeps the graver answer, whichever order is read first (o3d-7jfq)', async () => {
+  // One customer, two orders: order-1 contradicts itself, order-2 is merely short. The grouped row
+  // shows one word for both, and it has to be the one that needs a person — a later incomplete
+  // order must not overwrite it, and an earlier one must not be preferred by arriving first.
+  const contradicted = order({
+    id: 'order-1', customerId: 'cust-1', customerName: 'Acme', totalBase: '120', taxBase: '20',
+    lines: [{ id: 'line-1', productId: 'product-1', totalBase: '100', qty: '10' }],
+  })
+  const merelyShort = order({
+    id: 'order-2', customerId: 'cust-1', customerName: 'Acme', totalBase: '120', taxBase: '20',
+    lines: [{ id: 'line-2', productId: 'product-2', totalBase: '100', qty: '10' }],
+  })
+  const reportFor = (orders: Array<ReturnType<typeof order>>) => getCustomerAnalyticsReport(WINDOW, {
+    client: {
+      ...baseClient(),
+      salesOrder: { findMany: async () => orders },
+      stockMovement: {
+        findMany: async () => [
+          dispatch('order-1', 'line-1', 'product-1', '10'),
+          dispatch('order-2', 'line-2', 'product-2', '4'),
+        ],
+      },
+      cogsEntry: {
+        findMany: async () => [
+          cogsForDispatch('order-1', 'line-1', '10', '30'),
+          cogsForDispatch('order-1', 'line-1', '10', '30'),
+          cogsForDispatch('order-2', 'line-2', '4', '12'),
+        ],
+      },
+    },
+    now: NOW,
+  })
+
+  for (const orders of [[contradicted, merelyShort], [merelyShort, contradicted]]) {
+    const report = await reportFor(orders)
+    // One customer, two orders, one row.
+    assert.equal(report.rows.length, 1)
+    assert.equal(report.rows[0]?.orderCount, 2)
+    assert.equal(report.rows[0]?.grossProfitBase, null)
+    assert.equal(report.rows[0]?.costEvidence, 'inconsistent')
+    assert.equal(report.totals.costInconsistentRows, '1')
+  }
+})
+
+test('customer mix: an order with nothing to dispatch is still not costed at zero when its evidence contradicts itself (o3d-7jfq)', async () => {
+  // "Costed at zero, on its own evidence" is what makes a service-only order publishable, and it is
+  // an argument about an order that CANNOT carry a dispatch. An order that carries one anyway, with
+  // twice the entries the movement can justify, has not established anything — so the contradiction
+  // is read BEFORE coverage, not after it.
+  //
+  // 100 invoiced, no VAT, on one delivery-charge line. Coverage answers `nothing-to-dispatch`, and
+  // reading that first would publish 100 - (20 + 20) = 60 as a complete profit.
+  const orders = [order({
+    id: 'order-1', customerId: 'cust-1', customerName: 'Acme', totalBase: '100', taxBase: '0',
+    lines: [{ id: 'line-1', productId: 'delivery', totalBase: '100', qty: '1', productType: ProductType.NON_INVENTORY }],
+  })]
+  const client: SalesFulfillmentAnalyticsClient = {
+    ...baseClient(),
+    salesOrder: { findMany: async () => orders },
+    stockMovement: { findMany: async () => [dispatch('order-1', 'line-1', 'delivery', '1')] },
+    cogsEntry: {
+      findMany: async () => [
+        cogsForDispatch('order-1', 'line-1', '1', '20'),
+        cogsForDispatch('order-1', 'line-1', '1', '20'),
+      ],
+    },
+  }
+
+  const report = await getCustomerAnalyticsReport(WINDOW, { client, now: NOW })
+
+  assert.equal(report.rows[0]?.netRevenueExVatBase, '100')
+  assert.equal(report.rows[0]?.grossProfitBase, null)
+  assert.equal(report.rows[0]?.costEvidence, 'inconsistent')
+  assert.equal(report.totals.costInconsistentRows, '1')
+})
+
 test('customer mix: a unit dispatched AFTER the window does not complete the in-window cost (o3d-kyey)', async () => {
   // Orders are selected by createdAt, so a dispatch can never fall before the window — but it can
   // fall after it, which puts the cost in the NEXT period's COGS and the revenue in this one. The
