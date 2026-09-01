@@ -898,6 +898,17 @@ is genuinely gone, or register the receipt so the two agree. The moment a paymen
 posted, the recorded origin stops mattering and Xero's own list decides again — so a genuine
 **WooCommerce chargeback is still detected and still unwinds revenue**, exactly as before.
 
+**Recording a receipt replaces that origin only when the receipts settle the order.** Adding a payment
+to an order that was already marked paid by hand is the ordinary way to put the money on the ledger,
+and the recorded origin is dropped when it happens — the flag now has a real receipt behind it, and
+that receipt is registered with Xero like any other. But IMS accepts **part** payments, and the origin
+is a statement about the *whole* paid balance: a £1 receipt against a £100 order marked paid by hand
+does not make the other £99 any less off-ledger. So the origin is dropped only once the payments
+recorded against the order **cover its total**. Until then the order behaves exactly as it did before
+the part payment: the receipt is registered, the reversal decision waits for that registration in the
+usual way, and an empty Xero invoice with nothing left to speak for it is still **withheld** rather
+than charged back.
+
 **QuickBooks reverses on the same evidence, decided by the same code.** The rule above is not Xero's;
 it is IMS's, and the QuickBooks payment poller reaches its verdict through the same functions. It
 selects each order's recorded origin, takes the same database-clock reading *before* asking Intuit,
