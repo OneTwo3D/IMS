@@ -5,7 +5,7 @@
  */
 
 import { db } from '@/lib/db'
-import { logActivity } from '@/lib/activity-log'
+import { logActivity, logActivityPersisted } from '@/lib/activity-log'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import {
   detectPaymentReversals,
@@ -17,6 +17,15 @@ import {
   type LedgerReadFence,
   type RegisteredPaymentVerdict,
 } from '@/lib/connectors/xero/invoice-delta'
+import {
+  closeWithheldMarker,
+  deferWithheldMarker,
+  dueWithheldMarkers,
+  openWithheldDocuments,
+  withheldEntityKey,
+  WITHHELD_MARKER_HORIZON_MS,
+  WITHHELD_RECHECK_BATCH,
+} from '@/lib/domain/accounting/withheld-reversal-markers'
 import { qboQuery } from './api'
 import { getSettingValue } from '@/lib/settings-store'
 
@@ -25,15 +34,27 @@ const LAST_POLL_KEY = 'quickbooks_last_payment_poll'
 /** A QuickBooks reversal can only ever speak about rows QuickBooks itself issued. */
 const QUICKBOOKS_CONNECTOR = 'quickbooks'
 
+/**
+ * Whose withheld-reversal markers this poller owns.
+ *
+ * `legacyOwner: false` — markers written before the connector key existed belong to XERO, which is the
+ * only poller that had a recheck at all until o3d-psrx r4. Claiming them here would send QuickBooks
+ * asking about Xero invoice ids for ever.
+ */
+const QBO_MARKER_SCOPE = { connector: QUICKBOOKS_CONNECTOR, legacyOwner: false } as const
+
 type QboInvoice = {
   Id: string
   Balance: number
+  /** o3d-psrx r4: a VOIDED document is zeroed rather than deleted, which is how the by-id read sees it. */
+  TotalAmt?: number
   MetaData?: { LastUpdatedTime?: string }
 }
 
 type QboBill = {
   Id: string
   Balance: number
+  TotalAmt?: number
   MetaData?: { LastUpdatedTime?: string }
 }
 
@@ -93,6 +114,56 @@ async function fetchReversedEntityIds(
   const balanceDue = balanceRes.data?.QueryResponse?.[entity] ?? []
   const voided = voidedRes.data?.QueryResponse?.[entity] ?? []
   return { ...classifyQboReversals(balanceDue, voided), ledgerObservedBefore }
+}
+
+/**
+ * THE SAME QUESTION, ASKED ABOUT NAMED DOCUMENTS INSTEAD OF A TIME WINDOW (o3d-psrx r4 / o3d-a6i2).
+ *
+ * `fetchReversedEntityIds` above is the DELTA read: it asks which documents regressed since the
+ * watermark, and it is what the watermark is for. This one asks about a LIST OF IDS and is deliberately
+ * independent of the cursor — because the documents it is for are the ones the cursor has already moved
+ * past, and the thing that will settle them is usually not a QuickBooks change at all (a PENDING
+ * registration finishing, a FAILED one being cancelled, a database fence that failed once).
+ *
+ * ONE CLASSIFICATION, NOT A SECOND ONE WORDED LIKE IT: the two populations are split by
+ * `classifyQboReversals`, exactly as the delta read splits them. What differs is only which documents
+ * were asked about, which is the whole point.
+ *
+ * `returned` is the third answer this read gives and the delta read cannot: WHICH of the ids QuickBooks
+ * actually answered about. A document that did not come back has not been reconsidered, and "we did not
+ * hear" must never be spent as "there is nothing left to decide".
+ *
+ * Null on any failed query, so the caller closes nothing and every marker stays due.
+ */
+async function fetchReversedEntityIdsByIds(
+  entity: 'Invoice' | 'Bill',
+  ids: readonly string[],
+): Promise<{ all: Set<string>; voided: Set<string>; returned: Set<string>; ledgerObservedBefore: LedgerReadFence | null } | null> {
+  // Minted BEFORE the ledger is asked, for the reason `fetchReversedEntityIds` gives: the ordering is
+  // PROGRAM ORDER, and one fence covering several batches only ever decides FEWER registrations.
+  const ledgerObservedBefore = await readDatabaseLedgerFence()
+  const balanceDue: QboEntityId[] = []
+  const voided: QboEntityId[] = []
+  const returned = new Set<string>()
+  for (let i = 0; i < ids.length; i += WITHHELD_RECHECK_BATCH) {
+    const batch = ids.slice(i, i + WITHHELD_RECHECK_BATCH)
+    // Single-quoted ids, and ids that could break out of the quoting are refused rather than escaped:
+    // an `accountingInvoiceId` is a QuickBooks-issued numeric id, and anything else in that column is
+    // not a document this read can ask about.
+    const safe = batch.filter((id) => /^[A-Za-z0-9_-]+$/.test(id))
+    if (safe.length === 0) continue
+    const res = await qboQuery<QboQueryResponse<QboInvoice | QboBill>>(
+      entity, `Id IN (${safe.map((id) => `'${id}'`).join(', ')})`,
+    )
+    if (!res.ok) return null
+    for (const row of res.data?.QueryResponse?.[entity] ?? []) {
+      returned.add(row.Id)
+      // The same two predicates the delta read expresses as `Balance > '0'` and `TotalAmt = '0'`.
+      if (typeof row.Balance === 'number' && row.Balance > 0) balanceDue.push({ Id: row.Id })
+      if (typeof row.TotalAmt === 'number' && row.TotalAmt === 0) voided.push({ Id: row.Id })
+    }
+  }
+  return { ...classifyQboReversals(balanceDue, voided), returned, ledgerObservedBefore }
 }
 
 /**
@@ -235,11 +306,331 @@ export async function readQboBillReversalCandidates() {
   })
 }
 
+export type QboSalesReversalDoc = Awaited<ReturnType<typeof readQboSalesReversalCandidates>>[number]
+export type QboBillReversalDoc = Awaited<ReturnType<typeof readQboBillReversalCandidates>>[number]
+
+/**
+ * THE DURABLE RECORD OF A WITHHELD REVERSAL, AND THE THING THAT BRINGS IT BACK (o3d-psrx r4).
+ *
+ * Before r4 this was `logActivity` — fire and forget — and the poll checkpointed regardless. That was
+ * the whole of Codex's second finding: QuickBooks selects candidates only where `LastUpdatedTime`
+ * exceeds the watermark, so a withheld document whose cause resolves LOCALLY (a PENDING registration
+ * finishing, a FAILED one cancelled, a database fence that failed once) was never asked about again.
+ *
+ * Two things changed, and they are different things:
+ *
+ *   THE ROW IS THE WORK ITEM. It carries `connector` so `openWithheldDocuments` can claim it, and its
+ *   `createdAt` is the recheck timer. Writing it again is what restarts that timer.
+ *   A ROW THAT DID NOT LAND HOLDS THE WATERMARK. This is the one case where holding the cursor is
+ *   right and not a freeze: with no marker there is nothing to bring the document back at all, so the
+ *   delta window is the only remaining route to it. (A marker that DID land never holds the cursor —
+ *   see the note at the withheld loop.)
+ */
+async function signalWithheldQboReversal(entry: {
+  entityType: 'SALES_ORDER' | 'PURCHASE_ORDER'
+  entityId: string
+  action: 'payment_reversal_withheld' | 'bill_payment_reversal_withheld'
+  description: string
+  accountingInvoiceId: string | null
+  verdict: RegisteredPaymentVerdict
+}): Promise<boolean> {
+  return await logActivityPersisted({
+    entityType: entry.entityType,
+    entityId: entry.entityId,
+    action: entry.action,
+    tag: 'sync',
+    level: 'WARNING',
+    description: entry.description,
+    metadata: {
+      // o3d-psrx r4: WHOSE marker this is. The Xero poller writes the same action names, and a recheck
+      // that claimed the other connector's rows would ask the wrong ledger about the wrong ids.
+      connector: QUICKBOOKS_CONNECTOR,
+      registrationVerdict: entry.verdict.verdict,
+      accountingInvoiceId: entry.accountingInvoiceId,
+    },
+    resolveUser: false,
+  })
+}
+
+function qboSalesWithheldDescription(order: QboSalesReversalDoc, verdict: RegisteredPaymentVerdict): string {
+  return `QuickBooks reports a balance due on order ${order.orderNumber ?? order.externalOrderNumber} `
+    + `(status: ${order.status}), but the payment reversal was WITHHELD. ${qboWithheldReversalReason(verdict)}`
+}
+
+function qboBillWithheldDescription(bill: QboBillReversalDoc, verdict: RegisteredPaymentVerdict): string {
+  return `QuickBooks reports a balance due on the bill for PO ${bill.po.reference} `
+    + `(PO status: ${bill.po.status}), but the payment reversal was WITHHELD. ${qboWithheldReversalReason(verdict)}`
+}
+
+/**
+ * The closing effects of an ADMITTED sales reversal, as one step both the delta pass and the recheck
+ * run. Lifted out in r4 for the reason the candidate query was lifted out in r3: a recheck that
+ * re-implemented "what happens when a reversal is admitted" would be a second answer to the question
+ * that raises credit notes.
+ *
+ * `holdWatermark` is a FAILED chargeback: `paidAt` is left set so the reversal is retried, and the
+ * cursor must not move past the invoice or the retry never happens.
+ */
+async function applyQboSalesReversal(
+  order: QboSalesReversalDoc,
+  opts: { invoiceVoided: boolean },
+  errors: string[],
+): Promise<{ reversed: boolean; holdWatermark: boolean }> {
+  // scjz.71: a reversed payment on a revenue-POSTED order (revenue recognised +
+  // invoiced) is a chargeback — raise a revenue-only credit note that reverses
+  // recognised revenue against AR. Idempotent (one chargeback per order).
+  // A VOIDED invoice has already had its AR/revenue reversed by QBO, so a
+  // separate credit note would double-reverse — only auto-chargeback an
+  // un-applied payment where the invoice is still live.
+  // CRITICAL: clear paidAt ONLY after the chargeback is recorded — otherwise a
+  // failed chargeback would drop the order out of the next poll's paidOrders
+  // (paidAt: not null) and the recognised revenue would never be reversed.
+  let chargebackFailed = false
+  // o3d-w00 (Codex r8 #3): the refusal the posted-VAT fence raises stands until an admin changes
+  // the tax configuration, so holding paidAt AND the poll watermark for it would freeze the whole
+  // QuickBooks cursor indefinitely — every later payment and reversal behind it, not just this
+  // order. Payment truth is reconciled and the order flagged instead.
+  let chargebackManualReason: string | undefined
+  if (order.revenueDeferredDate && !opts.invoiceVoided) {
+    try {
+      const { raiseChargebackForReversedOrder } = await import('@/app/actions/sales')
+      const chargeback = await raiseChargebackForReversedOrder(order.id, { internalBypassToken: INTERNAL_ACTION_BYPASS })
+      if (chargeback.error && chargeback.manualResolutionRequired) {
+        chargebackManualReason = chargeback.error
+        errors.push(`Chargeback for order ${order.orderNumber ?? order.id} needs manual handling: ${chargeback.error}`)
+      } else if (chargeback.error) {
+        chargebackFailed = true
+        errors.push(`Chargeback for order ${order.orderNumber ?? order.id} failed: ${chargeback.error}`)
+      }
+    } catch (chargebackError) {
+      chargebackFailed = true
+      errors.push(`Chargeback for order ${order.orderNumber ?? order.id} failed: ${String(chargebackError)}`)
+    }
+  }
+  // Leave paidAt set on a failed chargeback so the reversal is re-attempted and
+  // the order is not silently shown unpaid-and-unreversed. Also hold the poll
+  // watermark: unlike Xero (whose cursor gate is errors.length===0), the QBO
+  // cursor advances on allQueriesSucceeded, so without this the window moves past
+  // the reversed invoice and the LastUpdatedTime>since reversal query never
+  // re-returns it — the chargeback would never actually retry.
+  if (chargebackFailed) return { reversed: false, holdWatermark: true }
+  // o3d-psrx r2: the provenance is cleared with the flag it describes.
+  await db.salesOrder.update({
+    where: { id: order.id },
+    data: { paidAt: null, unregisteredPaidAt: null },
+  })
+  await logActivity({
+    entityType: 'SALES_ORDER',
+    entityId: order.id,
+    action: 'payment_reversal_detected',
+    tag: 'sync',
+    level: 'WARNING',
+    description: chargebackManualReason
+      ? `Payment no longer present in QuickBooks for order ${order.orderNumber ?? order.externalOrderNumber} (status: ${order.status}) — cleared paidAt, but the revenue unwind was REFUSED and no credit note has been raised: ${chargebackManualReason} Raise the credit note manually, or fix the tax mapping and re-run the poller.`
+      : `Payment no longer present in QuickBooks for order ${order.orderNumber ?? order.externalOrderNumber} (status: ${order.status}) — cleared paidAt. Review whether the order status should revert.`,
+    resolveUser: false,
+  })
+  return { reversed: true, holdWatermark: false }
+}
+
+/** The closing effects of an ADMITTED bill reversal. No chargeback equivalent on the purchase side. */
+async function applyQboBillReversal(bill: QboBillReversalDoc): Promise<void> {
+  await db.purchaseInvoice.update({ where: { id: bill.id }, data: { paidAt: null } })
+  await logActivity({
+    entityType: 'PURCHASE_ORDER',
+    entityId: bill.poId,
+    action: 'bill_payment_reversal_detected',
+    tag: 'sync',
+    level: 'WARNING',
+    description: `Bill payment no longer present in QuickBooks for PO ${bill.po.reference} (PO status: ${bill.po.status}) — cleared paidAt.`,
+    resolveUser: false,
+  })
+}
+
+/**
+ * GO BACK AND RE-ASK EVERY WITHHELD QUICKBOOKS REVERSAL THAT HAS RESTED LONG ENOUGH
+ * (o3d-psrx r4, Codex HIGH; closes o3d-a6i2).
+ *
+ * THE DEFECT. `pollQuickBooksPayments` advances `LastUpdatedTime` after every successful query, and
+ * candidates are selected only where `LastUpdatedTime` exceeds it. A withheld candidate was therefore
+ * checkpointed past — and several of the causes that withhold it resolve with NO QuickBooks document
+ * change: a PENDING or PROCESSING registration finishing or being CANCELLED, or a database fence that
+ * failed once. A genuine chargeback or supplier-payment reversal could stay represented as paid
+ * indefinitely, recoverable only by a human reading the warning.
+ *
+ * WHAT THIS IS NOT. It is not a cursor hold. Holding the cursor for a paid flag that by design is
+ * never registered would freeze every later QuickBooks payment and reversal behind it — the trap
+ * o3d-w00 records, and the reason r3 advanced the watermark deliberately. The cursor keeps moving AND
+ * the withheld documents are revisited BY KEY.
+ *
+ * THE LIFECYCLE IS XERO'S, NOT A SECOND ONE WORDED LIKE IT. `openWithheldDocuments`,
+ * `dueWithheldMarkers`, `closeWithheldMarker` and `deferWithheldMarker` are the same functions
+ * o3d-clxw rounds 4–6 argued into shape, moved to lib/domain/accounting/withheld-reversal-markers.ts
+ * because none of that reasoning was ever about Xero: the work item is an activity row, the timer is
+ * its `createdAt`, the page is a round robin over documents rather than rows, and a settled document
+ * cannot spend the scan. All this connector supplies is its own read-by-id and its own gate — which is
+ * the SAME gate the delta pass uses, so a recheck cannot reach a verdict the delta would not have.
+ *
+ * FAILURE IS ALWAYS TOWARDS ASKING AGAIN. A QuickBooks read that fails closes nothing; a document
+ * QuickBooks did not return is DEFERRED, not closed; and a pass that recorded any error while these
+ * documents were being decided defers rather than closes, because "we could not decide" must never be
+ * spent as "there is nothing left to decide" (o3d-clxw round 5, finding 2).
+ */
+export async function recheckWithheldQboReversals(
+  errors: string[],
+): Promise<{ rechecked: number; resolved: number; salesReversed: number; billsReversed: number }> {
+  const out = { rechecked: 0, resolved: 0, salesReversed: 0, billsReversed: 0 }
+  const horizon = new Date(Date.now() - WITHHELD_MARKER_HORIZON_MS)
+  const { open: openMarkers, closed: closureMarkers } = await openWithheldDocuments(horizon, QBO_MARKER_SCOPE)
+  const due = dueWithheldMarkers(openMarkers, closureMarkers, Date.now())
+  if (due.length === 0) return out
+  out.rechecked = due.length
+
+  const poIds = due.filter((m) => m.entityType === 'PURCHASE_ORDER').map((m) => m.entityId)
+  const soIds = due.filter((m) => m.entityType === 'SALES_ORDER').map((m) => m.entityId)
+
+  // Only documents IMS STILL holds as paid have a disagreement left to settle. One PO can carry more
+  // than one bill, which is why the bill side is keyed by poId and may map to several documents.
+  const bills = poIds.length === 0 ? [] : await db.purchaseInvoice.findMany({
+    where: { poId: { in: poIds }, paidAt: { not: null }, accountingInvoiceId: { not: null } },
+    select: { id: true, accountingInvoiceId: true, poId: true, po: { select: { reference: true, status: true } } },
+  })
+  const orders = soIds.length === 0 ? [] : await db.salesOrder.findMany({
+    where: { id: { in: soIds }, paidAt: { not: null }, accountingInvoiceId: { not: null } },
+    select: {
+      id: true,
+      accountingInvoiceId: true,
+      orderNumber: true,
+      externalOrderNumber: true,
+      status: true,
+      revenueDeferredDate: true,
+      // No exceptions to the provenance rule inside a file that decides reversals — this read feeds
+      // the SAME gate the delta pass feeds, and the gate is what consumes it.
+      unregisteredPaidAt: true,
+    },
+  })
+
+  const documentIdsByEntity = new Map<string, string[]>()
+  const add = (key: string, invoiceId: string | null): void => {
+    if (!invoiceId) return
+    documentIdsByEntity.set(key, [...(documentIdsByEntity.get(key) ?? []), invoiceId])
+  }
+  for (const bill of bills) add(withheldEntityKey('PURCHASE_ORDER', bill.poId), bill.accountingInvoiceId)
+  for (const order of orders) add(withheldEntityKey('SALES_ORDER', order.id), order.accountingInvoiceId)
+
+  const salesRead = orders.length === 0 ? null : await fetchReversedEntityIdsByIds(
+    'Invoice', [...new Set(orders.map((o) => o.accountingInvoiceId).filter((id): id is string => id != null))])
+  const billsRead = bills.length === 0 ? null : await fetchReversedEntityIdsByIds(
+    'Bill', [...new Set(bills.map((b) => b.accountingInvoiceId).filter((id): id is string => id != null))])
+  if ((orders.length > 0 && salesRead == null) || (bills.length > 0 && billsRead == null)) {
+    // Nothing is closed and nothing is deferred: every due document keeps the marker it already has,
+    // so the whole page is still due on the next poll.
+    errors.push('Withheld-reversal recheck could not read QuickBooks; nothing was reconsidered.')
+    return out
+  }
+
+  const returned = new Set<string>([...(salesRead?.returned ?? []), ...(billsRead?.returned ?? [])])
+  const stillWithheld = new Set<string>()
+  // The recheck's equivalent of refusing to checkpoint is refusing to CLOSE, so it watches the same
+  // signal the delta pass does: any error recorded while these documents were being decided means this
+  // pass did not decide them all. Coarse in the safe direction only — an unrelated error defers
+  // documents that were in fact settled, which costs one activity row and one more reconsideration.
+  const errorsBeforeDecision = errors.length
+
+  if (salesRead != null && orders.length > 0) {
+    const gate = await gateQboReversalsOnProvenance(detectPaymentReversals(orders, salesRead.all), {
+      registrationType: 'INVOICE_PAYMENT',
+      referenceType: 'SalesOrder',
+      ledgerObservedBefore: salesRead.ledgerObservedBefore,
+    })
+    for (const { doc: order, verdict } of gate.withheld) {
+      // Rewriting the marker is what RESTARTS the timer, which is what keeps the page a round robin
+      // rather than a queue with a permanent head. `observe` before the write, not after: "we could
+      // not write it down" must never be mistaken for "the disagreement is over".
+      stillWithheld.add(withheldEntityKey('SALES_ORDER', order.id))
+      await signalWithheldQboReversal({
+        entityType: 'SALES_ORDER',
+        entityId: order.id,
+        action: 'payment_reversal_withheld',
+        description: qboSalesWithheldDescription(order, verdict),
+        accountingInvoiceId: order.accountingInvoiceId,
+        verdict,
+      })
+    }
+    for (const order of gate.admitted) {
+      const invoiceVoided = order.accountingInvoiceId != null && salesRead.voided.has(order.accountingInvoiceId)
+      const applied = await applyQboSalesReversal(order, { invoiceVoided }, errors)
+      if (applied.reversed) out.salesReversed++
+      // A failed chargeback leaves `paidAt` set and the disagreement open, so the marker stays.
+      else stillWithheld.add(withheldEntityKey('SALES_ORDER', order.id))
+    }
+  }
+
+  if (billsRead != null && bills.length > 0) {
+    const gate = await gateQboReversalsOnProvenance(detectPaymentReversals(bills, billsRead.all), {
+      registrationType: 'BILL_PAYMENT',
+      referenceType: 'PurchaseInvoice',
+      ledgerObservedBefore: billsRead.ledgerObservedBefore,
+    })
+    for (const { doc: bill, verdict } of gate.withheld) {
+      stillWithheld.add(withheldEntityKey('PURCHASE_ORDER', bill.poId))
+      await signalWithheldQboReversal({
+        entityType: 'PURCHASE_ORDER',
+        entityId: bill.poId,
+        action: 'bill_payment_reversal_withheld',
+        description: qboBillWithheldDescription(bill, verdict),
+        accountingInvoiceId: bill.accountingInvoiceId,
+        verdict,
+      })
+    }
+    for (const bill of gate.admitted) {
+      await applyQboBillReversal(bill)
+      out.billsReversed++
+    }
+  }
+
+  const decisionIncomplete = errors.length > errorsBeforeDecision
+
+  for (const marker of due) {
+    const key = withheldEntityKey(marker.entityType, marker.entityId)
+    // Still withheld — the signal pass has already rewritten the marker, which restarts its timer. If
+    // that write failed the OLD marker stands, and the document simply stays due.
+    if (stillWithheld.has(key)) continue
+
+    const documentIds = documentIdsByEntity.get(key)
+    // Grounded in IMS's own state and in nothing QuickBooks said, so an error in the decision pass has
+    // no bearing on it: there is no disagreement left to decide either way.
+    if (!documentIds || documentIds.length === 0) {
+      out.resolved++
+      await closeWithheldMarker(marker, QBO_MARKER_SCOPE.connector, 'no-paid-document',
+        'IMS no longer holds a paid, QuickBooks-linked document for this record, so the withheld '
+        + 'payment reversal has nothing left to decide and is closed.')
+      continue
+    }
+    // A read that did not come back cannot close anything. Deferring rewrites the marker so this
+    // document goes to the BACK of the oldest-first page instead of holding its head for ever.
+    if (!documentIds.every((id) => returned.has(id))) {
+      await deferWithheldMarker(marker, QBO_MARKER_SCOPE.connector, 'QuickBooks did not return the document')
+      continue
+    }
+    if (decisionIncomplete) {
+      await deferWithheldMarker(marker, QBO_MARKER_SCOPE.connector, 'the reconsideration pass could not complete')
+      continue
+    }
+    out.resolved++
+    await closeWithheldMarker(marker, QBO_MARKER_SCOPE.connector, 'settled',
+      'The withheld payment reversal for this document was reconsidered against a fresh QuickBooks '
+      + 'read and is no longer withheld — it was either reversed, or the ledger and IMS now agree. Closed.')
+  }
+
+  return out
+}
+
 /**
  * Poll QuickBooks for paid invoices and bills.
  * Updates paidAt on matching IMS records and advances order status.
  */
-export async function pollQuickBooksPayments(): Promise<{ salesPaid: number; billsPaid: number; salesReversed: number; billsReversed: number; salesReversalsWithheld: number; billsReversalsWithheld: number; errors: string[] }> {
+export async function pollQuickBooksPayments(): Promise<{ salesPaid: number; billsPaid: number; salesReversed: number; billsReversed: number; salesReversalsWithheld: number; billsReversalsWithheld: number; withheldRechecked: number; withheldResolved: number; errors: string[] }> {
   const errors: string[] = []
   let salesPaid = 0
   let billsPaid = 0
@@ -248,6 +639,9 @@ export async function pollQuickBooksPayments(): Promise<{ salesPaid: number; bil
   // o3d-psrx r3: reversals the provenance gate refused. Reported, never silently dropped.
   let salesReversalsWithheld = 0
   let billsReversalsWithheld = 0
+  // o3d-psrx r4 / o3d-a6i2: withheld documents re-asked off the delta cursor, and the ones that settled.
+  let withheldRechecked = 0
+  let withheldResolved = 0
   let allQueriesSucceeded = true
 
   const lastPoll = await getSettingValue(LAST_POLL_KEY)
@@ -335,6 +729,19 @@ export async function pollQuickBooksPayments(): Promise<{ salesPaid: number; bil
       allQueriesSucceeded = false
       errors.push('Failed to query QuickBooks invoices for payment reversals')
     } else {
+      // o3d-psrx r4 (Codex HIGH) — A NULL FENCE IS AN INCOMPLETE POLL, NOT A CLEAN ONE.
+      //
+      // With no database clock nothing is decided: every document carrying a registration withholds,
+      // because every registration might have landed after the snapshot. That is the correct verdict
+      // and it is NOT a reason to checkpoint — the query succeeded, so `allQueriesSucceeded` would
+      // otherwise move the watermark past a window in which IMS could decide nothing at all. The
+      // marker recheck would eventually re-ask, but the delta window is cheaper and this poll plainly
+      // did not finish its job.
+      if (reversedIds.ledgerObservedBefore == null) {
+        allQueriesSucceeded = false
+        errors.push('The database clock could not be read, so no sales payment reversal in this window '
+          + 'could be decided. Holding the poll watermark so the window is re-read.')
+      }
       // o3d-psrx r3 (Codex HIGH) — THE SAME EVIDENCE XERO NOW REQUIRES, REQUIRED HERE.
       const gate = await gateQboReversalsOnProvenance(
         detectPaymentReversals(paidOrders, reversedIds.all),
@@ -345,85 +752,44 @@ export async function pollQuickBooksPayments(): Promise<{ salesPaid: number; bil
         },
       )
 
-      // WITHHELD IS REPORTED, NEVER SILENT. The watermark is deliberately NOT held for it: a paid flag
-      // that was never going to be registered stays unregistered for ever, so holding the cursor on it
-      // would freeze every later QuickBooks payment and reversal behind it indefinitely — the same
-      // trap o3d-w00 (Codex r8 #3) records a few lines below for a refused chargeback. The audit
-      // entry is therefore the durable record, and it says what a human has to do.
+      // WITHHELD IS REPORTED, NEVER SILENT — AND NOW IT COMES BACK (o3d-psrx r4 / o3d-a6i2).
+      //
+      // The watermark is still deliberately NOT held for a withheld verdict that was RECORDED: a paid
+      // flag that was never going to be registered stays unregistered for ever, so holding the cursor
+      // on it would freeze every later QuickBooks payment and reversal behind it — the same trap
+      // o3d-w00 (Codex r8 #3) records a few lines below for a refused chargeback.
+      //
+      // What r3 got wrong was the other half. The cursor moving on is fine; the document never being
+      // asked about again is not, and QuickBooks selects candidates only where `LastUpdatedTime`
+      // exceeds the watermark. Several withholding causes resolve with NO QuickBooks change at all — a
+      // PENDING or PROCESSING registration finishing or being CANCELLED, a database fence that failed
+      // once — so a genuine chargeback could stay represented as paid for ever. The activity row is now
+      // a MARKER that `recheckWithheldQboReversals` re-reads by id on a timer, off the cursor entirely.
+      //
+      // A marker that did NOT land is the one case that holds the watermark, because then the delta
+      // window is the only remaining route back to the document.
       for (const { doc: order, verdict } of gate.withheld) {
         salesReversalsWithheld++
-        await logActivity({
+        const landed = await signalWithheldQboReversal({
           entityType: 'SALES_ORDER',
           entityId: order.id,
           action: 'payment_reversal_withheld',
-          tag: 'sync',
-          level: 'WARNING',
-          description: `QuickBooks reports a balance due on order ${order.orderNumber ?? order.externalOrderNumber} `
-            + `(status: ${order.status}), but the payment reversal was WITHHELD. ${qboWithheldReversalReason(verdict)}`,
-          resolveUser: false,
+          description: qboSalesWithheldDescription(order, verdict),
+          accountingInvoiceId: order.accountingInvoiceId,
+          verdict,
         })
+        if (!landed) {
+          allQueriesSucceeded = false
+          errors.push(`Withheld payment reversal for order ${order.orderNumber ?? order.id} left no durable `
+            + `marker, so nothing would bring it back. Holding the poll watermark instead.`)
+        }
       }
 
       for (const order of gate.admitted) {
-        // scjz.71: a reversed payment on a revenue-POSTED order (revenue recognised +
-        // invoiced) is a chargeback — raise a revenue-only credit note that reverses
-        // recognised revenue against AR. Idempotent (one chargeback per order).
-        // A VOIDED invoice has already had its AR/revenue reversed by QBO, so a
-        // separate credit note would double-reverse — only auto-chargeback an
-        // un-applied payment where the invoice is still live.
-        // CRITICAL: clear paidAt ONLY after the chargeback is recorded — otherwise a
-        // failed chargeback would drop the order out of the next poll's paidOrders
-        // (paidAt: not null) and the recognised revenue would never be reversed.
         const invoiceVoided = order.accountingInvoiceId != null && reversedIds.voided.has(order.accountingInvoiceId)
-        let chargebackFailed = false
-        // o3d-w00 (Codex r8 #3): the refusal the posted-VAT fence raises stands until an admin changes
-        // the tax configuration, so holding paidAt AND the poll watermark for it would freeze the whole
-        // QuickBooks cursor indefinitely — every later payment and reversal behind it, not just this
-        // order. Payment truth is reconciled and the order flagged instead.
-        let chargebackManualReason: string | undefined
-        if (order.revenueDeferredDate && !invoiceVoided) {
-          try {
-            const { raiseChargebackForReversedOrder } = await import('@/app/actions/sales')
-            const chargeback = await raiseChargebackForReversedOrder(order.id, { internalBypassToken: INTERNAL_ACTION_BYPASS })
-            if (chargeback.error && chargeback.manualResolutionRequired) {
-              chargebackManualReason = chargeback.error
-              errors.push(`Chargeback for order ${order.orderNumber ?? order.id} needs manual handling: ${chargeback.error}`)
-            } else if (chargeback.error) {
-              chargebackFailed = true
-              errors.push(`Chargeback for order ${order.orderNumber ?? order.id} failed: ${chargeback.error}`)
-            }
-          } catch (chargebackError) {
-            chargebackFailed = true
-            errors.push(`Chargeback for order ${order.orderNumber ?? order.id} failed: ${String(chargebackError)}`)
-          }
-        }
-        // Leave paidAt set on a failed chargeback so the reversal is re-attempted and
-        // the order is not silently shown unpaid-and-unreversed. Also hold the poll
-        // watermark: unlike Xero (whose cursor gate is errors.length===0), the QBO
-        // cursor advances on allQueriesSucceeded, so without this the window moves past
-        // the reversed invoice and the LastUpdatedTime>since reversal query never
-        // re-returns it — the chargeback would never actually retry.
-        if (chargebackFailed) {
-          allQueriesSucceeded = false
-          continue
-        }
-        // o3d-psrx r2: the provenance is cleared with the flag it describes.
-        await db.salesOrder.update({
-          where: { id: order.id },
-          data: { paidAt: null, unregisteredPaidAt: null },
-        })
-        salesReversed++
-        await logActivity({
-          entityType: 'SALES_ORDER',
-          entityId: order.id,
-          action: 'payment_reversal_detected',
-          tag: 'sync',
-          level: 'WARNING',
-          description: chargebackManualReason
-            ? `Payment no longer present in QuickBooks for order ${order.orderNumber ?? order.externalOrderNumber} (status: ${order.status}) — cleared paidAt, but the revenue unwind was REFUSED and no credit note has been raised: ${chargebackManualReason} Raise the credit note manually, or fix the tax mapping and re-run the poller.`
-            : `Payment no longer present in QuickBooks for order ${order.orderNumber ?? order.externalOrderNumber} (status: ${order.status}) — cleared paidAt. Review whether the order status should revert.`,
-          resolveUser: false,
-        })
+        const applied = await applyQboSalesReversal(order, { invoiceVoided }, errors)
+        if (applied.holdWatermark) allQueriesSucceeded = false
+        if (applied.reversed) salesReversed++
       }
     }
   }
@@ -478,6 +844,13 @@ export async function pollQuickBooksPayments(): Promise<{ salesPaid: number; bil
       allQueriesSucceeded = false
       errors.push('Failed to query QuickBooks bills for payment reversals')
     } else {
+      // o3d-psrx r4 (Codex HIGH): see the sales side — a fence that could not be read decides nothing,
+      // and a window in which nothing could be decided must not be checkpointed past.
+      if (reversedIds.ledgerObservedBefore == null) {
+        allQueriesSucceeded = false
+        errors.push('The database clock could not be read, so no bill payment reversal in this window '
+          + 'could be decided. Holding the poll watermark so the window is re-read.')
+      }
       // o3d-psrx r3: the SAME gate, at the sibling reader in this same file. A bill has no
       // `unregisteredPaidAt` column (markBillPaid queues its BILL_PAYMENT registration inside the paid
       // transaction — o3d-a3wx), so what this adds on the purchase side is the REGISTRATION fence: a
@@ -492,33 +865,38 @@ export async function pollQuickBooksPayments(): Promise<{ salesPaid: number; bil
 
       for (const { doc: bill, verdict } of gate.withheld) {
         billsReversalsWithheld++
-        await logActivity({
+        const landed = await signalWithheldQboReversal({
           entityType: 'PURCHASE_ORDER',
           entityId: bill.poId,
           action: 'bill_payment_reversal_withheld',
-          tag: 'sync',
-          level: 'WARNING',
-          description: `QuickBooks reports a balance due on the bill for PO ${bill.po.reference} `
-            + `(PO status: ${bill.po.status}), but the payment reversal was WITHHELD. ${qboWithheldReversalReason(verdict)}`,
-          resolveUser: false,
+          description: qboBillWithheldDescription(bill, verdict),
+          accountingInvoiceId: bill.accountingInvoiceId,
+          verdict,
         })
+        if (!landed) {
+          allQueriesSucceeded = false
+          errors.push(`Withheld bill payment reversal for PO ${bill.po.reference} left no durable marker, `
+            + `so nothing would bring it back. Holding the poll watermark instead.`)
+        }
       }
 
       for (const bill of gate.admitted) {
-        await db.purchaseInvoice.update({ where: { id: bill.id }, data: { paidAt: null } })
+        await applyQboBillReversal(bill)
         billsReversed++
-        await logActivity({
-          entityType: 'PURCHASE_ORDER',
-          entityId: bill.poId,
-          action: 'bill_payment_reversal_detected',
-          tag: 'sync',
-          level: 'WARNING',
-          description: `Bill payment no longer present in QuickBooks for PO ${bill.po.reference} (PO status: ${bill.po.status}) — cleared paidAt.`,
-          resolveUser: false,
-        })
       }
     }
   }
+
+  // o3d-psrx r4 / o3d-a6i2 — AND GO BACK FOR EVERYTHING THIS POLL, OR AN EARLIER ONE, WITHHELD.
+  //
+  // Runs whatever the delta pass did, because the documents it is for are precisely the ones the delta
+  // will never return again. Its own failures are recorded on `errors` and never checkpoint anything:
+  // a marker is only ever CLOSED on an answer.
+  const rechecked = await recheckWithheldQboReversals(errors)
+  withheldRechecked += rechecked.rechecked
+  withheldResolved += rechecked.resolved
+  salesReversed += rechecked.salesReversed
+  billsReversed += rechecked.billsReversed
 
   // Only advance the poll watermark if all QBO queries succeeded.
   // If a query failed, keep the previous checkpoint so the next run
@@ -532,16 +910,17 @@ export async function pollQuickBooksPayments(): Promise<{ salesPaid: number; bil
   }
 
   if (salesPaid > 0 || billsPaid > 0 || salesReversed > 0 || billsReversed > 0
-    || salesReversalsWithheld > 0 || billsReversalsWithheld > 0) {
+    || salesReversalsWithheld > 0 || billsReversalsWithheld > 0 || withheldRechecked > 0) {
     await logActivity({
       entityType: 'SYSTEM',
       action: 'quickbooks_payment_poll',
       tag: 'sync',
       description: `QuickBooks payment poll: ${salesPaid} sales paid, ${billsPaid} bills paid, ${salesReversed} sales reversed, ${billsReversed} bills reversed`
-        + `, ${salesReversalsWithheld} sales + ${billsReversalsWithheld} bill reversals withheld`,
-      metadata: { salesPaid, billsPaid, salesReversed, billsReversed, salesReversalsWithheld, billsReversalsWithheld },
+        + `, ${salesReversalsWithheld} sales + ${billsReversalsWithheld} bill reversals withheld`
+        + `, ${withheldRechecked} withheld reconsidered (${withheldResolved} settled)`,
+      metadata: { salesPaid, billsPaid, salesReversed, billsReversed, salesReversalsWithheld, billsReversalsWithheld, withheldRechecked, withheldResolved },
     })
   }
 
-  return { salesPaid, billsPaid, salesReversed, billsReversed, salesReversalsWithheld, billsReversalsWithheld, errors }
+  return { salesPaid, billsPaid, salesReversed, billsReversed, salesReversalsWithheld, billsReversalsWithheld, withheldRechecked, withheldResolved, errors }
 }
