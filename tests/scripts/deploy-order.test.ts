@@ -4209,11 +4209,19 @@ for (const entry of R8_CASES) {
 // namespace holding none of it.
 // ---------------------------------------------------------------------------
 
-/** The right-hand side of one top-level assignment, as the script actually writes it. */
+/**
+ * The right-hand side of the one SCRIPT-SCOPE assignment, as the script actually writes it.
+ *
+ * Resolved through shellConstant() rather than by an anchor on the name (o3d-secops): most of
+ * these declarations begin `readonly` now, and a `^NAME=` match would simply have stopped finding
+ * them. shellConstant() also refuses a script that assigns the name twice, which the anchor would
+ * have taken the first of.
+ */
 function assignment(source: string, name: string): string {
-  const match = new RegExp(`^${name}=(.*)$`, 'm').exec(source)
-  assert.notEqual(match, null, `the script must define ${name}`)
-  return (match as RegExpExecArray)[1]
+  const line = shellConstant(source, name)
+  const at = line.indexOf(`${name}=`)
+  assert.notEqual(at, -1, `the script must define ${name}`)
+  return line.slice(at + name.length + 1)
 }
 
 test('all three entrypoints resolve the cutover namespace from the same expression', () => {
@@ -7519,7 +7527,8 @@ test('every entrypoint defines what the shared fence library reads', () => {
 
   for (const [label, lines] of [['update.sh', UPDATE_LINES], ['deploy.sh', DEPLOY_LINES], ['install.sh', INSTALL_LINES]] as const) {
     const source = lines.filter((line) => !/^\s*#/.test(line)).join('\n')
-    const missing = [...needed].filter((name) => !new RegExp(`(^|\\n)\\s*(export\\s+)?${name}=`).test(source))
+    // `readonly` is a declaration prefix here too since o3d-secops.
+    const missing = [...needed].filter((name) => !new RegExp(`(^|\\n)\\s*((export|readonly)\\s+)?${name}=`).test(source))
     assert.deepEqual(missing, [], `${label} sources the fence library but never assigns what it reads`)
     // AND IT REALLY SOURCES IT, from its own directory rather than from an application path.
     assert.match(
