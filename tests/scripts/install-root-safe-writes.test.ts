@@ -959,6 +959,218 @@ test('[o3d-rn10] publish_root_anchored refuses a parent that belongs to neither 
   assert.match(rootOwned.stdout, /^rc=0$/m, `a root-owned parent must be anchored regardless of who runs this: ${rootOwned.stdout}${rootOwned.stderr}`)
 })
 
+// ---------------------------------------------------------------------------
+// THE ANCHOR'S OWN ANCESTRY (o3d-rn10 r4). Round 3 asked one question of the candidate's PARENT
+// and asked it of a pathname. A parent nobody else can write into is worth nothing if somebody
+// else can rename the parent — the question recurses, and `/` is the only place it stops.
+// ---------------------------------------------------------------------------
+
+test('[o3d-rn10] the anchor refuses a candidate whose GRANDPARENT can be written by somebody else, though its parent cannot', (t) => {
+  const root = createTempDirSync('ims-rn10-ancestry-', t)
+  // `/home/app/guard/state` — the finding's own example. `guard` is beyond reproach and `/home/app`
+  // is the service account's, so `guard` can be renamed aside wholesale and a tree of the
+  // attacker's left at that name with `state` a symlink inside it.
+  const outer = join(root, 'outer')
+  const parent = join(outer, 'parent')
+  const state = join(parent, 'state')
+  mkdirSync(state, { recursive: true })
+  chmodSync(outer, 0o755)
+  chmodSync(parent, 0o755)
+
+  const publish = (): Run => runBash(rig(PUBLISHER, [
+    `printf 'phase=stopping\\n' | publish_durable_file "${join(state, 'DEPLOY-FENCED')}" "" 600`,
+    'echo "rc=$?"',
+  ].join('\n'), roots({ data: state })))
+
+  // The layout as an operator would leave it: every directory on the way owned by the publishing
+  // account and closed to everyone else. This must keep working, or the anchor is just a refusal.
+  assert.match(publish().stdout, /^rc=0$/m, 'a candidate with a clean ancestry must still publish')
+  assert.equal(readFileSync(join(state, 'DEPLOY-FENCED'), 'utf8'), 'phase=stopping\n')
+
+  // And now the one change: the GRANDPARENT becomes a directory somebody else can rename inside.
+  // Expressed with a mode, because an unprivileged harness cannot make a directory owned by
+  // another account — it is the same standing ${APP_USER} has on /home/app.
+  chmodSync(outer, 0o775)
+
+  // NOT VACUOUS: the parent itself is still exactly what round 3 admitted — owned by the account
+  // running the publication, with no group or other write bit. A check that stopped at the parent
+  // would have to say yes.
+  const parentStat = statSync(parent)
+  assert.equal(parentStat.mode & 0o777, 0o755, 'the parent must still be 0755')
+  assert.equal(parentStat.uid, process.getuid?.(), 'and still owned by the publishing account')
+  const anchored = runBash(rig([...ANCHOR], `publish_root_anchored "${state}"; echo "rc=$?"`))
+  assert.match(anchored.stdout, /^rc=1$/m, 'a candidate whose grandparent is writable must not be a root')
+
+  // The state the first, LEGITIMATE publication left — `.ims-publish` included, which that run
+  // created and does not remove. Snapshotted rather than spelled out, so what the next lines
+  // measure is what the REFUSED run added, and not the difference between two shapes of success.
+  const before = readdirSync(state).sort()
+  assert.deepEqual(before, ['.ims-publish', 'DEPLOY-FENCED'], 'the first publication must have staged and landed')
+
+  const refused = publish()
+  assert.match(refused.stdout, /^rc=1$/m, 'and the publication must be refused rather than resolved')
+  assert.deepEqual(readdirSync(state).sort(), before,
+    'nothing new may be created under it — no staging directory, no temporary')
+  assert.deepEqual(readdirSync(join(state, '.ims-publish')), [],
+    'and nothing may be left inside the staging directory the earlier run made')
+  assert.equal(readFileSync(join(state, 'DEPLOY-FENCED'), 'utf8'), 'phase=stopping\n',
+    'and the marker the first publication left must be untouched')
+
+  // AND BACK: the grandparent is the discriminator, and nothing else changed.
+  chmodSync(outer, 0o755)
+  assert.match(publish().stdout, /^rc=0$/m, 'closing the grandparent again must restore the publication')
+})
+
+test('[o3d-rn10] the anchor refuses a candidate reached through a SYMLINKED ancestor, and publishes into the same directory named directly', (t) => {
+  const root = createTempDirSync('ims-rn10-linkancestor-', t)
+  const real = join(root, 'real')
+  const state = join(real, 'parent', 'state')
+  mkdirSync(state, { recursive: true })
+  // An ancestor that is a name for somewhere else. `cd -P` on the way down would follow it and the
+  // walk would then be proving things about a path nobody stated; the root is the ONE component
+  // this publisher follows a link through, and it earns that by having a proven parent.
+  const link = join(root, 'link')
+  symlinkSync(real, link)
+  const viaLink = join(link, 'parent', 'state')
+
+  const refused = runBash(rig(PUBLISHER, [
+    `printf 'PWNED\\n' | publish_durable_file "${join(viaLink, 'DEPLOY-FENCED')}" "" 600`,
+    'echo "rc=$?"',
+  ].join('\n'), roots({ data: viaLink })))
+
+  // NOT VACUOUS: the link is real, and it resolves to the very directory the next assertion
+  // publishes into successfully — so the refusal is about the SPELLING and not about the target.
+  assert.equal(lstatSync(link).isSymbolicLink(), true)
+  assert.equal(statSync(viaLink).ino, statSync(state).ino)
+
+  assert.match(refused.stdout, /^rc=1$/m, 'an ancestor resolved by following a link is an ancestor taken on trust')
+  assert.deepEqual(readdirSync(state), [], 'and nothing may be written through it')
+
+  const allowed = runBash(rig(PUBLISHER, [
+    `printf 'phase=stopping\\n' | publish_durable_file "${join(state, 'DEPLOY-FENCED')}" "" 600`,
+    'echo "rc=$?"',
+  ].join('\n'), roots({ data: state })))
+  assert.match(allowed.stdout, /^rc=0$/m, allowed.stderr)
+  assert.equal(readFileSync(join(state, 'DEPLOY-FENCED'), 'utf8'), 'phase=stopping\n')
+})
+
+test('[o3d-rn10] the anchor credits the sticky bit on an ANCESTOR and never on the parent', (t) => {
+  const root = createTempDirSync('ims-rn10-sticky-', t)
+  const mid = join(root, 'mid')
+  const parent = join(mid, 'parent')
+  const candidate = join(parent, 'candidate')
+  mkdirSync(candidate, { recursive: true })
+  chmodSync(parent, 0o755)
+
+  const ask = (dir: string, extra = ''): Run =>
+    runBash(rig([...ANCHOR], `publish_root_anchored "${dir}"; echo "rc=$?"`, extra))
+
+  // An ancestor anybody may write into is an ancestor anybody may rename `parent` inside.
+  chmodSync(mid, 0o777)
+  assert.match(ask(candidate).stdout, /^rc=1$/m, 'a world-writable ancestor must refuse the candidate')
+
+  // The SAME directory with the sticky bit set is /tmp's own mode, and it is the reason every
+  // harness in this file can build an anchored root at all: sticky lets anybody create entries and
+  // lets only the entry's owner move one, so `parent` — which exists, and belongs to the account
+  // running this — cannot be swapped out from under the walk.
+  chmodSync(mid, 0o1777)
+  assert.match(ask(candidate).stdout, /^rc=0$/m, 'sticky must be credited for an ancestor whose entry we own')
+
+  // AND THE OWNERSHIP HALF OF THAT CREDIT, which is the half that makes it sound rather than
+  // convenient. `/tmp` is root-owned and 1777 on this machine, and the mkdtemp directory inside it
+  // belongs to whoever runs this suite — so a run whose privileged account is somebody ELSE is a
+  // run for which that entry is a third party's and the sticky bit protects nothing of theirs.
+  assert.equal(statSync('/tmp').mode & 0o7777, 0o1777, '/tmp must be sticky and world-writable, or this assertion states nothing')
+  assert.equal(statSync(root).uid, process.getuid?.(), 'and the temp directory must belong to this account')
+  assert.match(ask(candidate, 'id() { printf "%s\\n" 424242; }').stdout, /^rc=1$/m,
+    'sticky must NOT be credited for an entry that belongs to neither root nor the privileged account')
+
+  // AND NEVER FOR THE PARENT, because on a first install the root does not exist yet and sticky
+  // says nothing about who gets to CREATE an entry. This is the /tmp/ims-state case, one level in.
+  chmodSync(mid, 0o755)
+  chmodSync(parent, 0o1777)
+  assert.match(ask(candidate).stdout, /^rc=1$/m, 'a sticky PARENT must still refuse the candidate')
+})
+
+/**
+ * THE WINDOW THE ANCHOR USED TO LEAVE OPEN, BUILT RATHER THAN ARGUED (o3d-rn10 r4, Codex HIGH).
+ *
+ * Round 3's shape was: publish_root_anchored() stats the parent BY PATHNAME and says yes;
+ * pin_dir_beneath_root() then runs `mkdir -p "$root"` and `cd -P "$root"` — two more resolutions of
+ * the same pathname, after the check and independent of it. Everything between the two is a window,
+ * and the entry into the root is the one step this publisher takes on a name rather than on an
+ * inode, so anything landing in that window aims it.
+ *
+ * THE SWAP IS INJECTED BY A SHIM ON `mkdir`, WHICH IS THE FIRST THING THE ACTING PATH DOES AND THE
+ * ONLY `mkdir` EITHER SHAPE REACHES BEFORE IT ENTERS THE ROOT. Selecting the root does not run
+ * `mkdir` at all — publish_trust_root() only ever stats — so the shim cannot fire during the
+ * lexical pass, and it fires at the same instant for the fixed publisher and for the round-3 one:
+ * after the parent has been accepted, before the root has been entered. That is what makes this a
+ * race and not two different tests.
+ *
+ * WHAT THE FIXED PUBLISHER DOES WITH IT: nothing, because by then it is not holding a pathname. The
+ * walk ended INSIDE the parent, `mkdir` and `cd -P` are given one relative component, and the
+ * kernel resolves them from the directory this process is standing in — which the rename moved a
+ * name away from and could not move the process out of. The publication lands in the operator's
+ * real directory under its new name, and the attacker's tree is never entered.
+ *
+ * MEASURED BY MUTATION, ROUTE STATED. Restoring round 3's two lines in scripts/install.sh —
+ * `publish_root_anchored "$root"` followed by `mkdir -p "$root"` and `cd -P "$root"` — makes this
+ * test fail with PWNED in the victim directory, because the absolute `cd -P` resolves the
+ * attacker's `parent` and follows the `state` symlink they left in it.
+ */
+test('[o3d-rn10] a parent replaced AFTER the anchor accepted it does not redirect the publication', (t) => {
+  const root = createTempDirSync('ims-rn10-swap-', t)
+  const anchor = join(root, 'anchor')
+  const parent = join(anchor, 'parent')
+  const state = join(parent, 'state')
+  const victim = join(root, 'victim')
+  mkdirSync(state, { recursive: true })
+  mkdirSync(victim)
+  writeFileSync(join(victim, 'DEPLOY-FENCED'), 'UNTOUCHED\n')
+  // 0700 and owned by the publishing uid, so that every check made AFTER the entry would pass on
+  // it: the only thing that can keep this publication out of here is where the entry went.
+  chmodSync(victim, 0o700)
+
+  const log = join(root, 'swapped.log')
+  const bin = shimDir(t, {
+    // FIRES ONCE, on the first `mkdir` of the run, and does what ${APP_USER} can do to a parent
+    // whose own parent they own: rename it aside, put a directory of their own at the name, and
+    // leave a symlink inside it at the name the publisher is about to enter.
+    mkdir: [
+      `if [[ ! -e ${q(log)} ]]; then`,
+      `  ims_shim_append ${q(log)} "swapped"`,
+      `  ${REAL.mv} ${q(parent)} ${q(`${parent}.real`)}`,
+      `  ${REAL.mkdir} ${q(parent)}`,
+      `  ${REAL.ln} -s ${q(victim)} ${q(join(parent, 'state'))}`,
+      'fi',
+      `exec ${REAL.mkdir} "$@"`,
+    ].join('\n'),
+  })
+
+  const run = runBash(rig(PUBLISHER, [
+    `printf 'phase=stopping\\n' | publish_durable_file "${join(state, 'DEPLOY-FENCED')}" "" 600`,
+    'echo "rc=$?"',
+  ].join('\n'), roots({ data: state })), { env: { PATH: `${bin}:${process.env.PATH ?? ''}` } })
+
+  // NOT VACUOUS: the swap really happened, in this run, and the plant is still standing at the
+  // moment the assertions look at it. A shim that never fired would leave every line below true
+  // for the boring reason.
+  assert.equal(readFileSync(log, 'utf8').trim(), 'swapped', 'the swap must have been injected exactly once')
+  assert.equal(lstatSync(join(parent, 'state')).isSymbolicLink(), true,
+    'the attacker directory must still hold a symlink at the name the publisher was entering')
+  assert.equal(statSync(join(parent, 'state')).ino, statSync(victim).ino, 'and it must resolve to the victim')
+
+  assert.match(run.stdout, /^rc=0$/m, `the publication must go through, into the directory it pinned: ${run.stderr}`)
+  assert.equal(readFileSync(join(`${parent}.real`, 'state', 'DEPLOY-FENCED'), 'utf8'), 'phase=stopping\n',
+    'and it must land in the operator\'s own directory, which the rename moved but did not replace')
+
+  assert.equal(readFileSync(join(victim, 'DEPLOY-FENCED'), 'utf8'), 'UNTOUCHED\n',
+    'the directory the planted link chose must not be written into')
+  assert.deepEqual(readdirSync(victim).sort(), ['DEPLOY-FENCED'],
+    'and nothing may be created inside it — no staging directory, no temporary')
+})
+
 /**
  * EVERY SHIPPED PUBLICATION, AND THE DIRECTORY IT LANDS IN (o3d-rn10).
  *
@@ -1132,6 +1344,92 @@ test('[o3d-rn10] deploy.sh and update.sh carry the SAME publisher as install.sh,
         `${script}: ${name}() has drifted from scripts/install.sh. Every regression for the anchor, the demotion and the nested override in this file runs install.sh's copy; a divergent one here is untested code on a root-side write. Re-sync it, or give this entrypoint its own regressions.`)
     }
   }
+})
+
+/**
+ * AND THE PARITY TEST READS THE DEFINITION BASH WOULD RUN, WHICH IT DID NOT (o3d-rn10 r4, Codex).
+ *
+ * shellFunction() used `indexOf` and shellConstant() used `find`, so both returned the FIRST
+ * textual definition in the file. Bash does not: a later definition REPLACES an earlier one, and a
+ * later assignment replaces an earlier one. So appending
+ *
+ *     publish_root_anchored() { return 0; }
+ *
+ * to scripts/deploy.sh left the test above comparing install.sh's canonical body against deploy.sh's
+ * canonical body — equal, passing — while deploy.sh itself ran the stub and every root became a
+ * trusted root. The vacuity was in the check built LAST ROUND to close a vacuity: the byte-identity
+ * claim had been prose, it was made a check, and the check read the wrong copy.
+ *
+ * THE ORDER IS THE FIX. Uniqueness is asserted BEFORE the comparison, because a comparison over a
+ * symbol defined twice is meaningless whichever copy it picks — it is not a weaker guarantee, it is
+ * not a guarantee. The assertion lives in tests/scripts/shell-symbol.ts, so it holds for the
+ * behavioural rigs too, which lifted the first definition the same way.
+ *
+ * ROUTE: this is the extractor the test above calls, on the file that test reads, given the bypass
+ * Codex demonstrated. The mutation is the pre-fix reading, reproduced here as firstDefinition() and
+ * firstAssignment() so the vacuity is MEASURED rather than described — both are shown returning
+ * install.sh's text, byte for byte, out of a file carrying a second definition.
+ */
+test('[o3d-rn10] a publisher symbol defined twice fails the parity extractor instead of being compared on its first copy', () => {
+  const DEPLOY = readFileSync(join(REPO, 'scripts/deploy.sh'), 'utf8')
+
+  /** The pre-fix reading of a function: the first `\nname() {\n` and the next `}` in column 0. */
+  const firstDefinition = (source: string, name: string): string => {
+    const start = source.indexOf(`\n${name}() {\n`)
+    const rest = source.slice(start + 1)
+    return rest.slice(0, rest.indexOf('\n}\n') + 2)
+  }
+  /** The pre-fix reading of a constant: the first line that starts with `NAME=`. */
+  const firstAssignment = (source: string, name: string): string =>
+    source.split('\n').find((l) => l.startsWith(`${name}=`)) ?? ''
+
+  // NOT VACUOUS: the shipped files extract cleanly and agree, so what fails below is the duplicate
+  // and not some unrelated strictness the extractor grew.
+  for (const name of PUBLISHER) {
+    assert.equal(shellFunction(DEPLOY, name), shellFunction(INSTALL_SH, name), `${name}() must be shared to begin with`)
+  }
+  assert.equal(shellConstant(DEPLOY, 'PUBLISH_STAGE_DIRNAME'), shellConstant(INSTALL_SH, 'PUBLISH_STAGE_DIRNAME'))
+
+  // THE BYPASS. A second top-level definition, appended where nobody reads, of the one function the
+  // whole trust-root mechanism rests on. Under bash this is the publisher deploy.sh executes.
+  const bypassed = `${DEPLOY}\npublish_root_anchored() {\n  return 0\n}\n`
+
+  // THE VACUITY, MEASURED: the old reading hands back install.sh's body byte for byte, so the
+  // comparison it feeds passes on a file whose effective publisher is `return 0`.
+  assert.equal(firstDefinition(bypassed, 'publish_root_anchored'), shellFunction(INSTALL_SH, 'publish_root_anchored'),
+    'the first-definition reading must still agree with install.sh — that agreement IS the finding')
+
+  assert.throws(() => shellFunction(bypassed, 'publish_root_anchored'), /defines publish_root_anchored\(\) 2 times/,
+    'the extractor must refuse a file that carries two definitions, rather than pick one')
+
+  // Every form bash accepts, not just the one Codex typed: a `function` keyword and an indentation
+  // are not a different bug. An appended definition inside another function is effective the moment
+  // that function runs, so it counts too.
+  for (const bypass of [
+    '\nfunction publish_root_anchored() {\n  return 0\n}\n',
+    '\nfunction publish_root_anchored {\n  return 0\n}\n',
+    '\nlate_wiring() {\n  publish_root_anchored() {\n    return 0\n  }\n}\n',
+  ]) {
+    assert.throws(() => shellFunction(`${DEPLOY}${bypass}`, 'publish_root_anchored'), /2 times/,
+      `a second definition written as ${JSON.stringify(bypass.trim().split('\n')[0])} must be refused too`)
+  }
+
+  // AND THE CONSTANT, which aims the staging directory every publication passes through.
+  const reassigned = `${DEPLOY}\nPUBLISH_STAGE_DIRNAME="../../attacker"\n`
+  assert.equal(firstAssignment(reassigned, 'PUBLISH_STAGE_DIRNAME'), shellConstant(INSTALL_SH, 'PUBLISH_STAGE_DIRNAME'),
+    'the first-assignment reading must still agree with install.sh')
+  assert.throws(() => shellConstant(reassigned, 'PUBLISH_STAGE_DIRNAME'), /assigns PUBLISH_STAGE_DIRNAME 2 times/,
+    'a second top-level assignment must be refused, not skipped')
+  for (const prefix of ['export ', 'readonly ', 'declare -r ']) {
+    assert.throws(() => shellConstant(`${DEPLOY}\n${prefix}PUBLISH_STAGE_DIRNAME="../../attacker"\n`, 'PUBLISH_STAGE_DIRNAME'),
+      /2 times/, `a second assignment written as \`${prefix}NAME=\` must be refused too`)
+  }
+
+  // A DELETED SYMBOL IS STILL THE OTHER FAILURE, and still fails: uniqueness means exactly one, and
+  // "none" is not one. This is the direction the previous round already had, kept here so a rewrite
+  // of the extractor cannot trade one for the other.
+  assert.throws(() => shellFunction(DEPLOY.replace('\npublish_root_anchored() {\n', '\nremoved_publisher() {\n'), 'publish_root_anchored'),
+    /must define publish_root_anchored\(\)/)
 })
 
 // ---------------------------------------------------------------------------
