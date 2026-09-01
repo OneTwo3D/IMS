@@ -27,27 +27,12 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync,
 import { join } from 'node:path'
 import test, { type TestContext } from 'node:test'
 
+import { shellConstant, shellConstantOptional, shellFunction } from './shell-symbol.ts'
 import { createTempDirSync } from './temp-dir.ts'
 
 const REPO = process.cwd()
 const INSTALL_SH = readFileSync(join(REPO, 'scripts/install.sh'), 'utf8')
 
-/** The text of one top-level shell function, from `name() {` to the `}` in column 0. */
-function shellFunction(source: string, name: string): string {
-  const start = source.indexOf(`\n${name}() {\n`)
-  assert.notEqual(start, -1, `scripts/install.sh must define ${name}()`)
-  const rest = source.slice(start + 1)
-  const end = rest.indexOf('\n}\n')
-  assert.notEqual(end, -1, `${name}() must be closed by a } in column 0`)
-  return rest.slice(0, end + 2)
-}
-
-/** One `NAME="value"` assignment in column 0, lifted rather than re-typed. */
-function shellConstant(source: string, name: string): string {
-  const line = source.split('\n').find((l) => l.startsWith(`${name}=`))
-  assert.ok(line, `scripts/install.sh must define ${name} on one line`)
-  return line
-}
 
 /**
  * The rig. `die` is a STUB and not the subject: install.sh's own is `die() { error "$*"; exit 1; }`
@@ -1043,8 +1028,14 @@ for (const script of ENTRYPOINTS) {
     assert.equal(callSites.length, spec.callSites,
       `${script} has ${callSites.length} publication call sites; this test accounts for ${spec.callSites}. Add the new one and prove its destination has a root:\n${callSites.join('\n')}`)
 
+    // ONE ASSIGNMENT PER FILE, ASSERTED (o3d-rn10 r4). This used to take the first line starting
+    // with `NAME=`, which is the same vacuity the parity test below carried: a second top-level
+    // assignment appended to an entrypoint would have been the one bash used, and the one this rig
+    // ignored. shellConstantOptional() refuses a file that assigns the name twice, and still lets a
+    // file that does not assign it at all fall through to the shared fence library.
     const constants = PUBLICATION_CONSTANTS
-      .map((name) => [source, FENCE_LIB].map((text) => text.split('\n').find((l) => l.startsWith(`${name}=`))).find(Boolean))
+      .map((name) => [[source, script], [FENCE_LIB, 'scripts/lib/db-fence-protected.sh']] as const)
+      .map((pairs, index) => pairs.map(([text, where]) => shellConstantOptional(text, PUBLICATION_CONSTANTS[index], where)).find(Boolean))
       .filter((line): line is string => Boolean(line))
 
     // THE ANCHOR IS STUBBED HERE, AND ONLY HERE (o3d-rn10 r2). The question this test asks is

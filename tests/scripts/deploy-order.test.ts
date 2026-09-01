@@ -15,6 +15,7 @@ import {
   protectedPaths,
   writeFenceCheckout,
 } from './fence-artefact-harness.ts'
+import { shellConstant, shellFunction } from './shell-symbol.ts'
 import { createTempDirSync } from './temp-dir.ts'
 
 // o3d-2sm1.1 — the deploy order is a safety property, not a style choice, so it is
@@ -252,34 +253,19 @@ function phaseEnd(lines: string[], phase: string): number {
   return next === -1 ? lines.length : next
 }
 
-/**
- * The text of one top-level shell function, from `name() {` to the `}` in column 0.
+/*
+ * shellFunction() and shellConstant() come from ./shell-symbol.ts, shared with
+ * install-root-safe-writes.test.ts, and assert that the script defines the symbol EXACTLY ONCE
+ * before handing back its text (o3d-rn10 r4).
  *
- * Used by the durability tests below to RUN the shipped code rather than to describe it:
- * a re-implementation of the marker writer would pass while the script wrote something
- * else, which is the failure mode this whole file exists to prevent.
+ * They are used by the durability tests below to RUN the shipped code rather than to describe it:
+ * a re-implementation of the marker writer would pass while the script wrote something else, which
+ * is the failure mode this whole file exists to prevent. publish_durable_file() reads
+ * PUBLISH_STAGE_DIRNAME, which scripts/install.sh ALSO has to prune out of its recursive chown over
+ * ${DATA_DIR}, so that name is lifted too rather than re-typed. Taking the FIRST of two definitions
+ * is the same failure wearing a different hat — bash runs the LAST one — so the extractor refuses a
+ * script that carries two.
  */
-function shellFunction(source: string, name: string): string {
-  const start = source.indexOf(`\n${name}() {\n`)
-  assert.notEqual(start, -1, `the script must define ${name}()`)
-  const rest = source.slice(start + 1)
-  const end = rest.indexOf('\n}\n')
-  assert.notEqual(end, -1, `${name}() must be closed by a } in column 0`)
-  return rest.slice(0, end + 2)
-}
-
-/**
- * One `NAME="value"` assignment in column 0, lifted rather than re-typed (o3d-czpy).
- *
- * publish_durable_file() reads PUBLISH_STAGE_DIRNAME, which scripts/install.sh ALSO has to prune
- * out of its recursive chown over ${DATA_DIR}. A harness that re-typed the name would keep passing
- * while the two came apart, which is the whole reason the name is stated once in the script.
- */
-function shellConstant(source: string, name: string): string {
-  const line = source.split('\n').find((l) => l.startsWith(`${name}=`))
-  assert.ok(line, `the script must define ${name} on one line`)
-  return line
-}
 
 /**
  * The durability primitives every marker and cron-backup writer now goes through, taken
