@@ -1253,8 +1253,9 @@ and neither does anything under a directory the application account owns.
   a symlink; symlink the data directory itself instead, which is a root nothing else covers.
 * An override **outside every other root** whose parent is writable by anyone but root — say
   `IMS_CUTOVER_STATE_DIR=/home/deploy/state` — is refused. The run fails, loudly, at the first
-  publication, rather than writing root-owned state into a directory somebody else can redirect. Setting any of them in
-`APP_DIR/.env` does nothing: the application user owns that file, and since o3d-2sm1.5 r25 none of
+  publication, rather than writing root-owned state into a directory somebody else can redirect.
+
+Setting any of them in `APP_DIR/.env` does nothing: the application user owns that file, and since o3d-2sm1.5 r25 none of
 the three entrypoints puts it into a shell's environment at all — each reads the handful of keys it
 needs out of it by name, so an `IMS_*` line in it never becomes a variable anywhere. Until o3d-2sm1.5 `deploy.sh` kept its own set under
 `/var/lib/ims-deploy` while the other two used the paths above, so following the banner after a
