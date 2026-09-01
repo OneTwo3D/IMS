@@ -1096,27 +1096,64 @@ async function loadCogsByOrder(client: SalesFulfillmentAnalyticsClient, window: 
 const INCONSISTENT_NOTICE_NAME_LIMIT = 10
 
 /**
- * THE CONTRADICTED CUSTOMERS BY NAME, SO THE NOTICE CAN BE ACTED ON FROM ANY PAGE (o3d-7jfq r3).
+ * ONE CONTRADICTED CUSTOMER, LABELLED SO THAT NO OTHER GROUP CAN WEAR THE SAME LABEL (o3d-7jfq r4).
+ *
+ * A NAME IS NOT AN IDENTIFIER. Round 3 handed the notice `customerName` alone, on the reasoning
+ * that the Customer column renders it and so it is what an operator reads down the page for. The
+ * first half of that is right and the second half does not follow: rows are grouped on
+ * `customerId ?? guest-email:… ?? guest-name:…`, and `customerName` is neither unique across those
+ * keys nor non-empty. Two guests called `John Smith` are two rows and one label, and a notice that
+ * says `John Smith` when a clean John Smith is also on the page names a row the operator cannot
+ * find — which is the off-page failure this list exists to close, arrived at from the other side.
+ *
+ * SO THE LABEL CARRIES EVERY FIELD THAT SEPARATES ONE GROUP FROM ANOTHER, and it is injective over
+ * distinct groups by exhaustion of the key:
+ *   • two `customerId` groups     — different ids, and the id is printed;
+ *   • a `customerId` and a guest  — one prints an id, the other prints `guest`;
+ *   • two `guest-email` groups    — different emails (the key lower-cases, so same-email-different-
+ *                                    case is ONE group), and the email is printed;
+ *   • `guest-email` vs `guest-name` — one has an email, the other has none;
+ *   • two `guest-name` groups     — the same name IS the same key, so there is no such pair.
+ * The synthesised guest key itself is deliberately NOT printed: it is a pure function of the email
+ * and the name, so it separates nothing those two do not already separate, and printing
+ * `guest-name:<name>` raw would re-import the delimiter hazard the quoting below exists to remove.
+ *
+ * AND EVERY PART OF IT IS SOMETHING THE OPERATOR CAN LOOK AT. The name is the Customer column, the
+ * email is the Email column, and `customerId` is a column of the CSV export this notice already
+ * points at. A label built from a field nobody can see would identify the row to the code and not
+ * to the person.
+ *
+ * QUOTED, AND THE QUOTES ARE DOUBLED INSIDE. Semicolons separate the entries because a company name
+ * may contain a comma — and a company name may contain a semicolon too, at which point an unquoted
+ * list is a list a reader cannot split. Every entry therefore begins with `"` and the name ends at
+ * its closing quote, so `; ` inside a name cannot be mistaken for the separator. An empty stored
+ * name renders as `""`, which is the honest label for a row whose Customer cell is empty, and is
+ * still visibly one entry rather than a gap between two separators.
+ */
+function inconsistentCustomerLabel(row: Pick<CustomerReportRow, 'customerId' | 'customerName' | 'customerEmail'>): string {
+  const name = row.customerName.replaceAll('"', '""')
+  const email = row.customerEmail ?? '(no email)'
+  return `"${name}" ${email} [${row.customerId ?? 'guest'}]`
+}
+
+/**
+ * THE CONTRADICTED CUSTOMERS, SO THE NOTICE CAN BE ACTED ON FROM ANY PAGE (o3d-7jfq r3).
  *
  * The count is computed over every group and the rows are then PAGINATED, so on a report longer
  * than a page the customers the notice is about can all rank outside the slice on screen — the
  * notice then announces a problem with nothing visible that carries it. That is the same complaint
  * that made over-costing its own status rather than a line in a summary: a count cannot tell an
  * operator WHICH customer to go and look at, and a count on page 1 about a row on page 4 is that
- * failure with an extra step. Names, not ids: the Customer column renders `customerName`, so the
- * identifier the notice hands over is the one the operator will be reading down the page for.
- *
- * Semicolons separate them because a company name may contain a comma, and a list a reader cannot
- * split is not a list of identifiers.
+ * failure with an extra step. What each one is called is `inconsistentCustomerLabel`.
  *
  * Capped, because a notice is one line of prose and a data incident could contradict hundreds. The
  * overflow is not dropped: it is COUNTED, said out loud, and pointed at the CSV export, which is
  * built with `paginate: false` and carries `costEvidence` on every row — so the complete answer
  * always exists somewhere the notice names, however long the list gets.
  */
-function namedInconsistentCustomers(names: string[]): string {
-  const shown = names.slice(0, INCONSISTENT_NOTICE_NAME_LIMIT)
-  const rest = names.length - shown.length
+function namedInconsistentCustomers(labels: string[]): string {
+  const shown = labels.slice(0, INCONSISTENT_NOTICE_NAME_LIMIT)
+  const rest = labels.length - shown.length
   const overflow = rest > 0
     ? `, and ${rest} more not named here — the CSV export is not paginated and stamps every one of them costEvidence=inconsistent`
     : ''
@@ -1164,11 +1201,22 @@ const COSTED_QTY_TOLERANCE = new Prisma.Decimal('0.000001')
  * AND EXCESS IS NOT A GAP — it is CONTRADICTORY EVIDENCE, so it is reported apart from a shortfall.
  * Both withhold, because neither supports a profit figure. But an incomplete order resolves itself:
  * the rest ships, the rest is costed, and next month's report publishes. Contradictory evidence
- * never resolves, means the COGS ledger itself is double-posted — which silently overstates cost in
- * every OTHER report that sums `CogsEntry.totalCostBase` — and is acted on by deleting an entry, not
- * by waiting. Folding the two into one boolean would send an operator looking for a missing entry
- * that is not missing, and the report's own notice names its causes: an unnamed third cause makes
- * that notice a false statement about the row in front of them.
+ * never resolves and is acted on by examining the entries, not by waiting. Folding the two into one
+ * boolean would send an operator looking for a missing entry that is not missing, and the report's
+ * own notice names its causes: an unnamed third cause makes that notice a false statement about the
+ * row in front of them.
+ *
+ * WHAT THIS PROVES IS A QUANTITY, AND ONLY A QUANTITY (o3d-7jfq r4). `Σ CogsEntry.qty >
+ * StockMovement.qty` is a fact about units; nothing here reads `totalCostBase` at all. The natural
+ * next sentence — "so every report summing COGS overstates cost by the duplicate" — is one step
+ * further than the comparison goes, and this function's own callers show why: a positive-quantity
+ * dispatch costed at ZERO is explicitly permitted upstream, so a doubled entry set for one of those
+ * is contradictory on quantity while the money it sums to is correct. Malformed quantity beside a
+ * correct total has the same shape. Nor is there a cheap PROVEN excess to publish instead: which
+ * entries are the spurious ones is not recoverable from the sums, and an assignment of the total
+ * that puts all of it on the legitimate units is always available, so the greatest overstatement
+ * this evidence *proves* is zero. The status therefore reports the quantity contradiction, and the
+ * notice offers duplicated money as the usual cause rather than asserting it.
  *
  * AND THE TOLERANCE BELONGS TO ONE SIDE ONLY (o3d-7jfq round 3). Carrying the same band into both
  * arms looked like symmetry and was not. The band exists to absorb the FIFO engine's own
@@ -1438,7 +1486,7 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
   // only place where "which customers" and "in the order the operator will page through them" are
   // both true. A second walk over `groups` for the count would be a second thing to get wrong, and
   // a count that disagreed with the names beneath it would be worse than either alone.
-  const inconsistentCustomers = rows.filter((row) => row.costEvidence === 'inconsistent').map((row) => row.customerName)
+  const inconsistentCustomers = rows.filter((row) => row.costEvidence === 'inconsistent').map(inconsistentCustomerLabel)
   const paged = paginate(rows, filters, deps?.paginate !== false)
   return {
     generatedAt: generatedAt.toISOString(),
@@ -1481,7 +1529,7 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
       // Named separately, and only when there is one: it is the cause an operator has to ACT on,
       // and the only one of the three that will still be here next month if nobody does.
       ...(inconsistentCustomers.length > 0
-        ? [`${inconsistentCustomers.length} of ${groups.size} customers are withheld as INCONSISTENT rather than incomplete: an in-period dispatch carries COGS entries for more units than the movement moved, which the FIFO engine cannot produce and most often means the entries were posted twice. Nothing further will ship to complete these — the posted cost has to be corrected. Until it is, every report that sums COGS entries is overstating cost by the duplicate. ${namedInconsistentCustomers(inconsistentCustomers)}`]
+        ? [`${inconsistentCustomers.length} of ${groups.size} customers are withheld as INCONSISTENT rather than incomplete: an in-period dispatch carries COGS entries for more units than the movement moved, which the FIFO engine cannot produce. What is proven here is the QUANTITY — the costed quantity exceeds the quantity that moved. Whether money was duplicated with it is NOT proven here: duplicate entries are the usual cause, and where they are the cause every figure that sums CogsEntry.totalCostBase overstates cost by the duplicate — but the same excess quantity can be carried by entries posted at no cost at all, whose money is right. Read the entries against the dispatch before altering any posted cost. Either way nothing further will ship to resolve this; it stands until somebody corrects the entries. ${namedInconsistentCustomers(inconsistentCustomers)}`]
         : []),
       'Non-inventory lines — services, fees, delivery charges — book no stock movement and post no cost, so they are not asked to show a dispatch and an order made only of them is fully costed at zero. A variable-parent line is not exempt: goods do leave for it and cannot be traced to it, so its cost is unknown and the order is withheld.',
       REFUND_BASIS_NOTICE_CUSTOMER_MIX,
