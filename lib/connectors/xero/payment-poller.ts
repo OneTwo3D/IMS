@@ -218,6 +218,20 @@ function registrationText(verdict: RegisteredPaymentVerdict, reason: WithheldAmo
         + `is IMS's own silence and not proof of a reversal. Check the payment in the sales channel: if `
         + `it is genuinely gone, reverse the order by hand; if it stands, register the receipt so the `
         + `two agree.`
+    // o3d-psrx r7 (Codex HIGH 1): the registrations that went missing were only ever PART of this
+    // order's balance, and the rest of it is still marked as never having had a ledger receipt. Said
+    // with both numbers, because the operator's question is "part of what?" and the answer decides
+    // whether they go to the ledger or to the order.
+    case 'PART_COVERED_OFF_LEDGER':
+      return ` The payment registration(s) IMS raised for this order (${verdict.paymentIds.join(', ') || 'none readable'}) `
+        + `${verdict.registeredTotal == null
+          ? 'do not record how much they sent'
+          : `cover only ${verdict.registeredTotal} of its ${verdict.documentTotal} total`}, and the order is `
+        + `still marked as having been paid with no ledger receipt behind it. So the ledger's figure is an `
+        + `account of PART of this balance, and the remainder was never in any ledger to have been removed `
+        + `from. Reversing the whole order here would raise a chargeback credit note over money nobody took `
+        + `back. Record the remaining receipt against the order, or reverse it by hand if the payment really `
+        + `is gone.`
     case 'GONE':
       return ''
   }
@@ -531,6 +545,25 @@ function salesWithheldDescription(
   // looking on /sync for a row that was never raised. Said separately rather than patched with a
   // clause, because the remedy is different too: nothing will arrive on its own if the registration
   // was refused.
+  // o3d-psrx r7 (Codex HIGH 1): the same objection as RECEIPT_NOT_REGISTERED below, one step later in
+  // the receipt's life. The zero-paid sentence in the `reason` switch asserts that IMS holds a
+  // registration THIS READ CANNOT SPEAK FOR and that IMS "will decide this by itself once a read
+  // covers those registrations" — both false here. The read covered them perfectly well; they simply
+  // do not add up to the order, and no later poll changes that. Stating it as an in-flight
+  // registration would send an operator to /sync to wait for something that has already happened.
+  if (verdict.verdict === 'PART_COVERED_OFF_LEDGER') {
+    return `Invoice for order ${ref} is ${invoice.Status} in Xero showing `
+      + `${ledgerAmountText(invoice.AmountPaid)} paid, which normally means a payment was removed. `
+      + `paidAt was LEFT SET and NO chargeback credit note was raised: the payment registration(s) IMS `
+      + `raised for this order `
+      + `${verdict.registeredTotal == null
+        ? 'do not record how much they sent'
+        : `cover only ${verdict.registeredTotal} of its ${verdict.documentTotal} total`}, and the order is `
+      + `still held as paid on evidence the ledger was never given. The ledger's figure is therefore an `
+      + `account of PART of this balance; the rest of it was never in any ledger to be taken away. `
+      + `Record the remaining receipt against the order, or unwind the order by hand if the payment is `
+      + `genuinely gone.`
+  }
   if (verdict.verdict === 'RECEIPT_NOT_REGISTERED') {
     return `Invoice for order ${ref} is ${invoice.Status} in Xero showing `
       + `${ledgerAmountText(invoice.AmountPaid)} paid, which normally means a payment was removed. `

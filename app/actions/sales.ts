@@ -103,6 +103,7 @@ import {
   expectedSalesOrderLineTaxForeign,
   validateSalesOrderLineTaxInputs,
 } from '@/lib/domain/sales/sales-order-tax-validation'
+import { coversDocumentTotal } from '@/lib/domain/accounting/paid-coverage'
 import { decideChargebackOrderDiscount, resolvePostedOrderDiscount } from '@/lib/domain/accounting/posted-order-discount'
 import { invoiceNumberIsExternallySupplied, resolveSalesInvoiceNumberForPost } from '@/lib/domain/accounting/sales-invoice-number'
 import { decideChargebackDiscountLine, readPostedSalesInvoiceDiscountForOrder } from '@/lib/domain/accounting/posted-document-discount'
@@ -3488,7 +3489,12 @@ export async function addPayment(input: {
       // So the same test decides both writes: do the non-refund receipts on this order, THIS ONE
       // INCLUDED, cover its total? That is already the test `becamePaid` applies; it is simply not
       // the only branch that needs it.
-      const coversOrderTotal = !refundId && totalPaid + input.amount >= Number(so.totalForeign) - 0.0001
+      //
+      // r7 (Codex HIGH 1): and it is now the test the REVERSAL READER applies too, spelt once in
+      // `coversDocumentTotal`. The reader refuses to treat a part-covering registration's absence as a
+      // reversal of the whole order while this marker stands, which is only sound while its comparison
+      // and this one are the same comparison. See lib/domain/accounting/paid-coverage.ts.
+      const coversOrderTotal = !refundId && coversDocumentTotal(totalPaid + input.amount, Number(so.totalForeign))
       const becamePaid = !so.paidAt && coversOrderTotal
       if (becamePaid) {
         await tx.salesOrder.update({
@@ -3747,7 +3753,9 @@ async function removePaymentAndSettlePaidAt(
     if (p.currency !== input.currency) return sum
     return sum + Number(p.amount)
   }, 0)
-  const stillFullyPaid = totalPaid >= Number(input.totalForeign) - 0.0001
+  // r7 (Codex HIGH 1): the same spelling `addPayment` clears the marker on and the same spelling the
+  // reversal reader's coverage guard asks. See lib/domain/accounting/paid-coverage.ts.
+  const stillFullyPaid = coversDocumentTotal(totalPaid, Number(input.totalForeign))
   // Only a genuine paid → not-paid transition is a mismatch. An order that was never fully paid
   // (e.g. shipped on credit terms) isn't flagged just because a partial payment was removed.
   const becameUnpaid = input.paidAt !== null && !stillFullyPaid

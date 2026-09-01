@@ -254,6 +254,20 @@ export function qboWithheldReversalReason(verdict: RegisteredPaymentVerdict): st
       return `QuickBooks still lists the payment IMS registered (${verdict.paymentIds.join(', ')}) on a `
         + 'document it reports as unpaid. That contradiction is not proof of a reversal, so paidAt was '
         + 'LEFT SET. Reconcile the document in QuickBooks.'
+    // o3d-psrx r7 (Codex HIGH 1). REACHABLE FROM THIS CONNECTOR, and by the route the header above
+    // describes: QuickBooks enumerates no payments, so a document with a posted registration lands on
+    // LEDGER_DID_NOT_LIST_PAYMENTS — which `zeroPaidIsProvenReversal` ADMITS. A £1 registration on a
+    // £100 order marked paid off-ledger therefore reversed the whole £100 here exactly as it did on
+    // the Xero side, and the guard that stops it lives in the shared classifier for that reason.
+    case 'PART_COVERED_OFF_LEDGER':
+      return `IMS holds this as paid on evidence QuickBooks was never given, and the payment `
+        + `registration(s) it did raise `
+        + `${verdict.registeredTotal == null
+          ? 'do not record how much they sent'
+          : `cover only ${verdict.registeredTotal} of the order's ${verdict.documentTotal} total`}. `
+        + `A balance due is therefore an account of PART of this order; the rest of it was never in `
+        + `QuickBooks to be removed. paidAt was LEFT SET and no chargeback credit note was raised. `
+        + `Record the remaining receipt, or unwind the order by hand if the payment is genuinely gone.`
     case 'GONE':
     case 'NOTHING_REGISTERED':
     case 'LEDGER_DID_NOT_LIST_PAYMENTS':

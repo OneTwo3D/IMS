@@ -127,6 +127,29 @@ export function payloadPaymentId(payload: unknown): string | null {
 }
 
 /**
+ * HOW MUCH A REGISTRATION TOLD THE LEDGER ABOUT, IN A NAMED CURRENCY (o3d-psrx r7, Codex HIGH 1).
+ *
+ * The enqueue writes `amount` and `currency` into the payload from the receipt it was raised for, and
+ * this is the durable record of what was actually SENT. The local `Payment` row is not a substitute:
+ * it can be deleted, and its amount can be corrected, while the money that reached the ledger cannot.
+ *
+ * `currency` IS PART OF THE ANSWER, NOT A DETAIL. The coverage test this feeds compares against
+ * `SalesOrder.totalForeign`, which is stated in the ORDER's currency; a registration raised in another
+ * covers none of it, and adding the two numbers would be arithmetic across two units. A payload that
+ * does not state its currency therefore answers NULL rather than "presumably the order's".
+ *
+ * NULL IS "THIS PAYLOAD WILL NOT SAY", and every caller must read it that way rather than as zero or
+ * as full cover. A row from before these fields existed, and one retention-compacted to `{}`
+ * (o3d-m5qk), both answer NULL.
+ */
+export function payloadRegisteredAmount(payload: unknown, currency: string): number | null {
+  const p = (payload && typeof payload === 'object' ? payload : {}) as Record<string, unknown>
+  if (typeof p.currency !== 'string' || p.currency !== currency) return null
+  if (typeof p.amount !== 'number' || !Number.isFinite(p.amount)) return null
+  return p.amount
+}
+
+/**
  * WHICH LEDGER DOCUMENT A REGISTRATION WAS RAISED AGAINST (o3d-hbgo; o3d-psrx r4, Codex HIGH).
  *
  * Both INVOICE_PAYMENT and BILL_PAYMENT put `accountingInvoiceId` in the payload at enqueue time, and

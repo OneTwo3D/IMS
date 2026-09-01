@@ -11,7 +11,7 @@ import {
   type RegisteredPaymentVerdict,
 } from '@/lib/connectors/xero/invoice-delta'
 import { storedBodyMayHaveReachedTheLedger } from '@/lib/domain/accounting/followup-idempotency'
-import { payloadAccountingInvoiceId, payloadPaymentId } from '@/lib/domain/accounting/invoice-payment-enqueue'
+import { payloadAccountingInvoiceId, payloadPaymentId, payloadRegisteredAmount } from '@/lib/domain/accounting/invoice-payment-enqueue'
 
 // ---------------------------------------------------------------------------
 // Payment-reversal detection (audit-M-acct #3)
@@ -168,10 +168,41 @@ export async function readPaidProvenanceVerdicts<T extends PaidProvenanceDoc>(
       payload: true,
     },
   })
+  // o3d-psrx r7 (Codex HIGH 1) — WHAT EACH DOCUMENT'S PAID FLAG IS FOR, AND IN WHICH CURRENCY.
+  //
+  // READ HERE RATHER THAN TAKEN FROM THE CALLER'S `docs`, and that is the point. The r3 defect was a
+  // poller asking a question the row could answer and never selecting the column that answers it, and
+  // the reader census (tests/accounting/paid-provenance-readers.test.ts) polices exactly one column
+  // against exactly one shape of query. A second connector added next month gets this for free
+  // because the shared reader fetches it, where a new field on `PaidProvenanceDoc` would be one more
+  // thing every poller's select has to remember.
+  //
+  // SALES ONLY. A `PurchaseInvoice` carries no off-ledger marker (o3d-a3wx), so the coverage guard
+  // this feeds is unreachable from the bill pass and there is nothing for a total to decide.
+  const documentTotals = new Map<string, { total: number; currency: string }>()
+  if (params.referenceType === 'SalesOrder') {
+    const orders = await db.salesOrder.findMany({
+      where: { id: { in: scoped.map((d) => d.id) } },
+      // `totalForeign` and NOT `totalBase`: the receipts and the registrations are both recorded in
+      // the order's own currency, and this is the number `addPayment`'s coverage test compares
+      // against. Comparing against a base-currency total would put an FX rate inside a reversal
+      // decision. `currency` comes with it because a sum across two of them is not a sum.
+      select: { id: true, totalForeign: true, currency: true },
+    })
+    for (const order of orders) {
+      const total = Number(order.totalForeign)
+      // An unreadable total is NOT zero and not "no opinion about coverage": leaving it out of the map
+      // makes `documentTotal` null below, which turns the guard off — the round-6 behaviour — and that
+      // is the only honest thing to do with a number that cannot be read.
+      if (Number.isFinite(total)) documentTotals.set(order.id, { total, currency: order.currency })
+    }
+  }
+
   const byDocument = new Map<string, RegisteredPaymentRow[]>()
   const receiptsNamedByDocument = new Map<string, { status: string; paymentId: string | null }[]>()
   for (const row of rows) {
     const list = byDocument.get(row.referenceId) ?? []
+    const documentCurrency = documentTotals.get(row.referenceId)?.currency ?? null
     list.push({
       id: row.id,
       status: row.status,
@@ -186,6 +217,12 @@ export async function readPaidProvenanceVerdicts<T extends PaidProvenanceDoc>(
       // r5: NULL here is "the payload cannot say", not "nothing can" — the classifier falls back to
       // the ledger's own payment listing for such a row.
       registeredAgainstInvoiceId: payloadAccountingInvoiceId(row.payload),
+      // o3d-psrx r7 (Codex HIGH 1): HOW MUCH this registration told the ledger about, read through
+      // the same helper the enqueue writes it with and in the DOCUMENT's currency — so a registration
+      // raised in another one, or a payload that names no amount, answers null and the coverage guard
+      // withholds rather than guesses. Null for a bill: no currency is resolved for one, and its
+      // classifier arm never asks.
+      registeredAmount: documentCurrency == null ? null : payloadRegisteredAmount(row.payload, documentCurrency),
     })
     byDocument.set(row.referenceId, list)
     const named = receiptsNamedByDocument.get(row.referenceId) ?? []
@@ -227,6 +264,9 @@ export async function readPaidProvenanceVerdicts<T extends PaidProvenanceDoc>(
         accountingInvoiceId: doc.accountingInvoiceId,
         unregisteredPaidAt: doc.unregisteredPaidAt ?? null,
       },
+      // o3d-psrx r7 (Codex HIGH 1): and WHAT THAT PAID FLAG IS FOR. Null for a bill and for any order
+      // whose total could not be read, which leaves the verdict exactly as round 6 reached it.
+      documentTotals.get(doc.id)?.total ?? null,
     ))
   }
   return out

@@ -5,6 +5,8 @@
  * type/status partitioning are where this went wrong before, and both are pure given a fetcher.
  */
 
+import { coversDocumentTotal } from '@/lib/domain/accounting/paid-coverage'
+
 import type { XeroResponse } from './api'
 
 export type XeroInvoice = {
@@ -1054,6 +1056,19 @@ export type RegisteredPaymentRow = {
    * supplies a binding is asking the question.
    */
   registeredAgainstInvoiceId?: string | null
+  /**
+   * o3d-psrx r7 (Codex HIGH 1) — HOW MUCH OF THE DOCUMENT'S TOTAL THIS REGISTRATION SETTLES.
+   *
+   * `payloadRegisteredAmount(row.payload, documentCurrency)`: the amount the enqueue recorded, in the
+   * DOCUMENT's currency, from the payload the registration was raised with. NULL means the payload
+   * will not say — a legacy row, or one retention-compacted to `{}`, or one raised in another
+   * currency — and it is never "zero" and never "all of it".
+   *
+   * OPTIONAL so every existing caller and test keeps its exact previous meaning. It is read only when
+   * a caller also supplies a `documentTotal`, which is the caller saying it wants the coverage
+   * question asked at all.
+   */
+  registeredAmount?: number | null
 }
 
 /**
@@ -1346,6 +1361,25 @@ export type RegisteredPaymentVerdict =
   | { verdict: 'PAID_WITHOUT_LEDGER_RECEIPT' }
   /** The payload did not enumerate the payments, so absence cannot be established from it. */
   | { verdict: 'LEDGER_DID_NOT_LIST_PAYMENTS' }
+  /**
+   * o3d-psrx r7 (Codex HIGH 1) — THE REGISTRATIONS THAT WENT MISSING NEVER COVERED THE WHOLE DOCUMENT.
+   *
+   * The document still carries its off-ledger provenance marker — `SalesOrder.unregisteredPaidAt`,
+   * which `addPayment` clears only when the receipts on the order COVER its total — and the
+   * registrations bound to this paid state settle LESS than that total. So the ledger's silence about
+   * them is an account of a part of the balance, and the rest of it was never in any ledger to be
+   * removed from.
+   *
+   * `registeredTotal` is what the bound registrations state they sent, or NULL when a payload would
+   * not say. NULL is not zero: it is the reason this verdict was reached rather than a measurement,
+   * and coverage that cannot be established cannot be established in either direction.
+   */
+  | {
+      verdict: 'PART_COVERED_OFF_LEDGER'
+      paymentIds: string[]
+      registeredTotal: number | null
+      documentTotal: number
+    }
   /** A registration exists whose effect on the ledger this read cannot speak for. */
   | { verdict: 'REGISTRATION_UNDECIDED'; entryIds: string[] }
 
@@ -1435,9 +1469,24 @@ export function classifyRegisteredPaymentAgainstListing(
    * registration weighs exactly as it did before.
    */
   paidState: PaidStateBinding | null = null,
+  /**
+   * o3d-psrx r7 (Codex HIGH 1) — WHAT THE PAID FLAG IS FOR, AS A NUMBER.
+   *
+   * `SalesOrder.totalForeign`, in the document's own currency, or NULL when the caller is not asking
+   * the coverage question — a bill (which has no off-ledger marker and cannot reach that arm), a test
+   * that predates this parameter, or a read that could not produce the total. NULL leaves every
+   * verdict exactly as round 6 reached it.
+   *
+   * It is read ONLY beside a standing `paidWithoutLedgerReceipt`. See the coverage guard below.
+   */
+  documentTotal: number | null = null,
 ): RegisteredPaymentVerdict {
   const undecided: string[] = []
   const posted: string[] = []
+  // o3d-psrx r7 — THE SAME ROWS AS `posted`, KEPT WHOLE, because the coverage guard needs their
+  // amounts and `posted` is a list of the LEDGER's payment ids. Pushed together, always, so the two
+  // cannot describe different sets.
+  const postedRows: RegisteredPaymentRow[] = []
   // o3d-psrx r4 — POSTED, BUT NOT ABOUT THIS PAID STATE. Kept apart from both other buckets on
   // purpose: counting these as `posted` is the defect Codex found, and DROPPING them would be worse —
   // a document whose only registration is unbound would read as NOTHING_REGISTERED, which is an
@@ -1474,6 +1523,7 @@ export function classifyRegisteredPaymentAgainstListing(
         continue
       }
       posted.push(row.externalTransactionId.trim())
+      postedRows.push(row)
       continue
     }
     // Everything else is a registration whose ledger effect is unknown to THIS read: PENDING (about
@@ -1524,13 +1574,71 @@ export function classifyRegisteredPaymentAgainstListing(
   }
 
   const listed = ledgerListedPaymentIds
-  if (listed === null) return { verdict: 'LEDGER_DID_NOT_LIST_PAYMENTS' }
+  if (listed !== null) {
+    const stillHeld = posted.filter((id) => listed.has(id.toLowerCase()))
+    // ALL of them, not any: with two registrations a bill can have one payment removed and one intact,
+    // and clearing paidAt there re-arms Mark Paid for the WHOLE total on top of the surviving payment.
+    // ASKED BEFORE THE COVERAGE GUARD BELOW because it is the more useful of two withholdings: it
+    // names the payment the ledger is still holding, which is the thing an operator has to go and look
+    // at. Both withhold, so the order changes what is SAID and not what is done.
+    if (stillHeld.length > 0) return { verdict: 'STILL_HELD', paymentIds: stillHeld }
+  }
 
-  const stillHeld = posted.filter((id) => listed.has(id.toLowerCase()))
-  // ALL of them, not any: with two registrations a bill can have one payment removed and one intact,
-  // and clearing paidAt there re-arms Mark Paid for the WHOLE total on top of the surviving payment.
-  if (stillHeld.length > 0) return { verdict: 'STILL_HELD', paymentIds: stillHeld }
+  // o3d-psrx r7 (Codex HIGH 1) — THE COVERAGE GUARD. IT DOMINATES BOTH REMAINING ANSWERS, AND BOTH OF
+  // THEM ARE ADMITTED REVERSALS.
+  //
+  // THE DEFECT. Round 6 made the WRITER keep `SalesOrder.unregisteredPaidAt` through a partial
+  // receipt: a £1 receipt on a £100 order marked paid off-ledger no longer erased the provenance of
+  // the other £99. This READER consults that marker only in the `posted.length === 0` arm above — so
+  // the moment the £1 receipt's registration posted and bound, the marker was never asked again. An
+  // empty ledger listing then produced GONE, `zeroPaidIsProvenReversal` admitted it, and
+  // `raiseChargebackForReversedOrder` unwound the WHOLE £100 against a customer who paid.
+  //
+  // Round 6 argued against making readers amount-aware, on the grounds that the marker is a BOOLEAN
+  // fact about the whole balance. That is right about the marker and wrong about this reader, which
+  // is already deciding whether one registration's absence justifies reversing a specific total. The
+  // amount is its business. The marker stays boolean; this one comparison is where the number enters.
+  //
+  // WHAT IT ASKS: while the document still says its paid flag was entered with no ledger receipt
+  // behind it, do the registrations bound to THAT flag settle its total? If they do, their removal is
+  // a removal of the whole balance and the ledger's answer stands unchanged. If they do not — or if a
+  // payload will not say how much it sent — the ledger's silence is an account of a PART, and the
+  // remainder was never in any ledger to be taken away from.
+  //
+  // COVERAGE THAT CANNOT BE ESTABLISHED IS NOT COVERAGE (`covered === null`). It is the same reading
+  // `LEDGER_DID_NOT_LIST_PAYMENTS` gives an absent `Payments[]` and `databaseStampedCompletion` gives
+  // an unvouched timestamp, and the population it withholds is vanishingly small: a compacted payload
+  // names no document either, so such a row only reaches `posted` at all when the LEDGER named the
+  // document for it — and a ledger that lists the payment has already produced STILL_HELD above.
+  //
+  // IT IS SELF-DISCHARGING, which is what stops it becoming a permanent withholding. The marker is a
+  // property of the order, not of this read: the receipt that completes the cover clears it at the
+  // write site, and this guard then does not run at all.
+  if (paidWithoutLedgerReceipt && documentTotal != null) {
+    const covered = sumRegisteredAmounts(postedRows)
+    if (covered === null || !coversDocumentTotal(covered, documentTotal)) {
+      return { verdict: 'PART_COVERED_OFF_LEDGER', paymentIds: posted, registeredTotal: covered, documentTotal }
+    }
+  }
+
+  if (listed === null) return { verdict: 'LEDGER_DID_NOT_LIST_PAYMENTS' }
   return { verdict: 'GONE', paymentIds: posted }
+}
+
+/**
+ * What these registrations state they sent, or NULL if ANY of them will not say (o3d-psrx r7).
+ *
+ * One unreadable row makes the whole sum unreadable rather than smaller. A sum with a hole in it is
+ * not a smaller sum, it is a number that means nothing — and the direction the hole would push the
+ * comparison depends entirely on which row it is in.
+ */
+function sumRegisteredAmounts(rows: readonly RegisteredPaymentRow[]): number | null {
+  let total = 0
+  for (const row of rows) {
+    if (typeof row.registeredAmount !== 'number' || !Number.isFinite(row.registeredAmount)) return null
+    total += row.registeredAmount
+  }
+  return total
 }
 
 /**
@@ -1593,6 +1701,11 @@ export function zeroPaidIsProvenReversal(verdict: RegisteredPaymentVerdict): boo
     // silence — the same asymmetry as every other arm: a wrongly withheld reversal is a warning a
     // human clears, a wrongly admitted one raises a chargeback credit note against a paid sale.
     case 'PAID_WITHOUT_LEDGER_RECEIPT':
+    // o3d-psrx r7 (Codex HIGH 1): the registrations that went missing covered PART of a document
+    // whose paid flag is still marked off-ledger, so the ledger's account of them is an account of
+    // part of the balance. Reversing the whole of it raises a chargeback credit note over the
+    // remainder — which no ledger ever held, and so cannot have taken away.
+    case 'PART_COVERED_OFF_LEDGER':
       return false
   }
 }
