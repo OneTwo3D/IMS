@@ -1761,10 +1761,13 @@ function publishStageAfter(form: string): string {
  * tests/scripts/shell-symbol.ts, which is the extractor the parity test above and the
  * publication-target tests call, on the file they read.
  *
- * MUTATION: restore the anchor — make constantAssignmentOffsets() keep only the offsets that start
- * their line, behind the old optional declaration prefix — and 9 of the 12 forms below stop
- * throwing (all but the three written `export`/`readonly`/`declare -r` at column 0), so the loop
- * fails 9 times. Verified by making that edit and running this test.
+ * MUTATION, run two ways. Put the WHOLE pre-o3d-1dk9 reading back — the per-line regex, no mask,
+ * no scope, no cross-check — and 9 of the 12 forms below stop being refused at all (every one
+ * except the three written `export`/`readonly`/`declare -r` at column 0), so the loop fails at its
+ * first. Re-apply the anchor to the RAW reading only, leaving the cross-check in place, and the
+ * guard still goes red on all 12 — but as a disagreement with bash's parse rather than as a count,
+ * which is why the assertion below pins the message and not merely that something threw. Both
+ * edits were made and this test was run under each.
  */
 test('[o3d-1dk9] a second script-scope assignment of a publisher constant is refused wherever it stands', () => {
   const DEPLOY = readFileSync(join(REPO, 'scripts/deploy.sh'), 'utf8')
@@ -1822,9 +1825,11 @@ test('[o3d-1dk9] a second script-scope assignment of a publisher constant is ref
  * ROUTE: shellConstant() on scripts/deploy.sh with each form appended.
  *
  * MUTATION: drop the scope filter in constantAssignmentOffsets() — count every assignment the mask
- * carries — and the four function-scoped forms throw `assigns PUBLISH_STAGE_DIRNAME 2 times`, so
- * the loop fails 4 times. Widen it the other way instead (scan the raw source rather than the mask)
- * and the comment, the quoted echo and the here-document fail too. Verified by making both edits.
+ * carries — and all four `local`-in-a-body spellings start throwing `2 script-scope assignments`,
+ * so the loop fails at its first. Widen it the other way instead (read the raw source rather than
+ * the mask) and two more do: the comment and the here-document. And the pre-o3d-1dk9 reading in the
+ * test above makes the LAST assertion here fail, the indented assignment outside a body. All three
+ * edits were made and this test was run under each.
  */
 test('[o3d-1dk9] an assignment inside a function body is not a script-scope assignment', () => {
   const DEPLOY = readFileSync(join(REPO, 'scripts/deploy.sh'), 'utf8')
@@ -1862,10 +1867,11 @@ test('[o3d-1dk9] an assignment inside a function body is not a script-scope assi
  *
  * ROUTE: shellConstantAssignments() on scripts/deploy.sh with each construct appended.
  *
- * MUTATION: make braceGroupExtent() return `[from, from]` for a body it does not recognise instead
- * of throwing — the "assume it is empty" reading — and the three body forms stop refusing and start
- * returning a count of 2, so the loop fails 3 times. Delete the `eval` check and the fourth case
- * fails too. Verified by making both edits.
+ * MUTATION: make braceGroupExtent() return an EMPTY extent for a body it does not recognise
+ * instead of throwing — the "assume it is empty" reading — and all three body forms stop refusing,
+ * so the loop fails at its first. Replace the `eval` scan in constantAssignmentOffsets() with an
+ * empty list and the eval case below fails too. Both edits were made and this test was run under
+ * each.
  */
 test('[o3d-1dk9] a function body whose extent cannot be determined refuses instead of returning a count', () => {
   const DEPLOY = readFileSync(join(REPO, 'scripts/deploy.sh'), 'utf8')
@@ -1913,6 +1919,13 @@ test('[o3d-1dk9] a function body whose extent cannot be determined refuses inste
  *
  * ROUTE: shellConstantOptional() and shellFunctionBodyCount() over `git ls-files '*.sh'` — the same
  * extractor the parity test and the publication-target tests go through.
+ *
+ * MUTATION, on the SUBJECT rather than the scanner, because a census that cannot go red on the code
+ * it walks is a walk and not a census. Appending `true; APP_DIR="/tmp/attacker"` to
+ * scripts/backup.sh — which still passes `bash -n` — turns this red on a second script-scope
+ * assignment; appending `census_probe() ( : )` turns it red on a body that is not a brace group.
+ * Neither is visible to the function census below, which stayed green under both. Both edits were
+ * made against the real file and reverted.
  */
 test('[o3d-1dk9] every publication constant the tracked shell scripts assign still resolves to exactly one', () => {
   const listed = spawnSync('git', ['ls-files', '*.sh'], { cwd: REPO, encoding: 'utf8' })
