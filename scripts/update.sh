@@ -225,16 +225,20 @@ valid_tcp_port() {
   (( 10#$value >= 1 && 10#$value <= 65535 )) || return 1
 }
 
-APP_NAME="one-two-inventory"
+# The protected publication constants in this script are `readonly` at their canonical
+# declaration (o3d-secops, Codex HIGH): a scanner sees `NAME=` words, and `printf -v`, `read`,
+# a nameref and `(( ))` all mutate a variable without being one. See the block above the same
+# declarations in scripts/install.sh for the whole argument.
+readonly APP_NAME="one-two-inventory"
 APP_USER="imsapp"
-APP_DIR="${IMS_APP_DIR:-/opt/${APP_NAME}}"
-DATA_DIR="${IMS_DATA_DIR:-/var/lib/${APP_NAME}}"
+readonly APP_DIR="${IMS_APP_DIR:-/opt/${APP_NAME}}"
+readonly DATA_DIR="${IMS_DATA_DIR:-/var/lib/${APP_NAME}}"
 BACKUP_DIR="${IMS_BACKUP_DIR:-/var/backups/${APP_NAME}}"
 SERVICE_UNIT="${IMS_SERVICE_UNIT:-${APP_NAME}.service}"
-DEPLOY_META_FILE="${APP_DIR}/.deploy-meta"
-DEPLOY_SSH_DIR="${DATA_DIR}/git-ssh"
+readonly DEPLOY_META_FILE="${APP_DIR}/.deploy-meta"
+readonly DEPLOY_SSH_DIR="${DATA_DIR}/git-ssh"
 DEPLOY_SSH_KEY_PATH="${DEPLOY_SSH_DIR}/id_ed25519"
-DEPLOY_SSH_KNOWN_HOSTS="${DEPLOY_SSH_DIR}/known_hosts"
+readonly DEPLOY_SSH_KNOWN_HOSTS="${DEPLOY_SSH_DIR}/known_hosts"
 
 NO_GIT=false
 SKIP_BUILD=false
@@ -521,13 +525,13 @@ BACKUP_FILE=""
 # against a namespace holding none of it. So all four paths are resolved by the SAME
 # expression in all three scripts, defaulting to the application data directory — what the
 # installed unit's AssertPathExists= already names and what docs/installation.md documents.
-CUTOVER_STATE_DIR="${IMS_CUTOVER_STATE_DIR:-${IMS_DEPLOY_STATE_DIR:-${IMS_DATA_DIR:-/var/lib/one-two-inventory}}}"
-FENCE_FILE="${CUTOVER_STATE_DIR}/DEPLOY-FENCED"
-CRON_BACKUP="${CUTOVER_STATE_DIR}/crontab-${APP_USER}.bak"
+readonly CUTOVER_STATE_DIR="${IMS_CUTOVER_STATE_DIR:-${IMS_DEPLOY_STATE_DIR:-${IMS_DATA_DIR:-/var/lib/one-two-inventory}}}"
+readonly FENCE_FILE="${CUTOVER_STATE_DIR}/DEPLOY-FENCED"
+readonly CRON_BACKUP="${CUTOVER_STATE_DIR}/crontab-${APP_USER}.bak"
 FENCE_DROPIN_DIR="/etc/systemd/system/${SERVICE_UNIT}.d"
 FENCE_DROPIN_FILE="${FENCE_DROPIN_DIR}/zz-deploy-fence.conf"
-DB_FENCE_DIR="${CUTOVER_STATE_DIR}/deploy"
-DB_FENCE_STATE="${DB_FENCE_DIR}/db-connect-fence.json"
+readonly DB_FENCE_DIR="${CUTOVER_STATE_DIR}/deploy"
+readonly DB_FENCE_STATE="${DB_FENCE_DIR}/db-connect-fence.json"
 # THE ENVIRONMENT THE STARTED SERVICE IS BOUND TO (o3d-2sm1.5 r23, Codex HIGH).
 #
 # Rounds 13-22 asked, in eleven spellings, WHICH DATABASE THE SERVICE WILL USE, and every answer
@@ -579,8 +583,8 @@ DB_FENCE_STATE="${DB_FENCE_DIR}/db-connect-fence.json"
 # other. The same reasoning is why nothing else in this script resolves a privileged path from a
 # variable the application can set — and since r25 the file is READ rather than executed, so an
 # IMS_* line in it never becomes a variable in this shell in the first place. See the load above.
-DB_ENV_SNAPSHOT_DIR="/etc/ims-cutover"
-DB_ENV_SNAPSHOT_FILE="${DB_ENV_SNAPSHOT_DIR}/db-identity-snapshot.env"
+readonly DB_ENV_SNAPSHOT_DIR="/etc/ims-cutover"
+readonly DB_ENV_SNAPSHOT_FILE="${DB_ENV_SNAPSHOT_DIR}/db-identity-snapshot.env"
 DB_ENV_SNAPSHOT_DROPIN_NAME="zz-deploy-db-identity.conf"
 # install.sh has had this line since r23; update.sh did not, and used the variable in FIVE places
 # inside publish_db_identity_snapshot() and remove_db_identity_binding(). Under `set -u` the
@@ -1842,7 +1846,7 @@ fsync_path() {
 # ONE NAME, STATED ONCE, because scripts/install.sh also has to PRUNE it out of the recursive
 # `chown -h ${APP_USER}` it runs over ${DATA_DIR}: half this function's targets live under that
 # directory, and a staging directory handed to the service account is not a staging directory.
-PUBLISH_STAGE_DIRNAME=".ims-publish"
+readonly PUBLISH_STAGE_DIRNAME=".ims-publish"
 
 # THE TRUSTED ANCESTORS EVERY publish_durable_file() DESTINATION IS REACHED FROM (o3d-rn10).
 #

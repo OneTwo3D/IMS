@@ -5072,10 +5072,13 @@ test('the environment snapshot lives at a literal path in all three entrypoints,
   // MUTATION ROUTE: put `${IMS_CUTOVER_ENV_DIR:-...}` back in any one of the three and the
   // equality below fails, naming the script that reintroduced it.
   for (const entry of R9_SCRIPTS) {
-    const line = entry.source.split(/\r?\n/).find((candidate) => candidate.startsWith('DB_ENV_SNAPSHOT_DIR='))
+    // Read through shellConstant() rather than by line prefix (o3d-secops): the declaration is
+    // `readonly` now, and it also has to stay the ONLY script-scope assignment, which is what
+    // shellConstant() refuses a second one for.
+    const line = shellConstant(entry.source, 'DB_ENV_SNAPSHOT_DIR', entry.name)
     assert.equal(
       line,
-      'DB_ENV_SNAPSHOT_DIR="/etc/ims-cutover"',
+      'readonly DB_ENV_SNAPSHOT_DIR="/etc/ims-cutover"',
       `${entry.name} must resolve the snapshot directory to a literal: an override only a root-owned source may set is indistinguishable from no override, and one an app-owned source CAN set is the finding`,
     )
   }
@@ -5471,7 +5474,9 @@ const MENTION_SHAPES: ReadonlyArray<{ why: string; match: RegExp }> = (
     { why: 'a file-shape or readability test opening a block', match: '(el)?if \\[\\[[^\\]]*\\]\\]; then' },
     { why: 'a file-shape or readability test guarding a refusal', match: '\\[\\[[^\\]]*\\]\\] \\|\\| die "[^"]*"' },
     // The path itself, assigned to a name.
-    { why: 'a path assignment', match: `(local )?[A-Za-z_][A-Za-z0-9_]*="(${APP_OWNED_PATH})"` },
+    // `readonly` is one of the prefixes now (o3d-secops): ${DEPLOY_META_FILE} is a protected
+    // publication constant, so its declaration carries the word bash refuses mutations with.
+    { why: 'a path assignment', match: `((local|readonly) )?[A-Za-z_][A-Za-z0-9_]*="(${APP_OWNED_PATH})"` },
     // Path canonicalisation for the EnvironmentFile= comparison — readlink resolves, it does not
     // read. Spelled out in full rather than as a fragment: this is one line in each script.
     {

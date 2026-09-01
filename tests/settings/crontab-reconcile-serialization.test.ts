@@ -19,6 +19,8 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import test, { mock } from 'node:test'
 
+import { shellConstant } from '../scripts/shell-symbol.ts'
+
 // ---------------------------------------------------------------------------
 // Codex r21 HIGH + r22 HIGH x2 — THE CRONTAB HAS EXACTLY ONE EXCLUSION PROTOCOL,
 // AND EVERY WRITER JOINS IT.
@@ -1088,9 +1090,11 @@ test('[o3d-batch-ret] the census fails on a FIFTEENTH writer, wherever it is put
 const COMPOSED_LOCK_NAMES = ['CRONTAB_LOCK_DIR', 'CRONTAB_LOCK_FILE']
 async function installerResolves(names: string[]): Promise<Record<string, string>> {
   const defs = names.filter((name) => !COMPOSED_LOCK_NAMES.includes(name)).map((name) => {
-    const line = INSTALL_SH.match(new RegExp(`^${name}="[^"]*"$`, 'm'))
-    assert.ok(line, `scripts/install.sh must define ${name} on one line`)
-    return line![0]
+    // o3d-secops: APP_NAME, APP_DIR and DATA_DIR are protected publication constants and their
+    // declarations begin `readonly`, so the line is resolved by scope rather than by an anchor on
+    // the name — and shellConstant() refuses a script that assigns one of them twice, which a
+    // `^NAME=` match would have taken the first of.
+    return shellConstant(INSTALL_SH, name, 'scripts/install.sh')
   })
   const compose = INSTALL_SH.match(/^crontab_lock_paths "\$\{DATA_DIR\}"$/m)
   assert.ok(compose, 'scripts/install.sh must compose its crontab lock path from ${DATA_DIR} '

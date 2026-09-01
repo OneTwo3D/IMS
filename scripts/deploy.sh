@@ -228,7 +228,11 @@
 
 set -euo pipefail
 
-APP_DIR="${IMS_APP_DIR:-/root/ims/onetwo3d-ims}"
+# The protected publication constants in this script are `readonly` at their canonical
+# declaration (o3d-secops, Codex HIGH): a scanner sees `NAME=` words, and `printf -v`, `read`,
+# a nameref and `(( ))` all mutate a variable without being one. See the block above the same
+# declarations in scripts/install.sh for the whole argument.
+readonly APP_DIR="${IMS_APP_DIR:-/root/ims/onetwo3d-ims}"
 PORT="${IMS_PORT:-3000}"
 # ---------------------------------------------------------------------------
 # THE CUTOVER NAMESPACE, AND THERE IS EXACTLY ONE (o3d-2sm1.5, Codex r9 HIGH).
@@ -250,7 +254,7 @@ PORT="${IMS_PORT:-3000}"
 #
 # ${IMS_CUTOVER_STATE_DIR} overrides it everywhere; ${IMS_DEPLOY_STATE_DIR} and
 # ${IMS_DATA_DIR} are honoured so an operator who already sets either keeps their override.
-CUTOVER_STATE_DIR="${IMS_CUTOVER_STATE_DIR:-${IMS_DEPLOY_STATE_DIR:-${IMS_DATA_DIR:-/var/lib/one-two-inventory}}}"
+readonly CUTOVER_STATE_DIR="${IMS_CUTOVER_STATE_DIR:-${IMS_DEPLOY_STATE_DIR:-${IMS_DATA_DIR:-/var/lib/one-two-inventory}}}"
 # The old name, kept because everything below already reads it. It is the shared directory
 # now, not deploy.sh's private one — which is why nothing here chmods it: it is the
 # application's own data directory, and 700 root-owned would take the uploads away from the
@@ -261,10 +265,10 @@ STATE_DIR="${CUTOVER_STATE_DIR}"
 # held ${DATA_DIR}/update.lock, so "refusing to run two cutovers at once" was true of two
 # deploys and false of a deploy racing an update; install.sh took no lock at all.
 LOCK_FILE="${CUTOVER_STATE_DIR}/cutover.lock"
-FENCE_FILE="${CUTOVER_STATE_DIR}/DEPLOY-FENCED"
+readonly FENCE_FILE="${CUTOVER_STATE_DIR}/DEPLOY-FENCED"
 FENCE_DROPIN_NAME="zz-deploy-fence.conf"
-DB_FENCE_DIR="${CUTOVER_STATE_DIR}/deploy"
-DB_FENCE_STATE="${DB_FENCE_DIR}/db-connect-fence.json"
+readonly DB_FENCE_DIR="${CUTOVER_STATE_DIR}/deploy"
+readonly DB_FENCE_STATE="${DB_FENCE_DIR}/db-connect-fence.json"
 # THE ENVIRONMENT THE STARTED SERVICE IS BOUND TO (o3d-2sm1.5 r23, Codex HIGH).
 #
 # Rounds 13-22 asked, in eleven spellings, WHICH DATABASE THE SERVICE WILL USE, and every answer
@@ -315,8 +319,8 @@ DB_FENCE_STATE="${DB_FENCE_DIR}/db-connect-fence.json"
 # move it edits this line, which is a root-owned change to a root-owned file, reviewed like any
 # other. The same reasoning is why nothing else in this script resolves a privileged path from a
 # variable the application can set — see the deploy-control restore after the .env source.
-DB_ENV_SNAPSHOT_DIR="/etc/ims-cutover"
-DB_ENV_SNAPSHOT_FILE="${DB_ENV_SNAPSHOT_DIR}/db-identity-snapshot.env"
+readonly DB_ENV_SNAPSHOT_DIR="/etc/ims-cutover"
+readonly DB_ENV_SNAPSHOT_FILE="${DB_ENV_SNAPSHOT_DIR}/db-identity-snapshot.env"
 DB_ENV_SNAPSHOT_DROPIN_NAME="zz-deploy-db-identity.conf"
 # The namespace deploy.sh wrote to before this round. Nothing writes here any more, and a
 # run that finds state at these paths IMPORTS it into the canonical namespace before it
@@ -516,7 +520,7 @@ if [[ "${IMS_ALLOW_UNIDENTIFIED_DEV_RESPONDER:-0}" == "1" ]]; then
   ALLOW_UNIDENTIFIED_DEV_RESPONDER=true
 fi
 
-CRON_BACKUP="${CUTOVER_STATE_DIR}/crontab-${APP_USER}.bak"
+readonly CRON_BACKUP="${CUTOVER_STATE_DIR}/crontab-${APP_USER}.bak"
 LEGACY_CRON_BACKUP="${LEGACY_CUTOVER_STATE_DIR}/crontab-${APP_USER}.bak"
 DB_FENCE_SCRIPT="${APP_DIR_REAL}/scripts/fence-db-connections.mjs"
 # ---------------------------------------------------------------------------
@@ -1286,7 +1290,7 @@ fsync_path() {
 # ONE NAME, STATED ONCE, because scripts/install.sh also has to PRUNE it out of the recursive
 # `chown -h ${APP_USER}` it runs over ${DATA_DIR}: half this function's targets live under that
 # directory, and a staging directory handed to the service account is not a staging directory.
-PUBLISH_STAGE_DIRNAME=".ims-publish"
+readonly PUBLISH_STAGE_DIRNAME=".ims-publish"
 
 # THE TRUSTED ANCESTORS EVERY publish_durable_file() DESTINATION IS REACHED FROM (o3d-rn10).
 #

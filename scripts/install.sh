@@ -480,12 +480,47 @@ header() {
 }
 
 # ---------------------------------------------------------------------------
+# WHY EVERY PROTECTED PUBLICATION CONSTANT BELOW IS `readonly` (o3d-secops, Codex HIGH)
+#
+# tests/scripts/shell-symbol.ts proves each of these names is assigned EXACTLY ONCE at script
+# scope, and the entrypoint tests compare the value across all three scripts. That is a claim
+# about ASSIGNMENT SYNTAX, and bash does not need an assignment word to change a variable:
+#
+#     printf -v PUBLISH_STAGE_DIRNAME %s ../../attacker
+#     read PUBLISH_STAGE_DIRNAME <<<'../../attacker'
+#     declare -n ref=PUBLISH_STAGE_DIRNAME; ref=../../attacker
+#     (( PUBLISH_STAGE_DIRNAME = 0 ))
+#
+# Not one of those is a `NAME=` word, all four take effect, and each one re-aims the staging
+# directory every publication passes through — or, for the other names here, the trust root a
+# destination is checked against and the path it is published to. A scanner can only catch them
+# by ENUMERATING them, which is the losing shape three earlier rounds on this branch already
+# replaced with an authority: the command-position rule gave way to a parse fact, the lexer was
+# paired with bash's own parser, the trusted-root list gave way to a walk from /.
+#
+# SO THE AUTHORITY IS BASH. `readonly` at the canonical declaration makes bash refuse every
+# mutation path, including the ones nobody has listed; the scanner keeps the job it can do —
+# proving there is exactly one declaration — and now also asserts the `readonly` is still
+# there, so deleting this word fails a test rather than silently reopening the surface.
+#
+# NOTHING IN ANY ENTRYPOINT REASSIGNS ONE OF THEM. That was checked before this was applied and
+# is asserted by tests/scripts/install-root-safe-writes.test.ts, which also runs each of the four
+# mutations above against the shipped declaration under a real bash and requires a refusal.
+#
+# The two names the same set owns in scripts/lib/db-fence-protected.sh — DB_FENCE_RECOVERY_DIR
+# and DB_FENCE_IDENTITY_FILE — are deliberately NOT readonly: every fence harness sources that
+# library for its shipped bytes and then points its /etc literals at a scratch directory, so
+# `readonly` there would be untestable rather than safe. deploy-order.test.ts asserts instead
+# that no entrypoint reassigns them.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
 # Defaults (overridden by prompts or --non-interactive env vars)
 # ---------------------------------------------------------------------------
-APP_NAME="one-two-inventory"
+readonly APP_NAME="one-two-inventory"
 APP_USER="imsapp"
-APP_DIR="/opt/${APP_NAME}"
-DATA_DIR="/var/lib/${APP_NAME}"
+readonly APP_DIR="/opt/${APP_NAME}"
+readonly DATA_DIR="/var/lib/${APP_NAME}"
 LOG_DIR="/var/log/${APP_NAME}"
 BACKUP_DIR="${DATA_DIR}/backups"
 UPLOAD_STORAGE_DIR="${DATA_DIR}/uploads"
@@ -496,9 +531,9 @@ PUBLIC_UPLOAD_STORAGE_DIR="${DATA_DIR}/public-uploads"
 # directory and the application derives it from $STATE_DIRECTORY (lib/crontab-reconcile-lock.ts).
 NGINX_CONF="/etc/nginx/sites-available/${APP_NAME}"
 NODE_VERSION="22"
-DEPLOY_SSH_DIR="${DATA_DIR}/git-ssh"
+readonly DEPLOY_SSH_DIR="${DATA_DIR}/git-ssh"
 DEPLOY_SSH_KEY_PATH="${DEPLOY_SSH_DIR}/id_ed25519"
-DEPLOY_SSH_KNOWN_HOSTS="${DEPLOY_SSH_DIR}/known_hosts"
+readonly DEPLOY_SSH_KNOWN_HOSTS="${DEPLOY_SSH_DIR}/known_hosts"
 
 # ---------------------------------------------------------------------------
 # THE UPGRADE CUTOVER FENCE (o3d-2sm1.3)
@@ -673,13 +708,13 @@ CUTOVER_STEP="startup"
 # So all four paths are resolved by the SAME expression in all three scripts, defaulting to
 # the application data directory — what the installed unit's AssertPathExists= already names
 # and what docs/installation.md documents for a manual fence.
-CUTOVER_STATE_DIR="${IMS_CUTOVER_STATE_DIR:-${IMS_DEPLOY_STATE_DIR:-${IMS_DATA_DIR:-/var/lib/one-two-inventory}}}"
-FENCE_FILE="${CUTOVER_STATE_DIR}/DEPLOY-FENCED"
-CRON_BACKUP="${CUTOVER_STATE_DIR}/crontab-${APP_USER}.bak"
+readonly CUTOVER_STATE_DIR="${IMS_CUTOVER_STATE_DIR:-${IMS_DEPLOY_STATE_DIR:-${IMS_DATA_DIR:-/var/lib/one-two-inventory}}}"
+readonly FENCE_FILE="${CUTOVER_STATE_DIR}/DEPLOY-FENCED"
+readonly CRON_BACKUP="${CUTOVER_STATE_DIR}/crontab-${APP_USER}.bak"
 FENCE_DROPIN_DIR="/etc/systemd/system/${APP_NAME}.service.d"
 FENCE_DROPIN_FILE="${FENCE_DROPIN_DIR}/zz-deploy-fence.conf"
-DB_FENCE_DIR="${CUTOVER_STATE_DIR}/deploy"
-DB_FENCE_STATE="${DB_FENCE_DIR}/db-connect-fence.json"
+readonly DB_FENCE_DIR="${CUTOVER_STATE_DIR}/deploy"
+readonly DB_FENCE_STATE="${DB_FENCE_DIR}/db-connect-fence.json"
 # THE ENVIRONMENT THE STARTED SERVICE IS BOUND TO (o3d-2sm1.5 r23, Codex HIGH).
 #
 # Rounds 13-22 asked, in eleven spellings, WHICH DATABASE THE SERVICE WILL USE, and every answer
@@ -732,8 +767,8 @@ DB_FENCE_STATE="${DB_FENCE_DIR}/db-connect-fence.json"
 # variable the application can set. This script never put ${APP_DIR}/.env into its environment at
 # all — it reads one key at a time with env_file_value() — and since r25 update.sh does the same,
 # so no IMS_* line in that file becomes a variable in any of the three entrypoints.
-DB_ENV_SNAPSHOT_DIR="/etc/ims-cutover"
-DB_ENV_SNAPSHOT_FILE="${DB_ENV_SNAPSHOT_DIR}/db-identity-snapshot.env"
+readonly DB_ENV_SNAPSHOT_DIR="/etc/ims-cutover"
+readonly DB_ENV_SNAPSHOT_FILE="${DB_ENV_SNAPSHOT_DIR}/db-identity-snapshot.env"
 DB_ENV_SNAPSHOT_DROPIN_NAME="zz-deploy-db-identity.conf"
 DB_ENV_SNAPSHOT_DROPIN_FILE="${FENCE_DROPIN_DIR}/${DB_ENV_SNAPSHOT_DROPIN_NAME}"
 # THE TRUST ROOT, AT A PATH ALL THREE PRINCIPALS CAN OPEN (o3d-2sm1.5 r46, Codex MEDIUM).
@@ -783,13 +818,13 @@ DB_ENV_SNAPSHOT_DROPIN_FILE="${FENCE_DROPIN_DIR}/${DB_ENV_SNAPSHOT_DROPIN_NAME}"
 # the application can set is not a privileged path. The owner is a literal beside it so the
 # regression rigs — which run as an ordinary user with no root to give a file to, and which lift
 # FUNCTIONS rather than these assignments — can measure the mechanism without measuring `chown`.
-DB_CA_PUBLISH_DIR="/etc/ims-db-ca"
+readonly DB_CA_PUBLISH_DIR="/etc/ims-db-ca"
 DB_CA_PUBLISH_OWNER="root:root"
 # The generation name, in two halves so prune_db_ca_generations() can glob exactly what
 # db_ca_generation_file() emits and nothing else — the publication's own temporary files live in
 # the same directory and must not match.
-DB_CA_GENERATION_PREFIX="db-ca-"
-DB_CA_GENERATION_SUFFIX=".crt"
+readonly DB_CA_GENERATION_PREFIX="db-ca-"
+readonly DB_CA_GENERATION_SUFFIX=".crt"
 # How many generations survive a prune BEYOND the two that are never pruned (this run's, and the one
 # the previous installation was using). Three is two rotations of headroom on a cluster whose CA
 # turns over yearly, and every one of them is a public certificate at 0644 — the cost of keeping
@@ -2570,7 +2605,7 @@ fsync_path() {
 # ONE NAME, STATED ONCE, because scripts/install.sh also has to PRUNE it out of the recursive
 # `chown -h ${APP_USER}` it runs over ${DATA_DIR}: half this function's targets live under that
 # directory, and a staging directory handed to the service account is not a staging directory.
-PUBLISH_STAGE_DIRNAME=".ims-publish"
+readonly PUBLISH_STAGE_DIRNAME=".ims-publish"
 
 # THE TRUSTED ANCESTORS EVERY publish_durable_file() DESTINATION IS REACHED FROM (o3d-rn10).
 #
@@ -3681,7 +3716,7 @@ verify_db_ca_published() {
 # publish_durable_file() gives it mode 0600 before the rename — so it is root-owned and 0600 from
 # the instant its name exists.
 # ---------------------------------------------------------------------------
-DB_ROLE_ROTATION_JOURNAL="${DB_ENV_SNAPSHOT_DIR}/db-role-rotation.journal"
+readonly DB_ROLE_ROTATION_JOURNAL="${DB_ENV_SNAPSHOT_DIR}/db-role-rotation.journal"
 # Set by reconcile_interrupted_role_rotation() when it found a journal and established, from the
 # server, which of the two credentials is live.
 DB_ROTATION_JOURNAL_FOUND=false
@@ -7305,7 +7340,7 @@ else
   fi
 fi
 
-DEPLOY_META_FILE="${APP_DIR}/.deploy-meta"
+readonly DEPLOY_META_FILE="${APP_DIR}/.deploy-meta"
 # PUBLISHED, NOT TRUNCATED-THEN-FILLED (o3d-czpy). ${APP_DIR} belongs to ${APP_USER} by the time an
 # upgrade reaches this line, so `cat >` followed by a `chown` and a `chmod 600` was three root-side
 # operations on a name they can turn into a symlink — the same shape as the `.env` write, over the

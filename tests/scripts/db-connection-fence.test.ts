@@ -80,6 +80,7 @@ import {
   verifyRelease,
 } from '@/scripts/fence-db-connections.mjs'
 import { protectedLibraryLines, writeFenceCheckout } from './fence-artefact-harness.ts'
+import { shellConstant } from './shell-symbol.ts'
 
 /**
  * resolve_fence_script(), lifted verbatim out of a shipped entrypoint (o3d-2sm1.5 r32).
@@ -3186,7 +3187,9 @@ test('o3d-2sm1.5 r23: the snapshot is written verbatim, root-only, and loaded wi
         'warn() { printf "WARN %s\\n" "$*"; }',
         'fsync_path() { sync "$1" 2>/dev/null || true; return 0; }',
         // o3d-czpy: publish_durable_file() stages through a root-owned directory named here.
-        source.split('\n').find((l) => l.startsWith('PUBLISH_STAGE_DIRNAME=')) ?? '',
+        // o3d-secops: the declaration begins `readonly` now, so it is read by scope and not by
+        // the start of a line.
+        shellConstant(source, 'PUBLISH_STAGE_DIRNAME'),
         readShellFunction(source, 'publish_trust_root_candidates'),
         // o3d-rn10 r4: publish_root_anchored() is a subshell around this walk.
         readShellFunction(source, 'pin_publish_root_parent'),

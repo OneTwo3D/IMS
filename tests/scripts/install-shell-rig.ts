@@ -18,6 +18,7 @@ import tls from 'node:tls'
 import pg from 'pg'
 
 import { type Cluster, cleanLibpqEnv, currentUser, shippedFunction } from './real-postgres-cluster.ts'
+import { shellConstant } from './shell-symbol.ts'
 import { createTempDirSync } from './temp-dir.ts'
 
 export const REPO = process.cwd()
@@ -186,11 +187,14 @@ export const CAPTURE_TERMINATOR_ASSIGNMENT = (() => {
  * would agree with itself and with nothing else. Unset, `${dir}/` resolves to the target's own
  * directory and every one of these tests measures a publication that is not the shipped one.
  */
-export const PUBLISH_STAGE_ASSIGNMENT = (() => {
-  const match = /^PUBLISH_STAGE_DIRNAME=.*$/m.exec(INSTALL_SOURCE)
-  assert.ok(match, 'precondition: scripts/install.sh must define PUBLISH_STAGE_DIRNAME')
-  return match[0]
-})()
+/*
+ * LIFTED THROUGH shellConstant(), NOT THROUGH `^NAME=` (o3d-secops). The declaration carries a
+ * `readonly` in front of the name now, and a line anchored to the name would silently stop
+ * finding it — which is the failure this rig exists to prevent. shellConstant() detects the
+ * assignment by SCOPE, still refuses a script that assigns it twice, and returns the whole line
+ * including the `readonly`, which is what a rig that executes it should run.
+ */
+export const PUBLISH_STAGE_ASSIGNMENT = shellConstant(INSTALL_SOURCE, 'PUBLISH_STAGE_DIRNAME', 'scripts/install.sh')
 
 export const DB_CA_ASSIGNMENTS = [
   'DB_CA_ACCEPTED_PEM_LABELS',
@@ -199,11 +203,8 @@ export const DB_CA_ASSIGNMENTS = [
   'DB_CA_GENERATIONS_RETAINED',
   'DB_CA_REFRESH_FAILURE_ADVICE',
 ]
-  .map((name) => {
-    const match = new RegExp(`^${name}=.*$`, 'm').exec(INSTALL_SOURCE)
-    assert.ok(match, `precondition: scripts/install.sh must define ${name} at top level`)
-    return match[0]
-  })
+  // Through the same reader, for the same reason: two of these five are `readonly` now.
+  .map((name) => shellConstant(INSTALL_SOURCE, name, 'scripts/install.sh'))
   .join('\n')
 
 export const ENV_HEREDOC_DEFAULTS = [
@@ -718,10 +719,13 @@ export function caGenerationPath(publishDir: string, caFile: string, trusted = f
     stdio: ['ignore', 'pipe', 'pipe'],
   })
   const digest = createHash('sha256').update(normalized).digest('hex')
-  const prefix = /^DB_CA_GENERATION_PREFIX="([^"]*)"$/m.exec(INSTALL_SOURCE)
-  const suffix = /^DB_CA_GENERATION_SUFFIX="([^"]*)"$/m.exec(INSTALL_SOURCE)
-  assert.ok(prefix && suffix, 'precondition: scripts/install.sh must spell the generation name in two literals')
-  return join(publishDir, `${prefix[1]}${digest}${suffix[1]}`)
+  const [prefix, suffix] = ['DB_CA_GENERATION_PREFIX', 'DB_CA_GENERATION_SUFFIX'].map((name) => {
+    // The VALUE, off the line shellConstant() resolved — the line itself now begins `readonly`.
+    const match = /="([^"]*)"$/.exec(shellConstant(INSTALL_SOURCE, name, 'scripts/install.sh'))
+    assert.ok(match, `precondition: scripts/install.sh must spell ${name} as a double-quoted literal`)
+    return match[1]
+  })
+  return join(publishDir, `${prefix}${digest}${suffix}`)
 }
 
 /**

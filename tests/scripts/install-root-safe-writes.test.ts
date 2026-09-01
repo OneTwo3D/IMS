@@ -1805,7 +1805,7 @@ test('[o3d-1dk9] a second script-scope assignment of a publisher constant is ref
 
   // A DELETED ASSIGNMENT IS THE OTHER FAILURE, and still fails: uniqueness means exactly one, and
   // "none" is not one.
-  assert.throws(() => shellConstant(DEPLOY.replace('\nPUBLISH_STAGE_DIRNAME=', '\nREMOVED_STAGE_DIRNAME='), 'PUBLISH_STAGE_DIRNAME'),
+  assert.throws(() => shellConstant(DEPLOY.replace(`\n${shellConstant(DEPLOY, 'PUBLISH_STAGE_DIRNAME')}`, '\nREMOVED_STAGE_DIRNAME=".ims-publish"'), 'PUBLISH_STAGE_DIRNAME'),
     /must define PUBLISH_STAGE_DIRNAME on one line/)
 })
 
