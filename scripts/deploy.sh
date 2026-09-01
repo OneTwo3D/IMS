@@ -1344,35 +1344,57 @@ publish_trust_root_candidates() {
   printf '%s\n' "${APP_DIR:-}" "${DATA_DIR:-}" "${CUTOVER_STATE_DIR:-}" "${DB_ENV_SNAPSHOT_DIR:-}" "${DB_CA_PUBLISH_DIR:-}" "${DB_FENCE_RECOVERY_DIR:-}"
 }
 
-# WHETHER "$1" MAY BE A STARTING POINT FOR THE WALK: can the service account replace the entry that
-# NAMES it? That is the one property the whole walk rests on, because the root — and only the root
-# — is entered with `cd -P`, which follows a symlink. Everything below it is created with a plain
-# `mkdir`, lstat-ed and inode-checked; the root is taken on trust, so the trust has to be earned.
+# WHETHER "$1" MAY BE A STARTING POINT FOR THE WALK — PROVEN BY WALKING TO IT (o3d-rn10 r4).
 #
-# THE PARENT, AND NOT THE ROOT ITSELF. The root may legitimately BE a symlink (a ${DATA_DIR} on a
-# second disk), may not exist yet on a first install, and is owned by ${APP_USER} by design in two
-# of the six cases. None of that is the question. The question is who can change the directory
-# ENTRY at that name, and that is decided by the containing directory alone.
+# The root, and only the root, is entered with `cd -P`, which follows a symlink. Everything below
+# it is created with a plain `mkdir`, lstat-ed and inode-checked; the root is taken on trust, so
+# the trust has to be earned. What earns it is one property: NO ACCOUNT BUT THE PRIVILEGED ONE CAN
+# CHANGE WHAT THE ROOT'S OWN NAME BINDS TO.
 #
-# OWNED BY ROOT, OR BY WHOEVER IS RUNNING THIS. `id -u` for the same reason publish_durable_file()
-# asks it instead of hardcoding 0: the property is "the privileged account that owns this install",
-# and asking lets the regression rigs measure the mechanism unprivileged. uid 0 is accepted
-# unconditionally as well, because root IS that account by definition — which is also what lets an
-# unprivileged harness resolve the SHIPPED roots under /opt, /var/lib and /etc.
+# ROUND 3 ASKED THAT OF THE PARENT ALONE, AND ASKED IT OF A PATHNAME. `stat "$parent"` answered
+# that the parent was root-owned and 0755, and stopped — so `IMS_CUTOVER_STATE_DIR=/home/app/guard/state`
+# passed with `guard` root-owned 0755 while ${APP_USER} owned /home/app and was free to rename
+# `guard` aside and leave a tree of their own at that name, `state` a symlink inside it. A
+# directory whose own name somebody else can replace anchors nothing, whatever its mode reads. The
+# question recurses, and the only place it terminates is `/`.
 #
-# AND NO GROUP OR OTHER WRITE BIT. Ownership alone is not the property: a root-owned parent that is
-# 0775 with the service group on it is a parent ${APP_USER} can rename inside. The sticky bit is
-# deliberately NOT credited — it would stop them replacing an entry that already exists and says
-# nothing about the first install, where the root does not exist yet and the `mkdir -p` below would
-# find whatever they left at that name. A root under /tmp is therefore REFUSED, which is intended.
+# SO THE ANCHOR IS A WALK FROM `/`, AND IT IS THE SAME WALK pin_dir_beneath_root() PERFORMS BELOW.
+# Each component is lstat-ed (`stat` without `-L`, so a symlinked ancestor reads as "symbolic
+# link" and is REFUSED — an ancestor resolved by name is an ancestor taken on trust), entered with
+# `cd -P`, and the directory we landed in is then required to BE the inode that entry named, with
+# `..` still the directory we came from. An ancestor is never named again after it has been
+# entered, and the walk ends holding the parent as a cwd rather than as a string.
 #
-# WHAT THIS DOES NOT CLAIM. It bounds what the SERVICE ACCOUNT can do to the root's own name; it
-# does not walk the parent's own ancestry, and it resolves the parent PATHNAME rather than pinning
-# it. /opt, /var/lib, /etc and /root are system directories this installer never hands to any
-# account — the same boundary enter_service_subdir() draws, stated here instead of left implicit.
-# POSIX ACLs are not read either: a parent given a write ACL is outside what a mode can express.
-publish_root_anchored() {
-  local root="$1" parent meta owner mode self
+# AND EVERY DIRECTORY ON THE WAY IS ASKED THE CONTAINER QUESTION — of the inode this process is
+# standing in, never of a pathname: is it owned by root or by whoever is running this, and can
+# anybody else write into it? `id -u` for the same reason publish_durable_file() asks it instead of
+# hardcoding 0: the property is "the privileged account that owns this install", and asking lets
+# the regression rigs measure the mechanism unprivileged. uid 0 is accepted unconditionally as
+# well, because root IS that account by definition — which is also what lets an unprivileged
+# harness resolve the SHIPPED roots under /opt, /var/lib and /etc.
+#
+# THE STICKY BIT IS CREDITED FOR AN ANCESTOR AND REFUSED FOR THE PARENT, which is a real
+# distinction and not a convenience. Sticky lets anybody CREATE an entry in the directory and lets
+# only that entry's owner — or the directory's, or root — rename or remove one. For an ANCESTOR
+# that is the whole question: the component already exists and already belongs to the privileged
+# account, so no third party can move it, and whatever they may create beside it is a name this
+# walk will never utter. For the PARENT it is not the question at all, because on a first install
+# THE ROOT DOES NOT EXIST YET: "cannot replace an existing entry" says nothing about who gets to
+# create it. A root directly under /tmp is therefore still refused, and a root inside a 0700
+# directory that /tmp happens to hold is not — which is precisely the difference between the two.
+#
+# WHAT THIS STILL DOES NOT CLAIM. POSIX ACLs are not read: a directory carrying a write ACL is
+# outside anything a mode can express. And the ROOT ITSELF is deliberately not lstat-ed — it may
+# legitimately BE a symlink (a ${DATA_DIR} on a second disk is a supported operator layout) and on
+# a first install it may not exist at all. It is entered from the pinned parent as ONE relative
+# component, so whatever sits at that name was put there by an account that can write into a
+# directory this walk has just proved only the privileged account can write into.
+#
+# IT LEAVES THE CALLING SHELL INSIDE THE PARENT, on success AND part-way down on failure, which is
+# the half the anchor never had. Its only caller that wants an answer rather than a position is
+# publish_root_anchored(), which runs it in a subshell.
+pin_publish_root_parent() {
+  local root="$1" parent rel comp self here entry meta owner mode
   [[ "$root" == /* ]] || return 1
   root="${root%/}"
   # `/` has no parent that could anchor it, and is not a directory anything here publishes under.
@@ -1380,19 +1402,72 @@ publish_root_anchored() {
   parent="${root%/*}"
   [[ -n "$parent" ]] || parent="/"
   self="$(id -u)" || return 1
-  # ONE stat, TAKING TYPE, OWNER AND MODE TOGETHER, so no two of the three can describe different
-  # directories — the same reason the walk below takes `%F|%d:%i` in one call.
-  meta="$(stat -c '%F|%u|%a' "$parent" 2>/dev/null || true)"
-  [[ "${meta%%|*}" == "directory" ]] || return 1
-  meta="${meta#*|}"
-  owner="${meta%%|*}"
-  mode="${meta##*|}"
-  [[ "$owner" == "0" || "$owner" == "$self" ]] || return 1
-  # Validated BEFORE `8#` sees it: `8#` on anything that is not octal is a fatal arithmetic error
-  # under `set -e`, which is a crash and not a refusal.
-  [[ "$mode" =~ ^[0-7]+$ ]] || return 1
-  (( (8#$mode & 8#22) == 0 )) || return 1
-  return 0
+  # THE FIXED TRUSTED ANCESTOR, and the only one there is: `/` is the one directory on the machine
+  # whose name nothing can rebind. Everything between it and the parent is proved, not assumed.
+  cd -P / 2>/dev/null || return 1
+  here="$(stat -c '%d:%i' . 2>/dev/null || true)"
+  [[ -n "$here" ]] || return 1
+  rel="${parent#/}"
+  while :; do
+    # THE CONTAINER QUESTION, asked of `.` and never of a name. ONE stat takes the owner and the
+    # mode together, so the two answers cannot describe different directories.
+    meta="$(stat -c '%u|%a' . 2>/dev/null || true)"
+    [[ "$meta" == *"|"* ]] || return 1
+    owner="${meta%%|*}"
+    mode="${meta##*|}"
+    [[ "$owner" == "0" || "$owner" == "$self" ]] || return 1
+    # Validated BEFORE `8#` sees it: `8#` on anything that is not octal is a fatal arithmetic error
+    # under `set -e`, which is a crash and not a refusal.
+    [[ "$mode" =~ ^[0-7]+$ ]] || return 1
+    if [[ -z "$rel" ]]; then
+      # THE PARENT, whose next entry — the root — may not exist yet. No sticky credit here.
+      (( (8#$mode & 8#22) == 0 )) || return 1
+      return 0
+    fi
+    comp="${rel%%/*}"
+    if [[ "$comp" == "$rel" ]]; then rel=""; else rel="${rel#*/}"; fi
+    # A `//` in the candidate names the directory we are already standing in.
+    [[ -n "$comp" ]] || continue
+    # `.` and `..` would step outside the walk while it believed it was stepping down it.
+    [[ "$comp" != "." && "$comp" != ".." ]] || return 1
+    # ONE lstat, TAKING THE TYPE, THE IDENTITY AND THE OWNER TOGETHER, so no two of the three can
+    # describe different directories. No `-L`, so a symlinked ancestor is refused, not followed.
+    entry="$(stat -c '%F|%d:%i|%u' "$comp" 2>/dev/null || true)"
+    [[ "${entry%%|*}" == "directory" ]] || return 1
+    entry="${entry#*|}"
+    if (( (8#$mode & 8#22) != 0 )); then
+      # Writable by somebody else, so only the sticky bit can still make THIS entry unreplaceable
+      # — and only because the entry exists and belongs to the privileged account.
+      (( (8#$mode & 8#1000) != 0 )) || return 1
+      [[ "${entry##*|}" == "0" || "${entry##*|}" == "$self" ]] || return 1
+    fi
+    entry="${entry%|*}"
+    cd -P "$comp" 2>/dev/null || return 1
+    # AND THE DIRECTORY WE LANDED IN IS THE ONE THAT ENTRY NAMED — the same pair of questions the
+    # walk below asks, for the same reason. An lstat gives the inode of the entry, `stat .` gives
+    # the inode we are standing in, and a rename between them can only make the two differ. `..`
+    # also refuses a directory moved WHOLESALE into another parent, which preserves its inode.
+    [[ "$(stat -c '%d:%i' . 2>/dev/null || true)" == "$entry" ]] || return 1
+    [[ "$(stat -c '%d:%i' .. 2>/dev/null || true)" == "$here" ]] || return 1
+    here="$entry"
+  done
+}
+
+# The same question as a PREDICATE: may "$1" be a root, asked without going anywhere.
+#
+# A SUBSHELL, so the walk's chdir dies with it. publish_trust_root() asks this of every candidate
+# in the table while it is choosing one, and a selector left standing inside the last candidate it
+# considered would be a worse bug than the one this closes. It creates nothing either: the `mkdir`
+# a first install needs belongs to the acting path, and a predicate that made directories would
+# make one for every candidate it rejected.
+#
+# THE ANSWER IS ADVISORY, AND DELIBERATELY SO. It decides WHICH of the six the publication is
+# walked from — a question about the table — and NOTHING ACTS ON IT. pin_dir_beneath_root() walks
+# from `/` again at the moment it enters the root, so no operation is ever aimed by an answer this
+# function gave earlier; a parent replaced in between is re-proved from scratch or refused, and is
+# never entered on the strength of the older answer.
+publish_root_anchored() {
+  ( pin_publish_root_parent "$1" )
 }
 
 # The SHALLOWEST ANCHORED candidate that "$1" lies at or under, printed; non-zero when there is
@@ -1460,18 +1535,28 @@ publish_trust_root() {
 # deliberately by mkdir_service_subdir() or ensure_cutover_state_dirs(); creating one here is the
 # first-install fallback, not the path that decides the permissions.
 pin_dir_beneath_root() {
-  local root="$1" path="$2" rel comp here entry
+  local root="$1" path="$2" rel comp here entry base
   [[ "$root" == /* && "$path" == /* ]] || return 1
+  root="${root%/}"
+  [[ -n "$root" ]] || return 1
   [[ "$path" == "$root" || "$path" == "${root}/"* ]] || return 1
-  # AND THE ROOT IS ANCHORED, ASKED AGAIN HERE (o3d-rn10 r2). publish_trust_root() only ever hands
-  # over anchored candidates, but this is the function that ACTS on the answer — the `mkdir -p` and
-  # the `cd -P` below are the two operations that take the root's own name on trust, and a caller
-  # arriving with a root from anywhere else must not get them for free.
-  publish_root_anchored "$root" || return 1
-  # The root itself, whose parent the line above proved the service account cannot write. `-p` is
-  # correct here and only here.
-  mkdir -p "$root" 2>/dev/null || return 1
-  cd -P "$root" 2>/dev/null || return 1
+  # ONE COMPONENT, which is what the pinned parent lets us enter the root as.
+  base="${root##*/}"
+  [[ -n "$base" && "$base" != "." && "$base" != ".." ]] || return 1
+  # THE ANCHOR AND THE ENTRY ARE ONE WALK (o3d-rn10 r4), and that is the finding. Round 3 asked
+  # publish_root_anchored() whether the root's parent looked right, by PATHNAME, and then ran
+  # `mkdir -p "$root"` and `cd -P "$root"` — two further resolutions of the same pathname, after
+  # the check and independent of it. Re-asking a pathname question only ever adds another window.
+  # pin_publish_root_parent() instead walks from `/` to the parent, proving every component on the
+  # way and ending with this shell INSIDE the parent, so the two operations below are aimed at a
+  # directory descriptor the kernel is holding rather than at a name anybody can rebind.
+  pin_publish_root_parent "$root" || return 1
+  # The root itself, as a SINGLE RELATIVE COMPONENT resolved from the pinned parent. `mkdir` is
+  # plain and its failure is tolerated, because the root usually exists and may legitimately be a
+  # symlink — `cd -P` follows it deliberately, and the walk above is what earned that. An
+  # unmakeable, unenterable name fails at the `cd` a line later.
+  mkdir "$base" 2>/dev/null || true
+  cd -P "$base" 2>/dev/null || return 1
   here="$(stat -c '%d:%i' . 2>/dev/null || true)"
   [[ -n "$here" ]] || return 1
   rel="${path#"$root"}"
