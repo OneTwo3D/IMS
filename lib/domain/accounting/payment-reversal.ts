@@ -118,6 +118,13 @@ export type PaidProvenanceDoc = {
  * `posted` non-empty, which is precisely what stops `unregisteredPaidAt` being consulted). Both facts
  * are already recorded, on the registration's payload and on the row; see `PaidStateBinding`.
  *
+ * AND THE PAYLOAD IS NOT THE ONLY WITNESS TO THE FIRST OF THEM (r5, Codex HIGH 3). A row from before
+ * that field existed, or one an older release compacted to `{}`, names no document — and r4 read that
+ * as "cannot be tied to any document", permanently. When the LEDGER's own listing names such a row's
+ * payment on the document being examined, the ledger has answered the question directly; see
+ * `registrationBindsToPaidState`. What stays unprovable is a payload-less row the ledger does NOT
+ * list, because absence cannot identify a document (o3d-g7jk).
+ *
  * Documents with no `accountingInvoiceId` get no verdict — there is no ledger document to disagree
  * with. A caller that finds no entry for a document must WITHHOLD, never admit: this map's absences
  * are "nothing was decided", which is the same fail-closed reading a null fence gets.
@@ -175,6 +182,9 @@ export async function readPaidProvenanceVerdicts<T extends PaidProvenanceDoc>(
       // through the same helper the enqueue writes it with and never re-spelt here. Selected because
       // `referenceId` alone groups every registration this order has EVER had — including one against
       // an invoice that was deleted and re-posted, which then answered for its replacement.
+      //
+      // r5: NULL here is "the payload cannot say", not "nothing can" — the classifier falls back to
+      // the ledger's own payment listing for such a row.
       registeredAgainstInvoiceId: payloadAccountingInvoiceId(row.payload),
     })
     byDocument.set(row.referenceId, list)
