@@ -6,6 +6,7 @@ import {
   classifyRegisteredPaymentAgainstListing,
   databaseLedgerFence,
   listedLedgerPaymentIds,
+  parseLedgerAmount,
   zeroPaidIsProvenReversal,
   PAYMENT_PRESENT_EPSILON,
   type RegisteredPaymentRow,
@@ -715,4 +716,106 @@ test('[o3d-psrx r10] the threshold is strictly below one minor unit of the curre
   // An unstated currency takes the finest precision the repository supports.
   assert.ok(ledgerAmountEpsilon(null).lte(ledgerAmountEpsilon('CLF')),
     'an unstated currency must be no more permissive than the finest currency it could be')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-psrx r13 (Codex HIGH 2) — THE INPUTS WERE GUARDED AND THE ARITHMETIC BETWEEN THEM WAS NOT.
+// ---------------------------------------------------------------------------
+//
+// r12 put a losslessness round trip on every figure COMING IN. `TotalAmt - Balance` is a Decimal
+// subtraction whose result was then handed to a bare `.toNumber()` — so the derived figure, the only
+// one any verdict is taken on, was the single unguarded conversion left in the chain.
+//
+// Both operands can survive the round trip perfectly and their exact difference still not, and the
+// pair below is the one from the finding. Its exact difference is ABOVE the GBP epsilon, so the
+// ledger holds a payment; the double it converts to is exactly the epsilon, which the comparison
+// reads as nothing. HOLDS_NOTHING is the verdict `zeroPaidIsProvenReversal` is written about, so the
+// provenance gate then admits a reversal that clears `paidAt` and raises a chargeback.
+
+/** The admitted pair from the finding, and the arithmetic that makes it one. */
+const ADMITTED_TOTAL = 0.005055810576648219
+const ADMITTED_BALANCE = 0.00005581057664821855
+
+test('[o3d-psrx r13] the two figures in the admitted pair are each individually READABLE', () => {
+  // The precondition, asserted rather than assumed: this pair is dangerous precisely BECAUSE r12's
+  // input guard passes it. If a future change made either figure unreadable on its own, the test
+  // below would still pass and would be proving nothing.
+  for (const [label, value] of [['total', ADMITTED_TOTAL], ['balance', ADMITTED_BALANCE]] as const) {
+    assert.equal(parseLedgerAmount(value), value,
+      `${label} must survive the input round trip — otherwise the derived-value guard is untested`)
+    assert.ok(toDecimal(parseLedgerAmount(value)!).equals(toDecimal(String(value))),
+      `${label} must be lossless coming in`)
+  }
+  // And the exact difference really is a payment the ledger holds: strictly ABOVE the GBP epsilon.
+  const exact = toDecimal(String(ADMITTED_TOTAL)).minus(toDecimal(String(ADMITTED_BALANCE)))
+  assert.equal(exact.toString(), '0.00500000000000000045')
+  assert.ok(exact.gt(ledgerAmountEpsilon('GBP')),
+    'the premise of the finding: this document holds a payment above the threshold')
+  // While the double it converts to does not clear the threshold — this is the loss itself.
+  assert.equal(exact.toNumber(), 0.005)
+  assert.ok(toDecimal(exact.toNumber()).lte(ledgerAmountEpsilon('GBP')),
+    'and the converted number does not, which is the whole defect')
+})
+
+test('[o3d-psrx r13] a derived paid amount that cannot be converted is UNREADABLE, never a zero', () => {
+  const amount = ledgerAmount(ADMITTED_TOTAL, ADMITTED_BALANCE, 'GBP')
+  assert.equal(amount.paid, null,
+    'a lossy Decimal->number conversion of the derived amount must refuse, not round onto the threshold')
+  // NULL IS NOT ZERO, and this is the assertion that says so in the currency the verdict speaks.
+  assert.notEqual(amount.paid, 0)
+  // The figures the ledger actually STATED are untouched — only the derivation refused.
+  assert.equal(amount.total, ADMITTED_TOTAL)
+  assert.equal(amount.outstanding, ADMITTED_BALANCE)
+})
+
+test('[o3d-psrx r13] THE ROUTE: the admitted pair WITHHOLDS instead of proving a full reversal', () => {
+  const verdict = classifyQboLedgerEvidence(ledgerAmount(ADMITTED_TOTAL, ADMITTED_BALANCE, 'GBP'))
+  // The load-bearing claim: this pair must not reach HOLDS_NOTHING, the one verdict every admitting
+  // arm of the provenance gate is written about.
+  assert.notEqual(verdict.kind, 'HOLDS_NOTHING',
+    'a positive payment must never be classified as a ledger holding nothing')
+  assert.deepEqual(verdict, { kind: 'UNPROVEN', paidAmount: null, documentTotal: ADMITTED_TOTAL })
+})
+
+test('[o3d-psrx r13] CONTROL: ordinary amounts classify exactly as they always did', () => {
+  // The guard must refuse a LOSSY conversion and nothing else. These are the readings the poller
+  // makes every day, and none of them may move.
+  const unchanged = [
+    // A document the ledger has FULLY settled is deliberately UNPROVEN, not PARTIALLY_PAID: the
+    // ledger and IMS agree about it, so there is nothing to report. See classifyQboLedgerEvidence.
+    { total: 100, balance: 0, currency: 'GBP', expect: { kind: 'UNPROVEN' as const } },
+    { total: 100, balance: 100, currency: 'GBP', expect: { kind: 'HOLDS_NOTHING' as const } },
+    { total: 100, balance: 40, currency: 'GBP', expect: { kind: 'PARTIALLY_PAID' as const } },
+    { total: 0, balance: 0, currency: 'GBP', expect: { kind: 'HOLDS_NOTHING' as const } },
+    { total: 1234.56, balance: 1234.56, currency: 'USD', expect: { kind: 'HOLDS_NOTHING' as const } },
+    { total: 1234.56, balance: 34.56, currency: 'USD', expect: { kind: 'PARTIALLY_PAID' as const } },
+    { total: 100.1, balance: 0.1, currency: 'GBP', expect: { kind: 'PARTIALLY_PAID' as const } },
+    { total: 9999999.99, balance: 0.01, currency: 'EUR', expect: { kind: 'PARTIALLY_PAID' as const } },
+    { total: 12.345, balance: 12.344, currency: 'KWD', expect: { kind: 'PARTIALLY_PAID' as const } },
+  ]
+  for (const c of unchanged) {
+    const amount = ledgerAmount(c.total, c.balance, c.currency)
+    assert.notEqual(amount.paid, null,
+      `${c.currency} ${c.total}/${c.balance}: an ordinary figure must still convert — a guard that `
+      + 'refuses the everyday reading has switched the poller off rather than fixed it')
+    // And the paid figure is the exact decimal difference, not a rounded one.
+    assert.equal(
+      toDecimal(amount.paid!).toString(),
+      toDecimal(String(c.total)).minus(toDecimal(String(c.balance))).toString(),
+      `${c.currency} ${c.total}/${c.balance}: the settled figure must be the exact difference`)
+    // AND THE STRONGER FORM OF "IDENTICAL": the figure equals what the PRE-CHANGE conversion
+    // produced. Hand-written expectations only say the verdict is what somebody wrote down; this
+    // says the new reader returns the same number the bare `.toNumber()` did on every ordinary
+    // reading, so the guard is a refusal of lossy conversions and not a change of arithmetic.
+    assert.equal(amount.paid, toDecimal(String(c.total)).minus(toDecimal(String(c.balance))).toNumber(),
+      `${c.currency} ${c.total}/${c.balance}: the guard must not change what a lossless conversion returns`)
+    assert.equal(classifyQboLedgerEvidence(amount).kind, c.expect.kind,
+      `${c.currency} ${c.total}/${c.balance}: the verdict must not move`)
+  }
+})
+
+test('[o3d-psrx r13] a VOIDED document is still a stated zero, not a derivation', () => {
+  // The one place a zero `paid` is legitimate is a document QuickBooks zeroed, and it is stated
+  // rather than subtracted — so the new refusal must not be able to reach it.
+  assert.deepEqual(classifyQboLedgerEvidence(ledgerAmount(0, 0, 'GBP')), { kind: 'HOLDS_NOTHING' })
 })
