@@ -1280,6 +1280,13 @@ says nothing about who may create it. So a root directly under `/tmp` is refused
   ERROR:   5. add: /srv/disk2/ims /var/lib/one-two-inventory none bind 0 0   to /etc/fstab so the bind survives a reboot, then start the service again
   ```
 
+  Every path in those commands is **shell-quoted** by the run that printed them (`printf %q`, so a
+  name containing a space, a `;`, a `$(…)`, a tab or a newline becomes one word that evaluates back
+  to exactly those bytes and executes nothing), and the `fstab` line uses **fstab's** own escaping
+  instead — `\040` for a space, `\011` for a tab, `\134` for a backslash — because `mount` reads
+  that field with different rules. A path carrying a newline gets a sentence pointing at a systemd
+  `.mount` unit rather than an `fstab` line that cannot express it.
+
   **What an operator with a symlinked root must do** is the five numbered steps above, in that
   order. They matter as a sequence, not as a one-liner: the refusal is printed while the service and
   its cron are still running, and step 3 removes a live pathname. The run **resolves the link
@@ -1327,11 +1334,19 @@ so the `syslog` account may *rename* any entry in it — root-owned ones include
 involved at all**. Between pre-flight and section 8 it could move the real log root aside and
 rename another `/var/log` subtree into its name.
 
-So section 8 does not act on the name. `enter_service_root()` walks from `/` again, creates the root
-with a plain `mkdir` (which fails on a planted link rather than working inside it) or accepts an
-existing one, refuses a root that belongs to somebody other than root, steps **into** it, checks
-both its inode and its `..`, and leaves the process there — and the ownership change is then made of
-`.`. A rename of the name after that cannot move a descriptor.
+So section 8 does not act on the name, and it is held to **what pre-flight approved**. The gate
+records the root's `dev:ino` (or the word `absent`, when the name was free). `enter_service_root()`
+then walks from `/` again, creates the root with a plain `mkdir` — which fails on a planted link
+rather than working inside it — or accepts an existing one, steps **into** it, checks its inode and
+its `..`, and finally requires the directory it is standing in to be **the very entry the gate
+approved**. A root the gate found absent must be one this run's own `mkdir` created; a root that
+appeared in between belongs to whoever made it and is refused. The process is left inside, and the
+ownership change is made of `.`, so a rename of the name afterwards cannot move a descriptor.
+
+Identity, not ownership: the recursive chowns hand `DATA_DIR` and `LOG_DIR` **themselves** to the
+service account, so from the second run onward the roots are not root-owned and a "must be owned by
+root" rule would refuse every upgrade — while still accepting a *different* root-owned subtree
+renamed into the name. Continuity from the gate answers both.
 
 **What this still does not cover**, stated rather than glossed: `logrotate` resolves
 `/var/log/one-two-inventory/*.log` by pathname, as root, on its own schedule, and on a

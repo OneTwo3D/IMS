@@ -2927,23 +2927,47 @@ publish_trust_root() {
 # and prints the one command that puts the link back if the mount does not take. A link that does
 # not resolve to a directory gets a different answer, because there is no bind mount to make.
 refuse_symlinked_root() {
-  local root="$1" target=""
+  local root="$1" target="" qroot qtarget froot ftarget
   # THE TARGET IS RESOLVED HERE AND PRINTED, not left to the operator to retype. Its status is
   # taken so that this stays out of the unchecked-substitution census: a `readlink` that fails is a
   # dangling or unreadable link, which is the branch below.
   target="$(readlink -f "$root" 2>/dev/null)" || target=""
   printf 'ERROR: %s is a symbolic link, and a root this run writes into may not be one: nothing here proves the path its target resolves through.\n' "$root" >&2
   printf 'ERROR: NOTHING HAS BEEN CHANGED by this run. To keep %s on another disk, replace the link with a real directory and bind-mount the disk onto it — no data has to move, because the bind exposes the same filesystem at the same path.\n' "$root" >&2
+  # EVERY PATH THAT GOES INTO A COMMAND IS SHELL-QUOTED FIRST (o3d-secops r7 third pass, Codex
+  # HIGH). ${target} is whatever `readlink -f` resolved to, and a component of that chain can be
+  # named by an account this script does not trust — so it may contain a space, a `;`, a `$(…)`, a
+  # newline or a control byte. Interpolated raw into a line an operator is told to paste into a
+  # ROOT SHELL, that is command execution with extra steps. `printf %q` is a bash builtin over a
+  # value this function already holds; it emits a single word that evaluates back to exactly these
+  # bytes, `$'…'` for anything unprintable, and it is applied to EVERY occurrence below including
+  # the one in the prose. Its status is taken, and a value it cannot quote gets no command at all.
+  qroot="$(printf '%q' "$root")" || qroot=""
+  qtarget="$(printf '%q' "$target")" || qtarget=""
   if [[ -z "$target" || ! -d "$target" ]]; then
-    printf 'ERROR: That link does not resolve to a directory%s, so there is no bind mount to make yet. Fix or remove it by hand — this run will not guess what it was meant to point at.\n' "${target:+ (it resolves to ${target})}" >&2
+    printf 'ERROR: That link does not resolve to a directory%s, so there is no bind mount to make yet. Fix or remove it by hand — this run will not guess what it was meant to point at.\n' "${qtarget:+ (it resolves to ${qtarget})}" >&2
+    return 0
+  fi
+  if [[ -z "$qroot" || -z "$qtarget" ]]; then
+    printf 'ERROR: The paths involved could not be quoted for a shell, so this run will not print commands to paste. Replace the link with a bind mount by hand.\n' >&2
     return 0
   fi
   printf 'ERROR: Do it with the writers stopped, in this order:\n' >&2
-  printf 'ERROR:   1. stop the application service, and pause any cron that writes under %s\n' "$root" >&2
-  printf 'ERROR:   2. this run resolved that link to: %s   — confirm that is where the data is\n' "$target" >&2
-  printf 'ERROR:   3. rm %s && mkdir -p %s && mount --bind %s %s\n' "$root" "$root" "$target" "$root" >&2
-  printf 'ERROR:   4. verify with: findmnt %s   — if the mount did NOT take, put the link back at once: rmdir %s && ln -s %s %s\n' "$root" "$root" "$target" "$root" >&2
-  printf 'ERROR:   5. add: %s %s none bind 0 0   to /etc/fstab so the bind survives a reboot, then start the service again\n' "$target" "$root" >&2
+  printf 'ERROR:   1. stop the application service, and pause any cron that writes under %s\n' "$qroot" >&2
+  printf 'ERROR:   2. this run resolved that link to: %s   — confirm that is where the data is\n' "$qtarget" >&2
+  printf 'ERROR:   3. rm %s && mkdir -p %s && mount --bind %s %s\n' "$qroot" "$qroot" "$qtarget" "$qroot" >&2
+  printf 'ERROR:   4. verify with: findmnt %s   — if the mount did NOT take, put the link back at once: rmdir %s && ln -s %s %s\n' "$qroot" "$qroot" "$qtarget" "$qroot" >&2
+  # /etc/fstab HAS ITS OWN ESCAPING, AND IT IS NOT THE SHELL'S. Fields are split on whitespace and
+  # a space, tab or backslash is written as an octal escape; `printf %q`'s answer would be read by
+  # mount as a literal backslash. A newline cannot be represented in an fstab field at all, so that
+  # one gets a sentence instead of a line to paste.
+  froot="${root//\\/\\134}"; froot="${froot// /\\040}"; froot="${froot//$'\t'/\\011}"
+  ftarget="${target//\\/\\134}"; ftarget="${ftarget// /\\040}"; ftarget="${ftarget//$'\t'/\\011}"
+  if [[ "$root" == *$'\n'* || "$target" == *$'\n'* ]]; then
+    printf 'ERROR:   5. one of these paths contains a newline, which /etc/fstab cannot express — make the bind persistent with a systemd .mount unit instead, then start the service again\n' >&2
+  else
+    printf 'ERROR:   5. add: %s %s none bind 0 0   to /etc/fstab so the bind survives a reboot, then start the service again\n' "$ftarget" "$froot" >&2
+  fi
 }
 
 pin_dir_beneath_root() {
@@ -3326,8 +3350,13 @@ service_root_entry_kind() {
   # substitution, so the moved cwd dies with the subshell.
   pin_service_root_parent "${root}" || return 1
   # ONE lstat, in the directory the walk is standing in, of a SINGLE COMPONENT — never a pathname.
-  # "absent" is a first install, and is the one answer that is neither a directory nor a refusal.
-  stat -c '%F' "${base}" 2>/dev/null || printf 'absent\n'
+  # "absent|" is a first install, and is the one answer that is neither a directory nor a refusal.
+  #
+  # THE IDENTITY COMES BACK WITH THE KIND (o3d-secops r7 third pass, Codex HIGH), taken by the SAME
+  # lstat so the two cannot describe different directories. enter_service_root() then requires the
+  # entry it acts on to be this one, which is what turns the gate from an observation into a
+  # premise the acting path can be held to.
+  stat -c '%F|%d:%i' "${base}" 2>/dev/null || printf 'absent|\n'
 }
 
 # THE WALK, ONCE, USED BOTH TO ASK AND TO ACT (o3d-secops r7 second pass).
@@ -3389,19 +3418,26 @@ pin_service_root_parent() {
   SERVICE_ROOT_PARENT="${here}"
 }
 
+# WHAT THE GATE APPROVED, BY IDENTITY, so the acting path can be held to it (o3d-secops r7 third
+# pass, Codex HIGH). Keyed by the root's pathname; the value is its `dev:ino` when the gate found a
+# directory there, and the word `absent` when the name was free.
+declare -A SERVICE_ROOT_APPROVED=()
+
 # The gate. It either returns or ends the run; there is no third outcome and no caller decides.
 require_real_service_root() {
-  local root="$1" what="$2" kind rc=0
+  local root="$1" what="$2" answer kind rc=0
   # A COMMAND SUBSTITUTION IS THE SUBSHELL: service_root_entry_kind() leaves the shell it runs in
   # inside the parent, on success and part-way down on failure, and the installer's own cwd must
   # not move. The status is taken with `|| rc=$?` because under `set -e` a failed substitution in
   # an assignment ends the script before the `die` below could say why.
-  kind="$(service_root_entry_kind "${root}")" || rc=$?
+  answer="$(service_root_entry_kind "${root}")" || rc=$?
   if (( rc != 0 )); then
     die "${root} — ${what} — could not be resolved from \`/\` without following a symbolic link, or a directory on the way to it changed while this run was walking it. Every component from \`/\` down to ${root} must be a real directory. NOTHING has been created, nothing has been migrated and nothing has been started."
   fi
+  kind="${answer%%|*}"
   case "${kind}" in
-    directory|absent) return 0 ;;
+    directory) SERVICE_ROOT_APPROVED["${root}"]="${answer#*|}" ; return 0 ;;
+    absent)    SERVICE_ROOT_APPROVED["${root}"]="absent"       ; return 0 ;;
     'symbolic link')
       refuse_symlinked_root "${root}"
       die "${root} — ${what} — is a symbolic link, so this run stops here rather than creating, entering, migrating into, rsyncing into or chowning whatever it resolves to. The two commands above replace it with a bind mount, which is the same layout with the indirection resolved once, at mount time. NOTHING has been created, nothing has been migrated and nothing has been started — this is the FIRST statement in the run that looks at ${root}, so an existing installation is exactly as it was."
@@ -3441,10 +3477,15 @@ require_real_service_root() {
 # there keeps whatever mode it has: chmod has no --no-dereference on Linux, which is the same
 # reason mkdir_service_subdir() gives.
 enter_service_root() {
-  local root="$1" mask="$2" what="$3" base parent entry kind owner self
+  local root="$1" mask="$2" what="$3" base parent entry kind approved landed created=false
   base="${root##*/}"
   [[ "${root}" == /* && -n "${base}" && "${base}" != "." && "${base}" != ".." ]] || die \
     "enter_service_root was asked for '${root}', which is not an absolute path with a nameable last component. This is a bug in this script, not an operator error."
+  # WHAT THE GATE APPROVED, AND A REFUSAL IF IT APPROVED NOTHING. Acting on a root no pre-flight
+  # check has seen would be the defect this whole round is about, one call site over.
+  approved="${SERVICE_ROOT_APPROVED[${root}]-}"
+  [[ -n "${approved}" ]] || die \
+    "enter_service_root was asked for ${root}, which require_real_service_root() has not approved in this run. This is a bug in this script, not an operator error: the gate is what establishes the identity this function holds the entry to."
   # CALLED DIRECTLY AND NOT THROUGH `$( )`: the chdir it performs is the pin every step below
   # depends on, and a command substitution would discard it. See its own comment.
   pin_service_root_parent "${root}" || die \
@@ -3453,36 +3494,52 @@ enter_service_root() {
   [[ -n "${parent}" ]] || die \
     "${root} — ${what} — was walked to but its parent could not be identified, so this run cannot prove where it is about to create or enter it. Nothing has been changed."
   # A PLAIN `mkdir`, not `mkdir -p`: it refuses a name that is already taken instead of working
-  # inside whatever is there.
-  if ! (umask "${mask}"; mkdir "${base}") 2>/dev/null; then
-    entry="$(stat -c '%F|%d:%i' "${base}" 2>/dev/null || true)"
-    kind="${entry%%|*}"
-    if [[ "${kind}" == "symbolic link" ]]; then
-      refuse_symlinked_root "${root}"
-      die "${root} — ${what} — is a symbolic link, so this run stops here rather than creating, entering or chowning whatever it resolves to. Nothing has been changed."
-    fi
-    [[ "${kind}" == "directory" ]] || die \
-      "${root} — ${what} — is a ${kind:-missing path}, not a directory, so this run will not create anything at that name or write through it. Nothing has been changed."
+  # inside whatever is there. Whether it SUCCEEDED is the fact the continuity check below rests on.
+  if (umask "${mask}"; mkdir "${base}") 2>/dev/null; then
+    created=true
+  fi
+  # CONTINUITY FROM THE GATE, WHICH IS WHAT OWNERSHIP WAS STANDING IN FOR (o3d-secops r7 third
+  # pass, Codex HIGH). An earlier draft required the root to be owned by root. That is wrong twice
+  # over: the recursive chown below hands ${DATA_DIR} and ${LOG_DIR} THEMSELVES to ${APP_USER}, so
+  # the check refused every upgrade after the first — and root ownership does not identify anything
+  # anyway, since a group-writable /var/log lets another account rename a DIFFERENT root-owned
+  # subtree into the name. The question is not who owns it; it is whether it is the entry the gate
+  # approved.
+  if [[ "${approved}" == "absent" ]]; then
+    ${created} || die \
+      "${root} — ${what} — did not exist when this run checked it at pre-flight and something has created it since. This run will not adopt a directory it did not make at that name — on a parent another account can write, that entry is theirs and its contents are whatever they chose. Remove it and run the installer again; nothing has been changed."
+  else
+    ! ${created} || die \
+      "${root} — ${what} — existed when this run checked it at pre-flight and does not now: it was removed while this installation was running. This run refuses rather than carrying on against a directory that is not the one it approved. Nothing has been changed."
   fi
   entry="$(stat -c '%F|%d:%i' "${base}" 2>/dev/null || true)"
-  [[ "${entry%%|*}" == "directory" ]] || die \
-    "${root} — ${what} — is not the directory this run had just created or accepted: it was replaced between the check and the step into it. This run refuses rather than following it; nothing has been changed."
+  kind="${entry%%|*}"
+  if [[ "${kind}" != "directory" ]]; then
+    if [[ "${kind}" == "symbolic link" ]]; then
+      refuse_symlinked_root "${root}"
+    fi
+    die "${root} — ${what} — is a ${kind:-missing path}, not a directory, so this run will not create anything at that name or write through it. Nothing has been changed."
+  fi
   cd -P "${base}" 2>/dev/null || die \
     "${root} — ${what} — could not be entered after this run created or accepted it. Nothing has been changed."
   # THE TWO IDENTITY CHECKS, of `.` and of `..`, both answered by the kernel for the inode this
   # process is inside rather than by re-resolving a name.
-  [[ "$(stat -c '%d:%i' . 2>/dev/null || true)" == "${entry#*|}" ]] || die \
+  landed="$(stat -c '%d:%i' . 2>/dev/null || true)"
+  [[ -n "${landed}" && "${landed}" == "${entry#*|}" ]] || die \
     "${root} — ${what} — is not the directory this run had just created or accepted: it was replaced between the check and the step into it. This run refuses rather than following it; nothing has been changed."
   [[ "$(stat -c '%d:%i' .. 2>/dev/null || true)" == "${parent}" ]] || die \
     "${root} — ${what} — is not in the directory this run walked to: it was replaced between the check and the step into it. This run refuses rather than following it; nothing has been changed."
-  # ROOT, OR WHOEVER IS RUNNING THIS SCRIPT — the same pair pin_publish_root_parent() accepts, and
-  # for the same reason. In production the two are one: section 1 refuses a run whose EUID is not 0.
-  # `id -u` rather than a literal 0 so that the regressions, which have a single uid and cannot
-  # chown anything to root, measure the check rather than being blocked by it.
-  self="$(id -u)" || die "\`id -u\` failed, so this run cannot establish which uid it is and cannot prove who owns ${root}."
-  owner="$(stat -c '%u' . 2>/dev/null || true)"
-  [[ "${owner}" == "0" || "${owner}" == "${self}" ]] || die \
-    "${root} — ${what} — already exists and belongs to uid ${owner:-unknown}, not to root. A root this installer creates is root's; one somebody else made at that name is a directory whose contents they chose, and handing it to '${APP_USER}' would hand them whatever is in it. Remove or fix that path and run the installer again; nothing has been changed."
+  if [[ "${approved}" == "absent" ]]; then
+    # Created by THIS run's `mkdir`, so it is ours. Record what it made, because the next call for
+    # the same root — the ownership change below is one — must be held to this same entry.
+    SERVICE_ROOT_APPROVED["${root}"]="${landed}"
+  else
+    # AND IT IS THE VERY ENTRY THE GATE APPROVED. A rename in a group-writable parent needs no
+    # symlink and no privilege, and every structural check above passes on the replacement: it is a
+    # real directory, in the right parent, and its `..` is correct. Only its identity differs.
+    [[ "${landed}" == "${approved}" ]] || die \
+      "${root} — ${what} — is not the directory this run approved at pre-flight: the entry at that name was replaced between the two. On a parent another account can write — /var/log is group-writable on some distributions — that takes a rename and nothing else, and every other check here passes on the replacement. This run refuses rather than writing into it; nothing has been changed."
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -7421,15 +7478,17 @@ fi
 # arrive after the writes it was meant to prevent. `mkdir -p` follows a link at the root silently;
 # a plain `mkdir` inside a pinned parent does not, and enter_service_root() is that.
 #
-# `if ! ( … )` AND NOT `( … ) || die`: a compound command on the left of `||` runs with `set -e`
-# IGNORED, so a failure inside it would be a failure this line did not notice. Every refusal below
-# is either an explicit `die` inside the subshell or this `if`.
-if ! ( enter_service_root "${DATA_DIR}" 022 "the state directory" ); then
-  die "${DATA_DIR} could not be created and proved; the reason is above. Nothing has been changed."
-fi
-if ! ( enter_service_root "${LOG_DIR}" 022 "the log directory" ); then
-  die "${LOG_DIR} could not be created and proved; the reason is above. Nothing has been changed."
-fi
+# NOT IN A SUBSHELL, and that is load-bearing (o3d-secops r7 third pass). enter_service_root()
+# RECORDS the identity of a root it creates, and the ownership change further down is held to that
+# record; a subshell would discard it and the second call would refuse the directory the first one
+# made. So the cwd is saved and restored around the two calls instead, exactly as
+# mkdir_service_subdir() does — every `die` inside them ends the run, so the moved cwd never
+# outlives the process.
+SERVICE_ROOT_CWD="$(pwd -P)" || die "this run cannot establish its own working directory, so it will not walk into its state roots and back. Nothing has been changed."
+enter_service_root "${DATA_DIR}" 022 "the state directory"
+cd "${SERVICE_ROOT_CWD}" || die "this run could not return to ${SERVICE_ROOT_CWD} after creating ${DATA_DIR}. Nothing further has been changed."
+enter_service_root "${LOG_DIR}" 022 "the log directory"
+cd "${SERVICE_ROOT_CWD}" || die "this run could not return to ${SERVICE_ROOT_CWD} after creating ${LOG_DIR}. Nothing further has been changed."
 
 # EVERYTHING BENEATH THEM GOES THROUGH THE SYMLINK-PROOF WALK (o3d-czpy). On an upgrade the
 # containing directory already belongs to ${APP_USER} — the recursive chown below did that on the

@@ -2150,23 +2150,47 @@ publish_trust_root() {
 # from the link instead of asking for it to be retyped, and prints the command that puts the link
 # back if the bind mount does not take.
 refuse_symlinked_root() {
-  local root="$1" target=""
+  local root="$1" target="" qroot qtarget froot ftarget
   # THE TARGET IS RESOLVED HERE AND PRINTED, not left to the operator to retype. Its status is
   # taken so that this stays out of the unchecked-substitution census: a `readlink` that fails is a
   # dangling or unreadable link, which is the branch below.
   target="$(readlink -f "$root" 2>/dev/null)" || target=""
   printf 'ERROR: %s is a symbolic link, and a root this run writes into may not be one: nothing here proves the path its target resolves through.\n' "$root" >&2
   printf 'ERROR: NOTHING HAS BEEN CHANGED by this run. To keep %s on another disk, replace the link with a real directory and bind-mount the disk onto it — no data has to move, because the bind exposes the same filesystem at the same path.\n' "$root" >&2
+  # EVERY PATH THAT GOES INTO A COMMAND IS SHELL-QUOTED FIRST (o3d-secops r7 third pass, Codex
+  # HIGH). ${target} is whatever `readlink -f` resolved to, and a component of that chain can be
+  # named by an account this script does not trust — so it may contain a space, a `;`, a `$(…)`, a
+  # newline or a control byte. Interpolated raw into a line an operator is told to paste into a
+  # ROOT SHELL, that is command execution with extra steps. `printf %q` is a bash builtin over a
+  # value this function already holds; it emits a single word that evaluates back to exactly these
+  # bytes, `$'…'` for anything unprintable, and it is applied to EVERY occurrence below including
+  # the one in the prose. Its status is taken, and a value it cannot quote gets no command at all.
+  qroot="$(printf '%q' "$root")" || qroot=""
+  qtarget="$(printf '%q' "$target")" || qtarget=""
   if [[ -z "$target" || ! -d "$target" ]]; then
-    printf 'ERROR: That link does not resolve to a directory%s, so there is no bind mount to make yet. Fix or remove it by hand — this run will not guess what it was meant to point at.\n' "${target:+ (it resolves to ${target})}" >&2
+    printf 'ERROR: That link does not resolve to a directory%s, so there is no bind mount to make yet. Fix or remove it by hand — this run will not guess what it was meant to point at.\n' "${qtarget:+ (it resolves to ${qtarget})}" >&2
+    return 0
+  fi
+  if [[ -z "$qroot" || -z "$qtarget" ]]; then
+    printf 'ERROR: The paths involved could not be quoted for a shell, so this run will not print commands to paste. Replace the link with a bind mount by hand.\n' >&2
     return 0
   fi
   printf 'ERROR: Do it with the writers stopped, in this order:\n' >&2
-  printf 'ERROR:   1. stop the application service, and pause any cron that writes under %s\n' "$root" >&2
-  printf 'ERROR:   2. this run resolved that link to: %s   — confirm that is where the data is\n' "$target" >&2
-  printf 'ERROR:   3. rm %s && mkdir -p %s && mount --bind %s %s\n' "$root" "$root" "$target" "$root" >&2
-  printf 'ERROR:   4. verify with: findmnt %s   — if the mount did NOT take, put the link back at once: rmdir %s && ln -s %s %s\n' "$root" "$root" "$target" "$root" >&2
-  printf 'ERROR:   5. add: %s %s none bind 0 0   to /etc/fstab so the bind survives a reboot, then start the service again\n' "$target" "$root" >&2
+  printf 'ERROR:   1. stop the application service, and pause any cron that writes under %s\n' "$qroot" >&2
+  printf 'ERROR:   2. this run resolved that link to: %s   — confirm that is where the data is\n' "$qtarget" >&2
+  printf 'ERROR:   3. rm %s && mkdir -p %s && mount --bind %s %s\n' "$qroot" "$qroot" "$qtarget" "$qroot" >&2
+  printf 'ERROR:   4. verify with: findmnt %s   — if the mount did NOT take, put the link back at once: rmdir %s && ln -s %s %s\n' "$qroot" "$qroot" "$qtarget" "$qroot" >&2
+  # /etc/fstab HAS ITS OWN ESCAPING, AND IT IS NOT THE SHELL'S. Fields are split on whitespace and
+  # a space, tab or backslash is written as an octal escape; `printf %q`'s answer would be read by
+  # mount as a literal backslash. A newline cannot be represented in an fstab field at all, so that
+  # one gets a sentence instead of a line to paste.
+  froot="${root//\\/\\134}"; froot="${froot// /\\040}"; froot="${froot//$'\t'/\\011}"
+  ftarget="${target//\\/\\134}"; ftarget="${ftarget// /\\040}"; ftarget="${ftarget//$'\t'/\\011}"
+  if [[ "$root" == *$'\n'* || "$target" == *$'\n'* ]]; then
+    printf 'ERROR:   5. one of these paths contains a newline, which /etc/fstab cannot express — make the bind persistent with a systemd .mount unit instead, then start the service again\n' >&2
+  else
+    printf 'ERROR:   5. add: %s %s none bind 0 0   to /etc/fstab so the bind survives a reboot, then start the service again\n' "$ftarget" "$froot" >&2
+  fi
 }
 
 pin_dir_beneath_root() {
