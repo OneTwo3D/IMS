@@ -27,7 +27,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync,
 import { dirname, join } from 'node:path'
 import test, { type TestContext } from 'node:test'
 
-import { maskShellSource, shellConstant, shellConstantAssignments, shellConstantOptional, shellFunction, shellFunctionBodyCount, shellFunctionDefinitions } from './shell-symbol.ts'
+import { maskShellSource, shellAssignments, shellConstant, shellConstantAssignments, shellConstantOptional, shellFunction, shellFunctionBodyCount, shellFunctionDefinitions } from './shell-symbol.ts'
 import { createTempDirSync } from './temp-dir.ts'
 
 const REPO = process.cwd()
@@ -2043,6 +2043,91 @@ test('[o3d-1dk9] a function body whose extent cannot be determined refuses inste
 })
 
 /**
+ * AND THE SAME WORD RULE, ASKED THE OTHER WAY ROUND: WHICH NAMES DOES THIS COMMAND ASSIGN?
+ * (o3d-secops r5, Codex HIGH.)
+ *
+ * shellConstantAssignments() has always answered "is NAME assigned here" by the word rule — a name
+ * is assigned where it STARTS A WORD, and a word starts after a metacharacter and nowhere else — so
+ * `export`, `readonly`, `declare -r`, `typeset` and `local` are covered without one of them being
+ * written down. That reading was only reachable PER NAME, and the sink census below needed the
+ * other direction: given a command, which names does it assign? Having nowhere to ask, it grew its
+ * own regex, `(?:local |export |readonly |declare [^ ]+ )*NAME=`, and that regex was wrong in the
+ * two ways an enumeration is always wrong:
+ *
+ *   `declare ref=X`             no option word, so `declare [^ ]+ ` had nothing to eat
+ *   `local scratch=x ref=X`     a SECOND operand, past the `$` the regex anchored on
+ *
+ * Both are ordinary bash and both really assign — asserted below under a real bash before anything
+ * is required of the scanner, because a rule aimed at a form bash does not accept is about a typo.
+ *
+ * ROUTE: shellAssignments() on each form, against bash's own answer for the same bytes.
+ *
+ * MUTATION: restore the enumerating regex as the reader (`(?:local |export |readonly |declare
+ * [^ ]+ )*([A-Za-z_][A-Za-z0-9_]*)\+?=(\S*)\s*$` over each form) and the `declare`, `typeset`,
+ * `readonly -g` and both multi-operand rows go red; drop the `start !== 0 ||
+ * METACHARACTERS.includes(...)` word-start test from maskAssignmentOperands() and the `$NAME=`,
+ * `x_NAME=` and `arr[0]=` rows go red instead. Both edits were made and this test run under each.
+ */
+test('[o3d-secops] the assignment reader names every operand of a declaration, with or without options', (t) => {
+  const seen = (text: string): string[] =>
+    shellAssignments(text, 'a fixture').map(({ name, value }) => `${name}=${value}`)
+
+  // WHAT BASH DOES WITH THE SAME BYTES, first. Each form is run inside a function (which is where a
+  // `local` is legal) and the variable it is claimed to set is printed back.
+  const bashAssigns = (form: string, name: string): string => {
+    const dir = createTempDirSync('ims-secops-assign-', t)
+    const file = join(dir, 'subject.sh')
+    writeFileSync(file, `f() {\n  ${form}\n  printf '%s' "\${${name}}"\n}\nf\n`)
+    const run = spawnSync('bash', [file], { encoding: 'utf8' })
+    assert.equal(run.status, 0, `bash must accept ${JSON.stringify(form)}: ${run.stderr}`)
+    return run.stdout
+  }
+
+  const forms: ReadonlyArray<readonly [string, readonly string[], readonly [string, string]]> = [
+    // THE TWO THE ENUMERATING REGEX MISSED.
+    ['declare ref=DB_FENCE_PROBE_REASON', ['ref=DB_FENCE_PROBE_REASON'], ['ref', 'DB_FENCE_PROBE_REASON']],
+    ['local scratch=x ref=DB_FENCE_PROBE_REASON', ['scratch=x', 'ref=DB_FENCE_PROBE_REASON'], ['ref', 'DB_FENCE_PROBE_REASON']],
+    // AND THE REST OF THE SHAPE, none of which is enumerated anywhere.
+    ['typeset ref=DB_FENCE_PROBE_REASON', ['ref=DB_FENCE_PROBE_REASON'], ['ref', 'DB_FENCE_PROBE_REASON']],
+    ['declare -r a=1 ref=DB_FENCE_PROBE_REASON', ['a=1', 'ref=DB_FENCE_PROBE_REASON'], ['ref', 'DB_FENCE_PROBE_REASON']],
+    ['local -a first=1 ref=DB_FENCE_PROBE_REASON', ['first=1', 'ref=DB_FENCE_PROBE_REASON'], ['ref', 'DB_FENCE_PROBE_REASON']],
+    ['export A=1 ref="DB_FENCE_PROBE_REASON"', ['A=1', 'ref="DB_FENCE_PROBE_REASON"'], ['ref', 'DB_FENCE_PROBE_REASON']],
+    ["readonly ref='DB_FENCE_PROBE_REASON'", ["ref='DB_FENCE_PROBE_REASON'"], ['ref', 'DB_FENCE_PROBE_REASON']],
+    ['ref=DB_FENCE_PROBE_REASON', ['ref=DB_FENCE_PROBE_REASON'], ['ref', 'DB_FENCE_PROBE_REASON']],
+    ['true; ref=DB_FENCE_PROBE_REASON', ['ref=DB_FENCE_PROBE_REASON'], ['ref', 'DB_FENCE_PROBE_REASON']],
+  ]
+  for (const [form, expected, [name, value]] of forms) {
+    assert.equal(bashAssigns(form, name), value,
+      `bash must really set ${name} from ${JSON.stringify(form)}, or the scanner is being asked about a typo`)
+    assert.deepEqual(seen(form), [...expected], `shellAssignments() on ${JSON.stringify(form)}`)
+  }
+
+  // AND WHAT IS NOT AN ASSIGNMENT STAYS OUT, which is what the word-start test buys. Each of these
+  // was checked to contain an `=` the reader has to walk past rather than report.
+  for (const notAnAssignment of [
+    '[[ "$a" == "$b" ]]',
+    '[[ "$a" != "$b" ]]',
+    '$ref=DB_FENCE_PROBE_REASON',
+    'x_ref=DB_FENCE_PROBE_REASON',
+    'arr[0]=DB_FENCE_PROBE_REASON',
+    '# ref=DB_FENCE_PROBE_REASON',
+    'echo x  # ref=DB_FENCE_PROBE_REASON',
+    "echo 'ref=DB_FENCE_PROBE_REASON'",
+    'cat <<EOF\nref=DB_FENCE_PROBE_REASON\nEOF',
+  ]) {
+    assert.ok(!seen(notAnAssignment).includes('ref=DB_FENCE_PROBE_REASON'),
+      `${JSON.stringify(notAnAssignment)} assigns no \`ref\`; the reader saw ${seen(notAnAssignment).join(', ')}`)
+  }
+  // `x_ref` and `arr[0]` are not silence-by-accident: the first IS reported, under its own name.
+  assert.deepEqual(seen('x_ref=DB_FENCE_PROBE_REASON'), ['x_ref=DB_FENCE_PROBE_REASON'])
+
+  // A LINE CONTINUATION JOINS THE WORD rather than starting one, which is the case the forward
+  // regex could not read at all: bash assigns `xref`, and so does the reader.
+  assert.equal(bashAssigns('x\\\nref=DB_FENCE_PROBE_REASON', 'xref'), 'DB_FENCE_PROBE_REASON')
+  assert.deepEqual(seen('x\\\nref=DB_FENCE_PROBE_REASON'), ['xref=DB_FENCE_PROBE_REASON'])
+})
+
+/**
  * AND THE SCOPE RULE HAS NOT MADE THE SCANNER UNUSABLE EITHER (o3d-1dk9).
  *
  * The function census below this one exists because a guard that trips on ordinary code gets
@@ -2597,6 +2682,23 @@ type Indirection = { readonly kind: string, readonly ref: string, readonly targe
 const LITERAL_NAME = /^["']?([A-Za-z_][A-Za-z0-9_]*)["']?$/
 const literalName = (word: string): string | null => LITERAL_NAME.exec(word)?.[1] ?? null
 
+/**
+ * The name an assignment's WHOLE right-hand side is, or `null` when the word is anything else.
+ *
+ * Stricter than {@link literalName} in one way that matters here: the quoting has to BALANCE.
+ * shellAssignments() ends a word at the first byte the mask and the source agree is a
+ * metacharacter, so a quoted space ends it early and `ref="DB_FENCE_PROBE_REASON extra"` comes back
+ * as the fragment `"DB_FENCE_PROBE_REASON`. literalName() would read that as the name, and the
+ * report set would gain a name that is not an alias — which is not a harmless over-approximation
+ * here, because a report in the set is a name the CONDITIONAL rule is allowed to see beside another
+ * report and stay silent about. An unbalanced fragment is therefore not a name.
+ */
+const ALIASED_NAME = /^(?:([A-Za-z_][A-Za-z0-9_]*)|"([A-Za-z_][A-Za-z0-9_]*)"|'([A-Za-z_][A-Za-z0-9_]*)')$/
+const aliasedName = (word: string): string | null => {
+  const match = ALIASED_NAME.exec(word)
+  return match === null ? null : (match[1] ?? match[2] ?? match[3])
+}
+
 function indirections(segment: string): Indirection[] {
   const out: Indirection[] = []
   // `${!c}`, `${!c[@]}`, `${!c*}`, `${!c-default}` — the controller is `c`, never the name read.
@@ -2737,20 +2839,25 @@ function reportSinkComplaints(sources: ReadonlyArray<readonly [string, string]>,
     // A report's NAME held as the WHOLE of an assignment's right-hand side is an alias: after
     // `ref=DB_FENCE_PROBE_REASON`, `${!ref}` reads the report. Whole-RHS only — see the note above
     // indirections() for the 786-complaint measurement that rejected the looser form.
+    //
+    // WHICH ASSIGNMENTS THOSE ARE IS NOT THIS RULE'S QUESTION TO ANSWER (o3d-secops r5, Codex HIGH).
+    // It used to answer it anyway, with `(?:local |export |readonly |declare [^ ]+ )*NAME=`, and
+    // that regex was wrong twice over: `declare ref=NAME` has no option word for `declare [^ ]+ `
+    // to eat, and `local scratch=x ref=NAME` has a SECOND operand the regex's `$` anchor could
+    // never reach. shellAssignments() answers it by the word rule this branch has used for
+    // definitions and for script-scope constants all along — a name is assigned where it starts a
+    // word — so `declare`, `local`, `export`, `readonly`, `typeset`, their option forms, their
+    // no-option forms and every operand of each are covered without one of them being enumerated.
+    // It reads the MASKED source too, so a `ref=DB_FENCE_PROBE_REASON` in a trailing comment or a
+    // here-document body is data rather than an alias, which the line rule could not tell.
     for (const [file, source] of sources) {
-      source.split('\n').forEach((raw, index) => {
-        const line = raw.trim()
-        if (line.length === 0 || line.startsWith('#')) return
-        for (const segment of shellSegments(line)) {
-          const held = /^(?:local |export |readonly |declare [^ ]+ )*([A-Za-z_][A-Za-z0-9_]*)\+?=(\S*)\s*$/.exec(segment)
-          if (held === null) continue
-          const pointee = literalName(held[2])
-          if (pointee !== null && reports.has(pointee) && !reports.has(held[1])) {
-            reports.add(held[1])
-            followed.push(`${held[1]} (holds the NAME ${pointee}, from ${file}:${index + 1})`)
-          }
-        }
-      })
+      for (const held of shellAssignments(source, file)) {
+        if (reports.has(held.name)) continue
+        const pointee = aliasedName(held.value)
+        if (pointee === null || !reports.has(pointee)) continue
+        reports.add(held.name)
+        followed.push(`${held.name} (holds the NAME ${pointee}, from ${file}:${held.line})`)
+      }
     }
     if (reports.size === before) break
   }
@@ -2805,6 +2912,16 @@ test('[o3d-secops] a report that reaches one of the four sinks fails the sink ce
     // A NAMEREF WITH A LITERAL POINTEE IS RESOLVED TOO: `$ref` IS ${DB_FENCE_PROBE_REASON}, so the
     // `rm` is DELETION of a report and is named as such rather than refused.
     ['local -n ref=DB_FENCE_PROBE_REASON\nrm -rf "${ref}"', /reaches DELETION with ref/],
+    // THE TWO SHAPES THE R4 ALIAS REGEX MISSED, and the ones this round's finding was about. Both
+    // are the ordinary alias — a report's NAME as the WHOLE right-hand side — written in a form the
+    // enumeration `(?:local |export |readonly |declare [^ ]+ )*` could not reach: a `declare` with
+    // no option word for it to eat, and a SECOND operand past the `$` it anchored on. Neither line
+    // expands anything, so under that regex the census saw no report on either statement and the
+    // `rm` that follows was a delete of a name it had never heard of.
+    ['declare declared_alias=DB_FENCE_PROBE_REASON\nrm -rf "${declared_alias}"',
+      /reaches DELETION with declared_alias/],
+    ['local scratch=/tmp/keep operand_alias=DB_FENCE_PROBE_REASON\nrm -rf "${operand_alias}"',
+      /reaches DELETION with operand_alias/],
     // AND WHAT CANNOT BE RESOLVED IS REFUSED RATHER THAN SKIPPED — four shapes, none of which puts
     // the variable's name in the text.
     ['node "${!DB_FENCE_PROBE_REASON}"', /uses an indirect expansion/],
@@ -3008,6 +3125,12 @@ test('[o3d-secops] a report renamed into a VARIABLE NAME inside an entrypoint is
  * AND IT MUST NOW CATCH ONE MORE THING THAN IT DID: a report laundered through a lowercase `local`,
  * PLANTED in that same tree. Under the r3 rule that plant produced nothing; under this one it is
  * the tenth complaint.
+ *
+ * R5 ADDS TWO MORE PLANTS FOR THE SAME REASON — `declare ref=NAME` and a second operand of one
+ * `local` — because the alias rule stopped being a regex over enumerated prefixes this round and
+ * became the same word rule shellConstantAssignments() uses. A rule change that is not re-measured
+ * against b128f47f is a rule that has quietly stopped being the one that was measured; the count is
+ * still exactly nine there, and each plant is still exactly the tenth.
  */
 const B128F47F = 'b128f47f'
 
@@ -3056,18 +3179,44 @@ test('[o3d-secops] the sink census still names exactly the seven values b128f47f
 
   // THE PLANTED LAUNDER: the same tree, plus one report routed through a lowercase `local` into
   // `node`. Under the r3 rule this produced nothing at all.
-  const planted = 'local laundered_reason="${DB_FENCE_PROBE_REASON}"\nnode "${laundered_reason}" --preflight'
-  const withPlant = reportSinkComplaints(
-    [[FENCE_LIBRARY, `${historical[0][1]}\n${planted}\n`], ...historical.slice(1)], B128F47F_MUTABLE)
+  const plantedInLibrary = (text: string): ReturnType<typeof reportSinkComplaints> => reportSinkComplaints(
+    [[FENCE_LIBRARY, `${historical[0][1]}\n${text}\n`], ...historical.slice(1)], B128F47F_MUTABLE)
+  const withPlant = plantedInLibrary('local laundered_reason="${DB_FENCE_PROBE_REASON}"\nnode "${laundered_reason}" --preflight')
   assert.equal(withPlant.complaints.length, 10,
     `the plant must be the tenth complaint and nothing else:\n${withPlant.complaints.join('\n')}`)
   assert.ok(withPlant.complaints.some((complaint) => /reaches EXECUTION with laundered_reason/.test(complaint)),
     withPlant.complaints.join('\n'))
 
+  // AND THE TWO ALIAS FORMS THE R4 REGEX COULD NOT READ, PLANTED IN THAT SAME TREE (r5).
+  //
+  // Each is the ordinary alias — a report's NAME as the WHOLE right-hand side — written in a form
+  // `(?:local |export |readonly |declare [^ ]+ )*NAME=(\S*)\s*$` could not reach: a `declare` with
+  // no option word for `declare [^ ]+ ` to eat, and a SECOND operand past the `$` the regex
+  // anchored on. NEITHER LINE EXPANDS ANYTHING, so nothing else in the census could have followed
+  // them either — under r4 both of these trees came back at nine complaints and the `rm -rf` two
+  // lines later was a delete of a name the census had never heard of. The FOLLOW is asserted as
+  // well as the complaint, because it is the follow that is the fix.
+  for (const [shape, text, sink, alias] of [
+    ['a `declare` with no option word',
+      'declare declared_alias=DB_FENCE_PROBE_REASON\nrm -rf "${declared_alias}"',
+      /reaches DELETION with declared_alias/,
+      'declared_alias (holds the NAME DB_FENCE_PROBE_REASON'],
+    ['a second operand of one `local`',
+      'local scratch=/tmp/keep operand_alias=DB_FENCE_PROBE_REASON\nrm -rf "${operand_alias}"',
+      /reaches DELETION with operand_alias/,
+      'operand_alias (holds the NAME DB_FENCE_PROBE_REASON'],
+  ] as ReadonlyArray<readonly [string, string, RegExp, string]>) {
+    const aliased = plantedInLibrary(text)
+    assert.equal(aliased.complaints.length, 10,
+      `${shape} must be the tenth complaint and nothing else:\n${aliased.complaints.join('\n')}`)
+    assert.ok(aliased.complaints.some((complaint) => sink.test(complaint)),
+      `${shape}:\n${aliased.complaints.join('\n')}`)
+    assert.ok(aliased.followed.some((entry) => entry.startsWith(alias)),
+      `${shape} must be FOLLOWED as an alias, which is what makes the sink visible; it followed: ${aliased.followed.join(', ')}`)
+  }
+
   // AND AN INDIRECT EXPANSION IN THAT TREE IS REFUSED, not passed over.
-  const indirect = reportSinkComplaints(
-    [[FENCE_LIBRARY, `${historical[0][1]}\nnode "\${!DB_FENCE_PROBE_SCRIPT}"\n`], ...historical.slice(1)],
-    B128F47F_MUTABLE)
+  const indirect = plantedInLibrary('node "\${!DB_FENCE_PROBE_SCRIPT}"')
   assert.equal(indirect.complaints.length, 10, indirect.complaints.join('\n'))
   assert.ok(indirect.complaints.some((complaint) => /uses an indirect expansion/.test(complaint)),
     indirect.complaints.join('\n'))
