@@ -1284,8 +1284,9 @@ says nothing about who may create it. So a root directly under `/tmp` is refused
   name containing a space, a `;`, a `$(…)`, a tab or a newline becomes one word that evaluates back
   to exactly those bytes and executes nothing), and the `fstab` line uses **fstab's** own escaping
   instead — `\040` for a space, `\011` for a tab, `\134` for a backslash — because `mount` reads
-  that field with different rules. A path carrying a newline gets a sentence pointing at a systemd
-  `.mount` unit rather than an `fstab` line that cannot express it.
+  that field with different rules. A path carrying a newline or a `#` gets a sentence pointing at a
+  systemd `.mount` unit rather than an `fstab` line that cannot express it: those two have no escape
+  in that format.
 
   **What an operator with a symlinked root must do** is the five numbered steps above, in that
   order. They matter as a sequence, not as a one-liner: the refusal is printed while the service and
@@ -1347,6 +1348,20 @@ Identity, not ownership: the recursive chowns hand `DATA_DIR` and `LOG_DIR` **th
 service account, so from the second run onward the roots are not root-owned and a "must be owned by
 root" rule would refuse every upgrade — while still accepting a *different* root-owned subtree
 renamed into the name. Continuity from the gate answers both.
+
+The gate also **opens a descriptor** on an approved root and holds it for the run, and section 8
+enters through `/proc/self/fd/N` — which the kernel resolves to the open file rather than to a
+pathname. A `dev:ino` alone would not be enough: inode numbers are reused, so an account that can
+write the parent could remove an empty approved root, create its own at the name, and win if the
+filesystem handed back the inode it had just freed. (A host without `/proc` falls back to entering
+by name with the `dev:ino` comparison.) The ownership change itself is `chown -Rh … .` and not
+`find … -exec chown`: coreutils walks with `fchownat(AT_SYMLINK_NOFOLLOW)` relative to descriptors
+it holds, whereas `find -exec` enumerates pathnames that are resolved again afterwards — and `-h`
+protects only the final component, so a descendant directory swapped for a symlink in between would
+redirect the change.
+
+Every `stat -c %F` in these scripts runs under `LC_ALL=C`, because coreutils **translates** those
+file-type descriptions and every walk compares them against the English words.
 
 **What this still does not cover**, stated rather than glossed: `logrotate` resolves
 `/var/log/one-two-inventory/*.log` by pathname, as root, on its own schedule, and on a

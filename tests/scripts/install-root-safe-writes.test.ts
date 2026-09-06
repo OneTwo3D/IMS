@@ -43,10 +43,12 @@ function rig(functions: string[], body: string, extra = ''): string {
   return [
     'set -uo pipefail',
     'APP_USER="svcuser"',
-    // o3d-secops r7: the gate records what it approved here, and enter_service_root() is held to
-    // it. Lifted for every rig because `set -u` makes a missing declaration a crash rather than a
-    // refusal, and a crash is indistinguishable from the refusal these tests assert.
+    // o3d-secops r7: the gate records what it approved here and holds a descriptor on it there,
+    // and enter_service_root() is held to both. Lifted for every rig because an undeclared name
+    // does not fail — bash would create an INDEXED array and quietly fold every string key onto
+    // index 0 — so a rig without these measures something other than the shipped script.
     shellConstant(INSTALL_SH, 'SERVICE_ROOT_APPROVED', 'scripts/install.sh'),
+    shellConstant(INSTALL_SH, 'SERVICE_ROOT_FD', 'scripts/install.sh'),
     'error() { printf "ERROR: %s\\n" "$*" >&2; }',
     'die() { error "$*"; exit 1; }',
     'info() { printf "INFO: %s\\n" "$*"; }',
@@ -4415,7 +4417,6 @@ const ROOT_GATE = ['refuse_symlinked_root', 'pin_service_root_parent', 'service_
 /** The declaration the gate records what it approved into, lifted rather than retyped: under
  *  `set -u` a rig without it dies on the first `${SERVICE_ROOT_APPROVED[…]-}`, and every "the run
  *  must refuse" assertion would pass for the wrong reason. */
-const ROOT_APPROVED_DECL = shellConstant(INSTALL_SH, 'SERVICE_ROOT_APPROVED', 'scripts/install.sh')
 
 /** The gate's ACTING twin (o3d-secops r7 second pass): it creates or accepts the root, proves it,
  *  and leaves the process inside it, so section 8's ownership change is aimed at an inode. */
@@ -4508,7 +4509,10 @@ test('[o3d-secops] the statements the mutations run are the ones the installer n
   // that simply dropped both operations.
   assert.match(SECTION8_ROOT_MKDIR, /enter_service_root "\$\{DATA_DIR\}" 022/)
   assert.match(SECTION8_ROOT_MKDIR, /enter_service_root "\$\{LOG_DIR\}" 022/)
-  assert.match(SECTION8_LOG_CHOWN, /enter_service_root "\$\{LOG_DIR\}"[\s\S]*find \. -exec chown -h/)
+  assert.match(SECTION8_LOG_CHOWN, /enter_service_root "\$\{LOG_DIR\}"[\s\S]*chown -Rh "\$\{APP_USER\}:\$\{APP_USER\}" \./)
+  // AND NOT THROUGH `find -exec`, which enumerates pathnames and lets a descendant be swapped
+  // between the enumeration and the chown that resolves it again.
+  assert.ok(!/find \. -exec chown/.test(SECTION8_LOG_CHOWN), SECTION8_LOG_CHOWN)
   // AND THE CREATING CALLS ARE NOT IN A SUBSHELL. enter_service_root() RECORDS the identity of a
   // root it creates, and the ownership change is held to that record; a subshell would discard it
   // and the second call would refuse the very directory the first one made. Measured on the shipped
@@ -4972,6 +4976,40 @@ test('[o3d-secops] a root renamed AFTER the gate does not redirect the ownership
     'while the directory the gate actually approved is left alone')
 })
 
+/**
+ * scripts/install.sh's enter_service_root() with named checks disabled, and nothing else changed.
+ *
+ * Each comparison is neutered by replacing the `[[ … ]]` TEST with `[[ 1 == 1 ]]`, so the `die` and
+ * its message stay exactly where they were and the only thing that changes is whether the condition
+ * can fire. Every replacement asserts its precondition on the shipped text first: a mutation that
+ * silently matched nothing is a test that measures nothing, which is the failure mode this whole
+ * file is built against.
+ */
+function entryWithout(disable: { identity?: boolean, landing?: boolean, descriptor?: boolean }): string {
+  let body = shellFunction(INSTALL_SH, 'enter_service_root')
+  const neuter = (test: string) => {
+    assert.ok(body.includes(test), `precondition: the shipped entry must contain ${test}`)
+    body = body.replace(test, '[[ 1 == 1 ]]')
+  }
+  if (disable.identity) {
+    // BOTH comparisons against what pre-flight approved: one made of the ENTRY, before this process
+    // goes anywhere — that is the one that says the NAME still leads to the approved directory —
+    // and one of the directory it landed in.
+    neuter('[[ "${entry#*|}" == "${approved}" ]]')
+    neuter('[[ "${landed}" == "${approved}" ]]')
+  }
+  if (disable.landing) {
+    neuter('[[ -n "${landed}" && "${landed}" == "${entry#*|}" ]]')
+  }
+  if (disable.descriptor) {
+    const branch = '  if [[ -n "${fd}" && -d "/proc/self/fd/${fd}" ]]; then'
+    assert.ok(body.includes(branch), `precondition: the shipped entry must enter through the descriptor: ${body}`)
+    body = body.replace(branch, '  if false; then')
+    assert.ok(body.includes('cd -P "${base}"'), 'and must still have the by-name fallback to fall into')
+  }
+  return body
+}
+
 test('[o3d-secops] a root SWAPPED between the gate and the entry is refused, though everything but its identity checks out', (t) => {
   /**
    * THE WINDOW THE GATE CANNOT CLOSE ON ITS OWN. The gate approves an entry and releases the cwd it
@@ -5024,11 +5062,11 @@ test('[o3d-secops] a root SWAPPED between the gate and the entry is refused, tho
   // MEASURED BY MUTATION, ROUTE STATED: the identity comparison removed from the shipped function,
   // and nothing else. Everything the walk checks still passes on the replacement — which is the
   // whole point of the finding — so the run goes through and changes somebody else's tree.
-  const shipped = shellFunction(INSTALL_SH, 'enter_service_root')
-  const check = shipped.split('\n').find((line) => line.includes('"${landed}" == "${approved}"'))
-  assert.ok(check, `precondition: the shipped entry must compare the landed inode with the approved one: ${shipped}`)
-  const blind = shipped.replace(`${check}\n`, '    [[ -n "${landed}" ]] || return 1\n')
-  assert.ok(!blind.includes('"${landed}" == "${approved}"'), 'the mutation must remove the identity comparison')
+  // scripts/install.sh as it stood before this pass, reproduced from the shipped function: no
+  // continuity with the gate, no landing check, and the root entered BY NAME. Every one of the
+  // three has to go, because each on its own would refuse this swap — which is the point, and is
+  // why the mutation names all three rather than one.
+  const blind = entryWithout({ identity: true, landing: true, descriptor: true })
 
   const attacked = plantSwap('ims-secops-swap-mutated-')
   const mutated = runBash(rig(ROOT_ENTER.filter((n) => n !== 'enter_service_root'), swap(attacked), blind))
@@ -5249,4 +5287,104 @@ test('[o3d-secops] a target whose name carries shell syntax is quoted, and the p
   // matters is what ran before it did.
   assert.equal(existsSync(attackedCanary), true,
     `the unquoted command must execute the substitution when pasted — that is the finding, executed: ${pasted.stderr}`)
+})
+
+test('[o3d-secops] the root is entered through the descriptor pre-flight opened, so a recycled inode cannot impersonate it', (t) => {
+  /**
+   * A `dev:ino` IS NOT A DURABLE IDENTITY. Inode numbers are reused, and an account that can write
+   * the root's parent can remove an empty approved root and create its own directory at the name;
+   * if the filesystem hands back the inode it has just freed, every comparison against a recorded
+   * `dev:ino` succeeds on the impostor. The descriptor the gate opens is the answer: the kernel
+   * resolves `/proc/self/fd/N` to the open file, not to a pathname.
+   *
+   * INODE REUSE CANNOT BE COMMANDED FROM A TEST, so this measures the PROPERTY that makes the
+   * attack impossible rather than staging the attack: with the approved root renamed aside and a
+   * different directory at its name, the entry reaches the ORIGINAL directory — the one the
+   * descriptor is on — and not the one the name now leads to. An implementation that re-entered by
+   * name would land on the impostor whether or not its inode matched, and the mutation shows it.
+   */
+  /** A FRESH LAYOUT PER RUN: each script below MOVES the impostor onto the root's name, so two
+   *  runs over one fixture would leave the second with nothing to move and refusing for a reason
+   *  that has nothing to do with what is being measured. */
+  function plantImpostor(prefix: string) {
+    const base = createTempDirSync(prefix, t)
+    const varlog = join(base, 'var-log')
+    mkdirSync(varlog)
+    chmodSync(varlog, 0o777)
+    const root = join(varlog, 'ims')
+    mkdirSync(root)
+    writeFileSync(join(root, 'APPROVED'), 'the directory the gate opened\n')
+    const impostor = join(varlog, 'impostor')
+    mkdirSync(impostor)
+    writeFileSync(join(impostor, 'IMPOSTOR'), 'a different directory at the same name\n')
+    return { base, root, impostor }
+  }
+
+  /** The gate, then the swap, then the entry — with the identity comparisons removed, so that what
+   *  is left to observe is WHICH DIRECTORY the entry reaches rather than whether it refused. */
+  // The continuity comparisons and the landing check removed — so that what is left to observe is
+  // WHICH DIRECTORY the entry reaches, rather than whether it refused. The descriptor branch stays,
+  // because it is the subject.
+  const blind = entryWithout({ identity: true, landing: true })
+
+  const script = (p: ReturnType<typeof plantImpostor>, extra: string) => rig(
+    ROOT_ENTER.filter((n) => n !== 'enter_service_root'),
+    [
+      `require_real_service_root ${q(p.root)} "the log directory"`,
+      `mv ${q(p.root)} ${q(`${p.root}.moved`)}`,
+      `mv ${q(p.impostor)} ${q(p.root)}`,
+      `enter_service_root ${q(p.root)} 022 "the log directory"`,
+      'ls',
+    ].join('\n'),
+    extra,
+  )
+
+  const viaFd = runBash(script(plantImpostor('ims-secops-fdpin-'), blind))
+  assert.equal(viaFd.status, 0, `the entry must complete: ${viaFd.stderr}`)
+  assert.equal(viaFd.stdout.trim(), 'APPROVED',
+    'the entry must reach the directory the descriptor is open on, whatever the name now leads to')
+
+  // MEASURED BY MUTATION, ROUTE STATED: the same function with the descriptor branch removed, so it
+  // enters by NAME — which is where it stood before this pass, and where a recycled inode would win.
+  const byName = entryWithout({ identity: true, landing: true, descriptor: true })
+  assert.notEqual(byName, blind, 'the two must differ only in how the root is entered')
+
+  const viaName = runBash(script(plantImpostor('ims-secops-fdpin-byname-'), byName))
+  assert.equal(viaName.status, 0, `the by-name entry must complete: ${viaName.stderr}`)
+  assert.equal(viaName.stdout.trim(), 'IMPOSTOR',
+    'entering by name reaches whatever now stands at it — which is what the descriptor exists to prevent')
+})
+
+test('[o3d-secops] the gate does not depend on the language the machine speaks', () => {
+  /**
+   * GNU coreutils TRANSLATES the file-type descriptions `stat -c %F` prints — "répertoire",
+   * "Verzeichnis", "lien symbolique" — and every walk in these scripts compares them against the
+   * English words. Unforced, the parent walk would reject `/opt` on its first component and the
+   * installer would refuse to run at all on a French or German host; and the `== "symbolic link"`
+   * comparisons would fail to RECOGNISE a link, which is worse than refusing.
+   *
+   * MEASURED AS A PROPERTY OF THE SOURCE, because a locale that is not generated on the machine
+   * running the tests cannot be exercised — `locale -a` here lists only C, C.utf8 and POSIX, so a
+   * behavioural test would silently measure C twice. What is asserted is the grammar: every `%F`
+   * query in the tracked shell scripts is run with LC_ALL=C.
+   */
+  const files = ['scripts/install.sh', 'scripts/deploy.sh', 'scripts/update.sh', 'scripts/lib/crontab-lock.sh']
+  const unforced: string[] = []
+  let total = 0
+  for (const file of files) {
+    const source = readFileSync(join(REPO, file), 'utf8')
+    for (const line of source.split('\n')) {
+      if (line.trimStart().startsWith('#')) continue
+      // Every INVOCATION: `%F` is only ever read through a command substitution in these scripts.
+      const invocations = line.split("stat -c '%F").length - 1
+      if (invocations === 0) continue
+      total += invocations
+      if (invocations !== line.split("LC_ALL=C stat -c '%F").length - 1) unforced.push(`${file}» ${line.trim()}`)
+    }
+  }
+  // NOT VACUOUS: the walk found the queries. A rule that matched nothing would report none unforced.
+  assert.ok(total >= 20, `the walk must reach the %F queries; it found ${total}`)
+  assert.deepEqual(unforced, [],
+    'every `stat -c %F` whose answer is compared against an English file-type description must be '
+    + 'run with LC_ALL=C, or the comparison is a statement about the operator\'s language')
 })

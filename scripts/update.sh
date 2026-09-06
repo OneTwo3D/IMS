@@ -2003,7 +2003,7 @@ pin_publish_root_parent() {
     [[ "$comp" != "." && "$comp" != ".." ]] || return 1
     # ONE lstat, TAKING THE TYPE AND THE IDENTITY TOGETHER, so the two cannot describe different
     # directories. No `-L`, so a symlinked ancestor is refused rather than followed.
-    entry="$(stat -c '%F|%d:%i' "$comp" 2>/dev/null || true)"
+    entry="$(LC_ALL=C stat -c '%F|%d:%i' "$comp" 2>/dev/null || true)"
     [[ "${entry%%|*}" == "directory" ]] || return 1
     entry="${entry#*|}"
     if (( (8#$mode & 8#22) != 0 )); then
@@ -2186,8 +2186,11 @@ refuse_symlinked_root() {
   # one gets a sentence instead of a line to paste.
   froot="${root//\\/\\134}"; froot="${froot// /\\040}"; froot="${froot//$'\t'/\\011}"
   ftarget="${target//\\/\\134}"; ftarget="${ftarget// /\\040}"; ftarget="${ftarget//$'\t'/\\011}"
-  if [[ "$root" == *$'\n'* || "$target" == *$'\n'* ]]; then
-    printf 'ERROR:   5. one of these paths contains a newline, which /etc/fstab cannot express — make the bind persistent with a systemd .mount unit instead, then start the service again\n' >&2
+  # A NEWLINE ENDS AN fstab RECORD AND A `#` BEGINS A COMMENT, and neither has an escape in that
+  # format — `\040`, `\011`, `\012` and `\134` are the whole vocabulary. A path containing either
+  # cannot be written into /etc/fstab at all, so it gets a sentence instead of a line to paste.
+  if [[ "$root" == *$'\n'* || "$target" == *$'\n'* || "$root" == *"#"* || "$target" == *"#"* ]]; then
+    printf 'ERROR:   5. one of these paths contains a newline or a "#", which /etc/fstab cannot express — make the bind persistent with a systemd .mount unit instead, then start the service again\n' >&2
   else
     printf 'ERROR:   5. add: %s %s none bind 0 0   to /etc/fstab so the bind survives a reboot, then start the service again\n' "$ftarget" "$froot" >&2
   fi
@@ -2211,7 +2214,7 @@ pin_dir_beneath_root() {
   # inode/`..` checked like every component below it, with a SYMLINK AT IT REFUSED. See the
   # comment above for the finding and for why the second disk is a bind mount and not a link.
   mkdir "$base" 2>/dev/null || true
-  entry="$(stat -c '%F|%d:%i' "$base" 2>/dev/null || true)"
+  entry="$(LC_ALL=C stat -c '%F|%d:%i' "$base" 2>/dev/null || true)"
   if [[ "${entry%%|*}" != "directory" ]]; then
     if [[ "${entry%%|*}" == "symbolic link" ]]; then
       # THE SAME BYTES THE PRE-FLIGHT GATE PRINTS (o3d-secops r7). One rule, one text.
@@ -2235,7 +2238,7 @@ pin_dir_beneath_root() {
     # ONE lstat, TAKING THE TYPE AND THE IDENTITY TOGETHER — whether this run created the component
     # a moment ago or found it already there. `stat` without `-L` does not dereference, so a link
     # reads as "symbolic link" and is refused before anything steps into it.
-    entry="$(stat -c '%F|%d:%i' "$comp" 2>/dev/null || true)"
+    entry="$(LC_ALL=C stat -c '%F|%d:%i' "$comp" 2>/dev/null || true)"
     [[ "${entry%%|*}" == "directory" ]] || return 1
     cd -P "$comp" 2>/dev/null || return 1
     # AND THE DIRECTORY WE LANDED IN IS THE ONE THAT ENTRY NAMED. `..` alone accepts a component
@@ -2337,7 +2340,7 @@ publish_durable_file() {
     [[ -n "$parent" ]] || exit 1
     # A SINGLE RELATIVE COMPONENT, resolved by the kernel from the directory this process holds.
     if ! (umask 077; mkdir "${PUBLISH_STAGE_DIRNAME}") 2>/dev/null; then
-      [[ "$(stat -c '%F' "${PUBLISH_STAGE_DIRNAME}" 2>/dev/null || true)" == "directory" ]] || exit 1
+      [[ "$(LC_ALL=C stat -c '%F' "${PUBLISH_STAGE_DIRNAME}" 2>/dev/null || true)" == "directory" ]] || exit 1
     fi
     # `-h`, so a name that became a symlink between the mkdir and here has the LINK re-owned and
     # not its target. The verification that follows the chdir is what decides whether we proceed.

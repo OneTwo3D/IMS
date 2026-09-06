@@ -2769,7 +2769,7 @@ pin_publish_root_parent() {
     [[ "$comp" != "." && "$comp" != ".." ]] || return 1
     # ONE lstat, TAKING THE TYPE AND THE IDENTITY TOGETHER, so the two cannot describe different
     # directories. No `-L`, so a symlinked ancestor is refused rather than followed.
-    entry="$(stat -c '%F|%d:%i' "$comp" 2>/dev/null || true)"
+    entry="$(LC_ALL=C stat -c '%F|%d:%i' "$comp" 2>/dev/null || true)"
     [[ "${entry%%|*}" == "directory" ]] || return 1
     entry="${entry#*|}"
     if (( (8#$mode & 8#22) != 0 )); then
@@ -2963,8 +2963,11 @@ refuse_symlinked_root() {
   # one gets a sentence instead of a line to paste.
   froot="${root//\\/\\134}"; froot="${froot// /\\040}"; froot="${froot//$'\t'/\\011}"
   ftarget="${target//\\/\\134}"; ftarget="${ftarget// /\\040}"; ftarget="${ftarget//$'\t'/\\011}"
-  if [[ "$root" == *$'\n'* || "$target" == *$'\n'* ]]; then
-    printf 'ERROR:   5. one of these paths contains a newline, which /etc/fstab cannot express — make the bind persistent with a systemd .mount unit instead, then start the service again\n' >&2
+  # A NEWLINE ENDS AN fstab RECORD AND A `#` BEGINS A COMMENT, and neither has an escape in that
+  # format — `\040`, `\011`, `\012` and `\134` are the whole vocabulary. A path containing either
+  # cannot be written into /etc/fstab at all, so it gets a sentence instead of a line to paste.
+  if [[ "$root" == *$'\n'* || "$target" == *$'\n'* || "$root" == *"#"* || "$target" == *"#"* ]]; then
+    printf 'ERROR:   5. one of these paths contains a newline or a "#", which /etc/fstab cannot express — make the bind persistent with a systemd .mount unit instead, then start the service again\n' >&2
   else
     printf 'ERROR:   5. add: %s %s none bind 0 0   to /etc/fstab so the bind survives a reboot, then start the service again\n' "$ftarget" "$froot" >&2
   fi
@@ -2988,7 +2991,7 @@ pin_dir_beneath_root() {
   # inode/`..` checked like every component below it, with a SYMLINK AT IT REFUSED. See the
   # comment above for the finding and for why the second disk is a bind mount and not a link.
   mkdir "$base" 2>/dev/null || true
-  entry="$(stat -c '%F|%d:%i' "$base" 2>/dev/null || true)"
+  entry="$(LC_ALL=C stat -c '%F|%d:%i' "$base" 2>/dev/null || true)"
   if [[ "${entry%%|*}" != "directory" ]]; then
     if [[ "${entry%%|*}" == "symbolic link" ]]; then
       # THE SAME BYTES THE PRE-FLIGHT GATE PRINTS (o3d-secops r7). One rule, one text.
@@ -3012,7 +3015,7 @@ pin_dir_beneath_root() {
     # ONE lstat, TAKING THE TYPE AND THE IDENTITY TOGETHER — whether this run created the component
     # a moment ago or found it already there. `stat` without `-L` does not dereference, so a link
     # reads as "symbolic link" and is refused before anything steps into it.
-    entry="$(stat -c '%F|%d:%i' "$comp" 2>/dev/null || true)"
+    entry="$(LC_ALL=C stat -c '%F|%d:%i' "$comp" 2>/dev/null || true)"
     [[ "${entry%%|*}" == "directory" ]] || return 1
     cd -P "$comp" 2>/dev/null || return 1
     # AND THE DIRECTORY WE LANDED IN IS THE ONE THAT ENTRY NAMED. `..` alone accepts a component
@@ -3114,7 +3117,7 @@ publish_durable_file() {
     [[ -n "$parent" ]] || exit 1
     # A SINGLE RELATIVE COMPONENT, resolved by the kernel from the directory this process holds.
     if ! (umask 077; mkdir "${PUBLISH_STAGE_DIRNAME}") 2>/dev/null; then
-      [[ "$(stat -c '%F' "${PUBLISH_STAGE_DIRNAME}" 2>/dev/null || true)" == "directory" ]] || exit 1
+      [[ "$(LC_ALL=C stat -c '%F' "${PUBLISH_STAGE_DIRNAME}" 2>/dev/null || true)" == "directory" ]] || exit 1
     fi
     # `-h`, so a name that became a symlink between the mkdir and here has the LINK re-owned and
     # not its target. The verification that follows the chdir is what decides whether we proceed.
@@ -3239,13 +3242,13 @@ enter_service_subdir() {
     [[ -n "${comp}" ]] || continue
     built="${built}/${comp}"
     if ! (umask "${mask}"; mkdir "${comp}") 2>/dev/null; then
-      kind="$(stat -c '%F' "${comp}" 2>/dev/null || true)"
+      kind="$(LC_ALL=C stat -c '%F' "${comp}" 2>/dev/null || true)"
       [[ "${kind}" == "directory" ]] || die \
         "${built} exists and is a ${kind:-missing path}, not a directory. A symlink there is how a compromised '${APP_USER}' would aim this installer's root-side writes at a path of their choosing, so this run refuses rather than following it. Remove or fix that path and run the installer again; nothing has been changed."
     fi
     # THE TYPE AND THE IDENTITY, TAKEN TOGETHER, whether this run created the component or accepted
     # one that was already there. `stat` without `-L` does not dereference.
-    entry="$(stat -c '%F|%d:%i' "${comp}" 2>/dev/null || true)"
+    entry="$(LC_ALL=C stat -c '%F|%d:%i' "${comp}" 2>/dev/null || true)"
     [[ "${entry%%|*}" == "directory" ]] || die \
       "${built} is not the directory this run had just checked: it was replaced between the check and the step into it, which is how a compromised '${APP_USER}' would aim this installer's root-side writes at a path of their choosing. This run refuses rather than following it; nothing has been changed."
     cd -P "${comp}" 2>/dev/null || die \
@@ -3352,11 +3355,19 @@ service_root_entry_kind() {
   # ONE lstat, in the directory the walk is standing in, of a SINGLE COMPONENT — never a pathname.
   # "absent|" is a first install, and is the one answer that is neither a directory nor a refusal.
   #
+  # `LC_ALL=C`, ON EVERY `%F` IN THESE SCRIPTS (o3d-secops r7 fourth pass, Codex MEDIUM). GNU
+  # coreutils TRANSLATES the file-type descriptions `%F` prints — "répertoire", "Verzeichnis",
+  # "lien symbolique" — and every walk here compares them against the English words. Unforced, the
+  # parent walk would reject `/opt` on the first component of a French or German host and the
+  # installer would refuse to run at all; and where a comparison is `== "symbolic link"` rather than
+  # `== "directory"`, a translated answer would fail to RECOGNISE a link. The tests run in a C
+  # locale and could never have shown either.
+  #
   # THE IDENTITY COMES BACK WITH THE KIND (o3d-secops r7 third pass, Codex HIGH), taken by the SAME
   # lstat so the two cannot describe different directories. enter_service_root() then requires the
   # entry it acts on to be this one, which is what turns the gate from an observation into a
   # premise the acting path can be held to.
-  stat -c '%F|%d:%i' "${base}" 2>/dev/null || printf 'absent|\n'
+  LC_ALL=C stat -c '%F|%d:%i' "${base}" 2>/dev/null || printf 'absent|\n'
 }
 
 # THE WALK, ONCE, USED BOTH TO ASK AND TO ACT (o3d-secops r7 second pass).
@@ -3405,7 +3416,7 @@ pin_service_root_parent() {
     [[ "${comp}" != "." && "${comp}" != ".." ]] || return 1
     # ONE lstat, TAKING THE TYPE AND THE IDENTITY TOGETHER, so the two cannot describe different
     # directories. No `-L`, so a symlinked ancestor is refused rather than followed.
-    entry="$(stat -c '%F|%d:%i' "${comp}" 2>/dev/null || true)"
+    entry="$(LC_ALL=C stat -c '%F|%d:%i' "${comp}" 2>/dev/null || true)"
     [[ "${entry%%|*}" == "directory" ]] || return 1
     cd -P "${comp}" 2>/dev/null || return 1
     [[ "$(stat -c '%d:%i' . 2>/dev/null || true)" == "${entry#*|}" ]] || return 1
@@ -3423,9 +3434,32 @@ pin_service_root_parent() {
 # directory there, and the word `absent` when the name was free.
 declare -A SERVICE_ROOT_APPROVED=()
 
+# AND AN OPEN DESCRIPTOR ON IT, WHERE THERE IS ONE TO OPEN (o3d-secops r7 fourth pass, Codex HIGH).
+#
+# A `dev:ino` is not a durable identity: inode numbers are REUSED. An account that can write the
+# root's parent — /var/log is group-writable on Ubuntu — can remove an empty approved root and
+# create its own directory at the name, and if the filesystem hands back the inode it just freed,
+# every comparison a later check makes succeeds. ext4 reuses recently-freed inodes readily enough
+# that this is not a theoretical objection.
+#
+# A DESCRIPTOR IS THE DURABLE IDENTITY. The gate opens the approved directory — by SINGLE COMPONENT,
+# from inside the parent its own walk pinned — and holds the fd for the length of the run.
+# enter_service_root() then reaches the directory through `/proc/self/fd/N`, which the kernel
+# resolves to the open file itself rather than to a pathname, so a rename cannot move it and a
+# delete-and-recreate cannot impersonate it. Verified rather than assumed: with the entry renamed
+# aside and a fresh directory at its name, `cd /proc/self/fd/N` lands on the ORIGINAL inode and its
+# `..` is still the parent.
+#
+# /proc IS A DEPENDENCY AND IT IS DECLARED. This installer supports Debian and Ubuntu, where /proc
+# is always mounted; a host without it falls back to entering by name with the `dev:ino` comparison,
+# which is where this stood before this pass, and which is still stronger than the pathname it
+# replaced.
+declare -A SERVICE_ROOT_FD=()
+
 # The gate. It either returns or ends the run; there is no third outcome and no caller decides.
 require_real_service_root() {
-  local root="$1" what="$2" answer kind rc=0
+  local root="$1" what="$2" answer kind base saved fd rc=0
+  base="${root##*/}"
   # A COMMAND SUBSTITUTION IS THE SUBSHELL: service_root_entry_kind() leaves the shell it runs in
   # inside the parent, on success and part-way down on failure, and the installer's own cwd must
   # not move. The status is taken with `|| rc=$?` because under `set -e` a failed substitution in
@@ -3436,7 +3470,28 @@ require_real_service_root() {
   fi
   kind="${answer%%|*}"
   case "${kind}" in
-    directory) SERVICE_ROOT_APPROVED["${root}"]="${answer#*|}" ; return 0 ;;
+    directory)
+      SERVICE_ROOT_APPROVED["${root}"]="${answer#*|}"
+      # THE DESCRIPTOR, OPENED FROM INSIDE THE PINNED PARENT. The walk runs a second time here, in
+      # a subshell of its own — the open has to happen where the shell is standing in the parent,
+      # and the answer above came out of a subshell that has already gone. A second walk can land
+      # on a different entry than the first if somebody renamed in between; that is exactly what
+      # the `dev:ino` comparison below catches, and a refusal is the right outcome either way.
+      saved="$(pwd -P)" || die "this run cannot establish its own working directory. Nothing has been changed."
+      if pin_service_root_parent "${root}" && exec {fd}< "${base}"; then
+        # `-L`, WHICH IS THE ONE PLACE IN THESE SCRIPTS THAT WANTS IT. /proc/self/fd/N is a magic
+        # link, and every other `stat` here is deliberately an lstat — so without `-L` this compares
+        # the inode of the /proc entry against the inode of a directory and never matches, which is
+        # a descriptor silently not taken rather than a refusal. It was written that way first.
+        if [[ "$(stat -L -c '%d:%i' "/proc/self/fd/${fd}" 2>/dev/null || true)" == "${answer#*|}" ]]; then
+          SERVICE_ROOT_FD["${root}"]="${fd}"
+        else
+          exec {fd}<&-
+        fi
+      fi
+      cd "${saved}" || die "this run could not return to ${saved} after checking ${root}. Nothing further has been changed."
+      return 0
+      ;;
     absent)    SERVICE_ROOT_APPROVED["${root}"]="absent"       ; return 0 ;;
     'symbolic link')
       refuse_symlinked_root "${root}"
@@ -3477,13 +3532,14 @@ require_real_service_root() {
 # there keeps whatever mode it has: chmod has no --no-dereference on Linux, which is the same
 # reason mkdir_service_subdir() gives.
 enter_service_root() {
-  local root="$1" mask="$2" what="$3" base parent entry kind approved landed created=false
+  local root="$1" mask="$2" what="$3" base parent entry kind approved landed fd newfd created=false
   base="${root##*/}"
   [[ "${root}" == /* && -n "${base}" && "${base}" != "." && "${base}" != ".." ]] || die \
     "enter_service_root was asked for '${root}', which is not an absolute path with a nameable last component. This is a bug in this script, not an operator error."
   # WHAT THE GATE APPROVED, AND A REFUSAL IF IT APPROVED NOTHING. Acting on a root no pre-flight
   # check has seen would be the defect this whole round is about, one call site over.
   approved="${SERVICE_ROOT_APPROVED[${root}]-}"
+  fd="${SERVICE_ROOT_FD[${root}]-}"
   [[ -n "${approved}" ]] || die \
     "enter_service_root was asked for ${root}, which require_real_service_root() has not approved in this run. This is a bug in this script, not an operator error: the gate is what establishes the identity this function holds the entry to."
   # CALLED DIRECTLY AND NOT THROUGH `$( )`: the chdir it performs is the pin every step below
@@ -3506,13 +3562,22 @@ enter_service_root() {
   # subtree into the name. The question is not who owns it; it is whether it is the entry the gate
   # approved.
   if [[ "${approved}" == "absent" ]]; then
-    ${created} || die \
-      "${root} — ${what} — did not exist when this run checked it at pre-flight and something has created it since. This run will not adopt a directory it did not make at that name — on a parent another account can write, that entry is theirs and its contents are whatever they chose. Remove it and run the installer again; nothing has been changed."
+    if ! ${created}; then
+      # A FAILED `mkdir` HAS TWO MEANINGS AND THEY GET DIFFERENT SENTENCES. If the name is still
+      # free the filesystem refused us — read-only, full, or a permission this run does not have —
+      # and telling that operator somebody planted a directory would send them hunting for an
+      # attacker that is not there.
+      entry="$(LC_ALL=C stat -c '%F|%d:%i' "${base}" 2>/dev/null || true)"
+      [[ -n "${entry}" ]] || die \
+        "${root} — ${what} — could not be created. The name is still free, so this is the filesystem refusing: a read-only mount, a full disk, or a permission this run does not have. Nothing has been changed."
+      die \
+        "${root} — ${what} — did not exist when this run checked it at pre-flight and something has created it since. This run will not adopt a directory it did not make at that name — on a parent another account can write, that entry is theirs and its contents are whatever they chose. Remove it and run the installer again; nothing has been changed."
+    fi
   else
     ! ${created} || die \
       "${root} — ${what} — existed when this run checked it at pre-flight and does not now: it was removed while this installation was running. This run refuses rather than carrying on against a directory that is not the one it approved. Nothing has been changed."
   fi
-  entry="$(stat -c '%F|%d:%i' "${base}" 2>/dev/null || true)"
+  entry="$(LC_ALL=C stat -c '%F|%d:%i' "${base}" 2>/dev/null || true)"
   kind="${entry%%|*}"
   if [[ "${kind}" != "directory" ]]; then
     if [[ "${kind}" == "symbolic link" ]]; then
@@ -3520,8 +3585,27 @@ enter_service_root() {
     fi
     die "${root} — ${what} — is a ${kind:-missing path}, not a directory, so this run will not create anything at that name or write through it. Nothing has been changed."
   fi
-  cd -P "${base}" 2>/dev/null || die \
-    "${root} — ${what} — could not be entered after this run created or accepted it. Nothing has been changed."
+  # THE NAME MUST STILL LEAD TO THE APPROVED ENTRY, asked here — before this process goes anywhere —
+  # because it is a statement about the DEPLOYMENT and not about this operation: a root renamed
+  # aside and replaced leaves the service, the crontab and logrotate pointing at the replacement,
+  # and a run that quietly chowned the old inode and carried on would have made that coherent-
+  # looking and wrong.
+  if [[ "${approved}" != "absent" ]]; then
+    [[ "${entry#*|}" == "${approved}" ]] || die \
+      "${root} — ${what} — is not the directory this run approved at pre-flight: the entry at that name was replaced between the two. On a parent another account can write — /var/log is group-writable on some distributions — that takes a rename and nothing else, and every other check here passes on the replacement. This run refuses rather than writing into it; nothing has been changed."
+  fi
+  # ENTERED THROUGH THE DESCRIPTOR THE GATE OPENED, where there is one (o3d-secops r7 fourth pass,
+  # Codex HIGH). `/proc/self/fd/N` is resolved by the kernel to the OPEN FILE, not to a pathname, so
+  # a rename cannot move it and a delete-and-recreate that recycles the inode cannot impersonate it.
+  # The entry check above has already established that the NAME still leads here, which is the other
+  # half: without it this would happily chown a directory the deployment no longer refers to.
+  if [[ -n "${fd}" && -d "/proc/self/fd/${fd}" ]]; then
+    cd "/proc/self/fd/${fd}" 2>/dev/null || die \
+      "${root} — ${what} — could not be entered through the descriptor this run opened for it at pre-flight. Nothing has been changed."
+  else
+    cd -P "${base}" 2>/dev/null || die \
+      "${root} — ${what} — could not be entered after this run created or accepted it. Nothing has been changed."
+  fi
   # THE TWO IDENTITY CHECKS, of `.` and of `..`, both answered by the kernel for the inode this
   # process is inside rather than by re-resolving a name.
   landed="$(stat -c '%d:%i' . 2>/dev/null || true)"
@@ -3530,13 +3614,23 @@ enter_service_root() {
   [[ "$(stat -c '%d:%i' .. 2>/dev/null || true)" == "${parent}" ]] || die \
     "${root} — ${what} — is not in the directory this run walked to: it was replaced between the check and the step into it. This run refuses rather than following it; nothing has been changed."
   if [[ "${approved}" == "absent" ]]; then
-    # Created by THIS run's `mkdir`, so it is ours. Record what it made, because the next call for
-    # the same root — the ownership change below is one — must be held to this same entry.
+    # Created by THIS run's `mkdir`, so it is ours. Record what it made — and open a descriptor on
+    # it — because the next call for the same root (the ownership change below is one) must be held
+    # to this same directory, and by then the name is no more trustworthy than any other.
     SERVICE_ROOT_APPROVED["${root}"]="${landed}"
+    if exec {newfd}< .; then SERVICE_ROOT_FD["${root}"]="${newfd}"; fi
   else
     # AND IT IS THE VERY ENTRY THE GATE APPROVED. A rename in a group-writable parent needs no
     # symlink and no privilege, and every structural check above passes on the replacement: it is a
     # real directory, in the right parent, and its `..` is correct. Only its identity differs.
+    #
+    # WHAT A dev:ino DOES NOT PROVE, stated rather than glossed: inode numbers are REUSED. An
+    # attacker who removes the approved root and gets the filesystem to hand the same inode back
+    # to a directory of their own would pass this. That is not a race they can aim — the allocator
+    # chooses, not they — and it costs them the log directory, which is noisy; the alternative is
+    # to hold an open descriptor from pre-flight to section 8, through the `$( )` the gate runs in
+    # and across every intervening command, which bash cannot do without /proc pathnames that
+    # reintroduce a name. The bound here is the same one publish_durable_file() lives with.
     [[ "${landed}" == "${approved}" ]] || die \
       "${root} — ${what} — is not the directory this run approved at pre-flight: the entry at that name was replaced between the two. On a parent another account can write — /var/log is group-writable on some distributions — that takes a rename and nothing else, and every other check here passes on the replacement. This run refuses rather than writing into it; nothing has been changed."
   fi
@@ -3599,7 +3693,7 @@ copy_tree_into_new_dir() {
     "${dest} could not be created: something is already at that path after it was removed, which is how a compromised '${APP_USER}' would aim this copy at a directory of their choosing. Nothing has been copied."
   (
     cd -P "${dest}" 2>/dev/null || exit 1
-    meta="$(stat -c '%F|%u' . 2>/dev/null || true)"
+    meta="$(LC_ALL=C stat -c '%F|%u' . 2>/dev/null || true)"
     [[ "${meta}" == "directory|${self}" ]] || exit 1
     [[ "$(stat -c '%d:%i' .. 2>/dev/null || true)" == "${parent}" ]] || exit 1
     cp -a "${src}/." . 2>/dev/null || exit 1
@@ -7578,13 +7672,23 @@ find "${DATA_DIR}" \( -path "${CRONTAB_LOCK_DIR}" -o -name "${PUBLISH_STAGE_DIRN
 # this `chown -R` would transfer that subtree, recursively, to ${APP_USER}. A pathname check cannot
 # see a rename; only an operation aimed at an inode is unaffected by one.
 #
-# So enter_service_root() re-walks from `/`, re-proves the root's identity and its `..`, and leaves
-# this subshell INSIDE it — and the ownership change is then made of `.`. Its subshell is why the
-# installer's own cwd is unaffected. `-exec chown -h` for the same reason the ${DATA_DIR} line
-# above uses it: a symlink under the root has its OWN ownership changed, never its target's.
+# So enter_service_root() re-walks from `/`, re-proves the root's identity and its `..`, enters it
+# through the descriptor pre-flight opened on it, and leaves this subshell INSIDE it — and the
+# ownership change is then made of `.`. Its subshell is why the installer's own cwd is unaffected.
+#
+# AND IT IS `chown -Rh .`, NOT `find . -exec chown -h {} +` (o3d-secops r7 fourth pass, Codex HIGH).
+# `find -exec` ENUMERATES pathnames and hands them to a chown that resolves them again afterwards;
+# `-h` protects only the FINAL component, so on an upgrade — where ${APP_USER} owns this tree — a
+# descendant directory renamed into a symlink between the enumeration and the chown redirects a
+# root-side ownership change through it. GNU find's own documentation calls `-exec` insecure for
+# exactly this. coreutils' chown walks with fts and `fchownat(AT_SYMLINK_NOFOLLOW)` relative to
+# directory descriptors it holds, so there is no pathname to re-resolve: `-R` is the recursion, `-h`
+# is the no-follow, and `.` is the pinned root. (The ${DATA_DIR} line above still uses `find`
+# because it must PRUNE two subtrees by name, which chown cannot express; it carries the same
+# residual and is not this round's change.)
 if ! (
   enter_service_root "${LOG_DIR}" 022 "the log directory"
-  find . -exec chown -h "${APP_USER}:${APP_USER}" {} +
+  chown -Rh "${APP_USER}:${APP_USER}" .
 ); then
   die "The ownership of ${LOG_DIR} could not be set; the reason is above. Nothing has been started."
 fi
