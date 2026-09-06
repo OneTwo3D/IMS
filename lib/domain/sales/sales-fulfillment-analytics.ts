@@ -1233,7 +1233,7 @@ function identityLabelField(value: string): string {
   let previousWasLoneSpace = false
   for (const char of value) {
     const codePoint = char.codePointAt(0)!
-    const loneSpace = char === ' ' && !previousWasLoneSpace
+    const loneSpace: boolean = char === ' ' && !previousWasLoneSpace
     if (char === '\\') encoded += '\\\\'
     else if (char === '"') encoded += '""'
     else if (loneSpace) encoded += ' '
