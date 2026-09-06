@@ -5675,13 +5675,21 @@ test('[o3d-secops] a link pointing at the root\'s own ancestor gets no bind comm
     `a target that is another managed root must get no bind command: ${overlapping.stderr}`)
   assert.match(overlapping.stderr, /which this installer also manages/, overlapping.stderr)
 
-  // AND THE LIST IS READ FROM THE SHIPPED SCRIPT, not invented here: install.sh really does name
-  // its three roots, and the other two entrypoints really do not set it.
-  assert.match(shellConstant(INSTALL_SH, 'SERVICE_ROOT_NAMES', 'scripts/install.sh'),
-    /^readonly -a SERVICE_ROOT_NAMES=\("\$\{APP_DIR\}" "\$\{DATA_DIR\}" "\$\{LOG_DIR\}"\)$/)
-  for (const script of ['scripts/deploy.sh', 'scripts/update.sh'] as const) {
-    assert.equal(shellConstantOptional(readFileSync(join(REPO, script), 'utf8'), 'SERVICE_ROOT_NAMES'), undefined,
-      `${script} must not set SERVICE_ROOT_NAMES, or the shared refusal would need a second reading`)
+  // AND EVERY ENTRYPOINT DECLARES ITS OWN, read from the shipped scripts rather than invented here.
+  // A list that existed in one of the three would leave the shared refusal answering a different
+  // question depending on which script printed it — and that is not hypothetical: a symlinked
+  // IMS_DATA_DIR resolving to APP_DIR reaches this refusal from update.sh, during cutover-state
+  // publication, and would have been handed a procedure binding the application tree onto the data
+  // root.
+  const declared: Readonly<Record<string, string>> = {
+    'scripts/install.sh': 'readonly -a SERVICE_ROOT_NAMES=("${APP_DIR}" "${DATA_DIR}" "${LOG_DIR}")',
+    'scripts/update.sh': 'readonly -a SERVICE_ROOT_NAMES=("${APP_DIR}" "${DATA_DIR}")',
+    'scripts/deploy.sh': 'readonly -a SERVICE_ROOT_NAMES=("${APP_DIR}")',
+  }
+  for (const [script, expected] of Object.entries(declared)) {
+    const source = script === 'scripts/install.sh' ? INSTALL_SH : readFileSync(join(REPO, script), 'utf8')
+    assert.equal(shellConstant(source, 'SERVICE_ROOT_NAMES', script), expected,
+      `${script} must name the roots it writes into, or the shared refusal is answering a question it cannot`)
   }
 })
 
@@ -5725,4 +5733,91 @@ test('[o3d-secops] a target whose identity cannot be read gets no procedure, rat
   assert.ok(ok.stderr.includes(`mount --bind ${target} ${root}`), ok.stderr)
   const st = statSync(target)
   assert.ok(ok.stderr.includes(`must print ${st.dev}:${st.ino}`), ok.stderr)
+})
+
+test('[o3d-secops] a target that is the same directory as the root\'s ancestor under ANOTHER name is refused too', (t) => {
+  /**
+   * THE BYPASS A PREFIX TEST CANNOT SEE. Disjointness by TEXT compares two strings; two paths can
+   * be the same directory, or nested, without sharing a prefix — a bind mount or a mount alias
+   * already in place gives `/mnt/opt-alias` and `/opt` the same device and inode. The refusal would
+   * then print a bind of the alias onto a root inside the very tree it aliases.
+   *
+   * A HARNESS CANNOT `mount --bind` (CAP_SYS_ADMIN), so the alias is made with a HARD LINK to a
+   * directory — which is also privileged — no. It is made the one way an unprivileged process can
+   * produce two names for one directory: the SECOND name is a path that resolves to the same
+   * directory without sharing a prefix, which on a real filesystem means a symlinked component
+   * somewhere in the harness's own scratch tree. `readlink -f` canonicalises the target, so the
+   * alias has to be somewhere the canonical form still differs textually while the identity does
+   * not — the case is therefore constructed with a bind mount that already exists on this machine,
+   * exactly as the mount-point test above does, and skipped with a stated reason if there is none.
+   */
+  const mount = existingMountPoint()
+  assert.ok(mount, 'no mount point was found; this test cannot state anything without one')
+
+  // The root lies INSIDE the mounted directory, and the target is that same directory reached by
+  // its other name — the mount source's own path. `existingMountPoint()` guarantees the two have
+  // the same device and inode while being different pathnames, which is the whole shape.
+  const base = createTempDirSync('ims-secops-alias-', t)
+  const link = join(base, 'ims')
+  symlinkSync(mount, link)
+
+  // NOT VACUOUS: this really is a directory reached by a name that is not its mount point's parent
+  // path, and the identity really is shared.
+  assert.equal(realpathSync(link), realpathSync(mount))
+
+  const run = runBash(rig([...ROOT_GATE], GATE_DATA, [
+    // The root's own ancestor list contains ${base}; the target is ${mount}. Textually disjoint.
+    `DATA_DIR=${q(link)}`,
+    `SERVICE_ROOT_NAMES=(${q(join(mount, 'inside'))})`,
+  ].join('\n')))
+
+  assert.equal(run.status, 1, run.stderr)
+  assert.ok(!run.stderr.includes('mount --bind'),
+    `a target that is the same directory as a managed root must get no bind command: ${run.stderr}`)
+  assert.match(run.stderr, /IS THE SAME DIRECTORY AS|lies inside the other|OVERLAPS/, run.stderr)
+})
+
+test('[o3d-secops] a root spelled with repeated slashes is still recognised as overlapping', (t) => {
+  /**
+   * `//var/lib/app` and `/var/lib/app` are one directory to the kernel and two strings to `[[`, and
+   * the ancestry walk deliberately treats an empty `//` component as the directory it is already
+   * standing in — so a prefix test on the raw spellings could be stepped around by an operator
+   * override that simply doubled a slash. The spellings are normalised before they are compared.
+   */
+  const base = createTempDirSync('ims-secops-slashes-', t)
+  const opt = join(base, 'opt')
+  mkdirSync(opt)
+  chmodSync(opt, 0o755)
+  const link = join(opt, 'app')
+  symlinkSync(opt, link)
+
+  // THE SAME LAYOUT, SPELLED TWICE. Both must be refused the bind command, and for the same reason.
+  // A LEADING `//`, which is the spelling that gets past a raw prefix test: `//a/b` does not match
+  // the pattern `/a/*`, while the kernel treats the two as one path. A doubled slash in the MIDDLE
+  // does not bypass it — `*` in a `[[` pattern spans the extra separator — and a test built on that
+  // one would pass without the fix. Measured, not assumed.
+  const doubled = `/${link}`
+  for (const spelling of [link, doubled]) {
+    const run = runBash(rig([...ROOT_GATE], GATE_DATA, `DATA_DIR=${q(spelling)}`))
+    assert.equal(run.status, 1, `${spelling}: ${run.stderr}`)
+    assert.ok(!run.stderr.includes('mount --bind'),
+      `${spelling}: a doubled slash must not buy a bind command: ${run.stderr}`)
+    assert.match(run.stderr, /the two are the same directory, or one lies inside the other/, run.stderr)
+  }
+
+  // MEASURED BY MUTATION, ROUTE STATED: the normalisation removed, which is where the textual test
+  // stood before this pass. The doubled spelling then reads as an unrelated string and the bind
+  // command is printed for a target that contains the root.
+  const shipped = shellFunction(INSTALL_SH, 'refuse_symlinked_root')
+  const rawText = shipped
+    .replace('if [[ "$ntarget" == "$nroot" || "$nroot" == "${ntarget%/}/"* || "$ntarget" == "${nroot%/}/"* ]]; then',
+      'if [[ "$target" == "$root" || "$root" == "${target%/}/"* || "$target" == "${root%/}/"* ]]; then')
+    // …and the identity walk that would otherwise catch it, which is the OTHER half of this fix.
+    .replace('if [[ -n "$ancid" && "$ancid" == "$ident" ]]; then', 'if false; then')
+  assert.notEqual(rawText, shipped, 'the mutation must change the shipped comparisons')
+
+  const mutated = runBash(rig(ROOT_GATE.filter((n) => n !== 'refuse_symlinked_root'), GATE_DATA,
+    [`DATA_DIR=${q(doubled)}`, rawText].join('\n')))
+  assert.ok(mutated.stderr.includes('mount --bind'),
+    `without the normalisation the doubled spelling gets a bind command: ${mutated.stderr}`)
 })

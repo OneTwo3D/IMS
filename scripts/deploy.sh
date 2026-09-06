@@ -233,6 +233,13 @@ set -euo pipefail
 # a nameref and `(( ))` all mutate a variable without being one. See the block above the same
 # declarations in scripts/install.sh for the whole argument.
 readonly APP_DIR="${IMS_APP_DIR:-/root/ims/onetwo3d-ims}"
+# THE ROOTS THIS ENTRYPOINT MANAGES, as a list, for the one question that has to be asked of all
+# of them at once (o3d-secops r7 seventh/eighth pass, Codex HIGH): refuse_symlinked_root() will not
+# print a bind-mount command whose target overlaps a root this script also writes into, and it
+# reads them from here. Every entrypoint declares its OWN — a list that existed in one of the three
+# would leave the shared refusal answering a different question depending on which script printed
+# it, which is the drift this file's parity tests exist to prevent.
+readonly -a SERVICE_ROOT_NAMES=("${APP_DIR}")
 PORT="${IMS_PORT:-3000}"
 # ---------------------------------------------------------------------------
 # THE CUTOVER NAMESPACE, AND THERE IS EXACTLY ONE (o3d-2sm1.5, Codex r9 HIGH).
@@ -1594,7 +1601,7 @@ publish_trust_root() {
 # from the link instead of asking for it to be retyped, and prints the command that puts the link
 # back if the bind mount does not take.
 refuse_symlinked_root() {
-  local root="$1" target="" qroot qtarget qother froot ftarget ident other
+  local root="$1" target="" qroot qtarget qother froot ftarget ident other nroot ntarget nother anc ancid
   # THE TARGET IS RESOLVED HERE AND PRINTED, not left to the operator to retype. Its status is
   # taken so that this stays out of the unchecked-substitution census: a `readlink` that fails is a
   # dangling or unreadable link, which is the branch below.
@@ -1658,16 +1665,27 @@ refuse_symlinked_root() {
   # SO THE TWO PATHS MUST BE DISJOINT. Neither may be the other, and neither may lie under the
   # other: a target ABOVE the root is the finding, and a target BELOW it is a bind of a directory
   # onto its own ancestor, which is a loop rather than a layout.
-  if [[ "$target" == "$root" || "$root" == "${target%/}/"* || "$target" == "${root%/}/"* ]]; then
+  #
+  # THE SPELLING IS NORMALISED FIRST (o3d-secops r7 eighth pass, Codex HIGH). A prefix test is a
+  # test on TEXT, and `//var/lib/app` and `/var/lib/app` are the same directory to the kernel and
+  # different strings to `[[`. Repeated slashes are collapsed and a trailing one dropped before the
+  # comparison; ${target} needs neither, `readlink -f` having produced it, but it costs nothing to
+  # be sure and it makes the two sides comparable.
+  nroot="/${root#/}"; while [[ "$nroot" == *//* ]]; do nroot="${nroot//\/\///}"; done; nroot="${nroot%/}"
+  ntarget="/${target#/}"; while [[ "$ntarget" == *//* ]]; do ntarget="${ntarget//\/\///}"; done; ntarget="${ntarget%/}"
+  [[ -n "$nroot" ]] || nroot="/"
+  [[ -n "$ntarget" ]] || ntarget="/"
+  if [[ "$ntarget" == "$nroot" || "$nroot" == "${ntarget%/}/"* || "$ntarget" == "${nroot%/}/"* ]]; then
     printf 'ERROR: BUT %s MAY NOT BE BOUND ONTO %s: the two are the same directory, or one lies inside the other. Binding a directory onto its own ancestor hands this installer a tree far larger than the one it manages — the next run would rsync and chown all of it — so this run will not print a command that does it. Point the link at a directory outside %s.\n' "$qtarget" "$qroot" "$qroot" >&2
     return 0
   fi
-  # AND NOR MAY IT OVERLAP ANY OTHER ROOT THIS RUN MANAGES, where the caller has said what they are.
-  # ${SERVICE_ROOT_NAMES[@]} is install.sh's three; the other two entrypoints do not set it, and the
-  # loop then runs zero times — which is why this text is identical in all three.
+  # AND NOR MAY IT OVERLAP ANY OTHER ROOT THIS RUN MANAGES. Every entrypoint declares its own
+  # ${SERVICE_ROOT_NAMES}: install.sh's three, update.sh's two, deploy.sh's one.
   for other in "${SERVICE_ROOT_NAMES[@]-}"; do
     [[ -n "$other" && "$other" != "$root" ]] || continue
-    if [[ "$target" == "$other" || "$target" == "${other%/}/"* || "$other" == "${target%/}/"* ]]; then
+    nother="/${other#/}"; while [[ "$nother" == *//* ]]; do nother="${nother//\/\///}"; done; nother="${nother%/}"
+    [[ -n "$nother" ]] || nother="/"
+    if [[ "$ntarget" == "$nother" || "$ntarget" == "${nother%/}/"* || "$nother" == "${ntarget%/}/"* ]]; then
       # THE STATUS IS TAKEN, like every other substitution in this function: a `printf %q` inside
       # the argument list would be one nobody checks, which is the rule the whole crontab-lock
       # census exists to hold these scripts to.
@@ -1691,6 +1709,34 @@ refuse_symlinked_root() {
     printf 'ERROR: BUT this run could not read the device and inode of %s, so it cannot give you a way to check that the bind mounted what you meant. It will not print a procedure you cannot verify. Look at that path by hand.\n' "$qtarget" >&2
     return 0
   fi
+  # AND THE COMPARISON IS MADE OF IDENTITIES AS WELL AS SPELLINGS (o3d-secops r7 eighth pass,
+  # Codex HIGH). Two paths that share no prefix can still be the SAME DIRECTORY: a bind mount
+  # already in place gives /mnt/opt-alias and /opt the same device and inode, and the textual test
+  # above sees two unrelated strings. So every ancestor of the root — the directories a bind of the
+  # target would swallow — is compared against the target by identity, and so is every other root
+  # this run manages. It is a bounded walk: a pathname has as many ancestors as it has components.
+  anc="$nroot"
+  while :; do
+    ancid="$(stat -c '%d:%i' "$anc" 2>/dev/null || true)"
+    if [[ -n "$ancid" && "$ancid" == "$ident" ]]; then
+      qother="$(printf '%q' "$anc")" || qother=""
+      [[ -n "$qother" ]] || qother="a directory this root lies inside"
+      printf 'ERROR: BUT %s IS THE SAME DIRECTORY AS %s, which %s lies inside — reached by another name, through a bind mount or a mount alias rather than a shared path. Binding it onto %s would hand this installer a tree far larger than the one it manages. This run will not print a command that does that.\n' "$qtarget" "$qother" "$qroot" "$qroot" >&2
+      return 0
+    fi
+    [[ "$anc" != "/" ]] || break
+    anc="${anc%/*}"
+    [[ -n "$anc" ]] || anc="/"
+  done
+  for other in "${SERVICE_ROOT_NAMES[@]-}"; do
+    [[ -n "$other" && "$other" != "$root" ]] || continue
+    if [[ "$(stat -c '%d:%i' "$other" 2>/dev/null || true)" == "$ident" ]]; then
+      qother="$(printf '%q' "$other")" || qother=""
+      [[ -n "$qother" ]] || qother="another directory this installer manages"
+      printf 'ERROR: BUT %s IS THE SAME DIRECTORY AS %s, which this installer also manages — reached by another name. This run will not print a command that binds them together.\n' "$qtarget" "$qother" >&2
+      return 0
+    fi
+  done
   printf 'ERROR: Do it with the writers stopped, in this order:\n' >&2
   printf 'ERROR:   1. stop the application service, and pause any cron that writes under %s\n' "$qroot" >&2
   printf 'ERROR:   2. this run resolved that link to: %s   (device:inode %s) — confirm that is where the data is\n' "$qtarget" "$ident" >&2
