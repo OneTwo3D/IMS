@@ -1435,7 +1435,73 @@ const SHIPPED_ROOTS = new Set([
   '/etc/ims-cutover', '/etc/ims-db-ca', '/etc/ims-cutover-recovery',
 ])
 
-const FENCE_LIB = readFileSync(join(REPO, 'scripts/lib/db-fence-protected.sh'), 'utf8')
+const FENCE_LIBRARY = 'scripts/lib/db-fence-protected.sh'
+const FENCE_LIB = readFileSync(join(REPO, FENCE_LIBRARY), 'utf8')
+
+/**
+ * THE SHARED LIBRARY'S OWN PROTECTED SET (o3d-secops r2, Codex HIGH).
+ *
+ * The previous round put `readonly` on the entrypoints' publication constants and stopped at the
+ * file boundary — one rule, several files, one protected, which is this branch's recurring defect.
+ * These are the names scripts/lib/db-fence-protected.sh declares that the PRIVILEGED mechanism
+ * trusts without re-deriving, and every one of them is declared once and reassigned nowhere.
+ *
+ * HOW THE SET WAS DECIDED — by reading what the library declares, not by copying the finding's
+ * list of seven kinds. Every script-scope declaration in the file was enumerated (the census below
+ * does exactly that, from bash's own reading) and each was asked one question: does the mechanism
+ * ACT on this value without checking it again?
+ *
+ *   ten PATHS      it reads, writes, seals, renames through or EXECUTES every one of them. Re-aim
+ *                  ${DB_FENCE_SCRIPT_COPY} and root runs a file of the application account's
+ *                  choosing with DEPLOY_ADMIN_DATABASE_URL beside it; re-aim
+ *                  ${DB_FENCE_ARTEFACT_FILE} and the digest is compared against a record somebody
+ *                  else wrote. ${DB_FENCE_RETIRED_APP_DIR} is on the list though the finding's
+ *                  seven kinds do not name it: it is the destination a publication renames the
+ *                  STANDING artefact to, so it is a write, and it was found by enumerating rather
+ *                  than by transcribing.
+ *   two DIGESTS    ${DB_FENCE_EXPECTED_SHA256} and ${DB_FENCE_EXPECTED_ARTEFACT_SHA256} are what
+ *                  AUTHENTICATES a rotation. A write to either is a forged authentication, which
+ *                  is the same hole as a re-aimed path and not a smaller one.
+ *   two VENDOR     ${DB_FENCE_VENDOR_ROOTS} decides which packages are copied into the tree that is
+ *   POLICY names   executed; ${DB_FENCE_VENDOR_MAX_FILES} bounds what a manifest in the checkout
+ *                  can talk root into copying under /etc.
+ *   two STRINGS    ${DB_FENCE_ARTEFACT_RECIPE} is the recorded definition of the digest and
+ *                  ${DB_FENCE_ARTEFACT_SOURCE_TEXT} is the answer every refusal gives to "where do
+ *                  I get that digest". Both are read by an operator deciding whether to trust a
+ *                  tree.
+ */
+const PROTECTED_LIBRARY_CONSTANTS = [
+  'DB_FENCE_RECOVERY_DIR', 'DB_FENCE_IDENTITY_FILE', 'DB_FENCE_PROTECTED_APP_DIR',
+  'DB_FENCE_SCRIPT_COPY', 'DB_FENCE_STAGED_APP_DIR', 'DB_FENCE_RETIRED_APP_DIR',
+  'DB_FENCE_ARTEFACT_FILE', 'DB_FENCE_MANIFEST_FILE', 'DB_FENCE_RELEASE_WRAPPER',
+  'DB_FENCE_REFENCE_WRAPPER', 'DB_FENCE_VENDOR_ROOTS', 'DB_FENCE_VENDOR_MAX_FILES',
+  'DB_FENCE_ARTEFACT_RECIPE', 'DB_FENCE_ARTEFACT_SOURCE_TEXT', 'DB_FENCE_EXPECTED_SHA256',
+  'DB_FENCE_EXPECTED_ARTEFACT_SHA256',
+] as const
+
+/**
+ * AND THE OTHER HALF OF THE CENSUS: what the library declares that is deliberately NOT `readonly`,
+ * each with the reason, because "it is not in the protected list" is not a reason.
+ *
+ * A name in neither list fails the census — which is what makes a path added to this library later
+ * covered by the rule rather than silently outside it.
+ */
+const MUTABLE_LIBRARY_NAMES: Readonly<Record<string, string>> = {
+  DB_FENCE_ROTATION_NOTE: 'a report: the library sets it to say why a divergence was not promoted',
+  DB_FENCE_SEAL_REASON: 'a report: _fence_tree_is_sealed() names the offending path in it',
+  DB_FENCE_PROBE_SCRIPT: 'a report: db_fence_probe_script() hands the caller what may be preflighted',
+  DB_FENCE_PROBE_TEMP: 'a report: the throwaway directory the caller must remove afterwards',
+  DB_FENCE_PROBE_ARTEFACT_SHA256: 'a report: what the tree this checkout would publish hashes to',
+  DB_FENCE_PROBE_STANDING_SHA256: 'a report: what the artefact already standing hashes to',
+  DB_FENCE_PROBE_REASON: 'a report: why there is nothing to preflight with',
+  DB_FENCE_SOURCE_UNTRUSTED_PATH: 'a report: the first path in the source tree that is not ours',
+  DB_FENCE_SUDO_PREFIX:
+    'not a path and not a decision: a display prefix resolved from PATH, and the one name here bash '
+    + 'assigns twice by construction (a default, then a conditional)',
+  _FENCE_SRC_STRICT: 'a private accumulator, rebuilt by _fence_source_trust() on every call',
+  _FENCE_SRC_PACKAGES: 'a private accumulator, rebuilt by _fence_source_trust() on every call',
+  _FENCE_SRC_PARENTS: 'a private accumulator, rebuilt by _fence_source_trust() on every call',
+}
 
 for (const script of ENTRYPOINTS) {
   test(`[o3d-rn10] every destination ${script} publishes to lies under a trusted ancestor`, () => {
@@ -2056,19 +2122,33 @@ const NON_ASSIGNMENT_MUTATIONS = [
  * because several are composed from the ones above them (${FENCE_FILE} from ${CUTOVER_STATE_DIR},
  * ${DEPLOY_META_FILE} from ${APP_DIR}).
  */
-function protectedDeclarations(source: string, where: string): Array<{ name: string, line: string }> {
-  const found = PROTECTED_CONSTANTS
+function protectedDeclarations(
+  source: string,
+  where: string,
+  names: readonly string[] = PROTECTED_CONSTANTS,
+): Array<{ name: string, line: string }> {
+  const found = names
     .map((name) => ({ name, line: shellConstantOptional(source, name, where) }))
     .filter((entry): entry is { name: string, line: string } => entry.line !== undefined)
   return found.sort((a, b) => source.indexOf(a.line) - source.indexOf(b.line))
 }
 
-/** The script's own declarations, in its own order, with or without the word under test. */
-function declarationPreamble(declarations: Array<{ name: string, line: string }>, strip: boolean): string[] {
+/**
+ * The script's own declarations, in its own order, with or without the word under test.
+ *
+ * `environment` is what the declarations READ and this rig does not declare: ${CRON_BACKUP} is
+ * composed from the service account, and the library's two expected digests are derived from
+ * IMS_FENCE_SCRIPT_SHA256 / IMS_FENCE_ARTEFACT_SHA256 — which have to resolve to something, or
+ * there would be no value for a mutation to fail to change.
+ */
+function declarationPreamble(
+  declarations: Array<{ name: string, line: string }>,
+  strip: boolean,
+  environment: readonly string[] = ['APP_USER=svcuser'],
+): string[] {
   return [
     'set -u',
-    // ${CRON_BACKUP} is composed from the service account; nothing else here reads outside the set.
-    'APP_USER=svcuser',
+    ...environment,
     ...declarations.map(({ line }) => (strip ? line.replace(/^readonly /, '') : line)),
   ]
 }
@@ -2081,9 +2161,15 @@ function declarationPreamble(declarations: Array<{ name: string, line: string }>
  * printed nothing at all and a rig that read its line got `undefined` instead of a refusal. A
  * process each keeps every outcome legible — the value survived, or the shell died refusing.
  */
-function mutationRig(declarations: Array<{ name: string, line: string }>, target: string, form: string, strip: boolean): string {
+function mutationRig(
+  declarations: Array<{ name: string, line: string }>,
+  target: string,
+  form: string,
+  strip: boolean,
+  environment?: readonly string[],
+): string {
   return [
-    ...declarationPreamble(declarations, strip),
+    ...declarationPreamble(declarations, strip, environment),
     form,
     `printf 'AFTER\\t%s\\n' "\${${target}}"`,
   ].join('\n')
@@ -2098,16 +2184,43 @@ function mutationValue(run: Run): string | undefined {
 /** The sentinel every mutation writes, so "it did not arrive" can be asserted directly. */
 const MUTATION_SENTINEL = '../../ims-secops-attacker'
 
-for (const script of ENTRYPOINTS) {
-  test(`[o3d-secops] bash refuses every non-assignment mutation of ${script}'s publication constants`, () => {
+/**
+ * THE SUBJECTS: the three entrypoints, AND THE LIBRARY THEY ALL SOURCE (o3d-secops r2).
+ *
+ * Leaving the library out was the finding. It is the file that names the recovery root, the
+ * protected tree and the executable helper, so the same measurement runs over it — with its own
+ * protected set and the environment its two digest declarations read.
+ */
+const MUTATION_SUBJECTS = [
+  ...ENTRYPOINTS.map((script) => ({
+    file: script,
+    what: "publication constants",
+    names: PROTECTED_CONSTANTS as readonly string[],
+    minimum: 9,
+    environment: ['APP_USER=svcuser'] as readonly string[],
+  })),
+  {
+    file: FENCE_LIBRARY,
+    what: 'protected constants',
+    names: PROTECTED_LIBRARY_CONSTANTS as readonly string[],
+    minimum: PROTECTED_LIBRARY_CONSTANTS.length,
+    environment: [
+      `IMS_FENCE_SCRIPT_SHA256=${'1'.repeat(64)}`,
+      `IMS_FENCE_ARTEFACT_SHA256=${'2'.repeat(64)}`,
+    ] as readonly string[],
+  },
+] as const
+
+for (const { file: script, what, names, minimum, environment } of MUTATION_SUBJECTS) {
+  test(`[o3d-secops] bash refuses every non-assignment mutation of ${script}'s ${what}`, () => {
     const source = readFileSync(join(REPO, script), 'utf8')
-    const declarations = protectedDeclarations(source, script)
-    assert.ok(declarations.length >= 9,
-      `${script} declared at least 9 protected publication constants when this was written; this test found ${declarations.length}`)
+    const declarations = protectedDeclarations(source, script, names)
+    assert.ok(declarations.length >= minimum,
+      `${script} declared at least ${minimum} protected constants when this was written; this test found ${declarations.length}`)
 
     for (const { name } of declarations) {
       // The value the script actually gives it, from the script's own declarations and no mutation.
-      const baseline = runBash([...declarationPreamble(declarations, false), `printf '%s' "\${${name}}"`].join('\n'))
+      const baseline = runBash([...declarationPreamble(declarations, false, environment), `printf '%s' "\${${name}}"`].join('\n'))
       assert.equal(baseline.status, 0, `${script}: the shipped declarations must evaluate: ${baseline.stderr}`)
       const value = baseline.stdout
       assert.ok(value.length > 0, `${script}: ${name} must resolve to something to compare against`)
@@ -2115,14 +2228,14 @@ for (const script of ENTRYPOINTS) {
       for (const { label, form } of NON_ASSIGNMENT_MUTATIONS) {
         // ROUTE / PRECONDITION: without the word, bash takes this mutation. A mutation bash ignores
         // anyway would make the refusal below theatre.
-        const unprotected = runBash(mutationRig(declarations, name, form(name), true))
+        const unprotected = runBash(mutationRig(declarations, name, form(name), true, environment))
         assert.equal(unprotected.status, 0,
           `${script}: with \`readonly\` stripped, ${label} must run cleanly against ${name}: ${unprotected.stderr}`)
         assert.notEqual(mutationValue(unprotected), value,
           `${script}: with \`readonly\` stripped, ${label} must actually change ${name}`)
 
         // THE CLAIM: with it, bash refuses, says so, and the constant is untouched.
-        const run = runBash(mutationRig(declarations, name, form(name), false))
+        const run = runBash(mutationRig(declarations, name, form(name), false, environment))
         const output = `${run.stdout}\n${run.stderr}`
         assert.ok(output.includes(`${name}: readonly variable`),
           `${script}: bash must REFUSE ${label} on ${name} and say so, not silently ignore it:\n${output}`)
@@ -2152,32 +2265,146 @@ for (const script of ENTRYPOINTS) {
  * MUTATION: drop `readonly` from any declaration and this names the script and the constant; delete
  * a declaration and the count moves.
  *
- * NOT THE TWO IN scripts/lib/db-fence-protected.sh, DELIBERATELY. DB_FENCE_RECOVERY_DIR and
- * DB_FENCE_IDENTITY_FILE are owned by the shared library, and every fence harness in
- * tests/scripts SOURCES that library — for its shipped bytes, which is the whole reason it is a
- * library — and then points its /etc literals at a scratch directory. `readonly` there would make
- * the library untestable rather than safer, and the property it would carry is already asserted
- * from the other side: tests/scripts/deploy-order.test.ts requires the literal, requires it to be
- * underivable from anything the application can move, and requires that NO entrypoint reassigns it.
+ * AND THE LIBRARY IS IN IT NOW (o3d-secops r2, Codex HIGH). The previous round excluded
+ * scripts/lib/db-fence-protected.sh on the grounds that every fence harness sources it and then
+ * points its /etc literals at a scratch directory, so `readonly` there "would make the library
+ * untestable rather than safer". That was a property of WHERE THE HARNESS SUBSTITUTED, not of the
+ * library: the harnesses now redirect the one trust-root literal in the shipped TEXT before running
+ * it (tests/scripts/fence-artefact-harness.ts) and the nine paths composed from it are composed by
+ * the library itself, `readonly` and all. The exclusion was the finding — the file that names the
+ * recovery root, the protected tree and the executable helper was the one file left mutable.
  */
-test('[o3d-secops] every protected publication constant an entrypoint declares is declared `readonly`', () => {
+test('[o3d-secops] every protected constant an entrypoint or the shared library declares is declared `readonly`', () => {
   const missing: string[] = []
-  let declared = 0
-  for (const script of ENTRYPOINTS) {
-    const source = readFileSync(join(REPO, script), 'utf8')
-    for (const name of PROTECTED_CONSTANTS) {
-      const line = shellConstantOptional(source, name, script)
+  const counted = new Map<string, number>()
+  for (const [where, names] of [
+    ...ENTRYPOINTS.map((script) => [script, PROTECTED_CONSTANTS as readonly string[]] as const),
+    [FENCE_LIBRARY, PROTECTED_LIBRARY_CONSTANTS as readonly string[]] as const,
+  ]) {
+    const source = readFileSync(join(REPO, where), 'utf8')
+    for (const name of names) {
+      const line = shellConstantOptional(source, name, where)
       if (line === undefined) continue
-      declared += 1
-      if (!line.startsWith('readonly ')) missing.push(`${script}: ${line}`)
+      counted.set(where, (counted.get(where) ?? 0) + 1)
+      if (!line.startsWith('readonly ')) missing.push(`${where}: ${line}`)
     }
   }
   assert.deepEqual(missing, [],
-    'these publication constants are mutable, and `printf -v`, `read`, a nameref and `(( ))` all change them '
+    'these constants are mutable, and `printf -v`, `read`, a nameref and `(( ))` all change them '
     + `without writing an assignment word any scanner here can see:\n${missing.join('\n')}`)
-  assert.equal(declared, 41,
-    `the three entrypoints declared 41 protected publication constants between them when this was written; this walk found ${declared}. `
+
+  const declared = [...counted.values()].reduce((total, one) => total + one, 0)
+  assert.equal(counted.get(FENCE_LIBRARY), PROTECTED_LIBRARY_CONSTANTS.length,
+    `the shared fence library declares ${PROTECTED_LIBRARY_CONSTANTS.length} protected constants; this walk found `
+    + `${counted.get(FENCE_LIBRARY)}. A declaration that disappears takes its regression above with it.`)
+  assert.equal(declared, 41 + PROTECTED_LIBRARY_CONSTANTS.length,
+    `the three entrypoints declared 41 protected publication constants between them when this was written, and the `
+    + `shared library ${PROTECTED_LIBRARY_CONSTANTS.length} of its own; this walk found ${declared}. `
     + 'A declaration that disappears takes its regression above with it, so the count is asserted rather than the floor.')
+})
+
+/**
+ * THE EXACT CENSUS OF THE LIBRARY'S OWN DECLARATIONS (o3d-secops r2).
+ *
+ * The two tests above measure the names this file WRITES DOWN. That is the shape that let the
+ * library out of the last round: a set stated as a list covers what somebody remembered to add to
+ * it, and a new path declared next to ${DB_FENCE_SCRIPT_COPY} tomorrow would be outside every one
+ * of them, silently.
+ *
+ * So the direction is reversed here. The library's script-scope declarations are ENUMERATED — from
+ * the same masked-and-bash-checked reading the rest of this file uses, so a declaration in a
+ * comment or inside a function body is not one — and every name found must be in exactly one of two
+ * lists: PROTECTED_LIBRARY_CONSTANTS, which the tests above then require `readonly` on and prove
+ * bash refuses four mutations of, or MUTABLE_LIBRARY_NAMES, which states the reason. A name in
+ * neither fails HERE, naming it, and the failure is the question rather than the answer: is this a
+ * value the privileged mechanism acts on?
+ *
+ * IT IS AN EQUALITY, NOT A SUBSET. A name that disappears from the library fails too, because a
+ * list that still claims a declaration nobody has is a list nobody has read.
+ *
+ * MUTATION / ROUTE: the test below appends one new path declaration to the library TEXT and
+ * requires this same census to reject it — the check is proved able to go red on the change it
+ * exists to catch, rather than asserted to be correct.
+ */
+function libraryDeclaredNames(source: string, where: string): string[] {
+  // Over the MASK, so prose and strings cannot contribute a name: this file's own header spells
+  // out four mutation forms and several ${NAME} references.
+  const mask = maskShellSource(source, where)
+  const candidates = new Set<string>()
+  for (const match of mask.matchAll(/[A-Z_][A-Z0-9_]*\+?=/g)) candidates.add(match[0].replace(/\+?=$/, ''))
+  // shellConstantAssignments() is the authority on SCOPE — it excludes every assignment inside a
+  // function body, and it cross-checks its own lexing against bash's parse — so a candidate with no
+  // script-scope assignment is a local, a here-document line, or a name this regex over-generated.
+  return [...candidates].filter((name) => shellConstantAssignments(source, name, where).length > 0).sort()
+}
+
+/** The census, as the message a failure would print — empty when the library is fully classified. */
+function unclassifiedLibraryNames(source: string, where: string): string[] {
+  const complaints: string[] = []
+  const found = libraryDeclaredNames(source, where)
+  const classified = new Set<string>([...PROTECTED_LIBRARY_CONSTANTS, ...Object.keys(MUTABLE_LIBRARY_NAMES)])
+  for (const name of found) {
+    if (classified.has(name)) continue
+    complaints.push(
+      `${where} declares ${name} and nothing here says what it is. If the privileged mechanism ACTS on this value `
+      + '— a path it reads, writes, seals, renames through or executes, a digest that authenticates, a decision '
+      + 'about what is copied under /etc — declare it `readonly` at its declaration and add it to '
+      + 'PROTECTED_LIBRARY_CONSTANTS. If the library sets it itself, add it to MUTABLE_LIBRARY_NAMES with the reason.')
+  }
+  for (const name of classified) {
+    if (found.includes(name)) continue
+    complaints.push(`${where} no longer declares ${name}, which is still listed here. Remove it from the list.`)
+  }
+  return complaints
+}
+
+test('[o3d-secops] every script-scope declaration the shared fence library makes is classified', () => {
+  const complaints = unclassifiedLibraryNames(FENCE_LIB, FENCE_LIBRARY)
+  assert.deepEqual(complaints, [], complaints.join('\n'))
+
+  // THE WALK REACHED THE FILE, stated as a number: a census that silently enumerated nothing would
+  // otherwise pass as one that enumerated everything and found it all classified.
+  const found = libraryDeclaredNames(FENCE_LIB, FENCE_LIBRARY)
+  assert.equal(found.length, PROTECTED_LIBRARY_CONSTANTS.length + Object.keys(MUTABLE_LIBRARY_NAMES).length,
+    `the census found ${found.length} script-scope declarations in ${FENCE_LIBRARY}: ${found.join(', ')}`)
+})
+
+test('[o3d-secops] a new library path declared next to the protected ones fails the census', () => {
+  // NOT VACUOUS, AND IN BOTH DIRECTIONS. The unmodified library passes the census (the test above),
+  // so the failures below are the appended declarations talking.
+  //
+  // ROUTE: each addition is a line bash really does execute as a script-scope declaration — proved
+  // here by running it — of exactly the kind this round was about: a path under the recovery root,
+  // an executable inside the protected tree, and a second digest record.
+  const additions = [
+    'readonly DB_FENCE_QUARANTINE_DIR="${DB_FENCE_RECOVERY_DIR}/.quarantine"',
+    'DB_FENCE_SECOND_HELPER="${DB_FENCE_PROTECTED_APP_DIR}/scripts/also-run-this.mjs"',
+    'readonly DB_FENCE_ARTEFACT_BACKUP="${DB_FENCE_RECOVERY_DIR}/db-fence-artefact.sha256.bak"',
+  ]
+  for (const addition of additions) {
+    const name = /^(?:readonly )?([A-Z_][A-Z0-9_]*)=/.exec(addition)?.[1] ?? ''
+    assert.match(name, /^DB_FENCE_/, `precondition: the fixture must declare a name: ${addition}`)
+
+    // PRECONDITION — bash takes it as a declaration, so what the census must catch is a real one.
+    const ran = runBash(['set -u', FENCE_LIB, addition, `printf 'VALUE=%s\\n' "\${${name}}"`].join('\n'))
+    assert.equal(ran.status, 0, `precondition: the appended declaration must run: ${ran.stderr}`)
+    assert.match(ran.stdout, /^VALUE=\/etc\/ims-cutover-recovery\//m,
+      `precondition: it must resolve to a real path under the recovery root: ${ran.stdout}`)
+
+    // THE CLAIM — the census names it, and says which decision has to be made about it.
+    const complaints = unclassifiedLibraryNames(`${FENCE_LIB}\n${addition}\n`, FENCE_LIBRARY)
+    assert.equal(complaints.length, 1, `the census must name exactly the new declaration:\n${complaints.join('\n')}`)
+    assert.match(complaints[0], new RegExp(`declares ${name} and nothing here says what it is`), complaints[0])
+    assert.match(complaints[0], /PROTECTED_LIBRARY_CONSTANTS/, 'and say what to do about it')
+  }
+
+  // AND A DECLARATION THAT DISAPPEARS FAILS TOO, so the census is an equality and not a subset: a
+  // list that still claims a name the library has stopped declaring is a list nobody has read.
+  const removed = FENCE_LIB.replace(/^readonly DB_FENCE_RETIRED_APP_DIR=.*$/m, '')
+  assert.notEqual(removed, FENCE_LIB, 'precondition: the declaration this deletes must exist')
+  const orphaned = unclassifiedLibraryNames(removed, FENCE_LIBRARY)
+  assert.equal(orphaned.length, 1, orphaned.join('\n'))
+  assert.match(orphaned[0], /no longer declares DB_FENCE_RETIRED_APP_DIR/, orphaned[0])
 })
 
 /**
