@@ -1037,11 +1037,17 @@ for (const entry of MARKER_CASES) {
     const fileBarrier = publish.indexOf('fsync_path "$tmp"')
     // o3d-czpy: `-T`, so a DIRECTORY planted at the target name is refused rather than filled
     // with a stray temporary while the run reports success.
-    // o3d-czpy r2: `../${base}` from inside the pinned staging directory, never the absolute
-    // target, which re-resolved the destination parent at the instant of the rename.
-    const rename = publish.indexOf('mv -f -T "$tmp" "../${base}"')
-    // And the directory barrier flushes the SAME pinned parent the rename landed in.
-    const dirBarrier = publish.indexOf('fsync_path ..')
+    // o3d-czpy r2: never the absolute target, which re-resolved the destination parent at the
+    // instant of the rename.
+    // o3d-secops r19: and no longer `../${base}` either. `..` is the kernel's own parent link, so
+    // no rename of a NAME above the staging directory could redirect it — but it is a property of
+    // WHERE THE STAGING DIRECTORY IS, and a staging directory moved wholesale into another parent
+    // takes it along. The destination is a descriptor opened before the staging directory exists,
+    // so `/proc/self/fd/N/${base}` is `renameat(N, "${base}", …)` and names nothing that can move.
+    const rename = publish.indexOf('mv -f -T "$tmp" "/proc/self/fd/${dest}/${base}"')
+    // And the directory barrier flushes THAT SAME DESCRIPTOR — the directory the rename landed in,
+    // asked for as an open file rather than as `..` of wherever the staging directory now is.
+    const dirBarrier = publish.indexOf('fsync_path "/proc/self/fd/${dest}"')
     assert.ok(fileBarrier !== -1, 'the data must be fsynced')
     assert.ok(rename !== -1, 'and published by rename')
     assert.ok(dirBarrier !== -1, 'and the parent directory fsynced')
