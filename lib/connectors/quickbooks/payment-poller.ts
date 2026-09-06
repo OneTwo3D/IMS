@@ -405,12 +405,33 @@ async function fetchReversedEntityIdsByIds(
       // IS OUTSTANDING.
       //
       // Every OTHER outcome of this loop is a reading: a balance due, a void, or a stated zero. An
-      // unreadable `Balance` is none of them, and the closing loop below reads "returned, nothing
+      // unreadable amount is none of them, and the closing loop below reads "returned, nothing
       // still withheld, no error" as SETTLED — so without this the marker on a document whose
-      // `Balance` arrived as `"0x64"` (or as anything else `parseLedgerAmount` now refuses) would be
+      // amount arrived as `"0x64"` (or as anything else `parseLedgerAmount` now refuses) would be
       // CLOSED, which is the r10 defect reached through the parser instead of through a `typeof`.
       // A void is exempt because it IS a reading: the document holds nothing by its own rule.
-      if (parsed.balance === null && !isVoided) unreadable.add(row.Id)
+      //
+      // o3d-psrx r12 (Codex HIGH 2) — EITHER FIGURE, NOT JUST `Balance`.
+      //
+      // r11 watched one field of the two this loop reads, and the escape was the other one:
+      // `Balance: "0.00", TotalAmt: "0x0"` gives a readable zero balance (so nothing is due and the
+      // document never becomes a candidate) and an unreadable total (so `isVoided` is false and the
+      // r11 test never fired) — returned, not withheld, not unreadable, CLOSED as settled, with
+      // QuickBooks' own statement of what the document is worth never read at all.
+      //
+      // WHAT THE CLOSING DECISION READS, ENUMERATED, rather than the field that was named. The rows
+      // this read returns carry exactly four fields (`QboAmountRow`), and the marker below closes on:
+      //   Id         — the join to the marker. A missing or unmatched one leaves the document out of
+      //                `returned`, and the loop DEFERS on that. Fail-safe already.
+      //   Balance    — decides `balanceDue`, and so whether the document is a candidate at all.
+      //   TotalAmt   — decides `isVoided`, the other way in, and is half of the `paid` figure the
+      //                provenance gate weighs.
+      //   CurrencyRef— sizes the gate's epsilon only. An unstated or malformed code takes the FINEST
+      //                threshold (`ledgerAmountEpsilon`), which can only move a document out of
+      //                HOLDS_NOTHING into a verdict that withholds. Fail-safe already.
+      // So `Balance` and `TotalAmt` are the two whose refusal could be spent as a settlement, and
+      // BOTH are watched here. `parsed.currency` deliberately is not: it has no way to close.
+      if (!isVoided && (parsed.balance === null || parsed.total === null)) unreadable.add(row.Id)
       if (isVoided) voided.push({ Id: row.Id })
       // o3d-psrx r8: and the amounts, from the row this loop is already holding. Voided by its own
       // rule for the reason `qboVoidedAmount` gives.
