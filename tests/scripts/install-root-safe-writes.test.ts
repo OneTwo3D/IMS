@@ -5909,3 +5909,88 @@ test('[o3d-secops] a link pointing into a system directory gets no bind command 
   assert.ok(mutated.stderr.includes('mount --bind /etc/systemd/system'),
     `without the exclusion the host's unit tree is offered as a bind source: ${mutated.stderr}`)
 })
+
+test('[o3d-secops] the one precondition the run cannot establish is stated immediately above the command that needs it', (t) => {
+  /**
+   * EVERY CHECK IN THIS REFUSAL establishes that the target is not something the installer must
+   * never touch. NONE of them can establish the property that actually matters — that the target is
+   * DEDICATED to this root — because "a directory holding nothing but this application's data" is
+   * not a question a filesystem can be asked, and a denylist cannot converge on it: `/var/www` was
+   * the eleventh path added to one, and there is always a twelfth.
+   *
+   * So the precondition is stated where it can be acted on: in the operator's own terms, naming the
+   * exact consequence, immediately above the command that carries it. This test measures that it is
+   * there, that it says what happens, and that it comes FIRST — advice an operator meets after the
+   * command it qualifies is advice they meet too late.
+   */
+  const base = createTempDirSync('ims-secops-precondition-', t)
+  const disk = join(base, 'srv-disk2')
+  const target = join(disk, 'ims')
+  mkdirSync(target, { recursive: true })
+  chmodSync(disk, 0o755)
+  const root = join(base, 'ims')
+  symlinkSync(target, root)
+
+  const run = runBash(rig([...ROOT_GATE], GATE_DATA, `DATA_DIR=${q(root)}`))
+  assert.equal(run.status, 1, run.stderr)
+  assert.ok(run.stderr.includes(`mount --bind ${target} ${root}`),
+    `precondition: this layout must reach the procedure, or the warning has nothing to qualify: ${run.stderr}`)
+
+  const warning = run.stderr.split('\n').find((line) => line.includes('BEFORE YOU RUN ANY OF THIS'))
+  assert.ok(warning, `the procedure must be preceded by its precondition: ${run.stderr}`)
+  assert.ok(warning.includes(`${target} must hold NOTHING BUT this application's data`), warning)
+  assert.match(warning, /--delete/, 'and name the operation that destroys what is there')
+  assert.match(warning, /chowns it recursively to svcuser/, 'and the account it hands the tree to')
+  assert.match(warning, /move this application's data into a directory of its own first/,
+    'and what to do when the operator is not certain')
+
+  // AND IT COMES FIRST. A warning below the command it qualifies is one the operator meets after
+  // they have run it.
+  assert.ok(run.stderr.indexOf('BEFORE YOU RUN ANY OF THIS') < run.stderr.indexOf('mount --bind'), run.stderr)
+
+  // MEASURED BY MUTATION, ROUTE STATED: the warning removed, which is where this stood before this
+  // pass. The same layout then gets a paste-ready destructive command with nothing qualifying it.
+  const shipped = shellFunction(INSTALL_SH, 'refuse_symlinked_root')
+  const line = shipped.split('\n').find((l) => l.includes('BEFORE YOU RUN ANY OF THIS'))
+  assert.ok(line, 'precondition: the shipped refusal must carry the warning')
+  const silent = shipped.replace(`${line}\n`, '')
+  assert.ok(!silent.includes('BEFORE YOU RUN ANY OF THIS'), 'the mutation must remove it')
+
+  const mutated = runBash(rig(ROOT_GATE.filter((n) => n !== 'refuse_symlinked_root'), GATE_DATA,
+    [`DATA_DIR=${q(root)}`, silent].join('\n')))
+  assert.ok(mutated.stderr.includes('mount --bind'), mutated.stderr)
+  assert.ok(!mutated.stderr.includes('BEFORE YOU RUN ANY OF THIS'),
+    'without it the command is printed unqualified — which is what this test exists to fail on')
+})
+
+test('[o3d-secops] a conventional shared tree is refused outright, not merely warned about', (t) => {
+  /**
+   * `/opt/one-two-inventory -> /var/www` is plausible for a legacy web deployment: root-controlled
+   * ancestry, disjoint from every managed root, outside every OS tree. Binding it would put other
+   * sites and package-managed content where the next run rsyncs with `--delete` and chowns. It is
+   * on the exclusion list for that reason — the warning above is the general answer, and a
+   * conventional shared tree does not need to reach it.
+   */
+  const base = createTempDirSync('ims-secops-shared-', t)
+  const opt = join(base, 'opt')
+  mkdirSync(opt)
+  chmodSync(opt, 0o755)
+  const link = join(opt, 'one-two-inventory')
+  symlinkSync('/var/www', link)
+
+  const run = runBash(rig([...ROOT_GATE], GATE_DATA, `DATA_DIR=${q(link)}`))
+  assert.equal(run.status, 1, run.stderr)
+  assert.ok(!run.stderr.includes('mount --bind'), `no bind command may name /var/www: ${run.stderr}`)
+  assert.ok(!run.stderr.includes('/etc/fstab'), 'and no fstab line')
+  // /var/www may not exist on this host; either refusal is correct and neither offers a command.
+  assert.match(run.stderr, /belongs to the operating system|does not resolve to a directory/, run.stderr)
+
+  // NOT VACUOUS: /var itself is NOT excluded — a dedicated directory under it is a supported bind
+  // source, and gets the procedure. So what is refused is the shared tree, not the location.
+  const dedicated = join(base, 'var-lib-ims')
+  mkdirSync(dedicated)
+  const goodLink = join(opt, 'link-dedicated')
+  symlinkSync(dedicated, goodLink)
+  const ok = runBash(rig([...ROOT_GATE], GATE_DATA, `DATA_DIR=${q(goodLink)}`))
+  assert.ok(ok.stderr.includes(`mount --bind ${dedicated} ${goodLink}`), ok.stderr)
+})

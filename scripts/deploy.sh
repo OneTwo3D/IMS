@@ -1703,7 +1703,7 @@ refuse_symlinked_root() {
   # added — and the question an operator is really being asked is simpler than that: a bind source
   # is a place data lives, not a part of the operating system. /srv, /mnt, /media, /opt, /var and
   # /home stay available; the trees the distribution owns do not.
-  for other in / /bin /boot /dev /etc /lib /lib32 /lib64 /libx32 /proc /root /run /sbin /sys /usr; do
+  for other in / /bin /boot /dev /etc /lib /lib32 /lib64 /libx32 /proc /root /run /sbin /sys /usr /var/www; do
     # `/` IS THE ENTRY THAT NEEDS THE GUARD: `${other%/}` empties it, and the pattern `/*` then
     # matches every absolute path there is. Only exact equality means anything for the root of the
     # filesystem, and every other entry keeps the prefix test.
@@ -1796,6 +1796,18 @@ ${LOG_DIR:-}"
       done
     fi
   done <<< "$keep"
+  # AND THE ONE THING THIS RUN CANNOT ESTABLISH IS SAID OUT LOUD, IMMEDIATELY ABOVE THE COMMANDS
+  # (o3d-secops r7 eleventh pass, Codex HIGH).
+  #
+  # THE FINDING, AND WHY IT IS ANSWERED THIS WAY. Every check above establishes that the target is
+  # not something this installer must never touch. NONE of them can establish the property that
+  # actually matters — that the target is DEDICATED to this root — because "a directory that holds
+  # nothing but this application's data" is not a question a filesystem can be asked. A denylist
+  # cannot converge on it either: /var/www was the eleventh path added to one, and there is always a
+  # twelfth. So the precondition is stated where it can be acted on, in the operator's own terms,
+  # naming the exact consequence, immediately above the command that has it — which is the same
+  # answer every other unprovable precondition in these scripts gets.
+  printf 'ERROR: BEFORE YOU RUN ANY OF THIS: %s must hold NOTHING BUT this application'"'"'s data. After the bind, every later run of this installer treats it as %s — it rsyncs into it with --delete and it chowns it recursively to %s. Anything else living there is deleted or taken over. If you are not certain, move this application'"'"'s data into a directory of its own first and bind THAT.\n' "$qtarget" "$qroot" "${APP_USER:-the service account}" >&2
   printf 'ERROR: Do it with the writers stopped, in this order:\n' >&2
   printf 'ERROR:   1. stop the application service, and pause any cron that writes under %s\n' "$qroot" >&2
   printf 'ERROR:   2. this run resolved that link to: %s   (device:inode %s) — confirm that is where the data is\n' "$qtarget" "$ident" >&2

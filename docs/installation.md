@@ -1299,8 +1299,18 @@ says nothing about who may create it. So a root directly under `/tmp` is refused
   publications resolve against; it is not an inventory of everything the installer writes, and
   `/opt/one-two-inventory -> /etc/systemd/system` would otherwise satisfy every other question. So
   a target inside `/`, `/bin`, `/boot`, `/dev`, `/etc`, `/lib*`, `/proc`, `/root`, `/run`, `/sbin`,
-  `/sys` or `/usr` gets no command: a bind source is where data lives. `/srv`, `/mnt`, `/media`,
-  `/opt`, `/var` and `/home` stay available.
+  `/sys`, `/usr` or `/var/www` gets no command: a bind source is where data lives. `/srv`, `/mnt`,
+  `/media`, `/opt`, `/var` and `/home` stay available.
+
+  **And the one precondition the run cannot establish is printed immediately above the commands.**
+  Every check listed here establishes that the target is not something the installer must never
+  touch. None of them can establish that the target is *dedicated* to this root — "a directory
+  holding nothing but this application's data" is not a question a filesystem can be asked, and a
+  denylist cannot converge on it. So the refusal says so, in the operator's terms and before the
+  first command: after the bind, every later run treats that directory as the root — `rsync
+  --delete` into it and `chown -R` over it — so anything else living there is deleted or taken over,
+  and an operator who is not certain should move the application's data into a directory of its own
+  and bind that.
 
   **And the target may not be the root, an ancestor of it, anything under it, or any other root the
   run writes into** — read from `publish_trust_root_candidates()`, the one table every publication
