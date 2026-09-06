@@ -9,18 +9,16 @@ import {
   listedLedgerPaymentIds,
   parseLedgerAmount,
   zeroPaidIsProvenReversal,
-  PAYMENT_PRESENT_EPSILON,
   type RegisteredPaymentRow,
   type XeroInvoice,
 } from '@/lib/connectors/xero/invoice-delta'
 import {
   classifyQboLedgerEvidence,
-  ledgerAmountEpsilon,
   qboLedgerAmount,
   qboWithheldReversalReason,
   resolveLedgerRowCurrency,
 } from '@/lib/connectors/quickbooks/payment-poller'
-import { currencyMinorUnits, toDecimal } from '@/lib/domain/math/decimal'
+import { currencyMinorUnits, ledgerAmountEpsilon, toDecimal } from '@/lib/domain/math/decimal'
 
 /**
  * One row of a QuickBooks reversal read, put through the PRODUCTION reader.
@@ -678,8 +676,8 @@ test('[o3d-psrx r10] the part-paid warning states the comparison and disclaims t
 // ---------------------------------------------------------------------------
 // o3d-psrx r10 (Codex HIGH 3) — THE EPSILON WAS CURRENCY-BLIND.
 //
-// `PAYMENT_PRESENT_EPSILON` is 0.005 and is documented for Xero's two-decimal amounts. This
-// classifier receives QuickBooks documents and no currency ever reached it, while the repository
+// The threshold was Xero's `PAYMENT_PRESENT_EPSILON`: 0.005, documented for Xero's two-decimal
+// amounts. This classifier receives QuickBooks documents and no currency ever reached it, while the repository
 // supports three- and four-decimal currencies (`currencyMinorUnits`). Against those, 0.005 is FIVE
 // whole minor units in a Gulf dinar and FIFTY in CLF: an amount the ledger really is holding read as
 // nothing, the registration gate admitted, and a full chargeback was raised over a document the
@@ -750,10 +748,11 @@ test('[o3d-psrx r10] the threshold is strictly below one minor unit of the curre
       + `(epsilon ${epsilon.toString()}, minor unit ${oneMinorUnit.toString()})`)
     assert.ok(epsilon.gt(0), `${currency}: and a zero threshold would make float dust a payment`)
   }
-  // The two-decimal case is unchanged from the constant it replaces, so nothing about the ordinary
-  // currency moves.
+  // The two-decimal case is unchanged from the fixed 0.005 this replaced, so nothing about the
+  // ordinary currency moves. Written out as the literal it has to equal: the constant it used to be
+  // compared against was deleted in r17, and a test that compared the rule against itself would pass
+  // however the rule moved.
   assert.equal(ledgerAmountEpsilon('GBP').toString(), '0.005')
-  assert.equal(ledgerAmountEpsilon('GBP').toString(), String(PAYMENT_PRESENT_EPSILON))
   // An unstated currency takes the finest precision the repository supports.
   assert.ok(ledgerAmountEpsilon(null).lte(ledgerAmountEpsilon('CLF')),
     'an unstated currency must be no more permissive than the finest currency it could be')

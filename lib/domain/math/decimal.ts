@@ -99,6 +99,49 @@ export function ledgerMinorUnits(currency: string | null): number {
   return currency == null ? FINEST_SUPPORTED_MINOR_UNITS : currencyMinorUnits(currency)
 }
 
+/**
+ * o3d-psrx r10 (Codex HIGH 3), moved here in r17 — HOW SMALL AN AMOUNT COUNTS AS NOTHING, IN THIS
+ * DOCUMENT'S CURRENCY.
+ *
+ * r9 used Xero's `PAYMENT_PRESENT_EPSILON`, which was 0.005 and documented for Xero's two-decimal
+ * amounts: half a penny, comfortably inside the gap between "nothing" and the smallest payment that
+ * can exist. Both connectors' reversal readers also receive three- and four-decimal currencies
+ * (`currencyMinorUnits` — BHD/IQD/JOD/KWD/LYD/OMR/TND at 3, CLF/UYW at 4). Against those, a fixed
+ * 0.005 is FIVE whole minor units in a Gulf dinar and fifty in CLF: a document the ledger states
+ * 0.004 is still settled on reads as holding NOTHING, the registration gate then admits, and
+ * `paidAt` is cleared with a chargeback credit note raised over a document the ledger is still
+ * accounting for. That is the o3d-psrx defect itself, reached through the tolerance.
+ *
+ * So the threshold is HALF ONE MINOR UNIT of the document's own currency — strictly below one minor
+ * unit in every currency, which is what makes "the smallest amount that can exist is not zero" true
+ * everywhere rather than only in GBP. In a two-decimal currency it is 0.005 exactly, so nothing about
+ * the ordinary case moves.
+ *
+ * A NULL CURRENCY TAKES THE STRICTEST THRESHOLD, not the most convenient one. QuickBooks omits
+ * `CurrencyRef` when multicurrency is off and Xero's fixtures predate `CurrencyCode`, and the
+ * fail-safe direction is unambiguous: too LARGE a threshold discards a real minor unit as zero and
+ * lets a reversal through, while too small a one can only move a document from "holds nothing" into
+ * a verdict that WITHHOLDS. So an unstated currency is given the finest precision this repository
+ * supports.
+ *
+ * o3d-psrx r17 (Codex HIGH) — AND IT LIVES HERE, BESIDE `ledgerMinorUnits`, BECAUSE IT IS THE ANSWER
+ * BOTH CONNECTORS GIVE. It was written in `lib/connectors/quickbooks/payment-poller.ts`, which is
+ * DOWNSTREAM of Xero's `invoice-delta.ts` in the import graph, so Xero's `partitionPaymentReversals`
+ * could not reach it and kept a fixed 0.005 of its own. Two rules with different ideas of "how small
+ * is nothing" is precisely what r16's scale rule made reachable: it admits `0.001` in KWD and
+ * `0.0001` in CLF — one whole minor unit, a payment the ledger genuinely holds — and Xero then
+ * measured that against a constant sized for pennies and called it zero. There is now ONE function,
+ * in the module both connectors already import their minor units from, and no import direction that
+ * can put it out of either one's reach again.
+ */
+export function ledgerAmountEpsilon(currency: string | null): Decimal {
+  // r16: through the shared resolver, so this rule and the two magnitude rules cannot drift apart on
+  // what an unstated currency means.
+  const digits = ledgerMinorUnits(currency)
+  // Half of 10^-digits, written exactly rather than computed in binary floating point.
+  return toDecimal(`0.${'0'.repeat(digits)}5`)
+}
+
 function currencyPrecision(currency: string): number {
   const normalizedCurrency = currency.trim().toUpperCase()
   if (!normalizedCurrency) return 2

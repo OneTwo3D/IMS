@@ -656,7 +656,7 @@ test('[o3d-psrx r10] CONTROL: a string TotalAmt of zero is still recognised as V
 // ---------------------------------------------------------------------------
 // o3d-psrx r10 (Codex HIGH 3) — THE THRESHOLD BELONGS TO THE DOCUMENT'S CURRENCY.
 //
-// `PAYMENT_PRESENT_EPSILON` is 0.005 and is documented for Xero's two-decimal amounts. This poller
+// The threshold was Xero's `PAYMENT_PRESENT_EPSILON`: 0.005, documented for Xero's two-decimal amounts. This poller
 // receives QuickBooks documents, and the repository supports three- and four-decimal currencies, in
 // which 0.005 is five whole minor units or fifty. Under the fixed threshold a Kuwaiti dinar document
 // still holding 0.001 read as holding NOTHING, the registration gate admitted, and `paidAt` was

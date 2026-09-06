@@ -19,13 +19,42 @@
  * note against a sale nobody reversed, which is the defect this whole round is about.
  *
  * WHY AN EPSILON AT ALL. Both sides are `Number`s read from Prisma `Decimal` columns, and a receipt
- * total assembled from several rows will not land exactly on a stored total. The band is a hundredth
- * of a penny — far below any currency's minor unit, so it cannot absorb a real shortfall — and it
- * leans towards "covered", which is the direction that was already in production.
+ * total assembled from several rows will not land exactly on a stored total. The band absorbs that
+ * assembly noise and nothing else, and it leans towards "covered", which is the direction that was
+ * already in production.
+ *
+ * o3d-psrx r17 — AND THE BAND IS DERIVED, BECAUSE THE SENTENCE THAT SIZED IT WAS FALSE. It was a
+ * literal `0.0001`, described here as "a hundredth of a penny — far below any currency's minor unit,
+ * so it cannot absorb a real shortfall". It is not below every minor unit: `currencyMinorUnits` puts
+ * CLF and UYW at FOUR decimals, whose minor unit is 0.0001 EXACTLY. So in those currencies the band
+ * was one whole minor unit wide and did absorb a real shortfall — a registration one unit short of
+ * the total read as covering it, the coverage guard in `classifyRegisteredPaymentAgainstListing`
+ * stood down, and the verdict became an ADMITTED reversal of the whole document. That is the same
+ * shape as the r17 finding one module over: a fixed constant that is safe only while every currency
+ * in sight happens to be coarser than it.
+ *
+ * So it is now HALF the finest minor unit this repository supports — `ledgerAmountEpsilon(null)`, the
+ * one function both connectors' reversal readers ask "how small is nothing", given the null currency
+ * it resolves to the strictest precision. That makes the original claim TRUE: strictly below one
+ * minor unit in every supported currency, so no real shortfall fits inside it, while remaining orders
+ * of magnitude above the float assembly noise it exists for (summing even a thousand receipt rows of
+ * a million-unit order moves the total by ~1e-7).
+ *
+ * IT MOVED IN THE STRICT DIRECTION, WHICH IS THE SAFE ONE FOR ALL THREE CALLERS. A narrower band can
+ * only make `coversDocumentTotal` answer NO where it used to answer YES: the reader then returns
+ * `PART_COVERED_OFF_LEDGER`, which WITHHOLDS the reversal; `addPayment` declines to set `paidAt` on
+ * coverage it cannot establish; `removePaymentAndSettlePaidAt` clears `paidAt` rather than leaving a
+ * document claiming to be settled by receipts that fall short of it. It is also a SHARED constant, so
+ * the writer and the reader move together and the "one spelling" property above is untouched.
  */
 
-/** A hundredth of a penny: below every minor unit, so it can only absorb float assembly noise. */
-export const PAID_COVERAGE_EPSILON = 0.0001
+import { ledgerAmountEpsilon } from '@/lib/domain/math/decimal'
+
+/**
+ * Half the finest supported minor unit: below every currency's minor unit, so it can only absorb
+ * float assembly noise. Not a literal — see above for the round it stopped being one.
+ */
+export const PAID_COVERAGE_EPSILON = ledgerAmountEpsilon(null).toNumber()
 
 /**
  * Does `covered` settle `documentTotal`?

@@ -10,7 +10,8 @@ import {
   type RegisteredPaymentRow,
 } from '@/lib/connectors/xero/invoice-delta'
 import { payloadRegisteredAmount } from '@/lib/domain/accounting/invoice-payment-enqueue'
-import { coversDocumentTotal } from '@/lib/domain/accounting/paid-coverage'
+import { coversDocumentTotal, PAID_COVERAGE_EPSILON } from '@/lib/domain/accounting/paid-coverage'
+import { currencyMinorUnits, toDecimal } from '@/lib/domain/math/decimal'
 
 /**
  * o3d-psrx r6 (Codex HIGH 2) — WHAT THE SURVIVING MARKER BUYS, AND WHAT A PART-COVERED ORDER READS AS.
@@ -193,6 +194,49 @@ test('[o3d-psrx r7] removing a PART-covering registration does not reverse the w
       : null,
     { registeredTotal: 1, documentTotal: 100 },
   )
+})
+
+test('[o3d-psrx r17] ONE MINOR UNIT SHORT IS NOT COVERAGE, in the finest currency the repository supports', () => {
+  // o3d-psrx r17 — THE SAME SHAPE AS THE XERO EPSILON, ONE MODULE OVER. `PAID_COVERAGE_EPSILON` was
+  // the literal 0.0001, described in its own file as "a hundredth of a penny — far below any
+  // currency's minor unit, so it cannot absorb a real shortfall". `currencyMinorUnits` puts CLF and
+  // UYW at FOUR decimals, whose minor unit is 0.0001 EXACTLY, so in those currencies the band was one
+  // whole minor unit wide and did absorb a real shortfall.
+  //
+  // THE ROUTE is `classifyRegisteredPaymentAgainstListing`, the production reader, not
+  // `coversDocumentTotal` on its own: the guard's whole purpose is the verdict it dominates, and the
+  // verdict is what `zeroPaidIsProvenReversal` spends. Registered 99.9999 against a 100 total is a
+  // shortfall of one CLF minor unit — a real part-coverage — and under the old literal the reader
+  // called it covered and returned GONE, an ADMITTED reversal of the whole document.
+  const oneUnitShort: RegisteredPaymentRow = { ...pennyRegistration, registeredAmount: 99.9999 }
+  const verdict = classifyRegisteredPaymentAgainstListing(
+    new Set<string>(), [oneUnitShort], READ_AT, [], true, withMarker, ORDER_TOTAL,
+  )
+  assert.equal(verdict.verdict, 'PART_COVERED_OFF_LEDGER',
+    'a whole minor unit short of the total is a PART, and its removal is not a reversal of the whole')
+  assert.equal(zeroPaidIsProvenReversal(verdict), false,
+    'so paidAt is LEFT SET and no chargeback is raised over the remainder')
+
+  // THE CONTROL, and the reason the band exists at all: float assembly noise from summing receipt
+  // rows must still read as covered, or every fully-settled order would withhold for ever.
+  const noisy: RegisteredPaymentRow = { ...pennyRegistration, registeredAmount: ORDER_TOTAL - 1e-9 }
+  assert.equal(
+    classifyRegisteredPaymentAgainstListing(
+      new Set<string>(), [noisy], READ_AT, [], true, withMarker, ORDER_TOTAL,
+    ).verdict,
+    'GONE',
+    'a shortfall of a billionth is assembly noise, not a part payment',
+  )
+
+  // AND THE RULE THE BAND IS NOW DERIVED FROM, stated rather than sampled: strictly below one minor
+  // unit of every supported currency, so no real shortfall fits inside it.
+  for (const currency of ['GBP', 'JPY', 'KWD', 'CLF', 'UYW']) {
+    const oneMinorUnit = toDecimal(1).div(toDecimal(10).pow(currencyMinorUnits(currency)))
+    assert.ok(toDecimal(PAID_COVERAGE_EPSILON).lt(oneMinorUnit),
+      `${currency}: a coverage band at or above one minor unit absorbs a real shortfall `
+      + `(band ${PAID_COVERAGE_EPSILON}, minor unit ${oneMinorUnit.toString()})`)
+  }
+  assert.ok(PAID_COVERAGE_EPSILON > 0, 'and a zero band would make float dust a shortfall')
 })
 
 test('[o3d-psrx r7] a registration that COVERS the order still reverses when the ledger says so', () => {

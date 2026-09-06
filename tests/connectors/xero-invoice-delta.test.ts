@@ -14,7 +14,6 @@ import {
   partitionPaymentReversals,
   listedLedgerPaymentIds,
   unregisteredLocalReceipts,
-  PAYMENT_PRESENT_EPSILON,
   MAX_CHUNKS_PER_POLL,
   MAX_PAGES,
   PAGE_SIZE,
@@ -22,7 +21,8 @@ import {
   type InvoiceFetcher,
   type XeroInvoice,
 } from '@/lib/connectors/xero/invoice-delta'
-import { ledgerAmountEpsilon, qboLedgerAmount } from '@/lib/connectors/quickbooks/payment-poller'
+import { qboLedgerAmount } from '@/lib/connectors/quickbooks/payment-poller'
+import { currencyMinorUnits, ledgerAmountEpsilon, toDecimal } from '@/lib/domain/math/decimal'
 
 const SINCE = new Date('2026-07-17T12:00:00.000Z')
 
@@ -538,11 +538,116 @@ test('a numeric string AmountPaid is read, not discarded', () => {
 })
 
 test('rounding dust is not a payment, but a penny is', () => {
-  const dust = partitionPaymentReversals([ledgerInv('b1', 'ACCPAY', 'AUTHORISED', { AmountPaid: PAYMENT_PRESENT_EPSILON / 2 })], 'ACCPAY')
-  assert.deepEqual(dust.zeroPaid.map((i) => i.InvoiceID), ['b1'])
+  // o3d-psrx r17: DUST IS MEASURED IN THE INVOICE'S OWN CURRENCY NOW, and the pair of rules r16 and
+  // r17 installed leaves it nowhere to land. Half a penny stated on a GBP invoice carries more
+  // decimals than a penny has, so the scale rule refuses it outright and the row is UNVERIFIABLE —
+  // withheld, which is the answer this partition already gives a figure it cannot read. It is
+  // emphatically not `zeroPaid`, the one bucket that can go on to clear paidAt.
+  const dust = partitionPaymentReversals([
+    ledgerInv('b1', 'ACCPAY', 'AUTHORISED', { AmountPaid: 0.005, CurrencyCode: 'GBP' }),
+  ], 'ACCPAY')
+  assert.deepEqual(dust.zeroPaid, [], 'a figure finer than the currency it is stated in is not a proven zero')
+  assert.deepEqual(dust.unverifiable.map((i) => i.InvoiceID), ['b1'])
 
   const penny = partitionPaymentReversals([ledgerInv('b2', 'ACCPAY', 'AUTHORISED', { AmountPaid: 0.01 })], 'ACCPAY')
   assert.deepEqual(penny.partPaid.map((i) => i.InvoiceID), ['b2'])
+})
+
+// ---------------------------------------------------------------------------
+// o3d-psrx r17 (Codex HIGH) — TWO RULES WITH DIFFERENT IDEAS OF "HOW SMALL IS NOTHING", AND A THIRD
+// CHANGE THAT MADE THE DISAGREEMENT REACHABLE.
+//
+// r10 gave QuickBooks a per-currency threshold. Xero kept a fixed `PAYMENT_PRESENT_EPSILON` of 0.005,
+// and r15 recorded on this branch that it was "not wrong today" because Xero rounds to 2dp. Then r16
+// added the scale rule, which admits a numeric token whose decimals fit its currency's minor unit —
+// so `0.001` in KWD and `0.0001` in CLF, each exactly ONE MINOR UNIT and the smallest payment those
+// currencies have, now reached a comparison sized for pennies and came out as nothing.
+//
+// `zeroPaid` is not a cosmetic bucket. It is the one the provenance gate can promote into a reversal,
+// which clears `paidAt`, re-arms Mark Paid over a supplier payment that was genuinely made, and
+// raises a chargeback credit note against a sale the ledger is still accounting for.
+//
+// THE ROUTE IS `partitionPaymentReversals` IN EVERY TEST BELOW — the function the poller calls at
+// lib/connectors/xero/payment-poller.ts, given the invoice shape Xero returns — and not the epsilon
+// helper on its own. A test that asked `ledgerAmountEpsilon` directly would have passed throughout
+// the entire life of this defect: the helper was always right, and the Xero decision never asked it.
+// ---------------------------------------------------------------------------
+
+test('[o3d-psrx r17] ONE MINOR UNIT IS A PAYMENT, NOT A ZERO, in every currency the repository supports', () => {
+  // Each row is a bill AUTHORISED with exactly one minor unit settled against it — the smallest
+  // payment that can exist in that currency, and a figure r16's scale rule admits precisely because
+  // it is quantized to the minor unit. Not one of them may be read as "the ledger holds nothing".
+  const oneMinorUnit: Array<[string, string, number]> = [
+    ['JPY', 'b-jpy', 1],          // 0dp
+    ['GBP', 'b-gbp', 0.01],       // 2dp — the case that always worked
+    ['KWD', 'b-kwd', 0.001],      // 3dp — 0.005 swallowed this, and five more like it
+    ['CLF', 'b-clf', 0.0001],     // 4dp — and fifty
+  ]
+  for (const [currency, id, paid] of oneMinorUnit) {
+    const reading = partitionPaymentReversals([
+      ledgerInv(id, 'ACCPAY', 'AUTHORISED', { AmountPaid: paid, AmountDue: 100, CurrencyCode: currency }),
+    ], 'ACCPAY')
+    assert.deepEqual(reading.zeroPaid.map((i) => i.InvoiceID), [],
+      `${currency}: ${paid} is ONE MINOR UNIT — a payment the ledger is holding — and it must never `
+      + 'reach the bucket that clears paidAt')
+    assert.deepEqual(reading.partPaid.map((i) => i.InvoiceID), [id],
+      `${currency}: it is a PART payment, which is the reading that withholds`)
+    assert.deepEqual(reading.unverifiable, [],
+      `${currency}: and it was read, not refused — the fix is a threshold, not a wider refusal`)
+    // The invariant behind the verdict, stated rather than inferred from the bucket: r16 guarantees
+    // every admitted amount is a whole multiple of its minor unit, so the smallest non-zero one is
+    // strictly more than half a unit, which is what this threshold is.
+    assert.ok(toDecimal(paid).gt(ledgerAmountEpsilon(currency)),
+      `${currency}: one minor unit must sit strictly above the currency's own "holds nothing" threshold`)
+  }
+})
+
+test('[o3d-psrx r17] a STATED ZERO is still a zero in every precision', () => {
+  // The other direction of the same rule, and the reason the fix is not "call everything a payment".
+  // A ledger that states 0.00 has stated that it holds nothing, and that reading must survive the
+  // threshold getting finer — otherwise every genuine reversal in a three- or four-decimal currency
+  // would be withheld for ever.
+  for (const [currency, id] of [['JPY', 'z-jpy'], ['GBP', 'z-gbp'], ['KWD', 'z-kwd'], ['CLF', 'z-clf']] as const) {
+    const reading = partitionPaymentReversals([
+      ledgerInv(id, 'ACCPAY', 'AUTHORISED', { AmountPaid: 0, AmountDue: 100, CurrencyCode: currency }),
+    ], 'ACCPAY')
+    assert.deepEqual(reading.zeroPaid.map((i) => i.InvoiceID), [id],
+      `${currency}: a stated zero is the ledger saying it holds nothing, in every precision`)
+    assert.deepEqual(reading.partPaid, [], `${currency}: and it is not a part payment`)
+  }
+  // An UNSTATED currency is read at the strictest precision, which can only move an invoice OUT of
+  // zeroPaid — never into it. A stated zero is still zero there too.
+  const unstated = partitionPaymentReversals([
+    ledgerInv('z-none', 'ACCPAY', 'AUTHORISED', { AmountPaid: 0, AmountDue: 100 }),
+  ], 'ACCPAY')
+  assert.deepEqual(unstated.zeroPaid.map((i) => i.InvoiceID), ['z-none'])
+})
+
+test('[o3d-psrx r17] GBP is UNCHANGED — the ordinary currency does not move', () => {
+  // The fix is a derivation, and a derivation that altered the two-decimal case would be a behaviour
+  // change smuggled in behind a bug fix. Three ways of saying "nothing moved in GBP":
+  //
+  //   THE THRESHOLD ITSELF, against the literal the deleted constant held.
+  assert.equal(ledgerAmountEpsilon('GBP').toString(), '0.005')
+  //   THE CLASSIFICATIONS, through the production route.
+  const gbp = partitionPaymentReversals([
+    ledgerInv('g-zero', 'ACCPAY', 'AUTHORISED', { AmountPaid: 0, AmountDue: 100, CurrencyCode: 'GBP' }),
+    ledgerInv('g-penny', 'ACCPAY', 'AUTHORISED', { AmountPaid: 0.01, AmountDue: 99.99, CurrencyCode: 'GBP' }),
+    ledgerInv('g-part', 'ACCPAY', 'AUTHORISED', { AmountPaid: 400, AmountDue: 100, CurrencyCode: 'GBP' }),
+    ledgerInv('g-neg', 'ACCPAY', 'AUTHORISED', { AmountPaid: -50, AmountDue: 150, CurrencyCode: 'GBP' }),
+  ], 'ACCPAY')
+  assert.deepEqual(gbp.zeroPaid.map((i) => i.InvoiceID), ['g-zero'])
+  assert.deepEqual(gbp.partPaid.map((i) => i.InvoiceID), ['g-penny', 'g-part', 'g-neg'])
+  assert.deepEqual(gbp.unverifiable, [])
+  //   AND THE RULE THE THRESHOLD IS DERIVED FROM, over every supported precision, so a later change to
+  //   how it is computed is measured against the rule rather than against today's numbers.
+  for (const currency of ['GBP', 'USD', 'JPY', 'KRW', 'ISK', 'KWD', 'BHD', 'JOD', 'CLF', 'UYW']) {
+    const epsilon = ledgerAmountEpsilon(currency)
+    const oneMinorUnit = toDecimal(1).div(toDecimal(10).pow(currencyMinorUnits(currency)))
+    assert.ok(epsilon.gt(0) && epsilon.lt(oneMinorUnit),
+      `${currency}: the threshold must sit strictly between zero and one minor unit `
+      + `(epsilon ${epsilon.toString()}, minor unit ${oneMinorUnit.toString()})`)
+  }
 })
 
 test('a negative AmountPaid is not read as "nothing is paid"', () => {
@@ -697,8 +802,8 @@ test('[o3d-psrx r12] the refusal is LOSSLESSNESS, not smallness: a tiny figure t
 test('[o3d-psrx r12] an AmountPaid that underflows to zero WITHHOLDS, it does not reverse', () => {
   // THE ROUTE, and it is the same one r11 used because it is the one that spends the number:
   // `partitionPaymentReversals` puts a stated zero into `zeroPaid`, which goes on to clear paidAt and
-  // re-arm Mark Paid. Under r11 the row below landed there — the invented 0 is inside
-  // PAYMENT_PRESENT_EPSILON — so the ledger appeared to have PROVEN it holds nothing.
+  // re-arm Mark Paid. Under r11 the row below landed there — the invented 0 is inside the
+  // "holds nothing" epsilon — so the ledger appeared to have PROVEN it holds nothing.
   const tooSmall = `0.${'0'.repeat(399)}1`
   const reading = partitionPaymentReversals([
     ledgerInv('b-underflow', 'ACCPAY', 'AUTHORISED', { AmountPaid: tooSmall, AmountDue: '500.00' }),
@@ -716,7 +821,7 @@ test('[o3d-psrx r11] an AmountPaid Xero did not state in decimal money WITHHOLDS
   // THE ROUTE: partitionPaymentReversals is what turns a figure into a reversal candidate. `zeroPaid`
   // is the bucket that goes on to clear paidAt and re-arm Mark Paid; `unverifiable` is the one that
   // withholds. Under Number() both rows below land in `zeroPaid` — "0x0" is 0 and "1e-9" is inside
-  // PAYMENT_PRESENT_EPSILON — so the ledger appears to have PROVEN it holds nothing.
+  // the "holds nothing" epsilon — so the ledger appears to have PROVEN it holds nothing.
   const reading = partitionPaymentReversals([
     ledgerInv('b-hex', 'ACCPAY', 'AUTHORISED', { AmountPaid: '0x0', AmountDue: '0x1F4' }),
     ledgerInv('b-exp', 'ACCPAY', 'AUTHORISED', { AmountPaid: '1e-9', AmountDue: '500' }),
@@ -1261,7 +1366,7 @@ test('[o3d-psrx r15] the bound is TIGHT for what it can guarantee: one binade lo
   // minor unit still survives the decode, so lowering would refuse money that is provably readable.
   //
   // MEASURED, not argued: every figure here is decoded from wire text, and the quantity checked is
-  // the one the decision uses — the settled amount against PAYMENT_PRESENT_EPSILON.
+  // the one the decision uses — the settled amount against the GBP "holds nothing" epsilon.
   const settledAfterDecode = async (a: string, b: string): Promise<number> => {
     const decoded = await decodeJsonAmounts(`{"a":${a},"b":${b}}`)
     return decoded.a - decoded.b
@@ -1273,10 +1378,11 @@ test('[o3d-psrx r15] the bound is TIGHT for what it can guarantee: one binade lo
     ['2^44 — a binade below that', '17592186044416.02', '17592186044416.01'],
   ]
   const settled = await Promise.all(pennyApart.map(([, a, b]) => settledAfterDecode(a, b)))
-  assert.ok(settled[0] <= PAYMENT_PRESENT_EPSILON,
+  const gbpEpsilon = ledgerAmountEpsilon('GBP').toNumber()
+  assert.ok(settled[0] <= gbpEpsilon,
     'AT the bound a whole penny is lost — which is what the bound is for, and it refuses these')
   for (const index of [1, 2]) {
-    assert.ok(settled[index] > PAYMENT_PRESENT_EPSILON,
+    assert.ok(settled[index] > gbpEpsilon,
       `${pennyApart[index][0]}: a whole penny still survives the decode here, so a bound set at or `
       + 'below this magnitude would refuse an amount whose decision is provably safe')
   }

@@ -7,6 +7,8 @@
 
 import { coversDocumentTotal } from '@/lib/domain/accounting/paid-coverage'
 import {
+  compareDecimal,
+  ledgerAmountEpsilon,
   ledgerMinorUnits,
   subtractMoney,
   toDecimal,
@@ -981,8 +983,8 @@ export function xeroInvoiceCurrency(invoice: XeroInvoice): string | null {
  * o3d-psrx r15 (Codex HIGH) — WHAT THIS BOUND GUARANTEES, EXACTLY, AND WHY IT IS NOT ONE BINADE
  * LOWER.
  *
- * The finding was that the reversal decision turns on HALF a minor unit (`ledgerAmountEpsilon`, and
- * Xero's `PAYMENT_PRESENT_EPSILON`) while the bound above is derived from ONE WHOLE minor unit — so
+ * The finding was that the reversal decision turns on HALF a minor unit (`ledgerAmountEpsilon`, on
+ * both connectors since r17) while the bound above is derived from ONE WHOLE minor unit — so
  * the bound protects a coarser quantity than the decision uses, and the obvious correction is to
  * re-derive it against the half unit, one binade lower. THAT CORRECTION WAS TESTED AND IT IS WRONG
  * IN BOTH DIRECTIONS. The measurements are pinned as tests; the argument is:
@@ -1112,7 +1114,7 @@ export function readDecimalAsNumber(decimal: Decimal): number | null {
  * TWO DECODED AMOUNTS MUST SIT UNDER, WHICH IS HALF THE ONE A SINGLE AMOUNT MUST.
  *
  * `ledgerAmountMagnitudeBound` guarantees that ONE WHOLE MINOR UNIT survives the decode. The reversal
- * decision turns on HALF of one (`ledgerAmountEpsilon`, `PAYMENT_PRESENT_EPSILON`), and r15 argued
+ * decision turns on HALF of one (`ledgerAmountEpsilon`), and r15 argued
  * that the whole unit is nevertheless enough BECAUSE a genuine settlement is a whole multiple of the
  * minor unit, so the smallest one that exists is twice the epsilon. THE SCALE RULE MAKES THAT
  * ARGUMENT TRUE OF THE READING; IT DOES NOT MAKE IT TRUE OF THE TOKEN, and for a DIFFERENCE that gap
@@ -1240,11 +1242,23 @@ export function parseLedgerAmount(value: unknown, currency: string | null): numb
   return null
 }
 
-/**
- * Below this, the ledger holds no payment. Xero rounds money to 2dp, so half a penny is well inside
- * the gap between "nothing" and "the smallest payment that can exist".
- */
-export const PAYMENT_PRESENT_EPSILON = 0.005
+// o3d-psrx r17 (Codex HIGH) — `PAYMENT_PRESENT_EPSILON` USED TO LIVE HERE, AND IT WAS THE SECOND
+// ANSWER TO A QUESTION THAT MAY ONLY HAVE ONE.
+//
+// It read: "Below this, the ledger holds no payment. Xero rounds money to 2dp, so half a penny is
+// well inside the gap between nothing and the smallest payment that can exist." Every clause of that
+// is true OF GBP, and r15 recorded on this branch that it was "not wrong today" for exactly that
+// reason. IT IS WRONG NOW, AND THIS BRANCH MADE IT WRONG: r16's scale rule admits `0.001` in KWD and
+// `0.0001` in CLF — one WHOLE minor unit, the smallest payment those currencies have — and
+// `partitionPaymentReversals` then measured that against a constant sized for pennies and put it in
+// `zeroPaid`, the bucket the provenance gate can turn into a cleared `paidAt`.
+//
+// The constant is DELETED rather than corrected in place. A fixed number that is right for one
+// currency is a standing invitation to reach for it from a second call site, and that is how this
+// defect was built: r10 moved QuickBooks onto a per-currency threshold and left this one behind,
+// because it sat in a module the shared rule could not be imported into. "How small is nothing" is
+// now answered in ONE place for both connectors — `ledgerAmountEpsilon`, in lib/domain/math/decimal.ts,
+// beside the minor-unit table it derives from and upstream of both.
 
 export type PaymentReversalReading = {
   /**
@@ -1308,14 +1322,34 @@ export function partitionPaymentReversals(
     }
     if (invoice.Status !== 'AUTHORISED') continue
 
-    const amountPaid = parseLedgerAmount(invoice.AmountPaid, xeroInvoiceCurrency(invoice))
+    // ONE currency reading, spent on BOTH halves of the decision (o3d-psrx r17, Codex HIGH). r16 read
+    // it here for the parse alone and left the comparison below on a GBP constant, which is how a
+    // whole minor unit of KWD got parsed as a payment and then classified as nothing.
+    const currency = xeroInvoiceCurrency(invoice)
+    const amountPaid = parseLedgerAmount(invoice.AmountPaid, currency)
     if (amountPaid === null) {
       unverifiable.push(invoice)
       continue
     }
     // ABS, not `> 0`: a negative AmountPaid is not a number this code understands, and "the ledger
     // holds something we cannot explain" is not permission to declare the payment gone.
-    if (Math.abs(amountPaid) > PAYMENT_PRESENT_EPSILON) {
+    //
+    // DECIMAL, not float, and against the DOCUMENT'S OWN epsilon (o3d-psrx r17, Codex HIGH):
+    //
+    //   THE THRESHOLD. `ledgerAmountEpsilon` is half one minor unit of this invoice's currency —
+    //   0.005 in GBP, so nothing about the ordinary case moves, but 0.0005 in KWD and 0.00005 in CLF.
+    //   r16 guaranteed that every amount admitted above is a whole multiple of its currency's minor
+    //   unit, so a payment is either 0 or at least ONE unit, which is strictly more than this. The
+    //   two rules therefore agree exactly: `zeroPaid` means the ledger stated a zero, in every
+    //   supported precision, rather than only in the ones whose minor unit happens to exceed a penny.
+    //   An unstated currency takes the strictest threshold, which can only move an invoice OUT of
+    //   `zeroPaid` and into `partPaid`, and `partPaid` withholds.
+    //
+    //   THE ARITHMETIC. Compared through `compareDecimal` rather than `>` on doubles, for the reason
+    //   r13 gave one module over: the binary comparison is taken at a magnitude where a four-decimal
+    //   currency's epsilon is near the noise, and `Math.abs` on a double that came out of a Decimal is
+    //   the conversion this branch has already had to undo twice.
+    if (compareDecimal(toDecimal(amountPaid).abs(), ledgerAmountEpsilon(currency)) > 0) {
       partPaid.push(invoice)
       continue
     }

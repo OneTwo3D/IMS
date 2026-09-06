@@ -24,9 +24,9 @@ import {
   compareDecimal,
   currencyMinorUnits,
   FINEST_SUPPORTED_MINOR_UNITS,
+  ledgerAmountEpsilon,
   ledgerMinorUnits,
   toDecimal,
-  type Decimal,
 } from '@/lib/domain/math/decimal'
 import {
   closeWithheldMarker,
@@ -358,37 +358,6 @@ export function qboLedgerAmount(row: QboAmountRow, imsDocumentCurrency?: string 
  */
 function qboVoidedAmount(currency: string | null, currencySource: LedgerCurrencySource): QboLedgerAmount {
   return { paid: 0, total: 0, outstanding: 0, currency, currencySource }
-}
-
-/**
- * o3d-psrx r10 (Codex HIGH 3) — HOW SMALL AN AMOUNT COUNTS AS NOTHING, IN THIS DOCUMENT'S CURRENCY.
- *
- * r9 used `PAYMENT_PRESENT_EPSILON`, which is 0.005 and is documented for Xero's two-decimal
- * amounts: half a penny, comfortably inside the gap between "nothing" and the smallest payment that
- * can exist. This classifier receives QuickBooks documents, and the repository supports three- and
- * four-decimal currencies (`currencyMinorUnits` — BHD/JOD/KWD at 3, CLF/UYW at 4). Against those, a
- * fixed 0.005 is FIVE whole minor units in a Gulf dinar and fifty in CLF: a document QuickBooks
- * states 0.004 is still settled on reads as holding NOTHING, the registration gate then admits, and
- * `paidAt` is cleared with a chargeback credit note raised over a document the ledger is still
- * accounting for. That is the o3d-psrx defect itself, reached through the tolerance.
- *
- * So the threshold is HALF ONE MINOR UNIT of the document's own currency — strictly below one minor
- * unit in every currency, which is what makes "the smallest amount that can exist is not zero" true
- * everywhere rather than only in GBP. In a two-decimal currency it is 0.005 exactly, so nothing about
- * the ordinary case moves.
- *
- * A NULL CURRENCY TAKES THE STRICTEST THRESHOLD, not the most convenient one. QuickBooks omits
- * `CurrencyRef` when multicurrency is off, and the fail-safe direction is unambiguous: too LARGE a
- * threshold discards a real minor unit as zero and lets a reversal through, while too small a one
- * can only move a document from `HOLDS_NOTHING` into a verdict that WITHHOLDS. So an unstated
- * currency is given the finest precision this repository supports.
- */
-export function ledgerAmountEpsilon(currency: string | null): Decimal {
-  // r16: through the shared resolver, so this rule and the two magnitude rules cannot drift apart on
-  // what an unstated currency means.
-  const digits = ledgerMinorUnits(currency)
-  // Half of 10^-digits, written exactly rather than computed in binary floating point.
-  return toDecimal(`0.${'0'.repeat(digits)}5`)
 }
 
 /**
