@@ -1271,13 +1271,28 @@ says nothing about who may create it. So a root directly under `/tmp` is refused
 
   ```text
   ERROR: /var/lib/one-two-inventory is a symbolic link, and a root this run writes into may not be one: nothing here proves the path its target resolves through.
-  ERROR: NOTHING HAS BEEN CHANGED by this run. To keep /var/lib/one-two-inventory on another disk, replace the link with a real directory and bind-mount the disk onto it — no data has to move, because the bind exposes the same filesystem at the same path.
+  ERROR: To keep /var/lib/one-two-inventory on another disk, replace the link with a real directory and bind-mount the disk onto it — no data has to move, because the bind exposes the same filesystem at the same path.
   ERROR: Do it with the writers stopped, in this order:
   ERROR:   1. stop the application service, and pause any cron that writes under /var/lib/one-two-inventory
-  ERROR:   2. this run resolved that link to: /srv/disk2/ims   — confirm that is where the data is
+  ERROR:   2. this run resolved that link to: /srv/disk2/ims   (inode 262145) — confirm that is where the data is
   ERROR:   3. rm /var/lib/one-two-inventory && mkdir -p /var/lib/one-two-inventory && mount --bind /srv/disk2/ims /var/lib/one-two-inventory
-  ERROR:   4. verify with: findmnt /var/lib/one-two-inventory   — if the mount did NOT take, put the link back at once: rmdir /var/lib/one-two-inventory && ln -s /srv/disk2/ims /var/lib/one-two-inventory
+  ERROR:   4. verify with: findmnt /var/lib/one-two-inventory   and: stat -c %i /var/lib/one-two-inventory   — that inode must be 262145. If the mount did NOT take, or the inode differs, put the link back at once: umount /var/lib/one-two-inventory 2>/dev/null; rmdir /var/lib/one-two-inventory && ln -s /srv/disk2/ims /var/lib/one-two-inventory
   ERROR:   5. add: /srv/disk2/ims /var/lib/one-two-inventory none bind 0 0   to /etc/fstab so the bind survives a reboot, then start the service again
+  ```
+
+  **The bind command is printed only when the target's own name cannot be rebound.** Saying that
+  nothing proves the path a symlink resolves through and then handing the operator a `mount --bind`
+  naming that same path would be the identical defect one step further out: an account that can
+  write any directory on the way to the target replaces it between the moment the installer looked
+  and the moment the command is pasted, and the bind then exposes a tree of their choosing at the
+  state root. So the run walks the target's ancestry first — every directory from `/` down to its
+  parent owned by root and carrying no group or other write bit, the same question that decides
+  whether a directory may be a publication root — and where that does not hold it prints no command
+  and no `fstab` line, only what would make it safe:
+
+  ```text
+  ERROR: BUT /srv/shared/ims IS NOT SAFE TO BIND YET. A directory on the way to it can be replaced by somebody other than root, so a bind mount naming that path would resolve it again, later, and could expose a tree of their choosing at /var/lib/one-two-inventory — which is the same defect as the symlink, one step further out. This run will not print a command that does that.
+  ERROR: Move the data under a path only root can rebind — every directory from / down to it owned by root and carrying no group or other write bit, which /srv, /var/lib and /mnt normally are — and run the installer again; it will then print the bind-mount procedure.
   ```
 
   Every path in those commands is **shell-quoted** by the run that printed them (`printf %q`, so a

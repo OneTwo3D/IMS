@@ -4412,7 +4412,7 @@ test('[o3d-czpy] no root-side write into a service-writable directory is left un
 /** The gate, the walk it asks through, and the refusal it shares with the publisher. A rig missing
  *  any of them fails with "command not found" and every "the run must refuse" assertion passes for
  *  the wrong reason, so they travel together. */
-const ROOT_GATE = ['refuse_symlinked_root', 'pin_service_root_parent', 'service_root_entry_kind', 'require_real_service_root'] as const
+const ROOT_GATE = ['refuse_symlinked_root', 'pin_publish_root_parent', 'pin_service_root_parent', 'service_root_entry_kind', 'require_real_service_root'] as const
 
 /** The declaration the gate records what it approved into, lifted rather than retyped: under
  *  `set -u` a rig without it dies on the first `${SERVICE_ROOT_APPROVED[…]-}`, and every "the run
@@ -5275,7 +5275,7 @@ test('[o3d-secops] a target whose name carries shell syntax is quoted, and the p
   mkdirSync(attackedDir)
   const attackedRoot = join(varlib, 'ims-mutated')
   symlinkSync(attackedDir, attackedRoot)
-  const mutatedRun = runBash(rig(['pin_service_root_parent', 'service_root_entry_kind', 'require_real_service_root'],
+  const mutatedRun = runBash(rig(ROOT_GATE.filter((n) => n !== 'refuse_symlinked_root'),
     GATE_DATA, [`DATA_DIR=${q(attackedRoot)}`, raw].join('\n')))
   const mutatedStep = mutatedRun.stderr.split('\n').find((line) => line.includes('mount --bind'))
   assert.ok(mutatedStep, mutatedRun.stderr)
@@ -5513,4 +5513,100 @@ test('[o3d-secops] an approved root with no descriptor is refused at the entry, 
   assert.equal(ok.status, 0, `the ordinary path must still run: ${ok.stderr}`)
   assert.ok(ok.stdout.includes(REACHED))
   assert.equal(statSync(root).mode & 0o777, 0o770, 'and reach the operation it was refusing above')
+})
+
+test('[o3d-secops] a bind-mount command is printed only when the target\'s own name cannot be rebound', (t) => {
+  /**
+   * THE FINDING. The refusal says, correctly, that nothing proves the path the link's target
+   * resolves through — and then printed `mount --bind TARGET ROOT` for the operator to paste, which
+   * RESOLVES THAT PATH AGAIN, later, as root. An account that can write any directory on the way to
+   * the target replaces it between the two moments, and the bind then exposes a tree of their
+   * choosing at the state root, where the next installer run writes and chowns as root. Stopping
+   * the service does not remove that account: it is the same defect as the symlink, one step out.
+   */
+  function plant(prefix: string, diskMode: number) {
+    const base = createTempDirSync(prefix, t)
+    const varlib = join(base, 'var-lib')
+    const disk = join(base, 'srv-disk2')
+    const target = join(disk, 'ims')
+    mkdirSync(varlib)
+    mkdirSync(target, { recursive: true })
+    chmodSync(varlib, 0o755)
+    // THE ONE THING THAT DIFFERS BETWEEN THE TWO RUNS BELOW.
+    chmodSync(disk, diskMode)
+    const root = join(varlib, 'ims')
+    symlinkSync(target, root)
+    return { base, root, target }
+  }
+
+  const exposed = plant('ims-secops-untrusted-target-', 0o777)
+  const refused = runBash(rig([...ROOT_GATE], GATE_DATA, `DATA_DIR=${q(exposed.root)}`))
+
+  assert.equal(refused.status, 1, refused.stderr)
+  assert.ok(!refused.stderr.includes('mount --bind'),
+    `no bind-mount command may be printed for a target somebody else can replace: ${refused.stderr}`)
+  assert.ok(!refused.stderr.includes('/etc/fstab'),
+    'and no fstab line either — a persistent bind of an unproved path is the same defect, made permanent')
+  assert.match(refused.stderr, /IS NOT SAFE TO BIND YET/, refused.stderr)
+  assert.match(refused.stderr, /can be replaced by somebody other than root/, refused.stderr)
+  assert.match(refused.stderr, /Move the data under a path only root can rebind/,
+    'and the operator must be told what would make it safe')
+
+  // NOT VACUOUS, AND THE ROUTE IS ONE MODE BIT: the identical layout with the target's parent at
+  // 0755 gets the whole procedure. So what is refused is the ancestry, not the location.
+  const sound = plant('ims-secops-trusted-target-', 0o755)
+  const ok = runBash(rig([...ROOT_GATE], GATE_DATA, `DATA_DIR=${q(sound.root)}`))
+  assert.equal(ok.status, 1, 'a symlinked root is still refused')
+  assert.ok(ok.stderr.includes(`mount --bind ${sound.target} ${sound.root}`), ok.stderr)
+  assert.match(ok.stderr, /\/etc\/fstab/, ok.stderr)
+  assert.ok(!ok.stderr.includes('IS NOT SAFE TO BIND YET'), ok.stderr)
+  // AND THE IDENTITY TO CHECK AFTER MOUNTING, so a bind that landed somewhere else is visible.
+  assert.ok(ok.stderr.includes(`(inode ${statSync(sound.target).ino})`),
+    `the refusal must print the inode the operator can verify against: ${ok.stderr}`)
+  assert.match(ok.stderr, /stat -c %i /, 'and the command that reads it back')
+  assert.match(ok.stderr, /umount .*; rmdir .* && ln -s /, 'and a rollback that undoes a mount that did take')
+})
+
+test('[o3d-secops] the shared refusal does not claim the run has changed nothing, because half its callers cannot say that', () => {
+  /**
+   * refuse_symlinked_root() is printed by TWO callers: the pre-flight gate, where nothing has
+   * happened yet, and pin_dir_beneath_root(), which is reached at the FIRST PUBLICATION — by which
+   * time packages are installed, section 8's directories exist, uploads have been migrated and the
+   * checkout is in place. A shared helper asserting "nothing has been changed" told half its
+   * operators something false, and told them not to look.
+   *
+   * The claim belongs to whoever can make it: the gate's own `die` carries it, and the shared text
+   * states only what is true wherever it is printed.
+   */
+  const helper = shellFunction(INSTALL_SH, 'refuse_symlinked_root')
+  // THE CODE, NOT THE PROSE. The comment above the guard explains the finding and quotes the
+  // sentence it removed; a check over the whole body would match its own explanation and fail
+  // whatever the code did — which is a test that measures the comment.
+  const printed = helper.split('\n').filter((line) => !line.trimStart().startsWith('#')).join('\n')
+  assert.ok(printed.includes('printf'), 'precondition: the shared refusal must still print something')
+  assert.ok(!/NOTHING HAS BEEN CHANGED/i.test(printed),
+    `the shared refusal must not claim the run has changed nothing:\n${printed}`)
+  assert.ok(!/nothing has been (created|migrated|started)/i.test(printed),
+    `nor any of its variants:\n${printed}`)
+
+  // NOT VACUOUS: the gate, which CAN make that claim, still does — so the guarantee has not simply
+  // been deleted, it has been moved to the caller that owns it.
+  const gate = shellFunction(INSTALL_SH, 'require_real_service_root')
+  assert.match(gate, /NOTHING has been created, nothing has been migrated and nothing has been started/,
+    `the pre-flight refusal must still carry the no-change guarantee:\n${gate}`)
+
+  // AND THE OTHER CALLER SAYS NOTHING IT CANNOT SUPPORT. pin_dir_beneath_root() returns a status to
+  // callers that each decide for themselves; it must not make a claim about the run on their behalf.
+  const publisher = shellFunction(INSTALL_SH, 'pin_dir_beneath_root')
+  assert.match(publisher, /refuse_symlinked_root "\$root"/, 'the publisher prints through the shared refusal')
+  const publisherCode = publisher.split('\n').filter((line) => !line.trimStart().startsWith('#')).join('\n')
+  assert.ok(!/NOTHING HAS BEEN CHANGED/i.test(publisherCode),
+    `and must not add a no-change claim of its own:\n${publisherCode}`)
+
+  // ALL THREE ENTRYPOINTS, because the text is carried byte for byte and a claim that is false in
+  // one of them is false in all of them.
+  for (const script of ['scripts/deploy.sh', 'scripts/update.sh'] as const) {
+    const source = readFileSync(join(REPO, script), 'utf8')
+    assert.equal(shellFunction(source, 'refuse_symlinked_root'), helper, `${script} has drifted`)
+  }
 })

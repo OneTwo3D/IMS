@@ -1594,13 +1594,20 @@ publish_trust_root() {
 # from the link instead of asking for it to be retyped, and prints the command that puts the link
 # back if the bind mount does not take.
 refuse_symlinked_root() {
-  local root="$1" target="" qroot qtarget froot ftarget
+  local root="$1" target="" qroot qtarget froot ftarget ident
   # THE TARGET IS RESOLVED HERE AND PRINTED, not left to the operator to retype. Its status is
   # taken so that this stays out of the unchecked-substitution census: a `readlink` that fails is a
   # dangling or unreadable link, which is the branch below.
   target="$(readlink -f "$root" 2>/dev/null)" || target=""
+  # NO "NOTHING HAS BEEN CHANGED" IN HERE (o3d-secops r7 sixth pass, Codex MEDIUM). This text is
+  # printed by TWO callers: the pre-flight gate, where nothing has happened yet, and
+  # pin_dir_beneath_root(), which is reached at the first publication — by which time packages are
+  # installed, directories are created, uploads are migrated and the checkout is in place. A shared
+  # helper that asserted "nothing has been changed" was telling half its callers' operators
+  # something false, and telling them not to look. The claim belongs to whoever can make it, so the
+  # gate's own `die` carries it and this function states only what is true wherever it is printed.
   printf 'ERROR: %s is a symbolic link, and a root this run writes into may not be one: nothing here proves the path its target resolves through.\n' "$root" >&2
-  printf 'ERROR: NOTHING HAS BEEN CHANGED by this run. To keep %s on another disk, replace the link with a real directory and bind-mount the disk onto it — no data has to move, because the bind exposes the same filesystem at the same path.\n' "$root" >&2
+  printf 'ERROR: To keep %s on another disk, replace the link with a real directory and bind-mount the disk onto it — no data has to move, because the bind exposes the same filesystem at the same path.\n' "$root" >&2
   # EVERY PATH THAT GOES INTO A COMMAND IS SHELL-QUOTED FIRST (o3d-secops r7 third pass, Codex
   # HIGH). ${target} is whatever `readlink -f` resolved to, and a component of that chain can be
   # named by an account this script does not trust — so it may contain a space, a `;`, a `$(…)`, a
@@ -1619,15 +1626,36 @@ refuse_symlinked_root() {
     printf 'ERROR: The paths involved could not be quoted for a shell, so this run will not print commands to paste. Replace the link with a bind mount by hand.\n' >&2
     return 0
   fi
+  # AND THE TARGET'S OWN ANCESTRY IS PROVED BEFORE ANY COMMAND NAMING IT IS PRINTED (o3d-secops r7
+  # sixth pass, Codex HIGH).
+  #
+  # THE FINDING. The refusal above says, correctly, that nothing proves the path the link's target
+  # resolves through — and then printed `mount --bind TARGET ROOT` for the operator to paste, which
+  # RESOLVES THAT PATH AGAIN, later, as root. An account that can write any directory on the way to
+  # the target can replace it between the moment this ran and the moment the operator pastes, and
+  # the bind then exposes a tree of their choosing at ${DATA_DIR} or ${APP_DIR} — where the next
+  # installer run writes and chowns as root. Stopping the service does not remove that account.
+  #
+  # SO THE COMMAND IS ONLY PRINTED WHEN THE TARGET'S NAME CANNOT BE REBOUND: every directory from
+  # `/` down to its parent owned by root (or by whoever is running this) and carrying no group or
+  # other write bit — the same question, asked by the same walk, that decides whether a directory
+  # may be a publication root at all. In a subshell, because the walk moves the shell it runs in.
+  if ! ( pin_publish_root_parent "$target" ) >/dev/null 2>&1; then
+    printf 'ERROR: BUT %s IS NOT SAFE TO BIND YET. A directory on the way to it can be replaced by somebody other than root, so a bind mount naming that path would resolve it again, later, and could expose a tree of their choosing at %s — which is the same defect as the symlink, one step further out. This run will not print a command that does that.\n' "$qtarget" "$qroot" >&2
+    printf 'ERROR: Move the data under a path only root can rebind — every directory from / down to it owned by root and carrying no group or other write bit, which /srv, /var/lib and /mnt normally are — and run the installer again; it will then print the bind-mount procedure.\n' >&2
+    return 0
+  fi
+  # THE IDENTITY THIS RUN SAW, so the operator can check that what got mounted is what was meant. A
+  # bind mount exposes the SAME inode at the new path, so this number does not change under it.
+  ident="$(stat -c '%i' "$target" 2>/dev/null || true)"
   printf 'ERROR: Do it with the writers stopped, in this order:\n' >&2
   printf 'ERROR:   1. stop the application service, and pause any cron that writes under %s\n' "$qroot" >&2
-  printf 'ERROR:   2. this run resolved that link to: %s   — confirm that is where the data is\n' "$qtarget" >&2
+  printf 'ERROR:   2. this run resolved that link to: %s   (inode %s) — confirm that is where the data is\n' "$qtarget" "${ident:-unknown}" >&2
   printf 'ERROR:   3. rm %s && mkdir -p %s && mount --bind %s %s\n' "$qroot" "$qroot" "$qtarget" "$qroot" >&2
-  printf 'ERROR:   4. verify with: findmnt %s   — if the mount did NOT take, put the link back at once: rmdir %s && ln -s %s %s\n' "$qroot" "$qroot" "$qtarget" "$qroot" >&2
+  printf 'ERROR:   4. verify with: findmnt %s   and: stat -c %%i %s   — that inode must be %s. If the mount did NOT take, or the inode differs, put the link back at once: umount %s 2>/dev/null; rmdir %s && ln -s %s %s\n' "$qroot" "$qroot" "${ident:-unknown}" "$qroot" "$qroot" "$qtarget" "$qroot" >&2
   # /etc/fstab HAS ITS OWN ESCAPING, AND IT IS NOT THE SHELL'S. Fields are split on whitespace and
   # a space, tab or backslash is written as an octal escape; `printf %q`'s answer would be read by
-  # mount as a literal backslash. A newline cannot be represented in an fstab field at all, so that
-  # one gets a sentence instead of a line to paste.
+  # mount as a literal backslash.
   froot="${root//\\/\\134}"; froot="${froot// /\\040}"; froot="${froot//$'\t'/\\011}"
   ftarget="${target//\\/\\134}"; ftarget="${ftarget// /\\040}"; ftarget="${ftarget//$'\t'/\\011}"
   # A NEWLINE ENDS AN fstab RECORD AND A `#` BEGINS A COMMENT, and neither has an escape in that
