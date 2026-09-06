@@ -4398,10 +4398,14 @@ test('[o3d-czpy] no root-side write into a service-writable directory is left un
  * ordering claim — while every `mkdir` is real and its effect on the victim is real.
  */
 
-/** The gate, and the refusal it shares with the publisher. A rig missing any of the three fails
- *  with "command not found" and every "the run must refuse" assertion passes for the wrong reason,
- *  so they travel together. */
-const ROOT_GATE = ['refuse_symlinked_root', 'service_root_entry_kind', 'require_real_service_root'] as const
+/** The gate, the walk it asks through, and the refusal it shares with the publisher. A rig missing
+ *  any of them fails with "command not found" and every "the run must refuse" assertion passes for
+ *  the wrong reason, so they travel together. */
+const ROOT_GATE = ['refuse_symlinked_root', 'pin_service_root_parent', 'service_root_entry_kind', 'require_real_service_root'] as const
+
+/** The gate's ACTING twin (o3d-secops r7 second pass): it creates or accepts the root, proves it,
+ *  and leaves the process inside it, so section 8's ownership change is aimed at an inode. */
+const ROOT_ENTER = [...ROOT_GATE, 'enter_service_root'] as const
 
 /**
  * A SHIPPED TOP-LEVEL STATEMENT, LIFTED WHOLE — line continuations included — rather than retyped.
@@ -4427,16 +4431,54 @@ function shippedStatement(firstLine: string): string {
   return out.join('\n')
 }
 
+/**
+ * A SHIPPED `if ! ( … ); then … fi` BLOCK, lifted from its unique opening line to the `fi` that
+ * closes it. Section 8 guards its two root operations that way rather than with `( … ) || die`,
+ * because a compound command on the left of `||` runs with `set -e` ignored — so the block, and
+ * not just its first line, is what these tests must run.
+ */
+function shippedIfBlock(firstLine: string): string {
+  const lines = INSTALL_SH.split('\n')
+  const at: number[] = []
+  lines.forEach((line, index) => { if (line === firstLine) at.push(index) })
+  assert.equal(at.length, 1,
+    `scripts/install.sh must contain exactly one line ${JSON.stringify(firstLine)} — found ${at.length}.`)
+  const out: string[] = []
+  for (let index = at[0]; index < lines.length; index += 1) {
+    out.push(lines[index])
+    if (lines[index] === 'fi') return out.join('\n')
+  }
+  throw new assert.AssertionError({ message: `the block opened at ${JSON.stringify(firstLine)} is not closed by a top-level fi` })
+}
+
 /** The three calls, as the shipped script spells them. */
 const GATE_APP = shippedStatement('require_real_service_root "${APP_DIR}"  "the application directory"')
 const GATE_DATA = shippedStatement('require_real_service_root "${DATA_DIR}" "the state directory"')
 const GATE_LOG = shippedStatement('require_real_service_root "${LOG_DIR}"  "the log directory"')
 
 /** Section 8's own writes, in the order it makes them. */
-const SECTION8_ROOT_MKDIR = shippedStatement('mkdir -p "${DATA_DIR}" "${LOG_DIR}"')
+const SECTION8_ROOT_MKDIR = [
+  shippedIfBlock('if ! ( enter_service_root "${DATA_DIR}" 022 "the state directory" ); then'),
+  shippedIfBlock('if ! ( enter_service_root "${LOG_DIR}" 022 "the log directory" ); then'),
+].join('\n')
 const SECTION8_DATA_SUBDIRS = shippedStatement('mkdir_service_subdir "${DATA_DIR}" 022 \\')
 const SECTION8_APP_SUBDIRS = shippedStatement('mkdir_service_subdir "${APP_DIR}" 022 "${APP_DIR}/backups"')
-const SECTION8_LOG_CHOWN = shippedStatement('chown -R "${APP_USER}:${APP_USER}" "${LOG_DIR}"')
+const SECTION8_LOG_CHOWN = shippedIfBlock('if ! (')
+
+/**
+ * SECTION 8 AS IT STOOD AT 8d8019ef — the two statements this round replaced, retyped HERE and
+ * nowhere else.
+ *
+ * The mutations below need the PRE-ROUND installer, not the shipped one: the shipped
+ * enter_service_root() refuses a symlinked root of its own accord, so a mutation that only removed
+ * the pre-flight gate would be caught by the second line of defence and would prove nothing about
+ * the first. Running the old text is running the finding.
+ *
+ * Both are asserted ABSENT from the shipped script, so this block cannot quietly become a copy of
+ * what is already there.
+ */
+const PRE_ROUND_ROOT_MKDIR = 'mkdir -p "${DATA_DIR}" "${LOG_DIR}"'
+const PRE_ROUND_LOG_CHOWN = 'chown -R "${APP_USER}:${APP_USER}" "${LOG_DIR}"'
 
 /** The three storage paths section 8's ${DATA_DIR} block names, lifted rather than re-derived. */
 const STORAGE_DIRS = ['BACKUP_DIR', 'UPLOAD_STORAGE_DIR', 'PUBLIC_UPLOAD_STORAGE_DIR']
@@ -4460,7 +4502,7 @@ test('[o3d-secops] a symlinked DATA_DIR is refused before section 8 creates anyt
   const vars = [`APP_DIR=${q(app)}`, `DATA_DIR=${q(plant.stateRoot)}`, `LOG_DIR=${q(log)}`, STORAGE_DIRS].join('\n')
   const writes = [SECTION8_ROOT_MKDIR, SECTION8_DATA_SUBDIRS, `echo ${REACHED}`].join('\n')
 
-  const run = runBash(rig([...ROOT_GATE, ...SUBDIR_WALK], [GATE_DATA, writes].join('\n'), vars))
+  const run = runBash(rig([...ROOT_ENTER, ...SUBDIR_WALK], [GATE_DATA, writes].join('\n'), vars))
 
   // NOT VACUOUS: the plant is standing at the moment the assertions look at it, and the root entry
   // is the operator's own symlink resolving to a directory the service account chose.
@@ -4483,7 +4525,8 @@ test('[o3d-secops] a symlinked DATA_DIR is refused before section 8 creates anyt
   const attackedLog = join(attacked.base, 'var-log')
   mkdirSync(attackedApp)
   mkdirSync(attackedLog)
-  const mutated = runBash(rig([...ROOT_GATE, ...SUBDIR_WALK], writes,
+  const mutated = runBash(rig([...ROOT_ENTER, ...SUBDIR_WALK],
+    [PRE_ROUND_ROOT_MKDIR, SECTION8_DATA_SUBDIRS, `echo ${REACHED}`].join('\n'),
     [`APP_DIR=${q(attackedApp)}`, `DATA_DIR=${q(attacked.stateRoot)}`, `LOG_DIR=${q(attackedLog)}`, STORAGE_DIRS].join('\n')))
 
   assert.equal(mutated.status, 0, `without the gate the writes must go through, or the mutation proves nothing: ${mutated.stderr}`)
@@ -4536,7 +4579,7 @@ test('[o3d-secops] a symlinked LOG_DIR is refused before `mkdir -p` creates its 
     [`APP_DIR=${q(p.app)}`, `DATA_DIR=${q(p.data)}`, `LOG_DIR=${q(p.logRoot)}`, chownStub].join('\n')
   const writes = [SECTION8_ROOT_MKDIR, SECTION8_LOG_CHOWN, `echo ${REACHED}`].join('\n')
 
-  const run = runBash(rig([...ROOT_GATE], [GATE_LOG, writes].join('\n'), vars(plant)))
+  const run = runBash(rig([...ROOT_ENTER], [GATE_LOG, writes].join('\n'), vars(plant)))
 
   assert.equal(lstatSync(plant.logRoot).isSymbolicLink(), true, 'the log root must be a symlink, or this test states nothing')
   assert.equal(statSync(plant.logRoot).ino, statSync(plant.victim).ino, 'and it must resolve to the victim')
@@ -4552,7 +4595,8 @@ test('[o3d-secops] a symlinked LOG_DIR is refused before `mkdir -p` creates its 
   const attacked = plantLogRoot('ims-secops-log-root-mutated-')
   const attackedChownLog = join(attacked.base, 'chown.log')
   writeFileSync(attackedChownLog, '')
-  const mutated = runBash(rig([...ROOT_GATE], writes,
+  const mutated = runBash(rig([...ROOT_ENTER],
+    [PRE_ROUND_ROOT_MKDIR, PRE_ROUND_LOG_CHOWN, `echo ${REACHED}`].join('\n'),
     [`APP_DIR=${q(attacked.app)}`, `DATA_DIR=${q(attacked.data)}`, `LOG_DIR=${q(attacked.logRoot)}`,
       `chown() { printf '%s\\n' "$*" >> ${q(attackedChownLog)}; }`].join('\n')))
 
@@ -4575,7 +4619,7 @@ test('[o3d-secops] a symlinked APP_DIR is refused before section 8 walks into it
   const vars = [`APP_DIR=${q(plant.stateRoot)}`, `DATA_DIR=${q(data)}`, `LOG_DIR=${q(log)}`, STORAGE_DIRS].join('\n')
   const writes = [SECTION8_APP_SUBDIRS, `echo ${REACHED}`].join('\n')
 
-  const run = runBash(rig([...ROOT_GATE, ...SUBDIR_WALK], [GATE_APP, writes].join('\n'), vars))
+  const run = runBash(rig([...ROOT_ENTER, ...SUBDIR_WALK], [GATE_APP, writes].join('\n'), vars))
 
   assert.equal(lstatSync(plant.stateRoot).isSymbolicLink(), true, 'the app root must be a symlink, or this test states nothing')
   assert.deepEqual(readdirSync(plant.victim).sort(), ['DEPLOY-FENCED'],
@@ -4590,7 +4634,7 @@ test('[o3d-secops] a symlinked APP_DIR is refused before section 8 walks into it
   const attackedLog = join(attacked.base, 'var-log-ims')
   mkdirSync(attackedData)
   mkdirSync(attackedLog)
-  const mutated = runBash(rig([...ROOT_GATE, ...SUBDIR_WALK], writes,
+  const mutated = runBash(rig([...ROOT_ENTER, ...SUBDIR_WALK], writes,
     [`APP_DIR=${q(attacked.stateRoot)}`, `DATA_DIR=${q(attackedData)}`, `LOG_DIR=${q(attackedLog)}`, STORAGE_DIRS].join('\n')))
 
   assert.equal(mutated.status, 0, `without the gate the writes must go through: ${mutated.stderr}`)
@@ -4618,11 +4662,11 @@ test('[o3d-secops] an ordinary install still runs: real roots pass, and a first 
   const writes = [SECTION8_ROOT_MKDIR, SECTION8_DATA_SUBDIRS, SECTION8_APP_SUBDIRS, `echo ${REACHED}`].join('\n')
 
   // THE GATE CREATES NOTHING, asserted between the two halves rather than described.
-  const gateOnly = runBash(rig([...ROOT_GATE, ...SUBDIR_WALK], gate, vars))
+  const gateOnly = runBash(rig([...ROOT_ENTER, ...SUBDIR_WALK], gate, vars))
   assert.equal(gateOnly.status, 0, `three real-or-absent roots must pass: ${gateOnly.stderr}`)
   assert.equal(existsSync(app), false, 'and an absent ${APP_DIR} must still be absent afterwards')
 
-  const run = runBash(rig([...ROOT_GATE, ...SUBDIR_WALK], [gate, writes].join('\n'), vars))
+  const run = runBash(rig([...ROOT_ENTER, ...SUBDIR_WALK], [gate, writes].join('\n'), vars))
   assert.equal(run.status, 0, `and the install must then run: ${run.stderr}`)
   assert.ok(run.stdout.includes(REACHED))
   assert.deepEqual(readdirSync(data).sort(), ['backups', 'public-uploads', 'uploads', 'xero'])
@@ -4647,10 +4691,10 @@ test('[o3d-secops] an ordinary install still runs: real roots pass, and a first 
   const freshVars = [`APP_DIR=${q(freshApp)}`, `DATA_DIR=${q(freshData)}`, `LOG_DIR=${q(freshLog)}`, STORAGE_DIRS].join('\n')
 
   // The shipped gate accepts it — the half that would make the mutation vacuous if it did not.
-  const shipped = runBash(rig([...ROOT_GATE], gate, freshVars))
+  const shipped = runBash(rig([...ROOT_ENTER], gate, freshVars))
   assert.equal(shipped.status, 0, `the shipped gate must accept a first install: ${shipped.stderr}`)
 
-  const refused = runBash(rig(['refuse_symlinked_root', 'service_root_entry_kind'], gate, [freshVars, strict].join('\n')))
+  const refused = runBash(rig(['refuse_symlinked_root', 'pin_service_root_parent', 'service_root_entry_kind'], gate, [freshVars, strict].join('\n')))
   assert.equal(refused.status, 1, 'a gate that does not accept an absent root refuses a first install')
   assert.ok(refused.stderr.includes(`${freshApp} — the application directory — is a`), refused.stderr)
 })
@@ -4683,8 +4727,8 @@ test('[o3d-secops] the installer and the publisher refuse a symlinked root with 
   // NOT VACUOUS: both really refused, and both really printed the whole refusal.
   assert.equal(viaGate.status, 1, viaGate.stderr)
   assert.match(viaPublisher.stdout, /^rc=1$/m, viaPublisher.stderr)
-  assert.equal(gateLines.length, 4, `the gate must print the whole refusal: ${viaGate.stderr}`)
-  assert.equal(publisherLines.length, 4, `and so must the publisher: ${viaPublisher.stderr}`)
+  assert.ok(gateLines.length >= 4, `the gate must print the whole refusal: ${viaGate.stderr}`)
+  assert.equal(publisherLines.length, gateLines.length, `and so must the publisher: ${viaPublisher.stderr}`)
   // AND THE LINE THAT WAS DROPPED IS THE GATE'S OWN, so the slice above removed a sentence rather
   // than a fourth line of the shared refusal.
   const gateDie = viaGate.stderr.split('\n').filter((line) => line.startsWith('ERROR: ')).at(-1) ?? ''
@@ -4694,11 +4738,25 @@ test('[o3d-secops] the installer and the publisher refuse a symlinked root with 
     'the pre-flight gate and the publisher must state one rule in one wording — an operator who meets '
     + 'two spellings of the same refusal at two depths has met two rules')
 
-  // AND THE REMEDY IS RUNNABLE, AND SURVIVES A REBOOT.
+  // AND THE REMEDY IS A PROCEDURE AN OPERATOR CAN FOLLOW ON A LIVE HOST (o3d-secops r7 second pass,
+  // Codex HIGH). The refusal is printed while the service and its cron are still running, so it has
+  // to say to stop them, has to derive the target rather than ask for it to be retyped, and has to
+  // say how to get back if the bind mount does not take. Asserted by content, not by line number.
+  const block = gateLines.join('\n')
   assert.ok(gateLines[0].includes('is a symbolic link'), gateLines[0])
-  assert.ok(gateLines[1].includes('no data has to move'), gateLines[1])
-  assert.equal(gateLines[2], `ERROR:   rm ${plant.stateRoot} && mkdir -p ${plant.stateRoot} && mount --bind TARGET ${plant.stateRoot}`)
-  assert.ok(gateLines[3].includes('/etc/fstab'), gateLines[3])
+  assert.ok(block.includes('no data has to move'), 'the question an operator asks first')
+  assert.match(block, /stop the application service/, 'the writers must be stopped before anything is removed')
+  assert.match(block, /TARGET="\$\(readlink -f /, 'and the target derived from the link, not retyped')
+  assert.ok(block.includes(`rm ${plant.stateRoot} && mkdir -p ${plant.stateRoot} && mount --bind "$TARGET" ${plant.stateRoot}`),
+    `the bind-mount command must be runnable as printed: ${block}`)
+  assert.match(block, /findmnt /, 'and verifiable')
+  assert.ok(block.includes(`ln -s "$TARGET" ${plant.stateRoot}`),
+    'and the rollback that puts the link back if the mount did not take must be on screen')
+  assert.match(block, /\/etc\/fstab/, 'including the half that survives a reboot')
+  // NOT VACUOUS ABOUT THE ORDER: the rollback must come AFTER the command it undoes, and the stop
+  // before it, or an operator reading top to bottom meets each one too late to matter.
+  assert.ok(block.indexOf('mount --bind') < block.indexOf('ln -s "$TARGET"'), block)
+  assert.ok(block.indexOf('stop the application service') < block.indexOf('mount --bind'), block)
 
   // AND IT IS ONE RULE BECAUSE IT IS ONE FUNCTION, not two texts that happen to agree today.
   assert.ok(shellFunction(INSTALL_SH, 'require_real_service_root').includes('refuse_symlinked_root "${root}"'),
@@ -4713,7 +4771,7 @@ test('[o3d-secops] the installer and the publisher refuse a symlinked root with 
     .replace('      refuse_symlinked_root "${root}"\n',
       '      printf \'ERROR: %s is a symbolic link, and a publication root may not be one: nothing here proves the path its target resolves through.\\n\' "${root}" >&2\n')
   assert.ok(!forked.includes('refuse_symlinked_root "${root}"'), 'the mutation must remove the shared call')
-  const mutated = runBash(rig(['refuse_symlinked_root', 'service_root_entry_kind'], GATE_DATA,
+  const mutated = runBash(rig(['refuse_symlinked_root', 'pin_service_root_parent', 'service_root_entry_kind'], GATE_DATA,
     [`DATA_DIR=${q(plant.stateRoot)}`, forked].join('\n')))
   assert.equal(mutated.status, 1, mutated.stderr)
   assert.notDeepEqual(refusalLines(mutated.stderr, true), publisherLines,
@@ -4763,4 +4821,125 @@ test('[o3d-secops] the gate is the first line of the run that names any of the t
   assert.equal(withoutGate.length, lines.length - 3, 'the mutation must remove exactly the three gate calls')
   assert.equal(mentions(withoutGate)[0].line, 'load_existing_env "${APP_DIR}/.env"',
     'without the gate the run reaches a root before anything has proved it — which is what this test exists to fail on')
+})
+
+/**
+ * THE ROOT THAT IS RENAMED AFTER THE GATE HAS PASSED ON IT (o3d-secops r7 second pass, Codex HIGH)
+ *
+ * THE FINDING. require_real_service_root() is a SNAPSHOT: it proves what is at the name and then
+ * releases the cwd it walked to. For ${APP_DIR} and ${DATA_DIR} that is the whole answer, because
+ * /opt and /var/lib are root-owned and 0755 — nobody else can put anything at those names
+ * afterwards. For ${LOG_DIR} it is not: on Ubuntu /var/log is `drwxrwxr-x root:syslog` and NOT
+ * sticky, so the `syslog` account may RENAME any entry in it, root-owned ones included. NO SYMLINK
+ * IS INVOLVED, so refusing symlinks does not touch it. Between the gate and section 8 that account
+ * could move the real log root aside and rename another /var/log subtree into its name, and a
+ * `chown -R "${LOG_DIR}"` would then transfer that subtree to ${APP_USER}, recursively.
+ *
+ * THE ANSWER IS A PIN THE OPERATION ITSELF USES. enter_service_root() walks, creates or accepts the
+ * root, steps INTO it, proves the inode and the `..`, and leaves the process there; section 8 then
+ * acts on `.`. A rename of the NAME after that cannot move a descriptor.
+ *
+ * WHAT THIS TEST SUBSTITUTES, AND WHY. The shipped operation is `chown -h`, which a harness with one
+ * uid cannot perform. `chmod` is the same shape — a root-side metadata change over the tree, aimed
+ * either at `.` or at a pathname — and it IS performable here, so the effect is real and measured on
+ * both trees rather than recorded by a stub. The rename is performed by the test, deterministically,
+ * at exactly the point the finding says it can happen.
+ */
+test('[o3d-secops] a root renamed AFTER the gate does not redirect the ownership change, because the change is aimed at `.`', (t) => {
+  function plantRenameRace(prefix: string) {
+    const base = createTempDirSync(prefix, t)
+    // /var/log's own shape on Ubuntu: writable by an account that is not root, so entries in it can
+    // be renamed by somebody other than their owner.
+    const varlog = join(base, 'var-log')
+    mkdirSync(varlog)
+    chmodSync(varlog, 0o777)
+    const logRoot = join(varlog, 'ims')
+    mkdirSync(logRoot)
+    writeFileSync(join(logRoot, 'REAL'), 'the real log root\n')
+    chmodSync(join(logRoot, 'REAL'), 0o644)
+    // The subtree the attacker renames into the log root's name. Another real directory, in the
+    // same writable parent — nothing about it is a symlink.
+    const decoy = join(varlog, 'somebody-elses-logs')
+    mkdirSync(decoy)
+    writeFileSync(join(decoy, 'VICTIM'), 'not this run\'s to touch\n')
+    chmodSync(join(decoy, 'VICTIM'), 0o644)
+    chmodSync(decoy, 0o755)
+    return { base, varlog, logRoot, decoy, moved: `${logRoot}.moved` }
+  }
+
+  /** The rename, and then the shipped shape of the operation: `enter_service_root` has already left
+   *  this shell inside the root, so the walk over `.` cannot be redirected by it. */
+  const race = (p: ReturnType<typeof plantRenameRace>, operation: string) => [
+    `enter_service_root ${q(p.logRoot)} 022 "the log directory"`,
+    // THE ATTACK, executed between the entry and the operation — which is precisely the window the
+    // finding names, made deterministic.
+    `mv ${q(p.logRoot)} ${q(p.moved)}`,
+    `mv ${q(p.decoy)} ${q(p.logRoot)}`,
+    operation,
+    `echo ${REACHED}`,
+  ].join('\n')
+
+  const plant = plantRenameRace('ims-secops-rename-')
+  const run = runBash(rig([...ROOT_ENTER], race(plant, 'find . -exec chmod 0770 {} +')))
+
+  // NOT VACUOUS: the rename really happened, and the name really points at the decoy now.
+  assert.equal(run.status, 0, `the shipped shape must complete: ${run.stderr}`)
+  assert.ok(run.stdout.includes(REACHED))
+  assert.deepEqual(readdirSync(plant.logRoot).sort(), ['VICTIM'], 'the log root NAME must now hold the decoy')
+  assert.deepEqual(readdirSync(plant.moved).sort(), ['REAL'], 'and the directory this run entered must be the one moved aside')
+
+  // THE SECURITY CLAIM: the change landed on the tree this run pinned, and on nothing else.
+  assert.equal(statSync(plant.moved).mode & 0o777, 0o770, 'the pinned directory must have been changed')
+  assert.equal(statSync(join(plant.moved, 'REAL')).mode & 0o777, 0o770, 'and everything under it')
+  assert.equal(statSync(plant.logRoot).mode & 0o777, 0o755, 'and the subtree renamed into its place must be untouched')
+  assert.equal(statSync(join(plant.logRoot, 'VICTIM')).mode & 0o777, 0o644, 'contents included')
+
+  // MEASURED BY MUTATION, ROUTE STATED: the identical race with the operation aimed at the PATHNAME
+  // — which is what `chown -R … "${LOG_DIR}"` was before this round. It follows the rename into the
+  // subtree that was moved in, and leaves the real one alone. That is the finding, executed.
+  const attacked = plantRenameRace('ims-secops-rename-mutated-')
+  const mutated = runBash(rig([...ROOT_ENTER], race(attacked, `chmod -R 0770 ${q(attacked.logRoot)}`)))
+
+  assert.equal(mutated.status, 0, `the pre-round shape must complete, or the mutation proves nothing: ${mutated.stderr}`)
+  assert.equal(statSync(attacked.logRoot).mode & 0o777, 0o770,
+    'a pathname operation must follow the rename into the renamed-in subtree')
+  assert.equal(statSync(join(attacked.logRoot, 'VICTIM')).mode & 0o777, 0o770,
+    'and recurse into it — a root-side `chown -R` here transfers a tree this run never proved')
+  assert.equal(statSync(attacked.moved).mode & 0o777, 0o755,
+    'while the directory the gate actually approved is left alone')
+})
+
+test('[o3d-secops] enter_service_root is the second line of defence: it refuses a symlinked root itself, with the same words', (t) => {
+  const plant = plantSymlinkedRoot(t, 'ims-secops-enter-root-')
+
+  // NO GATE IN THIS RIG AT ALL. The claim is that section 8 would refuse even if the pre-flight
+  // check were not there — which is what makes the two independent rather than one check written
+  // twice, and what closes the window a snapshot cannot.
+  const run = runBash(rig([...ROOT_ENTER], [
+    `enter_service_root ${q(plant.stateRoot)} 022 "the state directory"`,
+    `echo ${REACHED}`,
+  ].join('\n')))
+
+  assert.equal(run.status, 1, `enter_service_root must refuse a symlinked root: ${run.stderr}`)
+  assert.ok(!run.stdout.includes(REACHED))
+  assert.deepEqual(readdirSync(plant.victim).sort(), ['DEPLOY-FENCED'], 'and create nothing through the link')
+  assert.ok(run.stderr.includes(`${plant.stateRoot} is a symbolic link`), run.stderr)
+  assert.match(run.stderr, /mount --bind/, 'through the same shared refusal the gate and the publisher print')
+
+  // AND IT STILL DOES THE ORDINARY THING. A root that is absent is created; one that is a real
+  // directory is accepted; and the process is left INSIDE it either way — which is the property the
+  // rename test above rests on, asserted here directly rather than inferred.
+  const base = createTempDirSync('ims-secops-enter-root-ok-', t)
+  const fresh = join(base, 'ims')
+  const existing = join(base, 'ims-existing')
+  mkdirSync(existing)
+  for (const [what, root] of [['a first install', fresh], ['an upgrade', existing]] as const) {
+    const ok = runBash(rig([...ROOT_ENTER], [
+      `enter_service_root ${q(root)} 022 "the state directory"`,
+      'pwd -P',
+    ].join('\n')))
+    assert.equal(ok.status, 0, `${what} must be accepted: ${ok.stderr}`)
+    assert.equal(ok.stdout.trim(), realpathSync(root), `and leave the process inside ${root}`)
+    assert.equal(lstatSync(root).isDirectory(), true)
+  }
 })

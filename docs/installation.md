@@ -1271,15 +1271,24 @@ says nothing about who may create it. So a root directly under `/tmp` is refused
 
   ```text
   ERROR: /var/lib/one-two-inventory is a symbolic link, and a root this run writes into may not be one: nothing here proves the path its target resolves through.
-  ERROR: To keep /var/lib/one-two-inventory on another disk, replace the link with a real directory and bind-mount the disk onto it — no data has to move:
-  ERROR:   rm /var/lib/one-two-inventory && mkdir -p /var/lib/one-two-inventory && mount --bind TARGET /var/lib/one-two-inventory
-  ERROR: then add `TARGET /var/lib/one-two-inventory none bind 0 0` to /etc/fstab so the bind survives a reboot.
+  ERROR: NOTHING HAS BEEN CHANGED by this run. To keep /var/lib/one-two-inventory on another disk, replace the link with a real directory and bind-mount the disk onto it — no data has to move, because the bind exposes the same filesystem at the same path.
+  ERROR: Do it with the writers stopped, and resolve the target BEFORE removing anything:
+  ERROR:   1. stop the application service, and pause any cron that writes under /var/lib/one-two-inventory
+  ERROR:   2. TARGET="$(readlink -f /var/lib/one-two-inventory)"; test -d "$TARGET" || echo "STOP: that link does not resolve to a directory"
+  ERROR:   3. rm /var/lib/one-two-inventory && mkdir -p /var/lib/one-two-inventory && mount --bind "$TARGET" /var/lib/one-two-inventory
+  ERROR:   4. verify with: findmnt /var/lib/one-two-inventory   — if the mount did NOT take, put the link back at once: rmdir /var/lib/one-two-inventory && ln -s "$TARGET" /var/lib/one-two-inventory
+  ERROR:   5. add: "$TARGET" /var/lib/one-two-inventory none bind 0 0   to /etc/fstab so the bind survives a reboot, then start the service again
   ```
 
-  **What an operator with a symlinked state root must do:** remove the link, `mkdir` a real
-  directory at the same path, `mount --bind` the disk onto it, and add the matching `fstab` line so
-  the bind comes back after a reboot. Nothing moves — the bind exposes the same filesystem at the
-  same path, so the data, the ownership and the free space are the ones that were already there.
+  **What an operator with a symlinked root must do** is the five numbered steps above, in that
+  order. They matter as a sequence, not as a one-liner: the refusal is printed while the service and
+  its cron are still running, and the middle step removes a live pathname. So — stop the writers,
+  **derive** `TARGET` from the link rather than retyping it, check it is a directory, then replace
+  and bind. If `mount --bind` does not take, step 4 puts the symlink straight back; without that,
+  a wrong or unavailable target leaves an **empty real directory** at the live path with the data
+  detached behind it, and the application either fails or quietly populates a shadow tree. Nothing
+  moves — the bind exposes the same filesystem at the same path, so the data, the ownership and the
+  free space are the ones that were already there.
   **Why:** the root's own *name* is safe, because its parent is root-owned; the *path its target
   resolves through* is not walked by anything, so any directory on that path the application
   account can write is a place to redirect a root-side publication of `.env`. A bind mount is the
@@ -1303,13 +1312,34 @@ link, `useradd --create-home`, the upload migration, the crontab-lock preparatio
 `rsync`, `git clone` and every `chown -R` acted **through** the link, and the refusal above arrived
 afterwards. The gate now precedes all of them.
 
-`LOG_DIR` is in the list even though nothing is published under it, because
-`chown -R "$APP_USER:$APP_USER" "$LOG_DIR"` **dereferences its operand**: a link at
-`/var/log/one-two-inventory` would hand the whole of whatever it points at to the service account,
-recursively.
+`LOG_DIR` is in the list even though nothing is published under it, because the ownership change
+that follows **dereferences its operand**: a link at `/var/log/one-two-inventory` would hand the
+whole of whatever it points at to the service account, recursively.
 
-**Upgrading an installation whose root IS a symlink.** The run stops at pre-flight, prints the four
-lines above naming that root, and adds:
+**The gate is a snapshot, and for `LOG_DIR` a snapshot is not enough.** It proves what is at the
+name when it runs and then releases the directory it walked to. For `APP_DIR` and `DATA_DIR` that
+settles it: `/opt` and `/var/lib` are root-owned and `0755`, so from that moment only root can put
+anything else at those names. `/var/log` on Ubuntu is `drwxrwxr-x root:syslog` and **not sticky**,
+so the `syslog` account may *rename* any entry in it — root-owned ones included — with **no symlink
+involved at all**. Between pre-flight and section 8 it could move the real log root aside and
+rename another `/var/log` subtree into its name.
+
+So section 8 does not act on the name. `enter_service_root()` walks from `/` again, creates the root
+with a plain `mkdir` (which fails on a planted link rather than working inside it) or accepts an
+existing one, refuses a root that belongs to somebody other than root, steps **into** it, checks
+both its inode and its `..`, and leaves the process there — and the ownership change is then made of
+`.`. A rename of the name after that cannot move a descriptor.
+
+**What this still does not cover**, stated rather than glossed: `logrotate` resolves
+`/var/log/one-two-inventory/*.log` by pathname, as root, on its own schedule, and on a
+group-writable `/var/log` that name is rebindable by the same account. That is a property of putting
+logs in `/var/log` on Ubuntu and is shared with every package that ships a logrotate fragment; an
+installer cannot pin it from here. `chmod +t /var/log` closes it host-wide — sticky means only an
+entry's owner may rename or remove it — and is the recommended hardening if that account is in your
+threat model.
+
+**Upgrading an installation whose root IS a symlink.** The run stops at pre-flight, prints the
+procedure above naming that root, and adds:
 
 ```text
 ERROR: /var/lib/one-two-inventory — the state directory — is a symbolic link, so this run stops here rather than creating, entering, migrating into, rsyncing into or chowning whatever it resolves to. […] NOTHING has been created, nothing has been migrated and nothing has been started — this is the FIRST statement in the run that looks at /var/lib/one-two-inventory, so an existing installation is exactly as it was.

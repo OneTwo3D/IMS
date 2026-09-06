@@ -1588,12 +1588,21 @@ publish_trust_root() {
 # enters them, and an operator who meets one wording at pre-flight and a different one at the first
 # publication has met two rules. There is one rule, so there is one text — and this copy is held
 # byte-identical to install.sh's by the same parity test that holds the rest of the publisher.
+#
+# THE REMEDY IS A PROCEDURE, NOT A ONE-LINER (o3d-secops r7 second pass, Codex HIGH): it is printed
+# while the service and its cron are still live, so it stops the writers first, derives the target
+# from the link instead of asking for it to be retyped, and prints the command that puts the link
+# back if the bind mount does not take.
 refuse_symlinked_root() {
   local root="$1"
   printf 'ERROR: %s is a symbolic link, and a root this run writes into may not be one: nothing here proves the path its target resolves through.\n' "$root" >&2
-  printf 'ERROR: To keep %s on another disk, replace the link with a real directory and bind-mount the disk onto it — no data has to move:\n' "$root" >&2
-  printf 'ERROR:   rm %s && mkdir -p %s && mount --bind TARGET %s\n' "$root" "$root" "$root" >&2
-  printf 'ERROR: then add `TARGET %s none bind 0 0` to /etc/fstab so the bind survives a reboot.\n' "$root" >&2
+  printf 'ERROR: NOTHING HAS BEEN CHANGED by this run. To keep %s on another disk, replace the link with a real directory and bind-mount the disk onto it — no data has to move, because the bind exposes the same filesystem at the same path.\n' "$root" >&2
+  printf 'ERROR: Do it with the writers stopped, and resolve the target BEFORE removing anything:\n' >&2
+  printf 'ERROR:   1. stop the application service, and pause any cron that writes under %s\n' "$root" >&2
+  printf 'ERROR:   2. TARGET="$(readlink -f %s)"; test -d "$TARGET" || echo "STOP: that link does not resolve to a directory"\n' "$root" >&2
+  printf 'ERROR:   3. rm %s && mkdir -p %s && mount --bind "$TARGET" %s\n' "$root" "$root" "$root" >&2
+  printf 'ERROR:   4. verify with: findmnt %s   — if the mount did NOT take, put the link back at once: rmdir %s && ln -s "$TARGET" %s\n' "$root" "$root" "$root" >&2
+  printf 'ERROR:   5. add: "$TARGET" %s none bind 0 0   to /etc/fstab so the bind survives a reboot, then start the service again\n' "$root" >&2
 }
 
 pin_dir_beneath_root() {

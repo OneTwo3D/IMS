@@ -2915,12 +2915,26 @@ publish_trust_root() {
 # "a root this run writes into" rather than "a publication root": ${LOG_DIR} is not a publication
 # root — nothing is published under it — and it is still subject to `chown -R`, which dereferences
 # its OPERAND. The sentence has to cover both or it is wrong at one of the two call sites.
+#
+# AND THE REMEDY IS A PROCEDURE, NOT A ONE-LINER (o3d-secops r7 second pass, Codex HIGH). It used
+# to be `rm ROOT && mkdir -p ROOT && mount --bind TARGET ROOT`, printed at a moment when the
+# service and its cron are still LIVE — which is the pre-flight refusal's whole point. An operator
+# who ran that with the wrong TARGET, an unmounted disk, or a `mount` that simply failed was left
+# with an EMPTY REAL DIRECTORY at the live pathname and their data detached at the old target: the
+# application writes into a shadow tree, or fails, and there is nothing on screen that says how to
+# get back. So the remedy now stops the writers first, DERIVES the target from the link rather than
+# asking the operator to retype it, checks it, and prints the one command that puts the link back
+# if the mount does not take. There are no backticks in any of it, so every line can be pasted.
 refuse_symlinked_root() {
   local root="$1"
   printf 'ERROR: %s is a symbolic link, and a root this run writes into may not be one: nothing here proves the path its target resolves through.\n' "$root" >&2
-  printf 'ERROR: To keep %s on another disk, replace the link with a real directory and bind-mount the disk onto it — no data has to move:\n' "$root" >&2
-  printf 'ERROR:   rm %s && mkdir -p %s && mount --bind TARGET %s\n' "$root" "$root" "$root" >&2
-  printf 'ERROR: then add `TARGET %s none bind 0 0` to /etc/fstab so the bind survives a reboot.\n' "$root" >&2
+  printf 'ERROR: NOTHING HAS BEEN CHANGED by this run. To keep %s on another disk, replace the link with a real directory and bind-mount the disk onto it — no data has to move, because the bind exposes the same filesystem at the same path.\n' "$root" >&2
+  printf 'ERROR: Do it with the writers stopped, and resolve the target BEFORE removing anything:\n' >&2
+  printf 'ERROR:   1. stop the application service, and pause any cron that writes under %s\n' "$root" >&2
+  printf 'ERROR:   2. TARGET="$(readlink -f %s)"; test -d "$TARGET" || echo "STOP: that link does not resolve to a directory"\n' "$root" >&2
+  printf 'ERROR:   3. rm %s && mkdir -p %s && mount --bind "$TARGET" %s\n' "$root" "$root" "$root" >&2
+  printf 'ERROR:   4. verify with: findmnt %s   — if the mount did NOT take, put the link back at once: rmdir %s && ln -s "$TARGET" %s\n' "$root" "$root" "$root" >&2
+  printf 'ERROR:   5. add: "$TARGET" %s none bind 0 0   to /etc/fstab so the bind survives a reboot, then start the service again\n' "$root" >&2
 }
 
 pin_dir_beneath_root() {
@@ -3271,25 +3285,79 @@ mkdir_service_subdir() {
 # THE ANCHOR is an additional property only a publication root carries, and it is still enforced
 # where it always was.
 #
-# AND "PIN" MEANS WHAT IT CAN MEAN IN A SHELL. This process cannot hold a descriptor on three
-# directories for the length of an install. What the walk establishes is that at the moment it ran,
-# no component from `/` to the root was a symlink and the root was not one either — and the parents
-# of all three (/opt, /var/lib, /var/log) are root-owned, so from that moment only root can put a
-# link at any of those names. The window the finding is about is between an EXISTING link and the
-# writes that followed it, and that window is closed by asking first.
+# AND "PIN" MEANS WHAT IT CAN MEAN IN A SHELL — WHICH IS WHY THE GATE IS NOT THE WHOLE ANSWER
+# (o3d-secops r7 second pass, Codex HIGH). This process cannot hold a descriptor on three
+# directories for the length of an install, so what the gate establishes is a fact about the moment
+# it ran. For ${APP_DIR} and ${DATA_DIR} that is enough on its own: their parents (/opt, /var/lib)
+# are root-owned and 0755 on every supported distribution, so from that moment only root can put
+# anything else at those names.
+#
+# ${LOG_DIR} IS THE ONE THAT IS NOT ENOUGH, and the reason is the reason the anchor is not applied
+# to it: on Ubuntu /var/log is `drwxrwxr-x root:syslog` and NOT sticky, so the `syslog` account may
+# rename ANY entry in it — including one root owns. Between this gate and section 8 it could move
+# the real log root aside and rename another /var/log subtree into its name; a later
+# `chown -R … "${LOG_DIR}"` would then hand that subtree to ${APP_USER}. NO SYMLINK IS INVOLVED, so
+# refusing symlinks does not touch it, and no snapshot check can: the answer has to be a pin the
+# operation itself uses. enter_service_root() below is that pin — it walks, creates or accepts the
+# root, steps INTO it, proves the inode and the `..`, and leaves the process there, so section 8's
+# ownership change is made relative to `.` and can land nowhere else. See its own comment.
+#
+# What this still does not reach is a root-run consumer LATER and outside this script: logrotate
+# resolves ${LOG_DIR}/*.log by pathname on its own schedule, and on a group-writable /var/log that
+# name is rebindable by the same account. That is a property of putting logs in /var/log on Ubuntu
+# and is shared with every package that ships a logrotate fragment; it is not something an
+# installer can pin from here. `chmod +t /var/log` closes it host-wide, and docs/installation.md
+# says so.
 service_root_entry_kind() {
-  local root="${1%/}" rel comp here entry base
+  local root="${1%/}" base
   [[ "${root}" == /* ]] || return 1
   [[ -n "${root}" ]] || return 1
   base="${root##*/}"
-  [[ -n "${base}" && "${base}" != "." && "${base}" != ".." ]] || return 1
+  # THE WALK, WHICH LEAVES THIS SHELL INSIDE THE PARENT. Its caller runs it in a command
+  # substitution, so the moved cwd dies with the subshell.
+  pin_service_root_parent "${root}" || return 1
+  # ONE lstat, in the directory the walk is standing in, of a SINGLE COMPONENT — never a pathname.
+  # "absent" is a first install, and is the one answer that is neither a directory nor a refusal.
+  stat -c '%F' "${base}" 2>/dev/null || printf 'absent\n'
+}
+
+# THE WALK, ONCE, USED BOTH TO ASK AND TO ACT (o3d-secops r7 second pass).
+#
+# It walks from `/` — the one directory whose name nothing can rebind — to the PARENT of "$1", one
+# component at a time: each is lstat-ed (`stat` without `-L`, so a symlinked ancestor is refused
+# rather than followed), entered with `cd -P`, and then checked BOTH ways round — the inode this
+# process is standing in must be the one the entry named, and `..` must be the directory it came
+# from. That pair closes the window between the lstat and the chdir; `..` alone would accept a
+# component swapped for a symlink to a SIBLING, and the inode alone would accept a directory moved
+# WHOLESALE into another parent.
+#
+# IT LEAVES THE CALLING SHELL INSIDE THE PARENT, on success and part-way down on failure, and puts
+# that parent's device and inode in ${SERVICE_ROOT_PARENT} — which is what lets the caller check
+# the `..` of the root it then enters. Callers that want an answer rather than a position run it in
+# a subshell.
+#
+# THE INODE IS A VARIABLE AND NOT SOMETHING IT PRINTS, because a caller that read it through `$( )`
+# would be reading it out of a SUBSHELL — and the chdir, which is the whole point, would die with
+# that subshell while the caller went on to `mkdir` and `cd` relative to wherever it already was.
+# That was written first and caught by the regressions: enter_service_root() refused every root,
+# because the `..` it compared belonged to a directory the walk had never entered.
+#
+# THE OWNERSHIP AND MODE OF THE ANCESTORS ARE DELIBERATELY NOT ASKED HERE. That is
+# pin_publish_root_parent()'s question, and it is the right one for a PUBLICATION root; asking it
+# of ${LOG_DIR} would refuse a stock Ubuntu install over a question no publication asks. See the
+# comment above.
+pin_service_root_parent() {
+  local root="${1%/}" rel comp here entry
+  SERVICE_ROOT_PARENT=""
+  [[ "${root}" == /* ]] || return 1
+  [[ -n "${root}" ]] || return 1
   # THE FIXED TRUSTED ANCESTOR, and the only one there is.
   cd -P / 2>/dev/null || return 1
   here="$(stat -c '%d:%i' . 2>/dev/null || true)"
   [[ -n "${here}" ]] || return 1
   rel="${root#/}"
   # Every component ABOVE the root. The root's own name is what is left in ${rel} at the end, and
-  # it is deliberately not entered: this asks what is AT it, and creates nothing.
+  # it is deliberately not entered here: asking and acting want different things of it.
   while [[ "${rel}" == */* ]]; do
     comp="${rel%%/*}"
     rel="${rel#*/}"
@@ -3302,19 +3370,14 @@ service_root_entry_kind() {
     entry="$(stat -c '%F|%d:%i' "${comp}" 2>/dev/null || true)"
     [[ "${entry%%|*}" == "directory" ]] || return 1
     cd -P "${comp}" 2>/dev/null || return 1
-    # AND THE DIRECTORY WE LANDED IN IS THE ONE THAT ENTRY NAMED. `..` alone accepts a component
-    # swapped for a symlink to a SIBLING under the same parent; the inode does not. Both are kept:
-    # `..` also refuses a directory moved WHOLESALE into another parent, which preserves its inode.
     [[ "$(stat -c '%d:%i' . 2>/dev/null || true)" == "${entry#*|}" ]] || return 1
     [[ "$(stat -c '%d:%i' .. 2>/dev/null || true)" == "${here}" ]] || return 1
     here="${entry#*|}"
   done
   # The walk consumed every component but the last, so what is left must be the root's own name. A
   # trailing `/` or a `//` that made the two disagree is a refusal and not a guess.
-  [[ "${rel}" == "${base}" ]] || return 1
-  # ONE lstat, in the directory this walk is standing in, of a SINGLE COMPONENT. "absent" is a
-  # first install, and is the one answer that is neither a directory nor a refusal.
-  stat -c '%F' "${base}" 2>/dev/null || printf 'absent\n'
+  [[ "${rel}" == "${root##*/}" ]] || return 1
+  SERVICE_ROOT_PARENT="${here}"
 }
 
 # The gate. It either returns or ends the run; there is no third outcome and no caller decides.
@@ -3338,6 +3401,79 @@ require_real_service_root() {
       die "${root} — ${what} — is a ${kind}, not a directory. This run will not create anything at that name or write through it. NOTHING has been created, nothing has been migrated and nothing has been started."
       ;;
   esac
+}
+
+# CREATE-OR-ACCEPT A ROOT AND STAND INSIDE IT, so that what follows is aimed at an inode rather
+# than a name (o3d-secops r7 second pass, Codex HIGH).
+#
+# THE FINDING THIS ANSWERS. require_real_service_root() above is a SNAPSHOT: it proves what was at
+# the name when it ran and then releases the cwd it walked to. For a root whose parent only root
+# can write, that is the whole answer. For ${LOG_DIR} on Ubuntu it is not — /var/log is
+# `drwxrwxr-x root:syslog` and not sticky, so the `syslog` account may RENAME entries in it, and a
+# rename needs no symlink. Between the gate and section 8 it can move the real log root aside and
+# rename another /var/log subtree into its name; the `chown -R "${LOG_DIR}"` that used to follow
+# would then transfer that subtree to ${APP_USER}, recursively, and it could be renamed back
+# afterwards carrying the wrong ownership. Nothing a check makes of a PATHNAME can see that.
+#
+# SO THE OPERATION IS AIMED AT A DESCRIPTOR. This walks from `/` (pin_service_root_parent), creates
+# the root with a PLAIN `mkdir` — EEXIST on a planted symlink, where `mkdir -p` would silently work
+# inside its target — lstats what is there when the create fails, refuses a link through the shared
+# refusal, steps in with `cd -P`, and then proves BOTH that the directory it is standing in is the
+# one the entry named AND that its `..` is the parent the walk pinned. It LEAVES THE PROCESS THERE.
+# Section 8 then changes the ownership of `.`, and a rename of the NAME afterwards cannot move it.
+#
+# AND AN EXISTING ROOT MUST BELONG TO root. A directory the attacking account created at the name
+# BEFORE this run passes every structural check — it is a real directory in the right parent — and
+# handing it to ${APP_USER} would be handing them a directory they already chose the contents of.
+# `mkdir` succeeding means this run created it; `mkdir` failing means it must be proved instead,
+# and uid 0 is that proof. It is asked of `.` after the chdir, of an inode this walk has pinned.
+#
+# THE MODE COMES FROM THE UMASK THE CALLER STATES, at creation, and a directory that is already
+# there keeps whatever mode it has: chmod has no --no-dereference on Linux, which is the same
+# reason mkdir_service_subdir() gives.
+enter_service_root() {
+  local root="$1" mask="$2" what="$3" base parent entry kind owner self
+  base="${root##*/}"
+  [[ "${root}" == /* && -n "${base}" && "${base}" != "." && "${base}" != ".." ]] || die \
+    "enter_service_root was asked for '${root}', which is not an absolute path with a nameable last component. This is a bug in this script, not an operator error."
+  # CALLED DIRECTLY AND NOT THROUGH `$( )`: the chdir it performs is the pin every step below
+  # depends on, and a command substitution would discard it. See its own comment.
+  pin_service_root_parent "${root}" || die \
+    "${root} — ${what} — could not be resolved from \`/\` without following a symbolic link, or a directory on the way to it changed while this run was walking it. Nothing has been changed."
+  parent="${SERVICE_ROOT_PARENT}"
+  [[ -n "${parent}" ]] || die \
+    "${root} — ${what} — was walked to but its parent could not be identified, so this run cannot prove where it is about to create or enter it. Nothing has been changed."
+  # A PLAIN `mkdir`, not `mkdir -p`: it refuses a name that is already taken instead of working
+  # inside whatever is there.
+  if ! (umask "${mask}"; mkdir "${base}") 2>/dev/null; then
+    entry="$(stat -c '%F|%d:%i' "${base}" 2>/dev/null || true)"
+    kind="${entry%%|*}"
+    if [[ "${kind}" == "symbolic link" ]]; then
+      refuse_symlinked_root "${root}"
+      die "${root} — ${what} — is a symbolic link, so this run stops here rather than creating, entering or chowning whatever it resolves to. Nothing has been changed."
+    fi
+    [[ "${kind}" == "directory" ]] || die \
+      "${root} — ${what} — is a ${kind:-missing path}, not a directory, so this run will not create anything at that name or write through it. Nothing has been changed."
+  fi
+  entry="$(stat -c '%F|%d:%i' "${base}" 2>/dev/null || true)"
+  [[ "${entry%%|*}" == "directory" ]] || die \
+    "${root} — ${what} — is not the directory this run had just created or accepted: it was replaced between the check and the step into it. This run refuses rather than following it; nothing has been changed."
+  cd -P "${base}" 2>/dev/null || die \
+    "${root} — ${what} — could not be entered after this run created or accepted it. Nothing has been changed."
+  # THE TWO IDENTITY CHECKS, of `.` and of `..`, both answered by the kernel for the inode this
+  # process is inside rather than by re-resolving a name.
+  [[ "$(stat -c '%d:%i' . 2>/dev/null || true)" == "${entry#*|}" ]] || die \
+    "${root} — ${what} — is not the directory this run had just created or accepted: it was replaced between the check and the step into it. This run refuses rather than following it; nothing has been changed."
+  [[ "$(stat -c '%d:%i' .. 2>/dev/null || true)" == "${parent}" ]] || die \
+    "${root} — ${what} — is not in the directory this run walked to: it was replaced between the check and the step into it. This run refuses rather than following it; nothing has been changed."
+  # ROOT, OR WHOEVER IS RUNNING THIS SCRIPT — the same pair pin_publish_root_parent() accepts, and
+  # for the same reason. In production the two are one: section 1 refuses a run whose EUID is not 0.
+  # `id -u` rather than a literal 0 so that the regressions, which have a single uid and cannot
+  # chown anything to root, measure the check rather than being blocked by it.
+  self="$(id -u)" || die "\`id -u\` failed, so this run cannot establish which uid it is and cannot prove who owns ${root}."
+  owner="$(stat -c '%u' . 2>/dev/null || true)"
+  [[ "${owner}" == "0" || "${owner}" == "${self}" ]] || die \
+    "${root} — ${what} — already exists and belongs to uid ${owner:-unknown}, not to root. A root this installer creates is root's; one somebody else made at that name is a directory whose contents they chose, and handing it to '${APP_USER}' would hand them whatever is in it. Remove or fix that path and run the installer again; nothing has been changed."
 }
 
 # ---------------------------------------------------------------------------
@@ -6497,11 +6633,11 @@ header "Pre-flight checks"
 #
 #   load_existing_env "${APP_DIR}/.env"                 the first read of any of the three
 #   useradd --home-dir "${APP_DIR}" --create-home       creates ${APP_DIR}
-#   mkdir -p "${DATA_DIR}" "${LOG_DIR}"                 section 8's own roots
-#   mkdir_service_subdir / enter_service_subdir         `mkdir -p` + `cd -P` on the root
+#   enter_service_root "${DATA_DIR}" / "${LOG_DIR}"     section 8's own roots
+#   mkdir_service_subdir / enter_service_subdir         the walk beneath ${DATA_DIR}/${APP_DIR}
 #   migrate_uploads                                     moves the uploads into ${DATA_DIR}
 #   find "${DATA_DIR}" ... -exec chown -h               the recursive chown of the state root
-#   chown -R … "${LOG_DIR}"                             whose OPERAND is dereferenced
+#   the ownership change under ${LOG_DIR}               made of `.` inside a re-proved root
 #   prepare_crontab_lock                                the root-owned lock under ${DATA_DIR}
 #   mkdir_service_subdir "${DATA_DIR}" 077 …            the deploy key directory
 #   git clone / git fetch / rsync -a --delete           into ${APP_DIR}
@@ -6513,6 +6649,11 @@ header "Pre-flight checks"
 #
 # ${LOG_DIR} is in the list because `chown -R` DEREFERENCES its operand: a link at /var/log/<app>
 # hands the whole of whatever it points at to ${APP_USER}, recursively.
+#
+# AND THE GATE IS NOT THE WHOLE ANSWER FOR ${LOG_DIR}. It is a snapshot, and /var/log is
+# group-writable and not sticky on Ubuntu, so the `syslog` account can RENAME the root after this
+# line has passed on it — no symlink involved, and nothing a snapshot can see. enter_service_root()
+# is the other half: section 8 creates, re-proves and ENTERS the root, and changes ownership of `.`.
 require_real_service_root "${APP_DIR}"  "the application directory"
 require_real_service_root "${DATA_DIR}" "the state directory"
 require_real_service_root "${LOG_DIR}"  "the log directory"
@@ -7262,9 +7403,24 @@ if [[ -n "${DB_SSLROOTCERT}" ]]; then
     "The database CA at ${DB_CA_PUBLISHED_FILE} is not usable by the account the service runs as; the reason is above. DB_SSLMODE=${DB_SSLMODE} verifies every connection against that file, so an application that cannot open it cannot start. NOTHING HAS BEEN MIGRATED and nothing has been stopped. ${DB_CA_REFRESH_FAILURE_ADVICE}"
 fi
 
-# THE STATE ROOTS THEMSELVES: /var/lib and /var/log are root-owned, so a symlink at either of
-# these two names is an operator's storage layout and not an attack, and `-p` is right for them.
-mkdir -p "${DATA_DIR}" "${LOG_DIR}"
+# THE STATE ROOTS THEMSELVES, CREATED BY THE WALK AND NOT BY `mkdir -p` (o3d-secops r7).
+#
+# This was `mkdir -p "${DATA_DIR}" "${LOG_DIR}"`, on the argument that /var/lib and /var/log are
+# root-owned so a symlink at either name is an operator's storage layout rather than an attack.
+# Round 6 had already withdrawn that argument for the PUBLISHER — it refuses a symlinked root and
+# names the bind mount that replaces it — and leaving it standing here is what made the refusal
+# arrive after the writes it was meant to prevent. `mkdir -p` follows a link at the root silently;
+# a plain `mkdir` inside a pinned parent does not, and enter_service_root() is that.
+#
+# `if ! ( … )` AND NOT `( … ) || die`: a compound command on the left of `||` runs with `set -e`
+# IGNORED, so a failure inside it would be a failure this line did not notice. Every refusal below
+# is either an explicit `die` inside the subshell or this `if`.
+if ! ( enter_service_root "${DATA_DIR}" 022 "the state directory" ); then
+  die "${DATA_DIR} could not be created and proved; the reason is above. Nothing has been changed."
+fi
+if ! ( enter_service_root "${LOG_DIR}" 022 "the log directory" ); then
+  die "${LOG_DIR} could not be created and proved; the reason is above. Nothing has been changed."
+fi
 
 # EVERYTHING BENEATH THEM GOES THROUGH THE SYMLINK-PROOF WALK (o3d-czpy). On an upgrade the
 # containing directory already belongs to ${APP_USER} — the recursive chown below did that on the
@@ -7344,7 +7500,26 @@ migrate_uploads "${APP_DIR}/public/uploads/avatars" "${PUBLIC_UPLOAD_STORAGE_DIR
 # ${APP_USER} would be a staging directory they can rename — which is the whole finding.
 find "${DATA_DIR}" \( -path "${CRONTAB_LOCK_DIR}" -o -name "${PUBLISH_STAGE_DIRNAME}" \) -prune \
   -o -exec chown -h "${APP_USER}:${APP_USER}" {} +
-chown -R "${APP_USER}:${APP_USER}" "${LOG_DIR}"
+# ${LOG_DIR}'S OWNERSHIP IS AIMED AT A DESCRIPTOR, NOT AT A NAME (o3d-secops r7 second pass,
+# Codex HIGH).
+#
+# `chown -R "${APP_USER}:${APP_USER}" "${LOG_DIR}"` DEREFERENCES ITS OPERAND, and /var/log is
+# `drwxrwxr-x root:syslog` and not sticky on Ubuntu — so the `syslog` account may rename entries in
+# it, root-owned ones included, WITH NO SYMLINK ANYWHERE. Between the pre-flight gate and this
+# line it could move the real log root aside and rename another /var/log subtree into its name, and
+# this `chown -R` would transfer that subtree, recursively, to ${APP_USER}. A pathname check cannot
+# see a rename; only an operation aimed at an inode is unaffected by one.
+#
+# So enter_service_root() re-walks from `/`, re-proves the root's identity and its `..`, and leaves
+# this subshell INSIDE it — and the ownership change is then made of `.`. Its subshell is why the
+# installer's own cwd is unaffected. `-exec chown -h` for the same reason the ${DATA_DIR} line
+# above uses it: a symlink under the root has its OWN ownership changed, never its target's.
+if ! (
+  enter_service_root "${LOG_DIR}" 022 "the log directory"
+  find . -exec chown -h "${APP_USER}:${APP_USER}" {} +
+); then
+  die "The ownership of ${LOG_DIR} could not be set; the reason is above. Nothing has been started."
+fi
 chown -R "${APP_USER}:${APP_USER}" "${UPLOAD_STORAGE_DIR}" "${PUBLIC_UPLOAD_STORAGE_DIR}"
 
 # THE CRONTAB RECONCILIATION LOCK, prepared here and defined in scripts/lib/crontab-lock.sh.
