@@ -62,6 +62,14 @@ function zeroPaidInvoice(invoiceId: string) {
 type OrderShape = {
   /** Written by the WooCommerce importer and by markSalesOrderPaid; null for a ledger-sourced flag. */
   unregisteredPaidAt: Date | null
+  /**
+   * o3d-psrx r18: the order's stored total, as a decimal STRING so the fixture states what the
+   * `Decimal(18, 4)` column holds rather than what a double can carry. Defaulted to the GBP 100 every
+   * other case in this file uses.
+   */
+  totalForeign?: string
+  /** The order's currency, for the one case whose minor unit is the point. */
+  currency?: string
 }
 
 async function createPaidOrder(
@@ -71,15 +79,16 @@ async function createPaidOrder(
   shape: OrderShape,
 ): Promise<void> {
   const paidAt = new Date('2026-08-01T09:00:00.000Z')
+  const total = shape.totalForeign ?? '100'
   await db.salesOrder.create({
     data: {
       id,
       status: 'SHIPPED',
-      currency: 'GBP',
-      subtotalForeign: 100,
-      totalForeign: 100,
-      subtotalBase: 100,
-      totalBase: 100,
+      currency: shape.currency ?? 'GBP',
+      subtotalForeign: total,
+      totalForeign: total,
+      subtotalBase: total,
+      totalBase: total,
       accountingInvoiceId: invoiceId,
       paidAt,
       unregisteredPaidAt: shape.unregisteredPaidAt,
@@ -262,6 +271,8 @@ async function postedRegistration(
   amount: number = 100,
   /** The local receipt this registration names, when the case has one — see `unregisteredLocalReceipts`. */
   paymentId: string | null = null,
+  /** The currency the payload states it sent, which must match the order's or it covers none of it. */
+  currency: string = 'GBP',
 ): Promise<string> {
   const { stampSyncedAtFromDatabaseClock } = await import('@/lib/connectors/xero/synced-at-clock')
   const row = await db.accountingSyncLog.create({
@@ -276,8 +287,8 @@ async function postedRegistration(
       // document the call was about — the order's own column answers "which document NOW" — and (r7)
       // of how much of that document it settled.
       payload: paymentId == null
-        ? { accountingInvoiceId: registeredAgainstInvoiceId, amount, currency: 'GBP' }
-        : { accountingInvoiceId: registeredAgainstInvoiceId, amount, currency: 'GBP', paymentId },
+        ? { accountingInvoiceId: registeredAgainstInvoiceId, amount, currency }
+        : { accountingInvoiceId: registeredAgainstInvoiceId, amount, currency, paymentId },
     },
     select: { id: true },
   })
@@ -589,5 +600,118 @@ test(
     assert.ok(residual.zeroPaidReversed.has(fullInvoice),
       'a registration that covered the order and is now absent from a list IMS could read in full is '
       + 'still a proven reversal — the guard narrows the evidence, it does not switch the pass off')
+  },
+)
+
+// ---------------------------------------------------------------------------
+// o3d-psrx r18 (Codex HIGH 2) — THE READER'S OWN QUERY MUST CARRY THE STORED DECIMAL.
+//
+// THE FINDING. `readPaidProvenanceVerdicts` fetches `SalesOrder.totalForeign` — a `Decimal(18, 4)`
+// column — and handed it to the coverage rule through `Number(...)`. A double cannot hold four
+// decimals across that column's range: at 549755813888 (2^39) neighbouring doubles are about 0.00012
+// apart, so an order stated at `...0003` and a registration stating `...0002` become the SAME figure,
+// coverage reads as exact, and the classifier returns GONE — an ADMITTED reversal that clears
+// `paidAt` and raises a chargeback credit note over money nobody took back.
+//
+// WHY THIS IS HERE. The unit tests pin the DECISION; the conversion being fixed is in the QUERY, and
+// no unit test can see a column read. This drives the poller's own `readSalesResidualVerdicts`
+// against real rows, so the `Decimal` really does come out of Postgres and travel to the rule.
+//
+// MUTATION: put `Number(order.totalForeign)` back in `readPaidProvenanceVerdicts` and the headline
+// fails — the order's total collapses onto the registration's figure and the reversal is admitted.
+// ---------------------------------------------------------------------------
+
+test(
+  '[o3d-psrx r18] a four-decimal order total reaches the coverage rule as the DECIMAL it is stored as',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    const db = await loadDb()
+    const { readSalesResidualVerdicts } = await import('@/lib/connectors/xero/payment-poller')
+    const { databaseLedgerFence } = await import('@/lib/connectors/xero/invoice-delta')
+
+    // The pair from the finding: two valid four-decimal amounts one whole minor unit apart, which as
+    // `number`s are indistinguishable.
+    const SHORT = '549755813888.0002'
+    const TOTAL = '549755813888.0003'
+    assert.equal(Number(SHORT), Number(TOTAL),
+      'PRECONDITION: the two stored values collapse onto one double — the finding itself')
+
+    const shortId = probeId()
+    const exactId = probeId()
+    const shortInvoice = `INV-${shortId}`
+    const exactInvoice = `INV-${exactId}`
+    t.after(async () => {
+      await db.payment.deleteMany({ where: { orderId: { in: [shortId, exactId] } } })
+      await db.accountingSyncLog.deleteMany({ where: { referenceType: 'SalesOrder', referenceId: { in: [shortId, exactId] } } })
+      await db.salesOrder.deleteMany({ where: { id: { in: [shortId, exactId] } } })
+    })
+
+    // BOTH orders are CLF — a genuinely four-decimal currency — held as paid off-ledger. They differ
+    // in the ORDER TOTAL by one minor unit and in nothing else; both registrations state the same
+    // figure, which is all a payload double can express at this magnitude (o3d-1xq8).
+    const marker = new Date('2026-08-01T09:00:00.000Z')
+    await createPaidOrder(db, shortId, shortInvoice, { unregisteredPaidAt: marker, currency: 'CLF', totalForeign: TOTAL })
+    await createPaidOrder(db, exactId, exactInvoice, { unregisteredPaidAt: marker, currency: 'CLF', totalForeign: SHORT })
+
+    // PRECONDITION: Postgres really is holding the two totals apart. If the column rounded them
+    // together, both arms below would pass for a reason that has nothing to do with the reader.
+    const stored = await db.salesOrder.findMany({
+      where: { id: { in: [shortId, exactId] } },
+      select: { id: true, totalForeign: true },
+      orderBy: { id: 'asc' },
+    })
+    assert.equal(stored.length, 2)
+    assert.notEqual(
+      stored.find((o) => o.id === shortId)?.totalForeign.toString(),
+      stored.find((o) => o.id === exactId)?.totalForeign.toString(),
+      'PRECONDITION: the column holds these as two different figures',
+    )
+
+    const shortReceipt = await db.payment.create({
+      data: { orderId: shortId, amount: SHORT, currency: 'CLF', method: 'Card', paidAt: new Date('2026-08-02T09:00:00.000Z') },
+      select: { id: true },
+    })
+    const exactReceipt = await db.payment.create({
+      data: { orderId: exactId, amount: SHORT, currency: 'CLF', method: 'Card', paidAt: new Date('2026-08-02T09:00:00.000Z') },
+      select: { id: true },
+    })
+    await postedRegistration(db, shortId, shortInvoice, 'PAY-SHORT', Number(SHORT), shortReceipt.id, 'CLF')
+    await postedRegistration(db, exactId, exactInvoice, 'PAY-EXACT', Number(SHORT), exactReceipt.id, 'CLF')
+
+    const [{ now }] = await db.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`
+    const invoices = new Map([
+      [shortInvoice, zeroPaidInvoice(shortInvoice)],
+      [exactInvoice, zeroPaidInvoice(exactInvoice)],
+    ])
+    const residual = await readSalesResidualVerdicts(
+      invoices as never, new Set([shortInvoice, exactInvoice]), databaseLedgerFence(now),
+    )
+
+    // THE HEADLINE. One whole minor unit short of the order is a PART, and its removal is not a
+    // reversal of the whole document — however wide the doubles are at this magnitude.
+    assert.ok(!residual.zeroPaidReversed.has(shortInvoice),
+      'THE FINDING: the registration settles one minor unit less than the order, and reading both '
+      + 'through `Number` made that difference vanish — a chargeback over money nobody took back')
+    assert.ok(!residual.provenGone.has(shortInvoice))
+    const withheld = residual.withheld.find((w) => w.doc.id === shortId)
+    assert.ok(withheld, 'it must be WITHHELD and reported, not silently dropped')
+    assert.equal(withheld.verdict.verdict, 'PART_COVERED_OFF_LEDGER')
+    assert.deepEqual(
+      withheld.verdict.verdict === 'PART_COVERED_OFF_LEDGER'
+        ? {
+            registeredTotal: withheld.verdict.registeredTotal?.toString() ?? null,
+            documentTotal: withheld.verdict.documentTotal.toString(),
+          }
+        : null,
+      { registeredTotal: SHORT, documentTotal: TOTAL },
+      'and it carries the two DECIMALS it compared — as `number`s these would print the same figure '
+      + 'twice, which is the one case an operator most needs to be able to read',
+    )
+
+    // THE CONTROL, and it is what stops the fix being "never cover anything at this magnitude": the
+    // same registration against an order whose total it actually settles IS a reversal of the whole
+    // order, and the pass still recognises it.
+    assert.ok(residual.zeroPaidReversed.has(exactInvoice),
+      'exact coverage at the same magnitude still reverses — the rule got exact, not timid')
   },
 )

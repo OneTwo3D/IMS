@@ -467,3 +467,38 @@ test('[o3d-psrx r18] CONTROL: ordinary coverage at the same magnitude still sett
   assert.equal(coversDocumentTotal(toDecimal('100.01'), toDecimal('100.0000')), true)
   assert.equal(coversDocumentTotal(toDecimal('99.99'), toDecimal('100.0000')), false)
 })
+
+test('[o3d-psrx r18] and the SUM of the registrations is exact, not just the comparison', () => {
+  // The other half of "computes in Number": `sumRegisteredAmounts` added the registrations with `+`.
+  // Each term is still a payload double (o3d-1xq8), but adding two of them can land a whole minor unit
+  // away from their true sum — and that sum is one side of the coverage comparison.
+  //
+  // TWO registrations that between them settle the order EXACTLY. Their float sum does not.
+  const halfA: RegisteredPaymentRow = { ...pennyRegistration, id: 'log_a', externalTransactionId: 'PAY-A', registeredAmount: Number('274877906944.0001') }
+  const halfB: RegisteredPaymentRow = { ...pennyRegistration, id: 'log_b', externalTransactionId: 'PAY-B', registeredAmount: Number('274877906944.0002') }
+  // PRECONDITIONS. Each term is exactly the figure it names, and their float sum is a minor unit short
+  // of their exact sum — so the two summations really do disagree here.
+  assert.equal(toDecimal(halfA.registeredAmount!).toString(), '274877906944.0001')
+  assert.equal(toDecimal(halfB.registeredAmount!).toString(), '274877906944.0002')
+  assert.equal(toDecimal(halfA.registeredAmount!).add(halfB.registeredAmount!).toString(), FOUR_DP_TOTAL)
+  assert.equal(toDecimal(halfA.registeredAmount! + halfB.registeredAmount!).toString(), FOUR_DP_COVERED,
+    'PRECONDITION: added as doubles they fall one whole minor unit short')
+
+  const verdict = classifyRegisteredPaymentAgainstListing(
+    new Set<string>(), [halfA, halfB], READ_AT, [], true, withMarker, toDecimal(FOUR_DP_TOTAL),
+  )
+  assert.equal(verdict.verdict, 'GONE',
+    'registrations that between them settle the order EXACTLY cover it — a float sum said they were '
+    + 'a minor unit short and parked a genuine reversal for ever')
+  assert.equal(zeroPaidIsProvenReversal(verdict), true)
+
+  // CONTROL, in the other direction: two registrations that genuinely fall a minor unit short still
+  // do, so this is not "summing in Decimal admits everything".
+  const shortB: RegisteredPaymentRow = { ...halfB, registeredAmount: Number('274877906944.0001') }
+  assert.equal(
+    classifyRegisteredPaymentAgainstListing(
+      new Set<string>(), [halfA, shortB], READ_AT, [], true, withMarker, toDecimal(FOUR_DP_TOTAL),
+    ).verdict,
+    'PART_COVERED_OFF_LEDGER',
+  )
+})
