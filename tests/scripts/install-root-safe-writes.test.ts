@@ -2943,6 +2943,57 @@ test("[o3d-secops] the sink census is clean under bash's own parse too, and catc
 })
 
 /**
+ * AND THE SAME REFUSAL IN AN ENTRYPOINT, WHERE IT IS THE STATEMENT THAT TRIGGERS IT (o3d-secops r4).
+ *
+ * The fence library is refused unconditionally because it is the file that DECLARES these names.
+ * The three entrypoints cannot be: scripts/install.sh legitimately uses `local -n` and `${!name}`
+ * in prompt(), capture() and libpq_env_unset_args(), where the name comes from `$1` or from a
+ * `read` of a computed list, and refusing those would make this census red on the shipped tree and
+ * therefore worthless. So there the refusal is a rule about ONE COMMAND: an unresolvable shape in a
+ * segment that mentions a report, or whose controller IS a report.
+ *
+ * WHICH MAKES THE ALIAS RULE LOAD-BEARING HERE AND NOWHERE ELSE. `ref=DB_FENCE_PROBE_REASON` puts a
+ * report's NAME into `ref`; `node "${!ref}"` is a different statement, mentions no report, and is
+ * in a file where refusal is not unconditional. Without the whole-right-hand-side alias rule it
+ * passes. (Verified by disabling that rule: every other test in this file still passed.)
+ *
+ * AND THE LIMIT IS ASSERTED, NOT ASSUMED. The third case below is an indirection in an entrypoint
+ * with no report anywhere near it, and it is NOT refused. That is the honest edge of this rule: an
+ * indirection whose controller is built from argv, the environment or a command substitution is
+ * outside what a lexical census can answer, and what closes it instead is that the library — the
+ * only file that derives these values — refuses every such shape outright.
+ *
+ * ROUTE: reportSinkComplaints() with the addition appended to scripts/deploy.sh, which is where an
+ * operator or a compromised checkout would put one.
+ */
+test('[o3d-secops] a report renamed into a VARIABLE NAME inside an entrypoint is refused too', () => {
+  const DEPLOY_INDEX = SINK_CENSUS_SOURCES.findIndex(([file]) => file === 'scripts/deploy.sh')
+  assert.ok(DEPLOY_INDEX > 0, 'precondition: the census must be walking scripts/deploy.sh')
+  const withAddition = (addition: string): ReadonlyArray<readonly [string, string]> =>
+    SINK_CENSUS_SOURCES.map((pair, index) => index === DEPLOY_INDEX ? [pair[0], `${pair[1]}\n${addition}\n`] as const : pair)
+
+  for (const [addition, expected] of [
+    // The alias: the report's NAME is the whole right-hand side, so `ref` IS the report as far as
+    // `${!ref}` is concerned — in a statement that mentions no report at all.
+    ['ref=DB_FENCE_PROBE_REASON\nnode "${!ref}"', /uses an indirect expansion/],
+    // And an unresolvable WRITE on a statement that does mention one.
+    ['printf -v "$t" \'%s\' "${DB_FENCE_SEAL_REASON}"', /uses `printf -v`/],
+    ['declare -n alias_ref="${DB_FENCE_SEAL_REASON}"', /uses a nameref declaration/],
+  ] as ReadonlyArray<readonly [string, RegExp]>) {
+    const { complaints } = reportSinkComplaints(withAddition(addition), Object.keys(MUTABLE_LIBRARY_NAMES))
+    assert.ok(complaints.some((complaint) => expected.test(complaint)),
+      `the entrypoint refusal must fire for: ${addition}\n${complaints.join('\n')}`)
+  }
+
+  // THE STATED LIMIT, MEASURED. No report on the statement, no report in the controller, not the
+  // library: not refused. If this ever starts failing, the rule has become stricter than the
+  // paragraph above claims and install.sh's own helpers are about to go red.
+  const { complaints } = reportSinkComplaints(
+    withAddition('node "${!some_unrelated_controller}"'), Object.keys(MUTABLE_LIBRARY_NAMES))
+  assert.deepEqual(complaints, [], complaints.join('\n'))
+})
+
+/**
  * THE HISTORICAL MEASUREMENT, AS A TEST RATHER THAN A SENTENCE (o3d-secops r4).
  *
  * Every round of this rule has been justified by "it was run over b128f47f and named exactly the
