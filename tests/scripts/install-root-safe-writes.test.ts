@@ -4516,12 +4516,12 @@ function plantStateRoot(t: TestContext, prefix: string): { base: string, data: s
 
 /** The shipped walker, run over `data` as the shell runs it: from INSIDE the root, which is where
  *  enter_service_root() leaves the process, and therefore with `.` as its only pathname. */
-function runWalk(data: string, pruneAtRoot: string, opts: { helper?: string } = {}): Run {
+function runWalk(data: string, pruneAtRoot: string, opts: { helper?: string, env?: Record<string, string> } = {}): Run {
   return runBash([
     'set -uo pipefail',
     `node ${q(opts.helper ?? CHOWN_TREE)} . "$(${REAL.id} -u)" "$(${REAL.id} -g)" ${q(pruneAtRoot)}`,
     'echo "rc=$?"',
-  ].join('\n'), { cwd: data })
+  ].join('\n'), { cwd: data, env: opts.env })
 }
 
 /** THE SHIPPED WALKER WITH ITS STAGING PRUNE REMOVED, and nothing else changed — the mutation every
@@ -4801,9 +4801,336 @@ test('[o3d-n8xx] the shipped call site walks by descriptor, prunes by single com
 
   // AND THE WALK IT CALLS IS DESCRIPTOR-RELATIVE, which is the property the whole finding is about.
   const walker = readFileSync(CHOWN_TREE, 'utf8')
-  assert.match(walker, /O_DIRECTORY \| constants\.O_NOFOLLOW/, 'every directory is opened without following a link')
-  assert.match(walker, /lchownSync\(at\(dirFd, name\)/, 'every entry is chowned without following one')
-  assert.match(walker, /fchownSync\(childFd/, 'and a directory is chowned through the descriptor itself')
+  assert.match(walker, /constants\.O_NOFOLLOW/, 'nothing is opened by a name that may be followed')
+  assert.match(walker, /const OPEN_ENTRY = O_PATH \| constants\.O_NOFOLLOW/,
+    'every entry, of every type, is opened once from its parent descriptor')
+  assert.match(walker, /chownSync\(held\(fd\), uid, gid\)/,
+    'and the ownership change is aimed at the descriptor that open returned')
+
+  // AND NO OWNERSHIP CHANGE MAY NAME AN ENTRY (o3d-secops r20, Codex HIGH). This is the whole of
+  // the finding as a property of the text: `lchown`/`chown` of `at(dirFd, name)` is a SECOND
+  // resolution of a name the walk has already looked up, and the owner of the parent is live in
+  // between. It is asserted by shape rather than by one spelling, so a reintroduction under another
+  // name is caught too.
+  const namedChown = walker.split('\n')
+    .filter((line) => !line.trimStart().startsWith('*') && !line.trimStart().startsWith('//'))
+    .filter((line) => /\b(l?chownSync|fchownatSync)\s*\(\s*at\(/.test(line))
+  assert.deepEqual(namedChown, [],
+    `no ownership change in the walker may resolve an entry's NAME; that is the r20 finding:\n${namedChown.join('\n')}`)
+  assert.ok(!/\blchownSync\b/.test(walker),
+    'and the by-name primitive is not imported at all, so it cannot come back by accident')
+})
+
+// ---------------------------------------------------------------------------
+// THE TYPE-SWAP RACE THE PRUNE COULD NOT SEE (o3d-secops r20, Codex HIGH)
+//
+// Both prunes are consulted only once the walk has decided an entry is a DIRECTORY, and that
+// decision used to come from an `lstat()` OF THE NAME while the ownership change that followed was
+// an `lchown()` OF THE SAME NAME. Two lookups, with ${APP_USER} — who owns the parent and is still
+// running, because section 8 precedes the stop — live in between. A sacrificial regular file at a
+// name, and a `rename(2)` within that one parent (which needs no permission on what is moved), puts
+// the staging directory at the name after `lstat` has answered "not a directory": the prune is
+// never reached, `lchown` on a directory is exactly `chown`, and the debris of an interrupted
+// publication is handed to the account that planted the swap.
+//
+// HOW THE RACE IS MADE DETERMINISTIC. It is planted, not waited for. The walker under test is
+// written out with ONE statement inserted at the instant the attacker's rename would land — after
+// that version's single lookup of the name and before it acts on it — which is the same technique
+// the o3d-n8xx race above uses with its `chown` shim: the enumeration, the rename and the ownership
+// change are all real, and only WHEN the rename happens is decided by the harness.
+//
+// HOW THE EFFECT IS MEASURED. Not by ctime taken before the run: `rename(2)` updates the ctime of
+// the inode it moves, so the swap itself would show as a change and every assertion would be
+// vacuous. The shim records the staging directory's ctime AT THE MOMENT OF THE SWAP, and the test
+// compares that witness with the ctime after the walk has finished. Only an ownership change made
+// after the swap can move it.
+// ---------------------------------------------------------------------------
+
+/** The attacker, as a module prelude the shimmed walker carries. `__swap` fires once, on the entry
+ *  the test names, and leaves the witness behind. */
+const SWAP_SHIM = `
+import { renameSync as __renameSync, lstatSync as __lstatSync, writeFileSync as __writeFileSync } from 'node:fs'
+const __base = process.env.SWAP_BASE
+let __stage = 0
+const __witness = (path) => __writeFileSync(process.env.SWAP_WITNESS, String(__lstatSync(path, { bigint: true }).ctimeNs))
+/** A regular file is renamed aside and the staging directory takes its name. */
+const __swapInStaging = (name) => {
+  if (__stage !== 0 || name !== process.env.SWAP_NAME) return
+  __stage = 1
+  __renameSync(\`\${__base}/\${name}\`, \`\${__base}/\${name}.moved\`)
+  __renameSync(\`\${__base}/\${process.env.SWAP_STAGING}\`, \`\${__base}/\${name}\`)
+  __witness(\`\${__base}/\${name}\`)
+}
+/** The directory at the name is renamed aside and a plain file takes its place, so an O_DIRECTORY
+ *  open of that name is answered ENOTDIR. */
+const __swapOutDirectory = (name) => {
+  if (__stage !== 0 || name !== process.env.SWAP_NAME) return
+  __stage = 1
+  __renameSync(\`\${__base}/\${name}\`, \`\${__base}/\${name}.moved\`)
+  __renameSync(\`\${__base}/plainfile\`, \`\${__base}/\${name}\`)
+}
+/** And then the staging directory takes it, which is what the by-name fallback then chowns. */
+const __swapInStagingAfterFailedOpen = (name) => {
+  if (__stage !== 1 || name !== process.env.SWAP_NAME) return
+  __stage = 2
+  __renameSync(\`\${__base}/\${name}\`, \`\${__base}/plain.moved\`)
+  __renameSync(\`\${__base}/\${process.env.SWAP_STAGING}\`, \`\${__base}/\${name}\`)
+  __witness(\`\${__base}/\${name}\`)
+}
+`
+
+/** Writes a copy of `source` carrying the shim, with `inserted` placed at `anchor`. */
+function shimmedWalker(t: TestContext, prefix: string, source: string, anchor: string, inserted: string): string {
+  assert.equal(source.split(anchor).length - 1, 1, `precondition: the insertion point must be unique:\n${anchor}`)
+  assert.equal(source.split('const MAX_DEPTH = 512').length - 1, 1, 'precondition: the shim needs somewhere to go')
+  const shimmed = source
+    .replace('const MAX_DEPTH = 512', `${SWAP_SHIM}\nconst MAX_DEPTH = 512`)
+    .replace(anchor, `${anchor}\n${inserted}`)
+  const helper = join(createTempDirSync(prefix, t), 'chown-tree-shimmed.mjs')
+  writeFileSync(helper, shimmed)
+  return helper
+}
+
+/** WHERE THE SHIPPED WALKER LOOKS THE NAME UP, AND THE ONLY PLACE IT DOES. Everything after this
+ *  line is a question about the descriptor, which is the claim under test. */
+const SHIPPED_LOOKUP = `    const entryFd = openEntry(dirFd, name)
+    if (entryFd === null) continue`
+
+/**
+ * THE PRE-r20 PER-ENTRY HANDLING, RETYPED — as the retired `find -exec chown` construct above is
+ * retyped, and for the same reason: a mutation has to be the defect itself, and the defect is no
+ * longer in the file to lift. `lstat` decides, `lchown` acts, and both name the entry. The two
+ * `__swap*` calls mark the two instants at which the account that owns the parent gets to move.
+ */
+const PRE_R20_BLOCK = `    let entry
+    try {
+      entry = lstatSync(at(dirFd, name))
+    } catch (error) {
+      if (RACED.has(error.code)) continue
+      die(\`\${name} below \${root} could not be examined: \${error.code ?? error.message}.\`)
+    }
+    if (!entry.isDirectory()) {
+      __swapInStaging(name)
+      chownEntryByName(dirFd, name)
+      continue
+    }
+    __swapOutDirectory(name)
+    const childFd = openChildDir(dirFd, name)
+    if (childFd === null) {
+      __swapInStagingAfterFailedOpen(name)
+      chownEntryByName(dirFd, name)
+      continue
+    }
+    try {
+      const stats = fstatSync(childFd)
+      if (protectedIds.has(identity(stats))) continue
+      if (privilegedAndPrivate(stats)) continue
+      chownSync(held(childFd), uid, gid)
+      walk(childFd, depth + 1)
+    } finally {
+      closeSync(childFd)
+    }`
+
+/** What that block needs and the shipped file no longer imports or defines. */
+const PRE_R20_PRELUDE = `
+import { lchownSync as __lchownSync, lstatSync } from 'node:fs'
+const chownEntryByName = (dirFd, name) => {
+  try {
+    __lchownSync(at(dirFd, name), uid, gid)
+  } catch (error) {
+    if (error.code === 'ENOENT') return
+    die(\`the ownership of \${name} below \${root} could not be changed: \${error.code ?? error.message}.\`)
+  }
+}
+`
+
+/** The shipped walker with its per-entry handling replaced by the pre-r20 one, and NOTHING else
+ *  changed — the prunes, the identity record, the descriptor descent and the refusals are the
+ *  shipped ones. The route every assertion below states. */
+function walkerBeforeR20(t: TestContext): string {
+  const shipped = readFileSync(CHOWN_TREE, 'utf8')
+  const open = shipped.indexOf(SHIPPED_LOOKUP)
+  assert.ok(open >= 0, `precondition: the shipped walker must look each entry up exactly once:\n${SHIPPED_LOOKUP}`)
+  const closer = '      closeSync(entryFd)\n    }'
+  const end = shipped.indexOf(closer, open)
+  assert.ok(end > open, 'precondition: and close the descriptor it opened')
+  const body = shipped.slice(open, end + closer.length)
+  assert.ok(body.includes('chownPinned(entryFd, name)'), `precondition: through the descriptor:\n${body}`)
+  const mutated = shipped
+    .replace('const MAX_DEPTH = 512', `${SWAP_SHIM}${PRE_R20_PRELUDE}\nconst MAX_DEPTH = 512`)
+    .replace(body, PRE_R20_BLOCK)
+  const helper = join(createTempDirSync('ims-secops-r20-pre-', t), 'chown-tree-pre-r20.mjs')
+  writeFileSync(helper, mutated)
+  return helper
+}
+
+/** ctime of one path, as the shim records it. */
+function ctimeOf(path: string): string {
+  return String(lstatSync(path, { bigint: true }).ctimeNs)
+}
+
+test('[o3d-secops r20] a file swapped for the staging directory between the walk\'s lookup and its ownership change is NOT handed over, and the two-lookup construct handed it over', (t) => {
+  /**
+   * ROUTE. The shipped walker, with the attacker's rename planted immediately after its ONE lookup
+   * of the name — `openEntry()` — which is the latest instant at which it could possibly matter.
+   * The staging directory carries the shape publish_durable_file() gives it, so it is exactly the
+   * debris an interrupted publication leaves.
+   */
+  const plant = plantStateRoot(t, 'ims-secops-r20-shipped-')
+  writeFileSync(join(plant.data, 'decoy'), 'sacrificial\n')
+  writeFileSync(join(plant.data, STAGE_DIRNAME, 'publish.xyz'), 'DATABASE_URL=secret\n')
+  const witness = join(plant.base, 'witness')
+  const env = { SWAP_BASE: plant.data, SWAP_NAME: 'decoy', SWAP_STAGING: STAGE_DIRNAME, SWAP_WITNESS: witness }
+
+  const helper = shimmedWalker(t, 'ims-secops-r20-shim-', readFileSync(CHOWN_TREE, 'utf8'), SHIPPED_LOOKUP, '    __swapInStaging(name)')
+  const before = ctimes(plant.data)
+  pause(30)
+  const run = runWalk(plant.data, LOCK_DIRNAME, { helper, env })
+  assert.match(run.stdout, /^rc=0$/m, `the walk must complete across the swap: ${run.stderr}`)
+
+  // NOT VACUOUS, AND THE PRECONDITION IS ASSERTED RATHER THAN ASSUMED: the swap really happened,
+  // and the staging directory really is what now sits at the name the walk was about to act on.
+  assert.equal(existsSync(witness), true, `the shim must have fired: ${run.stderr}${run.stdout}`)
+  assert.equal(lstatSync(join(plant.data, 'decoy')).isDirectory(), true, 'and a DIRECTORY must now be at the name')
+  assert.equal(lstatSync(join(plant.data, 'decoy')).mode & 0o777, 0o700, 'wearing the staging shape')
+  assert.equal(existsSync(join(plant.data, 'decoy.moved')), true, 'with the sacrificial file renamed aside')
+
+  // THE CLAIM: nothing touched the staging directory after the swap put it there.
+  assert.equal(ctimeOf(join(plant.data, 'decoy')), readFileSync(witness, 'utf8'),
+    'the staging directory may not be handed over by a name the walk had already looked up')
+  // AND THE WALK REALLY RAN: the ordinary tree was handed over, and so was the inode the walk had
+  // pinned before the swap — which is now called `decoy.moved`, and is the sacrificial file.
+  const reached = touched(before, ctimes(plant.data))
+  assert.ok(reached.includes('uploads/invoices/a.pdf'), `the ordinary tree must be handed over: ${reached.join(' ')}`)
+  assert.ok(reached.includes('decoy.moved'),
+    `and the entry the walk pinned before the swap is the one it chowned: ${reached.join(' ')}`)
+
+  // MEASURED BY MUTATION, ROUTE STATED: the same fixture, the same swap at the same instant, under
+  // the shipped walker whose per-entry handling is the pre-r20 one — `lstat` the name, `lchown` the
+  // name. The staging directory is then handed over, which is the finding.
+  const mutant = plantStateRoot(t, 'ims-secops-r20-mutant-')
+  writeFileSync(join(mutant.data, 'decoy'), 'sacrificial\n')
+  writeFileSync(join(mutant.data, STAGE_DIRNAME, 'publish.xyz'), 'DATABASE_URL=secret\n')
+  const mutantWitness = join(mutant.base, 'witness')
+  const mutated = runWalk(mutant.data, LOCK_DIRNAME, {
+    helper: walkerBeforeR20(t),
+    env: { SWAP_BASE: mutant.data, SWAP_NAME: 'decoy', SWAP_STAGING: STAGE_DIRNAME, SWAP_WITNESS: mutantWitness },
+  })
+  assert.match(mutated.stdout, /^rc=0$/m, mutated.stderr)
+  assert.equal(existsSync(mutantWitness), true, `the shim must have fired under the mutant too: ${mutated.stderr}`)
+  assert.notEqual(ctimeOf(join(mutant.data, 'decoy')), readFileSync(mutantWitness, 'utf8'),
+    'the two-lookup construct hands the interrupted publication to the account that swapped it in — that is the finding this test exists to fail on')
+})
+
+test('[o3d-secops r20] the directory recursion had the SAME second lookup, and an entry that stops being a directory before the open no longer falls back to it', (t) => {
+  /**
+   * THE OTHER HALF OF THE FINDING. The directory branch opened the name with `O_DIRECTORY |
+   * O_NOFOLLOW` — which is safe — but when that open was answered ENOTDIR or ELOOP it fell back to
+   * `chownEntry(dirFd, name)`: the identical second lookup. So the swap in the other direction
+   * worked too. A directory is renamed aside and a plain file put at its name (the open fails), and
+   * then the staging directory is renamed onto that name (the fallback chowns it).
+   *
+   * ROUTE. Two planted renames at the two instants the account that owns the parent would use them:
+   * one after `lstat` has called the entry a directory, one after the `O_DIRECTORY` open has
+   * refused it. Under the shipped walker both are planted after its single `openEntry()`, because
+   * that is the only lookup it makes and there is no second one to aim at.
+   */
+  const plant = plantStateRoot(t, 'ims-secops-r20-recursion-')
+  mkdirSync(join(plant.data, 'd'))
+  writeFileSync(join(plant.data, 'd/f'), 'inside\n')
+  writeFileSync(join(plant.data, 'plainfile'), 'plain\n')
+  writeFileSync(join(plant.data, STAGE_DIRNAME, 'publish.xyz'), 'DATABASE_URL=secret\n')
+  const witness = join(plant.base, 'witness')
+  const env = { SWAP_BASE: plant.data, SWAP_NAME: 'd', SWAP_STAGING: STAGE_DIRNAME, SWAP_WITNESS: witness }
+
+  const helper = shimmedWalker(t, 'ims-secops-r20-recursion-shim-', readFileSync(CHOWN_TREE, 'utf8'),
+    SHIPPED_LOOKUP, '    __swapOutDirectory(name)\n    __swapInStagingAfterFailedOpen(name)')
+  const before = ctimes(plant.data)
+  pause(30)
+  const run = runWalk(plant.data, LOCK_DIRNAME, { helper, env })
+  assert.match(run.stdout, /^rc=0$/m, `the walk must complete across both renames: ${run.stderr}`)
+
+  // NOT VACUOUS: both renames landed, and the staging directory is at the name.
+  assert.equal(existsSync(witness), true, `both stages of the shim must have fired: ${run.stderr}${run.stdout}`)
+  assert.equal(lstatSync(join(plant.data, 'd')).mode & 0o777, 0o700, 'the staging directory must be at the name')
+  assert.equal(existsSync(join(plant.data, 'd.moved/f')), true, 'and the real directory renamed aside')
+
+  assert.equal(ctimeOf(join(plant.data, 'd')), readFileSync(witness, 'utf8'),
+    'a directory swapped in after the open may not be handed over by a name resolved a second time')
+  // AND THE PINNED DIRECTORY WAS STILL WALKED, under whatever name it now wears: the descriptor is
+  // the subject, so the recursion followed the inode the walk opened and not the name it came by.
+  const reached = touched(before, ctimes(plant.data))
+  assert.ok(reached.includes('d.moved'), `the directory the walk pinned must be handed over: ${reached.join(' ')}`)
+  assert.ok(reached.includes('d.moved/f'), `and descended into: ${reached.join(' ')}`)
+
+  // MEASURED BY MUTATION, ROUTE STATED: the pre-r20 per-entry handling, whose failed `O_DIRECTORY`
+  // open falls back to `lchown` of the name.
+  const mutant = plantStateRoot(t, 'ims-secops-r20-recursion-mutant-')
+  mkdirSync(join(mutant.data, 'd'))
+  writeFileSync(join(mutant.data, 'd/f'), 'inside\n')
+  writeFileSync(join(mutant.data, 'plainfile'), 'plain\n')
+  writeFileSync(join(mutant.data, STAGE_DIRNAME, 'publish.xyz'), 'DATABASE_URL=secret\n')
+  const mutantWitness = join(mutant.base, 'witness')
+  const mutated = runWalk(mutant.data, LOCK_DIRNAME, {
+    helper: walkerBeforeR20(t),
+    env: { SWAP_BASE: mutant.data, SWAP_NAME: 'd', SWAP_STAGING: STAGE_DIRNAME, SWAP_WITNESS: mutantWitness },
+  })
+  assert.match(mutated.stdout, /^rc=0$/m, mutated.stderr)
+  assert.equal(existsSync(mutantWitness), true, `both stages must have fired under the mutant: ${mutated.stderr}`)
+  assert.notEqual(ctimeOf(join(mutant.data, 'd')), readFileSync(mutantWitness, 'utf8'),
+    'the fallback after a failed O_DIRECTORY open hands the staging directory over — the same gap, one branch further along')
+})
+
+test('[o3d-secops r20] the walker proves it has O_PATH rather than assuming it, and refuses when the flag is ignored', (t) => {
+  /**
+   * `open(2)` IGNORES flag bits it does not know. A kernel without O_PATH would therefore hand this
+   * walk ORDINARY read descriptors and say nothing — and the walk would then block forever on the
+   * first fifo in ${DATA_DIR} and refuse the first symlink. The proof is one `fchown()` on the root
+   * descriptor: EBADF means O_PATH, anything else means it was ignored.
+   *
+   * ROUTE: the shipped file with O_PATH set to zero, which is exactly what a kernel that ignored
+   * the flag would produce.
+   */
+  const shipped = readFileSync(CHOWN_TREE, 'utf8')
+  const declaration = 'const O_PATH = 0o010000000'
+  assert.ok(shipped.includes(declaration), `precondition: the walker must spell O_PATH itself:\n${shipped}`)
+  const helper = join(createTempDirSync('ims-secops-r20-nopath-', t), 'chown-tree-nopath.mjs')
+  writeFileSync(helper, shipped.replace(declaration, 'const O_PATH = 0'))
+
+  const plant = plantStateRoot(t, 'ims-secops-r20-nopath-tree-')
+  const before = ctimes(plant.data)
+  pause(30)
+  const run = runWalk(plant.data, LOCK_DIRNAME, { helper })
+  assert.match(run.stdout, /^rc=1$/m, `a walk without O_PATH must refuse: ${run.stderr}`)
+  assert.match(run.stderr, /O_PATH/, run.stderr)
+  assert.deepEqual(touched(before, ctimes(plant.data)).filter((path) => path !== '.'), [],
+    'and refuse before it walks anything, not part of the way through')
+
+  // NOT VACUOUS: the identical fixture under the SHIPPED file walks the tree.
+  const ok = runWalk(plant.data, LOCK_DIRNAME)
+  assert.match(ok.stdout, /^rc=0$/m, ok.stderr)
+})
+
+test('[o3d-secops r20] a fifo in the state directory is re-owned without the walk opening it for reading', (t) => {
+  /**
+   * The r20 fix opens EVERY entry, where the retired construct opened only directories. That is
+   * only safe because O_PATH does not open the file: an ordinary `open()` of a fifo with no writer
+   * blocks until one arrives, which in ${DATA_DIR} would hang the installer for ever. The fixture
+   * is a fifo nothing will ever write to.
+   *
+   * ROUTE: the shipped walker, under the harness deadline, over a tree containing one.
+   */
+  const plant = plantStateRoot(t, 'ims-secops-r20-fifo-')
+  const made = runBash(`mkfifo ${q(join(plant.data, 'pipe'))}`)
+  assert.equal(made.status, 0, `precondition: the fixture needs a fifo: ${made.stderr}`)
+  assert.equal(lstatSync(join(plant.data, 'pipe')).isFIFO(), true, 'and it must really be one')
+
+  const before = ctimes(plant.data)
+  pause(30)
+  const run = runWalk(plant.data, LOCK_DIRNAME)
+  assert.match(run.stdout, /^rc=0$/m, `the walk must not block on a fifo: ${run.stderr}`)
+  const reached = touched(before, ctimes(plant.data))
+  assert.ok(reached.includes('pipe'), `and the fifo is handed over like any other entry: ${reached.join(' ')}`)
 })
 
 // ---------------------------------------------------------------------------

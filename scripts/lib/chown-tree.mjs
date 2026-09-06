@@ -84,6 +84,53 @@
  * about a directory whose contents become reachable — and never to the root itself, which must be
  * handed over and is chowned before the walk begins.
  *
+ * AND UNTIL o3d-secops r20 THE PRUNE WAS DECIDED ON ONE LOOKUP AND THE CHANGE MADE ON ANOTHER
+ * (Codex HIGH). The shape prune above is only ever consulted when the walk has decided the entry is
+ * a DIRECTORY, and that decision used to come from an `lstat()` OF THE NAME. An entry that looked
+ * like anything else took the other branch, which `lchown()`ed THE SAME NAME a moment later:
+ *
+ *     entry = lstatSync(at(dirFd, name))          // "a regular file"
+ *     if (!entry.isDirectory()) { chownEntry(dirFd, name); continue }   // resolves the name AGAIN
+ *
+ * Two lookups of one name, with the account that owns the parent live in between — which is the
+ * whole premise of this file, applied everywhere except here. That account plants a sacrificial
+ * regular file, waits for the walk to reach it, and renames a directory onto the name in the gap:
+ * `rename(2)` within one parent needs no permission on what is being moved, so the directory it
+ * renames in may be the staging directory, or the debris of an interrupted publication, or the
+ * crontab lock. `lchown()` differs from `chown()` only on a SYMLINK; on a directory it does exactly
+ * what `chown` does. The prune therefore never ran, and the walk handed over the one thing it
+ * exists to withhold — without descending, so the entry did not even appear as a directory in what
+ * the run reported.
+ *
+ * THE SAME GAP WAS IN THE DIRECTORY BRANCH, one step further along. When the `O_DIRECTORY` open of
+ * an entry `lstat` had called a directory failed with ENOTDIR or ELOOP — the swap in the other
+ * direction — the code fell back to `chownEntry(dirFd, name)`, the identical second lookup, and a
+ * directory renamed in after THAT failure was chowned by name with no prune consulted either.
+ *
+ * SO NO ENTRY IS NAMED TWICE ANY MORE. Every entry — directory, file, symlink, fifo, socket,
+ * device — is OPENED once with `O_PATH | O_NOFOLLOW` from its parent's descriptor; `fstat()` on
+ * that descriptor answers what it is, what its mode and owner are and which inode it is; both
+ * prunes are applied to THAT answer; and the ownership change is aimed at the descriptor. There is
+ * no second resolution for a rename to get between, so an entry swapped from a file to a directory
+ * — or from a directory to a file — between the walk noticing it and the walk acting on it is
+ * simply the thing the descriptor holds, and it faces the prunes like any other.
+ *
+ * WHY `O_PATH`, AND WHY THE CHANGE IS STILL AIMED AT A DESCRIPTOR. `O_PATH` opens the entry for
+ * METADATA ALONE: it needs no read permission, it does not block on a fifo or a device, and with
+ * `O_NOFOLLOW` it opens a SYMLINK ITSELF rather than failing with ELOOP — which is what lets one
+ * primitive cover every type and removes the last by-name case. Node has no `fchownat()` and
+ * `fchown()` on an `O_PATH` descriptor is EBADF by design, so the change is made through
+ * `/proc/self/fd/N`, which the kernel resolves to THE OPEN FILE and not to a pathname — the same
+ * mechanism this file already descends by, and the same one tests/temp-dir-sentinel.ts pins its
+ * chmods with. On a symlink that is verified NOT to follow the link: the link's own ownership
+ * changes and its target's does not, exactly as `chown -h` promised.
+ *
+ * AND `O_PATH` IS PROVEN AT RUNTIME, NOT ASSUMED. `open(2)` IGNORES flag bits it does not know, so
+ * a kernel without `O_PATH` would hand back ORDINARY read descriptors — which would block forever
+ * on a fifo and fail with ELOOP on a symlink. The root descriptor is therefore asked for an
+ * `fchown()` first: on a real `O_PATH` descriptor that is EBADF, and anything else means the flag
+ * was ignored and this run REFUSES rather than walking with a primitive it does not have.
+ *
  * FAILURE IS FATAL. Every error other than "the entry is gone" or "it is not a directory any more"
  * ends the process non-zero; the caller dies. A partial ownership change that reported success is
  * how a service ends up unable to read its own state directory.
@@ -93,7 +140,7 @@
  *        privileged-and-private prune above is not switchable: it is the security boundary, and an
  *        argument that could turn it off is an argument somebody will get wrong.
  */
-import { closeSync, fchownSync, fstatSync, lchownSync, lstatSync, openSync, readdirSync, statSync } from 'node:fs'
+import { chownSync, closeSync, fchownSync, fstatSync, openSync, readdirSync, statSync } from 'node:fs'
 import { constants } from 'node:fs'
 
 /** Deeper than any state directory this application creates, and shallow enough that the recursion
@@ -135,10 +182,25 @@ try {
   die(`/proc/self/fd is not available (${error && error.message}), so this run cannot address a directory by the descriptor it holds on it. It will not fall back to changing ownership by pathname, which is the defect this exists to remove. Mount /proc.`)
 }
 
-const OPEN_DIR = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW | (constants.O_NOCTTY ?? 0)
+/** Linux's, and Node does not export it — tests/temp-dir-sentinel.ts spells the same constant for
+ *  the same reason. It opens an entry for METADATA ALONE: no read permission is needed, a fifo or a
+ *  device does not block, and with O_NOFOLLOW a SYMLINK opens as itself instead of failing ELOOP.
+ *  That is what makes ONE open cover every type an entry can be, which is what removes the last
+ *  ownership change this walk made by name. */
+const O_PATH = 0o010000000
+/** ONE OPEN PER ENTRY, WHATEVER IT IS. No O_DIRECTORY: the point is that the walk finds out what
+ *  the entry is from the descriptor it already holds on it, rather than deciding from a name and
+ *  acting on the name again. */
+const OPEN_ENTRY = O_PATH | constants.O_NOFOLLOW
+/** The same, asserted to be a directory — used only for the identity prune's one lookup at the
+ *  root, where a non-directory is not the thing being protected. */
+const OPEN_DIR = O_PATH | constants.O_DIRECTORY | constants.O_NOFOLLOW
 /** The kernel resolves this prefix to the OPEN FILE, so what follows it is resolved from that
  *  directory and from nowhere else. This is the whole mechanism. */
 const at = (dirFd, name) => `/proc/self/fd/${dirFd}/${name}`
+/** And with nothing after it, it IS the open file: a chown through this changes the inode the
+ *  descriptor holds, with no name resolved on the way and nothing for a rename to redirect. */
+const held = (fd) => `/proc/self/fd/${fd}`
 const identity = (stats) => `${stats.dev}:${stats.ino}`
 
 /** THE UID THIS WALK RUNS AS — asked, exactly as publish_durable_file() asks `id -u` instead of
@@ -162,11 +224,26 @@ const SELF_UID = process.getuid()
 const privilegedAndPrivate = (stats) => stats.uid === SELF_UID && (stats.mode & 0o777) === 0o700
 
 /** GONE, or NO LONGER A DIRECTORY — the two outcomes a concurrent rename can produce that are not
- *  this program's problem. Anything else is. */
+ *  this program's problem. Anything else is. openEntry() can only ever meet the first of them,
+ *  because `O_PATH | O_NOFOLLOW` opens an entry of any type; the other two remain because
+ *  openChildDir() asserts O_DIRECTORY and can still be answered ENOTDIR or ELOOP. */
 const RACED = new Set(['ENOENT', 'ELOOP', 'ENOTDIR'])
 
-/** Opens one component from a descriptor its parent holds. Returns null if the entry raced away or
- *  stopped being a directory; dies on anything else. */
+/** Opens one component from a descriptor its parent holds, WHATEVER TYPE IT IS. Returns null if
+ *  the entry raced away; dies on anything else. This is the only lookup of the name that happens:
+ *  everything after it — the type, the mode, the owner, the inode, the prunes and the ownership
+ *  change — is asked of the descriptor this returns. */
+const openEntry = (dirFd, name) => {
+  try {
+    return openSync(at(dirFd, name), OPEN_ENTRY)
+  } catch (error) {
+    if (RACED.has(error.code)) return null
+    die(`${name} below ${root} could not be opened: ${error.code ?? error.message}. Nothing further has been changed.`)
+  }
+  return null
+}
+
+/** Opens one component and INSISTS it is a directory — the identity prune's single lookup. */
 const openChildDir = (dirFd, name) => {
   try {
     return openSync(at(dirFd, name), OPEN_DIR)
@@ -177,12 +254,16 @@ const openChildDir = (dirFd, name) => {
   return null
 }
 
-/** fchownat(dirFd, name, uid, gid, AT_SYMLINK_NOFOLLOW). A symlink here has its OWN ownership
- *  changed, exactly as `chown -h` promised and unlike `chown`, which would follow it. */
-const chownEntry = (dirFd, name) => {
+/** THE OWNERSHIP CHANGE, AIMED AT THE INODE THE DESCRIPTOR HOLDS. `fchown()` is EBADF on an
+ *  `O_PATH` descriptor, so this goes through the descriptor's own /proc name, which the kernel
+ *  resolves to the open file rather than resolving a path. On a symlink that changes THE LINK and
+ *  not its target — exactly what `chown -h` promised and what `lchown` did, without a second
+ *  lookup of the name for a rename to get between. */
+const chownPinned = (fd, name) => {
   try {
-    lchownSync(at(dirFd, name), uid, gid)
+    chownSync(held(fd), uid, gid)
   } catch (error) {
+    // The entry was unlinked between the open and this; there is no directory entry left to own.
     if (error.code === 'ENOENT') return
     die(`the ownership of ${name} below ${root} could not be changed: ${error.code ?? error.message}. Nothing further has been changed.`)
   }
@@ -196,6 +277,21 @@ const rootFd = (() => {
   }
   return -1
 })()
+
+// O_PATH IS PROVEN BEFORE ANYTHING IS WALKED WITH IT. open(2) silently IGNORES flag bits it does
+// not recognise, so a kernel without O_PATH hands back ordinary read descriptors and says nothing —
+// and this walk would then block forever on the first fifo and die on the first symlink. fchown()
+// on a real O_PATH descriptor is EBADF whatever the permissions are, and on an ordinary one it is
+// not; so the answer to this one call is the answer to "do I have the primitive". Anything but
+// EBADF is a refusal, including a SUCCESS: a descriptor that accepts fchown is not an O_PATH one.
+try {
+  fchownSync(rootFd, uid, gid)
+  die(`this kernel accepted fchown() on what should be an O_PATH descriptor for ${root}, so the O_PATH flag was ignored and every entry below would be opened for real — which blocks on a fifo and refuses a symlink. This run will not walk by pathname instead. Nothing further has been changed.`)
+} catch (error) {
+  if (error.code !== 'EBADF') {
+    die(`O_PATH is not available on this kernel (fchown on the descriptor for ${root} answered ${error.code ?? error.message}, not EBADF), so this run cannot open an entry of every type without following a link or blocking on it. It will not fall back to changing ownership by pathname, which is the defect this exists to remove.`)
+  }
+}
 
 // THE PROTECTED SUBTREE, BY IDENTITY RATHER THAN BY NAME. Opened once, from the root's own
 // descriptor, and recorded as a device and an inode: a directory the walk meets later that IS this
@@ -225,49 +321,36 @@ const walk = (dirFd, depth) => {
   }
   for (const name of names) {
     if (depth === 0 && pruneAtRoot !== '' && name === pruneAtRoot) continue
-    let entry
+    // THE NAME IS RESOLVED ONCE, HERE, AND NEVER AGAIN. Whatever the entry turns out to be — a
+    // directory, a file, a symlink, a fifo — this descriptor holds THAT inode, so the type check
+    // below and the ownership change after it are questions about one object rather than two
+    // lookups of one name with the parent's owner live in between (o3d-secops r20).
+    const entryFd = openEntry(dirFd, name)
+    if (entryFd === null) continue
     try {
-      entry = lstatSync(at(dirFd, name))
-    } catch (error) {
-      if (RACED.has(error.code)) continue
-      die(`${name} below ${root} could not be examined: ${error.code ?? error.message}. Nothing further has been changed.`)
-    }
-    if (!entry.isDirectory()) {
-      chownEntry(dirFd, name)
-      continue
-    }
-    const childFd = openChildDir(dirFd, name)
-    if (childFd === null) {
-      // It was a directory when it was examined and is not one now — which is precisely the rename
-      // this program exists to be indifferent to. Whatever is at the name gets its OWN ownership
-      // changed, and nothing is descended into.
-      chownEntry(dirFd, name)
-      continue
-    }
-    try {
-      // ONE fstat, ASKED OF THE DESCRIPTOR THIS PROCESS HOLDS, answering both prunes. Neither is a
-      // question about the name the entry was reached by, so neither can be defeated by a rename:
-      // the first is the lock directory's recorded identity, the second the shape of a directory
-      // the privileged side made and kept — a live staging directory, or the debris of a
-      // publication a SIGKILL interrupted between the fill and the rename.
-      const stats = fstatSync(childFd)
-      if (protectedIds.has(identity(stats))) continue
-      if (privilegedAndPrivate(stats)) continue
-      // AIMED AT THE DESCRIPTOR, not at the name it was reached by: fchown(2) takes no path at all.
-      try {
-        fchownSync(childFd, uid, gid)
-      } catch (error) {
-        die(`the ownership of a directory below ${root} could not be changed: ${error.code ?? error.message}. Nothing further has been changed.`)
+      // ONE fstat, ASKED OF THE DESCRIPTOR THIS PROCESS HOLDS, answering the type AND both prunes.
+      // None of the three is a question about the name the entry was reached by, so none can be
+      // defeated by a rename: the first is the lock directory's recorded identity, the second the
+      // shape of a directory the privileged side made and kept — a live staging directory, or the
+      // debris of a publication a SIGKILL interrupted between the fill and the rename.
+      const stats = fstatSync(entryFd)
+      // THE PRUNES ARE ABOUT DIRECTORIES, and they are asked of what the descriptor IS rather than
+      // of what the name looked like a moment ago. A file the walk was about to hand over, swapped
+      // for the staging directory in the gap, arrives here as a directory and is withheld.
+      if (stats.isDirectory()) {
+        if (protectedIds.has(identity(stats))) continue
+        if (privilegedAndPrivate(stats)) continue
       }
-      walk(childFd, depth + 1)
+      chownPinned(entryFd, name)
+      if (stats.isDirectory()) walk(entryFd, depth + 1)
     } finally {
-      closeSync(childFd)
+      closeSync(entryFd)
     }
   }
 }
 
 try {
-  fchownSync(rootFd, uid, gid)
+  chownSync(held(rootFd), uid, gid)
 } catch (error) {
   die(`the ownership of ${root} itself could not be changed: ${error.code ?? error.message}. Nothing has been changed.`)
 }
