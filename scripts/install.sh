@@ -7845,7 +7845,13 @@ if ! (
 ); then
   die "The ownership of ${LOG_DIR} could not be set; the reason is above. Nothing has been started."
 fi
-chown -R "${APP_USER}:${APP_USER}" "${UPLOAD_STORAGE_DIR}" "${PUBLIC_UPLOAD_STORAGE_DIR}"
+# AND THE TWO STORAGE ROOTS ARE NOT CHOWNED A SECOND TIME (o3d-n8xx). There used to be a
+# `chown -R "${APP_USER}:${APP_USER}" "${UPLOAD_STORAGE_DIR}" "${PUBLIC_UPLOAD_STORAGE_DIR}"` here.
+# Both are ${DATA_DIR}/uploads and ${DATA_DIR}/public-uploads — inside the tree the walk above has
+# just handed over in full, and pruned by neither name — so it did nothing the walk had not already
+# done, and it did it with a `chown -R` that DEREFERENCES ITS OPERAND, at two names inside a
+# directory ${APP_USER} owns. That is the shape the ${LOG_DIR} note below is about, at two more
+# sites, for no effect. A redundant root-side operation is not free: it is one more name to aim.
 
 # THE CRONTAB RECONCILIATION LOCK, prepared here and defined in scripts/lib/crontab-lock.sh.
 #

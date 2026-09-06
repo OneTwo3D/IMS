@@ -5083,6 +5083,18 @@ test('[o3d-n8xx] an ordinary install and the upgrade after it both complete thro
     `the upgrade must hand the ordinary tree over: ${reached.join(' ')}`)
   assert.ok(!reached.some((path) => path.split('/').includes(LOCK_DIRNAME) || path.split('/').includes(STAGE_DIRNAME)),
     `and neither protected subtree, at either depth: ${reached.join(' ')}`)
+  // AND THE TWO STORAGE ROOTS COME WITH IT (o3d-n8xx). There was a second
+  // `chown -R … "${UPLOAD_STORAGE_DIR}" "${PUBLIC_UPLOAD_STORAGE_DIR}"` after this walk. Both are
+  // INSIDE ${DATA_DIR} and neither is pruned, so it did nothing the walk had not done — with a
+  // `chown -R` that dereferences its operand, at two names the service account owns. It is gone,
+  // and this is the assertion that says the walk really did cover what it was doing.
+  assert.ok(reached.includes('uploads') && reached.includes('public-uploads'),
+    `the storage roots must be handed over by the walk itself: ${reached.join(' ')}`)
+  // THE CODE, NOT THE COMMENT that explains why the line went: a check over the whole file would
+  // match its own explanation and pass whatever the script did.
+  const installCode = INSTALL_SH.split('\n').filter((line) => !line.trimStart().startsWith('#'))
+  assert.ok(!installCode.some((line) => /^chown -R\b/.test(line) && line.includes('UPLOAD_STORAGE_DIR')),
+    `and the redundant second chown of them must not come back:\n${installCode.filter((l) => l.includes('UPLOAD_STORAGE_DIR')).join('\n')}`)
 
   // MEASURED BY MUTATION, ROUTE STATED: the guard that holds ${CRONTAB_LOCK_DIR} to
   // ${DATA_DIR}/${CRONTAB_LOCK_DIRNAME} removed, and the lock path composed from a name the walk is

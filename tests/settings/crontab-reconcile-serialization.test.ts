@@ -1008,11 +1008,23 @@ test('[o3d-batch-ret] every crontab writer in the repository is inside the one e
     ['scripts/lib/crontab-lock.sh', 'scripts/lib/crontab-lock.sh'],
     'the two `chown -h root:root` calls in prepare_crontab_lock — the directory and the file — and '
     + 'no entrypoint may have grown one of its own')
+  // A `chown` COMMAND, not any word beginning with those five letters (o3d-n8xx). The rule is that
+  // no root-side ownership change may name the service account and a lock path in the same
+  // statement; `chown_state_tree "${DATA_DIR}" "${APP_USER}" "${CRONTAB_LOCK_DIRNAME}" …` names both
+  // and is the OPPOSITE of the defect — the lock name is its PRUNE argument, which is what keeps
+  // the lock out of the walk. `\bchown\b` tells the two apart, because `_` is a word character, and
+  // the prune's own correctness is asserted where it can be measured rather than spelled: see
+  // tests/scripts/install-root-safe-writes.test.ts, which runs the shipped walk over a real tree
+  // and requires the lock directory's ctime to be unchanged afterwards.
   for (const [name, src] of [['scripts/lib/crontab-lock.sh', CRONTAB_LOCK_LIB_SRC] as [string, string],
     ...SHELL_ENTRYPOINTS]) {
-    assert.doesNotMatch(src, /chown[^\n]*\$\{APP_USER\}[^\n]*\$\{CRONTAB_LOCK_/,
+    assert.doesNotMatch(src, /\bchown\b[^\n]*\$\{APP_USER\}[^\n]*\$\{CRONTAB_LOCK_/,
       `${name}: the lock must never be handed to the service user — that is what made an installer `
       + 're-run a privilege-escalation primitive (r24 CRITICAL)')
+    // NOT VACUOUS: the rule still fires on the statement it is about, appended to the same source.
+    assert.match(`${src}\nchown "\${APP_USER}:\${APP_USER}" "\${CRONTAB_LOCK_DIR}"\n`,
+      /\bchown\b[^\n]*\$\{APP_USER\}[^\n]*\$\{CRONTAB_LOCK_/,
+      `${name}: the guard must still catch a real chown of the lock path`)
   }
   assert.ok(
     installLines.findIndex((l) => l === 'prepare_crontab_lock') < taken,
