@@ -83,17 +83,28 @@ export type RefundFigureSurface = {
 // the export route, so the page and the file cannot drift apart on what the figure means.
 // ---------------------------------------------------------------------------------------------
 
-/** Sales report: order-level totals, no refund loaded at all. */
-export const REFUND_BLIND_NOTICE_SALES =
-  'Refunds are NOT deducted: these are order totals as invoiced, so a credited or returned order still contributes its full revenue, tax, shipping and discount. Use the Returns report for credit values, and Sales Statistics for a refund-aware net revenue.'
+/**
+ * o3d-kyey REPLACED THE THREE `REFUND_BLIND_NOTICE_*` SENTENCES THESE REPORTS CARRIED.
+ *
+ * Round 5 declared the blindness rather than fixing it, on the grounds that a stated property beats
+ * an oversight. It does — and a stated defect is still a defect. The three reports now bucket every
+ * credit by its stamped basis, subtract only the bucket that is the same unit as the figure, publish
+ * the rest beside it and mark what the figure then is. The sentences below say what the reader is
+ * now looking at, and each one leads with WHICH CREDIT WAS TAKEN OFF, because "net of refunds" with
+ * no basis named is the ambiguity that produced the original defect.
+ */
 
-/** Customer Mix: revenue/gross profit/share from SalesOrder.totalBase. */
-export const REFUND_BLIND_NOTICE_CUSTOMER_MIX =
-  'Refunds are NOT deducted: customer revenue, gross profit and share of revenue are built from order totals as invoiced, so a customer who returned everything still ranks on what they originally bought. Use Sales Statistics for a refund-aware net revenue.'
+/** Sales report: order totals as invoiced, with a gross-basis net figure beside them. */
+export const REFUND_BASIS_NOTICE_SALES =
+  'Revenue, tax, shipping and discount are order totals AS INVOICED, so they still reconcile to SalesOrder totals; a credited order keeps its full invoiced value in those columns. Net revenue beside them deducts the credit recorded on the same VAT-inclusive basis, and the net/unproven-basis credit columns carry what could not be deducted — where they are non-zero, net revenue is marked as at most (≤) the true figure. Rows are ranked on net revenue.'
 
-/** Gross Margin: ex-VAT dispatched line revenue against posted COGS. */
-export const REFUND_BLIND_NOTICE_GROSS_MARGIN =
-  'Refunds are NOT deducted: revenue, gross profit, margin and contribution are built from dispatched sales-line revenue, so a fully credited sale still shows its original revenue and margin here. Use Sales Statistics for a refund-aware net revenue and its stated bounds.'
+/** Customer Mix: gross revenue as invoiced, plus a gross-basis net figure and an ex-VAT profit. */
+export const REFUND_BASIS_NOTICE_CUSTOMER_MIX =
+  'Revenue is order totals AS INVOICED (VAT-inclusive). Net revenue deducts the credit recorded on that same gross basis, and share of revenue is measured on it, so a customer who returned everything no longer ranks on what they originally bought. Gross profit is measured on the EX-VAT revenue less the net-basis credit, because COGS is ex-tax — it is NOT revenue minus gross profit. Credit that could not be placed on a figure’s basis is listed beside it and marks that figure as at most (≤) the true one.'
+
+/** Gross Margin: ex-VAT dispatched line revenue, net of net-basis credit, against posted COGS. */
+export const REFUND_BASIS_NOTICE_GROSS_MARGIN =
+  'Revenue is dispatched ex-VAT sales-line revenue LESS the net-basis credit raised in the period, so a fully credited sale no longer shows its original revenue and margin. Gross-basis and unproven-basis credit is reported but not deducted, and marks revenue and gross profit as at most (≤) the true figures; margin and contribution are ratios whose numerator and denominator both move, so they are marked (?) instead — a bound exists but its direction is not established.'
 
 /** COGS / inventory-turnover: revenue attributed back to the original sales line. */
 export const REFUND_BLIND_NOTICE_COGS_MARGIN =
@@ -113,10 +124,10 @@ export const RETURNS_MIXED_BASIS_NOTICE =
 export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   {
     file: 'app/(dashboard)/analytics/_components/sales-analytics-page-utils.ts',
-    figures: ['grossProfitBase', 'loadMarginAnalyticsReportForPage', 'margin', 'marginPct', 'revenue', 'revenueBase'],
-    treatment: 'refund-blind',
+    figures: ['grossProfitBase', 'grossProfitBaseBound', 'loadMarginAnalyticsReportForPage', 'margin', 'marginPct', 'marginPctBound', 'netRevenue', 'netRevenueBase', 'netRevenueBaseBound', 'netRevenueBound', 'netRevenueExVatBase', 'revenue', 'revenueBase', 'revenueBaseBound'],
+    treatment: 'basis-aware',
     reason:
-      'Loader/empty-totals shim for the six sales analytics reports. It carries their figure names but computes nothing; the treatment is the producer’s, and the empty-totals fallback publishes zeroes only when the source scan was refused, which the page states separately.',
+      'Loader/empty-totals shim for the six sales analytics reports. It carries their figure names but computes nothing; the treatment is the producer’s, and the empty-totals fallback publishes zeroes (with exact bounds) only when the source scan was refused, which the page states separately.',
   },
   {
     file: 'app/(dashboard)/analytics/_components/sales-analytics-report.tsx',
@@ -134,10 +145,10 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'app/(dashboard)/analytics/customers/page.tsx',
-    figures: ['grossProfitBase', 'profit', 'revenue', 'revenueBase', 'shareOfRevenuePct'],
-    treatment: 'refund-blind',
+    figures: ['grossProfitBase', 'grossProfitBaseBound', 'netRevenue', 'netRevenueBase', 'netRevenueBaseBound', 'netRevenueExVat', 'netRevenueExVatBase', 'netRevenueExVatBaseBound', 'profit', 'revenue', 'revenueBase', 'shareOfRevenuePct', 'shareOfRevenuePctBound'],
+    treatment: 'basis-aware',
     reason:
-      'Renders getCustomerAnalyticsReport revenue/gross profit/share. Refund-blind by the producer; the disclosure is carried in report.notices, which this page renders.',
+      'Renders getCustomerAnalyticsReport invoiced revenue, the gross-basis net revenue, the ex-VAT net revenue gross profit is measured on, the per-basis credit columns and every bound marker; gross profit renders as the withheld word where no cost was posted. o3d-kyey.',
   },
   {
     file: 'app/(dashboard)/analytics/inventory-turnover/page.tsx',
@@ -148,10 +159,10 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'app/(dashboard)/analytics/margin/page.tsx',
-    figures: ['grossProfitBase', 'margin', 'marginPct', 'profit', 'revenue', 'revenueBase'],
-    treatment: 'refund-blind',
+    figures: ['grossProfitBase', 'grossProfitBaseBound', 'margin', 'marginPct', 'marginPctBound', 'profit', 'revenue', 'revenueBase', 'revenueBaseBound'],
+    treatment: 'basis-aware',
     reason:
-      'Renders getMarginAnalyticsReport revenue/gross profit/margin/contribution. Refund-blind by the producer; the disclosure is carried in report.notices, which this page renders.',
+      'Renders getMarginAnalyticsReport revenue net of net-basis credit, gross profit, margin and contribution with their bound markers, the per-basis credit columns, and the credit that reached no product row. o3d-kyey.',
   },
   {
     file: 'app/(dashboard)/analytics/product-profitability/product-profitability-client.tsx',
@@ -169,24 +180,24 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'app/(dashboard)/analytics/sales-stats/sales-stats-client.tsx',
-    figures: ['avgMarginPct', 'avgMarginPctBound', 'avgOrderValue', 'grossProfit', 'grossRevenue', 'marginBoundTitle', 'marginPct', 'marginPctBound', 'netRevenue', 'netTotal', 'netTotalBasis', 'totalGrossProfit', 'totalGrossRevenue', 'totalNetRevenue'],
+    figures: ['avgMarginPct', 'avgMarginPctBound', 'avgOrderValue', 'grossProfit', 'grossRevenue', 'marginBoundTitle', 'marginPct', 'marginPctBound', 'netRevenue', 'netRevenueBound', 'netTotal', 'netTotalBasis', 'totalGrossProfit', 'totalGrossRevenue', 'totalNetRevenue'],
     treatment: 'basis-aware',
     reason:
-      'Renders every bounded sales-statistics figure, cards included, with the ratio marked separately from the linear figures.',
+      'Renders every bounded sales-statistics figure, cards included, with the ratio marked separately from the linear figures. o3d-7jfq: the linear cells and cards READ the producer\u2019s netRevenueBound instead of deriving \u2264 from refundBasisComplete, which is a boolean and could not say indeterminate.',
   },
   {
     file: 'app/(dashboard)/analytics/sales/page.tsx',
-    figures: ['revenue'],
-    treatment: 'refund-blind',
+    figures: ['netRevenue', 'netRevenueBound', 'revenue'],
+    treatment: 'basis-aware',
     reason:
-      'Renders getSalesAnalyticsReport revenue/tax/shipping/discount. Refund-blind by the producer; the disclosure is carried in report.notices, which this page renders.',
+      'Renders getSalesAnalyticsReport invoiced revenue/tax/shipping/discount AND the gross-basis net revenue beside it with its bound marker and the per-basis credit columns. The invoiced columns stay invoiced on purpose — this report’s stated contract is that its totals reconcile to SalesOrder totals. o3d-kyey.',
   },
   {
     file: 'app/(dashboard)/dashboard/dashboard-client.tsx',
-    figures: ['avgOrderValue', 'bestSellerMarginTitle', 'bestSellerRevenueTitle', 'compMarginPct', 'compMarginPctBound', 'compNetSales', 'compNetSalesUpperBound', 'grossSalesComparison', 'grossSalesCurrent', 'marginBoundComparison', 'marginBoundCurrent', 'marginChartTooltip', 'marginComparison', 'marginCurrent', 'marginPct', 'marginPctBound', 'marginTooltipFormatter', 'netRevenue', 'netRevenueBound', 'netSales', 'netSalesComparison', 'netSalesCurrent', 'netSalesTooltipFormatter', 'netSalesUpperBound', 'profitCurrent'],
+    figures: ['avgOrderValue', 'bestSellerMarginTitle', 'bestSellerRevenueTitle', 'compMarginPct', 'compMarginPctBound', 'compNetSales', 'compNetSalesBound', 'grossSalesComparison', 'grossSalesCurrent', 'marginBoundComparison', 'marginBoundCurrent', 'marginChartTooltip', 'marginComparison', 'marginCurrent', 'marginPct', 'marginPctBound', 'marginTooltipFormatter', 'netRevenue', 'netRevenueBound', 'netSales', 'netSalesBound', 'netSalesBoundComparison', 'netSalesBoundCurrent', 'netSalesComparison', 'netSalesCurrent', 'netSalesTooltipFormatter', 'profitCurrent'],
     treatment: 'basis-aware',
     reason:
-      'Renders the KPI cards, both chart tooltips per bucket, the cash-bridge bars and (round 5) the Best Sellers rows with their bound markers.',
+      'Renders the KPI cards, both chart tooltips per bucket, the cash-bridge bars and (round 5) the Best Sellers rows with their bound markers. o3d-7jfq: every linear \u2264 now reads a three-valued marker from the producer \u2014 the booleans it derived them from could not express indeterminate.',
   },
   {
     file: 'app/(dashboard)/sales/[id]/so-detail-client.tsx',
@@ -246,10 +257,10 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'app/actions/dashboard.ts',
-    figures: ['avgOrderValue', 'compMarginPct', 'compMarginPctBound', 'compNetSales', 'compNetSalesUpperBound', 'grossSales', 'grossSalesComparison', 'grossSalesCurrent', 'marginBoundComparison', 'marginBoundCurrent', 'marginComparison', 'marginCurrent', 'marginPct', 'marginPctBound', 'netRevenue', 'netRevenueBound', 'netSales', 'netSalesComparison', 'netSalesCurrent', 'netSalesUpperBound', 'profitCurrent'],
+    figures: ['avgOrderValue', 'compMarginPct', 'compMarginPctBound', 'compNetSales', 'compNetSalesBound', 'grossSales', 'grossSalesComparison', 'grossSalesCurrent', 'marginBoundComparison', 'marginBoundCurrent', 'marginComparison', 'marginCurrent', 'marginPct', 'marginPctBound', 'netRevenue', 'netRevenueBound', 'netSales', 'netSalesBound', 'netSalesBoundComparison', 'netSalesBoundCurrent', 'netSalesComparison', 'netSalesCurrent', 'profitCurrent'],
     treatment: 'basis-aware',
     reason:
-      'KPIs, chart buckets and (round 5) Best Sellers all bucket refunds by stamped basis, subtract only NET, and publish a bound.',
+      'KPIs, chart buckets and (round 5) Best Sellers all bucket refunds by stamped basis, subtract only NET, and publish a bound. o3d-7jfq: every bound comes from the unplaced credit\u2019s INTERVAL, recorded as each entry\u2019s positive part, so two opposite same-basis credits can no longer cancel into a \u2264.',
   },
   {
     file: 'app/actions/forecasting.ts',
@@ -288,10 +299,10 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'app/actions/sales-stats.ts',
-    figures: ['avgMarginPct', 'avgMarginPctBound', 'avgOrderValue', 'grossProfit', 'grossRevenue', 'marginPct', 'marginPctBound', 'netRevenue', 'netTotal', 'netTotalBasis', 'totalGrossProfit', 'totalGrossRevenue', 'totalNetRevenue'],
+    figures: ['avgMarginPct', 'avgMarginPctBound', 'avgOrderValue', 'grossProfit', 'grossRevenue', 'marginPct', 'marginPctBound', 'netRevenue', 'netRevenueBound', 'netTotal', 'netTotalBasis', 'totalGrossProfit', 'totalGrossRevenue', 'totalNetRevenue'],
     treatment: 'basis-aware',
     reason:
-      'The original basis-aware producer; round 5 moved its period totals and margin bound onto unrounded aggregates.',
+      'The original basis-aware producer; round 5 moved its period totals and margin bound onto unrounded aggregates. o3d-7jfq: it now PUBLISHES netRevenueBound for the three linear figures instead of leaving each consumer to re-derive it from two signed bucket columns.',
   },
   {
     file: 'app/actions/sales.ts',
@@ -331,11 +342,10 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'app/api/export/sales-analytics/route.ts',
-    figures: ['grossProfitBase', 'margin', 'marginPct', 'revenue', 'revenueBase', 'shareOfRevenuePct'],
-    treatment: 'refund-blind',
+    figures: ['grossProfitBase', 'grossProfitBaseBound', 'margin', 'marginPct', 'marginPctBound', 'netRevenue', 'netRevenueBase', 'netRevenueBaseBound', 'netRevenueBound', 'netRevenueExVatBase', 'netRevenueExVatBaseBound', 'revenue', 'revenueBase', 'revenueBaseBound', 'shareOfRevenuePct', 'shareOfRevenuePctBound'],
+    treatment: 'basis-aware',
     reason:
-      'Sales/customers/margin CSVs. Carry the producer’s disclosure as export metadata comment rows.',
-    disclosure: REFUND_BLIND_NOTICE_GROSS_MARGIN,
+      'Sales/customers/margin CSVs. Every net figure ships with its bound column and its per-basis credit columns beside it, and the producer’s basis notice travels as export metadata comment rows — a file reader has no tooltip.',
   },
   {
     file: 'lib/accounting.ts',
@@ -501,7 +511,7 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'lib/domain/sales/refund-basis-analytics.ts',
-    figures: ['margin', 'marginFigureBound', 'netRevenue', 'netTotal'],
+    figures: ['margin', 'marginFigureBound', 'marginFigureBoundDecimal', 'netRevenue', 'netTotal'],
     treatment: 'basis-aware',
     reason:
       'The classifier every basis-aware surface reads. Establishes the basis and the bound; converts nothing.',
@@ -522,11 +532,10 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'lib/domain/sales/sales-fulfillment-analytics.ts',
-    figures: ['getMarginAnalyticsReport', 'grossProfit', 'grossProfitBase', 'marginCogsBucket', 'marginGraph', 'marginPct', 'marginRequirementsByLine', 'revenue', 'revenueBase', 'revenueDecimal', 'shareOfRevenuePct', 'totalGrossProfit', 'totalRevenue', 'unitRevenue'],
-    treatment: 'refund-blind',
+    figures: ['emptyMarginGroup', 'getMarginAnalyticsReport', 'grossProfit', 'grossProfitBase', 'grossProfitBaseBound', 'marginCogsBucket', 'marginPct', 'marginPctBound', 'marginRefundLines', 'netRevenue', 'netRevenueBase', 'netRevenueBaseBound', 'netRevenueBound', 'netRevenueByGroup', 'netRevenueByKey', 'netRevenueExVat', 'netRevenueExVatBase', 'netRevenueExVatBaseBound', 'revenue', 'revenueBase', 'revenueBaseBound', 'revenueDecimal', 'revenueExVat', 'shareOfRevenuePct', 'shareOfRevenuePctBound', 'totalGrossProfit', 'totalRevenue', 'unitRevenue'],
+    treatment: 'basis-aware',
     reason:
-      'Sales, Customer Mix and Gross Margin publish revenue/profit/margin with NO refund loaded at all. Declared and disclosed here rather than fixed; the Returns report in the same module WAS fixed in round 5 because its defect was a mixed-basis sum used as a sort key.',
-    disclosure: REFUND_BLIND_NOTICE_GROSS_MARGIN,
+      'o3d-kyey fixed what round 5 had only declared. Sales, Customer Mix and Gross Margin now load the period’s credit, bucket it by its stamped basis, subtract only the bucket that is the same unit as the figure, publish the rest beside it, and mark each figure exact / ≤ / ? — ratios by their own case analysis, never from the linear flag. Customer Mix’s gross profit also moved onto the EX-VAT revenue (COGS is ex-tax) and is WITHHELD where no cost was posted.',
   },
   {
     file: 'lib/pdf.ts',

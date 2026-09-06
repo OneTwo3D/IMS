@@ -6,7 +6,6 @@ import { generateForecasts } from '@/app/actions/forecasting'
 import { toCsv, csvResponse } from '@/lib/csv'
 import { requireApiAuth } from '@/lib/auth/server'
 import { hasPermission } from '@/lib/permissions'
-import { netLinearFigureBound } from '@/lib/domain/sales/refund-basis-analytics'
 import {
   SUPPLIER_PAYMENT_AMOUNT_NOT_RECORDED,
   SUPPLIER_BILLED_WITH_PAYMENT_MARKER_BASIS,
@@ -43,8 +42,15 @@ export async function GET(req: NextRequest) {
       // (yes/no) is REPLACED rather than kept: a two-valued column cannot express `indeterminate`,
       // and a `no` there would read as "exact" on precisely the figure whose relation we cannot
       // establish. `cogs`, `orderCount` and the quantity columns are basis-independent and get none.
-      const linearBound = (r: { refundBasisComplete: boolean; refundsGrossBasis: number; refundsUnknownBasis: number }) =>
-        netLinearFigureBound({ basisComplete: r.refundBasisComplete, unplacedCredit: r.refundsGrossBasis + r.refundsUnknownBasis })
+      //
+      // o3d-7jfq: AND THE VERDICT IS THE PRODUCER'S, NOT THIS ROUTE'S. It used to be re-derived here
+      // from the two published bucket columns — `refundsGrossBasis + refundsUnknownBasis` — which is
+      // a SIGNED SUM: a product credited +120 on the gross basis and −120 on it again lands at zero,
+      // zero is not negative, and every column below printed `upper` about a figure that can sit on
+      // either side of the published one. Those columns are also ROUNDED by the time they arrive, so
+      // the classification was being made about a different number from the one the producer
+      // classified. The producer is the only place the individual credits still exist; it decides,
+      // and the file reads. The CSV's columns are unchanged — only where their values come from is.
       const data = rows.map((r) => ({
         sku: r.sku, name: r.name, type: r.type, stockUnit: r.stockUnit,
         barcode: r.barcode, mpn: r.mpn, lifecycleStatus: r.lifecycleStatus,
@@ -54,14 +60,14 @@ export async function GET(req: NextRequest) {
         refunds: r.refunds.toFixed(2),
         refundsGrossBasis: r.refundsGrossBasis.toFixed(2),
         refundsUnknownBasis: r.refundsUnknownBasis.toFixed(2),
-        netRevenue: r.netRevenue.toFixed(2), netRevenueBound: linearBound(r),
+        netRevenue: r.netRevenue.toFixed(2), netRevenueBound: r.netRevenueBound,
         cogs: r.cogs.toFixed(2),
-        grossProfit: r.grossProfit.toFixed(2), grossProfitBound: linearBound(r),
+        grossProfit: r.grossProfit.toFixed(2), grossProfitBound: r.netRevenueBound,
         // NOT linearBound: margin is a ratio whose numerator and denominator both move with the
         // unsubtracted credit, so it can be `indeterminate` on a row whose other three are `upper`.
         marginPct: r.marginPct, marginPctBound: r.marginPctBound,
         orderCount: r.orderCount,
-        avgOrderValue: r.avgOrderValue.toFixed(2), avgOrderValueBound: linearBound(r),
+        avgOrderValue: r.avgOrderValue.toFixed(2), avgOrderValueBound: r.netRevenueBound,
         salesPrice: r.salesPrice?.toFixed(2) ?? '', weight: r.weight ?? '',
       }))
       const headers = ['sku', 'name', 'type', 'stockUnit', 'barcode', 'mpn', 'lifecycleStatus', 'qtySold', 'qtyRefunded', 'netQty', 'grossRevenue', 'discounts', 'refunds', 'refundsGrossBasis', 'refundsUnknownBasis', 'netRevenue', 'netRevenueBound', 'cogs', 'grossProfit', 'grossProfitBound', 'marginPct', 'marginPctBound', 'orderCount', 'avgOrderValue', 'avgOrderValueBound', 'salesPrice', 'weight']

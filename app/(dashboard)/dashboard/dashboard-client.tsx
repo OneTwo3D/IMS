@@ -41,6 +41,25 @@ const UPPER_BOUND_TITLE_COMP = 'Upper bound: some refunds in the comparison peri
  */
 const MARGIN_INDETERMINATE_TITLE = 'Direction not established: margin divides two figures that BOTH move with the refunds this period could not subtract, so the true margin may be either side of this one. The figure is shown; the relation is not claimed.'
 
+/**
+ * o3d-7jfq: A LINEAR FIGURE CAN BE INDETERMINATE TOO, FOR A DIFFERENT REASON FROM MARGIN'S.
+ *
+ * Net Sales, Profit, Avg Order and the two chart series were marked straight off
+ * `refundBasisComplete` — a boolean, so the only things they could say were "exact" and `≤`. `≤`
+ * needs the unsubtracted credit to be NON-NEGATIVE, and a period credited +120 on the gross basis
+ * and −120 on it again has a signed bucket of zero and a true net that may be 120 ABOVE the
+ * published one. `netSalesBoundCurrent` / `netSalesBound` are the producer's verdict over the
+ * INTERVAL and carry the third case these could not express.
+ */
+const LINEAR_INDETERMINATE_TITLE = 'Direction not established: the credit this period could not subtract includes a NEGATIVE entry, so the true figure may be either side of this one. The figure is shown; the relation is not claimed.'
+const LINEAR_INDETERMINATE_TITLE_COMP = 'Direction not established: the credit the comparison period could not subtract includes a NEGATIVE entry, so the true figure may be either side of this one. The figure is shown; the relation is not claimed.'
+
+export function linearBoundTitle(bound: DerivedFigureBound, comparison = false): string | undefined {
+  if (bound === 'exact') return undefined
+  if (bound === 'indeterminate') return comparison ? LINEAR_INDETERMINATE_TITLE_COMP : LINEAR_INDETERMINATE_TITLE
+  return comparison ? UPPER_BOUND_TITLE_COMP : UPPER_BOUND_TITLE
+}
+
 function boundTitle(bound: DerivedFigureBound, comparison = false): string | undefined {
   if (bound === 'exact') return undefined
   if (bound === 'indeterminate') return MARGIN_INDETERMINATE_TITLE
@@ -83,17 +102,19 @@ export function marginChartTooltip(
  * basis-independent, and the Refunds bar is the NET-basis credit that WAS subtracted, so those four
  * are never marked. Module-level and pure so the marked set is assertable.
  */
-export function cashBridgeRows(kpi: KpiSummary): { name: string; value: number; fill: string; bounded: boolean }[] {
-  const bounded = !kpi.refundBasisCompleteCurrent
+export function cashBridgeRows(kpi: KpiSummary): { name: string; value: number; fill: string; bound: DerivedFigureBound }[] {
+  // o3d-7jfq: the RELATION, not a boolean. `!refundBasisCompleteCurrent` could only ever mean `≤`,
+  // and these two bars are the figures whose unsubtracted credit may be negative.
+  const bound = kpi.netSalesBoundCurrent
   return [
-    { name: 'Gross Sales', value: kpi.grossSalesCurrent, fill: 'hsl(221, 83%, 53%)', bounded: false },
-    { name: 'Discounts', value: -kpi.discountsCurrent, fill: 'hsl(25, 95%, 53%)', bounded: false },
+    { name: 'Gross Sales', value: kpi.grossSalesCurrent, fill: 'hsl(221, 83%, 53%)', bound: 'exact' },
+    { name: 'Discounts', value: -kpi.discountsCurrent, fill: 'hsl(25, 95%, 53%)', bound: 'exact' },
     // o3d-iigc: NET-basis credits only — the bridge must balance to Net Sales, and the two buckets
     // it could not absorb are surfaced on the Net Sales card instead.
-    { name: 'Refunds', value: -kpi.refundsCurrent, fill: 'hsl(0, 84%, 60%)', bounded: false },
-    { name: 'Net Sales', value: kpi.netSalesCurrent, fill: 'hsl(221, 83%, 63%)', bounded },
-    { name: 'COGS', value: -kpi.cogsCurrent, fill: 'hsl(0, 72%, 51%)', bounded: false },
-    { name: 'Margin', value: kpi.profitCurrent, fill: 'hsl(142, 71%, 45%)', bounded },
+    { name: 'Refunds', value: -kpi.refundsCurrent, fill: 'hsl(0, 84%, 60%)', bound: 'exact' },
+    { name: 'Net Sales', value: kpi.netSalesCurrent, fill: 'hsl(221, 83%, 63%)', bound },
+    { name: 'COGS', value: -kpi.cogsCurrent, fill: 'hsl(0, 72%, 51%)', bound: 'exact' },
+    { name: 'Margin', value: kpi.profitCurrent, fill: 'hsl(142, 71%, 45%)', bound },
   ]
 }
 
@@ -112,6 +133,13 @@ export function cashBridgeRows(kpi: KpiSummary): { name: string; value: number; 
  */
 export function bestSellerRevenueTitle(p: TopProduct, formatMoneyBase: (value: number) => string): string | undefined {
   if (p.netRevenueBound === 'exact') return undefined
+  // o3d-7jfq: THE AMOUNT IS ONLY THE WIDTH UNDER AN `upper` VERDICT. `upper` comes back exactly
+  // when no unplaced entry was negative, which is exactly when the two published buckets sum to the
+  // width; under `indeterminate` that same sum is a cancelled figure, and printing "£0.00 of credit
+  // … not subtracted" beside a figure that may be £120 out would be the defect wearing a number.
+  if (p.netRevenueBound === 'indeterminate') {
+    return 'Direction not established: some of the credit on this product that could not be subtracted is NEGATIVE, so the true figure may be either side of this one. The list order is by this figure, so the ranking carries the same uncertainty.'
+  }
   const unplaced = formatMoneyBase(p.refundsGrossBasis + p.refundsUnknownBasis)
   return `Upper bound: ${unplaced} of credit on this product is on the gross basis or has no proven basis, so it is not subtracted from this ex-VAT figure. The list order is by this figure, so the ranking carries the same bound.`
 }
@@ -241,9 +269,17 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
   const netSalesTooltipFormatter = (value: unknown, name: unknown, item?: { payload?: ChartPoint }): [string, string] => {
     const isComp = name !== 'netSales'
     const point = item?.payload
-    const bounded = point ? (isComp ? point.compNetSalesUpperBound : point.netSalesUpperBound) : false
+    // o3d-7jfq: three-valued, exactly as the margin tooltip beside it already is. A bucket whose
+    // unsubtracted credit contains a negative entry has no ceiling, and the boolean this read
+    // printed one anyway.
+    const bound: DerivedFigureBound = point ? (isComp ? point.compNetSalesBound : point.netSalesBound) : 'exact'
     const amount = fmtBaseFull(Number(value))
-    return [bounded ? `${amount} ≤ (upper bound — refunds not on the net basis are not subtracted)` : amount, isComp ? compLabel : periodLabel]
+    const note = bound === 'upper'
+      ? ' ≤ (upper bound — refunds not on the net basis are not subtracted)'
+      : bound === 'indeterminate'
+        ? ' ? (direction not established — some credit this bucket could not subtract is negative)'
+        : ''
+    return [`${amount}${note}`, isComp ? compLabel : periodLabel]
   }
   const marginTooltipFormatter = (value: unknown, name: unknown, item?: { payload?: ChartPoint }): [string, string] =>
     marginChartTooltip(value, name, item?.payload, periodLabel, compLabel)
@@ -299,9 +335,15 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
   }
 
   const bridge = cashBridgeRows(kpi)
-  const bridgeTooltipFormatter = (value: unknown, _name: unknown, item?: { payload?: { bounded?: boolean } }): [string, string] => {
+  const bridgeTooltipFormatter = (value: unknown, _name: unknown, item?: { payload?: { bound?: DerivedFigureBound } }): [string, string] => {
     const amount = fmtBaseFull(Math.abs(Number(value)))
-    return [item?.payload?.bounded ? `${amount} ≤ (upper bound — refunds not on the net basis are not subtracted)` : amount, '']
+    const bound = item?.payload?.bound ?? 'exact'
+    const note = bound === 'upper'
+      ? ' ≤ (upper bound — refunds not on the net basis are not subtracted)'
+      : bound === 'indeterminate'
+        ? ' ? (direction not established — some credit this period could not subtract is negative)'
+        : ''
+    return [`${amount}${note}`, '']
   }
 
   return (
@@ -342,7 +384,7 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
           {/* o3d-iigc round 4: avgOrderValue is netSalesCurrent / orders (app/actions/dashboard.ts), so
               it inherits net sales' upper bound EXACTLY — the divisor is a basis-independent count.
               It sat unmarked on the one card nobody expects to be bounded. */}
-          <p className={`text-[11px] mt-0.5 truncate ${kpi.refundBasisCompleteCurrent ? 'text-muted-foreground' : 'text-orange-600'}`} title={kpi.refundBasisCompleteCurrent ? undefined : UPPER_BOUND_TITLE}>{kpi.ordersCurrent} orders &middot; avg {fmtBaseFull(kpi.avgOrderValue)}{kpi.refundBasisCompleteCurrent ? '' : ' ≤'}</p>
+          <p className={`text-[11px] mt-0.5 truncate ${kpi.netSalesBoundCurrent === 'exact' ? 'text-muted-foreground' : 'text-orange-600'}`} title={linearBoundTitle(kpi.netSalesBoundCurrent)}>{kpi.ordersCurrent} orders &middot; avg {fmtBaseFull(kpi.avgOrderValue)}{boundSuffix(kpi.netSalesBoundCurrent)}</p>
         </Card>
         <Card className="p-3 sm:p-4">
           <div className="flex items-center justify-between">
@@ -355,7 +397,7 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
           </div>
           {/* o3d-iigc: when refundBasisCompleteCurrent is false this is an UPPER BOUND — refund value
               that is not on the net basis was left out of it rather than subtracted in the wrong unit. */}
-          <p className={`text-xl sm:text-2xl font-bold mt-1 ${kpi.refundBasisCompleteCurrent ? '' : 'text-orange-600'}`} title={kpi.refundBasisCompleteCurrent ? undefined : 'Upper bound: some refunds in this period are on the gross basis or have no proven basis, so they are not subtracted here'}>{fmtBase(kpi.netSalesCurrent)}{kpi.refundBasisCompleteCurrent ? '' : ' ≤'}</p>
+          <p className={`text-xl sm:text-2xl font-bold mt-1 ${kpi.netSalesBoundCurrent === 'exact' ? '' : 'text-orange-600'}`} title={linearBoundTitle(kpi.netSalesBoundCurrent)}>{fmtBase(kpi.netSalesCurrent)}{boundSuffix(kpi.netSalesBoundCurrent)}</p>
           <p className="text-[11px] text-muted-foreground mt-0.5 truncate">{kpi.discountsCurrent > 0 ? `${fmtBase(kpi.discountsCurrent)} discounts` : 'No discounts'} &middot; {kpi.refundsCurrent > 0 ? `${fmtBase(kpi.refundsCurrent)} refunds` : 'No refunds'}</p>
           {!kpi.refundBasisCompleteCurrent && (
             <p className="text-[11px] text-orange-600 mt-0.5 truncate" title="Refund value that is not on the net basis. It is reported here rather than folded into net sales, because subtracting a VAT-inclusive credit from an ex-VAT sales figure removes the VAT twice, and an unstamped credit cannot be placed at all.">
@@ -370,7 +412,7 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
           </div>
           <p className="text-xl sm:text-2xl font-bold mt-1">{fmtBase(kpi.cogsCurrent)}</p>
           {/* o3d-iigc: profit is net sales less COGS, so it inherits net sales' upper bound. */}
-          <p className={`text-[11px] mt-0.5 truncate ${kpi.refundBasisCompleteCurrent ? 'text-muted-foreground' : 'text-orange-600'}`} title={kpi.refundBasisCompleteCurrent ? undefined : UPPER_BOUND_TITLE}>Profit: {fmtBase(kpi.profitCurrent)}{kpi.refundBasisCompleteCurrent ? '' : ' ≤'}</p>
+          <p className={`text-[11px] mt-0.5 truncate ${kpi.netSalesBoundCurrent === 'exact' ? 'text-muted-foreground' : 'text-orange-600'}`} title={linearBoundTitle(kpi.netSalesBoundCurrent)}>Profit: {fmtBase(kpi.profitCurrent)}{boundSuffix(kpi.netSalesBoundCurrent)}</p>
         </Card>
         <Card className="p-3 sm:p-4">
           <div className="flex items-center justify-between">
@@ -610,7 +652,7 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
           {/* o3d-iigc round 4: the SAME netSalesComparison the Margin card already treats as bounded
               eight lines above — printed here bare. The order COUNT is basis-independent and stays
               unmarked; the money beneath it is not. */}
-          <p className={`text-[10px] ${kpi.refundBasisCompleteComparison ? 'text-muted-foreground' : 'text-orange-600'}`} title={kpi.refundBasisCompleteComparison ? undefined : UPPER_BOUND_TITLE_COMP}>{fmtBase(kpi.netSalesComparison)}{kpi.refundBasisCompleteComparison ? '' : ' ≤'}</p>
+          <p className={`text-[10px] ${kpi.netSalesBoundComparison === 'exact' ? 'text-muted-foreground' : 'text-orange-600'}`} title={linearBoundTitle(kpi.netSalesBoundComparison, true)}>{fmtBase(kpi.netSalesComparison)}{boundSuffix(kpi.netSalesBoundComparison)}</p>
         </Card>
       </div>
 

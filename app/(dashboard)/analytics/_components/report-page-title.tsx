@@ -34,8 +34,23 @@ export function ReportPageTitle({
         </TooltipTrigger>
         <TooltipContent className="max-w-md text-left whitespace-normal">
           <p>{description}</p>
+          {/*
+              LIGATURES OFF — AN AID, AND EXPLICITLY NOT THE ANSWER (o3d-7jfq r8, corrected r9).
+              A notice may carry a fixed-width identity token, `group=utf16hex:<4 hex digits per
+              code unit>`. A font that ligates `ff` into one glyph makes such a token LOOK a digit
+              shorter than it is, so suppressing ligatures here keeps the digit count honest for
+              anyone who glances at one. That costs nothing and it stays.
+
+              What it does NOT do is what round 8 implied it did. It addresses multi-character
+              ligatures; it cannot separate the single-glyph pairs `6`/`b`, `1`/`7` or `0`/`8`,
+              which is a different collision class entirely — so it was never a mitigation for the
+              residue `identityLabelField` names. The real answer is not a better rendering: the
+              same token is carried on the row and exported as the `groupToken` CSV column, so an
+              operator COPIES it or joins on it and never compares glyphs. See
+              `CustomerReportRow.groupToken`. Nothing here is load-bearing for identity.
+          */}
           {notices.length > 0 && (
-            <ul className="mt-2 space-y-1 border-t border-background/20 pt-2 text-[11px] leading-snug">
+            <ul className="mt-2 space-y-1 border-t border-background/20 pt-2 text-[11px] leading-snug [font-variant-ligatures:none]">
               {notices.map((notice) => (
                 <li key={notice}>{notice}</li>
               ))}
