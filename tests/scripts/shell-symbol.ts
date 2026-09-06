@@ -619,25 +619,129 @@ function functionBodyRanges(mask: string, where: string): Array<[number, number]
 }
 
 /**
- * Offsets in `mask` at which `name` is ASSIGNED — `name=`, `name+=`, with or without an `export`,
- * `readonly`, `declare`, `typeset` or `local` in front of it.
+ * EVERY ASSIGNMENT OPERAND IN `mask`, BY THE WORD RULE AND NOTHING ELSE (o3d-secops r5).
  *
- * Nothing in front is enumerated, for the reason {@link definitionOffsets} gives: what makes the
- * match ours is only that `name` STARTS A WORD, and a word starts after a metacharacter and nowhere
- * else. `export NAME=` and `readonly NAME=` are caught by that without being named; `$NAME=`,
- * `${NAME}` and `x_NAME=` are excluded by it, because in each the character in front joins the name
- * to something longer.
+ * This used to be a per-name forward regex, and the per-name form was the only form: a caller that
+ * wanted to know WHICH names a command assigns had nowhere to ask, so the sink census grew its own
+ * prefix-enumerating regex — `(?:local |export |readonly |declare [^ ]+ )*` — and that regex missed
+ * `declare ref=X` (no option word) and `local scratch=x ref=X` (a second operand). Both are the
+ * shape this function has never had to enumerate, so the answer is to make the general reading the
+ * one that exists and let the per-name query be a FILTER over it.
+ *
+ * THE RULE IS UNCHANGED AND IS STILL ONE SENTENCE: a name is assigned where it STARTS A WORD and is
+ * followed by `=` or `+=`. A word starts after a metacharacter and nowhere else, so `export NAME=`,
+ * `readonly -g NAME=`, `declare NAME=`, `typeset -r NAME=` and the second, third and fourth operand
+ * of any of them are all caught WITHOUT being named, and `$NAME=`, `${NAME}`, `x_NAME=`, `a[0]=`,
+ * `==`, `!=`, `<=` and `>=` are all excluded by it, because in each the byte in front either joins
+ * the name to something longer or is not a name byte at all.
+ *
+ * Read BACKWARDS from each `=` rather than forwards from a spelt-out name, which is what makes the
+ * general form possible; the two directions agree wherever the forward one matched, and the
+ * backward one additionally reads a name a line continuation splits (`; \<newline>NAME=`), which the
+ * forward one rejected because the byte in front of `N` was the continuation and not a metacharacter.
+ */
+type MaskAssignment = {
+  readonly name: string
+  /** Offset of the first byte of the name — the offset the per-name form has always returned. */
+  readonly nameOffset: number
+  /** Offset of the byte AFTER the `=`, where the assigned word begins. */
+  readonly valueOffset: number
+  readonly append: boolean
+}
+
+/** What a name may be spelt with. Bash's own: a letter or `_`, then letters, digits and `_`. */
+const ASSIGNMENT_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/
+
+const OPERAND_CACHE = new Map<string, MaskAssignment[]>()
+
+function maskAssignmentOperands(mask: string): MaskAssignment[] {
+  const hit = OPERAND_CACHE.get(mask)
+  if (hit !== undefined) return hit
+  const found: MaskAssignment[] = []
+  for (let eq = 0; eq < mask.length; eq += 1) {
+    if (mask[eq] !== '=') continue
+    let at = eq
+    while (at > 0 && mask[at - 1] === JOINED) at -= 1
+    let append = false
+    if (at > 0 && mask[at - 1] === '+') {
+      append = true
+      at -= 1
+      while (at > 0 && mask[at - 1] === JOINED) at -= 1
+    }
+    let start = at
+    while (start > 0 && (mask[start - 1] === JOINED || /[A-Za-z0-9_]/.test(mask[start - 1]))) start -= 1
+    // THE WHOLE OF THE RULE: the run has to START a word.
+    if (start !== 0 && !METACHARACTERS.includes(mask[start - 1])) continue
+    const name = mask.slice(start, at).split(JOINED).join('')
+    if (!ASSIGNMENT_NAME.test(name)) continue
+    let nameOffset = start
+    while (nameOffset < at && mask[nameOffset] === JOINED) nameOffset += 1
+    found.push({ name, nameOffset, valueOffset: eq + 1, append })
+  }
+  if (OPERAND_CACHE.size >= 64) OPERAND_CACHE.clear()
+  OPERAND_CACHE.set(mask, found)
+  return found
+}
+
+/**
+ * Offsets in `mask` at which `name` is ASSIGNED — `name=`, `name+=`, with or without an `export`,
+ * `readonly`, `declare`, `typeset` or `local` in front of it, and whether or not it is the first
+ * operand of that command.
+ *
+ * A filter over {@link maskAssignmentOperands}, which is where the rule lives.
  */
 function assignmentOffsets(mask: string, name: string): number[] {
-  const j = `[${JOINED}]*`
-  const spelt = name.split('').map((c) => escapeForRegExp(c)).join(j)
-  const found: number[] = []
-  for (const match of mask.matchAll(new RegExp(`${spelt}${j}\\+?${j}=`, 'g'))) {
-    const start = match.index
-    if (start !== 0 && !METACHARACTERS.includes(mask[start - 1])) continue
-    found.push(start)
-  }
-  return found
+  return maskAssignmentOperands(mask).filter((operand) => operand.name === name).map((operand) => operand.nameOffset)
+}
+
+/**
+ * The end of the word assigned at `start` — the first UNQUOTED metacharacter at or after it.
+ *
+ * The mask blanks quoted bytes to spaces, and a space is a metacharacter, so "unquoted" is read as
+ * "the mask still agrees with the source here": an unquoted `;`, ` ` or newline appears in both, a
+ * quote character appears as `"` in the source and as a blank in the mask, and a quoted `D` appears
+ * as `D` and as a blank. The one case the two readings cannot separate is a SPACE INSIDE QUOTES,
+ * which ends the word early — so `x="a b"` reads back as `"a`, an unbalanced fragment. That is the
+ * fail-closed direction for every caller in this repo, all of which ask whether the word is one
+ * bare identifier: a fragment is not one, and is rejected.
+ */
+function assignedWordEnd(source: string, mask: string, start: number): number {
+  let end = start
+  while (end < mask.length && !(METACHARACTERS.includes(mask[end]) && mask[end] === source[end])) end += 1
+  return end
+}
+
+/** One assignment `NAME=word` as {@link shellAssignments} reports it. */
+export type ShellAssignment = {
+  /** The name assigned. */
+  readonly name: string
+  /** 1-based line of the name in `source`. */
+  readonly line: number
+  /** True for `NAME+=word`. */
+  readonly append: boolean
+  /** The assigned word AS WRITTEN in the source — quotes and all, since the mask has blanked them. */
+  readonly value: string
+}
+
+/**
+ * EVERY assignment `source` makes, at every scope, in every command position — the general reading
+ * {@link shellConstantAssignments} is the script-scope, single-name query over.
+ *
+ * SCOPE IS DELIBERATELY NOT FILTERED HERE, and that is the whole reason this is a separate export
+ * rather than a call to shellConstantAssignments(): a value laundered into a `local` INSIDE a
+ * function is the case the caller exists to catch, and script scope is exactly what would hide it.
+ * Nor is bash's own parse cross-checked, because that check is a check on a COUNT — two readings
+ * must agree on how many times one name is assigned at script scope — and there is no count here to
+ * disagree about.
+ */
+export function shellAssignments(source: string, where = 'the script'): ShellAssignment[] {
+  const mask = maskCached(source, where)
+  return maskAssignmentOperands(mask).map(({ name, nameOffset, valueOffset, append }) => ({
+    name,
+    line: lineOf(source, nameOffset),
+    append,
+    value: source.slice(valueOffset, assignedWordEnd(source, mask, valueOffset)),
+  }))
 }
 
 const MASK_CACHE = new Map<string, string>()
