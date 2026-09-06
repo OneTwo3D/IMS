@@ -367,13 +367,14 @@ async function fetchReversedEntityIds(
 async function fetchReversedEntityIdsByIds(
   entity: 'Invoice' | 'Bill',
   ids: readonly string[],
-): Promise<{ all: Set<string>; voided: Set<string>; returned: Set<string>; amounts: Map<string, QboLedgerAmount>; ledgerObservedBefore: LedgerReadFence | null } | null> {
+): Promise<{ all: Set<string>; voided: Set<string>; returned: Set<string>; unreadable: Set<string>; amounts: Map<string, QboLedgerAmount>; ledgerObservedBefore: LedgerReadFence | null } | null> {
   // Minted BEFORE the ledger is asked, for the reason `fetchReversedEntityIds` gives: the ordering is
   // PROGRAM ORDER, and one fence covering several batches only ever decides FEWER registrations.
   const ledgerObservedBefore = await readDatabaseLedgerFence()
   const balanceDue: QboEntityId[] = []
   const voided: QboEntityId[] = []
   const returned = new Set<string>()
+  const unreadable = new Set<string>()
   const amounts = new Map<string, QboLedgerAmount>()
   for (let i = 0; i < ids.length; i += WITHHELD_RECHECK_BATCH) {
     const batch = ids.slice(i, i + WITHHELD_RECHECK_BATCH)
@@ -400,13 +401,23 @@ async function fetchReversedEntityIdsByIds(
       // now over the parsed values rather than over the raw ones.
       const isVoided = parsed.total !== null && parsed.total === 0
       if (parsed.balance !== null && parsed.balance > 0) balanceDue.push({ Id: row.Id })
+      // o3d-psrx r11 (Codex HIGH) — AND A FIGURE THE GRAMMAR REFUSED IS NOT A STATEMENT THAT NOTHING
+      // IS OUTSTANDING.
+      //
+      // Every OTHER outcome of this loop is a reading: a balance due, a void, or a stated zero. An
+      // unreadable `Balance` is none of them, and the closing loop below reads "returned, nothing
+      // still withheld, no error" as SETTLED — so without this the marker on a document whose
+      // `Balance` arrived as `"0x64"` (or as anything else `parseLedgerAmount` now refuses) would be
+      // CLOSED, which is the r10 defect reached through the parser instead of through a `typeof`.
+      // A void is exempt because it IS a reading: the document holds nothing by its own rule.
+      if (parsed.balance === null && !isVoided) unreadable.add(row.Id)
       if (isVoided) voided.push({ Id: row.Id })
       // o3d-psrx r8: and the amounts, from the row this loop is already holding. Voided by its own
       // rule for the reason `qboVoidedAmount` gives.
       amounts.set(row.Id, isVoided ? qboVoidedAmount(parsed.currency) : qboLedgerAmountFrom(parsed))
     }
   }
-  return { ...classifyQboReversals(balanceDue, voided), returned, amounts, ledgerObservedBefore }
+  return { ...classifyQboReversals(balanceDue, voided), returned, unreadable, amounts, ledgerObservedBefore }
 }
 
 /**
@@ -985,6 +996,8 @@ export async function recheckWithheldQboReversals(
   }
 
   const returned = new Set<string>([...(salesRead?.returned ?? []), ...(billsRead?.returned ?? [])])
+  // o3d-psrx r11: documents QuickBooks answered about in figures IMS could not read. See the defer below.
+  const unreadable = new Set<string>([...(salesRead?.unreadable ?? []), ...(billsRead?.unreadable ?? [])])
   const stillWithheld = new Set<string>()
   // The recheck's equivalent of refusing to checkpoint is refusing to CLOSE, so it watches the same
   // signal the delta pass does: any error recorded while these documents were being decided means this
@@ -1071,6 +1084,15 @@ export async function recheckWithheldQboReversals(
     // document goes to the BACK of the oldest-first page instead of holding its head for ever.
     if (!documentIds.every((id) => returned.has(id))) {
       await deferWithheldMarker(marker, QBO_MARKER_SCOPE.connector, 'QuickBooks did not return the document')
+      continue
+    }
+    // o3d-psrx r11 (Codex HIGH) — A DOCUMENT THAT CAME BACK IN FIGURES IMS COULD NOT READ HAS NOT
+    // BEEN RECONSIDERED EITHER. It contributed no balance due for the same reason it contributed no
+    // amount: nobody read it. Closing here would spend "we could not read it" as "there is nothing
+    // left to decide", which is the one thing this whole loop is written not to do.
+    if (documentIds.some((id) => unreadable.has(id))) {
+      await deferWithheldMarker(marker, QBO_MARKER_SCOPE.connector,
+        'QuickBooks stated an amount on the document that is not decimal money, so IMS could not read it')
       continue
     }
     if (decisionIncomplete) {

@@ -6,6 +6,7 @@
  */
 
 import { coversDocumentTotal } from '@/lib/domain/accounting/paid-coverage'
+import { toDecimal } from '@/lib/domain/math/decimal'
 
 import type { XeroResponse } from './api'
 
@@ -861,18 +862,46 @@ export function idsWhere(
 // already carries the number that says so, and this is where it is read.
 
 /**
- * Money the ledger reports, or null when the payload does not state it.
+ * o3d-psrx r11 (Codex HIGH) — WHAT A LEDGER AMOUNT IS, WRITTEN DOWN, RATHER THAN WHAT `Number()`
+ * HAPPENS TO SWALLOW.
+ *
+ * A money figure is: an optional sign, digits, and at most one decimal point with digits after it.
+ * Nothing else is a decimal amount, and everything else is REFUSED.
+ *
+ * This is stated as a GRAMMAR and not as a list of bad shapes on purpose. `Number()` additionally
+ * accepts radix-prefixed literals (`0x64` -> 100, `0b101` -> 5, `0o17` -> 15), exponent notation
+ * (`1e2` -> 100) and `Infinity`; that set is a property of the language, it is longer than anyone
+ * writing a blocklist will remember, and it can grow. A `Balance` of `"0x64"` read as 100 does not
+ * fail loudly — it STEERS A REVERSAL, which on the bill side re-arms a second supplier payment.
+ *
+ * AND THE GRAMMAR MUST COME FIRST, BEFORE ANY PARSER. `new Prisma.Decimal('0x64')` is also 100, as
+ * are its `0b`/`0o`/`1e2`/`Infinity` readings (decimal.js documents the radix prefixes as a
+ * feature) — so "parse it as a Decimal instead" is a better CONVERSION and not a validation. The
+ * refusal has to be made by this expression; the Decimal below only converts what it admits.
+ */
+const LEDGER_AMOUNT_GRAMMAR = /^[+-]?\d+(?:\.\d+)?$/
+
+/**
+ * Money the ledger reports, or null when the payload does not state it in decimal money.
  *
  * Xero serialises invoice amounts as JSON numbers, but a string is accepted rather than coerced
  * blindly: `Number('')` is 0, and a zero conjured out of an empty field is exactly the "no payment
  * is present" answer that clears paidAt and re-arms a second supplier payment.
+ *
+ * NULL IS A REFUSAL AND NEVER A ZERO. Every caller reads null as "the ledger did not state this",
+ * which withholds; a rejected string that came back as 0 would be indistinguishable from a ledger
+ * saying it holds nothing, i.e. from the reversal itself.
  */
 export function parseLedgerAmount(value: unknown): number | null {
   if (typeof value === 'number') return Number.isFinite(value) ? value : null
   if (typeof value === 'string') {
     const trimmed = value.trim()
-    if (trimmed === '') return null
-    const parsed = Number(trimmed)
+    if (!LEDGER_AMOUNT_GRAMMAR.test(trimmed)) return null
+    // Converted through the repository's decimal reader rather than `Number()`: the shape is already
+    // established above, and this reads the digits it was given instead of re-deriving them. Still
+    // guarded for finiteness — a grammatical figure with 400 digits is a finite Decimal and an
+    // infinite double, and an infinite amount is not a reading either.
+    const parsed = toDecimal(trimmed).toNumber()
     return Number.isFinite(parsed) ? parsed : null
   }
   return null
