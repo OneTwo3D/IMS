@@ -3475,7 +3475,10 @@ export async function addPayment(input: {
           notes: input.notes || null,
           paidAt,
         },
-        select: { id: true, paidAt: true },
+        // o3d-1xq8: `amount` is selected because the ledger registration below is enqueued from the
+        // STORED `Decimal` and not from `input.amount`. The two are normally the same figure, and
+        // when they are not it is the stored one that is the receipt.
+        select: { id: true, paidAt: true, amount: true },
       })
 
       // o3d-psrx — THE RECEIPT AND `paidAt` COMMIT TOGETHER, AND SOMETHING NOW DEPENDS ON THAT.
@@ -3576,7 +3579,7 @@ export async function addPayment(input: {
         referenceType: 'Payment',
         referenceId: payment.id,
       })
-      return { so, becamePaid, paymentId: payment.id, paidAt: payment.paidAt, settlementRateToBase, baseCurrency }
+      return { so, becamePaid, paymentId: payment.id, paidAt: payment.paidAt, paymentAmount: payment.amount, settlementRateToBase, baseCurrency }
     }, STOCK_TX_OPTIONS)
     if ('error' in txResult) return { success: false, error: txResult.error }
 
@@ -3620,7 +3623,10 @@ export async function addPayment(input: {
         orderId: input.orderId,
         orderReference: getSalesOrderReference(txResult.so),
         paymentId: txResult.paymentId,
-        amount: input.amount,
+        // o3d-1xq8 (Codex HIGH): the receipt AS STORED, carried through as a `Decimal`. `input.amount`
+        // is the double the form sent; `Payment.amount` is the `Decimal(18, 4)` the ledger
+        // registration is a record of, and the enqueue is the one place that may convert it.
+        amount: toDecimal(txResult.paymentAmount),
         currency: input.currency,
         method: input.method || null,
         reference: input.reference || null,

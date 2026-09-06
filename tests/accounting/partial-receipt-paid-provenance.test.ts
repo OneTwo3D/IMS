@@ -481,7 +481,11 @@ test('[o3d-psrx r18] and the SUM of the registrations is exact, not just the com
   assert.equal(toDecimal(halfA.registeredAmount!).toString(), '274877906944.0001')
   assert.equal(toDecimal(halfB.registeredAmount!).toString(), '274877906944.0002')
   assert.equal(toDecimal(halfA.registeredAmount!).add(halfB.registeredAmount!).toString(), FOUR_DP_TOTAL)
-  assert.equal(toDecimal(halfA.registeredAmount! + halfB.registeredAmount!).toString(), FOUR_DP_COVERED,
+  // `Number(...)` on each term rather than `!`, and it is a no-op on the doubles these two rows carry:
+  // o3d-1xq8 widened `registeredAmount` to `Decimal | number | null` so the production reader can hand
+  // over the payload's exact decimal, and THIS line is specifically about adding the two as DOUBLES.
+  // The assertion, its subject and its verdict are untouched.
+  assert.equal(toDecimal(Number(halfA.registeredAmount) + Number(halfB.registeredAmount)).toString(), FOUR_DP_COVERED,
     'PRECONDITION: added as doubles they fall one whole minor unit short')
 
   const verdict = classifyRegisteredPaymentAgainstListing(

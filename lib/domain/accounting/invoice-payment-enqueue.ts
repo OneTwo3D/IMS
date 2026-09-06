@@ -41,6 +41,7 @@ import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 import { attemptCouldHaveReachedTheLedger, effectiveTokenFor } from '@/lib/domain/accounting/followup-retry-guard'
 import { pinnedAttemptDate, settlementMarkerFor } from '@/lib/domain/accounting/ledger-settlement-evidence'
 import { probeLedgerSettlement } from '@/lib/connectors/accounting-settlement-probe'
+import { toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -127,11 +128,50 @@ export function payloadPaymentId(payload: unknown): string | null {
 }
 
 /**
+ * THE PAYLOAD FIELD THAT CARRIES A REGISTRATION'S AMOUNT AS AN EXACT DECIMAL (o3d-1xq8).
+ *
+ * Written BESIDE `amount`, never instead of it. Historical rows carry only the number and must keep
+ * settling exactly as they do today; every row written from now on carries both, and they agree —
+ * `registerInvoicePaymentWithLedger` refuses to enqueue an amount whose two forms would not.
+ */
+export const REGISTERED_AMOUNT_DECIMAL_FIELD = 'amountDecimal'
+
+/**
+ * A decimal NUMERAL, and nothing else. `new Prisma.Decimal(...)` accepts `'1e3'`, `'0x10'` and
+ * `'Infinity'`; a money field that will be summed against a stored total must be plain digits with at
+ * most one point, so the grammar is asserted BEFORE the value is constructed rather than inferred
+ * from the construction succeeding.
+ */
+const EXACT_DECIMAL_NUMERAL = /^-?\d+(?:\.\d+)?$/
+
+/**
+ * The exact decimal a payload string names, or NULL because it does not name one.
+ *
+ * NULL AND NEVER A FALLBACK. A payload that carries this field is a payload written by a build that
+ * promised it is exact; if the string is unreadable, that promise is broken and the honest answer is
+ * "this payload will not say" — reverting to the double beside it would silently reinstate the very
+ * hop this field exists to remove.
+ */
+function exactPayloadDecimal(value: string): Decimal | null {
+  const trimmed = value.trim()
+  if (!EXACT_DECIMAL_NUMERAL.test(trimmed)) return null
+  try {
+    const parsed = toDecimal(trimmed)
+    // The round trip is the proof that the digits survived: `toDecimal` is exact for a numeral of this
+    // grammar, so a disagreement here means the string was not the figure it appeared to be.
+    return parsed.toFixed() === toDecimal(parsed.toFixed()).toFixed() ? parsed : null
+  } catch {
+    return null
+  }
+}
+
+/**
  * HOW MUCH A REGISTRATION TOLD THE LEDGER ABOUT, IN A NAMED CURRENCY (o3d-psrx r7, Codex HIGH 1).
  *
- * The enqueue writes `amount` and `currency` into the payload from the receipt it was raised for, and
- * this is the durable record of what was actually SENT. The local `Payment` row is not a substitute:
- * it can be deleted, and its amount can be corrected, while the money that reached the ledger cannot.
+ * The enqueue writes the amount and `currency` into the payload from the receipt it was raised for,
+ * and this is the durable record of what was actually SENT. The local `Payment` row is not a
+ * substitute: it can be deleted, and its amount can be corrected, while the money that reached the
+ * ledger cannot.
  *
  * `currency` IS PART OF THE ANSWER, NOT A DETAIL. The coverage test this feeds compares against
  * `SalesOrder.totalForeign`, which is stated in the ORDER's currency; a registration raised in another
@@ -141,12 +181,58 @@ export function payloadPaymentId(payload: unknown): string | null {
  * NULL IS "THIS PAYLOAD WILL NOT SAY", and every caller must read it that way rather than as zero or
  * as full cover. A row from before these fields existed, and one retention-compacted to `{}`
  * (o3d-m5qk), both answer NULL.
+ *
+ * o3d-1xq8 — AND IT ANSWERS A `Decimal`, PREFERRING THE PAYLOAD'S EXACT DECIMAL STRING.
+ *
+ * THE DEFECT. `amount` is a JSON number, and until this issue the enqueue built it with
+ * `Number(receipt.amount)` — the `Decimal(18, 4)` receipt converted to a double. At 2^39 the spacing
+ * between neighbouring doubles is 0.000122, wider than a four-decimal minor unit, so THE CONVERSION
+ * MOVES THE FIGURE IN EITHER DIRECTION. o3d-psrx r18 disclosed only the DOWNWARD case
+ * (`549755813888.0003` reads as `...0002`, a registration that really settled the order reads as one
+ * minor unit short, and the coverage guard WITHHOLDS — the safe direction) and stated the conclusion
+ * generally. It is not general: `549755813888.0008` converts UP to `549755813888.000854492…`, which
+ * clears `documentTotal - PAID_COVERAGE_EPSILON` for a total of `549755813888.0009`. That
+ * MANUFACTURES coverage — the guard stands down, the classifier returns GONE, and `paidAt` is cleared
+ * with a chargeback credit note raised on a document nobody fully paid.
+ *
+ * THE FIX IS ADDITIVE. `registerInvoicePaymentWithLedger` now persists the stored receipt amount's
+ * exact decimal string in {@link REGISTERED_AMOUNT_DECIMAL_FIELD} beside the number, and this reader
+ * PREFERS it. A historical row carries no string, falls through to the number, and is read exactly as
+ * it is today — no row is rewritten and no row gets worse.
  */
-export function payloadRegisteredAmount(payload: unknown, currency: string): number | null {
+export function payloadRegisteredAmount(payload: unknown, currency: string): Decimal | null {
   const p = (payload && typeof payload === 'object' ? payload : {}) as Record<string, unknown>
   if (typeof p.currency !== 'string' || p.currency !== currency) return null
+  const exact = p[REGISTERED_AMOUNT_DECIMAL_FIELD]
+  // PRESENT DECIDES, readable or not — see `exactPayloadDecimal`.
+  if (exact !== undefined) return typeof exact === 'string' ? exactPayloadDecimal(exact) : null
   if (typeof p.amount !== 'number' || !Number.isFinite(p.amount)) return null
-  return p.amount
+  // The double's own exact decimal reading, which is what the caller's summation made of it before
+  // this field existed. Unchanged for every historical row.
+  return toDecimal(p.amount)
+}
+
+/**
+ * MAY THIS AMOUNT BE ENQUEUED AT ALL? (o3d-1xq8, Codex HIGH — the writer's backstop.)
+ *
+ * The payload's `amount` is a JSON number because the connectors need one: a Xero or QuickBooks
+ * payment body states its amount as a JSON number, and every consumer of this payload that is not the
+ * coverage reader — the capacity arithmetic, the retry guard's body test, the operator screens —
+ * reads that number. The decimal string added above makes the COVERAGE route exact; it does nothing
+ * for the figure that is actually SENT.
+ *
+ * So the writer refuses what it cannot state in both forms. A stored receipt whose `Decimal` does not
+ * survive `Number(...)` and back has no honest number to send, and money IMS cannot state exactly
+ * must not leave it. This is Codex's second option, kept as the backstop for the first rather than
+ * instead of it — the writer holds the `Decimal`, so it is the one place that can tell.
+ *
+ * TRUE FOR EVERY AMOUNT ANY REAL ORDER CARRIES. A `Decimal(18, 4)` round-trips through a double up to
+ * 2^53 / 10^4 ≈ 900,000,000,000 in the order's own currency; below that the check never fires.
+ */
+export function invoicePaymentAmountRoundTrips(amount: Decimal): boolean {
+  const asNumber = amount.toNumber()
+  if (!Number.isFinite(asNumber)) return false
+  return toDecimal(asNumber).eq(amount)
 }
 
 /**
@@ -1041,6 +1127,27 @@ export function invoicePaymentNotQueuedDescription(params: {
 }
 
 /**
+ * THE AMOUNT CANNOT BE STATED AS THE JSON NUMBER THE CONNECTORS SEND (o3d-1xq8, Codex HIGH).
+ *
+ * Reachable pinned and unpinned, so it takes a redrive like its neighbours. `amount` is the EXACT
+ * decimal as a string and never a `number`: this message exists because the number is wrong, and
+ * `toFixed(2)` on it would print the very figure the refusal is about.
+ */
+export function invoicePaymentAmountNotRepresentableDescription(params: {
+  orderReference: string
+  amount: string
+  currency: string
+  redrive: InvoicePaymentRedrive
+}): string {
+  return `Recorded ${params.currency} ${params.amount} against ${params.orderReference}, but that amount `
+    + `cannot be stated exactly as the number the accounting connector's payment call takes — it is `
+    + `large enough that the nearest value the format can hold differs from it — so NOTHING was sent `
+    + `and no registration was queued. IMS will not send a figure it would have to misstate. Register `
+    + `this receipt in the ledger by hand, or split it into amounts the connector can state. `
+    + invoicePaymentRemedyNote(params.redrive)
+}
+
+/**
  * THE DEFERRED WRAPPER'S OWN THREE MESSAGES (o3d-0bfh r13, Codex HIGH).
  *
  * Every one of these is written from inside `registerDeferredOrderReceipts`, i.e. always under a
@@ -1080,7 +1187,20 @@ export async function registerInvoicePaymentWithLedger(params: {
   orderId: string
   orderReference: string
   paymentId: string
-  amount: number
+  /**
+   * THE STORED RECEIPT AMOUNT, AS THE `Decimal` IT IS (o3d-1xq8, Codex HIGH).
+   *
+   * It used to be a `number`, and both callers wrote the conversion at the call site — the deferred
+   * re-drive with `Number(receipt.amount)` on a `Decimal(18, 4)` column. That conversion is not
+   * value-preserving in either direction (see {@link payloadRegisteredAmount}), and the direction the
+   * r18 disclosure did not cover MANUFACTURES coverage on the order it settles.
+   *
+   * So the `Decimal` comes in, and the two lossy things that must still happen to it happen HERE,
+   * once, where the exact value is in hand to check them against: the payload records its exact
+   * decimal string beside the number, and {@link invoicePaymentAmountRoundTrips} refuses the enqueue
+   * outright if the two forms would disagree.
+   */
+  amount: Decimal
   currency: string
   method: string | null
   reference: string | null
@@ -1107,6 +1227,13 @@ export async function registerInvoicePaymentWithLedger(params: {
 
   const pinned = params.postedUnder ?? null
 
+  /**
+   * THE JSON NUMBER EVERY OTHER CONSUMER OF THIS PAYLOAD READS (o3d-1xq8). Derived ONCE, here, from
+   * the stored `Decimal`, so no branch below can convert a second time and get a second answer — and
+   * refused outright a few lines down if the two forms would not agree.
+   */
+  const amountNumber = params.amount.toNumber()
+
   // WHICH live obligation names the remedy when more than one connector holds one — filled in below
   // once the active connector is resolved. It never decides WHETHER one exists (o3d-0bfh r14).
   let preferredConnector: string | null = pinned?.connector ?? null
@@ -1132,6 +1259,37 @@ export async function registerInvoicePaymentWithLedger(params: {
     invoicePaymentRedriveFor(pinned, refusal, await deferredRecovery())
 
   try {
+    /**
+     * AN AMOUNT IMS CANNOT STATE EXACTLY IS NEVER SENT (o3d-1xq8, Codex HIGH — the writer's backstop).
+     *
+     * ASKED FIRST, before the order is even read, because it is a fact about the receipt alone: no
+     * later state — a moved document, a switched connector, spare capacity — can make an amount
+     * sendable that the connectors' own JSON number cannot name. Refusing here also means no branch
+     * below has to wonder whether `amountNumber` is the figure it claims to be.
+     *
+     * TERMINAL, and reported like every other refusal on this path: `settled: false` keeps the
+     * deferred obligation retained, the message names the hand remedy, and nothing is queued. A
+     * receipt this large is not a rounding problem to be absorbed — it is money IMS would have to
+     * misstate to move, and the operator has to split it or register it in the ledger by hand.
+     */
+    if (!invoicePaymentAmountRoundTrips(params.amount)) {
+      await warn('invoice_payment_not_registered',
+        invoicePaymentAmountNotRepresentableDescription({
+          orderReference: params.orderReference,
+          amount: params.amount.toFixed(),
+          currency: params.currency,
+          redrive: await redriveFor(null),
+        }),
+        {
+          // The EXACT figure, as the string it is. Putting `amountNumber` in the metadata of the
+          // refusal that exists because `amountNumber` is wrong would record the wrong number.
+          amount: params.amount.toFixed(), currency: params.currency,
+          refusal: 'AMOUNT_NOT_REPRESENTABLE',
+          asNumber: amountNumber,
+        })
+      return
+    }
+
     const [paymentSyncEnabled, so, activeConnector] = await Promise.all([
       // Not merely "is the connector on": if INVOICE_PAYMENT posting is off, queueAccountingSync would
       // drop this silently, so treat it as nothing being expected rather than as a failure to report.
@@ -1170,14 +1328,14 @@ export async function registerInvoicePaymentWithLedger(params: {
         invoicePaymentDocumentMovedDescription({
           phase: 'before-queue',
           orderReference: params.orderReference,
-          amount: params.amount,
+          amount: amountNumber,
           currency: params.currency,
           postedInvoiceId: pinned.accountingInvoiceId,
           currentInvoiceId: so.accountingInvoiceId,
           connector: pinned.connector,
         }),
         {
-          amount: params.amount, currency: params.currency, refusal: 'DOCUMENT_MOVED',
+          amount: amountNumber, currency: params.currency, refusal: 'DOCUMENT_MOVED',
           postedInvoiceId: pinned.accountingInvoiceId, currentInvoiceId: so.accountingInvoiceId,
           connector: pinned.connector,
         })
@@ -1221,7 +1379,7 @@ export async function registerInvoicePaymentWithLedger(params: {
       accountingInvoiceId,
       orderCurrency: so.currency,
       paymentCurrency: params.currency,
-      paymentAmount: params.amount,
+      paymentAmount: amountNumber,
       paymentId: params.paymentId,
       bankAccountId: paymentSyncEnabled && accountingInvoiceId
         ? lookupPaymentAccount(await getPaymentAccountMap(), params.method ?? '', params.currency)
@@ -1252,7 +1410,7 @@ export async function registerInvoicePaymentWithLedger(params: {
       const notice = describeInvoicePaymentRefusal({
         refused,
         orderReference: params.orderReference,
-        amount: params.amount,
+        amount: amountNumber,
         currency: params.currency,
         orderCurrency: so.currency,
         method: params.method,
@@ -1337,7 +1495,15 @@ export async function registerInvoicePaymentWithLedger(params: {
         payload: {
           accountingInvoiceId,
           bankAccountId: underLock.bankAccountId,
-          amount: params.amount,
+          amount: amountNumber,
+          // o3d-1xq8: AND THE SAME FIGURE AS AN EXACT DECIMAL STRING, BESIDE THE NUMBER AND NEVER
+          // INSTEAD OF IT. The number is what the connectors put on the wire and what every other
+          // consumer of this payload reads; the string is what the coverage reader prefers, and it is
+          // the one form that cannot have moved. They agree by construction — the round-trip refusal
+          // at the top of this function is what makes that a guarantee rather than a hope — so this
+          // field adds evidence without changing a single existing reading. Historical rows carry no
+          // string and are read exactly as they are today.
+          [REGISTERED_AMOUNT_DECIMAL_FIELD]: params.amount.toFixed(),
           currency: params.currency,
           paymentDate: params.paidAt.toISOString().slice(0, 10),
           method: params.method ?? '',
@@ -1369,14 +1535,14 @@ export async function registerInvoicePaymentWithLedger(params: {
       await warn('invoice_payment_not_registered',
         invoicePaymentConnectorMovedDescription({
           orderReference: params.orderReference,
-          amount: params.amount,
+          amount: amountNumber,
           currency: params.currency,
           pinnedConnector: pinned?.connector ?? null,
           wroteFor: moved.wroteFor,
           alreadyQueued: moved.alreadyQueued,
         }),
         {
-          amount: params.amount, currency: params.currency, refusal: 'PINNED_CONNECTOR_MOVED',
+          amount: amountNumber, currency: params.currency, refusal: 'PINNED_CONNECTOR_MOVED',
           pinnedConnector: pinned?.connector ?? null, wroteFor: moved.wroteFor,
           // Whether the throw actually undid a write, or found the work already queued elsewhere.
           rolledBack: !moved.alreadyQueued,
@@ -1400,7 +1566,7 @@ export async function registerInvoicePaymentWithLedger(params: {
         invoicePaymentDocumentMovedDescription({
           phase: 'while-queueing',
           orderReference: params.orderReference,
-          amount: params.amount,
+          amount: amountNumber,
           currency: params.currency,
           postedInvoiceId: pinned?.accountingInvoiceId ?? 'unknown',
           currentInvoiceId: so.accountingInvoiceId,
@@ -1408,7 +1574,7 @@ export async function registerInvoicePaymentWithLedger(params: {
           connector: pinned?.connector ?? 'unknown',
         }),
         {
-          amount: params.amount, currency: params.currency, refusal: 'DOCUMENT_MOVED',
+          amount: amountNumber, currency: params.currency, refusal: 'DOCUMENT_MOVED',
           postedInvoiceId: pinned?.accountingInvoiceId ?? null,
         })
       return
@@ -1417,11 +1583,11 @@ export async function registerInvoicePaymentWithLedger(params: {
       await warn('invoice_payment_not_registered',
         invoicePaymentPostingContextChangedDescription({
           orderReference: params.orderReference,
-          amount: params.amount,
+          amount: amountNumber,
           currency: params.currency,
           redrive: await redriveFor(null),
         }),
-        { amount: params.amount, currency: params.currency, refusal: 'POSTING_CONTEXT_CHANGED' })
+        { amount: amountNumber, currency: params.currency, refusal: 'POSTING_CONTEXT_CHANGED' })
     }
   } catch (e) {
     // Same shape as markBillPaid's queue failure: the receipt is recorded in IMS with nothing queued to
@@ -1435,14 +1601,14 @@ export async function registerInvoicePaymentWithLedger(params: {
       level: 'ERROR',
       description: invoicePaymentNotQueuedDescription({
         orderReference: params.orderReference,
-        amount: params.amount,
+        amount: amountNumber,
         currency: params.currency,
         redrive: await redriveFor(null),
       }),
       metadata: {
         orderNumber: params.orderReference,
         paymentId: params.paymentId,
-        amount: params.amount,
+        amount: amountNumber,
         currency: params.currency,
         error: e instanceof Error ? e.message : String(e),
       },
@@ -1626,7 +1792,11 @@ export async function registerDeferredOrderReceipts(
         orderId: order.id,
         orderReference,
         paymentId: receipt.id,
-        amount: Number(receipt.amount),
+        // o3d-1xq8 (Codex HIGH): the STORED `Decimal`, not `Number(receipt.amount)`. That conversion
+        // was the last lossy hop in the coverage chain and it moves in BOTH directions — the
+        // r18 disclosure covered only the downward one. `registerInvoicePaymentWithLedger` now holds
+        // the exact value and does the one conversion the connectors need, under a refusal.
+        amount: toDecimal(receipt.amount),
         currency: receipt.currency,
         method: receipt.method,
         reference: receipt.reference,

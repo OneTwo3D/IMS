@@ -1481,8 +1481,17 @@ export type RegisteredPaymentRow = {
    * OPTIONAL so every existing caller and test keeps its exact previous meaning. It is read only when
    * a caller also supplies a `documentTotal`, which is the caller saying it wants the coverage
    * question asked at all.
+   *
+   * o3d-1xq8 — AND IT MAY NOW BE A `Decimal`, WHICH IS WHAT THE PRODUCTION READER SUPPLIES.
+   *
+   * `payloadRegisteredAmount` prefers the payload's exact decimal string over its JSON number, so the
+   * figure it answers with is a `Decimal`. The `number` arm is kept, and kept meaning EXACTLY what it
+   * meant before — the double's own exact decimal reading, which is what {@link sumRegisteredAmounts}
+   * already made of it — because a historical row carries no string and must settle as it does today.
+   * Neither form is preferred by this type; the READER decides which one a given row can supply, and
+   * a row that can supply neither answers null.
    */
-  registeredAmount?: number | null
+  registeredAmount?: Decimal | number | null
 }
 
 /**
@@ -2158,16 +2167,32 @@ export function classifyRegisteredPaymentAgainstListing(
  * comparison depends entirely on which row it is in.
  */
 function sumRegisteredAmounts(rows: readonly RegisteredPaymentRow[]): Decimal | null {
-  // o3d-psrx r18 (Codex HIGH 2): SUMMED AS `Decimal`. Each term is still a double — the enqueue
-  // records it that way in the payload (o3d-1xq8) — but `toDecimal` reads each one at its own exact
+  // o3d-psrx r18 (Codex HIGH 2): SUMMED AS `Decimal`. `toDecimal` reads each term at its own exact
   // decimal value and `addMoney` adds them without rounding, so the SUM contributes no error of its
   // own on top of the terms. Adding them in `Number` did: two four-decimal registrations against a
   // large order could total to a double a whole minor unit away from their true sum, and this figure
   // is one side of the coverage comparison.
+  //
+  // o3d-1xq8 (Codex HIGH): AND THE TERMS THEMSELVES ARE NO LONGER ALL DOUBLES. r18 wrote "each term
+  // is still a double — the enqueue records it that way in the payload" and left the residue to
+  // PAID_COVERAGE_EPSILON. That residue is not one-directional: `Number(receipt.amount)` on the
+  // stored `Decimal(18, 4)` rounds UP as readily as down, and a term rounded up can carry the sum
+  // over `documentTotal - PAID_COVERAGE_EPSILON` on an order the receipts fall a minor unit short
+  // of — manufacturing coverage, standing this guard down, and admitting a whole-document reversal.
+  // The enqueue now records the exact decimal string beside the number and
+  // `payloadRegisteredAmount` prefers it, so a term from a row written since is EXACT. A term from a
+  // historical row is still the double's own exact decimal reading, which is precisely what this
+  // loop made of it before — no row is read differently, and every new row is read exactly.
   let total = toDecimal(0)
   for (const row of rows) {
-    if (typeof row.registeredAmount !== 'number' || !Number.isFinite(row.registeredAmount)) return null
-    total = addMoney(total, row.registeredAmount)
+    const stated = row.registeredAmount
+    if (stated == null) return null
+    if (typeof stated === 'number') {
+      if (!Number.isFinite(stated)) return null
+      total = addMoney(total, stated)
+      continue
+    }
+    total = addMoney(total, stated)
   }
   return total
 }
