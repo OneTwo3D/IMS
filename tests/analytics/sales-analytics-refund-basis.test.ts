@@ -962,7 +962,14 @@ test('customer mix: a contradicted customer OUTSIDE the visible page is NAMED in
   // THE ROUTE FROM THE NOTICE TO THE ROW: the Customer cell, the Email cell, the id the CSV export
   // carries, and the group key the row was filed under — see `inconsistentCustomerLabel` for why
   // the name alone is not enough, and why the absent email is a token and not a form of words.
-  assert.ok(notice!.endsWith('highest-ranked first: name="Gamma" email=<none> customerId="cust-gamma" group="cust-gamma".'), notice)
+  // THE IDENTITY TOKEN, DERIVED BY HAND, and then used to check `identityToken` — which every
+  // other expectation in this file goes through, so it is worth pinning once against arithmetic
+  // done on paper. `cust-gamma` is c u s t - g a m m a; those are ASCII 0x63 0x75 0x73 0x74 0x2d
+  // 0x67 0x61 0x6d 0x6d 0x61, and each is written as four lowercase hex digits after the prefix.
+  const gammaToken = 'utf16hex:0063007500730074002d00670061006d006d0061'
+  assert.equal(identityToken('cust-gamma'), gammaToken)
+  assertIdentityToken(gammaToken)
+  assert.ok(notice!.endsWith(`highest-ranked first: name="Gamma" email=<none> customerId="cust-gamma" group=${gammaToken}.`), notice)
   // And ONLY the affected one. Naming every row would be no list at all at the size that matters.
   assert.equal(notice!.includes('Clean '), false)
 })
@@ -1006,7 +1013,7 @@ test('customer mix: past the tenth name the notice counts the rest and says wher
   assert.match(notice!, /^11 of 11 customers/)
   const named = Array.from({ length: 10 }, (_, index) => {
     const n = String(index + 1).padStart(2, '0')
-    return `name="Cust ${n}" email=<none> customerId="cust-${n}" group="cust-${n}"`
+    return `name="Cust ${n}" email=<none> customerId="cust-${n}" group=${identityToken(`cust-${n}`)}`
   }).join('; ')
   assert.ok(notice!.includes(`highest-ranked first: ${named}, and 1 more not named here`), notice)
   // The eleventh is not named, and the sentence that omits it says where it can be found.
@@ -1196,7 +1203,7 @@ test('customer mix: guests whose names differ ONLY in whitespace stay distinguis
   // ROUND 6, FINDING 2. Round 5 escaped quotes and nothing else, so `Acme Ltd` and `Acme\nLtd` were
   // two group keys (`guest-name:Acme Ltd` / `guest-name:Acme<LF>Ltd`) and two distinct raw label
   // strings — and the notice is rendered as collapsing HTML, which turned both into the one visible
-  // string `name="Acme Ltd" … group="guest-name:Acme Ltd"`. Injective in the string, not injective
+  // string `name="Acme Ltd" … group=…`. Injective in the string, not injective
   // in what is SEEN, and the thing wanted was the second: the collision the labelling exists to
   // remove, surviving one layer further out.
   //
@@ -1235,11 +1242,11 @@ test('customer mix: guests whose names differ ONLY in whitespace stay distinguis
   // renders as one.
   assert.ok(notice!.endsWith(
     'They are, highest-ranked first: '
-    + 'name="Acme Ltd" email=<none> customerId=<none> group="guest-name:Acme Ltd"; '
-    + 'name="Acme\\u00a0Ltd" email=<none> customerId=<none> group="guest-name:Acme\\u00a0Ltd"; '
-    + 'name="Acme \\u0020Ltd" email=<none> customerId=<none> group="guest-name:Acme \\u0020Ltd"; '
-    + 'name="Acme\\tLtd" email=<none> customerId=<none> group="guest-name:Acme\\tLtd"; '
-    + 'name="Acme\\u200bLtd" email=<none> customerId=<none> group="guest-name:Acme\\u200bLtd".',
+    + `name="Acme Ltd" email=<none> customerId=<none> group=${identityToken('guest-name:Acme Ltd')}; `
+    + `name="Acme\\u00a0Ltd" email=<none> customerId=<none> group=${identityToken('guest-name:Acme\u00a0Ltd')}; `
+    + `name="Acme \\u0020Ltd" email=<none> customerId=<none> group=${identityToken('guest-name:Acme\u0020\u0020Ltd')}; `
+    + `name="Acme\\tLtd" email=<none> customerId=<none> group=${identityToken('guest-name:Acme\tLtd')}; `
+    + `name="Acme\\u200bLtd" email=<none> customerId=<none> group=${identityToken('guest-name:Acme\u200bLtd')}.`,
   ), notice)
 
   // AND THE PROPERTY THAT IS ACTUALLY LOAD-BEARING, asserted through the renderer's own rule rather
@@ -1271,8 +1278,8 @@ test('customer mix: control and bidi characters in a name reach the operator as 
   assert.ok(notice, 'the report did not raise the inconsistent-evidence notice')
   assert.ok(notice!.endsWith(
     'They are, highest-ranked first: '
-    + 'name="Acme Ltd" email=<none> customerId=<none> group="guest-name:Acme Ltd"; '
-    + 'name="\\u202eAcme\\u00adLtd" email=<none> customerId=<none> group="guest-name:\\u202eAcme\\u00adLtd".',
+    + `name="Acme Ltd" email=<none> customerId=<none> group=${identityToken('guest-name:Acme Ltd')}; `
+    + `name="\\u202eAcme\\u00adLtd" email=<none> customerId=<none> group=${identityToken('guest-name:\u202eAcme\u00adLtd')}.`,
   ), notice)
   // NOTHING INVISIBLE SURVIVES INTO THE OUTPUT. Every code point of the notice is a printable ASCII
   // character or one of the punctuation marks the prose itself uses — so there is no character left
@@ -1305,8 +1312,8 @@ test('customer mix: a name that SPELLS an escape is not the name that contains o
   assert.ok(notice, 'the report did not raise the inconsistent-evidence notice')
   assert.ok(notice!.endsWith(
     'They are, highest-ranked first: '
-    + 'name="Acme\\\\nLtd" email=<none> customerId=<none> group="guest-name:Acme\\\\nLtd"; '
-    + 'name="Acme\\nLtd" email=<none> customerId=<none> group="guest-name:Acme\\nLtd".',
+    + `name="Acme\\\\nLtd" email=<none> customerId=<none> group=${identityToken('guest-name:Acme\\nLtd')}; `
+    + `name="Acme\\nLtd" email=<none> customerId=<none> group=${identityToken('guest-name:Acme\nLtd')}.`,
   ), notice)
   const rendered = noticeEntries(notice!).map(asRendered)
   assert.equal(new Set(rendered).size, 2, rendered.join(' || '))
@@ -1325,10 +1332,42 @@ function asSeen(text: string): string {
   return asRendered(text).normalize('NFC')
 }
 
-/** The `group=` field of one notice entry, quotes included — it is the last field of the entry. */
+/** The `group=` field of one notice entry — it is the last field of the entry. */
 function groupField(entry: string): string {
   const marker = ' group='
   return entry.slice(entry.indexOf(marker) + marker.length)
+}
+
+/**
+ * THE IDENTITY TOKEN FOR A GROUP KEY, DERIVED THROUGH A DIFFERENT ENCODER (o3d-7jfq r8).
+ *
+ * `group=` is `utf16hex:` followed by four lowercase hex digits per UTF-16 code unit. Re-deriving
+ * that here with `charCodeAt`/`toString(16)`/`padStart` would be a copy of the code under test —
+ * the same mistake would be made twice and cancel. So this goes through NODE'S OWN UTF-16 encoder
+ * instead: `Buffer.from(key, 'utf16le')` emits each code unit little-endian, and swapping the two
+ * bytes of each pair gives the big-endian hex the notice prints. A wrong width, a wrong base, an
+ * upper-case digit, a missing prefix, code POINTS where code UNITS belong, or a dropped character
+ * all fail against this. It is checked against a HAND-DERIVED literal at its first use below.
+ */
+function identityToken(key: string): string {
+  const littleEndian = Buffer.from(key, 'utf16le').toString('hex')
+  let bigEndian = ''
+  for (let index = 0; index < littleEndian.length; index += 4) {
+    bigEndian += littleEndian.slice(index + 2, index + 4) + littleEndian.slice(index, index + 2)
+  }
+  return `utf16hex:${bigEndian}`
+}
+
+/**
+ * The alphabet `group=` may draw from, asserted rather than assumed.
+ *
+ * This is the ON-SCREEN property the round-8 fix rests on, and the reason it is a regex over the
+ * whole field rather than a comparison against one expected string: `0`-`9` and `a`-`f` hold no
+ * letter `O` to confuse with `0`, no `I` and no `l` to confuse with `1`, and no `m`, `n` or `r`,
+ * so `rn` cannot be drawn as `m`. A field that matches this cannot be carrying any of them.
+ */
+function assertIdentityToken(field: string): void {
+  assert.match(field, /^utf16hex:(?:[0-9a-f]{4})+$/, `not a fixed-width identity token: ${field}`)
 }
 
 /** The readable half of one notice entry: `name=`, `email=` and `customerId=`, without `group=`. */
@@ -1372,11 +1411,12 @@ test('customer mix: NFC and NFD spellings of one guest name stay distinguishable
   assert.ok(notice, 'the report did not raise the inconsistent-evidence notice')
 
   // DERIVED BY HAND from the split: `name=` prints the name as stored, because it exists to be read
-  // against the Customer column; `group=` is ASCII-only, so U+00E9 and U+0301 are spelled out.
+  // against the Customer column; `group=` prints no characters of the name at all, so the composed
+  // U+00E9 and the decomposed `e` + U+0301 become four code units against five.
   assert.ok(notice!.endsWith(
     'They are, highest-ranked first: '
-    + 'name="Café" email=<none> customerId=<none> group="guest-name:Caf\\u00e9"; '
-    + 'name="Café" email=<none> customerId=<none> group="guest-name:Cafe\\u0301".',
+    + `name="Café" email=<none> customerId=<none> group=${identityToken('guest-name:Caf\u00e9')}; `
+    + `name="Café" email=<none> customerId=<none> group=${identityToken('guest-name:Cafe\u0301')}.`,
   ), notice)
 
   // AND THE PROPERTY THAT IS LOAD-BEARING, asserted through the rendering model rather than by
@@ -1416,19 +1456,21 @@ test('customer mix: guest names differing only in a non-ASCII homoglyph stay dis
   assert.ok(notice, 'the report did not raise the inconsistent-evidence notice')
   assert.ok(notice!.endsWith(
     'They are, highest-ranked first: '
-    + 'name="Αcme Ltd" email=<none> customerId=<none> group="guest-name:\\u0391cme Ltd"; '
-    + 'name="Аcme Ltd" email=<none> customerId=<none> group="guest-name:\\u0410cme Ltd".',
+    + `name="Αcme Ltd" email=<none> customerId=<none> group=${identityToken('guest-name:\u0391cme Ltd')}; `
+    + `name="Аcme Ltd" email=<none> customerId=<none> group=${identityToken('guest-name:\u0410cme Ltd')}.`,
   ), notice)
 
   // THE LOAD-BEARING PROPERTY, and the reason it is stated about `group=` rather than about the
-  // whole entry: printable ASCII contains no two code points that draw alike, so two `group=`
-  // fields that are distinct AND printable-ASCII throughout are distinct TO THE OPERATOR. That is
-  // an invariant of the encoding, not a fact about the characters this fixture happens to use.
+  // whole entry: two `group=` fields that are distinct AND drawn only from `utf16hex:` plus hex
+  // digits are distinct TO THE OPERATOR, because that alphabet holds no pair of characters this
+  // branch has found to draw alike. That is an invariant of the encoding, not a fact about the
+  // characters this fixture happens to use. (Round 7 asserted the same shape about printable
+  // ASCII, which was false — `O`/`0`, `I`/`l`/`1` and `rn`/`m` are all inside it.)
   const entries = noticeEntries(notice!)
   assert.equal(entries.length, 2)
   const groups = entries.map(groupField)
   assert.equal(new Set(groups).size, 2, groups.join(' || '))
-  for (const group of groups) assert.deepEqual(nonPrintableAscii(group), [], group)
+  for (const group of groups) assertIdentityToken(group)
 
   // NOT VACUOUS: the readable half of the two entries differs in exactly the one code point that
   // draws the same as the other, so nothing before `group=` separates these rows on screen.
@@ -1436,8 +1478,8 @@ test('customer mix: guest names differing only in a non-ASCII homoglyph stay dis
 })
 
 test('customer mix: a non-Latin name is spelled out in `group=` and left readable in `name=` (o3d-7jfq r7)', async () => {
-  // WHAT THE SPLIT COSTS, WRITTEN DOWN. `group=` is ASCII-only, so an emailless guest called
-  // `株式会社アクメ` gets an identity field of seven escapes that an operator cannot read as a
+  // WHAT THE SPLIT COSTS, WRITTEN DOWN. `group=` prints no characters at all, so an emailless guest
+  // called `株式会社アクメ` gets an identity field of hex digits that an operator cannot read as a
   // name. That is the price of a rule with no list to keep extending, and it is affordable only
   // because the other three fields are untouched: `name=` still prints the EXACT string the
   // Customer column prints, which is what the operator matches the row on. Escape both and the
@@ -1456,7 +1498,7 @@ test('customer mix: a non-Latin name is spelled out in `group=` and left readabl
   assert.ok(notice!.endsWith(
     'They are, highest-ranked first: '
     + 'name="株式会社アクメ" email=<none> customerId=<none> '
-    + 'group="guest-name:\\u682a\\u5f0f\\u4f1a\\u793e\\u30a2\\u30af\\u30e1".',
+    + `group=${identityToken('guest-name:株式会社アクメ')}.`,
   ), notice)
 
   // THE READABLE FIELD, TAKEN FROM THE COLUMN ITSELF rather than from a literal: whatever the
@@ -1465,10 +1507,214 @@ test('customer mix: a non-Latin name is spelled out in `group=` and left readabl
   assert.ok(notice!.includes(`name="${report.rows[0]!.customerName}"`), notice)
 
   const entry = noticeEntries(notice!)[0]!
-  assert.deepEqual(nonPrintableAscii(groupField(entry)), [], groupField(entry))
+  assertIdentityToken(groupField(entry))
   // AND THE TWO POLICIES REALLY ARE DIFFERENT HERE — proof the assertion above is not satisfied by
   // an accidentally all-ASCII fixture: the readable half carries all seven characters raw.
   assert.equal(nonPrintableAscii(readableFields(entry)).length, 7)
+})
+
+/**
+ * The LETTERS of the confusable pairs the round-8 finding named, which the hex alphabet excludes.
+ *
+ * The digits `0` and `1` are deliberately absent from this list: they are hex digits and a token is
+ * full of them. What made `O`/`0` and `I`/`l`/`1` dangerous was that a letter could be drawn as a
+ * digit, and what makes hex safe is that those letters cannot occur — not that the digits cannot.
+ * `m`, `n` and `r` are here for the same reason: no `rn` to be drawn as an `m`, and no `m` either.
+ * The assertion this feeds is a statement ABOUT THE ALPHABET and stays true however the fixtures
+ * change.
+ */
+const ASCII_CONFUSABLE_LETTERS = ['O', 'o', 'I', 'l', 'm', 'n', 'r']
+
+/**
+ * ONE LABEL AS A FONT MAY DRAW IT, for the ASCII confusables round 8 found (o3d-7jfq r8).
+ *
+ * The same shape of model as `asRendered` and `asSeen` above, one layer further in. Those two
+ * collapse what HTML collapses and what Unicode requires a renderer to unify; this one folds the
+ * pairs a PROPORTIONAL FONT unifies without being asked to — `O` and `0` are one shape, `I` and
+ * `l` and `1` are one shape, and `r` followed by `n` is the shape of `m`. A label that is still
+ * distinct after this is one no such font can merge; a label that is not was never distinct to the
+ * operator, whatever it was as a string. `rn` is folded first, before its own letters are.
+ */
+function asConfused(text: string): string {
+  return text.replaceAll('rn', 'm').replaceAll('O', '0').replaceAll('I', '1').replaceAll('l', '1')
+}
+
+test('customer mix: guest names differing only in an ASCII confusable stay distinguishable in `group=` (o3d-7jfq r8)', async () => {
+  // ROUND 8. Round 7 escaped everything OUTSIDE printable ASCII and emitted printable ASCII as
+  // itself, on an argument written into the code: printable ASCII holds no two code points that
+  // draw alike. IT DOES. `O` and `0`, `l` and `1`, and the sequence `rn` against `m` are one shape
+  // each in the 11px proportional font this notice renders in — so `group=` was injective as a
+  // string and NOT injective on screen. That is rounds 5, 6 and 7's defect exactly, one range
+  // inward, and it is why the field no longer emits any character of the key.
+  //
+  // Six emailless guests in three confusable pairs, invoiced 600 down to 100 so the rank order is
+  // the order below and no tie falls to localeCompare.
+  const names = ['Acme O Ltd', 'Acme 0 Ltd', 'Acme l Ltd', 'Acme 1 Ltd', 'Acme rn Ltd', 'Acme m Ltd']
+  const report = await reportForContradicted(
+    names.map((name, index) => contradicted({
+      id: `order-${index + 1}`,
+      customerId: null,
+      customerName: name,
+      customerEmail: null,
+      totalBase: String(600 - index * 100),
+    })),
+  )
+
+  // THE PREMISE: six groups. A grouping that folded any of these pairs would leave nothing for the
+  // label to tell apart and every assertion below would pass over an empty case.
+  assert.equal(report.rows.length, 6)
+  assert.equal(report.totals.costInconsistentRows, '6')
+  assert.deepEqual(report.rows.map((row) => row.customerName), names)
+
+  const notice = inconsistentNotice(report)
+  assert.ok(notice, 'the report did not raise the inconsistent-evidence notice')
+  const entries = noticeEntries(notice!)
+  assert.equal(entries.length, 6)
+
+  // THE READABLE HALF IS UNTOUCHED, and it is taken from the COLUMN rather than from a literal:
+  // whatever the Customer cell shows for a row is what `name=` prints for it, character for
+  // character. This is what stops the fix making the notice useless — hex the whole entry and an
+  // operator has nothing to match against the page.
+  for (const [index, row] of report.rows.entries()) {
+    assert.ok(entries[index]!.startsWith(`name="${row.customerName}" `), entries[index])
+    assert.ok(notice!.includes(`name="${row.customerName}"`), notice)
+  }
+
+  // THE LOAD-BEARING PROPERTY, asserted through the drawing model rather than by reading the
+  // strings: six entries, and no two of them look alike once a font has had its way with them.
+  // Under the round-7 encoder these six entries folded to THREE.
+  assert.equal(new Set(entries.map(asConfused)).size, 6, entries.map(asConfused).join(' || '))
+
+  // NOT VACUOUS, AND `group=` IS WHAT DOES IT: the six readable halves fold to three, so each pair
+  // of them is ONE STRING on screen and nothing before `group=` separates those rows.
+  assert.equal(new Set(entries.map(readableFields).map(asConfused)).size, 3)
+
+  // AND THE INVARIANT BEHIND IT, rather than a fact about this fixture: six identity fields, all
+  // six distinct, and none of them ABLE to carry a confusable — the alphabet is `utf16hex:` plus
+  // `0`-`9a`-`f`, which contains no `O`, no `I`, no `l`, and no `m`, `n` or `r`.
+  const groups = entries.map(groupField)
+  assert.equal(new Set(groups).size, 6, groups.join(' || '))
+  for (const group of groups) {
+    assertIdentityToken(group)
+    for (const confusable of ASCII_CONFUSABLE_LETTERS) {
+      assert.equal(group.includes(confusable), false, `${group} carries the confusable ${confusable}`)
+    }
+  }
+
+  // THE PRECONDITION THAT MAKES THAT MEAN SOMETHING: the KEYS really do carry those characters, so
+  // an encoder that emitted printable ASCII as itself would have put them on screen.
+  const keys = names.map((name) => `guest-name:${name}`)
+  assert.ok(keys.some((key) => key.includes('O')), keys.join(' || '))
+  assert.ok(keys.some((key) => key.includes('l')), keys.join(' || '))
+  assert.ok(keys.some((key) => key.includes('rn')), keys.join(' || '))
+
+  // AND THE FIELDS ARE THE KEYS: four hex digits per code unit, so the width is a function of the
+  // key's length and two tokens can be compared position against position.
+  for (const [index, key] of keys.entries()) {
+    assert.equal(groups[index], identityToken(key))
+    assert.equal(groups[index]!.length, 'utf16hex:'.length + key.length * 4)
+  }
+})
+
+test('customer mix: `group=` is fixed width over astral characters and lone surrogates too (o3d-7jfq r8)', async () => {
+  // WHY THE ENCODER WALKS CODE UNITS AND NOT CODE POINTS. The claim is that this is a fixed-width
+  // block code over THE WHOLE DOMAIN — every JavaScript string, not every well-formed one — and a
+  // code-point walk cannot deliver that: an astral character is one code point and would need six
+  // digits, and a lone surrogate is not a scalar value at all. A string IS a sequence of UTF-16
+  // code units, so walking those is what makes the width a constant and the map injective with
+  // nothing left to assume.
+  //
+  // Three emailless guests: an astral character, and two DIFFERENT lone high surrogates that no
+  // scalar-value encoder could tell apart (both would become U+FFFD). 300/200/100 to fix the rank.
+  const astral = 'A\u{1f600}B'
+  const loneOne = 'A\ud83dB'
+  const loneTwo = 'A\ud83eB'
+  assert.notEqual(loneOne, loneTwo)
+
+  const report = await reportForContradicted(
+    [astral, loneOne, loneTwo].map((name, index) => contradicted({
+      id: `order-${index + 1}`,
+      customerId: null,
+      customerName: name,
+      customerEmail: null,
+      totalBase: String(300 - index * 100),
+    })),
+  )
+
+  assert.equal(report.rows.length, 3)
+  assert.equal(report.totals.costInconsistentRows, '3')
+
+  const notice = inconsistentNotice(report)
+  assert.ok(notice, 'the report did not raise the inconsistent-evidence notice')
+  const groups = noticeEntries(notice!).map(groupField)
+  assert.equal(groups.length, 3)
+
+  // DERIVED BY HAND. `guest-name:` is g u e s t - n a m e :, ASCII 0x67 0x75 0x65 0x73 0x74 0x2d
+  // 0x6e 0x61 0x6d 0x65 0x3a. `A` is 0x41 and `B` is 0x42. U+1F600 is the surrogate pair
+  // U+D83D U+DE00, which is EIGHT digits and not six; the two lone surrogates are U+D83D and
+  // U+D83E, four digits each and different in the last one.
+  const prefix = 'utf16hex:00670075006500730074002d006e0061006d0065003a'
+  assert.equal(groups[0], `${prefix}0041d83dde000042`)
+  assert.equal(groups[1], `${prefix}0041d83d0042`)
+  assert.equal(groups[2], `${prefix}0041d83e0042`)
+
+  // THE PROPERTY THOSE THREE LITERALS ARE AN INSTANCE OF: still the alphabet, still four digits per
+  // code unit, and the two lone surrogates still distinct — which is the case a code-point or
+  // UTF-8 route would have collapsed.
+  for (const group of groups) assertIdentityToken(group)
+  assert.equal(new Set(groups).size, 3, groups.join(' || '))
+  assert.equal(groups[0]!.length, 'utf16hex:'.length + `guest-name:${astral}`.length * 4)
+})
+
+test('customer mix: the notice says in words that `group=` is a machine token (o3d-7jfq r8)', async () => {
+  // A FIELD NOBODY CAN READ HAS TO SAY SO. `group=utf16hex:0063…` looks like corruption to an
+  // operator who has not been told what it is, and the notice is the only place most of them will
+  // ever be told. So the wording is asserted here, not left to whoever edits the string next.
+  const report = await reportForContradicted([
+    contradicted({ id: 'order-1', customerId: 'cust-1', customerName: 'Acme Ltd', customerEmail: null, totalBase: '200' }),
+  ])
+  const notice = inconsistentNotice(report)
+  assert.ok(notice, 'the report did not raise the inconsistent-evidence notice')
+
+  // THE READABLE HALF IS WHAT AN OPERATOR IS SENT TO FIRST, and the notice says which fields those
+  // are — the sentence that stops this fix from making the notice unusable.
+  assert.ok(notice!.includes('Find the row by reading name= and email=, which show exactly what the Customer and Email cells show.'), notice)
+
+  // AND THE IDENTITY HALF IS NAMED FOR WHAT IT IS: not a name, not to be read, compared rather
+  // than parsed — and the encoding spelled out so the digits are not mistaken for a corrupted one.
+  assert.ok(notice!.includes('group= is not a name and is not meant to be read'), notice)
+  assert.ok(notice!.includes('written as a machine token'), notice)
+  assert.ok(notice!.includes('the literal utf16hex: followed by 4 lowercase hex digits for each UTF-16 code unit of it'), notice)
+  assert.ok(notice!.includes('comparing their tokens digit against digit at the same position'), notice)
+
+  // AND IT COMES BEFORE THE LIST. Not cosmetic: the list ends the notice so that the overflow
+  // clause — where the ones it could not name are found — is the last thing an operator reads,
+  // and every `endsWith` assertion in this file depends on the entries still being final.
+  assert.ok(notice!.indexOf('machine token') < notice!.indexOf('They are, highest-ranked first:'), notice)
+  assert.match(notice!, /group=utf16hex:[0-9a-f]+\.$/)
+})
+
+/**
+ * The component that draws the notices, read as a fixture for one property only.
+ */
+function reportPageTitleSource(): string {
+  return readFileSync(path.join(process.cwd(), 'app/(dashboard)/analytics/_components/report-page-title.tsx'), 'utf8')
+}
+
+test('the notice list is rendered with ligature formation suppressed (o3d-7jfq r8)', async () => {
+  // A MITIGATION, ASSERTED SO IT CANNOT QUIETLY LAPSE. The identity token's whole value is that
+  // every code unit is four digits wide and position therefore means something. A font that
+  // ligates `ff` into a single glyph — and `ff` is an ordinary pair of hex digits — makes a token
+  // LOOK a digit shorter than it is, which breaks positional comparison for the reader without
+  // changing a byte. Suppressing ligatures on the list costs nothing and closes that.
+  const source = reportPageTitleSource()
+
+  // THE WALK REACHED THE RIGHT ELEMENT: this is the component that renders `notices`, and the
+  // assertion below is about the list it renders them in, not about any string in the file.
+  assert.ok(source.includes('notices.map('), 'report-page-title.tsx no longer renders the notices list')
+  const list = source.split('\n').find((line) => line.includes('<ul className=') && line.includes('text-[11px]'))
+  assert.ok(list, 'the notices list is no longer the 11px <ul> this assertion was written about')
+  assert.ok(list!.includes('[font-variant-ligatures:none]'), list)
 })
 
 /**
@@ -1530,8 +1776,8 @@ test('help-docs/analytics.md documents the label format the code actually emits 
   // THE PREMISE: two labels, and they are not the same label. If the report merged these two the
   // doc assertions below would still pass on one example and prove nothing about the other.
   assert.equal(entries.length, 2)
-  assert.equal(entries[0], 'name="Acme Ltd" email=<none> customerId="cust-1" group="cust-1"')
-  assert.equal(entries[1], 'name="Acme Ltd" email=<none> customerId=<none> group="guest-name:Acme Ltd"')
+  assert.equal(entries[0], `name="Acme Ltd" email=<none> customerId="cust-1" group=${identityToken('cust-1')}`)
+  assert.equal(entries[1], `name="Acme Ltd" email=<none> customerId=<none> group=${identityToken('guest-name:Acme Ltd')}`)
 
   const doc = analyticsDoc()
   for (const entry of entries) {
@@ -1548,11 +1794,11 @@ test('help-docs/analytics.md documents the label format the code actually emits 
   assert.equal(doc.includes('[guest]'), false)
 })
 
-test('help-docs/analytics.md documents the ASCII-only group field it now emits (o3d-7jfq r7)', async () => {
-  // The doc has been wrong about this notice twice, so the round-7 split is executed rather than
+test('help-docs/analytics.md documents the machine-token group field it now emits (o3d-7jfq r8)', async () => {
+  // The doc has been wrong about this notice twice, so the split is executed rather than
   // described: the worked example in the paragraph is PRODUCED here and matched against the file.
   // A doc that still promised only whitespace escapes would send an operator meeting
-  // `group="guest-name:株…"` looking for a name that had been corrupted.
+  // a hex identity token looking for a name that had been corrupted.
   const report = await reportForContradicted([
     contradicted({ id: 'order-1', customerId: null, customerName: '株式会社アクメ', customerEmail: null, totalBase: '200' }),
   ])
@@ -1562,10 +1808,25 @@ test('help-docs/analytics.md documents the ASCII-only group field it now emits (
 
   const doc = analyticsDoc()
   assert.ok(doc.includes(entry), `help-docs/analytics.md does not show the label the code emits: ${entry}`)
-  // AND IT SAYS WHY, because the example alone reads as a bug. The split is the operator-facing
-  // fact: one half to find the row by, one half to tell two rows apart by.
-  assert.ok(doc.includes('**ASCII only**'), doc.slice(doc.indexOf('A third case reads differently')))
+
+  // AND IT SAYS WHAT THE FIELD IS, because the example alone reads as a bug. The operator-facing
+  // fact is the split — one half to find the row by, one half to tell two rows apart by — and,
+  // since round 8, that the second half is a TOKEN and not text. An operator who reads it as a
+  // corrupted name is the failure this sentence exists to prevent.
+  assert.ok(doc.includes('**a machine token, not a name**'), doc.slice(doc.indexOf('A third case reads differently')))
+  assert.ok(doc.includes('four lowercase hex digits for each UTF-16 code unit'), doc)
+  assert.ok(doc.includes('compare two tokens digit against digit at the same position'), doc)
   assert.ok(doc.includes('an identity you cannot tell apart is not an identity'), doc)
+
+  // AND IT NAMES THE CASE THAT MADE IT HEX rather than plain ASCII, so the doc cannot drift back
+  // to the claim the code used to make and the round-8 review found false.
+  assert.ok(doc.includes('a capital `O` against a digit `0`'), doc)
+  assert.equal(doc.includes('**ASCII only**'), false)
+
+  // AND IT STATES THE RESIDUE INSTEAD OF PROMISING THERE IS NONE. Hex removes the confusables the
+  // finding named; it does not make every glyph unmistakable, and a doc that claimed otherwise
+  // would be this branch's own recurring defect written into the operator-facing half.
+  assert.ok(doc.includes('`6` and `b`'), doc)
 })
 
 test('customer mix: two distinct customer groups sharing one name are two distinguishable entries (o3d-7jfq)', async () => {
@@ -1588,7 +1849,7 @@ test('customer mix: two distinct customer groups sharing one name are two distin
   assert.match(notice!, /^2 of 2 customers/)
   // The Email column is what separates these two on screen, so it is what separates them here —
   // and the group key says so a second time, from the identity the grouping actually used.
-  assert.ok(notice!.endsWith('They are, highest-ranked first: name="John Smith" email="john@one.example" customerId=<none> group="guest-email:john@one.example"; name="John Smith" email="john@two.example" customerId=<none> group="guest-email:john@two.example".'), notice)
+  assert.ok(notice!.endsWith(`They are, highest-ranked first: name="John Smith" email="john@one.example" customerId=<none> group=${identityToken('guest-email:john@one.example')}; name="John Smith" email="john@two.example" customerId=<none> group=${identityToken('guest-email:john@two.example')}.`), notice)
 })
 
 test('customer mix: a registered customer and a guest sharing BOTH name and email are still told apart (o3d-7jfq)', async () => {
@@ -1607,7 +1868,7 @@ test('customer mix: a registered customer and a guest sharing BOTH name and emai
 
   const notice = inconsistentNotice(report)
   assert.ok(notice, 'the report did not raise the inconsistent-evidence notice')
-  assert.ok(notice!.endsWith('They are, highest-ranked first: name="Acme Ltd" email="ops@acme.example" customerId="cust-1" group="cust-1"; name="Acme Ltd" email="ops@acme.example" customerId=<none> group="guest-email:ops@acme.example".'), notice)
+  assert.ok(notice!.endsWith(`They are, highest-ranked first: name="Acme Ltd" email="ops@acme.example" customerId="cust-1" group=${identityToken('cust-1')}; name="Acme Ltd" email="ops@acme.example" customerId=<none> group=${identityToken('guest-email:ops@acme.example')}.`), notice)
 })
 
 test('customer mix: a guest whose email IS the absence sentinel does not wear the emailless guest label (o3d-7jfq)', async () => {
@@ -1633,7 +1894,7 @@ test('customer mix: a guest whose email IS the absence sentinel does not wear th
 
   const notice = inconsistentNotice(report)
   assert.ok(notice, 'the report did not raise the inconsistent-evidence notice')
-  assert.ok(notice!.endsWith('They are, highest-ranked first: name="Acme Ltd" email=<none> customerId=<none> group="guest-name:Acme Ltd"; name="Acme Ltd" email="(no email)" customerId=<none> group="guest-email:(no email)".'), notice)
+  assert.ok(notice!.endsWith(`They are, highest-ranked first: name="Acme Ltd" email=<none> customerId=<none> group=${identityToken('guest-name:Acme Ltd')}; name="Acme Ltd" email="(no email)" customerId=<none> group=${identityToken('guest-email:(no email)')}.`), notice)
   // AND THE TWO ENTRIES ARE NOT THE SAME STRING. Split on the separator and compare: the round-4
   // label made these identical, and a list that names one row twice names neither.
   const entries = notice!.slice(notice!.indexOf('highest-ranked first: ') + 'highest-ranked first: '.length).replace(/\.$/, '').split('; ')
@@ -1665,7 +1926,7 @@ test('customer mix: the group key in the label is the one the rows were actually
   const notice = inconsistentNotice(report)
   assert.ok(notice, 'the report did not raise the inconsistent-evidence notice')
   assert.match(notice!, /^1 of 1 customers/)
-  assert.ok(notice!.endsWith('They are, highest-ranked first: name="Acme Ltd" email="Ops@Acme.example" customerId=<none> group="guest-email:ops@acme.example".'), notice)
+  assert.ok(notice!.endsWith(`They are, highest-ranked first: name="Acme Ltd" email="Ops@Acme.example" customerId=<none> group=${identityToken('guest-email:ops@acme.example')}.`), notice)
 })
 
 test('customer mix: a BLANK stored name is still one findable entry in the notice (o3d-7jfq)', async () => {
@@ -1684,7 +1945,7 @@ test('customer mix: a BLANK stored name is still one findable entry in the notic
 
   const notice = inconsistentNotice(report)
   assert.ok(notice, 'the report did not raise the inconsistent-evidence notice')
-  assert.ok(notice!.endsWith('They are, highest-ranked first: name="" email="jo@x.example" customerId="cust-1" group="cust-1"; name="Zeta" email=<none> customerId="cust-2" group="cust-2".'), notice)
+  assert.ok(notice!.endsWith(`They are, highest-ranked first: name="" email="jo@x.example" customerId="cust-1" group=${identityToken('cust-1')}; name="Zeta" email=<none> customerId="cust-2" group=${identityToken('cust-2')}.`), notice)
 })
 
 test('customer mix: a name containing the list separator does not break the list (o3d-7jfq)', async () => {
@@ -1699,7 +1960,7 @@ test('customer mix: a name containing the list separator does not break the list
 
   const notice = inconsistentNotice(report)
   assert.ok(notice, 'the report did not raise the inconsistent-evidence notice')
-  assert.ok(notice!.endsWith('They are, highest-ranked first: name="Smith; Jones Ltd" email=<none> customerId="cust-1" group="cust-1"; name="Say ""Hi"" Ltd" email=<none> customerId="cust-2" group="cust-2".'), notice)
+  assert.ok(notice!.endsWith(`They are, highest-ranked first: name="Smith; Jones Ltd" email=<none> customerId="cust-1" group=${identityToken('cust-1')}; name="Say ""Hi"" Ltd" email=<none> customerId="cust-2" group=${identityToken('cust-2')}.`), notice)
   // AND THE LIST IS SPLITTABLE: exactly one entry boundary for two customers. The name's own
   // semicolon is followed by ` Jones`, not by the field that opens an entry.
   assert.equal(notice!.split('; name="').length, 2)
