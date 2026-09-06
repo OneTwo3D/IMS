@@ -9,6 +9,7 @@ import {
   fetchInvoicesModifiedSince,
   idsWhere,
   ledgerAmountMagnitudeBound,
+  ledgerDifferenceMagnitudeBound,
   parseLedgerAmount,
   partitionPaymentReversals,
   listedLedgerPaymentIds,
@@ -21,7 +22,7 @@ import {
   type InvoiceFetcher,
   type XeroInvoice,
 } from '@/lib/connectors/xero/invoice-delta'
-import { subtractMoney } from '@/lib/domain/math/decimal'
+import { ledgerAmountEpsilon, qboLedgerAmount } from '@/lib/connectors/quickbooks/payment-poller'
 
 const SINCE = new Date('2026-07-17T12:00:00.000Z')
 
@@ -1287,36 +1288,108 @@ test('[o3d-psrx r15] the bound is TIGHT for what it can guarantee: one binade lo
   assert.equal(parseLedgerAmount(below.v, 'GBP'), 35184372088832.02)
 })
 
-test('[o3d-psrx r15] a payload FINER than its own minor unit crosses the threshold below ANY bound', async () => {
-  // o3d-psrx r15 (Codex HIGH) — THE OTHER HALF OF THE ANSWER, AND THE UNCOMFORTABLE ONE. The flip the
-  // finding reproduces is real, and it is NOT closed by lowering the bound: it needs digits finer than
-  // the currency's minor unit, and for those the true difference is not quantized to two epsilons, so
-  // a difference just above the threshold always exists within one spacing of it and rounding can
-  // always carry it below. Lowering the bound moves the class down instead of emptying it.
+test('[o3d-psrx r16] the r15 residual — a payload FINER than its minor unit — is REFUSED BY ITS SCALE', async () => {
+  // o3d-psrx r16 (Codex HIGH 1) — THE SAME FIGURES r15 HAD TO ADMIT, AND THE RULE THAT CLOSES THEM.
   //
-  // GBP, THREE decimals, at 2^44 — BELOW the bound proposed by the finding.
+  // r15's answer was that no finite MAGNITUDE empties this class, which is true and is not the whole
+  // question: the class is defined by SCALE, and a decoded double states its own scale. Every figure
+  // below is one r15 measured as flipping the decision, reused unchanged, and every one of them is now
+  // refused before it can reach a subtraction.
+  //
+  // GBP, THREE decimals, at 2^44 — BELOW every candidate bound, so the magnitude rule admits it and
+  // only the scale rule can refuse it.
   const three = await decodeJsonAmounts('{"TotalAmt":17592186044416.008,"Balance":17592186044416.002}')
-  assert.ok(parseLedgerAmount(three.TotalAmt, 'GBP') !== null && parseLedgerAmount(three.Balance, 'GBP') !== null,
-    'precondition: both figures are ADMITTED — this magnitude is below every candidate bound')
-  // THE SETTLED FIGURE AS PRODUCTION COMPUTES IT — `subtractMoney` on the two parsed values, not a
-  // float subtraction of the test's own. It is 0.004; the true one is 0.006, which is ABOVE the
-  // threshold, so a real payment reads as a ledger holding nothing.
-  const threeSettled = subtractMoney(parseLedgerAmount(three.TotalAmt, 'GBP')!, parseLedgerAmount(three.Balance, 'GBP')!)
-  assert.ok(threeSettled.toNumber() <= PAYMENT_PRESENT_EPSILON,
-    'the decoded settled amount is at or below the threshold, though the true one (0.006) is above')
-  // FOUR decimals, lower again — the class does not have a floor.
-  const four = await decodeJsonAmounts('{"TotalAmt":1099511627776.0062,"Balance":1099511627776.0011}')
-  const fourSettled = subtractMoney(parseLedgerAmount(four.TotalAmt, 'GBP')!, parseLedgerAmount(four.Balance, 'GBP')!)
-  assert.ok(fourSettled.toNumber() <= PAYMENT_PRESENT_EPSILON,
-    'at 2^40 a four-decimal payload does the same (true 0.0051, read 0.0048), which is why no finite '
-    + 'bound closes this class — lowering the bound only moves it down')
+  assert.ok(Math.abs(three.TotalAmt) < ledgerAmountMagnitudeBound('GBP')
+    && Math.abs(three.Balance) < ledgerAmountMagnitudeBound('GBP'),
+    'precondition: the MAGNITUDE rule admits both of these, so a refusal below can only be the scale')
+  assert.equal(parseLedgerAmount(three.TotalAmt, 'GBP'), null,
+    'the decoded double reads back as 17592186044416.008 — three decimals of a two-decimal currency, '
+    + 'which is not a figure that can be shown to be quantized')
+  assert.equal(parseLedgerAmount(three.Balance, 'GBP'), null)
+  // r15 measured this pair's decoded settlement at 0.004 against a true 0.006, so it crossed the
+  // threshold. It can no longer be computed at all, which is the point: the operands never arrive.
+  assert.equal(qboLedgerAmount({ Id: 'r', TotalAmt: three.TotalAmt, Balance: three.Balance,
+    CurrencyRef: { value: 'GBP' } }).paid, null,
+    'THE ROUTE: the settled figure r15 could only watch go wrong is now UNREADABLE, and null withholds')
 
-  // WHERE THE FIX ACTUALLY LIVES, as a control: the SAME figures arriving as strings are refused,
-  // because there the original digits still exist for the round trip to check. The residual is
-  // therefore precisely a JSON numeric token finer than its currency's minor unit — o3d-39jg.
+  // FOUR decimals at 2^40, the second figure r15 measured (true 0.0051, read 0.0048). Same answer.
+  const four = await decodeJsonAmounts('{"TotalAmt":1099511627776.0062,"Balance":1099511627776.0011}')
+  assert.equal(parseLedgerAmount(four.TotalAmt, 'GBP'), null)
+  assert.equal(parseLedgerAmount(four.Balance, 'GBP'), null)
+  assert.equal(qboLedgerAmount({ Id: 'r', TotalAmt: four.TotalAmt, Balance: four.Balance,
+    CurrencyRef: { value: 'GBP' } }).paid, null)
+
+  // AND CODEX'S OWN PAIR, which is the one case where the scale rule alone is not the reason. A token
+  // of `35184372088832.003` decodes to a double whose shortest reading is `35184372088832` — scale 0,
+  // so the scale rule ADMITS it, and admitting it is correct: the reading is within half a penny of
+  // the token, and every admitted reading is a whole penny from the next. The pair is refused because
+  // its OTHER half reads back at three decimals.
+  const codex = await decodeJsonAmounts('{"TotalAmt":35184372088832.003,"Balance":35184372088831.997}')
+  assert.equal(parseLedgerAmount(codex.TotalAmt, 'GBP'), 35184372088832,
+    'the shortest reading of a decoded double may be SHORTER than the token — this one is a whole '
+    + 'number, and a whole number of pounds is quantized')
+  assert.equal(parseLedgerAmount(codex.Balance, 'GBP'), null,
+    'while its partner reads back at three decimals and is refused, so the pair never subtracts')
+  assert.equal(qboLedgerAmount({ Id: 'r', TotalAmt: codex.TotalAmt, Balance: codex.Balance,
+    CurrencyRef: { value: 'GBP' } }).paid, null,
+    'THE ROUTE for the finding\'s own reproduction: 0.006 true, 0.004 decoded, and now UNREADABLE')
+
+  // THE STRING ARM IS UNCHANGED AND IS STILL THE CONTROL: the same figures as text are refused by the
+  // round trip, at every magnitude, because there the original digits exist to be checked.
   assert.equal(parseLedgerAmount('17592186044416.002', 'GBP'), null)
   assert.equal(parseLedgerAmount('1099511627776.0062', 'GBP'), null)
   assert.equal(parseLedgerAmount('1099511627776.0011', 'GBP'), null)
+})
+
+test('[o3d-psrx r16] scale alone does NOT close the class for a DIFFERENCE, and this is the bound that does', async () => {
+  // o3d-psrx r16 — THE CASE THE SCALE RULE CANNOT SEE, MEASURED. A double's shortest reading can be
+  // shorter than the token that produced it, so two tokens FINER than the minor unit can sit inside
+  // ONE rounding interval and read back as one coarse, perfectly quantized figure. Their exact
+  // difference is then zero while the ledger holds more than the threshold.
+  //
+  // GBP at 2^45: the interval around `35184372088832.01` is 0.0078125 wide, which is WIDER than the
+  // 0.005 threshold the decision uses. Both tokens below fall in it.
+  const hidden = await decodeJsonAmounts('{"TotalAmt":35184372088832.0117,"Balance":35184372088832.0040}')
+  assert.equal(hidden.TotalAmt, hidden.Balance,
+    'precondition: two tokens 0.0077 apart — ABOVE the threshold — decode to ONE double')
+  assert.equal(String(hidden.TotalAmt), '35184372088832.01',
+    'whose own decimal reading is two decimals, so the SCALE rule admits it and cannot help here')
+  assert.ok(Math.abs(hidden.TotalAmt) < ledgerAmountMagnitudeBound('GBP'),
+    'and it is below the single-value magnitude bound, so that rule admits it too')
+  // Each figure on its own is still READ — the guarantee for a single value is intact, and narrowing
+  // that would refuse money r15 measured as provably readable.
+  assert.equal(parseLedgerAmount(hidden.TotalAmt, 'GBP'), 35184372088832.01)
+  // THE ROUTE: the DIFFERENCE is refused, because at this magnitude the decode spacing is wider than
+  // the threshold the difference is about to be compared against.
+  assert.ok(Math.abs(hidden.TotalAmt) >= ledgerDifferenceMagnitudeBound('GBP'),
+    'precondition: this is the one binade where spacing exceeds the epsilon')
+  assert.equal(qboLedgerAmount({ Id: 'r', TotalAmt: hidden.TotalAmt, Balance: hidden.Balance,
+    CurrencyRef: { value: 'GBP' } }).paid, null,
+    'so the settled figure is UNREADABLE rather than a zero — without this bound it is exactly 0, '
+    + 'which is HOLDS_NOTHING, which clears paidAt over a payment the ledger is still holding')
+
+  // THE CONTROL, ONE BINADE DOWN, where the spacing is no wider than the threshold: the difference is
+  // read, so this is a bound and not a blanket refusal of large figures.
+  const readable = await decodeJsonAmounts('{"TotalAmt":17592186044416.02,"Balance":17592186044416.01}')
+  assert.ok(Math.abs(readable.TotalAmt) < ledgerDifferenceMagnitudeBound('GBP'))
+  assert.equal(qboLedgerAmount({ Id: 'r', TotalAmt: readable.TotalAmt, Balance: readable.Balance,
+    CurrencyRef: { value: 'GBP' } }).paid, 0.01,
+    'a whole penny still survives a subtraction here, exactly as r15 measured')
+
+  // AND THE RULE, STATED RATHER THAN SAMPLED: in every supported precision the difference bound is
+  // exactly the magnitude at which one decode spacing stops fitting inside the epsilon.
+  for (const currency of ['GBP', 'JPY', 'KWD', 'CLF', null]) {
+    const bound = ledgerDifferenceMagnitudeBound(currency)
+    const epsilon = Number(ledgerAmountEpsilon(currency).toString())
+    const spacingJustBelow = Math.pow(2, Math.floor(Math.log2(bound)) - 1 - 52)
+    const spacingAtBound = spacingJustBelow * 2
+    assert.ok(spacingJustBelow <= epsilon,
+      `${currency ?? 'unstated'}: below the difference bound one spacing fits inside the epsilon, so `
+      + 'two tokens sharing a double are at most half a minor unit apart')
+    assert.ok(spacingAtBound > epsilon,
+      `${currency ?? 'unstated'}: and AT it they are not, which is why the refusal starts here and `
+      + 'not a binade lower — a bound that refused more would refuse readable money')
+  }
 })
 
 test('[o3d-psrx r14] the same figures are read in a currency whose minor unit they CAN carry', async () => {
@@ -1358,16 +1431,35 @@ test('[o3d-psrx r14] the largest two-decimal amount below the bound still reads,
 test('[o3d-psrx r14] ordinary amounts are untouched, in every supported precision', async () => {
   // The half of this change that runs on every poll. None of these is anywhere near a bound, and a
   // guard that moved any of them would be a defect far larger than the one it was written for.
+  //
+  // o3d-psrx r16: EVERY CASE IS NOW QUANTIZED TO ITS OWN CURRENCY, which is what "ordinary" means for
+  // a ledger figure and what r16 requires. The cases that were not — a four-decimal GBP amount, a
+  // two-decimal JPY one — have moved to the refusal list below, because a figure finer than its own
+  // currency is precisely what cannot be shown to have survived the decode.
   const decoded = await decodeJsonAmounts(
-    '{"a":0,"b":50.25,"c":1234567.8901,"d":-12.34,"e":0.001,"f":123456789.99,"g":0.0001}')
+    '{"a":0,"b":50.25,"c":1234567.89,"d":-12.34,"e":0.001,"f":123456789.99,"g":0.0001,"h":123456789}')
   const cases: [string, string, number][] = [
-    ['GBP', 'a', 0], ['GBP', 'b', 50.25], ['GBP', 'c', 1234567.8901], ['GBP', 'd', -12.34],
+    ['GBP', 'a', 0], ['GBP', 'b', 50.25], ['GBP', 'c', 1234567.89], ['GBP', 'd', -12.34],
     ['KWD', 'e', 0.001], ['GBP', 'f', 123456789.99], ['CLF', 'g', 0.0001],
-    ['JPY', 'f', 123456789.99], ['GBP', 'g', 0.0001],
+    ['JPY', 'h', 123456789], ['CLF', 'c', 1234567.89],
+    ['UYW', 'g', 0.0001], ['BHD', 'e', 0.001], ['JPY', 'a', 0], ['USD', 'b', 50.25],
   ]
   for (const [currency, key, expected] of cases) {
     assert.equal(parseLedgerAmount(decoded[key], currency), expected,
       `${decoded[key]} in ${currency} is ordinary money and must read unchanged`)
+  }
+  // AND THE PAIRED REFUSALS, so this is a rule about the currency and not about the number: the SAME
+  // ordinary-looking figures are refused in a currency whose minor unit they overshoot.
+  const finerThanItsCurrency: [string, string][] = [
+    ['GBP', 'g'],   // 0.0001 is four decimals of a two-decimal currency
+    ['JPY', 'f'],   // 123456789.99 is pennies in a currency that has none
+    ['GBP', 'e'],   // 0.001 is a tenth of a penny
+    ['KWD', 'g'],   // 0.0001 is finer than a fils
+  ]
+  for (const [currency, key] of finerThanItsCurrency) {
+    assert.equal(parseLedgerAmount(decoded[key], currency), null,
+      `${decoded[key]} carries more decimals than ${currency} has, so it cannot be shown to be `
+      + 'quantized and must be refused rather than read')
   }
   // Including through the reversal partition, which is what spends the number.
   const rows: XeroInvoice[] = [

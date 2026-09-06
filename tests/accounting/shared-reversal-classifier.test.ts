@@ -29,7 +29,15 @@ import { currencyMinorUnits, toDecimal } from '@/lib/domain/math/decimal'
  * point is 0.0009999999999976353, which is a different answer from the one production gives, and it
  * is exactly the size of figure the currency-aware threshold is about.
  */
-const ledgerAmount = (total: number | null, balance: number | null, currency: string | null = null) =>
+// o3d-psrx r16: the figures may be given as STRINGS as well as numbers, because after r16 the two
+// arms of `parseLedgerAmount` answer differently and several cases below are about exactly that. A
+// string is what QuickBooks sends when it serialises money as text, and it carries its own decimal
+// evidence; a number has already been through `Response.json()` and carries none.
+const ledgerAmount = (
+  total: number | string | null,
+  balance: number | string | null,
+  currency: string | null = null,
+) =>
   qboLedgerAmount({
     Id: 'row',
     TotalAmt: total ?? undefined,
@@ -511,8 +519,13 @@ test('[o3d-psrx r9] a stated part-paid position and an evidence absence are diff
       expect: { kind: 'UNPROVEN', paidAmount: 100, documentTotal: 100, currencyUnbound: false },
     },
     {
+      // o3d-psrx r16: AS A STRING, and that is now the only way this case exists. A GBP amount of
+      // 0.001 is finer than the currency's own minor unit, so as a JSON NUMBER it is refused outright
+      // — the decoded double cannot be shown to be quantized and the reader will not guess. As a
+      // string the original digits are still here, the round trip admits them, and the classifier
+      // still has to answer for a figure below the epsilon.
       name: 'within the epsilon of the total — nothing outstanding worth naming',
-      amount: ledgerAmount(100, 0.001, 'GBP'),
+      amount: ledgerAmount(100, '0.001', 'GBP'),
       expect: { kind: 'UNPROVEN', paidAmount: 99.999, documentTotal: 100, currencyUnbound: false },
     },
     {
@@ -686,10 +699,17 @@ test('[o3d-psrx r10] one minor unit is never zero, in any currency the repositor
 
   // THE CONTROL, and it is what proves the threshold is currency-DERIVED rather than merely smaller:
   // an amount below one minor unit of its own currency really is nothing, and must still admit.
-  const belowOneMinorUnit: Array<{ currency: string; total: number; balance: number }> = [
-    { currency: 'GBP', total: 100, balance: 99.999 },     // 0.001 GBP is not an amount that exists
-    { currency: 'JPY', total: 100, balance: 99.6 },       // 0.4 JPY likewise
-    { currency: 'KWD', total: 100, balance: 99.9999 },    // 0.0001 KWD likewise
+  //
+  // o3d-psrx r16: THE FIGURES ARE STRINGS HERE, DELIBERATELY. Each of these balances is finer than its
+  // own currency's minor unit, which is precisely what r16 refuses to read out of a JSON NUMBER — the
+  // decoded double cannot be shown to be quantized, so it is withheld rather than guessed. The string
+  // arm still admits them because the original digits are there to be checked, so the epsilon is
+  // still the thing being measured, which is what this control is for. The number form of the same
+  // figures is asserted below, so the two arms are pinned against each other rather than assumed.
+  const belowOneMinorUnit: Array<{ currency: string; total: number; balance: string }> = [
+    { currency: 'GBP', total: 100, balance: '99.999' },     // 0.001 GBP is not an amount that exists
+    { currency: 'JPY', total: 100, balance: '99.6' },       // 0.4 JPY likewise
+    { currency: 'KWD', total: 100, balance: '99.9999' },    // 0.0001 KWD likewise
   ]
   for (const c of belowOneMinorUnit) {
     assert.deepEqual(
@@ -698,6 +718,13 @@ test('[o3d-psrx r10] one minor unit is never zero, in any currency the repositor
       `${c.currency}: below half a minor unit the ledger holds nothing, and a genuine reversal must `
       + 'still be able to proceed — narrowing the pass is not the same as switching it off',
     )
+    // o3d-psrx r16 — AND THE SAME FIGURE AS A JSON NUMBER IS REFUSED, which is what makes the string
+    // form above a deliberate choice rather than an accident of the fixture. The two arms disagree
+    // BECAUSE their evidence differs, and this is the assertion that says so out loud.
+    assert.equal(classifyQboLedgerEvidence(ledgerAmount(c.total, Number(c.balance), c.currency)).kind,
+      'UNPROVEN',
+      `${c.currency}: as a decoded NUMBER the same sub-minor-unit balance cannot be shown to be `
+      + 'quantized, so it is withheld rather than read')
   }
 })
 
@@ -735,19 +762,36 @@ test('[o3d-psrx r10] the threshold is strictly below one minor unit of the curre
 // reads as nothing. HOLDS_NOTHING is the verdict `zeroPaidIsProvenReversal` is written about, so the
 // provenance gate then admits a reversal that clears `paidAt` and raises a chargeback.
 
-/** The admitted pair from the finding, and the arithmetic that makes it one. */
-const ADMITTED_TOTAL = 0.005055810576648219
-const ADMITTED_BALANCE = 0.00005581057664821855
+/**
+ * The admitted pair from the finding, and the arithmetic that makes it one.
+ *
+ * o3d-psrx r16 — AS STRING TOKENS, WHICH IS WHERE THIS DEFECT NOW LIVES. Both figures carry eighteen
+ * decimals, so as JSON NUMBERS they are refused outright by the scale rule and the derived-value
+ * guard is never reached. That is not a reason to delete r13's guard: the string arm still admits
+ * them — correctly, because their own digits prove they were represented — and the subtraction
+ * BETWEEN two exactly-read figures is still a conversion that can round a real payment onto the
+ * threshold. Keeping the pair as text is what keeps this test non-vacuous.
+ */
+const ADMITTED_TOTAL_TOKEN = '0.005055810576648219'
+const ADMITTED_BALANCE_TOKEN = '0.00005581057664821855'
+const ADMITTED_TOTAL = Number(ADMITTED_TOTAL_TOKEN)
+const ADMITTED_BALANCE = Number(ADMITTED_BALANCE_TOKEN)
 
 test('[o3d-psrx r13] the two figures in the admitted pair are each individually READABLE', () => {
   // The precondition, asserted rather than assumed: this pair is dangerous precisely BECAUSE r12's
   // input guard passes it. If a future change made either figure unreadable on its own, the test
   // below would still pass and would be proving nothing.
-  for (const [label, value] of [['total', ADMITTED_TOTAL], ['balance', ADMITTED_BALANCE]] as const) {
-    assert.equal(parseLedgerAmount(value, 'GBP'), value,
+  const tokens = [['total', ADMITTED_TOTAL_TOKEN], ['balance', ADMITTED_BALANCE_TOKEN]] as const
+  for (const [label, token] of tokens) {
+    assert.equal(parseLedgerAmount(token, 'GBP'), Number(token),
       `${label} must survive the input round trip — otherwise the derived-value guard is untested`)
-    assert.ok(toDecimal(parseLedgerAmount(value, 'GBP')!).equals(toDecimal(String(value))),
+    assert.ok(toDecimal(parseLedgerAmount(token, 'GBP')!).equals(toDecimal(token)),
       `${label} must be lossless coming in`)
+    // o3d-psrx r16, THE OTHER HALF OF THE PRECONDITION: the same figure as a decoded NUMBER is
+    // refused, because eighteen decimals is far finer than a penny and nothing about the double can
+    // show it was ever quantized. The arm split is the reason this test uses text.
+    assert.equal(parseLedgerAmount(Number(token), 'GBP'), null,
+      `${label} as a JSON number is finer than its currency's minor unit and must be refused`)
   }
   // And the exact difference really is a payment the ledger holds: strictly ABOVE the GBP epsilon.
   const exact = toDecimal(String(ADMITTED_TOTAL)).minus(toDecimal(String(ADMITTED_BALANCE)))
@@ -761,7 +805,7 @@ test('[o3d-psrx r13] the two figures in the admitted pair are each individually 
 })
 
 test('[o3d-psrx r13] a derived paid amount that cannot be converted is UNREADABLE, never a zero', () => {
-  const amount = ledgerAmount(ADMITTED_TOTAL, ADMITTED_BALANCE, 'GBP')
+  const amount = ledgerAmount(ADMITTED_TOTAL_TOKEN, ADMITTED_BALANCE_TOKEN, 'GBP')
   assert.equal(amount.paid, null,
     'a lossy Decimal->number conversion of the derived amount must refuse, not round onto the threshold')
   // NULL IS NOT ZERO, and this is the assertion that says so in the currency the verdict speaks.
@@ -772,7 +816,7 @@ test('[o3d-psrx r13] a derived paid amount that cannot be converted is UNREADABL
 })
 
 test('[o3d-psrx r13] THE ROUTE: the admitted pair WITHHOLDS instead of proving a full reversal', () => {
-  const verdict = classifyQboLedgerEvidence(ledgerAmount(ADMITTED_TOTAL, ADMITTED_BALANCE, 'GBP'))
+  const verdict = classifyQboLedgerEvidence(ledgerAmount(ADMITTED_TOTAL_TOKEN, ADMITTED_BALANCE_TOKEN, 'GBP'))
   // The load-bearing claim: this pair must not reach HOLDS_NOTHING, the one verdict every admitting
   // arm of the provenance gate is written about.
   assert.notEqual(verdict.kind, 'HOLDS_NOTHING',

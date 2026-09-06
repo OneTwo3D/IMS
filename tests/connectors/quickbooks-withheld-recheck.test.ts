@@ -673,7 +673,14 @@ test('[o3d-psrx r10] the smallest amount a 3-decimal currency can hold is not tr
   state.salesOrders = [paidOrderRow()]
   state.syncLogs = [postedRegistration()]
   // KWD is a 3-decimal currency: 0.001 is ONE minor unit, the smallest amount that can exist in it.
-  state.qboDocuments.set('QI1', { Id: 'QI1', Balance: 99.999, TotalAmt: 100, CurrencyRef: { value: 'KWD' } })
+  //
+  // o3d-psrx r16 — THE BALANCE IS A STRING ON BOTH SIDES OF THIS PAIR, and it has to be for the pair
+  // to stay a pair. `99.999` is three decimals; in GBP that is finer than the currency's own minor
+  // unit, so as a decoded JSON NUMBER the control below would be refused for its SCALE and the two
+  // outcomes would then differ for two reasons at once. As text the digits are still there, both arms
+  // read the figure exactly, and the only thing left that can separate the outcomes is the currency —
+  // which is what this test is about. The number form is asserted separately at the end.
+  state.qboDocuments.set('QI1', { Id: 'QI1', Balance: '99.999', TotalAmt: 100, CurrencyRef: { value: 'KWD' } })
   state.deltaBalanceDue = ['QI1']
 
   const kwd = await poll()
@@ -692,7 +699,7 @@ test('[o3d-psrx r10] the smallest amount a 3-decimal currency can hold is not tr
   reset()
   state.salesOrders = [paidOrderRow()]
   state.syncLogs = [postedRegistration()]
-  state.qboDocuments.set('QI1', { Id: 'QI1', Balance: 99.999, TotalAmt: 100, CurrencyRef: { value: 'GBP' } })
+  state.qboDocuments.set('QI1', { Id: 'QI1', Balance: '99.999', TotalAmt: 100, CurrencyRef: { value: 'GBP' } })
   state.deltaBalanceDue = ['QI1']
 
   const gbp = await poll()
@@ -701,6 +708,23 @@ test('[o3d-psrx r10] the smallest amount a 3-decimal currency can hold is not tr
     + 'switched this reversal off too, and narrowing the pass is not the same as disabling it')
   assert.equal(gbp.partiallyPaidDocuments, 0)
   assert.deepEqual(state.chargebacks, ['so_1'])
+
+  // o3d-psrx r16 — AND THE SAME GBP FIGURE AS A DECODED NUMBER REVERSES NOTHING, because a
+  // three-decimal reading of a two-decimal currency cannot be shown to have been quantized. This is
+  // what makes the string form above a deliberate choice: it isolates the currency, and this line
+  // says out loud what the other variable would have done.
+  reset()
+  state.salesOrders = [paidOrderRow()]
+  state.syncLogs = [postedRegistration()]
+  state.qboDocuments.set('QI1', { Id: 'QI1', Balance: 99.999, TotalAmt: 100, CurrencyRef: { value: 'GBP' } })
+  state.deltaBalanceDue = ['QI1']
+
+  const gbpNumeric = await poll()
+  assert.equal(gbpNumeric.salesReversed, 0,
+    'as a JSON number the same balance is finer than a penny, so it is refused rather than read, and '
+    + 'a refusal is never spent as a proven zero')
+  assert.equal(gbpNumeric.salesReversalsWithheld, 1)
+  assert.deepEqual(state.chargebacks, [])
 })
 
 // ---------------------------------------------------------------------------
@@ -895,26 +919,37 @@ test('[o3d-psrx r12] CONTROL: an unreadable TotalAmt of ZERO is not read as a vo
 })
 
 // ---------------------------------------------------------------------------
-// o3d-psrx r15 (Codex MEDIUM 2) — A MISSING `CurrencyRef` IS THE ORDINARY SHAPE, NOT AN UNKNOWN.
+// o3d-psrx r16 (Codex HIGH 2) — AN UNVERIFIED CURRENCY MUST NEVER WIDEN THE BOUND.
 //
-// r14 sized the magnitude bound by the row's own `CurrencyRef` and gave an unstated currency the
-// FINEST supported minor unit — the strictest bound — on the "unstated means be stricter" rule. But
-// QuickBooks omits `CurrencyRef` on EVERY document whenever multicurrency is disabled, so the
-// strictest reading was being applied to the normal single-currency shape: a base-currency row of
-// `TotalAmt = Balance = 600000000000` became entirely unreadable, its reversal was withheld, and the
-// identical row tagged `GBP` reversed. A guard that fires on ordinary documents is a guard somebody
-// deletes.
+// r15 read a missing `CurrencyRef` as the ordinary single-currency shape (it is) and concluded that
+// the currency of the linked IMS document could therefore size the magnitude bound (it cannot). The
+// argument was that a coarser bound only READS more documents while a coarser epsilon DISCARDS more,
+// so provenance could be spent on the one and withheld from the other. READING A DOCUMENT THAT SHOULD
+// HAVE BEEN REFUSED IS THE FALSE-REVERSAL PATH: `600000000000.0003` and `600000000000.0002` are one
+// CLF minor unit apart and decode to a single double, and an unverified IMS `GBP` admits both under
+// the two-decimal bound, subtracts them to zero, and reads the ledger as holding nothing. The bound is
+// a safety mechanism, not a convenience.
 //
-// THIS DRIVES THE POLLER, not the reader, and that is the point of putting it here: the fix is a
-// piece of WIRING — the candidate query must select the order's `currency` column, and the value must
-// reach `parseLedgerAmount` through the read that produced the amounts. A test that called the reader
-// with a currency in hand would sail over the whole of it, which is the same mistake r3's finding was.
+// AND THE REGRESSION IT WAS TRADED FOR WAS NOT ONE. `600000000000` is six hundred billion. The largest
+// absolute value in ANY numeric column of any IMS database is 11,660, and the largest MONEY figure is
+// 1,100 — the reproduction sits eight orders of magnitude above anything the business has ever
+// recorded. Refusing an absurd amount whose currency genuinely cannot be established is correct
+// behaviour, so what r15 called a regression was the guard working.
+//
+// WHAT SURVIVES FROM r15 IS THE PART THAT WAS RIGHT: the refusal now NAMES the binding defect instead
+// of blaming the ledger, and the wiring that carries the IMS currency stays — an IMS code may still
+// TIGHTEN a read, it may simply never loosen one.
+//
+// THIS DRIVES THE POLLER, not the reader, and that is the point of putting it here: what is being
+// tested is the WIRING — the candidate query selects the order's `currency` column and the value
+// reaches the read that produced the amounts, and the assertion is that arriving there changes no
+// bound. A test that called the reader with a currency in hand would sail over the whole of it.
 // ---------------------------------------------------------------------------
 
-test('[o3d-psrx r15] an ordinary QuickBooks row with NO CurrencyRef is READ, not refused', async () => {
+test('[o3d-psrx r16] an unverified IMS currency does NOT widen the bound: the row is still refused', async () => {
   reset()
-  // Codex's reproduction, and an entirely ordinary document: a base-currency amount that fits the
-  // money column, far below the two-decimal bound and far ABOVE the four-decimal one.
+  // Codex's r15 reproduction, unchanged, and now with the opposite expectation: the IMS order says
+  // GBP, and QuickBooks has not confirmed that it is what the document is denominated in.
   state.salesOrders = [{ ...paidOrderRow(), currency: 'GBP' }]
   state.syncLogs = [postedRegistration()]
   state.qboDocuments.set('QI1', { Id: 'QI1', Balance: 600000000000, TotalAmt: 600000000000 })
@@ -922,20 +957,36 @@ test('[o3d-psrx r15] an ordinary QuickBooks row with NO CurrencyRef is READ, not
 
   const polled = await poll()
 
-  assert.equal(polled.salesReversed, 1,
-    'THE REGRESSION: with the currency resolved from the IMS order this row is READ — paid is zero, '
-    + 'the ledger has been shown to hold nothing, and the reversal proceeds exactly as it does for '
-    + 'the identical row carrying an explicit CurrencyRef')
-  assert.equal(polled.salesReversalsWithheld, 0)
-  assert.deepEqual(state.activity.filter((a) => a.action === 'payment_reversal_withheld'), [],
-    'and nothing is withheld, so no operator is sent to look at a document whose amounts are ordinary')
+  assert.equal(polled.salesReversed, 0,
+    'THE FINDING: an IMS currency nothing has verified against QuickBooks may not select a larger '
+    + 'magnitude bound — a finer real currency would then be read with a coarser one, and that is the '
+    + 'decode collapse the bound exists to refuse')
+  assert.equal(polled.salesReversalsWithheld, 1)
+  const withheld = state.activity.find((a) => a.action === 'payment_reversal_withheld')
+  assert.equal(withheld?.metadata?.currencyUnbound, true,
+    'and the refusal still names the binding defect, which is the half of r15 that was right')
+
+  // THE CONTROL, and it is what stops this being "refuse everything large": the identical row with an
+  // explicit `CurrencyRef` — QuickBooks stating the currency itself — IS read and DOES reverse. What
+  // separates the two is not the size of the figure but who vouched for the minor unit.
+  reset()
+  state.salesOrders = [{ ...paidOrderRow(), currency: 'GBP' }]
+  state.syncLogs = [postedRegistration()]
+  state.qboDocuments.set('QI1',
+    { Id: 'QI1', Balance: 600000000000, TotalAmt: 600000000000, CurrencyRef: { value: 'GBP' } })
+  state.deltaBalanceDue = ['QI1']
+
+  const stated = await poll()
+  assert.equal(stated.salesReversed, 1,
+    'a currency the LEDGER stated does size the bound, and this document then reads as holding nothing')
+  assert.equal(stated.salesReversalsWithheld, 0)
 })
 
 test('[o3d-psrx r15] and with NO currency anywhere the refusal NAMES the binding, instead of blaming the ledger', async () => {
   reset()
-  // THE ROUTE, AND THE MUTATION CONTROL FOR THE TEST ABOVE: the only difference from it is that the
-  // IMS order records no currency either. If the poller stopped selecting `currency`, or stopped
-  // passing it to the read, the test above would land here — so these two are each other's proof.
+  // THE ROUTE. r15 wrote this as the mutation control for the test above, when the two differed in
+  // outcome; r16 makes them agree, and the assertion is now that they DO — an IMS currency changes
+  // what the marker can say about provenance and nothing about what is read.
   state.salesOrders = [paidOrderRow()]
   state.syncLogs = [postedRegistration()]
   state.qboDocuments.set('QI1', { Id: 'QI1', Balance: 600000000000, TotalAmt: 600000000000 })
