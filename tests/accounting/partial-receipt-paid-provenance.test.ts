@@ -368,7 +368,10 @@ test('[o3d-psrx r7] the reader\'s comparison IS the writer\'s, epsilon included'
 // ---------------------------------------------------------------------------
 
 test('[o3d-psrx r7] a registration in another currency covers none of this order', () => {
-  assert.equal(payloadRegisteredAmount({ amount: 100, currency: 'GBP' }, 'GBP'), 100)
+  // o3d-1xq8 widened the return to a `Decimal` — the reader now prefers the payload's exact decimal
+  // string over its JSON number. `.toFixed()` and not `100`; the subject and the verdict are
+  // unchanged, and the `null` arms below (which are what this test is ABOUT) are untouched.
+  assert.equal(payloadRegisteredAmount({ amount: 100, currency: 'GBP' }, 'GBP')?.toFixed(), '100')
   assert.equal(payloadRegisteredAmount({ amount: 100, currency: 'EUR' }, 'GBP'), null,
     'EUR 100 is not GBP 100, and adding them would put an unstated FX rate inside a reversal decision')
   assert.equal(payloadRegisteredAmount({ amount: 100 }, 'GBP'), null,
@@ -445,12 +448,20 @@ test('[o3d-psrx r18] CONTROL: ordinary coverage at the same magnitude still sett
     'a registration that settled the whole order and is now absent IS a removal of the whole order')
 
   // AND THE ONE PLACE THE READER STILL CANNOT REACH EXACT COVERAGE AT THIS MAGNITUDE, SAID OUT LOUD
-  // RATHER THAN LEFT AS A SURPRISE (o3d-1xq8). `registeredAmount` is not a stored decimal: the enqueue
-  // writes `Number(receipt.amount)` into the registration's JSON payload, and at 2^39 no double
-  // answers to `549755813888.0003` — the nearest one is named `...0002`. So a registration that really
-  // did settle this order reads as one minor unit short and the reader WITHHOLDS. That is the
-  // fail-closed direction and it is the residue of the last lossy hop in the chain; closing it is
-  // o3d-1xq8, and this assertion is what will fail when it is closed.
+  // RATHER THAN LEFT AS A SURPRISE (o3d-1xq8). `registeredAmount` is not always a stored decimal: at
+  // 2^39 no double answers to `549755813888.0003` — the nearest one is named `...0002` — so a row
+  // that reaches this reader as a bare NUMBER, which is every row written before o3d-1xq8, states one
+  // minor unit less than the receipt behind it and the reader WITHHOLDS.
+  //
+  // o3d-1xq8 CORRECTS THE SENTENCE THAT USED TO END THIS COMMENT. It read "that is the fail-closed
+  // direction … this assertion is what will fail when it is closed", and both halves were wrong. The
+  // conversion is not fail-closed: it rounds UP as readily as down, and upward it manufactures
+  // coverage on an order the receipts fall short of — see
+  // tests/accounting/registration-amount-exactness.test.ts, which carries the other direction with
+  // the finding's own figure. And this assertion did NOT fail when it was closed, because the closing
+  // was ADDITIVE: the enqueue records an exact decimal string beside the number and the reader
+  // prefers it, so a row like this one — a bare number, no payload, no string — is read exactly as it
+  // always was. That is the point of the additive shape, and this line is now its regression guard
   const coveringAtScale: RegisteredPaymentRow = { ...pennyRegistration, registeredAmount: Number(FOUR_DP_TOTAL) }
   assert.equal(toDecimal(Number(FOUR_DP_TOTAL)).toString(), FOUR_DP_COVERED,
     'PRECONDITION: the payload double cannot name the order total at this magnitude')

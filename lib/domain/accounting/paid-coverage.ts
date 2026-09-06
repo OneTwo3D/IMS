@@ -23,10 +23,25 @@
  * total". HALF OF THAT SENTENCE IS NO LONGER TRUE — r18 carries the `Decimal`s through, so the two
  * writer call sites sum stored decimals exactly and there is no assembly noise left for a band to
  * absorb on that route. It is kept, and narrowed to the one operand that is still not a stored
- * decimal: the READER's `registeredAmount` comes from the enqueue's JSON payload, which records
- * `Number(receipt.amount)` (invoice-payment-enqueue.ts), and that double is the last lossy hop in the
- * chain. The band absorbs its residue and nothing else, and it leans towards "covered", which is the
- * direction that was already in production. See o3d-1xq8 for closing that hop as well.
+ * decimal: the READER's `registeredAmount` comes from the enqueue's JSON payload.
+ *
+ * o3d-1xq8 — AND THE SENTENCE r18 WROTE ABOUT THAT LAST OPERAND WAS ITSELF ONLY HALF TRUE.
+ *
+ * r18 said the payload double "leans towards covered, which is the direction that was already in
+ * production", filed the hop as o3d-1xq8 and moved on. `Number(receipt.amount)` does not lean: it
+ * rounds in BOTH directions, and the upward one is not absorbed by this band at all — at 2^39 the
+ * stored receipt `549755813888.0008` converts to a double whose own decimal reading is
+ * `549755813888.0009`, so against an order totalling `549755813888.0009` it is not "within the band"
+ * of the total, it IS the total. That MANUFACTURES coverage, this rule answers YES, the reader's
+ * PART_COVERED_OFF_LEDGER guard stands down, and a chargeback credit note is raised against a
+ * customer who paid. The band was never what stood between that and production; nothing did.
+ *
+ * WHAT THE BAND IS FOR NOW, stated exactly. The enqueue records the receipt's exact decimal STRING in
+ * the payload beside the number and `payloadRegisteredAmount` prefers it, so every registration
+ * written since o3d-1xq8 reaches this rule as the stored decimal and needs no band. A row written
+ * BEFORE it carries the number alone; the band absorbs that double's residue and nothing else. It is
+ * a legacy allowance with a shrinking population, not a tolerance the current writers rely on — and
+ * it can only ever admit, so it is not what makes a new row's reading exact.
  *
  * o3d-psrx r17 — AND THE BAND IS DERIVED, BECAUSE THE SENTENCE THAT SIZED IT WAS FALSE. It was a
  * literal `0.0001`, described here as "a hundredth of a penny — far below any currency's minor unit,
