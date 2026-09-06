@@ -2435,12 +2435,25 @@ test('[o3d-secops] every script-scope declaration the shared fence library makes
  * is allowed, whether or not anybody thought of it.
  *
  * MEASURED AGAINST THE TREE THAT HAD THE DEFECT, which is the only way to know this is a check and
- * not a decoration. The rule below, unchanged, was run over b128f47f's library and entrypoints with
- * b128f47f's classification (twelve mutable names, seven of them wrong). It examined 82 expansions
- * and produced 9 complaints naming exactly seven names — DB_FENCE_PROBE_SCRIPT (EXECUTION in both
+ * not a decoration — and no longer only in this comment: the measurement is now the standing test
+ * `the sink census still names exactly the seven values b128f47f got wrong`, which reads that
+ * commit's four shell files out of git and runs this same rule over them with that commit's
+ * classification (twelve mutable names, seven of them wrong). It examines 90 expansions and
+ * produces 9 complaints naming exactly seven names — DB_FENCE_PROBE_SCRIPT (EXECUTION in both
  * entrypoints, AUTHORIZATION in both), DB_FENCE_PROBE_TEMP (DELETION), DB_FENCE_PROBE_ARTEFACT_SHA256
  * (AUTHORIZATION), DB_FENCE_SOURCE_UNTRUSTED_PATH (the publication gate) and the three _FENCE_SRC_*
- * arrays (the find that computes it) — and nothing else. On the tree as it stands it produces none.
+ * arrays (the find that computes it) — and nothing else. On the tree as it stands, 63 expansions
+ * and no complaints.
+ *
+ * (82 was the r3 figure, taken before the rule stopped ignoring lowercase names. The eight extra
+ * expansions are the ones reached through `offender`, a lowercase `local` this rule now follows and
+ * did not before — which is the r4 finding, visible as a number.)
+ *
+ * AND TWO HOLES THE R3 RULE HAD, both closed below and both about names it could not see rather
+ * than sinks it did not list: it followed an assignment only into an UPPERCASE target, so a report
+ * routed through a `local` escaped; and it read only direct `$NAME`/`${NAME}` expansions, so bash
+ * indirection — `${!c}`, `declare -n`, `printf -v "$t"` — escaped entirely. See nameExpansions()
+ * and indirections().
  */
 const REPORT_PRINTERS = new Set([
   'echo', 'printf', 'warn', 'info', 'ok', 'success', 'error', 'die', 'note', 'log', 'step',
@@ -2505,24 +2518,136 @@ function isContinuedString(segment: string): boolean {
   return rest === '' || rest === '\\'
 }
 
-const upperExpansions = (text: string): string[] =>
-  [...text.matchAll(/\$\{?([A-Z_][A-Z0-9_]*)/g)].map((match) => match[1])
+/**
+ * EVERY EXPANSION OF A NAME, WHATEVER ITS CASE (o3d-secops r4, Codex HIGH).
+ *
+ * This used to match `[A-Z_][A-Z0-9_]*` only, and the assignment-follow below used to add a target
+ * only when the target was all-uppercase too. Between them that made a `local` a laundry:
+ *
+ *     local probe="${DB_FENCE_PROBE_REASON}"   # target is lowercase, so nothing was followed
+ *     node "${probe}" --preflight              # and `probe` was not a name this rule could see
+ *
+ * Uppercase-for-globals is a CONVENTION in these scripts, not a rule bash enforces, and a rename on
+ * the way to a sink is precisely what a `local` is for. So the pattern is now every identifier bash
+ * accepts, and the follow has no casing test at all.
+ *
+ * `${#NAME}` is included (a length is still a read of the value). `${!c}` is deliberately NOT
+ * matched here: an indirect expansion names a variable this rule cannot know, and it is handled by
+ * indirections() below, which REFUSES rather than returning a name.
+ *
+ * THE PRICE, STATED. Following lowercase names makes the census's name space FLAT: a `local x` in
+ * one function and a `local x` in another are the same name to this rule. That direction is
+ * fail-closed — a collision produces a complaint naming a file and a line, never a silence — and
+ * the shipped tree is measured clean below, so it is not happening today. It does mean that a
+ * future edit which routes a report through a name as common as `probe` will be told to rename it.
+ */
+const nameExpansions = (text: string): string[] =>
+  [...text.matchAll(/\$\{?#?([A-Za-z_][A-Za-z0-9_]*)/g)].map((match) => match[1])
+
+/**
+ * WHAT THE CENSUS CANNOT READ LEXICALLY, AND SO REFUSES (o3d-secops r4, Codex HIGH).
+ *
+ * Bash can name a variable at RUNTIME. `${!c}` reads the variable whose name is the VALUE of `c`;
+ * `declare -n r=X` makes `$r` an alias of `$X`; `printf -v "$t"`, `read "$t"` and `mapfile "$t"`
+ * WRITE a variable whose name is a value. None of those put the name in the text, so a rule that
+ * reads text cannot follow them — and the previous version of this census did not even try: it
+ * matched direct `$NAME`/`${NAME}` forms and skipped the rest, which is the silent pass the
+ * function-body scanner on this branch already refused to give for `eval` and for `$( ( … ) … )`.
+ *
+ * So the same answer is given here. Each shape below is either RESOLVED or REFUSED:
+ *
+ *   RESOLVED  a nameref with a literal pointee IS that name — `declare -n r=DB_FENCE_PROBE_REASON`
+ *             puts `r` into the report set, so `rm -rf "$r"` fails as DELETION like any other
+ *             report at a sink. `printf -v NAME`, `read NAME`, `mapfile NAME` and `(( NAME = … ))`
+ *             with a literal NAME are ASSIGNMENTS written without a `=` word, so the TARGET is
+ *             followed exactly as `NAME=` is. Resolved means followed, not waved through: only
+ *             `printf` is a printer, so `read -r NAME <<<"${A_REPORT}"` is followed AND still
+ *             named at a command position. That is deliberate — this rule does not model
+ *             redirections, and `read -r x < <(node "${A_REPORT}")` would otherwise be a sink
+ *             hiding behind an allowed head.
+ *   REFUSED   anything whose name is an expansion — `${!c}`, `declare -n r="$1"`, `printf -v "$t"`,
+ *             `read "$t"` — and `eval`, which re-parses text this rule will never see. The refusal
+ *             is a complaint naming the file, the line and the shape.
+ *
+ * WHERE THE REFUSAL APPLIES, AND WHY IT IS NOT THE WHOLE ESTATE. The fence library is the file that
+ * DECLARES the names this census classifies, and it is entirely under this branch's control: any
+ * unresolvable shape there is refused unconditionally, and there are none today (measured — the
+ * only `read` in it is `while IFS= read -r relative`, a literal target). In the three entrypoints
+ * the refusal is triggered by the STATEMENT: an unresolvable shape in a segment that also mentions
+ * a report, or whose controller is itself a report, is refused. That is a rule about the grammar of
+ * one command, not a proximity window.
+ *
+ * WHAT THAT DOES NOT SETTLE, SAID PLAINLY. scripts/install.sh legitimately uses `${!name}` and
+ * `local -n` in generic helpers — prompt(), capture(), libpq_env_unset_args() — where the name comes
+ * from `$1` or from a `read` of a computed list. Those are not refused, because no report is on
+ * those statements. An attacker who wrote `ref=SOMETHING_UNTRACKED` in an entrypoint and later
+ * `node "${!ref}"` in a different statement would not be caught. Resolving that needs call-site
+ * dataflow this rule does not do; what closes it instead is that the library — the only file that
+ * derives these values — refuses every such shape outright.
+ *
+ * AND ONE RESOLUTION THAT WAS TRIED AND REJECTED, with the measurement. Treating a report's NAME
+ * appearing anywhere in an assignment's right-hand side as an alias looked right and is unusable:
+ * a report name is also an ordinary English word (${DB_FENCE_SEAL_REASON}'s offender variable is
+ * literally `offender`), so message strings matched it. Measured against b128f47f that put 435
+ * names into the report set and produced 786 complaints. The rule below therefore requires the name
+ * to be the WHOLE right-hand side — `ref=DB_FENCE_PROBE_REASON` and nothing else.
+ */
+type Indirection = { readonly kind: string, readonly ref: string, readonly target: string, readonly literal: boolean }
+
+const LITERAL_NAME = /^["']?([A-Za-z_][A-Za-z0-9_]*)["']?$/
+const literalName = (word: string): string | null => LITERAL_NAME.exec(word)?.[1] ?? null
+
+function indirections(segment: string): Indirection[] {
+  const out: Indirection[] = []
+  // `${!c}`, `${!c[@]}`, `${!c*}`, `${!c-default}` — the controller is `c`, never the name read.
+  for (const match of segment.matchAll(/\$\{\s*!\s*([A-Za-z_][A-Za-z0-9_]*)?/g)) {
+    out.push({ kind: 'an indirect expansion `${!…}`', ref: '', target: match[1] ?? '', literal: false })
+  }
+  // `declare -n r=X`, `local -n r=X`, `typeset -rn r=X`, and the same with no `=` at all.
+  for (const match of segment.matchAll(/(?:^|[\s;&|(){}])(?:declare|local|typeset)((?:\s+-[A-Za-z]+)+)\s+([A-Za-z_][A-Za-z0-9_]*)(=(\S*))?/g)) {
+    if (!/n/.test(match[1])) continue
+    const pointee = match[3] === undefined ? '' : (match[4] ?? '')
+    const literal = literalName(pointee)
+    out.push({ kind: 'a nameref declaration', ref: match[2], target: literal ?? pointee, literal: literal !== null })
+  }
+  for (const match of segment.matchAll(/(?:^|[\s;&|(){}])printf(?:\s+-[A-Za-z]+)*\s+-v\s+(\S+)/g)) {
+    const literal = literalName(match[1])
+    out.push({ kind: '`printf -v`', ref: literal ?? match[1], target: '', literal: literal !== null })
+  }
+  // Every non-option word of a `read`/`mapfile` is treated as a target. `-p "$(…)"` therefore reads
+  // as a non-literal target and refuses — the fail-closed direction, and it costs nothing here
+  // because a refusal only fires where a report is on the statement or the file is the library.
+  for (const match of segment.matchAll(/(?:^|[\s;&|(){}])(read|mapfile|readarray)\s+([^<>|]*)/g)) {
+    for (const word of match[2].split(/\s+/).filter(Boolean)) {
+      if (word.startsWith('-')) continue
+      const literal = literalName(word)
+      out.push({ kind: `a \`${match[1]}\` target`, ref: literal ?? word, target: '', literal: literal !== null })
+    }
+  }
+  for (const match of segment.matchAll(/\(\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*[-+*/%^|&]?=[^=]/g)) {
+    out.push({ kind: 'an arithmetic assignment', ref: match[1], target: '', literal: true })
+  }
+  if (/(?:^|[\s;&|(){}])eval(\s|$)/.test(segment)) {
+    out.push({ kind: '`eval`', ref: '', target: '', literal: false })
+  }
+  return out
+}
 
 /**
  * Every sink a report-classified name reaches, across the library and the entrypoints. Also returns
  * how many expansions were examined, because a walk that inspected nothing would otherwise report
  * a clean estate.
  */
-function reportSinkComplaints(sources: ReadonlyArray<readonly [string, string]>, seeds: readonly string[]):
+function reportSinkComplaints(sources: ReadonlyArray<readonly [string, string]>, seeds: readonly string[], libraryFile: string = FENCE_LIBRARY):
 { complaints: string[]; examined: number; followed: string[] } {
   const reports = new Set<string>(seeds)
   const followed: string[] = []
-  const complaints: string[] = []
+  let complaints: string[] = []
   let examined = 0
   // The set GROWS as assignments are followed, so a report copied into another name drags that name
   // into the question. Re-walked until it stops growing; the estate is small and this terminates.
   for (let round = 0; round < 8; round += 1) {
-    complaints.length = 0
+    complaints = []
     examined = 0
     const before = reports.size
     for (const [file, source] of sources) {
@@ -2530,7 +2655,35 @@ function reportSinkComplaints(sources: ReadonlyArray<readonly [string, string]>,
         const line = raw.trim()
         if (line.length === 0 || line.startsWith('#')) return
         for (const segment of shellSegments(line)) {
-          const names = upperExpansions(segment).filter((name) => reports.has(name))
+          const where = `${file}:${index + 1}`
+          const owned = file === libraryFile
+          const names = nameExpansions(segment).filter((name) => reports.has(name))
+
+          // RUNTIME-NAMED VARIABLES FIRST: resolved into the walk, or refused outright.
+          for (const shape of indirections(segment)) {
+            if (shape.literal) {
+              if (shape.target !== '' && reports.has(shape.target) && !reports.has(shape.ref)) {
+                reports.add(shape.ref)
+                followed.push(`${shape.ref} (nameref to ${shape.target}, from ${where})`)
+              }
+              if (shape.target === '' && names.length > 0 && !reports.has(shape.ref)) {
+                reports.add(shape.ref)
+                followed.push(`${shape.ref} (from ${where})`)
+              }
+              continue
+            }
+            const onAReport = names.length > 0
+              || (shape.ref !== '' && reports.has(shape.ref))
+              || (shape.target !== '' && reports.has(shape.target))
+            if (!owned && !onAReport) continue
+            complaints.push(
+              `${where} uses ${shape.kind}, and the variable it names is a RUNTIME value this census `
+              + `cannot resolve: ${segment}\n`
+              + '  Bash indirection cannot be followed lexically, so the census refuses rather than '
+              + 'passes. Name the variable outright, or derive and consume the value inside one '
+              + 'function so no script-scope name is in play.')
+          }
+
           if (names.length === 0) continue
           examined += names.length
           // A continued argument — the next line of a multi-line `die "…"` — prints like the first.
@@ -2542,9 +2695,11 @@ function reportSinkComplaints(sources: ReadonlyArray<readonly [string, string]>,
           const assignment = /^(?:local |export |readonly |declare [^ ]+ )*([A-Za-z_][A-Za-z0-9_]*)(?:\[[^\]]*\])?\+?=/.exec(head === '' ? segment : segment.slice(segment.indexOf(head)))
           if (assignment !== null) {
             // The value flows into another name; that name now has to answer the same question.
-            if (!reports.has(assignment[1]) && /^[A-Z_][A-Z0-9_]*$/.test(assignment[1])) {
+            // NO CASING TEST: a `local probe=` is exactly where a report gets renamed on its way to
+            // a sink, and requiring the target to be uppercase let that through.
+            if (!reports.has(assignment[1])) {
               reports.add(assignment[1])
-              followed.push(`${assignment[1]} (from ${file}:${index + 1})`)
+              followed.push(`${assignment[1]} (from ${where})`)
             }
             continue
           }
@@ -2564,18 +2719,36 @@ function reportSinkComplaints(sources: ReadonlyArray<readonly [string, string]>,
             // `[[ -z "${DB_FENCE_EXPECTED_ARTEFACT_SHA256}" && -n "${DB_FENCE_SOURCE_UNTRUSTED_PATH}" ]]`,
             // an emptiness test that is the whole publication gate. What makes a conditional a
             // report is its COMPANY, not its operator.
-            if (upperExpansions(segment).every((name) => reports.has(name))) continue
+            if (nameExpansions(segment).every((name) => reports.has(name))) continue
             complaints.push(
-              `${file}:${index + 1} tests ${names.join(', ')} alongside something that is not another report — `
+              `${where} tests ${names.join(', ')} alongside something that is not another report — `
               + `that is AUTHORIZATION, not a report: ${segment}`)
             continue
           }
           const kind = SINK_KIND.find(([pattern]) => pattern.test(head))?.[1]
             ?? 'a command position — the mechanism ACTS on this value'
           complaints.push(
-            `${file}:${index + 1} reaches ${kind} with ${names.join(', ')}: ${segment}\n`
+            `${where} reaches ${kind} with ${names.join(', ')}: ${segment}\n`
             + '  A value that reaches execution, authorization, publication or deletion is not a report. '
             + 'Make it a `local` of the function that derives and consumes it, or `readonly` if it must be global.')
+        }
+      })
+    }
+    // A report's NAME held as the WHOLE of an assignment's right-hand side is an alias: after
+    // `ref=DB_FENCE_PROBE_REASON`, `${!ref}` reads the report. Whole-RHS only — see the note above
+    // indirections() for the 786-complaint measurement that rejected the looser form.
+    for (const [file, source] of sources) {
+      source.split('\n').forEach((raw, index) => {
+        const line = raw.trim()
+        if (line.length === 0 || line.startsWith('#')) return
+        for (const segment of shellSegments(line)) {
+          const held = /^(?:local |export |readonly |declare [^ ]+ )*([A-Za-z_][A-Za-z0-9_]*)\+?=(\S*)\s*$/.exec(segment)
+          if (held === null) continue
+          const pointee = literalName(held[2])
+          if (pointee !== null && reports.has(pointee) && !reports.has(held[1])) {
+            reports.add(held[1])
+            followed.push(`${held[1]} (holds the NAME ${pointee}, from ${file}:${index + 1})`)
+          }
         }
       })
     }
@@ -2618,6 +2791,26 @@ test('[o3d-secops] a report that reaches one of the four sinks fails the sink ce
     ['[[ -z "${DB_FENCE_EXPECTED_ARTEFACT_SHA256}" && -n "${DB_FENCE_PROBE_REASON}" ]] && exit 1',
       /tests DB_FENCE_PROBE_REASON alongside something that is not another report/],
     ['"${DB_FENCE_SUDO_PREFIX}${DB_FENCE_RELEASE_WRAPPER}" --release', /reaches .* with DB_FENCE_SUDO_PREFIX/],
+    // THE SHAPE THE R3 RULE MISSED, and the one this round's finding was about: a report renamed
+    // into a LOWERCASE `local` on its way to the sink. r3 followed an assignment only when the
+    // target was all-uppercase, so this passed. `laundered_reason` rather than `probe` because the
+    // census's name space is flat and `probe` is an ordinary local elsewhere in the estate — the
+    // collision would make this fixture prove six complaints instead of the one it is about.
+    ['local laundered_reason="${DB_FENCE_PROBE_REASON}"\nnode "${laundered_reason}" --preflight',
+      /reaches EXECUTION with laundered_reason/],
+    // AND THE SAME LAUNDERING WITHOUT AN `=` WORD. `printf -v NAME` is an assignment bash performs
+    // and no `NAME=` scanner sees; with a literal target it is RESOLVED and followed, not refused.
+    ['printf -v LAUNDERED \'%s\' "${DB_FENCE_PROBE_REASON}"\nnode "${LAUNDERED}" --preflight',
+      /reaches EXECUTION with LAUNDERED/],
+    // A NAMEREF WITH A LITERAL POINTEE IS RESOLVED TOO: `$ref` IS ${DB_FENCE_PROBE_REASON}, so the
+    // `rm` is DELETION of a report and is named as such rather than refused.
+    ['local -n ref=DB_FENCE_PROBE_REASON\nrm -rf "${ref}"', /reaches DELETION with ref/],
+    // AND WHAT CANNOT BE RESOLVED IS REFUSED RATHER THAN SKIPPED — four shapes, none of which puts
+    // the variable's name in the text.
+    ['node "${!DB_FENCE_PROBE_REASON}"', /uses an indirect expansion/],
+    ['ref=DB_FENCE_PROBE_REASON\nnode "${!ref}"', /uses an indirect expansion/],
+    ['declare -n ref="$1"', /uses a nameref declaration/],
+    ['printf -v "$target" \'%s\' "${DB_FENCE_PROBE_REASON}"', /uses `printf -v`/],
   ]
   for (const [addition, expected] of cases) {
     const { complaints } = reportSinkComplaints(
@@ -2634,12 +2827,199 @@ test('[o3d-secops] a report that reaches one of the four sinks fails the sink ce
     'if [[ -n "${DB_FENCE_ROTATION_NOTE}" ]]; then echo "${DB_FENCE_ROTATION_NOTE}" >&2; fi',
     'DB_FENCE_ROTATION_NOTE="${DB_FENCE_SEAL_REASON}"',
     '[[ "${DB_FENCE_PROBE_STANDING_SHA256}" == "${DB_FENCE_PROBE_ARTEFACT_SHA256}" ]] || printf ok',
+    // A LOWERCASE `local` THAT ONLY PRINTS is still allowed. Following lowercase targets must not
+    // turn the rule into "no report may be copied", or the shipped tree would be red and it is not.
+    'local note="${DB_FENCE_ROTATION_NOTE}"\nwarn "${note}"',
   ]) {
     const { complaints } = reportSinkComplaints(
       [[FENCE_LIBRARY, `${FENCE_LIB}\n${addition}\n`], ...SINK_CENSUS_SOURCES.slice(1)],
       Object.keys(MUTABLE_LIBRARY_NAMES))
     assert.deepEqual(complaints, [], `a printing/emptiness/report-comparison use must pass: ${addition}\n${complaints.join('\n')}`)
   }
+})
+
+test('[o3d-secops] `eval` and an indirect `read` are BOTH refused and named at a sink', () => {
+  // These two get their own case because each produces TWO complaints and both are the point: the
+  // shape is refused (the census cannot read what `eval` re-parses, nor which variable a `read`
+  // into an expansion writes) AND the report is separately named where it stands — `eval` is in
+  // SINK_KIND's EXECUTION list, and `read` is in no list at all, so it falls through to "a command
+  // position", which is the grammar rule doing its job on a word nobody wrote down. A
+  // single-complaint fixture would have had to pick one and would have hidden the other.
+  const cases: ReadonlyArray<readonly [string, RegExp, RegExp]> = [
+    ['eval "node \${DB_FENCE_PROBE_REASON}"', /uses `eval`/, /reaches EXECUTION with DB_FENCE_PROBE_REASON/],
+    ['read "$target" <<<"\${DB_FENCE_SEAL_REASON}"', /uses a `read` target/, /reaches a command position .* with DB_FENCE_SEAL_REASON/],
+  ]
+  for (const [addition, refusal, sink] of cases) {
+    const { complaints } = reportSinkComplaints(
+      [[FENCE_LIBRARY, `${FENCE_LIB}\n${addition}\n`], ...SINK_CENSUS_SOURCES.slice(1)],
+      Object.keys(MUTABLE_LIBRARY_NAMES))
+    assert.equal(complaints.length, 2, `${addition}\n${complaints.join('\n')}`)
+    assert.ok(complaints.some((complaint) => refusal.test(complaint)),
+      `the refusal must be one of them, for ${addition}:\n${complaints.join('\n')}`)
+    assert.ok(complaints.some((complaint) => sink.test(complaint)),
+      `and the sink the other, for ${addition}:\n${complaints.join('\n')}`)
+  }
+})
+
+/**
+ * AND THE SAME RULE OVER BASH'S OWN PARSE (o3d-secops r4).
+ *
+ * Codex's third next-step: an earlier round on this branch established that `bash --pretty-print`
+ * parses and deparses a script without executing it, and used it to cross-check the function
+ * scanner. It can carry some of this too, and this test says exactly how much.
+ *
+ * WHAT IT SETTLES. The census reads LINE BY LINE, and a line is not a command. `bash --pretty-print`
+ * hands back one command per line: a backslash-continued header is joined, `if …; then X; fi` is
+ * split across lines, and comments are gone. That closes a real blind spot, measured rather than
+ * asserted — the fixture below is
+ *
+ *     node --preflight \
+ *       "${DB_FENCE_PROBE_REASON}"
+ *
+ * on which the line-by-line reading is SILENT (the second line is a quoted string and nothing else,
+ * which is the shape of a continued `die "…"` argument, so isContinuedString() lets it past) and
+ * the deparsed reading names it as EXECUTION. Nobody listed that shape; it fell out of running the
+ * rule over a second reading of the same file.
+ *
+ * WHAT IT DOES NOT SETTLE, AND WHY REFUSAL IS STILL THE ANSWER FOR INDIRECTION. The deparse renders
+ * `${!c}`, `declare -n r="$1"` and `printf -v "$t"` back out VERBATIM — bash's parser records that
+ * a name is computed, it does not compute it, because the value only exists at run time. Asserted
+ * below on a fixture, because "the parser cannot help here" is exactly the sort of claim that turns
+ * out to be false and takes a guard down with it. `eval` is the same, and the r6 test above already
+ * measures that the deparse hands an eval'd definition back as the string it went in as.
+ *
+ * ROUTE: reportSinkComplaints() over `bash --pretty-print` output for the library and all three
+ * entrypoints, with the same seeds as the primary census.
+ */
+function deparseShell(text: string, t: TestContext): string {
+  const dir = createTempDirSync('ims-secops-deparse-', t)
+  const file = join(dir, 'subject.sh')
+  writeFileSync(file, text.endsWith('\n') ? text : `${text}\n`)
+  const run = spawnSync('bash', ['--pretty-print', file], { encoding: 'utf8' })
+  assert.equal(run.status, 0, `bash must parse the subject before it can be deparsed: ${run.stderr}`)
+  return run.stdout
+}
+
+test("[o3d-secops] the sink census is clean under bash's own parse too, and catches what line-by-line misses", (t) => {
+  const deparsed = (extra = ''): ReadonlyArray<readonly [string, string]> => SINK_CENSUS_SOURCES.map(
+    ([file, source]) => [`${file} (deparsed)`, deparseShell(file === FENCE_LIBRARY && extra ? `${source}\n${extra}\n` : source, t)] as const)
+  const library = `${FENCE_LIBRARY} (deparsed)`
+
+  // THE CLAIM: the second reading agrees with the first. It examines the same 63 expansions, so
+  // this is a genuine second reading of the same estate and not a deparse that lost the file.
+  const clean = reportSinkComplaints(deparsed(), Object.keys(MUTABLE_LIBRARY_NAMES), library)
+  assert.deepEqual(clean.complaints, [], clean.complaints.join('\n'))
+  assert.ok(clean.examined >= 60,
+    `the deparsed reading must reach the same sinks; it examined ${clean.examined} expansions`)
+
+  // AND WHAT THE FIRST READING MISSES, BOTH HALVES MEASURED. If the raw reading ever starts
+  // catching this, this test stops proving that the deparse adds anything and must be re-argued.
+  const continued = 'node --preflight \\\n  "${DB_FENCE_PROBE_REASON}"'
+  const raw = reportSinkComplaints(
+    [[FENCE_LIBRARY, `${FENCE_LIB}\n${continued}\n`], ...SINK_CENSUS_SOURCES.slice(1)],
+    Object.keys(MUTABLE_LIBRARY_NAMES))
+  assert.deepEqual(raw.complaints, [],
+    'precondition: the line-by-line reading is silent on a backslash-continued command word')
+  const joined = reportSinkComplaints(deparsed(continued), Object.keys(MUTABLE_LIBRARY_NAMES), library)
+  assert.equal(joined.complaints.length, 1, joined.complaints.join('\n'))
+  assert.match(joined.complaints[0], /reaches EXECUTION with DB_FENCE_PROBE_REASON/, joined.complaints[0])
+
+  // AND THE PARSER DOES NOT RESOLVE INDIRECTION, so refusing it is the honest answer and not a
+  // shortcut. The deparse carries the construct back out unchanged, and the census refuses on both
+  // readings rather than one of them quietly answering.
+  const indirect = 'node "${!DB_FENCE_PROBE_REASON}"'
+  assert.match(deparseShell(indirect, t), /node "\$\{!DB_FENCE_PROBE_REASON\}"/,
+    "bash's parse must hand the indirect expansion back verbatim — if it ever resolves one, this "
+    + 'refusal can become a resolution')
+  const refusedTwice = [
+    reportSinkComplaints([[FENCE_LIBRARY, `${FENCE_LIB}\n${indirect}\n`], ...SINK_CENSUS_SOURCES.slice(1)],
+      Object.keys(MUTABLE_LIBRARY_NAMES)),
+    reportSinkComplaints(deparsed(indirect), Object.keys(MUTABLE_LIBRARY_NAMES), library),
+  ]
+  for (const { complaints } of refusedTwice) {
+    assert.equal(complaints.length, 1, complaints.join('\n'))
+    assert.match(complaints[0], /uses an indirect expansion/, complaints[0])
+  }
+})
+
+/**
+ * THE HISTORICAL MEASUREMENT, AS A TEST RATHER THAN A SENTENCE (o3d-secops r4).
+ *
+ * Every round of this rule has been justified by "it was run over b128f47f and named exactly the
+ * seven" — a claim in a comment, which is worth nothing once the rule changes. This round changed
+ * the rule twice (casing, indirection), so the measurement is made standing: the four shell files
+ * are read out of git at b128f47f, seeded with b128f47f's own twelve-name classification, and the
+ * verdict is asserted.
+ *
+ * IT MUST STILL NAME EXACTLY THOSE SEVEN — a broadened rule that also started naming an eighth
+ * would be a rule that has drifted from the defect it was measured against.
+ *
+ * AND IT MUST NOW CATCH ONE MORE THING THAN IT DID: a report laundered through a lowercase `local`,
+ * PLANTED in that same tree. Under the r3 rule that plant produced nothing; under this one it is
+ * the tenth complaint.
+ */
+const B128F47F = 'b128f47f'
+
+/** b128f47f's own MUTABLE_LIBRARY_NAMES — twelve names, seven of which were not reports. */
+const B128F47F_MUTABLE = [
+  'DB_FENCE_ROTATION_NOTE', 'DB_FENCE_SEAL_REASON', 'DB_FENCE_PROBE_SCRIPT', 'DB_FENCE_PROBE_TEMP',
+  'DB_FENCE_PROBE_ARTEFACT_SHA256', 'DB_FENCE_PROBE_STANDING_SHA256', 'DB_FENCE_PROBE_REASON',
+  'DB_FENCE_SOURCE_UNTRUSTED_PATH', 'DB_FENCE_SUDO_PREFIX',
+  '_FENCE_SRC_STRICT', '_FENCE_SRC_PACKAGES', '_FENCE_SRC_PARENTS',
+] as const
+
+/** The seven that were wrong, and which of the four sinks each reached. */
+const B128F47F_MISCLASSIFIED = [
+  'DB_FENCE_PROBE_SCRIPT', 'DB_FENCE_PROBE_TEMP', 'DB_FENCE_PROBE_ARTEFACT_SHA256',
+  'DB_FENCE_SOURCE_UNTRUSTED_PATH', '_FENCE_SRC_STRICT', '_FENCE_SRC_PACKAGES', '_FENCE_SRC_PARENTS',
+] as const
+
+test('[o3d-secops] the sink census still names exactly the seven values b128f47f got wrong', () => {
+  const historical = [FENCE_LIBRARY, ...ENTRYPOINTS].map((file) => {
+    const show = spawnSync('git', ['show', `${B128F47F}:${file}`], { cwd: REPO, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 })
+    assert.equal(show.status, 0, `the historical tree must be readable: ${show.stderr}`)
+    assert.ok(show.stdout.length > 1000, `${file} at ${B128F47F} came back empty`)
+    return [file, show.stdout] as const
+  })
+
+  const { complaints, examined, followed } = reportSinkComplaints(historical, B128F47F_MUTABLE)
+
+  // THE WALK REACHED THAT TREE, stated as a number, so a git-show that returned nothing cannot look
+  // like a clean estate.
+  assert.ok(examined >= 80, `the historical walk examined ${examined} expansions`)
+
+  // EXACTLY THE SEVEN. Both directions: every one is named, and nothing else is.
+  const named = new Set(complaints.flatMap((complaint) =>
+    [...complaint.matchAll(/\b(DB_FENCE_[A-Z0-9_]+|_FENCE_SRC_[A-Z0-9_]+)\b/g)].map((match) => match[1]))
+    .filter((name) => (B128F47F_MUTABLE as readonly string[]).includes(name)))
+  assert.deepEqual([...named].sort(), [...B128F47F_MISCLASSIFIED].sort(),
+    `the census must name exactly b128f47f's seven:\n${complaints.join('\n')}`)
+  assert.equal(complaints.length, 9,
+    `and produce the nine complaints that were measured:\n${complaints.join('\n')}`)
+
+  // AND THE CASING FIX IS LIVE ON A REAL TREE, not only on a fixture: `offender` is a lowercase
+  // `local` that b128f47f copies a report into, and the r3 rule refused to follow it because it was
+  // not uppercase. It is followed here.
+  assert.ok(followed.includes('offender (from scripts/lib/db-fence-protected.sh:705)'),
+    `a lowercase local must be followed; it followed: ${followed.join(', ')}`)
+
+  // THE PLANTED LAUNDER: the same tree, plus one report routed through a lowercase `local` into
+  // `node`. Under the r3 rule this produced nothing at all.
+  const planted = 'local laundered_reason="${DB_FENCE_PROBE_REASON}"\nnode "${laundered_reason}" --preflight'
+  const withPlant = reportSinkComplaints(
+    [[FENCE_LIBRARY, `${historical[0][1]}\n${planted}\n`], ...historical.slice(1)], B128F47F_MUTABLE)
+  assert.equal(withPlant.complaints.length, 10,
+    `the plant must be the tenth complaint and nothing else:\n${withPlant.complaints.join('\n')}`)
+  assert.ok(withPlant.complaints.some((complaint) => /reaches EXECUTION with laundered_reason/.test(complaint)),
+    withPlant.complaints.join('\n'))
+
+  // AND AN INDIRECT EXPANSION IN THAT TREE IS REFUSED, not passed over.
+  const indirect = reportSinkComplaints(
+    [[FENCE_LIBRARY, `${historical[0][1]}\nnode "\${!DB_FENCE_PROBE_SCRIPT}"\n`], ...historical.slice(1)],
+    B128F47F_MUTABLE)
+  assert.equal(indirect.complaints.length, 10, indirect.complaints.join('\n'))
+  assert.ok(indirect.complaints.some((complaint) => /uses an indirect expansion/.test(complaint)),
+    indirect.complaints.join('\n'))
 })
 
 /**
