@@ -1594,7 +1594,7 @@ publish_trust_root() {
 # from the link instead of asking for it to be retyped, and prints the command that puts the link
 # back if the bind mount does not take.
 refuse_symlinked_root() {
-  local root="$1" target="" qroot qtarget froot ftarget ident
+  local root="$1" target="" qroot qtarget qother froot ftarget ident other
   # THE TARGET IS RESOLVED HERE AND PRINTED, not left to the operator to retype. Its status is
   # taken so that this stays out of the unchecked-substitution census: a `readlink` that fails is a
   # dangling or unreadable link, which is the branch below.
@@ -1645,14 +1645,57 @@ refuse_symlinked_root() {
     printf 'ERROR: Move the data under a path only root can rebind — every directory from / down to it owned by root and carrying no group or other write bit, which /srv, /var/lib and /mnt normally are — and run the installer again; it will then print the bind-mount procedure.\n' >&2
     return 0
   fi
+  # AND IT MAY NOT BE THE ROOT, AN ANCESTOR OF IT, OR ANYTHING UNDER IT (o3d-secops r7 seventh
+  # pass, Codex HIGH).
+  #
+  # THE FINDING. `/opt/one-two-inventory -> /opt` passes every question above: /opt's own name
+  # cannot be rebound by anybody but root. Binding /opt onto /opt/one-two-inventory would then be
+  # printed as the remedy — and the next installer run `rsync --delete`s and recursively chowns
+  # what it believes is the application directory, which is now the whole of /opt. The same shape
+  # gives /var/lib for ${DATA_DIR} and /var/log for ${LOG_DIR}. The inode check does not catch it,
+  # because the dangerous source really is what got mounted.
+  #
+  # SO THE TWO PATHS MUST BE DISJOINT. Neither may be the other, and neither may lie under the
+  # other: a target ABOVE the root is the finding, and a target BELOW it is a bind of a directory
+  # onto its own ancestor, which is a loop rather than a layout.
+  if [[ "$target" == "$root" || "$root" == "${target%/}/"* || "$target" == "${root%/}/"* ]]; then
+    printf 'ERROR: BUT %s MAY NOT BE BOUND ONTO %s: the two are the same directory, or one lies inside the other. Binding a directory onto its own ancestor hands this installer a tree far larger than the one it manages — the next run would rsync and chown all of it — so this run will not print a command that does it. Point the link at a directory outside %s.\n' "$qtarget" "$qroot" "$qroot" >&2
+    return 0
+  fi
+  # AND NOR MAY IT OVERLAP ANY OTHER ROOT THIS RUN MANAGES, where the caller has said what they are.
+  # ${SERVICE_ROOT_NAMES[@]} is install.sh's three; the other two entrypoints do not set it, and the
+  # loop then runs zero times — which is why this text is identical in all three.
+  for other in "${SERVICE_ROOT_NAMES[@]-}"; do
+    [[ -n "$other" && "$other" != "$root" ]] || continue
+    if [[ "$target" == "$other" || "$target" == "${other%/}/"* || "$other" == "${target%/}/"* ]]; then
+      # THE STATUS IS TAKEN, like every other substitution in this function: a `printf %q` inside
+      # the argument list would be one nobody checks, which is the rule the whole crontab-lock
+      # census exists to hold these scripts to.
+      qother="$(printf '%q' "$other")" || qother=""
+      [[ -n "$qother" ]] || qother="another directory this installer manages"
+      printf 'ERROR: BUT %s OVERLAPS %s, which this installer also manages. Two roots that are the same tree fight each other: what one run rsyncs or chowns, the next undoes. This run will not print a command that binds them together.\n' "$qtarget" "$qother" >&2
+      return 0
+    fi
+  done
   # THE IDENTITY THIS RUN SAW, so the operator can check that what got mounted is what was meant. A
-  # bind mount exposes the SAME inode at the new path, so this number does not change under it.
-  ident="$(stat -c '%i' "$target" 2>/dev/null || true)"
+  # bind mount exposes the SAME directory at the new path, so this pair does not change under it.
+  #
+  # DEVICE AND INODE, TOGETHER AND IN ONE `stat` (o3d-secops r7 seventh pass, Codex MEDIUM). An
+  # inode number alone identifies a file only WITHIN one filesystem, and different filesystems reuse
+  # the low ones freely — so `stat -c %i` would be satisfied by a wrong source on another disk,
+  # which is exactly the mistake this step exists to catch. And a capture that FAILED used to print
+  # "that inode must be unknown", an instruction nobody can follow: it now prints no procedure at
+  # all rather than one that cannot be verified.
+  ident="$(stat -c '%d:%i' "$target" 2>/dev/null || true)"
+  if [[ -z "$ident" ]]; then
+    printf 'ERROR: BUT this run could not read the device and inode of %s, so it cannot give you a way to check that the bind mounted what you meant. It will not print a procedure you cannot verify. Look at that path by hand.\n' "$qtarget" >&2
+    return 0
+  fi
   printf 'ERROR: Do it with the writers stopped, in this order:\n' >&2
   printf 'ERROR:   1. stop the application service, and pause any cron that writes under %s\n' "$qroot" >&2
-  printf 'ERROR:   2. this run resolved that link to: %s   (inode %s) — confirm that is where the data is\n' "$qtarget" "${ident:-unknown}" >&2
+  printf 'ERROR:   2. this run resolved that link to: %s   (device:inode %s) — confirm that is where the data is\n' "$qtarget" "$ident" >&2
   printf 'ERROR:   3. rm %s && mkdir -p %s && mount --bind %s %s\n' "$qroot" "$qroot" "$qtarget" "$qroot" >&2
-  printf 'ERROR:   4. verify with: findmnt %s   and: stat -c %%i %s   — that inode must be %s. If the mount did NOT take, or the inode differs, put the link back at once: umount %s 2>/dev/null; rmdir %s && ln -s %s %s\n' "$qroot" "$qroot" "${ident:-unknown}" "$qroot" "$qroot" "$qtarget" "$qroot" >&2
+  printf 'ERROR:   4. verify BOTH: findmnt -no TARGET,SOURCE %s   must name %s, and: stat -c %%d:%%i %s   must print %s. If the mount did not take, or either differs, put the link back at once: umount %s 2>/dev/null; rmdir %s && ln -s %s %s\n' "$qroot" "$qroot" "$qroot" "$ident" "$qroot" "$qroot" "$qtarget" "$qroot" >&2
   # /etc/fstab HAS ITS OWN ESCAPING, AND IT IS NOT THE SHELL'S. Fields are split on whitespace and
   # a space, tab or backslash is written as an octal escape; `printf %q`'s answer would be read by
   # mount as a literal backslash.

@@ -4870,6 +4870,7 @@ test('[o3d-secops] the gate is the first line of the run that names any of the t
     .slice(0, privilegeCheck)
     .filter((line) => names.test(line) && /^[A-Za-z_]/.test(line))
   assert.deepEqual(before, [
+    'readonly -a SERVICE_ROOT_NAMES=("${APP_DIR}" "${DATA_DIR}" "${LOG_DIR}")',
     'BACKUP_DIR="${DATA_DIR}/backups"',
     'UPLOAD_STORAGE_DIR="${DATA_DIR}/uploads"',
     'PUBLIC_UPLOAD_STORAGE_DIR="${DATA_DIR}/public-uploads"',
@@ -5268,7 +5269,11 @@ test('[o3d-secops] a target whose name carries shell syntax is quoted, and the p
   const raw = shipped
     .replace('qroot="$(printf \'%q\' "$root")" || qroot=""', 'qroot="$root"')
     .replace('qtarget="$(printf \'%q\' "$target")" || qtarget=""', 'qtarget="$target"')
-  assert.ok(!raw.includes("printf '%q'"), 'the mutation must remove the quoting')
+  // THE TWO ASSIGNMENTS, not every `printf %q` in the function — the overlap refusal quotes a root
+  // name with one too, and asserting on the bare substring would pass on a mutation that changed
+  // nothing the printed COMMANDS use.
+  assert.ok(!raw.includes('qroot="$(printf \'%q\''), 'the mutation must remove the quoting of the root')
+  assert.ok(!raw.includes('qtarget="$(printf \'%q\''), 'and of the target')
 
   const attackedCanary = join(base, 'canary-mutated.txt')
   const attackedDir = join(base, 'x;$(touch canary-mutated.txt)y')
@@ -5561,9 +5566,14 @@ test('[o3d-secops] a bind-mount command is printed only when the target\'s own n
   assert.match(ok.stderr, /\/etc\/fstab/, ok.stderr)
   assert.ok(!ok.stderr.includes('IS NOT SAFE TO BIND YET'), ok.stderr)
   // AND THE IDENTITY TO CHECK AFTER MOUNTING, so a bind that landed somewhere else is visible.
-  assert.ok(ok.stderr.includes(`(inode ${statSync(sound.target).ino})`),
-    `the refusal must print the inode the operator can verify against: ${ok.stderr}`)
-  assert.match(ok.stderr, /stat -c %i /, 'and the command that reads it back')
+  // DEVICE AND INODE, not the inode alone: an inode number identifies a file only within one
+  // filesystem, and different filesystems reuse the low ones freely — so `%i` alone would be
+  // satisfied by a wrong source on another disk, which is the mistake this step exists to catch.
+  const st = statSync(sound.target)
+  assert.ok(ok.stderr.includes(`(device:inode ${st.dev}:${st.ino})`),
+    `the refusal must print the identity the operator can verify against: ${ok.stderr}`)
+  assert.match(ok.stderr, /stat -c %d:%i /, 'and the command that reads it back')
+  assert.match(ok.stderr, /findmnt -no TARGET,SOURCE /, 'and the mount check beside it')
   assert.match(ok.stderr, /umount .*; rmdir .* && ln -s /, 'and a rollback that undoes a mount that did take')
 })
 
@@ -5609,4 +5619,110 @@ test('[o3d-secops] the shared refusal does not claim the run has changed nothing
     const source = readFileSync(join(REPO, script), 'utf8')
     assert.equal(shellFunction(source, 'refuse_symlinked_root'), helper, `${script} has drifted`)
   }
+})
+
+test('[o3d-secops] a link pointing at the root\'s own ancestor gets no bind command, however trustworthy that ancestor is', (t) => {
+  /**
+   * `/opt/one-two-inventory -> /opt` passes every OTHER question: /opt's name cannot be rebound by
+   * anybody but root, so the ancestry walk is satisfied, and the identity check would be satisfied
+   * too because the dangerous source really is what got mounted. Printing that bind hands the next
+   * installer run the whole of /opt as its application directory — to `rsync --delete` into and to
+   * `chown -R`. The same shape gives /var/lib for the state root and /var/log for the log root.
+   *
+   * The rule is disjointness, so the loop below covers the ancestor, the self and the descendant.
+   */
+  const base = createTempDirSync('ims-secops-overlap-', t)
+  const opt = join(base, 'opt')
+  mkdirSync(opt)
+  chmodSync(opt, 0o755)
+  // THE ANCESTOR CASE, which is the one Codex named three times over: APP_DIR -> /opt,
+  // DATA_DIR -> /var/lib, LOG_DIR -> /var/log. The self and descendant cases the same condition
+  // covers are not reachable through a symlink — a link cannot point at itself, and a link pointing
+  // beneath its own name does not resolve — so they are stated in the code and measured here only
+  // through the ancestor, which is the shape that occurs.
+  const link = join(opt, 'link-ancestor')
+  symlinkSync(opt, link)
+  const run = runBash(rig([...ROOT_GATE], GATE_DATA, `DATA_DIR=${q(link)}`))
+  assert.equal(run.status, 1, `a symlinked root is still refused: ${run.stderr}`)
+  assert.equal(realpathSync(link), opt, 'precondition: the link must really resolve to the root\'s own ancestor')
+  assert.ok(!run.stderr.includes('mount --bind'), `no bind command may be printed: ${run.stderr}`)
+  assert.ok(!run.stderr.includes('/etc/fstab'), 'and no fstab line')
+  assert.match(run.stderr, /the two are the same directory, or one lies inside the other/, run.stderr)
+
+  // NOT VACUOUS: a target that is genuinely elsewhere, under an equally trustworthy path, gets the
+  // whole procedure. So what is refused is the overlap and nothing else.
+  const elsewhere = join(base, 'srv-disk2')
+  mkdirSync(elsewhere)
+  chmodSync(elsewhere, 0o755)
+  const good = join(elsewhere, 'ims')
+  mkdirSync(good)
+  const goodLink = join(opt, 'link-elsewhere')
+  symlinkSync(good, goodLink)
+  const ok = runBash(rig([...ROOT_GATE], GATE_DATA, `DATA_DIR=${q(goodLink)}`))
+  assert.equal(ok.status, 1, 'a symlinked root is still refused')
+  assert.ok(ok.stderr.includes(`mount --bind ${good} ${goodLink}`), ok.stderr)
+  assert.ok(!ok.stderr.includes('lies inside the other'), ok.stderr)
+
+  // AND A TARGET THAT OVERLAPS A DIFFERENT ROOT THIS INSTALLER MANAGES is refused too, when the
+  // caller has said what those are. scripts/install.sh names its three in SERVICE_ROOT_NAMES;
+  // deploy.sh and update.sh do not set it, which is why the shared text is identical in all three.
+  const overlapping = runBash(rig([...ROOT_GATE], GATE_DATA, [
+    `DATA_DIR=${q(goodLink)}`,
+    `SERVICE_ROOT_NAMES=(${q(join(elsewhere, 'ims'))})`,
+  ].join('\n')))
+  assert.equal(overlapping.status, 1, overlapping.stderr)
+  assert.ok(!overlapping.stderr.includes('mount --bind'),
+    `a target that is another managed root must get no bind command: ${overlapping.stderr}`)
+  assert.match(overlapping.stderr, /which this installer also manages/, overlapping.stderr)
+
+  // AND THE LIST IS READ FROM THE SHIPPED SCRIPT, not invented here: install.sh really does name
+  // its three roots, and the other two entrypoints really do not set it.
+  assert.match(shellConstant(INSTALL_SH, 'SERVICE_ROOT_NAMES', 'scripts/install.sh'),
+    /^readonly -a SERVICE_ROOT_NAMES=\("\$\{APP_DIR\}" "\$\{DATA_DIR\}" "\$\{LOG_DIR\}"\)$/)
+  for (const script of ['scripts/deploy.sh', 'scripts/update.sh'] as const) {
+    assert.equal(shellConstantOptional(readFileSync(join(REPO, script), 'utf8'), 'SERVICE_ROOT_NAMES'), undefined,
+      `${script} must not set SERVICE_ROOT_NAMES, or the shared refusal would need a second reading`)
+  }
+})
+
+test('[o3d-secops] a target whose identity cannot be read gets no procedure, rather than one that cannot be verified', (t) => {
+  /**
+   * The verification step used to print "that inode must be unknown" when the capture failed — an
+   * instruction nobody can follow, attached to a command that would still be pasted. A procedure
+   * that cannot be checked is worse than none, because it is followed with the same confidence.
+   */
+  const shipped = shellFunction(INSTALL_SH, 'refuse_symlinked_root')
+  const capture = shipped.split('\n').find((line) => line.includes('ident="$(stat -c'))
+  assert.ok(capture, `precondition: the refusal must capture the target's identity: ${shipped}`)
+  assert.match(capture, /'%d:%i'/, `and take the device with the inode: ${capture}`)
+
+  const base = createTempDirSync('ims-secops-noident-', t)
+  const disk = join(base, 'srv-disk2')
+  const target = join(disk, 'ims')
+  mkdirSync(target, { recursive: true })
+  chmodSync(disk, 0o755)
+  const root = join(base, 'ims')
+  symlinkSync(target, root)
+
+  // FORCED AT THE ONE PLACE THE VALUE COMES FROM: a `stat` that answers nothing. Everything else in
+  // the rig is shipped text, so the branch under test is the only thing this can be measuring.
+  // NARROW ON PURPOSE: the walks either side of this call use `stat -c '%d:%i'` too, and a shim
+  // that failed all of them would stop the run somewhere else entirely and the test would pass
+  // while measuring the wrong refusal. Only the query about the TARGET is made to answer nothing.
+  const blindStat = `stat() { if [[ "\${1:-}" == "-c" && "\${2:-}" == "%d:%i" && "\${3:-}" == ${q(target)} ]]; then return 1; fi; command stat "$@"; }`
+  const run = runBash(rig([...ROOT_GATE], GATE_DATA, [`DATA_DIR=${q(root)}`, blindStat].join('\n')))
+
+  assert.equal(run.status, 1, run.stderr)
+  assert.ok(!run.stderr.includes('mount --bind'),
+    `no procedure may be printed when its verification cannot be: ${run.stderr}`)
+  assert.ok(!run.stderr.includes('/etc/fstab'), 'and no fstab line')
+  assert.match(run.stderr, /could not read the device and inode/, run.stderr)
+  assert.ok(!/must (print|be) unknown/.test(run.stderr),
+    'and it must never print an instruction naming an unknown value')
+
+  // NOT VACUOUS: the same layout with `stat` answering gets the whole procedure.
+  const ok = runBash(rig([...ROOT_GATE], GATE_DATA, `DATA_DIR=${q(root)}`))
+  assert.ok(ok.stderr.includes(`mount --bind ${target} ${root}`), ok.stderr)
+  const st = statSync(target)
+  assert.ok(ok.stderr.includes(`must print ${st.dev}:${st.ino}`), ok.stderr)
 })

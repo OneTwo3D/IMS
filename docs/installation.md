@@ -1274,9 +1274,9 @@ says nothing about who may create it. So a root directly under `/tmp` is refused
   ERROR: To keep /var/lib/one-two-inventory on another disk, replace the link with a real directory and bind-mount the disk onto it — no data has to move, because the bind exposes the same filesystem at the same path.
   ERROR: Do it with the writers stopped, in this order:
   ERROR:   1. stop the application service, and pause any cron that writes under /var/lib/one-two-inventory
-  ERROR:   2. this run resolved that link to: /srv/disk2/ims   (inode 262145) — confirm that is where the data is
+  ERROR:   2. this run resolved that link to: /srv/disk2/ims   (device:inode 2049:262145) — confirm that is where the data is
   ERROR:   3. rm /var/lib/one-two-inventory && mkdir -p /var/lib/one-two-inventory && mount --bind /srv/disk2/ims /var/lib/one-two-inventory
-  ERROR:   4. verify with: findmnt /var/lib/one-two-inventory   and: stat -c %i /var/lib/one-two-inventory   — that inode must be 262145. If the mount did NOT take, or the inode differs, put the link back at once: umount /var/lib/one-two-inventory 2>/dev/null; rmdir /var/lib/one-two-inventory && ln -s /srv/disk2/ims /var/lib/one-two-inventory
+  ERROR:   4. verify BOTH: findmnt -no TARGET,SOURCE /var/lib/one-two-inventory   must name /var/lib/one-two-inventory, and: stat -c %d:%i /var/lib/one-two-inventory   must print 2049:262145. If the mount did not take, or either differs, put the link back at once: umount /var/lib/one-two-inventory 2>/dev/null; rmdir /var/lib/one-two-inventory && ln -s /srv/disk2/ims /var/lib/one-two-inventory
   ERROR:   5. add: /srv/disk2/ims /var/lib/one-two-inventory none bind 0 0   to /etc/fstab so the bind survives a reboot, then start the service again
   ```
 
@@ -1294,6 +1294,17 @@ says nothing about who may create it. So a root directly under `/tmp` is refused
   ERROR: BUT /srv/shared/ims IS NOT SAFE TO BIND YET. A directory on the way to it can be replaced by somebody other than root, so a bind mount naming that path would resolve it again, later, and could expose a tree of their choosing at /var/lib/one-two-inventory — which is the same defect as the symlink, one step further out. This run will not print a command that does that.
   ERROR: Move the data under a path only root can rebind — every directory from / down to it owned by root and carrying no group or other write bit, which /srv, /var/lib and /mnt normally are — and run the installer again; it will then print the bind-mount procedure.
   ```
+
+  **And the target may not be the root, an ancestor of it, anything under it, or another root this
+  installer manages.** `/opt/one-two-inventory -> /opt` satisfies every other question — `/opt`'s
+  name cannot be rebound by anybody but root — and binding `/opt` onto `/opt/one-two-inventory`
+  would hand the next run the whole of `/opt` to `rsync --delete` into and `chown -R`. The same
+  shape gives `/var/lib` and `/var/log`. Those get a refusal naming the overlap and no command.
+
+  **The identity is device *and* inode, and a run that cannot read it prints no procedure at all.**
+  An inode number identifies a file only within one filesystem, so `stat -c %i` alone would be
+  satisfied by a wrong source on another disk — which is precisely what step 4 exists to catch — and
+  an instruction saying the inode "must be unknown" is one nobody can follow.
 
   Every path in those commands is **shell-quoted** by the run that printed them (`printf %q`, so a
   name containing a space, a `;`, a `$(…)`, a tab or a newline becomes one word that evaluates back
