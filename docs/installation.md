@@ -1339,11 +1339,13 @@ to apply before it would print anything; they are the operator's now.
    one directory two names. `stat -c %d:%i` on each, in both directions.
 5. **The root's own parent may be writable by somebody other than root, and `/var/log` is.** On
    Ubuntu `/var/log` is `drwxrwxr-x root:syslog` and not sticky, so the `syslog` account may create
-   and rename entries in it. Step 3 below removes a name in that directory and step 4 creates it
-   again: in the gap, that account can take the name. For `LOG_DIR` — or for any root whose parent
-   is group-writable and not sticky (`ls -ld` the parent) — **do not** use `rm` + `mkdir`. Stop the
-   accounts that can write the parent first, or make the parent sticky (`chmod +t`) for the
-   duration, and verify with step 5 that the directory you mounted onto is the one you created.
+   and rename entries in it. The `rm` in step 3 below removes a name in that directory and the
+   `mkdir` on the line after it creates the name again: in that gap, that account can take it, and
+   the `mount --bind` then lands on **their** directory entry. This is exactly why the installer no
+   longer prints these commands. For `LOG_DIR` — or for any root whose parent is group-writable and
+   not sticky (`ls -ld` the parent) — do not run `rm` + `mkdir` blind. Stop the accounts that can
+   write the parent first, or make the parent sticky (`chmod +t`) for the duration, and let step 5
+   tell you whether what you mounted onto is the directory you created.
 
 **Then do it, in this order, and not as a one-liner.** The sequence matters: the refusal appears
 while the service and its cron are still running, and step 3 removes a live pathname.
@@ -1386,7 +1388,6 @@ quietly populates a shadow tree — with nothing on screen to say how to get bac
 and a space, a tab or a backslash is written as an octal escape — `\040`, `\011`, `\134`. A
 newline or a `#` has no escape in that format at all: a path containing either cannot be written
 into `/etc/fstab`, and needs a systemd `.mount` unit instead.
-
 
 ### `install.sh` proves its three roots before it touches them
 
