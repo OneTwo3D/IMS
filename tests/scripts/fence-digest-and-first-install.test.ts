@@ -289,8 +289,7 @@ function runFirstInstall(
     APP_DIR=${JSON.stringify(checkout)}
     DB_FENCE_STATE=${JSON.stringify(join(root, 'no-fence-state.json'))}
     DB_FENCE_IDENTITY_ARGS=()
-    source ${JSON.stringify(join(REPO, 'scripts/lib/db-fence-protected.sh'))}
-    ${protectedLibraryLinesAt(recovery).join('\n    ')}
+${protectedLibraryLinesAt(recovery).join('\n')}
     DB_FENCE_SCRIPT=${JSON.stringify(join(checkout, 'scripts', 'fence-db-connections.mjs'))}
     DB_HOST=localhost
     DB_PORT=5432

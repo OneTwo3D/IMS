@@ -2414,7 +2414,7 @@ test('o3d-2sm1.5 r19/r32: the four options are parsed, and no file is read from 
   // AND THE ONE PACKAGE IT DOES IMPORT IS THE ONE THE LIBRARY VENDORS. A dependency added here
   // and not there resolves to nothing inside the mirror, which is a fence that dies at exec.
   const library = readFileSync(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'), 'utf8')
-  const roots = /^DB_FENCE_VENDOR_ROOTS=\(([^)]*)\)$/m.exec(library)
+  const roots = /^readonly DB_FENCE_VENDOR_ROOTS=\(([^)]*)\)$/m.exec(library)
   assert.ok(roots, 'the library must name what it vendors')
   assert.deepEqual(
     roots[1].split(/\s+/).filter(Boolean),
@@ -3299,10 +3299,11 @@ test('o3d-2sm1.5 r23: the trap re-fences the database it migrated even when the 
         // and never executed in place. Both paths are under the harness directory here; the copy
         // is absent to begin with, so the resolver publishes the real file above into it and runs
         // that, which is what every assertion below is written against.
-        // r31: the resolution is the SHARED library both scripts source, so the harness sources it
-        // too and then points its literals at the harness directory. Lifting the functions one by
-        // one would keep passing if an entrypoint stopped calling them, which is the finding.
-        `source ${JSON.stringify(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'))}`,
+        // r31: the resolution is the SHARED library both scripts source, so the harness runs its
+        // shipped text and points its trust root at the harness directory. Lifting the functions one
+        // by one would keep passing if an entrypoint stopped calling them, which is the finding.
+        // o3d-secops r2: the redirection is a substitution INSIDE that text, because the paths are
+        // `readonly` and an assignment after the source is now refused — as it should be.
         ...protectedLibraryLines(fenceDir),
         // resolve_fence_script() is what both entrypoints now call: it resolves the artefact AND
         // refreshes the root-owned recovery wrappers, so that the file executed and the file an

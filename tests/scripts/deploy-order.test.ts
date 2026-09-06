@@ -307,15 +307,14 @@ function durabilityFunctions(source: string): string {
  * two rounds running has been precisely that one entrypoint was reading a different copy of the
  * rule.
  *
- * The literal paths under /etc are then redirected at the harness directory — after the source,
- * so the assignments here win over the library's own. Everything else about it runs unchanged,
- * including the refusal to overwrite an existing protected copy.
+ * Its trust root is redirected at the harness directory by substituting the ONE /etc literal in
+ * the shipped TEXT before it is run — not by reassigning the paths afterwards, which `readonly`
+ * refuses since o3d-secops r2. Everything else about it runs unchanged, the nine paths composed
+ * from that root are composed by the library itself, and the refusal to overwrite an existing
+ * protected copy is the shipped one. See tests/scripts/fence-artefact-harness.ts.
  */
 function fenceProtectedLibrary(dir: string): string {
-  return [
-    `source ${JSON.stringify(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'))}`,
-    ...protectedLibraryLines(dir),
-  ].join('\n')
+  return protectedLibraryLines(dir).join('\n')
 }
 
 /** The one marker filename, in the one cutover namespace, for all three entrypoints. */
@@ -6042,9 +6041,8 @@ function plantProtectedArtefact(recovery: string, helperBody: string): void {
       [
         'set -uo pipefail',
         'exec 2>&1',
-        `source ${JSON.stringify(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'))}`,
-        `DB_FENCE_SCRIPT=${JSON.stringify(checkoutHelper(seed))}`,
         ...protectedLibraryLinesAt(recovery),
+        `DB_FENCE_SCRIPT=${JSON.stringify(checkoutHelper(seed))}`,
         'chown(){ :; }',
         'publish_fence_script_copy || { echo "PLANT FAILED: ${DB_FENCE_ROTATION_NOTE}"; exit 1; }',
       ].join('\n'),
@@ -6073,17 +6071,11 @@ function fenceRecoveryHarness(dirs: { app: string; state: string; recovery: stri
     // directory. It is what decides which bytes any of the three entrypoints may execute with
     // DEPLOY_ADMIN_DATABASE_URL, so a harness that re-implemented any part of it would be
     // asserting about a rule the shipped scripts no longer read.
-    fenceProtectedLibrary(dirs.recovery.replace(/\/recovery$/, '')),
-    `DB_FENCE_RECOVERY_DIR=${JSON.stringify(dirs.recovery)}`,
-    `DB_FENCE_IDENTITY_FILE=${JSON.stringify(join(dirs.recovery, 'db-fence-identity.env'))}`,
-    `DB_FENCE_PROTECTED_APP_DIR=${JSON.stringify(join(dirs.recovery, 'app'))}`,
-    `DB_FENCE_SCRIPT_COPY=${JSON.stringify(join(dirs.recovery, 'app', 'scripts', 'fence-db-connections.mjs'))}`,
-    `DB_FENCE_STAGED_APP_DIR=${JSON.stringify(join(dirs.recovery, '.app.staged'))}`,
-    `DB_FENCE_RETIRED_APP_DIR=${JSON.stringify(join(dirs.recovery, '.app.retired'))}`,
-    `DB_FENCE_ARTEFACT_FILE=${JSON.stringify(join(dirs.recovery, 'db-fence-artefact.sha256'))}`,
-    `DB_FENCE_MANIFEST_FILE=${JSON.stringify(join(dirs.recovery, 'db-fence-artefact.manifest'))}`,
-    `DB_FENCE_RELEASE_WRAPPER=${JSON.stringify(join(dirs.recovery, 'release-db-fence'))}`,
-    `DB_FENCE_REFENCE_WRAPPER=${JSON.stringify(join(dirs.recovery, 'refence-db'))}`,
+    // ONE redirection, not eleven: the recovery root is substituted in the library's own text and
+    // the rest are composed from it BY THE LIBRARY. The eleven-line block that used to stand here
+    // restated that composition in TypeScript, which is a second reader of the rule this file is a
+    // library to avoid having (o3d-secops r2).
+    protectedLibraryLinesAt(dirs.recovery).join('\n'),
     // The shipped resolver, not a stub (o3d-2sm1.5 r32): it is what every fence path in update.sh
     // now calls, and it does two things — resolve the artefact and rewrite the root-owned recovery
     // wrappers — that a stub would silently drop.
@@ -6674,9 +6666,11 @@ test('the recovery record lives where the application user cannot rewrite it', (
   // only as trustworthy as whatever can set that variable.
   const LIBRARY = readFileSync(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'), 'utf8')
   const LIBRARY_LINES = LIBRARY.split(/\r?\n/)
-  const line = LIBRARY_LINES.find((candidate) => /^DB_FENCE_RECOVERY_DIR=/.test(candidate))
-  assert.ok(line !== undefined, 'the library must resolve a recovery directory')
-  assert.match(line, /^DB_FENCE_RECOVERY_DIR="\/etc\/[^$]*"$/, `it must be a literal outside the application's tree: ${line}`)
+  // o3d-secops r2: the declaration begins `readonly` now, and the readers below REQUIRE that word
+  // rather than tolerating it — a `^DB_FENCE_` match would have gone on finding nothing and passing.
+  const line = LIBRARY_LINES.find((candidate) => /^readonly DB_FENCE_RECOVERY_DIR=/.test(candidate))
+  assert.ok(line !== undefined, 'the library must resolve a recovery directory, and declare it `readonly`')
+  assert.match(line, /^readonly DB_FENCE_RECOVERY_DIR="\/etc\/[^$]*"$/, `it must be a literal outside the application's tree: ${line}`)
   assert.ok(!/CUTOVER_STATE_DIR|APP_DIR|DATA_DIR|\$\{IMS_/.test(line), `and not derived from anything the application can move: ${line}`)
   for (const [label, lines] of [['update.sh', UPDATE_LINES], ['deploy.sh', DEPLOY_LINES], ['install.sh', INSTALL_LINES]] as const) {
     const reassign = lines.filter(
@@ -6693,10 +6687,10 @@ test('the recovery record lives where the application user cannot rewrite it', (
   //
   // MUTATION ROUTE: point DB_FENCE_SCRIPT_COPY back at "${DB_FENCE_RECOVERY_DIR}/fence-db-connections.mjs"
   // and the assertion below fails.
-  const copyLine = LIBRARY_LINES.find((candidate) => /^DB_FENCE_SCRIPT_COPY=/.test(candidate))
+  const copyLine = LIBRARY_LINES.find((candidate) => /^readonly DB_FENCE_SCRIPT_COPY=/.test(candidate))
   assert.match(
     copyLine ?? '',
-    /^DB_FENCE_SCRIPT_COPY="\$\{DB_FENCE_PROTECTED_APP_DIR\}\/scripts\/fence-db-connections\.mjs"$/,
+    /^readonly DB_FENCE_SCRIPT_COPY="\$\{DB_FENCE_PROTECTED_APP_DIR\}\/scripts\/fence-db-connections\.mjs"$/,
     `the protected copy must sit at <root>/scripts/, the layout node's module walk expects: ${copyLine}`,
   )
   // AND ITS IMPORTS ARE COPIED, NOT LINKED (o3d-2sm1.5 r32, Codex CRITICAL). r31 pointed
@@ -7851,16 +7845,29 @@ for (const entry of FENCE_HARNESS) {
 // ---------------------------------------------------------------------------
 
 /** The library alone, pointed at a scratch directory, with a checkout beside it. */
-function rotationHarness(dirs: { app: string; recovery: string; state: string }, body: string[]): string {
+/**
+ * THE PINS GO IN FRONT OF THE LIBRARY, NOT OVER IT (o3d-secops r2).
+ *
+ * ${DB_FENCE_EXPECTED_SHA256} and ${DB_FENCE_EXPECTED_ARTEFACT_SHA256} are what AUTHENTICATES a
+ * rotation, and they are `readonly` for the same reason the paths are. These harnesses used to
+ * assign them after the source, which bash now refuses — so they set the environment variables the
+ * library derives them FROM, which is the route the operator has and the derivation the shipped
+ * line performs. `pins` is spliced BEFORE the library text; nothing else may go there.
+ */
+function rotationHarness(
+  dirs: { app: string; recovery: string; state: string },
+  body: string[],
+  pins: string[] = [],
+): string {
   return [
     'set -uo pipefail',
     // The library reports a refused promotion on stderr, because every caller reads it through a
     // command substitution and a global set inside one dies with the subshell. Merged here so the
     // harness sees what an operator would.
     'exec 2>&1',
-    `source ${JSON.stringify(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'))}`,
-    `DB_FENCE_SCRIPT=${JSON.stringify(join(dirs.app, 'scripts', 'fence-db-connections.mjs'))}`,
+    ...pins,
     ...protectedLibraryLinesAt(dirs.recovery),
+    `DB_FENCE_SCRIPT=${JSON.stringify(join(dirs.app, 'scripts', 'fence-db-connections.mjs'))}`,
     `DB_FENCE_STATE=${JSON.stringify(join(dirs.state, 'db-connect-fence.json'))}`,
     'chown(){ :; }',
     ...body,
@@ -7935,7 +7942,7 @@ test('r31: the protected helper is bootstrapped once and then only rotated by an
     // CASE 3 — AN EXPECTED DIGEST THAT DOES NOT MATCH THE CHECKOUT. The rotation is refused and
     // the standing copy is untouched: an operator who was given the wrong digest, or a checkout
     // that was tampered with between the release and the box, are the same event here.
-    const wrong = runShell(rotationHarness(dirs, [`DB_FENCE_EXPECTED_SHA256=${sha256('// something else\n')}`, 'db_fence_script_in_use && echo']))
+    const wrong = runShell(rotationHarness(dirs, ['db_fence_script_in_use && echo'], [`IMS_FENCE_SCRIPT_SHA256=${sha256('// something else\n')}`]))
     assert.notEqual(wrong.status, 0, `a digest that does not match must refuse:\n${wrong.output}`)
     assert.equal(readFileSync(copy, 'utf8'), V1, 'and change nothing')
     assert.ok(!existsSync(join(dirs.recovery, 'app', 'scripts', '.fence-db-connections.mjs.staged')), 'and leave no staged file behind')
@@ -7943,7 +7950,7 @@ test('r31: the protected helper is bootstrapped once and then only rotated by an
     // CASE 4 — THE LEGITIMATE UPGRADE. The digest comes from the release, on the root invocation;
     // the bytes are staged inside the root-owned directory, hashed THERE, and that same file is
     // renamed into place, so the checkout cannot change between the check and the publication.
-    const rotate = runShell(rotationHarness(dirs, [`DB_FENCE_EXPECTED_SHA256=${sha256(V2)}`, 'db_fence_script_in_use && echo']))
+    const rotate = runShell(rotationHarness(dirs, ['db_fence_script_in_use && echo'], [`IMS_FENCE_SCRIPT_SHA256=${sha256(V2)}`]))
     assert.equal(rotate.status, 0, `the authenticated rotation must succeed:\n${rotate.output}`)
     assert.equal(readFileSync(copy, 'utf8'), V2, 'and the protected copy moves')
     const after = readFileSync(record, 'utf8')
@@ -7955,7 +7962,7 @@ test('r31: the protected helper is bootstrapped once and then only rotated by an
     // has to release it, from a record the raise wrote.
     writeFileSync(helper, '// v3\n')
     writeFileSync(join(dirs.state, 'db-connect-fence.json'), '{}\n')
-    const held = runShell(rotationHarness(dirs, [`DB_FENCE_EXPECTED_SHA256=${sha256('// v3\n')}`, 'db_fence_script_in_use && echo']))
+    const held = runShell(rotationHarness(dirs, ['db_fence_script_in_use && echo'], [`IMS_FENCE_SCRIPT_SHA256=${sha256('// v3\n')}`]))
     assert.equal(readFileSync(copy, 'utf8'), V2, 'a standing fence blocks the rotation')
     assert.match(held.output, /Release the fence first/, `and says why:\n${held.output}`)
     assert.equal(held.status, 0, 'without failing the run, which still has a fence to release')
@@ -8034,10 +8041,7 @@ test('r34: a dry run computes the candidate digest by READING, and hands back no
 
     // THE VALUE IS THE ONE A PUBLICATION WOULD RECORD, which is what makes it usable as a pin.
     const published = runShell(
-      rotationHarness(dirs, [
-        `DB_FENCE_EXPECTED_ARTEFACT_SHA256=${candidate}`,
-        'db_fence_script_in_use >/dev/null; echo "RC=$?"',
-      ]),
+      rotationHarness(dirs, ['db_fence_script_in_use >/dev/null; echo "RC=$?"'], [`IMS_FENCE_ARTEFACT_SHA256=${candidate}`]),
     )
     assert.match(published.output, /^RC=0$/m, `the digest a dry run reports must authorise the publication:\n${published.output}`)
     assert.equal(
@@ -8052,14 +8056,13 @@ test('r34: a dry run computes the candidate digest by READING, and hands back no
     // which is the failure mode a refusal has to avoid.
     const pinned = runShell(
       rotationHarness(dirs, [
-        `DB_FENCE_EXPECTED_ARTEFACT_SHA256=${candidate}`,
         'db_fence_probe_script; echo "RC=$?"',
         'echo "PROBE=[${DB_FENCE_PROBE_SCRIPT}]"',
         'echo "CONTENT=$(cat "${DB_FENCE_PROBE_SCRIPT}")"',
         'temp="${DB_FENCE_PROBE_TEMP}"',
         'db_fence_probe_cleanup',
         'echo "AFTER=$([[ -e "${temp}" ]] && echo present || echo gone)"',
-      ]),
+      ], [`IMS_FENCE_ARTEFACT_SHA256=${candidate}`]),
     )
     assert.match(pinned.output, /^RC=0$/m, `a pinned candidate is preflightable:\n${pinned.output}`)
     const probed = /^PROBE=\[(.*)\]$/m.exec(pinned.output)?.[1] ?? ''
@@ -8072,10 +8075,9 @@ test('r34: a dry run computes the candidate digest by READING, and hands back no
     // accepted above was the match and not the mere presence of the variable.
     const wrong = runShell(
       rotationHarness(dirs, [
-        `DB_FENCE_EXPECTED_ARTEFACT_SHA256=${'0'.repeat(64)}`,
         'db_fence_probe_script; echo "RC=$?"',
         'echo "PROBE=[${DB_FENCE_PROBE_SCRIPT}]"',
-      ]),
+      ], [`IMS_FENCE_ARTEFACT_SHA256=${'0'.repeat(64)}`]),
     )
     assert.match(wrong.output, /^RC=1$/m, `a pin that does not match authorises nothing:\n${wrong.output}`)
     assert.match(wrong.output, /^PROBE=\[\]$/m, wrong.output)
@@ -8116,14 +8118,14 @@ const STEALING_PG = [
   '',
 ].join('\n')
 
-/** The library alone, pointed at a scratch root laid out by writeFenceCheckout(). */
-function artefactHarness(root: string, body: string[]): string {
+/** The library alone, pointed at a scratch root laid out by writeFenceCheckout(). `pins` as above. */
+function artefactHarness(root: string, body: string[], pins: string[] = []): string {
   return [
     'set -uo pipefail',
     'exec 2>&1',
-    `source ${JSON.stringify(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'))}`,
-    `DB_FENCE_SCRIPT=${JSON.stringify(checkoutHelper(root))}`,
+    ...pins,
     ...protectedLibraryLines(root),
+    `DB_FENCE_SCRIPT=${JSON.stringify(checkoutHelper(root))}`,
     `DB_FENCE_STATE=${JSON.stringify(join(root, 'state.json'))}`,
     'chown(){ :; }',
     ...body,
@@ -8235,7 +8237,7 @@ test('r32: no module resolution out of the protected artefact can reach the appl
 /** The recipe the library computes with, and the one docs/installation.md prints. */
 const ARTEFACT_RECIPE = (() => {
   const library = readFileSync(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'), 'utf8')
-  const line = /^DB_FENCE_ARTEFACT_RECIPE="(.+)"$/m.exec(library)
+  const line = /^readonly DB_FENCE_ARTEFACT_RECIPE="(.+)"$/m.exec(library)
   assert.ok(line, 'the library must state the digest recipe as one string')
   return line[1].replace(/\\\\/g, '\\')
 })()
@@ -8343,7 +8345,7 @@ test('r32: IMS_FENCE_ARTEFACT_SHA256 pins the whole tree, at publication and at 
     const paths = protectedPaths(dir)
 
     // 1 — A WRONG PIN AT BOOTSTRAP PUBLISHES NOTHING AT ALL.
-    const wrong = runShell(artefactHarness(dir, [`IMS_FENCE_ARTEFACT_SHA256=${'a'.repeat(64)}`, 'DB_FENCE_EXPECTED_ARTEFACT_SHA256="${IMS_FENCE_ARTEFACT_SHA256}"', 'db_fence_script_in_use >/dev/null; echo "RC=$?"']))
+    const wrong = runShell(artefactHarness(dir, ['db_fence_script_in_use >/dev/null; echo "RC=$?"'], [`IMS_FENCE_ARTEFACT_SHA256=${'a'.repeat(64)}`]))
     assert.match(wrong.output, /^RC=1$/m, `a mismatched pin must refuse:\n${wrong.output}`)
     assert.match(wrong.output, /IMS_FENCE_ARTEFACT_SHA256 expects/, wrong.output)
     assert.ok(!existsSync(paths.app), 'and leave nothing behind under the protected directory')
@@ -8353,11 +8355,11 @@ test('r32: IMS_FENCE_ARTEFACT_SHA256 pins the whole tree, at publication and at 
     const digest = /^fence_artefact_sha256=([0-9a-f]{64})$/m.exec(readFileSync(paths.artefactFile, 'utf8'))![1]
 
     // 3 — THE RIGHT PIN RUNS; A WRONG ONE REFUSES A TREE ALREADY STANDING.
-    const pinned = runShell(artefactHarness(dir, [`IMS_FENCE_ARTEFACT_SHA256=${digest}`, 'DB_FENCE_EXPECTED_ARTEFACT_SHA256="${IMS_FENCE_ARTEFACT_SHA256}"', 'db_fence_script_in_use >/dev/null; echo "RC=$?"']))
+    const pinned = runShell(artefactHarness(dir, ['db_fence_script_in_use >/dev/null; echo "RC=$?"'], [`IMS_FENCE_ARTEFACT_SHA256=${digest}`]))
     assert.match(pinned.output, /^RC=0$/m, `the matching pin must be accepted:\n${pinned.output}`)
     // A mismatched pin against a standing artefact is refused at the ROTATION: the pin says
     // "publish this exact tree", the tree that can be assembled is not it, and nothing is written.
-    const mismatched = runShell(artefactHarness(dir, [`IMS_FENCE_ARTEFACT_SHA256=${'b'.repeat(64)}`, 'DB_FENCE_EXPECTED_ARTEFACT_SHA256="${IMS_FENCE_ARTEFACT_SHA256}"', 'db_fence_script_in_use >/dev/null; echo "RC=$?"']))
+    const mismatched = runShell(artefactHarness(dir, ['db_fence_script_in_use >/dev/null; echo "RC=$?"'], [`IMS_FENCE_ARTEFACT_SHA256=${'b'.repeat(64)}`]))
     assert.match(mismatched.output, /^RC=1$/m, `and a mismatched one must refuse:\n${mismatched.output}`)
     assert.match(mismatched.output, /IMS_FENCE_ARTEFACT_SHA256 expects b{64}/, mismatched.output)
     assert.match(mismatched.output, /NOTHING was published/, 'and say that nothing moved')
@@ -8372,7 +8374,7 @@ test('r32: IMS_FENCE_ARTEFACT_SHA256 pins the whole tree, at publication and at 
     // invocation did not authenticate: the rotation says "not now", and without the second check
     // the run would carry on with whatever is there.
     writeFileSync(join(dir, 'state.json'), '{}\n')
-    const standing = runShell(artefactHarness(dir, [`IMS_FENCE_ARTEFACT_SHA256=${'c'.repeat(64)}`, 'DB_FENCE_EXPECTED_ARTEFACT_SHA256="${IMS_FENCE_ARTEFACT_SHA256}"', 'db_fence_script_in_use >/dev/null; echo "RC=$?"']))
+    const standing = runShell(artefactHarness(dir, ['db_fence_script_in_use >/dev/null; echo "RC=$?"'], [`IMS_FENCE_ARTEFACT_SHA256=${'c'.repeat(64)}`]))
     assert.match(standing.output, /a connection fence is recorded at/, `the rotation must be refused while a fence stands:\n${standing.output}`)
     assert.match(standing.output, /^RC=1$/m, 'and the run must not go on with an unauthenticated tree')
     assert.match(standing.output, /Refusing to run a tree this invocation did not authenticate/, standing.output)
@@ -8697,7 +8699,7 @@ test('r33: a script-only pin cannot authorise a publication whose closure comes 
 
     // PHASE 1 — THE PIN THAT LOOKS LIKE AUTHORISATION.
     const refused = runShell(
-      artefactHarness(dir, [`DB_FENCE_EXPECTED_SHA256=${entryDigest}`, 'db_fence_script_in_use >/dev/null; echo "RC=$?"']),
+      artefactHarness(dir, ['db_fence_script_in_use >/dev/null; echo "RC=$?"'], [`IMS_FENCE_SCRIPT_SHA256=${entryDigest}`]),
     )
     assert.match(refused.output, /^RC=1$/m, `a script-only pin must not authorise this publication:\n${refused.output}`)
     assert.match(refused.output, /IMS_FENCE_SCRIPT_SHA256 IS NOT SUFFICIENT HERE/, refused.output)
@@ -8737,10 +8739,9 @@ test('r33: a script-only pin cannot authorise a publication whose closure comes 
     const reported = /just now hashes to ([0-9a-f]{64})/.exec(refused.output)?.[1]
     assert.ok(reported, `the refusal must report what the tree would hash to:\n${refused.output}`)
     const pinned = runShell(
-      artefactHarness(dir, [
-        `DB_FENCE_EXPECTED_SHA256=${entryDigest}`,
-        `DB_FENCE_EXPECTED_ARTEFACT_SHA256=${reported}`,
-        'db_fence_script_in_use >/dev/null; echo "RC=$?"',
+      artefactHarness(dir, ['db_fence_script_in_use >/dev/null; echo "RC=$?"'], [
+        `IMS_FENCE_SCRIPT_SHA256=${entryDigest}`,
+        `IMS_FENCE_ARTEFACT_SHA256=${reported}`,
       ]),
     )
     assert.match(pinned.output, /^RC=0$/m, `the artefact pin the refusal named must be accepted:\n${pinned.output}`)
@@ -8761,7 +8762,7 @@ test('r33: a script-only pin cannot authorise a publication whose closure comes 
     writeFenceCheckout(clean, importReportingHelper(clean))
     const digest = sha256File(checkoutHelper(clean))
     const result = runShell(
-      artefactHarness(clean, [`DB_FENCE_EXPECTED_SHA256=${digest}`, 'db_fence_script_in_use >/dev/null; echo "RC=$?"']),
+      artefactHarness(clean, ['db_fence_script_in_use >/dev/null; echo "RC=$?"'], [`IMS_FENCE_SCRIPT_SHA256=${digest}`]),
     )
     assert.match(result.output, /^RC=0$/m, `a trusted source must publish under the entry-file pin alone:\n${result.output}`)
     assert.doesNotMatch(result.output, /IS NOT SUFFICIENT/, result.output)
@@ -8839,10 +8840,7 @@ test('r34: an unpinned bootstrap out of an application-writable checkout is REFU
     const candidate = /^CANDIDATE=\[([0-9a-f]{64})\]$/m.exec(probe.output)?.[1] ?? ''
     assert.match(candidate, /^[0-9a-f]{64}$/, `the digest must be obtainable without publishing:\n${probe.output}`)
     const pinned = runShell(
-      artefactHarness(dir, [
-        `DB_FENCE_EXPECTED_ARTEFACT_SHA256=${candidate}`,
-        'db_fence_script_in_use >/dev/null; echo "RC=$?"',
-      ]),
+      artefactHarness(dir, ['db_fence_script_in_use >/dev/null; echo "RC=$?"'], [`IMS_FENCE_ARTEFACT_SHA256=${candidate}`]),
     )
     assert.match(pinned.output, /^RC=0$/m, `the pinned bootstrap must publish:\n${pinned.output}`)
     assert.equal(
@@ -9345,7 +9343,7 @@ test('r33: an authenticated rotation out of an application-writable checkout nee
     writeFenceCheckout(dir, importReportingHelper(dir))
     const paths = protectedPaths(dir)
     const v1 = sha256File(checkoutHelper(dir))
-    const first = runShell(artefactHarness(dir, [`DB_FENCE_EXPECTED_SHA256=${v1}`, 'db_fence_script_in_use >/dev/null; echo "RC=$?"']))
+    const first = runShell(artefactHarness(dir, ['db_fence_script_in_use >/dev/null; echo "RC=$?"'], [`IMS_FENCE_SCRIPT_SHA256=${v1}`]))
     assert.match(first.output, /^RC=0$/m, `the clean bootstrap must publish:\n${first.output}`)
     const standing = readFileSync(paths.pgEntry, 'utf8')
     assert.match(standing, /SHIPPED-PG/, 'and the vendored package is the shipped one')
@@ -9356,7 +9354,7 @@ test('r33: an authenticated rotation out of an application-writable checkout nee
     chmodSync(checkoutPgEntry(dir), 0o664)
     const v2 = sha256File(checkoutHelper(dir))
     assert.notEqual(v2, v1, 'precondition: this is a real upgrade of the entry file')
-    const refused = runShell(artefactHarness(dir, [`DB_FENCE_EXPECTED_SHA256=${v2}`, 'db_fence_script_in_use >/dev/null; echo "RC=$?"']))
+    const refused = runShell(artefactHarness(dir, ['db_fence_script_in_use >/dev/null; echo "RC=$?"'], [`IMS_FENCE_SCRIPT_SHA256=${v2}`]))
     assert.match(refused.output, /^RC=1$/m, `the rotation must be refused:\n${refused.output}`)
     assert.match(refused.output, /IMS_FENCE_SCRIPT_SHA256 IS NOT SUFFICIENT HERE/, refused.output)
     assert.equal(readFileSync(paths.pgEntry, 'utf8'), standing, 'and the standing artefact must be untouched')
@@ -9367,10 +9365,9 @@ test('r33: an authenticated rotation out of an application-writable checkout nee
     const reported = /just now hashes to ([0-9a-f]{64})/.exec(refused.output)?.[1]
     assert.ok(reported, `the refusal must report what the tree would hash to:\n${refused.output}`)
     const rotated = runShell(
-      artefactHarness(dir, [
-        `DB_FENCE_EXPECTED_SHA256=${v2}`,
-        `DB_FENCE_EXPECTED_ARTEFACT_SHA256=${reported}`,
-        'db_fence_script_in_use >/dev/null; echo "RC=$?"',
+      artefactHarness(dir, ['db_fence_script_in_use >/dev/null; echo "RC=$?"'], [
+        `IMS_FENCE_SCRIPT_SHA256=${v2}`,
+        `IMS_FENCE_ARTEFACT_SHA256=${reported}`,
       ]),
     )
     assert.match(rotated.output, /^RC=0$/m, `the whole-tree pin must authorise it:\n${rotated.output}`)
@@ -9458,9 +9455,8 @@ test('r34: a directory ABOVE the application directory is part of the provenance
       [
         'set -uo pipefail',
         'exec 2>&1',
-        `source ${JSON.stringify(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'))}`,
-        `DB_FENCE_SCRIPT=${JSON.stringify(checkoutHelper(parent))}`,
         ...protectedLibraryLinesAt(recovery),
+        `DB_FENCE_SCRIPT=${JSON.stringify(checkoutHelper(parent))}`,
         'chown(){ :; }',
         'db_fence_script_in_use >/dev/null; echo "RC=$?"',
       ].join('\n'),
@@ -9572,7 +9568,7 @@ test('r34: a dry run reports the tree it WOULD publish, not the one already stan
     const v1 = /^CANDIDATE=\[([0-9a-f]{64})\]$/m.exec(first.output)?.[1] ?? ''
     assert.match(v1, /^[0-9a-f]{64}$/, first.output)
     const publish = runShell(
-      rotationHarness(dirs, [`DB_FENCE_EXPECTED_ARTEFACT_SHA256=${v1}`, 'db_fence_script_in_use >/dev/null; echo "RC=$?"']),
+      rotationHarness(dirs, ['db_fence_script_in_use >/dev/null; echo "RC=$?"'], [`IMS_FENCE_ARTEFACT_SHA256=${v1}`]),
     )
     assert.match(publish.output, /^RC=0$/m, `precondition: an artefact must be standing:\n${publish.output}`)
 
@@ -9603,10 +9599,7 @@ test('r34: a dry run reports the tree it WOULD publish, not the one already stan
     // AND THE REPORTED CANDIDATE IS THE VALUE THAT AUTHORISES THE ROTATION — which is the whole
     // point of reporting it, and what the standing digest could never do.
     const rotated = runShell(
-      rotationHarness(dirs, [
-        `DB_FENCE_EXPECTED_ARTEFACT_SHA256=${candidate}`,
-        'db_fence_script_in_use >/dev/null; echo "RC=$?"',
-      ]),
+      rotationHarness(dirs, ['db_fence_script_in_use >/dev/null; echo "RC=$?"'], [`IMS_FENCE_ARTEFACT_SHA256=${candidate}`]),
     )
     assert.match(rotated.output, /^RC=0$/m, `the reported candidate must authorise the rotation:\n${rotated.output}`)
     assert.equal(
