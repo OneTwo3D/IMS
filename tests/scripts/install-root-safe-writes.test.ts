@@ -3566,6 +3566,46 @@ test('[o3d-secops] the sink census still names exactly the seven values b128f47f
   assert.equal(indirect.complaints.length, 10, indirect.complaints.join('\n'))
   assert.ok(indirect.complaints.some((complaint) => /uses an indirect expansion/.test(complaint)),
     indirect.complaints.join('\n'))
+
+  // R6 PLANTS THE ALIAS THE R5 READER COULD NOT SEE, IN THAT SAME TREE. One literal value spelt
+  // across a quote boundary is one word to bash, and `declare` puts it in the report set; the `rm`
+  // that follows is then a DELETION of a report. Under r5 this tree came back at nine and the
+  // delete was of a name the census had never heard of.
+  const concatenated = plantedInLibrary('declare concat_alias=DB_FENC"E_PROBE_REASON"\nrm -rf "${concat_alias}"')
+  assert.equal(concatenated.complaints.length, 10,
+    `a concatenated alias must be the tenth complaint and nothing else:\n${concatenated.complaints.join('\n')}`)
+  assert.ok(concatenated.complaints.some((complaint) => /reaches DELETION with concat_alias/.test(complaint)),
+    concatenated.complaints.join('\n'))
+  assert.ok(concatenated.followed.some((entry) => entry.startsWith('concat_alias (holds the NAME DB_FENCE_PROBE_REASON')),
+    `and it is the FOLLOW that makes the sink visible; it followed: ${concatenated.followed.join(', ')}`)
+
+  // AND THE THREE THAT MUST NOT PROPAGATE, IN THAT SAME TREE, AGAINST A GATE THEY WOULD HAVE
+  // SILENCED. `probe_alias` is given a value that is not a report first, so each shape below is
+  // asked to change an answer that is already settled; the gate then tests it beside a real report.
+  // Under r5 every one of these trees came back at NINE — the gate silenced by an invented alias.
+  const GATE = '[[ -n "${probe_alias}" && -n "${DB_FENCE_PROBE_REASON}" ]] && exit 1'
+  for (const [shape, form] of [
+    ['an append', 'probe_alias+=DB_FENCE_PROBE_REASON'],
+    ['a command prefix', 'probe_alias=DB_FENCE_PROBE_REASON true'],
+    ['an argument after an ordinary command', 'echo probe_alias=DB_FENCE_PROBE_REASON'],
+  ] as ReadonlyArray<readonly [string, string]>) {
+    const planted = plantedInLibrary(`probe_alias=SOMETHING_UNTRACKED\n${form}\n${GATE}`)
+    assert.ok(!planted.followed.some((entry) => entry.startsWith('probe_alias ')),
+      `${shape} must not make probe_alias an alias; it followed: ${planted.followed.join(', ')}`)
+    assert.equal(planted.complaints.length, 10,
+      `${shape} must leave the gate as the tenth complaint:\n${planted.complaints.join('\n')}`)
+    assert.ok(planted.complaints.some((complaint) =>
+      /tests DB_FENCE_PROBE_REASON alongside something that is not another report/.test(complaint)),
+    `${shape}:\n${planted.complaints.join('\n')}`)
+  }
+
+  // NOT VACUOUS: the SAME gate after a real replacement is back to nine, silenced — so the three
+  // assertions above are the position rule talking and not a census that has stopped following.
+  const silenced = plantedInLibrary(`probe_alias=SOMETHING_UNTRACKED\nprobe_alias=DB_FENCE_PROBE_REASON\n${GATE}`)
+  assert.equal(silenced.complaints.length, 9,
+    `a real alias must still silence the gate:\n${silenced.complaints.join('\n')}`)
+  assert.ok(silenced.followed.some((entry) => entry.startsWith('probe_alias (holds the NAME DB_FENCE_PROBE_REASON')),
+    `and it must be followed to do that; it followed: ${silenced.followed.join(', ')}`)
 })
 
 /**
