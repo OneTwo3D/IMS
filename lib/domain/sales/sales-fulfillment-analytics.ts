@@ -1,6 +1,7 @@
 import {
   ActivityEntityType,
   Prisma,
+  ProductType,
   SalesOrderStatus,
   ShipmentStatus,
   StockMovementType,
@@ -21,11 +22,19 @@ import {
   loadFulfillmentProductGraph,
 } from '@/lib/products/kit-fulfillment'
 import { lineFulfillmentRequirements } from '@/lib/products/fulfillment-requirement-snapshot'
-import { refundTotalsBasis } from '@/lib/domain/sales/refund-basis-analytics'
+import { isStockTrackedProductType } from '@/lib/domain/inventory/backorder-policy'
 import {
-  REFUND_BLIND_NOTICE_CUSTOMER_MIX,
-  REFUND_BLIND_NOTICE_GROSS_MARGIN,
-  REFUND_BLIND_NOTICE_SALES,
+  creditPlacement,
+  marginFigureBoundDecimal,
+  netLinearFigureBoundDecimal,
+  refundTotalsBasis,
+  shareFigureBound,
+  type DerivedFigureBound,
+} from '@/lib/domain/sales/refund-basis-analytics'
+import {
+  REFUND_BASIS_NOTICE_CUSTOMER_MIX,
+  REFUND_BASIS_NOTICE_GROSS_MARGIN,
+  REFUND_BASIS_NOTICE_SALES,
   RETURNS_MIXED_BASIS_MARKER,
   RETURNS_MIXED_BASIS_NOTICE,
 } from '@/lib/analytics/refund-figure-surfaces'
@@ -90,21 +99,121 @@ export type SalesReportRow = {
   currency: string
   orderCount: number
   lineCount: number
+  /**
+   * AS INVOICED, and deliberately still so after o3d-kyey. This report's contract — stated in its
+   * own notices, and the reason the product/category views allocate order totals across lines at all
+   * — is that its grand totals reconcile to `SalesOrder` totals. A figure that reconciles to the
+   * invoices cannot also be net of credit notes, so the refund-aware figure is `netRevenue` beside
+   * it rather than a redefinition of this one. `tax`, `shipping` and `discount` are as invoiced for
+   * the same reason.
+   */
   revenue: string
   tax: string
   shipping: string
   discount: string
+  /**
+   * `revenue` less the credit recorded on the SAME (gross, VAT-inclusive) basis. Not `revenue` minus
+   * every refund: a NET-basis credit is ex-VAT and subtracting it from a VAT-inclusive figure
+   * under-credits by its VAT, and an unproven one cannot be placed at all. Both sit in the buckets
+   * below and make this an upper bound — see `netRevenueBound`.
+   */
+  netRevenue: string
+  /** What `netRevenue` is: `exact`, `upper` (`≤`), or `indeterminate` (`?`). */
+  netRevenueBound: DerivedFigureBound
+  /** Credit stamped GROSS — the comparable one, already subtracted from `netRevenue`. */
+  refundsGrossBasis: string
+  /** Credit stamped NET — reported, NOT subtracted. */
+  refundsNetBasis: string
+  /** Credit with no proven basis — reported, NOT subtracted. */
+  refundsUnknownBasis: string
 }
+
+/**
+ * THE STATE OF A CUSTOMER'S COST EVIDENCE — and therefore why their gross profit is or is not there.
+ *
+ * `incomplete` and `inconsistent` both withhold, and an operator handles them differently. See
+ * `dispatchCostEvidenceByOrder` for why excess evidence is not a gap.
+ */
+export type CostEvidenceStatus =
+  /** Every in-period order's posted cost covers, exactly, the revenue the profit is measured against. */
+  | 'complete'
+  /** Some cost is missing or unknowable. It may arrive: the rest ships, the rest is costed. */
+  | 'incomplete'
+  /** Some dispatch is costed for MORE units than it moved. Cost evidence that contradicts itself. */
+  | 'inconsistent'
 
 export type CustomerReportRow = {
   customerId: string | null
   customerName: string
   customerEmail: string | null
+  /**
+   * THE ROW'S OWN COPY OF THE IDENTITY THE NOTICE NAMES IT BY (o3d-7jfq r9).
+   *
+   * `customerGroupKey` put through `identityLabelField` — the same value, from the same field, that
+   * `inconsistentCustomerLabel` prints as `group=`. It is on the row because the notice's token was
+   * previously the ONLY place it existed: an operator holding one had no mechanical way to reach
+   * the row it identifies, and was left comparing hex digits by eye against a name — which is not
+   * a route, it is a hope. Carried here it reaches the table cell and the `groupToken` CSV column,
+   * so the token is COPIED and MATCHED, or JOINED, and never read.
+   *
+   * ONE SOURCE, NOT TWO EQUAL ONES. The label takes this field rather than re-deriving the key, so
+   * the notice and the row cannot disagree about which row is meant — the same discipline the count
+   * and the names already follow, where both are taken from the one sorted, unpaginated array.
+   */
+  groupToken: string
   orderCount: number
+  /** AS INVOICED, unchanged, so this column still agrees with Sales Analytics' customer grouping. */
   revenueBase: string
-  grossProfitBase: string
+  /** `revenueBase` less the GROSS-basis credit — the only credit on the same basis as it. */
+  netRevenueBase: string
+  netRevenueBaseBound: DerivedFigureBound
+  /**
+   * The EX-VAT revenue gross profit is actually computed from: `Σ(totalBase - taxBase)` less the
+   * NET-basis credit. Published because otherwise the profit below is a number with no visible
+   * arithmetic — `revenueBase - grossProfitBase` is not COGS and never was.
+   */
+  netRevenueExVatBase: string
+  netRevenueExVatBaseBound: DerivedFigureBound
+  /**
+   * `netRevenueExVatBase - cogs`, or NULL when this customer has an order in the period with no
+   * posted COGS at all.
+   *
+   * o3d-kyey. It used to be `Σ SalesOrder.totalBase - Σ CogsEntry.totalCostBase`, which was wrong
+   * twice over. It subtracted an EX-TAX cost from a VAT-INCLUSIVE revenue, so it overstated profit
+   * by the whole VAT on every taxable order; and `cogsByOrder.get(id) ?? 0` turned "this order has
+   * not dispatched yet, so its cost is not known" into "this order cost nothing", which published
+   * an order's entire revenue as profit. A missing cost is not a zero cost, so the figure is
+   * WITHHELD for that customer rather than published wrong — see `costCaptured`.
+   */
+  grossProfitBase: string | null
+  grossProfitBaseBound: DerivedFigureBound
+  /**
+   * False when at least one of this customer's in-period orders has no COGS posted in the period.
+   * `grossProfitBase` is null exactly when this is false, and this is `costEvidence === 'complete'`.
+   */
+  costCaptured: boolean
+  /**
+   * WHY, when `costCaptured` is false. The decision and the reason are separate fields because they
+   * are read by different people: a reader who only wants to know whether a number is there reads
+   * the boolean, and one who has to DO something about a blank needs to know which thing to do.
+   * Derived from this in the projection, so the two cannot drift.
+   */
+  costEvidence: CostEvidenceStatus
+  /** Unpaid order value, less the GROSS-basis credit raised against those unpaid orders. */
   arExposureBase: string
+  /**
+   * AR exposure nets credit too, so it is bounded on the same terms as every other figure here. A
+   * NET-basis credit against an unpaid order is real relief this figure could not apply, which
+   * leaves the published exposure at most the true one.
+   */
+  arExposureBaseBound: DerivedFigureBound
+  /** Share of the period's REFUND-AWARE revenue, so a customer who returned everything ranks on it. */
   shareOfRevenuePct: string
+  /** A ratio moves both its parts; it is never an upper bound. See `shareFigureBound`. */
+  shareOfRevenuePctBound: DerivedFigureBound
+  refundsGrossBasis: string
+  refundsNetBasis: string
+  refundsUnknownBasis: string
 }
 
 export type MarginReportRow = {
@@ -113,11 +222,29 @@ export type MarginReportRow = {
   productName: string
   categoryName: string | null
   lineCount: number
+  /**
+   * Dispatched ex-VAT line revenue LESS the NET-basis credit raised in the period. Corrected in
+   * place rather than published beside an as-invoiced twin (the way Sales Analytics' is), because
+   * this figure reconciles to nothing: it is already prorated away from the order totals to the
+   * quantity each line dispatched inside the window, so there is no invoiced number for it to agree
+   * with. Its basis is NET, so the NET-basis credit is the comparable one.
+   */
   revenueBase: string
+  revenueBaseBound: DerivedFigureBound
   cogsBase: string
   grossProfitBase: string
+  grossProfitBaseBound: DerivedFigureBound
   marginPct: string
+  /** Margin is a RATIO: `refundBasisComplete === false` does not make it an upper bound. */
+  marginPctBound: DerivedFigureBound
   contributionPct: string
+  contributionPctBound: DerivedFigureBound
+  /** Credit stamped NET — the comparable one, already subtracted from `revenueBase`. */
+  refundsNetBasis: string
+  /** Credit stamped GROSS — reported, NOT subtracted. */
+  refundsGrossBasis: string
+  /** Credit with no proven basis — reported, NOT subtracted. */
+  refundsUnknownBasis: string
 }
 
 export type ReturnsReportRow = {
@@ -181,6 +308,12 @@ type SalesOrderLineRow = {
   product: {
     id: string
     sku: string
+    /**
+     * What the line SELLS, which is what says whether it has a cost to post at all. Loaded for
+     * `orderCostCoverage`; see the distinction it draws between a line with no cost and a line
+     * whose cost is unknown.
+     */
+    type: ProductType
     name: string
     category: { name: string } | null
   } | null
@@ -242,6 +375,229 @@ function marginCogsBucket(row: CogsEntryRow): { productId: string; product: Marg
   const line = row.movement.shipmentLine?.line
   if (line?.productId && line.product) return { productId: line.productId, product: line.product }
   return { productId: row.movement.productId, product: row.movement.product }
+}
+
+/**
+ * o3d-kyey: WHAT A PERIOD'S CREDIT IS, SPLIT BY THE BASIS IT WAS RECORDED ON.
+ *
+ * Every one of these three reports subtracts credit from a revenue figure, and each figure is on a
+ * basis of its own: Sales Analytics and Customer Mix build revenue from `SalesOrder.totalBase`,
+ * which is VAT-INCLUSIVE, while Gross Margin builds it from `SalesOrderLine.totalBase`, which is
+ * ex-VAT. Only the credit recorded on the SAME basis as the figure is the same unit as it, so only
+ * that one is subtracted; the other two are carried beside the figure and make it a stated bound.
+ * Nothing is converted between the bases — on a mixed-rate order the rate that produced a gross
+ * credit is not recoverable from stored data, which is the conclusion `refund-basis-analytics`
+ * reaches and `o3d-w00` made the refund CREATE path fail closed over.
+ *
+ * The two completeness flags are tracked SEPARATELY rather than derived from the sums, because a
+ * +5 and a -5 of unplaceable credit sum to zero while neither was placeable.
+ */
+type CreditBuckets = {
+  /** Credit stamped NET (ex-VAT). */
+  net: Prisma.Decimal
+  /** Credit stamped GROSS (VAT-inclusive). */
+  gross: Prisma.Decimal
+  /** Credit whose basis was never proved. Never guessed at, never converted. */
+  unknown: Prisma.Decimal
+  /**
+   * THE POSITIVE PART OF EACH BUCKET — `Σ max(entry, 0)` — carried beside the signed total because
+   * the signed total cannot bound anything on its own.
+   *
+   * A credit that is not the figure's unit contributes an INTERVAL, not an amount: an entry `b` on
+   * another basis is worth somewhere in `[min(b, 0), max(b, 0)]` once expressed in the figure's
+   * unit. Adding the entries up first destroys that interval — +120 and −120 of GROSS credit sum to
+   * a bucket of zero, and a bound read off that zero says the figure cannot move when the figure
+   * can move by 120 in either direction. Recording the positive part AT THE ENTRY keeps both
+   * endpoints recoverable from the two numbers: `Σ max(b, 0)` is this field and `Σ min(b, 0)` is
+   * `total − this field`.
+   *
+   * Same reasoning as the two completeness flags below being tracked rather than derived from the
+   * sums, applied to the AMOUNTS instead of the flags.
+   */
+  netPositive: Prisma.Decimal
+  grossPositive: Prisma.Decimal
+  unknownPositive: Prisma.Decimal
+  /** True while every credit seen could be placed on a NET-basis figure. */
+  netBasisComplete: boolean
+  /** True while every credit seen could be placed on a GROSS-basis figure. */
+  grossBasisComplete: boolean
+}
+
+function emptyCredits(): CreditBuckets {
+  return {
+    net: new Prisma.Decimal(0),
+    gross: new Prisma.Decimal(0),
+    unknown: new Prisma.Decimal(0),
+    netPositive: new Prisma.Decimal(0),
+    grossPositive: new Prisma.Decimal(0),
+    unknownPositive: new Prisma.Decimal(0),
+    netBasisComplete: true,
+    grossBasisComplete: true,
+  }
+}
+
+function addCredit(buckets: CreditBuckets, totalsBasis: string | null, amount: DecimalInput): void {
+  const onNet = creditPlacement('NET', totalsBasis, amount)
+  const onGross = creditPlacement('GROSS', totalsBasis, amount)
+  const value = toDecimal(amount)
+  // THIS IS THE LAST PLACE AN INDIVIDUAL CREDIT EXISTS. Every consumer above this line sees bucket
+  // sums only, so a separation that is not made here can never be made at all — which is exactly
+  // how two opposite same-basis credits used to reach the interval arithmetic as a single zero.
+  const positive = value.gt(0) ? value : new Prisma.Decimal(0)
+  if (onNet.bucket === 'net') {
+    buckets.net = buckets.net.add(value)
+    buckets.netPositive = buckets.netPositive.add(positive)
+  } else if (onNet.bucket === 'gross') {
+    buckets.gross = buckets.gross.add(value)
+    buckets.grossPositive = buckets.grossPositive.add(positive)
+  } else {
+    buckets.unknown = buckets.unknown.add(value)
+    buckets.unknownPositive = buckets.unknownPositive.add(positive)
+  }
+  if (!onNet.placeable) buckets.netBasisComplete = false
+  if (!onGross.placeable) buckets.grossBasisComplete = false
+}
+
+function mergeCredits(into: CreditBuckets, from: CreditBuckets): void {
+  into.net = into.net.add(from.net)
+  into.gross = into.gross.add(from.gross)
+  into.unknown = into.unknown.add(from.unknown)
+  into.netPositive = into.netPositive.add(from.netPositive)
+  into.grossPositive = into.grossPositive.add(from.grossPositive)
+  into.unknownPositive = into.unknownPositive.add(from.unknownPositive)
+  if (!from.netBasisComplete) into.netBasisComplete = false
+  if (!from.grossBasisComplete) into.grossBasisComplete = false
+}
+
+/** The credit that is the same unit as a figure on `basis`, and is therefore SUBTRACTED from it. */
+function comparableCredit(buckets: CreditBuckets, basis: 'NET' | 'GROSS'): Prisma.Decimal {
+  return basis === 'NET' ? buckets.net : buckets.gross
+}
+
+/**
+ * THE CREDIT A FIGURE COULD NOT ABSORB, AS THE INTERVAL IT ACTUALLY OCCUPIES — never as one signed
+ * amount, because one signed amount is what loses the cancellation.
+ *
+ * `[lower, upper]` is stated in the FIGURE'S unit and bounds the credit that was left unsubtracted,
+ * so the true figure lies in `[published − upper, published − lower]`.
+ *
+ * On a NET figure the bound is TIGHT in both directions: a GROSS entry `g` is worth `g / (1 + rate)`
+ * ex-VAT, which lies in `[0, g]` for `g >= 0` and in `[g, 0]` for `g < 0`, and an entry of unproven
+ * basis is worth either itself or that, so the same interval covers it.
+ *
+ * On a GROSS figure only the DIRECTION is established, which is all `netLinearFigureBoundDecimal`
+ * reads from it (its own docstring says so): a NET entry `n` is worth `n * (1 + rate)` VAT-inclusive
+ * and has no finite ceiling, so `upper` is a sign carrier there and not a magnitude. `lower` is
+ * still sign-correct — it is below zero exactly when some unplaced entry was negative, which is
+ * exactly when the published figure may be too LOW and no `≤` may be claimed.
+ */
+type UnplacedCreditInterval = { lower: Prisma.Decimal; upper: Prisma.Decimal }
+
+function unplacedCreditInterval(buckets: CreditBuckets, basis: 'NET' | 'GROSS'): UnplacedCreditInterval {
+  const zero = new Prisma.Decimal(0)
+  const unplaced: Array<[Prisma.Decimal, Prisma.Decimal]> = basis === 'NET'
+    ? [[buckets.gross, buckets.grossPositive], [buckets.unknown, buckets.unknownPositive]]
+    : [[buckets.net, buckets.netPositive], [buckets.unknown, buckets.unknownPositive]]
+  return unplaced.reduce<UnplacedCreditInterval>((interval, [total, positive]) => ({
+    // Σ min(b, 0) = total − Σ max(b, 0). The two fields are all the endpoints need.
+    lower: interval.lower.add(total.sub(positive)),
+    upper: interval.upper.add(positive),
+  }), { lower: zero, upper: zero })
+}
+
+function addUnplacedIntervals(a: UnplacedCreditInterval, b: UnplacedCreditInterval): UnplacedCreditInterval {
+  return { lower: a.lower.add(b.lower), upper: a.upper.add(b.upper) }
+}
+
+/**
+ * The one number `netLinearFigureBoundDecimal` and `marginFigureBoundDecimal` take, derived from the
+ * interval rather than from a sum.
+ *
+ * Both classifiers read a NEGATIVE value as "no `≤` claim holds", so a below-zero lower end is
+ * handed straight to them and produces `indeterminate`; otherwise the credit provably cannot be
+ * negative and the ceiling is the interval's upper end.
+ */
+function unplacedCreditBound(interval: UnplacedCreditInterval): Prisma.Decimal {
+  return interval.lower.lt(0) ? interval.lower : interval.upper
+}
+
+/** The bound input for the credit a figure on `basis` could not absorb. */
+function unplacedCredit(buckets: CreditBuckets, basis: 'NET' | 'GROSS'): Prisma.Decimal {
+  return unplacedCreditBound(unplacedCreditInterval(buckets, basis))
+}
+
+function creditBasisComplete(buckets: CreditBuckets, basis: 'NET' | 'GROSS'): boolean {
+  return basis === 'NET' ? buckets.netBasisComplete : buckets.grossBasisComplete
+}
+
+/** What off-row credit does to a report's figures, decided WITHOUT ever adding its bases together. */
+type OffRowCreditSummary = {
+  /**
+   * True when the off-row credit can move the figures at all. Decided from the INTERVAL, never from
+   * a signed sum and never from a bucket total:
+   *   - +100 GROSS and −100 NET add to zero while both still sit off every row (the cross-basis
+   *     cancellation), and
+   *   - +120 GROSS and −120 GROSS collapse to a zero GROSS BUCKET while their ex-VAT values need
+   *     not cancel at all, since the rates behind them may differ (the same-basis cancellation).
+   * Only when both endpoints are zero is nothing unaccounted for, and only then may a report call
+   * its revenue, profit and margin exact.
+   */
+  present: boolean
+  /**
+   * The interval, IN NET TERMS, on the off-row credit that no row subtracted.
+   *
+   * Off-row credit reached no row, so even the NET-basis part of it is missing from the figures —
+   * that part is added at BOTH endpoints, exactly, because it needs no conversion. The GROSS and
+   * unproven parts contribute `unplacedCreditInterval`'s per-entry interval. Sum:
+   *   `[ Σnet + Σ min(b, 0) , Σnet + Σ max(b, 0) ]`, over the ENTRIES, not the buckets.
+   * A lower end below zero means the unsubtracted credit may itself be negative, so the published
+   * figures are not ceilings and `unplacedCreditBound` turns that into `indeterminate`.
+   */
+  interval: UnplacedCreditInterval
+}
+
+function offRowCreditSummary(...sets: CreditBuckets[]): OffRowCreditSummary {
+  const merged = emptyCredits()
+  for (const set of sets) mergeCredits(merged, set)
+  const convertible = unplacedCreditInterval(merged, 'NET')
+  const interval = {
+    lower: merged.net.add(convertible.lower),
+    upper: merged.net.add(convertible.upper),
+  }
+  return { present: !(interval.lower.isZero() && interval.upper.isZero()), interval }
+}
+
+/** An order's whole credit, as Sales Analytics and Customer Mix attribute it: by order id. */
+type OrderRefundRow = {
+  orderId: string
+  totalBase: DecimalInput
+  totalForeign: DecimalInput
+  /** NET / GROSS / null. Governs what the two totals above MEAN. */
+  totalsBasis: string | null
+}
+
+/**
+ * A refund LINE as Gross Margin attributes it: to the sales line's product, which is the bucket the
+ * revenue it credits was booked into. `salesOrderLine.productId` is preferred over the refund line's
+ * own `productId` for the same reason `marginCogsBucket` prefers the shipment line's — the sales
+ * line is what the revenue is denominated in, and for a KIT the two differ.
+ */
+type MarginRefundLineRow = {
+  productId: string | null
+  totalBase: DecimalInput
+  salesOrderLine: { productId: string | null } | null
+  refund: { totalsBasis: string | null }
+}
+
+async function loadOrderRefunds(client: SalesFulfillmentAnalyticsClient, orderIds: string[]): Promise<OrderRefundRow[]> {
+  if (orderIds.length === 0) return []
+  const rows = await client.salesOrderRefund.findMany({
+    where: { orderId: { in: [...new Set(orderIds)] } },
+    select: { orderId: true, totalBase: true, totalForeign: true, totalsBasis: true },
+    take: SOURCE_ROW_LIMIT + 1,
+  }) as OrderRefundRow[]
+  assertSourceLimit(rows.length, SOURCE_ROW_LIMIT, 'Sales analytics refund source rows')
+  return rows
 }
 
 type RefundLineRow = {
@@ -433,7 +789,7 @@ async function loadSalesOrders(client: SalesFulfillmentAnalyticsClient, filters:
           taxForeign: true,
           taxBase: true,
           discountAmount: true,
-          product: { select: { id: true, sku: true, name: true, category: { select: { name: true } } } },
+          product: { select: { id: true, sku: true, type: true, name: true, category: { select: { name: true } } } },
         },
       },
       shoppingLinks: { select: { connector: true }, orderBy: { createdAt: 'asc' }, take: 1 },
@@ -480,7 +836,7 @@ async function loadSalesOrdersByIds(client: SalesFulfillmentAnalyticsClient, ord
           taxForeign: true,
           taxBase: true,
           discountAmount: true,
-          product: { select: { id: true, sku: true, name: true, category: { select: { name: true } } } },
+          product: { select: { id: true, sku: true, type: true, name: true, category: { select: { name: true } } } },
         },
       },
       shoppingLinks: { select: { connector: true }, orderBy: { createdAt: 'asc' }, take: 1 },
@@ -504,11 +860,25 @@ export async function getSalesAnalyticsReport(filters: SalesAnalyticsFilters = {
   const generatedAt = nowFromDeps(deps)
   const baseCurrency = await baseCurrencyFromDeps(deps)
   const window = period(filters, generatedAt)
-  const rowsByKey = new Map<string, SalesReportRow & { revenueDecimal: Prisma.Decimal; taxDecimal: Prisma.Decimal; shippingDecimal: Prisma.Decimal; discountDecimal: Prisma.Decimal; orderIds: Set<string> }>()
+  const rowsByKey = new Map<string, SalesReportRow & { revenueDecimal: Prisma.Decimal; taxDecimal: Prisma.Decimal; shippingDecimal: Prisma.Decimal; discountDecimal: Prisma.Decimal; credits: CreditBuckets; orderIds: Set<string> }>()
   const orders = await loadSalesOrders(client, filters, window)
   assertSourceLimit(orders.length, SOURCE_ROW_LIMIT, 'Sales analytics source orders')
   const grouping = groupBy(filters)
   const mode = currencyMode(filters)
+  // o3d-kyey: the credit raised against these orders, WHENEVER it was raised. The report's rows are
+  // an ORDER COHORT (orders created in the window), so its refund-aware figure is "what these orders
+  // were finally worth" — the same reading `getProductSalesStats` takes, and the reason neither
+  // filters credits by `refundedAt`. Attributed by order id and then, in the product/category views,
+  // spread across that order's lines by line value: the report's OWN allocation rule, already used
+  // for tax, shipping and discount, which is what keeps the credit total reconciling to the refunds.
+  const refunds = await loadOrderRefunds(client, orders.map((order) => order.id))
+  const refundsByOrder = new Map<string, OrderRefundRow[]>()
+  for (const refund of refunds) {
+    const existing = refundsByOrder.get(refund.orderId)
+    if (existing) existing.push(refund)
+    else refundsByOrder.set(refund.orderId, [refund])
+  }
+  const creditAmount = (refund: OrderRefundRow) => mode === 'foreign' ? refund.totalForeign : refund.totalBase
 
   for (const order of orders) {
     if (grouping === 'customer' || grouping === 'channel') {
@@ -528,15 +898,22 @@ export async function getSalesAnalyticsReport(filters: SalesAnalyticsFilters = {
         tax: '0',
         shipping: '0',
         discount: '0',
+        netRevenue: '0',
+        netRevenueBound: 'exact',
+        refundsGrossBasis: '0',
+        refundsNetBasis: '0',
+        refundsUnknownBasis: '0',
         revenueDecimal: new Prisma.Decimal(0),
         taxDecimal: new Prisma.Decimal(0),
         shippingDecimal: new Prisma.Decimal(0),
         discountDecimal: new Prisma.Decimal(0),
+        credits: emptyCredits(),
         orderIds: new Set<string>(),
       }
       current.orderIds.add(order.id)
       current.orderCount = current.orderIds.size
       current.lineCount += order.lines.length
+      for (const refund of refundsByOrder.get(order.id) ?? []) addCredit(current.credits, refund.totalsBasis, creditAmount(refund))
       current.revenueDecimal = current.revenueDecimal.add(toDecimal(mode === 'foreign' ? order.totalForeign : order.totalBase))
       current.taxDecimal = current.taxDecimal.add(toDecimal(mode === 'foreign' ? order.taxForeign : order.taxBase))
       current.shippingDecimal = current.shippingDecimal.add(toDecimal(mode === 'foreign' ? order.shippingForeign : order.shippingBase))
@@ -570,15 +947,29 @@ export async function getSalesAnalyticsReport(filters: SalesAnalyticsFilters = {
         tax: '0',
         shipping: '0',
         discount: '0',
+        netRevenue: '0',
+        netRevenueBound: 'exact',
+        refundsGrossBasis: '0',
+        refundsNetBasis: '0',
+        refundsUnknownBasis: '0',
         revenueDecimal: new Prisma.Decimal(0),
         taxDecimal: new Prisma.Decimal(0),
         shippingDecimal: new Prisma.Decimal(0),
         discountDecimal: new Prisma.Decimal(0),
+        credits: emptyCredits(),
         orderIds: new Set<string>(),
       }
       current.orderIds.add(order.id)
       current.orderCount = current.orderIds.size
       current.lineCount += 1
+      // This line's share of the order's credit, allocated by line value exactly as revenue, tax,
+      // shipping and discount are above. Allocating a GROSS credit by EX-VAT line value is the same
+      // approximation the report already makes for the order-level tax and shipping it apportions;
+      // it is exact whenever the order carries one rate, and the whole credit reaches SOME row of
+      // the order either way, so the grand total is unaffected by how it splits.
+      for (const refund of refundsByOrder.get(order.id) ?? []) {
+        addCredit(current.credits, refund.totalsBasis, allocatedOrderAmount(creditAmount(refund), lineAmount, lineTotal, fallbackShare))
+      }
       current.revenueDecimal = current.revenueDecimal.add(allocatedOrderAmount(mode === 'foreign' ? order.totalForeign : order.totalBase, lineAmount, lineTotal, fallbackShare))
       current.taxDecimal = current.taxDecimal.add(allocatedOrderAmount(mode === 'foreign' ? order.taxForeign : order.taxBase, lineAmount, lineTotal, fallbackShare))
       current.shippingDecimal = current.shippingDecimal.add(allocatedOrderAmount(mode === 'foreign' ? order.shippingForeign : order.shippingBase, lineAmount, lineTotal, fallbackShare))
@@ -594,29 +985,51 @@ export async function getSalesAnalyticsReport(filters: SalesAnalyticsFilters = {
     }
   }
 
+  // Revenue here is `SalesOrder.totalBase` (or totalForeign), which is VAT-INCLUSIVE, so GROSS is
+  // the basis every net figure below is on and the GROSS-basis credit is the comparable one.
+  const FIGURE_BASIS = 'GROSS' as const
   const rows = [...rowsByKey.values()]
-    .map((row) => ({
-      key: row.key,
-      label: row.label,
-      groupBy: row.groupBy,
-      currency: row.currency,
-      orderCount: row.orderCount,
-      lineCount: row.lineCount,
-      revenue: moneyString(row.revenueDecimal, row.currency === 'Multiple' ? baseCurrency : row.currency),
-      tax: moneyString(row.taxDecimal, row.currency === 'Multiple' ? baseCurrency : row.currency),
-      shipping: moneyString(row.shippingDecimal, row.currency === 'Multiple' ? baseCurrency : row.currency),
-      discount: moneyString(row.discountDecimal, row.currency === 'Multiple' ? baseCurrency : row.currency),
-    }))
-    .sort((a, b) => toDecimal(b.revenue).cmp(a.revenue) || a.label.localeCompare(b.label))
+    .map((row) => {
+      const currency = row.currency === 'Multiple' ? baseCurrency : row.currency
+      return {
+        key: row.key,
+        label: row.label,
+        groupBy: row.groupBy,
+        currency: row.currency,
+        orderCount: row.orderCount,
+        lineCount: row.lineCount,
+        revenue: moneyString(row.revenueDecimal, currency),
+        tax: moneyString(row.taxDecimal, currency),
+        shipping: moneyString(row.shippingDecimal, currency),
+        discount: moneyString(row.discountDecimal, currency),
+        netRevenue: moneyString(row.revenueDecimal.sub(comparableCredit(row.credits, FIGURE_BASIS)), currency),
+        // Classified from the UNROUNDED figures, before the rounding above: the claim is about which
+        // side of the published number the truth lies on, not about its last penny.
+        netRevenueBound: netLinearFigureBoundDecimal({
+          basisComplete: creditBasisComplete(row.credits, FIGURE_BASIS),
+          unplacedCredit: unplacedCredit(row.credits, FIGURE_BASIS),
+        }),
+        refundsGrossBasis: moneyString(row.credits.gross, currency),
+        refundsNetBasis: moneyString(row.credits.net, currency),
+        refundsUnknownBasis: moneyString(row.credits.unknown, currency),
+      }
+    })
+    // Ranked on the refund-aware figure. Ranking on `revenue` put a group that credited everything
+    // back above one that kept a smaller sale, which is the ordering defect o3d-kyey names.
+    .sort((a, b) => toDecimal(b.netRevenue).cmp(a.netRevenue) || a.label.localeCompare(b.label))
 
   const totals = [...rowsByKey.values()].reduce(
-    (total, row) => ({
-      revenue: total.revenue.add(row.revenueDecimal),
-      tax: total.tax.add(row.taxDecimal),
-      shipping: total.shipping.add(row.shippingDecimal),
-      discount: total.discount.add(row.discountDecimal),
-    }),
-    { revenue: new Prisma.Decimal(0), tax: new Prisma.Decimal(0), shipping: new Prisma.Decimal(0), discount: new Prisma.Decimal(0) },
+    (total, row) => {
+      mergeCredits(total.credits, row.credits)
+      return {
+        revenue: total.revenue.add(row.revenueDecimal),
+        tax: total.tax.add(row.taxDecimal),
+        shipping: total.shipping.add(row.shippingDecimal),
+        discount: total.discount.add(row.discountDecimal),
+        credits: total.credits,
+      }
+    },
+    { revenue: new Prisma.Decimal(0), tax: new Prisma.Decimal(0), shipping: new Prisma.Decimal(0), discount: new Prisma.Decimal(0), credits: emptyCredits() },
   )
   const paged = paginate(rows, filters, deps?.paginate !== false)
 
@@ -631,16 +1044,42 @@ export async function getSalesAnalyticsReport(filters: SalesAnalyticsFilters = {
       tax: moneyString(totals.tax, baseCurrency),
       shipping: moneyString(totals.shipping, baseCurrency),
       discount: moneyString(totals.discount, baseCurrency),
+      netRevenue: moneyString(totals.revenue.sub(comparableCredit(totals.credits, FIGURE_BASIS)), baseCurrency),
+      netRevenueBound: netLinearFigureBoundDecimal({
+        basisComplete: creditBasisComplete(totals.credits, FIGURE_BASIS),
+        unplacedCredit: unplacedCredit(totals.credits, FIGURE_BASIS),
+      }),
+      refundsGrossBasis: moneyString(totals.credits.gross, baseCurrency),
+      refundsNetBasis: moneyString(totals.credits.net, baseCurrency),
+      refundsUnknownBasis: moneyString(totals.credits.unknown, baseCurrency),
     },
     notices: [
       'Sales totals exclude cancelled orders. Product/category views allocate order-level totals across lines by line value so grand totals reconcile to SalesOrder totals.',
-      REFUND_BLIND_NOTICE_SALES,
+      REFUND_BASIS_NOTICE_SALES,
       mode === 'foreign' ? 'Foreign-currency product/category rows are split by original order currency; customer/channel rows show Multiple when a group contains more than one original currency.' : `Base-currency rows use ${baseCurrency} amounts recorded on the order.`,
     ],
   }
 }
 
-async function loadCogsByOrder(client: SalesFulfillmentAnalyticsClient, window: { dateFrom: Date; dateTo: Date; dateToExclusive: Date }): Promise<Map<string, Prisma.Decimal>> {
+/**
+ * The in-window SALE_DISPATCH cost, TOGETHER WITH WHICH DISPATCH MOVEMENT EACH PART OF IT COSTS.
+ *
+ * The amount alone cannot answer the caller's question. A cost total says a cost was posted; it
+ * cannot say WHICH of the order's dispatches it covers, and an order whose every unit shipped but
+ * whose lines only partly posted their cost produces a perfectly ordinary-looking total. So the
+ * costed QUANTITY is carried per movement beside it, and `ordersWithEveryDispatchCosted` joins the
+ * two populations — these entries and the dispatch movements they hang off — into the only
+ * statement that supports a profit figure: every unit this order dispatched is a unit whose cost
+ * was posted.
+ */
+type OrderDispatchCostEvidence = {
+  /** Cost posted per order, summed over the in-window dispatch entries. */
+  costByOrder: Map<string, Prisma.Decimal>
+  /** Quantity COSTED per dispatch movement — `Σ CogsEntry.qty`, keyed by `movementId`. */
+  costedQtyByMovement: Map<string, Prisma.Decimal>
+}
+
+async function loadCogsByOrder(client: SalesFulfillmentAnalyticsClient, window: { dateFrom: Date; dateTo: Date; dateToExclusive: Date }): Promise<OrderDispatchCostEvidence> {
   const rows = await client.cogsEntry.findMany({
     where: {
       movement: {
@@ -652,17 +1091,415 @@ async function loadCogsByOrder(client: SalesFulfillmentAnalyticsClient, window: 
     },
     select: {
       totalCostBase: true,
-      movement: { select: { referenceId: true } },
+      qty: true,
+      movement: { select: { id: true, referenceId: true } },
     },
     take: SOURCE_ROW_LIMIT + 1,
-  }) as Array<{ totalCostBase: DecimalInput; movement: { referenceId: string | null } }>
+  }) as Array<{ totalCostBase: DecimalInput; qty: DecimalInput; movement: { id: string; referenceId: string | null } }>
   assertSourceLimit(rows.length, SOURCE_ROW_LIMIT, 'Sales COGS source rows')
-  const byOrder = new Map<string, Prisma.Decimal>()
+  const costByOrder = new Map<string, Prisma.Decimal>()
+  const costedQtyByMovement = new Map<string, Prisma.Decimal>()
   for (const row of rows) {
+    costedQtyByMovement.set(row.movement.id, (costedQtyByMovement.get(row.movement.id) ?? new Prisma.Decimal(0)).add(toDecimal(row.qty)))
     if (!row.movement.referenceId) continue
-    byOrder.set(row.movement.referenceId, (byOrder.get(row.movement.referenceId) ?? new Prisma.Decimal(0)).add(toDecimal(row.totalCostBase)))
+    costByOrder.set(row.movement.referenceId, (costByOrder.get(row.movement.referenceId) ?? new Prisma.Decimal(0)).add(toDecimal(row.totalCostBase)))
   }
-  return byOrder
+  return { costByOrder, costedQtyByMovement }
+}
+
+/** How many contradicted customers the Customer Mix notice names before it points at the export. */
+const INCONSISTENT_NOTICE_NAME_LIMIT = 10
+
+/**
+ * THE ONE PLACE A CUSTOMER GROUP'S IDENTITY IS COMPUTED.
+ *
+ * A registered customer is its `customerId`. A guest is its LOWER-CASED email — so the same address
+ * typed in two cases is one customer — and, with no email to go on, its name. Both guest forms are
+ * namespaced so that the two of them cannot be confused with each other.
+ *
+ * It lives here rather than inline at the grouping loop because the row carries it onward: the
+ * projection encodes the MAP KEY into `CustomerReportRow.groupToken`, and the notice, the table
+ * cell and the CSV column all read that one field. Grouping and labelling therefore cannot drift
+ * apart, and the label's uniqueness is a property of the key rather than a claim about it.
+ */
+function customerGroupKey(row: Pick<CustomerReportRow, 'customerId' | 'customerName' | 'customerEmail'>): string {
+  return row.customerId ?? (row.customerEmail ? `guest-email:${row.customerEmail.toLowerCase()}` : `guest-name:${row.customerName}`)
+}
+
+/**
+ * THE CHARACTERS A RENDERED LABEL CANNOT SHOW, so the label spells them out instead (r6).
+ *
+ * A label is only an identifier once the OPERATOR can tell two of them apart, and the operator sees
+ * HTML: this notice reaches them through `ReportPageTitle` -> `TooltipContent`, which is
+ * `whitespace-normal`. HTML COLLAPSES WHITESPACE. A tab, a newline, a form feed and a run of spaces
+ * all arrive as ONE space; a zero-width or bidi format character arrives as nothing at all; and
+ * NBSP and the fixed-width spaces arrive looking exactly like the ordinary space they are not.
+ *
+ * So round 5's escaping was injective in the STRING and not in what is SEEN, which is the property
+ * that was wanted. Two emailless guests named `Acme Ltd` and `Acme\nLtd` are two Map keys and two
+ * distinct raw labels — and rendered they were ONE label: the collision this labelling exists to
+ * remove, surviving one layer further out.
+ *
+ * Every character below is therefore emitted as a visible ASCII escape rather than raw. The
+ * ordinary U+0020 is the one exception and is emitted as itself, because a label an operator cannot
+ * read against the Customer column is no better than one they cannot tell apart — but only where it
+ * is a LONE space: a second consecutive space is escaped too, since `A  B` and `A B` render alike.
+ */
+function rendersInvisiblyOrCollapses(codePoint: number): boolean {
+  return (
+    codePoint <= 0x1f // C0 controls, including TAB, LF, FF and CR
+    || (codePoint >= 0x7f && codePoint <= 0x9f) // DEL and the C1 controls
+    || codePoint === 0xa0 // NO-BREAK SPACE
+    || codePoint === 0xad // SOFT HYPHEN
+    || codePoint === 0x61c // ARABIC LETTER MARK
+    || codePoint === 0x1680 // OGHAM SPACE MARK
+    || codePoint === 0x180e // MONGOLIAN VOWEL SEPARATOR
+    || (codePoint >= 0x2000 && codePoint <= 0x200f) // EN QUAD..RLM, including ZWSP/ZWNJ/ZWJ
+    || (codePoint >= 0x2028 && codePoint <= 0x202f) // line/para separators, bidi embedding, NNBSP
+    || (codePoint >= 0x205f && codePoint <= 0x206f) // MMSP, word joiner, invisible operators, isolates
+    || codePoint === 0x3000 // IDEOGRAPHIC SPACE
+    || codePoint === 0xfeff // ZERO WIDTH NO-BREAK SPACE (BOM)
+    || (codePoint >= 0xfff9 && codePoint <= 0xfffb) // interlinear annotation controls
+    || codePoint === 0xe0001 // LANGUAGE TAG
+    || (codePoint >= 0xe0020 && codePoint <= 0xe007f) // the invisible TAG block
+  )
+}
+
+/** The three escapes a reader already knows; everything else is spelled by code point. */
+const NAMED_LABEL_ESCAPES: ReadonlyMap<number, string> = new Map([
+  [0x09, '\\t'],
+  [0x0a, '\\n'],
+  [0x0d, '\\r'],
+])
+
+function visibleLabelEscape(codePoint: number): string {
+  return NAMED_LABEL_ESCAPES.get(codePoint)
+    ?? (codePoint <= 0xffff
+      ? `\\u${codePoint.toString(16).padStart(4, '0')}`
+      : `\\u{${codePoint.toString(16)}}`)
+}
+
+/**
+ * ONE READABLE FIELD OF A LABEL: a present value quoted and escaped, an absent one a token no
+ * present value can be — kept legible, because this half of the label exists to be READ (r5, r6).
+ *
+ * `<none>` is unquoted and every present value is quoted, so the two live in disjoint spaces: a
+ * customer whose stored email is literally `<none>` renders `email="<none>"` and is still not the
+ * customer who has no email at all. That is the whole of the round-5 fix — a sentinel drawn from
+ * the value space could not do it, because a value can hold it.
+ *
+ * Round 6 adds the escapes above. A backslash doubles, so an escape sequence in the output can only
+ * have come from the character it names and never from a name that spells it; a quote doubles,
+ * CSV-style, so a reader tracking quote state can still find the field boundaries.
+ *
+ * WHAT THIS ENCODING IS AND IS NOT. It escapes a LIST of code-point ranges and emits every other
+ * code point as itself, which is what makes `name=` printable next to the Customer column and
+ * `email=` next to the Email cell — the whole reason those fields are in the notice. It is NOT an
+ * identity: a list only covers the characters somebody thought of, and round 7 found the next class
+ * out — NFC `Café` and NFD `Café` pass through it unchanged, as two strings a renderer is REQUIRED
+ * to draw identically. Uniqueness is `identityLabelField`'s job, on `group=`, and the two fields
+ * are separate precisely so that neither has to be both.
+ */
+function labelField(value: string | null | undefined): string {
+  if (value == null) return '<none>'
+  let encoded = ''
+  let previousWasLoneSpace = false
+  for (const char of value) {
+    const codePoint = char.codePointAt(0)!
+    if (char === '\\') encoded += '\\\\'
+    else if (char === '"') encoded += '""'
+    else if (char === ' ' && !previousWasLoneSpace) encoded += ' '
+    else if (char === ' ' || rendersInvisiblyOrCollapses(codePoint)) encoded += visibleLabelEscape(codePoint)
+    else encoded += char
+    previousWasLoneSpace = char === ' ' && !previousWasLoneSpace
+  }
+  return `"${encoded}"`
+}
+
+/** Four, so every UTF-16 code unit occupies the same width and a POSITION means something. */
+const IDENTITY_HEX_WIDTH = 4
+
+/** Says what the rest of the field is, so `group=` is not mistaken for a name or a value. */
+const IDENTITY_TOKEN_PREFIX = 'utf16hex:'
+
+/**
+ * THE IDENTITY FIELD OF A LABEL: the group key as a MACHINE TOKEN, not as text (o3d-7jfq r8).
+ *
+ * A RULE, NOT A LIST. Rounds 5 and 6 both widened `rendersInvisiblyOrCollapses` after a collision
+ * got through it, and round 7 was the third: canonical equivalence. NFC and NFD spellings of one
+ * accented name are two group keys and two raw labels, and Unicode does not merely permit a
+ * renderer to draw them identically - it REQUIRES it, so on screen they were one label. Homoglyphs
+ * are the same defect with no normalisation form to appeal to: GREEK CAPITAL ALPHA U+0391 and
+ * CYRILLIC CAPITAL A U+0410 stay distinct under NFC, NFD, NFKC and NFKD and are one glyph in every
+ * font that carries both. There is no list that ends, so this field stopped listing.
+ *
+ * AND THEN NOT A RANGE EITHER (r8). Round 7 escaped everything OUTSIDE printable ASCII and emitted
+ * printable ASCII as itself, on the stated argument that printable ASCII holds no two code points
+ * that draw alike. THAT ARGUMENT IS FALSE, and it is the same defect retreated one range inward:
+ * `O` and `0`, and `I` and `l` and `1`, draw alike in the 11px UI font this notice is rendered in,
+ * and `r` followed by `n` draws as `m`. The round-7 field was injective as a string and still not
+ * injective ON SCREEN, which is the only injectivity an operator has. So nothing is emitted as
+ * itself any more.
+ *
+ * WHAT IT EMITS. Every UTF-16 code unit of the key becomes exactly four lowercase hex digits,
+ * after the literal prefix `utf16hex:` that names what follows. A JavaScript string IS a sequence
+ * of UTF-16 code units, so this is a fixed-width block code over the whole domain - injective by
+ * arithmetic, appealing to nothing about well-formedness, normalisation, or which characters
+ * anybody remembered. Two distinct keys differ in a code unit or in length, hence in a hex digit
+ * or in length. Nothing needs quoting, escaping or a lone-space rule: the alphabet holds no quote,
+ * no backslash, no space and no `;`, so this field cannot break the list it sits in.
+ *
+ * WHY HEX. Its alphabet is `0`-`9` and `a`-`f` and nothing else, which excludes BY CONSTRUCTION
+ * every confusable the round-8 finding named: there is no letter `O` to confuse with `0`, no `I`
+ * and no `l` to confuse with `1`, and no `m`, `n` or `r`, so `rn` cannot be drawn as `m`.
+ *
+ * THE RESIDUE, AND WHY IT NO LONGER DECIDES ANYTHING (r9). This does not make the field
+ * unmistakable in every font, and no alphabet would be. Within `0`-`9` and `a`-`f` the pair `6`/`b`
+ * - and in some faces `1`/`7` or `0`/`8` - are font-dependent shapes, so two tokens whose ONLY
+ * difference is one such pair at one position can still be MISREAD. Round 8 answered that with a
+ * fixed width and with ligature suppression at the render site, and both were the wrong kind of
+ * answer: they make the token easier to READ, and reading is the step that fails. Neither one can
+ * separate `6` from `b`, so the mitigation did not address the collision it was named against.
+ *
+ * The answer is that nobody has to read it. The same token is carried on the row
+ * (`CustomerReportRow.groupToken`), rendered in the report's Group token cell, and exported as the
+ * `groupToken` CSV column, so the route from a notice entry to the row it names is COPY AND MATCH,
+ * or a join on the export - both exact, both blind to what a glyph looks like. The fixed width and
+ * the ligature suppression stay because they cost nothing and help an operator who does glance at
+ * one; they are aids, and this comment no longer offers them as the mitigation.
+ *
+ * WHAT IT COSTS, AND WHY THE SPLIT PAYS FOR IT. The emailless guest `Acme Ltd` keys on
+ * `guest-name:Acme Ltd` and is printed `group=utf16hex:0067007500650073...`, which no operator
+ * reads - and it is not meant to be read. It exists solely to tell two otherwise identical rows
+ * apart, which a fixed-width token does better than a quasi-readable one. That is affordable only
+ * because the other three fields are untouched: `name=`, `email=` and `customerId=` go through
+ * `labelField` and still print exactly what the Customer and Email cells print, in the name's own
+ * script. The operator FINDS the row by reading those and uses this field only to tell two of them
+ * apart once they have. Encoding both halves this way, or neither, would trade one unusable notice
+ * for another.
+ */
+function identityLabelField(value: string): string {
+  let encoded = ''
+  // BY CODE UNIT, not by code point: a JS string is a code-unit sequence, and iterating it as one
+  // is what fixes the width at four and keeps the mapping injective even over a lone surrogate.
+  for (let index = 0; index < value.length; index += 1) {
+    encoded += value.charCodeAt(index).toString(16).padStart(IDENTITY_HEX_WIDTH, '0')
+  }
+  return `${IDENTITY_TOKEN_PREFIX}${encoded}`
+}
+
+/**
+ * ONE CONTRADICTED CUSTOMER, LABELLED SO THAT NO OTHER GROUP CAN WEAR THE SAME LABEL (o3d-7jfq r5).
+ *
+ * A NAME IS NOT AN IDENTIFIER. Round 3 handed the notice `customerName` alone, on the reasoning
+ * that the Customer column renders it and so it is what an operator reads down the page for. The
+ * first half of that is right and the second half does not follow: rows are grouped on
+ * `customerGroupKey`, and `customerName` is neither unique across those keys nor non-empty. Two
+ * guests called `John Smith` are two rows and one label, and a notice that says `John Smith` when a
+ * clean John Smith is also on the page names a row the operator cannot find — which is the off-page
+ * failure this list exists to close, arrived at from the other side.
+ *
+ * AND A SENTINEL IS NOT AN IDENTIFIER EITHER. Round 4 separated the groups by printing the name,
+ * the email and the id, and rendered a missing email as the words `(no email)` — a string a
+ * customer can hold. A guest with no email keys on `guest-name:`, a guest whose stored email IS
+ * `(no email)` keys on `guest-email:`, and the two of them wore ONE label: the collision round 4
+ * set out to remove, re-entered through the fix. A label that must be unique cannot be built out of
+ * unescaped user data, and absence cannot be spelled with a value. So absence is encoded
+ * STRUCTURALLY — `labelField` above — and every present component is quoted and escaped.
+ *
+ * INJECTIVE BY CONSTRUCTION, NOT BY ARGUMENT. The label carries `group=`, the map key the row was
+ * grouped under, which is distinct for distinct groups by definition of a Map - and distinct keys
+ * stay distinct once encoded, because the encoding is reversible. Round 4 instead proved uniqueness
+ * by exhausting the cases the key is built from, a proof that has to be redone, correctly, every
+ * time the key changes. Carrying the key cannot go stale.
+ *
+ * TWO FIELDS, TWO JOBS, TWO ENCODINGS (r7). `name=` is the Customer column, `email=` is the Email
+ * column and `customerId=` is a column of the CSV export this notice already points at: they exist
+ * to be READ against the row on screen, so they go through `labelField` and stay legible - a
+ * non-Latin name is printed as the name. `group=` exists to be UNIQUE: it is the map key the row
+ * was grouped under, and it goes through `identityLabelField`, which is not text at all.
+ *
+ * Those jobs were fighting while one encoder did both. An encoder legible enough for `name=` emits
+ * most code points unchanged, and rounds 5, 6, 7 and 8 each found another pair it therefore let
+ * through - quote, whitespace, canonical equivalence, and finally the ASCII confusables `O`/`0`,
+ * `I`/`l`/`1` and `rn`/`m`. Splitting ends the recurrence rather than postponing it: `group=` no
+ * longer depends on which characters anybody remembered to escape, and `name=` no longer has to
+ * carry a burden that would make it unreadable. See both for why.
+ *
+ * AND THE IDENTITY HALF IS THE ROW'S, NOT THIS FUNCTION'S (r9). `group=` is `row.groupToken` read
+ * straight off the row — no second call to `customerGroupKey`, no second encode. It used to be
+ * re-derived here, which was correct and still wrong in shape: a token that exists ONLY in a
+ * notice names a row the operator cannot mechanically reach, and two derivations of one identity
+ * are two things that can be changed apart. The row, the Group token cell and the `groupToken` CSV
+ * column now print the same string this label does, from the one field, so the notice and the row
+ * cannot disagree and a token can be COPIED from one to the other instead of read.
+ *
+ * AND INJECTIVE WHERE IT IS READ, NOT ONLY WHERE IT IS BUILT (r8). The notice is rendered as
+ * collapsing HTML in an 11px proportional font, so a label distinct only before rendering is not
+ * distinct to the operator - and neither is one whose distinguishing character is `O` where the
+ * other's is `0`. `group=` is therefore not printed as characters anybody could read as a name: it
+ * is `utf16hex:` followed by four lowercase hex digits per code unit, a MACHINE TOKEN compared
+ * position against position. `identityLabelField` states what that leaves and what it does not.
+ *
+ * QUOTED CSV-STYLE, WITH INNER QUOTES DOUBLED - THE READABLE FIELDS. Entries are separated by `; `
+ * because a company name may contain a comma - and it may contain a semicolon too, at which point
+ * an unquoted list is a list a reader cannot split. Every READ value is delimited, with any quote
+ * inside it doubled, so a reader tracking quote state always knows whether a `; ` is inside a value
+ * or between two entries. An empty stored name renders `name=""`: the honest label for a row whose
+ * Customer cell is empty, and visibly a value rather than a gap. `group=` needs none of this and
+ * carries no quotes: its alphabet has no quote, no space and no `;` to be confused by.
+ */
+function inconsistentCustomerLabel(row: Pick<CustomerReportRow, 'customerId' | 'customerName' | 'customerEmail' | 'groupToken'>): string {
+  return `name=${labelField(row.customerName)} email=${labelField(row.customerEmail)} customerId=${labelField(row.customerId)} group=${row.groupToken}`
+}
+
+/**
+ * THE CONTRADICTED CUSTOMERS, SO THE NOTICE CAN BE ACTED ON FROM ANY PAGE (o3d-7jfq r3).
+ *
+ * The count is computed over every group and the rows are then PAGINATED, so on a report longer
+ * than a page the customers the notice is about can all rank outside the slice on screen — the
+ * notice then announces a problem with nothing visible that carries it. That is the same complaint
+ * that made over-costing its own status rather than a line in a summary: a count cannot tell an
+ * operator WHICH customer to go and look at, and a count on page 1 about a row on page 4 is that
+ * failure with an extra step. What each one is called is `inconsistentCustomerLabel`.
+ *
+ * Capped, because a notice is one line of prose and a data incident could contradict hundreds. The
+ * overflow is not dropped: it is COUNTED, said out loud, and pointed at the CSV export, which is
+ * built with `paginate: false` and carries `costEvidence` on every row - so the complete answer
+ * always exists somewhere the notice names, however long the list gets.
+ *
+ * AND THE LIST SAYS HOW TO USE ITSELF (r8). `group=` stopped being readable text when it became a
+ * fixed-width hex token, and an operator meeting one for the first time would otherwise reasonably
+ * read it as a corrupted name. So the notice says, in its own words and BEFORE the list rather
+ * than after it, which fields are for finding the row and which one is for telling two rows apart.
+ * Before the list because the entries end the sentence: the overflow clause is the last thing the
+ * notice says, so that where all of them can be found is what an operator reads last.
+ *
+ * AND IT NAMES A MECHANICAL ROUTE, NOT AN INSTRUCTION TO SQUINT (r9). Round 8's wording ended
+ * `compare their tokens digit against digit at the same position`, which asks the operator's EYES
+ * to be the authority over a hex alphabet that still holds `6` against `b`. The token now exists
+ * on the row and in the CSV as well as here, so the notice says to COPY one and match it against
+ * the Group token cell, or against the `groupToken` column of the unpaginated export. That is a
+ * route a person can follow without comparing a single glyph.
+ */
+const IDENTITY_FIELD_NOTICE =
+  'Find the row by reading name= and email=, which show exactly what the Customer and Email cells '
+  + 'show. group= is not a name and is not meant to be read: it is the identity the row was grouped '
+  + `under, written as a machine token — the literal ${IDENTITY_TOKEN_PREFIX} followed by `
+  + `${IDENTITY_HEX_WIDTH} lowercase hex digits for each UTF-16 code unit of it. Do not compare `
+  + 'tokens by eye: copy one whole and match it against the Group token cell on the row, or against '
+  + 'the groupToken column of the CSV export, which is not paginated.'
+
+function namedInconsistentCustomers(labels: string[]): string {
+  const shown = labels.slice(0, INCONSISTENT_NOTICE_NAME_LIMIT)
+  const rest = labels.length - shown.length
+  const overflow = rest > 0
+    ? `, and ${rest} more not named here — the CSV export is not paginated and stamps every one of them costEvidence=inconsistent`
+    : ''
+  return `${IDENTITY_FIELD_NOTICE} They are, highest-ranked first: ${shown.join('; ')}${overflow}.`
+}
+
+/**
+ * THE COSTED-QUANTITY SHORTFALL A DISPATCH MAY CARRY AND STILL COUNT AS COSTED.
+ *
+ * SHORTFALL ONLY. There is no excess counterpart and deliberately none — see the closing
+ * paragraph of `dispatchCostEvidenceByOrder`.
+ *
+ * `consumeFifoLayersStrict` (lib/cost-layers) absorbs a FIFO shortfall of at most this, and throws
+ * above it. Using the SAME figure means a movement is treated as costed here exactly when the
+ * costing engine treated it as costed there — a looser tolerance would let a real uncosted
+ * fraction through, and a tighter one would withhold profit for float-to-Decimal noise the engine
+ * has already ruled acceptable.
+ */
+const COSTED_QTY_TOLERANCE = new Prisma.Decimal('0.000001')
+
+/**
+ * The orders whose EVERY in-window dispatch movement is costed for its whole quantity.
+ *
+ * `cogsByOrder.has(orderId)` — the test this replaced — asks whether ANY cost was posted, which is
+ * the missing-cost defect one step along and the exact mirror of what `orderCostCoverage` fixed on
+ * the dispatch side. Coverage proves every ordered unit SHIPPED; this proves every shipped unit was
+ * COSTED. A profit figure needs both, because either one alone lets a real cost be silently treated
+ * as zero: coverage alone accepts an order that shipped in full and posted one line's cost, and
+ * `.has` alone accepts an order that posted one line's cost and shipped nothing else at all.
+ *
+ * Matched at the MOVEMENT, not summed per order. The sum would let one over-costed movement cover
+ * another's shortfall — and while the FIFO engine never consumes more than a movement's quantity,
+ * relying on that is relying on the writer whose output this function exists to check.
+ *
+ * SO THE MATCH IS TWO-SIDED, AND THE TWO SIDES DO NOT MEAN THE SAME THING (o3d-7jfq round 2). A
+ * one-sided `movement.qty - costedQty > tolerance` rejects only a SHORTFALL; a movement costed
+ * BEYOND its own quantity gives a negative difference and reads as fully costed — which is the very
+ * thing the paragraph above refuses to take on trust, granted anyway by the shape of the
+ * comparison. `Σ CogsEntry.qty > StockMovement.qty` cannot be a real event: `consumeFifoLayersStrict`
+ * consumes at most the requested quantity, so the consumed layers it writes entries from can never
+ * exceed the movement. Nothing in the schema ties the two together, and the deferred COGS-evidence
+ * guard checks only that an entry EXISTS — so a double-posted entry set is exactly what excess
+ * looks like, and it lands in `costByOrder` twice while the gate calls the order complete.
+ *
+ * AND EXCESS IS NOT A GAP — it is CONTRADICTORY EVIDENCE, so it is reported apart from a shortfall.
+ * Both withhold, because neither supports a profit figure. But an incomplete order resolves itself:
+ * the rest ships, the rest is costed, and next month's report publishes. Contradictory evidence
+ * never resolves and is acted on by examining the entries, not by waiting. Folding the two into one
+ * boolean would send an operator looking for a missing entry that is not missing, and the report's
+ * own notice names its causes: an unnamed third cause makes that notice a false statement about the
+ * row in front of them.
+ *
+ * WHAT THIS PROVES IS A QUANTITY, AND ONLY A QUANTITY (o3d-7jfq r4). `Σ CogsEntry.qty >
+ * StockMovement.qty` is a fact about units; nothing here reads `totalCostBase` at all. The natural
+ * next sentence — "so every report summing COGS overstates cost by the duplicate" — is one step
+ * further than the comparison goes, and this function's own callers show why: a positive-quantity
+ * dispatch costed at ZERO is explicitly permitted upstream, so a doubled entry set for one of those
+ * is contradictory on quantity while the money it sums to is correct. Malformed quantity beside a
+ * correct total has the same shape. Nor is there a cheap PROVEN excess to publish instead: which
+ * entries are the spurious ones is not recoverable from the sums, and an assignment of the total
+ * that puts all of it on the legitimate units is always available, so the greatest overstatement
+ * this evidence *proves* is zero. The status therefore reports the quantity contradiction, and the
+ * notice offers duplicated money as the usual cause rather than asserting it.
+ *
+ * AND THE TOLERANCE BELONGS TO ONE SIDE ONLY (o3d-7jfq round 3). Carrying the same band into both
+ * arms looked like symmetry and was not. The band exists to absorb the FIFO engine's own
+ * arithmetic, and on the SHORTFALL side there is arithmetic to absorb: `consumeFifoLayersStrict`
+ * really does leave a residue that small and treats the movement as costed, so a match tighter
+ * than the engine's would withhold profit the engine has already ruled complete. On the EXCESS
+ * side there is nothing to absorb, by the paragraph above — the engine consumes at most the
+ * requested quantity, so it cannot produce excess AT ALL, and any excess that exists was written
+ * by something else. Nor is 0.000001 sub-storage noise: `StockMovement.qty` and `CogsEntry.qty`
+ * are both `Decimal(14,6)`, so it is the smallest quantity the schema can represent — one whole
+ * unit of the stored scale, a real posted figure and not a rounding artefact. So the excess arm
+ * rejects at `> 0`, and the tolerance survives only on `excess.neg()`.
+ *
+ * Kit-safe by construction: both quantities are the MOVEMENT's own, so the parent-vs-component unit
+ * mismatch that `loadInWindowDispatchedQtyByLine` has to convert around never arises here.
+ */
+type DispatchCostEvidence = {
+  /** Orders whose every in-window dispatch is costed for its whole quantity — and for no more. */
+  fullyCosted: Set<string>
+  /** Orders carrying a dispatch costed BEYOND its own quantity. Withheld, and separately named. */
+  inconsistent: Set<string>
+}
+
+function dispatchCostEvidenceByOrder(
+  dispatchMovements: InWindowDispatchMovement[],
+  costedQtyByMovement: Map<string, Prisma.Decimal>,
+): DispatchCostEvidence {
+  const fullyCosted = new Set<string>()
+  const shortOrders = new Set<string>()
+  const inconsistent = new Set<string>()
+  for (const movement of dispatchMovements) {
+    if (!movement.orderId) continue
+    fullyCosted.add(movement.orderId)
+    const costed = costedQtyByMovement.get(movement.id) ?? new Prisma.Decimal(0)
+    // Excess POSITIVE, shortfall NEGATIVE. `excess.neg()` is the old `qty - costed`, so the
+    // shortfall arm is unchanged to the digit — tolerance and all — while the excess arm, which
+    // has no engine arithmetic to forgive, rejects the first storage unit of it.
+    const excess = costed.sub(toDecimal(movement.qty))
+    if (excess.gt(0)) inconsistent.add(movement.orderId)
+    else if (excess.neg().gt(COSTED_QTY_TOLERANCE)) shortOrders.add(movement.orderId)
+  }
+  for (const orderId of shortOrders) fullyCosted.delete(orderId)
+  for (const orderId of inconsistent) fullyCosted.delete(orderId)
+  return { fullyCosted, inconsistent }
 }
 
 export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters = {}, deps?: SalesFulfillmentAnalyticsDeps): Promise<SalesAnalyticsReport<CustomerReportRow>> {
@@ -670,52 +1507,235 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
   const generatedAt = nowFromDeps(deps)
   const baseCurrency = await baseCurrencyFromDeps(deps)
   const window = period(filters, generatedAt)
-  const [orders, cogsByOrder] = await Promise.all([
+  const [orders, { costByOrder: cogsByOrder, costedQtyByMovement }] = await Promise.all([
     loadSalesOrders(client, filters, window),
     loadCogsByOrder(client, window),
   ])
   assertSourceLimit(orders.length, SOURCE_ROW_LIMIT, 'Customer analytics source orders')
-  const totalRevenue = orders.reduce((sum, order) => sum.add(toDecimal(order.totalBase)), new Prisma.Decimal(0))
-  const groups = new Map<string, CustomerReportRow & { revenue: Prisma.Decimal; grossProfit: Prisma.Decimal; arExposure: Prisma.Decimal; orderIds: Set<string> }>()
+  // What each line actually shipped inside the window — the evidence that the cost posted for an
+  // order covers the revenue this report measures it against. See `orderCostCoverage`.
+  const { byLine: dispatchedQtyByLine, dispatchMovements } = await loadInWindowDispatchedQtyByLine(client, window, orders, 'Customer analytics')
+  // ...and, from the SAME movements, which orders had every one of those dispatches costed — and
+  // which carry a dispatch costed for more units than it moved, which is a different answer.
+  const { fullyCosted: fullyCostedOrders, inconsistent: inconsistentOrders } = dispatchCostEvidenceByOrder(dispatchMovements, costedQtyByMovement)
+  // As in Sales Analytics: an order cohort, so ALL of these orders' credit counts, whenever raised.
+  const refunds = await loadOrderRefunds(client, orders.map((order) => order.id))
+  const refundsByOrder = new Map<string, OrderRefundRow[]>()
+  for (const refund of refunds) {
+    const existing = refundsByOrder.get(refund.orderId)
+    if (existing) existing.push(refund)
+    else refundsByOrder.set(refund.orderId, [refund])
+  }
+
+  // `costCaptured` is OMITTED, not carried and ignored: it is derived from `costEvidence` at the
+  // projection, and a group field of the same name would be a second place to get it wrong.
+  // `groupToken` is omitted alongside `costCaptured`: both are DERIVED in the projection below —
+  // the token from the Map key this group is filed under, so there is no second place it could
+  // be set to something else. See `CustomerReportRow.groupToken`.
+  type CustomerGroup = Omit<CustomerReportRow, 'costCaptured' | 'groupToken'> & {
+    revenue: Prisma.Decimal
+    revenueExVat: Prisma.Decimal
+    cogs: Prisma.Decimal
+    arExposure: Prisma.Decimal
+    credits: CreditBuckets
+    /** Credit on the orders that are UNPAID, which is the only credit AR exposure may net off. */
+    unpaidCredits: CreditBuckets
+    orderIds: Set<string>
+  }
+  const groups = new Map<string, CustomerGroup>()
   for (const order of orders) {
-    const key = order.customerId ?? (order.customerEmail ? `guest-email:${order.customerEmail.toLowerCase()}` : `guest-name:${customerName(order)}`)
-    const cogs = cogsByOrder.get(order.id) ?? new Prisma.Decimal(0)
-    const current = groups.get(key) ?? {
+    // Through the same function the notice's `group=` is printed from, so the label the operator is
+    // sent after is the identity the row was actually grouped under and not a re-derivation of it.
+    const key = customerGroupKey({ customerId: order.customerId, customerName: customerName(order), customerEmail: order.customerEmail })
+    const current: CustomerGroup = groups.get(key) ?? {
       customerId: order.customerId,
       customerName: customerName(order),
       customerEmail: order.customerEmail,
       orderCount: 0,
       revenueBase: '0',
+      netRevenueBase: '0',
+      netRevenueBaseBound: 'exact',
+      netRevenueExVatBase: '0',
+      netRevenueExVatBaseBound: 'exact',
       grossProfitBase: '0',
+      grossProfitBaseBound: 'exact',
+      costEvidence: 'complete',
       arExposureBase: '0',
+      arExposureBaseBound: 'exact',
       shareOfRevenuePct: '0',
+      shareOfRevenuePctBound: 'exact',
+      refundsGrossBasis: '0',
+      refundsNetBasis: '0',
+      refundsUnknownBasis: '0',
       revenue: new Prisma.Decimal(0),
-      grossProfit: new Prisma.Decimal(0),
+      revenueExVat: new Prisma.Decimal(0),
+      cogs: new Prisma.Decimal(0),
       arExposure: new Prisma.Decimal(0),
+      credits: emptyCredits(),
+      unpaidCredits: emptyCredits(),
       orderIds: new Set<string>(),
     }
     current.orderIds.add(order.id)
     current.orderCount = current.orderIds.size
     current.revenue = current.revenue.add(toDecimal(order.totalBase))
-    current.grossProfit = current.grossProfit.add(toDecimal(order.totalBase).sub(cogs))
-    if (!order.paidAt) current.arExposure = current.arExposure.add(toDecimal(order.totalBase))
+    // The EX-VAT revenue gross profit is measured against. `SalesOrder.totalBase` is VAT-INCLUSIVE
+    // and `CogsEntry.totalCostBase` is ex-tax, so the old `totalBase - cogs` was a subtraction
+    // between two different units and overstated profit by the whole VAT on every taxable order.
+    current.revenueExVat = current.revenueExVat.add(toDecimal(order.totalBase).sub(toDecimal(order.taxBase)))
+    // A MISSING COST IS NOT A ZERO COST, AND A PARTIAL COST IS NOT A COMPLETE ONE.
+    //
+    // `cogsByOrder` is keyed on orders with a SALE_DISPATCH COGS entry inside the window; an order
+    // created near the end of the period and dispatched after it has none, and the old `?? 0`
+    // published its entire revenue as profit. `.has` is the right question for THAT — `.get() ?? 0`
+    // cannot tell "no cost posted" from "cost posted, and it was zero".
+    //
+    // But `.has` only asks whether ANY cost exists. A partially dispatched order has some, so it
+    // passed, and one dispatched unit's cost was then set against the whole order's revenue. The
+    // question the figure needs is whether the cost is COMPLETE for the revenue being measured, and
+    // that is `orderCostCoverage`: every dispatchable ordered unit shipped inside the window.
+    //
+    // COVERAGE IS ONLY HALF OF IT, AND `.has` WAS STILL THE OTHER HALF UNTIL NOW. Coverage proves
+    // every ordered unit was DISPATCHED; `.has` then proved only that the order carries at least
+    // one COGS row. An order whose every unit shipped but whose lines only PARTLY posted their cost
+    // satisfies both — and publishes a profit built from part of its cost, which is the same defect
+    // as the `?? 0` and the partial dispatch, arrived at from the third side. Nothing about a cost
+    // TOTAL can rule it out: the total is the thing that is short. So the second half now matches
+    // the posted cost to the DISPATCHED UNITS it is being set against, movement by movement —
+    // `ordersWithEveryDispatchCosted`. It subsumes `.has`: an order that is `covered` dispatched at
+    // least one unit, and a costed dispatch has a COGS entry by construction.
+    //
+    // AND NEITHER IS THE RIGHT SECOND HALF FOR EVERY ORDER. A service-only order — one
+    // whose lines are all NON_INVENTORY — has no COGS entry BY DESIGN, so requiring one would
+    // withhold that customer's profit permanently for an order whose cost is a known zero. That is
+    // `nothing-to-dispatch`, and it is complete on its own evidence. The `?? 0` there is not the
+    // one this branch removed: that one could not tell an absent cost from a zero one, while this
+    // has just established there is nothing on the order that could post a cost at all.
+    const coverage = orderCostCoverage(order, dispatchedQtyByLine)
+    if (inconsistentOrders.has(order.id)) {
+      // FIRST, ahead of coverage: a dispatch costed beyond its own quantity contradicts itself, and
+      // nothing coverage can say about the order repairs that. `nothing-to-dispatch` in particular
+      // must not publish here — an order with no dispatchable line that nonetheless carries an
+      // over-costed dispatch movement is contradictory twice over, not "costed at zero".
+      current.costEvidence = 'inconsistent'
+    } else if (coverage === 'nothing-to-dispatch') {
+      current.cogs = current.cogs.add(cogsByOrder.get(order.id) ?? new Prisma.Decimal(0))
+    } else if (coverage === 'covered' && fullyCostedOrders.has(order.id)) {
+      // `?? 0` is sound HERE and nowhere else in this block: membership of `fullyCostedOrders`
+      // requires a costed dispatch movement, so an absent total would be an order whose entries
+      // cost a positive quantity at no cost at all — a genuine zero, not an unknown.
+      current.cogs = current.cogs.add(cogsByOrder.get(order.id) ?? new Prisma.Decimal(0))
+    } else if (current.costEvidence !== 'inconsistent') {
+      // A customer's other order may already have contradicted itself. The graver answer stands:
+      // downgrading it to `incomplete` would send the operator after the wrong thing.
+      current.costEvidence = 'incomplete'
+    }
+    const orderRefunds = refundsByOrder.get(order.id) ?? []
+    for (const refund of orderRefunds) addCredit(current.credits, refund.totalsBasis, refund.totalBase)
+    if (!order.paidAt) {
+      current.arExposure = current.arExposure.add(toDecimal(order.totalBase))
+      // Only an UNPAID order's credit reduces exposure: a credit note against an order already paid
+      // is a debt to the customer, not less money owed by them.
+      for (const refund of orderRefunds) addCredit(current.unpaidCredits, refund.totalsBasis, refund.totalBase)
+    }
     groups.set(key, current)
   }
-  const rows = [...groups.values()]
-    .map((row) => ({
-      customerId: row.customerId,
-      customerName: row.customerName,
-      customerEmail: row.customerEmail,
-      orderCount: row.orderCount,
-      revenueBase: moneyString(row.revenue, baseCurrency),
-      grossProfitBase: moneyString(row.grossProfit, baseCurrency),
-      arExposureBase: moneyString(row.arExposure, baseCurrency),
-      shareOfRevenuePct: pctString(row.revenue, totalRevenue),
-    }))
-    .sort((a, b) => toDecimal(b.revenueBase).cmp(a.revenueBase) || a.customerName.localeCompare(b.customerName))
+
+  // Accumulated UNROUNDED and rounded exactly once, at the figure. Summing the rounded row strings
+  // would put the published totals and the counterfactual their bounds are classified against on
+  // different numbers — the o3d-iigc round-5 finding in the sales-stats summary.
+  const period_ = {
+    revenue: new Prisma.Decimal(0),
+    netRevenue: new Prisma.Decimal(0),
+    revenueExVat: new Prisma.Decimal(0),
+    netRevenueExVat: new Prisma.Decimal(0),
+    cogs: new Prisma.Decimal(0),
+    grossProfit: new Prisma.Decimal(0),
+    arExposure: new Prisma.Decimal(0),
+    credits: emptyCredits(),
+    unpaidCredits: emptyCredits(),
+    costCapturedRows: 0,
+  }
+  const netRevenueByGroup = new Map<string, Prisma.Decimal>()
+  for (const [key, group] of groups) {
+    const netRevenue = group.revenue.sub(comparableCredit(group.credits, 'GROSS'))
+    netRevenueByGroup.set(key, netRevenue)
+    period_.revenue = period_.revenue.add(group.revenue)
+    period_.netRevenue = period_.netRevenue.add(netRevenue)
+    period_.revenueExVat = period_.revenueExVat.add(group.revenueExVat)
+    period_.arExposure = period_.arExposure.add(group.arExposure.sub(comparableCredit(group.unpaidCredits, 'GROSS')))
+    mergeCredits(period_.credits, group.credits)
+    mergeCredits(period_.unpaidCredits, group.unpaidCredits)
+    if (group.costEvidence === 'complete') {
+      period_.costCapturedRows += 1
+      const netRevenueExVat = group.revenueExVat.sub(comparableCredit(group.credits, 'NET'))
+      period_.netRevenueExVat = period_.netRevenueExVat.add(netRevenueExVat)
+      period_.cogs = period_.cogs.add(group.cogs)
+      period_.grossProfit = period_.grossProfit.add(netRevenueExVat.sub(group.cogs))
+    }
+  }
+  // A ratio is bounded by the WHOLE report's completeness, not the row's: a row with no unplaced
+  // credit of its own still had its denominator moved by another row's.
+  const shareBound = shareFigureBound({ reportBasisComplete: creditBasisComplete(period_.credits, 'GROSS') })
+
+  const rows: CustomerReportRow[] = [...groups.entries()]
+    .map(([key, row]) => {
+      const netRevenue = netRevenueByGroup.get(key)!
+      const netRevenueExVat = row.revenueExVat.sub(comparableCredit(row.credits, 'NET'))
+      const grossProfit = netRevenueExVat.sub(row.cogs)
+      // The single derivation of the decision from the reason — see `CustomerReportRow.costEvidence`.
+      const costCaptured = row.costEvidence === 'complete'
+      return {
+        customerId: row.customerId,
+        customerName: row.customerName,
+        customerEmail: row.customerEmail,
+        // THE MAP KEY ITSELF, encoded once. `key` is the identity this group was actually filed
+        // under, so the token on the row is not a re-derivation that could drift from the grouping
+        // — and `inconsistentCustomerLabel` reads it back off the row rather than encoding again.
+        groupToken: identityLabelField(key),
+        orderCount: row.orderCount,
+        revenueBase: moneyString(row.revenue, baseCurrency),
+        netRevenueBase: moneyString(netRevenue, baseCurrency),
+        netRevenueBaseBound: netLinearFigureBoundDecimal({
+          basisComplete: creditBasisComplete(row.credits, 'GROSS'),
+          unplacedCredit: unplacedCredit(row.credits, 'GROSS'),
+        }),
+        netRevenueExVatBase: moneyString(netRevenueExVat, baseCurrency),
+        netRevenueExVatBaseBound: netLinearFigureBoundDecimal({
+          basisComplete: creditBasisComplete(row.credits, 'NET'),
+          unplacedCredit: unplacedCredit(row.credits, 'NET'),
+        }),
+        grossProfitBase: costCaptured ? moneyString(grossProfit, baseCurrency) : null,
+        // A withheld figure carries no bound: there is no published number for a relation to be
+        // about, and marking it would read as a claim about something that was not published.
+        grossProfitBaseBound: costCaptured
+          ? netLinearFigureBoundDecimal({
+            basisComplete: creditBasisComplete(row.credits, 'NET'),
+            unplacedCredit: unplacedCredit(row.credits, 'NET'),
+          })
+          : 'indeterminate',
+        costCaptured,
+        costEvidence: row.costEvidence,
+        arExposureBase: moneyString(row.arExposure.sub(comparableCredit(row.unpaidCredits, 'GROSS')), baseCurrency),
+        arExposureBaseBound: netLinearFigureBoundDecimal({
+          basisComplete: creditBasisComplete(row.unpaidCredits, 'GROSS'),
+          unplacedCredit: unplacedCredit(row.unpaidCredits, 'GROSS'),
+        }),
+        shareOfRevenuePct: pctString(netRevenue, period_.netRevenue),
+        shareOfRevenuePctBound: shareBound,
+        refundsGrossBasis: moneyString(row.credits.gross, baseCurrency),
+        refundsNetBasis: moneyString(row.credits.net, baseCurrency),
+        refundsUnknownBasis: moneyString(row.credits.unknown, baseCurrency),
+      }
+    })
+    // Ranked on the refund-aware figure, so a customer who returned everything no longer outranks
+    // one who kept a smaller order.
+    .sort((a, b) => toDecimal(b.netRevenueBase).cmp(a.netRevenueBase) || a.customerName.localeCompare(b.customerName))
+  // ONE derivation of both the count and the list, taken from the SORTED, UNPAGINATED rows: the
+  // only place where "which customers" and "in the order the operator will page through them" are
+  // both true. A second walk over `groups` for the count would be a second thing to get wrong, and
+  // a count that disagreed with the names beneath it would be worse than either alone.
+  const inconsistentCustomers = rows.filter((row) => row.costEvidence === 'inconsistent').map(inconsistentCustomerLabel)
   const paged = paginate(rows, filters, deps?.paginate !== false)
-  const grossProfit = [...groups.values()].reduce((sum, row) => sum.add(row.grossProfit), new Prisma.Decimal(0))
-  const arExposure = [...groups.values()].reduce((sum, row) => sum.add(row.arExposure), new Prisma.Decimal(0))
   return {
     generatedAt: generatedAt.toISOString(),
     dateFrom: dateOnly(window.dateFrom),
@@ -723,13 +1743,44 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
     rows: paged.rows,
     pageInfo: paged.pageInfo,
     totals: {
-      revenueBase: moneyString(totalRevenue, baseCurrency),
-      grossProfitBase: moneyString(grossProfit, baseCurrency),
-      arExposureBase: moneyString(arExposure, baseCurrency),
+      revenueBase: moneyString(period_.revenue, baseCurrency),
+      netRevenueBase: moneyString(period_.netRevenue, baseCurrency),
+      netRevenueBaseBound: netLinearFigureBoundDecimal({
+        basisComplete: creditBasisComplete(period_.credits, 'GROSS'),
+        unplacedCredit: unplacedCredit(period_.credits, 'GROSS'),
+      }),
+      netRevenueExVatBase: moneyString(period_.netRevenueExVat, baseCurrency),
+      // The period profit sums the CAPTURED rows only, which is why the count travels with it: a
+      // total over a subset that does not say it is a subset is the withheld-figure defect again,
+      // one level up.
+      grossProfitBase: moneyString(period_.grossProfit, baseCurrency),
+      grossProfitBaseBound: netLinearFigureBoundDecimal({
+        basisComplete: creditBasisComplete(period_.credits, 'NET'),
+        unplacedCredit: unplacedCredit(period_.credits, 'NET'),
+      }),
+      costCapturedRows: String(period_.costCapturedRows),
+      // Travels beside the count it is NOT part of: an inconsistent customer is withheld like an
+      // incomplete one, and unlike one it will still be withheld next month if nobody acts.
+      costInconsistentRows: String(inconsistentCustomers.length),
+      arExposureBase: moneyString(period_.arExposure, baseCurrency),
+      arExposureBaseBound: netLinearFigureBoundDecimal({
+        basisComplete: creditBasisComplete(period_.unpaidCredits, 'GROSS'),
+        unplacedCredit: unplacedCredit(period_.unpaidCredits, 'GROSS'),
+      }),
+      refundsGrossBasis: moneyString(period_.credits.gross, baseCurrency),
+      refundsNetBasis: moneyString(period_.credits.net, baseCurrency),
+      refundsUnknownBasis: moneyString(period_.credits.unknown, baseCurrency),
     },
     notices: [
-      'AR exposure is unpaid sales-order totalBase for the selected period. COGS comes from CogsEntry rows linked to SALE_DISPATCH movements.',
-      REFUND_BLIND_NOTICE_CUSTOMER_MIX,
+      'AR exposure is unpaid sales-order totalBase for the selected period, less the gross-basis credit raised against those unpaid orders. COGS comes from CogsEntry rows linked to SALE_DISPATCH movements.',
+      `Gross profit is withheld for a customer with an in-period order whose posted cost does not cover the revenue it is measured against — no COGS posted in the period, not every ordered stock unit dispatched within it, or a dispatch costed for more units than it moved — and the period total covers ${period_.costCapturedRows} of ${groups.size} customers. A missing cost is not a zero cost, and a partially dispatched order's cost is not the whole order's cost.`,
+      // Named separately, and only when there is one: it is the cause an operator has to ACT on,
+      // and the only one of the three that will still be here next month if nobody does.
+      ...(inconsistentCustomers.length > 0
+        ? [`${inconsistentCustomers.length} of ${groups.size} customers are withheld as INCONSISTENT rather than incomplete: an in-period dispatch carries COGS entries for more units than the movement moved, which the FIFO engine cannot produce. What is proven here is the QUANTITY — the costed quantity exceeds the quantity that moved. Nothing here is proven about the MONEY: this check compares CogsEntry.qty against the movement and never reads CogsEntry.totalCostBase. The monetary correctness of those entries is UNMEASURED — here, and anywhere else this report shows. Duplicate entries are the usual cause of the excess quantity. Read the entries against the dispatch before altering any posted cost. Nothing further will ship to resolve this; it stands until somebody corrects the entries. ${namedInconsistentCustomers(inconsistentCustomers)}`]
+        : []),
+      'Non-inventory lines — services, fees, delivery charges — book no stock movement and post no cost, so they are not asked to show a dispatch and an order made only of them is fully costed at zero. A variable-parent line is not exempt: goods do leave for it and cannot be traced to it, so its cost is unknown and the order is withheld.',
+      REFUND_BASIS_NOTICE_CUSTOMER_MIX,
     ],
   }
 }
@@ -844,6 +1895,175 @@ export function computeInWindowDispatchedQtyByLine(
   return effective
 }
 
+/**
+ * The in-window dispatched quantity of every line of `orders`, keyed `${lineId}|${productId}`.
+ *
+ * ONE loader for the questions that all need it, so they cannot drift on what "dispatched in this
+ * window" means: Gross Margin PRORATES a line's revenue to it, and Customer Mix asks whether the
+ * cost posted for an order covers the revenue that order is publishing (see `orderCostCoverage`).
+ * Both are the same measurement — how much of what was ordered was actually shipped, and therefore
+ * costed, inside the period being reported.
+ *
+ * The unaggregated movements come back beside the map for the third question, which the aggregate
+ * cannot answer: whether each of those dispatches actually posted its cost
+ * (`ordersWithEveryDispatchCosted`).
+ */
+type InWindowDispatchMovement = { id: string; orderId: string | null; qty: DecimalInput }
+
+async function loadInWindowDispatchedQtyByLine(
+  client: SalesFulfillmentAnalyticsClient,
+  window: { dateFrom: Date; dateTo: Date; dateToExclusive: Date },
+  orders: SalesOrderRow[],
+  sourceLabel: string,
+): Promise<{ byLine: Map<string, Prisma.Decimal>; dispatchMovements: InWindowDispatchMovement[] }> {
+  // In-window dispatch movements carry the line-granularity link (scjz.51/4pz6).
+  const dispatchRows = await client.stockMovement.findMany({
+    where: {
+      type: StockMovementType.SALE_DISPATCH,
+      referenceType: 'SalesOrder',
+      createdAt: { gte: window.dateFrom, lt: window.dateToExclusive },
+    },
+    select: { id: true, qty: true, referenceId: true, productId: true, shipmentLine: { select: { lineId: true } } },
+    take: SOURCE_ROW_LIMIT + 1,
+  }) as Array<{ id: string; qty: DecimalInput; referenceId: string | null; productId: string; shipmentLine: { lineId: string } | null }>
+  assertSourceLimit(dispatchRows.length, SOURCE_ROW_LIMIT, `${sourceLabel} dispatch source rows`)
+  // o3d-7r6x: a KIT line's dispatch movements are denominated in leaf components, the line in
+  // parent units. Resolve each line's component requirements so the linked dispatch can be
+  // converted to whole ordered units before it is matched back to the line.
+  const graph = await loadFulfillmentProductGraph(
+    client as unknown as Parameters<typeof loadFulfillmentProductGraph>[0],
+    [...new Set(orders.flatMap((order) => order.lines.map((line) => line.productId)).filter((id): id is string => Boolean(id)))],
+  )
+  const requirementsByLine = new Map<string, DecimalFulfillmentRequirement[]>()
+  for (const order of orders) {
+    for (const line of order.lines) {
+      if (!line.productId || requirementsByLine.has(line.id)) continue
+      requirementsByLine.set(
+        line.id,
+        requirementsMapToDecimalRows(expandFulfillmentRequirementsDecimal(line.productId, 1, graph)),
+      )
+    }
+  }
+  return {
+    byLine: computeInWindowDispatchedQtyByLine(
+      dispatchRows.map((row) => ({
+        orderId: row.referenceId,
+        productId: row.productId,
+        qty: row.qty,
+        shipmentLineLineId: row.shipmentLine?.lineId ?? null,
+      })),
+      orders.flatMap((order) => order.lines.map((line) => ({
+        id: line.id,
+        orderId: order.id,
+        productId: line.productId,
+        qty: line.qty,
+      }))),
+      requirementsByLine,
+    ),
+    // The SAME rows, unaggregated. `ordersWithEveryDispatchCosted` has to ask about each movement
+    // individually, and the per-line map has already added them up — so the population that
+    // establishes coverage and the population that establishes costedness are one query, and can
+    // never drift on what "dispatched in this window" means.
+    dispatchMovements: dispatchRows.map((row) => ({ id: row.id, orderId: row.referenceId, qty: row.qty })),
+  }
+}
+
+/**
+ * IS THE POSTED COST COMPLETE FOR THE REVENUE BEING MEASURED?
+ *
+ * Customer Mix measures gross profit against the WHOLE order's ex-VAT revenue — `SalesOrder.
+ * totalBase` less tax, every ordered unit of it. The question "was a cost posted for this order?"
+ * is therefore the wrong question, and answering it with `cogsByOrder.has(order.id)` is the
+ * missing-cost defect one step along: an order that dispatched one of ten units has a COGS entry,
+ * passes that test, and gets ONE unit's cost set against TEN units' revenue. The profit that comes
+ * out is plausible, confident and far too high — the same shape as the `?? 0` it replaced.
+ *
+ * COMPLETE therefore means: every ordered unit of every line THAT CAN BE DISPATCHED was dispatched
+ * INSIDE THE WINDOW. The in-window part is not a detail. Orders are selected by `createdAt`, so a
+ * dispatch can never fall before the window, but it can fall after it: an order created on the 30th
+ * and shipped on the 2nd has cost in NEXT period's `cogsByOrder` and revenue in THIS one. Measuring
+ * coverage with the same in-window dispatched quantity Gross Margin prorates by makes both leaks
+ * one rule.
+ *
+ * AND THE "THAT CAN BE DISPATCHED" IS THE WHOLE OF THE REST OF IT. Withholding is right when a
+ * figure cannot be supported and wrong when it can, so this has to separate two things a naive
+ * "every line must show dispatch" rule folds together:
+ *
+ *   NO COST TO POST. A NON_INVENTORY line — a service, a fee, a delivery charge — is by definition
+ *   not stock-tracked. It books no stock movement, so it can never carry a dispatch and never
+ *   produces a `CogsEntry`; its contribution to the order's cost is a KNOWN ZERO. Requiring a
+ *   dispatch for it would withhold that customer's gross profit for as long as the order exists,
+ *   and an order carrying a delivery charge is the ordinary case, not the exotic one. It is skipped
+ *   here, and an order whose only quantity-bearing lines are of this kind is `nothing-to-dispatch`:
+ *   completely costed, at zero, with no COGS entry needed to prove it.
+ *
+ *   COST UNKNOWN. Everything else that cannot show coverage fails closed, because "no dispatch
+ *   found" is then not evidence of no cost:
+ *     - a line with no `productId` (the schema's "product deleted / not found") has no product for
+ *       a dispatch movement to be attributed through, so what it shipped is not knowable;
+ *     - a line whose product row did not load, for the same reason — the type that would decide
+ *       this is the thing that is missing;
+ *     - a VARIABLE line. VARIABLE is a parent of stock-tracked variants: goods really will leave
+ *       for it, and `external-fulfillment` records that such a line can never receive shipment
+ *       coverage. So its cost is real and permanently untraceable — the opposite of NON_INVENTORY,
+ *       and the case where publishing profit would silently treat a cost as zero. Naming the two
+ *       types together (as `isStockTrackedProductType` does, for a question about STOCK) would put
+ *       a real unposted cost into the same bucket as a service line's absent one.
+ *
+ * A line ordered at zero quantity has no units to cover and is skipped. An order with no
+ * quantity-bearing line at all is `incomplete`, not `nothing-to-dispatch`: it sold nothing this
+ * report can see while carrying revenue that says otherwise, and that is an absence of evidence.
+ *
+ * Note this is about COVERAGE, not amount: an order whose posted cost is genuinely zero is complete
+ * as long as its units shipped, which is the "cost posted, and it was zero" evidence `.has` was
+ * introduced to preserve.
+ *
+ * AND `dispatched < ordered` IS ONE-SIDED ON PURPOSE — unlike the costed-quantity match beside it,
+ * which o3d-7jfq round 2 had to make symmetric. Asked and answered, so it is not re-litigated:
+ *
+ *   - The two sides here are not the same measurement. `costedQty` and `movement.qty` are one
+ *     movement's own two fields in one unit; `dispatched` is DERIVED — a kit conversion plus the
+ *     proration of unlinked legacy movements across a line's quantity share, which
+ *     `computeInWindowDispatchedQtyByLine` documents as its remaining gap. A line already covered
+ *     by a linked dispatch that also picks up a share of a legacy unlinked movement for the same
+ *     product exceeds its ordered quantity with nothing wrong anywhere. That is an imprecise
+ *     estimate, not evidence contradicting itself.
+ *   - The writers differ in what they can be trusted for. `StockMovement.idempotencyKey` is UNIQUE
+ *     and `validateActiveShipmentTotalsWithinOrder` caps a shipment at ordered − refunded − already-shipped, so
+ *     a duplicated or oversized dispatch is refused by a constraint. `CogsEntry` carries no unique
+ *     constraint at all — which is exactly why the costed side needs the two-sided check and this
+ *     side does not.
+ *   - The failure modes are opposite. Withholding for an over-estimate would withhold a profit that
+ *     IS supported, and this branch's other failure mode is refusing figures it can stand behind.
+ */
+type OrderCostCoverage =
+  /** Every dispatchable unit shipped in the window. The caller must still prove they were COSTED. */
+  | 'covered'
+  /** Nothing on this order could ever dispatch or post a cost. Complete, at zero, on its own. */
+  | 'nothing-to-dispatch'
+  /** Some line's cost is short or unknowable. No profit may be published for this order. */
+  | 'incomplete'
+
+function orderCostCoverage(order: SalesOrderRow, dispatchedQtyByLine: Map<string, Prisma.Decimal>): OrderCostCoverage {
+  let sawDispatchable = false
+  let sawNonStock = false
+  for (const line of order.lines) {
+    const ordered = toDecimal(line.qty)
+    if (ordered.lte(0)) continue
+    if (!line.productId || !line.product) return 'incomplete'
+    if (line.product.type === ProductType.NON_INVENTORY) {
+      sawNonStock = true
+      continue
+    }
+    if (!isStockTrackedProductType(line.product.type)) return 'incomplete'
+    sawDispatchable = true
+    const dispatched = dispatchedQtyByLine.get(`${line.id}|${line.productId}`) ?? new Prisma.Decimal(0)
+    if (dispatched.lt(ordered)) return 'incomplete'
+  }
+  if (sawDispatchable) return 'covered'
+  return sawNonStock ? 'nothing-to-dispatch' : 'incomplete'
+}
+
 export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = {}, deps?: SalesFulfillmentAnalyticsDeps): Promise<SalesAnalyticsReport<MarginReportRow>> {
   const client = clientFromDeps(deps)
   const generatedAt = nowFromDeps(deps)
@@ -885,71 +2105,61 @@ export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = 
     .filter((id): id is string => typeof id === 'string' && id.length > 0)
   const cogsProductIds = new Set(cogsRows.map((row) => marginCogsBucket(row).productId))
   const orders = await loadSalesOrdersByIds(client, cogsOrderIds)
-  // In-window dispatch movements carry the line-granularity link (scjz.51/4pz6):
-  // we prorate each line's revenue to the units it actually dispatched in the
-  // window instead of booking its full total against in-window COGS.
-  const dispatchRows = await client.stockMovement.findMany({
-    where: {
-      type: StockMovementType.SALE_DISPATCH,
-      referenceType: 'SalesOrder',
-      createdAt: { gte: window.dateFrom, lt: window.dateToExclusive },
+  // o3d-kyey: the credit RAISED IN THE WINDOW, which is the period this report already measures —
+  // it is anchored to CogsEntry.createdAt and prorates revenue to the quantity dispatched inside the
+  // window, so it is a DISPATCH-PERIOD report, not an order cohort. A credit note therefore belongs
+  // to the period it was raised in, exactly as the Returns report reads it. A credit raised here
+  // against a dispatch from an earlier period consequently reduces this period's revenue, which is
+  // the same thing a credit note does to a month's accounts.
+  const marginRefundLines = await client.salesOrderRefundLine.findMany({
+    where: { refund: { refundedAt: { gte: window.dateFrom, lt: window.dateToExclusive } } },
+    select: {
+      productId: true,
+      totalBase: true,
+      // The sales line the credit reverses. Its product is the bucket the revenue was booked into;
+      // for a KIT it differs from the refund line's own product, exactly as in marginCogsBucket.
+      salesOrderLine: { select: { productId: true } },
+      refund: { select: { totalsBasis: true } },
     },
-    select: { qty: true, referenceId: true, productId: true, shipmentLine: { select: { lineId: true } } },
     take: SOURCE_ROW_LIMIT + 1,
-  }) as Array<{ qty: DecimalInput; referenceId: string | null; productId: string; shipmentLine: { lineId: string } | null }>
-  assertSourceLimit(dispatchRows.length, SOURCE_ROW_LIMIT, 'Margin analytics dispatch source rows')
-  // o3d-7r6x: a KIT line's dispatch movements are denominated in leaf components, the line in
-  // parent units. Resolve each line's component requirements so the linked dispatch can be
-  // converted to whole ordered units before it is matched back to the line.
-  const marginGraph = await loadFulfillmentProductGraph(
-    client as unknown as Parameters<typeof loadFulfillmentProductGraph>[0],
-    [...new Set(orders.flatMap((order) => order.lines.map((line) => line.productId)).filter((id): id is string => Boolean(id)))],
-  )
-  const marginRequirementsByLine = new Map<string, DecimalFulfillmentRequirement[]>()
-  for (const order of orders) {
-    for (const line of order.lines) {
-      if (!line.productId || marginRequirementsByLine.has(line.id)) continue
-      marginRequirementsByLine.set(
-        line.id,
-        requirementsMapToDecimalRows(expandFulfillmentRequirementsDecimal(line.productId, 1, marginGraph)),
-      )
-    }
-  }
-  const dispatchedQtyByLine = computeInWindowDispatchedQtyByLine(
-    dispatchRows.map((row) => ({
-      orderId: row.referenceId,
-      productId: row.productId,
-      qty: row.qty,
-      shipmentLineLineId: row.shipmentLine?.lineId ?? null,
-    })),
-    orders.flatMap((order) => order.lines.map((line) => ({
-      id: line.id,
-      orderId: order.id,
-      productId: line.productId,
-      qty: line.qty,
-    }))),
-    marginRequirementsByLine,
-  )
-  const groups = new Map<string, MarginReportRow & { revenue: Prisma.Decimal; cogs: Prisma.Decimal; lineIds: Set<string> }>()
+  }) as MarginRefundLineRow[]
+  assertSourceLimit(marginRefundLines.length, SOURCE_ROW_LIMIT, 'Margin analytics refund source rows')
+  const { byLine: dispatchedQtyByLine } = await loadInWindowDispatchedQtyByLine(client, window, orders, 'Margin analytics')
+  type MarginGroup = MarginReportRow & { revenue: Prisma.Decimal; cogs: Prisma.Decimal; credits: CreditBuckets; lineIds: Set<string> }
+  const emptyMarginGroup = (productId: string, sku: string, productName: string, categoryName: string | null): MarginGroup => ({
+    productId,
+    sku,
+    productName,
+    categoryName,
+    lineCount: 0,
+    revenueBase: '0',
+    revenueBaseBound: 'exact',
+    cogsBase: '0',
+    grossProfitBase: '0',
+    grossProfitBaseBound: 'exact',
+    marginPct: '0',
+    marginPctBound: 'exact',
+    contributionPct: '0',
+    contributionPctBound: 'exact',
+    refundsNetBasis: '0',
+    refundsGrossBasis: '0',
+    refundsUnknownBasis: '0',
+    revenue: new Prisma.Decimal(0),
+    cogs: new Prisma.Decimal(0),
+    credits: emptyCredits(),
+    lineIds: new Set<string>(),
+  })
+  const groups = new Map<string, MarginGroup>()
   for (const order of orders) {
     for (const line of order.lines) {
       if (!line.productId || !cogsProductIds.has(line.productId)) continue
       const key = line.productId ?? `sku:${line.sku ?? line.description}`
-      const current = groups.get(key) ?? {
-        productId: line.productId,
-        sku: line.sku ?? line.product?.sku ?? 'No SKU',
-        productName: line.product?.name ?? line.description,
-        categoryName: line.product?.category?.name ?? null,
-        lineCount: 0,
-        revenueBase: '0',
-        cogsBase: '0',
-        grossProfitBase: '0',
-        marginPct: '0',
-        contributionPct: '0',
-        revenue: new Prisma.Decimal(0),
-        cogs: new Prisma.Decimal(0),
-        lineIds: new Set<string>(),
-      }
+      const current = groups.get(key) ?? emptyMarginGroup(
+        line.productId,
+        line.sku ?? line.product?.sku ?? 'No SKU',
+        line.product?.name ?? line.description,
+        line.product?.category?.name ?? null,
+      )
       current.lineIds.add(line.id)
       current.lineCount = current.lineIds.size
       const dispatchedQty = dispatchedQtyByLine.get(`${line.id}|${line.productId}`) ?? new Prisma.Decimal(0)
@@ -962,45 +2172,104 @@ export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = 
   for (const row of cogsRows) {
     const bucket = marginCogsBucket(row)
     const key = bucket.productId
-    const current = groups.get(key) ?? {
-      productId: key,
-      sku: bucket.product.sku,
-      productName: bucket.product.name,
-      categoryName: bucket.product.category?.name ?? null,
-      lineCount: 0,
-      revenueBase: '0',
-      cogsBase: '0',
-      grossProfitBase: '0',
-      marginPct: '0',
-      contributionPct: '0',
-      revenue: new Prisma.Decimal(0),
-      cogs: new Prisma.Decimal(0),
-      lineIds: new Set<string>(),
-    }
+    const current = groups.get(key) ?? emptyMarginGroup(
+      key,
+      bucket.product.sku,
+      bucket.product.name,
+      bucket.product.category?.name ?? null,
+    )
     current.cogs = current.cogs.add(toDecimal(row.totalCostBase))
     groups.set(key, current)
   }
-  const totalGrossProfit = [...groups.values()].reduce((sum, row) => sum.add(row.revenue.sub(row.cogs)), new Prisma.Decimal(0))
-  const rows = [...groups.values()]
-    .map((row) => {
-      const grossProfit = row.revenue.sub(row.cogs)
+
+  // THE CREDIT THAT COULD NOT REACH A ROW IS STATED, NEVER DROPPED. Two ways it can fail to:
+  //   - the refund line names no product at all (a shipping or monetary-only credit line), so there
+  //     is no revenue bucket it could belong to;
+  //   - it names a product this report has no row for, because that product posted no COGS inside
+  //     the window. A row is invented for it NOT: this report's rows are "what was dispatched in
+  //     the window", and a bucket with credit and no cost cannot support a margin — publishing one
+  //     would be the missing-cost defect wearing a minus sign.
+  // Both are published in the totals and both make the report's ratio bounds indeterminate.
+  const refundsUnattributed = emptyCredits()
+  const refundsOutsideReport = emptyCredits()
+  for (const refundLine of marginRefundLines) {
+    const productId = refundLine.salesOrderLine?.productId ?? refundLine.productId
+    const target = productId ? groups.get(productId) : undefined
+    const buckets = target ? target.credits : productId ? refundsOutsideReport : refundsUnattributed
+    addCredit(buckets, refundLine.refund.totalsBasis, refundLine.totalBase)
+  }
+  // Line revenue here is `SalesOrderLine.totalBase`, which is ex-VAT, so this report's basis is NET
+  // and the NET-basis credit is the comparable one. Every net figure is computed from the UNROUNDED
+  // Decimal and rounded once, at the string.
+  const MARGIN_FIGURE_BASIS = 'NET' as const
+  const netRevenueByKey = new Map<string, Prisma.Decimal>()
+  for (const [key, row] of groups) {
+    netRevenueByKey.set(key, row.revenue.sub(comparableCredit(row.credits, MARGIN_FIGURE_BASIS)))
+  }
+  const totalGrossProfit = [...groups.entries()].reduce((sum, [key, row]) => sum.add(netRevenueByKey.get(key)!.sub(row.cogs)), new Prisma.Decimal(0))
+  // The report-wide credit: every row's, plus the credit that reached no row at all.
+  const reportCredits = emptyCredits()
+  for (const row of groups.values()) mergeCredits(reportCredits, row.credits)
+  const rowBasisComplete = creditBasisComplete(reportCredits, MARGIN_FIGURE_BASIS)
+  const rowUnplacedInterval = unplacedCreditInterval(reportCredits, MARGIN_FIGURE_BASIS)
+  mergeCredits(reportCredits, refundsUnattributed)
+  mergeCredits(reportCredits, refundsOutsideReport)
+  /**
+   * OFF-ROW CREDIT BOUNDS THE PERIOD FIGURES WHATEVER BASIS IT IS ON, and this is the one place the
+   * basis test is not enough on its own. A NET-basis credit that reached no row is `placeable` by
+   * `creditPlacement` — it is the same unit as the figure — so the basis flag stays true while the
+   * credit sits unsubtracted. Reading completeness off the basis alone would publish the period
+   * revenue as EXACT with a credit note missing from it. Existence is decided by the AMOUNTS here
+   * because that is what "reached no row" means — but from the INTERVAL those amounts occupy, never
+   * from a sum. A cross-basis sum lets a negative credit on one basis cancel a real one on another;
+   * a per-bucket sum lets two opposite credits on the SAME basis cancel, though their ex-VAT values
+   * need not. Either restores the exactness claim this whole mechanism exists to withhold. See
+   * `offRowCreditSummary`.
+   */
+  const offRow = offRowCreditSummary(refundsUnattributed, refundsOutsideReport)
+  const contributionBound = shareFigureBound({ reportBasisComplete: rowBasisComplete && !offRow.present })
+  const rows: MarginReportRow[] = [...groups.entries()]
+    .map(([key, row]) => {
+      const netRevenue = netRevenueByKey.get(key)!
+      const grossProfit = netRevenue.sub(row.cogs)
+      const basisComplete = creditBasisComplete(row.credits, MARGIN_FIGURE_BASIS)
+      const unplaced = unplacedCredit(row.credits, MARGIN_FIGURE_BASIS)
+      const linearBound = netLinearFigureBoundDecimal({ basisComplete, unplacedCredit: unplaced })
       return {
         productId: row.productId,
         sku: row.sku,
         productName: row.productName,
         categoryName: row.categoryName,
         lineCount: row.lineCount,
-        revenueBase: moneyString(row.revenue, baseCurrency),
+        revenueBase: moneyString(netRevenue, baseCurrency),
+        revenueBaseBound: linearBound,
         cogsBase: moneyString(row.cogs, baseCurrency),
         grossProfitBase: moneyString(grossProfit, baseCurrency),
-        marginPct: pctString(grossProfit, row.revenue),
+        grossProfitBaseBound: linearBound,
+        marginPct: pctString(grossProfit, netRevenue),
+        marginPctBound: marginFigureBoundDecimal({ netRevenue, cogs: row.cogs, unplacedCredit: unplaced, basisComplete }),
         contributionPct: pctString(grossProfit, totalGrossProfit),
+        contributionPctBound: contributionBound,
+        refundsNetBasis: moneyString(row.credits.net, baseCurrency),
+        refundsGrossBasis: moneyString(row.credits.gross, baseCurrency),
+        refundsUnknownBasis: moneyString(row.credits.unknown, baseCurrency),
       }
     })
     .sort((a, b) => toDecimal(b.grossProfitBase).cmp(a.grossProfitBase) || a.sku.localeCompare(b.sku))
   const paged = paginate(rows, filters, deps?.paginate !== false)
-  const totalRevenue = [...groups.values()].reduce((sum, row) => sum.add(row.revenue), new Prisma.Decimal(0))
+  const totalRevenue = [...netRevenueByKey.values()].reduce((sum, revenue) => sum.add(revenue), new Prisma.Decimal(0))
   const totalCogs = [...groups.values()].reduce((sum, row) => sum.add(row.cogs), new Prisma.Decimal(0))
+  // The two intervals ADD, endpoint by endpoint — both are in NET terms, and the credit missing
+  // from the totals is the row credit no row could absorb plus the credit that reached no row at
+  // all. A below-zero lower end (the off-row credit could itself be negative) survives the addition
+  // and `unplacedCreditBound` hands it to the classifiers, which answer `indeterminate` rather than
+  // print a ceiling that is not one.
+  const totalUnplaced = unplacedCreditBound(addUnplacedIntervals(rowUnplacedInterval, offRow.interval))
+  const totalBasisComplete = rowBasisComplete && !offRow.present
+  const totalLinearBound: DerivedFigureBound = netLinearFigureBoundDecimal({
+    basisComplete: totalBasisComplete,
+    unplacedCredit: totalUnplaced,
+  })
   return {
     generatedAt: generatedAt.toISOString(),
     dateFrom: dateOnly(window.dateFrom),
@@ -1009,16 +2278,38 @@ export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = 
     pageInfo: paged.pageInfo,
     totals: {
       revenueBase: moneyString(totalRevenue, baseCurrency),
+      revenueBaseBound: totalLinearBound,
       cogsBase: moneyString(totalCogs, baseCurrency),
       grossProfitBase: moneyString(totalGrossProfit, baseCurrency),
+      grossProfitBaseBound: totalLinearBound,
       marginPct: pctString(totalGrossProfit, totalRevenue),
+      marginPctBound: marginFigureBoundDecimal({
+        netRevenue: totalRevenue,
+        cogs: totalCogs,
+        unplacedCredit: totalUnplaced,
+        basisComplete: totalBasisComplete,
+      }),
+      refundsNetBasis: moneyString(reportCredits.net, baseCurrency),
+      refundsGrossBasis: moneyString(reportCredits.gross, baseCurrency),
+      refundsUnknownBasis: moneyString(reportCredits.unknown, baseCurrency),
+      // Credit that reached no row, stated separately from credit that did, and ON ITS BASIS. Both
+      // are inside refunds*Basis above; these say how much of it no product row could account for.
+      // A single combined figure would be the one thing this report refuses to publish — a number
+      // adding NET, GROSS and unproven amounts is in no unit at all, and the operator reading it
+      // beside a NET revenue column would take it for one.
+      refundsUnattributedNetBasis: moneyString(refundsUnattributed.net, baseCurrency),
+      refundsUnattributedGrossBasis: moneyString(refundsUnattributed.gross, baseCurrency),
+      refundsUnattributedUnknownBasis: moneyString(refundsUnattributed.unknown, baseCurrency),
+      refundsOutsideReportNetBasis: moneyString(refundsOutsideReport.net, baseCurrency),
+      refundsOutsideReportGrossBasis: moneyString(refundsOutsideReport.gross, baseCurrency),
+      refundsOutsideReportUnknownBasis: moneyString(refundsOutsideReport.unknown, baseCurrency),
     },
     notices: [
       'Gross margin is anchored to CogsEntry.createdAt, matches the inventory COGS report period semantics, and uses source SalesOrderLine revenue without recalculating FIFO.',
       'Margin rows are product-level buckets: COGS is grouped by the sales line product behind the dispatch (the movement product for unlinked rows) and revenue is grouped from sales-order lines for COGS-linked orders. Duplicate SKU lines share the same product bucket; this report is not line-level COGS attribution.',
       'Line revenue is prorated to the quantity each line dispatched within the window (via the shipment-line link on dispatch movements), so a line shipped across periods books only its in-window revenue against in-window COGS.',
     'Kit lines are converted from component dispatch quantities to whole ordered units through the fulfillment-requirement graph, so a kit contributes revenue in the same units its line is priced in.',
-      REFUND_BLIND_NOTICE_GROSS_MARGIN,
+      REFUND_BASIS_NOTICE_GROSS_MARGIN,
     ],
   }
 }

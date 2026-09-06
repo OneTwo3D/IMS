@@ -274,3 +274,52 @@ test('a refund line with no productId cannot be attributed, and is not invented 
   assert.equal(topProducts[0].refundsNetBasis, 0)
   assert.equal(topProducts[0].netRevenueBound, 'exact')
 })
+
+// ---------------------------------------------------------------------------
+// o3d-7jfq: TWO OPPOSITE SAME-BASIS CREDITS MUST NOT PRODUCE A `≤` — AND THE LIST IS RANKED ON IT
+// ---------------------------------------------------------------------------
+
+test('Best Sellers: opposite GROSS credits cancel to a zero bucket and the row claims no ceiling (o3d-7jfq)', async () => {
+  // p2 sells £200 ex-VAT and is credited +£120 and −£120, both stamped GROSS. Neither is placeable
+  // on an ex-VAT figure, so `refundsGrossBasis` is 120 - 120 = 0 — and both markers used to be
+  // classified from `refundsGrossBasis + refundsUnknownBasis`. Zero is not negative, so the card
+  // printed "£200 ≤" and the tooltip said the bound was £0.00 wide, about a figure whose true value
+  // lies anywhere in [£80, £320].
+  ORDERS = [order('A', [line('p2', 200, 50)], [
+    { totalsBasis: 'GROSS', totalBase: 120, lines: [{ productId: 'p2', qty: 1, totalBase: 120 }] },
+    { totalsBasis: 'GROSS', totalBase: -120, lines: [{ productId: 'p2', qty: -1, totalBase: -120 }] },
+  ])]
+  const { topProducts } = await dashboard()
+  const row = topProducts.find((p) => p.productId === 'p2')!
+
+  assert.equal(row.refundsGrossBasis, 0, 'the signed bucket really is zero; that is the trap')
+  assert.equal(row.netRevenue, 200, 'the figure is unchanged — this is about the RELATION')
+  assert.equal(row.refundBasisComplete, false)
+  assert.equal(row.netRevenueBound, 'indeterminate')
+  assert.equal(row.marginPctBound, 'indeterminate')
+
+  // And the tooltip stops quoting a width that is not one: £0.00 of "credit not subtracted" beside
+  // a figure that may be £120 out is the same false claim with a number on it.
+  const { bestSellerRevenueTitle } = await import('@/app/(dashboard)/dashboard/dashboard-client')
+  const title = bestSellerRevenueTitle(row, (v: number) => `£${v.toFixed(2)}`)!
+  assert.match(title, /^Direction not established/)
+  assert.doesNotMatch(title, /£0\.00/)
+  assert.match(title, /ranking carries the same uncertainty/, 'the ORDER inherits it, as it did for ≤')
+})
+
+test('Best Sellers: the same pair with both entries POSITIVE keeps its ≤ and its width (o3d-7jfq control)', async () => {
+  ORDERS = [order('A', [line('p2', 200, 50)], [
+    { totalsBasis: 'GROSS', totalBase: 120, lines: [{ productId: 'p2', qty: 1, totalBase: 120 }] },
+    { totalsBasis: 'GROSS', totalBase: 120, lines: [{ productId: 'p2', qty: 1, totalBase: 120 }] },
+  ])]
+  const { topProducts } = await dashboard()
+  const row = topProducts.find((p) => p.productId === 'p2')!
+
+  assert.equal(row.refundsGrossBasis, 240)
+  assert.equal(row.netRevenueBound, 'upper')
+  const { bestSellerRevenueTitle } = await import('@/app/(dashboard)/dashboard/dashboard-client')
+  const title = bestSellerRevenueTitle(row, (v: number) => `£${v.toFixed(2)}`)!
+  // `upper` is returned only when no unplaced entry was negative, which is exactly when the signed
+  // column IS the width — so the amount may be quoted here and nowhere else.
+  assert.match(title, /^Upper bound: £240\.00 of credit/)
+})

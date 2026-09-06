@@ -22,6 +22,16 @@
 /** What a withheld figure READS as. A word, not a mark that another cell already uses. */
 export const WITHHELD_CELL_TEXT = 'Withheld'
 
+/**
+ * What a figure withheld because its EVIDENCE CONTRADICTS ITSELF reads as (o3d-7jfq round 2).
+ *
+ * Both this and `WITHHELD_CELL_TEXT` mean "no number here", and they are separate words because the
+ * reader's next move differs: a withheld figure is waiting on something that has not happened yet,
+ * and this one is waiting on somebody to repair data that cannot be right. Printing both as
+ * `Withheld` sends that reader looking for a missing entry that is not missing.
+ */
+export const INCONSISTENT_CELL_TEXT = 'Inconsistent'
+
 /** What a measured zero (or a genuinely empty quantity) reads as, unchanged. */
 export const MEASURED_ZERO_CELL_TEXT = '—'
 
