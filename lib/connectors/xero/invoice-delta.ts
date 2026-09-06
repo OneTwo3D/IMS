@@ -7,8 +7,8 @@
 
 import { coversDocumentTotal } from '@/lib/domain/accounting/paid-coverage'
 import {
-  currencyMinorUnits,
-  FINEST_SUPPORTED_MINOR_UNITS,
+  ledgerMinorUnits,
+  subtractMoney,
   toDecimal,
   type Decimal,
 } from '@/lib/domain/math/decimal'
@@ -1023,8 +1023,9 @@ const DOUBLE_SIGNIFICAND_SCALE = (() => {
 
 export function ledgerAmountMagnitudeBound(currency: string | null): number {
   // An unstated currency takes the FINEST supported precision, which yields the SMALLEST bound and so
-  // the strictest refusal — the same direction `ledgerAmountEpsilon` resolves a null currency in.
-  const digits = currency == null ? FINEST_SUPPORTED_MINOR_UNITS : currencyMinorUnits(currency)
+  // the strictest refusal — the same direction `ledgerAmountEpsilon` resolves a null currency in, and
+  // since r16 the same FUNCTION rather than the same sentence written out twice.
+  const digits = ledgerMinorUnits(currency)
   const cached = magnitudeBoundCache.get(digits)
   // Memoised on the DIGITS, not written down per currency: this is the derivation's own result being
   // reused, so there is no second place for a threshold to drift out of step with `currencyMinorUnits`.
@@ -1106,6 +1107,71 @@ export function readDecimalAsNumber(decimal: Decimal): number | null {
   return toDecimal(parsed).equals(decimal) ? parsed : null
 }
 
+/**
+ * o3d-psrx r16 (Codex HIGH 1, the half the scale rule does NOT reach) — THE MAGNITUDE A DIFFERENCE OF
+ * TWO DECODED AMOUNTS MUST SIT UNDER, WHICH IS HALF THE ONE A SINGLE AMOUNT MUST.
+ *
+ * `ledgerAmountMagnitudeBound` guarantees that ONE WHOLE MINOR UNIT survives the decode. The reversal
+ * decision turns on HALF of one (`ledgerAmountEpsilon`, `PAYMENT_PRESENT_EPSILON`), and r15 argued
+ * that the whole unit is nevertheless enough BECAUSE a genuine settlement is a whole multiple of the
+ * minor unit, so the smallest one that exists is twice the epsilon. THE SCALE RULE MAKES THAT
+ * ARGUMENT TRUE OF THE READING; IT DOES NOT MAKE IT TRUE OF THE TOKEN, and for a DIFFERENCE that gap
+ * is still reachable. Measured, in GBP at 2^45 — below the two-decimal bound of 2^46:
+ *
+ *   "35184372088832.0117" and "35184372088832.0040" are 0.0077 apart, which is ABOVE the epsilon, so
+ *   the ledger holds a payment. Both decode to ONE double, whose own decimal reading is
+ *   `35184372088832.01` — SCALE 2, so the scale rule admits both, and the magnitude rule admits both.
+ *   Their exact difference is then zero and the document reads HOLDS_NOTHING.
+ *
+ * The scale rule cannot see this because a double's shortest reading may be SHORTER than the token
+ * that produced it: `35184372088832.003` reads back as `35184372088832`, scale 0. That is harmless
+ * for a SINGLE reading — the value is then within half a spacing of the truth, and every admitted
+ * reading is a whole minor unit apart from the next, so "the reading is zero" still means "the token
+ * was zero". It is NOT harmless for a difference, because two tokens can hide inside ONE rounding
+ * interval and the interval is wider than the epsilon.
+ *
+ * SO THE ARM THAT TAKES A DIFFERENCE GETS THE BOUND ITS OWN DECISION NEEDS, and that bound is
+ * DERIVED FROM THE OTHER ONE rather than written down a second time: the spacing halves with each
+ * binade, so requiring `< bound / 2` is exactly requiring `spacing <= epsilon`. Below it, two tokens
+ * sharing a double are less than one spacing apart, hence at most half a minor unit apart, hence a
+ * ledger that reads as holding nothing IS holding nothing. Above it — the single top binade, and only
+ * ever that one, in every supported precision — the difference is refused and the reversal withheld.
+ *
+ * IT DOES NOT NARROW `parseLedgerAmount`. A single amount is still read to the full bound: the r15
+ * measurement that a whole penny survives at 2^45 and 2^44 stands, and refusing those readings would
+ * refuse money that is provably intact. The two rules differ because their DECISIONS differ, which is
+ * the same reason r15 gave for moving the bound off `readDecimalAsNumber` in the first place.
+ *
+ * WHAT THE REFUSAL COSTS: nothing that exists. For GBP it begins at 35,184,372,088,832 — eight orders
+ * of magnitude above the largest money figure any IMS database holds.
+ */
+export function ledgerDifferenceMagnitudeBound(currency: string | null): number {
+  return ledgerAmountMagnitudeBound(currency) / 2
+}
+
+/**
+ * The settled figure `total - balance`, or NULL because this code cannot prove what it says.
+ *
+ * Both operands have already been admitted by `parseLedgerAmount`, so each is a whole multiple of its
+ * currency's minor unit. That makes their exact difference a whole multiple too — never a sliver
+ * below the epsilon — so the "holds nothing" test on the result is exactly "the two figures are the
+ * same figure". The magnitude check is the one stated above: it is what makes SAME-FIGURE mean the
+ * tokens were within half a minor unit of each other rather than within a whole one.
+ *
+ * The subtraction itself is Decimal and its conversion back goes through `readDecimalAsNumber`, which
+ * is r13's finding and is unchanged: `100.1 - 0.1` is 100.00000000000001 in IEEE-754, and this figure
+ * is compared against a threshold small enough for a four-decimal currency to see that.
+ */
+export function readLedgerDifferenceAsNumber(
+  minuend: number,
+  subtrahend: number,
+  currency: string | null,
+): number | null {
+  const bound = ledgerDifferenceMagnitudeBound(currency)
+  if (Math.abs(minuend) >= bound || Math.abs(subtrahend) >= bound) return null
+  return readDecimalAsNumber(subtractMoney(minuend, subtrahend))
+}
+
 export function parseLedgerAmount(value: unknown, currency: string | null): number | null {
   if (typeof value === 'number') {
     if (!Number.isFinite(value)) return null
@@ -1115,7 +1181,38 @@ export function parseLedgerAmount(value: unknown, currency: string | null): numb
     // round trip cannot serve here and a magnitude rule must. What it establishes is stated at
     // `ledgerAmountMagnitudeBound` and is narrower than "this value is intact": below the bound a
     // difference of one whole minor unit survives the decode. Above it, it does not, so it is refused.
-    return Math.abs(value) < ledgerAmountMagnitudeBound(currency) ? value : null
+    if (Math.abs(value) >= ledgerAmountMagnitudeBound(currency)) return null
+    // o3d-psrx r16 (Codex HIGH 1) — AND THE OTHER HALF OF THE SAME RECOMMENDATION: the SCALE.
+    //
+    // r14 was asked for two things — "reject values whose scale exceeds the stated currency's
+    // supported precision, OR retain exact Decimals throughout" — and shipped only the magnitude. The
+    // residual r15 then had to admit was, by its own definition, a token FINER than its currency's
+    // minor unit, and the argument for admitting it was that the original token is gone.
+    //
+    // THE TOKEN IS GONE; ITS SCALE IS NOT. A double has its own decimal reading — the shortest text
+    // that decodes back to it — and this is the very fact the STRING arm below already turns on. So
+    // the question "is this amount quantized to its currency's minor unit?" can be asked of the double
+    // alone, without the token, and answered by refusing anything that reads back finer.
+    //
+    // WHAT THAT BUYS, EXACTLY. Every admitted number is a whole multiple of its currency's minor unit,
+    // so a decision taken on ONE of them cannot be wrong by less than a whole unit: `zeroPaid` in
+    // `partitionPaymentReversals` now means the reading is EXACTLY zero rather than merely inside half
+    // a unit of it, and a token that decoded to zero was a token that was zero. It also makes the
+    // difference of any two admitted numbers a whole multiple of the minor unit — see
+    // `readLedgerDifferenceAsNumber`, which is where the rest of the guarantee is made.
+    //
+    // WHAT IT COSTS. A ledger figure carrying MORE decimals than its own currency has is refused
+    // rather than read — `1234567.8901` in GBP, `123456789.99` in JPY. That is the fail-closed
+    // direction the finding asked for ("fail closed for numeric-token evidence that cannot be proven
+    // quantized"), and it costs nothing that exists: Xero and QuickBooks both state document totals
+    // and paid amounts rounded to the document's own currency, and an amount that arrives finer than
+    // its currency is precisely the shape this whole round cannot read safely.
+    //
+    // IT IS NOT A REFUSAL OF SMALL PRINT: a quantized token BELOW the bound always reads back at its
+    // own scale or shorter, because below the bound the double spacing is no wider than one minor
+    // unit, so the token itself sits in the rounding interval and nothing longer than it is needed to
+    // name that double. Measured across every supported precision in the tests.
+    return toDecimal(value).decimalPlaces() <= ledgerMinorUnits(currency) ? value : null
   }
   if (typeof value === 'string') {
     const trimmed = value.trim()

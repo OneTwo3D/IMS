@@ -15,7 +15,7 @@ import {
 import {
   ledgerCurrencyCode,
   parseLedgerAmount,
-  readDecimalAsNumber,
+  readLedgerDifferenceAsNumber,
   zeroPaidIsProvenReversal,
   type LedgerReadFence,
   type RegisteredPaymentVerdict,
@@ -24,7 +24,7 @@ import {
   compareDecimal,
   currencyMinorUnits,
   FINEST_SUPPORTED_MINOR_UNITS,
-  subtractMoney,
+  ledgerMinorUnits,
   toDecimal,
   type Decimal,
 } from '@/lib/domain/math/decimal'
@@ -110,46 +110,58 @@ export type QboLedgerAmount = {
 }
 
 /**
- * o3d-psrx r15 (Codex MEDIUM 2) — A MISSING `CurrencyRef` IS NOT AN UNKNOWN CURRENCY.
+ * o3d-psrx r15 (Codex MEDIUM 2), CORRECTED IN r16 (Codex HIGH 2) — WHERE THE MINOR UNIT COMES FROM
+ * WHEN QUICKBOOKS DOES NOT SAY, AND WHY AN IMS GUESS MAY ONLY TIGHTEN IT.
  *
- * QuickBooks omits `CurrencyRef` whenever multicurrency is disabled, which is the ORDINARY shape of
- * an ordinary company's documents rather than an anomaly. r14 mapped that shape to the strictest
- * (four-decimal) magnitude bound on the "unstated means be stricter" rule, and a routine base-currency
- * row was then refused: `TotalAmt = Balance = 600000000000` reads as null/UNPROVEN with no
- * `CurrencyRef` and as HOLDS_NOTHING with `GBP`, though the value fits the money column and sits far
- * below the two-decimal bound. A guard that fires on ordinary documents is a guard somebody deletes.
+ * QuickBooks omits `CurrencyRef` whenever multicurrency is disabled, which is the ORDINARY shape of an
+ * ordinary company's documents rather than an anomaly. r15 read that as a reason to fall back to the
+ * currency of the IMS document the row is linked to, and to size the MAGNITUDE BOUND from it.
  *
- * SO THE CURRENCY IS RESOLVED FROM PROVENANCE BEFORE THE FALLBACK IS REACHED, in this order:
+ * THAT WAS WRONG, AND THE ARGUMENT FOR IT WAS WRONG IN A SPECIFIC WAY WORTH KEEPING WRITTEN DOWN. It
+ * reasoned that a coarser bound only READS more documents while a coarser epsilon DISCARDS more, so
+ * provenance could be spent on the bound and withheld from the epsilon. But reading a document that
+ * should have been refused IS the false-reversal path: the bound exists because a decode can collapse
+ * a minor unit, and admitting a figure whose real currency is finer than the guessed one admits
+ * exactly that collapse. Codex's case: `600000000000.0003` and `600000000000.0002` are one CLF minor
+ * unit apart and decode to the same double; an unverified IMS `GBP` admits both under the two-decimal
+ * bound, the difference is zero, and the ledger reads as holding nothing. THE BOUND IS A SAFETY
+ * MECHANISM, NOT A CONVENIENCE, and an unverified currency must never widen one.
+ *
+ * SO THE RULE IS STRICTEST-WHEN-UNSTATED, AND AN IMS CURRENCY MAY ONLY NARROW:
  *
  *   LEDGER        QuickBooks stated `CurrencyRef`. Authoritative, and it always wins.
  *   IMS_DOCUMENT  the currency of the IMS order or purchase order this row is linked to by
- *                 `accountingInvoiceId`. IMS raised the document, so this is IMS's own record of what
- *                 it is denominated in — the poller has already loaded the row, so nothing is fetched
- *                 and no QuickBooks call is added to obtain it.
- *   NONE          neither could supply one. The strictest bound still applies, AND the refusal it
- *                 produces now says that this is why — see `currencyUnbound`.
+ *                 `accountingInvoiceId` — used ONLY when its minor unit is at least as fine as the
+ *                 unstated fallback, i.e. only where believing it can make no rule looser. Since no
+ *                 supported currency is finer than the fallback, this NEVER widens the bound today and
+ *                 in practice changes nothing; it is written as the RULE rather than as the present
+ *                 coincidence so that adding a five-decimal currency cannot silently turn an IMS guess
+ *                 back into a widening.
+ *   NONE          nothing usable. The strictest bound applies, AND the refusal it produces says that
+ *                 this is why — see `currencyUnbound`.
  *
- * A DURABLY VERIFIED QUICKBOOKS HOME CURRENCY IS NOT AVAILABLE TO BE THE THIRD SOURCE, and that is a
+ * AND THE REGRESSION THAT MOTIVATED r15 WAS NOT ONE. Codex's reproduction needed `600000000000` — six
+ * hundred billion — to reach the strictest bound. The largest absolute value in ANY numeric column of
+ * any IMS database is 11,660, and the largest MONEY figure is 1,100: the case is eight orders of
+ * magnitude above anything real. Refusing an absurd amount whose currency genuinely cannot be
+ * established is correct behaviour, not a regression, and the marker and operator sentence r15 added
+ * are the part of it worth keeping — they name the binding defect instead of silently guessing past it.
+ *
+ * A DURABLY VERIFIED QUICKBOOKS HOME CURRENCY IS NOT AVAILABLE TO BE A THIRD SOURCE, and that is a
  * fact this repository has already established rather than a choice made here: `connectQuickBooks`
  * compares `fetchCompanyInfo`'s `HomeCurrency` against the IMS base currency ONLY when it could read
  * it, stores the binding either way, and persists neither the value nor the fact that it compared.
  * `getBaseCurrencyCode()` is therefore not a stand-in for what the ledger denominates in — the same
  * conclusion `payloadPaymentCurrency` reached in o3d-batch-ret r12, and o3d-emus is the issue that
- * would make such a source exist.
- *
- * WHAT IT IS SPENT ON, AND WHAT IT IS DELIBERATELY NOT. Only the MAGNITUDE BOUND. The other rule
- * sized by the minor unit is `ledgerAmountEpsilon`, and the two fail safe in OPPOSITE directions: a
- * coarser bound READS more documents (which is the regression being fixed), while a coarser epsilon
- * DISCARDS more as nothing and can only move a document towards HOLDS_NOTHING, the one verdict that
- * clears `paidAt`. Provenance is spent where being wrong withholds a reversal and withheld from where
- * being wrong grants one, so no reversal becomes more admissible than it was before this change.
+ * would make such a source exist. Until it does, an unstated currency is read at the finest precision
+ * this repository supports, in EVERY rule sized by the minor unit rather than in some of them.
  */
 export type LedgerCurrencySource = 'LEDGER' | 'IMS_DOCUMENT' | 'NONE'
 
 export type ResolvedLedgerCurrency = {
   /** As QuickBooks stated it, or NULL. Never inferred. */
   stated: string | null
-  /** The code the amounts are READ against — stated, else IMS's, else NULL. */
+  /** The code the amounts are READ against — stated, else an IMS code that can only tighten, else NULL. */
   read: string | null
   source: LedgerCurrencySource
 }
@@ -163,7 +175,13 @@ export function resolveLedgerRowCurrency(
   // Validated through the SAME `ledgerCurrencyCode` the payload goes through: an IMS column holding
   // something that is not an ISO-4217 code is not provenance, it is another unstated currency.
   const ims = ledgerCurrencyCode(imsDocumentCurrency ?? null)
-  if (ims != null) return { stated: null, read: ims, source: 'IMS_DOCUMENT' }
+  // NARROW ONLY. `>=` is the whole rule: a finer minor unit means a smaller magnitude bound and a
+  // smaller epsilon, so believing an unverified code can only make this read STRICTER than the
+  // unstated fallback. A coarser one would loosen a safety mechanism on an unverified guess, which is
+  // the r16 finding.
+  if (ims != null && currencyMinorUnits(ims) >= FINEST_SUPPORTED_MINOR_UNITS) {
+    return { stated: null, read: ims, source: 'IMS_DOCUMENT' }
+  }
   return { stated: null, read: null, source: 'NONE' }
 }
 
@@ -212,6 +230,12 @@ type QboParsedLedgerRow = {
   total: number | null
   balance: number | null
   currency: string | null
+  /**
+   * The code the two amounts were READ against, carried because the SUBTRACTION between them is sized
+   * by the minor unit too and must not re-resolve it from `currency` — which is the STATED code and is
+   * null exactly where the resolved one matters. See `readLedgerDifferenceAsNumber`.
+   */
+  readCurrency: string | null
   currencySource: LedgerCurrencySource
 }
 
@@ -227,6 +251,7 @@ function parseQboLedgerRow(row: QboAmountRow, imsDocumentCurrency: string | null
     // STATED, never resolved: this is the figure the operator warnings and the withheld marker report
     // as the ledger's own, so it must not become an inference. `currencySource` carries the rest.
     currency: currency.stated,
+    readCurrency: currency.read,
     currencySource: currency.source,
   }
 }
@@ -271,19 +296,32 @@ function parseQboCurrency(value: unknown): string | null {
  * ZERO here either: `classifyQboLedgerEvidence` reads a null `paid` as `UNPROVEN`, which WITHHOLDS.
  * A figure this code cannot represent is not permission to declare the payment gone.
  *
- * o3d-psrx r15 (Codex MEDIUM 1) — AND IT TAKES NO CURRENCY, because the magnitude bound no longer
- * belongs to this conversion. The difference is a Decimal this code computed EXACTLY from two figures
- * that were each already admitted by their own arm, so its evidence is intact and the round trip can
- * decide it directly. See `readDecimalAsNumber`.
+ * o3d-psrx r15 (Codex MEDIUM 1) — AND IT TOOK NO CURRENCY, because the magnitude bound belonged to
+ * the arms that decode a token and not to this conversion: the difference is a Decimal this code
+ * computed EXACTLY from two figures already admitted by their own arm, so its own evidence is intact
+ * and the round trip can decide it directly.
+ *
+ * o3d-psrx r16 (Codex HIGH 1) — AND IT TAKES ONE AGAIN, FOR A DIFFERENT REASON. The round trip decides
+ * whether the SUBTRACTION was represented; it says nothing about whether the two operands still stand
+ * far enough apart for their difference to mean anything. Two tokens finer than their minor unit can
+ * decode to ONE double and their exact difference is then zero, which is the false reversal itself. So
+ * the operands are checked against the magnitude at which their decode spacing exceeds the threshold
+ * the difference is about to be compared against — `readLedgerDifferenceAsNumber`, which is where both
+ * halves now live together.
  */
 function qboLedgerAmountFrom(parsed: QboParsedLedgerRow): QboLedgerAmount {
-  const { total, balance, currency, currencySource } = parsed
+  const { total, balance, currency, readCurrency, currencySource } = parsed
   return {
     total,
     outstanding: balance,
-    // Decimal, not float: `100.1 - 0.1` is 100.00000000000001 in IEEE-754, and this figure is
-    // compared against a threshold small enough for a four-decimal currency to see that.
-    paid: total === null || balance === null ? null : readDecimalAsNumber(subtractMoney(total, balance)),
+    // o3d-psrx r16 (Codex HIGH 1): the DIFFERENCE is read by the rule written for a difference, not by
+    // the one written for a single value. Decimal rather than float — `100.1 - 0.1` is
+    // 100.00000000000001 in IEEE-754 and this figure is compared against a threshold small enough for
+    // a four-decimal currency to see that — and refused outright where the two operands' decode
+    // spacing is wider than the threshold their difference is about to be compared against.
+    paid: total === null || balance === null
+      ? null
+      : readLedgerDifferenceAsNumber(total, balance, readCurrency),
     currency,
     currencySource,
   }
@@ -340,7 +378,9 @@ function qboVoidedAmount(currency: string | null, currencySource: LedgerCurrency
  * currency is given the finest precision this repository supports.
  */
 export function ledgerAmountEpsilon(currency: string | null): Decimal {
-  const digits = currency == null ? FINEST_SUPPORTED_MINOR_UNITS : currencyMinorUnits(currency)
+  // r16: through the shared resolver, so this rule and the two magnitude rules cannot drift apart on
+  // what an unstated currency means.
+  const digits = ledgerMinorUnits(currency)
   // Half of 10^-digits, written exactly rather than computed in binary floating point.
   return toDecimal(`0.${'0'.repeat(digits)}5`)
 }
@@ -393,8 +433,11 @@ export type QboLedgerEvidence =
       paidAmount: number | null
       documentTotal: number | null
       /**
-       * o3d-psrx r15 (Codex MEDIUM 2) — TRUE when nothing could say what currency this document's
+       * o3d-psrx r15 (Codex MEDIUM 2) — TRUE when QUICKBOOKS did not say what currency this document's
        * figures are in, so they were read against the strictest minor unit this repository supports.
+       *
+       * r16: an IMS currency may only NARROW the bound, never widen it, so it does not clear this —
+       * the amounts were still sized by the fallback rather than by the ledger's own statement.
        *
        * It is a property of the BINDING and not of the ledger's answer, and it is carried separately
        * for that reason: an UNPROVEN reached this way is not QuickBooks declining to state an amount,
@@ -415,7 +458,12 @@ export function classifyQboLedgerEvidence(amount: QboLedgerAmount | undefined): 
       documentTotal: amount?.total ?? null,
       // An absent row said nothing about a currency either, so there is no binding defect to report;
       // only a row that WAS read and could not be sized carries one.
-      currencyUnbound: amount != null && amount.currencySource === 'NONE',
+      //
+      // r16: NOT-`LEDGER` rather than `NONE`. Since an IMS currency may only NARROW the bound, every
+      // source but the ledger's own read these amounts against the strictest minor unit — which is
+      // exactly what this marker is documented to mean, and the operator sentence it selects is the
+      // one that sends them to fix the binding.
+      currencyUnbound: amount != null && amount.currencySource !== 'LEDGER',
     }
   }
   const { paid, total, outstanding, currency } = amount
@@ -442,7 +490,12 @@ export function classifyQboLedgerEvidence(amount: QboLedgerAmount | undefined): 
   ) {
     return { kind: 'PARTIALLY_PAID', paidAmount: paid, documentTotal: total, outstandingAmount: outstanding, currency }
   }
-  return { kind: 'UNPROVEN', paidAmount: paid, documentTotal: total, currencyUnbound: amount.currencySource === 'NONE' }
+  return {
+    kind: 'UNPROVEN',
+    paidAmount: paid,
+    documentTotal: total,
+    currencyUnbound: amount.currencySource !== 'LEDGER',
+  }
 }
 
 /**

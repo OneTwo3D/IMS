@@ -85,6 +85,20 @@ export function currencyMinorUnits(currency: string): number {
  */
 export const FINEST_SUPPORTED_MINOR_UNITS = 4
 
+/**
+ * The minor-unit digits a LEDGER READ is sized against, for a currency that may not have been stated.
+ *
+ * o3d-psrx r16 — ONE PLACE, BECAUSE THREE RULES NOW ASK THE SAME QUESTION. The magnitude bound, the
+ * scale refusal and the "holds nothing" epsilon are all derived from the document's minor unit, and
+ * each of them had written out `currency == null ? FINEST_SUPPORTED_MINOR_UNITS : currencyMinorUnits(...)`
+ * for itself. Three copies of a fail-safe direction is three chances for one of them to be edited
+ * into the lenient reading, which is the direction that clears `paidAt` over money that is still
+ * there. The direction is stated once, here, and every rule derives from it.
+ */
+export function ledgerMinorUnits(currency: string | null): number {
+  return currency == null ? FINEST_SUPPORTED_MINOR_UNITS : currencyMinorUnits(currency)
+}
+
 function currencyPrecision(currency: string): number {
   const normalizedCurrency = currency.trim().toUpperCase()
   if (!normalizedCurrency) return 2
