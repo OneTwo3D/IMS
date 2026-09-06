@@ -215,40 +215,106 @@
 # 0755, not 0700: the fence runs as the application user and must traverse and read this.
 # Literals, not variables: a trust root chosen by a variable is only as trustworthy as whatever
 # can set it. A deployment that must move it edits these lines.
+#
+# ---------------------------------------------------------------------------
+# AND `readonly`, ON EVERY ONE OF THEM (o3d-secops r2, Codex HIGH)
+# ---------------------------------------------------------------------------
+# The previous round put `readonly` on the publication constants the three ENTRYPOINTS declare and
+# stopped at the file boundary. That left the enforcement everywhere except the file that names the
+# recovery root, the protected tree and THE EXECUTABLE HELPER — one rule, several files, one
+# protected, which is this branch's own recurring defect and the third time it has been found here.
+#
+# The reasoning that made `readonly` right there applies with more force here. A scanner proves a
+# name is assigned exactly once at script scope; that is a claim about ASSIGNMENT SYNTAX, and bash
+# does not need an assignment word to change a variable:
+#
+#     printf -v DB_FENCE_SCRIPT_COPY %s /home/imsapp/evil.mjs
+#     read DB_FENCE_SCRIPT_COPY <<<'/home/imsapp/evil.mjs'
+#     declare -n ref=DB_FENCE_SCRIPT_COPY; ref=/home/imsapp/evil.mjs
+#     (( DB_FENCE_VENDOR_MAX_FILES = 0 ))
+#
+# Not one of those is a `NAME=` word, all four take effect, and the first three of them re-aim the
+# file root EXECUTES with DEPLOY_ADMIN_DATABASE_URL beside it. A mutable path to an executable is a
+# worse hole than a mutable staging directory name. So bash is made the authority, exactly as it was
+# for the entrypoints: `readonly` at the canonical declaration refuses every mutation path including
+# the ones nobody has listed, and the scanner keeps the job it can do.
+#
+# WHICH NAMES, AND WHY THESE. Every name below is declared ONCE in this repository and reassigned
+# NOWHERE — checked before this was applied and asserted by the census in
+# tests/scripts/install-root-safe-writes.test.ts — and each is something the PRIVILEGED mechanism
+# trusts without re-deriving:
+#
+#   the ten PATHS      the recovery root, the identity record, the protected application tree, the
+#                      executable helper inside it, the staging and retired trees a publication
+#                      renames through, the artefact digest record and its per-file manifest, and
+#                      the two root-owned operator wrappers. Re-aim any one of them and a run that
+#                      reports a protected artefact is reading, writing or EXECUTING somewhere else.
+#
+#   the two DIGESTS    ${DB_FENCE_EXPECTED_SHA256} and ${DB_FENCE_EXPECTED_ARTEFACT_SHA256} are what
+#                      AUTHENTICATES a rotation. They are inputs to the privileged invocation and
+#                      are derived from the environment HERE, once; a later write to either is a
+#                      forged authentication, which is the same hole as a re-aimed path and not a
+#                      smaller one. Anything that wants to vary them sets the environment variable
+#                      this line reads, which is the route an operator has.
+#
+#   the two VENDOR     ${DB_FENCE_VENDOR_ROOTS} decides which packages are copied into the tree that
+#   POLICY constants   is executed, and ${DB_FENCE_VENDOR_MAX_FILES} is the bound on what a manifest
+#                      in the checkout can talk root into copying under /etc. Both are decisions
+#                      about the executable surface.
+#
+#   the two STRINGS    ${DB_FENCE_ARTEFACT_RECIPE} is the recorded definition of what "wholly
+#                      digested" means, and ${DB_FENCE_ARTEFACT_SOURCE_TEXT} is the one answer every
+#                      refusal gives to "where do I get that digest". Both are read by an operator
+#                      deciding whether to trust a tree; a rewritten one misdirects that decision.
+#
+# WHAT IS DELIBERATELY NOT READONLY, and it is not a residue: the report variables further down
+# (${DB_FENCE_ROTATION_NOTE}, ${DB_FENCE_SEAL_REASON}, the five ${DB_FENCE_PROBE_*} and
+# ${DB_FENCE_SOURCE_UNTRUSTED_PATH}) are WRITTEN BY THIS LIBRARY'S OWN FUNCTIONS — they are how it
+# reports — so `readonly` would break the mechanism rather than protect it. ${DB_FENCE_SUDO_PREFIX}
+# is assigned twice by construction (a default, then a conditional) and is a display prefix resolved
+# from PATH. The census names each of them with that reason, so a NEW declaration added here is in
+# neither list and FAILS until somebody classifies it — a path added later is covered by the rule
+# rather than silently outside it.
+#
+# THE HARNESSES DID NOT WEAKEN THIS. Every fence harness used to source this file and then reassign
+# these paths at a scratch directory, which `readonly` refuses. They now substitute the ONE literal
+# below — ${DB_FENCE_RECOVERY_DIR} — in the shipped text before sourcing it, and the nine paths
+# composed from it are composed by THIS FILE, unchanged, `readonly` and all. See
+# tests/scripts/fence-artefact-harness.ts.
 # ---------------------------------------------------------------------------
 
-DB_FENCE_RECOVERY_DIR="/etc/ims-cutover-recovery"
-DB_FENCE_IDENTITY_FILE="${DB_FENCE_RECOVERY_DIR}/db-fence-identity.env"
-DB_FENCE_PROTECTED_APP_DIR="${DB_FENCE_RECOVERY_DIR}/app"
-DB_FENCE_SCRIPT_COPY="${DB_FENCE_PROTECTED_APP_DIR}/scripts/fence-db-connections.mjs"
+readonly DB_FENCE_RECOVERY_DIR="/etc/ims-cutover-recovery"
+readonly DB_FENCE_IDENTITY_FILE="${DB_FENCE_RECOVERY_DIR}/db-fence-identity.env"
+readonly DB_FENCE_PROTECTED_APP_DIR="${DB_FENCE_RECOVERY_DIR}/app"
+readonly DB_FENCE_SCRIPT_COPY="${DB_FENCE_PROTECTED_APP_DIR}/scripts/fence-db-connections.mjs"
 # The whole artefact is assembled here and renamed into place in one step; the previous one is
 # moved aside under this name so a failed swap leaves the OLD tree standing rather than none.
-DB_FENCE_STAGED_APP_DIR="${DB_FENCE_RECOVERY_DIR}/.app.staged"
-DB_FENCE_RETIRED_APP_DIR="${DB_FENCE_RECOVERY_DIR}/.app.retired"
+readonly DB_FENCE_STAGED_APP_DIR="${DB_FENCE_RECOVERY_DIR}/.app.staged"
+readonly DB_FENCE_RETIRED_APP_DIR="${DB_FENCE_RECOVERY_DIR}/.app.retired"
 # What the published tree hashes to, and the per-file manifest that says WHICH file moved when it
 # stops matching. Root-owned, beside the tree and not inside it: a record that lived in the tree
 # would be part of its own digest.
-DB_FENCE_ARTEFACT_FILE="${DB_FENCE_RECOVERY_DIR}/db-fence-artefact.sha256"
-DB_FENCE_MANIFEST_FILE="${DB_FENCE_RECOVERY_DIR}/db-fence-artefact.manifest"
+readonly DB_FENCE_ARTEFACT_FILE="${DB_FENCE_RECOVERY_DIR}/db-fence-artefact.sha256"
+readonly DB_FENCE_MANIFEST_FILE="${DB_FENCE_RECOVERY_DIR}/db-fence-artefact.manifest"
 # The two commands an operator is ever given. Root-owned, generated by root at fence time with
 # this run's state file and connection identity baked in, so that what is PRINTED is a path that
 # exists and runs — see db_fence_publish_operator_wrappers().
-DB_FENCE_RELEASE_WRAPPER="${DB_FENCE_RECOVERY_DIR}/release-db-fence"
-DB_FENCE_REFENCE_WRAPPER="${DB_FENCE_RECOVERY_DIR}/refence-db"
+readonly DB_FENCE_RELEASE_WRAPPER="${DB_FENCE_RECOVERY_DIR}/release-db-fence"
+readonly DB_FENCE_REFENCE_WRAPPER="${DB_FENCE_RECOVERY_DIR}/refence-db"
 
 # The bare specifiers the entry file imports. The transitive closure is resolved from these; a
 # test asserts this list is exactly the set of bare imports in scripts/fence-db-connections.mjs,
 # so adding an import without vendoring it fails the suite rather than the cutover.
-DB_FENCE_VENDOR_ROOTS=(pg)
+readonly DB_FENCE_VENDOR_ROOTS=(pg)
 # A cap on what a package.json in the checkout can talk this into copying under /etc. The real
 # closure is ~140 files; a manifest that declares `next` as a dependency of `pg` would otherwise
 # vendor several hundred megabytes. Exceeding it is a refusal, with the count named.
-DB_FENCE_VENDOR_MAX_FILES=2000
+readonly DB_FENCE_VENDOR_MAX_FILES=2000
 
 # THE DOCUMENTED RECIPE, AS ONE STRING. The library hashes with exactly these bytes and
 # docs/installation.md prints exactly this line; a test asserts the three agree and that running
 # it reproduces the recorded digest.
-DB_FENCE_ARTEFACT_RECIPE="find . -type f -printf '%P\\0' | LC_ALL=C sort -z | xargs -0 -r sha256sum -- | sha256sum"
+readonly DB_FENCE_ARTEFACT_RECIPE="find . -type f -printf '%P\\0' | LC_ALL=C sort -z | xargs -0 -r sha256sum -- | sha256sum"
 
 # WHERE THE WHOLE-TREE DIGEST COMES FROM, AS ONE STRING (o3d-2sm1.5 r34, Codex CRITICAL).
 #
@@ -257,13 +323,13 @@ DB_FENCE_ARTEFACT_RECIPE="find . -type f -printf '%P\\0' | LC_ALL=C sort -z | xa
 # where a first-ever install gets it. Stated once here so the two refusals, the entrypoints and
 # docs/installation.md cannot drift into three different answers — which is the defect this whole
 # library was made a library to avoid. A test asserts the doc page contains it verbatim.
-DB_FENCE_ARTEFACT_SOURCE_TEXT="WHERE THAT VALUE COMES FROM, ON A FIRST-EVER INSTALL AS MUCH AS ON ANY OTHER: it is published WITH THE RELEASE. The release is built on a host that is not this one — a clean checkout of the tag, 'npm ci', then 'bash scripts/update.sh --print-fence-digest', which assembles exactly this tree, prints the line 'THE FENCE ARTEFACT THIS CHECKOUT WOULD PUBLISH HASHES TO <digest>', and neither writes nor executes any part of it. That mode exists BECAUSE the build host has no installation: it resolves the tree from the checkout the command was typed out of, needs no application directory, no .env, no port, no database and no root, and it runs before every gate the update path would otherwise refuse at — and that digest is published with the release checksums. A host that has ALREADY published this release will also report it: grep '^fence_artefact_sha256=' ${DB_FENCE_ARTEFACT_FILE} there. Running either that mode or --dry-run on THIS box prints the same kind of line, but assembled from the checkout under question, so it can CONFIRM the release's value and never stand in for it. The other way out needs no digest at all: bootstrap from a source only this account can write — install the release tree as root and take group and other write off it — and the provenance question answers itself."
+readonly DB_FENCE_ARTEFACT_SOURCE_TEXT="WHERE THAT VALUE COMES FROM, ON A FIRST-EVER INSTALL AS MUCH AS ON ANY OTHER: it is published WITH THE RELEASE. The release is built on a host that is not this one — a clean checkout of the tag, 'npm ci', then 'bash scripts/update.sh --print-fence-digest', which assembles exactly this tree, prints the line 'THE FENCE ARTEFACT THIS CHECKOUT WOULD PUBLISH HASHES TO <digest>', and neither writes nor executes any part of it. That mode exists BECAUSE the build host has no installation: it resolves the tree from the checkout the command was typed out of, needs no application directory, no .env, no port, no database and no root, and it runs before every gate the update path would otherwise refuse at — and that digest is published with the release checksums. A host that has ALREADY published this release will also report it: grep '^fence_artefact_sha256=' ${DB_FENCE_ARTEFACT_FILE} there. Running either that mode or --dry-run on THIS box prints the same kind of line, but assembled from the checkout under question, so it can CONFIRM the release's value and never stand in for it. The other way out needs no digest at all: bootstrap from a source only this account can write — install the release tree as root and take group and other write off it — and the provenance question answers itself."
 
 # The expected digests, from the ROOT INVOCATION and from nowhere else. Never read out of the
 # checkout, never out of ${APP_DIR}/.env — both are writable by the account this authenticates
 # against, and a digest that source can set authenticates nothing.
-DB_FENCE_EXPECTED_SHA256="${IMS_FENCE_SCRIPT_SHA256:-}"
-DB_FENCE_EXPECTED_ARTEFACT_SHA256="${IMS_FENCE_ARTEFACT_SHA256:-}"
+readonly DB_FENCE_EXPECTED_SHA256="${IMS_FENCE_SCRIPT_SHA256:-}"
+readonly DB_FENCE_EXPECTED_ARTEFACT_SHA256="${IMS_FENCE_ARTEFACT_SHA256:-}"
 
 # Why a divergence was not promoted, or why a rotation was refused. Printed by the caller; empty
 # when there is nothing to say.
