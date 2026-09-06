@@ -10,7 +10,11 @@ import {
   type RegisteredPaymentRow,
   type XeroInvoice,
 } from '@/lib/connectors/xero/invoice-delta'
-import { qboLedgerAmount, qboWithheldReversalReason } from '@/lib/connectors/quickbooks/payment-poller'
+import {
+  classifyQboLedgerEvidence,
+  qboLedgerAmount,
+  qboWithheldReversalReason,
+} from '@/lib/connectors/quickbooks/payment-poller'
 
 /**
  * o3d-psrx r3 (Codex HIGH) — ONE CASE TABLE, BOTH ENTRY POINTS.
@@ -213,10 +217,14 @@ test('[o3d-psrx r3] every withheld verdict can tell an operator what to do about
     { verdict: 'REGISTRATION_UNDECIDED' as const, entryIds: ['log_1'] },
     { verdict: 'STILL_HELD' as const, paymentIds: ['PAY-1'] },
     // o3d-psrx r8: the two ways the ledger can fail to show a zero, and they ask the operator for
-    // DIFFERENT things — reconcile a payment that is visibly still applied, versus go and look at a
-    // document whose figures IMS could not read at all.
-    { verdict: 'LEDGER_NOT_PROVEN_ZERO_PAID' as const, paidAmount: 50, documentTotal: 100 },
+    // DIFFERENT things — go and look at figures that do not describe a removal, versus go and look at
+    // a document whose figures IMS could not read at all.
+    { verdict: 'LEDGER_NOT_PROVEN_ZERO_PAID' as const, paidAmount: 100, documentTotal: 100 },
     { verdict: 'LEDGER_NOT_PROVEN_ZERO_PAID' as const, paidAmount: null, documentTotal: null },
+    // o3d-psrx r9: and the one that is not a failure to establish anything. It belongs in this census
+    // because it is withheld like the rest — and it is the one whose sentence has the most work to do,
+    // since it is the only withheld state IMS will never resolve by itself.
+    { verdict: 'LEDGER_PART_PAYMENT_REMOVED' as const, paidAmount: 50, documentTotal: 100, removedAmount: 50 },
   ]
   const reasons = withheld.map((v) => qboWithheldReversalReason(v))
   for (const reason of reasons) {
@@ -332,7 +340,7 @@ test('[o3d-psrx r4] the binding narrows the evidence; it never admits a reversal
 })
 
 // ---------------------------------------------------------------------------
-// o3d-psrx r8 (Codex HIGH 2) — THE PRECONDITION THE TABLE ABOVE PRESUMES.
+// o3d-psrx r8 (Codex HIGH 2) — THE UNSTATED FACT THE TABLE ABOVE PRESUMES.
 //
 // `zeroPaidIsProvenReversal` answers "may a ZERO-PAID document clear `paidAt`". Its subject is not
 // established by any of the evidence in this file: the classifier reads registrations, receipts and
@@ -395,11 +403,17 @@ test('[o3d-psrx r8] the two ways the zero is unproven do not borrow each other\'
   // sentence and differ only where a figure is interpolated still pass it, distinct and both wrong.
   // Collapse the branch and the unreadable case reports "QuickBooks still shows null of this document
   // as PAID", which is not a smaller answer: it is an assertion about money nobody established.
+  // r9 CHANGED THE FIXTURE, and the change is the finding. `paidAmount: 50, documentTotal: 100` is no
+  // longer this verdict at all — a MEASURED partial loss is `LEDGER_PART_PAYMENT_REMOVED` now — so
+  // testing this branch with it would be testing a state the gate cannot produce. What is left here is
+  // a figure that does not describe a removal: the ledger reporting the document still fully paid.
   const measured = qboWithheldReversalReason({
-    verdict: 'LEDGER_NOT_PROVEN_ZERO_PAID', paidAmount: 50, documentTotal: 100,
+    verdict: 'LEDGER_NOT_PROVEN_ZERO_PAID', paidAmount: 100, documentTotal: 100,
   })
-  assert.match(measured, /\b50\b/, 'a measured amount must name what QuickBooks is still holding')
-  assert.match(measured, /\b100\b/, 'and what it is a part OF, which is the operator\'s next question')
+  assert.match(measured, /\b100\b/, 'a stated amount must be named, or the operator has nothing to check against')
+  assert.doesNotMatch(measured, /part of the money missing|has been removed/i,
+    'and it must NOT describe a removal: nothing here has been shown to be missing, and this branch '
+    + 'saying otherwise is exactly the assertion-about-unestablished-money r9 split out')
 
   const unreadable = qboWithheldReversalReason({
     verdict: 'LEDGER_NOT_PROVEN_ZERO_PAID', paidAmount: null, documentTotal: null,
@@ -409,4 +423,107 @@ test('[o3d-psrx r8] the two ways the zero is unproven do not borrow each other\'
     + 'to look at the document precisely because IMS has no figure for it')
   assert.match(unreadable, /could not read|not.*read|without stating/i,
     'and it must say that is why, or the warning is indistinguishable from the measured one')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-psrx r9 (Codex HIGH) — A PARTIAL CHARGEBACK IS A MEASUREMENT, NOT AN UNCERTAINTY.
+//
+// r8 closed a false full-reversal by refusing to reverse anything the ledger had not been shown to
+// hold NOTHING on. Codex's finding is what that cost: every non-zero answer went into ONE verdict
+// meaning "IMS could not establish this", including the case where IMS established it perfectly.
+// A 100 document covered by two 50 payments, one removed, is `TotalAmt = 100, Balance = 50` — stable,
+// unambiguous, and the same on every future poll. Filed under "unproven", with `paidAt` left set, it
+// was in practice absorbed as "still paid" and there was nothing in IMS to find it by.
+//
+// The split changes NO reversal decision. What it changes is what the record can say, which is the
+// whole of the fix — reconciling a partial chargeback is o3d-x9tp and is deliberately not built.
+// ---------------------------------------------------------------------------
+
+test('[o3d-psrx r9] a measured partial loss and an evidence absence are different answers', () => {
+  const cases: Array<{ name: string; amount: Parameters<typeof classifyQboLedgerEvidence>[0]; expect: ReturnType<typeof classifyQboLedgerEvidence> }> = [
+    {
+      name: 'CODEX\'S CASE: one of two 50 payments removed from a 100 document',
+      amount: { paid: 50, total: 100 },
+      expect: { kind: 'PART_REMOVED', paidAmount: 50, documentTotal: 100, removedAmount: 50 },
+    },
+    {
+      name: 'every payment removed — the zero the admitting arms are written about',
+      amount: { paid: 0, total: 100 },
+      expect: { kind: 'HOLDS_NOTHING' },
+    },
+    {
+      name: 'THE CONTROL THAT STOPS THIS CRYING WOLF: the ledger still holds the WHOLE document',
+      amount: { paid: 100, total: 100 },
+      // Nothing is missing from it, so there is no loss to report. Classified UNPROVEN rather than
+      // PART_REMOVED because "paid equals the total" is not a partial anything — and a rule that
+      // called it one would raise a loss against every fully-settled document that ever reached the
+      // gate, which is how an operator learns to ignore the warnings that are real.
+      expect: { kind: 'UNPROVEN', paidAmount: 100, documentTotal: 100 },
+    },
+    {
+      name: 'within the epsilon of the total — still nothing missing',
+      amount: { paid: 99.999, total: 100 },
+      expect: { kind: 'UNPROVEN', paidAmount: 99.999, documentTotal: 100 },
+    },
+    {
+      name: 'a figure QuickBooks would not state',
+      amount: { paid: null, total: null },
+      expect: { kind: 'UNPROVEN', paidAmount: null, documentTotal: null },
+    },
+    {
+      name: 'an amount held, against a total the payload did not state — the loss cannot be quantified',
+      amount: { paid: 50, total: null },
+      expect: { kind: 'UNPROVEN', paidAmount: 50, documentTotal: null },
+    },
+    {
+      name: 'a NEGATIVE paid amount — over-credited, and `total - paid` would invent a loss bigger than the document',
+      amount: { paid: -25, total: 100 },
+      expect: { kind: 'UNPROVEN', paidAmount: -25, documentTotal: 100 },
+    },
+    {
+      name: 'a document this read said NOTHING about is not a document with nothing on it',
+      amount: undefined,
+      expect: { kind: 'UNPROVEN', paidAmount: null, documentTotal: null },
+    },
+  ]
+  for (const c of cases) {
+    assert.deepEqual(classifyQboLedgerEvidence(c.amount), c.expect, c.name)
+  }
+  // AND THE MEASUREMENT IS A MEASUREMENT: whatever else changes, the part that is gone plus the part
+  // still held is the document. A `removedAmount` that does not reconcile is worse than none.
+  const measured = classifyQboLedgerEvidence({ paid: 30, total: 100 })
+  assert.equal(measured.kind, 'PART_REMOVED')
+  if (measured.kind !== 'PART_REMOVED') return
+  assert.equal(measured.paidAmount + measured.removedAmount, measured.documentTotal)
+})
+
+test('[o3d-psrx r9] a partial chargeback withholds exactly as the verdict it was split out of', () => {
+  // THE SPLIT MUST MOVE NO MONEY. If separating the measured case had made it ADMIT, r9 would have
+  // re-opened the very defect r8 closed — a full chargeback credit note raised over the half
+  // QuickBooks never gave back.
+  assert.equal(
+    zeroPaidIsProvenReversal({
+      verdict: 'LEDGER_PART_PAYMENT_REMOVED', paidAmount: 50, documentTotal: 100, removedAmount: 50,
+    }),
+    false,
+    'the ledger is still holding half of this document, so the whole of it has plainly not been given back',
+  )
+})
+
+test('[o3d-psrx r9] the partial-chargeback warning quantifies the loss and says IMS will not fix it', () => {
+  const reason = qboWithheldReversalReason({
+    verdict: 'LEDGER_PART_PAYMENT_REMOVED', paidAmount: 40, documentTotal: 100, removedAmount: 60,
+  })
+  // ALL THREE FIGURES. "Part of it is gone" is not actionable; "60 of 100 is gone and 40 is still
+  // applied" is what an operator reconciles against.
+  assert.match(reason, /\b40\b/, 'what QuickBooks is still holding')
+  assert.match(reason, /\b100\b/, 'what it is a part OF')
+  assert.match(reason, /\b60\b/, 'and the amount that was actually removed — the figure nothing else states')
+  // AND THE SENTENCE THAT MAKES IT AN OUTSTANDING ITEM RATHER THAN A CURIOSITY. Every other withheld
+  // verdict describes something IMS expects to settle by itself. This one must say the opposite, or an
+  // operator reasonably files it with them and waits for a poll that is never coming.
+  assert.match(reason, /WILL NOT correct that by itself/,
+    'the operator has to be told IMS does not reconcile a partial chargeback — there is no partial '
+    + 'credit-note path (o3d-x9tp), so waiting for one is waiting for ever')
+  assert.match(reason, /paidAt was LEFT SET/, 'and that IMS still shows the document as paid meanwhile')
 })

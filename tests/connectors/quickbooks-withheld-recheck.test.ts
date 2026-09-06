@@ -106,8 +106,16 @@ mock.module('@/lib/connectors/quickbooks/api', {
         return { ok: true, data: { QueryResponse: { [entity]: rows } } }
       }
       // THE DELTA READS, which only ever see what changed since the watermark.
+      //
+      // o3d-psrx r9: and they answer with the WHOLE ROW, because `qboQuery` issues `SELECT *` and the
+      // amounts r8 made load-bearing are on it. Returning a bare `{ Id }` here — as this double did
+      // until r9 — models a QuickBooks that states no figures at all, under which EVERY delta-found
+      // reversal is withheld as unreadable and no test in this file can reach the reversal path it is
+      // about. That is what silently broke the fence control below: it asserted a reversal that the
+      // double had made impossible, for a reason having nothing to do with the fence.
       if (where?.startsWith('Balance > ')) {
-        return { ok: true, data: { QueryResponse: { [entity]: state.deltaBalanceDue.map((Id) => ({ Id })) } } }
+        const rows = state.deltaBalanceDue.map((Id) => state.qboDocuments.get(Id) ?? { Id })
+        return { ok: true, data: { QueryResponse: { [entity]: rows } } }
       }
       return { ok: true, data: { QueryResponse: {} } }
     },
@@ -407,4 +415,136 @@ test('a database fence that could not be read makes the poll INCOMPLETE, not cle
     + 'that did not do its job, not a clean one')
   assert.ok(result.errors.some((e) => /database clock could not be read/.test(e)),
     `the reason must be reported. Saw: ${JSON.stringify(result.errors)}`)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-psrx r9 (Codex HIGH) — THE PARTIAL CHARGEBACK, END TO END.
+//
+// r8's gate refuses to reverse a document the ledger has not been shown to hold NOTHING on. Codex's
+// finding is what that did to the case where the ledger states its position perfectly: a 100 document
+// covered by two 50 payments, one of them removed. `paidAt` stays set — which is right — and the
+// verdict said only "IMS could not establish this", which is false and is what made the loss
+// unfindable. The tests below drive the real poller and assert on what the MARKER carries, because the
+// marker is the whole of what an operator has: there is no partial-reversal accounting path (o3d-x9tp)
+// and IMS will never settle this document by itself.
+// ---------------------------------------------------------------------------
+
+test('[o3d-psrx r9] a PARTIAL QuickBooks chargeback is recorded and quantified, not absorbed as paid', async () => {
+  reset()
+  state.salesOrders = [paidOrderRow()]
+  // A registration that PROVABLY posted before the read, so the registration half of the gate would
+  // ADMIT. Without this the test could pass on the document being undecidable for some other reason,
+  // and would say nothing about the amount rule at all.
+  state.syncLogs = [postedRegistration()]
+  // TotalAmt 100, Balance 50: one of the two payments given back, the other still applied.
+  state.qboDocuments.set('QI1', { Id: 'QI1', Balance: 50, TotalAmt: 100 })
+  state.deltaBalanceDue = ['QI1']
+
+  const first = await poll()
+
+  // NOTHING IS REVERSED, which is r8's rule and is unchanged.
+  assert.equal(first.salesReversed, 0, 'reversing the whole document would credit the 50 QuickBooks kept')
+  assert.deepEqual(state.chargebacks, [], 'and no chargeback credit note is raised over it')
+  assert.deepEqual(state.salesOrderUpdates.filter((u) => u.data.paidAt === null), [])
+
+  // ...AND THE LOSS IS ON THE RECORD AS A LOSS. This is r9: before it, the marker said
+  // LEDGER_NOT_PROVEN_ZERO_PAID — the same thing it says about a payload IMS cannot parse — so a
+  // measured partial chargeback and an unreadable response were one row and neither could be found.
+  assert.equal(first.partialPaymentsRemoved, 1,
+    'the poll must count this apart from the withheld verdicts that are merely undecided: it is the '
+    + 'only one that will never resolve on its own')
+  const marker = state.activity.find((a) => a.action === 'payment_reversal_withheld')
+  assert.ok(marker, 'the withheld verdict must leave a durable marker — it is the only way back')
+  assert.equal(marker.metadata?.registrationVerdict, 'LEDGER_PART_PAYMENT_REMOVED',
+    'and the marker must say WHICH withheld state this is, or a measured loss is indistinguishable '
+    + 'from a figure IMS could not read')
+  // THE FIGURES AS FIELDS, not only inside the sentence: the number has to be queryable, or the only
+  // way to find every unreconciled partial chargeback is to read English.
+  assert.equal(marker.metadata?.partialPaymentRemoved, true)
+  assert.equal(marker.metadata?.ledgerPaidAmount, 50)
+  assert.equal(marker.metadata?.documentTotal, 100)
+  assert.equal(marker.metadata?.removedAmount, 50)
+  assert.match(String(marker.description), /50/)
+  assert.match(String(marker.description), /100/)
+  assert.match(String(marker.description), /WILL NOT correct that by itself/,
+    'the operator must be told IMS does not reconcile this, or they wait for a poll that never comes')
+
+  // ---- AND IT COMES BACK, for ever, off the delta cursor. A stable partial chargeback never reaches
+  // a zero paid amount, so nothing about it resolves — which is exactly why it must not be closed.
+  state.deltaBalanceDue = []
+  ageMarkers(HOUR + 60_000)
+  const markersBefore = state.activityRows.filter((r) => r.action === 'payment_reversal_withheld').length
+
+  const second = await poll()
+  assert.equal(second.withheldRechecked, 1)
+  assert.equal(second.partialPaymentsRemoved, 1, 'the recheck reaches the same measured answer')
+  assert.equal(second.salesReversed, 0)
+  assert.equal(state.activityRows.filter((r) => r.action === 'payment_reversal_withheld').length,
+    markersBefore + 1, 'the marker is REWRITTEN, which restarts its timer and keeps the page a round robin')
+  assert.equal(state.activity.some((a) => a.action === 'payment_reversal_withheld_cleared'), false,
+    'and it is NOT closed: a loss nobody has acted on is not a settled document')
+})
+
+test('[o3d-psrx r9] CONTROL: a FULL chargeback on the same order still reverses on the zero proof', async () => {
+  // The same order, the same registration, the same delta — differing ONLY in what QuickBooks says it
+  // still holds. Without this the test above is satisfied by a poller that withholds everything, which
+  // would be a worse defect than the one r9 fixes.
+  reset()
+  state.salesOrders = [paidOrderRow()]
+  state.syncLogs = [postedRegistration()]
+  state.qboDocuments.set('QI1', { Id: 'QI1', Balance: 100, TotalAmt: 100 })
+  state.deltaBalanceDue = ['QI1']
+
+  const result = await poll()
+  assert.equal(result.salesReversed, 1,
+    'QuickBooks states it holds NOTHING on this document, which is the proof r8 requires — the '
+    + 'partial verdict must narrow what reverses, not switch the reversal pass off')
+  assert.equal(result.partialPaymentsRemoved, 0, 'and nothing partial is reported about it')
+  assert.deepEqual(state.chargebacks, ['so_1'])
+  assert.deepEqual(state.salesOrderUpdates.filter((u) => u.data.paidAt === null).map((u) => u.id), ['so_1'])
+})
+
+test('[o3d-psrx r9] an ordinary FULLY PAID document produces no marker and no partial report', async () => {
+  // THE TEST THAT STOPS THE FIX CRYING WOLF. A rule that read every "paid is less than the total" as a
+  // partial loss would fire on documents that have nothing wrong with them, and an operator shown a
+  // loss on a settled order learns to ignore the ones that are real.
+  reset()
+  state.salesOrders = [paidOrderRow()]
+  state.syncLogs = [postedRegistration()]
+  // Balance 0: QuickBooks holds the whole 100. It is therefore not in the `Balance > 0` delta at all.
+  state.qboDocuments.set('QI1', { Id: 'QI1', Balance: 0, TotalAmt: 100 })
+  state.deltaBalanceDue = []
+
+  const clean = await poll()
+  assert.equal(clean.salesReversalsWithheld, 0)
+  assert.equal(clean.partialPaymentsRemoved, 0)
+  assert.equal(clean.salesReversed, 0)
+  assert.equal(state.activity.some((a) => a.action === 'payment_reversal_withheld'), false,
+    'a document nobody has a disagreement about must leave no marker whatever')
+
+  // ---- AND THE SAME THING SAID THROUGH THE LIFECYCLE: a partial chargeback that is PUT RIGHT stops
+  // being reported. This is the one route by which a fully-paid document reaches the recheck at all,
+  // and it must close the marker rather than write another partial one.
+  reset()
+  state.salesOrders = [paidOrderRow()]
+  state.syncLogs = [postedRegistration()]
+  state.qboDocuments.set('QI1', { Id: 'QI1', Balance: 50, TotalAmt: 100 })
+  state.deltaBalanceDue = ['QI1']
+
+  const partial = await poll()
+  assert.equal(partial.partialPaymentsRemoved, 1, 'the precondition: there IS an open partial loss to settle')
+
+  // The operator re-applies the payment in QuickBooks. Nothing else changes.
+  state.qboDocuments.set('QI1', { Id: 'QI1', Balance: 0, TotalAmt: 100 })
+  state.deltaBalanceDue = []
+  ageMarkers(HOUR + 60_000)
+
+  const settled = await poll()
+  assert.equal(settled.withheldRechecked, 1)
+  assert.equal(settled.partialPaymentsRemoved, 0,
+    'the document is whole again, so there is no loss left to report')
+  assert.equal(settled.withheldResolved, 1)
+  assert.ok(state.activity.some((a) => a.action === 'payment_reversal_withheld_cleared'),
+    'and the marker is CLOSED — an unreconciled loss that has been reconciled must leave the page')
+  assert.equal(settled.salesReversed, 0, 'nothing is reversed: the document is fully paid')
 })

@@ -1404,6 +1404,42 @@ export type RegisteredPaymentVerdict =
    * than a measurement.
    */
   | { verdict: 'LEDGER_NOT_PROVEN_ZERO_PAID'; paidAmount: number | null; documentTotal: number | null }
+  /**
+   * o3d-psrx r9 (Codex HIGH) — PART OF THE MONEY IS PROVABLY GONE, AND PART OF IT IS PROVABLY STILL
+   * THERE. NEITHER HALF IS A GUESS.
+   *
+   * r8 closed a false full-reversal by refusing to reverse anything the ledger had not been shown to
+   * hold NOTHING on, and it closed it by putting every unproven zero into ONE verdict. That verdict
+   * says "IMS could not establish the ledger's account of this document" — which is true of a payload
+   * that stated no figures, and FALSE of the case Codex actually described: a 100 document covered by
+   * two 50 payments, one of them removed, which QuickBooks states exactly and unambiguously as
+   * `TotalAmt = 100, Balance = 50`. There is nothing undecided about it. IMS holds the document as
+   * fully paid, the ledger holds half of it, and the difference is a partial chargeback that will
+   * still be there on the next poll and the one after that.
+   *
+   * Collapsed into `LEDGER_NOT_PROVEN_ZERO_PAID` that fact was UNRECOVERABLE from IMS's own records:
+   * the marker said only "unproven", so a stable partial loss and a payload IMS could not parse were
+   * the same row, and the loss was in practice absorbed as "still paid" for ever. Separating it is
+   * the whole of what this verdict does — it changes NO reversal decision (see
+   * `zeroPaidIsProvenReversal`, where it withholds exactly as its parent did) and adds no ledger call.
+   * What it changes is what the record says, and therefore what an operator can find.
+   *
+   * `paidAmount` is what the ledger states it STILL holds and `removedAmount` is
+   * `documentTotal - paidAmount` — the part that is gone. All three are numbers, never null: a figure
+   * that could not be read is not this verdict, it is `LEDGER_NOT_PROVEN_ZERO_PAID`, and that
+   * distinction is the reason this one can be trusted to quantify anything.
+   *
+   * IMS DOES NOT RECONCILE IT. There is no partial-reversal accounting path — no partial credit note,
+   * no partial unwind of the recognised revenue — and building one is deliberately out of this
+   * round's scope (o3d-x9tp). This verdict is the durable, quantified statement that the work is
+   * outstanding, carried by the withheld-marker lifecycle so it is rechecked rather than filed away.
+   */
+  | {
+      verdict: 'LEDGER_PART_PAYMENT_REMOVED'
+      paidAmount: number
+      documentTotal: number
+      removedAmount: number
+    }
   /** A registration exists whose effect on the ledger this read cannot speak for. */
   | { verdict: 'REGISTRATION_UNDECIDED'; entryIds: string[] }
 
@@ -1710,6 +1746,12 @@ function sumRegisteredAmounts(rows: readonly RegisteredPaymentRow[]): number | n
  *                               document merely showing a BALANCE DUE has not established it, and a
  *                               part-removed payment is indistinguishable from a fully removed one in
  *                               that predicate. WITHHELD.
+ *   LEDGER_PART_PAYMENT_REMOVED (r9) the same withholding, reached on evidence that is not missing at
+ *                               all: the ledger STATES a non-zero amount still held, short of the
+ *                               document's total. Split out of the verdict above because "IMS could
+ *                               not establish this" and "IMS established that half the money is gone"
+ *                               are opposite claims, and only one of them is an outstanding item
+ *                               somebody has to act on. WITHHELD, and quantified.
  *   REGISTRATION_UNDECIDED      THE DEFECT THIS FUNCTION EXISTS FOR. A PENDING, PROCESSING or FAILED
  *                               registration, or one that synced after the read, may have created a
  *                               payment this snapshot never saw. WITHHELD.
@@ -1756,6 +1798,14 @@ export function zeroPaidIsProvenReversal(verdict: RegisteredPaymentVerdict): boo
     // of which is still held — and reversing on it clears `paidAt` and raises a chargeback credit
     // note over money the ledger is still holding for us.
     case 'LEDGER_NOT_PROVEN_ZERO_PAID':
+    // o3d-psrx r9 (Codex HIGH): the ledger states it is STILL HOLDING part of this document, so the
+    // whole of it plainly has not been given back. Reversing here would raise a chargeback credit
+    // note over the part that never moved — the identical wrong outcome its parent verdict exists to
+    // prevent, and the reason this refinement changes no decision. What it changes is the RECORD: the
+    // withheld marker now carries the measured loss instead of "IMS could not tell", so a partial
+    // chargeback is an outstanding item somebody can find rather than a document that quietly stays
+    // paid. Reconciling it is o3d-x9tp and is not attempted here.
+    case 'LEDGER_PART_PAYMENT_REMOVED':
       return false
   }
 }

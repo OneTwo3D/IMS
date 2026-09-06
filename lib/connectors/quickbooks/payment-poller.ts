@@ -110,6 +110,59 @@ function qboVoidedAmount(): QboLedgerAmount {
 }
 
 /**
+ * o3d-psrx r9 (Codex HIGH) — THE THREE ANSWERS QUICKBOOKS' OWN FIGURES CAN GIVE, AND THEY ARE THREE.
+ *
+ * r8 asked one question of these figures — "has the ledger been shown to hold NOTHING?" — and put
+ * every other answer in one bucket. Codex's finding is that the bucket has two very different things
+ * in it, and lumping them is what makes a partial chargeback disappear:
+ *
+ *   HOLDS_NOTHING   `paid` is zero within the epsilon. This is the state every admitting arm of
+ *                   `zeroPaidIsProvenReversal` is written about, so the registration evidence decides.
+ *   PART_REMOVED    `paid` is POSITIVE and short of a stated `total`. Nothing here is undecided:
+ *                   QuickBooks has stated both figures, so the money still held and the money gone
+ *                   are both measured. It is Codex's 100 document with one of its two 50 payments
+ *                   removed, and it is stable — the same reading will come back on every future poll.
+ *   UNPROVEN        everything else, and every member of it is an ABSENCE rather than a measurement:
+ *                   no row for the document at all, a figure `parseLedgerAmount` would not read, a
+ *                   total that was not stated, or a `paid` that is not a quantity this code can
+ *                   explain (negative — an over-credited document, where "how much is missing" has no
+ *                   honest answer). `paid` equal to the total is here too, deliberately: nothing is
+ *                   missing from it, so it is not a partial loss, and it must not be reported as one.
+ *
+ * THE LAST TWO SENTENCES ARE THE ONES THAT STOP THIS CRYING WOLF. A rule that called every
+ * `paid < total` a partial loss would fire on a document the ledger has fully settled the moment one
+ * ever reached this gate, and an operator who is shown a loss on a document that has none learns to
+ * ignore the ones that are real.
+ *
+ * `PART_REMOVED` carries numbers, never nulls, and that is what its consumers are allowed to rely on:
+ * a verdict that quantifies a loss out of a figure nobody could read would be worse than the silence
+ * it replaced.
+ */
+export type QboLedgerEvidence =
+  | { kind: 'HOLDS_NOTHING' }
+  | { kind: 'PART_REMOVED'; paidAmount: number; documentTotal: number; removedAmount: number }
+  | { kind: 'UNPROVEN'; paidAmount: number | null; documentTotal: number | null }
+
+export function classifyQboLedgerEvidence(amount: QboLedgerAmount | undefined): QboLedgerEvidence {
+  // A document MISSING from the read is not a document with nothing on it: it is one this read said
+  // nothing about, and "we did not hear" is never spent as an answer here or anywhere else in the
+  // lifecycle.
+  if (amount == null || amount.paid == null) return { kind: 'UNPROVEN', paidAmount: null, documentTotal: amount?.total ?? null }
+  const { paid, total } = amount
+  // `Math.abs`, not `> 0`: a paid amount this code cannot explain is not permission to declare the
+  // payment gone. Exactly the reading `partitionPaymentReversals` gives a negative `AmountPaid`,
+  // through the same epsilon, so "the ledger holds nothing" means one thing across both connectors.
+  if (Math.abs(paid) <= PAYMENT_PRESENT_EPSILON) return { kind: 'HOLDS_NOTHING' }
+  // STRICTLY POSITIVE, and short of a total the ledger actually stated. A negative `paid` fails the
+  // first clause rather than being folded into the second, because `total - paid` would then report a
+  // loss LARGER than the document — a figure IMS would be inventing, not measuring.
+  if (paid > PAYMENT_PRESENT_EPSILON && total != null && total - paid > PAYMENT_PRESENT_EPSILON) {
+    return { kind: 'PART_REMOVED', paidAmount: paid, documentTotal: total, removedAmount: total - paid }
+  }
+  return { kind: 'UNPROVEN', paidAmount: paid, documentTotal: total }
+}
+
+/**
  * Split the QBO transactions that regressed out of the fully-paid state into the
  * full reversed set and the subset that was VOIDED. Mirrors the Xero poller's
  * {all, voided} contract (audit-M-acct #3 / scjz.71):
@@ -286,6 +339,24 @@ async function fetchReversedEntityIdsByIds(
  * part-paid document ("Not a reversal, and the IMS document must stay paid: clearing it re-arms the
  * UI over money that has already moved").
  *
+ * AND THE PARAGRAPH ABOVE UNDERSTATED IT, WHICH IS r9's FINDING (Codex HIGH). "When the rest of the
+ * payment goes" is a case, not the case. The STABLE partial chargeback — half given back, half kept,
+ * for ever — never reaches a zero paid amount, so nothing above it ever resolves, and r8 put it in the
+ * same verdict as a payload IMS could not parse. A verdict meaning "IMS could not establish anything"
+ * is the wrong name for a document whose figures IMS read perfectly: it made a measured loss
+ * indistinguishable from an unreadable one and, because the document keeps its `paidAt`, the practical
+ * effect was that the loss was absorbed as "still paid" and nobody could find it again.
+ *
+ * SO IT GETS ITS OWN VERDICT, AND NOTHING ELSE CHANGES. `LEDGER_PART_PAYMENT_REMOVED` withholds
+ * exactly as `LEDGER_NOT_PROVEN_ZERO_PAID` withholds — no reversal decision moves in either direction
+ * — but it carries the three figures, the marker carries them as queryable fields, the poll summary
+ * counts these documents apart from the rest, and the warning tells the operator plainly that IMS will
+ * not reconcile this one. RECONCILING IT — quantifying the removed payment into a partial credit note
+ * and unwinding that much of the recognised revenue — is NOT built here and is filed as o3d-x9tp.
+ * Recording an unreconciled loss and reconciling it are different pieces of work, and a round that
+ * silently did the second because it was doing the first would be putting new money-moving accounting
+ * behind a bug fix.
+ *
  * ONE CORNER OF IT IS NOW CLOSED, and only that corner (r7, Codex HIGH 1). Where the order still
  * carries its off-ledger provenance marker, the SHARED classifier compares what the bound
  * registrations told the ledger against the order's total and withholds when they do not cover it —
@@ -337,20 +408,27 @@ export async function gateQboReversalsOnProvenance<T extends { id: string; accou
     // is what an operator has to go and look at, and no registration evidence can make a document
     // the ledger is still paid on into a proven reversal.
     const amount = doc.accountingInvoiceId == null ? undefined : params.ledgerAmounts.get(doc.accountingInvoiceId)
-    // `Math.abs`, not `> 0`: a paid amount this code cannot explain is not permission to declare the
-    // payment gone. Exactly the reading `partitionPaymentReversals` gives a negative `AmountPaid`,
-    // through the same epsilon, so "the ledger holds nothing" means one thing across both connectors.
-    const zeroPaidProven = amount != null && amount.paid != null && Math.abs(amount.paid) <= PAYMENT_PRESENT_EPSILON
+    // o3d-psrx r9 (Codex HIGH): THREE answers, not two. `classifyQboLedgerEvidence` states them and
+    // says why the third exists; what matters here is that a MEASURED partial loss and an evidence
+    // ABSENCE stop sharing a verdict, so the marker written below can say which one this is.
+    const evidence = classifyQboLedgerEvidence(amount)
     // ONE ADMIT/WITHHOLD DECISION, NOT A SECOND ONE WORDED LIKE IT: the precondition is expressed as
     // a VERDICT and put through the same `zeroPaidIsProvenReversal` every other answer goes through,
     // so a connector added next month cannot reach an admitted reversal past a rule stated here.
-    const verdict = zeroPaidProven
+    const verdict = evidence.kind === 'HOLDS_NOTHING'
       ? verdicts.get(doc.id)
-      : {
-          verdict: 'LEDGER_NOT_PROVEN_ZERO_PAID' as const,
-          paidAmount: amount?.paid ?? null,
-          documentTotal: amount?.total ?? null,
-        }
+      : evidence.kind === 'PART_REMOVED'
+        ? {
+            verdict: 'LEDGER_PART_PAYMENT_REMOVED' as const,
+            paidAmount: evidence.paidAmount,
+            documentTotal: evidence.documentTotal,
+            removedAmount: evidence.removedAmount,
+          }
+        : {
+            verdict: 'LEDGER_NOT_PROVEN_ZERO_PAID' as const,
+            paidAmount: evidence.paidAmount,
+            documentTotal: evidence.documentTotal,
+          }
     // NO VERDICT IS NOT A PASS. An absence means nothing was decided about this document, and the
     // fail-closed reading of "nothing was decided" is the same one a null fence gets: withhold.
     if (verdict == null) {
@@ -407,13 +485,37 @@ export function qboWithheldReversalReason(verdict: RegisteredPaymentVerdict): st
           + 'establish that the payments IMS registered were removed — a payment that is PART of the '
           + 'document produces the same balance. paidAt was LEFT SET and no chargeback credit note '
           + 'was raised. Open the document in QuickBooks to see what is still applied to it.'
-        : `QuickBooks still shows ${verdict.paidAmount} of `
-          + `${verdict.documentTotal == null ? 'this document' : `this document's ${verdict.documentTotal}`} `
-          + 'as PAID, so the balance due is part of the money missing rather than all of it, and IMS '
-          + 'cannot tell from this read which payment survived. Reversing the whole document would '
-          + 'raise a chargeback credit note over money QuickBooks is still holding. paidAt was LEFT '
-          + 'SET. Reconcile the document in QuickBooks; if the rest of the payment goes too, IMS will '
-          + 'reverse it by itself on a later poll.'
+        // o3d-psrx r9 (Codex HIGH): NO LONGER THE PART-PAYMENT SENTENCE. A measured partial loss has
+        // its own verdict now, so what is left here is a figure that does not describe one — a total
+        // QuickBooks would not state, an amount it reports as still fully paid, or a quantity this
+        // code will not subtract. Saying "part of the money is missing" about any of those would be
+        // an assertion about money nobody established, which is the fault the split exists to end.
+        : `QuickBooks answered about this document with figures IMS cannot read a removal out of: it `
+          + `reports ${verdict.paidAmount} still paid `
+          + `${verdict.documentTotal == null
+            ? 'on a document whose total it did not state'
+            : `against a total of ${verdict.documentTotal}`}, which does not show that anything was `
+          + `taken away. paidAt was LEFT SET and no chargeback credit note was raised. Open the `
+          + `document in QuickBooks to see what is applied to it. (A PARTIAL chargeback — part still `
+          + `held, part gone — is reported separately and names the amount that was removed.)`
+    // o3d-psrx r9 (Codex HIGH). THE ONE ARM THAT REPORTS A LOSS RATHER THAN AN UNCERTAINTY, and the
+    // only one that has to tell an operator IMS will not put it right by itself. Every other withheld
+    // sentence above describes something IMS expects to settle — a registration lands, a receipt is
+    // recorded, a figure becomes readable — and says so. This one cannot: the money is measurably
+    // gone, there is no partial-reversal accounting path (o3d-x9tp), and the document will keep
+    // reading as fully paid until a person changes it.
+    case 'LEDGER_PART_PAYMENT_REMOVED':
+      return `QuickBooks has given back part of the payment on this document and is STILL HOLDING the `
+        + `rest: it reports ${verdict.paidAmount} paid of a ${verdict.documentTotal} total, so `
+        + `${verdict.removedAmount} has been removed. That is a PARTIAL chargeback, and IMS does not `
+        + `reverse one: clearing paidAt and raising a full credit note would reverse the `
+        + `${verdict.paidAmount} QuickBooks never gave back. paidAt was LEFT SET, so IMS still shows `
+        + `this document as fully paid and WILL NOT correct that by itself. Either settle the `
+        + `${verdict.removedAmount} in QuickBooks — re-apply the payment and IMS closes this by itself `
+        + `on the next poll — or, if the ${verdict.removedAmount} is genuinely lost, raise the credit `
+        + `note for it by hand and correct the order. This warning is rewritten on every recheck until `
+        + `one of those happens, and if the remaining ${verdict.paidAmount} goes too IMS will reverse `
+        + `the document in full by itself.`
     case 'GONE':
     case 'NOTHING_REGISTERED':
     case 'LEDGER_DID_NOT_LIST_PAYMENTS':
@@ -485,6 +587,29 @@ export type QboBillReversalDoc = Awaited<ReturnType<typeof readQboBillReversalCa
  *   delta window is the only remaining route to it. (A marker that DID land never holds the cursor —
  *   see the note at the withheld loop.)
  */
+/**
+ * o3d-psrx r9 (Codex HIGH) — THE MEASURED LOSS, ON THE MARKER, AS FIELDS RATHER THAN AS PROSE.
+ *
+ * A withheld marker is the durable record and the recheck work item both. For every other verdict
+ * that is enough: the marker says "undecided", and what settles it is a later read. A PARTIAL
+ * chargeback is different in kind — nothing about it is undecided and nothing IMS does will settle
+ * it — so the marker has to carry the QUANTITY, not just the classification, or the only place the
+ * number exists is inside an English sentence nobody can query.
+ *
+ * Written only for the verdict that actually measured something. Emitting nulls for every other
+ * verdict would make `removedAmount IS NOT NULL` useless as the way to find these, which is the one
+ * thing this is for.
+ */
+function withheldMarkerMoney(verdict: RegisteredPaymentVerdict): Record<string, number | boolean> {
+  if (verdict.verdict !== 'LEDGER_PART_PAYMENT_REMOVED') return {}
+  return {
+    partialPaymentRemoved: true,
+    ledgerPaidAmount: verdict.paidAmount,
+    documentTotal: verdict.documentTotal,
+    removedAmount: verdict.removedAmount,
+  }
+}
+
 async function signalWithheldQboReversal(entry: {
   entityType: 'SALES_ORDER' | 'PURCHASE_ORDER'
   entityId: string
@@ -506,6 +631,8 @@ async function signalWithheldQboReversal(entry: {
       connector: QUICKBOOKS_CONNECTOR,
       registrationVerdict: entry.verdict.verdict,
       accountingInvoiceId: entry.accountingInvoiceId,
+      // o3d-psrx r9: and the figures, when there ARE figures. See `withheldMarkerMoney`.
+      ...withheldMarkerMoney(entry.verdict),
     },
     resolveUser: false,
   })
@@ -637,8 +764,11 @@ async function applyQboBillReversal(bill: QboBillReversalDoc): Promise<void> {
  */
 export async function recheckWithheldQboReversals(
   errors: string[],
-): Promise<{ rechecked: number; resolved: number; salesReversed: number; billsReversed: number }> {
-  const out = { rechecked: 0, resolved: 0, salesReversed: 0, billsReversed: 0 }
+): Promise<{ rechecked: number; resolved: number; salesReversed: number; billsReversed: number; partialPaymentsRemoved: number }> {
+  // o3d-psrx r9: `partialPaymentsRemoved` is counted separately from `rechecked` because it is the
+  // one outcome of a recheck that is NOT progress — the document was reconsidered, the answer was the
+  // same measured loss, and nothing IMS does will change it. See the poll summary.
+  const out = { rechecked: 0, resolved: 0, salesReversed: 0, billsReversed: 0, partialPaymentsRemoved: 0 }
   // NO AGE BOUND (o3d-psrx r5, Codex HIGH 2). Every still-open marker is scanned, however old: an
   // outage longer than any horizon is exactly when a withheld reversal must not be dropped, and the
   // page is bounded by DOCUMENTS rather than by time. See the module note in withheld-reversal-markers.
@@ -711,6 +841,7 @@ export async function recheckWithheldQboReversals(
       // rather than a queue with a permanent head. `observe` before the write, not after: "we could
       // not write it down" must never be mistaken for "the disagreement is over".
       stillWithheld.add(withheldEntityKey('SALES_ORDER', order.id))
+      if (verdict.verdict === 'LEDGER_PART_PAYMENT_REMOVED') out.partialPaymentsRemoved++
       await signalWithheldQboReversal({
         entityType: 'SALES_ORDER',
         entityId: order.id,
@@ -738,6 +869,7 @@ export async function recheckWithheldQboReversals(
     })
     for (const { doc: bill, verdict } of gate.withheld) {
       stillWithheld.add(withheldEntityKey('PURCHASE_ORDER', bill.poId))
+      if (verdict.verdict === 'LEDGER_PART_PAYMENT_REMOVED') out.partialPaymentsRemoved++
       await signalWithheldQboReversal({
         entityType: 'PURCHASE_ORDER',
         entityId: bill.poId,
@@ -794,7 +926,7 @@ export async function recheckWithheldQboReversals(
  * Poll QuickBooks for paid invoices and bills.
  * Updates paidAt on matching IMS records and advances order status.
  */
-export async function pollQuickBooksPayments(): Promise<{ salesPaid: number; billsPaid: number; salesReversed: number; billsReversed: number; salesReversalsWithheld: number; billsReversalsWithheld: number; withheldRechecked: number; withheldResolved: number; errors: string[] }> {
+export async function pollQuickBooksPayments(): Promise<{ salesPaid: number; billsPaid: number; salesReversed: number; billsReversed: number; salesReversalsWithheld: number; billsReversalsWithheld: number; partialPaymentsRemoved: number; withheldRechecked: number; withheldResolved: number; errors: string[] }> {
   const errors: string[] = []
   let salesPaid = 0
   let billsPaid = 0
@@ -803,6 +935,13 @@ export async function pollQuickBooksPayments(): Promise<{ salesPaid: number; bil
   // o3d-psrx r3: reversals the provenance gate refused. Reported, never silently dropped.
   let salesReversalsWithheld = 0
   let billsReversalsWithheld = 0
+  // o3d-psrx r9 (Codex HIGH): of those withheld reversals, the ones where QuickBooks stated a MEASURED
+  // partial loss — part of the payment given back, part still held. Counted apart from the rest
+  // because it is the only withheld outcome that will never resolve on its own: every other one is
+  // waiting for something (a registration, a readable figure, a fresh read), and this one is waiting
+  // for a person. A summary that reported it inside `salesReversalsWithheld` would say a poll is
+  // making progress when it is repeating itself.
+  let partialPaymentsRemoved = 0
   // o3d-psrx r4 / o3d-a6i2: withheld documents re-asked off the delta cursor, and the ones that settled.
   let withheldRechecked = 0
   let withheldResolved = 0
@@ -935,6 +1074,7 @@ export async function pollQuickBooksPayments(): Promise<{ salesPaid: number; bil
       // window is the only remaining route back to the document.
       for (const { doc: order, verdict } of gate.withheld) {
         salesReversalsWithheld++
+        if (verdict.verdict === 'LEDGER_PART_PAYMENT_REMOVED') partialPaymentsRemoved++
         const landed = await signalWithheldQboReversal({
           entityType: 'SALES_ORDER',
           entityId: order.id,
@@ -1031,6 +1171,7 @@ export async function pollQuickBooksPayments(): Promise<{ salesPaid: number; bil
 
       for (const { doc: bill, verdict } of gate.withheld) {
         billsReversalsWithheld++
+        if (verdict.verdict === 'LEDGER_PART_PAYMENT_REMOVED') partialPaymentsRemoved++
         const landed = await signalWithheldQboReversal({
           entityType: 'PURCHASE_ORDER',
           entityId: bill.poId,
@@ -1061,6 +1202,7 @@ export async function pollQuickBooksPayments(): Promise<{ salesPaid: number; bil
   const rechecked = await recheckWithheldQboReversals(errors)
   withheldRechecked += rechecked.rechecked
   withheldResolved += rechecked.resolved
+  partialPaymentsRemoved += rechecked.partialPaymentsRemoved
   salesReversed += rechecked.salesReversed
   billsReversed += rechecked.billsReversed
 
@@ -1076,17 +1218,20 @@ export async function pollQuickBooksPayments(): Promise<{ salesPaid: number; bil
   }
 
   if (salesPaid > 0 || billsPaid > 0 || salesReversed > 0 || billsReversed > 0
-    || salesReversalsWithheld > 0 || billsReversalsWithheld > 0 || withheldRechecked > 0) {
+    || salesReversalsWithheld > 0 || billsReversalsWithheld > 0 || withheldRechecked > 0
+    || partialPaymentsRemoved > 0) {
     await logActivity({
       entityType: 'SYSTEM',
       action: 'quickbooks_payment_poll',
       tag: 'sync',
       description: `QuickBooks payment poll: ${salesPaid} sales paid, ${billsPaid} bills paid, ${salesReversed} sales reversed, ${billsReversed} bills reversed`
         + `, ${salesReversalsWithheld} sales + ${billsReversalsWithheld} bill reversals withheld`
-        + `, ${withheldRechecked} withheld reconsidered (${withheldResolved} settled)`,
-      metadata: { salesPaid, billsPaid, salesReversed, billsReversed, salesReversalsWithheld, billsReversalsWithheld, withheldRechecked, withheldResolved },
+        + `, ${withheldRechecked} withheld reconsidered (${withheldResolved} settled)`
+        + `, ${partialPaymentsRemoved} document(s) where QuickBooks gave back only PART of the payment `
+        + `and IMS still shows them fully paid — these need a person`,
+      metadata: { salesPaid, billsPaid, salesReversed, billsReversed, salesReversalsWithheld, billsReversalsWithheld, partialPaymentsRemoved, withheldRechecked, withheldResolved },
     })
   }
 
-  return { salesPaid, billsPaid, salesReversed, billsReversed, salesReversalsWithheld, billsReversalsWithheld, withheldRechecked, withheldResolved, errors }
+  return { salesPaid, billsPaid, salesReversed, billsReversed, salesReversalsWithheld, billsReversalsWithheld, partialPaymentsRemoved, withheldRechecked, withheldResolved, errors }
 }

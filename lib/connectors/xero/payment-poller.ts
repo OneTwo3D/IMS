@@ -244,6 +244,23 @@ function registrationText(verdict: RegisteredPaymentVerdict, reason: WithheldAmo
     case 'LEDGER_NOT_PROVEN_ZERO_PAID':
       return ` The ledger has not been shown to hold nothing on this document, so the figure it reports `
         + `is not evidence that a payment was removed.`
+    // o3d-psrx r9 (Codex HIGH): NOT REACHABLE FROM XERO EITHER, and by the same structural route as
+    // its parent verdict above. A part-paid Xero invoice never reaches the registration question at
+    // all — `partitionPaymentReversals` puts it in `partPaid`, which gets the `part-payment`
+    // `WithheldAmountReason` and this function's `reason` argument, not a verdict. Where QuickBooks
+    // has to MEASURE the split out of `TotalAmt - Balance`, Xero is handed it, so the two connectors
+    // arrive at the same withholding by different doors. Stated rather than defaulted so that a change
+    // making this reachable here is a sentence somebody has to write.
+    //
+    // WHAT XERO STILL DOES NOT DO WITH IT is the other half of o3d-x9tp: a stable part-paid Xero
+    // invoice is warned about on every poll that sees it and reconciled by nobody, exactly as the
+    // QuickBooks one is. The difference r9 closes is only that the QuickBooks side now says so in a
+    // form that can be found; extending that to Xero's `partPaid` bucket is filed with the
+    // reconciliation work rather than done here, because both need the same accounting path.
+    case 'LEDGER_PART_PAYMENT_REMOVED':
+      return ` The ledger states it is still holding ${verdict.paidAmount} of this document's `
+        + `${verdict.documentTotal}, so ${verdict.removedAmount} of it has been removed and the rest has `
+        + `not. Reversing the whole document would raise a credit note over money nobody gave back.`
     case 'GONE':
       return ''
   }
