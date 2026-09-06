@@ -98,6 +98,99 @@ export type QboLedgerAmount = {
   outstanding: number | null
   /** `CurrencyRef.value`, or NULL when the payload did not state one (o3d-psrx r10, Codex HIGH 3). */
   currency: string | null
+  /**
+   * o3d-psrx r15 (Codex MEDIUM 2) — WHERE THE MINOR UNIT THE AMOUNTS WERE READ AGAINST CAME FROM.
+   *
+   * `currency` above is what QUICKBOOKS STATED and nothing else, because it is what the operator
+   * warnings and the withheld marker report as the ledger's own figure. This says which currency
+   * `parseLedgerAmount` was actually given, which is a different question the moment QuickBooks
+   * states none: see `resolveLedgerRowCurrency`.
+   */
+  currencySource: LedgerCurrencySource
+}
+
+/**
+ * o3d-psrx r15 (Codex MEDIUM 2) — A MISSING `CurrencyRef` IS NOT AN UNKNOWN CURRENCY.
+ *
+ * QuickBooks omits `CurrencyRef` whenever multicurrency is disabled, which is the ORDINARY shape of
+ * an ordinary company's documents rather than an anomaly. r14 mapped that shape to the strictest
+ * (four-decimal) magnitude bound on the "unstated means be stricter" rule, and a routine base-currency
+ * row was then refused: `TotalAmt = Balance = 600000000000` reads as null/UNPROVEN with no
+ * `CurrencyRef` and as HOLDS_NOTHING with `GBP`, though the value fits the money column and sits far
+ * below the two-decimal bound. A guard that fires on ordinary documents is a guard somebody deletes.
+ *
+ * SO THE CURRENCY IS RESOLVED FROM PROVENANCE BEFORE THE FALLBACK IS REACHED, in this order:
+ *
+ *   LEDGER        QuickBooks stated `CurrencyRef`. Authoritative, and it always wins.
+ *   IMS_DOCUMENT  the currency of the IMS order or purchase order this row is linked to by
+ *                 `accountingInvoiceId`. IMS raised the document, so this is IMS's own record of what
+ *                 it is denominated in — the poller has already loaded the row, so nothing is fetched
+ *                 and no QuickBooks call is added to obtain it.
+ *   NONE          neither could supply one. The strictest bound still applies, AND the refusal it
+ *                 produces now says that this is why — see `currencyUnbound`.
+ *
+ * A DURABLY VERIFIED QUICKBOOKS HOME CURRENCY IS NOT AVAILABLE TO BE THE THIRD SOURCE, and that is a
+ * fact this repository has already established rather than a choice made here: `connectQuickBooks`
+ * compares `fetchCompanyInfo`'s `HomeCurrency` against the IMS base currency ONLY when it could read
+ * it, stores the binding either way, and persists neither the value nor the fact that it compared.
+ * `getBaseCurrencyCode()` is therefore not a stand-in for what the ledger denominates in — the same
+ * conclusion `payloadPaymentCurrency` reached in o3d-batch-ret r12, and o3d-emus is the issue that
+ * would make such a source exist.
+ *
+ * WHAT IT IS SPENT ON, AND WHAT IT IS DELIBERATELY NOT. Only the MAGNITUDE BOUND. The other rule
+ * sized by the minor unit is `ledgerAmountEpsilon`, and the two fail safe in OPPOSITE directions: a
+ * coarser bound READS more documents (which is the regression being fixed), while a coarser epsilon
+ * DISCARDS more as nothing and can only move a document towards HOLDS_NOTHING, the one verdict that
+ * clears `paidAt`. Provenance is spent where being wrong withholds a reversal and withheld from where
+ * being wrong grants one, so no reversal becomes more admissible than it was before this change.
+ */
+export type LedgerCurrencySource = 'LEDGER' | 'IMS_DOCUMENT' | 'NONE'
+
+export type ResolvedLedgerCurrency = {
+  /** As QuickBooks stated it, or NULL. Never inferred. */
+  stated: string | null
+  /** The code the amounts are READ against — stated, else IMS's, else NULL. */
+  read: string | null
+  source: LedgerCurrencySource
+}
+
+export function resolveLedgerRowCurrency(
+  statedCurrencyRef: unknown,
+  imsDocumentCurrency: string | null | undefined,
+): ResolvedLedgerCurrency {
+  const stated = parseQboCurrency(statedCurrencyRef)
+  if (stated != null) return { stated, read: stated, source: 'LEDGER' }
+  // Validated through the SAME `ledgerCurrencyCode` the payload goes through: an IMS column holding
+  // something that is not an ISO-4217 code is not provenance, it is another unstated currency.
+  const ims = ledgerCurrencyCode(imsDocumentCurrency ?? null)
+  if (ims != null) return { stated: null, read: ims, source: 'IMS_DOCUMENT' }
+  return { stated: null, read: null, source: 'NONE' }
+}
+
+/** The IMS currency for each QuickBooks document id a read is about, keyed by `accountingInvoiceId`. */
+export type LedgerDocumentCurrencies = ReadonlyMap<string, string | null>
+
+/**
+ * The IMS-side currency provenance for a set of candidate documents, keyed the way the ledger read is.
+ *
+ * AMBIGUITY COLLAPSES TO NULL RATHER THAN TO A WINNER. `accountingInvoiceId` is globally unique on
+ * PurchaseInvoice, but nothing forbids a SalesOrder and a PurchaseInvoice from carrying the same
+ * QuickBooks id, and each entity's read is built from its own candidates — so this is defensive rather
+ * than reachable today. If it ever became reachable, two documents disagreeing about the currency is
+ * exactly the state in which neither is provenance, and the strictest bound is the right answer.
+ */
+export function ledgerDocumentCurrencies(
+  documents: ReadonlyArray<{ accountingInvoiceId: string | null; currency?: string | null }>,
+): LedgerDocumentCurrencies {
+  const index = new Map<string, string | null>()
+  for (const document of documents) {
+    const id = document.accountingInvoiceId
+    if (id == null) continue
+    const code = ledgerCurrencyCode(document.currency ?? null)
+    if (index.has(id) && index.get(id) !== code) index.set(id, null)
+    else index.set(id, code)
+  }
+  return index
 }
 
 type QboAmountRow = { Id: string; Balance?: unknown; TotalAmt?: unknown; CurrencyRef?: unknown }
@@ -115,17 +208,26 @@ type QboAmountRow = { Id: string; Balance?: unknown; TotalAmt?: unknown; Currenc
  * So the row is read ONCE, here, through `parseLedgerAmount` — the same reader Xero's amount
  * partition uses — and both classifications are derived from that result. One parse, one truth.
  */
-type QboParsedLedgerRow = { total: number | null; balance: number | null; currency: string | null }
+type QboParsedLedgerRow = {
+  total: number | null
+  balance: number | null
+  currency: string | null
+  currencySource: LedgerCurrencySource
+}
 
-function parseQboLedgerRow(row: QboAmountRow): QboParsedLedgerRow {
+function parseQboLedgerRow(row: QboAmountRow, imsDocumentCurrency: string | null | undefined): QboParsedLedgerRow {
   // o3d-psrx r14: the currency is read FIRST because the amount reader needs it — the magnitude above
   // which a figure's own minor unit cannot survive `Response.json()` is a property of that minor unit,
-  // and it is the bound `parseLedgerAmount` refuses on.
-  const currency = parseQboCurrency(row.CurrencyRef)
+  // and it is the bound `parseLedgerAmount` refuses on. r15: and it is RESOLVED rather than merely
+  // read, because a missing `CurrencyRef` is the ordinary single-currency shape and not an unknown.
+  const currency = resolveLedgerRowCurrency(row.CurrencyRef, imsDocumentCurrency)
   return {
-    total: parseLedgerAmount(row.TotalAmt, currency),
-    balance: parseLedgerAmount(row.Balance, currency),
-    currency,
+    total: parseLedgerAmount(row.TotalAmt, currency.read),
+    balance: parseLedgerAmount(row.Balance, currency.read),
+    // STATED, never resolved: this is the figure the operator warnings and the withheld marker report
+    // as the ledger's own, so it must not become an inference. `currencySource` carries the rest.
+    currency: currency.stated,
+    currencySource: currency.source,
   }
 }
 
@@ -168,16 +270,22 @@ function parseQboCurrency(value: unknown): string | null {
  * through, and a conversion that cannot be spent in place of the Decimal yields NULL. NULL IS NOT
  * ZERO here either: `classifyQboLedgerEvidence` reads a null `paid` as `UNPROVEN`, which WITHHOLDS.
  * A figure this code cannot represent is not permission to declare the payment gone.
+ *
+ * o3d-psrx r15 (Codex MEDIUM 1) — AND IT TAKES NO CURRENCY, because the magnitude bound no longer
+ * belongs to this conversion. The difference is a Decimal this code computed EXACTLY from two figures
+ * that were each already admitted by their own arm, so its evidence is intact and the round trip can
+ * decide it directly. See `readDecimalAsNumber`.
  */
 function qboLedgerAmountFrom(parsed: QboParsedLedgerRow): QboLedgerAmount {
-  const { total, balance, currency } = parsed
+  const { total, balance, currency, currencySource } = parsed
   return {
     total,
     outstanding: balance,
     // Decimal, not float: `100.1 - 0.1` is 100.00000000000001 in IEEE-754, and this figure is
     // compared against a threshold small enough for a four-decimal currency to see that.
-    paid: total === null || balance === null ? null : readDecimalAsNumber(subtractMoney(total, balance), currency),
+    paid: total === null || balance === null ? null : readDecimalAsNumber(subtractMoney(total, balance)),
     currency,
+    currencySource,
   }
 }
 
@@ -189,8 +297,8 @@ function qboLedgerAmountFrom(parsed: QboParsedLedgerRow): QboLedgerAmount {
  * partition uses — so a string figure, a missing one and an unparseable one all get the answer the
  * other connector already gives them, rather than a second dialect of "is this a number".
  */
-export function qboLedgerAmount(row: QboAmountRow): QboLedgerAmount {
-  return qboLedgerAmountFrom(parseQboLedgerRow(row))
+export function qboLedgerAmount(row: QboAmountRow, imsDocumentCurrency?: string | null): QboLedgerAmount {
+  return qboLedgerAmountFrom(parseQboLedgerRow(row, imsDocumentCurrency))
 }
 
 /**
@@ -204,8 +312,8 @@ export function qboLedgerAmount(row: QboAmountRow): QboLedgerAmount {
  * voided document (clear `paidAt`, raise NO chargeback — QBO has already reversed the AR) is
  * unchanged by this round.
  */
-function qboVoidedAmount(currency: string | null): QboLedgerAmount {
-  return { paid: 0, total: 0, outstanding: 0, currency }
+function qboVoidedAmount(currency: string | null, currencySource: LedgerCurrencySource): QboLedgerAmount {
+  return { paid: 0, total: 0, outstanding: 0, currency, currencySource }
 }
 
 /**
@@ -280,13 +388,36 @@ export type QboLedgerEvidence =
       outstandingAmount: number
       currency: string | null
     }
-  | { kind: 'UNPROVEN'; paidAmount: number | null; documentTotal: number | null }
+  | {
+      kind: 'UNPROVEN'
+      paidAmount: number | null
+      documentTotal: number | null
+      /**
+       * o3d-psrx r15 (Codex MEDIUM 2) — TRUE when nothing could say what currency this document's
+       * figures are in, so they were read against the strictest minor unit this repository supports.
+       *
+       * It is a property of the BINDING and not of the ledger's answer, and it is carried separately
+       * for that reason: an UNPROVEN reached this way is not QuickBooks declining to state an amount,
+       * it is IMS unable to size one. A document MISSING from the read has no binding to report on,
+       * so it is FALSE there — see the first return below.
+       */
+      currencyUnbound: boolean
+    }
 
 export function classifyQboLedgerEvidence(amount: QboLedgerAmount | undefined): QboLedgerEvidence {
   // A document MISSING from the read is not a document with nothing on it: it is one this read said
   // nothing about, and "we did not hear" is never spent as an answer here or anywhere else in the
   // lifecycle.
-  if (amount == null || amount.paid == null) return { kind: 'UNPROVEN', paidAmount: null, documentTotal: amount?.total ?? null }
+  if (amount == null || amount.paid == null) {
+    return {
+      kind: 'UNPROVEN',
+      paidAmount: null,
+      documentTotal: amount?.total ?? null,
+      // An absent row said nothing about a currency either, so there is no binding defect to report;
+      // only a row that WAS read and could not be sized carries one.
+      currencyUnbound: amount != null && amount.currencySource === 'NONE',
+    }
+  }
   const { paid, total, outstanding, currency } = amount
   // o3d-psrx r10 (Codex HIGH 3): the threshold is a property of the DOCUMENT'S CURRENCY, not of
   // Xero's two decimal places, and every comparison below is decimal rather than binary float. See
@@ -311,7 +442,7 @@ export function classifyQboLedgerEvidence(amount: QboLedgerAmount | undefined): 
   ) {
     return { kind: 'PARTIALLY_PAID', paidAmount: paid, documentTotal: total, outstandingAmount: outstanding, currency }
   }
-  return { kind: 'UNPROVEN', paidAmount: paid, documentTotal: total }
+  return { kind: 'UNPROVEN', paidAmount: paid, documentTotal: total, currencyUnbound: amount.currencySource === 'NONE' }
 }
 
 /**
@@ -347,6 +478,11 @@ export function classifyQboReversals(
 async function fetchReversedEntityIds(
   entity: 'Invoice' | 'Bill',
   since: string,
+  // o3d-psrx r15 (Codex MEDIUM 2): the currency of each IMS document this read might be about, from
+  // the candidate rows the caller has ALREADY loaded. Passed in rather than fetched: the poller reads
+  // its candidates before it asks QuickBooks anything, so the provenance is in hand, and a resolver
+  // that went back to the database here would be a second read of rows the caller is holding.
+  documentCurrencies: LedgerDocumentCurrencies,
 ): Promise<{ all: Set<string>; voided: Set<string>; amounts: Map<string, QboLedgerAmount>; ledgerObservedBefore: LedgerReadFence | null } | null> {
   // o3d-psrx r3 — THE FENCE IS MINTED HERE, AND HERE IS BEFORE THE LEDGER IS ASKED.
   //
@@ -366,8 +502,11 @@ async function fetchReversedEntityIds(
   // o3d-psrx r8 (Codex HIGH 2) — the amounts these same rows already carry, kept instead of thrown
   // away. VOIDED is applied SECOND so a document in both sets is settled by the stronger rule.
   const amounts = new Map<string, QboLedgerAmount>()
-  for (const row of balanceDue) amounts.set(row.Id, qboLedgerAmount(row))
-  for (const row of voided) amounts.set(row.Id, qboVoidedAmount(parseQboCurrency(row.CurrencyRef)))
+  for (const row of balanceDue) amounts.set(row.Id, qboLedgerAmount(row, documentCurrencies.get(row.Id)))
+  for (const row of voided) {
+    const currency = resolveLedgerRowCurrency(row.CurrencyRef, documentCurrencies.get(row.Id))
+    amounts.set(row.Id, qboVoidedAmount(currency.stated, currency.source))
+  }
   return { ...classifyQboReversals(balanceDue, voided), amounts, ledgerObservedBefore }
 }
 
@@ -393,6 +532,8 @@ async function fetchReversedEntityIds(
 async function fetchReversedEntityIdsByIds(
   entity: 'Invoice' | 'Bill',
   ids: readonly string[],
+  /** o3d-psrx r15: see `fetchReversedEntityIds` — the recheck loads its documents first too. */
+  documentCurrencies: LedgerDocumentCurrencies,
 ): Promise<{ all: Set<string>; voided: Set<string>; returned: Set<string>; unreadable: Set<string>; amounts: Map<string, QboLedgerAmount>; ledgerObservedBefore: LedgerReadFence | null } | null> {
   // Minted BEFORE the ledger is asked, for the reason `fetchReversedEntityIds` gives: the ordering is
   // PROGRAM ORDER, and one fence covering several batches only ever decides FEWER registrations.
@@ -422,7 +563,7 @@ async function fetchReversedEntityIdsByIds(
       // test, the document went into `returned` with no disagreement recorded against it, and the
       // recheck CLOSED its withheld marker as settled while the ledger still disagreed with IMS. Two
       // readers of one field, the stricter deciding whether the marker survives.
-      const parsed = parseQboLedgerRow(row)
+      const parsed = parseQboLedgerRow(row, documentCurrencies.get(row.Id))
       // The same two predicates the delta read expresses as `Balance > '0'` and `TotalAmt = '0'`,
       // now over the parsed values rather than over the raw ones.
       const isVoided = parsed.total !== null && parsed.total === 0
@@ -452,16 +593,21 @@ async function fetchReversedEntityIdsByIds(
       //   Balance    — decides `balanceDue`, and so whether the document is a candidate at all.
       //   TotalAmt   — decides `isVoided`, the other way in, and is half of the `paid` figure the
       //                provenance gate weighs.
-      //   CurrencyRef— sizes the gate's epsilon only. An unstated or malformed code takes the FINEST
-      //                threshold (`ledgerAmountEpsilon`), which can only move a document out of
-      //                HOLDS_NOTHING into a verdict that withholds. Fail-safe already.
+      //   CurrencyRef— sizes the gate's epsilon (`ledgerAmountEpsilon`) and, since r14, the magnitude
+      //                bound the two figures above are read against. r15 made the SECOND of those
+      //                resolvable from the IMS document, so this field can now decide whether
+      //                `Balance` and `TotalAmt` are readable at all — which is a route to `unreadable`
+      //                and therefore to a DEFER. Still fail-safe in both directions: a currency
+      //                nothing can supply takes the FINEST minor unit, which gives the STRICTEST
+      //                bound (more refusals, so more defers) and the SMALLEST epsilon (which can only
+      //                move a document out of HOLDS_NOTHING into a verdict that withholds).
       // So `Balance` and `TotalAmt` are the two whose refusal could be spent as a settlement, and
       // BOTH are watched here. `parsed.currency` deliberately is not: it has no way to close.
       if (!isVoided && (parsed.balance === null || parsed.total === null)) unreadable.add(row.Id)
       if (isVoided) voided.push({ Id: row.Id })
       // o3d-psrx r8: and the amounts, from the row this loop is already holding. Voided by its own
       // rule for the reason `qboVoidedAmount` gives.
-      amounts.set(row.Id, isVoided ? qboVoidedAmount(parsed.currency) : qboLedgerAmountFrom(parsed))
+      amounts.set(row.Id, isVoided ? qboVoidedAmount(parsed.currency, parsed.currencySource) : qboLedgerAmountFrom(parsed))
     }
   }
   return { ...classifyQboReversals(balanceDue, voided), returned, unreadable, amounts, ledgerObservedBefore }
@@ -632,6 +778,10 @@ export async function gateQboReversalsOnProvenance<T extends { id: string; accou
             verdict: 'LEDGER_NOT_PROVEN_ZERO_PAID' as const,
             paidAmount: evidence.paidAmount,
             documentTotal: evidence.documentTotal,
+            // o3d-psrx r15 (Codex MEDIUM 2): carried onto the verdict so the withheld sentence and the
+            // durable marker can say WHY this document was unreadable, rather than reporting a
+            // currency-binding defect as though QuickBooks had declined to state an amount.
+            currencyUnbound: evidence.currencyUnbound,
           }
     // NO VERDICT IS NOT A PASS. An absence means nothing was decided about this document, and the
     // fail-closed reading of "nothing was decided" is the same one a null fence gets: withhold.
@@ -683,6 +833,21 @@ export function qboWithheldReversalReason(verdict: RegisteredPaymentVerdict): st
     // the document rather than about IMS's rows — so the operator's action is different from every
     // other arm here: go and look at what the ledger is still holding, not at a sync row.
     case 'LEDGER_NOT_PROVEN_ZERO_PAID':
+      // o3d-psrx r15 (Codex MEDIUM 2) — THE BINDING DEFECT IS ITS OWN SENTENCE, BECAUSE IT SENDS THE
+      // OPERATOR SOMEWHERE ELSE. Every other wording in this arm sends them to the QuickBooks document
+      // to see what is applied to it; this one is about IMS not knowing what currency the figures are
+      // in, and the document they would open looks perfectly ordinary. It names both places a currency
+      // could have come from, because fixing either one settles it on the next poll.
+      if (verdict.currencyUnbound) {
+        return 'QuickBooks answered about this document without stating a CurrencyRef, and the IMS '
+          + 'order or purchase order it is linked to does not record a valid currency either — so '
+          + 'nothing could say what minor unit its amounts are denominated in. Amounts IMS cannot size '
+          + 'are read against the finest precision it supports, which refused these, so the ledger has '
+          + 'NOT been shown to hold nothing on this document. paidAt was LEFT SET and no chargeback '
+          + 'credit note was raised. This is an IMS binding defect and not a QuickBooks reading: set '
+          + 'the currency on the linked IMS document (or enable multicurrency in QuickBooks so it '
+          + 'states one) and the next poll decides this by itself.'
+      }
       return verdict.paidAmount == null
         ? 'QuickBooks reported a balance due on this document without stating an amount IMS could '
           + 'read, so it has not been shown to be holding NOTHING. A balance due on its own does not '
@@ -765,6 +930,11 @@ export async function readQboSalesReversalCandidates() {
       externalOrderNumber: true,
       status: true,
       revenueDeferredDate: true,
+      // o3d-psrx r15 (Codex MEDIUM 2): WHAT THIS ORDER IS DENOMINATED IN, selected with the candidates
+      // for the same reason `unregisteredPaidAt` is — the reversal verdict turns on it. QuickBooks
+      // omits `CurrencyRef` whenever multicurrency is off, and without this column the amounts on an
+      // ordinary base-currency document are read against the finest minor unit and refused.
+      currency: true,
       // o3d-psrx r3 (Codex HIGH): WHERE this order's paid flag came from. Selected with `paidAt`'s own
       // candidates because the reversal verdict turns on it — see gateQboReversalsOnProvenance.
       // Leaving it out is the defect itself: every verdict then reads as NOTHING_REGISTERED and a sale
@@ -778,7 +948,9 @@ export async function readQboSalesReversalCandidates() {
 export async function readQboBillReversalCandidates() {
   return await db.purchaseInvoice.findMany({
     where: { accountingInvoiceId: { not: null }, paidAt: { not: null } },
-    select: { id: true, accountingInvoiceId: true, poId: true, po: { select: { reference: true, status: true } } },
+    // o3d-psrx r15: `po.currency` is the bill's denomination — a PurchaseInvoice carries no currency
+    // column of its own, it holds foreign/base pairs against the PO's. See `resolveLedgerRowCurrency`.
+    select: { id: true, accountingInvoiceId: true, poId: true, po: { select: { reference: true, status: true, currency: true } } },
   })
 }
 
@@ -822,6 +994,12 @@ export type QboBillReversalDoc = Awaited<ReturnType<typeof readQboBillReversalCa
  * this is for.
  */
 function withheldMarkerMoney(verdict: RegisteredPaymentVerdict): Record<string, number | boolean | string> {
+  // o3d-psrx r15 (Codex MEDIUM 2): the binding defect is queryable too, and for the same reason the
+  // part-paid figures are — the only other place it exists is inside an English sentence. Emitted
+  // only when it is TRUE, so `currencyUnbound = true` remains the way to find these.
+  if (verdict.verdict === 'LEDGER_NOT_PROVEN_ZERO_PAID') {
+    return verdict.currencyUnbound ? { currencyUnbound: true } : {}
+  }
   if (verdict.verdict !== 'LEDGER_PARTIALLY_PAID') return {}
   return {
     ledgerPartiallyPaid: true,
@@ -1006,7 +1184,7 @@ export async function recheckWithheldQboReversals(
   // than one bill, which is why the bill side is keyed by poId and may map to several documents.
   const bills = poIds.length === 0 ? [] : await db.purchaseInvoice.findMany({
     where: { poId: { in: poIds }, paidAt: { not: null }, accountingInvoiceId: { not: null } },
-    select: { id: true, accountingInvoiceId: true, poId: true, po: { select: { reference: true, status: true } } },
+    select: { id: true, accountingInvoiceId: true, poId: true, po: { select: { reference: true, status: true, currency: true } } },
   })
   const orders = soIds.length === 0 ? [] : await db.salesOrder.findMany({
     where: { id: { in: soIds }, paidAt: { not: null }, accountingInvoiceId: { not: null } },
@@ -1017,6 +1195,9 @@ export async function recheckWithheldQboReversals(
       externalOrderNumber: true,
       status: true,
       revenueDeferredDate: true,
+      // o3d-psrx r15: and the currency, for the reason the delta candidate query gives — this read
+      // feeds the SAME amount reader, so a recheck must be able to size the figures the delta could.
+      currency: true,
       // No exceptions to the provenance rule inside a file that decides reversals — this read feeds
       // the SAME gate the delta pass feeds, and the gate is what consumes it.
       unregisteredPaidAt: true,
@@ -1032,9 +1213,11 @@ export async function recheckWithheldQboReversals(
   for (const order of orders) add(withheldEntityKey('SALES_ORDER', order.id), order.accountingInvoiceId)
 
   const salesRead = orders.length === 0 ? null : await fetchReversedEntityIdsByIds(
-    'Invoice', [...new Set(orders.map((o) => o.accountingInvoiceId).filter((id): id is string => id != null))])
+    'Invoice', [...new Set(orders.map((o) => o.accountingInvoiceId).filter((id): id is string => id != null))],
+    ledgerDocumentCurrencies(orders))
   const billsRead = bills.length === 0 ? null : await fetchReversedEntityIdsByIds(
-    'Bill', [...new Set(bills.map((b) => b.accountingInvoiceId).filter((id): id is string => id != null))])
+    'Bill', [...new Set(bills.map((b) => b.accountingInvoiceId).filter((id): id is string => id != null))],
+    ledgerDocumentCurrencies(bills.map((b) => ({ accountingInvoiceId: b.accountingInvoiceId, currency: b.po.currency }))))
   if ((orders.length > 0 && salesRead == null) || (bills.length > 0 && billsRead == null)) {
     // Nothing is closed and nothing is deferred: every due document keeps the marker it already has,
     // so the whole page is still due on the next poll.
@@ -1261,7 +1444,7 @@ export async function pollQuickBooksPayments(): Promise<{ salesPaid: number; bil
   const paidOrders = await readQboSalesReversalCandidates()
 
   if (paidOrders.length > 0) {
-    const reversedIds = await fetchReversedEntityIds('Invoice', since)
+    const reversedIds = await fetchReversedEntityIds('Invoice', since, ledgerDocumentCurrencies(paidOrders))
     if (!reversedIds) {
       allQueriesSucceeded = false
       errors.push('Failed to query QuickBooks invoices for payment reversals')
@@ -1378,7 +1561,8 @@ export async function pollQuickBooksPayments(): Promise<{ salesPaid: number; bil
   const paidBills = await readQboBillReversalCandidates()
 
   if (paidBills.length > 0) {
-    const reversedIds = await fetchReversedEntityIds('Bill', since)
+    const reversedIds = await fetchReversedEntityIds('Bill', since,
+      ledgerDocumentCurrencies(paidBills.map((b) => ({ accountingInvoiceId: b.accountingInvoiceId, currency: b.po.currency }))))
     if (!reversedIds) {
       allQueriesSucceeded = false
       errors.push('Failed to query QuickBooks bills for payment reversals')

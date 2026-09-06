@@ -978,11 +978,39 @@ export function xeroInvoiceCurrency(invoice: XeroInvoice): string | null {
  * point of the finding — and the cost of it firing is the mildest one available: the document is
  * reported as an amount the ledger did not state, and its reversal is withheld for a human.
  *
- * NOTE WHAT IS STILL NOT COVERED. This bounds the MAGNITUDE at which a minor unit stops being
- * distinguishable. It does not make the decoding lossless, so a payload whose own digits are finer
- * than its currency's minor unit — a four-decimal figure in a two-decimal currency — is still read
- * through a double. That residual is o3d-39jg, the lossless decoder, and it is what remains of this
- * finding after the bound.
+ * o3d-psrx r15 (Codex HIGH) — WHAT THIS BOUND GUARANTEES, EXACTLY, AND WHY IT IS NOT ONE BINADE
+ * LOWER.
+ *
+ * The finding was that the reversal decision turns on HALF a minor unit (`ledgerAmountEpsilon`, and
+ * Xero's `PAYMENT_PRESENT_EPSILON`) while the bound above is derived from ONE WHOLE minor unit — so
+ * the bound protects a coarser quantity than the decision uses, and the obvious correction is to
+ * re-derive it against the half unit, one binade lower. THAT CORRECTION WAS TESTED AND IT IS WRONG
+ * IN BOTH DIRECTIONS. The measurements are pinned as tests; the argument is:
+ *
+ *   WHAT THE DECISION ACTUALLY NEEDS. A settled amount that is a whole multiple of its currency's
+ *   minor unit is either 0 or at least ONE minor unit, i.e. at least 2x the epsilon. Decoding two
+ *   such figures and subtracting them exactly can only move the result by less than one spacing. So
+ *   the decision flips only if the decode can collapse a whole minor unit — which is the property
+ *   this bound already states, and it is TIGHT: measured, no minor-unit-quantized GBP pair flips at
+ *   2^45 or 2^44, and the first one that does sits exactly at 2^46, the bound. Lowering it would
+ *   refuse a binade of money that is provably readable, which is how a guard earns its deletion.
+ *
+ *   WHAT NO BOUND CAN GIVE. The flip Codex reproduced — GBP `35184372088832.003` less
+ *   `35184372088831.997`, a true 0.006 decoding as 0.004 — needs digits FINER than the currency's
+ *   minor unit. For those the true difference is not quantized to 2x epsilon, so a difference just
+ *   ABOVE the epsilon always exists inside one spacing of it, and rounding can always carry it
+ *   below. Lowering the bound moves that class down rather than closing it: measured in GBP, a
+ *   3-decimal payload flips at 2^44 (below the proposed bound), a 4-decimal one at 2^40, a
+ *   6-decimal one at 2^34. There is no finite magnitude at which the class is empty.
+ *
+ * SO THE BOUND IS KEPT AT THE QUANTITY IT CAN ACTUALLY GUARANTEE, and the claim is narrowed to
+ * exactly that rather than widened: BELOW THIS BOUND, A DIFFERENCE OF ONE WHOLE MINOR UNIT SURVIVES
+ * DECODING. It does NOT guarantee the half-unit decision for a payload finer than its own minor
+ * unit, and it never could. THE STRING ARM IS DIFFERENT AND IS NOT AFFECTED: `"35184372088832.003"`
+ * is refused by the round trip at every magnitude (see `parseLedgerAmount`), because there the
+ * original digits still exist to be checked. The residual is therefore precisely a JSON NUMERIC
+ * TOKEN whose scale exceeds its currency's minor unit, and closing it needs the original token, not
+ * a threshold: that is o3d-39jg, the lossless decoder, and it is what remains of this finding.
  */
 const magnitudeBoundCache = new Map<number, number>()
 
@@ -1047,29 +1075,46 @@ export function ledgerAmountMagnitudeBound(currency: string | null): number {
  * NULL IS A REFUSAL AND NEVER A ZERO, wherever it is returned — see `parseLedgerAmount` below and
  * `QboLedgerAmount.paid`, both of which withhold on it.
  *
- * o3d-psrx r14 (Codex HIGH) — AND THE MAGNITUDE BOUND, WHICH THE ROUND TRIP CANNOT SEE. The check
- * below asks whether THIS Decimal survives conversion; it cannot ask whether the value arrived
- * intact, because a double that lost digits inside `Response.json()` round-trips to itself perfectly.
- * `ledgerAmountMagnitudeBound` is the independent question, and `currency` is required rather than
- * optional so that no call site can quietly opt out of it — a guard that one caller may omit is a
- * guard the next conversion does not get, which is the same reason this is a function at all.
+ * o3d-psrx r14 (Codex HIGH) added the magnitude bound HERE, and r15 (Codex MEDIUM 1) TOOK IT BACK
+ * OUT — because this function is only ever handed a value whose own evidence still exists.
+ *
+ * THE TWO RULES HAVE DIFFERENT PREMISES AND ONLY ONE OF THEM HOLDS HERE.
+ *
+ *   The ROUND TRIP asks "is THIS Decimal representable?", and it can only be asked of something that
+ *   still IS a Decimal — a figure whose original decimal text was preserved (a string amount) or one
+ *   this code computed exactly (`subtractMoney`). For those it is the STRONGER of the two rules: it
+ *   proves the exact value survives, at any magnitude and any scale, rather than proving that values
+ *   of this SIZE generally do.
+ *
+ *   The MAGNITUDE BOUND asks "did the value arrive intact?", and it exists precisely because that
+ *   question cannot be answered from the value itself — a double that lost digits inside
+ *   `Response.json()` round-trips to itself perfectly. Its premise is that the evidence is ALREADY
+ *   GONE, which is true of a JSON numeric token and false of everything reaching this function.
+ *
+ * SO THE BOUND MOVED TO THE ONE ARM WHOSE PREMISE IT MATCHES, and it is applied there and nowhere
+ * else. Keeping it here was not extra safety, it was a rule fired where its premise is false:
+ * `parseLedgerAmount('1649267441664', 'CLF')` answered null for a value that is exactly
+ * representable and demonstrably intact, which converted a readable zero-paid state into UNPROVEN
+ * and withheld a legitimate reversal indefinitely. Applying each rule where its premise holds is not
+ * a loosening.
+ *
+ * NULL IS STILL A REFUSAL AND NEVER A ZERO.
  */
-export function readDecimalAsNumber(decimal: Decimal, currency: string | null): number | null {
+export function readDecimalAsNumber(decimal: Decimal): number | null {
   const parsed = decimal.toNumber()
   if (!Number.isFinite(parsed)) return null
-  // REFUSED, not clamped: above this magnitude the figure's own minor unit is not representable, so
-  // there is no number here to spend and no honest rounding of one.
-  if (decimal.abs().gte(ledgerAmountMagnitudeBound(currency))) return null
   return toDecimal(parsed).equals(decimal) ? parsed : null
 }
 
 export function parseLedgerAmount(value: unknown, currency: string | null): number | null {
   if (typeof value === 'number') {
     if (!Number.isFinite(value)) return null
-    // o3d-psrx r14 (Codex HIGH) — THE ARM THE FINDING IS ABOUT. A JSON numeric token reaches here as
-    // a double that `Response.json()` has already rounded, and no test applied to the double can
-    // recover what it rounded away. What CAN be established is whether a value of this size is one
-    // whose minor unit survives that rounding at all; above the bound it is not, so it is refused.
+    // o3d-psrx r14 (Codex HIGH) — THE ARM THE FINDING IS ABOUT, and after r15 the ONLY arm the bound
+    // applies to. A JSON numeric token reaches here as a double that `Response.json()` has already
+    // rounded, and no test applied to the double can recover what it rounded away — which is why the
+    // round trip cannot serve here and a magnitude rule must. What it establishes is stated at
+    // `ledgerAmountMagnitudeBound` and is narrower than "this value is intact": below the bound a
+    // difference of one whole minor unit survives the decode. Above it, it does not, so it is refused.
     return Math.abs(value) < ledgerAmountMagnitudeBound(currency) ? value : null
   }
   if (typeof value === 'string') {
@@ -1078,12 +1123,18 @@ export function parseLedgerAmount(value: unknown, currency: string | null): numb
     // Converted through the repository's decimal reader rather than `Number()`: the shape is already
     // established above, and this reads the digits it was given instead of re-deriving them.
     //
+    // o3d-psrx r15 (Codex MEDIUM 1) — AND NO MAGNITUDE BOUND ON THIS ARM. A string carries its own
+    // evidence: the original decimal text is still here, so the round trip can decide THIS value
+    // rather than values of this size, and it decides it more strictly. `"35184372088832.003"` — the
+    // three-decimal GBP figure the r15 HIGH is about — is REFUSED here, at every magnitude, because
+    // no double says what it says; the bound would have let it through at a smaller magnitude. The
+    // arm that needs the bound is the one above, where the digits are already gone.
+    //
     // The alternative — carrying Decimal through every classification instead of converting at all —
     // is the stronger shape and is NOT small here: this reader's result is a `number` in the Xero
     // partition, in `QboLedgerAmount`, in `QboLedgerEvidence` and in the activity metadata those
-    // verdicts are written into. That is a change to two connectors' public readings. One comparison
-    // at every conversion refuses every lossy one, which is what the finding asks for.
-    return readDecimalAsNumber(toDecimal(trimmed), currency)
+    // verdicts are written into. That is a change to two connectors' public readings.
+    return readDecimalAsNumber(toDecimal(trimmed))
   }
   return null
 }
@@ -1613,7 +1664,26 @@ export type RegisteredPaymentVerdict =
    * zero, exactly as in `PART_COVERED_OFF_LEDGER`: it is the reason this verdict was reached rather
    * than a measurement.
    */
-  | { verdict: 'LEDGER_NOT_PROVEN_ZERO_PAID'; paidAmount: number | null; documentTotal: number | null }
+  | {
+      verdict: 'LEDGER_NOT_PROVEN_ZERO_PAID'
+      paidAmount: number | null
+      documentTotal: number | null
+      /**
+       * o3d-psrx r15 (Codex MEDIUM 2) — THE ONE CAUSE OF THIS VERDICT THAT IS A BINDING DEFECT
+       * RATHER THAN A LEDGER READING, SAID OUT LOUD.
+       *
+       * The amounts a ledger states are only readable against a MINOR UNIT, and the minor unit comes
+       * from the document's currency. When neither the payload nor the IMS document it is linked to
+       * can supply one, the reader falls back to the finest precision this repository supports — the
+       * strictest bound — and the figures are refused for a reason that has nothing to do with what
+       * the ledger said. An operator told only "IMS could not read the amount" would go and look at a
+       * document whose amounts are perfectly ordinary.
+       *
+       * Optional, and ABSENT MEANS NO: every other producer of this verdict read a currency from
+       * somewhere, so only the QuickBooks reader that can reach the unbound state sets it.
+       */
+      currencyUnbound?: boolean
+    }
   /**
    * o3d-psrx r10 (Codex HIGH 1) — THE LEDGER STATES THIS DOCUMENT IS ONLY PARTLY PAID. THAT IS THE
    * WHOLE OF WHAT IS KNOWN, AND THE NAME NOW SAYS SO.

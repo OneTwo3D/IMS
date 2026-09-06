@@ -508,32 +508,35 @@ test('[o3d-psrx r9] a stated part-paid position and an evidence absence are diff
       // than PARTIALLY_PAID because "paid equals the total" is not a partial anything — and a rule
       // that called it one would warn about every fully-settled document that ever reached the gate,
       // which is how an operator learns to ignore the warnings that are real.
-      expect: { kind: 'UNPROVEN', paidAmount: 100, documentTotal: 100 },
+      expect: { kind: 'UNPROVEN', paidAmount: 100, documentTotal: 100, currencyUnbound: false },
     },
     {
       name: 'within the epsilon of the total — nothing outstanding worth naming',
       amount: ledgerAmount(100, 0.001, 'GBP'),
-      expect: { kind: 'UNPROVEN', paidAmount: 99.999, documentTotal: 100 },
+      expect: { kind: 'UNPROVEN', paidAmount: 99.999, documentTotal: 100, currencyUnbound: false },
     },
     {
       name: 'a figure QuickBooks would not state',
       amount: ledgerAmount(null, null),
-      expect: { kind: 'UNPROVEN', paidAmount: null, documentTotal: null },
+      // o3d-psrx r15: this fixture states no currency either, so the binding flag is TRUE — and that
+      // is the honest reading of it, because nothing here could size a minor unit.
+      expect: { kind: 'UNPROVEN', paidAmount: null, documentTotal: null, currencyUnbound: true },
     },
     {
       name: 'an amount settled, against a total the payload did not state — nothing can be quantified',
-      amount: { paid: 50, total: null, outstanding: 50, currency: 'GBP' },
-      expect: { kind: 'UNPROVEN', paidAmount: 50, documentTotal: null },
+      amount: { paid: 50, total: null, outstanding: 50, currency: 'GBP', currencySource: 'LEDGER' as const },
+      expect: { kind: 'UNPROVEN', paidAmount: 50, documentTotal: null, currencyUnbound: false },
     },
     {
       name: 'a NEGATIVE settled amount — over-credited, and this code has no honest reading of it',
       amount: ledgerAmount(100, 125, 'GBP'),
-      expect: { kind: 'UNPROVEN', paidAmount: -25, documentTotal: 100 },
+      expect: { kind: 'UNPROVEN', paidAmount: -25, documentTotal: 100, currencyUnbound: false },
     },
     {
       name: 'a document this read said NOTHING about is not a document with nothing on it',
       amount: undefined,
-      expect: { kind: 'UNPROVEN', paidAmount: null, documentTotal: null },
+      // A document the read said NOTHING about has no binding to report on — see the classifier.
+      expect: { kind: 'UNPROVEN', paidAmount: null, documentTotal: null, currencyUnbound: false },
     },
   ]
   for (const c of cases) {

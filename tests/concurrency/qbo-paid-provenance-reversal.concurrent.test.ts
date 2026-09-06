@@ -89,6 +89,9 @@ const ledgerAmount = (total: number | null, balance: number | null, currency: st
   outstanding: balance,
   paid: total === null || balance === null ? null : total - balance,
   currency,
+  // o3d-psrx r15: these fixtures state their own currency directly, which is what the LEDGER source
+  // means — QuickBooks said it. `null` here is the unbound state, exactly as in production.
+  currencySource: (currency == null ? 'NONE' : 'LEDGER') as 'LEDGER' | 'IMS_DOCUMENT' | 'NONE',
 })
 
 /**
