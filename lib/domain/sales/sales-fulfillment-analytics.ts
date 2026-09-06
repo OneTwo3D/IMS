@@ -1164,8 +1164,8 @@ function visibleLabelEscape(codePoint: number): string {
 }
 
 /**
- * ONE FIELD OF A LABEL: a present value quoted and escaped, an absent one a token no present value
- * can be — and the escaping chosen so the field stays injective AFTER it is rendered (r5, r6).
+ * ONE READABLE FIELD OF A LABEL: a present value quoted and escaped, an absent one a token no
+ * present value can be — kept legible, because this half of the label exists to be READ (r5, r6).
  *
  * `<none>` is unquoted and every present value is quoted, so the two live in disjoint spaces: a
  * customer whose stored email is literally `<none>` renders `email="<none>"` and is still not the
@@ -1174,9 +1174,15 @@ function visibleLabelEscape(codePoint: number): string {
  *
  * Round 6 adds the escapes above. A backslash doubles, so an escape sequence in the output can only
  * have come from the character it names and never from a name that spells it; a quote doubles,
- * CSV-style, so a reader tracking quote state can still find the field boundaries. The encoding is
- * per character and uniquely decodable, and its output contains no character HTML collapses or
- * hides — so injective-as-a-string and injective-as-rendered are the same statement here.
+ * CSV-style, so a reader tracking quote state can still find the field boundaries.
+ *
+ * WHAT THIS ENCODING IS AND IS NOT. It escapes a LIST of code-point ranges and emits every other
+ * code point as itself, which is what makes `name=` printable next to the Customer column and
+ * `email=` next to the Email cell — the whole reason those fields are in the notice. It is NOT an
+ * identity: a list only covers the characters somebody thought of, and round 7 found the next class
+ * out — NFC `Café` and NFD `Café` pass through it unchanged, as two strings a renderer is REQUIRED
+ * to draw identically. Uniqueness is `identityLabelField`'s job, on `group=`, and the two fields
+ * are separate precisely so that neither has to be both.
  */
 function labelField(value: string | null | undefined): string {
   if (value == null) return '<none>'
@@ -1190,6 +1196,51 @@ function labelField(value: string | null | undefined): string {
     else if (char === ' ' || rendersInvisiblyOrCollapses(codePoint)) encoded += visibleLabelEscape(codePoint)
     else encoded += char
     previousWasLoneSpace = char === ' ' && !previousWasLoneSpace
+  }
+  return `"${encoded}"`
+}
+
+/**
+ * THE IDENTITY FIELD OF A LABEL: the group key, ASCII-ONLY AND REVERSIBLE (o3d-7jfq r7).
+ *
+ * A RULE, NOT A LIST. Rounds 5 and 6 both widened `rendersInvisiblyOrCollapses` after a collision
+ * got through it, and round 7 is the third: canonical equivalence. `Café` as U+00E9 and `Café` as
+ * `e` + COMBINING ACUTE U+0301 are two group keys and two raw labels, and Unicode does not merely
+ * permit a renderer to draw them identically — it REQUIRES it, so on screen they were one label.
+ * Homoglyphs are the same defect with no normalisation form to appeal to: GREEK CAPITAL ALPHA
+ * U+0391 and CYRILLIC CAPITAL A U+0410 stay distinct under NFC, NFD, NFKC and NFKD and are one
+ * glyph in every font that carries both. There is no list that ends, so this field stops listing:
+ * everything outside printable ASCII is spelled out, and what `group=` shows no longer depends on
+ * which characters anybody remembered.
+ *
+ * WHY THAT IS SUFFICIENT AND NOT MERELY LONGER. Printable ASCII holds no two code points that draw
+ * alike and none that HTML collapses or hides — bar the space, which is why a second consecutive
+ * space is still escaped. So two distinct group keys give two distinct encodings (the encoding is
+ * per code point and uniquely decodable), and two distinct encodings of printable ASCII are two
+ * distinct things ON SCREEN. Injective-as-a-string and injective-as-rendered coincide here by
+ * construction rather than by a case list that has to be re-checked whenever Unicode grows.
+ *
+ * WHAT IT COSTS. A group key built from a non-Latin name becomes escapes: the emailless guest
+ * 株式会社 keys on `guest-name:株式会社` and is printed
+ * `group="guest-name:\u682a\u5f0f\u4f1a\u793e"`, which an operator cannot read as a name. That is
+ * affordable only because it is a SPLIT — `name=`, `email=` and `customerId=` still print through
+ * `labelField` and still show the string the Customer and Email cells show, so the operator finds
+ * the row by reading those and uses `group=` only to tell two rows apart once they have. Encoding
+ * both halves this way would trade one unusable notice for another.
+ */
+function identityLabelField(value: string): string {
+  let encoded = ''
+  let previousWasLoneSpace = false
+  for (const char of value) {
+    const codePoint = char.codePointAt(0)!
+    const loneSpace = char === ' ' && !previousWasLoneSpace
+    if (char === '\\') encoded += '\\\\'
+    else if (char === '"') encoded += '""'
+    else if (loneSpace) encoded += ' '
+    // Printable ASCII above the space, minus the backslash and quote handled above: emitted raw.
+    else if (codePoint > 0x20 && codePoint <= 0x7e) encoded += char
+    else encoded += visibleLabelEscape(codePoint)
+    previousWasLoneSpace = loneSpace
   }
   return `"${encoded}"`
 }
@@ -1219,15 +1270,21 @@ function labelField(value: string | null | undefined): string {
  * by exhausting the cases the key is built from, a proof that has to be redone, correctly, every
  * time the key changes. Carrying the key cannot go stale.
  *
- * AND EVERY PART OF IT IS SOMETHING THE OPERATOR CAN LOOK AT. `name=` is the Customer column,
- * `email=` is the Email column, and `customerId=` is a column of the CSV export this notice already
- * points at — three fields that are matched against the row on screen. `group=` is the identity the
- * other three were read from, printed in a form that is readable rather than opaque (`cust-1`, or
- * `guest-email:…` / `guest-name:…`), so it names the row too instead of only separating it.
+ * TWO FIELDS, TWO JOBS, TWO ENCODINGS (r7). `name=` is the Customer column, `email=` is the Email
+ * column and `customerId=` is a column of the CSV export this notice already points at: they exist
+ * to be READ against the row on screen, so they go through `labelField` and stay legible — a
+ * non-Latin name is printed as the name. `group=` exists to be UNIQUE: it is the map key the row
+ * was grouped under, and it goes through `identityLabelField`, which is ASCII-only.
  *
- * AND INJECTIVE WHERE IT IS READ, NOT ONLY WHERE IT IS BUILT. `labelField` escapes whitespace and
- * invisible characters as well as quotes, because the notice is rendered as collapsing HTML and a
- * label that is distinct only before rendering is not distinct to the operator — see it for why.
+ * Those jobs were fighting while one encoder did both. An encoder legible enough for `name=` emits
+ * most code points unchanged, and rounds 5, 6 and 7 each found another pair it therefore let
+ * through — quote, whitespace, canonical equivalence. Splitting ends the recurrence rather than
+ * postponing it: `group=` no longer depends on which characters anybody remembered to escape, and
+ * `name=` no longer has to carry a burden that would make it unreadable. See both for why.
+ *
+ * AND INJECTIVE WHERE IT IS READ, NOT ONLY WHERE IT IS BUILT. The notice is rendered as collapsing
+ * HTML, so a label distinct only before rendering is not distinct to the operator. `group=` is
+ * distinct after rendering because printable ASCII has no two code points that draw alike.
  *
  * QUOTED CSV-STYLE, WITH INNER QUOTES DOUBLED. Entries are separated by `; ` because a company name
  * may contain a comma — and it may contain a semicolon too, at which point an unquoted list is a
@@ -1237,7 +1294,7 @@ function labelField(value: string | null | undefined): string {
  * and visibly a value rather than a gap.
  */
 function inconsistentCustomerLabel(row: Pick<CustomerReportRow, 'customerId' | 'customerName' | 'customerEmail'>): string {
-  return `name=${labelField(row.customerName)} email=${labelField(row.customerEmail)} customerId=${labelField(row.customerId)} group=${labelField(customerGroupKey(row))}`
+  return `name=${labelField(row.customerName)} email=${labelField(row.customerEmail)} customerId=${labelField(row.customerId)} group=${identityLabelField(customerGroupKey(row))}`
 }
 
 /**

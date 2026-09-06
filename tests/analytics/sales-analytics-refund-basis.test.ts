@@ -1548,6 +1548,26 @@ test('help-docs/analytics.md documents the label format the code actually emits 
   assert.equal(doc.includes('[guest]'), false)
 })
 
+test('help-docs/analytics.md documents the ASCII-only group field it now emits (o3d-7jfq r7)', async () => {
+  // The doc has been wrong about this notice twice, so the round-7 split is executed rather than
+  // described: the worked example in the paragraph is PRODUCED here and matched against the file.
+  // A doc that still promised only whitespace escapes would send an operator meeting
+  // `group="guest-name:株…"` looking for a name that had been corrupted.
+  const report = await reportForContradicted([
+    contradicted({ id: 'order-1', customerId: null, customerName: '株式会社アクメ', customerEmail: null, totalBase: '200' }),
+  ])
+  const notice = inconsistentNotice(report)
+  assert.ok(notice, 'the report did not raise the inconsistent-evidence notice')
+  const entry = noticeEntries(notice!)[0]!
+
+  const doc = analyticsDoc()
+  assert.ok(doc.includes(entry), `help-docs/analytics.md does not show the label the code emits: ${entry}`)
+  // AND IT SAYS WHY, because the example alone reads as a bug. The split is the operator-facing
+  // fact: one half to find the row by, one half to tell two rows apart by.
+  assert.ok(doc.includes('**ASCII only**'), doc.slice(doc.indexOf('A third case reads differently')))
+  assert.ok(doc.includes('an identity you cannot tell apart is not an identity'), doc)
+})
+
 test('customer mix: two distinct customer groups sharing one name are two distinguishable entries (o3d-7jfq)', async () => {
   // ROUND 4, FINDING 2. Rows are grouped on `customerId ?? guest-email:… ?? guest-name:…`, so two
   // guests really called `John Smith` are two rows — and a notice projecting them to `customerName`
