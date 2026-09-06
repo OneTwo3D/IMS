@@ -38,8 +38,15 @@ const state = {
   chargebacks: [] as string[],
   /** Every QuickBooks query string this run issued, so the by-id read can be told from the delta read. */
   queries: [] as string[],
-  /** Documents the by-id read is allowed to answer about, keyed by id. */
-  qboDocuments: new Map<string, { Id: string; Balance: number; TotalAmt: number }>(),
+  /**
+   * Documents the by-id read is allowed to answer about, keyed by id.
+   *
+   * o3d-psrx r10 (Codex HIGH 2/3): `Balance` and `TotalAmt` are `unknown`, not `number`. QuickBooks
+   * may serialise money as a string, and typing them as numbers here would make the very payload the
+   * by-id defect turns on unwritable in this harness. `CurrencyRef` is on the row for the same reason
+   * production reads it there: `qboQuery` issues `SELECT *`.
+   */
+  qboDocuments: new Map<string, { Id: string; Balance: unknown; TotalAmt: unknown; CurrencyRef?: unknown }>(),
   /** Ids the DELTA read reports as balance-due. Empty on the second poll: the cursor has moved past. */
   deltaBalanceDue: [] as string[],
   dbClockFails: false,
@@ -418,71 +425,88 @@ test('a database fence that could not be read makes the poll INCOMPLETE, not cle
 })
 
 // ---------------------------------------------------------------------------
-// o3d-psrx r9 (Codex HIGH) — THE PARTIAL CHARGEBACK, END TO END.
+// o3d-psrx r9 (Codex HIGH) — THE PART-PAID DOCUMENT, END TO END.
 //
 // r8's gate refuses to reverse a document the ledger has not been shown to hold NOTHING on. Codex's
 // finding is what that did to the case where the ledger states its position perfectly: a 100 document
-// covered by two 50 payments, one of them removed. `paidAt` stays set — which is right — and the
-// verdict said only "IMS could not establish this", which is false and is what made the loss
-// unfindable. The tests below drive the real poller and assert on what the MARKER carries, because the
-// marker is the whole of what an operator has: there is no partial-reversal accounting path (o3d-cdhl)
-// and IMS will never settle this document by itself.
+// with 50 settled against it. `paidAt` stays set — which is right — and the verdict said only "IMS
+// could not establish this", which is false and is what made the disagreement unfindable. The tests
+// below drive the real poller and assert on what the MARKER carries, because the marker is the whole
+// of what an operator has: there is no partial-settlement accounting path (o3d-cdhl) and IMS will
+// never settle this document by itself.
+//
+// o3d-psrx r10 (Codex HIGH 1) renamed what they assert on. The verdict is `LEDGER_PARTIALLY_PAID` and
+// its third figure is the OUTSTANDING amount, because `TotalAmt - Balance` cannot tell a document that
+// lost a payment from one that was only ever part paid — see the shared-classifier tests.
 // ---------------------------------------------------------------------------
 
-test('[o3d-psrx r9] a PARTIAL QuickBooks chargeback is recorded and quantified, not absorbed as paid', async () => {
+test('[o3d-psrx r9] a PART-PAID QuickBooks document is recorded and quantified, not absorbed as paid', async () => {
   reset()
   state.salesOrders = [paidOrderRow()]
   // A registration that PROVABLY posted before the read, so the registration half of the gate would
   // ADMIT. Without this the test could pass on the document being undecidable for some other reason,
   // and would say nothing about the amount rule at all.
   state.syncLogs = [postedRegistration()]
-  // TotalAmt 100, Balance 50: one of the two payments given back, the other still applied.
-  state.qboDocuments.set('QI1', { Id: 'QI1', Balance: 50, TotalAmt: 100 })
+  // TotalAmt 100, Balance 50: QuickBooks accounts for half of this document and IMS holds all of it.
+  state.qboDocuments.set('QI1', { Id: 'QI1', Balance: 50, TotalAmt: 100, CurrencyRef: { value: 'GBP' } })
   state.deltaBalanceDue = ['QI1']
 
   const first = await poll()
 
   // NOTHING IS REVERSED, which is r8's rule and is unchanged.
-  assert.equal(first.salesReversed, 0, 'reversing the whole document would credit the 50 QuickBooks kept')
+  assert.equal(first.salesReversed, 0,
+    'reversing the whole document would credit the 50 QuickBooks still accounts for')
   assert.deepEqual(state.chargebacks, [], 'and no chargeback credit note is raised over it')
   assert.deepEqual(state.salesOrderUpdates.filter((u) => u.data.paidAt === null), [])
 
-  // ...AND THE LOSS IS ON THE RECORD AS A LOSS. This is r9: before it, the marker said
+  // ...AND THE DISAGREEMENT IS ON THE RECORD AS ONE. This is r9: before it, the marker said
   // LEDGER_NOT_PROVEN_ZERO_PAID — the same thing it says about a payload IMS cannot parse — so a
-  // measured partial chargeback and an unreadable response were one row and neither could be found.
-  assert.equal(first.partialPaymentsRemoved, 1,
+  // document whose figures IMS read perfectly and an unreadable response were one row, and neither
+  // could be found.
+  assert.equal(first.partiallyPaidDocuments, 1,
     'the poll must count this apart from the withheld verdicts that are merely undecided: it is the '
     + 'only one that will never resolve on its own')
   const marker = state.activity.find((a) => a.action === 'payment_reversal_withheld')
   assert.ok(marker, 'the withheld verdict must leave a durable marker — it is the only way back')
-  assert.equal(marker.metadata?.registrationVerdict, 'LEDGER_PART_PAYMENT_REMOVED',
-    'and the marker must say WHICH withheld state this is, or a measured loss is indistinguishable '
-    + 'from a figure IMS could not read')
-  // THE FIGURES AS FIELDS, not only inside the sentence: the number has to be queryable, or the only
-  // way to find every unreconciled partial chargeback is to read English.
-  assert.equal(marker.metadata?.partialPaymentRemoved, true)
+  assert.equal(marker.metadata?.registrationVerdict, 'LEDGER_PARTIALLY_PAID',
+    'and the marker must say WHICH withheld state this is, or a document the ledger stated is '
+    + 'indistinguishable from a figure IMS could not read')
+  // THE FIGURES AS FIELDS, not only inside the sentence: the numbers have to be queryable, or the
+  // only way to find every unreconciled disagreement is to read English.
+  assert.equal(marker.metadata?.ledgerPartiallyPaid, true)
   assert.equal(marker.metadata?.ledgerPaidAmount, 50)
   assert.equal(marker.metadata?.documentTotal, 100)
-  assert.equal(marker.metadata?.removedAmount, 50)
+  assert.equal(marker.metadata?.outstandingAmount, 50)
+  // o3d-psrx r10 (Codex HIGH 1/3): AND THE CURRENCY THEY ARE IN. A bare 50 filed beside amounts from
+  // other documents is not a figure anybody can add up, and the threshold that classified it is
+  // itself currency-dependent.
+  assert.equal(marker.metadata?.ledgerCurrency, 'GBP')
+  assert.equal(marker.metadata?.removedAmount, undefined,
+    'and NOT a removed amount: these two figures cannot establish that anything was taken away')
   assert.match(String(marker.description), /50/)
   assert.match(String(marker.description), /100/)
   assert.match(String(marker.description), /WILL NOT correct that by itself/,
     'the operator must be told IMS does not reconcile this, or they wait for a poll that never comes')
+  assert.match(String(marker.description), /only ever part paid/i,
+    'o3d-psrx r10 (Codex HIGH 1): and the warning must say what these figures do NOT establish. A '
+    + 'document that was only ever part paid states exactly the same TotalAmt and Balance as one a '
+    + 'payment was taken back from, so telling an operator a payment was removed asserts a history '
+    + 'IMS has not got')
 
-  // ---- AND IT COMES BACK, for ever, off the delta cursor. A stable partial chargeback never reaches
-  // a zero paid amount, so nothing about it resolves — which is exactly why it must not be closed.
+  // ---- AND IT COMES BACK, for ever, off the delta cursor. A document that stays part paid never
+  // reaches a zero paid amount, so nothing about it resolves — which is why it must not be closed.
   state.deltaBalanceDue = []
   ageMarkers(HOUR + 60_000)
   const markersBefore = state.activityRows.filter((r) => r.action === 'payment_reversal_withheld').length
 
   const second = await poll()
   assert.equal(second.withheldRechecked, 1)
-  assert.equal(second.partialPaymentsRemoved, 1, 'the recheck reaches the same measured answer')
+  assert.equal(second.partiallyPaidDocuments, 1, 'the recheck reaches the same stated answer')
   assert.equal(second.salesReversed, 0)
   assert.equal(state.activityRows.filter((r) => r.action === 'payment_reversal_withheld').length,
     markersBefore + 1, 'the marker is REWRITTEN, which restarts its timer and keeps the page a round robin')
   assert.equal(state.activity.some((a) => a.action === 'payment_reversal_withheld_cleared'), false,
-    'and it is NOT closed: a loss nobody has acted on is not a settled document')
+    'and it is NOT closed: a disagreement nobody has acted on is not a settled document')
 })
 
 test('[o3d-psrx r9] CONTROL: a FULL chargeback on the same order still reverses on the zero proof', async () => {
@@ -498,16 +522,16 @@ test('[o3d-psrx r9] CONTROL: a FULL chargeback on the same order still reverses 
   const result = await poll()
   assert.equal(result.salesReversed, 1,
     'QuickBooks states it holds NOTHING on this document, which is the proof r8 requires — the '
-    + 'partial verdict must narrow what reverses, not switch the reversal pass off')
-  assert.equal(result.partialPaymentsRemoved, 0, 'and nothing partial is reported about it')
+    + 'part-paid verdict must narrow what reverses, not switch the reversal pass off')
+  assert.equal(result.partiallyPaidDocuments, 0, 'and nothing part-paid is reported about it')
   assert.deepEqual(state.chargebacks, ['so_1'])
   assert.deepEqual(state.salesOrderUpdates.filter((u) => u.data.paidAt === null).map((u) => u.id), ['so_1'])
 })
 
 test('[o3d-psrx r9] an ordinary FULLY PAID document produces no marker and no partial report', async () => {
-  // THE TEST THAT STOPS THE FIX CRYING WOLF. A rule that read every "paid is less than the total" as a
-  // partial loss would fire on documents that have nothing wrong with them, and an operator shown a
-  // loss on a settled order learns to ignore the ones that are real.
+  // THE TEST THAT STOPS THE FIX CRYING WOLF. A rule that read every "paid is less than the total" as
+  // something to warn about would fire on documents that have nothing wrong with them, and an operator
+  // shown a warning on a settled order learns to ignore the ones that are real.
   reset()
   state.salesOrders = [paidOrderRow()]
   state.syncLogs = [postedRegistration()]
@@ -517,14 +541,14 @@ test('[o3d-psrx r9] an ordinary FULLY PAID document produces no marker and no pa
 
   const clean = await poll()
   assert.equal(clean.salesReversalsWithheld, 0)
-  assert.equal(clean.partialPaymentsRemoved, 0)
+  assert.equal(clean.partiallyPaidDocuments, 0)
   assert.equal(clean.salesReversed, 0)
   assert.equal(state.activity.some((a) => a.action === 'payment_reversal_withheld'), false,
     'a document nobody has a disagreement about must leave no marker whatever')
 
-  // ---- AND THE SAME THING SAID THROUGH THE LIFECYCLE: a partial chargeback that is PUT RIGHT stops
+  // ---- AND THE SAME THING SAID THROUGH THE LIFECYCLE: a part-paid document that is PUT RIGHT stops
   // being reported. This is the one route by which a fully-paid document reaches the recheck at all,
-  // and it must close the marker rather than write another partial one.
+  // and it must close the marker rather than write another part-paid one.
   reset()
   state.salesOrders = [paidOrderRow()]
   state.syncLogs = [postedRegistration()]
@@ -532,7 +556,7 @@ test('[o3d-psrx r9] an ordinary FULLY PAID document produces no marker and no pa
   state.deltaBalanceDue = ['QI1']
 
   const partial = await poll()
-  assert.equal(partial.partialPaymentsRemoved, 1, 'the precondition: there IS an open partial loss to settle')
+  assert.equal(partial.partiallyPaidDocuments, 1, 'the precondition: there IS an open disagreement to settle')
 
   // The operator re-applies the payment in QuickBooks. Nothing else changes.
   state.qboDocuments.set('QI1', { Id: 'QI1', Balance: 0, TotalAmt: 100 })
@@ -541,10 +565,140 @@ test('[o3d-psrx r9] an ordinary FULLY PAID document produces no marker and no pa
 
   const settled = await poll()
   assert.equal(settled.withheldRechecked, 1)
-  assert.equal(settled.partialPaymentsRemoved, 0,
-    'the document is whole again, so there is no loss left to report')
+  assert.equal(settled.partiallyPaidDocuments, 0,
+    'the document is whole again, so there is nothing left to report')
   assert.equal(settled.withheldResolved, 1)
   assert.ok(state.activity.some((a) => a.action === 'payment_reversal_withheld_cleared'),
-    'and the marker is CLOSED — an unreconciled loss that has been reconciled must leave the page')
+    'and the marker is CLOSED — a disagreement that has been settled must leave the page')
   assert.equal(settled.salesReversed, 0, 'nothing is reversed: the document is fully paid')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-psrx r10 (Codex HIGH 2) — TWO READERS OF ONE FIELD, AND THE STRICTER ONE CLOSED THE MARKER.
+//
+// The by-id recheck decided void/balance-due with `typeof row.Balance === 'number'`, while the amount
+// reader on the very next line went through `parseLedgerAmount`, which deliberately accepts a numeric
+// STRING. A payload serialising `Balance` as "50.00" therefore failed the strict test: the document
+// was recorded as RETURNED with no disagreement against it, and the recheck's closing loop reads
+// "returned, nothing still withheld, no error" as SETTLED — so it closed the marker while the ledger
+// and IMS still disagreed, and nothing would ever bring the document back.
+//
+// The route matters: this cannot be reached through the delta pass, which never applied the strict
+// test. It needs a marker written on poll 1 and reconsidered by the BY-ID read on poll 2.
+// ---------------------------------------------------------------------------
+
+test('[o3d-psrx r10] a numeric-string Balance keeps the withheld marker OPEN', async () => {
+  reset()
+  state.salesOrders = [paidOrderRow()]
+  state.syncLogs = [postedRegistration()]
+  // QuickBooks serialising both figures as strings. `parseLedgerAmount` reads them; `typeof x ===
+  // 'number'` does not.
+  state.qboDocuments.set('QI1', { Id: 'QI1', Balance: '50.00', TotalAmt: '100.00', CurrencyRef: { value: 'GBP' } })
+  state.deltaBalanceDue = ['QI1']
+
+  // ---- POLL 1, through the DELTA read, which has always parsed strings. The marker is written.
+  const first = await poll()
+  assert.equal(first.partiallyPaidDocuments, 1,
+    'the precondition: the delta pass must reach the part-paid verdict on a string payload, or poll 2 '
+    + 'has no marker to reconsider and this test proves nothing')
+  assert.equal(first.salesReversed, 0)
+
+  // ---- POLL 2, through the BY-ID read, with the delta window empty. This is the defect's route.
+  state.deltaBalanceDue = []
+  ageMarkers(HOUR + 60_000)
+  const second = await poll()
+
+  assert.ok(state.queries.some((q) => q === "Invoice: Id IN ('QI1')"),
+    `the recheck must actually have re-read the document by id. Saw: ${JSON.stringify(state.queries)}`)
+  assert.equal(second.withheldRechecked, 1, 'and the marker must have been due, or nothing was decided')
+  // THE HEADLINE. Under the two-reader bug the by-id row is returned, contributes no balance due, and
+  // the closing loop reads "returned + nothing withheld + no error" as SETTLED.
+  assert.equal(second.withheldResolved, 0,
+    'a document the ledger still reports a balance on must NOT be closed as settled because its '
+    + 'Balance arrived as a string')
+  assert.equal(state.activity.some((a) => a.action === 'payment_reversal_withheld_cleared'), false,
+    'and no closure row is written for it')
+  assert.equal(second.partiallyPaidDocuments, 1,
+    'the recheck reaches the same stated answer through the by-id read as the delta read did')
+  assert.deepEqual(state.salesOrderUpdates.filter((u) => u.data.paidAt === null), [],
+    'and nothing about paidAt moves in either direction')
+})
+
+test('[o3d-psrx r10] CONTROL: a string TotalAmt of zero is still recognised as VOIDED', async () => {
+  // The other half of the same one-parse change. `typeof row.TotalAmt === 'number' && === 0` was the
+  // void test; a payload stating "0.00" would have failed it, and a voided document would have stopped
+  // reversing. Paired here so the fix cannot have been "treat everything as balance due".
+  reset()
+  state.salesOrders = [paidOrderRow()]
+  state.syncLogs = [postedRegistration()]
+  state.qboDocuments.set('QI1', { Id: 'QI1', Balance: '0.00', TotalAmt: '100.00' })
+  state.deltaBalanceDue = ['QI1']
+
+  // Poll 1 leaves a marker: QuickBooks states the document fully settled, which is UNPROVEN, not a
+  // reversal — the same reading a payload IMS cannot read gets.
+  const first = await poll()
+  assert.equal(first.salesReversalsWithheld, 1, 'the precondition: a marker exists to reconsider')
+  assert.equal(first.salesReversed, 0)
+
+  // ...and now QuickBooks zeroes the document, stating the zero as a STRING.
+  state.qboDocuments.set('QI1', { Id: 'QI1', Balance: '0.00', TotalAmt: '0.00' })
+  state.deltaBalanceDue = []
+  ageMarkers(HOUR + 60_000)
+
+  const second = await poll()
+  assert.equal(second.salesReversed, 1,
+    'a VOIDED document must still reverse when its zero total arrives as a string — the one-parse '
+    + 'change must not have made the void test unreachable')
+  assert.deepEqual(state.chargebacks, [],
+    'and a voided document raises NO chargeback: QuickBooks has already reversed the AR')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-psrx r10 (Codex HIGH 3) — THE THRESHOLD BELONGS TO THE DOCUMENT'S CURRENCY.
+//
+// `PAYMENT_PRESENT_EPSILON` is 0.005 and is documented for Xero's two-decimal amounts. This poller
+// receives QuickBooks documents, and the repository supports three- and four-decimal currencies, in
+// which 0.005 is five whole minor units or fifty. Under the fixed threshold a Kuwaiti dinar document
+// still holding 0.001 read as holding NOTHING, the registration gate admitted, and `paidAt` was
+// cleared with a full chargeback credit note raised over a document the ledger was still accounting
+// for. That is the o3d-psrx defect itself, reached through the tolerance rather than through the
+// verdict.
+//
+// The pair below differs in the CURRENCY CODE and in nothing else — same total, same balance, same
+// order, same registration — and the outcomes are opposite. A fixed epsilon cannot produce that.
+// ---------------------------------------------------------------------------
+
+test('[o3d-psrx r10] the smallest amount a 3-decimal currency can hold is not treated as zero', async () => {
+  reset()
+  state.salesOrders = [paidOrderRow()]
+  state.syncLogs = [postedRegistration()]
+  // KWD is a 3-decimal currency: 0.001 is ONE minor unit, the smallest amount that can exist in it.
+  state.qboDocuments.set('QI1', { Id: 'QI1', Balance: 99.999, TotalAmt: 100, CurrencyRef: { value: 'KWD' } })
+  state.deltaBalanceDue = ['QI1']
+
+  const kwd = await poll()
+  assert.equal(kwd.salesReversed, 0,
+    'THE FINDING: QuickBooks states one whole minor unit is still settled on this document, so it has '
+    + 'NOT been shown to hold nothing — reversing it credits money the ledger is still accounting for')
+  assert.deepEqual(state.chargebacks, [], 'and no chargeback credit note is raised over it')
+  assert.equal(kwd.partiallyPaidDocuments, 1, 'it is reported as the part-paid document it is')
+  const marker = state.activity.find((a) => a.action === 'payment_reversal_withheld')
+  assert.equal(marker?.metadata?.registrationVerdict, 'LEDGER_PARTIALLY_PAID')
+  assert.equal(marker?.metadata?.ledgerCurrency, 'KWD')
+
+  // THE CONTROL, and it is the whole proof that the threshold is currency-derived rather than merely
+  // smaller: the SAME figures in a two-decimal currency really are nothing. 0.001 GBP is not an
+  // amount that exists, so the ledger holds nothing and a genuine chargeback still reverses.
+  reset()
+  state.salesOrders = [paidOrderRow()]
+  state.syncLogs = [postedRegistration()]
+  state.qboDocuments.set('QI1', { Id: 'QI1', Balance: 99.999, TotalAmt: 100, CurrencyRef: { value: 'GBP' } })
+  state.deltaBalanceDue = ['QI1']
+
+  const gbp = await poll()
+  assert.equal(gbp.salesReversed, 1,
+    'the same figures in GBP ARE nothing — a threshold that is simply smaller everywhere would have '
+    + 'switched this reversal off too, and narrowing the pass is not the same as disabling it')
+  assert.equal(gbp.partiallyPaidDocuments, 0)
+  assert.deepEqual(state.chargebacks, ['so_1'])
 })

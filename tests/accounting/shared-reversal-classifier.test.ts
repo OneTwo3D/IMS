@@ -7,14 +7,34 @@ import {
   databaseLedgerFence,
   listedLedgerPaymentIds,
   zeroPaidIsProvenReversal,
+  PAYMENT_PRESENT_EPSILON,
   type RegisteredPaymentRow,
   type XeroInvoice,
 } from '@/lib/connectors/xero/invoice-delta'
 import {
   classifyQboLedgerEvidence,
+  ledgerAmountEpsilon,
   qboLedgerAmount,
   qboWithheldReversalReason,
 } from '@/lib/connectors/quickbooks/payment-poller'
+import { currencyMinorUnits, toDecimal } from '@/lib/domain/math/decimal'
+
+/**
+ * One row of a QuickBooks reversal read, put through the PRODUCTION reader.
+ *
+ * Deliberately not a hand-built object: `qboLedgerAmount` is where `TotalAmt - Balance` is done in
+ * decimal and where `CurrencyRef` is parsed, and a fixture that reimplemented either would be testing
+ * the classifier against arithmetic production does not perform. `100 - 99.999` in binary floating
+ * point is 0.0009999999999976353, which is a different answer from the one production gives, and it
+ * is exactly the size of figure the currency-aware threshold is about.
+ */
+const ledgerAmount = (total: number | null, balance: number | null, currency: string | null = null) =>
+  qboLedgerAmount({
+    Id: 'row',
+    TotalAmt: total ?? undefined,
+    Balance: balance ?? undefined,
+    CurrencyRef: currency == null ? undefined : { value: currency },
+  })
 
 /**
  * o3d-psrx r3 (Codex HIGH) — ONE CASE TABLE, BOTH ENTRY POINTS.
@@ -224,7 +244,10 @@ test('[o3d-psrx r3] every withheld verdict can tell an operator what to do about
     // o3d-psrx r9: and the one that is not a failure to establish anything. It belongs in this census
     // because it is withheld like the rest — and it is the one whose sentence has the most work to do,
     // since it is the only withheld state IMS will never resolve by itself.
-    { verdict: 'LEDGER_PART_PAYMENT_REMOVED' as const, paidAmount: 50, documentTotal: 100, removedAmount: 50 },
+    {
+      verdict: 'LEDGER_PARTIALLY_PAID' as const,
+      paidAmount: 50, documentTotal: 100, outstandingAmount: 50, currency: 'GBP',
+    },
   ]
   const reasons = withheld.map((v) => qboWithheldReversalReason(v))
   for (const reason of reasons) {
@@ -371,13 +394,30 @@ test('[o3d-psrx r8] the QuickBooks paid amount is TotalAmt - Balance, and NULL w
   // THE ARITHMETIC IS THE EVIDENCE, and it comes out of the response the reversal read ALREADY takes:
   // `qboQuery` issues `SELECT *`, so both figures are on the row. No QuickBooks call is added by this
   // round, which is what stops the gate being something a rate-limited poll can skip.
-  assert.deepEqual(qboLedgerAmount({ Id: '1', TotalAmt: 100, Balance: 50 }), { paid: 50, total: 100 },
-    'one of two payments removed: the ledger is still holding half of this document')
-  assert.deepEqual(qboLedgerAmount({ Id: '1', TotalAmt: 100, Balance: 100 }), { paid: 0, total: 100 },
-    'every payment removed: the zero the admitting arms are written about')
+  assert.deepEqual(
+    qboLedgerAmount({ Id: '1', TotalAmt: 100, Balance: 50 }),
+    { paid: 50, total: 100, outstanding: 50, currency: null },
+    'half the document settled: the ledger is still accounting for the rest of it')
+  assert.deepEqual(
+    qboLedgerAmount({ Id: '1', TotalAmt: 100, Balance: 100 }),
+    { paid: 0, total: 100, outstanding: 100, currency: null },
+    'nothing settled: the zero the admitting arms are written about')
   // QuickBooks serialises money as a number, but `parseLedgerAmount` is the reader Xero's own amount
   // partition uses and it accepts the string form — one dialect of "is this a number" across both.
-  assert.deepEqual(qboLedgerAmount({ Id: '1', TotalAmt: '100.00', Balance: '0.00' }), { paid: 100, total: 100 })
+  assert.deepEqual(
+    qboLedgerAmount({ Id: '1', TotalAmt: '100.00', Balance: '0.00' }),
+    { paid: 100, total: 100, outstanding: 0, currency: null })
+  // o3d-psrx r10 (Codex HIGH 3): and the CURRENCY, off the same row — `qboQuery` issues `SELECT *`,
+  // so `CurrencyRef` is already in the response. Both spellings QuickBooks uses are read.
+  assert.equal(qboLedgerAmount({ Id: '1', TotalAmt: 100, Balance: 50, CurrencyRef: { value: 'kwd' } }).currency, 'KWD')
+  assert.equal(qboLedgerAmount({ Id: '1', TotalAmt: 100, Balance: 50, CurrencyRef: 'JOD' }).currency, 'JOD')
+  for (const bad of [undefined, null, '', 'GBPX', { value: 42 }, {}]) {
+    assert.equal(qboLedgerAmount({ Id: '1', TotalAmt: 100, Balance: 50, CurrencyRef: bad }).currency, null,
+      `a currency that is not an ISO-4217-shaped code must be NULL rather than a guess: ${JSON.stringify(bad)}`)
+  }
+  // o3d-psrx r10: the subtraction is DECIMAL. In IEEE-754 `100.1 - 0.1` is 100.00000000000001, and
+  // this figure is compared against a threshold small enough for a four-decimal currency to see that.
+  assert.equal(qboLedgerAmount({ Id: '1', TotalAmt: 100.1, Balance: 0.1 }).paid, 100)
 
   // NULL IS NOT ZERO. Each of these is a payload that did not state a figure this code can use, and
   // the withheld direction is the only honest one: a document might be holding anything.
@@ -404,9 +444,9 @@ test('[o3d-psrx r8] the two ways the zero is unproven do not borrow each other\'
   // Collapse the branch and the unreadable case reports "QuickBooks still shows null of this document
   // as PAID", which is not a smaller answer: it is an assertion about money nobody established.
   // r9 CHANGED THE FIXTURE, and the change is the finding. `paidAmount: 50, documentTotal: 100` is no
-  // longer this verdict at all — a MEASURED partial loss is `LEDGER_PART_PAYMENT_REMOVED` now — so
-  // testing this branch with it would be testing a state the gate cannot produce. What is left here is
-  // a figure that does not describe a removal: the ledger reporting the document still fully paid.
+  // longer this verdict at all — a document the ledger STATES as part paid is `LEDGER_PARTIALLY_PAID`
+  // now — so testing this branch with it would be testing a state the gate cannot produce. What is
+  // left here is a figure that does not describe a removal: the ledger reporting it still fully paid.
   const measured = qboWithheldReversalReason({
     verdict: 'LEDGER_NOT_PROVEN_ZERO_PAID', paidAmount: 100, documentTotal: 100,
   })
@@ -426,58 +466,60 @@ test('[o3d-psrx r8] the two ways the zero is unproven do not borrow each other\'
 })
 
 // ---------------------------------------------------------------------------
-// o3d-psrx r9 (Codex HIGH) — A PARTIAL CHARGEBACK IS A MEASUREMENT, NOT AN UNCERTAINTY.
+// o3d-psrx r9 (Codex HIGH) — A DOCUMENT THE LEDGER STATES AS PART PAID IS NOT AN UNCERTAINTY.
 //
 // r8 closed a false full-reversal by refusing to reverse anything the ledger had not been shown to
 // hold NOTHING on. Codex's finding is what that cost: every non-zero answer went into ONE verdict
 // meaning "IMS could not establish this", including the case where IMS established it perfectly.
-// A 100 document covered by two 50 payments, one removed, is `TotalAmt = 100, Balance = 50` — stable,
-// unambiguous, and the same on every future poll. Filed under "unproven", with `paidAt` left set, it
-// was in practice absorbed as "still paid" and there was nothing in IMS to find it by.
+// A 100 document with 50 settled against it is `TotalAmt = 100, Balance = 50` — stable, unambiguous,
+// and the same on every future poll. Filed under "unproven", with `paidAt` left set, it was in
+// practice absorbed as "still paid" and there was nothing in IMS to find it by.
 //
 // The split changes NO reversal decision. What it changes is what the record can say, which is the
-// whole of the fix — reconciling a partial chargeback is o3d-cdhl and is deliberately not built.
+// whole of the fix — reconciling the difference is o3d-cdhl and is deliberately not built.
+//
+// o3d-psrx r10 (Codex HIGH 1) changed what the record is ALLOWED to say. See the tests below it.
 // ---------------------------------------------------------------------------
 
-test('[o3d-psrx r9] a measured partial loss and an evidence absence are different answers', () => {
+test('[o3d-psrx r9] a stated part-paid position and an evidence absence are different answers', () => {
   const cases: Array<{ name: string; amount: Parameters<typeof classifyQboLedgerEvidence>[0]; expect: ReturnType<typeof classifyQboLedgerEvidence> }> = [
     {
-      name: 'CODEX\'S CASE: one of two 50 payments removed from a 100 document',
-      amount: { paid: 50, total: 100 },
-      expect: { kind: 'PART_REMOVED', paidAmount: 50, documentTotal: 100, removedAmount: 50 },
+      name: 'CODEX\'S CASE: a 100 document with 50 settled against it',
+      amount: ledgerAmount(100, 50, 'GBP'),
+      expect: { kind: 'PARTIALLY_PAID', paidAmount: 50, documentTotal: 100, outstandingAmount: 50, currency: 'GBP' },
     },
     {
-      name: 'every payment removed — the zero the admitting arms are written about',
-      amount: { paid: 0, total: 100 },
+      name: 'nothing settled — the zero the admitting arms are written about',
+      amount: ledgerAmount(100, 100, 'GBP'),
       expect: { kind: 'HOLDS_NOTHING' },
     },
     {
-      name: 'THE CONTROL THAT STOPS THIS CRYING WOLF: the ledger still holds the WHOLE document',
-      amount: { paid: 100, total: 100 },
-      // Nothing is missing from it, so there is no loss to report. Classified UNPROVEN rather than
-      // PART_REMOVED because "paid equals the total" is not a partial anything — and a rule that
-      // called it one would raise a loss against every fully-settled document that ever reached the
-      // gate, which is how an operator learns to ignore the warnings that are real.
+      name: 'THE CONTROL THAT STOPS THIS CRYING WOLF: the ledger accounts for the WHOLE document',
+      amount: ledgerAmount(100, 0, 'GBP'),
+      // The ledger and IMS agree about it, so there is nothing to report. Classified UNPROVEN rather
+      // than PARTIALLY_PAID because "paid equals the total" is not a partial anything — and a rule
+      // that called it one would warn about every fully-settled document that ever reached the gate,
+      // which is how an operator learns to ignore the warnings that are real.
       expect: { kind: 'UNPROVEN', paidAmount: 100, documentTotal: 100 },
     },
     {
-      name: 'within the epsilon of the total — still nothing missing',
-      amount: { paid: 99.999, total: 100 },
+      name: 'within the epsilon of the total — nothing outstanding worth naming',
+      amount: ledgerAmount(100, 0.001, 'GBP'),
       expect: { kind: 'UNPROVEN', paidAmount: 99.999, documentTotal: 100 },
     },
     {
       name: 'a figure QuickBooks would not state',
-      amount: { paid: null, total: null },
+      amount: ledgerAmount(null, null),
       expect: { kind: 'UNPROVEN', paidAmount: null, documentTotal: null },
     },
     {
-      name: 'an amount held, against a total the payload did not state — the loss cannot be quantified',
-      amount: { paid: 50, total: null },
+      name: 'an amount settled, against a total the payload did not state — nothing can be quantified',
+      amount: { paid: 50, total: null, outstanding: 50, currency: 'GBP' },
       expect: { kind: 'UNPROVEN', paidAmount: 50, documentTotal: null },
     },
     {
-      name: 'a NEGATIVE paid amount — over-credited, and `total - paid` would invent a loss bigger than the document',
-      amount: { paid: -25, total: 100 },
+      name: 'a NEGATIVE settled amount — over-credited, and this code has no honest reading of it',
+      amount: ledgerAmount(100, 125, 'GBP'),
       expect: { kind: 'UNPROVEN', paidAmount: -25, documentTotal: 100 },
     },
     {
@@ -489,41 +531,181 @@ test('[o3d-psrx r9] a measured partial loss and an evidence absence are differen
   for (const c of cases) {
     assert.deepEqual(classifyQboLedgerEvidence(c.amount), c.expect, c.name)
   }
-  // AND THE MEASUREMENT IS A MEASUREMENT: whatever else changes, the part that is gone plus the part
-  // still held is the document. A `removedAmount` that does not reconcile is worse than none.
-  const measured = classifyQboLedgerEvidence({ paid: 30, total: 100 })
-  assert.equal(measured.kind, 'PART_REMOVED')
-  if (measured.kind !== 'PART_REMOVED') return
-  assert.equal(measured.paidAmount + measured.removedAmount, measured.documentTotal)
+  // AND THE FIGURES RECONCILE: whatever else changes, what the ledger says is settled plus what it
+  // says is outstanding is the document. Three figures that do not add up are worse than none.
+  const stated = classifyQboLedgerEvidence(ledgerAmount(100, 70, 'GBP'))
+  assert.equal(stated.kind, 'PARTIALLY_PAID')
+  if (stated.kind !== 'PARTIALLY_PAID') return
+  assert.equal(stated.paidAmount + stated.outstandingAmount, stated.documentTotal)
 })
 
-test('[o3d-psrx r9] a partial chargeback withholds exactly as the verdict it was split out of', () => {
-  // THE SPLIT MUST MOVE NO MONEY. If separating the measured case had made it ADMIT, r9 would have
-  // re-opened the very defect r8 closed — a full chargeback credit note raised over the half
-  // QuickBooks never gave back.
+test('[o3d-psrx r9] a part-paid document withholds exactly as the verdict it was split out of', () => {
+  // THE SPLIT MUST MOVE NO MONEY. If separating the stated case had made it ADMIT, r9 would have
+  // re-opened the very defect r8 closed — a full chargeback credit note raised over the part the
+  // ledger is still accounting for.
   assert.equal(
     zeroPaidIsProvenReversal({
-      verdict: 'LEDGER_PART_PAYMENT_REMOVED', paidAmount: 50, documentTotal: 100, removedAmount: 50,
+      verdict: 'LEDGER_PARTIALLY_PAID', paidAmount: 50, documentTotal: 100, outstandingAmount: 50,
+      currency: 'GBP',
     }),
     false,
-    'the ledger is still holding half of this document, so the whole of it has plainly not been given back',
+    'the ledger still accounts for half of this document, so the whole of it plainly has not been '
+    + 'given back',
   )
 })
 
-test('[o3d-psrx r9] the partial-chargeback warning quantifies the loss and says IMS will not fix it', () => {
-  const reason = qboWithheldReversalReason({
-    verdict: 'LEDGER_PART_PAYMENT_REMOVED', paidAmount: 40, documentTotal: 100, removedAmount: 60,
+// ---------------------------------------------------------------------------
+// o3d-psrx r10 (Codex HIGH 1) — THE VERDICT NAMED A REMOVAL IT CANNOT SEE.
+//
+// r9 called this `LEDGER_PART_PAYMENT_REMOVED` and its third figure `removedAmount`, on the strength
+// of `TotalAmt - Balance`. Those two fields describe the document AS IT STANDS: there is no prior
+// amount in them and no payment history. So a document that was only ever part paid — invoiced at
+// 100, settled with a single 50 — produces figures identical to one that carried 100 and lost 50.
+// r9 measured "partly paid now" and reported "a payment was removed".
+//
+// The quantity was real; the story about it was not, and the story is the part an operator acts on.
+// This is the same defect the sibling reports branch is fixing in its operator notice: state what the
+// comparison establishes, and nothing beyond it.
+// ---------------------------------------------------------------------------
+
+test('[o3d-psrx r10] a document only ever part paid is the SAME reading as one that lost a payment', () => {
+  // TWO DIFFERENT HISTORIES, and QuickBooks answers about them with the same row. That equality IS
+  // the finding, asserted rather than described: nothing downstream of this point can tell them
+  // apart, so nothing downstream of this point may claim to.
+  const onlyEverPartPaid = qboLedgerAmount({ Id: 'A', TotalAmt: 100, Balance: 50, CurrencyRef: { value: 'GBP' } })
+  const lostOneOfTwoPayments = qboLedgerAmount({ Id: 'B', TotalAmt: 100, Balance: 50, CurrencyRef: { value: 'GBP' } })
+  assert.deepEqual(onlyEverPartPaid, lostOneOfTwoPayments,
+    'a 100 invoice settled by a single 50 and a 100 invoice settled by two 50s one of which was '
+    + 'deleted are the SAME TotalAmt and the SAME Balance — the read carries no history to tell them '
+    + 'apart, which is why r9 was wrong to name one of them')
+
+  const verdicts = [onlyEverPartPaid, lostOneOfTwoPayments].map((amount) => {
+    const evidence = classifyQboLedgerEvidence(amount)
+    assert.equal(evidence.kind, 'PARTIALLY_PAID', 'both must reach the same neutral classification')
+    return evidence
   })
-  // ALL THREE FIGURES. "Part of it is gone" is not actionable; "60 of 100 is gone and 40 is still
-  // applied" is what an operator reconciles against.
-  assert.match(reason, /\b40\b/, 'what QuickBooks is still holding')
+  assert.deepEqual(verdicts[0], verdicts[1], 'and it must carry the same figures for both')
+  assert.deepEqual(verdicts[0], {
+    kind: 'PARTIALLY_PAID', paidAmount: 50, documentTotal: 100, outstandingAmount: 50, currency: 'GBP',
+  }, 'THE NAME AND THE FIELDS: what is settled, what the document is for, and what is OUTSTANDING — '
+    + 'the ledger\'s own balance. Not a removed amount, which is a claim about a payment that may '
+    + 'never have existed')
+
+  // AND THE FIGURE IS THE LEDGER'S, NOT A SUBTRACTION OF OURS. `outstandingAmount` must be the
+  // `Balance` QuickBooks stated: an inference dressed as a stated figure is the same fault again.
+  assert.equal(verdicts[0].kind === 'PARTIALLY_PAID' && verdicts[0].outstandingAmount, onlyEverPartPaid.outstanding)
+})
+
+test('[o3d-psrx r10] the part-paid warning states the comparison and disclaims the removal', () => {
+  const reason = qboWithheldReversalReason({
+    verdict: 'LEDGER_PARTIALLY_PAID', paidAmount: 40, documentTotal: 100, outstandingAmount: 60,
+    currency: 'KWD',
+  })
+  // ALL THREE FIGURES, AND THE CURRENCY. "Part of it is unpaid" is not actionable; "40 of 100 is
+  // settled and 60 is outstanding, in KWD" is what an operator reconciles against — and an amount
+  // reported without its currency cannot be added to anything.
+  assert.match(reason, /\b40\b/, 'what the ledger says is settled')
   assert.match(reason, /\b100\b/, 'what it is a part OF')
-  assert.match(reason, /\b60\b/, 'and the amount that was actually removed — the figure nothing else states')
+  assert.match(reason, /\b60\b/, 'and what is still outstanding')
+  assert.match(reason, /KWD/, 'in a stated currency')
+
+  // THE DISCLAIMER, which is the whole of r10. Without it the sentence reads as a report that money
+  // was taken back, which these two figures cannot establish.
+  assert.match(reason, /only ever part paid/i,
+    'the operator must be told that a document which was never fully paid produces this same reading')
+  assert.match(reason, /NOT a report that a payment was removed/i,
+    'and told plainly that this is not a removal, or they go hunting a chargeback that may not exist')
+
+  // AND THE r9 CLAIM SENTENCES MUST BE GONE, in the words r9 actually used. A re-introduction of any
+  // of them is a re-introduction of the finding.
+  for (const claim of [/has given back/i, /so \d+ has been removed/i, /is a PARTIAL chargeback/i]) {
+    assert.doesNotMatch(reason, claim,
+      `r9's wording asserted a history the figures do not contain: ${claim}`)
+  }
+
   // AND THE SENTENCE THAT MAKES IT AN OUTSTANDING ITEM RATHER THAN A CURIOSITY. Every other withheld
   // verdict describes something IMS expects to settle by itself. This one must say the opposite, or an
   // operator reasonably files it with them and waits for a poll that is never coming.
   assert.match(reason, /WILL NOT correct that by itself/,
-    'the operator has to be told IMS does not reconcile a partial chargeback — there is no partial '
-    + 'credit-note path (o3d-cdhl), so waiting for one is waiting for ever')
+    'the operator has to be told IMS does not reconcile this — there is no partial credit-note path '
+    + '(o3d-cdhl), so waiting for one is waiting for ever')
   assert.match(reason, /paidAt was LEFT SET/, 'and that IMS still shows the document as paid meanwhile')
+
+  // A DOCUMENT WHOSE CURRENCY QUICKBOOKS DID NOT STATE still gets a sentence, without a stray code.
+  const noCurrency = qboWithheldReversalReason({
+    verdict: 'LEDGER_PARTIALLY_PAID', paidAmount: 40, documentTotal: 100, outstandingAmount: 60,
+    currency: null,
+  })
+  assert.match(noCurrency, /\b60\b/)
+  assert.doesNotMatch(noCurrency, /\(\s*\)/, 'and no empty parenthetical where the currency would go')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-psrx r10 (Codex HIGH 3) — THE EPSILON WAS CURRENCY-BLIND.
+//
+// `PAYMENT_PRESENT_EPSILON` is 0.005 and is documented for Xero's two-decimal amounts. This
+// classifier receives QuickBooks documents and no currency ever reached it, while the repository
+// supports three- and four-decimal currencies (`currencyMinorUnits`). Against those, 0.005 is FIVE
+// whole minor units in a Gulf dinar and FIFTY in CLF: an amount the ledger really is holding read as
+// nothing, the registration gate admitted, and a full chargeback was raised over a document the
+// ledger was still accounting for.
+// ---------------------------------------------------------------------------
+
+test('[o3d-psrx r10] one minor unit is never zero, in any currency the repository supports', () => {
+  // ONE MINOR UNIT of each, still settled on a document whose total the ledger states. Not one of
+  // these may read as "the ledger holds nothing".
+  const oneMinorUnit: Array<{ currency: string | null; total: number; balance: number; paid: number }> = [
+    { currency: 'GBP', total: 100, balance: 99.99, paid: 0.01 },       // 2dp
+    { currency: 'JPY', total: 100, balance: 99, paid: 1 },             // 0dp
+    { currency: 'KWD', total: 100, balance: 99.999, paid: 0.001 },     // 3dp — 0.005 swallowed this
+    { currency: 'CLF', total: 100, balance: 99.9999, paid: 0.0001 },   // 4dp — and five of these
+    // An unstated currency takes the STRICTEST threshold rather than the most convenient one: too
+    // large a threshold discards a real minor unit and lets a reversal through, while too small a one
+    // can only move a document into a verdict that withholds.
+    { currency: null, total: 100, balance: 99.9999, paid: 0.0001 },
+  ]
+  for (const c of oneMinorUnit) {
+    const evidence = classifyQboLedgerEvidence(ledgerAmount(c.total, c.balance, c.currency))
+    assert.notEqual(evidence.kind, 'HOLDS_NOTHING',
+      `${c.currency ?? 'an unstated currency'}: the ledger states ${c.paid} is still settled on this `
+      + 'document, which is one whole minor unit — reading it as nothing admits a full reversal over '
+      + 'money the ledger is still accounting for')
+    assert.equal(evidence.kind, 'PARTIALLY_PAID', `${c.currency ?? 'unstated'}: and it is reported as part paid`)
+  }
+
+  // THE CONTROL, and it is what proves the threshold is currency-DERIVED rather than merely smaller:
+  // an amount below one minor unit of its own currency really is nothing, and must still admit.
+  const belowOneMinorUnit: Array<{ currency: string; total: number; balance: number }> = [
+    { currency: 'GBP', total: 100, balance: 99.999 },     // 0.001 GBP is not an amount that exists
+    { currency: 'JPY', total: 100, balance: 99.6 },       // 0.4 JPY likewise
+    { currency: 'KWD', total: 100, balance: 99.9999 },    // 0.0001 KWD likewise
+  ]
+  for (const c of belowOneMinorUnit) {
+    assert.deepEqual(
+      classifyQboLedgerEvidence(ledgerAmount(c.total, c.balance, c.currency)),
+      { kind: 'HOLDS_NOTHING' },
+      `${c.currency}: below half a minor unit the ledger holds nothing, and a genuine reversal must `
+      + 'still be able to proceed — narrowing the pass is not the same as switching it off',
+    )
+  }
+})
+
+test('[o3d-psrx r10] the threshold is strictly below one minor unit of the currency', () => {
+  // The rule stated directly, so a future change to how it is computed is measured against the RULE
+  // rather than against the numbers it happens to produce today.
+  for (const currency of ['GBP', 'USD', 'JPY', 'KRW', 'KWD', 'BHD', 'CLF', 'UYW']) {
+    const epsilon = ledgerAmountEpsilon(currency)
+    const oneMinorUnit = toDecimal(1).div(toDecimal(10).pow(currencyMinorUnits(currency)))
+    assert.ok(epsilon.lt(oneMinorUnit),
+      `${currency}: a threshold at or above one minor unit discards a real payment as zero `
+      + `(epsilon ${epsilon.toString()}, minor unit ${oneMinorUnit.toString()})`)
+    assert.ok(epsilon.gt(0), `${currency}: and a zero threshold would make float dust a payment`)
+  }
+  // The two-decimal case is unchanged from the constant it replaces, so nothing about the ordinary
+  // currency moves.
+  assert.equal(ledgerAmountEpsilon('GBP').toString(), '0.005')
+  assert.equal(ledgerAmountEpsilon('GBP').toString(), String(PAYMENT_PRESENT_EPSILON))
+  // An unstated currency takes the finest precision the repository supports.
+  assert.ok(ledgerAmountEpsilon(null).lte(ledgerAmountEpsilon('CLF')),
+    'an unstated currency must be no more permissive than the finest currency it could be')
 })

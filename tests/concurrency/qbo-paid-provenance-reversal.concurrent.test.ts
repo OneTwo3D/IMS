@@ -77,20 +77,35 @@ async function createPaidOrder(
 }
 
 /**
+ * The shape `qboLedgerAmount` produces from one row of a reversal read: what QuickBooks states is
+ * SETTLED on the document, what the document is for, what is still OUTSTANDING (QuickBooks' own
+ * `Balance`, not a subtraction of ours), and the currency it is all in. Written here from the two
+ * figures a fixture cares about; that the production reader turns a real row into exactly this —
+ * `CurrencyRef`, a numeric-string `Balance` and all — is pinned in
+ * tests/accounting/shared-reversal-classifier.test.ts.
+ */
+const ledgerAmount = (total: number | null, balance: number | null, currency: string | null = null) => ({
+  total,
+  outstanding: balance,
+  paid: total === null || balance === null ? null : total - balance,
+  currency,
+})
+
+/**
  * o3d-psrx r8 (Codex HIGH 2) — WHAT QUICKBOOKS SAID IT STILL HOLDS ON EACH DOCUMENT.
  *
  * The gate now requires this, and requiring it is the fix: `zeroPaidIsProvenReversal` decides whether
  * a ZERO-PAID document may clear `paidAt`, and this poller used to hand it documents selected only by
- * `Balance > 0` — under which a payment PART of which was removed is indistinguishable from one that
- * is entirely gone.
+ * `Balance > 0` — under which a part-paid document is indistinguishable from one whose payments are
+ * entirely gone.
  *
  * The r3/r4 probes below are all about the REGISTRATION half of the gate, so each is given the reading
- * that actually reaches it: the payment was removed in full and QuickBooks holds nothing. Saying so is
- * compulsory now, which is the point — before r8 these tests were asserting about a precondition they
- * had never established, and so was production.
+ * that actually reaches it: QuickBooks holds nothing at all on the document. Saying so is compulsory
+ * now, which is the point — before r8 these tests were asserting about a precondition they had never
+ * established, and so was production.
  */
 const fullyRemoved = (invoiceIds: Iterable<string>, total = 100) =>
-  new Map([...invoiceIds].map((id) => [id, { paid: 0, total }] as const))
+  new Map([...invoiceIds].map((id) => [id, ledgerAmount(total, total)] as const))
 
 test(
   '[o3d-psrx r3] a QuickBooks-polled sale marked paid with no ledger registration is NOT reversed',
@@ -495,10 +510,10 @@ test(
         referenceType: 'SalesOrder',
         ledgerObservedBefore,
         ledgerAmounts: new Map([
-          // TotalAmt 100, Balance 50: one payment gone, one still applied.
-          [invoiceOf.get(halfId)!, { paid: 50, total: 100 }],
+          // TotalAmt 100, Balance 50: half the document settled, half of it outstanding.
+          [invoiceOf.get(halfId)!, ledgerAmount(100, 50, 'GBP')],
           // TotalAmt 100, Balance 100: nothing is applied to it any more.
-          [invoiceOf.get(goneId)!, { paid: 0, total: 100 }],
+          [invoiceOf.get(goneId)!, ledgerAmount(100, 100, 'GBP')],
         ]),
       },
     )
@@ -508,14 +523,16 @@ test(
     assert.ok(withheld,
       'THE FINDING: QuickBooks is still holding half of this order and the gate reversed the whole of '
       + 'it — paidAt cleared and a chargeback credit note raised over money the ledger never gave back')
-    // o3d-psrx r9 (Codex HIGH): AND IT SAYS THIS IS A MEASURED LOSS, not that IMS could not tell.
+    // o3d-psrx r9 (Codex HIGH), r10 (Codex HIGH 1): AND IT REPORTS WHAT QUICKBOOKS STATED, no more.
     // r8 gave this the same verdict a payload with no readable figures gets, which is what made a
-    // stable partial chargeback unfindable: `paidAt` stays set (correctly), and the only record of the
-    // 50 that went said IMS had established nothing. The reversal decision is unchanged — this verdict
-    // withholds exactly as its parent did — but the loss is now quantified and can be listed.
+    // standing part-paid document unfindable: `paidAt` stays set (correctly), and the only record of
+    // the 50 said IMS had established nothing. r9 split it out but called it a REMOVAL, which these
+    // two figures cannot establish — a document only ever part paid states the same pair. The reversal
+    // decision is unchanged; what is quantified is the ledger's current position.
     assert.deepEqual(withheld.verdict, {
-      verdict: 'LEDGER_PART_PAYMENT_REMOVED', paidAmount: 50, documentTotal: 100, removedAmount: 50,
-    }, 'and it must say WHICH fact was missing, with the figures an operator has to reconcile against')
+      verdict: 'LEDGER_PARTIALLY_PAID', paidAmount: 50, documentTotal: 100, outstandingAmount: 50,
+      currency: 'GBP',
+    }, 'and it must carry the figures an operator has to reconcile against, in a stated currency')
     assert.ok(!gate.admitted.some((d) => d.id === halfId))
 
     // THE CONTROL. Same order, same two registrations, same absent listing, same balance due — and
@@ -573,10 +590,10 @@ test(
         ledgerObservedBefore,
         ledgerAmounts: new Map([
           // A payload whose figures `parseLedgerAmount` cannot read — `qboLedgerAmount` answers null.
-          [invoiceOf.get(unreadableId)!, { paid: null, total: null }],
+          [invoiceOf.get(unreadableId)!, ledgerAmount(null, null)],
           // `unaskedId` is deliberately ABSENT from this map.
           // VOIDED: `qboVoidedAmount`, a fact about the document rather than a subtraction.
-          [invoiceOf.get(voidedId)!, { paid: 0, total: 0 }],
+          [invoiceOf.get(voidedId)!, ledgerAmount(0, 0)],
         ]),
       },
     )
@@ -652,8 +669,8 @@ test(
         referenceType: 'SalesOrder',
         ledgerObservedBefore,
         ledgerAmounts: new Map([
-          [invoiceOf.get(settledId)!, { paid: 100, total: 100 }],
-          [invoiceOf.get(halfId)!, { paid: 50, total: 100 }],
+          [invoiceOf.get(settledId)!, ledgerAmount(100, 0, 'GBP')],
+          [invoiceOf.get(halfId)!, ledgerAmount(100, 50, 'GBP')],
         ]),
       },
     )
@@ -668,7 +685,8 @@ test(
     const partial = gate.withheld.find((w) => w.doc.id === halfId)
     assert.ok(partial, 'the half-removed document must still be withheld and reported')
     assert.deepEqual(partial.verdict, {
-      verdict: 'LEDGER_PART_PAYMENT_REMOVED', paidAmount: 50, documentTotal: 100, removedAmount: 50,
+      verdict: 'LEDGER_PARTIALLY_PAID', paidAmount: 50, documentTotal: 100, outstandingAmount: 50,
+      currency: 'GBP',
     })
   },
 )
