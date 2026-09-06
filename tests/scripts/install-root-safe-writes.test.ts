@@ -2953,6 +2953,31 @@ test('[o3d-secops] a report that reaches one of the four sinks fails the sink ce
       Object.keys(MUTABLE_LIBRARY_NAMES))
     assert.deepEqual(complaints, [], `a printing/emptiness/report-comparison use must pass: ${addition}\n${complaints.join('\n')}`)
   }
+
+  // AND A WORD THAT MERELY STARTS WITH A REPORT'S NAME IS NOT AN ALIAS (o3d-secops r5).
+  //
+  // shellAssignments() ends a word at the first byte the mask and the source agree is a
+  // metacharacter, and a QUOTED space is the one byte those two readings cannot tell from an
+  // unquoted one — so `ref="DB_FENCE_PROBE_REASON extra"` comes back as the fragment
+  // `"DB_FENCE_PROBE_REASON`. literalName()'s optional quotes would read that as the name and put
+  // `ref` in the report set, and a spare name in that set is NOT a harmless over-approximation:
+  // the conditional rule stays silent exactly when every expansion beside a report is also a
+  // report, so an invented report is a way to buy a conditional's silence. aliasedName() requires
+  // the quoting to balance, so the fragment is not a name and `ref` is not followed.
+  const fragment = reportSinkComplaints(
+    [[FENCE_LIBRARY, `${FENCE_LIB}\nref="DB_FENCE_PROBE_REASON extra"\n`], ...SINK_CENSUS_SOURCES.slice(1)],
+    Object.keys(MUTABLE_LIBRARY_NAMES))
+  assert.deepEqual(fragment.complaints, [], fragment.complaints.join('\n'))
+  assert.ok(!fragment.followed.some((entry) => entry.startsWith('ref ')),
+    `a word that is not exactly a report's name must not be followed as an alias; it followed: ${fragment.followed.join(', ')}`)
+
+  // NOT VACUOUS: the same line with the same name as the WHOLE word IS followed, so the assertion
+  // above is the balance rule talking and not an alias rule that has stopped working.
+  const whole = reportSinkComplaints(
+    [[FENCE_LIBRARY, `${FENCE_LIB}\nref="DB_FENCE_PROBE_REASON"\n`], ...SINK_CENSUS_SOURCES.slice(1)],
+    Object.keys(MUTABLE_LIBRARY_NAMES))
+  assert.ok(whole.followed.some((entry) => entry.startsWith('ref (holds the NAME DB_FENCE_PROBE_REASON')),
+    `a quoted whole-word alias must be followed; it followed: ${whole.followed.join(', ')}`)
 })
 
 test('[o3d-secops] `eval` and an indirect `read` are BOTH refused and named at a sink', () => {
