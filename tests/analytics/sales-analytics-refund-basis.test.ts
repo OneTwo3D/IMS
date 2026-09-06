@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import path from 'node:path'
 import { test } from 'node:test'
 import { Prisma, ProductType, SalesOrderStatus } from '@/app/generated/prisma/client'
 import {
@@ -1081,18 +1083,310 @@ test('customer mix: the contradiction notice claims the QUANTITY it proved, not 
   assert.ok(notice!.includes('the costed quantity exceeds the quantity that moved'), notice)
   assert.ok(notice!.includes('Nothing here is proven about the MONEY'), notice)
   assert.ok(notice!.includes('never reads CogsEntry.totalCostBase'), notice)
-  // WHAT IT STATES AS A POSSIBILITY: both directions, neither preferred, and the zero-cost half of
-  // it is the case this very fixture is.
-  assert.ok(notice!.includes('MAY have duplicated posted cost'), notice)
-  assert.ok(notice!.includes('may carry the excess at no cost at all'), notice)
-  assert.ok(notice!.includes('Which of the two it is has not been measured'), notice)
+  // AND THE STATE THE MONEY IS LEFT IN: unmeasured, named as such.
+  assert.ok(notice!.includes('The monetary correctness of those entries is UNMEASURED'), notice)
   // AND WHAT IT MUST NOT SAY. An operator sent after a monetary error that does not exist goes
   // looking for cost evidence to delete — on THIS customer, whose posted cost is already correct.
   // Both the round-3 sentence and the round-4 conditional that preserved it are asserted absent;
-  // `overstates` catches any third phrasing of the same claim.
+  // `overstates` catches any third phrasing of the same claim. Round 5's own replacement — the
+  // REASSURING conclusion `every cost total is already right` — is asserted absent by
+  // `noMonetaryConclusion` below, which bans it in both directions at once.
   assert.equal(notice!.includes('every report that sums COGS entries is overstating cost by the duplicate'), false)
   assert.equal(notice!.includes('where they are the cause every figure that sums CogsEntry.totalCostBase overstates cost by the duplicate'), false)
   assert.equal(notice!.includes('overstates'), false)
+})
+
+// ---------------------------------------------------------------------------------------------
+// Customer Mix: THE NOTICE SAYS NOTHING ABOUT MONEY, AND THE LABEL SURVIVES BEING RENDERED
+//   — o3d-7jfq round 6
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * EVERY MONETARY CONCLUSION, IN EITHER DIRECTION, THAT THIS NOTICE IS NOT ENTITLED TO DRAW.
+ *
+ * Round 3 said the cost was overstated. Round 5 deleted that and said, of the zero-cost branch,
+ * that `every cost total is already right` — the same unmeasured claim with the sign flipped, and
+ * one an operator acts on just as readily by not looking. The check reads `CogsEntry.qty` and never
+ * `CogsEntry.totalCostBase`, so it licenses NEITHER, and `Which of the two it is` additionally
+ * asserted the two were exhaustive, which nothing establishes.
+ *
+ * The bans are on the CLAIM's grammar rather than on any one sentence, so a re-phrasing of the same
+ * conclusion is caught too. `correct` is deliberately NOT banned: the notice both says the monetary
+ * correctness is unmeasured and asks somebody to correct the entries, and a ban that hit those
+ * would be a ban this notice cannot satisfy while saying anything true.
+ */
+const MONETARY_CONCLUSIONS = [
+  'overstat', // cost is too high — round 3
+  'understat', // cost is too low — the mirror nobody has written yet
+  'already right', // round 5's reassurance
+  'is already', //  ... and any softening of it
+  'which of the two', // and the claim that those are the only two
+  'no cost at all', // the branch round 5 named in order to conclude from it
+  'cost total is',
+  'totals are right',
+]
+
+function noMonetaryConclusion(notice: string): void {
+  const lower = notice.toLowerCase()
+  for (const phrase of MONETARY_CONCLUSIONS) {
+    assert.equal(lower.includes(phrase), false, `the notice draws a monetary conclusion it did not measure: ${phrase}`)
+  }
+}
+
+test('customer mix: the contradiction notice is the SAME words whether the posted cost is right or wrong (o3d-7jfq r6)', async () => {
+  // ROUND 6, FINDING 1 — THE STRONGEST FORM OF "IT SAYS NOTHING ABOUT THE MONEY": say it twice,
+  // over the two fixtures that differ ONLY in the money, and compare the sentences.
+  //
+  // Both customers are `cust-1`/`Acme Ltd` invoicing 200 with no VAT, ten units ordered, ten
+  // dispatched on one movement, and that movement's ten-unit COGS entry posted TWICE — 20 costed
+  // units against 10 moved, contradictory in both. The one difference is what each entry costs:
+  //   RIGHT:  0 + 0 = 0 posted against a true cost of 0. Nothing is overstated by a penny.
+  //   WRONG: 40 + 40 = 80 posted against a true cost of 40. Overstated by the whole duplicate.
+  // A notice that had measured the money — in either direction — could not print one string for
+  // both. Byte equality is therefore a proof of silence, and it is a proof that cannot be
+  // satisfied by re-wording: any sentence that leans either way breaks it.
+  const moneyCorrect = await reportForContradicted([
+    contradicted({ id: 'order-1', customerId: 'cust-1', customerName: 'Acme Ltd', totalBase: '200', costPerEntry: '0' }),
+  ])
+  const moneyDoubled = await reportForContradicted([
+    contradicted({ id: 'order-1', customerId: 'cust-1', customerName: 'Acme Ltd', totalBase: '200', costPerEntry: '40' }),
+  ])
+
+  // THE PREMISE, so this cannot pass by the two fixtures being the same fixture. Both rows withhold
+  // for the same quantity reason, and the posted cost really does differ: 0 against 80.
+  assert.equal(moneyCorrect.rows[0]?.costEvidence, 'inconsistent')
+  assert.equal(moneyDoubled.rows[0]?.costEvidence, 'inconsistent')
+  assert.equal(moneyCorrect.totals.costInconsistentRows, '1')
+  assert.equal(moneyDoubled.totals.costInconsistentRows, '1')
+
+  const correctNotice = inconsistentNotice(moneyCorrect)
+  const doubledNotice = inconsistentNotice(moneyDoubled)
+  assert.ok(correctNotice, 'the report did not raise the inconsistent-evidence notice')
+  assert.ok(doubledNotice, 'the report did not raise the inconsistent-evidence notice')
+  assert.equal(correctNotice, doubledNotice)
+
+  // AND NEITHER OF THEM DRAWS THE CONCLUSION. Equality alone would also be satisfied by a notice
+  // that said the same WRONG thing twice.
+  noMonetaryConclusion(correctNotice!)
+  assert.ok(correctNotice!.includes('Nothing here is proven about the MONEY'), correctNotice)
+  assert.ok(correctNotice!.includes('never reads CogsEntry.totalCostBase'), correctNotice)
+  assert.ok(correctNotice!.includes('The monetary correctness of those entries is UNMEASURED'), correctNotice)
+})
+
+/**
+ * WHAT THE OPERATOR ACTUALLY SEES, given the notice is rendered as HTML.
+ *
+ * `ReportPageTitle` puts each notice in a `whitespace-normal` `TooltipContent`, so the CSS
+ * `white-space: normal` rules apply: every run of the document white space characters — space, tab,
+ * line feed, carriage return, form feed — is collapsed to a SINGLE space. This is that rule, and
+ * nothing more; a label is only distinguishable to the operator if it is still distinct after it.
+ */
+function asRendered(text: string): string {
+  return text.replace(/[ \t\n\r\f]+/g, ' ')
+}
+
+/** The entries of the notice's `They are, highest-ranked first: …` list, in rank order. */
+function noticeEntries(notice: string): string[] {
+  const marker = 'highest-ranked first: '
+  const list = notice.slice(notice.indexOf(marker) + marker.length)
+  return list.replace(/\.$/, '').split('; name=').map((entry, index) => (index === 0 ? entry : `name=${entry}`))
+}
+
+test('customer mix: guests whose names differ ONLY in whitespace stay distinguishable after rendering (o3d-7jfq r6)', async () => {
+  // ROUND 6, FINDING 2. Round 5 escaped quotes and nothing else, so `Acme Ltd` and `Acme\nLtd` were
+  // two group keys (`guest-name:Acme Ltd` / `guest-name:Acme<LF>Ltd`) and two distinct raw label
+  // strings — and the notice is rendered as collapsing HTML, which turned both into the one visible
+  // string `name="Acme Ltd" … group="guest-name:Acme Ltd"`. Injective in the string, not injective
+  // in what is SEEN, and the thing wanted was the second: the collision the labelling exists to
+  // remove, surviving one layer further out.
+  //
+  // Five emailless guests, each named `Acme` and `Ltd` separated by a different invisible thing:
+  //   200  a lone ordinary space          — the readable case, which must NOT be escaped
+  //   190  a NO-BREAK SPACE (U+00A0)      — renders as a space and is not one
+  //   180  two ordinary spaces            — a run, collapsed to one on screen
+  //   170  a TAB                          — collapsed to one space on screen
+  //   160  a ZERO WIDTH SPACE (U+200B)    — renders as nothing at all
+  // Descending revenue, so rank order is exactly that and no tie falls to localeCompare. Each keys
+  // on `guest-name:<its own name>`, so there are five groups; the question is only whether the five
+  // labels survive being drawn.
+  const separators = [' ', '\u00a0', '  ', '\t', '\u200b']
+  const report = await reportForContradicted(
+    separators.map((separator, index) => contradicted({
+      id: `order-${index + 1}`,
+      customerId: null,
+      customerName: `Acme${separator}Ltd`,
+      customerEmail: null,
+      totalBase: String(200 - index * 10),
+    })),
+  )
+
+  // THE PREMISE: five separate groups. A grouping that folded whitespace would make this test
+  // vacuous — there would be one row and nothing for the label to tell apart.
+  assert.equal(report.rows.length, 5)
+  assert.equal(report.totals.costInconsistentRows, '5')
+  assert.deepEqual(report.rows.map((row) => row.customerName), separators.map((separator) => `Acme${separator}Ltd`))
+
+  const notice = inconsistentNotice(report)
+  assert.ok(notice, 'the report did not raise the inconsistent-evidence notice')
+
+  // THE FIVE LABELS, DERIVED BY HAND from the escaping rule: a lone ordinary space is kept because
+  // an operator has to read the label against the Customer column; every other invisible character
+  // is spelled out, and the second of two consecutive spaces is spelled `\u0020` because the pair
+  // renders as one.
+  assert.ok(notice!.endsWith(
+    'They are, highest-ranked first: '
+    + 'name="Acme Ltd" email=<none> customerId=<none> group="guest-name:Acme Ltd"; '
+    + 'name="Acme\\u00a0Ltd" email=<none> customerId=<none> group="guest-name:Acme\\u00a0Ltd"; '
+    + 'name="Acme \\u0020Ltd" email=<none> customerId=<none> group="guest-name:Acme \\u0020Ltd"; '
+    + 'name="Acme\\tLtd" email=<none> customerId=<none> group="guest-name:Acme\\tLtd"; '
+    + 'name="Acme\\u200bLtd" email=<none> customerId=<none> group="guest-name:Acme\\u200bLtd".',
+  ), notice)
+
+  // AND THE PROPERTY THAT IS ACTUALLY LOAD-BEARING, asserted through the renderer's own rule rather
+  // than by reading the strings above: five entries, and no two of them look alike once drawn.
+  const entries = noticeEntries(notice!)
+  assert.equal(entries.length, 5)
+  const rendered = entries.map(asRendered)
+  assert.equal(new Set(rendered).size, 5, `two labels render alike: ${rendered.join(' || ')}`)
+  // The rendering step is not a no-op on the INPUT it is protecting against — proof this assertion
+  // is reached with something to do. The raw names collapse to three distinct strings; the labels
+  // built from them collapse to five.
+  assert.equal(new Set(separators.map((separator) => asRendered(`Acme${separator}Ltd`))).size, 3)
+})
+
+test('customer mix: control and bidi characters in a name reach the operator as visible escapes (o3d-7jfq r6)', async () => {
+  // The other half of "invisible": characters that are not whitespace and draw nothing, so a name
+  // carrying one is indistinguishable on screen from the same name without it — and one that
+  // REORDERS what follows it, so a label could be made to read as another customer's. Two guests,
+  // `Acme Ltd` plain on 200 and `Acme Ltd` carrying a RIGHT-TO-LEFT OVERRIDE (U+202E) and a SOFT
+  // HYPHEN (U+00AD) on 100. Both key on `guest-name:` plus their own name, so two groups.
+  const report = await reportForContradicted([
+    contradicted({ id: 'order-1', customerId: null, customerName: 'Acme Ltd', customerEmail: null, totalBase: '200' }),
+    contradicted({ id: 'order-2', customerId: null, customerName: '\u202eAcme\u00adLtd', customerEmail: null, totalBase: '100' }),
+  ])
+
+  assert.equal(report.rows.length, 2)
+
+  const notice = inconsistentNotice(report)
+  assert.ok(notice, 'the report did not raise the inconsistent-evidence notice')
+  assert.ok(notice!.endsWith(
+    'They are, highest-ranked first: '
+    + 'name="Acme Ltd" email=<none> customerId=<none> group="guest-name:Acme Ltd"; '
+    + 'name="\\u202eAcme\\u00adLtd" email=<none> customerId=<none> group="guest-name:\\u202eAcme\\u00adLtd".',
+  ), notice)
+  // NOTHING INVISIBLE SURVIVES INTO THE OUTPUT. Every code point of the notice is a printable ASCII
+  // character or one of the punctuation marks the prose itself uses — so there is no character left
+  // in it whose rendering the label's uniqueness could depend on.
+  const invisible = Array.from(notice!).filter((char) => {
+    const code = char.codePointAt(0)!
+    return code < 0x20 || code === 0x7f || (code >= 0x80 && code <= 0xa0) || code === 0xad
+      || (code >= 0x200b && code <= 0x200f) || (code >= 0x2028 && code <= 0x202f) || code === 0xfeff
+  })
+  assert.deepEqual(invisible, [])
+})
+
+test('customer mix: a name that SPELLS an escape is not the name that contains one (o3d-7jfq r6)', async () => {
+  // The sentinel problem again, one level down: the escapes are made of characters a customer can
+  // type. A guest literally called `Acme\nLtd` — backslash, letter n — must not wear the label of
+  // the guest whose name contains a newline, or round 5's `(no email)` collision is back in a new
+  // costume. The backslash doubles, so `\n` in the output can only have come from a newline and
+  // `\\n` only from a typed backslash followed by an n. 200 and 100, so rank order is the typed
+  // one first.
+  const report = await reportForContradicted([
+    contradicted({ id: 'order-1', customerId: null, customerName: 'Acme\\nLtd', customerEmail: null, totalBase: '200' }),
+    contradicted({ id: 'order-2', customerId: null, customerName: 'Acme\nLtd', customerEmail: null, totalBase: '100' }),
+  ])
+
+  // THE PREMISE: two groups, and the first really does store a backslash rather than a newline.
+  assert.equal(report.rows.length, 2)
+  assert.deepEqual(report.rows.map((row) => row.customerName), ['Acme\\nLtd', 'Acme\nLtd'])
+
+  const notice = inconsistentNotice(report)
+  assert.ok(notice, 'the report did not raise the inconsistent-evidence notice')
+  assert.ok(notice!.endsWith(
+    'They are, highest-ranked first: '
+    + 'name="Acme\\\\nLtd" email=<none> customerId=<none> group="guest-name:Acme\\\\nLtd"; '
+    + 'name="Acme\\nLtd" email=<none> customerId=<none> group="guest-name:Acme\\nLtd".',
+  ), notice)
+  const rendered = noticeEntries(notice!).map(asRendered)
+  assert.equal(new Set(rendered).size, 2, rendered.join(' || '))
+})
+
+/**
+ * THE OPERATOR-FACING DOC FOR THIS NOTICE, read as a fixture.
+ *
+ * It has now been wrong TWICE about the same notice — round 3's `every figure summing COGS is
+ * overstating cost` outlived the code that said it, and the documented label format outlived two
+ * rewrites of `inconsistentCustomerLabel`. A paragraph nobody executes drifts silently, so this
+ * file executes it.
+ */
+function analyticsDoc(): string {
+  return readFileSync(path.join(process.cwd(), 'help-docs/analytics.md'), 'utf8')
+}
+
+/** The one paragraph of that doc that is about what the contradiction notice claims. */
+function whatTheNoticeClaimsParagraph(doc: string): string {
+  const opener = '**Read what that notice claims carefully'
+  const start = doc.indexOf(opener)
+  assert.notEqual(start, -1, 'help-docs/analytics.md no longer explains what the contradiction notice claims')
+  const end = doc.indexOf('\n\n', start)
+  assert.notEqual(end, -1, 'the paragraph runs to the end of the file — the extraction found no boundary')
+  return doc.slice(start, end)
+}
+
+test('help-docs/analytics.md draws no monetary conclusion the check did not measure (o3d-7jfq r6)', async () => {
+  // ROUND 6, FINDING 3. The doc still carried round 3's claim — duplicate entries imply every
+  // COGS-summing figure overstates cost — which THIS branch's own zero-cost fixture disproves, and
+  // which the notice itself stopped saying two rounds ago. The same ban list is applied to the doc
+  // and to the notice, so the two cannot drift into disagreeing about what was measured.
+  const paragraph = whatTheNoticeClaimsParagraph(analyticsDoc())
+
+  // THE EXTRACTION REACHED SOMETHING: this is one paragraph about this notice, not an empty slice
+  // that every assertion below would pass over vacuously.
+  assert.ok(paragraph.length > 400, `the extracted paragraph is ${paragraph.length} characters`)
+  assert.ok(paragraph.includes('CogsEntry.qty'), paragraph)
+  assert.ok(paragraph.includes('never `CogsEntry.totalCostBase`'), paragraph)
+
+  noMonetaryConclusion(paragraph)
+  // AND IT SAYS THE THING THAT IS TRUE: unmeasured, and unmeasured in both directions.
+  assert.ok(paragraph.includes('unmeasured'), paragraph)
+  assert.ok(paragraph.includes('does not establish that any figure summing COGS entries is wrong'), paragraph)
+  assert.ok(paragraph.includes('does not establish that any of them is right'), paragraph)
+})
+
+test('help-docs/analytics.md documents the label format the code actually emits (o3d-7jfq r6)', async () => {
+  // The doc described `"customer name" email [customer id]` — the round-3 format, two rewrites
+  // stale, with the `[guest]` marker that no longer exists. Rather than describe the shape in prose
+  // and hope, the doc carries two worked examples and this test PRODUCES them: a registered
+  // customer with no stored email on 200, and an emailless guest of the same name on 100. Same
+  // Customer cell, same (absent) Email cell, and two rows — which is the pair the format exists for.
+  const report = await reportForContradicted([
+    contradicted({ id: 'order-1', customerId: 'cust-1', customerName: 'Acme Ltd', customerEmail: null, totalBase: '200' }),
+    contradicted({ id: 'order-2', customerId: null, customerName: 'Acme Ltd', customerEmail: null, totalBase: '100' }),
+  ])
+  const notice = inconsistentNotice(report)
+  assert.ok(notice, 'the report did not raise the inconsistent-evidence notice')
+
+  const entries = noticeEntries(notice!)
+  // THE PREMISE: two labels, and they are not the same label. If the report merged these two the
+  // doc assertions below would still pass on one example and prove nothing about the other.
+  assert.equal(entries.length, 2)
+  assert.equal(entries[0], 'name="Acme Ltd" email=<none> customerId="cust-1" group="cust-1"')
+  assert.equal(entries[1], 'name="Acme Ltd" email=<none> customerId=<none> group="guest-name:Acme Ltd"')
+
+  const doc = analyticsDoc()
+  for (const entry of entries) {
+    assert.ok(doc.includes(entry), `help-docs/analytics.md does not show the label the code emits: ${entry}`)
+  }
+  // AND THE ESCAPES IT PROMISES ARE THE ESCAPES THE CODE WRITES — the four the whitespace test
+  // derives by hand, named in the doc so an operator meeting one knows it is not part of the name.
+  for (const escape of ['`\\t`', '`\\n`', '`\\u00a0`', '`\\u0020`']) {
+    assert.ok(doc.includes(escape), `help-docs/analytics.md does not document the ${escape} escape`)
+  }
+  // AND IT NO LONGER SHOWS THE FORMAT IT USED TO. `[guest]` was the round-3 marker for a guest with
+  // no customer record; the code has emitted `customerId=<none>` since round 5.
+  assert.equal(doc.includes('`"customer name" email [customer id]`'), false)
+  assert.equal(doc.includes('[guest]'), false)
 })
 
 test('customer mix: two distinct customer groups sharing one name are two distinguishable entries (o3d-7jfq)', async () => {
