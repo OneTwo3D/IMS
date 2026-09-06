@@ -1332,17 +1332,24 @@ test('[o3d-rn10] the refusal of a symlinked root names the bind mount an operato
   assert.deepEqual(readdirSync(target), [], 'and nothing may be written through the link')
   assert.ok(refused.stderr.includes(`${stateRoot} is a symbolic link`),
     `the refusal must name the root it refused: ${refused.stderr}`)
-  assert.match(refused.stderr, /mount --bind/,
-    'and say what to do instead, in a form that can be run')
-  assert.match(refused.stderr, /fstab/,
-    'including the half that survives a reboot')
+  assert.match(refused.stderr, /bind-mount the disk onto it/,
+    'and say what to do instead')
+  assert.match(refused.stderr, /rsyncs into this root with --delete and chowns it RECURSIVELY/,
+    'and WHY an aliased root is unsafe, which is the half an operator has to weigh')
   assert.match(refused.stderr, /no data has to move/,
     'and the fact that answers the question an operator asks first')
-  // o3d-secops r7 second pass: and the procedure a LIVE host needs, since the installer now prints
-  // this same refusal at pre-flight with the service still running.
-  assert.match(refused.stderr, /stop the application service/, refused.stderr)
-  assert.ok(refused.stderr.includes(`this run resolved that link to: ${realpathSync(stateRoot)}`), refused.stderr)
-  assert.match(refused.stderr, /put the link back at once/, refused.stderr)
+  assert.ok(refused.stderr.includes(`This run resolved that link to: ${realpathSync(stateRoot)}`), refused.stderr)
+  // AND NOTHING THAT CAN BE PASTED (o3d-secops r8, Codex HIGH). The refusal used to print a
+  // five-step `rm && mkdir -p && mount --bind` procedure behind an apparatus that decided whether
+  // it was safe to print — and that apparatus produced a finding in every review it survived, the
+  // last being the procedure itself: `rm ROOT && mkdir -p ROOT && mount --bind …` is raceable in a
+  // parent somebody else can write, and `/var/log` — LOG_DIR's parent — is exactly that on Ubuntu,
+  // as this same script says elsewhere. It points at the documentation now.
+  assert.match(refused.stderr, /docs\/installation\.md, "Putting a state root on another disk"/, refused.stderr)
+  for (const command of NO_PASTEABLE_COMMAND) {
+    assert.ok(!command.test(refused.stderr),
+      `the refusal must print no command to paste, and ${command} matched: ${refused.stderr}`)
+  }
 
   // NOT VACUOUS: the SAME layout with a real directory at the root name publishes. What is refused
   // is the LINK, not the location — an alternate disk is still supported, as a mount rather than a
@@ -4301,47 +4308,292 @@ test('[o3d-czpy] copy_tree_into_new_dir refuses a name replaced, AFTER it was cr
 })
 
 // ---------------------------------------------------------------------------
-// The recursive chown, which must not hand a staging directory back to the service account.
+// THE RECURSIVE OWNERSHIP CHANGE OVER ${DATA_DIR}, WHICH MAY NOT GO THROUGH PATHNAMES
+// (o3d-n8xx, Codex CRITICAL)
+//
+// It was `find "${DATA_DIR}" \( -path "${CRONTAB_LOCK_DIR}" -o -name .ims-publish \) -prune
+// -o -exec chown -h "${APP_USER}:${APP_USER}" {} +`. `find -exec` ENUMERATES pathnames and hands
+// them to a chown that resolves them AGAIN afterwards, and `-h` protects only the FINAL component.
+// On an upgrade the service account owns this tree AND IS STILL RUNNING — section 8 precedes the
+// `systemctl stop` in section 10c — so a descendant directory renamed aside and replaced by a
+// symlink in that gap redirects a root-side ownership change through it.
+//
+// WHAT IS MEASURED BELOW is the REAL EFFECT, on a real filesystem, by a real chown: `chown(2)`
+// updates a file's ctime even when the owner it sets is the owner it already had, so an
+// unprivileged harness that chowns to its OWN uid still leaves a record of exactly which inodes the
+// walk reached. Nothing is stubbed, and no dry-run mode exists to diverge from the shipped path.
 // ---------------------------------------------------------------------------
 
-test('[o3d-czpy] the recursive chown over DATA_DIR skips the lock directory AND every staging directory', (t) => {
-  const root = createTempDirSync('ims-czpy-chown-', t)
-  const dataDir = join(root, 'data')
-  mkdirSync(join(dataDir, 'uploads/invoices'), { recursive: true })
-  mkdirSync(join(dataDir, 'locks'))
-  writeFileSync(join(dataDir, 'locks/.crontab-reconcile.lock'), '')
-  mkdirSync(join(dataDir, '.ims-publish'))
-  writeFileSync(join(dataDir, '.ims-publish/publish.abc'), 'staged\n')
-  mkdirSync(join(dataDir, 'deploy/.ims-publish'), { recursive: true })
+/** The walker itself, as it ships. */
+const CHOWN_TREE = join(REPO, 'scripts/lib/chown-tree.mjs')
 
-  // The SHIPPED line, lifted whole. A test that retyped the find expression would be testing the
-  // test. `chown` is shimmed because this harness is not root and the question is which PATHS the
-  // line reaches, not what it does to them.
-  const line = INSTALL_SH.split('\n')
-  const at = line.findIndex((l) => l.startsWith('find "${DATA_DIR}"') && l.includes('-prune'))
-  assert.notEqual(at, -1, 'scripts/install.sh must still chown ${DATA_DIR} with a pruned find')
-  const shipped = `${line[at]}\n${line[at + 1]}`
-  assert.match(shipped, /chown -h/, 'and it must still be the chown line')
+/** A shell constant's VALUE, lifted rather than retyped: a fixture that spelled `.ims-publish`
+ *  itself would keep passing after the script stopped using that name. */
+function constantValue(source: string, name: string, where: string): string {
+  const declaration = shellConstant(source, name, where)
+  const value = shellWordLiteral(declaration.slice(declaration.indexOf('=') + 1))
+  assert.equal(value.kind, 'literal', `${name} in ${where} must be a literal: ${declaration}`)
+  return value.kind === 'literal' ? value.value : ''
+}
+const CRONTAB_LOCK_SH = readFileSync(join(REPO, 'scripts/lib/crontab-lock.sh'), 'utf8')
+const LOCK_DIRNAME = constantValue(CRONTAB_LOCK_SH, 'CRONTAB_LOCK_DIRNAME', 'scripts/lib/crontab-lock.sh')
+const LOCK_FILENAME = constantValue(CRONTAB_LOCK_SH, 'CRONTAB_LOCK_FILENAME', 'scripts/lib/crontab-lock.sh')
+const STAGE_DIRNAME = constantValue(INSTALL_SH, 'PUBLISH_STAGE_DIRNAME', 'scripts/install.sh')
 
-  const log = join(root, 'chown.log')
-  const bin = shimDir(t, { chown: `for a in "$@"; do ims_shim_append ${q(log)} "$a"; done\nexit 0` })
-  const run = runBash([
+/** ctime, in nanoseconds, of every entry at or below `root`, keyed by its path relative to it.
+ *  Symlinks are `lstat`ed: the LINK's own ctime is the record of an `lchown` on it. */
+function ctimes(root: string): Map<string, bigint> {
+  const seen = new Map<string, bigint>()
+  const visit = (dir: string, prefix: string) => {
+    for (const name of readdirSync(dir)) {
+      const path = join(dir, name)
+      const stats = lstatSync(path, { bigint: true })
+      seen.set(prefix + name, stats.ctimeNs)
+      if (stats.isDirectory()) visit(path, `${prefix}${name}/`)
+    }
+  }
+  seen.set('.', lstatSync(root, { bigint: true }).ctimeNs)
+  visit(root, '')
+  return seen
+}
+
+/** Which of them the run touched. */
+function touched(before: Map<string, bigint>, after: Map<string, bigint>): string[] {
+  return [...after].filter(([path, when]) => before.get(path) !== when).map(([path]) => path).sort()
+}
+
+/** Linux sets ctime from a clock whose granularity is coarser than a nanosecond, so a snapshot
+ *  taken in the same tick as the chown that follows it would compare equal and the measurement
+ *  would silently see nothing. Every test below asserts something DID change, which is what makes
+ *  that a failure rather than a pass, and this makes it not happen in the first place. */
+function pause(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+}
+
+/** The layout section 8 walks: an ordinary subtree, the root-owned crontab lock directory, a
+ *  staging directory at the root AND one further down, and — outside the root entirely — the victim
+ *  a redirected chown would land in. */
+function plantStateRoot(t: TestContext, prefix: string): { base: string, data: string, outside: string } {
+  const base = createTempDirSync(prefix, t)
+  const data = join(base, 'data')
+  mkdirSync(join(data, 'uploads/invoices'), { recursive: true })
+  writeFileSync(join(data, 'uploads/invoices/a.pdf'), 'an invoice\n')
+  mkdirSync(join(data, LOCK_DIRNAME))
+  writeFileSync(join(data, LOCK_DIRNAME, LOCK_FILENAME), '')
+  mkdirSync(join(data, STAGE_DIRNAME))
+  writeFileSync(join(data, STAGE_DIRNAME, 'publish.abc'), 'staged\n')
+  mkdirSync(join(data, 'deploy', STAGE_DIRNAME), { recursive: true })
+  const outside = join(base, 'outside')
+  mkdirSync(outside)
+  writeFileSync(join(outside, 'f'), 'the victim\n')
+  return { base, data, outside }
+}
+
+/** The shipped walker, run over `data` as the shell runs it: from INSIDE the root, which is where
+ *  enter_service_root() leaves the process, and therefore with `.` as its only pathname. */
+function runWalk(data: string, pruneAtRoot: string, pruneAnywhere: string, opts: { helper?: string } = {}): Run {
+  return runBash([
     'set -uo pipefail',
-    `DATA_DIR="${dataDir}"`,
-    `CRONTAB_LOCK_DIR="${join(dataDir, 'locks')}"`,
-    'APP_USER=svcuser',
-    shellConstant(INSTALL_SH, 'PUBLISH_STAGE_DIRNAME'),
-    shipped,
-  ].join('\n'), { env: { PATH: `${bin}:${process.env.PATH ?? ''}` } })
-  assert.equal(run.status, 0, run.stderr)
+    `node ${q(opts.helper ?? CHOWN_TREE)} . "$(${REAL.id} -u)" "$(${REAL.id} -g)" ${q(pruneAtRoot)} ${q(pruneAnywhere)}`,
+    'echo "rc=$?"',
+  ].join('\n'), { cwd: data })
+}
 
-  const touched = readFileSync(log, 'utf8').split('\n').filter(Boolean)
-  // NOT VACUOUS: the walk did reach the directory and did chown the ordinary contents.
-  assert.ok(touched.includes(join(dataDir, 'uploads/invoices')), `the walk must reach the ordinary tree: ${touched.join(' ')}`)
-  assert.ok(!touched.some((p) => p.includes('.ims-publish')),
-    `no staging directory may be handed to the service account: ${touched.join(' ')}`)
-  assert.ok(!touched.some((p) => p.includes('/locks')),
-    `nor the crontab lock directory: ${touched.join(' ')}`)
+test('[o3d-n8xx] the ownership walk reaches the ordinary tree and hands neither the lock directory nor any staging directory to the service account', (t) => {
+  const plant = plantStateRoot(t, 'ims-n8xx-prune-')
+
+  const before = ctimes(plant.data)
+  pause(30)
+  const run = runWalk(plant.data, LOCK_DIRNAME, STAGE_DIRNAME)
+  assert.match(run.stdout, /^rc=0$/m, `the ordinary walk must succeed: ${run.stderr}`)
+  const reached = touched(before, ctimes(plant.data))
+
+  // NOT VACUOUS: the walk really did reach the root itself and the ordinary tree below it, so the
+  // absences below are a prune and not a walk that did nothing.
+  assert.ok(reached.includes('.'), `the root itself must be handed over: ${reached.join(' ')}`)
+  assert.ok(reached.includes('uploads'), reached.join(' '))
+  assert.ok(reached.includes('uploads/invoices'), reached.join(' '))
+  assert.ok(reached.includes('uploads/invoices/a.pdf'), reached.join(' '))
+  // AND `deploy` IS REACHED THOUGH THE STAGING DIRECTORY INSIDE IT IS NOT: the prune is the entry,
+  // not the subtree it sits in.
+  assert.ok(reached.includes('deploy'), reached.join(' '))
+
+  assert.ok(!reached.some((path) => path === LOCK_DIRNAME || path.startsWith(`${LOCK_DIRNAME}/`)),
+    `the crontab lock directory may not be handed to the service account: ${reached.join(' ')}`)
+  assert.ok(!reached.some((path) => path.split('/').includes(STAGE_DIRNAME)),
+    `nor any publication staging directory, at any depth: ${reached.join(' ')}`)
+
+  // MEASURED BY MUTATION, ROUTE STATED: the same shipped walker over the same tree with the two
+  // prune components empty — which is what a caller that forgot them would produce, and what
+  // `chown -R` would do if it were used here. Both protected trees are then handed over.
+  const second = plantStateRoot(t, 'ims-n8xx-noprune-')
+  const beforeMutated = ctimes(second.data)
+  pause(30)
+  const mutated = runWalk(second.data, '', '')
+  assert.match(mutated.stdout, /^rc=0$/m, mutated.stderr)
+  const reachedMutated = touched(beforeMutated, ctimes(second.data))
+  assert.ok(reachedMutated.includes(LOCK_DIRNAME),
+    `without the prune the lock directory is handed over — that is the finding this test exists to fail on: ${reachedMutated.join(' ')}`)
+  assert.ok(reachedMutated.includes(`${LOCK_DIRNAME}/${LOCK_FILENAME}`), reachedMutated.join(' '))
+  assert.ok(reachedMutated.includes(STAGE_DIRNAME), reachedMutated.join(' '))
+  assert.ok(reachedMutated.includes(`deploy/${STAGE_DIRNAME}`), reachedMutated.join(' '))
+})
+
+test('[o3d-n8xx] a symlinked descendant has its OWN ownership changed and cannot redirect the change outside the root', (t) => {
+  const plant = plantStateRoot(t, 'ims-n8xx-nofollow-')
+  // THE STATE A RENAME LEAVES BEHIND: at a name that was a directory a moment ago there is now a
+  // symlink out of the tree. This is what `find`'s enumeration could not see, and what the walker
+  // meets on its way past.
+  mkdirSync(join(plant.data, 'd'))
+  writeFileSync(join(plant.data, 'd/f'), 'inside\n')
+  symlinkSync(plant.outside, join(plant.data, 'link-out'))
+  // AND A LINK AT A NAME WHOSE TARGET THIS HARNESS CANNOT CHOWN AT ALL, so a `chown` that FOLLOWED
+  // it would fail with EPERM and the run would die — a second, independent witness that it does not.
+  symlinkSync('/etc/passwd', join(plant.data, 'link-passwd'))
+
+  const beforeOutside = ctimes(plant.outside)
+  const before = ctimes(plant.data)
+  pause(30)
+  const run = runWalk(plant.data, LOCK_DIRNAME, STAGE_DIRNAME)
+  assert.match(run.stdout, /^rc=0$/m, `a symlink in the tree must not end the run: ${run.stderr}`)
+
+  const reached = touched(before, ctimes(plant.data))
+  // THE LINKS THEMSELVES ARE RE-OWNED, which is what `chown -h` promised and what `lchown` does.
+  assert.ok(reached.includes('link-out'), `the link's own ownership must change: ${reached.join(' ')}`)
+  assert.ok(reached.includes('link-passwd'), reached.join(' '))
+  assert.ok(reached.includes('d/f'), 'and the ordinary tree beside them is still walked')
+  // AND NOTHING THEY POINT AT IS TOUCHED.
+  assert.deepEqual(touched(beforeOutside, ctimes(plant.outside)), [],
+    'nothing outside the root may be reached through a link inside it')
+  assert.equal(statSync('/etc/passwd').uid, 0, 'and the system file the second link names is untouched')
+})
+
+test('[o3d-n8xx] a descendant renamed between the enumeration and the chown cannot redirect the ownership change, and the construct this replaced could', (t) => {
+  /**
+   * THE FINDING, EXECUTED. `find -exec chown -h {} +` prints `data/d/f` while `d` is a directory and
+   * runs `chown -h data/d/f` afterwards; `-h` protects `f` and NOT `d`, so a `d` that has become a
+   * symlink in between sends the ownership change to `outside/f`.
+   *
+   * ROUTE. The mutation is the retired construct, run under a real `find` with a `chown` SHIM that
+   * performs the rename on its first invocation and then `exec`s the real chown — which is exactly
+   * the gap `-exec … +` leaves, since find batches the paths and runs the command after the walk.
+   * Nothing about the race is simulated: the enumeration is real, the rename is real, and the chown
+   * that follows is the real one, resolving the pathname it was handed.
+   *
+   * THE SHIPPED WALKER IS THEN GIVEN THE SAME TREE IN THE SAME POST-RENAME STATE. It has no
+   * enumeration to be stale, so there is no gap to plant anything in — which is the claim — and the
+   * measurement is that `outside/f` is untouched while the link at `d` is re-owned in place.
+   */
+  const attacked = plantStateRoot(t, 'ims-n8xx-race-')
+  mkdirSync(join(attacked.data, 'd'))
+  writeFileSync(join(attacked.data, 'd/f'), 'inside\n')
+
+  const raced = join(attacked.base, 'raced')
+  const bin = shimDir(t, {
+    chown: [
+      `if [[ ! -e ${q(raced)} ]]; then`,
+      `  : > ${q(raced)}`,
+      // THE RENAME THE FINDING IS ABOUT, in the gap find leaves between printing a path and
+      // running the command on it.
+      `  ${REAL.mv} -T ${q(join(attacked.data, 'd'))} ${q(join(attacked.data, 'd.moved'))}`,
+      `  ${REAL.ln} -s ${q(attacked.outside)} ${q(join(attacked.data, 'd'))}`,
+      'fi',
+      `exec ${realBin('chown')} "$@"`,
+    ].join('\n'),
+  })
+
+  const beforeOutside = ctimes(attacked.outside)
+  pause(30)
+  const mutated = runBash([
+    'set -uo pipefail',
+    // THE RETIRED CONSTRUCT, byte for byte what scripts/install.sh carried before o3d-n8xx.
+    `find "${attacked.data}" \\( -path "${join(attacked.data, LOCK_DIRNAME)}" -o -name ${q(STAGE_DIRNAME)} \\) -prune \\`,
+    `  -o -exec chown -h "$(${REAL.id} -u):$(${REAL.id} -g)" {} +`,
+    'echo "rc=$?"',
+  ].join('\n'), { env: { PATH: `${bin}:${process.env.PATH ?? ''}` } })
+
+  // NOT VACUOUS: the shim really fired, and the plant really became a symlink out of the tree.
+  assert.ok(existsSync(raced), `the shim must have run: ${mutated.stderr}`)
+  assert.equal(lstatSync(join(attacked.data, 'd')).isSymbolicLink(), true,
+    'and the directory find enumerated must have been replaced by a link')
+  assert.deepEqual(touched(beforeOutside, ctimes(attacked.outside)), ['f'],
+    `the enumerating construct must reach the victim through the renamed component — that is the finding: ${mutated.stderr}`)
+
+  // AND THE SHIPPED WALKER, ON THE SAME TREE IN THE SAME STATE.
+  const shipped = plantStateRoot(t, 'ims-n8xx-race-shipped-')
+  mkdirSync(join(shipped.data, 'd.moved'))
+  writeFileSync(join(shipped.data, 'd.moved/f'), 'inside\n')
+  symlinkSync(shipped.outside, join(shipped.data, 'd'))
+  const beforeShippedOutside = ctimes(shipped.outside)
+  const beforeShipped = ctimes(shipped.data)
+  pause(30)
+  const run = runWalk(shipped.data, LOCK_DIRNAME, STAGE_DIRNAME)
+  assert.match(run.stdout, /^rc=0$/m, run.stderr)
+  const reached = touched(beforeShipped, ctimes(shipped.data))
+  assert.ok(reached.includes('d'), `the link at the renamed name must be re-owned in place: ${reached.join(' ')}`)
+  assert.ok(reached.includes('d.moved/f'), 'and the directory that was renamed aside is still walked')
+  assert.deepEqual(touched(beforeShippedOutside, ctimes(shipped.outside)), [],
+    'and NOTHING outside the root may be reached, which is the whole of o3d-n8xx')
+})
+
+test('[o3d-n8xx] the walker refuses rather than changing ownership by pathname when it cannot address a directory by descriptor', (t) => {
+  /**
+   * The mechanism is `/proc/self/fd/N/child`, which the kernel resolves from the OPEN FILE. A
+   * walker that fell back to composing a pathname when it could not do that would be the defect
+   * with an extra step, so the absence of /proc is a refusal — the same decision the pre-flight
+   * gate makes, in the program that depends on it.
+   *
+   * ROUTE: the shipped file with its `/proc/self/fd` availability check pointed at a path that does
+   * not exist, which is what a host with no /proc presents.
+   */
+  const base = createTempDirSync('ims-n8xx-noproc-', t)
+  const shipped = readFileSync(CHOWN_TREE, 'utf8')
+  assert.ok(shipped.includes("statSync('/proc/self/fd')"),
+    'precondition: the shipped walker must check that /proc is there')
+  const helper = join(base, 'chown-tree-noproc.mjs')
+  writeFileSync(helper, shipped.replace("statSync('/proc/self/fd')", "statSync('/proc/self/fd-absent')"))
+
+  const plant = plantStateRoot(t, 'ims-n8xx-noproc-tree-')
+  const before = ctimes(plant.data)
+  pause(30)
+  const run = runWalk(plant.data, LOCK_DIRNAME, STAGE_DIRNAME, { helper })
+  assert.match(run.stdout, /^rc=1$/m, `a walker that cannot hold a descriptor must refuse: ${run.stderr}`)
+  assert.match(run.stderr, /is not available/, run.stderr)
+  assert.deepEqual(touched(before, ctimes(plant.data)), [],
+    'and it must refuse before it changes anything, not part of the way through')
+
+  // NOT VACUOUS: the identical fixture under the SHIPPED file walks the tree.
+  const ok = runWalk(plant.data, LOCK_DIRNAME, STAGE_DIRNAME)
+  assert.match(ok.stdout, /^rc=0$/m, ok.stderr)
+})
+
+test('[o3d-n8xx] the shipped call site walks by descriptor, prunes by single component, and holds the lock PATH and the lock NAME to each other', () => {
+  // WHAT MAY NO LONGER BE THERE. The construct is named by its shape rather than by one spelling:
+  // any `find` over ${DATA_DIR} that hands paths to a `chown` is the finding, however it is written.
+  const code = INSTALL_SH.split('\n').filter((line) => !line.trimStart().startsWith('#'))
+  const enumerating = code.filter((line) => /^find\s/.test(line.trimStart()) && line.includes('DATA_DIR'))
+  assert.deepEqual(enumerating, [],
+    `no line may enumerate ${'${DATA_DIR}'} with find and chown what it prints:\n${enumerating.join('\n')}`)
+  assert.ok(!code.some((line) => /-exec\s+chown/.test(line)),
+    'and no `find -exec chown` may survive anywhere in the installer')
+
+  // AND WHAT MUST BE. The call names the two prunes as SINGLE COMPONENTS, from the constants that
+  // define them, so a rename of either constant cannot leave the prune pointing at nothing.
+  const call = code.find((line) => line.startsWith('chown_state_tree "${DATA_DIR}"'))
+  assert.ok(call, `scripts/install.sh must hand ${'${DATA_DIR}'} to the descriptor walk:\n${code.slice(-1)}`)
+  assert.ok(call.includes('"${CRONTAB_LOCK_DIRNAME}"'), call)
+  assert.ok(call.includes('"${PUBLISH_STAGE_DIRNAME}"'), call)
+
+  // AND THE ONE FACT THAT COULD SILENTLY UNDO THE PRUNE is checked in the script rather than
+  // assumed: the lock directory's PATH and its NAME have to compose.
+  const guard = code.find((line) => line.includes('"${CRONTAB_LOCK_DIR}" == "${DATA_DIR%/}/${CRONTAB_LOCK_DIRNAME}"'))
+  assert.ok(guard, `the composition of ${'${CRONTAB_LOCK_DIR}'} must be asserted before it is relied on:\n${code.join('\n').slice(-2000)}`)
+
+  // AND THE WALK IT CALLS IS DESCRIPTOR-RELATIVE, which is the property the whole finding is about.
+  const walker = readFileSync(CHOWN_TREE, 'utf8')
+  assert.match(walker, /O_DIRECTORY \| constants\.O_NOFOLLOW/, 'every directory is opened without following a link')
+  assert.match(walker, /lchownSync\(at\(dirFd, name\)/, 'every entry is chowned without following one')
+  assert.match(walker, /fchownSync\(childFd/, 'and a directory is chowned through the descriptor itself')
 })
 
 // ---------------------------------------------------------------------------
@@ -4412,6 +4664,12 @@ test('[o3d-czpy] no root-side write into a service-writable directory is left un
 /** The gate, the walk it asks through, and the refusal it shares with the publisher. A rig missing
  *  any of them fails with "command not found" and every "the run must refuse" assertion passes for
  *  the wrong reason, so they travel together. */
+/** WHAT THE REFUSAL MAY NO LONGER CONTAIN (o3d-secops r8, Codex HIGH). Not a spelling check on one
+ *  command: the finding is that a copy-pasteable SEQUENCE was printed at all, so what is asserted
+ *  is the absence of every verb such a sequence needs. A future author who re-adds one step of it
+ *  fails these two tests rather than only the one that named that step. */
+const NO_PASTEABLE_COMMAND = [/mount --bind/, /\bmkdir\b/, /\brm\b/, /\/etc\/fstab/, /\bumount\b/, /\bfindmnt\b/, /\bln -s\b/] as const
+
 const ROOT_GATE = ['publish_trust_root_candidates', 'refuse_symlinked_root', 'pin_publish_root_parent', 'pin_service_root_parent', 'service_root_entry_kind', 'require_real_service_root'] as const
 
 /** The declaration the gate records what it approved into, lifted rather than retyped: under
@@ -4745,6 +5003,164 @@ test('[o3d-secops] an ordinary install still runs: real roots pass, and a first 
   assert.ok(refused.stderr.includes(`${freshApp} — the application directory — is a`), refused.stderr)
 })
 
+/** Section 8's ${DATA_DIR} ownership change, lifted whole: the guard that holds the lock PATH to the
+ *  lock NAME, and the descriptor walk it protects. */
+const SECTION8_DATA_CHOWN = [
+  shippedStatement('[[ "${CRONTAB_LOCK_DIR}" == "${DATA_DIR%/}/${CRONTAB_LOCK_DIRNAME}" ]] || die \\'),
+  shippedStatement('chown_state_tree "${DATA_DIR}" "${APP_USER}" "${CRONTAB_LOCK_DIRNAME}" "${PUBLISH_STAGE_DIRNAME}" "the state directory"'),
+].join('\n')
+
+/** What the lock subsystem contributes to a rig that runs section 8's chown: the two names, and the
+ *  function that composes the PATH from one of them — lifted, because the guard above exists
+ *  precisely to catch the two disagreeing and a rig that retyped either could not. */
+const CRONTAB_LOCK_RIG = [
+  shellConstant(CRONTAB_LOCK_SH, 'CRONTAB_LOCK_DIRNAME', 'scripts/lib/crontab-lock.sh'),
+  shellConstant(CRONTAB_LOCK_SH, 'CRONTAB_LOCK_FILENAME', 'scripts/lib/crontab-lock.sh'),
+  shellFunction(CRONTAB_LOCK_SH, 'crontab_lock_paths', 'scripts/lib/crontab-lock.sh'),
+].join('\n')
+
+test('[o3d-n8xx] an ordinary install and the upgrade after it both complete through the shipped ownership walk', (t) => {
+  /**
+   * THE OTHER HALF OF THE CRITICAL. A walk that refuses everything would satisfy every test above,
+   * so this one runs the SHIPPED section-8 statements — the gate, the root entry, the subdirectory
+   * walk and the ownership change — twice over one tree: once with ${DATA_DIR} absent, which is a
+   * first install, and once with it populated the way the first run left it plus the lock directory
+   * and a staging directory that prepare_crontab_lock() and publish_durable_file() add, which is
+   * every upgrade afterwards. Both must reach the end.
+   */
+  const base = createTempDirSync('ims-n8xx-section8-', t)
+  const varlib = join(base, 'var-lib')
+  const varlog = join(base, 'var-log')
+  mkdirSync(varlib)
+  mkdirSync(varlog)
+  const data = join(varlib, 'one-two-inventory')
+  const log = join(varlog, 'one-two-inventory')
+
+  const vars = [
+    `APP_DIR=${q(join(base, 'opt-app'))}`,
+    `DATA_DIR=${q(data)}`,
+    `LOG_DIR=${q(log)}`,
+    STORAGE_DIRS,
+    CRONTAB_LOCK_RIG,
+    // THE ACCOUNT THIS HARNESS CAN ACTUALLY CHOWN TO. `chown_state_tree` resolves it to a uid and a
+    // gid with `id`, which is the shipped behaviour; only the name differs from a real install.
+    'APP_USER="$(id -un)"',
+    `IMS_CHOWN_TREE_HELPER=${q(CHOWN_TREE)}`,
+    'crontab_lock_paths "${DATA_DIR}"',
+  ].join('\n')
+  const section8 = [
+    GATE_DATA, GATE_LOG,
+    SECTION8_ROOT_MKDIR,
+    SECTION8_DATA_SUBDIRS,
+    SECTION8_DATA_CHOWN,
+    `echo ${REACHED}`,
+  ].join('\n')
+  const script = rig([...ROOT_ENTER, ...SUBDIR_WALK, 'chown_state_tree'], section8, vars)
+
+  // THE FIRST INSTALL.
+  assert.equal(existsSync(data), false, 'precondition: a first install has no state root yet')
+  const install = runBash(script)
+  assert.equal(install.status, 0, `an ordinary first install must complete: ${install.stderr}`)
+  assert.ok(install.stdout.includes(REACHED))
+  assert.deepEqual(readdirSync(data).sort(), ['backups', 'public-uploads', 'uploads', 'xero'])
+
+  // THE UPGRADE, over what the first run left plus what the rest of the installer adds to it.
+  mkdirSync(join(data, LOCK_DIRNAME))
+  writeFileSync(join(data, LOCK_DIRNAME, LOCK_FILENAME), '')
+  mkdirSync(join(data, STAGE_DIRNAME))
+  writeFileSync(join(data, STAGE_DIRNAME, 'publish.abc'), 'staged\n')
+  mkdirSync(join(data, 'uploads', STAGE_DIRNAME))
+  writeFileSync(join(data, 'uploads/invoices/a.pdf'), 'an invoice\n')
+
+  const before = ctimes(data)
+  pause(30)
+  const upgrade = runBash(script)
+  assert.equal(upgrade.status, 0, `and the upgrade after it must complete too: ${upgrade.stderr}`)
+  assert.ok(upgrade.stdout.includes(REACHED))
+
+  const reached = touched(before, ctimes(data))
+  assert.ok(reached.includes('.') && reached.includes('uploads/invoices/a.pdf'),
+    `the upgrade must hand the ordinary tree over: ${reached.join(' ')}`)
+  assert.ok(!reached.some((path) => path.split('/').includes(LOCK_DIRNAME) || path.split('/').includes(STAGE_DIRNAME)),
+    `and neither protected subtree, at either depth: ${reached.join(' ')}`)
+
+  // MEASURED BY MUTATION, ROUTE STATED: the guard that holds ${CRONTAB_LOCK_DIR} to
+  // ${DATA_DIR}/${CRONTAB_LOCK_DIRNAME} removed, and the lock path composed from a name the walk is
+  // not told to prune — which is what a rename of one constant without the other produces. The lock
+  // directory is then handed to the service account, and with the guard it is a refused run instead.
+  const composed = 'crontab_lock_paths "${DATA_DIR}"'
+  assert.ok(vars.includes(composed), 'precondition: the rig must compose the lock path the way the entrypoints do')
+  const drifted = vars.replace(composed, `${composed}\nCRONTAB_LOCK_DIR="\${DATA_DIR}/locks-renamed"`)
+  assert.notEqual(drifted, vars, 'the mutation must move the lock PATH without moving the lock NAME')
+  const mutated = runBash(rig([...ROOT_ENTER, ...SUBDIR_WALK, 'chown_state_tree'], section8, drifted))
+  assert.equal(mutated.status, 1, `a lock path that no longer composes must end the run: ${mutated.stderr}`)
+  assert.match(mutated.stderr, /prunes it by its single name component/, mutated.stderr)
+})
+
+test('[o3d-secops] a missing /proc ends the run at the pre-flight gate, rather than downgrading it to a walk by name', (t) => {
+  /**
+   * THE FIFTH FAIL-OPEN IN THIS ROUND'S OWN HARDENING. A missing `/proc/self/fd` was a `warn`, and
+   * the run then carried on with no descriptor on the root — which enter_service_root() had a
+   * by-name branch to accommodate. Every OTHER way of not getting a descriptor was already fatal,
+   * and the code's own comment explains why a name is not an identity. There is no way to name an
+   * open directory without /proc, so there is no weaker mode worth keeping.
+   *
+   * ROUTE: the shipped gate with the ONE path it asks about pointed at a name that does not exist,
+   * which is what a container built without /proc presents. Everything else is shipped text.
+   */
+  const base = createTempDirSync('ims-secops-noproc-', t)
+  const varlib = join(base, 'var-lib')
+  mkdirSync(varlib)
+  const data = join(varlib, 'one-two-inventory')
+  mkdirSync(data)
+  writeFileSync(join(data, 'MARKER'), 'untouched\n')
+  const vars = [
+    `APP_DIR=${q(join(base, 'opt-app'))}`,
+    `DATA_DIR=${q(data)}`,
+    `LOG_DIR=${q(join(base, 'var-log'))}`,
+    STORAGE_DIRS,
+  ].join('\n')
+
+  const shippedGate = shellFunction(INSTALL_SH, 'require_real_service_root')
+  const guard = '      [[ -d /proc/self/fd ]] || die \\'
+  assert.ok(shippedGate.includes(guard), `precondition: the shipped gate must require /proc: ${shippedGate}`)
+  const withoutProc = shippedGate.replace(guard, '      [[ -d /proc/self/fd-absent ]] || die \\')
+  assert.notEqual(withoutProc, shippedGate, 'the simulated host must differ from the shipped one')
+
+  const others = ROOT_GATE.filter((name) => name !== 'require_real_service_root')
+  const refused = runBash(rig([...others], [GATE_DATA, `echo ${REACHED}`].join('\n'), [vars, withoutProc].join('\n')))
+  assert.equal(refused.status, 1, `a host with no /proc must be refused: ${refused.stderr}`)
+  assert.ok(!refused.stdout.includes(REACHED), 'and nothing after the gate may run')
+  assert.match(refused.stderr, /\/proc is not mounted/, refused.stderr)
+  assert.match(refused.stderr, /NOTHING has been created, nothing has been migrated and nothing has been started/,
+    'and the refusal must carry the guarantee the pre-flight gate can make')
+
+  // NOT VACUOUS: on this host, which HAS /proc, the SHIPPED gate approves the same root and records
+  // a descriptor for it — so what refuses above is the absence and not the fixture.
+  const ok = runBash(rig([...ROOT_GATE], [GATE_DATA, 'echo "fds=${#SERVICE_ROOT_FD[@]}"', `echo ${REACHED}`].join('\n'), vars))
+  assert.equal(ok.status, 0, `the shipped gate must approve a real root: ${ok.stderr}`)
+  assert.match(ok.stdout, /^fds=1$/m, 'and hold a descriptor on it')
+  assert.ok(ok.stdout.includes(REACHED))
+
+  // MEASURED BY MUTATION, ROUTE STATED: the r7 shape, which is what stood here — a `warn` and a
+  // fall-through instead of a `die`. The gate then APPROVES the root with no descriptor at all, and
+  // the run carries on into section 8 in the weaker mode that an account able to write the parent
+  // can switch on at will by renaming the entry for the instant of the open.
+  const lines = withoutProc.split('\n')
+  const at = lines.findIndex((line) => line.includes('[[ -d /proc/self/fd-absent ]] || die'))
+  assert.notEqual(at, -1, 'precondition: the mutation must find the guard it is replacing')
+  lines.splice(at, 2, '      [[ -d /proc/self/fd-absent ]] || { printf \'WARN: /proc is not mounted\\n\' >&2; return 0; }')
+  const warned = lines.join('\n')
+  assert.ok(!warned.includes('/proc/self/fd-absent ]] || die'),
+    'the mutation must remove the refusal, and only it — the gate\'s other refusals stay')
+
+  const mutated = runBash(rig([...others], [GATE_DATA, 'echo "fds=${#SERVICE_ROOT_FD[@]}"', `echo ${REACHED}`].join('\n'), [vars, warned].join('\n')))
+  assert.equal(mutated.status, 0, `without the refusal the run carries on: ${mutated.stderr}`)
+  assert.ok(mutated.stdout.includes(REACHED), 'which is the fail-open this test exists to fail on')
+  assert.match(mutated.stdout, /^fds=0$/m,
+    'and it carries on with NO descriptor on the root, which is the state the whole round exists to remove')
+})
+
 test('[o3d-secops] the installer and the publisher refuse a symlinked root with the SAME bytes, naming the bind mount', (t) => {
   const plant = plantSymlinkedRoot(t, 'ims-secops-one-rule-')
 
@@ -4784,30 +5200,26 @@ test('[o3d-secops] the installer and the publisher refuse a symlinked root with 
     'the pre-flight gate and the publisher must state one rule in one wording — an operator who meets '
     + 'two spellings of the same refusal at two depths has met two rules')
 
-  // AND THE REMEDY IS A PROCEDURE AN OPERATOR CAN FOLLOW ON A LIVE HOST (o3d-secops r7 second pass,
-  // Codex HIGH). The refusal is printed while the service and its cron are still running, so it has
-  // to say to stop them, has to derive the target rather than ask for it to be retyped, and has to
-  // say how to get back if the bind mount does not take. Asserted by content, not by line number.
+  // AND WHAT IT SAYS IS THE REFUSAL, THE REASON, THE RESOLVED TARGET AND WHERE THE PROCEDURE IS
+  // (o3d-secops r8, Codex HIGH). It used to be a five-step paste; the r8 note on the r10 refusal
+  // test above says why five reviews' worth of findings came out of that and it was deleted rather
+  // than hardened a sixth time. Asserted by content, not by line number.
   const block = gateLines.join('\n')
   assert.ok(gateLines[0].includes('is a symbolic link'), gateLines[0])
   assert.ok(block.includes('no data has to move'), 'the question an operator asks first')
-  assert.match(block, /stop the application service/, 'the writers must be stopped before anything is removed')
+  assert.match(block, /rsyncs into this root with --delete and chowns it RECURSIVELY/,
+    'the reason, which is the half that lets an operator judge their own host')
   // THE TARGET IS RESOLVED AND PRINTED AS A LITERAL PATH. There is no `TARGET` for anybody to
-  // mistype and no shell variable anywhere in the procedure — the run read the link itself.
+  // retype, and no shell variable anywhere in the text — the run read the link itself.
   const resolved = realpathSync(plant.stateRoot)
-  assert.ok(block.includes(`this run resolved that link to: ${resolved}`),
+  assert.ok(block.includes(`This run resolved that link to: ${resolved}`),
     `the refusal must print where the link actually goes: ${block}`)
-  assert.ok(!/\$[A-Za-z_{(]/.test(block), `no step may contain a shell variable or substitution: ${block}`)
-  assert.ok(block.includes(`rm ${plant.stateRoot} && mkdir -p ${plant.stateRoot} && mount --bind ${resolved} ${plant.stateRoot}`),
-    `the bind-mount command must be runnable exactly as printed: ${block}`)
-  assert.match(block, /findmnt /, 'and verifiable')
-  assert.ok(block.includes(`ln -s ${resolved} ${plant.stateRoot}`),
-    'and the rollback that puts the link back if the mount did not take must be on screen')
-  assert.match(block, /\/etc\/fstab/, 'including the half that survives a reboot')
-  // NOT VACUOUS ABOUT THE ORDER: the rollback must come AFTER the command it undoes, and the stop
-  // before it, or an operator reading top to bottom meets each one too late to matter.
-  assert.ok(block.indexOf('mount --bind') < block.indexOf('ln -s '), block)
-  assert.ok(block.indexOf('stop the application service') < block.indexOf('mount --bind'), block)
+  assert.ok(!/\$[A-Za-z_{(]/.test(block), `no line may contain a shell variable or substitution: ${block}`)
+  assert.match(block, /docs\/installation\.md, "Putting a state root on another disk"/,
+    'and the procedure must be pointed at rather than printed')
+  for (const command of NO_PASTEABLE_COMMAND) {
+    assert.ok(!command.test(block), `no command may be printed for pasting, and ${command} matched: ${block}`)
+  }
 
   // AND A LINK THAT RESOLVES TO NOTHING GETS A DIFFERENT ANSWER, because there is no bind mount to
   // make. Measured rather than described: the same refusal, over a dangling link.
@@ -4819,8 +5231,8 @@ test('[o3d-secops] the installer and the publisher refuse a symlinked root with 
   const viaDangling = runBash(rig([...ROOT_GATE], GATE_DATA, `DATA_DIR=${q(danglingRoot)}`))
   assert.equal(viaDangling.status, 1, viaDangling.stderr)
   assert.match(viaDangling.stderr, /does not resolve to a directory/, viaDangling.stderr)
-  assert.ok(!viaDangling.stderr.includes('mount --bind'),
-    'a dangling link must not be given a bind-mount command whose target does not exist')
+  assert.ok(!viaDangling.stderr.includes('Putting a state root on another disk'),
+    'a dangling link is not sent to a bind-mount procedure whose target does not exist')
 
   // AND IT IS ONE RULE BECAUSE IT IS ONE FUNCTION, not two texts that happen to agree today.
   assert.ok(shellFunction(INSTALL_SH, 'require_real_service_root').includes('refuse_symlinked_root "${root}"'),
@@ -5002,13 +5414,16 @@ function entryWithout(disable: { identity?: boolean, landing?: boolean, descript
     neuter('[[ -n "${landed}" && "${landed}" == "${entry#*|}" ]]')
   }
   if (disable.descriptor) {
-    // THE ENTRY'S OWN `/proc` test, not the one in the absent branch a few lines below it — both
-    // read `if [[ -d /proc/self/fd ]]; then`, so the line that follows is what tells them apart.
-    const branch = '  elif [[ -d /proc/self/fd ]]; then\n    [[ -n "${fd}" ]] || die'
-    assert.ok(body.includes(branch), `precondition: the shipped entry must enter through the descriptor: ${body}`)
-    body = body.replace(branch, '  elif false; then\n    [[ -n "${fd}" ]] || die')
-    assert.ok(body.includes('cd -P "${base}"'), 'and must still have the by-name fallback to fall into')
-    assert.ok(!body.includes(branch), 'and the descriptor branch must be unreachable after the mutation')
+    // THE ENTRY BY DESCRIPTOR, REPLACED BY THE ENTRY BY NAME. There is no `[[ -d /proc/self/fd ]]`
+    // branch to switch off any more (o3d-secops r8): the gate refuses a host with no /proc, so the
+    // by-name fallback that used to sit behind that test was unreachable in a real run and
+    // reachable in a mutated one. The mutation is therefore the fallback itself, written back in —
+    // which is exactly what an author "simplifying" this would do.
+    const entered = '    cd "/proc/self/fd/${fd}" 2>/dev/null || die'
+    assert.ok(body.includes(entered), `precondition: the shipped entry must enter through the descriptor: ${body}`)
+    body = body.replace(entered, '    cd -P "${base}" 2>/dev/null || die')
+    assert.ok(!body.includes('cd "/proc/self/fd/'), 'and the descriptor entry must be gone after the mutation')
+    assert.ok(body.includes('cd -P "${base}" 2>/dev/null || die'), 'replaced by the by-name entry it removed')
   }
   return body
 }
@@ -5147,11 +5562,12 @@ test('[o3d-secops] enter_service_root refuses a root no gate has approved, and r
     + `run onward they are not root-owned and an ownership test refuses exactly the upgrades it is meant to protect:\n${code}`)
 })
 
-test('[o3d-secops] enter_service_root enters a real MOUNT POINT at the root, which is what the remedy it prints produces', (t) => {
+test('[o3d-secops] enter_service_root enters a real MOUNT POINT at the root, which is what the documented remedy produces', (t) => {
   const mount = existingMountPoint()
   // STATED RATHER THAN GLOSSED, as it is for the publisher's own version of this test: `mount
-  // --bind` needs CAP_SYS_ADMIN, which this harness does not have, so the layout the refusal
-  // PRESCRIBES is measured against a mount that is already on the machine. To path resolution a
+  // --bind` needs CAP_SYS_ADMIN, which this harness does not have, so the layout the refusal sends
+  // the operator to the documentation FOR is measured against a mount that is already on the
+  // machine. To path resolution a
   // bind mount and a filesystem mount are the same object, and what is measured is a
   // path-resolution property: that the lstat, the inode comparison and the `..` comparison all
   // agree across a mount boundary, where the entry in the parent and the directory the walk lands
@@ -5178,122 +5594,6 @@ test('[o3d-secops] enter_service_root enters a real MOUNT POINT at the root, whi
   const viaLink = runBash(rig([...ROOT_ENTER], `require_real_service_root ${q(link)} "the state directory"`))
   assert.equal(viaLink.status, 1, 'a symlink to the same mounted directory must be refused')
   assert.ok(viaLink.stderr.includes(`${link} is a symbolic link`), viaLink.stderr)
-})
-
-/**
- * THE REMEDY IS PRINTED FOR A ROOT SHELL, SO IT MUST BE SAFE TO PASTE (o3d-secops r7 third pass,
- * Codex HIGH)
- *
- * refuse_symlinked_root() resolves the link with `readlink -f` and prints the target into commands
- * an operator is told to run as root. A component of that chain can be named by an account this
- * script does not trust — /var/log is group-writable on Ubuntu — so the target may contain a space,
- * a `;`, a `$(…)`, a newline, a tab or a backslash. Interpolated raw, that is command execution
- * with extra steps.
- *
- * WHAT IS MEASURED. The refusal is run against real directories with those names on a real
- * filesystem, and the printed command is then EVALUATED in a real bash — with a canary that the
- * injected substitution would create. The canary must not exist, and the words bash produces must
- * be exactly the paths. That is the difference between "the string looks quoted" and "the string
- * cannot execute anything", and only the second one is the claim.
- */
-test('[o3d-secops] a target whose name carries shell syntax is quoted, and the printed command cannot execute it', (t) => {
-  const base = createTempDirSync('ims-secops-inject-', t)
-  // THE PAYLOAD NAMES ITS CANARY RELATIVELY, because a `/` cannot appear in a single pathname
-  // component — so the evaluated command below is run WITH ${base} AS ITS CWD, which is also what
-  // makes "the canary was not created" a statement about that directory and nothing else.
-  const canary = join(base, 'canary.txt')
-  const varlib = join(base, 'var-lib')
-  mkdirSync(varlib)
-  // A REAL DIRECTORY whose name is a command substitution. `touch` is the payload precisely because
-  // it leaves evidence; `mkdir` refuses a name it cannot create, and this one it can.
-  const nasty = join(base, 'a b;$(touch canary.txt)\ttail\\end')
-  mkdirSync(nasty)
-  writeFileSync(join(nasty, 'DATA'), 'the operator\'s data\n')
-  const root = join(varlib, 'ims')
-  symlinkSync(nasty, root)
-
-  const run = runBash(rig([...ROOT_GATE], GATE_DATA, `DATA_DIR=${q(root)}`))
-  assert.equal(run.status, 1, run.stderr)
-
-  // NOT VACUOUS: the plant really is a directory with that name, and the refusal really resolved
-  // to it — so the bytes under test really did reach the printed command.
-  assert.equal(lstatSync(nasty).isDirectory(), true)
-  assert.equal(realpathSync(root), nasty)
-
-  const step = run.stderr.split('\n').find((line) => line.includes('mount --bind'))
-  assert.ok(step, `the refusal must print a bind-mount command: ${run.stderr}`)
-  // THE RAW PATH MUST NOT APPEAR. `printf %q` renders this one as `$'…'` — ANSI-C quoting, inside
-  // which a `$(…)` is literal text and a tab is `\t` — so the bytes of the name are present but
-  // the SYNTAX is not. Which of the two it is is settled below by running it, not by reading it.
-  assert.ok(!step.includes(nasty), `the target must not be interpolated raw: ${step}`)
-  assert.match(step, /mount --bind \$'/, `and must be quoted for the shell: ${step}`)
-
-  // THE COMMAND, PARSED AND EXPANDED BY A REAL BASH — which is what an operator pasting it does.
-  // `mount` and `rm` and `mkdir` are shadowed so nothing is actually performed; what is recorded is
-  // the ARGV each one receives, which is where an injection would show up as extra words.
-  const argv = join(base, 'argv.log')
-  writeFileSync(argv, '')
-  const command = step.replace(/^ERROR:\s+\d+\.\s+/, '')
-  const evaluated = runBash([
-    `rm() { printf 'rm|%s\\n' "$*" >> ${q(argv)}; }`,
-    `mkdir() { printf 'mkdir|%s\\n' "$*" >> ${q(argv)}; }`,
-    `mount() { printf 'mount|%s\\n' "$*" >> ${q(argv)}; }`,
-    command,
-  ].join('\n'), { cwd: base })
-  assert.equal(evaluated.status, 0, `the printed command must parse and run: ${evaluated.stderr}`)
-
-  // THE SECURITY CLAIM: nothing the name contained was executed.
-  assert.equal(existsSync(canary), false,
-    'pasting the printed command must not run a command substitution hidden in a path name')
-  // AND IT IS STILL THE RIGHT COMMAND: `mount --bind <target> <root>`, as three words, byte for
-  // byte the paths — so the quoting did not merely defang it, it preserved it.
-  const lines = readFileSync(argv, 'utf8').trim().split('\n')
-  assert.deepEqual(lines, [`rm|${root}`, `mkdir|-p ${root}`, `mount|--bind ${nasty} ${root}`],
-    `every argument must survive the round trip intact: ${lines.join(' / ')}`)
-
-  // AND THE fstab LINE USES fstab's OWN ESCAPING, which is not the shell's: fields are split on
-  // whitespace, and a space or tab or backslash is octal-escaped. `printf %q`'s answer would be
-  // read by mount as a literal backslash.
-  const fstab = run.stderr.split('\n').find((line) => line.includes('/etc/fstab'))
-  assert.ok(fstab, run.stderr)
-  assert.ok(fstab.includes('\\040'), `a space in an fstab field must be written \\040: ${fstab}`)
-  assert.ok(fstab.includes('\\011'), `and a tab \\011: ${fstab}`)
-  assert.ok(fstab.includes('\\134'), `and a backslash \\134: ${fstab}`)
-  assert.ok(!/ \t/.test(fstab), 'no raw tab may reach the fstab line')
-
-  // MEASURED BY MUTATION, ROUTE STATED: the shipped function with the two `printf %q` results
-  // replaced by the raw values — which is what it printed before this pass. The same paste then
-  // executes the substitution, and the canary appears.
-  const shipped = shellFunction(INSTALL_SH, 'refuse_symlinked_root')
-  const raw = shipped
-    .replace('qroot="$(printf \'%q\' "$root")" || qroot=""', 'qroot="$root"')
-    .replace('qtarget="$(printf \'%q\' "$target")" || qtarget=""', 'qtarget="$target"')
-  // THE TWO ASSIGNMENTS, not every `printf %q` in the function — the overlap refusal quotes a root
-  // name with one too, and asserting on the bare substring would pass on a mutation that changed
-  // nothing the printed COMMANDS use.
-  assert.ok(!raw.includes('qroot="$(printf \'%q\''), 'the mutation must remove the quoting of the root')
-  assert.ok(!raw.includes('qtarget="$(printf \'%q\''), 'and of the target')
-
-  const attackedCanary = join(base, 'canary-mutated.txt')
-  const attackedDir = join(base, 'x;$(touch canary-mutated.txt)y')
-  mkdirSync(attackedDir)
-  const attackedRoot = join(varlib, 'ims-mutated')
-  symlinkSync(attackedDir, attackedRoot)
-  const mutatedRun = runBash(rig(ROOT_GATE.filter((n) => n !== 'refuse_symlinked_root'),
-    GATE_DATA, [`DATA_DIR=${q(attackedRoot)}`, raw].join('\n')))
-  const mutatedStep = mutatedRun.stderr.split('\n').find((line) => line.includes('mount --bind'))
-  assert.ok(mutatedStep, mutatedRun.stderr)
-  assert.ok(mutatedStep.includes('$(touch'), `the unquoted value must reach the printed command: ${mutatedStep}`)
-
-  const pasted = runBash([
-    'rm() { :; }', 'mkdir() { :; }', 'mount() { :; }',
-    mutatedStep.replace(/^ERROR:\s+\d+\.\s+/, ''),
-  ].join('\n'), { cwd: base })
-  // Its STATUS is not the claim and is deliberately not asserted: an unquoted path also word-splits,
-  // so bash runs the tail of the name as a command of its own and the paste fails noisily. What
-  // matters is what ran before it did.
-  assert.equal(existsSync(attackedCanary), true,
-    `the unquoted command must execute the substitution when pasted — that is the finding, executed: ${pasted.stderr}`)
 })
 
 test('[o3d-secops] the root is entered through the descriptor pre-flight opened, so a recycled inode cannot impersonate it', (t) => {
@@ -5519,63 +5819,6 @@ test('[o3d-secops] an approved root with no descriptor is refused at the entry, 
   assert.equal(statSync(root).mode & 0o777, 0o770, 'and reach the operation it was refusing above')
 })
 
-test('[o3d-secops] a bind-mount command is printed only when the target\'s own name cannot be rebound', (t) => {
-  /**
-   * THE FINDING. The refusal says, correctly, that nothing proves the path the link's target
-   * resolves through — and then printed `mount --bind TARGET ROOT` for the operator to paste, which
-   * RESOLVES THAT PATH AGAIN, later, as root. An account that can write any directory on the way to
-   * the target replaces it between the two moments, and the bind then exposes a tree of their
-   * choosing at the state root, where the next installer run writes and chowns as root. Stopping
-   * the service does not remove that account: it is the same defect as the symlink, one step out.
-   */
-  function plant(prefix: string, diskMode: number) {
-    const base = createTempDirSync(prefix, t)
-    const varlib = join(base, 'var-lib')
-    const disk = join(base, 'srv-disk2')
-    const target = join(disk, 'ims')
-    mkdirSync(varlib)
-    mkdirSync(target, { recursive: true })
-    chmodSync(varlib, 0o755)
-    // THE ONE THING THAT DIFFERS BETWEEN THE TWO RUNS BELOW.
-    chmodSync(disk, diskMode)
-    const root = join(varlib, 'ims')
-    symlinkSync(target, root)
-    return { base, root, target }
-  }
-
-  const exposed = plant('ims-secops-untrusted-target-', 0o777)
-  const refused = runBash(rig([...ROOT_GATE], GATE_DATA, `DATA_DIR=${q(exposed.root)}`))
-
-  assert.equal(refused.status, 1, refused.stderr)
-  assert.ok(!refused.stderr.includes('mount --bind'),
-    `no bind-mount command may be printed for a target somebody else can replace: ${refused.stderr}`)
-  assert.ok(!refused.stderr.includes('/etc/fstab'),
-    'and no fstab line either — a persistent bind of an unproved path is the same defect, made permanent')
-  assert.match(refused.stderr, /IS NOT SAFE TO BIND YET/, refused.stderr)
-  assert.match(refused.stderr, /can be replaced by somebody other than root/, refused.stderr)
-  assert.match(refused.stderr, /Move the data under a path only root can rebind/,
-    'and the operator must be told what would make it safe')
-
-  // NOT VACUOUS, AND THE ROUTE IS ONE MODE BIT: the identical layout with the target's parent at
-  // 0755 gets the whole procedure. So what is refused is the ancestry, not the location.
-  const sound = plant('ims-secops-trusted-target-', 0o755)
-  const ok = runBash(rig([...ROOT_GATE], GATE_DATA, `DATA_DIR=${q(sound.root)}`))
-  assert.equal(ok.status, 1, 'a symlinked root is still refused')
-  assert.ok(ok.stderr.includes(`mount --bind ${sound.target} ${sound.root}`), ok.stderr)
-  assert.match(ok.stderr, /\/etc\/fstab/, ok.stderr)
-  assert.ok(!ok.stderr.includes('IS NOT SAFE TO BIND YET'), ok.stderr)
-  // AND THE IDENTITY TO CHECK AFTER MOUNTING, so a bind that landed somewhere else is visible.
-  // DEVICE AND INODE, not the inode alone: an inode number identifies a file only within one
-  // filesystem, and different filesystems reuse the low ones freely — so `%i` alone would be
-  // satisfied by a wrong source on another disk, which is the mistake this step exists to catch.
-  const st = statSync(sound.target)
-  assert.ok(ok.stderr.includes(`(device:inode ${st.dev}:${st.ino})`),
-    `the refusal must print the identity the operator can verify against: ${ok.stderr}`)
-  assert.match(ok.stderr, /stat -c %d:%i /, 'and the command that reads it back')
-  assert.match(ok.stderr, /findmnt -no TARGET,SOURCE /, 'and the mount check beside it')
-  assert.match(ok.stderr, /umount .*; rmdir .* && ln -s /, 'and a rollback that undoes a mount that did take')
-})
-
 test('[o3d-secops] the shared refusal does not claim the run has changed nothing, because half its callers cannot say that', () => {
   /**
    * refuse_symlinked_root() is printed by TWO callers: the pre-flight gate, where nothing has
@@ -5618,379 +5861,4 @@ test('[o3d-secops] the shared refusal does not claim the run has changed nothing
     const source = readFileSync(join(REPO, script), 'utf8')
     assert.equal(shellFunction(source, 'refuse_symlinked_root'), helper, `${script} has drifted`)
   }
-})
-
-test('[o3d-secops] a link pointing at the root\'s own ancestor gets no bind command, however trustworthy that ancestor is', (t) => {
-  /**
-   * `/opt/one-two-inventory -> /opt` passes every OTHER question: /opt's name cannot be rebound by
-   * anybody but root, so the ancestry walk is satisfied, and the identity check would be satisfied
-   * too because the dangerous source really is what got mounted. Printing that bind hands the next
-   * installer run the whole of /opt as its application directory — to `rsync --delete` into and to
-   * `chown -R`. The same shape gives /var/lib for the state root and /var/log for the log root.
-   *
-   * The rule is disjointness, so the loop below covers the ancestor, the self and the descendant.
-   */
-  const base = createTempDirSync('ims-secops-overlap-', t)
-  const opt = join(base, 'opt')
-  mkdirSync(opt)
-  chmodSync(opt, 0o755)
-  // THE ANCESTOR CASE, which is the one Codex named three times over: APP_DIR -> /opt,
-  // DATA_DIR -> /var/lib, LOG_DIR -> /var/log. The self and descendant cases the same condition
-  // covers are not reachable through a symlink — a link cannot point at itself, and a link pointing
-  // beneath its own name does not resolve — so they are stated in the code and measured here only
-  // through the ancestor, which is the shape that occurs.
-  const link = join(opt, 'link-ancestor')
-  symlinkSync(opt, link)
-  const run = runBash(rig([...ROOT_GATE], GATE_DATA, `DATA_DIR=${q(link)}`))
-  assert.equal(run.status, 1, `a symlinked root is still refused: ${run.stderr}`)
-  assert.equal(realpathSync(link), opt, 'precondition: the link must really resolve to the root\'s own ancestor')
-  assert.ok(!run.stderr.includes('mount --bind'), `no bind command may be printed: ${run.stderr}`)
-  assert.ok(!run.stderr.includes('/etc/fstab'), 'and no fstab line')
-  assert.match(run.stderr, /MAY NOT BE BOUND ONTO [\s\S]*one of the two lies inside the other/, run.stderr)
-
-  // NOT VACUOUS: a target that is genuinely elsewhere, under an equally trustworthy path, gets the
-  // whole procedure. So what is refused is the overlap and nothing else.
-  const elsewhere = join(base, 'srv-disk2')
-  mkdirSync(elsewhere)
-  chmodSync(elsewhere, 0o755)
-  const good = join(elsewhere, 'ims')
-  mkdirSync(good)
-  const goodLink = join(opt, 'link-elsewhere')
-  symlinkSync(good, goodLink)
-  const ok = runBash(rig([...ROOT_GATE], GATE_DATA, `DATA_DIR=${q(goodLink)}`))
-  assert.equal(ok.status, 1, 'a symlinked root is still refused')
-  assert.ok(ok.stderr.includes(`mount --bind ${good} ${goodLink}`), ok.stderr)
-  assert.ok(!ok.stderr.includes('lies inside the other'), ok.stderr)
-
-  // AND A TARGET THAT OVERLAPS A DIFFERENT ROOT THIS INSTALLER MANAGES is refused too, when the
-  // caller has said what those are. scripts/install.sh names its three in SERVICE_ROOT_NAMES;
-  // deploy.sh and update.sh do not set it, which is why the shared text is identical in all three.
-  const overlapping = runBash(rig([...ROOT_GATE], GATE_DATA, [
-    `DATA_DIR=${q(goodLink)}`,
-    `CUTOVER_STATE_DIR=${q(join(elsewhere, 'ims'))}`,
-  ].join('\n')))
-  assert.equal(overlapping.status, 1, overlapping.stderr)
-  assert.ok(!overlapping.stderr.includes('mount --bind'),
-    `a target that is another managed root must get no bind command: ${overlapping.stderr}`)
-  assert.match(overlapping.stderr, /MAY NOT BE BOUND ONTO/, overlapping.stderr)
-
-  // AND THE ROOTS COME FROM THE ONE TABLE EVERY PUBLICATION ALREADY RESOLVES AGAINST, plus
-  // ${LOG_DIR}, which is written but is not a publication root. A second list maintained beside it
-  // is a list that goes stale: the first version of this fix declared one in install.sh and in
-  // neither of the others, so the same refusal answered a different question depending on which
-  // script printed it — and that is not hypothetical, since a symlinked IMS_DATA_DIR resolving to
-  // APP_DIR reaches this refusal from update.sh during cutover-state publication.
-  const refusal = shellFunction(INSTALL_SH, 'refuse_symlinked_root')
-  assert.match(refusal, /keep="\$\(publish_trust_root_candidates\)" \|\| keep=""/,
-    `the refusal must read the shared table, with its status taken:\n${refusal}`)
-  assert.match(refusal, /\$\{LOG_DIR:-\}/, 'and add the log root, which the table does not carry')
-  assert.ok(!/SERVICE_ROOT_NAMES/.test(readFileSync(join(REPO, 'scripts/install.sh'), 'utf8')),
-    'and no entrypoint may keep a second list beside it')
-  // THE TABLE REALLY NAMES THE WRITE ROOTS, and is really the same in all three entrypoints.
-  const table = shellFunction(INSTALL_SH, 'publish_trust_root_candidates')
-  for (const name of ['APP_DIR', 'DATA_DIR', 'CUTOVER_STATE_DIR', 'DB_ENV_SNAPSHOT_DIR', 'DB_CA_PUBLISH_DIR', 'DB_FENCE_RECOVERY_DIR']) {
-    assert.ok(table.includes(`\${${name}:-}`), `${name} must be in the table the refusal reads: ${table}`)
-  }
-  for (const script of ['scripts/deploy.sh', 'scripts/update.sh'] as const) {
-    const source = readFileSync(join(REPO, script), 'utf8')
-    assert.equal(shellFunction(source, 'publish_trust_root_candidates'), table, `${script} has drifted`)
-    assert.ok(!/SERVICE_ROOT_NAMES/.test(source), `${script} must not keep a second list either`)
-  }
-})
-
-test('[o3d-secops] a target whose identity cannot be read gets no procedure, rather than one that cannot be verified', (t) => {
-  /**
-   * The verification step used to print "that inode must be unknown" when the capture failed — an
-   * instruction nobody can follow, attached to a command that would still be pasted. A procedure
-   * that cannot be checked is worse than none, because it is followed with the same confidence.
-   */
-  const shipped = shellFunction(INSTALL_SH, 'refuse_symlinked_root')
-  const capture = shipped.split('\n').find((line) => line.includes('ident="$(stat -c'))
-  assert.ok(capture, `precondition: the refusal must capture the target's identity: ${shipped}`)
-  assert.match(capture, /'%d:%i'/, `and take the device with the inode: ${capture}`)
-
-  const base = createTempDirSync('ims-secops-noident-', t)
-  const disk = join(base, 'srv-disk2')
-  const target = join(disk, 'ims')
-  mkdirSync(target, { recursive: true })
-  chmodSync(disk, 0o755)
-  const root = join(base, 'ims')
-  symlinkSync(target, root)
-
-  // FORCED AT THE ONE PLACE THE VALUE COMES FROM: a `stat` that answers nothing. Everything else in
-  // the rig is shipped text, so the branch under test is the only thing this can be measuring.
-  // NARROW ON PURPOSE: the walks either side of this call use `stat -c '%d:%i'` too, and a shim
-  // that failed all of them would stop the run somewhere else entirely and the test would pass
-  // while measuring the wrong refusal. Only the query about the TARGET is made to answer nothing.
-  const blindStat = `stat() { if [[ "\${1:-}" == "-c" && "\${2:-}" == "%d:%i" && "\${3:-}" == ${q(target)} ]]; then return 1; fi; command stat "$@"; }`
-  const run = runBash(rig([...ROOT_GATE], GATE_DATA, [`DATA_DIR=${q(root)}`, blindStat].join('\n')))
-
-  assert.equal(run.status, 1, run.stderr)
-  assert.ok(!run.stderr.includes('mount --bind'),
-    `no procedure may be printed when its verification cannot be: ${run.stderr}`)
-  assert.ok(!run.stderr.includes('/etc/fstab'), 'and no fstab line')
-  assert.match(run.stderr, /could not read the device and inode/, run.stderr)
-  assert.ok(!/must (print|be) unknown/.test(run.stderr),
-    'and it must never print an instruction naming an unknown value')
-
-  // NOT VACUOUS: the same layout with `stat` answering gets the whole procedure.
-  const ok = runBash(rig([...ROOT_GATE], GATE_DATA, `DATA_DIR=${q(root)}`))
-  assert.ok(ok.stderr.includes(`mount --bind ${target} ${root}`), ok.stderr)
-  const st = statSync(target)
-  assert.ok(ok.stderr.includes(`must print ${st.dev}:${st.ino}`), ok.stderr)
-})
-
-test('[o3d-secops] a target that is the same directory as the root\'s ancestor under ANOTHER name is refused too', (t) => {
-  /**
-   * THE BYPASS A PREFIX TEST CANNOT SEE. Disjointness by TEXT compares two strings; two paths can
-   * be the same directory, or nested, without sharing a prefix — a bind mount or a mount alias
-   * already in place gives `/mnt/opt-alias` and `/opt` the same device and inode. The refusal would
-   * then print a bind of the alias onto a root inside the very tree it aliases.
-   *
-   * A HARNESS CANNOT `mount --bind` (CAP_SYS_ADMIN), so the alias is made with a HARD LINK to a
-   * directory — which is also privileged — no. It is made the one way an unprivileged process can
-   * produce two names for one directory: the SECOND name is a path that resolves to the same
-   * directory without sharing a prefix, which on a real filesystem means a symlinked component
-   * somewhere in the harness's own scratch tree. `readlink -f` canonicalises the target, so the
-   * alias has to be somewhere the canonical form still differs textually while the identity does
-   * not — the case is therefore constructed with a bind mount that already exists on this machine,
-   * exactly as the mount-point test above does, and skipped with a stated reason if there is none.
-   */
-  const mount = existingMountPoint()
-  assert.ok(mount, 'no mount point was found; this test cannot state anything without one')
-
-  // The root lies INSIDE the mounted directory, and the target is that same directory reached by
-  // its other name — the mount source's own path. `existingMountPoint()` guarantees the two have
-  // the same device and inode while being different pathnames, which is the whole shape.
-  const base = createTempDirSync('ims-secops-alias-', t)
-  const link = join(base, 'ims')
-  symlinkSync(mount, link)
-
-  // NOT VACUOUS: this really is a directory reached by a name that is not its mount point's parent
-  // path, and the identity really is shared.
-  assert.equal(realpathSync(link), realpathSync(mount))
-
-  const run = runBash(rig([...ROOT_GATE], GATE_DATA, [
-    // The root's own ancestor list contains ${base}; the target is ${mount}. Textually disjoint.
-    `DATA_DIR=${q(link)}`,
-    `CUTOVER_STATE_DIR=${q(join(mount, 'inside'))}`,
-  ].join('\n')))
-
-  assert.equal(run.status, 1, run.stderr)
-  assert.ok(!run.stderr.includes('mount --bind'),
-    `a target that is the same directory as a managed root must get no bind command: ${run.stderr}`)
-  assert.ok(!run.stderr.includes('/etc/fstab'), 'and no fstab line')
-
-  // WHAT THIS HARNESS CANNOT DO, STATED RATHER THAN GLOSSED: it cannot `mount --bind`, so it cannot
-  // manufacture a pair of textually disjoint paths that are one directory. The mount points that
-  // already exist on a machine are all inside the system trees the exclusion above refuses first,
-  // which is why the run above refuses for that reason rather than on identity. The identity walk
-  // is therefore asserted on the SHIPPED TEXT — both directions, present and bounded — and its
-  // behaviour is measured by the mutation in the neighbouring test, which removes it.
-  const refusal = shellFunction(INSTALL_SH, 'refuse_symlinked_root')
-  assert.match(refusal, /if \[\[ "\$ancid" == "\$ident" \]\]; then/,
-    'the target must be compared against every ancestor of each managed root')
-  assert.match(refusal, /if \[\[ "\$ancid" == "\$otherid" \]\]; then/,
-    'and each managed root against every ancestor of the target — one direction alone misses the other')
-  assert.equal(refusal.split('anc="${anc%/*}"').length - 1, 2, 'both walks must climb, and there must be two of them')
-  assert.equal(refusal.split('[[ "$anc" != "/" ]] || break').length - 1, 2, 'and both must stop at the root of the filesystem')
-})
-
-test('[o3d-secops] a root spelled with repeated slashes is still recognised as overlapping', (t) => {
-  /**
-   * `//var/lib/app` and `/var/lib/app` are one directory to the kernel and two strings to `[[`, and
-   * the ancestry walk deliberately treats an empty `//` component as the directory it is already
-   * standing in — so a prefix test on the raw spellings could be stepped around by an operator
-   * override that simply doubled a slash. The spellings are normalised before they are compared.
-   */
-  const base = createTempDirSync('ims-secops-slashes-', t)
-  const opt = join(base, 'opt')
-  mkdirSync(opt)
-  chmodSync(opt, 0o755)
-  const link = join(opt, 'app')
-  symlinkSync(opt, link)
-
-  // THE SAME LAYOUT, SPELLED TWICE. Both must be refused the bind command, and for the same reason.
-  // A LEADING `//`, which is the spelling that gets past a raw prefix test: `//a/b` does not match
-  // the pattern `/a/*`, while the kernel treats the two as one path. A doubled slash in the MIDDLE
-  // does not bypass it — `*` in a `[[` pattern spans the extra separator — and a test built on that
-  // one would pass without the fix. Measured, not assumed.
-  const doubled = `/${link}`
-  for (const spelling of [link, doubled]) {
-    const run = runBash(rig([...ROOT_GATE], GATE_DATA, `DATA_DIR=${q(spelling)}`))
-    assert.equal(run.status, 1, `${spelling}: ${run.stderr}`)
-    assert.ok(!run.stderr.includes('mount --bind'),
-      `${spelling}: a doubled slash must not buy a bind command: ${run.stderr}`)
-    assert.match(run.stderr, /MAY NOT BE BOUND ONTO [\s\S]*one of the two lies inside the other/, run.stderr)
-  }
-
-  // MEASURED BY MUTATION, ROUTE STATED: the normalisation removed, which is where the textual test
-  // stood before this pass. The doubled spelling then reads as an unrelated string and the bind
-  // command is printed for a target that contains the root.
-  const shipped = shellFunction(INSTALL_SH, 'refuse_symlinked_root')
-  const textual = 'if [[ "$ntarget" == "$nother" || "$nother" == "${ntarget%/}/"* || "$ntarget" == "${nother%/}/"* ]]; then'
-  assert.ok(shipped.includes(textual), `precondition: the shipped refusal must compare normalised spellings: ${shipped}`)
-  const rawText = shipped
-    .replace(textual, 'if [[ "$target" == "$other" || "$other" == "${target%/}/"* || "$target" == "${other%/}/"* ]]; then')
-    // …and BOTH identity walks, which are the other half of this fix and would catch it for the
-    // wrong reason. A mutation that left either standing would prove nothing about normalisation.
-    .replaceAll('if [[ "$ancid" == "$ident" ]]; then', 'if false; then')
-    .replaceAll('if [[ "$ancid" == "$otherid" ]]; then', 'if false; then')
-  assert.notEqual(rawText, shipped, 'the mutation must change the shipped comparisons')
-  assert.ok(!rawText.includes('"$ancid" == "$ident"') && !rawText.includes('"$ancid" == "$otherid"'),
-    'and remove both identity comparisons')
-
-  const mutated = runBash(rig(ROOT_GATE.filter((n) => n !== 'refuse_symlinked_root'), GATE_DATA,
-    [`DATA_DIR=${q(doubled)}`, rawText].join('\n')))
-  assert.ok(mutated.stderr.includes('mount --bind'),
-    `without the normalisation the doubled spelling gets a bind command: ${mutated.stderr}`)
-})
-
-test('[o3d-secops] a link pointing into a system directory gets no bind command either', (t) => {
-  /**
-   * THE ROOT TABLE IS NOT AN INVENTORY OF EVERYTHING THIS INSTALLER WRITES. It names the roots
-   * publications resolve against; the script also writes /etc/systemd/system, /etc/nginx,
-   * /etc/logrotate.d and /root/.ssh. `/opt/one-two-inventory -> /etc/systemd/system` is disjoint
-   * from every entry in that table and has an ancestry only root can rebind, so every check before
-   * this one passes — and the printed bind would put the host's unit tree where the next run
-   * `rsync -a --delete`s and `chown -R`s.
-   *
-   * The rule is stated as an EXCLUSION rather than as an inventory, because an inventory of "every
-   * directory this installer might ever write" goes stale the next time a line is added, while
-   * "a bind source is where data lives, not part of the operating system" does not.
-   */
-  const base = createTempDirSync('ims-secops-system-', t)
-  const opt = join(base, 'opt')
-  mkdirSync(opt)
-  chmodSync(opt, 0o755)
-
-  // REAL SYSTEM PATHS, and the run is a refusal either way, so nothing is touched by asking.
-  // `/` is not in this list because it never reaches the exclusion: it has no parent, so the
-  // ancestry walk above refuses it first — with a different sentence and, which is what matters
-  // here, no bind command either.
-  for (const target of ['/etc/systemd/system', '/etc', '/usr/lib', '/root']) {
-    const link = join(opt, `link-${target.replace(/\W+/g, '-') || 'root'}`)
-    symlinkSync(target, link)
-    const run = runBash(rig([...ROOT_GATE], GATE_DATA, `DATA_DIR=${q(link)}`))
-    assert.equal(run.status, 1, `${target}: a symlinked root is still refused: ${run.stderr}`)
-    assert.ok(!run.stderr.includes('mount --bind'),
-      `${target}: no bind command may name a system directory: ${run.stderr}`)
-    assert.ok(!run.stderr.includes('/etc/fstab'), `${target}: and no fstab line`)
-    assert.match(run.stderr, /belongs to the operating system/, run.stderr)
-    assert.match(run.stderr, /point the link at a directory that holds data/,
-      `${target}: and the operator must be told what would be acceptable`)
-  }
-
-  // NOT VACUOUS: a data directory outside those trees still gets the whole procedure, so what is
-  // refused is the system tree and not the idea of binding.
-  const disk = join(base, 'srv-disk2')
-  const good = join(disk, 'ims')
-  mkdirSync(good, { recursive: true })
-  chmodSync(disk, 0o755)
-  const goodLink = join(opt, 'link-data')
-  symlinkSync(good, goodLink)
-  const ok = runBash(rig([...ROOT_GATE], GATE_DATA, `DATA_DIR=${q(goodLink)}`))
-  assert.ok(ok.stderr.includes(`mount --bind ${good} ${goodLink}`), ok.stderr)
-  assert.ok(!ok.stderr.includes('belongs to the operating system'), ok.stderr)
-
-  // MEASURED BY MUTATION, ROUTE STATED: the exclusion list emptied, which is where this stood
-  // before this pass. /etc/systemd/system is then handed a bind-mount procedure — the finding,
-  // executed — while every other check in the function still passes on it, which is the point.
-  const shipped = shellFunction(INSTALL_SH, 'refuse_symlinked_root')
-  const listed = shipped.split('\n').find((line) => line.includes('for other in / /bin /boot'))
-  assert.ok(listed, `precondition: the shipped refusal must carry the exclusion list: ${shipped}`)
-  const unguarded = shipped.replace(listed, '  for other in; do')
-  assert.ok(!unguarded.includes('/etc /lib'), 'the mutation must empty the list')
-
-  const unitLink = join(opt, 'link-units')
-  symlinkSync('/etc/systemd/system', unitLink)
-  const mutated = runBash(rig(ROOT_GATE.filter((n) => n !== 'refuse_symlinked_root'), GATE_DATA,
-    [`DATA_DIR=${q(unitLink)}`, unguarded].join('\n')))
-  assert.ok(mutated.stderr.includes('mount --bind /etc/systemd/system'),
-    `without the exclusion the host's unit tree is offered as a bind source: ${mutated.stderr}`)
-})
-
-test('[o3d-secops] the one precondition the run cannot establish is stated immediately above the command that needs it', (t) => {
-  /**
-   * EVERY CHECK IN THIS REFUSAL establishes that the target is not something the installer must
-   * never touch. NONE of them can establish the property that actually matters — that the target is
-   * DEDICATED to this root — because "a directory holding nothing but this application's data" is
-   * not a question a filesystem can be asked, and a denylist cannot converge on it: `/var/www` was
-   * the eleventh path added to one, and there is always a twelfth.
-   *
-   * So the precondition is stated where it can be acted on: in the operator's own terms, naming the
-   * exact consequence, immediately above the command that carries it. This test measures that it is
-   * there, that it says what happens, and that it comes FIRST — advice an operator meets after the
-   * command it qualifies is advice they meet too late.
-   */
-  const base = createTempDirSync('ims-secops-precondition-', t)
-  const disk = join(base, 'srv-disk2')
-  const target = join(disk, 'ims')
-  mkdirSync(target, { recursive: true })
-  chmodSync(disk, 0o755)
-  const root = join(base, 'ims')
-  symlinkSync(target, root)
-
-  const run = runBash(rig([...ROOT_GATE], GATE_DATA, `DATA_DIR=${q(root)}`))
-  assert.equal(run.status, 1, run.stderr)
-  assert.ok(run.stderr.includes(`mount --bind ${target} ${root}`),
-    `precondition: this layout must reach the procedure, or the warning has nothing to qualify: ${run.stderr}`)
-
-  const warning = run.stderr.split('\n').find((line) => line.includes('BEFORE YOU RUN ANY OF THIS'))
-  assert.ok(warning, `the procedure must be preceded by its precondition: ${run.stderr}`)
-  assert.ok(warning.includes(`${target} must hold NOTHING BUT this application's data`), warning)
-  assert.match(warning, /--delete/, 'and name the operation that destroys what is there')
-  assert.match(warning, /chowns it recursively to svcuser/, 'and the account it hands the tree to')
-  assert.match(warning, /move this application's data into a directory of its own first/,
-    'and what to do when the operator is not certain')
-
-  // AND IT COMES FIRST. A warning below the command it qualifies is one the operator meets after
-  // they have run it.
-  assert.ok(run.stderr.indexOf('BEFORE YOU RUN ANY OF THIS') < run.stderr.indexOf('mount --bind'), run.stderr)
-
-  // MEASURED BY MUTATION, ROUTE STATED: the warning removed, which is where this stood before this
-  // pass. The same layout then gets a paste-ready destructive command with nothing qualifying it.
-  const shipped = shellFunction(INSTALL_SH, 'refuse_symlinked_root')
-  const line = shipped.split('\n').find((l) => l.includes('BEFORE YOU RUN ANY OF THIS'))
-  assert.ok(line, 'precondition: the shipped refusal must carry the warning')
-  const silent = shipped.replace(`${line}\n`, '')
-  assert.ok(!silent.includes('BEFORE YOU RUN ANY OF THIS'), 'the mutation must remove it')
-
-  const mutated = runBash(rig(ROOT_GATE.filter((n) => n !== 'refuse_symlinked_root'), GATE_DATA,
-    [`DATA_DIR=${q(root)}`, silent].join('\n')))
-  assert.ok(mutated.stderr.includes('mount --bind'), mutated.stderr)
-  assert.ok(!mutated.stderr.includes('BEFORE YOU RUN ANY OF THIS'),
-    'without it the command is printed unqualified — which is what this test exists to fail on')
-})
-
-test('[o3d-secops] a conventional shared tree is refused outright, not merely warned about', (t) => {
-  /**
-   * `/opt/one-two-inventory -> /var/www` is plausible for a legacy web deployment: root-controlled
-   * ancestry, disjoint from every managed root, outside every OS tree. Binding it would put other
-   * sites and package-managed content where the next run rsyncs with `--delete` and chowns. It is
-   * on the exclusion list for that reason — the warning above is the general answer, and a
-   * conventional shared tree does not need to reach it.
-   */
-  const base = createTempDirSync('ims-secops-shared-', t)
-  const opt = join(base, 'opt')
-  mkdirSync(opt)
-  chmodSync(opt, 0o755)
-  const link = join(opt, 'one-two-inventory')
-  symlinkSync('/var/www', link)
-
-  const run = runBash(rig([...ROOT_GATE], GATE_DATA, `DATA_DIR=${q(link)}`))
-  assert.equal(run.status, 1, run.stderr)
-  assert.ok(!run.stderr.includes('mount --bind'), `no bind command may name /var/www: ${run.stderr}`)
-  assert.ok(!run.stderr.includes('/etc/fstab'), 'and no fstab line')
-  // /var/www may not exist on this host; either refusal is correct and neither offers a command.
-  assert.match(run.stderr, /belongs to the operating system|does not resolve to a directory/, run.stderr)
-
-  // NOT VACUOUS: /var itself is NOT excluded — a dedicated directory under it is a supported bind
-  // source, and gets the procedure. So what is refused is the shared tree, not the location.
-  const dedicated = join(base, 'var-lib-ims')
-  mkdirSync(dedicated)
-  const goodLink = join(opt, 'link-dedicated')
-  symlinkSync(dedicated, goodLink)
-  const ok = runBash(rig([...ROOT_GATE], GATE_DATA, `DATA_DIR=${q(goodLink)}`))
-  assert.ok(ok.stderr.includes(`mount --bind ${dedicated} ${goodLink}`), ok.stderr)
 })

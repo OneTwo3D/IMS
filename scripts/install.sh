@@ -2945,15 +2945,19 @@ refuse_symlinked_root() {
   # name: a newline in it would forge an ERROR line of its own, and a control byte would corrupt
   # the terminal it is printed to. `printf %q` is a bash builtin over a value this function already
   # holds; its status is taken, and a value it cannot quote is simply not printed.
-  if [[ -z "$target" ]]; then
-    printf 'ERROR: This run could not resolve that link at all — it is dangling, or a directory on the way to its target cannot be read. Fix or remove it by hand; this run will not guess what it was meant to point at.\n' >&2
+  qtarget="$(printf '%q' "$target")" || qtarget=""
+  # A LINK THAT DOES NOT RESOLVE TO A DIRECTORY GETS A DIFFERENT ANSWER AND STOPS HERE, because
+  # there is nothing to bind yet. `readlink -f` canonicalises a DANGLING link too — it answers with
+  # a path that does not exist — so the test is on what is there, not on whether the resolution
+  # produced a string.
+  if [[ -z "$target" || ! -d "$target" ]]; then
+    printf 'ERROR: That link does not resolve to a directory%s, so there is no bind mount to make yet. Fix or remove it by hand — this run will not guess what it was meant to point at.\n' "${qtarget:+ (it resolves to ${qtarget})}" >&2
+    return 0
+  fi
+  if [[ -z "$qtarget" ]]; then
+    printf 'ERROR: This run could not render that link'"'"'s target safely for a terminal, so it is not printed here. Read it with: readlink -f -- THE-LINK\n' >&2
   else
-    qtarget="$(printf '%q' "$target")" || qtarget=""
-    if [[ -z "$qtarget" ]]; then
-      printf 'ERROR: This run could not render that link'"'"'s target safely for a terminal, so it is not printed here. Read it with: readlink -f -- THE-LINK\n' >&2
-    else
-      printf 'ERROR: This run resolved that link to: %s\n' "$qtarget" >&2
-    fi
+    printf 'ERROR: This run resolved that link to: %s\n' "$qtarget" >&2
   fi
   # AND THE PROCEDURE IS IN THE DOCUMENTATION, NOT ON THIS SCREEN (o3d-secops r8, Codex HIGH).
   #
@@ -2982,7 +2986,7 @@ refuse_symlinked_root() {
   # precondition, the order the writers must be stopped in, the checks to make on the target and on
   # every directory above it, the identity check to make after the mount, the command that puts the
   # link back if the mount does not take, and the /etc/fstab line.
-  printf 'ERROR: THE BIND-MOUNT PROCEDURE IS IN THE DOCUMENTATION, NOT ON THIS SCREEN: docs/installation.md, "Putting a state root on another disk". It is not printed here because it cannot be pasted safely without checks only you can make: the target must hold NOTHING BUT this application'"'"'s data, every directory from / down to it must be one only root can replace, and the parent of this root may not be. The documentation names all of those, the order to stop the writers in, the identity check to make after the mount, how to put the link back if the mount does not take, and the /etc/fstab line.\n' >&2
+  printf 'ERROR: THE BIND-MOUNT PROCEDURE IS IN THE DOCUMENTATION, NOT ON THIS SCREEN: docs/installation.md, "Putting a state root on another disk". It is not printed here because it cannot be pasted safely without checks only you can make: the target must hold NOTHING BUT this application'"'"'s data, every directory from / down to it must be one only root can replace, and the parent of this root may not be. The documentation names all of those, the order to stop the writers in, the identity check to make after the mount, how to put the link back if the mount does not take, and the fstab line that makes the bind survive a reboot.\n' >&2
   return 0
 }
 
