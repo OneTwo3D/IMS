@@ -1265,10 +1265,12 @@ says nothing about who may create it. So a root directly under `/tmp` is refused
   `IMS_CUTOVER_STATE_DIR=/home/deploy/state` — is refused. The run fails, loudly, at the first
   publication, rather than writing root-owned state into a directory somebody else can redirect.
 * A root that **is itself a symlink** — `/var/lib/one-two-inventory -> /srv/disk2/ims`, which is how
-  a second disk used to be wired in — is refused too, and says so at the first publication:
+  a second disk used to be wired in — is refused too. `install.sh` refuses it **at pre-flight**,
+  before it creates, enters or writes anything at all; the publisher refuses it at the first
+  publication. Both print the same four lines:
 
   ```text
-  ERROR: /var/lib/one-two-inventory is a symbolic link, and a publication root may not be one: this installer can prove the root name, but nothing proves the path its target resolves through.
+  ERROR: /var/lib/one-two-inventory is a symbolic link, and a root this run writes into may not be one: nothing here proves the path its target resolves through.
   ERROR: To keep /var/lib/one-two-inventory on another disk, replace the link with a real directory and bind-mount the disk onto it — no data has to move:
   ERROR:   rm /var/lib/one-two-inventory && mkdir -p /var/lib/one-two-inventory && mount --bind TARGET /var/lib/one-two-inventory
   ERROR: then add `TARGET /var/lib/one-two-inventory none bind 0 0` to /etc/fstab so the bind survives a reboot.
@@ -1283,6 +1285,47 @@ says nothing about who may create it. So a root directly under `/tmp` is refused
   account can write is a place to redirect a root-side publication of `.env`. A bind mount is the
   same indirection with the resolution done **once**, at mount time, out of a mount table only root
   can write.
+
+### `install.sh` proves its three roots before it touches them
+
+`APP_DIR` (`/opt/one-two-inventory`), `DATA_DIR` (`/var/lib/one-two-inventory`) and `LOG_DIR`
+(`/var/log/one-two-inventory`) are checked in **section 1**, immediately after the "must be run as
+root" check and before any other statement in the run. Each is resolved by a walk that starts at
+`/` and takes one component at a time: every component is `lstat`ed, so a **symlinked ancestor** is
+refused rather than followed, and after each step the directory the walk landed in is checked
+against both the inode the entry named and its own `..`. The root's own entry is then read by a
+single `lstat` inside that pinned parent — never as a pathname — and **a symlink at it ends the
+run**.
+
+This is an **ordering** rule, and the order is the point. Before it, `install.sh` created and
+entered those same roots with a bare `mkdir -p` plus `cd -P`, so on a host where one of them was a
+link, `useradd --create-home`, the upload migration, the crontab-lock preparation, the cron backup,
+`rsync`, `git clone` and every `chown -R` acted **through** the link, and the refusal above arrived
+afterwards. The gate now precedes all of them.
+
+`LOG_DIR` is in the list even though nothing is published under it, because
+`chown -R "$APP_USER:$APP_USER" "$LOG_DIR"` **dereferences its operand**: a link at
+`/var/log/one-two-inventory` would hand the whole of whatever it points at to the service account,
+recursively.
+
+**Upgrading an installation whose root IS a symlink.** The run stops at pre-flight, prints the four
+lines above naming that root, and adds:
+
+```text
+ERROR: /var/lib/one-two-inventory — the state directory — is a symbolic link, so this run stops here rather than creating, entering, migrating into, rsyncing into or chowning whatever it resolves to. […] NOTHING has been created, nothing has been migrated and nothing has been started — this is the FIRST statement in the run that looks at /var/lib/one-two-inventory, so an existing installation is exactly as it was.
+```
+
+Nothing has changed on the host at that point — no user, no directory, no crontab, no migration —
+so the installation you had is the installation you still have. Replace the link with a bind mount
+using the three commands above, then re-run `install.sh`. Your data does not move: the bind exposes
+the same filesystem at the same path.
+
+The **anchor** rule in the previous section (every directory from `/` down to the root owned by
+root and carrying no group or other write bit) is *additional*, and applies only to the roots that
+are **publication** roots — `APP_DIR`, `DATA_DIR` and the cutover/snapshot/CA directories. It is not
+applied to `LOG_DIR`, and deliberately so: on Ubuntu `/var/log` is `drwxrwxr-x root:syslog`, which
+the anchor refuses, and nothing is published under `/var/log`. The **symlink** rule is one rule for
+all three, stated in one wording by one function.
 
 Setting any of them in `APP_DIR/.env` does nothing: the application user owns that file, and since o3d-2sm1.5 r25 none of
 the three entrypoints puts it into a shell's environment at all — each reads the handful of keys it
