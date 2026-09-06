@@ -51,8 +51,10 @@ export const SALES_ANALYTICS_EXPORTS: Record<SalesAnalyticsExportType, SalesAnal
     // (o3d-7jfq r9). `customerId` is null for every guest, and the readable fields are exactly
     // what can look identical between two guest rows — so for the cases the contradiction notice
     // exists to name, this column is the only mechanical route from a notice entry to its row.
-    // The parity test above catches its omission structurally; it is listed here because the
-    // column ORDER is chosen, not because presence is optional.
+    // Its omission is caught structurally, not by this list: the row-to-column parity test in
+    // tests/analytics/sales-analytics-refund-basis.test.ts walks the producer's own row keys, and
+    // it failed on `groupToken` before this edit. It is named here because the column ORDER is a
+    // choice — beside the identity fields, not at the far end past twenty money columns.
     columns: ['customerId', 'customerName', 'customerEmail', 'groupToken', 'orderCount', 'revenueBase', 'netRevenueBase', 'netRevenueBaseBound', 'netRevenueExVatBase', 'netRevenueExVatBaseBound', 'grossProfitBase', 'grossProfitBaseBound', 'costCaptured', 'costEvidence', 'arExposureBase', 'arExposureBaseBound', 'shareOfRevenuePct', 'shareOfRevenuePctBound', 'refundsNetBasis', 'refundsGrossBasis', 'refundsUnknownBasis'],
     refundTreatment: REFUND_BASIS_NOTICE_CUSTOMER_MIX,
   },
