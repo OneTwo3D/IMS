@@ -1658,3 +1658,44 @@ test('[o3d-psrx r14] an invoice with no stated currency takes the STRICTEST boun
   // minor unit it can carry is read, and read as a part payment.
   assert.deepEqual(partition.partPaid.map((i) => i.InvoiceID), ['jpy'])
 })
+
+// ---------------------------------------------------------------------------
+// o3d-1xq8 — THE THREE MINOR-UNIT RULES DO NOT SHARE A DIRECTION, AND THE DOCBLOCK SAID THEY DID.
+//
+// `FINEST_SUPPORTED_MINOR_UNITS` used to be documented as "the strictest setting … every rule derived
+// from the minor unit gets HARSHER as the unit gets finer". Two of the three do. The SCALE rule
+// (`isLedgerMinorUnitQuantized`) runs the other way: more digits means more decimal places ACCEPTED,
+// so four — the answer an UNSTATED currency gets — is that rule's most PERMISSIVE setting.
+//
+// Found while re-checking the branch's other fail-closed claims after the o3d-1xq8 finding, which is
+// the same shape: a sentence true of the direction it demonstrates, generalised past it. The composed
+// decision is still safe (the scale rule and the epsilon derive from the same `d`, so an admitted
+// non-zero amount is still at least twice the epsilon), so this is a claim being corrected rather
+// than a defect being fixed — and it is pinned here so the correction is a property of the code and
+// not a paragraph somebody can re-generalise.
+//
+// ROUTE: `parseLedgerAmount`'s number arm, whose scale test is `isLedgerMinorUnitQuantized`.
+// Mutation: make `ledgerMinorUnits(null)` answer 2 and the null case below starts refusing.
+// ---------------------------------------------------------------------------
+
+test('[o3d-1xq8] an UNSTATED currency is the scale rule\'s most permissive setting, not its strictest', () => {
+  // A three-decimal figure. GBP cannot hold it, so it is refused …
+  assert.equal(parseLedgerAmount(0.005, 'GBP'), null,
+    'PRECONDITION: a two-decimal currency refuses a three-decimal figure — the r16/r18 scale rule')
+  // … and an unstated currency, read at four decimals, ADMITS it. Same value, looser answer.
+  assert.equal(parseLedgerAmount(0.005, null), 0.005,
+    'THE CORRECTION: null is four decimals, so the scale rule ACCEPTS more here, not less')
+  assert.equal(parseLedgerAmount(0.005, 'CLF'), 0.005, 'and a genuinely four-decimal currency agrees')
+
+  // WHILE THE OTHER TWO RULES REALLY DO TIGHTEN ON null, which is why the setting is still right.
+  // The epsilon: half a minor unit, so finer is smaller, so fewer documents read as holding nothing.
+  assert.ok(ledgerAmountEpsilon(null).lt(ledgerAmountEpsilon('GBP')),
+    'the "holds nothing" epsilon is stricter at null than at GBP')
+  // And the invariant that makes the pair safe together: an amount the scale rule ADMITS as non-zero
+  // is at least one minor unit, which is twice the epsilon — at every precision, null included.
+  for (const currency of [null, 'GBP', 'KWD', 'CLF']) {
+    const minorUnit = toDecimal(`1e-${currency == null ? 4 : currencyMinorUnits(currency)}`)
+    assert.ok(minorUnit.gte(ledgerAmountEpsilon(currency).mul(2)),
+      `the smallest amount ${currency ?? 'an unstated currency'} can state is not swallowed by its own epsilon`)
+  }
+})
