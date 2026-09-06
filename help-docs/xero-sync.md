@@ -931,24 +931,34 @@ One difference from Xero is worth knowing, because it is visible to whoever read
   removed one, and clearing **Paid** over it would raise a credit note against money QuickBooks is
   still holding.
 
+  "Nothing at all" is measured against the **document's own currency**: half of one minor unit, so a
+  penny in GBP, one yen in JPY, a thousandth of a dinar in KWD. An amount below that is dust; one
+  minor unit is a real payment and is never read as nothing.
+
   The withheld verdict is put back to QuickBooks on the same hourly timer Xero's is (see below), so a
   document does not need to change again for IMS to reconsider it.
 
-**A partial chargeback is reported, not reconciled — and IMS will not put it right by itself.** When
-QuickBooks gives back *part* of a payment and keeps the rest — a £100 invoice settled by two £50
-payments, one of which is removed — IMS can see exactly what happened and says so: the warning against
-the order names the amount still held, the document's total, and the amount that was removed, and the
-activity entry carries all three as fields so the outstanding ones can be listed. **Paid** stays set,
-because reversing the whole document would credit the half that never moved, and the warning is
-rewritten every time the document is reconsidered.
+**A part-paid document is reported, not reconciled — and IMS will not put it right by itself.** When
+QuickBooks says a document is only partly settled while IMS holds it as fully paid — a £100 invoice
+with £50 against it — IMS says exactly that: the warning against the order names the amount
+QuickBooks has settled, the document's total, the amount still **outstanding** and the currency, and
+the activity entry carries them as fields so the open ones can be listed. **Paid** stays set, because
+reversing the whole document would credit the half QuickBooks is still accounting for, and the
+warning is rewritten every time the document is reconsidered.
 
-What IMS does *not* do is unwind the missing half: there is no partial credit note and no partial
-reversal of recognised revenue. So the order goes on reading as fully paid until somebody acts. Either
-settle the missing amount in QuickBooks — re-apply the payment, and IMS closes the item by itself on
-the next poll — or, if the money really is gone, raise the credit note for it by hand and correct the
-order. If the *rest* of the payment is removed later, the document reaches a zero paid amount and IMS
-reverses it in full on its own. The same is true of a part-paid **Xero** invoice, which is warned
-about on every poll and reconciled by nobody.
+**The warning does not say a payment was removed, and that is deliberate.** A document that was only
+ever part paid — invoiced at £100, settled with a single £50 — states exactly the same total and
+balance as one that carried two £50 payments and lost one. The figures cannot tell them apart, so
+IMS reports the difference and leaves the cause to whoever opens the document. Being told money was
+taken back would send somebody hunting a chargeback that may never have happened.
+
+What IMS does *not* do is unwind the difference: there is no partial credit note and no partial
+reversal of recognised revenue. So the order goes on reading as fully paid until somebody acts.
+Either settle the outstanding amount in QuickBooks — pay or re-apply it, and IMS closes the item by
+itself on the next poll — or, if a payment really was taken back, raise the credit note for it by
+hand and correct the order. If the *rest* of the payment goes later, the document reaches a zero paid
+amount and IMS reverses it in full on its own. The same is true of a part-paid **Xero** invoice,
+which is warned about on every poll and reconciled by nobody.
 
 **A withheld verdict is asked again on a timer.** It cannot be left to resolve itself: the delta
 returns an invoice only when it *changes*, and what usually settles a withheld verdict is not a change
