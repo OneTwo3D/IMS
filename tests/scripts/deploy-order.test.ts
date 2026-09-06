@@ -8140,10 +8140,22 @@ test('o3d-secops r3: after a real publish and a real preflight, the six steering
   //   2. delete the `local DB_FENCE_SOURCE_UNTRUSTED_PATH=""` from _fence_stage_and_publish(): the
   //      assignment two frames down creates the global again and the same assertion fails.
   //   3. delete the `local -a _FENCE_SRC_*` from _fence_vendor_into(): all three report `set`.
-  //   4. have db_fence_preflight() publish its resolved path into a global before running it:
-  //      DB_FENCE_PROBE_SCRIPT reports `set`.
+  //   4. have db_fence_preflight() publish its resolved path into a global before running it —
+  //      on EITHER arm: DB_FENCE_PROBE_SCRIPT reports `set`. Both arms are exercised below,
+  //      because a mutation of the candidate arm alone is invisible to a run that has a standing
+  //      artefact, and the first draft of this test had only the standing one. (Measured: the
+  //      candidate-arm mutation left this test green until the second arm was added.)
   const dirs = rotationDirs()
   const scratch = join(dirs.app, '..', 'scratch-globals')
+  const NAMES = [
+    'DB_FENCE_PROBE_SCRIPT', 'DB_FENCE_PROBE_TEMP', 'DB_FENCE_SOURCE_UNTRUSTED_PATH',
+    '_FENCE_SRC_STRICT', '_FENCE_SRC_PACKAGES', '_FENCE_SRC_PARENTS',
+  ]
+  const probeGlobals = [
+    `for n in ${NAMES.join(' ')} DB_FENCE_PROBE_REASON; do`,
+    '  echo "GLOBAL ${n}=[${!n+set}]"',
+    'done',
+  ]
   try {
     writeFileSync(join(dirs.app, 'scripts', 'fence-db-connections.mjs'), '// v1\n')
     rmSync(dirs.recovery, { recursive: true, force: true })
@@ -8161,10 +8173,7 @@ test('o3d-secops r3: after a real publish and a real preflight, the six steering
         'db_fence_script_in_use >/dev/null; echo "PUBLISHED=$?"',
         // AND THE PREFLIGHT PATH, for real — it is the one that resolves and executes.
         'db_fence_preflight notice -- runner >/dev/null; echo "PREFLIGHT=$?"',
-        'for n in DB_FENCE_PROBE_SCRIPT DB_FENCE_PROBE_TEMP DB_FENCE_SOURCE_UNTRUSTED_PATH'
-          + ' _FENCE_SRC_STRICT _FENCE_SRC_PACKAGES _FENCE_SRC_PARENTS DB_FENCE_PROBE_REASON; do',
-        '  echo "GLOBAL ${n}=[${!n+set}]"',
-        'done',
+        ...probeGlobals,
         'report_probe',
       ], [`IMS_FENCE_ARTEFACT_SHA256=${candidate}`]),
     )
@@ -8179,10 +8188,7 @@ test('o3d-secops r3: after a real publish and a real preflight, the six steering
       `and something really was executed:\n${run.output}`)
 
     // THE CLAIM.
-    for (const name of [
-      'DB_FENCE_PROBE_SCRIPT', 'DB_FENCE_PROBE_TEMP', 'DB_FENCE_SOURCE_UNTRUSTED_PATH',
-      '_FENCE_SRC_STRICT', '_FENCE_SRC_PACKAGES', '_FENCE_SRC_PARENTS',
-    ]) {
+    for (const name of NAMES) {
       assert.match(run.output, new RegExp(`^GLOBAL ${name}=\\[\\]$`, 'm'),
         `${name} must not exist in the shell after both paths have run — it steers execution, `
         + `authentication, publication or deletion:\n${run.output}`)
@@ -8192,6 +8198,108 @@ test('o3d-secops r3: after a real publish and a real preflight, the six steering
     // never worked: a name that IS deliberately a global reports `set` in the same loop.
     assert.match(run.output, /^GLOBAL DB_FENCE_PROBE_REASON=\[set\]$/m,
       `the probe must be able to SEE a global, or the six above prove nothing:\n${run.output}`)
+
+    // AND THE OTHER ARM. With the artefact discarded and the same pin supplied, the preflight
+    // resolves and runs the CANDIDATE it assembles from the checkout — a different branch, with a
+    // different path, a different digest comparison and a throwaway to destroy afterwards.
+    rmSync(dirs.recovery, { recursive: true, force: true })
+    const fromCandidate = runShell(
+      rotationHarness(dirs, [
+        ...preflightSpies(join(dirs.app, '..', 'scratch-candidate')),
+        'db_fence_preflight notice -- runner >/dev/null; echo "PREFLIGHT=$?"',
+        ...probeGlobals,
+        'report_probe',
+      ], [`IMS_FENCE_ARTEFACT_SHA256=${candidate}`]),
+    )
+    assert.match(fromCandidate.output, /^PREFLIGHT=0$/m,
+      `precondition: the candidate arm must have run:\n${fromCandidate.output}`)
+    assert.match(fromCandidate.output, /^PROBE=\[\/.*\/scripts\/fence-db-connections\.mjs\]$/m,
+      `and executed a checkout-derived tree:\n${fromCandidate.output}`)
+    assert.doesNotMatch(fromCandidate.output,
+      new RegExp(`^PROBE=\\[${escapeRe(join(dirs.recovery, 'app'))}`, 'm'),
+      'which is NOT the standing artefact, because there is not one')
+    for (const name of NAMES) {
+      assert.match(fromCandidate.output, new RegExp(`^GLOBAL ${name}=\\[\\]$`, 'm'),
+        `${name} must not exist after the candidate arm either:\n${fromCandidate.output}`)
+    }
+    assert.match(fromCandidate.output, /^TMPLEFT=\[\s*\]$/m, 'and the throwaway it ran is destroyed')
+  } finally {
+    rmSync(join(dirs.app, '..'), { recursive: true, force: true })
+  }
+})
+
+test('o3d-secops r3: each entrypoint\'s own preflight line runs the standing artefact through the library', () => {
+  // THE WIRING, RUN RATHER THAN READ. Moving the exec into the library changed both entrypoints'
+  // call from `node "${VAR}" …` to `db_fence_preflight warn -- <runner…>`, and the two runners are
+  // spelled differently. A static assertion that the call exists would not notice a missing `--`,
+  // a notice that is not a command, or a runner whose arguments land in the wrong order — all of
+  // which are silent until a cutover.
+  //
+  // So the LINE IS LIFTED OUT OF THE SHIPPED FILE and executed against the real library, with the
+  // entrypoint's own warn() and its own privilege-dropping helper stubbed to report their argv.
+  //
+  // MUTATION ROUTE (each verified locally): drop the `--` from either call and the invocation
+  // returns 1 with nothing executed, so EXEC never appears; swap the notice for a name no function
+  // has and the same; put the runner's arguments after the `node` in the library and the argv
+  // assertion fails, naming the file.
+  const dirs = rotationDirs()
+  try {
+    writeFileSync(join(dirs.app, 'scripts', 'fence-db-connections.mjs'), '// v1\n')
+    rmSync(dirs.recovery, { recursive: true, force: true })
+    const digest = runShell(
+      rotationHarness(dirs, ['db_fence_probe_digests >/dev/null 2>&1', 'echo "CANDIDATE=[${DB_FENCE_PROBE_ARTEFACT_SHA256}]"']),
+    )
+    const candidate = /^CANDIDATE=\[([0-9a-f]{64})\]$/m.exec(digest.output)?.[1] ?? ''
+    const publish = runShell(
+      rotationHarness(dirs, ['db_fence_script_in_use >/dev/null; echo "RC=$?"'], [`IMS_FENCE_ARTEFACT_SHA256=${candidate}`]),
+    )
+    assert.match(publish.output, /^RC=0$/m, `precondition: an artefact must be standing:\n${publish.output}`)
+
+    for (const script of ['scripts/deploy.sh', 'scripts/update.sh']) {
+      const lines = readFileSync(join(process.cwd(), script), 'utf8').split('\n')
+      const start = lines.findIndex((line) => /^\s*db_fence_preflight /.test(line))
+      assert.ok(start >= 0, `${script}: precondition: it must call db_fence_preflight`)
+      const call: string[] = []
+      for (let i = start; i < lines.length; i += 1) {
+        call.push(lines[i])
+        if (!/\\$/.test(lines[i].trimEnd())) break
+      }
+      assert.ok(call.join('\n').includes(' -- '), `${script}: precondition: the lifted call must be complete:\n${call.join('\n')}`)
+
+      const run = runShell(
+        rotationHarness(dirs, [
+          ...preflightSpies(join(dirs.app, '..', `scratch-${script.replace(/\W/g, '-')}`)),
+          'warn() { echo "WARN: $*"; }',
+          // The two spellings, each reporting exactly what the library handed it.
+          'as_app_user() { echo "EXEC=[$*]"; printf "%s" "${2:-}" > "${PROBE_PATH_FILE}"; }',
+          'run_as_user() { local who="$1"; shift; echo "AS=${who}"; echo "EXEC=[$*]"; }',
+          'APP_USER=ims-app',
+          'DATABASE_URL=postgresql://app:pw@127.0.0.1:5432/imsdb',
+          'DEPLOY_ADMIN_DATABASE_URL=postgresql://admin:pw@127.0.0.1:5432/imsdb',
+          'dry_rc=0',
+          ...call,
+          'echo "DRY_RC=${dry_rc}"',
+          'echo "REASON=[${DB_FENCE_PROBE_REASON}]"',
+        ]),
+      )
+      assert.match(run.output, /^DRY_RC=0$/m, `${script}: the lifted call must succeed:\n${run.output}`)
+      assert.match(run.output, /^REASON=\[\]$/m,
+        `${script}: an empty reason is how the entrypoint learns the helper ran:\n${run.output}`)
+      assert.match(run.output, /^WARN: This dry run probes with the root-owned artefact at /m,
+        `${script}: and the announcement must come back through the entrypoint's own warn():\n${run.output}`)
+      const exec = /^EXEC=\[(.*)\]$/m.exec(run.output)?.[1] ?? ''
+      // The entrypoint's own environment comes FIRST (it is the runner it wrote), then the
+      // library's `node <artefact> --preflight`. The two scripts set different variables, so what
+      // is asserted is the shape and the boundary between them, not one script's spelling.
+      assert.match(exec, /^env (?:[A-Z_]+=\S+ )+node /,
+        `${script}: the runner must be handed its own environment first: ${exec}`)
+      assert.match(exec, /\bDEPLOY_ADMIN_DATABASE_URL=\S+/,
+        `${script}: including the credential the preflight needs: ${exec}`)
+      assert.ok(
+        exec.endsWith(`node ${join(dirs.recovery, 'app', 'scripts', 'fence-db-connections.mjs')} --preflight `),
+        `${script}: and then the STANDING artefact, appended by the library: ${exec}`,
+      )
+    }
   } finally {
     rmSync(join(dirs.app, '..'), { recursive: true, force: true })
   }
