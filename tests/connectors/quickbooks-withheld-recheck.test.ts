@@ -1005,7 +1005,14 @@ test('[o3d-psrx r15] and with NO currency anywhere the refusal NAMES the binding
     + 'that exist nowhere but inside English')
   assert.match(marker?.description ?? '', /CurrencyRef/,
     'and the sentence names the currency binding, because the QuickBooks document an operator would '
-    + 'be sent to look at is perfectly ordinary — the defect is on the IMS side')
+    + 'be sent to look at is perfectly ordinary')
+  // o3d-psrx r16 — AND IT NAMES THE FIX THAT WORKS, ONLY. r15 offered "set the currency on the linked
+  // IMS document" as an alternative; with the widening dropped that change decides nothing, and an
+  // instruction that does not work is worse than none.
+  assert.match(marker?.description ?? '', /Enable multicurrency in QuickBooks/,
+    'the actionable half of the sentence is the QuickBooks one')
+  assert.doesNotMatch(marker?.description ?? '', /set the currency on the linked IMS document/,
+    'and the IMS-side instruction is gone, because an unverified IMS currency no longer sizes anything')
   assert.doesNotMatch(marker?.description ?? '', /figures IMS cannot read a removal out of/,
     'and it does NOT borrow the sentence for a ledger that answered with an unreadable amount')
 })

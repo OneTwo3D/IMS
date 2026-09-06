@@ -886,20 +886,26 @@ export function qboWithheldReversalReason(verdict: RegisteredPaymentVerdict): st
     // the document rather than about IMS's rows — so the operator's action is different from every
     // other arm here: go and look at what the ledger is still holding, not at a sync row.
     case 'LEDGER_NOT_PROVEN_ZERO_PAID':
-      // o3d-psrx r15 (Codex MEDIUM 2) — THE BINDING DEFECT IS ITS OWN SENTENCE, BECAUSE IT SENDS THE
-      // OPERATOR SOMEWHERE ELSE. Every other wording in this arm sends them to the QuickBooks document
-      // to see what is applied to it; this one is about IMS not knowing what currency the figures are
-      // in, and the document they would open looks perfectly ordinary. It names both places a currency
-      // could have come from, because fixing either one settles it on the next poll.
+      // o3d-psrx r15 (Codex MEDIUM 2), REWORDED IN r16 — THE BINDING DEFECT IS ITS OWN SENTENCE,
+      // BECAUSE IT SENDS THE OPERATOR SOMEWHERE ELSE. Every other wording in this arm sends them to the
+      // QuickBooks document to see what is applied to it; this one is about nothing being able to say
+      // what currency the figures are in, and the document they would open looks perfectly ordinary.
+      //
+      // r16 NAMES ONE FIX AND NOT TWO. r15's wording offered "set the currency on the linked IMS
+      // document" as an alternative, which was true only while an IMS currency could widen the bound.
+      // It cannot — an unverified code may tighten a read and never loosen one — so that half of the
+      // sentence would now send an operator to make a change that decides nothing. An instruction that
+      // does not work is worse than no instruction.
       if (verdict.currencyUnbound) {
-        return 'QuickBooks answered about this document without stating a CurrencyRef, and the IMS '
-          + 'order or purchase order it is linked to does not record a valid currency either — so '
-          + 'nothing could say what minor unit its amounts are denominated in. Amounts IMS cannot size '
-          + 'are read against the finest precision it supports, which refused these, so the ledger has '
-          + 'NOT been shown to hold nothing on this document. paidAt was LEFT SET and no chargeback '
-          + 'credit note was raised. This is an IMS binding defect and not a QuickBooks reading: set '
-          + 'the currency on the linked IMS document (or enable multicurrency in QuickBooks so it '
-          + 'states one) and the next poll decides this by itself.'
+        return 'QuickBooks answered about this document without stating a CurrencyRef, so nothing the '
+          + 'ledger said could size the minor unit its amounts are denominated in. The currency the '
+          + 'linked IMS order or purchase order records is NOT used to size them: nothing has verified '
+          + 'it against QuickBooks, and reading a document with a coarser minor unit than its real one '
+          + 'is how a payment still on the ledger reads as nothing. So these amounts were read against '
+          + 'the finest precision IMS supports, which refused them, and the ledger has NOT been shown '
+          + 'to hold nothing on this document. paidAt was LEFT SET and no chargeback credit note was '
+          + 'raised. Enable multicurrency in QuickBooks so it states a CurrencyRef on this document, '
+          + 'and the next poll decides this by itself.'
       }
       return verdict.paidAmount == null
         ? 'QuickBooks reported a balance due on this document without stating an amount IMS could '

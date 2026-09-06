@@ -546,6 +546,15 @@ test('[o3d-psrx r9] a stated part-paid position and an evidence absence are diff
       expect: { kind: 'UNPROVEN', paidAmount: -25, documentTotal: 100, currencyUnbound: false },
     },
     {
+      // o3d-psrx r16 — A READ THAT SUCCEEDED AND STILL COULD NOT SIZE ITS OWN MINOR UNIT. The figures
+      // here are ordinary and read fine at the strictest precision, so this reaches the LAST UNPROVEN
+      // return rather than the early one — the other place the binding marker is set, and previously
+      // the only one no case exercised.
+      name: 'fully settled, but nothing said what currency it is in — the binding defect stands',
+      amount: ledgerAmount(100, 0),
+      expect: { kind: 'UNPROVEN', paidAmount: 100, documentTotal: 100, currencyUnbound: true },
+    },
+    {
       name: 'a document this read said NOTHING about is not a document with nothing on it',
       amount: undefined,
       // A document the read said NOTHING about has no binding to report on — see the classifier.

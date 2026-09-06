@@ -698,22 +698,27 @@ test(
 )
 
 /**
- * o3d-psrx r15 (Codex MEDIUM 2) — THE CURRENCY THAT SIZES THE AMOUNT READER COMES OUT OF THE POLLER'S
- * OWN QUERY, AND THIS IS THE ONLY TEST THAT CAN SAY SO.
+ * o3d-psrx r15 (Codex MEDIUM 2), REVERSED IN r16 (Codex HIGH 2) — THE CURRENCY THE POLLER'S OWN QUERY
+ * SUPPLIES, AND THE THING IT IS NOT ALLOWED TO DO WITH IT.
  *
  * QuickBooks omits `CurrencyRef` on every document when multicurrency is off, so an ordinary
- * base-currency row arrives with no currency of its own. r15 resolves it from the IMS document — which
- * makes the fix a piece of WIRING, of exactly the shape the r3 finding was: the poller asks a question
- * the row can answer, and it is answered only if the query SELECTS the column. The unit harness for
- * this poller mocks `findMany` and ignores `select` entirely, so dropping `currency: true` from the
- * production query would leave every one of those tests green. A real database is the only place the
- * select is real.
+ * base-currency row arrives with no currency of its own. r15 resolved it from the linked IMS document
+ * and let that size the magnitude bound. r16's finding is that it must not: nothing has verified the
+ * IMS currency against QuickBooks, and a coarser bound chosen on an unverified guess admits exactly
+ * the decode collapse the bound exists to refuse. An unverified currency may TIGHTEN a read and never
+ * loosen one.
  *
- * NO QUICKBOOKS CALL IS MADE HERE EITHER. The row is a literal; what is under test is that the
- * candidate query, `ledgerDocumentCurrencies` and `qboLedgerAmount` compose into a readable amount.
+ * SO THIS TEST NOW PINS THE OPPOSITE CONSEQUENCE, and it is still the only place that can pin it. The
+ * wiring is real — the poller asks a question the row can answer, and it is answered only if the query
+ * SELECTS the column, which the unit harness cannot see because it mocks `findMany` and ignores
+ * `select` entirely. What the assertions say about that wiring is that the currency it delivers
+ * changes NO bound, while a currency the LEDGER states does. Restoring the widening fails this test.
+ *
+ * NO QUICKBOOKS CALL IS MADE HERE EITHER. The row is a literal; what is under test is how the
+ * candidate query, `ledgerDocumentCurrencies` and `qboLedgerAmount` compose.
  */
 test(
-  '[o3d-psrx r15] the poller\'s own candidate queries carry the currency that sizes the amount reader',
+  '[o3d-psrx r16] an IMS currency the poller\'s query supplies cannot widen the amount reader\'s bound',
   { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
   async (t) => {
     const db = await loadDb()
@@ -778,17 +783,37 @@ test(
       'and the bill query must select it through the PO, which is where a bill\'s denomination lives')
 
     // AND THE CONSEQUENCE, which is what makes the assertions above load-bearing rather than tidy.
-    // Codex's reproduction: an ordinary base-currency amount, no CurrencyRef on the row at all.
+    // Codex's reproduction: an ordinary-looking base-currency amount, no CurrencyRef on the row at all.
+    // `600000000000` is above the four-decimal bound and far below the two-decimal one, so it is
+    // readable if and only if something is allowed to say the document is in GBP.
     const row = { Id: invoiceId, TotalAmt: 600000000000, Balance: 600000000000 }
+    const withImsCurrency = classifyQboLedgerEvidence(qboLedgerAmount(row, salesCurrencies.get(invoiceId)))
     assert.deepEqual(
-      classifyQboLedgerEvidence(qboLedgerAmount(row, salesCurrencies.get(invoiceId))),
-      { kind: 'HOLDS_NOTHING' },
-      'with the currency the query supplied, the ledger has been SHOWN to hold nothing on this '
-      + 'document and the reversal can be decided on registration evidence')
-    assert.deepEqual(
-      classifyQboLedgerEvidence(qboLedgerAmount(row)),
+      withImsCurrency,
       { kind: 'UNPROVEN', paidAmount: null, documentTotal: null, currencyUnbound: true },
-      'THE CONTROL: with no currency from anywhere the identical row is unreadable and withholds — '
-      + 'which is what the poller did to every single-currency company before r15')
+      'THE FINDING: the currency the query supplied is IMS\'s own record and nothing has checked it '
+      + 'against QuickBooks, so it may not select a larger bound — the row stays unreadable and the '
+      + 'reversal is withheld, with the binding defect named')
+    assert.deepEqual(
+      withImsCurrency,
+      classifyQboLedgerEvidence(qboLedgerAmount(row)),
+      'and it reads EXACTLY as it does with no currency from anywhere: an unverified code changes what '
+      + 'the marker can say about provenance and nothing about what is read')
+
+    // THE CONTROL, and it is what stops this being "refuse everything of this size": the identical row
+    // with the currency stated BY THE LEDGER is read, and reads as holding nothing. What separates the
+    // two is not the figure, and not even the code — it is who vouched for the minor unit.
+    assert.deepEqual(
+      classifyQboLedgerEvidence(qboLedgerAmount({ ...row, CurrencyRef: { value: 'GBP' } })),
+      { kind: 'HOLDS_NOTHING' },
+      'a currency QuickBooks STATED does size the bound, so the same figures are readable through it')
+
+    // AND THE BILL SIDE'S THREE-DECIMAL CURRENCY IS NOT A WIDENING EITHER, which is the direction the
+    // rule is written in: KWD is coarser than the unstated fallback, so believing it would loosen the
+    // read, and it is refused for the same reason GBP is.
+    assert.equal(qboLedgerAmount({ Id: billInvoiceId, TotalAmt: 600000000000, Balance: 600000000000 },
+      billCurrencies.get(billInvoiceId)).paid, null,
+      'an unverified KWD is still coarser than the finest supported minor unit, so it cannot raise the '
+      + 'bound above the strictest one')
   },
 )
