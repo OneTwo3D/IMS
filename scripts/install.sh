@@ -716,7 +716,57 @@ CUTOVER_STEP="startup"
 # the application data directory — what the installed unit's AssertPathExists= already names
 # and what docs/installation.md documents for a manual fence.
 readonly CUTOVER_STATE_DIR="${IMS_CUTOVER_STATE_DIR:-${IMS_DEPLOY_STATE_DIR:-${IMS_DATA_DIR:-/var/lib/one-two-inventory}}}"
-readonly FENCE_FILE="${CUTOVER_STATE_DIR}/DEPLOY-FENCED"
+# THE MARKER'S PARENT DECIDES WHO CAN REMOVE IT (o3d-secops r20, Codex CRITICAL).
+#
+# ${FENCE_FILE} used to default inside ${CUTOVER_STATE_DIR}, which is the application's own data
+# directory. The previous round noticed that the marker was published without an explicit owner and
+# fixed the CHOWN — and ownership was never the protection. A file's mode and owner secure ITS
+# BYTES; the DIRECTORY ENTRY that gives it a name belongs to whoever can write the parent, and that
+# is ${APP_USER}. `unlink(2)` and `rename(2)` ask for write permission ON THE DIRECTORY and ask
+# nothing whatever about the file, so a root-owned 0600 marker inside a directory the service
+# account owns is a marker the service account can delete. Which is the entire fence: the drop-in
+# says `AssertPathExists=!<marker>`, so removing the marker lets the unit start on the next boot,
+# over a schema in whatever state the interrupted cutover left it. Or the marker is renamed aside
+# and one of their own left at the name — and adoption reads that file as an account of what the
+# previous privileged run did, and acts on every line of it.
+#
+# The comment on the ownership fix said these markers are "deliberately root-owned so that the
+# service account cannot forge a fence". Half of that was true. It could not forge the CONTENT; it
+# could always forge the NAME.
+#
+# SO THE MARKER LIVES UNDER A ROOT-OWNED PARENT, AND THE PATH IS A LITERAL, for exactly the reasons
+# written out for ${DB_ENV_SNAPSHOT_DIR} below: an override only a root-owned source may set is
+# indistinguishable from no override, and a privileged path resolved from a variable the
+# application can set is not a privileged path. It is the SAME directory as the environment
+# snapshot — under /etc, whose own parent is root-owned, so the directory's own name cannot be
+# renamed aside or forged either — and that directory is ALREADY one of the publication trust
+# roots, so nothing in the publisher had to move to accept a destination inside it.
+#
+# AND THIS ONE COULD MOVE, WHERE THE STAGING DIRECTORY COULD NOT (o3d-secops r19). A staging
+# directory is where a publication is BUILT, and publication is a `rename(2)` into the
+# destination's own directory: it therefore has to share a filesystem with every destination, and
+# the trust roots span filesystems, so it cannot be relocated to one place. The marker is a
+# DESTINATION and not a stage. publish_durable_file() creates its `.ims-publish` beside the target —
+# here, inside /etc/ims-cutover — and renames within that directory, exactly as it already does for
+# ${DB_ENV_SNAPSHOT_FILE} and ${DB_ROLE_ROTATION_JOURNAL}. Nothing crosses a filesystem, and the
+# r19 argument does not apply.
+#
+# THE REST OF THE NAMESPACE STAYS WHERE IT IS. The cron backup, the connection-fence state and the
+# lock are not what a `AssertPathExists=!` asserts on, the connection-fence state must be WRITABLE
+# by ${APP_USER} because the fence script runs as that account, and moving the lock would split the
+# mutual exclusion the shared namespace exists to give. Only the marker is a boot-time authority.
+readonly FENCE_MARKER_DIR="/etc/ims-cutover"
+readonly FENCE_FILE="${FENCE_MARKER_DIR}/DEPLOY-FENCED"
+# WHERE THE MARKER USED TO LIVE, AND WHY IT IS STILL READ. An installation fenced by a checkout that
+# predates the line above has its marker at this path and a drop-in that names it. A run that looked
+# only at the new path would find no fence, adopt nothing, take a fresh crontab backup over an
+# already-fenced crontab and re-point the drop-in at a file that does not exist — RELEASING, in
+# silence, a fence standing over a possibly half-migrated schema. That is a worse failure than the
+# one being fixed, so it is handled rather than documented: import_relocated_fence_marker()
+# republishes the marker at ${FENCE_FILE} before anything is adopted, and install_reboot_fence()
+# clears the old one only AFTER a drop-in naming the new one has been written, reloaded and
+# verified. At every instant one of the two pairs is fencing the host.
+readonly LEGACY_STATE_DIR_FENCE_FILE="${CUTOVER_STATE_DIR}/DEPLOY-FENCED"
 readonly CRON_BACKUP="${CUTOVER_STATE_DIR}/crontab-${APP_USER}.bak"
 FENCE_DROPIN_DIR="/etc/systemd/system/${APP_NAME}.service.d"
 FENCE_DROPIN_FILE="${FENCE_DROPIN_DIR}/zz-deploy-fence.conf"
@@ -5020,6 +5070,123 @@ publish_durable_dropin() {
 # that need protecting carry their own 0600, and the connection-fence state lives in a 0700
 # subdirectory owned by ${APP_USER}, which is the identity that writes it: the fence script
 # runs as the app user, so a root-owned 0700 directory made that write impossible.
+# THE MARKER'S DIRECTORY, ROOT-OWNED AND PRIVATE (o3d-secops r20). Created here rather than left to
+# the publication, because publish_durable_file() secures the FILE and this finding is about the
+# PARENT: a directory an unprivileged account can write is one it can unlink the marker out of,
+# whatever the marker's own mode says.
+#
+# `id -u` rather than a hardcoded 0, exactly as publish_durable_file() asks it and for the same
+# reason: the property is "the privileged account that owns this install", and asking it lets an
+# unprivileged regression rig exhibit the mechanism with an ordinary directory instead of needing
+# two accounts. Under all three entrypoints it is 0.
+#
+# A SYMLINK AT THAT NAME IS A REFUSAL, not something to chmod. `mkdir -p` is happy with a symlink to
+# a directory and `chmod` would then secure the target, leaving the name pointing wherever it
+# pointed — which is the shape of every finding on this branch.
+ensure_fence_marker_dir() {
+  local dir
+  [[ -n "${FENCE_FILE:-}" ]] || return 1
+  dir="$(dirname "${FENCE_FILE}")"
+  [[ -L "${dir}" ]] && return 1
+  mkdir -p "${dir}" || return 1
+  [[ -L "${dir}" ]] && return 1
+  chown "$(id -u):$(id -g)" "${dir}" || return 1
+  chmod 700 "${dir}" || return 1
+  return 0
+}
+
+# WHAT MAY BE ADOPTED AS A FENCE (o3d-secops r20, Codex CRITICAL). Adoption asked `[[ -f ]]`, which
+# follows a symlink and says nothing about who wrote what it found. A marker is a DESCRIPTION of an
+# interrupted privileged run — which phase it reached, whether a migration was attempted, whether
+# the schema was touched — and every one of those lines is acted on: they decide whether this run
+# stops a healthy service, whether it may skip the migration, and whether it releases a connection
+# fence. A marker somebody else could have placed is therefore worse than no marker at all. It is a
+# false account of what happened, believed.
+#
+# Three facts, asked of the LINK rather than of its target (`stat` without -L is an lstat), and
+# asked of the PARENT as well as of the file — because the parent is the finding. A marker with
+# impeccable modes inside a directory the service account can write is a marker it can replace.
+fence_marker_is_trustworthy() {
+  local self dir info rest owner mode kind
+  self="$(id -u)"
+  dir="$(dirname "${FENCE_FILE}")"
+  FENCE_MARKER_REFUSAL=""
+
+  # THE FIELDS ARE CUT BY PARAMETER EXPANSION AND NOT BY `read` (o3d-secops r20). Two of these
+  # three scripts set IFS to newline-and-tab, so `read -r a b c` of a SPACE-separated line puts the
+  # whole line in `a` and leaves the other two empty — and every check below would then read "not
+  # there" about a directory that is there, refusing every adoption there is. A delimiter the fields
+  # cannot contain, cut with ${...%%...} and ${...#...}, depends on no ambient setting at all; and
+  # deploy.sh, which does NOT set IFS, would have behaved differently from the other two, which is
+  # the drift this branch keeps finding.
+  info="$(stat -c '%u|%a|%F' "${dir}" 2>/dev/null)" || info=""
+  owner="${info%%|*}"; rest="${info#*|}"; mode="${rest%%|*}"; kind="${rest#*|}"
+  [[ "${info}" == *"|"* ]] || kind=""
+  if [[ "${kind:-}" != "directory" ]]; then
+    FENCE_MARKER_REFUSAL="${dir} is ${kind:-not there} and not a directory, so anything found at ${FENCE_FILE} was reached through something this run did not create."
+    return 1
+  fi
+  if [[ "${owner}" != "${self}" ]]; then
+    FENCE_MARKER_REFUSAL="${dir} is owned by uid ${owner} and this cutover runs as uid ${self}, so whoever owns that directory can rename or unlink the marker inside it at will."
+    return 1
+  fi
+  if (( 0${mode} & 0022 )); then
+    FENCE_MARKER_REFUSAL="${dir} is mode ${mode}, which is writable by group or other: the marker inside it can be renamed or unlinked by exactly the accounts this fence exists to stop."
+    return 1
+  fi
+
+  info="$(stat -c '%u|%a|%F' "${FENCE_FILE}" 2>/dev/null)" || info=""
+  owner="${info%%|*}"; rest="${info#*|}"; mode="${rest%%|*}"; kind="${rest#*|}"
+  [[ "${info}" == *"|"* ]] || kind=""
+  if [[ "${kind:-}" != "regular file" && "${kind:-}" != "regular empty file" ]]; then
+    FENCE_MARKER_REFUSAL="${FENCE_FILE} is ${kind:-not there} and not a regular file. A fence marker is a file this installer published; anything else at that name was put there by something else."
+    return 1
+  fi
+  if [[ "${owner}" != "${self}" ]]; then
+    FENCE_MARKER_REFUSAL="${FENCE_FILE} is owned by uid ${owner} and this cutover runs as uid ${self}, so it is not a record this run may act on."
+    return 1
+  fi
+  if (( 0${mode} & 0022 )); then
+    FENCE_MARKER_REFUSAL="${FENCE_FILE} is mode ${mode}, which is writable by group or other, so its contents are not a record of what the interrupted run did."
+    return 1
+  fi
+  return 0
+}
+
+# THE MARKER AT THE OLD PATH, MOVED WITHOUT EVER LOWERING THE FENCE (o3d-secops r20).
+#
+# THE ORDERING IS THE WHOLE OF IT. The canonical marker is published FIRST and the old one is left
+# exactly where it is, so across the republication the drop-in on disk still names the old path and
+# the old path still exists — the host stays fenced. install_reboot_fence() clears the old marker
+# only after a drop-in naming ${FENCE_FILE} has been written, daemon-reloaded and VERIFIED, by which
+# point the new pair is what fences the host. A crash anywhere in between leaves BOTH markers, which
+# is the safe direction: whichever drop-in is loaded, the file it asserts on is there.
+#
+# AND BOTH PRESENT IS NOT A REFUSAL, unlike import_legacy_file()'s two-namespace case. Those were two
+# separate namespaces whose markers described two different runs, and choosing between them would
+# have discarded a record nothing else could reconstruct. These are ONE namespace at two spellings:
+# the canonical marker is only ever created by a run that also re-points the drop-in at it, so it is
+# the authoritative one and the other is debris this run clears. The alternative — dying — would
+# strand the ordinary retry loop, because a cutover that adopts and fails again leaves exactly this
+# state. It is said out loud rather than passed over in silence.
+import_relocated_fence_marker() {
+  [[ -n "${LEGACY_STATE_DIR_FENCE_FILE:-}" ]] || return 0
+  [[ "${LEGACY_STATE_DIR_FENCE_FILE}" != "${FENCE_FILE}" ]] || return 0
+  [[ -f "${LEGACY_STATE_DIR_FENCE_FILE}" ]] || return 0
+  if [[ -e "${FENCE_FILE}" ]]; then
+    warn "A cutover marker is present at BOTH ${LEGACY_STATE_DIR_FENCE_FILE} and ${FENCE_FILE}."
+    warn "The one under $(dirname "${FENCE_FILE}") is the authoritative one and is what this run adopts; the other is cleared once the reboot fence names it."
+    return 0
+  fi
+  ensure_fence_marker_dir || die "Could not create $(dirname "${FENCE_FILE}") owned by this run and private to it, so the cutover marker cannot be moved out of a directory ${APP_USER} can unlink it from. Nothing has been stopped."
+  publish_durable_file "${FENCE_FILE}" < "${LEGACY_STATE_DIR_FENCE_FILE}" || die \
+    "The cutover marker at ${LEGACY_STATE_DIR_FENCE_FILE} could not be published durably at ${FENCE_FILE}, so this run cannot adopt the fence a previous run left standing. Nothing has been stopped and nothing has been migrated."
+  warn "Moved the cutover marker out of the application's own data directory, where ${APP_USER} could have unlinked it:"
+  warn "  ${LEGACY_STATE_DIR_FENCE_FILE} -> ${FENCE_FILE}"
+  warn "The old marker stays where it is, and the installed drop-in still names it, until the reboot fence has been re-pointed — so this host is fenced throughout."
+  return 0
+}
+
 ensure_cutover_state_dirs() {
   mkdir -p "$CUTOVER_STATE_DIR" || return 1
   mkdir -p "$DB_FENCE_DIR" || return 1
@@ -5047,6 +5214,10 @@ acquire_cutover_lock() {
 
 write_cutover_marker() {
   local reason="$1" status="${2:-0}"
+  # The marker's own directory, which is NOT ${CUTOVER_STATE_DIR} any more (o3d-secops r20): it is
+  # root-owned and private, because a marker inside a directory ${APP_USER} can write is one it can
+  # unlink. A marker that cannot be published where only this run can remove it is not a fence.
+  ensure_fence_marker_dir || return 1
   mkdir -p "${CUTOVER_STATE_DIR}"
   {
     echo "fenced_at=$(date -Iseconds)"
@@ -5886,6 +6057,15 @@ FENCEEOF
     return 1
   fi
   REBOOT_FENCE_INSTALLED=true
+  # AND ONLY NOW IS A MARKER AT THE PRE-r20 PATH CLEARED. The drop-in just written, reloaded and
+  # verified names ${FENCE_FILE}, and ${FENCE_FILE} exists — so from this line the new pair is what
+  # fences this host and a marker left at the path an older checkout used fences nothing. Clearing
+  # it any earlier would open a window in which the drop-in on disk still named a file this run had
+  # already deleted, which is the failure the relocation exists to avoid.
+  if [[ -n "${LEGACY_STATE_DIR_FENCE_FILE:-}" && "${LEGACY_STATE_DIR_FENCE_FILE}" != "${FENCE_FILE}" && -e "${LEGACY_STATE_DIR_FENCE_FILE}" ]]; then
+    rm -f "${LEGACY_STATE_DIR_FENCE_FILE}" \
+      || warn "${LEGACY_STATE_DIR_FENCE_FILE} could not be removed; it is inert now that the fence names ${FENCE_FILE}, but remove it by hand."
+  fi
   # Re-written now that the answer is known. The marker is the file the NEXT run (and the
   # operator after a hard kill) reads, and it was written before the drop-in was verified —
   # so it said `reboot_fence=absent` about a fence that had just been installed.
@@ -5902,6 +6082,10 @@ remove_reboot_fence() {
   fi
   # The marker is the condition, so deleting it is what lifts the fence.
   rm -f "${FENCE_FILE}"
+  # AND THE ONE AT THE PRE-r20 PATH WITH IT (o3d-secops r20): a fence is lifted by removing the file
+  # the drop-in asserts on, and on a host part-way through the relocation two drop-ins could be
+  # asserting. Leaving that one behind would refuse the next boot with nothing left saying why.
+  [[ -z "${LEGACY_STATE_DIR_FENCE_FILE:-}" ]] || rm -f "${LEGACY_STATE_DIR_FENCE_FILE}"
   return 0
 }
 
@@ -6563,6 +6747,10 @@ import_legacy_file() {
 }
 
 import_legacy_cutover_state() {
+  # FIRST, AND UNCONDITIONALLY (o3d-secops r20). The relocation of the marker out of the
+  # application's own data directory is not a property of the /var/lib/ims-deploy namespace, and the
+  # early return below is: a host that never used the old deploy.sh would otherwise never look.
+  import_relocated_fence_marker
   [[ "$LEGACY_CUTOVER_STATE_DIR" != "$CUTOVER_STATE_DIR" ]] || return 0
   [[ -d "$LEGACY_CUTOVER_STATE_DIR" ]] || return 0
   ensure_cutover_state_dirs || die "Could not create ${CUTOVER_STATE_DIR}; the cutover namespace is unusable. Nothing has been stopped."
@@ -6585,6 +6773,10 @@ import_legacy_cutover_state() {
 
 adopt_existing_fence() {
   [[ -f "${FENCE_FILE}" ]] || return 0
+  # AND IT IS A FENCE THIS RUN MAY BELIEVE (o3d-secops r20, Codex CRITICAL). Existence is not
+  # provenance: every line below is acted on, so a marker that is not a regular file owned by this
+  # run inside a directory only this run can write is refused rather than read.
+  fence_marker_is_trustworthy || die "${FENCE_MARKER_REFUSAL} Refusing to adopt it as a cutover fence. Nothing has been stopped and nothing has been migrated: read ${FENCE_FILE} by hand, decide what the interrupted run actually did, remove it, and re-run."
 
   # WHAT PHASE DID THE RUN THAT LEFT THIS ACTUALLY REACH? (o3d-2sm1.5, Codex r8 HIGH)
   #

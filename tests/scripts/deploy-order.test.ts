@@ -296,6 +296,11 @@ function durabilityFunctions(source: string): string {
     // routes the systemd fragment through it, so a harness without it fails the install with
     // "command not found" and every "the install must fail" test passes for the wrong reason.
     shellFunction(source, 'publish_durable_dropin'),
+    // o3d-secops r20: the marker no longer lives in ${CUTOVER_STATE_DIR}, and every writer of it
+    // now creates the root-owned private directory it does live in first. Lifted here for the
+    // reason the trust-root walk is: a rig missing it fails every marker publication with
+    // "command not found", and every "the publish must fail" test then passes for the wrong reason.
+    shellFunction(source, 'ensure_fence_marker_dir'),
   ].join('\n')
 }
 
@@ -3243,6 +3248,10 @@ function adoptionProgram(entry: (typeof R8_CASES)[number], dir: string, state: s
     parts.push('fence_dropin_file(){ echo "${FENCE_DROPIN_DIR}/${FENCE_DROPIN_NAME}"; }')
   }
   parts.push(
+    // o3d-secops r20: adoption now asks whether the marker is one this run may believe — a regular
+    // file it owns, inside a directory only it can write — before it reads a line of it. Lifted, not
+    // stubbed: a stub would make every adoption test pass over a marker anybody could have planted.
+    shellFunction(entry.source, 'fence_marker_is_trustworthy'),
     shellFunction(entry.source, 'marker_is_complete'),
     shellFunction(entry.source, 'marker_phase'),
     shellFunction(entry.source, 'predecessor_is_active'),
@@ -3905,6 +3914,15 @@ function runR9(
         .flatMap((name) => (name === 'publish_durable_file'
           ? ['publish_trust_root_candidates', 'pin_publish_root_parent', 'publish_root_anchored', 'publish_trust_root', 'refuse_symlinked_root', 'pin_dir_beneath_root', name]
           : [name]))
+        // o3d-secops r20: the same edges for the relocated marker. Every writer of it creates its
+        // root-owned directory first, and the legacy import now moves a marker out of
+        // ${CUTOVER_STATE_DIR} before it looks at the /var/lib/ims-deploy namespace at all.
+        .flatMap((name) => (name === 'write_fence_marker' || name === 'write_cutover_marker'
+          ? ['ensure_fence_marker_dir', name]
+          : name === 'import_legacy_cutover_state'
+            ? ['ensure_fence_marker_dir', 'import_relocated_fence_marker', name]
+            : [name]))
+        .filter((name, index, all) => all.indexOf(name) === index)
         .map((name) => shellFunction(entry.source, name)),
       body,
     ].join('\n')
@@ -4240,7 +4258,7 @@ test('all three entrypoints resolve the cutover namespace from the same expressi
   )
 
   // And every path that decides recovery hangs off it, in the same shape everywhere.
-  for (const key of ['FENCE_FILE', 'CRON_BACKUP', 'DB_FENCE_DIR', 'LOCK_FILE'] as const) {
+  for (const key of ['CRON_BACKUP', 'DB_FENCE_DIR', 'LOCK_FILE'] as const) {
     const values = R9_SCRIPTS.map((entry) => assignment(entry.source, key))
     assert.equal(
       new Set(values).size,
@@ -4250,6 +4268,32 @@ test('all three entrypoints resolve the cutover namespace from the same expressi
     assert.match(values[0], /\$\{CUTOVER_STATE_DIR\}/, `${key} must derive from the shared namespace, not a private directory`)
   }
 
+  // THE MARKER IS THE ONE THAT LEFT, AND DELIBERATELY (o3d-secops r20, Codex CRITICAL). One path
+  // everywhere is still the requirement — a fence one entrypoint writes and another cannot see is
+  // the failure the shared namespace exists to end — but ${CUTOVER_STATE_DIR} is the application's
+  // own data directory, and `unlink(2)`/`rename(2)` ask for write permission ON THE PARENT and
+  // nothing about the file. A root-owned 0600 marker in a directory ${APP_USER} owns is a marker
+  // ${APP_USER} can delete, and deleting it lifts the reboot fence. So it is under a root-owned
+  // literal, and that it is a LITERAL rather than an override is the point: an override only a
+  // root-owned source may set is indistinguishable from no override.
+  for (const key of ['FENCE_MARKER_DIR', 'FENCE_FILE', 'LEGACY_STATE_DIR_FENCE_FILE'] as const) {
+    const values = R9_SCRIPTS.map((entry) => assignment(entry.source, key))
+    assert.equal(
+      new Set(values).size,
+      1,
+      `${key} must be the same path in all three:\n${R9_SCRIPTS.map((e, i) => `${e.name}: ${values[i]}`).join('\n')}`,
+    )
+  }
+  const markerDir = R9_SCRIPTS.map((entry) => assignment(entry.source, 'FENCE_MARKER_DIR'))[0]
+  assert.equal(markerDir, '"/etc/ims-cutover"',
+    `the marker's directory must be a root-owned literal, not an expression anything else can aim: ${markerDir}`)
+  assert.match(assignment(R9_SCRIPTS[0].source, 'FENCE_FILE'), /^"\$\{FENCE_MARKER_DIR\}\//,
+    'and the marker must hang off it rather than spelling a second path')
+  // AND THE PATH IT LEFT IS STILL NAMED, because an installation fenced before this round has its
+  // marker there and a drop-in that asserts on it.
+  assert.match(assignment(R9_SCRIPTS[0].source, 'LEGACY_STATE_DIR_FENCE_FILE'), /\$\{CUTOVER_STATE_DIR\}/,
+    'the pre-r20 marker path must still be derived from the shared namespace, or an upgrade cannot find it')
+
   // The connection-fence state is one level down, and also shared.
   const fenceStates = R9_SCRIPTS.map((entry) => assignment(entry.source, 'DB_FENCE_STATE'))
   assert.equal(new Set(fenceStates).size, 1, `DB_FENCE_STATE must be the same path in all three: ${fenceStates.join(' | ')}`)
@@ -4258,7 +4302,7 @@ test('all three entrypoints resolve the cutover namespace from the same expressi
   for (const entry of R9_SCRIPTS) {
     const privatePaths = entry.source
       .split(/\r?\n/)
-      .filter((line) => /^(FENCE_FILE|CRON_BACKUP|DB_FENCE_STATE|DB_FENCE_DIR|LOCK_FILE)=/.test(line))
+      .filter((line) => /^(CRON_BACKUP|DB_FENCE_STATE|DB_FENCE_DIR|LOCK_FILE)=/.test(line))
       .filter((line) => !line.includes('${CUTOVER_STATE_DIR}') && !line.includes('${DB_FENCE_DIR}'))
     assert.deepEqual(privatePaths, [], `${entry.name} still resolves cutover state outside the shared namespace: ${privatePaths}`)
   }
@@ -4282,6 +4326,13 @@ test('all three entrypoints carry the same durability and namespace primitives, 
     'marker_is_complete',
     'import_legacy_file',
     'import_legacy_cutover_state',
+    // o3d-secops r20: the marker's directory, the check that decides whether a marker may be
+    // adopted at all, and the move out of ${CUTOVER_STATE_DIR}. A fence written by one entrypoint
+    // and invisible to another is worse than the finding being fixed, so these three are held to
+    // the same byte-for-byte rule as the publisher.
+    'ensure_fence_marker_dir',
+    'fence_marker_is_trustworthy',
+    'import_relocated_fence_marker',
   ]) {
     const bodies = R9_SCRIPTS.map((entry) => shellFunction(entry.source, name))
     assert.equal(
@@ -5888,11 +5939,19 @@ function runLayoutGate(options: { env: string | null; marker: string | null }): 
   const state = mkdtempSync(join(tmpdir(), 'ims-layout-state-'))
   try {
     if (options.env !== null) writeFileSync(join(dir, '.env'), options.env)
-    if (options.marker !== null) writeFileSync(join(state, 'DEPLOY-FENCED'), options.marker)
+    // THE MARKER LIVES UNDER A ROOT-OWNED LITERAL NOW (o3d-secops r20), and this harness runs the
+    // REAL prelude, unprivileged, so it cannot write there. The literal is substituted for a
+    // directory of this run's own — asserted present first, so a rename of the constant cannot
+    // leave this quietly measuring an adoption that never had a marker to find. That it is a
+    // literal rather than an ${IMS_*} override is asserted by the namespace test above, which is
+    // where that claim belongs.
+    const markerDir = join(state, 'marker-dir')
+    mkdirSync(markerDir)
+    if (options.marker !== null) writeFileSync(join(markerDir, 'DEPLOY-FENCED'), options.marker)
     const log = join(state, 'calls.log')
     const source = UPDATE_LINES.join('\n')
     const program = [
-      preludeThrough(UPDATE_LINES, /^DB_OBJECT_ACCESS_SCRIPT=/),
+      redirectFenceMarkerDir(preludeThrough(UPDATE_LINES, /^DB_OBJECT_ACCESS_SCRIPT=/), markerDir),
       `LOG=${JSON.stringify(log)}`,
       ': > "${LOG}"',
       'DRY_RUN=false',
@@ -5911,6 +5970,9 @@ function runLayoutGate(options: { env: string | null; marker: string | null }): 
       // adoption. They are exercised against real files in the recovery tests below.
       'require_adoption_identity(){ echo "require_adoption_identity" >> "${LOG}"; return 0; }',
       'refuse_adoption_identity_mismatch(){ echo "refuse_adoption_identity_mismatch $*" >> "${LOG}"; return 0; }',
+      // o3d-secops r20: adoption asks whether the marker is one this run may believe before it
+      // reads a line of it. Lifted rather than stubbed, for the reason everything else here is.
+      shellFunction(source, 'fence_marker_is_trustworthy'),
       shellFunction(source, 'marker_is_complete'),
       shellFunction(source, 'marker_phase'),
       shellFunction(source, 'predecessor_is_active'),
@@ -5950,6 +6012,14 @@ function layoutInvocation(program: string, env: string): string {
   const script = join(stage, 'lifted.sh')
   writeFileSync(script, `${program}\n`)
   return `${env} bash ${JSON.stringify(script)} --dry-run`
+}
+
+/** The shipped literal, and where a harness that cannot write /etc puts it instead. */
+function redirectFenceMarkerDir(program: string, dir: string): string {
+  const shipped = 'readonly FENCE_MARKER_DIR="/etc/ims-cutover"'
+  assert.equal(program.split(shipped).length - 1, 1,
+    `precondition: the lifted prelude must carry the marker directory literal:\n${shipped}`)
+  return program.replace(shipped, `readonly FENCE_MARKER_DIR=${JSON.stringify(dir)}`)
 }
 
 /** What an interrupted run that had already begun migrating leaves behind. */

@@ -1538,7 +1538,7 @@ const ENTRYPOINTS = ['scripts/install.sh', 'scripts/deploy.sh', 'scripts/update.
  *  root. */
 const SHIPPED_PUBLICATIONS: Readonly<Record<string, { readonly callSites: number, readonly targets: readonly string[] }>> = {
   'scripts/install.sh': {
-    callSites: 8,
+    callSites: 9,
     targets: [
       '$(db_ca_generation_file abc123)',
       '${DB_ROLE_ROTATION_JOURNAL}',
@@ -1552,11 +1552,11 @@ const SHIPPED_PUBLICATIONS: Readonly<Record<string, { readonly callSites: number
     ],
   },
   'scripts/deploy.sh': {
-    callSites: 3,
+    callSites: 4,
     targets: ['${FENCE_FILE}', '${DB_ENV_SNAPSHOT_FILE}', '${DB_FENCE_STATE}', '${CRON_BACKUP}'],
   },
   'scripts/update.sh': {
-    callSites: 4,
+    callSites: 5,
     targets: ['${FENCE_FILE}', '${DB_ENV_SNAPSHOT_FILE}', '${DB_FENCE_IDENTITY_FILE}', '${DB_FENCE_STATE}', '${CRON_BACKUP}'],
   },
 }
@@ -1565,7 +1565,13 @@ const SHIPPED_PUBLICATIONS: Readonly<Record<string, { readonly callSites: number
  *  library. A script that does not define one simply does not contribute it. */
 const PUBLICATION_CONSTANTS = [
   'APP_NAME', 'APP_DIR', 'DATA_DIR', 'DEPLOY_SSH_DIR', 'DEPLOY_SSH_KNOWN_HOSTS',
-  'CUTOVER_STATE_DIR', 'FENCE_FILE', 'CRON_BACKUP', 'DB_FENCE_DIR', 'DB_FENCE_STATE',
+  'CUTOVER_STATE_DIR',
+  // o3d-secops r20: the marker's own root-owned directory, and the path it was moved out of. Both
+  // are read by the privileged mechanism without being re-derived, so both are held to the same
+  // rule as everything beside them. AFTER ${CUTOVER_STATE_DIR}, because these declarations are
+  // evaluated in this order and the second of them is composed from it.
+  'FENCE_MARKER_DIR', 'LEGACY_STATE_DIR_FENCE_FILE',
+  'FENCE_FILE', 'CRON_BACKUP', 'DB_FENCE_DIR', 'DB_FENCE_STATE',
   'DB_ENV_SNAPSHOT_DIR', 'DB_ENV_SNAPSHOT_FILE', 'DB_CA_PUBLISH_DIR',
   'DB_CA_GENERATION_PREFIX', 'DB_CA_GENERATION_SUFFIX', 'DB_ROLE_ROTATION_JOURNAL',
   'DEPLOY_META_FILE', 'DB_FENCE_RECOVERY_DIR', 'DB_FENCE_IDENTITY_FILE',
@@ -2559,8 +2565,11 @@ test('[o3d-secops] every protected constant an entrypoint or the shared library 
   assert.equal(counted.get(FENCE_LIBRARY), PROTECTED_LIBRARY_CONSTANTS.length,
     `the shared fence library declares ${PROTECTED_LIBRARY_CONSTANTS.length} protected constants; this walk found `
     + `${counted.get(FENCE_LIBRARY)}. A declaration that disappears takes its regression above with it.`)
-  assert.equal(declared, 41 + PROTECTED_LIBRARY_CONSTANTS.length,
-    `the three entrypoints declared 41 protected publication constants between them when this was written, and the `
+  // 41 before o3d-secops r20, plus ${FENCE_MARKER_DIR} and ${LEGACY_STATE_DIR_FENCE_FILE} in each
+  // of the three: the marker's root-owned directory, and the path inside the application's own data
+  // directory it was moved out of.
+  assert.equal(declared, 47 + PROTECTED_LIBRARY_CONSTANTS.length,
+    `the three entrypoints declared 47 protected publication constants between them when this was written, and the `
     + `shared library ${PROTECTED_LIBRARY_CONSTANTS.length} of its own; this walk found ${declared}. `
     + 'A declaration that disappears takes its regression above with it, so the count is asserted rather than the floor.')
 })
