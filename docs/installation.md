@@ -1272,23 +1272,26 @@ says nothing about who may create it. So a root directly under `/tmp` is refused
   ```text
   ERROR: /var/lib/one-two-inventory is a symbolic link, and a root this run writes into may not be one: nothing here proves the path its target resolves through.
   ERROR: NOTHING HAS BEEN CHANGED by this run. To keep /var/lib/one-two-inventory on another disk, replace the link with a real directory and bind-mount the disk onto it — no data has to move, because the bind exposes the same filesystem at the same path.
-  ERROR: Do it with the writers stopped, and resolve the target BEFORE removing anything:
+  ERROR: Do it with the writers stopped, in this order:
   ERROR:   1. stop the application service, and pause any cron that writes under /var/lib/one-two-inventory
-  ERROR:   2. TARGET="$(readlink -f /var/lib/one-two-inventory)"; test -d "$TARGET" || echo "STOP: that link does not resolve to a directory"
-  ERROR:   3. rm /var/lib/one-two-inventory && mkdir -p /var/lib/one-two-inventory && mount --bind "$TARGET" /var/lib/one-two-inventory
-  ERROR:   4. verify with: findmnt /var/lib/one-two-inventory   — if the mount did NOT take, put the link back at once: rmdir /var/lib/one-two-inventory && ln -s "$TARGET" /var/lib/one-two-inventory
-  ERROR:   5. add: "$TARGET" /var/lib/one-two-inventory none bind 0 0   to /etc/fstab so the bind survives a reboot, then start the service again
+  ERROR:   2. this run resolved that link to: /srv/disk2/ims   — confirm that is where the data is
+  ERROR:   3. rm /var/lib/one-two-inventory && mkdir -p /var/lib/one-two-inventory && mount --bind /srv/disk2/ims /var/lib/one-two-inventory
+  ERROR:   4. verify with: findmnt /var/lib/one-two-inventory   — if the mount did NOT take, put the link back at once: rmdir /var/lib/one-two-inventory && ln -s /srv/disk2/ims /var/lib/one-two-inventory
+  ERROR:   5. add: /srv/disk2/ims /var/lib/one-two-inventory none bind 0 0   to /etc/fstab so the bind survives a reboot, then start the service again
   ```
 
   **What an operator with a symlinked root must do** is the five numbered steps above, in that
   order. They matter as a sequence, not as a one-liner: the refusal is printed while the service and
-  its cron are still running, and the middle step removes a live pathname. So — stop the writers,
-  **derive** `TARGET` from the link rather than retyping it, check it is a directory, then replace
-  and bind. If `mount --bind` does not take, step 4 puts the symlink straight back; without that,
-  a wrong or unavailable target leaves an **empty real directory** at the live path with the data
-  detached behind it, and the application either fails or quietly populates a shadow tree. Nothing
-  moves — the bind exposes the same filesystem at the same path, so the data, the ownership and the
-  free space are the ones that were already there.
+  its cron are still running, and step 3 removes a live pathname. The run **resolves the link
+  itself** and prints the target as a literal path, so there is no `TARGET` to mistype and no shell
+  variable in any of it — every line can be pasted as printed. If `mount --bind` does not take, step
+  4 puts the symlink straight back; without that, a wrong or unavailable target leaves an **empty
+  real directory** at the live path with the data detached behind it, and the application either
+  fails or quietly populates a shadow tree. Nothing moves — the bind exposes the same filesystem at
+  the same path, so the data, the ownership and the free space are the ones that were already there.
+  A link that does **not** resolve to a directory gets a different message and no bind-mount
+  command: there is nothing to bind yet, and the installer will not guess what it was meant to
+  point at.
   **Why:** the root's own *name* is safe, because its parent is root-owned; the *path its target
   resolves through* is not walked by anything, so any directory on that path the application
   account can write is a place to redirect a root-side publication of `.env`. A bind mount is the

@@ -1332,6 +1332,11 @@ test('[o3d-rn10] the refusal of a symlinked root names the bind mount an operato
     'including the half that survives a reboot')
   assert.match(refused.stderr, /no data has to move/,
     'and the fact that answers the question an operator asks first')
+  // o3d-secops r7 second pass: and the procedure a LIVE host needs, since the installer now prints
+  // this same refusal at pre-flight with the service still running.
+  assert.match(refused.stderr, /stop the application service/, refused.stderr)
+  assert.ok(refused.stderr.includes(`this run resolved that link to: ${realpathSync(stateRoot)}`), refused.stderr)
+  assert.match(refused.stderr, /put the link back at once/, refused.stderr)
 
   // NOT VACUOUS: the SAME layout with a real directory at the root name publishes. What is refused
   // is the LINK, not the location — an alternate disk is still supported, as a mount rather than a
@@ -4711,7 +4716,7 @@ test('[o3d-secops] the installer and the publisher refuse a symlinked root with 
    *  refusal from the caller's own sentence, and the caller's sentence is asserted separately below
    *  rather than ignored. */
   const refusalLines = (stderr: string, died: boolean) => {
-    const errors = stderr.split('\n').filter((line) => line.startsWith('ERROR: ') && line.includes(plant.stateRoot))
+    const errors = stderr.split('\n').filter((line) => line.startsWith('ERROR: '))
     return died ? errors.slice(0, -1) : errors
   }
 
@@ -4746,17 +4751,35 @@ test('[o3d-secops] the installer and the publisher refuse a symlinked root with 
   assert.ok(gateLines[0].includes('is a symbolic link'), gateLines[0])
   assert.ok(block.includes('no data has to move'), 'the question an operator asks first')
   assert.match(block, /stop the application service/, 'the writers must be stopped before anything is removed')
-  assert.match(block, /TARGET="\$\(readlink -f /, 'and the target derived from the link, not retyped')
-  assert.ok(block.includes(`rm ${plant.stateRoot} && mkdir -p ${plant.stateRoot} && mount --bind "$TARGET" ${plant.stateRoot}`),
-    `the bind-mount command must be runnable as printed: ${block}`)
+  // THE TARGET IS RESOLVED AND PRINTED AS A LITERAL PATH. There is no `TARGET` for anybody to
+  // mistype and no shell variable anywhere in the procedure — the run read the link itself.
+  const resolved = realpathSync(plant.stateRoot)
+  assert.ok(block.includes(`this run resolved that link to: ${resolved}`),
+    `the refusal must print where the link actually goes: ${block}`)
+  assert.ok(!/\$[A-Za-z_{(]/.test(block), `no step may contain a shell variable or substitution: ${block}`)
+  assert.ok(block.includes(`rm ${plant.stateRoot} && mkdir -p ${plant.stateRoot} && mount --bind ${resolved} ${plant.stateRoot}`),
+    `the bind-mount command must be runnable exactly as printed: ${block}`)
   assert.match(block, /findmnt /, 'and verifiable')
-  assert.ok(block.includes(`ln -s "$TARGET" ${plant.stateRoot}`),
+  assert.ok(block.includes(`ln -s ${resolved} ${plant.stateRoot}`),
     'and the rollback that puts the link back if the mount did not take must be on screen')
   assert.match(block, /\/etc\/fstab/, 'including the half that survives a reboot')
   // NOT VACUOUS ABOUT THE ORDER: the rollback must come AFTER the command it undoes, and the stop
   // before it, or an operator reading top to bottom meets each one too late to matter.
-  assert.ok(block.indexOf('mount --bind') < block.indexOf('ln -s "$TARGET"'), block)
+  assert.ok(block.indexOf('mount --bind') < block.indexOf('ln -s '), block)
   assert.ok(block.indexOf('stop the application service') < block.indexOf('mount --bind'), block)
+
+  // AND A LINK THAT RESOLVES TO NOTHING GETS A DIFFERENT ANSWER, because there is no bind mount to
+  // make. Measured rather than described: the same refusal, over a dangling link.
+  const dangling = createTempDirSync('ims-secops-dangling-', t)
+  const varlib = join(dangling, 'var-lib')
+  mkdirSync(varlib)
+  const danglingRoot = join(varlib, 'ims')
+  symlinkSync(join(dangling, 'gone'), danglingRoot)
+  const viaDangling = runBash(rig([...ROOT_GATE], GATE_DATA, `DATA_DIR=${q(danglingRoot)}`))
+  assert.equal(viaDangling.status, 1, viaDangling.stderr)
+  assert.match(viaDangling.stderr, /does not resolve to a directory/, viaDangling.stderr)
+  assert.ok(!viaDangling.stderr.includes('mount --bind'),
+    'a dangling link must not be given a bind-mount command whose target does not exist')
 
   // AND IT IS ONE RULE BECAUSE IT IS ONE FUNCTION, not two texts that happen to agree today.
   assert.ok(shellFunction(INSTALL_SH, 'require_real_service_root').includes('refuse_symlinked_root "${root}"'),

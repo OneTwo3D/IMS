@@ -1594,15 +1594,23 @@ publish_trust_root() {
 # from the link instead of asking for it to be retyped, and prints the command that puts the link
 # back if the bind mount does not take.
 refuse_symlinked_root() {
-  local root="$1"
+  local root="$1" target=""
+  # THE TARGET IS RESOLVED HERE AND PRINTED, not left to the operator to retype. Its status is
+  # taken so that this stays out of the unchecked-substitution census: a `readlink` that fails is a
+  # dangling or unreadable link, which is the branch below.
+  target="$(readlink -f "$root" 2>/dev/null)" || target=""
   printf 'ERROR: %s is a symbolic link, and a root this run writes into may not be one: nothing here proves the path its target resolves through.\n' "$root" >&2
   printf 'ERROR: NOTHING HAS BEEN CHANGED by this run. To keep %s on another disk, replace the link with a real directory and bind-mount the disk onto it — no data has to move, because the bind exposes the same filesystem at the same path.\n' "$root" >&2
-  printf 'ERROR: Do it with the writers stopped, and resolve the target BEFORE removing anything:\n' >&2
+  if [[ -z "$target" || ! -d "$target" ]]; then
+    printf 'ERROR: That link does not resolve to a directory%s, so there is no bind mount to make yet. Fix or remove it by hand — this run will not guess what it was meant to point at.\n' "${target:+ (it resolves to ${target})}" >&2
+    return 0
+  fi
+  printf 'ERROR: Do it with the writers stopped, in this order:\n' >&2
   printf 'ERROR:   1. stop the application service, and pause any cron that writes under %s\n' "$root" >&2
-  printf 'ERROR:   2. TARGET="$(readlink -f %s)"; test -d "$TARGET" || echo "STOP: that link does not resolve to a directory"\n' "$root" >&2
-  printf 'ERROR:   3. rm %s && mkdir -p %s && mount --bind "$TARGET" %s\n' "$root" "$root" "$root" >&2
-  printf 'ERROR:   4. verify with: findmnt %s   — if the mount did NOT take, put the link back at once: rmdir %s && ln -s "$TARGET" %s\n' "$root" "$root" "$root" >&2
-  printf 'ERROR:   5. add: "$TARGET" %s none bind 0 0   to /etc/fstab so the bind survives a reboot, then start the service again\n' "$root" >&2
+  printf 'ERROR:   2. this run resolved that link to: %s   — confirm that is where the data is\n' "$target" >&2
+  printf 'ERROR:   3. rm %s && mkdir -p %s && mount --bind %s %s\n' "$root" "$root" "$target" "$root" >&2
+  printf 'ERROR:   4. verify with: findmnt %s   — if the mount did NOT take, put the link back at once: rmdir %s && ln -s %s %s\n' "$root" "$root" "$target" "$root" >&2
+  printf 'ERROR:   5. add: %s %s none bind 0 0   to /etc/fstab so the bind survives a reboot, then start the service again\n' "$target" "$root" >&2
 }
 
 pin_dir_beneath_root() {
