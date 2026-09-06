@@ -2242,6 +2242,7 @@ test('o3d-2sm1.5 r19: every entrypoint supplies the four values, and refuses whe
   const deploy = readFileSync(join(process.cwd(), 'scripts/deploy.sh'), 'utf8')
   const update = readFileSync(join(process.cwd(), 'scripts/update.sh'), 'utf8')
   const install = readFileSync(join(process.cwd(), 'scripts/install.sh'), 'utf8')
+  const library = readFileSync(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'), 'utf8')
 
   for (const [name, source] of [['deploy.sh', deploy], ['update.sh', update], ['install.sh', install]] as const) {
     // EVERY invocation of the helper carries the identity — not just the one a test happened to
@@ -2259,14 +2260,25 @@ test('o3d-2sm1.5 r19: every entrypoint supplies the four values, and refuses whe
       '"${fence_script}"', '"$fence_script"',
       '"${preflight_script}"', '"$preflight_script"',
       '"${release_script}"', '"$release_script"',
-      '"${DB_FENCE_PROBE_SCRIPT}"', '"$DB_FENCE_PROBE_SCRIPT"',
     ]
+    // r3 (o3d-secops): the dry-run preflight has no spelling here any more. The path it runs is a
+    // `local` of db_fence_preflight() in the shared library, which appends
+    // "${DB_FENCE_IDENTITY_ARGS[@]:-}" itself — so the identity travels with the invocation by
+    // construction rather than by every caller remembering to add it. The library's own line is
+    // asserted below.
     const invocations = source.split('\n').filter((line) => RESOLVED.some((spelling) => line.includes(spelling)))
     const modes = invocations.filter((line) => /--(fence|release|preflight|print-migration-url)\b/.test(line))
     assert.ok(modes.length >= 4, `${name}: precondition — the helper is actually invoked here (${modes.length})`)
     for (const line of modes) {
       assert.ok(line.includes('DB_FENCE_IDENTITY_ARGS[@]'), `${name}: every invocation passes the identity — ${line.trim()}`)
     }
+    // AND THE ONE INVOCATION THAT MOVED INTO THE LIBRARY STILL CARRIES IT.
+    const libInvocations = library.split('\n')
+      .filter((line) => !/^\s*#/.test(line))
+      .filter((line) => /^\s*"\$@" node /.test(line))
+    assert.equal(libInvocations.length, 1, `the library runs the helper in exactly one place:\n${libInvocations.join('\n')}`)
+    assert.ok(libInvocations[0].includes('DB_FENCE_IDENTITY_ARGS[@]'),
+      `and it passes the identity — ${libInvocations[0].trim()}`)
     // AND NOTHING NAMES A UNIT ANY MORE: the systemd interrogation is gone, not merely unused.
     assert.ok(!source.includes('--service-unit'), `${name}: no unit is interrogated`)
     assert.ok(!source.includes('--systemctl='), `${name}: and no systemctl path is passed`)

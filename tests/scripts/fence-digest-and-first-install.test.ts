@@ -182,9 +182,9 @@ test('r35: the digest-report mode needs no database, no credential and no standi
   // and no IMS_FENCE_* of any kind on the invocation — and there is no standing artefact anywhere
   // near the scratch root, so a mode that quietly consulted one would be visible as a refusal.
   //
-  // MUTATION ROUTE: make db_fence_report_candidate_digest() call db_fence_probe_script() instead
-  // of db_fence_probe_candidate_digest() — it then consults ${DB_FENCE_SCRIPT_COPY} and, with no
-  // pin supplied, returns non-zero, so the run exits 1 and this test fails on `status`.
+  // MUTATION ROUTE: make db_fence_report_candidate_digest() call db_fence_probe_digests() instead
+  // of _fence_probe_assemble() — it then consults ${DB_FENCE_SCRIPT_COPY} for a standing artefact
+  // and reports on a box the command is explicitly not about.
   const root = releaseCheckout()
   try {
     const checkout = join(root, 'checkout')

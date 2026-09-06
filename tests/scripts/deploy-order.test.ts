@@ -7874,6 +7874,38 @@ function rotationHarness(
   ].join('\n')
 }
 
+/**
+ * THE TWO THINGS db_fence_preflight() ASKS ITS CALLER FOR, AS OBSERVABLES (o3d-secops r3).
+ *
+ * The file a preflight would execute is no longer a variable any of these harnesses can read: it
+ * is a `local` of the function that runs it, which is the whole point of the round. So what is
+ * observed instead is the ARGV — strictly stronger, because it is the bytes root would actually
+ * have executed rather than a variable somebody hoped named them.
+ *
+ * `runner` stands in for the entrypoints' `as_app_user env …`; db_fence_preflight() hands it
+ * `node <path> --preflight [identity args]`, so ${2} is the file. `notice` stands in for warn().
+ *
+ * ${TMPDIR} is redirected at a scratch directory so that "no throwaway tree survives" is asked of
+ * the FILESYSTEM. The assertion it replaces was `TEMP=[]` — a variable being empty, which is
+ * exactly the kind of evidence this round found wanting.
+ */
+function preflightSpies(scratch: string): string[] {
+  mkdirSync(scratch, { recursive: true })
+  return [
+    `export TMPDIR=${JSON.stringify(scratch)}`,
+    `PROBE_PATH_FILE=${JSON.stringify(`${scratch}.probe-path`)}`,
+    ':> "${PROBE_PATH_FILE}"',
+    'notice() { echo "NOTICE=[$*]"; }',
+    'runner() { echo "EXEC=[$*]"; printf "%s" "${2:-}" > "${PROBE_PATH_FILE}";'
+      + ' echo "CONTENT=[$(cat "${2:-/dev/null}" 2>/dev/null)]"; }',
+    // The same recording, but it really EXECUTES what it was handed — for the cases whose claim is
+    // "the credential reached nothing", where a runner that only records would prove the recording.
+    'exec_runner() { echo "EXEC=[$*]"; printf "%s" "${2:-}" > "${PROBE_PATH_FILE}"; env "$@"; }',
+    'report_probe() { echo "PROBE=[$(cat "${PROBE_PATH_FILE}")]";'
+      + ' echo "TMPLEFT=[$(ls -A "${TMPDIR}" 2>/dev/null | tr "\\n" " ")]"; }',
+  ]
+}
+
 function rotationDirs(): { app: string; recovery: string; state: string } {
   const root = mkdtempSync(join(tmpdir(), 'ims-r31-rot-'))
   mkdirSync(join(root, 'app', 'scripts'), { recursive: true })
@@ -8006,11 +8038,11 @@ test('r34: a dry run computes the candidate digest by READING, and hands back no
   // refusal itself advertised. So the dry run reads and hashes; it does not run.
   //
   // MUTATION ROUTE (each verified by making the change locally and re-running):
-  //   1. put r33's tail back — set DB_FENCE_PROBE_SCRIPT to the snapshot's helper unconditionally
-  //      at the end of db_fence_probe_script() — and PROBE/TEMP stop being empty. Measured: the
-  //      unpinned probe hands back ${TMPDIR}/…/scripts/fence-db-connections.mjs.
-  //   2. delete the `_fence_probe_discard_candidate` call on the refusal path: TEMP is empty but
-  //      the tree survives, so a caller that ignores the return value still has something to run.
+  //   1. put r33's tail back — nominate the snapshot's helper unconditionally at the end of
+  //      db_fence_preflight()'s resolution — and PHASE 1's `runner` is called. Measured: EXEC
+  //      names ${TMPDIR}/…/scripts/fence-db-connections.mjs on an unpinned run.
+  //   2. delete the `rm -rf "${_fence_probe_dir}"` on the refusal path: nothing is executed but
+  //      TMPLEFT names the surviving tree, so a later caller still has something to run.
   //   3. drop the digest match from the pinned arm — accept any candidate when
   //      IMS_FENCE_ARTEFACT_SHA256 is merely SET — and PHASE 2's control (a pin that names a
   //      different tree) stops being refused.
@@ -8022,17 +8054,19 @@ test('r34: a dry run computes the candidate digest by READING, and hands back no
     // PHASE 1 — NO ARTEFACT, NO PIN. The digest is still produced; nothing is offered to run.
     const probe = runShell(
       rotationHarness(dirs, [
-        'db_fence_probe_script; echo "RC=$?"',
-        'echo "PROBE=[${DB_FENCE_PROBE_SCRIPT}]"',
-        'echo "TEMP=[${DB_FENCE_PROBE_TEMP}]"',
+        ...preflightSpies(join(dirs.app, '..', 'scratch-1')),
+        'db_fence_probe_digests; echo "DRC=$?"',
         'echo "CANDIDATE=[${DB_FENCE_PROBE_ARTEFACT_SHA256}]"',
         'echo "STANDING=[${DB_FENCE_PROBE_STANDING_SHA256}]"',
+        'db_fence_preflight notice -- runner; echo "RC=$?"',
         'echo "REASON=[${DB_FENCE_PROBE_REASON}]"',
+        'report_probe',
       ]),
     )
     assert.match(probe.output, /^RC=1$/m, `an unauthenticated candidate is not preflightable:\n${probe.output}`)
-    assert.match(probe.output, /^PROBE=\[\]$/m, 'and there is NOTHING for a caller to execute')
-    assert.match(probe.output, /^TEMP=\[\]$/m, 'and no tree left on disk for one to find')
+    assert.doesNotMatch(probe.output, /^EXEC=/m, 'and NOTHING was executed — the runner was never reached')
+    assert.match(probe.output, /^PROBE=\[\]$/m, 'so no argv named a file')
+    assert.match(probe.output, /^TMPLEFT=\[\s*\]$/m, 'and no tree left on disk for a later caller to find')
     const candidate = /^CANDIDATE=\[([0-9a-f]{64})\]$/m.exec(probe.output)?.[1] ?? ''
     assert.match(candidate, /^[0-9a-f]{64}$/, `the ANSWER survives the restriction:\n${probe.output}`)
     assert.match(probe.output, /^STANDING=\[\]$/m, 'and there is no standing artefact to report')
@@ -8056,31 +8090,108 @@ test('r34: a dry run computes the candidate digest by READING, and hands back no
     // which is the failure mode a refusal has to avoid.
     const pinned = runShell(
       rotationHarness(dirs, [
-        'db_fence_probe_script; echo "RC=$?"',
-        'echo "PROBE=[${DB_FENCE_PROBE_SCRIPT}]"',
-        'echo "CONTENT=$(cat "${DB_FENCE_PROBE_SCRIPT}")"',
-        'temp="${DB_FENCE_PROBE_TEMP}"',
-        'db_fence_probe_cleanup',
-        'echo "AFTER=$([[ -e "${temp}" ]] && echo present || echo gone)"',
+        ...preflightSpies(join(dirs.app, '..', 'scratch-2')),
+        'db_fence_preflight notice -- runner; echo "RC=$?"',
+        'report_probe',
       ], [`IMS_FENCE_ARTEFACT_SHA256=${candidate}`]),
     )
     assert.match(pinned.output, /^RC=0$/m, `a pinned candidate is preflightable:\n${pinned.output}`)
     const probed = /^PROBE=\[(.*)\]$/m.exec(pinned.output)?.[1] ?? ''
+    assert.match(probed, /\/scripts\/fence-db-connections\.mjs$/, `something really was executed:\n${pinned.output}`)
     assert.notEqual(probed, join(dirs.app, 'scripts', 'fence-db-connections.mjs'), 'never the checkout file in place')
-    assert.match(pinned.output, /^CONTENT=\/\/ v1$/m, 'but the same bytes, snapshotted')
-    assert.match(pinned.output, /^AFTER=gone$/m, 'and the snapshot is removed when it is done with')
+    // CONTENT is captured INSIDE the runner, so it is what the file held at the instant of the
+    // call — not what happened to be on disk afterwards.
+    assert.match(pinned.output, /^CONTENT=\[\/\/ v1\]$/m, 'but the same bytes, snapshotted')
+    assert.match(pinned.output, /^NOTICE=\[This dry run probes with a throwaway copy/m,
+      `and the operator was told which of the two sources it was:\n${pinned.output}`)
+    assert.match(pinned.output, /^TMPLEFT=\[\s*\]$/m, 'and the snapshot is destroyed by the call that made it')
     assert.ok(!existsSync(dirs.recovery), 'and a dry run still publishes nothing')
 
-    // THE CONTROL FOR PHASE 2: a pin that names a DIFFERENT tree hands back nothing, so what was
+    // THE CONTROL FOR PHASE 2: a pin that names a DIFFERENT tree executes nothing, so what was
     // accepted above was the match and not the mere presence of the variable.
     const wrong = runShell(
       rotationHarness(dirs, [
-        'db_fence_probe_script; echo "RC=$?"',
-        'echo "PROBE=[${DB_FENCE_PROBE_SCRIPT}]"',
+        ...preflightSpies(join(dirs.app, '..', 'scratch-3')),
+        'db_fence_preflight notice -- runner; echo "RC=$?"',
+        'report_probe',
       ], [`IMS_FENCE_ARTEFACT_SHA256=${'0'.repeat(64)}`]),
     )
     assert.match(wrong.output, /^RC=1$/m, `a pin that does not match authorises nothing:\n${wrong.output}`)
+    assert.doesNotMatch(wrong.output, /^EXEC=/m, wrong.output)
     assert.match(wrong.output, /^PROBE=\[\]$/m, wrong.output)
+    assert.match(wrong.output, /^TMPLEFT=\[\s*\]$/m, 'and the tree it assembled to check is gone')
+  } finally {
+    rmSync(join(dirs.app, '..'), { recursive: true, force: true })
+  }
+})
+
+test('o3d-secops r3: after a real publish and a real preflight, the six steering names are not globals', () => {
+  // THE LOAD-BEARING ASSERTION OF THE ROUND, asked of a live shell rather than of the source.
+  //
+  // Four names the census called reports steered privileged execution, authentication, publication
+  // and deletion, and the remedy was not `readonly` — none of them can carry it — but that they
+  // stop being script-scope names at all. A static rule says the declarations are gone. This says
+  // the VALUES are gone: after the publication path and the preflight path have both run for real,
+  // bash itself is asked whether each name exists, and the answer must be no.
+  //
+  // MUTATION ROUTE (verified by making each change locally and re-running):
+  //   1. put `DB_FENCE_SOURCE_UNTRUSTED_PATH=""` back at script scope in the library: that name
+  //      reports `set` and the loop fails, naming it.
+  //   2. delete the `local DB_FENCE_SOURCE_UNTRUSTED_PATH=""` from _fence_stage_and_publish(): the
+  //      assignment two frames down creates the global again and the same assertion fails.
+  //   3. delete the `local -a _FENCE_SRC_*` from _fence_vendor_into(): all three report `set`.
+  //   4. have db_fence_preflight() publish its resolved path into a global before running it:
+  //      DB_FENCE_PROBE_SCRIPT reports `set`.
+  const dirs = rotationDirs()
+  const scratch = join(dirs.app, '..', 'scratch-globals')
+  try {
+    writeFileSync(join(dirs.app, 'scripts', 'fence-db-connections.mjs'), '// v1\n')
+    rmSync(dirs.recovery, { recursive: true, force: true })
+    const digest = runShell(
+      rotationHarness(dirs, ['db_fence_probe_digests >/dev/null 2>&1', 'echo "CANDIDATE=[${DB_FENCE_PROBE_ARTEFACT_SHA256}]"']),
+    )
+    const candidate = /^CANDIDATE=\[([0-9a-f]{64})\]$/m.exec(digest.output)?.[1] ?? ''
+    assert.match(candidate, /^[0-9a-f]{64}$/, digest.output)
+
+    const run = runShell(
+      rotationHarness(dirs, [
+        ...preflightSpies(scratch),
+        // THE PUBLICATION PATH, for real — it is the one that runs _fence_stage_and_publish(),
+        // _fence_vendor_into(), _fence_source_paths() and _fence_source_trust().
+        'db_fence_script_in_use >/dev/null; echo "PUBLISHED=$?"',
+        // AND THE PREFLIGHT PATH, for real — it is the one that resolves and executes.
+        'db_fence_preflight notice -- runner >/dev/null; echo "PREFLIGHT=$?"',
+        'for n in DB_FENCE_PROBE_SCRIPT DB_FENCE_PROBE_TEMP DB_FENCE_SOURCE_UNTRUSTED_PATH'
+          + ' _FENCE_SRC_STRICT _FENCE_SRC_PACKAGES _FENCE_SRC_PARENTS DB_FENCE_PROBE_REASON; do',
+        '  echo "GLOBAL ${n}=[${!n+set}]"',
+        'done',
+        'report_probe',
+      ], [`IMS_FENCE_ARTEFACT_SHA256=${candidate}`]),
+    )
+
+    // PRECONDITIONS — both paths really ran, or the loop below is asking about code that never
+    // executed and every answer would be "unset" for the wrong reason.
+    assert.match(run.output, /^PUBLISHED=0$/m, `the publication path must have run:\n${run.output}`)
+    assert.match(run.output, /^PREFLIGHT=0$/m, `and the preflight path with it:\n${run.output}`)
+    assert.ok(existsSync(join(dirs.recovery, 'app', 'scripts', 'fence-db-connections.mjs')),
+      'and the artefact really was published, which is what proves _fence_source_trust() ran')
+    assert.match(run.output, new RegExp(`^PROBE=\\[${escapeRe(join(dirs.recovery, 'app', 'scripts', 'fence-db-connections.mjs'))}\\]$`, 'm'),
+      `and something really was executed:\n${run.output}`)
+
+    // THE CLAIM.
+    for (const name of [
+      'DB_FENCE_PROBE_SCRIPT', 'DB_FENCE_PROBE_TEMP', 'DB_FENCE_SOURCE_UNTRUSTED_PATH',
+      '_FENCE_SRC_STRICT', '_FENCE_SRC_PACKAGES', '_FENCE_SRC_PARENTS',
+    ]) {
+      assert.match(run.output, new RegExp(`^GLOBAL ${name}=\\[\\]$`, 'm'),
+        `${name} must not exist in the shell after both paths have run — it steers execution, `
+        + `authentication, publication or deletion:\n${run.output}`)
+    }
+
+    // AND THE CONTROL, because "no name reported `set`" would also be the answer if `${!n+set}`
+    // never worked: a name that IS deliberately a global reports `set` in the same loop.
+    assert.match(run.output, /^GLOBAL DB_FENCE_PROBE_REASON=\[set\]$/m,
+      `the probe must be able to SEE a global, or the six above prove nothing:\n${run.output}`)
   } finally {
     rmSync(join(dirs.app, '..'), { recursive: true, force: true })
   }
@@ -8835,7 +8946,7 @@ test('r34: an unpinned bootstrap out of an application-writable checkout is REFU
     // the release host produces it: assemble and hash without executing) and the bootstrap goes
     // through. This is the assertion that keeps the refusal from being a brick wall.
     const probe = runShell(
-      artefactHarness(dir, ['db_fence_probe_script >/dev/null 2>&1', 'echo "CANDIDATE=[${DB_FENCE_PROBE_ARTEFACT_SHA256}]"']),
+      artefactHarness(dir, ['db_fence_probe_digests >/dev/null 2>&1', 'echo "CANDIDATE=[${DB_FENCE_PROBE_ARTEFACT_SHA256}]"']),
     )
     const candidate = /^CANDIDATE=\[([0-9a-f]{64})\]$/m.exec(probe.output)?.[1] ?? ''
     assert.match(candidate, /^[0-9a-f]{64}$/, `the digest must be obtainable without publishing:\n${probe.output}`)
@@ -9563,7 +9674,7 @@ test('r34: a dry run reports the tree it WOULD publish, not the one already stan
     writeFileSync(join(dirs.app, 'scripts', 'fence-db-connections.mjs'), '// v1\n')
     rmSync(dirs.recovery, { recursive: true, force: true })
     const first = runShell(
-      rotationHarness(dirs, ['db_fence_probe_script >/dev/null 2>&1', 'echo "CANDIDATE=[${DB_FENCE_PROBE_ARTEFACT_SHA256}]"']),
+      rotationHarness(dirs, ['db_fence_probe_digests >/dev/null 2>&1', 'echo "CANDIDATE=[${DB_FENCE_PROBE_ARTEFACT_SHA256}]"']),
     )
     const v1 = /^CANDIDATE=\[([0-9a-f]{64})\]$/m.exec(first.output)?.[1] ?? ''
     assert.match(v1, /^[0-9a-f]{64}$/, first.output)
@@ -9576,10 +9687,12 @@ test('r34: a dry run reports the tree it WOULD publish, not the one already stan
     writeFileSync(join(dirs.app, 'scripts', 'fence-db-connections.mjs'), '// v2\n')
     const probe = runShell(
       rotationHarness(dirs, [
-        'db_fence_probe_script; echo "RC=$?"',
-        'echo "PROBE=[${DB_FENCE_PROBE_SCRIPT}]"',
+        ...preflightSpies(join(dirs.app, '..', 'scratch-upgrade')),
+        'db_fence_probe_digests; echo "DRC=$?"',
         'echo "CANDIDATE=[${DB_FENCE_PROBE_ARTEFACT_SHA256}]"',
         'echo "STANDING=[${DB_FENCE_PROBE_STANDING_SHA256}]"',
+        'db_fence_preflight notice -- runner; echo "RC=$?"',
+        'report_probe',
       ]),
     )
     const candidate = /^CANDIDATE=\[([0-9a-f]{64})\]$/m.exec(probe.output)?.[1] ?? ''
@@ -9588,13 +9701,15 @@ test('r34: a dry run reports the tree it WOULD publish, not the one already stan
     assert.equal(standing, v1, 'the standing digest is what was published')
     assert.notEqual(candidate, standing, 'and the candidate is a DIFFERENT tree, because the checkout moved')
 
-    // THE PREFLIGHT STILL USES THE AUTHENTICATED ARTEFACT, which is the other half of the split:
-    // reporting the candidate does not mean running it.
+    // THE PREFLIGHT STILL RUNS THE AUTHENTICATED ARTEFACT, which is the other half of the split:
+    // reporting the candidate does not mean running it. Observed as the argv the runner was given.
     assert.match(
       probe.output,
       new RegExp(`^PROBE=\\[${escapeRe(join(dirs.recovery, 'app', 'scripts', 'fence-db-connections.mjs'))}\\]$`, 'm'),
-      `the standing artefact is what a preflight may execute:\n${probe.output}`,
+      `the standing artefact is what a preflight executes:\n${probe.output}`,
     )
+    assert.match(probe.output, /^CONTENT=\[\/\/ v1\]$/m, 'the OLD bytes, because the artefact did not move')
+    assert.match(probe.output, /^TMPLEFT=\[\s*\]$/m, 'and the candidate it hashed to report is not left lying about')
 
     // AND THE REPORTED CANDIDATE IS THE VALUE THAT AUTHORISES THE ROTATION — which is the whole
     // point of reporting it, and what the standing digest could never do.
@@ -9623,12 +9738,17 @@ test('r34: a dry run against a substituted checkout executes no part of it, and 
   // says the substituted `pg` got DEPLOY_ADMIN_DATABASE_URL. Neither may appear.
   //
   // MUTATION ROUTE (each verified by making the change locally and re-running):
-  //   1. restore r33's tail — DB_FENCE_PROBE_SCRIPT="${dir}/scripts/fence-db-connections.mjs" and
-  //      return 0 with no pin — and BOTH witnesses appear. Measured: flavour.txt holds
-  //      SUBSTITUTED-PG and STOLEN holds the admin URL, from the dry run alone, before any
-  //      publication and with no digest anywhere in the invocation.
-  //   2. keep the refusal but drop the _fence_probe_discard_candidate call: PROBE stays empty and
-  //      the assertion on TEMP fails — the snapshot is still on disk for the next caller.
+  //   1. restore r33's tail — nominate "${_fence_probe_dir}/scripts/fence-db-connections.mjs"
+  //      with no pin — and BOTH witnesses appear. Measured: flavour.txt holds SUBSTITUTED-PG and
+  //      STOLEN holds the admin URL, from the dry run alone, before any publication and with no
+  //      digest anywhere in the invocation.
+  //   2. keep the refusal but drop the `rm -rf "${_fence_probe_dir}"` on that path: nothing runs
+  //      but TMPLEFT names the snapshot — still on disk for the next caller.
+  //
+  // AND THE CALLER IS STILL THE UNDISCIPLINED ONE. r34 proved the library refuses even when the
+  // caller does not check; the caller can no longer even TRY, because there is no variable naming
+  // a file for it to run (o3d-secops r3). What stands in for the r33 caller is a real `node` on
+  // the checkout's own helper path, which is what that caller would have reached for.
   const dir = mkdtempSync(join(tmpdir(), 'ims-r34-dry-'))
   const admin = 'postgresql://admin:sup3rsecret@127.0.0.1:5432/imsdb'
   try {
@@ -9639,14 +9759,15 @@ test('r34: a dry run against a substituted checkout executes no part of it, and 
 
     const run = runShell(
       artefactHarness(dir, [
+        ...preflightSpies(join(dir, 'scratch-dry')),
         `export DEPLOY_ADMIN_DATABASE_URL=${JSON.stringify(admin)}`,
         `export IMS_TEST_STOLEN_PATH=${JSON.stringify(stolen)}`,
-        'db_fence_probe_script; echo "RC=$?"',
-        'echo "PROBE=[${DB_FENCE_PROBE_SCRIPT}]"',
-        'echo "TEMP=[${DB_FENCE_PROBE_TEMP}]"',
+        'db_fence_probe_digests >/dev/null 2>&1; echo "DRC=$?"',
         'echo "CANDIDATE=[${DB_FENCE_PROBE_ARTEFACT_SHA256}]"',
-        // THE r33 CALLER, WORD FOR WORD: run whatever the probe returned, with the credential.
-        'node "${DB_FENCE_PROBE_SCRIPT:-/nonexistent-probe}" --preflight >/dev/null 2>&1; echo "EXEC=$?"',
+        // THE REAL RUNNER, not a spy: if the library nominates anything at all here, node runs it
+        // with the credential in its environment and the two witnesses appear.
+        'db_fence_preflight notice -- exec_runner; echo "RC=$?"',
+        'report_probe',
       ]),
     )
     // THE WITNESSES FIRST, because they are the finding: under r33's behaviour both of these
@@ -9654,10 +9775,9 @@ test('r34: a dry run against a substituted checkout executes no part of it, and 
     // route below a MEASUREMENT rather than a prediction.
     assert.ok(!existsSync(flavour), 'NO part of the checkout helper graph may have run')
     assert.ok(!existsSync(stolen), 'and DEPLOY_ADMIN_DATABASE_URL may not have reached any of it')
-    assert.match(run.output, /^RC=1$/m, `the probe must refuse to nominate anything:\n${run.output}`)
+    assert.match(run.output, /^RC=1$/m, `the preflight must refuse to run anything:\n${run.output}`)
     assert.match(run.output, /^PROBE=\[\]$/m, run.output)
-    assert.match(run.output, /^TEMP=\[\]$/m, 'and leave no snapshot behind for a caller to find')
-    assert.match(run.output, /^EXEC=[1-9][0-9]*$/m, 'the unchecked caller fails, having executed nothing')
+    assert.match(run.output, /^TMPLEFT=\[\s*\]$/m, 'and leave no snapshot behind for a caller to find')
 
     // THE ANSWERABILITY IT WAS TRADED AGAINST SURVIVES: the digest was still produced, from the
     // same bytes, by reading them.
@@ -9683,33 +9803,46 @@ test('r34: neither entrypoint executes a probe it was not given, and both print 
   // proof that a rule changed in one entrypoint and not the other is a rule that is not one.
   //
   // MUTATION ROUTE (each verified by making the change locally and re-running):
-  //   1. delete the `-z "${DB_FENCE_PROBE_SCRIPT}"` guard from either entrypoint: the "guarded
-  //      before it is run" assertion fails, naming that file.
-  //   2. move the db_fence_probe_script call below the DEPLOY_ADMIN_DATABASE_URL refusal: the
+  //   1. give either entrypoint back a `node "${...}" --preflight` of its own: the "no entrypoint
+  //      executes a fence helper it named itself" assertion fails, naming that file.
+  //   2. move the db_fence_probe_digests call below the DEPLOY_ADMIN_DATABASE_URL refusal: the
   //      ordering assertion fails, and with it the release build host's only way to obtain the
   //      digest it is supposed to publish.
   //   3. inline the digest-provenance sentence into an entrypoint instead of printing
   //      db_fence_probe_report: the "one text" assertion fails.
+  //
+  // WHAT THE GUARD BECAME (o3d-secops r3). Until this round each entrypoint held the resolved
+  // path in ${DB_FENCE_PROBE_SCRIPT} and this test checked that a `-z` guard stood between the
+  // resolution and the `node`. That guard is gone because the gap it spanned is gone: resolution
+  // and execution are one call inside the library, and there is no name for an entrypoint to
+  // execute. So what is asserted is the STRONGER property — no entrypoint executes a fence helper
+  // at all on this path — plus the one call that does.
   for (const [name, source] of [
     ['scripts/update.sh', readFileSync(join(process.cwd(), 'scripts/update.sh'), 'utf8')],
     ['scripts/deploy.sh', readFileSync(join(process.cwd(), 'scripts/deploy.sh'), 'utf8')],
   ] as const) {
     const lines = source.split('\n').filter((line) => !/^\s*#/.test(line))
-    const probeCall = lines.findIndex((line) => /db_fence_probe_script/.test(line))
+    const probeCall = lines.findIndex((line) => /db_fence_probe_digests/.test(line))
     const report = lines.findIndex((line) => /db_fence_probe_report/.test(line))
     const firstRefusal = lines.findIndex((line) => /A REAL RUN WOULD BE REFUSED HERE/.test(line))
-    const guard = lines.findIndex((line) => /-z "\$\{?DB_FENCE_PROBE_SCRIPT\}?"/.test(line))
-    const exec = lines.findIndex((line) => /node "\$\{?DB_FENCE_PROBE_SCRIPT\}?"/.test(line))
+    const preflight = lines.findIndex((line) => /db_fence_preflight /.test(line))
 
     assert.ok(probeCall >= 0, `${name}: precondition: the dry run must ask the library`)
     assert.ok(report > probeCall, `${name}: what it found must be printed`)
     assert.ok(firstRefusal > report, `${name}: the digest must be printed before any refusal can return`)
-    assert.ok(guard >= 0, `${name}: an empty probe must be checked for`)
-    assert.ok(exec > guard, `${name}: and checked BEFORE anything is executed with the credential`)
+    assert.ok(preflight > report, `${name}: and the preflight comes after, through the library`)
     assert.equal(
-      lines.filter((line) => /node "\$\{?DB_FENCE_PROBE_SCRIPT\}?"/.test(line)).length,
+      lines.filter((line) => /db_fence_preflight /.test(line)).length,
       1,
-      `${name}: exactly one place may execute the probe, or the guard covers only one of them`,
+      `${name}: exactly one call may preflight, or a second one is outside the rule`,
+    )
+    // AND NO ENTRYPOINT NAMES A FENCE HELPER TO node ITSELF. This is the assertion the `-z` guard
+    // used to approximate: the guard could be right and the value still be re-aimed between the
+    // check and the exec, because the value was a variable. There is now no variable.
+    assert.deepEqual(
+      lines.filter((line) => /\bnode\b.*fence-db-connections|\bnode\b\s+"\$\{?DB_FENCE_[A-Z_]*(SCRIPT|PROBE)/.test(line)),
+      [],
+      `${name}: the library is the only thing that executes the fence helper`,
     )
     // AND THE INSTRUCTION FOR OBTAINING THE DIGEST IS THE LIBRARY'S, once, not each entrypoint's.
     assert.doesNotMatch(

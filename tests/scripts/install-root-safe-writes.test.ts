@@ -1489,19 +1489,50 @@ const PROTECTED_LIBRARY_CONSTANTS = [
 const MUTABLE_LIBRARY_NAMES: Readonly<Record<string, string>> = {
   DB_FENCE_ROTATION_NOTE: 'a report: the library sets it to say why a divergence was not promoted',
   DB_FENCE_SEAL_REASON: 'a report: _fence_tree_is_sealed() names the offending path in it',
-  DB_FENCE_PROBE_SCRIPT: 'a report: db_fence_probe_script() hands the caller what may be preflighted',
-  DB_FENCE_PROBE_TEMP: 'a report: the throwaway directory the caller must remove afterwards',
   DB_FENCE_PROBE_ARTEFACT_SHA256: 'a report: what the tree this checkout would publish hashes to',
   DB_FENCE_PROBE_STANDING_SHA256: 'a report: what the artefact already standing hashes to',
-  DB_FENCE_PROBE_REASON: 'a report: why there is nothing to preflight with',
-  DB_FENCE_SOURCE_UNTRUSTED_PATH: 'a report: the first path in the source tree that is not ours',
+  DB_FENCE_PROBE_REASON: 'a report: why there is nothing to preflight with, and after '
+    + 'db_fence_preflight() the fact that nothing was executed',
   DB_FENCE_SUDO_PREFIX:
     'not a path and not a decision: a display prefix resolved from PATH, and the one name here bash '
     + 'assigns twice by construction (a default, then a conditional)',
-  _FENCE_SRC_STRICT: 'a private accumulator, rebuilt by _fence_source_trust() on every call',
-  _FENCE_SRC_PACKAGES: 'a private accumulator, rebuilt by _fence_source_trust() on every call',
-  _FENCE_SRC_PARENTS: 'a private accumulator, rebuilt by _fence_source_trust() on every call',
 }
+
+/**
+ * AND WHAT LEFT THE LIST BY CEASING TO BE A SCRIPT-SCOPE NAME AT ALL (o3d-secops r3, Codex HIGH).
+ *
+ * Six names that used to sit in MUTABLE_LIBRARY_NAMES are gone from the library's script scope.
+ * They were not reports. Asked at the SINK rather than at the declaration:
+ *
+ *   DB_FENCE_PROBE_SCRIPT           EXECUTED — `node "$…" --preflight` as the application user
+ *                                   with DEPLOY_ADMIN_DATABASE_URL in the environment.
+ *   DB_FENCE_PROBE_TEMP             DELETION — the operand of an `rm -rf`, and the directory the
+ *                                   executed path was composed from.
+ *   DB_FENCE_PROBE_ARTEFACT_SHA256  AUTHENTICATION — one side of the equality against
+ *                                   ${DB_FENCE_EXPECTED_ARTEFACT_SHA256} that licenses running
+ *                                   checkout-derived bytes.
+ *   DB_FENCE_SOURCE_UNTRUSTED_PATH  PUBLICATION — `-n` on it is the gate that refuses to publish a
+ *                                   tree nothing authenticated into ${DB_FENCE_RECOVERY_DIR}.
+ *   _FENCE_SRC_STRICT/PACKAGES/     the ARGV of the find that computes that gate. Empty them and
+ *   _FENCE_SRC_PARENTS              the find examines nothing and reports no offender — a vacuous
+ *                                   check that reads exactly like a clean one.
+ *
+ * None of them can carry `readonly`: every one is computed per run. So the answer was one step
+ * further on — each is now a `local` of the function that derives and consumes it, and there is no
+ * script-scope name for any path to write. The census below enforces that they stay gone, and
+ * LIBRARY_SINK_RULES enforces the general form: a name still on the mutable list that reaches one
+ * of those four sinks fails.
+ *
+ * DB_FENCE_PROBE_ARTEFACT_SHA256 is the one that stayed, because the NAME stayed and the ROLE did
+ * not: what it holds now is the digest a dry run PRINTS, while the digest that authenticates a
+ * candidate is derived inside db_fence_preflight() and never leaves it. Overwrite the survivor and
+ * an operator is told a wrong value, pins with it, and the publication gate refuses — fail-closed,
+ * which is what makes "report" true of it rather than merely said about it.
+ */
+const NO_LONGER_SCRIPT_SCOPE = [
+  'DB_FENCE_PROBE_SCRIPT', 'DB_FENCE_PROBE_TEMP', 'DB_FENCE_SOURCE_UNTRUSTED_PATH',
+  '_FENCE_SRC_STRICT', '_FENCE_SRC_PACKAGES', '_FENCE_SRC_PARENTS',
+] as const
 
 for (const script of ENTRYPOINTS) {
   test(`[o3d-rn10] every destination ${script} publishes to lies under a trusted ancestor`, () => {
@@ -2367,6 +2398,248 @@ test('[o3d-secops] every script-scope declaration the shared fence library makes
   const found = libraryDeclaredNames(FENCE_LIB, FENCE_LIBRARY)
   assert.equal(found.length, PROTECTED_LIBRARY_CONSTANTS.length + Object.keys(MUTABLE_LIBRARY_NAMES).length,
     `the census found ${found.length} script-scope declarations in ${FENCE_LIBRARY}: ${found.join(', ')}`)
+
+  // AND THE SIX THAT LEFT ARE GONE, not merely unlisted. Each was a value the privileged mechanism
+  // ACTS on, and re-declaring any of them at script scope puts it back in a slot every later line
+  // of every entrypoint can write.
+  for (const name of NO_LONGER_SCRIPT_SCOPE) {
+    assert.ok(!found.includes(name),
+      `${FENCE_LIBRARY} declares ${name} at script scope again. It steers execution, authentication, `
+      + 'publication or deletion, and it cannot carry `readonly` — so it belongs to the function that '
+      + 'derives and consumes it, as a `local`.')
+  }
+})
+
+/**
+ * THE CENSUS AT THE SINK, NOT AT THE DECLARATION (o3d-secops r3, Codex HIGH — its second next-step).
+ *
+ * The census above is a census of NAMES: every script-scope declaration is in one of two lists. It
+ * is exactly what let four values through last round, because the question it makes a reviewer ask
+ * is asked WHERE THE NAME IS WRITTEN DOWN, and at the declaration ${DB_FENCE_PROBE_SCRIPT} and
+ * ${DB_FENCE_PROBE_REASON} are the same thing: an empty string with a comment over it. What
+ * separates them is sixty lines away, in `node "${DB_FENCE_PROBE_SCRIPT}" --preflight`.
+ *
+ * So this walks the other end. For every name still classified as a report, every place its value
+ * is EXPANDED — in the library and in all three entrypoints — must be a place that only prints it,
+ * tests it for emptiness, compares it against another report, or copies it into another name that
+ * is itself only used that way (which is followed, so ${DB_FENCE_SUDO_PREFIX} pulls
+ * ${DB_FENCE_RELEASE_CMD} into the question and answers it too). Anything else — a command
+ * position, an argument to `node`/`rm`/`mv`/`cp`, an equality against something that authenticates
+ * — is a SINK, and a mutable name that reaches one fails here, naming the file, the line and which
+ * of the four it reached.
+ *
+ * WHY THE RULE IS ABOUT GRAMMAR AND NOT ABOUT A LIST OF DANGEROUS COMMANDS. A deny-list of `rm`,
+ * `node` and friends is a list somebody has to remember to extend, which is the failure this test
+ * exists to stop repeating. The rule here is the inverse: a report may appear in a printing
+ * position, an emptiness test, a report-to-report comparison, or an assignment — and NOTHING ELSE
+ * is allowed, whether or not anybody thought of it.
+ *
+ * MEASURED AGAINST THE TREE THAT HAD THE DEFECT, which is the only way to know this is a check and
+ * not a decoration. The rule below, unchanged, was run over b128f47f's library and entrypoints with
+ * b128f47f's classification (twelve mutable names, seven of them wrong). It examined 82 expansions
+ * and produced 9 complaints naming exactly seven names — DB_FENCE_PROBE_SCRIPT (EXECUTION in both
+ * entrypoints, AUTHORIZATION in both), DB_FENCE_PROBE_TEMP (DELETION), DB_FENCE_PROBE_ARTEFACT_SHA256
+ * (AUTHORIZATION), DB_FENCE_SOURCE_UNTRUSTED_PATH (the publication gate) and the three _FENCE_SRC_*
+ * arrays (the find that computes it) — and nothing else. On the tree as it stands it produces none.
+ */
+const REPORT_PRINTERS = new Set([
+  'echo', 'printf', 'warn', 'info', 'ok', 'success', 'error', 'die', 'note', 'log', 'step',
+])
+const SHELL_KEYWORDS = new Set(['if', 'elif', 'while', 'until', 'then', 'else', 'do', 'done', 'fi', '{', '}', '!'])
+const SINK_KIND: ReadonlyArray<readonly [RegExp, string]> = [
+  [/^(rm|rmdir|shred|unlink|truncate)$/, 'DELETION'],
+  [/^(node|bash|sh|eval|exec|source|\.|runuser|env|su|sudo|python3?)$/, 'EXECUTION'],
+  [/^(cp|mv|install|ln|chown|chmod|mkdir|tee|dd|rsync|find|cat)$/, 'PUBLICATION or a destructive filesystem operation'],
+]
+
+/**
+ * The segments of one shell line, split on `;`, `&&` and `||` OUTSIDE quotes AND OUTSIDE `[[ … ]]`.
+ *
+ * The bracket depth is load-bearing, not tidiness. Splitting inside a conditional pulls
+ * `[[ -z "${A}" && -n "${B}" ]]` apart into two one-name tests, and the rule below decides what a
+ * conditional is FROM THE COMPANY IT KEEPS — so a split there hands it a report standing alone and
+ * it says fine. That is the exact shape of the publication gate this round was about.
+ */
+function shellSegments(line: string): string[] {
+  const out: string[] = []
+  let cur = ''
+  let quote: string | null = null
+  let depth = 0
+  for (let i = 0; i < line.length; i += 1) {
+    const c = line[i]
+    if (quote !== null) {
+      cur += c
+      if (c === quote && line[i - 1] !== '\\') quote = null
+      continue
+    }
+    if (c === '"' || c === "'") { quote = c; cur += c; continue }
+    if (c === '[' && line[i + 1] === '[') { depth += 1; cur += '[['; i += 1; continue }
+    if (c === ']' && line[i + 1] === ']') { depth = Math.max(0, depth - 1); cur += ']]'; i += 1; continue }
+    if (depth === 0 && c === ';') { out.push(cur); cur = ''; continue }
+    if (depth === 0 && (c === '&' || c === '|') && line[i + 1] === c) { out.push(cur); cur = ''; i += 1; continue }
+    cur += c
+  }
+  out.push(cur)
+  return out.map((segment) => segment.trim()).filter((segment) => segment.length > 0)
+}
+
+/** The command word of a segment, with the shell keywords in front of it stepped over. */
+function segmentHead(segment: string): string {
+  let words = segment.split(/\s+/).filter((word) => word.length > 0)
+  while (words.length > 0 && SHELL_KEYWORDS.has(words[0])) words = words.slice(1)
+  return words[0] ?? ''
+}
+
+/**
+ * Whether a segment is the continued ARGUMENT of a multi-line printer — a quoted string and nothing
+ * else. `"${DB_FENCE_SUDO_PREFIX}${DB_FENCE_RELEASE_WRAPPER}" --release` opens with a quote as well
+ * and is a COMMAND WORD; treating every leading quote as prose was this rule's second false
+ * negative, caught by the mutation fixture below rather than by reading it again.
+ */
+function isContinuedString(segment: string): boolean {
+  const quote = segment[0]
+  if (quote !== '"' && quote !== "'") return false
+  let i = 1
+  while (i < segment.length && !(segment[i] === quote && segment[i - 1] !== '\\')) i += 1
+  const rest = segment.slice(i + 1).trim()
+  return rest === '' || rest === '\\'
+}
+
+const upperExpansions = (text: string): string[] =>
+  [...text.matchAll(/\$\{?([A-Z_][A-Z0-9_]*)/g)].map((match) => match[1])
+
+/**
+ * Every sink a report-classified name reaches, across the library and the entrypoints. Also returns
+ * how many expansions were examined, because a walk that inspected nothing would otherwise report
+ * a clean estate.
+ */
+function reportSinkComplaints(sources: ReadonlyArray<readonly [string, string]>, seeds: readonly string[]):
+{ complaints: string[]; examined: number; followed: string[] } {
+  const reports = new Set<string>(seeds)
+  const followed: string[] = []
+  const complaints: string[] = []
+  let examined = 0
+  // The set GROWS as assignments are followed, so a report copied into another name drags that name
+  // into the question. Re-walked until it stops growing; the estate is small and this terminates.
+  for (let round = 0; round < 8; round += 1) {
+    complaints.length = 0
+    examined = 0
+    const before = reports.size
+    for (const [file, source] of sources) {
+      source.split('\n').forEach((raw, index) => {
+        const line = raw.trim()
+        if (line.length === 0 || line.startsWith('#')) return
+        for (const segment of shellSegments(line)) {
+          const names = upperExpansions(segment).filter((name) => reports.has(name))
+          if (names.length === 0) continue
+          examined += names.length
+          // A continued argument — the next line of a multi-line `die "…"` — prints like the first.
+          // It is a CONTINUATION only when the quote is the whole segment: `"${X}" --release` opens
+          // with a quote too, and is a command word.
+          if (isContinuedString(segment)) continue
+          const head = segmentHead(segment)
+          if (REPORT_PRINTERS.has(head)) continue
+          const assignment = /^(?:local |export |readonly |declare [^ ]+ )*([A-Za-z_][A-Za-z0-9_]*)(?:\[[^\]]*\])?\+?=/.exec(head === '' ? segment : segment.slice(segment.indexOf(head)))
+          if (assignment !== null) {
+            // The value flows into another name; that name now has to answer the same question.
+            if (!reports.has(assignment[1]) && /^[A-Z_][A-Z0-9_]*$/.test(assignment[1])) {
+              reports.add(assignment[1])
+              followed.push(`${assignment[1]} (from ${file}:${index + 1})`)
+            }
+            continue
+          }
+          // A conditional, INCLUDING a continuation of one: splitting `[[ -n "$A" || -n "$B" ]]` on
+          // the `||` leaves a second segment that starts at the operator and ends at the `]]`.
+          // Treating that as a command position was this rule's own first false positive.
+          const conditional = head === '[[' || head === '[' || /\]\]?$/.test(segment) || /^!?\s*-[a-z]\s/.test(segment)
+          if (conditional) {
+            // A conditional over REPORTS ONLY decides which sentence gets printed — `-n` on a note
+            // to see whether there is anything to say, or one digest against another to choose
+            // between two report lines. The instant a NON-report expansion joins it, the test is
+            // deciding something about a value the mechanism acts on.
+            //
+            // AND THAT IS WHY THE OPERATOR IS NOT THE TEST. The rule read `-n`/`-z` as harmless at
+            // first, and that alone let ${DB_FENCE_SOURCE_UNTRUSTED_PATH} through when this was
+            // measured against the pre-fix tree: its sink is
+            // `[[ -z "${DB_FENCE_EXPECTED_ARTEFACT_SHA256}" && -n "${DB_FENCE_SOURCE_UNTRUSTED_PATH}" ]]`,
+            // an emptiness test that is the whole publication gate. What makes a conditional a
+            // report is its COMPANY, not its operator.
+            if (upperExpansions(segment).every((name) => reports.has(name))) continue
+            complaints.push(
+              `${file}:${index + 1} tests ${names.join(', ')} alongside something that is not another report — `
+              + `that is AUTHORIZATION, not a report: ${segment}`)
+            continue
+          }
+          const kind = SINK_KIND.find(([pattern]) => pattern.test(head))?.[1]
+            ?? 'a command position — the mechanism ACTS on this value'
+          complaints.push(
+            `${file}:${index + 1} reaches ${kind} with ${names.join(', ')}: ${segment}\n`
+            + '  A value that reaches execution, authorization, publication or deletion is not a report. '
+            + 'Make it a `local` of the function that derives and consumes it, or `readonly` if it must be global.')
+        }
+      })
+    }
+    if (reports.size === before) break
+  }
+  return { complaints, examined, followed }
+}
+
+const SINK_CENSUS_SOURCES: ReadonlyArray<readonly [string, string]> = [
+  [FENCE_LIBRARY, FENCE_LIB],
+  ...ENTRYPOINTS.map((script) => [script, readFileSync(join(REPO, script), 'utf8')] as const),
+]
+
+test('[o3d-secops] no name classified as a report reaches execution, authorization, publication or deletion', () => {
+  const { complaints, examined, followed } = reportSinkComplaints(
+    SINK_CENSUS_SOURCES, Object.keys(MUTABLE_LIBRARY_NAMES))
+  assert.deepEqual(complaints, [], complaints.join('\n'))
+
+  // THE WALK REACHED THE SINKS, stated as numbers. A rule that examined nothing would pass exactly
+  // like a rule that examined everything and found it clean — which is the shape of the defect this
+  // whole round is about.
+  assert.ok(examined >= 60,
+    `the sink census must reach the places these names are used; it examined ${examined} expansions`)
+  assert.ok(followed.length >= 1,
+    `and it must FOLLOW a report into the names it is copied into; it followed: ${followed.join(', ')}`)
+})
+
+test('[o3d-secops] a report that reaches one of the four sinks fails the sink census', () => {
+  // NOT VACUOUS: the unmodified estate passes (the test above), so each failure below is the
+  // appended line talking. One fixture per sink, each a line bash would really execute.
+  const cases: ReadonlyArray<readonly [string, RegExp]> = [
+    ['rm -rf "${DB_FENCE_PROBE_REASON}"', /reaches DELETION with DB_FENCE_PROBE_REASON/],
+    ['node "${DB_FENCE_ROTATION_NOTE}" --preflight', /reaches EXECUTION with DB_FENCE_ROTATION_NOTE/],
+    ['cp -R "${DB_FENCE_SEAL_REASON}" /etc/ims-cutover-recovery/app', /reaches PUBLICATION or a destructive filesystem operation with DB_FENCE_SEAL_REASON/],
+    ['[[ "${DB_FENCE_PROBE_STANDING_SHA256}" == "${DB_FENCE_EXPECTED_ARTEFACT_SHA256}" ]] || exit 1',
+      /tests DB_FENCE_PROBE_STANDING_SHA256 alongside something that is not another report/],
+    // THE SHAPE THE FIRST DRAFT OF THIS RULE MISSED, and the one the finding was actually about:
+    // an EMPTINESS test that is a gate. Measured against the pre-fix tree, an operator-based rule
+    // reported six of the seven sinks and stayed silent on this one.
+    ['[[ -z "${DB_FENCE_EXPECTED_ARTEFACT_SHA256}" && -n "${DB_FENCE_PROBE_REASON}" ]] && exit 1',
+      /tests DB_FENCE_PROBE_REASON alongside something that is not another report/],
+    ['"${DB_FENCE_SUDO_PREFIX}${DB_FENCE_RELEASE_WRAPPER}" --release', /reaches .* with DB_FENCE_SUDO_PREFIX/],
+  ]
+  for (const [addition, expected] of cases) {
+    const { complaints } = reportSinkComplaints(
+      [[FENCE_LIBRARY, `${FENCE_LIB}\n${addition}\n`], ...SINK_CENSUS_SOURCES.slice(1)],
+      Object.keys(MUTABLE_LIBRARY_NAMES))
+    assert.equal(complaints.length, 1, `exactly the appended line must fail, for: ${addition}\n${complaints.join('\n')}`)
+    assert.match(complaints[0], expected, complaints[0])
+  }
+
+  // AND THE ALLOWED SHAPES REALLY ARE ALLOWED, or the rule above is "nothing may mention a report"
+  // wearing a costume — which would be red on the shipped tree and is not.
+  for (const addition of [
+    'warn "${DB_FENCE_PROBE_REASON}"',
+    'if [[ -n "${DB_FENCE_ROTATION_NOTE}" ]]; then echo "${DB_FENCE_ROTATION_NOTE}" >&2; fi',
+    'DB_FENCE_ROTATION_NOTE="${DB_FENCE_SEAL_REASON}"',
+    '[[ "${DB_FENCE_PROBE_STANDING_SHA256}" == "${DB_FENCE_PROBE_ARTEFACT_SHA256}" ]] || printf ok',
+  ]) {
+    const { complaints } = reportSinkComplaints(
+      [[FENCE_LIBRARY, `${FENCE_LIB}\n${addition}\n`], ...SINK_CENSUS_SOURCES.slice(1)],
+      Object.keys(MUTABLE_LIBRARY_NAMES))
+    assert.deepEqual(complaints, [], `a printing/emptiness/report-comparison use must pass: ${addition}\n${complaints.join('\n')}`)
+  }
 })
 
 /**
