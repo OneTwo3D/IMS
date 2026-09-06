@@ -507,11 +507,18 @@ header() {
 # is asserted by tests/scripts/install-root-safe-writes.test.ts, which also runs each of the four
 # mutations above against the shipped declaration under a real bash and requires a refusal.
 #
-# The two names the same set owns in scripts/lib/db-fence-protected.sh — DB_FENCE_RECOVERY_DIR
-# and DB_FENCE_IDENTITY_FILE — are deliberately NOT readonly: every fence harness sources that
-# library for its shipped bytes and then points its /etc literals at a scratch directory, so
-# `readonly` there would be untestable rather than safe. deploy-order.test.ts asserts instead
-# that no entrypoint reassigns them.
+# AND THE SHARED LIBRARY IS UNDER THE SAME RULE (o3d-secops r2, Codex HIGH). The first round of
+# this applied the word to the entrypoints and stopped at the file boundary, leaving
+# scripts/lib/db-fence-protected.sh — which names the recovery root, the protected tree and the
+# EXECUTABLE HELPER — as ordinary mutable variables, on the grounds that the fence harnesses
+# source it and then point its /etc literals at a scratch directory. That was a property of where
+# the HARNESS substituted, not of the library: it redirects the one trust-root literal in the
+# shipped text now, and the library's sixteen protected constants carry the word at their own
+# canonical declarations. See the block above them there for which names and why.
+#
+# ONE CONSEQUENCE, STATED HERE BECAUSE IT IS ABOUT THIS FILE: a second `source` of that library in
+# one shell is now FATAL — the second `readonly NAME=` is an error and `set -e` takes it. Each
+# entrypoint sources it exactly once, and a test requires that.
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------

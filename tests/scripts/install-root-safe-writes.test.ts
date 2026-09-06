@@ -2369,6 +2369,67 @@ test('[o3d-secops] every script-scope declaration the shared fence library makes
     `the census found ${found.length} script-scope declarations in ${FENCE_LIBRARY}: ${found.join(', ')}`)
 })
 
+/**
+ * AND THE ONE THING `readonly` IN A LIBRARY BREAKS: SOURCING IT TWICE (o3d-secops r2).
+ *
+ * A second `readonly NAME=` against a name that already has the word is an ERROR, not a no-op —
+ * bash refuses the assignment and says `NAME: readonly variable`, and under `set -e` (which all
+ * three entrypoints run with) that aborts the run. Before this round a second source was harmless,
+ * so nothing measured it; it is now a way to break a cutover, and it is a one-line edit away.
+ *
+ * WHY THE ANSWER IS NOT A SOURCE GUARD. `[[ -n "${_DB_FENCE_LIB_SOURCED:-}" ]] && return 0` at the
+ * top of the library would make a second source a no-op — and would also make setting one variable
+ * in the environment skip the ENTIRE library, trust root and all, for the first source too. That is
+ * a worse hole than the one it closes, in the file this round exists to protect. So the library
+ * keeps refusing, and what is asserted is that nothing sources it twice.
+ *
+ * BOTH HALVES ARE MEASURED, because the static count alone would be a rule about text:
+ *   PRECONDITION — one source of the shipped library runs clean and defines the constants.
+ *   THE HAZARD    — a second source in the same shell fails, naming a protected constant. This is
+ *                   the fact that makes the count below load-bearing rather than tidiness.
+ *   THE CLAIM     — each entrypoint carries exactly one `source` of it.
+ *
+ * MUTATION: append a second `source "${IMS_SCRIPT_LIB_DIR}/db-fence-protected.sh"` to any
+ * entrypoint and the count fails, naming the script. (Verified by making that edit to
+ * scripts/update.sh and re-running.) Strip `readonly` from EVERY declaration in the library and the
+ * HAZARD half fails instead — the second source stops complaining and exits 0. (Also verified; one
+ * stripped declaration is not enough, because the other fifteen still refuse.)
+ */
+test('[o3d-secops] nothing sources the shared fence library twice, because a second source now refuses', () => {
+  const library = join(REPO, FENCE_LIBRARY)
+
+  // PRECONDITION: one source is clean, and the library really did declare something.
+  const once = runBash([
+    'set -euo pipefail',
+    `source ${JSON.stringify(library)}`,
+    'printf \'COPY=%s\\n\' "${DB_FENCE_SCRIPT_COPY}"',
+  ].join('\n'))
+  assert.equal(once.status, 0, `one source must run clean: ${once.stderr}`)
+  assert.match(once.stdout, /^COPY=\/etc\/ims-cutover-recovery\/app\/scripts\//m, once.stdout)
+
+  // THE HAZARD, DEMONSTRATED: the second source refuses, and says which name it refused.
+  const twice = runBash([
+    'set -euo pipefail',
+    `source ${JSON.stringify(library)}`,
+    `source ${JSON.stringify(library)}`,
+    'echo REACHED',
+  ].join('\n'))
+  assert.notEqual(twice.status, 0, `a second source must not pass silently:\n${twice.stdout}${twice.stderr}`)
+  assert.match(`${twice.stdout}${twice.stderr}`, /DB_FENCE_[A-Z_]+: readonly variable/,
+    `and it must name a protected constant:\n${twice.stdout}${twice.stderr}`)
+  assert.doesNotMatch(twice.stdout, /^REACHED$/m, 'and the shell must not carry on past it')
+
+  // THE CLAIM: one source each, counted over code lines only — the prose names the file often.
+  for (const script of ENTRYPOINTS) {
+    const sourced = readFileSync(join(REPO, script), 'utf8').split('\n')
+      .filter((line) => !line.trimStart().startsWith('#'))
+      .filter((line) => /(^|[\s;&|(){}])(source|\.)\s+\S*db-fence-protected\.sh/.test(line))
+    assert.equal(sourced.length, 1,
+      `${script} must source ${FENCE_LIBRARY} exactly once — a second source aborts the run on a `
+      + `\`readonly\` refusal, as demonstrated above:\n${sourced.join('\n')}`)
+  }
+})
+
 test('[o3d-secops] a new library path declared next to the protected ones fails the census', () => {
   // NOT VACUOUS, AND IN BOTH DIRECTIONS. The unmodified library passes the census (the test above),
   // so the failures below are the appended declarations talking.

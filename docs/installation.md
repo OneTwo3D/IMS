@@ -1981,6 +1981,20 @@ same instant as the body of the script, so it adds no window the entrypoint does
 unlike the helper, which is executed several phases later, after the application account has had a
 cutover's worth of time to replace it.
 
+**The library's own paths are `readonly`, and it may be sourced only once.** Every constant the
+privileged mechanism acts on without re-deriving — the recovery root, the identity record, the
+protected application tree, the fence helper inside it, the staging and retired trees, the artefact
+digest record and its manifest, the two operator wrappers, the two expected digests, and the
+vendoring policy — is declared `readonly` at its one declaration in
+`scripts/lib/db-fence-protected.sh`. A scanner can only see `NAME=` words, and `printf -v`, `read`,
+a nameref and `(( ))` each change a variable without writing one; `readonly` makes bash refuse all
+of them, including forms nobody has listed. Two consequences for anyone editing these scripts:
+**source the library exactly once per entrypoint** — a second `source` in the same shell fails on
+the first `readonly` and `set -e` aborts the run — and **do not reassign these names anywhere**;
+move the value by editing the declaration itself. A path added to that file later is refused by the
+census in `tests/scripts/install-root-safe-writes.test.ts` until it is either declared `readonly`
+and listed as protected or recorded as deliberately mutable with a reason.
+
 `--dry-run` is the one invocation that cannot use the publishing path, because a dry run writes
 nothing and least of all under `/etc`. It may not run the checkout's file in place either
 (`--preflight` opens the admin connection with `DEPLOY_ADMIN_DATABASE_URL`, so "it only reads" is a

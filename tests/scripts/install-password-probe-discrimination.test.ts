@@ -2903,9 +2903,17 @@ test('r45: an upgrade recovers the transport and the CA from the URL the previou
 // DB_SSLMODE inside the shell, because an assignment inside the shell is the thing that hid this.
 // ---------------------------------------------------------------------------
 
-/** The literal path install.sh publishes the CA to, read out of the script rather than retyped. */
+/**
+ * The literal path install.sh publishes the CA to, read out of the script rather than retyped.
+ *
+ * The declaration word is optional and not enumerated away: several of these names became
+ * `readonly` at their canonical declaration (o3d-secops), and a reader anchored on `^NAME="` simply
+ * stopped finding them — this precondition was failing on DB_CA_PUBLISH_DIR for exactly that
+ * reason. What makes the match ours is that the name starts the declaration, so the prefix is
+ * skipped rather than required.
+ */
 function shippedLiteral(source: string, name: string): string {
-  const match = new RegExp(`^${name}="([^"]*)"$`, 'm').exec(source)
+  const match = new RegExp(`^(?:(?:export|readonly|declare|typeset)\\s+(?:-\\w+\\s+)*)?${name}="([^"]*)"$`, 'm').exec(source)
   assert.ok(match, `precondition: scripts/install.sh must define ${name} as a double-quoted literal`)
   return match[1]
 }
