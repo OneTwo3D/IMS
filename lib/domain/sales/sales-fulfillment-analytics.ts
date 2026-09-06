@@ -146,6 +146,21 @@ export type CustomerReportRow = {
   customerId: string | null
   customerName: string
   customerEmail: string | null
+  /**
+   * THE ROW'S OWN COPY OF THE IDENTITY THE NOTICE NAMES IT BY (o3d-7jfq r9).
+   *
+   * `customerGroupKey` put through `identityLabelField` — the same value, from the same field, that
+   * `inconsistentCustomerLabel` prints as `group=`. It is on the row because the notice's token was
+   * previously the ONLY place it existed: an operator holding one had no mechanical way to reach
+   * the row it identifies, and was left comparing hex digits by eye against a name — which is not
+   * a route, it is a hope. Carried here it reaches the table cell and the `groupToken` CSV column,
+   * so the token is COPIED and MATCHED, or JOINED, and never read.
+   *
+   * ONE SOURCE, NOT TWO EQUAL ONES. The label takes this field rather than re-deriving the key, so
+   * the notice and the row cannot disagree about which row is meant — the same discipline the count
+   * and the names already follow, where both are taken from the one sorted, unpaginated array.
+   */
+  groupToken: string
   orderCount: number
   /** AS INVOICED, unchanged, so this column still agrees with Sales Analytics' customer grouping. */
   revenueBase: string
@@ -1102,9 +1117,10 @@ const INCONSISTENT_NOTICE_NAME_LIMIT = 10
  * typed in two cases is one customer — and, with no email to go on, its name. Both guest forms are
  * namespaced so that the two of them cannot be confused with each other.
  *
- * It lives here rather than inline at the grouping loop because `inconsistentCustomerLabel` prints
- * it: grouping and labelling then cannot drift apart, and the label's uniqueness is a property of
- * the key rather than a claim about it.
+ * It lives here rather than inline at the grouping loop because the row carries it onward: the
+ * projection encodes the MAP KEY into `CustomerReportRow.groupToken`, and the notice, the table
+ * cell and the CSV column all read that one field. Grouping and labelling therefore cannot drift
+ * apart, and the label's uniqueness is a property of the key rather than a claim about it.
  */
 function customerGroupKey(row: Pick<CustomerReportRow, 'customerId' | 'customerName' | 'customerEmail'>): string {
   return row.customerId ?? (row.customerEmail ? `guest-email:${row.customerEmail.toLowerCase()}` : `guest-name:${row.customerName}`)
@@ -1237,15 +1253,20 @@ const IDENTITY_TOKEN_PREFIX = 'utf16hex:'
  * every confusable the round-8 finding named: there is no letter `O` to confuse with `0`, no `I`
  * and no `l` to confuse with `1`, and no `m`, `n` or `r`, so `rn` cannot be drawn as `m`.
  *
- * THE RESIDUE, STATED RATHER THAN ARGUED AWAY. This does not make the field unmistakable in every
- * font, and no alphabet would be. Within `0`-`9` and `a`-`f` the pair `6`/`b` - and in some faces
- * `1`/`7` or `0`/`8` - are font-dependent shapes, so two tokens whose ONLY difference is one such
- * pair at one position can still be misread by eye. What is gone is the set the finding named and
- * the whole class of non-ASCII homoglyphs; what is left is that smaller residue, said out loud
- * rather than asserted away a third time. Two mitigations, both real and neither a proof: the
- * width is fixed, so two tokens are compared position against position rather than read; and the
- * render site suppresses ligature formation, so `ff` stays two digits wide and the DIGIT COUNT is
- * never wrong - see `app/(dashboard)/analytics/_components/report-page-title.tsx`.
+ * THE RESIDUE, AND WHY IT NO LONGER DECIDES ANYTHING (r9). This does not make the field
+ * unmistakable in every font, and no alphabet would be. Within `0`-`9` and `a`-`f` the pair `6`/`b`
+ * - and in some faces `1`/`7` or `0`/`8` - are font-dependent shapes, so two tokens whose ONLY
+ * difference is one such pair at one position can still be MISREAD. Round 8 answered that with a
+ * fixed width and with ligature suppression at the render site, and both were the wrong kind of
+ * answer: they make the token easier to READ, and reading is the step that fails. Neither one can
+ * separate `6` from `b`, so the mitigation did not address the collision it was named against.
+ *
+ * The answer is that nobody has to read it. The same token is carried on the row
+ * (`CustomerReportRow.groupToken`), rendered in the report's Group token cell, and exported as the
+ * `groupToken` CSV column, so the route from a notice entry to the row it names is COPY AND MATCH,
+ * or a join on the export - both exact, both blind to what a glyph looks like. The fixed width and
+ * the ligature suppression stay because they cost nothing and help an operator who does glance at
+ * one; they are aids, and this comment no longer offers them as the mitigation.
  *
  * WHAT IT COSTS, AND WHY THE SPLIT PAYS FOR IT. The emailless guest `Acme Ltd` keys on
  * `guest-name:Acme Ltd` and is printed `group=utf16hex:0067007500650073...`, which no operator
@@ -1305,6 +1326,14 @@ function identityLabelField(value: string): string {
  * longer depends on which characters anybody remembered to escape, and `name=` no longer has to
  * carry a burden that would make it unreadable. See both for why.
  *
+ * AND THE IDENTITY HALF IS THE ROW'S, NOT THIS FUNCTION'S (r9). `group=` is `row.groupToken` read
+ * straight off the row — no second call to `customerGroupKey`, no second encode. It used to be
+ * re-derived here, which was correct and still wrong in shape: a token that exists ONLY in a
+ * notice names a row the operator cannot mechanically reach, and two derivations of one identity
+ * are two things that can be changed apart. The row, the Group token cell and the `groupToken` CSV
+ * column now print the same string this label does, from the one field, so the notice and the row
+ * cannot disagree and a token can be COPIED from one to the other instead of read.
+ *
  * AND INJECTIVE WHERE IT IS READ, NOT ONLY WHERE IT IS BUILT (r8). The notice is rendered as
  * collapsing HTML in an 11px proportional font, so a label distinct only before rendering is not
  * distinct to the operator - and neither is one whose distinguishing character is `O` where the
@@ -1320,8 +1349,8 @@ function identityLabelField(value: string): string {
  * Customer cell is empty, and visibly a value rather than a gap. `group=` needs none of this and
  * carries no quotes: its alphabet has no quote, no space and no `;` to be confused by.
  */
-function inconsistentCustomerLabel(row: Pick<CustomerReportRow, 'customerId' | 'customerName' | 'customerEmail'>): string {
-  return `name=${labelField(row.customerName)} email=${labelField(row.customerEmail)} customerId=${labelField(row.customerId)} group=${identityLabelField(customerGroupKey(row))}`
+function inconsistentCustomerLabel(row: Pick<CustomerReportRow, 'customerId' | 'customerName' | 'customerEmail' | 'groupToken'>): string {
+  return `name=${labelField(row.customerName)} email=${labelField(row.customerEmail)} customerId=${labelField(row.customerId)} group=${row.groupToken}`
 }
 
 /**
@@ -1345,13 +1374,21 @@ function inconsistentCustomerLabel(row: Pick<CustomerReportRow, 'customerId' | '
  * than after it, which fields are for finding the row and which one is for telling two rows apart.
  * Before the list because the entries end the sentence: the overflow clause is the last thing the
  * notice says, so that where all of them can be found is what an operator reads last.
+ *
+ * AND IT NAMES A MECHANICAL ROUTE, NOT AN INSTRUCTION TO SQUINT (r9). Round 8's wording ended
+ * `compare their tokens digit against digit at the same position`, which asks the operator's EYES
+ * to be the authority over a hex alphabet that still holds `6` against `b`. The token now exists
+ * on the row and in the CSV as well as here, so the notice says to COPY one and match it against
+ * the Group token cell, or against the `groupToken` column of the unpaginated export. That is a
+ * route a person can follow without comparing a single glyph.
  */
 const IDENTITY_FIELD_NOTICE =
   'Find the row by reading name= and email=, which show exactly what the Customer and Email cells '
   + 'show. group= is not a name and is not meant to be read: it is the identity the row was grouped '
   + `under, written as a machine token — the literal ${IDENTITY_TOKEN_PREFIX} followed by `
-  + `${IDENTITY_HEX_WIDTH} lowercase hex digits for each UTF-16 code unit of it — so tell two `
-  + 'entries apart by comparing their tokens digit against digit at the same position.'
+  + `${IDENTITY_HEX_WIDTH} lowercase hex digits for each UTF-16 code unit of it. Do not compare `
+  + 'tokens by eye: copy one whole and match it against the Group token cell on the row, or against '
+  + 'the groupToken column of the CSV export, which is not paginated.'
 
 function namedInconsistentCustomers(labels: string[]): string {
   const shown = labels.slice(0, INCONSISTENT_NOTICE_NAME_LIMIT)
@@ -1492,7 +1529,10 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
 
   // `costCaptured` is OMITTED, not carried and ignored: it is derived from `costEvidence` at the
   // projection, and a group field of the same name would be a second place to get it wrong.
-  type CustomerGroup = Omit<CustomerReportRow, 'costCaptured'> & {
+  // `groupToken` is omitted alongside `costCaptured`: both are DERIVED in the projection below —
+  // the token from the Map key this group is filed under, so there is no second place it could
+  // be set to something else. See `CustomerReportRow.groupToken`.
+  type CustomerGroup = Omit<CustomerReportRow, 'costCaptured' | 'groupToken'> & {
     revenue: Prisma.Decimal
     revenueExVat: Prisma.Decimal
     cogs: Prisma.Decimal
@@ -1648,6 +1688,10 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
         customerId: row.customerId,
         customerName: row.customerName,
         customerEmail: row.customerEmail,
+        // THE MAP KEY ITSELF, encoded once. `key` is the identity this group was actually filed
+        // under, so the token on the row is not a re-derivation that could drift from the grouping
+        // — and `inconsistentCustomerLabel` reads it back off the row rather than encoding again.
+        groupToken: identityLabelField(key),
         orderCount: row.orderCount,
         revenueBase: moneyString(row.revenue, baseCurrency),
         netRevenueBase: moneyString(netRevenue, baseCurrency),

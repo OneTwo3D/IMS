@@ -47,7 +47,13 @@ export const SALES_ANALYTICS_EXPORTS: Record<SalesAnalyticsExportType, SalesAnal
   },
   customers: {
     filename: 'customer-mix',
-    columns: ['customerId', 'customerName', 'customerEmail', 'orderCount', 'revenueBase', 'netRevenueBase', 'netRevenueBaseBound', 'netRevenueExVatBase', 'netRevenueExVatBaseBound', 'grossProfitBase', 'grossProfitBaseBound', 'costCaptured', 'costEvidence', 'arExposureBase', 'arExposureBaseBound', 'shareOfRevenuePct', 'shareOfRevenuePctBound', 'refundsNetBasis', 'refundsGrossBasis', 'refundsUnknownBasis'],
+    // `groupToken` sits with the other identity fields, and it is the one an operator can JOIN ON
+    // (o3d-7jfq r9). `customerId` is null for every guest, and the readable fields are exactly
+    // what can look identical between two guest rows — so for the cases the contradiction notice
+    // exists to name, this column is the only mechanical route from a notice entry to its row.
+    // The parity test above catches its omission structurally; it is listed here because the
+    // column ORDER is chosen, not because presence is optional.
+    columns: ['customerId', 'customerName', 'customerEmail', 'groupToken', 'orderCount', 'revenueBase', 'netRevenueBase', 'netRevenueBaseBound', 'netRevenueExVatBase', 'netRevenueExVatBaseBound', 'grossProfitBase', 'grossProfitBaseBound', 'costCaptured', 'costEvidence', 'arExposureBase', 'arExposureBaseBound', 'shareOfRevenuePct', 'shareOfRevenuePctBound', 'refundsNetBasis', 'refundsGrossBasis', 'refundsUnknownBasis'],
     refundTreatment: REFUND_BASIS_NOTICE_CUSTOMER_MIX,
   },
   margin: {

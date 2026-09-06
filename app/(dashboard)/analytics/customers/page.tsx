@@ -33,6 +33,16 @@ export default async function CustomerAnalyticsPage({ searchParams }: { searchPa
     { key: 'creditNet', label: 'Credit (net basis)', align: 'right', render: (row) => row.refundsNetBasis, footer: report.totals.refundsNetBasis },
     { key: 'creditGross', label: 'Credit (gross basis)', align: 'right', render: (row) => row.refundsGrossBasis, footer: report.totals.refundsGrossBasis },
     { key: 'creditUnknown', label: 'Credit (unproven basis)', align: 'right', render: (row) => row.refundsUnknownBasis, footer: report.totals.refundsUnknownBasis },
+    // THE END OF THE ROUTE THE NOTICE STARTS (o3d-7jfq r9). The contradiction notice names its rows
+    // by `group=<token>`; until now that token existed NOWHERE else, so an operator holding one had
+    // to find the row by reading the name — and for the guest rows the notice exists to separate,
+    // the names are exactly what can be identical. The same token is on the row here, so the route
+    // is: select the cell (`select-all` selects the whole token on one click), copy, and match — or
+    // search the page for it. No digit is ever compared by eye. `break-all` because the token is
+    // long and a truncated identifier is not an identifier; last, because it is the field an
+    // operator uses least often. It reads `row.groupToken`, the same field the notice prints, so
+    // the cell and the notice cannot disagree about which row is meant.
+    { key: 'groupToken', label: 'Group token', render: (row) => <code className="select-all break-all font-mono text-[11px] text-muted-foreground">{row.groupToken}</code> },
   ]
 
   return (
@@ -43,7 +53,10 @@ export default async function CustomerAnalyticsPage({ searchParams }: { searchPa
       filters={salesAnalyticsFiltersForUi(filters)}
       pageInfo={report.pageInfo}
       rows={report.rows}
-      rowKey={(row, index) => row.customerId ?? `${row.customerName}:${index}`}
+      // The group token IS the row's identity — distinct per Map key by construction — so the React
+      // key no longer has to fall back to a name plus a position, which was unique only by accident
+      // of ordering. Same field as the cell and the notice.
+      rowKey={(row) => row.groupToken}
       columns={columns}
       summary={[
         { label: 'Revenue (invoiced)', value: report.totals.revenueBase },
