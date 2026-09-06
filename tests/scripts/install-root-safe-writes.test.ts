@@ -2901,6 +2901,24 @@ function reportSinkComplaints(sources: ReadonlyArray<readonly [string, string]>,
     // shellAssignments() derives it from where the word sits in its command.
     for (const [file, source] of sources) {
       for (const held of shellAssignments(source, file)) {
+        // AND ONE POSITION THAT IS NOT A THIRD ANSWER BUT NO ANSWER AT ALL. `ref=NAME $(pick)` is
+        // a command prefix when `pick` prints a word and a BARE ASSIGNMENT when it prints nothing,
+        // and both were measured under a real bash. Where that decides whether a report's name is
+        // held, the census says so rather than picking one.
+        if (held.position === 'undecidable' && !held.append) {
+          const undecided = aliasedName(held.value)
+          if (undecided.kind === 'refuse' || (undecided.kind === 'name' && reports.has(undecided.name))) {
+            complaints.push(
+              `${file}:${held.line} puts ${held.name} in front of a command word that is nothing but `
+              + `an expansion, so whether this is a command prefix or the whole command is decided at `
+              + `RUNTIME — and it is the assignment of a report's name: ${held.name}=${held.value}\n`
+              + '  If the expansion comes back empty the word vanishes and the assignment stands, '
+              + 'which would make this an alias; if it does not, the assignment is only that '
+              + "command's environment. Name the command outright, or split the assignment onto its "
+              + 'own line.')
+          }
+          continue
+        }
         // ONLY A PERSISTENT REPLACEMENT ANSWERS THE QUESTION. `held.replaces` is false for the
         // three shapes above, and each was measured under a real bash before this line was written.
         if (!held.replaces) continue
@@ -3073,6 +3091,10 @@ test('[o3d-secops] a report that reaches one of the four sinks fails the sink ce
  *   word after a non-declaration command      operand; the ARGUMENT row goes red.
  *   `replaces: position === 'assignment'    — the append ignored; the APPEND row goes red.
  *     || position === 'operand'`
+ *   `mayVanish = false`                    — the UNDECIDABLE rows go red: each reads as a prefix.
+ *   `mayVanish = pending.length > 0`       — the four rows below them go red instead: a quoted or
+ *                                            part-literal command word reads as one that may not
+ *                                            be there.
  * The last one leaves the census test below still green on its own, because appendedTo bars an
  * appended name there as well; dropping BOTH guards is what turns that row red, and that was run
  * too. Belt and braces, said out loud rather than left to look like one guard.
@@ -3121,6 +3143,44 @@ test('[o3d-secops] the assignment reader says which words REPLACE a name and whi
     assert.equal(bashLeaves(form), 'DB_FENCE_PROBE_REASON',
       `bash must really replace ref from ${JSON.stringify(form)}`)
     assert.deepEqual(read(form), { position, replaces: true }, `shellAssignments() on ${JSON.stringify(form)}`)
+  }
+
+  // AND THE SHAPE THAT HAS NO STATIC ANSWER: a prefix run whose command word is nothing but an
+  // unquoted expansion. Bash decides AFTER expanding, so the same spelling gives both answers, and
+  // both are run here — an empty substitution makes the word vanish and the assignment stands; a
+  // non-empty one makes it a prefix. A reader that picked either would be wrong half the time, so
+  // this one reports `undecidable` and the census refuses on it.
+  const decided = createTempDirSync('ims-secops-vanish-', t)
+  const both = join(decided, 'subject.sh')
+  writeFileSync(both,
+    'pick_empty() { :; }\npick_word() { printf true; }\n'
+    + 'f() { local ref=SOMETHING_UNTRACKED; ref=DB_FENCE_PROBE_REASON $(pick_empty); printf \'%s|\' "${ref}"; }\n'
+    + 'g() { local ref=SOMETHING_UNTRACKED; ref=DB_FENCE_PROBE_REASON $(pick_word); printf \'%s\' "${ref}"; }\nf; g\n')
+  const decidedRun = spawnSync('bash', [both], { encoding: 'utf8' })
+  assert.equal(decidedRun.status, 0, decidedRun.stderr)
+  assert.equal(decidedRun.stdout, 'DB_FENCE_PROBE_REASON|SOMETHING_UNTRACKED',
+    'one spelling, two answers: an empty command word vanishes and the assignment stands; a real one makes it a prefix')
+  for (const form of [
+    'ref=DB_FENCE_PROBE_REASON $(pick)',
+    'ref=DB_FENCE_PROBE_REASON $(pick a)',
+    'ref=DB_FENCE_PROBE_REASON `pick`',
+    'ref=DB_FENCE_PROBE_REASON ${cmd}',
+    'ref=DB_FENCE_PROBE_REASON $cmd',
+  ]) assert.deepEqual(read(form), { position: 'undecidable', replaces: false }, `shellAssignments() on ${JSON.stringify(form)}`)
+
+  // AND ONE LITERAL BYTE, OR ANY QUOTING AT ALL, SETTLES IT: `""` is a word however empty, so the
+  // command word is there whatever it expands to and the assignment really is only its environment.
+  for (const form of [
+    'ref=DB_FENCE_PROBE_REASON "$(pick)"',
+    'ref=DB_FENCE_PROBE_REASON "${cmd}"',
+    'ref=DB_FENCE_PROBE_REASON ${cmd}x',
+    'ref=DB_FENCE_PROBE_REASON $(pick)/x',
+  ]) assert.deepEqual(read(form), { position: 'prefix', replaces: false }, `shellAssignments() on ${JSON.stringify(form)}`)
+
+  // AND A SUBSTITUTION IN THE VALUE IS NOT A COMMAND WORD, or the rule above would read every
+  // `x="$(…)"` in the estate as a prefix. Measured: it reads none of them that way.
+  for (const form of ['x="$(f a)"', 'x=`f a`', 'x=$(f a)']) {
+    assert.deepEqual(read(form, 'x'), { position: 'assignment', replaces: true }, `shellAssignments() on ${JSON.stringify(form)}`)
   }
 
   // THE COMMAND PREFIX ON A FUNCTION, WHICH IS THE ONE THING THIS DOES NOT MODEL, ASSERTED RATHER
@@ -3250,6 +3310,9 @@ test('[o3d-secops] a shell word is evaluated whole, and what cannot be evaluated
  *                                             words and the assignment is demoted to a prefix.
  *   make aliasedName() return `settled`     — the ASSEMBLED-NAME row goes red: nothing is refused.
  *     where it returns `refuse`
+ *   `mayVanish = false`, and separately    — the UNDECIDABLE rows go red: the first reads the
+ *     dropping the undecidable refusal        position as a settled prefix, the second reads it
+ *                                             right and then says nothing about it.
  */
 test('[o3d-secops] a false alias does not silence a conditional, and a concatenated one is still followed', () => {
   const DEPLOY_INDEX = 1 + ENTRYPOINTS.indexOf('scripts/deploy.sh')
@@ -3305,6 +3368,23 @@ test('[o3d-secops] a false alias does not silence a conditional, and a concatena
     assert.equal(assembled.complaints.length, 1, `${word}:\n${assembled.complaints.join('\n')}`)
     assert.match(assembled.complaints[0], /assembles a NAME out of source text/, assembled.complaints[0])
   }
+
+  // AND THE FOURTH SHAPE, WHICH IS NOT A FALSE ALIAS BUT NO ANSWER AT ALL. `$(pick)` decides at
+  // runtime whether there is a command word here, and so whether `ref` keeps the report's name.
+  for (const word of ['$(pick)', '`pick`', '${cmd}', '$cmd']) {
+    const undecided = plantedInDeploy(`ref=DB_FENCE_PROBE_REASON ${word}\nnode "\${!ref}"`)
+    assert.ok(!undecided.followed.some((entry) => entry.startsWith('ref ')),
+      `${word} must not be followed as an alias; it followed: ${undecided.followed.join(', ')}`)
+    assert.equal(undecided.complaints.length, 1, `${word}:\n${undecided.complaints.join('\n')}`)
+    assert.match(undecided.complaints[0], /decided at RUNTIME/, undecided.complaints[0])
+  }
+
+  // AND THE SAME POSITION WITH A VALUE THAT IS NOT A REPORT'S NAME IS NOT REFUSED, or the rule
+  // above is "no assignment may precede an expansion" — which would be red on the shipped tree and
+  // is not: the estate has 1821 bare assignments, 447 declaration operands, 21 command prefixes,
+  // 97 arguments and NOT ONE undecidable position.
+  const harmless = plantedInDeploy('ref=/tmp/keep $(pick)')
+  assert.deepEqual(harmless.complaints, [], harmless.complaints.join('\n'))
 
   // AND A RUNTIME VALUE WITH NO LITERAL NAME TEXT IS NOT REFUSED, or the rule above is "no
   // assignment may expand anything" — which would be red on the shipped tree and is not. These are

@@ -405,7 +405,10 @@ function maskAndQuoting(source: string, where: string): { mask: string; quoted: 
       continue
     }
     if (c === '`') {
-      blank(i)  // a word boundary, for the reason given where a backtick opens inside double quotes
+      // A word boundary in the MASK, for the reason given where a backtick opens inside double
+      // quotes — but marked, so the reader that has to say which word is the COMMAND sees the
+      // substitution as part of the word it opens rather than as the end of the one before it.
+      blankQ(i)
       if (ctx.t === 'code' && ctx.term === 'backtick') stack.pop()
       else stack.push({ t: 'code', term: 'backtick', depth: 0, opened: i })
       atWordStart = true
@@ -474,6 +477,10 @@ function maskAndQuoting(source: string, where: string): { mask: string; quoted: 
     }
 
     out[i] = c
+    // Inside a backtick substitution the bytes are code, and the mask keeps them — but they belong
+    // to the WORD the backtick opened, so the reader that has to say which word is the command must
+    // not find a new one in the middle of `x=`f a``.
+    if (ctx.t === 'code' && ctx.term === 'backtick') quoted[i] = 1
     if (ctx.t === 'code' && ctx.term === 'paren') {
       if (c === '(') ctx.depth += 1
       else if (c === ')') {
@@ -699,7 +706,7 @@ function maskAssignmentOperands(mask: string, source: string, quoted: Uint8Array
     while (nameOffset < at && mask[nameOffset] === JOINED) nameOffset += 1
     found.push({ name, nameOffset, valueOffset: eq + 1, wordOffset: start, append, position: 'argument' })
   }
-  classifyAssignmentPositions(mask, quoted, found)
+  classifyAssignmentPositions(mask, source, quoted, found)
   if (OPERAND_CACHE.size >= 64) OPERAND_CACHE.clear()
   OPERAND_CACHE.set(source, found)
   return found
@@ -724,10 +731,18 @@ function maskAssignmentOperands(mask: string, source: string, quoted: Uint8Array
  *                                           `ref2` at `SOMETHING`).
  *   echo ref=X                `argument`    an ordinary argument that happens to contain an `=`.
  *                                           It assigns NOTHING; `echo` prints it.
+ *   ref=X $(pick)         `undecidable`     a prefix run whose command word is ENTIRELY an unquoted
+ *   ref=X ${cmd}                            expansion. Whether it is a prefix at all is decided at
+ *                                           RUNTIME, and both answers were measured: with `pick`
+ *                                           printing nothing, `ref=X $(pick)` leaves `ref` set to
+ *                                           X — the word vanished and the assignment was a bare
+ *                                           one — while `ref=X ${cmd}` with `cmd=true` leaves
+ *                                           `ref` alone. One spelling, two answers, so this reader
+ *                                           gives neither.
  *
- * A caller that asks "what does this name hold" has to have all four apart, because reading the
- * last two as replacements is not a harmless over-approximation: it invents a value for a name that
- * never had it.
+ * A caller that asks "what does this name hold" has to have all five apart, because reading any of
+ * the last three as a replacement is not a harmless over-approximation: it invents a value for a
+ * name that never had it.
  *
  * WHAT IS NOT MODELLED, SAID PLAINLY. A `prefix` on a FUNCTION call is visible inside that function
  * for the length of the call (measured: `refA=X g` prints `X` inside `g` and leaves `refA` unset
@@ -736,7 +751,7 @@ function maskAssignmentOperands(mask: string, source: string, quoted: Uint8Array
  * no reading of one command can do. A pipeline or a background `&` runs its assignment in a
  * subshell, where it IS a replacement, and is reported as one.
  */
-export type ShellAssignmentPosition = 'assignment' | 'operand' | 'prefix' | 'argument'
+export type ShellAssignmentPosition = 'assignment' | 'operand' | 'prefix' | 'argument' | 'undecidable'
 
 /** Words that stand in front of a command without being one. */
 const COMMAND_RESERVED = new Set([
@@ -744,13 +759,55 @@ const COMMAND_RESERVED = new Set([
   'case', 'esac', 'in', 'function', 'time', 'coproc', '!', '{', '}', '[[', ']]',
 ])
 
+const BARE_EXPANSION = /^\$(?:[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-])/
+
+/**
+ * Whether the word beginning at `at` is made ONLY of unquoted expansions and substitutions — the
+ * one shape that can expand to no word at all, and so the one shape that leaves it undecided
+ * whether the assignments in front of it were a command prefix or the whole command.
+ *
+ * Read off the SOURCE rather than the mask, because the mask ends a word at the `(` of a `$(` and
+ * at a substitution's own spaces, and the question here is about the word bash sees. Deliberately
+ * not an evaluator: ONE byte outside these forms — a letter, a `/`, a quote, since `""` is a word
+ * however empty — and the word survives whatever it expands to, which is all this has to decide.
+ */
+function mayVanishFrom(source: string, at: number): boolean {
+  let i = at
+  let saw = false
+  while (i < source.length) {
+    const c = source[i]
+    if (c === '$' && source[i + 1] === '{') {
+      const end = source.indexOf('}', i + 2)
+      if (end === -1) return false
+      i = end + 1
+    } else if (c === '$' && source[i + 1] === '(') {
+      let depth = 0
+      let j = i + 1
+      for (; j < source.length; j += 1) {
+        if (source[j] === '(') depth += 1
+        else if (source[j] === ')' && (depth -= 1) === 0) break
+      }
+      if (j >= source.length) return false
+      i = j + 1
+    } else if (c === '`') {
+      const end = source.indexOf('`', i + 1)
+      if (end === -1) return false
+      i = end + 1
+    } else if (c === '$' && BARE_EXPANSION.test(source.slice(i))) {
+      i += (BARE_EXPANSION.exec(source.slice(i)) as RegExpExecArray)[0].length
+    } else break
+    saw = true
+  }
+  return saw && (i >= source.length || ' \t\n;&|()<>'.includes(source[i]))
+}
+
 /** The builtins whose OPERANDS are assignments rather than arguments. */
 const DECLARATION_BUILTINS = new Set(['declare', 'local', 'export', 'readonly', 'typeset'])
 
 /** The metacharacters that end one simple command. `<` and `>` continue it; the rest do not. */
 const COMMAND_BOUNDARY = '\n|&;()'
 
-function classifyAssignmentPositions(mask: string, quoted: Uint8Array, operands: MaskAssignment[]): void {
+function classifyAssignmentPositions(mask: string, source: string, quoted: Uint8Array, operands: MaskAssignment[]): void {
   const byWord = new Map<number, MaskAssignment>()
   for (const operand of operands) byWord.set(operand.wordOffset, operand)
 
@@ -766,13 +823,19 @@ function classifyAssignmentPositions(mask: string, quoted: Uint8Array, operands:
   let pending: MaskAssignment[] = []
   let commandWord: string | null = null
   let declaration = false
+  /** True when the command word is entirely unquoted expansions, and so may expand to nothing. */
+  let mayVanish = false
   const endCommand = (): void => {
     // A prefix run with NO command word after it is the assignment itself; with one, it is that
-    // command's environment and nothing more.
-    for (const operand of pending) operand.position = commandWord === null ? 'assignment' : 'prefix'
+    // command's environment and nothing more; with one that MIGHT NOT BE THERE, neither answer is
+    // this reader's to give.
+    for (const operand of pending) {
+      operand.position = commandWord === null ? 'assignment' : mayVanish ? 'undecidable' : 'prefix'
+    }
     pending = []
     commandWord = null
     declaration = false
+    mayVanish = false
   }
 
   let i = 0
@@ -805,6 +868,11 @@ function classifyAssignmentPositions(mask: string, quoted: Uint8Array, operands:
     if (commandWord === null) {
       commandWord = word
       declaration = DECLARATION_BUILTINS.has(word)
+      // A WORD THAT MAY NOT BE A WORD. Bash expands before it decides which word is the command,
+      // so a command word that is nothing but unquoted expansions can disappear and leave the
+      // assignments in front of it as the whole command. Anything else — one literal byte, or any
+      // quoting at all, since `""` is a word however empty — survives whatever it expands to.
+      mayVanish = pending.length > 0 && mayVanishFrom(source, wordStart)
     }
   }
   endCommand()
