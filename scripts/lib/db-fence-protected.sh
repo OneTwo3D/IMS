@@ -268,13 +268,26 @@
 #                      deciding whether to trust a tree; a rewritten one misdirects that decision.
 #
 # WHAT IS DELIBERATELY NOT READONLY, and it is not a residue: the report variables further down
-# (${DB_FENCE_ROTATION_NOTE}, ${DB_FENCE_SEAL_REASON}, the five ${DB_FENCE_PROBE_*} and
-# ${DB_FENCE_SOURCE_UNTRUSTED_PATH}) are WRITTEN BY THIS LIBRARY'S OWN FUNCTIONS — they are how it
-# reports — so `readonly` would break the mechanism rather than protect it. ${DB_FENCE_SUDO_PREFIX}
-# is assigned twice by construction (a default, then a conditional) and is a display prefix resolved
-# from PATH. The census names each of them with that reason, so a NEW declaration added here is in
-# neither list and FAILS until somebody classifies it — a path added later is covered by the rule
-# rather than silently outside it.
+# (${DB_FENCE_ROTATION_NOTE}, ${DB_FENCE_SEAL_REASON} and the three ${DB_FENCE_PROBE_*}) are
+# WRITTEN BY THIS LIBRARY'S OWN FUNCTIONS — they are how it reports — so `readonly` would break the
+# mechanism rather than protect it. ${DB_FENCE_SUDO_PREFIX} is assigned twice by construction (a
+# default, then a conditional) and is a display prefix resolved from PATH. The census names each of
+# them with that reason, so a NEW declaration added here is in neither list and FAILS until
+# somebody classifies it — a path added later is covered by the rule rather than silently outside
+# it.
+#
+# AND "NOT READONLY" IS NOT THE SAME PERMISSION AS "MUTABLE GLOBAL" (o3d-secops r3, Codex HIGH).
+# Four of the names that used to sit on that list were not reports at all — ${DB_FENCE_PROBE_SCRIPT}
+# was EXECUTED with DEPLOY_ADMIN_DATABASE_URL beside it, ${DB_FENCE_PROBE_TEMP} was the operand of
+# an `rm -rf`, ${DB_FENCE_PROBE_ARTEFACT_SHA256} was half of the equality that authenticated
+# checkout-derived bytes, and ${DB_FENCE_SOURCE_UNTRUSTED_PATH} was the gate that decides whether an
+# unauthenticated tree is PUBLISHED — and the three ${_FENCE_SRC_*} arrays are the argv of the find
+# that computes it. The census had asked its question at the declaration, where they look like
+# scratch, instead of at the sink, where they steer execution, authentication, publication and
+# deletion. None of them can carry `readonly` (all are computed per run), so the answer is one step
+# further on: THEY ARE NOT SCRIPT-SCOPE NAMES AT ALL. Each is a `local` of the function that
+# derives and consumes it, so no path — enumerated or not — has a name to write. What remains
+# below is what is genuinely printed and nothing else, and the census now checks that at the sink.
 #
 # THE HARNESSES DID NOT WEAKEN THIS. Every fence harness used to source this file and then reassign
 # these paths at a scratch directory, which `readonly` refuses. They now substitute the ONE literal
@@ -339,22 +352,24 @@ DB_FENCE_ROTATION_NOTE=""
 # because "the artefact is not sealed" is not something an operator can act on.
 DB_FENCE_SEAL_REASON=""
 
-# Set by db_fence_probe_script(): the file a --preflight probe may run (EMPTY when nothing on this
-# box is authenticated enough to be handed the admin credential), the throwaway directory that has
-# to be removed afterwards, what the tree THIS CHECKOUT would publish hashes to — the value an
-# operator pins the first publication with, obtainable from a run that writes nothing and executes
-# nothing — what the artefact ALREADY STANDING hashes to, and why there is nothing to preflight
-# with. The candidate and the standing digests are separate because during an upgrade they differ,
-# and reporting the standing one answers a question nobody asked (o3d-2sm1.5 r34, Codex MEDIUM).
-DB_FENCE_PROBE_SCRIPT=""
-DB_FENCE_PROBE_TEMP=""
+# Set by db_fence_probe_digests(): what the tree THIS CHECKOUT would publish hashes to — the value
+# an operator pins the first publication with, obtainable from a run that writes nothing and
+# executes nothing — and what the artefact ALREADY STANDING hashes to. The candidate and the
+# standing digests are separate because during an upgrade they differ, and reporting the standing
+# one answers a question nobody asked (o3d-2sm1.5 r34, Codex MEDIUM).
+#
+# AND THEY ARE REPORTS, WHICH IS NOW TRUE OF THEM RATHER THAN SAID ABOUT THEM (o3d-secops r3,
+# Codex HIGH). The digest that AUTHENTICATES a candidate — the one compared against
+# ${DB_FENCE_EXPECTED_ARTEFACT_SHA256} before checkout-derived bytes are handed the admin
+# credential — is derived inside db_fence_preflight() and never leaves it. These two are what is
+# PRINTED. Overwrite them and the operator is told a wrong digest, pins with it, and the
+# publication gate refuses; there is no path by which they license anything.
 DB_FENCE_PROBE_ARTEFACT_SHA256=""
 DB_FENCE_PROBE_STANDING_SHA256=""
-DB_FENCE_PROBE_REASON=""
 
-# Set by _fence_source_trust(): empty when the tree the artefact was assembled FROM is one only
-# the publishing account could have written, and otherwise the first path that is not.
-DB_FENCE_SOURCE_UNTRUSTED_PATH=""
+# Why there is nothing this run may preflight with. After db_fence_preflight() a non-empty value
+# means exactly "nothing was executed", which is the fact the entrypoints' banners assert.
+DB_FENCE_PROBE_REASON=""
 
 # THE PRIVILEGE TRANSITION IS PART OF A PRINTED INSTRUCTION, NOT AN ASSUMPTION ABOUT ITS READER
 # (o3d-2sm1.5 r33, Codex HIGH). The recovery wrappers below are root-owned and 0700, so an
@@ -662,10 +677,15 @@ CLOSURE_EOF
 #                        is IN it.
 #   _FENCE_SRC_PACKAGES  the entry file and the package roots themselves, examined recursively.
 #   _FENCE_SRC_PARENTS   every directory from ${app_dir}'s parent up to /.
-_FENCE_SRC_STRICT=()
-_FENCE_SRC_PACKAGES=()
-_FENCE_SRC_PARENTS=()
-
+#
+# AND THEY ARE NOT SCRIPT-SCOPE NAMES (o3d-secops r3, Codex HIGH). They read like scratch, but they
+# are the ARGV of the `find` whose answer decides whether an artefact assembled out of an
+# application-writable checkout may be published into ${DB_FENCE_RECOVERY_DIR} and executed with
+# DEPLOY_ADMIN_DATABASE_URL for the rest of the box's life. Empty one of them and that `find`
+# examines nothing, reports no offender, and the provenance gate passes over a tree nobody checked
+# — a vacuous check that reads exactly like a clean one. `readonly` cannot apply (they are rebuilt
+# per call), so instead every frame that calls _fence_vendor_into() declares all three `local`, and
+# the three names exist only inside the call that derives and consumes them.
 _fence_source_paths() {
   local app_dir="$1" list="$2" relative acc part resolved
   _FENCE_SRC_STRICT=("${app_dir}" "$(dirname "${DB_FENCE_SCRIPT}")")
@@ -752,6 +772,11 @@ _fence_source_ident() {
 # parent is skipped rather than copied into itself.
 _fence_vendor_into() {
   local app_dir="$1" staged="$2" list relative count rc=0 before after
+  # THE PATH LISTS ARE THIS CALL'S, NOT THE SCRIPT'S. _fence_source_paths() derives them and
+  # _fence_source_trust() and _fence_source_ident() read them, all three inside this frame — so
+  # the `find` that answers the provenance question can only ever be aimed at paths derived by
+  # this same call. See the block above the derivation for why that matters.
+  local -a _FENCE_SRC_STRICT=() _FENCE_SRC_PACKAGES=() _FENCE_SRC_PARENTS=()
   list="${staged}/.fence-closure.list"
   mkdir -p "${staged}" || return 1
   rm -f "${list}"
@@ -820,6 +845,14 @@ _fence_vendor_into() {
 # is no interval in which it can change the outcome.
 _fence_stage_and_publish() {
   local app_dir script_digest artefact_digest manifest
+  # THE PROVENANCE ANSWER IS THIS CALL'S (o3d-secops r3, Codex HIGH). _fence_source_trust(), two
+  # frames down, writes it; the gate below — "publish nothing that nothing authenticated" — reads
+  # it. It is not a report: emptying it turns an unpinned publication of an application-writable
+  # tree from a refusal into a publication, after which root executes those bytes with
+  # DEPLOY_ADMIN_DATABASE_URL beside them on every cutover. `readonly` cannot apply (it is computed
+  # per call), so it is a `local` of the frame that consumes it, and there is no script-scope name
+  # for another path to pre-set. Every caller of _fence_vendor_into() declares it the same way.
+  local DB_FENCE_SOURCE_UNTRUSTED_PATH=""
   [[ -f "${DB_FENCE_SCRIPT}" ]] || {
     DB_FENCE_ROTATION_NOTE="${DB_FENCE_SCRIPT} is not in this checkout, so there is nothing to publish into ${DB_FENCE_SCRIPT_COPY}"
     return 1
@@ -1292,23 +1325,55 @@ WRAPPER_EOF
 #   With neither, PREFLIGHT IS UNAVAILABLE and the dry run says so and says why. It still prints
 #   the candidate digest, because that is the value the first real run needs.
 #
-# Sets:
-#   DB_FENCE_PROBE_SCRIPT            the file that may be run, or empty
-#   DB_FENCE_PROBE_TEMP              a directory to remove afterwards, or empty
+# AND WHAT THE ANSWER IS KEPT IN (o3d-secops r3, Codex HIGH).
+#
+# Until this round the resolution above finished by publishing its answer into three script-scope
+# variables — ${DB_FENCE_PROBE_SCRIPT}, ${DB_FENCE_PROBE_TEMP} and
+# ${DB_FENCE_PROBE_ARTEFACT_SHA256} — and each entrypoint then ran
+# `node "${DB_FENCE_PROBE_SCRIPT}" --preflight` some sixty lines later. The census that reviewed
+# those names classified all three as REPORTS, because it asked its question at the DECLARATION.
+# Asked at the SINK the answer is the opposite one: the first is EXECUTED as the application user
+# with DEPLOY_ADMIN_DATABASE_URL in its environment, the second is the operand of an `rm -rf`, and
+# the third is the equality that decides whether checkout-derived bytes are handed the credential
+# at all. Three of the seven names on the "harmless" list steered privileged execution.
+#
+# And they sat in mutable slots ACROSS THE GATES IN BETWEEN. require_db_identity() and
+# require_env_file_is_sole_definition() both run in that window, and both parse ${APP_DIR}/.env —
+# a file owned by the account this entire library exists to defend against.
+#
+# `readonly` is not the fix here: these values differ on every run and are computed, so the word
+# cannot be applied to them. THE FIX IS THAT THEY ARE NOT VARIABLES AT ALL. Resolution and
+# execution are one function; the path, the throwaway and the digest are `local` to it and are
+# consumed inside it; and the entrypoints hand in the only two things they know that this file
+# does not — how to print a line, and how to drop privilege. What survives the call is text an
+# operator reads and nothing else.
+#
+# Sets, and every one of them a report — printed, never acted on:
 #   DB_FENCE_PROBE_ARTEFACT_SHA256   what a publication FROM THIS CHECKOUT would record
 #   DB_FENCE_PROBE_STANDING_SHA256   what the artefact already on this box hashes to
-#   DB_FENCE_PROBE_REASON            why there is nothing this run may preflight with
+#   DB_FENCE_PROBE_REASON            why there is nothing this run may preflight with, and — after
+#                                    db_fence_preflight() — the fact that nothing was executed
 # Globals rather than stdout because the caller needs all of them and must not lose any to a
 # subshell.
 # ---------------------------------------------------------------------------
 
-# The candidate tree, assembled and hashed. The tree is LEFT ON DISK at ${DB_FENCE_PROBE_TEMP} so
-# db_fence_probe_script() can execute it if — and only if — a supplied digest turns out to
-# authenticate it; every path that does not reach that conclusion destroys it.
-db_fence_probe_candidate_digest() {
-  local dir app_dir
-  DB_FENCE_PROBE_ARTEFACT_SHA256=""
-  DB_FENCE_PROBE_TEMP=""
+# The candidate tree, assembled, sealed and hashed, with no part of it executed.
+#
+# Sets the caller's ${_fence_probe_dir} and ${_fence_probe_sha}. Both callers declare them `local`,
+# so the directory that may be executed and the digest that may authenticate it exist only inside
+# the frame that consumes them, and there is no script-scope name for any other path to write.
+# Not stdout, because _fence_vendor_into() records WHY it failed in ${DB_FENCE_ROTATION_NOTE} and a
+# command substitution would take that with the subshell.
+_fence_probe_assemble() {
+  local dir app_dir digest
+  # _fence_vendor_into() answers the provenance question as a side effect of vendoring, and this
+  # path has no use for the answer — a candidate is authenticated by its whole-tree digest, not by
+  # its source. It is declared here anyway so the assignment two frames down lands in a frame that
+  # dies with this call, rather than creating the script-scope name the rest of the file refuses to
+  # have. Every caller of _fence_vendor_into() declares it.
+  local DB_FENCE_SOURCE_UNTRUSTED_PATH=""
+  _fence_probe_dir=""
+  _fence_probe_sha=""
   [[ -f "${DB_FENCE_SCRIPT}" ]] || return 1
   app_dir="$(dirname "$(dirname "${DB_FENCE_SCRIPT}")")"
   dir="$(mktemp -d 2>/dev/null)" || return 1
@@ -1319,65 +1384,52 @@ db_fence_probe_candidate_digest() {
   # nobody else, which is what lets the seal check below mean anything.
   chmod -R u=rwX,go=rX "${dir}" || { rm -rf "${dir}"; return 1; }
   _fence_tree_is_sealed "${dir}" || { rm -rf "${dir}"; return 1; }
-  DB_FENCE_PROBE_ARTEFACT_SHA256="$(_fence_tree_digest "${dir}")" || {
-    rm -rf "${dir}"; DB_FENCE_PROBE_ARTEFACT_SHA256=""; return 1
-  }
-  DB_FENCE_PROBE_TEMP="${dir}"
+  digest="$(_fence_tree_digest "${dir}")" || { rm -rf "${dir}"; return 1; }
+  _fence_probe_dir="${dir}"
+  _fence_probe_sha="${digest}"
   return 0
 }
 
-# Destroy the candidate tree and keep what was learned from it.
-_fence_probe_discard_candidate() {
-  if [[ -n "${DB_FENCE_PROBE_TEMP}" ]]; then rm -rf "${DB_FENCE_PROBE_TEMP}"; fi
-  DB_FENCE_PROBE_TEMP=""
-  return 0
-}
-
-db_fence_probe_script() {
-  local recorded="" standing=""
-  DB_FENCE_PROBE_SCRIPT=""
-  DB_FENCE_PROBE_STANDING_SHA256=""
-  DB_FENCE_PROBE_REASON=""
-
-  # QUESTION ONE, ALWAYS ASKED AND ANSWERED FROM THE CHECKOUT IN FRONT OF US. It is the answer an
-  # upgrade needs, and it is the one the standing artefact cannot give.
-  db_fence_probe_candidate_digest || true
-
-  # QUESTION TWO. The standing artefact first: it is the only thing on the box that has been
-  # through the publication gate.
-  if [[ -f "${DB_FENCE_SCRIPT_COPY}" ]] && _fence_tree_is_sealed "${DB_FENCE_PROTECTED_APP_DIR}"; then
-    standing="$(_fence_tree_digest "${DB_FENCE_PROTECTED_APP_DIR}")" || standing=""
-    DB_FENCE_PROBE_STANDING_SHA256="${standing}"
-    recorded="$(fence_record_artefact_digest)" || recorded=""
-    if [[ -n "${standing}" && "${standing}" == "${recorded}" ]] &&
-       { [[ -z "${DB_FENCE_EXPECTED_ARTEFACT_SHA256}" ]] || [[ "${standing}" == "${DB_FENCE_EXPECTED_ARTEFACT_SHA256}" ]]; }; then
-      _fence_probe_discard_candidate
-      DB_FENCE_PROBE_SCRIPT="${DB_FENCE_SCRIPT_COPY}"
-      return 0
-    fi
-    DB_FENCE_PROBE_REASON="the protected fence artefact at ${DB_FENCE_PROTECTED_APP_DIR} is not one this run may execute: it hashes to ${standing:-nothing readable}, its record binds ${recorded:-nothing}${DB_FENCE_EXPECTED_ARTEFACT_SHA256:+, and this invocation pinned ${DB_FENCE_EXPECTED_ARTEFACT_SHA256}}."
-  fi
-
-  # And otherwise ONLY a candidate the invocation itself authenticated.
-  if [[ -n "${DB_FENCE_PROBE_TEMP}" && -n "${DB_FENCE_EXPECTED_ARTEFACT_SHA256}" &&
-        "${DB_FENCE_PROBE_ARTEFACT_SHA256}" == "${DB_FENCE_EXPECTED_ARTEFACT_SHA256}" ]]; then
-    # A reason recorded above is about a standing artefact this run declined to use, and this run
-    # found something else to preflight with. Callers print the reason only when there is nothing
-    # to run, so leaving it set would put a refusal next to a preflight that happened.
-    DB_FENCE_PROBE_REASON=""
-    DB_FENCE_PROBE_SCRIPT="${DB_FENCE_PROBE_TEMP}/scripts/fence-db-connections.mjs"
+# The artefact already standing on this box. Sets the caller's ${_fence_standing_sha} — a REPORT,
+# what the tree hashes to — and returns 0 only when this run may EXECUTE it: the tree is sealed, it
+# hashes to what its own record binds, and it hashes to IMS_FENCE_ARTEFACT_SHA256 when the
+# invocation supplied one. Otherwise it sets the caller's ${_fence_standing_reason} and returns 1.
+#
+# The digest and the verdict are separate returns on purpose: an unusable artefact still has a
+# digest an operator needs to see, and a digest is not a licence to run the tree it came from.
+_fence_standing_artefact() {
+  local standing="" recorded=""
+  _fence_standing_sha=""
+  _fence_standing_reason=""
+  [[ -f "${DB_FENCE_SCRIPT_COPY}" ]] || return 1
+  _fence_tree_is_sealed "${DB_FENCE_PROTECTED_APP_DIR}" || return 1
+  standing="$(_fence_tree_digest "${DB_FENCE_PROTECTED_APP_DIR}")" || standing=""
+  _fence_standing_sha="${standing}"
+  recorded="$(fence_record_artefact_digest)" || recorded=""
+  if [[ -n "${standing}" && "${standing}" == "${recorded}" ]] &&
+     { [[ -z "${DB_FENCE_EXPECTED_ARTEFACT_SHA256}" ]] || [[ "${standing}" == "${DB_FENCE_EXPECTED_ARTEFACT_SHA256}" ]]; }; then
     return 0
   fi
-
-  _fence_probe_discard_candidate
-  if [[ -z "${DB_FENCE_PROBE_REASON}" ]]; then
-    if [[ -z "${DB_FENCE_EXPECTED_ARTEFACT_SHA256}" ]]; then
-      DB_FENCE_PROBE_REASON="there is no protected fence artefact on this box yet, and this run was given nothing that authenticates the tree the checkout would publish. The preflight opens the admin connection with DEPLOY_ADMIN_DATABASE_URL, and the tree it would run is assembled out of the checkout, so it will not be executed on the strength of the checkout's own account of itself. Supply IMS_FENCE_ARTEFACT_SHA256 and this dry run preflights with the tree that value names; every run after the first publication preflights with the standing artefact instead, and needs nothing supplied."
-    else
-      DB_FENCE_PROBE_REASON="IMS_FENCE_ARTEFACT_SHA256 expects ${DB_FENCE_EXPECTED_ARTEFACT_SHA256} and the tree this checkout would publish hashes to ${DB_FENCE_PROBE_ARTEFACT_SHA256:-nothing that could be assembled}, so there is nothing this run is willing to execute with an administrative credential beside it."
-    fi
-  fi
+  _fence_standing_reason="the protected fence artefact at ${DB_FENCE_PROTECTED_APP_DIR} is not one this run may execute: it hashes to ${standing:-nothing readable}, its record binds ${recorded:-nothing}${DB_FENCE_EXPECTED_ARTEFACT_SHA256:+, and this invocation pinned ${DB_FENCE_EXPECTED_ARTEFACT_SHA256}}."
   return 1
+}
+
+# THE TWO DIGESTS A DRY RUN REPORTS, and nothing else. The candidate is assembled, hashed and
+# DESTROYED here: this function hands back no path, because it answers a question about bytes and
+# not a question about what may be run. The tree that is executed, if any, is assembled again
+# inside db_fence_preflight() and consumed there.
+#
+# Returns 0 when it established at least one digest — a producer nobody can take a status from is a
+# shape this subsystem no longer carries anywhere.
+db_fence_probe_digests() {
+  local _fence_probe_dir="" _fence_probe_sha="" _fence_standing_sha="" _fence_standing_reason=""
+  DB_FENCE_PROBE_ARTEFACT_SHA256=""
+  DB_FENCE_PROBE_STANDING_SHA256=""
+  if _fence_probe_assemble; then DB_FENCE_PROBE_ARTEFACT_SHA256="${_fence_probe_sha}"; fi
+  [[ -z "${_fence_probe_dir}" ]] || rm -rf "${_fence_probe_dir}"
+  _fence_standing_artefact || true
+  DB_FENCE_PROBE_STANDING_SHA256="${_fence_standing_sha}"
+  [[ -n "${DB_FENCE_PROBE_ARTEFACT_SHA256}" || -n "${DB_FENCE_PROBE_STANDING_SHA256}" ]]
 }
 
 # WHAT A DRY RUN HAS TO SAY, AS TEXT, WITHOUT DECIDING HOW IT IS SHOWN. One line per printf; the
@@ -1405,13 +1457,71 @@ db_fence_probe_report() {
   return 0
 }
 
-db_fence_probe_cleanup() {
-  _fence_probe_discard_candidate
-  DB_FENCE_PROBE_SCRIPT=""
-  DB_FENCE_PROBE_ARTEFACT_SHA256=""
-  DB_FENCE_PROBE_STANDING_SHA256=""
+# RESOLVE AND EXECUTE, IN ONE FUNCTION, WITH THE ANSWER NEVER LEAVING IT.
+#
+#   db_fence_preflight <notice> -- <runner> [<runner arg>...]
+#
+# <notice> is a command the CALLER supplies that prints one line. The entrypoints pass their own
+# warn(), so the explanation of what is about to be run still arrives in the caller's voice and
+# ahead of the helper's own output — which is where it has to be, because it is the line an
+# operator reads while the preflight is still opening its connection.
+#
+# <runner> is the command prefix that drops privilege and carries DEPLOY_ADMIN_DATABASE_URL. The
+# two entrypoints spell it differently (`as_app_user env …` and `run_as_user "${APP_USER}" env …`)
+# and neither spelling belongs in this file. `--` separates them so neither list has to be guessed.
+#
+# RETURNS the helper's own exit status when the helper ran, and 1 with ${DB_FENCE_PROBE_REASON} set
+# when nothing on this box was authenticated enough to be handed the credential. A non-empty
+# ${DB_FENCE_PROBE_REASON} after this call means EXACTLY "nothing was executed" — that is the fact
+# the caller's banner asserts, and it is the only thing this function reports through a variable.
+db_fence_preflight() {
+  local notice="${1:-}" probe="" rc=0
+  local _fence_probe_dir="" _fence_probe_sha="" _fence_standing_sha="" _fence_standing_reason=""
   DB_FENCE_PROBE_REASON=""
-  return 0
+  [[ -n "${notice}" ]] || return 1
+  shift
+  [[ "${1:-}" == "--" ]] || return 1
+  shift
+  [[ "$#" -gt 0 ]] || return 1
+
+  # THE STANDING ARTEFACT FIRST: it is the only thing on the box that has been through the
+  # publication gate.
+  if _fence_standing_artefact; then
+    probe="${DB_FENCE_SCRIPT_COPY}"
+    "${notice}" "This dry run probes with the root-owned artefact at ${probe}, which is the"
+    "${notice}" "tree this box already publishes and verifies — not with the checkout's copy."
+  else
+    DB_FENCE_PROBE_REASON="${_fence_standing_reason}"
+    # And otherwise ONLY a candidate the invocation itself authenticated. The tree is assembled
+    # HERE, immediately before it is run, and the digest that authenticates it is derived in this
+    # same frame — not carried in a variable across the entrypoint's ${APP_DIR}/.env parsing.
+    if [[ -n "${DB_FENCE_EXPECTED_ARTEFACT_SHA256}" ]] && _fence_probe_assemble &&
+       [[ "${_fence_probe_sha}" == "${DB_FENCE_EXPECTED_ARTEFACT_SHA256}" ]]; then
+      probe="${_fence_probe_dir}/scripts/fence-db-connections.mjs"
+      # A reason recorded above is about a standing artefact this run declined to use, and this run
+      # found something else to preflight with. Callers read a set reason as "nothing ran", so
+      # leaving it would put a refusal next to a preflight that happened.
+      DB_FENCE_PROBE_REASON=""
+      "${notice}" "This dry run probes with a throwaway copy of the tree IMS_FENCE_ARTEFACT_SHA256 named,"
+      "${notice}" "which is the only checkout-derived tree it will execute with the admin credential."
+    fi
+  fi
+
+  if [[ -z "${probe}" ]]; then
+    [[ -z "${_fence_probe_dir}" ]] || rm -rf "${_fence_probe_dir}"
+    if [[ -z "${DB_FENCE_PROBE_REASON}" ]]; then
+      if [[ -z "${DB_FENCE_EXPECTED_ARTEFACT_SHA256}" ]]; then
+        DB_FENCE_PROBE_REASON="there is no protected fence artefact on this box yet, and this run was given nothing that authenticates the tree the checkout would publish. The preflight opens the admin connection with DEPLOY_ADMIN_DATABASE_URL, and the tree it would run is assembled out of the checkout, so it will not be executed on the strength of the checkout's own account of itself. Supply IMS_FENCE_ARTEFACT_SHA256 and this dry run preflights with the tree that value names; every run after the first publication preflights with the standing artefact instead, and needs nothing supplied."
+      else
+        DB_FENCE_PROBE_REASON="IMS_FENCE_ARTEFACT_SHA256 expects ${DB_FENCE_EXPECTED_ARTEFACT_SHA256} and the tree this checkout would publish hashes to ${_fence_probe_sha:-nothing that could be assembled}, so there is nothing this run is willing to execute with an administrative credential beside it."
+      fi
+    fi
+    return 1
+  fi
+
+  "$@" node "${probe}" --preflight "${DB_FENCE_IDENTITY_ARGS[@]:-}" || rc=$?
+  [[ -z "${_fence_probe_dir}" ]] || rm -rf "${_fence_probe_dir}"
+  return "${rc}"
 }
 
 # ---------------------------------------------------------------------------
@@ -1454,15 +1564,21 @@ db_fence_probe_cleanup() {
 # throwaway directory this call creates and removes. The throwaway is removed before it
 # returns, so a caller that goes on to do anything else is unaffected by having asked.
 db_fence_report_candidate_digest() {
-  local rc=0
-  db_fence_probe_candidate_digest || rc=1
+  local rc=0 _fence_probe_dir="" _fence_probe_sha=""
+  DB_FENCE_PROBE_ARTEFACT_SHA256=""
   # db_fence_probe_report() prints the standing artefact's digest only when
-  # DB_FENCE_PROBE_STANDING_SHA256 is set, and nothing above sets it: the candidate is the whole
-  # answer here, and the box's own artefact is not this command's business.
+  # DB_FENCE_PROBE_STANDING_SHA256 is set, and nothing here sets it: the candidate is the whole
+  # answer, and the box's own artefact is not this command's business.
+  DB_FENCE_PROBE_STANDING_SHA256=""
+  _fence_probe_assemble || rc=1
+  DB_FENCE_PROBE_ARTEFACT_SHA256="${_fence_probe_sha}"
+  # THE THROWAWAY IS REMOVED HERE AND NOT BY A LATER CALL. The path to it is a `local` of this
+  # function: nothing outside this frame can name it, so nothing outside this frame can be relied
+  # on to clean it up, and nothing outside this frame can re-aim the `rm`.
+  [[ -z "${_fence_probe_dir}" ]] || rm -rf "${_fence_probe_dir}"
   # CALLED, NOT PROCESS-SUBSTITUTED (o3d-p9dq, Codex r33). The loop this replaces re-emitted the
   # report line by line through a producer whose exit reached nobody; calling it writes the same
   # bytes to the same stdout with no second process to fail, and its status is this shell's.
   db_fence_probe_report || rc=1
-  db_fence_probe_cleanup
   return "${rc}"
 }
