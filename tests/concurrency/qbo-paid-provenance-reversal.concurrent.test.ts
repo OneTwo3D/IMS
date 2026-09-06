@@ -58,13 +58,14 @@ async function createPaidOrder(
   id: string,
   invoiceId: string,
   unregisteredPaidAt: Date | null,
+  currency = 'GBP',
 ): Promise<void> {
   const paidAt = new Date('2026-08-01T09:00:00.000Z')
   await db.salesOrder.create({
     data: {
       id,
       status: 'SHIPPED',
-      currency: 'GBP',
+      currency,
       subtotalForeign: 100,
       totalForeign: 100,
       subtotalBase: 100,
@@ -593,7 +594,9 @@ test(
         ledgerObservedBefore,
         ledgerAmounts: new Map([
           // A payload whose figures `parseLedgerAmount` cannot read — `qboLedgerAmount` answers null.
-          [invoiceOf.get(unreadableId)!, ledgerAmount(null, null)],
+          // It DOES state a currency (o3d-psrx r15), so this case is about the FIGURES alone: an
+          // unbound currency is a different cause of the same verdict and is reported separately.
+          [invoiceOf.get(unreadableId)!, ledgerAmount(null, null, 'GBP')],
           // `unaskedId` is deliberately ABSENT from this map.
           // VOIDED: `qboVoidedAmount`, a fact about the document rather than a subtraction.
           [invoiceOf.get(voidedId)!, ledgerAmount(0, 0)],
@@ -603,11 +606,11 @@ test(
 
     const withheld = new Map(gate.withheld.map((w) => [w.doc.id, w.verdict]))
     assert.deepEqual(withheld.get(unreadableId),
-      { verdict: 'LEDGER_NOT_PROVEN_ZERO_PAID', paidAmount: null, documentTotal: null },
+      { verdict: 'LEDGER_NOT_PROVEN_ZERO_PAID', paidAmount: null, documentTotal: null, currencyUnbound: false },
       'a figure that could not be read is not a figure of zero, and coverage that cannot be '
       + 'established cannot be established in either direction')
     assert.deepEqual(withheld.get(unaskedId),
-      { verdict: 'LEDGER_NOT_PROVEN_ZERO_PAID', paidAmount: null, documentTotal: null },
+      { verdict: 'LEDGER_NOT_PROVEN_ZERO_PAID', paidAmount: null, documentTotal: null, currencyUnbound: false },
       'a document this read said NOTHING about is not a document with nothing on it — the same '
       + 'fail-closed reading an absent verdict and a null fence already get')
     for (const id of [unreadableId, unaskedId]) {
@@ -691,5 +694,101 @@ test(
       verdict: 'LEDGER_PARTIALLY_PAID', paidAmount: 50, documentTotal: 100, outstandingAmount: 50,
       currency: 'GBP',
     })
+  },
+)
+
+/**
+ * o3d-psrx r15 (Codex MEDIUM 2) — THE CURRENCY THAT SIZES THE AMOUNT READER COMES OUT OF THE POLLER'S
+ * OWN QUERY, AND THIS IS THE ONLY TEST THAT CAN SAY SO.
+ *
+ * QuickBooks omits `CurrencyRef` on every document when multicurrency is off, so an ordinary
+ * base-currency row arrives with no currency of its own. r15 resolves it from the IMS document — which
+ * makes the fix a piece of WIRING, of exactly the shape the r3 finding was: the poller asks a question
+ * the row can answer, and it is answered only if the query SELECTS the column. The unit harness for
+ * this poller mocks `findMany` and ignores `select` entirely, so dropping `currency: true` from the
+ * production query would leave every one of those tests green. A real database is the only place the
+ * select is real.
+ *
+ * NO QUICKBOOKS CALL IS MADE HERE EITHER. The row is a literal; what is under test is that the
+ * candidate query, `ledgerDocumentCurrencies` and `qboLedgerAmount` compose into a readable amount.
+ */
+test(
+  '[o3d-psrx r15] the poller\'s own candidate queries carry the currency that sizes the amount reader',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    const db = await loadDb()
+    const {
+      readQboSalesReversalCandidates,
+      readQboBillReversalCandidates,
+      ledgerDocumentCurrencies,
+      qboLedgerAmount,
+      classifyQboLedgerEvidence,
+    } = await import('@/lib/connectors/quickbooks/payment-poller')
+
+    const orderId = probeId()
+    const invoiceId = `QBO-INV-${randomUUID()}`
+    await createPaidOrder(db, orderId, invoiceId, null, 'GBP')
+
+    const supplier = await db.supplier.create({ data: { name: `PSRX15 probe ${randomUUID()}` }, select: { id: true } })
+    const po = await db.purchaseOrder.create({
+      data: {
+        reference: `PSRX15-${randomUUID()}`.slice(0, 40),
+        supplierId: supplier.id,
+        status: 'RECEIVED',
+        // A three-decimal currency, so the bill side cannot pass by inheriting the sales side's GBP:
+        // KWD has its own bound, and reading it as anything else would give a different answer.
+        currency: 'KWD',
+        fxRateToBase: 1,
+        subtotalForeign: 100,
+        subtotalBase: 100,
+        totalForeign: 100,
+        totalBase: 100,
+      },
+      select: { id: true },
+    })
+    const billInvoiceId = `QBO-BILL-${randomUUID()}`
+    const bill = await db.purchaseInvoice.create({
+      data: {
+        poId: po.id,
+        invoiceNumber: billInvoiceId,
+        invoiceDate: new Date('2026-08-01T00:00:00.000Z'),
+        fxRateToBase: 1,
+        totalForeign: 100,
+        totalBase: 100,
+        accountingInvoiceId: billInvoiceId,
+        paidAt: new Date('2026-08-01T09:00:00.000Z'),
+      },
+      select: { id: true },
+    })
+    t.after(async () => {
+      await db.salesOrder.deleteMany({ where: { id: orderId } })
+      await db.purchaseInvoice.deleteMany({ where: { id: bill.id } })
+      await db.purchaseOrder.deleteMany({ where: { id: po.id } })
+      await db.supplier.deleteMany({ where: { id: supplier.id } })
+    })
+
+    // THE QUERY, then the index production builds from it. Nothing is rebuilt by hand.
+    const salesCurrencies = ledgerDocumentCurrencies(await readQboSalesReversalCandidates())
+    const billCurrencies = ledgerDocumentCurrencies(
+      (await readQboBillReversalCandidates()).map((b) => ({ accountingInvoiceId: b.accountingInvoiceId, currency: b.po.currency })))
+    assert.equal(salesCurrencies.get(invoiceId), 'GBP',
+      'the sales candidate query must SELECT the order\'s currency — without the column the index is '
+      + 'empty and every base-currency document is read at the finest minor unit')
+    assert.equal(billCurrencies.get(billInvoiceId), 'KWD',
+      'and the bill query must select it through the PO, which is where a bill\'s denomination lives')
+
+    // AND THE CONSEQUENCE, which is what makes the assertions above load-bearing rather than tidy.
+    // Codex's reproduction: an ordinary base-currency amount, no CurrencyRef on the row at all.
+    const row = { Id: invoiceId, TotalAmt: 600000000000, Balance: 600000000000 }
+    assert.deepEqual(
+      classifyQboLedgerEvidence(qboLedgerAmount(row, salesCurrencies.get(invoiceId))),
+      { kind: 'HOLDS_NOTHING' },
+      'with the currency the query supplied, the ledger has been SHOWN to hold nothing on this '
+      + 'document and the reversal can be decided on registration evidence')
+    assert.deepEqual(
+      classifyQboLedgerEvidence(qboLedgerAmount(row)),
+      { kind: 'UNPROVEN', paidAmount: null, documentTotal: null, currencyUnbound: true },
+      'THE CONTROL: with no currency from anywhere the identical row is unreadable and withholds — '
+      + 'which is what the poller did to every single-currency company before r15')
   },
 )
