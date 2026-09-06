@@ -380,3 +380,90 @@ test('[o3d-psrx r7] a registration in another currency covers none of this order
     'a string is not a number here — the enqueue writes a number, and anything else is a row this '
     + 'reader cannot vouch for')
 })
+
+// ---------------------------------------------------------------------------
+// o3d-psrx r18 (Codex HIGH 2) — THE RULE WAS EXACT AND ITS OPERANDS WERE NOT.
+//
+// `PAID_COVERAGE_EPSILON` was derived from the minor unit in r17 and is exact. What reached the
+// comparison was not: every figure it weighs comes out of a `Decimal(18, 4)` column, and all three
+// call sites wrote `Number(...)` on the way in. A double cannot hold four decimals across that
+// column's range — at 549755813888 (2^39) neighbouring doubles are about 0.00012 apart — so the two
+// stored, valid, ONE-MINOR-UNIT-APART values below are the same number, and a registration a whole
+// unit short of the order read as exact coverage. The reader then returned GONE, which
+// `zeroPaidIsProvenReversal` admits: a chargeback credit note over money nobody took back.
+//
+// ROUTE: `coversDocumentTotal` for the rule itself, and `classifyRegisteredPaymentAgainstListing`
+// for the verdict it dominates. The writer half of the same rule is driven through the real
+// `addPayment` in tests/sales-add-payment-clears-paid-provenance.test.ts.
+// ---------------------------------------------------------------------------
+
+/** The pair from the finding: two valid four-decimal amounts, one minor unit apart. */
+const FOUR_DP_COVERED = '549755813888.0002'
+const FOUR_DP_TOTAL = '549755813888.0003'
+
+test('[o3d-psrx r18] a four-decimal registration ONE MINOR UNIT short is not coverage', () => {
+  // THE PRECONDITION, and it is what makes this a finding rather than a preference: as `number`s
+  // these two stored values are indistinguishable, so no comparison taken on them could ever have
+  // separated the covered order from the one that is a whole minor unit short.
+  assert.equal(Number(FOUR_DP_COVERED), Number(FOUR_DP_TOTAL),
+    'PRECONDITION: the two stored values collapse onto one double — the r18 finding itself')
+  assert.ok(toDecimal(FOUR_DP_COVERED).lt(toDecimal(FOUR_DP_TOTAL)),
+    'PRECONDITION: while as decimals they are a whole minor unit apart')
+  // And the shortfall is a REAL one — a whole minor unit of a four-decimal currency, an order of
+  // magnitude above the band, so the epsilon is not what is being measured here.
+  assert.ok(toDecimal(FOUR_DP_TOTAL).sub(toDecimal(FOUR_DP_COVERED)).gt(PAID_COVERAGE_EPSILON),
+    'PRECONDITION: and the gap is wider than the band, so this is a shortfall and not dust')
+
+  assert.equal(coversDocumentTotal(toDecimal(FOUR_DP_COVERED), toDecimal(FOUR_DP_TOTAL)), false,
+    'THE FINDING: one whole minor unit short is not coverage, at any magnitude the column can hold')
+
+  // AND THE VERDICT IT DOMINATES, through the production reader rather than the rule alone: the
+  // registration's absence from a ledger listing IMS read in full must be PART coverage, not a
+  // reversal of the whole document.
+  const oneUnitShort: RegisteredPaymentRow = { ...pennyRegistration, registeredAmount: Number(FOUR_DP_COVERED) }
+  const verdict = classifyRegisteredPaymentAgainstListing(
+    new Set<string>(), [oneUnitShort], READ_AT, [], true, withMarker, toDecimal(FOUR_DP_TOTAL),
+  )
+  assert.equal(verdict.verdict, 'PART_COVERED_OFF_LEDGER',
+    'and the reader withholds instead of returning GONE')
+  assert.equal(zeroPaidIsProvenReversal(verdict), false,
+    'so paidAt is LEFT SET and no chargeback credit note is raised over the remainder')
+})
+
+test('[o3d-psrx r18] CONTROL: ordinary coverage at the same magnitude still settles', () => {
+  // THE CONTROL, and it is what stops the fix being "never cover anything". Exact coverage of the
+  // same four-decimal total must still read as coverage and must still reverse — a rule that refused
+  // here would disable genuine chargeback detection for every large order.
+  assert.equal(coversDocumentTotal(toDecimal(FOUR_DP_TOTAL), toDecimal(FOUR_DP_TOTAL)), true,
+    'the exact total covers the total')
+  const covering: RegisteredPaymentRow = { ...pennyRegistration, registeredAmount: 100 }
+  const verdict = classifyRegisteredPaymentAgainstListing(
+    new Set<string>(), [covering], READ_AT, [], true, withMarker, toDecimal('100.0000'),
+  )
+  assert.equal(verdict.verdict, 'GONE')
+  assert.equal(zeroPaidIsProvenReversal(verdict), true,
+    'a registration that settled the whole order and is now absent IS a removal of the whole order')
+
+  // AND THE ONE PLACE THE READER STILL CANNOT REACH EXACT COVERAGE AT THIS MAGNITUDE, SAID OUT LOUD
+  // RATHER THAN LEFT AS A SURPRISE (o3d-1xq8). `registeredAmount` is not a stored decimal: the enqueue
+  // writes `Number(receipt.amount)` into the registration's JSON payload, and at 2^39 no double
+  // answers to `549755813888.0003` — the nearest one is named `...0002`. So a registration that really
+  // did settle this order reads as one minor unit short and the reader WITHHOLDS. That is the
+  // fail-closed direction and it is the residue of the last lossy hop in the chain; closing it is
+  // o3d-1xq8, and this assertion is what will fail when it is closed.
+  const coveringAtScale: RegisteredPaymentRow = { ...pennyRegistration, registeredAmount: Number(FOUR_DP_TOTAL) }
+  assert.equal(toDecimal(Number(FOUR_DP_TOTAL)).toString(), FOUR_DP_COVERED,
+    'PRECONDITION: the payload double cannot name the order total at this magnitude')
+  assert.equal(
+    classifyRegisteredPaymentAgainstListing(
+      new Set<string>(), [coveringAtScale], READ_AT, [], true, withMarker, toDecimal(FOUR_DP_TOTAL),
+    ).verdict,
+    'PART_COVERED_OFF_LEDGER',
+    'so the reader withholds rather than admitting a reversal it cannot establish — o3d-1xq8',
+  )
+
+  // And the everyday figures, which are the ones this rule answers on every poll.
+  assert.equal(coversDocumentTotal(toDecimal('100.00'), toDecimal('100.0000')), true)
+  assert.equal(coversDocumentTotal(toDecimal('100.01'), toDecimal('100.0000')), true)
+  assert.equal(coversDocumentTotal(toDecimal('99.99'), toDecimal('100.0000')), false)
+})

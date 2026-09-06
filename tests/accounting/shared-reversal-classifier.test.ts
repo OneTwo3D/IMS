@@ -8,6 +8,7 @@ import {
   ledgerAmountMagnitudeBound,
   listedLedgerPaymentIds,
   parseLedgerAmount,
+  partitionPaymentReversals,
   readDecimalAsNumber,
   readLedgerDifferenceAsNumber,
   zeroPaidIsProvenReversal,
@@ -1045,4 +1046,90 @@ test('[o3d-psrx r14] an ordinary decoded QBO document still classifies exactly a
     '{"QueryResponse":{"Invoice":[{"Id":"ord-2","TotalAmt":1200.50,'
     + '"Balance":1200.50,"CurrencyRef":{"value":"GBP"}}]}}')
   assert.deepEqual(classifyQboLedgerEvidence(qboLedgerAmount(zeroed)), { kind: 'HOLDS_NOTHING' })
+})
+
+// ---------------------------------------------------------------------------
+// o3d-psrx r18 (Codex HIGH 1) — ONE RULE, TWO READERS, AND NOW ONE ANSWER.
+//
+// THE DEFECT. r16 put the currency-scale refusal on `parseLedgerAmount`'s NUMBER arm only. The string
+// arm kept its grammar test and its round trip, and r15's argument for the asymmetry — a string
+// carries its own evidence, so it needs no rule about values of its SIZE — is an argument about
+// MAGNITUDE that does not transfer to SCALE. The round trip establishes that the number IS the text
+// it came from; it says nothing about whether that text is a figure the currency can hold. So GBP
+// `0.005` was UNVERIFIABLE as a JSON number and money as a JSON string, and both connectors spent the
+// difference: Xero on `AmountPaid` in `partitionPaymentReversals`, QuickBooks on `Balance` and
+// `TotalAmt` in `qboLedgerAmount`.
+//
+// ROUTE: the two connectors' own production readers, not `parseLedgerAmount` on its own — the whole
+// point of the finding is what the difference is spent on.
+//
+// MUTATION: take the scale check off the string arm of `parseLedgerAmount` (r18's edit) and the GBP
+// rows below stop agreeing — Xero reads `'0.005'` into `partPaid` while `0.005` stays `unverifiable`,
+// and QuickBooks reads a paid amount from the string where the number gives none.
+// ---------------------------------------------------------------------------
+
+const authorised = (amountPaid: unknown, currency: string): XeroInvoice => ({
+  InvoiceID: 'inv_paired',
+  Status: 'AUTHORISED',
+  Type: 'ACCREC',
+  CurrencyCode: currency,
+  AmountPaid: amountPaid,
+} as XeroInvoice)
+
+/** Which of Xero's four buckets this reading landed in. */
+function xeroBucket(amountPaid: unknown, currency: string): string {
+  const reading = partitionPaymentReversals([authorised(amountPaid, currency)], 'ACCREC')
+  if (reading.zeroPaid.length > 0) return 'zeroPaid'
+  if (reading.partPaid.length > 0) return 'partPaid'
+  if (reading.unverifiable.length > 0) return 'unverifiable'
+  return 'none'
+}
+
+test('[o3d-psrx r18] a string and a number of the same value classify identically, through BOTH connectors', () => {
+  // Each row is ONE value in ONE currency, read twice — once as the JSON text a ledger may serialise
+  // and once as the double `Response.json()` produces. The two readings must agree, and what they
+  // agree ON is decided by the currency's minor unit rather than by which form arrived.
+  const rows: Array<{
+    label: string
+    currency: string
+    /** The figure under test, as text. Xero spends it as AmountPaid, QuickBooks as the settled part. */
+    text: string
+    xero: string
+    qbo: string
+  }> = [
+    // THE FINDING'S OWN VALUE: three decimals in a two-decimal currency. Refused in both arms since
+    // r18; before it, refused as a number and READ as a string.
+    { label: 'a three-decimal figure in a two-decimal currency', currency: 'GBP', text: '0.005', xero: 'unverifiable', qbo: 'UNPROVEN' },
+    // THE CONTROL THAT MAKES THE REFUSAL ABOUT THE CURRENCY AND NOT ABOUT THE DIGITS: the identical
+    // text in a three-decimal currency is money, in both arms.
+    { label: 'the same text in a three-decimal currency', currency: 'KWD', text: '0.005', xero: 'partPaid', qbo: 'PARTIALLY_PAID' },
+    // A four-decimal figure: refused in KWD, read in CLF. Same digits, opposite answers, decided by
+    // the minor-unit table alone.
+    { label: 'four decimals in a three-decimal currency', currency: 'KWD', text: '0.0005', xero: 'unverifiable', qbo: 'UNPROVEN' },
+    { label: 'four decimals in a four-decimal currency', currency: 'CLF', text: '0.0005', xero: 'partPaid', qbo: 'PARTIALLY_PAID' },
+    // AND THE ORDINARY READINGS, which are the ones the pollers make every day and none of which may
+    // move: a stated zero, and an ordinary part payment.
+    { label: 'a stated zero', currency: 'GBP', text: '0', xero: 'zeroPaid', qbo: 'HOLDS_NOTHING' },
+    { label: 'an ordinary part payment', currency: 'GBP', text: '12.34', xero: 'partPaid', qbo: 'PARTIALLY_PAID' },
+  ]
+
+  for (const row of rows) {
+    const value = Number(row.text)
+    // XERO. `partitionPaymentReversals` reads `AmountPaid` and buckets the invoice; `zeroPaid` is the
+    // only bucket the provenance gate can turn into a cleared `paidAt`.
+    assert.equal(xeroBucket(row.text, row.currency), xeroBucket(value, row.currency),
+      `${row.label} (${row.currency} ${row.text}): Xero must bucket the string and the number alike`)
+    assert.equal(xeroBucket(row.text, row.currency), row.xero,
+      `${row.label} (${row.currency} ${row.text}): and the bucket is ${row.xero}`)
+
+    // QUICKBOOKS. `qboLedgerAmount` reads `TotalAmt` and `Balance` and derives the settled figure; the
+    // amount under test is the settled part of a document totalling 100.
+    const balanceText = toDecimal(100).minus(toDecimal(row.text)).toString()
+    const asText = classifyQboLedgerEvidence(ledgerAmount('100', balanceText, row.currency))
+    const asNumber = classifyQboLedgerEvidence(ledgerAmount(100, Number(balanceText), row.currency))
+    assert.deepEqual(asText, asNumber,
+      `${row.label} (${row.currency} ${row.text}): QuickBooks must classify the string and the number alike`)
+    assert.equal(asText.kind, row.qbo,
+      `${row.label} (${row.currency} ${row.text}): and the verdict is ${row.qbo}`)
+  }
 })

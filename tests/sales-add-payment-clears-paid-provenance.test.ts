@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
+import { toDecimal } from '@/lib/domain/math/decimal'
+
 /**
  * o3d-psrx r5 (Codex HIGH 1, second half) — A RECEIPT REPLACES THE OFF-LEDGER PROVENANCE, INCLUDING
  * ON AN ORDER THAT WAS ALREADY PAID.
@@ -238,4 +240,96 @@ test('[o3d-psrx r6] CONTROL: a partial receipt that MAKES the order paid is not 
   assert.equal(state.created.length, 1)
   assert.equal(state.updates.length, 0, 'GBP 1 of GBP 100 is not a paid transition')
   assert.deepEqual(state.updateManys.filter((u) => 'unregisteredPaidAt' in u.data), [])
+})
+
+// ---------------------------------------------------------------------------
+// o3d-psrx r18 (Codex HIGH 2) — THE WRITER HALF OF THE COVERAGE RULE, ON STORED DECIMALS.
+//
+// `coversDocumentTotal` decides whether this action clears `SalesOrder.unregisteredPaidAt`, and every
+// figure it weighs is a `Decimal(18, 4)` column: the order's `totalForeign` and each `Payment.amount`.
+// Round 7 summed them with `Number(...)`. A double cannot hold four decimals across that column's
+// range — at 549755813888 (2^39) the neighbouring doubles are about 0.00012 apart — so a receipt set a
+// whole minor unit short of the order collapsed onto the order's own total and the marker was cleared
+// over a balance that is still settled by nothing any ledger was told about. The reader then has one
+// registration to look at, its removal is GONE, and a chargeback credit note is raised.
+//
+// WHY THIS DRIVES THE ACTION. Same reason r5 gave: the defect is in what the action HANDS the rule,
+// not in the rule, and a test that rebuilt the comparison by hand would pass over it. The mocked
+// database returns `Prisma.Decimal`s here because that is what Prisma returns.
+//
+// MUTATION: put `Number(...)` back around either operand of the coverage test in `addPayment` and the
+// first test below fails — the two values become one and the marker is cleared.
+// ---------------------------------------------------------------------------
+
+/** A CLF order — a genuinely four-decimal currency — one minor unit above what its receipts settle. */
+const FOUR_DP_ORDER = {
+  ...HAND_MARKED_PAID,
+  currency: 'CLF',
+  totalForeign: toDecimal('549755813888.0003'),
+  totalBase: toDecimal('549755813888.0003'),
+}
+
+test('[o3d-psrx r18] receipts ONE MINOR UNIT short of a four-decimal order leave the provenance STANDING', async () => {
+  reset({ ...FOUR_DP_ORDER })
+  // Already recorded: everything but the last minor unit, less the receipt about to be added.
+  state.payments = [{ amount: toDecimal('549755813887.0002'), currency: 'CLF' }]
+
+  const result = await addPayment({ orderId: 'so-1', amount: 1, currency: 'CLF' })
+  assert.equal(result.success, true, JSON.stringify(result))
+
+  // THE PRECONDITIONS, so this cannot pass by refusing the receipt or by taking the paid branch.
+  assert.equal(state.created.length, 1, 'the receipt must actually have been recorded')
+  assert.equal(state.updates.length, 0, 'the order was already paid — the becamePaid path must not run')
+  // And the sum really is one minor unit short, and really is invisible to a double.
+  assert.equal(toDecimal('549755813887.0002').add(1).toString(), '549755813888.0002')
+  assert.equal(Number('549755813888.0002'), Number('549755813888.0003'),
+    'PRECONDITION: the two figures collapse onto one double — which is the finding')
+
+  assert.deepEqual(state.updateManys.filter((u) => 'unregisteredPaidAt' in u.data), [],
+    'THE FINDING: one whole minor unit short of the total is not coverage, so the marker — which '
+    + 'speaks for the WHOLE paid balance — must stand')
+
+  // And the receipt is still registered with the ledger: withholding the provenance change is not
+  // withholding the registration.
+  assert.equal(state.registered.length, 1)
+})
+
+test('[o3d-psrx r18] CONTROL: the receipt that completes a four-decimal cover still clears it', async () => {
+  reset({ ...FOUR_DP_ORDER })
+  // The same order, the same receipt size, one minor unit more already recorded.
+  state.payments = [{ amount: toDecimal('549755813887.0003'), currency: 'CLF' }]
+
+  const result = await addPayment({ orderId: 'so-1', amount: 1, currency: 'CLF' })
+  assert.equal(result.success, true, JSON.stringify(result))
+  assert.equal(state.created.length, 1, 'the receipt must actually have been recorded')
+
+  const cleared = state.updateManys.filter((u) => 'unregisteredPaidAt' in u.data)
+  assert.equal(cleared.length, 1,
+    'exact coverage is coverage — a rule that refused here would leave every large order marked '
+    + 'off-ledger for ever, which withholds genuine chargeback detection instead of narrowing it')
+  assert.deepEqual(cleared[0].data, { unregisteredPaidAt: null })
+})
+
+test('[o3d-psrx r18] and the over-payment guard is exact too, and its band is derived', async () => {
+  // The other rule in this block that computed in `Number` on stored decimals. Its band was a literal
+  // `0.0001` — EXACTLY one whole minor unit in the two four-decimal currencies the repository
+  // supports — so an over-payment of a full minor unit was admitted by a tolerance that only ever
+  // existed to absorb arithmetic dust. It is now `ledgerAmountEpsilon(null)`, half the finest unit.
+  //
+  // MUTATION: restore the `0.0001` literal, or the `Number(...)` summation, and this test fails.
+  reset({ ...FOUR_DP_ORDER })
+  state.payments = [{ amount: toDecimal('549755813888.0003'), currency: 'CLF' }]
+
+  const overPaid = await addPayment({ orderId: 'so-1', amount: 0.0001, currency: 'CLF' })
+  assert.equal(overPaid.success, false, 'a whole minor unit beyond the total is an over-payment')
+  assert.match(String(overPaid.error), /exceeds remaining balance/)
+  assert.equal(state.created.length, 0, 'and nothing is written')
+
+  // CONTROL: the exact remaining balance is still accepted, so the guard has been tightened rather
+  // than turned into a refusal of the last receipt on every order.
+  reset({ ...FOUR_DP_ORDER })
+  state.payments = [{ amount: toDecimal('549755813888.0002'), currency: 'CLF' }]
+  const exact = await addPayment({ orderId: 'so-1', amount: 0.0001, currency: 'CLF' })
+  assert.equal(exact.success, true, JSON.stringify(exact))
+  assert.equal(state.created.length, 1)
 })
