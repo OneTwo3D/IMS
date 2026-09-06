@@ -288,6 +288,8 @@ function durabilityFunctions(source: string): string {
     shellFunction(source, 'pin_publish_root_parent'),
     shellFunction(source, 'publish_root_anchored'),
     shellFunction(source, 'publish_trust_root'),
+    // o3d-secops r7: the shared refusal pin_dir_beneath_root() prints a symlinked root through.
+    shellFunction(source, 'refuse_symlinked_root'),
     shellFunction(source, 'pin_dir_beneath_root'),
     shellFunction(source, 'publish_durable_file'),
     // The drop-in publisher is one of these too (o3d-2sm1.5, Codex r11): install_reboot_fence()
@@ -3895,7 +3897,7 @@ function runR9(
       // every "the publish must fail" test then passes for the wrong reason.
       ...functions
         .flatMap((name) => (name === 'publish_durable_file'
-          ? ['publish_trust_root_candidates', 'pin_publish_root_parent', 'publish_root_anchored', 'publish_trust_root', 'pin_dir_beneath_root', name]
+          ? ['publish_trust_root_candidates', 'pin_publish_root_parent', 'publish_root_anchored', 'publish_trust_root', 'refuse_symlinked_root', 'pin_dir_beneath_root', name]
           : [name]))
         .map((name) => shellFunction(entry.source, name)),
       body,
@@ -4265,6 +4267,7 @@ test('all three entrypoints carry the same durability and namespace primitives, 
     'pin_publish_root_parent',
     'publish_root_anchored',
     'publish_trust_root',
+    'refuse_symlinked_root',
     'pin_dir_beneath_root',
     'publish_durable_file',
     'publish_durable_dropin',

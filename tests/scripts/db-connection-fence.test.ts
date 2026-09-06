@@ -3207,6 +3207,8 @@ test('o3d-2sm1.5 r23: the snapshot is written verbatim, root-only, and loaded wi
         readShellFunction(source, 'pin_publish_root_parent'),
         readShellFunction(source, 'publish_root_anchored'),
         readShellFunction(source, 'publish_trust_root'),
+        // o3d-secops r7: the shared symlinked-root refusal pin_dir_beneath_root() calls.
+        readShellFunction(source, 'refuse_symlinked_root'),
         readShellFunction(source, 'pin_dir_beneath_root'),
         readShellFunction(source, 'publish_durable_file'),
         readShellFunction(source, 'publish_durable_dropin'),

@@ -114,6 +114,10 @@ export const SHIPPED = [
   'pin_publish_root_parent',
   'publish_root_anchored',
   'publish_trust_root',
+  // o3d-secops r7: pin_dir_beneath_root() prints its symlinked-root refusal through this, and the
+  // installer's own pre-flight gate prints the same bytes. A rig missing it turns a refusal into a
+  // `command not found` on stderr and a test that only greps stderr passes for the wrong reason.
+  'refuse_symlinked_root',
   'pin_dir_beneath_root',
   'publish_durable_file',
   'rotation_journal_encode',
