@@ -1200,49 +1200,71 @@ function labelField(value: string | null | undefined): string {
   return `"${encoded}"`
 }
 
+/** Four, so every UTF-16 code unit occupies the same width and a POSITION means something. */
+const IDENTITY_HEX_WIDTH = 4
+
+/** Says what the rest of the field is, so `group=` is not mistaken for a name or a value. */
+const IDENTITY_TOKEN_PREFIX = 'utf16hex:'
+
 /**
- * THE IDENTITY FIELD OF A LABEL: the group key, ASCII-ONLY AND REVERSIBLE (o3d-7jfq r7).
+ * THE IDENTITY FIELD OF A LABEL: the group key as a MACHINE TOKEN, not as text (o3d-7jfq r8).
  *
  * A RULE, NOT A LIST. Rounds 5 and 6 both widened `rendersInvisiblyOrCollapses` after a collision
- * got through it, and round 7 is the third: canonical equivalence. `Café` as U+00E9 and `Café` as
- * `e` + COMBINING ACUTE U+0301 are two group keys and two raw labels, and Unicode does not merely
- * permit a renderer to draw them identically — it REQUIRES it, so on screen they were one label.
- * Homoglyphs are the same defect with no normalisation form to appeal to: GREEK CAPITAL ALPHA
- * U+0391 and CYRILLIC CAPITAL A U+0410 stay distinct under NFC, NFD, NFKC and NFKD and are one
- * glyph in every font that carries both. There is no list that ends, so this field stops listing:
- * everything outside printable ASCII is spelled out, and what `group=` shows no longer depends on
- * which characters anybody remembered.
+ * got through it, and round 7 was the third: canonical equivalence. NFC and NFD spellings of one
+ * accented name are two group keys and two raw labels, and Unicode does not merely permit a
+ * renderer to draw them identically - it REQUIRES it, so on screen they were one label. Homoglyphs
+ * are the same defect with no normalisation form to appeal to: GREEK CAPITAL ALPHA U+0391 and
+ * CYRILLIC CAPITAL A U+0410 stay distinct under NFC, NFD, NFKC and NFKD and are one glyph in every
+ * font that carries both. There is no list that ends, so this field stopped listing.
  *
- * WHY THAT IS SUFFICIENT AND NOT MERELY LONGER. Printable ASCII holds no two code points that draw
- * alike and none that HTML collapses or hides — bar the space, which is why a second consecutive
- * space is still escaped. So two distinct group keys give two distinct encodings (the encoding is
- * per code point and uniquely decodable), and two distinct encodings of printable ASCII are two
- * distinct things ON SCREEN. Injective-as-a-string and injective-as-rendered coincide here by
- * construction rather than by a case list that has to be re-checked whenever Unicode grows.
+ * AND THEN NOT A RANGE EITHER (r8). Round 7 escaped everything OUTSIDE printable ASCII and emitted
+ * printable ASCII as itself, on the stated argument that printable ASCII holds no two code points
+ * that draw alike. THAT ARGUMENT IS FALSE, and it is the same defect retreated one range inward:
+ * `O` and `0`, and `I` and `l` and `1`, draw alike in the 11px UI font this notice is rendered in,
+ * and `r` followed by `n` draws as `m`. The round-7 field was injective as a string and still not
+ * injective ON SCREEN, which is the only injectivity an operator has. So nothing is emitted as
+ * itself any more.
  *
- * WHAT IT COSTS. A group key built from a non-Latin name becomes escapes: the emailless guest
- * 株式会社 keys on `guest-name:株式会社` and is printed
- * `group="guest-name:\u682a\u5f0f\u4f1a\u793e"`, which an operator cannot read as a name. That is
- * affordable only because it is a SPLIT — `name=`, `email=` and `customerId=` still print through
- * `labelField` and still show the string the Customer and Email cells show, so the operator finds
- * the row by reading those and uses `group=` only to tell two rows apart once they have. Encoding
- * both halves this way would trade one unusable notice for another.
+ * WHAT IT EMITS. Every UTF-16 code unit of the key becomes exactly four lowercase hex digits,
+ * after the literal prefix `utf16hex:` that names what follows. A JavaScript string IS a sequence
+ * of UTF-16 code units, so this is a fixed-width block code over the whole domain - injective by
+ * arithmetic, appealing to nothing about well-formedness, normalisation, or which characters
+ * anybody remembered. Two distinct keys differ in a code unit or in length, hence in a hex digit
+ * or in length. Nothing needs quoting, escaping or a lone-space rule: the alphabet holds no quote,
+ * no backslash, no space and no `;`, so this field cannot break the list it sits in.
+ *
+ * WHY HEX. Its alphabet is `0`-`9` and `a`-`f` and nothing else, which excludes BY CONSTRUCTION
+ * every confusable the round-8 finding named: there is no letter `O` to confuse with `0`, no `I`
+ * and no `l` to confuse with `1`, and no `m`, `n` or `r`, so `rn` cannot be drawn as `m`.
+ *
+ * THE RESIDUE, STATED RATHER THAN ARGUED AWAY. This does not make the field unmistakable in every
+ * font, and no alphabet would be. Within `0`-`9` and `a`-`f` the pair `6`/`b` - and in some faces
+ * `1`/`7` or `0`/`8` - are font-dependent shapes, so two tokens whose ONLY difference is one such
+ * pair at one position can still be misread by eye. What is gone is the set the finding named and
+ * the whole class of non-ASCII homoglyphs; what is left is that smaller residue, said out loud
+ * rather than asserted away a third time. Two mitigations, both real and neither a proof: the
+ * width is fixed, so two tokens are compared position against position rather than read; and the
+ * render site suppresses ligature formation, so `ff` stays two digits wide and the DIGIT COUNT is
+ * never wrong - see `app/(dashboard)/analytics/_components/report-page-title.tsx`.
+ *
+ * WHAT IT COSTS, AND WHY THE SPLIT PAYS FOR IT. The emailless guest `Acme Ltd` keys on
+ * `guest-name:Acme Ltd` and is printed `group=utf16hex:0067007500650073...`, which no operator
+ * reads - and it is not meant to be read. It exists solely to tell two otherwise identical rows
+ * apart, which a fixed-width token does better than a quasi-readable one. That is affordable only
+ * because the other three fields are untouched: `name=`, `email=` and `customerId=` go through
+ * `labelField` and still print exactly what the Customer and Email cells print, in the name's own
+ * script. The operator FINDS the row by reading those and uses this field only to tell two of them
+ * apart once they have. Encoding both halves this way, or neither, would trade one unusable notice
+ * for another.
  */
 function identityLabelField(value: string): string {
   let encoded = ''
-  let previousWasLoneSpace = false
-  for (const char of value) {
-    const codePoint = char.codePointAt(0)!
-    const loneSpace: boolean = char === ' ' && !previousWasLoneSpace
-    if (char === '\\') encoded += '\\\\'
-    else if (char === '"') encoded += '""'
-    else if (loneSpace) encoded += ' '
-    // Printable ASCII above the space, minus the backslash and quote handled above: emitted raw.
-    else if (codePoint > 0x20 && codePoint <= 0x7e) encoded += char
-    else encoded += visibleLabelEscape(codePoint)
-    previousWasLoneSpace = loneSpace
+  // BY CODE UNIT, not by code point: a JS string is a code-unit sequence, and iterating it as one
+  // is what fixes the width at four and keeps the mapping injective even over a lone surrogate.
+  for (let index = 0; index < value.length; index += 1) {
+    encoded += value.charCodeAt(index).toString(16).padStart(IDENTITY_HEX_WIDTH, '0')
   }
-  return `"${encoded}"`
+  return `${IDENTITY_TOKEN_PREFIX}${encoded}`
 }
 
 /**
@@ -1265,33 +1287,38 @@ function identityLabelField(value: string): string {
  * STRUCTURALLY — `labelField` above — and every present component is quoted and escaped.
  *
  * INJECTIVE BY CONSTRUCTION, NOT BY ARGUMENT. The label carries `group=`, the map key the row was
- * grouped under, which is distinct for distinct groups by definition of a Map — and distinct keys
- * stay distinct once quoted, because the quoting is reversible. Round 4 instead proved uniqueness
+ * grouped under, which is distinct for distinct groups by definition of a Map - and distinct keys
+ * stay distinct once encoded, because the encoding is reversible. Round 4 instead proved uniqueness
  * by exhausting the cases the key is built from, a proof that has to be redone, correctly, every
  * time the key changes. Carrying the key cannot go stale.
  *
  * TWO FIELDS, TWO JOBS, TWO ENCODINGS (r7). `name=` is the Customer column, `email=` is the Email
  * column and `customerId=` is a column of the CSV export this notice already points at: they exist
- * to be READ against the row on screen, so they go through `labelField` and stay legible — a
+ * to be READ against the row on screen, so they go through `labelField` and stay legible - a
  * non-Latin name is printed as the name. `group=` exists to be UNIQUE: it is the map key the row
- * was grouped under, and it goes through `identityLabelField`, which is ASCII-only.
+ * was grouped under, and it goes through `identityLabelField`, which is not text at all.
  *
  * Those jobs were fighting while one encoder did both. An encoder legible enough for `name=` emits
- * most code points unchanged, and rounds 5, 6 and 7 each found another pair it therefore let
- * through — quote, whitespace, canonical equivalence. Splitting ends the recurrence rather than
- * postponing it: `group=` no longer depends on which characters anybody remembered to escape, and
- * `name=` no longer has to carry a burden that would make it unreadable. See both for why.
+ * most code points unchanged, and rounds 5, 6, 7 and 8 each found another pair it therefore let
+ * through - quote, whitespace, canonical equivalence, and finally the ASCII confusables `O`/`0`,
+ * `I`/`l`/`1` and `rn`/`m`. Splitting ends the recurrence rather than postponing it: `group=` no
+ * longer depends on which characters anybody remembered to escape, and `name=` no longer has to
+ * carry a burden that would make it unreadable. See both for why.
  *
- * AND INJECTIVE WHERE IT IS READ, NOT ONLY WHERE IT IS BUILT. The notice is rendered as collapsing
- * HTML, so a label distinct only before rendering is not distinct to the operator. `group=` is
- * distinct after rendering because printable ASCII has no two code points that draw alike.
+ * AND INJECTIVE WHERE IT IS READ, NOT ONLY WHERE IT IS BUILT (r8). The notice is rendered as
+ * collapsing HTML in an 11px proportional font, so a label distinct only before rendering is not
+ * distinct to the operator - and neither is one whose distinguishing character is `O` where the
+ * other's is `0`. `group=` is therefore not printed as characters anybody could read as a name: it
+ * is `utf16hex:` followed by four lowercase hex digits per code unit, a MACHINE TOKEN compared
+ * position against position. `identityLabelField` states what that leaves and what it does not.
  *
- * QUOTED CSV-STYLE, WITH INNER QUOTES DOUBLED. Entries are separated by `; ` because a company name
- * may contain a comma — and it may contain a semicolon too, at which point an unquoted list is a
- * list a reader cannot split. Every value is delimited, with any quote inside it doubled, so a
- * reader tracking quote state always knows whether a `; ` is inside a value or between two entries.
- * An empty stored name renders `name=""`: the honest label for a row whose Customer cell is empty,
- * and visibly a value rather than a gap.
+ * QUOTED CSV-STYLE, WITH INNER QUOTES DOUBLED - THE READABLE FIELDS. Entries are separated by `; `
+ * because a company name may contain a comma - and it may contain a semicolon too, at which point
+ * an unquoted list is a list a reader cannot split. Every READ value is delimited, with any quote
+ * inside it doubled, so a reader tracking quote state always knows whether a `; ` is inside a value
+ * or between two entries. An empty stored name renders `name=""`: the honest label for a row whose
+ * Customer cell is empty, and visibly a value rather than a gap. `group=` needs none of this and
+ * carries no quotes: its alphabet has no quote, no space and no `;` to be confused by.
  */
 function inconsistentCustomerLabel(row: Pick<CustomerReportRow, 'customerId' | 'customerName' | 'customerEmail'>): string {
   return `name=${labelField(row.customerName)} email=${labelField(row.customerEmail)} customerId=${labelField(row.customerId)} group=${identityLabelField(customerGroupKey(row))}`
@@ -1309,16 +1336,30 @@ function inconsistentCustomerLabel(row: Pick<CustomerReportRow, 'customerId' | '
  *
  * Capped, because a notice is one line of prose and a data incident could contradict hundreds. The
  * overflow is not dropped: it is COUNTED, said out loud, and pointed at the CSV export, which is
- * built with `paginate: false` and carries `costEvidence` on every row — so the complete answer
+ * built with `paginate: false` and carries `costEvidence` on every row - so the complete answer
  * always exists somewhere the notice names, however long the list gets.
+ *
+ * AND THE LIST SAYS HOW TO USE ITSELF (r8). `group=` stopped being readable text when it became a
+ * fixed-width hex token, and an operator meeting one for the first time would otherwise reasonably
+ * read it as a corrupted name. So the notice says, in its own words and BEFORE the list rather
+ * than after it, which fields are for finding the row and which one is for telling two rows apart.
+ * Before the list because the entries end the sentence: the overflow clause is the last thing the
+ * notice says, so that where all of them can be found is what an operator reads last.
  */
+const IDENTITY_FIELD_NOTICE =
+  'Find the row by reading name= and email=, which show exactly what the Customer and Email cells '
+  + 'show. group= is not a name and is not meant to be read: it is the identity the row was grouped '
+  + `under, written as a machine token — the literal ${IDENTITY_TOKEN_PREFIX} followed by `
+  + `${IDENTITY_HEX_WIDTH} lowercase hex digits for each UTF-16 code unit of it — so tell two `
+  + 'entries apart by comparing their tokens digit against digit at the same position.'
+
 function namedInconsistentCustomers(labels: string[]): string {
   const shown = labels.slice(0, INCONSISTENT_NOTICE_NAME_LIMIT)
   const rest = labels.length - shown.length
   const overflow = rest > 0
     ? `, and ${rest} more not named here — the CSV export is not paginated and stamps every one of them costEvidence=inconsistent`
     : ''
-  return `They are, highest-ranked first: ${shown.join('; ')}${overflow}.`
+  return `${IDENTITY_FIELD_NOTICE} They are, highest-ranked first: ${shown.join('; ')}${overflow}.`
 }
 
 /**

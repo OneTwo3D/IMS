@@ -35,7 +35,16 @@ export function ReportPageTitle({
         <TooltipContent className="max-w-md text-left whitespace-normal">
           <p>{description}</p>
           {notices.length > 0 && (
-            <ul className="mt-2 space-y-1 border-t border-background/20 pt-2 text-[11px] leading-snug">
+            {/*
+              LIGATURES OFF, because a notice may carry a fixed-width identity token (o3d-7jfq r8).
+              The customer report names contradicted rows with `group=utf16hex:<4 hex digits per
+              code unit>`, whose whole value is that the digits line up position against position.
+              A font that ligates `ff` into one glyph makes a token look a digit shorter than it is
+              and destroys exactly that. Nothing else in a notice needs a ligature, so the cheapest
+              honest thing is to suppress them for the list. It is a mitigation and not a proof —
+              `identityLabelField` states the glyph ambiguity that remains after it.
+            */}
+            <ul className="mt-2 space-y-1 border-t border-background/20 pt-2 text-[11px] leading-snug [font-variant-ligatures:none]">
               {notices.map((notice) => (
                 <li key={notice}>{notice}</li>
               ))}
