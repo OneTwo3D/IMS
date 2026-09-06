@@ -2902,6 +2902,27 @@ publish_trust_root() {
 # element, which Linux caps at MAX_ARG_STRLEN, and the first draft of this paragraph crossed the
 # cap — E2BIG, which arrives as a spawn error carrying no status and no output at all. The rig now
 # writes the script to a file, so the cliff is gone; the habit is still the right one.
+
+# THE REFUSAL ITSELF, IN ONE PLACE (o3d-secops r7, Codex CRITICAL).
+#
+# It was four printf lines inside pin_dir_beneath_root(), which made it the PUBLISHER's rule. The
+# installer needs the identical rule for ${APP_DIR}, ${DATA_DIR} and ${LOG_DIR} at the top of the
+# run — see require_real_service_root() below — and an operator who meets one wording at pre-flight
+# and a different one at the first publication has met two rules. There is one rule, so there is
+# one text: both callers print THESE bytes, and a test asserts the up-front refusal and the
+# publisher's refusal are the same function.
+#
+# "a root this run writes into" rather than "a publication root": ${LOG_DIR} is not a publication
+# root — nothing is published under it — and it is still subject to `chown -R`, which dereferences
+# its OPERAND. The sentence has to cover both or it is wrong at one of the two call sites.
+refuse_symlinked_root() {
+  local root="$1"
+  printf 'ERROR: %s is a symbolic link, and a root this run writes into may not be one: nothing here proves the path its target resolves through.\n' "$root" >&2
+  printf 'ERROR: To keep %s on another disk, replace the link with a real directory and bind-mount the disk onto it — no data has to move:\n' "$root" >&2
+  printf 'ERROR:   rm %s && mkdir -p %s && mount --bind TARGET %s\n' "$root" "$root" "$root" >&2
+  printf 'ERROR: then add `TARGET %s none bind 0 0` to /etc/fstab so the bind survives a reboot.\n' "$root" >&2
+}
+
 pin_dir_beneath_root() {
   local root="$1" path="$2" rel comp here entry base
   [[ "$root" == /* && "$path" == /* ]] || return 1
@@ -2923,10 +2944,8 @@ pin_dir_beneath_root() {
   entry="$(stat -c '%F|%d:%i' "$base" 2>/dev/null || true)"
   if [[ "${entry%%|*}" != "directory" ]]; then
     if [[ "${entry%%|*}" == "symbolic link" ]]; then
-      printf 'ERROR: %s is a symbolic link, and a publication root may not be one: nothing here proves the path its target resolves through.\n' "$root" >&2
-      printf 'ERROR: To keep %s on another disk, replace the link with a real directory and bind-mount the disk onto it — no data has to move:\n' "$root" >&2
-      printf 'ERROR:   rm %s && mkdir -p %s && mount --bind TARGET %s\n' "$root" "$root" "$root" >&2
-      printf 'ERROR: then add `TARGET %s none bind 0 0` to /etc/fstab so the bind survives a reboot.\n' "$root" >&2
+      # THE SAME BYTES THE PRE-FLIGHT GATE PRINTS (o3d-secops r7). One rule, one text.
+      refuse_symlinked_root "$root"
     fi
     return 1
   fi
@@ -3203,6 +3222,122 @@ mkdir_service_subdir() {
     enter_service_subdir "${root}" "${mask}" "${path}"
     cd "${saved}" || die "this run could not return to ${saved} after creating ${path}. Nothing further has been changed."
   done
+}
+
+# ---------------------------------------------------------------------------
+# THE THREE ROOTS THEMSELVES, PROVED FROM `/` BEFORE ANYTHING FOLLOWS ONE (o3d-secops r7,
+# Codex CRITICAL)
+#
+# THE FINDING. Round 6 hardened the PUBLISHER to refuse a symlinked root and told the operator to
+# use a bind mount instead. The installer kept the old behaviour at the same three names:
+# enter_service_subdir() opens with `mkdir -p "${root}"` and `cd -P "${root}"` on the root itself,
+# and section 8 opens with a bare `mkdir -p "${DATA_DIR}" "${LOG_DIR}"`. Both FOLLOW a symlink at
+# the root. So on a host where /var/lib/one-two-inventory is a link, this script's `useradd
+# --create-home`, its `mkdir -p`, its upload migration, its crontab-lock preparation and cron
+# backup, its `rsync`, its `git clone` and its `chown -R` all landed through the link — and the
+# refusal that says a symlinked root is not allowed arrived afterwards, at the first publication.
+# A gate that runs after the writes it is guarding is not a gate. The comment two lines below that
+# `mkdir -p` describes this very hazard for the SUBDIRECTORIES; the roots kept the behaviour the
+# subdirectories were fixed for.
+#
+# ORDERING IS THE FIX, so this runs in section 1, immediately after the `EUID` check and before
+# ANY other statement in the run — before `load_existing_env "${APP_DIR}/.env"`, which is the first
+# statement in the whole script that resolves one of these names at all.
+#
+# WHAT IT PROVES, EXACTLY. A walk from `/` — the one directory whose name nothing can rebind — to
+# the root's parent, one component at a time: each is lstat-ed (`stat` without `-L`, so a link
+# reads as "symbolic link" and is refused rather than followed), entered with `cd -P`, and then
+# checked BOTH ways round — the inode we are standing in must be the one the entry named, and `..`
+# must be the directory we came from. That pair is what closes the window between the lstat and the
+# chdir, and it is the same pair pin_publish_root_parent() and pin_dir_beneath_root() use. The
+# root's own entry is then read by ONE lstat inside the pinned parent, never as a pathname, and a
+# symlink at it ends the run through refuse_symlinked_root() — the publisher's own text.
+#
+# WHY NOT SIMPLY CALL pin_publish_root_parent(), WHICH ALREADY WALKS FROM `/`. Two reasons, and
+# both are about not turning a symlink fix into a policy change:
+#
+#   • It also decides OWNERSHIP AND MODE — every ancestor root-owned-or-ours, no group or other
+#     write bit on the parent. That is the anchor a PUBLICATION root must satisfy, and ${APP_DIR}
+#     and ${DATA_DIR} are publication roots, so they satisfy it already or every publication into
+#     them fails later anyway. ${LOG_DIR} IS NOT ONE — nothing is published under /var/log — and on
+#     Ubuntu /var/log is `drwxrwxr-x root:syslog`, which the anchor refuses. Applying it here would
+#     refuse a stock Ubuntu install over a question no publication asks.
+#   • It CREATES nothing and must not: ${APP_DIR} is created by `useradd --create-home` a few
+#     hundred lines below, and a root-owned directory pre-made at that name would leave the
+#     first-install `git clone`, which runs as ${APP_USER}, unable to write into it.
+#
+# So the two functions divide the question exactly as the two rules do: THE SYMLINK RULE IS ONE
+# RULE, applied here to all three roots and by the publisher to its own, printing the same bytes;
+# THE ANCHOR is an additional property only a publication root carries, and it is still enforced
+# where it always was.
+#
+# AND "PIN" MEANS WHAT IT CAN MEAN IN A SHELL. This process cannot hold a descriptor on three
+# directories for the length of an install. What the walk establishes is that at the moment it ran,
+# no component from `/` to the root was a symlink and the root was not one either — and the parents
+# of all three (/opt, /var/lib, /var/log) are root-owned, so from that moment only root can put a
+# link at any of those names. The window the finding is about is between an EXISTING link and the
+# writes that followed it, and that window is closed by asking first.
+service_root_entry_kind() {
+  local root="${1%/}" rel comp here entry base
+  [[ "${root}" == /* ]] || return 1
+  [[ -n "${root}" ]] || return 1
+  base="${root##*/}"
+  [[ -n "${base}" && "${base}" != "." && "${base}" != ".." ]] || return 1
+  # THE FIXED TRUSTED ANCESTOR, and the only one there is.
+  cd -P / 2>/dev/null || return 1
+  here="$(stat -c '%d:%i' . 2>/dev/null || true)"
+  [[ -n "${here}" ]] || return 1
+  rel="${root#/}"
+  # Every component ABOVE the root. The root's own name is what is left in ${rel} at the end, and
+  # it is deliberately not entered: this asks what is AT it, and creates nothing.
+  while [[ "${rel}" == */* ]]; do
+    comp="${rel%%/*}"
+    rel="${rel#*/}"
+    # A `//` names the directory we are already standing in.
+    [[ -n "${comp}" ]] || continue
+    # `.` and `..` would step outside the walk while it believed it was stepping down it.
+    [[ "${comp}" != "." && "${comp}" != ".." ]] || return 1
+    # ONE lstat, TAKING THE TYPE AND THE IDENTITY TOGETHER, so the two cannot describe different
+    # directories. No `-L`, so a symlinked ancestor is refused rather than followed.
+    entry="$(stat -c '%F|%d:%i' "${comp}" 2>/dev/null || true)"
+    [[ "${entry%%|*}" == "directory" ]] || return 1
+    cd -P "${comp}" 2>/dev/null || return 1
+    # AND THE DIRECTORY WE LANDED IN IS THE ONE THAT ENTRY NAMED. `..` alone accepts a component
+    # swapped for a symlink to a SIBLING under the same parent; the inode does not. Both are kept:
+    # `..` also refuses a directory moved WHOLESALE into another parent, which preserves its inode.
+    [[ "$(stat -c '%d:%i' . 2>/dev/null || true)" == "${entry#*|}" ]] || return 1
+    [[ "$(stat -c '%d:%i' .. 2>/dev/null || true)" == "${here}" ]] || return 1
+    here="${entry#*|}"
+  done
+  # The walk consumed every component but the last, so what is left must be the root's own name. A
+  # trailing `/` or a `//` that made the two disagree is a refusal and not a guess.
+  [[ "${rel}" == "${base}" ]] || return 1
+  # ONE lstat, in the directory this walk is standing in, of a SINGLE COMPONENT. "absent" is a
+  # first install, and is the one answer that is neither a directory nor a refusal.
+  stat -c '%F' "${base}" 2>/dev/null || printf 'absent\n'
+}
+
+# The gate. It either returns or ends the run; there is no third outcome and no caller decides.
+require_real_service_root() {
+  local root="$1" what="$2" kind rc=0
+  # A COMMAND SUBSTITUTION IS THE SUBSHELL: service_root_entry_kind() leaves the shell it runs in
+  # inside the parent, on success and part-way down on failure, and the installer's own cwd must
+  # not move. The status is taken with `|| rc=$?` because under `set -e` a failed substitution in
+  # an assignment ends the script before the `die` below could say why.
+  kind="$(service_root_entry_kind "${root}")" || rc=$?
+  if (( rc != 0 )); then
+    die "${root} — ${what} — could not be resolved from \`/\` without following a symbolic link, or a directory on the way to it changed while this run was walking it. Every component from \`/\` down to ${root} must be a real directory. NOTHING has been created, nothing has been migrated and nothing has been started."
+  fi
+  case "${kind}" in
+    directory|absent) return 0 ;;
+    'symbolic link')
+      refuse_symlinked_root "${root}"
+      die "${root} — ${what} — is a symbolic link, so this run stops here rather than creating, entering, migrating into, rsyncing into or chowning whatever it resolves to. The two commands above replace it with a bind mount, which is the same layout with the indirection resolved once, at mount time. NOTHING has been created, nothing has been migrated and nothing has been started — this is the FIRST statement in the run that looks at ${root}, so an existing installation is exactly as it was."
+      ;;
+    *)
+      die "${root} — ${what} — is a ${kind}, not a directory. This run will not create anything at that name or write through it. NOTHING has been created, nothing has been migrated and nothing has been started."
+      ;;
+  esac
 }
 
 # ---------------------------------------------------------------------------
@@ -6353,6 +6488,34 @@ prompt_yn() {
 header "Pre-flight checks"
 
 [[ $EUID -ne 0 ]] && die "This script must be run as root. Try: sudo bash install.sh"
+
+# THE THREE ROOTS, BEFORE ANY OTHER STATEMENT IN THE RUN (o3d-secops r7, Codex CRITICAL).
+#
+# This is the first line after the privilege check for a reason: every root-side operation this
+# script performs on these three names comes after it, and there is no statement before it that
+# resolves any of them. In run order, what it now precedes is
+#
+#   load_existing_env "${APP_DIR}/.env"                 the first read of any of the three
+#   useradd --home-dir "${APP_DIR}" --create-home       creates ${APP_DIR}
+#   mkdir -p "${DATA_DIR}" "${LOG_DIR}"                 section 8's own roots
+#   mkdir_service_subdir / enter_service_subdir         `mkdir -p` + `cd -P` on the root
+#   migrate_uploads                                     moves the uploads into ${DATA_DIR}
+#   find "${DATA_DIR}" ... -exec chown -h               the recursive chown of the state root
+#   chown -R … "${LOG_DIR}"                             whose OPERAND is dereferenced
+#   prepare_crontab_lock                                the root-owned lock under ${DATA_DIR}
+#   mkdir_service_subdir "${DATA_DIR}" 077 …            the deploy key directory
+#   git clone / git fetch / rsync -a --delete           into ${APP_DIR}
+#   copy_tree_into_new_dir … "${APP_DIR}/.git"          and its git metadata
+#   chown -R … "${APP_DIR}"                             the recursive chown of the app root
+#   publish_durable_file "${APP_DIR}/.env"              and every later publication
+#   fence_cron -> mkdir -p "${DATA_DIR}" + CRON_BACKUP  the crontab fence and its backup
+#   the migration, the seed, the unit and the service   everything downstream of all of it
+#
+# ${LOG_DIR} is in the list because `chown -R` DEREFERENCES its operand: a link at /var/log/<app>
+# hands the whole of whatever it points at to ${APP_USER}, recursively.
+require_real_service_root "${APP_DIR}"  "the application directory"
+require_real_service_root "${DATA_DIR}" "the state directory"
+require_real_service_root "${LOG_DIR}"  "the log directory"
 
 if [[ -f /etc/os-release ]]; then
   . /etc/os-release

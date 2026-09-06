@@ -2136,6 +2136,22 @@ publish_trust_root() {
 # element, which Linux caps at MAX_ARG_STRLEN, and the first draft of this paragraph crossed the
 # cap — E2BIG, which arrives as a spawn error carrying no status and no output at all. The rig now
 # writes the script to a file, so the cliff is gone; the habit is still the right one.
+
+# THE REFUSAL ITSELF, IN ONE PLACE (o3d-secops r7, Codex CRITICAL).
+#
+# It was four printf lines inside pin_dir_beneath_root(). scripts/install.sh applies the identical
+# rule to ${APP_DIR}, ${DATA_DIR} and ${LOG_DIR} at the top of its run, before anything creates or
+# enters them, and an operator who meets one wording at pre-flight and a different one at the first
+# publication has met two rules. There is one rule, so there is one text — and this copy is held
+# byte-identical to install.sh's by the same parity test that holds the rest of the publisher.
+refuse_symlinked_root() {
+  local root="$1"
+  printf 'ERROR: %s is a symbolic link, and a root this run writes into may not be one: nothing here proves the path its target resolves through.\n' "$root" >&2
+  printf 'ERROR: To keep %s on another disk, replace the link with a real directory and bind-mount the disk onto it — no data has to move:\n' "$root" >&2
+  printf 'ERROR:   rm %s && mkdir -p %s && mount --bind TARGET %s\n' "$root" "$root" "$root" >&2
+  printf 'ERROR: then add `TARGET %s none bind 0 0` to /etc/fstab so the bind survives a reboot.\n' "$root" >&2
+}
+
 pin_dir_beneath_root() {
   local root="$1" path="$2" rel comp here entry base
   [[ "$root" == /* && "$path" == /* ]] || return 1
@@ -2157,10 +2173,8 @@ pin_dir_beneath_root() {
   entry="$(stat -c '%F|%d:%i' "$base" 2>/dev/null || true)"
   if [[ "${entry%%|*}" != "directory" ]]; then
     if [[ "${entry%%|*}" == "symbolic link" ]]; then
-      printf 'ERROR: %s is a symbolic link, and a publication root may not be one: nothing here proves the path its target resolves through.\n' "$root" >&2
-      printf 'ERROR: To keep %s on another disk, replace the link with a real directory and bind-mount the disk onto it — no data has to move:\n' "$root" >&2
-      printf 'ERROR:   rm %s && mkdir -p %s && mount --bind TARGET %s\n' "$root" "$root" "$root" >&2
-      printf 'ERROR: then add `TARGET %s none bind 0 0` to /etc/fstab so the bind survives a reboot.\n' "$root" >&2
+      # THE SAME BYTES THE PRE-FLIGHT GATE PRINTS (o3d-secops r7). One rule, one text.
+      refuse_symlinked_root "$root"
     fi
     return 1
   fi
