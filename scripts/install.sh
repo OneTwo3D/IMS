@@ -2916,21 +2916,19 @@ publish_trust_root() {
 # root — nothing is published under it — and it is still subject to `chown -R`, which dereferences
 # its OPERAND. The sentence has to cover both or it is wrong at one of the two call sites.
 #
-# AND THE REMEDY IS A PROCEDURE, NOT A ONE-LINER (o3d-secops r7 second pass, Codex HIGH). It used
-# to be `rm ROOT && mkdir -p ROOT && mount --bind TARGET ROOT`, printed at a moment when the
-# service and its cron are still LIVE — which is the pre-flight refusal's whole point. An operator
-# who ran that with the wrong TARGET, an unmounted disk, or a `mount` that simply failed was left
-# with an EMPTY REAL DIRECTORY at the live pathname and their data detached at the old target: the
-# application writes into a shadow tree, or fails, and there is nothing on screen that says how to
-# get back. So the remedy now stops the writers first, RESOLVES THE TARGET ITSELF and prints it as
-# a literal path — there is no TARGET for anybody to mistype and no shell variable in any of it —
-# and prints the one command that puts the link back if the mount does not take. A link that does
-# not resolve to a directory gets a different answer, because there is no bind mount to make.
+# AND THE REMEDY IS NO LONGER PRINTED AT ALL (o3d-secops r8, Codex HIGH). It was a five-step
+# `rm && mkdir -p && mount --bind` procedure with an apparatus in front of it deciding whether it
+# was safe to print, and that apparatus produced a finding in every review it survived — the last
+# of them being that the procedure itself is raceable for ${LOG_DIR}, whose /var/log parent this
+# same script recognises as group-writable and non-sticky. The refusal stays, the reason stays, the
+# resolved target stays; the commands moved to docs/installation.md, where a human reads them,
+# checks their own parent directory and their own target, and is not handed a paste. The body
+# below says why in full.
 refuse_symlinked_root() {
-  local root="$1" target="" qroot qtarget qother froot ftarget ident otherid other nroot ntarget nother anc ancid keep
+  local root="$1" target="" qtarget=""
   # THE TARGET IS RESOLVED HERE AND PRINTED, not left to the operator to retype. Its status is
   # taken so that this stays out of the unchecked-substitution census: a `readlink` that fails is a
-  # dangling or unreadable link, which is the branch below.
+  # dangling or unreadable link, which the branch below covers.
   target="$(readlink -f "$root" 2>/dev/null)" || target=""
   # NO "NOTHING HAS BEEN CHANGED" IN HERE (o3d-secops r7 sixth pass, Codex MEDIUM). This text is
   # printed by TWO callers: the pre-flight gate, where nothing has happened yet, and
@@ -2940,225 +2938,52 @@ refuse_symlinked_root() {
   # something false, and telling them not to look. The claim belongs to whoever can make it, so the
   # gate's own `die` carries it and this function states only what is true wherever it is printed.
   printf 'ERROR: %s is a symbolic link, and a root this run writes into may not be one: nothing here proves the path its target resolves through.\n' "$root" >&2
+  printf 'ERROR: WHY: every later run of these scripts rsyncs into this root with --delete and chowns it RECURSIVELY. A root that is an ALIAS for another directory hands both of those to whatever the alias resolves to at that moment, and any account that can rename a directory on the way to the target chooses what that is. Stopping the service does not remove that account.\n' >&2
   printf 'ERROR: To keep %s on another disk, replace the link with a real directory and bind-mount the disk onto it — no data has to move, because the bind exposes the same filesystem at the same path.\n' "$root" >&2
-  # EVERY PATH THAT GOES INTO A COMMAND IS SHELL-QUOTED FIRST (o3d-secops r7 third pass, Codex
-  # HIGH). ${target} is whatever `readlink -f` resolved to, and a component of that chain can be
-  # named by an account this script does not trust — so it may contain a space, a `;`, a `$(…)`, a
-  # newline or a control byte. Interpolated raw into a line an operator is told to paste into a
-  # ROOT SHELL, that is command execution with extra steps. `printf %q` is a bash builtin over a
-  # value this function already holds; it emits a single word that evaluates back to exactly these
-  # bytes, `$'…'` for anything unprintable, and it is applied to EVERY occurrence below including
-  # the one in the prose. Its status is taken, and a value it cannot quote gets no command at all.
-  qroot="$(printf '%q' "$root")" || qroot=""
-  qtarget="$(printf '%q' "$target")" || qtarget=""
-  if [[ -z "$target" || ! -d "$target" ]]; then
-    printf 'ERROR: That link does not resolve to a directory%s, so there is no bind mount to make yet. Fix or remove it by hand — this run will not guess what it was meant to point at.\n' "${qtarget:+ (it resolves to ${qtarget})}" >&2
-    return 0
-  fi
-  if [[ -z "$qroot" || -z "$qtarget" ]]; then
-    printf 'ERROR: The paths involved could not be quoted for a shell, so this run will not print commands to paste. Replace the link with a bind mount by hand.\n' >&2
-    return 0
-  fi
-  # AND THE TARGET'S OWN ANCESTRY IS PROVED BEFORE ANY COMMAND NAMING IT IS PRINTED (o3d-secops r7
-  # sixth pass, Codex HIGH).
-  #
-  # THE FINDING. The refusal above says, correctly, that nothing proves the path the link's target
-  # resolves through — and then printed `mount --bind TARGET ROOT` for the operator to paste, which
-  # RESOLVES THAT PATH AGAIN, later, as root. An account that can write any directory on the way to
-  # the target can replace it between the moment this ran and the moment the operator pastes, and
-  # the bind then exposes a tree of their choosing at ${DATA_DIR} or ${APP_DIR} — where the next
-  # installer run writes and chowns as root. Stopping the service does not remove that account.
-  #
-  # SO THE COMMAND IS ONLY PRINTED WHEN THE TARGET'S NAME CANNOT BE REBOUND: every directory from
-  # `/` down to its parent owned by root (or by whoever is running this) and carrying no group or
-  # other write bit — the same question, asked by the same walk, that decides whether a directory
-  # may be a publication root at all. In a subshell, because the walk moves the shell it runs in.
-  if ! ( pin_publish_root_parent "$target" ) >/dev/null 2>&1; then
-    printf 'ERROR: BUT %s IS NOT SAFE TO BIND YET. A directory on the way to it can be replaced by somebody other than root, so a bind mount naming that path would resolve it again, later, and could expose a tree of their choosing at %s — which is the same defect as the symlink, one step further out. This run will not print a command that does that.\n' "$qtarget" "$qroot" >&2
-    printf 'ERROR: Move the data under a path only root can rebind — every directory from / down to it owned by root and carrying no group or other write bit, which /srv, /var/lib and /mnt normally are — and run the installer again; it will then print the bind-mount procedure.\n' >&2
-    return 0
-  fi
-  # THE IDENTITY THIS RUN SAW, so the operator can check that what got mounted is what was meant,
-  # and so the overlap questions below can be asked of inodes rather than of strings. A bind mount
-  # exposes the SAME directory at the new path, so this pair does not change under it.
-  #
-  # DEVICE AND INODE, TOGETHER AND IN ONE `stat` (o3d-secops r7 seventh pass, Codex MEDIUM). An
-  # inode number alone identifies a file only WITHIN one filesystem, and different filesystems reuse
-  # the low ones freely — so `stat -c %i` would be satisfied by a wrong source on another disk,
-  # which is exactly the mistake step 4 exists to catch. And a capture that FAILED used to print
-  # "that inode must be unknown", an instruction nobody can follow: it now prints no procedure at
-  # all rather than one that cannot be verified.
-  ident="$(stat -c '%d:%i' "$target" 2>/dev/null || true)"
-  if [[ -z "$ident" ]]; then
-    printf 'ERROR: BUT this run could not read the device and inode of %s, so it cannot give you a way to check that the bind mounted what you meant. It will not print a procedure you cannot verify. Look at that path by hand.\n' "$qtarget" >&2
-    return 0
-  fi
-  # AND IT MAY NOT BE — OR CONTAIN, OR LIE INSIDE — ANY ROOT THIS RUN WRITES INTO (o3d-secops r7
-  # seventh, eighth and ninth passes, Codex HIGH x3).
-  #
-  # THE FINDING. `/opt/one-two-inventory -> /opt` passes every question above: /opt's own name
-  # cannot be rebound by anybody but root. Binding /opt onto /opt/one-two-inventory would then be
-  # printed as the remedy — and the next installer run `rsync --delete`s and recursively chowns what
-  # it believes is the application directory, which is now the whole of /opt. The same shape gives
-  # /var/lib for ${DATA_DIR} and /var/log for ${LOG_DIR}, and the same shape ACROSS roots gives a
-  # ${DATA_DIR} bound onto ${APP_DIR}.
-  #
-  # THE ROOTS COME FROM ONE PLACE. publish_trust_root_candidates() is the table every publication
-  # already resolves against; it is byte-identical in all three entrypoints and it names every
-  # directory this run writes root-owned state into. ${LOG_DIR} is added because it is written too
-  # and is not a publication root, and an entrypoint that does not define it contributes an empty
-  # line the loop skips. A second list maintained beside that table is a list that goes stale, which
-  # is what a per-script one did: it existed in install.sh and in neither of the others, so the same
-  # refusal answered a different question depending on which script printed it.
-  #
-  # A CHECKED CAPTURE AND A HERE-STRING, never `< <(…)`: a process substitution has no status
-  # anybody can take, so a producer that died half-way through would be indistinguishable from one
-  # that listed every root — and here that is the difference between checking them all and silently
-  # checking none. Same rule the publisher and the crontab subsystem are held to.
-  # BOTH SPELLINGS NORMALISED ONCE, here, because every comparison below is a test on TEXT before it
-  # is a test on identity: repeated slashes collapsed, a trailing one dropped, an empty result
-  # restored to `/`.
-  nroot="/${root#/}"; while [[ "$nroot" == *//* ]]; do nroot="${nroot//\/\///}"; done; nroot="${nroot%/}"
-  ntarget="/${target#/}"; while [[ "$ntarget" == *//* ]]; do ntarget="${ntarget//\/\///}"; done; ntarget="${ntarget%/}"
-  [[ -n "$nroot" ]] || nroot="/"
-  [[ -n "$ntarget" ]] || ntarget="/"
-  # AND IT MAY NOT BE PART OF THE OPERATING SYSTEM (o3d-secops r7 tenth pass, Codex HIGH).
-  #
-  # THE FINDING. The table below names the roots this run PUBLISHES into; it is not an inventory of
-  # every root-owned tree the installer writes. `/opt/one-two-inventory -> /etc/systemd/system`
-  # is disjoint from every entry in it, has an ancestry only root can rebind, and would therefore
-  # have been handed a bind-mount procedure — after which the next run's `rsync -a --delete` and
-  # `chown -R` would operate on the host's unit tree. The same goes for /etc/nginx, /etc/apt,
-  # /etc/logrotate.d and /root/.ssh, each of which this script also writes.
-  #
-  # SO THE RULE IS STATED THE OTHER WAY ROUND, AS AN EXCLUSION, because an inventory of "every
-  # directory this installer might ever write" is a list that goes stale the next time a line is
-  # added — and the question an operator is really being asked is simpler than that: a bind source
-  # is a place data lives, not a part of the operating system. /srv, /mnt, /media, /opt, /var and
-  # /home stay available; the trees the distribution owns do not.
-  for other in / /bin /boot /dev /etc /lib /lib32 /lib64 /libx32 /proc /root /run /sbin /sys /usr /var/www; do
-    # `/` IS THE ENTRY THAT NEEDS THE GUARD: `${other%/}` empties it, and the pattern `/*` then
-    # matches every absolute path there is. Only exact equality means anything for the root of the
-    # filesystem, and every other entry keeps the prefix test.
-    if [[ "$ntarget" == "$other" || ( "$other" != "/" && "$ntarget" == "${other%/}/"* ) ]]; then
-      qother="$(printf '%q' "$other")" || qother="a system directory"
-      printf 'ERROR: BUT %s IS INSIDE %s, which belongs to the operating system and not to this application. Binding it onto %s would put a tree the distribution owns where the next run rsyncs, deletes and chowns. This run will not print a command that does that: point the link at a directory that holds data — under /srv, /mnt, /media, /opt, /var or /home — and run the installer again.\n' "$qtarget" "$qother" "$qroot" >&2
-      return 0
-    fi
-  done
-  keep="$(publish_trust_root_candidates)" || keep=""
-  keep="${keep}
-${LOG_DIR:-}"
-  while IFS= read -r other; do
-    [[ -n "$other" ]] || continue
-    nother="/${other#/}"; while [[ "$nother" == *//* ]]; do nother="${nother//\/\///}"; done; nother="${nother%/}"
-    [[ -n "$nother" ]] || nother="/"
-    # THE SPELLINGS FIRST, because they are free and they catch the ordinary case. A prefix test is
-    # a test on TEXT, so both sides are normalised: `//var/lib/app` and `/var/lib/app` are one
-    # directory to the kernel and two strings to `[[`. (A doubled slash in the MIDDLE never bypassed
-    # it — `*` spans the extra separator — but a LEADING one did.)
-    if [[ "$ntarget" == "$nother" || "$nother" == "${ntarget%/}/"* || "$ntarget" == "${nother%/}/"* ]]; then
-      qother="$(printf '%q' "$nother")" || qother=""
-      [[ -n "$qother" ]] || qother="a directory this run writes into"
-      printf 'ERROR: BUT %s MAY NOT BE BOUND ONTO %s: it is the same directory as %s, or one of the two lies inside the other. Binding a directory onto a tree this installer manages hands the next run far more than it should own — it would rsync and chown all of it — so this run will not print a command that does it.\n' "$qtarget" "$qroot" "$qother" >&2
-      return 0
-    fi
-    # AND THEN THE IDENTITIES, IN BOTH DIRECTIONS (o3d-secops r7 ninth pass, Codex HIGH). Two paths
-    # can be the same directory — or nested — while sharing no prefix at all: a bind mount already
-    # in place gives one directory two names, and the text above sees two unrelated strings. So the
-    # target is compared against every ancestor of this root, AND this root against every ancestor
-    # of the target. One direction alone misses the other. Both walks are bounded by the number of
-    # components in a pathname.
-    #
-    # THE ROOT BEING REPAIRED IS A SYMLINK, so its OWN identity is its target's and comparing the
-    # two would refuse every run there is. Its ANCESTORS are what a bind of the target would
-    # swallow, so its walk starts at its parent and it contributes no identity of its own.
-    if [[ "$nother" == "$nroot" ]]; then
-      anc="${nroot%/*}"; [[ -n "$anc" ]] || anc="/"
-      otherid=""
-    else
-      anc="$nother"
-      otherid="$(stat -c '%d:%i' "$nother" 2>/dev/null || true)"
-      # A ROOT THAT DOES NOT EXIST YET contributes nothing and is not an error: on a first install
-      # most of this table is names for directories section 8 has not created. A root that EXISTS
-      # and cannot be read is a different thing, and this run will not vouch for a comparison it
-      # could not make.
-      if [[ -z "$otherid" && -e "$nother" ]]; then
-        qother="$(printf '%q' "$nother")" || qother="a directory this run writes into"
-        printf 'ERROR: BUT this run could not read the device and inode of %s, which it also writes into, so it cannot prove that %s is a different directory. It will not print a procedure it cannot stand behind.\n' "$qother" "$qtarget" >&2
-        return 0
-      fi
-    fi
-    while :; do
-      if [[ -e "$anc" ]]; then
-        ancid="$(stat -c '%d:%i' "$anc" 2>/dev/null || true)"
-        if [[ -z "$ancid" ]]; then
-          qother="$(printf '%q' "$anc")" || qother="a directory above one this run writes into"
-          printf 'ERROR: BUT this run could not read the device and inode of %s, so it cannot prove that %s lies outside the trees it manages. It will not print a procedure it cannot stand behind.\n' "$qother" "$qtarget" >&2
-          return 0
-        fi
-        if [[ "$ancid" == "$ident" ]]; then
-          qother="$(printf '%q' "$anc")" || qother="a directory a managed root lies inside"
-          printf 'ERROR: BUT %s IS THE SAME DIRECTORY AS %s, reached by another name — through a bind mount or a mount alias rather than a shared path — and a tree this run writes into lies inside it. Binding it onto %s would hand this installer far more than it should own. This run will not print a command that does that.\n' "$qtarget" "$qother" "$qroot" >&2
-          return 0
-        fi
-      fi
-      [[ "$anc" != "/" ]] || break
-      anc="${anc%/*}"
-      [[ -n "$anc" ]] || anc="/"
-    done
-    if [[ -n "$otherid" ]]; then
-      anc="$ntarget"
-      while :; do
-        if [[ -e "$anc" ]]; then
-          ancid="$(stat -c '%d:%i' "$anc" 2>/dev/null || true)"
-          if [[ -z "$ancid" ]]; then
-            qother="$(printf '%q' "$anc")" || qother="a directory above the target"
-            printf 'ERROR: BUT this run could not read the device and inode of %s, so it cannot prove that the trees it manages lie outside %s. It will not print a procedure it cannot stand behind.\n' "$qother" "$qtarget" >&2
-            return 0
-          fi
-          if [[ "$ancid" == "$otherid" ]]; then
-            qother="$(printf '%q' "$nother")" || qother="a directory this run writes into"
-            printf 'ERROR: BUT %s LIES INSIDE %s, reached by another name — through a bind mount or a mount alias rather than a shared path — and that is a tree this run writes into. This run will not print a command that binds them together.\n' "$qtarget" "$qother" >&2
-            return 0
-          fi
-        fi
-        [[ "$anc" != "/" ]] || break
-        anc="${anc%/*}"
-        [[ -n "$anc" ]] || anc="/"
-      done
-    fi
-  done <<< "$keep"
-  # AND THE ONE THING THIS RUN CANNOT ESTABLISH IS SAID OUT LOUD, IMMEDIATELY ABOVE THE COMMANDS
-  # (o3d-secops r7 eleventh pass, Codex HIGH).
-  #
-  # THE FINDING, AND WHY IT IS ANSWERED THIS WAY. Every check above establishes that the target is
-  # not something this installer must never touch. NONE of them can establish the property that
-  # actually matters — that the target is DEDICATED to this root — because "a directory that holds
-  # nothing but this application's data" is not a question a filesystem can be asked. A denylist
-  # cannot converge on it either: /var/www was the eleventh path added to one, and there is always a
-  # twelfth. So the precondition is stated where it can be acted on, in the operator's own terms,
-  # naming the exact consequence, immediately above the command that has it — which is the same
-  # answer every other unprovable precondition in these scripts gets.
-  printf 'ERROR: BEFORE YOU RUN ANY OF THIS: %s must hold NOTHING BUT this application'"'"'s data. After the bind, every later run of this installer treats it as %s — it rsyncs into it with --delete and it chowns it recursively to %s. Anything else living there is deleted or taken over. If you are not certain, move this application'"'"'s data into a directory of its own first and bind THAT.\n' "$qtarget" "$qroot" "${APP_USER:-the service account}" >&2
-  printf 'ERROR: Do it with the writers stopped, in this order:\n' >&2
-  printf 'ERROR:   1. stop the application service, and pause any cron that writes under %s\n' "$qroot" >&2
-  printf 'ERROR:   2. this run resolved that link to: %s   (device:inode %s) — confirm that is where the data is\n' "$qtarget" "$ident" >&2
-  printf 'ERROR:   3. rm %s && mkdir -p %s && mount --bind %s %s\n' "$qroot" "$qroot" "$qtarget" "$qroot" >&2
-  printf 'ERROR:   4. verify BOTH: findmnt -no TARGET,SOURCE %s   must name %s, and: stat -c %%d:%%i %s   must print %s. If the mount did not take, or either differs, put the link back at once: umount %s 2>/dev/null; rmdir %s && ln -s %s %s\n' "$qroot" "$qroot" "$qroot" "$ident" "$qroot" "$qroot" "$qtarget" "$qroot" >&2
-  # /etc/fstab HAS ITS OWN ESCAPING, AND IT IS NOT THE SHELL'S. Fields are split on whitespace and
-  # a space, tab or backslash is written as an octal escape; `printf %q`'s answer would be read by
-  # mount as a literal backslash.
-  froot="${root//\\/\\134}"; froot="${froot// /\\040}"; froot="${froot//$'\t'/\\011}"
-  ftarget="${target//\\/\\134}"; ftarget="${ftarget// /\\040}"; ftarget="${ftarget//$'\t'/\\011}"
-  # A NEWLINE ENDS AN fstab RECORD AND A `#` BEGINS A COMMENT, and neither has an escape in that
-  # format — `\040`, `\011`, `\012` and `\134` are the whole vocabulary. A path containing either
-  # cannot be written into /etc/fstab at all, so it gets a sentence instead of a line to paste.
-  if [[ "$root" == *$'\n'* || "$target" == *$'\n'* || "$root" == *"#"* || "$target" == *"#"* ]]; then
-    printf 'ERROR:   5. one of these paths contains a newline or a "#", which /etc/fstab cannot express — make the bind persistent with a systemd .mount unit instead, then start the service again\n' >&2
+  # THE RESOLVED TARGET IS A DIAGNOSTIC, AND IT IS STILL QUOTED. It is no longer part of a command
+  # anybody is told to paste, but it is still a value an account this script does not trust can
+  # name: a newline in it would forge an ERROR line of its own, and a control byte would corrupt
+  # the terminal it is printed to. `printf %q` is a bash builtin over a value this function already
+  # holds; its status is taken, and a value it cannot quote is simply not printed.
+  if [[ -z "$target" ]]; then
+    printf 'ERROR: This run could not resolve that link at all — it is dangling, or a directory on the way to its target cannot be read. Fix or remove it by hand; this run will not guess what it was meant to point at.\n' >&2
   else
-    printf 'ERROR:   5. add: %s %s none bind 0 0   to /etc/fstab so the bind survives a reboot, then start the service again\n' "$ftarget" "$froot" >&2
+    qtarget="$(printf '%q' "$target")" || qtarget=""
+    if [[ -z "$qtarget" ]]; then
+      printf 'ERROR: This run could not render that link'"'"'s target safely for a terminal, so it is not printed here. Read it with: readlink -f -- THE-LINK\n' >&2
+    else
+      printf 'ERROR: This run resolved that link to: %s\n' "$qtarget" >&2
+    fi
   fi
+  # AND THE PROCEDURE IS IN THE DOCUMENTATION, NOT ON THIS SCREEN (o3d-secops r8, Codex HIGH).
+  #
+  # THE FINDING, AND WHY IT IS ANSWERED BY DELETION. This function used to print a five-step
+  # `rm && mkdir -p && mount --bind` recipe, gated by a growing apparatus whose only job was to
+  # decide whether the recipe was safe to print: an ancestry walk over the target, a device/inode
+  # capture, a system-directory exclusion, and containment checks in both directions against every
+  # root these scripts write into.
+  #
+  # THAT APPARATUS PRODUCED A FINDING IN EVERY REVIEW IT SURVIVED — a fail-open descriptor
+  # acquisition, an ancestry gate that proved an adjacent property, a fail-open identity capture, an
+  # identity that was not globally unique, and finally the recipe itself: `rm ROOT && mkdir -p ROOT
+  # && mount --bind TARGET ROOT`, printed for ${LOG_DIR} among others — whose /var/log parent THIS
+  # SAME SCRIPT recognises as group-writable and non-sticky, so the `syslog` account can take the
+  # name between the `rm` and the `mount` and the operator binds their disk onto somebody else's
+  # directory entry. Five findings from one operator convenience.
+  #
+  # SO IT IS DELETED, NOT HARDENED AGAIN. The precondition the recipe rests on — that the target
+  # holds nothing but this application's data — is not a question a filesystem can be asked, so no
+  # amount of checking here reaches it; and a sequence that must be weighed against the operator's
+  # own parent directory, their own target and their own service state is a sequence that belongs
+  # where a human reads it and decides, not in a copy-pasteable block printed by a program that has
+  # just said it cannot prove the thing the block depends on.
+  #
+  # NOTHING IS LOST BUT THE PASTE. The substance is kept in full in docs/installation.md: the
+  # precondition, the order the writers must be stopped in, the checks to make on the target and on
+  # every directory above it, the identity check to make after the mount, the command that puts the
+  # link back if the mount does not take, and the /etc/fstab line.
+  printf 'ERROR: THE BIND-MOUNT PROCEDURE IS IN THE DOCUMENTATION, NOT ON THIS SCREEN: docs/installation.md, "Putting a state root on another disk". It is not printed here because it cannot be pasted safely without checks only you can make: the target must hold NOTHING BUT this application'"'"'s data, every directory from / down to it must be one only root can replace, and the parent of this root may not be. The documentation names all of those, the order to stop the writers in, the identity check to make after the mount, how to put the link back if the mount does not take, and the /etc/fstab line.\n' >&2
+  return 0
 }
 
 pin_dir_beneath_root() {
@@ -3660,49 +3485,54 @@ require_real_service_root() {
   case "${kind}" in
     directory)
       SERVICE_ROOT_APPROVED["${root}"]="${answer#*|}"
-      # ON A HOST WITH /proc THE DESCRIPTOR IS MANDATORY, AND EVERY WAY OF NOT GETTING ONE IS FATAL
-      # (o3d-secops r7 fifth pass, Codex HIGH). It was written to fall through — a failed walk, a
-      # failed open, a failed verification all left the run going with no descriptor, and
-      # enter_service_root() then entered by name, which is precisely the state the descriptor was
-      # introduced to leave. Worse, it was REACHABLE: an account that can write /var/log can rename
-      # the entry aside for the instant of the open and put it back, and the installer would carry
-      # on in the weaker mode without saying so. A guarantee that an attacker can switch off is not
-      # a guarantee, so each step below either succeeds or ends the run.
-      if [[ -d /proc/self/fd ]]; then
-        # THE DESCRIPTOR, OPENED FROM INSIDE THE PINNED PARENT. The walk runs a second time here —
-        # the open has to happen where the shell is standing in the parent, and the answer above
-        # came out of a subshell that has already gone. A second walk can land on a different entry
-        # than the first if somebody renamed in between; the `dev:ino` comparison below catches
-        # that, and a refusal is the right outcome either way.
-        saved="$(pwd -P)" || die "this run cannot establish its own working directory. Nothing has been changed."
-        pin_service_root_parent "${root}" || die \
-          "${root} — ${what} — could not be resolved from \`/\` a second time, to open a descriptor on it: a directory on the way changed while this run was walking it. Nothing has been changed."
-        [[ -d "${base}" ]] || die \
-          "${root} — ${what} — was a directory a moment ago and is not one now, so this run cannot open a descriptor on it. Nothing has been changed."
-        # THE FAILURE IS TAKEN EXPLICITLY, NOT LEFT TO `set -e` (o3d-secops r7 sixth pass, Codex
-        # MEDIUM). A bare `exec {fd}< …` whose redirection fails ends a non-interactive shell only
-        # BECAUSE errexit is on — measured, not assumed: without it bash prints its message, leaves
-        # ${fd} unset and CARRIES ON. Resting a fail-closed guarantee on an ambient shell option is
-        # resting it on something a caller can change and a harness does not share, so the status is
-        # taken here. `||` also suspends errexit for the left-hand command, which is what lets this
-        # `die` be the diagnostic instead of bash's one-liner.
-        exec {fd}< "${base}" || die \
-          "${root} — ${what} — could not be opened to hold a descriptor on it: the open was refused (a permission this run does not have, or a process-wide file-descriptor limit). This run will not carry on identifying it by name. Nothing has been changed."
-        # `-L`, WHICH IS THE ONE PLACE IN THESE SCRIPTS THAT WANTS IT. /proc/self/fd/N is a magic
-        # link, and every other `stat` here is deliberately an lstat — so without `-L` this compares
-        # the inode of the /proc entry against the inode of a directory and never matches, which is
-        # a descriptor silently not taken rather than a refusal. It was written that way first.
-        [[ "$(stat -L -c '%d:%i' "/proc/self/fd/${fd}" 2>/dev/null || true)" == "${answer#*|}" ]] || die \
-          "${root} — ${what} — is not the directory this run had just checked: the entry at that name was replaced between the check and the descriptor this run opened on it. This run refuses rather than holding a descriptor on something else; nothing has been changed."
-        SERVICE_ROOT_FD["${root}"]="${fd}"
-        cd "${saved}" || die "this run could not return to ${saved} after checking ${root}. Nothing further has been changed."
-      else
-        # SAID OUT LOUD, ONCE. Without /proc there is no way to name an open directory, so the run
-        # continues on the `dev:ino` comparison alone — which is what this stood on before the
-        # descriptor and is still stronger than the pathname it replaced. An operator who sees this
-        # on Debian or Ubuntu has a broken container, not a supported configuration.
-        warn "/proc is not mounted, so this run cannot hold a descriptor on ${root} and will identify it by device and inode instead. That is weaker: inode numbers are reused. Mount /proc."
-      fi
+      # THE DESCRIPTOR IS MANDATORY, AND EVERY WAY OF NOT GETTING ONE IS FATAL — INCLUDING A
+      # MISSING /proc (o3d-secops r7 fifth pass, Codex HIGH; r8 thirteenth pass, Codex MEDIUM).
+      #
+      # It was written to fall through — a failed walk, a failed open, a failed verification all
+      # left the run going with no descriptor, and enter_service_root() then entered by name, which
+      # is precisely the state the descriptor was introduced to leave. Worse, it was REACHABLE: an
+      # account that can write /var/log can rename the entry aside for the instant of the open and
+      # put it back, and the installer would carry on in the weaker mode without saying so. A
+      # guarantee that an attacker can switch off is not a guarantee, so each step below either
+      # succeeds or ends the run.
+      #
+      # AND THE LAST WAY OF NOT GETTING ONE WAS THE ABSENCE OF /proc ITSELF, which was skipped with
+      # a `warn` and left the entry to be taken by NAME later — the fifth fail-open in this round's
+      # own hardening, and the one the code's own comment explains is unsafe. There is no way to
+      # name an open directory without /proc, so there is no weaker mode to fall back to that is
+      # worth having: a `dev:ino` pair is a claim about an inode NUMBER, and inode numbers are
+      # reused. A hardened environment without /proc is not a supported install for a script whose
+      # every root-side write is aimed through a descriptor, and refusing is the honest outcome —
+      # it arrives at the PRE-FLIGHT gate, before anything has been created, migrated or started.
+      [[ -d /proc/self/fd ]] || die \
+        "/proc is not mounted, so this run cannot hold a descriptor on ${root} — ${what} — and would have to identify it by name. That is the defect this gate exists to remove: a name can be renamed between the check and the write, and a device/inode pair is a number the kernel reuses. Mount /proc and run this again. NOTHING has been created, nothing has been migrated and nothing has been started."
+      # THE DESCRIPTOR, OPENED FROM INSIDE THE PINNED PARENT. The walk runs a second time here —
+      # the open has to happen where the shell is standing in the parent, and the answer above
+      # came out of a subshell that has already gone. A second walk can land on a different entry
+      # than the first if somebody renamed in between; the `dev:ino` comparison below catches
+      # that, and a refusal is the right outcome either way.
+      saved="$(pwd -P)" || die "this run cannot establish its own working directory. Nothing has been changed."
+      pin_service_root_parent "${root}" || die \
+        "${root} — ${what} — could not be resolved from \`/\` a second time, to open a descriptor on it: a directory on the way changed while this run was walking it. Nothing has been changed."
+      [[ -d "${base}" ]] || die \
+        "${root} — ${what} — was a directory a moment ago and is not one now, so this run cannot open a descriptor on it. Nothing has been changed."
+      # THE FAILURE IS TAKEN EXPLICITLY, NOT LEFT TO `set -e` (o3d-secops r7 sixth pass, Codex
+      # MEDIUM). A bare `exec {fd}< …` whose redirection fails ends a non-interactive shell only
+      # BECAUSE errexit is on — measured, not assumed: without it bash prints its message, leaves
+      # ${fd} unset and CARRIES ON. Resting a fail-closed guarantee on an ambient shell option is
+      # resting it on something a caller can change and a harness does not share, so the status is
+      # taken here. `||` also suspends errexit for the left-hand command, which is what lets this
+      # `die` be the diagnostic instead of bash's one-liner.
+      exec {fd}< "${base}" || die \
+        "${root} — ${what} — could not be opened to hold a descriptor on it: the open was refused (a permission this run does not have, or a process-wide file-descriptor limit). This run will not carry on identifying it by name. Nothing has been changed."
+      # `-L`, WHICH IS THE ONE PLACE IN THESE SCRIPTS THAT WANTS IT. /proc/self/fd/N is a magic
+      # link, and every other `stat` here is deliberately an lstat — so without `-L` this compares
+      # the inode of the /proc entry against the inode of a directory and never matches, which is
+      # a descriptor silently not taken rather than a refusal. It was written that way first.
+      [[ "$(stat -L -c '%d:%i' "/proc/self/fd/${fd}" 2>/dev/null || true)" == "${answer#*|}" ]] || die \
+        "${root} — ${what} — is not the directory this run had just checked: the entry at that name was replaced between the check and the descriptor this run opened on it. This run refuses rather than holding a descriptor on something else; nothing has been changed."
+      SERVICE_ROOT_FD["${root}"]="${fd}"
+      cd "${saved}" || die "this run could not return to ${saved} after checking ${root}. Nothing further has been changed."
       return 0
       ;;
     absent)    SERVICE_ROOT_APPROVED["${root}"]="absent"       ; return 0 ;;
@@ -3813,11 +3643,15 @@ enter_service_root() {
   # The entry check above has already established that the NAME still leads here, which is the other
   # half: without it this would happily chown a directory the deployment no longer refers to.
   # A MISSING DESCRIPTOR IS A REFUSAL, NOT PERMISSION TO ENTER BY NAME (o3d-secops r7 fifth pass,
-  # Codex HIGH). On a host with /proc the gate is required to have taken one, so its absence here
-  # means either a bug in this script or a run that has been downgraded — and entering by name on
-  # the strength of a `dev:ino` is exactly the state the descriptor exists to leave. The by-name
-  # branch is reachable only where there is no /proc to name a descriptor with, which the gate has
-  # already warned about.
+  # Codex HIGH). The gate is required to have taken one — it now DIES on a host with no /proc
+  # rather than warning and going on (r8 thirteenth pass, Codex MEDIUM) — so its absence here means
+  # a bug in this script or a run that has been downgraded, and entering by name on the strength of
+  # a `dev:ino` is exactly the state the descriptor exists to leave.
+  #
+  # AND THERE IS NO BY-NAME BRANCH LEFT TO FALL INTO. There used to be one, guarded by
+  # `[[ -d /proc/self/fd ]]`, for the host the gate had only warned about; with the gate refusing
+  # that host the branch was unreachable in a real run and reachable in a mutated one, which is the
+  # worst of both. The condition that decides how this enters is now the descriptor itself.
   if [[ "${approved}" == "absent" ]]; then
     # THIS RUN'S OWN `mkdir` MADE IT, a moment ago, in the parent this walk pinned — there is no
     # earlier descriptor to enter through, and the inode and `..` checks below are what establish
@@ -3825,14 +3659,11 @@ enter_service_root() {
     # calls that come later.
     cd -P "${base}" 2>/dev/null || die \
       "${root} — ${what} — could not be entered after this run created it. Nothing has been changed."
-  elif [[ -d /proc/self/fd ]]; then
+  else
     [[ -n "${fd}" ]] || die \
-      "${root} — ${what} — has no descriptor from this run's pre-flight check, and this host has /proc, so there should be one. This run will not fall back to entering it by name: that is the weaker identity the descriptor replaced. Nothing has been changed."
+      "${root} — ${what} — has no descriptor from this run's pre-flight check, and every supported host has one. This run will not fall back to entering it by name: that is the weaker identity the descriptor replaced. Nothing has been changed."
     cd "/proc/self/fd/${fd}" 2>/dev/null || die \
       "${root} — ${what} — could not be entered through the descriptor this run opened for it at pre-flight; the directory it names has been removed. Nothing has been changed."
-  else
-    cd -P "${base}" 2>/dev/null || die \
-      "${root} — ${what} — could not be entered after this run accepted it. Nothing has been changed."
   fi
   # THE TWO IDENTITY CHECKS, of `.` and of `..`, both answered by the kernel for the inode this
   # process is inside rather than by re-resolving a name.
@@ -3846,13 +3677,13 @@ enter_service_root() {
     # it — because the next call for the same root (the ownership change below is one) must be held
     # to this same directory, and by then the name is no more trustworthy than any other.
     SERVICE_ROOT_APPROVED["${root}"]="${landed}"
-    # AND THE DESCRIPTOR ON IT IS MANDATORY HERE TOO (o3d-secops r7 fifth pass, Codex HIGH): a root
-    # this run created and could not hold open is a root the next call would have to reach by name.
-    if [[ -d /proc/self/fd ]]; then
-      exec {newfd}< . || die \
-        "${root} — ${what} — was created by this run but could not be opened to hold a descriptor on it: the open was refused (a permission this run does not have, or a process-wide file-descriptor limit). The calls that follow would have to reach it by name, which is the weaker identity this replaced, so this run stops instead. Nothing further has been changed."
-      SERVICE_ROOT_FD["${root}"]="${newfd}"
-    fi
+    # AND THE DESCRIPTOR ON IT IS MANDATORY HERE TOO (o3d-secops r7 fifth pass, Codex HIGH), with
+    # no `[[ -d /proc/self/fd ]]` around it any more (r8 thirteenth pass, Codex MEDIUM): a root this
+    # run created and could not hold open is a root the next call would have to reach by name, and
+    # the gate has already refused the host that has no /proc to name it with.
+    exec {newfd}< . || die \
+      "${root} — ${what} — was created by this run but could not be opened to hold a descriptor on it: the open was refused (a permission this run does not have, or a process-wide file-descriptor limit). The calls that follow would have to reach it by name, which is the weaker identity this replaced, so this run stops instead. Nothing further has been changed."
+    SERVICE_ROOT_FD["${root}"]="${newfd}"
   else
     # AND IT IS THE VERY ENTRY THE GATE APPROVED. A rename in a group-writable parent needs no
     # symlink and no privilege, and every structural check above passes on the replacement: it is a
