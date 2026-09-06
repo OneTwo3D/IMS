@@ -1132,6 +1132,14 @@ export function invoicePaymentNotQueuedDescription(params: {
  * Reachable pinned and unpinned, so it takes a redrive like its neighbours. `amount` is the EXACT
  * decimal as a string and never a `number`: this message exists because the number is wrong, and
  * `toFixed(2)` on it would print the very figure the refusal is about.
+ *
+ * IT STATES THE FACT AND NOTHING ELSE (o3d-0bfh r13). The first draft of this ended "register this
+ * receipt in the ledger by hand, or split it", which the r13 structural guard caught and was right
+ * to: what a human should do here depends on the redrive state, not on the refusal, and on the
+ * deferred path a payment keyed into the accounting package's own UI carries no request id and could
+ * not be deduplicated against the registration that is still owed. `invoicePaymentRemedyNote` is the
+ * one place that decides. What belongs here is the part that IS a property of this refusal: that it
+ * is terminal for this figure, so nobody re-records it expecting a different answer.
  */
 export function invoicePaymentAmountNotRepresentableDescription(params: {
   orderReference: string
@@ -1141,9 +1149,9 @@ export function invoicePaymentAmountNotRepresentableDescription(params: {
 }): string {
   return `Recorded ${params.currency} ${params.amount} against ${params.orderReference}, but that amount `
     + `cannot be stated exactly as the number the accounting connector's payment call takes — it is `
-    + `large enough that the nearest value the format can hold differs from it — so NOTHING was sent `
-    + `and no registration was queued. IMS will not send a figure it would have to misstate. Register `
-    + `this receipt in the ledger by hand, or split it into amounts the connector can state. `
+    + `large enough that the nearest value that format can hold is a different figure — so NOTHING was `
+    + `sent and no registration was queued. IMS will not move money it would have to misstate. This is `
+    + `terminal for this figure: recording the same amount again is refused again for the same reason. `
     + invoicePaymentRemedyNote(params.redrive)
 }
 

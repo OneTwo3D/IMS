@@ -18,7 +18,10 @@ import { Prisma } from '@/app/generated/prisma/client'
  *   1. the queued payload CARRIES the exact decimal string, and it is the stored `Decimal(18, 4)`
  *      receipt rather than a re-rendering of the double beside it;
  *   2. an amount whose two forms would disagree is REFUSED — nothing queued, an operator message
- *      naming the hand remedy, and the deferred obligation retained.
+ *      that names the exact figure and says the refusal is terminal for it, and the deferred
+ *      obligation retained. The REMEDY in that message comes from `invoicePaymentRemedyNote` and not
+ *      from the refusal, which is the o3d-0bfh r13 rule: on the deferred path hand settlement is
+ *      refused, because a payment keyed into the accounting package's own UI carries no request id.
  *
  * (2) is the backstop the string cannot provide: the connectors state a payment's amount as a JSON
  * NUMBER on the wire, so an amount no double names has no honest figure to send however exactly the
@@ -198,10 +201,17 @@ test('[o3d-1xq8] an amount no JSON number can state is REFUSED, not sent as the 
   assert.equal(refusal.metadata.amount, '549755813888.0008')
   assert.equal(refusal.metadata.asNumber, 549755813888.0009,
     'PRECONDITION: and the number it declined to send is the minor unit too high')
-  // The operator message names the figure and the hand remedy.
+  // The operator message names the EXACT figure, says nothing was sent, and says the refusal is
+  // terminal for it — so nobody re-records the same amount expecting a different answer.
   assert.match(refusal.description, /549755813888\.0008/)
   assert.match(refusal.description, /NOTHING was sent/)
-  assert.match(refusal.description, /by hand/)
+  assert.match(refusal.description, /terminal for this figure/)
+  // AND THE REMEDY COMES FROM `invoicePaymentRemedyNote`, NOT FROM THIS MESSAGE (o3d-0bfh r13). This
+  // is the deferred path, where hand settlement is REFUSED: a payment keyed into the accounting
+  // package's own UI carries no request id and could not be deduplicated against the registration
+  // this obligation still owes. A refusal message that licensed one here would be the r13 defect.
+  assert.match(refusal.description, /HAND SETTLEMENT IS REFUSED HERE/)
+  assert.doesNotMatch(refusal.description, /register (the|this) (receipt|payment) in \w+ by hand/i)
 
   // AND THE OBLIGATION IS RETAINED. A refused receipt is not a settled one: the connector keeps the
   // marker so the deferred pass can come back for it, exactly as it does for every other refusal here.
