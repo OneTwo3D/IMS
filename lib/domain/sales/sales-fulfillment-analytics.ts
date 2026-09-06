@@ -1111,15 +1111,87 @@ function customerGroupKey(row: Pick<CustomerReportRow, 'customerId' | 'customerN
 }
 
 /**
- * ONE FIELD OF A LABEL: a present value CSV-quoted, an absent one a token no present value can be.
+ * THE CHARACTERS A RENDERED LABEL CANNOT SHOW, so the label spells them out instead (r6).
+ *
+ * A label is only an identifier once the OPERATOR can tell two of them apart, and the operator sees
+ * HTML: this notice reaches them through `ReportPageTitle` -> `TooltipContent`, which is
+ * `whitespace-normal`. HTML COLLAPSES WHITESPACE. A tab, a newline, a form feed and a run of spaces
+ * all arrive as ONE space; a zero-width or bidi format character arrives as nothing at all; and
+ * NBSP and the fixed-width spaces arrive looking exactly like the ordinary space they are not.
+ *
+ * So round 5's escaping was injective in the STRING and not in what is SEEN, which is the property
+ * that was wanted. Two emailless guests named `Acme Ltd` and `Acme\nLtd` are two Map keys and two
+ * distinct raw labels — and rendered they were ONE label: the collision this labelling exists to
+ * remove, surviving one layer further out.
+ *
+ * Every character below is therefore emitted as a visible ASCII escape rather than raw. The
+ * ordinary U+0020 is the one exception and is emitted as itself, because a label an operator cannot
+ * read against the Customer column is no better than one they cannot tell apart — but only where it
+ * is a LONE space: a second consecutive space is escaped too, since `A  B` and `A B` render alike.
+ */
+function rendersInvisiblyOrCollapses(codePoint: number): boolean {
+  return (
+    codePoint <= 0x1f // C0 controls, including TAB, LF, FF and CR
+    || (codePoint >= 0x7f && codePoint <= 0x9f) // DEL and the C1 controls
+    || codePoint === 0xa0 // NO-BREAK SPACE
+    || codePoint === 0xad // SOFT HYPHEN
+    || codePoint === 0x61c // ARABIC LETTER MARK
+    || codePoint === 0x1680 // OGHAM SPACE MARK
+    || codePoint === 0x180e // MONGOLIAN VOWEL SEPARATOR
+    || (codePoint >= 0x2000 && codePoint <= 0x200f) // EN QUAD..RLM, including ZWSP/ZWNJ/ZWJ
+    || (codePoint >= 0x2028 && codePoint <= 0x202f) // line/para separators, bidi embedding, NNBSP
+    || (codePoint >= 0x205f && codePoint <= 0x206f) // MMSP, word joiner, invisible operators, isolates
+    || codePoint === 0x3000 // IDEOGRAPHIC SPACE
+    || codePoint === 0xfeff // ZERO WIDTH NO-BREAK SPACE (BOM)
+    || (codePoint >= 0xfff9 && codePoint <= 0xfffb) // interlinear annotation controls
+    || codePoint === 0xe0001 // LANGUAGE TAG
+    || (codePoint >= 0xe0020 && codePoint <= 0xe007f) // the invisible TAG block
+  )
+}
+
+/** The three escapes a reader already knows; everything else is spelled by code point. */
+const NAMED_LABEL_ESCAPES: ReadonlyMap<number, string> = new Map([
+  [0x09, '\\t'],
+  [0x0a, '\\n'],
+  [0x0d, '\\r'],
+])
+
+function visibleLabelEscape(codePoint: number): string {
+  return NAMED_LABEL_ESCAPES.get(codePoint)
+    ?? (codePoint <= 0xffff
+      ? `\\u${codePoint.toString(16).padStart(4, '0')}`
+      : `\\u{${codePoint.toString(16)}}`)
+}
+
+/**
+ * ONE FIELD OF A LABEL: a present value quoted and escaped, an absent one a token no present value
+ * can be — and the escaping chosen so the field stays injective AFTER it is rendered (r5, r6).
  *
  * `<none>` is unquoted and every present value is quoted, so the two live in disjoint spaces: a
  * customer whose stored email is literally `<none>` renders `email="<none>"` and is still not the
- * customer who has no email at all. That is the whole of the round-5 fix — see below for why a
- * sentinel drawn from the value space could not do it.
+ * customer who has no email at all. That is the whole of the round-5 fix — a sentinel drawn from
+ * the value space could not do it, because a value can hold it.
+ *
+ * Round 6 adds the escapes above. A backslash doubles, so an escape sequence in the output can only
+ * have come from the character it names and never from a name that spells it; a quote doubles,
+ * CSV-style, so a reader tracking quote state can still find the field boundaries. The encoding is
+ * per character and uniquely decodable, and its output contains no character HTML collapses or
+ * hides — so injective-as-a-string and injective-as-rendered are the same statement here.
  */
 function labelField(value: string | null | undefined): string {
-  return value == null ? '<none>' : `"${value.replaceAll('"', '""')}"`
+  if (value == null) return '<none>'
+  let encoded = ''
+  let previousWasLoneSpace = false
+  for (const char of value) {
+    const codePoint = char.codePointAt(0)!
+    if (char === '\\') encoded += '\\\\'
+    else if (char === '"') encoded += '""'
+    else if (char === ' ' && !previousWasLoneSpace) encoded += ' '
+    else if (char === ' ' || rendersInvisiblyOrCollapses(codePoint)) encoded += visibleLabelEscape(codePoint)
+    else encoded += char
+    previousWasLoneSpace = char === ' ' && !previousWasLoneSpace
+  }
+  return `"${encoded}"`
 }
 
 /**
@@ -1152,6 +1224,10 @@ function labelField(value: string | null | undefined): string {
  * points at — three fields that are matched against the row on screen. `group=` is the identity the
  * other three were read from, printed in a form that is readable rather than opaque (`cust-1`, or
  * `guest-email:…` / `guest-name:…`), so it names the row too instead of only separating it.
+ *
+ * AND INJECTIVE WHERE IT IS READ, NOT ONLY WHERE IT IS BUILT. `labelField` escapes whitespace and
+ * invisible characters as well as quotes, because the notice is rendered as collapsing HTML and a
+ * label that is distinct only before rendering is not distinct to the operator — see it for why.
  *
  * QUOTED CSV-STYLE, WITH INNER QUOTES DOUBLED. Entries are separated by `; ` because a company name
  * may contain a comma — and it may contain a semicolon too, at which point an unquoted list is a
@@ -1559,7 +1635,7 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
       // Named separately, and only when there is one: it is the cause an operator has to ACT on,
       // and the only one of the three that will still be here next month if nobody does.
       ...(inconsistentCustomers.length > 0
-        ? [`${inconsistentCustomers.length} of ${groups.size} customers are withheld as INCONSISTENT rather than incomplete: an in-period dispatch carries COGS entries for more units than the movement moved, which the FIFO engine cannot produce. What is proven here is the QUANTITY — the costed quantity exceeds the quantity that moved. Nothing here is proven about the MONEY: this check compares CogsEntry.qty against the movement and never reads CogsEntry.totalCostBase. Duplicate entries are the usual cause, and duplicate entries MAY have duplicated posted cost along with the quantity — or may carry the excess at no cost at all, in which case every cost total is already right. Which of the two it is has not been measured, here or anywhere this report shows. Read the entries against the dispatch before altering any posted cost. Either way nothing further will ship to resolve this; it stands until somebody corrects the entries. ${namedInconsistentCustomers(inconsistentCustomers)}`]
+        ? [`${inconsistentCustomers.length} of ${groups.size} customers are withheld as INCONSISTENT rather than incomplete: an in-period dispatch carries COGS entries for more units than the movement moved, which the FIFO engine cannot produce. What is proven here is the QUANTITY — the costed quantity exceeds the quantity that moved. Nothing here is proven about the MONEY: this check compares CogsEntry.qty against the movement and never reads CogsEntry.totalCostBase. The monetary correctness of those entries is UNMEASURED — here, and anywhere else this report shows. Duplicate entries are the usual cause of the excess quantity. Read the entries against the dispatch before altering any posted cost. Nothing further will ship to resolve this; it stands until somebody corrects the entries. ${namedInconsistentCustomers(inconsistentCustomers)}`]
         : []),
       'Non-inventory lines — services, fees, delivery charges — book no stock movement and post no cost, so they are not asked to show a dispatch and an order made only of them is fully costed at zero. A variable-parent line is not exempt: goods do leave for it and cannot be traced to it, so its cost is unknown and the order is withheld.',
       REFUND_BASIS_NOTICE_CUSTOMER_MIX,
