@@ -3472,24 +3472,45 @@ require_real_service_root() {
   case "${kind}" in
     directory)
       SERVICE_ROOT_APPROVED["${root}"]="${answer#*|}"
-      # THE DESCRIPTOR, OPENED FROM INSIDE THE PINNED PARENT. The walk runs a second time here, in
-      # a subshell of its own — the open has to happen where the shell is standing in the parent,
-      # and the answer above came out of a subshell that has already gone. A second walk can land
-      # on a different entry than the first if somebody renamed in between; that is exactly what
-      # the `dev:ino` comparison below catches, and a refusal is the right outcome either way.
-      saved="$(pwd -P)" || die "this run cannot establish its own working directory. Nothing has been changed."
-      if pin_service_root_parent "${root}" && exec {fd}< "${base}"; then
+      # ON A HOST WITH /proc THE DESCRIPTOR IS MANDATORY, AND EVERY WAY OF NOT GETTING ONE IS FATAL
+      # (o3d-secops r7 fifth pass, Codex HIGH). It was written to fall through — a failed walk, a
+      # failed open, a failed verification all left the run going with no descriptor, and
+      # enter_service_root() then entered by name, which is precisely the state the descriptor was
+      # introduced to leave. Worse, it was REACHABLE: an account that can write /var/log can rename
+      # the entry aside for the instant of the open and put it back, and the installer would carry
+      # on in the weaker mode without saying so. A guarantee that an attacker can switch off is not
+      # a guarantee, so each step below either succeeds or ends the run.
+      if [[ -d /proc/self/fd ]]; then
+        # THE DESCRIPTOR, OPENED FROM INSIDE THE PINNED PARENT. The walk runs a second time here —
+        # the open has to happen where the shell is standing in the parent, and the answer above
+        # came out of a subshell that has already gone. A second walk can land on a different entry
+        # than the first if somebody renamed in between; the `dev:ino` comparison below catches
+        # that, and a refusal is the right outcome either way.
+        saved="$(pwd -P)" || die "this run cannot establish its own working directory. Nothing has been changed."
+        pin_service_root_parent "${root}" || die \
+          "${root} — ${what} — could not be resolved from \`/\` a second time, to open a descriptor on it: a directory on the way changed while this run was walking it. Nothing has been changed."
+        [[ -d "${base}" ]] || die \
+          "${root} — ${what} — was a directory a moment ago and is not one now, so this run cannot open a descriptor on it. Nothing has been changed."
+        # A REDIRECTION FAILURE ON `exec` ENDS A NON-INTERACTIVE SHELL, by bash's own rule and
+        # whatever surrounds it — so EMFILE, EACCES and a root that vanished between the test above
+        # and this line all stop the run, with bash's message. That is the outcome this block wants;
+        # what it must never do is carry on.
+        exec {fd}< "${base}"
         # `-L`, WHICH IS THE ONE PLACE IN THESE SCRIPTS THAT WANTS IT. /proc/self/fd/N is a magic
         # link, and every other `stat` here is deliberately an lstat — so without `-L` this compares
         # the inode of the /proc entry against the inode of a directory and never matches, which is
         # a descriptor silently not taken rather than a refusal. It was written that way first.
-        if [[ "$(stat -L -c '%d:%i' "/proc/self/fd/${fd}" 2>/dev/null || true)" == "${answer#*|}" ]]; then
-          SERVICE_ROOT_FD["${root}"]="${fd}"
-        else
-          exec {fd}<&-
-        fi
+        [[ "$(stat -L -c '%d:%i' "/proc/self/fd/${fd}" 2>/dev/null || true)" == "${answer#*|}" ]] || die \
+          "${root} — ${what} — is not the directory this run had just checked: the entry at that name was replaced between the check and the descriptor this run opened on it. This run refuses rather than holding a descriptor on something else; nothing has been changed."
+        SERVICE_ROOT_FD["${root}"]="${fd}"
+        cd "${saved}" || die "this run could not return to ${saved} after checking ${root}. Nothing further has been changed."
+      else
+        # SAID OUT LOUD, ONCE. Without /proc there is no way to name an open directory, so the run
+        # continues on the `dev:ino` comparison alone — which is what this stood on before the
+        # descriptor and is still stronger than the pathname it replaced. An operator who sees this
+        # on Debian or Ubuntu has a broken container, not a supported configuration.
+        warn "/proc is not mounted, so this run cannot hold a descriptor on ${root} and will identify it by device and inode instead. That is weaker: inode numbers are reused. Mount /proc."
       fi
-      cd "${saved}" || die "this run could not return to ${saved} after checking ${root}. Nothing further has been changed."
       return 0
       ;;
     absent)    SERVICE_ROOT_APPROVED["${root}"]="absent"       ; return 0 ;;
@@ -3599,12 +3620,27 @@ enter_service_root() {
   # a rename cannot move it and a delete-and-recreate that recycles the inode cannot impersonate it.
   # The entry check above has already established that the NAME still leads here, which is the other
   # half: without it this would happily chown a directory the deployment no longer refers to.
-  if [[ -n "${fd}" && -d "/proc/self/fd/${fd}" ]]; then
+  # A MISSING DESCRIPTOR IS A REFUSAL, NOT PERMISSION TO ENTER BY NAME (o3d-secops r7 fifth pass,
+  # Codex HIGH). On a host with /proc the gate is required to have taken one, so its absence here
+  # means either a bug in this script or a run that has been downgraded — and entering by name on
+  # the strength of a `dev:ino` is exactly the state the descriptor exists to leave. The by-name
+  # branch is reachable only where there is no /proc to name a descriptor with, which the gate has
+  # already warned about.
+  if [[ "${approved}" == "absent" ]]; then
+    # THIS RUN'S OWN `mkdir` MADE IT, a moment ago, in the parent this walk pinned — there is no
+    # earlier descriptor to enter through, and the inode and `..` checks below are what establish
+    # that the name still leads to what was created. The descriptor is opened afterwards, for the
+    # calls that come later.
+    cd -P "${base}" 2>/dev/null || die \
+      "${root} — ${what} — could not be entered after this run created it. Nothing has been changed."
+  elif [[ -d /proc/self/fd ]]; then
+    [[ -n "${fd}" ]] || die \
+      "${root} — ${what} — has no descriptor from this run's pre-flight check, and this host has /proc, so there should be one. This run will not fall back to entering it by name: that is the weaker identity the descriptor replaced. Nothing has been changed."
     cd "/proc/self/fd/${fd}" 2>/dev/null || die \
-      "${root} — ${what} — could not be entered through the descriptor this run opened for it at pre-flight. Nothing has been changed."
+      "${root} — ${what} — could not be entered through the descriptor this run opened for it at pre-flight; the directory it names has been removed. Nothing has been changed."
   else
     cd -P "${base}" 2>/dev/null || die \
-      "${root} — ${what} — could not be entered after this run created or accepted it. Nothing has been changed."
+      "${root} — ${what} — could not be entered after this run accepted it. Nothing has been changed."
   fi
   # THE TWO IDENTITY CHECKS, of `.` and of `..`, both answered by the kernel for the inode this
   # process is inside rather than by re-resolving a name.
@@ -3618,7 +3654,12 @@ enter_service_root() {
     # it — because the next call for the same root (the ownership change below is one) must be held
     # to this same directory, and by then the name is no more trustworthy than any other.
     SERVICE_ROOT_APPROVED["${root}"]="${landed}"
-    if exec {newfd}< .; then SERVICE_ROOT_FD["${root}"]="${newfd}"; fi
+    # AND THE DESCRIPTOR ON IT IS MANDATORY HERE TOO (o3d-secops r7 fifth pass, Codex HIGH): a root
+    # this run created and could not hold open is a root the next call would have to reach by name.
+    if [[ -d /proc/self/fd ]]; then
+      exec {newfd}< .
+      SERVICE_ROOT_FD["${root}"]="${newfd}"
+    fi
   else
     # AND IT IS THE VERY ENTRY THE GATE APPROVED. A rename in a group-writable parent needs no
     # symlink and no privilege, and every structural check above passes on the replacement: it is a

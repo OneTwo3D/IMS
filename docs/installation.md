@@ -1353,8 +1353,13 @@ The gate also **opens a descriptor** on an approved root and holds it for the ru
 enters through `/proc/self/fd/N` — which the kernel resolves to the open file rather than to a
 pathname. A `dev:ino` alone would not be enough: inode numbers are reused, so an account that can
 write the parent could remove an empty approved root, create its own at the name, and win if the
-filesystem handed back the inode it had just freed. (A host without `/proc` falls back to entering
-by name with the `dev:ino` comparison.) The ownership change itself is `chown -Rh … .` and not
+filesystem handed back the inode it had just freed. Acquiring that descriptor is **mandatory** on a host with `/proc`: a
+failed walk, a failed open or a verification that does not match ends the run, and a missing
+descriptor at section 8 is a refusal rather than permission to enter by name. (A host with no
+`/proc` at all — a broken container, not a supported configuration — says so out loud and falls back
+to the `dev:ino` comparison.) Fail-open here would be worse than not trying: an account that can
+write `/var/log` could rename the entry aside for the instant of the open and switch the weaker mode
+on at will. The ownership change itself is `chown -Rh … .` and not
 `find … -exec chown`: coreutils walks with `fchownat(AT_SYMLINK_NOFOLLOW)` relative to descriptors
 it holds, whereas `find -exec` enumerates pathnames that are resolved again afterwards — and `-h`
 protects only the final component, so a descendant directory swapped for a symlink in between would

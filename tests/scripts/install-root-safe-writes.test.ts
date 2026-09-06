@@ -5002,10 +5002,13 @@ function entryWithout(disable: { identity?: boolean, landing?: boolean, descript
     neuter('[[ -n "${landed}" && "${landed}" == "${entry#*|}" ]]')
   }
   if (disable.descriptor) {
-    const branch = '  if [[ -n "${fd}" && -d "/proc/self/fd/${fd}" ]]; then'
+    // THE ENTRY'S OWN `/proc` test, not the one in the absent branch a few lines below it — both
+    // read `if [[ -d /proc/self/fd ]]; then`, so the line that follows is what tells them apart.
+    const branch = '  elif [[ -d /proc/self/fd ]]; then\n    [[ -n "${fd}" ]] || die'
     assert.ok(body.includes(branch), `precondition: the shipped entry must enter through the descriptor: ${body}`)
-    body = body.replace(branch, '  if false; then')
+    body = body.replace(branch, '  elif false; then\n    [[ -n "${fd}" ]] || die')
     assert.ok(body.includes('cd -P "${base}"'), 'and must still have the by-name fallback to fall into')
+    assert.ok(!body.includes(branch), 'and the descriptor branch must be unreachable after the mutation')
   }
   return body
 }
@@ -5387,4 +5390,86 @@ test('[o3d-secops] the gate does not depend on the language the machine speaks',
   assert.deepEqual(unforced, [],
     'every `stat -c %F` whose answer is compared against an English file-type description must be '
     + 'run with LC_ALL=C, or the comparison is a statement about the operator\'s language')
+})
+
+test('[o3d-secops] a descriptor the gate cannot take ends the run, rather than downgrading it silently', (t) => {
+  /**
+   * THE FAIL-OPEN THIS CLOSES. The gate used to fall through every way of not getting a descriptor
+   * — a second walk that failed, an open that failed, a verification that did not match — and
+   * enter_service_root() then entered by name, which is the state the descriptor was introduced to
+   * leave. And it was REACHABLE: an account that can write `/var/log` can rename the entry aside
+   * for the instant of the open and put it back, so the weaker mode was something an attacker could
+   * switch on. A guarantee that can be switched off is not a guarantee.
+   *
+   * FORCED DETERMINISTICALLY, not raced: mode 000 on the root makes `open(O_RDONLY)` fail with
+   * EACCES for its own unprivileged owner, while `lstat` — which is what the gate's first walk uses
+   * — still succeeds. So the gate gets its answer, cannot get its descriptor, and must stop.
+   */
+  const base = createTempDirSync('ims-secops-fdfail-', t)
+  const varlog = join(base, 'var-log')
+  mkdirSync(varlog)
+  const root = join(varlog, 'ims')
+  mkdirSync(root)
+  writeFileSync(join(root, 'MARKER'), 'untouched\n')
+  chmodSync(root, 0o000)
+  t.after(() => { try { chmodSync(root, 0o755) } catch { /* already gone */ } })
+
+  // PRECONDITION, MEASURED: the harness really cannot open it, and really can still lstat it.
+  assert.equal(lstatSync(root).isDirectory(), true, 'lstat must still work, or this test forces the wrong failure')
+  assert.throws(() => readdirSync(root), 'and the open must really fail for this uid')
+
+  const run = runBash(rig([...ROOT_ENTER], [
+    `require_real_service_root ${q(root)} "the log directory"`,
+    `echo ${REACHED}`,
+  ].join('\n')))
+
+  assert.notEqual(run.status, 0, `the gate must not return success without a descriptor: ${run.stdout} ${run.stderr}`)
+  assert.ok(!run.stdout.includes(REACHED),
+    'and must not go on to the rest of the run — a run that continued here would enter the root by name')
+
+  // NOT VACUOUS: the same gate over the same directory, readable, takes its descriptor and returns.
+  chmodSync(root, 0o755)
+  const ok = runBash(rig([...ROOT_ENTER], [
+    `require_real_service_root ${q(root)} "the log directory"`,
+    `echo "fd=${'${SERVICE_ROOT_FD[' + JSON.stringify(root) + ']-none}'}"`,
+    `echo ${REACHED}`,
+  ].join('\n')))
+  assert.equal(ok.status, 0, `a readable root must pass: ${ok.stderr}`)
+  assert.ok(ok.stdout.includes(REACHED))
+  assert.match(ok.stdout, /^fd=\d+$/m, `and the gate must have recorded a descriptor: ${ok.stdout}`)
+})
+
+test('[o3d-secops] an approved root with no descriptor is refused at the entry, not entered by name', (t) => {
+  /**
+   * The other half of the same rule, and the one that makes a downgrade anywhere else in the run
+   * harmless: enter_service_root() treats a missing descriptor on a /proc host as a refusal. The
+   * downgrade is staged directly — the gate runs, and its record is then cleared — because what is
+   * being measured is the entry's response to it, not how it might come about.
+   */
+  const base = createTempDirSync('ims-secops-nofd-', t)
+  const varlog = join(base, 'var-log')
+  mkdirSync(varlog)
+  const root = join(varlog, 'ims')
+  mkdirSync(root)
+  writeFileSync(join(root, 'MARKER'), 'untouched\n')
+
+  const script = (clear: boolean) => rig([...ROOT_ENTER], [
+    `require_real_service_root ${q(root)} "the log directory"`,
+    ...(clear ? [`unset 'SERVICE_ROOT_FD[${root}]'`] : []),
+    `enter_service_root ${q(root)} 022 "the log directory"`,
+    'chmod 0770 .',
+    `echo ${REACHED}`,
+  ].join('\n'))
+
+  const downgraded = runBash(script(true))
+  assert.equal(downgraded.status, 1, `a missing descriptor must be refused: ${downgraded.stderr}`)
+  assert.ok(!downgraded.stdout.includes(REACHED))
+  assert.match(downgraded.stderr, /has no descriptor from this run's pre-flight check/, downgraded.stderr)
+  assert.equal(statSync(root).mode & 0o777, 0o755, 'and nothing may be changed on the way to refusing')
+
+  // NOT VACUOUS: the identical script WITHOUT the downgrade runs to the end and does the work.
+  const ok = runBash(script(false))
+  assert.equal(ok.status, 0, `the ordinary path must still run: ${ok.stderr}`)
+  assert.ok(ok.stdout.includes(REACHED))
+  assert.equal(statSync(root).mode & 0o777, 0o770, 'and reach the operation it was refusing above')
 })
