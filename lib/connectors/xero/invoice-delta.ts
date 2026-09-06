@@ -6,7 +6,12 @@
  */
 
 import { coversDocumentTotal } from '@/lib/domain/accounting/paid-coverage'
-import { toDecimal, type Decimal } from '@/lib/domain/math/decimal'
+import {
+  currencyMinorUnits,
+  FINEST_SUPPORTED_MINOR_UNITS,
+  toDecimal,
+  type Decimal,
+} from '@/lib/domain/math/decimal'
 
 import type { XeroResponse } from './api'
 
@@ -35,6 +40,14 @@ export type XeroInvoice = {
    */
   AmountPaid?: number | string
   AmountDue?: number | string
+  /**
+   * The currency the two amounts above are denominated in, as Xero states it (`"GBP"`, `"KWD"`).
+   *
+   * IT IS READ FOR ONE REASON: the minor unit is what sizes the magnitude above which those amounts
+   * stop surviving JSON transport — see `ledgerAmountMagnitudeBound`. Optional because the fixtures
+   * predate it, and an unstated currency is given the STRICTEST reading rather than a default one.
+   */
+  CurrencyCode?: string
   /**
    * The payments the ledger CURRENTLY HOLDS against this invoice, each carrying the id Xero issued
    * when it created it. Returned by the Invoices LIST endpoint — the same response shape
@@ -893,6 +906,117 @@ const LEDGER_AMOUNT_GRAMMAR = /^[+-]?\d+(?:\.\d+)?$/
  * saying it holds nothing, i.e. from the reversal itself.
  */
 /**
+ * An ISO-4217 code out of a payload field, or NULL when the field does not carry one.
+ *
+ * Shared by both connectors so "what currency is this document in" has ONE answer: Xero states it as
+ * `CurrencyCode: "GBP"`, QuickBooks as `CurrencyRef: { value: "GBP" }`, and the two unwrappings differ
+ * while the validation must not. Anything that is not three letters is NULL rather than a guess — the
+ * rules built on the result are all written about that null, and all of them take it as "be stricter".
+ */
+export function ledgerCurrencyCode(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const code = value.trim().toUpperCase()
+  return /^[A-Z]{3}$/.test(code) ? code : null
+}
+
+/** The currency of the amounts on one Xero invoice, or NULL when the payload did not state it. */
+export function xeroInvoiceCurrency(invoice: XeroInvoice): string | null {
+  return ledgerCurrencyCode(invoice.CurrencyCode)
+}
+
+/**
+ * o3d-psrx r14 (Codex HIGH) — THE MAGNITUDE AT WHICH ONE MINOR UNIT STOPS SURVIVING `Response.json()`.
+ *
+ * r13 guarded every conversion this module performs. It could not guard the one performed BEFORE this
+ * module sees anything: both connector clients read their bodies with `Response.json()`, so a JSON
+ * numeric token has ALREADY become an IEEE-754 double by the time `parseLedgerAmount` is handed it.
+ * No round trip taken afterwards can see that loss — the double round-trips to itself perfectly, and
+ * the digits that went missing went missing in the parser.
+ *
+ * Codex's pair is the demonstration: in CLF (four decimals) `1649267441664` and `1649267441663.9999`
+ * are DIFFERENT amounts that `JSON.parse` returns as the SAME double. Subtract that from a total and
+ * the difference is an exact zero, which every guard here accepts and which is the one verdict
+ * (`HOLDS_NOTHING`) that clears `paidAt`, re-arms Mark Paid over a supplier payment that was made, or
+ * raises a sales chargeback against a document the ledger is still accounting for.
+ *
+ * THE ANSWER IS NOT "NO INVOICE IS THAT BIG". That is an expectation, and nothing in this repository
+ * enforces it: the column these amounts land in is `numeric(18,4)`, which holds up to
+ * 99,999,999,999,999.9999 — comfortably above the point where the loss starts in every currency this
+ * repository supports. An expectation that is never checked is exactly the shape of defect this branch
+ * has now closed five times. So the bound is ENFORCED: above it the amount is not readable, and an
+ * amount that is not readable is REFUSED, never clamped and never rounded. It joins `"0x64"` and
+ * `"0." + "0".repeat(399) + "1"` as a figure this reader answers NULL to, and NULL WITHHOLDS.
+ *
+ * DERIVED, NOT TABULATED. It is a property of two things this code already knows — the currency's
+ * minor unit and the width of a double's significand — so it is computed from them rather than
+ * written down per currency. A hand-written table of thresholds is a list somebody must keep in step
+ * with `currencyMinorUnits`, and a list that drifts is how the minor unit stopped being respected in
+ * the first place. The derivation:
+ *
+ *   - a double's significand is 53 bits, so within the binade [2^e, 2^(e+1)) the representable values
+ *     are spaced exactly 2^(e-52) apart;
+ *   - a `d`-decimal currency's minor unit is 10^-d;
+ *   - two amounts one minor unit apart can only be guaranteed to land on DIFFERENT doubles while that
+ *     spacing is no wider than the minor unit itself: 2^(e-52) <= 10^-d. The moment the spacing
+ *     EXCEEDS the minor unit, some pair of adjacent minor-unit amounts shares a double — that is a
+ *     pigeonhole, not a rounding accident, so "possible" is the only honest reading of it;
+ *   - so the bound is the start of the first binade where that fails, i.e. 2^(E+1) for the largest E
+ *     with 2^E * 10^d <= 2^52.
+ *
+ * The last line is computed in BigInt, exactly, because it is a statement about binary and decimal
+ * integers and evaluating it in the floating point it is describing would be circular. It yields:
+ *
+ *   2 decimals  2^46 =     70,368,744,177,664   (measured: 70368744177664.01 and .02 share a double)
+ *   3 decimals  2^43 =      8,796,093,022,208   (BHD, IQD, JOD, KWD, LYD, OMR, TND)
+ *   4 decimals  2^39 =        549,755,813,888   (CLF, UYW)
+ *   0 decimals  2^53 =  9,007,199,254,740,992   (JPY, KRW, ISK … the familiar integer limit)
+ *
+ * WHAT THE REFUSAL COSTS: nothing that exists. The smallest of these bounds is 549 billion CLF, and
+ * the two-decimal bound is seventy trillion units of an ordinary currency. No document any connector
+ * in this repository has ever seen comes within many orders of magnitude of them, so this refusal is
+ * UNREACHABLE IN PRACTICE. It is here so that the bound is ENFORCED rather than ASSUMED — the whole
+ * point of the finding — and the cost of it firing is the mildest one available: the document is
+ * reported as an amount the ledger did not state, and its reversal is withheld for a human.
+ *
+ * NOTE WHAT IS STILL NOT COVERED. This bounds the MAGNITUDE at which a minor unit stops being
+ * distinguishable. It does not make the decoding lossless, so a payload whose own digits are finer
+ * than its currency's minor unit — a four-decimal figure in a two-decimal currency — is still read
+ * through a double. That residual is o3d-39jg, the lossless decoder, and it is what remains of this
+ * finding after the bound.
+ */
+const magnitudeBoundCache = new Map<number, number>()
+
+/** 2^52 — the spacing of doubles at 1.0 is 2^-52, which is the only IEEE-754 fact this needs. */
+const DOUBLE_SIGNIFICAND_SCALE = (() => {
+  let value = BigInt(1)
+  for (let bit = 0; bit < 52; bit += 1) value *= BigInt(2)
+  return value
+})()
+
+export function ledgerAmountMagnitudeBound(currency: string | null): number {
+  // An unstated currency takes the FINEST supported precision, which yields the SMALLEST bound and so
+  // the strictest refusal — the same direction `ledgerAmountEpsilon` resolves a null currency in.
+  const digits = currency == null ? FINEST_SUPPORTED_MINOR_UNITS : currencyMinorUnits(currency)
+  const cached = magnitudeBoundCache.get(digits)
+  // Memoised on the DIGITS, not written down per currency: this is the derivation's own result being
+  // reused, so there is no second place for a threshold to drift out of step with `currencyMinorUnits`.
+  if (cached !== undefined) return cached
+  // 10^digits, in exact integers. `2^e * 10^d <= 2^52` is the whole rule, rearranged so that both
+  // sides are integers and no part of the test is evaluated in the arithmetic it is describing.
+  let minorUnitScale = BigInt(1)
+  for (let digit = 0; digit < digits; digit += 1) minorUnitScale *= BigInt(10)
+  let exponent = -1
+  let nextPower = BigInt(1)
+  while (nextPower * minorUnitScale <= DOUBLE_SIGNIFICAND_SCALE) {
+    exponent += 1
+    nextPower *= BigInt(2)
+  }
+  const bound = Math.pow(2, exponent + 1)
+  magnitudeBoundCache.set(digits, bound)
+  return bound
+}
+
+/**
  * o3d-psrx r12 (Codex HIGH 1), generalised in r13 (Codex HIGH 2) — A DECIMAL READ AS A `number`, OR
  * NULL BECAUSE THE `number` WOULD NOT SAY WHAT THE DECIMAL SAID.
  *
@@ -922,15 +1046,32 @@ const LEDGER_AMOUNT_GRAMMAR = /^[+-]?\d+(?:\.\d+)?$/
  *
  * NULL IS A REFUSAL AND NEVER A ZERO, wherever it is returned — see `parseLedgerAmount` below and
  * `QboLedgerAmount.paid`, both of which withhold on it.
+ *
+ * o3d-psrx r14 (Codex HIGH) — AND THE MAGNITUDE BOUND, WHICH THE ROUND TRIP CANNOT SEE. The check
+ * below asks whether THIS Decimal survives conversion; it cannot ask whether the value arrived
+ * intact, because a double that lost digits inside `Response.json()` round-trips to itself perfectly.
+ * `ledgerAmountMagnitudeBound` is the independent question, and `currency` is required rather than
+ * optional so that no call site can quietly opt out of it — a guard that one caller may omit is a
+ * guard the next conversion does not get, which is the same reason this is a function at all.
  */
-export function readDecimalAsNumber(decimal: Decimal): number | null {
+export function readDecimalAsNumber(decimal: Decimal, currency: string | null): number | null {
   const parsed = decimal.toNumber()
   if (!Number.isFinite(parsed)) return null
+  // REFUSED, not clamped: above this magnitude the figure's own minor unit is not representable, so
+  // there is no number here to spend and no honest rounding of one.
+  if (decimal.abs().gte(ledgerAmountMagnitudeBound(currency))) return null
   return toDecimal(parsed).equals(decimal) ? parsed : null
 }
 
-export function parseLedgerAmount(value: unknown): number | null {
-  if (typeof value === 'number') return Number.isFinite(value) ? value : null
+export function parseLedgerAmount(value: unknown, currency: string | null): number | null {
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) return null
+    // o3d-psrx r14 (Codex HIGH) — THE ARM THE FINDING IS ABOUT. A JSON numeric token reaches here as
+    // a double that `Response.json()` has already rounded, and no test applied to the double can
+    // recover what it rounded away. What CAN be established is whether a value of this size is one
+    // whose minor unit survives that rounding at all; above the bound it is not, so it is refused.
+    return Math.abs(value) < ledgerAmountMagnitudeBound(currency) ? value : null
+  }
   if (typeof value === 'string') {
     const trimmed = value.trim()
     if (!LEDGER_AMOUNT_GRAMMAR.test(trimmed)) return null
@@ -942,7 +1083,7 @@ export function parseLedgerAmount(value: unknown): number | null {
     // partition, in `QboLedgerAmount`, in `QboLedgerEvidence` and in the activity metadata those
     // verdicts are written into. That is a change to two connectors' public readings. One comparison
     // at every conversion refuses every lossy one, which is what the finding asks for.
-    return readDecimalAsNumber(toDecimal(trimmed))
+    return readDecimalAsNumber(toDecimal(trimmed), currency)
   }
   return null
 }
@@ -1015,7 +1156,7 @@ export function partitionPaymentReversals(
     }
     if (invoice.Status !== 'AUTHORISED') continue
 
-    const amountPaid = parseLedgerAmount(invoice.AmountPaid)
+    const amountPaid = parseLedgerAmount(invoice.AmountPaid, xeroInvoiceCurrency(invoice))
     if (amountPaid === null) {
       unverifiable.push(invoice)
       continue

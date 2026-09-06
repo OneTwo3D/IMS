@@ -13,6 +13,7 @@ import {
   readPaidProvenanceVerdicts,
 } from '@/lib/domain/accounting/payment-reversal'
 import {
+  ledgerCurrencyCode,
   parseLedgerAmount,
   readDecimalAsNumber,
   zeroPaidIsProvenReversal,
@@ -22,6 +23,7 @@ import {
 import {
   compareDecimal,
   currencyMinorUnits,
+  FINEST_SUPPORTED_MINOR_UNITS,
   subtractMoney,
   toDecimal,
   type Decimal,
@@ -116,10 +118,14 @@ type QboAmountRow = { Id: string; Balance?: unknown; TotalAmt?: unknown; Currenc
 type QboParsedLedgerRow = { total: number | null; balance: number | null; currency: string | null }
 
 function parseQboLedgerRow(row: QboAmountRow): QboParsedLedgerRow {
+  // o3d-psrx r14: the currency is read FIRST because the amount reader needs it — the magnitude above
+  // which a figure's own minor unit cannot survive `Response.json()` is a property of that minor unit,
+  // and it is the bound `parseLedgerAmount` refuses on.
+  const currency = parseQboCurrency(row.CurrencyRef)
   return {
-    total: parseLedgerAmount(row.TotalAmt),
-    balance: parseLedgerAmount(row.Balance),
-    currency: parseQboCurrency(row.CurrencyRef),
+    total: parseLedgerAmount(row.TotalAmt, currency),
+    balance: parseLedgerAmount(row.Balance, currency),
+    currency,
   }
 }
 
@@ -137,9 +143,9 @@ function parseQboCurrency(value: unknown): string | null {
     : typeof (value as { value?: unknown } | null)?.value === 'string'
       ? (value as { value: string }).value
       : null
-  if (raw == null) return null
-  const code = raw.trim().toUpperCase()
-  return /^[A-Z]{3}$/.test(code) ? code : null
+  // The UNWRAPPING is QuickBooks-shaped; the VALIDATION is not, and is shared with Xero's reading of
+  // `CurrencyCode` so that "is this an ISO-4217 code" has one answer across both connectors.
+  return ledgerCurrencyCode(raw)
 }
 
 /**
@@ -170,7 +176,7 @@ function qboLedgerAmountFrom(parsed: QboParsedLedgerRow): QboLedgerAmount {
     outstanding: balance,
     // Decimal, not float: `100.1 - 0.1` is 100.00000000000001 in IEEE-754, and this figure is
     // compared against a threshold small enough for a four-decimal currency to see that.
-    paid: total === null || balance === null ? null : readDecimalAsNumber(subtractMoney(total, balance)),
+    paid: total === null || balance === null ? null : readDecimalAsNumber(subtractMoney(total, balance), currency),
     currency,
   }
 }
@@ -225,8 +231,6 @@ function qboVoidedAmount(currency: string | null): QboLedgerAmount {
  * can only move a document from `HOLDS_NOTHING` into a verdict that WITHHOLDS. So an unstated
  * currency is given the finest precision this repository supports.
  */
-const FINEST_SUPPORTED_MINOR_UNITS = 4
-
 export function ledgerAmountEpsilon(currency: string | null): Decimal {
   const digits = currency == null ? FINEST_SUPPORTED_MINOR_UNITS : currencyMinorUnits(currency)
   // Half of 10^-digits, written exactly rather than computed in binary floating point.

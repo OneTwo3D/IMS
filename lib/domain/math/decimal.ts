@@ -70,6 +70,21 @@ export function currencyMinorUnits(currency: string): number {
   return currencyPrecision(currency)
 }
 
+/**
+ * The finest minor-unit precision this repository supports — CLF and UYW at four decimals.
+ *
+ * IT IS THE STRICTEST SETTING AND THAT IS WHY IT IS THE ANSWER FOR AN UNSTATED CURRENCY. Every rule
+ * derived from the minor unit gets HARSHER as the unit gets finer: the "holds nothing" epsilon
+ * shrinks, and the magnitude above which a minor unit stops surviving JSON transport falls. So a
+ * payload that does not say what currency it is in is read with this precision, and both rules then
+ * fail in the direction that WITHHOLDS rather than the one that declares a payment gone.
+ *
+ * Exported from here, beside `currencyMinorUnits`, because two connectors need the same answer and
+ * the alternative is the same number written down twice — which is the failure mode this branch has
+ * closed repeatedly.
+ */
+export const FINEST_SUPPORTED_MINOR_UNITS = 4
+
 function currencyPrecision(currency: string): number {
   const normalizedCurrency = currency.trim().toUpperCase()
   if (!normalizedCurrency) return 2

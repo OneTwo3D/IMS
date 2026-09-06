@@ -58,6 +58,7 @@ import {
   idsWhere,
   listedLedgerPaymentIds,
   parseLedgerAmount,
+  xeroInvoiceCurrency,
   partitionPaymentReversals,
   zeroPaidIsProvenReversal,
   type LedgerReadFence,
@@ -166,8 +167,16 @@ async function notifyReversalAdmins(
  */
 type WithheldAmountReason = 'part-payment' | 'amount-not-stated' | 'zero-paid-unproven'
 
-function ledgerAmountText(value: unknown): string {
-  const parsed = parseLedgerAmount(value)
+/**
+ * One of an invoice's two stated amounts, as text — or the sentence that says Xero did not state it.
+ *
+ * o3d-psrx r14: it takes the INVOICE and the FIELD NAME rather than the value, so the currency the
+ * amount is read against always comes from the same document the amount came from. Passing the two
+ * separately would make a mismatched pair expressible, and the currency is what sizes the magnitude
+ * bound `parseLedgerAmount` refuses on.
+ */
+function ledgerAmountText(invoice: XeroInvoice | undefined, field: 'AmountPaid' | 'AmountDue'): string {
+  const parsed = invoice == null ? null : parseLedgerAmount(invoice[field], xeroInvoiceCurrency(invoice))
   return parsed === null ? 'an amount Xero did not state' : parsed.toFixed(2)
 }
 
@@ -462,7 +471,7 @@ async function readResidualVerdicts<T extends {
     }
 
     const reason: WithheldAmountReason =
-      parseLedgerAmount(invoice.AmountPaid) === null ? 'amount-not-stated' : 'part-payment'
+      parseLedgerAmount(invoice.AmountPaid, xeroInvoiceCurrency(invoice)) === null ? 'amount-not-stated' : 'part-payment'
     if (verdict.verdict === 'GONE') {
       out.provenGone.set(invoice.InvoiceID, { doc, invoice, paymentIds: verdict.paymentIds })
     } else {
@@ -503,8 +512,8 @@ function billWithheldDescription(bill: WithheldBillDoc, invoice: XeroInvoice, re
   switch (reason) {
     case 'part-payment':
       return `Bill for PO ${bill.po.reference} is ${invoice.Status} in Xero (not fully paid), but the ledger `
-        + `still holds a payment of ${ledgerAmountText(invoice.AmountPaid)} against it with `
-        + `${ledgerAmountText(invoice.AmountDue)} still due. That is a PART payment, NOT a reversal, so `
+        + `still holds a payment of ${ledgerAmountText(invoice, 'AmountPaid')} against it with `
+        + `${ledgerAmountText(invoice, 'AmountDue')} still due. That is a PART payment, NOT a reversal, so `
         + `paidAt was left set: clearing it would re-arm Mark Paid over a supplier payment that has `
         + `already been made, and pressing it again would pay the supplier twice. Settle the balance in `
         + `Xero, or correct the bill total in IMS.`
@@ -552,8 +561,8 @@ async function signalWithheldBillReversals(
           registrationVerdict: verdict.verdict,
           accountingInvoiceId: invoice.InvoiceID,
           xeroStatus: invoice.Status,
-          amountPaid: parseLedgerAmount(invoice.AmountPaid),
-          amountDue: parseLedgerAmount(invoice.AmountDue),
+          amountPaid: parseLedgerAmount(invoice.AmountPaid, xeroInvoiceCurrency(invoice)),
+          amountDue: parseLedgerAmount(invoice.AmountDue, xeroInvoiceCurrency(invoice)),
         },
         resolveUser: false,
       },
@@ -585,7 +594,7 @@ function salesWithheldDescription(
   // registration would send an operator to /sync to wait for something that has already happened.
   if (verdict.verdict === 'PART_COVERED_OFF_LEDGER') {
     return `Invoice for order ${ref} is ${invoice.Status} in Xero showing `
-      + `${ledgerAmountText(invoice.AmountPaid)} paid, which normally means a payment was removed. `
+      + `${ledgerAmountText(invoice, 'AmountPaid')} paid, which normally means a payment was removed. `
       + `paidAt was LEFT SET and NO chargeback credit note was raised: the payment registration(s) IMS `
       + `raised for this order `
       + `${verdict.registeredTotal == null
@@ -598,7 +607,7 @@ function salesWithheldDescription(
   }
   if (verdict.verdict === 'RECEIPT_NOT_REGISTERED') {
     return `Invoice for order ${ref} is ${invoice.Status} in Xero showing `
-      + `${ledgerAmountText(invoice.AmountPaid)} paid, which normally means a payment was removed. `
+      + `${ledgerAmountText(invoice, 'AmountPaid')} paid, which normally means a payment was removed. `
       + `paidAt was LEFT SET and NO chargeback credit note was raised: IMS has recorded a receipt `
       + `against this order that it has never registered with Xero, so the ledger is short by a `
       + `payment IMS never sent rather than by one that was taken away. Unwinding revenue here would `
@@ -607,8 +616,8 @@ function salesWithheldDescription(
   switch (reason) {
     case 'part-payment':
       return `Invoice for order ${ref} is ${invoice.Status} in Xero (not fully paid), but the ledger still `
-        + `holds a payment of ${ledgerAmountText(invoice.AmountPaid)} against it with `
-        + `${ledgerAmountText(invoice.AmountDue)} still due. That is a PART payment, NOT a reversal, so `
+        + `holds a payment of ${ledgerAmountText(invoice, 'AmountPaid')} against it with `
+        + `${ledgerAmountText(invoice, 'AmountDue')} still due. That is a PART payment, NOT a reversal, so `
         + `paidAt was left set and NO chargeback credit note was raised — unwinding revenue against a `
         + `payment the ledger is still holding would be wrong. Settle the balance in Xero, or correct `
         + `the order total in IMS.`
@@ -657,8 +666,8 @@ async function signalWithheldSalesReversals(
           accountingInvoiceId: invoice.InvoiceID,
           xeroStatus: invoice.Status,
           orderStatus: order.status,
-          amountPaid: parseLedgerAmount(invoice.AmountPaid),
-          amountDue: parseLedgerAmount(invoice.AmountDue),
+          amountPaid: parseLedgerAmount(invoice.AmountPaid, xeroInvoiceCurrency(invoice)),
+          amountDue: parseLedgerAmount(invoice.AmountDue, xeroInvoiceCurrency(invoice)),
         },
         resolveUser: false,
       },
@@ -1255,7 +1264,7 @@ async function processDeltaChunk(
             + (billResidual.provenGone.has(bill.accountingInvoiceId ?? '')
               // Named, because this is the case an amount reading calls a part payment: the ledger is
               // still holding money against this bill — just not ours.
-              ? ` The payment IMS registered (${billResidual.provenGone.get(bill.accountingInvoiceId ?? '')?.paymentIds.join(', ')}) is no longer among the payments Xero lists on this invoice, though the invoice still shows ${ledgerAmountText(invoiceById.get(bill.accountingInvoiceId ?? '')?.AmountPaid)} paid — that residual payment is somebody else's, not the one IMS made.`
+              ? ` The payment IMS registered (${billResidual.provenGone.get(bill.accountingInvoiceId ?? '')?.paymentIds.join(', ')}) is no longer among the payments Xero lists on this invoice, though the invoice still shows ${ledgerAmountText(invoiceById.get(bill.accountingInvoiceId ?? ''), 'AmountPaid')} paid — that residual payment is somebody else's, not the one IMS made.`
               : ''),
           resolveUser: false,
         })
