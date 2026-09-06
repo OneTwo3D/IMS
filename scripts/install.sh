@@ -3095,13 +3095,38 @@ pin_dir_beneath_root() {
 # to root. `%d` is in the same stat so the same answer also proves the rename below is a rename
 # and not a dereferencing cross-device copy.
 #
+# AND THE DESTINATION IS A DESCRIPTOR, NOT `..` (o3d-secops r19, Codex CRITICAL). Until this round
+# the publication was `mv -T "$tmp" "../${base}"` and the final barrier was `fsync_path ..`, on the
+# argument that `..` is the kernel's own parent link and so cannot be redirected by renaming any
+# NAME above it. That argument is true, and it is not the whole argument, because `..` is a
+# property of WHERE THE STAGING DIRECTORY IS — it is re-read at every syscall, and a staging
+# directory moved WHOLESALE into another parent takes `../${base}` with it. What actually stopped
+# that move was never written down: `rename(2)` of a directory into a DIFFERENT parent requires
+# write permission on the directory being moved, and the staging directory is root-owned 0700, so
+# ${APP_USER} gets EACCES. The publication's safety therefore rested on the staging directory's
+# MODE, one inference away from the code, in a function whose whole subject is not resting security
+# on properties of the staging directory.
+#
+# So the destination is pinned the way chown-tree.mjs pins one: a descriptor, opened on `.` while
+# this process is standing in the directory pin_dir_beneath_root() walked to, BEFORE the staging
+# directory exists at all. `/proc/self/fd/N` is resolved BY THE KERNEL to the open file rather than
+# to a pathname, so `mv -T … /proc/self/fd/N/${base}` IS `renameat(N, "${base}", …)` and
+# `sync /proc/self/fd/N` IS an fsync of that same open directory. Neither mentions the staging
+# directory, so neither depends on where it is, what it is called, or who may move it. /proc is
+# already a declared, gated dependency of these scripts — enter_service_root() enters every state
+# root through it and refuses a host without it — so this costs nothing that was not already spent,
+# and the `stat -L` immediately after the open proves BOTH that the descriptor is the directory that
+# was walked to AND that an external command can still reach it, which is the one way this could
+# fail quietly. The `..` checks are KEPT: they cost a stat and they still refuse a staging directory
+# that has been moved, which is now a refusal rather than a redirection.
+#
 # MODE AND OWNER ARE APPLIED BEFORE THE CONTENT, not after it. `.env` is the reason: it carries
 # AUTH_SECRET, SETTINGS_ENCRYPTION_KEY, CRON_SECRET and the database password, and a file that is
 # filled first and restricted second exists, for an instant, with secrets in it at whatever mode
 # the create left. Inside a 0700 root-owned directory nothing can open it either way — which is
 # the belt — but the ordering is the braces, and it costs nothing.
 publish_durable_file() {
-  local target="$1" owner="${2:-}" mode="${3:-600}" dir base root self tmp meta parent
+  local target="$1" owner="${2:-}" mode="${3:-600}" dir base root self tmp meta parent dest
   # Absolute, so `dirname` and `basename` below split a whole path rather than a fragment of one.
   [[ "$target" == /* ]] || target="${PWD}/${target}"
   dir="$(dirname "$target")"
@@ -3132,6 +3157,16 @@ publish_durable_file() {
     # makes it the SAME directory rather than the same name.
     parent="$(stat -c '%d:%i' . 2>/dev/null || true)"
     [[ -n "$parent" ]] || exit 1
+    # THE DESTINATION, AS A DESCRIPTOR ON THE INODE THIS PROCESS IS STANDING IN — taken here, before
+    # the staging directory exists, so nothing that happens to the staging directory afterwards can
+    # move it. A failed `exec` redirection ends this non-interactive subshell, which the `|| return 1`
+    # below reads as a refusal; the explicit `|| exit 1` is for the shell that would only warn.
+    exec {dest}< . 2>/dev/null || exit 1
+    # AND IT IS THE DIRECTORY THAT WAS WALKED TO. `-L` because /proc/self/fd/N is a magic symlink:
+    # without it `stat` reports the inode of the /proc entry itself and this could never match. The
+    # check is run by an EXTERNAL command on purpose — it is the same route `mv` and `sync` take
+    # below, so a descriptor those two could not reach is refused here rather than at the rename.
+    [[ "$(stat -L -c '%d:%i' "/proc/self/fd/${dest}" 2>/dev/null || true)" == "$parent" ]] || exit 1
     # A SINGLE RELATIVE COMPONENT, resolved by the kernel from the directory this process holds.
     if ! (umask 077; mkdir "${PUBLISH_STAGE_DIRNAME}") 2>/dev/null; then
       [[ "$(LC_ALL=C stat -c '%F' "${PUBLISH_STAGE_DIRNAME}" 2>/dev/null || true)" == "directory" ]] || exit 1
@@ -3154,19 +3189,21 @@ publish_durable_file() {
   # BARRIER 1: the data, before the name exists. After this the rename can only publish
   # bytes that are already on the medium.
     if ! fsync_path "$tmp"; then rm -f "$tmp"; exit 1; fi
-    # `../${base}`, and never the absolute target: one component, resolved from the pinned parent.
-    if ! mv -f -T "$tmp" "../${base}" 2>/dev/null; then rm -f "$tmp"; exit 1; fi
+    # ONE COMPONENT, RESOLVED FROM THE PINNED DESCRIPTOR — `renameat(dest, base)`, and never the
+    # absolute target, and no longer `../${base}` either. See the comment above the function.
+    if ! mv -f -T "$tmp" "/proc/self/fd/${dest}/${base}" 2>/dev/null; then rm -f "$tmp"; exit 1; fi
   # BARRIER 2: the directory entry the rename created. Without it the reboot can find the
-  # old name, or neither name, however well the data was flushed. It flushes `..` — the same
-  # pinned parent the rename landed in — because `fsync_path "$dir"` re-resolved the pathname
-  # a third time and could report durability for a directory nothing was published into.
+  # old name, or neither name, however well the data was flushed. It flushes THE DESCRIPTOR the
+  # rename landed in — not `fsync_path "$dir"`, which re-resolved the pathname a third time and
+  # could report durability for a directory nothing was published into, and no longer `..`, which
+  # answers for wherever the staging directory happens to be by then.
   #
   # A FAILURE HERE RETURNS NON-ZERO WITH THE NEW BYTES ALREADY AT $target (o3d-2sm1.5, Codex
   # r10 HIGH). That is not a leak, it is the honest answer: the content is VISIBLE and its
   # NAME is not proven, so a power loss can restore the previous directory entry and with it
   # the previous marker. Callers must act on THIS RETURN VALUE. Anything that greps $target
   # instead reads the new content and concludes a durability it was never given.
-    fsync_path .. || exit 1
+    fsync_path "/proc/self/fd/${dest}" || exit 1
   ) || return 1
   return 0
 }
@@ -3709,8 +3746,9 @@ enter_service_root() {
 # THE RECURSIVE OWNERSHIP CHANGE OVER A STATE ROOT, AIMED AT INODES (o3d-n8xx, Codex CRITICAL)
 #
 # THE FINDING. ${DATA_DIR}'s chown could not follow ${LOG_DIR}'s to `chown -Rh .` because it must
-# PRUNE two subtrees — the root-owned crontab lock directory, and every `.ims-publish` staging
-# directory at any depth — and `chown -R` cannot express a prune. So it stayed as
+# PRUNE two subtrees — the root-owned crontab lock directory, and every staging directory
+# publish_durable_file() has left behind, at any depth — and `chown -R` cannot express a prune. So
+# it stayed as
 #
 #     find "${DATA_DIR}" \( -path "${CRONTAB_LOCK_DIR}" -o -name "${PUBLISH_STAGE_DIRNAME}" \) \
 #       -prune -o -exec chown -h "${APP_USER}:${APP_USER}" {} +
@@ -3729,14 +3767,23 @@ enter_service_root() {
 #
 # THE ALTERNATIVE THAT WAS WEIGHED AND REJECTED was restructuring so that plain `chown -R` could do
 # the walk (it does not follow symlinks without -L/-H, so the race disappears) and re-taking the two
-# protected subtrees immediately afterwards. It does not work here. The staging directories are
-# pruned BY NAME AT ANY DEPTH and they PERSIST — publish_durable_file() creates one beside every
-# durable publication and never removes it — so "re-chown them afterwards" would need a
-# `find -name .ims-publish` to locate them, which is the same pathname enumeration this finding is
-# about, one verb later. And the window it opens is open while the service is RUNNING: a staging
-# directory handed to the service account is a staging directory they can rename, which is the
-# whole of o3d-czpy. A window that exposes the crontab lock alone would have been arguable; one
-# that also exposes every publication staging directory is not.
+# protected subtrees immediately afterwards. It does not work here. The staging directories PERSIST
+# — publish_durable_file() creates one beside every durable publication and never removes it — so
+# "re-chown them afterwards" would need a `find` to locate them, which is the same pathname
+# enumeration this finding is about, one verb later. And the window it opens is open while the
+# service is RUNNING: a staging directory handed to the service account is a staging directory they
+# can rename, which is the whole of o3d-czpy. A window that exposes the crontab lock alone would
+# have been arguable; one that also exposes every publication staging directory is not.
+#
+# AND THE STAGING PRUNE IS NO LONGER A NAME (o3d-secops r19, Codex CRITICAL). It used to be the
+# single component `.ims-publish`, passed down as a fifth argument. ${APP_USER} owns the containing
+# directory and a rename WITHIN one parent needs no permission on the directory being moved, so they
+# could rename a staging directory to an ordinary name before this line and the walk would hand it
+# over — and what it holds, after a SIGKILL between the fill and the rename, is a complete
+# root-owned copy of whatever was being published. The helper now prunes by the SHAPE of such a
+# directory instead: owned by the uid running the walk, mode exactly 0700. That is a shape
+# ${APP_USER} can neither manufacture (they cannot chown to root) nor alter (they do not own it), so
+# it is invariant under every rename they can perform. See the PRUNING section of the helper.
 #
 # SO IT IS A NODE HELPER, AND THAT ADDS NO DEPENDENCY. node is installed by section 4, which runs
 # before this; the installer already ships and runs scripts/lib/pg-auth-request.mjs. Node has no
@@ -3753,7 +3800,7 @@ enter_service_root() {
 # opened, and leaves the SUBSHELL inside it — so the helper is handed `.` and never a pathname. Its
 # subshell is why the installer's own cwd is unaffected.
 chown_state_tree() {
-  local root="$1" owner="$2" prune_here="$3" prune_any="$4" what="$5" uid gid helper
+  local root="$1" owner="$2" prune_here="$3" what="$4" uid gid helper
   # NUMERIC IDS, RESOLVED ONCE AND CHECKED. `chown` takes a name and resolves it itself; `fchown`
   # takes numbers, so the resolution happens here — and a name that resolves to nothing must end
   # the run rather than reach the helper as an empty string.
@@ -3773,7 +3820,7 @@ chown_state_tree() {
     "node is not on PATH, so this run cannot set the ownership of ${root} — ${what}. Section 4 installs it; if you have reached here without it, something removed it. Nothing has been started."
   if ! (
     enter_service_root "${root}" 022 "${what}"
-    node "${helper}" . "${uid}" "${gid}" "${prune_here}" "${prune_any}"
+    node "${helper}" . "${uid}" "${gid}" "${prune_here}"
   ); then
     die "The ownership of ${root} — ${what} — could not be set; the reason is above. Nothing has been started."
   fi
@@ -7797,16 +7844,25 @@ migrate_uploads "${APP_DIR}/public/uploads/avatars" "${PUBLIC_UPLOAD_STORAGE_DIR
 
 # The crontab lock directory below is deliberately NOT handed to the service user, so it is pruned
 # out of this recursive chown rather than being taken back and re-taken on every re-run (which would
-# open a window in which the service user could plant a symlink inside it). ${PUBLISH_STAGE_DIRNAME}
-# is pruned for the SAME reason and at any depth (o3d-czpy): publish_durable_file() stages
-# ${CUTOVER_STATE_DIR}/DEPLOY-FENCED and the cron backup through root-owned 0700 directories inside
-# ${DATA_DIR}, and a staging directory this line handed to ${APP_USER} would be a staging directory
-# they can rename — which is the whole finding.
+# open a window in which the service user could plant a symlink inside it). The staging directories
+# publish_durable_file() leaves behind are withheld for the SAME reason and at any depth (o3d-czpy):
+# it stages ${CUTOVER_STATE_DIR}/DEPLOY-FENCED and the cron backup through root-owned 0700
+# directories inside ${DATA_DIR}, and a staging directory this line handed to ${APP_USER} would be a
+# staging directory they can rename — which is the whole finding.
+#
+# THEY ARE WITHHELD BY SHAPE AND NOT BY NAME, WHICH IS WHY ${PUBLISH_STAGE_DIRNAME} IS NOT PASSED
+# HERE (o3d-secops r19, Codex CRITICAL). ${APP_USER} owns the directory a staging directory sits in
+# and can rename it to an ordinary name before this line runs; the walk would then have met an
+# ordinary name and handed over a directory that, after a SIGKILL between the fill and the rename,
+# holds a complete root-owned copy of the thing being published. The helper prunes a directory owned
+# by the uid running the walk whose mode is exactly 0700 — a shape ${APP_USER} can neither
+# manufacture nor alter — so no rename reaches it. ${PUBLISH_STAGE_DIRNAME} remains the name
+# publish_durable_file() CREATES; it is no longer the name anything DEFENDS.
 #
 # AND THE WALK IS FD-RELATIVE, NOT `find -exec chown -h` (o3d-n8xx, Codex CRITICAL). See
 # chown_state_tree() above for the finding, the alternative that was weighed, and why the traversal
-# is not written in shell. What changes here is that the two prunes are named as SINGLE COMPONENTS
-# — resolved against the descriptor of the directory they sit in, never as pathnames.
+# is not written in shell. What changes here is that the lock prune is named as a SINGLE COMPONENT —
+# resolved against the descriptor of the directory it sits in, never as a pathname.
 #
 # THE LOCK DIRECTORY'S NAME AND ITS PATH ARE THE SAME FACT, AND THIS SAYS SO. crontab_lock_paths()
 # composes ${CRONTAB_LOCK_DIR} as ${DATA_DIR}/${CRONTAB_LOCK_DIRNAME}; the walk prunes the single
@@ -7814,7 +7870,7 @@ migrate_uploads "${APP_DIR}/public/uploads/avatars" "${PUBLIC_UPLOAD_STORAGE_DIR
 # checked against each other here rather than left to be true.
 [[ "${CRONTAB_LOCK_DIR}" == "${DATA_DIR%/}/${CRONTAB_LOCK_DIRNAME}" ]] || die \
   "the crontab lock directory is ${CRONTAB_LOCK_DIR}, which is not ${DATA_DIR%/}/${CRONTAB_LOCK_DIRNAME}: the recursive ownership change over the state directory prunes it by its single name component, and a name that does not compose the same path would prune nothing. This is a bug in this script, not an operator error."
-chown_state_tree "${DATA_DIR}" "${APP_USER}" "${CRONTAB_LOCK_DIRNAME}" "${PUBLISH_STAGE_DIRNAME}" "the state directory"
+chown_state_tree "${DATA_DIR}" "${APP_USER}" "${CRONTAB_LOCK_DIRNAME}" "the state directory"
 # ${LOG_DIR}'S OWNERSHIP IS AIMED AT A DESCRIPTOR, NOT AT A NAME (o3d-secops r7 second pass,
 # Codex HIGH).
 #

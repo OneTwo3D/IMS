@@ -46,20 +46,52 @@
  * PRUNING. The lock directory is pruned BY VERIFIED IDENTITY: it is opened once from the root's
  * own descriptor, its `dev:ino` is recorded, and any directory the walk opens whose `dev:ino`
  * matches is skipped wherever it is met — so a rename of the lock directory during the walk cannot
- * get it chowned by presenting it under another name. The staging directories cannot be enumerated
- * up front (there is one wherever a publication has happened, at any depth), so they are pruned by
- * NAME, resolved once against the pinned parent descriptor. That is sound: what must not be handed
- * to the service account is the directory the publisher will USE, which is by definition the one
- * at the name `.ims-publish` when the publisher looks; a directory renamed away from that name is
- * no longer a staging directory but debris, and publish_durable_file() re-establishes root
- * ownership, the 0700 mode and the `..` identity of whatever it does find there on every run.
+ * get it chowned by presenting it under another name.
+ *
+ * THE STAGING DIRECTORIES ARE PRUNED BY A PROPERTY, AND UNTIL o3d-secops r19 THEY WERE PRUNED BY A
+ * NAME (Codex CRITICAL). They cannot be enumerated up front — there is one wherever a publication
+ * has happened, at any depth — so the previous round resolved the single component `.ims-publish`
+ * against each pinned parent descriptor and skipped it. The justification written here for that was
+ *
+ *     "what must not be handed to the service account is the directory the publisher will USE,
+ *      which is by definition the one at the name `.ims-publish` when the publisher looks; a
+ *      directory renamed away from that name is no longer a staging directory but debris"
+ *
+ * and it is a proof of the wrong property. It reasons about WHICH DIRECTORY THE PUBLISHER WILL USE
+ * NEXT. The question the prune has to answer is WHAT THE DEBRIS CONTAINS. publish_durable_file()
+ * applies the mode and the owner to its temporary and then fills it, and every failure path removes
+ * it — but a SIGKILL or a power loss between the fill and the rename cannot run a failure path, so
+ * the staging directory is left holding a complete, root-owned copy of whatever was being
+ * published. The service account owns the containing directory, so it may rename `.ims-publish` to
+ * an ordinary name at any time before section 8 (a rename WITHIN one parent needs no permission on
+ * the directory being moved). The walk then met an ordinary name, fchowned that directory, and
+ * descended into it — handing the interrupted publication to the account that renamed it.
+ *
+ * SO THE PRUNE IS NOT A FACT ABOUT A NAME ANY MORE. A staging directory is created by
+ * `(umask 077; mkdir …)` and `chown -h` to the privileged uid, and publish_durable_file() REFUSES
+ * to use one that is not exactly that: `%u|%a` must read `${self}|700`. That shape — owned by the
+ * uid running this walk, mode exactly 0700 — is one the account being handed the tree cannot
+ * MANUFACTURE (it cannot chown anything to root) and cannot ALTER (it does not own it, so `chmod`
+ * is EPERM). It is therefore invariant under every rename it can perform, which is precisely what
+ * a name was not. Such a directory below the root is by construction something the privileged side
+ * created and kept to itself: the crontab lock, a live staging directory, or the debris of an
+ * interrupted publication. All three are exactly what must not be handed over.
+ *
+ * AND IT CANNOT WITHHOLD A DIRECTORY A WORKING INSTALL NEEDS. Everything this installer creates for
+ * the service account it creates under `umask 022`, so 0755; a directory that is 0700 and owned by
+ * the privileged uid is one the service account cannot enter TODAY, so a run that stops handing it
+ * over takes away nothing that was working. The rule is applied to DIRECTORIES only — the finding is
+ * about a directory whose contents become reachable — and never to the root itself, which must be
+ * handed over and is chowned before the walk begins.
  *
  * FAILURE IS FATAL. Every error other than "the entry is gone" or "it is not a directory any more"
  * ends the process non-zero; the caller dies. A partial ownership change that reported success is
  * how a service ends up unable to read its own state directory.
  *
- * USAGE: node chown-tree.mjs <root> <uid> <gid> <prune-name-at-root> <prune-name-at-any-depth>
- *        Either prune name may be the empty string, which prunes nothing.
+ * USAGE: node chown-tree.mjs <root> <uid> <gid> <prune-name-at-root>
+ *        The prune name may be the empty string, which prunes nothing by identity. The
+ *        privileged-and-private prune above is not switchable: it is the security boundary, and an
+ *        argument that could turn it off is an argument somebody will get wrong.
  */
 import { closeSync, fchownSync, fstatSync, lchownSync, lstatSync, openSync, readdirSync, statSync } from 'node:fs'
 import { constants } from 'node:fs'
@@ -75,10 +107,10 @@ const die = (message) => {
 }
 
 const argv = process.argv.slice(2)
-if (argv.length !== 5) {
-  die('usage: chown-tree.mjs <root> <uid> <gid> <prune-name-at-root> <prune-name-at-any-depth>')
+if (argv.length !== 4) {
+  die('usage: chown-tree.mjs <root> <uid> <gid> <prune-name-at-root>')
 }
-const [root, uidText, gidText, pruneAtRoot, pruneAnywhere] = argv
+const [root, uidText, gidText, pruneAtRoot] = argv
 
 const asId = (text, what) => {
   if (!/^(0|[1-9][0-9]*)$/.test(text)) {
@@ -89,7 +121,7 @@ const asId = (text, what) => {
 const uid = asId(uidText, 'uid')
 const gid = asId(gidText, 'gid')
 
-for (const [name, value] of [['prune-name-at-root', pruneAtRoot], ['prune-name-at-any-depth', pruneAnywhere]]) {
+for (const [name, value] of [['prune-name-at-root', pruneAtRoot]]) {
   if (value === '.' || value === '..' || value.includes('/')) {
     die(`${name} must be a single path component and this run was given ${JSON.stringify(value)}. A prune this cannot resolve against one directory is a prune that silently protects nothing.`)
   }
@@ -108,6 +140,26 @@ const OPEN_DIR = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLL
  *  directory and from nowhere else. This is the whole mechanism. */
 const at = (dirFd, name) => `/proc/self/fd/${dirFd}/${name}`
 const identity = (stats) => `${stats.dev}:${stats.ino}`
+
+/** THE UID THIS WALK RUNS AS — asked, exactly as publish_durable_file() asks `id -u` instead of
+ *  hardcoding 0. The property is "the privileged account that owns this install", and asking it
+ *  lets an unprivileged regression rig exhibit the mechanism with two ordinary directories rather
+ *  than needing two accounts. Under the installer it is 0. */
+const SELF_UID = process.getuid()
+
+/** A DIRECTORY THE PRIVILEGED SIDE MADE AND KEPT TO ITSELF, and therefore one that is NOT handed
+ *  over however it has been renamed. See the PRUNING section at the top of this file: the service
+ *  account can neither create such a directory (it cannot chown to the privileged uid) nor change
+ *  one (it is not the owner, so `chmod` is EPERM), so this answer is invariant under every rename
+ *  it can perform — which is exactly what the `.ims-publish` NAME was not.
+ *
+ *  0700 EXACTLY, and not merely "nothing for group or other". Every directory this installer makes
+ *  for the service account it makes under `umask 022`, so 0755; the two it makes for itself —
+ *  prepare_crontab_lock() and publish_durable_file()'s staging directory — it makes under
+ *  `umask 077`, so 0700, and publish_durable_file() REFUSES to use a staging directory whose `%a`
+ *  is anything else. Testing for the exact mode keeps the rule to the shape those two produce
+ *  instead of withholding, say, a root-owned 0755 directory the walk exists to hand over. */
+const privilegedAndPrivate = (stats) => stats.uid === SELF_UID && (stats.mode & 0o777) === 0o700
 
 /** GONE, or NO LONGER A DIRECTORY — the two outcomes a concurrent rename can produce that are not
  *  this program's problem. Anything else is. */
@@ -172,7 +224,6 @@ const walk = (dirFd, depth) => {
     die(`a directory below ${root} could not be read: ${error.code ?? error.message}. Nothing further has been changed.`)
   }
   for (const name of names) {
-    if (pruneAnywhere !== '' && name === pruneAnywhere) continue
     if (depth === 0 && pruneAtRoot !== '' && name === pruneAtRoot) continue
     let entry
     try {
@@ -194,7 +245,14 @@ const walk = (dirFd, depth) => {
       continue
     }
     try {
-      if (protectedIds.has(identity(fstatSync(childFd)))) continue
+      // ONE fstat, ASKED OF THE DESCRIPTOR THIS PROCESS HOLDS, answering both prunes. Neither is a
+      // question about the name the entry was reached by, so neither can be defeated by a rename:
+      // the first is the lock directory's recorded identity, the second the shape of a directory
+      // the privileged side made and kept — a live staging directory, or the debris of a
+      // publication a SIGKILL interrupted between the fill and the rename.
+      const stats = fstatSync(childFd)
+      if (protectedIds.has(identity(stats))) continue
+      if (privilegedAndPrivate(stats)) continue
       // AIMED AT THE DESCRIPTOR, not at the name it was reached by: fchown(2) takes no path at all.
       try {
         fchownSync(childFd, uid, gid)
