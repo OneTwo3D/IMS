@@ -805,3 +805,91 @@ test('[o3d-psrx r11] CONTROL: a decimal-string Balance the ledger settles still 
     + 'must fire on unreadable figures only')
   assert.ok(state.activity.some((a) => a.action === 'payment_reversal_withheld_cleared'))
 })
+
+// ---------------------------------------------------------------------------
+// o3d-psrx r12 (Codex HIGH 2) — THE UNREADABLE SET COVERED ONE FIELD OF TWO.
+//
+// r11 added `unreadable` so that a refused amount could not close a marker, and pointed it at
+// `Balance`. The escape is the other figure the same rows carry. On `Balance: "0.00", TotalAmt:
+// "0x0"`:
+//   - the balance is READABLE and zero, so nothing is due and the document never becomes a
+//     reversal candidate — it cannot be withheld;
+//   - the total is REFUSED, so `isVoided` is false and r11's `parsed.balance === null` never fires;
+//   - the closing loop therefore sees returned + nothing withheld + no error, and CLOSES the marker
+//     as settled, having never read QuickBooks' statement of what the document is worth.
+//
+// The fix is stated over BOTH figures the decision reads rather than over the field that was named:
+// every non-void row with an unreadable `Balance` OR an unreadable `TotalAmt` is unreadable. (The
+// other two fields on the row cannot close: an unmatched `Id` leaves the document out of `returned`
+// and defers, and a missing `CurrencyRef` takes the FINEST epsilon, which only ever withholds more.)
+// ---------------------------------------------------------------------------
+
+test('[o3d-psrx r12] a readable zero Balance with an unreadable TotalAmt DEFERS, it never closes', async () => {
+  reset()
+  state.salesOrders = [paidOrderRow()]
+  // POSTED and clean, so nothing but the amount reading decides anything here.
+  state.syncLogs = [postedRegistration()]
+  // THE SHAPE FROM THE FINDING, and it is one document held throughout: a stated zero balance beside
+  // a total that is not decimal money.
+  state.qboDocuments.set('QI1', { Id: 'QI1', Balance: '0.00', TotalAmt: '0x0', CurrencyRef: { value: 'GBP' } })
+  state.deltaBalanceDue = ['QI1']
+
+  // ---- POLL 1, through the DELTA read, which writes the marker.
+  const first = await poll()
+  assert.equal(first.salesReversalsWithheld, 1,
+    'the precondition: poll 1 must leave a marker, or poll 2 reconsiders nothing and this test '
+    + 'proves nothing. The total is unreadable, so `paid` is null and the gate withholds')
+  assert.equal(first.salesReversed, 0)
+  assert.deepEqual(state.chargebacks, [])
+
+  // ---- POLL 2, through the BY-ID read, with the delta window empty. This is the defect's route.
+  state.deltaBalanceDue = []
+  ageMarkers(HOUR + 60_000)
+  const second = await poll()
+
+  assert.ok(state.queries.some((q) => q === "Invoice: Id IN ('QI1')"),
+    `the recheck must actually have re-read the document by id. Saw: ${JSON.stringify(state.queries)}`)
+  assert.equal(second.withheldRechecked, 1, 'and the marker must have been due, or nothing was decided')
+  assert.equal(second.withheldResolved, 0,
+    'THE FINDING: a readable zero Balance makes this document a non-candidate, so nothing is '
+    + 'withheld against it — and with only `Balance` watched the closing loop reads "returned, '
+    + 'nothing withheld, no error" as SETTLED and closes the marker over a total nobody could read')
+  assert.equal(state.activity.some((a) => a.action === 'payment_reversal_withheld_cleared'), false,
+    'so no closure row is written for it')
+  assert.ok(state.activity.some((a) => a.action === 'payment_reversal_recheck_deferred'),
+    'it is DEFERRED instead, which rewrites the marker and sends the document to the back of the page')
+  assert.deepEqual(state.salesOrderUpdates.filter((u) => u.data.paidAt === null), [],
+    'and nothing about paidAt moves in either direction')
+
+  // ---- POLL 3, THE CONTROL ON THE SAME ROUTE AND THE SAME DOCUMENT. QuickBooks states the total in
+  // ordinary decimal money; the document is genuinely settled, and it must CLOSE. Without this the
+  // fix could have been "defer everything", which fills the recheck page with markers that never go.
+  state.qboDocuments.set('QI1', { Id: 'QI1', Balance: '0.00', TotalAmt: '100.00', CurrencyRef: { value: 'GBP' } })
+  ageMarkers(HOUR + 60_000)
+  const third = await poll()
+
+  assert.equal(third.withheldRechecked, 1)
+  assert.equal(third.withheldResolved, 1,
+    'both figures are READINGS now and they agree with IMS, so the disagreement is over and the '
+    + 'marker must be closed')
+  assert.ok(state.activity.some((a) => a.action === 'payment_reversal_withheld_cleared'))
+  assert.equal(third.salesReversed, 0, 'and a settled document is not reversed on its way out')
+  assert.deepEqual(state.chargebacks, [])
+})
+
+test('[o3d-psrx r12] CONTROL: an unreadable TotalAmt of ZERO is not read as a void', async () => {
+  // The void exemption is what makes `unreadable` skip a zeroed document, and it must rest on a
+  // READ zero. "0x0" is `Number()`'s zero, not QuickBooks'; if the exemption were reached through it
+  // the document would be reversed — paidAt cleared with no chargeback — on a number IMS invented.
+  reset()
+  state.salesOrders = [paidOrderRow()]
+  state.syncLogs = [postedRegistration()]
+  state.qboDocuments.set('QI1', { Id: 'QI1', Balance: '0.00', TotalAmt: '0x0', CurrencyRef: { value: 'GBP' } })
+  state.deltaBalanceDue = ['QI1']
+
+  const only = await poll()
+  assert.equal(only.salesReversed, 0,
+    'a hexadecimal zero total is not a void: QuickBooks never said this document was zeroed')
+  assert.deepEqual(state.salesOrderUpdates.filter((u) => u.data.paidAt === null), [])
+  assert.equal(only.salesReversalsWithheld, 1)
+})

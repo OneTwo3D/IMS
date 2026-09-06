@@ -635,6 +635,71 @@ test('[o3d-psrx r11] ordinary decimal money still reads exactly as it always did
   assert.equal(parseLedgerAmount(Number.POSITIVE_INFINITY), null)
 })
 
+// ---------------------------------------------------------------------------
+// o3d-psrx r12 (Codex HIGH 1) — THE GRAMMAR ADMITS IT, AND THEN THE CONVERSION INVENTS A ZERO.
+//
+// r11 guarded ONE END of the conversion. `Number.isFinite` catches the overflow to infinity and says
+// nothing about the underflow to ZERO — and a zero is exactly the value that puts an amount in the
+// bucket that clears `paidAt`. `"0." + "0".repeat(399) + "1"` is grammatically perfect decimal money
+// and `Decimal.toNumber()` returns 0 for it, so a figure the ledger DID state came back as the one
+// reading that means "the ledger holds nothing".
+//
+// The property asserted below is LOSSLESSNESS, not a range. A test that pinned a smallest admissible
+// magnitude would be the blocklist r11 refused to write, in the other direction: it would need a
+// number somebody keeps in step with IEEE-754, and it would say nothing about the precision loss on
+// large integers, which is the same defect with the digits falling off the other end.
+// ---------------------------------------------------------------------------
+
+test('[o3d-psrx r12] a figure too small to survive conversion is UNREADABLE, never a zero', () => {
+  // The finding's own probe. Under r11 this returned 0 — a fabricated statement that the ledger
+  // holds nothing, made out of a figure that says it holds something.
+  const tooSmall = `0.${'0'.repeat(399)}1`
+  assert.equal(parseLedgerAmount(tooSmall), null,
+    'a decimal the double cannot hold is a figure IMS could not read, and "could not read" is the '
+    + 'answer that WITHHOLDS. Zero is the answer that clears paidAt')
+
+  // The same property from the other end: digits lost off the top are no more readable than digits
+  // lost off the bottom, and no magnitude rule covers both.
+  assert.equal(parseLedgerAmount('9007199254740993'), null,
+    'the first odd integer a double cannot represent reads back as ...992 — a different amount')
+  assert.equal(parseLedgerAmount('12345678901234567890'), null,
+    'and a twenty-digit figure reads back as ...567000')
+})
+
+test('[o3d-psrx r12] the refusal is LOSSLESSNESS, not smallness: a tiny figure that converts exactly is read', () => {
+  // THE CONTROL THAT STOPS THE FIX BEING "REFUSE SMALL NUMBERS". This is far below any money
+  // threshold in the repository and it converts EXACTLY, so there is nothing wrong with it and the
+  // reader must return it. A magnitude-based guard would have refused it; the round trip does not.
+  assert.equal(parseLedgerAmount('0.0000000000000000000000001'), 1e-25)
+  // And the ordinary case is untouched — the half of the change that matters every single poll.
+  const unchanged: [string, number][] = [
+    ['0', 0], ['0.00', 0], ['50.00', 50], ['-12.34', -12.34], ['+7.5', 7.5],
+    ['1234567.8901', 1234567.8901], ['0.001', 0.001], ['100.10', 100.1], ['0.1', 0.1],
+  ]
+  for (const [value, expected] of unchanged) {
+    assert.equal(parseLedgerAmount(value), expected,
+      `${JSON.stringify(value)} is ordinary decimal money and must still convert to ${expected}`)
+  }
+})
+
+test('[o3d-psrx r12] an AmountPaid that underflows to zero WITHHOLDS, it does not reverse', () => {
+  // THE ROUTE, and it is the same one r11 used because it is the one that spends the number:
+  // `partitionPaymentReversals` puts a stated zero into `zeroPaid`, which goes on to clear paidAt and
+  // re-arm Mark Paid. Under r11 the row below landed there — the invented 0 is inside
+  // PAYMENT_PRESENT_EPSILON — so the ledger appeared to have PROVEN it holds nothing.
+  const tooSmall = `0.${'0'.repeat(399)}1`
+  const reading = partitionPaymentReversals([
+    ledgerInv('b-underflow', 'ACCPAY', 'AUTHORISED', { AmountPaid: tooSmall, AmountDue: '500.00' }),
+  ], 'ACCPAY')
+
+  assert.deepEqual(reading.zeroPaid.map((i) => i.InvoiceID), [],
+    'a figure the conversion could not carry must never reach the bucket that clears paidAt')
+  assert.deepEqual(reading.unverifiable.map((i) => i.InvoiceID), ['b-underflow'],
+    'it is UNKNOWN — the answer this partition already has for a figure it could not read')
+  assert.deepEqual(reading.partPaid.map((i) => i.InvoiceID), [],
+    'and it is not claimed as a part payment either: nobody read what the ledger holds')
+})
+
 test('[o3d-psrx r11] an AmountPaid Xero did not state in decimal money WITHHOLDS, it does not reverse', () => {
   // THE ROUTE: partitionPaymentReversals is what turns a figure into a reversal candidate. `zeroPaid`
   // is the bucket that goes on to clear paidAt and re-arm Mark Paid; `unverifiable` is the one that
