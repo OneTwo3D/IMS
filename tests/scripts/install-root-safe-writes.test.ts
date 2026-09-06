@@ -184,6 +184,7 @@ const REAL = {
   wc: realBin('wc'),
   timeout: realBin('timeout'),
   sleep: realBin('sleep'),
+  sync: realBin('sync'),
 } as const
 
 /** A shell literal. Every path a shim names goes through this. */
@@ -488,6 +489,121 @@ test('[o3d-czpy] publish_durable_file publishes into the directory it staged in,
   assert.deepEqual(readdirSync(victim), ['known_hosts'], 'and must leave nothing else in it')
   assert.equal(readFileSync(join(moved, 'known_hosts'), 'utf8'), 'github.com ssh-ed25519 AAAA\n',
     'it lands in the directory the staging directory is IN, which is the one whose device was checked')
+})
+
+test('[o3d-secops] a staging directory MOVED WHOLESALE between the checks and the rename cannot redirect the publication', (t) => {
+  /**
+   * THE r19 CRITICAL ON THE PUBLISHER SIDE. Until this round the publication was
+   * `mv -T "$tmp" "../${base}"` and the last barrier was `fsync_path ..`. `..` is the kernel's own
+   * parent link, so no rename of any NAME above the staging directory can redirect it — but it is
+   * a property of WHERE THE STAGING DIRECTORY IS, re-read at every syscall, and a staging directory
+   * moved WHOLESALE into another parent takes `../${base}` with it. The `..` check happens before
+   * the temporary is created; the rename happens after it is filled and fsynced.
+   *
+   * WHAT ACTUALLY STOPPED THAT MOVE IN PRODUCTION WAS NEVER WRITTEN DOWN: renaming a directory into
+   * a DIFFERENT parent requires write permission on the directory being moved, and the staging
+   * directory is root-owned 0700, so the service account gets EACCES. The publication's safety
+   * rested on the staging directory's MODE, one inference away from the code, in a function whose
+   * whole subject is not resting on properties of the staging directory. It now rests on a
+   * descriptor opened on the destination before the staging directory exists.
+   *
+   * ROUTE: a `sync` shim. fsync_path()'s first barrier is `sync ./publish.XXXXXX`, which runs after
+   * every pin and every check and immediately before the rename — the exact window. The shim moves
+   * the staging directory into a parent of the attacker's choosing and then delegates. THIS HARNESS
+   * RUNS AS ONE UID, so the move SUCCEEDS here where a service account would get EACCES: that is
+   * deliberate, and it is what lets the descriptor be measured on its own rather than through the
+   * permission check that happens to stand in front of it.
+   */
+  const root = createTempDirSync('ims-secops-stagemove-', t)
+  const dataDir = join(root, 'data')
+  const gitSsh = join(dataDir, 'git-ssh')
+  // WHERE THE STAGING DIRECTORY IS MOVED TO, and therefore where `../known_hosts` would land: a
+  // directory of the attacker's choosing, inside ${DATA_DIR} so it is theirs to write.
+  const attacker = join(dataDir, 'attacker')
+  mkdirSync(gitSsh, { recursive: true })
+  mkdirSync(attacker)
+
+  const log = join(root, 'sync.log')
+  const shims = (moveTo: string) => shimDir(t, {
+    sync: [
+      // ONLY THE FIRST BARRIER, and only once: the second `sync` is of the destination itself, and
+      // firing on it would move the staging directory after the publication had already happened.
+      `if [[ "${'${1:-}'}" == ./publish.* && ! -e ${q(log)} ]]; then`,
+      `  ims_shim_append ${q(log)} "$PWD"`,
+      `  ${REAL.mv} -T "$PWD" ${q(moveTo)}`,
+      'fi',
+      `exec ${REAL.sync} "$@"`,
+    ].join('\n'),
+  })
+
+  const body = [
+    `printf 'github.com ssh-ed25519 AAAA\\n' | publish_durable_file "${join(gitSsh, 'known_hosts')}" "" 600`,
+    'echo "rc=$?"',
+  ].join('\n')
+  const bin = shims(join(attacker, 'stolen'))
+  const run = runBash(rig(PUBLISHER, body, roots({ data: dataDir })), { env: { PATH: `${bin}:${process.env.PATH ?? ''}` } })
+
+  // NOT VACUOUS: the shim fired, in the window, and the move really happened.
+  assert.equal(readFileSync(log, 'utf8').trim().split('\n').length, 1,
+    'the first barrier must have been reached exactly once')
+  assert.equal(existsSync(join(attacker, 'stolen')), true,
+    'and the staging directory must really have been moved into the attacker’s parent')
+  assert.equal(existsSync(join(gitSsh, '.ims-publish')), false, 'so it is no longer where it was staged')
+
+  assert.match(run.stdout, /^rc=0$/m, `the publication must still complete: ${run.stderr}`)
+  assert.equal(readFileSync(join(gitSsh, 'known_hosts'), 'utf8'), 'github.com ssh-ed25519 AAAA\n',
+    'and it must land in the directory the descriptor was opened on')
+  assert.deepEqual(readdirSync(join(attacker, 'stolen')), [],
+    'nothing may be published into the parent the staging directory was moved to')
+  assert.deepEqual(readdirSync(attacker).sort(), ['stolen'], 'nor beside it')
+
+  // MEASURED BY MUTATION, ROUTE STATED: the shipped publisher with the two lines this round changed
+  // put back to what they were — the rename through `../${base}` and the barrier through `..`. The
+  // same shim, the same move, and the publication then lands in the attacker's directory. That is
+  // the finding, and it is what makes the descriptor load-bearing rather than decorative.
+  const shipped = shellFunction(INSTALL_SH, 'publish_durable_file')
+  const renameLine = 'if ! mv -f -T "$tmp" "/proc/self/fd/${dest}/${base}" 2>/dev/null; then rm -f "$tmp"; exit 1; fi'
+  const barrierLine = 'fsync_path "/proc/self/fd/${dest}" || exit 1'
+  assert.ok(shipped.includes(renameLine), `precondition: the shipped rename must go through the descriptor:\n${shipped}`)
+  assert.ok(shipped.includes(barrierLine), `precondition: the shipped barrier must go through it too:\n${shipped}`)
+  const preR19 = shipped
+    .replace(renameLine, 'if ! mv -f -T "$tmp" "../${base}" 2>/dev/null; then rm -f "$tmp"; exit 1; fi')
+    .replace(barrierLine, 'fsync_path .. || exit 1')
+  assert.notEqual(preR19, shipped, 'the mutation must change the shipped publisher')
+
+  const mutRoot = createTempDirSync('ims-secops-stagemove-mut-', t)
+  const mutData = join(mutRoot, 'data')
+  const mutGitSsh = join(mutData, 'git-ssh')
+  const mutAttacker = join(mutData, 'attacker')
+  mkdirSync(mutGitSsh, { recursive: true })
+  mkdirSync(mutAttacker)
+  const mutLog = join(mutRoot, 'sync.log')
+  const mutBin = shimDir(t, {
+    sync: [
+      `if [[ "${'${1:-}'}" == ./publish.* && ! -e ${q(mutLog)} ]]; then`,
+      `  ims_shim_append ${q(mutLog)} "$PWD"`,
+      `  ${REAL.mv} -T "$PWD" ${q(join(mutAttacker, 'stolen'))}`,
+      'fi',
+      `exec ${REAL.sync} "$@"`,
+    ].join('\n'),
+  })
+  const mutBody = [
+    `printf 'github.com ssh-ed25519 AAAA\\n' | publish_durable_file "${join(mutGitSsh, 'known_hosts')}" "" 600`,
+    'echo "rc=$?"',
+  ].join('\n')
+  // `extra` is emitted AFTER the lifted functions and before the body, so this definition wins.
+  const mutated = runBash(rig(PUBLISHER, mutBody, [roots({ data: mutData }), preR19].join('\n')),
+    { env: { PATH: `${mutBin}:${process.env.PATH ?? ''}` } })
+
+  assert.equal(readFileSync(mutLog, 'utf8').trim().split('\n').length, 1, 'the mutation must meet the same shim')
+  assert.match(mutated.stdout, /^rc=0$/m, `and it must report SUCCESS while doing the wrong thing: ${mutated.stderr}`)
+  // `..` OF THE MOVED STAGING DIRECTORY IS ITS NEW PARENT — `${mutAttacker}`, the directory the
+  // move put it in — so that is where `../${base}` resolves to and where the root-written
+  // known_hosts lands.
+  assert.equal(readFileSync(join(mutAttacker, 'known_hosts'), 'utf8'), 'github.com ssh-ed25519 AAAA\n',
+    `through \`../\${base}\` the publication follows the moved staging directory into the attacker's parent — that is the finding this test exists to fail on: ${mutated.stderr}`)
+  assert.equal(existsSync(join(mutGitSsh, 'known_hosts')), false,
+    'and nothing reaches the destination it was walked to')
 })
 
 // ---------------------------------------------------------------------------
@@ -4378,11 +4494,20 @@ function plantStateRoot(t: TestContext, prefix: string): { base: string, data: s
   const data = join(base, 'data')
   mkdirSync(join(data, 'uploads/invoices'), { recursive: true })
   writeFileSync(join(data, 'uploads/invoices/a.pdf'), 'an invoice\n')
-  mkdirSync(join(data, LOCK_DIRNAME))
+  // THE LOCK DIRECTORY AT 0755 ON PURPOSE. prepare_crontab_lock() makes it 0700, which the walk's
+  // privileged-and-private prune would ALSO withhold — and the mutation below, which empties the
+  // identity prune and asserts the lock directory is then handed over, would become vacuous. At
+  // 0755 the identity prune is the only thing protecting it, so that mutation still bites.
+  mkdirSync(join(data, LOCK_DIRNAME), 0o755)
   writeFileSync(join(data, LOCK_DIRNAME, LOCK_FILENAME), '')
-  mkdirSync(join(data, STAGE_DIRNAME))
+  // THE STAGING DIRECTORIES AT THE SHAPE THE PUBLISHER GIVES THEM: `(umask 077; mkdir)` then
+  // `chown -h` to the uid running the publication, which in this same-uid harness is this process's
+  // own. Anything else would not be a staging directory, and publish_durable_file() refuses to use
+  // one whose `%u|%a` is not `${self}|700`.
+  mkdirSync(join(data, STAGE_DIRNAME), 0o700)
   writeFileSync(join(data, STAGE_DIRNAME, 'publish.abc'), 'staged\n')
-  mkdirSync(join(data, 'deploy', STAGE_DIRNAME), { recursive: true })
+  mkdirSync(join(data, 'deploy'))
+  mkdirSync(join(data, 'deploy', STAGE_DIRNAME), 0o700)
   const outside = join(base, 'outside')
   mkdirSync(outside)
   writeFileSync(join(outside, 'f'), 'the victim\n')
@@ -4391,12 +4516,26 @@ function plantStateRoot(t: TestContext, prefix: string): { base: string, data: s
 
 /** The shipped walker, run over `data` as the shell runs it: from INSIDE the root, which is where
  *  enter_service_root() leaves the process, and therefore with `.` as its only pathname. */
-function runWalk(data: string, pruneAtRoot: string, pruneAnywhere: string, opts: { helper?: string } = {}): Run {
+function runWalk(data: string, pruneAtRoot: string, opts: { helper?: string } = {}): Run {
   return runBash([
     'set -uo pipefail',
-    `node ${q(opts.helper ?? CHOWN_TREE)} . "$(${REAL.id} -u)" "$(${REAL.id} -g)" ${q(pruneAtRoot)} ${q(pruneAnywhere)}`,
+    `node ${q(opts.helper ?? CHOWN_TREE)} . "$(${REAL.id} -u)" "$(${REAL.id} -g)" ${q(pruneAtRoot)}`,
     'echo "rc=$?"',
   ].join('\n'), { cwd: data })
+}
+
+/** THE SHIPPED WALKER WITH ITS STAGING PRUNE REMOVED, and nothing else changed — the mutation every
+ *  assertion about that prune is measured against. The route is the predicate itself: made to
+ *  answer `false`, which is what pruning by a NAME the service account can rename amounts to once
+ *  the rename has happened. */
+function walkerWithoutShapePrune(t: TestContext): string {
+  const shipped = readFileSync(CHOWN_TREE, 'utf8')
+  const predicate = 'const privilegedAndPrivate = (stats) => stats.uid === SELF_UID && (stats.mode & 0o777) === 0o700'
+  assert.ok(shipped.includes(predicate),
+    `precondition: the shipped walker must prune by the shape of a privileged private directory:\n${shipped}`)
+  const helper = join(createTempDirSync('ims-secops-noshape-', t), 'chown-tree-noshape.mjs')
+  writeFileSync(helper, shipped.replace(predicate, 'const privilegedAndPrivate = () => false'))
+  return helper
 }
 
 test('[o3d-n8xx] the ownership walk reaches the ordinary tree and hands neither the lock directory nor any staging directory to the service account', (t) => {
@@ -4404,7 +4543,7 @@ test('[o3d-n8xx] the ownership walk reaches the ordinary tree and hands neither 
 
   const before = ctimes(plant.data)
   pause(30)
-  const run = runWalk(plant.data, LOCK_DIRNAME, STAGE_DIRNAME)
+  const run = runWalk(plant.data, LOCK_DIRNAME)
   assert.match(run.stdout, /^rc=0$/m, `the ordinary walk must succeed: ${run.stderr}`)
   const reached = touched(before, ctimes(plant.data))
 
@@ -4423,20 +4562,86 @@ test('[o3d-n8xx] the ownership walk reaches the ordinary tree and hands neither 
   assert.ok(!reached.some((path) => path.split('/').includes(STAGE_DIRNAME)),
     `nor any publication staging directory, at any depth: ${reached.join(' ')}`)
 
-  // MEASURED BY MUTATION, ROUTE STATED: the same shipped walker over the same tree with the two
-  // prune components empty — which is what a caller that forgot them would produce, and what
-  // `chown -R` would do if it were used here. Both protected trees are then handed over.
+  // MEASURED BY MUTATION, ROUTE STATED (the lock half): the same shipped walker over the same tree
+  // with the identity prune's name empty — which is what a caller that forgot it would produce, and
+  // what `chown -R` would do if it were used here. The lock directory is then handed over.
   const second = plantStateRoot(t, 'ims-n8xx-noprune-')
   const beforeMutated = ctimes(second.data)
   pause(30)
-  const mutated = runWalk(second.data, '', '')
+  const mutated = runWalk(second.data, '')
   assert.match(mutated.stdout, /^rc=0$/m, mutated.stderr)
   const reachedMutated = touched(beforeMutated, ctimes(second.data))
   assert.ok(reachedMutated.includes(LOCK_DIRNAME),
     `without the prune the lock directory is handed over — that is the finding this test exists to fail on: ${reachedMutated.join(' ')}`)
   assert.ok(reachedMutated.includes(`${LOCK_DIRNAME}/${LOCK_FILENAME}`), reachedMutated.join(' '))
-  assert.ok(reachedMutated.includes(STAGE_DIRNAME), reachedMutated.join(' '))
-  assert.ok(reachedMutated.includes(`deploy/${STAGE_DIRNAME}`), reachedMutated.join(' '))
+  // AND THE STAGING HALF, whose prune is not an argument at all: the shipped walker with its
+  // privileged-and-private predicate made to answer `false`. Both staging directories are then
+  // handed over, at both depths.
+  const third = plantStateRoot(t, 'ims-n8xx-noshape-')
+  const beforeShape = ctimes(third.data)
+  pause(30)
+  const noShape = runWalk(third.data, LOCK_DIRNAME, { helper: walkerWithoutShapePrune(t) })
+  assert.match(noShape.stdout, /^rc=0$/m, noShape.stderr)
+  const reachedShape = touched(beforeShape, ctimes(third.data))
+  assert.ok(reachedShape.includes(STAGE_DIRNAME), reachedShape.join(' '))
+  assert.ok(reachedShape.includes(`${STAGE_DIRNAME}/publish.abc`),
+    `without the shape prune the contents of an interrupted publication are handed over too: ${reachedShape.join(' ')}`)
+  assert.ok(reachedShape.includes(`deploy/${STAGE_DIRNAME}`), reachedShape.join(' '))
+})
+
+test('[o3d-secops] a staging directory RENAMED to an ordinary name before the walk is still not handed to the service account', (t) => {
+  /**
+   * THE r19 CRITICAL, EXHIBITED. The walk used to skip an entry currently NAMED `.ims-publish`, and
+   * the justification recorded for that reasoned about which directory the publisher would USE
+   * next. The question is what the debris CONTAINS: publish_durable_file() applies the owner and
+   * the mode to its temporary and then fills it, and a SIGKILL between the fill and the rename
+   * cannot run a failure path — so the staging directory is left holding a complete, root-owned
+   * copy of whatever was being published. ${APP_USER} owns the containing directory, so renaming
+   * `.ims-publish` to an ordinary name costs them nothing: a rename WITHIN one parent needs no
+   * permission on the directory being moved. Under the old rule the walk then met an ordinary name
+   * and handed the interrupted publication to the account that renamed it.
+   *
+   * ROUTE: the shipped walker over the shipped fixture, with the staging directory renamed exactly
+   * as the service account would rename it, BEFORE the walk starts.
+   */
+  const plant = plantStateRoot(t, 'ims-secops-renamed-stage-')
+  const debris = 'ordinary-looking'
+  // WHAT AN INTERRUPTED PUBLICATION LEAVES. The temporary is `chmod`ed and `chown`ed and then
+  // filled; only the rename and the removal are still to come.
+  writeFileSync(join(plant.data, STAGE_DIRNAME, 'publish.xyz'), 'DATABASE_URL=secret\n')
+  chmodSync(join(plant.data, STAGE_DIRNAME, 'publish.xyz'), 0o600)
+  renameSync(join(plant.data, STAGE_DIRNAME), join(plant.data, debris))
+
+  // PRECONDITION: the walk is really being asked about a name it has never heard of.
+  assert.equal(existsSync(join(plant.data, STAGE_DIRNAME)), false, 'the staging NAME must be gone')
+  assert.equal(lstatSync(join(plant.data, debris)).mode & 0o777, 0o700, 'and the SHAPE must survive the rename')
+
+  const before = ctimes(plant.data)
+  pause(30)
+  const run = runWalk(plant.data, LOCK_DIRNAME)
+  assert.match(run.stdout, /^rc=0$/m, `the walk must still complete: ${run.stderr}`)
+  const reached = touched(before, ctimes(plant.data))
+
+  // NOT VACUOUS: the walk reached the ordinary tree, so the absence below is a prune.
+  assert.ok(reached.includes('uploads/invoices/a.pdf'), `the ordinary tree must be handed over: ${reached.join(' ')}`)
+  assert.ok(!reached.some((path) => path === debris || path.startsWith(`${debris}/`)),
+    `a staging directory under any name may not be handed over, nor anything inside it: ${reached.join(' ')}`)
+
+  // MEASURED BY MUTATION, ROUTE STATED: the same fixture in the same state under the shipped walker
+  // with its privileged-and-private predicate made to answer `false` — which is precisely what
+  // pruning by the NAME `.ims-publish` amounts to once the rename has happened. The interrupted
+  // publication is then handed to the account that renamed it, which is the finding.
+  const mutant = plantStateRoot(t, 'ims-secops-renamed-stage-mut-')
+  writeFileSync(join(mutant.data, STAGE_DIRNAME, 'publish.xyz'), 'DATABASE_URL=secret\n')
+  renameSync(join(mutant.data, STAGE_DIRNAME), join(mutant.data, debris))
+  const beforeMut = ctimes(mutant.data)
+  pause(30)
+  const mutated = runWalk(mutant.data, LOCK_DIRNAME, { helper: walkerWithoutShapePrune(t) })
+  assert.match(mutated.stdout, /^rc=0$/m, mutated.stderr)
+  const reachedMut = touched(beforeMut, ctimes(mutant.data))
+  assert.ok(reachedMut.includes(debris), `without the shape prune the renamed staging directory is handed over: ${reachedMut.join(' ')}`)
+  assert.ok(reachedMut.includes(`${debris}/publish.xyz`),
+    `and with it the contents of the interrupted publication: ${reachedMut.join(' ')}`)
 })
 
 test('[o3d-n8xx] a symlinked descendant has its OWN ownership changed and cannot redirect the change outside the root', (t) => {
@@ -4454,7 +4659,7 @@ test('[o3d-n8xx] a symlinked descendant has its OWN ownership changed and cannot
   const beforeOutside = ctimes(plant.outside)
   const before = ctimes(plant.data)
   pause(30)
-  const run = runWalk(plant.data, LOCK_DIRNAME, STAGE_DIRNAME)
+  const run = runWalk(plant.data, LOCK_DIRNAME)
   assert.match(run.stdout, /^rc=0$/m, `a symlink in the tree must not end the run: ${run.stderr}`)
 
   const reached = touched(before, ctimes(plant.data))
@@ -4527,7 +4732,7 @@ test('[o3d-n8xx] a descendant renamed between the enumeration and the chown cann
   const beforeShippedOutside = ctimes(shipped.outside)
   const beforeShipped = ctimes(shipped.data)
   pause(30)
-  const run = runWalk(shipped.data, LOCK_DIRNAME, STAGE_DIRNAME)
+  const run = runWalk(shipped.data, LOCK_DIRNAME)
   assert.match(run.stdout, /^rc=0$/m, run.stderr)
   const reached = touched(beforeShipped, ctimes(shipped.data))
   assert.ok(reached.includes('d'), `the link at the renamed name must be re-owned in place: ${reached.join(' ')}`)
@@ -4556,14 +4761,14 @@ test('[o3d-n8xx] the walker refuses rather than changing ownership by pathname w
   const plant = plantStateRoot(t, 'ims-n8xx-noproc-tree-')
   const before = ctimes(plant.data)
   pause(30)
-  const run = runWalk(plant.data, LOCK_DIRNAME, STAGE_DIRNAME, { helper })
+  const run = runWalk(plant.data, LOCK_DIRNAME, { helper })
   assert.match(run.stdout, /^rc=1$/m, `a walker that cannot hold a descriptor must refuse: ${run.stderr}`)
   assert.match(run.stderr, /is not available/, run.stderr)
   assert.deepEqual(touched(before, ctimes(plant.data)), [],
     'and it must refuse before it changes anything, not part of the way through')
 
   // NOT VACUOUS: the identical fixture under the SHIPPED file walks the tree.
-  const ok = runWalk(plant.data, LOCK_DIRNAME, STAGE_DIRNAME)
+  const ok = runWalk(plant.data, LOCK_DIRNAME)
   assert.match(ok.stdout, /^rc=0$/m, ok.stderr)
 })
 
@@ -4577,12 +4782,17 @@ test('[o3d-n8xx] the shipped call site walks by descriptor, prunes by single com
   assert.ok(!code.some((line) => /-exec\s+chown/.test(line)),
     'and no `find -exec chown` may survive anywhere in the installer')
 
-  // AND WHAT MUST BE. The call names the two prunes as SINGLE COMPONENTS, from the constants that
-  // define them, so a rename of either constant cannot leave the prune pointing at nothing.
+  // AND WHAT MUST BE. The call names the identity prune as a SINGLE COMPONENT, from the constant
+  // that defines it, so a rename of that constant cannot leave the prune pointing at nothing.
   const call = code.find((line) => line.startsWith('chown_state_tree "${DATA_DIR}"'))
   assert.ok(call, `scripts/install.sh must hand ${'${DATA_DIR}'} to the descriptor walk:\n${code.slice(-1)}`)
   assert.ok(call.includes('"${CRONTAB_LOCK_DIRNAME}"'), call)
-  assert.ok(call.includes('"${PUBLISH_STAGE_DIRNAME}"'), call)
+  // AND WHAT MAY NOT BE (o3d-secops r19, Codex CRITICAL): the staging directories are NOT named
+  // here. They were, and a name the service account can rename is not a security boundary — see
+  // the renamed-staging-directory regression above. A call site that reintroduced the argument
+  // would be reintroducing the finding, so it is refused here rather than left to a comment.
+  assert.ok(!call.includes('PUBLISH_STAGE_DIRNAME'),
+    `the staging prune is a SHAPE and not a name; the call site may not pass one:\n${call}`)
 
   // AND THE ONE FACT THAT COULD SILENTLY UNDO THE PRUNE is checked in the script rather than
   // assumed: the lock directory's PATH and its NAME have to compose.
@@ -5007,7 +5217,7 @@ test('[o3d-secops] an ordinary install still runs: real roots pass, and a first 
  *  lock NAME, and the descriptor walk it protects. */
 const SECTION8_DATA_CHOWN = [
   shippedStatement('[[ "${CRONTAB_LOCK_DIR}" == "${DATA_DIR%/}/${CRONTAB_LOCK_DIRNAME}" ]] || die \\'),
-  shippedStatement('chown_state_tree "${DATA_DIR}" "${APP_USER}" "${CRONTAB_LOCK_DIRNAME}" "${PUBLISH_STAGE_DIRNAME}" "the state directory"'),
+  shippedStatement('chown_state_tree "${DATA_DIR}" "${APP_USER}" "${CRONTAB_LOCK_DIRNAME}" "the state directory"'),
 ].join('\n')
 
 /** What the lock subsystem contributes to a rig that runs section 8's chown: the two names, and the
@@ -5065,11 +5275,15 @@ test('[o3d-n8xx] an ordinary install and the upgrade after it both complete thro
   assert.deepEqual(readdirSync(data).sort(), ['backups', 'public-uploads', 'uploads', 'xero'])
 
   // THE UPGRADE, over what the first run left plus what the rest of the installer adds to it.
-  mkdirSync(join(data, LOCK_DIRNAME))
+  mkdirSync(join(data, LOCK_DIRNAME), 0o700)
   writeFileSync(join(data, LOCK_DIRNAME, LOCK_FILENAME), '')
-  mkdirSync(join(data, STAGE_DIRNAME))
+  // AT THE SHAPE publish_durable_file() LEAVES THEM — `(umask 077; mkdir)` plus `chown -h` — and
+  // one of them RENAMED, which is what the service account does with a name they own and what the
+  // walk must be indifferent to. The upgrade has to complete over both.
+  mkdirSync(join(data, STAGE_DIRNAME), 0o700)
   writeFileSync(join(data, STAGE_DIRNAME, 'publish.abc'), 'staged\n')
-  mkdirSync(join(data, 'uploads', STAGE_DIRNAME))
+  mkdirSync(join(data, 'uploads', STAGE_DIRNAME), 0o700)
+  renameSync(join(data, 'uploads', STAGE_DIRNAME), join(data, 'uploads', 'renamed-aside'))
   writeFileSync(join(data, 'uploads/invoices/a.pdf'), 'an invoice\n')
 
   const before = ctimes(data)
@@ -5083,6 +5297,8 @@ test('[o3d-n8xx] an ordinary install and the upgrade after it both complete thro
     `the upgrade must hand the ordinary tree over: ${reached.join(' ')}`)
   assert.ok(!reached.some((path) => path.split('/').includes(LOCK_DIRNAME) || path.split('/').includes(STAGE_DIRNAME)),
     `and neither protected subtree, at either depth: ${reached.join(' ')}`)
+  assert.ok(!reached.includes('uploads/renamed-aside'),
+    `nor a staging directory the service account renamed out of the way first: ${reached.join(' ')}`)
   // AND THE TWO STORAGE ROOTS COME WITH IT (o3d-n8xx). There was a second
   // `chown -R … "${UPLOAD_STORAGE_DIR}" "${PUBLIC_UPLOAD_STORAGE_DIR}"` after this walk. Both are
   // INSIDE ${DATA_DIR} and neither is pruned, so it did nothing the walk had not done — with a
