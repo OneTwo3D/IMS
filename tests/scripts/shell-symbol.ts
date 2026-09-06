@@ -250,8 +250,26 @@ type Ctx =
  * assuming it closed is how a definition hides inside the part that was assumed away.
  */
 export function maskShellSource(source: string, where = 'the script'): string {
+  return maskAndQuoting(source, where).mask
+}
+
+/**
+ * The mask, PLUS which bytes were inside a quote (or an arithmetic expansion) when it was made.
+ *
+ * The mask blanks a quoted byte to a space, and a space is a metacharacter — so `x="a b"` masks to
+ * `x=     ` and every reader that asks "does a word end here" by looking at the mask alone reads
+ * ONE word as two. assignedWordEnd() lives with that (a fragment is not an identifier, which is the
+ * answer its callers want anyway); a reader that has to say which word is the COMMAND cannot, since
+ * the second half of a quoted string would become the command word and demote a real assignment to
+ * a command prefix. `quoted[i]` is 1 exactly where the byte was inside `'…'`, `"…"`, `$'…'` or
+ * `$(( … ))`, so such a reader can veto the break. A comment and a here-document body are blanked
+ * but NOT marked, which is right: neither is part of a word, and both should read as whitespace.
+ */
+function maskAndQuoting(source: string, where: string): { mask: string; quoted: Uint8Array } {
   const out: string[] = new Array(source.length)
+  const quoted = new Uint8Array(source.length)
   const blank = (i: number): void => { out[i] = source[i] === '\n' ? '\n' : ' ' }
+  const blankQ = (i: number): void => { blank(i); quoted[i] = 1 }
   const stack: Ctx[] = [{ t: 'code', term: 'eof', depth: 0, opened: 0 }]
   /** Pending here-document terminators for the current line, in the order they were opened. */
   let heredocs: Array<{ tag: string; stripTabs: boolean }> = []
@@ -271,15 +289,15 @@ export function maskShellSource(source: string, where = 'the script'): string {
     const c = source[i]
 
     if (ctx.t === 'sq') {
-      blank(i)
+      blankQ(i)
       if (c === "'") stack.pop()
       i += 1
       continue
     }
 
     if (ctx.t === 'ansi') {
-      blank(i)
-      if (c === '\\' && i + 1 < source.length) { blank(i + 1); i += 2; continue }
+      blankQ(i)
+      if (c === '\\' && i + 1 < source.length) { blankQ(i + 1); i += 2; continue }
       if (c === "'") stack.pop()
       i += 1
       continue
@@ -289,30 +307,30 @@ export function maskShellSource(source: string, where = 'the script'): string {
       // Arithmetic is not command text: no word can be a function definition inside it, and its
       // `<<` is a shift rather than a here-document. Blanked whole, brackets counted so we leave
       // at the right `))`.
-      if (c === '(') { ctx.depth += 1; blank(i); i += 1; continue }
+      if (c === '(') { ctx.depth += 1; blankQ(i); i += 1; continue }
       if (c === ')') {
-        if (ctx.depth > 0) { ctx.depth -= 1; blank(i); i += 1; continue }
-        if (source[i + 1] === ')') { blank(i); blank(i + 1); stack.pop(); i += 2; continue }
+        if (ctx.depth > 0) { ctx.depth -= 1; blankQ(i); i += 1; continue }
+        if (source[i + 1] === ')') { blankQ(i); blankQ(i + 1); stack.pop(); i += 2; continue }
         // A single `)` closing what we entered as `$((` — bash re-reads it as `$( (`; we cannot.
         return fail(ctx.opened, 'an arithmetic expansion that does not close with `))`')
       }
-      blank(i)
+      blankQ(i)
       i += 1
       continue
     }
 
     if (ctx.t === 'dq') {
-      if (c === '\\' && i + 1 < source.length) { blank(i); blank(i + 1); i += 2; continue }
-      if (c === '"') { blank(i); stack.pop(); i += 1; continue }
+      if (c === '\\' && i + 1 < source.length) { blankQ(i); blankQ(i + 1); i += 2; continue }
+      if (c === '"') { blankQ(i); stack.pop(); i += 1; continue }
       if (c === '$' && source[i + 1] === '(' && source[i + 2] === '(') {
-        blank(i); blank(i + 1); blank(i + 2)
+        blankQ(i); blankQ(i + 1); blankQ(i + 2)
         stack.push({ t: 'arith', depth: 0, opened: i })
         i += 3
         continue
       }
       if (c === '$' && source[i + 1] === '(') {
         // Code again, even inside the quotes.
-        blank(i); out[i + 1] = '('
+        blankQ(i); out[i + 1] = '('
         stack.push({ t: 'code', term: 'paren', depth: 0, opened: i })
         atWordStart = true
         i += 2
@@ -322,13 +340,13 @@ export function maskShellSource(source: string, where = 'the script'): string {
         // Blanked, not kept: a backtick opens (or closes) command text, so what follows it starts a
         // WORD. Left in the mask it would sit in front of a `name()` as a non-metacharacter and make
         // the definition read as the tail of a longer name.
-        blank(i)
+        blankQ(i)
         stack.push({ t: 'code', term: 'backtick', depth: 0, opened: i })
         atWordStart = true
         i += 1
         continue
       }
-      blank(i)
+      blankQ(i)
       i += 1
       continue
     }
@@ -352,31 +370,31 @@ export function maskShellSource(source: string, where = 'the script'): string {
       return fail(i, 'a backslash at end of file')
     }
 
-    if (c === "'") { blank(i); stack.push({ t: 'sq', opened: i }); atWordStart = false; i += 1; continue }
-    if (c === '"') { blank(i); stack.push({ t: 'dq', opened: i }); atWordStart = false; i += 1; continue }
+    if (c === "'") { blankQ(i); stack.push({ t: 'sq', opened: i }); atWordStart = false; i += 1; continue }
+    if (c === '"') { blankQ(i); stack.push({ t: 'dq', opened: i }); atWordStart = false; i += 1; continue }
     if (c === '$' && source[i + 1] === "'") {
-      blank(i); blank(i + 1)
+      blankQ(i); blankQ(i + 1)
       stack.push({ t: 'ansi', opened: i })
       atWordStart = false
       i += 2
       continue
     }
     if (c === '$' && source[i + 1] === '"') {
-      blank(i); blank(i + 1)
+      blankQ(i); blankQ(i + 1)
       stack.push({ t: 'dq', opened: i })
       atWordStart = false
       i += 2
       continue
     }
     if (c === '$' && source[i + 1] === '(' && source[i + 2] === '(') {
-      blank(i); blank(i + 1); blank(i + 2)
+      blankQ(i); blankQ(i + 1); blankQ(i + 2)
       stack.push({ t: 'arith', depth: 0, opened: i })
       atWordStart = false
       i += 3
       continue
     }
     if (c === '(' && source[i + 1] === '(' && atWordStart) {
-      blank(i); blank(i + 1)
+      blankQ(i); blankQ(i + 1)
       stack.push({ t: 'arith', depth: 0, opened: i })
       atWordStart = false
       i += 2
@@ -479,7 +497,7 @@ export function maskShellSource(source: string, where = 'the script'): string {
   }
   if (heredocs.length > 0) return fail(source.length - 1, `an unterminated here-document (no line reading \`${heredocs[0].tag}\`)`)
 
-  return out.join('')
+  return { mask: out.join(''), quoted }
 }
 
 /**
@@ -657,8 +675,8 @@ const ASSIGNMENT_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/
 
 const OPERAND_CACHE = new Map<string, MaskAssignment[]>()
 
-function maskAssignmentOperands(mask: string): MaskAssignment[] {
-  const hit = OPERAND_CACHE.get(mask)
+function maskAssignmentOperands(mask: string, source: string, quoted: Uint8Array): MaskAssignment[] {
+  const hit = OPERAND_CACHE.get(source)
   if (hit !== undefined) return hit
   const found: MaskAssignment[] = []
   for (let eq = 0; eq < mask.length; eq += 1) {
@@ -681,9 +699,9 @@ function maskAssignmentOperands(mask: string): MaskAssignment[] {
     while (nameOffset < at && mask[nameOffset] === JOINED) nameOffset += 1
     found.push({ name, nameOffset, valueOffset: eq + 1, wordOffset: start, append, position: 'argument' })
   }
-  classifyAssignmentPositions(mask, found)
+  classifyAssignmentPositions(mask, quoted, found)
   if (OPERAND_CACHE.size >= 64) OPERAND_CACHE.clear()
-  OPERAND_CACHE.set(mask, found)
+  OPERAND_CACHE.set(source, found)
   return found
 }
 
@@ -732,9 +750,18 @@ const DECLARATION_BUILTINS = new Set(['declare', 'local', 'export', 'readonly', 
 /** The metacharacters that end one simple command. `<` and `>` continue it; the rest do not. */
 const COMMAND_BOUNDARY = '\n|&;()'
 
-function classifyAssignmentPositions(mask: string, operands: MaskAssignment[]): void {
+function classifyAssignmentPositions(mask: string, quoted: Uint8Array, operands: MaskAssignment[]): void {
   const byWord = new Map<number, MaskAssignment>()
   for (const operand of operands) byWord.set(operand.wordOffset, operand)
+
+  // A METACHARACTER THAT REALLY ENDS A WORD. The mask blanks quoted bytes to spaces, so
+  // `ref="DB_FENCE"_PROBE` masks to `ref=          _PROBE` and `note="a b"` to `note=     ` — a
+  // tokeniser trusting the mask alone reads one word as two, takes the second half for the command
+  // word, and demotes a real assignment to a command prefix. (Measured: it demoted 262 of the
+  // library's and the entrypoints' own message assignments.) The quoting map says which of those
+  // blanks were inside a quote; those never end a word. A comment and a here-document body are
+  // blanked and NOT marked, so they read as the whitespace they are rather than as a word.
+  const breaks = (at: number): boolean => quoted[at] === 0 && METACHARACTERS.includes(mask[at])
 
   let pending: MaskAssignment[] = []
   let commandWord: string | null = null
@@ -750,22 +777,24 @@ function classifyAssignmentPositions(mask: string, operands: MaskAssignment[]): 
 
   let i = 0
   while (i < mask.length) {
-    const c = mask[i]
-    if (c === ' ' || c === '\t' || c === JOINED) { i += 1; continue }
-    if (COMMAND_BOUNDARY.includes(c)) { endCommand(); i += 1; continue }
-    if (c === '<' || c === '>') {
-      // A redirection and its target are not the command word, and must not be mistaken for one.
+    if (breaks(i)) {
+      const c = mask[i]
+      if (COMMAND_BOUNDARY.includes(c)) { endCommand(); i += 1; continue }
+      if (c === ' ' || c === '\t') { i += 1; continue }
+      // A REDIRECTION AND ITS TARGET ARE NOT THE COMMAND WORD, and must not be taken for one.
       i += 1
-      while (i < mask.length && '<>&'.includes(mask[i])) i += 1
-      while (i < mask.length && (mask[i] === ' ' || mask[i] === '\t')) i += 1
-      while (i < mask.length && !METACHARACTERS.includes(mask[i])) i += 1
+      while (i < mask.length && breaks(i) && '<>&'.includes(mask[i])) i += 1
+      while (i < mask.length && breaks(i) && (mask[i] === ' ' || mask[i] === '\t')) i += 1
+      while (i < mask.length && !breaks(i)) i += 1
       continue
     }
+    // A word — a line continuation inside it is part of it, which is how the operand reader
+    // above finds the start of a name a `\<newline>` splits.
     const wordStart = i
-    while (i < mask.length && !METACHARACTERS.includes(mask[i])) i += 1
+    while (i < mask.length && !breaks(i)) i += 1
     const word = mask.slice(wordStart, i).split(JOINED).join('')
     // `2>&1` — the file descriptor is part of the redirection, not a command.
-    if ((mask[i] === '<' || mask[i] === '>') && /^[0-9]+$/.test(word)) continue
+    if (i < mask.length && (mask[i] === '<' || mask[i] === '>') && /^[0-9]+$/.test(word)) continue
     const operand = byWord.get(wordStart)
     if (operand !== undefined) {
       if (commandWord === null) pending.push(operand)
@@ -788,8 +817,9 @@ function classifyAssignmentPositions(mask: string, operands: MaskAssignment[]): 
  *
  * A filter over {@link maskAssignmentOperands}, which is where the rule lives.
  */
-function assignmentOffsets(mask: string, name: string): number[] {
-  return maskAssignmentOperands(mask).filter((operand) => operand.name === name).map((operand) => operand.nameOffset)
+function assignmentOffsets(reading: { mask: string; quoted: Uint8Array }, source: string, name: string): number[] {
+  return maskAssignmentOperands(reading.mask, source, reading.quoted)
+    .filter((operand) => operand.name === name).map((operand) => operand.nameOffset)
 }
 
 /**
@@ -841,8 +871,9 @@ export type ShellAssignment = {
  * disagree about.
  */
 export function shellAssignments(source: string, where = 'the script'): ShellAssignment[] {
-  const mask = maskCached(source, where)
-  return maskAssignmentOperands(mask).map(({ name, nameOffset, valueOffset, append, position }) => ({
+  const reading = readingCached(source, where)
+  const mask = reading.mask
+  return maskAssignmentOperands(mask, source, reading.quoted).map(({ name, nameOffset, valueOffset, append, position }) => ({
     name,
     line: lineOf(source, nameOffset),
     append,
@@ -939,11 +970,17 @@ export function shellWordLiteral(word: string): ShellWordValue {
       continue
     }
     if (c === '$') {
-      // `$1`, `$name`, `$@`, `$?` — and a `$` that names nothing, which bash leaves literal.
+      // `$1`, `$name`, `$@`, `$?`.
       const named = /^\$(?:[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-])/.exec(word.slice(i))
-      if (named === null) { literal += '$'; i += 1; continue }
-      why ??= 'a parameter expansion'
-      i += named[0].length
+      if (named !== null) { why ??= 'a parameter expansion'; i += named[0].length; continue }
+      // A `$` AT THE END OF THE WORD IS NOT TAKEN FOR THE LITERAL `$` BASH WOULD MAKE OF IT.
+      // `(` is a metacharacter in both readings, so shellAssignments() ends the word AT it and
+      // `ref=DB_FENCE_PROBE_$(pick)` arrives here as `DB_FENCE_PROBE_$` — a fragment whose last
+      // byte is the opening of a substitution that was cut off. A trailing `$` is refused for
+      // that reason; a real one mid-word is the literal bash makes of it.
+      if (i === word.length - 1) { why ??= 'a command substitution'; i += 1; continue }
+      literal += '$'
+      i += 1
       continue
     }
     if (c === '`') { why ??= 'a command substitution'; stack.push('`'); i += 1; continue }
@@ -962,16 +999,21 @@ export function shellWordLiteral(word: string): ShellWordValue {
   return { kind: 'literal', value: literal }
 }
 
-const MASK_CACHE = new Map<string, string>()
+const MASK_CACHE = new Map<string, { mask: string; quoted: Uint8Array }>()
 
-/** {@link maskShellSource}, memoised: the census walks 13 scripts once per symbol, not per byte. */
-function maskCached(source: string, where: string): string {
+/** {@link maskAndQuoting}, memoised: the census walks 13 scripts once per symbol, not per byte. */
+function readingCached(source: string, where: string): { mask: string; quoted: Uint8Array } {
   const hit = MASK_CACHE.get(source)
   if (hit !== undefined) return hit
-  const mask = maskShellSource(source, where)
+  const reading = maskAndQuoting(source, where)
   if (MASK_CACHE.size >= 64) MASK_CACHE.clear()
-  MASK_CACHE.set(source, mask)
-  return mask
+  MASK_CACHE.set(source, reading)
+  return reading
+}
+
+/** The mask alone, for the readers that do not need to know which word is the command. */
+function maskCached(source: string, where: string): string {
+  return readingCached(source, where).mask
 }
 
 const DEPARSE_CACHE = new Map<string, string>()
@@ -1072,12 +1114,14 @@ function bodyRangesBothReadings(source: string, where: string): {
   mask: string
   mine: Array<[number, number]>
   deparsedMask: string
+  deparsedSource: string
   deparsed: Array<[number, number]>
 } {
   const mask = maskCached(source, where)
   const mine = functionBodyRanges(mask, where)
   const deparsedWhere = `${where} (as bash parses it)`
-  const deparsedMask = maskCached(bashDeparse(source, where), deparsedWhere)
+  const deparsedSource = bashDeparse(source, where)
+  const deparsedMask = maskCached(deparsedSource, deparsedWhere)
   const deparsed = functionBodyRanges(deparsedMask, deparsedWhere)
   if (deparsed.length !== mine.length) {
     throw new ShellLexError(
@@ -1086,7 +1130,7 @@ function bodyRangesBothReadings(source: string, where: string): {
       + 'readings must agree on them before anything is reported. Fix the lexer — do not take '
       + 'either number on its own.')
   }
-  return { mask, mine, deparsedMask, deparsed }
+  return { mask, mine, deparsedMask, deparsedSource, deparsed }
 }
 
 /**
@@ -1111,8 +1155,8 @@ function constantAssignmentOffsets(source: string, name: string, where: string):
       + 'the string it is. The count is refused rather than guessed.')
   }
 
-  const { mine: bodies, deparsedMask, deparsed: deparsedBodies } = bodyRangesBothReadings(source, where)
-  const offsets = assignmentOffsets(mask, name)
+  const { mine: bodies, deparsedMask, deparsedSource, deparsed: deparsedBodies } = bodyRangesBothReadings(source, where)
+  const offsets = assignmentOffsets(readingCached(source, where), source, name)
     .filter((offset) => !bodies.some(([start, end]) => offset >= start && offset < end))
 
   // BASH'S OWN READING OF THE SAME BYTES, as for the definitions. `--pretty-print` deparses from
@@ -1128,7 +1172,7 @@ function constantAssignmentOffsets(source: string, name: string, where: string):
   // a second reading of the same question and not an oracle for it. It catches a body this file's
   // lexer failed to find or delimited differently from bash — which is the failure mode this
   // guard has actually had — and it does not catch a construct both readings misread alike.
-  const deparsed = assignmentOffsets(deparsedMask, name)
+  const deparsed = assignmentOffsets(readingCached(deparsedSource, `${where} (as bash parses it)`), deparsedSource, name)
     .filter((offset) => !deparsedBodies.some(([start, end]) => offset >= start && offset < end))
   if (deparsed.length !== offsets.length) {
     throw new ShellLexError(

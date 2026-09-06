@@ -2712,9 +2712,9 @@ const literalName = (word: string): string | null => LITERAL_NAME.exec(word)?.[1
  * follows `ref="${x}"` into `ref` whenever `x` is a report, so alias-ness travels through a copy on
  * that path rather than this one. What it does not model is where the copied value came from if it
  * was never a report — the call-site dataflow this census has refused to invent since r4, and which
- * the library closes instead by refusing EVERY indirection in it unconditionally. Measured: over
- * the shipped four files, 887 words are read out in full, 738 are ruled out by a character no
- * identifier may carry, 761 are copies, and NONE is refused.
+ * the library closes instead by refusing EVERY indirection in it unconditionally. Measured over the
+ * shipped four files, across the 2222 words that REPLACE a name: 837 are read out in full, 712 are
+ * ruled out by a character no identifier may carry, 673 are copies, and NONE is refused.
  */
 type AliasAnswer =
   | { readonly kind: 'name'; readonly name: string }
@@ -3039,6 +3039,266 @@ test('[o3d-secops] a report that reaches one of the four sinks fails the sink ce
     Object.keys(MUTABLE_LIBRARY_NAMES))
   assert.ok(whole.followed.some((entry) => entry.startsWith('ref (holds the NAME DB_FENCE_PROBE_REASON')),
     `a quoted whole-word alias must be followed; it followed: ${whole.followed.join(', ')}`)
+})
+
+/**
+ * WHICH ASSIGNMENT-SHAPED WORDS ACTUALLY ASSIGN (o3d-secops r6, Codex HIGH).
+ *
+ * The alias closure took every word shellAssignments() returned for a persistent replacement of a
+ * shell variable. Three of the shapes it returns are not one, and bash is unambiguous about all
+ * three — so each is RUN HERE FIRST, with `ref` given a non-report value beforehand, and what bash
+ * prints back is asserted before anything is asked of the scanner:
+ *
+ *   ref+=NAME          `ref` keeps SOMETHING_UNTRACKED and gains the text: an APPEND, not a
+ *                      replacement, so after it `ref` holds neither value on its own.
+ *   ref=NAME true      `ref` is still SOMETHING_UNTRACKED. The assignment went into `true`'s
+ *                      ENVIRONMENT and the shell's own variable was never touched.
+ *   echo ref=NAME      `ref` is still SOMETHING_UNTRACKED. `echo` printed the text; nothing was
+ *                      assigned by anything.
+ *
+ * WHY AN OVER-COUNT HERE IS NOT HARMLESS. A name in the report set is a name the CONDITIONAL rule
+ * is allowed to see beside another report and stay silent about, so an invented alias is a way to
+ * buy an authorization conditional's silence — exactly what r5's quote-balance requirement was
+ * added to stop, spent three other ways. Measured over the shipped four files: 2386 words are
+ * assignment-shaped, and 164 of them (46 appends, 21 command prefixes, 97 arguments) are not
+ * replacements. The old rule read all 164 as replacements. Every one of the 21 prefixes is real —
+ * `IFS= read`, `IFS='|' read`, `LC_ALL=C sort` — and every one of the 97 arguments is an operand of
+ * `env`, of `psql -v` or of `chmod`, none of which assigns a shell variable.
+ *
+ * ROUTE: shellAssignments().position and .replaces on each form, against bash's own answer.
+ *
+ * MUTATION: make `replaces` ignore the position (`replaces: !append`) and the prefix and argument
+ * rows go red; make it ignore the append (`replaces: position === 'assignment' || position ===
+ * 'operand'`) and the append row goes red instead. Both edits were made and this test run under
+ * each.
+ */
+test('[o3d-secops] the assignment reader says which words REPLACE a name and which only look like it', (t) => {
+  const bashLeaves = (form: string): string => {
+    const dir = createTempDirSync('ims-secops-replaces-', t)
+    const file = join(dir, 'subject.sh')
+    writeFileSync(file, `f() {\n  local ref=SOMETHING_UNTRACKED\n  ${form}\n  printf '%s' "\${ref}"\n}\nf\n`)
+    const run = spawnSync('bash', [file], { encoding: 'utf8' })
+    assert.equal(run.status, 0, `bash must accept ${JSON.stringify(form)}: ${run.stderr}`)
+    return run.stdout
+  }
+  const read = (form: string, name = 'ref'): { position: string; replaces: boolean } => {
+    const found = shellAssignments(`${form}\n`, 'a fixture').filter((entry) => entry.name === name)
+    assert.equal(found.length, 1, `exactly one \`${name}\` word in ${JSON.stringify(form)}`)
+    return { position: found[0].position, replaces: found[0].replaces }
+  }
+
+  // THE THREE THAT DO NOT REPLACE. `ref` must come back as the value it already had.
+  const NOT_REPLACED: ReadonlyArray<readonly [string, string, string]> = [
+    ['ref+=DB_FENCE_PROBE_REASON', 'SOMETHING_UNTRACKEDDB_FENCE_PROBE_REASON', 'assignment'],
+    ['ref=DB_FENCE_PROBE_REASON true', 'SOMETHING_UNTRACKED', 'prefix'],
+    ['echo ref=DB_FENCE_PROBE_REASON >/dev/null', 'SOMETHING_UNTRACKED', 'argument'],
+  ]
+  for (const [form, leaves, position] of NOT_REPLACED) {
+    assert.equal(bashLeaves(form), leaves,
+      `bash must leave ref as ${leaves} after ${JSON.stringify(form)}, or this test is about a typo`)
+    assert.deepEqual(read(form), { position, replaces: false }, `shellAssignments() on ${JSON.stringify(form)}`)
+  }
+
+  // AND THE ONES THAT DO, or the rule above is "nothing assigns" wearing a costume.
+  const REPLACED: ReadonlyArray<readonly [string, string]> = [
+    ['ref=DB_FENCE_PROBE_REASON', 'assignment'],
+    ['ref=DB_FENCE_PROBE_REASON; true', 'assignment'],
+    ['local ref=DB_FENCE_PROBE_REASON', 'operand'],
+    ['declare ref=DB_FENCE_PROBE_REASON', 'operand'],
+    ['export ref=DB_FENCE_PROBE_REASON', 'operand'],
+    ['readonly ref=DB_FENCE_PROBE_REASON', 'operand'],
+    ['typeset -r ref=DB_FENCE_PROBE_REASON', 'operand'],
+    ['declare -- ref=DB_FENC"E_PROBE_REASON"', 'operand'],
+    ['local scratch=/tmp/keep ref=DB_FENCE_PROBE_REASON', 'operand'],
+    ['ref=DB_FENCE_PROBE_REASON >/dev/null', 'assignment'],
+  ]
+  for (const [form, position] of REPLACED) {
+    assert.equal(bashLeaves(form), 'DB_FENCE_PROBE_REASON',
+      `bash must really replace ref from ${JSON.stringify(form)}`)
+    assert.deepEqual(read(form), { position, replaces: true }, `shellAssignments() on ${JSON.stringify(form)}`)
+  }
+
+  // THE COMMAND PREFIX ON A FUNCTION, WHICH IS THE ONE THING THIS DOES NOT MODEL, ASSERTED RATHER
+  // THAN LEFT IN A COMMENT. Inside the called function the prefix IS visible; after it returns the
+  // name is unset. It is still not a replacement of a shell variable, so it is still `prefix` —
+  // a caller that needs a function's view of its caller's prefix has to model the call.
+  const dir = createTempDirSync('ims-secops-prefix-', t)
+  const file = join(dir, 'subject.sh')
+  writeFileSync(file, 'g() { printf \'%s|\' "${refA-<unset>}"; }\nrefA=DB_FENCE_PROBE_REASON g\nprintf \'%s\' "${refA-<unset>}"\n')
+  const run = spawnSync('bash', [file], { encoding: 'utf8' })
+  assert.equal(run.status, 0, run.stderr)
+  assert.equal(run.stdout, 'DB_FENCE_PROBE_REASON|<unset>',
+    'a command prefix is visible inside the called function and gone after it')
+  assert.deepEqual(read('refA=DB_FENCE_PROBE_REASON g', 'refA'), { position: 'prefix', replaces: false },
+    'and it is reported as the prefix it is')
+})
+
+/**
+ * WHAT VALUE A WORD GIVES A NAME, READ WHOLE OR REFUSED (o3d-secops r6, Codex HIGH).
+ *
+ * The alias reader accepted a bare identifier, or one wrapped in a single matching pair of quotes.
+ * Bash does not read words that way: it removes quotes and CONCATENATES adjacent fragments, so
+ * `DB_FENCE_PROBE_"REASON"` is one word whose value is `DB_FENCE_PROBE_REASON`. Every spelling
+ * below is run under a real bash first and its value asserted, because a rule aimed at a form bash
+ * does not accept is a rule about a typo — and then shellWordLiteral() is required to give the same
+ * answer.
+ *
+ * AND WHAT IT WILL NOT GUESS. A parameter expansion or a command substitution makes the value a
+ * RUNTIME value; the reader returns `unstatic` with only the fragments that ARE determined, so the
+ * caller can still rule out what those already make impossible — a `/` or a space is in no
+ * identifier. That is what keeps `"${dir}/file"` from being refused while
+ * `"DB_FENCE_PROBE_${which}"` is.
+ *
+ * ROUTE: shellWordLiteral() on each word, against bash's own value for the same bytes.
+ *
+ * MUTATION: delete the double-quote branch so a `"` is an ordinary literal byte and every
+ * concatenated row goes red; make the `$` branch append `'$'` instead of recording `why` and every
+ * `unstatic` row goes red. Both edits were made and this test run under each.
+ */
+test('[o3d-secops] a shell word is evaluated whole, and what cannot be evaluated is refused', (t) => {
+  const bashValue = (word: string): string => {
+    const dir = createTempDirSync('ims-secops-word-', t)
+    const file = join(dir, 'subject.sh')
+    writeFileSync(file, `ref=${word}\nprintf '%s' "\${ref}"\n`)
+    const run = spawnSync('bash', [file], { encoding: 'utf8' })
+    assert.equal(run.status, 0, `bash must accept ref=${word}: ${run.stderr}`)
+    return run.stdout
+  }
+
+  // ONE VALUE, MANY SPELLINGS. bash says so, then the reader must.
+  for (const word of [
+    'DB_FENCE_PROBE_REASON',
+    '"DB_FENCE_PROBE_REASON"',
+    "'DB_FENCE_PROBE_REASON'",
+    'DB_FENCE_PROBE_"REASON"',
+    'DB_FENC"E_PROBE_REASON"',
+    '"DB_FENCE"_PROBE\'_REASON\'',
+    'DB_FENCE_PROBE_REASO\\N',
+    '""DB_FENCE_PROBE_REASON""',
+    "$'DB_FENCE_PROBE_REASON'",
+  ]) {
+    assert.equal(bashValue(word), 'DB_FENCE_PROBE_REASON',
+      `bash must really assign DB_FENCE_PROBE_REASON from ${JSON.stringify(word)}`)
+    assert.deepEqual(shellWordLiteral(word), { kind: 'literal', value: 'DB_FENCE_PROBE_REASON' },
+      `shellWordLiteral() on ${JSON.stringify(word)}`)
+  }
+
+  // AND VALUES THAT ARE READ WHOLE AND ARE SIMPLY NOT NAMES.
+  for (const [word, value] of [['/tmp/x', '/tmp/x'], ['a\\ b', 'a b'], ["'a b'", 'a b']] as const) {
+    assert.equal(bashValue(word), value, `bash on ${JSON.stringify(word)}`)
+    assert.deepEqual(shellWordLiteral(word), { kind: 'literal', value }, `shellWordLiteral() on ${JSON.stringify(word)}`)
+  }
+
+  // WHAT IS NOT DETERMINED BY THE SOURCE. Each is asserted on `kind` AND on the fragments it did
+  // determine, because the fragments are what the caller rules a name out with.
+  const unstatic: ReadonlyArray<readonly [string, string]> = [
+    ['"${x}"', ''],
+    ['$1', ''],
+    ['"$(pick)"', ''],
+    ['`pick`', ''],
+    ['"DB_FENCE_PROBE_${which}"', 'DB_FENCE_PROBE_'],
+    ['DB_FENCE_$(pick)', 'DB_FENCE_'],
+    ['"${dir}/file"', '/file'],
+    // A WORD SHELLASSIGNMENTS() CUT SHORT AT A QUOTED SPACE. The space is recovered into the
+    // fragments, where it says the one thing that matters: this is not one bare identifier.
+    ['"DB_FENCE_PROBE_REASON', 'DB_FENCE_PROBE_REASON '],
+    // A TRUNCATION INSIDE A SUBSTITUTION CARRIES NO SUCH FACT: that space never reaches the value.
+    ['"$(pick', ''],
+  ]
+  for (const [word, literal] of unstatic) {
+    const read = shellWordLiteral(word)
+    assert.equal(read.kind, 'unstatic', `${JSON.stringify(word)} is not determined by the source: ${JSON.stringify(read)}`)
+    assert.equal(read.kind === 'unstatic' ? read.literal : '', literal, `the determined fragments of ${JSON.stringify(word)}`)
+  }
+})
+
+/**
+ * AND THE SAME TWO FACTS AT THE CENSUS, WHERE THEY DECIDE WHETHER A FINDING IS PRODUCED
+ * (o3d-secops r6, Codex HIGH x2).
+ *
+ * The two halves are one question — what NAME does this assignment give? — and getting it wrong in
+ * either direction is a SILENCE:
+ *
+ *   A FALSE ALIAS suppresses. `ref` promoted into the report set on the strength of an append, a
+ *   command prefix or an argument makes `[[ -n "${ref}" && -n "${A_REPORT}" ]]` a test of reports
+ *   only, and the conditional rule stays silent about what is an authorization gate.
+ *
+ *   A MISSED ALIAS evades. `ref=DB_FENC"E_PROBE_REASON"` is a real alias in ordinary shell syntax;
+ *   unfollowed, the `${!ref}` two lines later carries no report on its statement and is skipped
+ *   rather than refused.
+ *
+ * ROUTE: reportSinkComplaints() with each plant appended to scripts/deploy.sh — an entrypoint,
+ * which is where the indirection refusal is SCOPED by the statement rather than unconditional, so a
+ * missed alias really does produce nothing there.
+ *
+ * MUTATION: drop the `if (!held.replaces) continue` gate and all three false-alias rows go red
+ * (each conditional falls silent); restore the r5 reader (`/^(?:(NAME)|"(NAME)"|'(NAME)')$/`) as
+ * aliasedName() and the concatenated row goes red; make aliasedName() return `settled` instead of
+ * `refuse` and the assembled-name row goes red. All three edits were made and this test run under
+ * each.
+ */
+test('[o3d-secops] a false alias does not silence a conditional, and a concatenated one is still followed', () => {
+  const DEPLOY_INDEX = 1 + ENTRYPOINTS.indexOf('scripts/deploy.sh')
+  const plantedInDeploy = (text: string): ReturnType<typeof reportSinkComplaints> => reportSinkComplaints(
+    SINK_CENSUS_SOURCES.map((entry, index) =>
+      (index === DEPLOY_INDEX ? [entry[0], `${entry[1]}\n${text}\n`] as const : entry)),
+    Object.keys(MUTABLE_LIBRARY_NAMES))
+
+  // THE GATE THE FALSE ALIAS WOULD HAVE BOUGHT SILENCE ON. `ref` is given a value that is not a
+  // report first, so each shape below is asked to change an answer that is already settled.
+  const GATE = '[[ -n "${ref}" && -n "${DB_FENCE_PROBE_REASON}" ]] && exit 1'
+  const NOT_A_REPORT = 'ref=SOMETHING_UNTRACKED'
+
+  for (const [shape, form] of [
+    ['an append', 'ref+=DB_FENCE_PROBE_REASON'],
+    ['a command prefix', 'ref=DB_FENCE_PROBE_REASON true'],
+    ['an argument after an ordinary command', 'echo ref=DB_FENCE_PROBE_REASON'],
+  ] as ReadonlyArray<readonly [string, string]>) {
+    const planted = plantedInDeploy(`${NOT_A_REPORT}\n${form}\n${GATE}`)
+    assert.ok(!planted.followed.some((entry) => entry.startsWith('ref ')),
+      `${shape} must not make \`ref\` an alias; it followed: ${planted.followed.join(', ')}`)
+    assert.equal(planted.complaints.length, 1,
+      `${shape} must leave the gate complained about and add nothing else:\n${planted.complaints.join('\n')}`)
+    assert.match(planted.complaints[0], /tests DB_FENCE_PROBE_REASON alongside something that is not another report/,
+      planted.complaints[0])
+  }
+
+  // NOT VACUOUS: the SAME gate, after a real replacement, IS silenced. Without this the three
+  // assertions above would pass just as well against a census that had stopped following aliases —
+  // which is the other half of this round's finding.
+  const silenced = plantedInDeploy(`${NOT_A_REPORT}\nref=DB_FENCE_PROBE_REASON\n${GATE}`)
+  assert.deepEqual(silenced.complaints, [],
+    `a real alias must still make the gate a test of reports only:\n${silenced.complaints.join('\n')}`)
+  assert.ok(silenced.followed.some((entry) => entry.startsWith('ref (holds the NAME DB_FENCE_PROBE_REASON')),
+    `and it must be followed to do that; it followed: ${silenced.followed.join(', ')}`)
+
+  // THE REAL ALIAS THAT EVADED: one literal value, spelt across a quote boundary, then read back
+  // through an indirect expansion in an entrypoint. The refusal there is scoped by the statement,
+  // so this is only refused BECAUSE the alias was followed.
+  for (const spelling of ['DB_FENC"E_PROBE_REASON"', 'DB_FENCE_PROBE_"REASON"', '"DB_FENCE"_PROBE\'_REASON\'', 'DB_FENCE_PROBE_REASO\\N']) {
+    const concatenated = plantedInDeploy(`ref=${spelling}\nnode "\${!ref}"`)
+    assert.ok(concatenated.followed.some((entry) => entry.startsWith('ref (holds the NAME DB_FENCE_PROBE_REASON')),
+      `${spelling} is one word whose value is DB_FENCE_PROBE_REASON and must be followed; it followed: ${concatenated.followed.join(', ')}`)
+    assert.equal(concatenated.complaints.length, 1,
+      `and the indirection it feeds must be the one complaint:\n${concatenated.complaints.join('\n')}`)
+    assert.match(concatenated.complaints[0], /uses an indirect expansion/, concatenated.complaints[0])
+  }
+
+  // AND A NAME BEING ASSEMBLED OUT OF SOURCE TEXT IS REFUSED, not skipped. This is the shape the
+  // canonicalisation above cannot finish: literal NAME text plus a value decided at runtime.
+  for (const word of ['"DB_FENCE_PROBE_${which}"', 'DB_FENCE_PROBE_$(pick)', 'DB_FENCE_PROBE_$suffix']) {
+    const assembled = plantedInDeploy(`ref=${word}\nnode "\${!ref}"`)
+    assert.equal(assembled.complaints.length, 1, `${word}:\n${assembled.complaints.join('\n')}`)
+    assert.match(assembled.complaints[0], /assembles a NAME out of source text/, assembled.complaints[0])
+  }
+
+  // AND A RUNTIME VALUE WITH NO LITERAL NAME TEXT IS NOT REFUSED, or the rule above is "no
+  // assignment may expand anything" — which would be red on the shipped tree and is not. These are
+  // COPIES, and a copy is carried by the walk's own assignment rule rather than this one.
+  for (const word of ['"$1"', '"${x}"', '"$(pick)"', '"${dir}/file"', '"DB_FENCE_PROBE_REASON extra"']) {
+    const copy = plantedInDeploy(`ref=${word}`)
+    assert.deepEqual(copy.complaints, [], `a copy must not be refused: ref=${word}\n${copy.complaints.join('\n')}`)
+  }
 })
 
 test('[o3d-secops] `eval` and an indirect `read` are BOTH refused and named at a sink', () => {
