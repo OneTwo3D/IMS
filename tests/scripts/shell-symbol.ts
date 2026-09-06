@@ -646,7 +646,10 @@ type MaskAssignment = {
   readonly nameOffset: number
   /** Offset of the byte AFTER the `=`, where the assigned word begins. */
   readonly valueOffset: number
+  /** Offset of the first byte of the WORD, which a line continuation puts before `nameOffset`. */
+  readonly wordOffset: number
   readonly append: boolean
+  position: ShellAssignmentPosition
 }
 
 /** What a name may be spelt with. Bash's own: a letter or `_`, then letters, digits and `_`. */
@@ -676,11 +679,106 @@ function maskAssignmentOperands(mask: string): MaskAssignment[] {
     if (!ASSIGNMENT_NAME.test(name)) continue
     let nameOffset = start
     while (nameOffset < at && mask[nameOffset] === JOINED) nameOffset += 1
-    found.push({ name, nameOffset, valueOffset: eq + 1, append })
+    found.push({ name, nameOffset, valueOffset: eq + 1, wordOffset: start, append, position: 'argument' })
   }
+  classifyAssignmentPositions(mask, found)
   if (OPERAND_CACHE.size >= 64) OPERAND_CACHE.clear()
   OPERAND_CACHE.set(mask, found)
   return found
+}
+
+/**
+ * WHERE IN ITS COMMAND AN ASSIGNMENT WORD SITS, WHICH IS WHETHER IT ASSIGNS AT ALL
+ * (o3d-secops r6, Codex HIGH).
+ *
+ * `NAME=word` starting a word is the shape of an assignment, and it was the whole of the rule
+ * above. It is not the whole of bash. THE SAME BYTES DO THREE DIFFERENT THINGS depending on what
+ * stands in front of them, and each was measured under a real bash before this was written:
+ *
+ *   ref=X                     `assignment`  a simple command with no command word: the shell's own
+ *                                           variable is replaced, and it stays replaced.
+ *   export ref=X              `operand`     an operand of a DECLARATION builtin — `declare`,
+ *   local scratch=y ref=X                   `local`, `export`, `readonly`, `typeset`. Also a
+ *                                           replacement, at that builtin's scope.
+ *   ref=X true                `prefix`      a command-prefix assignment: it is put in `true`'s
+ *                                           ENVIRONMENT and the shell's own `ref` is untouched
+ *                                           (measured: `ref2=SOMETHING; ref2=OTHER true` leaves
+ *                                           `ref2` at `SOMETHING`).
+ *   echo ref=X                `argument`    an ordinary argument that happens to contain an `=`.
+ *                                           It assigns NOTHING; `echo` prints it.
+ *
+ * A caller that asks "what does this name hold" has to have all four apart, because reading the
+ * last two as replacements is not a harmless over-approximation: it invents a value for a name that
+ * never had it.
+ *
+ * WHAT IS NOT MODELLED, SAID PLAINLY. A `prefix` on a FUNCTION call is visible inside that function
+ * for the length of the call (measured: `refA=X g` prints `X` inside `g` and leaves `refA` unset
+ * afterwards). It is still not a replacement of a shell variable and is still reported as `prefix`;
+ * a caller that cares about a function's view of its caller's prefix has to model the call, which
+ * no reading of one command can do. A pipeline or a background `&` runs its assignment in a
+ * subshell, where it IS a replacement, and is reported as one.
+ */
+export type ShellAssignmentPosition = 'assignment' | 'operand' | 'prefix' | 'argument'
+
+/** Words that stand in front of a command without being one. */
+const COMMAND_RESERVED = new Set([
+  'if', 'then', 'elif', 'else', 'fi', 'while', 'until', 'for', 'select', 'do', 'done',
+  'case', 'esac', 'in', 'function', 'time', 'coproc', '!', '{', '}', '[[', ']]',
+])
+
+/** The builtins whose OPERANDS are assignments rather than arguments. */
+const DECLARATION_BUILTINS = new Set(['declare', 'local', 'export', 'readonly', 'typeset'])
+
+/** The metacharacters that end one simple command. `<` and `>` continue it; the rest do not. */
+const COMMAND_BOUNDARY = '\n|&;()'
+
+function classifyAssignmentPositions(mask: string, operands: MaskAssignment[]): void {
+  const byWord = new Map<number, MaskAssignment>()
+  for (const operand of operands) byWord.set(operand.wordOffset, operand)
+
+  let pending: MaskAssignment[] = []
+  let commandWord: string | null = null
+  let declaration = false
+  const endCommand = (): void => {
+    // A prefix run with NO command word after it is the assignment itself; with one, it is that
+    // command's environment and nothing more.
+    for (const operand of pending) operand.position = commandWord === null ? 'assignment' : 'prefix'
+    pending = []
+    commandWord = null
+    declaration = false
+  }
+
+  let i = 0
+  while (i < mask.length) {
+    const c = mask[i]
+    if (c === ' ' || c === '\t' || c === JOINED) { i += 1; continue }
+    if (COMMAND_BOUNDARY.includes(c)) { endCommand(); i += 1; continue }
+    if (c === '<' || c === '>') {
+      // A redirection and its target are not the command word, and must not be mistaken for one.
+      i += 1
+      while (i < mask.length && '<>&'.includes(mask[i])) i += 1
+      while (i < mask.length && (mask[i] === ' ' || mask[i] === '\t')) i += 1
+      while (i < mask.length && !METACHARACTERS.includes(mask[i])) i += 1
+      continue
+    }
+    const wordStart = i
+    while (i < mask.length && !METACHARACTERS.includes(mask[i])) i += 1
+    const word = mask.slice(wordStart, i).split(JOINED).join('')
+    // `2>&1` — the file descriptor is part of the redirection, not a command.
+    if ((mask[i] === '<' || mask[i] === '>') && /^[0-9]+$/.test(word)) continue
+    const operand = byWord.get(wordStart)
+    if (operand !== undefined) {
+      if (commandWord === null) pending.push(operand)
+      else operand.position = declaration ? 'operand' : 'argument'
+      continue
+    }
+    if (COMMAND_RESERVED.has(word)) continue
+    if (commandWord === null) {
+      commandWord = word
+      declaration = DECLARATION_BUILTINS.has(word)
+    }
+  }
+  endCommand()
 }
 
 /**
@@ -719,6 +817,14 @@ export type ShellAssignment = {
   readonly line: number
   /** True for `NAME+=word`. */
   readonly append: boolean
+  /** Where in its command the word sits — see {@link ShellAssignmentPosition}. */
+  readonly position: ShellAssignmentPosition
+  /**
+   * Whether bash REPLACES the shell's own `name` with this word: a bare assignment or a declaration
+   * operand, and not an append. The one question a caller asking "what does this name hold" may
+   * ask of this record; `position` and `append` say why the answer is no.
+   */
+  readonly replaces: boolean
   /** The assigned word AS WRITTEN in the source — quotes and all, since the mask has blanked them. */
   readonly value: string
 }
@@ -736,12 +842,124 @@ export type ShellAssignment = {
  */
 export function shellAssignments(source: string, where = 'the script'): ShellAssignment[] {
   const mask = maskCached(source, where)
-  return maskAssignmentOperands(mask).map(({ name, nameOffset, valueOffset, append }) => ({
+  return maskAssignmentOperands(mask).map(({ name, nameOffset, valueOffset, append, position }) => ({
     name,
     line: lineOf(source, nameOffset),
     append,
+    position,
+    replaces: !append && (position === 'assignment' || position === 'operand'),
     value: source.slice(valueOffset, assignedWordEnd(source, mask, valueOffset)),
   }))
+}
+
+/**
+ * WHAT VALUE A SHELL WORD ACTUALLY GIVES A NAME, OR A REFUSAL (o3d-secops r6, Codex HIGH).
+ *
+ * Bash performs quote removal and concatenates ADJACENT fragments into one word, so
+ * `DB_FENCE_PROBE_"REASON"`, `"DB_FENCE"_PROBE'_REASON'` and `DB_FENCE_PROBE_REASO\N` are all
+ * exactly `DB_FENCE_PROBE_REASON` (each measured under a real bash). A reader that accepts only a
+ * bare identifier, or one wrapped in a single matching pair of quotes, does not see any of them —
+ * and "did not see it" is indistinguishable from "it is not that name", which is how a real alias
+ * gets past a rule that follows aliases.
+ *
+ * So the word is EVALUATED, one byte at a time, exactly as far as the source determines it:
+ *
+ *   `'…'`      literal throughout, no escapes.
+ *   `"…"`      literal, except that `\` before `$`, a backtick, `"` or `\` drops the backslash, and
+ *              before a newline drops both. Any other `\` is itself literal — bash keeps it.
+ *   `\c`       unquoted: `c`. `\<newline>` is a line continuation and contributes nothing.
+ *   `$'…'`     literal while it holds no backslash; one escape and the word is refused, because
+ *              ANSI-C escapes are a second language and this is not an interpreter for it.
+ *
+ * AND WHERE IT STOPS BEING DETERMINED, IT REFUSES RATHER THAN GUESSES. A parameter expansion, a
+ * command substitution or a backtick makes the value a RUNTIME value: `kind` comes back `unstatic`,
+ * and `literal` carries only the fragments that ARE determined, so a caller can still rule out what
+ * those fragments already make impossible.
+ *
+ * ONE FACT IS RECOVERED FROM A TRUNCATION, and it is the reason `literal` is returned at all rather
+ * than nothing. {@link shellAssignments} ends a word at the first byte the mask and the source agree
+ * is a metacharacter, which inside quotes means a SPACE or a NEWLINE — so a word that runs off the
+ * end of this reader with a quote still open contained a literal space. That space is put into
+ * `literal`, where it says what it means: whatever else this value is, it is not one bare
+ * identifier. A word that runs off the end inside a `$(`, a `${` or a backtick has no such fact
+ * attached, because the space is inside the substitution and never reaches the value.
+ */
+export type ShellWordValue =
+  /** The word is written out in full: `value` is exactly what bash assigns. */
+  | { readonly kind: 'literal'; readonly value: string }
+  /** The word is decided at runtime: `literal` is the part that is not, `why` names the shape. */
+  | { readonly kind: 'unstatic'; readonly literal: string; readonly why: string }
+
+export function shellWordLiteral(word: string): ShellWordValue {
+  const stack: string[] = []
+  let literal = ''
+  let why: string | null = null
+  let i = 0
+  while (i < word.length) {
+    const top = stack[stack.length - 1]
+    const c = word[i]
+
+    // Inside a substitution or a parameter expansion nothing is literal: these bytes are the recipe
+    // and not the result. Nested openers are tracked only so the right closer ends the region.
+    if (top === '$(' || top === '${' || top === '`') {
+      if (c === '\\') { i += 2; continue }
+      if ((c === ')' && top === '$(') || (c === '}' && top === '${') || (c === '`' && top === '`')) {
+        stack.pop(); i += 1; continue
+      }
+      if (c === '$' && (word[i + 1] === '(' || word[i + 1] === '{')) { stack.push(`$${word[i + 1]}`); i += 2; continue }
+      if (c === '`') { stack.push('`'); i += 1; continue }
+      i += 1
+      continue
+    }
+    if (top === "'") {
+      if (c === "'") { stack.pop(); i += 1; continue }
+      literal += c; i += 1; continue
+    }
+    if (top === "$'") {
+      if (c === '\\') { why ??= "an ANSI-C escape in a $'…' word"; i += 2; continue }
+      if (c === "'") { stack.pop(); i += 1; continue }
+      literal += c; i += 1; continue
+    }
+
+    // Unquoted, or inside a double quote.
+    if (c === '\\') {
+      const next = word[i + 1]
+      if (next === undefined) { why ??= 'a trailing backslash'; i += 1; continue }
+      if (next === '\n') { i += 2; continue }
+      if (top === '"' && !'$`"\\'.includes(next)) { literal += `\\${next}`; i += 2; continue }
+      literal += next; i += 2; continue
+    }
+    if (c === '"') { if (top === '"') stack.pop(); else stack.push('"'); i += 1; continue }
+    if (c === "'" && top !== '"') { stack.push("'"); i += 1; continue }
+    if (c === '$' && word[i + 1] === "'" && top !== '"') { stack.push("$'"); i += 2; continue }
+    if (c === '$' && (word[i + 1] === '(' || word[i + 1] === '{')) {
+      why ??= word[i + 1] === '(' ? 'a command substitution' : 'a parameter expansion'
+      stack.push(`$${word[i + 1]}`)
+      i += 2
+      continue
+    }
+    if (c === '$') {
+      // `$1`, `$name`, `$@`, `$?` — and a `$` that names nothing, which bash leaves literal.
+      const named = /^\$(?:[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-])/.exec(word.slice(i))
+      if (named === null) { literal += '$'; i += 1; continue }
+      why ??= 'a parameter expansion'
+      i += named[0].length
+      continue
+    }
+    if (c === '`') { why ??= 'a command substitution'; stack.push('`'); i += 1; continue }
+    literal += c
+    i += 1
+  }
+
+  const open = stack[stack.length - 1]
+  if (open === '"' || open === "'" || open === "$'") {
+    return { kind: 'unstatic', literal: `${literal} `, why: 'a quoted space, which ended the word early' }
+  }
+  if (open !== undefined) {
+    return { kind: 'unstatic', literal, why: open === '${' ? 'a parameter expansion' : 'a command substitution' }
+  }
+  if (why !== null) return { kind: 'unstatic', literal, why }
+  return { kind: 'literal', value: literal }
 }
 
 const MASK_CACHE = new Map<string, string>()

@@ -27,7 +27,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync,
 import { dirname, join } from 'node:path'
 import test, { type TestContext } from 'node:test'
 
-import { maskShellSource, shellAssignments, shellConstant, shellConstantAssignments, shellConstantOptional, shellFunction, shellFunctionBodyCount, shellFunctionDefinitions } from './shell-symbol.ts'
+import { maskShellSource, shellAssignments, shellConstant, shellConstantAssignments, shellConstantOptional, shellFunction, shellFunctionBodyCount, shellFunctionDefinitions, shellWordLiteral } from './shell-symbol.ts'
 import { createTempDirSync } from './temp-dir.ts'
 
 const REPO = process.cwd()
@@ -2683,20 +2683,52 @@ const LITERAL_NAME = /^["']?([A-Za-z_][A-Za-z0-9_]*)["']?$/
 const literalName = (word: string): string | null => LITERAL_NAME.exec(word)?.[1] ?? null
 
 /**
- * The name an assignment's WHOLE right-hand side is, or `null` when the word is anything else.
+ * WHAT NAME, IF ANY, AN ASSIGNED WORD HOLDS — ANSWERED, OR REFUSED (o3d-secops r6, Codex HIGH).
  *
- * Stricter than {@link literalName} in one way that matters here: the quoting has to BALANCE.
- * shellAssignments() ends a word at the first byte the mask and the source agree is a
- * metacharacter, so a quoted space ends it early and `ref="DB_FENCE_PROBE_REASON extra"` comes back
- * as the fragment `"DB_FENCE_PROBE_REASON`. literalName() would read that as the name, and the
- * report set would gain a name that is not an alias — which is not a harmless over-approximation
- * here, because a report in the set is a name the CONDITIONAL rule is allowed to see beside another
- * report and stay silent about. An unbalanced fragment is therefore not a name.
+ * This used to be a regex: a bare identifier, or one wrapped in a single matching pair of quotes.
+ * It was wrong in the direction that matters, because bash concatenates adjacent literal fragments
+ * and removes quotes, so `ref=DB_FENC"E_PROBE_REASON"` really does assign `DB_FENCE_PROBE_REASON`
+ * and the regex read it as "not a name at all". A real alias, in ordinary shell syntax, invisible —
+ * and then `node "${!ref}"` in an entrypoint had no report on the statement, so the indirection was
+ * skipped rather than refused. shellWordLiteral() evaluates the word instead, so every spelling of
+ * one literal value gives one answer.
+ *
+ * THERE ARE THREE ANSWERS, AND THE THIRD IS THE POINT.
+ *
+ *   `name`     the word is written out in full and IS an identifier. Follow it.
+ *   `settled`  the census knows there is nothing to follow. Either the word is written out in full
+ *              and is not an identifier (`ref=/tmp/x`), or it is a runtime value whose determined
+ *              fragments ALREADY rule an identifier out — `"${dir}/file"` carries a literal `/`,
+ *              and `"${a} b"` carries a literal space (see shellWordLiteral() on how a truncation
+ *              yields that fact). No identifier contains either.
+ *   `refuse`   the word mixes literal NAME text with something decided at runtime —
+ *              `ref="DB_FENCE_PROBE_${which}"`, `ref=DB_FENCE_$(pick)`. It is a name being
+ *              ASSEMBLED out of source text, the assembly cannot be finished lexically, and the
+ *              answer decides whether `${!ref}` reads a report. So it is refused by name and line.
+ *
+ * AND THE BOUNDARY OF `settled`, STATED RATHER THAN LEFT TO BE FOUND. A word with NO literal text
+ * at all — `ref="$1"`, `ref="${x}"`, `ref="$(pick)"` — is not refused. It COPIES a value from
+ * somewhere else, and a copy is what the census already models: the walk's own assignment rule
+ * follows `ref="${x}"` into `ref` whenever `x` is a report, so alias-ness travels through a copy on
+ * that path rather than this one. What it does not model is where the copied value came from if it
+ * was never a report — the call-site dataflow this census has refused to invent since r4, and which
+ * the library closes instead by refusing EVERY indirection in it unconditionally. Measured: over
+ * the shipped four files, 887 words are read out in full, 738 are ruled out by a character no
+ * identifier may carry, 761 are copies, and NONE is refused.
  */
-const ALIASED_NAME = /^(?:([A-Za-z_][A-Za-z0-9_]*)|"([A-Za-z_][A-Za-z0-9_]*)"|'([A-Za-z_][A-Za-z0-9_]*)')$/
-const aliasedName = (word: string): string | null => {
-  const match = ALIASED_NAME.exec(word)
-  return match === null ? null : (match[1] ?? match[2] ?? match[3])
+type AliasAnswer =
+  | { readonly kind: 'name'; readonly name: string }
+  | { readonly kind: 'settled' }
+  | { readonly kind: 'refuse'; readonly why: string }
+
+const NAME_TEXT = /^[A-Za-z0-9_]*$/
+const aliasedName = (word: string): AliasAnswer => {
+  const value = shellWordLiteral(word)
+  if (value.kind === 'literal') {
+    return /^[A-Za-z_][A-Za-z0-9_]*$/.test(value.value) ? { kind: 'name', name: value.value } : { kind: 'settled' }
+  }
+  if (!NAME_TEXT.test(value.literal) || value.literal === '') return { kind: 'settled' }
+  return { kind: 'refuse', why: value.why }
 }
 
 function indirections(segment: string): Indirection[] {
@@ -2746,6 +2778,13 @@ function reportSinkComplaints(sources: ReadonlyArray<readonly [string, string]>,
   const followed: string[] = []
   let complaints: string[] = []
   let examined = 0
+  // A NAME THAT IS EVER APPENDED TO IS NEVER AN ALIAS. `ref+=X` keeps whatever `ref` held and adds
+  // to it, so neither the append nor any replacement elsewhere leaves the census able to say the
+  // name still holds exactly one report's name. Estate-wide rather than per-file, because the
+  // census's name space is flat (see nameExpansions()). Measured: no name in the shipped four
+  // files, and none at b128f47f, is both appended to and otherwise followable as an alias.
+  const appendedTo = new Set(sources.flatMap(([file, source]) =>
+    shellAssignments(source, file).filter(({ append }) => append).map(({ name }) => name)))
   // The set GROWS as assignments are followed, so a report copied into another name drags that name
   // into the question. Re-walked until it stops growing; the estate is small and this terminates.
   for (let round = 0; round < 8; round += 1) {
@@ -2850,13 +2889,35 @@ function reportSinkComplaints(sources: ReadonlyArray<readonly [string, string]>,
     // no-option forms and every operand of each are covered without one of them being enumerated.
     // It reads the MASKED source too, so a `ref=DB_FENCE_PROBE_REASON` in a trailing comment or a
     // here-document body is data rather than an alias, which the line rule could not tell.
+    //
+    // AND WHICH OF THOSE ACTUALLY ASSIGN IS A SECOND QUESTION, WHICH THIS ALSO USED TO SKIP
+    // (o3d-secops r6, Codex HIGH). Everything shellAssignments() returned was taken for a
+    // persistent replacement, and three of the shapes it returns are not one — `ref+=NAME` keeps
+    // the old value, `ref=NAME true` is `true`'s environment, `echo ref=NAME` assigns nothing at
+    // all. Each nevertheless promoted `ref` into the report set, and a report in that set is a name
+    // the CONDITIONAL rule may see beside another report and stay silent about. So an invented
+    // alias BUYS A CONDITIONAL'S SILENCE, which is the same currency the quote-balance requirement
+    // was added for in r5, spent three other ways. `held.replaces` is now the gate, and
+    // shellAssignments() derives it from where the word sits in its command.
     for (const [file, source] of sources) {
       for (const held of shellAssignments(source, file)) {
-        if (reports.has(held.name)) continue
-        const pointee = aliasedName(held.value)
-        if (pointee === null || !reports.has(pointee)) continue
+        // ONLY A PERSISTENT REPLACEMENT ANSWERS THE QUESTION. `held.replaces` is false for the
+        // three shapes above, and each was measured under a real bash before this line was written.
+        if (!held.replaces) continue
+        const answer = aliasedName(held.value)
+        if (answer.kind === 'refuse') {
+          complaints.push(
+            `${file}:${held.line} assembles a NAME out of source text and ${answer.why}, so this `
+            + `census cannot say what ${held.name} holds: ${held.name}=${held.value}\n`
+            + '  A name held in a variable is read back with `${!…}`, and whether that reads a report '
+            + 'is decided by this value. Write the name outright, or derive and consume the value '
+            + 'inside one function so no script-scope name is in play.')
+          continue
+        }
+        if (answer.kind !== 'name' || !reports.has(answer.name)) continue
+        if (reports.has(held.name) || appendedTo.has(held.name)) continue
         reports.add(held.name)
-        followed.push(`${held.name} (holds the NAME ${pointee}, from ${file}:${held.line})`)
+        followed.push(`${held.name} (holds the NAME ${answer.name}, from ${file}:${held.line})`)
       }
     }
     if (reports.size === before) break
