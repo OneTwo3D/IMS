@@ -6,7 +6,7 @@
  */
 
 import { coversDocumentTotal } from '@/lib/domain/accounting/paid-coverage'
-import { toDecimal } from '@/lib/domain/math/decimal'
+import { toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 
 import type { XeroResponse } from './api'
 
@@ -892,6 +892,43 @@ const LEDGER_AMOUNT_GRAMMAR = /^[+-]?\d+(?:\.\d+)?$/
  * which withholds; a rejected string that came back as 0 would be indistinguishable from a ledger
  * saying it holds nothing, i.e. from the reversal itself.
  */
+/**
+ * o3d-psrx r12 (Codex HIGH 1), generalised in r13 (Codex HIGH 2) — A DECIMAL READ AS A `number`, OR
+ * NULL BECAUSE THE `number` WOULD NOT SAY WHAT THE DECIMAL SAID.
+ *
+ * `Decimal.toNumber()` is the only lossy step in this file's money handling, and it is lossy in two
+ * directions that both land on a value this lifecycle spends:
+ *
+ *   - OVERFLOW. A grammatical figure with 400 digits is a finite Decimal and an INFINITE double.
+ *     Checked first, because the round trip below cannot convert an infinity back into a Decimal.
+ *   - UNDERFLOW AND SILENT PRECISION LOSS. `"0." + "0".repeat(399) + "1"` is grammatically perfect
+ *     decimal money whose `toNumber()` is 0 — and a zero is precisely the value that puts an amount
+ *     in the bucket which clears `paidAt`. `"9007199254740993"` reads as ...992 the same way.
+ *
+ * STATED AS A LOSSLESSNESS PROPERTY AND NOT AS A RANGE. "Too small" and "too big" are magnitudes
+ * somebody has to remember and keep in step with IEEE-754, while "the number does not say what the
+ * Decimal said" is the actual defect and catches every instance of it. The comparison is against a
+ * Decimal RECONSTRUCTED FROM THE RESULTING NUMBER, so it asks exactly the question that matters: can
+ * this number be spent in place of the figure it came from?
+ *
+ * WHY IT IS A FUNCTION AND NOT A LINE INSIDE `parseLedgerAmount`. r12 guarded the INPUTS and not the
+ * ARITHMETIC BETWEEN THEM: QuickBooks' settled figure is `TotalAmt - Balance`, a Decimal subtraction
+ * whose result was converted bare. Both operands can round-trip perfectly and their exact difference
+ * still not — total `0.005055810576648219` less balance `0.00005581057664821855` is exactly
+ * `0.00500000000000000045`, which is ABOVE the GBP epsilon, and whose `toNumber()` is exactly
+ * `0.005`, which is NOT. That turns a positive payment into `HOLDS_NOTHING`, the one verdict that
+ * proves a full reversal. A guard that lives at one call site is a guard the next conversion does
+ * not get; this one belongs to the conversion itself.
+ *
+ * NULL IS A REFUSAL AND NEVER A ZERO, wherever it is returned — see `parseLedgerAmount` below and
+ * `QboLedgerAmount.paid`, both of which withhold on it.
+ */
+export function readDecimalAsNumber(decimal: Decimal): number | null {
+  const parsed = decimal.toNumber()
+  if (!Number.isFinite(parsed)) return null
+  return toDecimal(parsed).equals(decimal) ? parsed : null
+}
+
 export function parseLedgerAmount(value: unknown): number | null {
   if (typeof value === 'number') return Number.isFinite(value) ? value : null
   if (typeof value === 'string') {
@@ -899,37 +936,13 @@ export function parseLedgerAmount(value: unknown): number | null {
     if (!LEDGER_AMOUNT_GRAMMAR.test(trimmed)) return null
     // Converted through the repository's decimal reader rather than `Number()`: the shape is already
     // established above, and this reads the digits it was given instead of re-deriving them.
-    const decimal = toDecimal(trimmed)
-    const parsed = decimal.toNumber()
-    // A grammatical figure with 400 digits is a finite Decimal and an INFINITE double, and an
-    // infinite amount is not a reading. Checked first because the round trip below cannot convert
-    // an infinity back into a Decimal.
-    if (!Number.isFinite(parsed)) return null
-    // o3d-psrx r12 (Codex HIGH 1) — AND THE CONVERSION MUST NOT INVENT A FIGURE EITHER.
-    //
-    // r11 guarded ONE END of this conversion. `Number.isFinite` catches the overflow to infinity and
-    // says NOTHING about the underflow to zero, and a zero is precisely the value that puts an
-    // amount in the bucket which clears `paidAt`: `"0." + "0".repeat(399) + "1"` is grammatically
-    // perfect decimal money, and `toNumber()` returns 0 for it. A refusal that came back as a
-    // fabricated zero is indistinguishable from the ledger stating it holds nothing — the reversal
-    // itself — which is the same defect the grammar above was written to close, reached through the
-    // conversion instead of through the shape.
-    //
-    // STATED AS A LOSSLESSNESS PROPERTY AND NOT AS A RANGE, for the reason the grammar is stated as a
-    // grammar: "too small" and "too big" are magnitudes somebody has to remember and keep in step
-    // with IEEE-754, while "the number does not say what the Decimal said" is the actual defect and
-    // catches every instance of it — underflow to zero, and equally the silent precision loss that
-    // makes `"9007199254740993"` read as ...992. The comparison is against a Decimal RECONSTRUCTED
-    // FROM THE RESULTING NUMBER, so it asks exactly the question that matters: can this number be
-    // spent in place of the figure the ledger stated?
     //
     // The alternative — carrying Decimal through every classification instead of converting at all —
     // is the stronger shape and is NOT small here: this reader's result is a `number` in the Xero
     // partition, in `QboLedgerAmount`, in `QboLedgerEvidence` and in the activity metadata those
-    // verdicts are written into. That is a change to two connectors' public readings, and it is not
-    // this round's finding. One comparison at the boundary refuses every lossy conversion, which is
-    // what the finding asks for.
-    return toDecimal(parsed).equals(decimal) ? parsed : null
+    // verdicts are written into. That is a change to two connectors' public readings. One comparison
+    // at every conversion refuses every lossy one, which is what the finding asks for.
+    return readDecimalAsNumber(toDecimal(trimmed))
   }
   return null
 }

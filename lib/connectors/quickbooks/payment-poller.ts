@@ -14,6 +14,7 @@ import {
 } from '@/lib/domain/accounting/payment-reversal'
 import {
   parseLedgerAmount,
+  readDecimalAsNumber,
   zeroPaidIsProvenReversal,
   type LedgerReadFence,
   type RegisteredPaymentVerdict,
@@ -141,6 +142,27 @@ function parseQboCurrency(value: unknown): string | null {
   return /^[A-Z]{3}$/.test(code) ? code : null
 }
 
+/**
+ * o3d-psrx r13 (Codex HIGH 2) — THE SUBTRACTION IS A CONVERSION TOO, AND IT GETS THE SAME GUARD.
+ *
+ * r12 guarded the two figures COMING IN and nothing about the arithmetic BETWEEN them. `TotalAmt`
+ * and `Balance` each survived the losslessness round trip and their exact Decimal difference was
+ * then handed to a bare `.toNumber()` — so the derived figure, the only one any verdict is taken on,
+ * was the single unguarded conversion in the chain.
+ *
+ * It is reachable with figures the round trip admits. Total `0.005055810576648219` less balance
+ * `0.00005581057664821855` is exactly `0.00500000000000000045` — STRICTLY ABOVE the GBP epsilon of
+ * `0.005`, so the ledger holds a payment — and `.toNumber()` returns exactly `0.005`, which the
+ * epsilon comparison reads as `<= 0`. A positive payment becomes `HOLDS_NOTHING`, which is the
+ * verdict `zeroPaidIsProvenReversal` is written about: the provenance gate then admits a reversal
+ * that clears `paidAt`, re-arms Mark Paid over a supplier payment that was genuinely made, or raises
+ * a sales chargeback against a document the ledger is still accounting for.
+ *
+ * So the derived amount is converted through `readDecimalAsNumber`, the same reader the inputs go
+ * through, and a conversion that cannot be spent in place of the Decimal yields NULL. NULL IS NOT
+ * ZERO here either: `classifyQboLedgerEvidence` reads a null `paid` as `UNPROVEN`, which WITHHOLDS.
+ * A figure this code cannot represent is not permission to declare the payment gone.
+ */
 function qboLedgerAmountFrom(parsed: QboParsedLedgerRow): QboLedgerAmount {
   const { total, balance, currency } = parsed
   return {
@@ -148,7 +170,7 @@ function qboLedgerAmountFrom(parsed: QboParsedLedgerRow): QboLedgerAmount {
     outstanding: balance,
     // Decimal, not float: `100.1 - 0.1` is 100.00000000000001 in IEEE-754, and this figure is
     // compared against a threshold small enough for a four-decimal currency to see that.
-    paid: total === null || balance === null ? null : subtractMoney(total, balance).toNumber(),
+    paid: total === null || balance === null ? null : readDecimalAsNumber(subtractMoney(total, balance)),
     currency,
   }
 }
