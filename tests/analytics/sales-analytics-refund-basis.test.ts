@@ -1680,12 +1680,20 @@ test('customer mix: the notice says in words that `group=` is a machine token (o
   // are — the sentence that stops this fix from making the notice unusable.
   assert.ok(notice!.includes('Find the row by reading name= and email=, which show exactly what the Customer and Email cells show.'), notice)
 
-  // AND THE IDENTITY HALF IS NAMED FOR WHAT IT IS: not a name, not to be read, compared rather
-  // than parsed — and the encoding spelled out so the digits are not mistaken for a corrupted one.
+  // AND THE IDENTITY HALF IS NAMED FOR WHAT IT IS: not a name, not to be read — and the encoding
+  // spelled out so the digits are not mistaken for a corrupted one.
   assert.ok(notice!.includes('group= is not a name and is not meant to be read'), notice)
   assert.ok(notice!.includes('written as a machine token'), notice)
   assert.ok(notice!.includes('the literal utf16hex: followed by 4 lowercase hex digits for each UTF-16 code unit of it'), notice)
-  assert.ok(notice!.includes('comparing their tokens digit against digit at the same position'), notice)
+
+  // AND IT NAMES A MECHANICAL ROUTE RATHER THAN AN INSTRUCTION TO SQUINT (r9). Round 8 ended
+  // `compare their tokens digit against digit at the same position`, which made the operator's eyes
+  // the authority over an alphabet that still holds `6` against `b`. The token is now on the row
+  // and in the export, so the notice says to COPY it and match, or to join the file on it.
+  assert.ok(notice!.includes('Do not compare tokens by eye'), notice)
+  assert.ok(notice!.includes('copy one whole and match it against the Group token cell on the row'), notice)
+  assert.ok(notice!.includes('the groupToken column of the CSV export, which is not paginated'), notice)
+  assert.equal(notice!.includes('digit against digit'), false, 'the notice still sends the operator to compare glyphs')
 
   // AND IT COMES BEFORE THE LIST. Not cosmetic: the list ends the notice so that the overflow
   // clause — where the ones it could not name are found — is the last thing an operator reads,
@@ -1702,11 +1710,12 @@ function reportPageTitleSource(): string {
 }
 
 test('the notice list is rendered with ligature formation suppressed (o3d-7jfq r8)', async () => {
-  // A MITIGATION, ASSERTED SO IT CANNOT QUIETLY LAPSE. The identity token's whole value is that
-  // every code unit is four digits wide and position therefore means something. A font that
-  // ligates `ff` into a single glyph — and `ff` is an ordinary pair of hex digits — makes a token
-  // LOOK a digit shorter than it is, which breaks positional comparison for the reader without
-  // changing a byte. Suppressing ligatures on the list costs nothing and closes that.
+  // AN AID, ASSERTED SO IT CANNOT QUIETLY LAPSE — AND NOT THE MITIGATION (r9). A font that ligates
+  // `ff` into a single glyph — and `ff` is an ordinary pair of hex digits — makes a token LOOK a
+  // digit shorter than it is, so suppressing ligatures keeps the digit count honest for anyone who
+  // glances at one, and it costs nothing. It does NOT separate `6` from `b`, which is a different
+  // collision class, so nothing about identity rests on it: the token being on the row and in the
+  // `groupToken` CSV column is what makes the notice-to-row route exact. See the r9 join test.
   const source = reportPageTitleSource()
 
   // THE WALK REACHED THE RIGHT ELEMENT: this is the component that renders `notices`, and the
@@ -1715,6 +1724,189 @@ test('the notice list is rendered with ligature formation suppressed (o3d-7jfq r
   const list = source.split('\n').find((line) => line.includes('<ul className=') && line.includes('text-[11px]'))
   assert.ok(list, 'the notices list is no longer the 11px <ul> this assertion was written about')
   assert.ok(list!.includes('[font-variant-ligatures:none]'), list)
+})
+
+// ---------------------------------------------------------------------------------------------
+// Customer Mix: THE ROUTE FROM A NOTICE TOKEN TO THE ROW IT NAMES — o3d-7jfq round 9
+//
+// Round 8 made the identity token injective in bytes and then left the operator's route to the row
+// running through their EYES: the token existed only in the notice, so someone holding one could do
+// nothing with it but read it against a name. That is not a route. These tests are about the route
+// that replaced it — the same token on the row, in the table cell and in the CSV column, so it is
+// COPIED or JOINED and never read.
+// ---------------------------------------------------------------------------------------------
+
+/** GREEK CAPITAL ALPHA and CYRILLIC CAPITAL A: two code points, one shape in every font with both. */
+const GREEK_ALPHA_GUEST = 'Αcme Ltd'
+const CYRILLIC_A_GUEST = 'Аcme Ltd'
+
+/**
+ * The identity token for an emailless guest, DERIVED BY HAND.
+ *
+ * `guest-name:` is eleven code units, and this file already pins their encoding: the round-6 doc
+ * test asserts `help-docs/analytics.md` carries
+ * `group=utf16hex:00670075006500730074002d006e0061006d0065003a00410063006d00650020004c00740064`
+ * for the emailless guest `Acme Ltd`. Split at the name, that literal IS the prefix and tail below,
+ * with `0041` — Latin `A` — between them. So the only figure worked out fresh here is the code unit
+ * that differs: U+0391 is `0391` and U+0410 is `0410`, four lowercase hex digits each, big-endian.
+ */
+const GUEST_NAME_TOKEN_PREFIX = 'utf16hex:00670075006500730074002d006e0061006d0065003a'
+const ACME_LTD_TOKEN_TAIL = '0063006d00650020004c00740064'
+
+/** The `group=` value of one notice entry — the token an operator would copy out of the notice. */
+function noticeToken(entry: string): string {
+  const marker = ' group='
+  const at = entry.indexOf(marker)
+  assert.notEqual(at, -1, `the notice entry carries no group= field: ${entry}`)
+  return entry.slice(at + marker.length)
+}
+
+test('customer mix: a token from the notice joins to exactly ONE exported row (o3d-7jfq r9)', async () => {
+  const { parseCsv } = await import('@/lib/csv')
+
+  // THE PREMISE, ASSERTED SO NOTHING BELOW CAN PASS ON A PAIR THAT WAS NEVER CONFUSABLE. Two
+  // emailless guests whose names differ at ONE position, in a pair no normalisation form merges and
+  // no font distinguishes. Both have a null customerId, so the export's other identity column is
+  // empty on both — which is precisely the case the round-8 review said had no route to its row.
+  assert.notEqual(GREEK_ALPHA_GUEST, CYRILLIC_A_GUEST)
+  assert.equal(GREEK_ALPHA_GUEST.slice(1), CYRILLIC_A_GUEST.slice(1), 'the names differ in more than the first character')
+  for (const form of ['NFC', 'NFD', 'NFKC', 'NFKD'] as const) {
+    assert.notEqual(GREEK_ALPHA_GUEST.normalize(form), CYRILLIC_A_GUEST.normalize(form), `${form} merges the two names`)
+  }
+
+  const report = await reportForContradicted([
+    contradicted({ id: 'order-1', customerId: null, customerName: GREEK_ALPHA_GUEST, customerEmail: null, totalBase: '200' }),
+    contradicted({ id: 'order-2', customerId: null, customerName: CYRILLIC_A_GUEST, customerEmail: null, totalBase: '100' }),
+  ])
+  const notice = inconsistentNotice(report)
+  assert.ok(notice, 'the report did not raise the inconsistent-evidence notice')
+  const entries = noticeEntries(notice!)
+  assert.equal(entries.length, 2, 'the fixture did not produce two contradicted customers')
+
+  // THE TOKENS THE NOTICE PRINTS, against values derived above rather than read off the code.
+  const tokens = entries.map(noticeToken)
+  assert.deepEqual(tokens, [
+    `${GUEST_NAME_TOKEN_PREFIX}0391${ACME_LTD_TOKEN_TAIL}`,
+    `${GUEST_NAME_TOKEN_PREFIX}0410${ACME_LTD_TOKEN_TAIL}`,
+  ])
+
+  const rows = parseCsv(await exportedCsv('customers', report))
+  assert.equal(rows.length, 2, 'the export did not carry both contradicted rows')
+
+  // THE JOIN, WHICH IS THE WHOLE POINT: string equality on a column, no glyph inspected. Exactly
+  // one row per token, and it is the right one — a token that matched two rows, or matched a row
+  // whose name is the other guest's, would be an identity that does not identify.
+  const joined: string[] = []
+  for (const token of tokens) {
+    const matches = rows.filter((row) => row.groupToken === token)
+    assert.equal(matches.length, 1, `token ${token} matched ${matches.length} exported rows, not 1`)
+    joined.push(matches[0]!.customerName!)
+  }
+  assert.deepEqual(joined, [GREEK_ALPHA_GUEST, CYRILLIC_A_GUEST], 'the join reached the wrong rows')
+
+  // AND NO OTHER EXPORTED COLUMN COULD HAVE DONE IT. `customerId` is empty on both, and the two
+  // `customerName` values are the homoglyph pair above — so before `groupToken` the file offered an
+  // operator nothing to join a notice token on. This is the finding, restated as an assertion.
+  assert.deepEqual(rows.map((row) => row.customerId), ['', ''])
+  assert.notEqual(rows[0]!.customerName, rows[1]!.customerName)
+  assert.equal(rows[0]!.customerName!.slice(1), rows[1]!.customerName!.slice(1))
+})
+
+test('customer mix: the row token, the notice token and the GROUPING KEY are one value (o3d-7jfq r9)', async () => {
+  // The token must come from the identity the rows were actually GROUPED under — not from a field
+  // that merely looks like it. A mixed-case guest email is the case that tells those apart: the key
+  // lower-cases it, so the two typings are ONE customer, while `customerEmail` keeps what was
+  // stored. A token encoded from the displayed email would differ from the key, and this fails.
+  const report = await reportForContradicted([
+    contradicted({ id: 'order-1', customerId: null, customerName: 'Acme Ltd', customerEmail: 'MiXeD@Example.COM', totalBase: '200' }),
+    contradicted({ id: 'order-2', customerId: null, customerName: 'Acme Ltd', customerEmail: 'mixed@example.com', totalBase: '100' }),
+  ])
+  // THE PREMISE: the lower-casing key merged them, so there is ONE row and ONE notice entry. If the
+  // grouping ever stopped lower-casing, this test would be about two rows and would say so here.
+  assert.equal(report.rows.length, 1, 'the two typings of one address did not group together')
+  const row = report.rows[0]!
+  assert.equal(row.costEvidence, 'inconsistent')
+
+  const notice = inconsistentNotice(report)
+  assert.ok(notice, 'the report did not raise the inconsistent-evidence notice')
+  const entries = noticeEntries(notice!)
+  assert.equal(entries.length, 1)
+
+  // DERIVED THROUGH NODE'S OWN UTF-16 ENCODER, from the key spelled out here — not from the module
+  // under test, and not from either stored email as typed.
+  const expected = identityToken('guest-email:mixed@example.com')
+  assertIdentityToken(expected)
+  assert.notEqual(expected, identityToken('guest-email:MiXeD@Example.COM'), 'the two typings encode alike — the fixture proves nothing')
+
+  // THE ROW CARRIES IT, THE NOTICE PRINTS IT, AND THEY ARE THE SAME STRING.
+  assert.equal(row.groupToken, expected)
+  assert.equal(noticeToken(entries[0]!), expected)
+  assert.equal(noticeToken(entries[0]!), row.groupToken)
+
+  // AND IT REACHES THE FILE UNCHANGED, so the join above is a join on this same value.
+  const { parseCsv } = await import('@/lib/csv')
+  const exported = parseCsv(await exportedCsv('customers', report))
+  assert.equal(exported.length, 1)
+  assert.equal(exported[0]!.groupToken, expected)
+})
+
+test('customer mix: the readable fields still print exactly what the columns print (o3d-7jfq r9)', async () => {
+  // THE THING THE TOKEN MUST NOT HAVE COST. `name=`, `email=` and `customerId=` are how an operator
+  // finds a row in the ordinary case; the token is only for the ambiguous one. So the readable half
+  // is checked against the values the table renders and the file exports, not merely against itself.
+  const { parseCsv } = await import('@/lib/csv')
+  const report = await reportForContradicted([
+    contradicted({ id: 'order-1', customerId: 'cust-1', customerName: 'Bäcker & Söhne', customerEmail: 'ops@backer.example', totalBase: '200' }),
+  ])
+  const notice = inconsistentNotice(report)
+  assert.ok(notice, 'the report did not raise the inconsistent-evidence notice')
+  const entry = noticeEntries(notice!)[0]!
+  const row = report.rows[0]!
+  const exported = parseCsv(await exportedCsv('customers', report))[0]!
+
+  // The Customer cell renders `row.customerName` and the Email cell `row.customerEmail` — the same
+  // two fields the CSV writes — so pinning the notice to the row pins it to both surfaces.
+  assert.equal(row.customerName, 'Bäcker & Söhne')
+  assert.equal(exported.customerName, row.customerName)
+  assert.equal(exported.customerEmail, row.customerEmail)
+  assert.equal(exported.customerId, row.customerId)
+
+  // AND THE NOTICE PRINTS THOSE VALUES, quoted and otherwise untouched: the name in its own script,
+  // not encoded the way the identity half is.
+  assert.equal(
+    readableFields(entry),
+    `name="${row.customerName}" email="${row.customerEmail}" customerId="${row.customerId}"`,
+  )
+  assert.equal(entry.includes('B\\u00e4cker'), false, 'the readable half encoded a character it is supposed to print')
+})
+
+/** The Customer Mix page, read as a fixture for the cell that ends the notice-to-row route. */
+function customerAnalyticsPageSource(): string {
+  return readFileSync(path.join(process.cwd(), 'app/(dashboard)/analytics/customers/page.tsx'), 'utf8')
+}
+
+test('the customer report renders the group token as a copyable cell (o3d-7jfq r9)', async () => {
+  // THE ON-SCREEN END OF THE ROUTE, ASSERTED SO IT CANNOT QUIETLY LAPSE the way the notice-only
+  // token did. An operator who copies a token out of the notice must be able to match it against a
+  // row without reading it, which needs the value present, whole, and selectable in one gesture.
+  const source = customerAnalyticsPageSource()
+
+  // THE WALK REACHED THE RIGHT ELEMENT: the column list this assertion is about, and the one column
+  // in it that carries the token.
+  assert.ok(source.includes('const columns: Array<SalesAnalyticsColumn<CustomerReportRow>>'), 'the customers page no longer builds a column list')
+  const column = source.split('\n').find((line) => line.includes("key: 'groupToken'"))
+  assert.ok(column, 'the customers page defines no groupToken column')
+
+  // IT RENDERS THE ROW'S OWN FIELD — the same one the notice prints — and not a re-derivation.
+  assert.ok(column!.includes('row.groupToken'), column)
+  // WHOLE AND SELECTABLE IN ONE CLICK: `select-all` takes the entire token, `break-all` wraps it
+  // rather than clipping it. A truncated identifier is not an identifier.
+  assert.ok(column!.includes('select-all'), column)
+  assert.ok(column!.includes('break-all'), column)
+  assert.equal(column!.includes('truncate'), false, 'the token cell truncates, so it cannot be copied whole')
+  // AND THE COLUMN IS LABELLED THE WAY THE NOTICE AND THE DOC NAME IT, so the notice's instruction
+  // to match against the "Group token cell" points at something an operator can actually find.
+  assert.ok(column!.includes("label: 'Group token'"), column)
 })
 
 /**
@@ -1815,8 +2007,17 @@ test('help-docs/analytics.md documents the machine-token group field it now emit
   // corrupted name is the failure this sentence exists to prevent.
   assert.ok(doc.includes('**a machine token, not a name**'), doc.slice(doc.indexOf('A third case reads differently')))
   assert.ok(doc.includes('four lowercase hex digits for each UTF-16 code unit'), doc)
-  assert.ok(doc.includes('compare two tokens digit against digit at the same position'), doc)
   assert.ok(doc.includes('an identity you cannot tell apart is not an identity'), doc)
+
+  // AND IT GIVES THE OPERATOR A ROUTE THAT IS NOT THEIR EYES (r9). The doc used to end this on
+  // `compare two tokens digit against digit at the same position` — an instruction to read an
+  // alphabet the sentence before it admits is not always readable. It now names where the same
+  // token appears on the row and in the file, which is the join that makes reading unnecessary.
+  assert.ok(doc.includes('**do not compare two tokens by eye at all**'), doc)
+  assert.ok(doc.includes('**Group token** column'), doc)
+  assert.ok(doc.includes('the CSV export carries it as the `groupToken` column'), doc)
+  assert.ok(doc.includes('Copy a token out of the notice and match it against that cell, or join the export on it'), doc)
+  assert.equal(doc.includes('digit against digit'), false, 'the doc still sends the operator to compare glyphs')
 
   // AND IT NAMES THE CASE THAT MADE IT HEX rather than plain ASCII, so the doc cannot drift back
   // to the claim the code used to make and the round-8 review found false.
