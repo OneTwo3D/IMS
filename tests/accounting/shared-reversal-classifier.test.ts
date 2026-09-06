@@ -415,9 +415,16 @@ test('[o3d-psrx r8] the QuickBooks paid amount is TotalAmt - Balance, and NULL w
     assert.equal(qboLedgerAmount({ Id: '1', TotalAmt: 100, Balance: 50, CurrencyRef: bad }).currency, null,
       `a currency that is not an ISO-4217-shaped code must be NULL rather than a guess: ${JSON.stringify(bad)}`)
   }
-  // o3d-psrx r10: the subtraction is DECIMAL. In IEEE-754 `100.1 - 0.1` is 100.00000000000001, and
-  // this figure is compared against a threshold small enough for a four-decimal currency to see that.
-  assert.equal(qboLedgerAmount({ Id: '1', TotalAmt: 100.1, Balance: 0.1 }).paid, 100)
+  // o3d-psrx r10: THE SUBTRACTION IS DECIMAL, and it has to be. In IEEE-754 `100 - 99.999` is
+  // 0.0010000000000047748 and `100.1 - 50.1` is 49.99999999999999 — dust of a size a four-decimal
+  // currency's threshold can see, produced by arithmetic on figures that are exact in the ledger.
+  assert.equal(qboLedgerAmount({ Id: '1', TotalAmt: 100, Balance: 99.999 }).paid, 0.001,
+    'one minor unit of a 3-decimal currency, not 0.0010000000000047748')
+  assert.equal(qboLedgerAmount({ Id: '1', TotalAmt: 100, Balance: 99.9999 }).paid, 0.0001,
+    'and one minor unit of a 4-decimal currency')
+  assert.equal(qboLedgerAmount({ Id: '1', TotalAmt: 100.1, Balance: 50.1 }).paid, 50)
+  // ...and the OUTSTANDING figure is never a subtraction at all: it is the Balance the ledger stated.
+  assert.equal(qboLedgerAmount({ Id: '1', TotalAmt: 100, Balance: 99.999 }).outstanding, 99.999)
 
   // NULL IS NOT ZERO. Each of these is a payload that did not state a figure this code can use, and
   // the withheld direction is the only honest one: a document might be holding anything.
