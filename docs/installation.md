@@ -1295,12 +1295,15 @@ says nothing about who may create it. So a root directly under `/tmp` is refused
   ERROR: Move the data under a path only root can rebind — every directory from / down to it owned by root and carrying no group or other write bit, which /srv, /var/lib and /mnt normally are — and run the installer again; it will then print the bind-mount procedure.
   ```
 
-  **And the target may not be the root, an ancestor of it, anything under it, or another root the
-  entrypoint manages** — each of the three declares the roots it writes into, so the same refusal
-  answers the same question wherever it is printed. The comparison is made on **normalised**
+  **And the target may not be the root, an ancestor of it, anything under it, or any other root the
+  run writes into** — read from `publish_trust_root_candidates()`, the one table every publication
+  already resolves against, plus `LOG_DIR`, so the same refusal answers the same question wherever
+  it is printed and there is no second list to go stale. The comparison is made on **normalised**
   spellings (`//var/lib/app` and `/var/lib/app` are one directory) and then again on **device and
-  inode**, against every ancestor of the root: two paths can be the same directory, or nested,
-  without sharing a prefix, because a bind mount already in place gives one directory two names. `/opt/one-two-inventory -> /opt` satisfies every other question — `/opt`'s
+  inode**, in both directions — the target against every ancestor of each managed root, and each
+  managed root against every ancestor of the target — because two paths can be the same directory,
+  or nested, without sharing a prefix: a bind mount already in place gives one directory two names.
+  An identity the run cannot read, where the path exists, is a refusal rather than a skipped check. `/opt/one-two-inventory -> /opt` satisfies every other question — `/opt`'s
   name cannot be rebound by anybody but root — and binding `/opt` onto `/opt/one-two-inventory`
   would hand the next run the whole of `/opt` to `rsync --delete` into and `chown -R`. The same
   shape gives `/var/lib` and `/var/log`. Those get a refusal naming the overlap and no command.

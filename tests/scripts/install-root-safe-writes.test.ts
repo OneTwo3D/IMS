@@ -4412,7 +4412,7 @@ test('[o3d-czpy] no root-side write into a service-writable directory is left un
 /** The gate, the walk it asks through, and the refusal it shares with the publisher. A rig missing
  *  any of them fails with "command not found" and every "the run must refuse" assertion passes for
  *  the wrong reason, so they travel together. */
-const ROOT_GATE = ['refuse_symlinked_root', 'pin_publish_root_parent', 'pin_service_root_parent', 'service_root_entry_kind', 'require_real_service_root'] as const
+const ROOT_GATE = ['publish_trust_root_candidates', 'refuse_symlinked_root', 'pin_publish_root_parent', 'pin_service_root_parent', 'service_root_entry_kind', 'require_real_service_root'] as const
 
 /** The declaration the gate records what it approved into, lifted rather than retyped: under
  *  `set -u` a rig without it dies on the first `${SERVICE_ROOT_APPROVED[…]-}`, and every "the run
@@ -4870,7 +4870,6 @@ test('[o3d-secops] the gate is the first line of the run that names any of the t
     .slice(0, privilegeCheck)
     .filter((line) => names.test(line) && /^[A-Za-z_]/.test(line))
   assert.deepEqual(before, [
-    'readonly -a SERVICE_ROOT_NAMES=("${APP_DIR}" "${DATA_DIR}" "${LOG_DIR}")',
     'BACKUP_DIR="${DATA_DIR}/backups"',
     'UPLOAD_STORAGE_DIR="${DATA_DIR}/uploads"',
     'PUBLIC_UPLOAD_STORAGE_DIR="${DATA_DIR}/public-uploads"',
@@ -5647,7 +5646,7 @@ test('[o3d-secops] a link pointing at the root\'s own ancestor gets no bind comm
   assert.equal(realpathSync(link), opt, 'precondition: the link must really resolve to the root\'s own ancestor')
   assert.ok(!run.stderr.includes('mount --bind'), `no bind command may be printed: ${run.stderr}`)
   assert.ok(!run.stderr.includes('/etc/fstab'), 'and no fstab line')
-  assert.match(run.stderr, /the two are the same directory, or one lies inside the other/, run.stderr)
+  assert.match(run.stderr, /MAY NOT BE BOUND ONTO [\s\S]*one of the two lies inside the other/, run.stderr)
 
   // NOT VACUOUS: a target that is genuinely elsewhere, under an equally trustworthy path, gets the
   // whole procedure. So what is refused is the overlap and nothing else.
@@ -5668,28 +5667,34 @@ test('[o3d-secops] a link pointing at the root\'s own ancestor gets no bind comm
   // deploy.sh and update.sh do not set it, which is why the shared text is identical in all three.
   const overlapping = runBash(rig([...ROOT_GATE], GATE_DATA, [
     `DATA_DIR=${q(goodLink)}`,
-    `SERVICE_ROOT_NAMES=(${q(join(elsewhere, 'ims'))})`,
+    `CUTOVER_STATE_DIR=${q(join(elsewhere, 'ims'))}`,
   ].join('\n')))
   assert.equal(overlapping.status, 1, overlapping.stderr)
   assert.ok(!overlapping.stderr.includes('mount --bind'),
     `a target that is another managed root must get no bind command: ${overlapping.stderr}`)
-  assert.match(overlapping.stderr, /which this installer also manages/, overlapping.stderr)
+  assert.match(overlapping.stderr, /MAY NOT BE BOUND ONTO/, overlapping.stderr)
 
-  // AND EVERY ENTRYPOINT DECLARES ITS OWN, read from the shipped scripts rather than invented here.
-  // A list that existed in one of the three would leave the shared refusal answering a different
-  // question depending on which script printed it — and that is not hypothetical: a symlinked
-  // IMS_DATA_DIR resolving to APP_DIR reaches this refusal from update.sh, during cutover-state
-  // publication, and would have been handed a procedure binding the application tree onto the data
-  // root.
-  const declared: Readonly<Record<string, string>> = {
-    'scripts/install.sh': 'readonly -a SERVICE_ROOT_NAMES=("${APP_DIR}" "${DATA_DIR}" "${LOG_DIR}")',
-    'scripts/update.sh': 'readonly -a SERVICE_ROOT_NAMES=("${APP_DIR}" "${DATA_DIR}")',
-    'scripts/deploy.sh': 'readonly -a SERVICE_ROOT_NAMES=("${APP_DIR}")',
+  // AND THE ROOTS COME FROM THE ONE TABLE EVERY PUBLICATION ALREADY RESOLVES AGAINST, plus
+  // ${LOG_DIR}, which is written but is not a publication root. A second list maintained beside it
+  // is a list that goes stale: the first version of this fix declared one in install.sh and in
+  // neither of the others, so the same refusal answered a different question depending on which
+  // script printed it — and that is not hypothetical, since a symlinked IMS_DATA_DIR resolving to
+  // APP_DIR reaches this refusal from update.sh during cutover-state publication.
+  const refusal = shellFunction(INSTALL_SH, 'refuse_symlinked_root')
+  assert.match(refusal, /keep="\$\(publish_trust_root_candidates\)" \|\| keep=""/,
+    `the refusal must read the shared table, with its status taken:\n${refusal}`)
+  assert.match(refusal, /\$\{LOG_DIR:-\}/, 'and add the log root, which the table does not carry')
+  assert.ok(!/SERVICE_ROOT_NAMES/.test(readFileSync(join(REPO, 'scripts/install.sh'), 'utf8')),
+    'and no entrypoint may keep a second list beside it')
+  // THE TABLE REALLY NAMES THE WRITE ROOTS, and is really the same in all three entrypoints.
+  const table = shellFunction(INSTALL_SH, 'publish_trust_root_candidates')
+  for (const name of ['APP_DIR', 'DATA_DIR', 'CUTOVER_STATE_DIR', 'DB_ENV_SNAPSHOT_DIR', 'DB_CA_PUBLISH_DIR', 'DB_FENCE_RECOVERY_DIR']) {
+    assert.ok(table.includes(`\${${name}:-}`), `${name} must be in the table the refusal reads: ${table}`)
   }
-  for (const [script, expected] of Object.entries(declared)) {
-    const source = script === 'scripts/install.sh' ? INSTALL_SH : readFileSync(join(REPO, script), 'utf8')
-    assert.equal(shellConstant(source, 'SERVICE_ROOT_NAMES', script), expected,
-      `${script} must name the roots it writes into, or the shared refusal is answering a question it cannot`)
+  for (const script of ['scripts/deploy.sh', 'scripts/update.sh'] as const) {
+    const source = readFileSync(join(REPO, script), 'utf8')
+    assert.equal(shellFunction(source, 'publish_trust_root_candidates'), table, `${script} has drifted`)
+    assert.ok(!/SERVICE_ROOT_NAMES/.test(source), `${script} must not keep a second list either`)
   }
 })
 
@@ -5768,7 +5773,7 @@ test('[o3d-secops] a target that is the same directory as the root\'s ancestor u
   const run = runBash(rig([...ROOT_GATE], GATE_DATA, [
     // The root's own ancestor list contains ${base}; the target is ${mount}. Textually disjoint.
     `DATA_DIR=${q(link)}`,
-    `SERVICE_ROOT_NAMES=(${q(join(mount, 'inside'))})`,
+    `CUTOVER_STATE_DIR=${q(join(mount, 'inside'))}`,
   ].join('\n')))
 
   assert.equal(run.status, 1, run.stderr)
@@ -5802,19 +5807,24 @@ test('[o3d-secops] a root spelled with repeated slashes is still recognised as o
     assert.equal(run.status, 1, `${spelling}: ${run.stderr}`)
     assert.ok(!run.stderr.includes('mount --bind'),
       `${spelling}: a doubled slash must not buy a bind command: ${run.stderr}`)
-    assert.match(run.stderr, /the two are the same directory, or one lies inside the other/, run.stderr)
+    assert.match(run.stderr, /MAY NOT BE BOUND ONTO [\s\S]*one of the two lies inside the other/, run.stderr)
   }
 
   // MEASURED BY MUTATION, ROUTE STATED: the normalisation removed, which is where the textual test
   // stood before this pass. The doubled spelling then reads as an unrelated string and the bind
   // command is printed for a target that contains the root.
   const shipped = shellFunction(INSTALL_SH, 'refuse_symlinked_root')
+  const textual = 'if [[ "$ntarget" == "$nother" || "$nother" == "${ntarget%/}/"* || "$ntarget" == "${nother%/}/"* ]]; then'
+  assert.ok(shipped.includes(textual), `precondition: the shipped refusal must compare normalised spellings: ${shipped}`)
   const rawText = shipped
-    .replace('if [[ "$ntarget" == "$nroot" || "$nroot" == "${ntarget%/}/"* || "$ntarget" == "${nroot%/}/"* ]]; then',
-      'if [[ "$target" == "$root" || "$root" == "${target%/}/"* || "$target" == "${root%/}/"* ]]; then')
-    // …and the identity walk that would otherwise catch it, which is the OTHER half of this fix.
-    .replace('if [[ -n "$ancid" && "$ancid" == "$ident" ]]; then', 'if false; then')
+    .replace(textual, 'if [[ "$target" == "$other" || "$other" == "${target%/}/"* || "$target" == "${other%/}/"* ]]; then')
+    // …and BOTH identity walks, which are the other half of this fix and would catch it for the
+    // wrong reason. A mutation that left either standing would prove nothing about normalisation.
+    .replaceAll('if [[ "$ancid" == "$ident" ]]; then', 'if false; then')
+    .replaceAll('if [[ "$ancid" == "$otherid" ]]; then', 'if false; then')
   assert.notEqual(rawText, shipped, 'the mutation must change the shipped comparisons')
+  assert.ok(!rawText.includes('"$ancid" == "$ident"') && !rawText.includes('"$ancid" == "$otherid"'),
+    'and remove both identity comparisons')
 
   const mutated = runBash(rig(ROOT_GATE.filter((n) => n !== 'refuse_symlinked_root'), GATE_DATA,
     [`DATA_DIR=${q(doubled)}`, rawText].join('\n')))
