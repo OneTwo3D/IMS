@@ -8,6 +8,7 @@ import {
   drainInvoicesModifiedSince,
   fetchInvoicesModifiedSince,
   idsWhere,
+  ledgerAmountMagnitudeBound,
   parseLedgerAmount,
   partitionPaymentReversals,
   listedLedgerPaymentIds,
@@ -564,15 +565,15 @@ test('PAID and DRAFT rows are not reversal candidates at all, and types do not c
 })
 
 test('parseLedgerAmount refuses to turn an empty field into zero', () => {
-  assert.equal(parseLedgerAmount(''), null)
-  assert.equal(parseLedgerAmount('   '), null)
-  assert.equal(parseLedgerAmount(undefined), null)
-  assert.equal(parseLedgerAmount(null), null)
-  assert.equal(parseLedgerAmount(Number.NaN), null)
-  assert.equal(parseLedgerAmount({}), null)
-  assert.equal(parseLedgerAmount(0), 0)
-  assert.equal(parseLedgerAmount('0'), 0)
-  assert.equal(parseLedgerAmount(' 42.5 '), 42.5)
+  assert.equal(parseLedgerAmount('', 'GBP'), null)
+  assert.equal(parseLedgerAmount('   ', 'GBP'), null)
+  assert.equal(parseLedgerAmount(undefined, 'GBP'), null)
+  assert.equal(parseLedgerAmount(null, 'GBP'), null)
+  assert.equal(parseLedgerAmount(Number.NaN, 'GBP'), null)
+  assert.equal(parseLedgerAmount({}, 'GBP'), null)
+  assert.equal(parseLedgerAmount(0, 'GBP'), 0)
+  assert.equal(parseLedgerAmount('0', 'GBP'), 0)
+  assert.equal(parseLedgerAmount(' 42.5 ', 'GBP'), 42.5)
 })
 
 // ---------------------------------------------------------------------------
@@ -607,7 +608,7 @@ test('[o3d-psrx r11] a string that is not decimal money is UNREADABLE, never a n
     ['0x0', 'and the hexadecimal ZERO is the one that reads as a settled document'],
   ]
   for (const [value, why] of refused) {
-    assert.equal(parseLedgerAmount(value), null, `${JSON.stringify(value)} must be unreadable: ${why}`)
+    assert.equal(parseLedgerAmount(value, 'GBP'), null, `${JSON.stringify(value)} must be unreadable: ${why}`)
   }
 })
 
@@ -626,13 +627,13 @@ test('[o3d-psrx r11] ordinary decimal money still reads exactly as it always did
     ['0.001', 0.001],
   ]
   for (const [value, expected] of accepted) {
-    assert.equal(parseLedgerAmount(value), expected, `${JSON.stringify(value)} is decimal money and must read as ${expected}`)
+    assert.equal(parseLedgerAmount(value, 'GBP'), expected, `${JSON.stringify(value)} is decimal money and must read as ${expected}`)
   }
   // And the number branch is untouched: QuickBooks and Xero both serialise money as JSON numbers in
   // normal operation, so this is the path production actually takes.
-  assert.equal(parseLedgerAmount(0), 0)
-  assert.equal(parseLedgerAmount(50.25), 50.25)
-  assert.equal(parseLedgerAmount(Number.POSITIVE_INFINITY), null)
+  assert.equal(parseLedgerAmount(0, 'GBP'), 0)
+  assert.equal(parseLedgerAmount(50.25, 'GBP'), 50.25)
+  assert.equal(parseLedgerAmount(Number.POSITIVE_INFINITY, 'GBP'), null)
 })
 
 // ---------------------------------------------------------------------------
@@ -654,30 +655,39 @@ test('[o3d-psrx r12] a figure too small to survive conversion is UNREADABLE, nev
   // The finding's own probe. Under r11 this returned 0 — a fabricated statement that the ledger
   // holds nothing, made out of a figure that says it holds something.
   const tooSmall = `0.${'0'.repeat(399)}1`
-  assert.equal(parseLedgerAmount(tooSmall), null,
+  assert.equal(parseLedgerAmount(tooSmall, 'GBP'), null,
     'a decimal the double cannot hold is a figure IMS could not read, and "could not read" is the '
     + 'answer that WITHHOLDS. Zero is the answer that clears paidAt')
 
   // The same property from the other end: digits lost off the top are no more readable than digits
   // lost off the bottom, and no magnitude rule covers both.
-  assert.equal(parseLedgerAmount('9007199254740993'), null,
+  assert.equal(parseLedgerAmount('9007199254740993', 'GBP'), null,
     'the first odd integer a double cannot represent reads back as ...992 — a different amount')
-  assert.equal(parseLedgerAmount('12345678901234567890'), null,
+  assert.equal(parseLedgerAmount('12345678901234567890', 'GBP'), null,
     'and a twenty-digit figure reads back as ...567000')
+
+  // o3d-psrx r14 KEEPS THIS TEST HONEST. The two figures above are ALSO above the magnitude bound r14
+  // added, so on their own they would now be refused by that check and this test would have stopped
+  // exercising the round trip it was written for. This one is 1.23e9 — four orders of magnitude BELOW
+  // the two-decimal bound of 2^46 — so nothing but the losslessness comparison can refuse it, and
+  // mutating that comparison alone still fails here.
+  assert.equal(parseLedgerAmount('1234567890.123456789', 'GBP'), null,
+    'a figure well inside the magnitude bound that still reads back as ...4567 — refused by the round '
+    + 'trip and by nothing else')
 })
 
 test('[o3d-psrx r12] the refusal is LOSSLESSNESS, not smallness: a tiny figure that converts exactly is read', () => {
   // THE CONTROL THAT STOPS THE FIX BEING "REFUSE SMALL NUMBERS". This is far below any money
   // threshold in the repository and it converts EXACTLY, so there is nothing wrong with it and the
   // reader must return it. A magnitude-based guard would have refused it; the round trip does not.
-  assert.equal(parseLedgerAmount('0.0000000000000000000000001'), 1e-25)
+  assert.equal(parseLedgerAmount('0.0000000000000000000000001', 'GBP'), 1e-25)
   // And the ordinary case is untouched — the half of the change that matters every single poll.
   const unchanged: [string, number][] = [
     ['0', 0], ['0.00', 0], ['50.00', 50], ['-12.34', -12.34], ['+7.5', 7.5],
     ['1234567.8901', 1234567.8901], ['0.001', 0.001], ['100.10', 100.1], ['0.1', 0.1],
   ]
   for (const [value, expected] of unchanged) {
-    assert.equal(parseLedgerAmount(value), expected,
+    assert.equal(parseLedgerAmount(value, 'GBP'), expected,
       `${JSON.stringify(value)} is ordinary decimal money and must still convert to ${expected}`)
   }
 })
@@ -1091,4 +1101,209 @@ test('[o3d-psrx r2] PAID_WITHOUT_LEDGER_RECEIPT is never a proven reversal', () 
     'the ledger holds nothing of IMS\'s to have removed — its zero is IMS\'s own silence')
   // The paired case, so this cannot pass by returning false for everything.
   assert.equal(zeroPaidIsProvenReversal({ verdict: 'NOTHING_REGISTERED' }), true)
+})
+
+
+// ---------------------------------------------------------------------------
+// o3d-psrx r14 (Codex HIGH) — THE LOSS THAT HAPPENS BEFORE THIS MODULE IS HANDED ANYTHING.
+//
+// Every guard r11-r13 added is applied to a value that has already been through `Response.json()`.
+// A JSON numeric token becomes an IEEE-754 double there, and a double that lost digits in the parser
+// round-trips to itself perfectly afterwards — so no test this module can apply to it will ever see
+// what went missing. The only thing that CAN be established after the fact is whether a value of this
+// SIZE is one whose minor unit survives that decode at all.
+//
+// r13's answer was that no invoice is that big. That is an expectation and nothing enforces it: these
+// figures land in `numeric(18,4)`, which holds up to 99,999,999,999,999.9999. The tests below measure
+// where the loss actually starts, in each supported precision, and pin the bound to it.
+//
+// EVERY AMOUNT BELOW IS DECODED, NEVER CONSTRUCTED. Writing `1649267441663.9999` as a TypeScript
+// numeric literal would prove nothing about JSON, because the literal is rounded by the same rule and
+// a test that rounds its own fixture is testing its fixture.
+// ---------------------------------------------------------------------------
+
+/** Decode a JSON document exactly as a connector client does — from the wire text, through a Response. */
+async function decodeJsonAmounts(body: string): Promise<Record<string, number>> {
+  return await new Response(body, { headers: { 'content-type': 'application/json' } }).json()
+}
+
+/** The exact decimal text of `count` consecutive minor-unit amounts starting at `startScaled * 10^-digits`. */
+function minorUnitLadder(startScaled: bigint, digits: number, count: number): string[] {
+  const out: string[] = []
+  for (let step = 0; step < count; step += 1) {
+    const scaled = (startScaled + BigInt(step)).toString().padStart(digits + 1, '0')
+    out.push(digits === 0 ? scaled : `${scaled.slice(0, scaled.length - digits)}.${scaled.slice(scaled.length - digits)}`)
+  }
+  return out
+}
+
+/** The first pair of adjacent minor-unit amounts in the ladder that JSON decoding cannot tell apart. */
+function firstIndistinguishablePair(ladder: string[]): [string, string] | null {
+  for (let index = 1; index < ladder.length; index += 1) {
+    if (JSON.parse(ladder[index - 1]) === JSON.parse(ladder[index])) return [ladder[index - 1], ladder[index]]
+  }
+  return null
+}
+
+const SUPPORTED_PRECISIONS: { currency: string; digits: number; expected: number }[] = [
+  { currency: 'JPY', digits: 0, expected: Math.pow(2, 53) },
+  { currency: 'GBP', digits: 2, expected: Math.pow(2, 46) },
+  { currency: 'KWD', digits: 3, expected: Math.pow(2, 43) },
+  { currency: 'CLF', digits: 4, expected: Math.pow(2, 39) },
+]
+
+test('[o3d-psrx r14] the bound is the exact magnitude where a minor unit stops surviving a JSON decode', () => {
+  for (const { currency, digits, expected } of SUPPORTED_PRECISIONS) {
+    const bound = ledgerAmountMagnitudeBound(currency)
+    const minorUnit = Math.pow(10, -digits)
+    assert.equal(bound, expected, `${currency} (${digits}dp) must derive ${expected}, got ${bound}`)
+
+    // THE DERIVATION, RESTATED AGAINST THE RETURNED VALUE rather than against a second copy of the
+    // arithmetic. Doubles in [x, 2x) are spaced x * 2^-52 apart, so:
+    //   - just BELOW the bound the spacing is bound * 2^-53, which must be no wider than a minor unit;
+    //   - AT the bound it is bound * 2^-52, which must be wider than one.
+    // A bound one binade too high fails the first; one binade too low fails the second. There is
+    // exactly one value that satisfies both, which is what makes this a derivation and not a table.
+    assert.ok(bound * Math.pow(2, -53) <= minorUnit,
+      `${currency}: a minor unit must still be resolvable immediately below the bound`)
+    assert.ok(bound * Math.pow(2, -52) > minorUnit,
+      `${currency}: and must NOT be resolvable at it — otherwise the bound refuses readable money`)
+
+    // And the same fact MEASURED, because the argument above is only as good as its premise about
+    // IEEE-754. At the bound, some pair of adjacent minor-unit amounts really does decode to one
+    // double; immediately below it, no pair in the same-sized ladder does.
+    const scaleAt = BigInt(Math.round(bound)) * BigInt(10) ** BigInt(digits)
+    const scaleBelow = BigInt(Math.round(bound / 2)) * BigInt(10) ** BigInt(digits)
+    assert.ok(firstIndistinguishablePair(minorUnitLadder(scaleAt, digits, 4000)) !== null,
+      `${currency}: a minor unit must be measurably lost AT the bound, or the bound is refusing nothing`)
+    assert.equal(firstIndistinguishablePair(minorUnitLadder(scaleBelow, digits, 4000)), null,
+      `${currency}: and must be measurably intact below it, or the bound is refusing real money`)
+  }
+})
+
+test('[o3d-psrx r14] an amount above the bound is UNREADABLE — 4-decimal, decoded from the wire', async () => {
+  // The finding's own pair, as QuickBooks would put it on the wire.
+  const decoded = await decodeJsonAmounts('{"TotalAmt":1649267441664,"Balance":1649267441663.9999}')
+  // THE PRECONDITION, ASSERTED. These are two different CLF amounts one minor unit apart, and if the
+  // decode ever stopped collapsing them this test would pass while proving nothing.
+  assert.equal(decoded.TotalAmt, decoded.Balance,
+    'precondition: Response.json() must have collapsed a one-minor-unit difference into one double')
+  assert.ok(decoded.Balance > ledgerAmountMagnitudeBound('CLF'),
+    'precondition: and the pair must sit above the CLF bound, which is why it collapsed')
+
+  for (const value of [decoded.TotalAmt, decoded.Balance]) {
+    assert.equal(parseLedgerAmount(value, 'CLF'), null,
+      'a CLF figure this large cannot carry its own minor unit, so it is not an amount IMS can read')
+  }
+  // REFUSAL, NOT CLAMPING: null is the answer that withholds. Nothing here becomes a number.
+  assert.equal(parseLedgerAmount(decoded.Balance, 'CLF'), null)
+})
+
+test('[o3d-psrx r14] an amount above the bound is UNREADABLE — 3-decimal, decoded from the wire', async () => {
+  const decoded = await decodeJsonAmounts('{"TotalAmt":8796093022208.002,"Balance":8796093022208.001}')
+  assert.equal(decoded.TotalAmt, decoded.Balance,
+    'precondition: one Gulf-dinar fils separates these two figures and the decode lost it')
+  assert.ok(decoded.Balance > ledgerAmountMagnitudeBound('KWD'),
+    'precondition: and the pair must sit above the 3-decimal bound')
+
+  for (const value of [decoded.TotalAmt, decoded.Balance]) {
+    assert.equal(parseLedgerAmount(value, 'KWD'), null,
+      'a KWD figure this large cannot carry its own fils, so it is not an amount IMS can read')
+  }
+})
+
+test('[o3d-psrx r14] the bound is enforced on the STRING arm too, where the round trip cannot see it', () => {
+  // A STRING figure reaches `readDecimalAsNumber`, and r13's losslessness comparison is the only thing
+  // that had ever refused one. `"1649267441664"` passes that comparison perfectly — it is an integer a
+  // double holds exactly — so if the bound lived only in the number arm, this would be admitted and
+  // then spent: converted to a `number` and subtracted from another, in a currency whose minor unit
+  // that number cannot express.
+  //
+  // PRECONDITION, so this cannot pass for the wrong reason: the identical string IS read in a currency
+  // whose minor unit it can carry, which proves the round trip admits it and only the bound refuses it.
+  assert.equal(parseLedgerAmount('1649267441664', 'JPY'), 1649267441664,
+    'precondition: the losslessness round trip admits this string — it is exactly representable')
+  assert.equal(parseLedgerAmount('1649267441664', 'CLF'), null,
+    'and in CLF it is above the bound, so the string arm must refuse it as well')
+  assert.equal(parseLedgerAmount('8796093022208', 'KWD'), null,
+    'the same on the 3-decimal bound')
+})
+
+test('[o3d-psrx r14] the same figures are read in a currency whose minor unit they CAN carry', async () => {
+  // THE CONTROL THAT STOPS THIS BEING "REFUSE LARGE NUMBERS". 8,796,093,022,208 is far above the CLF
+  // bound and far below the JPY one, and the difference is entirely the minor unit — which is the
+  // claim the whole derivation makes. A guard that ignored the currency would refuse this too.
+  const decoded = await decodeJsonAmounts('{"amount":8796093022208}')
+  assert.equal(parseLedgerAmount(decoded.amount, 'JPY'), 8796093022208,
+    'a zero-decimal currency resolves whole units up to 2^53, so this is ordinary money in JPY')
+  assert.equal(parseLedgerAmount(decoded.amount, 'CLF'), null,
+    'and the identical figure is unreadable in CLF, where a minor unit is ten-thousandths')
+})
+
+test('[o3d-psrx r14] numeric(18,4) can hold a two-decimal amount that cannot carry its own penny', async () => {
+  // THE CLAIM r13 RESTED ON, MEASURED AND FOUND FALSE. The two-decimal case was described as bounded
+  // by the column — no 2dp amount the column accepts could lose a penny. The column's largest value
+  // loses one: these are two different amounts and the wire cannot tell them apart.
+  const decoded = await decodeJsonAmounts('{"max":99999999999999.99,"below":99999999999999.98}')
+  assert.equal(decoded.max, decoded.below,
+    'precondition: the top of numeric(18,4) and a penny less than it decode to ONE double')
+  assert.ok(decoded.max > ledgerAmountMagnitudeBound('GBP'),
+    'which is why: the column reaches ~1.0e14 and the two-decimal bound is 2^46 ~ 7.04e13')
+  assert.equal(parseLedgerAmount(decoded.max, 'GBP'), null,
+    'so the top of the column is REFUSED in a two-decimal currency, and withholding is the whole point')
+})
+
+test('[o3d-psrx r14] the largest two-decimal amount below the bound still reads, exactly', async () => {
+  // THE OTHER SIDE OF THAT LINE, so the refusal above is not "refuse anything large". One penny below
+  // the bound is read, and it is read as ITSELF — distinct from the penny either side of it.
+  const decoded = await decodeJsonAmounts(
+    '{"top":70368744177663.99,"under":70368744177663.98,"over":70368744177664.01}')
+  assert.notEqual(decoded.top, decoded.under, 'precondition: these pennies are still distinguishable here')
+  assert.equal(parseLedgerAmount(decoded.top, 'GBP'), 70368744177663.99)
+  assert.equal(parseLedgerAmount(decoded.under, 'GBP'), 70368744177663.98)
+  // And one penny the other side of the bound is not.
+  assert.equal(parseLedgerAmount(decoded.over, 'GBP'), null)
+})
+
+test('[o3d-psrx r14] ordinary amounts are untouched, in every supported precision', async () => {
+  // The half of this change that runs on every poll. None of these is anywhere near a bound, and a
+  // guard that moved any of them would be a defect far larger than the one it was written for.
+  const decoded = await decodeJsonAmounts(
+    '{"a":0,"b":50.25,"c":1234567.8901,"d":-12.34,"e":0.001,"f":123456789.99,"g":0.0001}')
+  const cases: [string, string, number][] = [
+    ['GBP', 'a', 0], ['GBP', 'b', 50.25], ['GBP', 'c', 1234567.8901], ['GBP', 'd', -12.34],
+    ['KWD', 'e', 0.001], ['GBP', 'f', 123456789.99], ['CLF', 'g', 0.0001],
+    ['JPY', 'f', 123456789.99], ['GBP', 'g', 0.0001],
+  ]
+  for (const [currency, key, expected] of cases) {
+    assert.equal(parseLedgerAmount(decoded[key], currency), expected,
+      `${decoded[key]} in ${currency} is ordinary money and must read unchanged`)
+  }
+  // Including through the reversal partition, which is what spends the number.
+  const rows: XeroInvoice[] = [
+    { InvoiceID: 'ord', Status: 'AUTHORISED', Type: 'ACCPAY', CurrencyCode: 'GBP', AmountPaid: decoded.b },
+  ]
+  assert.deepEqual(partitionPaymentReversals(rows, 'ACCPAY').partPaid.map((i) => i.InvoiceID), ['ord'])
+})
+
+test('[o3d-psrx r14] an invoice with no stated currency takes the STRICTEST bound, and withholds', async () => {
+  // Xero states CurrencyCode on every invoice; the fixtures predate the field, and an unstated
+  // currency must not be read as "the ordinary two decimals". The strictest reading can only move a
+  // document into a bucket that WITHHOLDS, which is the safe direction; the lenient one admits a
+  // reversal, which pays a supplier twice.
+  assert.equal(ledgerAmountMagnitudeBound(null), ledgerAmountMagnitudeBound('CLF'),
+    'an unstated currency is read at the finest precision this repository supports')
+  const decoded = await decodeJsonAmounts('{"amount":1649267441664}')
+  const rows: XeroInvoice[] = [
+    { InvoiceID: 'no-ccy', Status: 'AUTHORISED', Type: 'ACCPAY', AmountPaid: decoded.amount },
+    { InvoiceID: 'jpy', Status: 'AUTHORISED', Type: 'ACCPAY', CurrencyCode: 'JPY', AmountPaid: decoded.amount },
+  ]
+  const partition = partitionPaymentReversals(rows, 'ACCPAY')
+  assert.deepEqual(partition.unverifiable.map((i) => i.InvoiceID), ['no-ccy'],
+    'THE ROUTE: an amount the bound refuses lands in `unverifiable`, which withholds the reversal — '
+    + 'it must never reach `zeroPaid`, which is what clears paidAt')
+  assert.deepEqual(partition.zeroPaid.map((i) => i.InvoiceID), [])
+  // The paired case, so this cannot pass by refusing everything: the SAME figure in a currency whose
+  // minor unit it can carry is read, and read as a part payment.
+  assert.deepEqual(partition.partPaid.map((i) => i.InvoiceID), ['jpy'])
 })

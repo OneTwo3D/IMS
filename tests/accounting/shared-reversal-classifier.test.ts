@@ -741,9 +741,9 @@ test('[o3d-psrx r13] the two figures in the admitted pair are each individually 
   // input guard passes it. If a future change made either figure unreadable on its own, the test
   // below would still pass and would be proving nothing.
   for (const [label, value] of [['total', ADMITTED_TOTAL], ['balance', ADMITTED_BALANCE]] as const) {
-    assert.equal(parseLedgerAmount(value), value,
+    assert.equal(parseLedgerAmount(value, 'GBP'), value,
       `${label} must survive the input round trip — otherwise the derived-value guard is untested`)
-    assert.ok(toDecimal(parseLedgerAmount(value)!).equals(toDecimal(String(value))),
+    assert.ok(toDecimal(parseLedgerAmount(value, 'GBP')!).equals(toDecimal(String(value))),
       `${label} must be lossless coming in`)
   }
   // And the exact difference really is a payment the ledger holds: strictly ABOVE the GBP epsilon.
@@ -818,4 +818,93 @@ test('[o3d-psrx r13] a VOIDED document is still a stated zero, not a derivation'
   // The one place a zero `paid` is legitimate is a document QuickBooks zeroed, and it is stated
   // rather than subtracted — so the new refusal must not be able to reach it.
   assert.deepEqual(classifyQboLedgerEvidence(ledgerAmount(0, 0, 'GBP')), { kind: 'HOLDS_NOTHING' })
+})
+
+
+// ---------------------------------------------------------------------------
+// o3d-psrx r14 (Codex HIGH) — THE FULL QUICKBOOKS ROUTE, THROUGH AN ACTUAL `Response.json()`.
+//
+// r13's guard is applied to `TotalAmt - Balance` AFTER both figures have been decoded. Codex's point
+// is that the decode itself is the lossy step: two QuickBooks figures one minor unit apart come back
+// as ONE double, their exact difference is then a true zero, and every guard downstream — including
+// r13's, which is asking a question about a Decimal that is already wrong — accepts it. The verdict is
+// HOLDS_NOTHING, which is the one `zeroPaidIsProvenReversal` is written about.
+//
+// So these tests do not construct the numbers. They put QuickBooks' own wire text through `Response`,
+// exactly as `qboQuery` does, and read the row that comes out. A fixture built from numeric literals
+// would be rounded by the same rule and would prove nothing about the decode.
+// ---------------------------------------------------------------------------
+
+/** One row of a QBO query response, decoded from wire text the way the connector client decodes it. */
+async function decodeQboRow(body: string): Promise<Parameters<typeof qboLedgerAmount>[0]> {
+  const response = new Response(body, { headers: { 'content-type': 'application/json' } })
+  const payload = await response.json() as { QueryResponse: { Invoice: Parameters<typeof qboLedgerAmount>[0][] } }
+  return payload.QueryResponse.Invoice[0]
+}
+
+test('[o3d-psrx r14] a CLF document holding ONE minor unit is not read as holding NOTHING', async () => {
+  // The finding's pair. TotalAmt 1649267441664 with Balance 1649267441663.9999 is a document with
+  // 0.0001 CLF — one whole minor unit — settled on it.
+  const row = await decodeQboRow(
+    '{"QueryResponse":{"Invoice":[{"Id":"clf-1","TotalAmt":1649267441664,'
+    + '"Balance":1649267441663.9999,"CurrencyRef":{"value":"CLF"}}]}}')
+
+  // PRECONDITION 1: the ledger really does hold a payment. Read from the wire TEXT in exact decimal,
+  // which is the only place the truth still exists after the decode.
+  const trueSettled = toDecimal('1649267441664').minus(toDecimal('1649267441663.9999'))
+  assert.equal(trueSettled.toString(), '0.0001')
+  assert.ok(trueSettled.gt(ledgerAmountEpsilon('CLF')),
+    'precondition: one CLF minor unit is above the CLF threshold, so this document HOLDS a payment')
+
+  // PRECONDITION 2: and `Response.json()` destroyed exactly that. Without this the test could pass
+  // against a decode that never lost anything, and would be proving nothing at all.
+  assert.equal(row.TotalAmt, row.Balance,
+    'precondition: the decode collapsed the two figures, so their difference is now an exact zero')
+
+  const evidence = classifyQboLedgerEvidence(qboLedgerAmount(row))
+  assert.notEqual(evidence.kind, 'HOLDS_NOTHING',
+    'THE DEFECT: a document with a minor unit settled on it must never reach the verdict that clears '
+    + 'paidAt, re-arms Mark Paid over a supplier payment, and raises a sales chargeback')
+  assert.equal(evidence.kind, 'UNPROVEN',
+    'and the answer is that IMS could not read these figures — which withholds')
+})
+
+test('[o3d-psrx r14] a 3-decimal document holding ONE minor unit is not read as holding NOTHING', async () => {
+  const row = await decodeQboRow(
+    '{"QueryResponse":{"Invoice":[{"Id":"kwd-1","TotalAmt":8796093022208.002,'
+    + '"Balance":8796093022208.001,"CurrencyRef":{"value":"KWD"}}]}}')
+
+  const trueSettled = toDecimal('8796093022208.002').minus(toDecimal('8796093022208.001'))
+  assert.equal(trueSettled.toString(), '0.001')
+  assert.ok(trueSettled.gt(ledgerAmountEpsilon('KWD')),
+    'precondition: one fils is above the KWD threshold, so this document HOLDS a payment')
+  assert.equal(row.TotalAmt, row.Balance,
+    'precondition: the decode collapsed one fils out of existence')
+
+  const evidence = classifyQboLedgerEvidence(qboLedgerAmount(row))
+  assert.notEqual(evidence.kind, 'HOLDS_NOTHING',
+    'the Gulf-dinar equivalent of the finding, and it must withhold for the same reason')
+  assert.equal(evidence.kind, 'UNPROVEN')
+})
+
+test('[o3d-psrx r14] an ordinary decoded QBO document still classifies exactly as before', async () => {
+  // THE CONTROL. Everything above would also pass if the reader had simply stopped reading anything,
+  // which would withhold every reversal in the system and be a far worse defect than the one fixed.
+  const row = await decodeQboRow(
+    '{"QueryResponse":{"Invoice":[{"Id":"ord-1","TotalAmt":1200.50,'
+    + '"Balance":200.50,"CurrencyRef":{"value":"GBP"}}]}}')
+  assert.deepEqual(classifyQboLedgerEvidence(qboLedgerAmount(row)), {
+    kind: 'PARTIALLY_PAID',
+    paidAmount: 1000,
+    documentTotal: 1200.5,
+    outstandingAmount: 200.5,
+    currency: 'GBP',
+  })
+
+  // And a genuinely settled-to-nothing document still says so — the verdict this whole module exists
+  // to reach when it is true.
+  const zeroed = await decodeQboRow(
+    '{"QueryResponse":{"Invoice":[{"Id":"ord-2","TotalAmt":1200.50,'
+    + '"Balance":1200.50,"CurrencyRef":{"value":"GBP"}}]}}')
+  assert.deepEqual(classifyQboLedgerEvidence(qboLedgerAmount(zeroed)), { kind: 'HOLDS_NOTHING' })
 })
