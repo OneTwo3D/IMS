@@ -12,6 +12,7 @@ import {
 } from '@/lib/connectors/xero/invoice-delta'
 import { storedBodyMayHaveReachedTheLedger } from '@/lib/domain/accounting/followup-idempotency'
 import { payloadAccountingInvoiceId, payloadPaymentId, payloadRegisteredAmount } from '@/lib/domain/accounting/invoice-payment-enqueue'
+import { toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 
 // ---------------------------------------------------------------------------
 // Payment-reversal detection (audit-M-acct #3)
@@ -137,6 +138,23 @@ export type PaidProvenanceDoc = {
  * with. A caller that finds no entry for a document must WITHHOLD, never admit: this map's absences
  * are "nothing was decided", which is the same fail-closed reading a null fence gets.
  */
+/**
+ * A stored money column as the `Decimal` it is, or NULL because it is not one (o3d-psrx r18).
+ *
+ * `toDecimal` REFUSES a non-finite value by throwing rather than by returning something — which is
+ * the right shape everywhere else and the wrong one here. This reader runs inside a poll over many
+ * documents, and one unreadable column must turn the coverage guard off for THAT document (the
+ * round-6 behaviour, stated at the call site) instead of aborting the pass for all of them. So the
+ * refusal is turned back into a value, and it is a refusal and never a zero.
+ */
+function finiteDecimalOrNull(value: Prisma.Decimal): Decimal | null {
+  try {
+    return toDecimal(value)
+  } catch {
+    return null
+  }
+}
+
 export async function readPaidProvenanceVerdicts<T extends PaidProvenanceDoc>(
   docs: readonly T[],
   params: {
@@ -187,7 +205,13 @@ export async function readPaidProvenanceVerdicts<T extends PaidProvenanceDoc>(
   //
   // SALES ONLY. A `PurchaseInvoice` carries no off-ledger marker (o3d-a3wx), so the coverage guard
   // this feeds is unreachable from the bill pass and there is nothing for a total to decide.
-  const documentTotals = new Map<string, { total: number; currency: string }>()
+  //
+  // o3d-psrx r18 (Codex HIGH 2): AND IT IS KEPT AS THE STORED `Decimal`. `totalForeign` is a
+  // `Decimal(18, 4)` column, and `Number(...)` on it was the boundary conversion the coverage finding
+  // is about — at 2^39 the double spacing exceeds a four-decimal minor unit, so two totals a whole
+  // unit apart become one number before the guard ever sees them. Prisma already hands this over as a
+  // `Decimal`; carrying it is not extra work, it is declining to throw the precision away.
+  const documentTotals = new Map<string, { total: Decimal; currency: string }>()
   if (params.referenceType === 'SalesOrder') {
     const orders = await db.salesOrder.findMany({
       where: { id: { in: scoped.map((d) => d.id) } },
@@ -198,11 +222,11 @@ export async function readPaidProvenanceVerdicts<T extends PaidProvenanceDoc>(
       select: { id: true, totalForeign: true, currency: true },
     })
     for (const order of orders) {
-      const total = Number(order.totalForeign)
+      const total = finiteDecimalOrNull(order.totalForeign)
       // An unreadable total is NOT zero and not "no opinion about coverage": leaving it out of the map
       // makes `documentTotal` null below, which turns the guard off — the round-6 behaviour — and that
       // is the only honest thing to do with a number that cannot be read.
-      if (Number.isFinite(total)) documentTotals.set(order.id, { total, currency: order.currency })
+      if (total !== null) documentTotals.set(order.id, { total, currency: order.currency })
     }
   }
 

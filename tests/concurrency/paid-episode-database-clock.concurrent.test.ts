@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import test from 'node:test'
 import { config } from 'dotenv'
+import { toDecimal } from '@/lib/domain/math/decimal'
 
 /**
  * o3d-psrx r5 (Codex HIGH 1) — THE PAID-EPISODE FENCE IS MEASURED BY THE DATABASE, WHATEVER THE
@@ -641,7 +642,7 @@ test(
     assert.deepEqual(
       classifyRegisteredPaymentAgainstListing(
         new Set<string>(), [registration], databaseLedgerFence(new Date(await databaseNow(db))),
-        [], paidState.unregisteredPaidAt != null, paidState, 100,
+        [], paidState.unregisteredPaidAt != null, paidState, toDecimal(100),
       ),
       { verdict: 'GONE', paymentIds: ['PAY-1'] },
       'so a GENUINE chargeback on this order is still recognised. Under the resurrected fence the row '

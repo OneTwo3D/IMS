@@ -142,6 +142,42 @@ export function ledgerAmountEpsilon(currency: string | null): Decimal {
   return toDecimal(`0.${'0'.repeat(digits)}5`)
 }
 
+/**
+ * o3d-psrx r18 (Codex HIGH 1) — IS THIS AMOUNT A VALID FIGURE IN THIS CURRENCY? THE SCALE HALF OF
+ * THAT QUESTION, ASKED IN ONE PLACE SO IT CANNOT BE ASKED BY ONE READER ONLY.
+ *
+ * r16 put the scale refusal inside `parseLedgerAmount`'s NUMBER arm, because that is where the r14
+ * finding pointed and where the brief scoped it. The string arm kept only its grammar test and its
+ * round trip, and r15's argument for the asymmetry — a string carries its own evidence, so it needs
+ * no bound on values of its SIZE — is an argument about MAGNITUDE and does not reach SCALE. The
+ * round trip establishes that the number IS the text it came from; it says nothing about whether
+ * that text is a figure the currency can hold. So GBP `AmountPaid` "0.005" was read as an amount
+ * while the semantically identical `0.005` was refused, and `partitionPaymentReversals` then spent a
+ * three-decimal GBP figure that a two-decimal ledger cannot state.
+ *
+ * A THREE-DECIMAL FIGURE ON A TWO-DECIMAL CURRENCY IS MALFORMED FOR THAT CURRENCY HOWEVER IT
+ * ARRIVED. That sentence has no arm in it, so neither does the rule: it lives here, beside the
+ * minor-unit table it derives from and upstream of both connectors — the same move r17 made for
+ * `ledgerAmountEpsilon` when Xero and QuickBooks turned out to hold two answers to "how small is
+ * nothing".
+ *
+ * IT TAKES A `Decimal`, NOT A `DecimalInput`, and that is the whole guarantee. Each arm has to name
+ * the decimal it means: the number arm asks about `toDecimal(theDouble)` — the double's own shortest
+ * decimal reading, which is the only scale a token that is already gone still has — and the string
+ * arm asks about the digits it was actually given, BEFORE converting them. Accepting a `number` here
+ * would let a caller convert at the boundary and hand this rule a scale that is not the one it meant
+ * to test.
+ *
+ * WHAT STILL DIFFERS BETWEEN THE ARMS AFTER THIS, LEGITIMATELY: the MAGNITUDE bound. Its premise is
+ * that the evidence is already gone — a JSON numeric token has been through `Response.json()` and no
+ * test applied to the resulting double can recover what it rounded away — which is true of the
+ * number arm and false of the string arm, where the original digits are still here to be checked by
+ * the round trip. See `ledgerAmountMagnitudeBound` and `parseLedgerAmount`.
+ */
+export function isLedgerMinorUnitQuantized(value: Decimal, currency: string | null): boolean {
+  return value.decimalPlaces() <= ledgerMinorUnits(currency)
+}
+
 function currencyPrecision(currency: string): number {
   const normalizedCurrency = currency.trim().toUpperCase()
   if (!normalizedCurrency) return 2

@@ -7,7 +7,9 @@
 
 import { coversDocumentTotal } from '@/lib/domain/accounting/paid-coverage'
 import {
+  addMoney,
   compareDecimal,
+  isLedgerMinorUnitQuantized,
   ledgerAmountEpsilon,
   ledgerMinorUnits,
   subtractMoney,
@@ -1214,7 +1216,13 @@ export function parseLedgerAmount(value: unknown, currency: string | null): numb
     // own scale or shorter, because below the bound the double spacing is no wider than one minor
     // unit, so the token itself sits in the rounding interval and nothing longer than it is needed to
     // name that double. Measured across every supported precision in the tests.
-    return toDecimal(value).decimalPlaces() <= ledgerMinorUnits(currency) ? value : null
+    //
+    // r18 (Codex HIGH 1) — AND THE RULE ITSELF NOW LIVES UPSTREAM OF BOTH ARMS. It was spelt here, on
+    // the number arm alone, which is how a GBP "0.005" string was admitted while the identical double
+    // was refused. `isLedgerMinorUnitQuantized` is the one spelling; what this arm supplies is the
+    // decimal it is to be asked about — `toDecimal(value)`, the double's own shortest decimal reading,
+    // which is the only scale a token that is already gone still has.
+    return isLedgerMinorUnitQuantized(toDecimal(value), currency) ? value : null
   }
   if (typeof value === 'string') {
     const trimmed = value.trim()
@@ -1237,7 +1245,17 @@ export function parseLedgerAmount(value: unknown, currency: string | null): numb
     // is the stronger shape and is NOT small here: this reader's result is a `number` in the Xero
     // partition, in `QboLedgerAmount`, in `QboLedgerEvidence` and in the activity metadata those
     // verdicts are written into. That is a change to two connectors' public readings.
-    return readDecimalAsNumber(toDecimal(trimmed))
+    //
+    // o3d-psrx r18 (Codex HIGH 1) — AND THE SCALE IS ASKED HERE TOO, OF THE DIGITS THEMSELVES, BEFORE
+    // ANY CONVERSION. r15's argument above is about MAGNITUDE and does not transfer: the round trip
+    // proves this number IS the text it came from, not that the text is a figure the currency can
+    // hold. GBP `"0.005"` is a three-decimal amount in a two-decimal currency — malformed FOR THAT
+    // CURRENCY however it arrived — and it round-trips perfectly, so nothing below could refuse it.
+    // The rule is the same function the number arm asks, and it is asked of the PARSED decimal rather
+    // than of the double, because converting first would throw away the very digits in question.
+    const parsed = toDecimal(trimmed)
+    if (!isLedgerMinorUnitQuantized(parsed, currency)) return null
+    return readDecimalAsNumber(parsed)
   }
   return null
 }
@@ -1773,8 +1791,14 @@ export type RegisteredPaymentVerdict =
   | {
       verdict: 'PART_COVERED_OFF_LEDGER'
       paymentIds: string[]
-      registeredTotal: number | null
-      documentTotal: number
+      /**
+       * o3d-psrx r18: `Decimal`, not `number`. These two figures are the ones the guard COMPARED, and
+       * the comparison is now exact decimal arithmetic — reporting them as doubles would print the
+       * same value twice for exactly the pair the r18 finding is about (`549755813888.0002` covering
+       * `549755813888.0003`), which is the one case an operator most needs to be able to read.
+       */
+      registeredTotal: Decimal | null
+      documentTotal: Decimal
     }
   /**
    * o3d-psrx r8 (Codex HIGH 2) — THE LEDGER HAS NOT BEEN SHOWN TO HOLD NOTHING ON THIS DOCUMENT.
@@ -1980,7 +2004,7 @@ export function classifyRegisteredPaymentAgainstListing(
    *
    * It is read ONLY beside a standing `paidWithoutLedgerReceipt`. See the coverage guard below.
    */
-  documentTotal: number | null = null,
+  documentTotal: Decimal | null = null,
 ): RegisteredPaymentVerdict {
   const undecided: string[] = []
   const posted: string[] = []
@@ -2133,11 +2157,17 @@ export function classifyRegisteredPaymentAgainstListing(
  * not a smaller sum, it is a number that means nothing — and the direction the hole would push the
  * comparison depends entirely on which row it is in.
  */
-function sumRegisteredAmounts(rows: readonly RegisteredPaymentRow[]): number | null {
-  let total = 0
+function sumRegisteredAmounts(rows: readonly RegisteredPaymentRow[]): Decimal | null {
+  // o3d-psrx r18 (Codex HIGH 2): SUMMED AS `Decimal`. Each term is still a double — the enqueue
+  // records it that way in the payload (o3d-1xq8) — but `toDecimal` reads each one at its own exact
+  // decimal value and `addMoney` adds them without rounding, so the SUM contributes no error of its
+  // own on top of the terms. Adding them in `Number` did: two four-decimal registrations against a
+  // large order could total to a double a whole minor unit away from their true sum, and this figure
+  // is one side of the coverage comparison.
+  let total = toDecimal(0)
   for (const row of rows) {
     if (typeof row.registeredAmount !== 'number' || !Number.isFinite(row.registeredAmount)) return null
-    total += row.registeredAmount
+    total = addMoney(total, row.registeredAmount)
   }
   return total
 }

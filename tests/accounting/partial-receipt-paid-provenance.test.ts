@@ -179,7 +179,7 @@ const ORDER_TOTAL = 100
 test('[o3d-psrx r7] removing a PART-covering registration does not reverse the whole off-ledger order', () => {
   // The ledger has been read in full and lists nothing: the GBP 1 payment IMS registered is gone.
   const verdict = classifyRegisteredPaymentAgainstListing(
-    new Set<string>(), [pennyRegistration], READ_AT, [], true, withMarker, ORDER_TOTAL,
+    new Set<string>(), [pennyRegistration], READ_AT, [], true, withMarker, toDecimal(ORDER_TOTAL),
   )
   assert.equal(verdict.verdict, 'PART_COVERED_OFF_LEDGER',
     'THE FINDING: r6 returned GONE here, because the marker was consulted only while nothing had '
@@ -190,9 +190,11 @@ test('[o3d-psrx r7] removing a PART-covering registration does not reverse the w
   // The numbers travel with the verdict, because the operator's question is "part of what?".
   assert.deepEqual(
     verdict.verdict === 'PART_COVERED_OFF_LEDGER'
-      ? { registeredTotal: verdict.registeredTotal, documentTotal: verdict.documentTotal }
+      ? { registeredTotal: verdict.registeredTotal?.toString() ?? null, documentTotal: verdict.documentTotal.toString() }
       : null,
-    { registeredTotal: 1, documentTotal: 100 },
+    { registeredTotal: '1', documentTotal: '100' },
+    'and they travel as the DECIMALS the guard compared (r18), so the pair the finding is about is '
+    + 'reportable rather than printing the same double twice',
   )
 })
 
@@ -210,7 +212,7 @@ test('[o3d-psrx r17] ONE MINOR UNIT SHORT IS NOT COVERAGE, in the finest currenc
   // called it covered and returned GONE, an ADMITTED reversal of the whole document.
   const oneUnitShort: RegisteredPaymentRow = { ...pennyRegistration, registeredAmount: 99.9999 }
   const verdict = classifyRegisteredPaymentAgainstListing(
-    new Set<string>(), [oneUnitShort], READ_AT, [], true, withMarker, ORDER_TOTAL,
+    new Set<string>(), [oneUnitShort], READ_AT, [], true, withMarker, toDecimal(ORDER_TOTAL),
   )
   assert.equal(verdict.verdict, 'PART_COVERED_OFF_LEDGER',
     'a whole minor unit short of the total is a PART, and its removal is not a reversal of the whole')
@@ -222,7 +224,7 @@ test('[o3d-psrx r17] ONE MINOR UNIT SHORT IS NOT COVERAGE, in the finest currenc
   const noisy: RegisteredPaymentRow = { ...pennyRegistration, registeredAmount: ORDER_TOTAL - 1e-9 }
   assert.equal(
     classifyRegisteredPaymentAgainstListing(
-      new Set<string>(), [noisy], READ_AT, [], true, withMarker, ORDER_TOTAL,
+      new Set<string>(), [noisy], READ_AT, [], true, withMarker, toDecimal(ORDER_TOTAL),
     ).verdict,
     'GONE',
     'a shortfall of a billionth is assembly noise, not a part payment',
@@ -236,7 +238,7 @@ test('[o3d-psrx r17] ONE MINOR UNIT SHORT IS NOT COVERAGE, in the finest currenc
       `${currency}: a coverage band at or above one minor unit absorbs a real shortfall `
       + `(band ${PAID_COVERAGE_EPSILON}, minor unit ${oneMinorUnit.toString()})`)
   }
-  assert.ok(PAID_COVERAGE_EPSILON > 0, 'and a zero band would make float dust a shortfall')
+  assert.ok(PAID_COVERAGE_EPSILON.gt(0), 'and a zero band would make assembly dust a shortfall')
 })
 
 test('[o3d-psrx r7] a registration that COVERS the order still reverses when the ledger says so', () => {
@@ -244,7 +246,7 @@ test('[o3d-psrx r7] a registration that COVERS the order still reverses when the
   // stands. "Withhold whenever a marker is present" would pass the test above and disable genuine
   // chargeback detection for every order that carries one.
   const verdict = classifyRegisteredPaymentAgainstListing(
-    new Set<string>(), [fullRegistration], READ_AT, [], true, withMarker, ORDER_TOTAL,
+    new Set<string>(), [fullRegistration], READ_AT, [], true, withMarker, toDecimal(ORDER_TOTAL),
   )
   assert.equal(verdict.verdict, 'GONE')
   assert.equal(zeroPaidIsProvenReversal(verdict), true,
@@ -254,7 +256,7 @@ test('[o3d-psrx r7] a registration that COVERS the order still reverses when the
 
 test('[o3d-psrx r7] coverage a payload will not state is not coverage', () => {
   const verdict = classifyRegisteredPaymentAgainstListing(
-    new Set<string>(), [silentRegistration], READ_AT, [], true, withMarker, ORDER_TOTAL,
+    new Set<string>(), [silentRegistration], READ_AT, [], true, withMarker, toDecimal(ORDER_TOTAL),
   )
   assert.equal(verdict.verdict, 'PART_COVERED_OFF_LEDGER',
     'a compacted or legacy payload cannot establish that the registration covered the order, and '
@@ -274,7 +276,7 @@ test('[o3d-psrx r7] one unreadable amount makes the WHOLE sum unreadable, not me
   const verdict = classifyRegisteredPaymentAgainstListing(
     new Set<string>(),
     [{ ...fullRegistration, id: 'log_a', externalTransactionId: 'PAY-A' }, { ...silentRegistration, id: 'log_b', externalTransactionId: 'PAY-B' }],
-    READ_AT, [], true, withMarker, ORDER_TOTAL,
+    READ_AT, [], true, withMarker, toDecimal(ORDER_TOTAL),
   )
   assert.equal(verdict.verdict, 'PART_COVERED_OFF_LEDGER')
   assert.equal(verdict.verdict === 'PART_COVERED_OFF_LEDGER' ? verdict.registeredTotal : 'unread', null)
@@ -286,7 +288,7 @@ test('[o3d-psrx r7] the guard is gated on the MARKER, not on the amounts alone',
   // versus-removal question there is the amount reading's (`partitionPaymentReversals`), not this
   // one's. Passing `paidWithoutLedgerReceipt: false` must therefore change nothing about round 6.
   const verdict = classifyRegisteredPaymentAgainstListing(
-    new Set<string>(), [pennyRegistration], READ_AT, [], false, markerErased, ORDER_TOTAL,
+    new Set<string>(), [pennyRegistration], READ_AT, [], false, markerErased, toDecimal(ORDER_TOTAL),
   )
   assert.equal(verdict.verdict, 'GONE')
   assert.equal(zeroPaidIsProvenReversal(verdict), true)
@@ -307,7 +309,7 @@ test('[o3d-psrx r7] a ledger that still LISTS the part payment says so, rather t
   // is holding, which is the thing to go and look at. The guard's sentence would send them to the
   // order instead.
   const verdict = classifyRegisteredPaymentAgainstListing(
-    new Set(['pay-penny']), [pennyRegistration], READ_AT, [], true, withMarker, ORDER_TOTAL,
+    new Set(['pay-penny']), [pennyRegistration], READ_AT, [], true, withMarker, toDecimal(ORDER_TOTAL),
   )
   assert.equal(verdict.verdict, 'STILL_HELD')
   assert.equal(zeroPaidIsProvenReversal(verdict), false)
@@ -319,7 +321,7 @@ test('[o3d-psrx r7] the QuickBooks route — a withheld listing is not a licence
   // `zeroPaidIsProvenReversal` ADMITS. The GBP 1-on-GBP 100 defect therefore existed on that connector
   // too, by a different route, and the guard has to dominate that answer as well as GONE.
   const partCovered = classifyRegisteredPaymentAgainstListing(
-    null, [pennyRegistration], READ_AT, [], true, withMarker, ORDER_TOTAL,
+    null, [pennyRegistration], READ_AT, [], true, withMarker, toDecimal(ORDER_TOTAL),
   )
   assert.equal(partCovered.verdict, 'PART_COVERED_OFF_LEDGER')
   assert.equal(zeroPaidIsProvenReversal(partCovered), false)
@@ -327,7 +329,7 @@ test('[o3d-psrx r7] the QuickBooks route — a withheld listing is not a licence
   // And the control on the same route: a full-cover registration over a ledger stating a zero total
   // is still a reversal, exactly as it was.
   const fullyCovered = classifyRegisteredPaymentAgainstListing(
-    null, [fullRegistration], READ_AT, [], true, withMarker, ORDER_TOTAL,
+    null, [fullRegistration], READ_AT, [], true, withMarker, toDecimal(ORDER_TOTAL),
   )
   assert.equal(fullyCovered.verdict, 'LEDGER_DID_NOT_LIST_PAYMENTS')
   assert.equal(zeroPaidIsProvenReversal(fullyCovered), true)
@@ -339,15 +341,20 @@ test('[o3d-psrx r7] the reader\'s comparison IS the writer\'s, epsilon included'
   // at the boundary — the only place a drift between two spellings would ever show.
   const justUnder: RegisteredPaymentRow = { ...pennyRegistration, registeredAmount: ORDER_TOTAL - 0.01 }
   const withinEpsilon: RegisteredPaymentRow = { ...pennyRegistration, registeredAmount: ORDER_TOTAL - 0.00005 }
-  assert.equal(coversDocumentTotal(ORDER_TOTAL - 0.01, ORDER_TOTAL), false, 'PRECONDITION: a penny short is short')
-  assert.equal(coversDocumentTotal(ORDER_TOTAL - 0.00005, ORDER_TOTAL), true, 'PRECONDITION: float noise is not')
+  // r18: the arguments are `Decimal`s, and the conversion is WRITTEN DOWN at the call site rather
+  // than performed inside the rule — which is the property that stopped a stored four-decimal figure
+  // reaching this comparison as a collapsed double.
+  assert.equal(coversDocumentTotal(toDecimal(ORDER_TOTAL - 0.01), toDecimal(ORDER_TOTAL)), false,
+    'PRECONDITION: a penny short is short')
+  assert.equal(coversDocumentTotal(toDecimal(ORDER_TOTAL - 0.00005), toDecimal(ORDER_TOTAL)), true,
+    'PRECONDITION: assembly dust is not')
 
   assert.equal(
-    classifyRegisteredPaymentAgainstListing(new Set<string>(), [justUnder], READ_AT, [], true, withMarker, ORDER_TOTAL).verdict,
+    classifyRegisteredPaymentAgainstListing(new Set<string>(), [justUnder], READ_AT, [], true, withMarker, toDecimal(ORDER_TOTAL)).verdict,
     'PART_COVERED_OFF_LEDGER',
   )
   assert.equal(
-    classifyRegisteredPaymentAgainstListing(new Set<string>(), [withinEpsilon], READ_AT, [], true, withMarker, ORDER_TOTAL).verdict,
+    classifyRegisteredPaymentAgainstListing(new Set<string>(), [withinEpsilon], READ_AT, [], true, withMarker, toDecimal(ORDER_TOTAL)).verdict,
     'GONE',
   )
 })

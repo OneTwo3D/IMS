@@ -79,7 +79,7 @@ import { INTERNAL_STATUS_TRANSITION_BYPASS, INTERNAL_STATUS_TRANSITION_AUTH_ONLY
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { decimalToNumber } from '@/lib/decimal'
-import { multiplyMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { addMoney, ledgerAmountEpsilon, multiplyMoney, roundQuantity, subtractMoney, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { validateManualSalesOrderStatusTransition } from '@/lib/domain/workflows/action-guards'
 import {
   buildRealisedFxJournal,
@@ -3421,26 +3421,46 @@ export async function addPayment(input: {
       }
 
       const refundId = input.refundId || null
-      let payableTotal = Number(so.totalForeign)
+      // o3d-psrx r18 (Codex HIGH 2) — EVERY FIGURE BELOW IS THE STORED `Decimal`, NOT A `Number()` OF
+      // IT. `totalForeign` and `Payment.amount` are `Decimal(18, 4)` columns whose range a double
+      // cannot hold at four decimals: above 2^39 the spacing between neighbouring doubles is wider
+      // than one four-decimal minor unit, so two stored figures a whole unit apart converge on one
+      // number. That collapse decided BOTH tests in this block — the over-payment refusal and the
+      // coverage test that clears the off-ledger provenance marker — and neither can be recovered
+      // afterwards. Prisma hands these over as `Decimal`s already; this is simply not discarding them.
+      let payableTotal = toDecimal(so.totalForeign)
       if (refundId) {
         const refund = await tx.salesOrderRefund.findFirst({
           where: { id: refundId, orderId: input.orderId },
           select: { totalForeign: true },
         })
         if (!refund) return { error: 'Refund not found for this order' }
-        payableTotal = Number(refund.totalForeign)
+        payableTotal = toDecimal(refund.totalForeign)
       }
 
       const existingPayments = await tx.payment.findMany({
         where: { orderId: input.orderId, refundId },
         select: { amount: true, currency: true },
       })
-      const totalPaid = existingPayments.reduce((sum, payment) => {
+      const totalPaid = existingPayments.reduce<Decimal>((sum, payment) => {
         if (payment.currency !== so.currency) return sum
-        return sum + Number(payment.amount)
-      }, 0)
-      if (totalPaid + input.amount > payableTotal + 0.0001) {
-        return { error: `Payment exceeds remaining balance (${so.currency} ${(payableTotal - totalPaid).toFixed(2)})` }
+        return addMoney(sum, payment.amount)
+      }, toDecimal(0))
+      // `input.amount` is the one operand that is NOT a stored decimal — it is a `number` off the
+      // client — so it is read at its own exact decimal value and added exactly, rather than the sum
+      // being carried out in the arithmetic that loses the column's precision.
+      const requestedAmount = toDecimal(input.amount)
+      const totalAfter = addMoney(totalPaid, requestedAmount)
+      // AND THE BAND IS DERIVED RATHER THAN A LITERAL, for the reason r17 gave one module over
+      // (lib/domain/accounting/paid-coverage.ts). It was `0.0001`, which is EXACTLY one whole minor
+      // unit in the two four-decimal currencies `currencyMinorUnits` supports (CLF, UYW) — so in those
+      // an over-payment of a full minor unit was admitted by a band that was only ever meant to absorb
+      // arithmetic dust. `ledgerAmountEpsilon(null)` is half the FINEST supported minor unit, strictly
+      // below one unit in every currency and strictly below the old literal in every currency, so this
+      // moves only in the refusing direction — and the dust it was absorbing is gone anyway now that
+      // the sum above is exact.
+      if (totalAfter.gt(addMoney(payableTotal, ledgerAmountEpsilon(null)))) {
+        return { error: `Payment exceeds remaining balance (${so.currency} ${subtractMoney(payableTotal, totalPaid).toFixed(2)})` }
       }
 
       const paidAt = input.paidAt ? new Date(input.paidAt) : new Date()
@@ -3494,7 +3514,10 @@ export async function addPayment(input: {
       // `coversDocumentTotal`. The reader refuses to treat a part-covering registration's absence as a
       // reversal of the whole order while this marker stands, which is only sound while its comparison
       // and this one are the same comparison. See lib/domain/accounting/paid-coverage.ts.
-      const coversOrderTotal = !refundId && coversDocumentTotal(totalPaid + input.amount, Number(so.totalForeign))
+      //
+      // r18: `so.totalForeign` and not `payableTotal` — the two differ for a refund receipt, and this
+      // question is about the ORDER. Both sides are the stored decimals.
+      const coversOrderTotal = !refundId && coversDocumentTotal(totalAfter, toDecimal(so.totalForeign))
       const becamePaid = !so.paidAt && coversOrderTotal
       if (becamePaid) {
         await tx.salesOrder.update({
@@ -3745,7 +3768,9 @@ async function removePaymentAndSettlePaidAt(
     orderId: string
     refundId: string | null
     currency: string
-    totalForeign: unknown
+    // r18: the stored `Decimal`, declared as one. It was `unknown`, which is what let a `Number(...)`
+    // of it look like a reading rather than a conversion.
+    totalForeign: DecimalInput
     paidAt: Date | null
   },
 ): Promise<boolean> {
@@ -3755,13 +3780,16 @@ async function removePaymentAndSettlePaidAt(
     where: { orderId: input.orderId, refundId: null },
     select: { amount: true, currency: true },
   })
-  const totalPaid = remainingPayments.reduce((sum, p) => {
+  // r18 (Codex HIGH 2): summed as `Decimal`s straight off the `Decimal(18, 4)` column, for the reason
+  // stated at `addPayment`'s own summation — a `Number()` here collapses two stored amounts a whole
+  // minor unit apart, and this sum decides whether `paidAt` survives the removal.
+  const totalPaid = remainingPayments.reduce<Decimal>((sum, p) => {
     if (p.currency !== input.currency) return sum
-    return sum + Number(p.amount)
-  }, 0)
+    return addMoney(sum, p.amount)
+  }, toDecimal(0))
   // r7 (Codex HIGH 1): the same spelling `addPayment` clears the marker on and the same spelling the
   // reversal reader's coverage guard asks. See lib/domain/accounting/paid-coverage.ts.
-  const stillFullyPaid = coversDocumentTotal(totalPaid, Number(input.totalForeign))
+  const stillFullyPaid = coversDocumentTotal(totalPaid, toDecimal(input.totalForeign))
   // Only a genuine paid → not-paid transition is a mismatch. An order that was never fully paid
   // (e.g. shipped on credit terms) isn't flagged just because a partial payment was removed.
   const becameUnpaid = input.paidAt !== null && !stillFullyPaid

@@ -574,9 +574,12 @@ test(
     assert.equal(withheld.verdict.verdict, 'PART_COVERED_OFF_LEDGER')
     assert.deepEqual(
       withheld.verdict.verdict === 'PART_COVERED_OFF_LEDGER'
-        ? { registeredTotal: withheld.verdict.registeredTotal, documentTotal: withheld.verdict.documentTotal }
+        ? {
+            registeredTotal: withheld.verdict.registeredTotal?.toString() ?? null,
+            documentTotal: withheld.verdict.documentTotal.toString(),
+          }
         : null,
-      { registeredTotal: 1, documentTotal: 100 },
+      { registeredTotal: '1', documentTotal: '100' },
       'and it carries BOTH numbers, read from the registration\'s own payload and from the order — '
       + 'which is the wiring this test exists for',
     )

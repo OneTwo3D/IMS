@@ -18,10 +18,15 @@
  * the marker kept and the reader admitting a full reversal anyway. That band is a chargeback credit
  * note against a sale nobody reversed, which is the defect this whole round is about.
  *
- * WHY AN EPSILON AT ALL. Both sides are `Number`s read from Prisma `Decimal` columns, and a receipt
- * total assembled from several rows will not land exactly on a stored total. The band absorbs that
- * assembly noise and nothing else, and it leans towards "covered", which is the direction that was
- * already in production.
+ * WHY AN EPSILON AT ALL, AND WHAT IT IS FOR NOW. r7 wrote: "both sides are `Number`s read from Prisma
+ * `Decimal` columns, and a receipt total assembled from several rows will not land exactly on a stored
+ * total". HALF OF THAT SENTENCE IS NO LONGER TRUE — r18 carries the `Decimal`s through, so the two
+ * writer call sites sum stored decimals exactly and there is no assembly noise left for a band to
+ * absorb on that route. It is kept, and narrowed to the one operand that is still not a stored
+ * decimal: the READER's `registeredAmount` comes from the enqueue's JSON payload, which records
+ * `Number(receipt.amount)` (invoice-payment-enqueue.ts), and that double is the last lossy hop in the
+ * chain. The band absorbs its residue and nothing else, and it leans towards "covered", which is the
+ * direction that was already in production. See o3d-1xq8 for closing that hop as well.
  *
  * o3d-psrx r17 — AND THE BAND IS DERIVED, BECAUSE THE SENTENCE THAT SIZED IT WAS FALSE. It was a
  * literal `0.0001`, described here as "a hundredth of a penny — far below any currency's minor unit,
@@ -48,13 +53,17 @@
  * the writer and the reader move together and the "one spelling" property above is untouched.
  */
 
-import { ledgerAmountEpsilon } from '@/lib/domain/math/decimal'
+import { ledgerAmountEpsilon, type Decimal } from '@/lib/domain/math/decimal'
 
 /**
  * Half the finest supported minor unit: below every currency's minor unit, so it can only absorb
- * float assembly noise. Not a literal — see above for the round it stopped being one.
+ * assembly noise. Not a literal — see above for the round it stopped being one.
+ *
+ * o3d-psrx r18: and it is the `Decimal` `ledgerAmountEpsilon` returns, not a `.toNumber()` of it. The
+ * comparison below is exact decimal arithmetic, so converting the band to a double would put the one
+ * lossy step this rule exists to remove back into the only subtraction it performs.
  */
-export const PAID_COVERAGE_EPSILON = ledgerAmountEpsilon(null).toNumber()
+export const PAID_COVERAGE_EPSILON: Decimal = ledgerAmountEpsilon(null)
 
 /**
  * Does `covered` settle `documentTotal`?
@@ -62,7 +71,28 @@ export const PAID_COVERAGE_EPSILON = ledgerAmountEpsilon(null).toNumber()
  * Both arguments must already be in the SAME currency: a receipt in another one covers none of this
  * document, and neither caller converts. `removePaymentAndSettlePaidAt` filters by currency before it
  * sums, and the registration reader drops any registration whose payload names a different one.
+ *
+ * o3d-psrx r18 (Codex HIGH 2) — AND THEY ARE `Decimal`s CARRIED FROM STORAGE, NOT `number`s.
+ *
+ * THE DEFECT. Every figure this rule weighs comes out of a `Decimal(18, 4)` column — `Payment.amount`
+ * and `SalesOrder.totalForeign` — and all three call sites used to write `Number(...)` on the way in.
+ * A double cannot hold four decimals across that column's whole range: at 549755813888 (2^39) the
+ * spacing between neighbouring doubles is about 0.00012, so the stored, perfectly valid, one-minor-
+ * unit-apart values `549755813888.0002` and `549755813888.0003` are the SAME double. A registration a
+ * whole minor unit short of the order then read as exact coverage, `coversDocumentTotal` answered YES,
+ * and the classifier returned GONE — an ADMITTED reversal of the whole document, which is the r17
+ * epsilon defect reached by a second route. The r17 band is not what failed: the band is exact and
+ * the operands were not.
+ *
+ * THE CONVERSION WAS A CHOICE, NOT AN INHERITANCE, so it is simply not made. Prisma hands these
+ * columns over as `Decimal`, and they stay `Decimal` through the summation at each call site, through
+ * this comparison, and through the epsilon it subtracts. There is no magnitude at which any of it
+ * loses a minor unit, so this rule needs no bound of its own.
+ *
+ * THE PARAMETERS ARE `Decimal` RATHER THAN `DecimalInput` FOR THE SAME REASON `isLedgerMinorUnitQuantized`
+ * takes one: a caller that has a `number` must write the conversion down. It cannot reach this rule by
+ * accident, and a boundary conversion is then a visible edit rather than an invisible default.
  */
-export function coversDocumentTotal(covered: number, documentTotal: number): boolean {
-  return covered >= documentTotal - PAID_COVERAGE_EPSILON
+export function coversDocumentTotal(covered: Decimal, documentTotal: Decimal): boolean {
+  return covered.gte(documentTotal.sub(PAID_COVERAGE_EPSILON))
 }
