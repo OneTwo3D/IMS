@@ -1096,44 +1096,72 @@ async function loadCogsByOrder(client: SalesFulfillmentAnalyticsClient, window: 
 const INCONSISTENT_NOTICE_NAME_LIMIT = 10
 
 /**
- * ONE CONTRADICTED CUSTOMER, LABELLED SO THAT NO OTHER GROUP CAN WEAR THE SAME LABEL (o3d-7jfq r4).
+ * THE ONE PLACE A CUSTOMER GROUP'S IDENTITY IS COMPUTED.
+ *
+ * A registered customer is its `customerId`. A guest is its LOWER-CASED email — so the same address
+ * typed in two cases is one customer — and, with no email to go on, its name. Both guest forms are
+ * namespaced so that the two of them cannot be confused with each other.
+ *
+ * It lives here rather than inline at the grouping loop because `inconsistentCustomerLabel` prints
+ * it: grouping and labelling then cannot drift apart, and the label's uniqueness is a property of
+ * the key rather than a claim about it.
+ */
+function customerGroupKey(row: Pick<CustomerReportRow, 'customerId' | 'customerName' | 'customerEmail'>): string {
+  return row.customerId ?? (row.customerEmail ? `guest-email:${row.customerEmail.toLowerCase()}` : `guest-name:${row.customerName}`)
+}
+
+/**
+ * ONE FIELD OF A LABEL: a present value CSV-quoted, an absent one a token no present value can be.
+ *
+ * `<none>` is unquoted and every present value is quoted, so the two live in disjoint spaces: a
+ * customer whose stored email is literally `<none>` renders `email="<none>"` and is still not the
+ * customer who has no email at all. That is the whole of the round-5 fix — see below for why a
+ * sentinel drawn from the value space could not do it.
+ */
+function labelField(value: string | null | undefined): string {
+  return value == null ? '<none>' : `"${value.replaceAll('"', '""')}"`
+}
+
+/**
+ * ONE CONTRADICTED CUSTOMER, LABELLED SO THAT NO OTHER GROUP CAN WEAR THE SAME LABEL (o3d-7jfq r5).
  *
  * A NAME IS NOT AN IDENTIFIER. Round 3 handed the notice `customerName` alone, on the reasoning
  * that the Customer column renders it and so it is what an operator reads down the page for. The
  * first half of that is right and the second half does not follow: rows are grouped on
- * `customerId ?? guest-email:… ?? guest-name:…`, and `customerName` is neither unique across those
- * keys nor non-empty. Two guests called `John Smith` are two rows and one label, and a notice that
- * says `John Smith` when a clean John Smith is also on the page names a row the operator cannot
- * find — which is the off-page failure this list exists to close, arrived at from the other side.
+ * `customerGroupKey`, and `customerName` is neither unique across those keys nor non-empty. Two
+ * guests called `John Smith` are two rows and one label, and a notice that says `John Smith` when a
+ * clean John Smith is also on the page names a row the operator cannot find — which is the off-page
+ * failure this list exists to close, arrived at from the other side.
  *
- * SO THE LABEL CARRIES EVERY FIELD THAT SEPARATES ONE GROUP FROM ANOTHER, and it is injective over
- * distinct groups by exhaustion of the key:
- *   • two `customerId` groups     — different ids, and the id is printed;
- *   • a `customerId` and a guest  — one prints an id, the other prints `guest`;
- *   • two `guest-email` groups    — different emails (the key lower-cases, so same-email-different-
- *                                    case is ONE group), and the email is printed;
- *   • `guest-email` vs `guest-name` — one has an email, the other has none;
- *   • two `guest-name` groups     — the same name IS the same key, so there is no such pair.
- * The synthesised guest key itself is deliberately NOT printed: it is a pure function of the email
- * and the name, so it separates nothing those two do not already separate, and printing
- * `guest-name:<name>` raw would re-import the delimiter hazard the quoting below exists to remove.
+ * AND A SENTINEL IS NOT AN IDENTIFIER EITHER. Round 4 separated the groups by printing the name,
+ * the email and the id, and rendered a missing email as the words `(no email)` — a string a
+ * customer can hold. A guest with no email keys on `guest-name:`, a guest whose stored email IS
+ * `(no email)` keys on `guest-email:`, and the two of them wore ONE label: the collision round 4
+ * set out to remove, re-entered through the fix. A label that must be unique cannot be built out of
+ * unescaped user data, and absence cannot be spelled with a value. So absence is encoded
+ * STRUCTURALLY — `labelField` above — and every present component is quoted and escaped.
  *
- * AND EVERY PART OF IT IS SOMETHING THE OPERATOR CAN LOOK AT. The name is the Customer column, the
- * email is the Email column, and `customerId` is a column of the CSV export this notice already
- * points at. A label built from a field nobody can see would identify the row to the code and not
- * to the person.
+ * INJECTIVE BY CONSTRUCTION, NOT BY ARGUMENT. The label carries `group=`, the map key the row was
+ * grouped under, which is distinct for distinct groups by definition of a Map — and distinct keys
+ * stay distinct once quoted, because the quoting is reversible. Round 4 instead proved uniqueness
+ * by exhausting the cases the key is built from, a proof that has to be redone, correctly, every
+ * time the key changes. Carrying the key cannot go stale.
  *
- * QUOTED, AND THE QUOTES ARE DOUBLED INSIDE. Semicolons separate the entries because a company name
- * may contain a comma — and a company name may contain a semicolon too, at which point an unquoted
- * list is a list a reader cannot split. Every entry therefore begins with `"` and the name ends at
- * its closing quote, so `; ` inside a name cannot be mistaken for the separator. An empty stored
- * name renders as `""`, which is the honest label for a row whose Customer cell is empty, and is
- * still visibly one entry rather than a gap between two separators.
+ * AND EVERY PART OF IT IS SOMETHING THE OPERATOR CAN LOOK AT. `name=` is the Customer column,
+ * `email=` is the Email column, and `customerId=` is a column of the CSV export this notice already
+ * points at — three fields that are matched against the row on screen. `group=` is the identity the
+ * other three were read from, printed in a form that is readable rather than opaque (`cust-1`, or
+ * `guest-email:…` / `guest-name:…`), so it names the row too instead of only separating it.
+ *
+ * QUOTED CSV-STYLE, WITH INNER QUOTES DOUBLED. Entries are separated by `; ` because a company name
+ * may contain a comma — and it may contain a semicolon too, at which point an unquoted list is a
+ * list a reader cannot split. Every value is delimited, with any quote inside it doubled, so a
+ * reader tracking quote state always knows whether a `; ` is inside a value or between two entries.
+ * An empty stored name renders `name=""`: the honest label for a row whose Customer cell is empty,
+ * and visibly a value rather than a gap.
  */
 function inconsistentCustomerLabel(row: Pick<CustomerReportRow, 'customerId' | 'customerName' | 'customerEmail'>): string {
-  const name = row.customerName.replaceAll('"', '""')
-  const email = row.customerEmail ?? '(no email)'
-  return `"${name}" ${email} [${row.customerId ?? 'guest'}]`
+  return `name=${labelField(row.customerName)} email=${labelField(row.customerEmail)} customerId=${labelField(row.customerId)} group=${labelField(customerGroupKey(row))}`
 }
 
 /**
@@ -1302,7 +1330,9 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
   }
   const groups = new Map<string, CustomerGroup>()
   for (const order of orders) {
-    const key = order.customerId ?? (order.customerEmail ? `guest-email:${order.customerEmail.toLowerCase()}` : `guest-name:${customerName(order)}`)
+    // Through the same function the notice's `group=` is printed from, so the label the operator is
+    // sent after is the identity the row was actually grouped under and not a re-derivation of it.
+    const key = customerGroupKey({ customerId: order.customerId, customerName: customerName(order), customerEmail: order.customerEmail })
     const current: CustomerGroup = groups.get(key) ?? {
       customerId: order.customerId,
       customerName: customerName(order),
@@ -1529,7 +1559,7 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
       // Named separately, and only when there is one: it is the cause an operator has to ACT on,
       // and the only one of the three that will still be here next month if nobody does.
       ...(inconsistentCustomers.length > 0
-        ? [`${inconsistentCustomers.length} of ${groups.size} customers are withheld as INCONSISTENT rather than incomplete: an in-period dispatch carries COGS entries for more units than the movement moved, which the FIFO engine cannot produce. What is proven here is the QUANTITY — the costed quantity exceeds the quantity that moved. Whether money was duplicated with it is NOT proven here: duplicate entries are the usual cause, and where they are the cause every figure that sums CogsEntry.totalCostBase overstates cost by the duplicate — but the same excess quantity can be carried by entries posted at no cost at all, whose money is right. Read the entries against the dispatch before altering any posted cost. Either way nothing further will ship to resolve this; it stands until somebody corrects the entries. ${namedInconsistentCustomers(inconsistentCustomers)}`]
+        ? [`${inconsistentCustomers.length} of ${groups.size} customers are withheld as INCONSISTENT rather than incomplete: an in-period dispatch carries COGS entries for more units than the movement moved, which the FIFO engine cannot produce. What is proven here is the QUANTITY — the costed quantity exceeds the quantity that moved. Nothing here is proven about the MONEY: this check compares CogsEntry.qty against the movement and never reads CogsEntry.totalCostBase. Duplicate entries are the usual cause, and duplicate entries MAY have duplicated posted cost along with the quantity — or may carry the excess at no cost at all, in which case every cost total is already right. Which of the two it is has not been measured, here or anywhere this report shows. Read the entries against the dispatch before altering any posted cost. Either way nothing further will ship to resolve this; it stands until somebody corrects the entries. ${namedInconsistentCustomers(inconsistentCustomers)}`]
         : []),
       'Non-inventory lines — services, fees, delivery charges — book no stock movement and post no cost, so they are not asked to show a dispatch and an order made only of them is fully costed at zero. A variable-parent line is not exempt: goods do leave for it and cannot be traced to it, so its cost is unknown and the order is withheld.',
       REFUND_BASIS_NOTICE_CUSTOMER_MIX,
