@@ -1431,7 +1431,7 @@ export type RegisteredPaymentVerdict =
    *
    * IMS DOES NOT RECONCILE IT. There is no partial-reversal accounting path — no partial credit note,
    * no partial unwind of the recognised revenue — and building one is deliberately out of this
-   * round's scope (o3d-x9tp). This verdict is the durable, quantified statement that the work is
+   * round's scope (o3d-cdhl). This verdict is the durable, quantified statement that the work is
    * outstanding, carried by the withheld-marker lifecycle so it is rechecked rather than filed away.
    */
   | {
@@ -1804,7 +1804,7 @@ export function zeroPaidIsProvenReversal(verdict: RegisteredPaymentVerdict): boo
     // prevent, and the reason this refinement changes no decision. What it changes is the RECORD: the
     // withheld marker now carries the measured loss instead of "IMS could not tell", so a partial
     // chargeback is an outstanding item somebody can find rather than a document that quietly stays
-    // paid. Reconciling it is o3d-x9tp and is not attempted here.
+    // paid. Reconciling it is o3d-cdhl and is not attempted here.
     case 'LEDGER_PART_PAYMENT_REMOVED':
       return false
   }

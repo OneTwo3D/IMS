@@ -252,7 +252,7 @@ function registrationText(verdict: RegisteredPaymentVerdict, reason: WithheldAmo
     // arrive at the same withholding by different doors. Stated rather than defaulted so that a change
     // making this reachable here is a sentence somebody has to write.
     //
-    // WHAT XERO STILL DOES NOT DO WITH IT is the other half of o3d-x9tp: a stable part-paid Xero
+    // WHAT XERO STILL DOES NOT DO WITH IT is the other half of o3d-cdhl: a stable part-paid Xero
     // invoice is warned about on every poll that sees it and reconciled by nobody, exactly as the
     // QuickBooks one is. The difference r9 closes is only that the QuickBooks side now says so in a
     // form that can be found; extending that to Xero's `partPaid` bucket is filed with the

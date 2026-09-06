@@ -508,8 +508,13 @@ test(
     assert.ok(withheld,
       'THE FINDING: QuickBooks is still holding half of this order and the gate reversed the whole of '
       + 'it — paidAt cleared and a chargeback credit note raised over money the ledger never gave back')
+    // o3d-psrx r9 (Codex HIGH): AND IT SAYS THIS IS A MEASURED LOSS, not that IMS could not tell.
+    // r8 gave this the same verdict a payload with no readable figures gets, which is what made a
+    // stable partial chargeback unfindable: `paidAt` stays set (correctly), and the only record of the
+    // 50 that went said IMS had established nothing. The reversal decision is unchanged — this verdict
+    // withholds exactly as its parent did — but the loss is now quantified and can be listed.
     assert.deepEqual(withheld.verdict, {
-      verdict: 'LEDGER_NOT_PROVEN_ZERO_PAID', paidAmount: 50, documentTotal: 100,
+      verdict: 'LEDGER_PART_PAYMENT_REMOVED', paidAmount: 50, documentTotal: 100, removedAmount: 50,
     }, 'and it must say WHICH fact was missing, with the figures an operator has to reconcile against')
     assert.ok(!gate.admitted.some((d) => d.id === halfId))
 
@@ -596,5 +601,74 @@ test(
     assert.ok(gate.admitted.some((d) => d.id === voidedId),
       'a voided document must still reverse — it is the one reading that needs no arithmetic')
     assert.ok(!gate.withheld.some((w) => w.doc.id === voidedId))
+  },
+)
+
+test(
+  '[o3d-psrx r9] a document QuickBooks reports as FULLY PAID yields no verdict at all',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    // THE CONTROL THAT STOPS r9 CRYING WOLF, against the poller's own query and a real database.
+    //
+    // r9 reports a partial loss whenever the ledger states a positive amount short of the total. The
+    // reading that would ruin it is "paid is less than the total" applied to a document that is not a
+    // reversal candidate at all — every settled order would then carry a warning about money nobody
+    // has taken, and an operator who is shown a loss on a paid order stops reading the warnings that
+    // are real. The structural answer is that a fully-paid document never enters the candidate set:
+    // `detectPaymentReversals` is given the ids that REGRESSED, and this one did not.
+    const db = await loadDb()
+    const { readQboSalesReversalCandidates, gateQboReversalsOnProvenance } =
+      await import('@/lib/connectors/quickbooks/payment-poller')
+    const { detectPaymentReversals, readDatabaseLedgerFence } =
+      await import('@/lib/domain/accounting/payment-reversal')
+
+    const settledId = probeId()   // QuickBooks holds the whole 100 — nothing was removed
+    const halfId = probeId()      // ...and the paired document that DID lose half of it
+    const ids = [settledId, halfId]
+    const invoiceOf = new Map(ids.map((id) => [id, `QBO-INV-${id}`]))
+    t.after(async () => {
+      await db.accountingSyncLog.deleteMany({ where: { referenceType: 'SalesOrder', referenceId: { in: ids } } })
+      await db.payment.deleteMany({ where: { orderId: { in: ids } } })
+      await db.salesOrder.deleteMany({ where: { id: { in: ids } } })
+    })
+    for (const id of ids) {
+      await createPaidOrder(db, id, invoiceOf.get(id)!, null)
+      await twoPostedHalves(db, id, invoiceOf.get(id)!)
+    }
+
+    const ledgerObservedBefore = await readDatabaseLedgerFence()
+    assert.ok(ledgerObservedBefore != null, 'a null fence decides nothing and this test would be vacuous')
+    const candidates = (await readQboSalesReversalCandidates()).filter((c) => ids.includes(c.id))
+    assert.equal(candidates.length, 2, 'both orders must be selected by the poller\'s query, or the '
+      + 'control below is proved by the row simply not being there')
+
+    // ONLY THE HALF-REMOVED DOCUMENT REGRESSED. The settled one is in the amounts map — QuickBooks
+    // stated its figures — and NOT in the regressed set, which is exactly the shape production
+    // produces: the delta read's `Balance > 0` query never returns it.
+    const gate = await gateQboReversalsOnProvenance(
+      detectPaymentReversals(candidates, new Set([invoiceOf.get(halfId)!])),
+      {
+        registrationType: 'INVOICE_PAYMENT',
+        referenceType: 'SalesOrder',
+        ledgerObservedBefore,
+        ledgerAmounts: new Map([
+          [invoiceOf.get(settledId)!, { paid: 100, total: 100 }],
+          [invoiceOf.get(halfId)!, { paid: 50, total: 100 }],
+        ]),
+      },
+    )
+
+    // THE HEADLINE: the settled document produces NOTHING — not a reversal, and not a marker either.
+    assert.ok(!gate.withheld.some((w) => w.doc.id === settledId),
+      'a document QuickBooks reports as fully paid must raise no withheld verdict, or every settled '
+      + 'order in the system carries a warning about a loss that did not happen')
+    assert.ok(!gate.admitted.some((d) => d.id === settledId))
+
+    // AND THE PAIRED DOCUMENT STILL REPORTS ITS LOSS, so this cannot pass by the gate deciding nothing.
+    const partial = gate.withheld.find((w) => w.doc.id === halfId)
+    assert.ok(partial, 'the half-removed document must still be withheld and reported')
+    assert.deepEqual(partial.verdict, {
+      verdict: 'LEDGER_PART_PAYMENT_REMOVED', paidAmount: 50, documentTotal: 100, removedAmount: 50,
+    })
   },
 )

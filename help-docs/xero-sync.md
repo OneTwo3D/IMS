@@ -920,17 +920,35 @@ reverses the moment a payment registration has demonstrably reached QuickBooks. 
 covered too: a bill whose payment IMS has queued but not yet posted no longer has `paidAt` cleared on
 the strength of a balance QuickBooks reports while that payment is still on its way.
 
-Two differences from Xero are worth knowing, because they are visible to whoever reads the warnings:
+One difference from Xero is worth knowing, because it is visible to whoever reads the warnings:
 
 - **QuickBooks is not asked which payments a document carries.** The reversal read asks only which
   documents regressed, so IMS can never prove that one *particular* payment of its own has been
-  removed. Where Xero would name the vanished payment id, QuickBooks acts on the balance alone. For
-  the same reason a QuickBooks balance due does not distinguish a **part** payment from a removed one,
-  which Xero's amount reading does — reconcile a partly-paid QuickBooks document by hand.
-- **There is no hourly re-ask.** A withheld Xero verdict is put back to Xero on a timer; a withheld
-  QuickBooks reversal is reported once and the poll watermark still advances. Holding the cursor for
-  it would freeze every later QuickBooks payment and reversal behind a paid flag that, by design, is
-  never going to be registered. The warning is the durable record — act on it from there.
+  removed. Where Xero would name the vanished payment id, QuickBooks acts on the amounts alone: it
+  reads the document's total and its balance out of the same response, and reverses only when
+  QuickBooks states that **nothing at all** is still applied to it. A document showing merely a
+  balance due is never reversed on that alone — a part payment produces exactly the same balance as a
+  removed one, and clearing **Paid** over it would raise a credit note against money QuickBooks is
+  still holding.
+
+  The withheld verdict is put back to QuickBooks on the same hourly timer Xero's is (see below), so a
+  document does not need to change again for IMS to reconsider it.
+
+**A partial chargeback is reported, not reconciled — and IMS will not put it right by itself.** When
+QuickBooks gives back *part* of a payment and keeps the rest — a £100 invoice settled by two £50
+payments, one of which is removed — IMS can see exactly what happened and says so: the warning against
+the order names the amount still held, the document's total, and the amount that was removed, and the
+activity entry carries all three as fields so the outstanding ones can be listed. **Paid** stays set,
+because reversing the whole document would credit the half that never moved, and the warning is
+rewritten every time the document is reconsidered.
+
+What IMS does *not* do is unwind the missing half: there is no partial credit note and no partial
+reversal of recognised revenue. So the order goes on reading as fully paid until somebody acts. Either
+settle the missing amount in QuickBooks — re-apply the payment, and IMS closes the item by itself on
+the next poll — or, if the money really is gone, raise the credit note for it by hand and correct the
+order. If the *rest* of the payment is removed later, the document reaches a zero paid amount and IMS
+reverses it in full on its own. The same is true of a part-paid **Xero** invoice, which is warned
+about on every poll and reconciled by nobody.
 
 **A withheld verdict is asked again on a timer.** It cannot be left to resolve itself: the delta
 returns an invoice only when it *changes*, and what usually settles a withheld verdict is not a change

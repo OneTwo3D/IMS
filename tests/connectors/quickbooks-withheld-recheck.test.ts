@@ -425,7 +425,7 @@ test('a database fence that could not be read makes the poll INCOMPLETE, not cle
 // covered by two 50 payments, one of them removed. `paidAt` stays set — which is right — and the
 // verdict said only "IMS could not establish this", which is false and is what made the loss
 // unfindable. The tests below drive the real poller and assert on what the MARKER carries, because the
-// marker is the whole of what an operator has: there is no partial-reversal accounting path (o3d-x9tp)
+// marker is the whole of what an operator has: there is no partial-reversal accounting path (o3d-cdhl)
 // and IMS will never settle this document by itself.
 // ---------------------------------------------------------------------------
 

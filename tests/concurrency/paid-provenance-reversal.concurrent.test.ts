@@ -325,13 +325,27 @@ test(
       await db.salesOrder.deleteMany({ where: { id: { in: [staleId, currentId] } } })
     })
 
+    // AN EPISODE IS ENTERED BY THE PAID FLAG GOING ABSENT -> PRESENT, AND BY NOTHING ELSE (o3d-psrx
+    // r6/r8, migration 20260901090000). This fixture used to write `paidAt` a second time over a row
+    // that was ALREADY paid and expect a new fence out of it. The trigger's whole point is that it
+    // does not do that — `OLD."paidAt" IS NOT NULL` preserves the stored marker, because a WooCommerce
+    // redelivery re-sending `date_paid_gmt` must not advance the fence past registrations that have
+    // already completed under it. So both orders were left with NO marker at all, the stale
+    // registration bound freely, and the headline below failed while the CONTROL passed for a reason
+    // that had nothing to do with binding. The narrative in the comment above already says what has to
+    // happen — the payment was reversed and `paidAt` was CLEARED — so the fixture now does it.
     await createPaidOrder(db, staleId, staleInvoice, { unregisteredPaidAt: null })
-    // THE CONTROL. Its marker is stamped BEFORE its registration posts, so that registration belongs
+    await createPaidOrder(db, currentId, currentInvoice, { unregisteredPaidAt: null })
+    for (const id of [staleId, currentId]) {
+      await db.salesOrder.update({ where: { id }, data: { paidAt: null, unregisteredPaidAt: null } })
+    }
+
+    // THE CONTROL. Its marker is minted BEFORE its registration posts, so that registration belongs
     // to the paid state the marker describes and is allowed to discharge it — this is the 6oyu.6
     // WooCommerce chargeback, and withholding it would trade one money defect for another.
-    await createPaidOrder(db, currentId, currentInvoice, { unregisteredPaidAt: null })
-    const [{ before }] = await db.$queryRaw<Array<{ before: Date }>>`SELECT clock_timestamp() AS before`
-    await db.salesOrder.update({ where: { id: currentId }, data: { paidAt: before, unregisteredPaidAt: before } })
+    await db.salesOrder.update({
+      where: { id: currentId }, data: { paidAt: new Date(), unregisteredPaidAt: new Date() },
+    })
 
     await postedRegistration(db, staleId, staleInvoice, 'PAY-EPISODE-1')
     await postedRegistration(db, currentId, currentInvoice, 'PAY-THIS-EPISODE')
@@ -339,13 +353,31 @@ test(
     // ...and only NOW is the stale order's second paid state entered, AFTER its episode-1 registration
     // completed. That ordering is the whole fact this test is about, so it is asserted rather than
     // assumed: a fixture that got it backwards would pass for the control's reason.
-    const [{ after }] = await db.$queryRaw<Array<{ after: Date }>>`SELECT clock_timestamp() AS after`
-    await db.salesOrder.update({ where: { id: staleId }, data: { paidAt: after, unregisteredPaidAt: after } })
-    const staleRow = await db.accountingSyncLog.findFirstOrThrow({
-      where: { referenceId: staleId }, select: { syncedAtDatabaseClock: true },
+    await db.salesOrder.update({
+      where: { id: staleId }, data: { paidAt: new Date(), unregisteredPaidAt: new Date() },
     })
-    assert.ok(staleRow.syncedAtDatabaseClock != null && staleRow.syncedAtDatabaseClock.getTime() < after.getTime(),
+    // READ BACK WHAT THE DATABASE ACTUALLY MINTED, never what this test supplied: the trigger
+    // overwrites the caller's instant with its own `clock_timestamp()`, and comparing against the
+    // value we sent is how the broken fixture convinced itself it had built the state.
+    const markers = new Map((await db.salesOrder.findMany({
+      where: { id: { in: [staleId, currentId] } }, select: { id: true, unregisteredPaidAt: true },
+    })).map((row) => [row.id, row.unregisteredPaidAt]))
+    const registrations = new Map((await db.accountingSyncLog.findMany({
+      where: { referenceType: 'SalesOrder', referenceId: { in: [staleId, currentId] } },
+      select: { referenceId: true, syncedAtDatabaseClock: true },
+    })).map((row) => [row.referenceId, row.syncedAtDatabaseClock]))
+    const staleMarker = markers.get(staleId)
+    const currentMarker = markers.get(currentId)
+    const staleSynced = registrations.get(staleId)
+    const currentSynced = registrations.get(currentId)
+    assert.ok(staleMarker != null && currentMarker != null,
+      'BOTH orders must carry an off-ledger marker, or the fence has no lower bound and this test is '
+      + 'about nothing — which is exactly the state the old fixture reached')
+    assert.ok(staleSynced != null && staleSynced.getTime() < staleMarker.getTime(),
       'the stale registration must have completed BEFORE the current paid state was entered')
+    assert.ok(currentSynced != null && currentSynced.getTime() > currentMarker.getTime(),
+      'and the CONTROL\'s registration must have completed AFTER its own episode began, or the control '
+      + 'is not a control')
 
     const [{ now }] = await db.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`
     const invoices = new Map([

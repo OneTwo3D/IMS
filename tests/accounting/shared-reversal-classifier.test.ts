@@ -436,7 +436,7 @@ test('[o3d-psrx r8] the two ways the zero is unproven do not borrow each other\'
 // was in practice absorbed as "still paid" and there was nothing in IMS to find it by.
 //
 // The split changes NO reversal decision. What it changes is what the record can say, which is the
-// whole of the fix — reconciling a partial chargeback is o3d-x9tp and is deliberately not built.
+// whole of the fix — reconciling a partial chargeback is o3d-cdhl and is deliberately not built.
 // ---------------------------------------------------------------------------
 
 test('[o3d-psrx r9] a measured partial loss and an evidence absence are different answers', () => {
@@ -524,6 +524,6 @@ test('[o3d-psrx r9] the partial-chargeback warning quantifies the loss and says 
   // operator reasonably files it with them and waits for a poll that is never coming.
   assert.match(reason, /WILL NOT correct that by itself/,
     'the operator has to be told IMS does not reconcile a partial chargeback — there is no partial '
-    + 'credit-note path (o3d-x9tp), so waiting for one is waiting for ever')
+    + 'credit-note path (o3d-cdhl), so waiting for one is waiting for ever')
   assert.match(reason, /paidAt was LEFT SET/, 'and that IMS still shows the document as paid meanwhile')
 })

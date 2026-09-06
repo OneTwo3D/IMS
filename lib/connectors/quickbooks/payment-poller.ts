@@ -352,7 +352,7 @@ async function fetchReversedEntityIdsByIds(
  * — but it carries the three figures, the marker carries them as queryable fields, the poll summary
  * counts these documents apart from the rest, and the warning tells the operator plainly that IMS will
  * not reconcile this one. RECONCILING IT — quantifying the removed payment into a partial credit note
- * and unwinding that much of the recognised revenue — is NOT built here and is filed as o3d-x9tp.
+ * and unwinding that much of the recognised revenue — is NOT built here and is filed as o3d-cdhl.
  * Recording an unreconciled loss and reconciling it are different pieces of work, and a round that
  * silently did the second because it was doing the first would be putting new money-moving accounting
  * behind a bug fix.
@@ -502,7 +502,7 @@ export function qboWithheldReversalReason(verdict: RegisteredPaymentVerdict): st
     // only one that has to tell an operator IMS will not put it right by itself. Every other withheld
     // sentence above describes something IMS expects to settle — a registration lands, a receipt is
     // recorded, a figure becomes readable — and says so. This one cannot: the money is measurably
-    // gone, there is no partial-reversal accounting path (o3d-x9tp), and the document will keep
+    // gone, there is no partial-reversal accounting path (o3d-cdhl), and the document will keep
     // reading as fully paid until a person changes it.
     case 'LEDGER_PART_PAYMENT_REMOVED':
       return `QuickBooks has given back part of the payment on this document and is STILL HOLDING the `
