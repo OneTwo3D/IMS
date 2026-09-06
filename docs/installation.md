@@ -998,8 +998,8 @@ Both inputs are now written to **separately created temporary files**, each `mkt
 
 **And that primitive was not confined to the lock** (o3d-czpy). The lock file was one instance of a class: `scripts/install.sh` runs as root and writes into `${DATA_DIR}` and `${APP_DIR}`, both of which *it* hands to `imsapp` with a recursive `chown` — so on the next run every path it resolves inside them is a name the service account can have replaced with a symlink. Eight further sites were converted, and they now share three primitives with `prepare_crontab_lock`:
 
-* **Every publication is staged in a root-owned directory.** `publish_durable_file()` — the writer behind `${APP_DIR}/.env`, `${APP_DIR}/.deploy-meta`, `${DATA_DIR}/git-ssh/known_hosts`, `${DATA_DIR}/DEPLOY-FENCED` and the crontab backup — creates `.ims-publish` beside the target as `root:root` 0700, `cd`s into it (so the shell holds the *inode*, which no rename can move), makes its temporary there, applies **owner and mode before the content**, and publishes with `mv -T`. `rename(2)` replaces a symlink entry instead of following it. **And the rename names the destination RELATIVELY** (`../known_hosts`, never the absolute path): a pinned inode does not pin the path used afterwards, and `${DATA_DIR}/git-ssh` is a directory `imsapp` can rename aside between the pin and the publication, which would have sent a root-written `known_hosts` to a directory of their choosing. **And the destination itself is reached by walking down from a directory `imsapp` cannot replace**, one component at a time, rather than by `stat`ing its pathname: a pin taken from a name proves the directory did not *move*, and says nothing about *which* directory was pinned, so `git-ssh` replaced by a symlink to `/root/.ssh` **before** the installer ran would have been pinned as `/root/.ssh` and passed every later check. The walk starts at the nearest of `/opt/one-two-inventory`, `/var/lib/one-two-inventory`, the cutover state directory, `/etc/ims-cutover`, `/etc/ims-db-ca` and `/etc/ims-cutover-recovery` — each of which has a **root-owned parent** (`/opt`, `/var/lib`, `/etc`), so its own name cannot be renamed aside or forged — and refuses a publication whose destination lies under none of them. `deploy.sh` and `update.sh` carry the same publisher and the same table, byte for byte. From the moment the walk ends, the destination exists only as the process's working directory and is **never spelled again**: the staging directory, its `chown -h` and its `lstat` are all single relative components, and the publication and both fsyncs go through `..`, the kernel's own parent link. **You will see a `.ims-publish` directory inside `/var/lib/one-two-inventory` and in `/opt/one-two-inventory`; leave it, and do not `chown` it to `imsapp`.** The installer's recursive chown over the state directory prunes it by name, for the same reason it prunes `locks/`; the one over the application directory runs in section 9, before section 10 has created it, and the publisher re-takes root ownership with `chown -h` on every run and **refuses** — rather than correcting — anything at that path it does not end up inside.
-* **Every directory below one of those roots is created with a plain `mkdir`, one component at a time, by a walk that never names an ancestor twice.** `mkdir -p a/b` succeeds *silently* when `a` is a symlink to a directory; a plain `mkdir` fails with `EEXIST` and the installer then `lstat`s the path and **refuses the run**, naming it. That covers the component being created and says nothing about the ones already accepted, so the walk `cd`s into each component as it goes and creates the next one **relative to the directory it is inside** — an ancestor that is renamed after it was checked cannot redirect anything, because the shell holds its inode. The one remaining window, between the `stat` that says "directory" and the `cd` into it, is closed by taking the component's **inode** in the same `lstat` that took its type and requiring the directory the walk lands in to be that exact inode — and by checking `..` after the step as well. The two catch different things and both are needed: the inode refuses a component swapped for a symlink to a **sibling under the same parent**, which `..` cannot tell apart from the real destination; `..` refuses a destination **moved wholesale into another parent**, which keeps its inode. Together they close the class in shell — no descriptor-relative `openat2` helper is needed, because an `lstat` names an inode and a `cd` lands in one, and a rename between them can only make the two differ. The same check protects `${APP_DIR}/.git`, where the previous version asked only whether the directory it had entered was root-owned — which a symlink to *any other* root-owned directory satisfies. The state roots themselves (`/var/lib/one-two-inventory`, `/var/log/one-two-inventory`) still use `mkdir -p`, because their parents are root-owned. **The root used to be the one hop that was not proved** (o3d-rn10 r5): it was entered with a `cd -P` that followed a symlink *deliberately*, so a state root symlinked onto a second disk kept working. Only the link's **name** is protected by its root-owned parent, though — the path its **target** resolves through is proved by nothing, so a target under a directory the application account owns can be renamed aside and rebound to `/root/.ssh`, and the unchanged root entry passes every check while the publication lands there as root. The root is therefore now created, `lstat`ed, entered and inode/`..` checked exactly like every component below it, and **a symlinked root is refused** — with the `mount --bind` command that replaces it. Put a state root on another disk with a **bind mount**, never a symlink.
+* **Every publication is staged in a root-owned directory.** `publish_durable_file()` — the writer behind `${APP_DIR}/.env`, `${APP_DIR}/.deploy-meta`, `${DATA_DIR}/git-ssh/known_hosts`, `${DATA_DIR}/DEPLOY-FENCED` and the crontab backup — creates `.ims-publish` beside the target as `root:root` 0700, `cd`s into it (so the shell holds the *inode*, which no rename can move), makes its temporary there, applies **owner and mode before the content**, and publishes with `mv -T`. `rename(2)` replaces a symlink entry instead of following it. **And the rename names the destination RELATIVELY** (`../known_hosts`, never the absolute path): a pinned inode does not pin the path used afterwards, and `${DATA_DIR}/git-ssh` is a directory `imsapp` can rename aside between the pin and the publication, which would have sent a root-written `known_hosts` to a directory of their choosing. **And the destination itself is reached by walking down from a directory `imsapp` cannot replace**, one component at a time, rather than by `stat`ing its pathname: a pin taken from a name proves the directory did not *move*, and says nothing about *which* directory was pinned, so `git-ssh` replaced by a symlink to `/root/.ssh` **before** the installer ran would have been pinned as `/root/.ssh` and passed every later check. The walk starts at the nearest of `/opt/one-two-inventory`, `/var/lib/one-two-inventory`, the cutover state directory, `/etc/ims-cutover`, `/etc/ims-db-ca` and `/etc/ims-cutover-recovery` — each of which has a **root-owned parent** (`/opt`, `/var/lib`, `/etc`), so its own name cannot be renamed aside or forged — and refuses a publication whose destination lies under none of them. `deploy.sh` and `update.sh` carry the same publisher and the same table, byte for byte. From the moment the walk ends, the destination exists only as the process's working directory and is **never spelled again**: the staging directory, its `chown -h` and its `lstat` are all single relative components, and the publication and both fsyncs go through `..`, the kernel's own parent link. **You will see a `.ims-publish` directory inside `/var/lib/one-two-inventory` and in `/opt/one-two-inventory`; leave it, and do not `chown` it to `imsapp`.** The installer's recursive chown over the state directory prunes it, at any depth, for the same reason it prunes `locks/` — and that walk is **no longer `find -exec chown`** (o3d-n8xx). `find -exec` enumerates *pathnames* and hands them to a `chown` that resolves them again afterwards, and `chown -h` protects only the final component; on an upgrade the service account owns this tree and the service is still running, so a descendant directory renamed into a symlink between the enumeration and the execution redirected a root-side ownership change through it (GNU find's own documentation calls `-exec` insecure for exactly this). `scripts/lib/chown-tree.mjs` now walks it **by descriptor**: every directory is opened `O_DIRECTORY|O_NOFOLLOW` relative to its parent's descriptor, every ownership change is `fchown` on a descriptor or `fchownat(..., AT_SYMLINK_NOFOLLOW)` on one name resolved from one, and there is no pathname left for anyone to re-resolve. `locks/` is pruned by **verified identity** — its `dev:ino` is taken once from the root's own descriptor, so renaming it mid-walk cannot get it chowned under another name — and `.ims-publish` by **name**, resolved against the pinned parent, because there is one wherever a publication has happened and they cannot be enumerated up front. `LOG_DIR`'s equivalent is `chown -Rh .` inside a root entered by descriptor, which coreutils walks with `fchownat` relative to descriptors it holds; the one over the application directory runs in section 9, before section 10 has created it, and the publisher re-takes root ownership with `chown -h` on every run and **refuses** — rather than correcting — anything at that path it does not end up inside.
+* **Every directory below one of those roots is created with a plain `mkdir`, one component at a time, by a walk that never names an ancestor twice.** `mkdir -p a/b` succeeds *silently* when `a` is a symlink to a directory; a plain `mkdir` fails with `EEXIST` and the installer then `lstat`s the path and **refuses the run**, naming it. That covers the component being created and says nothing about the ones already accepted, so the walk `cd`s into each component as it goes and creates the next one **relative to the directory it is inside** — an ancestor that is renamed after it was checked cannot redirect anything, because the shell holds its inode. The one remaining window, between the `stat` that says "directory" and the `cd` into it, is closed by taking the component's **inode** in the same `lstat` that took its type and requiring the directory the walk lands in to be that exact inode — and by checking `..` after the step as well. The two catch different things and both are needed: the inode refuses a component swapped for a symlink to a **sibling under the same parent**, which `..` cannot tell apart from the real destination; `..` refuses a destination **moved wholesale into another parent**, which keeps its inode. Together they close the class in shell — no descriptor-relative `openat2` helper is needed, because an `lstat` names an inode and a `cd` lands in one, and a rename between them can only make the two differ. The same check protects `${APP_DIR}/.git`, where the previous version asked only whether the directory it had entered was root-owned — which a symlink to *any other* root-owned directory satisfies. The state roots themselves (`/var/lib/one-two-inventory`, `/var/log/one-two-inventory`) still use `mkdir -p`, because their parents are root-owned. **The root used to be the one hop that was not proved** (o3d-rn10 r5): it was entered with a `cd -P` that followed a symlink *deliberately*, so a state root symlinked onto a second disk kept working. Only the link's **name** is protected by its root-owned parent, though — the path its **target** resolves through is proved by nothing, so a target under a directory the application account owns can be renamed aside and rebound to `/root/.ssh`, and the unchanged root entry passes every check while the publication lands there as root. The root is therefore now created, `lstat`ed, entered and inode/`..` checked exactly like every component below it, and **a symlinked root is refused** — naming the bind mount that replaces it and pointing at the procedure under “Putting a state root on another disk” below. Put a state root on another disk with a **bind mount**, never a symlink.
 * **No `chmod`, anywhere on these paths.** `chmod` has no `--no-dereference` on Linux, so a raced one is the same escalation with a different verb. `${DATA_DIR}/git-ssh` is now created at 0700 by `umask` and a wrong mode is **refused** rather than corrected — set it back to 0700 by hand if you ever changed it.
 
 Two behaviour changes an operator may notice. `ssh-keyscan` output is captured and checked before it is published, so a keyscan that fails or returns nothing now **aborts the install** instead of leaving an empty `known_hosts`. The legacy-upload migration no longer requires its destination to be owned by the installer's uid — on any rerun the previous install has already chowned the upload roots to `imsapp`, so that check refused the ordinary upgrade; the walk above establishes the destination's identity instead, and the files are moved into the directory it is standing in. And `/tmp/one-two-inventory/pdf` and `/tmp/one-two-inventory/uploads` are **no longer created**: `/tmp` is world-writable, which made those the one pair of paths any local user could aim, and nothing in the application ever opened them (its own temporary uploads live under `os.tmpdir()/onetwoinventory`, created at runtime by the service).
@@ -1267,94 +1267,126 @@ says nothing about who may create it. So a root directly under `/tmp` is refused
 * A root that **is itself a symlink** — `/var/lib/one-two-inventory -> /srv/disk2/ims`, which is how
   a second disk used to be wired in — is refused too. `install.sh` refuses it **at pre-flight**,
   before it creates, enters or writes anything at all; the publisher refuses it at the first
-  publication. Both print the same four lines:
+  publication. Both print the same lines:
 
   ```text
   ERROR: /var/lib/one-two-inventory is a symbolic link, and a root this run writes into may not be one: nothing here proves the path its target resolves through.
+  ERROR: WHY: every later run of these scripts rsyncs into this root with --delete and chowns it RECURSIVELY. A root that is an ALIAS for another directory hands both of those to whatever the alias resolves to at that moment, and any account that can rename a directory on the way to the target chooses what that is. Stopping the service does not remove that account.
   ERROR: To keep /var/lib/one-two-inventory on another disk, replace the link with a real directory and bind-mount the disk onto it — no data has to move, because the bind exposes the same filesystem at the same path.
-  ERROR: Do it with the writers stopped, in this order:
-  ERROR:   1. stop the application service, and pause any cron that writes under /var/lib/one-two-inventory
-  ERROR:   2. this run resolved that link to: /srv/disk2/ims   (device:inode 2049:262145) — confirm that is where the data is
-  ERROR:   3. rm /var/lib/one-two-inventory && mkdir -p /var/lib/one-two-inventory && mount --bind /srv/disk2/ims /var/lib/one-two-inventory
-  ERROR:   4. verify BOTH: findmnt -no TARGET,SOURCE /var/lib/one-two-inventory   must name /var/lib/one-two-inventory, and: stat -c %d:%i /var/lib/one-two-inventory   must print 2049:262145. If the mount did not take, or either differs, put the link back at once: umount /var/lib/one-two-inventory 2>/dev/null; rmdir /var/lib/one-two-inventory && ln -s /srv/disk2/ims /var/lib/one-two-inventory
-  ERROR:   5. add: /srv/disk2/ims /var/lib/one-two-inventory none bind 0 0   to /etc/fstab so the bind survives a reboot, then start the service again
+  ERROR: This run resolved that link to: /srv/disk2/ims
+  ERROR: THE BIND-MOUNT PROCEDURE IS IN THE DOCUMENTATION, NOT ON THIS SCREEN: docs/installation.md, "Putting a state root on another disk". It is not printed here because it cannot be pasted safely without checks only you can make: the target must hold NOTHING BUT this application's data, every directory from / down to it must be one only root can replace, and the parent of this root may not be. The documentation names all of those, the order to stop the writers in, the identity check to make after the mount, how to put the link back if the mount does not take, and the /etc/fstab line.
   ```
 
-  **The bind command is printed only when the target's own name cannot be rebound.** Saying that
-  nothing proves the path a symlink resolves through and then handing the operator a `mount --bind`
-  naming that same path would be the identical defect one step further out: an account that can
-  write any directory on the way to the target replaces it between the moment the installer looked
-  and the moment the command is pasted, and the bind then exposes a tree of their choosing at the
-  state root. So the run walks the target's ancestry first — every directory from `/` down to its
-  parent owned by root and carrying no group or other write bit, the same question that decides
-  whether a directory may be a publication root — and where that does not hold it prints no command
-  and no `fstab` line, only what would make it safe:
+  **The commands themselves are no longer printed** (o3d-secops r8). They used to be: a five-step
+  `rm && mkdir -p && mount --bind` procedure, with an apparatus in front of it deciding whether the
+  procedure was safe to print — an ancestry walk over the target, a device/inode capture, a
+  system-directory exclusion, and containment checks in both directions against every root the run
+  writes into. **That apparatus produced a finding in every review it survived**: a fail-open
+  descriptor acquisition, an ancestry gate that proved an adjacent property, a fail-open identity
+  capture, an identity that was not globally unique, and finally the procedure itself. `rm ROOT &&
+  mkdir -p ROOT && mount --bind TARGET ROOT` is raceable for `LOG_DIR`, whose `/var/log` parent the
+  installer *itself* recognises as group-writable and non-sticky: between the `rm` and the `mount`
+  the `syslog` account can create the name, and the bind lands on their directory entry. Five
+  findings from one operator convenience. The refusal, the reason and the resolved target stayed;
+  the recipe moved here, where a human reads it, checks their own parent directory, and is not
+  handed a paste. The **only** thing the scripts still do about a symlinked root is refuse it.
 
-  ```text
-  ERROR: BUT /srv/shared/ims IS NOT SAFE TO BIND YET. A directory on the way to it can be replaced by somebody other than root, so a bind mount naming that path would resolve it again, later, and could expose a tree of their choosing at /var/lib/one-two-inventory — which is the same defect as the symlink, one step further out. This run will not print a command that does that.
-  ERROR: Move the data under a path only root can rebind — every directory from / down to it owned by root and carrying no group or other write bit, which /srv, /var/lib and /mnt normally are — and run the installer again; it will then print the bind-mount procedure.
-  ```
+  **Why they refuse it at all:** the root's own *name* is safe, because its parent is root-owned;
+  the *path its target resolves through* is not walked by anything, so any directory on that path
+  the application account can write is a place to redirect a root-side publication of `.env`. A bind
+  mount is the same indirection with the resolution done **once**, at mount time, out of a mount
+  table only root can write.
 
-  **And the target may not be part of the operating system.** The root table names the directories
-  publications resolve against; it is not an inventory of everything the installer writes, and
-  `/opt/one-two-inventory -> /etc/systemd/system` would otherwise satisfy every other question. So
-  a target inside `/`, `/bin`, `/boot`, `/dev`, `/etc`, `/lib*`, `/proc`, `/root`, `/run`, `/sbin`,
-  `/sys`, `/usr` or `/var/www` gets no command: a bind source is where data lives. `/srv`, `/mnt`,
-  `/media`, `/opt`, `/var` and `/home` stay available.
+#### Putting a state root on another disk
 
-  **And the one precondition the run cannot establish is printed immediately above the commands.**
-  Every check listed here establishes that the target is not something the installer must never
-  touch. None of them can establish that the target is *dedicated* to this root — "a directory
-  holding nothing but this application's data" is not a question a filesystem can be asked, and a
-  denylist cannot converge on it. So the refusal says so, in the operator's terms and before the
-  first command: after the bind, every later run treats that directory as the root — `rsync
-  --delete` into it and `chown -R` over it — so anything else living there is deleted or taken over,
-  and an operator who is not certain should move the application's data into a directory of its own
-  and bind that.
+This is the procedure the installer used to print. Read it, decide each point for your own host,
+and then run it **with the writers stopped**. It applies to `APP_DIR`, `DATA_DIR`, `LOG_DIR` and to
+any anchored override — anywhere you would otherwise have reached for a symlink.
 
-  **And the target may not be the root, an ancestor of it, anything under it, or any other root the
-  run writes into** — read from `publish_trust_root_candidates()`, the one table every publication
-  already resolves against, plus `LOG_DIR`, so the same refusal answers the same question wherever
-  it is printed and there is no second list to go stale. The comparison is made on **normalised**
-  spellings (`//var/lib/app` and `/var/lib/app` are one directory) and then again on **device and
-  inode**, in both directions — the target against every ancestor of each managed root, and each
-  managed root against every ancestor of the target — because two paths can be the same directory,
-  or nested, without sharing a prefix: a bind mount already in place gives one directory two names.
-  An identity the run cannot read, where the path exists, is a refusal rather than a skipped check. `/opt/one-two-inventory -> /opt` satisfies every other question — `/opt`'s
-  name cannot be rebound by anybody but root — and binding `/opt` onto `/opt/one-two-inventory`
-  would hand the next run the whole of `/opt` to `rsync --delete` into and `chown -R`. The same
-  shape gives `/var/lib` and `/var/log`. Those get a refusal naming the overlap and no command.
+**Before anything else — the precondition no program can check for you.** The target directory must
+hold **nothing but this application's data**. After the bind, every later run of `install.sh`,
+`deploy.sh` and `update.sh` treats that directory *as the root*: it `rsync --delete`s into it and
+`chown -R`s it to the service account. Anything else living there is deleted or taken over. "A
+directory that holds nothing but this application's data" is not a question a filesystem can be
+asked, and no denylist converges on it. If you are not certain, move the application's data into a
+directory of its own first and bind **that**.
 
-  **The identity is device *and* inode, and a run that cannot read it prints no procedure at all.**
-  An inode number identifies a file only within one filesystem, so `stat -c %i` alone would be
-  satisfied by a wrong source on another disk — which is precisely what step 4 exists to catch — and
-  an instruction saying the inode "must be unknown" is one nobody can follow.
+**Then check the target, by hand, against all five of these.** Each was a gate the installer used
+to apply before it would print anything; they are the operator's now.
 
-  Every path in those commands is **shell-quoted** by the run that printed them (`printf %q`, so a
-  name containing a space, a `;`, a `$(…)`, a tab or a newline becomes one word that evaluates back
-  to exactly those bytes and executes nothing), and the `fstab` line uses **fstab's** own escaping
-  instead — `\040` for a space, `\011` for a tab, `\134` for a backslash — because `mount` reads
-  that field with different rules. A path carrying a newline or a `#` gets a sentence pointing at a
-  systemd `.mount` unit rather than an `fstab` line that cannot express it: those two have no escape
-  in that format.
+1. **The target must resolve to a directory.** If the link is dangling there is nothing to bind, and
+   nothing here will guess what it was meant to point at.
+2. **Every directory from `/` down to the target must be one only root can replace** — owned by root
+   and carrying no group or other write bit. This is the same ancestry question that decides whether
+   a directory may be a publication root at all, and it is the whole reason a bind is safer than a
+   symlink: a bind resolves the path **once**, at mount time, but only if nobody can change what
+   that path means before you type the command. `/srv`, `/var/lib` and `/mnt` normally satisfy it;
+   a directory under `/home` or under anything the application account owns does not. Check it with
+   `namei -l /srv/disk2/ims`.
+3. **The target may not be part of the operating system.** `/`, `/bin`, `/boot`, `/dev`, `/etc`,
+   `/lib*`, `/proc`, `/root`, `/run`, `/sbin`, `/sys`, `/usr` and `/var/www` are not bind sources: a
+   bind source is where data lives. `/opt/one-two-inventory -> /etc/systemd/system` satisfies every
+   other question on this list and would put the host's unit tree where the next run rsyncs,
+   deletes and chowns. `/srv`, `/mnt`, `/media`, `/opt`, `/var` and `/home` stay available.
+4. **The target may not be the root, an ancestor of it, anything under it, or any other root these
+   scripts write into.** Those are `APP_DIR`, `DATA_DIR`, `LOG_DIR`, the cutover state directory,
+   `/etc/ims-cutover`, `/etc/ims-db-ca` and `/etc/ims-cutover-recovery`.
+   `/opt/one-two-inventory -> /opt` passes every other question — `/opt`'s name cannot be rebound by
+   anybody but root — and binding `/opt` onto `/opt/one-two-inventory` hands the next run the whole
+   of `/opt` to `rsync --delete` into and `chown -R`. The same shape gives `/var/lib` for `DATA_DIR`
+   and `/var/log` for `LOG_DIR`. Compare **device and inode**, not spellings: two paths can be the
+   same directory, or nested, without sharing a prefix, because a bind mount already in place gives
+   one directory two names. `stat -c %d:%i` on each, in both directions.
+5. **The root's own parent may be writable by somebody other than root, and `/var/log` is.** On
+   Ubuntu `/var/log` is `drwxrwxr-x root:syslog` and not sticky, so the `syslog` account may create
+   and rename entries in it. Step 3 below removes a name in that directory and step 4 creates it
+   again: in the gap, that account can take the name. For `LOG_DIR` — or for any root whose parent
+   is group-writable and not sticky (`ls -ld` the parent) — **do not** use `rm` + `mkdir`. Stop the
+   accounts that can write the parent first, or make the parent sticky (`chmod +t`) for the
+   duration, and verify with step 5 that the directory you mounted onto is the one you created.
 
-  **What an operator with a symlinked root must do** is the five numbered steps above, in that
-  order. They matter as a sequence, not as a one-liner: the refusal is printed while the service and
-  its cron are still running, and step 3 removes a live pathname. The run **resolves the link
-  itself** and prints the target as a literal path, so there is no `TARGET` to mistype and no shell
-  variable in any of it — every line can be pasted as printed. If `mount --bind` does not take, step
-  4 puts the symlink straight back; without that, a wrong or unavailable target leaves an **empty
-  real directory** at the live path with the data detached behind it, and the application either
-  fails or quietly populates a shadow tree. Nothing moves — the bind exposes the same filesystem at
-  the same path, so the data, the ownership and the free space are the ones that were already there.
-  A link that does **not** resolve to a directory gets a different message and no bind-mount
-  command: there is nothing to bind yet, and the installer will not guess what it was meant to
-  point at.
-  **Why:** the root's own *name* is safe, because its parent is root-owned; the *path its target
-  resolves through* is not walked by anything, so any directory on that path the application
-  account can write is a place to redirect a root-side publication of `.env`. A bind mount is the
-  same indirection with the resolution done **once**, at mount time, out of a mount table only root
-  can write.
+**Then do it, in this order, and not as a one-liner.** The sequence matters: the refusal appears
+while the service and its cron are still running, and step 3 removes a live pathname.
+
+```bash
+# 1. Stop the writers. Nothing may be writing under the root while its name is being replaced.
+systemctl stop one-two-inventory.service
+crontab -l                       # note and pause anything writing under the root
+
+# 2. Confirm the target is where the data actually is, and record its identity.
+readlink -f /var/lib/one-two-inventory     # -> /srv/disk2/ims
+stat -c %d:%i /srv/disk2/ims               # -> e.g. 2049:262145   (keep this)
+
+# 3. Replace the link with a real directory. See check 5 above before doing this on LOG_DIR.
+rm /var/lib/one-two-inventory
+mkdir /var/lib/one-two-inventory
+
+# 4. Bind the disk onto it. Nothing moves: the bind exposes the same filesystem at the same path,
+#    so the data, the ownership and the free space are the ones that were already there.
+mount --bind /srv/disk2/ims /var/lib/one-two-inventory
+
+# 5. Verify BOTH, and put the link back at once if either is wrong.
+findmnt -no TARGET,SOURCE /var/lib/one-two-inventory   # must name the root
+stat -c %d:%i /var/lib/one-two-inventory               # must print the identity from step 2
+
+# If the mount did not take, or either check differs:
+umount /var/lib/one-two-inventory 2>/dev/null
+rmdir /var/lib/one-two-inventory && ln -s /srv/disk2/ims /var/lib/one-two-inventory
+
+# 6. Make it survive a reboot, then start the service again.
+printf '%s\n' '/srv/disk2/ims /var/lib/one-two-inventory none bind 0 0' >> /etc/fstab
+systemctl start one-two-inventory.service
+```
+
+**Step 5 is not optional.** Without it, a wrong or unavailable target leaves an **empty real
+directory** at the live path with the data detached behind it, and the application either fails or
+quietly populates a shadow tree — with nothing on screen to say how to get back.
+
+**`/etc/fstab` has its own escaping, and it is not the shell's.** Fields are split on whitespace,
+and a space, a tab or a backslash is written as an octal escape — `\040`, `\011`, `\134`. A
+newline or a `#` has no escape in that format at all: a path containing either cannot be written
+into `/etc/fstab`, and needs a systemd `.mount` unit instead.
+
 
 ### `install.sh` proves its three roots before it touches them
 
@@ -1403,17 +1435,31 @@ The gate also **opens a descriptor** on an approved root and holds it for the ru
 enters through `/proc/self/fd/N` — which the kernel resolves to the open file rather than to a
 pathname. A `dev:ino` alone would not be enough: inode numbers are reused, so an account that can
 write the parent could remove an empty approved root, create its own at the name, and win if the
-filesystem handed back the inode it had just freed. Acquiring that descriptor is **mandatory** on a host with `/proc`: a
-failed walk, a failed open or a verification that does not match ends the run, and a missing
-descriptor at section 8 is a refusal rather than permission to enter by name. (A host with no
-`/proc` at all — a broken container, not a supported configuration — says so out loud and falls back
-to the `dev:ino` comparison.) Fail-open here would be worse than not trying: an account that can
-write `/var/log` could rename the entry aside for the instant of the open and switch the weaker mode
-on at will. The ownership change itself is `chown -Rh … .` and not
-`find … -exec chown`: coreutils walks with `fchownat(AT_SYMLINK_NOFOLLOW)` relative to descriptors
-it holds, whereas `find -exec` enumerates pathnames that are resolved again afterwards — and `-h`
-protects only the final component, so a descendant directory swapped for a symlink in between would
-redirect the change.
+filesystem handed back the inode it had just freed. Acquiring that descriptor is **mandatory**: a failed
+walk, a failed open or a verification that does not match ends the run, and a missing descriptor at
+section 8 is a refusal rather than permission to enter by name. Fail-open here would be worse than
+not trying: an account that can write `/var/log` could rename the entry aside for the instant of the
+open and switch the weaker mode on at will.
+
+**`/proc` must be mounted, and a host without it is refused** (o3d-secops r8). This used to be the
+one remaining way of not getting a descriptor: a missing `/proc/self/fd` was a `warn` and the run
+carried on on the `dev:ino` comparison, with a by-name entry branch in `enter_service_root()` to
+fall into. That was a fail-open in the middle of the hardening that exists to remove exactly it —
+and the code's own comment explains why identifying a root by name is unsafe. There is no way to
+name an open directory without `/proc`, so there is no weaker mode worth keeping: the gate now
+`die`s, at pre-flight, before anything has been created, migrated or started, and the by-name branch
+is gone with it. A hardened container without `/proc` is not a supported install for these scripts;
+mount it and run again.
+
+The ownership change itself is never `find … -exec chown`. For `LOG_DIR` it is `chown -Rh … .`
+inside the entered root — coreutils walks with `fchownat(AT_SYMLINK_NOFOLLOW)` relative to
+descriptors it holds. For `DATA_DIR`, which has two subtrees to prune and so cannot use `chown -R`
+at all, it is `scripts/lib/chown-tree.mjs`, which descends by descriptor and does the same thing
+(o3d-n8xx; see the publication bullet above for how it prunes). `find -exec` enumerates pathnames
+that are resolved again afterwards, and `-h` protects only the final component, so a descendant
+directory swapped for a symlink in between would redirect the change — and on an upgrade the account
+that can do that owns the tree and is still running, because section 8 precedes the `systemctl stop`
+in section 10c.
 
 Every `stat -c %F` in these scripts runs under `LC_ALL=C`, because coreutils **translates** those
 file-type descriptions and every walk compares them against the English words.
@@ -1427,7 +1473,7 @@ entry's owner may rename or remove it — and is the recommended hardening if th
 threat model.
 
 **Upgrading an installation whose root IS a symlink.** The run stops at pre-flight, prints the
-procedure above naming that root, and adds:
+refusal above naming that root, and adds:
 
 ```text
 ERROR: /var/lib/one-two-inventory — the state directory — is a symbolic link, so this run stops here rather than creating, entering, migrating into, rsyncing into or chowning whatever it resolves to. […] NOTHING has been created, nothing has been migrated and nothing has been started — this is the FIRST statement in the run that looks at /var/lib/one-two-inventory, so an existing installation is exactly as it was.
@@ -1435,8 +1481,8 @@ ERROR: /var/lib/one-two-inventory — the state directory — is a symbolic link
 
 Nothing has changed on the host at that point — no user, no directory, no crontab, no migration —
 so the installation you had is the installation you still have. Replace the link with a bind mount
-using the three commands above, then re-run `install.sh`. Your data does not move: the bind exposes
-the same filesystem at the same path.
+by following “Putting a state root on another disk” above, then re-run `install.sh`. Your data does
+not move: the bind exposes the same filesystem at the same path.
 
 The **anchor** rule in the previous section (every directory from `/` down to the root owned by
 root and carrying no group or other write bit) is *additional*, and applies only to the roots that

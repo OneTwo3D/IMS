@@ -3702,6 +3702,80 @@ enter_service_root() {
 }
 
 # ---------------------------------------------------------------------------
+# THE RECURSIVE OWNERSHIP CHANGE OVER A STATE ROOT, AIMED AT INODES (o3d-n8xx, Codex CRITICAL)
+#
+# THE FINDING. ${DATA_DIR}'s chown could not follow ${LOG_DIR}'s to `chown -Rh .` because it must
+# PRUNE two subtrees — the root-owned crontab lock directory, and every `.ims-publish` staging
+# directory at any depth — and `chown -R` cannot express a prune. So it stayed as
+#
+#     find "${DATA_DIR}" \( -path "${CRONTAB_LOCK_DIR}" -o -name "${PUBLISH_STAGE_DIRNAME}" \) \
+#       -prune -o -exec chown -h "${APP_USER}:${APP_USER}" {} +
+#
+# and `find -exec` ENUMERATES PATHNAMES and hands them to a `chown` that resolves them AGAIN
+# afterwards. `-h` protects only the FINAL component. On an upgrade the service account owns this
+# tree, and section 8 runs BEFORE section 10c stops the service — so that account is LIVE while
+# this walk happens. A descendant directory renamed aside and replaced by a symlink between the
+# enumeration and the execution redirects a root-side ownership change through it: `find` prints
+# ${DATA_DIR}/d/f, `d` becomes a link to /etc, and `chown -h ${DATA_DIR}/d/f` changes /etc/f. GNU
+# find's own documentation calls `-exec` insecure for exactly this.
+#
+# WHAT REPLACES IT, AND WHY IT IS NOT SHELL. The answer is an fd-relative traversal —
+# `openat`/`fstatat`/`fchownat` with AT_SYMLINK_NOFOLLOW, pruning by verified identity — and bash
+# cannot express one: it has no `openat`, and every builtin that takes a path re-resolves it.
+#
+# THE ALTERNATIVE THAT WAS WEIGHED AND REJECTED was restructuring so that plain `chown -R` could do
+# the walk (it does not follow symlinks without -L/-H, so the race disappears) and re-taking the two
+# protected subtrees immediately afterwards. It does not work here. The staging directories are
+# pruned BY NAME AT ANY DEPTH and they PERSIST — publish_durable_file() creates one beside every
+# durable publication and never removes it — so "re-chown them afterwards" would need a
+# `find -name .ims-publish` to locate them, which is the same pathname enumeration this finding is
+# about, one verb later. And the window it opens is open while the service is RUNNING: a staging
+# directory handed to the service account is a staging directory they can rename, which is the
+# whole of o3d-czpy. A window that exposes the crontab lock alone would have been arguable; one
+# that also exposes every publication staging directory is not.
+#
+# SO IT IS A NODE HELPER, AND THAT ADDS NO DEPENDENCY. node is installed by section 4, which runs
+# before this; the installer already ships and runs scripts/lib/pg-auth-request.mjs. Node has no
+# `dir_fd` parameter, but `/proc/self/fd/N` is resolved BY THE KERNEL to the open file, so
+# `/proc/self/fd/N/child` IS `openat(N, "child", …)` — the same primitive enter_service_root()
+# already enters a root with. A python3 helper would say it with real `dir_fd=` arguments and no
+# /proc; python3 is NOT a declared dependency of this installer (it arrives only as a transitive
+# dependency of `unattended-upgrades` and `apt-listchanges`, which section 3 happens to install),
+# and resting a security primitive on that is a dependency in all but name. /proc is mandatory for
+# this script as of the same change, so the /proc route costs nothing that was not already spent.
+#
+# THE ROOT IS ENTERED BY DESCRIPTOR FIRST, exactly as ${LOG_DIR}'s is: enter_service_root() re-walks
+# from `/`, re-proves the root's identity and its `..`, enters it through the descriptor pre-flight
+# opened, and leaves the SUBSHELL inside it — so the helper is handed `.` and never a pathname. Its
+# subshell is why the installer's own cwd is unaffected.
+chown_state_tree() {
+  local root="$1" owner="$2" prune_here="$3" prune_any="$4" what="$5" uid gid helper
+  # NUMERIC IDS, RESOLVED ONCE AND CHECKED. `chown` takes a name and resolves it itself; `fchown`
+  # takes numbers, so the resolution happens here — and a name that resolves to nothing must end
+  # the run rather than reach the helper as an empty string.
+  uid="$(id -u "${owner}" 2>/dev/null)" || uid=""
+  gid="$(id -g "${owner}" 2>/dev/null)" || gid=""
+  [[ "${uid}" =~ ^[0-9]+$ && "${gid}" =~ ^[0-9]+$ ]] || die \
+    "the account '${owner}' could not be resolved to a numeric uid and gid, so this run cannot set the ownership of ${root} — ${what}. Nothing has been started."
+  # WHERE THE HELPER LIVES: THIS SCRIPT'S OWN lib directory, resolved from BASH_SOURCE at startup —
+  # the release being installed, not ${APP_DIR}. Same rule as db-fence-protected.sh and
+  # pg-auth-request.mjs, and for the same reason. IMS_CHOWN_TREE_HELPER exists for the regressions,
+  # which run the shipped functions outside the shipped file and so have no BASH_SOURCE to resolve
+  # from; pointing it somewhere else produces a different program, not an exemption.
+  helper="${IMS_CHOWN_TREE_HELPER:-${IMS_SCRIPT_LIB_DIR:-}/chown-tree.mjs}"
+  [[ -f "${helper}" ]] || die \
+    "${helper} is missing, so this run cannot set the ownership of ${root} — ${what} — without re-resolving pathnames a compromised service account can rename. It will not do that. Restore the checkout and run the installer again; nothing has been started."
+  command -v node >/dev/null 2>&1 || die \
+    "node is not on PATH, so this run cannot set the ownership of ${root} — ${what}. Section 4 installs it; if you have reached here without it, something removed it. Nothing has been started."
+  if ! (
+    enter_service_root "${root}" 022 "${what}"
+    node "${helper}" . "${uid}" "${gid}" "${prune_here}" "${prune_any}"
+  ); then
+    die "The ownership of ${root} — ${what} — could not be set; the reason is above. Nothing has been started."
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # COPYING A TREE INTO A DIRECTORY THE SERVICE ACCOUNT OWNS (o3d-czpy)
 #
 # `rm -rf "${APP_DIR}/.git"` followed by `cp -a "${clone}/.git" "${APP_DIR}/.git"` is the same
@@ -7719,14 +7793,24 @@ migrate_uploads "${APP_DIR}/public/uploads/avatars" "${PUBLIC_UPLOAD_STORAGE_DIR
 
 # The crontab lock directory below is deliberately NOT handed to the service user, so it is pruned
 # out of this recursive chown rather than being taken back and re-taken on every re-run (which would
-# open a window in which the service user could plant a symlink inside it). `-exec chown -h` also
-# means a symlink anywhere under ${DATA_DIR} has its own ownership changed rather than its target's.
-# ${PUBLISH_STAGE_DIRNAME} is pruned for the SAME reason and by name, at any depth (o3d-czpy):
-# publish_durable_file() stages ${CUTOVER_STATE_DIR}/DEPLOY-FENCED and the cron backup through
-# root-owned 0700 directories inside ${DATA_DIR}, and a staging directory this line handed to
-# ${APP_USER} would be a staging directory they can rename — which is the whole finding.
-find "${DATA_DIR}" \( -path "${CRONTAB_LOCK_DIR}" -o -name "${PUBLISH_STAGE_DIRNAME}" \) -prune \
-  -o -exec chown -h "${APP_USER}:${APP_USER}" {} +
+# open a window in which the service user could plant a symlink inside it). ${PUBLISH_STAGE_DIRNAME}
+# is pruned for the SAME reason and at any depth (o3d-czpy): publish_durable_file() stages
+# ${CUTOVER_STATE_DIR}/DEPLOY-FENCED and the cron backup through root-owned 0700 directories inside
+# ${DATA_DIR}, and a staging directory this line handed to ${APP_USER} would be a staging directory
+# they can rename — which is the whole finding.
+#
+# AND THE WALK IS FD-RELATIVE, NOT `find -exec chown -h` (o3d-n8xx, Codex CRITICAL). See
+# chown_state_tree() above for the finding, the alternative that was weighed, and why the traversal
+# is not written in shell. What changes here is that the two prunes are named as SINGLE COMPONENTS
+# — resolved against the descriptor of the directory they sit in, never as pathnames.
+#
+# THE LOCK DIRECTORY'S NAME AND ITS PATH ARE THE SAME FACT, AND THIS SAYS SO. crontab_lock_paths()
+# composes ${CRONTAB_LOCK_DIR} as ${DATA_DIR}/${CRONTAB_LOCK_DIRNAME}; the walk prunes the single
+# component. If those two ever stop agreeing the prune would silently protect nothing, so they are
+# checked against each other here rather than left to be true.
+[[ "${CRONTAB_LOCK_DIR}" == "${DATA_DIR%/}/${CRONTAB_LOCK_DIRNAME}" ]] || die \
+  "the crontab lock directory is ${CRONTAB_LOCK_DIR}, which is not ${DATA_DIR%/}/${CRONTAB_LOCK_DIRNAME}: the recursive ownership change over the state directory prunes it by its single name component, and a name that does not compose the same path would prune nothing. This is a bug in this script, not an operator error."
+chown_state_tree "${DATA_DIR}" "${APP_USER}" "${CRONTAB_LOCK_DIRNAME}" "${PUBLISH_STAGE_DIRNAME}" "the state directory"
 # ${LOG_DIR}'S OWNERSHIP IS AIMED AT A DESCRIPTOR, NOT AT A NAME (o3d-secops r7 second pass,
 # Codex HIGH).
 #
