@@ -576,6 +576,93 @@ test('parseLedgerAmount refuses to turn an empty field into zero', () => {
 })
 
 // ---------------------------------------------------------------------------
+// o3d-psrx r11 (Codex HIGH) — `Number()` IS NOT A MONEY PARSER.
+//
+// The string branch of parseLedgerAmount used to be `Number(trimmed)`, which accepts a great deal
+// that no ledger ever calls an amount: radix-prefixed literals, exponent notation, and Infinity.
+// It does not throw on any of them — it returns a NUMBER, and that number then steers a reversal.
+// The worked example is the finding's own: a `Balance` of "0x64" against a `TotalAmt` of 100 makes
+// paid = 0, which is the proof the reversal gate is waiting for.
+//
+// The table is the test. A blocklist of these shapes would be a list of what somebody remembered;
+// what is asserted here is that the reader admits DECIMAL MONEY and nothing else.
+// ---------------------------------------------------------------------------
+
+test('[o3d-psrx r11] a string that is not decimal money is UNREADABLE, never a number', () => {
+  const refused: [string, string][] = [
+    ['0x64', 'hexadecimal — Number() reads 100, and 100 against a total of 100 is a proven zero'],
+    ['0X64', 'the same, upper case'],
+    ['0b101', 'binary — Number() reads 5'],
+    ['0o17', 'octal — Number() reads 15'],
+    ['1e2', 'exponent notation — Number() reads 100'],
+    ['1E2', 'the same, upper case'],
+    ['-1e-9', 'an exponent small enough to pass for zero is the most dangerous of them'],
+    ['Infinity', 'Number() reads an infinity, which is not an amount of money'],
+    ['-Infinity', 'nor is a negative one'],
+    ['NaN', 'the literal, which is a string this reader must refuse by shape'],
+    ['1_000', 'numeric separators are a JavaScript source-code spelling, not a ledger one'],
+    ['1,000.00', 'thousands separators state a locale this reader has not been told'],
+    ['£50.00', 'a currency symbol is not part of the figure'],
+    ['50.00.00', 'two decimal points is not one number'],
+    ['0x0', 'and the hexadecimal ZERO is the one that reads as a settled document'],
+  ]
+  for (const [value, why] of refused) {
+    assert.equal(parseLedgerAmount(value), null, `${JSON.stringify(value)} must be unreadable: ${why}`)
+  }
+})
+
+test('[o3d-psrx r11] ordinary decimal money still reads exactly as it always did', () => {
+  // The other half of the grammar: refusing everything would satisfy the test above and destroy the
+  // reader. Every one of these is a figure Xero or QuickBooks actually serialises.
+  const accepted: [string, number][] = [
+    ['0', 0],
+    ['0.00', 0],
+    ['50', 50],
+    ['50.00', 50],
+    [' 42.5 ', 42.5],
+    ['-12.34', -12.34],
+    ['+7.5', 7.5],
+    ['1234567.8901', 1234567.8901],
+    ['0.001', 0.001],
+  ]
+  for (const [value, expected] of accepted) {
+    assert.equal(parseLedgerAmount(value), expected, `${JSON.stringify(value)} is decimal money and must read as ${expected}`)
+  }
+  // And the number branch is untouched: QuickBooks and Xero both serialise money as JSON numbers in
+  // normal operation, so this is the path production actually takes.
+  assert.equal(parseLedgerAmount(0), 0)
+  assert.equal(parseLedgerAmount(50.25), 50.25)
+  assert.equal(parseLedgerAmount(Number.POSITIVE_INFINITY), null)
+})
+
+test('[o3d-psrx r11] an AmountPaid Xero did not state in decimal money WITHHOLDS, it does not reverse', () => {
+  // THE ROUTE: partitionPaymentReversals is what turns a figure into a reversal candidate. `zeroPaid`
+  // is the bucket that goes on to clear paidAt and re-arm Mark Paid; `unverifiable` is the one that
+  // withholds. Under Number() both rows below land in `zeroPaid` — "0x0" is 0 and "1e-9" is inside
+  // PAYMENT_PRESENT_EPSILON — so the ledger appears to have PROVEN it holds nothing.
+  const reading = partitionPaymentReversals([
+    ledgerInv('b-hex', 'ACCPAY', 'AUTHORISED', { AmountPaid: '0x0', AmountDue: '0x1F4' }),
+    ledgerInv('b-exp', 'ACCPAY', 'AUTHORISED', { AmountPaid: '1e-9', AmountDue: '500' }),
+  ], 'ACCPAY')
+  assert.deepEqual(reading.zeroPaid.map((i) => i.InvoiceID), [],
+    'a figure that is not decimal money must never reach the bucket that clears paidAt')
+  assert.deepEqual(reading.unverifiable.map((i) => i.InvoiceID), ['b-hex', 'b-exp'],
+    'it is UNKNOWN — the answer this partition already has for a figure the payload did not state')
+  assert.equal(reading.voided.size, 0)
+  assert.deepEqual(reading.partPaid.map((i) => i.InvoiceID), [])
+
+  // CONTROL, in the same call so the two cannot drift apart: the ordinary string figures still land
+  // exactly where they did. Withholding everything is not a fix.
+  const control = partitionPaymentReversals([
+    ledgerInv('b-zero', 'ACCPAY', 'AUTHORISED', { AmountPaid: '0.00', AmountDue: '500.00' }),
+    ledgerInv('b-part', 'ACCPAY', 'AUTHORISED', { AmountPaid: '400.00', AmountDue: '100.00' }),
+  ], 'ACCPAY')
+  assert.deepEqual(control.zeroPaid.map((i) => i.InvoiceID), ['b-zero'])
+  assert.deepEqual(control.partPaid.map((i) => i.InvoiceID), ['b-part'])
+  assert.deepEqual(control.unverifiable.map((i) => i.InvoiceID), [])
+})
+
+// ---------------------------------------------------------------------------
 // WHOSE payment is gone (o3d-clxw round 2)
 //
 // "Does the ledger hold ANY payment" and "is the payment IMS registered still here" are the same

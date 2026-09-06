@@ -702,3 +702,106 @@ test('[o3d-psrx r10] the smallest amount a 3-decimal currency can hold is not tr
   assert.equal(gbp.partiallyPaidDocuments, 0)
   assert.deepEqual(state.chargebacks, ['so_1'])
 })
+
+// ---------------------------------------------------------------------------
+// o3d-psrx r11 (Codex HIGH) — A FIGURE `Number()` HAPPENS TO READ IS NOT A FIGURE QUICKBOOKS STATED.
+//
+// `parseLedgerAmount` handed its string branch to `Number()`, which accepts radix-prefixed literals.
+// `Balance: "0x64"` therefore read as 100; against a `TotalAmt` of 100 that makes paid = 0, which is
+// HOLDS_NOTHING — the exact proof the registration gate is waiting for. A posted registration then
+// admits the reversal: `paidAt` cleared and a chargeback credit note raised over a document nobody
+// ever said was unpaid.
+//
+// The pair below is the two halves of the fix, on the two routes that reach the two halves:
+//   - the DELTA read, where the invented number steered the reversal itself;
+//   - the BY-ID recheck, where the refusal must not become a settlement. An unreadable Balance
+//     contributes no balance due, and the closing loop reads "returned + nothing withheld + no
+//     error" as SETTLED — so the stricter parser would have CLOSED the marker on the very document
+//     it refused to read.
+// ---------------------------------------------------------------------------
+
+test('[o3d-psrx r11] a hex-literal Balance does not steer a QuickBooks reversal', async () => {
+  reset()
+  state.salesOrders = [paidOrderRow()]
+  // POSTED, not in flight: the registration evidence is clean, so nothing but the amount reading is
+  // holding this reversal back. That is what makes the invented zero decisive here.
+  state.syncLogs = [postedRegistration()]
+  state.qboDocuments.set('QI1', { Id: 'QI1', Balance: '0x64', TotalAmt: '100.00', CurrencyRef: { value: 'GBP' } })
+  state.deltaBalanceDue = ['QI1']
+
+  const first = await poll()
+
+  assert.equal(first.salesReversed, 0,
+    'THE FINDING: "0x64" is not an amount QuickBooks stated in decimal money. Read as 100 it makes '
+    + 'paid = 0 on a total of 100, the ledger appears to have PROVEN it holds nothing, and the '
+    + 'reversal is admitted on a number IMS invented')
+  assert.deepEqual(state.chargebacks, [],
+    'and no chargeback credit note is raised against revenue on the strength of it')
+  assert.deepEqual(state.salesOrderUpdates.filter((u) => u.data.paidAt === null), [],
+    'and paidAt is not cleared')
+  assert.equal(first.salesReversalsWithheld, 1,
+    'the unreadable figure WITHHOLDS — refusing is not the same as answering zero, and a refusal that '
+    + 'came back as 0 would be indistinguishable from the reversal itself')
+  const marker = state.activity.find((a) => a.action === 'payment_reversal_withheld')
+  assert.equal(marker?.metadata?.registrationVerdict, 'LEDGER_NOT_PROVEN_ZERO_PAID',
+    'and it is withheld for want of a LEDGER reading, not for want of registration evidence — the '
+    + 'registration here is posted and clean')
+})
+
+test('[o3d-psrx r11] a Balance IMS could not read DEFERS the marker, it never closes it as settled', async () => {
+  reset()
+  state.salesOrders = [paidOrderRow()]
+  state.syncLogs = [postedRegistration()]
+  state.qboDocuments.set('QI1', { Id: 'QI1', Balance: '0x64', TotalAmt: '100.00', CurrencyRef: { value: 'GBP' } })
+  state.deltaBalanceDue = ['QI1']
+
+  const first = await poll()
+  assert.equal(first.salesReversalsWithheld, 1,
+    'the precondition: poll 1 must leave a marker, or poll 2 reconsiders nothing and this test proves nothing')
+
+  // ---- POLL 2, through the BY-ID read, with the delta window empty. QuickBooks says the same thing.
+  state.deltaBalanceDue = []
+  ageMarkers(HOUR + 60_000)
+  const second = await poll()
+
+  assert.ok(state.queries.some((q) => q === "Invoice: Id IN ('QI1')"),
+    `the recheck must actually have re-read the document by id. Saw: ${JSON.stringify(state.queries)}`)
+  assert.equal(second.withheldRechecked, 1, 'and the marker must have been due, or nothing was decided')
+  assert.equal(second.withheldResolved, 0,
+    'THE SECOND HALF: the document came back, contributed no balance due (nobody could read its '
+    + 'Balance) and nothing was still withheld — which the closing loop reads as SETTLED. Spending '
+    + '"we could not read it" as "there is nothing left to decide" is the r10 defect through a parser')
+  assert.equal(state.activity.some((a) => a.action === 'payment_reversal_withheld_cleared'), false,
+    'so no closure row is written for it')
+  assert.ok(state.activity.some((a) => a.action === 'payment_reversal_recheck_deferred'),
+    'it is DEFERRED instead, which rewrites the marker and sends the document to the back of the page')
+  assert.deepEqual(state.salesOrderUpdates.filter((u) => u.data.paidAt === null), [])
+})
+
+test('[o3d-psrx r11] CONTROL: a decimal-string Balance the ledger settles still CLOSES its marker', async () => {
+  // The control for the defer above, and the whole reason it is keyed on UNREADABLE rather than on
+  // "no balance due": a document QuickBooks states as settled in ordinary decimal money must still
+  // close, or the recheck page fills up with markers that can never resolve.
+  reset()
+  state.salesOrders = [paidOrderRow()]
+  state.syncLogs = [inFlightRegistration()]
+  state.qboDocuments.set('QI1', { Id: 'QI1', Balance: '100.00', TotalAmt: '100.00' })
+  state.deltaBalanceDue = ['QI1']
+
+  const first = await poll()
+  assert.equal(first.salesReversalsWithheld, 1, 'the precondition: a marker exists to reconsider')
+
+  // The registration finishes and QuickBooks now states the document fully settled — a real zero,
+  // stated as a string, which the grammar reads.
+  state.syncLogs = [inFlightRegistration({ status: 'CANCELLED' })]
+  state.qboDocuments.set('QI1', { Id: 'QI1', Balance: '0.00', TotalAmt: '100.00' })
+  state.deltaBalanceDue = []
+  ageMarkers(HOUR + 60_000)
+
+  const second = await poll()
+  assert.equal(second.withheldRechecked, 1)
+  assert.equal(second.withheldResolved, 1,
+    'a stated zero is a READING, and the disagreement it settles must still close — the r11 defer '
+    + 'must fire on unreadable figures only')
+  assert.ok(state.activity.some((a) => a.action === 'payment_reversal_withheld_cleared'))
+})
