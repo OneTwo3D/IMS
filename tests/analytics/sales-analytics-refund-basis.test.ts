@@ -1313,6 +1313,165 @@ test('customer mix: a name that SPELLS an escape is not the name that contains o
 })
 
 /**
+ * WHAT THE OPERATOR SEES, one step beyond the whitespace rule: CANONICAL EQUIVALENCE.
+ *
+ * Unicode defines two canonically equivalent sequences — `é` as U+00E9, and `é` as `e` followed by
+ * COMBINING ACUTE U+0301 — as two spellings of ONE character, and a conforming renderer is REQUIRED
+ * to draw them identically. `asRendered` models the CSS whitespace rule; this composes it with NFC,
+ * which is exactly the set of pairs a renderer is obliged to make indistinguishable. A label that
+ * is distinct only before this is not distinct on screen.
+ */
+function asSeen(text: string): string {
+  return asRendered(text).normalize('NFC')
+}
+
+/** The `group=` field of one notice entry, quotes included — it is the last field of the entry. */
+function groupField(entry: string): string {
+  const marker = ' group='
+  return entry.slice(entry.indexOf(marker) + marker.length)
+}
+
+/** The readable half of one notice entry: `name=`, `email=` and `customerId=`, without `group=`. */
+function readableFields(entry: string): string {
+  return entry.slice(0, entry.indexOf(' group='))
+}
+
+/** The code points of a string that are not printable ASCII — the ones whose rendering is a guess. */
+function nonPrintableAscii(text: string): string[] {
+  return Array.from(text).filter((char) => {
+    const code = char.codePointAt(0)!
+    return code < 0x20 || code > 0x7e
+  })
+}
+
+test('customer mix: NFC and NFD spellings of one guest name stay distinguishable on screen (o3d-7jfq r7)', async () => {
+  // ROUND 7. The round-6 encoder escapes a LIST of code-point ranges and emits every other code
+  // point unchanged, so its injectivity-as-rendered holds only for the characters somebody
+  // remembered to list. Canonical equivalence is one class further out: `Café` spelled with U+00E9
+  // and `Café` spelled `e` + U+0301 are two strings, two group keys and two distinct raw labels —
+  // and Unicode REQUIRES a renderer to draw them identically, so on screen they were ONE label.
+  // The whitespace collision again, at a character nobody had put on the list, which is why the
+  // fix is a rule with no list rather than a longer list.
+  const nfc = 'Café'
+  const nfd = 'Café'
+  assert.notEqual(nfc, nfd)
+  assert.equal(nfc.normalize('NFC'), nfd.normalize('NFC'))
+
+  const report = await reportForContradicted([
+    contradicted({ id: 'order-1', customerId: null, customerName: nfc, customerEmail: null, totalBase: '200' }),
+    contradicted({ id: 'order-2', customerId: null, customerName: nfd, customerEmail: null, totalBase: '100' }),
+  ])
+
+  // THE PREMISE: two groups. A grouping that normalised would make this vacuous — one row, and
+  // nothing for the label to tell apart.
+  assert.equal(report.rows.length, 2)
+  assert.equal(report.totals.costInconsistentRows, '2')
+  assert.deepEqual(report.rows.map((row) => row.customerName), [nfc, nfd])
+
+  const notice = inconsistentNotice(report)
+  assert.ok(notice, 'the report did not raise the inconsistent-evidence notice')
+
+  // DERIVED BY HAND from the split: `name=` prints the name as stored, because it exists to be read
+  // against the Customer column; `group=` is ASCII-only, so U+00E9 and U+0301 are spelled out.
+  assert.ok(notice!.endsWith(
+    'They are, highest-ranked first: '
+    + 'name="Café" email=<none> customerId=<none> group="guest-name:Caf\\u00e9"; '
+    + 'name="Café" email=<none> customerId=<none> group="guest-name:Cafe\\u0301".',
+  ), notice)
+
+  // AND THE PROPERTY THAT IS LOAD-BEARING, asserted through the rendering model rather than by
+  // reading the strings above: two entries, and no two of them look alike once drawn.
+  const entries = noticeEntries(notice!)
+  assert.equal(entries.length, 2)
+  const seen = entries.map(asSeen)
+  assert.equal(new Set(seen).size, 2, `two labels look alike on screen: ${seen.join(' || ')}`)
+
+  // NOT VACUOUS, AND `group=` IS WHAT DOES IT. The two raw names fold to one on screen, and so does
+  // the whole readable half of both entries — so the distinctness above cannot have come from
+  // `name=`, `email=` or `customerId=`. Only the identity field separates these two rows.
+  assert.equal(new Set([nfc, nfd].map(asSeen)).size, 1)
+  assert.equal(new Set(entries.map(readableFields).map(asSeen)).size, 1)
+})
+
+test('customer mix: guest names differing only in a non-ASCII homoglyph stay distinguishable (o3d-7jfq r7)', async () => {
+  // THE CLASS NORMALISATION CANNOT FIX, so that the fix has to be the encoding and not an NFC pass.
+  // GREEK CAPITAL ALPHA (U+0391) and CYRILLIC CAPITAL A (U+0410) are distinct code points, stay
+  // distinct under every normalisation form, and are drawn with the same glyph in every font that
+  // carries both. Two emailless guests whose names differ in nothing else; 200 and 100, so rank
+  // order is Greek then Cyrillic and no tie falls to localeCompare.
+  const greek = 'Αcme Ltd'
+  const cyrillic = 'Аcme Ltd'
+  assert.notEqual(greek.normalize('NFC'), cyrillic.normalize('NFC'))
+  assert.notEqual(greek.normalize('NFKC'), cyrillic.normalize('NFKC'))
+
+  const report = await reportForContradicted([
+    contradicted({ id: 'order-1', customerId: null, customerName: greek, customerEmail: null, totalBase: '200' }),
+    contradicted({ id: 'order-2', customerId: null, customerName: cyrillic, customerEmail: null, totalBase: '100' }),
+  ])
+
+  assert.equal(report.rows.length, 2)
+  assert.deepEqual(report.rows.map((row) => row.customerName), [greek, cyrillic])
+
+  const notice = inconsistentNotice(report)
+  assert.ok(notice, 'the report did not raise the inconsistent-evidence notice')
+  assert.ok(notice!.endsWith(
+    'They are, highest-ranked first: '
+    + 'name="Αcme Ltd" email=<none> customerId=<none> group="guest-name:\\u0391cme Ltd"; '
+    + 'name="Аcme Ltd" email=<none> customerId=<none> group="guest-name:\\u0410cme Ltd".',
+  ), notice)
+
+  // THE LOAD-BEARING PROPERTY, and the reason it is stated about `group=` rather than about the
+  // whole entry: printable ASCII contains no two code points that draw alike, so two `group=`
+  // fields that are distinct AND printable-ASCII throughout are distinct TO THE OPERATOR. That is
+  // an invariant of the encoding, not a fact about the characters this fixture happens to use.
+  const entries = noticeEntries(notice!)
+  assert.equal(entries.length, 2)
+  const groups = entries.map(groupField)
+  assert.equal(new Set(groups).size, 2, groups.join(' || '))
+  for (const group of groups) assert.deepEqual(nonPrintableAscii(group), [], group)
+
+  // NOT VACUOUS: the readable half of the two entries differs in exactly the one code point that
+  // draws the same as the other, so nothing before `group=` separates these rows on screen.
+  assert.equal(readableFields(entries[0]!).replaceAll('Α', 'А'), readableFields(entries[1]!))
+})
+
+test('customer mix: a non-Latin name is spelled out in `group=` and left readable in `name=` (o3d-7jfq r7)', async () => {
+  // WHAT THE SPLIT COSTS, WRITTEN DOWN. `group=` is ASCII-only, so an emailless guest called
+  // `株式会社アクメ` gets an identity field of seven escapes that an operator cannot read as a
+  // name. That is the price of a rule with no list to keep extending, and it is affordable only
+  // because the other three fields are untouched: `name=` still prints the EXACT string the
+  // Customer column prints, which is what the operator matches the row on. Escape both and the
+  // notice stops being usable — this test is what stops the fix doing that.
+  const name = '株式会社アクメ'
+
+  const report = await reportForContradicted([
+    contradicted({ id: 'order-1', customerId: null, customerName: name, customerEmail: null, totalBase: '200' }),
+  ])
+
+  assert.equal(report.rows.length, 1)
+  assert.equal(report.totals.costInconsistentRows, '1')
+
+  const notice = inconsistentNotice(report)
+  assert.ok(notice, 'the report did not raise the inconsistent-evidence notice')
+  assert.ok(notice!.endsWith(
+    'They are, highest-ranked first: '
+    + 'name="株式会社アクメ" email=<none> customerId=<none> '
+    + 'group="guest-name:\\u682a\\u5f0f\\u4f1a\\u793e\\u30a2\\u30af\\u30e1".',
+  ), notice)
+
+  // THE READABLE FIELD, TAKEN FROM THE COLUMN ITSELF rather than from a literal: whatever the
+  // Customer column shows for this row is what `name=` has to print, character for character.
+  assert.equal(report.rows[0]!.customerName, name)
+  assert.ok(notice!.includes(`name="${report.rows[0]!.customerName}"`), notice)
+
+  const entry = noticeEntries(notice!)[0]!
+  assert.deepEqual(nonPrintableAscii(groupField(entry)), [], groupField(entry))
+  // AND THE TWO POLICIES REALLY ARE DIFFERENT HERE — proof the assertion above is not satisfied by
+  // an accidentally all-ASCII fixture: the readable half carries all seven characters raw.
+  assert.equal(nonPrintableAscii(readableFields(entry)).length, 7)
+})
+
+/**
  * THE OPERATOR-FACING DOC FOR THIS NOTICE, read as a fixture.
  *
  * It has now been wrong TWICE about the same notice — round 3's `every figure summing COGS is
