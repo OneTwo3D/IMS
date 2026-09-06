@@ -3022,6 +3022,30 @@ refuse_symlinked_root() {
   ntarget="/${target#/}"; while [[ "$ntarget" == *//* ]]; do ntarget="${ntarget//\/\///}"; done; ntarget="${ntarget%/}"
   [[ -n "$nroot" ]] || nroot="/"
   [[ -n "$ntarget" ]] || ntarget="/"
+  # AND IT MAY NOT BE PART OF THE OPERATING SYSTEM (o3d-secops r7 tenth pass, Codex HIGH).
+  #
+  # THE FINDING. The table below names the roots this run PUBLISHES into; it is not an inventory of
+  # every root-owned tree the installer writes. `/opt/one-two-inventory -> /etc/systemd/system`
+  # is disjoint from every entry in it, has an ancestry only root can rebind, and would therefore
+  # have been handed a bind-mount procedure — after which the next run's `rsync -a --delete` and
+  # `chown -R` would operate on the host's unit tree. The same goes for /etc/nginx, /etc/apt,
+  # /etc/logrotate.d and /root/.ssh, each of which this script also writes.
+  #
+  # SO THE RULE IS STATED THE OTHER WAY ROUND, AS AN EXCLUSION, because an inventory of "every
+  # directory this installer might ever write" is a list that goes stale the next time a line is
+  # added — and the question an operator is really being asked is simpler than that: a bind source
+  # is a place data lives, not a part of the operating system. /srv, /mnt, /media, /opt, /var and
+  # /home stay available; the trees the distribution owns do not.
+  for other in / /bin /boot /dev /etc /lib /lib32 /lib64 /libx32 /proc /root /run /sbin /sys /usr; do
+    # `/` IS THE ENTRY THAT NEEDS THE GUARD: `${other%/}` empties it, and the pattern `/*` then
+    # matches every absolute path there is. Only exact equality means anything for the root of the
+    # filesystem, and every other entry keeps the prefix test.
+    if [[ "$ntarget" == "$other" || ( "$other" != "/" && "$ntarget" == "${other%/}/"* ) ]]; then
+      qother="$(printf '%q' "$other")" || qother="a system directory"
+      printf 'ERROR: BUT %s IS INSIDE %s, which belongs to the operating system and not to this application. Binding it onto %s would put a tree the distribution owns where the next run rsyncs, deletes and chowns. This run will not print a command that does that: point the link at a directory that holds data — under /srv, /mnt, /media, /opt, /var or /home — and run the installer again.\n' "$qtarget" "$qother" "$qroot" >&2
+      return 0
+    fi
+  done
   keep="$(publish_trust_root_candidates)" || keep=""
   keep="${keep}
 ${LOG_DIR:-}"

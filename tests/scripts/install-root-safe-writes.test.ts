@@ -5779,7 +5779,21 @@ test('[o3d-secops] a target that is the same directory as the root\'s ancestor u
   assert.equal(run.status, 1, run.stderr)
   assert.ok(!run.stderr.includes('mount --bind'),
     `a target that is the same directory as a managed root must get no bind command: ${run.stderr}`)
-  assert.match(run.stderr, /IS THE SAME DIRECTORY AS|lies inside the other|OVERLAPS/, run.stderr)
+  assert.ok(!run.stderr.includes('/etc/fstab'), 'and no fstab line')
+
+  // WHAT THIS HARNESS CANNOT DO, STATED RATHER THAN GLOSSED: it cannot `mount --bind`, so it cannot
+  // manufacture a pair of textually disjoint paths that are one directory. The mount points that
+  // already exist on a machine are all inside the system trees the exclusion above refuses first,
+  // which is why the run above refuses for that reason rather than on identity. The identity walk
+  // is therefore asserted on the SHIPPED TEXT — both directions, present and bounded — and its
+  // behaviour is measured by the mutation in the neighbouring test, which removes it.
+  const refusal = shellFunction(INSTALL_SH, 'refuse_symlinked_root')
+  assert.match(refusal, /if \[\[ "\$ancid" == "\$ident" \]\]; then/,
+    'the target must be compared against every ancestor of each managed root')
+  assert.match(refusal, /if \[\[ "\$ancid" == "\$otherid" \]\]; then/,
+    'and each managed root against every ancestor of the target — one direction alone misses the other')
+  assert.equal(refusal.split('anc="${anc%/*}"').length - 1, 2, 'both walks must climb, and there must be two of them')
+  assert.equal(refusal.split('[[ "$anc" != "/" ]] || break').length - 1, 2, 'and both must stop at the root of the filesystem')
 })
 
 test('[o3d-secops] a root spelled with repeated slashes is still recognised as overlapping', (t) => {
@@ -5830,4 +5844,68 @@ test('[o3d-secops] a root spelled with repeated slashes is still recognised as o
     [`DATA_DIR=${q(doubled)}`, rawText].join('\n')))
   assert.ok(mutated.stderr.includes('mount --bind'),
     `without the normalisation the doubled spelling gets a bind command: ${mutated.stderr}`)
+})
+
+test('[o3d-secops] a link pointing into a system directory gets no bind command either', (t) => {
+  /**
+   * THE ROOT TABLE IS NOT AN INVENTORY OF EVERYTHING THIS INSTALLER WRITES. It names the roots
+   * publications resolve against; the script also writes /etc/systemd/system, /etc/nginx,
+   * /etc/logrotate.d and /root/.ssh. `/opt/one-two-inventory -> /etc/systemd/system` is disjoint
+   * from every entry in that table and has an ancestry only root can rebind, so every check before
+   * this one passes — and the printed bind would put the host's unit tree where the next run
+   * `rsync -a --delete`s and `chown -R`s.
+   *
+   * The rule is stated as an EXCLUSION rather than as an inventory, because an inventory of "every
+   * directory this installer might ever write" goes stale the next time a line is added, while
+   * "a bind source is where data lives, not part of the operating system" does not.
+   */
+  const base = createTempDirSync('ims-secops-system-', t)
+  const opt = join(base, 'opt')
+  mkdirSync(opt)
+  chmodSync(opt, 0o755)
+
+  // REAL SYSTEM PATHS, and the run is a refusal either way, so nothing is touched by asking.
+  // `/` is not in this list because it never reaches the exclusion: it has no parent, so the
+  // ancestry walk above refuses it first — with a different sentence and, which is what matters
+  // here, no bind command either.
+  for (const target of ['/etc/systemd/system', '/etc', '/usr/lib', '/root']) {
+    const link = join(opt, `link-${target.replace(/\W+/g, '-') || 'root'}`)
+    symlinkSync(target, link)
+    const run = runBash(rig([...ROOT_GATE], GATE_DATA, `DATA_DIR=${q(link)}`))
+    assert.equal(run.status, 1, `${target}: a symlinked root is still refused: ${run.stderr}`)
+    assert.ok(!run.stderr.includes('mount --bind'),
+      `${target}: no bind command may name a system directory: ${run.stderr}`)
+    assert.ok(!run.stderr.includes('/etc/fstab'), `${target}: and no fstab line`)
+    assert.match(run.stderr, /belongs to the operating system/, run.stderr)
+    assert.match(run.stderr, /point the link at a directory that holds data/,
+      `${target}: and the operator must be told what would be acceptable`)
+  }
+
+  // NOT VACUOUS: a data directory outside those trees still gets the whole procedure, so what is
+  // refused is the system tree and not the idea of binding.
+  const disk = join(base, 'srv-disk2')
+  const good = join(disk, 'ims')
+  mkdirSync(good, { recursive: true })
+  chmodSync(disk, 0o755)
+  const goodLink = join(opt, 'link-data')
+  symlinkSync(good, goodLink)
+  const ok = runBash(rig([...ROOT_GATE], GATE_DATA, `DATA_DIR=${q(goodLink)}`))
+  assert.ok(ok.stderr.includes(`mount --bind ${good} ${goodLink}`), ok.stderr)
+  assert.ok(!ok.stderr.includes('belongs to the operating system'), ok.stderr)
+
+  // MEASURED BY MUTATION, ROUTE STATED: the exclusion list emptied, which is where this stood
+  // before this pass. /etc/systemd/system is then handed a bind-mount procedure — the finding,
+  // executed — while every other check in the function still passes on it, which is the point.
+  const shipped = shellFunction(INSTALL_SH, 'refuse_symlinked_root')
+  const listed = shipped.split('\n').find((line) => line.includes('for other in / /bin /boot'))
+  assert.ok(listed, `precondition: the shipped refusal must carry the exclusion list: ${shipped}`)
+  const unguarded = shipped.replace(listed, '  for other in; do')
+  assert.ok(!unguarded.includes('/etc /lib'), 'the mutation must empty the list')
+
+  const unitLink = join(opt, 'link-units')
+  symlinkSync('/etc/systemd/system', unitLink)
+  const mutated = runBash(rig(ROOT_GATE.filter((n) => n !== 'refuse_symlinked_root'), GATE_DATA,
+    [`DATA_DIR=${q(unitLink)}`, unguarded].join('\n')))
+  assert.ok(mutated.stderr.includes('mount --bind /etc/systemd/system'),
+    `without the exclusion the host's unit tree is offered as a bind source: ${mutated.stderr}`)
 })

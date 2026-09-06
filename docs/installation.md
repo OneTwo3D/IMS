@@ -1295,6 +1295,13 @@ says nothing about who may create it. So a root directly under `/tmp` is refused
   ERROR: Move the data under a path only root can rebind — every directory from / down to it owned by root and carrying no group or other write bit, which /srv, /var/lib and /mnt normally are — and run the installer again; it will then print the bind-mount procedure.
   ```
 
+  **And the target may not be part of the operating system.** The root table names the directories
+  publications resolve against; it is not an inventory of everything the installer writes, and
+  `/opt/one-two-inventory -> /etc/systemd/system` would otherwise satisfy every other question. So
+  a target inside `/`, `/bin`, `/boot`, `/dev`, `/etc`, `/lib*`, `/proc`, `/root`, `/run`, `/sbin`,
+  `/sys` or `/usr` gets no command: a bind source is where data lives. `/srv`, `/mnt`, `/media`,
+  `/opt`, `/var` and `/home` stay available.
+
   **And the target may not be the root, an ancestor of it, anything under it, or any other root the
   run writes into** — read from `publish_trust_root_candidates()`, the one table every publication
   already resolves against, plus `LOG_DIR`, so the same refusal answers the same question wherever
