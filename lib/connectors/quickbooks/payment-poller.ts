@@ -232,8 +232,14 @@ type QboParsedLedgerRow = {
   currency: string | null
   /**
    * The code the two amounts were READ against, carried because the SUBTRACTION between them is sized
-   * by the minor unit too and must not re-resolve it from `currency` — which is the STATED code and is
-   * null exactly where the resolved one matters. See `readLedgerDifferenceAsNumber`.
+   * by the minor unit too and must be sized by the SAME one the operands were — see
+   * `readLedgerDifferenceAsNumber`.
+   *
+   * It is deliberately not `currency` (the STATED code) even though nothing today can tell them apart:
+   * an unstated currency and every IMS code the narrow-only rule accepts resolve to the same minor
+   * unit, so both spellings compute the same bound and no test can separate them. The field exists so
+   * that the operands and their difference cannot DRIFT apart if that ever stops being true, which is
+   * the failure this file has closed twice already.
    */
   readCurrency: string | null
   currencySource: LedgerCurrencySource
