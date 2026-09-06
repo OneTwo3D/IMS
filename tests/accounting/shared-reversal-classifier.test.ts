@@ -5,6 +5,7 @@ import {
   classifyRegisteredPayment,
   classifyRegisteredPaymentAgainstListing,
   databaseLedgerFence,
+  ledgerAmountMagnitudeBound,
   listedLedgerPaymentIds,
   parseLedgerAmount,
   zeroPaidIsProvenReversal,
@@ -17,6 +18,7 @@ import {
   ledgerAmountEpsilon,
   qboLedgerAmount,
   qboWithheldReversalReason,
+  resolveLedgerRowCurrency,
 } from '@/lib/connectors/quickbooks/payment-poller'
 import { currencyMinorUnits, toDecimal } from '@/lib/domain/math/decimal'
 
@@ -755,6 +757,49 @@ test('[o3d-psrx r10] the threshold is strictly below one minor unit of the curre
   // An unstated currency takes the finest precision the repository supports.
   assert.ok(ledgerAmountEpsilon(null).lte(ledgerAmountEpsilon('CLF')),
     'an unstated currency must be no more permissive than the finest currency it could be')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-psrx r16 (Codex HIGH 2) — AN UNVERIFIED CURRENCY MAY TIGHTEN A READ AND MAY NEVER LOOSEN ONE.
+// ---------------------------------------------------------------------------
+
+test('[o3d-psrx r16] an IMS currency can never raise the bound above the strictest', () => {
+  // THE RULE, OVER EVERY CURRENCY THE REPOSITORY SUPPORTS, rather than over the two the poller happens
+  // to meet. `resolveLedgerRowCurrency` is handed an unstated `CurrencyRef` and each IMS code in turn,
+  // and the question asked of every answer is the same one: could believing this make the reader
+  // admit a figure the strictest fallback would have refused?
+  const supported = ['GBP', 'USD', 'EUR', 'JPY', 'KRW', 'ISK', 'BHD', 'IQD', 'JOD', 'KWD', 'LYD',
+    'OMR', 'TND', 'CLF', 'UYW', 'VND', 'XOF']
+  const strictestBound = ledgerAmountMagnitudeBound(null)
+  const strictestEpsilon = ledgerAmountEpsilon(null)
+  for (const ims of supported) {
+    const resolved = resolveLedgerRowCurrency(undefined, ims)
+    assert.equal(resolved.stated, null, `${ims}: nothing was stated, and an inference is never stated`)
+    assert.ok(ledgerAmountMagnitudeBound(resolved.read) <= strictestBound,
+      `${ims}: an unverified IMS currency must not select a LARGER magnitude bound than the unstated `
+      + 'fallback — a coarser bound admits a decode collapse the bound exists to refuse')
+    assert.ok(ledgerAmountEpsilon(resolved.read).lte(strictestEpsilon),
+      `${ims}: nor a larger epsilon, which would discard a real minor unit as nothing`)
+  }
+
+  // AND THE TWO ANSWERS IT ACTUALLY GIVES, so this cannot pass by refusing to resolve anything.
+  // A currency at least as fine as the fallback is accepted and labelled; a coarser one is not used
+  // at all, and the row is recorded as having no binding rather than a borrowed one.
+  assert.deepEqual(resolveLedgerRowCurrency(undefined, 'CLF'),
+    { stated: null, read: 'CLF', source: 'IMS_DOCUMENT' },
+    'four decimals is the finest precision supported, so believing it loosens nothing')
+  assert.deepEqual(resolveLedgerRowCurrency(undefined, 'GBP'),
+    { stated: null, read: null, source: 'NONE' },
+    'THE FINDING: two decimals is COARSER than the fallback, so it is not used — this is the exact '
+    + 'substitution that let 600000000000.0003 and 600000000000.0002 collapse into one reading')
+  assert.deepEqual(resolveLedgerRowCurrency(undefined, 'not-a-currency'),
+    { stated: null, read: null, source: 'NONE' })
+
+  // THE LEDGER'S OWN STATEMENT IS UNAFFECTED AND STILL WINS, including over a finer IMS code — it is
+  // the only source anything has actually vouched for.
+  assert.deepEqual(resolveLedgerRowCurrency({ value: 'GBP' }, 'CLF'),
+    { stated: 'GBP', read: 'GBP', source: 'LEDGER' },
+    'a currency QuickBooks stated is authoritative, and it is not second-guessed by an IMS column')
 })
 
 // ---------------------------------------------------------------------------
