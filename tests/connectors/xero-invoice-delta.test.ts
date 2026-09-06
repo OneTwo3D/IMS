@@ -12,6 +12,7 @@ import {
   ledgerDifferenceMagnitudeBound,
   parseLedgerAmount,
   partitionPaymentReversals,
+  readDecimalAsNumber,
   listedLedgerPaymentIds,
   unregisteredLocalReceipts,
   MAX_CHUNKS_PER_POLL,
@@ -730,12 +731,22 @@ test('[o3d-psrx r11] ordinary decimal money still reads exactly as it always did
     [' 42.5 ', 42.5],
     ['-12.34', -12.34],
     ['+7.5', 7.5],
-    ['1234567.8901', 1234567.8901],
-    ['0.001', 0.001],
   ]
   for (const [value, expected] of accepted) {
     assert.equal(parseLedgerAmount(value, 'GBP'), expected, `${JSON.stringify(value)} is decimal money and must read as ${expected}`)
   }
+  // o3d-psrx r18 (Codex HIGH 1) — AND `'1234567.8901'` AND `'0.001'` MOVED OUT OF THIS LIST, because
+  // "ordinary decimal money" is a question about a CURRENCY and this list was asking it of GBP. Four
+  // decimals is ordinary in CLF and three in KWD; in a two-decimal currency they are figures the
+  // ledger cannot state, and since r18 the string arm refuses them exactly as the number arm has
+  // since r16. They are still read — in the currencies that have those decimals.
+  assert.equal(parseLedgerAmount('1234567.8901', 'CLF'), 1234567.8901,
+    'four decimals is ordinary money in a four-decimal currency')
+  assert.equal(parseLedgerAmount('0.001', 'KWD'), 0.001, 'and three in a three-decimal one')
+  assert.equal(parseLedgerAmount('1234567.8901', 'GBP'), null,
+    'THE r18 FINDING: the same text in GBP is a figure that currency cannot hold, and the string arm '
+    + 'used to read it while the identical double was refused')
+  assert.equal(parseLedgerAmount('0.001', 'GBP'), null)
   // And the number branch is untouched: QuickBooks and Xero both serialise money as JSON numbers in
   // normal operation, so this is the path production actually takes.
   assert.equal(parseLedgerAmount(0, 'GBP'), 0)
@@ -773,25 +784,60 @@ test('[o3d-psrx r12] a figure too small to survive conversion is UNREADABLE, nev
   assert.equal(parseLedgerAmount('12345678901234567890', 'GBP'), null,
     'and a twenty-digit figure reads back as ...567000')
 
-  // o3d-psrx r14 KEEPS THIS TEST HONEST. The two figures above are ALSO above the magnitude bound r14
-  // added, so on their own they would now be refused by that check and this test would have stopped
-  // exercising the round trip it was written for. This one is 1.23e9 — four orders of magnitude BELOW
-  // the two-decimal bound of 2^46 — so nothing but the losslessness comparison can refuse it, and
-  // mutating that comparison alone still fails here.
-  assert.equal(parseLedgerAmount('1234567890.123456789', 'GBP'), null,
-    'a figure well inside the magnitude bound that still reads back as ...4567 — refused by the round '
-    + 'trip and by nothing else')
+  // o3d-psrx r14 KEPT THIS TEST HONEST, AND r18 HAD TO RE-EARN IT. r14's answer was
+  // `'1234567890.123456789'` — well inside the magnitude bound, so only the round trip could refuse
+  // it. Since r18 the SCALE rule refuses it first (nine decimals in a two-decimal currency), so it no
+  // longer reaches the comparison it was chosen to exercise and asserting it here would be proving
+  // that some guard fired, not that this one did.
+  //
+  // THE FIGURE THAT STILL REACHES THE ROUND TRIP has to be valid in its currency and lossy anyway:
+  // two decimals, in GBP, at a magnitude where the double spacing is wider than a penny. The string
+  // arm carries NO magnitude bound (r15), so nothing else in the reader can refuse it — and the pair
+  // below is the proof, because the two differ only in the last digit and only one of them survives.
+  assert.equal(parseLedgerAmount('70368744177664.01', 'GBP'), null,
+    'a perfectly-scaled GBP figure whose nearest double is named ...664.02 — refused by the round trip '
+    + 'and by nothing else, since the string arm has no magnitude rule')
+  assert.equal(parseLedgerAmount('17592186044416.02', 'GBP'), 17592186044416.02,
+    'CONTROL: the same shape one binade down IS its own double\'s name, so the round trip admits it — '
+    + 'a size rule would have refused both')
+
+  // AND THE UNDERFLOW HALF OF THE GUARD, ASKED AT ITS OWN DOOR. `readDecimalAsNumber` is what refuses
+  // a figure whose `toNumber()` is a fabricated zero, and after r18 no currency's scale admits a
+  // 400-decimal token, so `parseLedgerAmount` can no longer carry one to it. The guard is still spent
+  // on every derived amount (`readLedgerDifferenceAsNumber`, `qboLedgerAmountFrom`), so it is tested
+  // where it lives rather than through a door that is now shut.
+  assert.equal(readDecimalAsNumber(toDecimal(tooSmall)), null,
+    'a decimal whose double is 0 must be UNREADABLE at the conversion itself — zero is the reading '
+    + 'that clears paidAt')
+  assert.equal(readDecimalAsNumber(toDecimal('9007199254740993')), null)
+  assert.equal(readDecimalAsNumber(toDecimal('0.01')), 0.01, 'CONTROL: an exact one still converts')
 })
 
 test('[o3d-psrx r12] the refusal is LOSSLESSNESS, not smallness: a tiny figure that converts exactly is read', () => {
-  // THE CONTROL THAT STOPS THE FIX BEING "REFUSE SMALL NUMBERS". This is far below any money
-  // threshold in the repository and it converts EXACTLY, so there is nothing wrong with it and the
-  // reader must return it. A magnitude-based guard would have refused it; the round trip does not.
-  assert.equal(parseLedgerAmount('0.0000000000000000000000001', 'GBP'), 1e-25)
+  // THE CONTROL THAT STOPS THE FIX BEING "REFUSE SMALL NUMBERS", RE-AIMED BY r18.
+  //
+  // r12's control was `'0.0000000000000000000000001'` in GBP — twenty-five decimals, chosen because
+  // it converts EXACTLY and a magnitude guard would have refused it. Since r18 that figure is refused,
+  // and for a reason that has nothing to do with its size: a twenty-five-decimal amount is not a
+  // figure a two-decimal currency can state, however exactly it converts. So the control is asked in
+  // the currency that CAN state a small figure, and the claim it makes is unchanged — the reader
+  // refuses LOSS, not SMALLNESS.
+  assert.equal(parseLedgerAmount('0.0001', 'CLF'), 0.0001,
+    'one minor unit of the finest currency the repository supports is small, exact, and must be read')
+  assert.equal(parseLedgerAmount('0.001', 'KWD'), 0.001)
+  assert.equal(parseLedgerAmount('0.0000000000000000000000001', 'GBP'), null,
+    'and the twenty-five-decimal figure is refused for its SCALE — not its size, which is what the '
+    + 'assertions above establish')
+  // AND IT IS NOT A SIZE RULE AT THE OTHER END EITHER: a huge figure that is exact in its currency is
+  // read (the string arm has no magnitude bound), while one a penny along that is NOT its own double's
+  // name is refused. Same magnitude, opposite answers, so nothing here is deciding on size.
+  assert.equal(parseLedgerAmount('1649267441664', 'CLF'), 1649267441664)
+  assert.equal(parseLedgerAmount('17592186044416.02', 'GBP'), 17592186044416.02)
+  assert.equal(parseLedgerAmount('70368744177664.01', 'GBP'), null)
   // And the ordinary case is untouched — the half of the change that matters every single poll.
   const unchanged: [string, number][] = [
     ['0', 0], ['0.00', 0], ['50.00', 50], ['-12.34', -12.34], ['+7.5', 7.5],
-    ['1234567.8901', 1234567.8901], ['0.001', 0.001], ['100.10', 100.1], ['0.1', 0.1],
+    ['100.10', 100.1], ['0.1', 0.1],
   ]
   for (const [value, expected] of unchanged) {
     assert.equal(parseLedgerAmount(value, 'GBP'), expected,
@@ -1342,21 +1388,38 @@ test('[o3d-psrx r15] a STRING carries its own evidence, so the round trip govern
     'the same value as a decoded number is still refused — the bound stayed where its premise holds')
   assert.equal(parseLedgerAmount(8796093022208, 'KWD'), null)
 
-  // AND THE STRING ARM IS STRICTER, NOT LOOSER. These are refused at magnitudes far BELOW every bound,
-  // because the round trip asks a question about the value rather than about its size — including the
-  // three-decimal GBP figure the r15 HIGH is about, which no magnitude rule can refuse in general.
+  // AND THE STRING ARM IS STRICTER, NOT LOOSER — but only about MAGNITUDE, and r18 is where that
+  // sentence had to be corrected. These two are refused at magnitudes far BELOW every candidate
+  // bound; since r18 they are refused by the SCALE rule before the round trip is reached, because
+  // three decimals is not a figure GBP can state whatever double answers to it.
   assert.equal(parseLedgerAmount('35184372088832.003', 'GBP'), null,
-    'no double answers to these digits, so it is refused — and the bound would admit it lower down')
+    'three decimals in a two-decimal currency: refused for its scale, and the bound would admit it '
+    + 'lower down')
   assert.equal(parseLedgerAmount('17592186044416.002', 'GBP'), null,
-    'and the same at 2^44, which is below EVERY candidate bound — the round trip is not a size rule')
-  // THE LIMIT OF THE CLAIM, stated rather than glossed: what the round trip establishes is that the
-  // number's own decimal reading IS this text, not that the text is exact in the reals. A text that
-  // is a double's own shortest name passes, and passing is what makes it safe — every later step
-  // re-derives the decimal the same way, so the value can never disagree with the text downstream.
-  assert.equal(parseLedgerAmount('17592186044416.008', 'GBP'), 17592186044416.008,
+    'and the same at 2^44, which is below EVERY candidate bound — neither rule here is a size rule')
+  // THE ROUND TRIP IS STILL THE ONE DECIDING, and it is asked of figures whose SCALE is beyond
+  // reproach so that nothing else can be doing the refusing. Two GBP amounts, both two decimals, one
+  // binade apart: the lower IS its own double's name and is read at a magnitude no bound would allow,
+  // the upper is not and is refused. That pair is what the arm split buys and it is measured here.
+  assert.equal(parseLedgerAmount('17592186044416.02', 'GBP'), 17592186044416.02,
     'a string that IS a double\'s own name is read, and reads back as itself everywhere after this')
+  assert.equal(parseLedgerAmount('70368744177664.01', 'GBP'), null,
+    'and one that is not — its nearest double is named ...664.02 — is refused at ANY magnitude')
   assert.equal(parseLedgerAmount('9007199254740993', 'GBP'), null)
-  assert.equal(parseLedgerAmount('1234567890.123456789', 'GBP'), null)
+
+  // o3d-psrx r18 (Codex HIGH 1) — AND THE SCALE RULE IS NOT AN ARM'S PROPERTY AT ALL. r15's claim was
+  // that a string carries its own evidence and so needs no rule about values of its SIZE. True, and it
+  // does not transfer: the round trip proves the number IS the text it came from, not that the text is
+  // an amount this currency can hold. So the two forms of one figure now agree, which is the property
+  // this whole finding is about.
+  for (const [text, value] of [['0.005', 0.005], ['99.999', 99.999], ['0.0001', 0.0001]] as const) {
+    assert.equal(parseLedgerAmount(text, 'GBP'), parseLedgerAmount(value, 'GBP'),
+      `${text}: a string and a number of the same value must classify identically in GBP`)
+    assert.equal(parseLedgerAmount(text, 'GBP'), null, `${text}: and in GBP that answer is REFUSED`)
+  }
+  assert.equal(parseLedgerAmount('0.005', 'KWD'), parseLedgerAmount(0.005, 'KWD'),
+    'and identically again in a currency that CAN state it')
+  assert.equal(parseLedgerAmount('0.005', 'KWD'), 0.005, 'where the answer is that it is money')
 })
 
 test('[o3d-psrx r15] the bound is TIGHT for what it can guarantee: one binade lower refuses readable money', async () => {

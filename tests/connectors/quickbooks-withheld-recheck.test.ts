@@ -674,12 +674,10 @@ test('[o3d-psrx r10] the smallest amount a 3-decimal currency can hold is not tr
   state.syncLogs = [postedRegistration()]
   // KWD is a 3-decimal currency: 0.001 is ONE minor unit, the smallest amount that can exist in it.
   //
-  // o3d-psrx r16 — THE BALANCE IS A STRING ON BOTH SIDES OF THIS PAIR, and it has to be for the pair
-  // to stay a pair. `99.999` is three decimals; in GBP that is finer than the currency's own minor
-  // unit, so as a decoded JSON NUMBER the control below would be refused for its SCALE and the two
-  // outcomes would then differ for two reasons at once. As text the digits are still there, both arms
-  // read the figure exactly, and the only thing left that can separate the outcomes is the currency —
-  // which is what this test is about. The number form is asserted separately at the end.
+  // o3d-psrx r16 wrote this balance as a STRING so it would clear the scale rule that had just been
+  // put on the number arm, and r18 (Codex HIGH 1) took that escape away: the scale rule belongs to the
+  // CURRENCY and both arms now ask it. The figure is left as text because that is how QuickBooks can
+  // serialise it, and the number form is asserted alongside — the two must now AGREE.
   state.qboDocuments.set('QI1', { Id: 'QI1', Balance: '99.999', TotalAmt: 100, CurrencyRef: { value: 'KWD' } })
   state.deltaBalanceDue = ['QI1']
 
@@ -693,38 +691,43 @@ test('[o3d-psrx r10] the smallest amount a 3-decimal currency can hold is not tr
   assert.equal(marker?.metadata?.registrationVerdict, 'LEDGER_PARTIALLY_PAID')
   assert.equal(marker?.metadata?.ledgerCurrency, 'KWD')
 
-  // THE CONTROL, and it is the whole proof that the threshold is currency-derived rather than merely
-  // smaller: the SAME figures in a two-decimal currency really are nothing. 0.001 GBP is not an
-  // amount that exists, so the ledger holds nothing and a genuine chargeback still reverses.
+  // o3d-psrx r18 (Codex HIGH 1) — THE SAME TEXT IN GBP IS NOT "NOTHING", IT IS UNREADABLE, AND BOTH
+  // ARMS NOW SAY SO. r16's control asserted that `'99.999'` in GBP reversed (0.001 GBP being below
+  // the two-decimal epsilon) while the identical DOUBLE did not, and that split is exactly the
+  // finding. A three-decimal figure is malformed for a two-decimal currency however it arrived, so
+  // the two forms are asserted against EACH OTHER here rather than against opposite outcomes.
+  for (const balance of ['99.999', 99.999] as const) {
+    reset()
+    state.salesOrders = [paidOrderRow()]
+    state.syncLogs = [postedRegistration()]
+    state.qboDocuments.set('QI1', { Id: 'QI1', Balance: balance, TotalAmt: 100, CurrencyRef: { value: 'GBP' } })
+    state.deltaBalanceDue = ['QI1']
+
+    const gbp = await poll()
+    assert.equal(gbp.salesReversed, 0,
+      `${typeof balance}: a three-decimal GBP balance is refused rather than read, and a refusal is `
+      + 'never spent as a proven zero')
+    assert.equal(gbp.salesReversalsWithheld, 1, 'and the withholding is reported, not silently dropped')
+    assert.deepEqual(state.chargebacks, [], 'so no chargeback credit note is raised on it either')
+  }
+
+  // THE CONTROL, and it is what stops the fix being "reverse nothing": a ledger that states the WHOLE
+  // document is outstanding really does hold nothing, and a genuine chargeback still reverses. After
+  // r18 this is the only shape a stated zero can take — every admitted figure is a whole multiple of
+  // its minor unit, so "below half a minor unit" and "exactly zero" are the same set. The DERIVATION
+  // of the epsilon from the currency is pinned directly in
+  // tests/accounting/shared-reversal-classifier.test.ts, which is where it can still be measured.
   reset()
   state.salesOrders = [paidOrderRow()]
   state.syncLogs = [postedRegistration()]
-  state.qboDocuments.set('QI1', { Id: 'QI1', Balance: '99.999', TotalAmt: 100, CurrencyRef: { value: 'GBP' } })
+  state.qboDocuments.set('QI1', { Id: 'QI1', Balance: '100.00', TotalAmt: 100, CurrencyRef: { value: 'GBP' } })
   state.deltaBalanceDue = ['QI1']
 
-  const gbp = await poll()
-  assert.equal(gbp.salesReversed, 1,
-    'the same figures in GBP ARE nothing — a threshold that is simply smaller everywhere would have '
-    + 'switched this reversal off too, and narrowing the pass is not the same as disabling it')
-  assert.equal(gbp.partiallyPaidDocuments, 0)
+  const gbpZero = await poll()
+  assert.equal(gbpZero.salesReversed, 1,
+    'nothing settled IS nothing — narrowing the pass is not the same as disabling it')
+  assert.equal(gbpZero.partiallyPaidDocuments, 0)
   assert.deepEqual(state.chargebacks, ['so_1'])
-
-  // o3d-psrx r16 — AND THE SAME GBP FIGURE AS A DECODED NUMBER REVERSES NOTHING, because a
-  // three-decimal reading of a two-decimal currency cannot be shown to have been quantized. This is
-  // what makes the string form above a deliberate choice: it isolates the currency, and this line
-  // says out loud what the other variable would have done.
-  reset()
-  state.salesOrders = [paidOrderRow()]
-  state.syncLogs = [postedRegistration()]
-  state.qboDocuments.set('QI1', { Id: 'QI1', Balance: 99.999, TotalAmt: 100, CurrencyRef: { value: 'GBP' } })
-  state.deltaBalanceDue = ['QI1']
-
-  const gbpNumeric = await poll()
-  assert.equal(gbpNumeric.salesReversed, 0,
-    'as a JSON number the same balance is finer than a penny, so it is refused rather than read, and '
-    + 'a refusal is never spent as a proven zero')
-  assert.equal(gbpNumeric.salesReversalsWithheld, 1)
-  assert.deepEqual(state.chargebacks, [])
 })
 
 // ---------------------------------------------------------------------------
