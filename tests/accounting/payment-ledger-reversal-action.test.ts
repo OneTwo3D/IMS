@@ -38,7 +38,7 @@ type PaymentRow = { id: string; orderId: string; refundId: string | null; amount
 const state = {
   permissions: new Set<string>(['sales.refund']),
   freshAuthFails: false,
-  order: { id: 'order-1', orderNumber: 'SO-1001', externalOrderNumber: null as string | null, currency: 'GBP', totalForeign: 100, status: 'SHIPPED', paidAt: null as Date | null, accountingInvoiceId: 'INV-abc' as string | null },
+  order: { id: 'order-1', orderNumber: 'SO-1001', externalOrderNumber: null as string | null, currency: 'GBP', totalForeign: 100 as number | string, status: 'SHIPPED', paidAt: null as Date | null, accountingInvoiceId: 'INV-abc' as string | null },
   payments: [] as PaymentRow[],
   syncRows: [] as SyncRow[],
   activity: [] as Array<Record<string, unknown>>,
@@ -1155,4 +1155,62 @@ test('the receipt panel offers the undecided attempt somewhere to go, and refuse
   // another invoice"), and a field that disappeared on the first typo would restore the dead end.
   assert.match(panel, /\{undecidedAttempt === p\.id && \(/)
   assert.match(panel, /setUndecidedAttempt\(result\.code === 'registration_attempt_undecided' \? p\.id : null\)/)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-psrx r18 (Codex HIGH 2) — THE REMOVAL PATH WEIGHS THE STORED DECIMALS TOO.
+//
+// `removePaymentAndSettlePaidAt` is the third caller of `coversDocumentTotal`, and it decides whether
+// a document that just lost a receipt is still settled. It summed `Payment.amount` and read
+// `SalesOrder.totalForeign` through `Number(...)`, and neither column fits in a double at four
+// decimals across its range: at 549755813888 (2^39) the neighbouring doubles are about 0.00012 apart.
+// So an order left one whole minor unit short of its total read as still fully paid, `paidAt` stayed
+// set, and the UI went on showing a document as settled by receipts that fall short of it.
+//
+// ROUTE: the real `deletePayment`, through the real transaction, asserting on the write it issues.
+// MUTATION: put `Number(...)` back around either operand in `removePaymentAndSettlePaidAt` and the
+// headline fails — the remaining receipt collapses onto the order total and `paidAt` survives.
+// ---------------------------------------------------------------------------
+
+/** Two valid four-decimal amounts one whole minor unit apart, indistinguishable as doubles. */
+const R18_SHORT = '549755813888.0002'
+const R18_TOTAL = '549755813888.0003'
+
+test('[o3d-psrx r18] a removal leaving the order ONE MINOR UNIT short clears paidAt', async () => {
+  const { deletePayment } = await loadActions()
+  assert.equal(Number(R18_SHORT), Number(R18_TOTAL),
+    'PRECONDITION: the two stored values collapse onto one double — the finding itself')
+
+  state.order = { ...state.order, currency: 'CLF', totalForeign: R18_TOTAL }
+  state.payments = [
+    { id: 'pay-1', orderId: 'order-1', refundId: null, amount: '0.0001', currency: 'CLF' },
+    { id: 'pay-2', orderId: 'order-1', refundId: null, amount: R18_SHORT, currency: 'CLF' },
+  ]
+  // CANCELLED with no document id is the one status that lets a receipt go — see the case above — so
+  // the delete reaches the settlement write instead of being refused by the ledger hold.
+  state.syncRows = [syncRow({ status: 'CANCELLED', externalTransactionId: null })]
+
+  const result = await deletePayment('pay-1', 'order-1')
+  assert.equal(result.success, true, JSON.stringify(result))
+  assert.ok(!paymentStillThere(), 'PRECONDITION: the receipt really was removed')
+  assert.equal(state.order.paidAt, null,
+    'THE FINDING: what is left is one whole minor unit short of the order, so the document is no '
+    + 'longer settled by its receipts and paidAt must go with them')
+})
+
+test('[o3d-psrx r18] CONTROL: a removal the remaining receipts still cover leaves paidAt alone', async () => {
+  const { deletePayment } = await loadActions()
+  state.order = { ...state.order, currency: 'CLF', totalForeign: R18_TOTAL }
+  state.payments = [
+    { id: 'pay-1', orderId: 'order-1', refundId: null, amount: '0.0001', currency: 'CLF' },
+    { id: 'pay-2', orderId: 'order-1', refundId: null, amount: R18_TOTAL, currency: 'CLF' },
+  ]
+  state.syncRows = [syncRow({ status: 'CANCELLED', externalTransactionId: null })]
+
+  const result = await deletePayment('pay-1', 'order-1')
+  assert.equal(result.success, true, JSON.stringify(result))
+  assert.ok(!paymentStillThere())
+  assert.notEqual(state.order.paidAt, null,
+    'an over-payment being removed does not unsettle a document the rest of the receipts still cover '
+    + '— a rule that cleared here would re-arm Mark Paid over money that has already moved')
 })
