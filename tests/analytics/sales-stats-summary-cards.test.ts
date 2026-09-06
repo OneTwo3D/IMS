@@ -181,3 +181,57 @@ test('cards: an UNSTAMPED credit bounds the cards too, by its own amount (o3d-ii
   assert.match(card(html, 'Net Revenue'), /£100\.00 ≤/)
   assert.match(card(html, 'Net Revenue'), /Upper bound — £30\.00 of refunds not subtracted/)
 })
+
+// ---------------------------------------------------------------------------
+// o3d-7jfq: THE CARDS AND CELLS STOP DERIVING `≤` FROM A BOOLEAN
+// ---------------------------------------------------------------------------
+
+/** The same £100 sale, credited +£120 and −£120 on the GROSS basis — a credit and its reversal. */
+const OPPOSITE_GROSS_CREDITS: OrderRefund[] = [
+  { totalsBasis: 'GROSS', lines: [{ productId: 'p1', qty: 1, totalBase: 120 }] },
+  { totalsBasis: 'GROSS', lines: [{ productId: 'p1', qty: -1, totalBase: -120 }] },
+]
+
+test('cards: a cancelled gross bucket prints `?`, not `≤`, and quotes no width (o3d-7jfq)', async () => {
+  const { summary, html } = await renderPage(OPPOSITE_GROSS_CREDITS)
+  // The producer's own numbers first, so the render assertion is not the only thing under test.
+  assert.equal(summary.totalRefundsGrossBasis, 0, 'the signed column really is zero; that is the trap')
+  assert.equal(summary.refundBasisComplete, false)
+  assert.equal(summary.totalNetRevenue, 100)
+  assert.equal(summary.netRevenueBound, 'indeterminate')
+
+  const netRevenue = card(html, 'Net Revenue')
+  // `summaryLinearBound = summaryIsBounded ? 'upper' : 'exact'` printed "£100.00 ≤" here, and the
+  // sentence under it read "Upper bound — £0.00 of refunds not subtracted" — a claimed ceiling and
+  // a claimed width of nothing, on a figure whose truth lies anywhere in [-£20, £220].
+  assert.match(netRevenue, /£100\.00 \?/)
+  assert.doesNotMatch(netRevenue, /≤/)
+  assert.doesNotMatch(netRevenue, /£0\.00 of refunds not subtracted/)
+  assert.match(netRevenue, /Direction not established — some credit this figure could not subtract is negative/)
+
+  // Gross Profit moves with net revenue one for one, so it carries the same verdict.
+  assert.match(card(html, 'Gross Profit'), /£60\.00 \?/)
+})
+
+test('cards: the same period with both entries POSITIVE still prints ≤ and its width (o3d-7jfq control)', async () => {
+  const { summary, html } = await renderPage([
+    { totalsBasis: 'GROSS', lines: [{ productId: 'p1', qty: 1, totalBase: 120 }] },
+    { totalsBasis: 'GROSS', lines: [{ productId: 'p1', qty: 1, totalBase: 120 }] },
+  ])
+  assert.equal(summary.totalRefundsGrossBasis, 240)
+  assert.equal(summary.netRevenueBound, 'upper')
+
+  const netRevenue = card(html, 'Net Revenue')
+  assert.match(netRevenue, /£100\.00 ≤/)
+  assert.match(netRevenue, /Upper bound — £240\.00 of refunds not subtracted/)
+})
+
+test('the Net Revenue table CELL and its footer carry the same verdict as the card (o3d-7jfq)', async () => {
+  // The cells read `refundBasisComplete` directly, so fixing the cards alone would have left the
+  // table below them printing `≤` on the identical figure.
+  const { html } = await renderPage(OPPOSITE_GROSS_CREDITS)
+  const table = html.slice(html.indexOf('Net Revenue', html.indexOf('Orders / Qty')))
+  assert.match(table, /£100\.00 \?/, 'the row cell')
+  assert.doesNotMatch(table, /£100\.00 ≤/)
+  assert.doesNotMatch(table, /£60\.00 ≤/, 'and the Profit cell beside it')
+})
