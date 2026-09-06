@@ -3067,10 +3067,15 @@ test('[o3d-secops] a report that reaches one of the four sinks fails the sink ce
  *
  * ROUTE: shellAssignments().position and .replaces on each form, against bash's own answer.
  *
- * MUTATION: make `replaces` ignore the position (`replaces: !append`) and the prefix and argument
- * rows go red; make it ignore the append (`replaces: position === 'assignment' || position ===
- * 'operand'`) and the append row goes red instead. Both edits were made and this test run under
- * each.
+ * MUTATION, one per row, each edit made and this test run under it:
+ *   `replaces: !append`                    — the position ignored; the PREFIX row goes red.
+ *   `operand.position = 'operand'` for a    — a post-command argument taken for a declaration
+ *   word after a non-declaration command      operand; the ARGUMENT row goes red.
+ *   `replaces: position === 'assignment'    — the append ignored; the APPEND row goes red.
+ *     || position === 'operand'`
+ * The last one leaves the census test below still green on its own, because appendedTo bars an
+ * appended name there as well; dropping BOTH guards is what turns that row red, and that was run
+ * too. Belt and braces, said out loud rather than left to look like one guard.
  */
 test('[o3d-secops] the assignment reader says which words REPLACE a name and which only look like it', (t) => {
   const bashLeaves = (form: string): string => {
@@ -3231,11 +3236,20 @@ test('[o3d-secops] a shell word is evaluated whole, and what cannot be evaluated
  * which is where the indirection refusal is SCOPED by the statement rather than unconditional, so a
  * missed alias really does produce nothing there.
  *
- * MUTATION: drop the `if (!held.replaces) continue` gate and all three false-alias rows go red
- * (each conditional falls silent); restore the r5 reader (`/^(?:(NAME)|"(NAME)"|'(NAME)')$/`) as
- * aliasedName() and the concatenated row goes red; make aliasedName() return `settled` instead of
- * `refuse` and the assembled-name row goes red. All three edits were made and this test run under
- * each.
+ * MUTATION, each edit made and this test run under it:
+ *   drop `if (!held.replaces) continue`     — the PREFIX row goes red: `ref` is promoted and the
+ *                                             gate falls silent. With the append filter and
+ *                                             appendedTo both dropped the APPEND row goes red the
+ *                                             same way, and with a post-command argument
+ *                                             classified as a declaration operand, the ARGUMENT
+ *                                             row does.
+ *   restore the r5 reader                   — the CONCATENATED row goes red: the alias is not
+ *     `/^(?:(N)|"(N)"|'(N)')$/`               followed, so the `${!ref}` it feeds is skipped.
+ *   drop the quoting veto in                — the same row goes red for the other half of the
+ *     classifyAssignmentPositions()           reason: `"DB_FENCE"_PROBE'_REASON'` reads as two
+ *                                             words and the assignment is demoted to a prefix.
+ *   make aliasedName() return `settled`     — the ASSEMBLED-NAME row goes red: nothing is refused.
+ *     where it returns `refuse`
  */
 test('[o3d-secops] a false alias does not silence a conditional, and a concatenated one is still followed', () => {
   const DEPLOY_INDEX = 1 + ENTRYPOINTS.indexOf('scripts/deploy.sh')
