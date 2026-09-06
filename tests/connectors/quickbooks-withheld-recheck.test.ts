@@ -893,3 +893,68 @@ test('[o3d-psrx r12] CONTROL: an unreadable TotalAmt of ZERO is not read as a vo
   assert.deepEqual(state.salesOrderUpdates.filter((u) => u.data.paidAt === null), [])
   assert.equal(only.salesReversalsWithheld, 1)
 })
+
+// ---------------------------------------------------------------------------
+// o3d-psrx r15 (Codex MEDIUM 2) — A MISSING `CurrencyRef` IS THE ORDINARY SHAPE, NOT AN UNKNOWN.
+//
+// r14 sized the magnitude bound by the row's own `CurrencyRef` and gave an unstated currency the
+// FINEST supported minor unit — the strictest bound — on the "unstated means be stricter" rule. But
+// QuickBooks omits `CurrencyRef` on EVERY document whenever multicurrency is disabled, so the
+// strictest reading was being applied to the normal single-currency shape: a base-currency row of
+// `TotalAmt = Balance = 600000000000` became entirely unreadable, its reversal was withheld, and the
+// identical row tagged `GBP` reversed. A guard that fires on ordinary documents is a guard somebody
+// deletes.
+//
+// THIS DRIVES THE POLLER, not the reader, and that is the point of putting it here: the fix is a
+// piece of WIRING — the candidate query must select the order's `currency` column, and the value must
+// reach `parseLedgerAmount` through the read that produced the amounts. A test that called the reader
+// with a currency in hand would sail over the whole of it, which is the same mistake r3's finding was.
+// ---------------------------------------------------------------------------
+
+test('[o3d-psrx r15] an ordinary QuickBooks row with NO CurrencyRef is READ, not refused', async () => {
+  reset()
+  // Codex's reproduction, and an entirely ordinary document: a base-currency amount that fits the
+  // money column, far below the two-decimal bound and far ABOVE the four-decimal one.
+  state.salesOrders = [{ ...paidOrderRow(), currency: 'GBP' }]
+  state.syncLogs = [postedRegistration()]
+  state.qboDocuments.set('QI1', { Id: 'QI1', Balance: 600000000000, TotalAmt: 600000000000 })
+  state.deltaBalanceDue = ['QI1']
+
+  const polled = await poll()
+
+  assert.equal(polled.salesReversed, 1,
+    'THE REGRESSION: with the currency resolved from the IMS order this row is READ — paid is zero, '
+    + 'the ledger has been shown to hold nothing, and the reversal proceeds exactly as it does for '
+    + 'the identical row carrying an explicit CurrencyRef')
+  assert.equal(polled.salesReversalsWithheld, 0)
+  assert.deepEqual(state.activity.filter((a) => a.action === 'payment_reversal_withheld'), [],
+    'and nothing is withheld, so no operator is sent to look at a document whose amounts are ordinary')
+})
+
+test('[o3d-psrx r15] and with NO currency anywhere the refusal NAMES the binding, instead of blaming the ledger', async () => {
+  reset()
+  // THE ROUTE, AND THE MUTATION CONTROL FOR THE TEST ABOVE: the only difference from it is that the
+  // IMS order records no currency either. If the poller stopped selecting `currency`, or stopped
+  // passing it to the read, the test above would land here — so these two are each other's proof.
+  state.salesOrders = [paidOrderRow()]
+  state.syncLogs = [postedRegistration()]
+  state.qboDocuments.set('QI1', { Id: 'QI1', Balance: 600000000000, TotalAmt: 600000000000 })
+  state.deltaBalanceDue = ['QI1']
+
+  const polled = await poll()
+
+  assert.equal(polled.salesReversed, 0,
+    'nothing can size these figures, so they are read against the finest minor unit and refused — '
+    + 'and a refusal is never spent as a proven zero')
+  assert.equal(polled.salesReversalsWithheld, 1)
+  const marker = state.activity.find((a) => a.action === 'payment_reversal_withheld')
+  assert.equal(marker?.metadata?.registrationVerdict, 'LEDGER_NOT_PROVEN_ZERO_PAID')
+  assert.equal(marker?.metadata?.currencyUnbound, true,
+    'the binding defect is a QUERYABLE field and not only a sentence — the r9 lesson about figures '
+    + 'that exist nowhere but inside English')
+  assert.match(marker?.description ?? '', /CurrencyRef/,
+    'and the sentence names the currency binding, because the QuickBooks document an operator would '
+    + 'be sent to look at is perfectly ordinary — the defect is on the IMS side')
+  assert.doesNotMatch(marker?.description ?? '', /figures IMS cannot read a removal out of/,
+    'and it does NOT borrow the sentence for a ledger that answered with an unreadable amount')
+})

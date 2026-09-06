@@ -21,6 +21,7 @@ import {
   type InvoiceFetcher,
   type XeroInvoice,
 } from '@/lib/connectors/xero/invoice-delta'
+import { subtractMoney } from '@/lib/domain/math/decimal'
 
 const SINCE = new Date('2026-07-17T12:00:00.000Z')
 
@@ -1212,21 +1213,110 @@ test('[o3d-psrx r14] an amount above the bound is UNREADABLE — 3-decimal, deco
   }
 })
 
-test('[o3d-psrx r14] the bound is enforced on the STRING arm too, where the round trip cannot see it', () => {
-  // A STRING figure reaches `readDecimalAsNumber`, and r13's losslessness comparison is the only thing
-  // that had ever refused one. `"1649267441664"` passes that comparison perfectly — it is an integer a
-  // double holds exactly — so if the bound lived only in the number arm, this would be admitted and
-  // then spent: converted to a `number` and subtracted from another, in a currency whose minor unit
-  // that number cannot express.
+test('[o3d-psrx r15] a STRING carries its own evidence, so the round trip governs it and the bound does not', () => {
+  // o3d-psrx r15 (Codex MEDIUM 1) — THE INVERSE OF THE r14 TEST THIS REPLACES, and the reason is not
+  // that the bound was too strict in general: it is that the bound's PREMISE is false on this arm.
+  // A JSON numeric token has already lost its digits, so only a size rule can speak about it. A
+  // string still HAS its digits, so the round trip can decide THAT value — and it decides it more
+  // strictly than any bound could.
   //
-  // PRECONDITION, so this cannot pass for the wrong reason: the identical string IS read in a currency
-  // whose minor unit it can carry, which proves the round trip admits it and only the bound refuses it.
-  assert.equal(parseLedgerAmount('1649267441664', 'JPY'), 1649267441664,
-    'precondition: the losslessness round trip admits this string — it is exactly representable')
-  assert.equal(parseLedgerAmount('1649267441664', 'CLF'), null,
-    'and in CLF it is above the bound, so the string arm must refuse it as well')
-  assert.equal(parseLedgerAmount('8796093022208', 'KWD'), null,
-    'the same on the 3-decimal bound')
+  // Codex's own value. It is exactly representable, round-trips unchanged, and r14 answered null to
+  // it because of its size — turning a readable zero-paid state into UNPROVEN and withholding a
+  // legitimate reversal indefinitely.
+  assert.ok(1649267441664 > ledgerAmountMagnitudeBound('CLF'),
+    'precondition: this figure is in the BOUND\'s territory — above the four-decimal bound')
+  assert.equal(parseLedgerAmount('1649267441664', 'CLF'), 1649267441664,
+    'a string amount that is exactly representable must be READ, whatever its magnitude')
+  assert.equal(parseLedgerAmount('8796093022208', 'KWD'), 8796093022208,
+    'the same on the three-decimal bound')
+
+  // THE ARM SPLIT IS WHAT IS BEING TESTED, not "large values read now". The identical figure arriving
+  // as a JSON NUMERIC TOKEN is still refused, because there the evidence really is gone.
+  assert.equal(parseLedgerAmount(1649267441664, 'CLF'), null,
+    'the same value as a decoded number is still refused — the bound stayed where its premise holds')
+  assert.equal(parseLedgerAmount(8796093022208, 'KWD'), null)
+
+  // AND THE STRING ARM IS STRICTER, NOT LOOSER. These are refused at magnitudes far BELOW every bound,
+  // because the round trip asks a question about the value rather than about its size — including the
+  // three-decimal GBP figure the r15 HIGH is about, which no magnitude rule can refuse in general.
+  assert.equal(parseLedgerAmount('35184372088832.003', 'GBP'), null,
+    'no double answers to these digits, so it is refused — and the bound would admit it lower down')
+  assert.equal(parseLedgerAmount('17592186044416.002', 'GBP'), null,
+    'and the same at 2^44, which is below EVERY candidate bound — the round trip is not a size rule')
+  // THE LIMIT OF THE CLAIM, stated rather than glossed: what the round trip establishes is that the
+  // number's own decimal reading IS this text, not that the text is exact in the reals. A text that
+  // is a double's own shortest name passes, and passing is what makes it safe — every later step
+  // re-derives the decimal the same way, so the value can never disagree with the text downstream.
+  assert.equal(parseLedgerAmount('17592186044416.008', 'GBP'), 17592186044416.008,
+    'a string that IS a double\'s own name is read, and reads back as itself everywhere after this')
+  assert.equal(parseLedgerAmount('9007199254740993', 'GBP'), null)
+  assert.equal(parseLedgerAmount('1234567890.123456789', 'GBP'), null)
+})
+
+test('[o3d-psrx r15] the bound is TIGHT for what it can guarantee: one binade lower refuses readable money', async () => {
+  // o3d-psrx r15 (Codex HIGH) — THE FINDING WAS THAT THE BOUND IS DERIVED FROM ONE WHOLE MINOR UNIT
+  // WHILE THE DECISION TURNS ON HALF OF ONE, so it should be re-derived one binade lower. This is the
+  // measurement that says it should not be: at the proposed bound and a binade below it, a whole
+  // minor unit still survives the decode, so lowering would refuse money that is provably readable.
+  //
+  // MEASURED, not argued: every figure here is decoded from wire text, and the quantity checked is
+  // the one the decision uses — the settled amount against PAYMENT_PRESENT_EPSILON.
+  const settledAfterDecode = async (a: string, b: string): Promise<number> => {
+    const decoded = await decodeJsonAmounts(`{"a":${a},"b":${b}}`)
+    return decoded.a - decoded.b
+  }
+  // GBP, one penny apart, at three magnitudes: the bound itself and the two binades below it.
+  const pennyApart: [string, string, string][] = [
+    ['2^46 — the bound', '70368744177664.02', '70368744177664.01'],
+    ['2^45 — the proposed bound', '35184372088832.02', '35184372088832.01'],
+    ['2^44 — a binade below that', '17592186044416.02', '17592186044416.01'],
+  ]
+  const settled = await Promise.all(pennyApart.map(([, a, b]) => settledAfterDecode(a, b)))
+  assert.ok(settled[0] <= PAYMENT_PRESENT_EPSILON,
+    'AT the bound a whole penny is lost — which is what the bound is for, and it refuses these')
+  for (const index of [1, 2]) {
+    assert.ok(settled[index] > PAYMENT_PRESENT_EPSILON,
+      `${pennyApart[index][0]}: a whole penny still survives the decode here, so a bound set at or `
+      + 'below this magnitude would refuse an amount whose decision is provably safe')
+  }
+  // And the refusals line up with that: the pair that loses a penny is refused, the ones that do not
+  // are read. This is the bound's claim, stated as the reader's behaviour rather than as arithmetic.
+  const atBound = await decodeJsonAmounts('{"v":70368744177664.02}')
+  const below = await decodeJsonAmounts('{"v":35184372088832.02}')
+  assert.equal(parseLedgerAmount(atBound.v, 'GBP'), null)
+  assert.equal(parseLedgerAmount(below.v, 'GBP'), 35184372088832.02)
+})
+
+test('[o3d-psrx r15] a payload FINER than its own minor unit crosses the threshold below ANY bound', async () => {
+  // o3d-psrx r15 (Codex HIGH) — THE OTHER HALF OF THE ANSWER, AND THE UNCOMFORTABLE ONE. The flip the
+  // finding reproduces is real, and it is NOT closed by lowering the bound: it needs digits finer than
+  // the currency's minor unit, and for those the true difference is not quantized to two epsilons, so
+  // a difference just above the threshold always exists within one spacing of it and rounding can
+  // always carry it below. Lowering the bound moves the class down instead of emptying it.
+  //
+  // GBP, THREE decimals, at 2^44 — BELOW the bound proposed by the finding.
+  const three = await decodeJsonAmounts('{"TotalAmt":17592186044416.008,"Balance":17592186044416.002}')
+  assert.ok(parseLedgerAmount(three.TotalAmt, 'GBP') !== null && parseLedgerAmount(three.Balance, 'GBP') !== null,
+    'precondition: both figures are ADMITTED — this magnitude is below every candidate bound')
+  // THE SETTLED FIGURE AS PRODUCTION COMPUTES IT — `subtractMoney` on the two parsed values, not a
+  // float subtraction of the test's own. It is 0.004; the true one is 0.006, which is ABOVE the
+  // threshold, so a real payment reads as a ledger holding nothing.
+  const threeSettled = subtractMoney(parseLedgerAmount(three.TotalAmt, 'GBP')!, parseLedgerAmount(three.Balance, 'GBP')!)
+  assert.ok(threeSettled.toNumber() <= PAYMENT_PRESENT_EPSILON,
+    'the decoded settled amount is at or below the threshold, though the true one (0.006) is above')
+  // FOUR decimals, lower again — the class does not have a floor.
+  const four = await decodeJsonAmounts('{"TotalAmt":1099511627776.0062,"Balance":1099511627776.0011}')
+  const fourSettled = subtractMoney(parseLedgerAmount(four.TotalAmt, 'GBP')!, parseLedgerAmount(four.Balance, 'GBP')!)
+  assert.ok(fourSettled.toNumber() <= PAYMENT_PRESENT_EPSILON,
+    'at 2^40 a four-decimal payload does the same (true 0.0051, read 0.0048), which is why no finite '
+    + 'bound closes this class — lowering the bound only moves it down')
+
+  // WHERE THE FIX ACTUALLY LIVES, as a control: the SAME figures arriving as strings are refused,
+  // because there the original digits still exist for the round trip to check. The residual is
+  // therefore precisely a JSON numeric token finer than its currency's minor unit — o3d-39jg.
+  assert.equal(parseLedgerAmount('17592186044416.002', 'GBP'), null)
+  assert.equal(parseLedgerAmount('1099511627776.0062', 'GBP'), null)
+  assert.equal(parseLedgerAmount('1099511627776.0011', 'GBP'), null)
 })
 
 test('[o3d-psrx r14] the same figures are read in a currency whose minor unit they CAN carry', async () => {

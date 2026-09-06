@@ -397,17 +397,17 @@ test('[o3d-psrx r8] the QuickBooks paid amount is TotalAmt - Balance, and NULL w
   // round, which is what stops the gate being something a rate-limited poll can skip.
   assert.deepEqual(
     qboLedgerAmount({ Id: '1', TotalAmt: 100, Balance: 50 }),
-    { paid: 50, total: 100, outstanding: 50, currency: null },
+    { paid: 50, total: 100, outstanding: 50, currency: null, currencySource: 'NONE' },
     'half the document settled: the ledger is still accounting for the rest of it')
   assert.deepEqual(
     qboLedgerAmount({ Id: '1', TotalAmt: 100, Balance: 100 }),
-    { paid: 0, total: 100, outstanding: 100, currency: null },
+    { paid: 0, total: 100, outstanding: 100, currency: null, currencySource: 'NONE' },
     'nothing settled: the zero the admitting arms are written about')
   // QuickBooks serialises money as a number, but `parseLedgerAmount` is the reader Xero's own amount
   // partition uses and it accepts the string form — one dialect of "is this a number" across both.
   assert.deepEqual(
     qboLedgerAmount({ Id: '1', TotalAmt: '100.00', Balance: '0.00' }),
-    { paid: 100, total: 100, outstanding: 0, currency: null })
+    { paid: 100, total: 100, outstanding: 0, currency: null, currencySource: 'NONE' })
   // o3d-psrx r10 (Codex HIGH 3): and the CURRENCY, off the same row — `qboQuery` issues `SELECT *`,
   // so `CurrencyRef` is already in the response. Both spellings QuickBooks uses are read.
   assert.equal(qboLedgerAmount({ Id: '1', TotalAmt: 100, Balance: 50, CurrencyRef: { value: 'kwd' } }).currency, 'KWD')
@@ -777,7 +777,7 @@ test('[o3d-psrx r13] THE ROUTE: the admitted pair WITHHOLDS instead of proving a
   // arm of the provenance gate is written about.
   assert.notEqual(verdict.kind, 'HOLDS_NOTHING',
     'a positive payment must never be classified as a ledger holding nothing')
-  assert.deepEqual(verdict, { kind: 'UNPROVEN', paidAmount: null, documentTotal: ADMITTED_TOTAL })
+  assert.deepEqual(verdict, { kind: 'UNPROVEN', paidAmount: null, documentTotal: ADMITTED_TOTAL, currencyUnbound: false })
 })
 
 test('[o3d-psrx r13] CONTROL: ordinary amounts classify exactly as they always did', () => {

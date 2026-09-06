@@ -1125,10 +1125,14 @@ export function parseLedgerAmount(value: unknown, currency: string | null): numb
     //
     // o3d-psrx r15 (Codex MEDIUM 1) — AND NO MAGNITUDE BOUND ON THIS ARM. A string carries its own
     // evidence: the original decimal text is still here, so the round trip can decide THIS value
-    // rather than values of this size, and it decides it more strictly. `"35184372088832.003"` — the
-    // three-decimal GBP figure the r15 HIGH is about — is REFUSED here, at every magnitude, because
-    // no double says what it says; the bound would have let it through at a smaller magnitude. The
-    // arm that needs the bound is the one above, where the digits are already gone.
+    // instead of values of this size. What it establishes, stated precisely: THE NUMBER'S OWN DECIMAL
+    // READING IS THE TEXT IT CAME FROM. `toDecimal(aNumber)` reads a double by its shortest decimal
+    // name, and every later step in this lifecycle re-derives the decimal that way, so a string that
+    // passes can never disagree with itself downstream — `"1649267441664"` in CLF is such a string,
+    // and r14 refused it purely for its size. One that does NOT pass is refused at ANY magnitude:
+    // `"35184372088832.003"` and `"17592186044416.002"` are both null here, far below the two-decimal
+    // bound, because no double answers to those digits. The arm that needs a size rule is the one
+    // above, where the digits are already gone and nothing can be asked of them.
     //
     // The alternative — carrying Decimal through every classification instead of converting at all —
     // is the stronger shape and is NOT small here: this reader's result is a `number` in the Xero
