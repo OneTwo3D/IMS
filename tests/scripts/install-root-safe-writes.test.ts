@@ -5401,9 +5401,16 @@ test('[o3d-secops] a descriptor the gate cannot take ends the run, rather than d
    * for the instant of the open and put it back, so the weaker mode was something an attacker could
    * switch on. A guarantee that can be switched off is not a guarantee.
    *
-   * FORCED DETERMINISTICALLY, not raced: mode 000 on the root makes `open(O_RDONLY)` fail with
-   * EACCES for its own unprivileged owner, while `lstat` — which is what the gate's first walk uses
-   * — still succeeds. So the gate gets its answer, cannot get its descriptor, and must stop.
+   * FORCED WITHOUT RELYING ON WHO IS RUNNING THE TESTS. The obvious lever — `chmod 000` on the root
+   * — is a DAC restriction, and uid 0 walks through it; a harness that used it would prove nothing
+   * under a root CI and would fail its own precondition there. `ulimit -n 10` is uid-independent:
+   * bash allocates a `{var}` descriptor at 10 or above, so with the limit AT 10 the allocation
+   * itself fails, on every uid, every time. Measured on this bash before it was relied on.
+   *
+   * AND IT MEASURES THE EXPLICIT REFUSAL, not an ambient one. The shipped code takes the `exec`
+   * status with `|| die` precisely because a bare redirection failure ends the shell only while
+   * `set -e` happens to be on — the rig deliberately runs without it, so a test that passed here on
+   * bash's own exit would be measuring the harness rather than the guard.
    */
   const base = createTempDirSync('ims-secops-fdfail-', t)
   const varlog = join(base, 'var-log')
@@ -5411,32 +5418,66 @@ test('[o3d-secops] a descriptor the gate cannot take ends the run, rather than d
   const root = join(varlog, 'ims')
   mkdirSync(root)
   writeFileSync(join(root, 'MARKER'), 'untouched\n')
-  chmodSync(root, 0o000)
-  t.after(() => { try { chmodSync(root, 0o755) } catch { /* already gone */ } })
 
-  // PRECONDITION, MEASURED: the harness really cannot open it, and really can still lstat it.
-  assert.equal(lstatSync(root).isDirectory(), true, 'lstat must still work, or this test forces the wrong failure')
-  assert.throws(() => readdirSync(root), 'and the open must really fail for this uid')
-
-  const run = runBash(rig([...ROOT_ENTER], [
+  const script = (limit: string) => rig([...ROOT_ENTER], [
+    `ulimit -n ${limit}`,
     `require_real_service_root ${q(root)} "the log directory"`,
+    `enter_service_root ${q(root)} 022 "the log directory"`,
+    'chmod 0770 .',
     `echo ${REACHED}`,
-  ].join('\n')))
+  ].join('\n'))
 
-  assert.notEqual(run.status, 0, `the gate must not return success without a descriptor: ${run.stdout} ${run.stderr}`)
-  assert.ok(!run.stdout.includes(REACHED),
-    'and must not go on to the rest of the run — a run that continued here would enter the root by name')
+  const starved = runBash(script('10'))
+  assert.equal(starved.status, 1, `a descriptor the gate cannot take must end the run: ${starved.stdout} ${starved.stderr}`)
+  assert.ok(!starved.stdout.includes(REACHED),
+    'and it must not go on to the rest of the run — a run that continued here would enter the root by name')
+  assert.match(starved.stderr, /could not be opened to hold a descriptor on it/,
+    `and the refusal must be the shipped one, not bash's own redirection message: ${starved.stderr}`)
+  assert.equal(statSync(root).mode & 0o777, 0o755, 'and nothing may be changed on the way to refusing')
 
-  // NOT VACUOUS: the same gate over the same directory, readable, takes its descriptor and returns.
-  chmodSync(root, 0o755)
-  const ok = runBash(rig([...ROOT_ENTER], [
-    `require_real_service_root ${q(root)} "the log directory"`,
-    `echo "fd=${'${SERVICE_ROOT_FD[' + JSON.stringify(root) + ']-none}'}"`,
-    `echo ${REACHED}`,
-  ].join('\n')))
-  assert.equal(ok.status, 0, `a readable root must pass: ${ok.stderr}`)
+  // NOT VACUOUS: the identical script with descriptors to spare takes one, enters, and does the
+  // work. So what the run above refused on is the descriptor and nothing else about the layout.
+  const ok = runBash(script('64'))
+  assert.equal(ok.status, 0, `a root the gate can open must pass: ${ok.stderr}`)
   assert.ok(ok.stdout.includes(REACHED))
-  assert.match(ok.stdout, /^fd=\d+$/m, `and the gate must have recorded a descriptor: ${ok.stdout}`)
+  assert.equal(statSync(root).mode & 0o777, 0o770, 'and reach the operation the starved run refused')
+
+  // MEASURED BY MUTATION, ROUTE STATED: the shipped `|| die` removed from the open, which is where
+  // this stood before this pass. The rig runs without `set -e` — as a caller that had not set it
+  // would — so bash prints its own message and CARRIES ON, and the run reaches the ownership change
+  // having never held a descriptor. That is the fail-open, executed.
+  const shipped = shellFunction(INSTALL_SH, 'require_real_service_root')
+  const lines = shipped.split('\n')
+  const at = lines.findIndex((line) => line.includes('exec {fd}< "${base}"'))
+  assert.notEqual(at, -1, `precondition: the gate must open the descriptor: ${shipped}`)
+  assert.match(lines[at], /\|\| die \\$/, `and must take the status of that open explicitly: ${lines[at]}`)
+  assert.match(lines[at + 1], /could not be opened to hold a descriptor/,
+    `and the refusal must be the line that follows it: ${lines[at + 1]}`)
+  // THE WHOLE STATEMENT, both lines of it, replaced by the bare `exec` this stood as before the
+  // pass. Removing only the first would leave the message as a command of its own, which fails for
+  // a reason that has nothing to do with the finding.
+  const failOpen = [
+    ...lines.slice(0, at),
+    '        exec {fd}< "${base}"',
+    // ${fd} is left UNSET by a failed open — `local fd` does not create it — so `set -u` alone
+    // would stop the run and the mutation would prove the harness rather than the code. The
+    // pre-pass gate reached its verification with an empty value; this reproduces that.
+    '        fd="${fd:-}"',
+    ...lines.slice(at + 2),
+  ].join('\n')
+    // …and the identity check, which would otherwise catch the missing descriptor for it.
+    .replace('[[ "$(stat -L -c \'%d:%i\' "/proc/self/fd/${fd}" 2>/dev/null || true)" == "${answer#*|}" ]]', '[[ 1 == 1 ]]')
+  assert.ok(!failOpen.includes('could not be opened to hold a descriptor'),
+    'the mutation must remove the explicit refusal')
+  assert.ok(!failOpen.includes('stat -L'), 'and the verification that would stand in for it')
+
+  const mutated = runBash(rig(ROOT_ENTER.filter((n) => n !== 'require_real_service_root'), [
+    'ulimit -n 10',
+    `require_real_service_root ${q(root)} "the log directory"`,
+    `echo ${REACHED}`,
+  ].join('\n'), failOpen))
+  assert.ok(mutated.stdout.includes(REACHED),
+    `without the explicit status the gate returns having taken no descriptor: ${mutated.stdout} ${mutated.stderr}`)
 })
 
 test('[o3d-secops] an approved root with no descriptor is refused at the entry, not entered by name', (t) => {

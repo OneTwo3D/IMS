@@ -3491,11 +3491,15 @@ require_real_service_root() {
           "${root} — ${what} — could not be resolved from \`/\` a second time, to open a descriptor on it: a directory on the way changed while this run was walking it. Nothing has been changed."
         [[ -d "${base}" ]] || die \
           "${root} — ${what} — was a directory a moment ago and is not one now, so this run cannot open a descriptor on it. Nothing has been changed."
-        # A REDIRECTION FAILURE ON `exec` ENDS A NON-INTERACTIVE SHELL, by bash's own rule and
-        # whatever surrounds it — so EMFILE, EACCES and a root that vanished between the test above
-        # and this line all stop the run, with bash's message. That is the outcome this block wants;
-        # what it must never do is carry on.
-        exec {fd}< "${base}"
+        # THE FAILURE IS TAKEN EXPLICITLY, NOT LEFT TO `set -e` (o3d-secops r7 sixth pass, Codex
+        # MEDIUM). A bare `exec {fd}< …` whose redirection fails ends a non-interactive shell only
+        # BECAUSE errexit is on — measured, not assumed: without it bash prints its message, leaves
+        # ${fd} unset and CARRIES ON. Resting a fail-closed guarantee on an ambient shell option is
+        # resting it on something a caller can change and a harness does not share, so the status is
+        # taken here. `||` also suspends errexit for the left-hand command, which is what lets this
+        # `die` be the diagnostic instead of bash's one-liner.
+        exec {fd}< "${base}" || die \
+          "${root} — ${what} — could not be opened to hold a descriptor on it: the open was refused (a permission this run does not have, or a process-wide file-descriptor limit). This run will not carry on identifying it by name. Nothing has been changed."
         # `-L`, WHICH IS THE ONE PLACE IN THESE SCRIPTS THAT WANTS IT. /proc/self/fd/N is a magic
         # link, and every other `stat` here is deliberately an lstat — so without `-L` this compares
         # the inode of the /proc entry against the inode of a directory and never matches, which is
@@ -3657,7 +3661,8 @@ enter_service_root() {
     # AND THE DESCRIPTOR ON IT IS MANDATORY HERE TOO (o3d-secops r7 fifth pass, Codex HIGH): a root
     # this run created and could not hold open is a root the next call would have to reach by name.
     if [[ -d /proc/self/fd ]]; then
-      exec {newfd}< .
+      exec {newfd}< . || die \
+        "${root} — ${what} — was created by this run but could not be opened to hold a descriptor on it: the open was refused (a permission this run does not have, or a process-wide file-descriptor limit). The calls that follow would have to reach it by name, which is the weaker identity this replaced, so this run stops instead. Nothing further has been changed."
       SERVICE_ROOT_FD["${root}"]="${newfd}"
     fi
   else
