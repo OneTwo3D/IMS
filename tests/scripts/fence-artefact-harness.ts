@@ -42,6 +42,39 @@ export function pgPackage(body: string): { manifest: string; entry: string } {
  * transitive dependency so the closure walk has something to recurse through — a one-package
  * closure would pass a resolver that never recursed.
  */
+/**
+ * WHAT EVERY STUBBED HELPER ANSWERS `--plan` WITH (o3d-secops r23).
+ *
+ * Raising a fence is three steps since r23 — `--plan` as the service account, a privileged
+ * validation and durable publication by root, then `--fence` — so a stub that only knew about
+ * `--fence` would make every harness fail at step one, and a harness that skipped the plan would
+ * be measuring an ordering the shipped code no longer has.
+ *
+ * The plan is DERIVED FROM ARGV rather than hardcoded, because root validates it against the
+ * database and role IT supplied: a fixed answer would pass in the harnesses whose identity happens
+ * to match and fail in the ones testing a mismatch, for a reason that has nothing to do with what
+ * they are testing.
+ */
+export const FENCE_PLAN_STUB = [
+  "const planArg = (name) => {",
+  "  const hit = process.argv.find((a) => a.startsWith(`--${name}=`))",
+  "  return hit ? hit.slice(name.length + 3) : ''",
+  "}",
+  "if (process.argv.includes('--plan')) {",
+  "  process.stdout.write(`${JSON.stringify({",
+  "    database: planArg('app-database'),",
+  "    owner_role: 'imsapp',",
+  "    app_role: planArg('app-role') || planArg('app-user'),",
+  "    admin_role: 'deployadmin',",
+  "    revoked: ['PUBLIC', planArg('app-user') || 'imsapp'],",
+  "    datacl_before: null,",
+  "    fenced_at: '2026-01-01T00:00:00.000Z',",
+  "  })}\n`)",
+  "  process.exit(0)",
+  "}",
+  '',
+].join('\n')
+
 export function writeFenceCheckout(
   root: string,
   helperSource: string,
@@ -49,7 +82,7 @@ export function writeFenceCheckout(
 ): string {
   const app = join(root, 'app')
   mkdirSync(join(app, 'scripts'), { recursive: true })
-  writeFileSync(checkoutHelper(root), helperSource)
+  writeFileSync(checkoutHelper(root), `${FENCE_PLAN_STUB}${helperSource}`)
   writeCheckoutPg(app, pgBody)
   return checkoutHelper(root)
 }

@@ -45,12 +45,16 @@ const CUTOVER_NS_FUNCTIONS = new Set([
   'mkdir_service_subdir',
   'own_service_subdir',
   'verify_held_lock',
+  'narrow_held_lock',
+  'dir_is_private_to_this_run',
   'prepare_cutover_lock_file',
   'ensure_cutover_root_dir',
   'ensure_cutover_state_dirs',
   'acquire_cutover_lock',
-  'acquire_pre_r22_cutover_lock',
+  'acquire_legacy_namespace_lock',
+  'state_pre_r22_cutovers_are_not_excluded',
   'warn_pre_r22_db_fence_state',
+  'warn_legacy_namespace_db_fence_state',
 ])
 /** Lift `name` from whichever shipped file defines it. */
 function shippedShellFunction(source: string, name: string): string {
@@ -1159,7 +1163,10 @@ for (const [name, source] of [
     // check, because the new build cannot serve a database it may not connect to. If either
     // then fails the trap used to announce a HELD fence — one it had already released.
     const refence = shellFunction(source, 'refence_db_connections')
-    assert.match(refence, /--fence/, 'the trap-safe re-fence must actually re-apply the revoke')
+    // o3d-secops r23: raising a fence is db_fence_raise() — plan as the service account, validate
+    // and publish the authority as root, then `--fence`. A re-fence that only ran `--fence` would
+    // now revoke from an authority nothing had republished, which the helper refuses.
+    assert.match(refence, /db_fence_raise/, 'the trap-safe re-fence must actually re-apply the revoke')
     assert.ok(!/\bdie\b/.test(refence), 'and must never die, because it runs inside the exit trap')
 
     const trapName = name === 'install.sh' ? 'on_cutover_exit' : 'on_exit'
@@ -1289,6 +1296,12 @@ DB_IDENTITY_DRIFT_REASON=''
 # pointed at the harness directory instead of /etc.
 ${fenceProtectedLibrary(dir)}
 ${shellFunction(DEPLOY_LINES.join('\n'), 'resolve_fence_script')}
+# o3d-secops r23: raising a fence is plan -> authorise -> execute, and db_fence_raise() (sourced
+# above with the library) reaches back for the ONE part each entrypoint supplies for itself, plus
+# the namespace library's directory predicate. Lifted rather than stubbed, for the reason
+# everything else here is: a rig that supplied its own would stop measuring the shipped ordering.
+${shellFunction(CUTOVER_NS_LIB, 'dir_is_private_to_this_run')}
+${shellFunction(DEPLOY_LINES.join('\n'), 'db_fence_helper')}
 DB_FENCE_REFENCE_CMD="\${DB_FENCE_REFENCE_WRAPPER}"
 : "\${APP_DIR_REAL:=/opt/app}"
 : "\${APP_DIR:=/opt/app}"
@@ -1357,6 +1370,8 @@ DB_IDENTITY_DRIFT_REASON=''
 # assertion below still reads what was invoked.
 ${fenceProtectedLibrary(dir)}
 ${shellFunction(UPDATE_LINES.join('\n'), 'resolve_fence_script')}
+${shellFunction(CUTOVER_NS_LIB, 'dir_is_private_to_this_run')}
+${shellFunction(UPDATE_LINES.join('\n'), 'db_fence_helper')}
 DB_FENCE_REFENCE_CMD="\${DB_FENCE_REFENCE_WRAPPER}"
 DB_FENCE_IDENTITY_FROM_RECORD=false
 DB_FENCE_ADOPTING=false
@@ -1440,6 +1455,8 @@ DB_IDENTITY_DRIFT_REASON=''
 # pointed at the harness directory instead of /etc.
 ${fenceProtectedLibrary(dir)}
 ${shellFunction(INSTALL_SOURCE, 'resolve_fence_script')}
+${shellFunction(CUTOVER_NS_LIB, 'dir_is_private_to_this_run')}
+${shellFunction(INSTALL_SOURCE, 'db_fence_helper')}
 # o3d-2sm1.5 r35: install.sh's resolver refuses outright on a FIRST INSTALL, which performs no
 # credentialed fence execution. Every harness below is an UPGRADE cutover — that is what they are
 # for — so the flag is named here with the value the upgrade branch runs under. Named rather than
@@ -3975,7 +3992,10 @@ function runR9(
         .flatMap((name) => (name === 'write_fence_marker' || name === 'write_cutover_marker'
           ? ['ensure_fence_marker_dir', name]
           : name === 'import_legacy_cutover_state'
-            ? ['ensure_fence_marker_dir', 'import_relocated_fence_marker', name]
+            // o3d-secops r23: and the connection-fence record it no longer imports. Naming it is
+            // an edge like any other; a rig without it fails with "command not found" and every
+            // "the import must succeed" assertion below would then pass for the wrong reason.
+            ? ['ensure_fence_marker_dir', 'import_relocated_fence_marker', 'warn_legacy_namespace_db_fence_state', name]
             : [name]))
         // o3d-secops r22: the namespace library's own edges. ensure_cutover_state_dirs() no longer
         // `mkdir -p`s anything — it walks to the directory and applies the owner and the mode to the
@@ -3986,7 +4006,8 @@ function runR9(
           ? ['enter_service_subdir', 'own_service_subdir', 'ensure_cutover_root_dir', name]
           : name === 'acquire_cutover_lock'
             ? ['enter_service_subdir', 'own_service_subdir', 'ensure_cutover_root_dir', 'ensure_cutover_state_dirs',
-               'prepare_cutover_lock_file', 'verify_held_lock', 'acquire_pre_r22_cutover_lock',
+               'prepare_cutover_lock_file', 'verify_held_lock', 'narrow_held_lock', 'dir_is_private_to_this_run',
+               'acquire_legacy_namespace_lock', 'state_pre_r22_cutovers_are_not_excluded',
                'warn_pre_r22_db_fence_state', name]
             : [name]))
         .filter((name, index, all) => all.indexOf(name) === index)
@@ -4880,6 +4901,7 @@ for (const entry of R9_SCRIPTS) {
         'echo "CRON=$(cat "${CRON_BACKUP}" 2>/dev/null)"',
         'echo "DBSTATE=$(cat "${DB_FENCE_STATE}" 2>/dev/null)"',
         '[[ -e "${LEGACY_FENCE_FILE}" ]] && echo LEGACY_MARKER_REMAINS || echo LEGACY_MARKER_MOVED',
+        '[[ -e "${LEGACY_DB_FENCE_STATE}" ]] && echo LEGACY_DBSTATE_REMAINS || echo LEGACY_DBSTATE_GONE',
       ].join('\n'),
       R9_LEGACY_STATE,
     )
@@ -4887,7 +4909,16 @@ for (const entry of R9_SCRIPTS) {
     assert.equal(result.status, 0, `the import must succeed:\n${result.stdout}`)
     assert.match(result.stdout, /MARKER=phase=stopping;/, `the marker must arrive at the shared path:\n${result.stdout}`)
     assert.match(result.stdout, /CRON=\*\/5 \* \* \* \* \/usr\/bin\/true/, 'and the crontab backup with it')
-    assert.match(result.stdout, /DBSTATE=\{"grants":\[\]\}/, 'and the recorded grants, or the fence can never be released')
+    // o3d-secops r23, Codex CRITICAL: THE CONNECTION-FENCE RECORD IS NOT ONE OF THEM ANY MORE.
+    // It was written by the fence helper running as the service account, and republishing it into
+    // the shared namespace made root build `GRANT CONNECT` out of statements that account
+    // authored. It is reported and left exactly where it is.
+    assert.match(result.stdout, /DBSTATE=$/m,
+      `the legacy connection-fence record must NOT be imported:\n${result.stdout}`)
+    assert.match(result.stdout, /IT HAS NOT BEEN READ, COPIED OR IMPORTED/,
+      `and the operator must be told it is there and why it is being left alone:\n${result.stdout}`)
+    assert.match(result.stdout, /LEGACY_DBSTATE_REMAINS/,
+      `and it stays where it is, so it can still be read by hand:\n${result.stdout}`)
     assert.match(result.stdout, /LEGACY_MARKER_MOVED/, 'and nothing may be left at the old path for a later run to adopt twice')
   })
 
@@ -6621,6 +6652,11 @@ function fenceRecoveryHarness(dirs: { app: string; state: string; recovery: stri
     // now calls, and it does two things — resolve the artefact and rewrite the root-owned recovery
     // wrappers — that a stub would silently drop.
     shellFunction(source, 'resolve_fence_script'),
+    // o3d-secops r23: db_fence_raise() reaches back for the one part each entrypoint supplies for
+    // itself, and for the namespace library's directory predicate. Lifted for the reason the
+    // resolver is: a stub would drop the privilege drop the shipped ordering is built on.
+    shellFunction(CUTOVER_NS_LIB, 'dir_is_private_to_this_run'),
+    shellFunction(source, 'db_fence_helper'),
     // The two recovery commands, exactly as update.sh sets them: the PATHS of the root-owned
     // wrappers, not a command line (o3d-2sm1.5 r32). Setting them empty here would let a banner
     // that prints nothing pass every assertion about what it names.
@@ -6663,7 +6699,11 @@ function fenceRecoveryHarness(dirs: { app: string; state: string; recovery: stri
     '  shift',
     '  echo "run_as_user $*" >> "${LOG}"',
     '  case "$*" in',
-    '    *--fence*) mkdir -p "$(dirname "${DB_FENCE_STATE}")"; echo "{}" > "${DB_FENCE_STATE}"; return "${FENCE_EXIT:-0}" ;;',
+    // o3d-secops r23: the helper no longer writes the record — root does, out of the plan this
+    // prints. The stub answers the plan the shipped `--plan` mode would, derived from the identity
+    // it is passed, because root validates it against the database and role root itself supplied.
+    `    *--plan*) printf '{"database":"%s","owner_role":"imsapp","app_role":"%s","admin_role":"deployadmin","revoked":["PUBLIC","imsapp"],"datacl_before":null,"fenced_at":"2026-01-01T00:00:00.000Z"}\\n' "\${DB_IDENTITY_DATABASE:-imsdb}" "\${DB_IDENTITY_USER:-imsapp}"; return 0 ;;`,
+    '    *--fence*) return "${FENCE_EXIT:-0}" ;;',
     "    *--print-migration-url*) printf 'postgresql://admin:pw@127.0.0.1:5432/imsdb?options=-c%%20role%%3Dimsapp\\n'; return 0 ;;",
     '  esac',
     '  return 0',
@@ -9352,8 +9392,11 @@ test('r32: the recovery wrapper an operator is given runs, as pasted, with nothi
     assert.equal(invocation.ran, paths.helper, 'and the file it ran is the PROTECTED one, not the checkout')
     assert.deepEqual(
       invocation.argv,
-      ['--release', '--state-file=' + join(dir, 'state.json'), '--app-host=db.internal', '--app-port=6432', '--app-user=imsapp', '--app-database=imsdb'],
-      'with this run\'s state file and the four identity values already filled in',
+      // o3d-secops r23: and the uid the authority must belong to. Baked as `id -u` rather than a
+      // literal 0, for the reason publish_durable_file() asks it — the property is "the privileged
+      // account that owns this install", and asking is what lets this regression run unprivileged.
+      ['--release', '--state-file=' + join(dir, 'state.json'), `--state-owner=${process.getuid?.() ?? 0}`, '--app-host=db.internal', '--app-port=6432', '--app-user=imsapp', '--app-database=imsdb'],
+      'with this run\'s state file, the uid that publishes the authority, and the four identity values already filled in',
     )
     assert.equal(
       invocation.admin,
@@ -10819,10 +10862,14 @@ const CUTOVER_NS_OWNED = [
   'ensure_cutover_root_dir',
   'ensure_cutover_state_dirs',
   'verify_held_lock',
+  'narrow_held_lock',
+  'dir_is_private_to_this_run',
   'prepare_cutover_lock_file',
   'acquire_cutover_lock',
-  'acquire_pre_r22_cutover_lock',
+  'acquire_legacy_namespace_lock',
+  'state_pre_r22_cutovers_are_not_excluded',
   'warn_pre_r22_db_fence_state',
+  'warn_legacy_namespace_db_fence_state',
 ] as const
 
 /** What a run leaves behind at both root-side targets, read back the same way every time.
@@ -10836,7 +10883,8 @@ const NAMESPACE_OUTCOME = [
   'rc=0; ( acquire_cutover_lock ) 2>&1 || rc=$?; echo "RC=${rc}"',
   'echo "ROOT=$(LC_ALL=C stat -c "%F %a %u" "${CUTOVER_ROOT_DIR}" 2>/dev/null || echo missing)"',
   'echo "FENCEDIR=$(LC_ALL=C stat -c "%F %a" "${DB_FENCE_DIR}" 2>/dev/null || echo missing)"',
-  'echo "LOCK=$(LC_ALL=C stat -c "%F" "${LOCK_FILE}" 2>/dev/null || echo missing)"',
+  'echo "FENCEDIROWNER=$(LC_ALL=C stat -c "%u" "${DB_FENCE_DIR}" 2>/dev/null || echo missing)"',
+  'echo "LOCK=$(LC_ALL=C stat -c "%F %a" "${LOCK_FILE}" 2>/dev/null || echo missing)"',
 ]
 
 /** The same, with the acquisition in THIS shell, so the descriptors — and the locks on them —
@@ -10860,11 +10908,14 @@ for (const entry of R9_SCRIPTS) {
     assert.match(run.stdout, /^RC=0$/m, `an ordinary cutover must still take its lock:\n${run.stdout}`)
     assert.match(run.stdout, /^LOCK_HELD$/m,
       `and it must be a lock, not a file it opened and let go:\n${run.stdout}`)
-    assert.match(run.stdout, new RegExp(`^ROOT=directory 755 ${harnessUid()}$`, 'm'),
-      `the parent must be owned by the account running the cutover and writable by nobody else — that is what makes the two names beneath it unplantable:\n${run.stdout}`)
-    assert.match(run.stdout, /^FENCEDIR=directory 700$/m,
-      `and the connection-fence directory must be private, because the fence script writes it:\n${run.stdout}`)
-    assert.match(run.stdout, /^LOCK=regular (empty )?file$/m, `and the lock must be a plain file:\n${run.stdout}`)
+    assert.match(run.stdout, new RegExp(`^ROOT=directory 711 ${harnessUid()}$`, 'm'),
+      `the parent must be owned by the account running the cutover and writable by nobody else — that is what makes the two names beneath it unplantable — and traversable without being LISTABLE (o3d-secops r23):\n${run.stdout}`)
+    assert.match(run.stdout, /^FENCEDIR=directory 755$/m,
+      `and the connection-fence directory must be root-owned and readable rather than app-owned: since r23 the record in it is published by root and only EXECUTED by the service account:\n${run.stdout}`)
+    assert.match(run.stdout, new RegExp(`^FENCEDIROWNER=${harnessUid()}$`, 'm'),
+      `owned by the account running the cutover, which is what makes a record inside it one the service account cannot have written:\n${run.stdout}`)
+    assert.match(run.stdout, /^LOCK=regular (empty )?file 600$/m,
+      `and the lock must be a plain file no other account can open: flock needs nothing but a descriptor, so readable is holdable (o3d-secops r23, Codex HIGH):\n${run.stdout}`)
   })
 
   test(`${entry.name} does not truncate what a symlink at the lock path points at, and refuses to lock it`, () => {
@@ -11041,45 +11092,124 @@ for (const entry of R9_SCRIPTS) {
       `and the chmod then dereferences it as root — that is the other half:\n${mutated.stdout}`)
   })
 
-  test(`${entry.name} still excludes a cutover holding the pre-r22 lock, and follows nothing to do it`, () => {
+  test(`${entry.name} claims no exclusion over the pre-r22 lock, and says so on every run`, () => {
     /**
-     * MOVING A LOCK IS ALSO A WAY TO LOSE ONE. A cutover already running from the previous checkout
-     * holds ${CUTOVER_STATE_DIR}/cutover.lock; this run holds a different inode, and both would
-     * report an exclusion neither has. ROUTE: the shipped acquire_pre_r22_cutover_lock().
+     * o3d-secops r23, Codex CRITICAL. THE BRIDGE r22 SHIPPED IS GONE, AND THIS IS WHY.
      *
-     * Two shapes. A REGULAR FILE at the old name is locked — and a second run is then excluded.
-     * A SYMLINK there is not followed, not created, not written, and NOT FATAL: dying would let
-     * ${APP_USER} stop every future cutover with one entry it is entitled to create, for a
-     * compatibility path that expires. What is lost is said out loud instead.
+     * r22 also locked `${CUTOVER_STATE_DIR}/cutover.lock` so a cutover already running from the
+     * previous checkout stayed excluded. A predecessor holds an INODE; the bridge opened a NAME,
+     * inside a directory ${APP_USER} owns. That account can rename the entry out from under the
+     * locked inode and leave a fresh regular file at the name, and every check the bridge made —
+     * lstat says regular file, the descriptor is that name's own inode — passes on the
+     * REPLACEMENT. The run then reported an exclusion it had never taken.
+     *
+     * SO THE TEST IS THE OTHER WAY ROUND NOW. What is asserted is that a run holding a lock on
+     * the old name is NOT excluded by this one (the honest state), that nothing is opened,
+     * created or locked at a name the service account controls, and that the limitation is stated
+     * UNCONDITIONALLY — keying it on whether that name exists would be reading an absence as an
+     * answer at a name the adversary controls, which is the same mistake one layer up.
+     *
+     * ROUTE: the shipped acquire_cutover_lock(), which calls state_pre_r22_cutovers_are_not_excluded().
      */
     const held = runR9(entry, ['acquire_cutover_lock'], [
+      // A "predecessor" holding the pre-r22 name, from a child that keeps its descriptor open.
       'printf "" > "${CUTOVER_STATE_DIR}/cutover.lock"',
+      'exec 4<"${CUTOVER_STATE_DIR}/cutover.lock"',
+      'flock -n 4 && echo PREDECESSOR_HOLDS || echo PREDECESSOR_FAILED',
       ...NAMESPACE_OUTCOME_INLINE,
-      // THE LOCK IS ACTUALLY HELD, asked of the kernel rather than of this script: a second flock
-      // on the same inode, from a subshell with its own descriptor, must fail.
-      '( exec 5<"${CUTOVER_STATE_DIR}/cutover.lock"; flock -n 5 && echo OLD_LOCK_FREE || echo OLD_LOCK_HELD )',
+      // Nothing may have been done to that name, and this run must not report it excluded.
+      'echo "OLDLOCK=$(LC_ALL=C stat -c "%F %s" "${CUTOVER_STATE_DIR}/cutover.lock" 2>/dev/null || echo missing)"',
     ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
-    assert.match(held.stdout, /^RC=0$/m, held.stdout)
-    assert.match(held.stdout, /^OLD_LOCK_HELD$/m,
-      `a pre-r22 cutover must still be excluded, or this round traded the fix for the thing it fixes:\n${held.stdout}`)
+    assert.match(held.stdout, /^PREDECESSOR_HOLDS$/m, `the fixture must actually hold the old lock:\n${held.stdout}`)
+    assert.match(held.stdout, /^RC=0$/m,
+      `and this run still takes its own lock — the old name may not stop every cutover on the box:\n${held.stdout}`)
+    assert.match(held.stdout, /NOTHING HERE CAN EXCLUDE IT/,
+      `and it must say plainly that a pre-r22 cutover is not excluded, rather than reporting a continuity it cannot establish:\n${held.stdout}`)
+    assert.match(held.stdout, /docs\/installation\.md/,
+      `and send the reader to where the requirement they have to satisfy is written down:\n${held.stdout}`)
+    assert.match(held.stdout, /^OLDLOCK=regular (empty )?file 0$/m,
+      `and nothing may be written through that name:\n${held.stdout}`)
 
-    const linked = runR9(entry, ['acquire_cutover_lock'], [
-      'printf "SECRET-CONTENT\\n" > "${CUTOVER_STATE_DIR}/oldvictim"',
-      'echo "BEFORE=$(stat -c %s "${CUTOVER_STATE_DIR}/oldvictim")"',
-      'ln -s "${CUTOVER_STATE_DIR}/oldvictim" "${CUTOVER_STATE_DIR}/cutover.lock"',
+    // AND THE STATEMENT IS UNCONDITIONAL. With no entry at the old name at all — which proves
+    // nothing, because the account that owns that directory can unlink it — the same sentence is
+    // printed. A version that only warned when the file existed would go quiet exactly when an
+    // adversary wanted it to.
+    const absent = runR9(entry, ['acquire_cutover_lock'], [
       ...NAMESPACE_OUTCOME_INLINE,
-      'echo "AFTER=$(stat -c %s "${CUTOVER_STATE_DIR}/oldvictim")"',
-      '( exec 5<"${CUTOVER_STATE_DIR}/oldvictim"; flock -n 5 && echo TARGET_NOT_LOCKED || echo TARGET_LOCKED )',
+      '[[ -e "${CUTOVER_STATE_DIR}/cutover.lock" ]] && echo OLD_NAME_CREATED || echo OLD_NAME_UNTOUCHED',
     ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
-    assert.match(linked.stdout, /^RC=0$/m,
-      `a link at a name the service account owns may not stop every cutover on the box:\n${linked.stdout}`)
-    assert.match(linked.stdout, /^AFTER=15$/m, `and nothing may be written through it:\n${linked.stdout}`)
-    assert.match(linked.stdout, /^TARGET_NOT_LOCKED$/m,
-      `and the link's target must not be what this run locked:\n${linked.stdout}`)
-    assert.match(linked.stdout, /is not excluded by this run/,
-      `and the operator must be told exactly what is not excluded:\n${linked.stdout}`)
-    assert.match(linked.stdout, /two runs of THIS checkout still cannot overlap/,
-      `and what still is:\n${linked.stdout}`)
+    assert.match(absent.stdout, /^RC=0$/m, absent.stdout)
+    assert.match(absent.stdout, /NOTHING HERE CAN EXCLUDE IT/,
+      `the limitation is a property of the relocation, not of what happens to be on the disk:\n${absent.stdout}`)
+    assert.match(absent.stdout, /^OLD_NAME_UNTOUCHED$/m,
+      `and nothing may be created at a name the service account controls — that was the r22 finding:\n${absent.stdout}`)
+
+    // MEASURED BY MUTATION, ROUTE STATED: the statement removed. Without it the run is silent
+    // about a population its lock does not cover, which is what "reads as covered" means.
+    const body = shellFunction(CUTOVER_NS_LIB, 'state_pre_r22_cutovers_are_not_excluded')
+    assert.ok(body.includes('NOTHING HERE CAN EXCLUDE IT'), `the shipped statement must name what is not excluded:\n${body}`)
+    const mutated = runR9(entry, ['acquire_cutover_lock'], [
+      'state_pre_r22_cutovers_are_not_excluded() { return 0; }',
+      ...NAMESPACE_OUTCOME_INLINE,
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(mutated.stdout, /^RC=0$/m, mutated.stdout)
+    assert.ok(!/NOTHING HERE CAN EXCLUDE IT/.test(mutated.stdout),
+      `without it the run says nothing at all about the cutovers it cannot exclude:\n${mutated.stdout}`)
+  })
+
+  test(`${entry.name} takes the /var/lib/ims-deploy lock only where that directory is private to this run`, () => {
+    /**
+     * THE ONE CONTINUITY CLAIM THAT SURVIVES, AND ITS PRECONDITION PROVED RATHER THAN ASSUMED
+     * (o3d-secops r23). A lock on a name inside a directory somebody else may write proves
+     * nothing; a lock on a name inside a directory only this run may write does. So the claim is
+     * made where dir_is_private_to_this_run() says it can be, and abandoned — loudly, with
+     * nothing opened or created — where it cannot.
+     *
+     * ROUTE: the shipped acquire_legacy_namespace_lock(), through acquire_cutover_lock().
+     */
+    const priv = runR9(entry, ['acquire_cutover_lock'], [
+      'mkdir -p "${LEGACY_CUTOVER_STATE_DIR}"',
+      'chmod 755 "${LEGACY_CUTOVER_STATE_DIR}"',
+      ...NAMESPACE_OUTCOME_INLINE,
+      '( exec 5<"${LEGACY_CUTOVER_STATE_DIR}/deploy.lock"; flock -n 5 && echo LEGACY_FREE || echo LEGACY_HELD )',
+      'echo "LEGACYMODE=$(LC_ALL=C stat -c "%a" "${LEGACY_CUTOVER_STATE_DIR}/deploy.lock" 2>/dev/null || echo missing)"',
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(priv.stdout, /^RC=0$/m, priv.stdout)
+    assert.match(priv.stdout, /^LEGACY_HELD$/m,
+      `where the directory is this run's own, the exclusion is real and must be taken:\n${priv.stdout}`)
+    assert.match(priv.stdout, /^LEGACYMODE=600$/m,
+      `and that lock is narrowed too — a readable lock file is a holdable one:\n${priv.stdout}`)
+
+    // AND WHERE IT IS NOT. A world-writable legacy directory is one in which the entry can be
+    // renamed between a predecessor's open and this one's, so nothing is opened, nothing is
+    // created, and what is not excluded is named.
+    const shared = runR9(entry, ['acquire_cutover_lock'], [
+      'mkdir -p "${LEGACY_CUTOVER_STATE_DIR}"',
+      'chmod 777 "${LEGACY_CUTOVER_STATE_DIR}"',
+      ...NAMESPACE_OUTCOME_INLINE,
+      '[[ -e "${LEGACY_CUTOVER_STATE_DIR}/deploy.lock" ]] && echo LEGACY_LOCK_CREATED || echo LEGACY_LOCK_ABSENT',
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(shared.stdout, /^RC=0$/m, shared.stdout)
+    assert.match(shared.stdout, /^LEGACY_LOCK_ABSENT$/m,
+      `nothing may be created as root at a name another account can replace:\n${shared.stdout}`)
+    assert.match(shared.stdout, /is not a directory only this run may write/,
+      `and the run must say why it is claiming nothing there:\n${shared.stdout}`)
+
+    // MEASURED BY MUTATION, ROUTE STATED: the precondition removed, which is r22's behaviour
+    // exactly. The lock is then taken inside a directory anybody can rename entries in, and the
+    // run reports an exclusion that proves nothing about who is running.
+    const guard = shellFunction(CUTOVER_NS_LIB, 'acquire_legacy_namespace_lock')
+    const PRECONDITION = '  if ! dir_is_private_to_this_run "${LEGACY_CUTOVER_STATE_DIR}"; then'
+    assert.ok(guard.includes(PRECONDITION), `the shipped claim must be conditional on its precondition:\n${guard}`)
+    const mutated = runR9(entry, ['acquire_cutover_lock'], [
+      guard.replace(PRECONDITION, '  if false; then'),
+      'mkdir -p "${LEGACY_CUTOVER_STATE_DIR}"',
+      'chmod 777 "${LEGACY_CUTOVER_STATE_DIR}"',
+      ...NAMESPACE_OUTCOME_INLINE,
+      '[[ -e "${LEGACY_CUTOVER_STATE_DIR}/deploy.lock" ]] && echo MUTANT_LOCK_CREATED || echo MUTANT_LOCK_ABSENT',
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(mutated.stdout, /^MUTANT_LOCK_CREATED$/m,
+      `without the precondition the run creates and locks a name in a directory anybody may write:\n${mutated.stdout}`)
   })
 
   test(`${entry.name} names a connection-fence record left at the pre-r22 path and does not read it`, () => {
@@ -11140,7 +11270,7 @@ test('[o3d-secops r22] the library aims every privileged operation at a descript
   assert.match(own, /^  chmod "\$\{mode\}" \.( |$)/m, `own_service_subdir must fchmod the descriptor it walked to:\n${own}`)
   assert.match(own, /^  chown "\$\{owner\}:\$\{owner\}" \. /m, `and fchown it:\n${own}`)
   const root = shellFunction(lib, 'ensure_cutover_root_dir')
-  assert.match(root, /^  if ! chmod 755 \. \|\| ! chown "\$\(id -u\):\$\(id -g\)" \.; then$/m,
+  assert.match(root, /^  if ! chmod 711 \. \|\| ! chown "\$\(id -u\):\$\(id -g\)" \.; then$/m,
     `and the parent itself is walked into before its mode and owner are applied:\n${root}`)
 
   const acquire = shellFunction(lib, 'acquire_cutover_lock')

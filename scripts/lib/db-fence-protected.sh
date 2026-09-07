@@ -1483,9 +1483,17 @@ db_fence_publish_operator_wrappers() {
 # line at all: they get EACCES from the kernel first, which is why every banner that names this
 # file prints a privilege transition in front of it. The gate is kept because the mode is not a
 # proof and this message is the better one if the mode ever changes.
-if [[ "$(id -u)" -ne 0 ]]; then
-  echo "Run this as root: ${sudo_prefix}${self}" >&2
-  echo "It publishes and removes the connection-fence authority in a root-owned directory, and drops to ${app_account} to run the protected helper. Since o3d-secops r23 the ${app_account} path is gone: that account cannot write the authority, which is the whole point of the round." >&2
+# BASH BUILTINS ONLY, AND FOR A STATED REASON. This gate runs before anything else in the
+# wrapper, including the digest check, so it has to hold on a PATH that carries nothing: a
+# `dirname` or a `stat` here turns "you are not the right account" into "command not found" at
+# the one moment there is no time to debug it. `${var%/*}` is the shell own dirname and `-O` is
+# the shell own "owned by the effective uid". The mode of that directory is asked as well, but
+# in the process that does the publication -- see the validator, which lstats it and refuses a
+# group- or other-writable one before it renames anything.
+authority_dir="${state_file%/*}"
+if [[ -z "${authority_dir}" || ! -d "${authority_dir}" || ! -O "${authority_dir}" ]]; then
+  echo "Run this as the account that owns ${authority_dir} — on an installed host that is root: ${sudo_prefix}${self}" >&2
+  echo "This wrapper PUBLISHES and REMOVES the connection-fence authority in that directory, and drops to ${app_account} to run the protected helper. Until o3d-secops r23 it also accepted being run BY ${app_account}, because the record was that account's to write; it is not any more, and a wrapper that account could usefully run is one that could write the record." >&2
   exit 1
 fi
 # The tree this is about to execute must still be the tree this wrapper was written for.
@@ -1526,8 +1534,11 @@ if [[ -z "${DEPLOY_ADMIN_DATABASE_URL:-}" ]]; then
   echo "fence revoked CONNECT from; see docs/installation.md." >&2
   exit 1
 fi
+# `runuser` needs root; where this is already running AS the application account there is no
+# switch to make. The branch is about the switch and never about the gate above, which is what
+# decides whether this wrapper may run at all.
 run_helper() {
-  runuser -u "${app_account}" -- env "$@"
+  if [[ "$(id -un)" == "${app_account}" ]]; then env "$@"; else runuser -u "${app_account}" -- env "$@"; fi
 }
 # THE THREE STEPS, BAKED (o3d-secops r23, Codex CRITICAL). The authority this wrapper acts on is
 # published by ROOT out of a plan the unprivileged helper prints, validated field by field and
