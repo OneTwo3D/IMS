@@ -1501,8 +1501,11 @@ async function assessFenceRequest(client, options, prefix) {
     console.error(`${prefix}: the connection-fence authority at ${options.stateFile} was not published by the account this run acts for (${read.detail}).`)
     console.error('That file decides which roles a release hands CONNECT back to, so a copy anything else could')
     console.error('have written is a list of roles somebody else chose. It has NOT been read.')
-    console.error('Nothing has been revoked. Fix the ownership of that path — it is published by root through')
-    console.error('publish_durable_file() and nothing else may write it — and re-run.')
+    console.error('Nothing has been revoked. That path is published by root and nothing else may write it, so')
+    console.error('this is either a host being upgraded from a checkout whose helper wrote it, or a plant.')
+    console.error('IF A FENCE IS STANDING, the file itself is still there and still readable by root: read it,')
+    console.error(`restore the grants it names by hand (GRANT CONNECT ON DATABASE <db> TO <each of "revoked">),`)
+    console.error('remove it, and re-run. Nothing here will act on it.')
     return { exitCode: EXIT_NOT_FENCEABLE }
   }
   if (read.status === STATE_UNREADABLE || read.status === STATE_CORRUPT) {

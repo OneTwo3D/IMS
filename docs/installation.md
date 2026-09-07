@@ -2622,6 +2622,13 @@ directory in the cutover namespace any more — the plan travels on a pipe. The 
 world-**readable** because the executor is unprivileged and must obey it; readable is not writable,
 and it holds role names, not secrets.
 
+**Upgrading a host to r23.** `/etc/ims-cutover-state/db-fence` was owned by the service account at
+`0700`; the namespace walk re-owns it to root at `0755` on the next cutover. A record the *previous*
+checkout's helper left inside it is that account's, so the provenance gate refuses it — loudly, with
+nothing revoked or granted. That is the safe direction and it is not a dead end: the file is still
+there and still readable by root. If a fence really was standing, read it, run the `GRANT CONNECT`
+statements for every role in its `revoked` list by hand as a superuser, remove it, and re-run.
+
 **What this does not close, said plainly.** The helper runs with `DEPLOY_ADMIN_DATABASE_URL` in its
 environment for the length of a cutover, so during that window the application account can issue any
 SQL the admin can — this record included. What the split closes is the **persistent** half, which is
