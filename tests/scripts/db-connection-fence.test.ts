@@ -62,6 +62,12 @@ import {
   FENCE_MODE_INITIAL,
   FENCE_MODE_RECOVERY,
   assessAuthorityDrift,
+  // o3d-secops r26: the rule that settles an unstamped record, and the mode that drives it.
+  LEGACY_FENCE_ABSENT,
+  LEGACY_FENCE_AMBIGUOUS,
+  LEGACY_FENCE_STANDS,
+  assessLegacyFenceEvidence,
+  doAuditAuthority,
   assessDatabaseIdentity,
   assessUnrecordedRelease,
   authorityFenceMode,
@@ -832,6 +838,19 @@ class FakeAdminClient {
     if (sql.includes('FROM pg_roles r')) return { rows: [] }
     if (sql.includes('pg_terminate_backend')) return { rows: [] }
     if (sql.includes('FROM pg_stat_activity')) return { rows: this.options.attached ?? [] }
+    // o3d-secops r26: the one read `--audit-authority` makes. Its aliases are its own, so this
+    // branch cannot be reached by any other mode's question and vice versa.
+    if (sql.includes('AS audited_database')) {
+      return {
+        rows: [
+          {
+            audited_database: this.options.connectedDatabase ?? 'imsdb',
+            audited_owner_role: 'owner',
+            audited_datacl: this.options.datacl === undefined ? '{owner=CTc/owner,=Tc/owner,imsapp=c/owner}' : this.options.datacl,
+          },
+        ],
+      }
+    }
     if (sql.includes('FROM pg_database d WHERE d.datname = $1')) {
       return { rows: [{ datacl: this.options.releasedDatacl ?? null, owner_role: 'owner' }] }
     }
@@ -1540,6 +1559,137 @@ test('db_fence_raise clears the authority a FAILED PUBLICATION left behind (o3d-
  * The discriminator is the key's presence, not its value, and it holds because the directory is
  * root-owned and unwritable by anything else — the same argument `fence_mode` already rests on.
  */
+/**
+ * THE RULE THAT SETTLES AN UNSTAMPED RECORD, READ AS A RULE (o3d-secops r26, Codex HIGH).
+ *
+ * Pure and separate from the mode that drives it, for the reason assessAuthorityDrift() is: what
+ * the ACL is allowed to prove must be readable without a database beside it.
+ *
+ * MUTATION ROUTE (each made against the shipped file and reverted):
+ *   1. drop the `named.length === 0` guard: a record naming nobody reports `absent` — both later
+ *      branches are vacuously true over an empty list — and the wrapper CLEARS the record of a
+ *      fence it never looked at.
+ *   2. return LEGACY_FENCE_STANDS for the mixed case instead of AMBIGUOUS: a fence that was half
+ *      applied, and a host where an administrator removed one recorded role by hand, are both
+ *      stamped as standing fences.
+ */
+test('the ACL settles an unstamped record in three ways, and refuses in the third (o3d-secops r26)', () => {
+  const recorded = ['PUBLIC', 'imsapp', 'analytics']
+
+  // NO FENCE STANDS. The REVOKE names exactly these roles, so it cannot have run.
+  const spent = assessLegacyFenceEvidence({ recorded, holding: ['analytics', 'PUBLIC', 'imsapp'] })
+  assert.equal(spent.verdict, LEGACY_FENCE_ABSENT, 'every recorded grantee still connects')
+  assert.deepEqual(spent.lost, [], 'and nothing was taken from any of them')
+
+  // A FENCE STANDS. Not one of them holds CONNECT, which nothing else on an ordinary host does.
+  const standing = assessLegacyFenceEvidence({ recorded, holding: [] })
+  assert.equal(standing.verdict, LEGACY_FENCE_STANDS)
+  assert.deepEqual(standing.lost, recorded, 'and it names whose CONNECT is gone')
+
+  // AND THE MIXED READING, WHICH IS NEITHER. A half-applied fence and an administrator who removed
+  // one of these roles by hand are the same bytes from here.
+  const mixed = assessLegacyFenceEvidence({ recorded, holding: ['PUBLIC'] })
+  assert.equal(mixed.verdict, LEGACY_FENCE_AMBIGUOUS)
+  assert.deepEqual([mixed.holding, mixed.lost], [['PUBLIC'], ['imsapp', 'analytics']],
+    'and both lists are handed back, because the operator is the one who decides')
+
+  // A RECORD NAMING NOBODY IS NOT AN ANSWER EITHER. Both other branches are vacuously true over an
+  // empty list — every grantee holds CONNECT and no grantee holds CONNECT — so it is refused.
+  for (const empty of [[], undefined, ['', null] as unknown as string[]]) {
+    const nothing = assessLegacyFenceEvidence({ recorded: empty as string[], holding: [] })
+    assert.equal(nothing.verdict, LEGACY_FENCE_AMBIGUOUS, `${JSON.stringify(empty)} settles nothing`)
+  }
+})
+
+/**
+ * `--audit-authority` ASKS THE DATABASE AND WRITES NOTHING (o3d-secops r26, Codex HIGH).
+ *
+ * ROUTE: the shipped doAuditAuthority() over a record the shipped validator published, against a
+ * REAL `datacl` string of the shape PostgreSQL prints — an unfenced database's, then a fenced
+ * one's, then one an administrator has edited. The verdict is read off stdout the way the
+ * operator wrapper reads it, and the exit status the way the wrapper acts on it.
+ *
+ * MUTATION ROUTE (made against the shipped file and reverted): read `holding` with
+ * has_database_privilege()'s question instead of granteeHasConnect()'s — that is, treat every
+ * recorded grantee as holding CONNECT — and the FENCED case below reports `absent`, which is the
+ * wrapper deleting the record of a fence that is standing.
+ */
+test('--audit-authority reads the live ACL, decides, and touches nothing (o3d-secops r26)', async (t) => {
+  const dir = stateDir(t)
+  const stateFile = join(dir, 'db-connect-fence.json')
+  const record = { ...SAMPLE_STATE, revoked: ['PUBLIC', 'imsapp'] }
+  publishAuthority(stateFile, record)
+  const legacy = JSON.parse(readFileSync(stateFile, 'utf8'))
+  delete legacy.fence_applied
+  delete legacy.fence_mode
+  writeFileSync(stateFile, `${JSON.stringify(legacy, null, 2)}\n`)
+  const untouched = readFileSync(stateFile, 'utf8')
+
+  const audit = async (datacl: string | null, connectedDatabase = 'imsdb') => {
+    const client = new FakeAdminClient({ stateFile, datacl, connectedDatabase })
+    const written: string[] = []
+    const stdout = process.stdout.write.bind(process.stdout)
+    process.stdout.write = ((chunk: string) => { written.push(String(chunk)); return true }) as typeof process.stdout.write
+    try {
+      const code = await withAdminUrl(() => doAuditAuthority(client as never, {
+        stateFile, appRole: 'imsapp', ...suppliedIdentity({ appDatabase: 'imsdb' }),
+      }))
+      return { code, verdict: written.join('').trim(), log: client.log }
+    } finally {
+      process.stdout.write = stdout
+    }
+  }
+
+  // 1. THE DATABASE IS NOT FENCED: PUBLIC and the application both still hold CONNECT directly,
+  //    so the REVOKE this record describes never ran.
+  const spent = await audit('{owner=CTc/owner,=Tc/owner,imsapp=c/owner}')
+  assert.equal(spent.verdict, `legacy_fence_verdict=${LEGACY_FENCE_ABSENT}`)
+  assert.equal(spent.code, EXIT_OK, 'exit 0 is the status the wrapper clears the record on')
+
+  // 2. THE DATABASE IS FENCED: the owner keeps its own entry and nothing else holds CONNECT.
+  const standing = await audit('{owner=CTc/owner}')
+  assert.equal(standing.verdict, `legacy_fence_verdict=${LEGACY_FENCE_STANDS}`)
+  assert.equal(standing.code, EXIT_FENCE_STANDING, 'exit 5 is the status the wrapper stamps on')
+
+  // 3. AND THE MIXED ONE. PUBLIC lost CONNECT and the application kept it — which is what a fence
+  //    interrupted between two REVOKEs leaves, and also what an administrator revoking PUBLIC by
+  //    hand leaves. Neither action may follow from it.
+  const mixed = await audit('{owner=CTc/owner,imsapp=c/owner}')
+  assert.equal(mixed.verdict, `legacy_fence_verdict=${LEGACY_FENCE_AMBIGUOUS}`)
+  assert.equal(mixed.code, EXIT_FENCE_UNPROVEN, 'exit 4 is the status that means the wrapper must not act')
+
+  // NOTHING IN ANY OF THE THREE WROTE, OPENED A TRANSACTION OR CHANGED A GRANT. This is what makes
+  // it safe to hand to an operator staring at a fence they cannot explain.
+  for (const run of [spent, standing, mixed]) {
+    assert.deepEqual(run.log.filter((sql) => /^(BEGIN|COMMIT|ROLLBACK|GRANT|REVOKE)/.test(sql)), [],
+      `the audit must issue no transaction and no grant:\n${run.log.join(' | ')}`)
+  }
+  assert.equal(readFileSync(stateFile, 'utf8'), untouched, 'and the record must be exactly as it was found')
+
+  // AND IT REFUSES RATHER THAN GUESSING WHEN IT IS POINTED SOMEWHERE ELSE — at another database,
+  // where the ACL it would read is not the one this record was written against.
+  const elsewhere = await audit('{owner=CTc/owner}', 'otherdb')
+  assert.equal(elsewhere.code, EXIT_ERROR, 'a connection attached elsewhere settles nothing')
+  assert.equal(elsewhere.verdict, '', 'and prints no verdict at all, so nothing downstream can act on one')
+
+  // NOR WITH NO RECORD TO AUDIT.
+  const absent = new FakeAdminClient({ datacl: '{owner=CTc/owner}' })
+  const missing = await withAdminUrl(() => doAuditAuthority(absent as never, {
+    stateFile: join(dir, 'does-not-exist.json'), appRole: 'imsapp', ...suppliedIdentity({ appDatabase: 'imsdb' }),
+  }))
+  assert.equal(missing, EXIT_ERROR, 'there is nothing to ask the ACL about')
+
+  // AND A RECORD THE PUBLISHING ACCOUNT DID NOT WRITE IS NEVER READ — the audit's verdict decides
+  // whether root stamps a fence applied, so it goes through the same provenance gate as everything
+  // else that acts on this file.
+  const foreign = new FakeAdminClient({ stateFile, datacl: '{owner=CTc/owner}' })
+  const foreignCode = await withAdminUrl(() => doAuditAuthority(foreign as never, {
+    stateFile, appRole: 'imsapp', ...suppliedIdentity({ appDatabase: 'imsdb' }),
+    stateOwnerUid: (process.getuid?.() ?? 0) + 4242,
+  }))
+  assert.equal(foreignCode, EXIT_ERROR, 'a record this run does not act for may not drive a stamp')
+})
+
 /**
  * AN UNSTAMPED RECORD BUYS NOTHING, AND THE RELEASE STILL WORKS OVER IT
  * (o3d-secops r26, Codex HIGH — this test REPLACES r25's `a fence raised before the applied stamp

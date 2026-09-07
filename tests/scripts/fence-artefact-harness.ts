@@ -219,6 +219,7 @@ export function protectedPaths(root: string): {
   manifestFile: string
   releaseWrapper: string
   refenceWrapper: string
+  resolveWrapper: string
 } {
   const recovery = join(root, 'recovery')
   return {
@@ -230,5 +231,8 @@ export function protectedPaths(root: string): {
     manifestFile: join(recovery, 'db-fence-artefact.manifest'),
     releaseWrapper: join(recovery, 'release-db-fence'),
     refenceWrapper: join(recovery, 'refence-db'),
+    // o3d-secops r26: the third wrapper, which no cutover runs. It is the one-time operator way
+    // out of an authority that carries no applied stamp.
+    resolveWrapper: join(recovery, 'resolve-legacy-db-fence'),
   }
 }

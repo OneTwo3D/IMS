@@ -2270,16 +2270,19 @@ export async function doRelease(client, options) {
  * `--print-migration-url` does the same: the caller captures it.
  */
 export async function doAuditAuthority(client, options) {
-  const { rows: attachment } = await client.query(
-    `SELECT current_database()                        AS connected_database,
-            pg_catalog.pg_get_userbyid(d.datdba)      AS owner_role,
-            d.datacl::text                            AS datacl
+  // ONE READ, WITH ALIASES OF ITS OWN. `audited_database` rather than the `connected_database`
+  // --release asks for: two modes that ask different questions must not be answerable by the same
+  // branch of anything, a rig included.
+  const { rows: audited } = await client.query(
+    `SELECT current_database()                        AS audited_database,
+            pg_catalog.pg_get_userbyid(d.datdba)      AS audited_owner_role,
+            d.datacl::text                            AS audited_datacl
        FROM pg_database d
       WHERE d.datname = current_database()`,
   )
-  const connectedDatabase = attachment[0]?.connected_database ?? ''
-  const ownerRole = attachment[0]?.owner_role ?? ''
-  const datacl = attachment[0]?.datacl ?? null
+  const connectedDatabase = audited[0]?.audited_database ?? ''
+  const ownerRole = audited[0]?.audited_owner_role ?? ''
+  const datacl = audited[0]?.audited_datacl ?? null
 
   // THE SAME PROVENANCE GATE AS EVERY OTHER READER OF THIS RECORD. The verdict this prints decides
   // whether root stamps a fence applied — which buys the recovery rule, which is the tolerance the
