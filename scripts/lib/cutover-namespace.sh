@@ -400,6 +400,121 @@ narrow_held_lock() {
   return 0
 }
 
+# THE MODE THE DESCRIPTOR WAS OPENED ON, ASKED BEFORE ANYTHING NARROWS IT
+#
+#   held_lock_mode <fd>
+#
+# Printed rather than returned, because the answer is three octal digits and the caller compares
+# them. `stat -L` of /proc/self/fd/N for the same reason narrow_held_lock() chmods it: the magic
+# link is resolved by the kernel to the OPEN FILE, so this is an fstat of the inode this run is
+# holding and not a second walk of a pathname somebody could have re-aimed in between.
+#
+# `|| true`, so a stat that could not run yields the empty string — which lock_mode_is_private()
+# reads as "not private", and the failure direction is therefore the one that repairs.
+held_lock_mode() {
+  local fd="$1"
+  LC_ALL=C stat -L -c '%a' "/proc/self/fd/${fd}" 2>/dev/null || true
+}
+
+# WHETHER A MODE IS ONE NO OTHER ACCOUNT COULD HAVE OPENED
+#
+#   lock_mode_is_private <mode>
+#
+# `flock(2)` needs nothing but an open descriptor, so any bit that lets another account OPEN this
+# file is a bit that lets it hold this lock. The question is therefore about group and other, and
+# about read as much as write. An empty or unreadable mode answers "no".
+lock_mode_is_private() {
+  local mode="$1"
+  [[ -n "${mode}" ]] || return 1
+  (( (8#${mode} & 0077) == 0 )) || return 1
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# A LOCK THAT WAS EVER WIDE IS REPLACED, NOT REPAIRED (o3d-secops r24, Codex MEDIUM)
+#
+#   rotate_cutover_lock_inode <path>
+#
+# THE FINDING, AND IT IS PLAIN UNIX SEMANTICS. r23 narrowed an inherited 0644 lock to 0600 on the
+# descriptor and proved the new mode off that same descriptor, and concluded that only a privileged
+# account could now take this lock. PERMISSION IS CHECKED AT `open(2)` AND NEVER AGAIN. An
+# application-account process on a host upgraded from a checkout that left this file at 0644 can
+# have opened it BEFORE this run started, without locking it — nothing about an open is visible to
+# `fuser` in the way a lock is, and nothing about it is affected by a later `chmod`. It keeps a
+# usable descriptor. The moment this cutover exits and releases fd 9, that process can `flock` its
+# descriptor and hold the canonical lock indefinitely, and every deploy, update and install on the
+# box afterwards dies at the exclusion with nothing to point at. Narrowing in place revokes nothing
+# that is already held.
+#
+# SO THE INODE IS REPLACED. A fresh 0600 file is created in the same root-owned directory, opened,
+# verified, narrowed and LOCKED, and only then renamed over the canonical name. A descriptor
+# somebody opened while the old file was wide still refers to the old inode — which now has no name
+# — so the lock they can take on it is a lock on nothing, and the next cutover opens the
+# replacement and is not blocked by it.
+#
+# WHAT THAT BUYS AND WHAT IT COSTS, WORKED OUT RATHER THAN ASSERTED. Replacing an inode means
+# giving up exclusion against whoever still holds the old one. That is the whole trade, and it is
+# acceptable here for a reason that has to be stated to be checked:
+#
+#   * THIS IS ONLY EVER REACHED WHILE THIS RUN HOLDS `flock` ON THE OLD INODE. The caller flocks
+#     fd 9 first and dies if it cannot, so at the instant of the rename nothing else holds that
+#     lock — proved, not assumed. There is no predecessor to orphan.
+#   * AND fd 9 IS DELIBERATELY KEPT OPEN AFTERWARDS, for the whole run. Anything that opened the
+#     old inode before the rename and reaches its own `flock` later is still refused by us, so the
+#     window between the rename and the end of this cutover is covered too.
+#   * A GENUINE CONCURRENT CUTOVER THEREFORE NEVER LOSES. If it got here first it holds the old
+#     inode's lock, our `flock -n 9` fails, we die with "Another cutover ... holds" and NOTHING IS
+#     ROTATED -- its inode is never swapped out from under it. If it arrives while we hold fd 9 it
+#     is refused on the old inode; if it arrives after the rename it is refused on the new one. The
+#     only process that can ever take the orphaned inode's lock is one that opened it and then did
+#     not immediately try to lock it, and no cutover in this repository is ever in that state:
+#     `flock -n` is non-blocking, follows the open in this same function, and every failure is a
+#     `die`. That state belongs to the holdout this exists to defeat, and to nothing else.
+#   * AND IT HAPPENS ONCE. The gate is the mode the lock was INHERITED at, so the run after this
+#     one finds 0600 and rotates nothing; the canonical inode is stable from then on.
+#
+# THE DESCRIPTOR NUMBER IS A LITERAL, and it is 6 — the number the canonical lock used before r22,
+# free since r23 gave it back. `exec` cannot take an fd from a variable without `eval`, which the
+# lexical scanner these scripts are held to refuses. So the replacement is held on 6 and the
+# inherited inode stays on 9, and the cutover exclusion for the rest of the run is 6.
+#
+# THE PRIMITIVES ARE prepare_cutover_lock_file()'s, for its reasons: `set -C` is
+# `open(O_CREAT|O_EXCL)` and cannot create or truncate through a symlink, `stat -c %F` is an lstat,
+# `chown -h` never dereferences. The staging name is this process's own inside a directory only
+# root may write, so nothing else can be at it; a leftover from a crashed run with the same pid is
+# removed first.
+rotate_cutover_lock_inode() {
+  local path="$1" temporary kind
+  temporary="${path}.rotate.$$"
+  rm -f "${temporary}" 2>/dev/null || true
+  ( umask 077; set -C; : > "${temporary}" ) 2>/dev/null || return 1
+  kind="$(LC_ALL=C stat -c '%F' "${temporary}" 2>/dev/null || true)"
+  if [[ "${kind}" != "regular file" && "${kind}" != "regular empty file" ]]; then
+    rm -f "${temporary}" 2>/dev/null || true
+    return 1
+  fi
+  chown -h "$(id -u):$(id -g)" "${temporary}" 2>/dev/null || true
+  exec 6<"${temporary}"
+  if ! verify_held_lock 6 "${temporary}" || ! narrow_held_lock 6 || ! flock -n 6; then
+    exec 6<&-
+    rm -f "${temporary}" 2>/dev/null || true
+    return 1
+  fi
+  # THE RENAME IS THE PUBLICATION, and it is made while both locks are held: fd 9 on the inode
+  # being retired and fd 6 on the one taking its place. Nothing can be handed a lock on the
+  # canonical name in between, because there is no instant in which the name is unlocked.
+  if ! mv -f "${temporary}" "${path}" 2>/dev/null; then
+    exec 6<&-
+    rm -f "${temporary}" 2>/dev/null || true
+    return 1
+  fi
+  # AND THE NAME NOW MEANS THE DESCRIPTOR THIS RUN IS LOCKING, asked the same way the first
+  # acquisition asked it. A rename that landed somewhere else, or a name replaced in the instant
+  # after it, is a run that cannot say what it is excluding.
+  verify_held_lock 6 "${path}" || return 1
+  return 0
+}
+
 # ---------------------------------------------------------------------------
 # THE NAMESPACE, CREATED BEFORE ANYTHING IS LOCKED OR WRITTEN
 #
@@ -487,13 +602,22 @@ ensure_cutover_root_dir() {
 #   8  the /var/lib/ims-deploy namespace deploy.sh used before the shared one — taken ONLY
 #      where that directory is proved to be one no other account may write
 #
-# (6 was ${CUTOVER_STATE_DIR}/cutover.lock, where the canonical lock lived before r22. r23 gave
-# it back: see THE BRIDGE r22 SHIPPED below. Nothing in this file opens a name inside a directory
-# the service account can write.)
+#   6  the REPLACEMENT canonical lock, taken only where this run inherited a lock that had been
+#      openable by another account and had therefore to be replaced rather than narrowed
+#      (o3d-secops r24). 9 stays open on the retired inode for the rest of the run, deliberately:
+#      see rotate_cutover_lock_inode().
+#
+# (6 held ${CUTOVER_STATE_DIR}/cutover.lock before r22, where the canonical lock used to live; r23
+# gave it back — see THE BRIDGE r22 SHIPPED below — and r24 re-allocates it for the replacement.
+# Nothing in this file opens a name inside a directory the service account can write.)
 #
 # (7 is the crontab reconciliation lock; see lib/crontab-lock.sh, which explains why it is not
 # one of these and why none of these may be re-`exec`ed while a run is in flight.)
 acquire_cutover_lock() {
+  # INITIALISED, not merely declared: `local name` leaves the name UNSET, and every one of these
+  # scripts runs under `set -u`, so a path that reached the gate below without passing through the
+  # read would abort on an unbound variable instead of being told the mode is not private.
+  local inherited_lock_mode=""
   ensure_cutover_state_dirs || die "Could not create ${CUTOVER_ROOT_DIR}; the cutover namespace is unusable. Nothing has been stopped."
   prepare_cutover_lock_file "$LOCK_FILE" || die \
     "${LOCK_FILE} is not a regular file this run may lock. It lives in ${CUTOVER_ROOT_DIR}, which is root-owned and which no other account may write, so anything else at that name was put there by a privileged process. Refusing to run a cutover without the exclusion. Nothing has been stopped."
@@ -507,9 +631,25 @@ acquire_cutover_lock() {
   # this lock and hold it: at 0644 the service account could freeze every cutover on the box for
   # as long as it liked. Narrowed on the descriptor verify_held_lock() has just identified, and
   # proven off that same descriptor, BEFORE the exclusion is claimed.
+  # AND WHAT IT WAS BEFORE THIS RUN TOUCHED IT (o3d-secops r24, Codex MEDIUM). Read off the same
+  # descriptor, BEFORE the narrowing, because it is the only moment the answer still exists: a
+  # mode of 0644 here means every account on the box could have opened this inode at any time up
+  # to now, and `chmod` cannot reach a descriptor somebody is already holding. It decides whether
+  # the inode is repaired or REPLACED — see rotate_cutover_lock_inode().
+  inherited_lock_mode="$(held_lock_mode 9)"
   narrow_held_lock 9 || die \
     "${LOCK_FILE} could not be narrowed to 0600, so this run cannot show that the exclusion it is about to take is one only a privileged account can take. \`flock\` needs nothing but an open descriptor, and a lock file any account may open is a lock any account may hold — indefinitely, against every future deploy, update and install. Refusing to run a cutover on it. Nothing has been stopped."
-  flock -n 9 || die "Another cutover (deploy.sh, update.sh or install.sh) holds ${LOCK_FILE}. Refusing to run two cutovers at once. If no cutover is running, something else is holding that descriptor — \`fuser -v ${LOCK_FILE}\` names it; a host upgraded from a checkout that left this file at 0644 could have had it opened by ${APP_USER} before this run narrowed it."
+  flock -n 9 || die "Another cutover (deploy.sh, update.sh or install.sh) holds ${LOCK_FILE}. Refusing to run two cutovers at once. If no cutover is running, something else is holding that descriptor — \`fuser -v ${LOCK_FILE}\` names it; a host upgraded from a checkout that left this file at 0644 could have had it opened by ${APP_USER} before this run narrowed it. NOTHING HAS BEEN ROTATED: the replacement below is reached only once this run holds that lock, so a predecessor's inode is never swapped out from under it."
+  # A LOCK THAT WAS EVER OPENABLE BY ANOTHER ACCOUNT IS REPLACED RATHER THAN REPAIRED (o3d-secops
+  # r24, Codex MEDIUM). The narrowing above closes the door to new opens and does nothing at all to
+  # a descriptor the service account already holds from when this file was 0644 — permission is
+  # checked at `open(2)`. Held here, after the exclusion is proved and while it is held, so that
+  # the retiring inode is one nothing else can be locking. See rotate_cutover_lock_inode() for what
+  # replacing an inode buys, what it gives up, and why a genuine concurrent cutover never loses.
+  if ! lock_mode_is_private "${inherited_lock_mode}"; then
+    rotate_cutover_lock_inode "$LOCK_FILE" || die \
+      "${LOCK_FILE} was inherited at mode ${inherited_lock_mode:-unreadable} — openable, and therefore lockable, by accounts other than this one — and this run could not replace it with a fresh 0600 inode it holds. Narrowing it in place would not help: \`chmod\` cannot reach a descriptor ${APP_USER} opened while the file was wide, and that descriptor can block every future deploy, update and install on this box. Refusing to run a cutover behind an exclusion this run cannot show it owns. Nothing has been stopped."
+  fi
   acquire_legacy_namespace_lock
   state_pre_r22_cutovers_are_not_excluded
   warn_pre_r22_db_fence_state

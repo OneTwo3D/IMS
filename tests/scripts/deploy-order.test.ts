@@ -46,6 +46,9 @@ const CUTOVER_NS_FUNCTIONS = new Set([
   'own_service_subdir',
   'verify_held_lock',
   'narrow_held_lock',
+  'held_lock_mode',
+  'lock_mode_is_private',
+  'rotate_cutover_lock_inode',
   'dir_is_private_to_this_run',
   'prepare_cutover_lock_file',
   'ensure_cutover_root_dir',
@@ -4141,7 +4144,8 @@ function runR9(
           ? ['enter_service_subdir', 'own_service_subdir', 'ensure_cutover_root_dir', name]
           : name === 'acquire_cutover_lock'
             ? ['enter_service_subdir', 'own_service_subdir', 'ensure_cutover_root_dir', 'ensure_cutover_state_dirs',
-               'prepare_cutover_lock_file', 'verify_held_lock', 'narrow_held_lock', 'dir_is_private_to_this_run',
+               'prepare_cutover_lock_file', 'verify_held_lock', 'narrow_held_lock', 'held_lock_mode',
+               'lock_mode_is_private', 'rotate_cutover_lock_inode', 'dir_is_private_to_this_run',
                'acquire_legacy_namespace_lock', 'state_pre_r22_cutovers_are_not_excluded',
                'warn_pre_r22_db_fence_state', name]
             : [name]))
@@ -10998,6 +11002,9 @@ const CUTOVER_NS_OWNED = [
   'ensure_cutover_state_dirs',
   'verify_held_lock',
   'narrow_held_lock',
+  'held_lock_mode',
+  'lock_mode_is_private',
+  'rotate_cutover_lock_inode',
   'dir_is_private_to_this_run',
   'prepare_cutover_lock_file',
   'acquire_cutover_lock',
@@ -11025,6 +11032,13 @@ const NAMESPACE_OUTCOME = [
 /** The same, with the acquisition in THIS shell, so the descriptors — and the locks on them —
  *  outlive it and can be asked about. */
 const NAMESPACE_OUTCOME_INLINE = ['acquire_cutover_lock', 'echo "RC=0"', ...NAMESPACE_OUTCOME.slice(1)]
+
+/** o3d-secops r24: the rotation replaces the canonical inode, so it may only ever run once this run
+ *  has PROVED nothing else holds the lock on it — which is `flock -n 9` succeeding. Written as a
+ *  predicate rather than inline so the ordering is stated once. */
+const ACQUIRE_ORDER = (acquire: string) =>
+  acquire.indexOf('flock -n 9') !== -1 &&
+  acquire.indexOf('rotate_cutover_lock_inode "$LOCK_FILE"') > acquire.indexOf('flock -n 9')
 
 for (const entry of R9_SCRIPTS) {
   test(`${entry.name} creates the cutover namespace under a root-owned parent, and takes the lock on it`, () => {
@@ -11281,8 +11295,11 @@ for (const entry of R9_SCRIPTS) {
     const PREPARE = shellFunction(CUTOVER_NS_LIB, 'prepare_cutover_lock_file')
     const STATED_UMASK = '( umask 077; set -C; : > "${path}" )'
     assert.ok(PREPARE.includes(STATED_UMASK), `the shipped creation must state its own umask:\n${PREPARE}`)
+    // r24: with the rotation stubbed out, so what is measured here is still the NARROWING alone —
+    // the two repairs both end at 0600 and this case would otherwise stop distinguishing them.
     const wideCreate = runR9(entry, ['acquire_cutover_lock'], [
       PREPARE.replace(STATED_UMASK, '( umask 022; set -C; : > "${path}" )'),
+      'rotate_cutover_lock_inode() { return 0; }',
       ...NAMESPACE_OUTCOME_INLINE,
     ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
     assert.match(wideCreate.stdout, /^LOCK=regular (empty )?file 600$/m,
@@ -11290,12 +11307,22 @@ for (const entry of R9_SCRIPTS) {
 
     // MUTATION B, ROUTE STATED: and with BOTH gone, which is r22 exactly. 0644, and the run
     // reports an exclusion any account able to open that file could have taken first.
+    //
+    // THE THIRD STUB IS r24's AND IS WHY THIS MUTATION CHANGED (o3d-secops r24, Codex MEDIUM).
+    // r24 added a SECOND repair for a wide inherited lock — rotate_cutover_lock_inode(), which
+    // replaces the inode rather than narrowing it, because `chmod` cannot reach a descriptor
+    // somebody already holds. It leaves a 0600 lock too, so with only the two r23 stubs in place
+    // this mutation would no longer reproduce r22 and would pass while measuring nothing. What is
+    // being exhibited is unchanged; reproducing it now takes removing both repairs.
     const ACQUIRE = shellFunction(CUTOVER_NS_LIB, 'acquire_cutover_lock')
     const NARROW = '  narrow_held_lock 9 || die'
     assert.ok(ACQUIRE.includes(NARROW), `the shipped acquisition must narrow the descriptor it locks:\n${ACQUIRE}`)
+    assert.ok(ACQUIRE.includes('rotate_cutover_lock_inode "$LOCK_FILE" || die'),
+      `and replace one it inherited wide, rather than believing a chmod reached a descriptor somebody already had:\n${ACQUIRE}`)
     const pre23 = runR9(entry, ['acquire_cutover_lock'], [
       PREPARE.replace(STATED_UMASK, '( umask 022; set -C; : > "${path}" )'),
       'narrow_held_lock() { return 0; }',
+      'rotate_cutover_lock_inode() { return 0; }',
       ...NAMESPACE_OUTCOME_INLINE,
       'echo "MUTANT_GROUPOTHER=$(( $(LC_ALL=C stat -c "0%a" "${LOCK_FILE}") & 0077 ))"',
     ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
@@ -11316,6 +11343,148 @@ for (const entry of R9_SCRIPTS) {
       `a mode this run could not set must end the run, not be assumed:\n${refused.stdout}`)
     assert.match(refused.stdout, /could not be narrowed to 0600/,
       `and say what it could not establish:\n${refused.stdout}`)
+  })
+
+  test(`${entry.name} replaces a lock inode that was ever openable by another account, so a descriptor opened while it was wide cannot block a later cutover`, () => {
+    /**
+     * o3d-secops r24, Codex MEDIUM. PERMISSION IS CHECKED AT `open(2)` AND NEVER AGAIN.
+     *
+     * r23 narrowed an inherited 0644 lock to 0600 on the descriptor, proved the new mode off that
+     * same descriptor, and concluded that only a privileged account could now take this lock. It
+     * revokes nothing already held: on a host upgraded from a checkout that left this file at
+     * 0644, ${APP_USER} can have opened it BEFORE the cutover started, WITHOUT locking it — an
+     * open is invisible where a lock is not — and the `chmod` does not touch that descriptor. The
+     * instant this cutover exits, that process `flock`s what it has been holding all along and
+     * every deploy, update and install afterwards dies at the exclusion with nothing to point at.
+     *
+     * ROUTE: the shipped acquire_cutover_lock() over a 0644 lock, with a real unlocked descriptor
+     * open on it across the whole run, and then the two questions that matter — can the holdout
+     * take a lock, and does anything it takes block the NEXT cutover.
+     */
+    const fixture = [
+      'mkdir -p "${CUTOVER_ROOT_DIR}"',
+      '( umask 022; : > "${LOCK_FILE}" )',
+      'echo "BEFORE=$(LC_ALL=C stat -c "%a" "${LOCK_FILE}")"',
+      'old_inode="$(LC_ALL=C stat -c "%i" "${LOCK_FILE}")"',
+      // THE HOLDOUT. Opened while the file is wide, and deliberately NOT locked: that is the state
+      // nothing the cutover looks at can see, and it is the whole of the attack.
+      'exec 5<"${LOCK_FILE}"',
+    ]
+    const measure = [
+      'echo "AFTER=$(LC_ALL=C stat -c "%a" "${LOCK_FILE}")"',
+      '[[ "${old_inode}" == "$(LC_ALL=C stat -c "%i" "${LOCK_FILE}")" ]] && echo INODE=SAME || echo INODE=REPLACED',
+      // The holdout now takes the lock it could have taken at any point.
+      'flock -n 5 && echo HOLDOUT=LOCKED || echo HOLDOUT=BLOCKED',
+      // AND THE NEXT CUTOVER. A fresh descriptor on the canonical NAME, which is what every later
+      // deploy, update and install opens.
+      '( exec 7<"${LOCK_FILE}"; flock -n 7 && echo NEXT=FREE || echo NEXT=BLOCKED )',
+    ]
+    // A WHOLE CUTOVER, START TO FINISH: the subshell's descriptors die with it, which is what a run
+    // that has completed leaves behind. Only then is the holdout asked what it can do.
+    const RUN = 'rc=0; ( acquire_cutover_lock; echo "RC=0" ) || rc=$?; [[ "${rc}" -eq 0 ]] || echo "RC=${rc}"'
+
+    const shipped = runR9(entry, ['acquire_cutover_lock'], [...fixture, RUN, ...measure].join('\n'),
+      FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(shipped.stdout, /^BEFORE=644$/m, `the fixture must start wide, or this measures nothing:\n${shipped.stdout}`)
+    assert.match(shipped.stdout, /^RC=0$/m, `and an upgraded host must still be able to run a cutover:\n${shipped.stdout}`)
+    assert.match(shipped.stdout, /^AFTER=600$/m, `whose lock ends 0600:\n${shipped.stdout}`)
+    assert.match(shipped.stdout, /^INODE=REPLACED$/m,
+      `and the wide inode must be REPLACED rather than narrowed — narrowing cannot reach a descriptor that is already open:\n${shipped.stdout}`)
+    assert.match(shipped.stdout, /^HOLDOUT=LOCKED$/m,
+      `the holdout still gets its lock, because nothing can take a descriptor back — that is the point:\n${shipped.stdout}`)
+    assert.match(shipped.stdout, /^NEXT=FREE$/m,
+      `but the lock it gets is on an inode with no name, so the next cutover is not blocked by it:\n${shipped.stdout}`)
+
+    // MEASURED BY MUTATION, ROUTE STATED: the replacement stubbed out to report success and do
+    // nothing, which is r23 exactly — the narrowing runs, the mode reads back 0600, and the run
+    // reports an exclusion the holdout can take away from every future cutover on the box.
+    const ACQUIRE = shellFunction(CUTOVER_NS_LIB, 'acquire_cutover_lock')
+    assert.ok(ACQUIRE.includes('rotate_cutover_lock_inode "$LOCK_FILE" || die'),
+      `the shipped acquisition must replace a lock it inherited wide:\n${ACQUIRE}`)
+    const r23 = runR9(entry, ['acquire_cutover_lock'], [
+      'rotate_cutover_lock_inode() { return 0; }',
+      ...fixture, RUN, ...measure,
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(r23.stdout, /^AFTER=600$/m, `r23 left the mode looking right:\n${r23.stdout}`)
+    assert.match(r23.stdout, /^INODE=SAME$/m, `on the same inode the holdout is holding:\n${r23.stdout}`)
+    assert.match(r23.stdout, /^HOLDOUT=LOCKED$/m, `which it then locks:\n${r23.stdout}`)
+    assert.match(r23.stdout, /^NEXT=BLOCKED$/m,
+      `and every later deploy, update and install is refused by a descriptor a chmod could not reach — that is the finding:\n${r23.stdout}`)
+  })
+
+  test(`${entry.name} rotates only a lock it inherited wide, and never one a predecessor is holding`, () => {
+    /**
+     * WHAT REPLACING AN INODE COSTS, AND WHY IT IS PAID SAFELY (o3d-secops r24).
+     *
+     * Replacing the canonical inode means giving up exclusion against anything still holding the
+     * old one — which is exactly what defeats the holdout, and would be a disaster if a GENUINE
+     * concurrent cutover were the holder. It cannot be: the rotation is reached only after this
+     * run holds `flock` on the inherited inode, so at the instant of the rename nothing else holds
+     * that lock. Both halves are measured here.
+     *
+     * ROUTE: the shipped acquire_cutover_lock(), twice. Once against a predecessor that HOLDS the
+     * lock — which must refuse and must leave the predecessor's inode exactly where it is — and
+     * once on an ordinary 0600 lock, which must not be rotated at all.
+     */
+    const predecessor = runR9(entry, ['acquire_cutover_lock'], [
+      'mkdir -p "${CUTOVER_ROOT_DIR}"',
+      '( umask 022; : > "${LOCK_FILE}" )',
+      'old_inode="$(LC_ALL=C stat -c "%i" "${LOCK_FILE}")"',
+      // A GENUINE PREDECESSOR: it holds the lock, on the wide inode, exactly as a cutover launched
+      // a moment earlier from the pre-r24 checkout would.
+      'exec 5<"${LOCK_FILE}"',
+      'flock -n 5 && echo PREDECESSOR=HELD || echo PREDECESSOR=FAILED',
+      'rc=0; ( acquire_cutover_lock ) 2>&1 || rc=$?; echo "RC=${rc}"',
+      '[[ "${old_inode}" == "$(LC_ALL=C stat -c "%i" "${LOCK_FILE}")" ]] && echo INODE=SAME || echo INODE=REPLACED',
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(predecessor.stdout, /^PREDECESSOR=HELD$/m,
+      `the predecessor must actually hold the lock, or this test measures nothing:\n${predecessor.stdout}`)
+    assert.match(predecessor.stdout, /^RC=1$/m, `and the second cutover must refuse:\n${predecessor.stdout}`)
+    assert.match(predecessor.stdout, /Refusing to run two cutovers at once/,
+      `saying which exclusion it could not take:\n${predecessor.stdout}`)
+    assert.match(predecessor.stdout, /NOTHING HAS BEEN ROTATED/,
+      `and saying that the replacement was not reached:\n${predecessor.stdout}`)
+    assert.match(predecessor.stdout, /^INODE=SAME$/m,
+      `because a predecessor's inode may never be swapped out from under it — the rotation runs only while THIS run holds the lock:\n${predecessor.stdout}`)
+
+    // AND THE GATE IS NOT VACUOUS: an ordinary 0600 lock is left alone, so the canonical inode is
+    // stable from one cutover to the next and the replacement is a one-time repair.
+    const TWO_RUNS = [
+      '( acquire_cutover_lock; echo "RUN1=0" ) || echo "RUN1=FAILED"',
+      'first="$(LC_ALL=C stat -c "%i" "${LOCK_FILE}")"',
+      '( acquire_cutover_lock; echo "RUN2=0" ) || echo "RUN2=FAILED"',
+      '[[ "${first}" == "$(LC_ALL=C stat -c "%i" "${LOCK_FILE}")" ]] && echo STABLE=yes || echo STABLE=no',
+    ]
+    const ordinary = runR9(entry, ['acquire_cutover_lock'], TWO_RUNS.join('\n'),
+      FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(ordinary.stdout, /^RUN1=0$/m, ordinary.stdout)
+    assert.match(ordinary.stdout, /^RUN2=0$/m, ordinary.stdout)
+    assert.match(ordinary.stdout, /^STABLE=yes$/m,
+      `a lock this run created at 0600 was never openable by anybody else, so there is nothing to replace:\n${ordinary.stdout}`)
+
+    // MEASURED BY MUTATION, ROUTE STATED: the gate answered "never private", so every run rotates.
+    // The inode then changes underneath a host that had nothing wrong with it, which is the churn
+    // the mode question exists to avoid.
+    const GATE = shellFunction(CUTOVER_NS_LIB, 'lock_mode_is_private')
+    assert.ok(GATE.includes('(( (8#${mode} & 0077) == 0 )) || return 1'),
+      `the gate must ask about group and other, and about READ as much as write:\n${GATE}`)
+    const alwaysRotates = runR9(entry, ['acquire_cutover_lock'], [
+      'lock_mode_is_private() { return 1; }',
+      ...TWO_RUNS,
+    ].join('\n'), FENCE_RELOCATION_EXTRA('$CUTOVER_STATE_DIR'))
+    assert.match(alwaysRotates.stdout, /^STABLE=no$/m,
+      `without it the canonical inode is replaced on every cutover:\n${alwaysRotates.stdout}`)
+
+    // AND THE REPLACEMENT IS OPENED FOR READING AND LOCKED BEFORE IT IS PUBLISHED. A source-shaped
+    // check about GRAMMAR, for the reason the r22 one gives: the behaviour above cannot show that
+    // the next edit keeps the property.
+    const ROTATE = shellFunction(CUTOVER_NS_LIB, 'rotate_cutover_lock_inode')
+    assert.ok(ROTATE.includes('exec 6<"${temporary}"') && !/exec 6>/.test(ROTATE),
+      `the replacement must be opened for READING, like the lock it replaces:\n${ROTATE}`)
+    assert.ok(ROTATE.indexOf('flock -n 6') < ROTATE.indexOf('mv -f "${temporary}" "${path}"'),
+      `and locked BEFORE the rename publishes its name, or there is an instant in which the canonical name is unlocked:\n${ROTATE}`)
+    assert.ok(ACQUIRE_ORDER(shellFunction(CUTOVER_NS_LIB, 'acquire_cutover_lock')),
+      'and the rotation must come after the exclusion is taken, never before it')
   })
 
   test(`${entry.name} claims no exclusion over the pre-r22 lock, and says so on every run`, () => {

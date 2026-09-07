@@ -1341,8 +1341,11 @@ db_fence_publish_authority() {
 }
 
 # WHOSE JOB IT IS TO REMOVE THE RECORD (o3d-secops r23). The helper cannot: an unlink is a write to
-# the directory, and that directory is root own. So a verified release is followed by this, and by
-# nothing else. The ORDER is deliberate: between the GRANTs landing and this call the record
+# the directory, and that directory is root own. So a verified release is followed by this -- and,
+# since r24, so is an INITIAL fence that was refused before it revoked anything, where the record
+# this run published describes a fence that does not exist and would otherwise make the next
+# attempt a "recovery". Those are the two callers and there are no others. The ORDER is deliberate
+# for the release: between the GRANTs landing and this call the record
 # describes a fence that has been released, which is the safe way round -- a `--fence` over it
 # re-applies the same grantee list and a second `--release` re-grants what is already granted,
 # where removing it first would lose the only account of what was revoked.
@@ -1375,7 +1378,7 @@ db_fence_clear_authority() {
 db_fence_raise() {
   local fence_script="$1" state_file="$2"
   shift 2
-  local plan rc=0 argument database="" app_role="" app_user=""
+  local plan rc=0 argument database="" app_role="" app_user="" had_authority=0
   for argument in "$@"; do
     case "${argument}" in
       --app-database=*) database="${argument#--app-database=}" ;;
@@ -1388,6 +1391,15 @@ db_fence_raise() {
     echo "NOT FENCED: this run was not told which database and role it is fencing, so nothing could validate what a fence would revoke. Nothing has been revoked." >&2
     return 3
   fi
+
+  # WAS A FENCE ALREADY STANDING WHEN THIS RUN ARRIVED? (o3d-secops r24.) Asked BEFORE step 2
+  # republishes over whatever is there, because it decides two things and cannot be asked
+  # afterwards: it is the same fact root stamps into `fence_mode`, and it is what says whether the
+  # authority this run is about to publish is this run's OWN — the only one it may ever remove.
+  # ${DB_FENCE_DIR} is root-owned and unwritable by anything else, so an entry at that name was put
+  # there by a privileged process and the question has one answer. `-L` as well as `-e`, so a
+  # dangling link counts as something being there rather than as nothing.
+  if [[ -e "${state_file}" || -L "${state_file}" ]]; then had_authority=1; fi
 
   # STEP 1, UNPRIVILEGED: what WOULD be revoked, printed. Nothing is written and nothing is
   # revoked, so a failure here costs a message.
@@ -1411,6 +1423,26 @@ db_fence_raise() {
   # STEP 3, UNPRIVILEGED AGAIN: execute exactly what step 2 recorded.
   rc=0
   db_fence_helper "${fence_script}" --fence --state-file="${state_file}" --state-owner="$(id -u)" "$@" || rc=$?
+
+  # AND A REFUSED INITIAL FENCE LEAVES NO AUTHORITY BEHIND (o3d-secops r24, Codex HIGH).
+  #
+  # Exit 3 from `--fence` is EXIT_NOT_FENCEABLE, and every path in the helper that returns it is
+  # strictly BEFORE `BEGIN`: nothing has been revoked, so the record this run published a moment
+  # ago describes a fence that does not exist. Left there it is not merely litter. The next
+  # cutover's `--plan` reads it as a standing fence and unions its grantee list, and root — which
+  # decides `fence_mode` from whether an authority is present — stamps the retry RECOVERY. The
+  # strict both-directions rule that just refused this run would then be unavailable to the very
+  # next attempt, and one re-run would buy the tolerance the refusal exists to withhold.
+  #
+  # ONLY THIS RUN'S OWN PUBLICATION, WHICH IS WHY ${had_authority} IS READ BEFORE STEP 2. Where a
+  # fence WAS already standing, that record is the only account of what an earlier run revoked and
+  # removing it would strand every grantee it names. Then the refusal is left with the record
+  # intact, exactly as before.
+  if [[ "${rc}" -eq 3 && "${had_authority}" -eq 0 ]]; then
+    if ! db_fence_clear_authority "${state_file}"; then
+      echo "The connection fence was REFUSED before anything was revoked, and the authority this run published at ${state_file} could not be removed. Nothing is fenced and nothing has been migrated, but that file now describes a fence that does not exist: the next cutover will read it as a standing one. Remove it by hand before re-running." >&2
+    fi
+  fi
   return "${rc}"
 }
 
@@ -1600,11 +1632,26 @@ run_helper() {
 # rebuilt from the validator own template. The validator is the SAME program lib/db-fence-protected.sh
 # runs, written in here at publication rather than re-typed, so there is one text and two callers.
 raise_the_fence() {
-  local plan
+  local plan rc=0 had_authority=0
+  # o3d-secops r24: the same question db_fence_raise() asks, for the same two reasons -- it is what
+  # root stamps into fence_mode, and it says whether the authority published below is this run's
+  # own and therefore the only one this run may remove.
+  if [[ -e "${state_file}" || -L "${state_file}" ]]; then had_authority=1; fi
   plan="$(run_helper DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" node "${helper}" --plan --state-file="${state_file}" --state-owner="$(id -u)" "${identity_argv[@]}")" || return 1
   printf '%s\n' "${plan}" | env -u NODE_OPTIONS -u NODE_PATH -u NODE_REPL_EXTERNAL_MODULE \
     node -e "${authorise_plan}" -- "${expected_database}" "${expected_app_role}" "${state_file}" || return 1
-  run_helper DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" node "${helper}" --fence --state-file="${state_file}" --state-owner="$(id -u)" "${identity_argv[@]}"
+  run_helper DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" node "${helper}" --fence --state-file="${state_file}" --state-owner="$(id -u)" "${identity_argv[@]}" || rc=$?
+  # Exit 3 is EXIT_NOT_FENCEABLE, which the helper returns only before BEGIN: nothing was revoked,
+  # so an authority this run itself published describes a fence that does not exist, and leaving it
+  # would make the next attempt a "recovery" and hand it the tolerance this refusal withheld.
+  if [[ "${rc}" -eq 3 && "${had_authority}" -eq 0 ]]; then
+    rm -f "${state_file}" 2>/dev/null || true
+    if [[ -e "${state_file}" ]]; then
+      echo "The fence was REFUSED before anything was revoked and ${state_file} could not be removed. Nothing is fenced, but the next cutover reads that file as a STANDING FENCE. Remove it by hand." >&2
+      return 1
+    fi
+  fi
+  return "${rc}"
 }
 release_the_fence() {
   run_helper DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" node "${helper}" --release --state-file="${state_file}" --state-owner="$(id -u)" "${identity_argv[@]}" || return 1

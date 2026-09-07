@@ -59,8 +59,12 @@ import {
   STATE_COMPLETE_SENTINEL,
   STATE_PRESENT,
   STATE_UNREADABLE,
+  FENCE_MODE_INITIAL,
+  FENCE_MODE_RECOVERY,
+  assessAuthorityDrift,
   assessDatabaseIdentity,
   assessUnrecordedRelease,
+  authorityFenceMode,
   classifyStateShape,
   doFence,
   doRelease,
@@ -1002,6 +1006,278 @@ test('a grantee that appeared since the authority was published is refused, not 
   assert.equal(readFileSync(stateFile, 'utf8'), before, 'and the authority must be untouched by this process')
 })
 
+test('assessAuthorityDrift reports both set differences, and each mode says what it accepts', () => {
+  // o3d-secops r24, Codex HIGH. THE RULES, READ AS RULES. doFence() decides only what to print;
+  // what is acceptable is here, so that "checking for additions is not checking for equality" is a
+  // statement about a function rather than about a branch of one that also opens transactions.
+  //
+  // MUTATION ROUTE (made against the shipped file and reverted): drop `withdrawn` from the
+  // `accepted` expression — which is r23's rule exactly — and the second case below reports an
+  // initial fence over a stale authority as acceptable.
+  const same = assessAuthorityDrift({ authorised: ['PUBLIC', 'imsapp'], current: ['imsapp', 'PUBLIC'], mode: FENCE_MODE_INITIAL })
+  assert.deepEqual([same.appeared, same.withdrawn], [[], []], 'order is not a difference')
+  assert.equal(same.accepted, true, 'an initial fence over an ACL that has not moved must proceed, or nothing ever fences')
+
+  const lost = { authorised: ['PUBLIC', 'imsapp', 'analytics'], current: ['PUBLIC', 'imsapp'] }
+  const lostInitial = assessAuthorityDrift({ ...lost, mode: FENCE_MODE_INITIAL })
+  assert.deepEqual(lostInitial.withdrawn, ['analytics'], 'the OTHER direction of the difference is reported')
+  assert.deepEqual(lostInitial.appeared, [], 'and it is invisible to the direction r23 asked about')
+  assert.equal(lostInitial.accepted, false,
+    'a role that lost CONNECT under an INITIAL authority is drift: the release would grant it back to somebody who removed it')
+
+  const lostRecovery = assessAuthorityDrift({ ...lost, mode: FENCE_MODE_RECOVERY })
+  assert.deepEqual(lostRecovery.withdrawn, ['analytics'], 'a recovery re-fence sees the same difference')
+  assert.equal(lostRecovery.accepted, true,
+    'and accepts it, because a standing fence is what took CONNECT from its own recorded grantees')
+
+  // `appeared` IS FATAL IN BOTH MODES. Revoking a role no record names takes CONNECT from
+  // something nothing would restore, and that is true however the fence came to be raised.
+  const gained = { authorised: ['PUBLIC'], current: ['PUBLIC', 'analytics'] }
+  for (const mode of [FENCE_MODE_INITIAL, FENCE_MODE_RECOVERY]) {
+    const drift = assessAuthorityDrift({ ...gained, mode })
+    assert.deepEqual(drift.appeared, ['analytics'], `${mode}: a new grantee is reported`)
+    assert.equal(drift.accepted, false, `${mode}: and refused`)
+  }
+
+  // AN UNSTAMPED RECORD IS A RECOVERY. It can only be a fence raised before this round and still
+  // standing; refusing it would strand that fence with neither a re-apply nor a release.
+  assert.equal(authorityFenceMode({ revoked: ['PUBLIC'] }), FENCE_MODE_RECOVERY)
+  assert.equal(authorityFenceMode({ fence_mode: FENCE_MODE_INITIAL }), FENCE_MODE_INITIAL)
+  // AND A RECORD CANNOT TALK ITS WAY INTO THE STRICT RULE BY MISSPELLING THE LAX ONE.
+  assert.equal(authorityFenceMode({ fence_mode: 'INITIAL' }), FENCE_MODE_RECOVERY)
+})
+
+test('a grantee REMOVED between the plan and an initial fence aborts it (o3d-secops r24)', async (t) => {
+  // THE FINDING. r23 asked one direction of the set difference — had a grantee APPEARED? — and read
+  // "nothing appeared" as "the authority still describes the ACL". A role that LOSES CONNECT in the
+  // window leaves that comparison empty: the stale list was accepted whole, its REVOKE was a no-op
+  // nobody noticed, and `--release` afterwards issued GRANT CONNECT to every role the record named,
+  // handing database access back to one an administrator had deliberately removed.
+  //
+  // ROUTE: the shipped doFence() over an authority root published as INITIAL — that is what it
+  // stamps when nothing is at the destination — naming a grantee the live ACL does not carry.
+  //
+  // MUTATION ROUTE (made against the shipped file and reverted): drop `withdrawn` from
+  // assessAuthorityDrift()'s `accepted`, which is r23's rule, and this fence proceeds — it commits
+  // three REVOKEs including the no-op for `analytics`, and returns 0.
+  const dir = stateDir(t)
+  const stateFile = join(dir, 'db-connect-fence.json')
+  publishAuthority(stateFile, { ...SAMPLE_STATE, revoked: ['PUBLIC', 'owner', 'imsapp', 'analytics'] })
+  const published = JSON.parse(readFileSync(stateFile, 'utf8'))
+  assert.equal(published.fence_mode, FENCE_MODE_INITIAL,
+    'the fixture must be an INITIAL authority, or this measures the recovery rule by accident')
+  const before = readFileSync(stateFile, 'utf8')
+
+  // The live ACL carries PUBLIC, owner and imsapp and has never carried `analytics`: somebody took
+  // CONNECT from it between the plan and now.
+  const client = new FakeAdminClient({ stateFile })
+  const code = await withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1, ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
+
+  assert.equal(code, EXIT_NOT_FENCEABLE, 'a fence whose authority no longer describes the ACL must abort')
+  assert.deepEqual(client.revokes, [], 'and NOTHING may be revoked')
+  assert.ok(!client.log.includes('BEGIN'), 'the transaction must never be opened')
+  assert.equal(readFileSync(stateFile, 'utf8'), before, 'and the authority must be untouched by this process')
+
+  // AND THE HARM IT AVERTS, EXHIBITED RATHER THAN DESCRIBED: had the fence gone ahead, the record
+  // would have been the standing authority and the release builds GRANT CONNECT straight out of it
+  // — including for the role somebody had just removed.
+  const releasing = new FakeAdminClient({ stateFile, releasedDatacl: '{owner=CTc/owner,=Tc/owner,imsapp=c/owner}' })
+  await withAdminUrl(() => doRelease(releasing as never, { stateFile, appRole: 'imsapp', ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
+  assert.ok(releasing.grants.includes('GRANT CONNECT ON DATABASE "imsdb" TO "analytics";'),
+    `a release grants back everything the record names, which is why the record may not be stale:\n${releasing.grants.join(' | ')}`)
+})
+
+test('a recovery re-fence executes an authority whose grantees have already lost CONNECT', async (t) => {
+  // THE OTHER HALF, WITHOUT WHICH THE FIX ABOVE IS A REGRESSION. A fence that is already standing
+  // has taken CONNECT from every grantee its record names — its own earlier run did it — so on a
+  // re-apply `withdrawn` is not drift, it is the expected shape, and a bare equality rule would
+  // make a standing fence impossible to re-apply or release.
+  //
+  // ROUTE: a SECOND publication into the same directory. Root stamps `recovery` because an
+  // authority is already at the destination, which is a fact it can see and ${APP_USER} cannot
+  // forge — that directory is root-owned and unwritable by anything else.
+  //
+  // MUTATION ROUTE (made against the shipped file and reverted): make `accepted` a plain equality
+  // in both modes and this test fails at EXIT_OK — a standing fence can then never be re-applied.
+  const dir = stateDir(t)
+  const stateFile = join(dir, 'db-connect-fence.json')
+  const record = { ...SAMPLE_STATE, revoked: ['PUBLIC', 'owner', 'imsapp'] }
+  publishAuthority(stateFile, record)
+  publishAuthority(stateFile, record)
+  assert.equal(JSON.parse(readFileSync(stateFile, 'utf8')).fence_mode, FENCE_MODE_RECOVERY,
+    'a publication over a standing authority must be stamped as a recovery')
+
+  // THE ACL OF A FENCED DATABASE: the owner keeps its own entry, and nobody else has CONNECT.
+  const client = new FakeAdminClient({ stateFile, datacl: '{owner=CTc/owner}', stillConnectsBefore: false })
+  const code = await withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1, ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
+
+  assert.equal(code, EXIT_OK, `a standing fence must still be re-applicable:\n${client.log.join(' | ')}`)
+  assert.deepEqual(client.revokes, [
+    'REVOKE CONNECT ON DATABASE "imsdb" FROM PUBLIC;',
+    'REVOKE CONNECT ON DATABASE "imsdb" FROM "owner";',
+    'REVOKE CONNECT ON DATABASE "imsdb" FROM "imsapp";',
+  ], 'over the whole recorded list, so the release still restores all of it')
+
+  // AND THE SAME RECORD UNDER THE INITIAL RULE IS REFUSED — which is what makes the mode, and not
+  // the tolerance, the thing doing the work here.
+  const strict = join(dir, 'strict.json')
+  publishAuthority(strict, record)
+  assert.equal(JSON.parse(readFileSync(strict, 'utf8')).fence_mode, FENCE_MODE_INITIAL)
+  const strictClient = new FakeAdminClient({ stateFile: strict, datacl: '{owner=CTc/owner}', stillConnectsBefore: false })
+  const strictCode = await withAdminUrl(() => doFence(strictClient as never, { stateFile: strict, appRole: 'imsapp', timeoutSeconds: 1, ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
+  assert.equal(strictCode, EXIT_NOT_FENCEABLE, 'the identical grantee list under an INITIAL authority is drift')
+  assert.deepEqual(strictClient.revokes, [], 'and revokes nothing')
+})
+
+test('the plan cannot choose which rule its record is executed under (o3d-secops r24)', (t) => {
+  // `fence_mode` is the difference between the two rules, so it is the field worth forging: a plan
+  // that could declare itself a recovery would buy the tolerance. It is computed by ROOT, in the
+  // process that does the rename, from the presence of a file in a directory ${APP_USER} cannot
+  // write — so that account can neither create a record to obtain the tolerance nor unlink one to
+  // escape it — and one carried in the plan is dropped by the template like every other field root
+  // does not compute for itself.
+  //
+  // MUTATION ROUTE (made against the shipped validator and reverted): take the field from the
+  // request — `fence_mode: plan.fence_mode` — and the first case below publishes "recovery" over
+  // an empty directory, which is the unprivileged account choosing its own rule.
+  const dir = stateDir(t)
+  const stateFile = join(dir, 'db-connect-fence.json')
+
+  const asking = authorisePlan({ ...SAMPLE_STATE, fence_mode: FENCE_MODE_RECOVERY }, stateFile, 'imsdb', 'imsapp')
+  assert.equal(asking.status, 0, `a plan carrying an extra field must still publish:\n${asking.output}`)
+  assert.equal(JSON.parse(readFileSync(stateFile, 'utf8')).fence_mode, FENCE_MODE_INITIAL,
+    'nothing was at the destination, so this is an initial fence whatever the request said')
+
+  // AND THE CONVERSE: with a record standing, a plan asking for the strict rule does not get it
+  // either. The stamp answers to the filesystem and to nothing else.
+  const asserting = authorisePlan({ ...SAMPLE_STATE, fence_mode: FENCE_MODE_INITIAL }, stateFile, 'imsdb', 'imsapp')
+  assert.equal(asserting.status, 0, asserting.output)
+  assert.equal(JSON.parse(readFileSync(stateFile, 'utf8')).fence_mode, FENCE_MODE_RECOVERY,
+    'an authority was already there, so this is a recovery whatever the request said')
+
+  // AND IT IS ANNOUNCED, because an operator reading the publication line has to be able to tell
+  // which of the two rules the fence about to run is being held to.
+  assert.match(asserting.output, /\(recovery\)/, `the publication must name the mode:\n${asserting.output}`)
+})
+
+test('a refused INITIAL fence leaves no authority behind, and a standing one is left alone (o3d-secops r24)', (t) => {
+  /**
+   * WITHOUT THIS, ONE RE-RUN BUYS THE TOLERANCE THE REFUSAL WITHHELD.
+   *
+   * `fence_mode` is stamped from whether an authority is already at the destination. An initial
+   * fence that is REFUSED leaves the record root published a moment earlier describing a fence that
+   * does not exist — and the next cutover's `--plan` then reads it as a standing fence, unions its
+   * grantee list, and root stamps the retry RECOVERY. The both-directions rule that just refused
+   * the run would be unavailable to the very next attempt.
+   *
+   * Exit 3 is EXIT_NOT_FENCEABLE, and every path in the helper that returns it is strictly before
+   * `BEGIN`: nothing was revoked, so the record is this run's own and removing it loses nothing.
+   * Exit 5 is EXIT_FENCE_STANDING, where the revokes may be on the medium — that record is the only
+   * thing that undoes them and must survive.
+   *
+   * ROUTE: the shipped db_fence_raise(), with the shipped validator and the shipped publisher, and
+   * one stub: the privilege drop, which is the single part each entrypoint supplies for itself.
+   */
+  const dir = stateDir(t)
+  const PLAN = '{"database":"imsdb","owner_role":"owner","app_role":"imsapp","admin_role":"admin","revoked":["PUBLIC","imsapp"],"datacl_before":null,"fenced_at":"2026-01-01T00:00:00.000Z"}'
+
+  // A STATE FILE OF ITS OWN PER SCENARIO. `fence_mode` is stamped from whether one is already
+  // there, so a second scenario over the first one's leftovers would be measuring the leftovers.
+  const raise = (name: string, fenceRc: number, extra: string[] = [], mutate: (body: string) => string = (b) => b) => {
+    const stateFile = join(dir, `${name}.json`)
+    const program = [
+      'set -uo pipefail',
+      shellFunction(CUTOVER_NS_LIB_SOURCE, 'dir_is_private_to_this_run'),
+      // The program emitter, rebuilt around the SHIPPED program text rather than lifted whole:
+      // shellFunction() delimits a body by its braces and the validator's heredoc is full of them,
+      // so lifting it cuts the here-document in half. AUTHORISE_PLAN_PROGRAM is read out of the
+      // library between its own markers — the same bytes root hands `node -e` — so what runs here
+      // is still the shipped validator and not a re-typed one.
+      `db_fence_authorise_plan_program() {\n  cat <<'AUTHORISE_PLAN_EOF'\n${AUTHORISE_PLAN_PROGRAM}AUTHORISE_PLAN_EOF\n}`,
+      shellFunction(FENCE_LIBRARY, 'db_fence_authorise_plan'),
+      shellFunction(FENCE_LIBRARY, 'db_fence_publish_authority'),
+      shellFunction(FENCE_LIBRARY, 'db_fence_clear_authority'),
+      mutate(shellFunction(FENCE_LIBRARY, 'db_fence_raise')),
+      `state=${JSON.stringify(stateFile)}`,
+      `fence_rc=${fenceRc}`,
+      // THE PRIVILEGE DROP, STUBBED, and it answers `--plan` the way the shipped mode does: one
+      // line of JSON on STDOUT and nothing else there, because the caller captures it.
+      `db_fence_helper() { shift; case "$*" in *--plan*) printf '%s\\n' ${JSON.stringify(PLAN)}; return 0 ;; *--fence*) return "\${fence_rc}" ;; esac; return 0; }`,
+      ...extra,
+      'db_fence_raise "/nonexistent/fence.mjs" "${state}" --app-database=imsdb --app-user=imsapp; echo "RC=$?"',
+      '[[ -e "${state}" ]] && echo "AUTHORITY=PRESENT" || echo "AUTHORITY=GONE"',
+      '[[ -e "${state}" ]] && echo "MODE=$(node -e \'process.stdout.write(String(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).fence_mode))\' "${state}")"',
+    ].join('\n')
+    const run = spawnSync('bash', ['-c', program], { encoding: 'utf8' })
+    return `${run.stdout ?? ''}${run.stderr ?? ''}`
+  }
+
+  // THE PRECONDITION, PROVED RATHER THAN ASSUMED: a fence that SUCCEEDS keeps its authority, or
+  // every "GONE" below could be a publication that never happened.
+  const raised = raise('raised', 0)
+  assert.match(raised, /^RC=0$/m, `the ordinary raise must succeed:\n${raised}`)
+  assert.match(raised, /^AUTHORITY=PRESENT$/m, `and leave the record a release is driven from:\n${raised}`)
+  assert.match(raised, /^MODE=initial$/m, `stamped initial, because nothing was at the destination:\n${raised}`)
+
+  // REFUSED BEFORE ANY REVOKE, WITH NOTHING STANDING: the record is this run's own, and it goes.
+  const refused = raise('refused', 3)
+  assert.match(refused, /^RC=3$/m, `the refusal must be reported unchanged:\n${refused}`)
+  assert.match(refused, /^AUTHORITY=GONE$/m,
+    `and the authority this run published must not survive to make the RETRY a "recovery":\n${refused}`)
+  // AND THE RETRY IS STILL AN INITIAL FENCE, which is the whole reason the removal is there: the
+  // rule that refused this run has to be the rule the next attempt is held to as well.
+  // Read off the publication banner rather than the file, because the shipped retry removes its
+  // own record too: what is being asked is what root STAMPED, not what survived.
+  const retried = raise('refused', 3)
+  assert.match(retried, /published at .*\(initial\)/, `the re-run must be planned and stamped afresh:\n${retried}`)
+  assert.match(retried, /^AUTHORITY=GONE$/m, `and clear up after itself in turn:\n${retried}`)
+
+  // AND THE ONE IT MUST NEVER TOUCH: a fence was already standing when this run arrived, so that
+  // record is the only account of what an earlier run revoked.
+  const standing = raise('standing', 3, [
+    `printf '%s\\n' ${JSON.stringify(PLAN)} | db_fence_authorise_plan imsdb imsapp "\${state}" >/dev/null 2>&1`,
+  ])
+  assert.match(standing, /^RC=3$/m, standing)
+  assert.match(standing, /^AUTHORITY=PRESENT$/m,
+    `a standing fence's record may never be removed by a refusal — every grantee it names depends on it:\n${standing}`)
+  assert.match(standing, /^MODE=recovery$/m, `and it is a recovery, because an authority was already there:\n${standing}`)
+
+  // AND A FENCE THAT MAY BE STANDING KEEPS ITS RECORD TOO. Exit 5 is "the COMMIT was issued and
+  // this run never learned whether it took", which is the one outcome where the undo record is
+  // load-bearing and the run cannot prove it is not.
+  const uncertain = raise('uncertain', 5)
+  assert.match(uncertain, /^RC=5$/m, uncertain)
+  assert.match(uncertain, /^AUTHORITY=PRESENT$/m,
+    `a revoke that may be on the medium must keep the only thing that undoes it:\n${uncertain}`)
+
+  // MEASURED BY MUTATION, ROUTE STATED, UNDER A REAL SHELL. Two of them, because the cleanup has
+  // two halves and each can be wrong on its own.
+  const RAISE = shellFunction(FENCE_LIBRARY, 'db_fence_raise')
+  const CLEANUP = '  if [[ "${rc}" -eq 3 && "${had_authority}" -eq 0 ]]; then'
+  assert.ok(RAISE.includes(CLEANUP), `the shipped orchestration must clear its own refused publication:\n${RAISE}`)
+
+  // A: no cleanup at all, which is r23. The refused run leaves a record, and the next `--plan`
+  // reads it as a standing fence.
+  const withoutCleanup = (body: string) => body.replace(CLEANUP, '  if false; then')
+  const noCleanup = raise('nocleanup', 3, [], withoutCleanup)
+  assert.match(noCleanup, /^AUTHORITY=PRESENT$/m,
+    `without the cleanup the refusal leaves an authority behind:\n${noCleanup}`)
+  assert.match(noCleanup, /^MODE=initial$/m, `this run's own, stamped initial:\n${noCleanup}`)
+  // AND THE CONSEQUENCE, RUN RATHER THAN DESCRIBED: the very next attempt over that leftover is
+  // stamped a RECOVERY, so one re-run hands it the drift tolerance the refusal existed to withhold.
+  const secondAttempt = raise('nocleanup', 3, [], withoutCleanup)
+  assert.match(secondAttempt, /^MODE=recovery$/m,
+    `one re-run and the strict rule is gone — that is why a refused initial fence may not leave its record:\n${secondAttempt}`)
+
+  // B: the cleanup with its ownership half removed — `rc` alone. It then removes a STANDING
+  // fence's record, which is strictly worse than the finding it was added for.
+  const anyAuthority = raise('anyauthority', 3, [
+    `printf '%s\\n' ${JSON.stringify(PLAN)} | db_fence_authorise_plan imsdb imsapp "\${state}" >/dev/null 2>&1`,
+  ], (body) => body.replace(CLEANUP, '  if [[ "${rc}" -eq 3 ]]; then'))
+  assert.match(anyAuthority, /^AUTHORITY=GONE$/m,
+    `without the "this run published it" half, a refusal destroys the only record of a standing fence:\n${anyAuthority}`)
+})
+
 test('a record this account could have written is never a record (o3d-secops r23)', async (t) => {
   // THE LOAD-BEARING ONE. A planted fence-state file cannot cause a GRANT.
   //
@@ -1170,7 +1446,10 @@ test('the privileged validator rebuilds the record and refuses what it cannot ch
   const extra = authorisePlan({ ...plan, undo_sql: ['DROP DATABASE "imsdb";'], evil: 'x' }, stateFile, 'imsdb', 'imsapp')
   assert.equal(extra.status, 0, `a valid plan must publish:\n${extra.output}`)
   const published = JSON.parse(readFileSync(stateFile, 'utf8'))
-  assert.deepEqual(Object.keys(published), ['database', 'owner_role', 'app_role', 'admin_role', 'revoked', 'datacl_before', 'fenced_at', 'state_complete'],
+  // `fence_mode` joined the template in o3d-secops r24: root stamps which rule the executor runs
+  // the record under, and it is stamped from what root can SEE — whether an authority was already
+  // at the destination — rather than taken from the request. The sentinel stays last.
+  assert.deepEqual(Object.keys(published), ['database', 'owner_role', 'app_role', 'admin_role', 'revoked', 'datacl_before', 'fenced_at', 'fence_mode', 'state_complete'],
     'the published record is root\'s template, not the request')
   assert.equal(published.state_complete, STATE_COMPLETE_SENTINEL, 'and it ends with the sentinel the reader requires')
 
