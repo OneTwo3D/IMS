@@ -3594,7 +3594,7 @@ require_migration_landed_on_fenced_server() {
       # so a purportedly non-refusing sampling miss went on to issue no challenge, could not set
       # `clear_server`, took status 2 out of db_fence_clear_authority() and returned FAILURE into
       # `release_db_connections || die`. The witness is left bound; only the record is kept.
-      DB_FENCE_KEEP_RECORD=true
+      DB_FENCE_KEEP_RECORD=1
       warn "The migration window closed on the server this run fenced -- a connection opened on the"
       warn "migration's own string could still see the witness -- but the witness never saw a backend"
       warn "carrying this run's stamp while the migration ran. Nothing here is wrong with the schema,"
@@ -4013,7 +4013,7 @@ release_db_connections() {
     # MEDIUM). ${DB_FENCE_KEEP_RECORD} is set by the closing gate when the sampler never saw the
     # migration's own backends; the removal is withheld HERE rather than by taking the witness away
     # upstream and letting the missing attestation surface as a failure two steps later.
-    if ${DB_FENCE_KEEP_RECORD:-false}; then
+    if [[ "${DB_FENCE_KEEP_RECORD:-0}" == "1" ]]; then
       warn "The connection fence WAS released -- CONNECT is restored -- and its record at ${DB_FENCE_STATE} is being KEPT deliberately: the witness never saw a backend carrying this run's stamp while the migration ran. The next run reads that file as a STANDING FENCE and adopts it. End it with ${DB_FENCE_RELEASE_CMD}, which asks you to confirm at your terminal."
       db_fence_witness_stop
       success "Connection fence released; its record is kept for you to end."

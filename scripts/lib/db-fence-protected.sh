@@ -1941,7 +1941,13 @@ DB_FENCE_WITNESS_BOUND=0
 # The two facts are now two names. This one says only "do not remove the record at the end of this
 # run"; the witness stays bound, the release still challenges it, and the run still completes. It
 # is the ONLY thing any degraded reading may cost.
-DB_FENCE_KEEP_RECORD=false
+#
+# 0 OR 1, AND READ WITH `==` RATHER THAN AS A COMMAND (o3d-secops r33). `if ${NAME}; then` puts
+# whatever the name expands to in a COMMAND POSITION -- bash runs it -- which is the sink the
+# census in tests/scripts/install-root-safe-writes.test.ts exists to refuse, and it refused this
+# name in its first draft. A string comparison is not a command position and is not an arithmetic
+# context either, so no value this could ever hold is executed or indirected through.
+DB_FENCE_KEEP_RECORD=0
 
 # 128 bits of kernel randomness as lower-case hex. It is a NONCE and not a secret: what it has to
 # be is unguessable-in-advance and never reused, so that a lock on it cannot be a fact some earlier

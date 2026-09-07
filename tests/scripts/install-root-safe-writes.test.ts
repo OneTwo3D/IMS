@@ -1726,6 +1726,16 @@ const MUTABLE_LIBRARY_NAMES: Readonly<Record<string, string>> = {
     'a report: 0 or 1, set from what `--fence` said on its OWN connection about seeing the witness. '
     + 'It can only ever WITHHOLD the automatic removal of the fence record -- the removal itself is '
     + 'licensed by what `--release` reports out of the database, never by this flag',
+  // o3d-secops r33, Codex MEDIUM. The SECOND name the witness leaves behind, and it exists because
+  // the first was being made to carry two facts. "Keep the record" and "there is no witness" were
+  // the same bit, so a sampling miss took the release's own challenge away with it and a
+  // purportedly non-refusing status refused two steps later.
+  DB_FENCE_KEEP_RECORD:
+    'a report: 0 or 1, set by the closing gate when the witness never saw a backend wearing this '
+    + 'run\'s migration stamp. Read with `==` in one `[[ ]]`, which is neither a command position '
+    + 'nor an arithmetic context -- this census refused its first draft, which was `if ${NAME}`. It '
+    + 'can only ever WITHHOLD the automatic removal of the fence record: setting it cannot cause a '
+    + 'deletion, only prevent one, and it reaches no path and no digest',
 }
 
 /**

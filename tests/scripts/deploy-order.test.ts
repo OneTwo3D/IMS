@@ -13490,7 +13490,7 @@ for (const entry of FENCE_HARNESS) {
         `precondition: the closing probe must have run:\n${calls(dir)}`)
       assert.match(result.output, /^STARTED THE NEW BUILD$/m,
         `a missed sample is a property of polling, not of the deploy, so the cutover must go on:\n${result.output}`)
-      assert.match(result.output, /^KEEP RECORD=true$/m,
+      assert.match(result.output, /^KEEP RECORD=1$/m,
         `but the record must be withheld, which is what keeps it for a person:\n${result.output}`)
       assert.match(result.output, /^BOUND AT THE END=1$/m,
         `and the witness must SURVIVE, or the release issues no challenge and this "non-refusing" status refuses two steps later:\n${result.output}`)
