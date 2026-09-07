@@ -446,6 +446,36 @@ export const MACHINE_CHANNEL = {
   write: (text) => process.stdout.write(text),
 }
 
+/**
+ * THE CHANNEL CARRIES NO NAME ANYBODY ELSE CHOSE (o3d-secops r32, Codex HIGH 1).
+ *
+ * r31 captured `--fence`'s and `--release`'s stdout for one machine-readable word each and read it
+ * back BY SUBSTRING. Everything an operator reads was said to be on stderr; ELEVEN LINES IN THIS
+ * FILE WERE NOT. `Connection fence released: CONNECT restored to <roles> on <database>.` went to
+ * stdout, and so did the REVOKE statements, the "Verified:" line and the whole unrecorded-release
+ * verdict — every one of them interpolating a DATABASE OR ROLE NAME, which is text an operator (or
+ * whoever can create a role on that server) chooses. A database called `x witness_colocated=yes`
+ * therefore forged the release attestation, and a role called `x fence_witness=colocated` forged
+ * the fence one. Root then deleted the sole authority for a fence still standing.
+ *
+ * TWO CHANGES, AND THE FIRST ONE ALONE WOULD ROT. Every one of those eleven calls is now
+ * `console.error`, so stdout carries machine lines and nothing else; and because "nobody adds a
+ * twelfth" is not a property a comment can hold, `console.log` is REPLACED at the top of main()
+ * with a function that writes to stderr. A future line added in the ordinary way cannot reach the
+ * channel at all — it is not a lint, it is the runtime.
+ *
+ * WHAT THE MACHINE LINES THEMSELVES MAY CARRY is then the whole of the remaining question, and it
+ * is answered line by line: the plan is ONE JSON document (names inside it are JSON-escaped, so a
+ * newline in a database name cannot become a second line); the cluster identity lines are numbers;
+ * the witness verdicts are a fixed word plus THIS RUN'S OWN NONCE; and `--print-migration-url`
+ * emits a URL that is captured whole and never scanned for tokens.
+ */
+export function sealMachineChannel(target = console) {
+  const original = target.log
+  target.log = (...args) => target.error(...args)
+  return () => { target.log = original }
+}
+
 export const PUBLIC_GRANTEE = 'PUBLIC'
 
 /** SQL identifier quoting. Role and database names reach these statements as text. */
@@ -1007,12 +1037,19 @@ export function assessMigrationRole({ adminRole, appRole, adminIsSuperuser, admi
  * splits on a space, and the resulting `role=` would be silently truncated, so it is refused
  * rather than escaped-and-hoped.
  */
-export function buildMigrationConnectionString(adminConnectionString, appRole) {
+export function buildMigrationConnectionString(adminConnectionString, appRole, migrationNonce = '') {
   if (!adminConnectionString) {
     throw new Error('No admin connection string to compose a migration URL from.')
   }
   if (!appRole) {
     throw new Error('No application role, so there is no role for the migration to run as.')
+  }
+  if (migrationNonce !== '' && !isWitnessNonce(migrationNonce)) {
+    throw new Error(
+      'The migration nonce is not 32-64 lower-case hex characters, so the stamp it would put on every ' +
+        'migration backend could not be matched exactly by the witness. Refusing to compose a URL whose ' +
+        'binding cannot be read back.',
+    )
   }
   if (/[\t\n\r\f\v]/.test(String(appRole))) {
     throw new Error(
@@ -1040,13 +1077,59 @@ export function buildMigrationConnectionString(adminConnectionString, appRole) {
   const existing = allOptions.length > 0 ? allOptions[allOptions.length - 1] : null
   const merged = existing ? `${existing} -c role=${escaped}` : `-c role=${escaped}`
   url.searchParams.delete('options')
+  // THE STAMP EVERY MIGRATION BACKEND CARRIES (o3d-secops r32, Codex HIGH 2 / o3d-mzcp).
+  //
+  // AND IT IS A CONNECTION PARAMETER, NOT ANOTHER `-c` (measured, PostgreSQL 17.11). The obvious
+  // shape -- `options=-c role=<role> -c application_name=<nonce>`, since libpq takes repeated `-c`
+  // -- IS SILENTLY OVERRIDDEN and would have shipped a binding that never binds. libpq sends
+  // `application_name` (or, when the caller set none, its own `fallback_application_name`) as a
+  // startup-packet parameter, and the backend applies THAT AFTER the GUCs in `options`. Measured:
+  // `psql "…?options=-c application_name=X"` reports `application_name` = `psql`, and pg_dump would
+  // report `pg_dump`. As a query parameter it is what libpq sends, so it wins -- measured through
+  // psql, pg_dump, node-postgres and Prisma's own schema engine, which is the one consumer whose
+  // URL parser is not libpq at all.
+  //
+  // ANY EXISTING VALUE IS REPLACED rather than merged. Two `application_name=` entries resolve to
+  // one of them by a rule that differs between drivers, and a binding that depends on which entry a
+  // particular consumer picked is not a binding.
+  url.searchParams.delete('application_name')
   const query = url.searchParams.toString()
   url.search = ''
   const rendered = url.toString().replace(/\?$/, '')
   const parts = []
   if (query) parts.push(query)
   parts.push(`options=${encodeURIComponent(merged)}`)
+  if (migrationNonce !== '') {
+    parts.push(`application_name=${encodeURIComponent(migrationApplicationName(migrationNonce))}`)
+  }
   return `${rendered}?${parts.join('&')}`
+}
+
+/**
+ * THE VALUE `application_name` ACTUALLY CARRIES, AND WHY IT IS SHORT.
+ *
+ * `application_name` is a GUC with `GUC_IS_NAME`, so PostgreSQL TRUNCATES it to NAMEDATALEN-1 and
+ * says so in a NOTICE nobody is reading. Measured on 17.11: a 200-character value arrives as 63
+ * characters. A truncated nonce is the worst possible failure for this mechanism -- the witness
+ * matches the value EXACTLY, so a stamp that lost its tail reads as ABSENT, which is the same
+ * reading a redirect produces, and an ordinary cutover would start asking for a human.
+ *
+ * So the composed value is 46 bytes for a 32-hex nonce and this function REFUSES anything that
+ * would not survive: nothing is ever silently shortened, and two nonces cannot collide after
+ * truncation because no value that could be truncated is ever emitted.
+ */
+export const APPLICATION_NAME_LIMIT = 63
+
+export function migrationApplicationName(nonce) {
+  const composed = `ims-migration-${String(nonce)}`
+  if (Buffer.byteLength(composed, 'utf8') > APPLICATION_NAME_LIMIT) {
+    throw new Error(
+      `The migration stamp ${JSON.stringify(composed)} is ${Buffer.byteLength(composed, 'utf8')} bytes and PostgreSQL ` +
+        `truncates application_name at ${APPLICATION_NAME_LIMIT}. A truncated stamp reads as absent to the witness, ` +
+        'which is indistinguishable from a redirect. Refusing to compose it.',
+    )
+  }
+  return composed
 }
 
 /**
@@ -1108,12 +1191,15 @@ export function parseArgs(argv) {
     // THE THREE THE WITNESS SESSION IS DRIVEN BY (o3d-secops r31, Codex HIGH 1). All three are
     // nonces root generates; none of them is a credential, a path or an identity, and a mode
     // given none of them behaves exactly as it did before this round.
-    witnessNonce: '', witnessLock: '', witnessChallenge: '' }
+    witnessNonce: '', witnessLock: '', witnessChallenge: '',
+    // o3d-secops r32: the stamp `--print-migration-url` puts on every backend the migration window
+    // opens, and that `--bind-migration` then reads back off its own connection.
+    migrationNonce: '' }
   for (const arg of argv) {
     // `--audit-authority` (o3d-secops r26) is here with the rest and not behind a flag of its own:
     // it is a MODE, it is read-only, and a mode that is spelled differently from its siblings is a
     // mode somebody forgets to hold to the same identity requirements.
-    if (arg === '--fence' || arg === '--release' || arg === '--preflight' || arg === '--print-migration-url' || arg === '--plan' || arg === '--audit-authority' || arg === '--witness') options.mode = arg.slice(2)
+    if (arg === '--fence' || arg === '--release' || arg === '--preflight' || arg === '--print-migration-url' || arg === '--plan' || arg === '--audit-authority' || arg === '--witness' || arg === '--bind-migration') options.mode = arg.slice(2)
     else if (arg.startsWith('--state-file=')) options.stateFile = arg.slice('--state-file='.length)
     else if (arg.startsWith('--state-owner=')) options.stateOwnerUid = Number(arg.slice('--state-owner='.length))
     else if (arg.startsWith('--app-role=')) options.appRole = arg.slice('--app-role='.length)
@@ -1129,6 +1215,7 @@ export function parseArgs(argv) {
     else if (arg.startsWith('--witness-nonce=')) options.witnessNonce = arg.slice('--witness-nonce='.length)
     else if (arg.startsWith('--witness-lock=')) options.witnessLock = arg.slice('--witness-lock='.length)
     else if (arg.startsWith('--witness-challenge=')) options.witnessChallenge = arg.slice('--witness-challenge='.length)
+    else if (arg.startsWith('--migration-nonce=')) options.migrationNonce = arg.slice('--migration-nonce='.length)
   }
   return options
 }
@@ -1896,10 +1983,10 @@ async function doPreflight(client, options) {
     return EXIT_NOT_FENCEABLE
   }
 
-  console.log(`Preflight: ${facts.database} is fenceable.`)
-  console.log(`  CONNECT would be revoked from: ${plan.revoke.join(', ')}`)
-  console.log(`  the migration would connect as ${facts.admin_role} and RUN AS ${appRole}, so what it creates is owned by ${appRole}.`)
-  console.log('  Nothing was revoked, terminated or written by this check.')
+  console.error(`Preflight: ${facts.database} is fenceable.`)
+  console.error(`  CONNECT would be revoked from: ${plan.revoke.join(', ')}`)
+  console.error(`  the migration would connect as ${facts.admin_role} and RUN AS ${appRole}, so what it creates is owned by ${appRole}.`)
+  console.error('  Nothing was revoked, terminated or written by this check.')
   return EXIT_OK
 }
 
@@ -2268,6 +2355,43 @@ export async function doWitness(client, options, input = process.stdin) {
   // prompt. The timer is unref'd so it can never be the reason this process outlives its stdin.
   const keepalive = setInterval(() => { client.query('SELECT 1').catch(() => {}) }, 20_000)
   keepalive.unref?.()
+
+  // THE SAMPLER: WHICH BACKENDS ON THIS INSTANCE CARRIED THE MIGRATION'S STAMP
+  // (o3d-secops r32, Codex HIGH 2 / o3d-mzcp).
+  //
+  // The advisory lock above answers about a connection THIS PROCESS holds; it cannot answer about
+  // Prisma's, because Prisma opens its own connection minutes later from a string a DNS change, a
+  // proxy or a failover can re-point in between. What CAN answer is that the migration's own
+  // backends were seen HERE -- and `pg_stat_activity` is cluster-wide, so this session, attached to
+  // another database in the same cluster precisely so the drain cannot reach it, sees them.
+  //
+  // DISTINCT PIDS, ACCUMULATED, rather than a Boolean. Root reads the count immediately after its
+  // own bind probe and again after the last migration consumer has finished, and requires it to
+  // have GROWN -- so the probe's own connection cannot stand in for the migration's, which is
+  // exactly the substitution that would make this check vacuous.
+  //
+  // AN EXACT MATCH, NEVER A PREFIX. PostgreSQL truncates `application_name` at 63 bytes; a stamp
+  // that had been truncated would not equal this value and would read as absent, which is the
+  // direction that refuses. migrationApplicationName() refuses to compose such a stamp in the
+  // first place, so the two guards meet.
+  //
+  // EVERY FAILURE IS SILENT AND COUNTS AS NOTHING SEEN. A sampler that threw would be a witness
+  // that died, and a dead witness must cost this run its automatic removal and nothing else.
+  const watched = new Map()
+  let sampler = null
+  const stopSampling = () => { if (sampler) { clearInterval(sampler); sampler = null } }
+  const sample = async (nonce, seen) => {
+    try {
+      const { rows } = await client.query(
+        'SELECT pid FROM pg_stat_activity WHERE application_name = $1',
+        [migrationApplicationName(nonce)],
+      )
+      for (const row of rows) seen.add(String(row.pid))
+    } catch {
+      // A sampling error is not evidence of anything; the count simply does not grow.
+    }
+  }
+
   try {
     let buffer = ''
     for await (const chunk of input) {
@@ -2279,18 +2403,125 @@ export async function doWitness(client, options, input = process.stdin) {
         if (line === '') continue
         if (line === 'close') return EXIT_OK
         const challenge = /^challenge ([0-9a-f]{32,64})$/.exec(line)
-        if (!challenge) {
-          MACHINE_CHANNEL.write('WITNESS_REFUSED\n')
+        if (challenge) {
+          await client.query('SELECT pg_advisory_lock($1::bigint)', [advisoryKeyForWitnessNonce(challenge[1])])
+          MACHINE_CHANNEL.write(`WITNESS_HELD ${challenge[1]}\n`)
           continue
         }
-        await client.query('SELECT pg_advisory_lock($1::bigint)', [advisoryKeyForWitnessNonce(challenge[1])])
-        MACHINE_CHANNEL.write(`WITNESS_HELD ${challenge[1]}\n`)
+        const watch = /^watch ([0-9a-f]{32,64})$/.exec(line)
+        if (watch) {
+          stopSampling()
+          const seen = new Set()
+          watched.set(watch[1], seen)
+          await sample(watch[1], seen)
+          sampler = setInterval(() => { void sample(watch[1], seen) }, WITNESS_SAMPLE_INTERVAL_MS)
+          sampler.unref?.()
+          MACHINE_CHANNEL.write(`WITNESS_WATCHING ${watch[1]}\n`)
+          continue
+        }
+        const sightings = /^sightings ([0-9a-f]{32,64})$/.exec(line)
+        if (sightings) {
+          const seen = watched.get(sightings[1])
+          if (seen === undefined) {
+            // NEVER ASKED TO WATCH IT, which is not the same fact as "watched and saw nothing" and
+            // is not allowed to read like it. Root refuses on either, but it must be able to say
+            // which one an operator is looking at.
+            MACHINE_CHANNEL.write(`WITNESS_UNWATCHED ${sightings[1]}\n`)
+            continue
+          }
+          await sample(sightings[1], seen)
+          MACHINE_CHANNEL.write(`WITNESS_SIGHTINGS ${sightings[1]} ${seen.size}\n`)
+          continue
+        }
+        MACHINE_CHANNEL.write('WITNESS_REFUSED\n')
       }
     }
     return EXIT_OK
   } finally {
+    stopSampling()
     clearInterval(keepalive)
   }
+}
+
+/** How often the witness looks for the migration's stamp. Measured against a real `prisma migrate deploy` below. */
+export const WITNESS_SAMPLE_INTERVAL_MS = 50
+
+/**
+ * `--bind-migration`: DOES THE STRING THE MIGRATION WILL USE REACH THE INSTANCE THAT WAS FENCED?
+ * (o3d-secops r32, Codex HIGH 2 / o3d-mzcp.)
+ *
+ * IT IS THE ONLY MODE THAT CONNECTS ON `MIGRATION_DATABASE_URL` AND THE ONLY ONE THAT SETS NO
+ * `application_name` OF ITS OWN. Both are the point. It opens the composed migration URL -- the
+ * very bytes `prisma migrate deploy`, the drift check, `pg_dump` and the verification hook are
+ * about to be handed -- and asks its own backend two questions:
+ *
+ *   1. WHAT IS MY application_name? If the stamp did not survive the round trip through a
+ *      consumer's URL parser, the witness's sampler could never match it, and the run would later
+ *      refuse for a reason that has nothing to do with where the connection landed. That failure is
+ *      brought forward to HERE, before a single DDL statement, where it costs nothing.
+ *   2. CAN I SEE THE WITNESS'S LOCK? An advisory lock lives in one instance's shared memory. No
+ *      file-level copy of a cluster carries it, and no other server can answer yes.
+ *
+ * WHAT IT DOES NOT PROVE, said plainly: this is still a connection of its own, so it binds the
+ * STRING AT THIS MOMENT and not Prisma's later backend. That is what the witness's sampler is for,
+ * and why root asks it again after the last consumer has finished. A redirect that begins after
+ * this probe and ends before the migration is what the two together close.
+ */
+export async function doBindMigration(client, options) {
+  const { rows } = await client.query(
+    `SELECT current_setting('application_name') AS stamp,
+            current_database()                  AS connected_database,
+            current_user                        AS effective_role`,
+  )
+  const stamp = rows[0]?.stamp ?? ''
+  const connectedDatabase = rows[0]?.connected_database ?? ''
+  // AND THIS BACKEND STOPS CARRYING THE MIGRATION'S STAMP, IMMEDIATELY (o3d-secops r32).
+  //
+  // The witness's sampler counts backends whose `application_name` EQUALS the stamp, and root
+  // starts it AFTER this probe precisely so that the only sightings it can accumulate are the
+  // migration's own. A probe that kept the stamp would leave a backend that could still be in
+  // `pg_stat_activity` when the sampler takes its first reading -- and the check would then be
+  // satisfied by the very connection it exists to distinguish itself from. So the stamp is read
+  // and then dropped, before anything below can take any time at all.
+  await client.query("SET application_name = 'ims-deploy-fence-bind'")
+  let expected
+  try {
+    expected = migrationApplicationName(options.migrationNonce)
+  } catch (error) {
+    console.error(`NOT BOUND: ${error instanceof Error ? error.message : String(error)}`)
+    return EXIT_ERROR
+  }
+  // The database gate every connecting mode passes: a migration URL that reached a database of
+  // another name is not the application's database whatever else is true of it.
+  if (connectedDatabase !== options.appDatabase) {
+    console.error(`NOT BOUND: the migration URL reached the database "${connectedDatabase}" and this run is migrating "${options.appDatabase}".`)
+    return EXIT_ERROR
+  }
+  if (stamp !== expected) {
+    console.error('NOT BOUND: the migration URL did NOT arrive at the backend carrying the stamp this run put on it.')
+    console.error(`  the URL was composed with: ${expected}`)
+    console.error(`  the backend reports:       ${stamp || '<empty>'}`)
+    console.error('PostgreSQL truncates application_name at 63 bytes, and a driver that sets its own overrides one')
+    console.error('supplied in `options`. Either way the witness could not match the migration\'s backends, so the')
+    console.error('binding this window depends on would silently be absent. Nothing has been migrated.')
+    return EXIT_ERROR
+  }
+  if (!options.witnessLock) {
+    console.error('NOT BOUND: this run holds no connection witness, so there is no lock for the migration connection to look for.')
+    return EXIT_ERROR
+  }
+  const colocated = await witnessLockIsHeld(client, options.witnessLock)
+  MACHINE_CHANNEL.write(`MIGRATION_BINDING ${options.migrationNonce} ${colocated ? 'colocated' : 'absent'}\n`)
+  if (!colocated) {
+    console.error('THE MIGRATION CONNECTION IS NOT ON THE SERVER THIS RUN FENCED.')
+    console.error('This connection was opened with the exact string prisma, the drift check, pg_dump and the')
+    console.error('verification hook are about to be handed, and the witness session -- which is attached to the')
+    console.error('instance whose CONNECT was revoked -- is not visible from it. A DNS change, a proxy, a failover or')
+    console.error('a pooler has put the migration somewhere other than the fenced server. NOTHING HAS BEEN MIGRATED.')
+    return EXIT_ERROR
+  }
+  console.error(`The migration connection is on the fenced instance: it carries this run's stamp and can see the witness. Effective role: ${rows[0]?.effective_role ?? '<unknown>'}.`)
+  return EXIT_OK
 }
 
 /**
@@ -2338,7 +2569,12 @@ export async function doFence(client, options) {
   // is ended by a person instead.
   if (options.witnessLock) {
     const colocated = await witnessLockIsHeld(client, options.witnessLock)
-    MACHINE_CHANNEL.write(`fence_witness=${colocated ? 'colocated' : 'absent'}\n`)
+    // THE VERDICT NAMES THE NONCE IT IS ABOUT (o3d-secops r32, Codex HIGH 1). r31 wrote
+    // `fence_witness=colocated`, which root then looked for as a SUBSTRING of a stream that also
+    // carried role and database names. The word is now the whole of a line, and the line carries
+    // this run's own nonce -- which nothing outside this run and its witness has ever seen -- so a
+    // forged verdict would have to guess 128 bits that did not exist a minute ago.
+    MACHINE_CHANNEL.write(`FENCE_WITNESS ${options.witnessLock} ${colocated ? 'colocated' : 'absent'}\n`)
     if (colocated) {
       console.error('The connection witness is on this same instance: the session that will answer for this fence at release time is attached to the backend about to be fenced.')
     } else {
@@ -2497,7 +2733,7 @@ export async function doFence(client, options) {
  * happened".
  */
 async function completeFence(client, options, { facts, plan, grants, appRole, revokes }) {
-  for (const statement of revokes) console.log(`  ${statement}`)
+  for (const statement of revokes) console.error(`  ${statement}`)
 
   // ASK THE DATABASE WHETHER THE DOOR IS SHUT. Everything above reasons about ACL entries, and an
   // ACL entry is not the whole answer: CONNECT can reach the application role through membership of
@@ -2521,7 +2757,7 @@ async function completeFence(client, options, { facts, plan, grants, appRole, re
     // callers' sticky flag has to be able to see it (o3d-2sm1.5, Codex r13 HIGH).
     return EXIT_FENCE_STANDING
   }
-  console.log(`Verified: has_database_privilege('${appRole}', current_database(), 'CONNECT') is false.`)
+  console.error(`Verified: has_database_privilege('${appRole}', current_database(), 'CONNECT') is false.`)
 
   // Revoking CONNECT stops NEW connections; the ones already open keep writing.
   //
@@ -2545,7 +2781,7 @@ async function completeFence(client, options, { facts, plan, grants, appRole, re
     console.error(`Could not terminate the attached backends: ${error instanceof Error ? error.message : String(error)}`)
   }
   let remaining = await otherClientBackends(client)
-  if (remaining.length > 0) console.log(`Draining ${remaining.length} connection(s) already attached...`)
+  if (remaining.length > 0) console.error(`Draining ${remaining.length} connection(s) already attached...`)
   while (remaining.length > 0 && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 500))
     remaining = await otherClientBackends(client)
@@ -2565,7 +2801,7 @@ async function completeFence(client, options, { facts, plan, grants, appRole, re
     return EXIT_FENCE_STANDING
   }
 
-  console.log(`Database ${facts.database} is fenced: CONNECT revoked from ${plan.revoke.join(', ')}, no other client backends attached.`)
+  console.error(`Database ${facts.database} is fenced: CONNECT revoked from ${plan.revoke.join(', ')}, no other client backends attached.`)
   return EXIT_OK
 }
 
@@ -2747,7 +2983,7 @@ async function releaseWithoutRecord(client, options, read, connectedDatabase = '
     connectedDatabase,
     connectedPostmaster,
   })
-  for (const line of verdict.lines) (verdict.exitCode === EXIT_OK ? console.log : console.error)(line)
+  for (const line of verdict.lines) console.error(line)
   return verdict.exitCode
 }
 
@@ -2999,7 +3235,7 @@ export async function doRelease(client, options) {
   try {
     for (const statement of grants) {
       await client.query(statement)
-      console.log(`  ${statement}`)
+      console.error(`  ${statement}`)
     }
     await client.query('COMMIT')
   } catch (error) {
@@ -3048,7 +3284,10 @@ export async function doRelease(client, options) {
   // fences.
   if (options.witnessChallenge) {
     const colocated = await witnessLockIsHeld(client, options.witnessChallenge)
-    MACHINE_CHANNEL.write(`witness_colocated=${colocated ? 'yes' : 'no'}\n`)
+    // AS A WHOLE LINE, NAMING THE CHALLENGE IT ANSWERS (o3d-secops r32, Codex HIGH 1). See the
+    // matching line in doFence(); `witness_colocated=yes` used to be a substring of a stream that
+    // also carried `... CONNECT restored to <roles> on <database>.`
+    MACHINE_CHANNEL.write(`RELEASE_WITNESS ${options.witnessChallenge} ${colocated ? 'colocated' : 'absent'}\n`)
     if (!colocated) {
       console.error('THE CONNECTION WITNESS IS NOT ON THE SERVER THIS RELEASE JUST GRANTED ON.')
       console.error('CONNECT has been restored here and that is done. What cannot be shown is that "here" is the server')
@@ -3058,7 +3297,7 @@ export async function doRelease(client, options) {
     }
   }
 
-  console.log(`Connection fence released: CONNECT restored to ${state.revoked.join(', ')} on ${state.database}.`)
+  console.error(`Connection fence released: CONNECT restored to ${state.revoked.join(', ')} on ${state.database}.`)
   return EXIT_OK
 }
 
@@ -3287,6 +3526,12 @@ export async function doAuditAuthority(client, options) {
 }
 
 async function main() {
+  // THE MACHINE CHANNEL IS SEALED BEFORE A SINGLE LINE IS PRINTED (o3d-secops r32, Codex HIGH 1).
+  // From here `console.log` writes to stderr, so stdout carries the machine lines this file writes
+  // through MACHINE_CHANNEL and nothing else -- and in particular nothing carrying a database or
+  // role name, which is text somebody else chooses. See sealMachineChannel().
+  sealMachineChannel()
+
   // THIS RUN READS NO FILE OUT OF THE APPLICATION DIRECTORY (o3d-2sm1.5 r32, Codex CRITICAL).
   //
   // It used to load `<app dir>/.env` through `dotenv`, resolved from this file's own location, so
@@ -3307,9 +3552,9 @@ async function main() {
   // opened is proven against the connection itself (assessDatabaseIdentity, and the postmaster
   // stamp in --release).
   const options = parseArgs(process.argv.slice(2))
-  const modes = ['plan', 'fence', 'release', 'preflight', 'print-migration-url', 'audit-authority', 'witness']
+  const modes = ['plan', 'fence', 'release', 'preflight', 'print-migration-url', 'audit-authority', 'witness', 'bind-migration']
   if (!modes.includes(options.mode)) {
-    console.error('Usage: node scripts/fence-db-connections.mjs (--preflight|--plan|--fence|--release|--audit-authority|--witness|--print-migration-url) --app-host=HOST --app-port=PORT --app-user=ROLE --app-database=NAME [--state-file=PATH] [--state-owner=UID] [--app-role=ROLE] [--timeout-seconds=N] [--witness-nonce=HEX] [--witness-lock=HEX] [--witness-challenge=HEX]')
+    console.error('Usage: node scripts/fence-db-connections.mjs (--preflight|--plan|--fence|--release|--audit-authority|--witness|--bind-migration|--print-migration-url) --app-host=HOST --app-port=PORT --app-user=ROLE --app-database=NAME [--state-file=PATH] [--state-owner=UID] [--app-role=ROLE] [--timeout-seconds=N] [--witness-nonce=HEX] [--witness-lock=HEX] [--witness-challenge=HEX] [--migration-nonce=HEX]')
     process.exit(EXIT_ERROR)
   }
 
@@ -3345,7 +3590,26 @@ async function main() {
       console.error('--app-user names no role, so the migration has no role to run as. Refusing to emit a URL that would create objects owned by the admin.')
       process.exit(EXIT_ERROR)
     }
-    MACHINE_CHANNEL.write(`${buildMigrationConnectionString(process.env.DEPLOY_ADMIN_DATABASE_URL, appRole)}\n`)
+    MACHINE_CHANNEL.write(`${buildMigrationConnectionString(process.env.DEPLOY_ADMIN_DATABASE_URL, appRole, options.migrationNonce)}\n`)
+    return
+  }
+
+  // `--bind-migration` IS THE ONE MODE THAT CONNECTS ON THE MIGRATION'S OWN STRING, and it is
+  // therefore the one mode whose client sets no `application_name`: the whole question it asks is
+  // what the URL put there. Its connection string is DATABASE_URL and never the admin URL, because
+  // the admin URL is the one thing that certainly is NOT what the migration was handed.
+  if (options.mode === 'bind-migration') {
+    if (!process.env.DATABASE_URL) {
+      console.error('--bind-migration was given no DATABASE_URL, so there is no migration connection to bind. Nothing has been migrated.')
+      process.exit(EXIT_ERROR)
+    }
+    const migration = new pg.Client({ connectionString: process.env.DATABASE_URL })
+    await migration.connect()
+    try {
+      process.exitCode = await doBindMigration(migration, options)
+    } finally {
+      await migration.end().catch(() => {})
+    }
     return
   }
 

@@ -1933,6 +1933,47 @@ DB_FENCE_WITNESS_BOUND=0
 # 128 bits of kernel randomness as lower-case hex. It is a NONCE and not a secret: what it has to
 # be is unguessable-in-advance and never reused, so that a lock on it cannot be a fact some earlier
 # snapshot of a cluster happens to contain.
+# ---------------------------------------------------------------------------
+# READING A MACHINE LINE (o3d-secops r32, Codex HIGH 1)
+#
+# THE FINDING. r31 read `--fence`'s and `--release`'s verdicts with `[[ "${captured}" == *"token"* ]]`
+# -- a SUBSTRING of a stream that also carried `Connection fence released: CONNECT restored to
+# <roles> on <database>.` and the REVOKE statements themselves. A database or a role called
+# `x witness_colocated=yes` therefore SET THE VERDICT, and root deleted the sole authority for a
+# fence still standing on the real server. The helper's prose is on stderr now, all of it, and
+# `console.log` is replaced at the top of its main() so a twelfth line cannot arrive by accident --
+# but a channel that is machine-only by construction still has to be READ as one.
+#
+# SO THIS IS THE ONLY READER, AND IT ASKS FOR THREE THINGS AT ONCE:
+#
+#   * A WHOLE LINE. `case` patterns here are quoted, so every character is literal: no glob in a
+#     name can match, and a token embedded in a longer line is not a match.
+#   * THE EXACT NONCE. Root minted it seconds ago from /dev/urandom and the only party that has
+#     ever seen it is this run and its own witness, so a verdict for any other nonce is not this
+#     run's answer and is not counted as one.
+#   * EXACTLY ONE ANSWER. Two lines for the same nonce -- one affirmative, one not, or two
+#     affirmatives -- is a stream that cannot be trusted to say anything, and it REFUSES rather
+#     than taking the reading that happens to be last. `tail -1` is how a stream with an
+#     appended line gets read as its appendix.
+#
+# AND THE CALLER MUST ALSO SHOW THAT IT ASKED. This function cannot: it is handed a stream and a
+# nonce, and "no line" and "no question" reach it identically. Every caller therefore proves the
+# challenge was ISSUED before it consults the answer -- see the `${#witness_argv[@]}` guards -- so
+# that the ABSENCE OF THE EXCHANGE can never read as a positive verdict, which is the shape this
+# branch has closed four times.
+db_fence_machine_verdict() {
+  local stream="$1" prefix="$2" nonce="$3" affirmative="$4"
+  [[ "${nonce}" =~ ^[0-9a-f]{32,64}$ ]] || return 1
+  local line yes=0 other=0
+  while IFS= read -r line; do
+    case "${line}" in
+      "${prefix} ${nonce} ${affirmative}") yes=$((yes + 1)) ;;
+      "${prefix} ${nonce} "*) other=$((other + 1)) ;;
+    esac
+  done <<<"${stream}"
+  [[ "${yes}" -eq 1 && "${other}" -eq 0 ]]
+}
+
 db_fence_witness_nonce() {
   local hex
   hex="$(od -An -tx1 -N16 /dev/urandom 2>/dev/null | tr -d ' \n')" || return 1
@@ -2053,6 +2094,135 @@ db_fence_witness_challenge() {
   return 1
 }
 
+# ---------------------------------------------------------------------------
+# BINDING THE MIGRATION TO THE INSTANCE THAT WAS FENCED (o3d-secops r32, Codex HIGH 2; o3d-mzcp)
+#
+# THE FINDING, IN ONE SENTENCE: the fence helper exits, and `prisma migrate deploy` opens an
+# INDEPENDENT connection from ${MIGRATION_DATABASE_URL} minutes later -- so a DNS change, a proxy,
+# a pooler or a failover between the two applies the schema somewhere the fence never reached. If
+# the routing then returns before the release, the release attests happily against the original,
+# its record is removed, and the application starts on a server whose schema never moved while the
+# redirected one carries the DDL. Nothing in r31 asked where the MIGRATION landed; it asked where
+# `--fence` and `--release` landed, and those are two other connections again.
+#
+# TWO ANSWERS, BECAUSE ONE OF THEM CANNOT COVER THE OTHER'S CASE:
+#
+#   THE STRING, AT THE MOMENT THE WINDOW OPENS.  db_fence_migration_bind() opens the composed
+#   migration URL -- the exact bytes every consumer is handed -- and asks THAT backend whether it
+#   can see a witness lock taken seconds earlier. Deterministic, and it happens BEFORE ANY DDL, so
+#   the ordinary redirect costs nothing at all.
+#
+#   THE MIGRATION'S OWN BACKENDS.  `--print-migration-url` stamps `application_name` with a nonce,
+#   which every consumer of that string carries -- prisma, the drift check, `pg_dump`, the
+#   object-access check and the verification hook, because they are all handed the SAME URL and the
+#   stamp is in the URL rather than in any one of their environments. The witness, alive throughout
+#   and on the fenced instance by construction, samples `pg_stat_activity` for it.
+#   db_fence_migration_witnessed() then asks what it saw. A redirect that begins after the probe
+#   and reverts before the release is the case this one closes and the probe cannot.
+#
+# THE NONCE IS NOT A NAME ANY LATER PATH CAN WRITE. It is minted inside `--print-migration-url`'s
+# argument, lives in the composed URL, and is READ BACK OUT OF THAT URL here -- so the value these
+# functions ask the witness about is, by construction, the value the consumers were given. A
+# script-scope variable holding it would be a slot every later line could set to `psql`.
+db_fence_migration_nonce_in_url() {
+  local url="$1" tail
+  [[ "${url}" == *"application_name=ims-migration-"* ]] || return 1
+  tail="${url##*application_name=ims-migration-}"
+  tail="${tail%%&*}"
+  [[ "${tail}" =~ ^[0-9a-f]{32,64}$ ]] || return 1
+  printf '%s\n' "${tail}"
+}
+
+# One request down the witness's pipe, one strictly matched reply back. Separate from
+# db_fence_witness_challenge() rather than folded into it: that function is the r31 mechanism and
+# is measured by name, and a shared body would make one round's mutation route describe two.
+# The SIGPIPE handling is the same and is the same necessity -- the witness can die between any
+# two lines here, and bash does not ignore PIPE, so an unignored one kills the whole entrypoint.
+db_fence_witness_exchange() {
+  local request="$1" want="$2" kind="${3:-exact}"
+  [[ "${DB_FENCE_WITNESS_BOUND:-0}" -eq 1 ]] || return 1
+  local read_fd="${DB_FENCE_WITNESS[0]:-}" write_fd="${DB_FENCE_WITNESS[1]:-}"
+  [[ "${read_fd}" =~ ^[0-9]+$ && "${write_fd}" =~ ^[0-9]+$ ]] || return 1
+  local line wrote=0
+  trap '' PIPE
+  printf '%s\n' "${request}" >&"${write_fd}" 2>/dev/null || wrote=1
+  trap - PIPE
+  [[ "${wrote}" -eq 0 ]] || return 1
+  while read -r -t60 line <&"${read_fd}" 2>/dev/null; do
+    if [[ "${kind}" == "exact" && "${line}" == "${want}" ]]; then
+      printf '%s\n' "${line}"
+      return 0
+    fi
+    if [[ "${kind}" == "prefix" && "${line}" == "${want}"* ]]; then
+      printf '%s\n' "${line}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Exit codes, and each one means something different to the caller:
+#   0  the migration's own connection string reaches the fenced instance, and the sampler is armed.
+#   1  IT DOES NOT, or the stamp did not survive the URL. A REFUSAL: nothing has been migrated.
+#   2  the URL carries no stamp at all -- this run cannot bind a migration it did not compose.
+#   3  there is no witness to bind to. NOT a refusal: it is the pre-existing degraded mode, in
+#      which the fence still goes up, the migration still runs, and the fence record is kept at the
+#      end of the run for a person to end. A run with no witness has nothing that could tell a
+#      redirect from a lost session, and refusing every such deploy would trade this finding for an
+#      outage on every host with a pooler or a single-database cluster.
+db_fence_migration_bind() {
+  local fence_script="$1" migration_url="$2"
+  shift 2
+  local migration_nonce=""
+  migration_nonce="$(db_fence_migration_nonce_in_url "${migration_url}")" || return 2
+  [[ "${DB_FENCE_WITNESS_BOUND:-0}" -eq 1 ]] || return 3
+
+  # A FRESH LOCK FOR THE MIGRATION WINDOW, minted here and spent here, exactly as the release's
+  # challenge is. The fence's own nonce is minutes old by now and lives in a frame that has
+  # returned; more to the point, a lock taken NOW cannot be a fact any copy of this cluster
+  # contains, which is the whole of what makes an affirmative answer mean anything.
+  local bind_nonce=""
+  bind_nonce="$(db_fence_witness_nonce)" || return 3
+  db_fence_witness_challenge "${bind_nonce}" || return 3
+
+  local bound="" rc=0
+  bound="$(db_fence_migration_helper "${fence_script}" --bind-migration \
+    --migration-nonce="${migration_nonce}" --witness-lock="${bind_nonce}" "$@")" || rc=$?
+  [[ -z "${bound}" ]] || printf '%s\n' "${bound}"
+  if [[ "${rc}" -ne 0 ]] \
+    || ! db_fence_machine_verdict "${bound}" "MIGRATION_BINDING" "${migration_nonce}" "colocated"; then
+    return 1
+  fi
+
+  # AND THE SAMPLER STARTS ONLY NOW, with an empty set. Everything it counts from here is a backend
+  # that carried the migration's stamp AFTER the probe had finished and dropped its own -- so the
+  # count db_fence_migration_witnessed() reads is about prisma and its siblings and about nothing
+  # this function did.
+  db_fence_witness_exchange "watch ${migration_nonce}" "WITNESS_WATCHING ${migration_nonce}" >/dev/null || return 3
+  return 0
+}
+
+# Did the witness actually SEE the migration's backends on the fenced instance?
+#   0  yes, at least one.
+#   1  no. A REFUSAL, and the schema may already have moved: see the callers.
+#   2  the URL carries no stamp.
+#   3  no witness, or it never answered -- the degraded mode again.
+db_fence_migration_witnessed() {
+  local migration_url="$1"
+  local migration_nonce="" reply="" seen=""
+  migration_nonce="$(db_fence_migration_nonce_in_url "${migration_url}")" || return 2
+  [[ "${DB_FENCE_WITNESS_BOUND:-0}" -eq 1 ]] || return 3
+  reply="$(db_fence_witness_exchange "sightings ${migration_nonce}" "WITNESS_SIGHTINGS ${migration_nonce} " prefix)" || return 3
+  seen="${reply##"WITNESS_SIGHTINGS ${migration_nonce} "}"
+  # A COUNT THIS RUN CANNOT READ IS NOT A COUNT. Anything but digits -- a truncated line, a reply
+  # for another nonce that slipped the prefix, a witness answering something else entirely --
+  # refuses, because the alternative is arithmetic on text and `[[ x -gt 0 ]]` is TRUE for a
+  # non-numeric string in bash.
+  [[ "${seen}" =~ ^[0-9]+$ ]] || return 1
+  [[ "${seen}" -gt 0 ]] || return 1
+  return 0
+}
+
 db_fence_raise() {
   local fence_script="$1" state_file="$2"
   shift 2
@@ -2153,10 +2323,15 @@ db_fence_raise() {
   # that it could see the witness. It is re-derived from this run's own output every time rather
   # than left standing from a previous fence in the same shell -- the exit trap's re-fence goes
   # through here too, and a flag left true across it would attest a link the new fence never made.
-  if [[ "${fenced}" == *"fence_witness=colocated"* ]]; then
+  # AND IT IS A WHOLE LINE CARRYING THIS RUN'S OWN NONCE, READ ONLY IF A LOCK WAS ISSUED
+  # (o3d-secops r32, Codex HIGH 1). Two guards, and the first is the one that is easy to miss: with
+  # no `--witness-lock=` on the argv there was NO QUESTION, and a stream that answers a question
+  # nobody asked may not be allowed to raise this flag. `${#witness_argv[@]}` is that proof, taken
+  # from the argv actually passed a line above rather than from a second flag that could drift.
+  DB_FENCE_WITNESS_BOUND=0
+  if [[ "${#witness_argv[@]}" -gt 0 ]] \
+    && db_fence_machine_verdict "${fenced}" "FENCE_WITNESS" "${witness_nonce}" "colocated"; then
     DB_FENCE_WITNESS_BOUND=1
-  else
-    DB_FENCE_WITNESS_BOUND=0
   fi
 
   # STEP 4, PRIVILEGED AGAIN: THE RECORD IS TOLD THAT THE FENCE WAS APPLIED (o3d-secops r25, Codex
@@ -2437,6 +2612,32 @@ fi
 run_helper() {
   if [[ "$(id -un)" == "${app_account}" ]]; then env "$@"; else runuser -u "${app_account}" -- env "$@"; fi
 }
+# ONE VALUE FOR ONE KEY, ON A WHOLE LINE, OF A STATED SHAPE, OR NOTHING AT ALL
+# (o3d-secops r32, Codex HIGH 1 -- the "check the other machine lines" half).
+#
+# The three readings this wrapper takes off a captured stream were `sed -n 's/^key=\(.*\)$/\1/p' |
+# tail -1`. The anchoring was right and `tail -1` was not: a stream carrying the key TWICE was read
+# as its LAST occurrence rather than refused, which is how an appended line gets to be the answer.
+# Neither did anything constrain the VALUE, and each of these is bound into the confirmation token
+# an operator types -- so a value that is not the shape it claims to be is a value that should never
+# have reached a person's screen as evidence.
+#
+# The prose that used to share this channel is gone: every one of the helper's eleven `console.log`
+# calls is on stderr now, and its main() replaces `console.log` so a twelfth cannot arrive. This is
+# the reader's half of the same rule.
+machine_field() {
+  local stream="$1" key="$2" shape="$3" line value="" hits=0
+  while IFS= read -r line; do
+    case "${line}" in
+      "${key}="*) value="${line#"${key}="}"; hits=$((hits + 1)) ;;
+    esac
+  done <<<"${stream}"
+  [[ "${hits}" -eq 1 ]] || return 1
+  [[ "${value}" =~ ${shape} ]] || return 1
+  printf '%s\n' "${value}"
+}
+# `<system identifier>/<database oid>`, either half of which the server may decline to give.
+readonly CLUSTER_IDENTITY_SHAPE='^([0-9]+|<unavailable>)/([0-9]+|<unavailable>)$'
 # THE SHARED CUTOVER LOCK, TAKEN FOR THE WHOLE SEQUENCE (o3d-secops r28, Codex HIGH 3).
 #
 # WHAT WAS WRONG. Each of these three wrappers READS the authority, asks something about it, and
@@ -2665,7 +2866,7 @@ release_the_fence() {
     echo "The fence was released and ${state_file} could not be hashed, so nothing here can hold a removal to the bytes it read. The record is untouched and the next cutover reads it as a STANDING FENCE. Remove it by hand once you have confirmed CONNECT is back." >&2
     return 1
   fi
-  identity="$(printf '%s\n' "${released}" | sed -n 's/^release_cluster_identity=\(.*\)$/\1/p' | tail -1)"
+  identity="$(machine_field "${released}" release_cluster_identity "${CLUSTER_IDENTITY_SHAPE}")" || identity=""
   echo "" >&2
   echo "ABOUT TO REMOVE the connection-fence authority at ${state_file}." >&2
   echo "  record digest:    ${digest}" >&2
@@ -2784,7 +2985,7 @@ resolve_legacy_fence() {
   #    digest of the exact bytes it passed; its stderr is the prose the operator reads.
   inspected="$(env -u NODE_OPTIONS -u NODE_PATH -u NODE_REPL_EXTERNAL_MODULE \
     node -e "${legacy_inspect}" -- "${state_file}")" || return 1
-  digest="$(printf '%s\n' "${inspected}" | sed -n 's/^authority_sha256=\([0-9a-f]\{64\}\)$/\1/p' | tail -1)"
+  digest="$(machine_field "${inspected}" authority_sha256 '^[0-9a-f]{64}$')" || digest=""
   if [[ -z "${digest}" ]]; then
     echo "NOT RESOLVED: the inspection passed the record at ${state_file} and did not report the digest of the bytes it read." >&2
     echo "Every write below is held to those exact bytes -- that is what stops a decision taken about one record landing on another -- so without the digest there is nothing to hold it to. Nothing has been changed." >&2
@@ -2794,13 +2995,13 @@ resolve_legacy_fence() {
   #    Read-only -- it issues no REVOKE, no GRANT and no BEGIN, and writes no file. Its stdout is
   #    the verdict, the cluster verdict and the cluster identity; its stderr is the prose.
   audited="$(run_helper DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" node "${helper}" --audit-authority --state-file="${state_file}" --state-owner="$(id -u)" "${identity_argv[@]}")" || rc=$?
-  verdict="$(printf '%s\n' "${audited}" | sed -n 's/^\(legacy_fence_verdict=.*\)$/\1/p' | tail -1)"
-  cluster="$(printf '%s\n' "${audited}" | sed -n 's/^legacy_fence_cluster=\(.*\)$/\1/p' | tail -1)"
-  identity="$(printf '%s\n' "${audited}" | sed -n 's/^legacy_fence_cluster_identity=\(.*\)$/\1/p' | tail -1)"
+  verdict="$(machine_field "${audited}" legacy_fence_verdict '^(absent|stands|ambiguous)$')" || verdict=""
+  cluster="$(machine_field "${audited}" legacy_fence_cluster '^(proven|mismatch|no-fingerprint-recorded|fingerprint-unverifiable)$')" || cluster=""
+  identity="$(machine_field "${audited}" legacy_fence_cluster_identity "${CLUSTER_IDENTITY_SHAPE}")" || identity=""
   # 4. ROOT: act, and only on a status and a verdict line that agree. Two channels for one fact is
   #    deliberate -- an exit status can be produced by a shell that never ran the helper, and a
   #    line of stdout can be produced by a helper that could not decide.
-  if [[ "${rc}" -eq 0 && "${verdict}" == "legacy_fence_verdict=absent" ]]; then
+  if [[ "${rc}" -eq 0 && "${verdict}" == "absent" ]]; then
     echo "Every grantee the record names still holds CONNECT on the database that answered, so the REVOKE this record describes cannot have run there." >&2
     if [[ "${cluster}" != "proven" ]]; then
       echo "" >&2
@@ -2846,7 +3047,7 @@ resolve_legacy_fence() {
     echo "RESOLVED: ${state_file} is gone. Nothing was fenced and nothing was released; the next cutover plans and publishes an INITIAL authority as it would on any other host." >&2
     return 0
   fi
-  if [[ "${rc}" -eq 5 && "${verdict}" == "legacy_fence_verdict=stands" ]]; then
+  if [[ "${rc}" -eq 5 && "${verdict}" == "stands" ]]; then
     echo "Not one grantee the record names holds CONNECT. THAT IS THE EVIDENCE, and it is all of it: the list above is what the record names, and none of those roles holds CONNECT on ${expected_database} now." >&2
     echo "It is consistent with TWO HISTORIES -- the fence this record describes revoked those roles, or an administrator revoked them independently of it -- and the ACL cannot tell you which. It records what the grants ARE, never what made them so." >&2
     if [[ "${confirmed_stamp}" -ne 1 ]]; then

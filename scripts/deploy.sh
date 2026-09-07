@@ -2724,6 +2724,70 @@ db_fence_helper() {
   as_app_user env DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" node "${fence_script}" "$@"
 }
 
+# THE SAME DROP TO ${APP_USER}, WITH THE MIGRATION'S OWN CONNECTION STRING IN THE ENVIRONMENT
+# (o3d-secops r32, Codex HIGH 2). `--bind-migration` is the one mode that must open the URL the
+# migration will use rather than the admin URL, so it is the one mode whose DATABASE_URL matters --
+# and it is passed the same way as_app_user_db() passes it to prisma, the drift check and the
+# verification hook, because binding a string the consumers are not given would bind nothing.
+db_fence_migration_helper() {
+  local fence_script="$1"
+  shift
+  as_app_user env DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
+    DATABASE_URL="${MIGRATION_DATABASE_URL}" node "${fence_script}" "$@"
+}
+
+# THE GATE BEFORE ANY DDL (o3d-secops r32, Codex HIGH 2 / o3d-mzcp). See the section above
+# db_fence_migration_bind() in lib/db-fence-protected.sh for the argument; what belongs here is
+# what an operator sees for each answer.
+bind_migration_to_fenced_server() {
+  local bind_rc=0 bind_script
+  bind_script="$(resolve_fence_script)" || die \
+    "The connection fence is up and this run has no fence script it is willing to execute, so it cannot show that the migration connection reaches the server it fenced. Nothing has been migrated; release the fence with: ${DB_FENCE_RELEASE_CMD}"
+  db_fence_migration_bind "$bind_script" "$MIGRATION_DATABASE_URL" "${DB_FENCE_IDENTITY_ARGS[@]:-}" || bind_rc=$?
+  case "$bind_rc" in
+    0)
+      ok "The migration connection lands on the fenced server: it carries this run's stamp and can see the connection witness."
+      ;;
+    3)
+      # NO WITNESS AT ALL. This is the pre-existing degraded mode and not a new refusal: a run
+      # without one has nothing that could tell a redirect from a lost session, and every host
+      # behind a transaction-mode pooler or with a single-database cluster is in it. What it
+      # already costs is the automatic removal of the fence record, which is what it goes on
+      # costing. Said out loud so the later "kept for a person" is not a surprise.
+      warn "This run holds no connection witness, so NOTHING HERE CAN SHOW that the migration lands on the"
+      warn "server that was fenced. The migration proceeds -- refusing every such deploy would be an outage"
+      warn "on every host with a pooler -- and the fence record will be KEPT at the end for you to end."
+      ;;
+    2)
+      die "The connection fence is up and the migration URL carries no binding stamp, so nothing can show which server the migration would reach. Refusing to migrate. Nothing has been migrated; release the fence with: ${DB_FENCE_RELEASE_CMD}"
+      ;;
+    *)
+      die "THE MIGRATION WOULD NOT HAVE LANDED ON THE SERVER THIS RUN FENCED (the reason is printed above). A connection opened with the exact string prisma is about to be handed either could not see the connection witness or did not carry this run's stamp — so a DNS change, a proxy, a failover or a pooler is putting the migration somewhere the fence never reached. NOTHING HAS BEEN MIGRATED and the schema is untouched. Release the fence with: ${DB_FENCE_RELEASE_CMD}"
+      ;;
+  esac
+}
+
+# THE GATE AFTER THE LAST CONSUMER, and the one that catches a redirect the probe above cannot:
+# one that begins after it and reverts before the release. By here the schema MAY HAVE MOVED, so
+# this refusal holds the fence, leaves the record standing and does not start the new build --
+# which is the only safe direction when the question "on which server did it move?" has no answer.
+require_migration_landed_on_fenced_server() {
+  local seen_rc=0
+  db_fence_migration_witnessed "$MIGRATION_DATABASE_URL" || seen_rc=$?
+  case "$seen_rc" in
+    0)
+      ok "The connection witness saw the migration's own backends on the fenced server."
+      ;;
+    3)
+      warn "This run holds no connection witness, so nothing observed which server the migration actually"
+      warn "reached. The fence record will be KEPT at the end of this run for you to end."
+      ;;
+    *)
+      die "THE MIGRATION'S OWN CONNECTIONS WERE NEVER SEEN ON THE SERVER THIS RUN FENCED. The witness session has been attached to the fenced instance throughout and watched for the stamp this run put on every migration connection; it saw none. TWO HISTORIES END HERE AND NOTHING CAN SEPARATE THEM: the migration was routed to another server — in which case THAT server now carries the schema change and this one does not — or the witness was lost mid-window. THE SCHEMA MAY HAVE MOVED. The new build has NOT been started, the connection fence is STILL UP and its record is kept. Find out which server ${DB_FENCE_STATE} names and which one the migration reached before you release anything: ${DB_FENCE_RELEASE_CMD}"
+      ;;
+  esac
+}
+
 # ---------------------------------------------------------------------------
 # The connection fence. scripts/fence-db-connections.mjs states what it can and
 # cannot promise; what matters here is that failing to RELEASE it leaves an
@@ -2801,11 +2865,21 @@ fence_db_connections() {
       # "permission denied". `--print-migration-url` merges `options=-c role=<app role>` into
       # the admin URL, so authentication (and therefore the CONNECT the fence revoked) is
       # still the admin's while ownership is the application's.
+      #
+      # AND IT CARRIES A STAMP EVERY CONSUMER OF THIS STRING WILL WEAR (o3d-secops r32, Codex
+      # HIGH 2 / o3d-mzcp): `application_name=ims-migration-<nonce>`. The nonce is minted here, goes
+      # into the URL, and is read back OUT of the URL by the two gates below -- so what they ask the
+      # witness about is by construction what prisma, the drift check, pg_dump, the object-access
+      # check and the verification hook were handed.
+      local migration_nonce=""
+      migration_nonce="$(db_fence_witness_nonce)" || die \
+        "The connection fence is up and this run could not mint the nonce that binds the migration to the server it fenced (no readable randomness). Refusing to migrate on a connection nothing can place. Nothing has been migrated; release the fence with: ${DB_FENCE_RELEASE_CMD}"
       MIGRATION_DATABASE_URL="$(as_app_user env DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-        node "$fence_script" --print-migration-url "${DB_FENCE_IDENTITY_ARGS[@]:-}")" || die \
+        node "$fence_script" --print-migration-url --migration-nonce="${migration_nonce}" "${DB_FENCE_IDENTITY_ARGS[@]:-}")" || die \
         "The connection fence is up but the migration URL could not be composed, so the migration would run as the deploy admin and create objects the application cannot use. Nothing has been migrated; release the fence with: ${DB_FENCE_RELEASE_CMD}"
       [[ -n "$MIGRATION_DATABASE_URL" ]] || die \
         "The connection fence is up but --print-migration-url produced nothing. Nothing has been migrated; release the fence with: ${DB_FENCE_RELEASE_CMD}"
+      bind_migration_to_fenced_server
       ok "Connection fence up: new application connections are refused for the window."
       ok "The migration will connect as the deploy admin and RUN AS the application role, so what it creates is owned by the application."
       ;;
@@ -3044,7 +3118,18 @@ release_db_connections() {
     # release's own output, which reports what its own database connection could see; it is not
     # read from a flag this shell set, because a flag is the process-shaped memory whose reach
     # across two connections is the finding. No line, no removal.
-    if [[ "$released" == *"witness_colocated=yes"* ]]; then clear_server="same-server-as-the-fence"; fi
+    # AND IT IS A WHOLE LINE NAMING THIS RUN'S OWN CHALLENGE, READ ONLY IF ONE WAS ISSUED
+    # (o3d-secops r32, Codex HIGH 1). r31 read `witness_colocated=yes` as a SUBSTRING of a stream
+    # that also carried `Connection fence released: CONNECT restored to <roles> on <database>.`, so
+    # a database or a role whose NAME contained that token set this variable. Two guards now, and
+    # the first is the one that is easy to miss: `${#witness_argv[@]}` proves a challenge was
+    # actually put to the witness, so a stream answering a question nobody asked cannot license a
+    # deletion. The second holds the answer to the exact nonce, as a whole line, and refuses a
+    # stream that answers twice.
+    if [[ "${#witness_argv[@]}" -gt 0 ]] \
+      && db_fence_machine_verdict "$released" "RELEASE_WITNESS" "$witness_nonce" "colocated"; then
+      clear_server="same-server-as-the-fence"
+    fi
     db_fence_clear_authority "$DB_FENCE_STATE" "$clear_attestation" "$clear_server" || clear_rc=$?
     if [[ "$clear_rc" -eq 2 ]]; then
       echo -e "${RED}[ERROR]${RESET} The connection fence WAS released -- CONNECT is restored -- and its record at $DB_FENCE_STATE was deliberately NOT removed (the reason is printed above). The next run reads that file as a STANDING FENCE. End it with ${DB_FENCE_RELEASE_CMD}, which asks you to confirm at your terminal." >&2
@@ -3185,13 +3270,22 @@ refence_db_connections() {
   # while the log announces the application role; catching that throw and assigning
   # DEPLOY_ADMIN_DATABASE_URL substitutes exactly the URL it refused to emit. Fail loudly and
   # leave it empty instead: the fence is up, and nothing this trap does next needs the URL.
-  local url_rc=0
+  # THE RE-FENCE STAMPS ITS URL TOO (o3d-secops r32). This is the recovery path -- the exit trap's
+  # re-fence and the adoption of a fence a previous run left standing -- and it goes on to migrate
+  # through exactly the same five consumers, so a URL composed here without the binding stamp would
+  # leave the recovery as the one route with no answer to "which server did this reach?". The nonce
+  # is a fresh one, minted for THIS fence: db_fence_raise() has just opened a new witness session,
+  # and a stamp carried over from a previous window would name a lock that is gone.
+  local url_rc=0 migration_nonce=""
+  migration_nonce="$(db_fence_witness_nonce)" || migration_nonce=""
   MIGRATION_DATABASE_URL="$(as_app_user env DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-    node "$fence_script" --print-migration-url "${DB_FENCE_IDENTITY_ARGS[@]:-}")" || url_rc=$?
+    node "$fence_script" --print-migration-url --migration-nonce="${migration_nonce}" "${DB_FENCE_IDENTITY_ARGS[@]:-}")" || url_rc=$?
   if [[ "$url_rc" -ne 0 || -z "$MIGRATION_DATABASE_URL" ]]; then
     MIGRATION_DATABASE_URL=""
     warn "--print-migration-url refused to compose a migration URL (exit ${url_rc}); NOT falling back to DEPLOY_ADMIN_DATABASE_URL. The fence is up."
+    return 0
   fi
+  bind_migration_to_fenced_server
   return 0
 }
 
@@ -4773,6 +4867,13 @@ if ! $SKIP_MIGRATE; then
     as_app_user_db node scripts/run-migration-verifications.mjs \
       || die "A migration's verification check did not return zero. The new build has NOT been started."
     ok "Every declared verification check returned zero (the coverage report above says what was NOT declared)."
+    # AND ONLY NOW IS IT ASKED WHERE ALL OF THAT LANDED (o3d-secops r32, Codex HIGH 2 / o3d-mzcp).
+    # Here rather than after `prisma migrate deploy`, because every one of the five consumers above
+    # -- prisma, the drift check, the object-access check, the verification hook and, in update.sh,
+    # pg_dump -- opens its own connection on the same movable string, and the question is about all
+    # of them. Before the new build is started, because a build is the first thing that would serve
+    # a schema this run cannot place.
+    require_migration_landed_on_fenced_server
   fi
 else
   step "Verification checks — SKIPPED (--skip-migrate)"
