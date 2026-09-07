@@ -402,6 +402,48 @@ export const EXIT_FENCE_UNPROVEN = 4
  * its own release's "unproven" verdict as permission to carry on.
  */
 export const EXIT_FENCE_STANDING = 5
+/**
+ * `--release` FOUND THE FENCE ALREADY DOWN ON A RECORD THAT SAYS IT WENT UP (o3d-secops r30,
+ * Codex MEDIUM).
+ *
+ * WHAT IT IS FOR. There is an unavoidable interval between the GRANTs landing and root removing
+ * the record: the helper cannot unlink it — the directory is root's — so the two acts are two
+ * processes, and a crash, an OOM kill or a failed unlink in between leaves the grants restored
+ * and the record still there. Re-running the release then reads EVERY recorded grantee holding
+ * CONNECT, which until this round was refused as `absent` with no way forward at all: the
+ * resolution wrapper refuses a STAMPED record and points back at the release wrapper, and the
+ * release wrapper refused. A recovery path that cannot be retried is a recovery path that
+ * strands somebody, so that loop is what this code exists to break.
+ *
+ * WHAT IT IS NOT. It is NOT a claim that this connection reached the server the fence was raised
+ * on. An unfenced copy of that cluster produces an identical reading and always will (see the
+ * residual named in doRelease). So this code says one thing only — THERE IS NOTHING LEFT TO
+ * GRANT HERE — and it authorises no destruction by itself. Non-zero, deliberately: the record
+ * still stands and it is a person, at a terminal, who ends it.
+ */
+export const EXIT_ALREADY_RELEASED = 6
+
+/**
+ * THE MACHINE CHANNEL, AS A VALUE RATHER THAN A GLOBAL (o3d-secops r30, Codex LOW).
+ *
+ * Five lines in this file are read by ROOT out of a command substitution — the plan record, the
+ * migration URL, the audit's three verdict lines and the release's cluster line. They are the
+ * only writes to stdout here; everything else an operator reads is prose on stderr.
+ *
+ * They went through `process.stdout.write` directly, and the tests that captured them did it by
+ * REPLACING that method for the duration of an `await`. That is a process-global, and the test
+ * runner writes its own TAP stream through it: a capture held across a yield can swallow the
+ * runner's report of a test that finished inside the window, so a suite silently reports fewer
+ * tests than it declared and still says zero failures. A helper that can delete tests from a run
+ * is worse than anything it was added to measure.
+ *
+ * So the sink is a value the tests can substitute instead. Nothing about the shipped behaviour
+ * changes -- the default writes to stdout, unbuffered, exactly as before -- and a capture now
+ * reaches this object and not the runner's stream.
+ */
+export const MACHINE_CHANNEL = {
+  write: (text) => process.stdout.write(text),
+}
 
 export const PUBLIC_GRANTEE = 'PUBLIC'
 
@@ -2070,7 +2112,7 @@ export async function doPlan(client, options) {
     cluster_database_oid: facts.database_oid || null,
     fenced_at: existing?.fenced_at || new Date().toISOString(),
   }
-  process.stdout.write(`${JSON.stringify(record)}\n`)
+  MACHINE_CHANNEL.write(`${JSON.stringify(record)}\n`)
   if (existing) {
     console.error(`Re-applying the fence recorded at ${existing.fenced_at} (grantees: ${existing.revoked.join(', ')}).`)
     if (appeared.length > 0) {
@@ -2583,14 +2625,24 @@ export async function doRelease(client, options) {
     return EXIT_ERROR
   }
 
-  // AND IS THE FENCE THIS RECORD DESCRIBES ACTUALLY STANDING HERE (o3d-secops r29, Codex HIGH 2).
+  // WHICH SERVER ANSWERED, ON THE MACHINE CHANNEL (o3d-secops r30, Codex HIGH 1). The record is
+  // no longer removed on the strength of this run's exit status, and what replaces that is a
+  // person confirming a token derived from the record's bytes AND from this line. It is printed
+  // BEFORE the two refusals below as well as before the grants, because an operator reading a
+  // refusal is owed the same fact: `<system identifier>/<database oid>`, or the sentinel where
+  // this server would not identify itself.
+  MACHINE_CHANNEL.write(`release_cluster_identity=${releaseCluster.systemIdentifier || '<unavailable>'}/${releaseDatabase[0]?.released_database_oid || '<unavailable>'}\n`)
+
+  // AND IS THE FENCE THIS RECORD DESCRIBES ACTUALLY STANDING HERE (o3d-secops r29, Codex HIGH 2;
+  // narrowed to ONE reading in r30, Codex HIGH 2).
   //
-  // THE FINDING. A PHYSICAL CLONE -- pg_basebackup, a restored snapshot, a copied data directory
-  // started as its own primary -- INHERITS BOTH HALVES OF THE FINGERPRINT. Measured on PostgreSQL
-  // 17: a clone taken before the fence reports the SAME system_identifier and the SAME database
-  // OID as the cluster it was copied from, so it reads `proven` here, while its ACL never saw the
-  // REVOKE. Releasing on it grants what is already granted, verifies happily, exits 0 -- and the
-  // wrapper then DELETES the only account of the fence still standing on the real server.
+  // THE FINDING r29 ANSWERED. A PHYSICAL CLONE -- pg_basebackup, a restored snapshot, a copied
+  // data directory started as its own primary -- INHERITS BOTH HALVES OF THE FINGERPRINT.
+  // Measured on PostgreSQL 17: a clone taken before the fence reports the SAME system_identifier
+  // and the SAME database OID as the cluster it was copied from, so it reads `proven` at the gate
+  // above, while its ACL never saw the REVOKE. Releasing on it grants what is already granted,
+  // verifies happily, exits 0 -- and root then had nothing left to do but remove the only account
+  // of the fence still standing on the real server.
   //
   // AND THE TIMELINE DOES NOT SEPARATE THEM, WHICH WAS THE OBVIOUS CANDIDATE AND IS THE WRONG WAY
   // ROUND. Measured on the same clusters: promoting a standby moves pg_control_checkpoint()'s
@@ -2604,31 +2656,36 @@ export async function doRelease(client, options) {
   // never replayed that transaction they still hold it. --audit-authority has asked exactly this
   // question since r26 and --release never did: it granted first and verified afterwards, so the
   // one reading that could have told the two servers apart was taken only after the grants had
-  // already destroyed it.
+  // already destroyed it. So it is asked BEFORE THE FIRST GRANT.
   //
-  // SO IT IS ASKED BEFORE THE FIRST GRANT, and `absent` -- not one recorded grantee has lost
-  // CONNECT -- is refused. WHICH WAY THIS FAILS, DELIBERATELY: on that reading there is provably
-  // nothing to restore, because every role the record names already holds CONNECT here and the
-  // GRANTs would be a no-op; the only consequential act left is root's removal of the record.
-  // Refusing therefore locks nobody out of anything, and it keeps the record -- which is the only
-  // thing a release can be built from. The reading it refuses on is also what a fence that never
-  // committed leaves, and those two are not distinguishable from here either; both want the same
-  // answer, which is that a person looks before the record is destroyed.
+  // AND r30 ACTS ON ONE VALUE OF THE THREE, WHICH IS THE CORRECTION (Codex HIGH 2). r29 consumed
+  // this three-valued answer and proceeded on TWO of them, refusing only `absent`; it said so
+  // deliberately, and the justification it gave for letting `ambiguous` through was WRONG ON THE
+  // FACTS OF THIS FILE. It read: a half-applied fence and an administrator's own revoke look
+  // identical here, and a half-applied fence has something to restore. THERE IS NO SUCH THING AS
+  // A HALF-APPLIED FENCE HERE. doFence() issues every REVOKE inside ONE transaction and commits
+  // it as one -- BEGIN, the whole list, COMMIT -- so the fence is all-or-nothing on the medium,
+  // and the only reading it can leave behind is `stands` or nothing at all. The GRANTs below are
+  // now one transaction for the same reason (see the COMMIT), so a release interrupted midway
+  // cannot leave a mixed reading either. A MIXED READING IS THEREFORE NOT OURS. It is somebody
+  // else's revoke, on this server or on a copy of it -- and granting from the record would hand
+  // CONNECT back to a role an administrator deliberately took it from, which is the exact harm
+  // the r24 both-directions rule exists to prevent, arriving through the release instead.
   //
-  // AND WHAT THE OTHER TWO READINGS DO HERE, STATED SO IT IS NOT MISTAKEN FOR AN OVERSIGHT. This
-  // arm consumes a three-valued answer and acts on ONE of its values, deliberately. `stands` is
-  // the ordinary release and is exactly what the GRANTs below are for. `ambiguous` means SOME
-  // recorded grantee has lost CONNECT and some has not -- a half-applied fence and an
-  // administrator's own revoke look identical from here (assessLegacyFenceEvidence) -- and there
-  // IS something to restore, so it proceeds: restoring privilege is the recoverable direction and
-  // the record is what says what to restore. Only `absent`, where nothing was taken away at all,
-  // is refused.
+  // WHICH WAY EACH REFUSAL FAILS, DELIBERATELY. Neither of them locks anybody out of anything and
+  // neither destroys anything: no GRANT is sent, the record is left byte for byte as it was
+  // found, and the fence -- wherever it is standing -- can still be released from that record.
+  // What they cost is that an automatic path stops and a person looks, which is the direction
+  // this file fails in everywhere else.
   //
-  // WHAT IT DOES NOT CATCH, SAID PLAINLY: a clone taken AFTER the fence carries the fence too.
-  // Measured, again on real clusters: system identifier, database OID, timeline, the ACL itself,
-  // and even pg_database's xmin and ctid are identical to the origin's. Nothing readable
-  // separates them, no fact the fence could record at raise time would either, and this gate lets
-  // that one through. It is named here rather than left for the next round to find.
+  // WHAT THIS GATE STILL DOES NOT CATCH, SAID PLAINLY: a clone taken AFTER the fence carries the
+  // fence too. Measured, again on real clusters: system identifier, database OID, timeline, the
+  // ACL itself, and even pg_database's xmin and ctid are identical to the origin's. Nothing
+  // readable separates them and no fact the fence could record at raise time would either, so a
+  // release run against such a copy reads `stands` here and succeeds. THAT IS WHY NOTHING IN THIS
+  // PROCESS IS ALLOWED TO END THE RECORD, and why root no longer removes it on the strength of
+  // this exit status alone: see db_fence_clear_authority() in scripts/lib/db-fence-protected.sh,
+  // which now requires an attestation this process cannot supply and no database can replicate.
   const { rows: standing } = await client.query(
     `SELECT ${DATACL_PRIVILEGES_SQL} AS standing_fence_privileges FROM pg_database d WHERE d.datname = $1`,
     [state.database],
@@ -2639,6 +2696,34 @@ export async function doRelease(client, options) {
     holding: recordedGrantees.filter((grantee) => granteeHasConnect(standing[0]?.standing_fence_privileges, grantee)),
   })
   if (fenceEvidence.verdict === LEGACY_FENCE_ABSENT) {
+    // THE RETRY, TOLD APART FROM THE CLONE BY THE ONE THING THAT DISTINGUISHES THEM (o3d-secops
+    // r30, Codex MEDIUM). Both histories end at this reading and the ACL cannot separate them --
+    // but a record that root STAMPED APPLIED says the REVOKEs reached the medium, and after a
+    // successful release that is exactly the state left behind by a crash before root could
+    // remove the file. An UNSTAMPED record says no such thing, so it keeps r29's flat refusal.
+    //
+    // AND IT IS STILL NOT A LICENCE TO DESTROY ANYTHING. This exit says only that there is
+    // nothing left to grant here. The record is untouched, and clearing it is the operator's
+    // act, at a terminal, in the release wrapper -- which is what makes the retry completable
+    // without making a copy of the cluster able to end the real fence's record.
+    if (state.fence_applied === 1) {
+      MACHINE_CHANNEL.write(`release_state=already-released\n`)
+      console.error(`ALREADY RELEASED: every role the record at ${options.stateFile} names holds CONNECT on "${state.database}" here,`)
+      console.error('and that record is STAMPED APPLIED -- root wrote that stamp only after the REVOKEs were on the medium.')
+      console.error(`  the record names:      ${fenceEvidence.recorded.join(', ')}`)
+      console.error(`  all of them hold it:   ${fenceEvidence.holding.join(', ')}`)
+      console.error('So there is NOTHING LEFT TO GRANT: this is what a release that finished, and then died before its')
+      console.error('record could be removed, leaves behind. Nothing has been granted by this run and the record is')
+      console.error('exactly as it was found. RE-RUNNING THE RELEASE WILL ALWAYS REACH THIS POINT -- the remaining step')
+      console.error('is removing the record, and that is not this process\'s to take.')
+      console.error('ONE OTHER HISTORY ENDS HERE and nothing readable separates it: this connection reached a COPY of the')
+      console.error('fenced cluster taken BEFORE the fence -- a base backup, a restored snapshot, a staging clone -- which')
+      console.error('inherits the system identifier and the database OID and so passes every identity check above.')
+      console.error('That is why the record is ended by a person and not by this exit status. Run the release wrapper in')
+      console.error('the cutover recovery directory AS ROOT: it reaches this same answer and then offers to remove the')
+      console.error('record, once, after a token derived from these exact record bytes is typed at your terminal.')
+      return EXIT_ALREADY_RELEASED
+    }
     console.error(`NOT RELEASED: EVERY role the record at ${options.stateFile} names already holds CONNECT on "${state.database}" here.`)
     console.error(`  the record names:      ${fenceEvidence.recorded.join(', ')}`)
     console.error(`  all of them hold it:   ${fenceEvidence.holding.join(', ')}`)
@@ -2657,10 +2742,54 @@ export async function doRelease(client, options) {
     console.error('wrapper, which removes it only after a person confirms that at the terminal.')
     return EXIT_ERROR
   }
+  if (fenceEvidence.verdict === LEGACY_FENCE_AMBIGUOUS) {
+    console.error(`NOT RELEASED: the roles the record at ${options.stateFile} names DISAGREE about CONNECT on "${state.database}" here.`)
+    console.error(`  the record names:      ${fenceEvidence.recorded.join(', ')}`)
+    console.error(`  these still hold it:   ${fenceEvidence.holding.join(', ') || '(none)'}`)
+    console.error(`  these have lost it:    ${fenceEvidence.lost.join(', ') || '(none)'}`)
+    console.error('NO FENCE THIS PROGRAM RAISES CAN PRODUCE THAT READING. Every REVOKE a fence issues goes in ONE')
+    console.error('transaction and commits as one, so a fence is standing over the WHOLE recorded list or over none of')
+    console.error('it; the GRANTs a release issues are one transaction for the same reason, so an interrupted release')
+    console.error('cannot leave a mixed ACL either. Something other than this record took CONNECT from the roles above')
+    console.error('that have lost it -- an administrator here, or an administrator on the cluster this copy was taken')
+    console.error('from -- and granting from the record would hand database access back to every one of them.')
+    console.error('NOTHING HAS BEEN GRANTED AND THE RECORD IS UNTOUCHED, so nothing is lost by this refusal. Either:')
+    console.error('  * point DEPLOY_ADMIN_DATABASE_URL at the server you believe is fenced and re-run, if this may be a')
+    console.error('    copy of it; or')
+    console.error('  * read the list above against the ACL yourself and take the fence down by hand, as a superuser on')
+    console.error('    the server you know is the fenced one, granting only the roles you mean to grant:')
+    for (const statement of grants) console.error(`      ${statement}`)
+    return EXIT_ERROR
+  }
 
-  for (const statement of grants) {
-    await client.query(statement)
-    console.log(`  ${statement}`)
+  // ONE TRANSACTION, WHICH IS WHAT MAKES THE REFUSAL ABOVE SAFE (o3d-secops r30, Codex MEDIUM).
+  //
+  // These used to be issued one statement at a time in autocommit, so a process killed halfway
+  // through left SOME recorded grantees holding CONNECT and some not -- the very `ambiguous`
+  // reading the arm above now refuses, produced by this program's own interruption. Refusing it
+  // while being able to cause it would have made a legitimate retry unrunnable.
+  //
+  // Wrapped, the release is all-or-nothing exactly as the fence is: an interruption before COMMIT
+  // rolls back to the fenced ACL, the next run reads `stands` and grants the whole list, and an
+  // interruption after COMMIT reads `absent` on a stamped record and is answered by the retry arm
+  // above. There is no interruption that leaves a mixed one.
+  await client.query('BEGIN')
+  try {
+    for (const statement of grants) {
+      await client.query(statement)
+      console.log(`  ${statement}`)
+    }
+    await client.query('COMMIT')
+  } catch (error) {
+    // The rollback is best-effort and its failure is not the news: what matters is that this run
+    // does not report a release it did not complete. A transaction that never committed leaves
+    // the fence exactly as it found it, which is the state a re-run is able to release from.
+    await client.query('ROLLBACK').catch(() => {})
+    console.error(`Release FAILED and was rolled back: ${error instanceof Error ? error.message : String(error)}`)
+    console.error(`The fence described by ${options.stateFile} is still standing and its record is untouched, so a`)
+    console.error('re-run releases from it. Or run these by hand as a superuser on that server:')
+    for (const statement of grants) console.error(`  ${statement}`)
+    return EXIT_ERROR
   }
 
   const { rows } = await client.query(
@@ -2898,13 +3027,13 @@ export async function doAuditAuthority(client, options) {
       console.error('and run this again, and the answer becomes evidence instead of the absence of it.')
     }
   }
-  process.stdout.write(`legacy_fence_cluster=${clusterIdentity.status}\n`)
+  MACHINE_CHANNEL.write(`legacy_fence_cluster=${clusterIdentity.status}\n`)
   // AND WHICH CLUSTER ACTUALLY ANSWERED, verbatim. The operator resolution binds its interactive
   // confirmation token to this, so that a decision confirmed about one server cannot be replayed
   // against another; and an operator reading the transcript can compare it with the server they
   // believe they are pointed at.
-  process.stdout.write(`legacy_fence_cluster_identity=${liveCluster.systemIdentifier || '<unavailable>'}/${audited[0]?.audited_database_oid ?? '<unavailable>'}\n`)
-  process.stdout.write(`legacy_fence_verdict=${evidence.verdict}\n`)
+  MACHINE_CHANNEL.write(`legacy_fence_cluster_identity=${liveCluster.systemIdentifier || '<unavailable>'}/${audited[0]?.audited_database_oid ?? '<unavailable>'}\n`)
+  MACHINE_CHANNEL.write(`legacy_fence_verdict=${evidence.verdict}\n`)
   if (evidence.verdict === LEGACY_FENCE_ABSENT) return EXIT_OK
   if (evidence.verdict === LEGACY_FENCE_STANDS) return EXIT_FENCE_STANDING
   return EXIT_FENCE_UNPROVEN
@@ -2969,7 +3098,7 @@ async function main() {
       console.error('--app-user names no role, so the migration has no role to run as. Refusing to emit a URL that would create objects owned by the admin.')
       process.exit(EXIT_ERROR)
     }
-    process.stdout.write(`${buildMigrationConnectionString(process.env.DEPLOY_ADMIN_DATABASE_URL, appRole)}\n`)
+    MACHINE_CHANNEL.write(`${buildMigrationConnectionString(process.env.DEPLOY_ADMIN_DATABASE_URL, appRole)}\n`)
     return
   }
 

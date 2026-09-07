@@ -1762,9 +1762,60 @@ db_fence_publish_authority() {
 # describes a fence that has been released, which is the safe way round -- a `--fence` over it
 # re-applies the same grantee list and a second `--release` re-grants what is already granted,
 # where removing it first would lose the only account of what was revoked.
+# AND IT IS NOT AUTHORISED BY A DATABASE (o3d-secops r30, Codex HIGH 1)
+#
+# THE FINDING, AND WHY IT IS THE END OF AN ARGUMENT RATHER THAN THE START OF ONE. r29 measured, on
+# real clusters, that a PHYSICAL CLONE TAKEN AFTER THE FENCE is indistinguishable from the cluster
+# it was copied from: same system identifier, same database OID, same timeline, the same revoked
+# ACL, and even the same xmin and ctid on the pg_database row. A `--release` pointed at such a copy
+# therefore reads a standing fence, grants, verifies, and exits 0 -- correctly, on the evidence it
+# has -- and every fact it could ever gather was copied along with the data. r29 disclosed that
+# residual honestly and left this unlink hanging off that exit status, which is the defect: the
+# release succeeds on the copy and root then destroys the ONE account of the fence still standing
+# on the real server, the only thing a genuine release could have been built from.
+#
+# A MEASURED RESIDUAL IN A DESTRUCTIVE PATH IS A FINDING, and no in-database attestation retires
+# it. The connection endpoint was the tempting candidate -- inet_server_addr() and
+# inet_server_port() are properties of the socket rather than of the data directory, so a copy
+# running elsewhere does report different ones -- but it is not a total rule either: a copy that
+# takes over the origin's address after the origin has moved reads as the origin. It would shrink
+# this residual and not close it, at the price of a new recorded field through the validator, the
+# compare-and-swap and the census, and a fallback to "unproven" on every unix-socket and pooled
+# installation. Trading a total rule for a smaller residual in the same destructive path is how
+# this defect gets re-found in a later round with a longer comment attached.
+#
+# SO THE ATTESTATION IS NOT ABOUT THE DATABASE AT ALL. It is root's own memory, in this process, of
+# an act it performed itself: THIS RUN RAISED THE FENCE IT IS NOW RELEASING. On the ordinary
+# cutover that is simply true -- db_fence_raise() published this record and revoked from it minutes
+# ago, over the same connection string, under the same cutover lock -- and it is a fact no copy of
+# any cluster can produce, because it is not in any cluster. The ordinary deploy, update and
+# install therefore stay exactly as automatic as they were, which is what the arm exists for.
+#
+# WHERE THAT MEMORY IS ABSENT, NOTHING HERE DELETES. A release of a record some EARLIER run
+# published -- the standalone release wrapper an operator runs days later, or the start path
+# checking whether a previous cutover left a fence standing -- is precisely the case in which the
+# copy is realistic and the record is somebody else's account of what they revoked. That returns 2
+# and says so: distinct from 1, because "must not" and "could not" want different sentences from
+# the caller, and neither of them is success.
+#
+# THE WORD ITSELF IS A LITERAL AND NOT A SCRIPT-SCOPE NAME, deliberately. A name holding the value
+# that licenses an unlink is a name some later path can assign to, which is the whole subject of
+# the sink census in tests/scripts/install-root-safe-writes.test.ts; a literal compared in place has
+# nothing to write. Nothing else is accepted -- not an empty argument, not `true`, and not a value
+# the shell might produce by accident from an unset name under `set -u`.
 db_fence_clear_authority() {
-  local destination="$1"
+  local destination="$1" attestation="${2:-}"
   [[ -n "${destination}" ]] || return 0
+  # NOTHING THERE IS NOTHING TO REFUSE. Callers reach this after a release that found no record at
+  # all -- adopt_db_connections() takes that path deliberately -- and a gate that turned an absent
+  # file into a refusal would stop a recovery on the one state that needs no decision at all.
+  [[ -e "${destination}" || -L "${destination}" ]] || return 0
+  if [[ "${attestation}" != "raised-by-this-run" ]]; then
+    echo "NOT REMOVING ${destination}: this run did not raise the fence that record describes, so it cannot show that the server it just released is the server the record was written against." >&2
+    echo "A copy of a fenced cluster -- a base backup, a restored snapshot, a staging clone reachable at the same name -- carries the fence with it and answers a release exactly as the original does; nothing readable separates the two. Removing the record here would destroy the only account of what a fence still standing on the real server revoked." >&2
+    echo "The grants this run issued are unaffected and are safe to repeat. What is left is the record, and it is ended by a person: run ${DB_FENCE_SUDO_PREFIX}${DB_FENCE_RELEASE_WRAPPER} as root, which reaches the same answer and then offers to remove it once, after a token derived from that record's exact bytes is typed at your terminal." >&2
+    return 2
+  fi
   rm -f "${destination}" 2>/dev/null || true
   [[ ! -e "${destination}" ]] || return 1
   return 0
@@ -1842,7 +1893,10 @@ db_fence_raise() {
     # is there: where a fence WAS standing when this run arrived, that record is somebody else's
     # account of what was revoked and is never this run's to remove.
     if [[ "${had_authority}" -eq 0 ]]; then
-      if ! db_fence_clear_authority "${state_file}"; then
+      # THIS RUN'S OWN PUBLICATION, seconds old and never revoked from: ${had_authority} was read
+      # before step 2 precisely so this branch can say so. That is the attestation, and it is why
+      # this removal is still automatic while the release's is not.
+      if ! db_fence_clear_authority "${state_file}" "raised-by-this-run"; then
         echo "The connection-fence authority could not be published AND the partial record at ${state_file} could not be removed. It carries no applied stamp, so no later run can treat it as a standing fence and it cannot buy the recovery rule; it is still litter at the authoritative path. Remove it by hand." >&2
       fi
     fi
@@ -1903,7 +1957,8 @@ db_fence_raise() {
   # removing it would strand every grantee it names. Then the refusal is left with the record
   # intact, exactly as before.
   if [[ "${rc}" -eq 3 && "${had_authority}" -eq 0 ]]; then
-    if ! db_fence_clear_authority "${state_file}"; then
+    # Again this run's own publication and nothing else: ${had_authority} bounds it.
+    if ! db_fence_clear_authority "${state_file}" "raised-by-this-run"; then
       echo "The connection fence was REFUSED before anything was revoked, and the authority this run published at ${state_file} could not be removed. Nothing is fenced and nothing has been migrated, but that file now describes a fence that does not exist: the next cutover will treat it as a standing one. Remove it by hand before re-running." >&2
     fi
   fi
@@ -2310,18 +2365,76 @@ raise_the_fence() {
   fi
   return "${rc}"
 }
+# THE STANDALONE RELEASE, AND WHY IT NO LONGER ENDS THE RECORD BY ITSELF (o3d-secops r30, Codex
+# HIGH 1 + MEDIUM).
+#
+# THIS WRAPPER IS THE CASE THE FINDING IS ABOUT. It is run BY A PERSON, against a record some
+# EARLIER run published -- a cutover that died, a fence raised days ago -- so it has none of the
+# memory db_fence_raise() has, and the clone it may be pointed at is not a thought experiment: a
+# base backup, a restored snapshot or a staging copy reachable through the same name carries the
+# fence with it and answers this release exactly as the original does. r29 measured that the two
+# are indistinguishable in identifier, OID, timeline, ACL, xmin and ctid, and left the unlink
+# hanging off the helper's exit status anyway. So the unlink is gone from here.
+#
+# THE GRANTS STAY AUTOMATIC AND THE REMOVAL DOES NOT, which is the line that actually matters:
+# restoring CONNECT to the roles a record names is idempotent and harmless to repeat -- on the
+# real server it is the release, on a copy it is a no-op or a privilege restored on a copy --
+# while destroying the record is neither idempotent nor recoverable, and it is the ONLY thing a
+# genuine release could later be built from.
+#
+# AND IT IS RETRYABLE, WHICH IT WAS NOT (Codex MEDIUM). Between the grants landing and the record
+# being removed there is an interval no amount of ordering closes, because the two acts are two
+# processes. A crash there used to leave a state that read as "no fence stands here" and REFUSED,
+# with the resolution wrapper bouncing a STAMPED record straight back to this one -- a loop with
+# no way out but an operator deleting the file by hand. The helper now answers that reading with
+# exit 6 on a stamped record, and this wrapper treats 6 exactly as it treats 0: the fence is down
+# on the server that answered, and what remains is the record. Re-running only ever re-grants and
+# re-offers, which is what makes it safe to run twice.
 release_the_fence() {
-  # o3d-secops r28: the release READS the record, GRANTs from it and then REMOVES it. Held across
-  # all three, so a re-fence or a resolution cannot publish or stamp between them.
+  local released rc=0 identity="" digest=""
+  # o3d-secops r28: the release READS the record, GRANTs from it and then offers to remove it.
+  # Held across all three, so a re-fence or a resolution cannot move the record between them.
   take_cutover_lock || return 1
-  run_helper DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" node "${helper}" --release --state-file="${state_file}" --state-owner="$(id -u)" "${identity_argv[@]}" || return 1
-  # Root removes the record, after the release is verified and never before: see
-  # db_fence_clear_authority() in lib/db-fence-protected.sh for why that order and not the other.
-  rm -f "${state_file}" 2>/dev/null || true
-  if [[ -e "${state_file}" ]]; then
-    echo "The fence was released and ${state_file} could not be removed. The next cutover reads that file as a STANDING FENCE. Remove it by hand." >&2
+  # Its stdout is captured for the machine line below and printed straight back afterwards; the
+  # prose an operator reads is on stderr and is never captured, so it still streams live.
+  released="$(run_helper DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" node "${helper}" --release --state-file="${state_file}" --state-owner="$(id -u)" "${identity_argv[@]}")" || rc=$?
+  [[ -z "${released}" ]] || printf '%s\n' "${released}"
+  # 0 is a release this run performed. 6 is EXIT_ALREADY_RELEASED -- a record stamped applied whose
+  # every grantee already holds CONNECT, which is what a crash between the grants and this step
+  # leaves. Both mean the same thing about the database: there is nothing left to grant here.
+  if [[ "${rc}" -ne 0 && "${rc}" -ne 6 ]]; then
     return 1
   fi
+  if [[ ! -e "${state_file}" && ! -L "${state_file}" ]]; then
+    echo "The fence is released and there is no record at ${state_file} to remove." >&2
+    return 0
+  fi
+  if [[ "${rc}" -eq 6 ]]; then
+    echo "" >&2
+    echo "The grants this record describes were ALREADY in place, so this run issued none. That is what an earlier release that finished and then died before its record could be removed leaves behind, and completing it is the whole reason this arm exists." >&2
+  fi
+  digest="$(sha256sum < "${state_file}" 2>/dev/null | cut -d' ' -f1)"
+  if [[ ! "${digest}" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "The fence was released and ${state_file} could not be hashed, so nothing here can hold a removal to the bytes it read. The record is untouched and the next cutover reads it as a STANDING FENCE. Remove it by hand once you have confirmed CONNECT is back." >&2
+    return 1
+  fi
+  identity="$(printf '%s\n' "${released}" | sed -n 's/^release_cluster_identity=\(.*\)$/\1/p' | tail -1)"
+  echo "" >&2
+  echo "ABOUT TO REMOVE the connection-fence authority at ${state_file}." >&2
+  echo "  record digest:    ${digest}" >&2
+  echo "  cluster released: ${identity:-<this server would not say>}" >&2
+  echo "THE ONE THING THIS RUN CANNOT SHOW YOU is that the server above is the server this record was written against. A physical copy of a fenced cluster -- a base backup, a restored snapshot, a staging clone reachable at the same name -- inherits the system identifier, the database OID, the timeline and the fenced ACL itself, so it satisfies every check this program can make. Releasing on such a copy succeeds, and removing the record afterwards destroys the only account of the fence still standing on the original." >&2
+  echo "Confirm only if you know the host in DEPLOY_ADMIN_DATABASE_URL is the fenced server and not a replica, a proxy or a restored copy of it. This destroys the record; it cannot be undone and nothing else holds the grantee list it names. The GRANTs above are already done either way and are safe to repeat, so declining costs you nothing but this file." >&2
+  operator_confirms clear "$(decision_token clear "${digest}" "${identity}")" || {
+    echo "The fence is released and ${state_file} is exactly as it was found. Every automatic path goes on reading it as a STANDING FENCE until it is gone, so re-run this wrapper from a terminal when you are ready to end it." >&2
+    return 1
+  }
+  if ! env -u NODE_OPTIONS -u NODE_PATH -u NODE_REPL_EXTERNAL_MODULE \
+    node -e "${clear_authority}" -- "${state_file}" "${digest}"; then
+    echo "The fence was released and ${state_file} could not be removed (the reason is above). The next cutover reads that file as a STANDING FENCE. Remove it by hand." >&2
+    return 1
+  fi
+  echo "RESOLVED: ${state_file} is gone and the fence it described is down." >&2
   return 0
 }
 # THE ONE-TIME OPERATOR RESOLUTION (o3d-secops r26, Codex HIGH; reworked r28, Codex HIGH 1 + 3

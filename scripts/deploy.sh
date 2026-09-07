@@ -2992,7 +2992,24 @@ release_db_connections() {
     # revoked, and a record describing a released fence is the safe way round -- a re-fence
     # re-applies the same list, a second release re-grants what is already granted. A failure to
     # remove it would make the NEXT run believe a fence is standing, so it is a failure here.
-    db_fence_clear_authority "$DB_FENCE_STATE" || { echo -e "${RED}[ERROR]${RESET} The connection fence was released and its record at $DB_FENCE_STATE could not be removed. The next run reads that file as a STANDING FENCE and will refuse to start the application. Remove it by hand once you have confirmed CONNECT is back." >&2; return 1; }
+    # AND THE REMOVAL IS ATTESTED, OR IT DOES NOT HAPPEN (o3d-secops r30, Codex HIGH 1). The
+    # attestation is not a fact about the database -- r29 measured that a physical copy of a fenced
+    # cluster answers a release exactly as the original does, and always will -- it is this run's own
+    # memory of having raised the fence it just released, minutes ago, over this same connection
+    # string. Where that is absent the record belongs to an EARLIER run and is left alone: the
+    # grants above are done and are safe to repeat, and a person ends the record. See
+    # db_fence_clear_authority() in lib/db-fence-protected.sh.
+    local clear_attestation="" clear_rc=0
+    if ${DB_FENCE_RAISED:-false}; then clear_attestation="raised-by-this-run"; fi
+    db_fence_clear_authority "$DB_FENCE_STATE" "$clear_attestation" || clear_rc=$?
+    if [[ "$clear_rc" -eq 2 ]]; then
+      echo -e "${RED}[ERROR]${RESET} The connection fence WAS released -- CONNECT is restored -- and its record at $DB_FENCE_STATE was deliberately NOT removed (the reason is printed above). The next run reads that file as a STANDING FENCE. End it with ${DB_FENCE_RELEASE_CMD}, which asks you to confirm at your terminal." >&2
+      return 1
+    fi
+    if [[ "$clear_rc" -ne 0 ]]; then
+      echo -e "${RED}[ERROR]${RESET} The connection fence was released and its record at $DB_FENCE_STATE could not be removed. The next run reads that file as a STANDING FENCE and will refuse to start the application. Remove it by hand once you have confirmed CONNECT is back." >&2
+      return 1
+    fi
     ok "Connection fence released."
     return 0
   fi
