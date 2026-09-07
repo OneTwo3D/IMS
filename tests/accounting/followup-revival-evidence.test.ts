@@ -17,7 +17,10 @@ import test, { mock } from 'node:test'
  */
 
 const xeroCalls: string[] = []
-let xeroResponse: unknown = { Invoices: [{ InvoiceID: 'inv-1', Payments: [] }] }
+// o3d-nk5n: an UNSETTLED Xero invoice states its figures, and states `Total` and `AmountDue` EQUAL.
+// The figureless stub this used to be is not a response Xero sends, and since an empty record list
+// must now be PROVED rather than assumed it no longer reads as an unsettled invoice at all.
+let xeroResponse: unknown = { Invoices: [{ InvoiceID: 'inv-1', Total: 10, AmountDue: 10, AmountPaid: 0, Payments: [] }] }
 
 mock.module('@/lib/connectors/xero/api', {
   namedExports: {

@@ -515,7 +515,13 @@ test('xero: a credit the response ITEMISES explains itself and changes no verdic
         Total: 120,
         AmountDue: 60,
         AmountPaid: 20,
-        AmountCredited: 30,
+        // o3d-nk5n: 40, not 30. `AmountCredited` is money taken off the document by credit notes,
+        // prepayments AND overpayments — the probe's own type says so — so an itemised 30 of credit
+        // beside 10 of prepayment is 40 credited. At 30 this body was a response Xero cannot send:
+        // `Total - AmountDue` says 60 has settled while `AmountPaid + AmountCredited` says 50, and
+        // those are two forms of ONE figure. The primary pair decides this test either way, so the
+        // verdict is unchanged; what changes is that the fallback form now agrees with it.
+        AmountCredited: 40,
         Payments: [{ PaymentID: 'PAY-1', Date: '2026-08-01', Amount: 20 }],
         CreditNotes: [{ AppliedAmount: 30 }],
         Prepayments: [{ AppliedAmount: 10 }],
