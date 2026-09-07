@@ -1508,6 +1508,71 @@ export async function probeXeroSettlement(
             + 'much of the credit is already allocated',
       }
     }
+    /*
+     * o3d-acctmoney r5 (Codex HIGH, the hardening half) — AND EVERY COUNTED REFUND AMOUNT IS PROVED
+     * NON-NEGATIVE, BECAUSE ALL THE ARITHMETIC BELOW ASSUMES IT AND NOTHING CHECKED IT.
+     *
+     * WHAT ASSUMES IT. Two things, and the second is the one the finding turned on:
+     *
+     *   THE SUBTRACTION. `refunded` comes off `applied` as money that has already left the credit
+     *                    note. A NEGATIVE term there is money going back ON, which under this
+     *                    identity is not a refund at all.
+     *   THE INTERVAL.    `unprovedRefunded` is a WIDTH — `applied` is its bottom and
+     *                    `applied + unprovedRefunded` its top — and a width is a distance, which is
+     *                    non-negative by construction. With a negative term the two ends SWAP, and
+     *                    the incoherence check below, which is deliberately asked of the most
+     *                    generous reading, would then be asked of the least generous one.
+     *
+     * WHAT A NEGATIVE AMOUNT IS ON THIS ENDPOINT, decided before choosing what to do with it — which
+     * is the order this branch keeps being told to work in, and the answer is settled from what the
+     * repository records rather than from what feels safe:
+     *
+     *   XERO REVERSES A PAYMENT BY STATUS, NOT BY SIGN. `Payment.Status` is enumerated
+     *   `AUTHORISED` / `DELETED`, and Xero's own reversal is a POST of `Status: 'DELETED'` to
+     *   `Payments/{id}` — see `remove-xero-live-e2e-footprint.ts`, and `creditNoteRefundInclusion`,
+     *   which already drops such a payment as not a term. The same sentence is written one level up
+     *   about allocations: a deleted one LEAVES the collection rather than staying in it with a
+     *   reversing sign. So the contract has a channel for "this refund came back", it is not the
+     *   sign, and a negative `Amount` is not that channel spelled differently.
+     *   NOTHING IN THIS REPOSITORY RECORDS ONE. `audit-xero-live-contamination.ts` types the nested
+     *   element `{ PaymentID: string; Amount: number }` off the live tenant and no captured body
+     *   anywhere carries a negative payment amount; IMS never posts one either — every money post
+     *   short-circuits on `amount <= 0` before it reaches the wire. So a negative here is an
+     *   UNESTABLISHED shape, which is this arm's standing category for "the ledger stated something
+     *   this code cannot account for", not a shape whose meaning is known and merely inconvenient.
+     *
+     * SO IT REFUSES, AND AS AN UNACCOUNTABLE VALUE RATHER THAN AS A CONTRADICTION. The distinction is
+     * real in this file and worth keeping: a CONTRADICTION is two figures the ledger stated that
+     * cannot both be true — `RemainingCredit` against the note's own allocation collection — and it
+     * names the DOCUMENT, because the document is what disagrees with itself. A negative refund
+     * contradicts nothing on its own; the note's arithmetic may balance perfectly with it in. What it
+     * does is state a TERM this identity has no meaning for, which is exactly what an unenumerated
+     * `Status` or `PaymentType` does, and those refuse by naming the PAYMENT so an operator has one
+     * thing to open. This takes that route and that sentence-shape for the same reason.
+     *
+     * AND IT IS MEASURED AT THE FILE'S OWN BAND, not at a bare `< 0`. `shortBy(0, value)` is "the
+     * value is more than one band BELOW zero" — the same function and the same `completenessBand`
+     * every other comparison in this file decides at. A negative smaller than the band is two exact
+     * decimals agreeing to the document's minor unit, which is noise below the granularity of every
+     * decision here, and refusing on it would refuse an ordinary note for a rounding artefact.
+     *
+     * THE COUNTED ENTRIES ARE THE WHOLE OF WHAT IS CHECKED, and that is wider than the width alone on
+     * purpose: the width's readings are a SUBSET of these, so checking the superset establishes the
+     * invariant for `refunded` too, and an EXCLUDED payment's `Amount` is never read anywhere in this
+     * arm — demanding a sign of a figure this code will not use would be a refusal with no harm
+     * behind it, which is the rule `creditNoteRefundAmountDisagreement` already follows.
+     */
+    const negativeRefund = refundReadings.findIndex(
+      (reading) => reading.value !== null && shortBy(toDecimal(0), reading.value, noteCurrency),
+    )
+    if (negativeRefund !== -1) {
+      return {
+        ok: false,
+        reason: `Xero states payment ${countedEntries[negativeRefund]!.id} against this credit note as `
+          + `${formatLedgerMoney(refundReadings[negativeRefund]!.value!)}, which is not an amount that `
+          + 'can have come off the credit, so IMS cannot tell how much of the credit is already allocated',
+      }
+    }
     // o3d-acctmoney r4 (Codex MEDIUM) — HOW MUCH OF THE SUBTRACTED REFUND TERM IS UNPROVED.
     //
     // A payment the lookup budget did not reach is still SUBTRACTED above — its stub says nothing, and
@@ -1516,6 +1581,23 @@ export async function probeXeroSettlement(
     // INTERVAL of exactly this width rather than a figure, and every check below is entitled to one
     // end of it. Nothing is unresolved on the ordinary note, so this is zero and every bound collapses
     // to the single value r3 computed.
+    //
+    // o3d-acctmoney r5 (Codex HIGH) — AND THE TWO JOBS THIS SUM WAS DOING ARE NOW TWO VALUES.
+    //
+    // THE DEFECT. `unprovedRefunded` was the interval's WIDTH and, through `statesAnything`, the only
+    // marker that resolution had been INCOMPLETE. Those are not the same fact. Whether anything is
+    // unresolved is a fact about a COUNT — did the budget leave a payment unasked-about — and the sum
+    // is a derived quantity that reaches zero for reasons of its own. Codex's shape: a 32-payment
+    // response whose first 30 resolve and whose two budget-excluded amounts are +100 and -100. Their
+    // sum is exactly zero, so the marker read false, `provedComplete` came out TRUE over an empty
+    // record list, and the classifier said `clear` — with two refunds still unverified, which is the
+    // second allocation this whole arm exists to withhold.
+    //
+    // SO THE MARKER IS READ FROM THE THING IT DESCRIBES. `resolveCreditNoteRefunds` already returns
+    // the indices it did not reach; whether that list is EMPTY is the whole question, and no
+    // arithmetic can cancel a non-empty list into an empty one. The width keeps its own name and its
+    // own job below, and neither value can be spent as the other.
+    const somethingUnresolved = refundResolution.unresolved.length > 0
     const unresolvedReadings = refundEntries
       .filter((_entry, index) => refundInclusions[index]!.counts && unresolvedRefunds.has(index))
       .map((entry) => entry.amounts[0]!)
@@ -1643,10 +1725,19 @@ export async function probeXeroSettlement(
     // What a credit note with more refunds than the budget therefore loses is the ability to have a
     // FIRST allocation authorised automatically; what it keeps is every protection against a second
     // one, and it is no longer stranded as a hard failure that no retry can clear.
-    const allocationsDoNotProve = applied !== null
-      && (allocated === null
-        || exceeds(allocated, applied, noteCurrency)
-        || statesAnything(unprovedRefunded, noteCurrency))
+    //
+    // o3d-acctmoney r5 (Codex HIGH) — AND THE UNRESOLVED TERM IS READ OFF THE COUNT, OUTSIDE THE
+    // `applied !== null` GATE. "Something was left unasked-about" is true or false whatever the
+    // document's own figures say, so it is not a term of a conjunction about them; hoisting it makes
+    // `unresolved.length > 0` force `provedComplete: false` literally rather than by argument. The
+    // shape is the same one behind every finding on this branch — a fact taken from a proxy that
+    // merely correlates with it — and the correction is the same: read the fact from the thing it is
+    // about. See `somethingUnresolved`, and note that `unprovedRefunded` is still the interval WIDTH
+    // above and is no longer asked any question about whether the interval exists.
+    const allocationsDoNotProve = somethingUnresolved
+      || (applied !== null
+        && (allocated === null
+          || exceeds(allocated, applied, noteCurrency)))
     return settlementAnswer(applied, allocationsDoNotProve, records,
       'Xero states no total or remaining credit on this credit note and IMS read no allocation '
       + 'of it to this bill, so it has nothing to tell from — an empty answer here would say that '
