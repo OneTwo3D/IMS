@@ -13016,3 +13016,441 @@ test('[o3d-secops r31] taking down a witness whose reader has gone does not kill
     `taking down a witness whose reader has gone must not kill the cutover with a signal:\n${result.output}`)
   assert.equal(result.status, 0, `and the shell must exit cleanly, not on SIGPIPE:\n${result.output}`)
 })
+
+// ---------------------------------------------------------------------------
+// o3d-secops r32, Codex HIGH 1 — PROSE AND MACHINE DATA NO LONGER SHARE A CHANNEL,
+// AND THE CHANNEL IS NO LONGER READ BY SUBSTRING.
+//
+// THE FINDING. `released` held the WHOLE of `--release`'s stdout, and the shell accepted the
+// verdict with `[[ "$released" == *"witness_colocated=yes"* ]]`. Eleven `console.log` calls in the
+// helper wrote to that same stdout, and several of them interpolate a DATABASE OR ROLE NAME --
+// `Connection fence released: CONNECT restored to <roles> on <database>.` above all. A database or
+// a role called `x witness_colocated=yes` therefore set the verdict, and root then deleted the
+// sole authority for a fence still standing on the real server. The fence side had the same defect
+// with `fence_witness=colocated`, and both were duplicated across all three entrypoints.
+//
+// WHAT THESE MEASURE, and it is three separate properties rather than three spellings of one:
+//
+//   1. A NAME SOMEBODY ELSE CHOSE CANNOT FORGE A VERDICT. The stub puts the token on the channel
+//      the way an identifier would -- inside a longer line, and on a line of its own carrying a
+//      DIFFERENT nonce -- and the record must survive.
+//   2. TWO ANSWERS ARE NOT AN ANSWER. A stream that says both must refuse rather than take the
+//      last one, because `tail -1` semantics are how an appended line becomes the verdict.
+//   3. A VERDICT WITH NO CHALLENGE REFUSES. This is the one that is easy to miss and the shape
+//      this branch has closed four times: the ABSENCE of the exchange must not read as success.
+//      The stub learns the nonce through the witness co-process and answers PERFECTLY -- right
+//      grammar, right nonce, single line -- while the shell never issued the challenge, so only
+//      the `${#witness_argv[@]}` guard can refuse it.
+// ---------------------------------------------------------------------------
+
+/**
+ * A checkout whose `--release` speaks the r32 grammar and whatever else the case needs on stdout.
+ *
+ * `nonceSink` is the file the WITNESS stub writes every challenge nonce it is asked for. It is how
+ * case 3 above is reachable at all: `--release` is a different process from the witness, so
+ * without a channel between them a run that never passed `--witness-challenge=` could not produce
+ * a correctly-formed verdict, and the guard being tested would have nothing to refuse.
+ */
+function witnessProtocolCheckout(
+  dir: string,
+  options: {
+    verdict?: 'yes' | 'no'
+    extraStdout?: string[]
+    confirmChallenge?: boolean
+    sightings?: number
+    binding?: 'colocated' | 'absent'
+  } = {},
+): void {
+  const { verdict = 'yes', extraStdout = [], confirmChallenge = true, sightings = 1, binding = 'colocated' } = options
+  const helper = writeFenceCheckout(dir, '')
+  const sink = JSON.stringify(join(dir, 'challenge-nonce'))
+  writeFileSync(helper, [
+    "import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs'",
+    `appendFileSync(${JSON.stringify(join(dir, 'calls.log'))}, process.argv.slice(2).join(' ') + '\\n')`,
+    "if (process.argv.includes('--plan')) {",
+    "  process.stdout.write(JSON.stringify({",
+    "    database: 'imsdb', owner_role: 'imsapp', app_role: 'imsapp', admin_role: 'deployadmin',",
+    "    revoked: ['PUBLIC', 'imsapp'], datacl_before: null, fenced_at: '2026-01-01T00:00:00.000Z',",
+    "  }) + '\\n')",
+    '}',
+    "if (process.argv.includes('--print-migration-url')) process.stdout.write(`postgres://admin@127.0.0.1/nowhere?application_name=ims-migration-${process.argv.find((a) => a.startsWith('--migration-nonce='))?.slice('--migration-nonce='.length) ?? ''}\\n`)",
+    // THE WITNESS, WHICH ALSO RECORDS EVERY NONCE IT IS CHALLENGED WITH. Whether it CONFIRMS is
+    // the parameter: a witness that hears the challenge and says nothing is exactly the state in
+    // which the shell issues no `--witness-challenge=` and the verdict below is unasked-for.
+    "if (process.argv.includes('--witness')) {",
+    "  const nonce = process.argv.find((a) => a.startsWith('--witness-nonce='))?.slice('--witness-nonce='.length) ?? ''",
+    "  process.stdout.write(`WITNESS_READY ${nonce}\\n`)",
+    "  let buffer = ''",
+    "  process.stdin.on('data', (chunk) => {",
+    "    buffer += chunk.toString('utf8')",
+    "    let index",
+    "    while ((index = buffer.indexOf('\\n')) >= 0) {",
+    "      const line = buffer.slice(0, index).trim()",
+    "      buffer = buffer.slice(index + 1)",
+    "      const hit = /^challenge ([0-9a-f]+)$/.exec(line)",
+    `      if (hit) { writeFileSync(${sink}, hit[1]); ${confirmChallenge ? 'process.stdout.write(`WITNESS_HELD ${hit[1]}\\n`)' : '/* heard, never confirmed */'} }`,
+    "      const w = /^watch ([0-9a-f]+)$/.exec(line)",
+    "      if (w) process.stdout.write(`WITNESS_WATCHING ${w[1]}\\n`)",
+    "      const g = /^sightings ([0-9a-f]+)$/.exec(line)",
+    `      if (g) process.stdout.write(\`WITNESS_SIGHTINGS \${g[1]} ${sightings}\\n\`)`,
+    "    }",
+    "  })",
+    "  await new Promise((resolve) => process.stdin.on('end', resolve))",
+    "  process.exit(0)",
+    "}",
+    "const lockArg = process.argv.find((a) => a.startsWith('--witness-lock='))?.slice('--witness-lock='.length) ?? ''",
+    "const migrationArg = process.argv.find((a) => a.startsWith('--migration-nonce='))?.slice('--migration-nonce='.length) ?? ''",
+    "if (process.argv.includes('--bind-migration')) {",
+    `  process.stdout.write(\`MIGRATION_BINDING \${migrationArg} ${binding}\\n\`)`,
+    `  process.exit(${binding === 'colocated' ? 0 : 1})`,
+    "}",
+    "if (process.argv.includes('--fence') && lockArg) process.stdout.write(`FENCE_WITNESS ${lockArg} colocated\\n`)",
+    // THE NONCE THE WITNESS WAS CHALLENGED WITH, whether or not this run was told it on argv. That
+    // is the whole point of the sink: the release can answer a question nobody asked it.
+    `const heardNonce = existsSync(${sink}) ? readFileSync(${sink}, 'utf8').trim() : ''`,
+    "const challengeArg = process.argv.find((a) => a.startsWith('--witness-challenge='))?.slice('--witness-challenge='.length) ?? ''",
+    "const answerNonce = challengeArg || heardNonce",
+    `if (process.argv.includes('--release') && answerNonce) process.stdout.write(\`RELEASE_WITNESS \${answerNonce} ${verdict === 'yes' ? 'colocated' : 'absent'}\\n\`)`,
+    ...extraStdout,
+    'process.exit(0)',
+    '',
+  ].join('\n'))
+}
+
+/** Fence, then release, then say whether the record survived. */
+function fenceThenReleaseProgram(entry: typeof FENCE_HARNESS[number], dir: string): string {
+  return [
+    'set -uo pipefail',
+    'exec 2>&1',
+    entry.preamble(dir),
+    'error() { echo "ERROR: $*" >&2; }',
+    'DB_FENCE_RAISED=false',
+    CUTOVER_DIR_PRIMITIVES,
+    shellFunction(entry.source, 'fence_db_connections'),
+    shellFunction(entry.source, 'release_db_connections'),
+    'fence_db_connections',
+    'release_db_connections || echo "RELEASE REPORTED FAILURE"',
+    '[[ -e "${DB_FENCE_STATE}" ]] && echo AUTHORITY_REMAINS || echo AUTHORITY_CLEARED',
+  ].join('\n')
+}
+
+for (const entry of FENCE_HARNESS) {
+  // MUTATION ROUTE (made against the shipped file and reverted): replace the guard in this
+  // entrypoint's release with r31's `if [[ "$released" == *"RELEASE_WITNESS"*"colocated"* ]]` --
+  // this prints AUTHORITY_CLEARED, which is root deleting the fence record on the strength of a
+  // database name. Restoring `db_fence_machine_verdict` makes it red again.
+  test(`${entry.name}: a role or database name carrying the attestation token does not forge the release verdict (o3d-secops r32, Codex HIGH 1)`, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ims-r32forge-'))
+    try {
+      witnessProtocolCheckout(dir, {
+        verdict: 'no',
+        extraStdout: [
+          // WHAT THE HELPER ITSELF USED TO PRINT, with the token inside a name somebody chose.
+          // r31 read the stream by substring, so this line alone authorised the deletion.
+          "if (process.argv.includes('--release')) process.stdout.write('Connection fence released: CONNECT restored to PUBLIC, imsapp on RELEASE_WITNESS 00000000000000000000000000000000 colocated.\\n')",
+          // AND THE SAME TOKEN AS A WHOLE LINE, for a nonce this run never minted -- which is the
+          // most an attacker who cannot see root's randomness can produce.
+          "if (process.argv.includes('--release')) process.stdout.write('RELEASE_WITNESS ffffffffffffffffffffffffffffffff colocated\\n')",
+        ],
+      })
+      const result = runShell(fenceThenReleaseProgram(entry, dir))
+
+      // THE PRECONDITIONS. Without these the test passes on a run that never got as far as asking.
+      assert.match(calls(dir), /^--release .*--witness-challenge=[0-9a-f]{32}/m,
+        `precondition: the release must have been given a real challenge:\n${result.output}`)
+      assert.match(result.output, /RELEASE_WITNESS 00000000000000000000000000000000 colocated/,
+        `precondition: the forged text must actually have reached the channel root reads:\n${result.output}`)
+
+      assert.match(result.output, /^AUTHORITY_REMAINS$/m,
+        `a name somebody else chose must not license the removal of the fence record:\n${result.output}`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // MUTATION ROUTE (made against the shipped file and reverted): change db_fence_machine_verdict()
+  // to `[[ "${yes}" -ge 1 ]]` -- ignoring the conflicting line -- and this prints AUTHORITY_CLEARED.
+  test(`${entry.name}: a stream that answers the same challenge twice, once each way, refuses (o3d-secops r32, Codex HIGH 1)`, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ims-r32conflict-'))
+    try {
+      witnessProtocolCheckout(dir, {
+        verdict: 'yes',
+        extraStdout: [
+          // THE SAME NONCE, THE OTHER ANSWER. Whichever is "last" is an accident of ordering, and a
+          // reader that resolves it by position is a reader an appended line can steer.
+          "if (process.argv.includes('--release') && answerNonce) process.stdout.write(`RELEASE_WITNESS ${answerNonce} absent\\n`)",
+        ],
+      })
+      const result = runShell(fenceThenReleaseProgram(entry, dir))
+
+      assert.match(result.output, /RELEASE_WITNESS [0-9a-f]{32} colocated/,
+        `precondition: the affirmative line must be present, or this tests nothing:\n${result.output}`)
+      assert.match(result.output, /RELEASE_WITNESS [0-9a-f]{32} absent/,
+        `precondition: and so must the contradicting one:\n${result.output}`)
+      assert.match(result.output, /^AUTHORITY_REMAINS$/m,
+        `a stream that answers both ways has not answered, and the record must survive it:\n${result.output}`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // MUTATION ROUTE (made against the shipped file and reverted): delete
+  // `[[ "${#witness_argv[@]}" -gt 0 ]] &&` from this entrypoint's release guard and this prints
+  // AUTHORITY_CLEARED -- root removing the record on a verdict for a challenge it never issued.
+  test(`${entry.name}: a perfectly formed verdict for a challenge that was never issued refuses (o3d-secops r32, Codex HIGH 1)`, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ims-r32unasked-'))
+    try {
+      // The witness HEARS the challenge and records the nonce, and never confirms it. The shell
+      // therefore passes no `--witness-challenge=`, while the release can still answer with the
+      // exact nonce, in the exact grammar, on a line of its own.
+      witnessProtocolCheckout(dir, { verdict: 'yes', confirmChallenge: false })
+      const result = runShell(fenceThenReleaseProgram(entry, dir))
+
+      assert.doesNotMatch(calls(dir), /--witness-challenge=/,
+        `precondition: no challenge may have been issued, or this measures the ordinary path:\n${calls(dir)}`)
+      assert.match(result.output, /RELEASE_WITNESS [0-9a-f]{32} colocated/,
+        `precondition: the unasked-for verdict must be well-formed and carry a real nonce, or the`
+        + ` nonce check alone would refuse it and this guard would go unmeasured:\n${result.output}`)
+      assert.match(result.output, /^AUTHORITY_REMAINS$/m,
+        `the absence of the exchange must not read as success:\n${result.output}`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // MUTATION ROUTE (made against the shipped file and reverted): in db_fence_raise(), drop the
+  // `[[ "${#witness_argv[@]}" -gt 0 ]] &&` and the db_fence_machine_verdict call and restore
+  // `[[ "${fenced}" == *"fence_witness=colocated"* ]]` with the stub printing the old token inside
+  // a role name -- the record is then cleared, which is the fence-side half of the same finding.
+  test(`${entry.name}: a name carrying the fence-side token does not raise the witness-bound flag (o3d-secops r32, Codex HIGH 1)`, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ims-r32fenceforge-'))
+    try {
+      witnessProtocolCheckout(dir, {
+        verdict: 'yes',
+        extraStdout: [
+          // The fence's own report, for a nonce this run never minted, plus the same token buried
+          // in the kind of line the helper used to print on stdout.
+          "if (process.argv.includes('--fence')) process.stdout.write('FENCE_WITNESS ffffffffffffffffffffffffffffffff colocated\\n')",
+          "if (process.argv.includes('--fence')) process.stdout.write('Database imsdb is fenced: CONNECT revoked from FENCE_WITNESS 0000 colocated, PUBLIC.\\n')",
+        ],
+      })
+      // The witness is bound from the REAL verdict here, so the flag is 1 and this alone proves
+      // nothing; what it proves is that the forged lines did not raise it on their own. The
+      // negative is exercised by the same stub with the real fence verdict suppressed.
+      const program = [
+        'set -uo pipefail',
+        'exec 2>&1',
+        entry.preamble(dir),
+        'error() { echo "ERROR: $*" >&2; }',
+        'DB_FENCE_RAISED=false',
+        CUTOVER_DIR_PRIMITIVES,
+        shellFunction(entry.source, 'fence_db_connections'),
+        'fence_db_connections',
+        'echo "BOUND=${DB_FENCE_WITNESS_BOUND}"',
+      ].join('\n')
+      const result = runShell(program)
+      assert.match(result.output, /^BOUND=1$/m,
+        `precondition: with a real witness the flag is raised, so the negative below is about the forgery:\n${result.output}`)
+
+      // NOW THE SAME RUN WITH NO WITNESS AT ALL: the forged lines are all that is on the channel.
+      const bare = mkdtempSync(join(tmpdir(), 'ims-r32fenceforge-bare-'))
+      try {
+        const helper = writeFenceCheckout(bare, '')
+        writeFileSync(helper, [
+          "import { appendFileSync } from 'node:fs'",
+          `appendFileSync(${JSON.stringify(join(bare, 'calls.log'))}, process.argv.slice(2).join(' ') + '\\n')`,
+          "if (process.argv.includes('--witness')) process.exit(1)",
+          "if (process.argv.includes('--plan')) {",
+          "  process.stdout.write(JSON.stringify({",
+          "    database: 'imsdb', owner_role: 'imsapp', app_role: 'imsapp', admin_role: 'deployadmin',",
+          "    revoked: ['PUBLIC', 'imsapp'], datacl_before: null, fenced_at: '2026-01-01T00:00:00.000Z',",
+          "  }) + '\\n')",
+          '}',
+          "if (process.argv.includes('--print-migration-url')) process.stdout.write('postgres://admin@127.0.0.1/nowhere\\n')",
+          "if (process.argv.includes('--fence')) process.stdout.write('FENCE_WITNESS ffffffffffffffffffffffffffffffff colocated\\n')",
+          "if (process.argv.includes('--fence')) process.stdout.write('Database imsdb is fenced: CONNECT revoked from FENCE_WITNESS 0000 colocated, PUBLIC.\\n')",
+          'process.exit(0)',
+          '',
+        ].join('\n'))
+        const bareResult = runShell([
+          'set -uo pipefail',
+          'exec 2>&1',
+          entry.preamble(bare),
+          'error() { echo "ERROR: $*" >&2; }',
+          'DB_FENCE_RAISED=false',
+          CUTOVER_DIR_PRIMITIVES,
+          shellFunction(entry.source, 'fence_db_connections'),
+          'fence_db_connections',
+          'echo "BOUND=${DB_FENCE_WITNESS_BOUND}"',
+        ].join('\n'))
+        assert.match(bareResult.output, /FENCE_WITNESS ffffffffffffffffffffffffffffffff colocated/,
+          `precondition: the forged lines must reach the channel:\n${bareResult.output}`)
+        assert.match(bareResult.output, /^BOUND=0$/m,
+          `a fence with no witness must not be told it has one by text on its own stdout:\n${bareResult.output}`)
+      } finally {
+        rmSync(bare, { recursive: true, force: true })
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+}
+
+// ---------------------------------------------------------------------------
+// o3d-secops r32, Codex HIGH 2 (o3d-mzcp) — THE MIGRATION IS BOUND TO THE SERVER THAT WAS FENCED.
+//
+// THE FINDING. The fence helper exits; `prisma migrate deploy`, the drift check, `pg_dump`, the
+// object-access check and the verification hook then open INDEPENDENT connections from
+// ${MIGRATION_DATABASE_URL}, and nothing showed that any of them reached the instance the fence
+// was raised on. These measure the SHELL BETWEEN the composed URL and the two gates: that an
+// ordinary cutover still migrates with nobody at a terminal, that a probe reporting `absent`
+// refuses BEFORE any DDL, and that a witness which never saw a migration backend refuses AFTER it.
+//
+// The colocation itself -- what an advisory lock and `pg_stat_activity` actually say about two
+// clusters -- is measured against REAL PostgreSQL servers in
+// tests/scripts/db-connection-fence.test.ts, because a stub answering that question would be a
+// test of this file's model of PostgreSQL.
+// ---------------------------------------------------------------------------
+
+for (const entry of FENCE_HARNESS) {
+  // MUTATION ROUTE (made against the shipped file and reverted): delete the
+  // `bind_migration_to_fenced_server` call from this entrypoint's fence path -- the assertion that
+  // `--bind-migration` was invoked with the URL's own nonce fails.
+  test(`${entry.name}: an ordinary cutover binds the migration and needs nobody at a terminal (o3d-secops r32, Codex HIGH 2)`, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ims-r32bind-ok-'))
+    try {
+      witnessProtocolCheckout(dir, { verdict: 'yes', binding: 'colocated', sightings: 2 })
+      const result = runShell(fenceThenReleaseProgram(entry, dir))
+
+      const stamped = /--print-migration-url --migration-nonce=([0-9a-f]{32})/.exec(calls(dir))?.[1]
+      assert.ok(stamped, `the migration URL must be composed with a stamp:\n${calls(dir)}`)
+      assert.match(calls(dir), new RegExp(`^--bind-migration --migration-nonce=${stamped} --witness-lock=[0-9a-f]{32}`, 'm'),
+        `and the probe must ask about THAT nonce, read back out of the URL rather than remembered:\n${calls(dir)}`)
+      // AND THE LOCK IT LOOKS FOR IS FRESH. A reused one would be a fact some earlier copy of the
+      // cluster could already contain, which is the whole property a nonce buys.
+      const fenceLock = /^--fence .*--witness-lock=([0-9a-f]{32})/m.exec(calls(dir))?.[1]
+      const bindLock = /^--bind-migration .*--witness-lock=([0-9a-f]{32})/m.exec(calls(dir))?.[1]
+      assert.ok(fenceLock && bindLock, `both locks must reach the helper:\n${calls(dir)}`)
+      assert.notEqual(fenceLock, bindLock, 'the migration window takes a lock of its own, minted at the window')
+
+      assert.doesNotMatch(result.output, /^DIE:/m, `and the ordinary cutover must not refuse:\n${result.output}`)
+      assert.match(result.output, /^AUTHORITY_CLEARED$/m,
+        `and must still end its own record with nobody at a terminal:\n${result.output}`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // MUTATION ROUTE (made against the shipped file and reverted): change the `*)` arm of
+  // bind_migration_to_fenced_server() from `die` to `warn` -- REACHED THE MIGRATION is then printed
+  // and the schema would move on a server this run cannot place.
+  test(`${entry.name}: a migration connection that lands on another instance refuses before any DDL (o3d-secops r32, Codex HIGH 2)`, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ims-r32bind-absent-'))
+    try {
+      witnessProtocolCheckout(dir, { verdict: 'yes', binding: 'absent' })
+      const result = runShell([
+        'set -uo pipefail',
+        'exec 2>&1',
+        entry.preamble(dir),
+        'error() { echo "ERROR: $*" >&2; }',
+        'DB_FENCE_RAISED=false',
+        CUTOVER_DIR_PRIMITIVES,
+        shellFunction(entry.source, 'fence_db_connections'),
+        'fence_db_connections',
+        'echo "REACHED THE MIGRATION"',
+      ].join('\n'))
+
+      assert.match(calls(dir), /^--bind-migration /m,
+        `precondition: the probe must have run:\n${calls(dir)}`)
+      assert.doesNotMatch(result.output, /^REACHED THE MIGRATION$/m,
+        `a migration that would land somewhere else must not be reached:\n${result.output}`)
+      assert.match(result.output, /WOULD NOT HAVE LANDED ON THE SERVER THIS RUN FENCED/,
+        `and the operator must be told which question was answered:\n${result.output}`)
+      assert.match(result.output, /NOTHING HAS BEEN MIGRATED/,
+        `and that the schema is untouched:\n${result.output}`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // MUTATION ROUTE (made against the shipped file and reverted): change the `*)` arm of
+  // require_migration_landed_on_fenced_server() from `die` to `warn` -- STARTED THE NEW BUILD is
+  // then printed after a window in which nothing observed where the migration went.
+  test(`${entry.name}: a window in which the witness never saw a migration backend refuses (o3d-secops r32, Codex HIGH 2)`, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ims-r32unseen-'))
+    try {
+      witnessProtocolCheckout(dir, { verdict: 'yes', binding: 'colocated', sightings: 0 })
+      const result = runShell([
+        'set -uo pipefail',
+        'exec 2>&1',
+        entry.preamble(dir),
+        'error() { echo "ERROR: $*" >&2; }',
+        'DB_FENCE_RAISED=false',
+        CUTOVER_DIR_PRIMITIVES,
+        shellFunction(entry.source, 'fence_db_connections'),
+        'fence_db_connections',
+        'require_migration_landed_on_fenced_server',
+        'echo "STARTED THE NEW BUILD"',
+      ].join('\n'))
+
+      assert.match(result.output, /WITNESS_SIGHTINGS|never seen|NEVER SEEN/i,
+        `precondition: the witness must have been asked what it saw:\n${result.output}`)
+      assert.doesNotMatch(result.output, /^STARTED THE NEW BUILD$/m,
+        `nothing may start on a schema this run cannot place:\n${result.output}`)
+      assert.match(result.output, /THE SCHEMA MAY HAVE MOVED/,
+        `and the operator must be told that this refusal comes AFTER the DDL:\n${result.output}`)
+      assert.match(result.output, /STILL UP/,
+        `and that the fence is being held rather than released:\n${result.output}`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // AND A RUN WITH NO WITNESS IS NOT REFUSED. This is the degraded mode every host behind a
+  // transaction-mode pooler or with a single-database cluster is in, and turning it into an outage
+  // would be trading this finding for a worse one.
+  // MUTATION ROUTE (made against the shipped file and reverted): make db_fence_migration_bind()
+  // return 1 instead of 3 when ${DB_FENCE_WITNESS_BOUND} is 0 -- this run then dies and every such
+  // host stops being able to deploy.
+  test(`${entry.name}: a cutover that could hold no witness still migrates, and says the record will be kept (o3d-secops r32)`, () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ims-r32nowitness-'))
+    try {
+      const helper = writeFenceCheckout(dir, '')
+      writeFileSync(helper, [
+        "import { appendFileSync } from 'node:fs'",
+        `appendFileSync(${JSON.stringify(join(dir, 'calls.log'))}, process.argv.slice(2).join(' ') + '\\n')`,
+        "if (process.argv.includes('--witness')) process.exit(1)",
+        "if (process.argv.includes('--plan')) {",
+        "  process.stdout.write(JSON.stringify({",
+        "    database: 'imsdb', owner_role: 'imsapp', app_role: 'imsapp', admin_role: 'deployadmin',",
+        "    revoked: ['PUBLIC', 'imsapp'], datacl_before: null, fenced_at: '2026-01-01T00:00:00.000Z',",
+        "  }) + '\\n')",
+        '}',
+        "if (process.argv.includes('--print-migration-url')) process.stdout.write(`postgres://admin@127.0.0.1/nowhere?application_name=ims-migration-${process.argv.find((a) => a.startsWith('--migration-nonce='))?.slice('--migration-nonce='.length) ?? ''}\\n`)",
+        'process.exit(0)',
+        '',
+      ].join('\n'))
+      const result = runShell([
+        'set -uo pipefail',
+        'exec 2>&1',
+        entry.preamble(dir),
+        'error() { echo "ERROR: $*" >&2; }',
+        'DB_FENCE_RAISED=false',
+        CUTOVER_DIR_PRIMITIVES,
+        shellFunction(entry.source, 'fence_db_connections'),
+        'fence_db_connections',
+        'require_migration_landed_on_fenced_server',
+        'echo "REACHED THE MIGRATION"',
+      ].join('\n'))
+
+      assert.doesNotMatch(calls(dir), /^--bind-migration /m,
+        `precondition: with no witness there is nothing to bind against, so no probe is run:\n${calls(dir)}`)
+      assert.match(result.output, /^REACHED THE MIGRATION$/m,
+        `a host that can hold no witness must still be able to deploy:\n${result.output}`)
+      assert.match(result.output, /KEPT/,
+        `and must be told the fence record will be kept for a person:\n${result.output}`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+}
