@@ -86,6 +86,8 @@ import {
   aclPrivilegeRows,
   DATACL_PRIVILEGES_SQL,
   compareClusterIdentity,
+  MACHINE_CHANNEL,
+  EXIT_ALREADY_RELEASED,
   CLUSTER_IDENTITY_PROVEN,
   CLUSTER_IDENTITY_MISMATCH,
   CLUSTER_IDENTITY_NO_FINGERPRINT,
@@ -100,6 +102,45 @@ import { Client } from 'pg'
 
 import { cloneCluster, currentUser, freePort, startCluster } from './real-postgres-cluster.ts'
 import { shellConstant, shellFunction } from './shell-symbol.ts'
+
+/**
+ * CAPTURING WHAT THE HELPER SAYS, WITHOUT TOUCHING THE RUNNER'S OWN STREAM (o3d-secops r30,
+ * Codex LOW).
+ *
+ * WHAT WAS WRONG. Five helpers in this file captured output by REPLACING `process.stdout.write`
+ * and `process.stderr.write` for the duration of an `await`. Those are process globals and the
+ * test runner writes its TAP stream through the first of them: anything the runner emitted inside
+ * that window was swallowed into the test's own buffer and never forwarded, so a file could report
+ * fewer tests than it declared and still say zero failures. That is a helper able to delete tests
+ * from a run, which is worse than any finding it was written to measure.
+ *
+ * WHAT IT IS NOW. Nothing process-global is replaced. The shipped code's MACHINE CHANNEL -- the
+ * five `key=value` lines root reads out of a command substitution -- is a substitutable value in
+ * the module under test, and its PROSE goes through `console.log` and `console.error`, which the
+ * runner does not use for its report. So a capture reaches the subject and cannot reach the
+ * reporter.
+ *
+ * `out` is the machine channel plus anything on console.log; `err` is console.error. Both are
+ * restored in a `finally` that runs whether the body returned or threw.
+ */
+async function capturingFenceOutput<T>(body: () => Promise<T>): Promise<{ value: T; out: string; err: string }> {
+  const out: string[] = []
+  const err: string[] = []
+  const machine = MACHINE_CHANNEL.write
+  const log = console.log
+  const error = console.error
+  MACHINE_CHANNEL.write = (text: string) => { out.push(String(text)); return true }
+  console.log = (...args: unknown[]) => { out.push(`${args.map(String).join(' ')}\n`) }
+  console.error = (...args: unknown[]) => { err.push(`${args.map(String).join(' ')}\n`) }
+  try {
+    const value = await body()
+    return { value, out: out.join(''), err: err.join('') }
+  } finally {
+    MACHINE_CHANNEL.write = machine
+    console.log = log
+    console.error = error
+  }
+}
 
 /**
  * resolve_fence_script(), lifted verbatim out of a shipped entrypoint (o3d-2sm1.5 r32).
@@ -1317,7 +1358,12 @@ test('a grantee REMOVED between the plan and an initial fence aborts it (o3d-sec
   // AND THE HARM IT AVERTS, EXHIBITED RATHER THAN DESCRIBED: had the fence gone ahead, the record
   // would have been the standing authority and the release builds GRANT CONNECT straight out of it
   // — including for the role somebody had just removed.
-  const releasing = new FakeAdminClient({ stateFile, releasedDatacl: ACL_UNFENCED })
+  // o3d-secops r30: `standingDatacl` is stated here rather than defaulted. The default is
+  // ACL_FENCED, which leaves the OWNER holding CONNECT -- and `owner` is in this record's list, so
+  // the pre-grant reading would be MIXED, which r30 refuses (Codex HIGH 2). This fixture is about
+  // a stale record being granted back in full, so it states the ACL a standing fence over THIS
+  // list leaves: not one of the four holds CONNECT.
+  const releasing = new FakeAdminClient({ stateFile, releasedDatacl: ACL_UNFENCED, standingDatacl: aclRows([['other', 'c']]) })
   await withAdminUrl(() => doRelease(releasing as never, { stateFile, appRole: 'imsapp', ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
   assert.ok(releasing.grants.includes('GRANT CONNECT ON DATABASE "imsdb" TO "analytics";'),
     `a release grants back everything the record names, which is why the record may not be stale:\n${releasing.grants.join(' | ')}`)
@@ -1673,10 +1719,12 @@ test('db_fence_raise clears the authority a FAILED PUBLICATION left behind (o3d-
   // MEASURED BY MUTATION, ROUTE STATED, UNDER A REAL SHELL: remove the publication-path cleanup —
   // which is exactly the shape r24 shipped — and the record survives.
   const RAISE = shellFunction(FENCE_LIBRARY, 'db_fence_raise')
-  const PUBLICATION_CLEANUP = '    if [[ "${had_authority}" -eq 0 ]]; then\n      if ! db_fence_clear_authority "${state_file}"; then'
+  // o3d-secops r30: the call carries the attestation argument now (Codex HIGH 1) -- this is this
+  // run's OWN publication, seconds old, which is exactly the fact that licenses an unlink.
+  const PUBLICATION_CLEANUP = '    if [[ "${had_authority}" -eq 0 ]]; then\n      # THIS RUN\'S OWN PUBLICATION'
   assert.ok(RAISE.includes(PUBLICATION_CLEANUP),
     `the shipped orchestration must clear a failed publication's own record:\n${RAISE}`)
-  const withoutIt = (body: string) => body.replace(PUBLICATION_CLEANUP, '    if false; then\n      if ! db_fence_clear_authority "${state_file}"; then')
+  const withoutIt = (body: string) => body.replace(PUBLICATION_CLEANUP, '    if false; then\n      # THIS RUN\'S OWN PUBLICATION')
   const leftBehind = raise('nocleanup', withoutIt)
   assert.match(leftBehind, /^AUTHORITY=PRESENT$/m,
     `without it a failed publication leaves its record at the authoritative path:\n${leftBehind}`)
@@ -1764,17 +1812,10 @@ test('--audit-authority reads the live ACL, decides, and touches nothing (o3d-se
 
   const audit = async (datacl: ReturnType<typeof aclRows> | null, connectedDatabase = 'imsdb') => {
     const client = new FakeAdminClient({ stateFile, datacl, connectedDatabase })
-    const written: string[] = []
-    const stdout = process.stdout.write.bind(process.stdout)
-    process.stdout.write = ((chunk: string) => { written.push(String(chunk)); return true }) as typeof process.stdout.write
-    try {
-      const code = await withAdminUrl(() => doAuditAuthority(client as never, {
-        stateFile, appRole: 'imsapp', ...suppliedIdentity({ appDatabase: 'imsdb' }),
-      }))
-      return { code, verdict: written.join('').trim(), log: client.log }
-    } finally {
-      process.stdout.write = stdout
-    }
+    const captured = await capturingFenceOutput(() => withAdminUrl(() => doAuditAuthority(client as never, {
+      stateFile, appRole: 'imsapp', ...suppliedIdentity({ appDatabase: 'imsdb' }),
+    })))
+    return { code: captured.value, verdict: captured.out.trim(), log: client.log }
   }
 
   // 1. THE DATABASE IS NOT FENCED: PUBLIC and the application both still hold CONNECT directly,
@@ -1875,22 +1916,14 @@ test('--audit-authority refuses a same-named database on another cluster (o3d-se
 
   const audit = async (adminUrl: string, options: Record<string, unknown> = {}, client: Record<string, unknown> = {}) => {
     const fake = new FakeAdminClient({ stateFile, datacl: UNFENCED, connectedDatabase: 'imsdb', ...client })
-    const out: string[] = []
-    const err: string[] = []
-    const stdout = process.stdout.write.bind(process.stdout)
-    const stderr = process.stderr.write.bind(process.stderr)
     const previous = process.env.DEPLOY_ADMIN_DATABASE_URL
     process.env.DEPLOY_ADMIN_DATABASE_URL = adminUrl
-    process.stdout.write = ((chunk: string) => { out.push(String(chunk)); return true }) as typeof process.stdout.write
-    process.stderr.write = ((chunk: string) => { err.push(String(chunk)); return true }) as typeof process.stderr.write
     try {
-      const code = await doAuditAuthority(fake as never, {
+      const captured = await capturingFenceOutput(() => doAuditAuthority(fake as never, {
         stateFile, appRole: 'imsapp', ...suppliedIdentity(APP), ...options,
-      })
-      return { code, verdict: out.join('').trim(), said: err.join(''), log: fake.log }
+      }))
+      return { code: captured.value, verdict: captured.out.trim(), said: captured.err, log: fake.log }
     } finally {
-      process.stdout.write = stdout
-      process.stderr.write = stderr
       if (previous === undefined) delete process.env.DEPLOY_ADMIN_DATABASE_URL
       else process.env.DEPLOY_ADMIN_DATABASE_URL = previous
     }
@@ -2003,7 +2036,9 @@ test('an unstamped record is refused by the validator and still releasable from 
   //    `fence_mode` — so an operator holding a record no automatic path will touch can still take
   //    a standing fence down. Asserted on the GRANTs rather than the exit code, as the r24 release
   //    drive is, because the code's last arm probes a live DATABASE_URL.
-  const releaser = new FakeAdminClient({ stateFile, releasedDatacl: ACL_UNFENCED })
+  // o3d-secops r30: stated for the same reason as above -- this record names `owner`, and the
+  // default standing ACL leaves the owner holding CONNECT, which is now a refused MIXED reading.
+  const releaser = new FakeAdminClient({ stateFile, releasedDatacl: ACL_UNFENCED, standingDatacl: aclRows([['other', 'c']]) })
   await withAdminUrl(() => doRelease(releaser as never, { stateFile, appRole: 'imsapp', ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
   assert.deepEqual(releaser.grants, [
     'GRANT CONNECT ON DATABASE "imsdb" TO PUBLIC;',
@@ -5100,18 +5135,14 @@ test('a re-fence over a fingerprinted record refuses when the cluster will not i
     assert.equal(JSON.parse(readFileSync(stateFile, 'utf8')).fence_mode, FENCE_MODE_RECOVERY,
       'precondition: this must be the recovery rule, or the drift rule is what refuses below')
   }
-  // STDERR ONLY, DELIBERATELY. Every refusal below is console.error, and stdout is where the test
-  // runner writes its own results -- a capture that swallowed those would silently delete other
-  // tests' output from the report rather than failing.
+  // NOTHING PROCESS-GLOBAL (o3d-secops r30, Codex LOW). r29 wrote this to capture stderr only, on
+  // the reasoning that the runner's TAP goes to stdout -- true, and still the wrong shape: it
+  // replaced a process global across an `await`, which is the mechanism, and the runner's
+  // diagnostics go to stderr. capturingFenceOutput() reaches console.error and the module's own
+  // machine channel instead, so no capture in this file can touch the reporter's streams at all.
   const said = async (run: () => Promise<number>) => {
-    const lines: string[] = []
-    const stderr = process.stderr.write.bind(process.stderr)
-    process.stderr.write = ((chunk: string) => { lines.push(String(chunk)); return true }) as typeof process.stderr.write
-    try {
-      return { code: await run(), output: lines.join('') }
-    } finally {
-      process.stderr.write = stderr
-    }
+    const captured = await capturingFenceOutput(run)
+    return { code: captured.value, output: captured.err }
   }
   try {
     // 1. THE RECORD NAMES A CLUSTER AND THE SERVER WILL NOT. r28 refused only `mismatch` here too,
@@ -5246,21 +5277,13 @@ test('a same-named database on a DIFFERENT CLUSTER does not clear the record (o3
     const audit = async (cluster: ReturnType<typeof startCluster>) => {
       const client = new Client({ host: cluster.socket, port, database: 'imsdb', user: me })
       await client.connect()
-      const out: string[] = []
-      const err: string[] = []
-      const stdout = process.stdout.write.bind(process.stdout)
-      const stderr = process.stderr.write.bind(process.stderr)
-      process.stdout.write = ((chunk: string) => { out.push(String(chunk)); return true }) as typeof process.stdout.write
-      process.stderr.write = ((chunk: string) => { err.push(String(chunk)); return true }) as typeof process.stderr.write
       try {
-        const code = await doAuditAuthority(client as never, {
+        const captured = await capturingFenceOutput(() => doAuditAuthority(client as never, {
           stateFile, appRole: 'imsapp',
           ...suppliedIdentity({ appHost: '127.0.0.1', appPort: String(port), appUser: 'imsapp', appDatabase: 'imsdb' }),
-        })
-        return { code, verdict: out.join(''), said: err.join('') }
+        }))
+        return { code: captured.value, verdict: captured.out, said: captured.err }
       } finally {
-        process.stdout.write = stdout
-        process.stderr.write = stderr
         await client.end()
       }
     }
@@ -5409,27 +5432,35 @@ test('a PHYSICAL CLONE carries the whole fingerprint, and a release on it is ref
         sent.push(String(args[0]))
         return (query as (...a: unknown[]) => unknown)(...args)
       }
-      const lines: string[] = []
-      const stderr = process.stderr.write.bind(process.stderr)
-      process.stderr.write = ((chunk: string) => { lines.push(String(chunk)); return true }) as typeof process.stderr.write
       try {
-        const code = await doRelease(client as never, {
+        const captured = await capturingFenceOutput(() => doRelease(client as never, {
           stateFile, appRole: 'imsapp',
           ...suppliedIdentity({ appHost: '127.0.0.1', appPort: String(port), appUser: 'imsapp', appDatabase: 'imsdb' }),
-        })
-        return { code, said: lines.join(''), grants: sent.filter((sql) => sql.trim().startsWith('GRANT')) }
+        }))
+        return { code: captured.value, said: captured.err, grants: sent.filter((sql) => sql.trim().startsWith('GRANT')) }
       } finally {
-        process.stderr.write = stderr
         await client.end()
       }
     }
 
     // MUTATION ROUTE: delete the LEGACY_FENCE_ABSENT arm from doRelease() -- leaving r28's code --
     // and this exits 0, grants on the clone, and reports the fence released.
+    //
+    // AND THE STATUS CHANGED IN r30, WHILE THE PROTECTION DID NOT (Codex MEDIUM). This record is
+    // STAMPED APPLIED, which is what a fence raised since r28 leaves, and on a stamped record the
+    // "every recorded grantee holds CONNECT" reading is ALSO what a release that granted and then
+    // died before its record could be removed leaves behind. The two are indistinguishable here
+    // and always will be, so r29's flat refusal made a legitimate retry unrunnable -- the finding
+    // r30 answers. The exit is now EXIT_ALREADY_RELEASED, which says ONE thing: there is nothing
+    // left to grant on this server. What matters for THIS test is unchanged and is asserted
+    // below: not one GRANT is sent to the copy, the record is byte for byte what it was, and the
+    // origin's fence is untouched. Nothing automatic can end the record from either reading --
+    // see db_fence_clear_authority(), which refuses without an attestation no cluster can carry.
     const onTheClone = await release(staleClone)
-    assert.equal(onTheClone.code, EXIT_ERROR, `a copy that never saw the fence must not be released on:\n${onTheClone.said}`)
-    assert.match(onTheClone.said, /already holds CONNECT/, onTheClone.said)
-    assert.match(onTheClone.said, /COPY of the fenced cluster/, `and it must name what it may be looking at:\n${onTheClone.said}`)
+    assert.equal(onTheClone.code, EXIT_ALREADY_RELEASED, `a copy that never saw the fence must not be released on:\n${onTheClone.said}`)
+    assert.notEqual(onTheClone.code, EXIT_OK, 'and it must never be reported as a release this run performed')
+    assert.match(onTheClone.said, /holds CONNECT/, onTheClone.said)
+    assert.match(onTheClone.said, /COPY of the\s+fenced cluster/, `and it must name what it may be looking at:\n${onTheClone.said}`)
     assert.equal(readFileSync(stateFile, 'utf8'), untouched,
       'and the record the real fence is released from must be byte for byte what it was')
     assert.deepEqual(onTheClone.grants, [],
