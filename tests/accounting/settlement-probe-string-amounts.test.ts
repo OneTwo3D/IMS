@@ -690,3 +690,223 @@ test('[o3d-mm51] the AmountPaid gate no longer excludes itself over a record the
   assert.equal(held.outcome, 'unknown')
   assert.equal(held.outcome === 'unknown' && held.cause, 'record-unmeasurable', 'withheld by the record, as the gate assumed')
 })
+
+/* ------------------------------------------------------------------------------------------- *
+ * 6. o3d-nk5n (Codex HIGH, round 29) — THE SAME RULE ON THE XERO SIDE: AN EMPTY RECORD LIST IS A
+ *    POSITIVE CLAIM ABOUT MONEY, AND IT NEEDS A FIGURE BEHIND IT.
+ *
+ * o3d-mm51 closed this on the QuickBooks arm (section 5) and FILED it on both Xero arms, because 25
+ * fixtures modelled an ordinary first payment as a figureless stub Xero does not send. The fixtures
+ * now state what Xero states, so the rule is one function — `emptyAnswerIsUnproved` — reached by all
+ * three arms rather than one connector's own sentence.
+ *
+ * Every test below states the PRECONDITION it turns on, so none can pass by the shape under test
+ * quietly ceasing to be reached.
+ * ------------------------------------------------------------------------------------------- */
+
+test('[o3d-nk5n] an INCOMPLETE Xero invoice cannot classify as clear', async () => {
+  // THE FINDING, END TO END. `xeroGet` does `res.json() as T` with no runtime shape validation and
+  // every figure on the response type is optional, so a sparse, truncated or schema-degraded HTTP 200
+  // reaches this reader stating nothing. Both completeness cross-checks are guarded on a figure being
+  // present, so neither ran, and control fell through to `return { ok: true, records }` over an EMPTY
+  // list — which `classifyLedgerSettlement` reads as `clear`, and `clear` authorises a SECOND payment.
+  //
+  // ROUTE: probeXeroSettlement's invoice arm -> `amountPaid`/`settled` both null -> both checks
+  //        skipped -> `emptyAnswerIsUnproved(settled, records)` -> ok:false ->
+  //        classifyLedgerSettlement -> unknown/probe-unreadable.
+  // MUTATION: delete the `emptyAnswerIsUnproved` refusal at the end of the invoice arm and every one
+  //        of the bodies below answers ok:true with an EMPTY record list, and each classifies `clear`.
+
+  // THE PRECONDITION, AND IT IS WHAT THE TEST TURNS ON: none of these bodies states enough for EITHER
+  // form of the settlement figure — the `Total`/`AmountDue` pair or the `AmountPaid`/`AmountCredited`
+  // fallback pair — and none carries a payment, so the record list really is empty and the refusal is
+  // genuinely being reached rather than an arithmetic check being failed.
+  const INCOMPLETE: Array<[string, Record<string, unknown>]> = [
+    ['a body with no fields at all', {}],
+    ['a body that states only the currency', { CurrencyCode: 'GBP' }],
+    ['an empty Payments collection and nothing else', { CurrencyCode: 'GBP', Payments: [] }],
+    ['HALF the primary pair — Total without AmountDue', { CurrencyCode: 'GBP', Total: 40 }],
+    ['the other half — AmountDue without Total', { CurrencyCode: 'GBP', AmountDue: 40 }],
+    ['HALF the fallback tuple — AmountPaid without AmountCredited', { CurrencyCode: 'GBP', AmountPaid: 0 }],
+    ['the other half — AmountCredited without AmountPaid', { CurrencyCode: 'GBP', AmountCredited: 0 }],
+  ]
+  for (const [label, body] of INCOMPLETE) {
+    assert.ok(
+      !('Total' in body && 'AmountDue' in body) && !('AmountPaid' in body && 'AmountCredited' in body),
+      `the precondition for ${label}: neither figure pair is complete`,
+    )
+    assert.ok(
+      !Array.isArray(body.Payments) || body.Payments.length === 0,
+      `the precondition for ${label}: no payment, so the record list is empty`,
+    )
+
+    const probe = await probeInvoice(body)
+    assert.equal(probe.ok, false, `${label} must not answer positively`)
+    assert.match(
+      reasonOf(probe),
+      /states no total, amount due, amount paid or amount credited on this document and IMS read no payment against it/,
+      `and it must say WHY, for ${label}`,
+    )
+
+    const verdict = classifyLedgerSettlement(attemptFor('40.00'), probe)
+    assert.notEqual(verdict.outcome, 'clear', `${label} must not authorise a payment`)
+    assert.equal(verdict.outcome, 'unknown')
+    assert.equal(verdict.outcome === 'unknown' && verdict.cause, 'probe-unreadable')
+  }
+
+  // AND ABSENCE STILL ONLY SKIPS WHERE THERE IS OTHER EVIDENCE, exactly as on the QuickBooks arm. A
+  // figureless invoice whose payment this probe actually READ is not refused: the record is evidence
+  // in its own right and the verdict is decided by comparing it, not by the absence.
+  const withEvidence = await probeInvoice({
+    CurrencyCode: 'GBP',
+    Payments: [{ PaymentID: 'PAY-1', Date: `${DATE}T00:00:00`, Amount: 40 }],
+  })
+  assert.equal(withEvidence.ok, true, 'a figureless document whose settlement was READ still answers')
+  assert.equal(classifyLedgerSettlement(attemptFor('40.00'), withEvidence).outcome, 'present')
+})
+
+test('[o3d-nk5n] an INCOMPLETE Xero credit note cannot classify as clear', async () => {
+  // THE SECOND XERO ARM, which the finding names explicitly: "The credit-note branch has the same
+  // repeat-allocation failure at its unconditional return." `Total - RemainingCredit` is Xero's own
+  // account of how much of the credit has been used; with neither figure stated it is null, the
+  // completeness check is skipped, and an absent `Allocations` collection then makes the record list
+  // empty. That is `clear`, and `clear` allocates the same credit to the same bill a SECOND time.
+  //
+  // ROUTE: probeXeroSettlement's PURCHASE_CREDIT_NOTE_ALLOCATION arm -> `applied` null -> the
+  //        allocation check skipped -> `emptyAnswerIsUnproved(applied, records)` -> ok:false.
+  // MUTATION: delete the `emptyAnswerIsUnproved` refusal in the credit-note arm and each body below
+  //        answers ok:true with an EMPTY record list, which classifies `clear`.
+
+  // THE PRECONDITION: none of these states BOTH figures, and none carries an allocation to this bill,
+  // so the record list is empty and the refusal is genuinely reached.
+  const INCOMPLETE: Array<[string, Record<string, unknown>]> = [
+    ['a body with no fields at all', {}],
+    ['an empty Allocations collection and nothing else', { CurrencyCode: 'GBP', Allocations: [] }],
+    ['Total without RemainingCredit', { CurrencyCode: 'GBP', Total: 40 }],
+    ['RemainingCredit without Total', { CurrencyCode: 'GBP', RemainingCredit: 40 }],
+    [
+      'both figures missing while the credit is allocated ELSEWHERE',
+      { CurrencyCode: 'GBP', Allocations: [{ Amount: 40, Date: DATE, Invoice: { InvoiceID: 'other-bill' } }] },
+    ],
+  ]
+  for (const [label, body] of INCOMPLETE) {
+    assert.ok(!('Total' in body && 'RemainingCredit' in body), `the precondition for ${label}: the pair is incomplete`)
+    const allocations = (body.Allocations ?? []) as Array<{ Invoice?: { InvoiceID?: string } }>
+    assert.equal(
+      allocations.filter((a) => a.Invoice?.InvoiceID === 'inv-1').length, 0,
+      `the precondition for ${label}: nothing is allocated to THIS bill, so the record list is empty`,
+    )
+
+    const probe = await probeNote(body)
+    assert.equal(probe.ok, false, `${label} must not answer positively`)
+    assert.match(
+      reasonOf(probe),
+      /states no total or remaining credit on this credit note and IMS read no allocation of it to this bill/,
+      `and it must say WHY, for ${label}`,
+    )
+    assert.notEqual(
+      classifyLedgerSettlement(attemptFor('40.00'), probe).outcome, 'clear',
+      `${label} must not authorise a re-allocation`,
+    )
+  }
+
+  // AND THE SAME EXCEPTION HOLDS HERE: a figureless note whose allocation to THIS bill was read still
+  // answers, because the record is evidence rather than an absence.
+  const withEvidence = await probeNote({
+    CurrencyCode: 'GBP',
+    Allocations: [{ Amount: 40, Date: DATE, Invoice: { InvoiceID: 'inv-1' } }],
+  })
+  assert.equal(withEvidence.ok, true, 'a figureless note whose allocation was READ still answers')
+  assert.equal(classifyLedgerSettlement(attemptFor('40.00'), withEvidence).outcome, 'present')
+})
+
+test('[o3d-nk5n] a Xero document stating EQUAL readable totals proves zero settlement, and the payment posts', async () => {
+  // THE OTHER SIDE OF THE RULE, AND THE ONE THAT MUST NOT BE BROKEN BY IT. Closing the fall-through
+  // is only correct if the ordinary FIRST payment still proceeds — and it does, because Xero states
+  // these figures on every document that exists and an UNPAID one states them EQUAL. That is
+  // emptiness PROVED by two stated figures rather than assumed from four missing ones, which is the
+  // same sentence the QuickBooks arm has carried since o3d-mm51.
+  //
+  // ROUTE: probeXeroSettlement -> wireAmount reads both -> `settled` is exactly 0 -> statesAnything
+  //        false -> the check PASSES -> `emptyAnswerIsUnproved` is false because `settled` is a
+  //        figure -> ok:true over an empty record list -> classifyLedgerSettlement -> clear.
+  // MUTATION: drop the `settled === null` half of `emptyAnswerIsUnproved` (refuse whenever `records`
+  //        is empty) and every Xero first payment in the system stops — all four cases below fail.
+
+  // (1) THE PRIMARY PAIR. THE PRECONDITION: the two figures are STATED and EQUAL, asserted so this
+  //     cannot pass by the totals quietly going missing and taking the proof with them.
+  const UNPAID = { CurrencyCode: 'GBP', Total: 40, AmountDue: 40, AmountPaid: 0, Payments: [] }
+  assert.equal(UNPAID.Total, UNPAID.AmountDue, 'an unpaid invoice states its total and amount due equal')
+  const probe = await probeInvoice(UNPAID)
+  assert.deepEqual(probe, { ok: true, records: [] }, 'nothing settles it, and the document says so')
+  assert.equal(classifyLedgerSettlement(attemptFor('40.00'), probe).outcome, 'clear', 'so the payment posts')
+
+  // (2) A COMPLETE ZERO-VALUED FALLBACK TUPLE, which is the other proof the rule accepts and the one
+  //     the `settled` fallback exists for. THE PRECONDITION: the primary pair is genuinely absent, so
+  //     this case is carried by the fallback and not by the check above.
+  const FALLBACK = { CurrencyCode: 'GBP', AmountPaid: 0, AmountCredited: 0, Payments: [] }
+  assert.ok(!('Total' in FALLBACK) && !('AmountDue' in FALLBACK), 'the primary pair is not what proves this one')
+  const viaFallback = await probeInvoice(FALLBACK)
+  assert.deepEqual(viaFallback, { ok: true, records: [] })
+  assert.equal(classifyLedgerSettlement(attemptFor('40.00'), viaFallback).outcome, 'clear')
+
+  // (3) A PART-PAID INVOICE STILL ANSWERS. The rule is about an UNPROVED empty answer, not about
+  //     emptiness — a document whose stated settlement is fully explained by the payments beside it
+  //     is answerable however much has come off it.
+  const partPaid = await probeInvoice({
+    CurrencyCode: 'GBP', Total: 40, AmountDue: 30, AmountPaid: 10, AmountCredited: 0,
+    Payments: [{ PaymentID: 'PAY-1', Date: `${DATE}T00:00:00`, Amount: 10 }],
+  })
+  assert.equal(partPaid.ok, true, 'a stated settlement that is fully explained is not a refusal')
+
+  // (4) THE CREDIT-NOTE ARM'S OWN PROOF: a wholly unapplied credit states `Total` and
+  //     `RemainingCredit` EQUAL, so `applied` is exactly zero and the empty answer is the ledger's.
+  const UNAPPLIED = { CurrencyCode: 'GBP', Total: 40, RemainingCredit: 40, Allocations: [] }
+  assert.equal(UNAPPLIED.Total, UNAPPLIED.RemainingCredit, 'an unapplied credit note states them equal')
+  const note = await probeNote(UNAPPLIED)
+  assert.deepEqual(note, { ok: true, records: [] }, 'positively unapplied, on the note\'s own figures')
+  assert.equal(classifyLedgerSettlement(attemptFor('40.00'), note).outcome, 'clear')
+})
+
+test('[o3d-nk5n] the rule is ONE function, and all three arms reach it', async () => {
+  // NOT A SECOND SPELLING. The QuickBooks arm has required a proved empty answer since o3d-mm51; the
+  // Xero arms were closed by CALLING that same condition rather than by restating it, so a change to
+  // the rule cannot reach one connector and miss the other. Both halves are checked: that the source
+  // has one definition and three call sites, and that all three arms actually behave that way.
+
+  const source = await readFile(
+    path.join(process.cwd(), 'lib/connectors/accounting-settlement-probe.ts'), 'utf8',
+  )
+  // THE PRECONDITION: this test read the file it means to police, and the function it requires is
+  // actually named in it — so it cannot pass by reading nothing.
+  assert.ok(source.length > 1000, 'the probe source was read')
+  const code = source
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^[ \t]*\/\/.*$/gm, '')
+  assert.match(code, /function emptyAnswerIsUnproved/, 'the shared rule is defined in the module')
+
+  const definitions = [...code.matchAll(/function emptyAnswerIsUnproved/g)]
+  assert.equal(definitions.length, 1, 'exactly ONE definition, so there is one rule to change')
+  const callSites = [...code.matchAll(/emptyAnswerIsUnproved\s*\(/g)].map((m) => m.index!)
+  assert.equal(callSites.length, 4, 'the definition plus one call from each of the three arms')
+
+  // LOCATED, not merely counted: one call inside each probe, so this cannot be satisfied by three
+  // calls piled into one arm while another re-spells the condition.
+  const xeroAt = code.indexOf('export async function probeXeroSettlement')
+  const qboAt = code.indexOf('export async function probeQuickBooksSettlement')
+  assert.ok(xeroAt > 0 && qboAt > xeroAt, 'both probes were found, in the order this test assumes')
+  assert.equal(callSites.filter((i) => i > xeroAt && i < qboAt).length, 2, 'both Xero arms call it')
+  assert.equal(callSites.filter((i) => i > qboAt).length, 1, 'and the QuickBooks arm calls it')
+
+  // AND THE BEHAVIOURAL HALF, which is what actually protects the money: the same figureless shape
+  // refuses on all three arms. A source-shaped assertion alone would pass over a call whose result
+  // was discarded.
+  const invoice = await probeInvoice({ CurrencyCode: 'GBP' })
+  const note = await probeNote({ CurrencyCode: 'GBP' })
+  const bill = await probeBill({})
+  for (const [label, probe] of [['Xero invoice', invoice], ['Xero credit note', note], ['QuickBooks bill', bill]] as const) {
+    assert.equal(probe.ok, false, `${label}: a figureless document refuses`)
+    assert.match(reasonOf(probe), /it has nothing to tell from/, `${label}: and for the same reason`)
+    assert.notEqual(classifyLedgerSettlement(attemptFor('40.00'), probe).outcome, 'clear', `${label}: no clear`)
+  }
+})
