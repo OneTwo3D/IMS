@@ -9,7 +9,7 @@ import {
   unresolvedInvoicePaymentAttempts,
   type ExistingInvoicePaymentSync,
 } from '@/lib/domain/accounting/invoice-payment-registration'
-import type { LedgerSettlementRecord } from '@/lib/domain/accounting/ledger-settlement-evidence'
+import type { LedgerSettlementProbe, LedgerSettlementRecord } from '@/lib/domain/accounting/ledger-settlement-evidence'
 import { describeInvoicePaymentRefusal } from '@/lib/domain/accounting/invoice-payment-enqueue'
 import {
   OPERATOR_ASSERTION_SETTLEMENT_BASIS,
@@ -51,6 +51,21 @@ function live(row: Omit<ExistingInvoicePaymentSync, 'registeredAmount'>): Existi
   }
 }
 
+
+/**
+ * o3d-obyd r31 — WHAT THESE FIXTURES ALWAYS MEANT BY A LEDGER ANSWER, now said out loud.
+ *
+ * `ledgerSettlements` carried a bare `LedgerSettlementRecord[]`, and every fixture below that passes
+ * one is modelling a ledger that answered FULLY: the document's figures are stated and these are all
+ * the settlements it holds. That is the only reading under which `[]` means "nothing has settled this
+ * invoice", which is what each of them asserts. The field is now the probe itself, so the reading is
+ * written into the value instead of being assumed of it — `provedComplete: true` says the collection
+ * was measured against the document's own settled figure. No assertion in this file changes; the
+ * shape they were always making a claim about now states the premise of that claim.
+ */
+const answered = (records: LedgerSettlementRecord[]): LedgerSettlementProbe =>
+  ({ ok: true, records, provedComplete: true })
+
 const base = {
   syncEnabled: true,
   accountingInvoiceId: 'INV-1',
@@ -62,7 +77,7 @@ const base = {
   existing: [] as ExistingInvoicePaymentSync[],
   // Most cases have no unresolved attempt, so the ledger is never consulted and this is unread.
   // The cases that DO have one pass their own records — see the o3d-0m56 block at the end.
-  ledgerSettlements: null as LedgerSettlementRecord[] | null,
+  ledgerSettlements: null as LedgerSettlementProbe | null,
   ledgerTotal: toDecimal(100),
 }
 
@@ -159,7 +174,7 @@ test('a rejected or cancelled payment frees the DATABASE slot, but only the ledg
   for (const status of ['FAILED', 'CANCELLED'] as const) {
     const existing = [live({ status, amount: 100, paymentDate: '2026-08-01', paymentId: 'pay-old' })]
     assert.equal(
-      decideInvoicePaymentRegistration({ ...base, existing, ledgerSettlements: [] }).register,
+      decideInvoicePaymentRegistration({ ...base, existing, ledgerSettlements: answered([]) }).register,
       true,
       `${status}: a ledger with no matching settlement is what makes this safe`,
     )
@@ -189,7 +204,7 @@ test('an unreadable amount on a rejected row no longer waves the receipt through
   const d = decideInvoicePaymentRegistration({
     ...base,
     existing: [live({ status: 'FAILED', amount: null, paymentId: 'pay-old' })],
-    ledgerSettlements: [],
+    ledgerSettlements: answered([]),
   })
   assert.equal(d.register, false)
   assert.equal(d.register === false && d.refusal, 'UNRESOLVED_PAYMENT_ATTEMPT')
@@ -240,7 +255,7 @@ test('a receipt beside an unresolved attempt the ledger HOLDS is refused (o3d-0m
   const d = decideInvoicePaymentRegistration({
     ...base,
     existing: [unresolved()],
-    ledgerSettlements: [{ amount: toDecimal(100), date: '2026-08-01', id: 'PAY-1' }],
+    ledgerSettlements: answered([{ amount: toDecimal(100), date: '2026-08-01', id: 'PAY-1' }]),
   })
   assert.equal(d.register, false)
   assert.equal(d.register === false && d.refusal, 'UNRESOLVED_PAYMENT_ATTEMPT')
@@ -257,7 +272,7 @@ test('an unresolved attempt IMS cannot describe refuses (o3d-0m56)', () => {
   // No amount or no date means no settlement in the ledger can be matched to it, so it can never
   // be ruled out. Refusing is the only honest answer.
   for (const attempt of [unresolved({ amount: null }), unresolved({ paymentDate: null })]) {
-    const d = decideInvoicePaymentRegistration({ ...base, existing: [attempt], ledgerSettlements: [] })
+    const d = decideInvoicePaymentRegistration({ ...base, existing: [attempt], ledgerSettlements: answered([]) })
     assert.equal(d.register === false && d.refusal, 'UNRESOLVED_PAYMENT_ATTEMPT', JSON.stringify(attempt))
   }
 })
@@ -321,7 +336,7 @@ test('[o3d-r948 r6] an unmeasurable settlement withholds — whatever id any oth
     paymentAmount: toDecimal(60),
     existing: [settled, unresolved({ amount: 100, paymentDate: '2026-08-01' })],
     // The SYNCED row's own payment, as a ledger that will not state a readable figure reports it.
-    ledgerSettlements: [{ amount: null, unreadableAmount: '40.005', date: null, id: 'PAY-OTHER', reference: null }],
+    ledgerSettlements: answered([{ amount: null, unreadableAmount: '40.005', date: null, id: 'PAY-OTHER', reference: null }]),
   })
   assert.equal(d.register, false)
   assert.equal(d.register === false && d.refusal, 'UNRESOLVED_PAYMENT_ATTEMPT')
@@ -357,7 +372,7 @@ test('[o3d-r948 r6] the id being OURS, the ledger s, or nobody s makes no differ
         ...base,
         paymentAmount: toDecimal(60),
         existing: [other, attempt],
-        ledgerSettlements: [record],
+        ledgerSettlements: answered([record]),
       })
       assert.equal(d.register, false, `id ${externalTransactionId} / basis ${settlementBasis} must still withhold`)
     }
@@ -520,7 +535,7 @@ test('a settlement for a different amount or date leaves the receipt free (o3d-0
   const d = decideInvoicePaymentRegistration({
     ...base,
     existing: [unresolved()],
-    ledgerSettlements: [{ amount: toDecimal(100), date: '2026-07-01' }, { amount: toDecimal(40), date: '2026-08-01' }],
+    ledgerSettlements: answered([{ amount: toDecimal(100), date: '2026-07-01' }, { amount: toDecimal(40), date: '2026-08-01' }]),
   })
   assert.equal(d.register, true, 'only a settlement matching the ATTEMPT is evidence about it')
 })
@@ -549,8 +564,18 @@ test('sales.ts asks the ledger exactly when the decision needs it (o3d-0m56)', a
 
   assert.match(body, /unresolvedInvoicePaymentAttempts\(existing, params\.paymentId\)\.length > 0/,
     'the probe must be gated on an unresolved attempt, not run on every receipt')
-  assert.match(body, /return probe\.ok \? probe\.records : null/,
+  // o3d-obyd r31 — THE PROPERTY IS THE SAME AND THE EXPRESSION IS NOT. This asserted
+  // `return probe.ok ? probe.records : null`, which pinned TWO things: that an unanswered probe
+  // becomes null (the property this test names), and that the records are lifted out of the probe
+  // (which it never argued for). The lift is what Codex's HIGH 1 fix had to remove — the probe now
+  // reports whether its collection is proved complete, and pulling the list out of it left the
+  // decision to invent that fact in the permissive direction. The refusal property is asserted
+  // unchanged; what it is asserted about is the whole probe.
+  assert.match(body, /return probe\.ok \? probe : null/,
     'a probe that could not answer must become null — the value the decision refuses on')
+  assert.doesNotMatch(body, /probe\.ok \? probe\.records/,
+    'and an answering probe must reach the decision WHOLE: flattening it to its record list drops '
+    + 'whether the collection was proved complete, which is what makes a non-match mean anything')
   assert.match(source.slice(at), /ledgerSettlements,/, 'and it must reach the decision')
 
   // o3d-r948 r6: AND NOTHING BESIDE THE RECORDS. r5 plumbed the probe's organisation through here so
@@ -687,7 +712,7 @@ test('the WHOLE decision is re-runnable for the check inside the write (o3d-0m56
   const unresolvedNow = decideInvoicePaymentRegistration({
     ...base,
     existing: [unresolved()],
-    ledgerSettlements: [{ amount: toDecimal(100), date: '2026-08-01' }],
+    ledgerSettlements: answered([{ amount: toDecimal(100), date: '2026-08-01' }]),
   })
   assert.equal(unresolvedNow.register === false && unresolvedNow.refusal, 'UNRESOLVED_PAYMENT_ATTEMPT')
 })

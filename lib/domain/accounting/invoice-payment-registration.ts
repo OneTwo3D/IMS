@@ -15,7 +15,7 @@
 
 import {
   classifyLedgerSettlement,
-  type LedgerSettlementRecord,
+  type LedgerSettlementProbe,
 } from './ledger-settlement-evidence'
 import {
   exactAmountReadingOrLegacy,
@@ -248,8 +248,22 @@ export function decideInvoicePaymentRegistration(input: {
    * Only consulted when an unresolved earlier attempt exists, and null then means REFUSE: an
    * unanswered question about money that may already be in the ledger is not permission to send
    * more. Callers with no unresolved attempts may pass null freely.
+   *
+   * o3d-obyd r31 (Codex HIGH 1) — THE WHOLE PROBE, NOT THE RECORDS PULLED OUT OF IT.
+   *
+   * This was `LedgerSettlementRecord[] | null`, and the enqueue path filled it with
+   * `probe.ok ? probe.records : null` — which drops everything the probe knows EXCEPT the list. That
+   * was harmless while the list was the whole answer. It stopped being harmless the moment the probe
+   * started reporting whether its collection is proved complete: this site would have had to
+   * reconstruct a probe to call the classifier, and the only value it could have put in
+   * `provedComplete` is a guess. Guessing `true` re-opens, one layer up, exactly the fail-open Codex
+   * found — a truncated ledger response authorising a second payment — with the added vice that the
+   * probe had the right answer and this boundary threw it away.
+   *
+   * So the boundary carries the answer intact. A field that is a flattened copy of a richer value is
+   * a place for the two to disagree, and this one is on the path that decides whether money moves.
    */
-  ledgerSettlements: LedgerSettlementRecord[] | null
+  ledgerSettlements: LedgerSettlementProbe | null
   /**
    * What the ledger's copy of the invoice was built at (see ledgerSalesInvoiceTotalForeign), as the
    * stored `Decimal` (o3d-6abj). `Number(order.totalForeign)` is one of the two operands Codex's
@@ -325,7 +339,10 @@ export function decideInvoicePaymentRegistration(input: {
           date: attempt.paymentDate ?? null,
           marker: attempt.settlementMarker ?? null,
         },
-        { ok: true, records: input.ledgerSettlements },
+        // o3d-obyd r31: the probe AS THE PROBE ANSWERED IT. This used to rebuild one around the
+        // records, which is where the collection's proved-completeness would have been invented
+        // rather than carried — see the `ledgerSettlements` field.
+        input.ledgerSettlements,
         // o3d-r948 r6 — THE EXCLUSION SET WAS THE THIRD ARGUMENT HERE, AND IS GONE.
         //
         // WHAT IT DID AND WHY IT WAS BUILT. `classifyLedgerSettlement` withholds on a settlement it

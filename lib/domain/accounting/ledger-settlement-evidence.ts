@@ -91,6 +91,40 @@ export type LedgerSettlementProbe =
       ok: true
       records: LedgerSettlementRecord[]
       /**
+       * o3d-obyd r31 (Codex HIGH 1) — IS THIS RECORD LIST PROVED TO BE THE WHOLE COLLECTION?
+       *
+       * THE TWO CONCLUSIONS A RECORD LIST SUPPORTS ARE NOT SYMMETRIC, AND THAT IS THE WHOLE FIELD.
+       * A record that MATCHES the attempt proves the attempt settled: the record is there, this code
+       * read it, and no amount of truncation elsewhere can unmake it. A record that does NOT match
+       * proves nothing about the attempt — it is a statement about ONE OTHER settlement, and the
+       * question `clear` answers is about the COLLECTION ("the ledger holds no settlement matching
+       * this attempt"). Reaching that answer by walking the list requires the list to be the whole
+       * list, which a returned record is not evidence of.
+       *
+       * WHAT IT COST WHILE IT WAS UNTRACKED. `emptyAnswerIsUnproved` in the settlement probe refused
+       * a figureless response only when its record list was EMPTY, on the reasoning that "a non-empty
+       * record list still answers, records are evidence in their own right". True of a match, false
+       * of a non-match: a truncated response that omits the document's own settled figure, returns
+       * one UNRELATED settlement and omits the attempted one satisfied that predicate, answered
+       * `ok: true`, matched nothing, and reached `clear` — which authorises a second payment. Codex
+       * executed the shape against all three probe arms (Xero invoice, Xero credit note, QuickBooks
+       * bill) and got `clear` from each.
+       *
+       * SO WHAT PROVES COMPLETENESS. Not the records: the DOCUMENT'S OWN settled figure, which every
+       * arm already computes for its shortfall cross-check — `Total - AmountDue` on a Xero invoice,
+       * `Total - RemainingCredit` on a Xero credit note, `TotalAmt - Balance` on a QuickBooks
+       * document. When that figure is stated, the cross-check has run: either the ledger says nothing
+       * has settled the document (so an empty or non-matching list is the ledger's own answer), or it
+       * names an amount that the records this probe read must account for and do. Either way the
+       * collection is measured against a figure OUTSIDE it. When the figure is absent, nothing
+       * measured the list at all, and a non-match is `unknown` — see `classifyLedgerSettlement`.
+       *
+       * REQUIRED, NOT OPTIONAL, AND THAT IS DELIBERATE. Every fail-open this module has been through
+       * arrived as a permissive DEFAULT reached by a response shape nobody enumerated. A probe arm
+       * that does not state whether its collection is proved does not compile.
+       */
+      provedComplete: boolean
+      /**
        * o3d-r948 r6 — `connectionProvenance` WAS HERE, AND IS GONE WITH THE EXCLUSION IT SCOPED.
        *
        * r5 added it so a caller could show that an id it held named one of THESE records rather
@@ -146,8 +180,16 @@ export type AttemptDescription = {
  *  - `record-unmeasurable`   the ledger reported a settlement whose amount or date is unreadable,
  *                            so it cannot be ruled out as this attempt.
  *  - `attempt-undescribable` OUR row does not record what its attempt sent.
+ *  - `collection-unproved`   the connector answered, every record it sent was measured, and none is
+ *                            this attempt — but nothing established that the list is the whole
+ *                            collection, so "not among these" is not "not in the ledger".
+ *                            See `LedgerSettlementProbe.provedComplete`.
  */
-export type SettlementUnknownCause = 'probe-unreadable' | 'record-unmeasurable' | 'attempt-undescribable'
+export type SettlementUnknownCause =
+  | 'probe-unreadable'
+  | 'record-unmeasurable'
+  | 'attempt-undescribable'
+  | 'collection-unproved'
 
 export type SettlementVerdict =
   /** Positively established: the ledger holds no settlement matching this attempt. */
@@ -585,6 +627,40 @@ export function classifyLedgerSettlement(
         detail: `${money(record.amount)} dated ${record.date}`
           + (record.id ? ` (${record.id})` : ''),
       }
+    }
+  }
+
+  // o3d-obyd r31 (Codex HIGH 1) — AND FALLING OUT OF THAT LOOP IS ONLY AN ANSWER IF THE LIST WAS ALL
+  // OF THEM.
+  //
+  // EVERY `present` ABOVE STANDS WITHOUT THIS. The mark pass and the amount/date pass each return on
+  // a record they FOUND, and a found record is evidence in its own right: it exists, this code read
+  // it, and a truncated response cannot un-find it. That is why this gate is HERE, after both, rather
+  // than at the top of the function — a probe whose collection is unproved must still be allowed to
+  // recognise our own payment and say `present`, because `present` is what resolves the row and
+  // writes the matched id back. Refusing at the top would throw that away and hold the row on a
+  // question the ledger had in fact answered.
+  //
+  // ARRIVING HERE IS THE OTHER HALF, AND IT IS NOT SYMMETRIC. Nothing was found. That is a claim
+  // about the COLLECTION — "the ledger holds no settlement matching this attempt" — built by
+  // exhausting a list, and it is only sound if the list could not have omitted the settlement being
+  // looked for. `provedComplete` is exactly that fact, established by the probe against the
+  // document's OWN settled figure rather than against the records (see the field's docblock). Without
+  // it, "not among these" is not "not in the ledger", and `clear` is what authorises a second
+  // payment.
+  //
+  // WHAT THIS COSTS, STATED. A response that omits the document totals but returns settlements can no
+  // longer clear a row automatically; it holds visibly and a human resolves it. It costs the ordinary
+  // first payment NOTHING — an unsettled document states its totals, so `provedComplete` is true and
+  // the empty list clears, which is the same sentence `emptyAnswerIsUnproved` has carried since
+  // o3d-nk5n, now applied to the non-empty list it always should have covered.
+  if (!probe.provedComplete) {
+    return {
+      outcome: 'unknown',
+      cause: 'collection-unproved',
+      reason: 'the accounting connector returned settlements against this document but stated no total '
+        + 'of what has settled it, so IMS cannot tell whether it was sent all of them — none of the '
+        + 'ones it did read is this attempt, which is not the same as this attempt not being there',
     }
   }
   return { outcome: 'clear' }

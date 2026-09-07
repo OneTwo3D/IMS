@@ -35,6 +35,7 @@ import {
 import { formatLedgerMoney } from '@/lib/domain/accounting/ledger-settlement-evidence'
 import type { LedgerSettlementProbe, LedgerSettlementRecord } from '@/lib/domain/accounting/ledger-settlement-evidence'
 import {
+  addMoney,
   compareDecimal,
   ledgerAmountEpsilon,
   subtractMoney,
@@ -292,20 +293,37 @@ function shortBy(stated: Decimal, accounted: Decimal, currency: string | null): 
  * `Total - RemainingCredit` on a Xero credit note, `TotalAmt - Balance` on a QuickBooks document. In
  * every case it is null exactly when the ledger stated too little for the figure to be computed.
  *
- * A NON-EMPTY RECORD LIST STILL ANSWERS. Records are evidence in their own right: the classifier
- * compares them against the attempt and reaches its own verdict, so a figureless document whose
- * settlements this probe DID read is not refused. Only the empty case turns "I could not look" into
- * "there is nothing there".
+ * A NON-EMPTY RECORD LIST STILL ANSWERS — AND o3d-obyd r31 IS WHAT "ANSWERS" MEANS. This paragraph
+ * used to say records are evidence in their own right and stop there, and Codex found the half of
+ * that sentence which is false. It is TRUE OF A MATCH and FALSE OF A NON-MATCH. A record that matches
+ * the attempt proves the attempt settled, whatever else the response left out. A record that does not
+ * match is a statement about ONE OTHER settlement and says nothing about whether the attempted one is
+ * also in the collection — so a truncated response that omits the document figures, returns one
+ * unrelated settlement and omits ours cleared all three arms. The list is therefore no longer
+ * reported as a bare answer: it is reported WITH whether it is proved complete, and the classifier
+ * spends that on the non-match alone (see `LedgerSettlementProbe.provedComplete`).
  *
  * AND AN UNREADABLE FIGURE IS ALREADY HANDLED ELSEWHERE — `completenessCannotRun` refuses before this
  * is reached. What is left here is ABSENCE, which correctly skips arithmetic it cannot do and must
  * not also be allowed to contribute a conclusion.
+ *
+ * WHY IT IS ONE FUNCTION THAT BUILDS THE WHOLE ANSWER. `emptyAnswerIsUnproved` was a PREDICATE each
+ * arm called before its own `return { ok: true, records }`, so the two halves of the rule — refuse
+ * the figureless empty answer, and mark the figureless non-empty one unproved — could be applied in
+ * one arm and forgotten in another. They cannot drift now: there is no way to build a successful
+ * answer without handing over the document's own settled figure, and what that figure is null-or-not
+ * decides both halves in one place.
  */
-function emptyAnswerIsUnproved(
+function settlementAnswer(
+  /** The ledger's OWN account of how much has come off this document, or null when it stated too
+   * little to compute one. This is the sole evidence of completeness — never the records. */
   settled: Decimal | null,
-  records: readonly LedgerSettlementRecord[],
-): boolean {
-  return settled === null && records.length === 0
+  records: LedgerSettlementRecord[],
+  /** What to say when the document states no figure AND this probe read no settlement of it. */
+  figurelessAndEmpty: string,
+): LedgerSettlementProbe {
+  if (settled === null && records.length === 0) return { ok: false, reason: figurelessAndEmpty }
+  return { ok: true, records, provedComplete: settled !== null }
 }
 
 /** Sum exact readings, or null the moment one of them is unreadable. */
@@ -527,15 +545,15 @@ export async function probeXeroSettlement(
     // has been applied to this bill" on the strength of not having looked. A note that DOES state
     // them proves its own emptiness: a wholly unapplied credit reads `Total 40, RemainingCredit 40`,
     // `applied` is exactly zero, and the empty answer is the ledger's, not this code's.
-    if (emptyAnswerIsUnproved(applied, records)) {
-      return {
-        ok: false,
-        reason: 'Xero states no total or remaining credit on this credit note and IMS read no allocation '
-          + 'of it to this bill, so it has nothing to tell from — an empty answer here would say that '
-          + 'none of the credit has been allocated rather than report what has',
-      }
-    }
-    return { ok: true, records }
+    //
+    // o3d-obyd r31: and `applied` is also what proves the ALLOCATION LIST COMPLETE, which is the same
+    // fact used for a different conclusion. When it is stated, the shortfall check above has measured
+    // the collection against a figure outside it; when it is null, the allocations went unmeasured,
+    // and a non-matching allocation must not be allowed to say this credit was never applied to us.
+    return settlementAnswer(applied, records,
+      'Xero states no total or remaining credit on this credit note and IMS read no allocation '
+      + 'of it to this bill, so it has nothing to tell from — an empty answer here would say that '
+      + 'none of the credit has been allocated rather than report what has')
   }
 
   if (!invoiceId) return { ok: false, reason: 'the row records no document id to check' }
@@ -663,11 +681,54 @@ export async function probeXeroSettlement(
   const total = totalRead.value
   const amountDue = amountDueRead.value
   const amountCredited = amountCreditedRead.value
-  const settled = total !== null && amountDue !== null
-    ? subtractMoney(total, amountDue)
-    // Fallback for a response that omits the totals: the two component fields, which is still
-    // strictly more than `AmountPaid` alone was.
-    : amountPaid !== null && amountCredited !== null ? amountPaid.add(amountCredited) : null
+  // o3d-obyd r31 (Codex HIGH 2) — TWO FORMS OF ONE FIGURE, AND THEY MUST AGREE OR NEITHER IS BELIEVED.
+  //
+  // THEY ARE ONE FIGURE, BY XERO'S OWN DEFINITION. `AmountDue = Total - AmountPaid - AmountCredited`,
+  // so `Total - AmountDue` and `AmountPaid + AmountCredited` are the SAME quantity — how much has
+  // come off this document — rearranged. The fallback exists because a response may omit the totals,
+  // not because the two are different questions.
+  //
+  // THE DEFECT. The code took `Total - AmountDue` unconditionally whenever the pair was present and
+  // never looked at the other. So `Total 100, AmountDue 100, AmountPaid 0, AmountCredited 10,
+  // Payments: []` produced a settled value of EXACTLY ZERO — `statesAnything` false, the shortfall
+  // check passes on nothing, the empty list is "proved", and the classifier answers `clear` — while
+  // the same response simultaneously states that 10 was credited. A proved zero forged out of two
+  // figures that contradict each other, and `clear` is what authorises a second payment.
+  //
+  // THE PREVIOUS ROUND MET THIS EXACT SHAPE AND ONLY CORRECTED THE FIXTURE — a test invoice whose
+  // `Total - AmountDue` said 60 had settled while `AmountPaid + AmountCredited` said 50. Removing the
+  // contradiction from the test data left production still accepting it, which is why it is a code
+  // path now and not a comment.
+  //
+  // WHY REFUSE RATHER THAN PREFER THE LARGER. Taking whichever figure is safer would be picking a
+  // winner between two statements that cannot both be true, which is a guess about WHICH ONE Xero
+  // meant. When two derivations of one quantity disagree, the RESPONSE is incoherent — stale, partial
+  // or malformed — and nothing else read out of it is trustworthy either, including the collections
+  // the shortfall check is about to measure. So the probe refuses, the row holds visibly, and a human
+  // looks at a document Xero is describing inconsistently.
+  //
+  // THE BAND IS `completenessBand`, the same fraction of the document's own minor unit every other
+  // completeness comparison in this file uses — not equality, because both sides are read from stated
+  // decimals and the ordinary document agrees to the penny.
+  const settledFromTotals = total !== null && amountDue !== null ? subtractMoney(total, amountDue) : null
+  // Fallback for a response that omits the totals: the two component fields, which is still
+  // strictly more than `AmountPaid` alone was.
+  const settledFromComponents = amountPaid !== null && amountCredited !== null
+    ? addMoney(amountPaid, amountCredited)
+    : null
+  if (settledFromTotals !== null && settledFromComponents !== null
+    && compareDecimal(subtractMoney(settledFromTotals, settledFromComponents).abs(),
+      completenessBand(invoiceCurrency)) > 0) {
+    return {
+      ok: false,
+      reason: `Xero states two amounts settled against this document that do not agree — `
+        + `${formatLedgerMoney(settledFromTotals)} by Total less AmountDue and `
+        + `${formatLedgerMoney(settledFromComponents)} by AmountPaid plus AmountCredited. These are `
+        + 'the same figure in Xero\'s own arithmetic, so the response is inconsistent and IMS cannot '
+        + 'tell how much of the document is already settled from either of them',
+    }
+  }
+  const settled = settledFromTotals ?? settledFromComponents
   const applied = sumExact([
     sumApplied(invoice.CreditNotes, invoiceCurrency),
     sumApplied(invoice.Prepayments, invoiceCurrency),
@@ -716,15 +777,14 @@ export async function probeXeroSettlement(
   // answers `ok: true` with an empty record list — `clear`, and the payment posts. Emptiness proved
   // by two stated figures rather than assumed from four missing ones, which is the same sentence the
   // QuickBooks arm has carried since o3d-mm51 and now the same FUNCTION.
-  if (emptyAnswerIsUnproved(settled, records)) {
-    return {
-      ok: false,
-      reason: 'Xero states no total, amount due, amount paid or amount credited on this document and IMS '
-        + 'read no payment against it, so it has nothing to tell from — an empty answer here would say '
-        + 'that nothing has settled the document rather than report what does',
-    }
-  }
-  return { ok: true, records }
+  //
+  // o3d-obyd r31: and the SECOND thing `settled` decides here is whether the `Payments` list is
+  // proved whole. It is the identical fact — a stated figure the collection was measured against —
+  // spent on the other half of Codex's asymmetry, so both leave through one function.
+  return settlementAnswer(settled, records,
+    'Xero states no total, amount due, amount paid or amount credited on this document and IMS '
+    + 'read no payment against it, so it has nothing to tell from — an empty answer here would say '
+    + 'that nothing has settled the document rather than report what does')
 }
 
 // o3d-r948 — `XERO_AMOUNT_EPSILON` AND `QBO_AMOUNT_EPSILON` WERE HERE, BOTH `0.005`, AND BOTH ARE
@@ -1046,22 +1106,19 @@ export async function probeQuickBooksSettlement(
     // is the whole difference. The refusal below is reachable only by a document that states neither,
     // and that is not a shape QuickBooks sends for a document that is there.
     //
-    // AND A DOCUMENT WITH NO FIGURES WHOSE SETTLEMENTS THIS PROBE DID READ still answers: `records`
-    // is then evidence in its own right and the verdict is decided by comparing it, not by the
-    // absence. Only the empty case turns "I could not look" into "there is nothing there".
+    // AND A DOCUMENT WITH NO FIGURES WHOSE SETTLEMENTS THIS PROBE DID READ still answers — but
+    // o3d-obyd r31 corrected WHAT it answers. This paragraph used to end "`records` is then evidence
+    // in its own right and the verdict is decided by comparing it", and that is true only of a
+    // COMPARISON THAT MATCHES. With no `TotalAmt` and no `Balance` nothing measured the link list, so
+    // a linked payment that is not ours does not show that ours is absent — QuickBooks may simply not
+    // have sent it. Such an answer is now marked unproved and a non-match yields `unknown`; a match
+    // still yields `present`. See `settlementAnswer` and `LedgerSettlementProbe.provedComplete`.
     //
-    // o3d-nk5n: and this paragraph is now the SHARED rule rather than this arm's own. Both Xero arms
-    // reached the same fall-through and were closed by routing through `emptyAnswerIsUnproved`, which
-    // is this condition lifted out verbatim — `applied` is this arm's `settled`. Lifted rather than
-    // re-spelled so that a change to the rule cannot reach one connector and miss the other.
-    if (emptyAnswerIsUnproved(applied, records)) {
-      return {
-        ok: false,
-        reason: `QuickBooks states no total or balance on this ${documentKey.toLowerCase()} and IMS read no `
-          + 'settlement against it, so it has nothing to tell from — an empty answer here would say '
-          + 'that nothing has settled the document rather than report what does',
-      }
-    }
+    // o3d-nk5n: and this rule is the SHARED one rather than this arm's own. Both Xero arms reached
+    // the same fall-through and were closed by routing through the same function — `applied` is this
+    // arm's `settled`. Shared rather than re-spelled so that a change to the rule cannot reach one
+    // connector and miss the other; r31 is that guarantee being cashed, since it changed the rule for
+    // all three arms by changing one function.
   } else if (statesAnything(applied, documentCurrency)
     && (explained === null || shortBy(applied, explained, documentCurrency))) {
     return {
@@ -1075,7 +1132,10 @@ export async function probeQuickBooksSettlement(
           : links.length === 0 ? ' and links no transaction that accounts for it' : ''),
     }
   }
-  return { ok: true, records }
+  return settlementAnswer(applied, records,
+    `QuickBooks states no total or balance on this ${documentKey.toLowerCase()} and IMS read no `
+    + 'settlement against it, so it has nothing to tell from — an empty answer here would say '
+    + 'that nothing has settled the document rather than report what does')
 }
 
 /**
@@ -1442,13 +1502,29 @@ export async function authoriseMoneyPost(
       }
       // Undescribable AND the ledger is not empty: this row cannot say what it would create, so it
       // cannot rule itself out against what is already there. Refuse on what is visible.
-      if (!probe.ok || probe.records.length > 0) {
+      //
+      // o3d-obyd r31 — AND `!probe.provedComplete` IS THE THIRD ARM OF THE SAME TEST. This gate is
+      // the one place outside `classifyLedgerSettlement` that reads a conclusion out of a record list
+      // DIRECTLY, and it reads the strongest one: an empty list is taken as "there is nothing here to
+      // confuse this attempt with", and the row proceeds to POST. That inference has exactly the
+      // premise Codex's HIGH 1 is about — it holds only if the empty list is the whole collection.
+      // An unproved answer cannot support it, so it is refused here as it is there. No production
+      // response reaches this shape today (`settlementAnswer` refuses a figureless EMPTY answer
+      // outright, so unproved implies non-empty and the length test already catches it), and the
+      // check is written anyway rather than resting on that coincidence: this branch AUTHORISES A
+      // POST, and its premise should be stated where it is used, not inferred from another
+      // function's current refusal.
+      if (!probe.ok || probe.records.length > 0 || !probe.provedComplete) {
         return {
           proceed: false,
           error: 'Not sent: this entry does not record the amount its attempt would send, and the '
-            + `accounting connector already holds ${probe.ok ? probe.records.length : 'a'} settlement`
-            + `${probe.ok && probe.records.length === 1 ? '' : 's'} against this document. IMS cannot `
-            + 'tell them apart, so sending could pay it twice. Resolve this entry by hand.',
+            + (probe.ok && probe.records.length === 0
+              ? 'accounting connector did not state how much has settled this document, so IMS cannot '
+                + 'tell whether it was shown every settlement of it'
+              : `accounting connector already holds ${probe.ok ? probe.records.length : 'a'} settlement`
+                + `${probe.ok && probe.records.length === 1 ? '' : 's'} against this document. IMS cannot `
+                + 'tell them apart')
+            + ', so sending could pay it twice. Resolve this entry by hand.',
         }
       }
     }

@@ -1339,7 +1339,17 @@ export async function registerInvoicePaymentWithLedger(params: {
           payload: { accountingInvoiceId },
         })
         // A probe that could not answer stays null, which the decision reads as "refuse".
-        return probe.ok ? probe.records : null
+        //
+        // o3d-obyd r31 (Codex HIGH 1) — AND WHAT IT DID ANSWER IS PASSED WHOLE. This was
+        // `probe.ok ? probe.records : null`: the records lifted out and everything else dropped.
+        // The probe now also reports whether the collection it returned is PROVED COMPLETE, which is
+        // the difference between "no settlement matching this attempt exists" and "none of the ones
+        // I was sent is it" — and pulling the list out of the answer would have left the decision to
+        // invent that fact. It would have invented `true`, because a bare list looks whole, and a
+        // truncated Xero response would then authorise a second payment through this path with the
+        // probe having correctly refused to say so. Nothing is flattened; `null` still means "could
+        // not answer", which is still what the decision refuses on.
+        return probe.ok ? probe : null
       })()
       : null
 
