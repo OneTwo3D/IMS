@@ -17,7 +17,10 @@ import test, { mock } from 'node:test'
  */
 
 const xeroCalls: string[] = []
-let xeroResponse: unknown = { Invoices: [{ InvoiceID: 'inv-1', Payments: [] }] }
+// o3d-nk5n: an UNSETTLED Xero invoice states its figures, and states `Total` and `AmountDue` EQUAL.
+// The figureless stub this used to be is not a response Xero sends, and since an empty record list
+// must now be PROVED rather than assumed it no longer reads as an unsettled invoice at all.
+let xeroResponse: unknown = { Invoices: [{ InvoiceID: 'inv-1', Total: 10, AmountDue: 10, AmountPaid: 0, Payments: [] }] }
 
 mock.module('@/lib/connectors/xero/api', {
   namedExports: {
@@ -53,7 +56,15 @@ test('a pinned money revival is refused when the ledger already holds the attemp
 
 test('a pinned money revival proceeds when the ledger does not hold it (o3d-0m56)', async () => {
   xeroCalls.length = 0
-  xeroResponse = { Invoices: [{ InvoiceID: 'inv-1', Payments: [{ PaymentID: 'PAY-1', Date: '2026-07-01', Amount: 10 }] }] }
+  // o3d-obyd r31: with the invoice's own settled figure, as Xero returns it. A response that omits
+  // it proves nothing about whether these are ALL the payments on the document, so "the ledger does
+  // not hold this attempt" is not available from it — which is the point of this test.
+  xeroResponse = {
+    Invoices: [{
+      InvoiceID: 'inv-1', Total: 100, AmountDue: 90, AmountPaid: 10, AmountCredited: 0,
+      Payments: [{ PaymentID: 'PAY-1', Date: '2026-07-01', Amount: 10 }],
+    }],
+  }
 
   assert.deepEqual(await (await load())(revival), { clear: true })
 })

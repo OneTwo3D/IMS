@@ -9,8 +9,13 @@ import {
   unresolvedInvoicePaymentAttempts,
   type ExistingInvoicePaymentSync,
 } from '@/lib/domain/accounting/invoice-payment-registration'
-import type { LedgerSettlementRecord } from '@/lib/domain/accounting/ledger-settlement-evidence'
+import type { LedgerSettlementProbe, LedgerSettlementRecord } from '@/lib/domain/accounting/ledger-settlement-evidence'
 import { describeInvoicePaymentRefusal } from '@/lib/domain/accounting/invoice-payment-enqueue'
+import {
+  OPERATOR_ASSERTION_SETTLEMENT_BASIS,
+  OPERATOR_RELEASE_SETTLEMENT_BASIS,
+} from '@/lib/domain/accounting/sync-row-settlement'
+import { toDecimal } from '@/lib/domain/math/decimal'
 
 /**
  * o3d-lgo.15, decision recorded 2026-07-25: a manually-recorded sales receipt DOES register against the
@@ -22,19 +27,58 @@ import { describeInvoicePaymentRefusal } from '@/lib/domain/accounting/invoice-p
  * payment they were never told about.
  */
 
+/**
+ * o3d-6abj — AN EXISTING ROW CARRIES BOTH FORMS, BECAUSE THE PRODUCTION LOADER PRODUCES BOTH.
+ *
+ * `amount` is the JSON number that went on the wire: the only figure a reply from the LEDGER can be
+ * matched against, and what `classifyLedgerSettlement` compares. `registeredAmount` is the exact
+ * decimal the capacity sum reads. `loadInvoicePaymentSyncRows` fills both from one payload, so a
+ * fixture that set only one would describe a row production cannot produce — and, worse, would let
+ * the arithmetic under test read a figure no writer ever puts there.
+ */
+function live(row: Omit<ExistingInvoicePaymentSync, 'registeredAmount'>): ExistingInvoicePaymentSync {
+  // o3d-r948 r2: a READING now, and `loadInvoicePaymentSyncRows` builds exactly these two — a row
+  // with a number states its own decimal reading, a row without one states nothing.
+  //
+  // o3d-r948 r6: r5 also defaulted an `origin` here, because the loader put one on every row for the
+  // exclusion set to scope itself by. Both are gone — the loader no longer reads a row's connection
+  // provenance, because nothing excludes a settlement record any more.
+  return {
+    ...row,
+    registeredAmount: row.amount == null
+      ? { kind: 'not-stated' }
+      : { kind: 'stated', amount: toDecimal(row.amount) },
+  }
+}
+
+
+/**
+ * o3d-obyd r31 — WHAT THESE FIXTURES ALWAYS MEANT BY A LEDGER ANSWER, now said out loud.
+ *
+ * `ledgerSettlements` carried a bare `LedgerSettlementRecord[]`, and every fixture below that passes
+ * one is modelling a ledger that answered FULLY: the document's figures are stated and these are all
+ * the settlements it holds. That is the only reading under which `[]` means "nothing has settled this
+ * invoice", which is what each of them asserts. The field is now the probe itself, so the reading is
+ * written into the value instead of being assumed of it — `provedComplete: true` says the collection
+ * was measured against the document's own settled figure. No assertion in this file changes; the
+ * shape they were always making a claim about now states the premise of that claim.
+ */
+const answered = (records: LedgerSettlementRecord[]): LedgerSettlementProbe =>
+  ({ ok: true, records, provedComplete: true })
+
 const base = {
   syncEnabled: true,
   accountingInvoiceId: 'INV-1',
   orderCurrency: 'GBP',
   paymentCurrency: 'GBP',
-  paymentAmount: 100,
+  paymentAmount: toDecimal(100),
   paymentId: 'pay-new',
   bankAccountId: 'BANK-1',
   existing: [] as ExistingInvoicePaymentSync[],
   // Most cases have no unresolved attempt, so the ledger is never consulted and this is unread.
   // The cases that DO have one pass their own records — see the o3d-0m56 block at the end.
-  ledgerSettlements: null as LedgerSettlementRecord[] | null,
-  ledgerTotal: 100,
+  ledgerSettlements: null as LedgerSettlementProbe | null,
+  ledgerTotal: toDecimal(100),
 }
 
 test('a receipt against a posted invoice with a mapped bank account is registered', () => {
@@ -72,11 +116,11 @@ test('an imported order whose payment the ledger already holds is NOT paid a sec
   // there is no room left for this receipt. The figure the operator is shown is what is already on it.
   const d = decideInvoicePaymentRegistration({
     ...base,
-    existing: [{ status: 'SYNCED', amount: 100, paymentId: null }],
+    existing: [live({ status: 'SYNCED', amount: 100, paymentId: null })],
   })
   assert.equal(d.register === false && d.refusal, 'WOULD_OVERPAY')
-  assert.equal(d.register === false && d.alreadyRegistered, 100)
-  assert.equal(d.register === false && d.ledgerTotal, 100)
+  assert.equal(d.register === false && d.alreadyRegistered?.toFixed(), '100')
+  assert.equal(d.register === false && d.ledgerTotal?.toFixed(), '100')
 })
 
 test('o3d-cjt8: a SECOND receipt that fits alongside the first IS registered', () => {
@@ -86,8 +130,8 @@ test('o3d-cjt8: a SECOND receipt that fits alongside the first IS registered', (
   // DOCUMENT; the index is now scoped that way, and what is left to check is arithmetic.
   const d = decideInvoicePaymentRegistration({
     ...base,
-    paymentAmount: 60,
-    existing: [{ status: 'SYNCED', amount: 40, paymentId: 'pay-old' }],
+    paymentAmount: toDecimal(60),
+    existing: [live({ status: 'SYNCED', amount: 40, paymentId: 'pay-old' })],
   })
   assert.equal(d.register, true)
   assert.equal(d.register && d.bankAccountId, 'BANK-1')
@@ -99,15 +143,15 @@ test('o3d-cjt8: the receipt that would take the total PAST the invoice is the on
   // rather than only the invoice total, since that is the number that explains it.
   const d = decideInvoicePaymentRegistration({
     ...base,
-    paymentAmount: 10,
+    paymentAmount: toDecimal(10),
     existing: [
-      { status: 'SYNCED', amount: 40, paymentId: 'pay-1' },
-      { status: 'PENDING', amount: 60, paymentId: 'pay-2' },
+      live({ status: 'SYNCED', amount: 40, paymentId: 'pay-1' }),
+      live({ status: 'PENDING', amount: 60, paymentId: 'pay-2' }),
     ],
   })
   assert.equal(d.register === false && d.refusal, 'WOULD_OVERPAY')
-  assert.equal(d.register === false && d.alreadyRegistered, 100)
-  assert.equal(d.register === false && d.ledgerTotal, 100)
+  assert.equal(d.register === false && d.alreadyRegistered?.toFixed(), '100')
+  assert.equal(d.register === false && d.ledgerTotal?.toFixed(), '100')
 })
 
 test('a payment still in the queue consumes capacity as firmly as a synced one', () => {
@@ -115,9 +159,9 @@ test('a payment still in the queue consumes capacity as firmly as a synced one',
   // arithmetic must too. Otherwise two receipts queued in quick succession would each measure
   // themselves against an empty invoice.
   for (const status of ['PENDING', 'PROCESSING'] as const) {
-    const d = decideInvoicePaymentRegistration({ ...base, existing: [{ status, amount: 100, paymentId: 'pay-old' }] })
+    const d = decideInvoicePaymentRegistration({ ...base, existing: [live({ status, amount: 100, paymentId: 'pay-old' })] })
     assert.equal(d.register === false && d.refusal, 'WOULD_OVERPAY', status)
-    assert.equal(d.register === false && d.alreadyRegistered, 100, status)
+    assert.equal(d.register === false && d.alreadyRegistered?.toFixed(), '100', status)
   }
 })
 
@@ -128,9 +172,9 @@ test('a rejected or cancelled payment frees the DATABASE slot, but only the ledg
   // deleting a receipt CANCELS a row that may already have settled (o3d-0m56, Codex review). So the
   // slot is free and the decision is not, until the ledger says the earlier attempt is not in it.
   for (const status of ['FAILED', 'CANCELLED'] as const) {
-    const existing = [{ status, amount: 100, paymentDate: '2026-08-01', paymentId: 'pay-old' }]
+    const existing = [live({ status, amount: 100, paymentDate: '2026-08-01', paymentId: 'pay-old' })]
     assert.equal(
-      decideInvoicePaymentRegistration({ ...base, existing, ledgerSettlements: [] }).register,
+      decideInvoicePaymentRegistration({ ...base, existing, ledgerSettlements: answered([]) }).register,
       true,
       `${status}: a ledger with no matching settlement is what makes this safe`,
     )
@@ -146,10 +190,10 @@ test('a live row with no recorded amount refuses on the UNREADABLE amount, and i
   // closed with the reason named, and reports no total it does not have.
   const d = decideInvoicePaymentRegistration({
     ...base,
-    existing: [{ status: 'SYNCED', amount: null, paymentId: 'pay-old' }],
+    existing: [live({ status: 'SYNCED', amount: null, paymentId: 'pay-old' })],
   })
   assert.equal(d.register === false && d.refusal, 'LEDGER_AMOUNT_UNKNOWN')
-  assert.equal(d.register === false && d.alreadyRegistered, undefined)
+  assert.equal(d.register === false && d.alreadyRegistered?.toFixed(), undefined)
 })
 
 test('an unreadable amount on a rejected row no longer waves the receipt through', () => {
@@ -159,8 +203,8 @@ test('an unreadable amount on a rejected row no longer waves the receipt through
   // database's live slot, though, so the refusal names the unresolved attempt rather than a live one.
   const d = decideInvoicePaymentRegistration({
     ...base,
-    existing: [{ status: 'FAILED', amount: null, paymentId: 'pay-old' }],
-    ledgerSettlements: [],
+    existing: [live({ status: 'FAILED', amount: null, paymentId: 'pay-old' })],
+    ledgerSettlements: answered([]),
   })
   assert.equal(d.register, false)
   assert.equal(d.register === false && d.refusal, 'UNRESOLVED_PAYMENT_ATTEMPT')
@@ -171,7 +215,7 @@ test('this receipt does not count against itself when the decision is re-run', (
   // would refuse the retry for its own success.
   const d = decideInvoicePaymentRegistration({
     ...base,
-    existing: [{ status: 'PENDING', amount: 100, paymentId: 'pay-new' }],
+    existing: [live({ status: 'PENDING', amount: 100, paymentId: 'pay-new' })],
   })
   assert.equal(d.register, true)
 })
@@ -186,12 +230,12 @@ test('a receipt bigger than what the ledger holds is refused here, not left for 
   // total and an ordinary VAT receipt matches it. What is left for this guard is every OTHER way a
   // receipt can exceed the document (a credited or part-refunded invoice, a mistyped amount), plus the
   // invoices imported and posted before that fix.
-  const d = decideInvoicePaymentRegistration({ ...base, paymentAmount: 120, ledgerTotal: 100 })
+  const d = decideInvoicePaymentRegistration({ ...base, paymentAmount: toDecimal(120), ledgerTotal: toDecimal(100) })
   assert.equal(d.register === false && d.refusal, 'WOULD_OVERPAY')
 })
 
 test('sub-penny rounding does not refuse an exact settlement', () => {
-  const d = decideInvoicePaymentRegistration({ ...base, paymentAmount: 100.004, ledgerTotal: 100 })
+  const d = decideInvoicePaymentRegistration({ ...base, paymentAmount: toDecimal(100.004), ledgerTotal: toDecimal(100) })
   assert.equal(d.register, true)
 })
 
@@ -204,15 +248,14 @@ test('sub-penny rounding does not refuse an exact settlement', () => {
  * guard ever running — and a failed payment looks, from the order screen, like nothing happened.
  */
 
-const unresolved = (over: Partial<ExistingInvoicePaymentSync> = {}): ExistingInvoicePaymentSync => ({
-  status: 'FAILED', amount: 100, paymentDate: '2026-08-01', paymentId: 'pay-old', ...over,
-})
+const unresolved = (over: Partial<ExistingInvoicePaymentSync> = {}): ExistingInvoicePaymentSync =>
+  live({ status: 'FAILED', amount: 100, paymentDate: '2026-08-01', paymentId: 'pay-old', ...over })
 
 test('a receipt beside an unresolved attempt the ledger HOLDS is refused (o3d-0m56)', () => {
   const d = decideInvoicePaymentRegistration({
     ...base,
     existing: [unresolved()],
-    ledgerSettlements: [{ amount: 100, date: '2026-08-01', id: 'PAY-1' }],
+    ledgerSettlements: answered([{ amount: toDecimal(100), date: '2026-08-01', id: 'PAY-1' }]),
   })
   assert.equal(d.register, false)
   assert.equal(d.register === false && d.refusal, 'UNRESOLVED_PAYMENT_ATTEMPT')
@@ -229,7 +272,7 @@ test('an unresolved attempt IMS cannot describe refuses (o3d-0m56)', () => {
   // No amount or no date means no settlement in the ledger can be matched to it, so it can never
   // be ruled out. Refusing is the only honest answer.
   for (const attempt of [unresolved({ amount: null }), unresolved({ paymentDate: null })]) {
-    const d = decideInvoicePaymentRegistration({ ...base, existing: [attempt], ledgerSettlements: [] })
+    const d = decideInvoicePaymentRegistration({ ...base, existing: [attempt], ledgerSettlements: answered([]) })
     assert.equal(d.register === false && d.refusal, 'UNRESOLVED_PAYMENT_ATTEMPT', JSON.stringify(attempt))
   }
 })
@@ -243,6 +286,121 @@ test('an attempt that PROVABLY never posted does not block the receipt (o3d-0m56
     ledgerSettlements: null,
   })
   assert.equal(d.register, true)
+})
+
+/* ------------------------------------------------------------------------------------------- *
+ * o3d-r948 r6 — THE EXCLUSION IS GONE, AND SO ARE THE SEVEN TESTS THAT NARROWED IT.
+ *
+ * RETIRED HERE, NAMED SO THE HISTORY IS NOT SILENTLY SHORTER THAN IT WAS. Each of these asserted a
+ * property of `settlementsOfOtherAttempts`, the option `classifyLedgerSettlement` no longer accepts:
+ *
+ *   [o3d-r948 r3] a SYNCED row s own unmeasurable payment stops blocking every later receipt
+ *   [o3d-r948 r3] an attempt s OWN recorded settlement is never excluded from its own match
+ *   [o3d-r948 r4] a RETIRED operator-asserted row s typed id does not exclude the attempt s own settlement
+ *   [o3d-r948 r4] an OPERATOR_RELEASE row s id is the connector s own and still excludes
+ *   [o3d-r948 r5] an id minted in a FORMER realm does not exclude the current ledger s own evidence
+ *   [o3d-r948 r5] a row whose origin is UNKNOWN grants no exclusion — in any of its three flavours
+ *   [o3d-r948 r5] the PROBE side is scoped too — a connection the probe cannot name excludes nothing
+ *
+ * The first of them is the one that mattered: it pinned that a SYNCED row's own unmeasurable payment
+ * STOPS blocking every later receipt. That behaviour is deliberately reversed below. It blocks again,
+ * and the permanent hold that creates is filed as its own problem (bd o3d-llyw) rather than lifted
+ * by a rule four rounds of adversarial review kept finding holes in.
+ *
+ * WHAT REPLACES THEM is the round-2 rule, asserted directly: an unmeasurable settlement withholds,
+ * and no id any row of ours records can change that.
+ * ------------------------------------------------------------------------------------------- */
+
+test('[o3d-r948 r6] an unmeasurable settlement withholds — whatever id any other row records', () => {
+  // The exact shape r3 built the exclusion to release, now asserted to REFUSE. A SYNCED row for a
+  // different receipt records the ledger id `PAY-OTHER`; the ledger reports a settlement carrying
+  // that same id and an amount IMS will not read. r3 to r5 skipped that record and registered; r6
+  // measures it, cannot, and withholds.
+  //
+  // ROUTE: decideInvoicePaymentRegistration's unresolved-attempt loop → classifyLedgerSettlement's
+  //        record loop → the `record-unmeasurable` arm → UNRESOLVED_PAYMENT_ATTEMPT.
+  // MUTATION (run): re-add the exclusion at that call site as a third argument
+  //        `{ settlementsOfOtherAttempts: input.existing.filter((r) => r !== attempt).map((r) => r.externalTransactionId) }`
+  //        together with the `options` parameter and the folded-set `continue` in
+  //        `classifyLedgerSettlement`. Both assertions below then FAIL — `register` is true and the
+  //        refusal is undefined. Reverted after running.
+  const settled = live({
+    status: 'SYNCED',
+    amount: 40,
+    paymentId: 'pay-other',
+    accountingInvoiceId: 'INV-1',
+    externalTransactionId: 'PAY-OTHER',
+  })
+  const d = decideInvoicePaymentRegistration({
+    ...base,
+    paymentAmount: toDecimal(60),
+    existing: [settled, unresolved({ amount: 100, paymentDate: '2026-08-01' })],
+    // The SYNCED row's own payment, as a ledger that will not state a readable figure reports it.
+    ledgerSettlements: answered([{ amount: null, unreadableAmount: '40.005', date: null, id: 'PAY-OTHER', reference: null }]),
+  })
+  assert.equal(d.register, false)
+  assert.equal(d.register === false && d.refusal, 'UNRESOLVED_PAYMENT_ATTEMPT')
+})
+
+test('[o3d-r948 r6] the id being OURS, the ledger s, or nobody s makes no difference at all', () => {
+  // The withhold is not conditional on anything about the id. It was, through five revisions of a
+  // predicate — asserted or not, this realm or a former one, stamped or unknown — and each of those
+  // conditions was a route to `clear`. Now the id is not consulted, so a test that varies it and
+  // gets one answer is the strongest statement of the rule available.
+  //
+  // ROUTE: the same record loop. The variants differ ONLY in what the other row records.
+  // MUTATION (run): the same re-added exclusion. The first variant then registers while the last two
+  //        still refuse, so the loop's `assert` fails on the first — proving the loop is reached and
+  //        that the id genuinely used to decide it. Reverted after running.
+  const attempt = unresolved({ amount: 100, paymentDate: '2026-08-01' })
+  const record: LedgerSettlementRecord =
+    { amount: null, unreadableAmount: '40.005', date: null, id: 'PAY-OTHER', reference: null }
+
+  for (const externalTransactionId of ['PAY-OTHER', 'PAY-SOMETHING-ELSE', null]) {
+    for (const settlementBasis of [null, OPERATOR_ASSERTION_SETTLEMENT_BASIS, OPERATOR_RELEASE_SETTLEMENT_BASIS]) {
+      const other = live({
+        status: 'SYNCED',
+        amount: 40,
+        paymentId: 'pay-other',
+        // A DIFFERENT document, so the retired-document and asserted-amount gates ahead of the
+        // ledger probe do not decide this for us — the record loop has to be what refuses.
+        accountingInvoiceId: 'INV-1',
+        externalTransactionId,
+        settlementBasis,
+      })
+      const d = decideInvoicePaymentRegistration({
+        ...base,
+        paymentAmount: toDecimal(60),
+        existing: [other, attempt],
+        ledgerSettlements: answered([record]),
+      })
+      assert.equal(d.register, false, `id ${externalTransactionId} / basis ${settlementBasis} must still withhold`)
+    }
+  }
+})
+
+test('[o3d-r948 r6] an ordinary first payment still posts — the removal withholds nothing else', () => {
+  // The cost of the removal has to be BOUNDED to the case that reaches the ledger probe at all. A
+  // receipt on an order with no history never gets there: `unresolvedInvoicePaymentAttempts` is
+  // empty, no probe is made, and the decision is the capacity arithmetic alone.
+  //
+  // ROUTE: decideInvoicePaymentRegistration, straight past the unresolved-attempt block.
+  // MUTATION (run): make the unresolved-attempt loop run unconditionally — change the guard so the
+  //        block is entered with an empty `unresolved` and a null `ledgerSettlements`, which is the
+  //        REFUSE arm. This test then fails while the two above still pass, which is what shows it
+  //        is asserting the ordinary path rather than restating them. Reverted after running.
+  const d = decideInvoicePaymentRegistration({ ...base, existing: [], ledgerSettlements: null })
+  assert.equal(d.register, true)
+  assert.equal(d.register && d.bankAccountId, 'BANK-1')
+
+  // And with a settled sibling that leaves room: still no unresolved attempt, so still no probe.
+  const alongside = decideInvoicePaymentRegistration({
+    ...base,
+    paymentAmount: toDecimal(60),
+    existing: [live({ status: 'SYNCED', amount: 40, paymentId: 'pay-other', accountingInvoiceId: 'INV-1', externalTransactionId: 'PAY-OTHER' })],
+    ledgerSettlements: null,
+  })
+  assert.equal(alongside.register, true)
 })
 
 // ---------------------------------------------------------------------------
@@ -260,7 +418,7 @@ test('o3d-hbgo: ANOTHER receipt s payment against a RETIRED invoice leaves the r
   const d = decideInvoicePaymentRegistration({
     ...base,
     accountingInvoiceId: 'INV-2',
-    existing: [{ status: 'SYNCED', amount: 100, paymentId: 'pay-old', accountingInvoiceId: 'INV-1' }],
+    existing: [live({ status: 'SYNCED', amount: 100, paymentId: 'pay-old', accountingInvoiceId: 'INV-1' })],
   })
   assert.equal(d.register, true)
 })
@@ -286,13 +444,13 @@ test('[o3d-ekn8 r4] THIS receipt s own SYNCED row on a retired document refuses,
   const d = decideInvoicePaymentRegistration({
     ...base,
     accountingInvoiceId: 'INV-2',
-    existing: [{
+    existing: [live({
       status: 'SYNCED',
       amount: 100,
       paymentId: 'pay-new',
       accountingInvoiceId: 'INV-1',
       externalTransactionId: 'PAY-XYZ',
-    }],
+    })],
   })
   assert.equal(d.register, false, 'registering again pays the same receipt twice')
   assert.equal(d.register === false && d.refusal, 'SETTLED_ON_RETIRED_DOCUMENT')
@@ -309,7 +467,7 @@ test('[o3d-ekn8 r4] an UN-ATTRIBUTED live row on a retired document refuses too'
   const d = decideInvoicePaymentRegistration({
     ...base,
     accountingInvoiceId: 'INV-2',
-    existing: [{ status: 'SYNCED', amount: 100, paymentId: null, accountingInvoiceId: 'INV-1' }],
+    existing: [live({ status: 'SYNCED', amount: 100, paymentId: null, accountingInvoiceId: 'INV-1' })],
   })
   assert.equal(d.register === false && d.refusal, 'SETTLED_ON_RETIRED_DOCUMENT')
 })
@@ -319,7 +477,7 @@ test('[o3d-ekn8 r4] a PENDING row for this receipt on a retired document refuses
   const d = decideInvoicePaymentRegistration({
     ...base,
     accountingInvoiceId: 'INV-2',
-    existing: [{ status: 'PENDING', amount: 100, paymentId: 'pay-new', accountingInvoiceId: 'INV-1' }],
+    existing: [live({ status: 'PENDING', amount: 100, paymentId: 'pay-new', accountingInvoiceId: 'INV-1' })],
   })
   assert.equal(d.register === false && d.refusal, 'SETTLED_ON_RETIRED_DOCUMENT')
 })
@@ -332,7 +490,7 @@ test('[o3d-ekn8 r4] a CANCELLED retired-document row clears it — that is a hum
   const d = decideInvoicePaymentRegistration({
     ...base,
     accountingInvoiceId: 'INV-2',
-    existing: [{ status: 'CANCELLED', amount: 100, paymentId: 'pay-new', accountingInvoiceId: 'INV-1' }],
+    existing: [live({ status: 'CANCELLED', amount: 100, paymentId: 'pay-new', accountingInvoiceId: 'INV-1' })],
   })
   assert.equal(d.register, true)
 })
@@ -343,9 +501,9 @@ test('[o3d-ekn8 r4] it is asked BEFORE the capacity arithmetic, which cannot see
   const d = decideInvoicePaymentRegistration({
     ...base,
     accountingInvoiceId: 'INV-2',
-    paymentAmount: 1,
-    ledgerTotal: 100,
-    existing: [{ status: 'SYNCED', amount: 100, paymentId: 'pay-new', accountingInvoiceId: 'INV-1' }],
+    paymentAmount: toDecimal(1),
+    ledgerTotal: toDecimal(100),
+    existing: [live({ status: 'SYNCED', amount: 100, paymentId: 'pay-new', accountingInvoiceId: 'INV-1' })],
   })
   assert.equal(d.register === false && d.refusal, 'SETTLED_ON_RETIRED_DOCUMENT',
     'a receipt that fits the replacement invoice is still the same receipt already paid')
@@ -355,9 +513,9 @@ test('[o3d-ekn8 r4] a row on the CURRENT document is untouched by it — that is
   const d = decideInvoicePaymentRegistration({
     ...base,
     accountingInvoiceId: 'INV-2',
-    paymentAmount: 40,
-    ledgerTotal: 100,
-    existing: [{ status: 'SYNCED', amount: 60, paymentId: 'pay-old', accountingInvoiceId: 'INV-2' }],
+    paymentAmount: toDecimal(40),
+    ledgerTotal: toDecimal(100),
+    existing: [live({ status: 'SYNCED', amount: 60, paymentId: 'pay-old', accountingInvoiceId: 'INV-2' })],
   })
   assert.equal(d.register, true, 'a deposit and a balance on the SAME document are what o3d-cjt8 admits')
 })
@@ -377,7 +535,7 @@ test('a settlement for a different amount or date leaves the receipt free (o3d-0
   const d = decideInvoicePaymentRegistration({
     ...base,
     existing: [unresolved()],
-    ledgerSettlements: [{ amount: 100, date: '2026-07-01' }, { amount: 40, date: '2026-08-01' }],
+    ledgerSettlements: answered([{ amount: toDecimal(100), date: '2026-07-01' }, { amount: toDecimal(40), date: '2026-08-01' }]),
   })
   assert.equal(d.register, true, 'only a settlement matching the ATTEMPT is evidence about it')
 })
@@ -386,7 +544,7 @@ test('the caller can tell whether the ledger needs asking at all (o3d-0m56)', ()
   // The probe is a network read; putting one behind every receipt would be a new problem. This is
   // the rule the caller uses to decide, so it is pinned here rather than left implicit in sales.ts.
   assert.deepEqual(unresolvedInvoicePaymentAttempts([], 'pay-new'), [])
-  assert.deepEqual(unresolvedInvoicePaymentAttempts([{ status: 'SYNCED', amount: 100 }], 'pay-new'), [])
+  assert.deepEqual(unresolvedInvoicePaymentAttempts([live({ status: 'SYNCED', amount: 100 })], 'pay-new'), [])
   assert.deepEqual(unresolvedInvoicePaymentAttempts([unresolved({ paymentId: 'pay-new' })], 'pay-new'), [])
   assert.deepEqual(unresolvedInvoicePaymentAttempts([unresolved({ couldHaveReachedLedger: false })], 'pay-new'), [])
   assert.equal(unresolvedInvoicePaymentAttempts([unresolved(), unresolved({ status: 'CANCELLED' })], 'pay-new').length, 2)
@@ -406,9 +564,34 @@ test('sales.ts asks the ledger exactly when the decision needs it (o3d-0m56)', a
 
   assert.match(body, /unresolvedInvoicePaymentAttempts\(existing, params\.paymentId\)\.length > 0/,
     'the probe must be gated on an unresolved attempt, not run on every receipt')
-  assert.match(body, /probe\.ok \? probe\.records : null/,
+  // o3d-obyd r31 — THE PROPERTY IS THE SAME AND THE EXPRESSION IS NOT. This asserted
+  // `return probe.ok ? probe.records : null`, which pinned TWO things: that an unanswered probe
+  // becomes null (the property this test names), and that the records are lifted out of the probe
+  // (which it never argued for). The lift is what Codex's HIGH 1 fix had to remove — the probe now
+  // reports whether its collection is proved complete, and pulling the list out of it left the
+  // decision to invent that fact in the permissive direction. The refusal property is asserted
+  // unchanged; what it is asserted about is the whole probe.
+  assert.match(body, /return probe\.ok \? probe : null/,
     'a probe that could not answer must become null — the value the decision refuses on')
+  // On the CODE, not the prose: the paragraph above this line in the source quotes the very
+  // expression being banned, so a `doesNotMatch` over the raw slice would fail on its own
+  // explanation — and one written to tolerate that would pass whether the code was fixed or not.
+  const bodyCode = body.split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n')
+  assert.match(bodyCode, /return probe\.ok \? probe : null/,
+    'the comment strip must leave the return standing')
+  assert.doesNotMatch(bodyCode, /probe\.ok \? probe\.records/,
+    'and an answering probe must reach the decision WHOLE: flattening it to its record list drops '
+    + 'whether the collection was proved complete, which is what makes a non-match mean anything')
   assert.match(source.slice(at), /ledgerSettlements,/, 'and it must reach the decision')
+
+  // o3d-r948 r6: AND NOTHING BESIDE THE RECORDS. r5 plumbed the probe's organisation through here so
+  // the decision's exclusion set could be scoped to it. That exclusion is gone, and so is the
+  // provenance — which was itself unsound, being two token snapshots either side of the fetch. A
+  // reader who finds this pair reinstated should read bd o3d-llyw before trusting it.
+  const enqueueCode = source.split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n')
+  assert.match(enqueueCode, /ledgerSettlements,/, 'the comment strip must leave the enqueue code standing')
+  assert.doesNotMatch(enqueueCode, /ledgerConnectionProvenance/,
+    'no connection provenance may be plumbed into the decision again without the evidence o3d-llyw names')
 
   // The two fields the unresolved rule is decided from must actually be read off the stored row.
   // Without paymentDate no attempt can ever be matched, so every receipt beside a failed row is
@@ -423,6 +606,27 @@ test('sales.ts asks the ledger exactly when the decision needs it (o3d-0m56)', a
     'the attempt date must be carried from the shared money-post date rule')
   assert.match(loaderBody, /couldHaveReachedLedger: attemptCouldHaveReachedTheLedger\('INVOICE_PAYMENT', r\.payload\)/,
     'and postability judged by the SAME rule the retry guard uses')
+
+  // o3d-r948 r6: AND THE ROW'S ORIGIN IS NO LONGER READ AT ALL.
+  //
+  // r5 selected `connectionProvenance` and `backReferenceEvidenceCompactedAt` and put a four-state
+  // origin stamp on every row, so the exclusion set could prove a recorded id belonged to the
+  // organisation the probe answered from. Nothing excludes a settlement record now, so the loader
+  // reads neither — and this asserts the absence rather than merely stopping asserting the presence,
+  // because a half-restored version (the column selected, the stamp trusted) is exactly the shape
+  // Codex found could still authorise a duplicate payment. See bd o3d-llyw.
+  //
+  // ASSERTED ON THE CODE, NOT ON THE PROSE. The note above this in the loader explains the removal
+  // and necessarily spells the column's name, so a bare source match would trip on the sentence that
+  // records the rule — and would have to be relaxed until it matched nothing at all. Comment lines
+  // are stripped first, and the strip is proved to have left the code behind by the two matches
+  // above still passing against `loaderCode`.
+  const loaderCode = loaderBody.split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n')
+  assert.match(loaderCode, /settlementBasis: true,/, 'the strip must leave the loader\'s actual selects standing')
+  assert.doesNotMatch(loaderCode, /connectionProvenance/,
+    'the loader must not resurrect a row origin without the issuer evidence o3d-llyw names')
+  assert.doesNotMatch(loaderCode, /readAccountingOriginRecord/,
+    'nor read one through the origin reader')
 
   // The refusal has to be surfaced, not swallowed: an operator who is not told will record the
   // receipt again.
@@ -504,17 +708,17 @@ test('the WHOLE decision is re-runnable for the check inside the write (o3d-0m56
   // A sibling that appeared since the first decision consumes the invoice's remaining room.
   const raced = decideInvoicePaymentRegistration({
     ...base,
-    existing: [{ status: 'PENDING', amount: 100, paymentId: 'pay-other', accountingInvoiceId: 'INV-1' }],
+    existing: [live({ status: 'PENDING', amount: 100, paymentId: 'pay-other', accountingInvoiceId: 'INV-1' })],
   })
   assert.equal(raced.register === false && raced.refusal, 'WOULD_OVERPAY')
-  assert.equal(raced.register === false && raced.alreadyRegistered, 100)
+  assert.equal(raced.register === false && raced.alreadyRegistered?.toFixed(), '100')
 
   // And an attempt that turned unresolved in the same window is still refused on its own grounds,
   // which capacity arithmetic cannot see: a FAILED row consumes no capacity.
   const unresolvedNow = decideInvoicePaymentRegistration({
     ...base,
     existing: [unresolved()],
-    ledgerSettlements: [{ amount: 100, date: '2026-08-01' }],
+    ledgerSettlements: answered([{ amount: toDecimal(100), date: '2026-08-01' }]),
   })
   assert.equal(unresolvedNow.register === false && unresolvedNow.refusal, 'UNRESOLVED_PAYMENT_ATTEMPT')
 })
@@ -540,7 +744,7 @@ test('the registration re-decides INSIDE the write transaction, under both locks
 
   const orderLockAt = body.indexOf('await lockSalesOrder(tx, params.orderId)')
   const scopeLockAt = body.indexOf('await lockFollowUpScope(tx, {')
-  const readAt = body.indexOf('loadInvoicePaymentSyncRows(params.orderId, connectorId, tx)')
+  const readAt = body.indexOf('loadInvoicePaymentSyncRows(params.orderId, connectorId, so.currency, tx)')
   const decideAt = body.indexOf('decideInvoicePaymentRegistration({')
   const queueAt = body.indexOf('queueAccountingSyncTxWithOutcome(tx, {')
   // o3d-ekn8 r2: and the PINNED document is re-read through the same transaction, after the locks and
@@ -581,10 +785,10 @@ test('o3d-hbgo: a registration that names NO document still consumes capacity', 
   const d = decideInvoicePaymentRegistration({
     ...base,
     accountingInvoiceId: 'INV-2',
-    existing: [{ status: 'SYNCED', amount: 100, paymentId: 'pay-old', accountingInvoiceId: null }],
+    existing: [live({ status: 'SYNCED', amount: 100, paymentId: 'pay-old', accountingInvoiceId: null })],
   })
   assert.equal(d.register === false && d.refusal, 'WOULD_OVERPAY')
-  assert.equal(d.register === false && d.alreadyRegistered, 100)
+  assert.equal(d.register === false && d.alreadyRegistered?.toFixed(), '100')
 })
 
 // ---------------------------------------------------------------------------
@@ -598,7 +802,7 @@ test('o3d-ekn8: a receipt with no sync row at all is the one waiting to be regis
   // reached the ledger, and nothing came back for it once the invoice posted.
   const awaiting = selectReceiptsAwaitingRegistration({
     receipts,
-    existing: [{ status: 'SYNCED', amount: 40, paymentId: 'pay-1', accountingInvoiceId: 'INV-1' }],
+    existing: [live({ status: 'SYNCED', amount: 40, paymentId: 'pay-1', accountingInvoiceId: 'INV-1' })],
     accountingInvoiceId: 'INV-1',
   })
   assert.deepEqual(awaiting.map((r) => r.id), ['pay-2'])
@@ -610,7 +814,7 @@ test('o3d-ekn8: a receipt whose own attempt FAILED is left to the retry path, no
   // post under a token Xero has never seen — the o3d-h2wx double payment.
   const awaiting = selectReceiptsAwaitingRegistration({
     receipts,
-    existing: [{ status: 'FAILED', amount: 40, paymentId: 'pay-1', accountingInvoiceId: 'INV-1' }],
+    existing: [live({ status: 'FAILED', amount: 40, paymentId: 'pay-1', accountingInvoiceId: 'INV-1' })],
     accountingInvoiceId: 'INV-1',
   })
   assert.deepEqual(awaiting.map((r) => r.id), ['pay-2'])
@@ -622,7 +826,7 @@ test('o3d-ekn8: an UNATTRIBUTED live registration suppresses every receipt on th
   // "possibly that one" — for all of them.
   const awaiting = selectReceiptsAwaitingRegistration({
     receipts,
-    existing: [{ status: 'SYNCED', amount: 100, paymentId: null, accountingInvoiceId: 'INV-1' }],
+    existing: [live({ status: 'SYNCED', amount: 100, paymentId: null, accountingInvoiceId: 'INV-1' })],
     accountingInvoiceId: 'INV-1',
   })
   assert.deepEqual(awaiting, [])
@@ -633,7 +837,7 @@ test('o3d-ekn8: an unattributed row that is CANCELLED holds nothing back', () =>
   // covers an unidentified receipt. Treating it as one would strand every receipt on the order.
   const awaiting = selectReceiptsAwaitingRegistration({
     receipts,
-    existing: [{ status: 'CANCELLED', amount: 100, paymentId: null, accountingInvoiceId: 'INV-1' }],
+    existing: [live({ status: 'CANCELLED', amount: 100, paymentId: null, accountingInvoiceId: 'INV-1' })],
     accountingInvoiceId: 'INV-1',
   })
   assert.deepEqual(awaiting.map((r) => r.id), ['pay-1', 'pay-2'])
@@ -646,7 +850,7 @@ test('[o3d-ekn8 r3] a row naming a RETIRED document does not speak for its recei
   // gate that selects nothing has nothing to report.
   const awaiting = selectReceiptsAwaitingRegistration({
     receipts,
-    existing: [{ status: 'SYNCED', amount: 100, paymentId: 'pay-1', accountingInvoiceId: 'INV-1' }],
+    existing: [live({ status: 'SYNCED', amount: 100, paymentId: 'pay-1', accountingInvoiceId: 'INV-1' })],
     accountingInvoiceId: 'INV-2',
   })
   assert.deepEqual(awaiting.map((r) => r.id), ['pay-1', 'pay-2'])
@@ -657,7 +861,7 @@ test('[o3d-ekn8 r3] an UNATTRIBUTED live row on a RETIRED document suppresses no
   // match to a receipt still says nothing about a document it was not made against.
   const awaiting = selectReceiptsAwaitingRegistration({
     receipts,
-    existing: [{ status: 'SYNCED', amount: 100, paymentId: null, accountingInvoiceId: 'INV-1' }],
+    existing: [live({ status: 'SYNCED', amount: 100, paymentId: null, accountingInvoiceId: 'INV-1' })],
     accountingInvoiceId: 'INV-2',
   })
   assert.deepEqual(awaiting.map((r) => r.id), ['pay-1', 'pay-2'])
@@ -668,7 +872,7 @@ test('[o3d-ekn8 r3] a row that names NO document keeps suppressing, whichever in
   // out. Mirrors the read side, which counts an unanchored row against the current invoice.
   const awaiting = selectReceiptsAwaitingRegistration({
     receipts,
-    existing: [{ status: 'SYNCED', amount: 100, paymentId: 'pay-1', accountingInvoiceId: null }],
+    existing: [live({ status: 'SYNCED', amount: 100, paymentId: 'pay-1', accountingInvoiceId: null })],
     accountingInvoiceId: 'INV-2',
   })
   assert.deepEqual(awaiting.map((r) => r.id), ['pay-2'])
@@ -688,9 +892,9 @@ test('[o3d-ekn8 r3] a row that names NO document keeps suppressing, whichever in
 test('[o3d-anu8] a live OPERATOR-ASSERTED registration refuses the arithmetic instead of trusting its amount', () => {
   const d = decideInvoicePaymentRegistration({
     ...base,
-    paymentAmount: 40,
-    ledgerTotal: 100,
-    existing: [{
+    paymentAmount: toDecimal(40),
+    ledgerTotal: toDecimal(100),
+    existing: [live({
       status: 'SYNCED',
       // 60 + 40 = 100 exactly, so WOULD_OVERPAY does not fire and the receipt sails through on a
       // number nothing verified. That is the whole point: the sum is self-consistent and meaningless.
@@ -699,7 +903,7 @@ test('[o3d-anu8] a live OPERATOR-ASSERTED registration refuses the arithmetic in
       accountingInvoiceId: 'INV-1',
       externalTransactionId: 'PAY-TYPED',
       settlementBasis: 'OPERATOR_ASSERTION',
-    }],
+    })],
   })
   assert.equal(d.register, false)
   assert.equal(d.register === false && d.refusal, 'LEDGER_AMOUNT_ASSERTED')
@@ -713,16 +917,16 @@ test('[o3d-anu8] the identical row written back by the CONNECTOR still registers
   // refusing every ordinary deposit-plus-balance. Same numbers, settlementBasis NULL.
   const d = decideInvoicePaymentRegistration({
     ...base,
-    paymentAmount: 40,
-    ledgerTotal: 100,
-    existing: [{
+    paymentAmount: toDecimal(40),
+    ledgerTotal: toDecimal(100),
+    existing: [live({
       status: 'SYNCED',
       amount: 60,
       paymentId: 'pay-old',
       accountingInvoiceId: 'INV-1',
       externalTransactionId: 'PAY-REAL',
       settlementBasis: null,
-    }],
+    })],
   })
   assert.equal(d.register, true)
 })

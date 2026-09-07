@@ -20,7 +20,12 @@ import {
  * worth waking anyone for, and calling the first one a fault is how alerts get ignored.
  */
 
-const base = { paidLocally: true, syncEnabled: true, documentPosted: true }
+/**
+ * o3d-6yho (3 of 3): every case here states a CURRENCY, because the part/over settlement band is now
+ * half one minor unit of it and both production callers pass one. GBP keeps the sub-penny cases below
+ * at the half-penny they were written against; the cases about the rule itself say so.
+ */
+const base = { paidLocally: true, syncEnabled: true, documentPosted: true, currency: 'GBP' }
 const row = (over: Partial<PaymentSyncRow> = {}): PaymentSyncRow => ({ status: 'SYNCED', externalTransactionId: 'PAY-1', ...over })
 
 test('a confirmed payment is the only fully settled state', () => {
@@ -270,7 +275,7 @@ test('a confirmed payment with no recorded amount makes the SUM unknown, not zer
 
 test('a tax-exclusive invoice posts at the order total', () => {
   for (const importedFromShop of [true, false]) {
-    assert.equal(ledgerSalesInvoiceTotalForeign({ totalForeign: 120, taxForeign: 20, pricesIncludeVat: false, importedFromShop }), 120)
+    assert.equal(ledgerSalesInvoiceTotalForeign({ totalForeign: 120, taxForeign: 20, pricesIncludeVat: false, importedFromShop }).toFixed(), '120')
   }
 })
 
@@ -280,7 +285,7 @@ test('an IMPORTED tax-inclusive invoice now posts at GROSS too, so the receipt i
   // ex-tax on both conventions and Xero adds the tax, so the invoice totals to the order's 120 and a
   // gross receipt of 120 settles it exactly. Answering 100 here would refuse that ordinary receipt as
   // an over-payment.
-  assert.equal(ledgerSalesInvoiceTotalForeign({ totalForeign: 120, taxForeign: 20, pricesIncludeVat: true, importedFromShop: true }), 120)
+  assert.equal(ledgerSalesInvoiceTotalForeign({ totalForeign: 120, taxForeign: 20, pricesIncludeVat: true, importedFromShop: true }).toFixed(), '120')
   const v = settlementStatus({ ...base, payment: aggregatePaymentSyncRows([row({ amount: 120 })])!, totalForeign: 120 })
   assert.equal(v.status, 'SETTLED')
 })
@@ -289,7 +294,7 @@ test('a tax-inclusive order raised IN IMS posts at GROSS — unchanged, and now 
   // queueSalesInvoiceForOrder sends the gross unit prices (and grosses shipping up) before flagging them
   // inclusive. Keying on pricesIncludeVat alone understated the invoice, and the over-pay guard then
   // refused every ordinary VAT receipt it exists to allow.
-  assert.equal(ledgerSalesInvoiceTotalForeign({ totalForeign: 120, taxForeign: 20, pricesIncludeVat: true, importedFromShop: false }), 120)
+  assert.equal(ledgerSalesInvoiceTotalForeign({ totalForeign: 120, taxForeign: 20, pricesIncludeVat: true, importedFromShop: false }).toFixed(), '120')
 })
 
 test('a PART-registered receipt is still measured against the ledger total, not waved through', () => {

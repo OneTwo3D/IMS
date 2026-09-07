@@ -113,11 +113,19 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 
 import { storedBodyMayHaveReachedTheLedger } from '@/lib/domain/accounting/followup-idempotency'
+import { payloadRegisteredAmount } from '@/lib/domain/accounting/registered-amount'
 import { attemptProvenNeverMade } from '@/lib/domain/accounting/money-attempt-provenance'
 import { heldClaimWhere, type HeldClaim } from '@/lib/domain/accounting/sync-claim-fence'
-import { CAPACITY_EPSILON } from '@/lib/domain/accounting/invoice-payment-registration'
 import { isOperatorAssertedSettlement } from '@/lib/domain/accounting/sync-row-settlement'
 import { ledgerSalesInvoiceTotalForeign } from '@/lib/domain/accounting/settlement-status'
+import {
+  addMoney,
+  compareDecimal,
+  ledgerAmountEpsilon,
+  subtractMoney,
+  toDecimal,
+  type Decimal,
+} from '@/lib/domain/math/decimal'
 
 /** The only status that asserts the remote call happened. */
 export const POSTED_INVOICE_PAYMENT_STATUSES = ['SYNCED'] as const
@@ -138,8 +146,18 @@ export type PostedInvoicePaymentRegistration = {
    * not a reading of the ledger — see the SYNCED arm of `decideInvoicePaymentPost`.
    */
   settlementBasis: string | null
-  /** What was sent, in the document currency. Null when the payload did not record it. */
-  amount: number | null
+  /**
+   * WHAT THIS ROW REGISTERED, EXACTLY, IN THE DOCUMENT'S CURRENCY (o3d-6abj). `null` = this payload
+   * will not say, and the caller must read that as "unknowable", never as zero.
+   *
+   * A `Decimal`, and read through the ONE reader — `payloadRegisteredAmount` — so the exact decimal
+   * string o3d-1xq8 writes beside the JSON number is preferred here as well as on the coverage
+   * route. It was not, and that was the defect: this guard summed the doubles while the reader two
+   * modules away summed the strings, so one rule had two answers. `null` therefore also covers a
+   * PRESENT-BUT-UNREADABLE string and a payload stating a DIFFERENT currency: both are refusals
+   * rather than a fall back to the lossy field, which is the whole point of the string existing.
+   */
+  registeredAmount: Decimal | null
   /** The ledger document it settled. Null on rows queued before the payload recorded it. */
   accountingInvoiceId: string | null
   /**
@@ -195,12 +213,12 @@ export type InvoicePaymentPostRefusal =
   | 'WOULD_OVERPAY'
 
 export type InvoicePaymentPostVerdict =
-  | { post: true; alreadyPosted: number; ledgerTotal: number }
+  | { post: true; alreadyPosted: Decimal; ledgerTotal: Decimal }
   | {
       post: false
       refusal: InvoicePaymentPostRefusal
-      alreadyPosted: number | null
-      ledgerTotal: number
+      alreadyPosted: Decimal | null
+      ledgerTotal: Decimal
       /** The rows whose remote outcome is unknown. Empty unless the refusal is the ambiguous one. */
       ambiguousIds: string[]
     }
@@ -213,8 +231,18 @@ export function decideInvoicePaymentPost(input: {
   /** THIS entry's sync-log id. Its own row must never count against it. */
   entryId: string
   accountingInvoiceId: string
-  amount: number
-  ledgerTotal: number
+  /** What this entry is about to send, EXACTLY (o3d-6abj). See `guardInvoicePaymentCapacity`. */
+  amount: Decimal
+  /** The ledger's copy of the invoice, as the stored `Decimal` and not a conversion of it. */
+  ledgerTotal: Decimal
+  /**
+   * The DOCUMENT'S CURRENCY, and it is here to size the band below (o3d-6yho, 1 of 3) rather than to
+   * be compared with anything. `ledgerAmountEpsilon` is half one minor unit of it; the constant this
+   * replaced was a flat 0.005, which is half a penny in GBP and FIVE whole minor units of over-
+   * payment in a Gulf dinar. This test reads `amount > remaining + band`, so a LARGER band ADMITS
+   * more — the one direction that ends in a second payment on the ledger.
+   */
+  currency: string
   /** Every INVOICE_PAYMENT sync row for this order on this connector, including this entry's own. */
   registrations: PostedInvoicePaymentRegistration[]
 }): InvoicePaymentPostVerdict {
@@ -334,7 +362,12 @@ export function decideInvoicePaymentPost(input: {
     }
   }
 
-  if (posted.some((row) => typeof row.amount !== 'number')) {
+  // o3d-6abj: `registeredAmount` is `payloadRegisteredAmount`'s answer, so `null` here now covers
+  // three things and all three are the same refusal — the payload records no amount, it records an
+  // exact decimal string that will not parse, or it states a currency that is not this document's.
+  // The last two used to fall back to the JSON number, which is precisely the "reverting to the
+  // double" the string exists to remove.
+  if (posted.some((row) => row.registeredAmount == null)) {
     return {
       post: false,
       refusal: 'LEDGER_AMOUNT_UNKNOWN',
@@ -344,8 +377,26 @@ export function decideInvoicePaymentPost(input: {
     }
   }
 
-  const alreadyPosted = posted.reduce((sum, row) => sum + (row.amount as number), 0)
-  if (input.amount > input.ledgerTotal - alreadyPosted + CAPACITY_EPSILON) {
+  // ARITHMETIC IN DECIMAL, END TO END (o3d-6abj, Codex HIGH).
+  //
+  // Every term here used to be a double: `Number(order.totalForeign)` for the whole, a `+` reduce
+  // over the payload numbers for the parts, and the entry's own JSON number for the receipt. Above
+  // about 4.5e13 the spacing between neighbouring doubles exceeds the band this test allows, and the
+  // conversion is not one-directional — Codex's reproduction is a stored total of
+  // 35184372088832.0040 against a receipt of 35184372088832.01, which are 0.006 apart and MUST
+  // refuse, converting to the SAME double. `alreadyPosted` is 0, both operands are equal, the test
+  // reads `x > x + band`, and the guard approves an over-settlement of a whole minor unit.
+  //
+  // Money that cannot be stated cannot be measured, so nothing is converted: the total arrives as
+  // the stored `Decimal`, each part as the exact decimal its payload states, and the receipt as the
+  // figure the entry's own payload states — see `guardInvoicePaymentCapacity`, which also refuses
+  // unless that figure is the one the connector is about to put on the wire.
+  const alreadyPosted = posted.reduce(
+    (sum, row) => addMoney(sum, row.registeredAmount as Decimal),
+    toDecimal(0),
+  )
+  const remaining = subtractMoney(input.ledgerTotal, alreadyPosted)
+  if (compareDecimal(input.amount, addMoney(remaining, ledgerAmountEpsilon(input.currency))) > 0) {
     return {
       post: false,
       refusal: 'WOULD_OVERPAY',
@@ -370,19 +421,14 @@ export type InvoicePaymentPostGuardResult =
       kind: 'refused'
       refusal: InvoicePaymentPostRefusal
       message: string
-      alreadyPosted: number | null
-      ledgerTotal: number
+      alreadyPosted: Decimal | null
+      ledgerTotal: Decimal
       ambiguousIds: string[]
     }
   /** Could not be measured. Retryable, and NOT posted — fail closed. */
   | { post: false; kind: 'unmeasurable'; message: string }
 
 type CapacityClient = Pick<Prisma.TransactionClient, 'salesOrder' | 'accountingSyncLog'>
-
-function payloadNumber(payload: unknown, field: string): number | null {
-  const record = (payload && typeof payload === 'object' ? payload : {}) as Record<string, unknown>
-  return typeof record[field] === 'number' ? (record[field] as number) : null
-}
 
 function payloadString(payload: unknown, field: string): string | null {
   const record = (payload && typeof payload === 'object' ? payload : {}) as Record<string, unknown>
@@ -403,7 +449,18 @@ export async function guardInvoicePaymentCapacity(
     referenceType: string
     referenceId: string
     accountingInvoiceId: string
+    /** The JSON number the connector is about to put in the request body. */
     amount: number
+    /**
+     * THE STORED PAYLOAD THE CONNECTOR IS BUILDING THAT REQUEST FROM (o3d-6abj).
+     *
+     * Passed in rather than re-read here, and that is the point: the figure this guard measures has
+     * to be the figure that goes on the wire, and the only object that can establish that is the one
+     * the caller is reading `amount` out of. A re-read could hand back a row someone has since
+     * rewritten, and the guard would then have measured a different payment from the one it
+     * authorises.
+     */
+    payload: unknown
   },
 ): Promise<InvoicePaymentPostGuardResult> {
   // An INVOICE_PAYMENT is always order-scoped today. If one ever is not, its capacity cannot be
@@ -420,8 +477,9 @@ export async function guardInvoicePaymentCapacity(
   }
 
   let order: {
-    totalForeign: unknown
-    taxForeign: unknown
+    currency: string
+    totalForeign: Prisma.Decimal
+    taxForeign: Prisma.Decimal
     pricesIncludeVat: boolean
     shoppingLinks: { connector: string }[]
   } | null
@@ -438,6 +496,11 @@ export async function guardInvoicePaymentCapacity(
       client.salesOrder.findUnique({
         where: { id: params.referenceId },
         select: {
+          // o3d-6abj / o3d-6yho: the ORDER'S CURRENCY, asked for explicitly. Two things below need
+          // it and neither can guess: `payloadRegisteredAmount` will not read a row's amount without
+          // knowing what unit the sum is in, and `ledgerAmountEpsilon` sizes the over-payment band
+          // from this document's minor unit rather than from a hard-coded half-penny.
+          currency: true,
           totalForeign: true,
           taxForeign: true,
           pricesIncludeVat: true,
@@ -487,14 +550,17 @@ export async function guardInvoicePaymentCapacity(
     }
   }
 
+  // o3d-6abj: the STORED `Decimal`, handed straight to a function that now takes one. The
+  // `Number(order.totalForeign)` that used to be written here is the first half of Codex's
+  // reproduction — see the arithmetic in `decideInvoicePaymentPost`.
   const ledgerTotal = ledgerSalesInvoiceTotalForeign({
-    totalForeign: Number(order.totalForeign),
-    taxForeign: Number(order.taxForeign),
+    totalForeign: order.totalForeign,
+    taxForeign: order.taxForeign,
     pricesIncludeVat: order.pricesIncludeVat,
     // Only an IMPORTED tax-inclusive invoice posts at NET (o3d-cyn); an order raised in IMS posts gross.
     importedFromShop: order.shoppingLinks.length > 0,
   })
-  if (!Number.isFinite(ledgerTotal)) {
+  if (!ledgerTotal.isFinite()) {
     return {
       post: false,
       kind: 'unmeasurable',
@@ -504,16 +570,48 @@ export async function guardInvoicePaymentCapacity(
     }
   }
 
+  // WHAT THIS ENTRY IS ABOUT TO SEND, EXACTLY — AND A PROOF THAT IT IS WHAT WILL GO ON THE WIRE
+  // (o3d-6abj).
+  //
+  // `params.amount` is the JSON number the connector read out of `params.payload` and will put in the
+  // request body. The exact figure is in the SAME payload, in the field o3d-1xq8 added, and this
+  // guard reads it through the one reader every other consumer of that field uses — so a
+  // present-but-unreadable string refuses HERE too rather than quietly falling back to the double.
+  // A payload that names no currency, or names another one, also refuses: an amount whose unit is
+  // unknown cannot be subtracted from a total stated in the order's.
+  //
+  // The equality test is not ceremony. A guard that measures one figure while the connector sends
+  // another has measured nothing, and the two payload fields are only guaranteed to agree by the
+  // writer's round-trip refusal — which says nothing about a row whose payload was written by
+  // something else, edited by hand, or produced by a build that predates the guarantee. If they
+  // disagree, the honest answer is that this entry's size is not established, which is the existing
+  // `unmeasurable` arm: retryable, and nothing is sent.
+  const amount = payloadRegisteredAmount(params.payload, order.currency)
+  if (amount == null || !amount.eq(toDecimal(params.amount))) {
+    return {
+      post: false,
+      kind: 'unmeasurable',
+      message:
+        `Sync entry ${params.entryId} does not state the amount it is about to register against `
+        + `invoice ${params.accountingInvoiceId} in ${order.currency} exactly — `
+        + `${amount == null ? 'its payload records no readable amount in that currency' : `its payload says ${amount.toFixed()} while the request carries ${params.amount}`}`
+        + `. IMS cannot tell whether this payment would over-settle the invoice, so nothing was sent.`,
+    }
+  }
+
   const verdict = decideInvoicePaymentPost({
     entryId: params.entryId,
     accountingInvoiceId: params.accountingInvoiceId,
-    amount: params.amount,
+    amount,
     ledgerTotal,
+    currency: order.currency,
     registrations: registrations.map((row) => ({
       id: row.id,
       status: row.status,
       settlementBasis: row.settlementBasis,
-      amount: payloadNumber(row.payload, 'amount'),
+      // o3d-6abj: the exact decimal string in preference to the JSON number, through the SAME reader
+      // the coverage route uses. `null` when the payload will not say — never the double instead.
+      registeredAmount: payloadRegisteredAmount(row.payload, order.currency),
       accountingInvoiceId: payloadString(row.payload, 'accountingInvoiceId'),
       paymentId: payloadString(row.payload, 'paymentId'),
       bodyCouldHavePosted: storedBodyMayHaveReachedTheLedger('INVOICE_PAYMENT', row.payload),
@@ -526,7 +624,10 @@ export async function guardInvoicePaymentCapacity(
   // has decided it cannot resolve — and an operator who is only told "refused" will re-record the
   // receipt, which is the one action that can turn an ambiguity into a duplicate payment.
   const message = ((): string => {
-    const head = `Refused to register a payment of ${params.amount.toFixed(2)} against invoice `
+    // o3d-6abj: the EXACT digits, not `toFixed(2)`. The whole reason this refusal now fires is that
+    // two figures a penny-rounded rendering shows as identical are not, and an operator sent to
+    // reconcile against the ledger needs the numbers that actually differ.
+    const head = `Refused to register a payment of ${amount.toFixed()} against invoice `
       + `${params.accountingInvoiceId}: `
     switch (verdict.refusal) {
       case 'LEDGER_AMOUNT_UNKNOWN':
@@ -563,8 +664,8 @@ export async function guardInvoicePaymentCapacity(
           + `is already settled by it and no further payment should be registered.`
       case 'WOULD_OVERPAY':
         return head
-          + `the ledger's copy of this invoice is for ${verdict.ledgerTotal.toFixed(2)} with `
-          + `${(verdict.alreadyPosted ?? 0).toFixed(2)} already registered against it, so this payment `
+          + `the ledger's copy of this invoice is for ${verdict.ledgerTotal.toFixed()} with `
+          + `${(verdict.alreadyPosted ?? toDecimal(0)).toFixed()} already registered against it, so this payment `
           + `would over-settle it. Nothing was sent — reconcile the invoice in the ledger and register `
           + `the balance there by hand if it is genuinely owed.`
     }

@@ -1,0 +1,27 @@
+-- o3d-psrx r5, Codex HIGH 2: THE INDEX THAT LETS THE WITHHELD-REVERSAL SCAN DROP ITS AGE BOUND.
+--
+-- `openWithheldDocuments` used to bound itself at thirty days against `activity_logs."createdAt"`,
+-- and that bound is a work-loss bug: a poll outage longer than the horizon — a disabled connector, an
+-- expired credential, a maintenance window, a poller erroring every cycle — makes an unresolved
+-- reversal marker disappear from the queue, and the reversal watermark has already moved past the
+-- document, so nothing ever brings it back. The scan is now over ALL still-open markers, whatever
+-- their age.
+--
+-- The horizon was doing one legitimate job as well: keeping a grouped aggregate off an activity log
+-- that is overwhelmingly something else. This index does that job properly. `action` leads because
+-- the six withheld-marker names are what the predicate selects on and they are a vanishingly small
+-- fraction of the table; (entityType, entityId) is the grouping the aggregate reduces to one row per
+-- document; `createdAt` supplies both `MAX(...)` values and the oldest-first ordering from the index
+-- rather than from a sort.
+--
+-- It is also what makes the RETENTION side of the same finding cheap: lib/activity-log-cleanup.ts now
+-- decides a marker row's fate from the document's other markers (is this still the newest open one;
+-- does a closure exist at least as new), which is two correlated lookups on exactly this key.
+--
+-- Plain CREATE INDEX rather than CONCURRENTLY: Prisma runs each migration in a transaction and
+-- CONCURRENTLY cannot run inside one. `activity_logs` is append-mostly and the write path is a single
+-- INSERT per logged event, so the build's ACCESS SHARE-blocking window is a brief write pause on a
+-- log table, not on a money path. IF NOT EXISTS so a database that has been given the index by hand
+-- ahead of a cutover is not a failed migration.
+CREATE INDEX IF NOT EXISTS "activity_logs_action_entity_created_idx"
+ON "activity_logs" ("action", "entityType", "entityId", "createdAt");

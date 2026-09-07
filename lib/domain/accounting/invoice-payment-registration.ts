@@ -15,9 +15,22 @@
 
 import {
   classifyLedgerSettlement,
-  type LedgerSettlementRecord,
+  type LedgerSettlementProbe,
 } from './ledger-settlement-evidence'
+import {
+  exactAmountReadingOrLegacy,
+  statedAmountOnly,
+  type ExactAmountReading,
+} from '@/lib/domain/accounting/registered-amount'
 import { isOperatorAssertedSettlement } from './sync-row-settlement'
+import {
+  addMoney,
+  compareDecimal,
+  ledgerAmountEpsilon,
+  subtractMoney,
+  toDecimal,
+  type Decimal,
+} from '@/lib/domain/math/decimal'
 
 export type InvoicePaymentRegistrationRefusal =
   /** Nothing is expected to post: the connector is off. Not a fault, and not worth a warning. */
@@ -61,8 +74,8 @@ export type InvoicePaymentRegistrationDecision =
   | {
       register: false
       refusal: InvoicePaymentRegistrationRefusal
-      alreadyRegistered?: number
-      ledgerTotal?: number
+      alreadyRegistered?: Decimal
+      ledgerTotal?: Decimal
       /** Why an unresolved attempt could not be cleared, for the operator warning. */
       detail?: string
     }
@@ -70,8 +83,27 @@ export type InvoicePaymentRegistrationDecision =
 /** One INVOICE_PAYMENT sync row, reduced to what the decision depends on. */
 export type ExistingInvoicePaymentSync = {
   status: 'PENDING' | 'PROCESSING' | 'SYNCED' | 'FAILED' | 'CANCELLED'
-  /** What was sent, in the document currency. Null when the payload did not record it. */
+  /**
+   * WHAT WAS SENT, as the JSON number the connector put on the wire and the ledger therefore holds.
+   *
+   * Kept, and NOT the field the capacity arithmetic reads (o3d-6abj). It is the right figure for
+   * the one question that compares against the LEDGER's own reply — `classifyLedgerSettlement`
+   * matches a probe record's amount to the attempt that may have created it — and the wrong one for
+   * summing parts against a stored `Decimal` total. See `registeredAmount`.
+   */
   amount?: number | null
+  /**
+   * WHAT WAS REGISTERED, EXACTLY, in the ORDER's currency — `payloadRegisteredAmount`'s answer, and
+   * the only field the capacity sum below reads (o3d-6abj).
+   *
+   * Anything but `stated` = this payload will not say, which the sum must read as UNKNOWABLE and
+   * never as zero. It covers a payload with no amount, one whose exact decimal string does not parse,
+   * and one stating a different currency — all three refuse rather than fall back to the double.
+   *
+   * o3d-r948 r2 (Codex HIGH 2): and it is a READING, because the unresolved-attempt description
+   * below DOES hold a lossy number beside it and was falling back to it for the last two.
+   */
+  registeredAmount?: ExactAmountReading
   /** The date that attempt sent, `YYYY-MM-DD`. Null when the payload did not pin one. */
   paymentDate?: string | null
   /** The local Payment row it was queued for; null on rows queued before that was recorded. */
@@ -183,12 +215,18 @@ export function retiredDocumentInvoicePaymentAttempts(
 }
 
 /**
- * Sub-penny slack, so an exact settlement is not refused by float noise. Exported because the
- * POST-SITE capacity guard (invoice-payment-capacity.ts) must apply the identical tolerance: two
- * guards on one arithmetic that round differently would refuse at the enqueue and allow at the post,
- * or the reverse.
+ * `CAPACITY_EPSILON` WAS HERE, AND IS GONE (o3d-6yho, 1 of 3).
+ *
+ * It was a flat `0.005`, exported so the POST-SITE guard would apply the IDENTICAL tolerance — the
+ * right instinct, and the wrong shape for it. Half a penny is half one minor unit in GBP and FIVE
+ * whole minor units in a Gulf dinar, fifty in CLF, and this test reads
+ * `paymentAmount > remaining + band`: a larger band ADMITS more over-registration, which is the one
+ * direction that ends in a second payment on a supplier's ledger.
+ *
+ * The tolerance is now `ledgerAmountEpsilon(orderCurrency)` — half one minor unit of THIS document's
+ * currency — and both guards derive it from that one function rather than from a shared constant. So
+ * they still cannot round differently, and they are now right in every currency instead of in one.
  */
-export const CAPACITY_EPSILON = 0.005
 
 export function decideInvoicePaymentRegistration(input: {
   syncEnabled: boolean
@@ -196,7 +234,8 @@ export function decideInvoicePaymentRegistration(input: {
   accountingInvoiceId: string | null
   orderCurrency: string
   paymentCurrency: string
-  paymentAmount: number
+  /** The receipt being registered, as the stored `Decimal` and never a conversion of it (o3d-6abj). */
+  paymentAmount: Decimal
   /** The local Payment row being registered — its own sync row must not count against it. */
   paymentId: string
   /** The bank account mapped for this method/currency, or null when none is. */
@@ -209,10 +248,28 @@ export function decideInvoicePaymentRegistration(input: {
    * Only consulted when an unresolved earlier attempt exists, and null then means REFUSE: an
    * unanswered question about money that may already be in the ledger is not permission to send
    * more. Callers with no unresolved attempts may pass null freely.
+   *
+   * o3d-obyd r31 (Codex HIGH 1) — THE WHOLE PROBE, NOT THE RECORDS PULLED OUT OF IT.
+   *
+   * This was `LedgerSettlementRecord[] | null`, and the enqueue path filled it with
+   * `probe.ok ? probe.records : null` — which drops everything the probe knows EXCEPT the list. That
+   * was harmless while the list was the whole answer. It stopped being harmless the moment the probe
+   * started reporting whether its collection is proved complete: this site would have had to
+   * reconstruct a probe to call the classifier, and the only value it could have put in
+   * `provedComplete` is a guess. Guessing `true` re-opens, one layer up, exactly the fail-open Codex
+   * found — a truncated ledger response authorising a second payment — with the added vice that the
+   * probe had the right answer and this boundary threw it away.
+   *
+   * So the boundary carries the answer intact. A field that is a flattened copy of a richer value is
+   * a place for the two to disagree, and this one is on the path that decides whether money moves.
    */
-  ledgerSettlements: LedgerSettlementRecord[] | null
-  /** What the ledger's copy of the invoice was built at (see ledgerSalesInvoiceTotalForeign). */
-  ledgerTotal: number
+  ledgerSettlements: LedgerSettlementProbe | null
+  /**
+   * What the ledger's copy of the invoice was built at (see ledgerSalesInvoiceTotalForeign), as the
+   * stored `Decimal` (o3d-6abj). `Number(order.totalForeign)` is one of the two operands Codex's
+   * reproduction collapses; the other is the sum below.
+   */
+  ledgerTotal: Decimal
 }): InvoicePaymentRegistrationDecision {
   if (!input.syncEnabled) return { register: false, refusal: 'SYNC_DISABLED' }
   if (!input.accountingInvoiceId) return { register: false, refusal: 'DOCUMENT_NOT_POSTED' }
@@ -257,8 +314,72 @@ export function decideInvoicePaymentRegistration(input: {
     }
     for (const attempt of unresolved) {
       const verdict = classifyLedgerSettlement(
-        { amount: attempt.amount ?? null, date: attempt.paymentDate ?? null, marker: attempt.settlementMarker ?? null },
-        { ok: true, records: input.ledgerSettlements },
+        // o3d-78rq — `registeredAmount` NOW, AND THE NUMBER'S OWN DECIMAL READING WHERE THERE IS NONE.
+        //
+        // o3d-6abj chose `amount` here with the reason "this compares against a figure the LEDGER
+        // reported, which is the JSON number that went on the wire". That reason held while the ledger
+        // side was a wire number too. It no longer is: the probe now reads each settlement through
+        // `readLedgerStatedAmount` and the record carries the ledger's exact stated figure, so the
+        // operand that meets it must be exact as well or the band is spent on a double subtraction
+        // again. The fallback is the same one `payloadExactAmount` takes for a row written before
+        // `amountDecimal` existed — `toDecimal(theNumber)`, the number's own decimal reading — so this
+        // site describes no attempt it could not describe before and withholds nothing extra.
+        //
+        // o3d-6yho: and the ORDER's currency, which is the currency this attempt was raised in — the
+        // decision has already refused a receipt whose currency differs from the order's, so there is
+        // no second answer to give here.
+        {
+          // o3d-r948 r2 (Codex HIGH 2) — AND THE FALLBACK IS THE TRI-STATE'S, NOT `??`'s. `??` reads
+          // "no exact figure was stated" out of a value that also means "one was and IMS refused it",
+          // and then spends the very number the refusal is about. `exactAmountReadingOrLegacy` is the
+          // one place allowed to substitute the number, and it substitutes for a silence only — a
+          // refused attempt describes itself as undescribable, which withholds.
+          amount: statedAmountOnly(exactAmountReadingOrLegacy(attempt.registeredAmount, attempt.amount)),
+          currency: input.orderCurrency,
+          date: attempt.paymentDate ?? null,
+          marker: attempt.settlementMarker ?? null,
+        },
+        // o3d-obyd r31: the probe AS THE PROBE ANSWERED IT. This used to rebuild one around the
+        // records, which is where the collection's proved-completeness would have been invented
+        // rather than carried — see the `ledgerSettlements` field.
+        input.ledgerSettlements,
+        // o3d-r948 r6 — THE EXCLUSION SET WAS THE THIRD ARGUMENT HERE, AND IS GONE.
+        //
+        // WHAT IT DID AND WHY IT WAS BUILT. `classifyLedgerSettlement` withholds on a settlement it
+        // cannot measure, and when that settlement belongs to a DIFFERENT row that already posted
+        // the withhold is PERMANENT: `unresolvedInvoicePaymentAttempts` judges only FAILED and
+        // CANCELLED rows, so a SYNCED row's payment is never matched to its own attempt here — it
+        // can only block, and it blocks every future receipt on the order for good. The set handed
+        // over the ledger ids IMS had recorded against this order's OTHER rows so those records
+        // could be skipped, and the permanent hold lifted.
+        //
+        // WHY IT IS NOT HERE ANY MORE. Four rounds narrowed it — immutable ids only (r3), never an
+        // operator-asserted id (r4), and only from a row raised against the organisation the probe
+        // answered from (r5) — and the fifth found two gaps that are not looseness in the reasoning
+        // but FACTS NOTHING IN THIS SYSTEM RECORDS:
+        //
+        //   • `row.origin` is stamped at ENQUEUE and `externalTransactionId` is minted at POST. A
+        //     reconnect between them detaches one from the other, and on QuickBooks nothing stops
+        //     it: that connector has no post-time realm enforcement at all (o3d-8prh, OPEN), and
+        //     `QboResponse` discards the `realmId` its own request resolved, so there is no issuer
+        //     to record even if this branch wanted to.
+        //   • The probe's organisation was read from two token snapshots either side of the fetch,
+        //     which cannot see an A→B→A reconnect across it.
+        //
+        // AND A THIRD, FOUND WHILE WEIGHING THOSE TWO, WHICH SHOWS THE SHAPE IS NOT QUICKBOOKS-ONLY:
+        // `buildAssertedReversalData` (payment-ledger-hold.ts, called from app/actions/sales.ts)
+        // writes an operator-supplied `externalTransactionId` onto an undecided row and leaves
+        // `settlementBasis` NULL — so r4's `isOperatorAssertedSettlement` filter reads it as
+        // connector-backed. That id IS verified against the ledger by a live read, but against
+        // whatever tenant is connected at VERIFICATION time, while the row's origin still names
+        // enqueue time. Same detachment, a Xero door, and one that landing o3d-8prh would not shut.
+        //
+        // SO THE ROUND-2 BEHAVIOUR IS RESTORED: AN UNMEASURABLE SETTLEMENT WITHHOLDS, WHATEVER ID
+        // ANY ROW OF OURS RECORDS. The permanent hold is real and is now tracked as its own problem
+        // (bd o3d-llyw) with the full cost of a sound exclusion written down. The trade is the one
+        // `classifyLedgerSettlement` has always stated: the cost of holding a genuine payment back
+        // is a visible refusal with a nameable remedy, and the cost of the alternative is a second
+        // payment on somebody's ledger, which is neither visible nor remediable.
       )
       if (verdict.outcome === 'clear') continue
       return {
@@ -340,11 +461,19 @@ export function decideInvoicePaymentRegistration(input: {
 
   // An unreadable amount cannot be arithmetic. Treating it as zero would let this receipt through on the
   // assumption that the ledger holds nothing, which is precisely what is not known.
-  if (live.some((r) => typeof r.amount !== 'number')) {
+  //
+  // o3d-6abj: asked of `registeredAmount`, so a row whose exact decimal string is present but will
+  // not parse, or which states a currency that is not this order's, refuses here rather than being
+  // read from the lossy JSON number beside it.
+  // o3d-r948 r2: anything but `stated` — the same two facts the null covered, and both still refuse.
+  if (live.some((r) => r.registeredAmount?.kind !== 'stated')) {
     return { register: false, refusal: 'LEDGER_AMOUNT_UNKNOWN', ledgerTotal: input.ledgerTotal }
   }
 
-  const alreadyRegistered = live.reduce((sum, r) => sum + (r.amount as number), 0)
+  const alreadyRegistered = live.reduce(
+    (sum, r) => addMoney(sum, (r.registeredAmount as { kind: 'stated'; amount: Decimal }).amount),
+    toDecimal(0),
+  )
   // What is LEFT of the invoice. With no live rows this is the whole invoice, which is exactly the
   // single-receipt rule this replaced — so the case that rule was written for still refuses, and now
   // the part-payment case does too. Refusing here names the numbers, where letting it through produces
@@ -355,7 +484,13 @@ export function decideInvoicePaymentRegistration(input: {
   // is left is every OTHER way a receipt can exceed its document (a credited or part-refunded invoice, a
   // mistyped amount), the invoices imported and posted before that fix, and now the deposit-plus-balance
   // case the receipt-scoped index deliberately admits.
-  if (input.paymentAmount > input.ledgerTotal - alreadyRegistered + CAPACITY_EPSILON) {
+  //
+  // o3d-6abj: IN DECIMAL, ON EVERY TERM. The same collapse Codex found at the post site is reachable
+  // here — a stored total of 35184372088832.0040 and a receipt of 35184372088832.01 are 0.006 apart
+  // and become the SAME double — and the two guards have to agree, so they now do the same
+  // arithmetic on the same kind of value rather than the same arithmetic on two roundings.
+  const remaining = subtractMoney(input.ledgerTotal, alreadyRegistered)
+  if (compareDecimal(input.paymentAmount, addMoney(remaining, ledgerAmountEpsilon(input.orderCurrency))) > 0) {
     return { register: false, refusal: 'WOULD_OVERPAY', alreadyRegistered, ledgerTotal: input.ledgerTotal }
   }
   return { register: true, bankAccountId: input.bankAccountId }

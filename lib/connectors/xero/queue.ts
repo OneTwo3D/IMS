@@ -21,6 +21,13 @@ import {
 } from '@/lib/domain/accounting/enqueue-order-guard'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 import { stampingCustodyOnCreate } from '@/lib/domain/accounting/money-attempt-provenance'
+import {
+  classifyPriorAttempts,
+  describeUnresolvedPriorAttempt,
+  isIdempotencyKeyIndexCollision,
+  PRIOR_ATTEMPT_SELECT,
+  priorAttemptsWhere,
+} from '@/lib/domain/accounting/prior-posting-evidence'
 // Type-only, so the facade's dynamic import of this module stays the only runtime edge between them.
 import type { ConnectorEnqueueOutcome } from '@/lib/accounting'
 
@@ -71,19 +78,36 @@ export async function queueXeroSync(params: {
   }, await activeAccountingIdProvenance('xero'))
 
   if (params.idempotencyKey) {
-    const existing = await db.accountingSyncLog.findFirst({
-      where: {
-        connector: 'xero',
-        type: params.type,
-        referenceType: params.referenceType,
-        referenceId: params.referenceId,
-        status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
-        payload: { path: ['_idempotencyKey'], equals: params.idempotencyKey },
-      },
-      select: { id: true },
+    // o3d-d0pd: EVERY prior attempt for this key, in ANY status — not just the live ones. A FAILED
+    // row can name a real document (the remote call is made before its result is written back), and
+    // the partial unique index carries the same three-status predicate this query used to, so
+    // nothing else was going to stop the duplicate either. See prior-posting-evidence.ts.
+    const priorAttempts = await db.accountingSyncLog.findMany({
+      where: priorAttemptsWhere({ ...params, connector: 'xero', idempotencyKey: params.idempotencyKey }),
+      select: PRIOR_ATTEMPT_SELECT,
     })
+    const verdict = classifyPriorAttempts(priorAttempts)
     // ALREADY PRESENT IS QUEUED: a row for this posting is standing, so the GL counterpart exists.
-    if (existing) return { queued: true }
+    if (verdict.kind === 'live') return { queued: true }
+    // A document with an id EXISTS. Nothing is written, and nothing needs to be.
+    if (verdict.kind === 'posted') return { queued: true, reason: 'already-queued' }
+    // REFUSED, not decided: a failed attempt that may have landed. The posting is still owed and the
+    // caller must not read this as success.
+    if (verdict.kind === 'unresolved') {
+      const description = describeUnresolvedPriorAttempt({ ...params, syncLogId: verdict.syncLogId })
+      await logActivity({
+        entityType: 'SYSTEM',
+        action: 'accounting_enqueue_refused_unresolved_attempt',
+        tag: 'accounting',
+        level: 'WARNING',
+        description,
+        metadata: {
+          connector: 'xero', type: params.type, referenceType: params.referenceType,
+          referenceId: params.referenceId, blockingSyncLogId: verdict.syncLogId,
+        },
+      }).catch(() => { /* logging must never turn a refusal into a throw */ })
+      return { queued: false, reason: 'refused' }
+    }
   }
 
   try {
@@ -188,8 +212,13 @@ export async function queueXeroSync(params: {
     return { queued: true }
   } catch (error) {
     // A concurrent insert already queued this posting, so the counterpart exists — already present.
-    if (params.idempotencyKey && String(error).includes('accounting_sync_logs_idempotency_key_uq')) {
-      return { queued: true }
+    //
+    // o3d-d0pd: read through `isIdempotencyKeyIndexCollision`, not `String(error).includes(...)`. The
+    // driver adapter this build uses reports a P2002 as a COLUMN LIST and puts the index name nowhere
+    // the string form can see it (o3d-5od), so the old condition was never once true and an ordinary
+    // race threw a raw P2002 out of the enqueue instead.
+    if (params.idempotencyKey && isIdempotencyKeyIndexCollision(error)) {
+      return { queued: true, reason: 'already-queued' }
     }
     throw error
   }

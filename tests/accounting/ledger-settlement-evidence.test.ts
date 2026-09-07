@@ -11,8 +11,11 @@ import {
   moneyPostDateToSend,
   pinnedAttemptDate,
   settlementMarkerFor,
+  type AttemptDescription,
   type LedgerSettlementRecord,
 } from '@/lib/domain/accounting/ledger-settlement-evidence'
+import { REGISTERED_AMOUNT_DECIMAL_FIELD } from '@/lib/domain/accounting/registered-amount'
+import { toDecimal } from '@/lib/domain/math/decimal'
 
 /**
  * What the module used to export as `plannedAttemptDate`, spelt out here instead (round 7, Codex
@@ -35,8 +38,23 @@ const plannedAttemptDate = (type: string, payload: unknown, now: Date): string |
  * tests are written to pin the asymmetry, not merely the happy path.
  */
 
-const attempt = { amount: 10, date: '2026-08-01', marker: null }
-const records = (...rows: LedgerSettlementRecord[]) => ({ ok: true as const, records: rows })
+/**
+ * o3d-6yho (2 of 3): an attempt names its own currency, which sizes the amount band. GBP keeps every
+ * case below at the half-penny it was written against.
+ */
+/**
+ * o3d-78rq: both operands are `Decimal`s now, and these two helpers do the conversion so every case
+ * below still READS as the figure it is about. They convert and nothing else — a test that needs to
+ * pin an inexact operand states the Decimal itself.
+ */
+const described = (a: Omit<AttemptDescription, 'amount'> & { amount: number | string | null }): AttemptDescription =>
+  ({ ...a, amount: a.amount === null ? null : toDecimal(a.amount) })
+const recorded = (r: Omit<LedgerSettlementRecord, 'amount'> & { amount: number | string | null }): LedgerSettlementRecord =>
+  ({ ...r, amount: r.amount === null ? null : toDecimal(r.amount) })
+
+const attempt = described({ amount: 10, currency: 'GBP', date: '2026-08-01', marker: null })
+const records = (...rows: Array<Parameters<typeof recorded>[0]>) =>
+  ({ ok: true as const, provedComplete: true, records: rows.map(recorded) })
 
 test('an empty ledger clears the attempt (o3d-0m56)', () => {
   assert.deepEqual(classifyLedgerSettlement(attempt, records()), { outcome: 'clear' })
@@ -45,7 +63,7 @@ test('an empty ledger clears the attempt (o3d-0m56)', () => {
 test('same amount AND same date is the attempt (o3d-0m56)', () => {
   const verdict = classifyLedgerSettlement(attempt, records({ amount: 10, date: '2026-08-01', id: 'PAY-1' }))
   assert.equal(verdict.outcome, 'present')
-  assert.match(verdict.outcome === 'present' ? verdict.detail : '', /10\.00 dated 2026-08-01 \(PAY-1\)/)
+  assert.match(verdict.outcome === 'present' ? verdict.detail : '', /^10\.00 dated 2026-08-01 \(PAY-1\)$/)
 })
 
 test('a settlement of the same size on ANOTHER day is not this attempt (o3d-0m56)', () => {
@@ -79,8 +97,8 @@ test('an attempt IMS cannot describe is UNKNOWN (o3d-0m56)', () => {
   // reconstructed afterwards — so a row that pins neither amount nor date can never be matched,
   // and must not be treated as absent from the ledger.
   for (const partial of [
-    { amount: null, date: '2026-08-01', marker: null },
-    { amount: 10, date: null, marker: null },
+    described({ amount: null, currency: 'GBP', date: '2026-08-01', marker: null }),
+    described({ amount: 10, currency: 'GBP', date: null, marker: null }),
   ]) {
     assert.equal(classifyLedgerSettlement(partial, records()).outcome, 'unknown', JSON.stringify(partial))
   }
@@ -94,19 +112,51 @@ test('a ledger record IMS cannot measure is UNKNOWN (o3d-0m56)', () => {
 })
 
 test('the attempt is described from the payload the connector actually sends (o3d-0m56)', () => {
-  assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { amount: 12.5, paymentDate: '2026-08-01' }), { amount: 12.5, date: '2026-08-01', marker: null })
+  assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { amount: 12.5, paymentDate: '2026-08-01' }), described({ amount: 12.5, currency: null, date: '2026-08-01', marker: null }))
   // Allocations carry `date`, payments carry `paymentDate`; both are sliced to 10 characters
   // exactly as the processors slice them — and each type reads ONLY its own field.
-  assert.deepEqual(describeAttempt('PURCHASE_CREDIT_NOTE_ALLOCATION', { amount: 1, date: '2026-08-01T09:30:00Z' }), { amount: 1, date: '2026-08-01', marker: null })
+  assert.deepEqual(describeAttempt('PURCHASE_CREDIT_NOTE_ALLOCATION', { amount: 1, date: '2026-08-01T09:30:00Z' }), described({ amount: 1, currency: null, date: '2026-08-01', marker: null }))
   // A zero amount is a real request — the connectors reject an amount only when it is null.
-  assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { amount: 0, paymentDate: '2026-08-01' }), { amount: 0, date: '2026-08-01', marker: null })
-  assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { paymentDate: '2026-08-01' }), { amount: null, date: '2026-08-01', marker: null })
-  assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { amount: 1 }), { amount: 1, date: null, marker: null })
+  assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { amount: 0, paymentDate: '2026-08-01' }), described({ amount: 0, currency: null, date: '2026-08-01', marker: null }))
+  assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { paymentDate: '2026-08-01' }), described({ amount: null, currency: null, date: '2026-08-01', marker: null }))
+  assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { amount: 1 }), described({ amount: 1, currency: null, date: null, marker: null }))
   // A blank or truncated date is not a date. Slicing it anyway would produce a value that can
   // never match a real settlement, which reads as "clear" for the wrong reason.
-  assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { amount: 1, paymentDate: '' }), { amount: 1, date: null, marker: null })
-  assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { amount: 1, paymentDate: '2026-08' }), { amount: 1, date: null, marker: null })
-  assert.deepEqual(describeAttempt('INVOICE_PAYMENT', null), { amount: null, date: null, marker: null })
+  assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { amount: 1, paymentDate: '' }), described({ amount: 1, currency: null, date: null, marker: null }))
+  assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { amount: 1, paymentDate: '2026-08' }), described({ amount: 1, currency: null, date: null, marker: null }))
+  assert.deepEqual(describeAttempt('INVOICE_PAYMENT', null), described({ amount: null, currency: null, date: null, marker: null }))
+})
+
+test('[o3d-6yho] the attempt takes its CURRENCY from the payload, and the currency sizes the band', () => {
+  // Every money payload states one — both connectors' INVOICE_PAYMENT follow-ups, the receipt
+  // enqueue and markBillPaid's BILL_PAYMENT — so the ordinary row names its own and nothing is
+  // inferred. The test above pins the honest `null` for a payload that states none; this pins that a
+  // payload which DOES state one is read, and what reading it changes.
+  //
+  // ROUTE: describeAttempt -> AttemptDescription.currency -> ledgerMatchEpsilon.
+  // MUTATION: return a flat `currency: null` and the KWD case below matches a payment a fil away.
+  assert.deepEqual(
+    describeAttempt('INVOICE_PAYMENT', { amount: 10, currency: 'KWD', paymentDate: '2026-08-01' }),
+    described({ amount: 10, currency: 'KWD', date: '2026-08-01', marker: null }),
+  )
+
+  const oneThousandthAway = records({ amount: 10.001, date: '2026-08-01' })
+  assert.equal(
+    classifyLedgerSettlement(
+      describeAttempt('INVOICE_PAYMENT', { amount: 10, currency: 'KWD', paymentDate: '2026-08-01' }),
+      oneThousandthAway,
+    ).outcome,
+    'clear',
+    'one whole fil apart is a DIFFERENT payment in KWD — the flat half-penny called it the same one',
+  )
+  assert.equal(
+    classifyLedgerSettlement(
+      describeAttempt('INVOICE_PAYMENT', { amount: 10, currency: 'GBP', paymentDate: '2026-08-01' }),
+      oneThousandthAway,
+    ).outcome,
+    'present',
+    'and a tenth of a penny apart is still the same payment in GBP, so nothing ordinary moved',
+  )
 })
 
 /* --- round 6, finding 1: the date convention is PER TYPE, and there is only one of it --- */
@@ -189,12 +239,12 @@ test('describeAttempt fills a missing date ONLY from postingOn (o3d-0m56 r5)', (
   // is never overridden, because a past attempt's day is unreconstructable and substituting
   // today's would go looking for a settlement that was never created.
   assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { amount: 1 }, null, { postingOn: '2026-08-18' }),
-    { amount: 1, date: '2026-08-18', marker: null })
+    described({ amount: 1, currency: null, date: '2026-08-18', marker: null }))
   assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { amount: 1, paymentDate: '2026-08-01' }, null, { postingOn: '2026-08-18' }),
-    { amount: 1, date: '2026-08-01', marker: null })
+    described({ amount: 1, currency: null, date: '2026-08-01', marker: null }))
   assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { amount: 1 }, null, { postingOn: null }),
-    { amount: 1, date: null, marker: null })
-  assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { amount: 1 }), { amount: 1, date: null, marker: null },
+    described({ amount: 1, currency: null, date: null, marker: null }))
+  assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { amount: 1 }), described({ amount: 1, currency: null, date: null, marker: null }),
     'and a caller that does not opt in still gets the honest null')
 })
 
@@ -205,12 +255,10 @@ test("a settlement carrying this attempt's own mark IS this attempt (o3d-0m56)",
   // and it stops matching the attempt that created it while still paying the invoice — so a retry
   // would add a second one. The mark does not move.
   const marker = settlementMarkerFor('followup:xero:INVOICE_PAYMENT:SalesOrder:so-1:inv-9')
-  const marked = { amount: 10, date: '2026-08-01', marker }
+  const marked = described({ amount: 10, currency: 'GBP', date: '2026-08-01', marker })
 
-  const edited = classifyLedgerSettlement(marked, {
-    ok: true,
-    records: [{ amount: 999, date: '2020-01-01', id: 'PAY-1', reference: `Deposit ${marker}` }],
-  })
+  const edited = classifyLedgerSettlement(marked,
+    records({ amount: 999, date: '2020-01-01', id: 'PAY-1', reference: `Deposit ${marker}` }))
   assert.equal(edited.outcome, 'present', 'neither field matches, and it is still the same payment')
   assert.match(edited.outcome === 'present' ? edited.detail : '', new RegExp(marker))
 })
@@ -220,10 +268,8 @@ test('another entry\'s mark is not this attempt (o3d-0m56)', () => {
   const theirs = settlementMarkerFor('token-b')
   assert.notEqual(mine, theirs)
   assert.deepEqual(
-    classifyLedgerSettlement({ amount: 10, date: '2026-08-01', marker: mine }, {
-      ok: true,
-      records: [{ amount: 4, date: '2026-07-01', reference: theirs }],
-    }),
+    classifyLedgerSettlement(described({ amount: 10, currency: 'GBP', date: '2026-08-01', marker: mine }),
+      records({ amount: 4, date: '2026-07-01', reference: theirs })),
     { outcome: 'clear' },
     'a payment IMS made for something else must not strand this one',
   )
@@ -242,10 +288,93 @@ test('an unmarked settlement still matches on amount and date (o3d-0m56)', () =>
   // which have no reference field at all — can only be recognised this way.
   const marker = settlementMarkerFor('token-a')
   assert.equal(
-    classifyLedgerSettlement({ amount: 10, date: '2026-08-01', marker }, {
-      ok: true,
-      records: [{ amount: 10, date: '2026-08-01', reference: null }],
-    }).outcome,
+    classifyLedgerSettlement(described({ amount: 10, currency: 'GBP', date: '2026-08-01', marker }),
+      records({ amount: 10, date: '2026-08-01', reference: null })).outcome,
     'present',
   )
+})
+
+/* ------------------------------------------------------------------------------------------- *
+ * o3d-obyd r31 (Codex HIGH 1) — THE RULE ITSELF, AT THE BOUNDARY IT LIVES ON.
+ *
+ * The probe tests drive this end to end through a connector double; these drive the classifier
+ * directly, because the asymmetry is a property of `classifyLedgerSettlement` and not of any
+ * particular ledger response. Everything is held identical between the cases except the one fact.
+ * ------------------------------------------------------------------------------------------- */
+
+/** The same helper as `records`, for a collection nothing proved whole. */
+const unprovedRecords = (...rows: Array<Parameters<typeof recorded>[0]>) =>
+  ({ ok: true as const, provedComplete: false, records: rows.map(recorded) })
+
+test('[o3d-obyd r31] a NON-MATCH on an unproved collection is unknown, not clear', () => {
+  // ROUTE: `classifyLedgerSettlement` -> the marker pass finds nothing -> the record loop measures
+  //        every record and matches none -> the terminal gate reads `provedComplete`.
+  // MUTATION: delete the `if (!probe.provedComplete)` block before the final `return { outcome:
+  //        'clear' }`. This test answers `clear`, which is what authorises a second payment.
+
+  const other = { amount: 99, date: '2026-06-01', id: 'PAY-OTHER' } as const
+
+  // PRECONDITION — the record is READABLE and simply is not the attempt. If it were unmeasurable the
+  // verdict would be `record-unmeasurable` and this test would prove nothing about completeness.
+  const measured = recorded(other)
+  assert.notEqual(measured.amount, null, 'the record states an amount this module can read')
+  assert.notEqual(measured.date, null, 'and a date')
+  assert.notEqual(measured.date, attempt.date, 'and it is not the attempt')
+
+  const verdict = classifyLedgerSettlement(attempt, unprovedRecords(other))
+  assert.equal(verdict.outcome, 'unknown')
+  assert.equal(verdict.outcome === 'unknown' ? verdict.cause : null, 'collection-unproved')
+
+  // THE ISOLATED VARIABLE: the SAME attempt and the SAME records, differing only in whether the
+  // collection is proved. Nothing else in this pair can explain the difference in verdict.
+  assert.deepEqual(classifyLedgerSettlement(attempt, records(other)), { outcome: 'clear' },
+    'a proved collection that does not hold the attempt is still a clear')
+})
+
+test('[o3d-obyd r31] a MATCH on an unproved collection is still present', () => {
+  // The asymmetry, and why the gate is at the END of the classifier rather than the start: a found
+  // record is evidence in its own right, so an unproved collection must still be able to say
+  // `present` — which is the verdict that RESOLVES a row rather than holding it.
+  // ROUTE: the amount+date pass (and the marker pass) return before the terminal gate.
+  // MUTATION: move the `!probe.provedComplete` refusal above the marker pass. Both assertions here
+  //        become `unknown`, and IMS stops recognising a payment it can see in the ledger.
+
+  const ours = { amount: 10, date: '2026-08-01', id: 'PAY-OURS' } as const
+  const marker = settlementMarkerFor('token-r31')
+
+  // PRECONDITION — this collection really is unproved, so it is the same shape the test above
+  // refuses on. The only difference between the two is whether the record matches.
+  const probe = unprovedRecords(ours)
+  assert.equal(probe.provedComplete, false, 'nothing established that these are all of them')
+
+  const byFigures = classifyLedgerSettlement(attempt, probe)
+  assert.equal(byFigures.outcome, 'present')
+  assert.equal(byFigures.outcome === 'present' ? byFigures.matchedId : null, 'PAY-OURS')
+
+  const byMark = classifyLedgerSettlement(
+    described({ amount: 10, currency: 'GBP', date: '2026-08-01', marker }),
+    unprovedRecords({ amount: 999, date: '2020-01-01', id: 'PAY-M', reference: `Deposit ${marker}` }),
+  )
+  assert.equal(byMark.outcome, 'present', 'the mark identifies our payment whatever else the response omitted')
+})
+
+test('[o3d-obyd r31] an EMPTY unproved collection is unknown too, and an unmeasurable record still wins', () => {
+  // Two boundaries of the same rule.
+  // ROUTE: the empty loop body falls straight to the terminal gate; and the unmeasurable-record
+  //        refusal is reached BEFORE it, so the more specific sentence is the one an operator gets.
+  // MUTATION: narrow the gate to `records.length > 0 && !probe.provedComplete` — the first assertion
+  //        below answers `clear` on a probe that looked at nothing at all.
+
+  const empty = classifyLedgerSettlement(attempt, unprovedRecords())
+  assert.equal(empty.outcome, 'unknown', 'an empty list nothing measured is the weakest evidence there is')
+  assert.equal(empty.outcome === 'unknown' ? empty.cause : null, 'collection-unproved')
+
+  // AND THE ORDER: an unmeasurable record is diagnosed as such rather than swallowed by the newer,
+  // vaguer cause. Both withhold, so only the sentence is at stake — and the sentences send an
+  // operator to different places.
+  const unreadable = classifyLedgerSettlement(attempt,
+    unprovedRecords({ amount: null, unreadableAmount: '40.005', date: '2026-08-01', id: 'PAY-U' }))
+  assert.equal(unreadable.outcome, 'unknown')
+  assert.equal(unreadable.outcome === 'unknown' ? unreadable.cause : null, 'record-unmeasurable',
+    'the figure IMS could not read is the thing to say, not that the list might be short')
 })

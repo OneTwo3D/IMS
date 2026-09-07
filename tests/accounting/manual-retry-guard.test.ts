@@ -12,6 +12,7 @@ import {
   selectRevivableCandidates,
 } from '@/lib/domain/accounting/followup-retry-guard'
 import type { LedgerSettlementProbe } from '@/lib/domain/accounting/ledger-settlement-evidence'
+import { toDecimal } from '@/lib/domain/math/decimal'
 
 /**
  * Most of this file is about the token/ambiguity rules, which are independent of the ledger, so
@@ -19,7 +20,7 @@ import type { LedgerSettlementProbe } from '@/lib/domain/accounting/ledger-settl
  * of the real planner precisely so no caller can reach `allow` by omission; the tests that matter
  * for it pass their own reading explicitly.
  */
-const EMPTY_LEDGER: LedgerSettlementProbe = { ok: true, records: [] }
+const EMPTY_LEDGER: LedgerSettlementProbe = { ok: true, provedComplete: true, records: [] }
 const plan = (
   args: Omit<Parameters<typeof planManualRetry>[0], 'ledger'> & { ledger?: LedgerSettlementProbe },
 ) => planManualRetry({ ledger: EMPTY_LEDGER, ...args })
@@ -88,7 +89,7 @@ test('DISTINCT tokens for the same document refuse while ANY of them is unresolv
   // committed, and the other token would put a second payment beside it.
   const held = plan({
     ...scopeArgs, target: rows[0]!, siblings: rows,
-    ledger: { ok: true, records: [{ amount: 10, date: '2026-08-01', id: 'PAY-1' }] },
+    ledger: { ok: true, provedComplete: true, records: [{ amount: toDecimal(10), date: '2026-08-01', id: 'PAY-1' }] },
   })
   assert.equal(held.action, 'refuse')
 })
@@ -114,7 +115,7 @@ test('DISTINCT tokens are RECOVERABLE when the ledger holds none of them (o3d-0m
   assert.equal(
     plan({
       ...scopeArgs, target: rivalLanded[1]!, siblings: rivalLanded,
-      ledger: { ok: true, records: [{ amount: 25, date: '2026-08-01', id: 'PAY-RIVAL' }] },
+      ledger: { ok: true, provedComplete: true, records: [{ amount: toDecimal(25), date: '2026-08-01', id: 'PAY-RIVAL' }] },
     }).action,
     'refuse',
     'the target being absent from the ledger says nothing about its rival',
@@ -619,12 +620,12 @@ test('a LONE money row is refused unless the ledger says the attempt is not ther
   const only = { id: 'log-a', effectiveToken: 'log-a', payload: postable('inv-9'), status: 'FAILED' }
   const args = { ...scopeArgs, target: only, siblings: [only] }
 
-  assert.deepEqual(plan({ ...args, ledger: { ok: true, records: [] } }), { action: 'allow' },
+  assert.deepEqual(plan({ ...args, ledger: { ok: true, provedComplete: true, records: [] } }), { action: 'allow' },
     'a ledger that has been asked and answered "not here" is what makes a retry safe')
 
   const present = plan({
     ...args,
-    ledger: { ok: true, records: [{ amount: 10, date: '2026-08-01', id: 'PAY-1' }] },
+    ledger: { ok: true, provedComplete: true, records: [{ amount: toDecimal(10), date: '2026-08-01', id: 'PAY-1' }] },
   })
   assert.equal(present.action, 'refuse')
   assert.match(present.action === 'refuse' ? present.reason : '', /already holds a settlement of 10\.00 dated 2026-08-01/)
@@ -766,7 +767,7 @@ test('a sibling naming the target document in ANOTHER CASE is still a contender 
     ...scopeArgs,
     target,
     siblings: [target, rival],
-    ledger: { ok: true, records: [{ amount: 10, date: '2026-08-01', id: 'PAY-OLD', reference: null }] },
+    ledger: { ok: true, provedComplete: true, records: [{ amount: toDecimal(10), date: '2026-08-01', id: 'PAY-OLD', reference: null }] },
   })
   assert.notEqual(plan1.action, 'allow', 'one GUID in two cases is one invoice, and it is already paid')
 
@@ -781,7 +782,7 @@ test('a sibling naming the target document in ANOTHER CASE is still a contender 
       ...scopeArgs,
       target,
       siblings: [target, elsewhere],
-      ledger: { ok: true, records: [{ amount: 10, date: '2026-08-01', id: 'PAY-OLD', reference: null }] },
+      ledger: { ok: true, provedComplete: true, records: [{ amount: toDecimal(10), date: '2026-08-01', id: 'PAY-OLD', reference: null }] },
     }),
     { action: 'allow' },
     'a genuinely different id is still a different document — folding case has not made everything match',
@@ -809,7 +810,7 @@ test('a sibling carrying a creditNoteId a PAYMENT does not have is still a conte
     ...scopeArgs,
     target,
     siblings: [target, rival],
-    ledger: { ok: true, records: [{ amount: 10, date: '2026-08-01', id: 'PAY-OLD', reference: null }] },
+    ledger: { ok: true, provedComplete: true, records: [{ amount: toDecimal(10), date: '2026-08-01', id: 'PAY-OLD', reference: null }] },
   })
   assert.notEqual(verdict.action, 'allow', 'both rows pay inv-9; the ledger already holds the rival\'s payment')
 
@@ -830,7 +831,7 @@ test('a sibling carrying a creditNoteId a PAYMENT does not have is still a conte
       reference: 'SupplierCreditNote scn-1',
       target: allocTarget,
       siblings: [allocTarget, allocRival],
-      ledger: { ok: true, records: [{ amount: 10, date: '2026-08-01', reference: null }] },
+      ledger: { ok: true, provedComplete: true, records: [{ amount: toDecimal(10), date: '2026-08-01', reference: null }] },
     }),
     { action: 'allow' },
     'two credit notes offsetting one bill are two legitimate settlements',

@@ -177,12 +177,26 @@ mock.module('@/lib/security/connector-fetch', {
       // — the tenant guard is then what decides these cases, which is what this file is for. Left
       // unanswered it returned the payment-POST shape below, which carries no `Invoices`, so the
       // fence failed closed and refused every case before the guard ran.
+      //
+      // o3d-nk5n: `AmountPaid: 0` alone was never that invoice. Since an empty record list must be
+      // PROVED rather than assumed, a document stating no `Total`/`AmountDue` pair and no complete
+      // `AmountPaid`/`AmountCredited` fallback is refused — so the stub now states the figures Xero
+      // states, EQUAL, at the amount the payload is for.
       if (isFenceDocumentRead) {
         return {
           ok: true,
           status: 200,
           headers: { get: () => null },
-          json: async () => ({ Invoices: [{ InvoiceID: 'INV-1', AmountPaid: 0, Payments: [] }] }),
+          json: async () => ({
+            Invoices: [{
+              InvoiceID: 'INV-1',
+              CurrencyCode: 'GBP',
+              Total: 250,
+              AmountDue: 250,
+              AmountPaid: 0,
+              Payments: [],
+            }],
+          }),
           text: async () => '',
         }
       }

@@ -880,6 +880,86 @@ still queued, on the wire, **failed**, or finished after this Xero read was take
 A *failed* attempt counts as unresolved deliberately: the connector posts before it records the
 outcome, so a lost response is written down identically to a rejection.
 
+**"No registration at all" now depends on where the paid flag came from.** That arm is right for the
+document it was written for — one the IMS marked paid *because Xero said so*, through the payment poll
+or the backlog reconcile. If Xero later holds nothing, the payment really has been taken away and
+clearing `paidAt` is the point of the pass.
+
+It is wrong for a sale the IMS holds as paid on evidence Xero was never given. A **WooCommerce** order
+is marked paid from the channel's own payment date, and an order marked paid **by hand** in the IMS is
+marked paid because somebody said so; neither of those puts anything into Xero by itself. An empty
+Xero invoice against one of them is not a removal — it is the IMS's own silence — and acting on it
+cleared `paidAt` and raised a **chargeback credit note against a customer who really had paid**.
+
+So each sale records *where* its paid flag came from, in the same write that sets it. A sale paid by a
+channel or by an operator, with no payment registration that has demonstrably reached Xero, is
+**withheld** and reported: check the payment in the sales channel, then reverse the order by hand if it
+is genuinely gone, or register the receipt so the two agree. The moment a payment registration *has*
+posted, the recorded origin stops mattering and Xero's own list decides again — so a genuine
+**WooCommerce chargeback is still detected and still unwinds revenue**, exactly as before.
+
+**Recording a receipt replaces that origin only when the receipts settle the order.** Adding a payment
+to an order that was already marked paid by hand is the ordinary way to put the money on the ledger,
+and the recorded origin is dropped when it happens — the flag now has a real receipt behind it, and
+that receipt is registered with Xero like any other. But IMS accepts **part** payments, and the origin
+is a statement about the *whole* paid balance: a £1 receipt against a £100 order marked paid by hand
+does not make the other £99 any less off-ledger. So the origin is dropped only once the payments
+recorded against the order **cover its total**. Until then the order behaves exactly as it did before
+the part payment: the receipt is registered, the reversal decision waits for that registration in the
+usual way, and an empty Xero invoice with nothing left to speak for it is still **withheld** rather
+than charged back.
+
+**QuickBooks reverses on the same evidence, decided by the same code.** The rule above is not Xero's;
+it is IMS's, and the QuickBooks payment poller reaches its verdict through the same functions. It
+selects each order's recorded origin, takes the same database-clock reading *before* asking Intuit,
+and puts every reversal candidate through the same decision. A sale marked paid by hand or by a
+channel, one whose receipt has not been registered yet, and one whose registration this read cannot
+speak for are all **withheld** — `paidAt` is left set, no chargeback credit note is raised, and a
+WARNING against the order says which of the three it is and what to do. A genuine chargeback still
+reverses the moment a payment registration has demonstrably reached QuickBooks. The bill side is
+covered too: a bill whose payment IMS has queued but not yet posted no longer has `paidAt` cleared on
+the strength of a balance QuickBooks reports while that payment is still on its way.
+
+One difference from Xero is worth knowing, because it is visible to whoever reads the warnings:
+
+- **QuickBooks is not asked which payments a document carries.** The reversal read asks only which
+  documents regressed, so IMS can never prove that one *particular* payment of its own has been
+  removed. Where Xero would name the vanished payment id, QuickBooks acts on the amounts alone: it
+  reads the document's total and its balance out of the same response, and reverses only when
+  QuickBooks states that **nothing at all** is still applied to it. A document showing merely a
+  balance due is never reversed on that alone — a part payment produces exactly the same balance as a
+  removed one, and clearing **Paid** over it would raise a credit note against money QuickBooks is
+  still holding.
+
+  "Nothing at all" is measured against the **document's own currency**: half of one minor unit, so a
+  penny in GBP, one yen in JPY, a thousandth of a dinar in KWD. An amount below that is dust; one
+  minor unit is a real payment and is never read as nothing.
+
+  The withheld verdict is put back to QuickBooks on the same hourly timer Xero's is (see below), so a
+  document does not need to change again for IMS to reconsider it.
+
+**A part-paid document is reported, not reconciled — and IMS will not put it right by itself.** When
+QuickBooks says a document is only partly settled while IMS holds it as fully paid — a £100 invoice
+with £50 against it — IMS says exactly that: the warning against the order names the amount
+QuickBooks has settled, the document's total, the amount still **outstanding** and the currency, and
+the activity entry carries them as fields so the open ones can be listed. **Paid** stays set, because
+reversing the whole document would credit the half QuickBooks is still accounting for, and the
+warning is rewritten every time the document is reconsidered.
+
+**The warning does not say a payment was removed, and that is deliberate.** A document that was only
+ever part paid — invoiced at £100, settled with a single £50 — states exactly the same total and
+balance as one that carried two £50 payments and lost one. The figures cannot tell them apart, so
+IMS reports the difference and leaves the cause to whoever opens the document. Being told money was
+taken back would send somebody hunting a chargeback that may never have happened.
+
+What IMS does *not* do is unwind the difference: there is no partial credit note and no partial
+reversal of recognised revenue. So the order goes on reading as fully paid until somebody acts.
+Either settle the outstanding amount in QuickBooks — pay or re-apply it, and IMS closes the item by
+itself on the next poll — or, if a payment really was taken back, raise the credit note for it by
+hand and correct the order. If the *rest* of the payment goes later, the document reaches a zero paid
+amount and IMS reverses it in full on its own. The same is true of a part-paid **Xero** invoice,
+which is warned about on every poll and reconciled by nobody.
+
 **A withheld verdict is asked again on a timer.** It cannot be left to resolve itself: the delta
 returns an invoice only when it *changes*, and what usually settles a withheld verdict is not a change
 in Xero at all — it is the IMS's own registration finishing, or somebody cancelling a failed one.

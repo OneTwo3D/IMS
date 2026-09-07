@@ -95,6 +95,10 @@ const PAYMENT_PAYLOAD = {
   accountingInvoiceId: 'QBINV-1',
   bankAccountId: 'bank-1',
   amount: 40,
+  // o3d-6abj: every INVOICE_PAYMENT payload states its currency (both connectors' follow-up enqueues
+  // and the receipt enqueue write it), and the capacity guard will not read an amount whose unit it
+  // does not know — an amount in another currency settles none of a total stated in the order's.
+  currency: 'GBP',
   paymentDate: '2026-08-01',
   customerRef: 'QBCUST-1',
 }
@@ -206,7 +210,7 @@ function queuedPaymentEntry() {
 }
 
 /** A 100.00 order raised in IMS, so the ledger invoice total is 100.00. */
-const ORDER_100 = { totalForeign: 100, taxForeign: 0, pricesIncludeVat: false, shoppingLinks: [] }
+const ORDER_100 = { currency: 'GBP', totalForeign: 100, taxForeign: 0, pricesIncludeVat: false, shoppingLinks: [] }
 
 test('[o3d-anu8 r3] a money row OUTSIDE stamping custody is not claimed at all — a claim would launder it', async () => {
   // THE DEPLOYMENT OVERLAP THIS MECHANISM EXISTS FOR. An OLD binary claimed this receipt, its
