@@ -3377,35 +3377,47 @@ test('[o3d-acctmoney r5] a negative counted refund amount refuses, at the file\'
   // PAYMENT, rather than accuse the DOCUMENT of contradicting itself.
   //
   // ROUTE: `negativeRefund` over the COUNTED readings -> `shortBy(0, value)` -> ok:false.
-  // MUTATION: narrow the check to `unresolvedReadings` (the width alone). Measured: case (1) — a
-  //        RESOLVED negative refund — answers ok:true, `provedComplete: true` and classifies
-  //        `clear`, because `refunded` shrinks by 100 and the note lands on a proved zero.
+  // MUTATION: narrow the check to the WIDTH's readings — the unresolved ones alone. Measured: case
+  //        (1), whose status the note itself STATED so that nothing is unresolved, answers ok:true
+  //        with `provedComplete: true` and classifies `clear`. That is what makes the check cover
+  //        every COUNTED amount rather than only the ones inside the interval.
   // MUTATION 2: write it as a bare `compareDecimal(value, toDecimal(0)) < 0`. Measured: case (3)
   //        refuses over a rounding artefact four ten-thousandths below zero.
   // MUTATION 3: check every entry rather than the COUNTED ones. Measured: case (4) refuses over a
   //        DELETED payment whose amount this arm never reads.
+  //
+  // AND EVERY CASE BELOW IS A WOULD-BE `clear`. A negative term makes `applied` BIGGER, so the
+  // arithmetic of a note stating one lands on a proved zero over an empty collection — which is why
+  // the sign is worth a refusal at all, and why each assertion here is taking a `clear` away.
 
-  // (1) A RESOLVED, AUTHORISED REFUND STATING A NEGATIVE AMOUNT. Nothing is unresolved here, so the
-  // marker cannot be what refuses it — this is the sign invariant alone, and it is why the check
-  // covers every counted amount rather than only the ones in the width.
-  const resolvedNegative = await probeNote({
-    CurrencyCode: 'GBP', Total: 400, RemainingCredit: 370, Allocations: [],
-    Payments: [...budgetOfRefunds(), { PaymentID: 'PAY-NEG', Amount: -100 }],
-  }, { ...resolvedStubs(budgetOfRefunds()), 'PAY-NEG': { ...AUTHORISED_REFUND, Amount: -100 } })
-  assert.equal(resolvedNegative.ok, false,
+  // (1) AN AUTHORISED REFUND STATING A NEGATIVE AMOUNT, WITH NOTHING UNRESOLVED. The status is on the
+  // note's own stub, so no lookup is made and the marker cannot be what refuses this. `RemainingCredit`
+  // is LARGER than `Total` by exactly the negative — which is the shape a negative payment produces —
+  // and `applied` is `400 - 500 - (-100) = 0`, a proved zero over an empty collection.
+  const resolvedNegative = await probeNoteWithCalls({
+    CurrencyCode: 'GBP', Total: 400, RemainingCredit: 500, Allocations: [],
+    Payments: [{ PaymentID: 'PAY-NEG', Amount: -100, ...AUTHORISED_REFUND }],
+  })
+  assert.equal(resolvedNegative.paths.filter((path) => path.startsWith('Payments/')).length, 0,
+    'PRECONDITION: the status is stated, so nothing here is unresolved and the marker is not in play')
+  assert.equal(resolvedNegative.probe.ok, false,
     'money going back ON to a credit note is not a refund coming off it')
-  assert.match(reasonOf(resolvedNegative),
+  assert.match(reasonOf(resolvedNegative.probe),
     /Xero states payment PAY-NEG against this credit note as -100\.00, which is not an amount that can have come off the credit, so IMS cannot tell how much of the credit is already allocated/)
-  assert.notEqual(classifyLedgerSettlement(attemptFor('370.00'), resolvedNegative).outcome, 'clear')
+  assert.notEqual(classifyLedgerSettlement(attemptFor('500.00'), resolvedNegative.probe).outcome, 'clear')
 
-  // (2) AND ONE BAND-AND-A-BIT BELOW ZERO STILL REFUSES, so the rule is about the sign and not about
-  // the size of the example above.
-  const smallNegative = await probeNote({
-    CurrencyCode: 'GBP', Total: 400, RemainingCredit: 400, Allocations: [],
+  // (2) AND ONE RESOLVED THROUGH THE LOOKUP, a band-and-a-bit below zero: the rule is about the sign
+  // rather than the size of the example above, and it reaches the refunds this arm had to go and ask
+  // about as well as the ones the note described itself.
+  const smallNegative = await probeNoteWithCalls({
+    CurrencyCode: 'GBP', Total: 400, RemainingCredit: 400.01, Allocations: [],
     Payments: [{ PaymentID: 'PAY-NEG', Amount: -0.01 }],
   }, { 'PAY-NEG': { ...AUTHORISED_REFUND, Amount: -0.01 } })
-  assert.equal(smallNegative.ok, false)
-  assert.match(reasonOf(smallNegative), /payment PAY-NEG against this credit note as -0\.01/)
+  assert.equal(smallNegative.paths.filter((path) => path.startsWith('Payments/')).length, 1,
+    'PRECONDITION: this one WAS resolved through the endpoint that states the status')
+  assert.equal(smallNegative.probe.ok, false)
+  assert.match(reasonOf(smallNegative.probe), /payment PAY-NEG against this credit note as -0\.01/)
+  assert.notEqual(classifyLedgerSettlement(attemptFor('400.01'), smallNegative.probe).outcome, 'clear')
 
   // (3) BELOW THE BAND IS NOISE, NOT A NEGATIVE. `completenessBand` is half a minor unit — 0.005 in
   // GBP — and every comparison in this file decides at it. A figure four ten-thousandths under zero
