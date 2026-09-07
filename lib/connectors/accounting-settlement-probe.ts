@@ -484,6 +484,28 @@ type XeroPaymentsResponse = {
     /** The document's face value and what is still owed on it — the shape-independent cross-check. */
     Total?: number
     AmountDue?: number
+    /**
+     * o3d-acctmoney (Codex HIGH) — THE THIRD TERM OF `AmountDue`, AND WITHOUT IT THE IDENTITY IS
+     * WRONG ON EVERY UK CONSTRUCTION INVOICE.
+     *
+     * Xero's own arithmetic is `AmountDue = Total - CISDeduction - AmountPaid - AmountCredited`,
+     * not the three-term version the checks below were written against. `CISDeduction` is the
+     * amount a UK contractor withholds from a subcontractor under the Construction Industry
+     * Scheme and pays to HMRC instead of to the subcontractor. It comes off `AmountDue` and it is
+     * in NEITHER `AmountPaid` NOR `AmountCredited` NOR any collection this probe reads — there is
+     * no payment, no credit note, no prepayment and no overpayment behind it.
+     *
+     * ABSENT IS THE ORDINARY CASE and reads as ZERO: every invoice outside the scheme states no
+     * deduction, and it is a subtraction rather than a check, so nothing is skipped by its
+     * absence. An UNREADABLE one is a different thing entirely and refuses through
+     * `completenessCannotRun`, exactly as the four figures above it do — it is a figure Xero
+     * STATED that IMS cannot account for, and every identity below is built on it.
+     *
+     * `number | string` for the same reason `TotalAmt` below carries both: the decode is shared
+     * with every other money figure this file reads, so a numeric string is admitted here or the
+     * discipline is not the same discipline.
+     */
+    CISDeduction?: number | string
     Payments?: Array<{ PaymentID?: string; Date?: string; Amount?: number; Reference?: string }>
     CreditNotes?: XeroAppliedCollection
     Prepayments?: XeroAppliedCollection
@@ -577,6 +599,27 @@ export async function probeXeroSettlement(
           + 'cannot tell how much of the credit is already allocated',
       }
     }
+    // o3d-acctmoney — THE SAME QUESTION ASKED OF THIS ARM, AND THE ANSWER IS "NOT HERE", WITH A
+    // REASON RATHER THAN A SHRUG.
+    //
+    // The invoice arm above was wrong because `AmountDue` has a term this file did not know about.
+    // The obvious next move is to subtract a `CISDeduction` from `Total - RemainingCredit` too, and
+    // it is NOT taken, because the two arms are not symmetric in the direction they fail:
+    //
+    //   IF Xero reduces `RemainingCredit` by a deduction and this does not,   `applied` OVERSTATES,
+    //   the allocations fall short of it, and the probe REFUSES. A legitimate credit note holds
+    //   visibly and a human clears it — the same cost the invoice bug had, and a recoverable one.
+    //
+    //   IF Xero does NOT and this subtracts anyway,   `applied` UNDERSTATES. Take it to zero and
+    //   `statesAnything` is false, the shortfall check never runs, the empty allocation list is
+    //   "proved", and `classifyLedgerSettlement` answers `clear` — which authorises the money post.
+    //   That is the irreversible one, and it is the whole reason this module exists.
+    //
+    // `RemainingCredit = Total - SUM(Allocations)` is the construction this arm is written against
+    // and the one the comments below cite. Nothing in this repository, and nothing this branch can
+    // read without a live CIS tenant, says a credit note carries a deduction at all — and a probe
+    // is not the place to guess which way an unverified identity runs when one of the two guesses
+    // ends in a second payment. Filed rather than folded in; see the bd note on o3d-acctmoney.
     const applied = creditTotal.value !== null && remaining.value !== null
       ? subtractMoney(creditTotal.value, remaining.value)
       : null
@@ -676,15 +719,23 @@ export async function probeXeroSettlement(
   // Absent stays a skip on purpose: the `settled` fallback below EXISTS for a response that omits
   // `Total` and `AmountDue`, and an ordinary unsettled invoice that states no `AmountCredited` must
   // keep reading as the positive, empty answer it is.
+  //
+  // o3d-acctmoney: `CISDeduction` is read HERE, with the other four and through the same decoder,
+  // because it is the same kind of thing they are — a money figure on the wire, subject to the same
+  // magnitude discipline, whose absence skips nothing and whose UNREADABILITY must not be spent as
+  // permission. It is listed last only because it is the term that was missing; it is not optional
+  // to the arithmetic.
   const amountPaidRead = wireAmount(invoice.AmountPaid, invoiceCurrency)
   const totalRead = wireAmount(invoice.Total, invoiceCurrency)
   const amountDueRead = wireAmount(invoice.AmountDue, invoiceCurrency)
   const amountCreditedRead = wireAmount(invoice.AmountCredited, invoiceCurrency)
+  const cisDeductionRead = wireAmount(invoice.CISDeduction, invoiceCurrency)
   const cannotRun = completenessCannotRun([
     ['AmountPaid', amountPaidRead],
     ['Total', totalRead],
     ['AmountDue', amountDueRead],
     ['AmountCredited', amountCreditedRead],
+    ['CISDeduction', cisDeductionRead],
   ])
   if (cannotRun !== null) {
     return {
@@ -776,6 +827,13 @@ export async function probeXeroSettlement(
   const total = totalRead.value
   const amountDue = amountDueRead.value
   const amountCredited = amountCreditedRead.value
+  // o3d-acctmoney — ABSENT IS ZERO, AND IT IS THE ORDINARY INVOICE. An unreadable one never reaches
+  // here: `completenessCannotRun` above has already refused it. So the only two states left are
+  // "Xero stated a deduction" and "Xero stated none", and the second is arithmetically the first
+  // with a zero in it — which is why this is a `?? 0` and NOT another `!== null` guard. A guard here
+  // would put the identity back in the state the finding is about: correct on the documents that
+  // state the field and silently three-termed on the ones that do not.
+  const cisDeduction = cisDeductionRead.value ?? toDecimal(0)
   // o3d-obyd r31 (Codex HIGH 2) — TWO FORMS OF ONE FIGURE, AND THEY MUST AGREE OR NEITHER IS BELIEVED.
   //
   // THEY ARE ONE FIGURE, BY XERO'S OWN DEFINITION. `AmountDue = Total - AmountPaid - AmountCredited`,
@@ -805,7 +863,40 @@ export async function probeXeroSettlement(
   // THE BAND IS `completenessBand`, the same fraction of the document's own minor unit every other
   // completeness comparison in this file uses — not equality, because both sides are read from stated
   // decimals and the ordinary document agrees to the penny.
-  const settledFromTotals = total !== null && amountDue !== null ? subtractMoney(total, amountDue) : null
+  //
+  // o3d-acctmoney (Codex HIGH) — AND THE IDENTITY HAS A THIRD TERM, WHICH IS THE FIRST TIME THIS
+  // BRANCH'S TIGHTENING REFUSED A DOCUMENT XERO CAN LEGITIMATELY SEND.
+  //
+  // THE DEFECT. `AmountDue = Total - AmountPaid - AmountCredited` is only Xero's arithmetic OUTSIDE
+  // the UK Construction Industry Scheme. Inside it Xero also takes `CISDeduction` off `AmountDue` —
+  // money the contractor withholds and pays to HMRC rather than to the subcontractor. Codex's shape,
+  // reproduced: `Total 400, CISDeduction 80, AmountDue 320, AmountPaid 0, AmountCredited 0`. The
+  // check above then compared 80 against 0 and refused a WHOLLY UNPAID, PERFECTLY COHERENT invoice
+  // as self-contradictory, so the first payment against every CIS invoice — and every retry of it —
+  // was sent to manual resolution.
+  //
+  // WHY THAT MATTERS MORE THAN THE ARITHMETIC. Every other refusal in this file costs a document
+  // that IS malformed, or one whose collections IMS genuinely cannot measure. This one cost a
+  // document that is exactly right, on a whole class of UK invoice, on the FIRST payment — the most
+  // ordinary operation there is. A cross-check that refuses correct documents does not survive
+  // contact with the people who have to clear the queue; it gets deleted, and the duplicate-payment
+  // class it was protecting goes out with it.
+  //
+  // WHY THE TERM BELONGS TO `settled` AND NOT ONLY TO THE AGREEMENT CHECK BELOW. `settled` is spent
+  // twice — once against `settledFromComponents`, and once against `explained`, the sum of the
+  // payments and applied credit/prepayment/overpayment amounts. A CIS deduction appears in NONE of
+  // those collections, because there is no settlement behind it. Subtracting it only in the
+  // agreement check would have moved the same refusal one comparison later: `settled` 80,
+  // `explained` 0, and "80 already settled but only 0 of it is accounted for". So it is subtracted
+  // where the figure is CONSTRUCTED, and both identities inherit it.
+  //
+  // THE FALLBACK PAIR NEEDS NO SUCH TERM. `AmountPaid + AmountCredited` counts settlements, and the
+  // deduction is not one — it is the reason a subcontractor is owed less, not a thing that has been
+  // paid. The two derivations agree at `Total - AmountDue - CISDeduction` precisely because the
+  // deduction is what the four-term identity says it is.
+  const settledFromTotals = total !== null && amountDue !== null
+    ? subtractMoney(subtractMoney(total, amountDue), cisDeduction)
+    : null
   // Fallback for a response that omits the totals: the two component fields, which is still
   // strictly more than `AmountPaid` alone was.
   const settledFromComponents = amountPaid !== null && amountCredited !== null
@@ -817,7 +908,13 @@ export async function probeXeroSettlement(
     return {
       ok: false,
       reason: `Xero states two amounts settled against this document that do not agree — `
-        + `${formatLedgerMoney(settledFromTotals)} by Total less AmountDue and `
+        + `${formatLedgerMoney(settledFromTotals)} by Total less AmountDue`
+        // o3d-acctmoney: named only when there IS one, so the ordinary invoice's sentence is
+        // unchanged and a CIS invoice that still disagrees says which third term was taken off.
+        + (statesAnything(cisDeduction, invoiceCurrency)
+          ? ` less the ${formatLedgerMoney(cisDeduction)} CIS deduction`
+          : '')
+        + ` and `
         + `${formatLedgerMoney(settledFromComponents)} by AmountPaid plus AmountCredited. These are `
         + 'the same figure in Xero\'s own arithmetic, so the response is inconsistent and IMS cannot '
         + 'tell how much of the document is already settled from either of them',
@@ -1139,6 +1236,14 @@ export async function probeQuickBooksSettlement(
     })
   }
 
+  // o3d-acctmoney — AND THE THIRD IDENTITY WAS AUDITED FOR THE SAME OMISSION. `Balance` has no CIS
+  // term: the Construction Industry Scheme is a UK payroll deduction Xero models on the document and
+  // QuickBooks Online does not model at all. What DOES come off a QuickBooks `Balance` without being
+  // a payment — a deposit, a vendor credit, a credit memo, a journal entry — is money genuinely OFF
+  // the document, so `TotalAmt - Balance` counting it is CORRECT and it surfaces here as an
+  // unexplained amount rather than as a false agreement. That is the opposite of the CIS case, where
+  // the figure was never a settlement at all, and it is why this arm needs no change.
+  //
   // THE SHAPE-INDEPENDENT SETTLEMENT ACCOUNTING. Everything above depends on a list of type names
   // being right, and the bug this replaces was a list of type names being wrong. `TotalAmt` and
   // `Balance` are not names — they are the document's own account of how much of it has been
