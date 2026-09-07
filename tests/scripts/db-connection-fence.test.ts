@@ -56,6 +56,7 @@ import {
   PUBLIC_GRANTEE,
   STATE_ABSENT,
   STATE_CORRUPT,
+  STATE_COMPLETE_SENTINEL,
   STATE_PRESENT,
   STATE_UNREADABLE,
   assessDatabaseIdentity,
@@ -63,7 +64,6 @@ import {
   classifyStateShape,
   doFence,
   doRelease,
-  publishState,
   readState,
   assessEffectiveFence,
   assessMigrationRole,
@@ -80,7 +80,7 @@ import {
   verifyRelease,
 } from '@/scripts/fence-db-connections.mjs'
 import { protectedLibraryLines, writeFenceCheckout } from './fence-artefact-harness.ts'
-import { shellConstant } from './shell-symbol.ts'
+import { shellConstant, shellFunction } from './shell-symbol.ts'
 
 /**
  * resolve_fence_script(), lifted verbatim out of a shipped entrypoint (o3d-2sm1.5 r32).
@@ -111,7 +111,13 @@ const ATTACHED_AS_ADMIN = { connectedLoginRole: 'deployadmin', connectedEffectiv
  * (o3d-2sm1.5 r19). Nothing here derives them from a URL, because nothing in the helper does.
  */
 function suppliedIdentity(overrides: Partial<Record<'appHost' | 'appPort' | 'appUser' | 'appDatabase', string>> = {}) {
-  return { appHost: 'localhost', appPort: '5432', appUser: 'imsapp', appDatabase: 'onetwo3d_ims', ...overrides }
+  // stateOwnerUid TRAVELS WITH THE IDENTITY (o3d-secops r23). Since r23 every mode that acts on
+  // the authority record proves first that only the publishing account could have written it, and
+  // the caller says which uid that is — `--state-owner`, defaulted to 0 by parseArgs and set from
+  // `id -u` by the entrypoints, for the reason publish_durable_file() asks `id -u` instead of
+  // comparing against a literal: the property is "the privileged account that owns this install",
+  // and asking is what lets these regressions run unprivileged.
+  return { appHost: 'localhost', appPort: '5432', appUser: 'imsapp', appDatabase: 'onetwo3d_ims', stateOwnerUid: process.getuid?.() ?? 0, ...overrides }
 }
 
 /** The same four as command-line arguments, for the end-to-end runs. */
@@ -626,6 +632,42 @@ function stateDir(t: TestContext) {
   return dir
 }
 
+/**
+ * THE PRIVILEGED PUBLISHER, LIFTED OUT OF THE SHIPPED LIBRARY (o3d-secops r23).
+ *
+ * The helper has no writer for the authority record any more — that is the round's whole point —
+ * so every fixture below that needs a VALID record is published by the same program root
+ * publishes with, read out of scripts/lib/db-fence-protected.sh rather than re-implemented. A rig
+ * that wrote its own would be proving that its author can write a JSON file, and the three
+ * durability tests over it would be measuring the rig.
+ */
+const FENCE_LIBRARY = readFileSync(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'), 'utf8')
+/** The cutover namespace library, for the one predicate the fence library reaches back for. */
+const CUTOVER_NS_LIB_SOURCE = readFileSync(join(process.cwd(), 'scripts/lib/cutover-namespace.sh'), 'utf8')
+const AUTHORISE_PLAN_PROGRAM = (() => {
+  const opener = "readonly DB_FENCE_AUTHORISE_PLAN_PROGRAM='"
+  const from = FENCE_LIBRARY.indexOf(opener)
+  assert.notEqual(from, -1, 'the shipped library must hold the plan validator in one constant')
+  const to = FENCE_LIBRARY.indexOf("\n'\n", from)
+  assert.notEqual(to, -1, 'and that constant must be terminated')
+  return FENCE_LIBRARY.slice(from + opener.length, to + 1)
+})()
+
+/** Run the shipped validator over `plan`, exactly as root does. Returns its exit status. */
+function authorisePlan(plan: unknown, destination: string, database: string, appRole: string) {
+  const run = spawnSync('node', ['-e', AUTHORISE_PLAN_PROGRAM, '--', database, appRole, destination], {
+    input: `${JSON.stringify(plan)}\n`,
+    encoding: 'utf8',
+  })
+  return { status: run.status ?? -1, output: `${run.stdout}${run.stderr}` }
+}
+
+/** Publish a valid authority at `stateFile`, through the shipped validator, or throw. */
+function publishAuthority(stateFile: string, state: Record<string, unknown> = SAMPLE_STATE) {
+  const run = authorisePlan(state, stateFile, String(state.database), String(state.app_role))
+  assert.equal(run.status, 0, `the fixture must publish through the shipped validator:\n${run.output}`)
+}
+
 const SAMPLE_STATE = {
   database: 'imsdb',
   owner_role: 'owner',
@@ -761,7 +803,7 @@ test('the fence record is published atomically and ends with the completeness se
   const dir = stateDir(t)
   try {
     const stateFile = join(dir, 'db-connect-fence.json')
-    publishState(stateFile, SAMPLE_STATE)
+    publishAuthority(stateFile, SAMPLE_STATE)
 
     const body = readFileSync(stateFile, 'utf8')
     const keys = Object.keys(JSON.parse(body))
@@ -820,12 +862,12 @@ test('a publish that fails BEFORE the rename leaves the previous record byte for
   const dir = stateDir(t)
   try {
     const stateFile = join(dir, 'db-connect-fence.json')
-    publishState(stateFile, SAMPLE_STATE)
+    publishAuthority(stateFile, SAMPLE_STATE)
     const before = readFileSync(stateFile, 'utf8')
 
     chmodSync(dir, NO_WRITE)
     assert.throws(
-      () => publishState(stateFile, { ...SAMPLE_STATE, revoked: ['something else entirely'] }),
+      () => publishAuthority(stateFile, { ...SAMPLE_STATE, revoked: ['something else entirely'] }),
       /EACCES|EPERM/,
       'a publication that cannot create its temporary must throw, not return quietly',
     )
@@ -847,7 +889,7 @@ test('a publish whose POST-RENAME barrier fails throws, though the record is alr
   try {
     const stateFile = join(dir, 'db-connect-fence.json')
     chmodSync(dir, NO_READ)
-    assert.throws(() => publishState(stateFile, SAMPLE_STATE), /EACCES|EPERM/, 'an unprovable name must throw')
+    assert.throws(() => publishAuthority(stateFile, SAMPLE_STATE), /EACCES|EPERM/, 'an unprovable name must throw')
     chmodSync(dir, 0o700)
 
     // THE PRECONDITION, PROVED RATHER THAN ASSUMED: without it this could pass for a failure
@@ -882,87 +924,180 @@ test('the fence refuses to revoke when its record cannot be created at all', asy
   }
 })
 
-test('the fence refuses to revoke when its record is visible but its name is not durable', async (t) => {
-  // POST-RENAME side — the instant the finding names. The record is complete and readable at
-  // the authoritative path; a read-back would pass; a power loss can still restore the
-  // previous directory entry. Only publishState()'s throw can refuse here.
+test('the fence executes an authority it did not write, and revokes exactly what it names', async (t) => {
+  // o3d-secops r23, Codex CRITICAL. THE PUBLICATION LEFT THIS PROCESS. It runs as ${APP_USER}, so
+  // a record it can publish is a record that account can publish — and the record is what a later
+  // `--release` builds `GRANT CONNECT` out of. Root publishes it (db_fence_authorise_plan, above),
+  // and what is left here is an executor.
+  //
+  // The ordering property is unchanged and is now the SHELL's: db_fence_raise() publishes durably
+  // and only then invokes `--fence`. What this test holds is the other half of it — that the
+  // transaction revokes exactly the grantee list the authority names, and nothing derived here.
   const dir = stateDir(t)
-  try {
-    const stateFile = join(dir, 'db-connect-fence.json')
-    chmodSync(dir, NO_READ)
-    const client = new FakeAdminClient({ stateFile })
-    const code = await withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1, ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
-    chmodSync(dir, 0o700)
+  const stateFile = join(dir, 'db-connect-fence.json')
+  publishAuthority(stateFile, { ...SAMPLE_STATE, revoked: ['PUBLIC', 'owner', 'imsapp'] })
+  const client = new FakeAdminClient({ stateFile })
+  const code = await withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1, ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
 
-    // Precondition: the rename HAPPENED, so this is the post-rename side and not the other one.
-    assert.equal(existsSync(stateFile), true, 'the record must be visible at the authoritative path')
-    assert.match(readFileSync(stateFile, 'utf8'), /"state_complete": 1/, 'complete, and readable, at the moment of refusal')
-
-    assert.equal(code, EXIT_NOT_FENCEABLE, 'a record whose NAME is unproven must abort the fence')
-    assert.deepEqual(client.revokes, [], 'and NOTHING may be revoked')
-    assert.ok(!client.log.includes('BEGIN'), 'the transaction must never be opened')
-  } finally {
-    chmodSync(dir, 0o700)
-    rmSync(dir, { recursive: true, force: true })
-  }
+  assert.equal(code, EXIT_OK, 'the happy path must still fence')
+  assert.ok(client.fileAtBegin !== null, 'the record must exist before BEGIN, not after COMMIT')
+  const atBegin = JSON.parse(client.fileAtBegin as string)
+  assert.equal(atBegin.state_complete, 1, 'and be complete before BEGIN')
+  assert.deepEqual(
+    client.revokes,
+    [
+      'REVOKE CONNECT ON DATABASE "imsdb" FROM PUBLIC;',
+      'REVOKE CONNECT ON DATABASE "imsdb" FROM "owner";',
+      'REVOKE CONNECT ON DATABASE "imsdb" FROM "imsapp";',
+    ],
+    'and the transaction must revoke exactly what the AUTHORITY names',
+  )
+  // AND THE HELPER WROTE NOTHING. The record it acted on is byte-for-byte the one root published.
+  assert.equal(JSON.parse(readFileSync(stateFile, 'utf8')).fenced_at, SAMPLE_STATE.fenced_at,
+    'the executor must not have republished the record it was given')
 })
 
-test('the complete record is on the medium before the revoking transaction is opened', async (t) => {
-  // The positive half, observed at the wire: the fake snapshots the state file the instant it
-  // is asked for BEGIN. A publication ordered AFTER the transaction would leave it empty.
+test('the fence refuses when nothing privileged has recorded what it would revoke', async (t) => {
+  // THE REFUSAL THAT KEEPS THE OLD ASYMMETRY CLOSED (o3d-secops r23). A REVOKE is a committed
+  // transaction that survives a power cut and the record is the only thing that undoes it. Once
+  // this process stopped being the record's author, "no record" stopped being "start a fresh
+  // fence" and became "nothing has authorised this".
+  //
+  // MUTATION ROUTE (verified by making the change locally and re-running): delete the
+  // `if (!existing)` arm from doFence() and the fence proceeds with `existing.revoked` undefined —
+  // the run throws inside buildRevokeStatements() instead of refusing, and the caller's exit code
+  // stops distinguishing "nothing was revoked" from "the revokes may be standing".
   const dir = stateDir(t)
-  try {
-    const stateFile = join(dir, 'db-connect-fence.json')
-    const client = new FakeAdminClient({ stateFile })
-    const code = await withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1, ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
+  const stateFile = join(dir, 'db-connect-fence.json')
+  const client = new FakeAdminClient({ stateFile })
+  const code = await withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1, ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
 
-    assert.equal(code, EXIT_OK, 'the happy path must still fence')
-    assert.ok(client.fileAtBegin !== null, 'the record must exist before BEGIN, not after COMMIT')
-    const atBegin = JSON.parse(client.fileAtBegin as string)
-    assert.equal(atBegin.state_complete, 1, 'and be complete before BEGIN')
-    assert.deepEqual(
-      atBegin.revoked,
-      ['PUBLIC', 'owner', 'imsapp'],
-      'naming every grantee the transaction is about to revoke from',
-    )
-    assert.deepEqual(
-      client.revokes,
-      [
-        'REVOKE CONNECT ON DATABASE "imsdb" FROM PUBLIC;',
-        'REVOKE CONNECT ON DATABASE "imsdb" FROM "owner";',
-        'REVOKE CONNECT ON DATABASE "imsdb" FROM "imsapp";',
-      ],
-      'and the transaction must revoke exactly what the record names',
-    )
-  } finally {
-    rmSync(dir, { recursive: true, force: true })
-  }
+  assert.equal(code, EXIT_NOT_FENCEABLE, 'an unauthorised fence is NOT a fence')
+  assert.deepEqual(client.revokes, [], 'and NOTHING may be revoked')
+  assert.ok(!client.log.includes('BEGIN'), 'the transaction must never be opened')
+  assert.equal(existsSync(stateFile), false, 'and this process may not write the record it was missing')
 })
 
-test('a grantee that appeared since the fence was recorded is recorded durably before it is revoked', async (t) => {
-  // The append path, on the POST-RENAME side. The fence recorded earlier stays standing; the
-  // NEW grantee is not revoked, because the record that would restore it could not be proven.
+test('a grantee that appeared since the authority was published is refused, not revoked', async (t) => {
+  // The append path, inverted by r23. This process used to APPEND to the record and carry on,
+  // which it could do because it was the record's author. It is not, so a grantee the authority
+  // does not name is a REFUSAL: revoking it would take CONNECT from a role nothing would restore.
+  // A re-run re-plans and re-publishes, which is a whole-run cost and not a silent divergence.
+  //
+  // MUTATION ROUTE: delete the `appeared.length > 0` arm from doFence() and the run revokes from
+  // `owner` — a role the record does not list — so `--release` afterwards leaves it locked out.
   const dir = stateDir(t)
-  try {
-    const stateFile = join(dir, 'db-connect-fence.json')
-    publishState(stateFile, { ...SAMPLE_STATE, revoked: ['PUBLIC'] })
-    const before = readFileSync(stateFile, 'utf8')
+  const stateFile = join(dir, 'db-connect-fence.json')
+  publishAuthority(stateFile, { ...SAMPLE_STATE, revoked: ['PUBLIC'] })
+  const before = readFileSync(stateFile, 'utf8')
+  const client = new FakeAdminClient({ stateFile })
+  const code = await withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1, ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
 
-    chmodSync(dir, NO_READ)
-    const client = new FakeAdminClient({ stateFile })
-    const code = await withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1, ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
-    chmodSync(dir, 0o700)
+  assert.equal(code, EXIT_NOT_FENCEABLE, 'a fence wider than its authority must abort')
+  assert.deepEqual(client.revokes, [], 'and the newly appeared grantees must NOT be revoked')
+  assert.ok(!client.log.includes('BEGIN'), 'the transaction must never be opened')
+  assert.equal(readFileSync(stateFile, 'utf8'), before, 'and the authority must be untouched by this process')
+})
 
-    assert.equal(code, EXIT_NOT_FENCEABLE, 'an unrecordable append must abort')
-    assert.deepEqual(client.revokes, [], 'and the newly appeared grantees must NOT be revoked')
-    assert.ok(!client.log.includes('BEGIN'), 'the transaction must never be opened')
-    // The rename landed, so the visible record now names the appended grantees; what matters
-    // is that the DATABASE was not changed to match a record that may not survive.
-    assert.notEqual(readFileSync(stateFile, 'utf8'), before, 'precondition: the append reached the rename')
-  } finally {
-    chmodSync(dir, 0o700)
-    rmSync(dir, { recursive: true, force: true })
+test('a record this account could have written is never a record (o3d-secops r23)', async (t) => {
+  // THE LOAD-BEARING ONE. A planted fence-state file cannot cause a GRANT.
+  //
+  // Three plants, three refusals, and the refusal is the same in every case: the record is not
+  // read at all. The directory question is asked FIRST and is the more important of the two —
+  // `unlink(2)` and `rename(2)` ask for write permission on the PARENT and nothing about the
+  // file, so a record's own owner says nothing while its directory is writable by somebody else.
+  //
+  // MUTATION ROUTE: replace readAuthorityRecord() with readState() in doRelease() — which is
+  // exactly what r22 shipped — and every case below GRANTS: the planted grantee list is executed
+  // over the admin connection and the run reports "Connection fence released".
+  const dir = stateDir(t)
+  const stateFile = join(dir, 'db-connect-fence.json')
+  const planted = { ...SAMPLE_STATE, revoked: ['PUBLIC', 'attacker'], state_complete: 1 }
+
+  // 1. THE DIRECTORY IS WRITABLE BY SOMEBODY ELSE. The record itself is impeccable.
+  publishAuthority(stateFile, SAMPLE_STATE)
+  chmodSync(dir, 0o707)
+  const shared = new FakeAdminClient({ stateFile })
+  const sharedCode = await withAdminUrl(() => doRelease(shared as never, { stateFile, appRole: 'imsapp', ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
+  chmodSync(dir, 0o700)
+  assert.notEqual(sharedCode, EXIT_OK, 'a record in a directory anybody may write must never license a release')
+  assert.deepEqual(shared.grants, [], 'and NOTHING may be granted')
+
+  // 2. THE RECORD IS NOT THE PUBLISHING ACCOUNT'S. Same bytes, an owner the caller does not claim.
+  writeFileSync(stateFile, `${JSON.stringify(planted, null, 2)}\n`)
+  const foreign = new FakeAdminClient({ stateFile })
+  const foreignCode = await withAdminUrl(() => doRelease(foreign as never, {
+    stateFile, appRole: 'imsapp', ...suppliedIdentity({ appDatabase: 'imsdb' }), stateOwnerUid: (process.getuid?.() ?? 0) + 4242,
+  }))
+  assert.notEqual(foreignCode, EXIT_OK, 'a record the publishing account did not write must never license a release')
+  assert.deepEqual(foreign.grants, [], 'and NOTHING may be granted')
+
+  // 3. AND THE SAME AT THE OTHER END — a planted record may not drive a REVOKE either.
+  const fencing = new FakeAdminClient({ stateFile })
+  const fenceCode = await withAdminUrl(() => doFence(fencing as never, {
+    stateFile, appRole: 'imsapp', timeoutSeconds: 1, ...suppliedIdentity({ appDatabase: 'imsdb' }), stateOwnerUid: (process.getuid?.() ?? 0) + 4242,
+  }))
+  assert.equal(fenceCode, EXIT_NOT_FENCEABLE, 'nor a fence')
+  assert.deepEqual(fencing.revokes, [], 'and NOTHING may be revoked')
+
+  // THE PRECONDITION, PROVED RATHER THAN ASSUMED: the same record, with its provenance intact,
+  // IS acted on. Without this the three refusals above could be refusals for any other reason.
+  publishAuthority(stateFile, SAMPLE_STATE)
+  const genuine = new FakeAdminClient({ stateFile, releasedDatacl: '{owner=CTc/owner,=Tc/owner,imsapp=c/owner}' })
+  const genuineCode = await withAdminUrl(() => doRelease(genuine as never, { stateFile, appRole: 'imsapp', ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
+  assert.equal(genuineCode, EXIT_OK, `a record root published must still release:\n${genuine.log.join(' | ')}`)
+  assert.deepEqual(genuine.grants, [
+    'GRANT CONNECT ON DATABASE "imsdb" TO PUBLIC;',
+    'GRANT CONNECT ON DATABASE "imsdb" TO "imsapp";',
+  ], 'restoring exactly what it names')
+})
+
+test('the privileged validator rebuilds the record and refuses what it cannot check', (t) => {
+  // ROUTE: the shipped DB_FENCE_AUTHORISE_PLAN_PROGRAM, run exactly as db_fence_authorise_plan()
+  // runs it. It is the only thing that writes the authority, so what it will not accept is the
+  // whole of what can ever be in one.
+  const dir = stateDir(t)
+  const stateFile = join(dir, 'db-connect-fence.json')
+  const plan = { ...SAMPLE_STATE, revoked: ['PUBLIC', 'imsapp'] }
+
+  // THE FIELDS ARE A WHITELIST, NOT A FILTER. Anything the plan carries that the template does
+  // not name is dropped — including `undo_sql`, which used to be a second source of truth for the
+  // statements a release runs and could disagree with `revoked`.
+  const extra = authorisePlan({ ...plan, undo_sql: ['DROP DATABASE "imsdb";'], evil: 'x' }, stateFile, 'imsdb', 'imsapp')
+  assert.equal(extra.status, 0, `a valid plan must publish:\n${extra.output}`)
+  const published = JSON.parse(readFileSync(stateFile, 'utf8'))
+  assert.deepEqual(Object.keys(published), ['database', 'owner_role', 'app_role', 'admin_role', 'revoked', 'datacl_before', 'fenced_at', 'state_complete'],
+    'the published record is root\'s template, not the request')
+  assert.equal(published.state_complete, STATE_COMPLETE_SENTINEL, 'and it ends with the sentinel the reader requires')
+
+  // AND IT IS CHECKED AGAINST WHAT ROOT SUPPLIED, not against itself.
+  const wrongDatabase = authorisePlan(plan, stateFile, 'somewhere-else', 'imsapp')
+  assert.notEqual(wrongDatabase.status, 0, 'a plan naming another database must be refused')
+  assert.match(wrongDatabase.output, /this run is fencing/, 'and say which two disagreed')
+
+  const wrongRole = authorisePlan(plan, stateFile, 'imsdb', 'someone-else')
+  assert.notEqual(wrongRole.status, 0, 'a plan naming another application role must be refused')
+
+  for (const [what, broken] of [
+    ['a plan that is not an object', ['PUBLIC']],
+    ['a plan with no grantees', { ...plan, revoked: [] }],
+    ['a grantee that is not a string', { ...plan, revoked: ['PUBLIC', 7] }],
+    ['a grantee carrying a control character', { ...plan, revoked: ['PUBLIC', 'ims\napp'] }],
+    ['a duplicate grantee', { ...plan, revoked: ['PUBLIC', 'PUBLIC'] }],
+    ['a timestamp that is not one', { ...plan, fenced_at: 'yesterday' }],
+  ] as const) {
+    const run = authorisePlan(broken, stateFile, 'imsdb', 'imsapp')
+    assert.notEqual(run.status, 0, `${what} must be refused:\n${run.output}`)
+    assert.match(run.output, /NOT AUTHORISED/, `and say so: ${what}`)
   }
+
+  // AND IT WILL NOT PUBLISH INTO A DIRECTORY SOMEBODY ELSE MAY WRITE, which is the property the
+  // whole round rests on: the check is made in the same process that does the rename.
+  chmodSync(dir, 0o707)
+  const exposed = authorisePlan(plan, stateFile, 'imsdb', 'imsapp')
+  chmodSync(dir, 0o700)
+  assert.notEqual(exposed.status, 0, 'a group- or other-writable destination must be refused')
+  assert.match(exposed.output, /writable by group or other/, 'and name the reason')
 })
 
 test('the fence refuses to re-apply a record written for another database', async (t) => {
@@ -980,7 +1115,7 @@ test('the fence refuses to re-apply a record written for another database', asyn
   const dir = stateDir(t)
   try {
     const stateFile = join(dir, 'db-connect-fence.json')
-    publishState(stateFile, { ...SAMPLE_STATE, database: 'otherdb', revoked: ['PUBLIC', 'otherapp'] })
+    publishAuthority(stateFile, { ...SAMPLE_STATE, database: 'otherdb', revoked: ['PUBLIC', 'otherapp'] })
     const before = readFileSync(stateFile, 'utf8')
 
     // The connection is attached to imsdb — FakeAdminClient reports it as current_database() —
@@ -1170,7 +1305,7 @@ test('--release restores exactly the recorded grantees when the record survived'
   const dir = stateDir(t)
   try {
     const stateFile = join(dir, 'db-connect-fence.json')
-    publishState(stateFile, SAMPLE_STATE)
+    publishAuthority(stateFile, SAMPLE_STATE)
     const client = new FakeAdminClient({
       stateFile,
       releasedDatacl: '{owner=CTc/owner,=Tc/owner,imsapp=c/owner}',
@@ -1182,7 +1317,13 @@ test('--release restores exactly the recorded grantees when the record survived'
       'GRANT CONNECT ON DATABASE "imsdb" TO PUBLIC;',
       'GRANT CONNECT ON DATABASE "imsdb" TO "imsapp";',
     ])
-    assert.equal(existsSync(stateFile), false, 'and the record goes only once the grants are verified back')
+    // o3d-secops r23: THIS PROCESS DOES NOT REMOVE THE RECORD. An unlink is a write to the
+    // directory, and that directory is root's. Root clears it — db_fence_clear_authority(), called
+    // by every entrypoint AFTER a verified release — and until then the record describes a fence
+    // that has been released, which is the safe way round: a `--fence` over it re-applies the same
+    // grantee list, a second `--release` re-grants what is already granted, and removing it first
+    // would lose the only account of what was revoked.
+    assert.equal(existsSync(stateFile), true, 'the executor must not unlink a record it cannot write')
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -1376,7 +1517,7 @@ test('a release over an unbound connection restores nothing, however good its re
   const dir = stateDir(t)
   try {
     const stateFile = join(dir, 'db-connect-fence.json')
-    publishState(stateFile, SAMPLE_STATE)
+    publishAuthority(stateFile, SAMPLE_STATE)
     const client = new FakeAdminClient({ stateFile, releasedDatacl: '{owner=CTc/owner,=Tc/owner,imsapp=c/owner}' })
     const code = await withMismatchedUrls(() => doRelease(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1, ...MISMATCHED_IDENTITY }))
 
@@ -1399,7 +1540,7 @@ test('a release refuses when the record it holds was written for another databas
   const dir = stateDir(t)
   try {
     const stateFile = join(dir, 'db-connect-fence.json')
-    publishState(stateFile, { ...SAMPLE_STATE, database: 'elsewhere' })
+    publishAuthority(stateFile, { ...SAMPLE_STATE, database: 'elsewhere' })
     const client = new FakeAdminClient({ stateFile, connectedDatabase: 'imsdb' })
     const code = await withAdminUrl(() => doRelease(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1, ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
 
@@ -1501,6 +1642,10 @@ test('a fence that committed its revokes and could not shut the application out 
   const dir = stateDir(t)
   try {
     const stateFile = join(dir, 'db-connect-fence.json')
+    // o3d-secops r23: the authority is published by ROOT before `--fence` is invoked; this
+    // process executes it and never writes it. The fixture publishes it through the same
+    // validator root uses.
+    publishAuthority(stateFile, { ...SAMPLE_STATE, revoked: ['PUBLIC', 'owner', 'imsapp'] })
     const client = new FakeAdminClient({ stateFile, stillConnectsAfter: true })
     const code = await withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1, ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
 
@@ -1519,6 +1664,8 @@ test('a fence whose room will not go quiet says the fence is STANDING', async (t
   const dir = stateDir(t)
   try {
     const stateFile = join(dir, 'db-connect-fence.json')
+    // o3d-secops r23: the authority is published by ROOT before `--fence` is invoked.
+    publishAuthority(stateFile, { ...SAMPLE_STATE, revoked: ['PUBLIC', 'owner', 'imsapp'] })
     const client = new FakeAdminClient({
       stateFile,
       attached: [{ pid: 4242, application_name: 'psql', usename: 'someone' }],
@@ -1542,6 +1689,10 @@ test('an error thrown AFTER the commit is a standing fence, not an exception the
   const dir = stateDir(t)
   try {
     const stateFile = join(dir, 'db-connect-fence.json')
+    // o3d-secops r23: the authority is published by ROOT before `--fence` is invoked; this
+    // process executes it and never writes it. The fixture publishes it through the same
+    // validator root uses.
+    publishAuthority(stateFile, { ...SAMPLE_STATE, revoked: ['PUBLIC', 'owner', 'imsapp'] })
     const client = new FakeAdminClient({ stateFile, throwAfterCommit: 'server closed the connection unexpectedly' })
     const code = await withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1, ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
 
@@ -1761,6 +1912,10 @@ test('a COMMIT whose acknowledgement never arrives is a fence that MAY BE STANDI
   const dir = stateDir(t)
   try {
     const stateFile = join(dir, 'db-connect-fence.json')
+    // o3d-secops r23: the authority is published by ROOT before `--fence` is invoked; this
+    // process executes it and never writes it. The fixture publishes it through the same
+    // validator root uses.
+    publishAuthority(stateFile, { ...SAMPLE_STATE, revoked: ['PUBLIC', 'owner', 'imsapp'] })
     const client = new FakeAdminClient({ stateFile, failCommitAck: 'Connection terminated unexpectedly' })
     const code = await withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1, ...suppliedIdentity({ appDatabase: 'imsdb' }) }))
 
@@ -1796,6 +1951,8 @@ test('a failure BEFORE the COMMIT is issued still rolls back and still reports a
         return super.query(text)
       }
     }
+    // o3d-secops r23: the authority is published by ROOT before `--fence` is invoked.
+    publishAuthority(stateFile, { ...SAMPLE_STATE, revoked: ['PUBLIC', 'owner', 'imsapp'] })
     const client = new RefusingClient({ stateFile })
     await assert.rejects(
       () => withAdminUrl(() => doFence(client as never, { stateFile, appRole: 'imsapp', timeoutSeconds: 1, ...suppliedIdentity({ appDatabase: 'imsdb' }) })),
@@ -2389,7 +2546,11 @@ test('o3d-2sm1.5 r19/r32: the four options are parsed, and no file is read from 
   //    MUTATION ROUTE: drop any `--app-*` arm from parseArgs() and the matching assertion fails.
   assert.deepEqual(
     parseArgs(['--release', '--app-host=db.internal', '--app-port=6432', '--app-user=imsapp', '--app-database=imsdb', '--state-file=/x']),
-    { mode: 'release', stateFile: '/x', appRole: '', timeoutSeconds: 30, appHost: 'db.internal', appPort: '6432', appUser: 'imsapp', appDatabase: 'imsdb' },
+    // o3d-secops r23: and stateOwnerUid, whose DEFAULT is the load-bearing half. Every real
+    // invocation of this file is composed by a root-owned script or a root-owned wrapper, so the
+    // safe value is the one a caller gets without asking; `--state-owner` exists so an
+    // unprivileged harness can exhibit the mechanism.
+    { mode: 'release', stateFile: '/x', stateOwnerUid: 0, appRole: '', timeoutSeconds: 30, appHost: 'db.internal', appPort: '6432', appUser: 'imsapp', appDatabase: 'imsdb' },
   )
   // And nothing remains that would take a unit name or a systemctl path.
   const withUnit = parseArgs(['--fence', '--service-unit=one-two-inventory.service', '--systemctl=/x/systemctl']) as Record<string, unknown>
@@ -2990,7 +3151,9 @@ test('o3d-2sm1.5 r22: the re-read stands at the fence, at the release, and after
     //    refusal — and it must come before the --fence invocation, not after it.
     const fence = source.indexOf('fence_db_connections() {')
     const preFence = source.indexOf('require_start_identity_unchanged ||', fence)
-    const raised = source.indexOf('--fence --state-file', fence)
+    // o3d-secops r23: the invocation is db_fence_raise(), which plans, publishes the authority as
+    // root and only then issues `--fence`. The anchor moves with it.
+    const raised = source.indexOf('db_fence_raise', fence)
     assert.ok(fence > 0 && preFence > fence && preFence < raised, `${name}: re-read before the fence is raised`)
 
     // 2. AND 3. THE START PATH, in order: re-read (fence HELD) -> release -> remove the reboot
@@ -3290,7 +3453,7 @@ test('o3d-2sm1.5 r23: the trap re-fences the database it migrated even when the 
     const start = source.indexOf('refence_db_connections() {')
     assert.ok(start > 0, `${script}: precondition — the trap re-fences through a function of its own`)
     const lifted = source.slice(start, source.indexOf('\n  return 0\n}\n', start) + 14)
-    assert.ok(lifted.includes('--fence --state-file'), `${script}: and the lifted body is the one that issues it`)
+    assert.ok(lifted.includes('db_fence_raise'), `${script}: and the lifted body is the one that issues it`)
 
     // A REAL FILE, because the shipped function refuses when the fence script is missing — and a
     // test whose every call refused there would prove nothing about the guard under test.
@@ -3331,24 +3494,37 @@ test('o3d-2sm1.5 r23: the trap re-fences the database it migrated even when the 
         'DEPLOY_ADMIN_DATABASE_URL="postgresql://admin@127.0.0.1:5432/main"',
         'DATABASE_URL="postgresql://app:pw@127.0.0.1:5432/main"',
         'APP_USER="app"',
-        'DB_FENCE_STATE="/tmp/state.json"',
+        // o3d-secops r23: the authority is published by root into a directory only root may
+        // write, and db_fence_publish_authority() REFUSES anywhere else — so the harness points it
+        // at its own private temporary rather than at /tmp, which is 1777.
+        `DB_FENCE_STATE=${JSON.stringify(join(fenceDir, 'state.json'))}`,
         'DB_FENCE_RELEASE_CMD="release"',
         'MIGRATION_DATABASE_URL=""',
         'DB_FENCE_IDENTITY_ARGS=(--app-host=127.0.0.1 --app-port=5432 --app-user=app --app-database=main)',
         `SCHEMA_TOUCHED=${schemaTouched}`,
         `DB_FENCE_RAISED=${raised}`,
         'require_db_identity() { return 0; }',
+        // o3d-secops r23: raising a fence is plan -> authorise -> execute, so the rig carries the
+        // orchestration (from the sourced library), the namespace library's directory predicate,
+        // and the one adapter each entrypoint supplies for itself.
+        shellFunction(CUTOVER_NS_LIB_SOURCE, 'dir_is_private_to_this_run'),
+        shellFunction(source, 'db_fence_helper'),
         // THE STILL-PRESENT DISAGREEMENT: the unit acquired another environment source and the
         // gate keeps saying so, exactly as it does upstream.
         `require_env_file_is_sole_definition() { ${soleOk ? 'return 0' : 'return 1'}; }`,
         'warn() { :; }',
-        `${runner}() { printf "CALL %s\\n" "$*"; return 0; }`,
+        // THE PRIVILEGE DROP, STUBBED — and it answers `--plan` the way the shipped mode does,
+        // because root validates the plan against the identity IT supplied. CALL goes to STDERR so
+        // that the plan is the only thing on stdout: a diagnostic line there would be a corrupt
+        // record, which is exactly the property the shipped `--plan` mode is written around.
+        `${runner}() { printf "CALL %s\\n" "$*" >&2; case "$*" in *--plan*) printf '{"database":"main","owner_role":"app","app_role":"app","admin_role":"admin","revoked":["PUBLIC","app"],"datacl_before":null,"fenced_at":"2026-01-01T00:00:00.000Z"}\\n' ;; esac; return 0; }`,
         lifted,
         'refence_db_connections || printf "RETURNED-NONZERO\\n"',
       ].join('\n')
       const run = spawnSync('bash', ['-c', bash, 'refence', fenceScript], { encoding: 'utf8' })
       assert.equal(run.status, 0, `${script}: ${run.stderr}`)
-      return run.stdout ?? ''
+      // Both streams: the CALL log is on stderr since r23 so that stdout can carry the plan.
+      return `${run.stdout ?? ''}${run.stderr ?? ''}`
     }
 
     // THE RECOVERY PATH: schema touched, unit disagreeing. The re-fence must happen anyway.
