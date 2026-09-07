@@ -526,6 +526,45 @@ BACKUP_FILE=""
 # expression in all three scripts, defaulting to the application data directory — what the
 # installed unit's AssertPathExists= already names and what docs/installation.md documents.
 readonly CUTOVER_STATE_DIR="${IMS_CUTOVER_STATE_DIR:-${IMS_DEPLOY_STATE_DIR:-${IMS_DATA_DIR:-/var/lib/one-two-inventory}}}"
+# THE HALF OF THE CUTOVER NAMESPACE THAT IS A ROOT-SIDE TARGET (o3d-secops r22, Codex CRITICAL x2).
+#
+# ${CUTOVER_STATE_DIR} above is the APPLICATION'S OWN data directory and is owned by ${APP_USER}:
+# that is what it is for, and it is why `unlink(2)` and `rename(2)` on every name directly beneath
+# it belong to that account. Two of the things this script put there were opened or created BY
+# ROOT, which made both of them primitives rather than state:
+#
+#   ${CUTOVER_STATE_DIR}/cutover.lock  opened `exec 9>`, i.e. O_WRONLY|O_CREAT|O_TRUNC, as root,
+#                                      on a name that account could replace with a symlink to any
+#                                      file root may write. The target was TRUNCATED before the
+#                                      `flock` was even reached, and the `flock` that followed
+#                                      proved only that a lock had been taken, never that it had
+#                                      been taken on this file.
+#   ${CUTOVER_STATE_DIR}/deploy        created `mkdir -p`, which ACCEPTS a symlink-to-directory at
+#                                      the final component, and then `chown`ed and `chmod`ed by
+#                                      path — both of which dereference — handing whatever that
+#                                      link pointed at to ${APP_USER} at mode 0700.
+#
+# SO THEY LIVE UNDER A ROOT-OWNED PARENT, AND THE PATH IS A LITERAL, for exactly the reasons
+# written out for ${DB_ENV_SNAPSHOT_DIR} below: an override only a root-owned source may set is
+# indistinguishable from no override, and a privileged path resolved from a variable the
+# application can set is not a privileged path. Nobody but root may create, replace or unlink a
+# name inside /etc/ims-cutover-state, so there is no symlink left to plant at either of them.
+#
+# WHY NOT /etc/ims-cutover, WHICH r20 ALREADY CREATED. Because that one is 0700 and has to stay
+# 0700 — it holds ${DB_ENV_SNAPSHOT_FILE}, which carries the database password, and ${FENCE_FILE},
+# which is the boot authority — while the connection-fence directory has to be WRITABLE by
+# ${APP_USER}, since the fence script runs as that account. A directory nobody may traverse is
+# writable by nobody. Relaxing the one directory on the box that exists to be private, so that a
+# lock file could live beneath it, is not a trade worth making; this round does not touch it at
+# all. /etc/ims-cutover-state is 0755 and root-owned — the same shape ${DB_FENCE_RECOVERY_DIR}
+# already has, for the same reason.
+#
+# WHAT DOES NOT MOVE: the crontab backup and the crontab lock directory, which stay in
+# ${CUTOVER_STATE_DIR}. The crontab lock is already root-owned inside a root-owned subdirectory
+# and never followed (lib/crontab-lock.sh, r24 CRITICAL). The backup is its own finding and a
+# different shape — nothing truncates or dereferences it; what is wrong is that its PRESENCE and
+# its ABSENCE at that name are both read as answers — and moving the file would not fix that.
+readonly CUTOVER_ROOT_DIR="/etc/ims-cutover-state"
 # THE MARKER'S PARENT DECIDES WHO CAN REMOVE IT (o3d-secops r20, Codex CRITICAL).
 #
 # ${FENCE_FILE} used to default inside ${CUTOVER_STATE_DIR}, which is the application's own data
@@ -580,7 +619,14 @@ readonly LEGACY_STATE_DIR_FENCE_FILE="${CUTOVER_STATE_DIR}/DEPLOY-FENCED"
 readonly CRON_BACKUP="${CUTOVER_STATE_DIR}/crontab-${APP_USER}.bak"
 FENCE_DROPIN_DIR="/etc/systemd/system/${SERVICE_UNIT}.d"
 FENCE_DROPIN_FILE="${FENCE_DROPIN_DIR}/zz-deploy-fence.conf"
-readonly DB_FENCE_DIR="${CUTOVER_STATE_DIR}/deploy"
+# Under the root-owned parent since o3d-secops r22, and still owned by ${APP_USER} at 0700,
+# because the connection fence script writes it AS that account. A directory the service
+# account may write, whose NAME only root may create, is both of those things at once.
+readonly DB_FENCE_DIR="${CUTOVER_ROOT_DIR}/db-fence"
+# Where the pair above lived before r22. Nothing writes here any more; a run that finds a
+# connection-fence record at this path says so and refuses to read it — see
+# import_relocated_fence_marker() and warn_pre_r22_db_fence_state().
+readonly LEGACY_STATE_DIR_DB_FENCE_STATE="${CUTOVER_STATE_DIR}/deploy/db-connect-fence.json"
 readonly DB_FENCE_STATE="${DB_FENCE_DIR}/db-connect-fence.json"
 # THE ENVIRONMENT THE STARTED SERVICE IS BOUND TO (o3d-2sm1.5 r23, Codex HIGH).
 #
@@ -645,7 +691,9 @@ DB_ENV_SNAPSHOT_DROPIN_FILE="${FENCE_DROPIN_DIR}/${DB_ENV_SNAPSHOT_DROPIN_NAME}"
 # ONE lock for all three entrypoints. This script held ${DATA_DIR}/update.lock and deploy.sh
 # held its own, so "refusing to run two cutovers at once" was true of two updates and false
 # of an update racing a deploy; install.sh took no lock at all.
-LOCK_FILE="${CUTOVER_STATE_DIR}/cutover.lock"
+# Under the root-owned parent since o3d-secops r22; see ${CUTOVER_ROOT_DIR} above, and
+# lib/cutover-namespace.sh for how it is opened, judged and locked.
+LOCK_FILE="${CUTOVER_ROOT_DIR}/cutover.lock"
 # The namespace deploy.sh wrote to before this round. Nothing writes here any more, and a run
 # that finds state at these paths IMPORTS it into the canonical namespace before it changes a
 # unit or a crontab — see import_legacy_cutover_state().
@@ -742,6 +790,11 @@ source "${IMS_SCRIPT_LIB_DIR}/db-fence-protected.sh" || {
 # shellcheck source=lib/crontab-lock.sh
 source "${IMS_SCRIPT_LIB_DIR}/crontab-lock.sh" || {
   echo "FATAL: ${IMS_SCRIPT_LIB_DIR}/crontab-lock.sh could not be sourced. It is the only exclusion between this script's crontab writes and the running application's, and without it a cutover can silently discard a schedule an operator has just saved. Nothing has been changed." >&2
+  exit 1
+}
+# shellcheck source=lib/cutover-namespace.sh
+source "${IMS_SCRIPT_LIB_DIR}/cutover-namespace.sh" || {
+  echo "FATAL: ${IMS_SCRIPT_LIB_DIR}/cutover-namespace.sh could not be sourced. It is the only thing in this repository that creates a directory beneath a root-owned parent, takes ownership of one, or opens the shared cutover lock, and without it this run would have to resolve those paths by name as root. Nothing has been changed." >&2
   exit 1
 }
 # The lock lives inside the service's systemd StateDirectory, which is ${DATA_DIR} — the same path
@@ -1962,7 +2015,7 @@ readonly PUBLISH_STAGE_DIRNAME=".ims-publish"
 # destination that matches no root is REFUSED — a new publication site outside these six fails
 # loudly at install time instead of silently resolving its own path.
 publish_trust_root_candidates() {
-  printf '%s\n' "${APP_DIR:-}" "${DATA_DIR:-}" "${CUTOVER_STATE_DIR:-}" "${DB_ENV_SNAPSHOT_DIR:-}" "${DB_CA_PUBLISH_DIR:-}" "${DB_FENCE_RECOVERY_DIR:-}"
+  printf '%s\n' "${APP_DIR:-}" "${DATA_DIR:-}" "${CUTOVER_STATE_DIR:-}" "${CUTOVER_ROOT_DIR:-}" "${DB_ENV_SNAPSHOT_DIR:-}" "${DB_CA_PUBLISH_DIR:-}" "${DB_FENCE_RECOVERY_DIR:-}"
 }
 
 # WHETHER "$1" MAY BE A STARTING POINT FOR THE WALK — PROVEN BY WALKING TO IT (o3d-rn10 r4).
@@ -2654,115 +2707,129 @@ fence_marker_is_trustworthy() {
 # the authoritative one and the other is debris this run clears. The alternative — dying — would
 # strand the ordinary retry loop, because a cutover that adopts and fails again leaves exactly this
 # state. It is said out loud rather than passed over in silence.
-# AND THE SOURCE IS PINNED BEFORE A BYTE OF IT IS BELIEVED (o3d-secops r21, Codex HIGH).
+# AND ITS CONTENT IS NOT BELIEVED, BECAUSE IT CANNOT BE (o3d-secops r22, Codex HIGH).
 #
-# r20 moved the marker OUT of ${CUTOVER_STATE_DIR} and then had this function reach back into it BY
-# NAME: `[[ -f ]]`, which FOLLOWS A SYMLINK and asks nothing about who wrote what it found, and then
-# a redirection that resolves the same name a SECOND time, as root, straight into the privileged
-# publisher. So the account the fence exists to stop could leave a marker of its own at that name —
-# or a link to any file root can read — and the relocation would launder it into root-owned state at
-# ${FENCE_FILE}, where every destination check (regular file, owned by this run, 0600, private
-# parent) passes BECAUSE THE PUBLICATION MADE THEM PASS. Validating the copy proves the copy is
-# well-formed. It says nothing about where the bytes came from.
+# r21 pinned the SOURCE of this relocation to a descriptor: one `open(2)` with `O_NOFOLLOW`, then
+# every fact taken from the `fstat` of that descriptor — a regular file, owned by this run's uid,
+# not group- or other-writable, and with exactly ONE link — and the bytes copied from the same
+# descriptor rather than from the name a second time. Every one of those checks is sound. Together
+# they still do not establish the thing the relocation needed, and `st_nlink` is where that
+# becomes visible.
 #
-# The source's PARENT cannot be part of the answer here, which is what makes this different from
-# fence_marker_is_trustworthy(): the legacy path is inside the service account's own directory by
-# definition — that is why the marker was moved — so nothing about that directory is ever
-# reassuring. What is left is the file itself, and the only trustworthy way to ask about the file
-# itself is to HOLD it. scripts/lib/pin-source-file.mjs opens the name ONCE with `O_NOFOLLOW`,
-# judges the DESCRIPTOR (regular file, owned by this run's uid, not group- or other-writable, and
-# exactly one link), proves the descriptor is that name's own inode, and copies the bytes from the
-# descriptor. Same move as chown-tree.mjs, applied to a source instead of a destination: open once,
-# judge the descriptor, read the descriptor — never the name twice.
+# THE LINK COUNT IS A FACT ABOUT THE PRESENT, NOT ABOUT THE PAST. r21 argued that `st_nlink` was
+# "a fact about the inode being held", and it is; what it is not is a fact about the inode's
+# HISTORY. It says no second name exists AT THE MOMENT OF THE fstat. It cannot say none ever did.
+# The service account can link a root-owned 0600 inode whose CONTENT IT INFLUENCED into a directory
+# it controls, unlink the other name, and leave exactly one link at a path of its choosing — and
+# this branch creates root-owned mode-0600 files out of ${APP_USER}-controlled content on every
+# run: ${CRON_BACKUP} is that account's own crontab, written by root, at 0600, in that account's
+# own directory. `fs.protected_hardlinks` normally forbids linking to a file you neither own nor
+# may write, and r21 said so — and then rested on it anyway, which is resting a privilege boundary
+# on a sysctl this script does not set and cannot read back meaningfully.
 #
-# AND A REFUSAL ENDS THE RUN. It is tempting to skip the relocation and carry on, and it is the one
-# answer that cannot be given: an entry at ${LEGACY_STATE_DIR_FENCE_FILE} is what an already
-# installed drop-in's `AssertPathExists=!` asserts on, so WHILE IT IS THERE THIS HOST IS FENCED,
-# whoever put it there. Carrying on would re-point the drop-in at a ${FENCE_FILE} that does not
-# exist and then clear the old entry once that was "verified" — releasing, in silence, a fence that
-# may be standing over a half-migrated schema. Deleting the entry instead does the same thing and
-# destroys the only evidence. So the run stops, having stopped nothing, changed nothing and named no
-# new drop-in: the host keeps exactly the fence it had, and a human decides what the entry is.
+# SO THE ANSWER IS NOT ANOTHER INSPECTION. There is no sequence of questions about a file that
+# establishes provenance when the adversary owns the directory the file is named in: whatever the
+# check, the account can arrange for a file that passes it. Adding a seventh check makes the
+# apparatus longer and the guarantee identical. What has to change is what the answer is USED FOR.
+#
+# THE PRESENCE IS THE SIGNAL; THE CONTENT IS NOT EVIDENCE OF ANYTHING. An entry at
+# ${LEGACY_STATE_DIR_FENCE_FILE} is what a drop-in installed by an earlier checkout asserts on with
+# `AssertPathExists=!`, so while it is there THIS HOST IS FENCED — whoever put it there, and
+# whatever is inside it. That fact alone is everything this function needs, and it is a fact about
+# the NAME, which is the one thing that cannot be forged away: the account can create that name and
+# cannot make the running system ignore it.
+#
+# So nothing is opened and nothing is read. The marker published at ${FENCE_FILE} is composed
+# HERE, out of this run's own facts, and it records THE MOST CONSERVATIVE FENCE STATE THERE IS:
+#
+#   phase=stopping             marker_phase() reads anything unrecognised as `stopping` already,
+#                              because that is the reading that stops a service rather than leaving
+#                              one running over a schema that may have moved. It is written
+#                              explicitly rather than left to that default.
+#   schema_touched=true        the schema MAY be half-migrated, so the connection fence is not
+#                              released and the migration is re-run, re-drift-checked and
+#                              re-verified before anything gets CONNECT back.
+#   migration_attempted=true   and the reboot fence is treated as one that was meant.
+#
+# Those are the same three values adoption already derives for a marker that fails
+# marker_is_complete() — "missing is not false, it is unknown, and unknown is read the expensive
+# way" — reached here for the same reason by a different route. What is NOT copied forward is any
+# line of the old file: not `phase`, not `schema_touched`, not `marker_complete`. A truncated
+# predecessor cannot be told from a forged one, and neither may be republished as this host's
+# record of what a privileged run did.
+#
+# AND THE OPERATOR IS TOLD, because "the most conservative state" is a guess and the run says so.
+# The marker carries `legacy_marker_unauthenticated=1` and the path it came from, adoption prints
+# the marker verbatim, and the warnings below name the two things that CAN be established
+# independently: what systemd actually asserts on, and what the database actually says.
+#
+# WHY THIS IS NOT A NEW DENIAL OF SERVICE, stated rather than glossed. ${APP_USER} can now make
+# every subsequent cutover adopt a conservative fence by touching one name. It could already do
+# strictly more than that with the same name: a drop-in that asserts on it is a drop-in that stops
+# the unit from booting. The capability is unchanged and the outcome is fail-closed either way.
+#
+# WHAT r21's HELPER WAS AND WHY IT IS GONE. scripts/lib/pin-source-file.mjs existed to authenticate
+# these bytes and nothing else; with the bytes no longer read there is nothing left for it to
+# authenticate, and keeping an unused apparatus whose premise this comment rejects would be the
+# clearest possible invitation to wire it back up. It is deleted, with its regressions.
+#
+# THE ORDERING IS UNCHANGED, and it is still the whole of the safety: the canonical marker is
+# published FIRST and the old entry is left exactly where it is, so across the republication the
+# drop-in on disk still names the old path and the old path still exists. install_reboot_fence()
+# clears the old marker only after a drop-in naming ${FENCE_FILE} has been written, reloaded and
+# VERIFIED. At every instant one of the two pairs is fencing the host.
 import_relocated_fence_marker() {
-  local helper self staged rc=0
   [[ -n "${LEGACY_STATE_DIR_FENCE_FILE:-}" ]] || return 0
   [[ "${LEGACY_STATE_DIR_FENCE_FILE}" != "${FENCE_FILE}" ]] || return 0
-  # THE ONLY QUESTION THE NAME IS ASKED, and it decides just one thing: whether to LOOK. `-e` on its
-  # own answers "no" for a DANGLING symlink — an entry that IS there, that `AssertPathExists=!`
-  # still refuses a boot over, and that this run must judge rather than walk past — so `-L` is asked
-  # beside it. Every accept and every refusal below is made on a descriptor.
+  # THE ONLY QUESTION THE NAME IS ASKED, AND THE ONLY ONE IT CAN ANSWER: is there an entry here?
+  # `-e` on its own answers "no" for a DANGLING symlink — an entry that IS there, and that an
+  # `AssertPathExists=!` still refuses a boot over — so `-L` is asked beside it. Neither test opens
+  # anything. Nothing below opens it either.
   [[ -e "${LEGACY_STATE_DIR_FENCE_FILE}" || -L "${LEGACY_STATE_DIR_FENCE_FILE}" ]] || return 0
   if [[ -e "${FENCE_FILE}" ]]; then
     warn "A cutover marker is present at BOTH ${LEGACY_STATE_DIR_FENCE_FILE} and ${FENCE_FILE}."
     warn "The one under $(dirname "${FENCE_FILE}") is the authoritative one and is what this run adopts; the other is cleared once the reboot fence names it."
     return 0
   fi
-  # AND THEIR STATUS IS TAKEN, as in fence_marker_is_trustworthy() and for the same reason: every
-  # caller reaches this through an `|| return`, so errexit is SUSPENDED here and a substitution that
-  # failed silently would hand an empty uid to the check that decides whether a privileged run wrote
-  # these bytes.
-  self="$(id -u)" || die "This run could not read its own uid, so it cannot say whether the cutover marker at ${LEGACY_STATE_DIR_FENCE_FILE} is a record a privileged run wrote. Nothing has been stopped and nothing has been migrated."
-  # WHERE THE HELPER LIVES: THIS SCRIPT'S OWN lib directory, resolved from BASH_SOURCE at startup —
-  # the release being run, not ${APP_DIR}. Same rule as db-fence-protected.sh, pg-auth-request.mjs
-  # and chown-tree.mjs. The override exists for the regressions, which run the shipped functions
-  # outside the shipped file and so have no BASH_SOURCE to resolve from; pointing it somewhere else
-  # produces a different program, not an exemption.
-  helper="${IMS_FENCE_SOURCE_HELPER:-${IMS_SCRIPT_LIB_DIR:-}/pin-source-file.mjs}"
-  [[ -f "${helper}" ]] || die "${helper} is missing, so this run cannot read the cutover marker at ${LEGACY_STATE_DIR_FENCE_FILE} without resolving a pathname ${APP_USER} can replace between the check and the read. It will not do that. Restore the checkout and run again; nothing has been stopped and nothing has been migrated."
-  # A HOST WITH A MARKER TO RELOCATE HAS HAD THIS APPLICATION INSTALLED ON IT, so it has node. One
-  # that somehow does not gets a refusal rather than a fallback to reading the name twice.
-  command -v node >/dev/null 2>&1 || die "node is not on PATH, so this run cannot pin the cutover marker at ${LEGACY_STATE_DIR_FENCE_FILE} to a descriptor before reading it, and it will not read that name twice instead. Nothing has been stopped and nothing has been migrated."
-  ensure_fence_marker_dir || die "Could not create $(dirname "${FENCE_FILE}") owned by this run and private to it, so the cutover marker cannot be moved out of a directory ${APP_USER} can unlink it from. Nothing has been stopped."
-  # THE ONE HOP THAT IS STILL A PATHNAME, AND IT IS INSIDE THE BOUNDARY. publish_durable_file() takes
-  # its content on stdin, so the descriptor's bytes have to land somewhere first. They land in the
-  # marker's OWN directory — the root-owned 0700 one ensure_fence_marker_dir() just proved, and
-  # refused to create over a symlink — so this name is one only this run can write. The untrusted
-  # boundary was crossed exactly once, on a descriptor, above.
-  staged="$(mktemp "$(dirname "${FENCE_FILE}")/.legacy-marker.XXXXXX" 2>/dev/null)" || die "Could not stage the cutover marker inside $(dirname "${FENCE_FILE}"), so this run cannot adopt the fence a previous run left standing. Nothing has been stopped and nothing has been migrated."
-  node "${helper}" "${LEGACY_STATE_DIR_FENCE_FILE}" "${self}" > "${staged}" || rc=$?
-  # EXIT 2 IS "IT WENT AWAY", not "it was refused": the entry was there when the gate above looked
-  # and gone by the time the helper opened it. Nothing to relocate, and nothing to complain about.
-  if [[ "${rc}" -eq 2 ]]; then
-    rm -f "${staged}"
-    return 0
-  fi
-  if [[ "${rc}" -ne 0 ]]; then
-    rm -f "${staged}"
-    die "The entry at ${LEGACY_STATE_DIR_FENCE_FILE} is not a cutover marker this run may believe — the reason is printed above — and it sits in ${APP_USER}'s own data directory, where that account can create and replace names at will. NOTHING HAS BEEN STOPPED, nothing has been migrated, and no unit, drop-in or crontab has been touched, so this host is exactly as fenced as it was a moment ago. THE ENTRY HAS BEEN LEFT WHERE IT IS, DELIBERATELY: a reboot fence installed by an earlier checkout asserts on THAT NAME, so removing it may release a fence standing over a half-migrated schema. Do not delete it blind. Ask systemd what is actually asserted (systemctl show -p DropInPaths on the application's unit, then read the drop-in it names), decide from that whether a privileged run really was interrupted, and only then clear the entry by hand and re-run."
-  fi
-  publish_durable_file "${FENCE_FILE}" < "${staged}" || { rm -f "${staged}"; die \
-    "The cutover marker at ${LEGACY_STATE_DIR_FENCE_FILE} could not be published durably at ${FENCE_FILE}, so this run cannot adopt the fence a previous run left standing. Nothing has been stopped and nothing has been migrated."; }
-  rm -f "${staged}"
-  warn "Moved the cutover marker out of the application's own data directory, where ${APP_USER} could have unlinked it:"
-  warn "  ${LEGACY_STATE_DIR_FENCE_FILE} -> ${FENCE_FILE}"
-  warn "The old marker stays where it is, and the installed drop-in still names it, until the reboot fence has been re-pointed — so this host is fenced throughout."
+  ensure_fence_marker_dir || die "Could not create $(dirname "${FENCE_FILE}") owned by this run and private to it, so the fence a previous run left standing cannot be recorded where only this run can remove it. Nothing has been stopped."
+  # COMPOSED HERE, FROM THIS RUN'S OWN FACTS. The only thing taken from the old path is its NAME,
+  # which is recorded so an operator can go and look at it; not one byte of its content is read,
+  # and `publish_durable_file` therefore has nothing on stdin that ${APP_USER} chose.
+  {
+    echo "fenced_at=$(date -Iseconds)"
+    echo "reason=an entry at ${LEGACY_STATE_DIR_FENCE_FILE} says this host may be fenced by an interrupted cutover, and nothing in that directory can be authenticated"
+    echo "failed_step=unknown"
+    echo "exit_status=unknown"
+    # THE CONSERVATIVE READING, WRITTEN OUT. See the comment above this function for why each of
+    # these three is the expensive answer and not the convenient one.
+    echo "phase=stopping"
+    echo "migration_attempted=true"
+    echo "schema_touched=true"
+    echo "reboot_fence=unknown"
+    echo "db_connect_fence=unknown"
+    echo "legacy_marker_path=${LEGACY_STATE_DIR_FENCE_FILE}"
+    # THE LINE THAT SAYS THE THREE ABOVE ARE A POLICY AND NOT A READING. Adoption prints this
+    # marker verbatim, so whoever reads it sees that its predecessor was never authenticated.
+    echo "legacy_marker_unauthenticated=1"
+    # LAST, AND IT IS ABOUT THIS PUBLICATION AND NOT ABOUT THE PREDECESSOR: publish_durable_file()
+    # writes it last, so its presence proves the lines above it reached the medium together. The
+    # predecessor's own `marker_complete=` was not read and is not carried forward.
+    echo "marker_complete=1"
+  } | publish_durable_file "${FENCE_FILE}" || die \
+    "A cutover marker could not be published durably at ${FENCE_FILE}, so this run cannot record the fence the entry at ${LEGACY_STATE_DIR_FENCE_FILE} says may be standing. Nothing has been stopped and nothing has been migrated."
+  warn "An entry at ${LEGACY_STATE_DIR_FENCE_FILE} — the path a checkout older than this one fenced with — says this host may be mid-cutover."
+  warn "IT IS IN ${APP_USER}'S OWN DIRECTORY, so nothing in it can be shown to have been written by a privileged run: not the phase, not whether the schema was touched, not the completeness sentinel. NONE OF IT HAS BEEN READ."
+  warn "A marker recording the MOST CONSERVATIVE state has been published at ${FENCE_FILE} instead: this run assumes the predecessor had begun stopping and may have migrated, so it re-migrates, re-checks drift and re-verifies before anything gets CONNECT back."
+  warn "The old entry stays where it is, and the installed drop-in still names it, until the reboot fence has been re-pointed — so this host is fenced throughout."
+  warn "TWO THINGS CAN BE ESTABLISHED WITHOUT TRUSTING THAT FILE, and they are worth establishing before the next run: what systemd actually asserts on (systemctl show -p DropInPaths on the application's unit, then read the drop-in it names), and what the database actually says (whether the application role still has CONNECT). Settle those, clear the old entry by hand, and a later run will have nothing to adopt."
   return 0
 }
 
-ensure_cutover_state_dirs() {
-  mkdir -p "$CUTOVER_STATE_DIR" || return 1
-  mkdir -p "$DB_FENCE_DIR" || return 1
-  chown "${APP_USER}:${APP_USER}" "$DB_FENCE_DIR" 2>/dev/null || true
-  chmod 700 "$DB_FENCE_DIR" 2>/dev/null || true
-  return 0
-}
-
-# ONE LOCK FOR ALL THREE ENTRYPOINTS (o3d-2sm1.5, Codex r9 HIGH). deploy.sh held
-# ${STATE_DIR}/deploy.lock and update.sh held ${DATA_DIR}/update.lock, so "refusing to run
-# two cutovers at once" was true of two deploys and false of a deploy racing an update;
-# install.sh took no lock at all. One path, taken by all three.
-acquire_cutover_lock() {
-  ensure_cutover_state_dirs || die "Could not create ${CUTOVER_STATE_DIR}; the cutover namespace is unusable. Nothing has been stopped."
-  exec 9>"$LOCK_FILE"
-  flock -n 9 || die "Another cutover (deploy.sh, update.sh or install.sh) holds ${LOCK_FILE}. Refusing to run two cutovers at once."
-  # AND the lock the previous version of deploy.sh took, so a cutover started from a checkout
-  # that predates the shared namespace is still excluded. Only when that directory already
-  # exists: creating it would be re-creating the namespace this round retired.
-  if [[ -d "$LEGACY_CUTOVER_STATE_DIR" ]]; then
-    exec 8>"${LEGACY_CUTOVER_STATE_DIR}/deploy.lock"
-    flock -n 8 || die "A cutover from a checkout that predates the shared namespace holds ${LEGACY_CUTOVER_STATE_DIR}/deploy.lock. Refusing to run two cutovers at once."
-  fi
-}
+# ensure_cutover_state_dirs(), acquire_cutover_lock() and the walk they are built on live in
+# lib/cutover-namespace.sh since o3d-secops r22 (Codex CRITICAL x2). They were three byte-identical
+# copies of a rule about where a privileged process may write, and the walk that would have made
+# either of them safe existed in exactly one of the three. See that file for what the old
+# `mkdir -p`/`chown`/`chmod` trio and the old `exec 9>"$LOCK_FILE"` actually did.
 
 write_fence_marker() {
   local reason="$1" status="${2:-0}"
