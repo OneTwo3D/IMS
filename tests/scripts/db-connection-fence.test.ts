@@ -6537,6 +6537,68 @@ test('--bind-migration says colocated on the witness instance and absent on a by
       }
     }
 
+    // 5. AND A PIN IS NOT COUNTABLE, WHICH IS WHAT LETS THERE BE MANY OF THEM (o3d-secops r33,
+    //    Codex HIGH 2). The shipped entrypoints now run one probe of exactly this shape -- a
+    //    `--bind-migration` with NO `--hold-stamp` -- after every consumer, nine of them in
+    //    install.sh. Section 3 above measures that `--hold-stamp` KEEPS the stamp; that the OTHER
+    //    shape drops it was, until this round, asserted only in a comment, and it is now the thing
+    //    sixteen probes per run rest on. If a pin were countable the sampler's set would be filled
+    //    by the mechanism itself: `before > 0` would hold on every run, status 4 could never fire,
+    //    and the evidence the fence record's removal rests on would be the pins observing
+    //    themselves -- the same count-for-identity substitution one level down.
+    //
+    //    NO TIMING RACE, DELIBERATELY. The probe has RETURNED before anything is looked at, so the
+    //    SET has certainly run; and the client is still connected, which is asserted rather than
+    //    assumed -- otherwise "no backend wears the migration stamp" would be satisfied by a
+    //    backend that had simply gone away.
+    // MUTATION ROUTE (made against the shipped file and reverted): delete the `if
+    // (!options.holdStamp)` guard's negation in doBindMigration() so the SET never runs -- the pin
+    // then wears the migration stamp and the first assertion below finds it.
+    {
+      const composed = buildMigrationConnectionString(
+        `postgres://${me}@${encodeURIComponent(real.socket)}:${port}/imsdb`, me, nonce,
+      )
+      const pin = new Client({ connectionString: composed })
+      await pin.connect()
+      const observer = new Client({ host: real.socket, port, database: 'postgres', user: me })
+      await observer.connect()
+      try {
+        const pinned = await capturingFenceOutput(() => doBindMigration(pin as never, {
+          migrationNonce: nonce, witnessLock: lock, ...suppliedIdentity({ appDatabase: 'imsdb' }),
+        }))
+        assert.equal(pinned.value, EXIT_OK, `precondition: the pin must bind, or it is refusing for another reason:\n${pinned.err}`)
+
+        // THE PRECONDITION IS ASKED BY PID, NOT BY NAME. Asking "is anything called
+        // ims-deploy-fence-bind attached?" would be the same question as the assertion, inverted:
+        // a mutation that stopped the rename would then fail HERE, on the precondition, and the
+        // load-bearing assertion would never be evaluated at all. Measured -- the first draft did
+        // exactly that. A pid is what the backend is, whatever it has called itself.
+        const { rows: self } = await pin.query('SELECT pg_backend_pid() AS pid')
+        const pinPid = String(self[0]?.pid ?? '')
+        const alive = await observer.query('SELECT pid FROM pg_stat_activity WHERE pid = $1', [pinPid])
+        assert.equal(alive.rows.length, 1,
+          'precondition: the pin\'s own backend must still be attached, or the assertion below is about an absent connection')
+
+        const stamped = await observer.query(
+          'SELECT pid FROM pg_stat_activity WHERE application_name = $1',
+          [migrationApplicationName(nonce)],
+        )
+        assert.deepEqual(stamped.rows.map((row) => String(row.pid)), [],
+          'a pin must wear no migration stamp: the sampler counts by that name, and a countable pin '
+          + 'would let sixteen probes per run satisfy the evidence the record\'s removal rests on')
+
+        const renamed = await observer.query(
+          'SELECT pid FROM pg_stat_activity WHERE application_name = $1',
+          ['ims-deploy-fence-bind'],
+        )
+        assert.deepEqual(renamed.rows.map((row) => String(row.pid)), [pinPid],
+          'and it must have renamed itself to the pin name rather than to nothing in particular')
+      } finally {
+        await pin.end().catch(() => {})
+        await observer.end().catch(() => {})
+      }
+    }
+
     // 4. AND A STAMP THAT DID NOT SURVIVE IS ITS OWN REFUSAL, told apart from a redirect. This is
     //    the case that would otherwise make every cutover refuse for a reason nobody could act on.
     const unstamped = new Client({ host: real.socket, port, database: 'imsdb', user: me })
