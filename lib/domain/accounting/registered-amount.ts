@@ -93,6 +93,29 @@ function exactPayloadDecimal(value: string): Decimal | null {
 export function payloadRegisteredAmount(payload: unknown, currency: string): Decimal | null {
   const p = (payload && typeof payload === 'object' ? payload : {}) as Record<string, unknown>
   if (typeof p.currency !== 'string' || p.currency !== currency) return null
+  return payloadExactAmount(payload)
+}
+
+/**
+ * o3d-78rq — THE SAME READING, WITHOUT THE CURRENCY GATE, FOR THE ONE CALLER THAT MUST NOT HAVE ONE.
+ *
+ * `payloadRegisteredAmount` above answers "how much of THIS order's currency did this row register?",
+ * and refusing a payload stated in another currency is the whole point of it: adding the two figures
+ * would be arithmetic across two units.
+ *
+ * `describeAttempt` asks a different question — "what figure did this attempt SEND?" — and the answer
+ * to that does not depend on any other document's currency. It carries the payload's currency
+ * separately (it is what sizes the match band), so a gate here would only be able to refuse a payload
+ * that states no currency at all, and refusing THAT would describe an attempt as undescribable purely
+ * for wanting one. So the amount rule is stated ONCE, here, and the currency gate belongs to the
+ * coverage reader that needs it rather than to the reading of the figure.
+ *
+ * The preference is unchanged and is the whole of o3d-1xq8: the payload's exact decimal string where
+ * it has one, and otherwise the JSON number's OWN exact decimal reading — which is what every reader
+ * made of a historical row before that field existed, so no row is rewritten and no row gets worse.
+ */
+export function payloadExactAmount(payload: unknown): Decimal | null {
+  const p = (payload && typeof payload === 'object' ? payload : {}) as Record<string, unknown>
   const exact = p[REGISTERED_AMOUNT_DECIMAL_FIELD]
   // PRESENT DECIDES, readable or not — see `exactPayloadDecimal`.
   if (exact !== undefined) return typeof exact === 'string' ? exactPayloadDecimal(exact) : null

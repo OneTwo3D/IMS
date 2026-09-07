@@ -29,7 +29,8 @@
 
 import { createHash } from 'node:crypto'
 
-import { ledgerMatchEpsilon } from '@/lib/domain/math/decimal'
+import { payloadExactAmount } from '@/lib/domain/accounting/registered-amount'
+import { compareDecimal, ledgerMatchEpsilon, subtractMoney, type Decimal } from '@/lib/domain/math/decimal'
 
 /**
  * The mark IMS writes into the settlement it creates, so it can recognise its own work later.
@@ -50,8 +51,30 @@ export function settlementMarkerFor(effectiveToken: string): string {
 
 /** One settlement already recorded against the target document, as the ledger reports it. */
 export type LedgerSettlementRecord = {
-  /** In the document's currency, as posted. Null when the ledger did not report one. */
-  amount: number | null
+  /**
+   * In the document's currency, as posted — the EXACT figure, or null when there is not one this
+   * module may compare (o3d-78rq).
+   *
+   * A `Decimal`, and never the connector's wire number. The probes read it through
+   * `readLedgerStatedAmount`, which admits a value only when its decimal reading is PROVABLY the
+   * figure the ledger stated: below `ledgerAmountMagnitudeBound` two amounts one minor unit apart
+   * land on different doubles, and the reading is quantized to the currency's own minor unit, so
+   * exactly one stateable token names it. Null therefore covers two different facts and
+   * `unreadableAmount` below says which — see it for why the difference is the operator's.
+   */
+  amount: Decimal | null
+  /**
+   * o3d-78rq — THE LEDGER DID STATE AN AMOUNT AND THIS CONNECTOR WOULD NOT READ IT, as received.
+   *
+   * Set only when `amount` is null BECAUSE the figure was refused, never when the ledger reported no
+   * amount at all. Both are `record-unmeasurable` and both WITHHOLD, and that is deliberate: the
+   * refusal direction is the safe one here, because an unrecognised record of our own payment posts a
+   * second one. But they are not the same sentence to a human. "Xero did not state an amount on this
+   * payment" sends an operator to Xero; "Xero stated 35184372088832.055, which IMS cannot read as an
+   * exact GBP amount" tells them the figure is the problem and stops them reading the hold as
+   * evidence the document is unpaid. So the figure is carried, verbatim, for that sentence alone.
+   */
+  unreadableAmount?: string | null
   /** `YYYY-MM-DD`, normalised by the connector-specific probe. Null when unreadable. */
   date: string | null
   /** The remote id, carried only so a refusal can name it. */
@@ -69,7 +92,19 @@ export type LedgerSettlementProbe =
 
 /** What a row's stored payload says its attempt sent. */
 export type AttemptDescription = {
-  amount: number | null
+  /**
+   * WHAT THIS ATTEMPT SENT, EXACTLY (o3d-78rq) — a `Decimal`, read by `payloadExactAmount`.
+   *
+   * It was the payload's JSON number, and the band it is measured against became exact and
+   * currency-derived in o3d-6yho without either operand following it. An exact tolerance over two
+   * doubles decides nothing the tolerance says: our own attempt of `1073741824.0050` against a ledger
+   * that holds `1073741824.00` is EXACTLY the band apart and therefore the same payment, and the two
+   * doubles are 0.005000114440917969 apart — over it, `clear`, and a second payment posts.
+   *
+   * The exact figure is the payload's `amountDecimal` where the enqueue wrote one (o3d-1xq8), and
+   * otherwise the number's OWN decimal reading, which is exact where the subtraction was not.
+   */
+  amount: Decimal | null
   /**
    * o3d-6yho (2 of 3) — THE CURRENCY THAT AMOUNT IS IN, which sizes the band the match below runs
    * on. Read from the payload (every money payload states one) or supplied by a caller that holds
@@ -288,10 +323,14 @@ export function describeAttempt(
   options?: { postingOn?: string | null },
 ): AttemptDescription {
   const record = asRecord(payload)
-  const amount = record.amount
   const currency = record.currency
   return {
-    amount: typeof amount === 'number' && Number.isFinite(amount) ? amount : null,
+    // o3d-78rq: the payload's exact decimal, through the one reader that knows how a money payload
+    // states its amount. `payloadExactAmount` prefers the `amountDecimal` string the enqueue writes
+    // beside the number and falls back to the number's own decimal reading, so a historical row is
+    // described exactly as its number always read and a row written since is described as the figure
+    // that was actually registered.
+    amount: payloadExactAmount(payload),
     // o3d-6yho: from the payload the attempt was built from — every money payload writer states it
     // (both connectors' INVOICE_PAYMENT follow-ups, the receipt enqueue, and markBillPaid's
     // BILL_PAYMENT), so the ordinary row names its own currency and nothing has to be inferred.
@@ -301,8 +340,16 @@ export function describeAttempt(
   }
 }
 
-function money(value: number): string {
-  return value.toFixed(2)
+/**
+ * A money figure for an operator sentence.
+ *
+ * o3d-78rq: `toFixed()` with no argument, which is o3d-4ozd's rule — lossless, never exponential, and
+ * so incapable of printing two figures this verdict tells apart as the same text. A settlement of
+ * `1073741824.005` and one of `1073741824.01` are a different payment to this module and must read as
+ * different payments to the person holding the refusal.
+ */
+function money(value: Decimal): string {
+  return value.toFixed()
 }
 
 /**
@@ -351,14 +398,31 @@ export function classifyLedgerSettlement(
       return {
         outcome: 'unknown',
         cause: 'record-unmeasurable',
-        reason: 'the accounting connector returned a settlement whose amount or date could not be '
-          + 'read, so it cannot be ruled out as this attempt',
+        // o3d-78rq — AND IT SAYS WHICH, because the two facts send an operator to different places.
+        // A figure this connector REFUSED is a statement about the reading, not about the document:
+        // the hold is not evidence that nothing has been paid, and the sentence must not let anyone
+        // read it that way. See `LedgerSettlementRecord.unreadableAmount`.
+        reason: record.unreadableAmount
+          ? `the accounting connector reported a settlement${record.id ? ` (${record.id})` : ''} `
+            + `stating ${record.unreadableAmount}, which IMS cannot read as an exact `
+            + `${attempt.currency ?? 'document-currency'} amount — so this attempt cannot be ruled `
+            + 'out against it. This says the figure is unreadable, NOT that the document is unpaid.'
+          : 'the accounting connector returned a settlement whose amount or date could not be '
+            + 'read, so it cannot be ruled out as this attempt',
       }
     }
-    // o3d-6yho: half one minor unit of the attempt's OWN currency. Compared as numbers because both
-    // sides are numbers the ledger and the wire already agreed on; what changed is only the size of
-    // the band, which is now derived rather than assumed.
-    if (Math.abs(record.amount - attempt.amount) <= ledgerMatchEpsilon(attempt.currency).toNumber()
+    // o3d-6yho: half one minor unit of the attempt's OWN currency.
+    //
+    // o3d-78rq — AND BOTH OPERANDS ARE NOW DECIMALS, so the band decides what the band says. It was
+    // `Math.abs(record.amount - attempt.amount) <= ledgerMatchEpsilon(...).toNumber()`: an exact,
+    // currency-derived tolerance spent back to a double to meet two doubles. Two figures ONE
+    // THOUSANDTH apart can decode to doubles a whole ulp apart once the ulp exceeds the band —
+    // `35184372088832.0035` decodes to `35184372088832` and `35184372088832.0045` to
+    // `35184372088832.0078125`, 0.0078 apart against a 0.005 band — and the failure direction of THIS
+    // rule is the one that posts a second payment. Nothing is converted now: the attempt carries its
+    // payload's exact decimal, the record carries the ledger's stated figure, and the band stays a
+    // `Decimal` all the way into the comparison.
+    if (compareDecimal(subtractMoney(record.amount, attempt.amount).abs(), ledgerMatchEpsilon(attempt.currency)) <= 0
       && record.date === attempt.date) {
       return {
         outcome: 'present',

@@ -1176,88 +1176,113 @@ export function readLedgerDifferenceAsNumber(
   return readDecimalAsNumber(subtractMoney(minuend, subtrahend))
 }
 
-export function parseLedgerAmount(value: unknown, currency: string | null): number | null {
+/**
+ * o3d-78rq (Codex, o3d-acctmoney r21 HIGH) — WHAT A LEDGER'S AMOUNT IS ALLOWED TO MEAN, AS A DECIMAL.
+ *
+ * This is where the two rules live now; `parseLedgerAmount` below is this function plus a conversion.
+ * They were spelt inside it, which was correct while the only consumer wanted a `number`.
+ * `classifyLedgerSettlement` wants the FIGURE — it decides whether a ledger record is the payment IMS
+ * already made, and its two errors do not point the same way: too wide strands a payment visibly, too
+ * narrow posts a SECOND one — so it must compare Decimals, and the Decimal it compares has to be
+ * provably the figure the ledger stated rather than merely a reading of the double it arrived as.
+ * Re-deriving these rules beside it would have been the fourth copy of a fail-safe direction.
+ *
+ * o3d-psrx r14 (Codex HIGH) — THE MAGNITUDE RULE, ON THE NUMBER ARM AND (after r15) ONLY THERE. A
+ * JSON numeric token reaches here as a double that `Response.json()` has already rounded, and no test
+ * applied to the double can recover what it rounded away — which is why the round trip cannot serve
+ * here and a magnitude rule must. What it establishes is stated at `ledgerAmountMagnitudeBound` and is
+ * narrower than "this value is intact": below the bound a difference of one whole minor unit survives
+ * the decode. Above it, it does not, so it is refused.
+ *
+ * o3d-psrx r16 (Codex HIGH 1) — AND THE OTHER HALF OF THE SAME RECOMMENDATION: the SCALE.
+ *
+ * r14 was asked for two things — "reject values whose scale exceeds the stated currency's supported
+ * precision, OR retain exact Decimals throughout" — and shipped only the magnitude. The residual r15
+ * then had to admit was, by its own definition, a token FINER than its currency's minor unit, and the
+ * argument for admitting it was that the original token is gone.
+ *
+ * THE TOKEN IS GONE; ITS SCALE IS NOT. A double has its own decimal reading — the shortest text that
+ * decodes back to it — and this is the very fact the STRING arm already turns on. So the question "is
+ * this amount quantized to its currency's minor unit?" can be asked of the double alone, without the
+ * token, and answered by refusing anything that reads back finer.
+ *
+ * WHAT THAT BUYS, EXACTLY. Every admitted value is a whole multiple of its currency's minor unit, so a
+ * decision taken on ONE of them cannot be wrong by less than a whole unit: `zeroPaid` in
+ * `partitionPaymentReversals` means the reading is EXACTLY zero rather than merely inside half a unit
+ * of it, and a token that decoded to zero was a token that was zero. It also makes the difference of
+ * any two admitted numbers a whole multiple of the minor unit — see `readLedgerDifferenceAsNumber`,
+ * which is where the rest of that guarantee is made. And it is what lets o3d-78rq say that the DECIMAL
+ * returned here is the figure the ledger stated: below the bound, two amounts one minor unit apart
+ * land on different doubles, so exactly one quantized token names the double this reading came from.
+ *
+ * WHAT IT COSTS. A ledger figure carrying MORE decimals than its own currency has is refused rather
+ * than read — `1234567.8901` in GBP, `123456789.99` in JPY. That is the fail-closed direction the
+ * finding asked for ("fail closed for numeric-token evidence that cannot be proven quantized"), and it
+ * costs nothing that exists: Xero and QuickBooks both state document totals and paid amounts rounded
+ * to the document's own currency, and an amount that arrives finer than its currency is precisely the
+ * shape this reader cannot read safely. NULL IS A REFUSAL AND NEVER A ZERO, and every caller must
+ * withhold on it — in `classifyLedgerSettlement` that is `record-unmeasurable`, which reads as
+ * `present` and holds the payment back.
+ *
+ * IT IS NOT A REFUSAL OF SMALL PRINT: a quantized token BELOW the bound always reads back at its own
+ * scale or shorter, because below the bound the double spacing is no wider than one minor unit, so the
+ * token itself sits in the rounding interval and nothing longer than it is needed to name that double.
+ * Measured across every supported precision in the tests.
+ *
+ * r18 (Codex HIGH 1) — AND THE SCALE RULE IS ONE FUNCTION ACROSS BOTH ARMS. It was spelt on the number
+ * arm alone, which is how a GBP `"0.005"` string was admitted while the identical double was refused.
+ * `isLedgerMinorUnitQuantized` is the one spelling; what each arm supplies is the decimal it is to be
+ * asked about — the double's own shortest reading, or the digits the string was given, BEFORE any
+ * conversion, because converting first would throw away the very digits in question.
+ *
+ * THE STRING ARM TAKES NO MAGNITUDE BOUND (o3d-psrx r15, Codex MEDIUM 1). A string carries its own
+ * evidence: the original decimal text is still here, so `parseLedgerAmount`'s round trip can decide
+ * THIS value instead of values of this size. `"1649267441664"` in CLF is such a string, and r14
+ * refused it purely for its size. One that does NOT survive the conversion is refused at ANY
+ * magnitude: `"35184372088832.003"` and `"17592186044416.002"` are both null from `parseLedgerAmount`,
+ * far below the two-decimal bound, because no double answers to those digits. The arm that needs a
+ * size rule is the number one, where the digits are already gone and nothing can be asked of them.
+ */
+export function readLedgerStatedAmount(value: unknown, currency: string | null): Decimal | null {
   if (typeof value === 'number') {
     if (!Number.isFinite(value)) return null
-    // o3d-psrx r14 (Codex HIGH) — THE ARM THE FINDING IS ABOUT, and after r15 the ONLY arm the bound
-    // applies to. A JSON numeric token reaches here as a double that `Response.json()` has already
-    // rounded, and no test applied to the double can recover what it rounded away — which is why the
-    // round trip cannot serve here and a magnitude rule must. What it establishes is stated at
-    // `ledgerAmountMagnitudeBound` and is narrower than "this value is intact": below the bound a
-    // difference of one whole minor unit survives the decode. Above it, it does not, so it is refused.
     if (Math.abs(value) >= ledgerAmountMagnitudeBound(currency)) return null
-    // o3d-psrx r16 (Codex HIGH 1) — AND THE OTHER HALF OF THE SAME RECOMMENDATION: the SCALE.
-    //
-    // r14 was asked for two things — "reject values whose scale exceeds the stated currency's
-    // supported precision, OR retain exact Decimals throughout" — and shipped only the magnitude. The
-    // residual r15 then had to admit was, by its own definition, a token FINER than its currency's
-    // minor unit, and the argument for admitting it was that the original token is gone.
-    //
-    // THE TOKEN IS GONE; ITS SCALE IS NOT. A double has its own decimal reading — the shortest text
-    // that decodes back to it — and this is the very fact the STRING arm below already turns on. So
-    // the question "is this amount quantized to its currency's minor unit?" can be asked of the double
-    // alone, without the token, and answered by refusing anything that reads back finer.
-    //
-    // WHAT THAT BUYS, EXACTLY. Every admitted number is a whole multiple of its currency's minor unit,
-    // so a decision taken on ONE of them cannot be wrong by less than a whole unit: `zeroPaid` in
-    // `partitionPaymentReversals` now means the reading is EXACTLY zero rather than merely inside half
-    // a unit of it, and a token that decoded to zero was a token that was zero. It also makes the
-    // difference of any two admitted numbers a whole multiple of the minor unit — see
-    // `readLedgerDifferenceAsNumber`, which is where the rest of the guarantee is made.
-    //
-    // WHAT IT COSTS. A ledger figure carrying MORE decimals than its own currency has is refused
-    // rather than read — `1234567.8901` in GBP, `123456789.99` in JPY. That is the fail-closed
-    // direction the finding asked for ("fail closed for numeric-token evidence that cannot be proven
-    // quantized"), and it costs nothing that exists: Xero and QuickBooks both state document totals
-    // and paid amounts rounded to the document's own currency, and an amount that arrives finer than
-    // its currency is precisely the shape this whole round cannot read safely.
-    //
-    // IT IS NOT A REFUSAL OF SMALL PRINT: a quantized token BELOW the bound always reads back at its
-    // own scale or shorter, because below the bound the double spacing is no wider than one minor
-    // unit, so the token itself sits in the rounding interval and nothing longer than it is needed to
-    // name that double. Measured across every supported precision in the tests.
-    //
-    // r18 (Codex HIGH 1) — AND THE RULE ITSELF NOW LIVES UPSTREAM OF BOTH ARMS. It was spelt here, on
-    // the number arm alone, which is how a GBP "0.005" string was admitted while the identical double
-    // was refused. `isLedgerMinorUnitQuantized` is the one spelling; what this arm supplies is the
-    // decimal it is to be asked about — `toDecimal(value)`, the double's own shortest decimal reading,
-    // which is the only scale a token that is already gone still has.
-    return isLedgerMinorUnitQuantized(toDecimal(value), currency) ? value : null
+    const reading = toDecimal(value)
+    return isLedgerMinorUnitQuantized(reading, currency) ? reading : null
   }
   if (typeof value === 'string') {
     const trimmed = value.trim()
     if (!LEDGER_AMOUNT_GRAMMAR.test(trimmed)) return null
-    // Converted through the repository's decimal reader rather than `Number()`: the shape is already
-    // established above, and this reads the digits it was given instead of re-deriving them.
-    //
-    // o3d-psrx r15 (Codex MEDIUM 1) — AND NO MAGNITUDE BOUND ON THIS ARM. A string carries its own
-    // evidence: the original decimal text is still here, so the round trip can decide THIS value
-    // instead of values of this size. What it establishes, stated precisely: THE NUMBER'S OWN DECIMAL
-    // READING IS THE TEXT IT CAME FROM. `toDecimal(aNumber)` reads a double by its shortest decimal
-    // name, and every later step in this lifecycle re-derives the decimal that way, so a string that
-    // passes can never disagree with itself downstream — `"1649267441664"` in CLF is such a string,
-    // and r14 refused it purely for its size. One that does NOT pass is refused at ANY magnitude:
-    // `"35184372088832.003"` and `"17592186044416.002"` are both null here, far below the two-decimal
-    // bound, because no double answers to those digits. The arm that needs a size rule is the one
-    // above, where the digits are already gone and nothing can be asked of them.
-    //
-    // The alternative — carrying Decimal through every classification instead of converting at all —
-    // is the stronger shape and is NOT small here: this reader's result is a `number` in the Xero
-    // partition, in `QboLedgerAmount`, in `QboLedgerEvidence` and in the activity metadata those
-    // verdicts are written into. That is a change to two connectors' public readings.
-    //
-    // o3d-psrx r18 (Codex HIGH 1) — AND THE SCALE IS ASKED HERE TOO, OF THE DIGITS THEMSELVES, BEFORE
-    // ANY CONVERSION. r15's argument above is about MAGNITUDE and does not transfer: the round trip
-    // proves this number IS the text it came from, not that the text is a figure the currency can
-    // hold. GBP `"0.005"` is a three-decimal amount in a two-decimal currency — malformed FOR THAT
-    // CURRENCY however it arrived — and it round-trips perfectly, so nothing below could refuse it.
-    // The rule is the same function the number arm asks, and it is asked of the PARSED decimal rather
-    // than of the double, because converting first would throw away the very digits in question.
+    // Read through the repository's decimal reader rather than `Number()`: the shape is already
+    // established, and this reads the digits it was given instead of re-deriving them.
     const parsed = toDecimal(trimmed)
-    if (!isLedgerMinorUnitQuantized(parsed, currency)) return null
-    return readDecimalAsNumber(parsed)
+    return isLedgerMinorUnitQuantized(parsed, currency) ? parsed : null
   }
   return null
+}
+
+/**
+ * The same admission, answered as the `number` two connectors' partitions and evidence types spend.
+ *
+ * o3d-78rq: the rules moved up into `readLedgerStatedAmount` and this is what is left — the
+ * conversion, whose two arms differ exactly as they always have.
+ */
+export function parseLedgerAmount(value: unknown, currency: string | null): number | null {
+  const stated = readLedgerStatedAmount(value, currency)
+  if (stated === null) return null
+  // THE NUMBER ARM answers with the double it was handed, untouched. It is already a `number`, and
+  // re-deriving it from the reading is a conversion that can only lose (`-0` becomes `0`).
+  if (typeof value === 'number') return value
+  // THE STRING ARM must survive the conversion, which is r12/r13's finding and is unchanged:
+  // `"0." + "0".repeat(399) + "1"` is grammatical decimal money whose `toNumber()` is 0 — precisely
+  // the value that puts an amount in the bucket which clears `paidAt`.
+  //
+  // The alternative — carrying Decimal through every classification instead of converting at all — is
+  // the stronger shape and is NOT small here: this reader's result is a `number` in the Xero
+  // partition, in `QboLedgerAmount`, in `QboLedgerEvidence` and in the activity metadata those
+  // verdicts are written into. That is a change to two connectors' public readings, and o3d-78rq
+  // needed only the settlement classifier's operands, so it took the Decimal reader above instead.
+  return readDecimalAsNumber(stated)
 }
 
 // o3d-psrx r17 (Codex HIGH) — `PAYMENT_PRESENT_EPSILON` USED TO LIVE HERE, AND IT WAS THE SECOND

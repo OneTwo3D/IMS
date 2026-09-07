@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
 import type { LedgerSettlementProbe } from '@/lib/domain/accounting/ledger-settlement-evidence'
+import { toDecimal } from '@/lib/domain/math/decimal'
 
 /**
  * o3d-0m56 — BEHAVIOURAL coverage of the two manual retry actions.
@@ -235,7 +236,7 @@ const statusOf = (id: string) => state.rows.find((r) => r.id === id)?.status
 const ledgerHoldsTheAttemptOn = (invoiceId: string) =>
   state.probes.set(`INVOICE_PAYMENT ${invoiceId} `, {
     ok: true,
-    records: [{ amount: 10, date: '2026-08-01', id: 'PAY-A' }],
+    records: [{ amount: toDecimal(10), date: '2026-08-01', id: 'PAY-A' }],
   })
 
 const ACTIONS = [
@@ -306,7 +307,7 @@ for (const action of ACTIONS) {
     seed(action.connector)
     state.probes.set('INVOICE_PAYMENT inv-2 ', {
       ok: true,
-      records: [{ amount: 10, date: '2026-08-01', id: 'PAY-1' }],
+      records: [{ amount: toDecimal(10), date: '2026-08-01', id: 'PAY-1' }],
     })
     const retry = await load(action)
 
@@ -343,8 +344,8 @@ for (const action of ACTIONS) {
     state.probes.set('INVOICE_PAYMENT inv-2 ', {
       ok: true,
       records: [
-        { amount: 10, date: '2026-07-01', id: 'PAY-OLD' },
-        { amount: 25, date: '2026-08-01', id: 'PAY-OTHER' },
+        { amount: toDecimal(10), date: '2026-07-01', id: 'PAY-OLD' },
+        { amount: toDecimal(25), date: '2026-08-01', id: 'PAY-OTHER' },
       ],
     })
     const retry = await load(action)

@@ -13,6 +13,11 @@
  */
 
 import type { AccountingSyncType } from '@/app/generated/prisma/client'
+// o3d-78rq: the SAME reader both connectors' amount readings already go through, answering with the
+// Decimal rather than the double. It lives beside `parseLedgerAmount` in the Xero module because that
+// is where `ledgerAmountMagnitudeBound` is, and this is the import direction QuickBooks' own payment
+// poller already takes for exactly the same rule.
+import { ledgerCurrencyCode, readLedgerStatedAmount } from '@/lib/connectors/xero/invoice-delta'
 import type { LedgerSettlementProbe, LedgerSettlementRecord } from '@/lib/domain/accounting/ledger-settlement-evidence'
 import { settlementDocumentAnchorFilters, settlementDocumentKey } from '@/lib/domain/accounting/money-post-document'
 import type { MoneyPostLock } from '@/lib/domain/accounting/money-post-lock'
@@ -34,6 +39,40 @@ function str(value: unknown): string {
 
 function num(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+/**
+ * o3d-78rq — A SETTLEMENT'S AMOUNT, AS THE FIGURE THE LEDGER STATED OR NOT AT ALL.
+ *
+ * The record list this builds is the ledger operand of `classifyLedgerSettlement`, which decides
+ * whether a money row that has already been attempted may be sent again. It used to be `num()` — the
+ * wire double, unbounded and unquantized — measured against our payload's double with `-`, so at a
+ * magnitude where the double spacing exceeds the match band the comparison decided nothing the band
+ * said, in the direction that posts a SECOND payment.
+ *
+ * `readLedgerStatedAmount` is the rule `parseLedgerAmount` already applies to every other ledger
+ * amount either connector reads: a magnitude bound, and the currency's own minor-unit scale. What it
+ * returns is a Decimal that is PROVABLY the figure the ledger stated. What it refuses is a figure this
+ * code cannot say that about — and a refusal here WITHHOLDS the payment rather than clearing it,
+ * which is the direction this rule's asymmetry demands.
+ *
+ * `num()` IS DELIBERATELY STILL USED FOR THE COMPLETENESS ARITHMETIC BELOW. That cross-check asks a
+ * different question — "does Xero's own total of what settles this document agree with the collection
+ * it sent me?" — and its answer must not change because a figure was too finely stated to compare. It
+ * is unchanged, and so are its tests.
+ */
+function statedAmount(raw: unknown, currency: string | null): Pick<LedgerSettlementRecord, 'amount' | 'unreadableAmount'> {
+  const amount = readLedgerStatedAmount(raw, currency)
+  if (amount !== null) return { amount }
+  // The ledger stating NOTHING and the ledger stating something unreadable are both `null` and both
+  // withhold; only the second can name a figure, and naming it is what stops an operator reading the
+  // hold as "this document is unpaid". A non-number, non-string is reported by its type — there is no
+  // figure to quote.
+  if (raw === undefined || raw === null) return { amount: null }
+  return {
+    amount: null,
+    unreadableAmount: typeof raw === 'number' || typeof raw === 'string' ? String(raw) : typeof raw,
+  }
 }
 
 /**
@@ -69,6 +108,12 @@ type XeroPaymentsResponse = {
   Invoices?: Array<{
     InvoiceID?: string
     /**
+     * The currency every amount on this document is stated in (o3d-78rq). It sizes the minor-unit
+     * scale rule and the magnitude bound the settlement amounts are admitted by; absent, both
+     * resolve through `ledgerMinorUnits(null)` exactly as they do everywhere else in this repository.
+     */
+    CurrencyCode?: string
+    /**
      * Xero's own total of the payments applied to this document. Read as a CROSS-CHECK on the
      * collection below, never as a record in its own right — see the completeness note in
      * `probeXeroSettlement`.
@@ -93,6 +138,8 @@ type XeroPaymentsResponse = {
 type XeroCreditNoteResponse = {
   CreditNotes?: Array<{
     CreditNoteID?: string
+    /** o3d-78rq: as on an invoice — what the allocation amounts below are stated in. */
+    CurrencyCode?: string
     /** The credit's face value and what is left of it — how much of it has been allocated. */
     Total?: number
     RemainingCredit?: number
@@ -143,7 +190,11 @@ export async function probeXeroSettlement(
       // No reference field exists on a Xero credit-note allocation, so this type has no mark to
       // match and falls back to amount and date alone. Stated rather than left to be inferred from
       // a missing property.
-      .map((a) => ({ amount: num(a.Amount), date: normaliseXeroSettlementDate(a.Date), reference: null }))
+      .map((a) => ({
+        ...statedAmount(a.Amount, ledgerCurrencyCode(note.CurrencyCode)),
+        date: normaliseXeroSettlementDate(a.Date),
+        reference: null,
+      }))
 
     // COMPLETENESS, CHECKED RATHER THAN ASSUMED (Codex round 6, finding 3). This branch had NO
     // cross-check at all, so `Allocations` absent and `Allocations` empty were the same value —
@@ -185,8 +236,13 @@ export async function probeXeroSettlement(
   if (!res.ok) return { ok: false, reason: res.error ?? `HTTP ${res.status}` }
   const invoice = res.data?.Invoices?.[0]
   if (!invoice) return { ok: false, reason: 'Xero returned no document for that id' }
+  const invoiceCurrency = ledgerCurrencyCode(invoice.CurrencyCode)
+  // o3d-78rq: the wire numbers, kept for the completeness arithmetic below and for NOTHING ELSE. That
+  // cross-check asks whether the COLLECTION is complete, not whether a figure in it can be compared
+  // exactly, so it must go on reading exactly what it read before — see `statedAmount`.
+  const wireAmounts = (invoice.Payments ?? []).map((p) => num(p.Amount))
   const records: LedgerSettlementRecord[] = (invoice.Payments ?? []).map((p) => ({
-    amount: num(p.Amount),
+    ...statedAmount(p.Amount, invoiceCurrency),
     date: normaliseXeroSettlementDate(p.Date),
     id: str(p.PaymentID) || null,
     // Where IMS writes its own mark; matching it identifies the attempt whatever has since been
@@ -204,8 +260,8 @@ export async function probeXeroSettlement(
   // already yields `unknown` in the classifier, so it is excluded here rather than counted as
   // zero (which would fake a shortfall).
   const amountPaid = num(invoice.AmountPaid)
-  if (amountPaid !== null && records.every((r) => r.amount !== null)) {
-    const seen = records.reduce((total, r) => total + (r.amount ?? 0), 0)
+  if (amountPaid !== null && wireAmounts.every((a) => a !== null)) {
+    const seen = wireAmounts.reduce((total, a) => total + (a ?? 0), 0)
     if (amountPaid - seen > XERO_AMOUNT_EPSILON) {
       return {
         ok: false,
@@ -249,8 +305,8 @@ export async function probeXeroSettlement(
     .reduce<number | null>((sum, part) => (sum === null || part === null ? null : sum + part), 0)
   // Null the moment any read settlement is unmeasurable: an unknown addend makes the whole sum
   // unknown, and an unknown sum must not be allowed to "explain" anything.
-  const explained = records.reduce<number | null>(
-    (sum, record) => (sum === null || record.amount === null ? null : sum + record.amount),
+  const explained = wireAmounts.reduce<number | null>(
+    (sum, amount) => (sum === null || amount === null ? null : sum + amount),
     applied,
   )
   if (settled !== null && settled > XERO_AMOUNT_EPSILON
@@ -279,6 +335,13 @@ type QboDocumentBody = {
   /** The document's face value and what is still owed on it — the shape-independent cross-check. */
   TotalAmt?: number
   Balance?: number
+  /**
+   * o3d-78rq — the currency the applied amounts below are stated in. QuickBooks OMITS this whenever
+   * multicurrency is off, which is the ordinary single-currency company, so `null` is the common case
+   * and not an error: `ledgerMinorUnits(null)` answers it exactly as it answers every other unstated
+   * currency in this repository.
+   */
+  CurrencyRef?: { value?: string }
 }
 
 /**
@@ -435,7 +498,13 @@ export async function probeQuickBooksSettlement(
   }
   const settlementIds = paymentLinks.map((t) => str(t.TxnId))
 
+  const documentCurrency = ledgerCurrencyCode(body.CurrencyRef?.value)
   const records: LedgerSettlementRecord[] = []
+  // o3d-78rq: as on the Xero side, the wire figures are kept for the completeness arithmetic and the
+  // records carry the exact ones. `qboAmountAppliedTo` SUMS a payment's lines, and a sum of doubles is
+  // exactly where a figure stops being the one the ledger stated — which is why the reading below is
+  // asked of the sum rather than assumed of it.
+  const wireApplied: Array<number | null> = []
   for (const id of settlementIds) {
     const res = await qboGet<Record<string, { TxnDate?: string; PrivateNote?: string; Line?: QboPaymentLine[] } | undefined>>(
       `${settlementPath}/${encodeURIComponent(id)}`,
@@ -446,8 +515,10 @@ export async function probeQuickBooksSettlement(
     const settlement = res.data?.[settlementKey]
     if (!settlement) return { ok: false, reason: `QuickBooks returned no ${settlementKey} ${id}` }
     const date = str(settlement.TxnDate)
+    const applied = qboAmountAppliedTo(settlement.Line, documentId, linkedType)
+    wireApplied.push(applied)
     records.push({
-      amount: qboAmountAppliedTo(settlement.Line, documentId, linkedType),
+      ...statedAmount(applied, documentCurrency),
       date: date.length >= 10 ? date.slice(0, 10) : null,
       id,
       // PrivateNote is where IMS writes its mark on this connector.
@@ -478,8 +549,8 @@ export async function probeQuickBooksSettlement(
   const applied = total !== null && balance !== null ? total - balance : null
   // Null the moment any read settlement's applied amount is unreadable: an unknown addend makes
   // the whole sum unknown, and an unknown sum must not be allowed to "explain" anything.
-  const explained = records.reduce<number | null>(
-    (sum, record) => (sum === null || record.amount === null ? null : sum + record.amount),
+  const explained = wireApplied.reduce<number | null>(
+    (sum, amount) => (sum === null || amount === null ? null : sum + amount),
     0,
   )
   // `Payment` and the bill-payment spellings appear in BOTH tables — they are the covered shape on

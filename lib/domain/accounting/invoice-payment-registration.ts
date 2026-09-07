@@ -292,14 +292,22 @@ export function decideInvoicePaymentRegistration(input: {
     }
     for (const attempt of unresolved) {
       const verdict = classifyLedgerSettlement(
-        // `amount`, not `registeredAmount`: this compares against a figure the LEDGER reported, which
-        // is the JSON number that went on the wire (o3d-6abj).
+        // o3d-78rq — `registeredAmount` NOW, AND THE NUMBER'S OWN DECIMAL READING WHERE THERE IS NONE.
+        //
+        // o3d-6abj chose `amount` here with the reason "this compares against a figure the LEDGER
+        // reported, which is the JSON number that went on the wire". That reason held while the ledger
+        // side was a wire number too. It no longer is: the probe now reads each settlement through
+        // `readLedgerStatedAmount` and the record carries the ledger's exact stated figure, so the
+        // operand that meets it must be exact as well or the band is spent on a double subtraction
+        // again. The fallback is the same one `payloadExactAmount` takes for a row written before
+        // `amountDecimal` existed — `toDecimal(theNumber)`, the number's own decimal reading — so this
+        // site describes no attempt it could not describe before and withholds nothing extra.
         //
         // o3d-6yho: and the ORDER's currency, which is the currency this attempt was raised in — the
         // decision has already refused a receipt whose currency differs from the order's, so there is
         // no second answer to give here.
         {
-          amount: attempt.amount ?? null,
+          amount: attempt.registeredAmount ?? (attempt.amount == null ? null : toDecimal(attempt.amount)),
           currency: input.orderCurrency,
           date: attempt.paymentDate ?? null,
           marker: attempt.settlementMarker ?? null,

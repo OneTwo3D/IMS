@@ -225,7 +225,7 @@ test('a receipt beside an unresolved attempt the ledger HOLDS is refused (o3d-0m
   const d = decideInvoicePaymentRegistration({
     ...base,
     existing: [unresolved()],
-    ledgerSettlements: [{ amount: 100, date: '2026-08-01', id: 'PAY-1' }],
+    ledgerSettlements: [{ amount: toDecimal(100), date: '2026-08-01', id: 'PAY-1' }],
   })
   assert.equal(d.register, false)
   assert.equal(d.register === false && d.refusal, 'UNRESOLVED_PAYMENT_ATTEMPT')
@@ -390,7 +390,7 @@ test('a settlement for a different amount or date leaves the receipt free (o3d-0
   const d = decideInvoicePaymentRegistration({
     ...base,
     existing: [unresolved()],
-    ledgerSettlements: [{ amount: 100, date: '2026-07-01' }, { amount: 40, date: '2026-08-01' }],
+    ledgerSettlements: [{ amount: toDecimal(100), date: '2026-07-01' }, { amount: toDecimal(40), date: '2026-08-01' }],
   })
   assert.equal(d.register, true, 'only a settlement matching the ATTEMPT is evidence about it')
 })
@@ -527,7 +527,7 @@ test('the WHOLE decision is re-runnable for the check inside the write (o3d-0m56
   const unresolvedNow = decideInvoicePaymentRegistration({
     ...base,
     existing: [unresolved()],
-    ledgerSettlements: [{ amount: 100, date: '2026-08-01' }],
+    ledgerSettlements: [{ amount: toDecimal(100), date: '2026-08-01' }],
   })
   assert.equal(unresolvedNow.register === false && unresolvedNow.refusal, 'UNRESOLVED_PAYMENT_ATTEMPT')
 })

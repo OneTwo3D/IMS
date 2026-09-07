@@ -11,8 +11,11 @@ import {
   moneyPostDateToSend,
   pinnedAttemptDate,
   settlementMarkerFor,
+  type AttemptDescription,
   type LedgerSettlementRecord,
 } from '@/lib/domain/accounting/ledger-settlement-evidence'
+import { REGISTERED_AMOUNT_DECIMAL_FIELD } from '@/lib/domain/accounting/registered-amount'
+import { toDecimal } from '@/lib/domain/math/decimal'
 
 /**
  * What the module used to export as `plannedAttemptDate`, spelt out here instead (round 7, Codex
@@ -39,8 +42,19 @@ const plannedAttemptDate = (type: string, payload: unknown, now: Date): string |
  * o3d-6yho (2 of 3): an attempt names its own currency, which sizes the amount band. GBP keeps every
  * case below at the half-penny it was written against.
  */
-const attempt = { amount: 10, currency: 'GBP', date: '2026-08-01', marker: null }
-const records = (...rows: LedgerSettlementRecord[]) => ({ ok: true as const, records: rows })
+/**
+ * o3d-78rq: both operands are `Decimal`s now, and these two helpers do the conversion so every case
+ * below still READS as the figure it is about. They convert and nothing else — a test that needs to
+ * pin an inexact operand states the Decimal itself.
+ */
+const described = (a: Omit<AttemptDescription, 'amount'> & { amount: number | string | null }): AttemptDescription =>
+  ({ ...a, amount: a.amount === null ? null : toDecimal(a.amount) })
+const recorded = (r: Omit<LedgerSettlementRecord, 'amount'> & { amount: number | string | null }): LedgerSettlementRecord =>
+  ({ ...r, amount: r.amount === null ? null : toDecimal(r.amount) })
+
+const attempt = described({ amount: 10, currency: 'GBP', date: '2026-08-01', marker: null })
+const records = (...rows: Array<Parameters<typeof recorded>[0]>) =>
+  ({ ok: true as const, records: rows.map(recorded) })
 
 test('an empty ledger clears the attempt (o3d-0m56)', () => {
   assert.deepEqual(classifyLedgerSettlement(attempt, records()), { outcome: 'clear' })
@@ -49,7 +63,9 @@ test('an empty ledger clears the attempt (o3d-0m56)', () => {
 test('same amount AND same date is the attempt (o3d-0m56)', () => {
   const verdict = classifyLedgerSettlement(attempt, records({ amount: 10, date: '2026-08-01', id: 'PAY-1' }))
   assert.equal(verdict.outcome, 'present')
-  assert.match(verdict.outcome === 'present' ? verdict.detail : '', /10\.00 dated 2026-08-01 \(PAY-1\)/)
+  // o3d-78rq: `money()` prints `toFixed()` — lossless and never rounded — so ten pounds reads as `10`.
+  // The figure an operator is shown is the one the ledger holds, not a two-decimal rendering of it.
+  assert.match(verdict.outcome === 'present' ? verdict.detail : '', /^10 dated 2026-08-01 \(PAY-1\)$/)
 })
 
 test('a settlement of the same size on ANOTHER day is not this attempt (o3d-0m56)', () => {
@@ -83,8 +99,8 @@ test('an attempt IMS cannot describe is UNKNOWN (o3d-0m56)', () => {
   // reconstructed afterwards — so a row that pins neither amount nor date can never be matched,
   // and must not be treated as absent from the ledger.
   for (const partial of [
-    { amount: null, currency: 'GBP', date: '2026-08-01', marker: null },
-    { amount: 10, currency: 'GBP', date: null, marker: null },
+    described({ amount: null, currency: 'GBP', date: '2026-08-01', marker: null }),
+    described({ amount: 10, currency: 'GBP', date: null, marker: null }),
   ]) {
     assert.equal(classifyLedgerSettlement(partial, records()).outcome, 'unknown', JSON.stringify(partial))
   }
@@ -98,19 +114,19 @@ test('a ledger record IMS cannot measure is UNKNOWN (o3d-0m56)', () => {
 })
 
 test('the attempt is described from the payload the connector actually sends (o3d-0m56)', () => {
-  assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { amount: 12.5, paymentDate: '2026-08-01' }), { amount: 12.5, currency: null, date: '2026-08-01', marker: null })
+  assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { amount: 12.5, paymentDate: '2026-08-01' }), described({ amount: 12.5, currency: null, date: '2026-08-01', marker: null }))
   // Allocations carry `date`, payments carry `paymentDate`; both are sliced to 10 characters
   // exactly as the processors slice them — and each type reads ONLY its own field.
-  assert.deepEqual(describeAttempt('PURCHASE_CREDIT_NOTE_ALLOCATION', { amount: 1, date: '2026-08-01T09:30:00Z' }), { amount: 1, currency: null, date: '2026-08-01', marker: null })
+  assert.deepEqual(describeAttempt('PURCHASE_CREDIT_NOTE_ALLOCATION', { amount: 1, date: '2026-08-01T09:30:00Z' }), described({ amount: 1, currency: null, date: '2026-08-01', marker: null }))
   // A zero amount is a real request — the connectors reject an amount only when it is null.
-  assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { amount: 0, paymentDate: '2026-08-01' }), { amount: 0, currency: null, date: '2026-08-01', marker: null })
-  assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { paymentDate: '2026-08-01' }), { amount: null, currency: null, date: '2026-08-01', marker: null })
-  assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { amount: 1 }), { amount: 1, currency: null, date: null, marker: null })
+  assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { amount: 0, paymentDate: '2026-08-01' }), described({ amount: 0, currency: null, date: '2026-08-01', marker: null }))
+  assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { paymentDate: '2026-08-01' }), described({ amount: null, currency: null, date: '2026-08-01', marker: null }))
+  assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { amount: 1 }), described({ amount: 1, currency: null, date: null, marker: null }))
   // A blank or truncated date is not a date. Slicing it anyway would produce a value that can
   // never match a real settlement, which reads as "clear" for the wrong reason.
-  assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { amount: 1, paymentDate: '' }), { amount: 1, currency: null, date: null, marker: null })
-  assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { amount: 1, paymentDate: '2026-08' }), { amount: 1, currency: null, date: null, marker: null })
-  assert.deepEqual(describeAttempt('INVOICE_PAYMENT', null), { amount: null, currency: null, date: null, marker: null })
+  assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { amount: 1, paymentDate: '' }), described({ amount: 1, currency: null, date: null, marker: null }))
+  assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { amount: 1, paymentDate: '2026-08' }), described({ amount: 1, currency: null, date: null, marker: null }))
+  assert.deepEqual(describeAttempt('INVOICE_PAYMENT', null), described({ amount: null, currency: null, date: null, marker: null }))
 })
 
 test('[o3d-6yho] the attempt takes its CURRENCY from the payload, and the currency sizes the band', () => {
@@ -123,10 +139,10 @@ test('[o3d-6yho] the attempt takes its CURRENCY from the payload, and the curren
   // MUTATION: return a flat `currency: null` and the KWD case below matches a payment a fil away.
   assert.deepEqual(
     describeAttempt('INVOICE_PAYMENT', { amount: 10, currency: 'KWD', paymentDate: '2026-08-01' }),
-    { amount: 10, currency: 'KWD', date: '2026-08-01', marker: null },
+    described({ amount: 10, currency: 'KWD', date: '2026-08-01', marker: null }),
   )
 
-  const oneThousandthAway = { ok: true as const, records: [{ amount: 10.001, date: '2026-08-01' }] }
+  const oneThousandthAway = records({ amount: 10.001, date: '2026-08-01' })
   assert.equal(
     classifyLedgerSettlement(
       describeAttempt('INVOICE_PAYMENT', { amount: 10, currency: 'KWD', paymentDate: '2026-08-01' }),
@@ -225,12 +241,12 @@ test('describeAttempt fills a missing date ONLY from postingOn (o3d-0m56 r5)', (
   // is never overridden, because a past attempt's day is unreconstructable and substituting
   // today's would go looking for a settlement that was never created.
   assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { amount: 1 }, null, { postingOn: '2026-08-18' }),
-    { amount: 1, currency: null, date: '2026-08-18', marker: null })
+    described({ amount: 1, currency: null, date: '2026-08-18', marker: null }))
   assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { amount: 1, paymentDate: '2026-08-01' }, null, { postingOn: '2026-08-18' }),
-    { amount: 1, currency: null, date: '2026-08-01', marker: null })
+    described({ amount: 1, currency: null, date: '2026-08-01', marker: null }))
   assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { amount: 1 }, null, { postingOn: null }),
-    { amount: 1, currency: null, date: null, marker: null })
-  assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { amount: 1 }), { amount: 1, currency: null, date: null, marker: null },
+    described({ amount: 1, currency: null, date: null, marker: null }))
+  assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { amount: 1 }), described({ amount: 1, currency: null, date: null, marker: null }),
     'and a caller that does not opt in still gets the honest null')
 })
 
@@ -241,12 +257,10 @@ test("a settlement carrying this attempt's own mark IS this attempt (o3d-0m56)",
   // and it stops matching the attempt that created it while still paying the invoice — so a retry
   // would add a second one. The mark does not move.
   const marker = settlementMarkerFor('followup:xero:INVOICE_PAYMENT:SalesOrder:so-1:inv-9')
-  const marked = { amount: 10, currency: 'GBP', date: '2026-08-01', marker }
+  const marked = described({ amount: 10, currency: 'GBP', date: '2026-08-01', marker })
 
-  const edited = classifyLedgerSettlement(marked, {
-    ok: true,
-    records: [{ amount: 999, date: '2020-01-01', id: 'PAY-1', reference: `Deposit ${marker}` }],
-  })
+  const edited = classifyLedgerSettlement(marked,
+    records({ amount: 999, date: '2020-01-01', id: 'PAY-1', reference: `Deposit ${marker}` }))
   assert.equal(edited.outcome, 'present', 'neither field matches, and it is still the same payment')
   assert.match(edited.outcome === 'present' ? edited.detail : '', new RegExp(marker))
 })
@@ -256,10 +270,8 @@ test('another entry\'s mark is not this attempt (o3d-0m56)', () => {
   const theirs = settlementMarkerFor('token-b')
   assert.notEqual(mine, theirs)
   assert.deepEqual(
-    classifyLedgerSettlement({ amount: 10, currency: 'GBP', date: '2026-08-01', marker: mine }, {
-      ok: true,
-      records: [{ amount: 4, date: '2026-07-01', reference: theirs }],
-    }),
+    classifyLedgerSettlement(described({ amount: 10, currency: 'GBP', date: '2026-08-01', marker: mine }),
+      records({ amount: 4, date: '2026-07-01', reference: theirs })),
     { outcome: 'clear' },
     'a payment IMS made for something else must not strand this one',
   )
@@ -278,10 +290,8 @@ test('an unmarked settlement still matches on amount and date (o3d-0m56)', () =>
   // which have no reference field at all — can only be recognised this way.
   const marker = settlementMarkerFor('token-a')
   assert.equal(
-    classifyLedgerSettlement({ amount: 10, currency: 'GBP', date: '2026-08-01', marker }, {
-      ok: true,
-      records: [{ amount: 10, date: '2026-08-01', reference: null }],
-    }).outcome,
+    classifyLedgerSettlement(described({ amount: 10, currency: 'GBP', date: '2026-08-01', marker }),
+      records({ amount: 10, date: '2026-08-01', reference: null })).outcome,
     'present',
   )
 })
