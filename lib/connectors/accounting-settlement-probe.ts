@@ -1573,6 +1573,76 @@ export async function probeXeroSettlement(
           + 'can have come off the credit, so IMS cannot tell how much of the credit is already allocated',
       }
     }
+    /*
+     * o3d-acctmoney r6 (Codex HIGH) - A BAND IS A STATEMENT ABOUT ONE READING, SO THE SUM OF THE
+     * READINGS IT ADMITS NEEDS ONE OF ITS OWN.
+     *
+     * THE DEFECT, AND IT IS IN THE PARAGRAPH ABOVE RATHER THAN BESIDE IT. That paragraph ends "a
+     * negative smaller than the band is two exact decimals agreeing to the document's minor unit,
+     * which is noise below the granularity of every decision here". That sentence is true of ONE
+     * value and false of a collection of them. The test was applied to each entry INDEPENDENTLY and
+     * the values it admitted were then SUMMED into `refunded`, so any number of sub-band negatives
+     * could be added together and nothing whatsoever measured the total.
+     *
+     * Codex's shape, reproduced: three resolved GBP refunds of `-0.004` each, with `Total 400`,
+     * `RemainingCredit 400.012` and an empty `Allocations` collection. Every one of them passes the
+     * per-entry band; `refunded` is `-0.012`; `applied` is `400 - 400.012 - 0 - (-0.012)`, which is
+     * EXACTLY ZERO - a proved zero over an empty collection, which is `clear`, which authorises an
+     * allocation against a note whose own `RemainingCredit` is larger than its `Total`.
+     *
+     * WHAT THE NEGATIVES ARE ACTUALLY BUYING, because "the sum came out too big" is not the harm and
+     * saying so would leave the next reader looking in the wrong place. `refunded` is SUBTRACTED, so
+     * a negative term makes `applied` LARGER, and larger is the shortfall direction - visible, and
+     * never a `clear` on its own. The harm is one comparison further on: `shortBy(0, applied +
+     * unprovedRefunded)` is the incoherence check, it decides at ONE band, and a negative refund
+     * cancels EXACTLY the incoherence it introduces. So a note whose figures contradict each other by
+     * any amount at all can be presented as coherent by shipping that amount back as sub-band
+     * negative refunds, and the concealment is unbounded precisely because the tolerance was only
+     * ever asked about one term of the sum.
+     *
+     * WHICH OF THE TWO REMEDIES, AND WHY THIS ONE. Refusing every exact negative answers the finding
+     * in one line and throws away the property the band was there to protect: a SINGLE rounding
+     * artefact - two exact decimals agreeing to the document's own minor unit - would then hold an
+     * ordinary note, which is the whole-class harm this arm has repeatedly been told not to
+     * reintroduce. That property is worth keeping, and it is only ever a claim about ONE reading. So
+     * the per-entry tolerance stays exactly where it was and the AGGREGATE is measured separately,
+     * which is the only spelling of the rule that cannot be accumulated past.
+     *
+     * WHAT THE BOUND GUARANTEES, WRITTEN AS A CEILING RATHER THAN AS A REASSURANCE. The combined
+     * magnitude of every negative this arm admits is at most one `completenessBand`, so the most that
+     * can ever be hidden from the incoherence check is one band - the granularity every decision in
+     * this file already makes, and the same quantity a single artefact was always allowed to move.
+     * That is a property the arithmetic below can be read against; "negatives are rare" is not.
+     *
+     * THE SIGN TEST THAT COLLECTS THE CONTRIBUTIONS IS BARE, AND THAT IS THE POINT. Collecting a term
+     * is not deciding about it. The band has MOVED off the entry and onto the sum, and asking it again
+     * on the way in would put the hole straight back - three readings under the band would contribute
+     * nothing and the total would be zero however many of them there were.
+     *
+     * AND THE WIDTH NEEDS NO SECOND CHECK OF ITS OWN. `unresolvedReadings` below is a SUBSET of these
+     * readings, and a subset's negative contributions cannot total more than the whole set's, so
+     * `unprovedRefunded` INHERITS this ceiling rather than repeating it.
+     *
+     * THE PER-ENTRY ARM IS KEPT AND STILL RUNS FIRST, so a single unmistakable negative refuses by
+     * naming the ONE payment an operator has to open. This arm names all of the contributors, because
+     * no one of them is the reason on its own - which is the same fact the finding is about.
+     */
+    const negativeRefunds = refundReadings
+      .map((reading, index) => ({ value: reading.value, id: countedEntries[index]!.id }))
+      .filter((entry): entry is { value: Decimal; id: string } =>
+        entry.value !== null && compareDecimal(entry.value, toDecimal(0)) < 0)
+    const negativeRefundTotal = negativeRefunds.reduce<Decimal>(
+      (sum, entry) => addMoney(sum, entry.value), toDecimal(0),
+    )
+    if (shortBy(toDecimal(0), negativeRefundTotal, noteCurrency)) {
+      return {
+        ok: false,
+        reason: `Xero states payments ${negativeRefunds.map((entry) => entry.id).join(', ')} against `
+          + `this credit note as amounts totalling ${formatLedgerMoney(negativeRefundTotal)}, which `
+          + 'together are not an amount that can have come off the credit, so IMS cannot tell how '
+          + 'much of the credit is already allocated',
+      }
+    }
     // o3d-acctmoney r4 (Codex MEDIUM) — HOW MUCH OF THE SUBTRACTED REFUND TERM IS UNPROVED.
     //
     // A payment the lookup budget did not reach is still SUBTRACTED above — its stub says nothing, and

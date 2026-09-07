@@ -3446,6 +3446,159 @@ test('[o3d-acctmoney r5] a negative counted refund amount refuses, at the file\'
     'a wholly unallocated credit note whose only refund was reversed still allocates')
 })
 
+/**
+ * o3d-acctmoney r6 (Codex HIGH) - A PER-ENTRY TOLERANCE DOES NOT BOUND A SUM.
+ *
+ * r5's sign guard applied `completenessBand` to each counted refund INDEPENDENTLY and then summed the
+ * values it admitted. The band's justification - "a negative smaller than the band is two exact
+ * decimals agreeing to the document's minor unit" - is a statement about ONE reading, and three of
+ * them are 0.012, which is not. Every case below is a note that WOULD clear, so each assertion is
+ * taking a `clear` away rather than agreeing with a refusal that was already happening.
+ */
+
+/** Every refund below is resolved through the endpoint, so `somethingUnresolved` is never what refuses. */
+const resolvedNegativeStubs = (amounts: ReadonlyArray<readonly [string, number]>) =>
+  Object.fromEntries(amounts.map(([id, amount]) => [id, { ...AUTHORISED_REFUND, Amount: amount }]))
+
+/**
+ * A note whose only movement is the negative refunds themselves: `RemainingCredit` sits exactly
+ * `|sum|` ABOVE `Total`, so `applied` is `Total - RemainingCredit - 0 - sum`, which is EXACTLY ZERO -
+ * a proved zero over an empty collection, which is what `clear` is built out of.
+ */
+const noteWithNegatives = (amounts: ReadonlyArray<readonly [string, number]>) => ({
+  CurrencyCode: 'GBP',
+  Total: 400,
+  RemainingCredit: Number((400 - amounts.reduce((sum, [, a]) => sum + a, 0)).toFixed(6)),
+  Allocations: [],
+  Payments: amounts.map(([id, amount]) => ({ PaymentID: id, Amount: amount })),
+})
+
+test('[o3d-acctmoney r6] three sub-band negative refunds do not yield `clear`', async () => {
+  // CODEX'S FIGURES, VERBATIM: three resolved GBP refunds of -0.004, `Total 400`,
+  // `RemainingCredit 400.012`, no allocations. Each passes the per-entry band; `refunded` is -0.012;
+  // `applied` is `400 - 400.012 - 0 - (-0.012)` = 0; and a proved zero over an empty record list is
+  // `clear`, which authorises an allocation against a note whose remaining credit EXCEEDS its total.
+  //
+  // ROUTE: `negativeRefunds` collects all three on a BARE sign test -> `negativeRefundTotal` is
+  //        -0.012 -> `shortBy(0, -0.012)` is true at a GBP band of 0.005 -> ok:false naming all three.
+  // MUTATION: delete the aggregate block entirely (r5's code). Measured below.
+  // MUTATION 2: collect with the BAND instead of the bare sign - filter on
+  //        `shortBy(toDecimal(0), entry.value, noteCurrency)`. Measured below: nothing is collected,
+  //        the total is a flat zero, and the case clears again however many negatives there are.
+  const three = await probeNoteWithCalls(
+    noteWithNegatives([['PAY-N1', -0.004], ['PAY-N2', -0.004], ['PAY-N3', -0.004]]),
+    resolvedNegativeStubs([['PAY-N1', -0.004], ['PAY-N2', -0.004], ['PAY-N3', -0.004]]),
+  )
+  assert.equal(three.paths.filter((path) => path.startsWith('Payments/')).length, 3,
+    'PRECONDITION: all three were resolved, so nothing is unresolved and the marker is not in play')
+  assert.equal(three.probe.ok, false,
+    'three readings each below the band are 0.012, which is not below the band')
+  assert.match(reasonOf(three.probe),
+    /Xero states payments PAY-N1, PAY-N2, PAY-N3 against this credit note as amounts totalling -0\.012, which together are not an amount that can have come off the credit, so IMS cannot tell how much of the credit is already allocated/)
+  assert.notEqual(classifyLedgerSettlement(attemptFor('400.00'), three.probe).outcome, 'clear',
+    'and whatever else is true of the response, it does not authorise an allocation')
+
+  // WHAT THE NEGATIVES WERE CONCEALING, ASSERTED RATHER THAN ARGUED. Take the same note and delete
+  // the three refunds: `applied` is `400 - 400.012` = -0.012, the incoherence check fires at the same
+  // band, and the response refuses. So the negatives were cancelling EXACTLY the incoherence they
+  // introduced - the per-entry tolerance was buying an unbounded amount of concealment, which is the
+  // finding stated as a measurement.
+  const withoutThem = await probeNote({
+    CurrencyCode: 'GBP', Total: 400, RemainingCredit: 400.012, Allocations: [], Payments: [],
+  })
+  assert.equal(withoutThem.ok, false,
+    'PRECONDITION: the same figures with no refunds in them are incoherent and say so')
+  assert.match(reasonOf(withoutThem),
+    /remaining credit is larger than its own total less what has been taken off it/)
+
+  // TWO OF THEM IS ALREADY PAST THE BAND, so the rule is about the sum reaching the band and not
+  // about there being three. -0.008 is above a GBP band of 0.005.
+  const two = await probeNote(
+    noteWithNegatives([['PAY-N1', -0.004], ['PAY-N2', -0.004]]),
+    resolvedNegativeStubs([['PAY-N1', -0.004], ['PAY-N2', -0.004]]),
+  )
+  assert.equal(two.ok, false, 'two sub-band negatives already total more than one band')
+  assert.match(reasonOf(two), /payments PAY-N1, PAY-N2 .* totalling -0\.008/)
+  assert.notEqual(classifyLedgerSettlement(attemptFor('400.00'), two).outcome, 'clear')
+})
+
+test('[o3d-acctmoney r6] a single rounding artefact still does not hold an ordinary note', async () => {
+  // THE PROPERTY THE FIRST REMEDY WOULD HAVE THROWN AWAY, and the reason this branch took the second.
+  // Codex offered "reject every exact negative", which answers the finding in one line and refuses an
+  // ordinary note for two exact decimals agreeing to the document's own minor unit. The tolerance is
+  // kept exactly where it was; only the SUM acquired a bound. r5's own case (3) asserts this from the
+  // other side and is untouched.
+  //
+  // ROUTE: `negativeRefundTotal` is -0.004 -> `shortBy(0, -0.004)` is FALSE at a GBP band of 0.005 ->
+  //        the arm falls through, `applied` is a proved zero, and the note clears.
+  // MUTATION: take Codex's first remedy - refuse whenever `negativeRefunds.length > 0`. Measured
+  //        below: this whole test refuses, which is the whole-class harm the band exists to prevent.
+  const artefact = await probeNote(
+    noteWithNegatives([['PAY-NOISE', -0.004]]),
+    resolvedNegativeStubs([['PAY-NOISE', -0.004]]),
+  )
+  assert.equal(artefact.ok, true, 'ONE sub-band negative is still noise, and noise is not a refusal')
+  assert.equal(artefact.ok === true ? artefact.provedComplete : null, true)
+  assert.equal(classifyLedgerSettlement(attemptFor('400.00'), artefact).outcome, 'clear',
+    'and the note it sits on is still allocatable on the first attempt')
+
+  // THE CEILING IS ONE BAND, INCLUSIVE, which is the comparison `shortBy` makes everywhere else in
+  // this file rather than a threshold invented here. Two artefacts totalling EXACTLY one GBP band are
+  // admitted; one more ten-thousandth on top of them is not.
+  const exactlyOneBand = await probeNote(
+    noteWithNegatives([['PAY-A', -0.004], ['PAY-B', -0.001]]),
+    resolvedNegativeStubs([['PAY-A', -0.004], ['PAY-B', -0.001]]),
+  )
+  assert.equal(exactlyOneBand.ok, true, 'a total of exactly one band is not MORE than one band')
+  assert.equal(classifyLedgerSettlement(attemptFor('400.00'), exactlyOneBand).outcome, 'clear')
+
+  const oneOver = await probeNote(
+    noteWithNegatives([['PAY-A', -0.004], ['PAY-B', -0.001], ['PAY-C', -0.001]]),
+    resolvedNegativeStubs([['PAY-A', -0.004], ['PAY-B', -0.001], ['PAY-C', -0.001]]),
+  )
+  assert.equal(oneOver.ok, false, 'and one ten-thousandth past it is')
+  assert.match(reasonOf(oneOver), /totalling -0\.006/)
+})
+
+test('[o3d-acctmoney r6] the per-entry arm still runs first and still names the one payment', async () => {
+  // THE r5 BEHAVIOUR, OTHERWISE UNCHANGED. The aggregate arm is an ADDITION: a single unmistakable
+  // negative must still refuse through the per-entry arm, naming the ONE payment an operator has to
+  // open, rather than being reported as a total that happens to include it.
+  //
+  // ROUTE: `negativeRefund` (r5's findIndex) matches PAY-BIG -> the r5 sentence, unchanged.
+  // MUTATION: delete r5's per-entry block and keep only the aggregate one. Measured below: the
+  //        response still refuses, but with the r6 sentence naming BOTH payments - so the assertion
+  //        on the singular sentence is what holds the per-entry arm in place.
+  const mixed = await probeNote(
+    noteWithNegatives([['PAY-BIG', -0.01], ['PAY-NOISE', -0.004]]),
+    resolvedNegativeStubs([['PAY-BIG', -0.01], ['PAY-NOISE', -0.004]]),
+  )
+  assert.equal(mixed.ok, false)
+  assert.match(reasonOf(mixed),
+    /Xero states payment PAY-BIG against this credit note as -0\.01, which is not an amount that can have come off the credit/,
+    'the entry that is unmistakably negative on its own is still named on its own')
+  assert.doesNotMatch(reasonOf(mixed), /totalling/,
+    'and the aggregate sentence is not what an operator is handed for a single bad payment')
+
+  // AND AN EXCLUDED PAYMENT CONTRIBUTES TO NEITHER ARM. `refundReadings` is the COUNTED entries, so a
+  // DELETED refund's amount is not read here any more than it was in r5 - three of them cannot be
+  // accumulated into a refusal for a figure this arm will never subtract.
+  const deleted = await probeNote({
+    CurrencyCode: 'GBP', Total: 400, RemainingCredit: 400, Allocations: [], Payments: [
+      { PaymentID: 'PAY-G1', Amount: -0.004 },
+      { PaymentID: 'PAY-G2', Amount: -0.004 },
+      { PaymentID: 'PAY-G3', Amount: -0.004 },
+    ],
+  }, {
+    'PAY-G1': { ...DELETED_REFUND, Amount: -0.004 },
+    'PAY-G2': { ...DELETED_REFUND, Amount: -0.004 },
+    'PAY-G3': { ...DELETED_REFUND, Amount: -0.004 },
+  })
+  assert.equal(deleted.ok, true, 'none of the three is a term, so none of them is a contribution')
+  assert.equal(deleted.ok === true ? deleted.provedComplete : null, true)
+  assert.equal(classifyLedgerSettlement(attemptFor('400.00'), deleted).outcome, 'clear')
+})
+
 test('[o3d-acctmoney r5] the interval behaviour from r4 is unchanged for ordinary notes', async () => {
   // THE COST OF THE FIX, MEASURED. A marker read from a COUNT is strictly harder to cancel than one
   // read from a sum, so the thing to prove is that it did not become harder to SATISFY: an ordinary
