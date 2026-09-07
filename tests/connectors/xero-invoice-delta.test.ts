@@ -672,6 +672,47 @@ test('PAID and DRAFT rows are not reversal candidates at all, and types do not c
   assert.deepEqual(partitionPaymentReversals(rows, 'ACCREC').zeroPaid.map((i) => i.InvoiceID), ['s-auth'])
 })
 
+test('[o3d-77sj] a STATED ZERO is READABLE in every currency and in none — the reading a VOID rests on', () => {
+  // THE CLAIM THIS PINS, and it is the one every other guard on this reader could take away by
+  // accident. `readLedgerStatedAmount` refuses a figure for two reasons — it is too LARGE for its
+  // currency's minor unit to survive the decode (r14's magnitude bound), or it is written FINER than
+  // that minor unit (r16/r18's scale rule) — and both reasons are sized by a currency the payload may
+  // not state, in which case the STRICTEST one is used.
+  //
+  // ZERO ANSWERS TO NEITHER PREMISE. It is below every magnitude bound there is, and it is a whole
+  // multiple of every minor unit there is, so no currency knowledge is needed to read it and none can
+  // withdraw it. That is not a nicety: a VOIDED QuickBooks document is `TotalAmt = 0`, and
+  // `payment-poller.ts`'s void test is `parsed.total !== null && parsed.total === 0`. Refuse the zero
+  // and `isVoided` is false, the row joins `unreadable`, and a voided document STOPS REVERSING while
+  // QuickBooks has already unwound the AR — the refusal spent as a settlement, in the one case that
+  // needs no arithmetic at all.
+  //
+  // Every supported precision, and the UNSTATED currency that takes the finest of them.
+  const currencies: Array<string | null> = [
+    null, 'GBP', 'USD', 'JPY', 'KRW', 'ISK', 'KWD', 'BHD', 'JOD', 'CLF', 'UYW',
+  ]
+  // Both arms: the JSON numeric token QuickBooks sends with multicurrency off, and the decimal string
+  // it sends otherwise — written out to more places than the currency has, because trailing zeros are
+  // not a scale (`decimalPlaces()` reads the VALUE, and the value is zero everywhere).
+  const statedZeros: Array<number | string> = [0, '0', '0.0', '0.00', '0.000', '0.0000', ' 0.00 ']
+  for (const currency of currencies) {
+    for (const stated of statedZeros) {
+      assert.equal(
+        parseLedgerAmount(stated, currency), 0,
+        `${JSON.stringify(stated)} in ${currency ?? 'an unstated currency'} is the ledger STATING it `
+        + 'holds nothing, and a guard whose premise is about size or precision has nothing to say '
+        + 'about it',
+      )
+    }
+  }
+  // AND THE CONTROL, so this cannot pass by the reader having become permissive: one minor unit of the
+  // FINEST supported currency is still refused where the currency is unstated and coarser than it.
+  assert.equal(parseLedgerAmount('0.0001', null), 0.0001,
+    'the strictest minor unit is itself readable — the fallback is the finest precision, not a ban')
+  assert.equal(parseLedgerAmount('0.00001', null), null,
+    'and one place finer than any supported currency is still refused, so the scale rule is reached')
+})
+
 test('parseLedgerAmount refuses to turn an empty field into zero', () => {
   assert.equal(parseLedgerAmount('', 'GBP'), null)
   assert.equal(parseLedgerAmount('   ', 'GBP'), null)

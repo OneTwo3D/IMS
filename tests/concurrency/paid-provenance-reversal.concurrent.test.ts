@@ -96,6 +96,67 @@ async function createPaidOrder(
   })
 }
 
+/**
+ * o3d-77sj — THE FENCE INSTANT, WITH THE ORDERING IT RESTS ON PROVED INSTEAD OF ASSUMED.
+ *
+ * Cross-ported from the QuickBooks sibling, where the same shape was CI's only red test. The finding
+ * there applies here verbatim, and here it appears five times.
+ *
+ * `classifyRegisteredPaymentAgainstListing` counts a registration as spoken for only while it
+ * finished STRICTLY before the fence, and that strictness is right: the safe side of a tie about a
+ * payment is "this read cannot speak for it". What a FIXTURE owes it is a MARGIN. These tests wrote
+ * their registrations and then read `clock_timestamp()` with nothing in between — a couple of
+ * milliseconds — and called the ordering established.
+ *
+ * A COUPLE OF MILLISECONDS IS NOT A MARGIN, because neither end is stored at the precision it was
+ * measured at. `syncedAt` and `syncedAtDatabaseClock` are `TIMESTAMP(3)`, and PostgreSQL ROUNDS to
+ * that precision, so a registration can be recorded up to half a millisecond LATE. The fence is a
+ * full-precision `clock_timestamp()` that the driver and `Date` TRUNCATE, so it is recorded up to a
+ * millisecond EARLY. Below roughly a millisecond and a half of real gap the two meet, every
+ * registration lands on `undecided`, and the verdict is REGISTRATION_UNDECIDED — which withholds.
+ *
+ * EVERY TEST BELOW THAT ASSERTS AN ADMISSION DOES SO ABOUT ITS LAST-CREATED DOCUMENT, whose
+ * registration is stamped closest to the fence. Those are exactly the assertions this destroys, and
+ * it destroys them by reaching an arm the test is not about, so the failure names a behaviour
+ * ("a chargeback must still be detected") rather than the clock.
+ *
+ * So the instant is read until the DATABASE'S OWN clock is past every registration the fixture wrote,
+ * and this function ASSERTS that it got there. It cannot pass vacuously: a fixture that wrote no
+ * registration, or one whose stamp the trigger cleared, fails HERE. This host's clock takes no part
+ * in the verdict — it only bounds the loop.
+ *
+ * NOTHING IN PRODUCTION MOVES, and nothing is weakened: the strict `<` is untouched, and a
+ * registration that really is contemporaneous with the read still withholds.
+ */
+async function fenceInstantAfterRegistrations(
+  db: Awaited<ReturnType<typeof loadDb>>,
+  orderIds: readonly string[],
+): Promise<Date> {
+  const stamped = await db.accountingSyncLog.findMany({
+    where: { referenceId: { in: [...orderIds] } },
+    select: { syncedAt: true, syncedAtDatabaseClock: true },
+  })
+  assert.ok(stamped.length > 0,
+    'the fixture must have written a registration, or this helper orders the fence against nothing '
+    + 'and every caller of it is vacuous')
+  for (const row of stamped) {
+    assert.ok(
+      row.syncedAt != null && row.syncedAtDatabaseClock != null
+      && row.syncedAt.getTime() === row.syncedAtDatabaseClock.getTime(),
+      'every registration must be database-stamped, or the classifier calls it UNDECIDED and no '
+      + 'fence whatever can put it behind the read',
+    )
+  }
+  const lastStamp = Math.max(...stamped.map((row) => row.syncedAt!.getTime()))
+  const giveUpAt = Date.now() + 5_000
+  do {
+    const [{ now }] = await db.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`
+    if (now.getTime() > lastStamp) return now
+  } while (Date.now() < giveUpAt)
+  assert.fail('the database clock never passed the registrations this fixture wrote, so no fence '
+    + 'here can speak for them')
+}
+
 test(
   '[o3d-psrx r2] a channel-paid sale with no Payment row and no registration is NOT reversed',
   { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
@@ -215,7 +276,9 @@ test(
 
     // The fence is read AFTER the stamp, so the registration provably finished before the ledger was
     // asked — the ordering the poller itself relies on (SELECT clock_timestamp(), THEN call Xero).
-    const [{ now }] = await db.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`
+    // o3d-77sj: and it is PROVED to be after it, rather than left to whatever gap the round trips
+    // happen to leave. See `fenceInstantAfterRegistrations`.
+    const now = await fenceInstantAfterRegistrations(db, [orderId])
     const stamped = await db.accountingSyncLog.findUniqueOrThrow({
       where: { id: registration.id },
       select: { syncedAt: true, syncedAtDatabaseClock: true },
@@ -390,7 +453,8 @@ test(
       'and the CONTROL\'s registration must have completed AFTER its own episode began, or the control '
       + 'is not a control')
 
-    const [{ now }] = await db.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`
+    // o3d-77sj: strictly after every registration above, proved rather than assumed.
+    const now = await fenceInstantAfterRegistrations(db, [staleId, currentId])
     const invoices = new Map([
       [staleInvoice, zeroPaidInvoice(staleInvoice)],
       [currentInvoice, zeroPaidInvoice(currentInvoice)],
@@ -450,7 +514,8 @@ test(
     const strandedEntryId = await postedRegistration(db, movedId, deletedInvoice, 'PAY-AGAINST-DELETED')
     await postedRegistration(db, sameId, sameInvoice, 'PAY-AGAINST-THIS')
 
-    const [{ now }] = await db.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`
+    // o3d-77sj: strictly after every registration above, proved rather than assumed.
+    const now = await fenceInstantAfterRegistrations(db, [movedId, sameId])
     const invoices = new Map([
       [replacementInvoice, zeroPaidInvoice(replacementInvoice)],
       [sameInvoice, zeroPaidInvoice(sameInvoice)],
@@ -566,7 +631,8 @@ test(
     assert.ok(markers.every((m) => m.unregisteredPaidAt != null),
       'PRECONDITION: both orders must still carry the off-ledger marker — the guard is gated on it')
 
-    const [{ now }] = await db.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`
+    // o3d-77sj: strictly after every registration above, proved rather than assumed.
+    const now = await fenceInstantAfterRegistrations(db, [partId, fullId])
     const invoices = new Map([
       [partInvoice, zeroPaidInvoice(partInvoice)],
       [fullInvoice, zeroPaidInvoice(fullInvoice)],
@@ -678,7 +744,8 @@ test(
     await postedRegistration(db, shortId, shortInvoice, 'PAY-SHORT', Number(SHORT), shortReceipt.id, 'CLF')
     await postedRegistration(db, exactId, exactInvoice, 'PAY-EXACT', Number(SHORT), exactReceipt.id, 'CLF')
 
-    const [{ now }] = await db.$queryRaw<Array<{ now: Date }>>`SELECT clock_timestamp() AS now`
+    // o3d-77sj: strictly after every registration above, proved rather than assumed.
+    const now = await fenceInstantAfterRegistrations(db, [shortId, exactId])
     const invoices = new Map([
       [shortInvoice, zeroPaidInvoice(shortInvoice)],
       [exactInvoice, zeroPaidInvoice(exactInvoice)],

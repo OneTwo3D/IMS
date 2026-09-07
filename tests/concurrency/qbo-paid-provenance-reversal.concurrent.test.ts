@@ -111,6 +111,75 @@ const ledgerAmount = (total: number | null, balance: number | null, currency: st
 const fullyRemoved = (invoiceIds: Iterable<string>, total = 100) =>
   new Map([...invoiceIds].map((id) => [id, ledgerAmount(total, total)] as const))
 
+/**
+ * o3d-77sj — THE FENCE, WITH THE ORDERING IT RESTS ON PROVED INSTEAD OF ASSUMED.
+ *
+ * `classifyRegisteredPaymentAgainstListing` counts a registration as spoken for only while it
+ * finished STRICTLY before the fence, and that strictness is right: the safe side of a tie about a
+ * payment is "this read cannot speak for it". What a FIXTURE owes it is a MARGIN, and these fixtures
+ * had none. They wrote their registrations and read the fence with nothing in between — about two
+ * milliseconds later on the host that runs them — and called the ordering established.
+ *
+ * TWO MILLISECONDS IS NOT A MARGIN, because neither end is stored at the precision it was measured
+ * at. `syncedAt` and `syncedAtDatabaseClock` are `TIMESTAMP(3)`, and PostgreSQL ROUNDS to that
+ * precision, so a registration can be recorded up to half a millisecond LATE. The fence is a
+ * full-precision `clock_timestamp()` that the driver and `Date` TRUNCATE, so it is recorded up to a
+ * millisecond EARLY. Under roughly a millisecond and a half of real gap the two meet, every
+ * registration goes to `undecided`, the verdict is REGISTRATION_UNDECIDED, and a test whose subject
+ * is an ADMITTED reversal fails for a reason that has nothing to do with its subject.
+ *
+ * THAT IS WHAT CI CAUGHT, and only on the one test in this file that made no incidental round trip
+ * between the two: the voided-document control, whose probe is written LAST and so is stamped closest
+ * to the fence. Its two siblings that also assert an admission survived on a precondition read they
+ * happen to make in between. A margin nobody wrote is a margin nobody can keep.
+ *
+ * So the fence is read until the DATABASE'S OWN clock is past every registration this fixture wrote,
+ * and this function ASSERTS that it got there. It terminates because `clock_timestamp()` advances,
+ * and it cannot pass vacuously: a fixture that wrote no registration, or one whose stamp the trigger
+ * cleared, fails HERE rather than quietly reaching an arm the test is not about.
+ *
+ * NOTHING IN PRODUCTION MOVES, and nothing is weakened. The strict `<` is untouched; a poller reads
+ * its fence before an HTTP call, minutes or hours after the registrations it is weighing, and a
+ * registration that really is contemporaneous with the read still withholds.
+ */
+type LedgerFence = NonNullable<
+  Awaited<ReturnType<typeof import('@/lib/domain/accounting/payment-reversal').readDatabaseLedgerFence>>
+>
+
+async function fenceAfterRegistrations(
+  db: Awaited<ReturnType<typeof loadDb>>,
+  orderIds: readonly string[],
+): Promise<LedgerFence> {
+  const { readDatabaseLedgerFence } = await import('@/lib/domain/accounting/payment-reversal')
+  const stamped = await db.accountingSyncLog.findMany({
+    where: { referenceId: { in: [...orderIds] } },
+    select: { syncedAt: true, syncedAtDatabaseClock: true },
+  })
+  assert.ok(stamped.length > 0,
+    'the fixture must have written a registration, or this helper orders the fence against nothing '
+    + 'and every caller of it is vacuous')
+  for (const row of stamped) {
+    assert.ok(
+      row.syncedAt != null && row.syncedAtDatabaseClock != null
+      && row.syncedAt.getTime() === row.syncedAtDatabaseClock.getTime(),
+      'every registration must be database-stamped, or the classifier calls it UNDECIDED and no '
+      + 'fence whatever can put it behind the read',
+    )
+  }
+  const lastStamp = Math.max(...stamped.map((row) => row.syncedAt!.getTime()))
+  // BOUNDED BY A DEADLINE AND NOT BY AN ATTEMPT COUNT, because what is being waited for is an amount
+  // of TIME — a millisecond of the database's clock — and the number of round trips that takes is a
+  // property of the host. This host's clock takes no part in the verdict; it only stops the loop.
+  const giveUpAt = Date.now() + 5_000
+  do {
+    const fence = await readDatabaseLedgerFence()
+    assert.ok(fence != null, 'a null fence decides nothing and this test would be vacuous')
+    if (fence.databaseClock.getTime() > lastStamp) return fence
+  } while (Date.now() < giveUpAt)
+  assert.fail('the database clock never passed the registrations this fixture wrote, so no fence '
+    + 'here can speak for them')
+}
+
 test(
   '[o3d-psrx r3] a QuickBooks-polled sale marked paid with no ledger registration is NOT reversed',
   { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
@@ -204,8 +273,7 @@ test(
     const db = await loadDb()
     const { readQboSalesReversalCandidates, gateQboReversalsOnProvenance } =
       await import('@/lib/connectors/quickbooks/payment-poller')
-    const { detectPaymentReversals, readDatabaseLedgerFence } =
-      await import('@/lib/domain/accounting/payment-reversal')
+    const { detectPaymentReversals } = await import('@/lib/domain/accounting/payment-reversal')
     const { stampSyncedAtFromDatabaseClock } = await import('@/lib/connectors/xero/synced-at-clock')
 
     const orderId = probeId()
@@ -265,8 +333,9 @@ test(
 
     // The fence is read AFTER the stamp, so the registration provably finished before the ledger was
     // asked — the ordering the poller relies on (SELECT clock_timestamp(), THEN call QuickBooks).
-    const ledgerObservedBefore = await readDatabaseLedgerFence()
-    assert.ok(ledgerObservedBefore != null, 'a null fence decides nothing and this test would be vacuous')
+    // o3d-77sj: and the ordering is PROVED here rather than left to whatever gap the round trips
+    // happen to leave. See `fenceAfterRegistrations`.
+    const ledgerObservedBefore = await fenceAfterRegistrations(db, [orderId])
 
     const candidates = (await readQboSalesReversalCandidates()).filter((c) => c.id === orderId)
     assert.equal(candidates.length, 1)
@@ -461,8 +530,7 @@ test(
     const db = await loadDb()
     const { readQboSalesReversalCandidates, gateQboReversalsOnProvenance } =
       await import('@/lib/connectors/quickbooks/payment-poller')
-    const { detectPaymentReversals, readDatabaseLedgerFence } =
-      await import('@/lib/domain/accounting/payment-reversal')
+    const { detectPaymentReversals } = await import('@/lib/domain/accounting/payment-reversal')
 
     const halfId = probeId()   // QuickBooks removed ONE of the two payments
     const goneId = probeId()   // QuickBooks removed BOTH
@@ -498,8 +566,8 @@ test(
       )
     }
 
-    const ledgerObservedBefore = await readDatabaseLedgerFence()
-    assert.ok(ledgerObservedBefore != null, 'a null fence decides nothing and this test would be vacuous')
+    // o3d-77sj: strictly after every registration above, proved rather than assumed.
+    const ledgerObservedBefore = await fenceAfterRegistrations(db, ids)
 
     // THE POLLER'S OWN QUERY, then the gate production feeds on the next line.
     const candidates = (await readQboSalesReversalCandidates()).filter((c) => ids.includes(c.id))
@@ -563,8 +631,7 @@ test(
     const db = await loadDb()
     const { readQboSalesReversalCandidates, gateQboReversalsOnProvenance } =
       await import('@/lib/connectors/quickbooks/payment-poller')
-    const { detectPaymentReversals, readDatabaseLedgerFence } =
-      await import('@/lib/domain/accounting/payment-reversal')
+    const { detectPaymentReversals } = await import('@/lib/domain/accounting/payment-reversal')
 
     const unreadableId = probeId()  // QuickBooks answered, but not with a figure IMS can read
     const unaskedId = probeId()     // QuickBooks did not answer about this document at all
@@ -581,8 +648,13 @@ test(
       await twoPostedHalves(db, id, invoiceOf.get(id)!)
     }
 
-    const ledgerObservedBefore = await readDatabaseLedgerFence()
-    assert.ok(ledgerObservedBefore != null, 'a null fence decides nothing and this test would be vacuous')
+    // o3d-77sj — THE ORDERING THIS TEST'S CONTROL DEPENDS ON, AND THE ONE IT USED TO ASSUME.
+    //
+    // The voided probe is created LAST, so its two registrations are stamped closest to the fence,
+    // and it is the only document here whose assertion needs an ADMISSION. Read the fence with no
+    // margin and both of them land on `undecided`, the verdict is REGISTRATION_UNDECIDED, and the
+    // control below fails saying a voided document did not reverse — which was CI's only red test.
+    const ledgerObservedBefore = await fenceAfterRegistrations(db, ids)
     const candidates = (await readQboSalesReversalCandidates()).filter((c) => ids.includes(c.id))
     assert.equal(candidates.length, 3)
 

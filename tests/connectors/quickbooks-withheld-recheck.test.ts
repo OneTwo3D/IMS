@@ -653,6 +653,42 @@ test('[o3d-psrx r10] CONTROL: a string TotalAmt of zero is still recognised as V
     'and a voided document raises NO chargeback: QuickBooks has already reversed the AR')
 })
 
+test('[o3d-77sj] CONTROL: a NUMERIC zero total with no CurrencyRef is still recognised as VOIDED', async () => {
+  // THE OTHER ARM, AND THE ONE THIS BRANCH PUT A GUARD IN FRONT OF. r10's control above states the
+  // zero as a STRING. QuickBooks sends a JSON NUMBER whenever multicurrency is off — and then it also
+  // omits `CurrencyRef`, so the row arrives with no currency of its own and (r16) IMS is not allowed
+  // to supply one. The number arm is the arm r14's magnitude bound and r16/r18's scale rule are
+  // written on, both sized by that missing currency at its strictest.
+  //
+  // ZERO ANSWERS TO NEITHER PREMISE — it is below every bound and a whole multiple of every minor
+  // unit — so it must read, with no currency knowledge whatever. If it ever stopped reading,
+  // `parsed.total` would be null, `isVoided` false, the row would join `unreadable`, and a document
+  // QuickBooks has already unwound the AR on would keep its `paidAt` for ever.
+  reset()
+  state.salesOrders = [paidOrderRow()]
+  state.syncLogs = [postedRegistration()]
+  // Numeric throughout, and no `CurrencyRef` on the row: QuickBooks states the document fully
+  // SETTLED, which is UNPROVEN rather than a reversal, so a marker is left to reconsider.
+  state.qboDocuments.set('QI1', { Id: 'QI1', Balance: 0, TotalAmt: 100 })
+  state.deltaBalanceDue = ['QI1']
+
+  const first = await poll()
+  assert.equal(first.salesReversalsWithheld, 1, 'the precondition: a marker exists to reconsider')
+  assert.equal(first.salesReversed, 0, 'and nothing is reversed while QuickBooks states a paid total')
+
+  // ...and now QuickBooks VOIDS the document: numeric zeros, and no currency anywhere on the row.
+  state.qboDocuments.set('QI1', { Id: 'QI1', Balance: 0, TotalAmt: 0 })
+  state.deltaBalanceDue = []
+  ageMarkers(HOUR + 60_000)
+
+  const second = await poll()
+  assert.equal(second.salesReversed, 1,
+    'a VOIDED document must still reverse when its zero total arrives as a NUMBER with no currency — '
+    + 'no guard on this branch has a premise that applies to zero')
+  assert.deepEqual(state.chargebacks, [],
+    'and a voided document raises NO chargeback: QuickBooks has already reversed the AR')
+})
+
 // ---------------------------------------------------------------------------
 // o3d-psrx r10 (Codex HIGH 3) — THE THRESHOLD BELONGS TO THE DOCUMENT'S CURRENCY.
 //
