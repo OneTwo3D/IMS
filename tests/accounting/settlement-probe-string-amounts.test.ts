@@ -108,8 +108,14 @@ const noteResponses = (body: Record<string, unknown>, refunds: Record<string, un
   ...Object.fromEntries(Object.entries(refunds).map(([id, payment]) => [
     `Payments/${id}`,
     // `null` stubs a response Xero answered with NO payment in it, which is a distinct failure from
-    // an id that was never stubbed at all (that one is the 404).
-    payment === null ? { Payments: [] } : { Payments: [{ PaymentID: id, ...(payment as Record<string, unknown>) }] },
+    // an id that was never stubbed at all (that one is the 404). An ARRAY stubs the `Payments` array
+    // verbatim (o3d-acctmoney r4), which is what it takes to write a response that does NOT answer the
+    // request that was made — several payments, or one identifying nothing.
+    payment === null
+      ? { Payments: [] }
+      : Array.isArray(payment)
+        ? { Payments: payment }
+        : { Payments: [{ PaymentID: id, ...(payment as Record<string, unknown>) }] },
   ])),
 })
 
@@ -2781,39 +2787,432 @@ test('[o3d-acctmoney r3] what the resolution COSTS: nothing when the status is s
 
   // (3) A SILENT STUB COSTS ONE REQUEST, and a collection that lists the SAME payment twice still
   // costs one: the lookups are cached by id.
+  //
+  // o3d-acctmoney r4 — THE FIXTURE'S `RemainingCredit` IS 300 HERE AND WAS 200. Under r3 two entries
+  // were also two TERMS, so 200 had to have come off for this note to be coherent; they are now ONE
+  // term, and 100 is what one 100 refund accounts for. Every assertion below is unchanged, because
+  // what this case measures is the COST. The 200 spelling was the arithmetic Codex found — one
+  // payment listed twice reaching a proved zero over an empty collection — and it is now section 9's
+  // regression test rather than a precondition asserted in passing here.
   const twice = await probeNoteWithCalls({
-    CurrencyCode: 'GBP', Total: 400, RemainingCredit: 200, Allocations: [],
+    CurrencyCode: 'GBP', Total: 400, RemainingCredit: 300, Allocations: [],
     Payments: [{ PaymentID: 'PAY-R1', Amount: 100 }, { PaymentID: 'pay-r1', Amount: 100 }],
   }, { 'PAY-R1': AUTHORISED_REFUND })
-  assert.equal(twice.probe.ok, true, 'PRECONDITION: both entries are counted, so both were classified')
+  assert.equal(twice.probe.ok, true, 'PRECONDITION: the entries were classified, so a lookup happened')
   assert.equal(twice.probe.ok === true ? twice.probe.provedComplete : null, true)
   assert.deepEqual(twice.paths, ['CreditNotes/cn-1', 'Payments/PAY-R1'],
     'the second entry reuses the first lookup, and the id is matched case-insensitively as Xero\'s GUIDs are')
 
   // (4) AND THE LOOP IS BOUNDED. It is over a vendor-controlled array length inside a money post, and
   // Xero allows 60 calls a minute per tenant — an unbounded resolve would let one pathological
-  // document starve every other row in the sweep. Above the cap it refuses, visibly.
-  // MUTATION: raise `XERO_CREDIT_NOTE_REFUND_LOOKUP_LIMIT` past 26. Measured: this case answers
-  //        ok:true and 26 `Payments/` calls appear in the log.
-  const many = Array.from({ length: 26 }, (_unused, i) => ({ PaymentID: `PAY-${i}`, Amount: 1 }))
+  // document starve every other row in the sweep. The budget is half that documented allowance, which
+  // is where the number comes from; r3's 25 came from nowhere.
+  //
+  // WHAT THE BUDGET COSTS IS ASSERTED HERE. WHAT EXCEEDING IT MEANS IS SECTION 9'S SUBJECT: r3 refused
+  // TERMINALLY past the cap, which stranded any credit note with more refunds than it, and the two
+  // assertions that recorded that refusal are replaced there by the answer that took its place.
+  // MUTATION: raise `XERO_CREDIT_NOTE_REFUND_LOOKUP_BUDGET` past 31. Measured: 31 `Payments/` calls
+  //        appear in the log and the first assertion below fails.
+  const many = Array.from({ length: 31 }, (_unused, i) => ({ PaymentID: `PAY-${i}`, Amount: 1 }))
   const capped = await probeNoteWithCalls(
-    { CurrencyCode: 'GBP', Total: 400, RemainingCredit: 374, Allocations: [], Payments: many },
+    { CurrencyCode: 'GBP', Total: 400, RemainingCredit: 369, Allocations: [], Payments: many },
     Object.fromEntries(many.map((pmt) => [pmt.PaymentID, AUTHORISED_REFUND])),
   )
-  assert.equal(capped.probe.ok, false, 'a note this code would have to make 26 requests about refuses instead')
-  assert.match(reasonOf(capped.probe), /more than 25 payments against this credit note whose status it did not state/)
-  assert.equal(capped.paths.filter((path) => path.startsWith('Payments/')).length, 25,
-    'and it stops AT the cap rather than discovering it afterwards')
-  assert.notEqual(classifyLedgerSettlement(attemptFor('26.00'), capped.probe).outcome, 'clear')
+  assert.equal(capped.paths.filter((path) => path.startsWith('Payments/')).length, 30,
+    'it stops AT the budget rather than discovering it afterwards')
+  assert.equal(capped.probe.ok === true ? capped.probe.provedComplete : null, false,
+    'and the payment it did not reach is UNPROVED rather than fatal')
+  assert.notEqual(classifyLedgerSettlement(attemptFor('369.00'), capped.probe).outcome, 'clear')
 
-  // THE DISCRIMINATING HALF OF THE CAP: 25 is fine, so the refusal above is the bound and not a
-  // blanket refusal of notes with several refunds.
-  const under = Array.from({ length: 25 }, (_unused, i) => ({ PaymentID: `PAY-${i}`, Amount: 1 }))
+  // THE DISCRIMINATING HALF OF THE BUDGET: thirty is fine, so the boundary above is the budget and not
+  // a blanket withholding from every note with several refunds.
+  const under = Array.from({ length: 30 }, (_unused, i) => ({ PaymentID: `PAY-${i}`, Amount: 1 }))
   const allowed = await probeNoteWithCalls(
-    { CurrencyCode: 'GBP', Total: 400, RemainingCredit: 375, Allocations: [], Payments: under },
+    { CurrencyCode: 'GBP', Total: 400, RemainingCredit: 370, Allocations: [], Payments: under },
     Object.fromEntries(under.map((pmt) => [pmt.PaymentID, AUTHORISED_REFUND])),
   )
-  assert.equal(allowed.probe.ok, true, 'twenty-five resolvable refunds are resolved')
-  assert.equal(allowed.paths.filter((path) => path.startsWith('Payments/')).length, 25)
-  assert.equal(classifyLedgerSettlement(attemptFor('375.00'), allowed.probe).outcome, 'clear')
+  assert.equal(allowed.probe.ok, true, 'thirty resolvable refunds are resolved')
+  assert.equal(allowed.paths.filter((path) => path.startsWith('Payments/')).length, 30)
+  assert.equal(classifyLedgerSettlement(attemptFor('370.00'), allowed.probe).outcome, 'clear')
+})
+
+/* ------------------------------------------------------------------------------------------- *
+ * 9. o3d-acctmoney r4 (Codex HIGH 1, HIGH 2, MEDIUM): THREE THINGS THE RESOLVER WAS TRUSTING
+ *    WITHOUT HAVING ESTABLISHED THEM — a CACHE standing in for an identity, a RESPONSE standing in
+ *    for the one that was asked for, and a CONSTANT standing in for a real limit.
+ *
+ * HIGH 1. r3 made repeated `PaymentID`s cost one LOOKUP and left them costing several SUBTRACTIONS.
+ * HIGH 2. r3 asked `Payments/{id}` and then read `Payments[0]` of whatever came back.
+ * MEDIUM. r3's twenty-sixth silent payment refused TERMINALLY, so a credit note refunded in more
+ *   tranches than that could never apply its remaining balance at all.
+ * ------------------------------------------------------------------------------------------- */
+
+test('[o3d-acctmoney r4] a duplicate PaymentID cannot turn a missing allocation into `clear`', async () => {
+  // THE FINDING, REPRODUCED AND CLOSED. Codex's shape exactly: 200 has come off a 400 credit note, the
+  // allocation collection is empty, and ONE authorised 100 refund is listed TWICE. r3 subtracted the
+  // 100 twice, landed `applied` on a proved ZERO over an empty collection and answered `clear` — which
+  // authorises allocating the missing 100 a SECOND time.
+  //
+  // ROUTE: `distinctCreditNoteRefunds` collapses the two entries carrying PAY-R1 into one term ->
+  //        `refunded` = 100 -> `applied` = 400 - 200 - 0 - 100 = 100 -> the shortfall check against an
+  //        empty allocation collection -> ok:false -> `unknown`.
+  // MUTATION: make `distinctCreditNoteRefunds` return one entry per ARRAY ELEMENT instead of one per
+  //        id (drop the `byId` lookup and always push). Measured: this probe answers ok:true with
+  //        `provedComplete: true` and the classifier says `clear` — r3's behaviour, and the finding.
+  const DUPLICATED = {
+    CurrencyCode: 'GBP', Total: 400, RemainingCredit: 200, Allocations: [],
+    Payments: [{ PaymentID: 'PAY-R1', Amount: 100 }, { PaymentID: 'pay-r1', Amount: 100 }],
+  }
+  // PRECONDITION — 200 of the credit has been used and the note lists exactly ONE payment, under two
+  // spellings of its id. So 100 of what came off is NOT accounted for by a refund.
+  assert.equal(DUPLICATED.Total - DUPLICATED.RemainingCredit, 200, 'PRECONDITION: 200 has come off')
+  assert.equal(
+    new Set(DUPLICATED.Payments.map((p) => p.PaymentID.toLowerCase())).size, 1,
+    'PRECONDITION: and both entries are the same payment, differing only in case')
+
+  const dup = await probeNoteWithCalls(DUPLICATED, { 'PAY-R1': AUTHORISED_REFUND })
+  assert.equal(dup.probe.ok, false,
+    'one payment listed twice is one refund, so 100 of this credit is unaccounted for')
+  assert.match(reasonOf(dup.probe), /100\.00 of this credit note already applied but returned no allocations/)
+  assert.notEqual(classifyLedgerSettlement(attemptFor('100.00'), dup.probe).outcome, 'clear',
+    '`clear` here is the second allocation of the missing 100')
+  assert.equal(classifyLedgerSettlement(attemptFor('100.00'), dup.probe).outcome, 'unknown')
+  assert.deepEqual(dup.paths, ['CreditNotes/cn-1', 'Payments/PAY-R1'],
+    'and it still costs ONE lookup — the cache was never the problem, the arithmetic was')
+
+  // THE DISCRIMINATING HALF, and without it this test would pass just as well if the arm had started
+  // refusing every note with two refunds. TWO DISTINCT payments of 100 DO account for the 200.
+  const twoReal = await probeNote({
+    CurrencyCode: 'GBP', Total: 400, RemainingCredit: 200, Allocations: [],
+    Payments: [{ PaymentID: 'PAY-R1', Amount: 100 }, { PaymentID: 'PAY-R2', Amount: 100 }],
+  }, { 'PAY-R1': AUTHORISED_REFUND, 'PAY-R2': AUTHORISED_REFUND })
+  assert.equal(twoReal.ok, true, 'two genuinely distinct refunds are two terms')
+  assert.equal(twoReal.ok === true ? twoReal.provedComplete : null, true,
+    'and together they prove the empty collection, exactly as one refund of 200 would')
+  assert.equal(classifyLedgerSettlement(attemptFor('200.00'), twoReal).outcome, 'clear')
+})
+
+test('[o3d-acctmoney r4] duplicate entries that DISAGREE are a contradiction, not a subtraction to size', async () => {
+  // WHY THE STRICTER RULE. Deduplicating alone would have to PICK one of two disagreeing entries, and
+  // this branch refuses a contradictory response rather than choosing a reading of it.
+  //
+  // ROUTE: `distinctCreditNoteRefunds` (status/type) and `creditNoteRefundAmountDisagreement` (amount,
+  //        after resolution has said the payment is a term) -> ok:false.
+  // MUTATION: make `sameReading` return true unconditionally. Measured: the amount case below answers
+  //        ok:true with `applied` computed from whichever entry Xero happened to list first, and the
+  //        assertion fails as `true !== false`.
+  // MUTATION 2: drop the status/type comparison loop in `distinctCreditNoteRefunds`. Measured: the
+  //        status case answers ok:true and classifies `clear`, deciding a reversal from the entry that
+  //        happened to be first.
+
+  const amounts = await probeNote({
+    CurrencyCode: 'GBP', Total: 400, RemainingCredit: 200, Allocations: [],
+    Payments: [{ PaymentID: 'PAY-R1', Amount: 100 }, { PaymentID: 'PAY-R1', Amount: 50 }],
+  }, { 'PAY-R1': AUTHORISED_REFUND })
+  assert.equal(amounts.ok, false, 'the same payment cannot be two sizes')
+  assert.match(reasonOf(amounts),
+    /lists payment PAY-R1 against this credit note more than once without stating the same amount/)
+  assert.notEqual(classifyLedgerSettlement(attemptFor('200.00'), amounts).outcome, 'clear')
+
+  const statuses = await probeNote({
+    CurrencyCode: 'GBP', Total: 400, RemainingCredit: 300, Allocations: [],
+    Payments: [
+      { PaymentID: 'PAY-R1', Amount: 100, Status: 'AUTHORISED' },
+      { PaymentID: 'PAY-R1', Amount: 100, Status: 'DELETED' },
+    ],
+  })
+  assert.equal(statuses.ok, false, 'and it cannot be both reversed and not reversed')
+  assert.match(reasonOf(statuses), /lists payment PAY-R1 against this credit note more than once, stating a different status/)
+  assert.notEqual(classifyLedgerSettlement(attemptFor('300.00'), statuses).outcome, 'clear')
+
+  const types = await probeNote({
+    CurrencyCode: 'GBP', Total: 400, RemainingCredit: 300, Allocations: [],
+    Payments: [
+      { PaymentID: 'PAY-R1', Amount: 100, Status: 'AUTHORISED', PaymentType: 'APCREDITPAYMENT' },
+      { PaymentID: 'PAY-R1', Amount: 100, Status: 'AUTHORISED', PaymentType: 'ARCREDITPAYMENT' },
+    ],
+  })
+  assert.equal(types.ok, false, 'nor be two kinds of payment')
+  assert.match(reasonOf(types), /more than once, stating a different type each time/)
+
+  // AND AN EXCLUDED PAYMENT'S AMOUNT IS STILL NEVER READ, which is this arm's standing rule (o3d-jfhi)
+  // and the reason the amount half of the uniqueness rule waits for the resolution. Two DELETED
+  // entries stating different amounts are not a contradiction this code has to settle: neither is a
+  // term, so there is nothing to choose between.
+  const bothDeleted = await probeNote({
+    CurrencyCode: 'GBP', Total: 400, RemainingCredit: 400, Allocations: [],
+    Payments: [
+      { PaymentID: 'PAY-R1', Amount: 100, Status: 'DELETED' },
+      { PaymentID: 'PAY-R1', Amount: 'a hundred', Status: 'DELETED' },
+    ],
+  })
+  assert.equal(bothDeleted.ok, true, 'a figure that is never subtracted is not a figure that must agree')
+  assert.equal(classifyLedgerSettlement(attemptFor('400.00'), bothDeleted).outcome, 'clear')
+
+  // AND AN ENTRY WITH NO ID AT ALL. Without one it can be neither deduplicated nor bound to a lookup,
+  // which are the two things this round establishes — so a payment that would be SUBTRACTED without an
+  // identity refuses, where r3 only refused the one that could not be looked up.
+  const anonymousAuthorised = await probeNote({
+    CurrencyCode: 'GBP', Total: 400, RemainingCredit: 300, Allocations: [],
+    Payments: [{ Amount: 100, Status: 'AUTHORISED' }],
+  })
+  assert.equal(anonymousAuthorised.ok, false, 'a subtracted refund with no identity could be a repeat of another')
+  assert.match(reasonOf(anonymousAuthorised), /no id to tell it apart from the others it listed/)
+  assert.notEqual(classifyLedgerSettlement(attemptFor('300.00'), anonymousAuthorised).outcome, 'clear')
+})
+
+test('[o3d-acctmoney r4] a lookup answer that is not ABOUT the payment asked for is refused', async () => {
+  // THE FINDING. r3 requested `Payments/{paymentId}` and then read `Payments[0]`'s status and type
+  // without checking that the record WAS that payment, that there was exactly one, or that it belonged
+  // to this credit note. Codex reproduced `provedComplete: true` and `clear` from a PAY-R1 stub
+  // answered by a PAY-OTHER record — and if PAY-R1 had in fact been DELETED that is the second
+  // allocation this whole pass exists to prevent.
+  //
+  // ROUTE: `resolveCreditNoteRefunds` -> the binding checks between the response and the request ->
+  //        a refusal sentence -> ok:false, which the classifier cannot turn into `clear`.
+  // MUTATION: delete the returned-id comparison (`returnedId.toLowerCase() !== paymentId.toLowerCase()`).
+  //        Measured: case (1) answers ok:true, `provedComplete: true`, and classifies `clear` — the
+  //        finding, exactly as Codex reproduced it.
+  // MUTATION 2: read `returned[0]` without the `returned.length > 1` guard. Measured: case (2) answers
+  //        ok:true and clears on the first of two payments.
+  // MUTATION 3: drop the `CreditNote.CreditNoteID` comparison. Measured: case (3) clears.
+  // MUTATION 4: drop the resolved-amount comparison. Measured: case (4) clears.
+  const NOTE = { ...AMBIGUOUS_NOTE, Payments: [PRODUCTION_STUB] }
+
+  // PRECONDITION — resolved properly this note CLEARS, so every refusal below is taking a `clear` away
+  // rather than agreeing with a refusal that was going to happen anyway.
+  assert.equal(
+    classifyLedgerSettlement(attemptFor('300.00'), await probeNote(NOTE, { 'PAY-R1': AUTHORISED_REFUND })).outcome,
+    'clear', 'PRECONDITION: this note DOES clear when the lookup answers about PAY-R1')
+
+  // (1) A DIFFERENT PAYMENT ANSWERED. Codex's reproduction.
+  const wrongId = await probeNote(NOTE, { 'PAY-R1': { ...AUTHORISED_REFUND, PaymentID: 'PAY-OTHER' } })
+  assert.equal(wrongId.ok, false, 'an authorised OTHER payment says nothing about this one')
+  assert.match(reasonOf(wrongId), /answered the request for payment PAY-R1 against this credit note with payment PAY-OTHER/)
+  assert.notEqual(classifyLedgerSettlement(attemptFor('300.00'), wrongId).outcome, 'clear')
+
+  // (1b) AND A RECORD THAT IDENTIFIES NOTHING. Absent is not "it must be the one I asked for".
+  const unidentified = await probeNote(NOTE, { 'PAY-R1': [{ Status: 'AUTHORISED', PaymentType: 'APCREDITPAYMENT' }] })
+  assert.equal(unidentified.ok, false, 'a record with no id is not a record about this id')
+  assert.match(reasonOf(unidentified), /with a payment it did not identify/)
+
+  // (2) MORE THAN ONE PAYMENT. `Payments/{id}` addresses ONE payment; reading `[0]` out of several is
+  // choosing rather than resolving.
+  const several = await probeNote(NOTE, { 'PAY-R1': [
+    { PaymentID: 'PAY-R1', ...AUTHORISED_REFUND },
+    { PaymentID: 'PAY-R2', ...AUTHORISED_REFUND },
+  ] })
+  assert.equal(several.ok, false, 'a body carrying several payments is not an answer to a single-id request')
+  assert.match(reasonOf(several), /answered the request for payment PAY-R1 against this credit note with 2 payments/)
+
+  // (3) A PAYMENT AGAINST ANOTHER DOCUMENT. This half can only ever REFUSE — see the note on
+  // `resolveCreditNoteRefunds` about why an unestablished field may not be REQUIRED — and here it is
+  // shown to fire when Xero does state it.
+  const otherDoc = await probeNote(NOTE, {
+    'PAY-R1': { ...AUTHORISED_REFUND, CreditNote: { CreditNoteID: 'cn-other' } },
+  })
+  assert.equal(otherDoc.ok, false, 'a refund of somebody else\'s credit note is not a term of this one')
+  assert.match(reasonOf(otherDoc), /payment PAY-R1 is against credit note cn-other and not cn-1/)
+  assert.notEqual(classifyLedgerSettlement(attemptFor('300.00'), otherDoc).outcome, 'clear')
+
+  // (4) A PAYMENT WHOSE SIZE CONTRADICTS THE FIGURE ABOUT TO BE SUBTRACTED FOR IT.
+  const wrongAmount = await probeNote(NOTE, { 'PAY-R1': { ...AUTHORISED_REFUND, Amount: 250 } })
+  assert.equal(wrongAmount.ok, false, 'the note says the refund is 100 and the payment says 250; both cannot be true')
+  assert.match(reasonOf(wrongAmount), /payment PAY-R1 as 100\.00 on this credit note and 250\.00 on the payment itself/)
+
+  // THE DISCRIMINATING HALF: the SAME response with the id, the document and the amount all AGREEING
+  // still clears. Without this the four assertions above would pass just as well if the arm had
+  // started refusing every response that carried these fields at all.
+  const bound = await probeNote(NOTE, {
+    'PAY-R1': { ...AUTHORISED_REFUND, PaymentID: 'pay-r1', CreditNote: { CreditNoteID: 'CN-1' }, Amount: 100 },
+  })
+  assert.equal(bound.ok, true, 'a fully bound answer is still an answer')
+  assert.equal(bound.ok === true ? bound.provedComplete : null, true)
+  assert.equal(classifyLedgerSettlement(attemptFor('300.00'), bound).outcome, 'clear',
+    'and both ids are matched case-insensitively, as Xero\'s GUIDs are compared everywhere else here')
+})
+
+test('[o3d-acctmoney r4] past the lookup budget a credit note is UNPROVED, never stranded', async () => {
+  // THE FINDING. r3 refused TERMINALLY on the twenty-sixth distinct silent payment, and neither the
+  // schema nor anything else establishes a maximum of 25 refunds. A legitimately long-lived credit
+  // note refunded in more tranches than that then had no path at all: every retry reads the same
+  // stable shape and refuses again, and the row ends FAILED — the permanent-hold class this branch
+  // rejected the cheap option to avoid, reintroduced by the guard against unbounded work.
+  //
+  // THE TRADE THAT REPLACED IT, ASSERTED RATHER THAN DESCRIBED. The budget still bounds the CALLS —
+  // that reason was always sound — but it no longer decides the ANSWER, only how much of it is PROVED.
+  // Past the budget the remaining payments go unresolved, `applied` becomes an INTERVAL, and the arm
+  // answers `ok: true` with `provedComplete: false`. So a note with more refunds than the budget loses
+  // the ability to have a FIRST allocation authorised automatically, and keeps every protection
+  // against a SECOND one.
+  //
+  // ROUTE: `resolveCreditNoteRefunds` -> `lookups >= XERO_CREDIT_NOTE_REFUND_LOOKUP_BUDGET` -> the
+  //        index is reported unresolved instead of refusing -> `unprovedRefunded` -> the third arm of
+  //        `allocationsDoNotProve` -> `provedComplete: false` -> `unknown`.
+  // MUTATION: restore r3's refusal in that branch (return a `refusal` instead of pushing to
+  //        `unresolved`). Measured: the 100-refund case answers ok:false and the `present` assertion
+  //        below fails — an allocation that DID land stops being recognised, which is the probe's
+  //        whole purpose.
+  // MUTATION 2: drop `statesAnything(unprovedRefunded, …)` from `allocationsDoNotProve`. Measured: the
+  //        100-refund case answers `provedComplete: true` and classifies `clear` — 70 refunds this
+  //        code never established would be certifying an empty collection.
+  const refundsOf = (n: number) => Array.from({ length: n }, (_unused, i) => ({ PaymentID: `PAY-${i}`, Amount: 1 }))
+  const stubsFor = (many: ReadonlyArray<{ PaymentID: string }>) =>
+    Object.fromEntries(many.map((pmt) => [pmt.PaymentID, AUTHORISED_REFUND]))
+
+  // (1) AT THE BUDGET, EVERYTHING IS PROVED — so the boundary below is the budget and not a blanket
+  // refusal of notes with several refunds.
+  const thirty = refundsOf(30)
+  const atBudget = await probeNoteWithCalls(
+    { CurrencyCode: 'GBP', Total: 400, RemainingCredit: 370, Allocations: [], Payments: thirty },
+    stubsFor(thirty),
+  )
+  assert.equal(atBudget.probe.ok, true, 'thirty resolvable refunds are resolved')
+  assert.equal(atBudget.paths.filter((path) => path.startsWith('Payments/')).length, 30)
+  assert.equal(atBudget.probe.ok === true ? atBudget.probe.provedComplete : null, true)
+  assert.equal(classifyLedgerSettlement(attemptFor('370.00'), atBudget.probe).outcome, 'clear',
+    'and the 370 it has left is allocatable on the first attempt')
+
+  // (2) ONE PAST IT. The ONLY difference from (1) is the thirty-first payment, and the arm answers
+  // rather than refusing.
+  const thirtyOne = refundsOf(31)
+  const overBudget = await probeNoteWithCalls(
+    { CurrencyCode: 'GBP', Total: 400, RemainingCredit: 369, Allocations: [], Payments: thirtyOne },
+    stubsFor(thirtyOne),
+  )
+  assert.equal(overBudget.probe.ok, true, 'the thirty-first refund does not make the response unreadable')
+  assert.equal(overBudget.paths.filter((path) => path.startsWith('Payments/')).length, 30,
+    'it stops AT the budget rather than discovering it afterwards')
+  assert.equal(overBudget.probe.ok === true ? overBudget.probe.provedComplete : null, false,
+    'but one unresolved refund makes `applied` an interval, and an interval certifies nothing')
+  const overVerdict = classifyLedgerSettlement(attemptFor('369.00'), overBudget.probe)
+  assert.equal(overVerdict.outcome, 'unknown', 'so a FIRST allocation is withheld for an operator')
+  assert.equal(overVerdict.outcome === 'unknown' ? overVerdict.cause : null, 'collection-unproved')
+
+  // (3) AND A HUNDRED, WHICH IS THE QUESTION THE BOUND HAS TO ANSWER. Thirty calls, an answer, no
+  // `clear` — and, below, no lost protection either.
+  const hundred = refundsOf(100)
+  const huge = await probeNoteWithCalls(
+    { CurrencyCode: 'GBP', Total: 400, RemainingCredit: 300, Allocations: [], Payments: hundred },
+    stubsFor(hundred),
+  )
+  assert.equal(huge.paths.filter((path) => path.startsWith('Payments/')).length, 30,
+    'a hundred refunds cost thirty calls, not a hundred — the sweep\'s minute is still bounded')
+  assert.equal(huge.probe.ok, true, 'and the document is NOT stranded as a hard failure no retry can clear')
+  assert.equal(huge.probe.ok === true ? huge.probe.provedComplete : null, false)
+  assert.notEqual(classifyLedgerSettlement(attemptFor('300.00'), huge.probe).outcome, 'clear')
+
+  // (4) THE PROTECTION THAT MATTERS IS KEPT, and this is what makes the degradation better than r3's
+  // refusal rather than merely different. The same hundred-refund note with the allocation ALREADY
+  // MADE: r3 answered ok:false and the classifier could only say `unknown`, so a retry of a payment
+  // that had already landed stayed unresolved for ever. It is now recognised as PRESENT and the row
+  // can be closed.
+  const landed = await probeNote({
+    CurrencyCode: 'GBP',
+    Total: 400,
+    RemainingCredit: 0,
+    Allocations: [{ Amount: 300, Date: `${DATE}T00:00:00`, Invoice: { InvoiceID: 'inv-1' } }],
+    Payments: hundred,
+  }, stubsFor(hundred))
+  assert.equal(landed.ok, true, 'PRECONDITION: the response is coherent — 100 refunded, 300 allocated')
+  assert.equal(landed.ok === true ? landed.records.length : -1, 1,
+    'and the allocation to THIS bill is read even though the refund term is not fully proved')
+  assert.equal(classifyLedgerSettlement(attemptFor('300.00'), landed).outcome, 'present',
+    'a settlement this attempt would have created IS this attempt, whatever else went unproved')
+})
+
+test('[o3d-acctmoney r4] the CREDIT NOTE this arm reads must be the one it asked for', async () => {
+  // THE CLOSING AUDIT OF THIS ROUND'S OWN CODE, and the one thing it turned up. Codex's HIGH 2 was the
+  // payment lookup believing whatever arrived; the document read ONE LEVEL UP had exactly that shape —
+  // `CreditNotes/{id}` followed by `CreditNotes[0]`, with `CreditNoteID` modelled on the response type
+  // since o3d-obyd and compared with nothing at all. Binding a PAYMENT to a credit note this code had
+  // not established was the requested one is proof of an adjacent property.
+  //
+  // AND IT IS NOT HYPOTHETICAL ON THIS ENDPOINT FAMILY: `scripts/audit-xero-live-contamination.ts`
+  // carries a live-tenant guard for precisely it — "CreditNotes ignored the IDs filter (returned
+  // unrequested ids)" — written because Xero did it.
+  //
+  // ROUTE: the credit-note arm's document read -> the identity checks on the response -> ok:false.
+  // MUTATION: drop the `notedId.toLowerCase() !== creditNoteId.toLowerCase()` comparison. Measured:
+  //        case (1) answers ok:true with `provedComplete: true` and classifies `clear` — our credit
+  //        note allocated a second time on the strength of a DIFFERENT note's emptiness.
+  // MUTATION 2: drop the `returnedNotes.length > 1` guard. Measured: case (2) clears on the first of
+  //        two credit notes.
+  const UNTOUCHED = { CurrencyCode: 'GBP', Total: 40, RemainingCredit: 40, Allocations: [] }
+  const askCn1 = (body: unknown) => probeXeroSettlement(NOTE_TARGET, ledgerDouble({ 'CreditNotes/cn-1': body }).get)
+
+  // PRECONDITION — that body IS a `clear` when it is the note that was asked for, so each refusal
+  // below is taking a `clear` away rather than agreeing with one that was going to happen anyway.
+  const asked = await askCn1({ CreditNotes: [{ CreditNoteID: 'cn-1', ...UNTOUCHED }] })
+  assert.equal(classifyLedgerSettlement(attemptFor('40.00'), asked).outcome, 'clear',
+    'PRECONDITION: a wholly unallocated credit note clears on the first attempt')
+
+  // (1) A DIFFERENT CREDIT NOTE.
+  const wrongNote = await askCn1({ CreditNotes: [{ CreditNoteID: 'cn-other', ...UNTOUCHED }] })
+  assert.equal(wrongNote.ok, false, 'another note\'s empty allocation list says nothing about ours')
+  assert.match(reasonOf(wrongNote), /answered the request for credit note cn-1 with credit note cn-other/)
+  assert.notEqual(classifyLedgerSettlement(attemptFor('40.00'), wrongNote).outcome, 'clear')
+
+  // (1b) AND ONE THAT IDENTIFIES NOTHING. Absent is not "it must be the one I asked for" — the same
+  // rule the payment lookup applies, on the field this repository's live audit script types
+  // NON-OPTIONAL off this very endpoint.
+  const unidentified = await askCn1({ CreditNotes: [{ ...UNTOUCHED }] })
+  assert.equal(unidentified.ok, false, 'a credit note with no id is not a credit note about this id')
+  assert.match(reasonOf(unidentified), /with a credit note it did not identify/)
+
+  // (2) MORE THAN ONE. `CreditNotes/{id}` addresses ONE document; reading `[0]` out of several is
+  // choosing rather than reading.
+  const several = await askCn1({ CreditNotes: [
+    { CreditNoteID: 'cn-1', ...UNTOUCHED },
+    { CreditNoteID: 'cn-2', ...UNTOUCHED },
+  ] })
+  assert.equal(several.ok, false, 'a body carrying several documents is not an answer to a single-id request')
+  assert.match(reasonOf(several), /answered the request for credit note cn-1 with 2 credit notes/)
+
+  // AND THE EMPTY BODY STILL READS AS IT ALWAYS DID, so this change did not rewrite the sentence an
+  // operator already knows for the commonest of these failures.
+  const none = await askCn1({ CreditNotes: [] })
+  assert.equal(none.ok, false)
+  assert.match(reasonOf(none), /Xero returned no credit note for that id/)
+})
+
+test('[o3d-acctmoney r4] an unresolved refund cannot make IMS call a coherent response incoherent', async () => {
+  // THE OTHER END OF THE INTERVAL, and the check that has to be asked of it. `applied` subtracts EVERY
+  // unresolved refund, so it is the LOWEST the allocation usage can be. The identity's own sanity check
+  // — "the usage came out below zero, so Xero has contradicted itself" — is a strong accusation, and
+  // the lower bound is not entitled to make it: a note is perfectly coherent the moment enough of the
+  // refunds this code never looked at turn out to have been REVERSED.
+  //
+  // ROUTE: `shortBy(0, addMoney(applied, unprovedRefunded))` -> the UPPER end -> no refusal, and the
+  //        withheld proof from the arm below instead.
+  // MUTATION: ask it of `applied` alone (r3's spelling, and correct while nothing could go unresolved).
+  //        Measured: the first case answers ok:false with "the response is inconsistent", over a
+  //        response that is not.
+  const hundred = Array.from({ length: 100 }, (_unused, i) => ({ PaymentID: `PAY-${i}`, Amount: 1 }))
+  const hundredStubs = Object.fromEntries(hundred.map((pmt) => [pmt.PaymentID, AUTHORISED_REFUND]))
+
+  // PRECONDITION — 60 has come off the note, 100 refunds of 1 are listed, and the budget reaches 30 of
+  // them. Counting all 100 puts the usage at -40; leaving any 40 of the 70 unreached ones out puts it
+  // at zero or above.
+  const coherent = await probeNote(
+    { CurrencyCode: 'GBP', Total: 400, RemainingCredit: 340, Allocations: [], Payments: hundred },
+    hundredStubs,
+  )
+  assert.equal(coherent.ok, true, 'IMS does not accuse the ledger of contradicting itself on its own guess')
+  assert.equal(coherent.ok === true ? coherent.provedComplete : null, false,
+    'it withholds the proof instead, which is the honest answer about a figure it did not establish')
+  assert.notEqual(classifyLedgerSettlement(attemptFor('340.00'), coherent).outcome, 'clear')
+
+  // THE DISCRIMINATING HALF: when even the MOST generous reading of the unresolved payments is still
+  // below zero, the response really is incoherent and the check still says so. Same shape, refunds of
+  // 5 rather than 1.
+  const bigger = Array.from({ length: 100 }, (_unused, i) => ({ PaymentID: `PAY-${i}`, Amount: 5 }))
+  const incoherent = await probeNote(
+    { CurrencyCode: 'GBP', Total: 400, RemainingCredit: 390, Allocations: [], Payments: bigger },
+    Object.fromEntries(bigger.map((pmt) => [pmt.PaymentID, AUTHORISED_REFUND])),
+  )
+  assert.equal(incoherent.ok, false, 'ten off a note carrying 500 of refunds is incoherent however the 70 read')
+  assert.match(reasonOf(incoherent),
+    /remaining credit is larger than its own total less what has been taken off it/)
+  assert.notEqual(classifyLedgerSettlement(attemptFor('10.00'), incoherent).outcome, 'clear')
 })
