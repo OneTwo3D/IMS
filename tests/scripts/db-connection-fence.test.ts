@@ -6503,19 +6503,18 @@ test('--bind-migration says colocated on the witness instance and absent on a by
         const probing = capturingFenceOutput(() => doBindMigration(client as never, {
           migrationNonce: nonce, witnessLock: lock, holdStamp: true, ...suppliedIdentity({ appDatabase: 'imsdb' }),
         }))
-        // BOUNDED, and that is not tidiness: an unbounded wait for a sighting that will never come
-        // is a test that HANGS instead of failing, which is worse than one that passes wrongly --
-        // it takes the whole file's budget with it. The probe holds its stamp for twelve sampler
-        // ticks by construction, so twenty attempts is generous and finite.
-        for (let attempt = 0; attempt < 20 && sightings.length === 0; attempt += 1) {
-          const { rows } = await observer.query(
-            'SELECT application_name FROM pg_stat_activity WHERE application_name = $1',
-            [migrationApplicationName(nonce)],
-          )
-          for (const row of rows) sightings.push(String(row.application_name))
-          if (sightings.length > 0) break
-          await new Promise((resolve) => setTimeout(resolve, WITNESS_SAMPLE_INTERVAL_MS))
-        }
+        // ONE READING, TAKEN LATE, AND BOUNDED. Not a poll-until-seen: the pre-DDL probe drops its
+        // stamp within a millisecond of connecting, so a loop that started looking immediately
+        // would catch the stamp in flight and the assertion would hold whether or not
+        // `--hold-stamp` did anything -- measured, by mutating the guard away and watching this
+        // pass. The probe keeps its stamp for twelve sampler ticks, so the reading is taken after
+        // four: comfortably inside the hold, and comfortably after a SET that is not being skipped.
+        await new Promise((resolve) => setTimeout(resolve, WITNESS_SAMPLE_INTERVAL_MS * 4))
+        const { rows } = await observer.query(
+          'SELECT application_name FROM pg_stat_activity WHERE application_name = $1',
+          [migrationApplicationName(nonce)],
+        )
+        for (const row of rows) sightings.push(String(row.application_name))
         const held = await probing
         assert.equal(held.value, EXIT_OK, `the holding probe must bind:\n${held.err}`)
         assert.deepEqual(sightings, [migrationApplicationName(nonce)],
