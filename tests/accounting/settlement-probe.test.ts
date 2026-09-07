@@ -7,6 +7,9 @@ import {
   probeXeroSettlement,
   settlementProbeKey,
 } from '@/lib/connectors/accounting-settlement-probe'
+// o3d-78rq: a settlement record's amount is the ledger's EXACT stated figure now, not its wire
+// double, so every expectation below states the same figure as a Decimal.
+import { toDecimal } from '@/lib/domain/math/decimal'
 
 /**
  * o3d-0m56 — what the two ledgers are actually asked, and what is read back.
@@ -51,8 +54,8 @@ test('xero reads payments from the SINGLE-invoice endpoint (o3d-0m56)', async ()
   assert.deepEqual(probe, {
     ok: true,
     records: [
-      { amount: 10, date: '2026-08-01', id: 'PAY-1', reference: 'IMS-abc123abc123' },
-      { amount: 25, date: '2026-07-01', id: 'PAY-2', reference: null },
+      { amount: toDecimal(10), date: '2026-08-01', id: 'PAY-1', reference: 'IMS-abc123abc123' },
+      { amount: toDecimal(25), date: '2026-07-01', id: 'PAY-2', reference: null },
     ],
   })
 })
@@ -92,7 +95,7 @@ test('xero: a credit-note allocation is read from the credit note, filtered to T
   )
 
   assert.deepEqual(calls, [{ path: 'CreditNotes/cn-1' }])
-  assert.deepEqual(probe, { ok: true, records: [{ amount: 10, date: '2026-08-01', reference: null }] },
+  assert.deepEqual(probe, { ok: true, records: [{ amount: toDecimal(10), date: '2026-08-01', reference: null }] },
     'the same credit note legitimately offsets other bills; only this one is evidence')
 })
 
@@ -142,7 +145,7 @@ test('quickbooks follows the invoice\'s linked payments and measures the APPLIED
   const probe = await probeQuickBooksSettlement({ type: 'INVOICE_PAYMENT', payload: { accountingInvoiceId: 'inv-1' } }, get)
 
   assert.deepEqual(calls, [{ path: 'invoice/inv-1' }, { path: 'payment/55' }], 'the Estimate link is not a settlement')
-  assert.deepEqual(probe, { ok: true, records: [{ amount: 10, date: '2026-08-01', id: '55', reference: 'IMS-deadbeef0000' }] },
+  assert.deepEqual(probe, { ok: true, records: [{ amount: toDecimal(10), date: '2026-08-01', id: '55', reference: 'IMS-deadbeef0000' }] },
     'and PrivateNote is carried through as the mark')
 })
 
@@ -177,7 +180,7 @@ test('quickbooks: a REAL bill payment is recorded as BillPaymentCheck, and is fo
   const probe = await probeQuickBooksSettlement({ type: 'BILL_PAYMENT', payload: { accountingInvoiceId: 'bill-1' } }, get)
   assert.deepEqual(calls, [{ path: 'bill/bill-1' }, { path: 'billpayment/77' }],
     'the link says BillPaymentCheck; the entity is still read from /billpayment')
-  assert.deepEqual(probe, { ok: true, records: [{ amount: 10, date: '2026-08-01', id: '77', reference: 'IMS-abc123abc123' }] })
+  assert.deepEqual(probe, { ok: true, records: [{ amount: toDecimal(10), date: '2026-08-01', id: '77', reference: 'IMS-abc123abc123' }] })
 })
 
 test('quickbooks: a credit-card bill payment is found too, and the bare entity name still works (o3d-0m56)', async () => {
@@ -189,7 +192,7 @@ test('quickbooks: a credit-card bill payment is found too, and the bare entity n
       },
     })
     const probe = await probeQuickBooksSettlement({ type: 'BILL_PAYMENT', payload: { accountingInvoiceId: 'bill-1' } }, get)
-    assert.deepEqual(probe, { ok: true, records: [{ amount: 10, date: '2026-08-01', id: '77', reference: null }] }, linkType)
+    assert.deepEqual(probe, { ok: true, records: [{ amount: toDecimal(10), date: '2026-08-01', id: '77', reference: null }] }, linkType)
   }
 })
 
@@ -292,7 +295,7 @@ test('quickbooks: a payment that fully explains the applied amount is still a cl
     },
   })
   const probe = await probeQuickBooksSettlement({ type: 'BILL_PAYMENT', payload: { accountingInvoiceId: 'bill-1' } }, get)
-  assert.deepEqual(probe, { ok: true, records: [{ amount: 60, date: '2026-08-01', id: '77', reference: null }] })
+  assert.deepEqual(probe, { ok: true, records: [{ amount: toDecimal(60), date: '2026-08-01', id: '77', reference: null }] })
 })
 
 test('quickbooks: money off the document that the payments do not explain fails the probe (o3d-0m56)', async () => {
@@ -451,7 +454,7 @@ test('xero: allocations to OTHER documents still count towards the credit note\'
     { type: 'PURCHASE_CREDIT_NOTE_ALLOCATION', payload: { creditNoteId: 'cn-1', accountingInvoiceId: 'bill-1' } },
     get,
   )
-  assert.deepEqual(probe, { ok: true, records: [{ amount: 10, date: '2026-08-01', reference: null }] })
+  assert.deepEqual(probe, { ok: true, records: [{ amount: toDecimal(10), date: '2026-08-01', reference: null }] })
 })
 
 test('xero: an allocation whose amount cannot be read fails the credit note probe (o3d-0m56 r6)', async () => {
@@ -514,7 +517,7 @@ test('xero: a credit the response ITEMISES explains itself and changes no verdic
   })
   assert.deepEqual(
     await probeXeroSettlement({ type: 'INVOICE_PAYMENT', payload: { accountingInvoiceId: 'inv-1' } }, get),
-    { ok: true, records: [{ amount: 20, date: '2026-08-01', id: 'PAY-1', reference: null }] },
+    { ok: true, records: [{ amount: toDecimal(20), date: '2026-08-01', id: 'PAY-1', reference: null }] },
   )
 })
 

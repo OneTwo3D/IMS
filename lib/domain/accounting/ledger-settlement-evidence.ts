@@ -341,15 +341,20 @@ export function describeAttempt(
 }
 
 /**
- * A money figure for an operator sentence.
+ * A money figure for an operator sentence — NEVER ROUNDED, and money-shaped where it can be.
  *
- * o3d-78rq: `toFixed()` with no argument, which is o3d-4ozd's rule — lossless, never exponential, and
- * so incapable of printing two figures this verdict tells apart as the same text. A settlement of
- * `1073741824.005` and one of `1073741824.01` are a different payment to this module and must read as
- * different payments to the person holding the refusal.
+ * o3d-78rq. It was `value.toFixed(2)` over a `number`, and o3d-4ozd's finding is that a presentation
+ * which rounds can print two figures this verdict tells apart as the same text: a settlement of
+ * `1073741824.005` and one of `1073741824.01` are a DIFFERENT payment here, and "the ledger already
+ * holds 1073741824.01" would be the wrong figure to go looking for in Xero.
+ *
+ * So the places are `max(2, the figure's own)`: two is what every operator sentence on this path has
+ * always shown and it keeps a whole ten pounds reading as `10.00`, while a figure carrying more than
+ * two decimals is shown at ITS OWN scale rather than rounded to fit. `Decimal.toFixed` never uses
+ * exponential notation, so a large amount stays readable as digits at either width.
  */
 function money(value: Decimal): string {
-  return value.toFixed()
+  return value.toFixed(Math.max(2, value.decimalPlaces()))
 }
 
 /**

@@ -63,9 +63,7 @@ test('an empty ledger clears the attempt (o3d-0m56)', () => {
 test('same amount AND same date is the attempt (o3d-0m56)', () => {
   const verdict = classifyLedgerSettlement(attempt, records({ amount: 10, date: '2026-08-01', id: 'PAY-1' }))
   assert.equal(verdict.outcome, 'present')
-  // o3d-78rq: `money()` prints `toFixed()` — lossless and never rounded — so ten pounds reads as `10`.
-  // The figure an operator is shown is the one the ledger holds, not a two-decimal rendering of it.
-  assert.match(verdict.outcome === 'present' ? verdict.detail : '', /^10 dated 2026-08-01 \(PAY-1\)$/)
+  assert.match(verdict.outcome === 'present' ? verdict.detail : '', /^10\.00 dated 2026-08-01 \(PAY-1\)$/)
 })
 
 test('a settlement of the same size on ANOTHER day is not this attempt (o3d-0m56)', () => {
