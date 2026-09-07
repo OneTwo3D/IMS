@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { execFile, spawn } from 'node:child_process'
+import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import {
   chmodSync,
   existsSync,
@@ -90,11 +90,24 @@ import test, { mock } from 'node:test'
 //  19. the ordering itself: build -> unit -> restart -> guard -> lock, and the crontab section
 //      REFUSES to open the lock if the restart did not happen, with a CONTROL that it otherwise does
 //
-// DETERMINISM. There is no sleep and no timer used to sequence anything. The interleaving comes
+// DETERMINISM. There is no sleep and no timer used to SEQUENCE anything. The interleaving comes
 // from two injected barriers — one inside the settings snapshot, one inside a real `crontab`
 // executable that parks mid-write — and every wait below is on a FIFO or a process exit, never on
-// wall-clock time. The two flock waits that DO carry a timeout are asked for `--timeout 0` (an
-// immediate, deterministic answer about a lock that is definitely held) or are asserted to expire.
+// wall-clock time. The two flock waits that DO carry a timeout are asked for a wait the shipped
+// library HONOURS (asserted, see `shellLockProbe`) or are asserted to expire.
+//
+// o3d-ondn AMENDED BOTH HALVES OF THAT PARAGRAPH, because neither was true as written:
+//
+//   • "a process exit" was `child.on('exit', resolve)`, which is a wait on an EVENT and not on the
+//     condition. `exit` fires once; a child already reaped by the time the listener is attached
+//     never fires it again, the promise stays pending with nothing holding the loop open, and the
+//     runner CANCELS the rest of the file. See `awaitExit`, which waits on the condition.
+//   • "`--timeout 0`" was silently rewritten to the library's 60-second constant, so the file spent
+//     a full minute of wall clock in a test whose comment said it took none. See `shellLockProbe`.
+//
+// Every bounded wait added by that round is a FAILURE bound and never a rendezvous: it is sized so
+// far above any real handoff that reaching it means the thing genuinely never happened, and it
+// reports that by failing the test BY NAME rather than by draining the loop.
 //
 // WHAT IS REAL HERE. The lock is a real `flock(2)` on a real file. The crontab is a real executable
 // on PATH writing a real file. The installer's lock lines are EXTRACTED FROM scripts/install.sh and
@@ -176,17 +189,95 @@ function sh(script: string): Promise<{ code: number | null; stdout: string; stde
   })
 }
 
-/** Block until the parked child announces itself. A FIFO read, never a poll. */
-function awaitFifo(path: string): Promise<string> {
+/**
+ * HOW LONG A WAIT IS ALLOWED TO TAKE BEFORE IT IS A FAILURE RATHER THAN A HANDOFF.
+ *
+ * o3d-ondn. Not a rendezvous: every handoff in this file completes in single-digit milliseconds on
+ * an idle box and in tens of them on a loaded one, so thirty seconds is three orders of magnitude of
+ * headroom and is only ever reached when the thing being waited for is never going to happen. What
+ * it buys is the DIRECTION of that outcome — a bounded wait fails THIS test with a sentence naming
+ * what did not happen, while an unbounded one drains the event loop and takes the other hundred
+ * tests in the file with it, reported as `cancelled` and not as `fail`.
+ */
+const WAIT_BOUND_MS = 30_000
+
+/**
+ * WAIT UNTIL A CHILD HAS EXITED — WHICH IS NOT THE SAME AS WAITING FOR ITS `exit` EVENT.
+ *
+ * o3d-ondn — THE CANCELLATION CASCADE, AND IT WAS A RACE THIS FILE COULD NOT SEE ITSELF LOSE.
+ *
+ * Four places here wrote `await new Promise((resolve) => child.on('exit', resolve))`. `exit` is
+ * emitted ONCE. A child that has already been reaped by the time the listener is attached will never
+ * emit it again — so the promise stays pending forever, and because nothing else is left holding the
+ * event loop open, node's test runner reports
+ *
+ *     Promise resolution is still pending but the event loop has already resolved
+ *
+ * against the running test and marks EVERY remaining test in the file `cancelledByParent`.
+ *
+ * THE REPORTING TRAP, WHICH IS WHY IT SURVIVED A WHOLE SESSION AS "NOISE". Cancelled tests are not
+ * failures. The suite prints `fail 0` and exits 1: measured on this branch, `# fail 0` with
+ * `# cancelled 103`. Every summary anybody reads says the run is clean, and a hundred assertions
+ * about crontab serialisation simply did not run.
+ *
+ * IT IS REACHED BY ORDINARY CONTENTION. `writeFile(GO_FIFO, …)` releases the parked child; whether
+ * that child is reaped before or after the next statement runs depends on how many other test FILES
+ * the runner has on the CPUs at that moment. Adding ONE unrelated test file to the repository was
+ * enough to flip it — and it is fully deterministic under load: measured, three runs of this file
+ * with six spinners on four cores cancelled on two of them, at the same test both times.
+ *
+ * SO THE WAIT IS ON THE CONDITION AND NOT ON THE EVENT. "Has this process exited" is answerable
+ * without an event at all: `exitCode`/`signalCode` are non-null exactly when it has. A child that
+ * beat us to it is answered immediately; one that has not yet exited is waited for; one that never
+ * exits is killed and FAILS THIS TEST BY NAME.
+ */
+function awaitExit(child: ChildProcess, what: string): Promise<number | null> {
+  // Already gone. The event will never come, and it does not need to: this is the question.
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(child.exitCode)
+  return new Promise((resolve, reject) => {
+    const bound = setTimeout(() => {
+      child.kill('SIGKILL')
+      reject(new Error(
+        `${what} had not exited ${WAIT_BOUND_MS}ms after it was released. It has been killed so the `
+        + 'run can continue; this is a failure of THIS test, not of the ones after it.',
+      ))
+    }, WAIT_BOUND_MS)
+    child.on('exit', (code) => {
+      clearTimeout(bound)
+      resolve(code)
+    })
+  })
+}
+
+/**
+ * Block until the parked child announces itself. A FIFO read, never a poll.
+ *
+ * o3d-ondn: BOUNDED, for the reason above. An announcement that never comes used to leave this
+ * promise pending with an open read stream, and the failure it eventually produced was the same
+ * whole-file cancellation — the parked child is the only thing that can write here, so if it died
+ * before reaching its `echo` nothing else ever will.
+ */
+function awaitFifo(path: string, what = path): Promise<string> {
   return new Promise((resolve, reject) => {
     const stream = createReadStream(path)
+    const bound = setTimeout(() => {
+      stream.close()
+      reject(new Error(
+        `nothing announced itself on ${what} within ${WAIT_BOUND_MS}ms, so the child that was `
+        + 'supposed to park there never reached its announcement.',
+      ))
+    }, WAIT_BOUND_MS)
     let data = ''
     stream.on('data', (chunk) => {
       data += String(chunk)
+      clearTimeout(bound)
       stream.close()
       resolve(data)
     })
-    stream.on('error', reject)
+    stream.on('error', (error) => {
+      clearTimeout(bound)
+      reject(error)
+    })
   })
 }
 
@@ -432,7 +523,7 @@ test('[o3d-batch-ret] the crontab child inherits the lock descriptor, so the exc
     'the lock must still be held by the child that inherited the descriptor')
 
   await writeFile(GO_FIFO, 'go\n')
-  await new Promise((resolve) => child!.on('exit', resolve))
+  await awaitExit(child!, 'the child holding the inherited lock descriptor')
   assert.equal(await lockIsFree(), true, 'and it is released once that child exits')
 })
 
@@ -460,12 +551,28 @@ const SHELL_ENTRYPOINTS: Array<[string, string]> = [
  * Those two lines are gone — o3d-p9dq moved the acquisition into the library, partly because fd 9
  * is where all three entrypoints hold the SHARED CUTOVER lock and `exec 9<` was silently releasing
  * it.
+ *
+ * o3d-ondn — AND IT NOW REPORTS THE WAIT THE LIBRARY ACTUALLY RESOLVED, because the one this file
+ * asked for was not the one it got.
+ *
+ * The conflict test below asked for `IMS_CRONTAB_LOCK_WAIT_SECONDS=0` and its comment said
+ * "`--timeout 0`: an immediate, deterministic answer about a lock that is definitely held". The
+ * shipped library rejects a non-positive wait — deliberately, and the application applies the same
+ * rule to `OTI_CRONTAB_LOCK_WAIT_MS`, where `'0'` is one of the unusable overrides an existing test
+ * here enumerates — and substitutes its 60-second constant. So the test spent SIXTY SECONDS of wall
+ * clock on a `flock` that was always going to expire, in the single slowest file in the suite,
+ * while claiming to spend none.
+ *
+ * That is what makes it a rendezvous rather than an assertion: a wait nobody asked for, whose length
+ * is invisible at the call site, and which is the file's whole runtime. Echoing the RESOLVED value
+ * turns the substitution into a failed assertion — a sentence about the wait — instead of a minute.
  */
 function shellLockProbe(body: string, waitSeconds: number): string {
   return `set -u
 die() { echo "DIE: $*" >&2; exit 1; }
 IMS_CRONTAB_LOCK_WAIT_SECONDS=${waitSeconds}
 source '${CRONTAB_LOCK_LIB}'
+echo "RESOLVED-WAIT=\${CRONTAB_LOCK_WAIT_SECONDS}"
 CRONTAB_LOCK_DIR='${dirname(LOCK_FILE)}'
 CRONTAB_LOCK_FILE='${LOCK_FILE}'
 probe_body() {
@@ -479,9 +586,20 @@ exit "$rc"`
 /** `flock --conflict-exit-code` is not used by the shell helper; it reports conflicts as 75. */
 const SHELL_LOCK_CONFLICT = 75
 
+/**
+ * THE SHORTEST WAIT THE SHIPPED LIBRARY HONOURS.
+ *
+ * o3d-ondn: ONE, not ZERO. `flock --timeout` is in seconds, and `scripts/lib/crontab-lock.sh`
+ * refuses a non-positive wait and substitutes its 60-second constant — so zero is not "no wait", it
+ * is the longest wait in the file. One second is the smallest value that means what the call site
+ * says it means, and the refusal below is guaranteed to arrive at it rather than to race for it: the
+ * application holds the lock across the WHOLE of the probe's lifetime, so the expiry is the
+ * assertion and not a timing hope.
+ */
+const SHELL_LOCK_WAIT_SECONDS = 1
+
 test('[o3d-batch-ret] a SHELL ENTRYPOINT cannot take the crontab lock while the application holds it', async () => {
-  // `--timeout 0`: an immediate, deterministic answer about a lock that is definitely held.
-  const probe = shellLockProbe('  echo ACQUIRED', 0)
+  const probe = shellLockProbe('  echo ACQUIRED', SHELL_LOCK_WAIT_SECONDS)
 
   const { withCrontabReconcileLock } = await import('@/lib/crontab-reconcile-lock')
   const outcome = await withCrontabReconcileLock(async () => sh(probe))
@@ -491,11 +609,19 @@ test('[o3d-batch-ret] a SHELL ENTRYPOINT cannot take the crontab lock while the 
     'with_crontab_lock must report a conflict, not run the body, while a reconciliation holds the lock')
   assert.doesNotMatch(result!.stdout, /ACQUIRED/,
     'and the body must not have run: a shell writer that proceeds without the lock IS the defect')
+  // o3d-ondn — AND THE WAIT IT ACTUALLY USED IS THE ONE THIS TEST ASKED FOR. Without this the
+  // library can silently substitute its own constant and the only symptom is that the suite takes a
+  // minute longer, which is not a symptom anybody reads. It is asserted on BOTH probes below,
+  // because the second is the one whose wait would otherwise be unobserved entirely.
+  assert.match(result!.stdout, new RegExp(`^RESOLVED-WAIT=${SHELL_LOCK_WAIT_SECONDS}$`, 'm'),
+    `with_crontab_lock must wait the ${SHELL_LOCK_WAIT_SECONDS}s it was given, not fall back to its `
+    + `own constant: ${JSON.stringify(result!.stdout)}`)
 
   // …and granted the moment it is free, so this is exclusion and not a broken command.
   const after = await sh(probe)
   assert.equal(after.code, 0)
   assert.match(after.stdout, /ACQUIRED/)
+  assert.match(after.stdout, new RegExp(`^RESOLVED-WAIT=${SHELL_LOCK_WAIT_SECONDS}$`, 'm'))
 })
 
 test('[o3d-batch-ret] an APPLICATION reconciliation is refused while a SHELL ENTRYPOINT holds the crontab lock', async () => {
@@ -518,7 +644,7 @@ test('[o3d-batch-ret] an APPLICATION reconciliation is refused while a SHELL ENT
   assert.match(result.status === 'post-commit-failed' ? result.error : '', /Another crontab reconciliation is still running/)
 
   await writeFile(GO_FIFO, 'go\n')
-  await new Promise((resolve) => holder.on('exit', resolve))
+  await awaitExit(holder, 'the shell entrypoint holding the crontab lock')
 
   // Once the entrypoint is out, the application reconciles normally — the refusal was the
   // exclusion, not a broken path.
@@ -619,7 +745,7 @@ test('[o3d-batch-ret] a lock file REPLACED mid-wait does not leave the reconcili
 
   await sh(`mv '${LOCK_FILE}' '${LOCK_FILE}.replaced' && touch '${LOCK_FILE}'`)
   await writeFile(GO_FIFO, 'go\n')
-  await new Promise((resolve) => holder.on('exit', resolve))
+  await awaitExit(holder, 'the shell entrypoint queued ahead of the replaced lock file')
   await pending
 
   assert.equal(insideProbe, false,
@@ -2110,7 +2236,7 @@ async function reconcileInsideTheCutoverWindow(fenceCall: string) {
   const crontabDuringWindow = crontabText()
 
   await writeFile(GO_FIFO, 'go\n')
-  const fenceCode: number | null = await new Promise((resolve) => fence.on('exit', resolve))
+  const fenceCode = await awaitExit(fence, 'the cutover fence parked mid-write')
 
   const restore = await sh(cutoverProgram('CRON_FENCED=true\nunfence_cron'))
   return { saved, crontabDuringWindow, fenceCode, fenceErr, restore, final: crontabText() }
@@ -3738,7 +3864,16 @@ test('[o3d-batch-ret] the no-binary proof is not vacuous: each thing it checks c
   // found by the real `pgrep` — the check is exercised, not simulated.
   const daemon = spawn('sleep', ['30'], { stdio: 'ignore' })
   try {
-    await new Promise((r) => setTimeout(r, 200))
+    // o3d-ondn: WAIT FOR THE CONDITION, not for 200ms. The condition is "pgrep can see this pid",
+    // which is the very thing the shipped library is about to ask, so it is asked here directly
+    // rather than approximated by a sleep that a loaded runner can outlast. The bound is a failure
+    // bound: falling out of it leaves the assertion below to fail loudly, exactly as it did before.
+    const deadline = Date.now() + WAIT_BOUND_MS
+    while (Date.now() < deadline) {
+      const { code } = await sh(`pgrep -x sleep | grep -qx '${daemon.pid}'`)
+      if (code === 0) break
+      await new Promise((r) => setTimeout(r, 10))
+    }
     const running = await probe(`CRON_SPOOL_ROOTS=('${emptySpool}')\nCRON_DAEMON_NAMES=(sleep)`, asRootLib())
     assert.match(running.stdout, /^RC=1$/m,
       `a running daemon holds the loaded schedule in memory and must withhold the proof:\n${running.stdout}${running.stderr}`)
