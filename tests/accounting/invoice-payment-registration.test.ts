@@ -39,13 +39,35 @@ import { toDecimal } from '@/lib/domain/math/decimal'
 function live(row: Omit<ExistingInvoicePaymentSync, 'registeredAmount'>): ExistingInvoicePaymentSync {
   // o3d-r948 r2: a READING now, and `loadInvoicePaymentSyncRows` builds exactly these two — a row
   // with a number states its own decimal reading, a row without one states nothing.
+  //
+  // o3d-r948 r5 — AND AN ORIGIN, FOR THE SAME REASON THE TWO AMOUNTS ARE BOTH HERE. The production
+  // loader now reads every row's connection provenance through `readAccountingOriginRecord` and puts
+  // the answer on the row, so a fixture without one describes a row production cannot produce. The
+  // default is the ORDINARY row — raised against the organisation `base` says the probe answered
+  // from — because that is what almost every row on a healthy order is, and because the rules the
+  // older tests pin are about baskets, bases and amounts rather than about realms. The cases that
+  // are about realms override it, and they are directly below the r4 block.
   return {
+    origin: { state: 'stamped', provenance: PROBED_REALM },
     ...row,
     registeredAmount: row.amount == null
       ? { kind: 'not-stated' }
       : { kind: 'stated', amount: toDecimal(row.amount) },
   }
 }
+
+/**
+ * o3d-r948 r5 — THE ORGANISATION THE PROBE ANSWERED FROM, in the format
+ * `activeAccountingIdProvenance` mints: `"<connector>:<tenantId>"`.
+ *
+ * QuickBooks deliberately, and a numeric realm deliberately: the collision this round closes needs a
+ * namespace where two organisations really can issue the same short id, and QuickBooks' payment ids
+ * are exactly that. A Xero GUID would make the reconnect case look impossible when it is only
+ * improbable.
+ */
+const PROBED_REALM = 'quickbooks:realm-B'
+/** The organisation this connection was pointed at BEFORE the reconnect. Same connector, other ledger. */
+const FORMER_REALM = 'quickbooks:realm-A'
 
 const base = {
   syncEnabled: true,
@@ -59,6 +81,11 @@ const base = {
   // Most cases have no unresolved attempt, so the ledger is never consulted and this is unread.
   // The cases that DO have one pass their own records — see the o3d-0m56 block at the end.
   ledgerSettlements: null as LedgerSettlementRecord[] | null,
+  // o3d-r948 r5: WHICH organisation those settlements came from. Stated on the shared base rather
+  // than only on the realm tests, because it is stated in production on every call — the probe
+  // returns it beside the records — and a base that omitted it would leave every older test
+  // silently exercising the "the probe could not say" path instead of the ordinary one.
+  ledgerConnectionProvenance: PROBED_REALM as string | null,
   ledgerTotal: toDecimal(100),
 }
 
@@ -438,6 +465,186 @@ test('[o3d-r948 r4] an OPERATOR_RELEASE row s id is the connector s own and stil
   assert.equal(d.register, true)
 })
 
+/* ------------------------------------------------------------------------------------------- *
+ * o3d-r948 r5 (Codex HIGH) — AND A CONNECTOR IS NOT A NAMESPACE.
+ *
+ * r4 finished by clearing the last question the wrong way: "the connector itself is already pinned
+ * upstream ... the ids cannot come from another connector's namespace. There is no per-realm
+ * `provenance` column to check beyond that: that work was tried and REVERTED."
+ *
+ * `connector` is `'quickbooks'` — a ledger TYPE. Reconnect from one company to another and every row
+ * raised against the first stays in the table under that same string, holding an id from the first
+ * company's namespace. And the column DOES exist: `AccountingSyncLog.connectionProvenance`, read with
+ * the payload stamp through `readAccountingOriginRecord`. What was reverted was one DESIGN, not the
+ * capability — the schema comment recording the revert sits directly above the column that shipped.
+ *
+ * The exclusion is the one permissive input on this path, so both sides are now scoped: the row must
+ * record the organisation the probe answered from, and the probe must say which that was.
+ * ------------------------------------------------------------------------------------------- */
+
+test('[o3d-r948 r5] an id minted in a FORMER realm does not exclude the current ledger s own evidence', () => {
+  // THE RECONNECT, BUILT EXPLICITLY. QuickBooks was disconnected from realm A and reconnected to
+  // realm B. The order's invoice was re-posted in B as INV-2. A CONNECTOR-CONFIRMED row from the
+  // realm-A days is still on this order — it names the retired INV-1 and a DIFFERENT receipt, so
+  // `retiredDocumentInvoicePaymentAttempts` skips it (its paymentId is neither null nor this
+  // receipt's), the `live` document filter drops it, and the LEDGER_AMOUNT_ASSERTED gate reads that
+  // filter's output and never sees it. Its basis is null, so r4's asserted-row filter passes it too.
+  //
+  // Its `externalTransactionId` is `123` — a QuickBooks payment id from realm A. Realm B has issued
+  // its own payment `123`, and that one IS the unresolved attempt's settlement, reported in a form
+  // IMS will not read. Excluding it skips the only record proving that attempt posted: `clear`, and
+  // a second payment lands in realm B.
+  //
+  // ROUTE: decideInvoicePaymentRegistration's unresolved-attempt loop → the
+  //        `settlementsOfOtherAttempts` filter → `excludingRowIsFromTheProbedLedger(row.origin,
+  //        input.ledgerConnectionProvenance)`.
+  // MUTATION: drop that clause from the filter and this registers instead of refusing (verified).
+  const formerRealmRow = {
+    status: 'SYNCED' as const,
+    amount: 40,
+    paymentId: 'pay-other',
+    // The document retired when the invoice was re-posted — what makes this row invisible elsewhere.
+    accountingInvoiceId: 'INV-1',
+    // Realm A's payment 123. Realm B has a different payment with the same id.
+    externalTransactionId: '123',
+    // Connector-confirmed: no operator ever typed this in. r4's filter has nothing to say about it.
+    settlementBasis: null,
+  }
+  const input = {
+    ...base,
+    accountingInvoiceId: 'INV-2',
+    paymentAmount: toDecimal(60),
+    ledgerConnectionProvenance: PROBED_REALM,
+    ledgerSettlements: [
+      // REALM B's payment 123: the unresolved attempt's own settlement, stated unreadably. Only an
+      // exclusion can skip it.
+      { amount: null, unreadableAmount: '100.005', date: null, id: '123', reference: null },
+    ] as LedgerSettlementRecord[],
+  }
+  const attempt = unresolved({ amount: 100, paymentDate: '2026-08-01' })
+
+  // THE PRECONDITION, and it carries the whole test: the SAME row, differing only in the realm it
+  // records, DOES exclude — so this id demonstrably reaches the set, the record really is skipped
+  // by it, and the origin is the only thing that changes the answer.
+  const sameRealm = decideInvoicePaymentRegistration({
+    ...input,
+    existing: [live({ ...formerRealmRow, origin: { state: 'stamped', provenance: PROBED_REALM } }), attempt],
+  })
+  assert.equal(sameRealm.register, true, 'a same-realm connector-backed id must still exclude')
+
+  const d = decideInvoicePaymentRegistration({
+    ...input,
+    existing: [live({ ...formerRealmRow, origin: { state: 'stamped', provenance: FORMER_REALM } }), attempt],
+  })
+  assert.equal(d.register, false)
+  assert.equal(d.register === false && d.refusal, 'UNRESOLVED_PAYMENT_ATTEMPT')
+})
+
+test('[o3d-r948 r5] a row whose origin is UNKNOWN grants no exclusion — in any of its three flavours', () => {
+  // An exclusion is PERMISSIVE, so it needs positive evidence and absence is not a weak yes. The
+  // three unknowns are three different sentences to an operator and one answer here:
+  //
+  //   absent               queued before `_connectionProvenance` shipped, or a caller that does not
+  //                        plumb it. Nothing recorded — so nothing vouches for the id.
+  //   unreadable           the durable column and the payload stamp describe two different moments.
+  //                        "I cannot tell" is never "the same".
+  //   raised-disconnected  raised while nothing was connected at all, which is the one state that
+  //                        positively rules OUT any organisation vouching for the id.
+  //
+  // ROUTE: the same filter → `excludingRowIsFromTheProbedLedger`, whose `origin?.state === 'stamped'`
+  //        test is the only thing standing between each of these and an exclusion.
+  // MUTATION: relax that to `origin != null` (or drop the origin clause) and all three register
+  //        instead of refusing (verified).
+  const row = {
+    status: 'SYNCED' as const,
+    amount: 40,
+    paymentId: 'pay-other',
+    accountingInvoiceId: 'INV-1',
+    externalTransactionId: 'PAY-X',
+    settlementBasis: null,
+  }
+  const input = {
+    ...base,
+    accountingInvoiceId: 'INV-2',
+    paymentAmount: toDecimal(60),
+    ledgerConnectionProvenance: PROBED_REALM,
+    ledgerSettlements: [
+      { amount: null, unreadableAmount: '100.005', date: null, id: 'PAY-X', reference: null },
+    ] as LedgerSettlementRecord[],
+  }
+  const attempt = unresolved({ amount: 100, paymentDate: '2026-08-01' })
+  const decide = (origin: ExistingInvoicePaymentSync['origin']) => decideInvoicePaymentRegistration({
+    ...input,
+    existing: [live({ ...row, origin }), attempt],
+  })
+
+  // THE PRECONDITION: recorded as the probed realm, this row's id excludes and the receipt registers.
+  // So the filter is reached, the id is in the set, and the state of the origin is what moves it.
+  assert.equal(decide({ state: 'stamped', provenance: PROBED_REALM }).register, true)
+
+  for (const origin of [
+    undefined,
+    { state: 'absent' } as const,
+    { state: 'unreadable', detail: 'this row records TWO different origins' } as const,
+    { state: 'raised-disconnected' } as const,
+  ]) {
+    const d = decide(origin)
+    assert.equal(d.register, false, `origin ${origin?.state ?? 'undefined'} must not grant an exclusion`)
+    assert.equal(d.register === false && d.refusal, 'UNRESOLVED_PAYMENT_ATTEMPT')
+  }
+})
+
+test('[o3d-r948 r5] the PROBE side is scoped too — a connection the probe cannot name excludes nothing', () => {
+  // THE OTHER HALF OF THE RECOMMENDATION, and it is not symmetry for its own sake. Excluding on a
+  // realm-matched id is only sound if the RECORD being matched against is also known to be from that
+  // realm. Scoping only the row would compare a realm-stamped id against records of unknown origin —
+  // a different unproved claim, not half of a proof.
+  //
+  // Null here is what `probeLedgerSettlement` reports when it cannot say which organisation answered,
+  // INCLUDING the case where the connection moved across the read: it reads the active provenance
+  // either side of the fetch and answers null when the two disagree.
+  //
+  // ROUTE: the same filter → `excludingRowIsFromTheProbedLedger`'s `probed === '' ? null : probed`
+  //        argument, and `accountingIdProvenanceMatches`, which is false whenever the active side is
+  //        null.
+  // MUTATION: make the predicate ignore its second argument and return `origin?.state === 'stamped'`
+  //        and the unnamed and blank cases register instead of refusing (verified).
+  const row = live({
+    status: 'SYNCED',
+    amount: 40,
+    paymentId: 'pay-other',
+    accountingInvoiceId: 'INV-1',
+    externalTransactionId: 'PAY-X',
+    settlementBasis: null,
+    origin: { state: 'stamped', provenance: PROBED_REALM },
+  })
+  const attempt = unresolved({ amount: 100, paymentDate: '2026-08-01' })
+  const decide = (ledgerConnectionProvenance: string | null | undefined) =>
+    decideInvoicePaymentRegistration({
+      ...base,
+      accountingInvoiceId: 'INV-2',
+      paymentAmount: toDecimal(60),
+      existing: [row, attempt],
+      ledgerConnectionProvenance,
+      ledgerSettlements: [
+        { amount: null, unreadableAmount: '100.005', date: null, id: 'PAY-X', reference: null },
+      ] as LedgerSettlementRecord[],
+    })
+
+  // THE PRECONDITION: with the probe naming the row's own realm, the id excludes and this registers.
+  assert.equal(decide(PROBED_REALM).register, true)
+
+  for (const unnamed of [null, undefined, '', '   ']) {
+    const d = decide(unnamed)
+    assert.equal(d.register, false, `a probe provenance of ${JSON.stringify(unnamed)} must exclude nothing`)
+    assert.equal(d.register === false && d.refusal, 'UNRESOLVED_PAYMENT_ATTEMPT')
+  }
+
+  // And a probe that names a DIFFERENT organisation from the row is the reconnect seen from the other
+  // side: still no exclusion, and for the same reason.
+  assert.equal(decide(FORMER_REALM).register, false)
+})
+
 // ---------------------------------------------------------------------------
 // o3d-hbgo, read side: WHICH ledger document a registration settled
 // ---------------------------------------------------------------------------
@@ -593,15 +800,24 @@ test('sales.ts asks the ledger exactly when the decision needs it (o3d-0m56)', a
   const source = await readFile(
     path.join(process.cwd(), 'lib/domain/accounting/invoice-payment-enqueue.ts'), 'utf8',
   )
-  const at = source.indexOf('const ledgerSettlements =')
+  const at = source.indexOf('const ledgerProbe =')
   assert.notEqual(at, -1, 'the registration path must resolve what the ledger holds')
   const body = source.slice(at, source.indexOf('const decision = decideInvoicePaymentRegistration', at))
 
   assert.match(body, /unresolvedInvoicePaymentAttempts\(existing, params\.paymentId\)\.length > 0/,
     'the probe must be gated on an unresolved attempt, not run on every receipt')
-  assert.match(body, /probe\.ok \? probe\.records : null/,
+  assert.match(body, /\? \{ records: probe\.records, connectionProvenance: probe\.connectionProvenance \?\? null \}\s*\n\s*: null/,
     'a probe that could not answer must become null — the value the decision refuses on')
   assert.match(source.slice(at), /ledgerSettlements,/, 'and it must reach the decision')
+
+  // o3d-r948 r5: AND SO MUST THE ORGANISATION IT ANSWERED FROM. The records are ids in one ledger's
+  // namespace and say nowhere which; without this the exclusion set is comparing across namespaces
+  // again, which is the whole of the round. Read off the SAME probe result as the records — plumbing
+  // them from two places is how they would come to describe two different connections.
+  assert.match(body, /const ledgerSettlements = ledgerProbe\?\.records \?\? null/,
+    'the records must be read off the one probe result')
+  assert.match(source.slice(at), /ledgerConnectionProvenance: ledgerProbe\?\.connectionProvenance \?\? null,/,
+    'and the provenance must reach the decision from that same result')
 
   // The two fields the unresolved rule is decided from must actually be read off the stored row.
   // Without paymentDate no attempt can ever be matched, so every receipt beside a failed row is
@@ -616,6 +832,19 @@ test('sales.ts asks the ledger exactly when the decision needs it (o3d-0m56)', a
     'the attempt date must be carried from the shared money-post date rule')
   assert.match(loaderBody, /couldHaveReachedLedger: attemptCouldHaveReachedTheLedger\('INVOICE_PAYMENT', r\.payload\)/,
     'and postability judged by the SAME rule the retry guard uses')
+
+  // o3d-r948 r5: AND THE ROW'S ORIGIN, THROUGH THE ONE READER, FROM BOTH DURABLE HALVES.
+  //
+  // Not `r.connectionProvenance` on its own: the column alone refuses every row queued before it
+  // shipped, the payload alone answers nothing for a retention-compacted tombstone, and only
+  // `backReferenceEvidenceCompactedAt` separates "retention emptied this payload" from "somebody
+  // rewrote it". A loader that selected one half would hand the exclusion a confident wrong answer.
+  assert.match(loaderBody, /connectionProvenance: true,/,
+    'the durable connection column must be selected')
+  assert.match(loaderBody, /backReferenceEvidenceCompactedAt: true,/,
+    'and the compaction instant that says whether the column may speak for the payload')
+  assert.match(loaderBody, /origin: readAccountingOriginRecord\(\{[\s\S]*?payload: r\.payload,[\s\S]*?connectionProvenance: r\.connectionProvenance,[\s\S]*?backReferenceEvidenceCompactedAt: r\.backReferenceEvidenceCompactedAt,/,
+    'and the origin must be read from all three through readAccountingOriginRecord, not re-derived here')
 
   // The refusal has to be surfaced, not swallowed: an operator who is not told will record the
   // receipt again.
